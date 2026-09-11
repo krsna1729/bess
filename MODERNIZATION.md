@@ -49,7 +49,7 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-11, at commit `49f1ec86` on `develop`.
+Last updated: 2026-09-11, at commit `cfa82e3b` on `develop`.
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
@@ -121,13 +121,43 @@ unrelated scapy-version checksum mismatch in `url_filter.py`.
    restarts workers rapidly, which stress-tests this path much harder than
    unit tests do). `launch_worker()` detached its OS thread; `destroy_worker()`
    only waited for a status flag that flips *before* the thread actually
-   finishes and exits, so a same-`wid` relaunch could race a still-exiting
-   previous thread for the same TLS block. Fixed by joining instead of
-   detaching, plus made `run_worker()` defensively re-zero `current_worker`
-   (with a `WARNING` log) instead of `CHECK`-crashing the whole daemon if it
-   ever isn't pristine — reduced crashes from 9/run to 0/run across 3
-   consecutive full test-suite runs. **Under Opus review as of this writing —
-   check for its findings before trusting this fix is final.**
+   finishes and exits. Fixed by joining instead of detaching, plus made
+   `run_worker()` defensively re-zero `current_worker` instead of
+   `CHECK`-crashing the daemon if it ever isn't pristine. **This commit's
+   own stated root cause (glibc TLS-block reuse) turned out to be wrong,
+   and it introduced a critical regression — see commit 7, which an Opus
+   review of this commit caught.** Left in the log as-is (don't rewrite
+   history) since 7 supersedes/corrects it; read them together.
+7. **`cfa82e3b`** — Opus review of commit 6 found: (a) **critical**: normal
+   `bessctl daemon stop` now aborted `bessd` with `std::terminate()` — 6
+   removed `.detach()` without accounting for `KillBess()` (bessctl.cc)
+   resuming workers before an async shutdown, so `main()` returned with
+   workers still running and their thread handles still joinable, and
+   `worker_threads[]` (a namespace-scope global) calls `~std::thread()` on
+   exit. **Confirmed by direct reproduction before and after the fix**
+   (start `bessd`, build an active pipeline, `daemon stop` — crashed
+   before, 3/3 clean after). Fixed with a new
+   `detach_all_worker_threads()`, called once at shutdown. (b) 6's root
+   cause was wrong: the review traced glibc's actual TLS init and showed
+   recycled TLS is zeroed synchronously inside `pthread_create()`, before
+   the new thread runs — "stale TLS reuse" was never possible. The `join()`
+   in 6 is still correct, but for a different, more serious reason: it
+   serializes worker teardown (`~Scheduler` → `~TrafficClass` →
+   `TrafficClassBuilder::Clear()`) against the **global, unsynchronized**
+   `std::unordered_map all_tcs_` (`core/traffic_class.cc`, confirmed no
+   locking exists around it anywhere) — without the join, concurrent
+   mutation of that map from two teardown paths is a real heap-corruption
+   race. Comments rewritten to reflect this. (c) Added a defensive `CHECK`
+   in `launch_worker()` against reusing a still-joinable slot (the same
+   `std::terminate()` failure mode as (a), on the move-assignment).
+   (d) Upgraded the `run_worker()` recovery log from `WARNING` to `ERROR`
+   with actual diagnostic values, since per (b) a non-pristine
+   `current_worker` more likely indicates real corruption than benign
+   timing. **Lesson for future work on this file**: verify claims about
+   *why* a fix works independently of whether the fix itself is correct —
+   6's fix direction was right, its explanation wasn't, and that
+   explanation being wrong is exactly what let the shutdown regression
+   through unnoticed.
 
 ## Review process established this session
 
