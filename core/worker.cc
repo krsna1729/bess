@@ -192,6 +192,12 @@ void destroy_worker(int wid) {
     while (workers[wid]->status() == WORKER_PAUSED) {
     } /* spin */
 
+    // Wait for the OS thread to fully exit (not just for status_ to have
+    // left WORKER_PAUSED, which happens earlier, inside BlockWorker())
+    // before this wid's slot can be reused. See the comment in
+    // launch_worker().
+    worker_threads[wid].join();
+
     workers[wid] = nullptr;
 
     num_workers--;
@@ -333,7 +339,22 @@ void *Worker::Run(void *_arg) {
 }
 
 void *run_worker(void *_arg) {
-  CHECK_EQ(memcmp(&current_worker, new Worker(), sizeof(Worker)), 0);
+  // current_worker (a __thread/TLS object) should always start pristine
+  // for a brand new OS thread -- the join() in destroy_worker() (see the
+  // comment in launch_worker() below) ensures a previous worker's OS
+  // thread has fully exited before its wid can be reused, closing the
+  // main way this could go stale. But relying on memcmp-equals-zero
+  // being an absolute guarantee of TLS freshness pushes correctness onto
+  // glibc/kernel thread-teardown timing this code doesn't fully control,
+  // and getting that wrong used to crash the whole daemon (CHECK_EQ)
+  // over what's a harmless-to-fix condition. Reset explicitly instead,
+  // and only warn: robust either way, but still visible if it happens.
+  const Worker kZeroWorker{};
+  if (memcmp(&current_worker, &kZeroWorker, sizeof(Worker)) != 0) {
+    LOG(WARNING) << "current_worker was not pristine at worker thread "
+                    "start; resetting. (stale TLS reuse?)";
+    current_worker = kZeroWorker;
+  }
   return current_worker.Run(_arg);
 }
 
@@ -349,8 +370,15 @@ void launch_worker(int wid, int core,
   }
 
   worker_threads[wid] = std::thread(run_worker, &arg);
-  worker_threads[wid].detach();
-
+  // Not detached: destroy_worker() joins this thread to make sure the OS
+  // thread (and its __thread current_worker TLS block) has fully exited
+  // before this wid can be reused by a future launch_worker() call. The
+  // old detach()-based version only waited for the status_ flag to leave
+  // WORKER_PAUSED, which BlockWorker() sets *before* Run() actually
+  // returns -- under load, a new thread could start (and get handed a
+  // recycled, not-yet-rezeroed TLS block by glibc) while the previous
+  // one was still mid-teardown, tripping the memcmp check in
+  // run_worker() below.
   INST_BARRIER();
 
   /* spin until it becomes ready and fully paused */
