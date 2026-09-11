@@ -40,6 +40,7 @@
 #include "port.h"
 #include "utils/format.h"
 #include "version.h"
+#include "worker.h"
 
 int main(int argc, char *argv[]) {
   FLAGS_logbuflevel = -1;
@@ -109,6 +110,14 @@ int main(int argc, char *argv[]) {
   }
 
   rte_eal_mp_wait_lcore();
+
+  // KillBess() resumes workers (WorkerPauser's destructor) before
+  // scheduling an async server shutdown, so we get here with workers
+  // still running. worker_threads[] is a namespace-scope global, so its
+  // std::thread destructors run at static-destruction time on process
+  // exit; a still-joinable one calls std::terminate(). Detach them here
+  // instead of leaving that to chance.
+  detach_all_worker_threads();
 
   LOG(INFO) << "BESS daemon has been gracefully shut down";
 

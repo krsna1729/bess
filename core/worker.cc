@@ -192,10 +192,18 @@ void destroy_worker(int wid) {
     while (workers[wid]->status() == WORKER_PAUSED) {
     } /* spin */
 
-    // Wait for the OS thread to fully exit (not just for status_ to have
-    // left WORKER_PAUSED, which happens earlier, inside BlockWorker())
-    // before this wid's slot can be reused. See the comment in
-    // launch_worker().
+    // Wait for the OS thread to fully exit -- not just for status_ to
+    // have left WORKER_PAUSED, which happens earlier, inside
+    // BlockWorker() -- before returning. Worker::Run()'s teardown
+    // (`delete scheduler_`) recursively destroys the TC tree, and every
+    // ~TrafficClass calls TrafficClassBuilder::Clear(), which mutates the
+    // *global, unsynchronized* std::unordered_map
+    // TrafficClassBuilder::all_tcs_ (see traffic_class.cc). Without this
+    // join, the caller (e.g. destroy_all_workers(), or ResetAll's
+    // subsequent ResetTcs() which calls all_tcs_.clear()) could run
+    // concurrently with that teardown still executing on the worker
+    // thread -- a real, unsynchronized concurrent-mutation race on that
+    // map, not merely a benign timing quirk. This join serializes it.
     worker_threads[wid].join();
 
     workers[wid] = nullptr;
@@ -220,6 +228,14 @@ void destroy_worker(int wid) {
 void destroy_all_workers() {
   for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
     destroy_worker(wid);
+  }
+}
+
+void detach_all_worker_threads() {
+  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+    if (worker_threads[wid].joinable()) {
+      worker_threads[wid].detach();
+    }
   }
 }
 
@@ -339,21 +355,32 @@ void *Worker::Run(void *_arg) {
 }
 
 void *run_worker(void *_arg) {
-  // current_worker (a __thread/TLS object) should always start pristine
-  // for a brand new OS thread -- the join() in destroy_worker() (see the
-  // comment in launch_worker() below) ensures a previous worker's OS
-  // thread has fully exited before its wid can be reused, closing the
-  // main way this could go stale. But relying on memcmp-equals-zero
-  // being an absolute guarantee of TLS freshness pushes correctness onto
-  // glibc/kernel thread-teardown timing this code doesn't fully control,
-  // and getting that wrong used to crash the whole daemon (CHECK_EQ)
-  // over what's a harmless-to-fix condition. Reset explicitly instead,
-  // and only warn: robust either way, but still visible if it happens.
+  // current_worker (a __thread/TLS object) should always start zeroed for
+  // a brand new OS thread -- glibc zeroes .tbss-backed TLS synchronously
+  // inside pthread_create(), before the new thread runs a single
+  // instruction, so this is NOT a TLS-reuse timing question. If this
+  // fires, either a real bug wrote to this thread's current_worker before
+  // it got here (which shouldn't be reachable: run_worker() is the
+  // thread's entry point), or -- more plausibly given destroy_worker()'s
+  // join() above exists specifically to prevent concurrent mutation of
+  // TrafficClassBuilder::all_tcs_ during worker teardown -- heap
+  // corruption from that same class of race elsewhere landed on this
+  // block. Either way this is not a condition to silently paper over:
+  // Worker::Run() also never (re)initializes silent_drops_/current_ns_,
+  // so a non-pristine block would otherwise leak stale values into
+  // reported stats forever. Reset explicitly (so the daemon doesn't go
+  // down over it), but log loudly with the actual stale/expected values
+  // so this is diagnosable if it ever fires again.
   const Worker kZeroWorker{};
   if (memcmp(&current_worker, &kZeroWorker, sizeof(Worker)) != 0) {
-    LOG(WARNING) << "current_worker was not pristine at worker thread "
-                    "start; resetting. (stale TLS reuse?)";
-    current_worker = kZeroWorker;
+    const auto *arg = static_cast<const struct thread_arg *>(_arg);
+    LOG(ERROR) << "current_worker was not pristine at the start of worker "
+               << arg->wid << " (core " << arg->core
+               << ") -- resetting. Stale values: wid=" << current_worker.wid()
+               << " core=" << current_worker.core()
+               << " socket=" << current_worker.socket()
+               << " fd_event=" << current_worker.fd_event();
+    memset(&current_worker, 0, sizeof(Worker));
   }
   return current_worker.Run(_arg);
 }
@@ -369,16 +396,24 @@ void launch_worker(int wid, int core,
     CHECK(false) << "Scheduler " << scheduler << " is invalid.";
   }
 
+  // std::thread::operator= calls std::terminate() if the target is still
+  // joinable. That should be impossible here -- destroy_worker() always
+  // joins this wid's thread before clearing workers[wid], and
+  // detach_all_worker_threads() (called once, at daemon shutdown) detaches
+  // any thread still joinable at that point -- but if that invariant is
+  // ever violated by a future change, better to CHECK loudly here than to
+  // let the assignment below abort the daemon with a bare "terminate
+  // called" and no context.
+  CHECK(!worker_threads[wid].joinable())
+      << "worker_threads[" << wid << "] is still joinable; "
+      << "destroy_worker() must join it before this wid can be reused.";
   worker_threads[wid] = std::thread(run_worker, &arg);
-  // Not detached: destroy_worker() joins this thread to make sure the OS
-  // thread (and its __thread current_worker TLS block) has fully exited
-  // before this wid can be reused by a future launch_worker() call. The
-  // old detach()-based version only waited for the status_ flag to leave
-  // WORKER_PAUSED, which BlockWorker() sets *before* Run() actually
-  // returns -- under load, a new thread could start (and get handed a
-  // recycled, not-yet-rezeroed TLS block by glibc) while the previous
-  // one was still mid-teardown, tripping the memcmp check in
-  // run_worker() below.
+  // Not detached: destroy_worker() joins this thread on teardown to
+  // serialize it against concurrent mutation of the global
+  // TrafficClassBuilder::all_tcs_ map during ~Scheduler's TC-tree
+  // destruction (see the comment in destroy_worker() above). This means a
+  // worker thread stays joinable, not detached, until destroy_worker()
+  // (or detach_all_worker_threads() at shutdown) handles it.
   INST_BARRIER();
 
   /* spin until it becomes ready and fully paused */
