@@ -309,13 +309,73 @@ class alignas(64) Packet {
   // Never called; exists purely so the static_asserts in its body run at
   // compile time (a member function body is a "complete-class context",
   // so offsetof(Packet, ...) is legal here even though Packet is still
-  // being defined at this point in the source). Fields from `pool_`
-  // onward moved between DPDK versions -- see the notes in the union
-  // above -- so these checks make sure the hand-written layout there
-  // always matches whatever DPDK headers this is actually compiled
-  // against, instead of silently drifting the way it did between DPDK
-  // 19.11 and 20.11+ (see upstream NetSys/bess#1050).
+  // being defined at this point in the source). This pins every field of
+  // the hand-written overlay above -- both the ones that are known to
+  // have moved between DPDK versions (pool_ onward) and the ones that
+  // happen to still match today (buf_addr_ through buf_len_, including
+  // the rearm_data_/rx_descriptor_fields1_ SIMD-hot fields) -- against
+  // whatever DPDK headers this is actually compiled against, so nothing
+  // here can silently drift on a future DPDK bump the way it did between
+  // DPDK 19.11 and 20.11+ (see upstream NetSys/bess#1050).
   static void CheckMbufLayout() {
+    static_assert(
+        offsetof(Packet, buf_addr_) == offsetof(struct rte_mbuf, buf_addr),
+        "Packet::buf_addr_ offset must match rte_mbuf::buf_addr");
+    static_assert(
+        offsetof(Packet, buf_physaddr_) == offsetof(struct rte_mbuf, buf_iova),
+        "Packet::buf_physaddr_ offset must match rte_mbuf::buf_iova");
+    static_assert(
+        offsetof(Packet, rearm_data_) == offsetof(struct rte_mbuf, rearm_data),
+        "Packet::rearm_data_ offset must match rte_mbuf::rearm_data");
+    static_assert(
+        offsetof(Packet, data_off_) == offsetof(struct rte_mbuf, data_off),
+        "Packet::data_off_ offset must match rte_mbuf::data_off");
+    static_assert(
+        offsetof(Packet, refcnt_) == offsetof(struct rte_mbuf, refcnt),
+        "Packet::refcnt_ offset must match rte_mbuf::refcnt");
+    static_assert(
+        offsetof(Packet, nb_segs_) == offsetof(struct rte_mbuf, nb_segs),
+        "Packet::nb_segs_ offset must match rte_mbuf::nb_segs");
+    static_assert(offsetof(Packet, _dummy0_) == offsetof(struct rte_mbuf, port),
+                  "Packet's port placeholder offset must match "
+                  "rte_mbuf::port");
+    static_assert(
+        offsetof(Packet, _dummy1_) == offsetof(struct rte_mbuf, ol_flags),
+        "Packet's ol_flags placeholder offset must match "
+        "rte_mbuf::ol_flags");
+    static_assert(offsetof(Packet, rx_descriptor_fields1_) ==
+                      offsetof(struct rte_mbuf, rx_descriptor_fields1),
+                  "Packet::rx_descriptor_fields1_ offset must match "
+                  "rte_mbuf::rx_descriptor_fields1");
+    static_assert(offsetof(Packet, _dummy2_) ==
+                      offsetof(struct rte_mbuf, packet_type),
+                  "Packet's packet_type placeholder offset must match "
+                  "rte_mbuf::packet_type");
+    static_assert(
+        offsetof(Packet, pkt_len_) == offsetof(struct rte_mbuf, pkt_len),
+        "Packet::pkt_len_ offset must match rte_mbuf::pkt_len");
+    static_assert(
+        offsetof(Packet, data_len_) == offsetof(struct rte_mbuf, data_len),
+        "Packet::data_len_ offset must match rte_mbuf::data_len");
+    static_assert(
+        offsetof(Packet, _dummy3_) == offsetof(struct rte_mbuf, vlan_tci),
+        "Packet's vlan_tci placeholder offset must match "
+        "rte_mbuf::vlan_tci");
+    static_assert(offsetof(Packet, _dummy4_lo) ==
+                      offsetof(struct rte_mbuf, hash.fdir.lo),
+                  "Packet's fdir.lo placeholder offset must match "
+                  "rte_mbuf::hash.fdir.lo");
+    static_assert(offsetof(Packet, _dummy4_hi) ==
+                      offsetof(struct rte_mbuf, hash.fdir.hi),
+                  "Packet's fdir.hi placeholder offset must match "
+                  "rte_mbuf::hash.fdir.hi");
+    static_assert(offsetof(Packet, _dummy5_) ==
+                      offsetof(struct rte_mbuf, vlan_tci_outer),
+                  "Packet's vlan_tci_outer placeholder offset must match "
+                  "rte_mbuf::vlan_tci_outer");
+    static_assert(
+        offsetof(Packet, buf_len_) == offsetof(struct rte_mbuf, buf_len),
+        "Packet::buf_len_ offset must match rte_mbuf::buf_len");
     static_assert(offsetof(Packet, pool_) == offsetof(struct rte_mbuf, pool),
                   "Packet::pool_ offset must match rte_mbuf::pool");
     static_assert(offsetof(Packet, next_) == offsetof(struct rte_mbuf, next),

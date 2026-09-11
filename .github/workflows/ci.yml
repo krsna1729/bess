@@ -1,21 +1,23 @@
 name: CI
 
-# 2026 CI baseline: GitHub Actions on Ubuntu 24.04, Python 3 only.
-#
-# This intentionally keeps building against the same pinned DPDK 19.11.4 /
-# nefelinetworks/bess_build:bionic container that Travis used -- the C++/DPDK
-# toolchain migration is a separate, larger effort. This workflow only
-# replaces the CI plumbing (Travis -> Actions) and drops Python 2, so we get
-# fast, modern feedback before touching the build system itself.
+# 2026 CI baseline: GitHub Actions on Ubuntu 24.04, Python 3 only, DPDK
+# 25.11 LTS built natively on the runner via Meson/Ninja (see build.py and
+# core/Makefile). This replaced the original version of this workflow,
+# which built against a pinned Ubuntu Bionic / DPDK 19.11.4 container --
+# that container has no meson/ninja and far-too-old compilers for DPDK
+# 25.11, so it can no longer build this tree at all.
 #
 # Known gaps intentionally left for follow-up work:
 #  - core/kmod build/build-test is not run here: it depends on matching
 #    kernel headers on the runner and is a known-broken legacy path on
 #    modern kernels (see upstream NetSys/bess#1056). It is expected to be
 #    made optional entirely once VFIO/AF_XDP become the primary I/O paths.
-#  - The C++ toolchain is still whatever ships in the pinned build
-#    container (g++-7/g++-8/clang-6.0 on Ubuntu Bionic), not a current
-#    compiler. That requires porting off DPDK 19.11 first.
+#  - No sanitizer (ASan/UBSan) or coverage lane yet -- the old workflow
+#    had one via the pinned container's clang-6.0; re-adding one against
+#    a current clang is follow-up work, not re-created here.
+#  - DPDK is rebuilt from source on every run (no cache): it's a genuine
+#    multi-minute build. Worth caching deps/dpdk-*/ keyed on DPDK_VER
+#    once this is otherwise stable.
 
 on:
   push:
@@ -24,9 +26,6 @@ on:
     branches: [master]
 
 env:
-  ASAN_OPTIONS: log_path=/tmp/sanitizer,log_exe_name=1
-  LSAN_OPTIONS: suppressions=${{ github.workspace }}/core/lsan.suppress
-  UBSAN_OPTIONS: suppressions=${{ github.workspace }}/core/ubsan.suppress,print_stacktrace=1
   FIFO_TEST_TIMEOUT: 200
 
 jobs:
@@ -37,13 +36,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: g++-7
-            cxx: g++-7
-          - name: g++-8
-            cxx: g++-8
-          - name: clang-6.0 (sanitize)
-            cxx: clang++-6.0
-            sanitize: "1"
+          - name: g++
+            cxx: g++
+          - name: clang++
+            cxx: clang++
 
     steps:
       - uses: actions/checkout@v4
@@ -54,31 +50,33 @@ jobs:
           sudo mkdir -p /mnt/huge
           sudo mount -t hugetlbfs nodev /mnt/huge
 
-      - name: Set up ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ matrix.name }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ matrix.name }}-
-
       - name: Set up Python 3
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install host dependencies
+      - name: Install build dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang meson ninja-build pkg-config \
+            python3-pyelftools xz-utils \
+            libnuma-dev libpcap-dev zlib1g-dev \
+            libgoogle-glog-dev libgflags-dev libgtest-dev libbenchmark-dev \
+            libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev \
+            protobuf-compiler libsystemd-dev libc-ares-dev libcap-dev
           pip3 install --user -r requirements.txt coverage
 
-      - name: Pull build container
-        run: docker pull nefelinetworks/bess_build:latest
+      - name: Cache DPDK build
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: dpdk-${{ matrix.name }}-${{ hashFiles('build.py') }}
 
-      - name: Build BESS (in container)
+      - name: Build BESS
         env:
           CXX: ${{ matrix.cxx }}
-          SANITIZE: ${{ matrix.sanitize }}
-        run: ./container_build.py bess
+        run: ./build.py bess
 
       - name: Run core unit tests
         working-directory: core
@@ -94,4 +92,3 @@ jobs:
         if: failure()
         run: |
           cat /tmp/bessd.*.INFO.* 2>/dev/null || true
-          sudo cat /tmp/sanitizer* 2>/dev/null || true

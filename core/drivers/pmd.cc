@@ -143,12 +143,13 @@ static CommandResponse find_dpdk_port_by_pci_addr(const std::string &pci,
   const rte_bus *bus = nullptr;
 
   // struct rte_pci_device is opaque in the public API now, so its ->addr
-  // field isn't reachable for rte_pci_addr_cmp() here. Format the target
-  // address the same way DPDK names PCI devices (matching the name[]
-  // construction below) and compare against rte_dev_name() instead.
+  // field isn't reachable for rte_pci_addr_cmp() here. Use DPDK's own
+  // canonical PCI-name formatter (PCI_PRI_FMT: "%.4x:%.2x:%.2x.%x", NOT
+  // "%08x:%02x:%02x.%02x" -- domain is 4 hex digits and function is
+  // unpadded) and compare against rte_dev_name() instead, which returns
+  // exactly this format for PCI devices.
   char target_name[RTE_ETH_NAME_MAX_LEN];
-  snprintf(target_name, sizeof(target_name), "%08x:%02x:%02x.%02x",
-           addr.domain, addr.bus, addr.devid, addr.function);
+  rte_pci_device_name(&addr, target_name, sizeof(target_name));
 
   dpdk_port_t num_dpdk_ports = rte_eth_dev_count_avail();
   for (dpdk_port_t i = 0; i < num_dpdk_ports; i++) {
@@ -172,8 +173,11 @@ static CommandResponse find_dpdk_port_by_pci_addr(const std::string &pci,
   if (port_id == DPDK_PORT_UNKNOWN) {
     int ret;
     char name[RTE_ETH_NAME_MAX_LEN];
-    snprintf(name, RTE_ETH_NAME_MAX_LEN, "%08x:%02x:%02x.%02x", addr.domain,
-             addr.bus, addr.devid, addr.function);
+    // Use the same canonical formatter as target_name above.
+    // rte_eth_dev_get_port_by_name() below does an exact string match
+    // against the port's real (canonically-formatted) name, so this must
+    // match precisely, not just be something rte_pci_addr_parse() accepts.
+    rte_pci_device_name(&addr, name, sizeof(name));
 
     ret = rte_eal_hotplug_add("pci", name, "");
     if (ret < 0) {
