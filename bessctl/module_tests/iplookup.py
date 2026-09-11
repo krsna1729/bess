@@ -47,8 +47,8 @@ class BessIPLookupTest(BessModuleTestCase):
             ipl.delete(prefix='52.22.22.0', prefix_len=24)
 
         pkt_outs = self.run_module(ipl, 0, pkts, [0, 1])
-        self.assertEquals(len(pkt_outs[0]), 1)
-        self.assertEquals(len(pkt_outs[1]), 1)
+        self.assertEqual(len(pkt_outs[0]), 1)
+        self.assertEqual(len(pkt_outs[1]), 1)
         self.assertSamePackets(pkt_outs[0][0], pkts[0])
         self.assertSamePackets(pkt_outs[1][0], pkts[1])
 

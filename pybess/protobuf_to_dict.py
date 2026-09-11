@@ -97,7 +97,10 @@ def protobuf_to_dict(pb, type_callable_map=TYPE_CALLABLE_MAP, use_enum_labels=Fa
         else:
             type_callable = _get_field_value_adaptor(
                 pb, field, type_callable_map, use_enum_labels)
-            if field.label == FieldDescriptor.LABEL_REPEATED:
+            # FieldDescriptor.label was dropped from the upb-backed
+            # FieldDescriptor (the default protobuf Python implementation
+            # since 4.21); is_repeated is the stable replacement.
+            if field.is_repeated:
                 type_callable = repeated(type_callable)
 
         if field.is_extension:
@@ -191,7 +194,8 @@ def _dict_to_protobuf(pb, value, type_callable_map, strict):
         basestr = str
 
     for field, input_value, pb_value in fields:
-        if field.label == FieldDescriptor.LABEL_REPEATED:
+        # See the matching comment in protobuf_to_dict() above.
+        if field.is_repeated:
             if field.message_type and field.message_type.has_options and \
                    field.message_type.GetOptions().map_entry:
                 # Special processing for nested dict

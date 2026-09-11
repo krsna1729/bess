@@ -71,18 +71,18 @@ class BessExactMatchTest(BessModuleTestCase):
         pkt_nomatch = get_tcp_packet(sip='0.12.33.56', dip='12.34.56.78')
 
         pkt_outs = self.run_module(em, 0, [], [0])
-        self.assertEquals(len(pkt_outs[0]), 0)
+        self.assertEqual(len(pkt_outs[0]), 0)
 
         pkt_outs = self.run_module(em, 0, [pkt1], [0, 1, 2, 3])
-        self.assertEquals(len(pkt_outs[1]), 1)
+        self.assertEqual(len(pkt_outs[1]), 1)
         self.assertSamePackets(pkt_outs[1][0], pkt1)
 
         pkt_outs = self.run_module(em, 0, [pkt2], [0, 1, 2, 3])
-        self.assertEquals(len(pkt_outs[2]), 1)
+        self.assertEqual(len(pkt_outs[2]), 1)
         self.assertSamePackets(pkt_outs[2][0], pkt2)
 
         pkt_outs = self.run_module(em, 0, [pkt_nomatch], [0, 1, 2, 3])
-        self.assertEquals(len(pkt_outs[3]), 1)
+        self.assertEqual(len(pkt_outs[3]), 1)
         self.assertSamePackets(pkt_outs[3][0], pkt_nomatch)
 
     def test_exactmatch_with_metadata(self):
@@ -119,7 +119,7 @@ class BessExactMatchTest(BessModuleTestCase):
         for i in range(3):
             pkt_outs = self.run_pipeline(
                 metadata[i], em, 0, [test_packet_in], range(3))
-            self.assertEquals(len(pkt_outs[i]), 1)
+            self.assertEqual(len(pkt_outs[i]), 1)
             self.assertSamePackets(pkt_outs[i][0], test_packet_in)
 
     def test_exactmatch_selfconfig(self):

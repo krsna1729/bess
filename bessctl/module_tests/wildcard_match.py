@@ -87,18 +87,18 @@ class BessWildcardMatchTest(BessModuleTestCase):
 
         pkt_outs = self.run_module(wm, 0, [], range(4))
         for i in range(4):
-            self.assertEquals(len(pkt_outs[i]), 0)
+            self.assertEqual(len(pkt_outs[i]), 0)
 
         pkt_outs = self.run_module(wm, 0, [pkt1], range(4))
-        self.assertEquals(len(pkt_outs[1]), 1)
+        self.assertEqual(len(pkt_outs[1]), 1)
         self.assertSamePackets(pkt_outs[1][0], pkt1)
 
         pkt_outs = self.run_module(wm, 0, [pkt2], range(4))
-        self.assertEquals(len(pkt_outs[2]), 1)
+        self.assertEqual(len(pkt_outs[2]), 1)
         self.assertSamePackets(pkt_outs[2][0], pkt2)
 
         pkt_outs = self.run_module(wm, 0, [pkt_nomatch], range(4))
-        self.assertEquals(len(pkt_outs[3]), 1)
+        self.assertEqual(len(pkt_outs[3]), 1)
         self.assertSamePackets(pkt_outs[3][0], pkt_nomatch)
 
     def test_wildcardmatch_with_metadata(self):
@@ -135,7 +135,7 @@ class BessWildcardMatchTest(BessModuleTestCase):
         for i in range(3):
             pkt_outs = self.run_pipeline(
                 metadata[i], wm, 0, [test_packet_in], range(3))
-            self.assertEquals(len(pkt_outs[i]), 1)
+            self.assertEqual(len(pkt_outs[i]), 1)
             self.assertSamePackets(pkt_outs[i][0], test_packet_in)
 
     def test_wildcardmatch_selfconfig(self):
