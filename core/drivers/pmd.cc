@@ -30,6 +30,7 @@
 
 #include "pmd.h"
 
+#include <rte_bus.h>
 #include <rte_bus_pci.h>
 #include <rte_ethdev.h>
 
@@ -40,15 +41,19 @@ static const rte_eth_conf default_eth_conf(const rte_eth_dev_info &dev_info,
                                            int nb_rxq) {
   rte_eth_conf ret = {};
 
-  ret.link_speeds = ETH_LINK_SPEED_AUTONEG;
-  ret.rxmode.mq_mode = (nb_rxq > 1) ? ETH_MQ_RX_RSS : ETH_MQ_RX_NONE;
+  ret.link_speeds = RTE_ETH_LINK_SPEED_AUTONEG;
+  ret.rxmode.mq_mode = (nb_rxq > 1) ? RTE_ETH_MQ_RX_RSS : RTE_ETH_MQ_RX_NONE;
   ret.rxmode.offloads = 0;
 
   ret.rx_adv_conf.rss_conf = {
       .rss_key = nullptr,
       .rss_key_len = 0,
-      .rss_hf = (ETH_RSS_IP | ETH_RSS_UDP | ETH_RSS_TCP | ETH_RSS_SCTP) &
+      .rss_hf = (RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP |
+                 RTE_ETH_RSS_SCTP) &
                 dev_info.flow_type_rss_offloads,
+      // rte_eth_rss_conf gained this field upstream; DEFAULT (0) preserves
+      // prior behavior (drivers picked their own hash algorithm).
+      .algorithm = RTE_ETH_HASH_FUNCTION_DEFAULT,
   };
 
   return ret;
@@ -62,7 +67,11 @@ void PMDPort::InitDriver() {
 
   for (dpdk_port_t i = 0; i < num_dpdk_ports; i++) {
     rte_eth_dev_info dev_info;
-    rte_eth_dev_info_get(i, &dev_info);
+    if (rte_eth_dev_info_get(i, &dev_info) != 0) {
+      LOG(WARNING) << "rte_eth_dev_info_get(" << static_cast<int>(i)
+                   << ") failed";
+      continue;
+    }
 
     bess::utils::Ethernet::Address lladdr;
     rte_eth_macaddr_get(i, reinterpret_cast<rte_ether_addr *>(lladdr.bytes));
@@ -71,13 +80,14 @@ void PMDPort::InitDriver() {
 
     std::string pci_info;
     if (dev_info.device) {
-      rte_bus *bus = rte_bus_find_by_device(dev_info.device);
-      if (bus && !strcmp(bus->name, "pci")) {
-        rte_pci_device *pci_dev = RTE_DEV_TO_PCI(dev_info.device);
-        pci_info = bess::utils::Format(
-            "%08x:%02hhx:%02hhx.%02hhx %04hx:%04hx  ", pci_dev->addr.domain,
-            pci_dev->addr.bus, pci_dev->addr.devid, pci_dev->addr.function,
-            pci_dev->id.vendor_id, pci_dev->id.device_id);
+      const rte_bus *bus = rte_bus_find_by_device(dev_info.device);
+      if (bus && !strcmp(rte_bus_name(bus), "pci")) {
+        // struct rte_pci_device is opaque in the public API now (only
+        // exposed to driver-SDK builds), so vendor/device IDs aren't
+        // reachable here anymore. The device's name string is already
+        // the PCI address for PCI devices (e.g. "0000:03:00.0"), which
+        // covers what this log line actually needs.
+        pci_info = bess::utils::Format("%s  ", rte_dev_name(dev_info.device));
       }
     }
 
@@ -97,7 +107,11 @@ static CommandResponse find_dpdk_port_by_id(dpdk_port_t port_id,
   if (port_id >= RTE_MAX_ETHPORTS) {
     return CommandFailure(EINVAL, "Invalid port id %d", port_id);
   }
-  if (rte_eth_devices[port_id].state != RTE_ETH_DEV_ATTACHED) {
+  // rte_eth_devices[] is no longer part of the public API (struct rte_bus /
+  // rte_pci_device are opaque now; direct port-state array indexing went
+  // with it) -- rte_eth_dev_is_valid_port() is the current public
+  // equivalent of the old ATTACHED check.
+  if (!rte_eth_dev_is_valid_port(port_id)) {
     return CommandFailure(ENODEV, "Port id %d is not available", port_id);
   }
 
@@ -128,16 +142,25 @@ static CommandResponse find_dpdk_port_by_pci_addr(const std::string &pci,
 
   const rte_bus *bus = nullptr;
 
+  // struct rte_pci_device is opaque in the public API now, so its ->addr
+  // field isn't reachable for rte_pci_addr_cmp() here. Format the target
+  // address the same way DPDK names PCI devices (matching the name[]
+  // construction below) and compare against rte_dev_name() instead.
+  char target_name[RTE_ETH_NAME_MAX_LEN];
+  snprintf(target_name, sizeof(target_name), "%08x:%02x:%02x.%02x",
+           addr.domain, addr.bus, addr.devid, addr.function);
+
   dpdk_port_t num_dpdk_ports = rte_eth_dev_count_avail();
   for (dpdk_port_t i = 0; i < num_dpdk_ports; i++) {
     rte_eth_dev_info dev_info;
-    rte_eth_dev_info_get(i, &dev_info);
+    if (rte_eth_dev_info_get(i, &dev_info) != 0) {
+      continue;
+    }
 
     if (dev_info.device) {
       bus = rte_bus_find_by_device(dev_info.device);
-      if (bus && !strcmp(bus->name, "pci")) {
-        const rte_pci_device *pci_dev = RTE_DEV_TO_PCI(dev_info.device);
-        if (rte_pci_addr_cmp(&addr, &pci_dev->addr) == 0) {
+      if (bus && !strcmp(rte_bus_name(bus), "pci")) {
+        if (strcmp(target_name, rte_dev_name(dev_info.device)) == 0) {
           port_id = i;
           break;
         }
@@ -239,7 +262,10 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
 
   /* Use defaut rx/tx configuration as provided by PMD drivers,
    * with minor tweaks */
-  rte_eth_dev_info_get(ret_port_id, &dev_info);
+  ret = rte_eth_dev_info_get(ret_port_id, &dev_info);
+  if (ret != 0) {
+    return CommandFailure(-ret, "rte_eth_dev_info_get() failed");
+  }
 
   eth_conf = default_eth_conf(dev_info, num_rxq);
   if (arg.loopback()) {
@@ -311,9 +337,11 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
   rte_eth_promiscuous_enable(ret_port_id);
 
   int offload_mask = 0;
-  offload_mask |= arg.vlan_offload_rx_strip() ? ETH_VLAN_STRIP_OFFLOAD : 0;
-  offload_mask |= arg.vlan_offload_rx_filter() ? ETH_VLAN_FILTER_OFFLOAD : 0;
-  offload_mask |= arg.vlan_offload_rx_qinq() ? ETH_VLAN_EXTEND_OFFLOAD : 0;
+  offload_mask |=
+      arg.vlan_offload_rx_strip() ? RTE_ETH_VLAN_STRIP_OFFLOAD : 0;
+  offload_mask |=
+      arg.vlan_offload_rx_filter() ? RTE_ETH_VLAN_FILTER_OFFLOAD : 0;
+  offload_mask |= arg.vlan_offload_rx_qinq() ? RTE_ETH_VLAN_EXTEND_OFFLOAD : 0;
   if (offload_mask) {
     ret = rte_eth_dev_set_vlan_offload(ret_port_id, offload_mask);
     if (ret != 0) {
@@ -392,17 +420,22 @@ void PMDPort::DeInit() {
   rte_eth_dev_stop(dpdk_port_id_);
 
   if (hot_plugged_) {
-    rte_eth_dev_info dev_info;
-    rte_eth_dev_info_get(dpdk_port_id_, &dev_info);
+    rte_eth_dev_info dev_info = {};
+    if (rte_eth_dev_info_get(dpdk_port_id_, &dev_info) != 0) {
+      LOG(WARNING) << "rte_eth_dev_info_get("
+                   << static_cast<int>(dpdk_port_id_) << ") failed";
+      // fall through: dev_info.device is left null, so the existing
+      // "no device" handling below still runs rte_eth_dev_close().
+    }
 
     char name[RTE_ETH_NAME_MAX_LEN];
     int ret;
 
     if (dev_info.device) {
-      rte_bus *bus = rte_bus_find_by_device(dev_info.device);
+      const rte_bus *bus = rte_bus_find_by_device(dev_info.device);
       if (rte_eth_dev_get_name_by_port(dpdk_port_id_, name) == 0) {
         rte_eth_dev_close(dpdk_port_id_);
-        ret = rte_eal_hotplug_remove(bus->name, name);
+        ret = rte_eal_hotplug_remove(rte_bus_name(bus), name);
         if (ret < 0) {
           LOG(WARNING) << "rte_eal_hotplug_remove("
                        << static_cast<int>(dpdk_port_id_)
@@ -423,9 +456,6 @@ void PMDPort::DeInit() {
 }
 
 void PMDPort::CollectStats(bool reset) {
-  packet_dir_t dir;
-  queue_t qid;
-
   if (reset) {
     rte_eth_stats_reset(dpdk_port_id_);
     return;
@@ -448,32 +478,23 @@ void PMDPort::CollectStats(bool reset) {
 
   port_stats_.inc.dropped = stats.imissed;
 
-  // i40e/net_e1000_igb PMD drivers, ixgbevf and net_bonding vdevs don't support
-  // per-queue stats
-  if (driver_ == "net_i40e" || driver_ == "net_i40e_vf" ||
-      driver_ == "net_ixgbe_vf" || driver_ == "net_bonding" ||
-      driver_ == "net_e1000_igb") {
-    // NOTE:
-    // - if link is down, tx bytes won't increase
-    // - if destination MAC address is incorrect, rx pkts won't increase
-    port_stats_.inc.packets = stats.ipackets;
-    port_stats_.inc.bytes = stats.ibytes;
-    port_stats_.out.packets = stats.opackets;
-    port_stats_.out.bytes = stats.obytes;
-  } else {
-    dir = PACKET_DIR_INC;
-    for (qid = 0; qid < num_queues[dir]; qid++) {
-      queue_stats[dir][qid].packets = stats.q_ipackets[qid];
-      queue_stats[dir][qid].bytes = stats.q_ibytes[qid];
-      queue_stats[dir][qid].dropped = stats.q_errors[qid];
-    }
+  // NOTE:
+  // - if link is down, tx bytes won't increase
+  // - if destination MAC address is incorrect, rx pkts won't increase
+  port_stats_.inc.packets = stats.ipackets;
+  port_stats_.inc.bytes = stats.ibytes;
+  port_stats_.out.packets = stats.opackets;
+  port_stats_.out.bytes = stats.obytes;
 
-    dir = PACKET_DIR_OUT;
-    for (qid = 0; qid < num_queues[dir]; qid++) {
-      queue_stats[dir][qid].packets = stats.q_opackets[qid];
-      queue_stats[dir][qid].bytes = stats.q_obytes[qid];
-    }
-  }
+  // Per-queue software stats (rte_eth_stats::q_ipackets/q_ibytes/q_errors/
+  // q_opackets/q_obytes) were removed from DPDK's generic stats struct
+  // upstream -- they were never supported by all PMDs to begin with (see
+  // the driver exclusion list this replaced). Per-queue counters are still
+  // available per-PMD through rte_eth_xstats_get() with driver-specific
+  // named counters (e.g. "rx_q0_packets"), but that needs a real
+  // xstats-name-to-id lookup and cache, not a mechanical field rename, so
+  // it's left as follow-up work; queue_stats[][] simply stays at zero for
+  // now, same as it already did for the drivers above.
 }
 
 int PMDPort::RecvPackets(queue_t qid, bess::Packet **pkts, int cnt) {
@@ -494,9 +515,14 @@ int PMDPort::SendPackets(queue_t qid, bess::Packet **pkts, int cnt) {
 }
 
 Port::LinkStatus PMDPort::GetLinkStatus() {
-  rte_eth_link status;
+  rte_eth_link status = {};
   // rte_eth_link_get() may block up to 9 seconds, so use _nowait() variant.
-  rte_eth_link_get_nowait(dpdk_port_id_, &status);
+  int ret = rte_eth_link_get_nowait(dpdk_port_id_, &status);
+  if (ret != 0) {
+    LOG(WARNING) << "rte_eth_link_get_nowait("
+                 << static_cast<int>(dpdk_port_id_)
+                 << ") failed: " << rte_strerror(-ret);
+  }
 
   return LinkStatus{.speed = status.link_speed,
                     .full_duplex = static_cast<bool>(status.link_duplex),

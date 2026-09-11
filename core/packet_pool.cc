@@ -241,14 +241,17 @@ DpdkPacketPool::DpdkPacketPool(size_t capacity, int socket_id)
 
 static Packet *paddr_to_snb_memchunk(struct rte_mempool_memhdr *chunk,
                                      phys_addr_t paddr) {
-  if (chunk->phys_addr == RTE_BAD_IOVA) {
+  // NOTE: rte_mempool_memhdr's "phys_addr" field was renamed to "iova"
+  // upstream (same uint64_t IO-address type; not a physical-address-only
+  // concept even before the rename). Verified against DPDK 25.11.
+  if (chunk->iova == RTE_BAD_IOVA) {
     return nullptr;
   }
 
-  if (chunk->phys_addr <= paddr && paddr < chunk->phys_addr + chunk->len) {
+  if (chunk->iova <= paddr && paddr < chunk->iova + chunk->len) {
     uintptr_t vaddr;
 
-    vaddr = (uintptr_t)chunk->addr + paddr - chunk->phys_addr;
+    vaddr = (uintptr_t)chunk->addr + paddr - chunk->iova;
     return reinterpret_cast<Packet *>(vaddr);
   }
 

@@ -59,42 +59,44 @@ ifeq "$(CXXCOMPILER)" "g++"
   endif
 endif
 
+# DPDK is consumed entirely through pkg-config (libdpdk.pc), which is only
+# produced by DPDK's Meson build -- the legacy Make build never generated
+# one. See ../build.py, which builds DPDK with Meson/Ninja and installs it
+# under DPDK_INSTALL_DIR below.
+DPDK_VER ?= dpdk-25.11.3
+DPDK_INSTALL_DIR ?= $(abspath ../deps/$(DPDK_VER)/install)
+
 HAS_PKG_CONFIG := $(shell command -v $(PKG_CONFIG) 2>&1 >/dev/null && echo yes || echo no)
+ifneq ($(HAS_PKG_CONFIG), yes)
+  $(error pkg-config is required to build BESS (used to locate DPDK and other dependencies))
+endif
 
-RTE_SDK ?= $(abspath ../deps/dpdk-19.11.4)
-RTE_TARGET ?= $(shell uname -m)-native-linuxapp-gcc
-DPDK_LIB ?= dpdk
+# Prepend, rather than override: a caller-supplied PKG_CONFIG_PATH (e.g. for
+# a system-installed DPDK) still takes priority via normal pkg-config search
+# order, but our own deps/ build is always found.
+#
+# NB: this is baked directly into $(PKG_CONFIG) itself (rather than using
+# "export PKG_CONFIG_PATH := ...") because GNU Make does not reliably apply
+# a same-pass "export" to $(shell ...) calls later in this same file.
+PKG_CONFIG := PKG_CONFIG_PATH=$(DPDK_INSTALL_DIR)/lib/pkgconfig:$(PKG_CONFIG_PATH) $(PKG_CONFIG)
 
-ifneq ($(wildcard $(RTE_SDK)/$(RTE_TARGET)/*),)
-  DPDK_INC_DIR := $(RTE_SDK)/$(RTE_TARGET)/include
-  DPDK_LIB_DIR := $(RTE_SDK)/$(RTE_TARGET)/build/lib
-else ifneq ($(wildcard $(RTE_SDK)/build/*),)
-  # if the user didn't do "make install" for DPDK
-  DPDK_INC_DIR := $(RTE_SDK)/build/include
-  DPDK_LIB_DIR := $(RTE_SDK)/build/lib
-else ifneq ($(MAKECMDGOALS),clean)
-  $(error DPDK is not available. Make sure $(abspath $(RTE_SDK)) is available and built)
+ifeq ($(shell $(PKG_CONFIG) --exists libdpdk && echo yes),)
+  ifneq ($(MAKECMDGOALS),clean)
+    $(error DPDK is not available via pkg-config (looked in $(DPDK_INSTALL_DIR)/lib/pkgconfig). Run '../build.py dpdk' first, or set DPDK_INSTALL_DIR/PKG_CONFIG_PATH)
+  endif
 endif
 
 # We always want these libraries to be dynamically linked even when the
 # user requests a static build.
 ALWAYS_DYN_LIBS := -lpthread -ldl
 # These libraries are not supported by pkg-config.
-ALWAYS_LIBS := -lpcap -lgflags -lnuma
-# If pkg-config is available, we just need a list of the dependecies.
-PKG_CONFIG_DEPS := libglog protobuf grpc++ libunwind zlib
-# If pkg-config is not available, we need to list the libs we depend on.
-NO_PKG_CONFIG_LIBS := -lglog -lgflags -lprotobuf -lgrpc++ -lunwind -lz
-# If pkg-config is not available and we're static linking, we also need
-# the indirect dependecies.  This is annoying, because they may change
-# in future versions.
-NO_PKG_CONFIG_LIBS_INDIRECT := -lgrpc -lssl -lcrypto -llzma
+# -lcap: libsystemd.a (itself pulled in as a bare "-lsystemd" by grpc++'s
+# static Libs, not via a pkg-config Requires.private) needs it when
+# statically linked, but Ubuntu's libsystemd.pc doesn't declare that.
+ALWAYS_LIBS := -lpcap -lgflags -lnuma -lcap
+PKG_CONFIG_DEPS := libdpdk libglog protobuf grpc++ libunwind zlib
 
-ifeq ($(HAS_PKG_CONFIG), yes)
-  PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKG_CONFIG_DEPS))
-else
-  PKG_CFLAGS :=
-endif
+PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKG_CONFIG_DEPS))
 
 # Plugins get to look in $COREDIR through -I $(COREDIR).  Let them also
 # see their own top level directory, e.g., /some/path/to/modules/foo.cc
@@ -110,7 +112,7 @@ endif
 COREDIR := $(abspath .)
 CPU ?= native
 CXXFLAGS += -std=c++17 -g3 -ggdb3 -march=$(CPU) \
-            -isystem $(DPDK_INC_DIR) -isystem $(COREDIR) \
+            -isystem $(COREDIR) \
             -isystem $(dir $<).. -isystem $(COREDIR)/modules \
             -D_GNU_SOURCE \
             -Werror -Wall -Wextra -Wcast-align -Wno-error=deprecated-declarations \
@@ -133,32 +135,35 @@ ifeq "$(shell expr $(CXXCOMPILER) = g++)" "1"
   CXXFLAGS += -fno-gnu-unique
 endif
 
-LDFLAGS += -rdynamic -L$(DPDK_LIB_DIR) -Wl,-rpath=$(DPDK_LIB_DIR) -pthread
+LDFLAGS += -rdynamic -pthread -no-pie
 ifdef BESS_LINK_DYNAMIC
   LIBS_ALL_SHARED = -Wl,-call_shared
   LIBS_DL_SHARED =
-  ifeq ($(HAS_PKG_CONFIG), yes)
-    PKG_LIBS := $(shell $(PKG_CONFIG) --libs $(PKG_CONFIG_DEPS))
-  else
-    PKG_LIBS := $(NO_PKG_CONFIG_LIBS)
-  endif
+  PKG_LIBS := $(shell $(PKG_CONFIG) --libs $(PKG_CONFIG_DEPS))
 else # Used static libraries
   LIBS_ALL_SHARED =
   LIBS_DL_SHARED = -Wl,-call_shared
   LDFLAGS += -static-libstdc++
-  ifeq ($(HAS_PKG_CONFIG), yes)
-    PKG_LIBS := $(shell $(PKG_CONFIG) --static --libs $(PKG_CONFIG_DEPS))
-    # One of our pkg-config dependency might depend on a library that
-    # we want to dynamically link no matter what.  Filter those out
-    # to avoid including them into the static linking section.
-    PKG_LIBS := $(filter-out $(ALWAYS_DYN_LIBS), $(PKG_LIBS))
-  else
-    PKG_LIBS := $(NO_PKG_CONFIG_LIBS) $(NO_PKG_CONFIG_LIBS_INDIRECT)
-  endif
+  PKG_LIBS := $(shell $(PKG_CONFIG) --static --libs $(PKG_CONFIG_DEPS))
+  # One of our pkg-config dependencies might depend on a library that
+  # we want to dynamically link no matter what.  Filter those out
+  # to avoid including them into the static linking section.
+  PKG_LIBS := $(filter-out $(ALWAYS_DYN_LIBS), $(PKG_LIBS))
+  # grpc++'s static Libs (transitively, via c-ares) ask for "-lcares", but
+  # Debian/Ubuntu's libc-ares-dev ships the static archive under a
+  # different name (libcares_static.a) than what -lcares looks for
+  # (libcares.a) -- only libcares.so exists under the plain name, which
+  # doesn't satisfy a -Wl,-non_shared (static-only) link. Point -lcares at
+  # the archive that actually exists instead.
+  PKG_LIBS := $(subst -lcares,-l:libcares_static.a,$(PKG_LIBS))
 endif
 
+# libdpdk's own pkg-config Libs already carry its
+# -Wl,--whole-archive ... -Wl,--no-whole-archive block (needed because
+# DPDK drivers self-register via constructor attributes, so a normal
+# linker would drop "unreferenced" PMD .a members), so PKG_LIBS covers
+# DPDK -- no separate whole-archive handling needed here.
 LIBS += -Wl,-non_shared \
-        -Wl,--whole-archive -l$(DPDK_LIB) -Wl,--no-whole-archive \
         $(LIBS_ALL_SHARED) \
         $(PKG_LIBS) $(ALWAYS_LIBS) \
         $(LIBS_DL_SHARED) \

@@ -402,7 +402,14 @@ class ExactMatchTable {
                                       MAX_FIELD_SIZE));
     }
 
-    if (mt_attr_name.length() > 0) {
+    // Check `m` itself (rather than mt_attr_name.length()) so the
+    // guard directly matches what's dereferenced right below -- the two
+    // AddField() overloads above always pass this pair consistently
+    // (both empty/null, or both set), but phrasing the check this way
+    // lets the compiler actually prove m is non-null here instead of
+    // just trusting that correlation, which newer GCC's -Wnonnull no
+    // longer does across the inlined call.
+    if (m != nullptr) {
       f->attr_id = m->AddMetadataAttr(mt_attr_name, f->size,
                                       metadata::Attribute::AccessMode::kRead);
       if (f->attr_id < 0) {

@@ -261,29 +261,86 @@ class alignas(64) Packet {
       const uint16_t buf_len_;
 
       // offset 56:
-      uint64_t _dummy6_;  // rte_mbuf.timestamp
+      // NOTE: as of DPDK 20.11+, rte_mbuf.pool moved from offset 72 to
+      // here; the fixed "timestamp" field that used to live at this
+      // offset in DPDK <20.11 no longer exists as a static struct member
+      // (see the dynfield1 note below). Verified against DPDK 25.11 via
+      // offsetof(); see the static_asserts after this class definition.
+      struct rte_mempool *pool_;  // Pool from which mbuf was allocated.
 
       // 2nd cacheline - fields only used in slow path or on TX --------------
       // offset 64:
-      uint64_t _dummy7_;  // rte_mbuf.userdata
-
-      // offset 72:
-      struct rte_mempool *pool_;  // Pool from which mbuf was allocated.
-
-      // offset 80:
+      // NOTE: aliases rte_mbuf.next (DPDK <20.11 had "userdata" here).
+      // Any code that hands a multi-segment Packet to real DPDK/PMD code
+      // (which walks rte_mbuf.next, not a BESS-private field) depends on
+      // this offset being correct -- that's exactly what regressed
+      // silently when this struct was last written against DPDK 19.11.
       Packet *next_;  // Next segment. nullptr if not scattered.
 
-      // offset 88:
-      uint64_t _dummy8;   // rte_mbuf.tx_offload
-      uint16_t _dummy9;   // rte_mbuf.priv_size
-      uint16_t _dummy10;  // rte_mbuf.timesync
-      uint32_t _dummy11;  // rte_mbuf.seqn
+      // offset 72:
+      uint64_t _dummy8;  // rte_mbuf.tx_offload
 
-      // offset 104:
+      // offset 80:
+      // rte_mbuf.shinfo (external/indirect buffer support). BESS does not
+      // use rte_pktmbuf_attach_extbuf(), but the field must still be
+      // reserved so later offsets line up with the real struct.
+      uint64_t _dummy_shinfo_;
+
+      // offset 88:
+      uint16_t _dummy9_;   // rte_mbuf.priv_size
+      // offset 90:
+      uint16_t _dummy10_;  // rte_mbuf.timesync
+
+      // offset 92:
+      // rte_mbuf.dynfield1: DPDK's registered-dynamic-field area. Modern
+      // DPDK stores what used to be fixed fields here (timestamp,
+      // userdata, seqn, ...) via rte_mbuf_dynfield_register() instead of
+      // named struct members, so there is no longer a fixed field to
+      // mirror by name. BESS doesn't use dynfields; this is reservation
+      // only, to keep sizeof(Packet) correct.
+      uint32_t _dummy_dynfield1_[9];
+
+      // offset 128:
     };
 
     struct rte_mbuf mbuf_;
   };
+
+  // Never called; exists purely so the static_asserts in its body run at
+  // compile time (a member function body is a "complete-class context",
+  // so offsetof(Packet, ...) is legal here even though Packet is still
+  // being defined at this point in the source). Fields from `pool_`
+  // onward moved between DPDK versions -- see the notes in the union
+  // above -- so these checks make sure the hand-written layout there
+  // always matches whatever DPDK headers this is actually compiled
+  // against, instead of silently drifting the way it did between DPDK
+  // 19.11 and 20.11+ (see upstream NetSys/bess#1050).
+  static void CheckMbufLayout() {
+    static_assert(offsetof(Packet, pool_) == offsetof(struct rte_mbuf, pool),
+                  "Packet::pool_ offset must match rte_mbuf::pool");
+    static_assert(offsetof(Packet, next_) == offsetof(struct rte_mbuf, next),
+                  "Packet::next_ offset must match rte_mbuf::next");
+    static_assert(offsetof(Packet, _dummy8) ==
+                      offsetof(struct rte_mbuf, tx_offload),
+                  "Packet's tx_offload placeholder offset must match "
+                  "rte_mbuf::tx_offload");
+    static_assert(offsetof(Packet, _dummy_shinfo_) ==
+                      offsetof(struct rte_mbuf, shinfo),
+                  "Packet's shinfo placeholder offset must match "
+                  "rte_mbuf::shinfo");
+    static_assert(offsetof(Packet, _dummy9_) ==
+                      offsetof(struct rte_mbuf, priv_size),
+                  "Packet's priv_size placeholder offset must match "
+                  "rte_mbuf::priv_size");
+    static_assert(offsetof(Packet, _dummy10_) ==
+                      offsetof(struct rte_mbuf, timesync),
+                  "Packet's timesync placeholder offset must match "
+                  "rte_mbuf::timesync");
+    static_assert(offsetof(Packet, _dummy_dynfield1_) ==
+                      offsetof(struct rte_mbuf, dynfield1),
+                  "Packet's dynfield1 placeholder offset must match "
+                  "rte_mbuf::dynfield1");
+  }
 
   union {
     char reserve_[SNBUF_RESERVE];

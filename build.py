@@ -87,16 +87,20 @@ BESS_DIR = os.path.dirname(os.path.abspath(__file__))
 DEPS_DIR = '%s/deps' % BESS_DIR
 
 DPDK_URL = 'https://fast.dpdk.org/rel'
-DPDK_VER = 'dpdk-19.11.4'
-DPDK_TARGET = 'x86_64-native-linuxapp-gcc'
+DPDK_VER = 'dpdk-25.11.3'  # current DPDK LTS; see https://core.dpdk.org/roadmap/
 
 kernel_release = cmd('uname -r', quiet=True).strip()
 
 DPDK_DIR = '%s/%s' % (DEPS_DIR, DPDK_VER)
-DPDK_CFLAGS = '"-g -w"'
-DPDK_CONFIG = '%s/build/.config' % DPDK_DIR
+# DPDK is built with Meson/Ninja (the only DPDK build that produces a
+# pkg-config file; the old Make build never did) and installed to its own
+# prefix under DPDK_DIR. core/Makefile finds it via pkg-config, using
+# DPDK_INSTALL_DIR/lib/pkgconfig -- see core/Makefile for the consuming
+# side.
+DPDK_BUILD_DIR = '%s/build' % DPDK_DIR
+DPDK_INSTALL_DIR = '%s/install' % DPDK_DIR
+DPDK_PKGCONFIG_DIR = '%s/lib/pkgconfig' % DPDK_INSTALL_DIR
 
-extra_libs = set()
 cxx_flags = []
 ld_flags = []
 plugins = []
@@ -139,28 +143,6 @@ def check_header(header_file, compiler):
         cmd('rm -f %s %s' % (test_c_file, test_o_file), quiet=True)
 
 
-def check_c_lib(lib):
-    test_c_file = '%s/test.c' % DEPS_DIR
-    test_e_file = '%s/test' % DEPS_DIR
-
-    src = """
-        int main()
-        {
-            return 0;
-        }
-        """
-
-    try:
-        with open(test_c_file, 'w') as fp:
-            fp.write(textwrap.dedent(src))
-
-        return cmd_success('gcc %s -l%s %s %s -o %s' %
-                           (test_c_file, lib, ' '.join(cxx_flags),
-                            ' '.join(ld_flags), test_e_file))
-    finally:
-        cmd('rm -f %s %s' % (test_c_file, test_e_file), quiet=True)
-
-
 def required(header_file, lib_name, compiler):
     if not check_header(header_file, compiler):
         print('Error - #include <%s> failed. Did you install "%s" package?'
@@ -181,6 +163,22 @@ def check_essential():
         print('Error - "make" is not available', file=sys.stderr)
         sys.exit(1)
 
+    if not cmd_success('meson --version'):
+        print('Error - "meson" is not available (needed to build DPDK; '
+              'see https://mesonbuild.com/Getting-meson.html)',
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not cmd_success('ninja --version'):
+        print('Error - "ninja" is not available (needed to build DPDK)',
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not cmd_success('pkg-config --version'):
+        print('Error - "pkg-config" is not available (needed to locate '
+              'DPDK and other dependencies)', file=sys.stderr)
+        sys.exit(1)
+
     required('numa.h', 'libnuma-dev', 'gcc')
     required('pcap/pcap.h', 'libpcap-dev', 'gcc')
     required('zlib.h', 'zlib1g-dev', 'gcc')
@@ -191,64 +189,8 @@ def check_essential():
              'g++')
 
 
-def set_config(filename, config, new_value):
-    with open(filename) as fp:
-        lines = fp.readlines()
-
-    found = False
-    with open(filename, 'w') as fp:
-        for line in lines:
-            if line.startswith(config + '='):
-                found = True
-                line = '%s=%s\n' % (config, new_value)
-            fp.write(line)
-
-    assert found, '"%s" is not found in %s' % (config, filename)
-    print('  %s: %s=%s' % (filename, config, new_value))
-
-
 def is_kernel_header_installed():
     return os.path.isdir("/lib/modules/%s/build" % kernel_release)
-
-
-def check_kernel_headers():
-    # If kernel header is not available, do not attempt to build
-    # any components that require kernel.
-    if not is_kernel_header_installed():
-        set_config(DPDK_CONFIG, 'CONFIG_RTE_EAL_IGB_UIO', 'n')
-        set_config(DPDK_CONFIG, 'CONFIG_RTE_KNI_KMOD', 'n')
-        set_config(DPDK_CONFIG, 'CONFIG_RTE_LIBRTE_KNI', 'n')
-        set_config(DPDK_CONFIG, 'CONFIG_RTE_LIBRTE_PMD_KNI', 'n')
-
-
-def check_bnx():
-    if check_header('zlib.h', 'gcc') and check_c_lib('z'):
-        extra_libs.add('z')
-    else:
-        print(' - "zlib1g-dev" is not available. Disabling BNX2X PMD...')
-        set_config(DPDK_CONFIG, 'CONFIG_RTE_LIBRTE_BNX2X_PMD', 'n')
-
-
-def check_mlx():
-    if check_header('infiniband/ib.h', 'gcc') and check_c_lib('mlx4') and \
-            check_c_lib('mlx5'):
-        extra_libs.add('ibverbs')
-        extra_libs.add('mlx4')
-        extra_libs.add('mlx5')
-    else:
-        print(' - "Mellanox OFED" is not available. '
-              'Disabling MLX4 and MLX5 PMDs...')
-        if check_header('infiniband/verbs.h', 'gcc'):
-            print('   NOTE: "libibverbs-dev" does exist, but it does not '
-                  'work with MLX PMDs. Instead download OFED from '
-                  'http://www.melloanox.com')
-        set_config(DPDK_CONFIG, 'CONFIG_RTE_LIBRTE_MLX4_PMD', 'n')
-        set_config(DPDK_CONFIG, 'CONFIG_RTE_LIBRTE_MLX5_PMD', 'n')
-
-
-def generate_dpdk_extra_mk():
-    with open('core/extra.dpdk.mk', 'w') as fp:
-        fp.write('LIBS += %s\n' % ' '.join(['-l' + lib for lib in extra_libs]))
 
 
 def find_current_plugins():
@@ -280,9 +222,12 @@ def download_dpdk(quiet=False):
         return
     try:
         cmd('mkdir -p %s' % DPDK_DIR)
-        url = '%s/%s.tar.gz' % (DPDK_URL, DPDK_VER)
+        # DPDK stopped shipping .tar.gz releases at some point; .tar.xz is
+        # what's actually published now (only fast.dpdk.org/rel/*.tar.xz
+        # exists for this version, verified when this was written).
+        url = '%s/%s.tar.xz' % (DPDK_URL, DPDK_VER)
         print('Downloading %s ...  ' % url)
-        cmd('curl -s -L %s | tar zx -C %s --strip-components 1' %
+        cmd('curl -s -L %s | tar xJ -C %s --strip-components 1' %
             (url, DPDK_DIR), shell=True)
     except:
         cmd('rm -rf %s' % (DPDK_DIR))
@@ -290,17 +235,21 @@ def download_dpdk(quiet=False):
 
 
 def configure_dpdk():
-    print('Configuring DPDK...')
-    cmd('make -C %s config T=%s' % (DPDK_DIR, DPDK_TARGET))
-
-    check_kernel_headers()
-    check_mlx()
-    generate_dpdk_extra_mk()
+    print('Configuring DPDK (meson)...')
+    meson_args = ['meson', 'setup', DPDK_BUILD_DIR, DPDK_DIR,
+                  '--prefix=%s' % DPDK_INSTALL_DIR,
+                  # Force a fixed, non-multiarch libdir (Debian/Ubuntu
+                  # otherwise install to lib/<triplet>/), so
+                  # DPDK_PKGCONFIG_DIR above is predictable.
+                  '--libdir=lib',
+                  '-Dexamples=']
 
     arch = os.getenv('CPU')
     if arch:
-        print(' - Building DPDK with -march=%s' % arch)
-        set_config(DPDK_CONFIG, "CONFIG_RTE_MACHINE", arch)
+        print(' - Building DPDK with machine=%s' % arch)
+        meson_args.append('-Dmachine=%s' % arch)
+
+    cmd(' '.join(shlex.quote(a) for a in meson_args))
 
 
 def makeflags():
@@ -327,23 +276,27 @@ def makeflags():
     return result
 
 
+def dpdk_is_installed():
+    return os.path.exists('%s/libdpdk.pc' % DPDK_PKGCONFIG_DIR)
+
+
 def build_dpdk():
     check_essential()
     download_dpdk(quiet=True)
-
-    # not configured yet?
-    if not os.path.exists('%s/build' % DPDK_DIR):
-        configure_dpdk()
 
     for f in glob.glob('%s/*.patch' % DEPS_DIR):
         print('Applying patch %s' % f)
         cmd('patch -d %s -N -p1 < %s || true' % (DPDK_DIR, f), shell=True)
 
+    # not configured yet?
+    if not os.path.exists(DPDK_BUILD_DIR):
+        configure_dpdk()
+
     print('Building DPDK...')
-    nproc = int(cmd('nproc', quiet=True))
-    cmd('make -C %s EXTRA_CFLAGS=%s %s' % (DPDK_DIR,
-                                           DPDK_CFLAGS,
-                                           makeflags()))
+    cmd('ninja -C %s %s' % (DPDK_BUILD_DIR, makeflags()))
+
+    print('Installing DPDK to %s...' % DPDK_INSTALL_DIR)
+    cmd('ninja -C %s install' % DPDK_BUILD_DIR)
 
 
 def generate_protobuf_files():
@@ -392,7 +345,7 @@ def generate_protobuf_files():
 def build_bess():
     check_essential()
 
-    if not os.path.exists('%s/build' % DPDK_DIR):
+    if not dpdk_is_installed():
         build_dpdk()
 
     generate_protobuf_files()
@@ -442,7 +395,7 @@ def do_clean():
             '{path}/__init__.pyc {path}/ports/__init__.pyc '
             '{path}/*_pb2_grpc.py* {path}/ports/*_pb2_grpc.py* '
             '{path}/__pycache__ {path}/ports/__pycache__'.format(path=path))
-    cmd('rm -rf %s/build' % DPDK_DIR)
+    cmd('rm -rf %s %s' % (DPDK_BUILD_DIR, DPDK_INSTALL_DIR))
 
 
 def do_dist_clean():
