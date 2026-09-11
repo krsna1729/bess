@@ -40,6 +40,7 @@
 
 #include <cassert>
 #include <climits>
+#include <cstring>
 #include <list>
 #include <string>
 #include <utility>

@@ -111,9 +111,12 @@ int main(int argc, char *argv[]) {
 
   rte_eal_mp_wait_lcore();
 
-  // KillBess() resumes workers (WorkerPauser's destructor) before
-  // scheduling an async server shutdown, so we get here with workers
-  // still running. worker_threads[] is a namespace-scope global, so its
+  // Nothing along the normal shutdown path (`daemon stop` -> PauseAll then
+  // KillBess, or a bare KillBess) ever joins or detaches worker threads --
+  // KillBess() just schedules an async server shutdown and returns, so we
+  // get here with worker threads still alive (paused or, if killed
+  // without a preceding pause, still running) and their handles still
+  // joinable. worker_threads[] is a namespace-scope global, so its
   // std::thread destructors run at static-destruction time on process
   // exit; a still-joinable one calls std::terminate(). Detach them here
   // instead of leaving that to chance.

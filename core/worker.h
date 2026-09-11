@@ -173,15 +173,17 @@ void resume_all_workers();
 void destroy_worker(int wid);
 void destroy_all_workers();
 
-// Detach any worker_threads[] entry that's still joinable. KillBess()
-// resumes workers (WorkerPauser's destructor) before scheduling an async
-// server shutdown, so normal daemon-stop exits main() with workers still
-// running -- call this once, right before process exit, so their
-// std::thread destructors (run at static-destruction time, since
-// worker_threads is a namespace-scope global) don't call std::terminate()
-// over a still-joinable thread. Not a substitute for destroy_worker()'s
-// join() on the actual teardown path (ResetWorkers/DestroyWorker RPCs);
-// this only runs once, at shutdown.
+// Detach any worker_threads[] entry that's still joinable. Nothing on the
+// normal shutdown path (`daemon stop`'s PauseAll+KillBess, or a bare
+// KillBess) ever joins or detaches worker threads -- KillBess() just
+// schedules an async server shutdown and returns -- so main() exits with
+// worker threads still alive (paused, or still running if killed without
+// a preceding pause) and their handles still joinable. Call this once,
+// right before process exit, so their std::thread destructors (run at
+// static-destruction time, since worker_threads is a namespace-scope
+// global) don't call std::terminate() over a still-joinable thread. Not a
+// substitute for destroy_worker()'s join() on the actual teardown path
+// (ResetWorkers/DestroyWorker RPCs); this only runs once, at shutdown.
 void detach_all_worker_threads();
 
 bool is_any_worker_running();
