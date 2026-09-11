@@ -1,5 +1,6 @@
 # Temporary/hidden files
 .*
+!.github/
 *.dump
 cscope.*
 *.vim

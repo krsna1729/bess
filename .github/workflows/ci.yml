@@ -1,0 +1,97 @@
+name: CI
+
+# 2026 CI baseline: GitHub Actions on Ubuntu 24.04, Python 3 only.
+#
+# This intentionally keeps building against the same pinned DPDK 19.11.4 /
+# nefelinetworks/bess_build:bionic container that Travis used -- the C++/DPDK
+# toolchain migration is a separate, larger effort. This workflow only
+# replaces the CI plumbing (Travis -> Actions) and drops Python 2, so we get
+# fast, modern feedback before touching the build system itself.
+#
+# Known gaps intentionally left for follow-up work:
+#  - core/kmod build/build-test is not run here: it depends on matching
+#    kernel headers on the runner and is a known-broken legacy path on
+#    modern kernels (see upstream NetSys/bess#1056). It is expected to be
+#    made optional entirely once VFIO/AF_XDP become the primary I/O paths.
+#  - The C++ toolchain is still whatever ships in the pinned build
+#    container (g++-7/g++-8/clang-6.0 on Ubuntu Bionic), not a current
+#    compiler. That requires porting off DPDK 19.11 first.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  ASAN_OPTIONS: log_path=/tmp/sanitizer,log_exe_name=1
+  LSAN_OPTIONS: suppressions=${{ github.workspace }}/core/lsan.suppress
+  UBSAN_OPTIONS: suppressions=${{ github.workspace }}/core/ubsan.suppress,print_stacktrace=1
+  FIFO_TEST_TIMEOUT: 200
+
+jobs:
+  build-and-test:
+    name: build (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: g++-7
+            cxx: g++-7
+          - name: g++-8
+            cxx: g++-8
+          - name: clang-6.0 (sanitize)
+            cxx: clang++-6.0
+            sanitize: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reserve hugepages
+        run: |
+          sudo sysctl -w vm.nr_hugepages=512
+          sudo mkdir -p /mnt/huge
+          sudo mount -t hugetlbfs nodev /mnt/huge
+
+      - name: Set up ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.name }}-
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install host dependencies
+        run: |
+          pip3 install --user -r requirements.txt coverage
+
+      - name: Pull build container
+        run: docker pull nefelinetworks/bess_build:latest
+
+      - name: Build BESS (in container)
+        env:
+          CXX: ${{ matrix.cxx }}
+          SANITIZE: ${{ matrix.sanitize }}
+        run: ./container_build.py bess
+
+      - name: Run core unit tests
+        working-directory: core
+        run: ./all_test --gtest_shuffle
+
+      - name: Run bessctl/pybess unit tests (Python 3)
+        run: python3 -m unittest discover -v
+
+      - name: Run module tests (Python 3)
+        run: python3 bessctl/run_module_tests.py
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          cat /tmp/bessd.*.INFO.* 2>/dev/null || true
+          sudo cat /tmp/sanitizer* 2>/dev/null || true
