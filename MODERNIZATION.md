@@ -49,7 +49,7 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-11, at commit `cfa82e3b` on `develop`.
+Last updated: 2026-09-11, at commit `ecbdd3bc` on `develop`.
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
@@ -137,11 +137,13 @@ unrelated scapy-version checksum mismatch in `url_filter.py`.
    exit. **Confirmed by direct reproduction before and after the fix**
    (start `bessd`, build an active pipeline, `daemon stop` — crashed
    before, 3/3 clean after). Fixed with a new
-   `detach_all_worker_threads()`, called once at shutdown. (b) 6's root
-   cause was wrong: the review traced glibc's actual TLS init and showed
-   recycled TLS is zeroed synchronously inside `pthread_create()`, before
-   the new thread runs — "stale TLS reuse" was never possible. The `join()`
-   in 6 is still correct, but for a different, more serious reason: it
+   `detach_all_worker_threads()`, called once at shutdown. **(a)'s
+   explanation of *why* workers were still alive turned out to be
+   incomplete/wrong too — see 8.** (b) 6's root cause was wrong: the
+   review traced glibc's actual TLS init and showed recycled TLS is
+   zeroed synchronously inside `pthread_create()`, before the new thread
+   runs — "stale TLS reuse" was never possible. The `join()` in 6 is
+   still correct, but for a different, more serious reason: it
    serializes worker teardown (`~Scheduler` → `~TrafficClass` →
    `TrafficClassBuilder::Clear()`) against the **global, unsynchronized**
    `std::unordered_map all_tcs_` (`core/traffic_class.cc`, confirmed no
@@ -158,6 +160,36 @@ unrelated scapy-version checksum mismatch in `url_filter.py`.
    6's fix direction was right, its explanation wasn't, and that
    explanation being wrong is exactly what let the shutdown regression
    through unnoticed.
+8. **`ecbdd3bc`** — A *second* Opus review, of commit 7 specifically,
+   verdict: **"correct and sufficient", no correctness defect found**
+   (this review also independently re-audited every process-exit path —
+   `exit()` call sites, `LOG(FATAL)`/`CHECK` → `GoPanic` → `_exit`/`abort`,
+   signal handling via `SetTrapHandler` (only `SIGSEGV/BUS/ILL/FPE/
+   ABRT/USR1`, not `SIGTERM`/`SIGINT`) — and confirmed `main()`'s
+   `return 0` really is the only route to static destruction, so
+   `detach_all_worker_threads()`'s placement is sufficient, not just
+   lucky). Two things it did flag, both fixed in this commit: 7's own
+   comments (and its commit message, and entry 7 above) claimed workers
+   are alive at shutdown *because* `KillBess()`'s `WorkerPauser`
+   destructor resumes them — true only for a bare `kill()` RPC. The
+   actual `daemon stop` path (`bessctl/commands.py` `_do_stop`) calls
+   `pause_all()` *before* `kill()`, so every worker is already
+   `WORKER_PAUSED` by the time `KillBess()` runs, and `WorkerPauser`'s
+   constructor only records workers it finds `WORKER_RUNNING` — nothing
+   for its destructor to resume in this path. The real, simpler reason:
+   nothing on the shutdown path ever joined or detached workers at all,
+   regardless of paused/running state. Comments corrected; the fix
+   itself was never affected by this (`detach_all_worker_threads()`
+   handles both cases identically). Also added an explicit `<cstring>`
+   include `worker.cc` was missing (used `memcmp`/`memset` via a
+   transitive include only). **Flagged, not fixed** (see backlog): in the
+   bare-`kill()`-without-pause-first case, `detach_all_worker_threads()`
+   abandons workers that are still actively scheduling, which then keep
+   running while the globals they touch are being torn down by static
+   destruction — this exactly matches pre-`49f1ec86` behavior
+   (detach-at-launch), so it's not a regression, but a stronger fix would
+   `destroy_all_workers()` before the detach loop, trading "shutdown
+   always completes promptly" for "a wedged worker can hang shutdown".
 
 ## Review process established this session
 
@@ -199,6 +231,14 @@ it's a standing instruction from the user, not a one-time thing.
 - [ ] Commit author on all commits this session is `root@PARAM.localdomain`
       — cosmetic, but ask the user before fixing (would require amending
       already-pushed commits).
+- [ ] `detach_all_worker_threads()` (added in `cfa82e3b`) abandons still
+      actively-scheduling workers in the bare-`kill()`-without-pause-first
+      shutdown case (not the normal `daemon stop` path, which pauses
+      first) — matches pre-`49f1ec86` behavior exactly, so not a
+      regression, but a stronger fix would call `destroy_all_workers()`
+      before the detach loop in `core/main.cc`. Trade-off: that makes a
+      wedged worker able to hang shutdown, which is presumably why the
+      minimal fix was chosen instead. See commit 8 in the log above.
 
 ---
 
