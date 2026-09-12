@@ -49,7 +49,7 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-12, at commit `f79c20c8` on `develop`.
+Last updated: 2026-09-12, at commit `667c48a8` on `develop`.
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
@@ -206,20 +206,51 @@ was actually a real checksum bug (see commit 9 below), now fixed.
    hoisted ahead of the `ip->length = ...` write — verified by hand-computing
    the checksum for that exact "stale length" hypothesis and matching it
    exactly against BESS's actual wrong output (`0xb023` vs. correct
-   `0xaff1`). `-fno-strict-aliasing` was tried first and did **not** fix
-   it. Fixed all 10 blocks with `asm volatile(... : "memory")`. Also found
-   a subtler variant of the same bug specific to
-   `Verify`/`CalculateIpv4NoOptChecksum`: both had a plain
-   `uint32_t sum = buf32[0];` C statement *preceding* the asm block — a
-   "memory" clobber only fences things around the asm statement itself,
-   so it does nothing to stop an earlier plain load from being hoisted
-   even further up. Fixed by folding that read into the asm's own memory
-   operand list instead. Verified: `core/all_test` 181/181,
-   `run_module_tests.py` clean including `test_urlfilter`, live `bessd`
-   rebuilt and re-run under `-m 0` with no regressions. **Not yet
-   reviewed by Opus** (pending, per standing review-at-milestones
-   instruction — this touches correctness-critical low-level code used by
-   every IP/UDP/TCP-touching module).
+   `0xaff1`). `-fno-strict-aliasing` was tried first and *appeared* not to
+   fix it — **this test turned out to be invalid, see commit 10.** Fixed
+   all 10 blocks with `asm volatile(... : "memory")`. Also found a subtler
+   variant of the same bug specific to `Verify`/`CalculateIpv4NoOptChecksum`:
+   both had a plain `uint32_t sum = buf32[0];` C statement *preceding* the
+   asm block — a "memory" clobber only fences things around the asm
+   statement itself, so it does nothing to stop an earlier plain load from
+   being hoisted even further up. Fixed by folding that read into the
+   asm's own memory operand list instead. Verified: `core/all_test`
+   181/181, `run_module_tests.py` clean including `test_urlfilter`, live
+   `bessd` rebuilt and re-run under `-m 0` with no regressions.
+10. **`667c48a8`** — An **Opus review of commit 9** found it was
+    incomplete: 4 of the 10 asm blocks use a `"g"` (general) operand for a
+    masked/shifted read — e.g. `[u2] "g"(buf32[2] & 0xFFFF)` in
+    `CalculateIpv4NoOptChecksum`/`CalculateIpv4Checksum`, the equivalent
+    in `CalculateIpv4UdpChecksum`, and `[u4] "g"(buf32[4] >> 16)` in
+    `CalculateIpv4TcpChecksum`. A `"g"` operand's expression is evaluated
+    as an ordinary C load *before* the asm executes — it is not an asm
+    memory reference at all, so 9's `"memory"` clobber does nothing to
+    protect it. **The review reproduced a live miscompile from this**: a
+    real copy-template → set-length → checksum shape (matching
+    `flowgen.cc`/`l4_checksum.cc`'s UDP path) at `-O3` store-forwards the
+    stale template's `udp->length` into the `"g"` operand instead of the
+    just-written value. It doesn't reproduce in this repo's own
+    `ChecksumTest.UdpChecksum` — coincidental code shape around it happens
+    to prevent the reorder there — which is exactly why it went
+    undetected: working by luck, not by a closed hazard. The review also
+    determined commit 9's `-fno-strict-aliasing` claim was backwards:
+    that flag **does** eliminate this whole class; the original in-session
+    test of it was almost certainly invalid (Make doesn't recompile a
+    `.o` on a Makefile-only flag change — the same gotcha noted earlier
+    in this doc's "how to build" section). Fixed by introducing
+    `may_alias`-attributed pointer typedefs (`aliasing_uint16_t/32_t/64_t`)
+    and using them for every `reinterpret_cast` in the file that type-puns
+    into a packed header or raw byte buffer — this closes the hazard at
+    the pointer-type level for *every* read through these pointers
+    (asm operand or plain C expression alike), rather than depending on
+    each future edit picking the right asm-operand constraint. Same
+    technique the file already used for the AVX2 path's 16-bit union.
+    Makes 9's `volatile`/`"memory"` additions belt-and-suspenders rather
+    than load-bearing. Verified: `core/all_test` 181/181,
+    `run_module_tests.py` clean, live `bessd` rebuilt with no regressions.
+    **Not yet reviewed by Opus** (pending — this is itself a fix to a
+    commit that only passed review after a second, more careful pass;
+    get independent eyes on it too before pushing).
 
 ## Review process established this session
 
