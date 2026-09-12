@@ -49,7 +49,7 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-12, at commit `e8545843` on `develop`.
+Last updated: 2026-09-12, at commit `68d2b677` on `develop`.
 
 **CI is fully green** (both `build (g++)` and `build (clang++)` jobs
 passing — run 34700531733) for the first time this session. Getting here
@@ -396,6 +396,52 @@ rather than one call site).
     full test pass under both compilers from a clean tree, which is
     the strongest form of verification available for "does the code
     still do the same thing" questions like these).
+14. **`e8545843`** — Built and ran the benchmark suite. Correcting this
+    doc's own earlier, wrong claim ("no benchmark suite exists yet"):
+    BESS already had one (`utils/checksum_bench.cc`, `copy_bench.cc`,
+    `cuckoo_map_bench.cc`, `modules/url_filter_bench.cc`,
+    `traffic_class_bench.cc`), and `core/Makefile` already fully supports
+    it (`make benchmarks`) — none of it needed building from scratch.
+    The actual gap: `build.py`'s `build_bess()` (what CI calls) never ran
+    `make ... benchmarks`, so this whole pre-existing suite had never
+    been built or run against the DPDK 25.11 port this entire session,
+    despite the port touching code some of it depends on. Verified all 5
+    by actually running each (not just compiling) — all pass;
+    `cuckoo_map_bench` looked hung under a 30s timeout at first (false
+    alarm — 22 cases up to 4M entries just need more wall time, confirmed
+    fine with `--benchmark_min_time=0.001s`). Added `core/packet_bench.cc`
+    (the one genuinely new file): `Packet`/`PacketPool`/`PacketBatch`
+    benchmarks using `PlainPacketPool` (the no-hugepage-required backend,
+    "for standalone benchmarks and unittests" per its own doc comment) —
+    exactly the primitives the proposed Phase B refactor would touch.
+    Fixed the actual gap: added `benchmarks` to `build.py`'s
+    `build_bess()`, added a CI "Smoke-test benchmarks" step (crash/hang
+    check via tiny `--benchmark_min_time`, not perf tracking — runner
+    variance makes that unreliable in CI). See Phase B's "Benchmark
+    suite" section below for the full writeup, including what's still
+    not covered (PMD-level and Module/Gate/Task-dispatch benchmarks).
+15. **`68d2b677`** — Pushing commit 14 (and the doc commit after it)
+    exposed a real, independent CI reliability bug: two runs in a row
+    (both doc-only commits — could not have been a real regression)
+    crashed with "Illegal instruction (core dumped)" a fraction of a
+    second into `all_test`, clang++ job only. Root cause: DPDK's meson
+    build defaults to `-march=native`, and the "Cache DPDK build" step
+    persists that compiled DPDK across CI runs — but different runs
+    aren't guaranteed the same actual GitHub-hosted runner hardware, so
+    a `native` build compiled for one run's CPU can contain instructions
+    a later run's CPU lacks. Fixed with `CPU=corei7` (a workflow env var;
+    already supported end-to-end with zero code changes — `build.py`
+    already forwards `CPU` to DPDK's `-Dmachine=`, `core/Makefile`'s
+    `CPU ?= native` already respects an inherited environment value).
+    `corei7` is DPDK's own documented portable baseline (what
+    `-Dmachine=generic` resolves to on x86). Also fixed the cache key
+    (didn't depend on `CPU` at all, so today's fix would've been
+    silently ineffective — the old `native`-built cache would just keep
+    getting served under the same key). Verified locally end-to-end
+    before pushing: built DPDK fresh with `-Dmachine=corei7` in a
+    separate tree, built BESS against it, ran the full test suite
+    (183/183) and every benchmark — no regressions, just the existing
+    `#if __AVX2__` fallback paths taken at compile time.
 
 ## Review process established this session
 
