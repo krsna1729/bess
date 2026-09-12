@@ -109,7 +109,8 @@ static inline uint32_t CalculateSum(const void *buf, size_t len) {
   // Repeat 64-bit one's complement sum (at sum64) including carrys
   // 8 additions in a loop
   while (len >= sizeof(uint64_t) * 8) {
-    asm("addq %[u0], %[sum] \n\t"
+    asm volatile(
+        "addq %[u0], %[sum] \n\t"
         "adcq %[u1], %[sum] \n\t"
         "adcq %[u2], %[sum] \n\t"
         "adcq %[u3], %[sum] \n\t"
@@ -121,7 +122,8 @@ static inline uint32_t CalculateSum(const void *buf, size_t len) {
         : [sum] "+r"(sum64)
         : [u0] "m"(buf64[0]), [u1] "m"(buf64[1]), [u2] "m"(buf64[2]),
           [u3] "m"(buf64[3]), [u4] "m"(buf64[4]), [u5] "m"(buf64[5]),
-          [u6] "m"(buf64[6]), [u7] "m"(buf64[7]));
+          [u6] "m"(buf64[6]), [u7] "m"(buf64[7])
+        : "memory");
     len -= sizeof(uint64_t) * 8;
     buf64 += 8;
   }
@@ -129,11 +131,13 @@ static inline uint32_t CalculateSum(const void *buf, size_t len) {
   while (len >= sizeof(uint64_t) * 2) {
     // Repeat 64-bit one's complement sum (at sum64) including carrys
     // 2 additions in a loop
-    asm("addq %[u0], %[sum] \n\t"
+    asm volatile(
+        "addq %[u0], %[sum] \n\t"
         "adcq %[u1], %[sum] \n\t"
         "adcq $0, %[sum]"
         : [sum] "+r"(sum64)
-        : [u0] "m"(buf64[0]), [u1] "m"(buf64[1]));
+        : [u0] "m"(buf64[0]), [u1] "m"(buf64[1])
+        : "memory");
     len -= sizeof(uint64_t) * 2;
     buf64 += 2;
   }
@@ -210,18 +214,30 @@ static inline bool VerifyGenericChecksum(const void *buf, size_t len) {
 // Returns true if the IP checksum is correct
 static inline bool VerifyIpv4NoOptChecksum(const Ipv4 &iph) {
   const uint32_t *buf32 = reinterpret_cast<const uint32_t *>(&iph);
-  uint32_t sum = buf32[0];
+  uint32_t sum;
 
   // Calculate internet checksum, the optimized way is
   // 1. get 32-bit one's complement sum including carrys
-  asm("addl %[u1], %[sum]   \n\t"
+  //
+  // buf32[0] must be read here, inside the asm's memory operands, rather
+  // than via a preceding plain C `sum = buf32[0]` statement: a plain load
+  // is not ordered by the asm's "memory" clobber (that clobber only
+  // fences things *after* the asm executes), so it can still be hoisted
+  // ahead of a caller's write to the same bytes through a different
+  // pointer type when this function is inlined. See
+  // CalculateIpv4NoOptChecksum() below and MODERNIZATION.md for the
+  // confirmed repro of exactly this reordering.
+  asm volatile(
+      "movl %[u0], %[sum]   \n\t"
+      "addl %[u1], %[sum]   \n\t"
       "adcl %[u2], %[sum]   \n\t"
       "adcl %[u3], %[sum]   \n\t"
       "adcl %[u4], %[sum]   \n\t"
       "adcl $0, %[sum]        \n\t"
-      : [sum] "+r"(sum)
-      : [u1] "m"(buf32[1]), [u2] "m"(buf32[2]), [u3] "m"(buf32[3]),
-        [u4] "m"(buf32[4]));
+      : [sum] "=&r"(sum)
+      : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [u2] "m"(buf32[2]),
+        [u3] "m"(buf32[3]), [u4] "m"(buf32[4])
+      : "memory");
 
   // 2. reduce to 16-bit unsigned integer and negate
   return FoldChecksum(sum) == 0;
@@ -232,19 +248,43 @@ static inline bool VerifyIpv4NoOptChecksum(const Ipv4 &iph) {
 // It does not set the checksum field in ip header
 static inline uint16_t CalculateIpv4NoOptChecksum(const Ipv4 &iph) {
   const uint32_t *buf32 = reinterpret_cast<const uint32_t *>(&iph);
-  uint32_t sum = buf32[0];
+  uint32_t sum;
 
   // Calculate internet checksum, the optimized way is
   // 1. get 32-bit one's complement sum including carrys
-  asm("addl %[u1], %[sum]    \n\t"
+  //
+  // This asm block (and every other one in this file) must be `volatile`
+  // with a "memory" clobber: without both, nothing tells the compiler
+  // that these memory reads need to observe prior writes to the same
+  // buffer through *other* pointer types (e.g. the Ipv4*/Tcp* field
+  // assignments callers do just before calling into these functions).
+  // Confirmed by direct reproduction: without this, GCC 13 at -O3 was
+  // observed hoisting a read of buf32[0] (ip.length, among other
+  // fields) *before* a preceding `ip->length = ...` write when this
+  // function got inlined into url_filter.cc's Generate403Packet(),
+  // silently computing the checksum over the wrong (stale template
+  // default) length field. See MODERNIZATION.md for the full
+  // investigation.
+  //
+  // Note buf32[0] is read here as an asm memory operand rather than via
+  // a preceding plain C `sum = buf32[0]` statement: a plain load sits
+  // *before* this asm in program order, so the asm's "memory" clobber
+  // (which only fences things after it executes) would not stop the
+  // compiler from still hoisting that plain load ahead of the caller's
+  // write. Folding the read into the asm's operand list is what actually
+  // closes the reordering window.
+  asm volatile(
+      "movl %[u0], %[sum]    \n\t"
+      "addl %[u1], %[sum]    \n\t"
       "adcl %[u2], %[sum]    \n\t"
       "adcl %[u3], %[sum]    \n\t"
       "adcl %[u4], %[sum]    \n\t"
       "adcl $0, %[sum]       \n\t"
-      : [sum] "+r"(sum)
-      : [u1] "m"(buf32[1]),
+      : [sum] "=&r"(sum)
+      : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]),
         [u2] "g"(buf32[2] & 0xFFFF),  // skip checksum fields
-        [u3] "m"(buf32[3]), [u4] "m"(buf32[4]));
+        [u3] "m"(buf32[3]), [u4] "m"(buf32[4])
+      : "memory");
 
   // 2. reduce to 16-bit unsigned integer and negate
   return FoldChecksum(sum);
@@ -268,7 +308,8 @@ static inline bool VerifyIpv4Checksum(const Ipv4 &iph) {
 
   // Calculate internet checksum, the optimized way is
   // 1. get 32-bit one's complement sum including carrys
-  asm("addl %[u0], %[sum]   \n\t"
+  asm volatile(
+      "addl %[u0], %[sum]   \n\t"
       "adcl %[u1], %[sum]   \n\t"
       "adcl %[u2], %[sum]   \n\t"
       "adcl %[u3], %[sum]   \n\t"
@@ -276,7 +317,8 @@ static inline bool VerifyIpv4Checksum(const Ipv4 &iph) {
       "adcl $0, %[sum]        \n\t"
       : [sum] "+r"(sum)
       : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [u2] "m"(buf32[2]),
-        [u3] "m"(buf32[3]), [u4] "m"(buf32[4]));
+        [u3] "m"(buf32[3]), [u4] "m"(buf32[4])
+      : "memory");
 
   // 2. reduce to 16-bit unsigned integer and negate
   return FoldChecksum(sum) == 0;
@@ -302,7 +344,8 @@ static inline uint16_t CalculateIpv4Checksum(const Ipv4 &iph) {
 
   // Calculate internet checksum, the optimized way is
   // 1. get 32-bit one's complement sum including carrys
-  asm("addl %[u0], %[sum]    \n\t"
+  asm volatile(
+      "addl %[u0], %[sum]    \n\t"
       "adcl %[u1], %[sum]    \n\t"
       "adcl %[u2], %[sum]    \n\t"
       "adcl %[u3], %[sum]    \n\t"
@@ -311,7 +354,8 @@ static inline uint16_t CalculateIpv4Checksum(const Ipv4 &iph) {
       : [sum] "+r"(sum)
       : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]),
         [u2] "g"(buf32[2] & 0xFFFF),  // skip checksum fields
-        [u3] "m"(buf32[3]), [u4] "m"(buf32[4]));
+        [u3] "m"(buf32[3]), [u4] "m"(buf32[4])
+      : "memory");
 
   // 2. reduce to 16-bit unsigned integer and negate
   return FoldChecksum(sum);
@@ -336,7 +380,8 @@ static inline bool VerifyIpv4UdpChecksum(const Udp &udph, be32_t src_ip,
   uint32_t len = static_cast<uint32_t>(be16_t::swap(udp_len));
 
   // Calculate the checksum of UDP header and pseudo header
-  asm("addl %[u0], %[sum]      \n\t"
+  asm volatile(
+      "addl %[u0], %[sum]      \n\t"
       "adcl %[u1], %[sum]      \n\t"
       "adcl %[src], %[sum]     \n\t"
       "adcl %[dst], %[sum]     \n\t"
@@ -345,7 +390,8 @@ static inline bool VerifyIpv4UdpChecksum(const Udp &udph, be32_t src_ip,
       "adcl $0, %[sum]         \n\t"
       : [sum] "+r"(sum)
       : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [src] "r"(src_ip.raw_value()),
-        [dst] "r"(dst_ip.raw_value()), [len] "r"(len));
+        [dst] "r"(dst_ip.raw_value()), [len] "r"(len)
+      : "memory");
 
   return FoldChecksum(sum) == 0;
 }
@@ -377,7 +423,8 @@ static inline uint16_t CalculateIpv4UdpChecksum(const Udp &udph, be32_t src,
   uint32_t len = static_cast<uint32_t>(be16_t::swap(udp_len));
 
   // Calculate the checksum of UDP header and pseudo header
-  asm("addl %[u0], %[sum]      \n\t"
+  asm volatile(
+      "addl %[u0], %[sum]      \n\t"
       "adcl %[u1], %[sum]      \n\t"
       "adcl %[src], %[sum]     \n\t"
       "adcl %[dst], %[sum]     \n\t"
@@ -386,7 +433,8 @@ static inline uint16_t CalculateIpv4UdpChecksum(const Udp &udph, be32_t src,
       "adcl $0, %[sum]         \n\t"
       : [sum] "+r"(sum)
       : [u0] "m"(buf32[0]), [u1] "g"(buf32[1] & 0xFFFF),  // skip checksum field
-        [src] "r"(src.raw_value()), [dst] "r"(dst.raw_value()), [len] "r"(len));
+        [src] "r"(src.raw_value()), [dst] "r"(dst.raw_value()), [len] "r"(len)
+      : "memory");
 
   // If the result of UDP checksum calculation is 0, return all ones (rfc 768)
   return FoldChecksum(sum) ?: 0xFFFF;
@@ -420,7 +468,8 @@ static inline bool VerifyIpv4TcpChecksum(const Tcp &tcph, be32_t src_ip,
   uint32_t len = static_cast<uint32_t>(be16_t::swap(tcp_len));
 
   // Calculate the checksum of TCP header and pseudo header
-  asm("addl %[u0], %[sum]      \n\t"
+  asm volatile(
+      "addl %[u0], %[sum]      \n\t"
       "adcl %[u1], %[sum]      \n\t"
       "adcl %[u2], %[sum]      \n\t"
       "adcl %[u3], %[sum]      \n\t"
@@ -433,7 +482,8 @@ static inline bool VerifyIpv4TcpChecksum(const Tcp &tcph, be32_t src_ip,
       : [sum] "+r"(sum)
       : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [u2] "m"(buf32[2]),
         [u3] "m"(buf32[3]), [u4] "m"(buf32[4]), [src] "r"(src_ip.raw_value()),
-        [dst] "r"(dst_ip.raw_value()), [len] "r"(len));
+        [dst] "r"(dst_ip.raw_value()), [len] "r"(len)
+      : "memory");
 
   return FoldChecksum(sum) == 0;
 }
@@ -467,7 +517,8 @@ static inline uint16_t CalculateIpv4TcpChecksum(const Tcp &tcph, be32_t src,
   uint32_t len = static_cast<uint32_t>(be16_t::swap(tcp_len));
 
   // Calculate the checksum of TCP header and pseudo header
-  asm("addl %[u0], %[sum]      \n\t"
+  asm volatile(
+      "addl %[u0], %[sum]      \n\t"
       "adcl %[u1], %[sum]      \n\t"
       "adcl %[u2], %[sum]      \n\t"
       "adcl %[u3], %[sum]      \n\t"
@@ -481,7 +532,8 @@ static inline uint16_t CalculateIpv4TcpChecksum(const Tcp &tcph, be32_t src,
       : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [u2] "m"(buf32[2]),
         [u3] "m"(buf32[3]),
         [u4] "g"(buf32[4] >> 16),  // skip checksum field
-        [src] "r"(src.raw_value()), [dst] "r"(dst.raw_value()), [len] "r"(len));
+        [src] "r"(src.raw_value()), [dst] "r"(dst.raw_value()), [len] "r"(len)
+      : "memory");
 
   return FoldChecksum(sum);
 }
