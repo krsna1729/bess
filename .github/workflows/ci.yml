@@ -50,22 +50,24 @@ jobs:
           sudo mkdir -p /mnt/huge
           sudo mount -t hugetlbfs nodev /mnt/huge
 
-      - name: Set up Python 3
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang meson ninja-build pkg-config \
-            python3-pyelftools xz-utils \
+            python3-pip python3-pyelftools xz-utils \
             libnuma-dev libpcap-dev zlib1g-dev \
             libgoogle-glog-dev libgflags-dev libgtest-dev libbenchmark-dev \
             libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev \
             protobuf-compiler libsystemd-dev libc-ares-dev libcap-dev
-          pip3 install --user -r requirements.txt coverage
+          # Deliberately not using actions/setup-python: it swaps python3 to
+          # a hosted interpreter that can't see apt-installed modules like
+          # the pyelftools above (DPDK's meson build needs it), and
+          # ubuntu-24.04 already ships Python 3.12 as the system python3.
+          # --break-system-packages: Ubuntu 24.04's system Python enforces
+          # PEP 668; there's no venv here to isolate into, and this runner
+          # is single-purpose/ephemeral anyway.
+          pip3 install --break-system-packages -r requirements.txt coverage
 
       - name: Cache DPDK build
         uses: actions/cache@v4
