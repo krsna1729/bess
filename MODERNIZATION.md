@@ -608,3 +608,103 @@ for style (simple loops stay easier to verify in generated assembly);
 exceptions for *expected* errors anywhere; hiding `native_mbuf()`-style
 DPDK escape hatches from advanced modules (Phase B's `PacketRef` should
 still expose the real `rte_mbuf*` for code that needs it).
+
+## Phase I — Compile-time invalid-state prevention (proposed 2026-09-12, not started)
+
+Cross-cutting principle proposed alongside G/H, prompted by a pattern in
+this session's own bug log: the `rte_mbuf` ABI drift, the PCI-format bug,
+ignored return values, and `DCHECK`-only invariants (disappears under
+`-DNDEBUG`) were all bugs the type system could plausibly have caught at
+compile time, while the `worker.cc`/`all_tcs_` races (commits 6-8) were
+not — they're lifetime/synchronization bugs, found only by actually
+running the daemon under load. Keep that distinction explicit rather than
+over-claiming what stronger types buy: **use the compiler aggressively for
+identity, ownership, units, layout, and interface shape; use runtime
+synchronization and load-bearing tests for concurrency and lifetime
+ordering.**
+
+Several of the highest-value items are already captured in Phase H above
+— `std::expected`, strong ID types (`GateId`/`WorkerId`/`QueueId`/`PortId`),
+concepts (`BessModule`, `PortDriver`), `consteval` network literals,
+`std::span`, `std::jthread` for management-side jobs, ABI `static_assert`s.
+Don't duplicate those; this phase covers what isn't in Phase H yet:
+
+- **Scoped enums** for status/policy values currently mixed with plain
+  integers (`worker_status_t`, `resource_t`'s `RESOURCE_COUNT`/
+  `RESOURCE_CYCLE`/etc., traffic-class policy identifiers) → `enum class`.
+  Zero runtime cost; stops accidental cross-domain comparison/arithmetic.
+- **Typed resource/accounting arrays**: replace
+  `typedef uint64_t resource_arr_t[NUM_RESOURCES]` plus raw
+  `usage[RESOURCE_COUNT]` indexing with a small wrapper
+  (`operator[](Resource)`, `Resource` the scoped enum above) — identical
+  codegen to the C array, but indexing by a bare integer or an unrelated ID
+  no longer compiles.
+- **A dedicated `PciAddress` value type** at the DPDK boundary, generalizing
+  the one real bug this session already found and fixed (`9e8c4af1`:
+  hand-rolled `%08x:%02x:%02x.%02x` vs. DPDK's actual `PCI_PRI_FMT`
+  `%.4x:%.2x:%.2x.%x`). The shipped fix used `rte_pci_device_name()` at the
+  one call site that needed it; this phase's version is the general form —
+  one canonical `ToString()`/parser pair so no other call site can
+  reintroduce the same format mismatch by hand-rolling it again.
+- **Sentinel APIs → `std::optional`**: replace `kAnyWorker = -1`,
+  `INVALID_GATE == UINT16_MAX`-style sentinels with
+  `std::optional<WorkerId>` (or similar) at cold/control-plane call sites,
+  while keeping a named `GateId::Invalid()` constant available for
+  hot-path code that genuinely needs the fixed-width sentinel
+  representation.
+- **Ownership cleanup in the traffic-class tree specifically**
+  (`core/traffic_class.cc`/`.h` — the same file whose unsynchronized
+  global `all_tcs_` map was the real bug behind commits 6-7): migrate
+  parent→child ownership edges to `std::unique_ptr<TrafficClass>`, keeping
+  raw observer pointers for the scheduling hot path. This does **not** fix
+  the `all_tcs_` registry race by itself (that's a synchronization
+  problem, not an ownership-type one — see the non-goals note below), but
+  it closes off an adjacent class of double-delete/ambiguous-ownership bug
+  in the same destructor chain that caused this session's investigation.
+- **`constinit thread_local` vs. the current `extern __thread Worker
+  current_worker`** (`worker.h`): re-benchmark the GNU `__thread` vs.
+  standard `thread_local` codegen difference that motivated the original
+  choice (per its own comment). If `constinit thread_local Worker
+  current_worker{}` disassembles identically for hot-path access like
+  `current_worker.wid()`, switch to it — `constinit` additionally
+  guarantees at compile time that initialization can't silently become
+  dynamic, which is exactly the "uninitialized state only caught at
+  runtime" class of bug this phase targets. If codegen differs, keep
+  `__thread` and record the disassembly comparison in this doc so the
+  decision doesn't get re-litigated from scratch later.
+- **`std::jthread` for worker threads — do NOT do this mechanically.**
+  Swapping `std::thread worker_threads[]` for `jthread` changes shutdown
+  semantics (its destructor calls `request_stop()` + `join()`, so a wedged
+  worker now blocks the destructor instead of being detached) and directly
+  interacts with the exact shutdown-ordering bug already found and fixed
+  twice this session (commits 6-8). If pursued, redesign worker ownership
+  into an explicit `WorkerSlot { Worker worker_; std::jthread thread_; }`
+  first, with stop/join behavior chosen deliberately, before changing the
+  thread type.
+- **Physical-quantity wrapper types** (`TscCycles`, a `std::chrono`-based
+  nanoseconds alias) at scheduler/rate-limiter APIs that currently pass
+  raw `uint64_t` and mix cycles/ns/packets/bytes by convention only. Lower
+  priority than the items above — evaluate call-site churn against benefit
+  before committing.
+- **A compile-time negative-test file** (e.g.
+  `core/utils/typesafety_test.cc`) asserting the properties the rest of
+  this phase is for: `static_assert(!std::is_convertible_v<CpuId,
+  WorkerId>)`, `static_assert(sizeof(WorkerId) == sizeof(uint16_t))`,
+  concept-satisfaction checks (`static_assert(BessModule<NoOp>)`), etc., so
+  a future refactor that accidentally reintroduces an implicit conversion
+  or breaks a concept fails CI immediately instead of silently.
+
+**Explicit non-goal, stated plainly so it isn't re-litigated:** the
+`worker.cc`/`all_tcs_` concurrency and shutdown-ordering bugs (commits
+6-8) are lifetime/synchronization problems, not type-safety problems — no
+amount of `enum class`/strong-ID/ownership-type work would have caught
+them on its own; they needed runtime synchronization (a join, ultimately)
+and were found only by running the daemon live under load, not by a
+stronger type system. The worker-lifecycle redesign (`jthread`,
+`WorkerSlot`, or otherwise) is tracked as its own concurrency-focused
+effort, not folded into this phase's compile-time-provable scope.
+
+C++26 contracts (`pre`/`post`) are the natural long-term home for some of
+the invariants this phase encodes as constructors/factories instead —
+already deferred in Phase H pending non-experimental compiler support;
+revisit there rather than re-deciding it here.
