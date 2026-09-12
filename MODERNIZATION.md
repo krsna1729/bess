@@ -49,7 +49,7 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-12, at commit `c00ac605` on `develop`.
+Last updated: 2026-09-12, at commit `e8545843` on `develop`.
 
 **CI is fully green** (both `build (g++)` and `build (clang++)` jobs
 passing — run 34700531733) for the first time this session. Getting here
@@ -502,16 +502,18 @@ picking one.
       new finding). Header-level verification is the strongest check
       available here.
 
-## Phase B — Packet/mbuf architecture (deferred, large, needs benchmarking)
+## Phase B — Packet/mbuf architecture (ready to start -- benchmark baseline now exists)
 
 Stop mirroring `rte_mbuf` byte-for-byte in `Packet`; make `Packet` a thin
 wrapper (ideally `sizeof(void*)`) around a real `rte_mbuf*`, with BESS's own
 metadata moved into DPDK's supported mbuf private-data area instead of a
 hand-maintained shadow struct. This is the fix that makes Phase-A-style
 ABI-drift bugs structurally impossible instead of merely caught by
-`static_assert`. Requires a benchmark suite *before* starting (this repo does
-not have one yet) — packet access, batch operations, PMD forwarding,
-scheduler throughput, at minimum. Do not merge if it regresses any of those.
+`static_assert`. Requires a benchmark suite *before* starting — see
+"Benchmark suite" below: this now exists and passes green, covering packet
+access, batch operations, and scheduler throughput (the PMD-forwarding leg
+still needs a real or simulated NIC and isn't covered — see that section).
+Do not merge Phase B if it regresses any benchmark checked in there.
 See the original modernization-plan analysis of `core/packet.h` earlier in
 this project's history for the detailed design sketch (`PacketRef`,
 `BessPacketPrivate`, offset-resolved `MetadataRef<T>`).
@@ -520,6 +522,55 @@ Also bundle when doing this: dynamic packet-pool data-room sizing (today
 `SNBUF_DATA` is a fixed 2048-byte compile-time constant — this is why jumbo
 frames don't work, see upstream `#1024`), and real multi-segment mbuf test
 coverage.
+
+### Benchmark suite (added 2026-09-12, commit 14)
+
+Correcting an error in this doc's own earlier text (both here and in Phase
+H below both used to claim "this repo does not have one yet"): **BESS
+already had a `*_bench.cc` Google Benchmark suite** (`utils/checksum_bench.cc`,
+`utils/copy_bench.cc`, `utils/cuckoo_map_bench.cc`,
+`modules/url_filter_bench.cc`, `traffic_class_bench.cc`) and the
+`core/Makefile` already has full `%_bench.cc` build-rule support
+(`make benchmarks`) — none of this needed to be built from scratch. What
+was missing: `build.py`'s `build_bess()` (what CI actually calls) only ran
+`make -C core bessd modules all_test`, never `make ... benchmarks`, so
+**this entire pre-existing suite had never been built or run against the
+DPDK 25.11 port this whole session**, despite the port touching code
+several of these benchmarks depend on (`checksum_bench.cc` in particular,
+given commits 9-12's checksum.h correction chain). Verified all 5 by
+actually running each one (not just compiling): all pass, no crashes, sane
+throughput numbers. `cuckoo_map_bench` looked hung at first under a 30s
+timeout with default `--benchmark_min_time` — false alarm, it just has 22
+cases up to 4M entries and needs more wall time, not a bug; confirmed by
+rerunning with `--benchmark_min_time=0.001s` (all 22 cases complete in
+seconds).
+
+Added `core/packet_bench.cc` — the one genuinely new file — covering what
+the existing suite didn't: `Packet`/`PacketPool`/`PacketBatch` themselves
+(`BM_PacketAllocFree`, `BM_PacketAllocFreeBulk`, `BM_PacketHeadData`,
+`BM_PacketAppendTrim`, `BM_BatchForward`), using `PlainPacketPool` (the
+only pool backend that doesn't need real hugepages, which this sandbox
+lacks — see packet_pool.h's own doc comment: "For standalone benchmarks
+and unittests"). These are the primitives Phase B would actually
+refactor, so they're the most direct regression check for it.
+
+Fixed the actual gap: added `benchmarks` to `build.py`'s `build_bess()`
+target list, and added a "Smoke-test benchmarks" CI step (runs every
+`*_bench` binary with a tiny `--benchmark_min_time` — a crash/hang check,
+not perf tracking; CI runner variance makes real perf regression
+detection unreliable there, that's a local/dedicated-hardware job) so this
+gap can't reopen silently.
+
+**What Phase B's benchmark prerequisite still doesn't cover**: PMD-level
+forwarding throughput (needs a real NIC or a simulated one via DPDK's
+`net_null`/`net_ring` virtual PMDs — not attempted here) and full
+Module/Gate/Task dispatch overhead (no C++-level harness exists for
+constructing a `Module` + calling `ProcessBatch()` outside the live
+daemon — all existing module testing goes through
+`bessctl/module_tests/*.py` against a running `bessd`, not a standalone
+gtest/benchmark binary). `traffic_class_bench.cc` already covers scheduler
+throughput specifically (`TCWeightedFair`/`TCRoundRobin` scheduling), which
+covers the "scheduler throughput" leg of Phase B's requirement in full.
 
 ## Phase C — Linux I/O modernization
 
@@ -775,9 +826,12 @@ consumption to pkg-config in Phase A, ahead of a full Meson migration);
 CLI11 for `bessctl` argument parsing; replxx for the interactive shell
 (BSD-licensed, not GPL-readline-coupled); GoogleTest/GoogleMock (already a
 natural fit — `core/` already uses GoogleTest); Google Benchmark for a real
-microbenchmark suite (`BM_PacketHeadData`, `BM_PacketAllocFree`,
-`BM_BatchForward`, `BM_ExactMatch32`, etc. — this repo does not have one yet
-and Phase B explicitly should not start without one); libFuzzer +
+microbenchmark suite (already exists and is now actually built/run by CI —
+`BM_PacketHeadData`/`BM_PacketAllocFree`/`BM_BatchForward` etc. in
+`core/packet_bench.cc`, plus the pre-existing checksum/copy/cuckoo_map/
+url_filter/traffic_class benchmarks; see Phase B's "Benchmark suite"
+section for the full story and an `ExactMatch`-style module benchmark
+gap that's still open); libFuzzer +
 ASan/UBSan/TSan/MSan; clang-tidy/clang-format/clangd/include-what-you-use.
 ThinLTO/PGO/BOLT are finishing-tools territory — only worth evaluating after
 functional/performance parity is otherwise established, trained on a
