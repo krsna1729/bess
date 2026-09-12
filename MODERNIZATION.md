@@ -49,12 +49,13 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-12, at commit `ddae0181` on `develop`.
+Last updated: 2026-09-12, at commit `253b3832` on `develop`.
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
 processed 7.2B packets with no crash or corruption; `core/all_test` is
-181/181 (previously-noted `CodelTest` flakes did not reproduce on the latest
+183/183 (181 plus 2 new checksum regression tests from commit 12;
+previously-noted `CodelTest` flakes did not reproduce on the latest
 run — timing-sensitive, may still recur under load, not chased further);
 `bessctl/run_module_tests.py` passes cleanly with **no known failures** —
 the `url_filter.py` mismatch previously attributed to scapy version drift
@@ -274,19 +275,57 @@ was actually a real checksum bug (see commit 9 below), now fixed.
     64-bit-loop blocks are unaffected (no other register-allocated input
     operands to coalesce with). Verified: `core/all_test` 181/181,
     `run_module_tests.py` clean, live `bessd` rebuilt with no regressions.
-    **Not yet reviewed by Opus** (pending, same reasoning as 10 — get
-    independent eyes on this fix too before pushing).
+12. **`253b3832`** — A **third** Opus review, of commit 11 (`ddae0181`)
+    specifically, verdict: **"correct and sufficient", no defects** —
+    independently reproduced both the miscompile (`0x7e97`/verify-fails
+    without the fix vs. `0xcc25`/verify-passes with it, for the exact
+    src==dst==0/no-payload TCP packet) and confirmed `"+&r"` is GCC's
+    documented idiom for this pattern (its own Extended Asm docs use this
+    exact spelling), with byte-identical codegen against the alternative
+    `"=&r"` + `"0"`-matching-input idiom. It flagged two low-risk hardening
+    gaps, not live bugs: (a) `CalculateSum`'s two 64-bit-loop blocks still
+    used plain `"+r"` for their `sum64` accumulator — never a live bug
+    there (no other register-allocated input operand exists to coalesce
+    with), but an inconsistency with the reasoning just applied to 6 other
+    blocks in the same file; (b) no test in this file's history would
+    have caught 11's bug class — the existing randomized TCP/UDP tests
+    always use non-zero random src/dst, so they never construct the
+    `src == dst == sum_in == 0` condition GCC needs. This commit closes
+    both: made `"+&r"` uniform across every running-sum accumulator in the
+    file (zero codegen change, confirmed), and added
+    `ChecksumTest.TcpChecksumZeroAddressNoPayload`/
+    `UdpChecksumZeroAddressNoPayload`, pinning exactly that packet shape
+    against DPDK's independent `rte_ipv4_udptcp_cksum()` oracle. Verified
+    the new tests actually catch the regression by reverting just the
+    `"+&r"` change and rebuilding: the UDP test failed exactly as
+    predicted (`cksum_dpdk=57087` vs `cksum_bess=50943`,
+    `VerifyIpv4UdpChecksum()` returned `false`); the TCP variant didn't
+    trigger in this specific build (register allocation for this exact
+    coalescing is sensitive to surrounding code and compiler version, per
+    the review) but is kept as still-valid coverage. This is hardening
+    after a review found the underlying fix already correct, not a new
+    defect — no further review round needed for this commit specifically.
+    Verified: `core/all_test` 183/183 (181 + 2 new), `run_module_tests.py`
+    clean, live `bessd` rebuilt with no regressions. **This concludes the
+    checksum.h correction chain (commits 9-12) — ready to push.**
 
-**Running theme across commits 9-11**: this file has now needed three
-correction rounds in a row, each Opus review finding something the
-previous round's fix (and its own test suite) missed. The lesson isn't
-"stop trusting reviews" — it's the opposite: keep re-reviewing narrowly-
-scoped low-level fixes even after they look done and tests pass, because
-the existing unit tests in this file were not written to catch any of
-these three bug classes (they happen not to trigger the exact register/
-memory conditions needed). Consider adding targeted regression tests for
-all three (reordering, "g"-operand hazard, earlyclobber coalescing) as a
-follow-up once the fixes themselves stop moving.
+**Running theme across commits 9-12**: this file needed three correction
+rounds before an Opus review returned a clean verdict, each round finding
+something the previous round's fix (and its own test suite) missed —
+reordering (9), then a strict-aliasing hazard the first fix didn't fully
+close (10), then a register-allocation constraint gap unrelated to either
+(11), closed with hardening + regression tests once nothing more turned
+up (12). The lesson isn't "stop trusting reviews" — it's the opposite:
+keep re-reviewing narrowly-scoped low-level fixes even after they look
+done and tests pass, because the existing unit tests in this file weren't
+written to catch any of these three bug classes (they don't trigger the
+exact register/memory conditions needed, only by chance). All three now
+have targeted regression coverage (9/10's `Ipv4NoOptChecksum`/`url_filter`
+tests already covered the reordering case incidentally by exercising the
+inlined path; 11/12 added the earlyclobber-specific tests above; 10's
+"g"-operand hazard is covered structurally by the `may_alias` fix rather
+than a specific test, since the fix closes the pointer-type-level hazard
+rather than one call site).
 
 ## Review process established this session
 
