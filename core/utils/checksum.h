@@ -334,7 +334,7 @@ static inline bool VerifyIpv4Checksum(const Ipv4 &iph) {
       "adcl %[u3], %[sum]   \n\t"
       "adcl %[u4], %[sum]   \n\t"
       "adcl $0, %[sum]        \n\t"
-      : [sum] "+r"(sum)
+      : [sum] "+&r"(sum)
       : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [u2] "m"(buf32[2]),
         [u3] "m"(buf32[3]), [u4] "m"(buf32[4])
       : "memory");
@@ -371,7 +371,7 @@ static inline uint16_t CalculateIpv4Checksum(const Ipv4 &iph) {
       "adcl %[u3], %[sum]    \n\t"
       "adcl %[u4], %[sum]    \n\t"
       "adcl $0, %[sum]       \n\t"
-      : [sum] "+r"(sum)
+      : [sum] "+&r"(sum)
       : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]),
         [u2] "g"(buf32[2] & 0xFFFF),  // skip checksum fields
         [u3] "m"(buf32[3]), [u4] "m"(buf32[4])
@@ -409,7 +409,7 @@ static inline bool VerifyIpv4UdpChecksum(const Udp &udph, be32_t src_ip,
       "adcl %[len], %[sum]     \n\t"
       "adcl $0x1100, %[sum]    \n\t"  // 17 == IPPROTO_UDP
       "adcl $0, %[sum]         \n\t"
-      : [sum] "+r"(sum)
+      : [sum] "+&r"(sum)
       : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [src] "r"(src_ip.raw_value()),
         [dst] "r"(dst_ip.raw_value()), [len] "r"(len)
       : "memory");
@@ -453,7 +453,7 @@ static inline uint16_t CalculateIpv4UdpChecksum(const Udp &udph, be32_t src,
       "adcl %[len], %[sum]     \n\t"
       "adcl $0x1100, %[sum]    \n\t"  // 17 == IPPROTO_UDP
       "adcl $0, %[sum]         \n\t"
-      : [sum] "+r"(sum)
+      : [sum] "+&r"(sum)
       : [u0] "m"(buf32[0]), [u1] "g"(buf32[1] & 0xFFFF),  // skip checksum field
         [src] "r"(src.raw_value()), [dst] "r"(dst.raw_value()), [len] "r"(len)
       : "memory");
@@ -502,7 +502,7 @@ static inline bool VerifyIpv4TcpChecksum(const Tcp &tcph, be32_t src_ip,
       "adcl %[len], %[sum]     \n\t"
       "adcl $0x0600, %[sum]    \n\t"  // 6 == IPPROTO_TCP
       "adcl $0, %[sum]         \n\t"
-      : [sum] "+r"(sum)
+      : [sum] "+&r"(sum)
       : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [u2] "m"(buf32[2]),
         [u3] "m"(buf32[3]), [u4] "m"(buf32[4]), [src] "r"(src_ip.raw_value()),
         [dst] "r"(dst_ip.raw_value()), [len] "r"(len)
@@ -552,7 +552,7 @@ static inline uint16_t CalculateIpv4TcpChecksum(const Tcp &tcph, be32_t src,
       "adcl %[len], %[sum]     \n\t"
       "adcl $0x0600, %[sum]    \n\t"  // 6 == IPPROTO_TCP
       "adcl $0, %[sum]         \n\t"
-      : [sum] "+r"(sum)
+      : [sum] "+&r"(sum)
       : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [u2] "m"(buf32[2]),
         [u3] "m"(buf32[3]),
         [u4] "g"(buf32[4] >> 16),  // skip checksum field
