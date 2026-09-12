@@ -15,9 +15,23 @@ name: CI
 #  - No sanitizer (ASan/UBSan) or coverage lane yet -- the old workflow
 #    had one via the pinned container's clang-6.0; re-adding one against
 #    a current clang is follow-up work, not re-created here.
-#  - DPDK is rebuilt from source on every run (no cache): it's a genuine
-#    multi-minute build. Worth caching deps/dpdk-*/ keyed on DPDK_VER
-#    once this is otherwise stable.
+#
+# CPU=corei7 below is load-bearing, not a style choice: DPDK's build
+# defaults to `-march=native`, and the "Cache DPDK build" step below
+# persists that build across separate CI runs -- but different runs can
+# land on different actual GitHub-hosted runner hardware, so a DPDK
+# build compiled `native` on one run's CPU can contain instructions the
+# next run's CPU doesn't have. This was not hypothetical: it happened
+# twice in a row (runs 34701174001, 34701493223 -- both "Illegal
+# instruction (core dumped)" a fraction of a second into `all_test`,
+# clang++ job only, immediately after a prior run had built and cached a
+# `native` DPDK). `corei7` is DPDK's own documented portable baseline
+# (what `-Dmachine=generic` resolves to on x86; see
+# deps/dpdk-*/config/meson.build) -- old enough (~2008) to be safe on
+# every CPU in GitHub's fleet, verified locally to build and pass the
+# full test suite and benchmark smoke test with no regressions (it just
+# takes the existing non-AVX2 fallback paths, e.g. in
+# core/utils/checksum.h's `#if __AVX2__` guard, at compile time).
 
 on:
   push:
@@ -27,6 +41,7 @@ on:
 
 env:
   FIFO_TEST_TIMEOUT: 200
+  CPU: corei7
 
 jobs:
   build-and-test:
@@ -73,7 +88,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: deps
-          key: dpdk-${{ matrix.name }}-${{ hashFiles('build.py') }}
+          # env.CPU is part of the key deliberately: it controls the
+          # -march/-mcpu DPDK itself gets built with (see the CPU=corei7
+          # comment up top), and hashFiles('build.py') alone wouldn't
+          # reflect a change to it -- a stale cache built under an old
+          # CPU setting must not get silently reused under a new one.
+          key: dpdk-${{ matrix.name }}-${{ env.CPU }}-${{ hashFiles('build.py') }}
 
       - name: Build BESS
         env:
