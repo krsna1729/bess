@@ -49,13 +49,18 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-12, at commit `68d2b677` on `develop`.
+Last updated: 2026-09-12, at commit `7f401fbb` on `develop`.
 
-**CI is fully green** (both `build (g++)` and `build (clang++)` jobs
-passing — run 34700531733) for the first time this session. Getting here
-took commits 5 (trigger fix), 9-12 (the checksum.h correction chain) and
-13 (9 clang-only portability bugs) — see the completed-work log below for
-the full history if picking this up cold.
+**CI is fully green and stable** (both `build (g++)` and `build (clang++)`
+jobs passing, including the new benchmark smoke-test step — run
+34714875102, with a from-scratch DPDK rebuild forced by the cache-key
+change in commit 15, so this is a clean-slate confirmation, not a lucky
+cache hit). Getting here took commits 5 (trigger fix), 9-12 (the
+checksum.h correction chain), 13 (9 clang-only portability bugs), 14
+(benchmark suite), and 15 (the CPU=corei7 CI reliability fix, which
+explains why runs 34701174001/34701493223 flakily failed in between with
+SIGILL even though nothing code-relevant had changed) — see the
+completed-work log below for the full history if picking this up cold.
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
