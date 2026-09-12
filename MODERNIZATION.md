@@ -49,7 +49,7 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-12, at commit `667c48a8` on `develop`.
+Last updated: 2026-09-12, at commit `ddae0181` on `develop`.
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
@@ -248,9 +248,45 @@ was actually a real checksum bug (see commit 9 below), now fixed.
     Makes 9's `volatile`/`"memory"` additions belt-and-suspenders rather
     than load-bearing. Verified: `core/all_test` 181/181,
     `run_module_tests.py` clean, live `bessd` rebuilt with no regressions.
-    **Not yet reviewed by Opus** (pending — this is itself a fix to a
-    commit that only passed review after a second, more careful pass;
-    get independent eyes on it too before pushing).
+11. **`ddae0181`** — A second Opus review, this time of commit 10
+    specifically, verdict: **"correct and sufficient" for 10's own stated
+    purpose** (independently reproduced the `may_alias` fix working via
+    disassembly at `-O0` through `-O3`, and reproduced the pre-fix `"g"`-
+    operand miscompile through the real header to confirm it was real).
+    It also found one more **separate, pre-existing** defect in the same
+    file, not caused by 9 or 10: 6 asm blocks declare their running sum as
+    `[sum] "+r"(sum)` (no earlyclobber) while also reading other values
+    into `"r"` input operands (src/dst/len for the UDP/TCP pseudo-header,
+    or a masked/shifted header word) later in the same block. Without `&`,
+    GCC may allocate an `"r"` input the same register as the `"+r"` output
+    whenever it can prove they're equal at asm entry — e.g. a TCP checksum
+    for a packet whose `CalculateSum()` result is 0 and `src == dst ==
+    0.0.0.0` coalesces `sum` with `src`/`dst`, so `"adcl %[src], %[sum]"`
+    ends up adding the register to itself instead of the real value.
+    **Reproduced live**: g++ 13.3 `-O3` gave `0x0077` instead of the
+    correct `0xac9d` (matched by `-O0` and by clang++ at any level) for
+    exactly that packet shape. Predates both 9 and 10 — a register-
+    allocation constraint gap, unrelated to the strict-aliasing issues
+    those fixed. `f79c20c8` had already used the correct `"=&r"` for the
+    two NoOpt functions, so the pattern was half-applied; this commit
+    makes it consistent across `Verify`/`CalculateIpv4Checksum` and
+    `Verify`/`CalculateIpv4UdpChecksum`/`TcpChecksum`. `CalculateSum`'s
+    64-bit-loop blocks are unaffected (no other register-allocated input
+    operands to coalesce with). Verified: `core/all_test` 181/181,
+    `run_module_tests.py` clean, live `bessd` rebuilt with no regressions.
+    **Not yet reviewed by Opus** (pending, same reasoning as 10 — get
+    independent eyes on this fix too before pushing).
+
+**Running theme across commits 9-11**: this file has now needed three
+correction rounds in a row, each Opus review finding something the
+previous round's fix (and its own test suite) missed. The lesson isn't
+"stop trusting reviews" — it's the opposite: keep re-reviewing narrowly-
+scoped low-level fixes even after they look done and tests pass, because
+the existing unit tests in this file were not written to catch any of
+these three bug classes (they happen not to trigger the exact register/
+memory conditions needed). Consider adding targeted regression tests for
+all three (reordering, "g"-operand hazard, earlyclobber coalescing) as a
+follow-up once the fixes themselves stop moving.
 
 ## Review process established this session
 
