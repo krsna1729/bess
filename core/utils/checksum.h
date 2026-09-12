@@ -48,9 +48,24 @@ namespace utils {
 // All input bytestreams for checksum should be network-order
 // Todo: strongly-typed endian for input/output paramters
 
+// Pointer types used below to type-pun into packed protocol headers
+// (Ipv4/Udp/Tcp) that a caller may have just written through their real
+// struct type. Plain `uint32_t`/`uint64_t`/`uint16_t` pointers are NOT
+// safe for this: strict aliasing lets GCC assume such a read can't
+// observe a write made through the header's own struct type, and CSE or
+// hoist the read across it -- including reads that appear as a plain C
+// expression operand to inline asm (e.g. `"g"(buf32[i] & 0xFFFF)`), which
+// is not protected by a later asm's `"memory"` clobber. `may_alias`
+// disables that assumption for these specific pointer types. Confirmed
+// necessary and sufficient by direct reproduction; see MODERNIZATION.md.
+typedef uint16_t __attribute__((may_alias)) aliasing_uint16_t;
+typedef uint32_t __attribute__((may_alias)) aliasing_uint32_t;
+typedef uint64_t __attribute__((may_alias)) aliasing_uint64_t;
+
 // Returns 32-bit one's complement sum of 'len' bytes from 'buf' and 'sum16'.
 static inline uint32_t CalculateSum(const void *buf, size_t len) {
-  const uint64_t *buf64 = reinterpret_cast<const uint64_t *>(buf);
+  const aliasing_uint64_t *buf64 =
+      reinterpret_cast<const aliasing_uint64_t *>(buf);
   uint64_t sum64 = 0;
   bool odd = len & 1;
 
@@ -101,7 +116,7 @@ static inline uint32_t CalculateSum(const void *buf, size_t len) {
 
     // fold 128bit sum into 64bit
     sum64 += m128i_extract_u64(sum128, 0) + m128i_extract_u64(sum128, 1);
-    buf64 = reinterpret_cast<const uint64_t *>(buf256);
+    buf64 = reinterpret_cast<const aliasing_uint64_t *>(buf256);
   }
 #endif
 
@@ -162,11 +177,12 @@ static inline uint32_t CalculateSum(const void *buf, size_t len) {
     len -= sizeof(uint64_t);
     ubuf64++;
   }
-  buf64 = reinterpret_cast<const uint64_t *>(ubuf64);
+  buf64 = reinterpret_cast<const aliasing_uint64_t *>(ubuf64);
 #endif
 
   // Repeat 16-bit one's complement sum (at sum64)
-  const uint16_t *buf16 = reinterpret_cast<const uint16_t *>(buf64);
+  const aliasing_uint16_t *buf16 =
+      reinterpret_cast<const aliasing_uint16_t *>(buf64);
   while (len >= sizeof(uint16_t)) {
     sum64 += *buf16++;
     len -= sizeof(uint16_t);
@@ -213,7 +229,8 @@ static inline bool VerifyGenericChecksum(const void *buf, size_t len) {
 
 // Returns true if the IP checksum is correct
 static inline bool VerifyIpv4NoOptChecksum(const Ipv4 &iph) {
-  const uint32_t *buf32 = reinterpret_cast<const uint32_t *>(&iph);
+  const aliasing_uint32_t *buf32 =
+      reinterpret_cast<const aliasing_uint32_t *>(&iph);
   uint32_t sum;
 
   // Calculate internet checksum, the optimized way is
@@ -247,7 +264,8 @@ static inline bool VerifyIpv4NoOptChecksum(const Ipv4 &iph) {
 // It skips the checksum field into the calculation
 // It does not set the checksum field in ip header
 static inline uint16_t CalculateIpv4NoOptChecksum(const Ipv4 &iph) {
-  const uint32_t *buf32 = reinterpret_cast<const uint32_t *>(&iph);
+  const aliasing_uint32_t *buf32 =
+      reinterpret_cast<const aliasing_uint32_t *>(&iph);
   uint32_t sum;
 
   // Calculate internet checksum, the optimized way is
@@ -292,7 +310,8 @@ static inline uint16_t CalculateIpv4NoOptChecksum(const Ipv4 &iph) {
 
 // Returns true if the IP checksum is correct
 static inline bool VerifyIpv4Checksum(const Ipv4 &iph) {
-  const uint32_t *buf32 = reinterpret_cast<const uint32_t *>(&iph);
+  const aliasing_uint32_t *buf32 =
+      reinterpret_cast<const aliasing_uint32_t *>(&iph);
   size_t ip_header_len = iph.header_length << 2;
 
   if (likely(ip_header_len == sizeof(iph))) {
@@ -328,7 +347,8 @@ static inline bool VerifyIpv4Checksum(const Ipv4 &iph) {
 // It skips the checksum field into the calculation
 // It does not set the checksum field in ip header
 static inline uint16_t CalculateIpv4Checksum(const Ipv4 &iph) {
-  const uint32_t *buf32 = reinterpret_cast<const uint32_t *>(&iph);
+  const aliasing_uint32_t *buf32 =
+      reinterpret_cast<const aliasing_uint32_t *>(&iph);
   size_t ip_header_len = iph.header_length << 2;
 
   if (likely(ip_header_len == sizeof(iph))) {
@@ -367,7 +387,8 @@ static inline uint16_t CalculateIpv4Checksum(const Ipv4 &iph) {
 // NOTE: Undefined behavior if udp_len < 8
 static inline bool VerifyIpv4UdpChecksum(const Udp &udph, be32_t src_ip,
                                          be32_t dst_ip, uint16_t udp_len) {
-  const uint32_t *buf32 = reinterpret_cast<const uint32_t *>(&udph);
+  const aliasing_uint32_t *buf32 =
+      reinterpret_cast<const aliasing_uint32_t *>(&udph);
 
   // UDP checksum is optional, and all zeroes mean "not computed"
   if (udph.checksum == 0) {
@@ -416,7 +437,8 @@ static inline bool VerifyIpv4UdpChecksum(const Ipv4 &iph, const Udp &udph) {
 // NOTE: Undefined behavior if udp_len < 8
 static inline uint16_t CalculateIpv4UdpChecksum(const Udp &udph, be32_t src,
                                                 be32_t dst, uint16_t udp_len) {
-  const uint32_t *buf32 = reinterpret_cast<const uint32_t *>(&udph);
+  const aliasing_uint32_t *buf32 =
+      reinterpret_cast<const aliasing_uint32_t *>(&udph);
   // UDP payload
   uint32_t sum = CalculateSum(buf32 + sizeof(udph) / sizeof(*buf32),
                               udp_len - sizeof(udph));
@@ -460,7 +482,8 @@ static inline uint16_t CalculateIpv4UdpChecksum(const Ipv4 &iph,
 // NOTE: Undefined behavior if tcp_len < 20
 static inline bool VerifyIpv4TcpChecksum(const Tcp &tcph, be32_t src_ip,
                                          be32_t dst_ip, uint16_t tcp_len) {
-  const uint32_t *buf32 = reinterpret_cast<const uint32_t *>(&tcph);
+  const aliasing_uint32_t *buf32 =
+      reinterpret_cast<const aliasing_uint32_t *>(&tcph);
 
   // TCP options and payload
   uint32_t sum = CalculateSum(buf32 + sizeof(tcph) / sizeof(*buf32),
@@ -510,7 +533,8 @@ static inline bool VerifyIpv4TcpChecksum(const Ipv4 &iph, const Tcp &tcph) {
 // NOTE: Undefined behavior if tcp_len < 20
 static inline uint16_t CalculateIpv4TcpChecksum(const Tcp &tcph, be32_t src,
                                                 be32_t dst, uint16_t tcp_len) {
-  const uint32_t *buf32 = reinterpret_cast<const uint32_t *>(&tcph);
+  const aliasing_uint32_t *buf32 =
+      reinterpret_cast<const aliasing_uint32_t *>(&tcph);
   // tcp options and payload
   uint32_t sum = CalculateSum(buf32 + sizeof(tcph) / sizeof(*buf32),
                               tcp_len - sizeof(tcph));
