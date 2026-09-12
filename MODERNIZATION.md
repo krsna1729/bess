@@ -410,11 +410,35 @@ it's a standing instruction from the user, not a one-time thing.
 
 ## Known issues / explicit follow-ups (not yet fixed)
 
-- [ ] **Per-queue PMD stats** (`pmd.cc`) were removed, not reimplemented.
-      Proper fix needs `rte_eth_xstats_get()` with driver-specific named
-      counters (e.g. `rx_q0_packets`) and a name→id lookup/cache — real
-      work, not a mechanical fix. (Relates to backlog Phase F below and old
-      upstream PR #1007.)
+- [x] **Per-queue PMD stats** (`pmd.cc`) — investigated further; this was
+      over-scoped in the original DPDK-port writeup. What DPDK actually
+      removed is `rte_eth_stats::q_ipackets/q_ibytes/q_errors/...`, a
+      *hardware-reported, per-queue* breakdown. Traced every consumer of
+      `Port::queue_stats[dir][qid]` (`port.cc`'s `GetPortStats()`,
+      `port_inc.cc`, `port_out.cc`, `queue_inc.cc`, `queue_out.cc`): the
+      `.packets`/`.bytes`/histograms that actually get reported are
+      populated generically at the *module* level (driver-independent,
+      counting what the module itself processed), not from the driver's
+      per-queue hardware stats at all -- PMDPort never touched
+      `queue_stats[PACKET_DIR_INC]` even before this port, and its
+      `SendPackets()`'s `queue_stats[PACKET_DIR_OUT][qid].dropped` is
+      software-tracked (tx-burst requested-vs-sent), not hardware-sourced,
+      unaffected by the removal. And `protobuf/service.proto`'s
+      `GetPortStats` RPC has always explicitly documented "per-queue
+      stats are not supported" at the API level -- there is no external
+      consumer that would even receive hardware per-queue data if it were
+      reimplemented. Net effect of the upstream removal, for BESS
+      specifically: **none** -- aggregate port stats (what
+      `GetPortStats()` actually returns) already come from
+      `rte_eth_stats`'s whole-port fields (`ipackets`/`opackets`/etc,
+      still present), which `PMDPort::CollectStats()` already uses
+      correctly. Building an `rte_eth_xstats_get()` name→id lookup/cache
+      for data nothing consumes would be scope creep, not a fix -- closing
+      this without further action. If a real need for hardware-level
+      per-queue visibility surfaces later (e.g. a new debugging RPC), the
+      `rte_eth_xstats_get()` approach sketched in the old note is still
+      the right shape for it. (Old upstream PR #1007 is still relevant
+      prior art if that need arises.)
 - [ ] `DPDK_VER` is duplicated (`build.py` and `core/Makefile` each hardcode
       it) and must be bumped in both places by hand — documented with a
       comment, not structurally fixed (see `9e8c4af1` commit message for why
@@ -455,15 +479,28 @@ client side; A–F touch the dataplane/DPDK/build side); either can proceed
 first. Read the "how G relates to A–F" note at the start of Phase G before
 picking one.
 
-## Phase A — DPDK/build modernization (in progress)
+## Phase A — DPDK/build modernization (complete as of 2026-09-12)
 
 - [x] DPDK 19.11.4 → 25.11.3 LTS port (commits 3–4 above)
-- [ ] Verify the rewritten CI workflow actually passes on GitHub Actions
-- [ ] Reimplement per-queue PMD stats via xstats (see known issues)
-- [ ] Audit remaining drivers (`vport.cc`, `pcap.cc`) for latent DPDK 25.11
-      API drift beyond what compiled cleanly — they compiled without error,
-      but "compiles" isn't "verified correct" the way `pmd.cc` now is after
-      the live-pipeline test
+- [x] Verify the rewritten CI workflow actually passes on GitHub Actions
+      (both g++ and clang++ jobs green as of commit 13 / run 34700531733)
+- [x] Reimplement per-queue PMD stats via xstats — investigated instead of
+      implemented; turned out to be unneeded (see known issues above for
+      why: no consumer, zero externally-visible impact from the upstream
+      removal).
+- [x] Audit remaining drivers (`vport.cc`, `pcap.cc`) for latent DPDK 25.11
+      API drift beyond what compiled cleanly. `pcap.cc` has zero DPDK API
+      surface (libpcap + BESS's own `Packet` only) — no drift risk.
+      `vport.cc` touches exactly 4 DPDK EAL calls (`rte_zmalloc`,
+      `rte_free`, `rte_malloc_virt2iova`, `rte_prefetch0`); cross-checked
+      every call site's argument types/count against the real installed
+      `deps/dpdk-25.11.3/install/include/{rte_malloc,rte_prefetch}.h`
+      signatures — all match exactly, no drift. Could not live-test
+      `vport.cc`'s actual runtime path (it requires `open("/dev/bess")`,
+      which needs `core/kmod` loaded — already documented above as
+      known-broken/not built in this sandbox, tracked as Phase C, not a
+      new finding). Header-level verification is the strongest check
+      available here.
 
 ## Phase B — Packet/mbuf architecture (deferred, large, needs benchmarking)
 
