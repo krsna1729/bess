@@ -134,7 +134,7 @@ static inline uint32_t CalculateSum(const void *buf, size_t len) {
         "adcq %[u6], %[sum] \n\t"
         "adcq %[u7], %[sum] \n\t"
         "adcq $0, %[sum]"
-        : [sum] "+r"(sum64)
+        : [sum] "+&r"(sum64)
         : [u0] "m"(buf64[0]), [u1] "m"(buf64[1]), [u2] "m"(buf64[2]),
           [u3] "m"(buf64[3]), [u4] "m"(buf64[4]), [u5] "m"(buf64[5]),
           [u6] "m"(buf64[6]), [u7] "m"(buf64[7])
@@ -150,7 +150,7 @@ static inline uint32_t CalculateSum(const void *buf, size_t len) {
         "addq %[u0], %[sum] \n\t"
         "adcq %[u1], %[sum] \n\t"
         "adcq $0, %[sum]"
-        : [sum] "+r"(sum64)
+        : [sum] "+&r"(sum64)
         : [u0] "m"(buf64[0]), [u1] "m"(buf64[1])
         : "memory");
     len -= sizeof(uint64_t) * 2;

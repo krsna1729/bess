@@ -347,6 +347,76 @@ TEST(ChecksumTest, TcpChecksum) {
   }
 }
 
+// Regression test for a real miscompile found (and fixed) in this session:
+// the checksum asm blocks declared their running sum as a read-write "+r"
+// operand without an earlyclobber ("&"), while also reading src/dst/len
+// into separate "r" input operands later in the same asm block. When GCC
+// can prove the sum's initial value equals one of those inputs -- which
+// happens here because a zero-length payload makes CalculateSum() return
+// 0, and src/dst are also all-zero -- it's permitted to coalesce them into
+// one register, corrupting the checksum (confirmed via direct disassembly:
+// GCC 13 at -O3 emitted "adcl %eax, %eax" instead of adding the real
+// src/dst values). This exact packet shape (zero addresses, no payload) is
+// exactly what a stress/fuzz test could plausibly generate, so pin it here
+// against DPDK's independent rte_ipv4_udptcp_cksum() oracle rather than
+// only relying on the randomized loop above (which uses rd.Get() and would
+// only hit this by chance).
+TEST(ChecksumTest, TcpChecksumZeroAddressNoPayload) {
+  char buf[1514] = {0};
+
+  bess::utils::Ipv4 *ip = reinterpret_cast<bess::utils::Ipv4 *>(buf);
+  bess::utils::Tcp *tcp = reinterpret_cast<bess::utils::Tcp *>(ip + 1);
+
+  ip->version = 4;
+  ip->header_length = 5;
+  ip->length = be16_t(sizeof(*ip) + sizeof(*tcp));
+  ip->ttl = 10;
+  ip->protocol = bess::utils::Ipv4::Proto::kTcp;
+  ip->src = be32_t(0);
+  ip->dst = be32_t(0);
+
+  tcp->src_port = be16_t(0);
+  tcp->dst_port = be16_t(0);
+  tcp->seq_num = be32_t(0);
+  tcp->ack_num = be32_t(0);
+
+  uint16_t cksum_dpdk =
+      rte_ipv4_udptcp_cksum(reinterpret_cast<const rte_ipv4_hdr *>(ip), tcp);
+  uint16_t cksum_bess = CalculateIpv4TcpChecksum(*ip, *tcp);
+  EXPECT_EQ(cksum_dpdk, cksum_bess);
+
+  tcp->checksum = cksum_bess;
+  EXPECT_TRUE(VerifyIpv4TcpChecksum(*ip, *tcp));
+}
+
+// Same regression, for the UDP checksum path.
+TEST(ChecksumTest, UdpChecksumZeroAddressNoPayload) {
+  char buf[1514] = {0};
+
+  bess::utils::Ipv4 *ip = reinterpret_cast<bess::utils::Ipv4 *>(buf);
+  bess::utils::Udp *udp = reinterpret_cast<bess::utils::Udp *>(ip + 1);
+
+  ip->version = 4;
+  ip->header_length = 5;
+  ip->length = be16_t(sizeof(*ip) + sizeof(*udp));
+  ip->ttl = 10;
+  ip->protocol = bess::utils::Ipv4::Proto::kUdp;
+  ip->src = be32_t(0);
+  ip->dst = be32_t(0);
+
+  udp->src_port = be16_t(0);
+  udp->dst_port = be16_t(0);
+  udp->length = be16_t(sizeof(*udp));
+
+  uint16_t cksum_dpdk =
+      rte_ipv4_udptcp_cksum(reinterpret_cast<const rte_ipv4_hdr *>(ip), udp);
+  uint16_t cksum_bess = CalculateIpv4UdpChecksum(*ip, *udp);
+  EXPECT_EQ(cksum_dpdk, cksum_bess);
+
+  udp->checksum = cksum_bess;
+  EXPECT_TRUE(VerifyIpv4UdpChecksum(*ip, *udp));
+}
+
 // Tests incremental checksum update for unsigned 16-bit integer
 TEST(ChecksumTest, IncrementalUpdateChecksum16) {
   uint16_t old16 = 0x4500;
