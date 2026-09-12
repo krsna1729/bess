@@ -49,7 +49,13 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-12, at commit `49a6fdec` on `develop`.
+Last updated: 2026-09-12, at commit `c00ac605` on `develop`.
+
+**CI is fully green** (both `build (g++)` and `build (clang++)` jobs
+passing — run 34700531733) for the first time this session. Getting here
+took commits 5 (trigger fix), 9-12 (the checksum.h correction chain) and
+13 (9 clang-only portability bugs) — see the completed-work log below for
+the full history if picking this up cold.
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
