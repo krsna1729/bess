@@ -49,14 +49,16 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-11, at commit `ecbdd3bc` on `develop`.
+Last updated: 2026-09-12, at commit `f79c20c8` on `develop`.
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
 processed 7.2B packets with no crash or corruption; `core/all_test` is
-175/181 (6 pre-existing `CodelTest` flakes under load, see above);
-`bessctl/run_module_tests.py` passes cleanly except one pre-existing,
-unrelated scapy-version checksum mismatch in `url_filter.py`.
+181/181 (previously-noted `CodelTest` flakes did not reproduce on the latest
+run — timing-sensitive, may still recur under load, not chased further);
+`bessctl/run_module_tests.py` passes cleanly with **no known failures** —
+the `url_filter.py` mismatch previously attributed to scapy version drift
+was actually a real checksum bug (see commit 9 below), now fixed.
 
 ## Completed work (chronological, with commit hashes on `develop`)
 
@@ -190,6 +192,34 @@ unrelated scapy-version checksum mismatch in `url_filter.py`.
    (detach-at-launch), so it's not a regression, but a stronger fix would
    `destroy_all_workers()` before the detach loop, trading "shutdown
    always completes promptly" for "a wedged worker can hang shutdown".
+9. **`f79c20c8`** — Found and fixed the real root cause behind
+   `url_filter.py`'s IP checksum test failure, previously (wrongly)
+   written off in this doc as scapy-version drift. Every checksum inline
+   x86 `asm()` block in `core/utils/checksum.h` (10 total) was missing
+   `volatile` and a `"memory"` clobber. Without both, GCC is free to
+   reorder the asm's memory reads across a caller's writes to the same
+   buffer made through a *different* pointer type, once inlined.
+   Confirmed by direct reproduction: at `-O3`,
+   `CalculateIpv4NoOptChecksum()` inlined into `url_filter.cc`'s
+   `Generate403Packet()` read `ip.length` with its stale template-default
+   value (`0x0028`) instead of the just-assigned real value (`0x005a`),
+   hoisted ahead of the `ip->length = ...` write — verified by hand-computing
+   the checksum for that exact "stale length" hypothesis and matching it
+   exactly against BESS's actual wrong output (`0xb023` vs. correct
+   `0xaff1`). `-fno-strict-aliasing` was tried first and did **not** fix
+   it. Fixed all 10 blocks with `asm volatile(... : "memory")`. Also found
+   a subtler variant of the same bug specific to
+   `Verify`/`CalculateIpv4NoOptChecksum`: both had a plain
+   `uint32_t sum = buf32[0];` C statement *preceding* the asm block — a
+   "memory" clobber only fences things around the asm statement itself,
+   so it does nothing to stop an earlier plain load from being hoisted
+   even further up. Fixed by folding that read into the asm's own memory
+   operand list instead. Verified: `core/all_test` 181/181,
+   `run_module_tests.py` clean including `test_urlfilter`, live `bessd`
+   rebuilt and re-run under `-m 0` with no regressions. **Not yet
+   reviewed by Opus** (pending, per standing review-at-milestones
+   instruction — this touches correctness-critical low-level code used by
+   every IP/UDP/TCP-touching module).
 
 ## Review process established this session
 
@@ -223,11 +253,6 @@ it's a standing instruction from the user, not a one-time thing.
       before trusting it (matrix, caching, runner behavior are all
       unverified; the underlying `build.py`/`make` invocations are the same
       ones verified locally).
-- [ ] `url_filter.py` module test has one pre-existing `FAIL` (not crash) —
-      an IP checksum byte mismatch almost certainly caused by scapy version
-      drift between whenever this test's expected-packet data was last
-      generated and the now-installed scapy 2.7.0. Not investigated further;
-      unrelated to this session's diff.
 - [ ] Commit author on all commits this session is `root@PARAM.localdomain`
       — cosmetic, but ask the user before fixing (would require amending
       already-pushed commits).
