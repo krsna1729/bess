@@ -68,7 +68,7 @@ else:
     s.connect(SOCKET_PATH)
 
 for i in range(ITERATION):
-    original = gen_packet('10.0.0.1', '192.168.1.10' + bytes(i))
+    original = gen_packet('10.0.0.1', '192.168.1.10' + str(i))
     s.send(bytes(original))
 
     modified = s.recv(2048)

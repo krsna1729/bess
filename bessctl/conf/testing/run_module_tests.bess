@@ -28,6 +28,7 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import binascii
 import scapy.all as scapy
 import sys
 import os
@@ -78,9 +79,9 @@ def pkt_str(pkt):
     if pkt is None:
         return "None"
     elif issubclass(type(pkt), scapy.Packet):
-        return pkt.summary() + " " + str(pkt).encode("HEX")
+        return pkt.summary() + " " + binascii.hexlify(bytes(pkt)).decode()
     else:
-        return str(pkt).encode("HEX")
+        return binascii.hexlify(bytes(pkt)).decode()
 
 # The classic
 def aton(ip):
