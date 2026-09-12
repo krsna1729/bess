@@ -84,6 +84,21 @@ jobs:
         working-directory: core
         run: ./all_test --gtest_shuffle
 
+      - name: Smoke-test benchmarks
+        working-directory: core
+        # Not for perf tracking (too much runner-to-runner variance for
+        # that) -- just confirms every *_bench binary actually runs to
+        # completion. build.py's build_bess() didn't build the
+        # `benchmarks` Makefile target until this was added, so these
+        # binaries had never been exercised against the DPDK 25.11 port
+        # at all before now. --benchmark_min_time is kept tiny so this
+        # stays a fast smoke check, not a real measurement.
+        run: |
+          for b in *_bench; do
+            echo "=== $b ==="
+            ./"$b" --benchmark_min_time=0.001s
+          done
+
       - name: Run bessctl/pybess unit tests (Python 3)
         run: python3 -m unittest discover -v
 
