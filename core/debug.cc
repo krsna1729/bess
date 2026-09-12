@@ -398,9 +398,21 @@ static bool SkipSymbol(char *symbol) {
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = SIG_DFL;
     sigaction(SIGABRT, &sa, 0);
-    google::InstallFailureFunction(abort_failure);
+    // Clang (unlike GCC) does not implicitly convert a function pointer
+    // whose noreturn-ness comes from the C++11 [[noreturn]] attribute into
+    // glog's logging_fail_func_t, which spells noreturn via the GNU
+    // __attribute__ instead -- the two attribute spellings aren't
+    // interchangeable for this conversion under Clang, which also rejects
+    // static_cast between them (they aren't "related" function pointer
+    // types in its view). reinterpret_cast is the correct tool here: both
+    // sides are ordinary function pointers with identical calling
+    // convention and signature, differing only in an attribute that isn't
+    // part of the ABI.
+    google::InstallFailureFunction(
+        reinterpret_cast<google::logging_fail_func_t>(abort_failure));
   } else {
-    google::InstallFailureFunction(exit_failure);
+    google::InstallFailureFunction(
+        reinterpret_cast<google::logging_fail_func_t>(exit_failure));
   }
   LOG(FATAL) << oops_msg;
 }

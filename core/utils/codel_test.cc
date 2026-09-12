@@ -75,7 +75,7 @@ TEST(CodelTest, NonPointerType) {
 TEST(CodelTest, NoDropTest) {
   Codel<int*> c(&integer_drop, 8, 5000000, 100000000);
 
-  int n = 4;
+  constexpr int n = 4;
   int* vals[n];
   for (int i = 0; i < n; i++) {
     vals[i] = new int();
@@ -110,7 +110,7 @@ TEST(CodelTest, NoDropTest) {
 TEST(CodelTest, DropTest) {
   Codel<int*> c(&integer_drop, 16, 5000000, 100000000);
 
-  int n = 10;
+  constexpr int n = 10;
   int* vals[n];
   for (int i = 0; i < n; i++) {
     vals[i] = new int();
@@ -175,7 +175,7 @@ TEST(CodelTest, DropTest) {
 // front entry is low delay.
 TEST(CodelTest, ChangeStateTest) {
   Codel<int*> c(&integer_drop, 16, 5000000, 100000000);
-  int n = 10;
+  constexpr int n = 10;
   int* vals[n];
   for (int i = 0; i < n; i++) {
     vals[i] = new int();
@@ -248,7 +248,7 @@ TEST(CodelTest, ChangeStateTest) {
 // at the same time
 TEST(CodelTest, MultiPushPop) {
   Codel<int*> c(&integer_drop, 16, 5000000, 100000000);
-  int n = 6;
+  constexpr int n = 6;
   int* vals[n];
   for (int i = 0; i < n; i++) {
     vals[i] = new int();

@@ -48,8 +48,19 @@ $(shell mkdir -p $(DEPDIR)/gate_hooks >/dev/null)
 $(shell mkdir -p $(DEPDIR)/resume_hooks >/dev/null)
 $(shell mkdir -p $(DEPDIR)/pb >/dev/null)
 
-# 'clang' or 'g++'
-CXXCOMPILER := $(shell expr $(word 1, $(shell $(CXX) --version)) : '\(clang\|g++\)')
+# 'clang' or 'g++' -- searched across the whole `$(CXX) --version` output
+# rather than just its first word: Ubuntu's packaged clang prints "Ubuntu
+# clang version X" (first word "Ubuntu", not "clang"), which the previous
+# first-word-only regex never matched, silently leaving CXXCOMPILER empty
+# and making the `expr $(CXXCOMPILER) = g++ ...` checks below fail with
+# "expr: syntax error" (harmless in effect, since an empty CXXCOMPILER
+# still isn't "g++" either way, but noisy and fragile).
+CXXVERSION_STRING := $(shell $(CXX) --version)
+ifneq (,$(findstring clang,$(CXXVERSION_STRING)))
+  CXXCOMPILER := clang
+else ifneq (,$(findstring g++,$(CXXVERSION_STRING)))
+  CXXCOMPILER := g++
+endif
 
 CXXVERSION := $(shell $(CXX) -dumpversion)
 
@@ -95,8 +106,17 @@ ifeq ($(shell $(PKG_CONFIG) --exists libdpdk && echo yes),)
 endif
 
 # We always want these libraries to be dynamically linked even when the
-# user requests a static build.
-ALWAYS_DYN_LIBS := -lpthread -ldl
+# user requests a static build. -lm is here because glibc >= 2.34 merged
+# libm's actual code into libc.so itself; the standalone libm.a that
+# remains only for compatibility contains ifunc resolvers
+# (__log2_ifunc etc.) that reference glibc-internal symbols (e.g.
+# _dl_x86_cpu_features) never exported for use outside glibc's own build,
+# so statically linking it fails at link time with "undefined reference
+# to `_dl_x86_cpu_features'" -- confirmed reproducing under clang++,
+# whose codegen for this file set happens to pull in log/log2/pow from
+# libm where g++'s didn't, exposing the archive as genuinely unlinkable
+# rather than just unreferenced-and-dropped.
+ALWAYS_DYN_LIBS := -lpthread -ldl -lm
 # These libraries are not supported by pkg-config.
 ALWAYS_LIBS := -lpcap -lgflags -lnuma
 PKG_CONFIG_DEPS := libdpdk libglog protobuf grpc++ libunwind zlib
@@ -133,8 +153,17 @@ CXXFLAGS += -std=c++17 -g3 -ggdb3 -march=$(CPU) \
             -Wno-error=array-bounds \
             $(PKG_CFLAGS)
 
-ifeq "$(shell test $(CXXVERSION) -ge 9; echo $$?)" "0"
-  CXXFLAGS += -Wno-error=address-of-packed-member
+# -Waddress-of-packed-member is a GCC (>= 9) addition to -Wall; Clang
+# doesn't enable it there (confirmed: Clang warns but doesn't error on the
+# exact same casts without this flag), so this only needs to apply to
+# g++. Gating on $(CXXCOMPILER) also avoids running `test` on Clang's
+# dotted -dumpversion output (e.g. "18.1.3"), which isn't a valid `test
+# -ge` operand and previously produced a harmless but confusing "Illegal
+# number" on stderr for every Clang build.
+ifeq "$(CXXCOMPILER)" "g++"
+  ifeq "$(shell test $(CXXVERSION) -ge 9; echo $$?)" "0"
+    CXXFLAGS += -Wno-error=address-of-packed-member
+  endif
 endif
 
 PERMISSIVE := -Wno-unused-parameter -Wno-missing-field-initializers

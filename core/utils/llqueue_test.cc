@@ -55,7 +55,7 @@ TEST(LLQueueTest, SingleInputOutput) {
 // Tests to make sure that one can get back out multiple objects
 TEST(LLQueueTest, MultiInputOutput) {
   LockLessQueue<int*> q(8);
-  int n = 4;
+  constexpr int n = 4;
   int* vals[n];
   for (int i = 0; i < n; i++) {
     vals[i] = new int();
@@ -88,7 +88,7 @@ TEST(LLQueueTest, MultiInputOutput) {
 TEST(LLQueueTest, Resize) {
   LockLessQueue<int*> q(8);
 
-  int n = 6;
+  constexpr int n = 6;
   int* vals1[n];
   int* vals2[n];
   for (int i = 0; i < n; i++) {
@@ -121,7 +121,7 @@ TEST(LLQueueTest, Resize) {
 // at the same time
 TEST(LLQueueTest, MultiPushPop) {
   LockLessQueue<int*> q(16);
-  int n = 6;
+  constexpr int n = 6;
   int* vals[n];
   for (int i = 0; i < n; i++) {
     vals[i] = new int();

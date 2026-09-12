@@ -33,6 +33,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -284,11 +285,11 @@ bool PtoP::SendString(int fd, const char *bytes, ssize_t len) {
 
 // Receives a string.  Returns true if it gets one.  See SendString.
 bool PtoP::RecvString(int fd, std::string *str, size_t maxlen) {
-  char buf[maxlen];
+  std::vector<char> buf(maxlen);
   for (int tries = 0; tries < kMaxTries;) {
-    ssize_t nread = read(fd, buf, sizeof buf);
+    ssize_t nread = read(fd, buf.data(), buf.size());
     if (nread > 0) {
-      *str = std::string(buf, nread);
+      *str = std::string(buf.data(), nread);
       return true;
     }
     if (nread != -1 || (errno != EAGAIN && errno != EWOULDBLOCK)) {

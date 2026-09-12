@@ -46,7 +46,11 @@ int main(int argc, char *argv[]) {
   FLAGS_logbuflevel = -1;
   FLAGS_colorlogtostderr = true;
   google::InitGoogleLogging(argv[0]);
-  google::InstallFailureFunction(bess::debug::GoPanic);
+  // See debug.cc's InstallFailureFunction call sites for why this cast is
+  // needed under Clang (GoPanic's [[noreturn]] doesn't implicitly convert
+  // to glog's __attribute__((noreturn))-spelled function pointer type).
+  google::InstallFailureFunction(
+      reinterpret_cast<google::logging_fail_func_t>(bess::debug::GoPanic));
   bess::debug::SetTrapHandler();
 
   google::SetVersionString(VERSION);

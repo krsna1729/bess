@@ -85,6 +85,7 @@ class[[gnu::packed]] BigEndian final : public EndianBase<T> {
  public:
   BigEndian() = default;
   BigEndian(const BigEndian<T> &o) = default;
+  BigEndian<T> &operator=(const BigEndian<T> &o) = default;
 
   explicit constexpr BigEndian(const T &cpu_value)
       : data_(is_be_system() ? cpu_value : EndianBase<T>::swap(cpu_value)) {}
