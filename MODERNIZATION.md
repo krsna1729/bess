@@ -601,6 +601,26 @@ rather than one call site).
     file's compilation flags plus two real (if latent) bug fixes, so it
     gets the same review treatment as other milestone commits this
     session.
+20. **C++26 toolchain experiment (no commit -- research only, not adopted)**
+    — user asked to actually try getting ahead of the curve on C++26 rather
+    than stop at "the stock toolchain can't do it." Installed `g++-14`
+    and `clang++-20` (both natively available via Ubuntu 24.04's own
+    `noble-updates/universe` repo, no PPA needed) and tested this exact
+    codebase against `-std=c++26` in a throwaway worktree. Result:
+    `clang++-20` builds the whole codebase clean at C++26 with zero code
+    changes (179/179 tests pass) -- proves this codebase's actual C++
+    usage has no C++26 incompatibility, the barrier really is toolchain
+    availability, not this project's code. `g++-14` compiles every source
+    file clean too, but fails to *link* any binary due to an unrelated
+    distro-packaging issue (Ubuntu's system `libunwind.a` is LTO-tagged
+    for GCC 13, which GCC 14's LTO reader rejects) -- not a C++26 or BESS
+    problem, would need its own fix (newer `libunwind` or de-static-linking
+    it) if ever pursued. See Phase H's "C++26 experiment" subsection for
+    the full writeup. Not adopted: C++26's library features worth having
+    (reflection/contracts/`std::simd`) remain experimental regardless of
+    which compiler implements the language core, so this doesn't change
+    Phase H's existing recommendation to stay on C++23 for now -- recorded
+    purely so a future session doesn't have to re-derive this.
 
 ## Review process established this session
 
@@ -1066,6 +1086,55 @@ baseline. Treat C++26 features as isolated experiments only (e.g. a
 separately-`-std=c++26`-compiled `.a`, per the `std::simd` sketch below),
 not production dependencies, until both the standard and this project's
 toolchain mature together.
+
+**C++26 experiment (2026-09-17, not adopted, informational)**: user asked
+to actually try newer toolchains rather than stop at "the stock one can't do
+it." Installed `gcc-14`/`g++-14` (14.2.0) and `clang-20`/`clang++-20`
+(20.1.2) via `apt` from Ubuntu 24.04's own `noble-updates/universe`
+repo (no PPA/third-party script needed for these two -- both are already
+packaged there) into this sandbox, **without** touching `update-alternatives`
+(so plain `gcc`/`g++`/`clang++` still resolve to the 13.3.0/18.1.3 CI-matching
+versions; the newer ones are invoked explicitly as `g++-14`/`clang++-20`).
+Tested both against this exact codebase in a throwaway git worktree
+(`-std=c++26`, otherwise identical source to commit 19):
+- **`clang++-20` at `-std=c++26`: builds this entire codebase clean, zero
+  errors, zero code changes needed beyond what commit 19 already did.**
+  `core/all_test` 179/179 (excluding the pre-existing `CodelTest` flake).
+  This is a genuinely useful data point: it means nothing in this
+  codebase's actual C++ *usage* is C++26-incompatible under a compiler
+  that implements it -- the barrier is purely toolchain availability
+  (CI/this sandbox's stock compiler), not this project's code.
+- **`g++-14` at `-std=c++26`: compiles every source file with zero errors**
+  (same result as clang++-20 for the actual language/library usage), but
+  **fails at the link step for every single binary** (`bessd`, `all_test`,
+  and all three `*_bench` targets that got that far) with `lto1: fatal
+  error: bytecode stream in file '.../libunwind.a' generated with LTO
+  version 13.1 instead of the expected 14.0`. This is Ubuntu's system
+  `libunwind-dev` package shipping a "fat LTO" static archive built by
+  the distro's default GCC (13), which GCC 14's LTO reader can't consume
+  -- an orthogonal distro-packaging/LTO-version mismatch, **not** a C++26
+  or BESS-code issue (every linked binary hits it identically, regardless
+  of `-std=`). A newer GCC (15, 16 -- the user separately suggested the
+  `ubuntu-toolchain-r/test` PPA for these) would very likely hit the exact
+  same mismatch, since the gap versus GCC 13's bytecode only grows; fixing
+  it needs either a matching newer `libunwind` build or changing how this
+  Makefile links against it (not attempted here -- out of scope for an
+  experiment, and this repo's static-linking choices elsewhere in the
+  Makefile look deliberate, not accidental, so that would need its own
+  investigation before touching it).
+
+**Conclusion, not acted on further**: this is good news about the
+codebase's own forward-compatibility, but doesn't change the recommendation
+above -- C++26's *library* features that would actually be worth adopting
+(reflection, contracts, `std::simd`) remain explicitly experimental even in
+compilers that implement C++26's language core, per the research in the
+subsection above. Installing a newer compiler didn't change that maturity
+verdict, only confirmed this project's code isn't itself a blocker. Not
+adopted as the project's toolchain or default `-std=`; recorded here so a
+future session doesn't have to re-derive "does our code even work under
+C++26" from scratch, and knows the GCC-side link failure is a known,
+separate, orthogonal issue rather than something to debug as a C++26
+problem.
 
 ### Compiler/language-ecosystem hardening research (added 2026-09-17)
 
