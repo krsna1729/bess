@@ -969,6 +969,89 @@ GCC 16 marks C++20 Modules, reflection, contracts, and `std::simd` as
 as isolated experiments only, not production dependencies, until compiler
 support matures.
 
+### Compiler/language-ecosystem hardening research (added 2026-09-17)
+
+User asked to survey what current C++ language-level and compiler-ecosystem
+work (the kind of thing Lemire/Sutter/Godbolt et al. keep publishing about)
+could plausibly move more of this codebase's bug classes to compile time or
+harden it for free, and to fold anything worthwhile in here rather than
+start implementing — this phase (and Phase I) already exists for exactly
+that purpose. **Nothing below is adopted or scheduled; it's backlog input
+for whoever picks up Phase H.** Every item's real-world performance cost
+(where known) is stated explicitly, per standing instruction to always
+check that before recommending a hardening feature — a feature that
+"eliminates a bug class" by adding cost to the packet hot path is a
+tradeoff decision for Phase H to make deliberately, not something to
+enable blindly.
+
+- **`-fhardened` (GCC ≥14, GNU/Linux only)** — one meta-flag bundling
+  `-D_FORTIFY_SOURCE=3 -D_GLIBCXX_ASSERTIONS -ftrivial-auto-var-init=zero
+  -fPIE -pie -Wl,-z,relro,-z,now -fstack-protector-strong
+  -fstack-clash-protection -fcf-protection=full`; it only fills in flags
+  not already set on the command line, so it composes safely with this
+  repo's existing `-Wall -Wextra -Werror` etc. **Performance**: most of
+  these sub-flags are the same low-single-digit-percent-or-less overhead
+  already standard in production Linux builds (stack protector, RELRO,
+  CET) — but `-D_GLIBCXX_ASSERTIONS` specifically (libstdc++ container/
+  smart-pointer precondition checks) has measured up to ~6% slowdown in
+  some libstdc++ versions on containers-heavy code, and
+  `-ftrivial-auto-var-init=zero` adds a real per-function stack-zeroing
+  cost. **Recommendation for this repo**: safe to turn on for
+  `bessctl`/control-plane C++ (Phase G) without much thought; for
+  `bessd`'s dataplane build, benchmark `_GLIBCXX_ASSERTIONS` and
+  `-ftrivial-auto-var-init` specifically against `core/*_bench.cc` before
+  enabling — don't assume the "it's usually fine" number applies to a
+  per-packet hot loop without checking, the same way Stage 1's
+  `priv()`/`metadata()` change was checked by diffing actual generated
+  assembly rather than trusting noisy sub-nanosecond timings alone (see
+  commit 17 above — that objdump-diff technique, not just
+  `--benchmark_min_time`, is the right verification method to reuse here).
+  ([OpenSSF hardening guide](https://best.openssf.org/Compiler-Hardening-Guides/Compiler-Options-Hardening-Guide-for-C-and-C++.html))
+- **C++26 Standard Library Hardening (P3471R4, P3697, P3878)** — turns
+  many stdlib UB cases (`std::vector::operator[]` out of bounds, null
+  smart-pointer deref, etc.) into a terminating contract violation instead
+  of silent corruption, once compilers ship it as the standard's default
+  rather than a vendor flag. GCC 15/16 and MSVC 19.44 already partially
+  implement the underlying checks today via `_GLIBCXX_ASSERTIONS` (same
+  mechanism `-fhardened` above enables) — so this is not a new thing to
+  adopt, it's the standardization of what's already actionable today.
+  Track it for when it becomes default-on rather than opt-in.
+  ([P3471R4](https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2025/p3471r4.html))
+- **GCC `-fanalyzer`** — evaluated, not a good fit yet: GCC's own C++
+  support for it remains weak, and it shows a higher false-positive rate
+  than tools like Cppcheck specifically on template-heavy C++ (this
+  codebase's `core/utils/*.h` templates, `Module`'s CRTP-adjacent patterns,
+  etc.) — revisit once its C++ mode matures rather than adding it to CI
+  now and fighting noise.
+- **C++26 reflection (`<meta>`) and contracts** — confirms this doc's
+  existing caution was already correctly calibrated, not outdated: GCC
+  16.1 shipped both, but GCC's own release notes say explicitly **"not
+  recommended for production use"** — incomplete, may still change before
+  the final standard's implementations converge. No change to the
+  "revisit once non-experimental" stance already in this phase.
+- **C++26 `std::simd` (§29.10)** — likewise still incomplete in both GCC
+  (`simd.loadstore`/`simd.permute.dynamic` missing, `simd.math` partial)
+  and Clang (further behind) as of mid-2026. Confirms the existing
+  "prototype only, compare against scalar/x86/ARM kernels before ever
+  defaulting to it" stance in this phase needs no change yet.
+- **C++29 "Profiles" (P3589 framework + P3984 type-safety profile,
+  Dos Reis/Stroustrup)** — the actual successor to the "Safe C++"
+  proposal that flamed out of C++26 consideration. Proposes
+  `[[profiles::enforce(...)]]`/`[[profiles::suppress(...)]]` annotations
+  turning on compiler-enforced Bounds/Lifetime/Type/Initialization safety
+  subsets *as a first-class language mechanism*, opt-in per
+  TU/block/statement. This is directly relevant to Phase I's whole
+  premise (hand-rolled strong IDs, scoped enums, etc., to catch invalid
+  states at compile time) — **not shippable now** (targeted C++29, still
+  a draft), but worth tracking: if/when it lands, some of Phase I's
+  hand-written patterns might become expressible as
+  `[[profiles::enforce(bounds)]]` annotations instead of bespoke wrapper
+  types, which would be less code to maintain for the same guarantee.
+  Don't design Phase I around a draft proposal today; just don't be
+  surprised if this changes the shape of "how" later.
+  ([P3589R3](https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2026/p3589r3.pdf),
+  [Stroustrup's type-safety profile](https://www.stroustrup.com/type-safety-profile.pdf))
+
 **Adopt now (C++23, control-plane/CLI/SDK only):**
 - `std::expected<T, Error>` as the standard fallible-call return type through
   `ControlPlane` and the C++ client SDK — replaces mixed
@@ -1047,6 +1130,14 @@ DPDK escape hatches from advanced modules (Phase B's `PacketRef` should
 still expose the real `rte_mbuf*` for code that needs it).
 
 ## Phase I — Compile-time invalid-state prevention (proposed 2026-09-12, not started)
+
+See Phase H's "Compiler/language-ecosystem hardening research" subsection
+above (added 2026-09-17) for a survey of current standard-track/compiler
+work in this exact space — most relevantly, the C++29 "Profiles"
+(`[[profiles::enforce(...)]]`) effort, which could eventually let some of
+this phase's hand-rolled patterns be expressed as annotations instead of
+bespoke types. Not shippable yet; noted there so it isn't re-researched
+from scratch later.
 
 Cross-cutting principle proposed alongside G/H, prompted by a pattern in
 this session's own bug log: the `rte_mbuf` ABI drift, the PCI-format bug,
