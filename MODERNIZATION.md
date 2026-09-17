@@ -49,7 +49,7 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-12, at commit `7f401fbb` on `develop`.
+Last updated: 2026-09-17, at commit `dea288f9` on `develop`.
 
 **CI is fully green and stable** (both `build (g++)` and `build (clang++)`
 jobs passing, including the new benchmark smoke-test step — run
@@ -62,10 +62,16 @@ explains why runs 34701174001/34701493223 flakily failed in between with
 SIGILL even though nothing code-relevant had changed) — see the
 completed-work log below for the full history if picking this up cold.
 
+Phase B Stage 1 (commit 16 / `dea288f9`, `core/packet.h`'s private-area
+accessor — `BessPacketPrivate`/`priv()`) has since landed on top of that;
+see Phase B's own section below for what it does and why the original
+single-shot Phase B plan was split into two stages. Not yet pushed/
+CI-verified as of this writing — do that next if picking this up cold.
+
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
 processed 7.2B packets with no crash or corruption; `core/all_test` is
-183/183 (181 plus 2 new checksum regression tests from commit 12;
+185/185 (183 plus 2 new `PacketTest` cases from commit 16;
 previously-noted `CodelTest` flakes did not reproduce on the latest
 run — timing-sensitive, may still recur under load, not chased further);
 `bessctl/run_module_tests.py` passes cleanly with **no known failures** —
@@ -447,6 +453,30 @@ rather than one call site).
     separate tree, built BESS against it, ran the full test suite
     (183/183) and every benchmark — no regressions, just the existing
     `#if __AVX2__` fallback paths taken at compile time.
+16. **`dea288f9`** — **Phase B, Stage 1**. Ran two research
+    passes into `PacketPool`/DPDK's `priv_size` mechanism and the codebase
+    blast radius of Phase B's original "thin `rte_mbuf*` wrapper" text
+    before writing code, per standing practice (plan mode + explicit
+    sign-off for anything this size/risk). Found a concrete reason the full
+    end-state can't land as one shot — see Phase B's own section below —
+    and scoped a smaller, safe, real first slice instead: gave `Packet`'s
+    private/metadata area an explicit `BessPacketPrivate` struct reached via
+    `rte_mbuf_to_priv()` (zero layout/ABI change, pinned by a new
+    `CheckPrivLayout()` static_assert), fixed `wildcard_match.cc`'s
+    `mt_offset_to_databuf_offset()`-based raw-offset trick (the one latent
+    hazard this surfaced — same "offset math assumed correct by
+    construction" bug class as Phase A's two ABI-drift bugs), and deduped
+    `CheckMbufLayout()` vs. the redundant (and dead — never called)
+    `check_offset` macro in `Packet::CheckSanity()`. Added
+    `core/packet_test.cc` (new — `Packet` had no gtest coverage before) and
+    a `BM_PacketMetadataAccess` benchmark. Verified: `core/all_test`
+    185/185, `run_module_tests.py` clean including
+    `test_wildcardmatch_with_metadata`, live `bessd -m 0` smoke-started
+    cleanly (262144-packet `PlainPacketPool` created via the new `priv()`
+    path with no crash). Not yet CI-reviewed as of this writing — an Opus
+    review is the next step per standing practice, then push. Stage 2 (the
+    actual thin wrapper) is explicitly deferred, not scoped, needs its own
+    sign-off; see Phase B below.
 
 ## Review process established this session
 
@@ -522,8 +552,8 @@ it's a standing instruction from the user, not a one-time thing.
 # Roadmap / Backlog
 
 Organized in phases. Phases A–F are the original DPDK-era modernization plan
-(mostly still ahead of us — only the DPDK version bump itself, Phase A, is
-underway). Phases G–I are a newer, larger proposal — a from-first-principles
+(mostly still ahead of us — Phase A is done, Phase B's Stage 1 has landed,
+Stage 2 and Phases C–F remain). Phases G–I are a newer, larger proposal — a from-first-principles
 rethink of the control plane and language/tooling stack — added 2026-09-11.
 **G and the A–F track are largely independent** (G touches `bessctl`/gRPC/the
 client side; A–F touch the dataplane/DPDK/build side); either can proceed
@@ -553,26 +583,104 @@ picking one.
       new finding). Header-level verification is the strongest check
       available here.
 
-## Phase B — Packet/mbuf architecture (ready to start -- benchmark baseline now exists)
+## Phase B — Packet/mbuf architecture
 
-Stop mirroring `rte_mbuf` byte-for-byte in `Packet`; make `Packet` a thin
-wrapper (ideally `sizeof(void*)`) around a real `rte_mbuf*`, with BESS's own
-metadata moved into DPDK's supported mbuf private-data area instead of a
-hand-maintained shadow struct. This is the fix that makes Phase-A-style
-ABI-drift bugs structurally impossible instead of merely caught by
-`static_assert`. Requires a benchmark suite *before* starting — see
-"Benchmark suite" below: this now exists and passes green, covering packet
-access, batch operations, and scheduler throughput (the PMD-forwarding leg
-still needs a real or simulated NIC and isn't covered — see that section).
-Do not merge Phase B if it regresses any benchmark checked in there.
-See the original modernization-plan analysis of `core/packet.h` earlier in
-this project's history for the detailed design sketch (`PacketRef`,
-`BessPacketPrivate`, offset-resolved `MetadataRef<T>`).
+End state (unchanged from the original proposal): stop mirroring `rte_mbuf`
+byte-for-byte in `Packet`; make `Packet` a thin wrapper (ideally
+`sizeof(void*)`) around a real `rte_mbuf*`, with BESS's own metadata moved
+into DPDK's supported mbuf private-data area instead of a hand-maintained
+shadow struct. This is the fix that makes Phase-A-style ABI-drift bugs
+structurally impossible instead of merely caught by `static_assert`.
 
-Also bundle when doing this: dynamic packet-pool data-room sizing (today
-`SNBUF_DATA` is a fixed 2048-byte compile-time constant — this is why jumbo
-frames don't work, see upstream `#1024`), and real multi-segment mbuf test
-coverage.
+**This is now explicitly staged, not a single commit sequence** — see
+"Stage 1" and "Stage 2" below. Before writing any Stage-1 code, two research
+passes (one on `PacketPool`/DPDK's `priv_size` mechanism, one on the
+blast radius of `Packet`'s layout assumptions across `core/`) found a
+concrete reason the full end-state can't land as one shot the way Phase A's
+DPDK port did:
+
+- `PacketPool`'s custom mempools are sized as `sizeof(Packet)` per element
+  (`core/packet_pool.cc:72`, `rte_mempool_create_empty(..., sizeof(Packet),
+  ...)`), and `Packet` embeds a fixed `char data_[SNBUF_DATA]` array. A
+  pointer-thin `Packet` needs "the object stored in the mempool" decoupled
+  from "the C++ type used to manipulate it" — a real allocator redesign.
+- `PMDPort::RecvPackets()`/`SendPackets()` (`core/drivers/pmd.cc:504-511`)
+  hand `Packet**` straight to `rte_eth_rx_burst()`/`rte_eth_tx_burst()` —
+  **real DPDK PMD drivers write actual `struct rte_mbuf` bytes directly
+  into that array.** This only works today because `Packet` *is*
+  `rte_mbuf`-shaped. A thin wrapper needs an explicit wrap/unwrap step at
+  this exact hot-path boundary, i.e. a real redesign of the single hottest
+  code path in the system, not a mechanical rename.
+- Together these mean there's no safe intermediate/bisectable state between
+  "`Packet` overlays `rte_mbuf`" and "`Packet` is a thin wrapper" — it's an
+  atomic swap across allocator + PMD I/O + every direct field user at once.
+  That's exactly the kind of large, hard-to-reverse, hot-path change that
+  needs a dedicated design spike and explicit sign-off, not something to
+  start opportunistically just because the benchmark prerequisite is done.
+- Dynamic per-pool data-room sizing (jumbo frames, upstream `#1024`) has the
+  *same* blocker (`Packet::data_` is a fixed-size embedded array used as
+  the mempool element) — it moves to Stage 2 with the rest, it can't be
+  bundled into Stage 1 the way the original text here proposed.
+
+Requires a benchmark suite *before* either stage — see "Benchmark suite"
+below: this now exists and passes green, covering packet access, batch
+operations, and scheduler throughput (the PMD-forwarding leg still needs a
+real or simulated NIC and isn't covered — see that section). Do not merge
+either stage if it regresses any benchmark checked in there.
+
+### Stage 1 — explicit private-area accessor (done, commit 16)
+
+Give `Packet`'s pool-bookkeeping/metadata/scratchpad area (today the
+`reserve_` union) an explicit, named type (`bess::BessPacketPrivate`,
+`core/packet.h`) reached via DPDK's own documented `rte_mbuf_to_priv()`
+instead of a union member that merely happens to sit at the right offset by
+construction — **zero layout/ABI change** (pinned by a new
+`Packet::CheckPrivLayout()` static_assert alongside the existing
+`CheckMbufLayout()`), since BESS's mempools already configure DPDK's
+`mbuf_priv_size`/`mbuf_data_room_size` correctly
+(`PacketPool::PostPopulate()`, `core/packet_pool.cc`) — this stage only
+changes how that byte range is *reached*, not what's in it or where.
+Surfaced and fixed one real latent hazard this replaces: `wildcard_match.cc`
+computed a metadata field's address via `buf_addr + offset` pointer
+arithmetic (`Packet::mt_offset_to_databuf_offset()`, now deleted — it was
+the function's only caller), relying on `metadata_` and the packet's data
+buffer being part of one contiguous allocation at a fixed relative offset —
+the same class of "offset math assumed correct by construction" hazard as
+the ABI-drift bugs Phase A found twice already. Fixed to address metadata
+fields via `Packet::priv()`/`metadata<T>()` directly. Also deduped two
+overlapping `rte_mbuf`-offset-check mechanisms found in the same pass
+(`Packet::CheckMbufLayout()` vs. the `check_offset` macro inside
+`Packet::CheckSanity()`, `core/packet.cc` — the latter was a strict subset
+of the former and dead code besides, never called anywhere in the tree).
+Added `core/packet_test.cc` (new file — no gtest coverage of `Packet`
+existed before) covering the new `priv()` plumbing's round-trip and field
+ordering, plus basic multi-segment (`next_`/`nb_segs_`) chaining, which had
+no coverage anywhere either. Added `BM_PacketMetadataAccess` to
+`packet_bench.cc` to catch a cost regression in the new accessor path
+specifically (sub-nanosecond, no measurable change vs. the other
+benchmarks in that file). Verified: `core/all_test` 185/185 (183 + 2 new),
+`run_module_tests.py` clean including `test_wildcardmatch_with_metadata`
+(the live functional check for the fixed code path), live `bessd -m 0`
+smoke-started with no crash (exercises `PacketPool` creation for 262144
+packets, i.e. `InitPacket()`'s `priv()`-based `set_vaddr()`/`set_paddr()`
+calls, at real scale). Left untouched, deliberately: the `rte_mbuf`-mirroring
+union (`buf_addr_`, `data_off_`, `pkt_len_`, `next_`, etc.) and
+`CheckMbufLayout()` — that's Stage 2's problem.
+
+### Stage 2 — thin `rte_mbuf*` wrapper (not started, needs its own sign-off)
+
+The actual `PacketRef`-over-`rte_mbuf*` wrapper, the `PacketPool` allocator
+redesign, the `PMDPort::RecvPackets`/`SendPackets` wrap/unwrap redesign at
+the `rte_eth_{rx,tx}_burst` boundary, dynamic per-pool data-room sizing
+(jumbo frames), and revisiting `core/drivers/vport.cc`/`pcap.cc`'s
+`reinterpret_cast<Packet*>(snb->next())`-style multi-segment chain walking
+(fine while the `rte_mbuf` overlay still exists; becomes an issue once
+Stage 2 removes it). See the original modernization-plan analysis of
+`core/packet.h` earlier in this project's history for the detailed design
+sketch (`PacketRef`, offset-resolved `MetadataRef<T>`) — `BessPacketPrivate`
+from that same sketch is now already real, see Stage 1 above. High risk,
+hot-path-touching — needs a dedicated design spike and explicit user
+sign-off before any code, not started now.
 
 ### Benchmark suite (added 2026-09-12, commit 14)
 
