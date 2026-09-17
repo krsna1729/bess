@@ -49,7 +49,7 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-17, at commit `640774cf` on `develop`.
+Last updated: 2026-09-17, at commit `95f5231f` on `develop`.
 
 **CI is fully green and stable** (both `build (g++)` and `build (clang++)`
 jobs passing, including the new benchmark smoke-test step — run
@@ -64,10 +64,12 @@ completed-work log below for the full history if picking this up cold.
 
 Phase B Stage 1 (commits 16-17 / `dea288f9`+`f22a69eb`, `core/packet.h`'s
 private-area accessor — `BessPacketPrivate`/`priv()` — plus the Opus-review
-fixes on top) has since landed on top of that; see Phase B's own section
-below for what it does and why the original single-shot Phase B plan was
-split into two stages. Not yet pushed/CI-verified as of this writing — do
-that next if picking this up cold.
+fixes on top) has since landed on top of that and is **pushed and
+CI-confirmed green** (both jobs, run 35255689088; the code-carrying push's
+own run, 35255310803, was also green). See Phase B's own section below for
+what it does and why the original single-shot Phase B plan was split into
+two stages. A C++ hardening/compiler-ecosystem research note (commit 18,
+non-actionable backlog input for Phase H/I) is also in on top of that.
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
@@ -515,9 +517,29 @@ rather than one call site).
     **zero real cost**, not the noisy delta the timing numbers suggested.
     `wildcard_match.cc`'s `ProcessBatch()` likewise compiles to the same
     instruction count before/after (1828 vs. 1829 disassembly lines).
-    Not yet pushed as of this writing. Stage 2 (the actual thin wrapper)
-    is explicitly deferred, not scoped, needs its own sign-off; see Phase B
-    below.
+    Stage 2 (the actual thin wrapper) is explicitly deferred, not scoped,
+    needs its own sign-off; see Phase B below.
+18. **`640774cf`** — User asked to survey current C++ language/compiler-
+    ecosystem work (the kind of thing Lemire/Sutter/Godbolt et al. publish
+    about) for hardening/compile-time-bug-elimination ideas, fold anything
+    worthwhile into this doc, and defer actual adoption since Phase H/I
+    already exist for exactly that purpose. Research-only, no code: added
+    a "Compiler/language-ecosystem hardening research" subsection to Phase
+    H covering `-fhardened` (GCC's one-flag hardening bundle -- actionable
+    for `bessctl`/control-plane now, but `_GLIBCXX_ASSERTIONS`'s reported
+    ~6% overhead on some libstdc++ versions needs benchmarking against the
+    dataplane specifically before enabling there), C++26 Standard Library
+    Hardening (P3471, standardizes what `_GLIBCXX_ASSERTIONS` already
+    does), GCC `-fanalyzer` (evaluated, not a good fit yet -- weak
+    C++/template support), and confirmation that C++26 reflection/
+    contracts/`std::simd` remain genuinely experimental (GCC's own docs:
+    "not recommended for production use") -- validating this doc's
+    existing caution rather than changing it. Also flagged the C++29
+    "Profiles" effort (P3589/P3984, Stroustrup/Dos Reis --
+    `[[profiles::enforce(...)]]`) as the real successor to the failed
+    "Safe C++" proposal and directly relevant to Phase I's goals, though
+    not shippable yet. Pushed right after commits 16-17; both pushes
+    verified green on CI (runs 35255310803 and 35255689088 respectively).
 
 ## Review process established this session
 
