@@ -61,13 +61,18 @@ namespace bess {
 
 // BESS's own per-packet private data: pool bookkeeping (vaddr_/paddr_/
 // sid_/index_, set once at pool-init time and otherwise read-only),
-// dynamic metadata attributes, and module/driver scratchpad. This is
-// exactly the memory DPDK's mbuf_priv_size mechanism already reserves for
-// us (see PacketPool::PostPopulate() in packet_pool.cc, which configures
-// mbuf_priv_size = SNBUF_RESERVE) -- reached via rte_mbuf_to_priv(), DPDK's
-// own documented accessor for "the private area immediately following an
-// rte_mbuf", instead of a Packet-side union member that merely happens to
-// sit at the right offset by construction.
+// dynamic metadata attributes, and module/driver scratchpad.
+//
+// Packet::priv() reaches this via rte_mbuf_to_priv(), DPDK's own
+// documented accessor for "the private area immediately following an
+// rte_mbuf" -- RTE_PTR_ADD(m, sizeof(struct rte_mbuf)), a compile-time
+// constant offset that holds for *any* rte_mbuf, independent of pool
+// configuration. What PacketPool::PostPopulate() configuring
+// mbuf_priv_size = SNBUF_RESERVE (packet_pool.cc) actually controls is
+// where DPDK's rte_pktmbuf_init()/rte_pktmbuf_reset() place buf_addr_ --
+// i.e. where the data buffer (headroom_/data_ below) starts -- not where
+// this private area lives; CheckPrivLayout() below pins that offset
+// directly instead.
 struct BessPacketPrivate {
   union {
     char immutable_[SNBUF_IMMUTABLE];
@@ -101,16 +106,6 @@ static_assert(sizeof(BessPacketPrivate) == SNBUF_RESERVE,
 class alignas(64) Packet {
  public:
   Packet() = delete;  // Packet must be allocated from PacketPool
-
-  // BESS's own private per-packet data (pool bookkeeping, metadata,
-  // scratchpad) -- see BessPacketPrivate's own comment above.
-  BessPacketPrivate *priv() {
-    return reinterpret_cast<BessPacketPrivate *>(rte_mbuf_to_priv(&mbuf_));
-  }
-  const BessPacketPrivate *priv() const {
-    return reinterpret_cast<const BessPacketPrivate *>(
-        rte_mbuf_to_priv(const_cast<struct rte_mbuf *>(&mbuf_)));
-  }
 
   Packet *vaddr() const { return priv()->vaddr_; }
   void set_vaddr(Packet *addr) { priv()->vaddr_ = addr; }
@@ -247,6 +242,22 @@ class alignas(64) Packet {
   static void Free(PacketBatch *batch) { Free(batch->pkts(), batch->cnt()); }
 
  private:
+  // BESS's own private per-packet data (pool bookkeeping, metadata,
+  // scratchpad) -- see BessPacketPrivate's own comment above. Private:
+  // every external caller goes through vaddr()/metadata()/scratchpad()/etc
+  // below, not this directly -- keeps BessPacketPrivate's fields no more
+  // exposed than they were as named Packet union members before this
+  // (reserve<T>() already exposes these bytes untyped to anyone who wants
+  // them; this just avoids also handing out a *named*, directly-writable
+  // view that bypasses set_vaddr()/set_sid()/etc).
+  BessPacketPrivate *priv() {
+    return reinterpret_cast<BessPacketPrivate *>(rte_mbuf_to_priv(&mbuf_));
+  }
+  const BessPacketPrivate *priv() const {
+    return reinterpret_cast<const BessPacketPrivate *>(
+        rte_mbuf_to_priv(const_cast<struct rte_mbuf *>(&mbuf_)));
+  }
+
   union {
     struct {
       // offset 0: Virtual address of segment buffer.
@@ -449,11 +460,25 @@ class alignas(64) Packet {
   // Never called (see CheckMbufLayout()'s comment above for why that's
   // fine); pins that Packet::priv() (rte_mbuf_to_priv(&mbuf_), i.e. exactly
   // sizeof(struct rte_mbuf) bytes past the start of the object) lands
-  // exactly on reserve_ -- the byte range PacketPool::PostPopulate()
-  // actually configures DPDK's mbuf_priv_size to cover.
+  // exactly on reserve_, and that BessPacketPrivate's own field offsets
+  // match what SNBUF_METADATA_OFF/SNBUF_SCRATCHPAD_OFF (snbuf_layout.h)
+  // assume -- those are a cross-language ABI contract with
+  // core/kmod/sn_common.h's vport code, which addresses the scratchpad via
+  // a hardcoded SNBUF_SCRATCHPAD_OFF rather than this struct.
   static void CheckPrivLayout() {
+    static_assert(offsetof(Packet, mbuf_) == 0,
+                  "mbuf_ must be at offset 0 for priv()'s +sizeof(rte_mbuf) "
+                  "arithmetic to be correct");
     static_assert(offsetof(Packet, reserve_) == sizeof(struct rte_mbuf),
                   "Packet::priv() must land exactly on reserve_");
+    static_assert(
+        offsetof(BessPacketPrivate, metadata_) ==
+            SNBUF_METADATA_OFF - SNBUF_MBUF,
+        "BessPacketPrivate::metadata_ offset must match SNBUF_METADATA_OFF");
+    static_assert(offsetof(BessPacketPrivate, scratchpad_) ==
+                      SNBUF_SCRATCHPAD_OFF - SNBUF_MBUF,
+                  "BessPacketPrivate::scratchpad_ offset must match "
+                  "SNBUF_SCRATCHPAD_OFF");
   }
 
   // BESS's private per-packet data (see BessPacketPrivate above) is

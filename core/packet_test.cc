@@ -86,7 +86,9 @@ TEST(PacketTest, MultiSegmentChaining) {
   EXPECT_EQ(seg0->nb_segs(), 2);
   EXPECT_EQ(seg1->next(), nullptr);
 
-  bess::Packet::Free(seg1);
+  // Free(seg0) alone: rte_pktmbuf_free() walks the next_ chain and frees
+  // every segment. A separate Free(seg1) here would double-free it back
+  // into the mempool.
   bess::Packet::Free(seg0);
 }
 
