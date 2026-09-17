@@ -316,8 +316,10 @@ static inline int llring_init(struct llring *r, unsigned int slots, int sp,
 	r->common.sp_enqueue = !!sp;
 	r->common.sc_dequeue = !!sc;
 
-	r->prod.head = r->cons.head = 0;
-	r->prod.tail = r->cons.tail = 0;
+	r->prod.head = 0;
+	r->cons.head = 0;
+	r->prod.tail = 0;
+	r->cons.tail = 0;
 
 	return 0;
 }

@@ -192,7 +192,7 @@ std::string GetNonWorkerCoreList() {
   int ret = pthread_getaffinity_np(pthread_self(), sizeof(set), &set);
   if (ret < 0) {
     PLOG(WARNING) << "pthread_getaffinity_np()";
-    return 0;  // Core 0 as a fallback
+    return "0";  // Core 0 as a fallback
   }
 
   // Choose the last core available
