@@ -49,7 +49,7 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-17, at commit `f22a69eb` on `develop`.
+Last updated: 2026-09-17, at commit `640774cf` on `develop`.
 
 **CI is fully green and stable** (both `build (g++)` and `build (clang++)`
 jobs passing, including the new benchmark smoke-test step — run
