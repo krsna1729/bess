@@ -540,6 +540,67 @@ rather than one call site).
     "Safe C++" proposal and directly relevant to Phase I's goals, though
     not shippable yet. Pushed right after commits 16-17; both pushes
     verified green on CI (runs 35255310803 and 35255689088 respectively).
+19. **`f2f3bf84`** — **Phase H first concrete step**: bumped
+    the whole build from `-std=c++17` to `-std=c++23` (`core/Makefile`) --
+    the actual prerequisite for literally every item on Phase H's "adopt
+    now" list, which this doc hadn't previously verified was even possible
+    (the build had never been bumped past C++17 despite Phase H being
+    written against a C++23 baseline). Confirmed GCC 13.3 and Clang 18.1.3
+    (both installed here, matching CI's Ubuntu 24.04 packages) accept
+    `-std=c++23`; **neither accepts `-std=c++26`** -- GCC 13.3 rejects the
+    flag outright as unrecognized, so C++26 stays infeasible as a build-wide
+    baseline in this environment/CI until the toolchain itself is upgraded
+    (a separate, bigger undertaking than this step; C++26 features stay
+    isolated/prototype-only per Phase H's existing text either way, since
+    even newer compilers mark them experimental -- see commit 18 above).
+    The bump itself **found two real, if minor/latent, pre-existing bugs**
+    via hard compile errors (not just warnings) -- exactly the "move bug
+    classes to compile time" value Phase H is for, discovered by the
+    standard bump alone, before adopting any specific new feature:
+    - `core/dpdk.cc`'s `GetNonWorkerCoreList()` had `return 0;` inside a
+      function returning `std::string` -- `0` as a null-pointer-constant
+      implicitly converted to `const char*` and then to
+      `std::string(const char*)`, i.e. constructing a string from a null
+      pointer (real UB, just never triggered in practice because
+      `pthread_getaffinity_np(pthread_self(), ...)` essentially never
+      fails). C++23 added `basic_string(nullptr_t) = delete` specifically
+      to catch this pattern, turning it into a hard compile error. Fixed
+      to `return "0";` (the actually-intended fallback string, per the
+      function's own comment).
+    - `core/kmod/llring.h`'s `llring_init()` had
+      `r->prod.head = r->cons.head = 0;` / `r->prod.tail = r->cons.tail
+      = 0;` -- chained assignment through `volatile uint32_t` fields
+      (lock-free ring buffer indices). Using the *value* of an assignment
+      to a volatile-qualified object has been deprecated since C++20
+      (P1152) and is now a compiler error under this repo's `-Werror`.
+      Split into 4 separate statements -- purely mechanical, no behavior
+      change (this runs once at ring-buffer init, not per-packet).
+    Verified: clean `make clean && make ... -j4` under both g++ and
+    clang++ from a clean tree, `core/all_test` 185/185 under g++ (179/179
+    excluding the pre-existing `CodelTest` flake) and 179/179 under
+    clang++ (ran with `-CodelTest.*` filtered), `run_module_tests.py`
+    clean. **Performance**: checked rigorously per standing instruction,
+    not just assumed harmless from "it's just a language-standard flag" --
+    built the identical source under `-std=c++17` and `-std=c++23`
+    side by side and compared: `core/packet.o`'s `.text` size grew by
+    ~1KB, but that delta is confined entirely to `Packet::Dump()` (a cold,
+    debug-only diagnostic function never called in the packet-processing
+    path -- likely different libstdc++ iostream/sstream template codegen
+    under the newer `__cplusplus` value); `Packet::copy()` (the one
+    actually-hot function in that file) is byte-identical in size between
+    both builds. `packet_bench` under proper repeated measurement
+    (5-7 reps, 1s min-time) shows no consistent difference beyond noise.
+    `checksum_bench` initially looked alarming (one data point showed
+    "777ns -> 62.7ns", i.e. ~12x) on a single-shot run -- re-ran with 7
+    repetitions and found this benchmark has ~26-49% coefficient of
+    variation in this sandbox regardless of compiler standard (visible in
+    both the c++17 and c++23 builds equally), so the single-shot swing was
+    just this benchmark's own noise floor, not a real per-standard effect;
+    medians across both builds land within each other's stddev band. Not
+    yet pushed or Opus-reviewed as of this writing -- this touches every
+    file's compilation flags plus two real (if latent) bug fixes, so it
+    gets the same review treatment as other milestone commits this
+    session.
 
 ## Review process established this session
 
@@ -980,16 +1041,31 @@ language so configs stay statically validate-able.
 
 ---
 
-## Phase H — C++23/26 tooling adoption (proposed 2026-09-11, not started)
+## Phase H — C++23/26 tooling adoption (proposed 2026-09-11; first step landed 2026-09-17)
 
 Applies mainly to the control-plane/CLI/SDK code from Phase G — the
-dataplane should stay on the more conservative C++20 baseline from the
-earlier (Phase B-adjacent) modernization plan discussion unless a specific
-feature is proven zero-cost there. As of this writing GCC 16.2 is current;
-GCC 16 marks C++20 Modules, reflection, contracts, and `std::simd` as
-*experimental* — so require C++23 for production code, treat C++26 features
-as isolated experiments only, not production dependencies, until compiler
-support matures.
+dataplane should stay on the more conservative C++20-or-newer baseline from
+the earlier (Phase B-adjacent) modernization plan discussion unless a
+specific feature is proven zero-cost there (this whole build is now
+compiled as one target at one `-std=`, so in practice that means: don't
+write new C++23-only idioms in dataplane files, not a hard compiler-enforced
+split yet — see the still-open "compile targets should differ deliberately"
+item below).
+
+**Toolchain reality check** (this doc previously cited "GCC 16.2 is
+current" as if that were installed; it isn't, here or in CI): this sandbox
+and CI's `ubuntu-24.04` runners both have **GCC 13.3.0 and Clang 18.1.3**
+(Ubuntu 24.04's repo packages). Both accept `-std=c++23`; **neither accepts
+`-std=c++26`** (GCC 13.3 rejects it outright as an unrecognized flag) — so
+until this project's build environment moves off Ubuntu 24.04's stock
+toolchain, C++26 isn't adoptable as a build-wide baseline here regardless of
+any individual feature's maturity. The build is now (commit 19) actually
+compiled with `-std=c++23` — previously it was still pinned to `-std=c++17`
+despite this section's text implicitly assuming C++23 was already the
+baseline. Treat C++26 features as isolated experiments only (e.g. a
+separately-`-std=c++26`-compiled `.a`, per the `std::simd` sketch below),
+not production dependencies, until both the standard and this project's
+toolchain mature together.
 
 ### Compiler/language-ecosystem hardening research (added 2026-09-17)
 
