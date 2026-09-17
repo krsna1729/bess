@@ -114,6 +114,25 @@ void BM_PacketAppendTrim(benchmark::State &state) {
 }
 BENCHMARK(BM_PacketAppendTrim);
 
+// Every module attribute read/write (Module::get_attr/set_attr/ptr_attr,
+// module.h) funnels through Packet::metadata<T>(), which as of Phase B
+// Stage 1 (see MODERNIZATION.md) resolves via Packet::priv() ->
+// rte_mbuf_to_priv() instead of a Packet-side union member. This exercises
+// that path directly to catch a regression in cost, not just correctness.
+void BM_PacketMetadataAccess(benchmark::State &state) {
+  bess::PlainPacketPool &pool = GetPool();
+  bess::Packet *pkt = pool.Alloc();
+
+  for (auto _ : state) {
+    uintptr_t addr = pkt->metadata<uintptr_t>();
+    benchmark::DoNotOptimize(addr);
+  }
+  state.SetItemsProcessed(state.iterations());
+
+  bess::Packet::Free(pkt);
+}
+BENCHMARK(BM_PacketMetadataAccess);
+
 // "Forwarding" a batch from one module to the next is, at its core, a
 // pointer-array copy of up to kMaxBurst Packet* -- this is that copy in
 // isolation, without the surrounding Module/Gate/Task dispatch machinery

@@ -148,28 +148,15 @@ std::string Packet::Dump() {
   return dump.str();
 }
 
-#define check_offset(field)                                    \
-  static_assert(                                               \
-      offsetof(Packet, field##_) == offsetof(rte_mbuf, field), \
-      "Incompatibility detected between class Packet and struct rte_mbuf");
-
 void Packet::CheckSanity() {
-  static_assert(offsetof(Packet, mbuf_) == 0, "mbuf_ must be at offset 0");
-  check_offset(buf_addr);
-  check_offset(rearm_data);
-  check_offset(data_off);
-  check_offset(refcnt);
-  check_offset(nb_segs);
-  check_offset(rx_descriptor_fields1);
-  check_offset(pkt_len);
-  check_offset(data_len);
-  check_offset(buf_len);
-  check_offset(pool);
-  check_offset(next);
+  // The Packet/rte_mbuf offset compatibility checks that used to live here
+  // duplicated Packet::CheckMbufLayout() (packet.h) field-for-field; that's
+  // the single canonical set now, and it already runs at compile time
+  // regardless of whether this function is ever called (see its own
+  // comment for why). This function is reserved for actual runtime sanity
+  // checks.
 
   // TODO: check runtime properties
 }
-
-#undef check_offset
 
 }  // namespace bess

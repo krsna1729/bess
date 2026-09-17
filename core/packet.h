@@ -59,22 +59,70 @@ static_assert(SNBUF_SCRATCHPAD_OFF == 320,
 
 namespace bess {
 
+// BESS's own per-packet private data: pool bookkeeping (vaddr_/paddr_/
+// sid_/index_, set once at pool-init time and otherwise read-only),
+// dynamic metadata attributes, and module/driver scratchpad. This is
+// exactly the memory DPDK's mbuf_priv_size mechanism already reserves for
+// us (see PacketPool::PostPopulate() in packet_pool.cc, which configures
+// mbuf_priv_size = SNBUF_RESERVE) -- reached via rte_mbuf_to_priv(), DPDK's
+// own documented accessor for "the private area immediately following an
+// rte_mbuf", instead of a Packet-side union member that merely happens to
+// sit at the right offset by construction.
+struct BessPacketPrivate {
+  union {
+    char immutable_[SNBUF_IMMUTABLE];
+
+    const struct {
+      // must be the first field
+      Packet *vaddr_;
+
+      phys_addr_t paddr_;
+
+      // socket ID
+      uint32_t sid_;
+
+      // packet index within the pool
+      uint32_t index_;
+    };
+  };
+
+  // Dynamic metadata.
+  // Each attribute value is stored in host order
+  char metadata_[SNBUF_METADATA];
+
+  // Used for module/driver-specific data
+  char scratchpad_[SNBUF_SCRATCHPAD];
+};
+
+static_assert(sizeof(BessPacketPrivate) == SNBUF_RESERVE,
+              "BessPacketPrivate size must match SNBUF_RESERVE");
+
 // For the layout of snbuf, see snbuf_layout.h
 class alignas(64) Packet {
  public:
   Packet() = delete;  // Packet must be allocated from PacketPool
 
-  Packet *vaddr() const { return vaddr_; }
-  void set_vaddr(Packet *addr) { vaddr_ = addr; }
+  // BESS's own private per-packet data (pool bookkeeping, metadata,
+  // scratchpad) -- see BessPacketPrivate's own comment above.
+  BessPacketPrivate *priv() {
+    return reinterpret_cast<BessPacketPrivate *>(rte_mbuf_to_priv(&mbuf_));
+  }
+  const BessPacketPrivate *priv() const {
+    return reinterpret_cast<const BessPacketPrivate *>(
+        rte_mbuf_to_priv(const_cast<struct rte_mbuf *>(&mbuf_)));
+  }
 
-  phys_addr_t paddr() { return paddr_; }
-  void set_paddr(phys_addr_t addr) { paddr_ = addr; }
+  Packet *vaddr() const { return priv()->vaddr_; }
+  void set_vaddr(Packet *addr) { priv()->vaddr_ = addr; }
 
-  uint32_t sid() const { return sid_; }
-  void set_sid(uint32_t sid) { sid_ = sid; }
+  phys_addr_t paddr() { return priv()->paddr_; }
+  void set_paddr(phys_addr_t addr) { priv()->paddr_ = addr; }
 
-  uint32_t index() const { return index_; }
-  void set_index(uint32_t index) { index_ = index; }
+  uint32_t sid() const { return priv()->sid_; }
+  void set_sid(uint32_t sid) { priv()->sid_ = sid; }
+
+  uint32_t index() const { return priv()->index_; }
+  void set_index(uint32_t index) { priv()->index_ = index; }
 
   template <typename T = char *>
   T reserve() {
@@ -100,12 +148,12 @@ class alignas(64) Packet {
 
   template <typename T = char *>
   T metadata() const {
-    return reinterpret_cast<T>(metadata_);
+    return reinterpret_cast<T>(priv()->metadata_);
   }
 
   template <typename T = char *>
   T scratchpad() {
-    return reinterpret_cast<T>(scratchpad_);
+    return reinterpret_cast<T>(priv()->scratchpad_);
   }
 
   template <typename T = void *>
@@ -185,10 +233,6 @@ class alignas(64) Packet {
   std::string Dump();
 
   void CheckSanity();
-
-  static int mt_offset_to_databuf_offset(bess::metadata::mt_offset_t offset) {
-    return offset + offsetof(Packet, metadata_) - offsetof(Packet, headroom_);
-  }
 
   // pkt may be nullptr
   static void Free(Packet *pkt) {
@@ -402,35 +446,21 @@ class alignas(64) Packet {
                   "rte_mbuf::dynfield1");
   }
 
-  union {
-    char reserve_[SNBUF_RESERVE];
+  // Never called (see CheckMbufLayout()'s comment above for why that's
+  // fine); pins that Packet::priv() (rte_mbuf_to_priv(&mbuf_), i.e. exactly
+  // sizeof(struct rte_mbuf) bytes past the start of the object) lands
+  // exactly on reserve_ -- the byte range PacketPool::PostPopulate()
+  // actually configures DPDK's mbuf_priv_size to cover.
+  static void CheckPrivLayout() {
+    static_assert(offsetof(Packet, reserve_) == sizeof(struct rte_mbuf),
+                  "Packet::priv() must land exactly on reserve_");
+  }
 
-    struct {
-      union {
-        char immutable_[SNBUF_IMMUTABLE];
-
-        const struct {
-          // must be the first field
-          Packet *vaddr_;
-
-          phys_addr_t paddr_;
-
-          // socket ID
-          uint32_t sid_;
-
-          // packet index within the pool
-          uint32_t index_;
-        };
-      };
-
-      // Dynamic metadata.
-      // Each attribute value is stored in host order
-      char metadata_[SNBUF_METADATA];
-
-      // Used for module/driver-specific data
-      char scratchpad_[SNBUF_SCRATCHPAD];
-    };
-  };
+  // BESS's private per-packet data (see BessPacketPrivate above) is
+  // reached via priv()/rte_mbuf_to_priv(), not via named members of this
+  // struct -- reserve_ is just the byte reservation that keeps
+  // sizeof(Packet) and headroom_/data_'s offsets correct.
+  char reserve_[SNBUF_RESERVE];
 
   char headroom_[SNBUF_HEADROOM];
   char data_[SNBUF_DATA];
