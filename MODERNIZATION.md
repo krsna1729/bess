@@ -49,7 +49,7 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-17, at commit `dea288f9` on `develop`.
+Last updated: 2026-09-17, at commit `f22a69eb` on `develop`.
 
 **CI is fully green and stable** (both `build (g++)` and `build (clang++)`
 jobs passing, including the new benchmark smoke-test step — run
@@ -62,11 +62,12 @@ explains why runs 34701174001/34701493223 flakily failed in between with
 SIGILL even though nothing code-relevant had changed) — see the
 completed-work log below for the full history if picking this up cold.
 
-Phase B Stage 1 (commit 16 / `dea288f9`, `core/packet.h`'s private-area
-accessor — `BessPacketPrivate`/`priv()`) has since landed on top of that;
-see Phase B's own section below for what it does and why the original
-single-shot Phase B plan was split into two stages. Not yet pushed/
-CI-verified as of this writing — do that next if picking this up cold.
+Phase B Stage 1 (commits 16-17 / `dea288f9`+`f22a69eb`, `core/packet.h`'s
+private-area accessor — `BessPacketPrivate`/`priv()` — plus the Opus-review
+fixes on top) has since landed on top of that; see Phase B's own section
+below for what it does and why the original single-shot Phase B plan was
+split into two stages. Not yet pushed/CI-verified as of this writing — do
+that next if picking this up cold.
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
@@ -473,10 +474,50 @@ rather than one call site).
     185/185, `run_module_tests.py` clean including
     `test_wildcardmatch_with_metadata`, live `bessd -m 0` smoke-started
     cleanly (262144-packet `PlainPacketPool` created via the new `priv()`
-    path with no crash). Not yet CI-reviewed as of this writing — an Opus
-    review is the next step per standing practice, then push. Stage 2 (the
-    actual thin wrapper) is explicitly deferred, not scoped, needs its own
-    sign-off; see Phase B below.
+    path with no crash).
+17. **`f22a69eb`** — Opus review of `dea288f9` verdict: **correct and
+    sufficient for its stated purpose**, one real defect found plus three
+    hardening gaps, all fixed here. Real defect: the new
+    `PacketTest.MultiSegmentChaining` double-freed `seg1` --
+    `rte_pktmbuf_free()` walks the `next_` chain, so a separate
+    `Free(seg1)` before `Free(seg0)` (which still has `next_ == seg1`)
+    returns `seg1` to the mempool twice (`avail_after` = 17 in a
+    16-capacity pool, reproduced with a temporary probe test before
+    fixing). Fixed by freeing `seg0` alone. Hardening: made `priv()`
+    private (it was accidentally public, making `BessPacketPrivate`'s
+    `vaddr_`/`paddr_`/`sid_`/`index_` directly writable from outside
+    `Packet` in a way the old union members never were -- nothing outside
+    `Packet` actually called it); added `CheckPrivLayout()` asserts pinning
+    `BessPacketPrivate::metadata_`/`scratchpad_`'s offsets against
+    `SNBUF_METADATA_OFF`/`SNBUF_SCRATCHPAD_OFF` (the size-only assert from
+    `dea288f9` didn't catch an internal-offset drift that keeps `sizeof`
+    correct -- matters because `core/kmod/sn_common.h`'s vport code
+    addresses the scratchpad via a hardcoded `SNBUF_SCRATCHPAD_OFF`, a
+    cross-language ABI contract nothing was checking either side of); and
+    corrected `BessPacketPrivate`'s doc comment (`priv()`'s correctness
+    comes from `rte_mbuf_to_priv()` being a compile-time constant offset,
+    not from `PostPopulate()`'s runtime `mbuf_priv_size` configuration, as
+    `dea288f9`'s comment wrongly implied). Verified: `core/all_test`
+    185/185, `run_module_tests.py` clean. **Performance quantification**
+    (done for both `dea288f9` and this commit together, since neither
+    changes the accessor's compiled code): built the pre-Stage-1 tree
+    (`3fcf8d4d`) in a throwaway git worktree sharing this session's
+    existing DPDK install, so both binaries link against identical DPDK
+    bits. `packet_bench`'s 5 pre-existing benchmarks showed no
+    change beyond noise; the new `BM_PacketMetadataAccess` showed a
+    within-noise 0.087ns-vs-0.108ns difference at 5 reps/1s min-time --
+    too small to trust directly (cv ~12%), so settled it by diffing
+    normalized objdump output for the benchmark's compiled function
+    byte-for-byte identical apart from two unrelated relocation offsets
+    elsewhere in the object file. Confirms `rte_mbuf_to_priv()`'s pointer
+    arithmetic constant-folds to the exact same single fixed-offset
+    computation the old union-member access already compiled to --
+    **zero real cost**, not the noisy delta the timing numbers suggested.
+    `wildcard_match.cc`'s `ProcessBatch()` likewise compiles to the same
+    instruction count before/after (1828 vs. 1829 disassembly lines).
+    Not yet pushed as of this writing. Stage 2 (the actual thin wrapper)
+    is explicitly deferred, not scoped, needs its own sign-off; see Phase B
+    below.
 
 ## Review process established this session
 
