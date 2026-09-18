@@ -33,19 +33,23 @@
 
 #include <glog/logging.h>
 
-#include "llring.h"
+#include <rte_ring.h>
+
+#include <atomic>
+#include <cstdio>
+
 #include "queue.h"
 
 namespace bess {
 namespace utils {
 
-// A wrapper class for llring that extends the abstract class Queue. Takes a
+// A wrapper class for rte_ring that extends the abstract class Queue. Takes a
 // template argument T which is the type to be enqueued and dequeued.
 template <typename T>
 class LockLessQueue final : public Queue<T> {
- static_assert(std::is_pointer<T>::value, "LockLessQueue only supports pointer types");
- public:
-  static const size_t kDefaultRingSize = 256;
+  static_assert(std::is_pointer<T>::value, "LockLessQueue only supports pointer types");
+  public:
+   static const size_t kDefaultRingSize = 256;
 
   // Construct a new queue. Takes the size of backing ring buffer (must power of
   // two and entries available will be one less than specified. default is 256),
@@ -57,11 +61,10 @@ class LockLessQueue final : public Queue<T> {
                 bool single_consumer = true)
       : capacity_(capacity) {
     CHECK((capacity & (capacity - 1)) == 0);
-    size_t ring_sz = llring_bytes_with_slots(capacity_);
-    ring_ = reinterpret_cast<struct llring*>(
-        aligned_alloc(alignof(llring), ring_sz));
+    ring_ = NewRing(capacity_,
+                    (single_producer ? RING_F_SP_ENQ : 0) |
+                        (single_consumer ? RING_F_SC_DEQ : 0));
     CHECK(ring_);
-    llring_init(ring_, capacity_, single_producer, single_consumer);
   }
 
   virtual ~LockLessQueue() {
@@ -74,22 +77,26 @@ class LockLessQueue final : public Queue<T> {
   // but the high water mark is exceeded. -2 is not enough room in the
   // ring to enqueue; no object is enqueued.
   int Push(T obj) override {
-    return llring_enqueue(ring_, reinterpret_cast<void*>(obj));
+    return rte_ring_enqueue(ring_, reinterpret_cast<void*>(obj));
   }
 
   int Push(T* objs, size_t count) override {
-    if(!llring_enqueue_bulk(ring_, reinterpret_cast<void**>(objs), count)) {
+    // rte_ring_*_bulk return the count moved (0 or n, all-or-nothing),
+    // unlike llring's 0-on-success convention.
+    if (rte_ring_enqueue_bulk(ring_, reinterpret_cast<void**>(objs), count,
+                              nullptr) == count) {
       return count;
     }
     return 0;
   }
 
   int Pop(T &obj) override {
-    return llring_dequeue(ring_, reinterpret_cast<void**>(&obj));
+    return rte_ring_dequeue(ring_, reinterpret_cast<void**>(&obj));
   }
 
   int Pop(T* objs, size_t count) override {
-    if (!llring_dequeue_bulk(ring_, reinterpret_cast<void**>(objs), count)) {
+    if (rte_ring_dequeue_bulk(ring_, reinterpret_cast<void**>(objs), count,
+                              nullptr) == count) {
       return count;
     }
     return 0;
@@ -98,31 +105,25 @@ class LockLessQueue final : public Queue<T> {
   // capacity will be one less than specified
   size_t Capacity() override { return capacity_; }
 
-  size_t Size() override { return llring_count(ring_); }
+  size_t Size() override { return rte_ring_count(ring_); }
 
-  bool Empty() override { return llring_empty(ring_); }
+  bool Empty() override { return rte_ring_empty(ring_); }
 
-  bool Full() override { return llring_full(ring_); }
+  bool Full() override { return rte_ring_full(ring_); }
 
   int Resize(size_t new_capacity) override {
     if (new_capacity <= Size() || (new_capacity & (new_capacity - 1))) {
       return -1;
     }
 
-    int err;
-    size_t ring_sz = llring_bytes_with_slots(new_capacity);
-    llring* new_ring = reinterpret_cast<struct llring*>(malloc(ring_sz));
-    CHECK(new_ring);
-    err = llring_init(new_ring, new_capacity, ring_->common.sp_enqueue,
-                      ring_->common.sc_dequeue);
-    if (err != 0) {
-      free(new_ring);
-      return err;
+    rte_ring* new_ring = NewRing(new_capacity, ring_->flags);
+    if (!new_ring) {
+      return -ENOMEM;
     }
 
     void* obj;
-    while (llring_dequeue(ring_, reinterpret_cast<void**>(&obj)) == 0) {
-      llring_enqueue(new_ring, obj);
+    while (rte_ring_dequeue(ring_, &obj) == 0) {
+      rte_ring_enqueue(new_ring, obj);
     }
 
     free(ring_);
@@ -131,9 +132,33 @@ class LockLessQueue final : public Queue<T> {
     return 0;
   }
 
- private:
-  struct llring* ring_;  // class's ring buffer
-  size_t capacity_;      // the size of the backing ring buffer
+  private:
+   static rte_ring* NewRing(size_t capacity, unsigned flags) {
+     static std::atomic<uint64_t> id{0};
+     char name[64];
+     snprintf(name, sizeof(name), "locklessq_%lu",
+              static_cast<unsigned long>(id.fetch_add(1)));
+     ssize_t bytes = rte_ring_get_memsize(capacity);
+     if (bytes < 0) {
+       return nullptr;
+     }
+     const size_t align = 64;
+     size_t rounded =
+         (static_cast<size_t>(bytes) + align - 1) / align * align;
+     void* mem = std::aligned_alloc(align, rounded);
+     if (!mem) {
+       return nullptr;
+     }
+     rte_ring* ring = static_cast<rte_ring*>(mem);
+     if (rte_ring_init(ring, name, capacity, flags) != 0) {
+       std::free(mem);
+       return nullptr;
+     }
+     return ring;
+   }
+
+   struct rte_ring* ring_;  // class's ring buffer
+   size_t capacity_;      // the size of the backing ring buffer
 };
 
 }  // namespace utils

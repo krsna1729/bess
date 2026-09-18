@@ -30,7 +30,9 @@
 
 #include "drr.h"
 
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -38,6 +40,30 @@
 #include "../utils/ether.h"
 #include "../utils/ip.h"
 #include "../utils/udp.h"
+
+namespace {
+
+// All DRR rings are single-producer/single-consumer (one task owns the
+// module); the explicit SP/SC entry points below match that mode.
+const unsigned kRingFlags = RING_F_SP_ENQ | RING_F_SC_DEQ;
+
+// rte_ring_init() takes a name; every (re-)created ring gets a unique one
+// so per-flow and resized rings can never collide.
+std::string NewRingName(const char *prefix) {
+  static std::atomic<uint64_t> id{0};
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%s_%lu", prefix,
+           static_cast<unsigned long>(id.fetch_add(1)));
+  return buf;
+}
+
+// Caller-owned ring memory, cache-line aligned.
+void *AllocRingMem(size_t bytes) {
+  const size_t align = 64;
+  return std::aligned_alloc(align, (bytes + align - 1) / align * align);
+}
+
+}  // namespace
 
 uint32_t RoundToPowerTwo(uint32_t v) {
   v--;
@@ -135,7 +161,7 @@ void DRR::ProcessBatch(Context *, bess::PacketBatch *batch) {
     // if the Flow doesn't exist create one
     // and add the packet to the new Flow
     if (it == nullptr) {
-      if (llring_full(flow_ring_)) {
+      if (rte_ring_full(flow_ring_)) {
         bess::Packet::Free(pkt);
       } else {
         AddNewFlow(pkt, id, &err);
@@ -177,7 +203,7 @@ struct task_result DRR::RunTask(Context *ctx, bess::PacketBatch *batch,
 uint32_t DRR::GetNextBatch(bess::PacketBatch *batch, int *err) {
   Flow *f;
   uint32_t total_bytes = 0;
-  uint32_t count = llring_count(flow_ring_);
+  uint32_t count = rte_ring_count(flow_ring_);
   if (current_flow_) {
     count++;
   }
@@ -192,7 +218,7 @@ uint32_t DRR::GetNextBatch(bess::PacketBatch *batch, int *err) {
       if (batch_size == batch->cnt()) {
         break;
       } else {
-        count = llring_count(flow_ring_);
+        count = rte_ring_count(flow_ring_);
         batch_size = batch->cnt();
       }
     }
@@ -211,13 +237,13 @@ uint32_t DRR::GetNextBatch(bess::PacketBatch *batch, int *err) {
       return total_bytes;
     }
 
-    if (llring_empty(f->queue) && !f->next_packet) {
+    if (rte_ring_empty(f->queue) && !f->next_packet) {
       f->deficit = 0;
     }
 
     // if the flow doesn't have any more packets to give, reenqueue it
     if (!f->next_packet || f->next_packet->total_len() > f->deficit) {
-      *err = llring_enqueue(flow_ring_, f);
+      *err = rte_ring_sp_enqueue(flow_ring_, f);
       if (*err != 0) {
         return total_bytes;
       }
@@ -235,17 +261,17 @@ DRR::Flow *DRR::GetNextFlow(int *err) {
   double now = get_epoch_time();
 
   if (!current_flow_) {
-    *err = llring_dequeue(flow_ring_, reinterpret_cast<void **>(&f));
+    *err = rte_ring_sc_dequeue(flow_ring_, reinterpret_cast<void **>(&f));
     if (*err < 0) {
       return nullptr;
     }
 
-    if (llring_empty(f->queue) && !f->next_packet) {
+    if (rte_ring_empty(f->queue) && !f->next_packet) {
       // if the flow expired, remove it
       if (now - f->timer > kTtl) {
         RemoveFlow(f);
       } else {
-        *err = llring_enqueue(flow_ring_, f);
+        *err = rte_ring_sp_enqueue(flow_ring_, f);
         if (*err < 0) {
           return nullptr;
         }
@@ -265,10 +291,10 @@ uint32_t DRR::GetNextPackets(bess::PacketBatch *batch, Flow *f, int *err) {
   uint32_t total_bytes = 0;
   bess::Packet *pkt;
 
-  while (!batch->full() && (!llring_empty(f->queue) || f->next_packet)) {
+  while (!batch->full() && (!rte_ring_empty(f->queue) || f->next_packet)) {
     // makes sure there isn't already a packet at the front
     if (!f->next_packet) {
-      *err = llring_dequeue(f->queue, reinterpret_cast<void **>(&pkt));
+      *err = rte_ring_sc_dequeue(f->queue, reinterpret_cast<void **>(&pkt));
       if (*err < 0) {
         return total_bytes;
       }
@@ -325,7 +351,7 @@ void DRR::AddNewFlow(bess::Packet *pkt, FlowId id, int *err) {
   }
 
   // puts flow in round robin
-  *err = llring_enqueue(flow_ring_, f);
+  *err = rte_ring_sp_enqueue(flow_ring_, f);
 }
 
 void DRR::RemoveFlow(Flow *f) {
@@ -336,17 +362,23 @@ void DRR::RemoveFlow(Flow *f) {
   delete f;
 }
 
-llring *DRR::AddQueue(uint32_t slots, int *err) {
-  int bytes = llring_bytes_with_slots(slots);
+rte_ring *DRR::AddQueue(uint32_t slots, int *err) {
+  ssize_t bytes = rte_ring_get_memsize(slots);
+  if (bytes < 0) {
+    *err = -EINVAL;
+    return nullptr;
+  }
   int ret;
 
-  llring *queue = static_cast<llring *>(aligned_alloc(alignof(llring), bytes));
+  rte_ring *queue =
+      static_cast<rte_ring *>(AllocRingMem(static_cast<size_t>(bytes)));
   if (!queue) {
     *err = -ENOMEM;
     return nullptr;
   }
 
-  ret = llring_init(queue, slots, 1, 1);
+  std::string name = NewRingName("drr");
+  ret = rte_ring_init(queue, name.c_str(), slots, kRingFlags);
   if (ret) {
     std::free(queue);
     *err = -EINVAL;
@@ -357,16 +389,16 @@ llring *DRR::AddQueue(uint32_t slots, int *err) {
 
 void DRR::Enqueue(Flow *f, bess::Packet *newpkt, int *err) {
   // if the queue is full. drop the packet.
-  if (llring_count(f->queue) >= max_queue_size_) {
+  if (rte_ring_count(f->queue) >= max_queue_size_) {
     bess::Packet::Free(newpkt);
     return;
   }
 
   // creates a new queue if there is not enough space for the new packet
   // in the old queue
-  if (llring_full(f->queue)) {
+  if (rte_ring_full(f->queue)) {
     uint32_t slots =
-        RoundToPowerTwo(llring_count(f->queue) * kQueueGrowthFactor);
+        RoundToPowerTwo(rte_ring_count(f->queue) * kQueueGrowthFactor);
     f->queue = ResizeQueue(f->queue, slots, err);
     if (*err != 0) {
       bess::Packet::Free(newpkt);
@@ -374,7 +406,7 @@ void DRR::Enqueue(Flow *f, bess::Packet *newpkt, int *err) {
     }
   }
 
-  *err = llring_enqueue(f->queue, reinterpret_cast<void *>(newpkt));
+  *err = rte_ring_sp_enqueue(f->queue, reinterpret_cast<void *>(newpkt));
   if (*err == 0) {
     f->timer = get_epoch_time();
   } else {
@@ -382,8 +414,8 @@ void DRR::Enqueue(Flow *f, bess::Packet *newpkt, int *err) {
   }
 }
 
-llring *DRR::ResizeQueue(llring *old_queue, uint32_t new_size, int *err) {
-  llring *new_queue = AddQueue(new_size, err);
+rte_ring *DRR::ResizeQueue(rte_ring *old_queue, uint32_t new_size, int *err) {
+  rte_ring *new_queue = AddQueue(new_size, err);
   if (*err != 0) {
     return nullptr;
   }
@@ -392,9 +424,9 @@ llring *DRR::ResizeQueue(llring *old_queue, uint32_t new_size, int *err) {
   if (old_queue) {
     bess::Packet *pkt;
 
-    while (llring_dequeue(old_queue, reinterpret_cast<void **>(&pkt)) == 0) {
-      *err = llring_enqueue(new_queue, pkt);
-      if (*err == -LLRING_ERR_NOBUF) {
+    while (rte_ring_sc_dequeue(old_queue, reinterpret_cast<void **>(&pkt)) == 0) {
+      *err = rte_ring_sp_enqueue(new_queue, pkt);
+      if (*err == -ENOBUFS) {
         bess::Packet::Free(pkt);
         *err = 0;
       } else if (*err != 0) {

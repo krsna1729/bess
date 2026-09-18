@@ -30,11 +30,33 @@
 
 #include "queue.h"
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 
 #include "../utils/format.h"
 
 #define DEFAULT_QUEUE_SIZE 1024
+
+namespace {
+
+// rte_ring_init() takes a name; every (re-)created ring gets a unique one
+// so resized rings can never collide.
+std::string NewRingName(const char *prefix) {
+  static std::atomic<uint64_t> id{0};
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%s_%lu", prefix,
+           static_cast<unsigned long>(id.fetch_add(1)));
+  return buf;
+}
+
+// Caller-owned ring memory, cache-line aligned.
+void *AllocRingMem(size_t bytes) {
+  const size_t align = 64;
+  return std::aligned_alloc(align, (bytes + align - 1) / align * align);
+}
+
+}  // namespace
 
 const Commands Queue::cmds = {
     {"set_burst", "QueueCommandSetBurstArg",
@@ -51,18 +73,21 @@ const Commands Queue::cmds = {
      MODULE_CMD_FUNC(&Queue::SetRuntimeConfig), Command::THREAD_UNSAFE}};
 
 int Queue::Resize(int slots) {
-  struct llring *old_queue = queue_;
-  struct llring *new_queue;
+  struct rte_ring *old_queue = queue_;
+  struct rte_ring *new_queue;
 
-  int bytes = llring_bytes_with_slots(slots);
+  ssize_t bytes = rte_ring_get_memsize(slots);
+  if (bytes < 0) {
+    return -EINVAL;
+  }
 
-  new_queue =
-      reinterpret_cast<llring *>(std::aligned_alloc(alignof(llring), bytes));
+  new_queue = static_cast<rte_ring *>(AllocRingMem(bytes));
   if (!new_queue) {
     return -ENOMEM;
   }
 
-  int ret = llring_init(new_queue, slots, 0, 1);
+  std::string name = NewRingName("queue");
+  int ret = rte_ring_init(new_queue, name.c_str(), slots, RING_F_SC_DEQ);
   if (ret) {
     std::free(new_queue);
     return -EINVAL;
@@ -72,9 +97,9 @@ int Queue::Resize(int slots) {
   if (old_queue) {
     bess::Packet *pkt;
 
-    while (llring_sc_dequeue(old_queue, (void **)&pkt) == 0) {
-      ret = llring_sp_enqueue(new_queue, pkt);
-      if (ret == -LLRING_ERR_NOBUF) {
+    while (rte_ring_sc_dequeue(old_queue, (void **)&pkt) == 0) {
+      ret = rte_ring_sp_enqueue(new_queue, pkt);
+      if (ret == -ENOBUFS) {
         bess::Packet::Free(pkt);
       }
     }
@@ -156,7 +181,7 @@ void Queue::DeInit() {
   bess::Packet *pkt;
 
   if (queue_) {
-    while (llring_sc_dequeue(queue_, (void **)&pkt) == 0) {
+    while (rte_ring_sc_dequeue(queue_, (void **)&pkt) == 0) {
       bess::Packet::Free(pkt);
     }
     std::free(queue_);
@@ -164,16 +189,17 @@ void Queue::DeInit() {
 }
 
 std::string Queue::GetDesc() const {
-  const struct llring *ring = queue_;
+  const struct rte_ring *ring = queue_;
 
-  return bess::utils::Format("%u/%u", llring_count(ring), ring->common.slots);
+  return bess::utils::Format("%u/%u", rte_ring_count(ring),
+                             rte_ring_get_size(ring));
 }
 
 /* from upstream */
 void Queue::ProcessBatch(Context *, bess::PacketBatch *batch) {
-  int queued =
-      llring_mp_enqueue_burst(queue_, (void **)batch->pkts(), batch->cnt());
-  if (backpressure_ && llring_count(queue_) > high_water_) {
+  int queued = static_cast<int>(
+      rte_ring_mp_enqueue_burst(queue_, (void **)batch->pkts(), batch->cnt(), nullptr));
+  if (backpressure_ && rte_ring_count(queue_) > high_water_) {
     SignalOverload();
   }
 
@@ -202,7 +228,8 @@ struct task_result Queue::RunTask(Context *ctx, bess::PacketBatch *batch,
 
   uint64_t total_bytes = 0;
 
-  uint32_t cnt = llring_sc_dequeue_burst(queue_, (void **)batch->pkts(), burst);
+  uint32_t cnt = static_cast<uint32_t>(rte_ring_sc_dequeue_burst(
+      queue_, (void **)batch->pkts(), burst, nullptr));
 
   if (cnt == 0) {
     return {.block = true, .packets = 0, .bits = 0};
@@ -224,7 +251,7 @@ struct task_result Queue::RunTask(Context *ctx, bess::PacketBatch *batch,
 
   RunNextModule(ctx, batch);
 
-  if (backpressure_ && llring_count(queue_) < low_water_) {
+  if (backpressure_ && rte_ring_count(queue_) < low_water_) {
     SignalUnderload();
   }
 
@@ -271,7 +298,7 @@ CommandResponse Queue::CommandSetSize(
 CommandResponse Queue::CommandGetStatus(
     const bess::pb::QueueCommandGetStatusArg &) {
   bess::pb::QueueCommandGetStatusResponse resp;
-  resp.set_count(llring_count(queue_));
+  resp.set_count(rte_ring_count(queue_));
   resp.set_size(size_);
   resp.set_enqueued(stats_.enqueued);
   resp.set_dequeued(stats_.dequeued);

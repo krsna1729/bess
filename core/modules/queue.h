@@ -31,7 +31,8 @@
 #ifndef BESS_MODULES_QUEUE_H_
 #define BESS_MODULES_QUEUE_H_
 
-#include "../utils/llring.h"
+#include <rte_ring.h>
+
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 
@@ -85,7 +86,7 @@ class Queue : public Module {
 
   CommandResponse SetSize(uint64_t size);
 
-  struct llring *queue_;
+  struct rte_ring *queue_;
   bool prefetch_;
 
   // Whether backpressure should be applied or not
