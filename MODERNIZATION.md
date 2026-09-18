@@ -49,7 +49,7 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-18, at commit `705782b3` on `develop`.
+Last updated: 2026-09-18, at commit `5f23e318` on `develop`.
 
 **CI is fully green and stable** through commit 18 / push `eea4fc5c`
 (both `build (g++)` and `build (clang++)` jobs, runs 35255310803 and
@@ -802,8 +802,8 @@ rather than one call site).
     Verified: `python3 -m unittest pybess.test_bess -v` 5/5 (was 1
     `ERROR`); confirmed no other test file references `vport`/`VPort` or
     the deleted sample filenames.
-25. **DPDK-proposal review folded into the roadmap (uncommitted as of this
-    writing)** — user provided a long external write-up surveying DPDK's
+25. **`5f23e318`** — **DPDK-proposal review folded into the roadmap.**
+    User provided a long external write-up surveying DPDK's
     evolution since ~2017 against BESS's 25.11.3-pinned state (~30
     proposed items) and asked for an Opus review + fold-in, with an
     explicit filter: "we should not adopt just for the sake of it, only
