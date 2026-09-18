@@ -206,7 +206,10 @@ void BM_PmdRingRoundTrip(benchmark::State &state) {
     rx_total += static_cast<uint64_t>(recvd);
     // Steady state: the ring is empty at iteration start (batch <= 32 is
     // far below the ring size and the previous iteration drained it), so
-    // recvd == sent every iteration; anything else indicates loss.
+    // recvd == sent every iteration. Enforced, not just documented: a
+    // future PMD/Stage-2 change that strands a packet would otherwise leak
+    // it into the next iteration and silently measure a shifted workload.
+    CHECK_EQ(recvd, sent);
     bess::Packet::Free(rx, recvd);
   }
   state.SetItemsProcessed(rx_total);
@@ -235,6 +238,7 @@ void BM_PmdRingRoundTripEndToEnd(benchmark::State &state) {
 
     int recvd = fx.ring_port.RecvPackets(0, rx, batch);
     rx_total += static_cast<uint64_t>(recvd);
+    CHECK_EQ(recvd, sent);  // self-loopback invariant, see above
     bess::Packet::Free(rx, recvd);
   }
   state.SetItemsProcessed(rx_total);

@@ -62,9 +62,13 @@
 // sequence verification, then the timed loop where the consumer only
 // counts (a verifying consumer becomes the ceiling at high producer
 // counts and would hide producer-side differences). Pass --pin_threads
-// to pin threads best-effort to distinct allowed CPUs; the default is
-// unpinned, because on a shared host pinning can force threads onto busy
-// cores (measured far slower here -- use it on quiet machines only).
+// to pin producers best-effort to distinct allowed CPUs (placement always
+// derives from a snapshot of the process's original mask, taken in main
+// before any pinning -- deriving it from an already-pinned thread would
+// collapse every producer onto one CPU); the default is unpinned, for
+// comparability with CI/sandbox runs. The benchmark thread itself is
+// never pinned, which also keeps Google Benchmark's per-thread CPU timer
+// accounting the real consumer work.
 //
 // Needs no EAL, no hugepages, no daemon: rings live in plain caller-owned
 // memory via the shared `utils/rte_ring_alloc.h` helpers.
@@ -151,22 +155,25 @@ struct RteHtsOps : public RteRingOps<RING_F_SC_DEQ | RING_F_MP_HTS_ENQ> {
 // Silently runs unpinned where affinity is unavailable; BESS is
 // Linux-only, so no portability shim.
 // Set via --pin_threads (stripped from argv in main before Google
-// Benchmark sees it). Default off: on a shared/noisy host, hard pinning
-// forces threads onto whatever cores happen to be busy (measured ~500x
-// slower in this sandbox), while the scheduler migrates away from them.
-// Enable explicitly for scaling studies on a quiet/dedicated machine.
+// Benchmark sees it). Default off: on a shared/noisy host the scheduler
+// usually places threads better than any static assignment; enable
+// explicitly for scaling studies on a quiet/dedicated machine.
 bool g_pin_threads = false;
+
+// The process's CPU allowance, snapshotted once in main before any thread
+// pins itself. Placement must ALWAYS derive from this snapshot, never from
+// a thread's own current affinity: threads inherit their creator's mask,
+// so deriving from the current mask collapses everything onto whatever
+// CPU the creator was pinned to (all N producers + consumer fighting for
+// one core -- measured ~500x slower before this was fixed, originally
+// misattributed to host noise).
+cpu_set_t g_allowed_cpus;
 
 void PinThread(int idx) {
   if (!g_pin_threads) {
     return;
   }
-  cpu_set_t allowed;
-  CPU_ZERO(&allowed);
-  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
-    return;
-  }
-  int ncpu = CPU_COUNT(&allowed);
+  int ncpu = CPU_COUNT(&g_allowed_cpus);
   if (ncpu <= 0) {
     return;
   }
@@ -174,7 +181,7 @@ void PinThread(int idx) {
   int seen = -1;
   int target = -1;
   for (int c = 0; c < CPU_SETSIZE; c++) {
-    if (!CPU_ISSET(c, &allowed)) {
+    if (!CPU_ISSET(c, &g_allowed_cpus)) {
       continue;
     }
     if (++seen == want) {
@@ -223,6 +230,33 @@ std::vector<std::thread> SpawnProducers(
   return producers;
 }
 
+// Consumer body shared by both phases. Always runs on the benchmark
+// (main) thread, which is deliberately never pinned: that keeps Google
+// Benchmark's per-thread CPU timer accounting the real work, and -- with
+// producers inheriting the full mask at spawn time -- the snapshot-based
+// PinThread above still places every producer correctly.
+template <typename Ops>
+void ConsumerLoop(typename Ops::Ring *ring, int num_producers, uint64_t total,
+                  uint64_t &consumed, bool verify) {
+  std::vector<void *> out(kBurst);
+  std::vector<uint64_t> expected(verify ? num_producers : 0, 0);
+  uint64_t n = 0;
+  while (n < total) {
+    unsigned m = Ops::DequeueBurst(ring, out.data(), kBurst);
+    if (verify) {
+      for (unsigned i = 0; i < m; i++) {
+        uint64_t v = reinterpret_cast<uint64_t>(out[i]);
+        int src = static_cast<int>(v >> 32);
+        CHECK(src >= 0 && src < num_producers);
+        CHECK((v & 0xffffffffu) == expected[src]);
+        expected[src]++;
+      }
+    }
+    n += m;
+  }
+  consumed = n;
+}
+
 // Untimed correctness phase, run once per (variant, producer count):
 // moves the full quota through a fresh ring checking exact per-producer
 // sequences, so the timed phase below can count cheaply. A ring that
@@ -238,22 +272,9 @@ void VerifyRing(int num_producers) {
   std::atomic<bool> start{false};
   std::vector<std::thread> producers =
       SpawnProducers<Ops>(ring, num_producers, bufs, start);
-  PinThread(num_producers);
-  start.store(true, std::memory_order_release);
-  std::vector<void *> out(kBurst);
-  std::vector<uint64_t> expected(num_producers, 0);
   uint64_t consumed = 0;
-  while (consumed < total) {
-    unsigned n = Ops::DequeueBurst(ring, out.data(), kBurst);
-    for (unsigned i = 0; i < n; i++) {
-      uint64_t v = reinterpret_cast<uint64_t>(out[i]);
-      int src = static_cast<int>(v >> 32);
-      CHECK(src >= 0 && src < num_producers);
-      CHECK((v & 0xffffffffu) == expected[src]);
-      expected[src]++;
-    }
-    consumed += n;
-  }
+  start.store(true, std::memory_order_release);
+  ConsumerLoop<Ops>(ring, num_producers, total, consumed, true);
   CHECK(consumed == total);
   for (auto &t : producers) {
     t.join();
@@ -276,15 +297,11 @@ void RunRingBenchmark(benchmark::State &state) {
     std::atomic<bool> start{false};
     std::vector<std::thread> producers =
         SpawnProducers<Ops>(ring, num_producers, bufs, start);
+    uint64_t consumed = 0;
     state.ResumeTiming();
 
-    PinThread(num_producers);
     start.store(true, std::memory_order_release);
-    std::vector<void *> out(kBurst);
-    uint64_t consumed = 0;
-    while (consumed < total) {
-      consumed += Ops::DequeueBurst(ring, out.data(), kBurst);
-    }
+    ConsumerLoop<Ops>(ring, num_producers, total, consumed, false);
     benchmark::DoNotOptimize(consumed);
 
     for (auto &t : producers) {
@@ -318,6 +335,10 @@ BENCHMARK(BM_RingRteHtsSc)->RangeMultiplier(2)->Range(1, 16);
 
 int main(int argc, char **argv) {
   google::InitGoogleLogging(argv[0]);
+  // Snapshot the process's CPU allowance once, before any thread pins
+  // itself: placement below always derives from this copy (see PinThread).
+  CPU_ZERO(&g_allowed_cpus);
+  CHECK(sched_getaffinity(0, sizeof(g_allowed_cpus), &g_allowed_cpus) == 0);
   // Strip our own flag before Google Benchmark parses argv (it errors on
   // unrecognized arguments).
   int w = 1;
