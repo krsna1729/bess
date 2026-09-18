@@ -49,26 +49,26 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-18, at commit `7cf7ccc0` on `develop`.
+Last updated: 2026-09-18, at commit `7bb99eed` on `develop`.
 
-**CI is fully green and stable** through commit 18 / push `eea4fc5c`
-(both `build (g++)` and `build (clang++)` jobs, runs 35255310803 and
-35255689088; the original from-scratch DPDK-rebuild confirmation was run
-34714875102). Getting here took commits 5 (trigger fix), 9-12 (the
-checksum.h correction chain), 13 (9 clang-only portability bugs), 14
-(benchmark suite), and 15 (the CPU=corei7 CI reliability fix) — see the
+**CI is fully green and stable** through `7bb99eed` (both `build (g++)`
+and `build (clang++)` jobs, run 35345541633). The road there, in brief:
+commits 5 (trigger fix), 9-12 (the checksum.h correction chain), 13 (9
+clang-only portability bugs), 14 (benchmark suite), 15 (the CPU=corei7 CI
+reliability fix), 16-17 (Phase B Stage 1, `dea288f9`+`f22a69eb`), 18
+(hardening research), 19 (C++23 bump + 2 latent bug fixes), 21+24
+(`core/kmod`/`VPort` removal + review-found pybess fix), 25 (DPDK-proposal
+review fold-in), 26 (descriptor-clamping replacement `7ac9d660`), 27 (PMD
+benchmark `cef92c50`), 28 (`llring` removal `0bda5a84`) — see the
 completed-work log below for the full history if picking this up cold.
 
-**Not yet pushed as of this writing**: commits 19-24 --
-the C++23 build bump + 2 real bug fixes it surfaced (19), the C++26
-toolchain experiment doc (20), the `core/kmod`/`VPort` removal (21), the
-C++23 bump's Opus review + perf-claim correction with real throughput
-numbers (22), the `core/kmod`/`VPort` removal's Opus review (23, found a
-real CI-breaking regression), and the fix for that regression (24). All
-verified locally (clean build + full test suite under both compilers,
-`run_module_tests.py`/`pybess` unit tests clean, each checkpoint on its
-own) but **never run through GitHub Actions yet** — push and get a fresh
-CI run next if picking this up cold.
+**Not yet pushed as of this writing**: the review-follow-up corrections
+to commits 27-28 — `alignof(rte_ring)` caller-owned storage fix (+ shared
+`utils/rte_ring_alloc.h` helper), `ring_bench` verify/timed split +
+opt-in pinning, `pmd_bench` sent-accounting + `EndToEnd` twins, and the
+zero-copy factual correction. Verified locally (below) but **never run
+through GitHub Actions yet** — push and get a fresh CI run next if
+picking this up cold.
 
 Phase B Stage 1 (commits 16-17 / `dea288f9`+`f22a69eb`, `core/packet.h`'s
 private-area accessor — `BessPacketPrivate`/`priv()` — plus the Opus-review
@@ -931,9 +931,15 @@ rather than one call site).
     10-30% vs the explicit sync-mode entry points (runtime flag
     dispatch) — the first full run measured the wrappers and would have
     kept `llring` on false grounds; re-ran explicit-against-explicit
-    (which is also what a migrated `Queue` calls); (b) DPDK 25.11 has no
-    ring zero-copy API at all, so the "HTS + zero-copy" variant from the
-    backlog text was dropped unmeasurable. Verdict (5-rep medians,
+    (which is also what a migrated `Queue` calls); (b) DPDK 25.11 *does*
+    ship a ring zero-copy API (`rte_ring_{en,de}queue_zc_burst_{start,
+    finish}` in `rte_ring_peek_zc.h`, reached via `rte_ring_elem.h` — an
+    earlier grep of `rte_ring.h` alone missed it and wrongly recorded it
+    as absent, corrected 2026-09-18) but it was still dropped from the
+    comparison: it wasn't needed to justify the removal, and its win
+    applies to producers writing directly into reserved slots, not to
+    this pointer-handoff shape. HTS+ZC stays an optional follow-up
+    optimization experiment, not a migration question. Verdict (5-rep medians,
     M items/s, llring vs rte-MP/SC at 1/2/4/8/16P):
     253/243/196/132/100 vs 320/273/212/139/100 — rte faster-or-equal
     everywhere, RTS/HTS no better. Per the decision rule the header went:
@@ -956,6 +962,39 @@ rather than one call site).
     evidence). No Opus review: measurement-led mechanical migration, and
     its own unit tests demonstrably covered the riskiest seam (return
     conventions).
+29. **`e740b6b5`** — **Review follow-ups to entries 27-28** (external review of
+    `cef92c50`/`0bda5a84`, verdict: keep the `llring` removal, fix listed
+    items first). (a) **Real portability bug, fixed**: caller-owned
+    `rte_ring` storage was hardcoded to 64-byte alignment in four places;
+    the type is `alignas(RTE_CACHE_LINE_SIZE)` (64 here, larger on some
+    ARM64 — silent UB there). New shared `core/utils/rte_ring_alloc.h`
+    (`AllocRingMem` on `alignof(rte_ring)`, unique-name helper), used by
+    `Queue`, `DRR`, `LockLessQueue`, and `ring_bench`. (b) **Factual
+    correction**: DPDK 25.11 *does* ship a ring zero-copy API
+    (`rte_ring_peek_zc.h`, included via `rte_ring_elem.h` — the earlier
+    "absent" claim came from grepping `rte_ring.h` only). Decision
+    unchanged (ZC wasn't needed to justify the removal); HTS+ZC stays an
+    optional follow-up, backlog item 2 and entry 28 corrected. (c)
+    `ring_bench` methodology: untimed exact-verification phase once per
+    (variant, count), timed loop counts only (a verifying consumer becomes
+    the ceiling at high producer counts); `--pin_threads` opt-in flag for
+    quiet-machine scaling studies, default unpinned (pinning measured
+    ~500x slower in this shared sandbox — scheduler migrates away from
+    busy cores, pinning can't). Restructured-bench baselines (MP/SC
+    medians, M/s at 1/2/4/8/16P): 274/232/183/126/95 — same band as the
+    decision run; the verdict table in entry 28 stands (it was
+    same-structure, same-session). (d) `pmd_bench`: `NullTx` reports
+    actual sent with drops explicit, plus `EndToEnd` twins (alloc through
+    free timed) for allocator-adjacent questions; comments now state which
+    family measures what. Restructuring the bench caught its own lifetime
+    bug first: threads spawned from a helper captured the ring pointer by
+    reference to the helper's dead parameter (segfault) — fixed by
+    by-value capture, with a comment at the site. Verified: full g++
+    rebuild clean, `all_test` 184/185 (sole failure the known `CodelTest`
+    flake, 6/6 in isolation), module tests 22 files OK, python units
+    84/84, clang++ TU-clean on all six touched/new files, both benches
+    re-run clean. Status snapshot above refreshed alongside (it still
+    described commits 19-24 as unpushed).
 
 ## Review process established this session
 
@@ -2366,7 +2405,12 @@ the rejected list for what's already been decided either way.
     were already linked and `PMDPort` already accepted `vdev=`.
     `BM_PmdNullTx` (TX + alloc/free rate) and `BM_PmdRingRoundTrip`
     (self-loopback through real `rte_eth_rx/tx_burst`), batch sweep 1-32,
-    zero drops throughout. Baseline medians (this sandbox, g++, malloc-
+    zero drops throughout. A later review pass corrected two weaknesses
+    without changing the numbers' meaning: `NullTx` now reports actual
+    sent (not requested) items with drops as an explicit counter, and two
+    `EndToEnd` twins (alloc + TX + RX + free all timed) were added for
+    allocator-adjacent questions, since the originals time only the
+    PMD/interface boundary by design. Baseline medians (this sandbox, g++, malloc-
     backed `--no-huge` EAL — relative comparisons only, not production
     numbers): NullTx 4.5→100.7M/s, RingRoundTrip 4.6→108.3M/s at batch
     1→32. Still open on top of it: the cross-worker
