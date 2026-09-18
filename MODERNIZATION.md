@@ -49,27 +49,33 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-17, at commit `95f5231f` on `develop`.
+Last updated: 2026-09-18, at commit `90d908f7` on `develop`.
 
-**CI is fully green and stable** (both `build (g++)` and `build (clang++)`
-jobs passing, including the new benchmark smoke-test step — run
-34714875102, with a from-scratch DPDK rebuild forced by the cache-key
-change in commit 15, so this is a clean-slate confirmation, not a lucky
-cache hit). Getting here took commits 5 (trigger fix), 9-12 (the
+**CI is fully green and stable** through commit 18 / push `eea4fc5c`
+(both `build (g++)` and `build (clang++)` jobs, runs 35255310803 and
+35255689088; the original from-scratch DPDK-rebuild confirmation was run
+34714875102). Getting here took commits 5 (trigger fix), 9-12 (the
 checksum.h correction chain), 13 (9 clang-only portability bugs), 14
-(benchmark suite), and 15 (the CPU=corei7 CI reliability fix, which
-explains why runs 34701174001/34701493223 flakily failed in between with
-SIGILL even though nothing code-relevant had changed) — see the
+(benchmark suite), and 15 (the CPU=corei7 CI reliability fix) — see the
 completed-work log below for the full history if picking this up cold.
+
+**Not yet pushed as of this writing**: commits 19-21 (the C++23 build
+bump + 2 real bug fixes it surfaced, the C++26 toolchain experiment doc,
+and the `core/kmod`/`VPort` removal), plus commit 22 (the C++23 bump's
+Opus review — verdict: correct, both fixes complete, `CodelTest` flake
+definitively confirmed pre-existing/unrelated; one evidence gap found and
+closed with real throughput numbers, see entry 22 — no regression, the
+scheduler path is if anything ~10-14% faster at larger batch sizes).
+Push and get a fresh CI run next if picking this up cold — all of 19-21
+were verified locally (clean build + full test suite under both
+compilers, `run_module_tests.py` clean, each on its own) but never
+run through GitHub Actions yet.
 
 Phase B Stage 1 (commits 16-17 / `dea288f9`+`f22a69eb`, `core/packet.h`'s
 private-area accessor — `BessPacketPrivate`/`priv()` — plus the Opus-review
-fixes on top) has since landed on top of that and is **pushed and
-CI-confirmed green** (both jobs, run 35255689088; the code-carrying push's
-own run, 35255310803, was also green). See Phase B's own section below for
-what it does and why the original single-shot Phase B plan was split into
-two stages. A C++ hardening/compiler-ecosystem research note (commit 18,
-non-actionable backlog input for Phase H/I) is also in on top of that.
+fixes on top) is **pushed and CI-confirmed green** (both jobs, run
+35255689088). See Phase B's own section below for what it does and why
+the original single-shot Phase B plan was split into two stages.
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
@@ -621,6 +627,105 @@ rather than one call site).
     which compiler implements the language core, so this doesn't change
     Phase H's existing recommendation to stay on C++23 for now -- recorded
     purely so a future session doesn't have to re-derive this.
+21. **`90d908f7`** — **Removed `core/kmod` and the `VPort` driver entirely**
+    — user asked directly to get rid of `core/kmod`.
+    Investigated first rather than deleting blindly: `core/kmod/` mixed
+    genuinely-dead kernel-module source (`sn_host.c`, `sn_netdev.c`,
+    `sn_ethtool.c`, `sndrv.c`, `sn_kernel.h` -- known-broken on modern
+    kernels per upstream `#1056`, never built by this session's CI/build
+    path) with two headers still load-bearing for other, unrelated,
+    working code: `llring.h` (a general-purpose lock-free ring buffer used
+    by `core/modules/queue.h`/`drr.h` and `core/utils/lock_less_queue.h`
+    -- nothing to do with the kernel module) and `sn_common.h` (the
+    vport/kmod shared-memory IPC protocol structs, whose only consumer was
+    `core/drivers/vport.cc`/`.h`). Given the choice between removing just
+    the kernel module (relocating the two shared headers) or also removing
+    `VPort` (which only exists to talk to that kernel module via
+    `/dev/bess`, so is dead-but-harmless without it), user chose the
+    latter -- full removal. Did: relocated `core/kmod/llring.h` to
+    `core/utils/llring.h` (`git mv`, preserves history) and updated its 3
+    include sites; deleted `core/drivers/vport.{cc,h}`, the rest of
+    `core/kmod/` (`sn_common.h` included, since nothing needed it once
+    `vport.cc` was gone), and 5 VPort-only sample `.bess` configs under
+    `bessctl/conf/` (not part of any automated test); removed `VPortArg`
+    from `protobuf/ports/port_msg.proto`; removed a dead
+    `friend class ZeroCopyVPortTest;` declaration in `core/port.h` (the
+    class was never defined anywhere in the tree); removed
+    `build.py`/`container_build.py`'s `build_kmod`/`build_kmod_buildtest`
+    functions, their `kmod`/`kmod_buildtest` CLI actions, and the
+    now-unused `kernel_release`/`is_kernel_header_installed()` helpers
+    (verified both were only ever used by `build_kmod()`); updated stale
+    comments in `core/snbuf_layout.h`, `core/packet.h` (the
+    `CheckPrivLayout()` comment explaining why the scratchpad offset is
+    pinned -- kept the assert, since it's still cheap general insurance,
+    just fixed the now-wrong "cross-language ABI contract with
+    core/kmod/sn_common.h" justification), and `.github/workflows/ci.yml`
+    (dropped the "core/kmod build/build-test is not run here" known-gap
+    comment, since there's no longer a kmod to not-build).
+    `pybess/test_bess.py`'s `test_create_port` passes the string `'VPort'`
+    to a **mock** gRPC servicer defined in the same test file -- confirmed
+    by reading it that this doesn't touch the real C++ `PortBuilder`
+    registry at all, so needed no change. `bin/dpdk-devbind.py`'s `kmod/`
+    reference is upstream DPDK's own vendored script (Intel copyright
+    header) with an unrelated meaning (DPDK's own kernel driver binding),
+    not touched.
+22. **Opus review of `f2f3bf84`** (the C++23 bump, commit 19) came back:
+    **correct, both bug fixes right and complete** -- independently
+    re-derived every claim (byte-identical `Packet::copy()` disassembly
+    between standards; a tree-wide scan found no second occurrence of
+    either bug class; confirmed clean builds under both compilers,
+    185/185 tests each). It also **definitively settled the `CodelTest`
+    flake question** commit 19 had only asserted: reproduced under g++
+    (1/10 runs under CPU load) *and* under a temporary `-std=c++17`
+    rebuild (2/12 under load, same two tests) -- decisive proof the flake
+    predates this commit entirely; under clang++ it's nondeterministic
+    (different assertion line fails each run), ruling out a fixed
+    miscompile. Confirms this doc's longstanding "known pre-existing
+    flake, don't chase it" note was right.
+
+    **One real gap found (not a defect, an evidence gap)**: commit 19's
+    "no dataplane performance regression" claim was based on `packet.o`
+    alone, and doesn't generalize -- paired `-std=c++17`/`-std=c++23`
+    object-file comparison across the whole tree found real `.text`
+    growth in hot dataplane code (`core/modules/drr.o` +39%,
+    `WildcardMatch::ProcessBatch` +18%, plus `traffic_class.o`, `nat.o`,
+    `exact_match.o`). The review's own disassembly of the worst case
+    found a likely-benign cause: `Task::AddToRun` got **inlined into**
+    `WildcardMatch::ProcessBatch` under C++23 (one fewer call on the
+    packet path, not added work) -- traced to the same root cause as
+    `Packet::Dump()`'s growth, C++20's `constexpr`-ification of libstdc++
+    `string`/`vector` changing what the inliner can see across every TU
+    that touches them. But this was reasoned from static code, not
+    measured. Followed up with real throughput numbers on
+    `traffic_class_bench`'s `TCWeightedFair` suite (the scheduler
+    hot-path the review flagged specifically, 3 reps/0.2s min-time,
+    paired `-std=c++17`-worktree vs. current `-std=c++23` build): C++23
+    is **consistently as fast or faster** across every batch size, with
+    the larger cases (16384-65536 packets) **~10-14% faster**, beyond
+    what stddev explains -- confirms the review's inlining hypothesis
+    with actual measurement, not just architectural reasoning. No
+    regression found anywhere; if anything, a modest real improvement in
+    the scheduler path. `url_filter_bench`'s `BM_FlowHash` was flat
+    (noise-level either way, and too simple a benchmark to be very
+    informative here).
+
+    Also flagged, not yet acted on: `std::is_pod` (13 sites across
+    `core/utils/*.h`/`pktbatch.h`) is removed outright in C++26 (not just
+    deprecated) -- confirmed to be the concrete reason commit 20's
+    `clang++-20 -std=c++26` experiment only compiled clean because
+    libstdc++ still ships it as an extension; mechanical fix is
+    `is_standard_layout_v<T> && is_trivial_v<T>`, not done here, noted as
+    backlog for whenever Phase H actually pursues C++26. `core/gate.h`'s
+    `std::unary_function` base (removed from the standard in C++17,
+    libstdc++-extension-only already, and dropped entirely by libc++
+    >= 17) is pre-existing, unrelated to this commit, same backlog bucket.
+    The review's cited "~26-49% coefficient of variation" for
+    `checksum_bench` didn't reproduce on an idle re-run (0.9-2.6%) --
+    likely a load artifact from whatever else this sandbox was doing at
+    the time -- but the underlying conclusion (no real per-standard
+    effect) holds for a stronger reason: every `checksum.h` kernel is
+    hand-written `asm volatile` with a `"memory"` clobber, so its codegen
+    physically cannot vary with the language standard.
 
 ## Review process established this session
 
@@ -669,10 +774,9 @@ it's a standing instruction from the user, not a one-time thing.
       comment, not structurally fixed (see `9e8c4af1` commit message for why
       the obvious fix — `core/extra.mk` — doesn't work: it's `-include`d too
       late relative to where `DPDK_INSTALL_DIR` is first used).
-- [ ] `core/kmod` (legacy out-of-tree VPort kernel module) is not built or
-      tested by anything currently — known-broken on modern kernels per
-      upstream `#1056`. Making it optional/legacy-by-default is backlog
-      Phase C.
+- [x] `core/kmod` (legacy out-of-tree VPort kernel module) — resolved by
+      full removal rather than the originally-proposed "make it optional"
+      (see the completed-work log entry for this, and Phase C below).
 - [x] `.github/workflows/ci.yml` has now actually run against real GitHub
       Actions repeatedly this session (see commits 5, 12-ish onward) — the
       g++ job passes; the clang++ job needed 9 real portability fixes
@@ -816,10 +920,12 @@ union (`buf_addr_`, `data_off_`, `pkt_len_`, `next_`, etc.) and
 The actual `PacketRef`-over-`rte_mbuf*` wrapper, the `PacketPool` allocator
 redesign, the `PMDPort::RecvPackets`/`SendPackets` wrap/unwrap redesign at
 the `rte_eth_{rx,tx}_burst` boundary, dynamic per-pool data-room sizing
-(jumbo frames), and revisiting `core/drivers/vport.cc`/`pcap.cc`'s
+(jumbo frames), and revisiting `core/drivers/pcap.cc`'s
 `reinterpret_cast<Packet*>(snb->next())`-style multi-segment chain walking
 (fine while the `rte_mbuf` overlay still exists; becomes an issue once
-Stage 2 removes it). See the original modernization-plan analysis of
+Stage 2 removes it) — `vport.cc` had the same pattern but was removed
+entirely along with `core/kmod`, see Phase C. See the original
+modernization-plan analysis of
 `core/packet.h` earlier in this project's history for the detailed design
 sketch (`PacketRef`, offset-resolved `MetadataRef<T>`) — `BessPacketPrivate`
 from that same sketch is now already real, see Stage 1 above. High risk,
@@ -877,13 +983,34 @@ covers the "scheduler throughput" leg of Phase B's requirement in full.
 
 ## Phase C — Linux I/O modernization
 
-Make VFIO the primary physical-NIC path and AF_XDP the primary Linux
-host/container path; keep vhost-user for VMs. Move `core/kmod` behind an
-explicit "legacy, unsupported by default" build flag rather than something
-`bessd` tries to auto-load on startup (see current behavior:
-`vport.cc:318` logs a warning and moves on when it's missing — that's
-already graceful, but the fallback direction should flip: VFIO/AF_XDP should
-be first-class, kmod optional).
+- [x] `core/kmod` (the legacy out-of-tree VPort kernel module -- `sn_host.c`,
+      `sn_netdev.c`, `sn_ethtool.c`, `sndrv.c`, `sn_kernel.h`, its own
+      `Makefile`/`install` script) and the `VPort` driver that was its only
+      consumer (`core/drivers/vport.cc`/`.h`) were **removed entirely**
+      (see the completed-work log), not merely made optional as originally
+      proposed here -- upstream `#1056` already documented it as
+      known-broken on modern kernels, and it was never built or tested by
+      anything in this session's CI/build (`build.py`'s `build_kmod()`
+      wasn't in the default `build_all()`/CI path either). Two things it
+      owned that other, still-working code actually needed were kept, just
+      relocated: `llring.h` (a general-purpose lock-free ring buffer used
+      by `Queue`/`DRR` modules and `core/utils/lock_less_queue.h` --
+      nothing to do with the kernel module itself) moved to
+      `core/utils/llring.h`; `sn_common.h` (the vport/kmod IPC protocol
+      structs) had no other consumer once `vport.cc` was gone, so it went
+      too. `VPortArg` removed from `protobuf/ports/port_msg.proto`
+      (dead once nothing registers a `"vport"` driver); 5 VPort-only
+      sample `.bess` configs under `bessctl/conf/` removed (not part of
+      any automated test, would have silently stopped working).
+      `pybess/test_bess.py`'s `test_create_port` passes `'VPort'` as a
+      string to a **mock** gRPC servicer defined in that same test file --
+      confirmed it doesn't touch the real C++ driver registry, so it needed
+      no change.
+- [ ] Make VFIO the primary physical-NIC path and AF_XDP the primary Linux
+      host/container path; keep vhost-user for VMs. With kmod gone, there's
+      no "kmod optional" fallback-direction flip left to design -- VFIO/
+      AF_XDP just need to become the actual Linux port drivers, from
+      scratch, whenever this phase is picked up.
 
 ## Phase D — ARM64 + portable SIMD
 
