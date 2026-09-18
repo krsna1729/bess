@@ -802,6 +802,50 @@ rather than one call site).
     Verified: `python3 -m unittest pybess.test_bess -v` 5/5 (was 1
     `ERROR`); confirmed no other test file references `vport`/`VPort` or
     the deleted sample filenames.
+25. **DPDK-proposal review folded into the roadmap (uncommitted as of this
+    writing)** — user provided a long external write-up surveying DPDK's
+    evolution since ~2017 against BESS's 25.11.3-pinned state (~30
+    proposed items) and asked for an Opus review + fold-in, with an
+    explicit filter: "we should not adopt just for the sake of it, only
+    things which make BESS faster, less maintenance burden, without
+    losing flexibility and developer ergonomics." The review verified the
+    document's factual claims against the real tree at `705782b3` rather
+    than trusting them, and found the document **unusually accurate on
+    DPDK-side facts and unusually wrong about what BESS already has** --
+    most importantly, several of its proposals described work already
+    done (`PMDPort` already accepts arbitrary vdevs, including vhost-user
+    -- `bessctl/conf/port/vhost/vhost.bess` already does this) or targeted
+    a subsystem this session had already deleted (the document's proposed
+    memory-model split assumed the `VPort`/`kmod` legacy path this
+    session's commit 21 already removed). After filtering: **6 items
+    landed as concrete backlog now** (Phase B Stage 2 scope notes on the
+    now-dead `paddr`/`vaddr` plumbing; Phase C's `PMDPort` vdev-substrate
+    scope correction, `rte_eth_dev_adjust_nb_rx_tx_desc()`, a narrow
+    consumer-driven `PortCapabilities`, and the `WorkerId`-vs-lcore-ID
+    decoupling; Phase F's `DumpMempool()` backend-independence fix), **4
+    items became explicit benchmark/experiment backlog** (`llring` vs
+    modern `rte_ring`, mempool backend/cache-size, DPDK's `rte_bpf` vs
+    BESS's 1066-line hand-written FreeBSD-derived x86 JIT -- the
+    strongest maintenance-reduction candidate found, and `rte_fib` vs
+    `rte_lpm`), **one new cross-cutting phase was added** (Phase J,
+    RCU/QSBR-based live table updates -- verified the actual current
+    mechanism is worse than the source document described:
+    `THREAD_UNSAFE` commands are *refused* with `EBUSY` while any worker
+    runs, not merely routed through a pause, and `bessctl` works around
+    that by unconditionally pausing every worker for *every* module
+    command, thread-safe ones included), and **16 items were explicitly
+    rejected** with reasoning recorded (`rte_hash` replacing `CuckooMap`,
+    `rte_acl` replacing the toy `ACL` module, a NAT RSS-affinity feature
+    whose premise — multi-worker NAT — doesn't exist in this codebase,
+    `rte_flow`, DMAdev, `pdump` (blocked by `--no-shconf`), and others —
+    see "Rejected from the 2026-09-18 DPDK-proposal review" below). Every
+    library proposed across all ~30 items is already linked into `bessd`
+    today (`libdpdk.pc`'s `--whole-archive` list includes
+    `librte_{acl,fib,rcu,bpf,hash,stack,...}.a`), so none of the surviving
+    experiment items carry a new-dependency cost. Not yet reviewed by a
+    second Opus pass (this was itself the review of external material,
+    not a diff of BESS's own code, so the usual "review the review"
+    pattern doesn't apply the same way) or pushed as of this writing.
 
 ## Review process established this session
 
@@ -882,7 +926,9 @@ rethink of the control plane and language/tooling stack — added 2026-09-11.
 **G and the A–F track are largely independent** (G touches `bessctl`/gRPC/the
 client side; A–F touch the dataplane/DPDK/build side); either can proceed
 first. Read the "how G relates to A–F" note at the start of Phase G before
-picking one.
+picking one. Phase J (RCU/QSBR live table updates) was added 2026-09-18
+from an external DPDK-modernization review and is cross-cutting — see its
+own intro for why it doesn't fit under A–I.
 
 ## Phase A — DPDK/build modernization (complete as of 2026-09-12)
 
@@ -1008,6 +1054,65 @@ from that same sketch is now already real, see Stage 1 above. High risk,
 hot-path-touching — needs a dedicated design spike and explicit user
 sign-off before any code, not started now.
 
+### DPDK-proposal review notes (2026-09-18)
+
+An Opus review of an external DPDK-modernization proposal (see this doc's
+"Roadmap / Backlog" intro and the new Phase J below for the full context)
+found three things specifically relevant to Stage 2's scope, all verified
+against the tree at `705782b3`:
+
+- **The `paddr`/`vaddr` layer is dead code, not a subsystem needing
+  stronger types.** `PacketPool::from_paddr()` (`core/packet_pool.h:69`,
+  `packet_pool.cc:261`) and `Packet::paddr()`/`vaddr()` (`core/packet.h`)
+  had `core/drivers/vport.cc` as their *only* consumers (confirmed via
+  `git grep` at `90d908f7^`, call sites at `vport.cc:95,113,133,147,
+  617,652,682`). Since commit 21 removed VPort, nothing reads any of
+  them; `InitPacket()` (`packet_pool.cc:24-25`) still *writes*
+  `vaddr_`/`paddr_` per packet into fields with no reader, and
+  `sid_`/`index_` are written nowhere outside `core/packet_test.cc`. An
+  external proposal suggested introducing `Iova`/`PhysAddr`/
+  `VirtualAddress` strong types to describe this field — reject that:
+  there is no live consumer left to type. **Stage 2 should delete the
+  24-byte `immutable_` union from `BessPacketPrivate` (`core/packet.h`)
+  instead.** This shrinks `SNBUF_RESERVE` and moves
+  `SNBUF_METADATA_OFF`/`SNBUF_SCRATCHPAD_OFF`, so it's genuinely Stage 2
+  territory (a layout change, pinned by `CheckPrivLayout()`), not a
+  Stage-1 follow-up to do now.
+- **A third Stage 2 blocker, not previously listed here:**
+  `PacketPool::AllocBulk()` (`core/packet_pool.cc:118-145`) writes
+  `Packet`'s mirrored mbuf fields with raw `_mm_store_si128` into
+  `rearm_data_`/`rx_descriptor_fields1_`, hand-reproducing
+  `rte_pktmbuf_reset()`'s two 16-byte stores. This is simultaneously a
+  Stage 2 blocker of the same kind as the `PMDPort::Recv/SendPackets`
+  `reinterpret_cast` already listed above, *and* an x86-only SSE
+  intrinsic block that Phase D has to deal with. Stage 2 and Phase D
+  should agree on who owns it before either starts.
+- **Verdict on "Stage 2 is more important than it first appeared"**
+  (the external proposal's headline claim): agree with the conclusion,
+  disagree with the reasoning. It framed Stage 2 as "the point BESS
+  stops carrying the pre-2018 DPDK memory model forward" — but the
+  `kmod`/`VPort` removal already deleted the one subsystem
+  (`BessPacketPool`'s self-managed-hugepage/physical-contiguity path's
+  only unique consumer) that framing depended on. `--legacy-mem`
+  (`core/dpdk.cc:126`) remains, but whether it's droppable is a
+  live-hardware question this sandbox cannot answer (no hugepages, no
+  NIC) — it is blocked on a test rig, not on Stage 2. What Stage 2
+  genuinely unlocks, and the honest argument for its priority: **external
+  mbuf buffers** (the real enabler for AF_XDP/vhost zero-copy, see Phase
+  C), **per-pool data-room sizing** (jumbo frames, already listed above),
+  and **`MBUF_FAST_FREE` eligibility** (see Phase C). Keep Stage 2's
+  priority high for those three, not for a memory-model-lineage argument
+  the kmod removal already partly resolved.
+- **Also verified, and correctly rejected by the proposal itself: don't
+  replace BESS metadata with mbuf dynamic fields.** BESS's metadata
+  system is a graph-liveness-aware offset allocator; dynfields are a flat
+  registry with a shared, tiny (36-byte) budget across every DPDK
+  subsystem on the process (already noted in Phase B's own header
+  above). Use dynfields only for genuine DPDK-ecosystem contracts (flow
+  marks, hardware timestamps) if a future feature needs interop with
+  another DPDK subsystem that reads them — not for BESS's own logical
+  attributes.
+
 ### Benchmark suite (added 2026-09-12, commit 14)
 
 Correcting an error in this doc's own earlier text (both here and in Phase
@@ -1078,15 +1183,139 @@ covers the "scheduler throughput" leg of Phase B's requirement in full.
       (dead once nothing registers a `"vport"` driver); 5 VPort-only
       sample `.bess` configs under `bessctl/conf/` removed (not part of
       any automated test, would have silently stopped working).
-      `pybess/test_bess.py`'s `test_create_port` passes `'VPort'` as a
-      string to a **mock** gRPC servicer defined in that same test file --
-      confirmed it doesn't touch the real C++ driver registry, so it needed
-      no change.
+      `pybess/test_bess.py`'s `test_create_port` passed `'VPort'` as a
+      string to a **mock** gRPC servicer defined in that same test file, so
+      the servicer itself needed no change -- but this reasoning missed
+      that `pybess/bess.py`'s `create_port()` does
+      `getattr(port_msg, driver + 'Arg', EmptyArg)` **before the RPC is
+      even sent**, so removing `VPortArg` broke the test client-side. A
+      later review caught and fixed this (see completed-work log entries
+      23-24) -- left as a cautionary note here since it's a good example
+      of "verified the obvious half of a claim, missed the other half."
+- [x] **Scope-corrected and substantially descoped (2026-09-18, DPDK-proposal
+      review): `PMDPort` already accepts arbitrary DPDK vdevs.**
+      `protobuf/ports/port_msg.proto` has `oneof port { port_id | pci |
+      vdev }` and `core/drivers/pmd.cc`'s `find_dpdk_vdev()` (via
+      `rte_dev_probe()` + `RTE_ETH_FOREACH_MATCHING_DEV`) already
+      implements it. `deps/dpdk-25.11.3/install/lib/pkgconfig/libdpdk.pc`
+      already links `librte_net_{vhost,tap,af_packet,memif,null,ring}.a`
+      under `--whole-archive` -- **zero additional dependency cost** to
+      use any of them. Concretely:
+      - **vhost-user is already done.**
+        `bessctl/conf/port/vhost/vhost.bess` already runs
+        `PMDPort(vdev='eth_vhost_...')`. The "keep vhost-user for VMs, but
+        first-class it via a modern PMD" framing below described work
+        BESS already shipped years ago -- no new driver needed. Unverified
+        residual: whether the `eth_vhost` devargs alias still resolves
+        under DPDK 25.11 vs. the current `net_vhost` driver name; worth a
+        smoke test when a rig exists, not a design question.
+      - **TAP / AF_PACKET / memif / null / ring, and switchdev
+        representors** (via `...,representor=vf[0-3]` devargs on an
+        existing `pci`/`vdev` port) are likewise reachable with **no new
+        BESS code** -- this item is a documentation/config-ergonomics
+        task, not an engineering project.
+      - **AF_XDP is the one real gap, and it's a build gap, not a code
+        gap.** This tree's DPDK build produces no `librte_net_af_xdp.*`
+        (confirmed absent from `deps/dpdk-25.11.3/install/lib/`) because
+        DPDK's AF_XDP PMD needs `libxdp`/`libbpf` present at *DPDK* build
+        time. Work item: add `libxdp-dev`/`libbpf-dev` to the DPDK build
+        prerequisites (`build.py`, `.github/workflows/ci.yml`, `env/`),
+        confirm `librte_net_af_xdp` appears, then expose `net_af_xdp`
+        through the existing `vdev` arg with BESS-side config sugar.
+        **Do not write a new `AF_XDPPort : Port` driver** -- that's new
+        code to own for something ethdev already covers.
+      - Small ergonomic follow-up once AF_XDP works: `PMDPortArg`
+        currently exposes only `loopback` and three VLAN-offload
+        booleans; long vdev devargs strings are the whole configuration
+        surface today. A few named fields (queues, zero-copy mode,
+        busy-poll) would be worth adding as BESS-level semantics, not raw
+        devargs passthrough.
+      - VFIO for physical NICs was already the normal `PMDPort` path
+        before this review (`pci=` args) -- nothing new needed there
+        either. The net effect of this whole scope correction: this phase
+        is mostly a config-ergonomics and one-build-flag-addition task,
+        not the ground-up multi-driver effort it read as before.
+- [ ] **Replace `PMDPort::Init()`'s hand-rolled descriptor clamping with
+      `rte_eth_dev_adjust_nb_rx_tx_desc()`** (DPDK-proposal review,
+      2026-09-18). `core/drivers/pmd.cc` clamps `queue_size[]` against
+      `dev_info.rx_desc_lim.nb_min`/`nb_max` and `tx_desc_lim.nb_min`/
+      `nb_max` by hand -- but **ignores `nb_align`** (`rte_ethdev.h`,
+      "Number of descriptors should be aligned to"), which several PMDs
+      enforce and which causes a later `rte_eth_{rx,tx}_queue_setup()`
+      failure rather than a silent adjustment.
+      `rte_eth_dev_adjust_nb_rx_tx_desc()` is DPDK's own answer and
+      handles min/max/align in one call. Net effect: ~36 lines of
+      hand-rolled clamping deleted, one latent misconfiguration class
+      closed -- same "offset/limit math assumed correct by construction"
+      bug family as the two Phase A ABI-drift bugs. Configuration path
+      only, no performance implication. Small, low-risk, do this one
+      without a design spike.
+- [ ] **A minimal, consumer-driven `PortCapabilities` in `PMDPort`**
+      (DPDK-proposal review, 2026-09-18) -- explicitly **not** a
+      speculative capability struct built ahead of its consumers.
+      Verified: `PMDPort` does essentially no offload negotiation today
+      (`rxmode.offloads = 0`, `txmode` never touched); the one existing
+      negotiation is RSS hash types masked against
+      `dev_info.flow_type_rss_offloads`. Introduce a small **internal**
+      struct populated once from `rte_eth_dev_info` at `Init()`, and only
+      as consumers land -- not exposed in the protobuf API (that's Phase
+      G2's `GetCapabilities`, which already has the right rule: expose
+      BESS semantics, never raw `RTE_ETH_*` flags, same principle as
+      Phase B's `PacketRef` work). First three consumers, in order: (1)
+      the `adjust_nb_rx_tx_desc` item above; (2)
+      `RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE` gating -- benchmark-gated, and
+      must be re-evaluated after Phase B Stage 2, since clones/external
+      buffers break its "direct packet, refcount 1, single known pool"
+      precondition; (3) `RTE_ETH_DEV_CAPA_RXQ_SHARE`/MT-lockfree-Tx
+      gating, to let `PortOut` skip its per-queue MCS lock
+      (`core/modules/port_out.h`/`.cc`) when the PMD advertises lock-free
+      multithreaded Tx. All three need a real NIC to evaluate; none
+      should land unbenchmarked.
+      **Design constraint to record now so it isn't re-litigated later**:
+      do **not** globally enable checksum/TSO offload. BESS's
+      `IPChecksum`/`L4Checksum` modules conflate two semantics -- *verify
+      an incoming packet and route failures* (cannot be replaced by a Tx
+      offload) and *produce a correct outgoing checksum* (can be). If Tx
+      checksum offload is ever adopted it must be explicit graph
+      semantics (a distinct module or mode that zeroes the field and
+      populates mbuf offload metadata), so a later module that rewrites
+      the header after the offload metadata was prepared is a visible
+      graph error rather than silent corruption. Same for TSO/GSO.
 - [ ] Make VFIO the primary physical-NIC path and AF_XDP the primary Linux
-      host/container path; keep vhost-user for VMs. With kmod gone, there's
-      no "kmod optional" fallback-direction flip left to design -- VFIO/
-      AF_XDP just need to become the actual Linux port drivers, from
-      scratch, whenever this phase is picked up.
+      host/container path (once the `libxdp`/`libbpf` build-prereq item
+      above lands); keep vhost-user for VMs (already available, see
+      above). With kmod gone, there's no "kmod optional" fallback-direction
+      flip left to design.
+- [ ] **Decouple `WorkerId` from DPDK's lcore ID; migrate off direct
+      `RTE_PER_LCORE(_lcore_id)` writes -- carefully, this is load-bearing,
+      not vestigial** (DPDK-proposal review, 2026-09-18). `core/worker.cc`
+      writes `RTE_PER_LCORE(_lcore_id) = arg->wid` directly into DPDK's TLS
+      and asserts `wid == rte_lcore_id()` immediately after -- i.e. BESS
+      today hardcodes `WorkerId == DPDK lcore ID`. **This is not
+      vestigial**: `rte_mempool_default_cache(mp, rte_lcore_id())` keys
+      the per-core mempool allocator cache on exactly this value, so
+      without the write every worker would be `LCORE_ID_ANY` and every
+      `Packet` alloc/free would silently bypass the per-core cache -- a
+      real, currently-invisible performance dependency. Modern DPDK has a
+      public, intended API for this: `rte_thread_register()` lets a
+      non-EAL pthread acquire a valid lcore ID (and
+      `rte_thread_unregister()` release it) instead of writing the TLS
+      variable directly, which is exactly the kind of "reaching into a
+      library's internals instead of using its public API" pattern that's
+      already bitten this project once (the Phase A `rte_mbuf` ABI-drift
+      bugs were the same class of hazard, just for a different DPDK
+      internal). If this migrates, decouple the types explicitly
+      (`WorkerId`, DPDK lcore ID, and physical CPU ID as three distinct
+      things -- `WorkerId` is already a Phase H "adopt now" strong-ID-type
+      candidate) and **benchmark mempool cache-hit rate before and after**
+      -- don't assume `rte_thread_register()`'s ID allocation behaves
+      identically to the current scheme under BESS's actual worker
+      topology. Low urgency (nothing is broken today), but worth doing
+      before any new DPDK library that also cares about lcore identity
+      (QSBR included, see Phase J -- though note QSBR itself doesn't
+      depend on this: `rte_rcu_qsbr_thread_register()` takes an arbitrary
+      caller-chosen `thread_id`, not an lcore ID, so the two migrations
+      are independent and don't need to be sequenced).
 
 ## Phase D — ARM64 + portable SIMD
 
@@ -1095,6 +1324,79 @@ implementation always available; x86 SSE/AVX and ARM NEON selected at
 startup via one dispatch per batch (not per packet/byte). Harvest upstream
 PR `#1041` (ARM support) as reference material, not a mergeable diff — it
 predates this DPDK port and the packet-layout work.
+
+- [ ] **Replace the BPF module's execution backend with `rte_bpf`
+      (experiment, strong prior toward adoption)** — DPDK-proposal review,
+      2026-09-18, the single best maintenance-reduction candidate it
+      found. `core/utils/bpf.cc` is **1066 lines of hand-written x86-64
+      machine-code emission**, adopted from FreeBSD 10, that `mmap()`s a
+      writable buffer, emits opcodes into it, and `mprotect()`s it
+      executable. The entire file is inside `#ifdef __x86_64`; on every
+      other architecture `BPF::Match()` (`core/modules/bpf.cc`) falls back
+      to libpcap's `bpf_filter()` **interpreter** -- i.e. ARM64 currently
+      gets no JIT at all for this module. DPDK 25.11 ships
+      `rte_bpf_convert(const struct bpf_program *)`, which takes exactly
+      what `pcap_compile_nopcap()` already produces
+      (`core/modules/bpf.cc`), plus `rte_bpf_load()`/`rte_bpf_get_jit()`/
+      `rte_bpf_exec_burst()`. `librte_bpf.a` is **already linked into
+      `bessd`** (`libdpdk.pc`'s `--whole-archive` list) -- zero new
+      dependency. If throughput is comparable, this deletes a home-grown
+      JIT (a real security/maintenance liability -- BESS writes executable
+      memory at control-plane request) and gives ARM64 a real JIT instead
+      of an interpreter, i.e. Phase D parity, for free. Caveats to settle
+      in the experiment, not assume: DPDK BPF isn't full eBPF (no maps,
+      limited tail calls -- irrelevant for cBPF filters; don't let this
+      become "BESS gets eBPF"); BESS's current JIT returns `SNAPLEN` on
+      match / `0` otherwise while converted cBPF returns the program's own
+      return value, so `Match()`'s `!= 0` test needs re-checking against
+      the new semantics; `rte_bpf_load()` may need an EAL-initialized
+      process, which the module-command path already satisfies
+      (`current_worker.SetNonWorker()` is called there for exactly this
+      reason) but should be confirmed. 26.07 adds direct cBPF loading and
+      a hardened validator, making this direction cleaner after a future
+      DPDK bump -- not a reason to wait, since 25.11 already has everything
+      needed.
+- [ ] **Runtime maximum-SIMD-width policy, not just CPU detection**
+      (DPDK-proposal review, 2026-09-18). DPDK deliberately doesn't always
+      select AVX-512 even when available, letting the application cap the
+      vector width, because AVX-512 can speed up one kernel while costing
+      enough core-frequency throttling to slow the whole pipeline down.
+      Today BESS has **no runtime dispatch at all** -- ISA selection is
+      entirely compile-time (`#if __AVX2__` in `core/utils/{copy,checksum,
+      simd,bits}.h`, `#if !__SSE4_2__` in `simd.h`, plus bare
+      `<x86intrin.h>` includes in `core/modules/set_metadata.cc` and
+      `core/modules/http_parser.cc`), under `-march=$(CPU)` with
+      `CPU ?= native` (which is also why CI needed `CPU=corei7`, commit
+      15 in the completed-work log). Phase D's dispatch layer should bind
+      implementation pointers from `min(detected ISA, configured policy)`,
+      with the policy settable at startup, not from detected ISA alone.
+      **Two x86-only hot blocks Phase D must take ownership of**, both
+      found by the same review: `PacketPool::AllocBulk()`'s
+      `_mm_store_si128` mbuf-reset (`core/packet_pool.cc` -- also a Phase
+      B Stage 2 blocker, coordinate with that phase) and
+      `IPLookup::ProcessBatch()`'s `_mm_set_epi32`/`_mm_shuffle_epi8`
+      address gather (`core/modules/ip_lookup.cc`, see the `rte_fib` item
+      below for a way to delete it outright rather than port it).
+- [ ] **Benchmark `rte_fib` vs `rte_lpm` for `IPLookup`** (DPDK-proposal
+      review, 2026-09-18) — the value here is a deletion, not necessarily
+      a speedup. Correction to the source proposal's own framing: BESS does
+      *not* hand-code the x4 lookup itself -- it already calls DPDK's own
+      `rte_lpm_lookupx4()` (`core/modules/ip_lookup.cc`). What BESS *does*
+      hand-code is the x86-only SSE **gather** feeding it (`_mm_set_epi32`
+      + `_mm_shuffle_epi8`, same file, inside an ISA `#if`).
+      `rte_fib_lookup_bulk()` takes a plain `uint32_t[]`, so migrating
+      would let BESS **delete that intrinsic block outright** and get
+      DPDK's runtime-dispatched (including AVX-512, and NEON where
+      available) lookup instead -- directly serving Phase D's stated goal
+      of replacing BESS-local intrinsics with runtime dispatch.
+      `librte_fib.a` is already linked. Both `rte_fib` and `rte_lpm`
+      implement DIR24_8 internally, so raw lookup speed is likely a wash
+      on small tables -- benchmark with realistic route populations (small
+      edge table, near-full IPv4, mostly-/24, mixed prefix lengths,
+      update-heavy), not random prefixes, and keep `rte_lpm` if it wins;
+      the deletion is the win, not a guaranteed speedup. `rte_fib` also
+      has native RCU integration, making it a natural second pilot for
+      Phase J below if the migration happens.
 
 ## Phase E — Build system: migrate BESS itself to Meson
 
@@ -1111,6 +1413,62 @@ OCI images (amd64+arm64), a `.deb`, a `pybess` wheel, and an SBOM per
 release; add Renovate/Dependabot. Revive per-queue/pool/scheduler metrics
 (old upstream PR `#1007` had the right idea) as a small Prometheus exporter
 outside the dataplane hot path.
+
+- [ ] **Make `DumpMempool()` backend-independent** (DPDK-proposal review,
+      2026-09-18). `core/bessctl.cc` does
+      `reinterpret_cast<struct rte_ring*>(mempool->pool_data)`, which is
+      only valid because `PacketPool::PacketPool()` hardcodes
+      `rte_mempool_set_ops_byname(pool_, "ring_mp_mc", ...)`
+      (`core/packet_pool.cc`). Not a live bug today -- correct by
+      construction, same shape as Phase A's two ABI-drift bugs and Phase
+      B Stage 1's `mt_offset_to_databuf_offset` -- but it's a hard blocker
+      on ever evaluating another mempool backend (see the benchmark
+      backlog below). Rewrite using `rte_mempool_avail_count()`/
+      `rte_mempool_in_use_count()`/`rte_mempool_dump()`. **Do this before,
+      not during, the mempool-backend benchmark.**
+- [ ] **DPDK telemetry / `pdump` / CTF tracing** (DPDK-proposal review,
+      2026-09-18) — mostly not worth pursuing, recorded so it isn't
+      re-proposed cold:
+      - Telemetry v2: don't build a second, competing monitoring API next
+        to BESS's own control plane. If ever used, it's a *source* for
+        this phase's Prometheus exporter (DPDK-native diagnostics, PMD
+        xstats), not a user-facing surface. Unverified: whether it
+        actually initializes given `bessd` passes `--no-shconf` (see
+        `pdump` below for why that flag matters) -- needs a live check
+        before relying on it for anything.
+      - `pdump`/`dumpcap`: **blocked today, not just low-priority.**
+        `dpdk-pdump`/`dpdk-dumpcap` are DPDK secondary processes;
+        `bessd` passes `--no-shconf` (`core/dpdk.cc`), which makes
+        `rte_eal_config_create()` return early without creating the
+        shared-memory config a secondary process needs to attach to. Its
+        own comment explains why: so BESS doesn't interfere with other
+        DPDK applications. Adopting `pdump` means giving that up -- a real
+        trade-off, not a free diagnostic win. Not worth it: BESS's gate
+        hooks already capture at arbitrary internal graph locations,
+        which `pdump` can't reach anyway (NIC-boundary only).
+      - CTF tracing: the motivating pitch (that it would have helped find
+        this session's worker-teardown concurrency bugs) doesn't hold up
+        -- commit 7's `std::terminate()` bug was found by *reproducing a
+        crash*, and the `all_tcs_` race was found by *reasoning about an
+        unsynchronized global*, neither of which a timestamped event log
+        surfaces. `rte_trace` instruments DPDK's own internals; adopting
+        it for BESS-defined events would be a modest improvement over
+        interleaved glog lines at best. Low priority, park it.
+- [ ] **DPDK version discipline: stay on 25.11.3 LTS through Phase B–D**
+      (DPDK-proposal review, 2026-09-18). 26.03/26.07 have relevant work
+      (hash RCU deferred-free, richer BPF including direct cBPF loading
+      and a hardened validator, ACL custom allocators), but none justifies
+      leaving a stable baseline mid-refactor. **One forward hazard to
+      pre-register**: DPDK 26.07 reportedly changes the mempool cache
+      refill/flush algorithm and makes effective cache size match the
+      requested size, with an upstream warning that pipelined applications
+      allocating on one lcore and freeing on another may need retuning --
+      which describes BESS's `PortInc(worker A) → Queue → PortOut(worker
+      B)` shape exactly (unverified here against the actual 26.07 release
+      notes; flagged from the source review, worth confirming before it
+      matters). The mempool cache-size benchmark in the backlog below
+      should exist *before* the next DPDK bump, so the bump has a
+      baseline to compare against, not after.
 
 ---
 
@@ -1606,3 +1964,225 @@ C++26 contracts (`pre`/`post`) are the natural long-term home for some of
 the invariants this phase encodes as constructors/factories instead —
 already deferred in Phase H pending non-experimental compiler support;
 revisit there rather than re-deciding it here.
+
+---
+
+## Phase J — Live table updates without stopping the world (proposed 2026-09-18, not started)
+
+Cross-cutting phase, not a natural fit under A–I: touches the control
+plane (Phase G), the module command API, and the scheduler loop. Emerged
+from an Opus review of an external DPDK-modernization proposal (see the
+"Roadmap / Backlog" phases above for where its other findings landed, and
+"Rejected" / "Benchmark backlog" below for the rest).
+
+**The problem, as actually measured in this tree** (the external proposal
+described this mechanism, and got it wrong in a way that *understated* the
+real cost): BESS today cannot update a rule table on a running pipeline at
+all. `ModuleBuilder::RunCommand()` (`core/module.cc`) **refuses** any
+command not marked `Command::THREAD_SAFE` with `EBUSY` whenever
+`Module::HasRunningWorker()` (`core/module.h`) is true; `bessctl`'s
+`command_module` (`bessctl/commands.py`) works around that by calling
+`pause_all()` before **every** module command -- thread-safe ones
+included -- and `resume_all()` after. `pause_all` blocks every worker on
+an `eventfd` read (`core/worker.cc`). There are **45 `THREAD_UNSAFE`
+commands across 22 module files**, including `ACL::CommandAdd`,
+`IPLookup::CommandAdd`/`Delete`, `ExactMatch::CommandAdd`/`Delete`/
+`SetRuntimeConfig`, `BPF::CommandAdd`/`Delete`, and `Queue::CommandSetSize`.
+Net effect: **adding one ACL rule or one route stops packet processing on
+every worker in the process.**
+
+**The mechanism**: replace pause-mutate-resume with build-publish-reclaim
+-- construct a replacement table off the dataplane, atomically publish the
+pointer (release store), let workers keep running, wait for a QSBR grace
+period, then destroy the old table. `rte_rcu_qsbr` provides this and
+`librte_rcu.a` is **already linked into `bessd`** (part of
+`libdpdk.pc`'s `--whole-archive` list) -- no new dependency. Reader cost is
+one `rte_rcu_qsbr_quiescent()` (a store) per `Scheduler::ScheduleLoop()`
+iteration. This is the first real backend for the `bess::RcuDomain`
+abstraction Phase H already sketches ("backed initially by DPDK's own
+QSBR/RCU primitives ... swap in `std::rcu` underneath later") -- keep
+`RcuDomain` as the interface so a future replacement doesn't touch
+callers.
+
+**Independent of the `WorkerId`/lcore-ID migration** (Phase C, above):
+`rte_rcu_qsbr_thread_register()` takes a caller-chosen `thread_id`, not an
+lcore ID -- BESS can pass `wid` directly, today, with no prerequisite.
+
+**Scope discipline -- do exactly one pilot first.** `IPLookup` is the best
+candidate: its table is already an opaque `rte_lpm*` behind a single
+pointer, its three mutating commands are all `THREAD_UNSAFE`, the
+rebuild-and-swap cost is bounded, and `rte_fib` (Phase D, above) has
+native RCU support if the table migrates there anyway. `ExactMatch` is the
+natural second. Only after two modules work should this generalize into a
+`Module`-level contract. Explicitly **not** in scope for the first pass:
+RCU-swapping the `ModuleGraph`, gate adjacency, or the traffic-class tree
+-- those are Phase G/H territory (live reconfiguration), not this phase's
+narrower table-update goal.
+
+**Stated non-goal, so it isn't over-claimed later:** this would **not**
+have prevented any bug in this session's log. The `worker.cc`/`all_tcs_`
+defects (commits 6-8, see completed-work log above) are a writer-writer
+race on an unsynchronized global map during concurrent teardown plus a
+thread-lifetime bug; QSBR protects readers from writers and needs its own
+writer serialization. Phase I's existing non-goal note on those bugs
+applies here unchanged -- this is a capability improvement for
+control-plane table updates, not a concurrency-bug-prevention mechanism.
+
+**Judge this by the right metric.** This is a *capability* change (update
+rules on a live pipeline), not a throughput change -- it will not move any
+number in `core/*_bench.cc`. The acceptance test is a live one: drive a
+`Source → IPLookup → Sink` pipeline at a steady rate while adding/removing
+routes, and show zero packet loss and zero throughput dip across the
+update, versus today's full stop.
+
+---
+
+## Rejected from the 2026-09-18 DPDK-proposal review
+
+Listed so these don't get re-litigated from scratch later. Each was
+considered and independently assessed against real code, not dismissed on
+the reviewing document's word alone.
+
+- **Replace `rte_hash` for `CuckooMap`** — reject. `CuckooMap<K, V, H, E>`
+  (`core/utils/cuckoo_map.h`) is a typed C++ template; `NAT` stores
+  `CuckooMap<Endpoint, NatEntry, ...>` as a real value type, and
+  `ExactMatchTable`/`WildcardMatch` pass runtime-constructed
+  hasher/comparator objects carrying a key length. `rte_hash` is a C API:
+  fixed-size byte keys declared at create time, `void*` data, no
+  iterators, no per-call comparator. Swapping means hand-rolling
+  serialization for every `V` and losing type safety at every call site --
+  squarely against "without losing flexibility and developer ergonomics"
+  for a speculative lookup delta on a container that already has a
+  benchmark (`core/utils/cuckoo_map_bench.cc`) showing it performs fine.
+  The one genuinely useful thing in `rte_hash`'s modernization -- its QSBR
+  integration pattern -- is achievable by making `CuckooMap`
+  snapshot-publishable under Phase J, without replacing the container.
+- **Replace the `ACL` module's engine with `rte_acl`** — reject as framed.
+  `core/modules/acl.cc`/`.h` (~170 lines total) is a minimal demo module:
+  it matches only IPv4 src/dst prefix plus src/dst port with `0` meaning
+  wildcard, **ignores the IP protocol field entirely**, and reads the L4
+  header assuming UDP-shaped layout regardless of actual protocol. Its
+  maintenance burden is approximately zero. Adopting `rte_acl` means a
+  rule-model translation layer, a context-rebuild control path, and *more*
+  code -- to accelerate a module whose current semantics don't support a
+  real ACL workload anyway. If a real ACL is ever needed: **write a new
+  `rte_acl`-backed module and leave `ACL` alone**, don't swap the engine
+  under a toy. Kept in the benchmark backlog below at low priority, under
+  that framing only.
+- **NAT RSS-affinity subsystem** (predictable RSS via `rte_thash` so
+  NAT's translated-port choice makes the return flow land on the same
+  worker) — reject the feature, keep one small piece. The premise is
+  false: **`NAT` is single-worker today**
+  (`Module::max_allowed_workers_` defaults to 1, `core/module.h`, not
+  overridden in `nat.h` -- verified by checking every override in
+  `core/modules/`), so the "return flow lands on the wrong worker"
+  problem this would solve doesn't exist; multi-worker NAT doesn't exist
+  either. This is a substantial new *feature* (multi-worker NAT + RSS-
+  affine port selection), not modernization, and the largest-scope single
+  item in the source document. Worth keeping: `PMDPort`'s RSS setup
+  currently uses the PMD's default key with no RETA control -- making the
+  RSS key and hash types configurable on `PMDPortArg` is small,
+  non-speculative, and unblocks any future RSS work without committing to
+  the NAT feature. That belongs in Phase C, not this phase.
+- **`rte_flow` as an optional hardware-offload backend** — reject for now,
+  keep one design constraint. The constraint is worth recording: compile
+  BESS logical rules down to `rte_flow`, never let a module secretly
+  *become* `rte_flow` under the hood (same "expose BESS semantics, not
+  backend implementation details" principle as `PacketCapabilities` above
+  and `PacketRef` in Phase B). But the work presupposes a rule IR BESS
+  doesn't have yet. Natural home is after Phase G's `GraphSpec`/
+  `Capabilities` work -- record the constraint, schedule nothing now.
+- **DMAdev** — reject/defer. Submission/completion overhead dominates for
+  BESS's typical per-packet work (TTL decrement, MAC swap, small header
+  rewrites); DPDK's own DMA docs use packet-copy-heavy workloads as the
+  motivating case, which BESS mostly doesn't have. Revisit only if a
+  genuinely copy-heavy path (e.g. async vhost) appears.
+- **`rte_eth_recycle_mbufs()`** — reject. Still experimental in the ethdev
+  API, and BESS's general graph (buffer, clone, drop, cross-worker,
+  generate packets, hold state) breaks the simple-1:1-forwarding ownership
+  assumption it needs.
+- **`rte_bitset`** — reject. `kMaxWorkers = 64` (`core/worker.h`), so the
+  existing `std::vector<bool>` active-worker set already fits one
+  `uint64_t`; nothing to gain.
+- **`rte_lcore_var`** — reject for `current_worker`. Per-worker state is
+  already a per-thread `Worker` object with real lifetime semantics that
+  `thread_local`/`constinit` (already tracked in Phase I) fits better than
+  a lcore-indexed array abstraction.
+- **`pdump`/`dumpcap`, DPDK CTF tracing as a fix for past concurrency
+  bugs, replacing the graph runtime with `rte_graph`, replacing the
+  scheduler with eventdev, DPDK multi-process for control-plane
+  isolation** — reject, each with a concrete reason recorded in the phase
+  section it's most related to above (`pdump`: Phase F, blocked by
+  `--no-shconf`; tracing: Phase F, wrong fix for the wrong bug class;
+  `rte_graph`/eventdev: not new rejections, this doc's Phase H/backlog
+  language already treated both as reference-only; multi-process: doubly
+  moot since `bessd` already passes `--no-shconf`, reinforcing Phase G's
+  gRPC/UDS direction rather than changing it).
+
+## Benchmark / experiment backlog (from the 2026-09-18 DPDK-proposal review)
+
+Ordered by "what must exist before other answers here are trustworthy."
+None of these are decided adoptions -- see the phase sections above and
+the rejected list for what's already been decided either way.
+
+1. **PMD loopback forwarding benchmark — do this first; it unblocks most
+   of the rest of this list**, and closes the gap Phase B's own benchmark
+   section already flags ("needs a real NIC or a simulated one ... not
+   attempted here"). Closable today with no DPDK rebuild:
+   `librte_net_null.a`/`librte_net_ring.a` are already linked and
+   `PMDPort` already accepts `vdev=` (see Phase C above). Build
+   `PMDPort(vdev='net_null0')`/`net_ring0` → forwarding pipelines and
+   measure Mpps.
+2. **`llring` vs modern `rte_ring`** for the `Queue` module's actual mode
+   (MP/SC): compare `llring` MP/SC, `rte_ring` MP/SC, `MP_RTS/SC`
+   (`RING_F_MP_RTS_ENQ`), `MP_HTS/SC`, and HTS + zero-copy, at 1/2/4/8/16
+   producers → 1 consumer. Migration is mechanically feasible --
+   `rte_ring_get_memsize()`/`rte_ring_init()` work on caller-supplied
+   memory, matching how `Queue`/`DRR` already allocate their ring memory
+   -- and `llring`'s one non-`rte_ring` feature, its watermark field, is
+   unused (`Queue` computes its own high/low water from `llring_count()`).
+   **Decision rule: if `rte_ring` is within noise, delete
+   `core/utils/llring.h` (1193 lines of vendored lock-free code)
+   regardless** -- the maintenance win is the point, not a required
+   speedup. `DRR`'s ring is SP/SC and won't show the same effect; don't
+   let it muddy the MP/SC result.
+3. **Mempool backend × cache size × worker topology.** Gated on (1) and on
+   the `DumpMempool()` fix (Phase F, above). Backends: `ring_mp_mc`
+   (current), `ring_mt_rts`, `ring_mt_hts`, `stack`, `lf_stack`
+   (`librte_mempool_stack.a` already linked). Cache sizes: 0/32/64/128/
+   256/512 (current `kMaxCacheSize = 512`, `core/packet_pool.h`, applied
+   only above 1024-capacity pools). **The workload that matters is
+   cross-worker**: `PortInc`(worker A) → `Queue` → `PortOut`(worker B),
+   since pools are shared per-NUMA-socket across workers while the
+   per-core cache is keyed on `rte_lcore_id()` -- single-core Source→Sink
+   won't show the effect. Establish this before any DPDK bump past 25.11
+   (see Phase F's version-discipline note above).
+4. **DPDK BPF vs the FreeBSD JIT** — see Phase D above for full detail;
+   listed here for backlog completeness.
+5. **`rte_fib` vs `rte_lpm`** — see Phase D above for full detail.
+6. **`MBUF_FAST_FREE` on/off** — needs a real NIC and (1); re-run after
+   Phase B Stage 2 lands, since clones/external buffers can invalidate its
+   preconditions.
+7. **`PortOut` MCS lock vs PMD MT-lockfree Tx** — 2/4/8 workers on one Tx
+   queue, on a PMD advertising the capability. Low priority; few PMDs
+   support it.
+8. **Burst size sweep** — 32 (current `PacketBatch::kMaxBurst`) / 64 /
+   128 / 256, through `traffic_class_bench` and the new PMD loopback
+   bench from (1), to check DPDK's own claim that 256 is a common sweet
+   spot on server x86/ARM64. Informational only -- `kMaxBurst` is deeply
+   wired into the codebase; this is not a proposal to change it, just to
+   measure before anyone does.
+9. **`rte_acl` as a *new* module** (low priority, only under the framing
+   in "Rejected" above) — if a real ACL workload ever materializes,
+   compare a new `rte_acl`-backed module against the existing toy `ACL`
+   at 16/64/256/1K/10K/100K rules with varying match position.
+10. **Power-aware idle** — legitimate but mostly a **scheduler** problem,
+    not primarily a DPDK-adoption one: `core/scheduler.h` already has a
+    `TODO` stating BESS "currently ha[s] no functionality to support such
+    whole-scheduler blocking/unblocking." The scheduler would need to
+    compute an earliest-wake condition across queue work, rate-limiter
+    wakeups, timers, and multiple `PortInc` tasks before any DPDK
+    monitor/pause primitive is useful. Judge by idle watts, p50/p99 wake
+    latency, low-rate CPU consumption, and full-load throughput -- not
+    packet rate. Not evaluable in this sandbox (no real NIC/power
+    control). Track as a scheduler-redesign item first.
