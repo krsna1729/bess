@@ -888,9 +888,38 @@ rather than one call site).
     `daemon stop` reclaimed everything (512/512 free). Same binary passes
     `iplookup.py` under `-m 0`, and the changed function
     (`PMDPort::Init`) never executes in that sample (no PMD ports) — the
-    base tree fails identically by mechanism. `test_samples` was never in
+    base tree fails identically by mechanism.    `test_samples` was never in
     this sandbox's verification loop (only in CI, where runners have
     real hugepage capacity); don't treat its sandbox hang as a gate.
+27. **`cef92c50`** — **PMD forwarding benchmark (`core/pmd_bench.cc`, new
+    file).** Benchmark-backlog item 1 ("do this first") and the review-
+    recommended measurement substrate for Stage 2 / rings / mempools /
+    burst-size / FIB work. `BM_PmdNullTx` (alloc + `rte_eth_tx_burst` +
+    PMD-side free rate through `net_null0`) and `BM_PmdRingRoundTrip`
+    (full TX→RX self-loopback through real `rte_eth_rx/tx_burst` on
+    `net_ring0`, the closest standalone analogue of `PortInc → PortOut`),
+    both with a 1-32 batch sweep (`RangeMultiplier(2)`), drop counters,
+    and `SetItemsProcessed` throughput. Setup mirrors `bessd -m 0`:
+    `InitDpdk(0)` (`--no-huge`, malloc-backed — no hugepages needed, so
+    this runs in the sandbox and CI) plus `CreateDefaultPools()` with
+    `FLAGS_m = 0` (`PlainPacketPool`; absolute numbers aren't production-
+    comparable, relative before/after on one machine is the use case);
+    one queue per port, 1024 descriptors (through the new
+    `adjust_nb_rx_tx_desc()` path, incidentally). Deliberately PMD-level,
+    not module-graph: `PortInc`/`PortOut` need a live daemon, and the
+    cross-worker `Queue` shape belongs to the mempool experiment's own
+    harness (gated on this file + the `DumpMempool()` fix) — see the
+    file's header comment. No existing file touched, so no regression
+    surface outside the new binary; still verified: g++ build clean,
+    `pmd_bench` TU compiles clean under clang++ with the bench flags,
+    smoke run (`--benchmark_min_time=0.001s`) OK, full 5-rep/0.5s run
+    clean with tight CVs (mostly 1-4%) and zero `tx_drops` at every batch
+    size. Baseline medians: NullTx 4.53/9.07/17.05/32.11/60.58/100.74M/s,
+    RingRoundTrip 4.57/8.74/16.64/32.06/60.23/108.31M/s (batch
+    1/2/4/8/16/32). No Makefile/`build.py`/`ci.yml` change needed: the
+    `%_bench` pattern rule and the CI smoke loop pick up any
+    `core/*_bench.cc` automatically. Phase B's benchmark-coverage note and
+    backlog item 1 updated alongside.
 
 ## Review process established this session
 
@@ -1197,15 +1226,19 @@ detection unreliable there, that's a local/dedicated-hardware job) so this
 gap can't reopen silently.
 
 **What Phase B's benchmark prerequisite still doesn't cover**: PMD-level
-forwarding throughput (needs a real NIC or a simulated one via DPDK's
-`net_null`/`net_ring` virtual PMDs — not attempted here) and full
-Module/Gate/Task dispatch overhead (no C++-level harness exists for
-constructing a `Module` + calling `ProcessBatch()` outside the live
-daemon — all existing module testing goes through
-`bessctl/module_tests/*.py` against a running `bessd`, not a standalone
-gtest/benchmark binary). `traffic_class_bench.cc` already covers scheduler
-throughput specifically (`TCWeightedFair`/`TCRoundRobin` scheduling), which
-covers the "scheduler throughput" leg of Phase B's requirement in full.
+forwarding throughput is now covered for the single-worker loopback shape
+by `core/pmd_bench.cc` (entry 27 below: `net_null` TX + `net_ring`
+round-trip, batch sweep 1-32) — still open: the cross-worker
+`PortInc → Queue → PortOut` shape (belongs to the mempool experiment's
+own harness, gated on this file plus the `DumpMempool()` fix) and real-NIC
+numbers generally. Full Module/Gate/Task dispatch overhead is still
+uncovered (no C++-level harness exists for constructing a `Module` +
+calling `ProcessBatch()` outside the live daemon — all existing module
+testing goes through `bessctl/module_tests/*.py` against a running
+`bessd`, not a standalone gtest/benchmark binary).
+`traffic_class_bench.cc` already covers scheduler throughput specifically
+(`TCWeightedFair`/`TCRoundRobin` scheduling), which covers the
+"scheduler throughput" leg of Phase B's requirement in full.
 
 ## Phase C — Linux I/O modernization
 
@@ -2289,14 +2322,20 @@ Ordered by "what must exist before other answers here are trustworthy."
 None of these are decided adoptions -- see the phase sections above and
 the rejected list for what's already been decided either way.
 
-1. **PMD loopback forwarding benchmark — do this first; it unblocks most
-   of the rest of this list**, and closes the gap Phase B's own benchmark
-   section already flags ("needs a real NIC or a simulated one ... not
-   attempted here"). Closable today with no DPDK rebuild:
-   `librte_net_null.a`/`librte_net_ring.a` are already linked and
-   `PMDPort` already accepts `vdev=` (see Phase C above). Build
-   `PMDPort(vdev='net_null0')`/`net_ring0` → forwarding pipelines and
-   measure Mpps.
+1. **[x] PMD loopback forwarding benchmark — done 2026-09-18
+    (`core/pmd_bench.cc`, entry 27 below).** Was "do this first; it unblocks
+    most of the rest of this list", closing the gap Phase B's own benchmark
+    section flagged ("needs a real NIC or a simulated one ... not attempted
+    here"). Needed no DPDK rebuild: `librte_net_null.a`/`librte_net_ring.a`
+    were already linked and `PMDPort` already accepted `vdev=`.
+    `BM_PmdNullTx` (TX + alloc/free rate) and `BM_PmdRingRoundTrip`
+    (self-loopback through real `rte_eth_rx/tx_burst`), batch sweep 1-32,
+    zero drops throughout. Baseline medians (this sandbox, g++, malloc-
+    backed `--no-huge` EAL — relative comparisons only, not production
+    numbers): NullTx 4.5→100.7M/s, RingRoundTrip 4.6→108.3M/s at batch
+    1→32. Still open on top of it: the cross-worker
+    `PortInc → Queue → PortOut` harness (mempool experiment's own work,
+    gated on the `DumpMempool()` fix) and real-NIC numbers.
 2. **`llring` vs modern `rte_ring`** for the `Queue` module's actual mode
    (MP/SC): compare `llring` MP/SC, `rte_ring` MP/SC, `MP_RTS/SC`
    (`RING_F_MP_RTS_ENQ`), `MP_HTS/SC`, and HTS + zero-copy, at 1/2/4/8/16
