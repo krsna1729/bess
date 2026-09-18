@@ -21,7 +21,6 @@ To install BESS on Linux quickly, you can download the binary from [Release](htt
     sudo sysctl vm.nr_hugepages=1024  # For single NUMA node systems
     tar -xf bess-core2-linux.tar.gz
     cd bess/
-    make -C core/kmod # Build the kernel module (optional)
     bessctl/bessctl
 
 Documentation can be found [here](https://github.com/NetSys/bess/wiki/). Please consider [contributing](https://github.com/NetSys/bess/wiki/How-to-Contribute) to the project!
