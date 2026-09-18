@@ -49,32 +49,28 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-18, at commit `7bb99eed` on `develop`.
+Status current through completed-work entry 29 (`e740b6b5`); CI green
+through `5fd40fd6` (both jobs, run 35350999388). See GitHub Actions for
+the current branch-head status rather than trusting any SHA here -- this
+section used to embed exact SHAs and went stale every commit; the
+completed-work log below is the durable record.
 
-**CI is fully green and stable** through `7bb99eed` (both `build (g++)`
-and `build (clang++)` jobs, run 35345541633). The road there, in brief:
-commits 5 (trigger fix), 9-12 (the checksum.h correction chain), 13 (9
-clang-only portability bugs), 14 (benchmark suite), 15 (the CPU=corei7 CI
-reliability fix), 16-17 (Phase B Stage 1, `dea288f9`+`f22a69eb`), 18
-(hardening research), 19 (C++23 bump + 2 latent bug fixes), 21+24
-(`core/kmod`/`VPort` removal + review-found pybess fix), 25 (DPDK-proposal
-review fold-in), 26 (descriptor-clamping replacement `7ac9d660`), 27 (PMD
-benchmark `cef92c50`), 28 (`llring` removal `0bda5a84`) — see the
-completed-work log below for the full history if picking this up cold.
+**Not yet pushed as of this writing**: the affinity-inheritance fix and
+hardening below (entry 30). Verified locally; **never run through GitHub
+Actions yet** — push and get a fresh CI run next if picking this up
+cold.
 
-**Not yet pushed as of this writing**: the review-follow-up corrections
-to commits 27-28 — `alignof(rte_ring)` caller-owned storage fix (+ shared
-`utils/rte_ring_alloc.h` helper), `ring_bench` verify/timed split +
-opt-in pinning, `pmd_bench` sent-accounting + `EndToEnd` twins, and the
-zero-copy factual correction. Verified locally (below) but **never run
-through GitHub Actions yet** — push and get a fresh CI run next if
-picking this up cold.
-
-Phase B Stage 1 (commits 16-17 / `dea288f9`+`f22a69eb`, `core/packet.h`'s
-private-area accessor — `BessPacketPrivate`/`priv()` — plus the Opus-review
-fixes on top) is **pushed and CI-confirmed green** (both jobs, run
-35255689088). See Phase B's own section below for what it does and why
-the original single-shot Phase B plan was split into two stages.
+What "green" has meant throughout: both `build (g++)` and
+`build (clang++)` jobs (each runs `./build.py bess`, `all_test
+--gtest_shuffle`, the benchmark smoke loop, `unittest discover`, and
+`run_module_tests.py`). The road here, in brief: commits 5 (trigger
+fix), 9-12 (checksum.h correction chain), 13 (9 clang-only portability
+bugs), 14 (benchmark suite), 15 (CPU=corei7 reliability fix), 16-17
+(Phase B Stage 1), 18 (hardening research), 19 (C++23 bump + 2 latent bug
+fixes), 21+24 (`core/kmod`/`VPort` removal + review-found pybess fix),
+25 (DPDK-proposal review fold-in), 26 (descriptor-clamping `7ac9d660`),
+27 (PMD benchmark `cef92c50`), 28 (`llring` removal `0bda5a84`), 29
+(review follow-ups `e740b6b5`) — full history in the log below.
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
@@ -962,6 +958,31 @@ rather than one call site).
     evidence). No Opus review: measurement-led mechanical migration, and
     its own unit tests demonstrably covered the riskiest seam (return
     conventions).
+30. **`23aacd29`** — **Fixed `ring_bench --pin_threads` affinity collapse +
+    `net_ring` invariant hardening** (external review of `e740b6b5`).
+    The review was right on all three points. (a) **Real bug**: `PinThread`
+    derived placement from the calling thread's own affinity, but threads
+    inherit their creator's mask -- the benchmark thread pinned itself in
+    `VerifyRing`, so every later producer inherited a one-CPU mask and all
+    N producers + consumer fought for a single core. That, not host noise,
+    was the recorded "~500x pinning slowdown" (entry 29's interpretation
+    is superseded here; 29 is left intact as the historical record).
+    Fixed by snapshotting the process mask once in `main`
+    (`g_allowed_cpus`, before any pinning) and deriving all placement
+    from it. (b) The consumer stays on the benchmark thread deliberately:
+    moving it to its own thread broke Google Benchmark's per-thread CPU
+    accounting (items/sec computed against an idle main thread read
+    21-51G/s); since the benchmark thread is now never pinned, producers
+    inherit the full mask at spawn and the snapshot places them
+    correctly. (c) `pmd_bench` ring benchmarks now `CHECK_EQ(recvd, sent)`
+    -- the documented self-loopback invariant is a regression detector,
+    so a future change that strands a packet fails loudly instead of
+    measuring a shifted workload. Verified: pinned mode re-measured sane
+    (MP/SC 326/302/190/117/95M at 1/2/4/8/16P, same band as unpinned),
+    unpinned numbers unchanged in band, `pmd_bench` ring variants pass
+    with the new check enforced. Status snapshot above rewritten in the
+    review-suggested self-maintaining form (entry number, not docs-commit
+    SHA) since it had already gone stale once.
 29. **`e740b6b5`** — **Review follow-ups to entries 27-28** (external review of
     `cef92c50`/`0bda5a84`, verdict: keep the `llring` removal, fix listed
     items first). (a) **Real portability bug, fixed**: caller-owned
