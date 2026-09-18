@@ -462,9 +462,11 @@ class alignas(64) Packet {
   // sizeof(struct rte_mbuf) bytes past the start of the object) lands
   // exactly on reserve_, and that BessPacketPrivate's own field offsets
   // match what SNBUF_METADATA_OFF/SNBUF_SCRATCHPAD_OFF (snbuf_layout.h)
-  // assume -- those are a cross-language ABI contract with
-  // core/kmod/sn_common.h's vport code, which addresses the scratchpad via
-  // a hardcoded SNBUF_SCRATCHPAD_OFF rather than this struct.
+  // assume. (Originally added because core/kmod's vport driver addressed
+  // the scratchpad via a hardcoded SNBUF_SCRATCHPAD_OFF cross-language ABI
+  // contract; that driver and core/kmod are gone now, see MODERNIZATION.md,
+  // but the assert stays -- cheap, general insurance for whatever uses
+  // scratchpad next.)
   static void CheckPrivLayout() {
     static_assert(offsetof(Packet, mbuf_) == 0,
                   "mbuf_ must be at offset 0 for priv()'s +sizeof(rte_mbuf) "

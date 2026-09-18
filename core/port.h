@@ -93,7 +93,6 @@ static inline port_init_func_t PORT_INIT_FUNC(
 class PortBuilder {
  public:
   friend class PortTest;
-  friend class ZeroCopyVPortTest;
   friend class PortBuilderTest;
 
   PortBuilder(std::function<Port *()> port_generator,

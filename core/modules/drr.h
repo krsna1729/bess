@@ -35,7 +35,7 @@
 
 #include <rte_hash_crc.h>
 
-#include "../kmod/llring.h"
+#include "../utils/llring.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../pktbatch.h"

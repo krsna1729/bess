@@ -142,26 +142,8 @@ def build_bess():
     run_docker_cmd('%s bess' % BUILD_SCRIPT)
 
 
-def build_kmod():
-    subprocess.check_output('uname -r', shell=True).strip()
-
-    try:
-        run_docker_cmd('%s kmod' % BUILD_SCRIPT)
-    except:
-        print('*** module build has failed.', file=sys.stderr)
-
-
-def build_kmod_buildtest():
-    kernels_to_test = '/lib/modules/*/build'
-    kmod_build = 'KERNELDIR=$0 %s kmod' % BUILD_SCRIPT
-
-    run_docker_cmd('ls -x -d %s | xargs -n 1 sh -c %s' %
-                   (kernels_to_test, shell_quote(kmod_build)))
-
-
 def build_all():
     build_bess()
-    build_kmod()
 
 
 def do_clean():
@@ -183,8 +165,6 @@ def main():
     cmds = {
         'all': build_all,
         'bess': build_bess,
-        'kmod': build_kmod,
-        'kmod_buildtest': build_kmod_buildtest,
         'clean': do_clean,
         'dist_clean': do_dist_clean,
         'shell': run_shell,

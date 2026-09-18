@@ -89,8 +89,6 @@ DEPS_DIR = '%s/deps' % BESS_DIR
 DPDK_URL = 'https://fast.dpdk.org/rel'
 DPDK_VER = 'dpdk-25.11.3'  # current DPDK LTS; see https://core.dpdk.org/roadmap/
 
-kernel_release = cmd('uname -r', quiet=True).strip()
-
 DPDK_DIR = '%s/%s' % (DEPS_DIR, DPDK_VER)
 # DPDK is built with Meson/Ninja (the only DPDK build that produces a
 # pkg-config file; the old Make build never did) and installed to its own
@@ -187,10 +185,6 @@ def check_essential():
     required('gtest/gtest.h', 'libgtest-dev', 'g++')
     required('benchmark/benchmark.h', 'https://github.com/google/benchmark',
              'g++')
-
-
-def is_kernel_header_installed():
-    return os.path.isdir("/lib/modules/%s/build" % kernel_release)
 
 
 def find_current_plugins():
@@ -357,38 +351,15 @@ def build_bess():
     cmd('make -C core bessd modules all_test benchmarks %s' % makeflags())
 
 
-def build_kmod():
-    check_essential()
-
-    if os.getenv('KERNELDIR'):
-        print('Building BESS kernel module (%s) ...' %
-              os.getenv('KERNELDIR'))
-    else:
-        print('Building BESS kernel module (%s - running kernel) ...' %
-              kernel_release)
-        if not is_kernel_header_installed():
-            print('"kernel-headers-%s" is not available. Build may fail.' %
-                  kernel_release)
-    sys.stdout.flush()
-    cmd('sudo -n rmmod bess 2> /dev/null || true', shell=True)
-    try:
-        cmd('make -C core/kmod')
-    except SystemExit:
-        print('*** module build has failed.', file=sys.stderr)
-        sys.exit(1)
-
-
 def build_all():
     build_dpdk()
     build_bess()
-    build_kmod()
     print('Done.')
 
 
 def do_clean():
     print('Cleaning up...')
     cmd('make -C core clean')
-    cmd('make -C core/kmod clean')
     for path in ('pybess/builtin_pb', 'pybess/plugin_pb'):
         cmd('rm -rf '
             '{path}/*_pb2.py* {path}/ports/*_pb2.py* '
@@ -440,7 +411,6 @@ def main():
         'download_dpdk': download_dpdk,
         'dpdk': build_dpdk,
         'bess': build_bess,
-        'kmod': build_kmod,
         'clean': do_clean,
         'dist_clean': do_dist_clean,
         'help': lambda: print_usage(parser),

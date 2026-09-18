@@ -8,10 +8,6 @@ name: CI
 # 25.11, so it can no longer build this tree at all.
 #
 # Known gaps intentionally left for follow-up work:
-#  - core/kmod build/build-test is not run here: it depends on matching
-#    kernel headers on the runner and is a known-broken legacy path on
-#    modern kernels (see upstream NetSys/bess#1056). It is expected to be
-#    made optional entirely once VFIO/AF_XDP become the primary I/O paths.
 #  - No sanitizer (ASan/UBSan) or coverage lane yet -- the old workflow
 #    had one via the pinned container's clang-6.0; re-adding one against
 #    a current clang is follow-up work, not re-created here.

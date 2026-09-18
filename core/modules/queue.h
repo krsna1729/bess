@@ -31,7 +31,7 @@
 #ifndef BESS_MODULES_QUEUE_H_
 #define BESS_MODULES_QUEUE_H_
 
-#include "../kmod/llring.h"
+#include "../utils/llring.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 

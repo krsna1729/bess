@@ -33,7 +33,7 @@
 
 #include <glog/logging.h>
 
-#include "kmod/llring.h"
+#include "llring.h"
 #include "queue.h"
 
 namespace bess {

@@ -39,7 +39,9 @@
  *  - 128	64	some read-only/immutable fields
  *  - 192	128	static/dynamic metadata fields
  *  - 320	64	private area for module/driver's internal use
- *                        (currently used for vport RX/TX descriptors)
+ *                        (no current consumer; the vport driver that used
+ *                        to be the one user was removed along with
+ *                        core/kmod's kernel module, see MODERNIZATION.md)
  *  - 384	128	_headroom (SNBUF_HEADROOM == RTE_PKTMBUF_HEADROOM)
  *  - 512	2048	_data (SNBUF_DATA)
  *
