@@ -49,7 +49,7 @@ chase it.
 
 ## Status snapshot
 
-Last updated: 2026-09-18, at commit `90d908f7` on `develop`.
+Last updated: 2026-09-18, at commit `705782b3` on `develop`.
 
 **CI is fully green and stable** through commit 18 / push `eea4fc5c`
 (both `build (g++)` and `build (clang++)` jobs, runs 35255310803 and
@@ -59,17 +59,16 @@ checksum.h correction chain), 13 (9 clang-only portability bugs), 14
 (benchmark suite), and 15 (the CPU=corei7 CI reliability fix) — see the
 completed-work log below for the full history if picking this up cold.
 
-**Not yet pushed as of this writing**: commits 19-21 (the C++23 build
-bump + 2 real bug fixes it surfaced, the C++26 toolchain experiment doc,
-and the `core/kmod`/`VPort` removal), plus commit 22 (the C++23 bump's
-Opus review — verdict: correct, both fixes complete, `CodelTest` flake
-definitively confirmed pre-existing/unrelated; one evidence gap found and
-closed with real throughput numbers, see entry 22 — no regression, the
-scheduler path is if anything ~10-14% faster at larger batch sizes).
-Push and get a fresh CI run next if picking this up cold — all of 19-21
-were verified locally (clean build + full test suite under both
-compilers, `run_module_tests.py` clean, each on its own) but never
-run through GitHub Actions yet.
+**Not yet pushed as of this writing**: commits 19-24 --
+the C++23 build bump + 2 real bug fixes it surfaced (19), the C++26
+toolchain experiment doc (20), the `core/kmod`/`VPort` removal (21), the
+C++23 bump's Opus review + perf-claim correction with real throughput
+numbers (22), the `core/kmod`/`VPort` removal's Opus review (23, found a
+real CI-breaking regression), and the fix for that regression (24). All
+verified locally (clean build + full test suite under both compilers,
+`run_module_tests.py`/`pybess` unit tests clean, each checkpoint on its
+own) but **never run through GitHub Actions yet** — push and get a fresh
+CI run next if picking this up cold.
 
 Phase B Stage 1 (commits 16-17 / `dea288f9`+`f22a69eb`, `core/packet.h`'s
 private-area accessor — `BessPacketPrivate`/`priv()` — plus the Opus-review
@@ -726,6 +725,83 @@ rather than one call site).
     effect) holds for a stronger reason: every `checksum.h` kernel is
     hand-written `asm volatile` with a `"memory"` clobber, so its codegen
     physically cannot vary with the language standard.
+23. **Opus review of `90d908f7`** (the `core/kmod`/`VPort` removal, commit
+    21) verdict: **C++ side correct and complete, but one real,
+    CI-breaking regression shipped, plus 2 more dead sample configs
+    missed by the commit's own deletion criterion** -- both fixed here.
+
+    **Real bug**: `pybess/test_bess.py::test_create_port` called
+    `client.create_port('VPort', 'p0', {...})`. This test's assertion
+    that removing the real C++ `VPort` driver "needed no change" (because
+    the test talks to a mock gRPC servicer that doesn't consult the
+    driver registry) was correct as far as it went, but missed that the
+    breakage happens **client-side, before the RPC is even sent**:
+    `pybess/bess.py`'s `create_port()` does
+    `getattr(port_msg, driver + 'Arg', module_msg.EmptyArg)` --  with
+    `VPortArg` removed from the regenerated stubs, this silently falls
+    back to `EmptyArg`, and the strict-mode `dict_to_protobuf()` call
+    right after it throws `KeyError: EmptyArg does not have a field
+    called ifname`. Reproduced exactly as the review described
+    (`python3 -m unittest pybess.test_bess -v` → `ERROR`), confirmed it
+    would have failed the same way in CI (`.github/workflows/ci.yml`'s
+    "Run bessctl/pybess unit tests" step runs `python3 -m unittest
+    discover`, which discovers this file). Fixed by deleting the
+    `VPort` block from `test_create_port` (the other three drivers in
+    that test are still real, still meaningful coverage). Also worth
+    knowing for later: `getattr(..., EmptyArg)`'s silent fallback is a
+    general footgun -- removing any `*Arg` message degrades to a
+    confusing `EmptyArg`-shaped error instead of a clear "no such
+    driver" one, at any future call site, not just this test.
+
+    **Missed cleanup**: `bessctl/conf/port/latency.bess` and
+    `bessctl/conf/port/vxlan.bess` both instantiate `VPort` as their only
+    port type (not fixable by editing around it -- both configs are
+    built entirely around `VPort`, same as the 5 already deleted).
+    Confirmed via the review neither is referenced by
+    `bessctl/test_samples.py` (only walks `conf/samples/`, which is
+    VPort-clean) or `run_module_tests.py` (only globs `module_tests/*.py`)
+    -- dead-but-not-CI-breaking, unlike the bug above. Deleted both.
+
+    **Also fixed**: `README.md`'s quickstart still told users to
+    `make -C core/kmod # Build the kernel module (optional)` -- removed,
+    since it's user-facing and now simply wrong.
+
+    **Everything else the review checked came back clean**: the
+    `kernel_release`/`is_kernel_header_installed()` removal (confirmed
+    zero other uses, pre- and post-commit), `sn_common.h`'s single
+    consumer, all 3 `llring.h` include-site rewrites, `git mv` history
+    preservation (`git log --follow` walks back 12 commits to the
+    original public-release commit), the protobuf removal (confirmed
+    `VPortArg` was genuinely the last message, nothing else references it
+    by name -- BESS packs port args via `google.protobuf.Any`, not a
+    `oneof`), the `PortBuilder` registration mechanism (confirmed
+    `ADD_DRIVER`'s static-initializer registration into
+    `all_port_builders()` is the *only* path -- no separate driver
+    enum/switch/hardcoded list anywhere needed updating), and the dead
+    `ZeroCopyVPortTest` friend declaration.
+
+    **Flagged, not fixed** (legacy packaging/provisioning scaffolding,
+    not part of the current build/CI path at all -- same "already-dead,
+    pre-2026-CI-rewrite" bucket as the Bionic/Travis container this
+    session's `ci.yml` already documents replacing): `env/after_install.sh`
+    still runs `make -C .../core/kmod && insmod .../bess.ko` as part of a
+    package post-install hook; `env/ci.yml`, `env/kmod.yml`,
+    `env/Dockerfile` are Ansible/Vagrant provisioning that installs
+    kernel headers for the now-gone module. None of these are invoked by
+    `.github/workflows/ci.yml` or `container_build.py`'s current code
+    paths -- left as backlog rather than fixed blind, since this
+    sandbox has no way to actually exercise/verify a packaging or
+    Vagrant/Ansible flow.
+24. **`705782b3`** — Fixed the real regression and the missed cleanup entry
+    23's review found: dropped the `VPort` block from
+    `pybess/test_bess.py::test_create_port` (the actual bug -- see entry
+    23 for the `getattr(..., EmptyArg)` mechanism), deleted
+    `bessctl/conf/port/{latency,vxlan}.bess` (two more VPort-only sample
+    configs missed by commit 21's own deletion criterion), and fixed
+    `README.md`'s now-wrong `make -C core/kmod` quickstart instruction.
+    Verified: `python3 -m unittest pybess.test_bess -v` 5/5 (was 1
+    `ERROR`); confirmed no other test file references `vport`/`VPort` or
+    the deleted sample filenames.
 
 ## Review process established this session
 
