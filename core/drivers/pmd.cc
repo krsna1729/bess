@@ -30,6 +30,9 @@
 
 #include "pmd.h"
 
+#include <algorithm>
+#include <cstdint>
+
 #include <rte_bus.h>
 #include <rte_bus_pci.h>
 #include <rte_ethdev.h>
@@ -289,21 +292,35 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
   eth_rxconf = dev_info.default_rxconf;
   eth_rxconf.rx_drop_en = 1;
 
-  if (dev_info.rx_desc_lim.nb_min > 0 &&
-      queue_size[PACKET_DIR_INC] < dev_info.rx_desc_lim.nb_min) {
-    int old_size_rxq = queue_size[PACKET_DIR_INC];
-    queue_size[PACKET_DIR_INC] = dev_info.rx_desc_lim.nb_min;
-    LOG(WARNING) << "resizing RX queue size from " << old_size_rxq << " to "
-                 << queue_size[PACKET_DIR_INC];
+  // Let DPDK clamp the requested descriptor counts to each PMD's
+  // min/max/align limits in one call. The old hand-rolled code here only
+  // handled min/max and ignored nb_align, which several PMDs enforce (a
+  // later queue_setup() failure rather than a silent adjustment).
+  // queue_size is size_t but the ethdev API is uint16_t throughout
+  // (queue_setup takes uint16_t too), so clamp to UINT16_MAX first to
+  // avoid truncation on the narrowing conversion.
+  uint16_t nb_rx_desc = static_cast<uint16_t>(
+      std::min(queue_size[PACKET_DIR_INC], static_cast<size_t>(UINT16_MAX)));
+  uint16_t nb_tx_desc = static_cast<uint16_t>(
+      std::min(queue_size[PACKET_DIR_OUT], static_cast<size_t>(UINT16_MAX)));
+  const uint16_t old_rx_desc = nb_rx_desc;
+  const uint16_t old_tx_desc = nb_tx_desc;
+
+  ret = rte_eth_dev_adjust_nb_rx_tx_desc(ret_port_id, &nb_rx_desc, &nb_tx_desc);
+  if (ret != 0) {
+    return CommandFailure(-ret, "rte_eth_dev_adjust_nb_rx_tx_desc() failed");
   }
 
-  if (dev_info.rx_desc_lim.nb_max > 0 &&
-      queue_size[PACKET_DIR_INC] > dev_info.rx_desc_lim.nb_max) {
-    int old_size_rxq = queue_size[PACKET_DIR_INC];
-    queue_size[PACKET_DIR_INC] = dev_info.rx_desc_lim.nb_max;
-    LOG(WARNING) << "capping RX queue size from " << old_size_rxq << " to "
-                 << queue_size[PACKET_DIR_INC];
+  if (nb_rx_desc != old_rx_desc) {
+    LOG(WARNING) << "adjusting RX queue size from " << old_rx_desc << " to "
+                 << nb_rx_desc;
   }
+  if (nb_tx_desc != old_tx_desc) {
+    LOG(WARNING) << "adjusting TX queue size from " << old_tx_desc << " to "
+                 << nb_tx_desc;
+  }
+  queue_size[PACKET_DIR_INC] = nb_rx_desc;
+  queue_size[PACKET_DIR_OUT] = nb_tx_desc;
 
   for (int i = 0; i < num_rxq; i++) {
     ret = rte_eth_rx_queue_setup(ret_port_id, i, queue_size[PACKET_DIR_INC],
@@ -312,22 +329,6 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
     if (ret != 0) {
       return CommandFailure(-ret, "rte_eth_rx_queue_setup() failed");
     }
-  }
-
-  if (dev_info.tx_desc_lim.nb_min > 0 &&
-      queue_size[PACKET_DIR_OUT] < dev_info.tx_desc_lim.nb_min) {
-    int old_size_txq = queue_size[PACKET_DIR_OUT];
-    queue_size[PACKET_DIR_OUT] = dev_info.tx_desc_lim.nb_min;
-    LOG(WARNING) << "resizing TX queue size from " << old_size_txq << " to "
-                 << queue_size[PACKET_DIR_OUT];
-  }
-
-  if (dev_info.tx_desc_lim.nb_max > 0 &&
-      queue_size[PACKET_DIR_OUT] > dev_info.tx_desc_lim.nb_max) {
-    int old_size_txq = queue_size[PACKET_DIR_OUT];
-    queue_size[PACKET_DIR_OUT] = dev_info.tx_desc_lim.nb_max;
-    LOG(WARNING) << "capping TX queue size from " << old_size_txq << " to "
-                 << queue_size[PACKET_DIR_OUT];
   }
 
   for (int i = 0; i < num_txq; i++) {
