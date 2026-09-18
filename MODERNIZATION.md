@@ -920,6 +920,42 @@ rather than one call site).
     `%_bench` pattern rule and the CI smoke loop pick up any
     `core/*_bench.cc` automatically. Phase B's benchmark-coverage note and
     backlog item 1 updated alongside.
+28. **`0bda5a84`** — **`llring` experiment + removal** (benchmark-backlog item
+    2, done). Built `core/ring_bench.cc`: `llring` MP/SC vs `rte_ring`
+    MP/SC vs MP_RTS/SC vs MP_HTS/SC, N-producer burst traffic (32-wide,
+    256K items/producer, per-item `(producer, sequence)` encoding so the
+    consumer verifies exact delivery, not just counts), 1/2/4/8/16
+    producers → 1 SC consumer, no EAL/hugepages needed (caller-owned
+    memory both sides). **Two methodological findings before the verdict:**
+    (a) the generic `rte_ring_enqueue/dequeue_burst` wrappers cost
+    10-30% vs the explicit sync-mode entry points (runtime flag
+    dispatch) — the first full run measured the wrappers and would have
+    kept `llring` on false grounds; re-ran explicit-against-explicit
+    (which is also what a migrated `Queue` calls); (b) DPDK 25.11 has no
+    ring zero-copy API at all, so the "HTS + zero-copy" variant from the
+    backlog text was dropped unmeasurable. Verdict (5-rep medians,
+    M items/s, llring vs rte-MP/SC at 1/2/4/8/16P):
+    253/243/196/132/100 vs 320/273/212/139/100 — rte faster-or-equal
+    everywhere, RTS/HTS no better. Per the decision rule the header went:
+    `Queue` → `rte_ring` MP/SC (`mp/sc_enqueue/dequeue_burst`), `DRR` →
+    SP/SC (`sp/sc_enqueue/dequeue`, flags `RING_F_SP_ENQ|RING_F_SC_DEQ`),
+    `LockLessQueue` (test-only) → runtime-flag `rte_ring` with the generic
+    single/bulk calls; unique ring names per `rte_ring_init` via a
+    per-TU atomic counter; `ENOBUFS`/`ENOENT` replacing
+    `LLRING_ERR_NOBUF`. `git rm core/utils/llring.h` (1193 lines);
+    `ring_bench.cc`'s llring variant removed with it (rte variants kept
+    as the forward guard). **The migration's own tests caught a real
+    convention bug**: `rte_ring_enqueue/dequeue_bulk` return the count
+    moved (0-or-n), not llring's 0-on-success — `LLQueueTest.Resize` +
+    `MultiPushPop` failed until fixed. Verified: g++ full
+    `bessd`/`modules`/`all_test` build clean, `all_test --gtest_shuffle`
+    185/185, `run_module_tests.py` all 22 files OK (incl. live `DRR`
+    tests), python units 84/84, clang++ TU-clean on every touched file,
+    `ring_bench` rte variants re-run clean post-edit. No throughput
+    comparison beyond the decision benchmark itself (it *is* the perf
+    evidence). No Opus review: measurement-led mechanical migration, and
+    its own unit tests demonstrably covered the riskiest seam (return
+    conventions).
 
 ## Review process established this session
 
@@ -2336,19 +2372,23 @@ the rejected list for what's already been decided either way.
     1→32. Still open on top of it: the cross-worker
     `PortInc → Queue → PortOut` harness (mempool experiment's own work,
     gated on the `DumpMempool()` fix) and real-NIC numbers.
-2. **`llring` vs modern `rte_ring`** for the `Queue` module's actual mode
-   (MP/SC): compare `llring` MP/SC, `rte_ring` MP/SC, `MP_RTS/SC`
-   (`RING_F_MP_RTS_ENQ`), `MP_HTS/SC`, and HTS + zero-copy, at 1/2/4/8/16
-   producers → 1 consumer. Migration is mechanically feasible --
-   `rte_ring_get_memsize()`/`rte_ring_init()` work on caller-supplied
-   memory, matching how `Queue`/`DRR` already allocate their ring memory
-   -- and `llring`'s one non-`rte_ring` feature, its watermark field, is
-   unused (`Queue` computes its own high/low water from `llring_count()`).
-   **Decision rule: if `rte_ring` is within noise, delete
-   `core/utils/llring.h` (1193 lines of vendored lock-free code)
-   regardless** -- the maintenance win is the point, not a required
-   speedup. `DRR`'s ring is SP/SC and won't show the same effect; don't
-   let it muddy the MP/SC result.
+2. **[x] `llring` vs modern `rte_ring` — done 2026-09-18, `llring.h`
+    deleted** (entry 28 below). Compared in `Queue`'s exact mode (MP
+    enqueue-burst, SC dequeue-burst) at 1/2/4/8/16 producers → 1 consumer
+    (`core/ring_bench.cc`, new file, kept — the `rte_ring` variants stay
+    as the ring perf guard). **First measurement was misleading and
+    would have decided wrong**: the generic `rte_ring_enqueue_burst` /
+    `dequeue_burst` wrappers dispatch on creation flags at runtime and
+    measured 10-30% slower than `llring`'s explicit calls across the
+    board. Re-ran explicit-against-explicit and the deficit inverted:
+    rte MP/SC medians 320/273/212/139/100M vs llring 253/243/196/132/100M
+    items/s (1/2/4/8/16 producers) — faster-or-equal everywhere, so per
+    the decision rule `core/utils/llring.h` (1193 lines) is gone and
+    `Queue` (MP/SC), `DRR` (SP/SC), `LockLessQueue` (runtime flags) moved
+    to `rte_ring`. RTS/HTS measured no better than classic MP/SC here;
+    zero-copy has no API in DPDK 25.11 (verified absent), both dropped.
+    `DRR`'s SP/SC rings were migrated alongside (same mechanical change,
+    not benchmarked separately per the original scoping note).
 3. **Mempool backend × cache size × worker topology.** Gated on (1) and on
    the `DumpMempool()` fix (Phase F, above). Backends: `ring_mp_mc`
    (current), `ring_mt_rts`, `ring_mt_hts`, `stack`, `lf_stack`
