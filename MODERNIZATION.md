@@ -2071,36 +2071,92 @@ the reviewing document's word alone.
   that framing only.
 - **NAT RSS-affinity subsystem** (predictable RSS via `rte_thash` so
   NAT's translated-port choice makes the return flow land on the same
-  worker) — reject the feature, keep one small piece. The premise is
-  false: **`NAT` is single-worker today**
-  (`Module::max_allowed_workers_` defaults to 1, `core/module.h`, not
-  overridden in `nat.h` -- verified by checking every override in
-  `core/modules/`), so the "return flow lands on the wrong worker"
-  problem this would solve doesn't exist; multi-worker NAT doesn't exist
-  either. This is a substantial new *feature* (multi-worker NAT + RSS-
-  affine port selection), not modernization, and the largest-scope single
-  item in the source document. Worth keeping: `PMDPort`'s RSS setup
-  currently uses the PMD's default key with no RETA control -- making the
-  RSS key and hash types configurable on `PMDPortArg` is small,
-  non-speculative, and unblocks any future RSS work without committing to
-  the NAT feature. That belongs in Phase C, not this phase.
-- **`rte_flow` as an optional hardware-offload backend** — reject for now,
-  keep one design constraint. The constraint is worth recording: compile
-  BESS logical rules down to `rte_flow`, never let a module secretly
-  *become* `rte_flow` under the hood (same "expose BESS semantics, not
-  backend implementation details" principle as `PacketCapabilities` above
-  and `PacketRef` in Phase B). But the work presupposes a rule IR BESS
-  doesn't have yet. Natural home is after Phase G's `GraphSpec`/
-  `Capabilities` work -- record the constraint, schedule nothing now.
+  worker) — reject the feature as scoped, but the underlying question
+  ("is NAT single-worker *because* predictable RSS doesn't exist?") is
+  worth answering precisely rather than dismissing (follow-up
+  investigation, 2026-09-18): **no, not primarily.** `NAT::DoProcessBatch`
+  calls `map_.Insert()` (`core/modules/nat.cc`) -- i.e. NAT mutates its
+  `CuckooMap` of translation state **from the data plane itself**, on
+  every newly-seen flow, not just via control-plane commands. That's
+  structurally different from `ACL`/`IPLookup`/`ExactMatch`/
+  `WildcardMatch`, which all *do* override `max_allowed_workers_` upward
+  (verified: all four appear in the set of modules under `core/modules/`
+  that override it) because their tables are only ever mutated by
+  control-plane commands, never by `ProcessBatch` itself -- concurrent
+  *reads* across workers are fine, only writes need serializing, and
+  those already go through the pause-all path. NAT has no such
+  separation: two workers processing two different flows could call
+  `map_.Insert()` on the shared table concurrently, and `CuckooMap` isn't
+  documented or verified safe for concurrent multi-writer access. **So
+  the real blocker is table write-safety, not RSS.** That said, RSS
+  affinity is still the *architectural key* to fixing it, just not on its
+  own: a viable multi-worker NAT would most naturally shard its
+  translation table one-per-worker (eliminating the shared-writer problem
+  entirely), and that sharding only stays correct if forward *and*
+  reverse packets of the same flow are guaranteed to land on the same
+  worker -- which is exactly what predictable/symmetric RSS provides. So:
+  predictable RSS is necessary but not sufficient; the table-sharding
+  design is the other, undesigned half. Still a substantial new feature,
+  still rejected as out of scope for modernization -- but noted precisely
+  so a future NAT-scaling effort starts from the right diagnosis.
+
+  **Independent of NAT, one thing genuinely worth leveraging: symmetric
+  RSS as a general `PMDPort` capability.** Verified `core/drivers/pmd.cc`
+  configures `rss_key = nullptr` (PMD default key), `rss_key_len = 0`,
+  and never calls RETA query/update -- the *only* RSS control BESS
+  exposes today is which hash types to request. A symmetric hash key (a
+  well-known technique: designing the Toeplitz key, or using `rte_thash`'s
+  adjustment helpers, so a 5-tuple and its reverse hash identically) makes
+  forward/reverse flows land on the same RX queue for **any** future
+  stateful per-flow module wanting worker affinity -- not NAT-specific,
+  and not blocked on redesigning NAT at all. This is small, general,
+  non-speculative infrastructure. Add to Phase C: expose RSS key
+  (including a symmetric-key helper/preset) and hash-type selection on
+  `PMDPortArg`; RETA control as a follow-up once a real consumer wants
+  non-default queue mapping.
+- **`rte_flow` as an optional hardware-offload backend** — reclassified as
+  **exploratory research, not a rejection** (per explicit direction,
+  2026-09-18): don't schedule it, but don't file it as "no" either. The
+  design constraint from the original assessment still stands and is the
+  useful output of this pass: compile BESS logical rules down to
+  `rte_flow`, never let a module secretly *become* `rte_flow` under the
+  hood (same "expose BESS semantics, not backend implementation details"
+  principle as the narrow `PortCapabilities` in Phase C and `PacketRef`
+  in Phase B). The blocker is real -- the work presupposes a rule IR BESS
+  doesn't have yet, so it can't start before Phase G's `GraphSpec`/
+  `Capabilities` work exists -- but "blocked on a prerequisite" is a
+  different status than "not worth doing," and this doc should say which
+  one it means. Revisit as a real research spike once `GraphSpec` lands.
 - **DMAdev** — reject/defer. Submission/completion overhead dominates for
   BESS's typical per-packet work (TTL decrement, MAC swap, small header
   rewrites); DPDK's own DMA docs use packet-copy-heavy workloads as the
   motivating case, which BESS mostly doesn't have. Revisit only if a
-  genuinely copy-heavy path (e.g. async vhost) appears.
-- **`rte_eth_recycle_mbufs()`** — reject. Still experimental in the ethdev
-  API, and BESS's general graph (buffer, clone, drop, cross-worker,
-  generate packets, hold state) breaks the simple-1:1-forwarding ownership
-  assumption it needs.
+  genuinely copy-heavy path (e.g. async vhost) appears. (No change from
+  the original assessment as of 2026-09-18 -- flagged for a second look
+  but nothing new found to shift the verdict; revisit if a concrete
+  copy-heavy use case shows up rather than re-litigating abstractly.)
+- **`rte_eth_recycle_mbufs()`** — reject as a global default, but **the
+  graph-aware angle raised 2026-09-18 is worth keeping as a research
+  note, not dropping**: BESS's control plane already has full topology
+  knowledge (today via the imperative connect-time graph; more
+  explicitly once Phase G's `GraphSpec` exists), which is exactly the
+  information needed to determine *per RX/TX queue pair* whether a
+  simple, eligible 1:1-forwarding sub-path exists (no buffering, cloning,
+  dropping, cross-worker handoff, or packet generation between a specific
+  `PortInc` and `PortOut`) -- and to re-evaluate that eligibility whenever
+  the graph changes, enabling/disabling the DPDK optimization dynamically
+  per queue pair rather than as an all-or-nothing global switch. This is
+  a genuinely different (and more interesting) proposal than the source
+  document's static "detect a simple topology, use it" framing: it makes
+  the optimization *follow* live topology changes instead of requiring a
+  static deployment shape. It is **not buildable yet** -- it needs (a) a
+  graph-analysis pass that can answer "is this specific path eligible"
+  and (b) a way to toggle the recycle optimization per queue pair at
+  runtime, neither of which exist -- and the API itself remains
+  experimental in DPDK's ethdev layer regardless. Right home: revisit
+  alongside Phase G's graph/topology work once `GraphSpec` gives BESS a
+  real data structure to run this analysis over, not as a standalone
+  `PMDPort` feature today.
 - **`rte_bitset`** — reject. `kMaxWorkers = 64` (`core/worker.h`), so the
   existing `std::vector<bool>` active-worker set already fits one
   `uint64_t`; nothing to gain.
