@@ -1993,16 +1993,56 @@ every worker in the process.**
 
 **The mechanism**: replace pause-mutate-resume with build-publish-reclaim
 -- construct a replacement table off the dataplane, atomically publish the
-pointer (release store), let workers keep running, wait for a QSBR grace
-period, then destroy the old table. `rte_rcu_qsbr` provides this and
-`librte_rcu.a` is **already linked into `bessd`** (part of
-`libdpdk.pc`'s `--whole-archive` list) -- no new dependency. Reader cost is
-one `rte_rcu_qsbr_quiescent()` (a store) per `Scheduler::ScheduleLoop()`
-iteration. This is the first real backend for the `bess::RcuDomain`
-abstraction Phase H already sketches ("backed initially by DPDK's own
-QSBR/RCU primitives ... swap in `std::rcu` underneath later") -- keep
-`RcuDomain` as the interface so a future replacement doesn't touch
-callers.
+pointer (release store), let workers keep running, wait for a grace
+period, then destroy the old table.
+
+**Which `RcuDomain` backend to actually build first: C++-native, not
+DPDK** (design note added 2026-09-18, answering a direct question).
+Real options, in increasing order of "how much you're building yourself":
+`std::shared_mutex` (not RCU at all, a reader-writer lock -- every read
+pays a real lock even with zero writer activity, strictly worse than any
+RCU-style approach for this access pattern, mentioned only as the naive
+baseline); `std::atomic<std::shared_ptr<T>>` ("RCU via refcounting" --
+`std::atomic_load`/`_store` on a `shared_ptr`, reclamation is automatic
+because the refcount *is* the grace-period tracking, at the cost of a
+real atomic op per access); a hand-rolled epoch-based scheme with
+`std::atomic` (reimplementing QSBR's algorithm yourself: readers store a
+relaxed/release epoch counter once per loop iteration, writers defer
+freeing until all readers have advanced past the retirement epoch --
+same performance ceiling as DPDK's QSBR, but every memory-ordering detail
+is now this project's problem); `rte_rcu_qsbr` (the same algorithm as
+the hand-rolled version, already written, already tested in a networking
+context, and `librte_rcu.a` is **already linked into `bessd`** -- no new
+dependency, reader cost is one `rte_rcu_qsbr_quiescent()` store per
+`Scheduler::ScheduleLoop()` iteration); and C++26 `std::rcu`/hazard
+pointers (not production-ready anywhere yet, per Phase H -- the eventual
+target, not a near-term option).
+
+**Recommendation: prototype the first backend as
+`std::atomic<std::shared_ptr<T>>`, not the hand-rolled epoch scheme and
+not `rte_rcu_qsbr` yet.** Two reasons, both concrete rather than
+theoretical: (1) this session already found a real, hard-to-reproduce
+concurrency bug in this exact codebase's hand-rolled synchronization
+(`worker.cc`/`all_tcs_`, commits 6-8) -- a live argument against adding a
+*second* bespoke concurrency primitive when a well-tested one exists, and
+`shared_ptr`'s refcounting needs no separate "prove the grace period
+elapsed" logic to get right at all, unlike either epoch-based option; (2)
+BESS processes packets in batches of `PacketBatch::kMaxBurst = 32`, not
+one at a time -- if the RCU-protected read happens once per
+`ProcessBatch()` call (grab a stable table reference for the whole
+batch, not once per packet), the atomic refcount cost amortizes over 32
+packets, meaningfully weakening the usual "shared_ptr is too slow for
+RCU" argument for BESS's specific access pattern. Phase J's own
+acceptance criterion is explicitly capability, not a `*_bench.cc` number
+-- so the honest performance bar to clear here is low. Swap the backend
+to `rte_rcu_qsbr` behind the same `RcuDomain` interface later only if
+profiling actually shows the refcount cost matters, as a measurement,
+not an assumption. **Caveat if that swap ever happens**: `rte_rcu_qsbr`'s
+writer side would need the control-plane thread (handling gRPC commands,
+not currently EAL-registered) to either call `rte_thread_register()`
+once at startup or have a worker perform the actual reclaim on the
+control plane's behalf via a deferred/queued mechanism -- a real design
+detail to work out then, not automatic.
 
 **Independent of the `WorkerId`/lcore-ID migration** (Phase C, above):
 `rte_rcu_qsbr_thread_register()` takes a caller-chosen `thread_id`, not an
