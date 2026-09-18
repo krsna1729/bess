@@ -2106,9 +2106,6 @@ def show_system_packets(cli, socket):
         cli.fout.write('\tmp_available_count: {}\n'.format(
             dump.mp_available_count))
         cli.fout.write('\tmp_in_use_count: {}\n'.format(dump.mp_in_use_count))
-        cli.fout.write('\tring_count: {}\n'.format(dump.ring_count))
-        cli.fout.write('\tring_free_count: {}\n'.format(dump.ring_free_count))
-        cli.fout.write('\tring_bytes: {}\n'.format(dump.ring_bytes))
 
 
 @cmd('http [HOST] [PORT_NUMBER]', 'Run an HTTP server')

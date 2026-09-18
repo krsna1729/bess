@@ -479,9 +479,12 @@ message MempoolDump {
     uint32 mp_populated_size = 6;   /// Number of populated objects
     uint32 mp_available_count = 7;  /// Number of entries in this mempool
     uint32 mp_in_use_count = 8;     /// Number of elements which have been allocated from this mempool
-    uint32 ring_count = 9;          /// Number of entries in the backing ring
-    uint32 ring_free_count = 10;    /// Number of free entries in the backing ring
-    uint64 ring_bytes = 11;         /// Size of the backing ring in bytes 
+    // Deprecated: assumed the mempool was backed by rte_ring (ring_mp_mc).
+    // Unset (zero) since the backend-independent DumpMempool rewrite; use
+    // mp_available_count / mp_in_use_count instead. Field numbers reserved.
+    uint32 ring_count = 9;          /// DEPRECATED, always zero
+    uint32 ring_free_count = 10;    /// DEPRECATED, always zero
+    uint64 ring_bytes = 11;         /// DEPRECATED, always zero
 }
 
 message DumpMempoolRequest {
