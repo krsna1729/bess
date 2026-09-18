@@ -47,12 +47,24 @@
 // *relative* comparisons between runs of this binary (the actual use case:
 // before/after a refactor, same machine) are valid.
 //
+// Two families, with deliberately different timing boundaries -- read
+// before comparing numbers across them:
+//   - BM_PmdNullTx / BM_PmdRingRoundTrip: the PMD/interface boundary only.
+//     Allocation is set up outside the timed region, so these isolate
+//     rte_eth_rx/tx_burst (+ PMD-side free) cost. Use them for Stage 2,
+//     burst-size, and FIB questions.
+//   - BM_PmdNullTxEndToEnd / BM_PmdRingRoundTripEndToEnd: the full local
+//     lifecycle -- alloc + TX + RX + free, all timed. Use them for
+//     allocator-adjacent questions (mempool backend/cache), where omitting
+//     half the lifecycle would be measuring the wrong thing.
+// Neither replaces the cross-worker PortInc -> Queue -> PortOut harness
+// the mempool experiment needs (allocate on worker A, free on worker B);
+// that is its own work, gated on this file plus the DumpMempool() fix.
+//
 // Deliberately PMD-level, not module-graph-level: PortInc/PortOut modules
 // need a live daemon (workers, scheduler loop), which has no standalone
 // harness -- this exercises the exact rte_eth_rx/tx_burst boundary Phase B
-// Stage 2 must redesign, without it. The cross-worker
-// PortInc -> Queue -> PortOut shape belongs to the mempool experiment's
-// own harness, gated on this file plus the DumpMempool() fix.
+// Stage 2 must redesign, without it.
 
 #include <benchmark/benchmark.h>
 #include <glog/logging.h>
@@ -109,13 +121,15 @@ bess::PacketPool *DefaultPool() {
   return pool;
 }
 
-// TX-only through the null PMD: measures alloc + rte_eth_tx_burst +
-// (PMD-side) free per packet. RX is meaningless here (always 0).
+// TX-only through the null PMD: the TX-burst path in isolation (RX is
+// meaningless here -- always 0). Allocation is deliberately outside the
+// timed region; see the EndToEnd twin below for the full lifecycle.
 void BM_PmdNullTx(benchmark::State &state) {
   PmdFixture &fx = GetFixture();
   bess::PacketPool *pool = DefaultPool();
   const int batch = static_cast<int>(state.range(0));
   bess::Packet *pkts[bess::PacketBatch::kMaxBurst];
+  uint64_t sent_total = 0;
   uint64_t dropped = 0;
 
   for (auto _ : state) {
@@ -124,6 +138,7 @@ void BM_PmdNullTx(benchmark::State &state) {
     state.ResumeTiming();
 
     int sent = fx.null_port.SendPackets(0, pkts, batch);
+    sent_total += static_cast<uint64_t>(sent);
     dropped += static_cast<uint64_t>(batch - sent);
     // The null PMD frees everything it accepts, so nothing to free here.
     // Anything it didn't accept is a real drop: free it to keep the pool
@@ -132,13 +147,41 @@ void BM_PmdNullTx(benchmark::State &state) {
       bess::Packet::Free(pkts[i]);
     }
   }
-  state.SetItemsProcessed(state.iterations() * batch);
+  // Actual packets transmitted, not requested: if a future change starts
+  // dropping, throughput must visibly fall, not look excellent while doing
+  // less work. Drops are reported separately below.
+  state.SetItemsProcessed(sent_total);
   state.counters["tx_drops"] = benchmark::Counter(dropped);
 }
 BENCHMARK(BM_PmdNullTx)->RangeMultiplier(2)->Range(1, bess::PacketBatch::kMaxBurst);
 
+// Null-TX twin with the full local lifecycle timed: alloc + TX +
+// PMD-side free. The allocator-facing variant; see the file header.
+void BM_PmdNullTxEndToEnd(benchmark::State &state) {
+  PmdFixture &fx = GetFixture();
+  bess::PacketPool *pool = DefaultPool();
+  const int batch = static_cast<int>(state.range(0));
+  bess::Packet *pkts[bess::PacketBatch::kMaxBurst];
+  uint64_t sent_total = 0;
+  uint64_t dropped = 0;
+
+  for (auto _ : state) {
+    CHECK(pool->AllocBulk(pkts, batch, kPktLen));
+    int sent = fx.null_port.SendPackets(0, pkts, batch);
+    sent_total += static_cast<uint64_t>(sent);
+    dropped += static_cast<uint64_t>(batch - sent);
+    for (int i = sent; i < batch; i++) {
+      bess::Packet::Free(pkts[i]);
+    }
+  }
+  state.SetItemsProcessed(sent_total);
+  state.counters["tx_drops"] = benchmark::Counter(dropped);
+}
+BENCHMARK(BM_PmdNullTxEndToEnd)->RangeMultiplier(2)->Range(1, bess::PacketBatch::kMaxBurst);
+
 // Full self-loopback through the ring PMD: TX a burst, RX it back, free.
 // This is the closest standalone analogue of PortInc -> PortOut forwarding.
+// Allocation is outside the timed region (interface-boundary variant).
 void BM_PmdRingRoundTrip(benchmark::State &state) {
   PmdFixture &fx = GetFixture();
   bess::PacketPool *pool = DefaultPool();
@@ -170,6 +213,34 @@ void BM_PmdRingRoundTrip(benchmark::State &state) {
   state.counters["tx_drops"] = benchmark::Counter(tx_drops);
 }
 BENCHMARK(BM_PmdRingRoundTrip)->RangeMultiplier(2)->Range(1, bess::PacketBatch::kMaxBurst);
+
+// Ring twin with the full local lifecycle timed: alloc + TX + RX + free.
+// The allocator-facing variant; see the file header.
+void BM_PmdRingRoundTripEndToEnd(benchmark::State &state) {
+  PmdFixture &fx = GetFixture();
+  bess::PacketPool *pool = DefaultPool();
+  const int batch = static_cast<int>(state.range(0));
+  bess::Packet *tx[bess::PacketBatch::kMaxBurst];
+  bess::Packet *rx[bess::PacketBatch::kMaxBurst];
+  uint64_t tx_drops = 0;
+  uint64_t rx_total = 0;
+
+  for (auto _ : state) {
+    CHECK(pool->AllocBulk(tx, batch, kPktLen));
+    int sent = fx.ring_port.SendPackets(0, tx, batch);
+    tx_drops += static_cast<uint64_t>(batch - sent);
+    for (int i = sent; i < batch; i++) {
+      bess::Packet::Free(tx[i]);
+    }
+
+    int recvd = fx.ring_port.RecvPackets(0, rx, batch);
+    rx_total += static_cast<uint64_t>(recvd);
+    bess::Packet::Free(rx, recvd);
+  }
+  state.SetItemsProcessed(rx_total);
+  state.counters["tx_drops"] = benchmark::Counter(tx_drops);
+}
+BENCHMARK(BM_PmdRingRoundTripEndToEnd)->RangeMultiplier(2)->Range(1, bess::PacketBatch::kMaxBurst);
 
 }  // namespace
 

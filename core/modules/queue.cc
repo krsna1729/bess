@@ -30,33 +30,13 @@
 
 #include "queue.h"
 
-#include <atomic>
-#include <cstdio>
 #include <cstdlib>
+#include <string>
 
 #include "../utils/format.h"
+#include "../utils/rte_ring_alloc.h"
 
 #define DEFAULT_QUEUE_SIZE 1024
-
-namespace {
-
-// rte_ring_init() takes a name; every (re-)created ring gets a unique one
-// so resized rings can never collide.
-std::string NewRingName(const char *prefix) {
-  static std::atomic<uint64_t> id{0};
-  char buf[64];
-  snprintf(buf, sizeof(buf), "%s_%lu", prefix,
-           static_cast<unsigned long>(id.fetch_add(1)));
-  return buf;
-}
-
-// Caller-owned ring memory, cache-line aligned.
-void *AllocRingMem(size_t bytes) {
-  const size_t align = 64;
-  return std::aligned_alloc(align, (bytes + align - 1) / align * align);
-}
-
-}  // namespace
 
 const Commands Queue::cmds = {
     {"set_burst", "QueueCommandSetBurstArg",
@@ -81,12 +61,13 @@ int Queue::Resize(int slots) {
     return -EINVAL;
   }
 
-  new_queue = static_cast<rte_ring *>(AllocRingMem(bytes));
+  new_queue = static_cast<rte_ring *>(
+      bess::utils::AllocRingMem(static_cast<size_t>(bytes)));
   if (!new_queue) {
     return -ENOMEM;
   }
 
-  std::string name = NewRingName("queue");
+  std::string name = bess::utils::NewRingName("queue");
   int ret = rte_ring_init(new_queue, name.c_str(), slots, RING_F_SC_DEQ);
   if (ret) {
     std::free(new_queue);

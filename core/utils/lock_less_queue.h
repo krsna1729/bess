@@ -35,10 +35,8 @@
 
 #include <rte_ring.h>
 
-#include <atomic>
-#include <cstdio>
-
 #include "queue.h"
+#include "rte_ring_alloc.h"
 
 namespace bess {
 namespace utils {
@@ -132,25 +130,19 @@ class LockLessQueue final : public Queue<T> {
     return 0;
   }
 
-  private:
+   private:
    static rte_ring* NewRing(size_t capacity, unsigned flags) {
-     static std::atomic<uint64_t> id{0};
-     char name[64];
-     snprintf(name, sizeof(name), "locklessq_%lu",
-              static_cast<unsigned long>(id.fetch_add(1)));
      ssize_t bytes = rte_ring_get_memsize(capacity);
      if (bytes < 0) {
        return nullptr;
      }
-     const size_t align = 64;
-     size_t rounded =
-         (static_cast<size_t>(bytes) + align - 1) / align * align;
-     void* mem = std::aligned_alloc(align, rounded);
+     void* mem = bess::utils::AllocRingMem(static_cast<size_t>(bytes));
      if (!mem) {
        return nullptr;
      }
      rte_ring* ring = static_cast<rte_ring*>(mem);
-     if (rte_ring_init(ring, name, capacity, flags) != 0) {
+     std::string name = bess::utils::NewRingName("locklessq");
+     if (rte_ring_init(ring, name.c_str(), capacity, flags) != 0) {
        std::free(mem);
        return nullptr;
      }

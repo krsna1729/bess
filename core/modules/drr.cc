@@ -30,15 +30,14 @@
 
 #include "drr.h"
 
-#include <atomic>
 #include <cmath>
-#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <string>
 
 #include "../utils/ether.h"
 #include "../utils/ip.h"
+#include "../utils/rte_ring_alloc.h"
 #include "../utils/udp.h"
 
 namespace {
@@ -46,22 +45,6 @@ namespace {
 // All DRR rings are single-producer/single-consumer (one task owns the
 // module); the explicit SP/SC entry points below match that mode.
 const unsigned kRingFlags = RING_F_SP_ENQ | RING_F_SC_DEQ;
-
-// rte_ring_init() takes a name; every (re-)created ring gets a unique one
-// so per-flow and resized rings can never collide.
-std::string NewRingName(const char *prefix) {
-  static std::atomic<uint64_t> id{0};
-  char buf[64];
-  snprintf(buf, sizeof(buf), "%s_%lu", prefix,
-           static_cast<unsigned long>(id.fetch_add(1)));
-  return buf;
-}
-
-// Caller-owned ring memory, cache-line aligned.
-void *AllocRingMem(size_t bytes) {
-  const size_t align = 64;
-  return std::aligned_alloc(align, (bytes + align - 1) / align * align);
-}
 
 }  // namespace
 
@@ -370,14 +353,14 @@ rte_ring *DRR::AddQueue(uint32_t slots, int *err) {
   }
   int ret;
 
-  rte_ring *queue =
-      static_cast<rte_ring *>(AllocRingMem(static_cast<size_t>(bytes)));
+  rte_ring *queue = static_cast<rte_ring *>(
+      bess::utils::AllocRingMem(static_cast<size_t>(bytes)));
   if (!queue) {
     *err = -ENOMEM;
     return nullptr;
   }
 
-  std::string name = NewRingName("drr");
+  std::string name = bess::utils::NewRingName("drr");
   ret = rte_ring_init(queue, name.c_str(), slots, kRingFlags);
   if (ret) {
     std::free(queue);

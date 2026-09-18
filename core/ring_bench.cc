@@ -42,11 +42,12 @@
 // Variants: rte_ring MP/SC (`RING_F_SC_DEQ` -- Queue's mode); rte_ring
 // MP_RTS/SC; rte_ring MP_HTS/SC. (RTS/HTS measured no better than classic
 // MP/SC here, so nothing adopted them; kept as coverage in case a future
-// DPDK or topology changes the answer.) Zero-copy reservation is
-// deliberately *not* benchmarked: DPDK 25.11's `rte_ring.h` has no
-// zero-copy burst API (verified by grep -- no `zc_burst`/`zero_copy`
-// symbols), so there is nothing to adopt; revisit if a future DPDK bump
-// adds one.
+// DPDK or topology changes the answer.) Zero-copy reservation
+// (`rte_ring_{en,de}queue_zc_burst_{start,finish}` in `rte_ring_peek_zc.h`)
+// is deliberately *not* benchmarked: it wasn't needed to justify the
+// removal, and its win applies to producers that can write directly into
+// reserved slots, not to this pointer-handoff shape; a separate HTS+ZC
+// optimization experiment may evaluate it later.
 //
 // All calls below are the *explicit* sync-mode entry points
 // (`mp_enqueue_burst`, `sc_dequeue_burst`, `mp_rts/hts_enqueue_burst`),
@@ -56,11 +57,17 @@
 // `Queue` that already knows its mode), and the explicit forms are
 // exactly what the migrated `Queue` calls.
 //
-// Needs no EAL, no hugepages, no daemon: both rings live in plain
-// `aligned_alloc` memory (`rte_ring_init` on caller-supplied memory,
-// same as `Queue` already allocates its `llring` memory). `DRR`'s ring is
-// SP/SC and intentionally excluded -- it can't show the MP/SC effect and
-// must not muddy the result.
+// Each (variant, producer count) runs in two phases: an untimed
+// correctness phase moving the full quota with exact per-producer
+// sequence verification, then the timed loop where the consumer only
+// counts (a verifying consumer becomes the ceiling at high producer
+// counts and would hide producer-side differences). Pass --pin_threads
+// to pin threads best-effort to distinct allowed CPUs; the default is
+// unpinned, because on a shared host pinning can force threads onto busy
+// cores (measured far slower here -- use it on quiet machines only).
+//
+// Needs no EAL, no hugepages, no daemon: rings live in plain caller-owned
+// memory via the shared `utils/rte_ring_alloc.h` helpers.
 
 #include <benchmark/benchmark.h>
 #include <glog/logging.h>
@@ -72,8 +79,11 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <sched.h>
 #include <thread>
 #include <vector>
+
+#include "utils/rte_ring_alloc.h"
 
 namespace {
 
@@ -89,15 +99,13 @@ struct RteRingOps {
   using Ring = rte_ring;
 
   static Ring *Create() {
-    static std::atomic<int> id{0};
-    char name[32];
-    snprintf(name, sizeof(name), "ringbench_%d", id.fetch_add(1));
-    size_t bytes = static_cast<size_t>(rte_ring_get_memsize(kSlots));
-    const size_t align = 64;
-    void *mem = std::aligned_alloc(align, (bytes + align - 1) / align * align);
+    ssize_t bytes = rte_ring_get_memsize(kSlots);
+    CHECK(bytes > 0);
+    void *mem = bess::utils::AllocRingMem(static_cast<size_t>(bytes));
     CHECK(mem != nullptr);
     Ring *r = static_cast<Ring *>(mem);
-    CHECK(rte_ring_init(r, name, kSlots, Flags) == 0);
+    std::string name = bess::utils::NewRingName("ringbench");
+    CHECK(rte_ring_init(r, name.c_str(), kSlots, Flags) == 0);
     return r;
   }
 
@@ -137,64 +145,145 @@ struct RteHtsOps : public RteRingOps<RING_F_SC_DEQ | RING_F_MP_HTS_ENQ> {
   }
 };
 
+// Best-effort thread pinning: spread producers and consumer over the
+// process's allowed CPUs so scheduler placement isn't an uncontrolled
+// variable in a benchmark whose entire subject is inter-core contention.
+// Silently runs unpinned where affinity is unavailable; BESS is
+// Linux-only, so no portability shim.
+// Set via --pin_threads (stripped from argv in main before Google
+// Benchmark sees it). Default off: on a shared/noisy host, hard pinning
+// forces threads onto whatever cores happen to be busy (measured ~500x
+// slower in this sandbox), while the scheduler migrates away from them.
+// Enable explicitly for scaling studies on a quiet/dedicated machine.
+bool g_pin_threads = false;
+
+void PinThread(int idx) {
+  if (!g_pin_threads) {
+    return;
+  }
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+    return;
+  }
+  int ncpu = CPU_COUNT(&allowed);
+  if (ncpu <= 0) {
+    return;
+  }
+  int want = idx % ncpu;
+  int seen = -1;
+  int target = -1;
+  for (int c = 0; c < CPU_SETSIZE; c++) {
+    if (!CPU_ISSET(c, &allowed)) {
+      continue;
+    }
+    if (++seen == want) {
+      target = c;
+      break;
+    }
+  }
+  if (target < 0) {
+    return;
+  }
+  cpu_set_t one;
+  CPU_ZERO(&one);
+  CPU_SET(target, &one);
+  (void)sched_setaffinity(0, sizeof(one), &one);
+}
+
+// Spawns parked producers; the caller sets `start` and joins. NOTE: `ring`
+// is captured by value, not by reference -- it is this helper's parameter
+// and dies on return, while the spawned threads outlive the call.
+template <typename Ops>
+std::vector<std::thread> SpawnProducers(
+    typename Ops::Ring *ring, int num_producers,
+    std::vector<std::vector<void *>> &bufs, std::atomic<bool> &start) {
+  std::vector<std::thread> producers;
+  for (int p = 0; p < num_producers; p++) {
+    producers.emplace_back([&, p, ring]() {
+      PinThread(p);
+      while (!start.load(std::memory_order_acquire)) {
+      }
+      // Items carry (producer_id, sequence). The encoding work is part of
+      // every variant's cost equally; the consumer side decides whether to
+      // verify it (correctness phase) or just count (timed phase).
+      uint64_t seq = 0;
+      while (seq < kItemsPerProducer) {
+        // Cap the last request so producers enqueue exactly their quota
+        // (a full 32-wide final burst would overshoot it).
+        uint64_t left = kItemsPerProducer - seq;
+        unsigned want = (left < kBurst) ? static_cast<unsigned>(left) : kBurst;
+        for (unsigned i = 0; i < want; i++) {
+          bufs[p][i] = reinterpret_cast<void *>((static_cast<uint64_t>(p) << 32) | (seq + i));
+        }
+        seq += Ops::EnqueueBurst(ring, bufs[p].data(), want);
+      }
+    });
+  }
+  return producers;
+}
+
+// Untimed correctness phase, run once per (variant, producer count):
+// moves the full quota through a fresh ring checking exact per-producer
+// sequences, so the timed phase below can count cheaply. A ring that
+// dropped one item and delivered another twice would still pass a pure
+// count check -- this phase exists so the timed loop doesn't have to.
+template <typename Ops>
+void VerifyRing(int num_producers) {
+  const uint64_t total =
+      kItemsPerProducer * static_cast<uint64_t>(num_producers);
+  typename Ops::Ring *ring = Ops::Create();
+  std::vector<std::vector<void *>> bufs(num_producers,
+                                        std::vector<void *>(kBurst));
+  std::atomic<bool> start{false};
+  std::vector<std::thread> producers =
+      SpawnProducers<Ops>(ring, num_producers, bufs, start);
+  PinThread(num_producers);
+  start.store(true, std::memory_order_release);
+  std::vector<void *> out(kBurst);
+  std::vector<uint64_t> expected(num_producers, 0);
+  uint64_t consumed = 0;
+  while (consumed < total) {
+    unsigned n = Ops::DequeueBurst(ring, out.data(), kBurst);
+    for (unsigned i = 0; i < n; i++) {
+      uint64_t v = reinterpret_cast<uint64_t>(out[i]);
+      int src = static_cast<int>(v >> 32);
+      CHECK(src >= 0 && src < num_producers);
+      CHECK((v & 0xffffffffu) == expected[src]);
+      expected[src]++;
+    }
+    consumed += n;
+  }
+  CHECK(consumed == total);
+  for (auto &t : producers) {
+    t.join();
+  }
+  Ops::Destroy(ring);
+}
+
 template <typename Ops>
 void RunRingBenchmark(benchmark::State &state) {
   const int num_producers = static_cast<int>(state.range(0));
   const uint64_t total = kItemsPerProducer * static_cast<uint64_t>(num_producers);
 
+  VerifyRing<Ops>(num_producers);
+
   for (auto _ : state) {
     state.PauseTiming();
     typename Ops::Ring *ring = Ops::Create();
-
-    // Per-producer private object tables (distinct addresses, no sharing).
     std::vector<std::vector<void *>> bufs(num_producers,
                                           std::vector<void *>(kBurst));
-    for (int p = 0; p < num_producers; p++) {
-      for (unsigned i = 0; i < kBurst; i++) {
-        bufs[p][i] = reinterpret_cast<void *>(
-            static_cast<uintptr_t>(0x1000 * (p + 1) + i + 1));
-      }
-    }
-
     std::atomic<bool> start{false};
-    std::vector<std::thread> producers;
-    for (int p = 0; p < num_producers; p++) {
-      producers.emplace_back([&, p]() {
-        while (!start.load(std::memory_order_acquire)) {
-        }
-        // Items carry (producer_id, sequence) so the consumer can verify
-        // exact delivery, not just the total count: a ring that dropped
-        // one item and delivered another twice would still pass a pure
-        // count check. Same encoding cost on every variant measured.
-        uint64_t seq = 0;
-        while (seq < kItemsPerProducer) {
-          // Cap the last request so producers enqueue exactly their quota
-          // (a full 32-wide final burst would overshoot it).
-          uint64_t left = kItemsPerProducer - seq;
-          unsigned want = (left < kBurst) ? static_cast<unsigned>(left) : kBurst;
-          for (unsigned i = 0; i < want; i++) {
-            bufs[p][i] = reinterpret_cast<void *>((static_cast<uint64_t>(p) << 32) | (seq + i));
-          }
-          seq += Ops::EnqueueBurst(ring, bufs[p].data(), want);
-        }
-      });
-    }
+    std::vector<std::thread> producers =
+        SpawnProducers<Ops>(ring, num_producers, bufs, start);
     state.ResumeTiming();
 
+    PinThread(num_producers);
     start.store(true, std::memory_order_release);
     std::vector<void *> out(kBurst);
-    std::vector<uint64_t> expected(num_producers, 0);
     uint64_t consumed = 0;
     while (consumed < total) {
-      unsigned n = Ops::DequeueBurst(ring, out.data(), kBurst);
-      for (unsigned i = 0; i < n; i++) {
-        uint64_t v = reinterpret_cast<uint64_t>(out[i]);
-        int src = static_cast<int>(v >> 32);
-        CHECK(src >= 0 && src < num_producers);
-        CHECK((v & 0xffffffffu) == expected[src]);
-        expected[src]++;
-      }
-      consumed += n;
+      consumed += Ops::DequeueBurst(ring, out.data(), kBurst);
     }
     benchmark::DoNotOptimize(consumed);
 
@@ -229,6 +318,17 @@ BENCHMARK(BM_RingRteHtsSc)->RangeMultiplier(2)->Range(1, 16);
 
 int main(int argc, char **argv) {
   google::InitGoogleLogging(argv[0]);
+  // Strip our own flag before Google Benchmark parses argv (it errors on
+  // unrecognized arguments).
+  int w = 1;
+  for (int r = 1; r < argc; r++) {
+    if (std::string(argv[r]) == "--pin_threads") {
+      g_pin_threads = true;
+    } else {
+      argv[w++] = argv[r];
+    }
+  }
+  argc = w;
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {
     return 1;
