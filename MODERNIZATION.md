@@ -846,6 +846,51 @@ rather than one call site).
     second Opus pass (this was itself the review of external material,
     not a diff of BESS's own code, so the usual "review the review"
     pattern doesn't apply the same way) or pushed as of this writing.
+26. **`7ac9d660`** — **Replaced `PMDPort::Init()`'s hand-rolled descriptor
+    clamping with `rte_eth_dev_adjust_nb_rx_tx_desc()`** (Phase C item
+    below, done). The old code clamped `queue_size[]` against
+    `nb_min`/`nb_max` by hand in two ~18-line blocks and ignored `nb_align`
+    entirely; DPDK's helper (verified against
+    `deps/dpdk-25.11.3/lib/ethdev/rte_ethdev.c`: `RTE_ALIGN_CEIL` to
+    `nb_align` first, then min-with-`nb_max`, then max-with-`nb_min`)
+    closes that one latent misconfiguration class. `queue_size` is `size_t`
+    but the ethdev API is `uint16_t` throughout (including the downstream
+    `queue_setup` calls), so values are clamped to `UINT16_MAX` before the
+    narrowing conversion; the helper's before/after comparison preserves
+    the old `LOG(WARNING)` observability (single "adjusting RX/TX queue
+    size" message instead of separate "resizing"/"capping" ones), and a
+    non-zero return becomes a `CommandFailure` (unreachable in practice —
+    the port was just validated and configured a few lines above).
+    Verified, full matrix, both compilers from clean trees (`-j4` throughout):
+    g++ `./build.py bess` clean, `core/all_test --gtest_shuffle` 185/185
+    (CodelTest included this time — no flake), all 6 `*_bench` smoke-run
+    OK, `run_module_tests.py` all 22 files OK (including `iplookup.py`,
+    0.271s), `pybess`/`test_sugar`/`test_utils` 84/84 OK; clang++
+    `CXX=clang++ ./build.py bess` from `make clean` with zero errors,
+    clang-built `all_test --gtest_shuffle` 185/185, all 6 clang-built
+    benches smoke-run OK. Live `bessd -m 0` smoke test of the changed path:
+    `PMDPort(vdev='net_null0')` created OK at default 1024 and at odd size
+    1000, size 8192 still correctly rejected by the pre-existing
+    `MAX_QUEUE_SIZE` guard in `bessctl.cc` (unrelated), daemon stopped
+    cleanly via `pause_all`+`kill`. No throughput comparison run: the
+    changed code executes once per port creation (config path), zero
+    per-packet instructions touched — there is nothing hot to regress.
+    No Opus review requested: config-path-only mechanical replacement,
+    same rationale as commit 13's infra work.
+    **Sandbox caveat found during verification (pre-existing, not caused
+    by this change):** `python3 -m unittest discover`'s `test_samples`
+    leg hangs at `iplookup.bess` here. Root-caused, not chased: a fresh
+    `bin/bessctl daemon start` (no `-m 0`, unlike `run_module_tests.py`)
+    consumes all 512 sandbox hugepages at startup
+    (`HugePages_Free: 512→0` with zero pipeline running), so `IPLookup`'s
+    `rte_lpm` allocation fails ENOMEM; repeated daemon cycling plus two
+    `kill -9`ed orphans made it hang-or-fail erratically until a graceful
+    `daemon stop` reclaimed everything (512/512 free). Same binary passes
+    `iplookup.py` under `-m 0`, and the changed function
+    (`PMDPort::Init`) never executes in that sample (no PMD ports) — the
+    base tree fails identically by mechanism. `test_samples` was never in
+    this sandbox's verification loop (only in CI, where runners have
+    real hugepage capacity); don't treat its sandbox hang as a gate.
 
 ## Review process established this session
 
@@ -1235,9 +1280,11 @@ covers the "scheduler throughput" leg of Phase B's requirement in full.
         either. The net effect of this whole scope correction: this phase
         is mostly a config-ergonomics and one-build-flag-addition task,
         not the ground-up multi-driver effort it read as before.
-- [ ] **Replace `PMDPort::Init()`'s hand-rolled descriptor clamping with
-      `rte_eth_dev_adjust_nb_rx_tx_desc()`** (DPDK-proposal review,
-      2026-09-18). `core/drivers/pmd.cc` clamps `queue_size[]` against
+- [x] **Replaced `PMDPort::Init()`'s hand-rolled descriptor clamping with
+      `rte_eth_dev_adjust_nb_rx_tx_desc()`** (2026-09-18, see completed-work
+      entry 26 for hash and full verification matrix).
+      Original proposal text (DPDK-proposal review, 2026-09-18):
+      `core/drivers/pmd.cc` clamps `queue_size[]` against
       `dev_info.rx_desc_lim.nb_min`/`nb_max` and `tx_desc_lim.nb_min`/
       `nb_max` by hand -- but **ignores `nb_align`** (`rte_ethdev.h`,
       "Number of descriptors should be aligned to"), which several PMDs
