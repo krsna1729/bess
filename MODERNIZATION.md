@@ -1015,6 +1015,27 @@ rather than one call site).
     and green on a g++ rerun: load-sensitive flake, same family as the
     `CodelTest` flakes -- don't chase it; treat `timestamp.py` the same
     way if it recurs.
+31. **`97f4a065`** — **`DumpMempool()` backend-independent** (Phase F item,
+    prerequisite for the mempool-backend experiment). `core/bessctl.cc`
+    read `mempool->pool_data` as `struct rte_ring*`, valid only for the
+    `ring_mp_mc` backend `PacketPool` happens to select -- same "correct
+    by construction" coupling already removed twice this session. Now
+    uses only `struct rte_mempool`'s own fields plus
+    `rte_mempool_avail_count`/`in_use_count`; the `ring_*` response
+    fields are unset (kept on the wire, marked DEPRECATED in
+    `protobuf/bess_msg.proto` with field numbers reserved -- comment-only,
+    no codegen/wire change), and `show system packets` no longer prints
+    them. Verified live (`show system packets`: all `mp_*` populated, no
+    crash) plus full matrix: g++ build, `all_test` 185/185 shuffled,
+    python units 84/84, module tests 22 files OK, clang++ TU-clean.
+    Sandbox notes: build with `MAKEFLAGS=-j2` after a swap scare (later
+    runs stayed healthy, ~5-6G available -- the `-j4` cap in this doc's
+    constraints still stands, `-j2` was session caution); mid-session
+    `/proc/meminfo` showed `HugePages_Total: 0` (not merely exhausted --
+    the pool itself was gone, cause unknown, possibly host reclaim),
+    restored with `sysctl -w vm.nr_hugepages=512` (then 512/512 free);
+    if a future session sees Total 0, that sysctl is the fix, not daemon
+    archaeology.
 
 ## Review process established this session
 
@@ -1589,8 +1610,9 @@ release; add Renovate/Dependabot. Revive per-queue/pool/scheduler metrics
 (old upstream PR `#1007` had the right idea) as a small Prometheus exporter
 outside the dataplane hot path.
 
-- [ ] **Make `DumpMempool()` backend-independent** (DPDK-proposal review,
-      2026-09-18). `core/bessctl.cc` does
+- [x] **Made `DumpMempool()` backend-independent** (2026-09-18, entry 31).
+      Original proposal text (DPDK-proposal review, 2026-09-18):
+      `core/bessctl.cc` does
       `reinterpret_cast<struct rte_ring*>(mempool->pool_data)`, which is
       only valid because `PacketPool::PacketPool()` hardcodes
       `rte_mempool_set_ops_byname(pool_, "ring_mp_mc", ...)`
