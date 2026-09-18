@@ -2100,6 +2100,27 @@ the reviewing document's word alone.
   still rejected as out of scope for modernization -- but noted precisely
   so a future NAT-scaling effort starts from the right diagnosis.
 
+  **Does Phase J's RCU/QSBR help here? Not directly, but it's a natural
+  third piece if this is ever built** (follow-up, 2026-09-18). RCU is
+  built for one infrequent writer plus many frequent readers -- Phase J's
+  actual target (control-plane rule changes, dataplane reads). NAT's
+  problem is the opposite shape: **multiple frequent writers** (every
+  worker inserting into one shared table on every new flow), and RCU says
+  nothing about writer-writer races. It only becomes relevant *after* the
+  per-worker sharding above: once each shard has exactly one writer (its
+  owning worker -- confirmed via `core/modules/nat.cc`'s "lazy reclaim of
+  expired" comment that expiry (`map_.Remove()`) already happens inline
+  in the same per-packet path as insertion, not from a separate aging
+  thread, so there's no second writer to worry about even within one
+  shard), RCU is the right tool for **cross-shard reads**: a stats RPC,
+  `GetRuntimeConfig`, or a future connection-tracking/debug API reading a
+  shard from outside its owning worker, consistently, without locking the
+  hot insert/expire path or pausing that worker. So the complete picture,
+  if ever pursued: **symmetric RSS** (routes flows correctly) +
+  **per-worker sharding** (eliminates writer contention structurally) +
+  **RCU/QSBR** (makes cross-shard/control-plane reads safe) -- three
+  pieces, not one.
+
   **Independent of NAT, one thing genuinely worth leveraging: symmetric
   RSS as a general `PMDPort` capability.** Verified `core/drivers/pmd.cc`
   configures `rss_key = nullptr` (PMD default key), `rss_key_len = 0`,
