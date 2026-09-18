@@ -982,7 +982,16 @@ rather than one call site).
     unpinned numbers unchanged in band, `pmd_bench` ring variants pass
     with the new check enforced. Status snapshot above rewritten in the
     review-suggested self-maintaining form (entry number, not docs-commit
-    SHA) since it had already gone stale once.
+    SHA) since it had already gone stale once. CI watch postscript: the
+    g++ job first failed in `run_module_tests.py` on
+    `timestamp.py::test_timestamped_and_measured` (`1.2366 not <= 1.0`)
+    -- a stats self-consistency check (`|avg*count-total|/total` over
+    1ns-quantized histogram buckets) in a `Source -> Rewrite ->
+    Timestamp -> Bypass -> Measure -> Sink` pipeline containing zero
+    touched code. Same commit went green on clang, green locally twice,
+    and green on a g++ rerun: load-sensitive flake, same family as the
+    `CodelTest` flakes -- don't chase it; treat `timestamp.py` the same
+    way if it recurs.
 29. **`e740b6b5`** — **Review follow-ups to entries 27-28** (external review of
     `cef92c50`/`0bda5a84`, verdict: keep the `llring` removal, fix listed
     items first). (a) **Real portability bug, fixed**: caller-owned
