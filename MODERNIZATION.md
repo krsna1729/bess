@@ -1305,46 +1305,77 @@ rather than one call site).
 
     | benchmark             | 1K routes      | 64K routes     | 512K routes    |
     |-----------------------|----------------|----------------|----------------|
-    | `BM_LookupLpmVec`     | 3.89 ns (257M) | 5.70 ns (176M) | 4.77 ns (210M) |
-    | `BM_LookupLpmScalar`  | 3.17 ns (315M) | 5.20 ns (192M) | 4.05 ns (247M) |
-    | `BM_LookupFib`        | 3.70 ns (270M) | 5.45 ns (184M) | not registered |
+    | `BM_LookupLpmVec`     | 3.95 ns (253M) | 5.42 ns (185M) | 4.47 ns (224M) |
+    | `BM_LookupLpmScalar`  | 3.19 ns (314M) | 5.34 ns (187M) | 4.63 ns (216M) |
+    | `BM_LookupFib`        | 3.70 ns (270M) | 5.20 ns (192M) | not registered |
 
     (Mpps in parentheses.) So FIB's lookup ties or very slightly beats the
-    module's current vector path (0.95-0.96x), while its *other* numbers are
-    much better: table build is 0.44/0.75 us per route at 1K/64K versus
-    0.67/5.56/40.6 us for LPM (LPM's per-route build cost rises with table
-    size, ~21 s to build 512K routes), and delete+add is 209/497 ns per
-    operation versus 549/8299 ns for LPM -- a 17x win at 64K, i.e. FIB is
-    dramatically better at exactly what a control plane with live route
-    updates needs. Footprint goes the other way: LPM 98 KB per route at 1K
+    module's current vector path (0.94x at 1K, 0.96x at 64K), while its
+    *other* numbers look much better: table build is 0.41/0.59 us per route at
+    1K/64K versus 0.65/5.84/39.6 us for LPM (LPM's per-route build cost rises
+    with table size -- ~21 s to build 512K routes -- while FIB's does not),
+    and delete+add at 1K is 212 ns per operation versus 606 ns for LPM. **The 64K update numbers from the first
+    run -- 497 vs 8299 ns, a 17x FIB win -- are withdrawn**: re-running with
+    the post-churn verification below showed the FIB table those operations
+    left behind no longer matches the reference (LPM's does, at every size),
+    so that measurement is of a table that ended up wrong, not of usable
+    update performance. Footprint goes LPM's way: 98 KB per route at 1K
     (its fixed 64MB tbl24 dominating) down to 1.5 KB at 64K and 200 B at
     512K; FIB 99 KB / 1.96 KB (about 28% larger at 64K).
 
     Decision: **not adopted**, on correctness rather than speed. At 512K
     routes, with rules inserted in the generator's arbitrary order -- the
     order `IPLookup CommandAdd` permits, since a control plane may add a
-    /24 after a /28 under it -- `rte_fib` returned, for a key that both
+    /24 after a /28 under it -- `rte_fib` (DPDK 25.11.3, DIR24_8, 4-byte
+    next hops) **produced an incorrect lookup result**: for a key that both
     `rte_lpm` and the independent reference resolve to a `/12` rule's next
-    hop, a next hop (7207) matching **no rule at all**. Deterministic (same
-    key, same value on repeated runs), independent of tbl8 sizing
-    (identical failure with a 4x larger pool), and gone when the same rule
-    set is inserted shortest-prefix-first -- while `rte_lpm` passes the
-    same gate in both orders. A minimal standalone reproducer was *not*
-    produced: the two-rule and four-rule nested cases (in both orders)
-    behave correctly, so the trigger needs something the larger mixed table
-    has; that is the open work, with the gate as its detector.
+    hop, it returned a next hop (7207) matching **no rule at all**. Observed
+    behaviour, not a root cause: DPDK 25.11.3 already carries the upstream
+    `fib: fix prefix addition handling` stable fix, so this is not that
+    known defect, and no minimized reproducer exists yet (the two-rule and
+    four-rule nested cases behave correctly in both orders, so the trigger
+    needs something the larger mixed table has). What is established:
+    deterministic (same key, same value on repeated runs), unchanged by a
+    4x larger tbl8 pool, gone when the same rule set is inserted
+    shortest-prefix-first, while `rte_lpm` passes the same gate in both
+    orders. Re-verified after the harness-hardening pass below, with the
+    full 64K-key stream checked instead of a 512-key sample and with
+    add/delete/return values all validated -- same key, same wrong value.
     `BM_LookupFib` is therefore registered only up to 64K routes, with a
     comment at the registration saying why and what to re-enable after a
     DPDK fix, and `IPLookup` keeps `rte_lpm` -- which also settles the
     table representation Phase J's live-update pilot should build on.
 
+    The same hardening pass then found a *second*, independent instance in
+    the update path, which no amount of build-time checking would have caught:
+    at 64K routes, timing the delete+add churn (the workload whose cost
+    motivated this experiment) left the table resolving key `0xc8d35058` to
+    3208 while the only matching rule -- a /24 -- has 7368, and only because
+    the add/delete benchmark now re-verifies the whole table after the timed
+    loop. `rte_lpm` returns exactly the reference after identical churn at
+    every size. FIB's update comparison is therefore reported only at 1K;
+    the 64K "17x cheaper" measurement from the first run is withdrawn, since
+    the table it produced was wrong.
+
+    Review-driven hardening of the gate itself (same commit series): the
+    default-next-hop sentinel is now `DROP_GATE` (`8192`, `core/gate.h`),
+    outside the generated route range, because a sentinel colliding with a
+    real next hop would make a miss indistinguishable from a correct hit;
+    the whole key stream is verified, not a sample; `rte_fib_lookup_bulk`'s
+    return value is checked (it is `-EINVAL` or `0`, *not* the number of
+    lookups -- an assumption this pass caught); and the add/delete
+    benchmark now counts per-operation failures inside the timed loop and
+    re-verifies the whole table after it, since a failed operation could be
+    cheaper than a successful one and would otherwise be counted as work.
+    `rte_lpm` passes the strengthened gate at every size, including 512K.
+
     Side finding, recorded but deliberately not acted on: the *scalar* LPM
-    path beats the vector one by 15-19% at every size, so the module's
-    `VECTOR_OPTIMIZATION` SSE byte-swap block plus `rte_lpm_lookupx4` is a
-    pessimization -- in this harness. In the real module the four keys
-    arrive scattered in packet headers rather than in one contiguous array,
-    which is the case that block exists for, so measuring this needs a
-    NIC-backed workload.
+    path beats the vector one by 19% at 1K, but the gap closes to 1% at 64K
+    and reverses at 512K (vector 4.47 vs scalar 4.63 ns) -- so
+    `VECTOR_OPTIMIZATION`'s SSE byte-swap plus `rte_lpm_lookupx4` is a cost at
+    small tables and a win as tables grow, and the first run's
+    "pessimization at every size" reading was a small-table artifact that the
+    full-key-stream gate plus a re-measure corrected.
 
     Verified: `g++`/`clang++ -fsyntax-only` clean on the new file; a full
     default run of `fib_bench` exits 0 with all registered cases passing
