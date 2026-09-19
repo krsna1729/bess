@@ -32,6 +32,12 @@ propose it unprompted.
 - **Commit author identity is wrong** (`root@PARAM.localdomain`, auto-set by
   the harness). Not yet fixed — ask the user before amending anything, per
   standing git-safety rules.
+- **`all_test` leaves SIGABRT cores in `coredumpctl` by design**: they are
+  `BessdTest`'s `EXPECT_DEATH` children (7 statements in
+  `core/bessd_test.cc`, covering pidfile/unique-instance error paths). The
+  count varies between runs (5-7 observed) with which of them skip by
+  environment. A green `all_test` summary plus such cores is *not* a crash;
+  check the test suite's own output first.
 - **Building/testing on a rolling-release host** (Arch, g++ 16, glibc 2.42+,
   glog 0.7, protobuf 36, grpc 1.83 — verified 2026-09-19, entry 32) needs
   build-flag workarounds only, no source changes:
@@ -1203,6 +1209,65 @@ rather than one call site).
     without root (`You need root privilege to run the BESS daemon`) and this
     session is an unprivileged user; CI covers it.
 
+33. **`3dc30b0e`** — **worker pthreads register with DPDK instead of writing
+    `_lcore_id`** (Phase C item). `core/worker.cc` used to do
+    `RTE_PER_LCORE(_lcore_id) = arg->wid` and then assume
+    `wid == rte_lcore_id()`; `Worker::Run()` now calls DPDK's public
+    `rte_thread_register()` (after `rte_thread_set_affinity()`, so DPDK
+    captures the pinned cpuset and derives the NUMA id from it) and
+    `rte_thread_unregister()` after `delete scheduler_; delete rand_;` --
+    deliberately last, because scheduler/TrafficClass teardown can still
+    free packets and a free wants the worker's mempool-cache context.
+    `rte_errno.h` is now included for `rte_strerror(rte_errno)`.
+
+    The point of the item was that the old write was **load-bearing but
+    invisible**: `rte_mempool_default_cache(mp, rte_lcore_id())` keys every
+    worker's allocator cache on that value, so a missing or wrong lcore id
+    silently degrades every `Packet` alloc/free to the cache-bypassing path
+    with no symptom other than throughput. The three concepts are now
+    explicitly separate -- BESS `WorkerId` (`arg->wid`), physical CPU
+    (`arg->core`), DPDK lcore id (whatever `rte_thread_register()` returns)
+    -- and the startup log line reports all three
+    (`Worker 0(...) is running on core 0 (socket 0, DPDK lcore 0)`), so a
+    run can no longer be mis-described. Nothing may assume
+    `wid == rte_lcore_id()` any more; a repo-wide grep found no other reader
+    of `rte_lcore_id()` in BESS outside this file, so nothing did.
+
+    Registration cannot fail for a supported configuration: BESS's EAL
+    config (`core/dpdk.cc`, `--lcores 127@<all cpus>`) leaves lcores 0..126
+    free and `Worker::kMaxWorkers` is 64, so the `CHECK_EQ` guards a future
+    EAL-config change rather than a live risk.
+
+    Before/after regression, using the axis entry 32 built for exactly this
+    (interleaved pairs in one session, so the host's >2x clock/thermal drift
+    hits both sides -- `bess` = the old mechanism, `register` = the new one,
+    pipeline family, `ring_mp_mc`, batch 32, median of 3, Mpps):
+
+    | case                    | `bess` (before) | `register` (after) |
+    |-------------------------|-----------------|--------------------|
+    | `--pin=cores`, cache 512 | 93.9 / 94.4    | 99.4 / 98.9        |
+    | `--pin=cores`, cache 128 | 94.1 / 93.9    | 90.9 / 99.6        |
+    | `--pin=none`, cache 512  | 109.7 / 120.9  | 108.1 / 108.6      |
+    | `--pin=none`, cache 128  | 105.7 / 116.3  | 96.9 / 106.6       |
+
+    (Two interleaved pairs per row.) Indistinguishable: the signs disagree
+    between pairs. The cache-occupancy counters were identical between
+    mechanisms as well (the consumer's cache full at the configured size,
+    the producer's at about half), i.e. the cache is still *in use* after
+    the migration, not merely present -- the failure this item existed to
+    prevent. `cache 0` stays noisy in both mechanisms (entry 32).
+
+    Verified: `all_test --gtest_shuffle` 185/185 with the change; a live
+    `bessd` run as an unprivileged user (`--skip_root_check -m 0`) with two
+    workers -- the log shows `Worker 0 ... core 0 (socket 0, DPDK lcore 0)`
+    and `Worker 1 ... core 2 (socket 0, DPDK lcore 1)`, no
+    `rte_socket_id() returned -1` warning, a `Source -> Queue -> Sink`
+    pipeline moved 26.3G packets, `show system packets` still reports the
+    mempool (cache 512, 262144 objects), and `daemon stop` ended in
+    `BESS daemon has been gracefully shut down` with exit code 0 -- so the
+    unregister path is exercised, not just compiled. The eight regression
+    runs all exited 0 with no coredumps.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -1648,9 +1713,16 @@ testing goes through `bessctl/module_tests/*.py` against a running
       above lands); keep vhost-user for VMs (already available, see
       above). With kmod gone, there's no "kmod optional" fallback-direction
       flip left to design.
-- [ ] **Decouple `WorkerId` from DPDK's lcore ID; migrate off direct
-      `RTE_PER_LCORE(_lcore_id)` writes -- carefully, this is load-bearing,
-      not vestigial** (DPDK-proposal review, 2026-09-18). `core/worker.cc`
+- [x] **Decouple `WorkerId` from DPDK's lcore ID; migrate off direct
+      `RTE_PER_LCORE(_lcore_id)` writes -- done 2026-09-19, entry 33**
+      (`3dc30b0e`): `Worker::Run()` now calls `rte_thread_register()` /
+      `rte_thread_unregister()`, the startup log reports WorkerId, CPU and
+      DPDK lcore id separately, and the before/after regression this item
+      asked for (via `mempool_bench --lcore_mode=bess|register`) found the
+      two indistinguishable at production cache settings with identical
+      cache occupancy -- i.e. the cache is still in use. Original scoping
+      text: **carefully, this is load-bearing, not vestigial** (DPDK-proposal
+      review, 2026-09-18). `core/worker.cc`
       writes `RTE_PER_LCORE(_lcore_id) = arg->wid` directly into DPDK's TLS
       and asserts `wid == rte_lcore_id()` immediately after -- i.e. BESS
       today hardcodes `WorkerId == DPDK lcore ID`. **This is not
