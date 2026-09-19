@@ -34,6 +34,9 @@
 #include <rte_errno.h>
 #include <rte_lpm.h>
 
+#include <algorithm>
+#include <string>
+
 #include "../utils/bits.h"
 #include "../utils/ether.h"
 #include "../utils/format.h"
@@ -45,43 +48,103 @@ static inline int is_valid_gate(gate_idx_t gate) {
   return (gate < MAX_GATES || gate == DROP_GATE);
 }
 
+// THREAD_SAFE, not THREAD_UNSAFE: these commands no longer touch the table the
+// data path is reading. Each one builds a replacement generation off the data
+// path and publishes it atomically, so workers do not have to be paused to
+// change routes (MODERNIZATION.md entry 35).
 const Commands IPLookup::cmds = {
     {"add", "IPLookupCommandAddArg", MODULE_CMD_FUNC(&IPLookup::CommandAdd),
-     Command::THREAD_UNSAFE},
-    {"delete", "IPLookupCommandDeleteArg", MODULE_CMD_FUNC(&IPLookup::CommandDelete),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_SAFE},
+    {"delete", "IPLookupCommandDeleteArg",
+     MODULE_CMD_FUNC(&IPLookup::CommandDelete), Command::THREAD_SAFE},
     {"clear", "EmptyArg", MODULE_CMD_FUNC(&IPLookup::CommandClear),
-     Command::THREAD_UNSAFE}};
+     Command::THREAD_SAFE}};
 
-CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
+// rte_lpm table names are limited to RTE_LPM_NAMESIZE-1 characters and must be
+// unique for the lifetime of a generation, because a rebuild happens while the
+// previous generation may still be serving in-flight batches.
+static std::string NextGenerationName(const std::string &module_name) {
+  static std::atomic<uint64_t> next{0};
+  char suffix[24];
+  snprintf(suffix, sizeof(suffix), "_g%lu",
+           static_cast<unsigned long>(next.fetch_add(1)));
+  const size_t room = RTE_LPM_NAMESIZE - 1 - strlen(suffix);
+  return module_name.substr(0, room) + suffix;
+}
+
+IPLookup::Generation::~Generation() {
+  if (lpm != nullptr) {
+    rte_lpm_free(lpm);
+  }
+}
+
+IPLookup::GenerationPtr IPLookup::Build(const std::vector<Route> &routes,
+                                        gate_idx_t default_gate, int *err) {
+  const std::string lpm_name = NextGenerationName(name());
+
   struct rte_lpm_config conf = {
-      .max_rules = arg.max_rules() ? arg.max_rules() : 1024,
-      .number_tbl8s = arg.max_tbl8s() ? arg.max_tbl8s() : 128,
+      .max_rules = max_rules_,
+      .number_tbl8s = max_tbl8s_,
       .flags = 0,
   };
 
-  default_gate_ = DROP_GATE;
-
-  lpm_ = rte_lpm_create(name().c_str(), /* socket_id = */ 0, &conf);
-
-  if (!lpm_) {
-    return CommandFailure(rte_errno, "DPDK error: %s", rte_strerror(rte_errno));
+  struct rte_lpm *lpm =
+      rte_lpm_create(lpm_name.c_str(), /* socket_id = */ 0, &conf);
+  if (lpm == nullptr) {
+    *err = rte_errno;
+    return nullptr;
   }
+
+  for (const Route &r : routes) {
+    const int ret = rte_lpm_add(lpm, r.prefix.value(), r.prefix_len, r.gate);
+    if (ret != 0) {
+      *err = -ret;
+      rte_lpm_free(lpm);
+      return nullptr;
+    }
+  }
+
+  std::shared_ptr<Generation> gen(new Generation());
+  gen->routes = routes;
+  gen->lpm = lpm;
+  gen->default_gate = default_gate;
+  return gen;
+}
+
+CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
+  max_rules_ = arg.max_rules() ? arg.max_rules() : 1024;
+  max_tbl8s_ = arg.max_tbl8s() ? arg.max_tbl8s() : 128;
+
+  int err = 0;
+  GenerationPtr gen = Build(/*routes=*/{}, /*default_gate=*/DROP_GATE, &err);
+  if (gen == nullptr) {
+    return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
+  }
+  table_.store(std::move(gen));
 
   return CommandSuccess();
 }
 
 void IPLookup::DeInit() {
-  if (lpm_) {
-    rte_lpm_free(lpm_);
-  }
+  // Drop this module's current generation now; any retired generation still
+  // held by an in-flight batch releases itself when that batch finishes.
+  table_.store(nullptr);
 }
 
 void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::Ethernet;
   using bess::utils::Ipv4;
 
-  gate_idx_t default_gate = default_gate_;
+  // One snapshot acquisition per batch: the only thing the data path does
+  // about routing updates. Holding the shared_ptr for the whole batch means a
+  // concurrent command can neither free this table under an in-flight lookup
+  // nor swap it mid-batch.
+  const GenerationPtr table = table_.load(std::memory_order_acquire);
+  if (table == nullptr || table->lpm == nullptr) {
+    return;  // not initialized, or already deinitialized
+  }
+  const gate_idx_t default_gate = table->default_gate;
+  struct rte_lpm *lpm = table->lpm;
 
   int cnt = batch->cnt();
   int i;
@@ -120,7 +183,7 @@ void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     ip_addr = _mm_set_epi32(a3, a2, a1, a0);
     ip_addr = _mm_shuffle_epi8(ip_addr, bswap_mask);
 
-    rte_lpm_lookupx4(lpm_, ip_addr, next_hops, default_gate);
+    rte_lpm_lookupx4(lpm, ip_addr, next_hops, default_gate);
 
     EmitPacket(ctx, batch->pkts()[i], next_hops[0]);
     EmitPacket(ctx, batch->pkts()[i + 1], next_hops[1]);
@@ -140,7 +203,7 @@ void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     eth = batch->pkts()[i]->head_data<Ethernet *>();
     ip = (Ipv4 *)(eth + 1);
 
-    ret = rte_lpm_lookup(lpm_, ip->dst.value(), &next_hop);
+    ret = rte_lpm_lookup(lpm, ip->dst.value(), &next_hop);
 
     if (ret == 0) {
       EmitPacket(ctx, batch->pkts()[i], next_hop);
@@ -150,8 +213,8 @@ void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   }
 }
 
-ParsedPrefix IPLookup::ParseIpv4Prefix(
-    const std::string &prefix, uint64_t prefix_len) {
+ParsedPrefix IPLookup::ParseIpv4Prefix(const std::string &prefix,
+                                       uint64_t prefix_len) {
   using bess::utils::Format;
   be32_t net_addr;
   be32_t net_mask;
@@ -160,25 +223,23 @@ ParsedPrefix IPLookup::ParseIpv4Prefix(
     return std::make_tuple(EINVAL, "prefix' is missing", be32_t(0));
   }
   if (!bess::utils::ParseIpv4Address(prefix, &net_addr)) {
-    return std::make_tuple(EINVAL,
-			   Format("Invalid IP prefix: %s", prefix.c_str()),
-			   be32_t(0));
+    return std::make_tuple(
+        EINVAL, Format("Invalid IP prefix: %s", prefix.c_str()), be32_t(0));
   }
 
   if (prefix_len > 32) {
-    return std::make_tuple(EINVAL,
-			   Format("Invalid prefix length: %" PRIu64,
-				  prefix_len),
-			   be32_t(0));
+    return std::make_tuple(
+        EINVAL, Format("Invalid prefix length: %" PRIu64, prefix_len),
+        be32_t(0));
   }
 
   net_mask = be32_t(bess::utils::SetBitsLow<uint32_t>(prefix_len));
   if ((net_addr & ~net_mask).value()) {
-    return std::make_tuple(EINVAL,
-			   Format("Invalid IP prefix %s/%" PRIu64 " %x %x",
-				  prefix.c_str(), prefix_len, net_addr.value(),
-				  net_mask.value()),
-			   be32_t(0));
+    return std::make_tuple(
+        EINVAL,
+        Format("Invalid IP prefix %s/%" PRIu64 " %x %x", prefix.c_str(),
+               prefix_len, net_addr.value(), net_mask.value()),
+        be32_t(0));
   }
   return std::make_tuple(0, "", net_addr);
 }
@@ -190,22 +251,45 @@ CommandResponse IPLookup::CommandAdd(
   ParsedPrefix prefix = ParseIpv4Prefix(arg.prefix(), prefix_len);
   if (std::get<0>(prefix)) {
     return CommandFailure(std::get<0>(prefix), "%s",
-			  std::get<1>(prefix).c_str());
+                          std::get<1>(prefix).c_str());
   }
 
   if (!is_valid_gate(gate)) {
     return CommandFailure(EINVAL, "Invalid gate: %hu", gate);
   }
 
+  std::lock_guard<std::mutex> lock(mutation_lock_);
+  const GenerationPtr current = table_.load(std::memory_order_acquire);
+  std::vector<Route> routes = current->routes;
+  gate_idx_t default_gate = current->default_gate;
+
   if (prefix_len == 0) {
-    default_gate_ = gate;
+    default_gate = gate;
   } else {
-    be32_t net_addr = std::get<2>(prefix);
-    int ret = rte_lpm_add(lpm_, net_addr.value(), prefix_len, gate);
-    if (ret) {
-      return CommandFailure(-ret, "rpm_lpm_add() failed");
+    const be32_t net_addr = std::get<2>(prefix);
+    // rte_lpm_add() overwrote the next hop of an existing prefix; mirror that
+    // semantics here rather than letting the route list accumulate duplicates
+    // (the table would end up right either way, but only the last one
+    // matters, and delete should remove "the" rule).
+    bool replaced = false;
+    for (Route &r : routes) {
+      if (r.prefix_len == prefix_len && r.prefix.value() == net_addr.value()) {
+        r.gate = gate;
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) {
+      routes.push_back({net_addr, static_cast<uint8_t>(prefix_len), gate});
     }
   }
+
+  int err = 0;
+  GenerationPtr next = Build(routes, default_gate, &err);
+  if (next == nullptr) {
+    return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
+  }
+  table_.store(std::move(next), std::memory_order_release);
 
   return CommandSuccess();
 }
@@ -216,24 +300,50 @@ CommandResponse IPLookup::CommandDelete(
   ParsedPrefix prefix = ParseIpv4Prefix(arg.prefix(), prefix_len);
   if (std::get<0>(prefix)) {
     return CommandFailure(std::get<0>(prefix), "%s",
-			  std::get<1>(prefix).c_str());
+                          std::get<1>(prefix).c_str());
   }
 
+  std::lock_guard<std::mutex> lock(mutation_lock_);
+  const GenerationPtr current = table_.load(std::memory_order_acquire);
+  std::vector<Route> routes = current->routes;
+  gate_idx_t default_gate = current->default_gate;
+
   if (prefix_len == 0) {
-    default_gate_ = DROP_GATE;
+    default_gate = DROP_GATE;
   } else {
-    be32_t net_addr = std::get<2>(prefix);
-    int ret = rte_lpm_delete(lpm_, net_addr.value(), prefix_len);
-    if (ret) {
-      return CommandFailure(-ret, "rpm_lpm_delete() failed");
+    const be32_t net_addr = std::get<2>(prefix);
+    auto it = std::find_if(routes.begin(), routes.end(), [&](const Route &r) {
+      return r.prefix_len == prefix_len && r.prefix.value() == net_addr.value();
+    });
+    if (it == routes.end()) {
+      // What rte_lpm_delete() reported before this became copy-on-write.
+      return CommandFailure(ENOENT, "no such rule");
     }
+    routes.erase(it);
   }
+
+  int err = 0;
+  GenerationPtr next = Build(routes, default_gate, &err);
+  if (next == nullptr) {
+    return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
+  }
+  table_.store(std::move(next), std::memory_order_release);
 
   return CommandSuccess();
 }
 
 CommandResponse IPLookup::CommandClear(const bess::pb::EmptyArg &) {
-  rte_lpm_delete_all(lpm_);
+  std::lock_guard<std::mutex> lock(mutation_lock_);
+  const GenerationPtr current = table_.load(std::memory_order_acquire);
+
+  // Rules go, the default gate stays -- what rte_lpm_delete_all() did.
+  int err = 0;
+  GenerationPtr next = Build(/*routes=*/{}, current->default_gate, &err);
+  if (next == nullptr) {
+    return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
+  }
+  table_.store(std::move(next), std::memory_order_release);
+
   return CommandSuccess();
 }
 

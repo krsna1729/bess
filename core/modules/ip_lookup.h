@@ -31,6 +31,12 @@
 #ifndef BESS_MODULES_IPLOOKUP_H_
 #define BESS_MODULES_IPLOOKUP_H_
 
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <tuple>
+#include <vector>
+
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../utils/endian.h"
@@ -44,9 +50,7 @@ class IPLookup final : public Module {
 
   static const Commands cmds;
 
-  IPLookup() : Module(), lpm_(), default_gate_() {
-    max_allowed_workers_ = Worker::kMaxWorkers;
-  }
+  IPLookup() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 
   CommandResponse Init(const bess::pb::IPLookupArg &arg);
 
@@ -59,9 +63,44 @@ class IPLookup final : public Module {
   CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
 
  private:
-  struct rte_lpm *lpm_;
-  gate_idx_t default_gate_;
+  // One rule as the control plane last set it. This list, not rte_lpm, is the
+  // source of truth a rebuild is made from -- rte_lpm cannot be read back.
+  struct Route {
+    be32_t prefix;
+    uint8_t prefix_len;
+    gate_idx_t gate;
+  };
+
+  // One immutable routing generation. ProcessBatch() takes a snapshot of the
+  // current generation once per batch and never observes a *mutated* table:
+  // each routing command builds a replacement off the data path and publishes
+  // it atomically, and a retired generation is freed by shared_ptr as soon as
+  // the last batch holding it returns. That is what lets route updates run
+  // while workers keep forwarding, instead of requiring workers to be paused
+  // (MODERNIZATION.md entry 35).
+  struct Generation {
+    ~Generation();
+
+    std::vector<Route> routes;
+    struct rte_lpm *lpm = nullptr;
+    gate_idx_t default_gate = DROP_GATE;
+  };
+
+  using GenerationPtr = std::shared_ptr<const Generation>;
+
+  // Builds a generation from `routes`, or returns nullptr with `*err` set to
+  // the errno a caller can report. Called with `mutation_lock_` held, or
+  // before the module is running.
+  GenerationPtr Build(const std::vector<Route> &routes, gate_idx_t default_gate,
+                      int *err);
+
   ParsedPrefix ParseIpv4Prefix(const std::string &prefix, uint64_t prefix_len);
+
+  // nullptr only before Init() and after DeInit().
+  std::atomic<GenerationPtr> table_;
+  std::mutex mutation_lock_;  // serializes routing-command rebuilds
+  uint32_t max_rules_ = 0;    // from Init(), reused for every rebuild
+  uint32_t max_tbl8s_ = 0;
 };
 
 #endif  // BESS_MODULES_IPLOOKUP_H_
