@@ -1502,6 +1502,76 @@ rather than one call site).
     done as the second Phase J module -- two proven modules first, per the
     scope discipline above.
 
+36. **`03e1b6f8`** — **Phase J module #2: `ExactMatch` rule updates without
+    pausing workers**. `ExactMatch`'s four mutating commands (`add`, `delete`,
+    `clear`, `set_runtime_config`) edited one live table in place, which is why
+    they were `Command::THREAD_UNSAFE`. They now build a replacement
+    *generation* (the rule list it was built from, the default gate, and the
+    table built from them) behind
+    `std::atomic<std::shared_ptr<const Generation>>` and swap it in, so a batch
+    sees the old table or the new one, never a half-applied change.
+    `ProcessBatch()` takes one snapshot per batch; `Publish()` (same helper
+    shape as the `IPLookup` pilot) publishes, then waits for the batches that
+    held the retired generation to drain, so its destructor runs on the command
+    thread.
+
+    Where this module forced a *different* shape than `IPLookup` -- precisely
+    what running a second module was meant to reveal:
+
+    - `CuckooMap` deletes copy and defaults move, so a generation cannot be a
+      copy of the live table; every rebuild replays the stored rule list, and
+      the module's field configuration (fixed at `Init()`) is re-applied to
+      each new table.
+    - Rule identity is field-vector equality, which *is* key equality here
+      because `gather_key()` validates every field's size against the
+      configuration -- so "add with the same match values" overwrites the gate
+      in the rule list, exactly what inserting the same key into the live table
+      did.
+    - `set_default_gate` was already `THREAD_SAFE` (via `ACCESS_ONCE`); the
+      default gate now travels inside the generation, so rules and default
+      change atomically.
+    - `SetRuntimeConfig` is now all-or-nothing: the old code warned that "the
+      state may be partially restored" on error (`TODO(torek)`); a failed
+      rebuild leaves the running configuration untouched and that TODO is gone.
+
+    Pre-existing quirks preserved rather than fixed: the "Invalid gate" EINVAL
+    path is unreachable for `add`/`delete` because `gate_idx_t` truncates the
+    protobuf's uint32 gate before `is_valid_gate()` sees it, and a `CuckooMap`
+    insert that finds no free slot is still silent.
+
+    Acceptance evidence (live, pybess, one daemon, 4 workers, each
+    `Source -> Rewrite -> the same ExactMatch`, matching IPv4 dst at offset 30,
+    traffic running throughout; `bessctl/module_tests/exact_match.py` remains
+    the CI-side check of the same semantics):
+
+    - 13 semantics checks with workers running: no rules -> default DROP;
+      `add` -> gate 1; `add` with the same fields -> gate 0 (overwrite, not a
+      duplicate); `delete` -> back to DROP with the counters frozen (a strong
+      observable); `set_default_gate` -> gate 0; a rule beats the default gate;
+      `clear` -> rules gone, default gate kept; EINVAL for empty fields and for
+      a wrong field count; ENOENT for a missing rule; `get_runtime_config` and
+      `get_initial_arg` round-trip.
+    - 251 add/delete updates: 0 command errors, 0 drops, daemon RSS
+      745.5 -> 745.7 MB (retired generations reclaimed promptly), no
+      `~Generation`/`Publish` line on any worker thread (searched the log for
+      each worker's `pthread_self()` handle -- empty, against a query that
+      returns hits for real control-plane threads), drain 0-1 yields.
+    - Update-time continuity, 4 workers, the same three-way comparison the
+      `IPLookup` review used: control (no updates) 0.952 min/p50, fail-fast
+      commands 0.961, add/delete with rebuilds 0.816-0.860 across runs -- no
+      zero trough, and the fail-fast control shows the command path itself is
+      free, so the delta is rebuild/drain work.
+
+    Verified: full build clean; `all_test` 185/185; `g++`/`clang++`
+    `-fsyntax-only` clean under the tree's `-Werror` set.
+
+    Not done, on purpose: nothing in `bessctl` (its `command module` still
+    pauses unconditionally) and no shared abstraction yet. With two modules now
+    landed, extracting the common snapshot/publication mechanism -- and exposing
+    command thread-safety so `bessctl` pauses only when it must -- is the next
+    Phase J step; the two implementations are what that extraction should be
+    designed from.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -2744,9 +2814,12 @@ pointer, its three mutating commands are all `THREAD_UNSAFE`, the
 rebuild-and-swap cost is bounded, and `rte_fib` (Phase D, above) has
 native RCU support if the table migrates there anyway. `ExactMatch` is the
 natural second. Only after two modules work should this generalize into a
-`Module`-level contract. *(Status: the `IPLookup` pilot landed 2026-09-19 --
-see entry 35, including its writer-side reclamation fix and the measured
-update-time continuity; `ExactMatch` is next.)* Explicitly **not** in scope for the first pass:
+`Module`-level contract. *(Status: both planned modules have landed --
+`IPLookup` (entry 35, with its writer-side reclamation fix, single- and
+multi-reader validation) and `ExactMatch` (entry 36, four workers, 13 live
+semantics checks). Next: extract the common snapshot/publication mechanism
+from the two implementations, and expose command thread-safety so `bessctl`
+pauses only for `THREAD_UNSAFE` commands.)* Explicitly **not** in scope for the first pass:
 RCU-swapping the `ModuleGraph`, gate adjacency, or the traffic-class tree
 -- those are Phase G/H territory (live reconfiguration), not this phase's
 narrower table-update goal.
