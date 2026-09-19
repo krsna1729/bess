@@ -1017,11 +1017,25 @@ def _module_command_is_thread_safe(cli, module, cmd_name):
         return False
 
 
-def _gatehook_command_is_thread_safe(cli, hook_name, module, gate, cmd_name):
+def _gatehook_command_is_thread_safe(cli, hook_name, module, direction, gate,
+                                     cmd_name):
     try:
-        matches = [h for h in cli.bess.list_gatehooks().hooks
-                   if h.hook_name == hook_name and h.module_name == module
-                   and h.ogate == gate]
+        # Direction is part of the identity: the same hook name can sit on an
+        # input and an output gate, and an unset oneof scalar reads as 0, so
+        # igate/ogate must be told apart by which one the hook actually set.
+        if direction == 'in':
+            gate_field = 'igate'
+        elif direction == 'out' or direction is None:
+            gate_field = 'ogate'
+        else:
+            return False
+
+        matches = [
+            h for h in cli.bess.list_gatehooks().hooks
+            if h.hook_name == hook_name and h.module_name == module
+            and h.WhichOneof('gate') == gate_field
+            and getattr(h, gate_field) == gate
+        ]
         if len(matches) != 1:
             # Unknown or ambiguous hook instance: do not guess behaviour.
             return False
@@ -1060,7 +1074,8 @@ def command_gatehook(cli, name, module, direction, gate, cmd, arg_type, args):
     if args is None:
         args = {}
 
-    if _gatehook_command_is_thread_safe(cli, name, module, gate, cmd):
+    if _gatehook_command_is_thread_safe(cli, name, module, direction, gate,
+                                        cmd):
         ret = cli.bess.run_gatehook_command(name, module, direction, gate, cmd,
                                             arg_type, args)
         cli.fout.write('response: %s\n' % repr(ret))

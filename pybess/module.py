@@ -69,7 +69,7 @@ class Module(object):
         cls = self.bess.get_mclass_info(self.__class__.__name__)
         for cmd in cls.cmds:
             func = _callback_factory(self, cmd.name, cmd.arg_type)
-            setattr(self, cmd, types.MethodType(func, self))
+            setattr(self, cmd.name, types.MethodType(func, self))
 
         self.ogate = None
         self.igate = None
