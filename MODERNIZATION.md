@@ -1479,6 +1479,20 @@ rather than one call site).
     - the instrumentation was temporary; the committed code carries only the
       `Publish()` helper and its preconditions.
 
+    Multi-reader validation (reviewer-recommended before copying the pattern):
+    four workers, each with its own `Source -> Rewrite`, all feeding **one**
+    shared `IPLookup`, 221 add/delete updates again with traffic flowing.
+    No forwarding errors (0 drops, 0 command errors), daemon RSS flat
+    (877.4 -> 877.5 MB across the retired generations), and with the
+    instrumentation back in, zero `~Generation`/`Publish` lines ran on any
+    of the four worker threads (checked by searching the log for each
+    worker's `pthread_self()` handle as the glog thread field; the same
+    query returns dozens of hits for a real control-plane thread, so it can
+    fail). The drain still took 0-1 yields with four readers in flight.
+    Update-time continuity at 4 workers: min/p50 0.898 vs 0.949 for the
+    no-update control at ~212 Mpps aggregate -- same ~5pp signature as the
+    single-worker run, no stop-the-world.
+
     Status and sequence: `bessctl`'s `command module` still pauses
     unconditionally (deliberate -- `Command::THREAD_UNSAFE` commands need
     that, and a "retry after EBUSY" hack could duplicate side effects); the
