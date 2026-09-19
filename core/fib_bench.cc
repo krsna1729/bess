@@ -124,8 +124,13 @@ namespace {
 
 const size_t kBatch = 32;            // PacketBatch::kMaxBurst
 const size_t kLookupKeys = 1 << 16;  // 256KB of keys: L2-resident by design
-const uint32_t kDefaultNextHop = 1;  // stands in for a default gate
-const uint32_t kMaxNextHop = 8191;   // gate_idx_t range the module allows
+// BESS's DROP_GATE (core/gate.h: MAX_GATES), i.e. what IPLookup emits when
+// there is no match. Deliberately outside the generated route range
+// ([1, kMaxNextHop]): a sentinel that collides with a real next hop would
+// make a lookup miss indistinguishable from a correct hit, in both the gate
+// and any counter that counts hops.
+const uint32_t kDefaultNextHop = 8192;  // DROP_GATE
+const uint32_t kMaxNextHop = 8191;      // highest next hop a rule may use
 
 // dir24_8 geometry, chosen to be comparable with rte_lpm rather than merely
 // convenient: 4-byte next hops (LPM stores uint32_t), so dir24_8's tbl24 is
@@ -147,22 +152,26 @@ const size_t kMaxNestedParents = 1 << 14;
 // Key forms
 // --------------------------------------------------------------------------
 
-// Both go through BESS's own be32_t so this file cannot drift from endian.h
-// (on a big-endian host both calls are identities).
-using bess::utils::be32_t;
-
-uint32_t ToRaw(uint32_t value) {
-  const be32_t b(value);
-  uint32_t raw;
-  memcpy(&raw, &b, sizeof(raw));
-  return raw;
+// The two forms, expressed through the same translation BESS's be32_t
+// performs on its stored bytes (utils/endian.h). The static_asserts below pin
+// that equivalence, so a change to endian.h fails the build here rather than
+// silently changing what this benchmark measures. (The first version used
+// memcpy into/out of the class; g++ rejects writing into it under
+// -Werror=class-memaccess -- and CI builds with -Werror, without the -w this
+// session's local builds needed for unrelated g++16 warnings.)
+constexpr uint32_t ToRaw(uint32_t value) {
+  return bess::utils::is_be_system() ? value : __builtin_bswap32(value);
 }
 
-uint32_t ToValue(uint32_t raw) {
-  be32_t b;
-  memcpy(&b, &raw, sizeof(b));
-  return b.value();
-}
+// Same translation: byte order conversion is its own inverse.
+constexpr uint32_t ToValue(uint32_t raw) { return ToRaw(raw); }
+
+static_assert(ToRaw(0x12345678u) ==
+                  bess::utils::be32_t(0x12345678u).raw_value(),
+              "ToRaw must match be32_t's stored byte image");
+static_assert(ToValue(bess::utils::be32_t(0x12345678u).raw_value()) ==
+                  0x12345678u,
+              "ToValue must invert be32_t's raw_value()");
 
 // A rule as both tables want it: the host-order numeric prefix.
 uint32_t PrefixValue(uint32_t host_addr, uint8_t len) {
@@ -364,7 +373,12 @@ class FibTable {
 
   void LookupBatch(const uint32_t *keys, uint32_t *next_hops) {
     uint64_t hop64[kBatch];
-    rte_fib_lookup_bulk(fib_, const_cast<uint32_t *>(keys), hop64, kBatch);
+    // The API returns -EINVAL for bad arguments and 0 otherwise (it discards
+    // the internal lookup's count -- checked here, not assumed).
+    CHECK_EQ(rte_fib_lookup_bulk(fib_, const_cast<uint32_t *>(keys), hop64,
+                                 kBatch),
+             0)
+        << "rte_fib_lookup_bulk() failed: " << rte_strerror(rte_errno);
     for (size_t i = 0; i < kBatch; i++) {
       next_hops[i] = static_cast<uint32_t>(hop64[i]);
     }
@@ -420,9 +434,45 @@ size_t EalHeapUsed() {
   return stats.heap_totalsz_bytes - stats.heap_freesz_bytes;
 }
 
-// Builds the table, records build cost and footprint, and gates on the
-// independent reference. Templated so LPM and FIB share every one of those
-// lines and cannot drift apart in how they are measured.
+// Gates a table against the independent longest-prefix reference over the
+// *entire* key stream -- not a sample: this benchmark's whole reason to exist
+// is that it can veto a table that is fast but wrong, so it pays the ~32 hash
+// probes per key rather than risking a stale entry in the unchecked part.
+// Templated so LPM and FIB share every line, and so a failure prints the
+// rules that could explain both answers (which is what makes the finding
+// minimizable instead of just a number mismatch).
+template <typename Table>
+void VerifyAgainstReference(Prepared *prep, Table *table) {
+  uint32_t hops[kBatch];
+  const size_t n = prep->keys.raw.size();
+  for (size_t i = 0; i + kBatch <= n; i += kBatch) {
+    table->LookupBatch(&prep->keys.raw[i], hops);
+    for (size_t j = 0; j < kBatch; j++) {
+      const uint32_t key = prep->keys.value[i + j];
+      const uint32_t want = prep->reference.Lookup(key);
+      if (hops[j] == want) {
+        continue;
+      }
+      std::string rules;
+      for (const Route &r : prep->routes) {
+        if (r.next_hop != want && r.next_hop != hops[j]) {
+          continue;
+        }
+        const uint32_t mask = r.len == 0 ? 0 : 0xFFFFFFFFu << (32 - r.len);
+        if ((key & mask) == r.prefix) {
+          char buf[64];
+          snprintf(buf, sizeof(buf), " [/%u nh=%u]", r.len, r.next_hop);
+          rules += buf;
+        }
+      }
+      LOG(FATAL) << "table/independent-LPM disagreement: key 0x" << std::hex
+                 << key << std::dec << " table=" << hops[j]
+                 << " reference=" << want << " matching rules:" << rules;
+    }
+  }
+}
+
+// Builds the table, records build cost and footprint, and gates it.
 template <typename Table>
 Table *Prepare(Prepared *prep, const std::string &name) {
   const size_t before = EalHeapUsed();
@@ -437,35 +487,7 @@ Table *Prepare(Prepared *prep, const std::string &name) {
   prep->bytes_per_route = static_cast<double>(EalHeapUsed() - before) /
                           static_cast<double>(prep->routes.size());
 
-  uint32_t hops[kBatch];
-  const size_t n = prep->keys.raw.size();
-  for (size_t i = 0; i + kBatch <= n; i += 4096) {
-    table->LookupBatch(&prep->keys.raw[i], hops);
-    for (size_t j = 0; j < kBatch; j++) {
-      const uint32_t key = prep->keys.value[i + j];
-      const uint32_t want = prep->reference.Lookup(key);
-      if (hops[j] != want) {
-        // Dump the rules that could explain both answers: a failure here has
-        // to be minimizable into a standalone reproducer, not just visible
-        // as a number mismatch in a 512K-route table.
-        std::string rules;
-        for (const Route &r : prep->routes) {
-          if (r.next_hop != want && r.next_hop != hops[j]) {
-            continue;
-          }
-          const uint32_t mask = r.len == 0 ? 0 : 0xFFFFFFFFu << (32 - r.len);
-          if ((key & mask) == r.prefix) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), " [/%u nh=%u]", r.len, r.next_hop);
-            rules += buf;
-          }
-        }
-        LOG(FATAL) << "table/independent-LPM disagreement: key 0x" << std::hex
-                   << key << std::dec << " table=" << hops[j]
-                   << " reference=" << want << " matching rules:" << rules;
-      }
-    }
-  }
+  VerifyAgainstReference(prep, table);
   return table;
 }
 
@@ -508,15 +530,23 @@ void RunAddDelete(benchmark::State &state) {
   Table *table = Prepare<Table>(&prep, TableName());
 
   uint64_t items = 0;
+  uint64_t errors = 0;  // counted, not CHECKed, inside the timed loop
   const uint64_t cpu0 = ThreadCpuNs();
   for (auto _ : state) {
     for (const Route &r : prep.routes) {
-      benchmark::DoNotOptimize(table->Delete(r));
-      benchmark::DoNotOptimize(table->Add(r));
+      errors += table->Delete(r) != 0;
+      errors += table->Add(r) != 0;
       items += 2;
     }
   }
   const uint64_t cpu_ns = ThreadCpuNs() - cpu0;
+
+  // A failed add/delete could be cheaper than a successful one, so without
+  // these two checks the update-cost numbers would be unfalsifiable: first
+  // that no operation failed during the timed loop, then that the table is
+  // still the one the reference describes after all that churn.
+  CHECK_EQ(errors, 0) << errors << " add/delete operations failed";
+  VerifyAgainstReference(&prep, table);
   delete table;
 
   state.SetItemsProcessed(items);
@@ -525,8 +555,10 @@ void RunAddDelete(benchmark::State &state) {
 }
 
 // Sizes: 1K (small edge/ToR table), 64K (plausible transit FIB), 512K (large
-// IPv4 FIB). 512K is this host's ceiling: rte_lpm's tbl24 alone is a fixed
-// 64MB and dir24_8's tbl24 32MB, both out of EAL's --no-huge heap.
+// IPv4 FIB). 512K is this host's ceiling: both tables' tbl24 is fixed at
+// 2^24 entries, which is 64MB for rte_lpm (4-byte entries) and -- because
+// this bench configures dir24_8 with 4-byte next hops, for comparability --
+// also 64MB for rte_fib; both come out of EAL's --no-huge heap.
 void BM_LookupLpmVec(benchmark::State &state) {
   RunLookup<LpmTable, &LpmTable::LookupBatch>(state);
 }
@@ -546,12 +578,17 @@ BENCHMARK(BM_LookupLpmScalar)
     ->Arg(1 << 19);
 
 // FIB is registered only up to 64K routes: at 512K, with rules inserted in
-// the generator's arbitrary (realistic) order, rte_fib returns next hops
-// matching no rule for some keys -- deterministically, independent of nh_sz
-// and of tbl8 sizing (verified with a 4x larger pool), and absent when the
-// same rule set is inserted shortest-prefix-first (while rte_lpm and the
-// independent reference agree in both orders). See MODERNIZATION.md entry
-// 34; re-register 1 << 19 here after a DPDK fix that the gate accepts.
+// the generator's arbitrary (realistic) order -- what a control plane may do,
+// adding a /24 after a /28 under it -- rte_fib (DPDK 25.11.3, DIR24_8,
+// 4-byte next hops) returns a next hop matching no rule at all for some
+// keys. Observed, not root-caused: deterministic across runs, unchanged by a
+// 4x larger tbl8 pool, and gone when the same rule set goes in
+// shortest-prefix-first, while rte_lpm and the independent reference agree in
+// both orders. Re-verified 2026-09-19 with this file's full-key-stream gate
+// and with add/delete return values checked. DPDK 25.11.3 already carries the
+// upstream "fib: fix prefix addition handling" fix, so this is not that known
+// defect. See MODERNIZATION.md entry 34; re-register 1 << 19 here after a DPDK
+// fix that this gate accepts.
 void BM_LookupFib(benchmark::State &state) {
   RunLookup<FibTable, &FibTable::LookupBatch>(state);
 }
@@ -565,7 +602,15 @@ BENCHMARK(BM_AddDeleteLpm)->ArgNames({"routes"})->Arg(1024)->Arg(1 << 16);
 void BM_AddDeleteFib(benchmark::State &state) {
   RunAddDelete<FibTable>(state);
 }
-BENCHMARK(BM_AddDeleteFib)->ArgNames({"routes"})->Arg(1024)->Arg(1 << 16);
+// FIB's add/delete comparison stops at 1K routes: at 64K, the delete+add
+// churn of the generated rule set leaves some keys resolving to a next hop
+// matching no rule -- caught by this benchmark's post-timing verification
+// (added in the same review-hardening pass), while rte_lpm returns exactly the
+// reference for the same churn at every size. Same defect class as the 512K
+// build finding, but in the *update* path -- the path whose measured cost
+// advantage motivated this experiment -- so FIB's 64K update numbers are not
+// reportable. See MODERNIZATION.md entry 34.
+BENCHMARK(BM_AddDeleteFib)->ArgNames({"routes"})->Arg(1024);
 
 }  // namespace
 
