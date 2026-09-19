@@ -48,10 +48,11 @@ namespace bess {
 
 static struct rte_mempool *pframe_pool[RTE_MAX_NUMA_NODES];
 
-Packet *Packet::copy(const Packet *src) {
+PacketHandle Packet::copy(PacketHandle src) {
   DCHECK(src->is_linear());
 
-  Packet *dst = reinterpret_cast<Packet *>(rte_pktmbuf_alloc(src->pool_));
+  PacketHandle dst =
+      reinterpret_cast<PacketHandle>(rte_pktmbuf_alloc(src->pool_));
   if (!dst) {
     return nullptr;  // FAIL.
   }

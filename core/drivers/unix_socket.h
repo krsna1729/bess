@@ -95,14 +95,15 @@ class UnixSocketPort final : public Port {
   void DeInit() override;
 
   // Multi-queue is not supported. qid must be 0.
-  int RecvPackets(queue_t qid, bess::Packet **pkts, int cnt) override;
-  int SendPackets(queue_t qid, bess::Packet **pkts, int cnt) override;
+  int RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) override;
+  int SendPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) override;
 
  private:
   void ReplenishRecvVector(int cnt);
 
   // These rely on there being no multiqueue support !!!
-  std::array<bess::Packet *, bess::PacketBatch::kMaxBurst> pkt_recv_vector_;
+  std::array<bess::PacketHandle, bess::PacketBatch::kMaxBurst>
+      pkt_recv_vector_;
   std::array<mmsghdr, bess::PacketBatch::kMaxBurst> recv_vector_;
   std::array<iovec, bess::PacketBatch::kMaxBurst> recv_iovecs_;
   // send_iovecs reserves *8 elements for segmented packets

@@ -92,7 +92,7 @@ class PMDPort final : public Port {
    *
    * PARAMETERS:
    * * queue_t quid : NIC queue to receive from.
-   * * bess::Packet **pkts   : buffer to store received packets in to.
+   * * bess::PacketHandle *pkts : buffer to store received packets in to.
    * * int cnt  : max number of packets to pull.
    *
    * EXPECTS:
@@ -102,15 +102,14 @@ class PMDPort final : public Port {
    * RETURNS:
    * * Total number of packets received (<=cnt)
    */
-  int RecvPackets(queue_t qid, bess::Packet **pkts, int cnt) override;
+  int RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) override;
 
   /*!
    * Sends packets out on the device.
    *
    * PARAMETERS:
    * * queue_t quid : NIC queue to transmit on.
-   * * bess::Packet ** pkts   : packets to transmit.
-   * * int cnt  : number of packets in pkts to transmit.
+   * * bess::PacketHandle *pkts : packets to transmit.
    *
    * EXPECTS:
    * * Only call this after calling Init with a device.
@@ -119,7 +118,7 @@ class PMDPort final : public Port {
    * RETURNS:
    * * Total number of packets sent (<=cnt).
    */
-  int SendPackets(queue_t qid, bess::Packet **pkts, int cnt) override;
+  int SendPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) override;
 
   uint64_t GetFlags() const override {
     return DRIVER_FLAG_SELF_INC_STATS | DRIVER_FLAG_SELF_OUT_STATS;

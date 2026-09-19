@@ -44,7 +44,7 @@
 // 2. single segment
 // 3. reference counter == 1
 // 4. the data buffer is embedded in the mbuf
-inline void Packet::Free(Packet **pkts, size_t cnt) {
+inline void Packet::Free(PacketHandle *pkts, size_t cnt) {
   DCHECK(cnt <= PacketBatch::kMaxBurst);
 
   // rte_mempool_put_bulk() crashes when called with cnt == 0
@@ -63,8 +63,10 @@ inline void Packet::Free(Packet **pkts, size_t cnt) {
   size_t i;
 
   for (i = 0; i < (cnt & ~1); i += 2) {
-    auto *mbuf0 = pkts[i];
-    auto *mbuf1 = pkts[i + 1];
+    // since the data is likely to be in the store buffer
+    // as 64-bit writes, 128-bit read will cause stalls
+    PacketHandle mbuf0 = pkts[i];
+    PacketHandle mbuf1 = pkts[i + 1];
 
     __m128i buf_addrs_derived;
     __m128i buf_addrs_actual;
@@ -96,7 +98,7 @@ inline void Packet::Free(Packet **pkts, size_t cnt) {
   }
 
   if (i < cnt) {
-    const Packet *pkt = pkts[i];
+    const PacketHandle pkt = pkts[i];
 
     if (unlikely(pkt->pool_ != _pool || pkt->next_ != nullptr ||
                  pkt->refcnt_ != 1 || pkt->buf_addr_ != pkt->headroom_)) {
@@ -107,7 +109,7 @@ inline void Packet::Free(Packet **pkts, size_t cnt) {
   // When a rte_mbuf is returned to a mempool, the following conditions
   // must hold:
   for (i = 0; i < cnt; i++) {
-    Packet *pkt = pkts[i];
+    PacketHandle pkt = pkts[i];
     DCHECK_EQ(pkt->mbuf_.refcnt, 1);
     DCHECK_EQ(pkt->mbuf_.nb_segs, 1);
     DCHECK_EQ(pkt->mbuf_.next, static_cast<struct rte_mbuf *>(nullptr));

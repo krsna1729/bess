@@ -42,8 +42,9 @@ class PacketPool {
   PacketPool &operator=(const PacketPool &) = delete;
 
   // Allocate a packet from the pool, with specified initial packet size.
-  Packet *Alloc(size_t len = 0) {
-    Packet *pkt = reinterpret_cast<Packet *>(rte_pktmbuf_alloc(pool_));
+  PacketHandle Alloc(size_t len = 0) {
+    PacketHandle pkt =
+        reinterpret_cast<PacketHandle>(rte_pktmbuf_alloc(pool_));
     if (pkt) {
       pkt->pkt_len_ = len;
       pkt->data_len_ = len;
@@ -55,7 +56,7 @@ class PacketPool {
 
   // Allocate multiple packets. Note that this function has no partial success;
   // it allocates either all "count" packets (returns true) or none (false).
-  bool AllocBulk(Packet **pkts, size_t count, size_t len = 0);
+  bool AllocBulk(PacketHandle *pkts, size_t count, size_t len = 0);
 
   // The number of total packets in the pool. 0 if initialization failed.
   size_t Capacity() const { return pool_->populated_size; }
@@ -66,7 +67,7 @@ class PacketPool {
   // Note: It would be ideal to not expose this
   rte_mempool *pool() { return pool_; }
 
-  static Packet *from_paddr(phys_addr_t paddr);
+  static PacketHandle from_paddr(phys_addr_t paddr);
 
   virtual bool IsVirtuallyContiguous() = 0;
   virtual bool IsPhysicallyContiguous() = 0;

@@ -103,8 +103,8 @@ void UnixSocketPort::ReplenishRecvVector(int cnt) {
 
   for (int i = 0; i < cnt; i++) {
     if (allocated) {
-      recv_iovecs_[i] = {.iov_base = pkt_recv_vector_[i]->data(),
-                         .iov_len = SNBUF_DATA};
+      recv_iovecs_[i] = {.iov_base = bess::PacketRef(pkt_recv_vector_[i]).head_data(),
+                         .iov_len = bess::PacketRef(pkt_recv_vector_[i]).tailroom()};
     } else {
       // vectors can have holes, it will just drop the packet
       recv_iovecs_[i] = {.iov_base = nullptr, .iov_len = 0};
@@ -204,11 +204,11 @@ void UnixSocketPort::DeInit() {
   }
 
   for (auto *pkt : pkt_recv_vector_) {
-    bess::Packet::Free(pkt);
+    bess::PacketFree(pkt);
   }
 }
 
-int UnixSocketPort::RecvPackets(queue_t qid, bess::Packet **pkts, int cnt) {
+int UnixSocketPort::RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
   int client_fd = client_fd_;
 
   DCHECK_EQ(qid, 0);
@@ -233,8 +233,9 @@ int UnixSocketPort::RecvPackets(queue_t qid, bess::Packet **pkts, int cnt) {
       for (int i = 0; i < ret; i++) {
         if ((recv_iovecs_[i].iov_base != nullptr) &&
             (recv_vector_[i].msg_len > 0)) {
-          pkt_recv_vector_[i]->append(recv_vector_[i].msg_len);
-          pkts[received++] = pkt_recv_vector_[i];
+          bess::PacketRef pkt(pkt_recv_vector_[i]);
+          pkt.append(recv_vector_[i].msg_len);
+          pkts[received++] = pkt.handle();
         }
       }
       ReplenishRecvVector(ret);
@@ -248,7 +249,7 @@ int UnixSocketPort::RecvPackets(queue_t qid, bess::Packet **pkts, int cnt) {
   return received;
 }
 
-int UnixSocketPort::SendPackets(queue_t qid, bess::Packet **pkts, int cnt) {
+int UnixSocketPort::SendPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
   int i;
   int sent = 0;
   int client_fd = client_fd_;
@@ -261,17 +262,17 @@ int UnixSocketPort::SendPackets(queue_t qid, bess::Packet **pkts, int cnt) {
 
   size_t iovec_idx = 0;
   for (i = 0; i < cnt; i++) {
-    bess::Packet *pkt = pkts[i];
-    int nb_segs = pkt->nb_segs();
+    bess::PacketRef pkt(pkts[i]);
+    int nb_segs = pkt.nb_segs();
 
     for (int j = 0; j < nb_segs; j++) {
       if (iovec_idx >= send_iovecs_.size()) {
         break;
       }
       send_iovecs_[iovec_idx++] = {
-          .iov_base = pkt->head_data(),
-          .iov_len = static_cast<size_t>(pkt->head_len())};
-      pkt = pkt->next();
+          .iov_base = pkt.head_data(),
+          .iov_len = static_cast<size_t>(pkt.head_len())};
+      pkt = pkt.next();
     }
 
     send_vector_[i] = {
@@ -288,7 +289,7 @@ int UnixSocketPort::SendPackets(queue_t qid, bess::Packet **pkts, int cnt) {
   if (!send_vector_.empty()) {
     sent = sendmmsg(client_fd, send_vector_.data(), i, 0);
     if (sent > 0) {
-      bess::Packet::Free(pkts, sent);
+      bess::PacketFreeBulk(pkts, sent);
     } else {
       sent = 0;
     }

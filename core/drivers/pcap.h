@@ -47,12 +47,12 @@ class PCAPPort final : public Port {
 
   void DeInit() override;
   // PCAP has no notion of queue so unlike parent (port.cc) quid is ignored.
-  int SendPackets(queue_t qid, bess::Packet **pkts, int cnt) override;
+  int SendPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) override;
   // Ditto above: quid is ignored.
-  int RecvPackets(queue_t qid, bess::Packet **pkts, int cnt) override;
+  int RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) override;
 
  private:
-  void GatherData(unsigned char *data, bess::Packet *pkt);
+  void GatherData(unsigned char *data, bess::PacketRef pkt);
   PcapHandle pcap_handle_;
 };
 

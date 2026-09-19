@@ -88,7 +88,7 @@ PacketPool::~PacketPool() {
   rte_mempool_free(pool_);
 }
 
-bool PacketPool::AllocBulk(Packet **pkts, size_t count, size_t len) {
+bool PacketPool::AllocBulk(PacketHandle *pkts, size_t count, size_t len) {
   if (rte_mempool_get_bulk(pool_, reinterpret_cast<void **>(pkts), count) < 0) {
     return false;
   }
@@ -113,7 +113,7 @@ bool PacketPool::AllocBulk(Packet **pkts, size_t count, size_t len) {
   // We can ignore these fields:
   //   vlan_tci_outer == 0 (not required if ol_flags == 0)
   //   tx_offload == 0     (not required if ol_flags == 0)
-  //   next == nullptr     (all packets in a mempool must already be nullptr)
+  //   next == nullptr      (all packets in a mempool must already be nullptr)
 
   __m128i rearm = _mm_setr_epi16(SNBUF_HEADROOM, 1, 1, 0xff, 0, 0, 0, 0);
   __m128i rxdesc = _mm_setr_epi32(0, len, len, 0);
@@ -124,8 +124,8 @@ bool PacketPool::AllocBulk(Packet **pkts, size_t count, size_t len) {
   for (i = 0; i < (count & (~0x1)); i += 2) {
     // since the data is likely to be in the store buffer
     // as 64-bit writes, 128-bit read will cause stalls
-    Packet *pkt0 = pkts[i];
-    Packet *pkt1 = pkts[i + 1];
+    PacketHandle pkt0 = pkts[i];
+    PacketHandle pkt1 = pkts[i + 1];
 
     _mm_store_si128(&pkt0->rearm_data_, rearm);
     _mm_store_si128(&pkt0->rx_descriptor_fields1_, rxdesc);
@@ -134,7 +134,7 @@ bool PacketPool::AllocBulk(Packet **pkts, size_t count, size_t len) {
   }
 
   if (count & 0x1) {
-    Packet *pkt = pkts[i];
+    PacketHandle pkt = pkts[i];
 
     _mm_store_si128(&pkt->rearm_data_, rearm);
     _mm_store_si128(&pkt->rx_descriptor_fields1_, rxdesc);
@@ -239,8 +239,8 @@ DpdkPacketPool::DpdkPacketPool(size_t capacity, int socket_id)
   PostPopulate();
 }
 
-static Packet *paddr_to_snb_memchunk(struct rte_mempool_memhdr *chunk,
-                                     phys_addr_t paddr) {
+static PacketHandle paddr_to_snb_memchunk(struct rte_mempool_memhdr *chunk,
+                                          phys_addr_t paddr) {
   // NOTE: rte_mempool_memhdr's "phys_addr" field was renamed to "iova"
   // upstream (same uint64_t IO-address type; not a physical-address-only
   // concept even before the rename). Verified against DPDK 25.11.
@@ -252,13 +252,13 @@ static Packet *paddr_to_snb_memchunk(struct rte_mempool_memhdr *chunk,
     uintptr_t vaddr;
 
     vaddr = (uintptr_t)chunk->addr + paddr - chunk->iova;
-    return reinterpret_cast<Packet *>(vaddr);
+    return reinterpret_cast<PacketHandle>(vaddr);
   }
 
   return nullptr;
 }
 
-Packet *PacketPool::from_paddr(phys_addr_t paddr) {
+PacketHandle PacketPool::from_paddr(phys_addr_t paddr) {
   for (int i = 0; i < RTE_MAX_NUMA_NODES; i++) {
     struct rte_mempool *pool;
     struct rte_mempool_memhdr *chunk;
@@ -268,7 +268,7 @@ Packet *PacketPool::from_paddr(phys_addr_t paddr) {
     }
     pool = default_pools_[i]->pool();
     STAILQ_FOREACH(chunk, &pool->mem_list, next) {
-      Packet *pkt = paddr_to_snb_memchunk(chunk, paddr);
+      PacketHandle pkt = paddr_to_snb_memchunk(chunk, paddr);
       if (!pkt) {
         continue;
       }

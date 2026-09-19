@@ -222,7 +222,7 @@ class alignas(64) Packet {
 
   // Duplicate a new Packet object, allocated from the same PacketPool as src.
   // Returns nullptr if memory allocation failed
-  static Packet *copy(const Packet *src);
+  static PacketHandle copy(PacketHandle src);
 
   phys_addr_t dma_addr() { return buf_physaddr_ + data_off_; }
 
@@ -231,16 +231,18 @@ class alignas(64) Packet {
   void CheckSanity();
 
   // pkt may be nullptr
-  static void Free(Packet *pkt) {
+  static void Free(PacketHandle pkt) {
     rte_pktmbuf_free(reinterpret_cast<struct rte_mbuf *>(pkt));
   }
 
-  // All pointers in pkts must not be nullptr.
+  // All handles in pkts must not be nullptr.
   // cnt must be [0, PacketBatch::kMaxBurst]
-  static inline void Free(Packet **pkts, size_t cnt);
+  static inline void Free(PacketHandle *pkts, size_t cnt);
 
   // batch must not be nullptr
-  static void Free(PacketBatch *batch) { Free(batch->pkts(), batch->cnt()); }
+  static void Free(PacketBatch *batch) {
+    Free(batch->handles(), batch->cnt());
+  }
 
  private:
   // BESS's own private per-packet data (pool bookkeeping, metadata,
@@ -523,12 +525,6 @@ class PacketRef {
     return pkt_->head_data<T>(offset);
   }
 
-  // Transitional raw-data accessor; migrate consumers to logical data methods.
-  template <typename T = char *>
-  T data() const {
-    return pkt_->data<T>();
-  }
-
   template <typename T = char *>
   T metadata() const {
     // Packet::metadata() is a const accessor, but modules need a writable view
@@ -542,22 +538,12 @@ class PacketRef {
     return pkt_->scratchpad<T>();
   }
 
-  // Transitional storage accessor; do not add new users.
-  template <typename T = void *>
-  T buffer() const {
-    return pkt_->buffer<T>();
-  }
-
   int nb_segs() const { return pkt_->nb_segs(); }
 
   void set_nb_segs(int n) { pkt_->set_nb_segs(n); }
 
   PacketRef next() const { return PacketRef(pkt_->next()); }
   void set_next(PacketRef next) { pkt_->set_next(next.handle()); }
-
-  // Transitional raw offset/length setters; migrate consumers before Stage 2B.
-  uint16_t data_off() const { return pkt_->data_off(); }
-  void set_data_off(uint16_t offset) { pkt_->set_data_off(offset); }
 
   uint16_t data_len() const { return pkt_->data_len(); }
   void set_data_len(uint16_t len) { pkt_->set_data_len(len); }
@@ -577,8 +563,6 @@ class PacketRef {
   void *adj(uint16_t len) { return pkt_->adj(len); }
   void *append(uint16_t len) { return pkt_->append(len); }
   void trim(uint16_t to_remove) { pkt_->trim(to_remove); }
-
-  phys_addr_t dma_addr() const { return pkt_->dma_addr(); }
 
  private:
   PacketHandle pkt_;
@@ -628,7 +612,7 @@ inline void PacketBatch::add(PacketRef pkt) {
 #if __AVX__
 #include "packet_avx.h"
 #else
-inline void Packet::Free(Packet **pkts, size_t cnt) {
+inline void Packet::Free(PacketHandle *pkts, size_t cnt) {
   DCHECK_LE(cnt, PacketBatch::kMaxBurst);
 
   // rte_mempool_put_bulk() crashes when called with cnt == 0
@@ -639,7 +623,7 @@ inline void Packet::Free(Packet **pkts, size_t cnt) {
   struct rte_mempool *pool = pkts[0]->pool_;
 
   for (size_t i = 0; i < cnt; i++) {
-    const Packet *pkt = pkts[i];
+    PacketHandle pkt = pkts[i];
 
     if (unlikely(pkt->pool_ != pool || !pkt->is_simple() ||
                  pkt->refcnt_ != 1)) {

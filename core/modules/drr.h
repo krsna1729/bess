@@ -100,26 +100,27 @@ class DRR final : public Module {
   // stores the metrics of the flow, a timer and the queue to store the packets
   // in.
   struct Flow {
-    int deficit;                // the allocated bytes to the flow
-    double timer;               // to determine if TTL should be used
-    FlowId id;                  // allows the flow to remove itself from the map
-    struct rte_ring *queue;       // queue to store current packets for flow
-    bess::Packet *next_packet;  // buffer to store next packet from the queue.
+    int deficit;                   // the allocated bytes to the flow
+    double timer;                  // to determine if TTL should be used
+    FlowId id;                     // allows the flow to remove itself from the map
+    struct rte_ring *queue;        // queue to store current packets for flow
+    bess::PacketHandle next_packet;  // buffer to store next packet from the queue.
     Flow() : deficit(0), timer(0), id(), next_packet(nullptr){};
     Flow(FlowId new_id)
         : deficit(0), timer(0), id(new_id), next_packet(nullptr){};
     ~Flow() {
       if (queue) {
-        bess::Packet *pkt;
-        while (rte_ring_sc_dequeue(queue, reinterpret_cast<void **>(&pkt)) == 0) {
-          bess::Packet::Free(pkt);
+        bess::PacketHandle pkt;
+        while (rte_ring_sc_dequeue(queue, reinterpret_cast<void **>(&pkt)) ==
+               0) {
+          bess::PacketFree(pkt);
         }
 
         std::free(queue);
       }
 
       if (next_packet) {
-        bess::Packet::Free(next_packet);
+        bess::PacketFree(next_packet);
       }
     }
   };
@@ -193,19 +194,18 @@ class DRR final : public Module {
   rte_ring *ResizeQueue(rte_ring *old_queue, uint32_t new_size, int *err);
 
   //  Puts the packet into the ring queue within the flow. Takes the flow to
-  //  enqueue the packet into, the packet to enqueue into the flow's queue
+  //  enqueue into, the packet handle to enqueue into the flow's queue
   //  and integer pointer to be set on error.
-  void Enqueue(Flow *f, bess::Packet *pkt, int *err);
+  void Enqueue(Flow *f, bess::PacketHandle pkt, int *err);
 
-  //  Takes a Packet to get a flow id for. Returns the 5 element identifier for
-  //  the flow that the packet belongs to
-  FlowId GetId(bess::Packet *pkt);
+  //  Takes a PacketRef to get a flow id for. Returns the 5 element identifier
+  //  for the packet's flow.
+  FlowId GetId(bess::PacketRef pkt);
 
-  //  Creates a new flow and adds it to the round robin queue. Takes the first
-  //  pkt
-  //  to be enqueued in the new flow, the id of the new flow to be created and
-  //  integer pointer to set on error.
-  void AddNewFlow(bess::Packet *pkt, FlowId id, int *err);
+  //  Creates a new flow and adds it to the round robin queue. Takes the packet
+  //  handle to enqueue, the id of the new flow and integer pointer to set on
+  //  error.
+  void AddNewFlow(bess::PacketHandle pkt, FlowId id, int *err);
 
   //  Removes the flow from the hash table and frees all the packets within its
   //  queue. Takes the pointer to the flow to remove

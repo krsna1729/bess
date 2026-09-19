@@ -58,7 +58,7 @@ void PCAPPort::DeInit() {
   pcap_handle_.Reset();
 }
 
-int PCAPPort::RecvPackets(queue_t qid, bess::Packet** pkts, int cnt) {
+int PCAPPort::RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
   if (!pcap_handle_.is_initialized()) {
     return 0;
   }
@@ -74,39 +74,40 @@ int PCAPPort::RecvPackets(queue_t qid, bess::Packet** pkts, int cnt) {
       break;
     }
 
-    bess::Packet* pkt = current_worker.packet_pool()->Alloc();
+    bess::PacketHandle pkt = current_worker.packet_pool()->Alloc();
     if (!pkt) {
       break;
     }
 
-    int copy_len = std::min(caplen, static_cast<int>(pkt->tailroom()));
-    bess::utils::CopyInlined(pkt->append(copy_len), packet, copy_len, true);
+    bess::PacketRef pkt_ref(pkt);
+    int copy_len = std::min(caplen, static_cast<int>(pkt_ref.tailroom()));
+    bess::utils::CopyInlined(pkt_ref.append(copy_len), packet, copy_len, true);
 
     packet += copy_len;
     caplen -= copy_len;
-    bess::Packet* m = pkt;
+    bess::PacketRef m = pkt_ref;
 
     int nb_segs = 1;
     while (caplen > 0) {
-      m->set_next(current_worker.packet_pool()->Alloc());
-      m = m->next();
+      m.set_next(bess::PacketRef(current_worker.packet_pool()->Alloc()));
+      m = m.next();
       nb_segs++;
 
-      copy_len = std::min(caplen, static_cast<int>(m->tailroom()));
-      bess::utils::Copy(m->append(copy_len), packet, copy_len, true);
+      copy_len = std::min(caplen, static_cast<int>(m.tailroom()));
+      bess::utils::Copy(m.append(copy_len), packet, copy_len, true);
 
       packet += copy_len;
       caplen -= copy_len;
     }
-    pkt->set_nb_segs(nb_segs);
-    pkts[recv_cnt] = pkt;
+    pkt_ref.set_nb_segs(nb_segs);
+    pkts[recv_cnt] = pkt_ref.handle();
     recv_cnt++;
   }
 
   return recv_cnt;
 }
 
-int PCAPPort::SendPackets(queue_t, bess::Packet** pkts, int cnt) {
+int PCAPPort::SendPackets(queue_t, bess::PacketHandle *pkts, int cnt) {
   if (!pcap_handle_.is_initialized()) {
     CHECK(0);  // raise an error
   }
@@ -114,30 +115,30 @@ int PCAPPort::SendPackets(queue_t, bess::Packet** pkts, int cnt) {
   int sent = 0;
 
   while (sent < cnt) {
-    bess::Packet* sbuf = pkts[sent];
+    bess::PacketRef sbuf(pkts[sent]);
 
-    if (likely(sbuf->nb_segs() == 1)) {
-      pcap_handle_.SendPacket(sbuf->head_data<const u_char*>(),
-                              sbuf->total_len());
-    } else if (sbuf->total_len() <= PCAP_SNAPLEN) {
+    if (likely(sbuf.nb_segs() == 1)) {
+      pcap_handle_.SendPacket(sbuf.head_data<const u_char *>(),
+                              sbuf.total_len());
+    } else if (sbuf.total_len() <= PCAP_SNAPLEN) {
       unsigned char tx_pcap_data[PCAP_SNAPLEN];
       GatherData(tx_pcap_data, sbuf);
-      pcap_handle_.SendPacket(tx_pcap_data, sbuf->total_len());
+      pcap_handle_.SendPacket(tx_pcap_data, sbuf.total_len());
     }
 
     sent++;
   }
 
-  bess::Packet::Free(pkts, sent);
+  bess::PacketFreeBulk(pkts, sent);
   return sent;
 }
 
-void PCAPPort::GatherData(unsigned char* data, bess::Packet* pkt) {
-  while (pkt) {
-    bess::utils::CopyInlined(data, pkt->head_data(), pkt->head_len());
+void PCAPPort::GatherData(unsigned char* data, bess::PacketRef pkt) {
+  while (pkt.handle()) {
+    bess::utils::CopyInlined(data, pkt.head_data(), pkt.head_len());
 
-    data += pkt->head_len();
-    pkt = reinterpret_cast<bess::Packet*>(pkt->next());
+    data += pkt.head_len();
+    pkt = pkt.next();
   }
 }
 

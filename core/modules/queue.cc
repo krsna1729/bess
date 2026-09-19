@@ -76,12 +76,13 @@ int Queue::Resize(int slots) {
 
   /* migrate packets from the old queue */
   if (old_queue) {
-    bess::Packet *pkt;
+    bess::PacketHandle pkt;
 
-    while (rte_ring_sc_dequeue(old_queue, (void **)&pkt) == 0) {
-      ret = rte_ring_sp_enqueue(new_queue, pkt);
+    while (rte_ring_sc_dequeue(old_queue,
+                               reinterpret_cast<void **>(&pkt)) == 0) {
+      ret = rte_ring_sp_enqueue(new_queue, reinterpret_cast<void *>(pkt));
       if (ret == -ENOBUFS) {
-        bess::Packet::Free(pkt);
+        bess::PacketFree(pkt);
       }
     }
 
@@ -159,11 +160,12 @@ CommandResponse Queue::SetRuntimeConfig(const bess::pb::QueueArg &arg) {
 }
 
 void Queue::DeInit() {
-  bess::Packet *pkt;
+  bess::PacketHandle pkt;
 
   if (queue_) {
-    while (rte_ring_sc_dequeue(queue_, (void **)&pkt) == 0) {
-      bess::Packet::Free(pkt);
+    while (rte_ring_sc_dequeue(queue_,
+                               reinterpret_cast<void **>(&pkt)) == 0) {
+      bess::PacketFree(pkt);
     }
     std::free(queue_);
   }
@@ -178,8 +180,9 @@ std::string Queue::GetDesc() const {
 
 /* from upstream */
 void Queue::ProcessBatch(Context *, bess::PacketBatch *batch) {
-  int queued = static_cast<int>(
-      rte_ring_mp_enqueue_burst(queue_, (void **)batch->pkts(), batch->cnt(), nullptr));
+  int queued = static_cast<int>(rte_ring_mp_enqueue_burst(
+      queue_, reinterpret_cast<void **>(batch->handles()), batch->cnt(),
+      nullptr));
   if (backpressure_ && rte_ring_count(queue_) > high_water_) {
     SignalOverload();
   }
@@ -189,7 +192,7 @@ void Queue::ProcessBatch(Context *, bess::PacketBatch *batch) {
   if (queued < batch->cnt()) {
     int to_drop = batch->cnt() - queued;
     stats_.dropped += to_drop;
-    bess::Packet::Free(batch->pkts() + queued, to_drop);
+    bess::PacketFreeBulk(batch->handles() + queued, to_drop);
   }
 }
 
@@ -210,7 +213,7 @@ struct task_result Queue::RunTask(Context *ctx, bess::PacketBatch *batch,
   uint64_t total_bytes = 0;
 
   uint32_t cnt = static_cast<uint32_t>(rte_ring_sc_dequeue_burst(
-      queue_, (void **)batch->pkts(), burst, nullptr));
+      queue_, reinterpret_cast<void **>(batch->handles()), burst, nullptr));
 
   if (cnt == 0) {
     return {.block = true, .packets = 0, .bits = 0};
@@ -221,12 +224,13 @@ struct task_result Queue::RunTask(Context *ctx, bess::PacketBatch *batch,
 
   if (prefetch_) {
     for (uint32_t i = 0; i < cnt; i++) {
-      total_bytes += batch->pkts()[i]->total_len();
-      rte_prefetch0(batch->pkts()[i]->head_data());
+      bess::PacketRef pkt = batch->packet(i);
+      total_bytes += pkt.total_len();
+      rte_prefetch0(pkt.head_data());
     }
   } else {
     for (uint32_t i = 0; i < cnt; i++) {
-      total_bytes += batch->pkts()[i]->total_len();
+      total_bytes += batch->packet(i).total_len();
     }
   }
 

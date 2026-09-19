@@ -127,7 +127,7 @@ struct task_result PortInc::RunTask(Context *ctx, bess::PacketBatch *batch,
   const int burst = ACCESS_ONCE(burst_);
   const int pkt_overhead = 24;
 
-  batch->set_cnt(p->RecvPackets(qid, batch->pkts(), burst));
+  batch->set_cnt(p->RecvPackets(qid, batch->handles(), burst));
   uint32_t cnt = batch->cnt();
   p->queue_stats[PACKET_DIR_INC][qid].requested_hist[burst]++;
   p->queue_stats[PACKET_DIR_INC][qid].actual_hist[cnt]++;
@@ -139,12 +139,13 @@ struct task_result PortInc::RunTask(Context *ctx, bess::PacketBatch *batch,
   // NOTE: we cannot skip this step since it might be used by scheduler.
   if (prefetch_) {
     for (uint32_t i = 0; i < cnt; i++) {
-      received_bytes += batch->pkts()[i]->total_len();
-      rte_prefetch0(batch->pkts()[i]->head_data());
+      bess::PacketRef pkt = batch->packet(i);
+      received_bytes += pkt.total_len();
+      rte_prefetch0(pkt.head_data());
     }
   } else {
     for (uint32_t i = 0; i < cnt; i++) {
-      received_bytes += batch->pkts()[i]->total_len();
+      received_bytes += batch->packet(i).total_len();
     }
   }
 

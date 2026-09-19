@@ -253,11 +253,12 @@ class alignas(64) Module {
   inline void RunNextModule(Context *ctx, bess::PacketBatch *batch);
 
   // With the contexts('ctx'), drop a packet. Dropped packets will be freed.
-  inline void DropPacket(Context *ctx, bess::Packet *pkt);
+  inline void DropPacket(Context *ctx, bess::PacketRef pkt);
 
   // With the contexts('ctx'), emit (forward) a packet ('pkt') to the next
   // module connected with 'ogate'
-  inline void EmitPacket(Context *ctx, bess::Packet *pkt, gate_idx_t ogate = 0);
+  inline void EmitPacket(Context *ctx, bess::PacketRef pkt,
+                         gate_idx_t ogate = 0);
 
   // Process OGate hooks and forward packet batches into next modules.
   inline void ProcessOGates(Context *ctx);
@@ -491,7 +492,7 @@ class alignas(64) Module {
 
 static inline void deadend(Context *ctx, bess::PacketBatch *batch) {
   ctx->silent_drops += batch->cnt();
-  bess::Packet::Free(batch);
+  bess::PacketFreeBatch(batch);
   batch->clear();
 }
 
@@ -528,7 +529,7 @@ inline void Module::RunNextModule(Context *ctx, bess::PacketBatch *batch) {
   RunChooseModule(ctx, 0, batch);
 }
 
-inline void Module::DropPacket(Context *ctx, bess::Packet *pkt) {
+inline void Module::DropPacket(Context *ctx, bess::PacketRef pkt) {
   ctx->task->dead_batch()->add(pkt);
   deadends_[ctx->wid]++;
   if (static_cast<size_t>(ctx->task->dead_batch()->cnt()) >=
@@ -537,7 +538,7 @@ inline void Module::DropPacket(Context *ctx, bess::Packet *pkt) {
   }
 }
 
-inline void Module::EmitPacket(Context *ctx, bess::Packet *pkt,
+inline void Module::EmitPacket(Context *ctx, bess::PacketRef pkt,
                                gate_idx_t ogate_idx) {
   // Check if valid ogate is set
   if (unlikely(ogates_.size() <= ogate_idx) || unlikely(!ogates_[ogate_idx])) {
@@ -629,7 +630,7 @@ inline void Module::RunSplit(Context *ctx, const gate_idx_t *out_gates,
   }
 
   for (int i = 0; i < pkt_cnt; i++) {
-    EmitPacket(ctx, mixed_batch->pkts()[i], out_gates[i]);
+    EmitPacket(ctx, mixed_batch->packet(i), out_gates[i]);
   }
 
   mixed_batch->clear();
@@ -653,28 +654,28 @@ static inline int is_active_gate(const std::vector<T *> &gates,
 // Unsafe, but faster version. for offset use Attribute_offset().
 template <typename T>
 static inline T *_ptr_attr_with_offset(bess::metadata::mt_offset_t offset,
-                                       const bess::Packet *pkt) {
+                                       bess::PacketRef pkt) {
   promise(offset >= 0);
-  uintptr_t addr = pkt->metadata<uintptr_t>() + offset;
+  uintptr_t addr = pkt.metadata<uintptr_t>() + offset;
   return reinterpret_cast<T *>(addr);
 }
 
 template <typename T>
 static inline T _get_attr_with_offset(bess::metadata::mt_offset_t offset,
-                                      const bess::Packet *pkt) {
+                                      bess::PacketRef pkt) {
   return *_ptr_attr_with_offset<T>(offset, pkt);
 }
 
 template <typename T>
 static inline void _set_attr_with_offset(bess::metadata::mt_offset_t offset,
-                                         bess::Packet *pkt, T val) {
+                                         bess::PacketRef pkt, T val) {
   *(_ptr_attr_with_offset<T>(offset, pkt)) = val;
 }
 
 // Safe version.
 template <typename T>
 static T *ptr_attr_with_offset(bess::metadata::mt_offset_t offset,
-                               bess::Packet *pkt) {
+                               bess::PacketRef pkt) {
   return bess::metadata::IsValidOffset(offset)
              ? _ptr_attr_with_offset<T>(offset, pkt)
              : nullptr;
@@ -682,7 +683,7 @@ static T *ptr_attr_with_offset(bess::metadata::mt_offset_t offset,
 
 template <typename T>
 static T get_attr_with_offset(bess::metadata::mt_offset_t offset,
-                              const bess::Packet *pkt) {
+                              bess::PacketRef pkt) {
   return bess::metadata::IsValidOffset(offset)
              ? _get_attr_with_offset<T>(offset, pkt)
              : T();
@@ -690,7 +691,7 @@ static T get_attr_with_offset(bess::metadata::mt_offset_t offset,
 
 template <typename T>
 static inline void set_attr_with_offset(bess::metadata::mt_offset_t offset,
-                                        bess::Packet *pkt, T val) {
+                                        bess::PacketRef pkt, T val) {
   if (bess::metadata::IsValidOffset(offset)) {
     _set_attr_with_offset<T>(offset, pkt, val);
   }
@@ -699,17 +700,17 @@ static inline void set_attr_with_offset(bess::metadata::mt_offset_t offset,
 // Slowest but easiest.
 // TODO(melvin): These ought to be members of Module
 template <typename T>
-static inline T *ptr_attr(Module *m, int attr_id, bess::Packet *pkt) {
+static inline T *ptr_attr(Module *m, int attr_id, bess::PacketRef pkt) {
   return ptr_attr_with_offset<T>(m->attr_offset(attr_id), pkt);
 }
 
 template <typename T>
-static inline T get_attr(Module *m, int attr_id, const bess::Packet *pkt) {
+static inline T get_attr(Module *m, int attr_id, bess::PacketRef pkt) {
   return get_attr_with_offset<T>(m->attr_offset(attr_id), pkt);
 }
 
 template <typename T>
-static inline void set_attr(Module *m, int attr_id, bess::Packet *pkt, T val) {
+static inline void set_attr(Module *m, int attr_id, bess::PacketRef pkt, T val) {
   set_attr_with_offset(m->attr_offset(attr_id), pkt, val);
 }
 

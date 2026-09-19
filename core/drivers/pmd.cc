@@ -502,12 +502,12 @@ void PMDPort::CollectStats(bool reset) {
   // now, same as it already did for the drivers above.
 }
 
-int PMDPort::RecvPackets(queue_t qid, bess::Packet **pkts, int cnt) {
+int PMDPort::RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
   return rte_eth_rx_burst(dpdk_port_id_, qid,
                           reinterpret_cast<rte_mbuf **>(pkts), cnt);
 }
 
-int PMDPort::SendPackets(queue_t qid, bess::Packet **pkts, int cnt) {
+int PMDPort::SendPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
   int sent = rte_eth_tx_burst(dpdk_port_id_, qid,
                               reinterpret_cast<rte_mbuf **>(pkts), cnt);
   auto &stats = queue_stats[PACKET_DIR_OUT][qid];

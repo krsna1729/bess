@@ -65,7 +65,7 @@ class PacketBatch {
   // WARNING: this function has no bounds checks and so it's possible to
   // overrun the buffer by calling this. We are not adding bounds check because
   // we want maximum GOFAST.
-  void add(Packet *pkt) { pkts_[cnt_++] = pkt; }
+  void add(PacketHandle pkt) { pkts_[cnt_++] = pkt; }
 
   // Same thing through the seam; defined in packet.h.
   void add(PacketRef pkt);

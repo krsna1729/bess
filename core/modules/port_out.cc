@@ -95,14 +95,14 @@ static inline int SendBatch(bess::PacketBatch *batch, Port *p, queue_t qid) {
   int sent_pkts = 0;
 
   if (p->conf().admin_up) {
-    sent_pkts = p->SendPackets(qid, batch->pkts(), batch->cnt());
+    sent_pkts = p->SendPackets(qid, batch->handles(), batch->cnt());
   }
 
   if (!(p->GetFlags() & DRIVER_FLAG_SELF_OUT_STATS)) {
     const packet_dir_t dir = PACKET_DIR_OUT;
 
     for (int i = 0; i < sent_pkts; i++) {
-      sent_bytes += batch->pkts()[i]->total_len();
+      sent_bytes += batch->packet(i).total_len();
     }
 
     p->queue_stats[dir][qid].packets += sent_pkts;
@@ -130,7 +130,7 @@ void PortOut::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   }
 
   if (sent_pkts < batch->cnt()) {
-    bess::Packet::Free(batch->pkts() + sent_pkts, batch->cnt() - sent_pkts);
+    bess::PacketFreeBulk(batch->handles() + sent_pkts, batch->cnt() - sent_pkts);
   }
 }
 

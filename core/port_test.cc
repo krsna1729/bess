@@ -51,8 +51,8 @@ class DummyPort : public Port {
       *deinited_ = true;
   }
 
-  int RecvPackets(queue_t, bess::Packet **, int) override { return 0; }
-  int SendPackets(queue_t, bess::Packet **, int) override { return 0; }
+  int RecvPackets(queue_t, bess::PacketHandle *, int) override { return 0; }
+  int SendPackets(queue_t, bess::PacketHandle *, int) override { return 0; }
 
   void set_deinited(bool *val) { deinited_ = val; }
 
