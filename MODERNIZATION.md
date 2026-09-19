@@ -1451,6 +1451,43 @@ rather than one call site).
     with the mechanism and its live evidence in place they can now be argued
     from a working example instead of a proposal.
 
+    Reclamation follow-up (`9db37492`, review-driven): the first cut dropped
+    the command's reference at publish time, which made the *last dataplane
+    batch* to finish run `~Generation()` -> `rte_lpm_free()` -- a 64 MiB
+    tbl24 free plus DPDK's global tailq write lock, on a packet worker.
+    `Publish()` now stores the replacement and then waits for the batches that
+    already held the retired generation to drain, so the final reference --
+    and the free -- is released by the command thread; the wait is a
+    `std::this_thread::yield()` loop on a `use_count()` that can only
+    decrease, under `mutation_lock_`, which also keeps rapid commands from
+    accumulating retired generations. Measured, not argued:
+
+    - temporary glog instrumentation under 233 add/delete updates with
+      traffic flowing: every free ran on the *same thread as its own
+      `Publish()`*, and all four control-plane thread handles involved
+      differed from the worker's (`0x7ce048ff9670`); the drain took 0-1
+      yields, so the RPC-side cost is negligible.
+    - update-time continuity (2 ms counter sampler on its own client, 50 ms
+      buckets, one daemon, one pipeline): control (no updates) 0.933 min/p50,
+      fail-fast commands 0.946, add/delete with rebuilds 0.907 -- no zero
+      trough. The ~3pp delta is the rebuild's memory traffic at ~39
+      updates/s, orders of magnitude above realistic route churn. A first run
+      reported 0.088 and was a measurement artifact: its sampler shared one
+      pybess client with the command thread.
+    - daemon RSS flat (876.7 -> 876.9 MB) across those 233 generations:
+      reclamation is prompt, not deferred.
+    - the instrumentation was temporary; the committed code carries only the
+      `Publish()` helper and its preconditions.
+
+    Status and sequence: `bessctl`'s `command module` still pauses
+    unconditionally (deliberate -- `Command::THREAD_UNSAFE` commands need
+    that, and a "retry after EBUSY" hack could duplicate side effects); the
+    fix is to expose command thread-safety through the module-class
+    introspection API so `bessctl` pauses only when it must. That, and any
+    reusable snapshot/publication abstraction, come **after** `ExactMatch` is
+    done as the second Phase J module -- two proven modules first, per the
+    scope discipline above.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -2606,7 +2643,7 @@ revisit there rather than re-deciding it here.
 
 ---
 
-## Phase J — Live table updates without stopping the world (proposed 2026-09-18, not started)
+## Phase J — Live table updates without stopping the world (pilot landed 2026-09-19, entry 35; generalization pending)
 
 Cross-cutting phase, not a natural fit under A–I: touches the control
 plane (Phase G), the module command API, and the scheduler loop. Emerged
@@ -2693,7 +2730,9 @@ pointer, its three mutating commands are all `THREAD_UNSAFE`, the
 rebuild-and-swap cost is bounded, and `rte_fib` (Phase D, above) has
 native RCU support if the table migrates there anyway. `ExactMatch` is the
 natural second. Only after two modules work should this generalize into a
-`Module`-level contract. Explicitly **not** in scope for the first pass:
+`Module`-level contract. *(Status: the `IPLookup` pilot landed 2026-09-19 --
+see entry 35, including its writer-side reclamation fix and the measured
+update-time continuity; `ExactMatch` is next.)* Explicitly **not** in scope for the first pass:
 RCU-swapping the `ModuleGraph`, gate adjacency, or the traffic-class tree
 -- those are Phase G/H territory (live reconfiguration), not this phase's
 narrower table-update goal.
