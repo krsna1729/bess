@@ -139,9 +139,12 @@ class ExactMatch final : public Module {
   std::vector<FieldSpec> field_specs_;
   bool empty_masks_;  // mainly for GetInitialArg
 
-  // nullptr only before Init() and after DeInit().
+  // Holds one published generation; `mutation_lock_` serializes rebuilds.
+  // Never null between Init() and module destruction: there is no DeInit()
+  // (the generation is released with the module, workers already paused), and
+  // every command publishes a replacement rather than clearing it.
   std::atomic<GenerationPtr> generation_;
-  std::mutex mutation_lock_;  // serializes table rebuilds
+  std::mutex mutation_lock_;  // serializes rule-table rebuilds
 };
 
 #endif  // BESS_MODULES_EXACTMATCH_H_

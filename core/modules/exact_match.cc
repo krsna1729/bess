@@ -135,9 +135,9 @@ ExactMatch::GenerationPtr ExactMatch::Build(const std::vector<Rule> &rules,
   }
 
   for (const Rule &rule : rules) {
-    // Only validation failures are reported; a CuckooMap insert that runs out
-    // of slots is silent here, exactly as it was when rules were inserted into
-    // the live table.
+    // Validation failures and CuckooMap insertion failures (ENOSPC) both fail
+    // the build: a rule that is not in the table must not enter the rule list
+    // either.
     Error add_ret = gen->table.AddRule(rule.gate, rule.fields);
     if (add_ret.first) {
       *err = add_ret;

@@ -99,8 +99,11 @@ Both GCC and Clang CI jobs are expected to remain green. Each runs
 `./build.py bess`, `all_test --gtest_shuffle`, the benchmark smoke loop,
 `unittest discover`, and `run_module_tests.py`. Known timing-sensitive
 test flakes (not regressions -- do not chase): `CodelTest.*` under full-
-suite load, and `timestamp.py::test_timestamped_and_measured`'s 1%
-histogram self-consistency check under runner load (see entry 30).
+suite load, `timestamp.py::test_timestamped_and_measured`'s 1% histogram
+self-consistency check under runner load (see entry 30), and
+`TcpFlowReconstructTest.*` (seen once on 2026-09-19 under full-suite load:
+3 failures, then 3/3 passing with `--gtest_filter` and 185/185 on a rerun,
+with a working tree that touches neither the module nor its headers).
 
 **Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
 new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
@@ -1534,10 +1537,12 @@ rather than one call site).
       state may be partially restored" on error (`TODO(torek)`); a failed
       rebuild leaves the running configuration untouched and that TODO is gone.
 
-    Pre-existing quirks preserved rather than fixed: the "Invalid gate" EINVAL
+    Pre-existing quirk preserved rather than fixed: the "Invalid gate" EINVAL
     path is unreachable for `add`/`delete` because `gate_idx_t` truncates the
-    protobuf's uint32 gate before `is_valid_gate()` sees it, and a `CuckooMap`
-    insert that finds no free slot is still silent.
+    protobuf's uint32 gate before `is_valid_gate()` sees it. The one
+    behavioural change to old behavior is the insertion-failure report in the
+    follow-up below (a rule that could not be inserted used to be reported as
+    added).
 
     Acceptance evidence (live, pybess, one daemon, 4 workers, each
     `Source -> Rewrite -> the same ExactMatch`, matching IPv4 dst at offset 30,
