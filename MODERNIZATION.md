@@ -1624,6 +1624,53 @@ rather than one call site).
     Phase J step; these two implementations are what that extraction should be
     designed from.
 
+37. **`b14f431a`** — **Phase J: the snapshot/publication/reclamation mechanism,
+    extracted**. `IPLookup` and `ExactMatch` had grown the same writer protocol
+    and the same reader rule independently (entries 35 and 36); both now use
+    `bess::utils::PublishedGeneration<Generation>` (`core/utils/`), and their
+    own `Publish()`/members/duplicated drain loops are gone (241 insertions,
+    176 deletions across the two modules and the new header).
+
+    The class owns exactly three things, per the review's split: `Snapshot()`
+    (one acquisition per batch, held for the batch's duration); `Update(build)`
+    (serialize writers, ask the caller's builder for a replacement, publish it
+    with a release store); and the drain that follows (wait for the readers of
+    the retired generation to drop their snapshots, so the retired generation's
+    destructor runs on the control-plane thread, not on whichever packet worker
+    finishes its batch last). Construction stays in the modules -- replaying
+    routes into an `rte_lpm` with unique per-generation names, replaying
+    canonical rules plus resolved field specs into an `ExactMatchTable` -- so a
+    later QSBR backend can replace the shared class without forcing the two
+    modules into one table-building model.
+
+    One hardening while extracting: `Update()` hands the builder a
+    `const Generation &`, not a `shared_ptr`. A builder that kept a
+    `shared_ptr` would inflate the use count the drain loop waits on and stall
+    it forever; a reference makes that impossible rather than merely
+    documented. Builders that fail return `nullptr`, the installed generation
+    is left untouched, and each module keeps reporting its own error type.
+
+    Behavior-preserving, verified by re-running everything that covered the two
+    modules *before* the change (no new tests, no changed expectations):
+
+    | suite (all pre-existing) | result after extraction | before |
+    |---|---|---|
+    | `module_tests/exact_match.py` (sugar runner, CI path) | 6/6 OK | 6/6 OK |
+    | `module_tests/iplookup.py` (same) | 2/2 OK | 2/2 OK |
+    | ExactMatch metadata/canonicalization driver | all pass | all pass |
+    | ExactMatch semantics driver | all pass | all pass |
+    | ExactMatch 4-worker storm `min/p50` | 0.815, 0 drops | 0.816-0.884 |
+    | IPLookup single-worker control / updates | 0.950 / 0.887 | 0.933-0.949 / 0.898-0.907 |
+    | IPLookup 4-worker control / updates | 0.968 / 0.911 | 0.949 / 0.898 |
+
+    Daemon RSS stayed bounded in every run (tens of kB across hundreds of
+    retired generations), `core/all_test` is 185/185, and both modules compile
+    clean under the tree's `-Werror` set with g++ and clang++.
+
+    Next, and last for this phase: the `bessctl` command-thread-safety
+    metadata, so the capability these two modules now have is reachable through
+    `command module ...` rather than only through pybess/direct RPC.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -2879,13 +2926,13 @@ pointer, its three mutating commands are all `THREAD_UNSAFE`, the
 rebuild-and-swap cost is bounded, and `rte_fib` (Phase D, above) has
 native RCU support if the table migrates there anyway. `ExactMatch` is the
 natural second. Only after two modules work should this generalize into a
-`Module`-level contract. *(Status: both planned modules have landed and
-been reviewed -- `IPLookup` (entry 35, with its writer-side reclamation fix and
-single-/multi-reader validation) and `ExactMatch` (entry 36, including the
-review-follow-up fixes `a0688fcf`: metadata-field rebuilds, rule-list/table
-canonicalization, reported insertion failure). Next: extract the common
-snapshot/publication mechanism from the two implementations, and expose command
-thread-safety so `bessctl` pauses only for `THREAD_UNSAFE` commands.)* Explicitly **not** in scope for the first pass:
+`Module`-level contract. *(Status: both planned modules landed and were
+reviewed -- `IPLookup` (entry 35) and `ExactMatch` (entry 36, including the
+review-follow-up fixes `a0688fcf`) -- and the common
+snapshot/publication/reclamation mechanism is now extracted and shared (entry
+37). Next and last for this phase: expose command thread-safety so `bessctl`
+pauses only for `THREAD_UNSAFE` commands, instead of pausing `command module`
+unconditionally.)* Explicitly **not** in scope for the first pass:
 RCU-swapping the `ModuleGraph`, gate adjacency, or the traffic-class tree
 -- those are Phase G/H territory (live reconfiguration), not this phase's
 narrower table-update goal.
