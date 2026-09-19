@@ -1719,6 +1719,40 @@ rather than one call site).
     `cmdlist` entry is `None` and that both handlers are registered under
     their syntaxes.
 
+    Follow-up from review (`d2fe52f6`): three defects in the consumers of the
+    new metadata, one of them CI-confirmed.
+
+    - **pybess module construction was broken** by the cutover:
+      `setattr(self, cmd, ...)` passed the `CommandInfo` object instead of
+      `cmd.name`, so every pybess module construction raised
+      `TypeError: attribute name must be string, not 'CommandInfo'`. The claim
+      in this entry's first draft that ordinary pybess construction exercised
+      the new metadata end-to-end was wrong -- CI's sample configurations were
+      the first thing to run that path, and they caught it.
+    - **Gatehook resolution ignored direction.** Matching on `ogate` alone is
+      wrong for gate 0 specifically, because an unset oneof scalar reads as
+      0 there: a hook on an *input* gate looked like an output hook at gate 0.
+      Direction is now part of the identity (`in` -> `igate`, `out`/None ->
+      `ogate`, anything else refuses to guess), the match must be unique after
+      filtering on which field the oneof actually set, and the tests cover
+      in/out at gate 0, the pitfall case, nonzero gates, and the same hook
+      name on both directions.
+    - **The new test polluted `sys.path`** with an unnormalized
+      `bessctl/../pybess`, which `pybess/bess.py`'s plugin scanner then
+      visited twice, reporting duplicate protobuf definitions. The test uses
+      `SimpleNamespace` instead of protobufs and keeps only one normalized,
+      deduplicated path entry (needed solely because `commands.py` imports
+      its sibling `sugar` by name).
+
+    Evidence: the new `PybessWrapperTest` fails on the pre-fix code with the
+    exact CI error and passes after; `unittest discover` runs 98 tests with no
+    protobuf collision (the one remaining error is `test_samples`' subprocess
+    python lacking `grpc` -- environment, not code); module tests and the
+    metadata driver still pass; the live CLI acceptance re-run on a clean
+    daemon yields exactly four pauses -- one setup, none for the THREAD_SAFE
+    command, one each for the THREAD_UNSAFE, unknown, and unresolvable-gatehook
+    cases.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
