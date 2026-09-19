@@ -373,12 +373,12 @@ class FibTable {
 
   void LookupBatch(const uint32_t *keys, uint32_t *next_hops) {
     uint64_t hop64[kBatch];
-    // The API returns -EINVAL for bad arguments and 0 otherwise (it discards
-    // the internal lookup's count -- checked here, not assumed).
-    CHECK_EQ(rte_fib_lookup_bulk(fib_, const_cast<uint32_t *>(keys), hop64,
-                                 kBatch),
-             0)
-        << "rte_fib_lookup_bulk() failed: " << rte_strerror(rte_errno);
+    // The API returns -EINVAL for bad arguments and 0 otherwise, and does not
+    // set rte_errno on that path (checked in the DPDK source), so the message
+    // must come from the return value rather than a possibly stale errno.
+    const int ret =
+        rte_fib_lookup_bulk(fib_, const_cast<uint32_t *>(keys), hop64, kBatch);
+    CHECK_EQ(ret, 0) << "rte_fib_lookup_bulk() failed: " << rte_strerror(-ret);
     for (size_t i = 0; i < kBatch; i++) {
       next_hops[i] = static_cast<uint32_t>(hop64[i]);
     }
