@@ -123,7 +123,7 @@ CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
   if (gen == nullptr) {
     return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
   }
-  published_.Store(std::move(gen));
+  published_.Initialize(std::move(gen));
 
   return CommandSuccess();
 }
@@ -134,7 +134,7 @@ void IPLookup::DeInit() {
   // drain wait: the control plane pauses workers before deleting a module, so
   // nothing is mid-batch. If that ever stops holding, this needs an
   // Update()-style wait instead.
-  published_.Store(nullptr);
+  published_.ResetQuiesced();
 }
 
 void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {

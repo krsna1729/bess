@@ -197,7 +197,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
   if (gen == nullptr) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
-  published_.Store(std::move(gen));
+  published_.Initialize(std::move(gen));
 
   return CommandSuccess();
 }

@@ -62,11 +62,19 @@ class PublishedGeneration {
  public:
   using Ptr = std::shared_ptr<const Generation>;
 
-  // Installs a generation directly (Init()). Passing nullptr is only valid when
-  // no reader can be running -- module teardown, which BESS performs with
-  // workers paused; a replacement published by a command goes through Update().
-  void Store(Ptr gen) {
+  // Installs the first generation. Call during Init(), before any batch can
+  // snapshot; every later change goes through Update(), which is the only path
+  // that honors the drain protocol.
+  void Initialize(Ptr gen) {
     generation_.store(std::move(gen), std::memory_order_release);
+  }
+
+  // Drops the current generation without waiting for readers. Only valid when
+  // no reader can be running: BESS pauses workers before deleting a module, and
+  // this exists for exactly that teardown path. If readers can be live, use
+  // Update() instead.
+  void ResetQuiesced() {
+    generation_.store(nullptr, std::memory_order_release);
   }
 
   // One acquisition per batch. Hold the result for the batch's duration; it
