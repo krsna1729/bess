@@ -1281,6 +1281,78 @@ rather than one call site).
     unregister path is exercised, not just compiled. The eight regression
     runs all exited 0 with no coredumps.
 
+34. **`e55fb8a2`** — **`rte_fib` vs `rte_lpm`: experiment done, FIB not adopted**
+    (Phase D item; no module change). New `core/fib_bench.cc` compares the
+    exact code shapes `IPLookup` uses or would use -- `lpm_vec` (the
+    module's SSE byte-swap + `rte_lpm_lookupx4` path), `lpm_scalar` (its
+    tail path), and `fib_bulk` (`rte_fib_lookup_bulk` over raw
+    packet-order keys, FIB created with `RTE_FIB_F_LOOKUP_NETWORK_ORDER`,
+    i.e. no swap anywhere) -- over deterministic 1K/64K/512K-route tables
+    (mostly /24, mixed lengths, longer prefixes nested under earlier /24s),
+    measuring lookup throughput, build cost, EAL-heap footprint and
+    add/delete cost. Key conventions were settled against DPDK itself with
+    a standalone probe rather than by reading docs: rules go in as
+    `be32_t::value()` for both tables, and the network-order flag changes
+    only how the *lookup key* is addressed (`lib/fib/rte_fib.c`:
+    `dir24_8_get_lookup_fn(..., be_addr)`), so a FIB caller holding packet
+    headers needs no swap at all. Before any timing, every case
+    cross-checks the table against an independent longest-prefix match
+    computed in the benchmark; a disagreement aborts and prints the rules
+    that could explain both answers.
+
+    Lookup results (median of 3, this benchmark's thread-CPU-time counter,
+    CV <= 5%):
+
+    | benchmark             | 1K routes      | 64K routes     | 512K routes    |
+    |-----------------------|----------------|----------------|----------------|
+    | `BM_LookupLpmVec`     | 3.89 ns (257M) | 5.70 ns (176M) | 4.77 ns (210M) |
+    | `BM_LookupLpmScalar`  | 3.17 ns (315M) | 5.20 ns (192M) | 4.05 ns (247M) |
+    | `BM_LookupFib`        | 3.70 ns (270M) | 5.45 ns (184M) | not registered |
+
+    (Mpps in parentheses.) So FIB's lookup ties or very slightly beats the
+    module's current vector path (0.95-0.96x), while its *other* numbers are
+    much better: table build is 0.44/0.75 us per route at 1K/64K versus
+    0.67/5.56/40.6 us for LPM (LPM's per-route build cost rises with table
+    size, ~21 s to build 512K routes), and delete+add is 209/497 ns per
+    operation versus 549/8299 ns for LPM -- a 17x win at 64K, i.e. FIB is
+    dramatically better at exactly what a control plane with live route
+    updates needs. Footprint goes the other way: LPM 98 KB per route at 1K
+    (its fixed 64MB tbl24 dominating) down to 1.5 KB at 64K and 200 B at
+    512K; FIB 99 KB / 1.96 KB (about 28% larger at 64K).
+
+    Decision: **not adopted**, on correctness rather than speed. At 512K
+    routes, with rules inserted in the generator's arbitrary order -- the
+    order `IPLookup CommandAdd` permits, since a control plane may add a
+    /24 after a /28 under it -- `rte_fib` returned, for a key that both
+    `rte_lpm` and the independent reference resolve to a `/12` rule's next
+    hop, a next hop (7207) matching **no rule at all**. Deterministic (same
+    key, same value on repeated runs), independent of tbl8 sizing
+    (identical failure with a 4x larger pool), and gone when the same rule
+    set is inserted shortest-prefix-first -- while `rte_lpm` passes the
+    same gate in both orders. A minimal standalone reproducer was *not*
+    produced: the two-rule and four-rule nested cases (in both orders)
+    behave correctly, so the trigger needs something the larger mixed table
+    has; that is the open work, with the gate as its detector.
+    `BM_LookupFib` is therefore registered only up to 64K routes, with a
+    comment at the registration saying why and what to re-enable after a
+    DPDK fix, and `IPLookup` keeps `rte_lpm` -- which also settles the
+    table representation Phase J's live-update pilot should build on.
+
+    Side finding, recorded but deliberately not acted on: the *scalar* LPM
+    path beats the vector one by 15-19% at every size, so the module's
+    `VECTOR_OPTIMIZATION` SSE byte-swap block plus `rte_lpm_lookupx4` is a
+    pessimization -- in this harness. In the real module the four keys
+    arrive scattered in packet headers rather than in one contiguous array,
+    which is the case that block exists for, so measuring this needs a
+    NIC-backed workload.
+
+    Verified: `g++`/`clang++ -fsyntax-only` clean on the new file; a full
+    default run of `fib_bench` exits 0 with all registered cases passing
+    the correctness gate. The gate caught two real problems while this was
+    built, which is why it exists: first a key-convention mistake in the
+    harness itself (rules built in raw form, every lookup missing), then
+    the FIB behaviour above.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -1835,9 +1907,19 @@ predates this DPDK port and the packet-layout work.
       `IPLookup::ProcessBatch()`'s `_mm_set_epi32`/`_mm_shuffle_epi8`
       address gather (`core/modules/ip_lookup.cc`, see the `rte_fib` item
       below for a way to delete it outright rather than port it).
-- [ ] **Benchmark `rte_fib` vs `rte_lpm` for `IPLookup`** (DPDK-proposal
-      review, 2026-09-18) — the value here is a deletion, not necessarily
-      a speedup. Correction to the source proposal's own framing: BESS does
+- [x] **Benchmark `rte_fib` vs `rte_lpm` for `IPLookup` — done 2026-09-19,
+      entry 34 (`e55fb8a2`): FIB not adopted, so the deletion is *not*
+      available yet.** The SSE gather block stays and `IPLookup` keeps
+      `rte_lpm` (which also settles the table representation Phase J's
+      pilot should build on). Reason is correctness, not speed: at 512K
+      routes inserted in arbitrary order `rte_fib` returns next hops
+      matching no rule, order-dependently, while `rte_lpm` passes the same
+      independent-LPM gate in both orders; FIB's *build* and *update* costs
+      are dramatically better (17x cheaper delete+add at 64K), so if a DPDK
+      fix lands, re-enable the benchmark's 512K FIB case and revisit —
+      `core/fib_bench.cc` is the guard for that. Original scoping text
+      (DPDK-proposal review, 2026-09-18) — the value here is a deletion, not
+      necessarily a speedup. Correction to the source proposal's own framing: BESS does
       *not* hand-code the x4 lookup itself -- it already calls DPDK's own
       `rte_lpm_lookupx4()` (`core/modules/ip_lookup.cc`). What BESS *does*
       hand-code is the x86-only SSE **gather** feeding it (`_mm_set_epi32`
@@ -2768,7 +2850,11 @@ the rejected list for what's already been decided either way.
    (see Phase F's version-discipline note above).
 4. **DPDK BPF vs the FreeBSD JIT** — see Phase D above for full detail;
    listed here for backlog completeness.
-5. **`rte_fib` vs `rte_lpm`** — see Phase D above for full detail.
+5. **[x] `rte_fib` vs `rte_lpm` — done 2026-09-19, entry 34: FIB not
+   adopted** (order-dependent wrong answers at 512K routes; `rte_lpm`
+   stays, and `core/fib_bench.cc` is the guard for any future DPDK fix).
+   FIB remains tempting for update-heavy workloads: 0.75 vs 5.56 us per
+   route build at 64K, 497 vs 8299 ns per delete+add.
 6. **`MBUF_FAST_FREE` on/off** — needs a real NIC and (1); re-run after
    Phase B Stage 2 lands, since clones/external buffers can invalidate its
    preconditions.
