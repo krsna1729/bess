@@ -65,14 +65,16 @@
 //
 // Flags of this binary (stripped from argv before Google Benchmark parses
 // it):
-//   --lcore_mode=bess|register|none      default bess
+//   --lcore_mode=bess|register|none      default register
 //       bess:     `RTE_PER_LCORE(_lcore_id) = wid` -- BESS's mechanism up
 //                 to MODERNIZATION.md entry 33, kept as the "before" side
 //                 of this bench's own A/B; production no longer does this.
+//                 Note this mode is what a *pre-entry-33* bessd did, so it
+//                 is the control, not a supported configuration.
 //       register: rte_thread_register() -- what core/worker.cc does now
-//                 (entry 33), and what this axis existed to de-risk before
-//                 that commit. Note the registered *consumer* thread here
-//                 is Google Benchmark's main/EAL thread, which
+//                 (entry 33), and the default here so that an ordinary
+//                 run measures production. Note the registered *consumer*
+//                 thread here is Google Benchmark's main/EAL thread, which
 //                 rte_thread_register() merely re-labels from the EAL main
 //                 lcore to a fresh non-EAL lcore id; in bessd the
 //                 allocator's threads are spawned workers, so this
@@ -211,7 +213,11 @@ const char *const kBackendNames[kNumBackends] = {
 enum class LcoreMode { kBess, kRegister, kNone };
 enum class PinMode { kNone, kSmt, kCores, kNuma };
 
-LcoreMode g_lcore_mode = LcoreMode::kBess;
+// Default to what production does today (core/worker.cc registers worker
+// pthreads -- MODERNIZATION.md entry 33), so a default run -- including CI's
+// flagless smoke run -- exercises the shipped worker lifecycle rather than
+// the mechanism BESS used before the migration.
+LcoreMode g_lcore_mode = LcoreMode::kRegister;
 PinMode g_pin_mode = PinMode::kNone;
 int g_producer_cpu = -1;  // -1: leave the scheduler alone
 int g_consumer_cpu = -1;

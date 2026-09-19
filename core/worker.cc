@@ -306,7 +306,16 @@ void *Worker::Run(void *_arg) {
 
   CPU_ZERO(&set);
   CPU_SET(arg->core, &set);
-  rte_thread_set_affinity(&set);
+  // Checked, not best-effort: registration below captures this thread's
+  // cpuset and derives its NUMA/socket id from it. Silently continuing on
+  // failure (a restrictive cgroup/cpuset, a CPU that is not in the process
+  // mask) would leave the worker reporting core_ = arg->core while running
+  // somewhere else AND registering a socket that does not match where it
+  // runs -- i.e. it would pick the wrong PacketPool and key its mempool
+  // cache under a wrong lcore. Dying here is the lesser evil; rejecting the
+  // worker-creation RPC instead would be nicer, later.
+  CHECK_EQ(rte_thread_set_affinity(&set), 0)
+      << "failed to pin worker " << arg->wid << " to CPU " << arg->core;
 
   // Register this pthread as a non-EAL DPDK lcore. DPDK's per-lcore
   // machinery -- above all the default mempool cache that

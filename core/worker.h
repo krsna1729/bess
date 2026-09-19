@@ -47,15 +47,17 @@
 
 /*  TODO: worker threads doesn't necessarily be pinned to 1 core
  *
- *  n: kMaxWorkers
+ *  Three separate identities -- do NOT assume they are the same value:
  *
- *  Role              DPDK lcore ID      Hardware core(s)
- *  --------------------------------------------------------
- *  worker 0                      0      1 specified core
- *  worker 1                      1      1 specified core
- *  ...
- *  worker n-1                  n-1      1 specified core
- *  master          RTE_MAX_LCORE-1      all other cores that are allowed
+ *  BESS WorkerId   stable BESS logical identity (launch_worker()'s `wid`,
+ *                  [0, kMaxWorkers-1]; the index into `workers[]`)
+ *  CPU ID          the physical CPU the worker asked to be pinned to
+ *  DPDK lcore ID   dynamically allocated by rte_thread_register() at
+ *                  Worker::Run() time (see MODERNIZATION.md entry 33) --
+ *                  a re-created worker gets whatever id DPDK hands out
+ *                  next, so there is no wid == lcore_id mapping
+ *  master          RTE_MAX_LCORE-1 (EAL's main lcore; all other allowed
+ *                  cores, no registration)
  */
 
 typedef enum {
