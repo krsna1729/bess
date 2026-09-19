@@ -109,10 +109,21 @@ jobs:
         # binaries had never been exercised against the DPDK 25.11 port
         # at all before now. --benchmark_min_time is kept tiny so this
         # stays a fast smoke check, not a real measurement.
+        #
+        # `timeout` is load-bearing, not decoration: this list now contains
+        # an allocator benchmark that creates DPDK mempools, and a binary
+        # that hangs here would otherwise burn the job's whole 6-hour limit
+        # with no output saying which one did it (observed once, before
+        # this was added -- every step after it, including module tests,
+        # never ran). 120s is ~30x the slowest binary's observed runtime.
         run: |
           for b in *_bench; do
             echo "=== $b ==="
-            ./"$b" --benchmark_min_time=0.001s
+            timeout 120 ./"$b" --benchmark_min_time=0.001s || {
+              rc=$?
+              echo "::error::$b failed or timed out (status $rc)"
+              exit $rc
+            }
           done
 
       - name: Run bessctl/pybess unit tests (Python 3)
