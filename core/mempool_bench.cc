@@ -35,12 +35,14 @@
 //
 // Why a dedicated harness: BESS's packet pools are per-socket and shared by
 // every worker, while DPDK's mempool cache is per *lcore* -- keyed on
-// rte_lcore_id(), i.e. on the value BESS assigns in core/worker.cc:311
-// (`RTE_PER_LCORE(_lcore_id) = wid`). A packet can therefore be allocated
-// from one worker's cache, handed over a Queue, and freed into another
-// worker's cache. Neither the single-threaded pmd_bench EndToEnd variants
-// nor packet_bench can answer whether the current `ring_mp_mc` + cache 512
-// configuration is sensible for that; this binary can.
+// rte_lcore_id(), the id DPDK assigns when a worker pthread registers as a
+// non-EAL lcore (`rte_thread_register()`, core/worker.cc; before
+// MODERNIZATION.md entry 33 BESS wrote DPDK's private
+// RTE_PER_LCORE(_lcore_id) for the same purpose). A packet can therefore be
+// allocated from one worker's cache, handed over a Queue, and freed into
+// another worker's cache. Neither the single-threaded pmd_bench EndToEnd
+// variants nor packet_bench can answer whether the current `ring_mp_mc` +
+// cache 512 configuration is sensible for that; this binary can.
 //
 // Two families, deliberately different shapes:
 //   - BM_MempoolLocal: one thread, alloc-burst + free-burst of the same
@@ -64,12 +66,13 @@
 // Flags of this binary (stripped from argv before Google Benchmark parses
 // it):
 //   --lcore_mode=bess|register|none      default bess
-//       bess:     `RTE_PER_LCORE(_lcore_id) = wid` -- exactly what
-//                 core/worker.cc does today, so the sweep measures the
-//                 configuration BESS actually ships.
-//       register: rte_thread_register() -- the public DPDK API the lcore
-//                 decoupling would move to. Note the registered *consumer*
-//                 thread here is Google Benchmark's main/EAL thread, which
+//       bess:     `RTE_PER_LCORE(_lcore_id) = wid` -- BESS's mechanism up
+//                 to MODERNIZATION.md entry 33, kept as the "before" side
+//                 of this bench's own A/B; production no longer does this.
+//       register: rte_thread_register() -- what core/worker.cc does now
+//                 (entry 33), and what this axis existed to de-risk before
+//                 that commit. Note the registered *consumer* thread here
+//                 is Google Benchmark's main/EAL thread, which
 //                 rte_thread_register() merely re-labels from the EAL main
 //                 lcore to a fresh non-EAL lcore id; in bessd the
 //                 allocator's threads are spawned workers, so this
@@ -423,16 +426,17 @@ void PinCurrentThread(int cpu) {
 
 // Gives the calling thread whatever lcore identity --lcore_mode asks for,
 // and takes it back on scope exit. The lcore id is the key DPDK's default
-// mempool cache is stored under, so this is the axis the lcore decoupling
-// work will change; both ends of that change (BESS's manual assignment and
-// rte_thread_register()) are first-class here.
+// mempool cache is stored under, so this is the axis the lcore migration
+// (MODERNIZATION.md entry 33) was measured along; both ends of that change
+// (BESS's manual assignment and rte_thread_register()) stay first-class
+// here -- as a kept A/B, not as pending work.
 class LcoreScope {
  public:
   explicit LcoreScope(unsigned wid) {
     switch (g_lcore_mode) {
       case LcoreMode::kBess:
-        // core/worker.cc:311. A DPDK implementation detail, written from
-        // outside DPDK -- measured here precisely because it is what ships.
+        // What core/worker.cc did before entry 33: a DPDK implementation
+        // detail, written from outside DPDK. Kept as this bench's "before".
         RTE_PER_LCORE(_lcore_id) = wid;
         break;
       case LcoreMode::kRegister:

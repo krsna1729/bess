@@ -36,6 +36,7 @@
 
 #include <glog/logging.h>
 #include <rte_config.h>
+#include <rte_errno.h>
 #include <rte_lcore.h>
 
 #include <cassert>
@@ -307,10 +308,33 @@ void *Worker::Run(void *_arg) {
   CPU_SET(arg->core, &set);
   rte_thread_set_affinity(&set);
 
-  /* DPDK lcore ID == worker ID (0, 1, 2, 3, ...) */
-  RTE_PER_LCORE(_lcore_id) = arg->wid;
+  // Register this pthread as a non-EAL DPDK lcore. DPDK's per-lcore
+  // machinery -- above all the default mempool cache that
+  // rte_mempool_default_cache() keys on rte_lcore_id() -- needs a valid
+  // lcore id; without one every Packet allocation would silently bypass the
+  // per-core cache. This is DPDK's public API for exactly that; BESS used
+  // to poke DPDK's private TLS (RTE_PER_LCORE(_lcore_id) = arg->wid)
+  // instead -- see MODERNIZATION.md entry 33 (Phase C item).
+  //
+  // What this deliberately does *not* do is keep WorkerId and the lcore id
+  // equal: they are separate concepts now, and a re-created worker gets
+  // whatever id DPDK hands out next. Nothing may assume
+  // wid == rte_lcore_id() any more; arg->wid stays BESS's identity and
+  // arg->core stays the physical CPU.
+  //
+  // Order matters: registration captures the thread's cpuset and derives
+  // the NUMA/socket id from it, so the affinity call has to happen first.
+  //
+  // BESS's EAL configuration (core/dpdk.cc: --lcores 127@<all cpus>, main
+  // lcore 127) leaves lcores 0..126 free, so Worker::kMaxWorkers (64)
+  // workers always have one available. The CHECK is here so that a future
+  // EAL-config change fails loudly instead of silently degrading every
+  // worker's allocator to the cache-bypassing path.
+  CHECK_EQ(rte_thread_register(), 0)
+      << "rte_thread_register() failed for worker " << arg->wid << ": "
+      << rte_strerror(rte_errno);
+  const unsigned lcore_id = rte_lcore_id();
 
-  /* for workers, wid == rte_lcore_id() */
   wid_ = arg->wid;
   core_ = arg->core;
   socket_ = rte_socket_id();
@@ -340,7 +364,8 @@ void *Worker::Run(void *_arg) {
                          // instead of a global
 
   LOG(INFO) << "Worker " << wid_ << "(" << this << ") "
-            << "is running on core " << core_ << " (socket " << socket_ << ")";
+            << "is running on core " << core_ << " (socket " << socket_
+            << ", DPDK lcore " << lcore_id << ")";
 
   CPU_ZERO(&set);
   scheduler_->ScheduleLoop();
@@ -351,6 +376,11 @@ void *Worker::Run(void *_arg) {
 
   delete scheduler_;
   delete rand_;
+
+  // Release the lcore id last, after scheduler/TrafficClass teardown: that
+  // teardown can still free packets, and a free wants this worker's mempool
+  // cache context to put them back into.
+  rte_thread_unregister();
 
   return nullptr;
 }
