@@ -36,6 +36,8 @@
 
 #include <algorithm>
 #include <string>
+#include <thread>
+#include <utility>
 
 #include "../utils/bits.h"
 #include "../utils/ether.h"
@@ -111,6 +113,28 @@ IPLookup::GenerationPtr IPLookup::Build(const std::vector<Route> &routes,
   return gen;
 }
 
+void IPLookup::Publish(GenerationPtr next, const GenerationPtr &current) {
+  // Publish first: after this store, no new batch can acquire `current`, so
+  // only batches that snapshotted it before publication can still hold it.
+  table_.store(std::move(next), std::memory_order_release);
+
+  // Then wait for those to drain, so that *this* thread drops the last
+  // reference and therefore runs Generation::~Generation() ->
+  // rte_lpm_free() (a 64MB tbl24 plus DPDK's global tailq write lock) --
+  // rather than whichever packet worker happens to finish its batch last. An
+  // update must not move that cost onto the data path; the RPC waiting a
+  // little longer is the right side of that trade.
+  //
+  // The count only decreases once the atomic no longer points at `current`
+  // (no new references can be taken), so a stale read can only delay this
+  // loop by an iteration, never livelock it. Caller holds mutation_lock_,
+  // which also keeps rapid commands from retiring several generations at
+  // once.
+  while (current.use_count() != 1) {
+    std::this_thread::yield();
+  }
+}
+
 CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
   max_rules_ = arg.max_rules() ? arg.max_rules() : 1024;
   max_tbl8s_ = arg.max_tbl8s() ? arg.max_tbl8s() : 128;
@@ -127,7 +151,10 @@ CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
 
 void IPLookup::DeInit() {
   // Drop this module's current generation now; any retired generation still
-  // held by an in-flight batch releases itself when that batch finishes.
+  // held by an in-flight batch releases itself when that batch finishes. No
+  // drain wait here: the control plane pauses workers before deleting a
+  // module, so nothing is mid-batch. If that ever stops holding, this store
+  // needs `Publish()`'s draining instead.
   table_.store(nullptr);
 }
 
@@ -289,7 +316,7 @@ CommandResponse IPLookup::CommandAdd(
   if (next == nullptr) {
     return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
   }
-  table_.store(std::move(next), std::memory_order_release);
+  Publish(std::move(next), current);
 
   return CommandSuccess();
 }
@@ -327,7 +354,7 @@ CommandResponse IPLookup::CommandDelete(
   if (next == nullptr) {
     return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
   }
-  table_.store(std::move(next), std::memory_order_release);
+  Publish(std::move(next), current);
 
   return CommandSuccess();
 }
@@ -342,7 +369,7 @@ CommandResponse IPLookup::CommandClear(const bess::pb::EmptyArg &) {
   if (next == nullptr) {
     return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
   }
-  table_.store(std::move(next), std::memory_order_release);
+  Publish(std::move(next), current);
 
   return CommandSuccess();
 }

@@ -94,6 +94,13 @@ class IPLookup final : public Module {
   GenerationPtr Build(const std::vector<Route> &routes, gate_idx_t default_gate,
                       int *err);
 
+  // Publishes `next` and then waits for the readers of `current` to drain, so
+  // the retired generation is freed on this (control-plane) thread rather than
+  // on a packet worker. `current` must be the caller's only reference to the
+  // generation (the wait is until its use count drops to that one); caller
+  // holds mutation_lock_ too.
+  void Publish(GenerationPtr next, const GenerationPtr &current);
+
   ParsedPrefix ParseIpv4Prefix(const std::string &prefix, uint64_t prefix_len);
 
   // nullptr only before Init() and after DeInit().
