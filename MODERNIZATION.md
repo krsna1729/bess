@@ -29,9 +29,12 @@ propose it unprompted.
   sandbox. `pip3 install --break-system-packages --ignore-installed
   typing-extensions -r requirements.txt` gets scapy/flask/grpcio/protobuf;
   regenerate protobuf stubs with `./build.py protobuf` afterward.
-- **Commit author identity is wrong** (`root@PARAM.localdomain`, auto-set by
-  the harness). Not yet fixed — ask the user before amending anything, per
-  standing git-safety rules.
+- **Commit author identity**: the WSL sandbox auto-set a wrong identity
+  (`root@PARAM.localdomain`). Environment-specific -- on the Arch machine this
+  session moved to, commits are authored correctly (`Saikrishna Edupuganti
+  <6157640+krsna1729@users.noreply.github.com>`, entries 32/33), and `git
+  config user.*` is the thing to check rather than assume. Fixing history
+  would still need the user's go-ahead, per standing git-safety rules.
 - **`all_test` leaves SIGABRT cores in `coredumpctl` by design**: they are
   `BessdTest`'s `EXPECT_DEATH` children (7 statements in
   `core/bessd_test.cc`, covering pidfile/unique-instance error paths). The
@@ -1323,10 +1326,21 @@ it's a standing instruction from the user, not a one-time thing.
       g++ job passes; the clang++ job needed 9 real portability fixes
       (commit 13) before it did too. Matrix/caching/runner behavior
       confirmed working, not just the underlying `build.py`/`make`
-      invocations.
-- [ ] Commit author on all commits this session is `root@PARAM.localdomain`
-      — cosmetic, but ask the user before fixing (would require amending
-      already-pushed commits).
+      invocations. **Correction (2026-09-19, entry 33 session): the
+      "Smoke-test benchmarks" step is not a fast check on hosted runners.**
+      Completed runs measure it at 14.6-18.5 min (before the allocator
+      benchmark existed) and 19.1 min with it; the same loop takes 36 s
+      locally, 28 s of that `cuckoo_map_bench` alone. So the whole job's
+      ~26 min is dominated by the smoke step, and a *hang* there would have
+      looked exactly like ordinary slowness — `2a541ba7` added a 30-minute
+      per-binary `timeout` so a real hang names itself instead of eating the
+      6-hour job limit. If CI wall time ever matters, `cuckoo_map_bench` is
+      the first thing to look at, not the new benchmarks.
+- [x] Commit author identity — resolved by moving to a machine whose
+      `git config user.*` is correct (the `root@PARAM.localdomain` commits
+      were the WSL sandbox's; entries 32/33 are authored properly). Old
+      commits left as they are: amending pushed history still needs the
+      user's go-ahead, and the value is cosmetic.
 - [ ] `detach_all_worker_threads()` (added in `cfa82e3b`) abandons still
       actively-scheduling workers in the bare-`kill()`-without-pause-first
       shutdown case (not the normal `daemon stop` path, which pauses
