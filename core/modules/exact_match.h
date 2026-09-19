@@ -44,6 +44,7 @@
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../utils/exact_match_table.h"
+#include "../utils/published_generation.h"
 
 using google::protobuf::RepeatedPtrField;
 using bess::utils::ExactMatchField;
@@ -107,7 +108,7 @@ class ExactMatch final : public Module {
   // Turns a command argument into a `Rule`, validating gate and fields.
   Error RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg, Rule *rule);
   // Builds a generation for `rules`; nullptr with *err set on failure. Runs on
-  // the control plane, off the data path.
+  // the control plane under the writer lock, off the data path.
   GenerationPtr Build(const std::vector<Rule> &rules, gate_idx_t default_gate,
                       Error *err);
   // Applies the module's configured fields (fixed at Init() time; a table
@@ -119,13 +120,6 @@ class ExactMatch final : public Module {
   // existing key into the live table performed. Shared by the add command and
   // SetRuntimeConfig so both canonicalize identically.
   static void UpsertRule(std::vector<Rule> *rules, Rule rule);
-  // Publishes `next` and then waits for the readers of `current` to drain, so
-  // the retired generation is freed on this (control-plane) thread rather than
-  // on a packet worker. `current` must be the caller's only reference to the
-  // generation (the wait is until its use count drops to that one); caller
-  // holds mutation_lock_ too.
-  void Publish(GenerationPtr next, const GenerationPtr &current);
-
   // Field configuration, fixed at Init() time; every generation's table gets
   // it, so a rebuild reproduces the module's matching exactly.
   struct FieldSpec {
@@ -139,12 +133,13 @@ class ExactMatch final : public Module {
   std::vector<FieldSpec> field_specs_;
   bool empty_masks_;  // mainly for GetInitialArg
 
-  // Holds one published generation; `mutation_lock_` serializes rebuilds.
+  // Snapshot/publication/reclamation (bess::utils::PublishedGeneration): one
+  // snapshot per batch on the data path, serialized rebuilds off it, and the
+  // retired generation is destroyed here rather than on a packet worker.
   // Never null between Init() and module destruction: there is no DeInit()
   // (the generation is released with the module, workers already paused), and
   // every command publishes a replacement rather than clearing it.
-  std::atomic<GenerationPtr> generation_;
-  std::mutex mutation_lock_;  // serializes rule-table rebuilds
+  bess::utils::PublishedGeneration<Generation> published_;
 };
 
 #endif  // BESS_MODULES_EXACTMATCH_H_

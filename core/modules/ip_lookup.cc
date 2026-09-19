@@ -40,6 +40,7 @@
 #include <utility>
 
 #include "../utils/bits.h"
+#include "../utils/published_generation.h"
 #include "../utils/ether.h"
 #include "../utils/format.h"
 #include "../utils/ip.h"
@@ -113,28 +114,6 @@ IPLookup::GenerationPtr IPLookup::Build(const std::vector<Route> &routes,
   return gen;
 }
 
-void IPLookup::Publish(GenerationPtr next, const GenerationPtr &current) {
-  // Publish first: after this store, no new batch can acquire `current`, so
-  // only batches that snapshotted it before publication can still hold it.
-  table_.store(std::move(next), std::memory_order_release);
-
-  // Then wait for those to drain, so that *this* thread drops the last
-  // reference and therefore runs Generation::~Generation() ->
-  // rte_lpm_free() (a 64MB tbl24 plus DPDK's global tailq write lock) --
-  // rather than whichever packet worker happens to finish its batch last. An
-  // update must not move that cost onto the data path; the RPC waiting a
-  // little longer is the right side of that trade.
-  //
-  // The count only decreases once the atomic no longer points at `current`
-  // (no new references can be taken), so a stale read can only delay this
-  // loop by an iteration, never livelock it. Caller holds mutation_lock_,
-  // which also keeps rapid commands from retiring several generations at
-  // once.
-  while (current.use_count() != 1) {
-    std::this_thread::yield();
-  }
-}
-
 CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
   max_rules_ = arg.max_rules() ? arg.max_rules() : 1024;
   max_tbl8s_ = arg.max_tbl8s() ? arg.max_tbl8s() : 128;
@@ -144,7 +123,7 @@ CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
   if (gen == nullptr) {
     return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
   }
-  table_.store(std::move(gen));
+  published_.Store(std::move(gen));
 
   return CommandSuccess();
 }
@@ -152,10 +131,10 @@ CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
 void IPLookup::DeInit() {
   // Drop this module's current generation now; any retired generation still
   // held by an in-flight batch releases itself when that batch finishes. No
-  // drain wait here: the control plane pauses workers before deleting a
-  // module, so nothing is mid-batch. If that ever stops holding, this store
-  // needs `Publish()`'s draining instead.
-  table_.store(nullptr);
+  // drain wait: the control plane pauses workers before deleting a module, so
+  // nothing is mid-batch. If that ever stops holding, this needs an
+  // Update()-style wait instead.
+  published_.Store(nullptr);
 }
 
 void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
@@ -166,7 +145,7 @@ void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   // about routing updates. Holding the shared_ptr for the whole batch means a
   // concurrent command can neither free this table under an in-flight lookup
   // nor swap it mid-batch.
-  const GenerationPtr table = table_.load(std::memory_order_acquire);
+  const GenerationPtr table = published_.Snapshot();
   if (table == nullptr || table->lpm == nullptr) {
     return;  // not initialized, or already deinitialized
   }
@@ -285,38 +264,38 @@ CommandResponse IPLookup::CommandAdd(
     return CommandFailure(EINVAL, "Invalid gate: %hu", gate);
   }
 
-  std::lock_guard<std::mutex> lock(mutation_lock_);
-  const GenerationPtr current = table_.load(std::memory_order_acquire);
-  std::vector<Route> routes = current->routes;
-  gate_idx_t default_gate = current->default_gate;
+  int err = 0;
+  const bool published = published_.Update([&](const Generation &current) {
+    std::vector<Route> routes = current.routes;
+    gate_idx_t default_gate = current.default_gate;
 
-  if (prefix_len == 0) {
-    default_gate = gate;
-  } else {
-    const be32_t net_addr = std::get<2>(prefix);
-    // rte_lpm_add() overwrote the next hop of an existing prefix; mirror that
-    // semantics here rather than letting the route list accumulate duplicates
-    // (the table would end up right either way, but only the last one
-    // matters, and delete should remove "the" rule).
-    bool replaced = false;
-    for (Route &r : routes) {
-      if (r.prefix_len == prefix_len && r.prefix.value() == net_addr.value()) {
-        r.gate = gate;
-        replaced = true;
-        break;
+    if (prefix_len == 0) {
+      default_gate = gate;
+    } else {
+      const be32_t net_addr = std::get<2>(prefix);
+      // rte_lpm_add() overwrote the next hop of an existing prefix; mirror
+      // that semantics here rather than letting the route list accumulate
+      // duplicates (the table would end up right either way, but only the last
+      // one matters, and delete should remove "the" rule).
+      bool replaced = false;
+      for (Route &r : routes) {
+        if (r.prefix_len == prefix_len &&
+            r.prefix.value() == net_addr.value()) {
+          r.gate = gate;
+          replaced = true;
+          break;
+        }
+      }
+      if (!replaced) {
+        routes.push_back({net_addr, static_cast<uint8_t>(prefix_len), gate});
       }
     }
-    if (!replaced) {
-      routes.push_back({net_addr, static_cast<uint8_t>(prefix_len), gate});
-    }
-  }
 
-  int err = 0;
-  GenerationPtr next = Build(routes, default_gate, &err);
-  if (next == nullptr) {
+    return Build(routes, default_gate, &err);
+  });
+  if (!published) {
     return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
   }
-  Publish(std::move(next), current);
 
   return CommandSuccess();
 }
@@ -330,46 +309,50 @@ CommandResponse IPLookup::CommandDelete(
                           std::get<1>(prefix).c_str());
   }
 
-  std::lock_guard<std::mutex> lock(mutation_lock_);
-  const GenerationPtr current = table_.load(std::memory_order_acquire);
-  std::vector<Route> routes = current->routes;
-  gate_idx_t default_gate = current->default_gate;
+  int err = 0;
+  bool missing = false;
+  const bool published =
+      published_.Update([&](const Generation &current) -> GenerationPtr {
+    std::vector<Route> routes = current.routes;
+    gate_idx_t default_gate = current.default_gate;
 
-  if (prefix_len == 0) {
-    default_gate = DROP_GATE;
-  } else {
-    const be32_t net_addr = std::get<2>(prefix);
-    auto it = std::find_if(routes.begin(), routes.end(), [&](const Route &r) {
-      return r.prefix_len == prefix_len && r.prefix.value() == net_addr.value();
-    });
-    if (it == routes.end()) {
+    if (prefix_len == 0) {
+      default_gate = DROP_GATE;
+    } else {
+      const be32_t net_addr = std::get<2>(prefix);
+      auto it = std::find_if(routes.begin(), routes.end(), [&](const Route &r) {
+        return r.prefix_len == prefix_len &&
+               r.prefix.value() == net_addr.value();
+      });
+      if (it == routes.end()) {
+        missing = true;
+        return nullptr;
+      }
+      routes.erase(it);
+    }
+
+    return Build(routes, default_gate, &err);
+  });
+  if (!published) {
+    if (missing) {
       // What rte_lpm_delete() reported before this became copy-on-write.
       return CommandFailure(ENOENT, "no such rule");
     }
-    routes.erase(it);
-  }
-
-  int err = 0;
-  GenerationPtr next = Build(routes, default_gate, &err);
-  if (next == nullptr) {
     return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
   }
-  Publish(std::move(next), current);
 
   return CommandSuccess();
 }
 
 CommandResponse IPLookup::CommandClear(const bess::pb::EmptyArg &) {
-  std::lock_guard<std::mutex> lock(mutation_lock_);
-  const GenerationPtr current = table_.load(std::memory_order_acquire);
-
   // Rules go, the default gate stays -- what rte_lpm_delete_all() did.
   int err = 0;
-  GenerationPtr next = Build(/*routes=*/{}, current->default_gate, &err);
-  if (next == nullptr) {
+  const bool published = published_.Update([&](const Generation &current) {
+    return Build(/*routes=*/{}, current.default_gate, &err);
+  });
+  if (!published) {
     return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
   }
-  Publish(std::move(next), current);
 
   return CommandSuccess();
 }

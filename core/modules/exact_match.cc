@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "../utils/endian.h"
+#include "../utils/published_generation.h"
 #include "../utils/format.h"
 
 // XXX: this is repeated in many modules. get rid of them when converting .h to
@@ -165,28 +166,6 @@ void ExactMatch::UpsertRule(std::vector<Rule> *rules, Rule rule) {
   rules->push_back(std::move(rule));
 }
 
-void ExactMatch::Publish(GenerationPtr next, const GenerationPtr &current) {
-  // Publish first: after this store, no new batch can acquire `current`, so
-  // only batches that snapshotted it before publication can still hold it.
-  generation_.store(std::move(next), std::memory_order_release);
-
-  // Then wait for those to drain, so that *this* thread drops the last
-  // reference and therefore runs the retired generation's destructor -- the
-  // whole cuckoo table's storage -- rather than whichever packet worker
-  // happens to finish its batch last. An update must not move that cost onto
-  // the data path; the RPC waiting a little longer is the right side of that
-  // trade.
-  //
-  // The count only decreases once the atomic no longer points at `current`
-  // (no new references can be taken), so a stale read can only delay this
-  // loop by an iteration, never livelock it. Caller holds mutation_lock_,
-  // which also keeps rapid commands from retiring several generations at
-  // once.
-  while (current.use_count() != 1) {
-    std::this_thread::yield();
-  }
-}
-
 CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
   empty_masks_ = arg.masks_size() == 0;
   if (arg.fields_size() != arg.masks_size() && !empty_masks_) {
@@ -218,7 +197,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
   if (gen == nullptr) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
-  generation_.store(std::move(gen));
+  published_.Store(std::move(gen));
 
   return CommandSuccess();
 }
@@ -227,7 +206,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
 CommandResponse ExactMatch::GetInitialArg(const bess::pb::EmptyArg &) {
   bess::pb::ExactMatchArg r;
 
-  const GenerationPtr gen = generation_.load();
+  const GenerationPtr gen = published_.Snapshot();
   for (size_t i = 0; i < gen->table.num_fields(); i++) {
     const ExactMatchField &f = gen->table.get_field(i);
     bess::pb::Field *ret_field = r.add_fields();
@@ -257,7 +236,7 @@ CommandResponse ExactMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
   bess::pb::ExactMatchConfig r;
   using rule_t = bess::pb::ExactMatchCommandAddArg;
 
-  const GenerationPtr gen = generation_.load();
+  const GenerationPtr gen = published_.Snapshot();
   r.set_default_gate(gen->default_gate);
   for (const Rule &rule : gen->rules) {
     rule_t *out = r.add_rules();
@@ -317,9 +296,6 @@ Error ExactMatch::RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg,
 // state, which is what the old in-place version had to warn about.
 CommandResponse ExactMatch::SetRuntimeConfig(
     const bess::pb::ExactMatchConfig &arg) {
-  std::lock_guard<std::mutex> guard(mutation_lock_);
-  const GenerationPtr current = generation_.load();
-
   std::vector<Rule> rules;
   rules.reserve(arg.rules_size());
   for (auto i = 0; i < arg.rules_size(); i++) {
@@ -335,11 +311,12 @@ CommandResponse ExactMatch::SetRuntimeConfig(
   }
 
   Error err;
-  GenerationPtr next = Build(rules, arg.default_gate(), &err);
-  if (next == nullptr) {
+  const bool published = published_.Update([&](const Generation &) {
+    return Build(rules, arg.default_gate(), &err);
+  });
+  if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
-  Publish(std::move(next), current);
 
   return CommandSuccess();
 }
@@ -349,7 +326,7 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
   // One snapshot for the whole batch: a concurrent command can neither swap
   // the table mid-batch nor free it under this lookup.
-  const GenerationPtr gen = generation_.load();
+  const GenerationPtr gen = published_.Snapshot();
   const auto &table = gen->table;
   const gate_idx_t default_gate = gen->default_gate;
 
@@ -370,7 +347,7 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 }
 
 std::string ExactMatch::GetDesc() const {
-  const GenerationPtr gen = generation_.load();
+  const GenerationPtr gen = published_.Snapshot();
   return bess::utils::Format("%zu fields, %zu rules", gen->table.num_fields(),
                              gen->table.Size());
 }
@@ -407,33 +384,27 @@ Error ExactMatch::RuleFieldsFromPb(
 
 CommandResponse ExactMatch::CommandAdd(
     const bess::pb::ExactMatchCommandAddArg &arg) {
-  std::lock_guard<std::mutex> guard(mutation_lock_);
-  const GenerationPtr current = generation_.load();
-
   Rule rule;
   Error ret = RuleFromPb(arg, &rule);
   if (ret.first) {
     return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
 
-  std::vector<Rule> rules = current->rules;
-  UpsertRule(&rules, std::move(rule));
-
   Error err;
-  GenerationPtr next = Build(rules, current->default_gate, &err);
-  if (next == nullptr) {
+  const bool published = published_.Update([&](const Generation &current) {
+    std::vector<Rule> rules = current.rules;
+    UpsertRule(&rules, rule);
+    return Build(rules, current.default_gate, &err);
+  });
+  if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
-  Publish(std::move(next), current);
 
   return CommandSuccess();
 }
 
 CommandResponse ExactMatch::CommandDelete(
     const bess::pb::ExactMatchCommandDeleteArg &arg) {
-  std::lock_guard<std::mutex> guard(mutation_lock_);
-  const GenerationPtr current = generation_.load();
-
   if (arg.fields_size() == 0) {
     return CommandFailure(EINVAL, "argument must be a list");
   }
@@ -444,57 +415,57 @@ CommandResponse ExactMatch::CommandDelete(
     return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
 
-  std::vector<Rule> rules;
-  rules.reserve(current->rules.size());
-  bool found = false;
-  for (const Rule &r : current->rules) {
-    if (r.fields == fields) {
-      found = true;
-      continue;
-    }
-    rules.push_back(r);
-  }
-  if (!found) {
-    return CommandFailure(ENOENT, "rule doesn't exist");
-  }
-
   Error err;
-  GenerationPtr next = Build(rules, current->default_gate, &err);
-  if (next == nullptr) {
+  bool found = false;
+  const bool published =
+      published_.Update([&](const Generation &current) -> GenerationPtr {
+        std::vector<Rule> rules;
+        rules.reserve(current.rules.size());
+        for (const Rule &r : current.rules) {
+          if (r.fields == fields) {
+            found = true;
+            continue;
+          }
+          rules.push_back(r);
+        }
+        if (!found) {
+          return nullptr;
+        }
+        return Build(rules, current.default_gate, &err);
+      });
+  if (!published) {
+    if (!found) {
+      return CommandFailure(ENOENT, "rule doesn't exist");
+    }
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
-  Publish(std::move(next), current);
 
   return CommandSuccess();
 }
 
 CommandResponse ExactMatch::CommandClear(const bess::pb::EmptyArg &) {
-  std::lock_guard<std::mutex> guard(mutation_lock_);
-  const GenerationPtr current = generation_.load();
-
   // Rules go, the default gate stays -- what ClearRules() did to the live
   // table.
   Error err;
-  GenerationPtr next = Build(/*rules=*/{}, current->default_gate, &err);
-  if (next == nullptr) {
+  const bool published = published_.Update([&](const Generation &current) {
+    return Build(/*rules=*/{}, current.default_gate, &err);
+  });
+  if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
-  Publish(std::move(next), current);
 
   return CommandSuccess();
 }
 
 CommandResponse ExactMatch::CommandSetDefaultGate(
     const bess::pb::ExactMatchCommandSetDefaultGateArg &arg) {
-  std::lock_guard<std::mutex> guard(mutation_lock_);
-  const GenerationPtr current = generation_.load();
-
   Error err;
-  GenerationPtr next = Build(current->rules, arg.gate(), &err);
-  if (next == nullptr) {
+  const bool published = published_.Update([&](const Generation &current) {
+    return Build(current.rules, arg.gate(), &err);
+  });
+  if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
-  Publish(std::move(next), current);
 
   return CommandSuccess();
 }

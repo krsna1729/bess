@@ -40,6 +40,7 @@
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../utils/endian.h"
+#include "../utils/published_generation.h"
 
 using bess::utils::be32_t;
 using ParsedPrefix = std::tuple<int, std::string, be32_t>;
@@ -89,23 +90,17 @@ class IPLookup final : public Module {
   using GenerationPtr = std::shared_ptr<const Generation>;
 
   // Builds a generation from `routes`, or returns nullptr with `*err` set to
-  // the errno a caller can report. Called with `mutation_lock_` held, or
-  // before the module is running.
+  // the errno a caller can report. Called with the writer lock held, or before
+  // the module is running.
   GenerationPtr Build(const std::vector<Route> &routes, gate_idx_t default_gate,
                       int *err);
 
-  // Publishes `next` and then waits for the readers of `current` to drain, so
-  // the retired generation is freed on this (control-plane) thread rather than
-  // on a packet worker. `current` must be the caller's only reference to the
-  // generation (the wait is until its use count drops to that one); caller
-  // holds mutation_lock_ too.
-  void Publish(GenerationPtr next, const GenerationPtr &current);
-
   ParsedPrefix ParseIpv4Prefix(const std::string &prefix, uint64_t prefix_len);
 
-  // nullptr only before Init() and after DeInit().
-  std::atomic<GenerationPtr> table_;
-  std::mutex mutation_lock_;  // serializes routing-command rebuilds
+  // Snapshot/publication/reclamation (bess::utils::PublishedGeneration): one
+  // snapshot per batch on the data path, serialized rebuilds off it, and the
+  // retired generation is destroyed here rather than on a packet worker.
+  bess::utils::PublishedGeneration<Generation> published_;
   uint32_t max_rules_ = 0;    // from Init(), reused for every rebuild
   uint32_t max_tbl8s_ = 0;
 };
