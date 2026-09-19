@@ -184,8 +184,14 @@ class ExactMatchTable {
       return err;
     }
 
-    table_.Insert(key, val, ExactMatchKeyHash(total_key_size_),
-                  ExactMatchKeyEq(total_key_size_));
+    if (table_.Insert(key, val, ExactMatchKeyHash(total_key_size_),
+                      ExactMatchKeyEq(total_key_size_)) == nullptr) {
+      // CuckooMap::Insert() gives up after excessive hash collisions. Report
+      // it: a rule that is not in the table must not be reported as added by
+      // the caller's source of truth either.
+      return MakeError(ENOSPC,
+                       "table is full (excessive hash collisions)");
+    }
 
     return MakeError(0);
   }
@@ -313,6 +319,20 @@ class ExactMatchTable {
     return DoAddField(f, mt_attr_name, idx, m);
   }
 
+  // Set the `idx`th field of this table to one at the offset of an
+  // already-registered metadata attribute `attr_id` (as returned by
+  // Module::AddMetadataAttr()). Unlike the overload above, this registers
+  // nothing with the module: the caller resolves the attribute once and can
+  // then configure any number of tables with it, which is what rebuilding a
+  // table needs -- registering the same attribute twice fails with EEXIST.
+  // Returns 0 on success, non-zero errno on failure.
+  Error AddResolvedAttrField(int attr_id, int size, uint64_t mask, int idx) {
+    promise(attr_id >= 0);
+    ExactMatchField f = {
+        .mask = mask, .attr_id = attr_id, .offset = 0, .pos = 0, .size = size};
+    return DoAddField(f, "", idx, nullptr, /*attr_resolved=*/true);
+  }
+
   size_t num_fields() const { return num_fields_; }
 
   // Returns the ith field.
@@ -387,10 +407,12 @@ class ExactMatchTable {
   // If `mt_attr_name` is set, the `offset` field of `field` will be ignored and
   // the inserted field will use the offset of `mt_attr_name` as reported by the
   // module `m`.
+  // With `attr_resolved`, `field.attr_id` is used as-is (the caller registered
+  // it already) and neither `m` nor `mt_attr_name` is consulted.
   // Returns 0 on success, non-zero errno on failure.
   Error DoAddField(const ExactMatchField &field,
                    const std::string &mt_attr_name, int idx,
-                   Module *m = nullptr) {
+                   Module *m = nullptr, bool attr_resolved = false) {
     if (idx >= MAX_FIELDS) {
       return MakeError(EINVAL,
                        Format("idx %d is not in [0,%d)", idx, MAX_FIELDS));
@@ -409,7 +431,16 @@ class ExactMatchTable {
     // lets the compiler actually prove m is non-null here instead of
     // just trusting that correlation, which newer GCC's -Wnonnull no
     // longer does across the inlined call.
-    if (m != nullptr) {
+    if (attr_resolved) {
+      // The attribute is already registered for this module; re-registering
+      // would fail with EEXIST, which is exactly what rebuilding a table must
+      // not do.
+      f->attr_id = field.attr_id;
+      if (f->attr_id < 0) {
+        return MakeError(EINVAL,
+                         Format("idx %d: attr id must be already resolved", idx));
+      }
+    } else if (m != nullptr) {
       f->attr_id = m->AddMetadataAttr(mt_attr_name, f->size,
                                       metadata::Attribute::AccessMode::kRead);
       if (f->attr_id < 0) {

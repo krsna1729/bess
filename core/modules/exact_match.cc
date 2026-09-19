@@ -77,10 +77,19 @@ CommandResponse ExactMatch::AddFieldOne(const bess::pb::Field &field,
   FieldSpec spec;
   spec.size = size;
   spec.mask = mask64;
+  spec.attr_id = -1;
   if (field.position_case() == bess::pb::Field::kAttrName) {
     spec.by_offset = false;
     spec.attr_name = field.attr_name();
     spec.offset = 0;
+    // Resolve (register) the attribute here, once per module -- not per
+    // generation: a rebuild that re-registered it would fail with EEXIST.
+    spec.attr_id = AddMetadataAttr(
+        spec.attr_name, size, bess::metadata::Attribute::AccessMode::kRead);
+    if (spec.attr_id < 0) {
+      return CommandFailure(-spec.attr_id,
+                            "idx %d: add_metadata_attr() failed", idx);
+    }
   } else if (field.position_case() == bess::pb::Field::kOffset) {
     spec.by_offset = true;
     spec.offset = field.offset();
@@ -104,7 +113,7 @@ Error ExactMatch::ApplyFields(ExactMatchTable<gate_idx_t> *table) {
     if (spec.by_offset) {
       ret = table->AddField(spec.offset, spec.size, spec.mask, i);
     } else {
-      ret = table->AddField(this, spec.attr_name, spec.size, spec.mask, i);
+      ret = table->AddResolvedAttrField(spec.attr_id, spec.size, spec.mask, i);
     }
     if (ret.first) {
       return ret;
@@ -136,8 +145,24 @@ ExactMatch::GenerationPtr ExactMatch::Build(const std::vector<Rule> &rules,
     }
   }
 
+  // Canonicalized by the callers, so the source of truth and the table must
+  // agree rule for rule. This is the regression invariant for that.
+  CHECK_EQ(gen->table.Size(), rules.size());
+
   gen->rules = rules;
   return gen;
+}
+
+void ExactMatch::UpsertRule(std::vector<Rule> *rules, Rule rule) {
+  for (Rule &r : *rules) {
+    // Same match values: overwrite the gate, the way inserting the same key
+    // into the live table did.
+    if (r.fields == rule.fields) {
+      r.gate = rule.gate;
+      return;
+    }
+  }
+  rules->push_back(std::move(rule));
 }
 
 void ExactMatch::Publish(GenerationPtr next, const GenerationPtr &current) {
@@ -303,7 +328,10 @@ CommandResponse ExactMatch::SetRuntimeConfig(
     if (ret.first) {
       return CommandFailure(ret.first, "%s", ret.second.c_str());
     }
-    rules.push_back(std::move(rule));
+    // Duplicates in the argument collapse to one rule with the last gate,
+    // which is what inserting them into the table did -- and keeps the rule
+    // list from disagreeing with the table.
+    UpsertRule(&rules, std::move(rule));
   }
 
   Error err;
@@ -389,19 +417,7 @@ CommandResponse ExactMatch::CommandAdd(
   }
 
   std::vector<Rule> rules = current->rules;
-  bool replaced = false;
-  for (Rule &r : rules) {
-    // Same match values: overwrite the gate, the way inserting the same key
-    // into the live table did.
-    if (r.fields == rule.fields) {
-      r.gate = rule.gate;
-      replaced = true;
-      break;
-    }
-  }
-  if (!replaced) {
-    rules.push_back(std::move(rule));
-  }
+  UpsertRule(&rules, std::move(rule));
 
   Error err;
   GenerationPtr next = Build(rules, current->default_gate, &err);

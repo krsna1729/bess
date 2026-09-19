@@ -111,8 +111,14 @@ class ExactMatch final : public Module {
   GenerationPtr Build(const std::vector<Rule> &rules, gate_idx_t default_gate,
                       Error *err);
   // Applies the module's configured fields (fixed at Init() time; a table
-  // starts out empty) to `table`.
+  // starts out empty) to `table`. Metadata attributes were resolved once at
+  // Init(); this only configures the table, never registers anything.
   Error ApplyFields(ExactMatchTable<gate_idx_t> *table);
+  // Inserts `rule` into `rules` or, if a rule with the same match values is
+  // already there, overwrites its gate -- the same operation inserting an
+  // existing key into the live table performed. Shared by the add command and
+  // SetRuntimeConfig so both canonicalize identically.
+  static void UpsertRule(std::vector<Rule> *rules, Rule rule);
   // Publishes `next` and then waits for the readers of `current` to drain, so
   // the retired generation is freed on this (control-plane) thread rather than
   // on a packet worker. `current` must be the caller's only reference to the
@@ -125,7 +131,8 @@ class ExactMatch final : public Module {
   struct FieldSpec {
     bool by_offset;
     int offset;             // valid when by_offset
-    std::string attr_name;  // otherwise
+    std::string attr_name;  // otherwise (for GetInitialArg)
+    int attr_id;            // resolved once at Init() when !by_offset
     int size;
     uint64_t mask;
   };

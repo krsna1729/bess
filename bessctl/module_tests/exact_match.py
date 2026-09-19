@@ -157,6 +157,59 @@ class BessExactMatchTest(BessModuleTestCase):
         #    '\nmut state:', cur_config, 'expecting:', expect_config)
         assert arg == iconf and cur_config == expect_config
 
+    def test_exactmatch_metadata_field_survives_updates(self):
+        """An attr_name field must survive table rebuilds.
+
+        Regression: every mutating command rebuilt the table by calling
+        Module::AddMetadataAttr() again for the metadata field, which fails
+        with EEXIST -- so the first add/delete/clear/set_default_gate/
+        set_runtime_config after Init failed for any ExactMatch matching on
+        metadata. Each of the commands below is such a rebuild.
+        """
+        em = ExactMatch(
+            fields=[{'attr_name': 'phase_j_meta', 'num_bytes': 2}])
+
+        em.add(fields=[{'value_bin': b'\x88\x80'}], gate=1)
+        em.add(fields=[{'value_bin': b'\x88\x80'}], gate=2)  # upsert, one rule
+        em.set_default_gate(gate=3)
+        em.set_runtime_config(
+            default_gate=2,
+            rules=[{'gate': 1, 'fields': [{'value_bin': b'\x88\x80'}]}])
+        em.delete(fields=[{'value_bin': b'\x88\x80'}])
+        em.clear()
+
+        config = pb_conv.protobuf_to_dict(em.get_runtime_config())
+        # protobuf_to_dict omits empty repeated fields
+        assert config['default_gate'] == 2, config
+        assert config.get('rules', []) == [], config
+        self.assertBessAlive()
+
+    def test_exactmatch_setconfig_dedups_duplicate_rules(self):
+        """Duplicate rules in set_runtime_config collapse to one, last wins.
+
+        The stored rule list is what rebuilds replay, so it must be canonical:
+        the table it produces holds one entry per match value.
+        """
+        em = ExactMatch(fields=[{'offset': 26, 'num_bytes': 4}])
+        field = {'value_bin': socket.inet_aton('1.2.3.4')}
+
+        em.set_runtime_config(
+            default_gate=0,
+            rules=[{'gate': 1, 'fields': [field]},
+                   {'gate': 2, 'fields': [field]}])
+
+        config = pb_conv.protobuf_to_dict(em.get_runtime_config())
+        assert len(config['rules']) == 1, config
+        assert config['rules'][0]['gate'] == 2, config
+
+        # The surviving rule is a real table entry, and delete removes it once.
+        em.delete(fields=[field])
+        config = pb_conv.protobuf_to_dict(em.get_runtime_config())
+        assert config.get('rules', []) == [], config
+        with self.assertRaises(bess.Error):
+            em.delete(fields=[field])
+
+
 suite = unittest.TestLoader().loadTestsFromTestCase(BessExactMatchTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)
 
