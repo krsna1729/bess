@@ -32,6 +32,25 @@ propose it unprompted.
 - **Commit author identity is wrong** (`root@PARAM.localdomain`, auto-set by
   the harness). Not yet fixed — ask the user before amending anything, per
   standing git-safety rules.
+- **Building/testing on a rolling-release host** (Arch, g++ 16, glibc 2.42+,
+  glog 0.7, protobuf 36, grpc 1.83 — verified 2026-09-19, entry 32) needs
+  build-flag workarounds only, no source changes:
+  `-DGLOG_USE_GLOG_EXPORT` (glog >= 0.7's headers refuse to compile without
+  it and Arch's `libglog.pc` does not supply the define);
+  `-include cinttypes` (libstdc++ 16 no longer provides `PRIxPTR`
+  transitively, which `core/memory.cc` relies on); `BESS_LINK_DYNAMIC=1`
+  (Arch's `grpc++.pc` lists `-labsl_strerror`, absent from Arch's abseil
+  package). g++ 16 additionally promotes three pre-existing warning classes
+  to errors under the tree's `-Werror` (`Any::PackFrom`/`UnpackTo` are
+  `[[nodiscard]]` since protobuf 4, `LOG(FATAL)` is no longer treated as
+  noreturn, a few unused variables), so a local build needs `-Wno-error=...`
+  for those or `-w`. CI's Ubuntu 24.04 toolchain is unaffected — these are
+  local-build notes, not repo bugs. `all_test` also needs gtest *sources*
+  (`/usr/src/gtest` ships them on Ubuntu; Arch does not): point `GTEST_DIR`
+  at a googletest checkout whose headers match what the test TUs will
+  include, or the link fails on `AssertHelper`'s `string_view` ctor.
+  `bessctl/run_module_tests.py` needs root (the daemon refuses otherwise) —
+  the CI runners have it, an unprivileged session does not.
 
 ## How to build and verify (the loop this session used)
 
@@ -1036,6 +1055,153 @@ rather than one call site).
     restored with `sysctl -w vm.nr_hugepages=512` (then 512/512 free);
     if a future session sees Total 0, that sysctl is the fix, not daemon
     archaeology.
+32. **`5ee632f1`** — **mempool backend/cache/worker-topology benchmark**
+    (benchmark-backlog item 3; the allocator half of the plan `pmd_bench.cc`
+    documents for the PMD boundary, after the `DumpMempool()` fix in entry
+    31). New `core/mempool_bench.cc`; no production file touched.
+
+    Two families: **local** (one thread, alloc-burst + free-burst of the
+    same packets) and **pipeline** (a producer thread allocates and
+    enqueues on an `rte_ring` in `Queue`'s exact MP-enqueue/SC-dequeue burst
+    mode; the benchmark thread dequeues and frees -- the minimal
+    `Source -> Queue -> Sink` shape, ring inside the timed region). Sweeps
+    DPDK's five registered backends (`ring_mp_mc`, `ring_mt_rts`,
+    `ring_mt_hts`, `stack`, `lf_stack`) x cache size (0/32/128/512) x batch
+    (1/8/32), plus the two axes the plan needs:
+
+    - `--pin=none|smt|cores|numa`: placement from sysfs topology, restricted
+      to the process mask, chosen CPUs logged and reported per case; an
+      unsatisfiable request is a hard failure, never a silent fallback (a
+      run must not report cross-node numbers it did not measure).
+    - `--lcore_mode=bess|register|none`: BESS's manual
+      `RTE_PER_LCORE(_lcore_id) = wid` (`core/worker.cc:311`) vs
+      `rte_thread_register()` vs no lcore id at all. This axis is the
+      regression test for the planned WorkerId/lcore decoupling.
+
+    Metrics: wall-clock `pkt_per_s`, per-thread busy fractions, per-worker
+    **default-cache occupancy** (read from the public `struct rte_mempool`'s
+    `local_cache[].len`), and an epoch-boundary assertion that
+    `rte_mempool_avail_count() == capacity` -- a packet stranded in use
+    fails the run instead of shifting the next epoch's workload.
+
+    Two things found while building it, both relevant beyond this
+    experiment:
+
+    - **`rte_mempool_avail_count()` counts the default per-lcore caches**
+      (DPDK 25.11 `rte_mempool.c`: backend count + every
+      `local_cache[lcore].len`, clamped to `size`). So the `show system
+      packets` fields rewritten in entry 31 mean "free anywhere (backend +
+      caches)", not "in the backend" -- accurate, just not the
+      cache-versus-ring split, which is why this bench reads occupancy
+      directly. The first metric design here (sampling availability at epoch
+      boundaries) was blind for exactly that reason and was replaced.
+    - **Any `rte_lcore_id()` other than `LCORE_ID_ANY` gets a default
+      cache**, registered with EAL or not -- so the `none` control has to
+      write `LCORE_ID_ANY` explicitly (the benchmark thread starts as EAL's
+      main lcore, 127). `CheckCacheInPlay()` caught exactly that: the first
+      `--lcore_mode=none` run aborted with `mempool cache present but not
+      expected (cache_size=32, lcore_id=127)` instead of reporting
+      meaningless numbers. The other aborts during this work were also
+      self-inflicted and caught the same way: a `--pin=` off-by-one made the
+      flag parser reject its own value (5 SIGABRTs in `coredumpctl`), fixed
+      before any sweep.
+
+    Results. Machine: a laptop (i7-13900H, single socket, 20 logical CPUs),
+    g++ 16, DPDK 25.11.3 `machine=native`, malloc-backed `--no-huge`;
+    `--pin=cores` = CPU0/CPU2 (distinct P-cores, same package),
+    `--lcore_mode=bess`, batch 32, median of 3. Pipeline Mpps (CV in
+    parentheses):
+
+    | backend      | cache 0        | cache 32     | cache 128    | cache 512    |
+    |--------------|----------------|--------------|--------------|--------------|
+    | ring_mp_mc   | 59.4 (17%)     | 90.1 (0.8%)  | 94.6 (1.7%)  | 94.5 (0.6%)  |
+    | ring_mt_rts  | 52.6 (23%)     | 91.6 (1.4%)  | 94.4 (0.6%)  | 94.1 (0.07%) |
+    | ring_mt_hts  | 92.4 (7%)      | 91.7 (0.4%)  | 93.0 (0.7%)  | 94.8 (0.5%)  |
+    | stack        | 34.5 (6%)      | 43.5 (5.5%)  | 94.9 (8%)    | 83.7 (11%)   |
+    | lf_stack     | 43.7 (0.3%)    | 43.1 (0.3%)  | 45.3 (0.8%)  | 44.9 (0.3%)  |
+
+    An earlier sweep of the same grid, hours before, measured the same
+    shapes at roughly half the absolute rate (e.g. `ring_mp_mc` 32.3 / 41.4
+    / 41.3 Mpps at cache 0/32/512, CV <= 4%), and a lone control run saw 91
+    Mpps for the same configuration that sweep had just measured at 47. **The
+    absolute rate on this host moves by more than 2x between and even within
+    sessions (clock/thermal state), so only within-run comparisons are used
+    below; every claim that needed two runs states both.** What survives
+    both:
+
+    - **Cache size stops mattering at the burst size.** No cache at all is
+      clearly worse (`ring_mp_mc`: 32 vs 41 Mpps in the stable run, 59 vs 90
+      in the fast one), and everything from cache 32 upward is identical
+      within 2% CV at *every* batch and in both runs -- while cache 512
+      parks 255 + 511 = 766 of 8191 objects (9.4%) in the two caches (256 +
+      389 in the fast run): the consumer's cache is always the fuller one,
+      and the producer's is always the emptier one, which is the
+      cache-imbalance shape the plan predicted. The cache only has to cover
+      the worker's burst; "as large as possible" is an assumption this
+      benchmark retires, not a finding it confirms.
+    - **`lf_stack` is 1.5-2x slower cross-worker** than every ring backend at
+      cache >= 32 (27 vs 41 in the stable run, 44 vs 90-95 in the fast one),
+      at CV < 2% for the ring side -- and it is also the worst cacheless
+      single-threaded allocator (12.7 ns/pkt vs 4.9 for `ring_mp_mc`).
+    - **`stack` is not measurable as a dataplane backend in this harness
+      yet**: it is the *fastest* cacheless single-threaded allocator
+      (2.9 ns/pkt) but under two-thread contention it swings between 28 and
+      95 Mpps with CV up to 11% across cache sizes and runs -- consistent
+      with `rte_stack`'s locked variant serialising both workers, but
+      unproven here. Recorded as a follow-up, not a result.
+    - **`ring_mp_mc` / `ring_mt_rts` / `ring_mt_hts` are equivalent at
+      production settings** (91.6-94.8 Mpps, CV <= 1.7% in the fast run;
+      41.3-45.5 in the stable one). One earlier run had RTS ahead by ~8% at
+      batch 32 only; it did not reproduce at batch 1/8 or in any other run.
+      No basis to change the shipped default.
+    - **Single-threaded, the cache is worth ~2x** (4.93 -> 2.34 ns/pkt for
+      `ring_mp_mc`; same shape in both runs) and the backend barely matters
+      once a cache exists -- the exact inverse of the cross-worker ordering,
+      which is why the "A alloc -> A free" and "A alloc -> B free" cases
+      needed separate families.
+    - **The lcore decoupling has no allocator-side cost**: `register` vs
+      `bess` differ by <= 6% at cache >= 32 (95-100 vs 90-95 Mpps in the
+      fast run; equal within 1% in the stable one), i.e. at drift scale.
+      That work can proceed with this binary as its regression guard.
+    - Topology, as expected: SMT siblings (`--pin=smt`) run at 30-35 Mpps
+      against 41-95 on two physical cores (both runs agree on the
+      direction; the ratio depends on host state), and unpinned placement
+      beat the static pin in both runs (49.5 vs 41.3; 115 vs 94.5) --
+      consistent with entry 29's "scheduler usually beats static pinning on
+      a shared host". `--pin=numa` refuses on this single-node machine.
+    - Controls: with no lcore id (`--lcore_mode=none`) cache size has no
+      effect in the local family (0.4-1.3% spread over 0/32/128/512), i.e.
+      the harness proves its own cache axis is real, and in the pipeline the
+      cache-size trend disappears as well (4.8-19% spread with no monotone
+      trend, against the 2x cache-0 penalty when caches are in play).
+
+    Net: the shipped `ring_mp_mc` + cache 512 survives, but the reason is
+    "nothing better reproduces", not "bigger is better" -- for the
+    cross-worker pipeline the cache needs only to cover the burst size, and
+    the backend family (ring vs stack/lf_stack) matters more than any other
+    knob measured. No default changed. Follow-ups that need hardware this
+    sandbox does not have: cross-socket `--pin=numa`; NIC-backed numbers
+    (backlog item 6, `MBUF_FAST_FREE`, still gated on both); and, only if
+    flush/refill *frequency* is ever needed, a separate DPDK build with
+    `-Dc_args=-DRTE_LIBRTE_MEMPOOL_STATS` (it instruments the timed path, so
+    it cannot be the same build these numbers came from).
+
+    Verified: `g++ -fsyntax-only` and `clang++ -fsyntax-only` clean on the
+    new TU under the tree's `-Werror -Wall -Wextra -Wcast-align -Wshadow`
+    (only pre-existing `is_pod`/`unary_function` deprecations from other
+    headers, demoted as in CI); CI-shape smoke run
+    (`--benchmark_min_time=0.001s`) covers all 120 cases clean; five full
+    sweeps (`--pin=cores`, `--pin=none`, `--pin=smt`, `--pin=cores
+    --lcore_mode=register`, `--pin=cores --lcore_mode=none`) completed
+    clean, then the whole grid re-run once more for the commit;
+    `all_test --gtest_shuffle` 185/185 on this machine under the workarounds
+    noted in the sandbox-constraints section (the new file is a translation
+    unit of its own, not part of `bess.a` and not linked into any test --
+    that run is the tree's state, not coverage of this file).
+    `bessctl/run_module_tests.py` could **not** run here for an environmental
+    reason, not a code one: it starts a real `bessd`, which refuses to run
+    without root (`You need root privilege to run the BESS daemon`) and this
+    session is an unprivileged user; CI covers it.
 
 ## Review process established this session
 
@@ -2475,8 +2641,26 @@ the rejected list for what's already been decided either way.
     zero-copy has no API in DPDK 25.11 (verified absent), both dropped.
     `DRR`'s SP/SC rings were migrated alongside (same mechanical change,
     not benchmarked separately per the original scoping note).
-3. **Mempool backend × cache size × worker topology.** Gated on (1) and on
-   the `DumpMempool()` fix (Phase F, above). Backends: `ring_mp_mc`
+3. **[x] Mempool backend × cache size × worker topology — done 2026-09-19,
+   entry 32** (`core/mempool_bench.cc`, kept; the doc's item text below is
+   the original scoping). Cross-worker results (`--pin=cores`, two P-cores,
+   batch 32, median of 3, CV <= 2% for everything at cache >= 32): the
+   per-lcore cache is worth ~30-70% over cache 0 but **saturates at the
+   worker's burst size** -- cache 32 == cache 128 == cache 512 within CV,
+   while 512 parks 766 of 8191 objects in the two caches (consumer 511,
+   producer 255); no reproducible difference between `ring_mp_mc` /
+   `ring_mt_rts` / `ring_mt_hts`; `lf_stack` is 1.5-2× slower than the ring
+   backends and `stack` is not measurable in this harness yet (its locked
+   variant serialises both workers: CV up to 11%, 28-95 Mpps across runs).
+   Single-threaded the ordering inverts (cache ~2×; cacheless `stack`
+   fastest at 2.9 ns/pkt vs 4.9 for `ring_mp_mc`). Shipped default
+   unchanged. `--lcore_mode=register` matches BESS's manual `_lcore_id`
+   write within drift, so the WorkerId/lcore decoupling is unblocked and
+   this binary is its regression guard. Still open on top of it:
+   cross-socket `--pin=numa` and NIC-backed numbers on real hardware (item
+   6's `MBUF_FAST_FREE` remains gated on both), plus a stats-instrumented
+   DPDK (`-Dc_args=-DRTE_LIBRTE_MEMPOOL_STATS`) if flush/refill *frequency*
+   is ever needed. Original scoping text: Backends: `ring_mp_mc`
    (current), `ring_mt_rts`, `ring_mt_hts`, `stack`, `lf_stack`
    (`librte_mempool_stack.a` already linked). Cache sizes: 0/32/64/128/
    256/512 (current `kMaxCacheSize = 512`, `core/packet_pool.h`, applied
