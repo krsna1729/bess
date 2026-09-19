@@ -110,16 +110,18 @@ jobs:
         # at all before now. --benchmark_min_time is kept tiny so this
         # stays a fast smoke check, not a real measurement.
         #
-        # `timeout` is load-bearing, not decoration: this list now contains
-        # an allocator benchmark that creates DPDK mempools, and a binary
-        # that hangs here would otherwise burn the job's whole 6-hour limit
-        # with no output saying which one did it (observed once, before
-        # this was added -- every step after it, including module tests,
-        # never ran). 120s is ~30x the slowest binary's observed runtime.
+        # `timeout` is a backstop against a true hang, not a performance
+        # budget: a hang here would otherwise burn the job's whole 6-hour
+        # limit. The bound is deliberately loose because this loop is NOT
+        # fast on GitHub runners -- measured on completed runs, the step
+        # takes 14.6-18.5 min (both jobs, with and without the allocator
+        # benchmark added in 5ee632f1; that binary adds ~a minute at most).
+        # Locally the same loop takes 36 s, of which cuckoo_map_bench alone
+        # is 28 s; the ~30x runner slowdown is what accounts for the rest.
         run: |
           for b in *_bench; do
             echo "=== $b ==="
-            timeout 120 ./"$b" --benchmark_min_time=0.001s || {
+            timeout 1800 ./"$b" --benchmark_min_time=0.001s || {
               rc=$?
               echo "::error::$b failed or timed out (status $rc)"
               exit $rc
