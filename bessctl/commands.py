@@ -992,11 +992,59 @@ def add_connection(cli, m1, m2, ogate, igate, pause_workers='pause'):
             cli.bess.resume_all()
 
 
+def _command_is_thread_safe(commands, cmd_name):
+    """Whether the daemon reports `cmd_name` safe to run with workers running.
+
+    Conservative by design: only an explicit thread_safe == true skips
+    pausing. An unknown command, and empty or missing metadata, all mean
+    pause -- which is also what the daemon itself enforces (EBUSY) for a
+    command that is not thread-safe.
+    """
+    for cmd in commands:
+        if cmd.name == cmd_name:
+            return cmd.thread_safe
+    return False
+
+
+def _module_command_is_thread_safe(cli, module, cmd_name):
+    try:
+        mclass = cli.bess.get_module_info(module).mclass
+        return _command_is_thread_safe(cli.bess.get_mclass_info(mclass).cmds,
+                                       cmd_name)
+    except Exception:
+        # No safety determination possible: pause, and let the command RPC
+        # report whatever is actually wrong (e.g. no such module).
+        return False
+
+
+def _gatehook_command_is_thread_safe(cli, hook_name, module, gate, cmd_name):
+    try:
+        matches = [h for h in cli.bess.list_gatehooks().hooks
+                   if h.hook_name == hook_name and h.module_name == module
+                   and h.ogate == gate]
+        if len(matches) != 1:
+            # Unknown or ambiguous hook instance: do not guess behaviour.
+            return False
+        info = cli.bess.get_gatehook_class_info(matches[0].class_name)
+        return _command_is_thread_safe(info.cmds, cmd_name)
+    except Exception:
+        return False
+
+
 @cmd('command module MODULE MODULE_CMD ARG_TYPE [CMD_ARGS...]',
      'Send a command to a module')
 def command_module(cli, module, cmd, arg_type, args):
     if args is None:
         args = {}
+
+    if _module_command_is_thread_safe(cli, module, cmd):
+        # The daemon says this command may run while workers are running (the
+        # module builds and publishes a replacement instead of mutating
+        # shared state). It stays the authority: RunCommand() still answers
+        # EBUSY if that ever fails to hold.
+        ret = cli.bess.run_module_command(module, cmd, arg_type, args)
+        cli.fout.write('response: %s\n' % repr(ret))
+        return
 
     cli.bess.pause_all()
     try:
@@ -1011,6 +1059,12 @@ def command_module(cli, module, cmd, arg_type, args):
 def command_gatehook(cli, name, module, direction, gate, cmd, arg_type, args):
     if args is None:
         args = {}
+
+    if _gatehook_command_is_thread_safe(cli, name, module, gate, cmd):
+        ret = cli.bess.run_gatehook_command(name, module, direction, gate, cmd,
+                                            arg_type, args)
+        cli.fout.write('response: %s\n' % repr(ret))
+        return
 
     cli.bess.pause_all()
     try:
