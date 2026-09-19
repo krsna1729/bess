@@ -30,7 +30,10 @@
 
 #include "exact_match.h"
 
+#include <algorithm>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "../utils/endian.h"
@@ -48,13 +51,13 @@ const Commands ExactMatch::cmds = {
     {"get_runtime_config", "EmptyArg",
      MODULE_CMD_FUNC(&ExactMatch::GetRuntimeConfig), Command::THREAD_SAFE},
     {"set_runtime_config", "ExactMatchConfig",
-     MODULE_CMD_FUNC(&ExactMatch::SetRuntimeConfig), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&ExactMatch::SetRuntimeConfig), Command::THREAD_SAFE},
     {"add", "ExactMatchCommandAddArg", MODULE_CMD_FUNC(&ExactMatch::CommandAdd),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_SAFE},
     {"delete", "ExactMatchCommandDeleteArg",
-     MODULE_CMD_FUNC(&ExactMatch::CommandDelete), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&ExactMatch::CommandDelete), Command::THREAD_SAFE},
     {"clear", "EmptyArg", MODULE_CMD_FUNC(&ExactMatch::CommandClear),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_SAFE},
     {"set_default_gate", "ExactMatchCommandSetDefaultGateArg",
      MODULE_CMD_FUNC(&ExactMatch::CommandSetDefaultGate),
      Command::THREAD_SAFE}};
@@ -71,23 +74,92 @@ CommandResponse ExactMatch::AddFieldOne(const bess::pb::Field &field,
                       mask.value_bin().c_str(), mask.value_bin().size());
   }
 
-  Error ret;
+  FieldSpec spec;
+  spec.size = size;
+  spec.mask = mask64;
   if (field.position_case() == bess::pb::Field::kAttrName) {
-    ret = table_.AddField(this, field.attr_name(), size, mask64, idx);
-    if (ret.first) {
-      return CommandFailure(ret.first, "%s", ret.second.c_str());
-    }
+    spec.by_offset = false;
+    spec.attr_name = field.attr_name();
+    spec.offset = 0;
   } else if (field.position_case() == bess::pb::Field::kOffset) {
-    ret = table_.AddField(field.offset(), size, mask64, idx);
-    if (ret.first) {
-      return CommandFailure(ret.first, "%s", ret.second.c_str());
-    }
+    spec.by_offset = true;
+    spec.offset = field.offset();
   } else {
     return CommandFailure(EINVAL,
                           "idx %d: must specify 'offset' or 'attr_name'", idx);
   }
 
+  field_specs_.push_back(std::move(spec));
   return CommandSuccess();
+}
+
+// Applies the module's configured fields to `table`. Called for every
+// generation, so a rebuild reproduces the module's matching exactly. The
+// second and later calls re-validate the same configuration -- cheap, and the
+// error paths stay in one place.
+Error ExactMatch::ApplyFields(ExactMatchTable<gate_idx_t> *table) {
+  for (size_t i = 0; i < field_specs_.size(); i++) {
+    const FieldSpec &spec = field_specs_[i];
+    Error ret;
+    if (spec.by_offset) {
+      ret = table->AddField(spec.offset, spec.size, spec.mask, i);
+    } else {
+      ret = table->AddField(this, spec.attr_name, spec.size, spec.mask, i);
+    }
+    if (ret.first) {
+      return ret;
+    }
+  }
+  return std::make_pair(0, std::string());
+}
+
+ExactMatch::GenerationPtr ExactMatch::Build(const std::vector<Rule> &rules,
+                                            gate_idx_t default_gate,
+                                            Error *err) {
+  auto gen = std::make_shared<Generation>();
+  gen->default_gate = default_gate;
+
+  Error ret = ApplyFields(&gen->table);
+  if (ret.first) {
+    *err = ret;
+    return nullptr;
+  }
+
+  for (const Rule &rule : rules) {
+    // Only validation failures are reported; a CuckooMap insert that runs out
+    // of slots is silent here, exactly as it was when rules were inserted into
+    // the live table.
+    Error add_ret = gen->table.AddRule(rule.gate, rule.fields);
+    if (add_ret.first) {
+      *err = add_ret;
+      return nullptr;
+    }
+  }
+
+  gen->rules = rules;
+  return gen;
+}
+
+void ExactMatch::Publish(GenerationPtr next, const GenerationPtr &current) {
+  // Publish first: after this store, no new batch can acquire `current`, so
+  // only batches that snapshotted it before publication can still hold it.
+  generation_.store(std::move(next), std::memory_order_release);
+
+  // Then wait for those to drain, so that *this* thread drops the last
+  // reference and therefore runs the retired generation's destructor -- the
+  // whole cuckoo table's storage -- rather than whichever packet worker
+  // happens to finish its batch last. An update must not move that cost onto
+  // the data path; the RPC waiting a little longer is the right side of that
+  // trade.
+  //
+  // The count only decreases once the atomic no longer points at `current`
+  // (no new references can be taken), so a stale read can only delay this
+  // loop by an iteration, never livelock it. Caller holds mutation_lock_,
+  // which also keeps rapid commands from retiring several generations at
+  // once.
+  while (current.use_count() != 1) {
+    std::this_thread::yield();
+  }
 }
 
 CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
@@ -98,6 +170,9 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
                           "default match on all bits on all fields)");
   }
 
+  // AddFieldOne only records the configuration; Build() below is what
+  // validates it against the module (attr names) and applies it.
+  field_specs_.clear();
   for (auto i = 0; i < arg.fields_size(); ++i) {
     CommandResponse err;
 
@@ -113,7 +188,12 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
     }
   }
 
-  default_gate_ = DROP_GATE;
+  Error err;
+  GenerationPtr gen = Build(/*rules=*/{}, /*default_gate=*/DROP_GATE, &err);
+  if (gen == nullptr) {
+    return CommandFailure(err.first, "%s", err.second.c_str());
+  }
+  generation_.store(std::move(gen));
 
   return CommandSuccess();
 }
@@ -122,8 +202,9 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
 CommandResponse ExactMatch::GetInitialArg(const bess::pb::EmptyArg &) {
   bess::pb::ExactMatchArg r;
 
-  for (size_t i = 0; i < table_.num_fields(); i++) {
-    const ExactMatchField &f = table_.get_field(i);
+  const GenerationPtr gen = generation_.load();
+  for (size_t i = 0; i < gen->table.num_fields(); i++) {
+    const ExactMatchField &f = gen->table.get_field(i);
     bess::pb::Field *ret_field = r.add_fields();
     if (f.attr_id >= 0) {
       ret_field->set_attr_name(all_attrs().at(f.attr_id).name);
@@ -151,30 +232,27 @@ CommandResponse ExactMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
   bess::pb::ExactMatchConfig r;
   using rule_t = bess::pb::ExactMatchCommandAddArg;
 
-  r.set_default_gate(default_gate_);
-  for (auto const &kv : table_) {
-    auto const &key = kv.first;
-    auto const &value = kv.second;
-    rule_t *rule = r.add_rules();
-
-    rule->set_gate(value);
-    for (size_t i = 0; i < table_.num_fields(); i++) {
-      const ExactMatchField &f = table_.get_field(i);
-      bess::pb::FieldData *field = rule->add_fields();
+  const GenerationPtr gen = generation_.load();
+  r.set_default_gate(gen->default_gate);
+  for (const Rule &rule : gen->rules) {
+    rule_t *out = r.add_rules();
+    out->set_gate(rule.gate);
+    for (size_t i = 0; i < rule.fields.size(); i++) {
+      bess::pb::FieldData *field = out->add_fields();
 
       // See GetInitialArg above for why we only set_value_bin here.
-      const char *ptr = reinterpret_cast<const char *>(&key.u64_arr[0]);
-      field->set_value_bin(ptr + f.pos, f.size);
+      const char *ptr = reinterpret_cast<const char *>(rule.fields[i].data());
+      field->set_value_bin(ptr, rule.fields[i].size());
     }
   }
   std::sort(r.mutable_rules()->begin(), r.mutable_rules()->end(),
-            [this](const rule_t &a, const rule_t &b) {
+            [](const rule_t &a, const rule_t &b) {
               // Primary sort key is gate number.
               if (a.gate() != b.gate()) {
                 return a.gate() < b.gate();
               }
               // After that, sort by value-to-be-matched, in field order.
-              for (size_t i = 0; i < table_.num_fields(); i++) {
+              for (int i = 0; i < a.fields_size(); i++) {
                 if (a.fields(i).value_bin() != b.fields(i).value_bin()) {
                   return a.fields(i).value_bin() < b.fields(i).value_bin();
                 }
@@ -186,7 +264,8 @@ CommandResponse ExactMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
   return CommandSuccess(r);
 }
 
-Error ExactMatch::AddRule(const bess::pb::ExactMatchCommandAddArg &arg) {
+Error ExactMatch::RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg,
+                             Rule *rule) {
   gate_idx_t gate = arg.gate();
 
   if (!is_valid_gate(gate)) {
@@ -198,34 +277,53 @@ Error ExactMatch::AddRule(const bess::pb::ExactMatchCommandAddArg &arg) {
     return std::make_pair(EINVAL, "'fields' must be a list");
   }
 
-  ExactMatchRuleFields rule;
-  RuleFieldsFromPb(arg.fields(), &rule);
+  Error ret = RuleFieldsFromPb(arg.fields(), &rule->fields);
+  if (ret.first) {
+    return ret;
+  }
+  rule->gate = gate;
 
-  return table_.AddRule(gate, rule);
+  return std::make_pair(0, std::string());
 }
 
 // Uses an ExactMatchConfig to restore this module's runtime config.
-// If this returns with an error, the state may be partially restored.
-// TODO(torek): consider vetting the entire argument before clobbering state.
+// The new configuration is built in full and swapped in, so an error leaves
+// the currently installed one serving unchanged -- no partially restored
+// state, which is what the old in-place version had to warn about.
 CommandResponse ExactMatch::SetRuntimeConfig(
     const bess::pb::ExactMatchConfig &arg) {
-  default_gate_ = arg.default_gate();
-  table_.ClearRules();
+  std::lock_guard<std::mutex> guard(mutation_lock_);
+  const GenerationPtr current = generation_.load();
 
+  std::vector<Rule> rules;
+  rules.reserve(arg.rules_size());
   for (auto i = 0; i < arg.rules_size(); i++) {
-    Error ret = AddRule(arg.rules(i));
+    Rule rule;
+    Error ret = RuleFromPb(arg.rules(i), &rule);
     if (ret.first) {
       return CommandFailure(ret.first, "%s", ret.second.c_str());
     }
+    rules.push_back(std::move(rule));
   }
+
+  Error err;
+  GenerationPtr next = Build(rules, arg.default_gate(), &err);
+  if (next == nullptr) {
+    return CommandFailure(err.first, "%s", err.second.c_str());
+  }
+  Publish(std::move(next), current);
+
   return CommandSuccess();
 }
 
 void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  gate_idx_t default_gate;
   ExactMatchKey keys[bess::PacketBatch::kMaxBurst] __ymm_aligned;
 
-  default_gate = ACCESS_ONCE(default_gate_);
+  // One snapshot for the whole batch: a concurrent command can neither swap
+  // the table mid-batch nor free it under this lookup.
+  const GenerationPtr gen = generation_.load();
+  const auto &table = gen->table;
+  const gate_idx_t default_gate = gen->default_gate;
 
   const auto buffer_fn = [&](bess::Packet *pkt, const ExactMatchField &f) {
     int attr_id = f.attr_id;
@@ -234,25 +332,32 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
     return pkt->head_data<uint8_t *>() + f.offset;
   };
-  table_.MakeKeys(batch, buffer_fn, keys);
+  table.MakeKeys(batch, buffer_fn, keys);
 
   int cnt = batch->cnt();
   for (int i = 0; i < cnt; i++) {
     bess::Packet *pkt = batch->pkts()[i];
-    EmitPacket(ctx, pkt, table_.Find(keys[i], default_gate));
+    EmitPacket(ctx, pkt, table.Find(keys[i], default_gate));
   }
 }
 
 std::string ExactMatch::GetDesc() const {
-  return bess::utils::Format("%zu fields, %zu rules", table_.num_fields(),
-                             table_.Size());
+  const GenerationPtr gen = generation_.load();
+  return bess::utils::Format("%zu fields, %zu rules", gen->table.num_fields(),
+                             gen->table.Size());
 }
 
-void ExactMatch::RuleFieldsFromPb(
+Error ExactMatch::RuleFieldsFromPb(
     const RepeatedPtrField<bess::pb::FieldData> &fields,
     bess::utils::ExactMatchRuleFields *rule) {
+  if (static_cast<size_t>(fields.size()) != field_specs_.size()) {
+    return std::make_pair(
+        EINVAL, bess::utils::Format("rule should have %zu fields (has %d)",
+                                    field_specs_.size(), fields.size()));
+  }
+
   for (auto i = 0; i < fields.size(); i++) {
-    int field_size = table_.get_field(i).size;
+    int field_size = field_specs_[i].size;
 
     bess::pb::FieldData current = fields.Get(i);
 
@@ -268,45 +373,113 @@ void ExactMatch::RuleFieldsFromPb(
       }
     }
   }
+
+  return std::make_pair(0, std::string());
 }
 
 CommandResponse ExactMatch::CommandAdd(
     const bess::pb::ExactMatchCommandAddArg &arg) {
-  Error ret = AddRule(arg);
+  std::lock_guard<std::mutex> guard(mutation_lock_);
+  const GenerationPtr current = generation_.load();
+
+  Rule rule;
+  Error ret = RuleFromPb(arg, &rule);
   if (ret.first) {
     return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
+
+  std::vector<Rule> rules = current->rules;
+  bool replaced = false;
+  for (Rule &r : rules) {
+    // Same match values: overwrite the gate, the way inserting the same key
+    // into the live table did.
+    if (r.fields == rule.fields) {
+      r.gate = rule.gate;
+      replaced = true;
+      break;
+    }
+  }
+  if (!replaced) {
+    rules.push_back(std::move(rule));
+  }
+
+  Error err;
+  GenerationPtr next = Build(rules, current->default_gate, &err);
+  if (next == nullptr) {
+    return CommandFailure(err.first, "%s", err.second.c_str());
+  }
+  Publish(std::move(next), current);
 
   return CommandSuccess();
 }
 
 CommandResponse ExactMatch::CommandDelete(
     const bess::pb::ExactMatchCommandDeleteArg &arg) {
-  CommandResponse err;
+  std::lock_guard<std::mutex> guard(mutation_lock_);
+  const GenerationPtr current = generation_.load();
 
   if (arg.fields_size() == 0) {
     return CommandFailure(EINVAL, "argument must be a list");
   }
 
-  ExactMatchRuleFields rule;
-  RuleFieldsFromPb(arg.fields(), &rule);
-
-  Error ret = table_.DeleteRule(rule);
+  ExactMatchRuleFields fields;
+  Error ret = RuleFieldsFromPb(arg.fields(), &fields);
   if (ret.first) {
     return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
+
+  std::vector<Rule> rules;
+  rules.reserve(current->rules.size());
+  bool found = false;
+  for (const Rule &r : current->rules) {
+    if (r.fields == fields) {
+      found = true;
+      continue;
+    }
+    rules.push_back(r);
+  }
+  if (!found) {
+    return CommandFailure(ENOENT, "rule doesn't exist");
+  }
+
+  Error err;
+  GenerationPtr next = Build(rules, current->default_gate, &err);
+  if (next == nullptr) {
+    return CommandFailure(err.first, "%s", err.second.c_str());
+  }
+  Publish(std::move(next), current);
 
   return CommandSuccess();
 }
 
 CommandResponse ExactMatch::CommandClear(const bess::pb::EmptyArg &) {
-  table_.ClearRules();
+  std::lock_guard<std::mutex> guard(mutation_lock_);
+  const GenerationPtr current = generation_.load();
+
+  // Rules go, the default gate stays -- what ClearRules() did to the live
+  // table.
+  Error err;
+  GenerationPtr next = Build(/*rules=*/{}, current->default_gate, &err);
+  if (next == nullptr) {
+    return CommandFailure(err.first, "%s", err.second.c_str());
+  }
+  Publish(std::move(next), current);
+
   return CommandSuccess();
 }
 
 CommandResponse ExactMatch::CommandSetDefaultGate(
     const bess::pb::ExactMatchCommandSetDefaultGateArg &arg) {
-  default_gate_ = arg.gate();
+  std::lock_guard<std::mutex> guard(mutation_lock_);
+  const GenerationPtr current = generation_.load();
+
+  Error err;
+  GenerationPtr next = Build(current->rules, arg.gate(), &err);
+  if (next == nullptr) {
+    return CommandFailure(err.first, "%s", err.second.c_str());
+  }
+  Publish(std::move(next), current);
+
   return CommandSuccess();
 }
 
