@@ -35,12 +35,22 @@ propose it unprompted.
   <6157640+krsna1729@users.noreply.github.com>`, entries 32/33), and `git
   config user.*` is the thing to check rather than assume. Fixing history
   would still need the user's go-ahead, per standing git-safety rules.
-- **`all_test` leaves SIGABRT cores in `coredumpctl` by design**: they are
-  `BessdTest`'s `EXPECT_DEATH` children (7 statements in
-  `core/bessd_test.cc`, covering pidfile/unique-instance error paths). The
-  count varies between runs (5-7 observed) with which of them skip by
-  environment. A green `all_test` summary plus such cores is *not* a crash;
-  check the test suite's own output first.
+- **`all_test` leaves SIGABRT entries in `coredumpctl` by design**: they
+  are gtest death-test children -- 7 `EXPECT_DEATH` statements in
+  `core/bessd_test.cc` (the `CheckRunningAsRoot.*`, `WritePidFile.*`,
+  `ReadPidFile.*`, `TryAcquirePidfileLock.*`, `CheckUniqueInstance.*` cases)
+  and 3 in `core/memory_test.cc`. There is no `BessdTest` suite; that wrong
+  guess cost this session a phantom hunt. `coredumpctl info <pid>` settles
+  it in one line: a death-test child's *command line* carries
+  `--gtest_internal_run_death_test=<file>|<line>|...`. How many fire varies
+  with which cases skip by environment (~6-7 observed of the 10). A green
+  `all_test` summary plus such entries is *not* a crash -- and a deliberate
+  abort looks identical to a notification system (this session aborted
+  `python3 -c 'import os; os.abort()'` on purpose, as a control), so read
+  the command line before concluding anything. `ulimit -c 0` does not
+  suppress the *entry* (piped `core_pattern`) but does suppress the core
+  itself: `Storage: none` with no size, versus a stored path plus
+  `Size on Disk` when real.
 - **Building/testing on a rolling-release host** (Arch, g++ 16, glibc 2.42+,
   glog 0.7, protobuf 36, grpc 1.83 — verified 2026-09-19, entry 32) needs
   build-flag workarounds only, no source changes:
