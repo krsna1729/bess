@@ -1671,6 +1671,54 @@ rather than one call site).
     metadata, so the capability these two modules now have is reachable through
     `command module ...` rather than only through pybess/direct RPC.
 
+38. **`8b1f0e90`** + **`afc7860f`** — **Phase J's last item: the capability through
+    the normal CLI**. `command module` / `command gatehook` paused every worker
+    unconditionally, so live table updates were reachable only through
+    pybess/direct RPC. Two commits:
+
+    - `8b1f0e90`: module/gatehook class introspection now reports command
+      descriptors -- one shared `CommandInfo { name, arg_type, thread_safe }`
+      in `bess_msg.proto` replaces the parallel `cmds`/`cmd_args` string arrays
+      at tag 4 (tag 5 reserved), which is the clean cutover the
+      no-backwards-compatibility policy calls for and implements the FIXME
+      those fields carried. `ModuleBuilder::cmds()`/`GateHookBuilder::cmds()`
+      return the real `Commands`/`GateHookCommands` instead of rebuilding
+      pairs; pybess's dynamic wrapper and `show mclass`/`show gatehookclass`
+      (which now prints thread safety) were updated in the same commit.
+      `thread_safe` defaults to false on purpose: skipping a pause requires an
+      explicit true.
+    - `afc7860f`: bessctl skips pausing only when the daemon reports the named
+      command as explicitly thread-safe. Unknown command, `thread_safe=false`,
+      empty/missing metadata, an unresolvable module, or an unknown/ambiguous
+      gatehook instance all keep the old pause-run-resume behavior. The
+      daemon's `RunCommand()` EBUSY enforcement is untouched -- the CLI
+      metadata is control-plane UX, the daemon remains the authority. The
+      user-supplied `ARG_TYPE` contract is unchanged.
+
+    Live acceptance (one daemon, workers running, commands issued through
+    `bessctl`, pause/resume counted in the daemon log):
+
+    | CLI command | workers paused? | result |
+    |---|---|---|
+    | `command module ipl add …` (THREAD_SAFE) | **no pause at all** | succeeded |
+    | `command module acl clear …` (THREAD_UNSAFE) | pause + resume | succeeded |
+    | `command module ipl nosuchcmd …` (unknown) | pause + resume | daemon's normal error |
+    | `command gatehook nosuchhook ipl out 0 reset …` (unresolvable) | pause + resume | daemon's normal error |
+
+    Not demonstrable live: a THREAD_SAFE *gatehook* command. The tree has
+    exactly one gatehook command (`Track::reset`) and it is THREAD_UNSAFE, so
+    the gatehook skip path is covered by the unit test only; the fallback and
+    the instance lookup are both exercised above.
+
+    Writing the unit tests (`bessctl/test_commands.py`, picked up by the CI's
+    unittest step) caught a real bug in this change: the helpers were first
+    inserted *between* `@cmd('command module ...')` and its `def`, and
+    `cmd_decorator()` registers into `cmdlist` and returns `None` -- so the
+    helper became the registered handler and both `command module` and
+    `command gatehook` lost their registrations. A guard test now asserts no
+    `cmdlist` entry is `None` and that both handlers are registered under
+    their syntaxes.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -2839,7 +2887,7 @@ revisit there rather than re-deciding it here.
 
 ---
 
-## Phase J — Live table updates without stopping the world (pilot landed 2026-09-19, entry 35; generalization pending)
+## Phase J — Live table updates without stopping the world (done 2026-09-19: entries 35-38)
 
 Cross-cutting phase, not a natural fit under A–I: touches the control
 plane (Phase G), the module command API, and the scheduler loop. Emerged
@@ -2926,13 +2974,15 @@ pointer, its three mutating commands are all `THREAD_UNSAFE`, the
 rebuild-and-swap cost is bounded, and `rte_fib` (Phase D, above) has
 native RCU support if the table migrates there anyway. `ExactMatch` is the
 natural second. Only after two modules work should this generalize into a
-`Module`-level contract. *(Status: both planned modules landed and were
-reviewed -- `IPLookup` (entry 35) and `ExactMatch` (entry 36, including the
-review-follow-up fixes `a0688fcf`) -- and the common
-snapshot/publication/reclamation mechanism is now extracted and shared (entry
-37). Next and last for this phase: expose command thread-safety so `bessctl`
-pauses only for `THREAD_UNSAFE` commands, instead of pausing `command module`
-unconditionally.)* Explicitly **not** in scope for the first pass:
+`Module`-level contract. *(Status: complete. `IPLookup` (entry 35) and
+`ExactMatch` (entry 36, plus the review-follow-up fixes `a0688fcf`) publish
+generations instead of mutating live tables; the snapshot, publication and
+writer-side reclamation mechanism they share lives in
+`bess::utils::PublishedGeneration` (entry 37); and the capability is reachable
+through the normal CLI, which now pauses only for commands the daemon reports
+as not thread-safe (entry 38). Deliberately out of scope, unchanged: QSBR/RCU
+machinery, the `ModuleGraph`/traffic-class tree, and removing the
+user-supplied `ARG_TYPE` from `command module`.)* Explicitly **not** in scope for the first pass:
 RCU-swapping the `ModuleGraph`, gate adjacency, or the traffic-class tree
 -- those are Phase G/H territory (live reconfiguration), not this phase's
 narrower table-update goal.
