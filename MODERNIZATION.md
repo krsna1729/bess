@@ -1630,6 +1630,19 @@ sites, don't just trust the commit message). This caught two real bugs
 shipped otherwise. **Keep doing this at every significant milestone commit** —
 it's a standing instruction from the user, not a one-time thing.
 
+**Module tests *are* locally runnable** (found while fixing `a0688fcf`, and
+worth not forgetting, since earlier entries in this log claim otherwise): the
+harness only needs a daemon it can reach. Start one with `--skip_root_check`
+(`hub`/`bessd`), then run
+
+```
+bessctl/bessctl daemon reset -- run file bessctl/module_tests/<name>.py
+```
+
+against it -- `daemon reset` goes over gRPC, so no sudo is involved. That is
+the real CI path (the sugar runner that rewrites `->`), which is how the
+pre-fix/post-fix module-test evidence for `a0688fcf` was produced.
+
 ## Known issues / explicit follow-ups (not yet fixed)
 
 - [x] **Per-queue PMD stats** (`pmd.cc`) — investigated further; this was
