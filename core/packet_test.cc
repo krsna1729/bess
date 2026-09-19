@@ -92,4 +92,149 @@ TEST(PacketTest, MultiSegmentChaining) {
   bess::Packet::Free(seg0);
 }
 
+// Phase B Stage 2A (MODERNIZATION.md): PacketRef/PacketHandle are the
+// backend-neutral seam over whatever storage backs a packet. Stage 2A keeps
+// the legacy overlay underneath, so these pin that the seam resolves to
+// exactly the same packet state, that a ref is a pointer-sized value with no
+// ownership, and that handles stay directly usable by raw consumers.
+TEST(PacketRefTest, IsPointerSizedAndTriviallyCopyable) {
+  static_assert(sizeof(bess::PacketRef) == sizeof(void *),
+                "PacketRef must stay pointer-sized");
+  static_assert(std::is_trivially_copyable<bess::PacketRef>::value,
+                "PacketRef must be trivially copyable");
+  static_assert(std::is_same<bess::PacketHandle, bess::Packet *>::value,
+                "Stage 2A keeps the legacy handle");
+
+  bess::PacketRef empty;
+  EXPECT_EQ(empty.handle(), nullptr);
+  bess::PacketRef from_null(static_cast<bess::PacketHandle>(nullptr));
+  EXPECT_EQ(from_null.handle(), nullptr);
+}
+
+TEST(PacketRefTest, ResolvesToTheSamePacketState) {
+  bess::PlainPacketPool pool(16);
+  bess::Packet *pkt = pool.Alloc();
+  ASSERT_NE(pkt, nullptr);
+
+  bess::PacketRef ref(pkt);
+  EXPECT_EQ(ref.handle(), pkt);
+
+  EXPECT_EQ(ref.head_data(), pkt->head_data());
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(ref.metadata<char *>()),
+            pkt->metadata<uintptr_t>());
+  EXPECT_EQ(ref.scratchpad<char *>(), pkt->scratchpad<char *>());
+  EXPECT_EQ(ref.buffer(), pkt->buffer());
+  EXPECT_EQ(ref.dma_addr(), pkt->dma_addr());
+
+  void *appended = ref.append(14);
+  ASSERT_NE(appended, nullptr);
+  EXPECT_EQ(appended, pkt->head_data());
+  EXPECT_EQ(ref.data_len(), pkt->data_len());
+  EXPECT_EQ(ref.head_len(), pkt->head_len());
+  EXPECT_EQ(ref.total_len(), pkt->total_len());
+  EXPECT_EQ(ref.headroom(), pkt->headroom());
+  EXPECT_EQ(ref.tailroom(), pkt->tailroom());
+  EXPECT_EQ(ref.is_linear(), pkt->is_linear());
+  EXPECT_EQ(ref.is_simple(), pkt->is_simple());
+
+  ref.trim(4);
+  EXPECT_EQ(ref.data_len(), pkt->data_len());
+  EXPECT_EQ(ref.total_len(), pkt->total_len());
+
+  // Sequenced deliberately: both sides move the same packet's data offset, so
+  // comparing them in one expression would depend on evaluation order.
+  void *prepended = ref.prepend(4);
+  EXPECT_EQ(prepended, pkt->head_data());
+  EXPECT_EQ(ref.data_off(), pkt->data_off());
+  void *adjusted = ref.adj(2);
+  EXPECT_EQ(adjusted, pkt->head_data());
+  EXPECT_EQ(ref.data_off(), pkt->data_off());
+
+  ref.set_data_len(3);
+  EXPECT_EQ(pkt->data_len(), 3);
+  ref.set_total_len(3);
+  EXPECT_EQ(pkt->total_len(), 3);
+
+  bess::PacketFree(ref.handle());
+}
+
+TEST(PacketRefTest, MultiSegmentTraversalRoundTrips) {
+  bess::PlainPacketPool pool(16);
+  bess::Packet *first = pool.Alloc();
+  bess::Packet *second = pool.Alloc();
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+
+  first->set_next(second);
+  first->set_nb_segs(2);
+
+  bess::PacketRef ref(first);
+  EXPECT_EQ(ref.nb_segs(), 2);
+  EXPECT_EQ(ref.next().handle(), second);
+  EXPECT_EQ(ref.next().next().handle(), nullptr);
+
+  ref.next().set_data_len(7);
+  EXPECT_EQ(second->data_len(), 7);
+
+  ref.set_nb_segs(2);
+  EXPECT_EQ(first->nb_segs(), 2);
+
+  // Freeing the head frees the whole chain (rte_pktmbuf_free semantics).
+  bess::PacketFree(ref.handle());
+}
+
+TEST(PacketRefTest, CopyIsADeepCopyOfBytesAndNotMetadata) {
+  bess::PlainPacketPool pool(16);
+  bess::Packet *src = pool.Alloc();
+  ASSERT_NE(src, nullptr);
+
+  const char payload[] = "copy-me!";
+  bess::PacketRef src_ref(src);
+  ASSERT_NE(src_ref.append(sizeof(payload)), nullptr);
+  bess::utils::Copy(src_ref.head_data(), payload, sizeof(payload));
+  src_ref.metadata<uint32_t *>()[0] = 0xdeadbeef;
+
+  bess::PacketHandle dup = bess::PacketCopy(src);
+  ASSERT_NE(dup, nullptr);
+  EXPECT_NE(dup, src);
+  bess::PacketRef dup_ref(dup);
+  EXPECT_EQ(dup_ref.total_len(), src_ref.total_len());
+  EXPECT_EQ(memcmp(dup_ref.head_data(), src_ref.head_data(),
+                   src_ref.total_len()), 0);
+  // BESS metadata is not part of the copy.
+  EXPECT_NE(dup_ref.metadata<uint32_t *>()[0], 0xdeadbeef);
+
+  bess::PacketFree(dup);
+  bess::PacketFree(src);
+}
+
+TEST(PacketBatchSeamTest, HandlesAndRefsReferToTheSamePacket) {
+  bess::PlainPacketPool pool(16);
+  bess::PacketBatch batch;
+  batch.clear();  // PacketBatch stays a POD; cnt_ is not initialized by a ctor
+
+  bess::Packet *pkt = pool.Alloc();
+  ASSERT_NE(pkt, nullptr);
+  batch.add(bess::PacketRef(pkt));
+
+  EXPECT_EQ(batch.cnt(), 1);
+  EXPECT_EQ(batch.handles()[0], pkt);
+  EXPECT_EQ(batch.packet(0).handle(), pkt);
+
+  // Batch copies stay pointer-array copies: writing through the copy reaches
+  // the same packet. (Neither batch owns anything, so the packet must be
+  // freed exactly once, by whichever batch is designated the owner.)
+  bess::PacketBatch copy;
+  copy.Copy(&batch);
+  EXPECT_EQ(copy.cnt(), 1);
+  EXPECT_EQ(copy.handles()[0], pkt);
+  EXPECT_EQ(copy.packet(0).handle(), pkt);
+
+  copy.packet(0).set_data_len(5);
+  EXPECT_EQ(pkt->data_len(), 5);
+  EXPECT_EQ(batch.packet(0).data_len(), 5);
+
+  bess::PacketFreeBatch(&batch);
+}
+
 }  // namespace

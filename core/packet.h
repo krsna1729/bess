@@ -41,6 +41,7 @@
 #include <rte_mbuf.h>
 
 #include "metadata.h"
+#include "pktbatch.h"
 #include "snbuf_layout.h"
 #include "worker.h"
 
@@ -497,6 +498,125 @@ class alignas(64) Packet {
 
 static_assert(std::is_standard_layout<Packet>::value, "Incorrect class Packet");
 static_assert(sizeof(Packet) == SNBUF_SIZE, "Incorrect class Packet");
+
+// Non-owning view of one packet: what packet-processing code manipulates
+// instead of knowing which representation currently backs a packet (Phase B
+// Stage 2A, MODERNIZATION.md). Deliberately a value type -- pointer-sized,
+// trivially copyable, destructor does nothing -- so passing one costs what
+// passing a Packet * costs, and a PacketRef never owns a packet.
+//
+// Stage 2A delegates to the legacy overlay Packet; Stage 2B reimplements these
+// against native rte_mbuf fields without changing this interface.
+class PacketRef {
+ public:
+  PacketRef() = default;
+  explicit PacketRef(PacketHandle pkt) : pkt_(pkt) {}
+
+  // The stored representation. Ownership and transport machinery wants this;
+  // packet-processing code should not need it.
+  PacketHandle handle() const { return pkt_; }
+
+  // Same operations, and same meaning, as Packet's methods of these names.
+  template <typename T = void *>
+  T head_data(uint16_t offset = 0) const {
+    return pkt_->head_data<T>(offset);
+  }
+
+  template <typename T = char *>
+  T data() const {
+    return pkt_->data<T>();
+  }
+
+  template <typename T = char *>
+  T metadata() const {
+    // Packet::metadata() is a const accessor, but modules need a writable view
+    // of the metadata area; going through uintptr_t is the same route
+    // module.h takes.
+    return reinterpret_cast<T>(pkt_->metadata<uintptr_t>());
+  }
+
+  template <typename T = char *>
+  T scratchpad() const {
+    return pkt_->scratchpad<T>();
+  }
+
+  template <typename T = void *>
+  T buffer() const {
+    return pkt_->buffer<T>();
+  }
+
+  template <typename T = char *>
+  T reserve() const {
+    return pkt_->reserve<T>();
+  }
+
+  int nb_segs() const { return pkt_->nb_segs(); }
+  void set_nb_segs(int n) { pkt_->set_nb_segs(n); }
+
+  PacketRef next() const { return PacketRef(pkt_->next()); }
+  void set_next(PacketRef next) { pkt_->set_next(next.handle()); }
+
+  uint16_t data_off() const { return pkt_->data_off(); }
+  void set_data_off(uint16_t offset) { pkt_->set_data_off(offset); }
+
+  uint16_t data_len() const { return pkt_->data_len(); }
+  void set_data_len(uint16_t len) { pkt_->set_data_len(len); }
+
+  int head_len() const { return pkt_->head_len(); }
+  int total_len() const { return pkt_->total_len(); }
+  void set_total_len(uint32_t len) { pkt_->set_total_len(len); }
+
+  uint16_t headroom() const { return pkt_->headroom(); }
+  uint16_t tailroom() const { return pkt_->tailroom(); }
+
+  int is_linear() const { return pkt_->is_linear(); }
+  int is_simple() const { return pkt_->is_simple(); }
+
+  void reset() { pkt_->reset(); }
+  void *prepend(uint16_t len) { return pkt_->prepend(len); }
+  void *adj(uint16_t len) { return pkt_->adj(len); }
+  void *append(uint16_t len) { return pkt_->append(len); }
+  void trim(uint16_t to_remove) { pkt_->trim(to_remove); }
+
+  phys_addr_t dma_addr() const { return pkt_->dma_addr(); }
+
+ private:
+  PacketHandle pkt_;
+};
+
+static_assert(sizeof(PacketRef) == sizeof(void *),
+              "PacketRef must stay pointer-sized");
+static_assert(std::is_trivially_copyable<PacketRef>::value,
+              "PacketRef must be trivially copyable");
+
+// Ownership helpers. Free functions, not PacketRef members: a PacketRef is
+// non-owning, and its destructor does nothing.
+inline void PacketFree(PacketHandle pkt) {
+  Packet::Free(pkt);
+}
+
+inline void PacketFreeBulk(PacketHandle *pkts, size_t cnt) {
+  Packet::Free(pkts, cnt);
+}
+
+inline void PacketFreeBatch(PacketBatch *batch) {
+  Packet::Free(batch);
+}
+
+// Deep-copies the packet bytes; BESS metadata is not copied, and no
+// clone/refcount semantics are introduced (Packet::copy's current contract).
+inline PacketHandle PacketCopy(PacketHandle src) {
+  return Packet::copy(src);
+}
+
+// Defined here because both PacketRef and PacketBatch must be complete.
+inline PacketRef PacketBatch::packet(size_t i) {
+  return PacketRef(pkts_[i]);
+}
+
+inline void PacketBatch::add(PacketRef pkt) {
+  pkts_[cnt_++] = pkt.handle();
+}
 
 #if __AVX__
 #include "packet_avx.h"

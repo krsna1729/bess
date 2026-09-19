@@ -31,11 +31,13 @@
 #ifndef BESS_PKTBATCH_H_
 #define BESS_PKTBATCH_H_
 
+#include "packet_handle.h"
 #include "utils/copy.h"
 
 namespace bess {
 
 class Packet;
+class PacketRef;
 
 class PacketBatch {
  public:
@@ -43,8 +45,19 @@ class PacketBatch {
   void set_cnt(int cnt) { cnt_ = cnt; }
   void incr_cnt(int n = 1) { cnt_ += n; }
 
+  // The stored representation: for ownership/transport machinery (ports,
+  // rings, allocators, batch copies). Packet-processing code wants packet(i).
+  PacketHandle *handles() { return pkts_; }
+  const PacketHandle *handles() const { return pkts_; }
+
+  // Transitional raw accessor, kept while the tree migrates; new
+  // packet-processing code should use packet(i).
   Packet *const *pkts() const { return pkts_; }
   Packet **pkts() { return pkts_; }
+
+  // Non-owning view of one packet. Definition lives in packet.h, where both
+  // PacketRef and Packet are complete.
+  PacketRef packet(size_t i);
 
   void clear() { cnt_ = 0; }
 
@@ -52,6 +65,9 @@ class PacketBatch {
   // overrun the buffer by calling this. We are not adding bounds check because
   // we want maximum GOFAST.
   void add(Packet *pkt) { pkts_[cnt_++] = pkt; }
+
+  // Same thing through the seam; defined in packet.h.
+  void add(PacketRef pkt);
   void add(PacketBatch *batch) {
     bess::utils::CopyInlined(pkts_ + cnt_, batch->pkts(),
                              batch->cnt() * sizeof(Packet *));
@@ -71,7 +87,7 @@ class PacketBatch {
 
  private:
   int cnt_;
-  Packet *pkts_[kMaxBurst];
+  PacketHandle pkts_[kMaxBurst];
 };
 
 static_assert(std::is_pod<PacketBatch>::value, "PacketBatch is not a POD Type");
