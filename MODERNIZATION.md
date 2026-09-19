@@ -1565,11 +1565,58 @@ rather than one call site).
     Verified: full build clean; `all_test` 185/185; `g++`/`clang++`
     `-fsyntax-only` clean under the tree's `-Werror` set.
 
+    Follow-up from review (`a0688fcf`): three defects, all fixed before this
+    module is used as an abstraction input.
+
+    - **A metadata-field table could not be rebuilt at all.** `ApplyFields()`
+      called `AddField(this, attr_name, ...)` for every generation, which calls
+      `Module::AddMetadataAttr()` again, and re-registering a module attribute
+      fails with `EEXIST` -- so the first
+      `add`/`delete`/`clear`/`set_default_gate`/`set_runtime_config` after
+      `Init` failed for any ExactMatch matching on metadata. Attribute ids are
+      now resolved once during `Init()` into `FieldSpec::attr_id`, and
+      `ExactMatchTable` gained a narrow `AddResolvedAttrField()` (plus an
+      `attr_resolved` path in `DoAddField`) that configures a table from an
+      already-resolved id without registering anything: generation
+      construction never mutates module metadata. The offset-field live tests
+      could not see this -- the pre-existing `test_exactmatch_with_metadata()`
+      is what catches it, which is the argument for keeping the module-test
+      suite in the gate.
+    - **`SetRuntimeConfig()` could make the stored rule list disagree with the
+      table.** It pushed every protobuf rule, while the table it built holds one
+      entry per match value, so `get_runtime_config` emitted duplicates the old
+      implementation never produced and `delete` removed them all at once. Both
+      `add` and `set_runtime_config` now upsert through one helper (last gate
+      wins), and `Build()` asserts `table.Size() == rules.size()` so the two
+      cannot silently diverge again.
+    - **Silent `CuckooMap` insertion failure is no longer swallowed.**
+      `ExactMatchTable::AddRule()` ignored `Insert()`'s `nullptr` (documented
+      after excessive hash collisions): a command used to report success for a
+      rule absent from the table, and with a stored rule list that became a
+      phantom rule -- reportable, deletable, forwarding nothing, possibly
+      reappearing on a later rebuild. `AddRule()` now returns `ENOSPC` and the
+      command fails instead. A deliberate fix to the old quirk, chosen over a
+      source of truth that knowingly disagrees with the dataplane.
+
+    Evidence the regressions have teeth: the same module tests against the
+    pre-fix binary fail exactly as predicted -- `test_exactmatch_with_metadata`,
+    `test_exactmatch_selfconfig` and the new metadata-rebuild test error with
+    `EEXIST: add_metadata_attr() failed`, the new duplicate-rule test fails
+    (`Ran 6 tests` / 1 failure + 3 errors); the fixed binary passes all six.
+    Drivers re-run: 13 metadata/canonicalization checks, 13 semantics checks,
+    4-worker storm at 0 drops with RSS +168 kB over 251 retired generations,
+    `min/p50` 0.884. `iplookup.py` module tests still pass, build clean,
+    `all_test` 185/185, both compilers clean under the tree's `-Werror` set.
+
+    New CI-path coverage: `test_exactmatch_metadata_field_survives_updates`
+    and `test_exactmatch_setconfig_dedups_duplicate_rules`.
+
     Not done, on purpose: nothing in `bessctl` (its `command module` still
-    pauses unconditionally) and no shared abstraction yet. With two modules now
-    landed, extracting the common snapshot/publication mechanism -- and exposing
+    pauses unconditionally) and no shared abstraction yet. With both planned
+    modules landed, reviewed, and (for ExactMatch) reviewed again after these
+    fixes, extracting the common snapshot/publication mechanism -- and exposing
     command thread-safety so `bessctl` pauses only when it must -- is the next
-    Phase J step; the two implementations are what that extraction should be
+    Phase J step; these two implementations are what that extraction should be
     designed from.
 
 ## Review process established this session
@@ -2814,12 +2861,13 @@ pointer, its three mutating commands are all `THREAD_UNSAFE`, the
 rebuild-and-swap cost is bounded, and `rte_fib` (Phase D, above) has
 native RCU support if the table migrates there anyway. `ExactMatch` is the
 natural second. Only after two modules work should this generalize into a
-`Module`-level contract. *(Status: both planned modules have landed --
-`IPLookup` (entry 35, with its writer-side reclamation fix, single- and
-multi-reader validation) and `ExactMatch` (entry 36, four workers, 13 live
-semantics checks). Next: extract the common snapshot/publication mechanism
-from the two implementations, and expose command thread-safety so `bessctl`
-pauses only for `THREAD_UNSAFE` commands.)* Explicitly **not** in scope for the first pass:
+`Module`-level contract. *(Status: both planned modules have landed and
+been reviewed -- `IPLookup` (entry 35, with its writer-side reclamation fix and
+single-/multi-reader validation) and `ExactMatch` (entry 36, including the
+review-follow-up fixes `a0688fcf`: metadata-field rebuilds, rule-list/table
+canonicalization, reported insertion failure). Next: extract the common
+snapshot/publication mechanism from the two implementations, and expose command
+thread-safety so `bessctl` pauses only for `THREAD_UNSAFE` commands.)* Explicitly **not** in scope for the first pass:
 RCU-swapping the `ModuleGraph`, gate adjacency, or the traffic-class tree
 -- those are Phase G/H territory (live reconfiguration), not this phase's
 narrower table-update goal.
