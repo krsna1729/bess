@@ -1384,6 +1384,73 @@ rather than one call site).
     harness itself (rules built in raw form, every lookup missing), then
     the FIB behaviour above.
 
+35. **`4e7f420e`** — **Phase J pilot: `IPLookup` route updates without pausing
+    workers**. `IPLookup` no longer keeps a single mutable `rte_lpm` that
+    commands edit in place -- the coupling that forced
+    `Command::THREAD_UNSAFE`, i.e. "pause every worker or refuse". It now
+    holds one *immutable routing generation* (the route list it was built
+    from, plus the `rte_lpm` built from it) behind
+    `std::atomic<std::shared_ptr<const Generation>>`:
+
+    - `ProcessBatch()` takes **one snapshot acquisition per batch** and holds
+      the `shared_ptr` for that batch, so a concurrent command can neither
+      free the table under an in-flight lookup nor swap it mid-batch;
+    - `add`/`delete`/`clear` copy the current route list, apply the change,
+      build a replacement off the data path, and publish it with a release
+      store (a mutex serializes command-side mutation, so concurrent commands
+      cannot lose an update);
+    - retired generations are reclaimed by `shared_ptr` as soon as the last
+      batch holding one returns -- deliberately no epoch/QSBR machinery: the
+      first pilot is one module and one atomic pointer, per the review's
+      scope (no BESS-wide QSBR, no graph RCU, no reusable framework).
+
+    Deliberate first-cut costs, recorded rather than hidden: every command
+    rebuilds the table from the route list (`O(routes)` off-path work; a
+    control plane adding 500K routes one at a time would notice), and the
+    command *semantics* are exactly as before -- `rte_lpm_add` overwrite (the
+    route list replaces rather than duplicates a prefix), default gate via
+    `prefix_len == 0`, `clear` drops rules and keeps the default gate,
+    deleting a missing rule is still an error, and the
+    `VECTOR_OPTIMIZATION` SSE path is untouched. Each generation gets a
+    unique `rte_lpm` name (`<module>_g<N>`) because a rebuild happens while
+    the previous generation may still be serving in-flight batches.
+
+    Acceptance evidence (live: pybess against a real `bessd`, not the CLI --
+    `bessctl`'s `command module` pauses workers unconditionally and would hide
+    the answer): `Source -> Rewrite -> IPLookup -> two Sinks`, one worker,
+    traffic flowing, six route commands issued with workers running. Packets
+    counted on `ipl`'s output gates (task-less `Sink`s do not account for
+    input, which cost one wrong reading before it was noticed):
+
+    | phase | to gate 0 | to gate 1 |
+    |-------|-----------|-----------|
+    | no route (DROP) | 0 | 0 |
+    | `add 10.7.7.0/24 -> 0` | +68.8M | 0 |
+    | `add 10.7.7.7/32 -> 1` | +0.2M | +64.1M |
+    | `delete 10.7.7.7/32` | +64.6M | +0.1M |
+    | `add default -> 1` then `clear` | mixed phase | +65.2M |
+    | `delete default` (-> DROP) | +0 | +0.09M in flight |
+
+    The small deltas on the "wrong" gate at each switch are batches that had
+    already snapshotted the previous generation -- per-batch atomicity working
+    as designed, and visible here for the first time. Both daemon runs show
+    exactly one `*** All workers have been paused ***` (the test's own setup,
+    before traffic started) and none for any route command; both exited 0
+    with no coredumps.
+
+    Verified: full build clean; `all_test` 185/185; `g++`/`clang++`
+    `-fsyntax-only` clean under the tree's `-Werror` set (modulo this host's
+    pre-existing protobuf-36 `[[nodiscard]]` warnings inside `module.h`, which
+    CI does not see); `bessctl/module_tests/iplookup.py` is unchanged in its
+    expectations and runs in CI -- it exercises add/delete/prefix validation
+    against a paused pipeline, and could not run locally because the harness
+    starts its daemon through `sudo`.
+
+    Not done, on purpose: generalizing the pattern to other modules, and any
+    BESS-wide RCU/QSBR design. Those were the review's explicit "not yet";
+    with the mechanism and its live evidence in place they can now be argued
+    from a working example instead of a proposal.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
