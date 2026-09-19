@@ -589,13 +589,13 @@ void L2Forward::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
   int cnt = batch->cnt();
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *snb = batch->pkts()[i];
+    bess::PacketRef snb = batch->packet(i);
 
     gate_idx_t out_gate;
     // read destination MAC address (first 6 bytes)
     // NOTE: assumes little endian
     int ret = l2_find(&l2_table_,
-                      *(snb->head_data<uint64_t *>()) & 0x0000ffffffffffff,
+                      *(snb.head_data<uint64_t *>()) & 0x0000ffffffffffff,
                       &out_gate);
     if (ret != 0) {
       EmitPacket(ctx, snb, default_gate);

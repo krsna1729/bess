@@ -130,7 +130,7 @@ void SequentialUpdate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     size_t bit_shift = var->bit_shift;
 
     for (int j = 0; j < cnt; j++) {
-      be32_t *p = batch->pkts()[j]->head_data<be32_t *>(offset);
+      be32_t *p = batch->packet(j).head_data<be32_t *>(offset);
       uint32_t value = min + cur;
       cur = cur + 1;
       if (cur >= range) {

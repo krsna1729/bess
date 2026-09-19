@@ -85,7 +85,7 @@ void VXLANEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
 
     be32_t ip_src = get_attr<be32_t>(this, ATTR_R_TUN_IP_SRC, pkt);
     be32_t ip_dst = get_attr<be32_t>(this, ATTR_R_TUN_IP_DST, pkt);
@@ -95,10 +95,10 @@ void VXLANEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     Udp *udp;
     Vxlan *vh;
 
-    size_t inner_frame_len = pkt->total_len() + sizeof(*udp);
+    size_t inner_frame_len = pkt.total_len() + sizeof(*udp);
 
-    inner_eth = pkt->head_data<Ethernet *>();
-    udp = static_cast<Udp *>(pkt->prepend(sizeof(*udp) + sizeof(*vh)));
+    inner_eth = pkt.head_data<Ethernet *>();
+    udp = static_cast<Udp *>(pkt.prepend(sizeof(*udp) + sizeof(*vh)));
     if (unlikely(!udp)) {
       continue;
     }

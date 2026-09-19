@@ -39,23 +39,23 @@ using bess::utils::Ethernet;
 using bess::utils::Ipv4;
 using bess::utils::Udp;
 
-static inline void timestamp_packet(bess::Packet *pkt, size_t offset,
+static inline void timestamp_packet(bess::PacketRef pkt, size_t offset,
                                     uint64_t time) {
   Timestamp::MarkerType *marker;
   uint64_t *ts;
 
   const size_t kStampSize = sizeof(*marker) + sizeof(*ts);
-  size_t room = pkt->data_len() - offset;
+  size_t room = pkt.data_len() - offset;
 
   if (room < kStampSize) {
-    void *ret = pkt->append(kStampSize - room);
+    void *ret = pkt.append(kStampSize - room);
     if (!ret) {
       // not enough tailroom for timestamp. give up
       return;
     }
   }
 
-  marker = pkt->head_data<Timestamp::MarkerType *>(offset);
+  marker = pkt.head_data<Timestamp::MarkerType *>(offset);
   *marker = Timestamp::kMarker;
   ts = reinterpret_cast<uint64_t *>(marker + 1);
   *ts = time;
@@ -82,12 +82,13 @@ void Timestamp::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
   int cnt = batch->cnt();
   for (int i = 0; i < cnt; i++) {
+    bess::PacketRef pkt = batch->packet(i);
     if (attr_id_ != -1)
-      set_attr<uint64_t>(this, attr_id_, batch->pkts()[i], now_ns);
+      set_attr<uint64_t>(this, attr_id_, pkt, now_ns);
     else
-      timestamp_packet(batch->pkts()[i], offset, now_ns);
-  }
+      timestamp_packet(pkt, offset, now_ns);
 
+  }
   RunNextModule(ctx, batch);
 }
 

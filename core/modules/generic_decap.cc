@@ -47,7 +47,8 @@ void GenericDecap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int decap_size = decap_size_;
 
   for (int i = 0; i < cnt; i++) {
-    batch->pkts()[i]->adj(decap_size);
+    bess::PacketRef pkt = batch->packet(i);
+    pkt.adj(decap_size);
   }
 
   RunNextModule(ctx, batch);

@@ -55,12 +55,13 @@ CommandResponse Dump::Init(const bess::pb::DumpArg &arg) {
 
 void Dump::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   if (unlikely(ctx->current_ns >= next_ns_)) {
-    bess::Packet *pkt = batch->pkts()[0];
+    bess::PacketRef pkt = batch->packet(0);
 
     printf("----------------------------------------\n");
     printf("%s: packet dump\n", name().c_str());
-    std::cout << pkt->Dump();
-    rte_hexdump(stdout, "Metadata buffer", pkt->metadata<const char *>(),
+    // Dump is legacy debug formatting; keep this representation escape local.
+    std::cout << pkt.handle()->Dump();
+    rte_hexdump(stdout, "Metadata buffer", pkt.metadata<const char *>(),
                 SNBUF_METADATA);
     next_ns_ = ctx->current_ns + min_interval_ns_;
   }

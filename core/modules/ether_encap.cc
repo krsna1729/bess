@@ -55,7 +55,7 @@ void EtherEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
 
     Ethernet::Address ether_src;
     Ethernet::Address ether_dst;
@@ -65,7 +65,7 @@ void EtherEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     ether_dst = get_attr<Ethernet::Address>(this, ATTR_R_ETHER_DST, pkt);
     ether_type = get_attr<bess::utils::be16_t>(this, ATTR_R_ETHER_TYPE, pkt);
 
-    Ethernet *eth = static_cast<Ethernet *>(pkt->prepend(sizeof(*eth)));
+    Ethernet *eth = static_cast<Ethernet *>(pkt.prepend(sizeof(*eth)));
 
     // not enough headroom?
     if (unlikely(!eth)) {

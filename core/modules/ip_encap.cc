@@ -63,7 +63,7 @@ void IPEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
 
     be32_t ip_src = get_attr<be32_t>(this, ATTR_R_IP_SRC, pkt);
     be32_t ip_dst = get_attr<be32_t>(this, ATTR_R_IP_DST, pkt);
@@ -71,9 +71,9 @@ void IPEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
     Ipv4 *iph;
 
-    uint16_t total_len = pkt->total_len() + sizeof(*iph);
+    uint16_t total_len = pkt.total_len() + sizeof(*iph);
 
-    iph = static_cast<Ipv4 *>(pkt->prepend(sizeof(*iph)));
+    iph = static_cast<Ipv4 *>(pkt.prepend(sizeof(*iph)));
 
     if (unlikely(!iph)) {
       continue;

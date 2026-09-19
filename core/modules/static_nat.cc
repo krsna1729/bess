@@ -149,8 +149,8 @@ inline void StaticNAT::DoProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
-    auto *eth = pkt->head_data<bess::utils::Ethernet *>();
+    bess::PacketRef pkt = batch->packet(i);
+    auto *eth = pkt.head_data<bess::utils::Ethernet *>();
     auto *ip = reinterpret_cast<bess::utils::Ipv4 *>(eth + 1);
 
     be32_t &addr_be = (dir == kForward) ? ip->src : ip->dst;

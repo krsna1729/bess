@@ -60,9 +60,9 @@ bess::PlainPacketPool &GetPool() {
 void BM_PacketAllocFree(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();
   for (auto _ : state) {
-    bess::Packet *pkt = pool.Alloc();
+    bess::PacketHandle pkt = pool.Alloc();
     benchmark::DoNotOptimize(pkt);
-    bess::Packet::Free(pkt);
+    bess::PacketFree(pkt);
   }
   state.SetItemsProcessed(state.iterations());
 }
@@ -71,13 +71,13 @@ BENCHMARK(BM_PacketAllocFree);
 void BM_PacketAllocFreeBulk(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();
   const size_t kBatch = bess::PacketBatch::kMaxBurst;
-  bess::Packet *pkts[kBatch];
+  bess::PacketHandle pkts[kBatch];
 
   for (auto _ : state) {
     bool ok = pool.AllocBulk(pkts, kBatch);
     benchmark::DoNotOptimize(pkts);
     if (ok) {
-      bess::Packet::Free(pkts, kBatch);
+      bess::PacketFreeBulk(pkts, kBatch);
     }
   }
   state.SetItemsProcessed(state.iterations() * kBatch);
@@ -86,33 +86,38 @@ BENCHMARK(BM_PacketAllocFreeBulk);
 
 void BM_PacketHeadData(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();
-  bess::Packet *pkt = pool.Alloc(64);
+  constexpr size_t kPackets = 32;
+  bess::PacketHandle pkts[kPackets];
+  CHECK(pool.AllocBulk(pkts, kPackets, 64));
+  size_t next = 0;
 
   for (auto _ : state) {
-    char *data = pkt->head_data<char *>();
+    bess::PacketRef pkt(pkts[next++ & (kPackets - 1)]);
+    char *data = pkt.head_data<char *>();
     benchmark::DoNotOptimize(data);
   }
   state.SetItemsProcessed(state.iterations());
 
-  bess::Packet::Free(pkt);
+  bess::PacketFreeBulk(pkts, kPackets);
 }
 BENCHMARK(BM_PacketHeadData);
-
 void BM_PacketAppendTrim(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();
-  bess::Packet *pkt = pool.Alloc();
+  bess::PacketHandle pkt_handle = pool.Alloc();
+  bess::PacketRef pkt(pkt_handle);
   const uint16_t kLen = 64;
 
   for (auto _ : state) {
-    void *data = pkt->append(kLen);
+    void *data = pkt.append(kLen);
     benchmark::DoNotOptimize(data);
-    pkt->trim(kLen);
+    pkt.trim(kLen);
   }
   state.SetItemsProcessed(state.iterations());
 
-  bess::Packet::Free(pkt);
+  bess::PacketFree(pkt_handle);
 }
 BENCHMARK(BM_PacketAppendTrim);
+
 
 // Every module attribute read/write (Module::get_attr/set_attr/ptr_attr,
 // module.h) funnels through Packet::metadata<T>(), which as of Phase B
@@ -121,45 +126,48 @@ BENCHMARK(BM_PacketAppendTrim);
 // that path directly to catch a regression in cost, not just correctness.
 void BM_PacketMetadataAccess(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();
-  bess::Packet *pkt = pool.Alloc();
+  constexpr size_t kPackets = 32;
+  bess::PacketHandle pkts[kPackets];
+  CHECK(pool.AllocBulk(pkts, kPackets));
+  size_t next = 0;
 
   for (auto _ : state) {
-    uintptr_t addr = pkt->metadata<uintptr_t>();
+    bess::PacketRef pkt(pkts[next++ & (kPackets - 1)]);
+    uintptr_t addr = pkt.metadata<uintptr_t>();
     benchmark::DoNotOptimize(addr);
   }
   state.SetItemsProcessed(state.iterations());
 
-  bess::Packet::Free(pkt);
+  bess::PacketFreeBulk(pkts, kPackets);
 }
 BENCHMARK(BM_PacketMetadataAccess);
 
 // "Forwarding" a batch from one module to the next is, at its core, a
-// pointer-array copy of up to kMaxBurst Packet* -- this is that copy in
-// isolation, without the surrounding Module/Gate/Task dispatch machinery
-// (which has no standalone-benchmark harness yet; see MODERNIZATION.md).
 void BM_BatchForward(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();
   const size_t kBatch = bess::PacketBatch::kMaxBurst;
-  bess::Packet *pkts[kBatch];
+  bess::PacketHandle pkts[kBatch];
   CHECK(pool.AllocBulk(pkts, kBatch));
 
   bess::PacketBatch src;
   src.clear();
   for (size_t i = 0; i < kBatch; i++) {
-    src.add(pkts[i]);
+    src.handles()[i] = pkts[i];
   }
+  src.set_cnt(kBatch);
 
   bess::PacketBatch dst;
   for (auto _ : state) {
     dst.clear();
     dst.add(&src);
-    benchmark::DoNotOptimize(dst.pkts());
+    benchmark::DoNotOptimize(dst.handles());
   }
   state.SetItemsProcessed(state.iterations() * kBatch);
 
-  bess::Packet::Free(pkts, kBatch);
+  bess::PacketFreeBulk(pkts, kBatch);
 }
 BENCHMARK(BM_BatchForward);
+
 
 }  // namespace
 

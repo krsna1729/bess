@@ -64,10 +64,10 @@ void VLANPush::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   be32_t qinq_tag = qinq_tag_;
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
     char *new_head;
 
-    if ((new_head = static_cast<char *>(pkt->prepend(4))) != nullptr) {
+    if ((new_head = static_cast<char *>(pkt.prepend(4))) != nullptr) {
       // shift 12 bytes to the left by 4 bytes
       __m128i ethh;
 

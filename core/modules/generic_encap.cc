@@ -141,16 +141,16 @@ void GenericEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     char *header = headers[0] + fields_[i].pos;
 
     for (int j = 0; j < cnt; j++, header += MAX_HEADER_SIZE) {
-      bess::Packet *pkt = batch->pkts()[j];
+      bess::PacketRef pkt = batch->packet(j);
       *(reinterpret_cast<uint64_t *>(header)) =
           (attr_id < 0) ? value : get_attr_with_offset<uint64_t>(offset, pkt);
     }
   }
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
 
-    char *p = static_cast<char *>(pkt->prepend(encap_size));
+    char *p = static_cast<char *>(pkt.prepend(encap_size));
 
     if (unlikely(!p)) {
       continue;

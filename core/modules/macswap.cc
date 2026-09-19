@@ -38,7 +38,7 @@ void MACSwap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
 
   for (int i = 0; i < cnt; i++) {
-    Ethernet *eth = batch->pkts()[i]->head_data<Ethernet *>();
+    Ethernet *eth = batch->packet(i).head_data<Ethernet *>();
     Ethernet::Address tmp;
 
     tmp = eth->dst_addr;

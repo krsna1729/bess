@@ -116,8 +116,8 @@ class FlowGen final : public Module {
   void PopulateInitialFlows();
 
   CommandResponse UpdateBaseAddresses();
-  bess::Packet *FillUdpPacket(struct flow *f);
-  bess::Packet *FillTcpPacket(struct flow *f);
+  bess::PacketRef FillUdpPacket(struct flow *f);
+  bess::PacketRef FillTcpPacket(struct flow *f);
   void GeneratePackets(Context *ctx, bess::PacketBatch *batch);
 
   CommandResponse ProcessArguments(const bess::pb::FlowGenArg &arg);

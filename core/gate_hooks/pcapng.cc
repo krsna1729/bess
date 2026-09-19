@@ -187,7 +187,7 @@ void Pcapng::ProcessBatch(const bess::PacketBatch *batch) {
   uint16_t comment_size = static_cast<uint16_t>(attr_template_.size());
 
   for (int i = 0; i < batch->cnt(); i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
 
     Option opt_comment = {
         .code = Option::kComment,
@@ -213,13 +213,13 @@ void Pcapng::ProcessBatch(const bess::PacketBatch *batch) {
         .type = EnhancedPacketBlock::kType,
         .tot_len = static_cast<uint32_t>(
             sizeof(epb) + sizeof(uint32_t) +
-            RoundUp<uint32_t>(pkt->head_len(), 4) + sizeof(opt_comment) +
+            RoundUp<uint32_t>(pkt.head_len(), 4) + sizeof(opt_comment) +
             RoundUp<uint32_t>(comment_size, 4) + sizeof(opt_end)),
         .interface_id = 0,
         .timestamp_high = static_cast<uint32_t>(ts >> 32),
         .timestamp_low = static_cast<uint32_t>(ts),
-        .captured_len = static_cast<uint32_t>(pkt->head_len()),
-        .orig_len = static_cast<uint32_t>(pkt->total_len()),
+        .captured_len = static_cast<uint32_t>(pkt.head_len()),
+        .orig_len = static_cast<uint32_t>(pkt.total_len()),
     };
 
     uint32_t padding = 0;
@@ -228,8 +228,8 @@ void Pcapng::ProcessBatch(const bess::PacketBatch *batch) {
 
     struct iovec vec[8] = {
         {&epb, sizeof(epb)},
-        {pkt->head_data(), static_cast<size_t>(pkt->head_len())},
-        {&padding, static_cast<size_t>(PadSize(pkt->head_len(), 4))},
+        {pkt.head_data(), static_cast<size_t>(pkt.head_len())},
+        {&padding, static_cast<size_t>(PadSize(pkt.head_len(), 4))},
 
         {&opt_comment, sizeof(opt_comment)},
         {attr_template_.data(), comment_size},

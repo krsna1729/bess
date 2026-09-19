@@ -31,7 +31,7 @@
 #include "sink.h"
 
 void Sink::ProcessBatch(Context *, bess::PacketBatch *batch) {
-  bess::Packet::Free(batch);
+  bess::PacketFreeBatch(batch);
 }
 
 ADD_MODULE(Sink, "sink", "discards all packets")

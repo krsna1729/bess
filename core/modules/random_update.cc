@@ -126,7 +126,8 @@ void RandomUpdate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     size_t bit_shift = var->bit_shift;
 
     for (int j = 0; j < cnt; j++) {
-      be32_t *p = batch->pkts()[j]->head_data<be32_t *>(offset);
+      bess::PacketRef pkt = batch->packet(j);
+      be32_t *p = pkt.head_data<be32_t *>(offset);
       uint32_t rand_val = min + rng_.GetRange(range);
       *p = (*p & mask) | (be32_t(rand_val) << bit_shift);
     }

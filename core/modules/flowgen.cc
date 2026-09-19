@@ -51,6 +51,7 @@ using bess::utils::be32_t;
 
 /* we ignore the last 1% tail to make the variance finite */
 const double PARETO_TAIL_LIMIT = 0.99;
+constexpr size_t kMinTcpPacketSize = 60;
 
 const Commands FlowGen::cmds = {
     {"update", "FlowGenArg", MODULE_CMD_FUNC(&FlowGen::CommandUpdate),
@@ -203,6 +204,10 @@ CommandResponse FlowGen::ProcessUpdatableArguments(const bess::pb::FlowGenArg &a
     if (ip->protocol != Ipv4::Proto::kUdp &&
         ip->protocol != Ipv4::Proto::kTcp) {
       return CommandFailure(EINVAL, "'template' is not UDP or TCP");
+    }
+    if (ip->protocol == Ipv4::Proto::kTcp &&
+        arg.template_().length() < kMinTcpPacketSize) {
+      return CommandFailure(EINVAL, "TCP 'template' must be at least 60 bytes");
     }
 
     if (l4_proto_ == 0) {
@@ -402,24 +407,23 @@ CommandResponse FlowGen::UpdateBaseAddresses() {
   return CommandSuccess();
 }
 
-bess::Packet *FlowGen::FillUdpPacket(struct flow *f) {
-  bess::Packet *pkt;
-
-  int size = template_size_;
-
-  if (!(pkt = current_worker.packet_pool()->Alloc())) {
-    return nullptr;
+bess::PacketRef FlowGen::FillUdpPacket(struct flow *f) {
+  bess::PacketRef pkt(current_worker.packet_pool()->Alloc());
+  const int size = template_size_;
+  if (!pkt.handle()) {
+    return {};
   }
 
-  char *p = pkt->buffer<char *>() + SNBUF_HEADROOM;
-  Ethernet *eth = reinterpret_cast<Ethernet *>(p);
+  pkt.reset();
+  void *data = pkt.append(size);
+  if (!data) {
+    bess::PacketFree(pkt.handle());
+    return {};
+  }
+  bess::utils::Copy(data, tmpl_, size, true);
+
+  Ethernet *eth = pkt.head_data<Ethernet *>();
   Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
-
-  pkt->set_data_off(SNBUF_HEADROOM);
-  pkt->set_total_len(size);
-  pkt->set_data_len(size);
-  bess::utils::Copy(p, tmpl_, size, true);
-
   ip->src = f->src_ip;
   ip->dst = f->dst_ip;
 
@@ -434,36 +438,31 @@ bess::Packet *FlowGen::FillUdpPacket(struct flow *f) {
   return pkt;
 }
 
-
-bess::Packet *FlowGen::FillTcpPacket(struct flow *f) {
-  bess::Packet *pkt;
-
-  int size = template_size_;
-
-  if (!(pkt = current_worker.packet_pool()->Alloc())) {
-    return nullptr;
+bess::PacketRef FlowGen::FillTcpPacket(struct flow *f) {
+  bess::PacketRef pkt(current_worker.packet_pool()->Alloc());
+  const int size = template_size_;
+  if (!pkt.handle()) {
+    return {};
   }
 
-  char *p = pkt->buffer<char *>() + SNBUF_HEADROOM;
+  pkt.reset();
+  void *data = pkt.append(size);
+  if (!data) {
+    bess::PacketFree(pkt.handle());
+    return {};
+  }
+  bess::utils::Copy(data, tmpl_, size, true);
 
-  Ethernet *eth = reinterpret_cast<Ethernet *>(p);
+  Ethernet *eth = pkt.head_data<Ethernet *>();
   Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
-
-  bess::utils::Copy(p, tmpl_, size, true);
 
   // SYN or FIN?
   if (f->first_pkt || f->packets_left <= 1) {
-    pkt->set_total_len(60);  // eth + ip + tcp
-    pkt->set_data_len(60);   // eth + ip + tcp
+    pkt.trim(size - kMinTcpPacketSize);
     ip->length = be16_t(40);
-  } else {
-    pkt->set_data_off(SNBUF_HEADROOM);
-    pkt->set_total_len(size);
-    pkt->set_data_len(size);
   }
 
   uint8_t tcp_flags = f->first_pkt ? /* SYN */ 0x02 : /* ACK */ 0x10;
-
   if (f->packets_left <= 1) {
     tcp_flags |= 0x01; /* FIN */
   }
@@ -475,7 +474,6 @@ bess::Packet *FlowGen::FillTcpPacket(struct flow *f) {
   Tcp *tcp = reinterpret_cast<Tcp *>(reinterpret_cast<char *>(ip) + ip_bytes);
   tcp->src_port = f->src_port;
   tcp->dst_port = f->dst_port;
-
   tcp->flags = tcp_flags;
   tcp->seq_num = be32_t(f->next_seq_no);
   tcp->checksum = bess::utils::CalculateIpv4TcpChecksum(*ip, *tcp);
@@ -507,13 +505,13 @@ void FlowGen::GeneratePackets(Context *ctx, bess::PacketBatch *batch) {
       continue;
     }
 
-    bess::Packet *pkt = nullptr;
+    bess::PacketRef pkt;
     if (l4_proto_ == Ipv4::Proto::kUdp) {
       pkt = FillUdpPacket(f);
     } else if (l4_proto_ == Ipv4::Proto::kTcp) {
       pkt = FillTcpPacket(f);
     }
-    if (pkt) {
+    if (pkt.handle()) {
       batch->add(pkt);
     }
 

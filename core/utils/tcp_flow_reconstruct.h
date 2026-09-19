@@ -68,16 +68,16 @@ class TcpFlowReconstruct {
     return (it == received_map_.end()) ? 0 : (it->second - it->first);
   }
 
-  // Adds the data of the given packet based upon its TCP sequence number.  If
-  // the packet is a SYN then we use the SYN to set the initial sequence number
-  // offset.
+  // Adds the data of the given packet view based upon its TCP sequence number.
+  // If the packet is a SYN then we use the SYN to set the initial sequence
+  // number offset.
   //
-  // Returns true upon success.  Returns false if the given packet is not a SYN
+  // Returns true upon success. Returns false if the given packet is not a SYN
   // but if we have not been given a SYN previously.
   //
-  // Behavior is undefined the packet is not a TCP packet.
-  bool InsertPacket(Packet *p) {
-    const Ethernet *eth = p->head_data<const Ethernet *>();
+  // Behavior is undefined if the packet is not a TCP packet.
+  bool InsertPacket(PacketRef p) {
+    const Ethernet *eth = p.head_data<const Ethernet *>();
     const Ipv4 *ip = (const Ipv4 *)(eth + 1);
     const Tcp *tcp =
         (const Tcp *)(((const char *)ip) + (ip->header_length * 4));

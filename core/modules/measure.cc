@@ -43,8 +43,8 @@ using bess::utils::Ethernet;
 using bess::utils::Ipv4;
 using bess::utils::Udp;
 
-static bool IsTimestamped(bess::Packet *pkt, size_t offset, uint64_t *time) {
-  auto *marker = pkt->head_data<Timestamp::MarkerType *>(offset);
+static bool IsTimestamped(bess::PacketRef pkt, size_t offset, uint64_t *time) {
+  auto *marker = pkt.head_data<Timestamp::MarkerType *>(offset);
 
   if (*marker == Timestamp::kMarker) {
     *time = *reinterpret_cast<uint64_t *>(marker + 1);
@@ -116,10 +116,11 @@ void Measure::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
   int cnt = batch->cnt();
   for (int i = 0; i < cnt; i++) {
+    bess::PacketRef pkt = batch->packet(i);
     uint64_t pkt_time = 0;
     if (attr_id_ != -1)
-      pkt_time = get_attr<uint64_t>(this, attr_id_, batch->pkts()[i]);
-    if (pkt_time || IsTimestamped(batch->pkts()[i], offset, &pkt_time)) {
+      pkt_time = get_attr<uint64_t>(this, attr_id_, pkt);
+    if (pkt_time || IsTimestamped(pkt, offset, &pkt_time)) {
       uint64_t diff;
 
       if (now_ns >= pkt_time) {
@@ -129,7 +130,7 @@ void Measure::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
         continue;
       }
 
-      bytes_cnt_ += batch->pkts()[i]->total_len();
+      bytes_cnt_ += pkt.total_len();
 
       rtt_hist_.Insert(diff);
       if (rand_.GetRealNonzero() <= jitter_sample_prob_) {

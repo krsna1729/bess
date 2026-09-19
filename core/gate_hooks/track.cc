@@ -69,7 +69,7 @@ void Track::ProcessBatch(const bess::PacketBatch *batch) {
 
   uint64_t bytes = 0;
   for (size_t i = 0; i < cnt; i++) {
-    bytes += batch->pkts()[i]->data_len() + kEthernetOverhead;
+    bytes += batch->packet(i).data_len() + kEthernetOverhead;
   }
   stat->bytes += bytes;
 }

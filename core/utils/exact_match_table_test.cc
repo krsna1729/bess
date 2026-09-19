@@ -138,7 +138,7 @@ TEST(EmTableTest, FindMakeKeysPktBatch) {
   ExactMatchKey keys[n];
   bess::PacketBatch batch;
   bess::PlainPacketPool pool;
-  bess::Packet *pkts[n];
+  bess::PacketHandle pkts[n];
   pool.AllocBulk(pkts, n, 0);
   char databuf[32] = {0};
 
@@ -147,13 +147,13 @@ TEST(EmTableTest, FindMakeKeysPktBatch) {
 
   batch.clear();
   for (size_t i = 0; i < n; i++) {
-    bess::Packet *pkt = pkts[i];
-    bess::utils::Copy(pkt->append(sizeof(databuf)), databuf, sizeof(databuf));
+    bess::PacketRef pkt(pkts[i]);
+    bess::utils::Copy(pkt.append(sizeof(databuf)), databuf, sizeof(databuf));
     batch.add(pkt);
   }
 
-  const auto buffer_fn = [](const bess::Packet *pkt, const ExactMatchField &) {
-    return pkt->head_data<void *>();
+  const auto buffer_fn = [](bess::PacketRef pkt, const ExactMatchField &) {
+    return pkt.head_data<void *>();
   };
   em.MakeKeys(&batch, buffer_fn, keys);
   for (size_t i = 0; i < n; i++) {

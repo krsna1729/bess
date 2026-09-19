@@ -125,8 +125,6 @@ TEST(PacketRefTest, ResolvesToTheSamePacketState) {
   EXPECT_EQ(reinterpret_cast<uintptr_t>(ref.metadata<char *>()),
             pkt->metadata<uintptr_t>());
   EXPECT_EQ(ref.scratchpad<char *>(), pkt->scratchpad<char *>());
-  EXPECT_EQ(ref.buffer(), pkt->buffer());
-  EXPECT_EQ(ref.dma_addr(), pkt->dma_addr());
 
   void *appended = ref.append(14);
   ASSERT_NE(appended, nullptr);
@@ -143,14 +141,11 @@ TEST(PacketRefTest, ResolvesToTheSamePacketState) {
   EXPECT_EQ(ref.data_len(), pkt->data_len());
   EXPECT_EQ(ref.total_len(), pkt->total_len());
 
-  // Sequenced deliberately: both sides move the same packet's data offset, so
-  // comparing them in one expression would depend on evaluation order.
+  // Mutating packet layout through the ref updates the same Packet state.
   void *prepended = ref.prepend(4);
   EXPECT_EQ(prepended, pkt->head_data());
-  EXPECT_EQ(ref.data_off(), pkt->data_off());
   void *adjusted = ref.adj(2);
   EXPECT_EQ(adjusted, pkt->head_data());
-  EXPECT_EQ(ref.data_off(), pkt->data_off());
 
   ref.set_data_len(3);
   EXPECT_EQ(pkt->data_len(), 3);

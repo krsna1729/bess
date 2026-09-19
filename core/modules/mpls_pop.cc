@@ -52,9 +52,9 @@ void MPLSPop::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
 
-    Ethernet *eth = pkt->head_data<Ethernet *>();
+    Ethernet *eth = pkt.head_data<Ethernet *>();
 
     if (eth->ether_type != be16_t(Ethernet::Type::kMpls)) {
       // non MPLS packets are sent to different output gate
@@ -67,13 +67,13 @@ void MPLSPop::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
     // TODO(gsagie) convert this to be more efficient using Intel instructions
     if (remove_eth_header_) {
-      pkt->adj(sizeof(Ethernet) + sizeof(Mpls));
+      pkt.adj(sizeof(Ethernet) + sizeof(Mpls));
     } else {
       Ethernet::Address src_addr = eth->src_addr;
       Ethernet::Address dst_addr = eth->dst_addr;
 
-      pkt->adj(sizeof(Mpls));
-      Ethernet *eth_new = pkt->head_data<Ethernet *>();
+      pkt.adj(sizeof(Mpls));
+      Ethernet *eth_new = pkt.head_data<Ethernet *>();
       eth_new->src_addr = src_addr;
       eth_new->dst_addr = dst_addr;
       eth_new->ether_type = next_ether_type_;

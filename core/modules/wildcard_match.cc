@@ -182,15 +182,15 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
 
     for (int j = 0; j < cnt; j++) {
-      bess::Packet *pkt = batch->pkts()[j];
+      bess::PacketRef pkt = batch->packet(j);
 
       // Offset-based attrs are relative to the packet header; metadata
       // attrs live in BESS's own private per-packet area (see
       // bess::Packet::priv() / metadata()) -- these are two different
       // regions, not one contiguous buffer at a fixed relative offset.
       const char *base_addr =
-          (attr_id < 0) ? pkt->buffer<const char *>() + pkt->data_off()
-                        : pkt->metadata<const char *>();
+          (attr_id < 0) ? pkt.head_data<const char *>()
+                        : pkt.metadata<const char *>();
 
       char *key = reinterpret_cast<char *>(keys[j].u64_arr) + pos;
 
@@ -200,7 +200,7 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   }
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
     EmitPacket(ctx, pkt, LookupEntry(keys[i], default_gate));
   }
 }

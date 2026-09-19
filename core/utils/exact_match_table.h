@@ -241,7 +241,7 @@ class ExactMatchTable {
   // be based on metadata attributes. If you know your workload will never need
   // to match on metadata attributes, consider manually creating buffers from
   // your PacketBatches and instead use
-  // `MakeKeys(const void**, ExactMatchKey *, size_t)`
+  // `MakeKeys(const void**, ExactMatchKey *, size_t)`.
   template <typename BufferFunc>
   void MakeKeys(const PacketBatch *batch, const BufferFunc &buffer_fn,
                 ExactMatchKey *keys) const {
@@ -262,7 +262,7 @@ class ExactMatchTable {
         uint8_t *k = reinterpret_cast<uint8_t *>(keys[j].u64_arr) + pos;
         *(reinterpret_cast<uint64_t *>(k)) =
             *reinterpret_cast<const uint64_t *>(
-                buffer_fn(batch->pkts()[j], fields_[i])) &
+                buffer_fn(batch->packet(j), fields_[i])) &
             mask;
       }
     }

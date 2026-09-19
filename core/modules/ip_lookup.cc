@@ -138,9 +138,6 @@ void IPLookup::DeInit() {
 }
 
 void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  using bess::utils::Ethernet;
-  using bess::utils::Ipv4;
-
   // One snapshot acquisition per batch: the only thing the data path does
   // about routing updates. Holding the shared_ptr for the whole batch means a
   // concurrent command can neither free this table under an in-flight lookup
@@ -153,7 +150,7 @@ void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   struct rte_lpm *lpm = table->lpm;
 
   int cnt = batch->cnt();
-  int i;
+  int i = 0;
 
 #if VECTOR_OPTIMIZATION
   // Convert endianness for four addresses at the same time
@@ -162,28 +159,28 @@ void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
   /* 4 at a time */
   for (i = 0; i + 3 < cnt; i += 4) {
-    Ethernet *eth;
-    Ipv4 *ip;
+    bess::PacketRef pkt0 = batch->packet(i);
+    bess::PacketRef pkt1 = batch->packet(i + 1);
+    bess::PacketRef pkt2 = batch->packet(i + 2);
+    bess::PacketRef pkt3 = batch->packet(i + 3);
+    bess::utils::Ethernet *eth;
+    bess::utils::Ipv4 *ip;
 
     uint32_t a0, a1, a2, a3;
     uint32_t next_hops[4];
-
     __m128i ip_addr;
 
-    eth = batch->pkts()[i]->head_data<Ethernet *>();
-    ip = (Ipv4 *)(eth + 1);
+    eth = pkt0.head_data<bess::utils::Ethernet *>();
+    ip = (bess::utils::Ipv4 *)(eth + 1);
     a0 = ip->dst.raw_value();
-
-    eth = batch->pkts()[i + 1]->head_data<Ethernet *>();
-    ip = (Ipv4 *)(eth + 1);
+    eth = pkt1.head_data<bess::utils::Ethernet *>();
+    ip = (bess::utils::Ipv4 *)(eth + 1);
     a1 = ip->dst.raw_value();
-
-    eth = batch->pkts()[i + 2]->head_data<Ethernet *>();
-    ip = (Ipv4 *)(eth + 1);
+    eth = pkt2.head_data<bess::utils::Ethernet *>();
+    ip = (bess::utils::Ipv4 *)(eth + 1);
     a2 = ip->dst.raw_value();
-
-    eth = batch->pkts()[i + 3]->head_data<Ethernet *>();
-    ip = (Ipv4 *)(eth + 1);
+    eth = pkt3.head_data<bess::utils::Ethernet *>();
+    ip = (bess::utils::Ipv4 *)(eth + 1);
     a3 = ip->dst.raw_value();
 
     ip_addr = _mm_set_epi32(a3, a2, a1, a0);
@@ -191,30 +188,27 @@ void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
     rte_lpm_lookupx4(lpm, ip_addr, next_hops, default_gate);
 
-    EmitPacket(ctx, batch->pkts()[i], next_hops[0]);
-    EmitPacket(ctx, batch->pkts()[i + 1], next_hops[1]);
-    EmitPacket(ctx, batch->pkts()[i + 2], next_hops[2]);
-    EmitPacket(ctx, batch->pkts()[i + 3], next_hops[3]);
+    EmitPacket(ctx, pkt0, next_hops[0]);
+    EmitPacket(ctx, pkt1, next_hops[1]);
+    EmitPacket(ctx, pkt2, next_hops[2]);
+    EmitPacket(ctx, pkt3, next_hops[3]);
   }
 #endif
 
   /* process the rest one by one */
   for (; i < cnt; i++) {
-    Ethernet *eth;
-    Ipv4 *ip;
+    bess::PacketRef pkt = batch->packet(i);
+    bess::utils::Ethernet *eth =
+        pkt.head_data<bess::utils::Ethernet *>();
+    bess::utils::Ipv4 *ip = (bess::utils::Ipv4 *)(eth + 1);
 
     uint32_t next_hop;
-    int ret;
-
-    eth = batch->pkts()[i]->head_data<Ethernet *>();
-    ip = (Ipv4 *)(eth + 1);
-
-    ret = rte_lpm_lookup(lpm, ip->dst.value(), &next_hop);
+    int ret = rte_lpm_lookup(lpm, ip->dst.value(), &next_hop);
 
     if (ret == 0) {
-      EmitPacket(ctx, batch->pkts()[i], next_hop);
+      EmitPacket(ctx, pkt, next_hop);
     } else {
-      EmitPacket(ctx, batch->pkts()[i], default_gate);
+      EmitPacket(ctx, pkt, default_gate);
     }
   }
 }

@@ -42,9 +42,9 @@ void IPSwap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
 
-    Ethernet *eth = pkt->head_data<Ethernet *>();
+    Ethernet *eth = pkt.head_data<Ethernet *>();
     Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
     size_t ip_bytes = (ip->header_length & 0xf) << 2;
     Udp *udp =

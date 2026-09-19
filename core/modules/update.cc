@@ -54,8 +54,8 @@ void Update::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     int16_t offset = field->offset;  // could be < 0
 
     for (int j = 0; j < cnt; j++) {
-      bess::Packet *snb = batch->pkts()[j];
-      char *head = snb->head_data<char *>();
+      bess::PacketRef snb = batch->packet(j);
+      char *head = snb.head_data<char *>();
 
       be64_t *p = reinterpret_cast<be64_t *>(head + offset);
       *p = (*p & mask) | value;

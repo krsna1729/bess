@@ -87,19 +87,26 @@ CommandResponse Rewrite::CommandClear(const bess::pb::EmptyArg &) {
   return CommandSuccess();
 }
 
+inline void ResetPacket(bess::PacketRef pkt) {
+  // Resetting a chained mbuf would detach its tail without freeing it.
+  if (pkt.nb_segs() > 1) {
+    bess::PacketRef tail = pkt.next();
+    pkt.set_next(bess::PacketRef());
+    pkt.set_nb_segs(1);
+    bess::PacketFree(tail.handle());
+  }
+  pkt.reset();
+}
+
 inline void Rewrite::DoRewriteSingle(bess::PacketBatch *batch) {
   const int cnt = batch->cnt();
   uint16_t size = template_size_[0];
   const void *templ = templates_[0];
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
-    char *ptr = pkt->buffer<char *>() + SNBUF_HEADROOM;
-
-    pkt->set_data_off(SNBUF_HEADROOM);
-    pkt->set_total_len(size);
-    pkt->set_data_len(size);
-
+    bess::PacketRef pkt = batch->packet(i);
+    ResetPacket(pkt);
+    void *ptr = pkt.append(size);
     bess::utils::CopyInlined(ptr, templ, size, true);
   }
 }
@@ -110,13 +117,9 @@ inline void Rewrite::DoRewrite(bess::PacketBatch *batch) {
 
   for (size_t i = 0; i < cnt; i++) {
     uint16_t size = template_size_[start + i];
-    bess::Packet *pkt = batch->pkts()[i];
-    char *ptr = pkt->buffer<char *>() + SNBUF_HEADROOM;
-
-    pkt->set_data_off(SNBUF_HEADROOM);
-    pkt->set_total_len(size);
-    pkt->set_data_len(size);
-
+    bess::PacketRef pkt = batch->packet(i);
+    ResetPacket(pkt);
+    void *ptr = pkt.append(size);
     bess::utils::CopyInlined(ptr, templates_[start + i], size, true);
   }
 

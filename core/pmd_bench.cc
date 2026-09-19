@@ -128,7 +128,7 @@ void BM_PmdNullTx(benchmark::State &state) {
   PmdFixture &fx = GetFixture();
   bess::PacketPool *pool = DefaultPool();
   const int batch = static_cast<int>(state.range(0));
-  bess::Packet *pkts[bess::PacketBatch::kMaxBurst];
+  bess::PacketHandle pkts[bess::PacketBatch::kMaxBurst];
   uint64_t sent_total = 0;
   uint64_t dropped = 0;
 
@@ -144,7 +144,7 @@ void BM_PmdNullTx(benchmark::State &state) {
     // Anything it didn't accept is a real drop: free it to keep the pool
     // balanced across iterations.
     for (int i = sent; i < batch; i++) {
-      bess::Packet::Free(pkts[i]);
+      bess::PacketFree(pkts[i]);
     }
   }
   // Actual packets transmitted, not requested: if a future change starts
@@ -161,7 +161,7 @@ void BM_PmdNullTxEndToEnd(benchmark::State &state) {
   PmdFixture &fx = GetFixture();
   bess::PacketPool *pool = DefaultPool();
   const int batch = static_cast<int>(state.range(0));
-  bess::Packet *pkts[bess::PacketBatch::kMaxBurst];
+  bess::PacketHandle pkts[bess::PacketBatch::kMaxBurst];
   uint64_t sent_total = 0;
   uint64_t dropped = 0;
 
@@ -171,7 +171,7 @@ void BM_PmdNullTxEndToEnd(benchmark::State &state) {
     sent_total += static_cast<uint64_t>(sent);
     dropped += static_cast<uint64_t>(batch - sent);
     for (int i = sent; i < batch; i++) {
-      bess::Packet::Free(pkts[i]);
+      bess::PacketFree(pkts[i]);
     }
   }
   state.SetItemsProcessed(sent_total);
@@ -186,8 +186,8 @@ void BM_PmdRingRoundTrip(benchmark::State &state) {
   PmdFixture &fx = GetFixture();
   bess::PacketPool *pool = DefaultPool();
   const int batch = static_cast<int>(state.range(0));
-  bess::Packet *tx[bess::PacketBatch::kMaxBurst];
-  bess::Packet *rx[bess::PacketBatch::kMaxBurst];
+  bess::PacketHandle tx[bess::PacketBatch::kMaxBurst];
+  bess::PacketHandle rx[bess::PacketBatch::kMaxBurst];
   uint64_t tx_drops = 0;
   uint64_t rx_total = 0;
 
@@ -199,7 +199,7 @@ void BM_PmdRingRoundTrip(benchmark::State &state) {
     int sent = fx.ring_port.SendPackets(0, tx, batch);
     tx_drops += static_cast<uint64_t>(batch - sent);
     for (int i = sent; i < batch; i++) {
-      bess::Packet::Free(tx[i]);
+      bess::PacketFree(tx[i]);
     }
 
     int recvd = fx.ring_port.RecvPackets(0, rx, batch);
@@ -210,7 +210,7 @@ void BM_PmdRingRoundTrip(benchmark::State &state) {
     // future PMD/Stage-2 change that strands a packet would otherwise leak
     // it into the next iteration and silently measure a shifted workload.
     CHECK_EQ(recvd, sent);
-    bess::Packet::Free(rx, recvd);
+    bess::PacketFreeBulk(rx, recvd);
   }
   state.SetItemsProcessed(rx_total);
   state.counters["tx_drops"] = benchmark::Counter(tx_drops);
@@ -223,8 +223,8 @@ void BM_PmdRingRoundTripEndToEnd(benchmark::State &state) {
   PmdFixture &fx = GetFixture();
   bess::PacketPool *pool = DefaultPool();
   const int batch = static_cast<int>(state.range(0));
-  bess::Packet *tx[bess::PacketBatch::kMaxBurst];
-  bess::Packet *rx[bess::PacketBatch::kMaxBurst];
+  bess::PacketHandle tx[bess::PacketBatch::kMaxBurst];
+  bess::PacketHandle rx[bess::PacketBatch::kMaxBurst];
   uint64_t tx_drops = 0;
   uint64_t rx_total = 0;
 
@@ -233,13 +233,13 @@ void BM_PmdRingRoundTripEndToEnd(benchmark::State &state) {
     int sent = fx.ring_port.SendPackets(0, tx, batch);
     tx_drops += static_cast<uint64_t>(batch - sent);
     for (int i = sent; i < batch; i++) {
-      bess::Packet::Free(tx[i]);
+      bess::PacketFree(tx[i]);
     }
 
     int recvd = fx.ring_port.RecvPackets(0, rx, batch);
     rx_total += static_cast<uint64_t>(recvd);
     CHECK_EQ(recvd, sent);  // self-loopback invariant, see above
-    bess::Packet::Free(rx, recvd);
+    bess::PacketFreeBulk(rx, recvd);
   }
   state.SetItemsProcessed(rx_total);
   state.counters["tx_drops"] = benchmark::Counter(tx_drops);

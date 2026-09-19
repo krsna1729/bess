@@ -67,7 +67,7 @@ void WorkerSplit::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   if (gate >= 0) {
     RunChooseModule(ctx, gate, batch);
   } else {
-    bess::Packet::Free(batch);
+    bess::PacketFreeBatch(batch);
   }
 }
 

@@ -39,8 +39,8 @@ void VLANSplit::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
-    char *old_head = pkt->head_data<char *>();
+    bess::PacketRef pkt = batch->packet(i);
+    char *old_head = pkt.head_data<char *>();
     __m128i eth;
 
     eth = _mm_loadu_si128(reinterpret_cast<__m128i *>(old_head));
@@ -49,7 +49,7 @@ void VLANSplit::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     bool tagged = (tpid == be16_t(Ethernet::Type::kVlan)) ||
                   (tpid == be16_t(Ethernet::Type::kQinQ));
 
-    if (tagged && pkt->adj(4)) {
+    if (tagged && pkt.adj(4)) {
       be16_t tci(be16_t::swap(_mm_extract_epi16(eth, 7)));
       eth = _mm_slli_si128(eth, 4);
       _mm_storeu_si128(reinterpret_cast<__m128i *>(old_head), eth);

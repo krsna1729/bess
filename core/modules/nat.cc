@@ -329,9 +329,9 @@ inline void NAT::DoProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   uint64_t now = ctx->current_ns;
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
 
-    Ethernet *eth = pkt->head_data<Ethernet *>();
+    Ethernet *eth = pkt.head_data<Ethernet *>();
     Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
     size_t ip_bytes = (ip->header_length) << 2;
     void *l4 = reinterpret_cast<uint8_t *>(ip) + ip_bytes;

@@ -60,7 +60,7 @@ class TcpFlowReconstructTest : public ::testing::TestWithParam<const char *> {
     while ((pcap_pkt = pcap_next(handle_, &pcap_hdr)) != nullptr) {
       ASSERT_EQ(pcap_hdr.caplen, pcap_hdr.len)
           << "Didn't capture the full packet.";
-      Packet *p = pool_.Alloc(pcap_hdr.caplen);
+      PacketHandle p = pool_.Alloc(pcap_hdr.caplen);
       bess::utils::Copy(p->head_data(), pcap_pkt, pcap_hdr.caplen);
       pkts_.push_back(p);
     }
@@ -75,8 +75,8 @@ class TcpFlowReconstructTest : public ::testing::TestWithParam<const char *> {
   }
 
   virtual void TearDown() {
-    for (Packet *p : pkts_) {
-      bess::Packet::Free(p);
+    for (PacketHandle p : pkts_) {
+      PacketFree(p);
     }
     if (handle_) {
       pcap_close(handle_);
@@ -86,7 +86,7 @@ class TcpFlowReconstructTest : public ::testing::TestWithParam<const char *> {
   PlainPacketPool pool_;
 
   // The packets of the pcap trace file.
-  std::vector<Packet *> pkts_;
+  std::vector<PacketHandle> pkts_;
 
   // The correctly reconstructed raw TCP byte stream.
   std::vector<char> bytestream_;
@@ -106,8 +106,8 @@ TEST(TcpFlowReconstruct, Constructor) {
 TEST_F(TcpFlowReconstructTest, StandardReconstruction) {
   TcpFlowReconstruct t(1);
 
-  for (Packet *p : pkts_) {
-    ASSERT_TRUE(t.InsertPacket(p));
+  for (PacketHandle p : pkts_) {
+    ASSERT_TRUE(t.InsertPacket(PacketRef(p)));
   }
 
   ASSERT_EQ(bytestream_.size(), t.contiguous_len());
@@ -116,13 +116,13 @@ TEST_F(TcpFlowReconstructTest, StandardReconstruction) {
 
 // Tests that reordering packets doesn't affect the reconstruction.
 TEST_F(TcpFlowReconstructTest, ReorderedReconstruction) {
-  Packet *syn = pkts_[0];
+  PacketHandle syn = pkts_[0];
 
-  std::vector<Packet *> pkt_rotation;
+  std::vector<PacketHandle> pkt_rotation;
   for (size_t i = 1; i < pkts_.size(); ++i) {
     int ack_size = sizeof(Ethernet) + sizeof(Ipv4) + sizeof(Tcp);
     // Skip pure ACK packets for the permutations
-    if (pkts_[i]->head_len() > ack_size) {
+    if (PacketRef(pkts_[i]).head_len() > ack_size) {
       pkt_rotation.push_back(pkts_[i]);
     }
   }
@@ -130,10 +130,10 @@ TEST_F(TcpFlowReconstructTest, ReorderedReconstruction) {
 
   do {
     TcpFlowReconstruct t;
-    ASSERT_TRUE(t.InsertPacket(syn));
+    ASSERT_TRUE(t.InsertPacket(PacketRef(syn)));
 
-    for (Packet *p : pkt_rotation) {
-      ASSERT_TRUE(t.InsertPacket(p));
+    for (PacketHandle p : pkt_rotation) {
+      ASSERT_TRUE(t.InsertPacket(PacketRef(p)));
     }
 
     ASSERT_EQ(bytestream_.size(), t.contiguous_len());
@@ -143,13 +143,13 @@ TEST_F(TcpFlowReconstructTest, ReorderedReconstruction) {
 
 // Tests that we reject packet insertion without the SYN.
 TEST_F(TcpFlowReconstructTest, MissingSyn) {
-  Packet *syn = pkts_[0];
-  Packet *nonsyn = pkts_[1];
+  PacketHandle syn = pkts_[0];
+  PacketHandle nonsyn = pkts_[1];
 
   TcpFlowReconstruct t(1);
-  ASSERT_FALSE(t.InsertPacket(nonsyn));
-  ASSERT_TRUE(t.InsertPacket(syn));
-  ASSERT_TRUE(t.InsertPacket(nonsyn));
+  ASSERT_FALSE(t.InsertPacket(PacketRef(nonsyn)));
+  ASSERT_TRUE(t.InsertPacket(PacketRef(syn)));
+  ASSERT_TRUE(t.InsertPacket(PacketRef(nonsyn)));
 }
 
 }  // namespace

@@ -45,7 +45,8 @@ void IPChecksum::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
 
   for (int i = 0; i < cnt; i++) {
-    Ethernet *eth = batch->pkts()[i]->head_data<Ethernet *>();
+    bess::PacketRef pkt = batch->packet(i);
+    Ethernet *eth = pkt.head_data<Ethernet *>();
     void *data = eth + 1;
     Ipv4 *ip;
 
@@ -56,7 +57,7 @@ void IPChecksum::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       data = qinq + 1;
       ether_type = qinq->ether_type;
       if (ether_type != be16_t(Ethernet::Type::kVlan)) {
-	EmitPacket(ctx, batch->pkts()[i], FORWARD_GATE);
+        EmitPacket(ctx, pkt, FORWARD_GATE);
 	continue;
       }
     }
@@ -70,15 +71,15 @@ void IPChecksum::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     if (ether_type == be16_t(Ethernet::Type::kIpv4)) {
       ip = reinterpret_cast<Ipv4 *>(data);
     } else {
-      EmitPacket(ctx, batch->pkts()[i], FORWARD_GATE);
+      EmitPacket(ctx, pkt, FORWARD_GATE);
       continue;
     }
 
     if (verify_) {
-      EmitPacket(ctx, batch->pkts()[i], (VerifyIpv4Checksum(*ip)) ? FORWARD_GATE : FAIL_GATE);
+      EmitPacket(ctx, pkt, (VerifyIpv4Checksum(*ip)) ? FORWARD_GATE : FAIL_GATE);
     } else {
       ip->checksum = CalculateIpv4Checksum(*ip);
-      EmitPacket(ctx, batch->pkts()[i], FORWARD_GATE);
+      EmitPacket(ctx, pkt, FORWARD_GATE);
     }
   }
 }

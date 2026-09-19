@@ -100,14 +100,14 @@ CommandResponse RoundRobin::CommandSetGates(
 
 void RoundRobin::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   if (ngates_ <= 0) {
-    bess::Packet::Free(batch);
+    bess::PacketFreeBatch(batch);
     return;
   }
 
   if (per_packet_) {
     int cnt = batch->cnt();
     for (int i = 0; i < cnt; i++) {
-      bess::Packet *pkt = batch->pkts()[i];
+      bess::PacketRef pkt = batch->packet(i);
       EmitPacket(ctx, pkt, gates_[current_gate_]);
       if (++current_gate_ >= ngates_) {
         current_gate_ = 0;

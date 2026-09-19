@@ -65,8 +65,8 @@ void VXLANDecap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
-    Ethernet *eth = pkt->head_data<Ethernet *>();
+    bess::PacketRef pkt = batch->packet(i);
+    Ethernet *eth = pkt.head_data<Ethernet *>();
     Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
     size_t ip_bytes = ip->header_length << 2;
     Udp *udp =
@@ -77,7 +77,7 @@ void VXLANDecap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     set_attr<be32_t>(this, ATTR_W_TUN_IP_DST, pkt, ip->dst);
     set_attr<be32_t>(this, ATTR_W_TUN_ID, pkt, vh->vx_vni >> 8);
 
-    pkt->adj(sizeof(*eth) + ip_bytes + sizeof(*udp) + sizeof(*vh));
+    pkt.adj(sizeof(*eth) + ip_bytes + sizeof(*udp) + sizeof(*vh));
   }
 
   RunNextModule(ctx, batch);

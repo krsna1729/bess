@@ -101,13 +101,13 @@ CommandResponse RandomSplit::CommandSetGates(
 
 void RandomSplit::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   if (ngates_ <= 0) {
-    bess::Packet::Free(batch);
+    bess::PacketFreeBatch(batch);
     return;
   }
 
   int cnt = batch->cnt();
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
     if (rng_.GetReal() > drop_rate_) {
       EmitPacket(ctx, pkt, gates_[rng_.GetRange(ngates_)]);
     } else {

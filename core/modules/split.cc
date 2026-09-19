@@ -69,15 +69,15 @@ void Split::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   if (attr_id_ >= 0) {
     bess::metadata::mt_offset_t offset = attr_offset(attr_id_);
     for (int i = 0; i < cnt; i++) {
-      bess::Packet *pkt = batch->pkts()[i];
+      bess::PacketRef pkt = batch->packet(i);
       uint64_t val = get_attr_with_offset<be64_t>(offset, pkt).value();
       val = (val >> shift_) & mask_;
       EmitPacket(ctx, pkt, val);
     }
   } else {
     for (int i = 0; i < cnt; i++) {
-      bess::Packet *pkt = batch->pkts()[i];
-      uint64_t val = (pkt->head_data<be64_t *>(offset_))->value();
+      bess::PacketRef pkt = batch->packet(i);
+      uint64_t val = (pkt.head_data<be64_t *>(offset_))->value();
       val = (val >> shift_) & mask_;
       EmitPacket(ctx, pkt, val);
     }

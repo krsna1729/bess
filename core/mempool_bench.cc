@@ -176,6 +176,8 @@
 namespace {
 
 using bess::Packet;
+using bess::PacketHandle;
+using bess::PacketRef;
 
 // Pool and handoff sizing. The worst-case in-flight set must stay strictly
 // below the pool capacity, or the producer would spin on a drained pool --
@@ -530,7 +532,7 @@ struct BenchPoolPrivate {
 void InitPacket(rte_mempool *mp, void *, void *mbuf, unsigned index) {
   rte_pktmbuf_init(mp, nullptr, mbuf, index);
 
-  auto *pkt = static_cast<Packet *>(mbuf);
+  auto *pkt = static_cast<PacketHandle>(mbuf);
   pkt->set_vaddr(pkt);
   pkt->set_paddr(rte_mempool_virt2iova(pkt));
 }
@@ -574,13 +576,14 @@ class BenchPool {
   // omission is ~2 stores of constant work, identical in every measured
   // configuration, and it keeps this file out of Packet's private fields
   // (friend class PacketPool) entirely.
-  bool AllocBulk(Packet **pkts, size_t count, size_t len) {
+  bool AllocBulk(PacketHandle *pkts, size_t count, size_t len) {
     if (rte_mempool_get_bulk(mp_, reinterpret_cast<void **>(pkts), count) < 0) {
       return false;
     }
     for (size_t i = 0; i < count; i++) {
-      pkts[i]->set_total_len(len);
-      pkts[i]->set_data_len(len);
+      PacketRef pkt(pkts[i]);
+      pkt.set_total_len(len);
+      pkt.set_data_len(len);
     }
     return true;
   }
@@ -678,7 +681,7 @@ void ProducerLoop(ProducerArgs *args) {
            "cross-worker case would not be measured at all";
   }
 
-  Packet *pkts[kMaxBatch];
+  PacketHandle pkts[kMaxBatch];
   while (!args->start->load(std::memory_order_acquire)) {
   }
   args->cpu_id = sched_getcpu();
@@ -729,7 +732,7 @@ void BM_MempoolLocal(benchmark::State &state) {
   PinCurrentThread(g_consumer_cpu);
   CheckCacheInPlay(pool->mp(), cache_size);
 
-  Packet *pkts[kMaxBatch];
+  PacketHandle pkts[kMaxBatch];
   uint64_t items = 0;
   uint64_t failures = 0;
 
@@ -743,7 +746,7 @@ void BM_MempoolLocal(benchmark::State &state) {
       CHECK_LT(failures, kMaxAllocFailures) << "pool drained in the local case";
       continue;
     }
-    Packet::Free(pkts, batch);
+    bess::PacketFreeBulk(pkts, batch);
     items += batch;
   }
   const uint64_t cpu_ns = ThreadCpuNs() - cpu0;
@@ -793,7 +796,7 @@ void BM_MempoolPipeline(benchmark::State &state) {
   PinCurrentThread(g_consumer_cpu);
   CheckCacheInPlay(pool->mp(), cache_size);
 
-  Packet *pkts[kMaxBatch];
+  PacketHandle pkts[kMaxBatch];
   uint64_t items_total = 0;
   uint64_t prod_cpu_total = 0;
   uint64_t cons_cpu_total = 0;
@@ -822,7 +825,7 @@ void BM_MempoolPipeline(benchmark::State &state) {
       if (got == 0) {
         continue;  // the consumer waits for the producer: real pipeline state
       }
-      Packet::Free(pkts, got);
+      bess::PacketFreeBulk(pkts, got);
       consumed += got;
     }
     const uint64_t cons_cpu = ThreadCpuNs() - cpu0;

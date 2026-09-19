@@ -98,23 +98,27 @@ static const char HTTP_403_BODY[] =
 static PacketTemplate rst_template;
 
 // Generate an HTTP 403 packet
-inline static bess::Packet *Generate403Packet(const Ethernet::Address &src_eth,
-                                              const Ethernet::Address &dst_eth,
-                                              be32_t src_ip, be32_t dst_ip,
-                                              be16_t src_port, be16_t dst_port,
-                                              be32_t seq, be32_t ack) {
-  bess::Packet *pkt = current_worker.packet_pool()->Alloc();
-  char *ptr = static_cast<char *>(pkt->buffer()) + SNBUF_HEADROOM;
-  pkt->set_data_off(SNBUF_HEADROOM);
-
+inline static bess::PacketRef Generate403Packet(
+    const Ethernet::Address &src_eth, const Ethernet::Address &dst_eth,
+    be32_t src_ip, be32_t dst_ip, be16_t src_port, be16_t dst_port,
+    be32_t seq, be32_t ack) {
   constexpr size_t len = sizeof(HTTP_403_BODY) - 1;
-  pkt->set_total_len(sizeof(rst_template) + len);
-  pkt->set_data_len(sizeof(rst_template) + len);
+  bess::PacketRef pkt(current_worker.packet_pool()->Alloc());
+  if (!pkt.handle()) {
+    return {};
+  }
+  pkt.reset();
+  void *ptr = pkt.append(sizeof(rst_template) + len);
+  if (!ptr) {
+    bess::PacketFree(pkt.handle());
+    return {};
+  }
 
   bess::utils::Copy(ptr, &rst_template, sizeof(rst_template));
-  bess::utils::Copy(ptr + sizeof(rst_template), HTTP_403_BODY, len);
+  bess::utils::Copy(static_cast<char *>(ptr) + sizeof(rst_template),
+                    HTTP_403_BODY, len);
 
-  Ethernet *eth = reinterpret_cast<Ethernet *>(ptr);
+  Ethernet *eth = pkt.head_data<Ethernet *>();
   Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
   // We know there is no IP option
   Tcp *tcp = reinterpret_cast<Tcp *>(ip + 1);
@@ -131,27 +135,31 @@ inline static bess::Packet *Generate403Packet(const Ethernet::Address &src_eth,
   tcp->ack_num = ack;
   tcp->flags = Tcp::Flag::kAck;
 
-  tcp->checksum = bess::utils::CalculateIpv4TcpChecksum(*tcp, src_ip, dst_ip,
-                                                        sizeof(*tcp) + len);
+  tcp->checksum = bess::utils::CalculateIpv4TcpChecksum(
+      *tcp, src_ip, dst_ip, sizeof(*tcp) + len);
   ip->checksum = bess::utils::CalculateIpv4NoOptChecksum(*ip);
 
   return pkt;
 }
 
 // Generate a TCP RST packet
-inline static bess::Packet *GenerateResetPacket(
+inline static bess::PacketRef GenerateResetPacket(
     const Ethernet::Address &src_eth, const Ethernet::Address &dst_eth,
     be32_t src_ip, be32_t dst_ip, be16_t src_port, be16_t dst_port, be32_t seq,
     be32_t ack) {
-  bess::Packet *pkt = current_worker.packet_pool()->Alloc();
-  char *ptr = static_cast<char *>(pkt->buffer()) + SNBUF_HEADROOM;
-  pkt->set_data_off(SNBUF_HEADROOM);
-  pkt->set_total_len(sizeof(rst_template));
-  pkt->set_data_len(sizeof(rst_template));
-
+  bess::PacketRef pkt(current_worker.packet_pool()->Alloc());
+  if (!pkt.handle()) {
+    return {};
+  }
+  pkt.reset();
+  void *ptr = pkt.append(sizeof(rst_template));
+  if (!ptr) {
+    bess::PacketFree(pkt.handle());
+    return {};
+  }
   bess::utils::Copy(ptr, &rst_template, sizeof(rst_template));
 
-  Ethernet *eth = reinterpret_cast<Ethernet *>(ptr);
+  Ethernet *eth = pkt.head_data<Ethernet *>();
   Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
   // We know there is no IP option
   Tcp *tcp = reinterpret_cast<Tcp *>(ip + 1);
@@ -245,9 +253,9 @@ void UrlFilter::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
 
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
 
-    Ethernet *eth = pkt->head_data<Ethernet *>();
+    Ethernet *eth = pkt.head_data<Ethernet *>();
     Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
 
     if (ip->protocol != Ipv4::Proto::kTcp) {
@@ -360,24 +368,29 @@ void UrlFilter::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       it->second.SetAnalyzed();
 
       // Inject RST to destination
-      EmitPacket(ctx, GenerateResetPacket(eth->src_addr, eth->dst_addr, ip->src,
-                                          ip->dst, tcp->src_port, tcp->dst_port,
-                                          tcp->seq_num, tcp->ack_num),
-                 0);
+      bess::PacketRef rst_to_destination = GenerateResetPacket(
+          eth->src_addr, eth->dst_addr, ip->src, ip->dst, tcp->src_port,
+          tcp->dst_port, tcp->seq_num, tcp->ack_num);
+      if (rst_to_destination.handle()) {
+        EmitPacket(ctx, rst_to_destination, 0);
+      }
 
       // Inject 403 to source. 403 should arrive earlier than RST.
-      EmitPacket(ctx, Generate403Packet(eth->dst_addr, eth->src_addr, ip->dst,
-                                        ip->src, tcp->dst_port, tcp->src_port,
-                                        tcp->ack_num, tcp->seq_num),
-                 1);
+      bess::PacketRef forbidden = Generate403Packet(
+          eth->dst_addr, eth->src_addr, ip->dst, ip->src, tcp->dst_port,
+          tcp->src_port, tcp->ack_num, tcp->seq_num);
+      if (forbidden.handle()) {
+        EmitPacket(ctx, forbidden, 1);
+      }
 
       // Inject RST to source
-      EmitPacket(ctx, GenerateResetPacket(
-                          eth->dst_addr, eth->src_addr, ip->dst, ip->src,
-                          tcp->dst_port, tcp->src_port,
-                          be32_t(tcp->ack_num.value() + strlen(HTTP_403_BODY)),
-                          tcp->seq_num),
-                 1);
+      bess::PacketRef rst_to_source = GenerateResetPacket(
+          eth->dst_addr, eth->src_addr, ip->dst, ip->src, tcp->dst_port,
+          tcp->src_port, be32_t(tcp->ack_num.value() + strlen(HTTP_403_BODY)),
+          tcp->seq_num);
+      if (rst_to_source.handle()) {
+        EmitPacket(ctx, rst_to_source, 1);
+      }
 
       // Drop the data packet
       DropPacket(ctx, pkt);

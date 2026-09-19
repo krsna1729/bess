@@ -330,18 +330,18 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const auto &table = gen->table;
   const gate_idx_t default_gate = gen->default_gate;
 
-  const auto buffer_fn = [&](bess::Packet *pkt, const ExactMatchField &f) {
+  const auto buffer_fn = [&](bess::PacketRef pkt, const ExactMatchField &f) {
     int attr_id = f.attr_id;
     if (attr_id >= 0) {
       return ptr_attr<uint8_t>(this, attr_id, pkt);
     }
-    return pkt->head_data<uint8_t *>() + f.offset;
+    return pkt.head_data<uint8_t *>() + f.offset;
   };
   table.MakeKeys(batch, buffer_fn, keys);
 
   int cnt = batch->cnt();
   for (int i = 0; i < cnt; i++) {
-    bess::Packet *pkt = batch->pkts()[i];
+    bess::PacketRef pkt = batch->packet(i);
     EmitPacket(ctx, pkt, table.Find(keys[i], default_gate));
   }
 }

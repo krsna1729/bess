@@ -1850,9 +1850,10 @@ pre-fix/post-fix module-test evidence for `a0688fcf` was produced.
 # Roadmap / Backlog
 
 Organized in phases. Phases A–F are the original DPDK-era modernization plan
-(mostly still ahead of us — Phase A is done, Phase B's Stage 1 has landed,
-Stage 2 and Phases C–F remain). Phases G–I are a newer, larger proposal — a from-first-principles
-rethink of the control plane and language/tooling stack — added 2026-09-11.
+(mostly still ahead of us — Phase A is done, Phase B's Stage 1 and Stage 2A
+have landed, while Stage 2B and Phases C–F remain). Phases G–I are a newer,
+larger proposal — a from-first-principles rethink of the control plane and
+language/tooling stack — added 2026-09-11.
 **G and the A–F track are largely independent** (G touches `bessctl`/gRPC/the
 client side; A–F touch the dataplane/DPDK/build side); either can proceed
 first. Read the "how G relates to A–F" note at the start of Phase G before
@@ -1893,8 +1894,8 @@ shadow struct. This is the fix that makes Phase-A-style ABI-drift bugs
 structurally impossible instead of merely caught by `static_assert`.
 
 **This is now explicitly staged, not a single commit sequence** — see
-"Stage 1" and "Stage 2" below. Before writing any Stage-1 code, two research
-passes (one on `PacketPool`/DPDK's `priv_size` mechanism, one on the
+"Stage 1", "Stage 2A", and "Stage 2B" below. Before writing any Stage-1 code,
+two research passes (one on `PacketPool`/DPDK's `priv_size` mechanism, one on
 blast radius of `Packet`'s layout assumptions across `core/`) found a
 concrete reason the full end-state can't land as one shot the way Phase A's
 DPDK port did:
@@ -1967,7 +1968,21 @@ calls, at real scale). Left untouched, deliberately: the `rte_mbuf`-mirroring
 union (`buf_addr_`, `data_off_`, `pkt_len_`, `next_`, etc.) and
 `CheckMbufLayout()` — that's Stage 2's problem.
 
-### Stage 2 — thin `rte_mbuf*` wrapper (not started, needs its own sign-off)
+### Stage 2A — `PacketHandle`/`PacketRef` seam and consumer migration
+
+Stage 2A landed the storage/processing boundary without changing packet
+layout or allocator representation. `PacketHandle` names the stored packet
+handle used by batches, rings, queues, ports, and ownership helpers;
+`PacketRef` is the pointer-sized, trivially copyable, non-owning view used by
+packet-processing code. `PacketBatch::packet()` supplies that view, while
+`handles()` keeps native arrays at transport boundaries. Core drivers,
+allocators, queues/rings, built-in modules, gate hooks, the sample plugin,
+benchmarks, and packet utilities now use the seam. The backing `Packet` is
+still the legacy `rte_mbuf` overlay; the thin-wrapper redesign below is not
+part of Stage 2A. Final acceptance is gated on a green CI run for the
+migration tip.
+
+### Stage 2B — thin `rte_mbuf*` wrapper (not started, needs its own sign-off)
 
 The actual `PacketRef`-over-`rte_mbuf*` wrapper, the `PacketPool` allocator
 redesign, the `PMDPort::RecvPackets`/`SendPackets` wrap/unwrap redesign at
