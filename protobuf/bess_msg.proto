@@ -362,14 +362,22 @@ message GetMclassInfoRequest {
   string name = 1;  /// Name of module type
 }
 
+/// A command supported by a module type or a gatehook type.
+message CommandInfo {
+  string name = 1;      /// Command name
+  string arg_type = 2;  /// Protobuf message type of the command argument
+  /// True iff the command may run while packet workers are running. False is
+  /// the conservative value: a caller that wants to run a command without
+  /// pausing workers must see an explicit true.
+  bool thread_safe = 3;
+}
+
 message GetMclassInfoResponse {
   Error error = 1;
   string name = 2;               /// Name of module type
   string help = 3;               /// 1=line description of the module type
-  repeated string cmds = 4;      /// List of commands supported by the module
-  repeated string cmd_args = 5;  /// Corresponding Protobuf message types
-
-  /// FIXME; Should be "repeated ModuleCommand cmds", with the above two grouped
+  repeated CommandInfo cmds = 4; /// Commands supported by the module
+  reserved 5;                    /// Former cmd_args; now part of CommandInfo
 }
 
 message ListModulesResponse {
@@ -525,8 +533,8 @@ message GetGateHookClassInfoResponse {
   Error error = 1;
   string name = 2;               /// Name of gatehook type
   string help = 3;               /// 1=line description of the gatehook type
-  repeated string cmds = 4;      /// List of commands supported by the gatehook
-  repeated string cmd_args = 5;  /// Corresponding Protobuf message types
+  repeated CommandInfo cmds = 4; /// Commands supported by the gatehook
+  reserved 5;                    /// Former cmd_args; now part of CommandInfo
 }
 
 /// Enable/Disable the "Track" hook on a gate (or all gates)

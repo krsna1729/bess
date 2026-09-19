@@ -1571,10 +1571,11 @@ def _show_mclass(cli, cls_name, detail):
     if detail:
         if len(info.cmds) > 0:
             cli.fout.write('\t\t commands: %s\n' %
-                           (', '.join(map(lambda cmd, msg: "%s(%s)"
-                                          % (cmd, msg),
-                                          info.cmds,
-                                          info.cmd_args))))
+                           (', '.join('%s(%s, %s)' % (
+                               cmd.name, cmd.arg_type,
+                               'thread-safe' if cmd.thread_safe
+                               else 'thread-unsafe')
+                               for cmd in info.cmds)))
         else:
             cli.fout.write('\t\t (no commands)\n')
 
@@ -1618,10 +1619,11 @@ def _show_gatehook_class(cli, cls_name, detail):
     if detail:
         if len(info.cmds) > 0:
             cli.fout.write('\t\t commands: %s\n' %
-                           (', '.join(map(lambda cmd, msg: "%s(%s)"
-                                          % (cmd, msg),
-                                          info.cmds,
-                                          info.cmd_args))))
+                           (', '.join('%s(%s, %s)' % (
+                               cmd.name, cmd.arg_type,
+                               'thread-safe' if cmd.thread_safe
+                               else 'thread-unsafe')
+                               for cmd in info.cmds)))
         else:
             cli.fout.write('\t\t (no commands)\n')
 

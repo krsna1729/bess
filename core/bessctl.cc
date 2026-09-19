@@ -1472,8 +1472,10 @@ class BESSControlImpl final : public BESSControl::Service {
     response->set_name(cls->class_name());
     response->set_help(cls->help_text());
     for (const auto& cmd : cls->cmds()) {
-      response->add_cmds(cmd.first);
-      response->add_cmd_args(cmd.second);
+      auto* out = response->add_cmds();
+      out->set_name(cmd.cmd);
+      out->set_arg_type(cmd.arg_type);
+      out->set_thread_safe(cmd.mt_safe == GateHookCommand::THREAD_SAFE);
     }
     return Status::OK;
   }
@@ -1750,8 +1752,10 @@ class BESSControlImpl final : public BESSControl::Service {
     response->set_name(cls->class_name());
     response->set_help(cls->help_text());
     for (const auto& cmd : cls->cmds()) {
-      response->add_cmds(cmd.first);
-      response->add_cmd_args(cmd.second);
+      auto* out = response->add_cmds();
+      out->set_name(cmd.cmd);
+      out->set_arg_type(cmd.arg_type);
+      out->set_thread_safe(cmd.mt_safe == Command::THREAD_SAFE);
     }
     return Status::OK;
   }

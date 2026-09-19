@@ -67,9 +67,8 @@ class Module(object):
 
         # add mclass-specific methods
         cls = self.bess.get_mclass_info(self.__class__.__name__)
-        assert len(cls.cmds) == len(cls.cmd_args)
-        for i, cmd in enumerate(cls.cmds):
-            func = _callback_factory(self, cmd, cls.cmd_args[i])
+        for cmd in cls.cmds:
+            func = _callback_factory(self, cmd.name, cmd.arg_type)
             setattr(self, cmd, types.MethodType(func, self))
 
         self.ogate = None
