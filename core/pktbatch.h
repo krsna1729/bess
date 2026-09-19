@@ -58,6 +58,7 @@ class PacketBatch {
   // Non-owning view of one packet. Definition lives in packet.h, where both
   // PacketRef and Packet are complete.
   PacketRef packet(size_t i);
+  PacketRef packet(size_t i) const;
 
   void clear() { cnt_ = 0; }
 
@@ -69,8 +70,8 @@ class PacketBatch {
   // Same thing through the seam; defined in packet.h.
   void add(PacketRef pkt);
   void add(PacketBatch *batch) {
-    bess::utils::CopyInlined(pkts_ + cnt_, batch->pkts(),
-                             batch->cnt() * sizeof(Packet *));
+    bess::utils::CopyInlined(handles() + cnt_, batch->handles(),
+                             batch->cnt() * sizeof(PacketHandle));
     cnt_ += batch->cnt();
   }
 
@@ -80,7 +81,8 @@ class PacketBatch {
 
   void Copy(const PacketBatch *src) {
     cnt_ = src->cnt_;
-    bess::utils::CopyInlined(pkts_, src->pkts_, cnt_ * sizeof(Packet *));
+    bess::utils::CopyInlined(handles(), src->handles(),
+                             cnt_ * sizeof(PacketHandle));
   }
 
   inline static const size_t kMaxBurst = 32;

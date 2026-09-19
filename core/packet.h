@@ -505,11 +505,12 @@ static_assert(sizeof(Packet) == SNBUF_SIZE, "Incorrect class Packet");
 // trivially copyable, destructor does nothing -- so passing one costs what
 // passing a Packet * costs, and a PacketRef never owns a packet.
 //
-// Stage 2A delegates to the legacy overlay Packet; Stage 2B reimplements these
-// against native rte_mbuf fields without changing this interface.
+// Stage 2A delegates to the legacy overlay Packet. This method set is
+// intentionally transitional while consumers migrate; Stage 2B should retain
+// only operations that express backend-neutral packet semantics.
 class PacketRef {
  public:
-  PacketRef() = default;
+  PacketRef() : pkt_(nullptr) {}
   explicit PacketRef(PacketHandle pkt) : pkt_(pkt) {}
 
   // The stored representation. Ownership and transport machinery wants this;
@@ -522,6 +523,7 @@ class PacketRef {
     return pkt_->head_data<T>(offset);
   }
 
+  // Transitional raw-data accessor; migrate consumers to logical data methods.
   template <typename T = char *>
   T data() const {
     return pkt_->data<T>();
@@ -540,22 +542,20 @@ class PacketRef {
     return pkt_->scratchpad<T>();
   }
 
+  // Transitional storage accessor; do not add new users.
   template <typename T = void *>
   T buffer() const {
     return pkt_->buffer<T>();
   }
 
-  template <typename T = char *>
-  T reserve() const {
-    return pkt_->reserve<T>();
-  }
-
   int nb_segs() const { return pkt_->nb_segs(); }
+
   void set_nb_segs(int n) { pkt_->set_nb_segs(n); }
 
   PacketRef next() const { return PacketRef(pkt_->next()); }
   void set_next(PacketRef next) { pkt_->set_next(next.handle()); }
 
+  // Transitional raw offset/length setters; migrate consumers before Stage 2B.
   uint16_t data_off() const { return pkt_->data_off(); }
   void set_data_off(uint16_t offset) { pkt_->set_data_off(offset); }
 
@@ -588,6 +588,8 @@ static_assert(sizeof(PacketRef) == sizeof(void *),
               "PacketRef must stay pointer-sized");
 static_assert(std::is_trivially_copyable<PacketRef>::value,
               "PacketRef must be trivially copyable");
+static_assert(std::is_trivially_destructible<PacketRef>::value,
+              "PacketRef must be trivially destructible");
 
 // Ownership helpers. Free functions, not PacketRef members: a PacketRef is
 // non-owning, and its destructor does nothing.
@@ -603,14 +605,19 @@ inline void PacketFreeBatch(PacketBatch *batch) {
   Packet::Free(batch);
 }
 
-// Deep-copies the packet bytes; BESS metadata is not copied, and no
-// clone/refcount semantics are introduced (Packet::copy's current contract).
+// Deep-copies a linear packet's bytes; this inherits Packet::copy's current
+// DCHECK(src->is_linear()) precondition. BESS metadata is not copied, and no
+// clone/refcount semantics are introduced.
 inline PacketHandle PacketCopy(PacketHandle src) {
   return Packet::copy(src);
 }
 
 // Defined here because both PacketRef and PacketBatch must be complete.
 inline PacketRef PacketBatch::packet(size_t i) {
+  return PacketRef(pkts_[i]);
+}
+
+inline PacketRef PacketBatch::packet(size_t i) const {
   return PacketRef(pkts_[i]);
 }
 

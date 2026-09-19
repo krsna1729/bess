@@ -102,6 +102,8 @@ TEST(PacketRefTest, IsPointerSizedAndTriviallyCopyable) {
                 "PacketRef must stay pointer-sized");
   static_assert(std::is_trivially_copyable<bess::PacketRef>::value,
                 "PacketRef must be trivially copyable");
+  static_assert(std::is_trivially_destructible<bess::PacketRef>::value,
+                "PacketRef must be trivially destructible");
   static_assert(std::is_same<bess::PacketHandle, bess::Packet *>::value,
                 "Stage 2A keeps the legacy handle");
 
@@ -220,6 +222,8 @@ TEST(PacketBatchSeamTest, HandlesAndRefsReferToTheSamePacket) {
   EXPECT_EQ(batch.cnt(), 1);
   EXPECT_EQ(batch.handles()[0], pkt);
   EXPECT_EQ(batch.packet(0).handle(), pkt);
+  const bess::PacketBatch &const_batch = batch;
+  EXPECT_EQ(const_batch.packet(0).handle(), pkt);
 
   // Batch copies stay pointer-array copies: writing through the copy reaches
   // the same packet. (Neither batch owns anything, so the packet must be
