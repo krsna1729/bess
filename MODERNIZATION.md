@@ -1850,7 +1850,7 @@ pre-fix/post-fix module-test evidence for `a0688fcf` was produced.
 # Roadmap / Backlog
 
 Organized in phases. Phases A–F are the original DPDK-era modernization plan
-(`mostly still ahead of us — Phase A is done, and Phase B's Stages 1, 2A,
+(mostly still ahead of us — Phase A is done, and Phase B's Stages 1, 2A,
 and 2B have landed; Phases C–F remain). Phases G–I are a newer,
 larger proposal — a from-first-principles rethink of the control plane and
 language/tooling stack — added 2026-09-11.
