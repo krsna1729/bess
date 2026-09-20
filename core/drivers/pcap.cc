@@ -89,7 +89,15 @@ int PCAPPort::RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
 
     int nb_segs = 1;
     while (caplen > 0) {
-      m.set_next(bess::PacketRef(current_worker.packet_pool()->Alloc()));
+      bess::PacketHandle next = current_worker.packet_pool()->Alloc();
+      if (!next) {
+        // Drop the whole chain if a later segment cannot be allocated.
+        bess::PacketFree(pkt);
+        pkt = nullptr;
+        break;
+      }
+
+      m.set_next(bess::PacketRef(next));
       m = m.next();
       nb_segs++;
 
@@ -98,6 +106,9 @@ int PCAPPort::RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
 
       packet += copy_len;
       caplen -= copy_len;
+    }
+    if (!pkt) {
+      break;
     }
     pkt_ref.set_nb_segs(nb_segs);
     pkts[recv_cnt] = pkt_ref.handle();

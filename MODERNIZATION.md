@@ -1886,48 +1886,34 @@ own intro for why it doesn't fit under A–I.
 
 ## Phase B — Packet/mbuf architecture
 
-End state (unchanged from the original proposal): stop mirroring `rte_mbuf`
-byte-for-byte in `Packet`; make `Packet` a thin wrapper (ideally
-`sizeof(void*)`) around a real `rte_mbuf*`, with BESS's own metadata moved
-into DPDK's supported mbuf private-data area instead of a hand-maintained
-shadow struct. This is the fix that makes Phase-A-style ABI-drift bugs
-structurally impossible instead of merely caught by `static_assert`.
+End state: stop mirroring `rte_mbuf` byte-for-byte in a C++ packet object.
+`PacketHandle` is the transport/ownership representation (`rte_mbuf *`);
+`PacketRef` is the only C++ packet-processing wrapper and remains one pointer
+wide. BESS's own metadata lives in DPDK's supported mbuf private-data area
+instead of a hand-maintained shadow layout. This makes Phase-A-style ABI-drift
+bugs structurally impossible rather than merely caught by `static_assert`.
 
-**This is now explicitly staged, not a single commit sequence** — see
-"Stage 1", "Stage 2A", and "Stage 2B" below. Before writing any Stage-1 code,
-two research passes (one on `PacketPool`/DPDK's `priv_size` mechanism, one on
-blast radius of `Packet`'s layout assumptions across `core/`) found a
-concrete reason the full end-state can't land as one shot the way Phase A's
-DPDK port did:
+**This is now explicitly staged, not a single commit sequence** — Stage 1
+introduced the private-area accessor, Stage 2A introduced the safe
+`PacketHandle`/`PacketRef` intermediate and migrated consumers, and Stage 2B
+replaces the backing representation. The Stage 2A seam is the safe,
+bisectable state that the original proposal lacked.
 
-- `PacketPool`'s custom mempools are sized as `sizeof(Packet)` per element
-  (`core/packet_pool.cc:72`, `rte_mempool_create_empty(..., sizeof(Packet),
-  ...)`), and `Packet` embeds a fixed `char data_[SNBUF_DATA]` array. A
-  pointer-thin `Packet` needs "the object stored in the mempool" decoupled
-  from "the C++ type used to manipulate it" — a real allocator redesign.
-- `PMDPort::RecvPackets()`/`SendPackets()` (`core/drivers/pmd.cc:504-511`)
-  hand `Packet**` straight to `rte_eth_rx_burst()`/`rte_eth_tx_burst()` —
-  **real DPDK PMD drivers write actual `struct rte_mbuf` bytes directly
-  into that array.** This only works today because `Packet` *is*
-  `rte_mbuf`-shaped. A thin wrapper needs an explicit wrap/unwrap step at
-  this exact hot-path boundary, i.e. a real redesign of the single hottest
-  code path in the system, not a mechanical rename.
-- Together these mean there's no safe intermediate/bisectable state between
-  "`Packet` overlays `rte_mbuf`" and "`Packet` is a thin wrapper" — it's an
-  atomic swap across allocator + PMD I/O + every direct field user at once.
-  That's exactly the kind of large, hard-to-reverse, hot-path change that
-  needs a dedicated design spike and explicit sign-off, not something to
-  start opportunistically just because the benchmark prerequisite is done.
-- Dynamic per-pool data-room sizing (jumbo frames, upstream `#1024`) has the
-  *same* blocker (`Packet::data_` is a fixed-size embedded array used as
-  the mempool element) — it moves to Stage 2 with the rest, it can't be
-  bundled into Stage 1 the way the original text here proposed.
+Stage 2B still has two real backend boundaries:
 
-Requires a benchmark suite *before* either stage — see "Benchmark suite"
-below: this now exists and passes green, covering packet access, batch
-operations, and scheduler throughput (the PMD-forwarding leg still needs a
-real or simulated NIC and isn't covered — see that section). Do not merge
-either stage if it regresses any benchmark checked in there.
+- `PacketPool` must size and populate native pktmbuf objects rather than
+  `sizeof(Packet)` elements with embedded payload storage.
+- `PacketRef` must use native mbuf fields/helpers while PMD RX/TX receives the
+  native handle array directly. Once `PacketHandle` is `rte_mbuf *`, there is
+  no per-packet or per-burst wrap/unwrap conversion at the PMD boundary.
+
+Dynamic per-pool data-room sizing (jumbo frames, upstream `#1024`) remains a
+later change. Stage 2B keeps the existing 2048-byte BESS payload limit and
+the default `RTE_PKTMBUF_HEADROOM` data-room configuration.
+
+The full benchmark suite is required before and after the representation
+flip; do not merge Stage 2B if it regresses a checked benchmark by more than
+2% on the same machine.
 
 ### Stage 1 — explicit private-area accessor (done, commit 16)
 
@@ -1977,27 +1963,53 @@ handle used by batches, rings, queues, ports, and ownership helpers;
 packet-processing code. `PacketBatch::packet()` supplies that view, while
 `handles()` keeps native arrays at transport boundaries. Core drivers,
 allocators, queues/rings, built-in modules, gate hooks, the sample plugin,
-benchmarks, and packet utilities now use the seam. The backing `Packet` is
-still the legacy `rte_mbuf` overlay; the thin-wrapper redesign below is not
-part of Stage 2A. Final acceptance is gated on a green CI run for the
-migration tip.
+benchmarks, and packet utilities now use the seam. CI run
+`35464737427` passed for both g++ and clang++.
 
-### Stage 2B — thin `rte_mbuf*` wrapper (not started, needs its own sign-off)
+The post-Stage-2A baseline below was captured on the development machine with
+five repetitions and `--benchmark_min_time=0.5s`; PMD values are mean
+throughput in Mpps at burst sizes 1/2/4/8/16/32.
 
-The actual `PacketRef`-over-`rte_mbuf*` wrapper, the `PacketPool` allocator
-redesign, the `PMDPort::RecvPackets`/`SendPackets` wrap/unwrap redesign at
-the `rte_eth_{rx,tx}_burst` boundary, dynamic per-pool data-room sizing
-(jumbo frames), and revisiting `core/drivers/pcap.cc`'s
-`reinterpret_cast<Packet*>(snb->next())`-style multi-segment chain walking
-(fine while the `rte_mbuf` overlay still exists; becomes an issue once
-Stage 2 removes it) — `vport.cc` had the same pattern but was removed
-entirely along with `core/kmod`, see Phase C. See the original
-modernization-plan analysis of
-`core/packet.h` earlier in this project's history for the detailed design
-sketch (`PacketRef`, offset-resolved `MetadataRef<T>`) — `BessPacketPrivate`
-from that same sketch is now already real, see Stage 1 above. High risk,
-hot-path-touching — needs a dedicated design spike and explicit user
-sign-off before any code, not started now.
+| `packet_bench` benchmark | Mean |
+| --- | ---: |
+| `BM_PacketAllocFree` | 6.00 ns |
+| `BM_PacketAllocFreeBulk` | 34.8 ns |
+| `BM_PacketHeadData` | 0.258 ns |
+| `BM_PacketAppendTrim` | 2.54 ns |
+| `BM_PacketMetadataAccess` | 0.188 ns |
+| `BM_BatchForward` | 2.12 ns |
+
+| `pmd_bench` benchmark | 1 | 2 | 4 | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `BM_PmdNullTx` | 6.79 | 12.87 | 25.07 | 47.83 | 78.65 | 149.01 |
+| `BM_PmdNullTxEndToEnd` | 58.40 | 89.88 | 156.55 | 253.75 | 289.30 | 385.26 |
+| `BM_PmdRingRoundTrip` | 6.50 | 12.50 | 25.13 | 48.58 | 89.02 | 159.25 |
+| `BM_PmdRingRoundTripEndToEnd` | 55.05 | 89.32 | 123.28 | 218.26 | 331.13 | 466.06 |
+
+### Stage 2B — native `rte_mbuf *` handle and `PacketRef` backend
+
+Stage 2B replaces the legacy overlay with native DPDK pktmbuf storage.
+`PacketHandle` becomes `struct rte_mbuf *`; `PacketBatch` arrays can therefore
+be passed directly to `rte_eth_{rx,tx}_burst` with no wrap/unwrap array
+conversion. `PacketRef` owns the backend-neutral processing operations,
+`BessPacketPrivate` contains only metadata and scratchpad, and `PacketPool`
+retains its Plain/Bess/DPDK population backends while using one native
+pktmbuf element layout. This stage deliberately keeps the 2048-byte payload
+limit; jumbo/data-room changes, external-buffer pool plumbing, clone
+semantics, and offload work remain later phases.
+
+The PCAP receive path must release the already-built chain when a subsequent
+segment allocation fails; it must never call `tailroom()` on a null segment.
+The old overlay-specific PCAP cast is no longer part of the design.
+
+Stage 2B implementation is the current work item.
+
+The Stage 2B implementation is the native-handle/backend replacement
+described above. It is intentionally separate from dynamic data-room sizing,
+jumbo frames, AF_XDP/vhost external-buffer plumbing, clone semantics, hardware
+offloads, `MBUF_FAST_FREE`, `PortCapabilities`, and `PacketBatch::kMaxBurst`
+changes. `vport.cc` had the same old representation assumptions but was
+removed with `core/kmod`, see Phase C.
 
 ### DPDK-proposal review notes (2026-09-18)
 
