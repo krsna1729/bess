@@ -49,7 +49,6 @@ class PacketBatch {
   PacketHandle *handles() { return pkts_; }
   const PacketHandle *handles() const { return pkts_; }
 
-
   // Non-owning view of one packet. Definition lives in packet.h, where
   // PacketRef is complete.
   PacketRef packet(size_t i);

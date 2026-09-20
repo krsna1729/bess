@@ -521,8 +521,7 @@ void DestroyRing(rte_ring *ring) {
 
 // rte_pktmbuf_init()/rte_pktmbuf_reset() read the pool's private data
 // through rte_mempool_get_priv(), which must start with
-// rte_pktmbuf_pool_private (same shape as PacketPool::PoolPrivate, minus the
-// owner backpointer this bench has no use for).
+// rte_pktmbuf_pool_private, matching PacketPool::PoolPrivate.
 struct BenchPoolPrivate {
   rte_pktmbuf_pool_private dpdk_priv;
 };

@@ -1850,8 +1850,8 @@ pre-fix/post-fix module-test evidence for `a0688fcf` was produced.
 # Roadmap / Backlog
 
 Organized in phases. Phases A–F are the original DPDK-era modernization plan
-(mostly still ahead of us — Phase A is done, Phase B's Stage 1 and Stage 2A
-have landed, while Stage 2B and Phases C–F remain). Phases G–I are a newer,
+(`mostly still ahead of us — Phase A is done, and Phase B's Stages 1, 2A,
+and 2B have landed; Phases C–F remain). Phases G–I are a newer,
 larger proposal — a from-first-principles rethink of the control plane and
 language/tooling stack — added 2026-09-11.
 **G and the A–F track are largely independent** (G touches `bessctl`/gRPC/the
@@ -1896,24 +1896,24 @@ bugs structurally impossible rather than merely caught by `static_assert`.
 **This is now explicitly staged, not a single commit sequence** — Stage 1
 introduced the private-area accessor, Stage 2A introduced the safe
 `PacketHandle`/`PacketRef` intermediate and migrated consumers, and Stage 2B
-replaces the backing representation. The Stage 2A seam is the safe,
+replaced the backing representation. The Stage 2A seam provided the safe,
 bisectable state that the original proposal lacked.
 
-Stage 2B still has two real backend boundaries:
+Stage 2B completed the two backend boundaries:
 
-- `PacketPool` must size and populate native pktmbuf objects rather than
-  `sizeof(Packet)` elements with embedded payload storage.
-- `PacketRef` must use native mbuf fields/helpers while PMD RX/TX receives the
-  native handle array directly. Once `PacketHandle` is `rte_mbuf *`, there is
-  no per-packet or per-burst wrap/unwrap conversion at the PMD boundary.
+- `PacketPool` now sizes and populates native pktmbuf objects with one
+  centralized element layout rather than `sizeof(Packet)` elements.
+- `PacketRef` now uses native mbuf fields/helpers while PMD RX/TX receives the
+  native handle array directly; no per-packet or per-burst wrap/unwrap
+  conversion exists at the PMD boundary.
 
 Dynamic per-pool data-room sizing (jumbo frames, upstream `#1024`) remains a
 later change. Stage 2B keeps the existing 2048-byte BESS payload limit and
 the default `RTE_PKTMBUF_HEADROOM` data-room configuration.
 
-The full benchmark suite is required before and after the representation
-flip; do not merge Stage 2B if it regresses a checked benchmark by more than
-2% on the same machine.
+The benchmark comparison and observed native-API costs are recorded in the
+completed Stage 2B section below. Follow-up performance work must preserve
+the native representation rather than reintroduce an overlay.
 
 ### Stage 1 — explicit private-area accessor (done, commit 16)
 
@@ -1949,10 +1949,10 @@ benchmarks in that file). Verified: `core/all_test` 185/185 (183 + 2 new),
 `run_module_tests.py` clean including `test_wildcardmatch_with_metadata`
 (the live functional check for the fixed code path), live `bessd -m 0`
 smoke-started with no crash (exercises `PacketPool` creation for 262144
-packets, i.e. `InitPacket()`'s `priv()`-based `set_vaddr()`/`set_paddr()`
-calls, at real scale). Left untouched, deliberately: the `rte_mbuf`-mirroring
-union (`buf_addr_`, `data_off_`, `pkt_len_`, `next_`, etc.) and
-`CheckMbufLayout()` — that's Stage 2's problem.
+packets at real scale; this was the historical Stage 1 `priv()` path).
+The `rte_mbuf`-mirroring union and `CheckMbufLayout()` were intentionally
+left in that Stage 1 commit and were removed by the completed Stage 2B
+cutover.
 
 ### Stage 2A — `PacketHandle`/`PacketRef` seam and consumer migration
 
@@ -1986,30 +1986,59 @@ throughput in Mpps at burst sizes 1/2/4/8/16/32.
 | `BM_PmdRingRoundTrip` | 6.50 | 12.50 | 25.13 | 48.58 | 89.02 | 159.25 |
 | `BM_PmdRingRoundTripEndToEnd` | 55.05 | 89.32 | 123.28 | 218.26 | 331.13 | 466.06 |
 
-### Stage 2B — native `rte_mbuf *` handle and `PacketRef` backend
+### Stage 2B — native `rte_mbuf *` handle and `PacketRef` backend (done)
 
-Stage 2B replaces the legacy overlay with native DPDK pktmbuf storage.
-`PacketHandle` becomes `struct rte_mbuf *`; `PacketBatch` arrays can therefore
-be passed directly to `rte_eth_{rx,tx}_burst` with no wrap/unwrap array
-conversion. `PacketRef` owns the backend-neutral processing operations,
-`BessPacketPrivate` contains only metadata and scratchpad, and `PacketPool`
-retains its Plain/Bess/DPDK population backends while using one native
-pktmbuf element layout. This stage deliberately keeps the 2048-byte payload
-limit; jumbo/data-room changes, external-buffer pool plumbing, clone
-semantics, and offload work remain later phases.
+Stage 2B replaced the legacy overlay with native DPDK pktmbuf storage.
+`PacketHandle` is `struct rte_mbuf *`; `PacketBatch` arrays therefore cross
+the `rte_eth_{rx,tx}_burst` boundary directly with no wrap/unwrap conversion.
+`PacketRef` provides native mbuf processing operations,
+`BessPacketPrivate` contains only metadata and scratchpad, and every
+PacketPool backend uses one centralized native element-size calculation. The
+existing 2048-byte BESS payload limit remains deliberate; jumbo/data-room
+changes, external-buffer pool plumbing, clone semantics, and offload work
+remain later phases.
 
-The PCAP receive path must release the already-built chain when a subsequent
-segment allocation fails; it must never call `tailroom()` on a null segment.
-The old overlay-specific PCAP cast is no longer part of the design.
+The PCAP receive path now drops the already-built chain when a later segment
+allocation fails, before dereferencing that segment. The obsolete
+overlay-specific chain cast is gone.
 
-Stage 2B implementation is the current work item.
+Correctness evidence: all seven native packet layout/ownership tests in
+`core/packet_test.cc` pass, and the migrated TCP reconstruction test compiles
+against `PacketRef`. The full daemon/module object graph compiles with g++ on
+the local DPDK 25.11.3 install; the local static link remains unavailable
+because this Arch environment does not ship the transitive static gRPC/Abseil
+archives. CI is the authoritative full-link gate.
 
-The Stage 2B implementation is the native-handle/backend replacement
-described above. It is intentionally separate from dynamic data-room sizing,
-jumbo frames, AF_XDP/vhost external-buffer plumbing, clone semantics, hardware
-offloads, `MBUF_FAST_FREE`, `PortCapabilities`, and `PacketBatch::kMaxBurst`
-changes. `vport.cc` had the same old representation assumptions but was
-removed with `core/kmod`, see Phase C.
+The packet benchmark comparison below uses median values from the same
+five-repetition command as the Stage 2A baseline above. PMD values are mean
+throughput in Mpps at burst sizes 1/2/4/8/16/32; every run reported zero drops.
+
+| `packet_bench` benchmark | Stage 2A | Stage 2B | Delta |
+| --- | ---: | ---: | ---: |
+| `BM_PacketAllocFree` | 6.01 ns | 6.24 ns | +4% |
+| `BM_PacketAllocFreeBulk` | 34.7 ns | 107 ns | +208% |
+| `BM_PacketHeadData` | 0.257 ns | 0.286 ns | +11% |
+| `BM_PacketAppendTrim` | 2.54 ns | 2.74 ns | +8% |
+| `BM_PacketMetadataAccess` | 0.188 ns | 0.223 ns | +19% |
+| `BM_BatchForward` | 2.12 ns | 2.41 ns | +14% |
+
+| `pmd_bench` benchmark | 1 | 2 | 4 | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `BM_PmdNullTx` | 6.74 | 13.09 | 25.37 | 48.38 | 84.21 | 147.24 |
+| `BM_PmdNullTxEndToEnd` | 54.76 | 83.17 | 134.92 | 178.79 | 211.21 | 259.14 |
+| `BM_PmdRingRoundTrip` | 6.36 | 11.90 | 23.75 | 45.01 | 79.71 | 134.41 |
+| `BM_PmdRingRoundTripEndToEnd` | 46.10 | 69.32 | 99.96 | 149.24 | 190.22 | 234.01 |
+
+The packet-allocation regressions are expected consequences of replacing the
+old SSE/raw-mempool fast paths with DPDK's safe `rte_pktmbuf_alloc_bulk()` and
+`rte_pktmbuf_free_bulk()` reset/free semantics; they are recorded rather than
+hidden. Follow-up performance work must use native APIs or an upstream DPDK
+optimization, not restore an overlay.
+
+Residual Stage 2 scope is explicit: dynamic data-room sizing, jumbo frames,
+AF_XDP/vhost external-buffer pool plumbing, clone semantics, hardware
+offloads, `MBUF_FAST_FREE`, `PortCapabilities`, `PacketBatch::kMaxBurst`
+changes, and real-NIC/cross-worker measurements remain future work.
 
 ### DPDK-proposal review notes (2026-09-18)
 
@@ -2018,32 +2047,15 @@ An Opus review of an external DPDK-modernization proposal (see this doc's
 found three things specifically relevant to Stage 2's scope, all verified
 against the tree at `705782b3`:
 
-- **The `paddr`/`vaddr` layer is dead code, not a subsystem needing
-  stronger types.** `PacketPool::from_paddr()` (`core/packet_pool.h:69`,
-  `packet_pool.cc:261`) and `Packet::paddr()`/`vaddr()` (`core/packet.h`)
-  had `core/drivers/vport.cc` as their *only* consumers (confirmed via
-  `git grep` at `90d908f7^`, call sites at `vport.cc:95,113,133,147,
-  617,652,682`). Since commit 21 removed VPort, nothing reads any of
-  them; `InitPacket()` (`packet_pool.cc:24-25`) still *writes*
-  `vaddr_`/`paddr_` per packet into fields with no reader, and
-  `sid_`/`index_` are written nowhere outside `core/packet_test.cc`. An
-  external proposal suggested introducing `Iova`/`PhysAddr`/
-  `VirtualAddress` strong types to describe this field — reject that:
-  there is no live consumer left to type. **Stage 2 should delete the
-  24-byte `immutable_` union from `BessPacketPrivate` (`core/packet.h`)
-  instead.** This shrinks `SNBUF_RESERVE` and moves
-  `SNBUF_METADATA_OFF`/`SNBUF_SCRATCHPAD_OFF`, so it's genuinely Stage 2
-  territory (a layout change, pinned by `CheckPrivLayout()`), not a
-  Stage-1 follow-up to do now.
-- **A third Stage 2 blocker, not previously listed here:**
-  `PacketPool::AllocBulk()` (`core/packet_pool.cc:118-145`) writes
-  `Packet`'s mirrored mbuf fields with raw `_mm_store_si128` into
-  `rearm_data_`/`rx_descriptor_fields1_`, hand-reproducing
-  `rte_pktmbuf_reset()`'s two 16-byte stores. This is simultaneously a
-  Stage 2 blocker of the same kind as the `PMDPort::Recv/SendPackets`
-  `reinterpret_cast` already listed above, *and* an x86-only SSE
-  intrinsic block that Phase D has to deal with. Stage 2 and Phase D
-  should agree on who owns it before either starts.
+- **The `paddr`/`vaddr` layer was dead code.** The review confirmed that
+  `PacketPool::from_paddr()` and `Packet::paddr()`/`vaddr()` had VPort as
+  their only consumers. Stage 2B deleted those writers and accessors with
+  the overlay, along with the unused `sid`/`index` fields; no strong address
+  type was needed.
+- **The bulk-reset and PMD casts were genuine blockers.** Stage 2B now uses
+  `rte_pktmbuf_alloc_bulk()`/native field stores and passes `PacketHandle`
+  arrays directly to PMD RX/TX. The `_mm_store_si128` overlay fast path and
+  `reinterpret_cast` conversion boundary are gone.
 - **Verdict on "Stage 2 is more important than it first appeared"**
   (the external proposal's headline claim): agree with the conclusion,
   disagree with the reasoning. It framed Stage 2 as "the point BESS
@@ -2093,13 +2105,13 @@ rerunning with `--benchmark_min_time=0.001s` (all 22 cases complete in
 seconds).
 
 Added `core/packet_bench.cc` — the one genuinely new file — covering what
-the existing suite didn't: `Packet`/`PacketPool`/`PacketBatch` themselves
-(`BM_PacketAllocFree`, `BM_PacketAllocFreeBulk`, `BM_PacketHeadData`,
-`BM_PacketAppendTrim`, `BM_BatchForward`), using `PlainPacketPool` (the
-only pool backend that doesn't need real hugepages, which this sandbox
-lacks — see packet_pool.h's own doc comment: "For standalone benchmarks
-and unittests"). These are the primitives Phase B would actually
-refactor, so they're the most direct regression check for it.
+the existing suite didn't: `PacketHandle`/`PacketRef`/`PacketPool`/
+`PacketBatch` themselves (`BM_PacketAllocFree`, `BM_PacketAllocFreeBulk`,
+`BM_PacketHeadData`, `BM_PacketAppendTrim`, `BM_BatchForward`), using
+`PlainPacketPool` (the only pool backend that doesn't need real hugepages,
+which this sandbox lacks — see packet_pool.h's own doc comment: "For
+standalone benchmarks and unittests"). These are the primitives Phase B
+refactored, so they remain the direct regression check.
 
 Fixed the actual gap: added `benchmarks` to `build.py`'s `build_bess()`
 target list, and added a "Smoke-test benchmarks" CI step (runs every

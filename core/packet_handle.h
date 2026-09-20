@@ -31,8 +31,8 @@
 #define BESS_PACKET_HANDLE_H_
 
 struct rte_mbuf;
-namespace bess {
 
+namespace bess {
 
 // What is *stored and transported* for a packet: in batches, rings, queues and
 // ports. Packet-processing code should use PacketRef (packet.h) instead, which
