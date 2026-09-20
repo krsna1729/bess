@@ -186,8 +186,8 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
       // Offset-based attrs are relative to the packet header; metadata
       // attrs live in BESS's own private per-packet area (see
-      // bess::Packet::priv() / metadata()) -- these are two different
-      // regions, not one contiguous buffer at a fixed relative offset.
+      // PacketRef::metadata()) -- these are two different regions, not one
+      // contiguous buffer at a fixed relative offset.
       const char *base_addr =
           (attr_id < 0) ? pkt.head_data<const char *>()
                         : pkt.metadata<const char *>();

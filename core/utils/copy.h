@@ -244,7 +244,7 @@ void CopyNonInlined(void *__restrict__ dst, const void *__restrict__ src,
 // NOTE: When "sloppy" is set, it may copy more than "bytes", up to additional
 // 31 bytes. It will generate much smaller and usually faster code. Use this
 // option only if overwriting some data at the end is acceptable, such as
-// rewriting the payload data of class Packet.
+// rewriting packet payload data through PacketRef.
 static inline void Copy(void *__restrict__ dst, const void *__restrict__ src,
                         size_t bytes, bool sloppy = false) {
   // If the size is a compile-time constant, inlining can generate compact code

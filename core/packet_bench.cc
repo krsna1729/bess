@@ -27,11 +27,10 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-// Baseline microbenchmarks for Packet/PacketPool/PacketBatch -- the
-// primitives Phase B (packet/mbuf architecture refactor, see
-// MODERNIZATION.md) would touch. Captured *before* any such refactor so a
-// candidate redesign can be checked against real numbers instead of
-// intuition.
+// Baseline microbenchmarks for PacketHandle/PacketRef/PacketPool/PacketBatch
+// -- the primitives Phase B (packet/mbuf architecture refactor, see
+// MODERNIZATION.md) touches. Captured at the Stage 2A boundary so the native
+// handle redesign can be checked against real numbers instead of intuition.
 //
 // Uses PlainPacketPool (see packet_pool.h): the only pool backend that
 // doesn't require real hugepages, which this sandbox doesn't have. Not
@@ -120,10 +119,9 @@ BENCHMARK(BM_PacketAppendTrim);
 
 
 // Every module attribute read/write (Module::get_attr/set_attr/ptr_attr,
-// module.h) funnels through Packet::metadata<T>(), which as of Phase B
-// Stage 1 (see MODERNIZATION.md) resolves via Packet::priv() ->
-// rte_mbuf_to_priv() instead of a Packet-side union member. This exercises
-// that path directly to catch a regression in cost, not just correctness.
+// module.h) funnels through PacketRef::metadata<T>(), which resolves via
+// rte_mbuf_to_priv(). This exercises that path directly to catch a regression
+// in cost, not just correctness.
 void BM_PacketMetadataAccess(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();
   constexpr size_t kPackets = 32;

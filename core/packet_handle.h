@@ -30,19 +30,17 @@
 #ifndef BESS_PACKET_HANDLE_H_
 #define BESS_PACKET_HANDLE_H_
 
+struct rte_mbuf;
 namespace bess {
 
-class Packet;
 
 // What is *stored and transported* for a packet: in batches, rings, queues and
 // ports. Packet-processing code should use PacketRef (packet.h) instead, which
 // is the non-owning view over one of these.
 //
-// Phase B Stage 2A (MODERNIZATION.md) keeps this as the legacy overlay object,
-// so the seam can be introduced with no storage or layout change. Stage 2B
-// flips it to `rte_mbuf *`, which is then why batches hold handles: PMD RX/TX
-// takes the native array directly, with no conversion loop.
-using PacketHandle = Packet *;
+// Stage 2B uses the native DPDK representation directly. PacketBatch arrays
+// can therefore cross the PMD RX/TX boundary without a conversion loop.
+using PacketHandle = struct rte_mbuf *;
 
 }  // namespace bess
 

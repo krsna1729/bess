@@ -31,538 +31,109 @@
 #ifndef BESS_PACKET_H_
 #define BESS_PACKET_H_
 
-#include <algorithm>
-#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <type_traits>
 
-#include <rte_atomic.h>
-#include <rte_config.h>
+#include <glog/logging.h>
 #include <rte_mbuf.h>
 
 #include "metadata.h"
 #include "pktbatch.h"
 #include "snbuf_layout.h"
-#include "worker.h"
-
-/* NOTE: NEVER use rte_pktmbuf_*() directly,
- *       unless you know what you are doing */
-static_assert(SNBUF_MBUF == sizeof(struct rte_mbuf),
-              "DPDK compatibility check failed");
-static_assert(SNBUF_HEADROOM == RTE_PKTMBUF_HEADROOM,
-              "DPDK compatibility check failed");
-
-static_assert(SNBUF_IMMUTABLE_OFF == 128,
-              "Packet immbutable offset must be 128");
-static_assert(SNBUF_METADATA_OFF == 192, "Packet metadata offset must by 192");
-static_assert(SNBUF_SCRATCHPAD_OFF == 320,
-              "Packet scratchpad offset must be 320");
 
 namespace bess {
 
-// BESS's own per-packet private data: pool bookkeeping (vaddr_/paddr_/
-// sid_/index_, set once at pool-init time and otherwise read-only),
-// dynamic metadata attributes, and module/driver scratchpad.
-//
-// Packet::priv() reaches this via rte_mbuf_to_priv(), DPDK's own
-// documented accessor for "the private area immediately following an
-// rte_mbuf" -- RTE_PTR_ADD(m, sizeof(struct rte_mbuf)), a compile-time
-// constant offset that holds for *any* rte_mbuf, independent of pool
-// configuration. What PacketPool::PostPopulate() configuring
-// mbuf_priv_size = SNBUF_RESERVE (packet_pool.cc) actually controls is
-// where DPDK's rte_pktmbuf_init()/rte_pktmbuf_reset() place buf_addr_ --
-// i.e. where the data buffer (headroom_/data_ below) starts -- not where
-// this private area lives; CheckPrivLayout() below pins that offset
-// directly instead.
+// BESS's application-private packet area. DPDK places this immediately after
+// struct rte_mbuf and exposes it through rte_mbuf_to_priv().
 struct BessPacketPrivate {
-  union {
-    char immutable_[SNBUF_IMMUTABLE];
-
-    const struct {
-      // must be the first field
-      Packet *vaddr_;
-
-      phys_addr_t paddr_;
-
-      // socket ID
-      uint32_t sid_;
-
-      // packet index within the pool
-      uint32_t index_;
-    };
-  };
-
-  // Dynamic metadata.
-  // Each attribute value is stored in host order
   char metadata_[SNBUF_METADATA];
-
-  // Used for module/driver-specific data
   char scratchpad_[SNBUF_SCRATCHPAD];
 };
 
-static_assert(sizeof(BessPacketPrivate) == SNBUF_RESERVE,
-              "BessPacketPrivate size must match SNBUF_RESERVE");
-
-// For the layout of snbuf, see snbuf_layout.h
-class alignas(64) Packet {
- public:
-  Packet() = delete;  // Packet must be allocated from PacketPool
-
-  Packet *vaddr() const { return priv()->vaddr_; }
-  void set_vaddr(Packet *addr) { priv()->vaddr_ = addr; }
-
-  phys_addr_t paddr() { return priv()->paddr_; }
-  void set_paddr(phys_addr_t addr) { priv()->paddr_ = addr; }
-
-  uint32_t sid() const { return priv()->sid_; }
-  void set_sid(uint32_t sid) { priv()->sid_ = sid; }
-
-  uint32_t index() const { return priv()->index_; }
-  void set_index(uint32_t index) { priv()->index_ = index; }
-
-  template <typename T = char *>
-  T reserve() {
-    return reinterpret_cast<T>(reserve_);
-  }
-
-  template <typename T = void *>
-  const T head_data(uint16_t offset = 0) const {
-    return reinterpret_cast<T>(static_cast<char *>(buf_addr_) + data_off_ +
-                               offset);
-  }
-
-  template <typename T = void *>
-  T head_data(uint16_t offset = 0) {
-    return const_cast<T>(
-        static_cast<const Packet &>(*this).head_data<T>(offset));
-  }
-
-  template <typename T = char *>
-  T data() {
-    return reinterpret_cast<T>(data_);
-  }
-
-  template <typename T = char *>
-  T metadata() const {
-    return reinterpret_cast<T>(priv()->metadata_);
-  }
-
-  template <typename T = char *>
-  T scratchpad() {
-    return reinterpret_cast<T>(priv()->scratchpad_);
-  }
-
-  template <typename T = void *>
-  T buffer() {
-    return reinterpret_cast<T>(buf_addr_);
-  }
-
-  int nb_segs() const { return nb_segs_; }
-  void set_nb_segs(int n) { nb_segs_ = n; }
-
-  Packet *next() const { return next_; }
-  void set_next(Packet *next) { next_ = next; }
-
-  uint16_t data_off() { return data_off_; }
-  void set_data_off(uint16_t offset) { data_off_ = offset; }
-
-  uint16_t data_len() { return data_len_; }
-  void set_data_len(uint16_t len) { data_len_ = len; }
-
-  int head_len() const { return data_len_; }
-
-  int total_len() const { return pkt_len_; }
-  void set_total_len(uint32_t len) { pkt_len_ = len; }
-
-  uint16_t headroom() const { return rte_pktmbuf_headroom(&mbuf_); }
-
-  uint16_t tailroom() const { return rte_pktmbuf_tailroom(&mbuf_); }
-
-  // single segment?
-  int is_linear() const { return rte_pktmbuf_is_contiguous(&mbuf_); }
-
-  // single segment and direct?
-  int is_simple() const { return is_linear() && RTE_MBUF_DIRECT(&mbuf_); }
-
-  void reset() { rte_pktmbuf_reset(&mbuf_); }
-
-  void *prepend(uint16_t len) {
-    if (unlikely(data_off_ < len))
-      return nullptr;
-
-    data_off_ -= len;
-    data_len_ += len;
-    pkt_len_ += len;
-
-    return head_data();
-  }
-
-  // remove bytes from the beginning
-  void *adj(uint16_t len) {
-    if (unlikely(data_len_ < len))
-      return nullptr;
-
-    data_off_ += len;
-    data_len_ -= len;
-    pkt_len_ -= len;
-
-    return head_data();
-  }
-
-  // add bytes to the end
-  void *append(uint16_t len) { return rte_pktmbuf_append(&mbuf_, len); }
-
-  // remove bytes from the end
-  void trim(uint16_t to_remove) {
-    int ret;
-
-    ret = rte_pktmbuf_trim(&mbuf_, to_remove);
-    DCHECK_EQ(ret, 0);
-  }
-
-  // Duplicate a new Packet object, allocated from the same PacketPool as src.
-  // Returns nullptr if memory allocation failed
-  static PacketHandle copy(PacketHandle src);
-
-  phys_addr_t dma_addr() { return buf_physaddr_ + data_off_; }
-
-  std::string Dump();
-
-  void CheckSanity();
-
-  // pkt may be nullptr
-  static void Free(PacketHandle pkt) {
-    rte_pktmbuf_free(reinterpret_cast<struct rte_mbuf *>(pkt));
-  }
-
-  // All handles in pkts must not be nullptr.
-  // cnt must be [0, PacketBatch::kMaxBurst]
-  static inline void Free(PacketHandle *pkts, size_t cnt);
-
-  // batch must not be nullptr
-  static void Free(PacketBatch *batch) {
-    Free(batch->handles(), batch->cnt());
-  }
-
- private:
-  // BESS's own private per-packet data (pool bookkeeping, metadata,
-  // scratchpad) -- see BessPacketPrivate's own comment above. Private:
-  // every external caller goes through vaddr()/metadata()/scratchpad()/etc
-  // below, not this directly -- keeps BessPacketPrivate's fields no more
-  // exposed than they were as named Packet union members before this
-  // (reserve<T>() already exposes these bytes untyped to anyone who wants
-  // them; this just avoids also handing out a *named*, directly-writable
-  // view that bypasses set_vaddr()/set_sid()/etc).
-  BessPacketPrivate *priv() {
-    return reinterpret_cast<BessPacketPrivate *>(rte_mbuf_to_priv(&mbuf_));
-  }
-  const BessPacketPrivate *priv() const {
-    return reinterpret_cast<const BessPacketPrivate *>(
-        rte_mbuf_to_priv(const_cast<struct rte_mbuf *>(&mbuf_)));
-  }
-
-  union {
-    struct {
-      // offset 0: Virtual address of segment buffer.
-      void *buf_addr_;
-      // offset 8: Physical address of segment buffer.
-      alignas(8) phys_addr_t buf_physaddr_;
-
-      union {
-        __m128i rearm_data_;
-
-        struct {
-          // offset 16:
-          alignas(8) uint16_t data_off_;
-
-          // offset 18:
-          uint16_t refcnt_;
-
-          // offset 20:
-          uint16_t nb_segs_;  // Number of segments
-
-          // offset 22:
-          uint16_t _dummy0_;  // rte_mbuf.port
-          // offset 24:
-          uint64_t _dummy1_;  // rte_mbuf.ol_flags
-        };
-      };
-
-      union {
-        __m128i rx_descriptor_fields1_;
-
-        struct {
-          // offset 32:
-          uint32_t _dummy2_;  // rte_mbuf.packet_type_;
-
-          // offset 36:
-          uint32_t pkt_len_;  // Total pkt length: sum of all segments
-
-          // offset 40:
-          uint16_t data_len_;  // Amount of data in this segment
-
-          // offset 42:
-          uint16_t _dummy3_;  // rte_mbuf.vlan_tci
-
-          // offset 44:
-          uint32_t _dummy4_lo;  // rte_mbuf.fdir.lo and rte_mbuf.rss
-        };
-      };
-
-      // offset 48:
-      uint32_t _dummy4_hi;  // rte_mbuf.fdir.hi
-
-      // offset 52:
-      uint16_t _dummy5_;  // rte_mbuf.vlan_tci_outer
-
-      // offset 54:
-      const uint16_t buf_len_;
-
-      // offset 56:
-      // NOTE: as of DPDK 20.11+, rte_mbuf.pool moved from offset 72 to
-      // here; the fixed "timestamp" field that used to live at this
-      // offset in DPDK <20.11 no longer exists as a static struct member
-      // (see the dynfield1 note below). Verified against DPDK 25.11 via
-      // offsetof(); see the static_asserts after this class definition.
-      struct rte_mempool *pool_;  // Pool from which mbuf was allocated.
-
-      // 2nd cacheline - fields only used in slow path or on TX --------------
-      // offset 64:
-      // NOTE: aliases rte_mbuf.next (DPDK <20.11 had "userdata" here).
-      // Any code that hands a multi-segment Packet to real DPDK/PMD code
-      // (which walks rte_mbuf.next, not a BESS-private field) depends on
-      // this offset being correct -- that's exactly what regressed
-      // silently when this struct was last written against DPDK 19.11.
-      Packet *next_;  // Next segment. nullptr if not scattered.
-
-      // offset 72:
-      uint64_t _dummy8;  // rte_mbuf.tx_offload
-
-      // offset 80:
-      // rte_mbuf.shinfo (external/indirect buffer support). BESS does not
-      // use rte_pktmbuf_attach_extbuf(), but the field must still be
-      // reserved so later offsets line up with the real struct.
-      uint64_t _dummy_shinfo_;
-
-      // offset 88:
-      uint16_t _dummy9_;   // rte_mbuf.priv_size
-      // offset 90:
-      uint16_t _dummy10_;  // rte_mbuf.timesync
-
-      // offset 92:
-      // rte_mbuf.dynfield1: DPDK's registered-dynamic-field area. Modern
-      // DPDK stores what used to be fixed fields here (timestamp,
-      // userdata, seqn, ...) via rte_mbuf_dynfield_register() instead of
-      // named struct members, so there is no longer a fixed field to
-      // mirror by name. BESS doesn't use dynfields; this is reservation
-      // only, to keep sizeof(Packet) correct.
-      uint32_t _dummy_dynfield1_[9];
-
-      // offset 128:
-    };
-
-    struct rte_mbuf mbuf_;
-  };
-
-  // Never called; exists purely so the static_asserts in its body run at
-  // compile time (a member function body is a "complete-class context",
-  // so offsetof(Packet, ...) is legal here even though Packet is still
-  // being defined at this point in the source). This pins every field of
-  // the hand-written overlay above -- both the ones that are known to
-  // have moved between DPDK versions (pool_ onward) and the ones that
-  // happen to still match today (buf_addr_ through buf_len_, including
-  // the rearm_data_/rx_descriptor_fields1_ SIMD-hot fields) -- against
-  // whatever DPDK headers this is actually compiled against, so nothing
-  // here can silently drift on a future DPDK bump the way it did between
-  // DPDK 19.11 and 20.11+ (see upstream NetSys/bess#1050).
-  static void CheckMbufLayout() {
-    static_assert(
-        offsetof(Packet, buf_addr_) == offsetof(struct rte_mbuf, buf_addr),
-        "Packet::buf_addr_ offset must match rte_mbuf::buf_addr");
-    static_assert(
-        offsetof(Packet, buf_physaddr_) == offsetof(struct rte_mbuf, buf_iova),
-        "Packet::buf_physaddr_ offset must match rte_mbuf::buf_iova");
-    static_assert(
-        offsetof(Packet, rearm_data_) == offsetof(struct rte_mbuf, rearm_data),
-        "Packet::rearm_data_ offset must match rte_mbuf::rearm_data");
-    static_assert(
-        offsetof(Packet, data_off_) == offsetof(struct rte_mbuf, data_off),
-        "Packet::data_off_ offset must match rte_mbuf::data_off");
-    static_assert(
-        offsetof(Packet, refcnt_) == offsetof(struct rte_mbuf, refcnt),
-        "Packet::refcnt_ offset must match rte_mbuf::refcnt");
-    static_assert(
-        offsetof(Packet, nb_segs_) == offsetof(struct rte_mbuf, nb_segs),
-        "Packet::nb_segs_ offset must match rte_mbuf::nb_segs");
-    static_assert(offsetof(Packet, _dummy0_) == offsetof(struct rte_mbuf, port),
-                  "Packet's port placeholder offset must match "
-                  "rte_mbuf::port");
-    static_assert(
-        offsetof(Packet, _dummy1_) == offsetof(struct rte_mbuf, ol_flags),
-        "Packet's ol_flags placeholder offset must match "
-        "rte_mbuf::ol_flags");
-    static_assert(offsetof(Packet, rx_descriptor_fields1_) ==
-                      offsetof(struct rte_mbuf, rx_descriptor_fields1),
-                  "Packet::rx_descriptor_fields1_ offset must match "
-                  "rte_mbuf::rx_descriptor_fields1");
-    static_assert(offsetof(Packet, _dummy2_) ==
-                      offsetof(struct rte_mbuf, packet_type),
-                  "Packet's packet_type placeholder offset must match "
-                  "rte_mbuf::packet_type");
-    static_assert(
-        offsetof(Packet, pkt_len_) == offsetof(struct rte_mbuf, pkt_len),
-        "Packet::pkt_len_ offset must match rte_mbuf::pkt_len");
-    static_assert(
-        offsetof(Packet, data_len_) == offsetof(struct rte_mbuf, data_len),
-        "Packet::data_len_ offset must match rte_mbuf::data_len");
-    static_assert(
-        offsetof(Packet, _dummy3_) == offsetof(struct rte_mbuf, vlan_tci),
-        "Packet's vlan_tci placeholder offset must match "
-        "rte_mbuf::vlan_tci");
-    static_assert(offsetof(Packet, _dummy4_lo) ==
-                      offsetof(struct rte_mbuf, hash.fdir.lo),
-                  "Packet's fdir.lo placeholder offset must match "
-                  "rte_mbuf::hash.fdir.lo");
-    static_assert(offsetof(Packet, _dummy4_hi) ==
-                      offsetof(struct rte_mbuf, hash.fdir.hi),
-                  "Packet's fdir.hi placeholder offset must match "
-                  "rte_mbuf::hash.fdir.hi");
-    static_assert(offsetof(Packet, _dummy5_) ==
-                      offsetof(struct rte_mbuf, vlan_tci_outer),
-                  "Packet's vlan_tci_outer placeholder offset must match "
-                  "rte_mbuf::vlan_tci_outer");
-    static_assert(
-        offsetof(Packet, buf_len_) == offsetof(struct rte_mbuf, buf_len),
-        "Packet::buf_len_ offset must match rte_mbuf::buf_len");
-    static_assert(offsetof(Packet, pool_) == offsetof(struct rte_mbuf, pool),
-                  "Packet::pool_ offset must match rte_mbuf::pool");
-    static_assert(offsetof(Packet, next_) == offsetof(struct rte_mbuf, next),
-                  "Packet::next_ offset must match rte_mbuf::next");
-    static_assert(offsetof(Packet, _dummy8) ==
-                      offsetof(struct rte_mbuf, tx_offload),
-                  "Packet's tx_offload placeholder offset must match "
-                  "rte_mbuf::tx_offload");
-    static_assert(offsetof(Packet, _dummy_shinfo_) ==
-                      offsetof(struct rte_mbuf, shinfo),
-                  "Packet's shinfo placeholder offset must match "
-                  "rte_mbuf::shinfo");
-    static_assert(offsetof(Packet, _dummy9_) ==
-                      offsetof(struct rte_mbuf, priv_size),
-                  "Packet's priv_size placeholder offset must match "
-                  "rte_mbuf::priv_size");
-    static_assert(offsetof(Packet, _dummy10_) ==
-                      offsetof(struct rte_mbuf, timesync),
-                  "Packet's timesync placeholder offset must match "
-                  "rte_mbuf::timesync");
-    static_assert(offsetof(Packet, _dummy_dynfield1_) ==
-                      offsetof(struct rte_mbuf, dynfield1),
-                  "Packet's dynfield1 placeholder offset must match "
-                  "rte_mbuf::dynfield1");
-  }
-
-  // Never called (see CheckMbufLayout()'s comment above for why that's
-  // fine); pins that Packet::priv() (rte_mbuf_to_priv(&mbuf_), i.e. exactly
-  // sizeof(struct rte_mbuf) bytes past the start of the object) lands
-  // exactly on reserve_, and that BessPacketPrivate's own field offsets
-  // match what SNBUF_METADATA_OFF/SNBUF_SCRATCHPAD_OFF (snbuf_layout.h)
-  // assume. (Originally added because core/kmod's vport driver addressed
-  // the scratchpad via a hardcoded SNBUF_SCRATCHPAD_OFF cross-language ABI
-  // contract; that driver and core/kmod are gone now, see MODERNIZATION.md,
-  // but the assert stays -- cheap, general insurance for whatever uses
-  // scratchpad next.)
-  static void CheckPrivLayout() {
-    static_assert(offsetof(Packet, mbuf_) == 0,
-                  "mbuf_ must be at offset 0 for priv()'s +sizeof(rte_mbuf) "
-                  "arithmetic to be correct");
-    static_assert(offsetof(Packet, reserve_) == sizeof(struct rte_mbuf),
-                  "Packet::priv() must land exactly on reserve_");
-    static_assert(
-        offsetof(BessPacketPrivate, metadata_) ==
-            SNBUF_METADATA_OFF - SNBUF_MBUF,
-        "BessPacketPrivate::metadata_ offset must match SNBUF_METADATA_OFF");
-    static_assert(offsetof(BessPacketPrivate, scratchpad_) ==
-                      SNBUF_SCRATCHPAD_OFF - SNBUF_MBUF,
-                  "BessPacketPrivate::scratchpad_ offset must match "
-                  "SNBUF_SCRATCHPAD_OFF");
-  }
-
-  // BESS's private per-packet data (see BessPacketPrivate above) is
-  // reached via priv()/rte_mbuf_to_priv(), not via named members of this
-  // struct -- reserve_ is just the byte reservation that keeps
-  // sizeof(Packet) and headroom_/data_'s offsets correct.
-  char reserve_[SNBUF_RESERVE];
-
-  char headroom_[SNBUF_HEADROOM];
-  char data_[SNBUF_DATA];
-
-  friend class PacketPool;
-};
-
-static_assert(std::is_standard_layout<Packet>::value, "Incorrect class Packet");
-static_assert(sizeof(Packet) == SNBUF_SIZE, "Incorrect class Packet");
-
-// Non-owning view of one packet: what packet-processing code manipulates
-// instead of knowing which representation currently backs a packet (Phase B
-// Stage 2A, MODERNIZATION.md). Deliberately a value type -- pointer-sized,
-// trivially copyable, destructor does nothing -- so passing one costs what
-// passing a Packet * costs, and a PacketRef never owns a packet.
-//
-// Stage 2A delegates to the legacy overlay Packet. This method set is
-// intentionally transitional while consumers migrate; Stage 2B should retain
-// only operations that express backend-neutral packet semantics.
+static_assert(sizeof(BessPacketPrivate) == SNBUF_METADATA + SNBUF_SCRATCHPAD,
+              "BessPacketPrivate size must match BESS private data");
+static_assert(sizeof(BessPacketPrivate) % RTE_MBUF_PRIV_ALIGN == 0,
+              "BessPacketPrivate size must satisfy RTE_MBUF_PRIV_ALIGN");
+
+// One centralized native pktmbuf layout shared by every PacketPool backend and
+// the allocator benchmark. The data room includes DPDK headroom; BESS's
+// module-visible payload limit remains SNBUF_DATA.
+inline constexpr size_t kPacketPrivateSize = sizeof(BessPacketPrivate);
+inline constexpr size_t kPacketDataRoomSize =
+    RTE_PKTMBUF_HEADROOM + SNBUF_DATA;
+inline constexpr size_t kPacketMempoolElementSize =
+    sizeof(struct rte_mbuf) + sizeof(BessPacketPrivate) + kPacketDataRoomSize;
+
+static_assert(kPacketPrivateSize <= std::numeric_limits<uint16_t>::max(),
+              "Bess private data must fit in rte_mbuf::priv_size");
+static_assert(kPacketDataRoomSize <= std::numeric_limits<uint16_t>::max(),
+              "Packet data room must fit in rte_mbuf::buf_len");
+
+// Non-owning view of one native packet mbuf. PacketRef is deliberately a value
+// type: one pointer wide, trivially copyable, and never an owner.
 class PacketRef {
  public:
   PacketRef() : pkt_(nullptr) {}
   explicit PacketRef(PacketHandle pkt) : pkt_(pkt) {}
 
-  // The stored representation. Ownership and transport machinery wants this;
-  // packet-processing code should not need it.
   PacketHandle handle() const { return pkt_; }
 
-  // Same operations, and same meaning, as Packet's methods of these names.
   template <typename T = void *>
   T head_data(uint16_t offset = 0) const {
-    return pkt_->head_data<T>(offset);
+    return rte_pktmbuf_mtod_offset(pkt_, T, offset);
   }
 
   template <typename T = char *>
   T metadata() const {
-    // Packet::metadata() is a const accessor, but modules need a writable view
-    // of the metadata area; going through uintptr_t is the same route
-    // module.h takes.
-    return reinterpret_cast<T>(pkt_->metadata<uintptr_t>());
+    return reinterpret_cast<T>(rte_mbuf_to_priv(pkt_));
   }
 
   template <typename T = char *>
   T scratchpad() const {
-    return pkt_->scratchpad<T>();
+    return reinterpret_cast<T>(static_cast<char *>(rte_mbuf_to_priv(pkt_)) +
+                               SNBUF_METADATA);
   }
 
-  int nb_segs() const { return pkt_->nb_segs(); }
+  int nb_segs() const { return pkt_->nb_segs; }
+  void set_nb_segs(int n) { pkt_->nb_segs = static_cast<uint16_t>(n); }
 
-  void set_nb_segs(int n) { pkt_->set_nb_segs(n); }
+  PacketRef next() const { return PacketRef(pkt_->next); }
+  void set_next(PacketRef next) { pkt_->next = next.handle(); }
 
-  PacketRef next() const { return PacketRef(pkt_->next()); }
-  void set_next(PacketRef next) { pkt_->set_next(next.handle()); }
+  uint16_t data_len() const { return pkt_->data_len; }
+  void set_data_len(uint16_t len) { pkt_->data_len = len; }
 
-  uint16_t data_len() const { return pkt_->data_len(); }
-  void set_data_len(uint16_t len) { pkt_->set_data_len(len); }
+  int head_len() const { return pkt_->data_len; }
 
-  int head_len() const { return pkt_->head_len(); }
-  int total_len() const { return pkt_->total_len(); }
-  void set_total_len(uint32_t len) { pkt_->set_total_len(len); }
+  int total_len() const { return pkt_->pkt_len; }
+  void set_total_len(uint32_t len) { pkt_->pkt_len = len; }
 
-  uint16_t headroom() const { return pkt_->headroom(); }
-  uint16_t tailroom() const { return pkt_->tailroom(); }
+  uint16_t headroom() const { return rte_pktmbuf_headroom(pkt_); }
+  uint16_t tailroom() const { return rte_pktmbuf_tailroom(pkt_); }
 
-  int is_linear() const { return pkt_->is_linear(); }
-  int is_simple() const { return pkt_->is_simple(); }
+  int is_linear() const { return rte_pktmbuf_is_contiguous(pkt_); }
+  int is_simple() const { return is_linear() && RTE_MBUF_DIRECT(pkt_); }
 
-  void reset() { pkt_->reset(); }
-  void *prepend(uint16_t len) { return pkt_->prepend(len); }
-  void *adj(uint16_t len) { return pkt_->adj(len); }
-  void *append(uint16_t len) { return pkt_->append(len); }
-  void trim(uint16_t to_remove) { pkt_->trim(to_remove); }
+  // DPDK requires reset's input mbuf to be a single segment.
+  void reset() {
+    DCHECK_EQ(pkt_->nb_segs, 1);
+    rte_pktmbuf_reset(pkt_);
+  }
+
+  void *prepend(uint16_t len) { return rte_pktmbuf_prepend(pkt_, len); }
+  void *adj(uint16_t len) { return rte_pktmbuf_adj(pkt_, len); }
+  void *append(uint16_t len) { return rte_pktmbuf_append(pkt_, len); }
+
+  void trim(uint16_t to_remove) {
+    const int ret = rte_pktmbuf_trim(pkt_, to_remove);
+    DCHECK_EQ(ret, 0);
+  }
+
+  std::string Dump() const;
+  void CheckSanity() const;
 
  private:
   PacketHandle pkt_;
@@ -575,74 +146,32 @@ static_assert(std::is_trivially_copyable<PacketRef>::value,
 static_assert(std::is_trivially_destructible<PacketRef>::value,
               "PacketRef must be trivially destructible");
 
-// Ownership helpers. Free functions, not PacketRef members: a PacketRef is
-// non-owning, and its destructor does nothing.
-inline void PacketFree(PacketHandle pkt) {
-  Packet::Free(pkt);
-}
+// Ownership helpers. PacketRef is non-owning and has no destructor action.
+inline void PacketFree(PacketHandle pkt) { rte_pktmbuf_free(pkt); }
 
 inline void PacketFreeBulk(PacketHandle *pkts, size_t cnt) {
-  Packet::Free(pkts, cnt);
+  if (cnt != 0) {
+    rte_pktmbuf_free_bulk(pkts, static_cast<unsigned>(cnt));
+  }
 }
 
 inline void PacketFreeBatch(PacketBatch *batch) {
-  Packet::Free(batch);
+  PacketFreeBulk(batch->handles(), batch->cnt());
 }
 
-// Deep-copies a linear packet's bytes; this inherits Packet::copy's current
-// DCHECK(src->is_linear()) precondition. BESS metadata is not copied, and no
-// clone/refcount semantics are introduced.
-inline PacketHandle PacketCopy(PacketHandle src) {
-  return Packet::copy(src);
-}
+// Deep-copies a linear packet's bytes using native DPDK facilities. The
+// linear-packet precondition is retained from the old PacketCopy contract;
+// rte_pktmbuf_copy deliberately does not copy BESS's private metadata.
+PacketHandle PacketCopy(PacketHandle src);
 
 // Defined here because both PacketRef and PacketBatch must be complete.
-inline PacketRef PacketBatch::packet(size_t i) {
-  return PacketRef(pkts_[i]);
-}
+inline PacketRef PacketBatch::packet(size_t i) { return PacketRef(handles()[i]); }
 
 inline PacketRef PacketBatch::packet(size_t i) const {
-  return PacketRef(pkts_[i]);
+  return PacketRef(handles()[i]);
 }
 
-inline void PacketBatch::add(PacketRef pkt) {
-  pkts_[cnt_++] = pkt.handle();
-}
-
-#if __AVX__
-#include "packet_avx.h"
-#else
-inline void Packet::Free(PacketHandle *pkts, size_t cnt) {
-  DCHECK_LE(cnt, PacketBatch::kMaxBurst);
-
-  // rte_mempool_put_bulk() crashes when called with cnt == 0
-  if (unlikely(cnt <= 0)) {
-    return;
-  }
-
-  struct rte_mempool *pool = pkts[0]->pool_;
-
-  for (size_t i = 0; i < cnt; i++) {
-    PacketHandle pkt = pkts[i];
-
-    if (unlikely(pkt->pool_ != pool || !pkt->is_simple() ||
-                 pkt->refcnt_ != 1)) {
-      goto slow_path;
-    }
-  }
-
-  /* NOTE: it seems that zeroing the refcnt of mbufs is not necessary.
-   *   (allocators will reset them) */
-  rte_mempool_put_bulk(pool, reinterpret_cast<void **>(pkts), cnt);
-  return;
-
-slow_path:
-  // slow path: packets are not homogeneous or simple enough
-  for (size_t i = 0; i < cnt; i++) {
-    Free(pkts[i]);
-  }
-}
-#endif
+inline void PacketBatch::add(PacketRef pkt) { handles()[cnt_++] = pkt.handle(); }
 
 }  // namespace bess
 

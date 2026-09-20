@@ -59,8 +59,8 @@ void Dump::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
     printf("----------------------------------------\n");
     printf("%s: packet dump\n", name().c_str());
-    // Dump is legacy debug formatting; keep this representation escape local.
-    std::cout << pkt.handle()->Dump();
+    // PacketRef owns the native-mbuf debug formatting.
+    std::cout << pkt.Dump();
     rte_hexdump(stdout, "Metadata buffer", pkt.metadata<const char *>(),
                 SNBUF_METADATA);
     next_ns_ = ctx->current_ns + min_interval_ns_;

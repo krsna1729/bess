@@ -36,7 +36,6 @@
 
 namespace bess {
 
-class Packet;
 class PacketRef;
 
 class PacketBatch {
@@ -50,13 +49,9 @@ class PacketBatch {
   PacketHandle *handles() { return pkts_; }
   const PacketHandle *handles() const { return pkts_; }
 
-  // Transitional raw accessor, kept while the tree migrates; new
-  // packet-processing code should use packet(i).
-  Packet *const *pkts() const { return pkts_; }
-  Packet **pkts() { return pkts_; }
 
-  // Non-owning view of one packet. Definition lives in packet.h, where both
-  // PacketRef and Packet are complete.
+  // Non-owning view of one packet. Definition lives in packet.h, where
+  // PacketRef is complete.
   PacketRef packet(size_t i);
   PacketRef packet(size_t i) const;
 

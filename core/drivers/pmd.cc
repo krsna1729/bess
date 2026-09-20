@@ -503,13 +503,11 @@ void PMDPort::CollectStats(bool reset) {
 }
 
 int PMDPort::RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
-  return rte_eth_rx_burst(dpdk_port_id_, qid,
-                          reinterpret_cast<rte_mbuf **>(pkts), cnt);
+  return rte_eth_rx_burst(dpdk_port_id_, qid, pkts, cnt);
 }
 
 int PMDPort::SendPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
-  int sent = rte_eth_tx_burst(dpdk_port_id_, qid,
-                              reinterpret_cast<rte_mbuf **>(pkts), cnt);
+  int sent = rte_eth_tx_burst(dpdk_port_id_, qid, pkts, cnt);
   auto &stats = queue_stats[PACKET_DIR_OUT][qid];
   int dropped = cnt - sent;
   stats.dropped += dropped;

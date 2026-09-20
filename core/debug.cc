@@ -540,7 +540,7 @@ void DumpTypes(void) {
 
   // BESS types
   DumpType<rte_mbuf>();
-  DumpType<Packet>();
+  DumpType<bess::PacketRef>();
   DumpType<bess::PacketBatch>();
 
   DumpType<Scheduler>();

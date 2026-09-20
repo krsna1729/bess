@@ -1,163 +1,73 @@
-// Copyright (c) 2014-2016, The Regents of the University of California.
-// Copyright (c) 2016-2017, Nefeli Networks, Inc.
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// * Redistributions of source code must retain the above copyright notice, this
-// list of conditions and the following disclaimer.
-//
-// * Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// * Neither the names of the copyright holders nor the names of their
-// contributors may be used to endorse or promote products derived from this
-// software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-// POSSIBILITY OF SUCH DAMAGE.
-
 #include "packet.h"
 
-#include <cassert>
-#include <cstdio>
+#include <algorithm>
 #include <iomanip>
 #include <sstream>
-#include <string>
 
-#include <glog/logging.h>
-
-#include <rte_errno.h>
-
-#include "dpdk.h"
-#include "opts.h"
-#include "utils/common.h"
+#include "utils/format.h"
 
 namespace bess {
+namespace {
 
-static struct rte_mempool *pframe_pool[RTE_MAX_NUMA_NODES];
-
-PacketHandle Packet::copy(PacketHandle src) {
-  DCHECK(src->is_linear());
-
-  PacketHandle dst =
-      reinterpret_cast<PacketHandle>(rte_pktmbuf_alloc(src->pool_));
-  if (!dst) {
-    return nullptr;  // FAIL.
+void HexDump(std::ostringstream *dump, const void *data, size_t len) {
+  const auto *bytes = static_cast<const uint8_t *>(data);
+  for (size_t i = 0; i < len; i++) {
+    if ((i & 0xf) == 0) {
+      *dump << "\n  " << std::setfill('0') << std::setw(4) << std::hex << i
+            << ": ";
+    }
+    *dump << std::setfill('0') << std::setw(2) << std::hex
+          << static_cast<unsigned>(bytes[i]) << ' ';
   }
-
-  bess::utils::CopyInlined(dst->append(src->total_len()), src->head_data(),
-                           src->total_len(), true);
-
-  return dst;
+  *dump << std::dec << std::setfill(' ');
 }
 
-// basically rte_hexdump() from eal_common_hexdump.c
-static std::string HexDump(const void *buffer, size_t len) {
-  std::ostringstream dump;
-  size_t i, ofs;
-  const char *data = reinterpret_cast<const char *>(buffer);
+}  // namespace
 
-  dump << "Dump data at [" << buffer << "], len=" << len << std::endl;
-  ofs = 0;
-  while (ofs < len) {
-    dump << std::setfill('0') << std::setw(8) << std::hex << ofs << ":";
-    for (i = 0; ((ofs + i) < len) && (i < 16); i++) {
-      dump << " " << std::setfill('0') << std::setw(2) << std::hex
-           << (data[ofs + i] & 0xFF);
-    }
-    for (; i <= 16; i++) {
-      dump << " | ";
-    }
-    for (i = 0; (ofs < len) && (i < 16); i++, ofs++) {
-      char c = data[ofs];
-      if ((c < ' ') || (c > '~')) {
-        c = '.';
-      }
-      dump << c;
-    }
-    dump << std::endl;
-  }
-  return dump.str();
+PacketHandle PacketCopy(PacketHandle src) {
+  DCHECK(src != nullptr);
+  DCHECK_EQ(src->nb_segs, 1);
+  return rte_pktmbuf_copy(src, src->pool, 0, src->pkt_len);
 }
 
-std::string Packet::Dump() {
+std::string PacketRef::Dump() const {
   std::ostringstream dump;
-  Packet *pkt;
-  uint32_t nb_segs;
-  uint32_t len;
+  const struct rte_mbuf *pkt = pkt_;
 
-  dump << "refcnt chain: ";
-  for (pkt = this; pkt; pkt = pkt->next_) {
-    dump << pkt->refcnt_ << ' ';
+  dump << "dump packet at " << pkt << ", phys=" << rte_mbuf_iova_get(pkt)
+       << ", buf_len=" << pkt->buf_len << '\n';
+  dump << "  pkt_len=" << pkt->pkt_len << ", ol_flags=" << std::hex
+       << pkt->ol_flags << ", nb_segs=" << std::dec << pkt->nb_segs
+       << ", port=" << pkt->port << '\n';
+
+  dump << "  refcnt chain: ";
+  for (const struct rte_mbuf *seg = pkt; seg != nullptr; seg = seg->next) {
+    dump << rte_mbuf_refcnt_read(seg) << ' ';
   }
-  dump << std::endl;
+  dump << '\n';
 
-  dump << "pool chain: ";
-  for (pkt = this; pkt; pkt = pkt->next_) {
-    int i;
-
-    dump << pkt->pool_ << "(";
-
-    for (i = 0; i < RTE_MAX_NUMA_NODES; i++) {
-      if (pframe_pool[i] == pkt->pool_) {
-        dump << "P" << i;
-      }
-    }
-    dump << ") ";
+  dump << "  pool chain: ";
+  for (const struct rte_mbuf *seg = pkt; seg != nullptr; seg = seg->next) {
+    dump << seg->pool << ' ';
   }
-  dump << std::endl;
+  dump << '\n';
 
-  dump << "dump packet at " << this << ", phys=" << buf_physaddr_
-       << ", buf_len=" << buf_len_ << std::endl;
-  dump << "  pkt_len=" << pkt_len_ << ", ol_flags=" << std::hex
-       << mbuf_.ol_flags << ", nb_segs=" << std::dec << nb_segs_
-       << ", in_port=" << mbuf_.port << std::endl;
-
-  nb_segs = nb_segs_;
-  pkt = this;
-  while (pkt && nb_segs != 0) {
-    __rte_mbuf_sanity_check(&pkt->mbuf_, 0);
-
-    dump << "  segment at " << pkt << ", data=" << pkt->head_data()
-         << ", data_len=" << std::dec << unsigned{data_len_} << std::endl;
-
-    len = total_len();
-    if (len > data_len_) {
-      len = data_len_;
-    }
-
-    if (len != 0) {
-      dump << HexDump(head_data(), len);
-    }
-
-    pkt = pkt->next_;
-    nb_segs--;
+  uint32_t remaining = pkt->pkt_len;
+  uint16_t segments = pkt->nb_segs;
+  for (const struct rte_mbuf *seg = pkt;
+       seg != nullptr && segments != 0; seg = seg->next, segments--) {
+    const uint16_t segment_len = static_cast<uint16_t>(
+        std::min<uint32_t>(remaining, static_cast<uint32_t>(seg->data_len)));
+    dump << "  segment at " << seg << ", data="
+         << rte_pktmbuf_mtod(seg, const void *)
+         << ", data_len=" << std::dec << seg->data_len << '\n';
+    HexDump(&dump, rte_pktmbuf_mtod(seg, const void *), segment_len);
+    remaining -= segment_len;
   }
 
   return dump.str();
 }
 
-void Packet::CheckSanity() {
-  // The Packet/rte_mbuf offset compatibility checks that used to live here
-  // duplicated Packet::CheckMbufLayout() (packet.h) field-for-field; that's
-  // the single canonical set now, and it already runs at compile time
-  // regardless of whether this function is ever called (see its own
-  // comment for why). This function is reserved for actual runtime sanity
-  // checks.
-
-  // TODO: check runtime properties
-}
+void PacketRef::CheckSanity() const { rte_mbuf_sanity_check(pkt_, 1); }
 
 }  // namespace bess

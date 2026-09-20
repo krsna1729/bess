@@ -175,9 +175,7 @@
 
 namespace {
 
-using bess::Packet;
 using bess::PacketHandle;
-using bess::PacketRef;
 
 // Pool and handoff sizing. The worst-case in-flight set must stay strictly
 // below the pool capacity, or the producer would spin on a drained pool --
@@ -529,20 +527,12 @@ struct BenchPoolPrivate {
   rte_pktmbuf_pool_private dpdk_priv;
 };
 
-void InitPacket(rte_mempool *mp, void *, void *mbuf, unsigned index) {
-  rte_pktmbuf_init(mp, nullptr, mbuf, index);
-
-  auto *pkt = static_cast<PacketHandle>(mbuf);
-  pkt->set_vaddr(pkt);
-  pkt->set_paddr(rte_mempool_virt2iova(pkt));
-}
 
 // One rte_mempool built the way PlainPacketPool builds one (mmap-backed,
-// MEMPOOL_F_NO_IOVA_CONTIG, mbufs initialized by rte_pktmbuf_init + BESS's
-// vaddr/paddr bookkeeping), except that the two knobs PacketPool hardcodes --
-// ops backend and cache size -- are explicit parameters. Kept local to this
-// file rather than threaded through PacketPool: the experiment must not
-// change production allocation behavior to be able to measure it.
+// MEMPOOL_F_NO_IOVA_CONTIG, native mbufs initialized by rte_pktmbuf_init),
+// except that the ops backend and cache size are explicit parameters. Kept
+// local to this file rather than threaded through PacketPool: the experiment
+// must not change production allocation behavior to measure it.
 class BenchPool {
  public:
   // nullptr when `ops` is not registered in this DPDK build, or the pool
@@ -567,23 +557,24 @@ class BenchPool {
 
   rte_mempool *mp() const { return mp_; }
 
-  // The mempool half of PacketPool::AllocBulk(). The 12 fields
-  // rte_pktmbuf_reset() would write are already in the required state when a
-  // packet comes back out of the pool: rte_pktmbuf_init() set them at pool
-  // creation, and neither free path (BESS's fast free or DPDK's
-  // rte_pktmbuf_free) leaves them in any other state, so only the two
-  // lengths, which really do vary per allocation, are rewritten. That
-  // omission is ~2 stores of constant work, identical in every measured
-  // configuration, and it keeps this file out of Packet's private fields
-  // (friend class PacketPool) entirely.
+  // The production PacketPool::AllocBulk path, using native DPDK allocation
+  // and the two per-allocation length stores.
   bool AllocBulk(PacketHandle *pkts, size_t count, size_t len) {
-    if (rte_mempool_get_bulk(mp_, reinterpret_cast<void **>(pkts), count) < 0) {
+    if (count == 0) {
+      return true;
+    }
+
+    const uint16_t data_room = rte_pktmbuf_data_room_size(mp_);
+    if (data_room < RTE_PKTMBUF_HEADROOM ||
+        len > static_cast<size_t>(data_room) - RTE_PKTMBUF_HEADROOM) {
+      return false;
+    }
+    if (rte_pktmbuf_alloc_bulk(mp_, pkts, static_cast<unsigned>(count)) < 0) {
       return false;
     }
     for (size_t i = 0; i < count; i++) {
-      PacketRef pkt(pkts[i]);
-      pkt.set_total_len(len);
-      pkt.set_data_len(len);
+      pkts[i]->pkt_len = static_cast<uint32_t>(len);
+      pkts[i]->data_len = static_cast<uint16_t>(len);
     }
     return true;
   }
@@ -596,9 +587,9 @@ class BenchPool {
     char name[64];
     snprintf(name, sizeof(name), "MempoolBench%u", next_id.fetch_add(1));
 
-    mp_ = rte_mempool_create_empty(name, kPoolCapacity, sizeof(Packet),
-                                   cache_size, sizeof(BenchPoolPrivate),
-                                   SOCKET_ID_ANY, 0);
+    mp_ = rte_mempool_create_empty(name, kPoolCapacity,
+                                   bess::kPacketMempoolElementSize, cache_size,
+                                   sizeof(BenchPoolPrivate), SOCKET_ID_ANY, 0);
     if (mp_ == nullptr) {
       LOG(ERROR) << "rte_mempool_create_empty() failed: "
                  << rte_strerror(rte_errno);
@@ -641,11 +632,11 @@ class BenchPool {
     }
 
     BenchPoolPrivate priv = {};
-    priv.dpdk_priv.mbuf_data_room_size = SNBUF_HEADROOM + SNBUF_DATA;
-    priv.dpdk_priv.mbuf_priv_size = SNBUF_RESERVE;
+    priv.dpdk_priv.mbuf_data_room_size = bess::kPacketDataRoomSize;
+    priv.dpdk_priv.mbuf_priv_size = bess::kPacketPrivateSize;
     priv.dpdk_priv.flags = 0;
     rte_pktmbuf_pool_init(mp_, &priv.dpdk_priv);
-    rte_mempool_obj_iter(mp_, InitPacket, nullptr);
+    rte_mempool_obj_iter(mp_, rte_pktmbuf_init, nullptr);
     return true;
   }
 
