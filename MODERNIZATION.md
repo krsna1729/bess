@@ -2147,6 +2147,34 @@ rather than one call site).
     sample-plugin load **41/41**, module integration 22/22 files, wire-parity
     script passes, `git diff --check` clean.
 
+49. **`f48e8dc0`** — **G0 commit 7/7: failure injection, leak assertions, phase
+    timings — Phase G0 complete.** `SetFailureInjector()` /
+    `ClearFailureInjector()` in `transaction.h` is a test-only hook the engine
+    consults before every operation (phase + operation), empty by default, with
+    deliberately no environment-variable switch. `apply_pipeline_test.cc` gains
+    a failure-injection matrix that walks a *real* plan — a module to create, a
+    connection to make, a traffic class to attach — and fails each operation in
+    turn, comparing a full runtime fingerprint after every one: generation,
+    port/module/TC/worker counts, orphan-TC count, per-queue `users` occupancy
+    (no acquired queue left behind) and the structural snapshot, all of which
+    must be identical, with the still-active pipeline diffing clean.
+
+    Retirement is not undoable by construction, so an injected retire failure is
+    logged and the transaction still counts as applied — the test pins that
+    semantic down. `ApplyResult::timing` records validation / prepare /
+    paused-commit / retire microseconds, so the quiesced window is measurable
+    from the start (section 9.10).
+
+    Docs: section 9 is marked COMPLETE with the seven-commit table and an
+    explicit list of what G0 left out and where each item lands — metadata layout
+    validation in `Prepare()`, transactional replacement refused by design, RCU
+    in K1, the public desired-state API in G1. The order of work shows G0 done
+    and K1 next; the status snapshot reflects the finished state.
+
+    Verification: GCC + Clang builds clean, native tests + benchmarks +
+    sample-plugin load 41/41, module integration 22/22 files, wire-parity script
+    passes, `git diff --check` clean.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
