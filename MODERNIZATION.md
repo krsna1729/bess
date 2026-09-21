@@ -2060,6 +2060,54 @@ rather than one call site).
     sample-plugin load 40/40, module integration 22/22 files, wire-parity
     script passes, `git diff --check` clean.
 
+47. **`8be5cb8f`** — **G0 commit 5/7: transaction engine, generation,
+    optimistic concurrency.** `ControlPlane::ApplyPipeline(desired, options)`
+    is the transactional path — validate → expected-generation check → diff →
+    plan → prepare → commit → retire, all under the control-plane lock so
+    concurrent writers cannot interleave.
+
+    `core/control/transaction.{h,cc}` holds the state machine and an explicit
+    undo log: Prepare runs reversible setup while workers run; Commit takes the
+    smallest quiesced window that `RequiredQuiescence()` decides (setup-only
+    plans never pause anything); Retire destroys what the new state replaced
+    *after* the transition succeeded and reports failures rather than pretending
+    the transaction failed; Abort walks the undo log in reverse and logs loudly
+    if an undo step fails instead of claiming the rollback worked. Generation
+    lives in `RuntimeState` and is bumped exactly once per successful
+    state-changing transaction — never for reads, validation, planning,
+    failures, or a no-op apply (which returns zero operations and no pause).
+    `expected_generation` is checked before any side effect and reports a
+    conflict (`ESTALE`). `CheckReversibility()` refuses what cannot be staged
+    reversibly — port reconfiguration, module replacement, traffic-class policy
+    changes — with `kUnsupportedTransaction`, naming the object.
+
+    `ControlPlane`'s mutating primitives were split into `*Locked` bodies so the
+    engine can compose them under one lock; `RemoveTcLocked` is new. Planner
+    fix: traffic classes are created parent-before-child and removed
+    child-before-parent.
+
+    Bug found by verification: `AttachTc` deleted an already-registered traffic
+    class on failure without releasing its registry entry, leaving a dangling
+    pointer that `ListTcs` followed — the daemon segfaulted. The entry is now
+    released on every failure path, and the parity script covers the case (a
+    priority child without a priority fails, the parent survives, the daemon
+    stays up).
+
+    Tests: 6 new cases (27 total) — generation bumps once and not on a no-op;
+    validation failure leaves it untouched; stale generation is a conflict with
+    no side effects; a mid-transaction failure rolls back what it created;
+    replacement is refused with the right code; TC hierarchies plan
+    parent-first.
+
+    Verification: GCC + Clang builds clean, native tests + benchmarks +
+    sample-plugin load 40/40, module integration 22/22 files, extended
+    wire-parity script passes, `git diff --check` clean.
+
+    Scope note: unit binaries have no DPDK EAL and therefore cannot launch a
+    worker, so commit-phase failures (which need a scheduler root) are exercised
+    through the daemon runs; commit 7's failure-injection matrix covers them
+    systematically.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
