@@ -1815,6 +1815,41 @@ rather than one call site).
     intentional unaligned header casts remain diagnostics but are demoted from
     errors with `-Wno-error=cast-align`.
 
+40. **`5ef2a971`** + **`23fdc84a`** — **Roadmap re-based on the reordered
+    future-work phases, and Phase G0 fully specified** (docs only, no code).
+
+    The completed record is untouched — chronological log, completed-phase
+    detail, known issues and the benchmark/experiment backlog all keep their
+    numbering, so source comments that cite entry or backlog-item numbers stay
+    valid — and the updated future-work ordering is spliced in above it:
+    modern-glog daemon mode → G0 → K1-K8 → G1 → D → F → H/I, with
+    hardware-gated work parked under Phase C-HW and unable to block the
+    sequence. A naming map resolves older section names (the old
+    `Phase G`/"G1 compatible"/"G2 breaking" variants, old D/F/H/I) to their
+    current homes, Phase E is marked complete with CI run `35615217363` at
+    `e8c8e176` as evidence, the Meson build invariants are recorded in the
+    build section, and the AF_XDP/Linux-I/O end-state policies plus the
+    cross-cutting rules (static graph/dynamic state, transaction classes,
+    G0↔K1 boundary, hardware-offload direction, performance and classifier
+    acceptance discipline, OMEC relationship, rejected directions, execution
+    plan, end-state definitions, current handoff) are folded in.
+
+    §9 (Phase G0) is then replaced by the operative control-plane spec:
+    ControlPlane extraction with its internal API and one error model, RPC
+    handlers as pure adapters, RuntimeState ownership (type registries stay
+    global, mutable instance registries get one owner, destructors stop
+    mutating registries, WorkerManager, module init context, ModuleGraph split,
+    task/TC and port-queue ownership), PipelineSpec with explicit
+    desired-state names, deterministic PipelineSnapshot, side-effect-free
+    validation including a stageable metadata layout, deterministic diff and
+    typed dependency-ordered plan operations, the transaction state machine
+    with engine-decided quiescence and a prepare/commit split, the atomicity
+    caveat made explicit via a `Reversibility` classification, generation and
+    optimistic-concurrency semantics, the failure-injection/test matrix with
+    its 19-item acceptance checklist, hot-path and pause-time discipline,
+    Meson source layout, the 7-commit landing structure with the final
+    verification gate, and the G0 non-goals. Baseline: `e8c8e176`.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
