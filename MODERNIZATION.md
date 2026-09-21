@@ -2291,6 +2291,29 @@ rather than one call site).
     sample-plugin load 41/41, module integration 22/22 files, wire-parity script
     passes, `git diff --check` clean.
 
+53. **`3f49a18a`** — **G0.1 follow-up: snapshot the old attachment before the
+    legacy detach.** `UpdateTcParentLocked()` captured `AttachmentSpecOf(c)`
+    *after* detaching the class, so the description it kept was no longer where
+    the class had been: a leaf that had been a child of a priority class with
+    priority 10 was recorded as a root/orphan, and a refused reattach
+    "restored" it to the orphan list instead of back under its parent. The class
+    was no longer destroyed (that part of `20d9fe2a` was right) but it was still
+    moved. The snapshot now happens immediately after `FindTc()`, the same
+    ordering the transactional `ReparentTcLocked()` already used.
+
+    Tests: 2 new (17 in `apply_pipeline_test.cc`) — a real leaf class created by
+    a `QueueInc` module is homed under a round-robin parent through the legacy
+    path, then a move colliding with a sibling's priority is refused: failure,
+    generation unchanged, class still registered *and still under its original
+    parent*, pipeline still diffing clean. Verified to fail against the pre-fix
+    ordering and pass after. The second pins the stricter legacy rule for
+    non-leaf classes (they may only move as orphans) leaving the snapshot
+    byte-identical.
+
+    Verification: GCC + Clang builds clean, native tests + benchmarks +
+    sample-plugin load 41/41, module integration 22/22 files, wire-parity script
+    passes, `git diff --check` clean.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
