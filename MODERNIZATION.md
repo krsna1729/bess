@@ -2248,6 +2248,49 @@ rather than one call site).
     startup-semantics ripples, unlike the client-reachable paths where G0
     already returns errors.
 
+52. **`20d9fe2a`** — **G0.1: reparent must not destroy the class it moves.**
+    `ReparentTcLocked()` detached an existing class and called `AttachTc()`,
+    which owns cleanup for a *newly created* class — on failure it released the
+    registry entry and let its `unique_ptr` destroy the object. A refused move
+    therefore destroyed the class being moved, and since the transaction records
+    the reparent undo only *after* success, `Abort()` could not restore it; for
+    a non-leaf class it could recursively destroy descendants while their
+    registry entries still existed. Reachable through an ordinary desired-state
+    edit (priority collision, missing priority, `share == 0`, any parent-specific
+    `AddChild()` refusal).
+
+    Attachment ownership is split: `AttachExistingTcLocked()` attaches a class
+    that already exists and never unregisters or destroys it; creation keeps its
+    semantics (release the entry, destroy the new class); reparent snapshots the
+    current attachment (`AttachmentSpecOf`), detaches, tries the new attachment
+    and *reattaches the old one* when it is refused; the legacy
+    `UpdateTcParent` gets the same failure semantics while keeping its stricter
+    orphan-only rule for non-leaf classes.
+
+    `ValidatePipeline()` now refuses impossible attachment up front: a priority
+    parent's child must carry a non-reserved, sibling-unique priority, a
+    weighted-fair parent's child must carry a share greater than zero,
+    `rate_limit` takes a single child, and policies that take no attachment
+    parameter reject children carrying one.
+
+    Bug found while fixing this: `Diff()` compared the raw snapshot parent, so a
+    root class the scheduler had placed under its internal `!default_rr_*`
+    wrapper looked like an attachment change on every apply — hand-written
+    desired state could never reach an empty diff. The diff now treats an
+    internal parent as "no parent", matching `SpecFromSnapshot`.
+
+    Tests: 4 new (15 in `apply_pipeline_test.cc`) — the review's acceptance case
+    (refused priority move: generation, snapshot, both children and their
+    priorities unchanged, no dangling entries), an attach failure validation
+    cannot see (rate limiter's current child retired later in the same
+    transaction) rolling back cleanly including the class created for it,
+    `share == 0` refused before any change, and the policy-change refusal against
+    a validation-clean setup.
+
+    Verification: GCC + Clang builds clean, native tests + benchmarks +
+    sample-plugin load 41/41, module integration 22/22 files, wire-parity script
+    passes, `git diff --check` clean.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -3351,8 +3394,10 @@ update, versus today's full stop.
 | 6 | a complete pipeline applied from C++ end to end, including "a failed commit keeps the active pipeline" |
 | 7 | failure injection over every operation of a real plan, leak/queue/orphan assertions, phase timings |
 
-**Closure follow-up (`5fc0ee2a`, entry 50)** — three correctness gaps found in
-review of the finished code, all about semantics rather than structure:
+**Closure follow-up (`5fc0ee2a`, entry 50; `20d9fe2a`, entry 52)** — four
+correctness gaps found in review of the finished code, all about semantics
+rather than structure (the fourth: a refused reparent destroyed the class it
+was moving — see the last bullet):
 
 - **generation coherence**: legacy structural mutations advance the same
   generation as `ApplyPipeline()`, so a stale writer is detected no matter which
@@ -3363,7 +3408,11 @@ review of the finished code, all about semantics rather than structure:
   them unchanged;
 - **retire contract**: retirement preconditions are proven before the commit,
   and a retire failure is reported as a failure — an ordinary successful apply
-  never claims a pipeline that does not exist.
+  never claims a pipeline that does not exist;
+- **reparent ownership**: `AttachExistingTcLocked()` never destroys the class it
+  attaches, so a refused move reattaches it where it was; attachment
+  constraints are validated up front, and `Diff()` no longer mistakes a
+  scheduler's internal `!default_rr_*` wrapper for a desired parent.
 
 What G0 deliberately did **not** do, and where it lands instead:
 
