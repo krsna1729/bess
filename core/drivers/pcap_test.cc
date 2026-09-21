@@ -1,5 +1,4 @@
-// Copyright (c) 2014-2016, The Regents of the University of California.
-// Copyright (c) 2016-2017, Nefeli Networks, Inc.
+// Copyright (c) 2026, Nefeli Networks, Inc.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -28,33 +27,36 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-#ifndef BESS_DRIVERS_PCAP_H_
-#define BESS_DRIVERS_PCAP_H_
+#include "pcap.h"
 
-#include "../port.h"
+#include <cstdint>
+#include <vector>
 
-#include <glog/logging.h>
+#include <gtest/gtest.h>
+#include <pcap/pcap.h>
 
-#include "../utils/pcap_handle.h"
+#include "../packet_pool.h"
 
-// Port to connect to a device via PCAP.
-// (Not recommended because PCAP is slow :-)
-// Captured packets are copied into one or more native mbuf segments.
-class PCAPPort final : public Port {
- public:
-  CommandResponse Init(const bess::pb::PCAPPortArg &arg);
+TEST(PCAPPortTest, OversizedChainedPacketIsNotReportedSent) {
+  pcap_t *dead_handle = pcap_open_dead(DLT_EN10MB, 65535);
+  ASSERT_NE(dead_handle, nullptr);
 
-  void DeInit() override;
-  // PCAP has no notion of queue so unlike parent (port.cc) quid is ignored.
-  int SendPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) override;
-  // Ditto above: quid is ignored.
-  int RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) override;
+  PCAPPort port;
+  port.pcap_handle_ = PcapHandle(dead_handle);
 
- private:
-  FRIEND_TEST(PCAPPortTest, OversizedChainedPacketIsNotReportedSent);
+  bess::PlainPacketPool pool(32, -1, 4096);
+  std::vector<uint8_t> payload(65536, 0xa5);
+  bess::PacketHandle pkt = pool.AllocCopy(payload.data(), payload.size());
+  ASSERT_NE(pkt, nullptr);
+  ASSERT_GT(pkt->nb_segs, 1);
 
-  void GatherData(unsigned char *data, bess::PacketRef pkt);
-  PcapHandle pcap_handle_;
-};
+  // A dead libpcap handle rejects sends. The regression was that the old
+  // PCAP_SNAPLEN branch skipped this call and still reported success.
+  const int sent = port.SendPackets(0, &pkt, 1);
+  EXPECT_EQ(sent, 0);
 
-#endif  // BESS_DRIVERS_PCAP_H_
+  if (sent == 0) {
+    bess::PacketFree(pkt);
+  }
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}

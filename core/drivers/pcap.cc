@@ -30,8 +30,9 @@
 
 #include "pcap.h"
 
-#include <algorithm>
+#include <limits>
 #include <string>
+#include <vector>
 
 #include "../utils/pcap.h"
 
@@ -93,17 +94,26 @@ int PCAPPort::SendPackets(queue_t, bess::PacketHandle *pkts, int cnt) {
   }
 
   int sent = 0;
+  std::vector<unsigned char> tx_pcap_data;
 
   while (sent < cnt) {
     bess::PacketRef sbuf(pkts[sent]);
+    const uint32_t total_len = sbuf.handle()->pkt_len;
 
-    if (likely(sbuf.nb_segs() == 1)) {
-      pcap_handle_.SendPacket(sbuf.head_data<const u_char *>(),
-                              sbuf.total_len());
-    } else if (sbuf.total_len() <= PCAP_SNAPLEN) {
-      unsigned char tx_pcap_data[PCAP_SNAPLEN];
-      GatherData(tx_pcap_data, sbuf);
-      pcap_handle_.SendPacket(tx_pcap_data, sbuf.total_len());
+    // PcapHandle::SendPacket() and pcap_sendpacket() accept an int length.
+    if (total_len > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+      break;
+    }
+
+    const u_char *data = sbuf.head_data<const u_char *>();
+    if (sbuf.nb_segs() != 1) {
+      tx_pcap_data.resize(total_len);
+      GatherData(tx_pcap_data.data(), sbuf);
+      data = tx_pcap_data.data();
+    }
+
+    if (pcap_handle_.SendPacket(data, static_cast<int>(total_len)) != 0) {
+      break;
     }
 
     sent++;

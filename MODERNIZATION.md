@@ -2202,9 +2202,16 @@ Stage 2C supports both jumbo representations:
 PMD initialization enables `RTE_ETH_RX_OFFLOAD_SCATTER` when the device
 advertises it, and MTU validation uses the device's reported `max_mtu`
 instead of `SNBUF_DATA`. Native `PacketRef` operations remain segment-aware:
-prepend operates on the first segment, append follows DPDK's native
-last-segment behavior, and `tailroom()` reports the native tail segment's
-available room. No overlay-specific jumbo path was added.
+prepend operates on the first segment, `tailroom()` reports room in the
+segment referenced by the `PacketRef`, and `append()`/`trim()` follow DPDK's
+chain-tail behavior when called on a chain head. No overlay-specific jumbo
+path was added.
+
+PCAP TX gathers multisegment packets into dynamically sized scratch storage;
+`PCAP_SNAPLEN` remains a capture snapshot-size constant, not a TX boundary.
+Transmission is limited only by the `int` length accepted by
+`PcapHandle::SendPacket()`, and failed or unrepresentable packets are returned
+as drops rather than counted as successful sends.
 
 The packet suite covers large single-segment operations, PCAP-sized chains,
 partial-chain allocation cleanup, and deep copies of chained bytes. The

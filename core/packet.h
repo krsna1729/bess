@@ -118,6 +118,8 @@ class PacketRef {
   void set_total_len(uint32_t len) { pkt_->pkt_len = len; }
 
   uint16_t headroom() const { return rte_pktmbuf_headroom(pkt_); }
+  // Reports room in the referenced mbuf segment. append() and trim() follow
+  // DPDK's chain-tail behavior when called on a chain head.
   uint16_t tailroom() const { return rte_pktmbuf_tailroom(pkt_); }
 
   int is_linear() const { return rte_pktmbuf_is_contiguous(pkt_); }
