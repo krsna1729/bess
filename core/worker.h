@@ -76,8 +76,11 @@ class Task;
 
 class Worker {
  public:
-  static const int kMaxWorkers = 64;
-  static const int kAnyWorker = -1;  // unspecified worker ID
+  // `constexpr` (not `const`): these are used as array bounds and in
+  // comparisons, and a sanitizer build odr-uses them -- which needs the
+  // implicitly-inline definition that `constexpr` static members have.
+  static constexpr int kMaxWorkers = 64;
+  static constexpr int kAnyWorker = -1;  // unspecified worker ID
 
   /* ----------------------------------------------------------------------
    * functions below are invoked by non-worker threads (the master)
