@@ -1959,6 +1959,33 @@ rather than one call site).
     Remaining from commit 2: the worker globals behind an explicit
     `WorkerManager`.
 
+44. **`fb1259b8`** — **G0 commit 2c/7: `WorkerManager` owns worker slots,
+    threads and orphans — commit 2 complete.** The last mutable-instance
+    globals move into the runtime: `core/control/worker_manager.{h,cc}` owns
+    the worker slots, the OS threads and the orphan-TC list, while `worker.cc`
+    keeps `current_worker` (the thread's TLS `Worker`), pause/resume signalling
+    and `WorkerPauser`, and reduces its free functions to forwarders.
+
+    The worker slots became `std::atomic<Worker *>` instead of the legacy
+    `Worker *volatile workers[]` — a correctness fix, not cosmetics: the old
+    array relied on `volatile` to stop the compiler caching the pointer between
+    the "slot filled?" test and the dereference in the launch spin. Without it
+    the daemon segfaulted (null deref at address 0) in
+    `WorkerManager::Launch` the first time a worker was launched from
+    `AttachOrphans`; reproduced and diagnosed from the daemon's own crashlog
+    before the fix. `num_workers`/`orphan_tcs` globals are gone, the thread
+    entry point and its argument struct moved next to the manager, and
+    `worker_threads[]` left the public header.
+
+    Verification: GCC + Clang builds clean, native tests + benchmarks +
+    sample-plugin load 39/39, module integration 22/22 files, wire-parity
+    script passes, `git diff --check` clean.
+
+    Commit 2's acceptance condition now holds end to end: ports, modules,
+    traffic classes and workers each have one owner in `RuntimeState`, and no
+    destructor mutates a global registry. Next: commit 3
+    (PipelineSpec / PipelineSnapshot / side-effect-free validation).
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
