@@ -90,14 +90,20 @@ foreach proto_index : range(core_proto_names.length())
   if proto_stem.startswith('tests/')
     python_install_stem = proto_stem.split('/')[-1]
   endif
+  python_install_dir = 'builtin_pb'
+  if proto_stem.startswith('ports/')
+    python_install_dir = join_paths('builtin_pb', 'ports')
+  endif
   python_generated_install_entries += [
     [
-      join_paths(python_proto_root, 'builtin_pb', python_install_stem + '_pb2.py'),
-      'builtin_pb',
+      join_paths(python_proto_root, 'builtin_pb',
+                 python_install_stem + '_pb2.py'),
+      python_install_dir,
     ],
     [
-      join_paths(python_proto_root, 'builtin_pb', python_install_stem + '_pb2_grpc.py'),
-      'builtin_pb',
+      join_paths(python_proto_root, 'builtin_pb',
+                 python_install_stem + '_pb2_grpc.py'),
+      python_install_dir,
     ],
   ]
   core_python_proto_targets += python_target

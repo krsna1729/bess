@@ -115,7 +115,16 @@ common_deps = [
 gtest_dep = dependency('gtest', method: 'pkg-config', required: true)
 gtest_main_dep = dependency('gtest_main', method: 'pkg-config', required: true)
 benchmark_dep = dependency('benchmark', method: 'pkg-config', required: true)
-benchmark_main_dep = dependency('benchmark_main', method: 'pkg-config', required: true)
+benchmark_main_dep = dependency('benchmark_main', method: 'pkg-config',
+                                required: false)
+if not benchmark_main_dep.found()
+  benchmark_main_dep = declare_dependency(
+    dependencies: [
+      benchmark_dep,
+      cpp.find_library('benchmark_main', required: true),
+    ],
+  )
+endif
 
 protoc = find_program('protoc', required: true)
 grpc_cpp_plugin = find_program('grpc_cpp_plugin', required: true)

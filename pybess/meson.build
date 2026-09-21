@@ -1,5 +1,5 @@
 python_proto_root = join_paths(meson.project_build_root(), 'protobuf', 'generated', 'python')
-python_proto_env = {
+python_env = {
   'BESS_PROTOBUF_ROOT': python_proto_root,
   'PYTHONPATH': ':'.join([
     python_proto_root,
@@ -7,27 +7,25 @@ python_proto_env = {
     join_paths(python_proto_root, 'plugin_pb'),
     meson.project_source_root(),
   ]),
-}
-
-foreach test_module : ['test_bess', 'test_protobuf_to_dict']
-  test(
-    'python_' + test_module,
-    python,
-    args: ['-m', 'unittest', 'pybess.' + test_module],
-    depends: python_proto_targets,
-    env: python_proto_env,
-    suite: 'python',
-    is_parallel: false,
-  )
-endforeach
-
-bess_data_dir = join_paths(get_option('datadir'), 'bess')
-integration_env = {
   'BESSD_BINARY': join_paths(meson.project_build_root(), 'core', 'bessd'),
-  'BESS_PROTOBUF_ROOT': python_proto_root,
-  'PYTHONPATH': python_proto_env['PYTHONPATH'],
   'LD_LIBRARY_PATH': dpdk_libdir,
 }
+
+test(
+  'python_unittest_discover',
+  python,
+  args: [
+    '-m', 'unittest', 'discover', '-v',
+    '-s', meson.project_source_root(),
+  ],
+  depends: python_proto_targets,
+  env: python_env,
+  suite: 'python',
+  is_parallel: false,
+  timeout: 1800,
+)
+
+integration_env = python_env
 test(
   'module_integration',
   python,
@@ -38,6 +36,7 @@ test(
   is_parallel: false,
   timeout: 1800,
 )
+bess_data_dir = join_paths(get_option('datadir'), 'bess')
 install_data(
   files('__init__.py', 'bess.py', 'module.py', 'pm_import.py',
         'port.py', 'protobuf_to_dict.py'),
@@ -45,19 +44,19 @@ install_data(
 )
 install_data(
   files('builtin_pb/__init__.py'),
-  install_dir: join_paths(bess_data_dir, 'pybess', 'builtin_pb'),
+  install_dir: join_paths(bess_data_dir, 'builtin_pb'),
 )
 install_data(
   files('builtin_pb/ports/__init__.py'),
-  install_dir: join_paths(bess_data_dir, 'pybess', 'builtin_pb', 'ports'),
+  install_dir: join_paths(bess_data_dir, 'builtin_pb', 'ports'),
 )
 install_data(
   files('plugin_pb/__init__.py'),
-  install_dir: join_paths(bess_data_dir, 'pybess', 'plugin_pb'),
+  install_dir: join_paths(bess_data_dir, 'plugin_pb'),
 )
 install_data(
   files('plugin_pb/ports/__init__.py'),
-  install_dir: join_paths(bess_data_dir, 'pybess', 'plugin_pb', 'ports'),
+  install_dir: join_paths(bess_data_dir, 'plugin_pb', 'ports'),
 )
 install_copy = find_program('cp', required: true)
 foreach generated_entry : python_generated_install_entries

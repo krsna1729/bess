@@ -684,6 +684,11 @@ def _do_start(cli, opts):
         os.path.join(os.path.dirname(cli.this_dir), 'core', 'bessd'),
     )
     command = [bessd, '-k'] + list(opts)
+    # sudo's env_reset drops LD_LIBRARY_PATH even with -E.  Keep the
+    # build-tree DPDK runtime visible when the daemon is launched by bessctl.
+    ld_library_path = os.environ.get('LD_LIBRARY_PATH')
+    if ld_library_path:
+        command = ['env', 'LD_LIBRARY_PATH=' + ld_library_path] + command
     cmd = 'sudo -E ' + ' '.join(shlex.quote(arg) for arg in command)
 
     cli.bess.disconnect()

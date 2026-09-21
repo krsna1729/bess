@@ -106,6 +106,15 @@ module integration, benchmarks, sample plugin, install layout, and AF_XDP
 artifact checks are first-class Meson targets.  No dataplane ownership,
 `MBUF_FAST_FREE`, `PortOut`, plugin ABI, or DPDK-version behavior changes are
 part of this phase.
+Phase E intentionally does not publish an external plugin-development package:
+installed BESS headers and pkg-config/Meson dependency metadata remain part of
+the later plugin-ABI work.  The in-tree sample plugin is the only supported
+plugin build surface for this phase.
+
+The installed tree also does not provide a `bin/bessctl` entrypoint.  The
+control-plane CLI remains source-tree tooling while its redesign is pending;
+Phase E verifies the installed Python API separately.
+
 ## Status snapshot
 
 This log records the Meson cutover delivered in `c02f41ef` on `develop`;

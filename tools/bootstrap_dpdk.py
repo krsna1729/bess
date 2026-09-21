@@ -66,14 +66,21 @@ def download_and_extract(metadata: dict[str, str], source_dir: Path,
         os.replace(temporary, archive)
 
     verify_archive(archive, metadata['sha256'])
-    with tempfile.TemporaryDirectory(prefix='dpdk-extract-', dir=archive.parent) as temporary:
+    with tempfile.TemporaryDirectory(
+            prefix='dpdk-extract-', dir=archive.parent) as temporary:
         temporary_path = Path(temporary)
         with tarfile.open(archive, 'r:*') as package:
             package.extractall(temporary_path, filter='data')
         extracted = temporary_path / metadata['directory']
         if not extracted.is_dir():
-            raise SystemExit(
-                f'archive {archive} did not contain {metadata["directory"]}/')
+            roots = [
+                candidate for candidate in temporary_path.iterdir()
+                if candidate.is_dir()
+            ]
+            if len(roots) != 1:
+                raise SystemExit(
+                    f'archive {archive} did not contain a single source directory')
+            extracted = roots[0]
         os.replace(extracted, source_dir)
 
 
@@ -136,8 +143,8 @@ def configure_and_build(source_dir: Path, build_dir: Path, prefix: Path,
     if cpu:
         command.append('-Dmachine=' + cpu)
     run(command, env=env)
-    run(['ninja', '-C', str(build_dir)], env=env)
-    run(['ninja', '-C', str(build_dir), 'install'], env=env)
+    run(['ninja', '-C', str(build_dir), '-j4'], env=env)
+    run(['ninja', '-C', str(build_dir), '-j4', 'install'], env=env)
 
 
 def main() -> int:

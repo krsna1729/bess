@@ -88,8 +88,23 @@ jobs:
       - name: Verify install tree
         run: |
           meson install -C "build-${{ matrix.name }}" --destdir "$PWD/stage-${{ matrix.name }}"
-          test -x "stage-${{ matrix.name }}/usr/local/bin/bessd"
-          test -f "stage-${{ matrix.name }}/usr/local/lib/bess/modules/libsequential_update.so"
+          python3 - "$PWD/stage-${{ matrix.name }}" <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+
+          stage = Path(sys.argv[1])
+          bessd = list(stage.glob('**/bin/bessd'))
+          plugins = list(stage.glob('**/bess/modules/libsequential_update.so'))
+          assert len(bessd) == 1, bessd
+          assert len(plugins) == 1, plugins
+          assert os.access(bessd[0], os.X_OK), bessd[0]
+          PY
+
+      - name: Verify installed Python client
+        run: |
+          python3 tools/check_installed_pybess.py \
+            --root "$PWD/stage-${{ matrix.name }}/usr/local/share/bess"
 
       - name: Dump daemon logs on failure
         if: failure()

@@ -1,0 +1,6 @@
+{
+  "version": "25.11.3",
+  "directory": "dpdk-25.11.3",
+  "url": "https://fast.dpdk.org/rel/dpdk-25.11.3.tar.xz",
+  "sha256": "3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7490"
+}

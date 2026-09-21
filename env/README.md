@@ -35,8 +35,9 @@ $ ./container_build.py
 
 then the script will automatically fetch the container image
 (nefelinetworks/bess_build at hub.docker.com) and provide the Meson/Ninja
-toolchain and DPDK bootstrap environment.  Build output uses shared DPDK
-libraries and remains in the mounted source tree.
+toolchain and dependency environment.  `container_build.py` mounts the
+checkout and runs its checksum-pinned DPDK bootstrap helper; build output uses
+shared DPDK libraries and remains in the mounted source tree.
 
 ## Ansible scripts
 

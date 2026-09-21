@@ -15,25 +15,16 @@ COPY ci.yml /tmp/
 
 # Install dependency packages with Ansible
 RUN apt-get -q update && \
-	apt-get install -y ansible curl && \
+	apt-get install -y ansible && \
         ansible-playbook /tmp/ci.yml -i "localhost," -c local && \
 	apt-get purge -y ansible && \
 	apt-get autoremove -y && \
 	rm -rf /var/lib/apt/lists
 
-RUN mkdir -p /build/bess
-
-# The container image is a dependency/runtime image; BESS itself is built by
-# Meson after the image starts.
-ENV CPU=corei7
-ENV AF_XDP=required
-ARG BESS_DPDK_BRANCH=develop
-RUN cd /build/bess && \
-	curl -s -L https://github.com/NetSys/bess/archive/${BESS_DPDK_BRANCH}.tar.gz | tar zx --strip-components=1 && \
-	tools/bootstrap_dpdk.py --af-xdp required --cpu "$CPU" && \
-	rm -rf /build/bess
+# The image provides the dependency and runtime environment.  The mounted
+# checkout owns DPDK bootstrap and the Meson build.
+WORKDIR /build/bess
 
 ENV CCACHE_DIR=/tmp/ccache
 ENV CCACHE_COMPRESS=true
 
-WORKDIR /build/bess
