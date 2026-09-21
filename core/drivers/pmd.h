@@ -31,6 +31,9 @@
 #ifndef BESS_DRIVERS_PMD_H_
 #define BESS_DRIVERS_PMD_H_
 
+#include <cstddef>
+#include <cstdint>
+
 #include <string>
 
 #include <rte_config.h>
@@ -43,6 +46,30 @@
 typedef uint16_t dpdk_port_t;
 
 #define DPDK_PORT_UNKNOWN RTE_MAX_ETHPORTS
+// Semantic PMD capabilities consumed by BESS. This intentionally does not
+// mirror rte_eth_dev_info wholesale.
+struct PmdCapabilities {
+  enum class RxMtuSupport {
+    kSingleMbuf,
+    kScatter,
+    kExceedsDeviceMtu,
+    kScatterUnsupported,
+  };
+
+  static PmdCapabilities FromDeviceInfo(
+      const rte_eth_dev_info &dev_info);
+
+  // single_mbuf_capacity includes RTE_PKTMBUF_HEADROOM.
+  RxMtuSupport RxMtuSupportFor(uint32_t mtu,
+                                size_t single_mbuf_capacity) const;
+
+  bool rx_scatter = false;
+  uint32_t max_mtu = RTE_ETHER_MAX_JUMBO_FRAME_LEN;
+  uint64_t rx_offload_capa = 0;
+  uint64_t tx_offload_capa = 0;
+  uint64_t dev_capa = 0;
+};
+
 /*!
  * This driver binds a port to a device using DPDK.
  * This is the recommended driver for performance.
@@ -53,7 +80,11 @@ class PMDPort final : public Port {
       : Port(),
         dpdk_port_id_(DPDK_PORT_UNKNOWN),
         hot_plugged_(false),
-        node_placement_(UNCONSTRAINED_SOCKET) {}
+        node_placement_(UNCONSTRAINED_SOCKET),
+        capabilities_(),
+        rx_scatter_enabled_(false),
+        loopback_(false),
+        vlan_offload_mask_(0) {}
 
   void InitDriver() override;
 
@@ -137,6 +168,10 @@ class PMDPort final : public Port {
   }
 
  private:
+  CommandResponse ConfigureDevice(dpdk_port_t port_id,
+                                  const rte_eth_dev_info &dev_info,
+                                  bool enable_rx_scatter);
+
   /*!
    * The DPDK port ID number (set after binding).
    */
@@ -152,6 +187,10 @@ class PMDPort final : public Port {
    * The NUMA node to which device is attached
    */
   placement_constraint node_placement_;
+  PmdCapabilities capabilities_;
+  bool rx_scatter_enabled_;
+  bool loopback_;
+  int vlan_offload_mask_;
 
   std::string driver_;  // ixgbe, i40e, ...
 };

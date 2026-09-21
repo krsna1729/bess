@@ -37,18 +37,43 @@
 #include <rte_bus_pci.h>
 #include <rte_ethdev.h>
 
+#include "../packet_pool.h"
 #include "../utils/ether.h"
 #include "../utils/format.h"
 
+PmdCapabilities PmdCapabilities::FromDeviceInfo(
+    const rte_eth_dev_info &dev_info) {
+  PmdCapabilities ret;
+  ret.rx_scatter =
+      (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER) != 0;
+  ret.max_mtu = dev_info.max_mtu != 0 ? dev_info.max_mtu
+                                     : RTE_ETHER_MAX_JUMBO_FRAME_LEN;
+  ret.rx_offload_capa = dev_info.rx_offload_capa;
+  ret.tx_offload_capa = dev_info.tx_offload_capa;
+  ret.dev_capa = dev_info.dev_capa;
+  return ret;
+}
+
+PmdCapabilities::RxMtuSupport PmdCapabilities::RxMtuSupportFor(
+    uint32_t mtu, size_t single_mbuf_capacity) const {
+  if (mtu > max_mtu) {
+    return RxMtuSupport::kExceedsDeviceMtu;
+  }
+  if (mtu <= single_mbuf_capacity) {
+    return RxMtuSupport::kSingleMbuf;
+  }
+  return rx_scatter ? RxMtuSupport::kScatter
+                    : RxMtuSupport::kScatterUnsupported;
+}
+
 static const rte_eth_conf default_eth_conf(const rte_eth_dev_info &dev_info,
-                                           int nb_rxq) {
+                                           int nb_rxq,
+                                           bool enable_rx_scatter) {
   rte_eth_conf ret = {};
 
   ret.rxmode.mq_mode = (nb_rxq > 1) ? RTE_ETH_MQ_RX_RSS : RTE_ETH_MQ_RX_NONE;
   ret.rxmode.offloads = 0;
-  // Keep the receive contract valid for both large single-segment mbufs and
-  // chains when a PMD advertises scatter support.
-  if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER) {
+  if (enable_rx_scatter) {
     ret.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_SCATTER;
   }
   ret.rx_adv_conf.rss_conf = {
@@ -63,6 +88,61 @@ static const rte_eth_conf default_eth_conf(const rte_eth_dev_info &dev_info,
   };
 
   return ret;
+}
+CommandResponse PMDPort::ConfigureDevice(dpdk_port_t port_id,
+                                          const rte_eth_dev_info &dev_info,
+                                          bool enable_rx_scatter) {
+  const int num_txq = num_queues[PACKET_DIR_OUT];
+  const int num_rxq = num_queues[PACKET_DIR_INC];
+
+  int sid = rte_eth_dev_socket_id(port_id);
+  if (sid < 0 || sid > RTE_MAX_NUMA_NODES) {
+    sid = 0;
+  }
+
+  bess::PacketPool *pool = bess::PacketPool::GetDefaultPool(sid);
+  if (!pool) {
+    return CommandFailure(ENODEV, "No default packet pool for socket %d", sid);
+  }
+
+  rte_eth_conf eth_conf =
+      default_eth_conf(dev_info, num_rxq, enable_rx_scatter);
+  eth_conf.lpbk_mode = loopback_ ? 1 : 0;
+
+  int ret = rte_eth_dev_configure(port_id, num_rxq, num_txq, &eth_conf);
+  if (ret != 0) {
+    return CommandFailure(-ret, "rte_eth_dev_configure() failed");
+  }
+
+  rte_eth_rxconf eth_rxconf = dev_info.default_rxconf;
+  eth_rxconf.rx_drop_en = 1;
+
+  for (int i = 0; i < num_rxq; i++) {
+    ret = rte_eth_rx_queue_setup(port_id, i, queue_size[PACKET_DIR_INC], sid,
+                                 &eth_rxconf, pool->pool());
+    if (ret != 0) {
+      return CommandFailure(-ret, "rte_eth_rx_queue_setup() failed");
+    }
+  }
+
+  for (int i = 0; i < num_txq; i++) {
+    ret = rte_eth_tx_queue_setup(port_id, i, queue_size[PACKET_DIR_OUT], sid,
+                                 nullptr);
+    if (ret != 0) {
+      return CommandFailure(-ret, "rte_eth_tx_queue_setup() failed");
+    }
+  }
+
+  rte_eth_promiscuous_enable(port_id);
+  if (vlan_offload_mask_) {
+    ret = rte_eth_dev_set_vlan_offload(port_id, vlan_offload_mask_);
+    if (ret != 0) {
+      return CommandFailure(-ret, "rte_eth_dev_set_vlan_offload() failed");
+    }
+  }
+
+  rx_scatter_enabled_ = enable_rx_scatter;
+  return CommandSuccess();
 }
 
 void PMDPort::InitDriver() {
@@ -153,7 +233,6 @@ static CommandResponse find_dpdk_port_by_pci_addr(const std::string &pci,
   // canonical PCI-name formatter (PCI_PRI_FMT: "%.4x:%.2x:%.2x.%x", NOT
   // "%08x:%02x:%02x.%02x" -- domain is 4 hex digits and function is
   // unpadded) and compare against rte_dev_name() instead, which returns
-  // exactly this format for PCI devices.
   char target_name[RTE_ETH_NAME_MAX_LEN];
   rte_pci_device_name(&addr, target_name, sizeof(target_name));
 
@@ -234,10 +313,7 @@ static CommandResponse find_dpdk_vdev(const std::string &vdev,
 
 CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
   dpdk_port_t ret_port_id = DPDK_PORT_UNKNOWN;
-
   rte_eth_dev_info dev_info;
-  rte_eth_conf eth_conf;
-  rte_eth_rxconf eth_rxconf;
 
   int num_txq = num_queues[PACKET_DIR_OUT];
   int num_rxq = num_queues[PACKET_DIR_INC];
@@ -277,23 +353,44 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
     return CommandFailure(-ret, "rte_eth_dev_info_get() failed");
   }
 
-  eth_conf = default_eth_conf(dev_info, num_rxq);
-  if (arg.loopback()) {
-    eth_conf.lpbk_mode = 1;
-  }
-
-  ret = rte_eth_dev_configure(ret_port_id, num_rxq, num_txq, &eth_conf);
-  if (ret != 0) {
-    return CommandFailure(-ret, "rte_eth_dev_configure() failed");
-  }
+  capabilities_ = PmdCapabilities::FromDeviceInfo(dev_info);
+  loopback_ = arg.loopback();
+  vlan_offload_mask_ =
+      (arg.vlan_offload_rx_strip() ? RTE_ETH_VLAN_STRIP_OFFLOAD : 0) |
+      (arg.vlan_offload_rx_filter() ? RTE_ETH_VLAN_FILTER_OFFLOAD : 0) |
+      (arg.vlan_offload_rx_qinq() ? RTE_ETH_VLAN_EXTEND_OFFLOAD : 0);
 
   int sid = rte_eth_dev_socket_id(ret_port_id);
   if (sid < 0 || sid > RTE_MAX_NUMA_NODES) {
     sid = 0;  // if socket_id is invalid, set to 0
   }
 
-  eth_rxconf = dev_info.default_rxconf;
-  eth_rxconf.rx_drop_en = 1;
+  bess::PacketPool *pool = bess::PacketPool::GetDefaultPool(sid);
+  if (!pool) {
+    return CommandFailure(ENODEV, "No default packet pool for socket %d", sid);
+  }
+  if (conf_.mtu < RTE_ETHER_MIN_MTU) {
+    return CommandFailure(EINVAL, "mtu should be >= %d and <= %u",
+                          RTE_ETHER_MIN_MTU, capabilities_.max_mtu);
+  }
+
+  const auto rx_mtu_support =
+      capabilities_.RxMtuSupportFor(conf_.mtu, pool->mbuf_data_room_size());
+  if (rx_mtu_support ==
+      PmdCapabilities::RxMtuSupport::kExceedsDeviceMtu) {
+    return CommandFailure(EINVAL, "mtu %u exceeds PMD max_mtu %u", conf_.mtu,
+                          capabilities_.max_mtu);
+  }
+  if (rx_mtu_support ==
+      PmdCapabilities::RxMtuSupport::kScatterUnsupported) {
+    return CommandFailure(
+        EINVAL,
+        "mtu %u exceeds single-mbuf RX capacity %zu and PMD does not support "
+        "RX scatter",
+        conf_.mtu, pool->mbuf_data_room_size());
+  }
+  const bool enable_rx_scatter =
+      rx_mtu_support == PmdCapabilities::RxMtuSupport::kScatter;
 
   // Let DPDK clamp the requested descriptor counts to each PMD's
   // min/max/align limits in one call. The old hand-rolled code here only
@@ -325,36 +422,9 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
   queue_size[PACKET_DIR_INC] = nb_rx_desc;
   queue_size[PACKET_DIR_OUT] = nb_tx_desc;
 
-  for (int i = 0; i < num_rxq; i++) {
-    ret = rte_eth_rx_queue_setup(ret_port_id, i, queue_size[PACKET_DIR_INC],
-                                 sid, &eth_rxconf,
-                                 bess::PacketPool::GetDefaultPool(sid)->pool());
-    if (ret != 0) {
-      return CommandFailure(-ret, "rte_eth_rx_queue_setup() failed");
-    }
-  }
-
-  for (int i = 0; i < num_txq; i++) {
-    ret = rte_eth_tx_queue_setup(ret_port_id, i, queue_size[PACKET_DIR_OUT],
-                                 sid, nullptr);
-    if (ret != 0) {
-      return CommandFailure(-ret, "rte_eth_tx_queue_setup() failed");
-    }
-  }
-
-  rte_eth_promiscuous_enable(ret_port_id);
-
-  int offload_mask = 0;
-  offload_mask |=
-      arg.vlan_offload_rx_strip() ? RTE_ETH_VLAN_STRIP_OFFLOAD : 0;
-  offload_mask |=
-      arg.vlan_offload_rx_filter() ? RTE_ETH_VLAN_FILTER_OFFLOAD : 0;
-  offload_mask |= arg.vlan_offload_rx_qinq() ? RTE_ETH_VLAN_EXTEND_OFFLOAD : 0;
-  if (offload_mask) {
-    ret = rte_eth_dev_set_vlan_offload(ret_port_id, offload_mask);
-    if (ret != 0) {
-      return CommandFailure(-ret, "rte_eth_dev_set_vlan_offload() failed");
-    }
+  err = ConfigureDevice(ret_port_id, dev_info, enable_rx_scatter);
+  if (err.error().code() != 0) {
+    return err;
   }
 
   ret = rte_eth_dev_start(ret_port_id);
@@ -383,16 +453,54 @@ CommandResponse PMDPort::UpdateConf(const Conf &conf) {
   rte_eth_dev_stop(dpdk_port_id_);  // need to restart before return
 
   if (conf_.mtu != conf.mtu && conf.mtu != 0) {
-    uint32_t max_mtu = RTE_ETHER_MAX_JUMBO_FRAME_LEN;
-    rte_eth_dev_info mtu_dev_info = {};
-    if (rte_eth_dev_info_get(dpdk_port_id_, &mtu_dev_info) == 0 &&
-        mtu_dev_info.max_mtu != 0) {
-      max_mtu = mtu_dev_info.max_mtu;
-    }
-    if (conf.mtu > max_mtu || conf.mtu < RTE_ETHER_MIN_MTU) {
-      resp = CommandFailure(EINVAL, "mtu should be >= %d and <= %d",
-                            RTE_ETHER_MIN_MTU, max_mtu);
+    if (conf.mtu < RTE_ETHER_MIN_MTU) {
+      resp = CommandFailure(EINVAL, "mtu should be >= %d and <= %u",
+                            RTE_ETHER_MIN_MTU, capabilities_.max_mtu);
       goto restart;
+    }
+
+    int sid = rte_eth_dev_socket_id(dpdk_port_id_);
+    if (sid < 0 || sid > RTE_MAX_NUMA_NODES) {
+      sid = 0;
+    }
+    bess::PacketPool *pool = bess::PacketPool::GetDefaultPool(sid);
+    if (!pool) {
+      resp = CommandFailure(ENODEV, "No default packet pool for socket %d",
+                            sid);
+      goto restart;
+    }
+
+    const auto rx_mtu_support =
+        capabilities_.RxMtuSupportFor(conf.mtu, pool->mbuf_data_room_size());
+    if (rx_mtu_support ==
+        PmdCapabilities::RxMtuSupport::kExceedsDeviceMtu) {
+      resp = CommandFailure(EINVAL, "mtu %u exceeds PMD max_mtu %u", conf.mtu,
+                            capabilities_.max_mtu);
+      goto restart;
+    }
+    if (rx_mtu_support ==
+        PmdCapabilities::RxMtuSupport::kScatterUnsupported) {
+      resp = CommandFailure(
+          EINVAL,
+          "mtu %u exceeds single-mbuf RX capacity %zu and PMD does not "
+          "support RX scatter",
+          conf.mtu, pool->mbuf_data_room_size());
+      goto restart;
+    }
+
+    const bool enable_rx_scatter =
+        rx_mtu_support == PmdCapabilities::RxMtuSupport::kScatter;
+    if (enable_rx_scatter != rx_scatter_enabled_) {
+      rte_eth_dev_info dev_info = {};
+      int ret = rte_eth_dev_info_get(dpdk_port_id_, &dev_info);
+      if (ret != 0) {
+        resp = CommandFailure(-ret, "rte_eth_dev_info_get() failed");
+        goto restart;
+      }
+      resp = ConfigureDevice(dpdk_port_id_, dev_info, enable_rx_scatter);
+      if (resp.error().code() != 0) {
+        goto restart;
+      }
     }
 
     int ret = rte_eth_dev_set_mtu(dpdk_port_id_, conf.mtu);

@@ -2141,9 +2141,10 @@ initialization.
 
 At the Stage 2B boundary, residual Stage 2 scope was explicit: jumbo/
 multisegment policy, AF_XDP/vhost external-buffer pool plumbing, clone
-semantics, hardware offloads, `MBUF_FAST_FREE`, `PortCapabilities`,
-`PacketBatch::kMaxBurst` changes, and real-NIC/cross-worker measurements
-remained future work. Stage 2C below records the portions now implemented.
+semantics, hardware offloads, `MBUF_FAST_FREE`, `PacketBatch::kMaxBurst`
+changes, and real-NIC/cross-worker measurements remained future work.
+Stage 2C below records the portions now implemented, including the internal
+PMD capability and RX MTU/scatter foundation.
 
 ### Stage 2C.1 — variable packet data-room sizing (first substage)
 
@@ -2167,16 +2168,16 @@ The `SNBUF_DATA` audit is intentional:
 
 | Use | Classification |
 | --- | --- |
-| `core/packet.h`, `core/snbuf_layout.h` | Historical default payload capacity |
-| `core/drivers/pmd.cc` MTU validation | Capacity-dependent; remains fixed until the jumbo policy substage |
+| `core/drivers/pmd.cc` MTU validation | Capacity-dependent; consumes the default pool's payload room plus `RTE_PKTMBUF_HEADROOM` and the PMD capability contract |
 | `core/modules/source.cc` packet-size validation | Capacity-dependent; remains fixed until the jumbo policy substage |
 | `core/modules/random_update.cc`, `core/modules/update.cc`, `sample_plugin/modules/sequential_update.cc` | Fixed application-level packet-field offset contract |
 | `core/modules/set_metadata.cc` | Fixed application-level packet-field offset contract |
 
 The offset-contract uses are not allocator sizing. They must not be replaced
 with a larger pool room without separately changing the module's packet-field
-contract. The PMD and source checks are the remaining capacity consumers and
-are deliberately left for the jumbo/multisegment decision.
+contract. The PMD check now consumes the actual pool room and PMD capabilities.
+The source checks are the remaining capacity consumers and are deliberately
+left for the jumbo/multisegment decision.
 
 The variable-room before/after gate was recaptured after the initial unpinned
 attempt: both `8ab929fd` and the working tree were built with clang++ against
@@ -2199,9 +2200,12 @@ Stage 2C supports both jumbo representations:
   exceeds one segment. PCAP receive uses this path, so captured packets do not
   need a fixed `SNBUF_DATA` limit.
 
-PMD initialization enables `RTE_ETH_RX_OFFLOAD_SCATTER` when the device
-advertises it, and MTU validation uses the device's reported `max_mtu`
-instead of `SNBUF_DATA`. Native `PacketRef` operations remain segment-aware:
+PMD initialization derives an internal capability object from
+`rte_eth_dev_info`. It enables `RTE_ETH_RX_OFFLOAD_SCATTER` only when the
+configured MTU exceeds the single-mbuf RX capacity
+(`payload room + RTE_PKTMBUF_HEADROOM`) and the PMD advertises scatter; an
+unsupported geometry or a device `max_mtu` exceed is rejected explicitly.
+Native `PacketRef` operations remain segment-aware:
 prepend operates on the first segment, `tailroom()` reports room in the
 segment referenced by the `PacketRef`, and `append()`/`trim()` follow DPDK's
 chain-tail behavior when called on a chain head. No overlay-specific jumbo
@@ -2511,12 +2515,14 @@ testing goes through `bessctl/module_tests/*.py` against a running
         rate, so those samples are not a synchronized loss measurement.
         The userspace run completed without another reboot; all processes and
         veths were stopped and removed afterward.
-      - Small ergonomic follow-up once AF_XDP works: `PMDPortArg`
-        currently exposes only `loopback` and three VLAN-offload
-        booleans; long vdev devargs strings are the whole configuration
-        surface today. A few named fields (queues, zero-copy mode,
-        busy-poll) would be worth adding as BESS-level semantics, not raw
-        devargs passthrough.
+      - **No AF_XDP-specific BESS configuration sugar is planned.** AF_XDP
+        uses the existing generic `PMDPort.vdev` devargs path; physical
+        devices continue to use `pci=...`, while DPDK virtual devices use
+        `vdev='net_af_xdp,...'`. PMD-specific options (`iface`, `force_copy`,
+        `mode`, busy-poll, UMEM, and future PMD parameters) remain DPDK
+        devargs. BESS adds fields only for portable cross-PMD semantics such
+        as queue counts, generic MTU, VLAN behavior, loopback, and capability
+        reporting.
       - VFIO for physical NICs was already the normal `PMDPort` path
         before this review (`pci=` args) -- nothing new needed there
         either. The net effect of this whole scope correction: this phase
@@ -2539,27 +2545,25 @@ testing goes through `bessctl/module_tests/*.py` against a running
       bug family as the two Phase A ABI-drift bugs. Configuration path
       only, no performance implication. Small, low-risk, do this one
       without a design spike.
-- [ ] **A minimal, consumer-driven `PortCapabilities` in `PMDPort`**
-      (DPDK-proposal review, 2026-09-18) -- explicitly **not** a
-      speculative capability struct built ahead of its consumers.
-      Verified: `PMDPort` does essentially no offload negotiation today
-      (`rxmode.offloads = 0`, `txmode` never touched); the one existing
-      negotiation is RSS hash types masked against
-      `dev_info.flow_type_rss_offloads`. Introduce a small **internal**
-      struct populated once from `rte_eth_dev_info` at `Init()`, and only
-      as consumers land -- not exposed in the protobuf API (that's Phase
-      G2's `GetCapabilities`, which already has the right rule: expose
-      BESS semantics, never raw `RTE_ETH_*` flags, same principle as
-      Phase B's `PacketRef` work). First three consumers, in order: (1)
-      the `adjust_nb_rx_tx_desc` item above; (2)
-      `RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE` gating -- benchmark-gated, and
-      must be re-evaluated after Phase B Stage 2, since clones/external
-      buffers break its "direct packet, refcount 1, single known pool"
-      precondition; (3) `RTE_ETH_DEV_CAPA_RXQ_SHARE`/MT-lockfree-Tx
-      gating, to let `PortOut` skip its per-queue MCS lock
-      (`core/modules/port_out.h`/`.cc`) when the PMD advertises lock-free
-      multithreaded Tx. All three need a real NIC to evaluate; none
-      should land unbenchmarked.
+- [x] **Internal `PmdCapabilities` in `PMDPort`** (completed 2026-09-19,
+      DPDK-proposal review). `PMDPort::Init()` now populates this semantic
+      object once from `rte_eth_dev_info`; it is not exposed through protobuf.
+      The initial fields are `rx_scatter`, effective `max_mtu`,
+      `rx_offload_capa`, `tx_offload_capa`, and `dev_capa`.
+      `PMDPort` validates the configured MTU against the default pool's
+      single-mbuf RX capacity (`payload room + RTE_PKTMBUF_HEADROOM`): it
+      leaves scatter disabled when the frame fits, enables scatter only when
+      needed and advertised, rejects unsupported geometry clearly, and still
+      rejects a device `max_mtu` exceed. Deterministic coverage lives in
+      `core/drivers/pmd_test.cc`.
+      `RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE` remains a hardware/performance gate;
+      do not enable it until the direct-packet/refcount/pool preconditions are
+      benchmarked on a real NIC after the relevant Phase B work.
+      `RTE_ETH_DEV_CAPA_RXQ_SHARE`/MT-lockfree-Tx likewise remains a
+      hardware/performance gate; `PortOut` locking is unchanged until a PMD
+      and real workload prove the contract.
+      No raw capability flags or AF_XDP-specific configuration sugar belongs
+      in the protobuf API.
       **Design constraint to record now so it isn't re-litigated later**:
       do **not** globally enable checksum/TSO offload. BESS's
       `IPChecksum`/`L4Checksum` modules conflate two semantics -- *verify
@@ -2567,14 +2571,14 @@ testing goes through `bessctl/module_tests/*.py` against a running
       offload) and *produce a correct outgoing checksum* (can be). If Tx
       checksum offload is ever adopted it must be explicit graph
       semantics (a distinct module or mode that zeroes the field and
-      populates mbuf offload metadata), so a later module that rewrites
-      the header after the offload metadata was prepared is a visible
+      populates mbuf offload metadata), so a later module that rewrites the
+      header after the offload metadata was prepared is a visible
       graph error rather than silent corruption. Same for TSO/GSO.
-- [ ] Make VFIO the primary physical-NIC path and AF_XDP the primary Linux
-      host/container path (once the `libxdp`/`libbpf` build-prereq item
-      above lands); keep vhost-user for VMs (already available, see
-      above). With kmod gone, there's no "kmod optional" fallback-direction
-      flip left to design.
+- [ ] **Real-NIC AF_XDP zero-copy validation and primary-path policy remain
+      hardware-gated.** The PMD build/runtime path and generic `pci=`/`vdev=`
+      wiring are complete; the BESS daemon does not add AF_XDP-specific
+      protobuf fields. Validate zero-copy and any physical-NIC/container
+      default policy only on a suitable NIC/kernel/privilege setup.
 - [x] **Decouple `WorkerId` from DPDK's lcore ID; migrate off direct
       `RTE_PER_LCORE(_lcore_id)` writes -- done 2026-09-19, entry 33**
       (`3dc30b0e`): `Worker::Run()` now calls `rte_thread_register()` /
