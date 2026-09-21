@@ -148,10 +148,14 @@ counter, optimistic concurrency and engine-decided quiescence. Verified on GCC
 and Clang: 41 native test binaries, 22/22 module integration files against a
 foreground daemon, and the wire-parity script.
 
-The modern-glog daemon-mode recursion — the first item in the order of work —
-is fixed (§8, entry 54): daemon mode no longer routes C stdio back into glog,
-which is what made it recurse on glog 0.7+. The next work follows the order in
-the roadmap below: K1 (generic RCU/QSBR), then K2-K8, then G1. The active
+The modern-glog daemon-mode recursion is fixed (§8, entry 54) and **K1 is
+complete** (entries 55-57): `RuntimeState` owns one dataplane `RcuDomain`,
+workers register/online/offline/unregister around the pause boundary, the
+scheduler reports quiescence at a safe task boundary, `RcuPtr<T>` publishes and
+retires immutable state with an acquire-load read path, and `IPLookup` and
+`ExactMatch` are migrated onto it (with `PublishedGeneration` deleted). The next
+work follows the order in the roadmap below: K2 (ActionId + immutable
+action/object tables), then K3-K8, then G1. The active
 build graph is Meson/Ninja only. GCC and Clang full Meson compiles succeed
 with the pinned DPDK 25.11.3. GCC verification passes all 28 native C++
 tests, both Python targets, all 10 benchmark smoke tests, the PMD null/ring
@@ -2397,6 +2401,52 @@ rather than one call site).
     Verification: GCC + Clang clean, 44/44 native tests + benchmarks + plugin
     load, module integration 22/22, wire-parity passes.
 
+57. **`45e5723a` … `8207d913`** — **K1: the generic RCU/QSBR substrate, and the
+    two modules that used to do this by hand.** Landed as seven bisectable
+    commits (entries 55-57 cover the first six; the benchmarks and this closure
+    are the rest).
+
+    - **`RcuDomain`** (`core/rcu/`): one dataplane reader domain per runtime,
+      reader identity is the BESS `WorkerId`, DPDK's `rte_rcu_qsbr` behind a
+      BESS interface. Readers register/unregister and go online/offline; grace
+      periods are started/checked/synchronised; retired objects of any type are
+      destroyed by `ReclaimReady()`/`Drain()` on the calling control thread --
+      never on a packet worker; one grace period can retire several objects; the
+      queue is bounded with control-side back-pressure; the QSBR memory is
+      ordinary cache-line-aligned memory, so no EAL is needed.
+    - **Worker lifecycle**: the thread registers its reader on startup and stays
+      *offline*; `BlockWorker()` goes offline **before blocking** and online
+      **before dataplane work resumes**; the thread unregisters before teardown,
+      so a destroyed worker stops blocking grace periods and its id is reusable.
+    - **Scheduler**: quiescence is reported at the existing periodic boundary
+      (every 256 rounds) -- previous task returned, next not started -- so an
+      online worker advances grace periods whether or not it has work.
+    - **`RcuPtr<T>`**: `Read()` is one acquire load (measured equal to a raw
+      atomic pointer load); `Publish()` encodes build → release-store → start
+      grace period → retire old; `Exchange()` supports retiring several objects
+      against one grace period; `ResetQuiesced()` is the named teardown path;
+      writers are serialized; destroying it with online readers is a debug
+      failure.
+    - **Migrations**: `IPLookup` and `ExactMatch` publish and retire through the
+      domain, each with one private `Publish()` helper that owns the writer
+      protocol; `core/utils/published_generation.h` is deleted (no consumers
+      left). Rule semantics, gates, keys and update APIs unchanged.
+    - **Benchmarks** (`core/rcu/rcu_bench.cc`): read path 66 ns vs 68 ns for the
+      raw-atomic baseline (256 loads per iteration), publish with an idle reader
+      39 ns, publish while a reader holds 123 ns (bounded), grace-period latency
+      16 ns. A 2000-generation publication storm with a live reader reclaims
+      everything and never touches the active generation.
+
+    Tests: 34 RCU cases across `rcu_test`, `rcu_ptr_test`, `rcu_worker_test` and
+    `rcu_scheduler_test` (unit, publication, worker lifecycle and scheduler
+    boundary), plus the existing module suites for the two migrated modules.
+
+    Bugs found while building it, all in the tests and all the same family --
+    boundary ordering: a wait predicate changed outside its mutex (lost wakeup),
+    a worker destroyed before the module that owns its task, and a blocking
+    `Synchronize()` while the reader was still online. Each is now pinned by the
+    test that found it.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -2423,8 +2473,10 @@ pre-fix/post-fix module-test evidence for `a0688fcf` was produced.
 
 ## Known issues / explicit follow-ups (not yet fixed)
 
-- [ ] **Daemon mode (`bessd` without `-f`) recurses in logging on glog >= 0.7** —
-      immediate correctness debt; details in the subsection below.
+- [x] **Daemon mode (`bessd` without `-f`) recursed in logging on glog >= 0.7** —
+      fixed by `05413f53` (entry 54): the `fopencookie()` feedback path is gone,
+      C stdio in daemon mode is deliberately discarded, and a regression test
+      exercises logging after `Daemonize()`. Details in the subsection below.
 
 ### 8. Daemon-mode glog recursion — FIXED (`05413f53`, entry 54)
 
@@ -2565,7 +2617,7 @@ fix modern-glog daemon mode            DONE (§8, entry 54)
 G0   C++ transactional control-plane core   DONE (§9, entries 41-53)
   |
   v
-K1   generic RCU/QSBR publication and reclamation
+K1   generic RCU/QSBR publication and reclamation   DONE (entries 55-57)
 K2   ActionId + immutable action/object tables
 K3   unified runtime-schema classifier framework
 K4   packet parsing/mutation primitives
