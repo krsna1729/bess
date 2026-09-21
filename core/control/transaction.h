@@ -31,6 +31,7 @@
 #define BESS_CONTROL_TRANSACTION_H_
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -66,11 +67,38 @@ struct ApplyOptions {
   std::optional<uint64_t> expected_generation;
 };
 
+// Where a transaction spent its time. Recorded so that pause duration is
+// observable from the start (MODERNIZATION.md section 9.10); it is not an
+// optimization target yet.
+struct ApplyTiming {
+  uint64_t validation_us = 0;
+  uint64_t prepare_us = 0;
+  uint64_t paused_commit_us = 0;
+  uint64_t retire_us = 0;
+};
+
 struct ApplyResult {
   uint64_t generation = 0;   // generation after a successful apply
   size_t applied_ops = 0;    // operations executed (prepare + commit + retire)
   bool workers_paused = false;
+  ApplyTiming timing;
 };
+
+enum class TransactionPhase {
+  kPrepare,
+  kCommit,
+  kRetire,
+};
+
+// Test-only failure injection: when set, the engine asks before executing each
+// operation and fails the transaction if an error comes back. Empty by default,
+// so production behavior is unaffected -- there is deliberately no
+// environment-variable switch.
+using FailureInjector = std::function<std::optional<ControlError>(
+    TransactionPhase phase, const PlanOperation &op)>;
+
+void SetFailureInjector(FailureInjector injector);
+void ClearFailureInjector();
 
 // Transaction state machine (section 9.7):
 //
@@ -105,6 +133,7 @@ class Transaction {
 
   Quiescence quiescence() const { return quiescence_; }
   size_t ops_executed() const { return ops_executed_; }
+  const ApplyTiming &timing() const { return timing_; }
 
  private:
   // One undoable step: how to put back what an executed operation changed.
@@ -136,6 +165,7 @@ class Transaction {
   std::vector<Undo> undo_;
   Quiescence quiescence_ = Quiescence::kNone;
   size_t ops_executed_ = 0;
+  ApplyTiming timing_;
 };
 
 // Decides whether a plan needs worker quiescence: anything that touches the

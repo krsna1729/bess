@@ -139,8 +139,18 @@ separately.
 
 ## Status snapshot
 
-Phase E is closed. The next work follows the order in the roadmap below:
-the modern-glog daemon-mode fix, then G0, then K1-K8, then G1. The active
+Phase E is closed, and **Phase G0 is complete** (seven commits, entries 41-49):
+the control plane is a real C++ subsystem -- `RuntimeState` owns every mutable
+instance, `PipelineSpec`/`PipelineSnapshot` describe desired and active state,
+validation is side-effect-free, diff and planner are deterministic, and
+`ApplyPipeline()` runs multi-object transactions with rollback, a generation
+counter, optimistic concurrency and engine-decided quiescence. Verified on GCC
+and Clang: 41 native test binaries, 22/22 module integration files against a
+foreground daemon, and the wire-parity script.
+
+The next work follows the order in the roadmap below: K1 (generic RCU/QSBR),
+then K2-K8, then G1. The modern-glog daemon-mode fix is still the first item in
+that order and is still open (§8). The active
 build graph is Meson/Ninja only. GCC and Clang full Meson compiles succeed
 with the pinned DPDK 25.11.3. GCC verification passes all 28 native C++
 tests, both Python targets, all 10 benchmark smoke tests, the PMD null/ring
@@ -2295,7 +2305,7 @@ The active order is deliberately **not** phase-number order (consolidated roadma
 fix modern-glog daemon mode            (known issues, §8)
   |
   v
-G0   C++ transactional control-plane core                 §9
+G0   C++ transactional control-plane core   DONE (§9, entries 41-49)
   |
   v
 K1   generic RCU/QSBR publication and reclamation
@@ -3226,9 +3236,36 @@ update, versus today's full stop.
 ---
 
 
-## 9. Phase G0 — C++ transactional control-plane core — NEXT
+## 9. Phase G0 — C++ transactional control-plane core — COMPLETE
 
-This is the next major architecture surgery, and the first item in the active
+**Status: done.** Landed as seven reviewed commits (entries 41-49):
+
+| commit | what |
+|---|---|
+| 1 | `ControlPlane` extracted from the gRPC service; handlers are adapters; one error model; service lock gone |
+| 2a/2b/2c | `RuntimeState` owns ports, modules, traffic classes and workers; no destructor mutates a registry |
+| 3 | `PipelineSpec` (desired state), deterministic `PipelineSnapshot`, side-effect-free `ValidatePipeline()` |
+| 4 | deterministic `Diff()` and the dependency-ordered planner (typed operations, three phases) |
+| 5 | transaction engine (prepare/commit/retire/abort), generation, optimistic concurrency, reversibility gate |
+| 6 | a complete pipeline applied from C++ end to end, including "a failed commit keeps the active pipeline" |
+| 7 | failure injection over every operation of a real plan, leak/queue/orphan assertions, phase timings |
+
+What G0 deliberately did **not** do, and where it lands instead:
+
+- **metadata layout validation** stays in `Prepare()`: a module's attributes only
+  exist once the module instance exists (`Module::AddMetadataAttr` runs in its
+  `Init`), so it needs the stageable metadata layout described above;
+- **transactional replacement** (port reconfiguration, module rebuild,
+  traffic-class policy change) is refused with `kUnsupportedTransaction` rather
+  than attempted -- correct refusal beats false atomicity;
+- **RCU/QSBR** is K1's job: `RuntimeState` is unique and quiesced during
+  mutation, and `IPLookup`/`ExactMatch` keep their existing immutable-generation
+  mechanism untouched;
+- **the public desired-state API** is G1's job: `ApplyPipeline()` is C++-internal,
+  and the RPC surface still exposes the legacy imperative calls (now thin
+  adapters over one-operation transactions).
+
+This was the next major architecture surgery, and the first item in the active
 order of work.
 
 The goal is **not** "make every client C++".

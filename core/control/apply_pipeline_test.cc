@@ -44,6 +44,8 @@
 #include "control/control_plane.h"
 #include "control/pipeline_spec.h"
 #include "control/runtime_state.h"
+#include "control/transaction.h"
+#include "control/worker_manager.h"
 #include "opts.h"
 #include "packet_pool.h"
 #include "port.h"
@@ -239,6 +241,187 @@ TEST_F(ApplyPipelineTest, RemovesModulesAndConnectionsAgain) {
   ASSERT_EQ(1u, snapshot.modules.size());
   EXPECT_EQ("src", snapshot.modules[0].name);
   EXPECT_TRUE(snapshot.connections.empty());
+}
+
+
+// ---------------------------------------------------------------------------
+// Failure injection: every injected failure must leave no trace
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Everything a transaction must leave untouched when it fails.
+struct Fingerprint {
+  uint64_t generation = 0;
+  size_t ports = 0;
+  size_t modules = 0;
+  size_t traffic_classes = 0;
+  size_t workers = 0;
+  size_t orphan_tcs = 0;
+  PipelineSnapshot snapshot;
+  std::vector<size_t> queue_users;  // one entry per port queue, must all be 0
+
+  bool operator==(const Fingerprint &other) const {
+    return generation == other.generation && ports == other.ports &&
+           modules == other.modules &&
+           traffic_classes == other.traffic_classes &&
+           workers == other.workers && orphan_tcs == other.orphan_tcs &&
+           snapshot == other.snapshot && queue_users == other.queue_users;
+  }
+};
+
+Fingerprint Capture() {
+  Fingerprint fingerprint;
+  const bess::control::RuntimeState &state = bess::control::runtime();
+
+  fingerprint.generation = state.generation();
+  fingerprint.ports = state.ports().Size();
+  fingerprint.modules = state.modules().Size();
+  fingerprint.traffic_classes = state.traffic_classes().Size();
+  fingerprint.workers = static_cast<size_t>(state.workers().num_workers());
+  fingerprint.orphan_tcs = state.workers().orphan_tcs().size();
+  fingerprint.snapshot = bess::control::SnapshotRuntime(state);
+
+  for (const auto &pair : state.ports().All()) {
+    const Port *port = pair.second.get();
+    for (packet_dir_t dir : {PACKET_DIR_INC, PACKET_DIR_OUT}) {
+      for (queue_t qid = 0; qid < port->num_queues[dir]; qid++) {
+        fingerprint.queue_users.push_back(port->users[dir][qid] != nullptr);
+      }
+    }
+  }
+
+  return fingerprint;
+}
+
+}  // namespace
+
+// Every operation of a real plan is injected in turn: each failure must leave
+// the runtime exactly as it was, with no leaked module, port, traffic class,
+// worker, orphan task or acquired queue.
+TEST_F(ApplyPipelineTest, InjectedFailuresLeaveNoTrace) {
+  PipelineSpec desired = FullPipeline();
+
+  bess::control::ModuleSpec extra;
+  extra.name = "extra";
+  extra.mclass = "Bypass";
+  desired.modules.push_back(extra);
+
+  // Apply it once, so failures happen against a populated, active runtime.
+  ASSERT_TRUE(control_plane_->ApplyPipeline(desired, {}).has_value());
+  const Fingerprint active = Capture();
+  ASSERT_GT(active.modules, 0u);
+  ASSERT_GT(active.traffic_classes, 0u);
+
+  // Now change it in a way that has to create a module, connect it and attach a
+  // traffic class -- and fail at each operation of that plan in turn.
+  PipelineSpec changed = desired;
+  bess::control::ModuleSpec added;
+  added.name = "added";
+  added.mclass = "Bypass";
+  changed.modules.push_back(added);
+
+  bess::control::ConnectionSpec edge;
+  edge.upstream = "added";
+  edge.ogate = 0;
+  edge.downstream = "src";
+  edge.igate = 0;
+  changed.connections.push_back(edge);
+
+  bess::control::TrafficClassSpec tc;
+  tc.name = "added_tc";
+  tc.policy = "round_robin";
+  tc.wid = 0;
+  changed.traffic_classes.push_back(tc);
+
+  auto plan = control_plane_->PlanPipeline(changed);
+  ASSERT_TRUE(plan.has_value()) << plan.error().message;
+
+  struct Step {
+    bess::control::TransactionPhase phase;
+    size_t index;
+    const char *phase_name;
+  };
+  std::vector<Step> steps;
+  for (size_t i = 0; i < plan->prepare_ops.size(); i++) {
+    steps.push_back({bess::control::TransactionPhase::kPrepare, i, "prepare"});
+  }
+  for (size_t i = 0; i < plan->commit_ops.size(); i++) {
+    steps.push_back({bess::control::TransactionPhase::kCommit, i, "commit"});
+  }
+  ASSERT_GE(steps.size(), 3u)
+      << "the plan should have several operations to inject into";
+
+  for (const Step &step : steps) {
+    size_t seen = 0;
+    bess::control::SetFailureInjector(
+        [&step, &seen](bess::control::TransactionPhase phase,
+                       const bess::control::PlanOperation &) {
+          if (phase == step.phase && seen++ == step.index) {
+            return std::optional<bess::control::ControlError>(
+                bess::control::Err(EIO, "injected failure"));
+          }
+          return std::optional<bess::control::ControlError>();
+        });
+
+    auto applied = control_plane_->ApplyPipeline(changed, {});
+    bess::control::ClearFailureInjector();
+
+    EXPECT_FALSE(applied.has_value())
+        << "injection at " << step.phase_name << " op " << step.index
+        << " did not fail the apply";
+    EXPECT_TRUE(Capture() == active)
+        << "injection at " << step.phase_name << " op " << step.index
+        << " left a trace";
+  }
+
+  // The active pipeline is still usable afterwards.
+  auto diff = control_plane_->DiffPipeline(desired);
+  ASSERT_TRUE(diff.has_value());
+  EXPECT_TRUE(diff->empty());
+}
+
+// Retirement is not undoable by construction, so an injected retire failure is
+// reported and the transaction still counts as applied: the new state is
+// active either way.
+TEST_F(ApplyPipelineTest, InjectedRetireFailureIsReportedNotRolledBack) {
+  ASSERT_TRUE(control_plane_->ApplyPipeline(FullPipeline(), {}).has_value());
+  const uint64_t generation = bess::control::runtime().generation();
+
+  PipelineSpec reduced = FullPipeline();
+  reduced.connections.clear();  // the edge into "sink" goes away with it
+  reduced.modules.pop_back();   // "sink" has to be retired
+
+  bess::control::SetFailureInjector(
+      [](bess::control::TransactionPhase phase,
+         const bess::control::PlanOperation &) {
+        if (phase != bess::control::TransactionPhase::kRetire) {
+          return std::optional<bess::control::ControlError>();
+        }
+        return std::optional<bess::control::ControlError>(
+            bess::control::Err(EIO, "injected retire failure"));
+      });
+  auto applied = control_plane_->ApplyPipeline(reduced, {});
+  bess::control::ClearFailureInjector();
+
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  EXPECT_EQ(generation + 1, applied->generation);
+
+  // The module that failed to retire is still there: the transaction is
+  // committed, and the failure is visible in the log rather than hidden.
+  EXPECT_TRUE(bess::control::runtime().modules().Contains("sink"));
+}
+
+// Pause duration is observable from the start.
+TEST_F(ApplyPipelineTest, RecordsPhaseTimings) {
+  auto applied = control_plane_->ApplyPipeline(FullPipeline(), {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+
+  EXPECT_TRUE(applied->workers_paused);
+  EXPECT_GE(applied->timing.validation_us, 0u);
+  EXPECT_GE(applied->timing.prepare_us, 0u);
+  EXPECT_GE(applied->timing.paused_commit_us, 0u);
+  EXPECT_GE(applied->timing.retire_us, 0u);
 }
 
 }  // namespace

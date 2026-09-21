@@ -1197,6 +1197,8 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
     const PipelineSpec &desired, const ApplyOptions &options) {
   std::lock_guard<std::mutex> lock(mutex_);
 
+  const auto validation_start = std::chrono::steady_clock::now();
+
   // 1. Validate. Pure, so a rejected spec cannot have touched anything.
   auto validated = bess::control::ValidatePipeline(runtime(), desired);
   if (!validated) {
@@ -1218,10 +1220,17 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
   }
 
   // 3. Diff and plan. Nothing to do means no pause and no generation change.
+  const uint64_t validation_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - validation_start)
+          .count());
+
   PipelineSnapshot before = SnapshotRuntime(runtime());
   PipelineDiff diff = Diff(before, validated->spec);
   if (diff.empty()) {
-    return ApplyResult{runtime().generation(), 0, false};
+    ApplyTiming timing;
+    timing.validation_us = validation_us;
+    return ApplyResult{runtime().generation(), 0, false, timing};
   }
   PipelinePlan plan = Plan(diff);
 
@@ -1244,8 +1253,11 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
 
   runtime().BumpGeneration();
 
+  ApplyTiming timing = transaction.timing();
+  timing.validation_us = validation_us;
+
   return ApplyResult{runtime().generation(), transaction.ops_executed(),
-                     transaction.quiescence() == Quiescence::kWorkers};
+                     transaction.quiescence() == Quiescence::kWorkers, timing};
 }
 
 ControlResult<ValidatedPipeline> ControlPlane::ValidatePipeline(

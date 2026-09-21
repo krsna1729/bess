@@ -30,6 +30,7 @@
 #include "control/transaction.h"
 
 #include <cerrno>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <utility>
@@ -45,6 +46,28 @@ namespace bess {
 namespace control {
 
 namespace {
+
+// Test-only injection point; empty in production.
+FailureInjector &Injector() {
+  static FailureInjector injector;
+  return injector;
+}
+
+std::optional<ControlError> MaybeInjectFailure(TransactionPhase phase,
+                                             const PlanOperation &op) {
+  FailureInjector &injector = Injector();
+  if (!injector) {
+    return std::nullopt;
+  }
+  return injector(phase, op);
+}
+
+uint64_t MicrosSince(std::chrono::steady_clock::time_point start) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count());
+}
 
 const ConnectionSnapshot *FindEdge(const PipelineSnapshot &snapshot,
                                    const std::string &upstream,
@@ -79,6 +102,14 @@ ControlError Unsupported(const std::string &object, const std::string &name,
 }
 
 }  // namespace
+
+void SetFailureInjector(FailureInjector injector) {
+  Injector() = std::move(injector);
+}
+
+void ClearFailureInjector() {
+  Injector() = nullptr;
+}
 
 Quiescence RequiredQuiescence(const PipelinePlan &plan) {
   // Setup alone can run while workers run; anything that rewires the graph or
@@ -134,16 +165,26 @@ Transaction::Transaction(ControlPlane *plane, PipelinePlan plan,
     : plane_(plane), plan_(std::move(plan)), before_(std::move(before)) {}
 
 ControlResult<void> Transaction::Prepare() {
+  const auto start = std::chrono::steady_clock::now();
+
   for (const PlanOperation &op : plan_.prepare_ops) {
+    if (auto injected = MaybeInjectFailure(TransactionPhase::kPrepare, op);
+        injected.has_value()) {
+      return std::unexpected(*injected);
+    }
     if (auto result = ExecutePrepareOp(op); !result) {
       return std::unexpected(result.error());
     }
   }
+
+  timing_.prepare_us = MicrosSince(start);
   return {};
 }
 
 ControlResult<void> Transaction::Commit() {
   quiescence_ = RequiredQuiescence(plan_);
+
+  const auto start = std::chrono::steady_clock::now();
 
   std::optional<WorkerPauser> pauser;
   if (quiescence_ == Quiescence::kWorkers) {
@@ -151,11 +192,18 @@ ControlResult<void> Transaction::Commit() {
   }
 
   for (const PlanOperation &op : plan_.commit_ops) {
+    if (auto injected = MaybeInjectFailure(TransactionPhase::kCommit, op);
+        injected.has_value()) {
+      return std::unexpected(*injected);
+    }
     if (auto result = ExecuteCommitOp(op); !result) {
       return std::unexpected(result.error());
     }
   }
 
+  // The quiesced window ends when the pauser goes out of scope; measuring to
+  // here is the closest honest number for "time spent with workers paused".
+  timing_.paused_commit_us = MicrosSince(start);
   return {};
 }
 
@@ -164,13 +212,24 @@ void Transaction::Retire() {
     return;
   }
 
+  const auto start = std::chrono::steady_clock::now();
+
   // Teardown destroys traffic classes, modules and ports the dataplane can
   // see, so it happens quiesced. It is not undoable by construction: by now the
   // new state is active, so a failure here is reported, not rolled back.
   WorkerPauser pauser;
   for (const PlanOperation &op : plan_.retire_ops) {
+    if (auto injected = MaybeInjectFailure(TransactionPhase::kRetire, op);
+        injected.has_value()) {
+      // Retirement is not undoable by construction; an injected failure here
+      // is reported the same way a real one is.
+      LOG(ERROR) << "retire step injected failure: " << injected->message;
+      continue;
+    }
     ExecuteRetireOp(op);
   }
+
+  timing_.retire_us = MicrosSince(start);
 }
 
 void Transaction::Abort() noexcept {
