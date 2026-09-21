@@ -3500,6 +3500,16 @@ layout from the desired graph, validate it, and never mutate
 `bess::metadata::default_pipeline` during validation. Candidate metadata state
 must be stageable for side-effect-free validation to be possible at all.
 
+> **Status (G0 commit 3):** the structural validator landed and is pure, but
+> metadata layout validation is *not* in it yet, and that is a real boundary
+> rather than an omission: a module's attributes only exist once a module
+> instance exists, because `Module::AddMetadataAttr()` runs inside the module's
+> own `Init()`. Deciding metadata compatibility without instantiating anything
+> therefore requires the candidate/staged metadata layout that section 9.2
+> calls for — so metadata validation lands with `Prepare()` (commit 5), where
+> candidate modules exist, and the same rule as driver-specific checks applies:
+> never claim a check is pure when it is not.
+
 ### 9.6 Diff and planner
 
 ```cpp
