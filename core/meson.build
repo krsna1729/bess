@@ -186,6 +186,7 @@ bessd = executable(
 
 unit_test_sources = [
   'rcu/rcu_test.cc',
+  'rcu/rcu_ptr_test.cc',
   'rcu/rcu_worker_test.cc',
   'rcu/rcu_scheduler_test.cc',
   'control/apply_pipeline_test.cc',

@@ -110,6 +110,7 @@ class RcuDomain {
   bool IsOnline(ReaderId id) const;
   bool IsRegistered(ReaderId id) const;
   size_t registered_readers() const;
+  size_t online_readers() const;
 
   // Reports a quiescent state for `id`. Call it only at a safe boundary: after
   // a task invocation returned, before the next one starts.
@@ -139,7 +140,9 @@ class RcuDomain {
     if (object == nullptr) {
       return;
     }
-    T *raw = object.release();
+    // The type-erased queue holds a plain void*; the deleter remembers T, so
+    // both `unique_ptr<T>` and `unique_ptr<const T>` work.
+    void *raw = const_cast<void *>(static_cast<const void *>(object.release()));
     RetireErased(token, raw, [](void *p) { delete static_cast<T *>(p); });
   }
 

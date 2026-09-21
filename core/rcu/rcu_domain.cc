@@ -170,6 +170,15 @@ size_t RcuDomain::registered_readers() const {
   return registered_readers_;
 }
 
+size_t RcuDomain::online_readers() const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  size_t online = 0;
+  for (uint8_t state : online_) {
+    online += state;
+  }
+  return online;
+}
+
 void RcuDomain::Quiescent(ReaderId id) {
   if (id >= max_readers_) {
     return;
