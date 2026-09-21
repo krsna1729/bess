@@ -148,9 +148,10 @@ counter, optimistic concurrency and engine-decided quiescence. Verified on GCC
 and Clang: 41 native test binaries, 22/22 module integration files against a
 foreground daemon, and the wire-parity script.
 
-The next work follows the order in the roadmap below: K1 (generic RCU/QSBR),
-then K2-K8, then G1. The modern-glog daemon-mode fix is still the first item in
-that order and is still open (§8). The active
+The modern-glog daemon-mode recursion — the first item in the order of work —
+is fixed (§8, entry 54): daemon mode no longer routes C stdio back into glog,
+which is what made it recurse on glog 0.7+. The next work follows the order in
+the roadmap below: K1 (generic RCU/QSBR), then K2-K8, then G1. The active
 build graph is Meson/Ninja only. GCC and Clang full Meson compiles succeed
 with the pinned DPDK 25.11.3. GCC verification passes all 28 native C++
 tests, both Python targets, all 10 benchmark smoke tests, the PMD null/ring
@@ -2314,6 +2315,42 @@ rather than one call site).
     sample-plugin load 41/41, module integration 22/22 files, wire-parity script
     passes, `git diff --check` clean.
 
+54. **`TBD`** — **Daemon-mode glog recursion fixed by deletion.**
+    `CloseStdStreams()` redirected the C `FILE*` streams through
+    `fopencookie()` callbacks that called `LOG()`. On any glog that writes
+    through libc's stderr — absl-based glog 0.7+ does — that is a feedback loop:
+    `LOG → glog → fwrite(stderr) → cookie callback → LOG → …` until the stack
+    was exhausted.
+
+    Reproduced before the fix on this machine (google-glog 0.7.1-2, absl LTS
+    20260817): daemon mode died with SIGSEGV during `Daemonize()`, the launcher
+    reported "Failed to launch a daemon process", and the symbolized core shows
+    the exact loop — `LogMessage::Flush → SendToLog → fwrite → _IO_file_xsputn →
+    bessd.cc:303 (stderr cookie) → LOG(WARNING) → LogMessage::Flush → …`, with
+    the recursive message literally containing the previous line's text.
+
+    The fix deletes the machinery (production file: 41 lines added, 55 removed):
+    `stdout`/`stderr` are no longer replaced as `FILE*`, C stdio output in daemon
+    mode goes to `/dev/null` by design, buffers are flushed before the `dup2()`
+    calls so pre-fork output is not carried across, and the C++ streams keep
+    their one-way bridge into glog (`std::cout → LOG(INFO)`,
+    `std::cerr → LOG(WARNING)`), which is safe because glog writes through fd 2
+    and never through those streambufs. `FLAGS_stderrthreshold = FATAL + 1`
+    stays, but correctness no longer depends on it. The contract comment at the
+    top of `bessd.cc` describes the real behaviour instead of the deleted one.
+
+    New regression test `Daemonize.LoggingAfterDaemonizationDoesNotRecurse`
+    exercises `LOG(INFO)`, `fprintf(stdout)`, `fprintf(stderr)`, `std::cout`,
+    `std::cerr`, `LOG(WARNING)` and `LOG(ERROR)` after daemonizing and then
+    reports readiness — process survival is the assertion. Verified to fail
+    against the pre-fix code (10s timeout: the child died) and pass after.
+
+    Verification: GCC + Clang builds clean; native tests + benchmarks +
+    sample-plugin load 41/41; module integration 22/22 files; wire-parity script
+    passes; real daemonized daemon smoke (launcher exit 0, child alive, gRPC
+    request served, clean SIGTERM shutdown, no cores) and real foreground smoke
+    (unchanged: normal stderr logging, gRPC served); `git diff --check` clean.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -2343,7 +2380,14 @@ pre-fix/post-fix module-test evidence for `a0688fcf` was produced.
 - [ ] **Daemon mode (`bessd` without `-f`) recurses in logging on glog >= 0.7** —
       immediate correctness debt; details in the subsection below.
 
-### 8. Immediate known software bug: daemon-mode glog recursion
+### 8. Daemon-mode glog recursion — FIXED (`1f6c7f3d`-range commit, entry 54)
+
+**Status: fixed.** `CloseStdStreams()` no longer installs `FILE*` callbacks that
+call `LOG()`; C stdio in daemon mode goes to `/dev/null` by design and the C++
+streams are bridged into glog one-way. Reproduced before the fix on glog 0.7.1
+(absl-based) as a SIGSEGV from stack exhaustion, and covered by a regression
+test that exercises `LOG(INFO)`, `fprintf`, `std::cout` and `std::cerr` after
+`Daemonize()`.
 
 A pre-existing daemon-mode bug was exposed during Meson verification on systems with glog >= 0.7.
 
@@ -2469,10 +2513,10 @@ The active order is deliberately **not** phase-number order (consolidated roadma
 §1 and §26):
 
 ```text
-fix modern-glog daemon mode            (known issues, §8)
+fix modern-glog daemon mode            DONE (§8, entry 54)
   |
   v
-G0   C++ transactional control-plane core   DONE (§9, entries 41-49)
+G0   C++ transactional control-plane core   DONE (§9, entries 41-53)
   |
   v
 K1   generic RCU/QSBR publication and reclamation

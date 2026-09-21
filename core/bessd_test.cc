@@ -37,6 +37,8 @@
 #include <gtest/gtest.h>
 
 #include <csignal>
+#include <cstdio>
+#include <iostream>
 #include <string>
 
 #include "opts.h"
@@ -343,6 +345,43 @@ TEST(Daemonize, BasicRun) {
         ASSERT_NO_FATAL_FAILURE(signal_fd = Daemonize(););
         ASSERT_NE(-1, signal_fd);
 
+        uint64_t one = 1;
+        ASSERT_LT(-1, write(signal_fd, &one, sizeof(one)) < 0)
+            << "Couldn't write out to fd that communicates with parent process";
+        close(signal_fd);
+      },
+      {}, 0);
+}
+
+// Daemon mode must survive logging: the C stdio streams are discarded and the
+// C++ streams are bridged into glog, so nothing here may feed back into glog.
+// Before this was fixed, the fopencookie() callbacks that redirected C stdio
+// into LOG() recursed on any glog that writes through libc's stderr (glog 0.7+
+// does) until the stack was exhausted -- the child died of SIGSEGV during
+// Daemonize() and the parent never saw the readiness signal.
+TEST(Daemonize, LoggingAfterDaemonizationDoesNotRecurse) {
+  DO_MULTI_PROCESS_TEST(
+      {
+        int signal_fd = -1;
+        ASSERT_NO_FATAL_FAILURE(signal_fd = Daemonize(););
+        ASSERT_NE(-1, signal_fd);
+
+        // Every path that used to participate in the loop.
+        LOG(INFO) << "daemon glog test";
+
+        fprintf(stdout, "stdout test\n");
+        fflush(stdout);
+
+        fprintf(stderr, "stderr test\n");
+        fflush(stderr);
+
+        std::cout << "cout test" << std::endl;
+        std::cerr << "cerr test" << std::endl;
+
+        LOG(WARNING) << "daemon warning test";
+        LOG(ERROR) << "daemon error test";
+
+        // Still alive and able to report readiness: that is the assertion.
         uint64_t one = 1;
         ASSERT_LT(-1, write(signal_fd, &one, sizeof(one)) < 0)
             << "Couldn't write out to fd that communicates with parent process";

@@ -55,23 +55,30 @@
 #include "port.h"
 
 // How log messages are processed in BESS?
-// - In daemon mode:
-//   - via Google glog (recommended)
-//     - LOG(*) -> /tmp/bessd.*
-//     - Note that any log messages are routed to stderr, regardless of glog
-//       command-line flags, such as "stderrthreshold"
-//   - via libc stdout/stderr: e.g., printf(...) , fprintf(stderr, ...)
-//     - stdout -> stdout_funcs -> LOG(INFO) -> /tmp/bessd.INFO
-//     - stderr -> stderr_funcs -> LOG(WARNING) -> /tmp/bessd.[INFO|WARNING]
-//   - via libstdc++ cout/cerr
-//     - cout -> stdout_buf -> LOG(INFO) -> /tmp/bessd.INFO
-//     - cerr -> stderr_buf -> LOG(WARNING) -> /tmp/bessd.INFO
-// - In process mode (foreground; -f option):
-//   - via Google glog (recommended)
-//     - LOG(*) -> standard error (colored, if applicable)
-//   - via libc/libstdc++
-//     - stdout/cout -> standard output
-//     - stderr/cerr -> standard error (colored, currently always)
+//
+// Daemon mode (one-way, deliberately):
+//   - LOG(*) / glog  -> glog's own sinks and log files (/tmp/bessd.*)
+//   - printf / fprintf(stdout|stderr) / puts -> the process's stdout/stderr
+//     file descriptors, which point at /dev/null: daemon output through C
+//     stdio is discarded, not captured
+//   - std::cout -> StreambufLogger -> LOG(INFO) -> glog's sinks
+//   - std::cerr -> StreambufLogger -> LOG(WARNING) -> glog's sinks
+//
+// The C stdio streams are *not* routed back into glog. They used to be, via
+// fopencookie() callbacks that called LOG(), which is a feedback loop on any
+// glog that writes through libc's stderr (absl-based glog >= 0.7 does):
+//
+//   LOG -> glog -> fwrite(stderr) -> cookie callback -> LOG -> glog -> ...
+//
+// It recursed until the stack was exhausted (reproduced on glog 0.7.1, SIGSEGV
+// inside absl's formatter). The invariant now is that glog never writes into a
+// sink that calls glog again. Code that needs a daemon-visible diagnostic uses
+// the logging API, not printf.
+//
+// Process mode (foreground; -f option) is untouched:
+//   - LOG(*) -> standard error (colored, if applicable)
+//   - stdout/cout -> standard output
+//   - stderr/cerr -> standard error (colored, currently always)
 
 namespace {
 
@@ -279,54 +286,33 @@ static void CloseStdStreams() {
     return;
   }
 
-  // do not log to stderr anymore.
+  // Anything buffered before the descriptors are replaced belongs to the
+  // process that was just forked; flush it here so it is not carried across the
+  // redirection.
+  fflush(nullptr);
+  std::cout.flush();
+  std::cerr.flush();
+
+  // do not log to stderr anymore. (Correctness does not depend on this: fd 2 is
+  // /dev/null below, so even a glog that insists on stderr cannot feed back
+  // into anything that logs.)
   FLAGS_stderrthreshold = google::FATAL + 1;
 
-  // Replace standard input/output/error with /dev/null
+  // Replace standard input/output/error with /dev/null. The libc FILE objects
+  // (stdout, stderr) stay as they are and now refer to these descriptors: C
+  // stdio output in daemon mode is discarded by design, never routed into glog.
   dup2(fd, STDIN_FILENO);
   dup2(fd, STDOUT_FILENO);
   dup2(fd, STDERR_FILENO);
 
-  cookie_io_functions_t stdout_funcs = {
-      .read = nullptr,
-      .write = [](void *, const char *data, size_t len) -> ssize_t {
-        LOG(INFO) << std::string(data, len);
-        return len;
-      },
-      .seek = nullptr,
-      .close = nullptr,
-  };
-
-  cookie_io_functions_t stderr_funcs = {
-      .read = nullptr,
-      .write = [](void *, const char *data, size_t len) -> ssize_t {
-        LOG(WARNING) << std::string(data, len);
-        return len;
-      },
-      .seek = nullptr,
-      .close = nullptr,
-  };
-
-  /* NOTE: although we replace stdout with our handler,
-   *   printf() statements that are transformed to puts()
-   *   will not be redirected to syslog,
-   *   since puts() does not use stdout, but _IO_stdout.
-   *   gcc automatically "optimizes" printf() only with
-   *   a format string that ends with '\n'.
-   *   In that case, the message will go to /dev/null
-   *   (see dup2 above). */
-  stdout = fopencookie(NULL, "w", stdout_funcs);
-  setvbuf(stdout, NULL, _IOLBF, 0);
-
-  stderr = fopencookie(NULL, "w", stderr_funcs);
-  setvbuf(stderr, NULL, _IOLBF, 0);
-
-  // Redirect stdout output to LOG(INFO) and stderr output to LOG(WARNING)
+  // The C++ streams are bridged into glog. This is safe in one direction: glog
+  // writes through libc's stderr (fd 2 -> /dev/null), never through these
+  // streambufs, so there is no path back into LOG().
   static StreambufLogger stdout_buf(std::cout, google::GLOG_INFO);
   static StreambufLogger stderr_buf(std::cerr, google::GLOG_WARNING);
 
   // For whatever reason if fd happens to be assigned 0, 1, or 2, do not close
-  // it since it now points to our custom handler
+  // it since it now points to /dev/null
   if (fd > 2) {
     close(fd);
   }
