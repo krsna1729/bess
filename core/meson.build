@@ -3,6 +3,8 @@ core_include = include_directories('.', '..')
 core_sources = files(
   'bessctl.cc',
   'bessd.cc',
+  'control/control_error.cc',
+  'control/control_plane.cc',
   'debug.cc',
   'dpdk.cc',
   'event.cc',

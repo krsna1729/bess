@@ -44,6 +44,7 @@
 #include "pb/service.grpc.pb.h"
 #pragma GCC diagnostic pop
 
+#include "control/control_plane.h"
 #include "bessd.h"
 #include "gate.h"
 #include "gate_hooks/tcpdump.h"
@@ -83,10 +84,13 @@ static inline Status return_with_error(T* response, int code, const char* fmt,
   return Status::OK;
 }
 
+// Translates a control-plane error into the legacy protobuf error fields
+// (grpc::Status is always OK; Error.code carries the failure).
 template <typename T>
-static inline Status return_with_errno(T* response, int code) {
-  response->mutable_error()->set_code(code);
-  response->mutable_error()->set_errmsg(strerror(code));
+static inline Status return_with_control_error(
+    T* response, const bess::control::ControlError& e) {
+  response->mutable_error()->set_code(e.err);
+  response->mutable_error()->set_errmsg(e.message);
   return Status::OK;
 }
 
@@ -102,121 +106,6 @@ static inline bess::Gate* module_gate(const Module* m, bool is_igate,
     }
   }
   return nullptr;
-}
-
-static Status enable_hook_for_module(ConfigureGateHookResponse* response,
-                                     const std::string hook_name,
-                                     const Module* m, gate_idx_t gate_idx,
-                                     bool is_igate, bool use_gate,
-                                     const bess::GateHookBuilder& builder,
-                                     const google::protobuf::Any& arg) {
-  pb_error_t* error = response->mutable_error();
-  if (use_gate) {
-    bess::Gate* gate = module_gate(m, is_igate, gate_idx);
-    if (gate == nullptr) {
-      return return_with_error(
-          response, ENOENT, "'%s': %cgate '%hu' does not exist",
-          m->name().c_str(), is_igate ? 'i' : 'o', gate_idx);
-    }
-
-    bess::GateHook* hook =
-        gate->CreateGateHook(&builder, gate, hook_name, arg, error);
-    if (hook) {
-      response->set_name(hook->name());
-    }
-    return Status::OK;
-  }
-
-  std::vector<std::string> created_hook_names;
-
-  if (is_igate) {
-    for (auto& gate : m->igates()) {
-      if (!gate) {
-        continue;
-      }
-      bess::GateHook* hook =
-          gate->CreateGateHook(&builder, gate, hook_name, arg, error);
-      if (error->code() != 0 || !hook) {
-        // in case of failed creating gate hook, remove previously created
-        // before return
-        auto it = created_hook_names.begin();
-        while (it != created_hook_names.end()) {
-          gate->RemoveHook(*it);
-          it = created_hook_names.erase(it);
-        }
-        return Status::OK;
-      } else {
-        created_hook_names.push_back(hook->name());
-      }
-    }
-  } else {
-    for (auto& gate : m->ogates()) {
-      if (!gate) {
-        continue;
-      }
-      bess::GateHook* hook =
-          gate->CreateGateHook(&builder, gate, hook_name, arg, error);
-      if (error->code() != 0 || !hook) {
-        // in case of failed creating gate hook, remove previously created
-        // before return
-        auto it = created_hook_names.begin();
-        while (it != created_hook_names.end()) {
-          gate->RemoveHook(*it);
-          it = created_hook_names.erase(it);
-        }
-        return Status::OK;
-      } else {
-        created_hook_names.push_back(hook->name());
-      }
-    }
-  }
-  return Status::OK;
-}
-
-static Status disable_hook_for_module(ConfigureGateHookResponse* response,
-                                      const std::string& class_name,
-                                      const std::string& hook_name,
-                                      const Module* m, gate_idx_t gate_idx,
-                                      bool is_igate, bool use_gate) {
-  if (use_gate) {
-    bess::Gate* gate = module_gate(m, is_igate, gate_idx);
-    if (gate == nullptr) {
-      return return_with_error(
-          response, EINVAL, "'%s': %cgate '%hu' does not exist",
-          m->name().c_str(), is_igate ? 'i' : 'o', gate_idx);
-    }
-    if (hook_name != "") {
-      gate->RemoveHook(hook_name);
-    } else {
-      gate->RemoveHookByClass(class_name);
-    }
-    return Status::OK;
-  }
-
-  if (is_igate) {
-    for (auto& gate : m->igates()) {
-      if (!gate) {
-        continue;
-      }
-      if (hook_name != "") {
-        gate->RemoveHook(hook_name);
-      } else {
-        gate->RemoveHookByClass(class_name);
-      }
-    }
-  } else {
-    for (auto& gate : m->ogates()) {
-      if (!gate) {
-        continue;
-      }
-      if (hook_name != "") {
-        gate->RemoveHook(hook_name);
-      } else {
-        gate->RemoveHookByClass(class_name);
-      }
-    }
-  }
-  return Status::OK;
 }
 
 static int collect_igates(Module* m, GetModuleInfoResponse* response) {
@@ -311,85 +200,24 @@ static int collect_metadata(Module* m, GetModuleInfoResponse* response) {
   return 0;
 }
 
-static ::Port* create_port(const std::string& name, const PortBuilder& driver,
-                           queue_t num_inc_q, queue_t num_out_q,
-                           size_t size_inc_q, size_t size_out_q,
-                           const google::protobuf::Any& arg, pb_error_t* perr) {
-  std::unique_ptr<::Port> p;
-
-  if (num_inc_q == 0) {
-    num_inc_q = 1;
-  }
-
-  if (num_out_q == 0) {
-    num_out_q = 1;
-  }
-
-  if (num_inc_q > MAX_QUEUES_PER_DIR || num_out_q > MAX_QUEUES_PER_DIR) {
-    perr->set_code(EINVAL);
-    perr->set_errmsg("Invalid number of queues");
-    return nullptr;
-  }
-
-  if (size_inc_q > MAX_QUEUE_SIZE || size_out_q > MAX_QUEUE_SIZE) {
-    perr->set_code(EINVAL);
-    perr->set_errmsg("Invalid queue size");
-    return nullptr;
-  }
-
-  std::string port_name;
-
-  if (name.length() > 0) {
-    if (PortBuilder::all_ports().count(name)) {
-      p.reset(PortBuilder::all_ports().at(name));
-    }
-    port_name = name;
-  } else {
-    port_name = PortBuilder::GenerateDefaultPortName(driver.class_name(),
-                                                     driver.name_template());
-  }
-
-  // Try to create and initialize the port.
-  p.reset(driver.CreatePort(port_name));
-
-  if (size_inc_q == 0) {
-    size_inc_q = p->DefaultIncQueueSize();
-  }
-
-  if (size_out_q == 0) {
-    size_out_q = p->DefaultOutQueueSize();
-  }
-
-  p->num_queues[PACKET_DIR_INC] = num_inc_q;
-  p->num_queues[PACKET_DIR_OUT] = num_out_q;
-  p->queue_size[PACKET_DIR_INC] = size_inc_q;
-  p->queue_size[PACKET_DIR_OUT] = size_out_q;
-
-  // DPDK functions may be called, so be prepared
-  current_worker.SetNonWorker();
-
-  CommandResponse ret = p->InitWithGenericArg(arg);
-
-  {
-    google::protobuf::Any empty;
-
-    if (ret.data().SerializeAsString() != empty.SerializeAsString()) {
-      LOG(WARNING) << port_name << "::" << driver.class_name()
-                   << " Init() returned non-empty response: "
-                   << ret.data().DebugString();
-    }
-  }
-
-  if (ret.error().code() != 0) {
-    *perr = ret.error();
-    return nullptr;
-  }
-
-  if (!PortBuilder::AddPort(p.get())) {
-    return nullptr;
-  }
-
-  return p.release();
+static bess::control::TrafficClassSpec to_tc_spec(
+    const bess::pb::TrafficClass& class_) {
+  bess::control::TrafficClassSpec spec;
+  spec.name = class_.name();
+  spec.parent = class_.parent();
+  spec.policy = class_.policy();
+  spec.resource = class_.resource();
+  spec.wid = class_.wid();
+  spec.has_priority =
+      class_.arg_case() == bess::pb::TrafficClass::kPriority;
+  spec.priority = class_.priority();
+  spec.has_share = class_.arg_case() == bess::pb::TrafficClass::kShare;
+  spec.share = class_.share();
+  spec.limit = {class_.limit().begin(), class_.limit().end()};
+  spec.max_burst = {class_.max_burst().begin(), class_.max_burst().end()};
+  spec.leaf_module_name = class_.leaf_module_name();
+  spec.leaf_module_taskid = class_.leaf_module_taskid();
+  return spec;
 }
 
 static void collect_tc(const bess::TrafficClass* c, int wid,
@@ -441,106 +269,53 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status GetVersion(ServerContext*, const EmptyRequest*,
                     VersionResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     response->set_version(google::VersionString());
     return Status::OK;
   }
 
-  Status ResetAll(ServerContext* context, const EmptyRequest* request,
+  Status ResetAll(ServerContext*, const EmptyRequest*,
                   EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    Status status;
-    WorkerPauser wp;
-
-    LOG(INFO) << "*** ResetAll requested ***";
-
-    status = ResetModules(context, request, response);
-    if (response->error().code() != 0) {
-      return status;
+    if (auto ret = control_plane_.Reset(); !ret) {
+      return return_with_control_error(response, ret.error());
     }
-
-    status = ResetPorts(context, request, response);
-    if (response->error().code() != 0) {
-      return status;
-    }
-
-    status = ResetTcs(context, request, response);
-    if (response->error().code() != 0) {
-      return status;
-    }
-
-    status = ResetWorkers(context, request, response);
-    if (response->error().code() != 0) {
-      return status;
-    }
-
     return Status::OK;
   }
 
   Status PauseAll(ServerContext*, const EmptyRequest*,
                   EmptyResponse*) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    pause_all_workers();
-    LOG(INFO) << "*** All workers have been paused ***";
+    (void)control_plane_.PauseAll();
     return Status::OK;
   }
 
   Status PauseWorker(ServerContext*, const PauseWorkerRequest* req,
                      EmptyResponse*) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    int wid = req->wid();
-    // TODO: It should be made harder to wreak havoc on the rest of the daemon
-    // when using PauseWorker(). For now a warning and suggestion that this is
-    // for experts only is sufficient.
-    LOG(WARNING) << "PauseWorker() is an experimental operation and should be"
-                 << " used with care. Long-term support not guaranteed.";
-    pause_worker(wid);
-    LOG(INFO) << "*** Worker " << wid << " has been paused ***";
+    (void)control_plane_.PauseWorker(req->wid());
     return Status::OK;
   }
 
   Status ResumeAll(ServerContext*, const EmptyRequest*,
                    EmptyResponse*) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    if (!is_any_worker_running()) {
-      attach_orphans();
-    }
-
-    bess::run_global_resume_hooks();
-
-    LOG(INFO) << "*** Resuming ***";
-    resume_all_workers();
+    (void)control_plane_.ResumeAll();
     return Status::OK;
   }
 
   Status ResumeWorker(ServerContext*, const ResumeWorkerRequest* req,
                       EmptyResponse*) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    int wid = req->wid();
-    LOG(INFO) << "*** Resuming worker " << wid << " ***";
-    resume_worker(wid);
+    (void)control_plane_.ResumeWorker(req->wid());
     return Status::OK;
   }
 
   Status ResetWorkers(ServerContext*, const EmptyRequest*,
                       EmptyResponse*) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    WorkerPauser wp;
-    destroy_all_workers();
-    LOG(INFO) << "*** All workers have been destroyed ***";
+    (void)control_plane_.ResetWorkers();
     return Status::OK;
   }
 
   Status ListWorkers(ServerContext*, const EmptyRequest*,
                      ListWorkersResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
       if (!is_worker_active(wid))
@@ -557,76 +332,33 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status AddWorker(ServerContext*, const AddWorkerRequest* request,
                    EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    uint64_t wid = request->wid();
-    if (wid >= Worker::kMaxWorkers) {
-      return return_with_error(response, EINVAL, "Invalid worker id");
+    if (auto ret = control_plane_.AddWorker(request->wid(), request->core(),
+                                            request->scheduler());
+        !ret) {
+      return return_with_control_error(response, ret.error());
     }
-    uint64_t core = request->core();
-    if (!is_cpu_present(core)) {
-      return return_with_error(response, EINVAL, "Invalid core %d", core);
-    }
-    if (is_worker_active(wid)) {
-      return return_with_error(response, EEXIST, "worker:%d is already active",
-                               wid);
-    }
-    const std::string& scheduler = request->scheduler();
-    if (scheduler != "" && scheduler != "experimental") {
-      return return_with_error(response, EINVAL, "Invalid scheduler %s",
-                               scheduler.c_str());
-    }
-
-    launch_worker(wid, core, scheduler);
     return Status::OK;
   }
 
   Status DestroyWorker(ServerContext*, const DestroyWorkerRequest* request,
                        EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    uint64_t wid = request->wid();
-    if (wid >= Worker::kMaxWorkers) {
-      return return_with_error(response, EINVAL, "Invalid worker id");
+    if (auto ret = control_plane_.DestroyWorker(request->wid()); !ret) {
+      return return_with_control_error(response, ret.error());
     }
-    Worker* worker = workers[wid];
-    if (!worker) {
-      return return_with_error(response, ENOENT, "Worker %d is not active",
-                               wid);
-    }
-
-    bess::TrafficClass* root = workers[wid]->scheduler()->root();
-    if (root) {
-      for (const auto& it : TrafficClassBuilder::all_tcs()) {
-        bess::TrafficClass* c = it.second;
-        if (c->policy() == bess::POLICY_LEAF && c->Root() == root) {
-          return return_with_error(response, EBUSY,
-                                   "Worker %d has active tasks: %s", wid,
-                                   c->name().c_str());
-        }
-      }
-    }
-
-    destroy_worker(wid);
     return Status::OK;
   }
 
   Status ResetTcs(ServerContext*, const EmptyRequest*,
                   EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    WorkerPauser wp;
-
-    if (!TrafficClassBuilder::ClearAll()) {
-      return return_with_error(response, EBUSY, "TCs still have tasks");
+    if (auto ret = control_plane_.ResetTcs(); !ret) {
+      return return_with_control_error(response, ret.error());
     }
-
     return Status::OK;
   }
 
   Status ListTcs(ServerContext*, const ListTcsRequest* request,
                  ListTcsResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     int wid_filter = request->wid();
     if (wid_filter >= Worker::kMaxWorkers) {
@@ -678,217 +410,56 @@ class BESSControlImpl final : public BESSControl::Service {
   Status CheckSchedulingConstraints(
       ServerContext*, const EmptyRequest*,
       CheckSchedulingConstraintsResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    // Start by attaching orphans -- this is essential to make sure we visit
-    // every TC.
-    if (!is_any_worker_running()) {
-      // If any worker is running (i.e., not everything is paused), then there
-      // is no point in attaching orphans.
-      attach_orphans();
-    }
-    ModuleGraph::PropagateActiveWorker();
-    LOG(INFO) << "Checking scheduling constraints";
-    // Check constraints around chains run by each worker. This checks that
-    // global constraints are met.
-    for (int i = 0; i < Worker::kMaxWorkers; i++) {
-      if (workers[i] == nullptr) {
-        continue;
-      }
-      int socket = 1ull << workers[i]->socket();
-      int core = workers[i]->core();
-      bess::TrafficClass* root = workers[i]->scheduler()->root();
-
-      for (const auto& tc_pair : TrafficClassBuilder::all_tcs()) {
-        bess::TrafficClass* c = tc_pair.second;
-        if (c->policy() == bess::POLICY_LEAF && root == c->Root()) {
-          auto leaf = static_cast<bess::LeafTrafficClass*>(c);
-          int constraints = leaf->task()->GetSocketConstraints();
-          if ((constraints & socket) == 0) {
-            LOG(WARNING) << "Scheduler constraints are violated for wid " << i
-                         << " socket " << socket << " constraint "
-                         << constraints;
-            auto violation = response->add_violations();
-            violation->set_name(c->name());
-            violation->set_constraint(constraints);
-            violation->set_assigned_node(workers[i]->socket());
-            violation->set_assigned_core(core);
-          }
-        }
-      }
+    auto report = control_plane_.CheckSchedulingConstraints();
+    if (!report) {
+      return return_with_control_error(response, report.error());
     }
 
-    // Check local constraints
-    for (const auto& pair : ModuleGraph::GetAllModules()) {
-      const Module* m = pair.second;
-      auto ret = m->CheckModuleConstraints();
-      if (ret != CHECK_OK) {
-        LOG(WARNING) << "Module " << m->name() << " failed check " << ret;
-        auto module = response->add_modules();
-        module->set_name(m->name());
-        if (ret == CHECK_FATAL_ERROR) {
-          LOG(WARNING) << " --- FATAL CONSTRAINT FAILURE ---";
-          response->set_fatal(true);
-        }
-      }
+    for (const auto& v : report->violations) {
+      auto violation = response->add_violations();
+      violation->set_name(v.name);
+      violation->set_constraint(v.constraint);
+      violation->set_assigned_node(v.assigned_node);
+      violation->set_assigned_core(v.assigned_core);
     }
+
+    for (const auto& m : report->modules) {
+      response->add_modules()->set_name(m.name);
+    }
+
+    response->set_fatal(report->fatal);
     return Status::OK;
   }
 
   Status AddTc(ServerContext*, const AddTcRequest* request,
                EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    WorkerPauser wp;
-
-    const char* tc_name = request->class_().name().c_str();
-    if (request->class_().name().length() == 0) {
-      return return_with_error(response, EINVAL, "Missing 'name' field");
-    } else if (tc_name[0] == '!') {
-      return return_with_error(response, EINVAL,
-                               "TC names starting with \'!\' are reserved");
+    if (auto ret = control_plane_.AddTc(to_tc_spec(request->class_())); !ret) {
+      return return_with_control_error(response, ret.error());
     }
-
-    if (TrafficClassBuilder::all_tcs().count(tc_name)) {
-      return return_with_error(response, EINVAL, "Name '%s' already exists",
-                               tc_name);
-    }
-
-    const std::string& policy = request->class_().policy();
-
-    bess::TrafficClass* c = nullptr;
-    if (policy == bess::TrafficPolicyName[bess::POLICY_PRIORITY]) {
-      c = reinterpret_cast<bess::TrafficClass*>(
-          TrafficClassBuilder::CreateTrafficClass<bess::PriorityTrafficClass>(
-              tc_name));
-    } else if (policy == bess::TrafficPolicyName[bess::POLICY_WEIGHTED_FAIR]) {
-      const std::string& resource = request->class_().resource();
-      if (bess::ResourceMap.count(resource) == 0) {
-        return return_with_error(response, EINVAL, "Invalid resource");
-      }
-      c = reinterpret_cast<bess::TrafficClass*>(
-          TrafficClassBuilder::CreateTrafficClass<
-              bess::WeightedFairTrafficClass>(tc_name,
-                                              bess::ResourceMap.at(resource)));
-    } else if (policy == bess::TrafficPolicyName[bess::POLICY_ROUND_ROBIN]) {
-      c = reinterpret_cast<bess::TrafficClass*>(
-          TrafficClassBuilder::CreateTrafficClass<bess::RoundRobinTrafficClass>(
-              tc_name));
-    } else if (policy == bess::TrafficPolicyName[bess::POLICY_RATE_LIMIT]) {
-      uint64_t limit = 0;
-      uint64_t max_burst = 0;
-      const std::string& resource = request->class_().resource();
-      const auto& limits = request->class_().limit();
-      const auto& max_bursts = request->class_().max_burst();
-      if (bess::ResourceMap.count(resource) == 0) {
-        return return_with_error(response, EINVAL, "Invalid resource");
-      }
-      if (limits.find(resource) != limits.end()) {
-        limit = limits.at(resource);
-      }
-      if (max_bursts.find(resource) != max_bursts.end()) {
-        max_burst = max_bursts.at(resource);
-      }
-      c = reinterpret_cast<bess::TrafficClass*>(
-          TrafficClassBuilder::CreateTrafficClass<bess::RateLimitTrafficClass>(
-              tc_name, bess::ResourceMap.at(resource), limit, max_burst));
-    } else if (policy == bess::TrafficPolicyName[bess::POLICY_LEAF]) {
-      return return_with_error(response, EINVAL,
-                               "Cannot create leaf TC. Use "
-                               "UpdateTcParentRequest message");
-    } else {
-      return return_with_error(response, EINVAL, "Invalid traffic policy");
-    }
-
-    if (!c) {
-      return return_with_error(response, ENOMEM, "CreateTrafficClass failed");
-    }
-
-    return AttachTc(c, request->class_(), response);
+    return Status::OK;
   }
 
   Status UpdateTcParams(ServerContext*, const UpdateTcParamsRequest* request,
                         EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    WorkerPauser wp;
-
-    bess::TrafficClass* c = FindTc(request->class_(), response);
-    if (!c) {
-      return Status::OK;
+    if (auto ret = control_plane_.UpdateTcParams(to_tc_spec(request->class_()));
+        !ret) {
+      return return_with_control_error(response, ret.error());
     }
-
-    if (c->policy() == bess::POLICY_RATE_LIMIT) {
-      bess::RateLimitTrafficClass* tc =
-          reinterpret_cast<bess::RateLimitTrafficClass*>(c);
-      const std::string& resource = request->class_().resource();
-      const auto& limits = request->class_().limit();
-      const auto& max_bursts = request->class_().max_burst();
-      if (bess::ResourceMap.count(resource) == 0) {
-        return return_with_error(response, EINVAL, "Invalid resource");
-      }
-      tc->set_resource(bess::ResourceMap.at(resource));
-      if (limits.find(resource) != limits.end()) {
-        tc->set_limit(limits.at(resource));
-      }
-      if (max_bursts.find(resource) != max_bursts.end()) {
-        tc->set_max_burst(max_bursts.at(resource));
-      }
-    } else if (c->policy() == bess::POLICY_WEIGHTED_FAIR) {
-      bess::WeightedFairTrafficClass* tc =
-          reinterpret_cast<bess::WeightedFairTrafficClass*>(c);
-      const std::string& resource = request->class_().resource();
-      if (bess::ResourceMap.count(resource) == 0) {
-        return return_with_error(response, EINVAL, "Invalid resource");
-      }
-      tc->set_resource(bess::ResourceMap.at(resource));
-    } else {
-      return return_with_error(response, EINVAL,
-                               "Only 'rate_limit' and"
-                               " 'weighted_fair' can be updated");
-    }
-
     return Status::OK;
   }
 
   Status UpdateTcParent(ServerContext*, const UpdateTcParentRequest* request,
                         EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    WorkerPauser wp;
-
-    bess::TrafficClass* c = FindTc(request->class_(), response);
-    if (!c) {
-      return Status::OK;
+    if (auto ret = control_plane_.UpdateTcParent(to_tc_spec(request->class_()));
+        !ret) {
+      return return_with_control_error(response, ret.error());
     }
-
-    if (c->policy() == bess::POLICY_LEAF) {
-      if (!detach_tc(c)) {
-        return return_with_error(response, EINVAL,
-                                 "Cannot detach '%s'"
-                                 " from parent",
-                                 request->class_().name().c_str());
-      }
-    }
-
-    // XXX Leaf nodes can always be moved, other nodes can be moved only if
-    // they're orphans. The scheduler maintains state which would need to be
-    // updated otherwise.
-    if (c->policy() != bess::POLICY_LEAF) {
-      if (!remove_tc_from_orphan(c)) {
-        return return_with_error(response, EINVAL,
-                                 "Cannot detach '%s'."
-                                 " while it is part of a worker",
-                                 request->class_().name().c_str());
-      }
-    }
-
-    return AttachTc(c, request->class_(), response);
+    return Status::OK;
   }
 
   Status GetTcStats(ServerContext*, const GetTcStatsRequest* request,
                     GetTcStatsResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     const char* tc_name = request->name().c_str();
 
@@ -917,7 +488,7 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status ListDrivers(ServerContext*, const EmptyRequest*,
                      ListDriversResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     for (const auto& pair : PortBuilder::all_port_builders()) {
       const PortBuilder& builder = pair.second;
@@ -929,7 +500,7 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status GetDriverInfo(ServerContext*, const GetDriverInfoRequest* request,
                        GetDriverInfoResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     if (request->driver_name().length() == 0) {
       return return_with_error(response, EINVAL,
@@ -958,29 +529,15 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status ResetPorts(ServerContext*, const EmptyRequest*,
                     EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    WorkerPauser wp;
-
-    for (auto it = PortBuilder::all_ports().cbegin();
-         it != PortBuilder::all_ports().end();) {
-      auto it_next = std::next(it);
-      ::Port* p = it->second;
-
-      int ret = PortBuilder::DestroyPort(p);
-      if (ret)
-        return return_with_errno(response, -ret);
-
-      it = it_next;
+    if (auto ret = control_plane_.ResetPorts(); !ret) {
+      return return_with_control_error(response, ret.error());
     }
-
-    LOG(INFO) << "*** All ports have been destroyed ***";
     return Status::OK;
   }
 
   Status ListPorts(ServerContext*, const EmptyRequest*,
                    ListPortsResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     for (const auto& pair : PortBuilder::all_ports()) {
       const ::Port* p = pair.second;
@@ -1001,76 +558,48 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status CreatePort(ServerContext*, const CreatePortRequest* request,
                     CreatePortResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    const char* driver_name;
-    ::Port* port = nullptr;
-
     VLOG(1) << "CreatePortRequest from client:" << std::endl
             << request->DebugString();
 
-    if (request->driver().length() == 0)
-      return return_with_error(response, EINVAL, "Missing 'driver' field");
+    bess::control::PortSpec spec;
+    spec.name = request->name();
+    spec.driver = request->driver();
+    spec.num_inc_q = request->num_inc_q();
+    spec.num_out_q = request->num_out_q();
+    spec.size_inc_q = request->size_inc_q();
+    spec.size_out_q = request->size_out_q();
+    spec.arg = request->arg();
 
-    driver_name = request->driver().c_str();
-    const auto& builders = PortBuilder::all_port_builders();
-    const auto& it = builders.find(driver_name);
-    if (it == builders.end()) {
-      return return_with_error(response, ENOENT, "No port driver '%s' found",
-                               driver_name);
+    auto info = control_plane_.CreatePort(spec);
+    if (!info) {
+      return return_with_control_error(response, info.error());
     }
 
-    const PortBuilder& builder = it->second;
-    pb_error_t* error = response->mutable_error();
-
-    port = create_port(request->name(), builder, request->num_inc_q(),
-                       request->num_out_q(), request->size_inc_q(),
-                       request->size_out_q(), request->arg(), error);
-
-    if (!port)
-      return Status::OK;
-
-    response->set_name(port->name());
-    response->set_mac_addr(port->conf().mac_addr.ToString());
+    response->set_name(info->name);
+    response->set_mac_addr(info->mac_addr);
 
     return Status::OK;
   }
 
   Status SetPortConf(ServerContext*, const SetPortConfRequest* request,
                      CommandResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    bess::control::PortConfSpec spec;
+    spec.mac_addr = request->conf().mac_addr();
+    spec.mtu = request->conf().mtu();
+    spec.admin_up = request->conf().admin_up();
 
-    if (!request->name().length()) {
-      return return_with_error(response, EINVAL, "Port name is not given");
+    auto ret = control_plane_.SetPortConf(request->name(), spec);
+    if (!ret) {
+      return return_with_control_error(response, ret.error());
     }
 
-    const char* port_name = request->name().c_str();
-    const auto& it = PortBuilder::all_ports().find(port_name);
-    if (it == PortBuilder::all_ports().end()) {
-      return return_with_error(response, ENOENT, "No port `%s' found",
-                               port_name);
-    }
-
-    const bess::pb::PortConf& pb_conf = request->conf();
-    Port::Conf conf;
-
-    conf.mtu = pb_conf.mtu();
-    conf.admin_up = pb_conf.admin_up();
-
-    if (!conf.mac_addr.FromString(pb_conf.mac_addr())) {
-      return return_with_error(
-          response, EINVAL,
-          "MAC address should be formatted xx:xx:xx:xx:xx:xx");
-    }
-
-    WorkerPauser wp;
-    *response = it->second->UpdateConf(conf);
+    *response = *ret;
     return Status::OK;
   }
 
   Status GetPortConf(ServerContext*, const GetPortConfRequest* request,
                      GetPortConfResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     if (!request->name().length()) {
       return return_with_error(response, EINVAL, "Port name is not given");
@@ -1095,32 +624,15 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status DestroyPort(ServerContext*, const DestroyPortRequest* request,
                      EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    const char* port_name;
-    int ret;
-
-    if (!request->name().length())
-      return return_with_error(response, EINVAL,
-                               "Argument must be a name in str");
-
-    port_name = request->name().c_str();
-    const auto& it = PortBuilder::all_ports().find(port_name);
-    if (it == PortBuilder::all_ports().end())
-      return return_with_error(response, ENOENT, "No port `%s' found",
-                               port_name);
-
-    ret = PortBuilder::DestroyPort(it->second);
-    if (ret) {
-      return return_with_errno(response, -ret);
+    if (auto ret = control_plane_.DestroyPort(request->name()); !ret) {
+      return return_with_control_error(response, ret.error());
     }
-
     return Status::OK;
   }
 
   Status GetPortStats(ServerContext*, const GetPortStatsRequest* request,
                       GetPortStatsResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     const auto& it = PortBuilder::all_ports().find(request->name());
     if (it == PortBuilder::all_ports().end()) {
@@ -1157,7 +669,7 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status GetLinkStatus(ServerContext*, const GetLinkStatusRequest* request,
                        GetLinkStatusResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     const auto& it = PortBuilder::all_ports().find(request->name());
     if (it == PortBuilder::all_ports().end()) {
@@ -1176,20 +688,16 @@ class BESSControlImpl final : public BESSControl::Service {
   }
 
   Status ResetModules(ServerContext*, const EmptyRequest*,
-                      EmptyResponse*) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    WorkerPauser wp;
-
-    ModuleGraph::DestroyAllModules();
-    bess::event_modules.clear();
-    LOG(INFO) << "*** All modules have been destroyed ***";
+                      EmptyResponse* response) override {
+    if (auto ret = control_plane_.ResetModules(); !ret) {
+      return return_with_control_error(response, ret.error());
+    }
     return Status::OK;
   }
 
   Status ListModules(ServerContext*, const EmptyRequest*,
                      ListModulesResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     for (const auto& pair : ModuleGraph::GetAllModules()) {
       const Module* m = pair.second;
@@ -1204,83 +712,34 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status CreateModule(ServerContext*, const CreateModuleRequest* request,
                       CreateModuleResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
     VLOG(1) << "CreateModuleRequest from client:" << std::endl
             << request->DebugString();
 
-    if (!request->mclass().length()) {
-      return return_with_error(response, EINVAL, "Missing 'mclass' field");
+    bess::control::ModuleSpec spec;
+    spec.name = request->name();
+    spec.mclass = request->mclass();
+    spec.arg = request->arg();
+
+    auto name = control_plane_.CreateModule(spec);
+    if (!name) {
+      return return_with_control_error(response, name.error());
     }
 
-    const auto& builders = ModuleBuilder::all_module_builders();
-    const auto& it = builders.find(request->mclass());
-    if (it == builders.end()) {
-      return return_with_error(response, ENOENT, "No mclass '%s' found",
-                               request->mclass().c_str());
-    }
-    const ModuleBuilder& builder = it->second;
-
-    std::string mod_name;
-    if (request->name().length()) {
-      const auto& it2 = ModuleGraph::GetAllModules().find(request->name());
-      if (it2 != ModuleGraph::GetAllModules().end()) {
-        return return_with_error(response, EEXIST, "Module %s exists",
-                                 request->name().c_str());
-      }
-      mod_name = request->name();
-    } else {
-      mod_name = ModuleGraph::GenerateDefaultName(builder.class_name(),
-                                                  builder.name_template());
-    }
-
-    // DPDK functions may be called, so be prepared
-    current_worker.SetNonWorker();
-
-    pb_error_t* error = response->mutable_error();
-    Module* module =
-        ModuleGraph::CreateModule(builder, mod_name, request->arg(), error);
-    if (module) {
-      response->set_name(module->name());
-      bess::event_modules[bess::Event::PreResume].insert(module);
-    }
-
+    response->set_name(*name);
     return Status::OK;
   }
 
   Status DestroyModule(ServerContext*, const DestroyModuleRequest* request,
                        EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    WorkerPauser wp;
-    const char* m_name;
-    Module* m;
-
-    if (!request->name().length())
-      return return_with_error(response, EINVAL,
-                               "Argument must be a name in str");
-    m_name = request->name().c_str();
-
-    const auto& it = ModuleGraph::GetAllModules().find(request->name());
-    if (it == ModuleGraph::GetAllModules().end()) {
-      return return_with_error(response, ENOENT, "No module '%s' found",
-                               m_name);
+    if (auto ret = control_plane_.DestroyModule(request->name()); !ret) {
+      return return_with_control_error(response, ret.error());
     }
-    m = it->second;
-
-    auto& resume_modules = bess::event_modules[bess::Event::PreResume];
-    if (resume_modules.erase(m) > 0) {
-      VLOG(1) << "Cleared pre-resume hook for module '" << m->name() << "'";
-    }
-
-    ModuleGraph::DestroyModule(m);
-
     return Status::OK;
   }
 
   Status GetModuleInfo(ServerContext*, const GetModuleInfoRequest* request,
                        GetModuleInfoResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     const char* m_name;
     Module* m;
@@ -1311,98 +770,38 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status ConnectModules(ServerContext*, const ConnectModulesRequest* request,
                         EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
     VLOG(1) << "ConnectModulesRequest from client:" << std::endl
             << request->DebugString();
 
-    const char* m1_name;
-    const char* m2_name;
-    gate_idx_t ogate;
-    gate_idx_t igate;
+    bess::control::ConnectionSpec spec;
+    spec.m1 = request->m1();
+    spec.m2 = request->m2();
+    spec.ogate = request->ogate();
+    spec.igate = request->igate();
+    spec.skip_default_hooks = request->skip_default_hooks();
 
-    Module* m1;
-    Module* m2;
-
-    int ret;
-
-    m1_name = request->m1().c_str();
-    m2_name = request->m2().c_str();
-    ogate = request->ogate();
-    igate = request->igate();
-
-    if (!m1_name || !m2_name)
-      return return_with_error(response, EINVAL, "Missing 'm1' or 'm2' field");
-
-    const auto& it1 = ModuleGraph::GetAllModules().find(request->m1());
-    if (it1 == ModuleGraph::GetAllModules().end()) {
-      return return_with_error(response, ENOENT, "No module '%s' found",
-                               m1_name);
+    if (auto ret = control_plane_.ConnectModules(spec); !ret) {
+      return return_with_control_error(response, ret.error());
     }
-
-    m1 = it1->second;
-
-    const auto& it2 = ModuleGraph::GetAllModules().find(request->m2());
-    if (it2 == ModuleGraph::GetAllModules().end()) {
-      return return_with_error(response, ENOENT, "No module '%s' found",
-                               m2_name);
-    }
-    m2 = it2->second;
-
-    if (is_any_worker_running()) {
-      ModuleGraph::PropagateActiveWorker();
-      if (m1->num_active_workers() || m2->num_active_workers()) {
-        WorkerPauser wp;  // Only pause when absolutely required
-        ret = ModuleGraph::ConnectModules(m1, ogate, m2, igate,
-                                          request->skip_default_hooks());
-        goto done;
-      }
-    }
-    ret = ModuleGraph::ConnectModules(m1, ogate, m2, igate,
-                                      request->skip_default_hooks());
-  done:
-    if (ret < 0)
-      return return_with_error(response, -ret, "Connection %s:%d->%d:%s failed",
-                               m1_name, ogate, igate, m2_name);
-
     return Status::OK;
   }
 
   Status DisconnectModules(ServerContext*,
                            const DisconnectModulesRequest* request,
                            EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    bess::control::DisconnectionSpec spec;
+    spec.name = request->name();
+    spec.ogate = request->ogate();
 
-    WorkerPauser wp;
-    const char* m_name;
-    gate_idx_t ogate;
-
-    int ret;
-
-    m_name = request->name().c_str();
-    ogate = request->ogate();
-
-    if (!request->name().length())
-      return return_with_error(response, EINVAL, "Missing 'name' field");
-
-    const auto& it = ModuleGraph::GetAllModules().find(request->name());
-    if (it == ModuleGraph::GetAllModules().end()) {
-      return return_with_error(response, ENOENT, "No module '%s' found",
-                               m_name);
+    if (auto ret = control_plane_.DisconnectModules(spec); !ret) {
+      return return_with_control_error(response, ret.error());
     }
-    Module* m = it->second;
-
-    ret = ModuleGraph::DisconnectModule(m, ogate);
-    if (ret < 0)
-      return return_with_error(response, -ret, "Disconnection %s:%d failed",
-                               m_name, ogate);
-
     return Status::OK;
   }
 
   Status DumpMempool(ServerContext*, const DumpMempoolRequest* request,
                      DumpMempoolResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     int socket_filter = request->socket();
     socket_filter =
@@ -1439,7 +838,7 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status ListGateHookClass(ServerContext*, const EmptyRequest*,
                            ListGateHookClassResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     for (const auto& pair : bess::GateHookBuilder::all_gate_hook_builders()) {
       const auto& builder = pair.second;
@@ -1451,7 +850,7 @@ class BESSControlImpl final : public BESSControl::Service {
   Status GetGateHookClassInfo(ServerContext*,
                               const GetGateHookClassInfoRequest* request,
                               GetGateHookClassInfoResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     VLOG(1) << "GetGateHookClassInfo from client:" << std::endl
             << request->DebugString();
@@ -1482,7 +881,7 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status ListGateHooks(ServerContext*, const EmptyRequest*,
                        ListGateHooksResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     for (const auto& pair : ModuleGraph::GetAllModules()) {
       const Module* m = pair.second;
@@ -1519,71 +918,35 @@ class BESSControlImpl final : public BESSControl::Service {
   Status ConfigureGateHook(ServerContext*,
                            const ConfigureGateHookRequest* request,
                            ConfigureGateHookResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    WorkerPauser wp;
-    bool use_gate = true;
-    gate_idx_t gate_idx = 0;
-    bool is_igate =
+    bess::control::GateHookSpec spec;
+    spec.class_name = request->hook().class_name();
+    spec.hook_name = request->hook().hook_name();
+    spec.module_name = request->hook().module_name();
+    spec.is_igate =
         request->hook().gate_case() == bess::pb::GateHookInfo::kIgate;
+    spec.arg = request->hook().arg();
 
-    if (is_igate) {
-      gate_idx = request->hook().igate();
-      use_gate = request->hook().igate() >= 0;
+    if (spec.is_igate) {
+      spec.gate_idx = request->hook().igate();
+      spec.use_gate = request->hook().igate() >= 0;
     } else {
-      gate_idx = request->hook().ogate();
-      use_gate = request->hook().ogate() >= 0;
+      spec.gate_idx = request->hook().ogate();
+      spec.use_gate = request->hook().ogate() >= 0;
     }
 
-    const auto builder = bess::GateHookBuilder::all_gate_hook_builders().find(
-        request->hook().class_name());
-    if (builder == bess::GateHookBuilder::all_gate_hook_builders().end()) {
-      return return_with_error(response, ENOENT, "No such gate hook: %s",
-                               request->hook().class_name().c_str());
+    auto name = control_plane_.ConfigureGateHook(spec, request->enable());
+    if (!name) {
+      return return_with_control_error(response, name.error());
     }
-
-    if (request->hook().module_name().length() == 0) {
-      // Install this hook on all modules
-      for (const auto& it : ModuleGraph::GetAllModules()) {
-        if (request->enable()) {
-          enable_hook_for_module(response, request->hook().hook_name(),
-                                 it.second, gate_idx, is_igate, use_gate,
-                                 builder->second, request->hook().arg());
-        } else {
-          disable_hook_for_module(response, request->hook().class_name(),
-                                  request->hook().hook_name(), it.second,
-                                  gate_idx, is_igate, use_gate);
-        }
-        if (response->error().code() != 0) {
-          return Status::OK;
-        }
-      }
-      return Status::OK;
+    if (!name->empty()) {
+      response->set_name(*name);
     }
-
-    // Install this hook on the specified module
-    const auto& it =
-        ModuleGraph::GetAllModules().find(request->hook().module_name());
-    if (it == ModuleGraph::GetAllModules().end()) {
-      return return_with_error(response, ENOENT, "No module '%s' found",
-                               request->hook().module_name().c_str());
-    }
-    if (request->enable()) {
-      enable_hook_for_module(response, request->hook().hook_name(), it->second,
-                             gate_idx, is_igate, use_gate, builder->second,
-                             request->hook().arg());
-    } else {
-      disable_hook_for_module(response, request->hook().class_name(),
-                              request->hook().hook_name(), it->second, gate_idx,
-                              is_igate, use_gate);
-    }
-
     return Status::OK;
   }
 
   Status GateHookCommand(ServerContext*, const GateHookCommandRequest* request,
                          CommandResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     // No need to look up the hook builder: the gate either
     // has a hook instance with the right name, or doesn't.
@@ -1621,50 +984,19 @@ class BESSControlImpl final : public BESSControl::Service {
   Status ConfigureResumeHook(ServerContext*,
                              const ConfigureResumeHookRequest* request,
                              CommandResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    auto& hooks = bess::global_resume_hooks;
-    auto hook_it = hooks.end();
-    for (auto it = hooks.begin(); it != hooks.end(); ++it) {
-      if (it->get()->name() == request->hook_name()) {
-        hook_it = it;
-        break;
-      }
+    auto ret = control_plane_.ConfigureResumeHook(
+        request->hook_name(), request->enable(), request->arg());
+    if (!ret) {
+      return return_with_control_error(response, ret.error());
     }
 
-    if (!request->enable()) {
-      if (hook_it != hooks.end()) {
-        hooks.erase(hook_it);
-      }
-      return Status::OK;
-    }
-
-    if (hook_it != hooks.end()) {
-      return return_with_error(response, EEXIST,
-                               "Resume hook '%s' is already installed",
-                               request->hook_name().c_str());
-    }
-
-    const auto builder =
-        bess::ResumeHookBuilder::all_resume_hook_builders().find(
-            request->hook_name());
-    if (builder == bess::ResumeHookBuilder::all_resume_hook_builders().end()) {
-      return return_with_error(response, ENOENT, "No such resume hook '%s'",
-                               request->hook_name().c_str());
-    }
-    auto hook = builder->second.CreateResumeHook();
-    *response = builder->second.InitResumeHook(hook.get(), request->arg());
-    if (response->has_error()) {
-      return Status::OK;
-    }
-    hooks.insert(std::move(hook));
-
+    *response = *ret;
     return Status::OK;
   }
 
   Status KillBess(ServerContext*, const EmptyRequest*,
                   EmptyResponse*) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     WorkerPauser wp;
     LOG(WARNING) << "Halt requested by a client\n";
@@ -1683,34 +1015,23 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status ImportPlugin(ServerContext*, const ImportPluginRequest* request,
                       EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    WorkerPauser wp;
-    VLOG(1) << "Loading plugin: " << request->path();
-    if (!bess::bessd::LoadPlugin(request->path())) {
-      return return_with_error(response, -1, "Failed loading plugin %s",
-                               request->path().c_str());
+    if (auto ret = control_plane_.ImportPlugin(request->path()); !ret) {
+      return return_with_control_error(response, ret.error());
     }
     return Status::OK;
   }
 
   Status UnloadPlugin(ServerContext*, const UnloadPluginRequest* request,
                       EmptyResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    WorkerPauser wp;
-
-    VLOG(1) << "Unloading plugin: " << request->path();
-    if (!bess::bessd::UnloadPlugin(request->path())) {
-      return return_with_error(response, -1, "Failed unloading plugin %s",
-                               request->path().c_str());
+    if (auto ret = control_plane_.UnloadPlugin(request->path()); !ret) {
+      return return_with_control_error(response, ret.error());
     }
     return Status::OK;
   }
 
   Status ListPlugins(ServerContext*, const EmptyRequest*,
                      ListPluginsResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     auto list = bess::bessd::ListPlugins();
     for (auto& path : list) {
@@ -1721,7 +1042,7 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status ListMclass(ServerContext*, const EmptyRequest*,
                     ListMclassResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     for (const auto& pair : ModuleBuilder::all_module_builders()) {
       const ModuleBuilder& builder = pair.second;
@@ -1732,7 +1053,7 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status GetMclassInfo(ServerContext*, const GetMclassInfoRequest* request,
                        GetMclassInfoResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     VLOG(1) << "GetMclassInfo from client:" << std::endl
             << request->DebugString();
@@ -1762,7 +1083,7 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status ModuleCommand(ServerContext*, const CommandRequest* request,
                        CommandResponse* response) override {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto lock = control_plane_.AcquireLock();
 
     if (!request->name().length()) {
       return return_with_error(response, EINVAL,
@@ -1783,147 +1104,12 @@ class BESSControlImpl final : public BESSControl::Service {
   }
 
  private:
-  Status AttachTc(bess::TrafficClass* c_, const bess::pb::TrafficClass& class_,
-                  EmptyResponse* response) {
-    std::unique_ptr<bess::TrafficClass> c(c_);
-    int wid = class_.wid();
+  // BESS control-plane semantics live here; this class is a protocol
+  // adapter. The control plane owns the (non-recursive) lock.
+  bess::control::ControlPlane control_plane_;
 
-    if (class_.parent() == "") {
-      if (wid != Worker::kAnyWorker &&
-          (wid < 0 || wid >= Worker::kMaxWorkers)) {
-        return return_with_error(response, EINVAL,
-                                 "'wid' must be %d or between 0 and %d",
-                                 Worker::kAnyWorker, Worker::kMaxWorkers - 1);
-      }
-
-      if ((wid != Worker::kAnyWorker && !is_worker_active(wid)) ||
-          (wid == Worker::kAnyWorker && num_workers == 0)) {
-        if (num_workers == 0 && (wid == 0 || wid == Worker::kAnyWorker)) {
-          launch_worker(0, FLAGS_c);
-        } else {
-          return return_with_error(response, EINVAL, "worker:%d does not exist",
-                                   wid);
-        }
-      }
-
-      add_tc_to_orphan(c.release(), wid);
-      return Status::OK;
-    }
-
-    if (wid != Worker::kAnyWorker) {
-      return return_with_error(response, EINVAL,
-                               "Both 'parent' and 'wid'"
-                               "have been specified");
-    }
-
-    bess::TrafficClass* parent;
-    const auto& tcs = TrafficClassBuilder::all_tcs();
-    const auto& it = tcs.find(class_.parent());
-    if (it == tcs.end()) {
-      return return_with_error(response, ENOENT, "Parent TC '%s' not found",
-                               class_.parent().c_str());
-    }
-    parent = it->second;
-
-    bool fail = false;
-    switch (parent->policy()) {
-      case bess::POLICY_PRIORITY: {
-        if (class_.arg_case() != bess::pb::TrafficClass::kPriority) {
-          return return_with_error(response, EINVAL, "No priority specified");
-        }
-        bess::priority_t pri = class_.priority();
-        if (pri == DEFAULT_PRIORITY) {
-          return return_with_error(response, EINVAL, "Priority %d is reserved",
-                                   DEFAULT_PRIORITY);
-        }
-        fail = !static_cast<bess::PriorityTrafficClass*>(parent)->AddChild(
-            c.get(), pri);
-        break;
-      }
-      case bess::POLICY_WEIGHTED_FAIR:
-        if (class_.arg_case() != bess::pb::TrafficClass::kShare) {
-          return return_with_error(response, EINVAL, "No share specified");
-        }
-        fail = !static_cast<bess::WeightedFairTrafficClass*>(parent)->AddChild(
-            c.get(), class_.share());
-        break;
-      case bess::POLICY_ROUND_ROBIN:
-        fail = !static_cast<bess::RoundRobinTrafficClass*>(parent)->AddChild(
-            c.get());
-        break;
-      case bess::POLICY_RATE_LIMIT:
-        fail = !static_cast<bess::RateLimitTrafficClass*>(parent)->AddChild(
-            c.get());
-        break;
-      default:
-        return return_with_error(response, EPERM,
-                                 "Parent tc doesn't support children");
-    }
-    if (fail) {
-      return return_with_error(response, EINVAL, "AddChild() failed");
-    }
-    c.release();
-    return Status::OK;
-  }
-
-  bess::TrafficClass* FindTc(const bess::pb::TrafficClass& class_,
-                             EmptyResponse* response) {
-    bess::TrafficClass* c = nullptr;
-
-    if (class_.name().length() != 0) {
-      const char* name = class_.name().c_str();
-      const auto all_tcs = TrafficClassBuilder::all_tcs();
-      auto it = all_tcs.find(name);
-      if (it == all_tcs.end()) {
-        return_with_error(response, ENOENT, "Tc '%s' doesn't exist", name);
-        return nullptr;
-      }
-
-      c = it->second;
-    } else if (class_.leaf_module_name().length() != 0) {
-      const std::string& module_name = class_.leaf_module_name();
-      const auto& it = ModuleGraph::GetAllModules().find(module_name);
-      if (it == ModuleGraph::GetAllModules().end()) {
-        return_with_error(response, ENOENT, "No module '%s' found",
-                          module_name.c_str());
-        return nullptr;
-      }
-      Module* m = it->second;
-
-      task_id_t tid = class_.leaf_module_taskid();
-      if (tid >= MAX_TASKS_PER_MODULE) {
-        return_with_error(response, EINVAL, "'taskid' must be between 0 and %d",
-                          MAX_TASKS_PER_MODULE - 1);
-        return nullptr;
-      }
-
-      if (tid >= m->tasks().size()) {
-        return_with_error(response, ENOENT, "Task %s:%hu does not exist",
-                          class_.leaf_module_name().c_str(), tid);
-        return nullptr;
-      }
-
-      c = m->tasks()[tid]->GetTC();
-    } else {
-      return_with_error(response, EINVAL,
-                        "One of 'name' or "
-                        "'leaf_module_name' must be specified");
-      return nullptr;
-    }
-
-    if (!c) {
-      return_with_error(response, ENOENT, "Error finding TC");
-    }
-
-    return c;
-  }
-
-  // function to call to close this gRPC service.
   std::function<void()> shutdown_func_;
 
-  // gRPC service handlers are not thread-safe; we serialize them with a lock.
-  // A recursive mutex is required since handlers may call each other.
-  std::recursive_mutex mutex_;
 };
 
 void ApiServer::Listen(const std::string& addr) {
