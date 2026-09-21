@@ -242,6 +242,13 @@ class DefaultScheduler : public Scheduler {
     for (uint64_t round = 0;; ++round) {
       // Periodic check, to mitigate expensive operations.
       if ((round & accounting_mask) == 0) {
+        // RCU quiescent state (K1): the previous task invocation has returned
+        // and the next has not started, so nothing from the previous call
+        // stack can still hold a published pointer. An idle worker reaches
+        // this boundary too, which is what keeps reclamation from stalling
+        // when there is no traffic.
+        current_worker.ReportQuiescent();
+
         if (current_worker.is_pause_requested()) {
           if (current_worker.BlockWorker()) {
             break;
@@ -329,6 +336,13 @@ class ExperimentalScheduler : public Scheduler {
     for (uint64_t round = 0;; ++round) {
       // Periodic check, to mitigate expensive operations.
       if ((round & accounting_mask) == 0) {
+        // RCU quiescent state (K1): the previous task invocation has returned
+        // and the next has not started, so nothing from the previous call
+        // stack can still hold a published pointer. An idle worker reaches
+        // this boundary too, which is what keeps reclamation from stalling
+        // when there is no traffic.
+        current_worker.ReportQuiescent();
+
         if (current_worker.is_pause_requested()) {
           if (current_worker.BlockWorker()) {
             break;

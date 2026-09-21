@@ -182,6 +182,13 @@ void Worker::SetNonWorker() {
   }
 }
 
+void Worker::ReportQuiescent() {
+  if (wid_ < 0 || wid_ >= Worker::kMaxWorkers) {
+    return;  // not a worker thread
+  }
+  bess::control::runtime().rcu().Quiescent(wid_);
+}
+
 int Worker::BlockWorker() {
   bess::control::worker_signal t;
   int ret;

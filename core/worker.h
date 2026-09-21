@@ -92,6 +92,13 @@ class Worker {
   /* Block myself. Return nonzero if the worker needs to die */
   int BlockWorker();
 
+  /* Report an RCU quiescent state (K1). The scheduler calls this at its
+   * periodic boundary -- after a task invocation returned and before the next
+   * one starts -- which is the only place a worker can legitimately claim that
+   * no RCU pointer from the previous call stack is still in use. Never call it
+   * from inside packet processing. */
+  void ReportQuiescent();
+
   /* The entry point of worker threads */
   void *Run(void *_arg);
 
