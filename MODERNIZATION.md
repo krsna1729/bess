@@ -2373,6 +2373,30 @@ rather than one call site).
     Verification: GCC + Clang clean; 43/43 native tests + benchmarks + plugin
     load; module integration 22/22; wire-parity passes.
 
+56. **`0a635e2f`** — **K1.3: quiescence is reported at the scheduler boundary.**
+    An online worker now advances grace periods while it runs: the report
+    happens at the scheduler's existing periodic boundary (every 256 rounds,
+    where the pause request is already checked), which is exactly "the previous
+    task invocation returned and the next has not started" — the definition of a
+    BESS quiescent state, and a worker execution-state property rather than
+    something a module reports. Both schedulers report, and because the boundary
+    is reached whether or not there is work, an *idle* worker still advances
+    grace periods: reclamation does not stall when traffic stops.
+
+    Tests: `core/rcu/rcu_scheduler_test.cc` — a task that holds a published
+    pointer keeps the old object alive until it returns and the worker reaches
+    the boundary; an idle worker completes a grace period promptly.
+
+    Two bugs found while writing them, both in the test: the release flag was
+    set outside the mutex guarding the wait predicate (lost wakeup — the task
+    slept past its release), and teardown destroyed the worker before the module,
+    leaving `Module::tasks_` dangling (only visible under meson, which sets
+    `MALLOC_PERTURB_`; the test now follows the daemon's order — modules under a
+    pause, then workers).
+
+    Verification: GCC + Clang clean, 44/44 native tests + benchmarks + plugin
+    load, module integration 22/22, wire-parity passes.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
