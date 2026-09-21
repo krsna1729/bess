@@ -108,8 +108,8 @@ artifact checks are first-class Meson targets.  No dataplane ownership,
 part of this phase.
 ## Status snapshot
 
-This log records the Meson cutover work on `develop`; current uncommitted
-state remains visible in `git status` and branch diff until delivery.
+This log records the Meson cutover delivered in `c02f41ef` on `develop`;
+the working tree is clean after the follow-up log update.
 
 The active build graph is Meson/Ninja only.  GCC and Clang full Meson compiles
 succeed with the pinned DPDK 25.11.3.  GCC verification passes all 28 native
@@ -1756,6 +1756,34 @@ rather than one call site).
     daemon yields exactly four pauses -- one setup, none for the THREAD_SAFE
     command, one each for the THREAD_UNSAFE, unknown, and unresolvable-gatehook
     cases.
+
+39. **`c02f41ef`** — **Phase E: Meson is now the sole BESS build entrypoint.**
+    DPDK bootstrap is checksum-pinned and separate; DPDK is consumed through
+    `pkg-config`; C++/Python protobuf and the version header are generated
+    only under the build tree; and the obsolete top-level `build.py` and
+    `core/Makefile` paths are removed.  Native unit tests, benchmarks, Python
+    tests, module integration, the sample plugin, install staging, sanitizer
+    and coverage controls, and required AF_XDP artifact checks are first-class
+    Meson targets.  CI now runs the GCC/Clang Meson matrix with `-j4`.
+
+    Verification on the pinned DPDK 25.11.3 build:
+
+    | check | result |
+    |---|---|
+    | GCC and Clang full Meson compiles | pass |
+    | GCC native C++ tests | 28/28 |
+    | Python protobuf tests | 2/2 |
+    | module integration | 22/22 files |
+    | benchmark smoke | 10/10 |
+    | PMD null/ring smoke | pass |
+    | sample plugin registry load | pass |
+    | AF_XDP required configure/artifacts | pass |
+    | install staging and source hygiene | pass |
+
+    The only compiler-specific source adjustment is removing unnecessary
+    `virtual` specifiers from destructors in `shared_obj_test.cc`; DPDK's
+    intentional unaligned header casts remain diagnostics but are demoted from
+    errors with `-Wno-error=cast-align`.
 
 ## Review process established this session
 
