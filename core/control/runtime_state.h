@@ -186,6 +186,13 @@ class RuntimeState {
   TrafficClassRegistry &traffic_classes() { return traffic_classes_; }
   WorkerManager &workers();
 
+  const PortRegistry &ports() const { return ports_; }
+  const ModuleRegistry &modules() const { return modules_; }
+  const TrafficClassRegistry &traffic_classes() const {
+    return traffic_classes_;
+  }
+  const WorkerManager &workers() const;
+
   RuntimeState(const RuntimeState &) = delete;
   RuntimeState &operator=(const RuntimeState &) = delete;
 

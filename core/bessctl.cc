@@ -564,10 +564,10 @@ class BESSControlImpl final : public BESSControl::Service {
     bess::control::PortSpec spec;
     spec.name = request->name();
     spec.driver = request->driver();
-    spec.num_inc_q = request->num_inc_q();
-    spec.num_out_q = request->num_out_q();
-    spec.size_inc_q = request->size_inc_q();
-    spec.size_out_q = request->size_out_q();
+    spec.num_rx_queues = request->num_inc_q();
+    spec.num_tx_queues = request->num_out_q();
+    spec.rx_queue_size = request->size_inc_q();
+    spec.tx_queue_size = request->size_out_q();
     spec.arg = request->arg();
 
     auto info = control_plane_.CreatePort(spec);
@@ -773,8 +773,8 @@ class BESSControlImpl final : public BESSControl::Service {
             << request->DebugString();
 
     bess::control::ConnectionSpec spec;
-    spec.m1 = request->m1();
-    spec.m2 = request->m2();
+    spec.upstream = request->m1();
+    spec.downstream = request->m2();
     spec.ogate = request->ogate();
     spec.igate = request->igate();
     spec.skip_default_hooks = request->skip_default_hooks();

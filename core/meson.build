@@ -5,6 +5,9 @@ core_sources = files(
   'bessd.cc',
   'control/control_error.cc',
   'control/control_plane.cc',
+  'control/pipeline_snapshot.cc',
+  'control/pipeline_spec.cc',
+  'control/pipeline_validator.cc',
   'control/runtime_state.cc',
   'control/worker_manager.cc',
   'debug.cc',
@@ -178,6 +181,7 @@ bessd = executable(
 )
 
 unit_test_sources = [
+  'control/control_plane_test.cc',
   'bessd_test.cc',
   'gate_test.cc',
   'memory_test.cc',

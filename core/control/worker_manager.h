@@ -80,6 +80,22 @@ class WorkerManager {
     return workers_[wid].load();
   }
 
+  const Worker *Get(int wid) const {
+    if (wid < 0 || wid >= Worker::kMaxWorkers) {
+      return nullptr;
+    }
+    return workers_[wid].load();
+  }
+
+  // The scheduler name this worker was launched with ("" for the default one).
+  const std::string &scheduler_name(int wid) const {
+    static const std::string kEmpty;
+    if (wid < 0 || wid >= Worker::kMaxWorkers) {
+      return kEmpty;
+    }
+    return scheduler_names_[wid];
+  }
+
   bool IsActive(int wid) const {
     return wid >= 0 && wid < Worker::kMaxWorkers &&
            workers_[wid].load() != nullptr;
@@ -123,6 +139,7 @@ class WorkerManager {
   // the legacy `Worker *volatile workers[]` array is what this replaces.
   std::array<std::atomic<Worker *>, Worker::kMaxWorkers> workers_{};
   std::array<std::thread, Worker::kMaxWorkers> threads_;
+  std::array<std::string, Worker::kMaxWorkers> scheduler_names_;
   int num_workers_ = 0;
   std::list<std::pair<int, TrafficClass *>> orphan_tcs_;
 };

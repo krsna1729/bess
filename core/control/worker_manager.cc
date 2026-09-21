@@ -176,6 +176,7 @@ void WorkerManager::Destroy(int wid) {
     threads_[wid].join();
 
     workers_[wid].store(nullptr);
+    scheduler_names_[wid].clear();
 
     num_workers_--;
   }
@@ -229,6 +230,7 @@ void WorkerManager::Launch(int wid, int core, const std::string &scheduler) {
       << "worker thread " << wid << " is still joinable; "
       << "Destroy() must join it before this wid can be reused.";
   threads_[wid] = std::thread(run_worker, &arg);
+  scheduler_names_[wid] = scheduler;
   INST_BARRIER();
 
   /* spin until it becomes ready and fully paused */

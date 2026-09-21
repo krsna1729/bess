@@ -37,6 +37,9 @@
 #include <vector>
 
 #include "control/control_error.h"
+#include "control/pipeline_spec.h"
+#include "control/pipeline_snapshot.h"
+#include "control/pipeline_validator.h"
 #include "message.h"
 #include "port.h"
 #include "traffic_class.h"
@@ -47,19 +50,8 @@ namespace bess {
 namespace control {
 
 // Requests are plain C++ values: the RPC layer converts protobuf messages into
-// these and converts results back. Phase G0 commit 1 keeps the request shape of
-// today's RPCs; the desired-state PipelineSpec (see MODERNIZATION.md section 9)
-// is what these requests will be derived from.
-struct PortSpec {
-  std::string name;
-  std::string driver;
-  queue_t num_inc_q = 0;
-  queue_t num_out_q = 0;
-  uint64_t size_inc_q = 0;
-  uint64_t size_out_q = 0;
-  google::protobuf::Any arg;
-};
-
+// these and converts results back. The structural desired-state types live in
+// control/pipeline_spec.h; the ones here are operation-specific.
 struct PortInfo {
   std::string name;
   std::string driver;
@@ -75,39 +67,9 @@ struct PortConfSpec {
   bool admin_up = true;
 };
 
-struct ModuleSpec {
-  std::string name;
-  std::string mclass;
-  google::protobuf::Any arg;
-};
-
-struct ConnectionSpec {
-  std::string m1;
-  std::string m2;
-  gate_idx_t ogate = 0;
-  gate_idx_t igate = 0;
-  bool skip_default_hooks = false;
-};
-
 struct DisconnectionSpec {
   std::string name;
   gate_idx_t ogate = 0;
-};
-
-struct TrafficClassSpec {
-  std::string name;
-  std::string parent;
-  std::string policy;
-  std::string resource;
-  int wid = Worker::kAnyWorker;
-  bool has_priority = false;
-  int64_t priority = 0;
-  bool has_share = false;
-  int64_t share = 0;
-  std::map<std::string, int64_t> limit;
-  std::map<std::string, int64_t> max_burst;
-  std::string leaf_module_name;
-  uint64_t leaf_module_taskid = 0;
 };
 
 struct SchedulingConstraintViolation {
@@ -202,6 +164,13 @@ class ControlPlane {
   ControlResult<void> ImportPlugin(const std::string& path);
   ControlResult<void> UnloadPlugin(const std::string& path);
 
+  // -- desired state --
+  // Validates a desired pipeline without touching the runtime, and snapshots
+  // the active one. ApplyPipeline (the transactional path) lands with the
+  // planner and transaction engine; these two are its read-only half.
+  ControlResult<ValidatedPipeline> ValidatePipeline(const PipelineSpec& desired);
+  PipelineSnapshot GetPipeline() const;
+
   // -- composition --
   // Today's ResetAll: modules, then ports, then TCs, then workers. Composed
   // here rather than by one RPC handler calling four others.
@@ -219,7 +188,9 @@ class ControlPlane {
                                const TrafficClassSpec& spec);
   ControlResult<bess::TrafficClass*> FindTc(const TrafficClassSpec& spec);
 
-  std::mutex mutex_;
+  // Locked by every public method, including the const readers (the snapshot
+  // and validation paths), hence mutable.
+  mutable std::mutex mutex_;
 };
 
 }  // namespace control

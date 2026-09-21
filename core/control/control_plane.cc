@@ -89,10 +89,10 @@ ControlResult<PortInfo> ControlPlane::CreatePort(const PortSpec& spec) {
 
   std::unique_ptr<::Port> p;
 
-  queue_t num_inc_q = spec.num_inc_q;
-  queue_t num_out_q = spec.num_out_q;
-  uint64_t size_inc_q = spec.size_inc_q;
-  uint64_t size_out_q = spec.size_out_q;
+  queue_t num_inc_q = spec.num_rx_queues;
+  queue_t num_out_q = spec.num_tx_queues;
+  uint64_t size_inc_q = spec.rx_queue_size;
+  uint64_t size_out_q = spec.tx_queue_size;
 
   if (num_inc_q == 0) {
     num_inc_q = 1;
@@ -332,23 +332,23 @@ ControlResult<void> ControlPlane::ResetModulesLocked() {
 ControlResult<void> ControlPlane::ConnectModules(const ConnectionSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  VLOG(1) << "ConnectModules " << spec.m1 << ":" << spec.ogate << " -> "
-          << spec.igate << ":" << spec.m2;
+  VLOG(1) << "ConnectModules " << spec.upstream << ":" << spec.ogate << " -> "
+          << spec.igate << ":" << spec.downstream;
 
-  if (spec.m1.empty() || spec.m2.empty()) {
+  if (spec.upstream.empty() || spec.downstream.empty()) {
     return std::unexpected(Err(EINVAL, "Missing 'm1' or 'm2' field"));
   }
 
-  Module* m1 = runtime().modules().Find(spec.m1);
+  Module* m1 = runtime().modules().Find(spec.upstream);
   if (!m1) {
     return std::unexpected(
-        Err(ENOENT, "No module '%s' found", spec.m1.c_str()));
+        Err(ENOENT, "No module '%s' found", spec.upstream.c_str()));
   }
 
-  Module* m2 = runtime().modules().Find(spec.m2);
+  Module* m2 = runtime().modules().Find(spec.downstream);
   if (!m2) {
     return std::unexpected(
-        Err(ENOENT, "No module '%s' found", spec.m2.c_str()));
+        Err(ENOENT, "No module '%s' found", spec.downstream.c_str()));
   }
 
   int ret;
@@ -360,8 +360,8 @@ ControlResult<void> ControlPlane::ConnectModules(const ConnectionSpec& spec) {
                                         spec.skip_default_hooks);
       if (ret < 0) {
         return std::unexpected(
-            Err(-ret, "Connection %s:%d->%d:%s failed", spec.m1.c_str(),
-                spec.ogate, spec.igate, spec.m2.c_str()));
+            Err(-ret, "Connection %s:%d->%d:%s failed", spec.upstream.c_str(),
+                spec.ogate, spec.igate, spec.downstream.c_str()));
       }
       return {};
     }
@@ -371,8 +371,8 @@ ControlResult<void> ControlPlane::ConnectModules(const ConnectionSpec& spec) {
                                     spec.skip_default_hooks);
   if (ret < 0) {
     return std::unexpected(Err(-ret, "Connection %s:%d->%d:%s failed",
-                               spec.m1.c_str(), spec.ogate, spec.igate,
-                               spec.m2.c_str()));
+                               spec.upstream.c_str(), spec.ogate, spec.igate,
+                               spec.downstream.c_str()));
   }
 
   return {};
@@ -1115,6 +1115,17 @@ ControlResult<void> ControlPlane::UnloadPlugin(const std::string& path) {
 // ---------------------------------------------------------------------------
 // Composition
 // ---------------------------------------------------------------------------
+
+ControlResult<ValidatedPipeline> ControlPlane::ValidatePipeline(
+    const PipelineSpec &desired) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return bess::control::ValidatePipeline(runtime(), desired);
+}
+
+PipelineSnapshot ControlPlane::GetPipeline() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return SnapshotRuntime(runtime());
+}
 
 ControlResult<void> ControlPlane::Reset() {
   std::lock_guard<std::mutex> lock(mutex_);

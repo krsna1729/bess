@@ -98,9 +98,9 @@ class Worker {
   worker_status_t status() { return status_; }
   void set_status(worker_status_t status) { status_ = status; }
 
-  int wid() { return wid_; }
-  int core() { return core_; }
-  int socket() { return socket_; }
+  int wid() const { return wid_; }
+  int core() const { return core_; }
+  int socket() const { return socket_; }
   int fd_event() { return fd_event_; }
 
   bess::PacketPool *packet_pool() { return packet_pool_; }

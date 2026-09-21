@@ -310,6 +310,10 @@ class alignas(64) Module {
 
   const std::string &name() const { return name_; }
 
+  // The argument the module was created with; the control plane snapshots it
+  // so that module configuration can be diffed.
+  const google::protobuf::Any &initial_arg() const { return initial_arg_; }
+
   const std::vector<bess::metadata::Attribute> &all_attrs() const {
     return attrs_;
   }

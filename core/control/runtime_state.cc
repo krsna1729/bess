@@ -248,6 +248,10 @@ WorkerManager &RuntimeState::workers() {
   return *workers_;
 }
 
+const WorkerManager &RuntimeState::workers() const {
+  return *workers_;
+}
+
 RuntimeState &RuntimeState::Get() {
   static RuntimeState state;
   return state;
