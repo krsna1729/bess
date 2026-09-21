@@ -176,6 +176,152 @@ TEST(PacketPoolTest, AllocationRejectsOversizeAndBulkFailureIsAtomic) {
   bess::PacketFreeBulk(held, 4);
 }
 
+TEST(PacketPoolTest, BulkAllocationInitializesFreshNativeState) {
+  bess::PlainPacketPool pool(8);
+
+  EXPECT_TRUE(pool.AllocBulk(nullptr, 0, SNBUF_DATA + 1));
+  bess::PacketFreeBulk(nullptr, 0);
+
+  bess::PacketHandle pkts[4] = {};
+  ASSERT_TRUE(pool.AllocBulk(pkts, 4, 64));
+  EXPECT_TRUE(bess::detail::PacketFreeBulkRawEligible(pkts, 4));
+  for (bess::PacketHandle pkt : pkts) {
+    ASSERT_NE(pkt, nullptr);
+    EXPECT_EQ(pkt->pool, pool.pool());
+    EXPECT_NE(pkt->buf_addr, nullptr);
+    EXPECT_EQ(pkt->buf_len, rte_pktmbuf_data_room_size(pool.pool()));
+    EXPECT_EQ(pkt->priv_size, bess::kPacketPrivateSize);
+    EXPECT_NE(rte_mbuf_to_priv(pkt), nullptr);
+    EXPECT_EQ(pkt->pkt_len, 64u);
+    EXPECT_EQ(pkt->data_len, 64);
+    EXPECT_EQ(pkt->data_off, RTE_PKTMBUF_HEADROOM);
+    EXPECT_EQ(pkt->port, RTE_MBUF_PORT_INVALID);
+    EXPECT_EQ(pkt->ol_flags, 0u);
+    EXPECT_EQ(pkt->packet_type, 0u);
+    EXPECT_EQ(pkt->tx_offload, 0u);
+    EXPECT_EQ(pkt->vlan_tci, 0);
+    EXPECT_EQ(pkt->vlan_tci_outer, 0);
+    EXPECT_EQ(rte_mbuf_refcnt_read(pkt), 1);
+    EXPECT_EQ(pkt->nb_segs, 1);
+    EXPECT_EQ(pkt->next, nullptr);
+    EXPECT_TRUE(RTE_MBUF_DIRECT(pkt));
+    bess::PacketRef ref(pkt);
+    ref.metadata<uint32_t *>()[0] = 0x13579bdf;
+    EXPECT_EQ(ref.metadata<uint32_t *>()[0], 0x13579bdfu);
+
+    pkt->pkt_len = 999;
+    pkt->data_len = 999;
+    pkt->data_off = 0;
+    pkt->port = 7;
+    pkt->ol_flags = RTE_MBUF_F_TX_IPV4;
+    pkt->packet_type = 123;
+    pkt->tx_offload = 0x1234;
+    pkt->vlan_tci = 0x1234;
+    pkt->vlan_tci_outer = 0x5678;
+  }
+  bess::PacketFreeBulk(pkts, 4);
+
+  bess::PacketHandle reused[4] = {};
+  ASSERT_TRUE(pool.AllocBulk(reused, 4, 32));
+  EXPECT_TRUE(bess::detail::PacketFreeBulkRawEligible(reused, 4));
+  for (bess::PacketHandle pkt : reused) {
+    ASSERT_NE(pkt, nullptr);
+    EXPECT_EQ(pkt->pkt_len, 32u);
+    EXPECT_EQ(pkt->data_len, 32);
+    EXPECT_EQ(pkt->data_off, RTE_PKTMBUF_HEADROOM);
+    EXPECT_EQ(pkt->port, RTE_MBUF_PORT_INVALID);
+    EXPECT_EQ(pkt->ol_flags, 0u);
+    EXPECT_EQ(pkt->packet_type, 0u);
+    EXPECT_EQ(pkt->tx_offload, 0u);
+    EXPECT_EQ(pkt->vlan_tci, 0);
+    EXPECT_EQ(pkt->vlan_tci_outer, 0);
+    EXPECT_EQ(rte_mbuf_refcnt_read(pkt), 1);
+    EXPECT_EQ(pkt->nb_segs, 1);
+    EXPECT_EQ(pkt->next, nullptr);
+
+    bess::PacketRef ref(pkt);
+    ref.metadata<uint32_t *>()[0] = 0xdeadbeef;
+    EXPECT_EQ(ref.metadata<uint32_t *>()[0], 0xdeadbeefu);
+  }
+  bess::PacketFreeBulk(reused, 4);
+}
+
+TEST(PacketOwnershipTest, BulkFreeFallsBackForMixedPools) {
+  bess::PlainPacketPool first_pool(4);
+  bess::PlainPacketPool second_pool(4);
+  bess::PacketHandle pkts[2] = {first_pool.Alloc(), second_pool.Alloc()};
+  ASSERT_NE(pkts[0], nullptr);
+  ASSERT_NE(pkts[1], nullptr);
+
+  EXPECT_FALSE(bess::detail::PacketFreeBulkRawEligible(pkts, 2));
+  bess::PacketFreeBulk(pkts, 2);
+  EXPECT_EQ(first_pool.Size(), 4);
+  EXPECT_EQ(second_pool.Size(), 4);
+}
+
+TEST(PacketOwnershipTest, BulkFreeFallsBackForNullElement) {
+  bess::PlainPacketPool pool(4);
+  bess::PacketHandle pkts[3] = {pool.Alloc(), nullptr, pool.Alloc()};
+  ASSERT_NE(pkts[0], nullptr);
+  ASSERT_NE(pkts[2], nullptr);
+
+  EXPECT_FALSE(bess::detail::PacketFreeBulkRawEligible(pkts, 3));
+  bess::PacketFreeBulk(pkts, 3);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+TEST(PacketOwnershipTest, BulkFreeFallsBackForMultisegmentPackets) {
+  bess::PlainPacketPool pool(8);
+  bess::PacketHandle first = pool.Alloc();
+  bess::PacketHandle second = pool.Alloc();
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+
+  bess::PacketRef first_ref(first);
+  bess::PacketRef second_ref(second);
+  ASSERT_NE(first_ref.append(32), nullptr);
+  ASSERT_NE(second_ref.append(16), nullptr);
+  first_ref.set_next(second_ref);
+  first_ref.set_nb_segs(2);
+  first_ref.set_total_len(first_ref.total_len() + second_ref.total_len());
+
+  bess::PacketHandle chain[1] = {first};
+  EXPECT_FALSE(bess::detail::PacketFreeBulkRawEligible(chain, 1));
+  bess::PacketFreeBulk(chain, 1);
+  EXPECT_EQ(pool.Size(), 8);
+}
+
+TEST(PacketOwnershipTest, BulkFreeFallsBackForSharedReference) {
+  bess::PlainPacketPool pool(4);
+  bess::PacketHandle pkt = pool.Alloc();
+  ASSERT_NE(pkt, nullptr);
+  rte_mbuf_refcnt_update(pkt, 1);
+  EXPECT_EQ(rte_mbuf_refcnt_read(pkt), 2);
+
+  EXPECT_FALSE(bess::detail::PacketFreeBulkRawEligible(&pkt, 1));
+  bess::PacketFreeBulk(&pkt, 1);
+  EXPECT_EQ(rte_mbuf_refcnt_read(pkt), 1);
+  bess::PacketFree(pkt);
+  EXPECT_EQ(pool.Size(), 4);
+}
+
+TEST(PacketOwnershipTest, BulkFreeFallsBackForIndirectClone) {
+  bess::PlainPacketPool pool(8);
+  bess::PacketHandle original = pool.Alloc();
+  ASSERT_NE(original, nullptr);
+  ASSERT_NE(bess::PacketRef(original).append(32), nullptr);
+
+  bess::PacketHandle clone = rte_pktmbuf_clone(original, pool.pool());
+  ASSERT_NE(clone, nullptr);
+  EXPECT_FALSE(RTE_MBUF_DIRECT(clone));
+  EXPECT_FALSE(bess::detail::PacketFreeBulkRawEligible(&clone, 1));
+
+  bess::PacketFreeBulk(&clone, 1);
+  EXPECT_EQ(rte_mbuf_refcnt_read(original), 1);
+  bess::PacketFree(original);
+  EXPECT_EQ(pool.Size(), 8);
+}
+
 TEST(PacketBatchTest, HandlesAndRefsShareNativeIdentity) {
   bess::PlainPacketPool pool(16);
   bess::PacketBatch batch;
@@ -204,12 +350,12 @@ TEST(PacketBatchTest, HandlesAndRefsShareNativeIdentity) {
 }
 
 struct ExternalBufferOwner {
-  bool *freed;
+  int *free_count;
 };
 
 void FreeExternalBuffer(void *addr, void *opaque) {
   auto *owner = static_cast<ExternalBufferOwner *>(opaque);
-  *owner->freed = true;
+  ++*owner->free_count;
   delete[] static_cast<unsigned char *>(addr);
   delete owner;
 }
@@ -219,9 +365,9 @@ TEST(PacketOwnershipTest, NativeExternalBufferFreeCallbackRuns) {
   bess::PacketHandle pkt = pool.Alloc();
   ASSERT_NE(pkt, nullptr);
 
-  bool freed = false;
+  int free_count = 0;
   auto *buffer = new unsigned char[4096];
-  auto *owner = new ExternalBufferOwner{&freed};
+  auto *owner = new ExternalBufferOwner{&free_count};
   uint16_t buffer_len = 4096;
   rte_mbuf_ext_shared_info *shinfo = rte_pktmbuf_ext_shinfo_init_helper(
       buffer, &buffer_len, FreeExternalBuffer, owner);
@@ -238,8 +384,9 @@ TEST(PacketOwnershipTest, NativeExternalBufferFreeCallbackRuns) {
   ASSERT_NE(ref.append(32), nullptr);
   EXPECT_EQ(ref.data_len(), 32);
 
-  bess::PacketFree(pkt);
-  EXPECT_TRUE(freed);
+  EXPECT_FALSE(bess::detail::PacketFreeBulkRawEligible(&pkt, 1));
+  bess::PacketFreeBulk(&pkt, 1);
+  EXPECT_EQ(free_count, 1);
 }
 
 }  // namespace

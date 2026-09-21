@@ -1954,7 +1954,7 @@ The `rte_mbuf`-mirroring union and `CheckMbufLayout()` were intentionally
 left in that Stage 1 commit and were removed by the completed Stage 2B
 cutover.
 
-### Stage 2A — `PacketHandle`/`PacketRef` seam and consumer migration
+### Stage 2A — `PacketHandle`/`PacketRef` seam and consumer migration (done)
 
 Stage 2A landed the storage/processing boundary without changing packet
 layout or allocator representation. `PacketHandle` names the stored packet
@@ -2002,7 +2002,7 @@ The PCAP receive path now drops the already-built chain when a later segment
 allocation fails, before dereferencing that segment. The obsolete
 overlay-specific chain cast is gone.
 
-Correctness evidence: all seven native packet layout/ownership tests in
+Correctness evidence: the native packet layout/ownership tests in
 `core/packet_test.cc` pass, and the migrated TCP reconstruction test compiles
 against `PacketRef`. The full daemon/module object graph compiles with g++ on
 the local DPDK 25.11.3 install; the local static link remains unavailable
@@ -2029,11 +2029,113 @@ throughput in Mpps at burst sizes 1/2/4/8/16/32; every run reported zero drops.
 | `BM_PmdRingRoundTrip` | 6.36 | 11.90 | 23.75 | 45.01 | 79.71 | 134.41 |
 | `BM_PmdRingRoundTripEndToEnd` | 46.10 | 69.32 | 99.96 | 149.24 | 190.22 | 234.01 |
 
-The packet-allocation regressions are expected consequences of replacing the
-old SSE/raw-mempool fast paths with DPDK's safe `rte_pktmbuf_alloc_bulk()` and
-`rte_pktmbuf_free_bulk()` reset/free semantics; they are recorded rather than
-hidden. Follow-up performance work must use native APIs or an upstream DPDK
-optimization, not restore an overlay.
+The native packet representation and the Candidate-C performance recovery are
+complete. The measured allocation regressions came from replacing BESS's
+specialized simple-packet bulk lifecycle—the old hand-optimized raw-mempool
+allocation/reset/free paths, including layout-specific x86 SIMD fast paths—
+with DPDK's fully general
+`rte_pktmbuf_alloc_bulk()`/`rte_pktmbuf_free_bulk()` lifecycle, not from an
+intrinsic cost of native `rte_mbuf` storage. Candidate C restores that
+specialized lifecycle through native DPDK raw bulk APIs while retaining checked
+generic fallback for non-simple ownership cases. No overlay restoration is
+planned.
+
+#### Stage 2B final Candidate-C acceptance signoff
+
+The final standardized comparison used A = final Stage 2A (`0d4da18a`), B =
+the original native Stage 2B (`493dc520`), and C = the final Candidate-C
+implementation in this change.
+Each endpoint received ten interleaved observations on pinned CPU 2 with its
+SMT sibling offline, `--benchmark_min_time=1.0s`, the same compiler (`g++`,
+`-march=native`), and DPDK 25.11.3. The raw captures are archived as
+`raw-captures.tar.gz`; `acceptance-summary.json`, `metadata.json`, and
+`sha256sums.txt` preserve the compact summary, protocol, and integrity record
+under `scratch/phaseb-study/acceptance-final/` on the validation host.
+
+Packet benchmark medians are ns/op:
+
+| Endpoint | A | B | C | A→B | B→C | A→C |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `BM_BatchForward` | 2.242 | 2.253 | 2.256 | +0.5% | +0.1% | +0.6% |
+| `BM_PacketAllocFree` | 6.534 | 6.427 | 6.490 | -1.6% | +1.0% | -0.7% |
+| `BM_PacketAllocFreeBulk` | 38.639 | 105.988 | 70.806 | +174.3% | -33.2% | +83.2% |
+| `BM_PacketAppendTrim` | 2.676 | 2.718 | 2.693 | +1.6% | -0.9% | +0.6% |
+| `BM_PacketHeadData` | 0.275 | 0.321 | 0.274 | +16.5% | -14.8% | -0.7% |
+| `BM_PacketMetadataAccess` | 0.200 | 0.200 | 0.200 | -0.1% | +0.0% | -0.1% |
+
+PMD benchmark medians are ns/burst. EndToEnd rows are synthetic local
+allocator/lifecycle paths, not real-NIC throughput:
+
+| Endpoint | Burst | A | B | C | A→B | B→C | A→C |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `BM_PmdNullTx` | 1 | 150.428 | 150.942 | 150.059 | +0.3% | -0.6% | -0.2% |
+| `BM_PmdNullTx` | 2 | 153.723 | 155.171 | 154.091 | +0.9% | -0.7% | +0.2% |
+| `BM_PmdNullTx` | 4 | 157.281 | 158.638 | 157.463 | +0.9% | -0.7% | +0.1% |
+| `BM_PmdNullTx` | 8 | 165.842 | 167.800 | 166.942 | +1.2% | -0.5% | +0.7% |
+| `BM_PmdNullTx` | 16 | 190.030 | 191.983 | 189.593 | +1.0% | -1.2% | -0.2% |
+| `BM_PmdNullTx` | 32 | 213.639 | 217.075 | 210.785 | +1.6% | -2.9% | -1.3% |
+| `BM_PmdNullTxEndToEnd` | 1 | 16.843 | 18.367 | 17.556 | +9.1% | -4.4% | +4.2% |
+| `BM_PmdNullTxEndToEnd` | 2 | 22.004 | 24.073 | 23.320 | +9.4% | -3.1% | +6.0% |
+| `BM_PmdNullTxEndToEnd` | 4 | 25.761 | 29.249 | 27.675 | +13.5% | -5.4% | +7.4% |
+| `BM_PmdNullTxEndToEnd` | 8 | 32.281 | 41.995 | 39.980 | +30.1% | -4.8% | +23.8% |
+| `BM_PmdNullTxEndToEnd` | 16 | 55.224 | 73.396 | 77.720 | +32.9% | +5.9% | +40.7% |
+| `BM_PmdNullTxEndToEnd` | 32 | 84.665 | 117.453 | 138.863 | +38.7% | +18.2% | +64.0% |
+| `BM_PmdRingRoundTrip` | 1 | 150.950 | 155.145 | 150.641 | +2.8% | -2.9% | -0.2% |
+| `BM_PmdRingRoundTrip` | 2 | 154.348 | 159.741 | 154.640 | +3.5% | -3.2% | +0.2% |
+| `BM_PmdRingRoundTrip` | 4 | 155.374 | 163.956 | 156.787 | +5.5% | -4.4% | +0.9% |
+| `BM_PmdRingRoundTrip` | 8 | 162.526 | 178.671 | 163.346 | +9.9% | -8.6% | +0.5% |
+| `BM_PmdRingRoundTrip` | 16 | 174.130 | 199.674 | 181.465 | +14.7% | -9.1% | +4.2% |
+| `BM_PmdRingRoundTrip` | 32 | 195.215 | 230.095 | 204.927 | +17.9% | -10.9% | +5.0% |
+| `BM_PmdRingRoundTripEndToEnd` | 1 | 17.740 | 22.457 | 19.058 | +26.6% | -15.1% | +7.4% |
+| `BM_PmdRingRoundTripEndToEnd` | 2 | 21.438 | 29.402 | 23.529 | +37.1% | -20.0% | +9.8% |
+| `BM_PmdRingRoundTripEndToEnd` | 4 | 30.373 | 38.171 | 34.177 | +25.7% | -10.5% | +12.5% |
+| `BM_PmdRingRoundTripEndToEnd` | 8 | 34.736 | 50.293 | 41.743 | +44.8% | -17.0% | +20.2% |
+| `BM_PmdRingRoundTripEndToEnd` | 16 | 47.130 | 83.937 | 73.189 | +78.1% | -12.8% | +55.3% |
+| `BM_PmdRingRoundTripEndToEnd` | 32 | 74.644 | 140.722 | 127.380 | +88.5% | -9.5% | +70.7% |
+
+Lifecycle decomposition at burst 32, using Candidate-C's checked/trusted
+endpoints, was also run with all three pool modes:
+
+| Pool mode | `A_CurrentChecked` | `B_CurrentTrusted` | `C_NormalChecked` | `D_NormalGeneric` |
+| --- | ---: | ---: | ---: | ---: |
+| `PlainPacketPool` | 68.970 | 47.977 | 73.362 | 99.323 |
+| DPDK hugepages | 66.563 | 43.820 | 66.552 | 91.126 |
+| BESS-managed hugepages | 131.761 | 145.568 | 164.310 | 179.515 |
+
+The packet suite and PMD fixtures use `PlainPacketPool` for source-comparable
+interleaved A/B/C measurements. The decomposition above supplies the
+backend-specific pool comparison; DPDK and BESS hugepage modes were run with
+1024 MiB hugepage backing where available.
+
+The result separates cleanly. Native `rte_mbuf *` storage and the transport
+boundary are complete. The generic native lifecycle caused the major
+`BM_PacketAllocFreeBulk` regression; the checked raw native path recovered
+substantial cost, from 105.988 ns to 70.806 ns, but remains 83.2% above A.
+Native access and direct PMD transport remain effectively flat. `BM_PmdNullTx`
+is within measurement spread across the burst sweep. `BM_PmdRingRoundTrip`
+retains +4.2% and +5.0% A→C cost at bursts 16 and 32 because its timed region
+also includes post-RX `PacketFreeBulk()`; the earlier split experiments with
+free outside timing isolated TX/RX itself as effectively flat. The residual is
+a measured fresh-state initialization, ownership-validation, and lifecycle
+tradeoff, not “expected DPDK overhead.” Further recovery
+would require weakening ownership validation, pruning DPDK fresh-state
+semantics, or adding layout-sensitive/vectorized initialization; those choices
+were rejected.
+
+Correctness gates passed: g++ and clang++ `-Werror` builds with the repository's
+documented local warning exceptions, `core/all_test` (196/196), the focused
+packet ownership tests, Python/pybess discovery (129 tests), the complete
+module-test runner, all ten benchmark smoke binaries, and
+`./build.py --plugin sample_plugin`. Packet ownership coverage retains fresh
+and reused packets, mixed pools, multisegment chains, shared references,
+indirect clones, external buffers, zero-count calls, and oversized-count
+handling. Candidate C is accepted as the final Stage 2B implementation.
+
+The legacy SIMD reset also zeroed the mbuf hash/RSS union as an incidental
+consequence of its packed stores. DPDK's raw-reset contract does not reset that
+field; BESS has no fresh-packet consumer requiring a zero hash, so Stage 2B
+follows DPDK's validity-state semantics rather than preserving that incidental
+initialization.
 
 Residual Stage 2 scope is explicit: dynamic data-room sizing, jumbo frames,
 AF_XDP/vhost external-buffer pool plumbing, clone semantics, hardware

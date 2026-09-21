@@ -149,8 +149,91 @@ static_assert(std::is_trivially_destructible<PacketRef>::value,
 // Ownership helpers. PacketRef is non-owning and has no destructor action.
 inline void PacketFree(PacketHandle pkt) { rte_pktmbuf_free(pkt); }
 
+namespace detail {
+
+enum class PacketFreeBulkEligibility : uint8_t {
+  kEligible,
+  kZeroCount,
+  kCountOverflow,
+  kNullArray,
+  kNullPacket,
+  kMixedPool,
+  kNonDirect,
+  kRefcnt,
+  kMultiSegment,
+  kNextSegment,
+};
+
+inline PacketFreeBulkEligibility CheckPacketFreeBulkEligibility(
+    PacketHandle *pkts, size_t cnt) {
+  if (cnt == 0) {
+    return PacketFreeBulkEligibility::kZeroCount;
+  }
+  if (cnt > std::numeric_limits<unsigned>::max()) {
+    return PacketFreeBulkEligibility::kCountOverflow;
+  }
+  if (pkts == nullptr) {
+    return PacketFreeBulkEligibility::kNullArray;
+  }
+
+  rte_mempool *pool = nullptr;
+  for (size_t i = 0; i < cnt; i++) {
+    PacketHandle pkt = pkts[i];
+    if (pkt == nullptr) {
+      return PacketFreeBulkEligibility::kNullPacket;
+    }
+    if (i == 0) {
+      pool = pkt->pool;
+      if (pool == nullptr) {
+        return PacketFreeBulkEligibility::kNullPacket;
+      }
+    } else if (pkt->pool != pool) {
+      return PacketFreeBulkEligibility::kMixedPool;
+    }
+    if (!RTE_MBUF_DIRECT(pkt)) {
+      return PacketFreeBulkEligibility::kNonDirect;
+    }
+    if (rte_mbuf_refcnt_read(pkt) != 1) {
+      return PacketFreeBulkEligibility::kRefcnt;
+    }
+    if (pkt->nb_segs != 1) {
+      return PacketFreeBulkEligibility::kMultiSegment;
+    }
+    if (pkt->next != nullptr) {
+      return PacketFreeBulkEligibility::kNextSegment;
+    }
+  }
+  return PacketFreeBulkEligibility::kEligible;
+}
+
+inline bool PacketFreeBulkRawEligible(PacketHandle *pkts, size_t cnt) {
+  return CheckPacketFreeBulkEligibility(pkts, cnt) ==
+         PacketFreeBulkEligibility::kEligible;
+}
+
+}  // namespace detail
+
 inline void PacketFreeBulk(PacketHandle *pkts, size_t cnt) {
-  if (cnt != 0) {
+  if (cnt == 0) {
+    return;
+  }
+
+  DCHECK(pkts != nullptr) << "PacketFreeBulk requires a packet array";
+  if (unlikely(pkts == nullptr)) {
+    return;
+  }
+
+  const auto eligibility =
+      detail::CheckPacketFreeBulkEligibility(pkts, cnt);
+  if (eligibility == detail::PacketFreeBulkEligibility::kEligible) {
+    rte_mbuf_raw_free_bulk(pkts[0]->pool, pkts,
+                           static_cast<unsigned>(cnt));
+  } else if (eligibility ==
+             detail::PacketFreeBulkEligibility::kCountOverflow) {
+    for (size_t i = 0; i < cnt; i++) {
+      rte_pktmbuf_free(pkts[i]);
+    }
+  } else {
     rte_pktmbuf_free_bulk(pkts, static_cast<unsigned>(cnt));
   }
 }

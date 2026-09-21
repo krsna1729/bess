@@ -2,6 +2,7 @@
 
 #include <sys/mman.h>
 
+#include <algorithm>
 #include <limits>
 #include <rte_errno.h>
 #include <rte_mempool.h>
@@ -93,13 +94,35 @@ bool PacketPool::AllocBulk(PacketHandle *pkts, size_t count, size_t len) {
     return false;
   }
 
-  if (rte_pktmbuf_alloc_bulk(pool_, pkts, static_cast<unsigned>(count)) < 0) {
+  const uint64_t initial_ol_flags =
+      (rte_pktmbuf_priv_flags(pool_) &
+       RTE_PKTMBUF_POOL_F_PINNED_EXT_BUF)
+          ? RTE_MBUF_F_EXTERNAL
+          : 0;
+  const uint16_t initial_data_off = static_cast<uint16_t>(
+      std::min<unsigned>(static_cast<unsigned>(RTE_PKTMBUF_HEADROOM),
+                         static_cast<unsigned>(data_room)));
+  const uint32_t packet_len = static_cast<uint32_t>(len);
+  const uint16_t data_len = static_cast<uint16_t>(len);
+
+  // rte_mbuf_raw_alloc_bulk() establishes the pool/buffer fields and the
+  // simple ownership invariants. Initialize the remaining fresh-packet state
+  // in one traversal, including BESS's requested initial length.
+  if (rte_mbuf_raw_alloc_bulk(pool_, pkts, static_cast<unsigned>(count)) < 0) {
     return false;
   }
 
   for (size_t i = 0; i < count; i++) {
-    pkts[i]->pkt_len = static_cast<uint32_t>(len);
-    pkts[i]->data_len = static_cast<uint16_t>(len);
+    PacketHandle pkt = pkts[i];
+    pkt->pkt_len = packet_len;
+    pkt->tx_offload = 0;
+    pkt->vlan_tci = 0;
+    pkt->vlan_tci_outer = 0;
+    pkt->port = RTE_MBUF_PORT_INVALID;
+    pkt->ol_flags = initial_ol_flags;
+    pkt->packet_type = 0;
+    pkt->data_off = initial_data_off;
+    pkt->data_len = data_len;
   }
   return true;
 }
