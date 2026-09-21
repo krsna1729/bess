@@ -855,6 +855,11 @@ ControlResult<void> ControlPlane::UpdateTcParentLocked(const TrafficClassSpec& s
   }
   bess::TrafficClass* c = *found;
 
+  // Where it is now, *before* anything detaches it: a refused reattach has to
+  // put the class back where it came from, priority or share included, and once
+  // it is detached that description is gone.
+  const TrafficClassSpec previous = AttachmentSpecOf(c);
+
   if (c->policy() == bess::POLICY_LEAF) {
     if (!detach_tc(c)) {
       return std::unexpected(Err(EINVAL,
@@ -877,9 +882,8 @@ ControlResult<void> ControlPlane::UpdateTcParentLocked(const TrafficClassSpec& s
   }
 
   // Keep the legacy rule for non-leaf classes (they may only move as orphans),
-  // but a refused reattach must not destroy the class: put it back.
-  const TrafficClassSpec previous = AttachmentSpecOf(c);
-
+  // but a refused reattach must not destroy the class: put it back where
+  // `previous` says it was.
   auto attached = AttachExistingTcLocked(c, spec);
   if (!attached) {
     auto restored = AttachExistingTcLocked(c, previous);

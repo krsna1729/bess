@@ -791,4 +791,154 @@ TEST_F(ApplyPipelineTest, RecordsPhaseTimings) {
   EXPECT_GE(applied->timing.retire_us, 0u);
 }
 
+
+// The legacy `UpdateTcParent` used to snapshot the old attachment *after*
+// detaching the class, so a refused move restored it as a root/orphan instead
+// of putting it back under its parent with its priority or share. It now
+// snapshots first, which is what this pins down.
+TEST_F(ApplyPipelineTest, LegacyReparentRestoresTheOriginalAttachment) {
+  PipelineSpec spec = FullPipeline();
+  spec.traffic_classes.clear();
+
+  // A port and a module with a task, so there is a real leaf traffic class.
+  bess::pb::PMDPortArg port_arg;
+  port_arg.set_vdev("net_null1");
+  bess::control::PortSpec port;
+  port.name = "p0";
+  port.driver = "PMDPort";
+  port.num_rx_queues = 1;
+  port.num_tx_queues = 1;
+  port.rx_queue_size = 1024;
+  port.tx_queue_size = 1024;
+  port.arg.PackFrom(port_arg);
+  spec.ports.push_back(port);
+
+  bess::pb::QueueIncArg queue_arg;
+  queue_arg.set_port("p0");
+  queue_arg.set_qid(0);
+  bess::control::ModuleSpec reader;
+  reader.name = "reader";
+  reader.mclass = "QueueInc";
+  reader.arg.PackFrom(queue_arg);
+  spec.modules.push_back(reader);
+
+  // A round-robin home for the leaf, and a priority class whose slot is taken.
+  bess::control::TrafficClassSpec home;
+  home.name = "home";
+  home.policy = "round_robin";
+  home.wid = 0;
+  spec.traffic_classes.push_back(home);
+
+  bess::control::TrafficClassSpec prio;
+  prio.name = "prio";
+  prio.policy = "priority";
+  prio.wid = 0;
+  spec.traffic_classes.push_back(prio);
+
+  bess::control::TrafficClassSpec holder;
+  holder.name = "holder";
+  holder.policy = "round_robin";
+  holder.parent = "prio";
+  holder.has_priority = true;
+  holder.priority = 10;
+  spec.traffic_classes.push_back(holder);
+
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+
+  // Find the leaf the module created, and give it a known home through the
+  // legacy path (this one is expected to succeed).
+  const bess::control::PipelineSnapshot after_apply =
+      control_plane_->GetPipeline();
+  std::string leaf_name;
+  for (const auto &tc : after_apply.traffic_classes) {
+    if (tc.policy == "leaf" && tc.leaf_module_name == "reader") {
+      leaf_name = tc.name;
+    }
+  }
+  ASSERT_FALSE(leaf_name.empty());
+
+  bess::control::TrafficClassSpec move;
+  move.leaf_module_name = "reader";
+  move.leaf_module_taskid = 0;
+  move.parent = "home";
+  ASSERT_TRUE(control_plane_->UpdateTcParent(move).has_value());
+
+  const uint64_t generation = bess::control::runtime().generation();
+  {
+    const bess::control::PipelineSnapshot moved = control_plane_->GetPipeline();
+    bool homed = false;
+    for (const auto &tc : moved.traffic_classes) {
+      if (tc.name == leaf_name) {
+        homed = tc.parent == "home";
+      }
+    }
+    ASSERT_TRUE(homed) << "the leaf should be under 'home'";
+  }
+
+  // Now ask for a move that must be refused: priority 10 is already taken.
+  bess::control::TrafficClassSpec collision = move;
+  collision.parent = "prio";
+  collision.has_priority = true;
+  collision.priority = 10;
+
+  auto refused = control_plane_->UpdateTcParent(collision);
+  ASSERT_FALSE(refused.has_value());
+
+  EXPECT_EQ(generation, bess::control::runtime().generation());
+  EXPECT_TRUE(bess::control::runtime().traffic_classes().Contains(leaf_name));
+
+  // The class went back where it was, not to the orphan list.
+  bool restored = false;
+  for (const auto &tc : control_plane_->GetPipeline().traffic_classes) {
+    if (tc.name == leaf_name) {
+      restored = tc.parent == "home";
+    }
+  }
+  EXPECT_TRUE(restored) << "the leaf should still be under 'home'";
+
+  const PipelineSpec running =
+      SpecFromSnapshot(control_plane_->GetPipeline());
+  auto diff = control_plane_->DiffPipeline(running);
+  ASSERT_TRUE(diff.has_value());
+  EXPECT_TRUE(diff->empty());
+}
+
+// The legacy rule for non-leaf classes is stricter: they may only move as
+// orphans. A refusal there must leave everything exactly as it was.
+TEST_F(ApplyPipelineTest, LegacyReparentRefusesToMoveAnAttachedRoot) {
+  PipelineSpec spec = FullPipeline();
+  spec.traffic_classes.clear();
+
+  bess::control::TrafficClassSpec root;
+  root.name = "solo";
+  root.policy = "round_robin";
+  root.wid = 0;
+  spec.traffic_classes.push_back(root);
+
+  bess::control::TrafficClassSpec prio;
+  prio.name = "prio";
+  prio.policy = "priority";
+  prio.wid = 0;
+  spec.traffic_classes.push_back(prio);
+
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+
+  const PipelineSnapshot active = control_plane_->GetPipeline();
+  const uint64_t generation = bess::control::runtime().generation();
+
+  bess::control::TrafficClassSpec move;
+  move.name = "solo";
+  move.parent = "prio";
+  move.has_priority = true;
+  move.priority = 5;  // free: the move would succeed if it were allowed
+
+  auto refused = control_plane_->UpdateTcParent(move);
+  ASSERT_FALSE(refused.has_value());
+  EXPECT_EQ(EINVAL, refused.error().err);
+
+  EXPECT_EQ(generation, bess::control::runtime().generation());
+  EXPECT_TRUE(control_plane_->GetPipeline() == active);
+  EXPECT_TRUE(bess::control::runtime().traffic_classes().Contains("solo"));
+}
+
 }  // namespace
