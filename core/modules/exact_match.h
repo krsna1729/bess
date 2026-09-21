@@ -35,16 +35,18 @@
 #include <rte_hash_crc.h>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "../control/runtime_state.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../utils/exact_match_table.h"
-#include "../utils/published_generation.h"
+#include "../rcu/rcu_ptr.h"
 
 using google::protobuf::RepeatedPtrField;
 using bess::utils::ExactMatchField;
@@ -59,7 +61,8 @@ class ExactMatch final : public Module {
 
   static const Commands cmds;
 
-  ExactMatch() : Module() {
+  ExactMatch()
+      : Module(), published_(bess::control::runtime().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 
@@ -97,7 +100,7 @@ class ExactMatch final : public Module {
     ExactMatchTable<gate_idx_t> table;
   };
 
-  using GenerationPtr = std::shared_ptr<const Generation>;
+  using GenerationPtr = std::unique_ptr<const Generation>;
 
   CommandResponse AddFieldOne(const bess::pb::Field &field,
                               const bess::pb::FieldData &mask, int idx);
@@ -109,6 +112,13 @@ class ExactMatch final : public Module {
   Error RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg, Rule *rule);
   // Builds a generation for `rules`; nullptr with *err set on failure. Runs on
   // the control plane under the writer lock, off the data path.
+  // Replaces the published generation with `build(current)`, or leaves the
+  // active one alone when the builder returns nullptr (with *err set). The
+  // writer protocol lives here so no call site can publish without retiring,
+  // or retire before publishing (K1).
+  bool Publish(const std::function<GenerationPtr(const Generation &)> &build,
+               Error *err);
+
   GenerationPtr Build(const std::vector<Rule> &rules, gate_idx_t default_gate,
                       Error *err);
   // Applies the module's configured fields (fixed at Init() time; a table
@@ -133,13 +143,14 @@ class ExactMatch final : public Module {
   std::vector<FieldSpec> field_specs_;
   bool empty_masks_;  // mainly for GetInitialArg
 
-  // Snapshot/publication/reclamation (bess::utils::PublishedGeneration): one
-  // snapshot per batch on the data path, serialized rebuilds off it, and the
-  // retired generation is destroyed here rather than on a packet worker.
+  // Publication and reclamation (bess::rcu::RcuPtr + the runtime's RcuDomain):
+  // one acquire load per batch on the data path, serialized rebuilds off it,
+  // and the retired generation is destroyed by a control thread rather than on
+  // a packet worker.
   // Never null between Init() and module destruction: there is no DeInit()
   // (the generation is released with the module, workers already paused), and
   // every command publishes a replacement rather than clearing it.
-  bess::utils::PublishedGeneration<Generation> published_;
+  bess::rcu::RcuPtr<Generation> published_;
 };
 
 #endif  // BESS_MODULES_EXACTMATCH_H_

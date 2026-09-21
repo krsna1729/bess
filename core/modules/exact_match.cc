@@ -37,7 +37,7 @@
 #include <vector>
 
 #include "../utils/endian.h"
-#include "../utils/published_generation.h"
+#include "../rcu/rcu_ptr.h"
 #include "../utils/format.h"
 
 // XXX: this is repeated in many modules. get rid of them when converting .h to
@@ -126,7 +126,7 @@ Error ExactMatch::ApplyFields(ExactMatchTable<gate_idx_t> *table) {
 ExactMatch::GenerationPtr ExactMatch::Build(const std::vector<Rule> &rules,
                                             gate_idx_t default_gate,
                                             Error *err) {
-  auto gen = std::make_shared<Generation>();
+  auto gen = std::make_unique<Generation>();
   gen->default_gate = default_gate;
 
   Error ret = ApplyFields(&gen->table);
@@ -164,6 +164,27 @@ void ExactMatch::UpsertRule(std::vector<Rule> *rules, Rule rule) {
     }
   }
   rules->push_back(std::move(rule));
+}
+
+bool ExactMatch::Publish(
+    const std::function<GenerationPtr(const Generation &)> &build, Error *err) {
+  const Generation *current = published_.Read();
+  if (current == nullptr) {
+    *err = Error(EINVAL, "not initialized");
+    return false;  // not initialized (or already deinitialized)
+  }
+
+  GenerationPtr next = build(*current);
+  if (next == nullptr) {
+    return false;  // the builder owns reporting why
+  }
+
+  // Publish, retire the replaced generation against a fresh grace period, and
+  // reclaim whatever readers are already done with. This runs on the control
+  // thread, so a retired table is destroyed here -- never on a worker.
+  published_.Publish(std::move(next));
+  bess::control::runtime().rcu().ReclaimReady();
+  return true;
 }
 
 CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
@@ -206,7 +227,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
 CommandResponse ExactMatch::GetInitialArg(const bess::pb::EmptyArg &) {
   bess::pb::ExactMatchArg r;
 
-  const GenerationPtr gen = published_.Snapshot();
+  const Generation *gen = published_.Read();
   for (size_t i = 0; i < gen->table.num_fields(); i++) {
     const ExactMatchField &f = gen->table.get_field(i);
     bess::pb::Field *ret_field = r.add_fields();
@@ -236,7 +257,7 @@ CommandResponse ExactMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
   bess::pb::ExactMatchConfig r;
   using rule_t = bess::pb::ExactMatchCommandAddArg;
 
-  const GenerationPtr gen = published_.Snapshot();
+  const Generation *gen = published_.Read();
   r.set_default_gate(gen->default_gate);
   for (const Rule &rule : gen->rules) {
     rule_t *out = r.add_rules();
@@ -311,9 +332,9 @@ CommandResponse ExactMatch::SetRuntimeConfig(
   }
 
   Error err;
-  const bool published = published_.Update([&](const Generation &) {
+  const bool published = Publish([&](const Generation &) {
     return Build(rules, arg.default_gate(), &err);
-  });
+  }, &err);
   if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
@@ -326,7 +347,7 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
   // One snapshot for the whole batch: a concurrent command can neither swap
   // the table mid-batch nor free it under this lookup.
-  const GenerationPtr gen = published_.Snapshot();
+  const Generation *gen = published_.Read();
   const auto &table = gen->table;
   const gate_idx_t default_gate = gen->default_gate;
 
@@ -347,7 +368,7 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 }
 
 std::string ExactMatch::GetDesc() const {
-  const GenerationPtr gen = published_.Snapshot();
+  const Generation *gen = published_.Read();
   return bess::utils::Format("%zu fields, %zu rules", gen->table.num_fields(),
                              gen->table.Size());
 }
@@ -391,11 +412,11 @@ CommandResponse ExactMatch::CommandAdd(
   }
 
   Error err;
-  const bool published = published_.Update([&](const Generation &current) {
+  const bool published = Publish([&](const Generation &current) {
     std::vector<Rule> rules = current.rules;
     UpsertRule(&rules, rule);
     return Build(rules, current.default_gate, &err);
-  });
+  }, &err);
   if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
@@ -418,7 +439,7 @@ CommandResponse ExactMatch::CommandDelete(
   Error err;
   bool found = false;
   const bool published =
-      published_.Update([&](const Generation &current) -> GenerationPtr {
+      Publish([&](const Generation &current) -> GenerationPtr {
         std::vector<Rule> rules;
         rules.reserve(current.rules.size());
         for (const Rule &r : current.rules) {
@@ -432,7 +453,7 @@ CommandResponse ExactMatch::CommandDelete(
           return nullptr;
         }
         return Build(rules, current.default_gate, &err);
-      });
+      }, &err);
   if (!published) {
     if (!found) {
       return CommandFailure(ENOENT, "rule doesn't exist");
@@ -447,9 +468,9 @@ CommandResponse ExactMatch::CommandClear(const bess::pb::EmptyArg &) {
   // Rules go, the default gate stays -- what ClearRules() did to the live
   // table.
   Error err;
-  const bool published = published_.Update([&](const Generation &current) {
+  const bool published = Publish([&](const Generation &current) {
     return Build(/*rules=*/{}, current.default_gate, &err);
-  });
+  }, &err);
   if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
@@ -460,9 +481,9 @@ CommandResponse ExactMatch::CommandClear(const bess::pb::EmptyArg &) {
 CommandResponse ExactMatch::CommandSetDefaultGate(
     const bess::pb::ExactMatchCommandSetDefaultGateArg &arg) {
   Error err;
-  const bool published = published_.Update([&](const Generation &current) {
+  const bool published = Publish([&](const Generation &current) {
     return Build(current.rules, arg.gate(), &err);
-  });
+  }, &err);
   if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }

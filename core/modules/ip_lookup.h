@@ -32,15 +32,17 @@
 #define BESS_MODULES_IPLOOKUP_H_
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <tuple>
 #include <vector>
 
+#include "../control/runtime_state.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../utils/endian.h"
-#include "../utils/published_generation.h"
+#include "../rcu/rcu_ptr.h"
 
 using bess::utils::be32_t;
 using ParsedPrefix = std::tuple<int, std::string, be32_t>;
@@ -51,7 +53,10 @@ class IPLookup final : public Module {
 
   static const Commands cmds;
 
-  IPLookup() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
+  IPLookup()
+      : Module(), published_(bess::control::runtime().rcu()) {
+    max_allowed_workers_ = Worker::kMaxWorkers;
+  }
 
   CommandResponse Init(const bess::pb::IPLookupArg &arg);
 
@@ -87,7 +92,7 @@ class IPLookup final : public Module {
     gate_idx_t default_gate = DROP_GATE;
   };
 
-  using GenerationPtr = std::shared_ptr<const Generation>;
+  using GenerationPtr = std::unique_ptr<const Generation>;
 
   // Builds a generation from `routes`, or returns nullptr with `*err` set to
   // the errno a caller can report. Called with the writer lock held, or before
@@ -95,12 +100,20 @@ class IPLookup final : public Module {
   GenerationPtr Build(const std::vector<Route> &routes, gate_idx_t default_gate,
                       int *err);
 
+  // Replaces the published generation with `build(current)`, or leaves the
+  // active one alone when the builder returns nullptr (with *err set). The
+  // writer protocol lives here so no call site can publish without retiring,
+  // or retire before publishing (K1).
+  bool Publish(const std::function<GenerationPtr(const Generation &)> &build,
+               int *err);
+
   ParsedPrefix ParseIpv4Prefix(const std::string &prefix, uint64_t prefix_len);
 
-  // Snapshot/publication/reclamation (bess::utils::PublishedGeneration): one
-  // snapshot per batch on the data path, serialized rebuilds off it, and the
-  // retired generation is destroyed here rather than on a packet worker.
-  bess::utils::PublishedGeneration<Generation> published_;
+  // Publication and reclamation (bess::rcu::RcuPtr + the runtime's RcuDomain):
+  // one acquire load per batch on the data path, serialized rebuilds off it,
+  // and the retired generation is destroyed by a control thread rather than on
+  // a packet worker.
+  bess::rcu::RcuPtr<Generation> published_;
   uint32_t max_rules_ = 0;    // from Init(), reused for every rebuild
   uint32_t max_tbl8s_ = 0;
 };

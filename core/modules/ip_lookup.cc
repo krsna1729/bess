@@ -40,7 +40,7 @@
 #include <utility>
 
 #include "../utils/bits.h"
-#include "../utils/published_generation.h"
+#include "../rcu/rcu_ptr.h"
 #include "../utils/ether.h"
 #include "../utils/format.h"
 #include "../utils/ip.h"
@@ -107,11 +107,32 @@ IPLookup::GenerationPtr IPLookup::Build(const std::vector<Route> &routes,
     }
   }
 
-  std::shared_ptr<Generation> gen(new Generation());
+  std::unique_ptr<Generation> gen(new Generation());
   gen->routes = routes;
   gen->lpm = lpm;
   gen->default_gate = default_gate;
   return gen;
+}
+
+bool IPLookup::Publish(
+    const std::function<GenerationPtr(const Generation &)> &build, int *err) {
+  const Generation *current = published_.Read();
+  if (current == nullptr) {
+    *err = EINVAL;
+    return false;  // not initialized (or already deinitialized)
+  }
+
+  GenerationPtr next = build(*current);
+  if (next == nullptr) {
+    return false;  // the builder owns reporting why
+  }
+
+  // Publish, retire the replaced generation against a fresh grace period, and
+  // reclaim whatever readers are already done with. This runs on the control
+  // thread, so a retired `rte_lpm` is destroyed here -- never on a worker.
+  published_.Publish(std::move(next));
+  bess::control::runtime().rcu().ReclaimReady();
+  return true;
 }
 
 CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
@@ -142,7 +163,10 @@ void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   // about routing updates. Holding the shared_ptr for the whole batch means a
   // concurrent command can neither free this table under an in-flight lookup
   // nor swap it mid-batch.
-  const GenerationPtr table = published_.Snapshot();
+  // One acquire load per batch. The pointer is valid until this worker
+  // reaches its next quiescent state, which is why it is used for this
+  // invocation only and never cached across invocations.
+  const Generation *table = published_.Read();
   if (table == nullptr || table->lpm == nullptr) {
     return;  // not initialized, or already deinitialized
   }
@@ -259,7 +283,7 @@ CommandResponse IPLookup::CommandAdd(
   }
 
   int err = 0;
-  const bool published = published_.Update([&](const Generation &current) {
+  const bool published = Publish([&](const Generation &current) {
     std::vector<Route> routes = current.routes;
     gate_idx_t default_gate = current.default_gate;
 
@@ -286,7 +310,7 @@ CommandResponse IPLookup::CommandAdd(
     }
 
     return Build(routes, default_gate, &err);
-  });
+  }, &err);
   if (!published) {
     return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
   }
@@ -306,7 +330,7 @@ CommandResponse IPLookup::CommandDelete(
   int err = 0;
   bool missing = false;
   const bool published =
-      published_.Update([&](const Generation &current) -> GenerationPtr {
+      Publish([&](const Generation &current) -> GenerationPtr {
     std::vector<Route> routes = current.routes;
     gate_idx_t default_gate = current.default_gate;
 
@@ -326,7 +350,7 @@ CommandResponse IPLookup::CommandDelete(
     }
 
     return Build(routes, default_gate, &err);
-  });
+  }, &err);
   if (!published) {
     if (missing) {
       // What rte_lpm_delete() reported before this became copy-on-write.
@@ -341,9 +365,9 @@ CommandResponse IPLookup::CommandDelete(
 CommandResponse IPLookup::CommandClear(const bess::pb::EmptyArg &) {
   // Rules go, the default gate stays -- what rte_lpm_delete_all() did.
   int err = 0;
-  const bool published = published_.Update([&](const Generation &current) {
+  const bool published = Publish([&](const Generation &current) {
     return Build(/*routes=*/{}, current.default_gate, &err);
-  });
+  }, &err);
   if (!published) {
     return CommandFailure(err, "DPDK error: %s", rte_strerror(err));
   }
