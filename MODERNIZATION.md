@@ -2315,7 +2315,7 @@ rather than one call site).
     sample-plugin load 41/41, module integration 22/22 files, wire-parity script
     passes, `git diff --check` clean.
 
-54. **`TBD`** — **Daemon-mode glog recursion fixed by deletion.**
+54. **`05413f53`** — **Daemon-mode glog recursion fixed by deletion.**
     `CloseStdStreams()` redirected the C `FILE*` streams through
     `fopencookie()` callbacks that called `LOG()`. On any glog that writes
     through libc's stderr — absl-based glog 0.7+ does — that is a feedback loop:
@@ -2380,7 +2380,7 @@ pre-fix/post-fix module-test evidence for `a0688fcf` was produced.
 - [ ] **Daemon mode (`bessd` without `-f`) recurses in logging on glog >= 0.7** —
       immediate correctness debt; details in the subsection below.
 
-### 8. Daemon-mode glog recursion — FIXED (`1f6c7f3d`-range commit, entry 54)
+### 8. Daemon-mode glog recursion — FIXED (`05413f53`, entry 54)
 
 **Status: fixed.** `CloseStdStreams()` no longer installs `FILE*` callbacks that
 call `LOG()`; C stdio in daemon mode goes to `/dev/null` by design and the C++
