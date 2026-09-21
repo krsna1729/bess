@@ -255,6 +255,7 @@ if get_option('build_benchmarks')
     'packet_bench': ['packet_bench.cc', benchmark_dep],
     'pmd_bench': ['pmd_bench.cc', benchmark_dep],
     'ring_bench': ['ring_bench.cc', benchmark_dep],
+    'rcu_bench': ['rcu/rcu_bench.cc', benchmark_main_dep],
     'traffic_class_bench': ['traffic_class_bench.cc', benchmark_main_dep],
     'modules_url_filter_bench': ['modules/url_filter_bench.cc', benchmark_main_dep],
     'utils_checksum_bench': ['utils/checksum_bench.cc', benchmark_main_dep],

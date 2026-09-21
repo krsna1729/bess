@@ -234,6 +234,58 @@ TEST_F(RcuPtrTest, ConcurrentWritersAreSerialized) {
   domain_->Unregister(id);
 }
 
+// Publication storm: many generations published while a reader runs, with the
+// reader reporting quiescence in parallel. Nothing may be lost, double-freed,
+// or left behind, and the active generation must never be reclaimed.
+TEST_F(RcuPtrTest, PublicationStormReclaimsEverything) {
+  const ReaderId id = 5;
+  ASSERT_TRUE(domain_->Register(id).has_value());
+  domain_->Online(id);
+
+  published_->Initialize(std::make_unique<const State>(0));
+
+  constexpr int kGenerations = 2000;
+  std::atomic<bool> stop{false};
+  std::atomic<int> reader_rounds{0};
+
+  std::thread reader([&]() {
+    while (!stop.load()) {
+      domain_->Quiescent(id);
+      reader_rounds++;
+      // A reader that keeps using the published pointer across the storm.
+      const State *state = published_->Read();
+      EXPECT_NE(nullptr, state);
+    }
+  });
+
+  for (int i = 1; i <= kGenerations; i++) {
+    published_->Publish(std::make_unique<const State>(i));
+    // The control side reclaims as it goes; nothing waits for readers here.
+    domain_->ReclaimReady();
+  }
+
+  stop.store(true);
+  reader.join();
+  EXPECT_GT(reader_rounds.load(), 0);
+
+  // The reader must leave the domain before a blocking Synchronize: an online
+  // reader that has stopped reporting would hold the grace period forever,
+  // which is exactly the offline-before-blocking rule in the other direction.
+  domain_->Offline(id);
+  domain_->Synchronize();
+  domain_->ReclaimReady();
+
+  EXPECT_EQ(1, State::alive) << "exactly the active generation may remain";
+  EXPECT_EQ(0u, domain_->Stats().pending_retired_objects);
+  EXPECT_EQ(static_cast<uint64_t>(kGenerations),
+            domain_->Stats().objects_retired);
+  EXPECT_GE(domain_->Stats().objects_reclaimed,
+            static_cast<uint64_t>(kGenerations));
+  EXPECT_EQ(kGenerations, published_->Read()->value);
+
+  domain_->Unregister(id);
+}
+
 // Teardown invariant: an RcuPtr must not be destroyed while a reader could
 // still be holding what it published.
 TEST_F(RcuPtrTest, DestroyWithOnlineReaderIsADebugFailure) {
