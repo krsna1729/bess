@@ -97,33 +97,54 @@ daemon through sudo.  Local verification used the same gRPC reset/run path
 against a foreground `bessd -skip_root_check -m 0`, avoiding sudo while
 exercising all 22 module test files.
 
-## Phase E: Meson cutover
+### Build invariants
 
-Phase E is complete when this branch lands: Meson is the sole BESS build
+- Meson/Ninja is the sole BESS build system.
+- Do not restore `core/Makefile`.
+- Do not restore top-level `build.py` as a BESS build orchestrator.
+- DPDK is external and consumed through `pkg-config`.
+- DPDK source/version/checksum has one tracked source of truth: `deps/dpdk.json`.
+- Generated C++ and Python protobuf artifacts live in the build tree.
+- The source tree should remain clean after a normal build/test.
+- Cap local build parallelism at `-j4` on memory-constrained development systems.
+- C++23 is the production baseline.
+- C++26 remains experimental and must not become a project-wide production requirement yet.
+
+---
+
+
+## Phase E: Meson cutover — COMPLETE
+
+Phase E is closed as of `e8c8e176` on `develop`. Meson is the sole BESS build
 entrypoint; DPDK bootstrap is separate and checksum-pinned; C++ and Python
 protobuf generation is build-tree-only; native unit tests, Python tests,
 module integration, benchmarks, sample plugin, install layout, and AF_XDP
-artifact checks are first-class Meson targets.  No dataplane ownership,
+artifact checks are first-class Meson targets. No dataplane ownership,
 `MBUF_FAST_FREE`, `PortOut`, plugin ABI, or DPDK-version behavior changes are
 part of this phase.
+
+CI (`35615217363` at `e8c8e176`) is green for both `Meson (gcc)` and
+`Meson (clang)`: bootstrap, configure, build, AF_XDP artifact checks, all
+Meson tests, install staging, and the installed Python client smoke all pass.
+
 Phase E intentionally does not publish an external plugin-development package:
 installed BESS headers and pkg-config/Meson dependency metadata remain part of
-the later plugin-ABI work.  The in-tree sample plugin is the only supported
+the later plugin-ABI work. The in-tree sample plugin is the only supported
 plugin build surface for this phase.
 
-The installed tree also does not provide a `bin/bessctl` entrypoint.  The
-control-plane CLI remains source-tree tooling while its redesign is pending;
-Phase E verifies the installed Python API separately.
+The installed tree also does not provide a `bin/bessctl` entrypoint. The
+control-plane CLI remains source-tree tooling while its redesign is pending
+(see §14.4 in the roadmap); Phase E verifies the installed Python API
+separately.
 
 ## Status snapshot
 
-This log records the Meson cutover delivered in `c02f41ef` on `develop`;
-the working tree is clean after the follow-up log update.
-
-The active build graph is Meson/Ninja only.  GCC and Clang full Meson compiles
-succeed with the pinned DPDK 25.11.3.  GCC verification passes all 28 native
-C++ tests, both Python targets, all 10 benchmark smoke tests, the PMD null/ring
-smoke, and the sample-plugin registry load.  The 22-file module integration
+Phase E is closed. The next work follows the order in the roadmap below:
+the modern-glog daemon-mode fix, then G0, then K1-K8, then G1. The active
+build graph is Meson/Ninja only. GCC and Clang full Meson compiles succeed
+with the pinned DPDK 25.11.3. GCC verification passes all 28 native C++
+tests, both Python targets, all 10 benchmark smoke tests, the PMD null/ring
+smoke, and the sample-plugin registry load. The 22-file module integration
 run passes against a no-hugepage daemon; `-Daf_xdp=required` configuration,
 install staging, generated build-tree protobuf imports, and source-tree
 hygiene checks also pass.
@@ -1820,6 +1841,59 @@ pre-fix/post-fix module-test evidence for `a0688fcf` was produced.
 
 ## Known issues / explicit follow-ups (not yet fixed)
 
+- [ ] **Daemon mode (`bessd` without `-f`) recurses in logging on glog >= 0.7** —
+      immediate correctness debt; details in the subsection below.
+
+### 8. Immediate known software bug: daemon-mode glog recursion
+
+A pre-existing daemon-mode bug was exposed during Meson verification on systems with glog >= 0.7.
+
+Observed shape:
+
+```text
+bessd daemon mode
+  ↓
+CloseStdStreams()
+  ↓
+stdout/stderr replaced by cookie-backed FILE*
+  ↓
+cookie callback calls LOG(...)
+  ↓
+newer glog writes log output back to that FILE*
+  ↓
+callback calls LOG(...)
+  ↓
+recursive logging until stack overflow / segfault
+```
+
+The observed backtrace alternates through approximately:
+
+```text
+LogMessage::Flush
+SendToLog
+fwrite
+BESS cookie callback
+LOG
+...
+```
+
+with BESS frames around `core/bessd.cc:303/305`.
+
+Ubuntu CI currently uses an older glog where this does not reproduce because stderr logging behavior differs, so green CI does not prove daemon mode is safe on modern glog.
+
+#### Required follow-up
+
+Fix this independently before relying on daemonized operation on glog >= 0.7.
+
+The fix should ensure the replacement stdio sink cannot recursively enter glog.
+
+Do not mix this bug fix into G0 transaction semantics.
+
+Add a regression test or process-level smoke that launches actual daemon mode under a modern glog implementation if practical.
+
+---
+
+
 - [x] **Per-queue PMD stats** (`pmd.cc`) — investigated further; this was
       over-scoped in the original DPDK-port writeup. What DPDK actually
       removed is `rte_eth_stats::q_ipackets/q_ibytes/q_errors/...`, a
@@ -1890,19 +1964,61 @@ pre-fix/post-fix module-test evidence for `a0688fcf` was produced.
 
 # Roadmap / Backlog
 
-Organized in phases. Phases A–F are the original DPDK-era modernization plan
-(mostly still ahead of us — Phase A is done, and Phase B's Stages 1, 2A,
-and 2B have landed; Phases C–F remain). Phases G–I are a newer,
-larger proposal — a from-first-principles rethink of the control plane and
-language/tooling stack — added 2026-09-11.
-**G and the A–F track are largely independent** (G touches `bessctl`/gRPC/the
-client side; A–F touch the dataplane/DPDK/build side); either can proceed
-first. Read the "how G relates to A–F" note at the start of Phase G before
-picking one. Phase J (RCU/QSBR live table updates) was added 2026-09-18
-from an external DPDK-modernization review and is cross-cutting — see its
-own intro for why it doesn't fit under A–I.
+## Order of work
 
-## Phase A — DPDK/build modernization (complete as of 2026-09-12)
+The active order is deliberately **not** phase-number order (consolidated roadmap
+§1 and §26):
+
+```text
+fix modern-glog daemon mode            (known issues, §8)
+  |
+  v
+G0   C++ transactional control-plane core                 §9
+  |
+  v
+K1   generic RCU/QSBR publication and reclamation
+K2   ActionId + immutable action/object tables
+K3   unified runtime-schema classifier framework
+K4   packet parsing/mutation primitives
+K5   generic software metering
+K6   worker-local statistics/snapshots
+K7   route and next-hop abstraction
+K8   generic fragmentation/reassembly                     §10
+  |
+  v
+G1   desired-state API + Go/C++ SDKs + C++ bessctl        §14
+  |
+  v
+D    ARM64 / runtime SIMD / rte_bpf                       §16
+  |
+  v
+F    release, packaging, observability, CI                §17
+  |
+  v
+H/I  language / tooling / type-safety hardening           §18, §19
+```
+
+Hardware-gated work is parked under **Phase C-HW** (§5) and must not block this
+sequence.
+
+### Naming map: older roadmap text -> current sections
+
+| older heading | subject | current home |
+|---|---|---|
+| `Phase G — C++-only control plane` (including its older `G1` "compatible" / `G2` "breaking" variants) | control-plane redesign | §9 **G0** (transactional core) + §14 **G1** (desired-state API and SDKs); the compatible-vs-breaking wire decision now lives in §14.2 |
+| `Phase D — ARM64 + portable SIMD` | ARM64 / SIMD / `rte_bpf` | §16 |
+| `Phase F — Ops / release automation` | releases / observability | §17 |
+| `Phase H — C++23/26 tooling adoption` | language / tooling | §18, plus the retained 2026-09-17 research detail |
+| `Phase I — Compile-time invalid-state prevention` | type safety | §19 |
+| new `Phase K` | generic dataplane substrate | §10; no older counterpart |
+| older `Phase C` items | Linux I/O | software items are complete (worker/lcore decoupling: entry 33); hardware items are parked in §5 |
+
+The benchmark/experiment backlog is retained verbatim at the end of this
+document; source comments cite its item numbers.
+
+## Completed phases
+
+### Phase A — DPDK/build modernization (complete as of 2026-09-12)
 
 - [x] DPDK 19.11.4 → 25.11.3 LTS port (commits 3–4 above)
 - [x] Verify the rewritten CI workflow actually passes on GitHub Actions
@@ -1925,7 +2041,8 @@ own intro for why it doesn't fit under A–I.
       new finding). Header-level verification is the strongest check
       available here.
 
-## Phase B — Packet/mbuf architecture
+
+### Phase B — Packet/mbuf architecture
 
 End state: stop mirroring `rte_mbuf` byte-for-byte in a C++ packet object.
 `PacketHandle` is the transport/ownership representation (`rte_mbuf *`);
@@ -1958,7 +2075,7 @@ The benchmark comparison and observed native-API costs are recorded in the
 completed Stage 2B section below. Follow-up performance work must preserve
 the native representation rather than reintroduce an overlay.
 
-### Stage 1 — explicit private-area accessor (done, commit 16)
+#### Stage 1 — explicit private-area accessor (done, commit 16)
 
 Give `Packet`'s pool-bookkeeping/metadata/scratchpad area (today the
 `reserve_` union) an explicit, named type (`bess::BessPacketPrivate`,
@@ -1997,7 +2114,7 @@ The `rte_mbuf`-mirroring union and `CheckMbufLayout()` were intentionally
 left in that Stage 1 commit and were removed by the completed Stage 2B
 cutover.
 
-### Stage 2A — `PacketHandle`/`PacketRef` seam and consumer migration (done)
+#### Stage 2A — `PacketHandle`/`PacketRef` seam and consumer migration (done)
 
 Stage 2A landed the storage/processing boundary without changing packet
 layout or allocator representation. `PacketHandle` names the stored packet
@@ -2029,7 +2146,7 @@ throughput in Mpps at burst sizes 1/2/4/8/16/32.
 | `BM_PmdRingRoundTrip` | 6.50 | 12.50 | 25.13 | 48.58 | 89.02 | 159.25 |
 | `BM_PmdRingRoundTripEndToEnd` | 55.05 | 89.32 | 123.28 | 218.26 | 331.13 | 466.06 |
 
-### Stage 2B — native `rte_mbuf *` handle and `PacketRef` backend (done)
+#### Stage 2B — native `rte_mbuf *` handle and `PacketRef` backend (done)
 
 Stage 2B replaced the legacy overlay with native DPDK pktmbuf storage.
 `PacketHandle` is `struct rte_mbuf *`; `PacketBatch` arrays therefore cross
@@ -2083,7 +2200,7 @@ specialized lifecycle through native DPDK raw bulk APIs while retaining checked
 generic fallback for non-simple ownership cases. No overlay restoration is
 planned.
 
-#### Stage 2B final Candidate-C acceptance signoff
+##### Stage 2B final Candidate-C acceptance signoff
 
 The final standardized comparison used A = final Stage 2A (`0d4da18a`), B =
 the original native Stage 2B (`493dc520`), and C = the final Candidate-C
@@ -2187,7 +2304,7 @@ changes, and real-NIC/cross-worker measurements remained future work.
 Stage 2C below records the portions now implemented, including the internal
 PMD capability and RX MTU/scatter foundation.
 
-### Stage 2C.1 — variable packet data-room sizing (first substage)
+#### Stage 2C.1 — variable packet data-room sizing (first substage)
 
 `PacketPool` now accepts a payload data-room size independently of pool
 capacity. The value is retained as a pool property, exposed through
@@ -2230,7 +2347,7 @@ sibling CPU 3 was offline for the runs. Both packet and PMD suites used
 repeatable regression requiring investigation; CPU scaling remained enabled,
 so the numbers are protocol-consistent but not a fixed-frequency claim.
 
-### Stage 2C.2 — jumbo and multisegment policy
+#### Stage 2C.2 — jumbo and multisegment policy
 
 Stage 2C supports both jumbo representations:
 
@@ -2265,7 +2382,7 @@ partial-chain allocation cleanup, and deep copies of chained bytes. The
 `net_ring` PMD benchmark covers chained RX/TX and a large external-backed
 packet round trip.
 
-### Stage 2C.3 — external-buffer plumbing
+#### Stage 2C.3 — external-buffer plumbing
 
 `PacketPool::AllocExternal()` accepts a caller-managed buffer, IOVA, length,
 and `rte_mbuf_ext_shared_info`, validates the DPDK external-buffer contract,
@@ -2281,7 +2398,7 @@ benchmark exercises an external-buffer receive/transmit round trip. AF_XDP
 and vhost-specific adapters still require their device integrations; this
 substage supplies the common native mbuf plumbing they can consume.
 
-### Stage 2C.4 — clone semantics
+#### Stage 2C.4 — clone semantics
 
 `PacketClone()` is explicitly shallow: it creates independent mbuf headers
 that share every payload segment, including external-buffer storage and its
@@ -2309,7 +2426,7 @@ measured 64.0 ns versus the 65.6 ns pinned reference, so the signal was not
 repeatable. No regression investigation was triggered. CPU scaling remained
 enabled, so these measurements are not a fixed-frequency claim.
 
-### DPDK-proposal review notes (2026-09-18)
+#### DPDK-proposal review notes (2026-09-18)
 
 An Opus review of an external DPDK-modernization proposal (see this doc's
 "Roadmap / Backlog" intro and the new Phase J below for the full context)
@@ -2351,7 +2468,7 @@ against the tree at `705782b3`:
   another DPDK subsystem that reads them — not for BESS's own logical
   attributes.
 
-### Benchmark suite (added 2026-09-12, commit 14)
+#### Benchmark suite (added 2026-09-12, commit 14)
 
 Correcting an error in this doc's own earlier text (both here and in Phase
 H below both used to claim "this repo does not have one yet"): **BESS
@@ -2404,7 +2521,8 @@ testing goes through `bessctl/module_tests/*.py` against a running
 (`TCWeightedFair`/`TCRoundRobin` scheduling), which covers the
 "scheduler throughput" leg of Phase B's requirement in full.
 
-## Phase C — Linux I/O modernization
+
+### Phase C — Linux I/O modernization
 
 - [x] `core/kmod` (the legacy out-of-tree VPort kernel module -- `sn_host.c`,
       `sn_netdev.c`, `sn_ethtool.c`, `sndrv.c`, `sn_kernel.h`, its own
@@ -2662,398 +2780,1049 @@ testing goes through `bessctl/module_tests/*.py` against a running
       caller-chosen `thread_id`, not an lcore ID, so the two migrations
       are independent and don't need to be sequenced).
 
-## Phase D — ARM64 + portable SIMD
 
-Add `core/arch/{generic,x86,arm64}/` with a correct scalar reference
-implementation always available; x86 SSE/AVX and ARM NEON selected at
-startup via one dispatch per batch (not per packet/byte). Harvest upstream
-PR `#1041` (ARM support) as reference material, not a mergeable diff — it
-predates this DPDK port and the packet-layout work.
+### Phase E — Meson cutover — COMPLETE
 
-- [ ] **Replace the BPF module's execution backend with `rte_bpf`
-      (experiment, strong prior toward adoption)** — DPDK-proposal review,
-      2026-09-18, the single best maintenance-reduction candidate it
-      found. `core/utils/bpf.cc` is **1066 lines of hand-written x86-64
-      machine-code emission**, adopted from FreeBSD 10, that `mmap()`s a
-      writable buffer, emits opcodes into it, and `mprotect()`s it
-      executable. The entire file is inside `#ifdef __x86_64`; on every
-      other architecture `BPF::Match()` (`core/modules/bpf.cc`) falls back
-      to libpcap's `bpf_filter()` **interpreter** -- i.e. ARM64 currently
-      gets no JIT at all for this module. DPDK 25.11 ships
-      `rte_bpf_convert(const struct bpf_program *)`, which takes exactly
-      what `pcap_compile_nopcap()` already produces
-      (`core/modules/bpf.cc`), plus `rte_bpf_load()`/`rte_bpf_get_jit()`/
-      `rte_bpf_exec_burst()`. `librte_bpf.a` is **already linked into
-      `bessd`** (`libdpdk.pc`'s `--whole-archive` list) -- zero new
-      dependency. If throughput is comparable, this deletes a home-grown
-      JIT (a real security/maintenance liability -- BESS writes executable
-      memory at control-plane request) and gives ARM64 a real JIT instead
-      of an interpreter, i.e. Phase D parity, for free. Caveats to settle
-      in the experiment, not assume: DPDK BPF isn't full eBPF (no maps,
-      limited tail calls -- irrelevant for cBPF filters; don't let this
-      become "BESS gets eBPF"); BESS's current JIT returns `SNAPLEN` on
-      match / `0` otherwise while converted cBPF returns the program's own
-      return value, so `Match()`'s `!= 0` test needs re-checking against
-      the new semantics; `rte_bpf_load()` may need an EAL-initialized
-      process, which the module-command path already satisfies
-      (`current_worker.SetNonWorker()` is called there for exactly this
-      reason) but should be confirmed. 26.07 adds direct cBPF loading and
-      a hardened validator, making this direction cleaner after a future
-      DPDK bump -- not a reason to wait, since 25.11 already has everything
-      needed.
-- [ ] **Runtime maximum-SIMD-width policy, not just CPU detection**
-      (DPDK-proposal review, 2026-09-18). DPDK deliberately doesn't always
-      select AVX-512 even when available, letting the application cap the
-      vector width, because AVX-512 can speed up one kernel while costing
-      enough core-frequency throttling to slow the whole pipeline down.
-      Today BESS has **no runtime dispatch at all** -- ISA selection is
-      entirely compile-time (`#if __AVX2__` in `core/utils/{copy,checksum,
-      simd,bits}.h`, `#if !__SSE4_2__` in `simd.h`, plus bare
-      `<x86intrin.h>` includes in `core/modules/set_metadata.cc` and
-      `core/modules/http_parser.cc`), under `-march=$(CPU)` with
-      `CPU ?= native` (which is also why CI needed `CPU=corei7`, commit
-      15 in the completed-work log). Phase D's dispatch layer should bind
-      implementation pointers from `min(detected ISA, configured policy)`,
-      with the policy settable at startup, not from detected ISA alone.
-      **Two x86-only hot blocks Phase D must take ownership of**, both
-      found by the same review: `PacketPool::AllocBulk()`'s
-      `_mm_store_si128` mbuf-reset (`core/packet_pool.cc` -- also a Phase
-      B Stage 2 blocker, coordinate with that phase) and
-      `IPLookup::ProcessBatch()`'s `_mm_set_epi32`/`_mm_shuffle_epi8`
-      address gather (`core/modules/ip_lookup.cc`, see the `rte_fib` item
-      below for a way to delete it outright rather than port it).
-- [x] **Benchmark `rte_fib` vs `rte_lpm` for `IPLookup` — done 2026-09-19,
-      entry 34 (`e55fb8a2`): FIB not adopted, so the deletion is *not*
-      available yet.** The SSE gather block stays and `IPLookup` keeps
-      `rte_lpm` (which also settles the table representation Phase J's
-      pilot should build on). Reason is correctness, not speed: at 512K
-      routes inserted in arbitrary order `rte_fib` returns next hops
-      matching no rule, order-dependently, while `rte_lpm` passes the same
-      independent-LPM gate in both orders; FIB's *build* and *update* costs
-      are dramatically better (17x cheaper delete+add at 64K), so if a DPDK
-      fix lands, re-enable the benchmark's 512K FIB case and revisit —
-      `core/fib_bench.cc` is the guard for that. Original scoping text
-      (DPDK-proposal review, 2026-09-18) — the value here is a deletion, not
-      necessarily a speedup. Correction to the source proposal's own framing: BESS does
-      *not* hand-code the x4 lookup itself -- it already calls DPDK's own
-      `rte_lpm_lookupx4()` (`core/modules/ip_lookup.cc`). What BESS *does*
-      hand-code is the x86-only SSE **gather** feeding it (`_mm_set_epi32`
-      + `_mm_shuffle_epi8`, same file, inside an ISA `#if`).
-      `rte_fib_lookup_bulk()` takes a plain `uint32_t[]`, so migrating
-      would let BESS **delete that intrinsic block outright** and get
-      DPDK's runtime-dispatched (including AVX-512, and NEON where
-      available) lookup instead -- directly serving Phase D's stated goal
-      of replacing BESS-local intrinsics with runtime dispatch.
-      `librte_fib.a` is already linked. Both `rte_fib` and `rte_lpm`
-      implement DIR24_8 internally, so raw lookup speed is likely a wash
-      on small tables -- benchmark with realistic route populations (small
-      edge table, near-full IPv4, mostly-/24, mixed prefix lengths,
-      update-heavy), not random prefixes, and keep `rte_lpm` if it wins;
-      the deletion is the win, not a guaranteed speedup. `rte_fib` also
-      has native RCU integration, making it a natural second pilot for
-      Phase J below if the migration happens.
+See the Phase E summary and CI evidence at the top of this document.
 
-## Phase E — Build system: migrate BESS itself to Meson
+### Phase J — Live table updates without stopping the world (done 2026-09-19: entries 35-38)
 
-Only after Phase A/B's DPDK-facing churn has fully settled — bisecting a
-simultaneous build-system + API migration is much harder than doing them in
-sequence. `core/Makefile` can serve as the bridge in the meantime (it already
-does, post-Phase-A: DPDK is consumed via pkg-config exactly the way a Meson
-build would too).
+Cross-cutting phase, not a natural fit under A–I: touches the control
+plane (Phase G), the module command API, and the scheduler loop. Emerged
+from an Opus review of an external DPDK-modernization proposal (see the
+"Roadmap / Backlog" phases above for where its other findings landed, and
+"Rejected" / "Benchmark backlog" below for the rest).
 
-## Phase F — Ops / release automation
+**The problem, as actually measured in this tree** (the external proposal
+described this mechanism, and got it wrong in a way that *understated* the
+real cost): BESS today cannot update a rule table on a running pipeline at
+all. `ModuleBuilder::RunCommand()` (`core/module.cc`) **refuses** any
+command not marked `Command::THREAD_SAFE` with `EBUSY` whenever
+`Module::HasRunningWorker()` (`core/module.h`) is true; `bessctl`'s
+`command_module` (`bessctl/commands.py`) works around that by calling
+`pause_all()` before **every** module command -- thread-safe ones
+included -- and `resume_all()` after. `pause_all` blocks every worker on
+an `eventfd` read (`core/worker.cc`). There are **45 `THREAD_UNSAFE`
+commands across 22 module files**, including `ACL::CommandAdd`,
+`IPLookup::CommandAdd`/`Delete`, `ExactMatch::CommandAdd`/`Delete`/
+`SetRuntimeConfig`, `BPF::CommandAdd`/`Delete`, and `Queue::CommandSetSize`.
+Net effect: **adding one ACL rule or one route stops packet processing on
+every worker in the process.**
 
-Pin DPDK download by version+checksum (not just URL); produce signed
-OCI images (amd64+arm64), a `.deb`, a `pybess` wheel, and an SBOM per
-release; add Renovate/Dependabot. Revive per-queue/pool/scheduler metrics
-(old upstream PR `#1007` had the right idea) as a small Prometheus exporter
-outside the dataplane hot path.
+**The mechanism**: replace pause-mutate-resume with build-publish-reclaim
+-- construct a replacement table off the dataplane, atomically publish the
+pointer (release store), let workers keep running, wait for a grace
+period, then destroy the old table.
 
-- [x] **Made `DumpMempool()` backend-independent** (2026-09-18, entry 31).
-      Original proposal text (DPDK-proposal review, 2026-09-18):
-      `core/bessctl.cc` does
-      `reinterpret_cast<struct rte_ring*>(mempool->pool_data)`, which is
-      only valid because `PacketPool::PacketPool()` hardcodes
-      `rte_mempool_set_ops_byname(pool_, "ring_mp_mc", ...)`
-      (`core/packet_pool.cc`). Not a live bug today -- correct by
-      construction, same shape as Phase A's two ABI-drift bugs and Phase
-      B Stage 1's `mt_offset_to_databuf_offset` -- but it's a hard blocker
-      on ever evaluating another mempool backend (see the benchmark
-      backlog below). Rewrite using `rte_mempool_avail_count()`/
-      `rte_mempool_in_use_count()`/`rte_mempool_dump()`. **Do this before,
-      not during, the mempool-backend benchmark.**
-- [ ] **DPDK telemetry / `pdump` / CTF tracing** (DPDK-proposal review,
-      2026-09-18) — mostly not worth pursuing, recorded so it isn't
-      re-proposed cold:
-      - Telemetry v2: don't build a second, competing monitoring API next
-        to BESS's own control plane. If ever used, it's a *source* for
-        this phase's Prometheus exporter (DPDK-native diagnostics, PMD
-        xstats), not a user-facing surface. Unverified: whether it
-        actually initializes given `bessd` passes `--no-shconf` (see
-        `pdump` below for why that flag matters) -- needs a live check
-        before relying on it for anything.
-      - `pdump`/`dumpcap`: **blocked today, not just low-priority.**
-        `dpdk-pdump`/`dpdk-dumpcap` are DPDK secondary processes;
-        `bessd` passes `--no-shconf` (`core/dpdk.cc`), which makes
-        `rte_eal_config_create()` return early without creating the
-        shared-memory config a secondary process needs to attach to. Its
-        own comment explains why: so BESS doesn't interfere with other
-        DPDK applications. Adopting `pdump` means giving that up -- a real
-        trade-off, not a free diagnostic win. Not worth it: BESS's gate
-        hooks already capture at arbitrary internal graph locations,
-        which `pdump` can't reach anyway (NIC-boundary only).
-      - CTF tracing: the motivating pitch (that it would have helped find
-        this session's worker-teardown concurrency bugs) doesn't hold up
-        -- commit 7's `std::terminate()` bug was found by *reproducing a
-        crash*, and the `all_tcs_` race was found by *reasoning about an
-        unsynchronized global*, neither of which a timestamped event log
-        surfaces. `rte_trace` instruments DPDK's own internals; adopting
-        it for BESS-defined events would be a modest improvement over
-        interleaved glog lines at best. Low priority, park it.
-- [ ] **DPDK version discipline: stay on 25.11.3 LTS through Phase B–D**
-      (DPDK-proposal review, 2026-09-18). 26.03/26.07 have relevant work
-      (hash RCU deferred-free, richer BPF including direct cBPF loading
-      and a hardened validator, ACL custom allocators), but none justifies
-      leaving a stable baseline mid-refactor. **One forward hazard to
-      pre-register**: DPDK 26.07 reportedly changes the mempool cache
-      refill/flush algorithm and makes effective cache size match the
-      requested size, with an upstream warning that pipelined applications
-      allocating on one lcore and freeing on another may need retuning --
-      which describes BESS's `PortInc(worker A) → Queue → PortOut(worker
-      B)` shape exactly (unverified here against the actual 26.07 release
-      notes; flagged from the source review, worth confirming before it
-      matters). The mempool cache-size benchmark in the backlog below
-      should exist *before* the next DPDK bump, so the bump has a
-      baseline to compare against, not after.
+**Which `RcuDomain` backend to actually build first: C++-native, not
+DPDK** (design note added 2026-09-18, answering a direct question).
+Real options, in increasing order of "how much you're building yourself":
+`std::shared_mutex` (not RCU at all, a reader-writer lock -- every read
+pays a real lock even with zero writer activity, strictly worse than any
+RCU-style approach for this access pattern, mentioned only as the naive
+baseline); `std::atomic<std::shared_ptr<T>>` ("RCU via refcounting" --
+`std::atomic_load`/`_store` on a `shared_ptr`, reclamation is automatic
+because the refcount *is* the grace-period tracking, at the cost of a
+real atomic op per access); a hand-rolled epoch-based scheme with
+`std::atomic` (reimplementing QSBR's algorithm yourself: readers store a
+relaxed/release epoch counter once per loop iteration, writers defer
+freeing until all readers have advanced past the retirement epoch --
+same performance ceiling as DPDK's QSBR, but every memory-ordering detail
+is now this project's problem); `rte_rcu_qsbr` (the same algorithm as
+the hand-rolled version, already written, already tested in a networking
+context, and `librte_rcu.a` is **already linked into `bessd`** -- no new
+dependency, reader cost is one `rte_rcu_qsbr_quiescent()` store per
+`Scheduler::ScheduleLoop()` iteration); and C++26 `std::rcu`/hazard
+pointers (not production-ready anywhere yet, per Phase H -- the eventual
+target, not a near-term option).
+
+**Recommendation: prototype the first backend as
+`std::atomic<std::shared_ptr<T>>`, not the hand-rolled epoch scheme and
+not `rte_rcu_qsbr` yet.** Two reasons, both concrete rather than
+theoretical: (1) this session already found a real, hard-to-reproduce
+concurrency bug in this exact codebase's hand-rolled synchronization
+(`worker.cc`/`all_tcs_`, commits 6-8) -- a live argument against adding a
+*second* bespoke concurrency primitive when a well-tested one exists, and
+`shared_ptr`'s refcounting needs no separate "prove the grace period
+elapsed" logic to get right at all, unlike either epoch-based option; (2)
+BESS processes packets in batches of `PacketBatch::kMaxBurst = 32`, not
+one at a time -- if the RCU-protected read happens once per
+`ProcessBatch()` call (grab a stable table reference for the whole
+batch, not once per packet), the atomic refcount cost amortizes over 32
+packets, meaningfully weakening the usual "shared_ptr is too slow for
+RCU" argument for BESS's specific access pattern. Phase J's own
+acceptance criterion is explicitly capability, not a `*_bench.cc` number
+-- so the honest performance bar to clear here is low. Swap the backend
+to `rte_rcu_qsbr` behind the same `RcuDomain` interface later only if
+profiling actually shows the refcount cost matters, as a measurement,
+not an assumption. **Caveat if that swap ever happens**: `rte_rcu_qsbr`'s
+writer side would need the control-plane thread (handling gRPC commands,
+not currently EAL-registered) to either call `rte_thread_register()`
+once at startup or have a worker perform the actual reclaim on the
+control plane's behalf via a deferred/queued mechanism -- a real design
+detail to work out then, not automatic.
+
+**Independent of the `WorkerId`/lcore-ID migration** (Phase C, above):
+`rte_rcu_qsbr_thread_register()` takes a caller-chosen `thread_id`, not an
+lcore ID -- BESS can pass `wid` directly, today, with no prerequisite.
+
+**Scope discipline -- do exactly one pilot first.** `IPLookup` is the best
+candidate: its table is already an opaque `rte_lpm*` behind a single
+pointer, its three mutating commands are all `THREAD_UNSAFE`, the
+rebuild-and-swap cost is bounded, and `rte_fib` (Phase D, above) has
+native RCU support if the table migrates there anyway. `ExactMatch` is the
+natural second. Only after two modules work should this generalize into a
+`Module`-level contract. *(Status: complete. `IPLookup` (entry 35) and
+`ExactMatch` (entry 36, plus the review-follow-up fixes `a0688fcf`) publish
+generations instead of mutating live tables; the snapshot, publication and
+writer-side reclamation mechanism they share lives in
+`bess::utils::PublishedGeneration` (entry 37); and the capability is reachable
+through the normal CLI, which now pauses only for commands the daemon reports
+as not thread-safe (entry 38). Deliberately out of scope, unchanged: QSBR/RCU
+machinery, the `ModuleGraph`/traffic-class tree, and removing the
+user-supplied `ARG_TYPE` from `command module`.)* Explicitly **not** in scope for the first pass:
+RCU-swapping the `ModuleGraph`, gate adjacency, or the traffic-class tree
+-- those are Phase G/H territory (live reconfiguration), not this phase's
+narrower table-update goal.
+
+**Stated non-goal, so it isn't over-claimed later:** this would **not**
+have prevented any bug in this session's log. The `worker.cc`/`all_tcs_`
+defects (commits 6-8, see completed-work log above) are a writer-writer
+race on an unsynchronized global map during concurrent teardown plus a
+thread-lifetime bug; QSBR protects readers from writers and needs its own
+writer serialization. Phase I's existing non-goal note on those bugs
+applies here unchanged -- this is a capability improvement for
+control-plane table updates, not a concurrency-bug-prevention mechanism.
+
+**Judge this by the right metric.** This is a *capability* change (update
+rules on a live pipeline), not a throughput change -- it will not move any
+number in `core/*_bench.cc`. The acceptance test is a live one: drive a
+`Source → IPLookup → Sink` pipeline at a steady rate while adding/removing
+routes, and show zero packet loss and zero throughput dip across the
+update, versus today's full stop.
 
 ---
 
-## Phase G — C++-only control plane (proposed 2026-09-11, not started)
 
-**Read this before starting:** `bessd` **already implements its control
-plane in C++** — `core/bessctl.cc` is the gRPC `BESSControl::Service`
-implementation (create ports/modules, connect gates, pause/resume workers,
-stats, ~67KB of C++). Python's actual role today is: gRPC *client*
-(`pybess/bess.py`), interactive CLI (`bessctl/cli.py`, `bin/bessctl`),
-`.bess` DSL interpreter (executable-Python-flavored config language, see
-`bessctl/sugar.py`), and test/tooling layer. This phase is about replacing
-*that* layer, not touching the dataplane or (in the compatible variant) the
-daemon's RPC surface. It is therefore independent of Phases A–F and can be
-staffed/scheduled separately.
+## 9. Phase G0 — C++ transactional control-plane core — NEXT
 
-Two variants are on the table — **get explicit user sign-off on which one
-before writing code**, since G2 is an intentional breaking change to the
-wire API:
+This is the next major architecture surgery.
 
-### G1 — Compatible variant (keep the existing gRPC API)
+The goal is **not** "make every client C++".
 
-Reach C++ feature parity with the Python client *while Python still works*,
-then make Python optional. Sequence (each step independently shippable):
+The goal is:
 
-1. Extract a `ControlPlane` C++ class from `core/bessctl.cc` so the gRPC
-   handlers become thin adapters (`FromProto → ControlPlane call → ToProto`)
-   instead of having business logic inline in RPC handlers. This benefits
-   *everything* downstream (CLI, tests, a future REST/gNMI surface) and is
-   good groundwork regardless of whether G1 or G2 proceeds further.
-2. Build `libbessclient`: a typed C++ wrapper (`class BessClient`) around the
-   generated gRPC stubs — `expected<PortInfo, Error> create_port(...)` etc.,
-   not raw protobuf manipulation at call sites.
-3. Build a minimal C++ `bessctl` (new `tools/bessctl/` or `cli/`) covering
-   `show`/`list`/`create`/`destroy`/worker ops/module commands — enough for
-   parity on the common path, not everything on day one.
-4. Interactive completion/help parity (daemon-driven: `bessd` should expose
-   `ListModuleClasses`/`DescribeModuleClass`/`ListPortDrivers`/etc.
-   reflection RPCs so the CLI doesn't need to statically know every module's
-   shape — this also kills `pybess`'s current dynamic-import-scanning trick
-   for discovering `*Arg`/`*Response` message types, replacing it with
-   protobuf descriptor reflection).
-5. Define a `GraphSpec`/`Pipeline` protobuf message (ports+modules+
-   connections+workers+traffic-classes as one struct) as a common IR that
-   `.bess` files, a new C++ DSL, YAML/TOML, or hand-written C++ can all
-   compile down to. Add an `ApplyGraph` RPC that validates/plans/commits as
-   one atomic-ish operation instead of the current one-RPC-per-mutation
-   sequence (`ResetAll; CreatePort; CreateModule; ...; ConnectModules; ...`).
-6. New C++ config parser targeting `GraphSpec` (see "DSL note" below).
-7. Automated compatibility corpus: every existing `.bess` file in the repo
-   (and any others available) run through both the old Python path and the
-   new C++ path, diffed.
-8. Port module/integration tests from Python (`bessctl/module_tests/*.py`)
-   to a C++ harness (GoogleTest-based `PipelineTest` fixture sketched in the
-   proposal — packet construction via a small typed builder replacing most
-   Scapy use, PCAP-fixture-based tests for the rest).
-9. Make Python tooling opt-in (`BUILD_PYTHON_BINDINGS=OFF` default) once (7)
-   and (8) give confidence.
-10. Eventually: move the legacy Python `bessctl` to `legacy/` or split it
-    into its own repo, if/when the user decides to.
+> BESS-specific validation, planning, resource ordering, pause/RCU decisions, rollback, generation management, and commit semantics live in C++ inside `bessd`. Go/C++/other SDKs are thin typed bindings.
 
-Target dependency footprint for a normal install, once done: `bessd` needs
-libstdc++/DPDK/protobuf/gRPC-C++/libnuma/system libs — no Python, no pip, no
-virtualenv, no scapy/Flask, no protobuf-Python-vs-C++ version skew.
+Current BESS exposes many imperative RPCs:
 
-Explicitly **keep**: gRPC as the transport (process isolation, remote mgmt,
-language-neutral schema — protobuf already generates C++/Go/Java/Python/Rust
-bindings, so the schema is a better interop boundary than a C++ ABI), and
-**keep `bessctl` and `bessd` as separate processes** even once both are C++
-(unprivileged CLI vs. privileged/high-perf daemon — don't fold the CLI into
-the daemon just because "it's all C++ now"). A Unix-domain-socket gRPC
-transport (`unix:///run/bess/bessd.sock`) is worth adding alongside the
-current TCP one, for local-management permissions/isolation.
+```text
+CreatePort
+CreateModule
+ConnectModules
+AddWorker
+AddTc
+...
+```
 
-### G2 — Breaking-change variant (redesign the wire API too)
+and explicit pause/resume operations.
 
-Only pursue this if the user explicitly says wire/API compatibility doesn't
-matter. Same end state as G1 (Python eliminated as an architectural
-dependency) but *also* replaces the current procedural, fine-grained RPC
-surface (`CreatePort`/`CreateModule`/`ConnectModules`/`AddWorker`/... as
-~30+ separate imperative RPCs) with a smaller, desired-state-oriented v2 API
-centered on one `Pipeline` message:
+That makes the client an orchestration engine.
+
+A client can currently reach states like:
+
+```text
+CreatePort A       ✓
+CreatePort B       ✓
+CreateModule X     ✓
+CreateModule Y     ✗
+---------------------
+client must somehow repair partial state
+```
+
+That is the architectural problem to remove.
+
+### 9.1 Extract a real ControlPlane subsystem
+
+`core/bessctl.cc` should stop being both:
+
+- gRPC adapter; and
+- BESS control business logic.
+
+Target shape:
+
+```text
+gRPC
+  │
+  ▼
+FromProto
+  │
+  ▼
+C++ ControlPlane
+  │
+  ├── validation
+  ├── diff
+  ├── planning
+  ├── preparation
+  ├── commit
+  ├── rollback/abort
+  └── generation management
+  │
+  ▼
+BESS runtime
+```
+
+The RPC layer should become a thin protocol adapter.
+
+A useful internal shape is conceptually:
+
+```cpp
+class ControlPlane {
+ public:
+  ValidationResult ValidatePipeline(const PipelineSpec &desired);
+  DiffResult DiffPipeline(const PipelineSpec &desired);
+  PlanResult PlanPipeline(const PipelineSpec &desired);
+  ApplyResult ApplyPipeline(const ApplyRequest &request);
+
+  PipelineSnapshot GetPipeline() const;
+};
+```
+
+Do not commit to exact names before inspecting current object ownership, but preserve the separation of concerns.
+
+### 9.2 PipelineSpec / desired-state IR
+
+Introduce an internal desired-state representation for structural BESS configuration:
+
+```text
+PipelineSpec
+  ├── workers
+  ├── ports
+  ├── modules
+  ├── connections
+  └── traffic classes
+```
+
+Later it can reference generic mutable dataplane resources, but G0 should not invent APIs for resources that do not exist yet.
+
+This IR is the thing validated and planned.
+
+It is not merely a protobuf message passed directly into constructors.
+
+### 9.3 Apply semantics
+
+Target:
+
+```text
+PipelineSpec
+    │
+    ▼
+Normalize
+    │
+    ▼
+Validate
+    │
+    ├── names/types
+    ├── module configs
+    ├── gate topology
+    ├── port configs/capabilities
+    ├── worker constraints
+    ├── scheduling constraints
+    └── object references
+    │
+    ▼
+Diff(current, desired)
+    │
+    ▼
+Plan ordered operations
+    │
+    ▼
+Prepare
+    │
+    ├── allocate/create resources
+    └── perform reversible setup
+    │
+    ▼
+Commit
+    │
+    ▼
+publish new generation/state
+    │
+    ▼
+Retire old state
+```
+
+### 9.4 Transaction contract
+
+Publicly visible semantics should eventually be strong:
+
+```text
+SUCCESS
+    requested generation/state is active
+
+VALIDATION_FAILED
+    active state unchanged
+
+PREPARE_FAILED
+    active state unchanged
+    staged resources released
+
+COMMIT_FAILED
+    previous active state retained/restored where contractually possible
+```
+
+Irreversible external-resource operations must be modeled explicitly.
+
+Do not pretend physical devices and arbitrary external side effects have database-grade rollback if they do not.
+
+Instead structure the plan so irreversible operations are minimized and late.
+
+### 9.5 Generations and optimistic concurrency
+
+The control plane should have a monotonically increasing generation.
+
+Conceptually:
+
+```protobuf
+message ApplyRequest {
+  uint64 expected_generation = 1;
+  Pipeline desired = 2;
+}
+```
+
+If:
+
+```text
+active generation = 42
+```
+
+and one writer commits generation 43, a second writer trying to commit based on generation 42 should receive a conflict rather than silently overwriting newer state.
+
+The same concept should later apply to high-frequency generic resource transactions.
+
+### 9.6 G0 scope discipline
+
+G0 should establish the internal transaction architecture.
+
+Do **not** yet require:
+
+- final public v2 protobuf API;
+- Go SDK;
+- C++ CLI replacement;
+- Python removal;
+- classifier/action/meter/route messages before those resources exist;
+- graph-level RCU publication for everything.
+
+The invariant G0 must establish is:
+
+> New important mutable BESS subsystems integrate with a C++ transaction engine rather than exposing client-orchestrated sequences of independent mutations.
+
+---
+
+
+## 10. Phase K — generic high-performance dataplane substrate
+
+This phase exists because modern BESS needs reusable mutable dataplane machinery, especially for applications such as OMEC UPF.
+
+The split is strict:
+
+### BESS owns generic mechanisms
+
+Examples:
+
+- RCU/QSBR publication;
+- classifier engines;
+- action/object tables;
+- meter engines;
+- worker-local counters;
+- route/next-hop mechanics;
+- packet parsing/mutation helpers;
+- fragmentation/reassembly;
+- semantic hardware-offload abstraction.
+
+### Applications own protocol/domain semantics
+
+For OMEC UPF, BESS must **not** own:
+
+- PFCP;
+- PDR semantics;
+- FAR semantics;
+- QER semantics/hierarchy;
+- URR semantics;
+- F-SEID;
+- TEID interpretation;
+- QFI;
+- PSC;
+- N3/N6/N9 meaning;
+- session precedence/policy semantics;
+- GTP control messages;
+- buffering/NOCP policy.
+
+OMEC should compile these semantics into generic BESS dataplane resources.
+
+---
+
+### K1 — generic RCU/QSBR lifetime and publication
+
+Phase J proved immutable generation swapping in selected modules, but it intentionally did not add general read-side reclamation.
+
+Add a generic BESS RCU domain.
+
+Conceptual surface:
+
+```cpp
+class RcuDomain {
+ public:
+  ReaderToken RegisterReader(...);
+  void Quiescent(ReaderToken);
+  void Synchronize();
+  void Retire(...);
+};
+
+template <typename T>
+class RcuPtr;
+
+template <typename K, typename V>
+class RcuTable;
+```
+
+Exact types may differ.
+
+#### Requirements
+
+- Packet path must not perform `shared_ptr` refcount operations.
+- Reader-side overhead must be extremely small and batch-friendly.
+- Worker registration/unregistration must be explicit.
+- Worker quiescent-state reporting must integrate with BESS worker scheduling.
+- Writers must have explicit serialization; RCU does not solve writer/writer races.
+- Safe reclamation must survive workers pausing, stopping, or being removed.
+- Unit tests must cover delayed readers and object retirement.
+- Add microbenchmarks for read-side cost and update/reclaim cost.
+
+DPDK QSBR is an obvious candidate implementation, but callers should depend on a BESS semantic interface rather than raw DPDK QSBR APIs everywhere.
+
+---
+
+### K2 — ActionId and immutable object/action tables
+
+Introduce a generic stable dataplane object reference:
+
+```text
+ActionId
+```
+
+or more generally a strongly typed object ID where useful.
+
+A classifier should be able to return an ID that directly resolves to immutable action state.
+
+Conceptual flow:
+
+```text
+packet
+  │
+  ▼
+classifier
+  │
+  ▼
+ActionId
+  │
+  ▼
+ActionTable[ActionId]
+  │
+  ▼
+immutable action state
+```
+
+This eliminates architectures where classification repeatedly materializes fields into metadata only for later modules to re-read and re-interpret them.
+
+#### Generic action table requirements
+
+- immutable published objects;
+- stable IDs within a generation;
+- RCU-safe replacement/deletion;
+- batch-friendly lookup;
+- no packet-path heap allocation;
+- no packet-path atomic reference counting;
+- explicit invalid/deleted behavior;
+- transaction integration from G0.
+
+For OMEC, `PdrAction`, `FarAction`, etc. remain OMEC-defined types layered on this generic mechanism.
+
+---
+
+### K3 — unified runtime-schema classifier framework
+
+This is one of the highest-value missing generic BESS facilities.
+
+The generic classifier must support a schema known at **module initialization/configuration time**, not require compile-time key size.
+
+The framework should compile the runtime schema into a fixed hot-path extractor/backend configuration.
+
+Conceptually:
+
+```text
+runtime configuration
+      │
+      ▼
+ClassifierSchema
+      │
+      ▼
+compile at init/update
+      │
+      ├── fixed field extraction plan
+      ├── fixed key layout/size
+      ├── fixed backend
+      └── fixed result representation
+      │
+      ▼
+batch classify
+      │
+      ▼
+ActionId
+```
+
+#### Critical design rule
+
+Do **not** fix generic classifier key size at C++ compile time.
+
+A UPF-specific or other domain-specific module may know its chosen schema and therefore its key size before activation, but the generic classifier framework must remain runtime configurable.
+
+Internally it may specialize common sizes after initialization:
+
+```text
+8 bytes
+16 bytes
+24/32 bytes
+48 bytes
+64 bytes
+generic fallback
+```
+
+That is an implementation optimization, not a public type restriction.
+
+#### Backend strategy
+
+One logical classifier API may compile to different software backends:
+
+```text
+exact match
+    → current typed CuckooMap or another proven exact backend
+
+few masks / tuple structure
+    → tuple-space style hash
+
+many masks / prefixes / arbitrary ranges
+    → rte_acl
+
+future hardware
+    → rte_flow / MARK(ActionId)
+```
+
+Do not replace the existing toy `ACL` module underneath its historical semantics merely to say BESS uses `rte_acl`.
+
+Build the new classifier framework with explicit semantics.
+
+#### Arbitrary port ranges
+
+Fast non-power-of-two port ranges are a first-class requirement.
+
+Do not explode arbitrary ranges into large sets of prefix-like masks unless a measured backend proves that preferable.
+
+`rte_acl` RANGE fields are a natural backend for:
+
+```text
+src port range
+dst port range
+```
+
+combined with prefix/mask/exact fields.
+
+Benchmark representative mixes, not only exact rules.
+
+#### Result model
+
+Classifier result should be an opaque generic ID such as `ActionId`, not only a graph gate.
+
+A gate may be part of an action, but classification and graph topology should not be artificially coupled.
+
+---
+
+### K4 — packet parsing and mutation primitives
+
+Stage 2 established correct packet storage/ownership. The next layer is ergonomic and safe packet manipulation.
+
+Desired generic primitives include concepts like:
+
+```text
+PacketCursor
+HeaderView<T>
+EnsureContiguous(n)
+EnsureLinear()
+PushHeader<T>()
+RemoveHeader()
+ChecksumPlan
+TxOffloadPlan
+```
+
+Goals:
+
+- centralize mbuf-chain boundary handling;
+- avoid repeated ad-hoc pointer arithmetic in modules;
+- make head/tail/segment semantics explicit;
+- make packet mutation failure explicit;
+- preserve zero-copy/multisegment operation where possible;
+- allow optimized contiguous fast paths;
+- keep protocol semantics out of BESS generic code.
+
+OMEC may use these primitives to implement GTP-U operations, but BESS should not interpret PFCP/GTP policy.
+
+---
+
+### K5 — generic software metering
+
+Add a generic meter abstraction with a software backend built on DPDK metering primitives.
+
+Conceptually:
+
+```text
+MeterProfile
+MeterState
+MeterHandle
+MeterColor
+```
+
+Backend:
+
+```text
+SoftwareMeterBackend
+    → rte_meter
+```
+
+Future hardware backend:
+
+```text
+HardwareMeterBackend
+    → rte_mtr / rte_flow
+```
+
+The hardware backend is C-HW gated.
+
+BESS owns:
+
+- token-bucket/trTCM mechanics;
+- state placement/lifetime;
+- batch-friendly execution;
+- worker-safe ownership model.
+
+OMEC owns:
+
+- what a QER means;
+- application/session/slice hierarchy;
+- what green/yellow/red means to UPF policy;
+- PFCP encoding.
+
+---
+
+### K6 — worker-local statistics and snapshots
+
+Build the data mechanism before building more exporters.
+
+Desired primitives:
+
+```text
+WorkerLocal<T>
+CounterSet
+EpochCounter
+Histogram
+SnapshotGeneration
+```
+
+Rule:
+
+```text
+worker writes local state
+controller aggregates snapshots
+```
+
+Packet path must not take a shared statistics mutex.
+
+Support:
+
+- monotonic counters;
+- deltas;
+- histograms;
+- reset/epoch semantics;
+- per-worker aggregation;
+- consistent-enough snapshot generation;
+- low-cost batch updates.
+
+The future Prometheus exporter in Phase F should consume this mechanism rather than invent another counter ownership model.
+
+For OMEC, subscriber/PDR/URR identities remain application-level semantics.
+
+---
+
+### K7 — route and next-hop abstraction
+
+Introduce a generic routing layer:
+
+```text
+RouteTable
+NextHopId
+NextHop
+neighbor state
+egress port
+L2 rewrite
+bulk lookup
+route generation
+```
+
+Do not couple application logic directly to a specific DPDK table implementation.
+
+Current trusted backend:
+
+```text
+rte_lpm
+```
+
+`rte_fib` was benchmarked and showed order-dependent correctness failures at large arbitrary-order route sets. It must **not** become the default until that issue is resolved and independently revalidated.
+
+Desired shape:
+
+```text
+RouteTable API
+   │
+   ├── rte_lpm backend       trusted/default
+   └── rte_fib backend       disabled/experimental until correctness fixed
+```
+
+---
+
+### K8 — generic IPv4 fragmentation/reassembly
+
+Add generic packet mechanisms around DPDK fragmentation/reassembly facilities.
+
+Requirements:
+
+- native `PacketHandle`;
+- chained packet correctness;
+- worker-local or intentionally sharded state;
+- NUMA-safe ownership;
+- explicit timeout/resource bounds;
+- correct cleanup on partial failures.
+
+These may be libraries rather than permanent graph modules.
+
+Lower priority than K1–K3 and K5/K6.
+
+---
+
+
+## 14. Phase G1 — desired-state API and thin language SDKs
+
+After G0 and enough K resources exist to design against real semantics, expose the new public API.
+
+The old imperative API should not constrain the ideal end state.
+
+A v2-style service should be coarse-grained and desired-state oriented.
+
+Conceptually:
 
 ```protobuf
 service Bess {
-  rpc GetSystem(...) returns (System);
-  rpc GetCapabilities(...) returns (Capabilities);
+  rpc GetSystem(...) returns (...);
+  rpc GetCapabilities(...) returns (...);
+
   rpc ValidatePipeline(Pipeline) returns (ValidationResult);
+  rpc PlanPipeline(Pipeline) returns (PlanResult);
   rpc ApplyPipeline(ApplyPipelineRequest) returns (ApplyResult);
   rpc GetPipeline(...) returns (Pipeline);
   rpc DiffPipeline(...) returns (PipelineDiff);
-  rpc ListModules(...) returns (ListModulesResponse);
-  rpc GetStats(...) returns (Stats);
-  rpc WatchStats(...) returns (stream Stats);      // streaming, not polling
-  rpc WatchEvents(...) returns (stream Event);
+
+  rpc ApplyDataplaneTransaction(DataplaneTransaction)
+      returns (DataplaneTransactionResult);
+
+  rpc GetStats(...) returns (...);
+  rpc WatchStats(...) returns (stream ...);
+  rpc WatchEvents(...) returns (stream ...);
+
   rpc Shutdown(...) returns (...);
 }
 ```
 
-Design rules for this API if pursued:
-- Client submits desired state (`Pipeline`); `bessd` validates/plans/commits
-  it — not "client orchestrates a sequence of mutations."
-- `oneof` for every built-in module's config (typed, no client-side dynamic
-  discovery needed); reserve `google.protobuf.Any` for genuine third-party
-  plugin extension points only.
-- Don't leak DPDK concepts into the schema (`PortCapabilities{rx_checksum,
-  tso, rss, ...}`, not `rte_eth_dev_flags` verbatim) — same "expose BESS
-  semantics, not backend implementation details" rule as the `PacketRef`
-  work in Phase B.
-- Keep the API coarse-grained (`ValidatePipeline`/`PlanPipeline`/
-  `ApplyPipeline`/`PatchPipeline`, not one RPC per internal C++ setter) —
-  this also simplifies synchronization/locking inside `bessd`.
-- A custom `protoc-gen-bess` plugin (proto options like `option
-  (bess.module) = { name: "Rewrite" input_gates: 1 ... }`) could generate
-  the module registry entry, CLI help/completion metadata, SDK builder
-  wrappers, and docs from one source of truth in the `.proto` file, deleting
-  a lot of hand-written registration boilerplate. Worth prototyping early if
-  G2 is chosen, since it changes how every subsequent module gets added.
-- Plugin ABI: stop exposing C++ internals as the plugin contract. A tiny
-  stable `extern "C" const bess_plugin_v1* bess_plugin_init_v1();` entry
-  point returning a descriptor (ABI version, module/port descriptors,
-  protobuf `FileDescriptorSet`, factory pointers) avoids C++
-  name-mangling/STL-ABI coupling between `bessd` and plugins built with a
-  possibly-different compiler/stdlib, at effectively zero runtime cost
-  (plugin dispatch is already a dynamic boundary).
-- Tooling: **Buf CLI** for proto formatting/linting/breaking-change
-  detection/codegen (`buf format`, `buf lint`, `buf breaking --against ...`
-  once v2 is declared stable); **Protovalidate** for structural/semantic
-  field constraints (ranges, required fields, PCI-address shape) via CEL —
-  but topology-level validation (gate compatibility, NUMA constraints,
-  scheduler structure) stays hand-written C++, it's not a message-shape
-  problem.
-- SDKs: generated stubs plus a thin ergonomic wrapper per language (sketch
-  in the proposal shows C++/Go/Rust builder APIs that all compile down to
-  the same `Pipeline` proto) — don't ship only raw generated code.
+Exact API should be designed only after G0/K primitives exist.
 
-### DSL note (applies to either G1 or G2)
+### 14.1 C++ remains authoritative
 
-Don't try to preserve `.bess`'s "config is executable Python" trick by
-embedding a Python interpreter in the C++ daemon/CLI — that's exactly the
-dependency this phase is trying to remove, just moved one layer down. If a
-DSL is wanted at all (vs. `textproto`/JSON-protobuf/a typed C++ builder,
-which can ship first and cover power users immediately), the proposal
-suggests **lexy** (a compile-time-grammar C++ parsing library) as a
-reasonable choice for parsing directly into `GraphSpec`/`Pipeline` — no
-`eval()`, no embedded runtime. A config language needs variables, objects,
-arrays, loops, conditionals, functions/templates, env-var lookup, and
-includes; it does not need classes, threads, reflection, arbitrary syscalls,
-or metaclasses — keep it deliberately smaller than a general-purpose
-language so configs stay statically validate-able.
+Business logic lives in `bessd` C++.
+
+The gRPC layer performs:
+
+```text
+FromProto
+  ↓
+ControlPlane call
+  ↓
+ToProto
+```
+
+No client is responsible for rollback or ordering BESS internals.
+
+### 14.2 SDK philosophy
+
+SDKs are intentionally thin.
+
+Go SDK responsibilities:
+
+- ergonomic typed builders;
+- obvious local type validation;
+- serialization;
+- RPC;
+- typed errors;
+- generation/conflict handling.
+
+C++ SDK responsibilities are equivalent.
+
+Python may remain temporarily while migration is in progress.
+
+SDK transaction builders must **not** implement transactions as ten sequential RPCs plus client-side rollback.
+
+For example:
+
+```go
+tx := client.NewDataplaneTransaction()
+
+action := tx.AddAction(...)
+tx.AddMeter(...)
+tx.AddClassifierEntry(..., action)
+
+generation, err := tx.Commit(ctx)
+```
+
+`Commit()` serializes one transaction request.
+
+### 14.3 OMEC relationship
+
+OMEC can remain Go.
+
+That does not reduce the value of a robust C++ control plane; it increases it.
+
+Responsibility split:
+
+```text
+OMEC Go:
+    PFCP
+    PDR/FAR/QER interpretation
+    session lifecycle
+    precedence/policy
+    compile domain semantics to generic BESS resources
+
+BESS C++:
+    graph/resource validation
+    dependency ordering
+    object lifetime
+    generations
+    transactions
+    rollback/abort
+    worker coordination
+    pause vs live-publication decisions
+    generic resource publication
+
+Go SDK:
+    thin typed binding
+```
+
+This keeps all language clients consistent and prevents each SDK from becoming a partial reimplementation of BESS.
+
+### 14.4 C++ bessctl
+
+A future C++ CLI should use the same public transactional API.
+
+Keep `bessctl` and `bessd` separate processes.
+
+A Unix-domain-socket gRPC transport remains attractive for local management and permissions.
+
+Do not fold the CLI into the privileged daemon merely because both are C++.
 
 ---
 
-## Phase H — C++23/26 tooling adoption (proposed 2026-09-11; first step landed 2026-09-17)
 
-Applies mainly to the control-plane/CLI/SDK code from Phase G — the
-dataplane should stay on the more conservative C++20-or-newer baseline from
-the earlier (Phase B-adjacent) modernization plan discussion unless a
-specific feature is proven zero-cost there (this whole build is now
-compiled as one target at one `-std=`, so in practice that means: don't
-write new C++23-only idioms in dataplane files, not a hard compiler-enforced
-split yet — see the still-open "compile targets should differ deliberately"
-item below).
+## 16. Phase D — ARM64 + portable architecture
 
-**Toolchain reality check** (this doc previously cited "GCC 16.2 is
-current" as if that were installed; it isn't, here or in CI): this sandbox
-and CI's `ubuntu-24.04` runners both have **GCC 13.3.0 and Clang 18.1.3**
-(Ubuntu 24.04's repo packages). Both accept `-std=c++23`; **neither accepts
-`-std=c++26`** (GCC 13.3 rejects it outright as an unrecognized flag) — so
-until this project's build environment moves off Ubuntu 24.04's stock
-toolchain, C++26 isn't adoptable as a build-wide baseline here regardless of
-any individual feature's maturity. The build is now (commit 19) actually
-compiled with `-std=c++23` — previously it was still pinned to `-std=c++17`
-despite this section's text implicitly assuming C++23 was already the
-baseline. Treat C++26 features as isolated experiments only (e.g. a
-separately-`-std=c++26`-compiled `.a`, per the `std::simd` sketch below),
-not production dependencies, until both the standard and this project's
-toolchain mature together.
+Phase D remains important but no longer blocks G0/K.
 
-**C++26 experiment (2026-09-17, not adopted, informational)**: user asked
-to actually try newer toolchains rather than stop at "the stock one can't do
-it." Installed `gcc-14`/`g++-14` (14.2.0) and `clang-20`/`clang++-20`
-(20.1.2) via `apt` from Ubuntu 24.04's own `noble-updates/universe`
-repo (no PPA/third-party script needed for these two -- both are already
-packaged there) into this sandbox, **without** touching `update-alternatives`
-(so plain `gcc`/`g++`/`clang++` still resolve to the 13.3.0/18.1.3 CI-matching
-versions; the newer ones are invoked explicitly as `g++-14`/`clang++-20`).
-Tested both against this exact codebase in a throwaway git worktree
-(`-std=c++26`, otherwise identical source to commit 19):
-- **`clang++-20` at `-std=c++26`: builds this entire codebase clean, zero
-  errors, zero code changes needed beyond what commit 19 already did.**
-  `core/all_test` 179/179 (excluding the pre-existing `CodelTest` flake).
-  This is a genuinely useful data point: it means nothing in this
-  codebase's actual C++ *usage* is C++26-incompatible under a compiler
-  that implements it -- the barrier is purely toolchain availability
-  (CI/this sandbox's stock compiler), not this project's code.
-- **`g++-14` at `-std=c++26`: compiles every source file with zero errors**
-  (same result as clang++-20 for the actual language/library usage), but
-  **fails at the link step for every single binary** (`bessd`, `all_test`,
-  and all three `*_bench` targets that got that far) with `lto1: fatal
-  error: bytecode stream in file '.../libunwind.a' generated with LTO
-  version 13.1 instead of the expected 14.0`. This is Ubuntu's system
-  `libunwind-dev` package shipping a "fat LTO" static archive built by
-  the distro's default GCC (13), which GCC 14's LTO reader can't consume
-  -- an orthogonal distro-packaging/LTO-version mismatch, **not** a C++26
-  or BESS-code issue (every linked binary hits it identically, regardless
-  of `-std=`). A newer GCC (15, 16 -- the user separately suggested the
-  `ubuntu-toolchain-r/test` PPA for these) would very likely hit the exact
-  same mismatch, since the gap versus GCC 13's bytecode only grows; fixing
-  it needs either a matching newer `libunwind` build or changing how this
-  Makefile links against it (not attempted here -- out of scope for an
-  experiment, and this repo's static-linking choices elsewhere in the
-  Makefile look deliberate, not accidental, so that would need its own
-  investigation before touching it).
+### D1 — architecture layer
 
-**Conclusion, not acted on further**: this is good news about the
-codebase's own forward-compatibility, but doesn't change the recommendation
-above -- C++26's *library* features that would actually be worth adopting
-(reflection, contracts, `std::simd`) remain explicitly experimental even in
-compilers that implement C++26's language core, per the research in the
-subsection above. Installing a newer compiler didn't change that maturity
-verdict, only confirmed this project's code isn't itself a blocker. Not
-adopted as the project's toolchain or default `-std=`; recorded here so a
-future session doesn't have to re-derive "does our code even work under
-C++26" from scratch, and knows the GCC-side link failure is a known,
-separate, orthogonal issue rather than something to debug as a C++26
-problem.
+Target:
 
-### Compiler/language-ecosystem hardening research (added 2026-09-17)
+```text
+core/arch/
+    generic/
+    x86/
+    arm64/
+```
+
+Keep scalar reference implementations.
+
+Architecture-specific implementations should have explicit interfaces and batch-level runtime dispatch.
+
+Do not scatter ISA checks through per-packet code.
+
+### D2 — runtime SIMD policy
+
+Detect what the CPU supports, but also allow a configured maximum implementation.
+
+Conceptually:
+
+```text
+available ISA
+    ∩
+configured max ISA
+    ↓
+selected kernel
+```
+
+Supporting AVX-512 does not mean every workload should always use it.
+
+Selection should occur outside the inner packet loop.
+
+### D3 — `rte_bpf` experiment
+
+BESS currently carries a large architecture-specific BPF execution/JIT path.
+
+Evaluate DPDK BPF as a replacement.
+
+Acceptance criteria:
+
+- semantic equivalence;
+- verifier behavior understood;
+- x86 performance acceptable;
+- ARM path materially improved over interpretation;
+- maintenance/security benefit justifies any performance tradeoff.
+
+Do not adopt solely because it removes code.
+
+### D4 — ARM validation
+
+Without local ARM hardware:
+
+- cross-build;
+- CI compile;
+- unit tests under practical emulation where useful;
+- maintain scalar correctness.
+
+Real ARM performance remains a later hardware gate and must not block software architecture.
+
+---
+
+
+## 17. Phase F — operations, releases, and observability
+
+Some Phase F prerequisites are now complete because Meson landed.
+
+Remaining work:
+
+- signed amd64 OCI image;
+- signed arm64 OCI image;
+- `.deb`;
+- SBOM;
+- dependency update automation;
+- reproducible release metadata;
+- sanitizer lanes;
+- static-analysis/format tooling;
+- metrics exporter built on K6;
+- explicit supported dependency/toolchain matrix.
+
+DPDK source pinning by version + SHA256 is already complete.
+
+### DPDK version discipline
+
+Stay on DPDK 25.11.3 until the current software architecture settles.
+
+Do not combine:
+
+```text
+new DPDK
++
+new transaction engine
++
+new classifier
++
+new RCU layer
+```
+
+in one debugging window.
+
+Before the next DPDK bump, preserve benchmark coverage for:
+
+- packet lifecycle;
+- PMD null/ring;
+- ring implementation;
+- mempool topology/cache;
+- routing;
+- cross-worker allocation/free.
+
+Future DPDK mempool cache changes are especially relevant because BESS commonly allocates on one worker and frees on another.
+
+### Observability
+
+Do not create a competing DPDK telemetry control plane.
+
+A future Prometheus exporter should consume BESS-native snapshots, including K6 worker-local counters.
+
+DPDK telemetry may be an input for PMD-specific diagnostics, not the primary user-facing API.
+
+`pdump` remains unattractive because BESS uses `--no-shconf` and gate hooks provide more useful internal capture points anyway.
+
+---
+
+
+## 18. Phase H — modern C++ and toolchain hardening
+
+C++23 is already the project baseline.
+
+Current Ubuntu CI GCC 13.3 / Clang 18.1 can compile the tree at C++23.
+
+Local newer compiler verification has also succeeded.
+
+Do not raise the project to C++26 yet.
+
+### Useful C++23 adoption areas
+
+Primarily control-plane and management-side code:
+
+- `std::expected<T, Error>`;
+- strong IDs;
+- concepts for interfaces where useful;
+- `std::span`;
+- `std::string_view`;
+- `std::filesystem`;
+- `std::jthread` / stop tokens for management jobs where lifetime semantics are deliberately designed;
+- `std::pmr::monotonic_buffer_resource` for short-lived validation/planning arenas.
+
+Do not use modern syntax merely for stylistic churn in packet hot loops.
+
+### Hardening
+
+Evaluate, do not blindly enable in dataplane:
+
+- `_GLIBCXX_ASSERTIONS`;
+- trivial auto-variable initialization;
+- GCC `-fhardened` subfeatures;
+- stronger linker hardening;
+- ASan/UBSan;
+- targeted TSan;
+- libFuzzer;
+- clang-tidy;
+- include-what-you-use.
+
+Every dataplane-hardening option with potential runtime cost requires benchmarks.
+
+---
+
+
+### Retained research detail (2026-09-17)
+
 
 User asked to survey what current C++ language-level and compiler-ecosystem
 work (the kind of thing Lemire/Sutter/Godbolt et al. keep publishing about)
@@ -3213,235 +3982,540 @@ exceptions for *expected* errors anywhere; hiding `native_mbuf()`-style
 DPDK escape hatches from advanced modules (Phase B's `PacketRef` should
 still expose the real `rte_mbuf*` for code that needs it).
 
-## Phase I — Compile-time invalid-state prevention (proposed 2026-09-12, not started)
 
-See Phase H's "Compiler/language-ecosystem hardening research" subsection
-above (added 2026-09-17) for a survey of current standard-track/compiler
-work in this exact space — most relevantly, the C++29 "Profiles"
-(`[[profiles::enforce(...)]]`) effort, which could eventually let some of
-this phase's hand-rolled patterns be expressed as annotations instead of
-bespoke types. Not shippable yet; noted there so it isn't re-researched
-from scratch later.
+## 19. Phase I — compile-time invalid-state prevention
 
-Cross-cutting principle proposed alongside G/H, prompted by a pattern in
-this session's own bug log: the `rte_mbuf` ABI drift, the PCI-format bug,
-ignored return values, and `DCHECK`-only invariants (disappears under
-`-DNDEBUG`) were all bugs the type system could plausibly have caught at
-compile time, while the `worker.cc`/`all_tcs_` races (commits 6-8) were
-not — they're lifetime/synchronization bugs, found only by actually
-running the daemon under load. Keep that distinction explicit rather than
-over-claiming what stronger types buy: **use the compiler aggressively for
-identity, ownership, units, layout, and interface shape; use runtime
-synchronization and load-bearing tests for concurrency and lifetime
-ordering.**
+Use the type system aggressively for things it can actually guarantee.
 
-Several of the highest-value items are already captured in Phase H above
-— `std::expected`, strong ID types (`GateId`/`WorkerId`/`QueueId`/`PortId`),
-concepts (`BessModule`, `PortDriver`), `consteval` network literals,
-`std::span`, `std::jthread` for management-side jobs, ABI `static_assert`s.
-Don't duplicate those; this phase covers what isn't in Phase H yet:
+High-value items:
 
-- **Scoped enums** for status/policy values currently mixed with plain
-  integers (`worker_status_t`, `resource_t`'s `RESOURCE_COUNT`/
-  `RESOURCE_CYCLE`/etc., traffic-class policy identifiers) → `enum class`.
-  Zero runtime cost; stops accidental cross-domain comparison/arithmetic.
-- **Typed resource/accounting arrays**: replace
-  `typedef uint64_t resource_arr_t[NUM_RESOURCES]` plus raw
-  `usage[RESOURCE_COUNT]` indexing with a small wrapper
-  (`operator[](Resource)`, `Resource` the scoped enum above) — identical
-  codegen to the C array, but indexing by a bare integer or an unrelated ID
-  no longer compiles.
-- **A dedicated `PciAddress` value type** at the DPDK boundary, generalizing
-  the one real bug this session already found and fixed (`9e8c4af1`:
-  hand-rolled `%08x:%02x:%02x.%02x` vs. DPDK's actual `PCI_PRI_FMT`
-  `%.4x:%.2x:%.2x.%x`). The shipped fix used `rte_pci_device_name()` at the
-  one call site that needed it; this phase's version is the general form —
-  one canonical `ToString()`/parser pair so no other call site can
-  reintroduce the same format mismatch by hand-rolling it again.
-- **Sentinel APIs → `std::optional`**: replace `kAnyWorker = -1`,
-  `INVALID_GATE == UINT16_MAX`-style sentinels with
-  `std::optional<WorkerId>` (or similar) at cold/control-plane call sites,
-  while keeping a named `GateId::Invalid()` constant available for
-  hot-path code that genuinely needs the fixed-width sentinel
-  representation.
-- **Ownership cleanup in the traffic-class tree specifically**
-  (`core/traffic_class.cc`/`.h` — the same file whose unsynchronized
-  global `all_tcs_` map was the real bug behind commits 6-7): migrate
-  parent→child ownership edges to `std::unique_ptr<TrafficClass>`, keeping
-  raw observer pointers for the scheduling hot path. This does **not** fix
-  the `all_tcs_` registry race by itself (that's a synchronization
-  problem, not an ownership-type one — see the non-goals note below), but
-  it closes off an adjacent class of double-delete/ambiguous-ownership bug
-  in the same destructor chain that caused this session's investigation.
-- **`constinit thread_local` vs. the current `extern __thread Worker
-  current_worker`** (`worker.h`): re-benchmark the GNU `__thread` vs.
-  standard `thread_local` codegen difference that motivated the original
-  choice (per its own comment). If `constinit thread_local Worker
-  current_worker{}` disassembles identically for hot-path access like
-  `current_worker.wid()`, switch to it — `constinit` additionally
-  guarantees at compile time that initialization can't silently become
-  dynamic, which is exactly the "uninitialized state only caught at
-  runtime" class of bug this phase targets. If codegen differs, keep
-  `__thread` and record the disassembly comparison in this doc so the
-  decision doesn't get re-litigated from scratch later.
-- **`std::jthread` for worker threads — do NOT do this mechanically.**
-  Swapping `std::thread worker_threads[]` for `jthread` changes shutdown
-  semantics (its destructor calls `request_stop()` + `join()`, so a wedged
-  worker now blocks the destructor instead of being detached) and directly
-  interacts with the exact shutdown-ordering bug already found and fixed
-  twice this session (commits 6-8). If pursued, redesign worker ownership
-  into an explicit `WorkerSlot { Worker worker_; std::jthread thread_; }`
-  first, with stop/join behavior chosen deliberately, before changing the
-  thread type.
-- **Physical-quantity wrapper types** (`TscCycles`, a `std::chrono`-based
-  nanoseconds alias) at scheduler/rate-limiter APIs that currently pass
-  raw `uint64_t` and mix cycles/ns/packets/bytes by convention only. Lower
-  priority than the items above — evaluate call-site churn against benefit
-  before committing.
-- **A compile-time negative-test file** (e.g.
-  `core/utils/typesafety_test.cc`) asserting the properties the rest of
-  this phase is for: `static_assert(!std::is_convertible_v<CpuId,
-  WorkerId>)`, `static_assert(sizeof(WorkerId) == sizeof(uint16_t))`,
-  concept-satisfaction checks (`static_assert(BessModule<NoOp>)`), etc., so
-  a future refactor that accidentally reintroduces an implicit conversion
-  or breaks a concept fails CI immediately instead of silently.
+- strongly distinct `WorkerId`, `GateId`, `PortId`, `QueueId`;
+- scoped enums;
+- typed resource/accounting arrays;
+- canonical `PciAddress`;
+- `std::optional` instead of cold-path integer sentinels;
+- physical-quantity types for cycles/time/rates where call-site clarity justifies them;
+- compile-time negative tests.
 
-**Explicit non-goal, stated plainly so it isn't re-litigated:** the
-`worker.cc`/`all_tcs_` concurrency and shutdown-ordering bugs (commits
-6-8) are lifetime/synchronization problems, not type-safety problems — no
-amount of `enum class`/strong-ID/ownership-type work would have caught
-them on its own; they needed runtime synchronization (a join, ultimately)
-and were found only by running the daemon live under load, not by a
-stronger type system. The worker-lifecycle redesign (`jthread`,
-`WorkerSlot`, or otherwise) is tracked as its own concurrency-focused
-effort, not folded into this phase's compile-time-provable scope.
+Example:
 
-C++26 contracts (`pre`/`post`) are the natural long-term home for some of
-the invariants this phase encodes as constructors/factories instead —
-already deferred in Phase H pending non-experimental compiler support;
-revisit there rather than re-deciding it here.
+```cpp
+static_assert(!std::is_convertible_v<WorkerId, QueueId>);
+```
+
+Do not claim type safety solves concurrency.
+
+The historical worker teardown and `all_tcs_` issues were synchronization/lifetime bugs and require runtime concurrency design.
 
 ---
 
-## Phase J — Live table updates without stopping the world (done 2026-09-19: entries 35-38)
 
-Cross-cutting phase, not a natural fit under A–I: touches the control
-plane (Phase G), the module command API, and the scheduler loop. Emerged
-from an Opus review of an external DPDK-modernization proposal (see the
-"Roadmap / Backlog" phases above for where its other findings landed, and
-"Rejected" / "Benchmark backlog" below for the rest).
+## 5. Hardware-gated Phase C-HW
 
-**The problem, as actually measured in this tree** (the external proposal
-described this mechanism, and got it wrong in a way that *understated* the
-real cost): BESS today cannot update a rule table on a running pipeline at
-all. `ModuleBuilder::RunCommand()` (`core/module.cc`) **refuses** any
-command not marked `Command::THREAD_SAFE` with `EBUSY` whenever
-`Module::HasRunningWorker()` (`core/module.h`) is true; `bessctl`'s
-`command_module` (`bessctl/commands.py`) works around that by calling
-`pause_all()` before **every** module command -- thread-safe ones
-included -- and `resume_all()` after. `pause_all` blocks every worker on
-an `eventfd` read (`core/worker.cc`). There are **45 `THREAD_UNSAFE`
-commands across 22 module files**, including `ACL::CommandAdd`,
-`IPLookup::CommandAdd`/`Delete`, `ExactMatch::CommandAdd`/`Delete`/
-`SetRuntimeConfig`, `BPF::CommandAdd`/`Delete`, and `Queue::CommandSetSize`.
-Net effect: **adding one ACL rule or one route stops packet processing on
-every worker in the process.**
+No suitable real NIC is currently available.
 
-**The mechanism**: replace pause-mutate-resume with build-publish-reclaim
--- construct a replacement table off the dataplane, atomically publish the
-pointer (release store), let workers keep running, wait for a grace
-period, then destroy the old table.
+These items are parked deliberately and **do not gate software-only phases**:
 
-**Which `RcuDomain` backend to actually build first: C++-native, not
-DPDK** (design note added 2026-09-18, answering a direct question).
-Real options, in increasing order of "how much you're building yourself":
-`std::shared_mutex` (not RCU at all, a reader-writer lock -- every read
-pays a real lock even with zero writer activity, strictly worse than any
-RCU-style approach for this access pattern, mentioned only as the naive
-baseline); `std::atomic<std::shared_ptr<T>>` ("RCU via refcounting" --
-`std::atomic_load`/`_store` on a `shared_ptr`, reclamation is automatic
-because the refcount *is* the grace-period tracking, at the cost of a
-real atomic op per access); a hand-rolled epoch-based scheme with
-`std::atomic` (reimplementing QSBR's algorithm yourself: readers store a
-relaxed/release epoch counter once per loop iteration, writers defer
-freeing until all readers have advanced past the retirement epoch --
-same performance ceiling as DPDK's QSBR, but every memory-ordering detail
-is now this project's problem); `rte_rcu_qsbr` (the same algorithm as
-the hand-rolled version, already written, already tested in a networking
-context, and `librte_rcu.a` is **already linked into `bessd`** -- no new
-dependency, reader cost is one `rte_rcu_qsbr_quiescent()` store per
-`Scheduler::ScheduleLoop()` iteration); and C++26 `std::rcu`/hazard
-pointers (not production-ready anywhere yet, per Phase H -- the eventual
-target, not a near-term option).
+```text
+[ ] Physical NIC VFIO validation
+[ ] Real-NIC MTU/jumbo validation
+[ ] Real-NIC scatter RX
+[ ] Multi-queue/RSS validation
+[ ] Real-NIC throughput baseline
+[ ] AF_XDP zero-copy on suitable real hardware
+[ ] RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE correctness
+[ ] RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE performance
+[ ] MT-lockfree Tx capability validation
+[ ] PortOut lock-elision benchmark
+[ ] checksum-offload validation if later justified
+[ ] TSO/GSO evaluation if later justified
+[ ] hardware meter backend
+[ ] rte_flow acceleration backend
+```
 
-**Recommendation: prototype the first backend as
-`std::atomic<std::shared_ptr<T>>`, not the hand-rolled epoch scheme and
-not `rte_rcu_qsbr` yet.** Two reasons, both concrete rather than
-theoretical: (1) this session already found a real, hard-to-reproduce
-concurrency bug in this exact codebase's hand-rolled synchronization
-(`worker.cc`/`all_tcs_`, commits 6-8) -- a live argument against adding a
-*second* bespoke concurrency primitive when a well-tested one exists, and
-`shared_ptr`'s refcounting needs no separate "prove the grace period
-elapsed" logic to get right at all, unlike either epoch-based option; (2)
-BESS processes packets in batches of `PacketBatch::kMaxBurst = 32`, not
-one at a time -- if the RCU-protected read happens once per
-`ProcessBatch()` call (grab a stable table reference for the whole
-batch, not once per packet), the atomic refcount cost amortizes over 32
-packets, meaningfully weakening the usual "shared_ptr is too slow for
-RCU" argument for BESS's specific access pattern. Phase J's own
-acceptance criterion is explicitly capability, not a `*_bench.cc` number
--- so the honest performance bar to clear here is low. Swap the backend
-to `rte_rcu_qsbr` behind the same `RcuDomain` interface later only if
-profiling actually shows the refcount cost matters, as a measurement,
-not an assumption. **Caveat if that swap ever happens**: `rte_rcu_qsbr`'s
-writer side would need the control-plane thread (handling gRPC commands,
-not currently EAL-registered) to either call `rte_thread_register()`
-once at startup or have a worker perform the actual reclaim on the
-control plane's behalf via a deferred/queued mechanism -- a real design
-detail to work out then, not automatic.
+#### Important rules
 
-**Independent of the `WorkerId`/lcore-ID migration** (Phase C, above):
-`rte_rcu_qsbr_thread_register()` takes a caller-chosen `thread_id`, not an
-lcore ID -- BESS can pass `wid` directly, today, with no prerequisite.
+Do not enable `MBUF_FAST_FREE` merely because a PMD advertises it.
 
-**Scope discipline -- do exactly one pilot first.** `IPLookup` is the best
-candidate: its table is already an opaque `rte_lpm*` behind a single
-pointer, its three mutating commands are all `THREAD_UNSAFE`, the
-rebuild-and-swap cost is bounded, and `rte_fib` (Phase D, above) has
-native RCU support if the table migrates there anyway. `ExactMatch` is the
-natural second. Only after two modules work should this generalize into a
-`Module`-level contract. *(Status: complete. `IPLookup` (entry 35) and
-`ExactMatch` (entry 36, plus the review-follow-up fixes `a0688fcf`) publish
-generations instead of mutating live tables; the snapshot, publication and
-writer-side reclamation mechanism they share lives in
-`bess::utils::PublishedGeneration` (entry 37); and the capability is reachable
-through the normal CLI, which now pauses only for commands the daemon reports
-as not thread-safe (entry 38). Deliberately out of scope, unchanged: QSBR/RCU
-machinery, the `ModuleGraph`/traffic-class tree, and removing the
-user-supplied `ARG_TYPE` from `command module`.)* Explicitly **not** in scope for the first pass:
-RCU-swapping the `ModuleGraph`, gate adjacency, or the traffic-class tree
--- those are Phase G/H territory (live reconfiguration), not this phase's
-narrower table-update goal.
+Stage 2C deliberately supports:
 
-**Stated non-goal, so it isn't over-claimed later:** this would **not**
-have prevented any bug in this session's log. The `worker.cc`/`all_tcs_`
-defects (commits 6-8, see completed-work log above) are a writer-writer
-race on an unsynchronized global map during concurrent teardown plus a
-thread-lifetime bug; QSBR protects readers from writers and needs its own
-writer serialization. Phase I's existing non-goal note on those bugs
-applies here unchanged -- this is a capability improvement for
-control-plane table updates, not a concurrency-bug-prevention mechanism.
+- clones;
+- chains;
+- external buffers;
+- nontrivial refcounts.
 
-**Judge this by the right metric.** This is a *capability* change (update
-rules on a live pipeline), not a throughput change -- it will not move any
-number in `core/*_bench.cc`. The acceptance test is a live one: drive a
-`Source → IPLookup → Sink` pipeline at a steady rate while adding/removing
-routes, and show zero packet loss and zero throughput dip across the
-update, versus today's full stop.
+Any fast-free optimization must prove that the packets sent through the relevant path satisfy DPDK's ownership preconditions.
+
+Likewise, do not remove the current `PortOut` synchronization until a PMD actually advertises the relevant thread-safety capability and a real workload validates the result.
 
 ---
 
-## Rejected from the 2026-09-18 DPDK-proposal review
+
+## Cross-cutting design and acceptance rules
+
+### 4. Linux I/O end state
+
+#### 4.1 PMDPort is the generic DPDK port abstraction
+
+Physical device:
+
+```text
+PMDPort(pci=...)
+```
+
+Virtual DPDK device:
+
+```text
+PMDPort(vdev=...)
+```
+
+This is sufficient for:
+
+- vhost-user;
+- TAP;
+- AF_PACKET;
+- memif;
+- null;
+- ring;
+- AF_XDP;
+- other DPDK ethdev vdevs;
+- representor-style device arguments where supported by the PMD.
+
+Do not add BESS port subclasses merely to wrap DPDK PMDs.
+
+#### 4.2 AF_XDP policy
+
+AF_XDP is configured through ordinary DPDK devargs:
+
+```text
+PMDPort(vdev="net_af_xdp,...")
+```
+
+There is **no planned AF_XDP-specific BESS protobuf/configuration layer**.
+
+PMD-specific knobs remain DPDK devargs, including things such as:
+
+- interface;
+- copy/zero-copy mode;
+- busy-poll related knobs;
+- UMEM-specific settings;
+- future AF_XDP PMD options.
+
+BESS should only expose named fields for portable BESS semantics shared across backends.
+
+#### Build dependency policy
+
+Local:
+
+```text
+AF_XDP=auto
+```
+
+Official CI/release:
+
+```text
+AF_XDP=required
+```
+
+AF_XDP build dependencies are optional capabilities for local BESS development, but official supported builds must exercise them so the feature does not silently rot.
+
+#### Runtime result already established
+
+DPDK AF_XDP uses ordinary direct mbufs from the configured mempool:
+
+- copy mode copies into normal mbufs;
+- zero-copy overlays UMEM on the configured mempool;
+- no BESS-specific external-buffer ownership adapter is required.
+
+A root-owned userspace AF_XDP test through veths successfully forwarded real 64-byte traffic through BESS at roughly 1.92 Mpps / 0.984 Gbps with zero BESS-reported drops.
+
+That number is a functional host/veth result, not a NIC performance claim.
+
+---
+
+
+### 11. Static graph, dynamic state
+
+This is a core architecture rule for modern BESS applications.
+
+High-frequency control changes should not require graph topology mutation.
+
+For a UPF-like appliance:
+
+```text
+PFCP session change
+    ✗ create/destroy arbitrary BESS modules per rule
+    ✗ reconnect gates per session
+```
+
+Instead:
+
+```text
+mostly static packet graph
+        +
+dynamic classifier/action/meter/route generations
+```
+
+Structural pipeline mutation is comparatively rare.
+
+Dynamic dataplane state mutation is frequent.
+
+This motivates two transaction classes.
+
+---
+
+
+### 12. Two transaction classes
+
+#### 12.1 Structural pipeline transaction
+
+Rare.
+
+Owns:
+
+```text
+ports
+modules
+connections
+workers
+traffic classes
+```
+
+Public operation later:
+
+```text
+ApplyPipeline
+```
+
+#### 12.2 Dataplane-state transaction
+
+Frequent.
+
+Owns generic mutable resources:
+
+```text
+classifier entries
+actions/objects
+meter profiles/states
+routes/next-hops
+```
+
+Example:
+
+```text
+OMEC PFCP Session Establishment
+        │
+        ▼
+OMEC Go PFCP compiler
+        │
+        ▼
+BESS dataplane transaction
+        │
+        ├── create action
+        ├── create meter
+        ├── add classifier entry
+        └── reference route/next-hop
+        │
+        ▼
+validate all references
+        │
+        ▼
+commit generation N+1
+```
+
+A failure before commit should not leave a half-programmed BESS dataplane.
+
+---
+
+
+### 13. G0 and K1 relationship
+
+These are complementary.
+
+```text
+G0 ControlPlane
+    decides WHAT state becomes active
+          │
+          ▼
+transaction plan / generation
+          │
+          ▼
+K1 RCU/QSBR
+    decides HOW old dataplane state
+    remains valid for active readers
+          │
+          ▼
+workers report quiescent state
+          │
+          ▼
+old objects reclaimed safely
+```
+
+Do not make the RCU library understand PFCP, pipelines, or transactions.
+
+Do not make the transaction engine implement ad-hoc packet-path reader tracking.
+
+---
+
+
+### 15. Future hardware offload architecture
+
+Do not allow application modules to construct PMD-specific `rte_flow` structures.
+
+Future generic shape:
+
+```text
+software logical rule
+        │
+        ▼
+semantic FlowProgram
+        │
+        ├── Match(...)
+        ├── Mark(ActionId)
+        ├── Queue(...)
+        └── Count(...)
+        │
+        ▼
+port.TryOffload(...)
+```
+
+Critical unification:
+
+Software:
+
+```text
+classifier
+  ↓
+ActionId 4711
+  ↓
+ActionTable[4711]
+```
+
+Hardware:
+
+```text
+NIC rte_flow
+  ↓
+MARK 4711
+  ↓
+ActionTable[4711]
+```
+
+The continuation is identical.
+
+Only classification placement changes.
+
+Implementation/validation remains C-HW gated until suitable hardware exists.
+
+---
+
+
+### 20. Performance acceptance discipline
+
+Modernization is allowed to change implementation, not silently sacrifice the dataplane.
+
+Use the existing benchmark suite as a regression guard.
+
+For software-only hot-path changes:
+
+> Any repeatable regression larger than roughly 2% in a relevant benchmark must be investigated before signoff.
+
+This is an investigation threshold, not a claim that every run must fall inside ±2%.
+
+Use:
+
+- pinned CPU;
+- SMT sibling isolation where practical;
+- same compiler/flags;
+- same DPDK build;
+- interleaved before/after observations;
+- sufficient benchmark duration;
+- median/variance rather than one sample.
+
+Do not optimize based on noisy one-off CI timings.
+
+CI benchmark runs are smoke tests, not performance measurements.
+
+#### Important Stage 2B conclusion
+
+Native `rte_mbuf *` transport itself was effectively flat.
+
+The major lifecycle regression came from replacing BESS's specialized simple-packet lifecycle with fully generic DPDK allocation/free semantics.
+
+The accepted design uses native raw APIs for safe/simple cases and generic fallback otherwise.
+
+Do not reopen the packet representation to recover allocator microbenchmarks.
+
+---
+
+
+### 21. Generic classifier performance requirements
+
+K3 must have a dedicated benchmark suite before it becomes a foundation for OMEC.
+
+Measure at least:
+
+```text
+rule counts:
+    16
+    64
+    256
+    1K
+    10K
+    100K
+    larger where memory allows
+
+traffic:
+    all hits
+    all misses
+    mixed
+    hot-rule skew
+    random-rule distribution
+
+fields:
+    exact only
+    prefixes
+    arbitrary port ranges
+    mixed exact/prefix/range
+```
+
+Compare backend choices.
+
+Benchmark:
+
+- lookup throughput;
+- cycles/packet;
+- batch scaling;
+- build/update cost;
+- memory;
+- worst-case rule position/distribution;
+- generation swap latency.
+
+Do not choose `rte_acl`, tuple space, or another backend based on a single synthetic rule shape.
+
+---
+
+
+### 22. OMEC UPF target relationship
+
+The long-term desired division is:
+
+```text
++------------------------------------------------------+
+|                    OMEC UPF                          |
+|                                                      |
+| PFCP / PDR / FAR / QER / URR / GTP semantics        |
+| session compilation                                  |
+| Go control-plane logic                               |
++---------------------------+--------------------------+
+                            |
+                            | thin transactional Go SDK
+                            v
++------------------------------------------------------+
+|                 BESS C++ Control Plane               |
+|                                                      |
+| Validate / Diff / Plan / Prepare / Commit            |
+| generations / conflicts / rollback                   |
++---------------------------+--------------------------+
+                            |
+                            v
++------------------------------------------------------+
+|          Generic modern BESS dataplane substrate     |
+|                                                      |
+| RCU | ActionId | classifier | meter | stats | route  |
+| packet mutation | fragmentation | PMD capabilities   |
++---------------------------+--------------------------+
+                            |
+                            v
++------------------------------------------------------+
+|                  DPDK / NIC / Linux                  |
++------------------------------------------------------+
+```
+
+The goal is to make OMEC-specific code a consumer of BESS, not a permanent fork of generic dataplane infrastructure.
+
+---
+
+
+### 23. Things that should remain application-specific
+
+Do not move these into generic BESS merely because OMEC needs them:
+
+```text
+PFCP message/session semantics
+PDR precedence semantics
+FAR behavior semantics
+QER hierarchy and QFI meaning
+URR accounting semantics
+F-SEID/session identity
+N3/N6/N9 interface semantics
+GTP-U TEID interpretation
+PSC semantics
+Echo / End Marker policy
+UPF buffering / NOCP behavior
+UPF-specific SessionProgram
+UPF-specific PdrAction/FarAction/QerState
+```
+
+BESS provides the mechanisms underneath.
+
+---
+
+
+### 24. Rejected or constrained directions
+
+These decisions should not be repeatedly reopened without new evidence.
+
+#### Do not restore a custom VPort/kernel module path
+
+The legacy kmod/VPort architecture is gone.
+
+Modern host/network integration is PMD-based.
+
+#### Do not create an AF_XDP-specific BESS port
+
+Use `PMDPort.vdev`.
+
+#### Do not mirror `rte_eth_dev_info` into public protobufs
+
+Expose semantic BESS capabilities, not raw backend implementation flags.
+
+#### Do not globally enable checksum/TSO offload
+
+BESS checksum modules may verify packets or produce checksums; those are different semantics.
+
+Future TX offload must be explicit graph/action semantics with correct mbuf metadata preparation.
+
+#### Do not replace `CuckooMap` globally with `rte_hash` without a concrete workload/result
+
+The typed C++ map semantics are useful and the generic replacement cost is nontrivial.
+
+#### Do not silently replace the existing toy ACL module with `rte_acl`
+
+Build the new classifier framework with explicit modern semantics.
+
+#### Do not adopt `rte_fib` as routing default yet
+
+The existing benchmark found correctness failures.
+
+#### Do not treat RCU as a multi-writer synchronization primitive
+
+RCU solves read-side lifetime/reclamation.
+
+Writers still require correct serialization/transaction semantics.
+
+#### Do not expose raw `rte_flow` to applications
+
+Compile semantic BESS rules to a backend.
+
+#### Do not use client-side RPC sequences as transactions
+
+Transactions belong in `bessd`.
+
+---
+
+
+#### Rejected from the 2026-09-18 DPDK-proposal review
 
 Listed so these don't get re-litigated from scratch later. Each was
 considered and independently assessed against real code, not dismissed on
@@ -3600,6 +4674,199 @@ the reviewing document's word alone.
   moot since `bessd` already passes `--no-shconf`, reinforcing Phase G's
   gRPC/UDS direction rather than changing it).
 
+
+## 26. Immediate execution plan
+
+### Milestone 1 — fix modern glog daemon mode
+
+Small independent correctness fix.
+
+Do not let it grow into G0.
+
+Acceptance:
+
+- foreground mode still works;
+- daemon mode works on glog >= 0.7;
+- Ubuntu CI behavior remains correct;
+- no recursive logging through replaced stdio streams.
+
+### Milestone 2 — G0 transactional C++ control core
+
+First major project.
+
+Deliver:
+
+1. extract `ControlPlane`;
+2. define internal `PipelineSpec`;
+3. implement validation;
+4. implement current-vs-desired diff;
+5. define explicit operation plan;
+6. separate prepare/commit/abort lifecycle;
+7. introduce generation IDs;
+8. introduce optimistic expected-generation conflict checks;
+9. route existing RPC mutations through the new C++ core where practical;
+10. prove failure does not leave half-applied structural state.
+
+Do not build Go SDK yet.
+
+### Milestone 3 — K1 RCU/QSBR
+
+Implement generic read-side lifetime mechanism integrated with workers.
+
+### Milestone 4 — K2 ActionId/object tables
+
+Make immutable generic actions a first-class continuation target.
+
+### Milestone 5 — K3 classifier framework
+
+Build runtime-schema classifier and benchmark backends.
+
+Once these three are in place, modern OMEC UPF work can begin depending on stable generic BESS primitives rather than inventing them inside the UPF tree.
+
+---
+
+
+## 25. Known lower-priority research/backlog
+
+These remain useful but should not distract from G0/K.
+
+- symmetric RSS configuration as a generic PMD capability;
+- RETA control if a real consumer appears;
+- graph-aware mbuf recycling research after a desired-state graph representation exists;
+- power-aware scheduler idle/wakeup design;
+- C++26 `std::simd` prototype when toolchains/library maturity justify it;
+- stable external plugin ABI;
+- stable plugin development package/export metadata;
+- optional Unix-domain-socket gRPC transport;
+- streaming stats/events API;
+- PGO/BOLT/ThinLTO only after representative workloads and architecture settle.
+
+---
+
+
+## End state
+
+### 27. Definition of the software-only modernization end state
+
+Ignoring hardware-gated validation, the modernization effort is software-complete when:
+
+```text
+Build
+    Meson-only, reproducible, pinned dependencies, strong CI
+
+Packets
+    native rte_mbuf, multisegment/extbuf, explicit safe ownership
+
+Ports
+    PMD-centric, capability-aware, generic vdev path
+
+Control
+    C++ desired-state/transaction core inside bessd
+    generation/conflict/rollback semantics
+
+Mutable dataplane state
+    RCU/QSBR-managed generations
+    ActionId/object tables
+    unified classifier
+    generic meters
+    worker-local stats
+    route/next-hop abstraction
+
+SDKs
+    thin Go and C++ transactional bindings
+    no client-side BESS orchestration/rollback
+
+Portability
+    scalar + x86 + ARM architecture boundaries
+    measured runtime ISA selection
+    BPF backend decision complete
+
+Operations
+    install/package/release/SBOM/observability paths established
+
+Safety
+    strong IDs and compile-time invalid-state prevention where useful
+    sanitizer/static-analysis coverage appropriate to the codebase
+```
+
+Hardware validation can then be performed as a dedicated lab phase without blocking the software architecture.
+
+---
+
+
+### 28. Hardware validation end state
+
+When suitable hardware becomes available, validate as one focused program:
+
+```text
+VFIO physical NIC
+    ↓
+single/multi-queue RX/TX
+    ↓
+MTU / jumbo / scatter
+    ↓
+RSS / affinity
+    ↓
+cross-worker forwarding
+    ↓
+AF_XDP zero-copy where relevant
+    ↓
+MBUF_FAST_FREE
+    ↓
+MT-lockfree Tx / lock elision
+    ↓
+semantic rte_flow MARK(ActionId)
+    ↓
+hardware meters if useful
+```
+
+Every hardware acceleration must retain a software fallback with identical BESS semantics.
+
+---
+
+
+### 29. Final architectural principles
+
+1. **BESS owns mechanisms; applications own domain semantics.**
+2. **`bessd` owns transaction semantics; clients submit desired state.**
+3. **Language SDKs are bindings, not orchestration engines.**
+4. **Static-ish graph, dynamic state.**
+5. **Publish immutable state; avoid mutating structures read by workers.**
+6. **Use RCU for lifetime, not as a substitute for writer synchronization.**
+7. **Expose semantic capabilities, not raw DPDK internals.**
+8. **Keep DPDK PMD-specific configuration in DPDK devargs unless BESS has a portable semantic reason to abstract it.**
+9. **No packet-path shared ownership/refcounting abstractions.**
+10. **Optimize only after correctness and representative measurement.**
+11. **Hardware absence must not stall software architecture.**
+12. **Do not preserve compatibility layers merely because they existed historically when a clean cutover is feasible.**
+
+---
+
+
+### 30. Current handoff
+
+Current reviewed `develop` baseline:
+
+```text
+e8c8e17684115e71ff9727134b5eb6e346db175b
+Fix Meson packaging and CI coverage
+```
+
+Phase E is closed.
+
+The next architecture work is:
+
+```text
+1. glog >= 0.7 daemon-mode recursion fix
+2. G0 C++ transactional control-plane core
+3. K1 RCU/QSBR
+4. K2 ActionId/object tables
+5. K3 unified classifier
+```
+
+Do not block this sequence on real-NIC work.
+
+
 ## Benchmark / experiment backlog (from the 2026-09-18 DPDK-proposal review)
 
 Ordered by "what must exist before other answers here are trustworthy."
@@ -3704,3 +4971,6 @@ the rejected list for what's already been decided either way.
     latency, low-rate CPU consumption, and full-load throughput -- not
     packet rate. Not evaluable in this sandbox (no real NIC/power
     control). Track as a scheduler-redesign item first.
+
+
+
