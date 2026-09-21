@@ -67,7 +67,6 @@ PriorityTrafficClass::~PriorityTrafficClass() {
   for (auto &c : children_) {
     delete c.c_;
   }
-  TrafficClassBuilder::Clear(this);
 }
 
 std::vector<TrafficClass *> PriorityTrafficClass::Children() const {
@@ -174,7 +173,6 @@ WeightedFairTrafficClass::~WeightedFairTrafficClass() {
   for (auto &c : blocked_children_) {
     delete c.c;
   }
-  TrafficClassBuilder::Clear(this);
 }
 
 std::vector<TrafficClass *> WeightedFairTrafficClass::Children() const {
@@ -304,7 +302,6 @@ RoundRobinTrafficClass::~RoundRobinTrafficClass() {
   for (TrafficClass *c : blocked_children_) {
     delete c;
   }
-  TrafficClassBuilder::Clear(this);
 }
 
 bool RoundRobinTrafficClass::AddChild(TrafficClass *child) {
@@ -432,7 +429,6 @@ RateLimitTrafficClass::~RateLimitTrafficClass() {
   // also cleared out of the wakeup_queue_ in Scheduler if it is present
   // there.
   delete child_;
-  TrafficClassBuilder::Clear(this);
 }
 
 std::vector<TrafficClass *> RateLimitTrafficClass::Children() const {
@@ -521,21 +517,17 @@ void RateLimitTrafficClass::FinishAndAccountTowardsRoot(
 }
 
 LeafTrafficClass::~LeafTrafficClass() {
-  TrafficClassBuilder::Clear(this);
   task_->Detach();
   delete task_;
 }
 
-std::unordered_map<std::string, TrafficClass *> TrafficClassBuilder::all_tcs_;
-
 bool TrafficClassBuilder::ClearAll() {
-  all_tcs_.clear();
+  bess::control::runtime().traffic_classes().ReleaseAll();
   return true;
 }
 
 bool TrafficClassBuilder::Clear(TrafficClass *c) {
-  bool ret = all_tcs_.erase(c->name());
-  return ret;
+  return bess::control::runtime().traffic_classes().Release(c);
 }
 
 }  // namespace bess

@@ -441,7 +441,7 @@ ControlResult<void> ControlPlane::DestroyWorker(uint64_t wid) {
   bess::TrafficClass* root = workers[wid]->scheduler()->root();
   if (root) {
     for (const auto& it : TrafficClassBuilder::all_tcs()) {
-      bess::TrafficClass* c = it.second;
+      bess::TrafficClass* c = it.second.get();
       if (c->policy() == bess::POLICY_LEAF && c->Root() == root) {
         return std::unexpected(Err(EBUSY, "Worker %d has active tasks: %s", static_cast<int>(wid),
                                    c->name().c_str()));
@@ -696,7 +696,7 @@ ControlPlane::CheckSchedulingConstraints() {
     bess::TrafficClass* root = workers[i]->scheduler()->root();
 
     for (const auto& tc_pair : TrafficClassBuilder::all_tcs()) {
-      bess::TrafficClass* c = tc_pair.second;
+      bess::TrafficClass* c = tc_pair.second.get();
       if (c->policy() == bess::POLICY_LEAF && root == c->Root()) {
         auto leaf = static_cast<bess::LeafTrafficClass*>(c);
         int constraints = leaf->task()->GetSocketConstraints();
@@ -735,13 +735,10 @@ ControlResult<bess::TrafficClass*> ControlPlane::FindTc(
 
   if (spec.name.length() != 0) {
     const char* name = spec.name.c_str();
-    const auto& all_tcs = TrafficClassBuilder::all_tcs();
-    auto it = all_tcs.find(name);
-    if (it == all_tcs.end()) {
+    c = TrafficClassBuilder::Find(name);
+    if (!c) {
       return std::unexpected(Err(ENOENT, "Tc '%s' doesn't exist", name));
     }
-
-    c = it->second;
   } else if (spec.leaf_module_name.length() != 0) {
     const std::string& module_name = spec.leaf_module_name;
     Module* m = runtime().modules().Find(module_name);
@@ -806,14 +803,11 @@ ControlResult<void> ControlPlane::AttachTc(bess::TrafficClass* c_,
                                "have been specified"));
   }
 
-  bess::TrafficClass* parent;
-  const auto& tcs = TrafficClassBuilder::all_tcs();
-  const auto& it = tcs.find(spec.parent);
-  if (it == tcs.end()) {
+  bess::TrafficClass* parent = TrafficClassBuilder::Find(spec.parent);
+  if (!parent) {
     return std::unexpected(
         Err(ENOENT, "Parent TC '%s' not found", spec.parent.c_str()));
   }
-  parent = it->second;
 
   bool fail = false;
   switch (parent->policy()) {

@@ -404,6 +404,7 @@ void Module::DestroyAllTasks() {
     }
 
     CHECK(detach_tc(c));
+    bess::control::runtime().traffic_classes().Release(c);
     delete c;
   }
   tasks_.clear();

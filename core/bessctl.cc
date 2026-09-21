@@ -370,7 +370,7 @@ class BESSControlImpl final : public BESSControl::Service {
     }
 
     for (const auto& tc_pair : TrafficClassBuilder::all_tcs()) {
-      bess::TrafficClass* c = tc_pair.second;
+      bess::TrafficClass* c = tc_pair.second.get();
       int wid = c->WorkerId();
       if (wid_filter == Worker::kAnyWorker || wid_filter == wid) {
         // WRR and Priority TCs associate share/priority to each child
@@ -470,12 +470,10 @@ class BESSControlImpl final : public BESSControl::Service {
                                "Argument must be a name in str");
     }
 
-    const auto& tcs = TrafficClassBuilder::all_tcs();
-    const auto& it = tcs.find(tc_name);
-    if (it == tcs.end()) {
+    c = TrafficClassBuilder::Find(tc_name);
+    if (!c) {
       return return_with_error(response, ENOENT, "No TC '%s' found", tc_name);
     }
-    c = it->second;
 
     response->set_timestamp(get_epoch_time());
     response->set_count(c->stats().usage[bess::RESOURCE_COUNT]);

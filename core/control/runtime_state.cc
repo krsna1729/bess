@@ -35,6 +35,7 @@
 
 #include "module.h"
 #include "port.h"
+#include "traffic_class.h"
 #include "utils/common.h"
 
 namespace bess {
@@ -190,6 +191,48 @@ void ModuleRegistry::Clear() {
   }
   modules_.clear();
   task_names_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// TrafficClassRegistry
+// ---------------------------------------------------------------------------
+
+bool TrafficClassRegistry::Register(std::unique_ptr<TrafficClass> &&c) {
+  if (classes_.count(c->name())) {
+    return false;
+  }
+  classes_.emplace(c->name(), std::move(c));
+  return true;
+}
+
+TrafficClass *TrafficClassRegistry::Find(const std::string &name) const {
+  auto it = classes_.find(name);
+  return it == classes_.end() ? nullptr : it->second.get();
+}
+
+bool TrafficClassRegistry::Release(TrafficClass *c) {
+  auto it = classes_.find(c->name());
+  if (it == classes_.end() || it->second.get() != c) {
+    return false;
+  }
+  // Forget the object without destroying it: the caller owns the teardown.
+  it->second.release();
+  classes_.erase(it);
+  return true;
+}
+
+void TrafficClassRegistry::ReleaseTree(TrafficClass *root) {
+  for (TrafficClass *child : root->Children()) {
+    ReleaseTree(child);
+  }
+  Release(root);
+}
+
+void TrafficClassRegistry::ReleaseAll() {
+  for (auto &pair : classes_) {
+    pair.second.release();
+  }
+  classes_.clear();
 }
 
 // ---------------------------------------------------------------------------

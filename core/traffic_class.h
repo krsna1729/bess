@@ -41,6 +41,7 @@
 #include <utility>
 #include <vector>
 
+#include "control/runtime_state.h"
 #include "task.h"
 #include "utils/common.h"
 #include "utils/extended_priority_queue.h"
@@ -652,18 +653,19 @@ class RateLimitChildArgs : public TCChildArgs {
   RateLimitChildArgs(TrafficClass *c) : TCChildArgs(POLICY_RATE_LIMIT, c) {}
 };
 
-// Responsible for creating and destroying all traffic classes.
+// Responsible for creating traffic classes; the instances themselves are
+// owned by the runtime's TrafficClassRegistry.
 class TrafficClassBuilder {
  public:
   template <typename T, typename... TArgs>
   static T *CreateTrafficClass(const std::string &name, TArgs... args) {
-    if (all_tcs_.count(name)) {
+    std::unique_ptr<TrafficClass> c =
+        std::make_unique<T>(name, args...);
+    T *raw = static_cast<T *>(c.get());
+    if (!bess::control::runtime().traffic_classes().Register(std::move(c))) {
       return nullptr;
     }
-
-    T *c = new T(name, args...);
-    all_tcs_.emplace(name, c);
-    return c;
+    return raw;
   }
 
   struct PriorityArgs {
@@ -753,29 +755,22 @@ class TrafficClassBuilder {
     return CreateTrafficClass<LeafTrafficClass>(name, args.task);
   }
 
-  // Attempts to clear knowledge of all classes.  Returns true upon success.
-  // Frees all TrafficClass objects that were created by this builder.
+  // Forgets every traffic class without destroying it (the schedulers and
+  // modules that own those trees still delete them). Returns true.
   static bool ClearAll();
 
-  // Attempts to clear knowledge of given class.  Returns true upon success.
+  // Forgets the given class without destroying it. Returns true upon success.
   static bool Clear(TrafficClass *c);
 
-  static const std::unordered_map<std::string, TrafficClass *> &all_tcs() {
-    return all_tcs_;
+  // Non-owning view of the runtime's traffic-class registry.
+  static const bess::control::TrafficClassRegistry::Map &all_tcs() {
+    return bess::control::runtime().traffic_classes().All();
   }
 
   // Returns the TrafficClass * with the given name or nullptr if not found.
   static TrafficClass *Find(const std::string &name) {
-    auto it = all_tcs_.find(name);
-    if (it != all_tcs_.end()) {
-      return it->second;
-    }
-    return nullptr;
+    return bess::control::runtime().traffic_classes().Find(name);
   }
-
- private:
-  // A collection of all TCs in the system, mapped from their textual name.
-  static std::unordered_map<std::string, TrafficClass *> all_tcs_;
 };
 
 }  // namespace bess

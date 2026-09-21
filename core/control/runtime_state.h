@@ -41,6 +41,8 @@ class Module;
 class Port;
 
 namespace bess {
+class TrafficClass;
+
 namespace control {
 
 // Mutable instance state has an owner.
@@ -135,6 +137,41 @@ class ModuleRegistry {
   std::unordered_set<std::string> task_names_;
 };
 
+// Owns the live traffic classes, keyed by name. Traffic classes form trees
+// (scheduler roots, TC hierarchies, leaf classes attached to module tasks), so
+// teardown paths that delete a tree hand the entries back before deleting:
+// `Release`/`ReleaseTree` erase registry entries without destroying objects,
+// which is what keeps destruction out of the destructors.
+class TrafficClassRegistry {
+ public:
+  using Map = std::map<std::string, std::unique_ptr<TrafficClass>>;
+
+  // Takes ownership on success; false (leaving ownership with the caller) if
+  // the name is already registered.
+  bool Register(std::unique_ptr<TrafficClass> &&c);
+
+  TrafficClass *Find(const std::string &name) const;
+  bool Contains(const std::string &name) const { return Find(name) != nullptr; }
+  size_t Size() const { return classes_.size(); }
+  bool Empty() const { return classes_.empty(); }
+
+  // Non-owning view, for readers that need to iterate.
+  const Map &All() const { return classes_; }
+
+  // Erases `c`'s entry (and, for ReleaseTree, its descendants' entries)
+  // without deleting anything. The caller destroys the objects.
+  bool Release(TrafficClass *c);
+  void ReleaseTree(TrafficClass *root);
+
+  // Forgets every traffic class without destroying it (legacy `ClearAll`
+  // semantics: the schedulers and modules that own those trees still delete
+  // them, and unowned orphans are leaked exactly as before).
+  void ReleaseAll();
+
+ private:
+  Map classes_;
+};
+
 // The state of the running pipeline. G0 keeps exactly one active instance
 // (created on first use); later commits hand it to the transaction engine
 // explicitly instead of reaching for it.
@@ -144,6 +181,7 @@ class RuntimeState {
 
   PortRegistry &ports() { return ports_; }
   ModuleRegistry &modules() { return modules_; }
+  TrafficClassRegistry &traffic_classes() { return traffic_classes_; }
 
   RuntimeState(const RuntimeState &) = delete;
   RuntimeState &operator=(const RuntimeState &) = delete;
@@ -153,6 +191,7 @@ class RuntimeState {
 
   PortRegistry ports_;
   ModuleRegistry modules_;
+  TrafficClassRegistry traffic_classes_;
 };
 
 // Accessor for code that needs the runtime it is operating in. Module
