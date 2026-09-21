@@ -32,6 +32,7 @@
 #include <cerrno>
 #include <chrono>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -40,6 +41,8 @@
 #include "control/control_plane.h"
 #include "control/runtime_state.h"
 #include "control/worker_manager.h"
+#include "module.h"
+#include "scheduler.h"
 #include "worker.h"
 
 namespace bess {
@@ -157,6 +160,65 @@ ControlResult<void> CheckReversibility(const PipelinePlan &plan) {
     }
   }
 
+  // Retirement is not undoable, so prove its preconditions now, while nothing
+  // has changed: a plan whose retire phase could fail is refused instead of
+  // committing and then discovering it cannot finish the job.
+  std::set<std::string> removed_modules;
+  for (const PlanOperation &op : plan.retire_ops) {
+    if (const auto *remove = std::get_if<RemoveModuleOp>(&op)) {
+      removed_modules.insert(remove->name);
+    }
+  }
+
+  for (const PlanOperation &op : plan.retire_ops) {
+    if (const auto *remove = std::get_if<RemovePortOp>(&op)) {
+      const Port *port = state.ports().Find(remove->name);
+      if (port == nullptr) {
+        continue;  // already gone; nothing to retire
+      }
+      for (packet_dir_t dir : {PACKET_DIR_INC, PACKET_DIR_OUT}) {
+        for (queue_t qid = 0; qid < port->num_queues[dir]; qid++) {
+          const module *user = port->users[dir][qid];
+          if (user == nullptr) {
+            continue;
+          }
+          const auto *user_module = reinterpret_cast<const Module *>(user);
+          if (removed_modules.count(user_module->name()) == 0) {
+            return std::unexpected(Unsupported(
+                "port", remove->name,
+                "still in use by module '" + user_module->name() +
+                    "', which this plan keeps"));
+          }
+        }
+      }
+    }
+
+    if (const auto *remove = std::get_if<RemoveWorkerOp>(&op)) {
+      const Worker *worker = state.workers().Get(remove->wid);
+      if (worker == nullptr) {
+        continue;  // already gone
+      }
+      const TrafficClass *root = worker->scheduler()->root();
+      if (root == nullptr) {
+        continue;
+      }
+      for (const auto &pair : state.traffic_classes().All()) {
+        TrafficClass *c = pair.second.get();
+        if (c->policy() != POLICY_LEAF || c->Root() != root) {
+          continue;
+        }
+        const Module *owner =
+            static_cast<LeafTrafficClass *>(c)->task()->module();
+        if (removed_modules.count(owner->name()) == 0) {
+          return std::unexpected(Unsupported(
+              "worker", std::to_string(remove->wid),
+              "still runs tasks of module '" + owner->name() +
+                  "', which this plan keeps"));
+        }
+      }
+    }
+  }
+
   return {};
 }
 
@@ -207,9 +269,9 @@ ControlResult<void> Transaction::Commit() {
   return {};
 }
 
-void Transaction::Retire() {
+ControlResult<void> Transaction::Retire() {
   if (plan_.retire_ops.empty()) {
-    return;
+    return {};
   }
 
   const auto start = std::chrono::steady_clock::now();
@@ -221,15 +283,15 @@ void Transaction::Retire() {
   for (const PlanOperation &op : plan_.retire_ops) {
     if (auto injected = MaybeInjectFailure(TransactionPhase::kRetire, op);
         injected.has_value()) {
-      // Retirement is not undoable by construction; an injected failure here
-      // is reported the same way a real one is.
-      LOG(ERROR) << "retire step injected failure: " << injected->message;
-      continue;
+      return std::unexpected(*injected);
     }
-    ExecuteRetireOp(op);
+    if (auto result = ExecuteRetireOp(op); !result) {
+      return std::unexpected(result.error());
+    }
   }
 
   timing_.retire_us = MicrosSince(start);
+  return {};
 }
 
 void Transaction::Abort() noexcept {
@@ -257,7 +319,10 @@ void Transaction::Abort() noexcept {
         result = plane_->RemoveTcLocked(undo.name);
         break;
       case Undo::Kind::kReparentTc:
-        result = plane_->UpdateTcParentLocked(undo.tc);
+        result = plane_->ReparentTcLocked(undo.tc);
+        break;
+      case Undo::Kind::kRestoreTcParams:
+        result = plane_->UpdateTcParamsLocked(undo.tc);
         break;
     }
 
@@ -366,7 +431,7 @@ ControlResult<void> Transaction::ExecuteCommitOp(const PlanOperation &op) {
   if (const auto *reparent = std::get_if<ReparentTcOp>(&op)) {
     const TrafficClassSnapshot *before = FindTc(before_, reparent->spec.name);
 
-    auto result = plane_->UpdateTcParentLocked(reparent->spec);
+    auto result = plane_->ReparentTcLocked(reparent->spec);
     if (!result) {
       return std::unexpected(result.error());
     }
@@ -384,6 +449,34 @@ ControlResult<void> Transaction::ExecuteCommitOp(const PlanOperation &op) {
     return {};
   }
 
+  if (const auto *params = std::get_if<UpdateTcParamsOp>(&op)) {
+    const TrafficClassSnapshot *before = FindTc(before_, params->spec.name);
+
+    auto result = plane_->UpdateTcParamsLocked(params->spec);
+    if (!result) {
+      return std::unexpected(result.error());
+    }
+
+    Undo undo{Undo::Kind::kRestoreTcParams, params->spec.name, {}, -1, {}};
+    if (before != nullptr) {
+      // Restore what the class had: same identity, previous parameters.
+      undo.tc = params->spec;
+      undo.tc.resource = before->resource;
+      undo.tc.limit.clear();
+      undo.tc.max_burst.clear();
+      if (before->limit != 0) {
+        undo.tc.limit[before->resource] = static_cast<int64_t>(before->limit);
+      }
+      if (before->max_burst != 0) {
+        undo.tc.max_burst[before->resource] =
+            static_cast<int64_t>(before->max_burst);
+      }
+    }
+    undo_.push_back(undo);
+    ops_executed_++;
+    return {};
+  }
+
   if (std::get_if<RemoveTcOp>(&op)) {
     // A policy change is expressed as remove+create; the remove half is
     // destructive, which is why CheckReversibility refuses such plans.
@@ -393,7 +486,7 @@ ControlResult<void> Transaction::ExecuteCommitOp(const PlanOperation &op) {
   return std::unexpected(Err(EINVAL, "unexpected commit operation"));
 }
 
-void Transaction::ExecuteRetireOp(const PlanOperation &op) {
+ControlResult<void> Transaction::ExecuteRetireOp(const PlanOperation &op) {
   ControlResult<void> result;
 
   if (const auto *remove = std::get_if<RemoveTcOp>(&op)) {
@@ -405,16 +498,11 @@ void Transaction::ExecuteRetireOp(const PlanOperation &op) {
   } else if (const auto *remove = std::get_if<RemoveWorkerOp>(&op)) {
     result = plane_->DestroyWorkerLocked(remove->wid);
   } else {
-    LOG(ERROR) << "unexpected retire operation";
-    return;
+    return std::unexpected(Err(EINVAL, "unexpected retire operation"));
   }
 
-  if (!result) {
-    // Retirement happens after the transition succeeded; report, do not
-    // pretend the transaction failed (it did not).
-    LOG(ERROR) << "retire step failed: " << result.error().message;
-  }
   ops_executed_++;
+  return result;
 }
 
 }  // namespace control

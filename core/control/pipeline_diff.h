@@ -46,8 +46,9 @@ namespace control {
 enum class ChangeKind {
   kCreate,
   kRemove,
-  kReplace,
-  kUpdate,
+  kReplace,       // cannot be changed in place: rebuild it
+  kUpdate,        // reattach (parent, priority or share)
+  kUpdateParams,  // change parameters in place (rate limit, burst, resource)
   kUnchanged,
 };
 
@@ -79,7 +80,7 @@ struct WorkerChange {
 
 struct TrafficClassChange {
   std::string name;
-  ChangeKind kind = ChangeKind::kUnchanged;  // kUpdate == reparent
+  ChangeKind kind = ChangeKind::kUnchanged;
   TrafficClassSpec desired;
 };
 

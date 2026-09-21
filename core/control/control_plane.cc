@@ -74,7 +74,15 @@ ControlError ErrorFromLegacy(int code, const std::string& message) {
 
 ControlResult<PortInfo> ControlPlane::CreatePort(const PortSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return CreatePortLocked(spec);
+  auto result = CreatePortLocked(spec);
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<PortInfo> ControlPlane::CreatePortLocked(const PortSpec& spec) {
@@ -179,7 +187,15 @@ ControlResult<PortInfo> ControlPlane::CreatePortLocked(const PortSpec& spec) {
 
 ControlResult<void> ControlPlane::DestroyPort(const std::string& name) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return DestroyPortLocked(name);
+  auto result = DestroyPortLocked(name);
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<void> ControlPlane::DestroyPortLocked(const std::string& name) {
@@ -203,7 +219,15 @@ ControlResult<void> ControlPlane::DestroyPortLocked(const std::string& name) {
 ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConf(
     const std::string& name, const PortConfSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return SetPortConfLocked(name, spec);
+  auto result = SetPortConfLocked(name, spec);
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConfLocked(const std::string& name, const PortConfSpec& spec) {
@@ -232,7 +256,15 @@ ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConfLocked(const s
 
 ControlResult<void> ControlPlane::ResetPorts() {
   std::lock_guard<std::mutex> lock(mutex_);
-  return ResetPortsLocked();
+  auto result = ResetPortsLocked();
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<void> ControlPlane::ResetPortsLocked() {
@@ -263,7 +295,15 @@ ControlResult<void> ControlPlane::ResetPortsLocked() {
 
 ControlResult<std::string> ControlPlane::CreateModule(const ModuleSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return CreateModuleLocked(spec);
+  auto result = CreateModuleLocked(spec);
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<std::string> ControlPlane::CreateModuleLocked(const ModuleSpec& spec) {
@@ -309,7 +349,15 @@ ControlResult<std::string> ControlPlane::CreateModuleLocked(const ModuleSpec& sp
 
 ControlResult<void> ControlPlane::DestroyModule(const std::string& name) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return DestroyModuleLocked(name);
+  auto result = DestroyModuleLocked(name);
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<void> ControlPlane::DestroyModuleLocked(const std::string& name) {
@@ -337,7 +385,15 @@ ControlResult<void> ControlPlane::DestroyModuleLocked(const std::string& name) {
 
 ControlResult<void> ControlPlane::ResetModules() {
   std::lock_guard<std::mutex> lock(mutex_);
-  return ResetModulesLocked();
+  auto result = ResetModulesLocked();
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<void> ControlPlane::ResetModulesLocked() {
@@ -351,7 +407,15 @@ ControlResult<void> ControlPlane::ResetModulesLocked() {
 
 ControlResult<void> ControlPlane::ConnectModules(const ConnectionSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return ConnectModulesLocked(spec);
+  auto result = ConnectModulesLocked(spec);
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<void> ControlPlane::ConnectModulesLocked(const ConnectionSpec& spec) {
@@ -405,7 +469,15 @@ ControlResult<void> ControlPlane::ConnectModulesLocked(const ConnectionSpec& spe
 ControlResult<void> ControlPlane::DisconnectModules(
     const DisconnectionSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return DisconnectModulesLocked(spec);
+  auto result = DisconnectModulesLocked(spec);
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<void> ControlPlane::DisconnectModulesLocked(const DisconnectionSpec& spec) {
@@ -438,7 +510,15 @@ ControlResult<void> ControlPlane::DisconnectModulesLocked(const DisconnectionSpe
 ControlResult<void> ControlPlane::AddWorker(uint64_t wid, uint64_t core,
                                             const std::string& scheduler) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return AddWorkerLocked(wid, core, scheduler);
+  auto result = AddWorkerLocked(wid, core, scheduler);
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<void> ControlPlane::AddWorkerLocked(uint64_t wid, uint64_t core, const std::string& scheduler) {
@@ -463,7 +543,15 @@ ControlResult<void> ControlPlane::AddWorkerLocked(uint64_t wid, uint64_t core, c
 
 ControlResult<void> ControlPlane::DestroyWorker(uint64_t wid) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return DestroyWorkerLocked(wid);
+  auto result = DestroyWorkerLocked(wid);
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<void> ControlPlane::DestroyWorkerLocked(uint64_t wid) {
@@ -493,7 +581,15 @@ ControlResult<void> ControlPlane::DestroyWorkerLocked(uint64_t wid) {
 
 ControlResult<void> ControlPlane::ResetWorkers() {
   std::lock_guard<std::mutex> lock(mutex_);
-  return ResetWorkersLocked();
+  auto result = ResetWorkersLocked();
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<void> ControlPlane::ResetWorkersLocked() {
@@ -552,7 +648,15 @@ ControlResult<void> ControlPlane::ResumeWorker(uint64_t wid) {
 
 ControlResult<void> ControlPlane::AddTc(const TrafficClassSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return AddTcLocked(spec);
+  auto result = AddTcLocked(spec);
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<void> ControlPlane::AddTcLocked(const TrafficClassSpec& spec) {
@@ -624,7 +728,15 @@ ControlResult<void> ControlPlane::AddTcLocked(const TrafficClassSpec& spec) {
 
 ControlResult<void> ControlPlane::UpdateTcParams(const TrafficClassSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
+  auto result = UpdateTcParamsLocked(spec);
+  if (result) {
+    runtime().BumpGeneration();
+  }
+  return result;
+}
 
+ControlResult<void> ControlPlane::UpdateTcParamsLocked(
+    const TrafficClassSpec& spec) {
   WorkerPauser wp;
 
   ControlResult<bess::TrafficClass*> found = FindTc(spec);
@@ -664,7 +776,15 @@ ControlResult<void> ControlPlane::UpdateTcParams(const TrafficClassSpec& spec) {
 
 ControlResult<void> ControlPlane::UpdateTcParent(const TrafficClassSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return UpdateTcParentLocked(spec);
+  auto result = UpdateTcParentLocked(spec);
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<void> ControlPlane::UpdateTcParentLocked(const TrafficClassSpec& spec) {
@@ -701,6 +821,22 @@ ControlResult<void> ControlPlane::UpdateTcParentLocked(const TrafficClassSpec& s
   return AttachTc(c, spec);
 }
 
+// A class that is waiting to be woken up must not stay reachable from a
+// scheduler once it (or an ancestor) is moved or destroyed: the wakeup queue
+// holds raw pointers, and a stale one would be followed on the next wakeup.
+void ControlPlane::RemoveSubtreeFromWakeupQueues(bess::TrafficClass* c) {
+  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+    Worker* worker = runtime().workers().Get(wid);
+    if (worker != nullptr) {
+      worker->scheduler()->wakeup_queue().Remove(c);
+    }
+  }
+
+  for (bess::TrafficClass* child : c->Children()) {
+    RemoveSubtreeFromWakeupQueues(child);
+  }
+}
+
 // Destroys a traffic class that belongs to the control plane (leaf classes
 // belong to their module). Used by the transaction engine's retire phase and
 // to undo a TC it created.
@@ -713,6 +849,9 @@ ControlResult<void> ControlPlane::RemoveTcLocked(const std::string& name) {
     return std::unexpected(
         Err(EINVAL, "Tc '%s' is a leaf class owned by a module", name.c_str()));
   }
+
+  RemoveSubtreeFromWakeupQueues(c);
+
   if (!detach_tc(c)) {
     return std::unexpected(
         Err(EBUSY, "Cannot detach '%s' while it is part of a worker",
@@ -724,9 +863,37 @@ ControlResult<void> ControlPlane::RemoveTcLocked(const std::string& name) {
   return {};
 }
 
+ControlResult<void> ControlPlane::ReparentTcLocked(const TrafficClassSpec& spec) {
+  bess::TrafficClass* c = TrafficClassBuilder::Find(spec.name);
+  if (!c) {
+    return std::unexpected(
+        Err(ENOENT, "Tc '%s' doesn't exist", spec.name.c_str()));
+  }
+  if (c->policy() == bess::POLICY_LEAF) {
+    return std::unexpected(Err(EINVAL, "Tc '%s' is a leaf class owned by a module",
+                               spec.name.c_str()));
+  }
+
+  RemoveSubtreeFromWakeupQueues(c);
+
+  if (!detach_tc(c)) {
+    return std::unexpected(Err(EBUSY, "Cannot detach '%s'", spec.name.c_str()));
+  }
+
+  return AttachTc(c, spec);
+}
+
 ControlResult<void> ControlPlane::ResetTcs() {
   std::lock_guard<std::mutex> lock(mutex_);
-  return ResetTcsLocked();
+  auto result = ResetTcsLocked();
+  if (result) {
+    // Every successful structural mutation advances the generation, so
+    // the legacy RPC path and the transactional path share one sequence
+    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
+    // ApplyPipeline() bumps once for the whole transaction.
+    runtime().BumpGeneration();
+  }
+  return result;
 }
 
 ControlResult<void> ControlPlane::ResetTcsLocked() {
@@ -1249,7 +1416,22 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
     transaction.Abort();
     return std::unexpected(committed.error());
   }
-  transaction.Retire();
+
+  // Retirement is not undoable, so its preconditions were proven before the
+  // commit (CheckReversibility). If a step still fails, the new state *is*
+  // active -- the generation has to say so -- but the caller is told, because
+  // returning success would claim a pipeline that does not exist.
+  if (auto retired = transaction.Retire(); !retired) {
+    runtime().BumpGeneration();
+
+    ControlError error = Err(retired.error().err,
+                             "pipeline committed, but retirement failed: %s",
+                             retired.error().message.c_str());
+    error.code = ControlErrorCode::kResourceFailure;
+    error.object = retired.error().object;
+    error.field = "retire";
+    return std::unexpected(error);
+  }
 
   runtime().BumpGeneration();
 
@@ -1300,7 +1482,8 @@ ControlResult<void> ControlPlane::Reset() {
 
   LOG(INFO) << "*** ResetAll requested ***";
 
-  // One transaction, one lock, no RPC handler calling other RPC handlers.
+  // One transaction, one lock, one generation bump, no RPC handler calling
+  // other RPC handlers.
   if (auto m = ResetModulesLocked(); !m) {
     return std::unexpected(m.error());
   }
@@ -1314,6 +1497,7 @@ ControlResult<void> ControlPlane::Reset() {
     return std::unexpected(w.error());
   }
 
+  runtime().BumpGeneration();
   return {};
 }
 

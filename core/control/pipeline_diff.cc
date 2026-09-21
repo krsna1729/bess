@@ -48,6 +48,17 @@ bool QueueMatches(uint64_t desired, uint64_t current) {
   return desired == 0 || desired == current;
 }
 
+// The legacy API carries rate-limit parameters as maps keyed by resource name.
+uint64_t DesiredLimit(const TrafficClassSpec &spec) {
+  auto it = spec.limit.find(spec.resource);
+  return it == spec.limit.end() ? 0 : static_cast<uint64_t>(it->second);
+}
+
+uint64_t DesiredMaxBurst(const TrafficClassSpec &spec) {
+  auto it = spec.max_burst.find(spec.resource);
+  return it == spec.max_burst.end() ? 0 : static_cast<uint64_t>(it->second);
+}
+
 const PortSnapshot *FindPort(const PipelineSnapshot &snapshot,
                              const std::string &name) {
   for (const PortSnapshot &port : snapshot.ports) {
@@ -226,12 +237,24 @@ PipelineDiff Diff(const PipelineSnapshot &current,
     if (active == nullptr) {
       diff.traffic_classes.push_back(
           TrafficClassChange{tc.name, ChangeKind::kCreate, tc});
-    } else if (active->parent != tc.parent) {
-      diff.traffic_classes.push_back(
-          TrafficClassChange{tc.name, ChangeKind::kUpdate, tc});  // reparent
     } else if (active->policy != tc.policy) {
+      // A different policy is a different class: it cannot be changed in place.
       diff.traffic_classes.push_back(
           TrafficClassChange{tc.name, ChangeKind::kReplace, tc});
+    } else if (active->parent != tc.parent ||
+               active->has_priority != tc.has_priority ||
+               active->priority != tc.priority ||
+               active->has_share != tc.has_share ||
+               active->share != tc.share) {
+      // Attachment is reversible: detach and reattach.
+      diff.traffic_classes.push_back(
+          TrafficClassChange{tc.name, ChangeKind::kUpdate, tc});
+    } else if (active->resource != tc.resource ||
+               active->limit != DesiredLimit(tc) ||
+               active->max_burst != DesiredMaxBurst(tc)) {
+      // Parameters change in place, and are undone by restoring the old ones.
+      diff.traffic_classes.push_back(
+          TrafficClassChange{tc.name, ChangeKind::kUpdateParams, tc});
     } else {
       diff.traffic_classes.push_back(
           TrafficClassChange{tc.name, ChangeKind::kUnchanged, tc});

@@ -46,6 +46,8 @@
 #include "control/runtime_state.h"
 #include "control/transaction.h"
 #include "control/worker_manager.h"
+#include "pb/module_msg.pb.h"
+#include "pb/port_msg.pb.h"
 #include "opts.h"
 #include "packet_pool.h"
 #include "port.h"
@@ -381,10 +383,10 @@ TEST_F(ApplyPipelineTest, InjectedFailuresLeaveNoTrace) {
   EXPECT_TRUE(diff->empty());
 }
 
-// Retirement is not undoable by construction, so an injected retire failure is
-// reported and the transaction still counts as applied: the new state is
-// active either way.
-TEST_F(ApplyPipelineTest, InjectedRetireFailureIsReportedNotRolledBack) {
+// Retirement is not undoable, so its preconditions are proven before the
+// commit; if a step still fails, the caller is told -- an ordinary successful
+// apply must never claim a pipeline that does not exist.
+TEST_F(ApplyPipelineTest, InjectedRetireFailureIsReportedAsFailure) {
   ASSERT_TRUE(control_plane_->ApplyPipeline(FullPipeline(), {}).has_value());
   const uint64_t generation = bess::control::runtime().generation();
 
@@ -404,12 +406,222 @@ TEST_F(ApplyPipelineTest, InjectedRetireFailureIsReportedNotRolledBack) {
   auto applied = control_plane_->ApplyPipeline(reduced, {});
   bess::control::ClearFailureInjector();
 
-  ASSERT_TRUE(applied.has_value()) << applied.error().message;
-  EXPECT_EQ(generation + 1, applied->generation);
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(bess::control::ControlErrorCode::kResourceFailure,
+            applied.error().code);
+  EXPECT_NE(std::string::npos,
+            applied.error().message.find("retirement failed"));
 
-  // The module that failed to retire is still there: the transaction is
-  // committed, and the failure is visible in the log rather than hidden.
+  // The new state *is* active -- the commit happened -- so the generation says
+  // so, and the module that could not be retired is still there. The caller
+  // knows, which is the difference from silently succeeding.
+  EXPECT_EQ(generation + 1, bess::control::runtime().generation());
   EXPECT_TRUE(bess::control::runtime().modules().Contains("sink"));
+}
+
+// The invariant: a successful apply leaves exactly the desired state.
+TEST_F(ApplyPipelineTest, SuccessfulApplyMatchesDesiredState) {
+  auto expect_desired = [this](const PipelineSpec &desired) {
+    const PipelineSpec running =
+        SpecFromSnapshot(control_plane_->GetPipeline());
+    PipelineSpec expected = desired;
+    bess::control::Normalize(&expected);
+    PipelineSpec observed = running;
+    bess::control::Normalize(&observed);
+    EXPECT_TRUE(observed == expected) << "active state differs from desired";
+  };
+
+  // Creation.
+  PipelineSpec full = FullPipeline();
+  ASSERT_TRUE(control_plane_->ApplyPipeline(full, {}).has_value());
+  expect_desired(full);
+
+  // Change: add a module and a connection.
+  bess::control::ModuleSpec extra;
+  extra.name = "extra";
+  extra.mclass = "Bypass";
+  full.modules.push_back(extra);
+  bess::control::ConnectionSpec edge;
+  edge.upstream = "sink";
+  edge.ogate = 0;
+  edge.downstream = "extra";
+  edge.igate = 0;
+  full.connections.push_back(edge);
+  ASSERT_TRUE(control_plane_->ApplyPipeline(full, {}).has_value());
+  expect_desired(full);
+
+  // Removal.
+  full.modules.pop_back();
+  full.connections.pop_back();
+  ASSERT_TRUE(control_plane_->ApplyPipeline(full, {}).has_value());
+  expect_desired(full);
+}
+
+// Traffic-class parameters are part of desired state: a changed rate limit is a
+// change, and applying it moves the runtime.
+TEST_F(ApplyPipelineTest, RateLimitParameterChangesAreVisibleAndApplied) {
+  PipelineSpec spec = FullPipeline();
+  spec.traffic_classes.clear();
+
+  bess::control::TrafficClassSpec limiter;
+  limiter.name = "limiter";
+  limiter.policy = "rate_limit";
+  limiter.resource = "bit";
+  limiter.limit["bit"] = 1000000000;  // 1 Gbps
+  limiter.max_burst["bit"] = 1000000;
+  limiter.wid = 0;
+  spec.traffic_classes.push_back(limiter);
+
+  bess::control::TrafficClassSpec child;
+  child.name = "child";
+  child.policy = "round_robin";
+  child.parent = "limiter";
+  spec.traffic_classes.push_back(child);
+
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+
+  // Same pipeline, ten times slower: this must not be "unchanged".
+  PipelineSpec slower = spec;
+  slower.traffic_classes[0].limit["bit"] = 100000000;  // 100 Mbps
+
+  auto diff = control_plane_->DiffPipeline(slower);
+  ASSERT_TRUE(diff.has_value()) << diff.error().message;
+  ASSERT_EQ(1u, diff->traffic_classes.size());
+  EXPECT_EQ(bess::control::ChangeKind::kUpdateParams,
+            diff->traffic_classes[0].kind);
+  EXPECT_EQ("limiter", diff->traffic_classes[0].name);
+
+  auto applied = control_plane_->ApplyPipeline(slower, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+
+  // The snapshot shows the new rate, and the runtime matches desired state.
+  bool found = false;
+  for (const auto &tc : control_plane_->GetPipeline().traffic_classes) {
+    if (tc.name == "limiter") {
+      found = true;
+      EXPECT_EQ(100000000u, tc.limit);
+    }
+  }
+  EXPECT_TRUE(found);
+
+  const PipelineSpec running =
+      SpecFromSnapshot(control_plane_->GetPipeline());
+  auto settled = control_plane_->DiffPipeline(running);
+  ASSERT_TRUE(settled.has_value());
+  EXPECT_TRUE(settled->empty());
+}
+
+// Attachment changes (priority, share) are reversible: detach and reattach.
+TEST_F(ApplyPipelineTest, AttachmentChangesAreReversibleUpdates) {
+  PipelineSpec spec = FullPipeline();
+  spec.traffic_classes.clear();
+
+  bess::control::TrafficClassSpec priority;
+  priority.name = "prio";
+  priority.policy = "priority";
+  priority.wid = 0;
+  spec.traffic_classes.push_back(priority);
+
+  bess::control::TrafficClassSpec child;
+  child.name = "child";
+  child.policy = "round_robin";
+  child.parent = "prio";
+  child.has_priority = true;
+  child.priority = 10;
+  spec.traffic_classes.push_back(child);
+
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+
+  PipelineSpec reprioritised = spec;
+  reprioritised.traffic_classes[1].priority = 20;
+
+  auto diff = control_plane_->DiffPipeline(reprioritised);
+  ASSERT_TRUE(diff.has_value()) << diff.error().message;
+  ASSERT_EQ(1u, diff->traffic_classes.size());
+  EXPECT_EQ(bess::control::ChangeKind::kUpdate, diff->traffic_classes[0].kind);
+
+  auto applied = control_plane_->ApplyPipeline(reprioritised, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+
+  const PipelineSpec running =
+      SpecFromSnapshot(control_plane_->GetPipeline());
+  auto settled = control_plane_->DiffPipeline(running);
+  ASSERT_TRUE(settled.has_value());
+  EXPECT_TRUE(settled->empty());
+}
+
+// A different policy is a different class: refused, not silently ignored.
+TEST_F(ApplyPipelineTest, PolicyChangeIsRefusedTransactionally) {
+  ASSERT_TRUE(control_plane_->ApplyPipeline(FullPipeline(), {}).has_value());
+  const uint64_t generation = bess::control::runtime().generation();
+
+  PipelineSpec changed = FullPipeline();
+  for (auto &tc : changed.traffic_classes) {
+    if (tc.name == "child") {
+      tc.policy = "weighted_fair";
+      tc.resource = "packet";
+      tc.has_share = true;
+      tc.share = 3;
+    }
+  }
+
+  auto diff = control_plane_->DiffPipeline(changed);
+  ASSERT_TRUE(diff.has_value()) << diff.error().message;
+  ASSERT_EQ(1u, diff->traffic_classes.size());
+  EXPECT_EQ(bess::control::ChangeKind::kReplace, diff->traffic_classes[0].kind);
+
+  auto applied = control_plane_->ApplyPipeline(changed, {});
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(bess::control::ControlErrorCode::kUnsupportedTransaction,
+            applied.error().code);
+  EXPECT_EQ(generation, bess::control::runtime().generation());
+}
+
+// A plan whose retirement cannot be guaranteed is refused up front: the port is
+// still in use by a module the plan keeps.
+TEST_F(ApplyPipelineTest, RetirementPreconditionsAreProvenUpFront) {
+  PipelineSpec spec = FullPipeline();
+
+  bess::pb::PMDPortArg port_arg;
+  port_arg.set_vdev("net_null0");
+  bess::control::PortSpec port;
+  port.name = "p0";
+  port.driver = "PMDPort";
+  port.num_rx_queues = 1;
+  port.num_tx_queues = 1;
+  port.rx_queue_size = 1024;
+  port.tx_queue_size = 1024;
+  port.arg.PackFrom(port_arg);
+  spec.ports.push_back(port);
+
+  bess::pb::QueueIncArg queue_arg;
+  queue_arg.set_port("p0");
+  queue_arg.set_qid(0);
+  bess::control::ModuleSpec reader;
+  reader.name = "reader";
+  reader.mclass = "QueueInc";
+  reader.arg.PackFrom(queue_arg);
+  spec.modules.push_back(reader);
+
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+
+  // Keep the module, drop the port it reads from: the port cannot be retired
+  // while the module holds its queues, so the plan must be refused before
+  // anything happens.
+  PipelineSpec without_port = spec;
+  without_port.ports.clear();
+
+  const uint64_t generation = bess::control::runtime().generation();
+  const PipelineSnapshot active = control_plane_->GetPipeline();
+
+  auto applied = control_plane_->ApplyPipeline(without_port, {});
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(bess::control::ControlErrorCode::kUnsupportedTransaction,
+            applied.error().code);
+  EXPECT_EQ("port", applied.error().object);
+  EXPECT_NE(std::string::npos, applied.error().message.find("still in use"));
+  EXPECT_EQ(generation, bess::control::runtime().generation());
+  EXPECT_TRUE(control_plane_->GetPipeline() == active);
 }
 
 // Pause duration is observable from the start.

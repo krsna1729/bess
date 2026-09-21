@@ -89,11 +89,29 @@ struct WorkerSnapshot {
   bool operator==(const WorkerSnapshot &other) const = default;
 };
 
+// A traffic class as the runtime holds it. Beyond identity and placement this
+// carries the *parameters* that decide behaviour -- the resource a weighted-fair
+// or rate-limit class regulates, its limit and burst, and the priority or share
+// with which it hangs off its parent -- so that desired state which changes only
+// a parameter is not mistaken for "unchanged".
 struct TrafficClassSnapshot {
   std::string name;
   std::string parent;
   std::string policy;
   int wid = -1;
+
+  // Own parameters (weighted_fair, rate_limit).
+  std::string resource;
+  uint64_t limit = 0;
+  uint64_t max_burst = 0;
+
+  // Attachment parameters, held by the parent: priority under a priority
+  // class, share under a weighted-fair one.
+  bool has_priority = false;
+  int64_t priority = 0;
+  bool has_share = false;
+  int64_t share = 0;
+
   std::string leaf_module_name;
   uint64_t leaf_module_taskid = 0;
 

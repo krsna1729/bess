@@ -61,6 +61,7 @@ PipelinePlan Plan(const PipelineDiff &diff) {
         break;
       case ChangeKind::kRemove:
       case ChangeKind::kUnchanged:
+      case ChangeKind::kUpdateParams:  // not a port concept
         break;  // removal is a retire operation
     }
   }
@@ -140,6 +141,9 @@ PipelinePlan Plan(const PipelineDiff &diff) {
         break;  // handled above, in hierarchy order
       case ChangeKind::kUpdate:
         plan.commit_ops.push_back(ReparentTcOp{change.desired});
+        break;
+      case ChangeKind::kUpdateParams:
+        plan.commit_ops.push_back(UpdateTcParamsOp{change.desired});
         break;
       case ChangeKind::kReplace:
         // No in-place policy change: detach now, recreate in prepare-time

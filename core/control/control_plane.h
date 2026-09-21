@@ -206,6 +206,12 @@ class ControlPlane {
   ControlResult<void> DestroyWorkerLocked(uint64_t wid);
   ControlResult<void> AddTcLocked(const TrafficClassSpec& spec);
   ControlResult<void> UpdateTcParentLocked(const TrafficClassSpec& spec);
+  ControlResult<void> UpdateTcParamsLocked(const TrafficClassSpec& spec);
+  // Moves a traffic class to a new parent/priority/share. Unlike the legacy
+  // UpdateTcParent this works for a class that is currently attached to a
+  // worker: the move purges the subtree from the scheduler wakeup queues first.
+  ControlResult<void> ReparentTcLocked(const TrafficClassSpec& spec);
+  void RemoveSubtreeFromWakeupQueues(bess::TrafficClass* c);
   ControlResult<void> RemoveTcLocked(const std::string& name);
 
   ControlResult<void> ResetModulesLocked();

@@ -77,6 +77,9 @@ struct CreateTcOp {
 struct ReparentTcOp {
   TrafficClassSpec spec;
 };
+struct UpdateTcParamsOp {
+  TrafficClassSpec spec;
+};
 struct RemoveTcOp {
   std::string name;
 };
@@ -84,7 +87,8 @@ struct RemoveTcOp {
 using PlanOperation = std::variant<CreatePortOp, UpdatePortOp, RemovePortOp,
                                    CreateModuleOp, RemoveModuleOp, ConnectOp,
                                    DisconnectOp, AddWorkerOp, RemoveWorkerOp,
-                                   CreateTcOp, ReparentTcOp, RemoveTcOp>;
+                                   CreateTcOp, ReparentTcOp, UpdateTcParamsOp,
+                                   RemoveTcOp>;
 
 // A dependency-ordered plan in three phases:
 //

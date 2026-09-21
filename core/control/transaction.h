@@ -124,9 +124,11 @@ class Transaction {
   // it. On failure the transaction is aborted (see Abort()).
   ControlResult<void> Commit();
 
-  // Destroys what the new state replaced. Best effort and not undoable: by the
-  // time it runs, the new state is already active.
-  void Retire();
+  // Destroys what the new state replaced. Not undoable -- by the time it runs
+  // the new state is active -- so the planner proves its preconditions up front
+  // (see CheckReversibility) and a failure here is a contract violation that
+  // the caller must hear about rather than a step to ignore.
+  ControlResult<void> Retire();
 
   // Undoes everything Prepare and Commit did, in reverse order.
   void Abort() noexcept;
@@ -144,8 +146,9 @@ class Transaction {
       kRemoveWorker,
       kReconnect,   // restore the connection that Disconnect removed
       kDisconnect,  // undo Connect
-      kRemoveTc,    // undo a TC that this transaction created
-      kReparentTc,  // put a TC back under its previous parent
+      kRemoveTc,        // undo a TC that this transaction created
+      kReparentTc,      // put a TC back under its previous parent
+      kRestoreTcParams, // put a TC's parameters back
     };
 
     Kind kind;
@@ -157,7 +160,7 @@ class Transaction {
 
   ControlResult<void> ExecutePrepareOp(const PlanOperation &op);
   ControlResult<void> ExecuteCommitOp(const PlanOperation &op);
-  void ExecuteRetireOp(const PlanOperation &op);
+  ControlResult<void> ExecuteRetireOp(const PlanOperation &op);
 
   ControlPlane *plane_;
   PipelinePlan plan_;

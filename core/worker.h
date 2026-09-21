@@ -105,7 +105,7 @@ class Worker {
 
   bess::PacketPool *packet_pool() { return packet_pool_; }
 
-  bess::Scheduler *scheduler() { return scheduler_; }
+  bess::Scheduler *scheduler() const { return scheduler_; }
 
   uint64_t silent_drops() { return silent_drops_; }
   void set_silent_drops(uint64_t drops) { silent_drops_ = drops; }

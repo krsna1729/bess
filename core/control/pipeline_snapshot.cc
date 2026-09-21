@@ -117,7 +117,20 @@ PipelineSpec SpecFromSnapshot(const PipelineSnapshot &snapshot) {
     entry.parent =
         (!tc.parent.empty() && tc.parent[0] == '!') ? "" : tc.parent;
     entry.policy = tc.policy;
-    entry.wid = tc.wid;
+    // A class that hangs off a parent inherits its placement; only a root's
+    // worker is part of its desired state.
+    entry.wid = entry.parent.empty() ? tc.wid : Worker::kAnyWorker;
+    entry.resource = tc.resource;
+    entry.has_priority = tc.has_priority;
+    entry.priority = tc.priority;
+    entry.has_share = tc.has_share;
+    entry.share = tc.share;
+    if (tc.limit != 0) {
+      entry.limit[entry.resource] = static_cast<int64_t>(tc.limit);
+    }
+    if (tc.max_burst != 0) {
+      entry.max_burst[entry.resource] = static_cast<int64_t>(tc.max_burst);
+    }
     entry.leaf_module_name = tc.leaf_module_name;
     entry.leaf_module_taskid = tc.leaf_module_taskid;
     spec.traffic_classes.push_back(std::move(entry));
@@ -197,6 +210,55 @@ PipelineSnapshot SnapshotRuntime(const RuntimeState &runtime) {
                        ? TrafficPolicyName[c->policy()]
                        : "invalid";
     entry.wid = c->WorkerId();
+
+    // Parameters the class owns.
+    switch (c->policy()) {
+      case POLICY_WEIGHTED_FAIR: {
+        const auto *wrr = static_cast<const WeightedFairTrafficClass *>(c);
+        entry.resource = ResourceName.at(wrr->resource());
+        break;
+      }
+      case POLICY_RATE_LIMIT: {
+        const auto *rl = static_cast<const RateLimitTrafficClass *>(c);
+        entry.resource = ResourceName.at(rl->resource());
+        entry.limit = rl->limit_arg();
+        entry.max_burst = rl->max_burst_arg();
+        break;
+      }
+      default:
+        break;
+    }
+
+    // Parameters the parent holds for this class.
+    const TrafficClass *parent = c->parent();
+    if (parent != nullptr) {
+      switch (parent->policy()) {
+        case POLICY_PRIORITY: {
+          const auto *prio = static_cast<const PriorityTrafficClass *>(parent);
+          for (const auto &child : prio->children()) {
+            if (child.c_ == c) {
+              entry.has_priority = true;
+              entry.priority = child.priority_;
+              break;
+            }
+          }
+          break;
+        }
+        case POLICY_WEIGHTED_FAIR: {
+          const auto *wrr = static_cast<const WeightedFairTrafficClass *>(parent);
+          for (const auto &child : wrr->children()) {
+            if (child.first == c) {
+              entry.has_share = true;
+              entry.share = child.second;
+              break;
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
 
     if (c->policy() == POLICY_LEAF) {
       const auto *leaf = static_cast<const LeafTrafficClass *>(c);

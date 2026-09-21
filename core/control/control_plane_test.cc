@@ -758,4 +758,71 @@ TEST_F(ControlPlaneTest, PlanCreatesTrafficClassesParentFirst) {
   EXPECT_EQ("achild", order[1]);
 }
 
+
+// ---------------------------------------------------------------------------
+// Generation coherence: the legacy path and the transactional path share one
+// sequence
+// ---------------------------------------------------------------------------
+
+TEST_F(ControlPlaneTest, EveryStructuralMutationAdvancesTheGeneration) {
+  ControlPlane control_plane;
+  const uint64_t start = runtime_->generation();
+
+  ASSERT_TRUE(control_plane.CreateModule(ModuleSpec{"g0", "Bypass", {}})
+                  .has_value());
+  EXPECT_EQ(start + 1, runtime_->generation());
+
+  // A failed mutation changes nothing, generation included.
+  ASSERT_FALSE(control_plane.CreateModule(ModuleSpec{"g0", "Bypass", {}})
+                   .has_value());
+  EXPECT_EQ(start + 1, runtime_->generation());
+
+  ASSERT_TRUE(control_plane.CreateModule(ModuleSpec{"g1", "Bypass", {}})
+                  .has_value());
+  EXPECT_EQ(start + 2, runtime_->generation());
+
+  ASSERT_TRUE(control_plane.ConnectModules({"g0", 0, "g1", 0}).has_value());
+  EXPECT_EQ(start + 3, runtime_->generation());
+
+  ASSERT_TRUE(control_plane.DestroyModule("g1").has_value());
+  EXPECT_EQ(start + 4, runtime_->generation());
+
+  // Reads, planning and worker pause/resume are not structural mutations.
+  (void)control_plane.GetPipeline();
+  (void)control_plane.DiffPipeline(ModuleOnlySpec());
+  (void)control_plane.PlanPipeline(ModuleOnlySpec());
+  (void)control_plane.ValidatePipeline(ModuleOnlySpec());
+  (void)control_plane.PauseAll();
+  (void)control_plane.ResumeAll();
+  EXPECT_EQ(start + 4, runtime_->generation());
+
+  // Reset is one mutation, one bump.
+  ASSERT_TRUE(control_plane.Reset().has_value());
+  EXPECT_EQ(start + 5, runtime_->generation());
+}
+
+TEST_F(ControlPlaneTest, LegacyMutationsInvalidateStaleTransactions) {
+  ControlPlane control_plane;
+  const uint64_t seen_by_client = runtime_->generation();
+
+  // A client read the generation, then somebody else used the legacy path.
+  ASSERT_TRUE(control_plane.CreateModule(ModuleSpec{"stale0", "Bypass", {}})
+                  .has_value());
+  EXPECT_EQ(seen_by_client + 1, runtime_->generation());
+
+  bess::control::ApplyOptions options;
+  options.expected_generation = seen_by_client;
+  auto applied = control_plane.ApplyPipeline(ModuleOnlySpec(), options);
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(bess::control::ControlErrorCode::kConflict, applied.error().code);
+  EXPECT_EQ(seen_by_client + 1, runtime_->generation());
+
+  // With the current generation it is accepted.
+  options.expected_generation = seen_by_client + 1;
+  ASSERT_TRUE(control_plane.ApplyPipeline(ModuleOnlySpec(), options)
+                  .has_value());
+
+  ASSERT_TRUE(control_plane.Reset().has_value());
+}
+
 }  // namespace
