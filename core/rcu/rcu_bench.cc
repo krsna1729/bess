@@ -101,7 +101,9 @@ void BM_PublishWithIdleReader(benchmark::State &state) {
   published.Initialize(std::make_unique<const Table>());
 
   const uint32_t reader = 1;
-  domain.Register(reader);
+  // Registration cannot fail in these benchmarks (the id is in range
+  // and unused); check it anyway so the [[nodiscard]] result is used.
+  CHECK(domain.Register(reader).has_value());
   domain.Online(reader);
 
   for (auto _ : state) {
@@ -126,7 +128,9 @@ void BM_PublishWithReaderHolding(benchmark::State &state) {
   published.Initialize(std::make_unique<const Table>());
 
   const uint32_t reader = 1;
-  domain.Register(reader);
+  // Registration cannot fail in these benchmarks (the id is in range
+  // and unused); check it anyway so the [[nodiscard]] result is used.
+  CHECK(domain.Register(reader).has_value());
   domain.Online(reader);
 
   for (auto _ : state) {
@@ -150,7 +154,9 @@ BENCHMARK(BM_PublishWithReaderHolding);
 void BM_GracePeriodLatency(benchmark::State &state) {
   RcuDomain domain(kMaxReaders);
   const uint32_t reader = 1;
-  domain.Register(reader);
+  // Registration cannot fail in these benchmarks (the id is in range
+  // and unused); check it anyway so the [[nodiscard]] result is used.
+  CHECK(domain.Register(reader).has_value());
   domain.Online(reader);
 
   for (auto _ : state) {
