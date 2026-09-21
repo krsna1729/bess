@@ -218,12 +218,16 @@ unit_test_sources = [
 
 foreach source : unit_test_sources
   test_name = source.replace('.cc', '').replace('/', '_')
+  # The test main is ours (core/gtest_main.cc) rather than the packaged one:
+  # it configures the death-test style and keeps expected-death children from
+  # writing core dumps.
   unit_exe = executable(
     test_name,
     source,
+    'gtest_main.cc',
     include_directories: core_include,
     link_whole: runtime_whole,
-    dependencies: runtime_deps + [gtest_main_dep],
+    dependencies: runtime_deps + [gtest_dep],
     build_rpath: runtime_rpath,
   )
   test_workdir = meson.current_build_dir()

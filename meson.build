@@ -113,7 +113,6 @@ common_deps = [
 ]
 
 gtest_dep = dependency('gtest', method: 'pkg-config', required: true)
-gtest_main_dep = dependency('gtest_main', method: 'pkg-config', required: true)
 benchmark_dep = dependency('benchmark', method: 'pkg-config', required: true)
 benchmark_main_dep = dependency('benchmark_main', method: 'pkg-config',
                                 required: false)
