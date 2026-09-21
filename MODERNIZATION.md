@@ -2493,6 +2493,24 @@ testing goes through `bessctl/module_tests/*.py` against a running
         of root cause; no packet or performance result was collected. Do not
         repeat live AF_XDP/veth traffic on this host until kernel crash
         capture and an isolated test host are available.
+        The userspace follow-up used DPDK `testpmd` instead of kernel
+        `pktgen`: a `txonly` testpmd AF_XDP port on `tp-in-tx`, a BESS
+        `QueueInc -> QueueOut` path between `net_af_xdp0` on `tp-in-bess`
+        and `net_af_xdp1` on `tp-out-bess`, and an `rxonly` testpmd AF_XDP
+        port on `tp-out-rx`. The testpmd processes and BESS daemon were
+        root-owned userspace processes; the only kernel objects were the two
+        temporary veth pairs and AF_XDP sockets. Testpmd's default
+        155456-mbuf pool did not fit with no hugepages, so the experiment
+        used `--total-num-mbufs=8192`.
+        The path forwarded real 64-byte packets. Three consecutive five-second
+        BESS samples measured 1.945/1.922/1.920 Mpps in and
+        1.945/1.922/1.920 Mpps out, or 0.996/0.984/0.983 Gbps, with zero
+        BESS-reported drops. The latest testpmd live samples showed
+        2.335 Mpps / 1.195 Gbps transmitted and 1.854 Mpps / 0.949 Gbps
+        received; testpmd was generating above the steady BESS forwarding
+        rate, so those samples are not a synchronized loss measurement.
+        The userspace run completed without another reboot; all processes and
+        veths were stopped and removed afterward.
       - Small ergonomic follow-up once AF_XDP works: `PMDPortArg`
         currently exposes only `loopback` and three VLAN-offload
         booleans; long vdev devargs strings are the whole configuration
