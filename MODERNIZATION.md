@@ -1850,6 +1850,51 @@ rather than one call site).
     Meson source layout, the 7-commit landing structure with the final
     verification gate, and the G0 non-goals. Baseline: `e8c8e176`.
 
+41. **`8449ed78`** — **G0 commit 1/7: `ControlPlane` extracted from the gRPC
+    service.** `core/bessctl.cc` shrinks 1957 → 1143 lines and is now a
+    protocol adapter: protobuf request → plain C++ spec → `ControlPlane` call
+    → protobuf response/error. New `core/control/`:
+    `control_error.{h,cc}` (one internal error model: semantic
+    `ControlErrorCode`, errno-compatible `err`, legacy message text;
+    `ControlResult<T> = std::expected<T, ControlError>`) and
+    `control_plane.{h,cc}` (ports, modules, connections, workers, traffic
+    classes incl. the `AttachTc`/`FindTc` placement logic, gate hooks, resume
+    hooks, plugins, and `Reset()`).
+
+    The service-level `std::recursive_mutex` is gone: handlers no longer call
+    each other (`ResetAll` used to invoke four reset handlers), composition
+    moved into `ControlPlane::Reset()`, and the control plane owns the single
+    non-recursive writer lock. Delegating handlers take no lock; the read-only
+    handlers that still read runtime state directly take it through
+    `AcquireLock()`, the documented temporary seam until reads move behind
+    snapshot accessors.
+
+    Two legacy quirks are preserved verbatim and marked `NOTE(G0)` for the
+    registry-ownership commit rather than hidden here: `CreatePort`'s
+    silent-failure path when an existing name is reused (it leaves a stale
+    registry entry), and the code-0 failure reports that `ModuleGraph`
+    produces.
+
+    Verification on this sandbox (GCC + Clang, DPDK 25.11.3, `-m 0`):
+
+    | check | result |
+    |---|---|
+    | GCC Meson build | clean |
+    | Clang Meson build | clean |
+    | native C++ tests + benchmarks + sample-plugin load | 39/39 |
+    | module integration (`bessctl daemon reset -- run file`, foreground daemon) | 22/22 files |
+    | wire-error parity (12 negative cases + positive path) | identical codes/messages |
+    | `git diff --check` | clean |
+
+    The integration and Python suites' own `bessctl daemon start` needs root,
+    so they still fail in this sandbox for that reason alone; the module tests
+    were therefore run through the same gRPC reset/run path against a
+    foreground `bessd -skip_root_check -m 0`.
+
+    Remaining G0 commits: 2 RuntimeState ownership, 3 PipelineSpec/Snapshot/
+    validation, 4 diff/planner, 5 transaction engine, 6 internal
+    `ApplyPipeline`, 7 failure injection/integration/performance/docs.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
