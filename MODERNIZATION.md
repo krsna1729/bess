@@ -2108,6 +2108,35 @@ rather than one call site).
     through the daemon runs; commit 7's failure-injection matrix covers them
     systematically.
 
+48. **`76cab6a8`** — **G0 commit 6/7: a complete pipeline applied from C++ end
+    to end.** `core/control/apply_pipeline_test.cc` is a native test binary that
+    brings up a runtime the way the daemon does (DPDK EAL with `--no-huge`,
+    packet pools, port drivers — launching a worker needs a live EAL) and drives
+    `ApplyPipeline()` directly, so the engine is exercised as a real
+    multi-object transaction rather than through RPC adapters.
+
+    Cases: a complete pipeline (worker, two modules, a connection, a TC
+    hierarchy) applies in one transaction with exactly one generation bump and a
+    worker-pausing commit; the snapshot of the active runtime reconstructs the
+    desired state and diffs clean (idempotency, end to end); **a transaction that
+    fails while committing leaves the previous pipeline active** — generation,
+    module count, TC count and the structural snapshot all unchanged, and the
+    still-active pipeline still diffs clean; and removal goes through the retire
+    phase leaving a consistent runtime.
+
+    Bug found by the third case and fixed here: undoing the operations was not
+    enough, because leaving the quiesced window attaches orphan traffic classes
+    — a scheduler that briefly held two roots keeps a `!default_rr_*` wrapper
+    behind, and the failed transaction left it in the snapshot. `Abort()` now
+    collapses scheduler defaults after replaying the undo log, so a failed
+    transaction leaves no trace, internal traffic classes included.
+    `SpecFromSnapshot()` also treats an internal parent as "no parent", which is
+    what makes re-applying the running pipeline a no-op.
+
+    Verification: GCC + Clang builds clean, native tests + benchmarks +
+    sample-plugin load **41/41**, module integration 22/22 files, wire-parity
+    script passes, `git diff --check` clean.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
