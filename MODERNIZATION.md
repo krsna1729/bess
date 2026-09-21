@@ -1986,6 +1986,47 @@ rather than one call site).
     destructor mutates a global registry. Next: commit 3
     (PipelineSpec / PipelineSnapshot / side-effect-free validation).
 
+45. **`7b62da94`** — **G0 commit 3/7: `PipelineSpec`, `PipelineSnapshot` and
+    pure validation.** The desired-state half of the control plane exists and is
+    read-only: nothing in this commit mutates the runtime.
+
+    - `core/control/pipeline_spec.{h,cc}` — the desired-state IR
+      (`PortSpec`/`ModuleSpec`/`ConnectionSpec`/`WorkerSpec`/`TrafficClassSpec`
+      + `PipelineSpec`) with value equality (protobuf arguments compared by
+      serialized bytes) and `Normalize()` (stable ordering; "0 queues" resolves
+      to one queue) so equal descriptions compare equal. The structural types
+      moved out of `control_plane.h`.
+    - `core/control/pipeline_snapshot.{h,cc}` — deterministic structural
+      snapshot: ports, modules, connections (derived from module gates in
+      `(upstream, ogate)` order), workers (with the scheduler each was launched
+      with — `WorkerManager` now records it) and traffic classes (parent,
+      policy, worker, leaf task identity). Ordered maps, no pointer addresses,
+      no transient statistics.
+    - `core/control/pipeline_validator.{h,cc}` — `ValidatePipeline()`,
+      side-effect free by construction (type registries and CPU topology only,
+      never the instance registries): names, types, references, gates, workers,
+      port shape, traffic classes (policy, resource, reserved names, wid range,
+      task-id range, parent cycles), returning the canonical spec.
+    - `ControlPlane::ValidatePipeline()` / `ControlPlane::GetPipeline()` expose
+      both under the control-plane lock (now `mutable`, since the snapshot path
+      is const).
+
+    Deliberately recorded rather than faked: module metadata attributes exist
+    only once a module instance exists (`Module::AddMetadataAttr` runs in the
+    module's own `Init`), so metadata *layout* validation cannot be
+    side-effect-free today. It belongs to `Prepare()` — where candidate modules
+    exist — and the runtime's metadata pipeline must become stageable for it,
+    exactly as section 9.5 already requires for driver-specific checks.
+
+    Tests: `core/control/control_plane_test.cc`, 14 cases wired into Meson like
+    every other native test — normalization, every rejection class, parent
+    cycles, purity (rejected *and* accepted specs leave port/module/TC counts
+    unchanged) and snapshot determinism/reflectivity.
+
+    Verification: GCC + Clang builds clean, native tests + benchmarks +
+    sample-plugin load **40/40**, module integration 22/22 files, wire-parity
+    script passes, `git diff --check` clean.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
