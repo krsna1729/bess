@@ -74,6 +74,10 @@ ControlError ErrorFromLegacy(int code, const std::string& message) {
 
 ControlResult<PortInfo> ControlPlane::CreatePort(const PortSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return CreatePortLocked(spec);
+}
+
+ControlResult<PortInfo> ControlPlane::CreatePortLocked(const PortSpec& spec) {
 
   if (spec.driver.empty()) {
     return std::unexpected(Err(EINVAL, "Missing 'driver' field"));
@@ -175,6 +179,10 @@ ControlResult<PortInfo> ControlPlane::CreatePort(const PortSpec& spec) {
 
 ControlResult<void> ControlPlane::DestroyPort(const std::string& name) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return DestroyPortLocked(name);
+}
+
+ControlResult<void> ControlPlane::DestroyPortLocked(const std::string& name) {
 
   if (name.length() == 0) {
     return std::unexpected(
@@ -195,6 +203,10 @@ ControlResult<void> ControlPlane::DestroyPort(const std::string& name) {
 ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConf(
     const std::string& name, const PortConfSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return SetPortConfLocked(name, spec);
+}
+
+ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConfLocked(const std::string& name, const PortConfSpec& spec) {
 
   if (!name.length()) {
     return std::unexpected(Err(EINVAL, "Port name is not given"));
@@ -251,6 +263,10 @@ ControlResult<void> ControlPlane::ResetPortsLocked() {
 
 ControlResult<std::string> ControlPlane::CreateModule(const ModuleSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return CreateModuleLocked(spec);
+}
+
+ControlResult<std::string> ControlPlane::CreateModuleLocked(const ModuleSpec& spec) {
 
   if (spec.mclass.length() == 0) {
     return std::unexpected(Err(EINVAL, "Missing 'mclass' field"));
@@ -293,6 +309,10 @@ ControlResult<std::string> ControlPlane::CreateModule(const ModuleSpec& spec) {
 
 ControlResult<void> ControlPlane::DestroyModule(const std::string& name) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return DestroyModuleLocked(name);
+}
+
+ControlResult<void> ControlPlane::DestroyModuleLocked(const std::string& name) {
 
   WorkerPauser wp;
 
@@ -331,6 +351,10 @@ ControlResult<void> ControlPlane::ResetModulesLocked() {
 
 ControlResult<void> ControlPlane::ConnectModules(const ConnectionSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return ConnectModulesLocked(spec);
+}
+
+ControlResult<void> ControlPlane::ConnectModulesLocked(const ConnectionSpec& spec) {
 
   VLOG(1) << "ConnectModules " << spec.upstream << ":" << spec.ogate << " -> "
           << spec.igate << ":" << spec.downstream;
@@ -381,6 +405,10 @@ ControlResult<void> ControlPlane::ConnectModules(const ConnectionSpec& spec) {
 ControlResult<void> ControlPlane::DisconnectModules(
     const DisconnectionSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return DisconnectModulesLocked(spec);
+}
+
+ControlResult<void> ControlPlane::DisconnectModulesLocked(const DisconnectionSpec& spec) {
 
   WorkerPauser wp;
 
@@ -410,6 +438,10 @@ ControlResult<void> ControlPlane::DisconnectModules(
 ControlResult<void> ControlPlane::AddWorker(uint64_t wid, uint64_t core,
                                             const std::string& scheduler) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return AddWorkerLocked(wid, core, scheduler);
+}
+
+ControlResult<void> ControlPlane::AddWorkerLocked(uint64_t wid, uint64_t core, const std::string& scheduler) {
 
   if (wid >= Worker::kMaxWorkers) {
     return std::unexpected(Err(EINVAL, "Invalid worker id"));
@@ -431,6 +463,10 @@ ControlResult<void> ControlPlane::AddWorker(uint64_t wid, uint64_t core,
 
 ControlResult<void> ControlPlane::DestroyWorker(uint64_t wid) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return DestroyWorkerLocked(wid);
+}
+
+ControlResult<void> ControlPlane::DestroyWorkerLocked(uint64_t wid) {
 
   if (wid >= Worker::kMaxWorkers) {
     return std::unexpected(Err(EINVAL, "Invalid worker id"));
@@ -516,6 +552,10 @@ ControlResult<void> ControlPlane::ResumeWorker(uint64_t wid) {
 
 ControlResult<void> ControlPlane::AddTc(const TrafficClassSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return AddTcLocked(spec);
+}
+
+ControlResult<void> ControlPlane::AddTcLocked(const TrafficClassSpec& spec) {
 
   WorkerPauser wp;
 
@@ -624,6 +664,10 @@ ControlResult<void> ControlPlane::UpdateTcParams(const TrafficClassSpec& spec) {
 
 ControlResult<void> ControlPlane::UpdateTcParent(const TrafficClassSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return UpdateTcParentLocked(spec);
+}
+
+ControlResult<void> ControlPlane::UpdateTcParentLocked(const TrafficClassSpec& spec) {
 
   WorkerPauser wp;
 
@@ -655,6 +699,29 @@ ControlResult<void> ControlPlane::UpdateTcParent(const TrafficClassSpec& spec) {
   }
 
   return AttachTc(c, spec);
+}
+
+// Destroys a traffic class that belongs to the control plane (leaf classes
+// belong to their module). Used by the transaction engine's retire phase and
+// to undo a TC it created.
+ControlResult<void> ControlPlane::RemoveTcLocked(const std::string& name) {
+  bess::TrafficClass* c = TrafficClassBuilder::Find(name);
+  if (!c) {
+    return std::unexpected(Err(ENOENT, "Tc '%s' doesn't exist", name.c_str()));
+  }
+  if (c->policy() == bess::POLICY_LEAF) {
+    return std::unexpected(
+        Err(EINVAL, "Tc '%s' is a leaf class owned by a module", name.c_str()));
+  }
+  if (!detach_tc(c)) {
+    return std::unexpected(
+        Err(EBUSY, "Cannot detach '%s' while it is part of a worker",
+            name.c_str()));
+  }
+
+  runtime().traffic_classes().Release(c);
+  delete c;
+  return {};
 }
 
 ControlResult<void> ControlPlane::ResetTcs() {
@@ -778,12 +845,22 @@ ControlResult<bess::TrafficClass*> ControlPlane::FindTc(
 ControlResult<void> ControlPlane::AttachTc(bess::TrafficClass* c_,
                                            const TrafficClassSpec& spec) {
   std::unique_ptr<bess::TrafficClass> c(c_);
+
+  // The class is already registered (it was created through
+  // TrafficClassBuilder), so a failure here has to give the registry entry back
+  // before the unique_ptr destroys the object -- otherwise the registry would
+  // keep a pointer to freed memory.
+  auto fail = [&](ControlError error) -> ControlResult<void> {
+    runtime().traffic_classes().Release(c.get());
+    return std::unexpected(error);
+  };
+
   int wid = spec.wid;
 
   if (spec.parent == "") {
     if (wid != Worker::kAnyWorker && (wid < 0 || wid >= Worker::kMaxWorkers)) {
-      return std::unexpected(Err(EINVAL, "'wid' must be %d or between 0 and %d",
-                                 Worker::kAnyWorker, Worker::kMaxWorkers - 1));
+      return fail(Err(EINVAL, "'wid' must be %d or between 0 and %d",
+                      Worker::kAnyWorker, Worker::kMaxWorkers - 1));
     }
 
     int active_workers = runtime().workers().num_workers();
@@ -792,7 +869,8 @@ ControlResult<void> ControlPlane::AttachTc(bess::TrafficClass* c_,
       if (active_workers == 0 && (wid == 0 || wid == Worker::kAnyWorker)) {
         launch_worker(0, FLAGS_c);
       } else {
-        return std::unexpected(Err(EINVAL, "worker:%d does not exist", static_cast<int>(wid)));
+        return fail(Err(EINVAL, "worker:%d does not exist",
+                        static_cast<int>(wid)));
       }
     }
 
@@ -801,52 +879,51 @@ ControlResult<void> ControlPlane::AttachTc(bess::TrafficClass* c_,
   }
 
   if (wid != Worker::kAnyWorker) {
-    return std::unexpected(Err(EINVAL,
-                               "Both 'parent' and 'wid'"
-                               "have been specified"));
+    return fail(Err(EINVAL,
+                    "Both 'parent' and 'wid'"
+                    "have been specified"));
   }
 
   bess::TrafficClass* parent = TrafficClassBuilder::Find(spec.parent);
   if (!parent) {
-    return std::unexpected(
+    return fail(
         Err(ENOENT, "Parent TC '%s' not found", spec.parent.c_str()));
   }
 
-  bool fail = false;
+  bool fail_add = false;
   switch (parent->policy()) {
     case bess::POLICY_PRIORITY: {
       if (!spec.has_priority) {
-        return std::unexpected(Err(EINVAL, "No priority specified"));
+        return fail(Err(EINVAL, "No priority specified"));
       }
       bess::priority_t pri = spec.priority;
       if (pri == DEFAULT_PRIORITY) {
-        return std::unexpected(
-            Err(EINVAL, "Priority %d is reserved", DEFAULT_PRIORITY));
+        return fail(Err(EINVAL, "Priority %d is reserved", DEFAULT_PRIORITY));
       }
-      fail = !static_cast<bess::PriorityTrafficClass*>(parent)->AddChild(c.get(),
-                                                                       pri);
+      fail_add = !static_cast<bess::PriorityTrafficClass*>(parent)->AddChild(
+          c.get(), pri);
       break;
     }
     case bess::POLICY_WEIGHTED_FAIR:
       if (!spec.has_share) {
-        return std::unexpected(Err(EINVAL, "No share specified"));
+        return fail(Err(EINVAL, "No share specified"));
       }
-      fail = !static_cast<bess::WeightedFairTrafficClass*>(parent)->AddChild(
+      fail_add = !static_cast<bess::WeightedFairTrafficClass*>(parent)->AddChild(
           c.get(), spec.share);
       break;
     case bess::POLICY_ROUND_ROBIN:
-      fail =
-          !static_cast<bess::RoundRobinTrafficClass*>(parent)->AddChild(c.get());
+      fail_add = !static_cast<bess::RoundRobinTrafficClass*>(parent)->AddChild(
+          c.get());
       break;
     case bess::POLICY_RATE_LIMIT:
-      fail =
-          !static_cast<bess::RateLimitTrafficClass*>(parent)->AddChild(c.get());
+      fail_add = !static_cast<bess::RateLimitTrafficClass*>(parent)->AddChild(
+          c.get());
       break;
     default:
-      return std::unexpected(Err(EPERM, "Parent tc doesn't support children"));
+      return fail(Err(EPERM, "Parent tc doesn't support children"));
   }
-  if (fail) {
-    return std::unexpected(Err(EINVAL, "AddChild() failed"));
+  if (fail_add) {
+    return fail(Err(EINVAL, "AddChild() failed"));
   }
   c.release();
   return {};
@@ -1115,6 +1192,61 @@ ControlResult<void> ControlPlane::UnloadPlugin(const std::string& path) {
 // ---------------------------------------------------------------------------
 // Composition
 // ---------------------------------------------------------------------------
+
+ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
+    const PipelineSpec &desired, const ApplyOptions &options) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // 1. Validate. Pure, so a rejected spec cannot have touched anything.
+  auto validated = bess::control::ValidatePipeline(runtime(), desired);
+  if (!validated) {
+    return std::unexpected(validated.error());
+  }
+
+  // 2. Optimistic concurrency: a stale writer is rejected before any effect.
+  if (options.expected_generation.has_value() &&
+      *options.expected_generation != runtime().generation()) {
+    ControlError error = Err(ESTALE, "expected generation %llu, active generation %llu",
+                             static_cast<unsigned long long>(
+                                 *options.expected_generation),
+                             static_cast<unsigned long long>(
+                                 runtime().generation()));
+    error.code = ControlErrorCode::kConflict;
+    error.object = "pipeline";
+    error.field = "expected_generation";
+    return std::unexpected(error);
+  }
+
+  // 3. Diff and plan. Nothing to do means no pause and no generation change.
+  PipelineSnapshot before = SnapshotRuntime(runtime());
+  PipelineDiff diff = Diff(before, validated->spec);
+  if (diff.empty()) {
+    return ApplyResult{runtime().generation(), 0, false};
+  }
+  PipelinePlan plan = Plan(diff);
+
+  // 4. Refuse what cannot be made reversible rather than hoping rollback works.
+  if (auto reversible = CheckReversibility(plan); !reversible) {
+    return std::unexpected(reversible.error());
+  }
+
+  // 5. Run it.
+  Transaction transaction(this, std::move(plan), std::move(before));
+  if (auto prepared = transaction.Prepare(); !prepared) {
+    transaction.Abort();
+    return std::unexpected(prepared.error());
+  }
+  if (auto committed = transaction.Commit(); !committed) {
+    transaction.Abort();
+    return std::unexpected(committed.error());
+  }
+  transaction.Retire();
+
+  runtime().BumpGeneration();
+
+  return ApplyResult{runtime().generation(), transaction.ops_executed(),
+                     transaction.quiescence() == Quiescence::kWorkers};
+}
 
 ControlResult<ValidatedPipeline> ControlPlane::ValidatePipeline(
     const PipelineSpec &desired) {

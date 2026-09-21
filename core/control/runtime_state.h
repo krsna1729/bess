@@ -193,6 +193,12 @@ class RuntimeState {
   }
   const WorkerManager &workers() const;
 
+  // Monotonic control-plane generation: bumped exactly once per successful
+  // state-changing transaction, never for reads, validation, planning, failed
+  // transactions or a no-op apply.
+  uint64_t generation() const { return generation_; }
+  void BumpGeneration() { generation_++; }
+
   RuntimeState(const RuntimeState &) = delete;
   RuntimeState &operator=(const RuntimeState &) = delete;
 
@@ -204,6 +210,7 @@ class RuntimeState {
   ModuleRegistry modules_;
   TrafficClassRegistry traffic_classes_;
   std::unique_ptr<WorkerManager> workers_;
+  uint64_t generation_ = 0;
 };
 
 // Accessor for code that needs the runtime it is operating in. Module

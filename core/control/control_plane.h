@@ -42,6 +42,7 @@
 #include "control/pipeline_plan.h"
 #include "control/pipeline_snapshot.h"
 #include "control/pipeline_validator.h"
+#include "control/transaction.h"
 #include "message.h"
 #include "port.h"
 #include "traffic_class.h"
@@ -173,14 +174,40 @@ class ControlPlane {
   ControlResult<PipelineDiff> DiffPipeline(const PipelineSpec& desired) const;
   ControlResult<PipelinePlan> PlanPipeline(const PipelineSpec& desired) const;
 
+  // -- transactions --
+  // The transactional path (section 9.7): validate, check the expected
+  // generation, diff, plan, then run the plan as a transaction. A failure
+  // leaves the previous runtime active; a no-op apply neither pauses workers
+  // nor bumps the generation.
+  ControlResult<ApplyResult> ApplyPipeline(const PipelineSpec& desired,
+                                           const ApplyOptions& options);
+
   // -- composition --
   // Today's ResetAll: modules, then ports, then TCs, then workers. Composed
   // here rather than by one RPC handler calling four others.
   ControlResult<void> Reset();
 
  private:
-  // Lock-free bodies used by composed operations (Reset) that already hold the
-  // control-plane lock. Public wrappers take the lock and call these.
+  friend class Transaction;
+
+  // Lock-free bodies used by composed operations (Reset) and by the transaction
+  // engine, both of which already hold the control-plane lock. Public wrappers
+  // take the lock and call these.
+  ControlResult<PortInfo> CreatePortLocked(const PortSpec& spec);
+  ControlResult<void> DestroyPortLocked(const std::string& name);
+  ControlResult<bess::pb::CommandResponse> SetPortConfLocked(
+      const std::string& name, const PortConfSpec& spec);
+  ControlResult<std::string> CreateModuleLocked(const ModuleSpec& spec);
+  ControlResult<void> DestroyModuleLocked(const std::string& name);
+  ControlResult<void> ConnectModulesLocked(const ConnectionSpec& spec);
+  ControlResult<void> DisconnectModulesLocked(const DisconnectionSpec& spec);
+  ControlResult<void> AddWorkerLocked(uint64_t wid, uint64_t core,
+                                      const std::string& scheduler);
+  ControlResult<void> DestroyWorkerLocked(uint64_t wid);
+  ControlResult<void> AddTcLocked(const TrafficClassSpec& spec);
+  ControlResult<void> UpdateTcParentLocked(const TrafficClassSpec& spec);
+  ControlResult<void> RemoveTcLocked(const std::string& name);
+
   ControlResult<void> ResetModulesLocked();
   ControlResult<void> ResetPortsLocked();
   ControlResult<void> ResetTcsLocked();

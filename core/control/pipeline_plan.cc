@@ -30,6 +30,8 @@
 #include "control/pipeline_plan.h"
 
 #include <algorithm>
+#include <string>
+#include <vector>
 
 namespace bess {
 namespace control {
@@ -94,11 +96,48 @@ PipelinePlan Plan(const PipelineDiff &diff) {
   // Modules that are replaced have to be rebuilt before anything connects to
   // them; that is expressed by the prepare phase, so here the remaining work is
   // traffic classes: a leaf class attaches to a module task that now exists.
+  // Parent before child: a child attaches to a parent that must already
+  // exist. `traffic_classes` is sorted by name, so this is a separate stable
+  // sort by hierarchy depth.
+  std::vector<const TrafficClassChange *> tc_creates;
+  for (const TrafficClassChange &change : diff.traffic_classes) {
+    if (change.kind == ChangeKind::kCreate) {
+      tc_creates.push_back(&change);
+    }
+  }
+  auto depth_of = [&diff](const std::string &name) {
+    int depth = 0;
+    std::string current = name;
+    for (size_t guard = 0; guard < diff.traffic_classes.size() + 1; guard++) {
+      const std::string *parent = nullptr;
+      for (const TrafficClassChange &change : diff.traffic_classes) {
+        if (change.name == current) {
+          parent = &change.desired.parent;
+          break;
+        }
+      }
+      if (parent == nullptr || parent->empty()) {
+        break;
+      }
+      depth++;
+      current = *parent;
+    }
+    return depth;
+  };
+  std::stable_sort(tc_creates.begin(), tc_creates.end(),
+                   [&depth_of](const TrafficClassChange *a,
+                               const TrafficClassChange *b) {
+                     return depth_of(a->name) < depth_of(b->name);
+                   });
+
+  for (const TrafficClassChange *change : tc_creates) {
+    plan.commit_ops.push_back(CreateTcOp{change->desired});
+  }
+
   for (const TrafficClassChange &change : diff.traffic_classes) {
     switch (change.kind) {
       case ChangeKind::kCreate:
-        plan.commit_ops.push_back(CreateTcOp{change.desired});
-        break;
+        break;  // handled above, in hierarchy order
       case ChangeKind::kUpdate:
         plan.commit_ops.push_back(ReparentTcOp{change.desired});
         break;
@@ -117,10 +156,20 @@ PipelinePlan Plan(const PipelineDiff &diff) {
   }
 
   // -- retire: teardown, reverse dependency order ---------------------------
+  // Children before parents, the reverse of how they were created.
+  std::vector<const TrafficClassChange *> tc_removes;
   for (const TrafficClassChange &change : diff.traffic_classes) {
     if (change.kind == ChangeKind::kRemove) {
-      plan.retire_ops.push_back(RemoveTcOp{change.name});
+      tc_removes.push_back(&change);
     }
+  }
+  std::stable_sort(tc_removes.begin(), tc_removes.end(),
+                   [&depth_of](const TrafficClassChange *a,
+                               const TrafficClassChange *b) {
+                     return depth_of(a->name) > depth_of(b->name);
+                   });
+  for (const TrafficClassChange *change : tc_removes) {
+    plan.retire_ops.push_back(RemoveTcOp{change->name});
   }
 
   // Modules before ports: a module releases the port queues it acquired.

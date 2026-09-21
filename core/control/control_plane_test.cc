@@ -35,6 +35,7 @@
 #include "control/control_plane.h"
 #include "control/pipeline_diff.h"
 #include "control/pipeline_plan.h"
+#include "control/transaction.h"
 #include "control/pipeline_spec.h"
 #include "control/pipeline_validator.h"
 #include "control/runtime_state.h"
@@ -71,6 +72,20 @@ PipelineSpec MinimalSpec() {
   worker.core = 0;
   spec.workers.push_back(worker);
 
+  ModuleSpec module;
+  module.name = "bypass0";
+  module.mclass = "Bypass";
+  spec.modules.push_back(module);
+  return spec;
+}
+
+
+// Desired state that a unit test can actually apply: modules only. Launching a
+// worker needs a live DPDK EAL (Worker::Run registers the thread with DPDK),
+// which the native test binaries do not have -- worker lifecycle is covered by
+// the daemon-based integration run instead.
+PipelineSpec ModuleOnlySpec() {
+  PipelineSpec spec;
   ModuleSpec module;
   module.name = "bypass0";
   module.mclass = "Bypass";
@@ -572,6 +587,175 @@ TEST_F(ControlPlaneTest, DiffAndPlanAreDeterministic) {
   EXPECT_EQ("aaa", diff_a->modules[0].name);
   EXPECT_EQ("bypass0", diff_a->modules[1].name);
   EXPECT_EQ("zzz", diff_a->modules[2].name);
+}
+
+
+// ---------------------------------------------------------------------------
+// Transactions: generation, optimistic concurrency, rollback
+// ---------------------------------------------------------------------------
+
+TEST_F(ControlPlaneTest, GenerationBumpsOncePerSuccessfulApply) {
+  ControlPlane control_plane;
+
+  const uint64_t before = runtime_->generation();
+
+  auto applied = control_plane.ApplyPipeline(ModuleOnlySpec(), {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  EXPECT_EQ(before + 1, applied->generation);
+  EXPECT_EQ(before + 1, runtime_->generation());
+  EXPECT_GT(applied->applied_ops, 0u);
+  // Setup-only plans do not need worker quiescence.
+  EXPECT_FALSE(applied->workers_paused);
+
+  // Applying the same desired state again is a no-op: no pause, no generation
+  // change, no operations.
+  auto again = control_plane.ApplyPipeline(ModuleOnlySpec(), {});
+  ASSERT_TRUE(again.has_value()) << again.error().message;
+  EXPECT_EQ(before + 1, again->generation);
+  EXPECT_EQ(0u, again->applied_ops);
+  EXPECT_FALSE(again->workers_paused);
+  EXPECT_EQ(before + 1, runtime_->generation());
+
+  ASSERT_TRUE(control_plane.DestroyModule("bypass0").has_value());
+}
+
+TEST_F(ControlPlaneTest, FailedValidationLeavesGenerationUntouched) {
+  ControlPlane control_plane;
+  const uint64_t before = runtime_->generation();
+
+  PipelineSpec bad = ModuleOnlySpec();
+  bad.modules[0].mclass = "NoSuchModule";
+
+  auto applied = control_plane.ApplyPipeline(bad, {});
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(ENOENT, applied.error().err);
+  EXPECT_EQ(before, runtime_->generation());
+  EXPECT_TRUE(control_plane.GetPipeline().modules.empty());
+}
+
+TEST_F(ControlPlaneTest, StaleGenerationIsRejectedBeforeSideEffects) {
+  ControlPlane control_plane;
+  const uint64_t before = runtime_->generation();
+
+  bess::control::ApplyOptions options;
+  options.expected_generation = before + 1;  // someone else got there first
+
+  auto applied = control_plane.ApplyPipeline(ModuleOnlySpec(), options);
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(ESTALE, applied.error().err);
+  EXPECT_EQ(bess::control::ControlErrorCode::kConflict, applied.error().code);
+  EXPECT_EQ(before, runtime_->generation());
+  EXPECT_TRUE(control_plane.GetPipeline().modules.empty());
+
+  // With the right expectation it goes through.
+  options.expected_generation = before;
+  auto applied_now = control_plane.ApplyPipeline(ModuleOnlySpec(), options);
+  ASSERT_TRUE(applied_now.has_value()) << applied_now.error().message;
+  EXPECT_EQ(before + 1, applied_now->generation);
+
+  ASSERT_TRUE(control_plane.DestroyModule("bypass0").has_value());
+}
+
+// A transaction that fails partway must leave the runtime exactly as it was:
+// the module created before the failure is gone again.
+//
+// The failure here is induced in the prepare phase (a module whose Init
+// rejects its argument). Commit-phase failures need a runtime that can hold
+// workers -- every traffic class needs a scheduler root, and launching one
+// requires a live DPDK EAL -- so those are covered by the daemon-based
+// integration run instead of by this binary.
+TEST_F(ControlPlaneTest, FailedTransactionRollsBackWhatItDid) {
+  ControlPlane control_plane;
+
+  PipelineSpec desired;
+  ModuleSpec good;
+  good.name = "good";
+  good.mclass = "Bypass";
+  desired.modules.push_back(good);
+
+  ModuleSpec bad;
+  bad.name = "bad";
+  bad.mclass = "QueueInc";  // requires a 'port' argument, which is not given
+  desired.modules.push_back(bad);
+
+  const bess::control::PipelineSnapshot before = control_plane.GetPipeline();
+  const uint64_t generation_before = runtime_->generation();
+  const size_t modules_before = runtime_->modules().Size();
+
+  auto applied = control_plane.ApplyPipeline(desired, {});
+  ASSERT_FALSE(applied.has_value());
+
+  EXPECT_EQ(generation_before, runtime_->generation());
+  EXPECT_EQ(modules_before, runtime_->modules().Size());
+  EXPECT_FALSE(runtime_->modules().Contains("good"));
+  EXPECT_FALSE(runtime_->modules().Contains("bad"));
+  EXPECT_TRUE(control_plane.GetPipeline() == before);
+}
+
+// Replacement is refused rather than attempted: a module cannot be rebuilt in
+// place, so the transaction says so instead of pretending it can roll back.
+TEST_F(ControlPlaneTest, ReplacementIsRefusedTransactionally) {
+  ControlPlane control_plane;
+
+  bess::pb::EmptyArg empty;
+  ModuleSpec original;
+  original.name = "r0";
+  original.mclass = "Bypass";
+  original.arg.PackFrom(empty);
+  ASSERT_TRUE(control_plane.CreateModule(original).has_value());
+
+  PipelineSpec desired;
+  ModuleSpec changed = original;
+  changed.arg.Clear();
+  desired.modules.push_back(changed);
+
+  const uint64_t before = runtime_->generation();
+  auto applied = control_plane.ApplyPipeline(desired, {});
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(
+      bess::control::ControlErrorCode::kUnsupportedTransaction,
+      applied.error().code);
+  EXPECT_EQ("module", applied.error().object);
+  EXPECT_EQ(before, runtime_->generation());
+
+  // The original module is untouched.
+  ASSERT_TRUE(runtime_->modules().Contains("r0"));
+
+  ASSERT_TRUE(control_plane.DestroyModule("r0").has_value());
+}
+
+// Traffic classes are created parent-first, so a hierarchy commits in an order
+// that always has the parent in place.
+TEST_F(ControlPlaneTest, PlanCreatesTrafficClassesParentFirst) {
+  ControlPlane control_plane;
+
+  PipelineSpec desired = ModuleOnlySpec();
+  TrafficClassSpec parent;
+  parent.name = "zparent";
+  parent.policy = "round_robin";
+  desired.traffic_classes.push_back(parent);
+
+  TrafficClassSpec child;
+  child.name = "achild";
+  child.policy = "round_robin";
+  child.parent = "zparent";
+  desired.traffic_classes.push_back(child);
+
+  auto plan = control_plane.PlanPipeline(desired);
+  ASSERT_TRUE(plan.has_value()) << plan.error().message;
+
+  // Even though "achild" sorts before "zparent", the parent is created first.
+  size_t tc_ops = 0;
+  std::vector<std::string> order;
+  for (const auto &op : plan->commit_ops) {
+    if (const auto *create = std::get_if<bess::control::CreateTcOp>(&op)) {
+      order.push_back(create->spec.name);
+      tc_ops++;
+    }
+  }
+  ASSERT_EQ(2u, tc_ops);
+  EXPECT_EQ("zparent", order[0]);
+  EXPECT_EQ("achild", order[1]);
 }
 
 }  // namespace

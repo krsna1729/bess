@@ -11,6 +11,7 @@ core_sources = files(
   'control/pipeline_spec.cc',
   'control/pipeline_validator.cc',
   'control/runtime_state.cc',
+  'control/transaction.cc',
   'control/worker_manager.cc',
   'debug.cc',
   'dpdk.cc',
