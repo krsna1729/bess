@@ -26,6 +26,7 @@ core_sources = files(
   'packet.cc',
   'packet_pool.cc',
   'port.cc',
+  'rcu/rcu_domain.cc',
   'resume_hook.cc',
   'shared_obj.cc',
   'task.cc',
@@ -184,6 +185,7 @@ bessd = executable(
 )
 
 unit_test_sources = [
+  'rcu/rcu_test.cc',
   'control/apply_pipeline_test.cc',
   'control/control_plane_test.cc',
   'bessd_test.cc',
