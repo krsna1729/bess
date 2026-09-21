@@ -1,5 +1,5 @@
-# Container provisioning for building BESS on Travis CI,
-# with various compilers and configurations
+# Container provisioning for building BESS with multiple compiler
+# configurations.
 
 # all packages for build are also required here
 - name: Install basic build requirements first
@@ -11,10 +11,19 @@
 - hosts: all
   tags: ci
   tasks:
-    - name: Install additional compilers for the build container
+    - name: Install modern compiler tooling (Ubuntu 24.04+)
+      apt: name={{item}} update_cache=yes
+      become: true
+      with_items:
+        - clang
+        - ccache
+      when: ansible_distribution == 'Ubuntu' and ansible_distribution_version is version('24.04', '>=')
+
+    - name: Install legacy compilers (pre-Ubuntu 24.04)
       apt: name={{item}} update_cache=yes
       become: true
       with_items:
         - g++-8
         - clang-6.0
         - ccache
+      when: ansible_distribution_version is version('24.04', '<')

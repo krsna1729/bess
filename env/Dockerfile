@@ -1,8 +1,7 @@
 # vim: syntax=dockerfile
 
-# Bionic Beaver (18.04) does not require ppa repositories for any packages
-# we need, such as g++-7, clang-6.0, ansible, grpc, etc.
-ARG BASE_IMAGE=ubuntu:bionic
+# Ubuntu 24.04 is the supported container base for the DPDK 25.11 build.
+ARG BASE_IMAGE=ubuntu:noble
 FROM ${BASE_IMAGE}
 
 RUN echo "APT::Install-Recommends false;" >> /etc/apt/apt.conf.d/00recommends && \
@@ -26,10 +25,11 @@ RUN mkdir -p /build/bess
 
 # Build DPDK testpmd (used in bessctl samples)
 ARG BESS_DPDK_BRANCH=master
+ENV AF_XDP=required
 RUN cd /build/bess && \
 	curl -s -L https://github.com/NetSys/bess/archive/${BESS_DPDK_BRANCH}.tar.gz | tar zx --strip-components=1 && \
 	./build.py dpdk && \
-	cp /build/bess/deps/dpdk-19.11.4/build/app/testpmd /usr/local/bin/ && \
+	cp /build/bess/deps/dpdk-25.11.3/build/app/dpdk-testpmd /usr/local/bin/ && \
 	rm -rf /build/bess
 
 ENV CCACHE_DIR=/tmp/ccache

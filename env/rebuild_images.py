@@ -39,7 +39,7 @@ import time
 TARGET_REPO = 'nefelinetworks/bess_build'
 
 imgs = {
-    'bionic64': {'base': 'ubuntu:bionic', 'tag_suffix': ''},
+    'noble64': {'base': 'ubuntu:noble', 'tag_suffix': ''},
 }
 
 

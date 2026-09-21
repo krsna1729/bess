@@ -148,6 +148,60 @@ def required(header_file, lib_name, compiler):
         sys.exit(1)
 
 
+def pkg_config_available(package, minimum_version=None):
+    if minimum_version:
+        check = 'pkg-config --atleast-version=%s %s' % (
+            minimum_version, package)
+    else:
+        check = 'pkg-config --exists %s' % package
+    return cmd_success(check)
+
+
+def af_xdp_required():
+    mode = os.getenv('AF_XDP', 'auto').strip().lower()
+    if mode not in ('auto', 'required'):
+        print('Error - AF_XDP must be "auto" or "required", got "%s"'
+              % mode, file=sys.stderr)
+        sys.exit(1)
+    return mode == 'required'
+
+
+def af_xdp_dependencies_available():
+    return (pkg_config_available('libxdp', '1.2.2') and
+            pkg_config_available('libbpf') and
+            check_header('xdp/xsk.h', 'gcc') and
+            check_header('bpf/bpf.h', 'gcc'))
+
+
+def check_af_xdp_capability():
+    available = af_xdp_dependencies_available()
+    if available:
+        print('AF_XDP capability: libxdp >= 1.2.2 and libbpf prerequisites found')
+    elif af_xdp_required():
+        print('Error - AF_XDP=required but libxdp >= 1.2.2 and libbpf '
+              'development prerequisites are unavailable. Install '
+              '"libxdp-dev" and "libbpf-dev".', file=sys.stderr)
+        sys.exit(1)
+    else:
+        print('AF_XDP capability: disabled; install "libxdp-dev" and '
+              '"libbpf-dev" to build net_af_xdp, or set AF_XDP=required')
+    return available
+
+
+def dpdk_has_af_xdp():
+    return bool(glob.glob(os.path.join(DPDK_INSTALL_DIR,
+                                       'lib', 'librte_net_af_xdp.*')))
+
+
+def require_af_xdp_build():
+    if not dpdk_has_af_xdp():
+        print('Error - AF_XDP=required but DPDK did not produce '
+              'librte_net_af_xdp.* under %s/lib' % DPDK_INSTALL_DIR,
+              file=sys.stderr)
+        sys.exit(1)
+    print('AF_XDP capability: DPDK net_af_xdp PMD built')
+
+
 def check_essential():
     if not cmd_success('gcc -v'):
         print('Error - "gcc" is not available', file=sys.stderr)
@@ -276,6 +330,7 @@ def dpdk_is_installed():
 
 def build_dpdk():
     check_essential()
+    check_af_xdp_capability()
     download_dpdk(quiet=True)
 
     for f in glob.glob('%s/*.patch' % DEPS_DIR):
@@ -291,6 +346,9 @@ def build_dpdk():
 
     print('Installing DPDK to %s...' % DPDK_INSTALL_DIR)
     cmd('ninja -C %s install' % DPDK_BUILD_DIR)
+
+    if af_xdp_required():
+        require_af_xdp_build()
 
 
 def generate_protobuf_files():
@@ -341,7 +399,10 @@ def build_bess():
 
     if not dpdk_is_installed():
         build_dpdk()
-
+    else:
+        check_af_xdp_capability()
+        if af_xdp_required():
+            require_af_xdp_build()
     generate_protobuf_files()
 
     print('Building BESS daemon...')

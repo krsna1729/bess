@@ -2409,16 +2409,90 @@ testing goes through `bessctl/module_tests/*.py` against a running
         existing `pci`/`vdev` port) are likewise reachable with **no new
         BESS code** -- this item is a documentation/config-ergonomics
         task, not an engineering project.
-      - **AF_XDP is the one real gap, and it's a build gap, not a code
-        gap.** This tree's DPDK build produces no `librte_net_af_xdp.*`
-        (confirmed absent from `deps/dpdk-25.11.3/install/lib/`) because
-        DPDK's AF_XDP PMD needs `libxdp`/`libbpf` present at *DPDK* build
-        time. Work item: add `libxdp-dev`/`libbpf-dev` to the DPDK build
-        prerequisites (`build.py`, `.github/workflows/ci.yml`, `env/`),
-        confirm `librte_net_af_xdp` appears, then expose `net_af_xdp`
-        through the existing `vdev` arg with BESS-side config sugar.
-        **Do not write a new `AF_XDPPort : Port` driver** -- that's new
-        code to own for something ethdev already covers.
+      - **AF_XDP is the one real gap, and the baseline is a DPDK build gap
+        rather than a BESS port gap.** At the start of this slice, `develop`
+        was at `9016d973ec223430b148987ae5b1166a9d9d1452` with DPDK `25.11.3`
+        installed. `PMDPortArg.vdev` already reached `rte_dev_probe()` in
+        `core/drivers/pmd.cc`, followed by `RTE_ETH_FOREACH_MATCHING_DEV` and
+        `rte_eth_dev_info_get()`; no new BESS port class was needed. The
+        installed DPDK had no `librte_net_af_xdp.so`,
+        `librte_net_af_xdp.a`, or AF_XDP PMD plugin. DPDK's Meson log recorded
+        `libxdp` missing from pkg-config, `libbpf` found at 1.7.0,
+        `linux/if_xdp.h` present, and `bpf/xsk.h` absent; the driver summary
+        was `missing dependency, "libxdp >=1.2.2" and "libbpf"`. This is the
+        exact reason the `net_af_xdp` driver was disabled, not an inference
+        from the missing installed library.
+        This slice adds `libbpf-dev`/`libxdp-dev` to the supported Ubuntu
+        24.04 CI/container definitions and makes AF_XDP policy explicit:
+        `AF_XDP=auto` is the local default and only reports a disabled
+        capability when prerequisites are absent; `AF_XDP=required` is set by
+        official CI and the Noble build container and fails if prerequisites
+        or the DPDK PMD artifact are missing.
+        With Arch `libxdp` 1.6.3 and `libbpf` 1.7.0 installed, the rebuilt
+        DPDK produced `install/lib/librte_net_af_xdp.so`,
+        `install/lib/librte_net_af_xdp.a`, and the
+        `install/lib/dpdk/pmds-26.0/librte_net_af_xdp.so` plugin. Its
+        `libdpdk.pc --static --libs` output contains
+        `-l:librte_net_af_xdp.a -lxdp -lbpf`, while `ldd` on the shared PMD
+        reports `libxdp.so.1` and `libbpf.so.1`.
+        The follow-up permission experiment separated the kernel boundary
+        from the interface type. This user has `CapEff=0` and
+        `kernel.unprivileged_bpf_disabled=2`; the same temporary veth pair
+        (`veth-afx0`/`veth-afx1`) failed for an unprivileged BESS daemon at
+        `xdp_umem_configure()` with `Operation not permitted`, while a root
+        daemon created the same `net_af_xdp` vdev on `veth-afx0` with
+        `force_copy=1,mode=skb` and PMDPort creation succeeded. The temporary
+        veth pair and both daemons were removed after the experiment. AF_XDP
+        therefore needs a privileged daemon or an explicitly granted
+        capability/device policy; veth is not a permission-free workaround.
+        The existing unprivileged PMDPort path was also exercised through
+        pybess with `vdev='net_af_xdp,iface=wlo1'`; the daemon logged the
+        same `xdp_umem_configure()` `Operation not permitted` failure,
+        surfaced as `rte_eth_rx_queue_setup() failed`. A privileged
+        loopback probe attached generic XDP but did not complete port
+        creation before the smoke timeout; the test daemon was stopped and
+        interfaces were confirmed free of residual XDP programs. This host
+        therefore proves PMD discovery, dependency linkage, the permission
+        boundary, and the BESS error path, but not packet I/O.
+        The static dependency question is distro packaging, not an AF_XDP
+        source limitation. Arch ships shared `libxdp.so*` and `libbpf.so*`
+        but no `/usr/lib/libxdp.a` or `/usr/lib/libbpf.a`; it also lacks
+        several unrelated static system archives needed by a complete BESS
+        static link. A disposable Ubuntu 24.04 container with
+        `libxdp-dev` 1.4.2-1ubuntu4 and `libbpf-dev` 1:1.3.0-2build2
+        shipped `/usr/lib/x86_64-linux-gnu/libxdp.a` and
+        `libbpf.a`. Its `pkg-config --static --libs libxdp libbpf` output
+        included the transitive `libelf`, `zstd`, `zlib`, and pthread
+        flags, and a tiny `gcc -static` program referencing both libraries
+        linked successfully (`ldd` reported `not a dynamic executable`).
+        Thus the AF_XDP PMD dependencies can be static like the rest of
+        DPDK when the distro's development packages provide archives; the
+        current Arch host still cannot produce a fully static BESS binary
+        without separately sourcing all missing system archives.
+        Ownership is compatible with BESS's native packet contract: DPDK's
+        zero-copy path overlays UMEM on the RX queue's configured mempool and
+        returns ordinary direct `rte_mbuf` objects; copy mode allocates
+        ordinary mbufs from that same pool and copies into them. The driver
+        has no external-mbuf attachment path. Its TX path accepts same-pool
+        direct mbufs in zero-copy mode, copies/frees other mbufs, and always
+        follows DPDK's mbuf ownership rules. BESS `PacketRef` is non-owning,
+        `PacketFree` delegates to `rte_pktmbuf_free`, and the bulk-free
+        helper has a native direct-mbuf fast path with a safe fallback.
+        No AF_XDP-specific BESS ownership shim is required. Permanent
+        regression coverage is the required-mode DPDK build plus shared/static
+        PMD artifact check; a privileged interface smoke is intentionally not
+        in CI because XDP attach rights and NIC/kernel support are host-specific.
+        A follow-up attempt to run traffic through two temporary veth pairs
+        (`veth -> AF_XDP -> BESS -> AF_XDP -> veth`) was stopped before any
+        packets were sent. Loading the kernel `pktgen` module succeeded at
+        15:01:08, but the host rebooted at 15:04:18 while the two AF_XDP
+        ports were being attached/configured. The previous-boot kernel
+        journal ends with `afx-out-wire: entered promiscuous mode` at
+        15:03:09; it contains no panic/oops trace, `/sys/fs/pstore` is empty,
+        and `kdump` is inactive. This is temporal correlation only, not proof
+        of root cause; no packet or performance result was collected. Do not
+        repeat live AF_XDP/veth traffic on this host until kernel crash
+        capture and an isolated test host are available.
       - Small ergonomic follow-up once AF_XDP works: `PMDPortArg`
         currently exposes only `loopback` and three VLAN-offload
         booleans; long vdev devargs strings are the whole configuration

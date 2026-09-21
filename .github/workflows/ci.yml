@@ -38,6 +38,7 @@ on:
 env:
   FIFO_TEST_TIMEOUT: 200
   CPU: corei7
+  AF_XDP: required
 
 jobs:
   build-and-test:
@@ -68,6 +69,7 @@ jobs:
             build-essential clang meson ninja-build pkg-config \
             python3-pip python3-pyelftools xz-utils \
             libnuma-dev libpcap-dev zlib1g-dev \
+            libbpf-dev libxdp-dev \
             libgoogle-glog-dev libgflags-dev libgtest-dev libbenchmark-dev \
             libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev \
             protobuf-compiler libsystemd-dev libc-ares-dev libcap-dev
@@ -95,6 +97,10 @@ jobs:
         env:
           CXX: ${{ matrix.cxx }}
         run: ./build.py bess
+      - name: Verify AF_XDP PMD artifacts
+        run: |
+          test -f deps/dpdk-25.11.3/install/lib/librte_net_af_xdp.so
+          test -f deps/dpdk-25.11.3/install/lib/librte_net_af_xdp.a
 
       - name: Run core unit tests
         working-directory: core
