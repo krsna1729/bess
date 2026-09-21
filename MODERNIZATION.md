@@ -1895,6 +1895,42 @@ rather than one call site).
     validation, 4 diff/planner, 5 transaction engine, 6 internal
     `ApplyPipeline`, 7 failure injection/integration/performance/docs.
 
+42. **`00e961a0`** — **G0 commit 2a/7: `RuntimeState` owns ports and modules.**
+    Mutable instance state now has an owner: `PortBuilder` and `ModuleGraph`
+    keep only what they are (a type registry and graph topology), while live
+    objects live in `bess::control::RuntimeState` as `unique_ptr`s in
+    `PortRegistry` / `ModuleRegistry` (`core/control/runtime_state.{h,cc}`).
+    The registry API is `Find`/`Contains`/`Size`/`All` (non-owning view),
+    `Add` (refuses duplicates without consuming the argument), `Remove`
+    (hands ownership back), `Destroy` (busy check → `DeInit` → destroy),
+    `GenerateDefaultName`, `Clear`; `ModuleRegistry` also owns the
+    task-membership set that used to be `ModuleGraph::tasks_`.
+
+    Call sites migrated: `ModuleGraph` create/destroy/destroy-all, task graph,
+    gate numbering, active-worker propagation and name generation;
+    `metadata.cc`; the four port-resolving modules (`PortInc`, `PortOut`,
+    `QueueInc`, `QueueOut` resolve through the runtime instead of a global
+    map); the read-only RPC handlers; `port_test`/`module_test`.
+
+    Two legacy bugs died with the ownership change instead of being carried
+    forward: `CreatePort` with an existing name used to free the old port,
+    leave a dangling registry entry and report success with an empty name (it
+    now refuses with `EEXIST` and touches nothing), and a failed module `Init`
+    can no longer leave a registered half-module because the registry takes
+    ownership only after `Init` succeeds.
+
+    Verification: GCC + Clang builds clean, native tests + benchmarks +
+    sample-plugin load 39/39, module integration 22/22 files against a
+    foreground daemon, wire-parity script passes (extended with the new port
+    lifecycle: create → duplicate refused → destroy), `git diff --check`
+    clean. `port_test`'s queue test needed a fix: it used the port after
+    moving it into the registry.
+
+    Still on the old globals (rest of commit 2): traffic classes
+    (`TrafficClassBuilder::all_tcs_`, whose destructors mutate the registry)
+    and workers (`workers[]`, `worker_threads[]`, `num_workers`,
+    `orphan_tcs`).
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
