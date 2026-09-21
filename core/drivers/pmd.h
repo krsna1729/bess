@@ -50,6 +50,7 @@ typedef uint16_t dpdk_port_t;
 // mirror rte_eth_dev_info wholesale.
 struct PmdCapabilities {
   enum class RxMtuSupport {
+    kBelowDeviceMinMtu,
     kSingleMbuf,
     kScatter,
     kExceedsDeviceMtu,
@@ -59,12 +60,16 @@ struct PmdCapabilities {
   static PmdCapabilities FromDeviceInfo(
       const rte_eth_dev_info &dev_info);
 
-  // single_mbuf_capacity includes RTE_PKTMBUF_HEADROOM.
-  RxMtuSupport RxMtuSupportFor(uint32_t mtu,
-                                size_t single_mbuf_capacity) const;
+  size_t RxFrameLengthFor(uint32_t mtu) const;
+
+  // usable_single_mbuf_bytes excludes RTE_PKTMBUF_HEADROOM.
+  RxMtuSupport RxMtuSupportFor(
+      uint32_t mtu, size_t usable_single_mbuf_bytes) const;
 
   bool rx_scatter = false;
+  uint32_t min_mtu = RTE_ETHER_MIN_MTU;
   uint32_t max_mtu = RTE_ETHER_MAX_JUMBO_FRAME_LEN;
+  uint32_t rx_frame_overhead = RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN;
   uint64_t rx_offload_capa = 0;
   uint64_t tx_offload_capa = 0;
   uint64_t dev_capa = 0;

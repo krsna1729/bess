@@ -46,24 +46,44 @@ PmdCapabilities PmdCapabilities::FromDeviceInfo(
   PmdCapabilities ret;
   ret.rx_scatter =
       (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER) != 0;
+  ret.min_mtu =
+      dev_info.min_mtu != 0 ? dev_info.min_mtu : RTE_ETHER_MIN_MTU;
   ret.max_mtu = dev_info.max_mtu != 0 ? dev_info.max_mtu
                                      : RTE_ETHER_MAX_JUMBO_FRAME_LEN;
+  if (dev_info.max_mtu != UINT16_MAX &&
+      dev_info.max_rx_pktlen > dev_info.max_mtu) {
+    ret.rx_frame_overhead = dev_info.max_rx_pktlen - dev_info.max_mtu;
+  }
   ret.rx_offload_capa = dev_info.rx_offload_capa;
   ret.tx_offload_capa = dev_info.tx_offload_capa;
   ret.dev_capa = dev_info.dev_capa;
   return ret;
 }
 
+size_t PmdCapabilities::RxFrameLengthFor(uint32_t mtu) const {
+  return static_cast<size_t>(mtu) + rx_frame_overhead;
+}
+
 PmdCapabilities::RxMtuSupport PmdCapabilities::RxMtuSupportFor(
-    uint32_t mtu, size_t single_mbuf_capacity) const {
+    uint32_t mtu, size_t usable_single_mbuf_bytes) const {
+  if (mtu < min_mtu) {
+    return RxMtuSupport::kBelowDeviceMinMtu;
+  }
   if (mtu > max_mtu) {
     return RxMtuSupport::kExceedsDeviceMtu;
   }
-  if (mtu <= single_mbuf_capacity) {
+  if (RxFrameLengthFor(mtu) <= usable_single_mbuf_bytes) {
     return RxMtuSupport::kSingleMbuf;
   }
   return rx_scatter ? RxMtuSupport::kScatter
                     : RxMtuSupport::kScatterUnsupported;
+}
+
+static size_t single_mbuf_rx_capacity(const bess::PacketPool &pool) {
+  const size_t data_room = pool.mbuf_data_room_size();
+  return data_room > RTE_PKTMBUF_HEADROOM
+             ? data_room - RTE_PKTMBUF_HEADROOM
+             : 0;
 }
 
 static const rte_eth_conf default_eth_conf(const rte_eth_dev_info &dev_info,
@@ -369,13 +389,15 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
   if (!pool) {
     return CommandFailure(ENODEV, "No default packet pool for socket %d", sid);
   }
-  if (conf_.mtu < RTE_ETHER_MIN_MTU) {
-    return CommandFailure(EINVAL, "mtu should be >= %d and <= %u",
-                          RTE_ETHER_MIN_MTU, capabilities_.max_mtu);
-  }
 
-  const auto rx_mtu_support =
-      capabilities_.RxMtuSupportFor(conf_.mtu, pool->mbuf_data_room_size());
+  const size_t usable_single_mbuf_bytes = single_mbuf_rx_capacity(*pool);
+  const auto rx_mtu_support = capabilities_.RxMtuSupportFor(
+      conf_.mtu, usable_single_mbuf_bytes);
+  if (rx_mtu_support ==
+      PmdCapabilities::RxMtuSupport::kBelowDeviceMinMtu) {
+    return CommandFailure(EINVAL, "mtu %u is below PMD min_mtu %u", conf_.mtu,
+                          capabilities_.min_mtu);
+  }
   if (rx_mtu_support ==
       PmdCapabilities::RxMtuSupport::kExceedsDeviceMtu) {
     return CommandFailure(EINVAL, "mtu %u exceeds PMD max_mtu %u", conf_.mtu,
@@ -385,9 +407,10 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
       PmdCapabilities::RxMtuSupport::kScatterUnsupported) {
     return CommandFailure(
         EINVAL,
-        "mtu %u exceeds single-mbuf RX capacity %zu and PMD does not support "
-        "RX scatter",
-        conf_.mtu, pool->mbuf_data_room_size());
+        "mtu %u requires RX frame length %zu, exceeds usable single-mbuf "
+        "RX capacity %zu and PMD does not support RX scatter",
+        conf_.mtu, capabilities_.RxFrameLengthFor(conf_.mtu),
+        usable_single_mbuf_bytes);
   }
   const bool enable_rx_scatter =
       rx_mtu_support == PmdCapabilities::RxMtuSupport::kScatter;
@@ -453,12 +476,6 @@ CommandResponse PMDPort::UpdateConf(const Conf &conf) {
   rte_eth_dev_stop(dpdk_port_id_);  // need to restart before return
 
   if (conf_.mtu != conf.mtu && conf.mtu != 0) {
-    if (conf.mtu < RTE_ETHER_MIN_MTU) {
-      resp = CommandFailure(EINVAL, "mtu should be >= %d and <= %u",
-                            RTE_ETHER_MIN_MTU, capabilities_.max_mtu);
-      goto restart;
-    }
-
     int sid = rte_eth_dev_socket_id(dpdk_port_id_);
     if (sid < 0 || sid > RTE_MAX_NUMA_NODES) {
       sid = 0;
@@ -470,8 +487,15 @@ CommandResponse PMDPort::UpdateConf(const Conf &conf) {
       goto restart;
     }
 
-    const auto rx_mtu_support =
-        capabilities_.RxMtuSupportFor(conf.mtu, pool->mbuf_data_room_size());
+    const size_t usable_single_mbuf_bytes = single_mbuf_rx_capacity(*pool);
+    const auto rx_mtu_support = capabilities_.RxMtuSupportFor(
+        conf.mtu, usable_single_mbuf_bytes);
+    if (rx_mtu_support ==
+        PmdCapabilities::RxMtuSupport::kBelowDeviceMinMtu) {
+      resp = CommandFailure(EINVAL, "mtu %u is below PMD min_mtu %u", conf.mtu,
+                            capabilities_.min_mtu);
+      goto restart;
+    }
     if (rx_mtu_support ==
         PmdCapabilities::RxMtuSupport::kExceedsDeviceMtu) {
       resp = CommandFailure(EINVAL, "mtu %u exceeds PMD max_mtu %u", conf.mtu,
@@ -482,9 +506,10 @@ CommandResponse PMDPort::UpdateConf(const Conf &conf) {
         PmdCapabilities::RxMtuSupport::kScatterUnsupported) {
       resp = CommandFailure(
           EINVAL,
-          "mtu %u exceeds single-mbuf RX capacity %zu and PMD does not "
-          "support RX scatter",
-          conf.mtu, pool->mbuf_data_room_size());
+          "mtu %u requires RX frame length %zu, exceeds usable single-mbuf "
+          "RX capacity %zu and PMD does not support RX scatter",
+          conf.mtu, capabilities_.RxFrameLengthFor(conf.mtu),
+          usable_single_mbuf_bytes);
       goto restart;
     }
 

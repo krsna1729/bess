@@ -2168,7 +2168,7 @@ The `SNBUF_DATA` audit is intentional:
 
 | Use | Classification |
 | --- | --- |
-| `core/drivers/pmd.cc` MTU validation | Capacity-dependent; consumes the default pool's payload room plus `RTE_PKTMBUF_HEADROOM` and the PMD capability contract |
+| `core/drivers/pmd.cc` MTU validation | Capacity-dependent; consumes usable RX bytes (`rte_pktmbuf_data_room_size(pool->pool()) - RTE_PKTMBUF_HEADROOM`) plus PMD-reported Ethernet frame overhead |
 | `core/modules/source.cc` packet-size validation | Capacity-dependent; remains fixed until the jumbo policy substage |
 | `core/modules/random_update.cc`, `core/modules/update.cc`, `sample_plugin/modules/sequential_update.cc` | Fixed application-level packet-field offset contract |
 | `core/modules/set_metadata.cc` | Fixed application-level packet-field offset contract |
@@ -2202,9 +2202,11 @@ Stage 2C supports both jumbo representations:
 
 PMD initialization derives an internal capability object from
 `rte_eth_dev_info`. It enables `RTE_ETH_RX_OFFLOAD_SCATTER` only when the
-configured MTU exceeds the single-mbuf RX capacity
-(`payload room + RTE_PKTMBUF_HEADROOM`) and the PMD advertises scatter; an
-unsupported geometry or a device `max_mtu` exceed is rejected explicitly.
+configured MTU plus the effective RX frame overhead exceeds the usable
+single-mbuf RX capacity (`rte_pktmbuf_data_room_size(pool->pool()) -
+RTE_PKTMBUF_HEADROOM`) and the PMD advertises scatter; an unsupported
+geometry, a device minimum/maximum MTU violation, or a PMD without scatter
+support is rejected explicitly.
 Native `PacketRef` operations remain segment-aware:
 prepend operates on the first segment, `tailroom()` reports room in the
 segment referenced by the `PacketRef`, and `append()`/`trim()` follow DPDK's
@@ -2548,14 +2550,16 @@ testing goes through `bessctl/module_tests/*.py` against a running
 - [x] **Internal `PmdCapabilities` in `PMDPort`** (completed 2026-09-19,
       DPDK-proposal review). `PMDPort::Init()` now populates this semantic
       object once from `rte_eth_dev_info`; it is not exposed through protobuf.
-      The initial fields are `rx_scatter`, effective `max_mtu`,
-      `rx_offload_capa`, `tx_offload_capa`, and `dev_capa`.
-      `PMDPort` validates the configured MTU against the default pool's
-      single-mbuf RX capacity (`payload room + RTE_PKTMBUF_HEADROOM`): it
-      leaves scatter disabled when the frame fits, enables scatter only when
-      needed and advertised, rejects unsupported geometry clearly, and still
-      rejects a device `max_mtu` exceed. Deterministic coverage lives in
-      `core/drivers/pmd_test.cc`.
+      The fields are `rx_scatter`, effective `min_mtu`/`max_mtu`,
+      `rx_frame_overhead`, `rx_offload_capa`, `tx_offload_capa`, and
+      `dev_capa`.
+      `PMDPort` validates the configured MTU as an Ethernet frame length
+      (`mtu + rx_frame_overhead`) against the default pool's usable
+      single-mbuf RX capacity (`rte_pktmbuf_data_room_size(pool->pool()) -
+      RTE_PKTMBUF_HEADROOM`): it leaves scatter disabled when the frame fits,
+      enables scatter only when needed and advertised, rejects unsupported
+      geometry clearly, and rejects device minimum/maximum MTU violations.
+      Deterministic coverage lives in `core/drivers/pmd_test.cc`.
       `RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE` remains a hardware/performance gate;
       do not enable it until the direct-packet/refcount/pool preconditions are
       benchmarked on a real NIC after the relevant Phase B work.

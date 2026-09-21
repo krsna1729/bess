@@ -33,9 +33,12 @@
 
 namespace {
 
-rte_eth_dev_info MakeDeviceInfo(uint32_t max_mtu, bool rx_scatter) {
+rte_eth_dev_info MakeDeviceInfo(uint16_t min_mtu, uint16_t max_mtu,
+                                bool rx_scatter, uint32_t max_rx_pktlen) {
   rte_eth_dev_info info = {};
+  info.min_mtu = min_mtu;
   info.max_mtu = max_mtu;
+  info.max_rx_pktlen = max_rx_pktlen;
   info.rx_offload_capa =
       (rx_scatter ? RTE_ETH_RX_OFFLOAD_SCATTER : 0) | 0x400000000ULL;
   info.tx_offload_capa = 0x55;
@@ -43,61 +46,88 @@ rte_eth_dev_info MakeDeviceInfo(uint32_t max_mtu, bool rx_scatter) {
   return info;
 }
 
+constexpr size_t kEtherOverhead = RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN;
 constexpr size_t kPayloadRoom = 2048;
-constexpr size_t kSingleMbufCapacity = kPayloadRoom + RTE_PKTMBUF_HEADROOM;
+constexpr size_t kMbufDataRoom = kPayloadRoom + RTE_PKTMBUF_HEADROOM;
+constexpr size_t kUsableSingleMbufBytes =
+    kMbufDataRoom - RTE_PKTMBUF_HEADROOM;
 
 using RxMtuSupport = PmdCapabilities::RxMtuSupport;
 
 }  // namespace
 
-TEST(PmdCapabilitiesTest, CopiesDeviceCapabilities) {
-  const rte_eth_dev_info info = MakeDeviceInfo(9000, true);
+TEST(PmdCapabilitiesTest, CopiesDeviceCapabilitiesAndRxGeometry) {
+  const rte_eth_dev_info info = MakeDeviceInfo(576, 9000, true, 9018);
   const PmdCapabilities capabilities =
       PmdCapabilities::FromDeviceInfo(info);
 
   EXPECT_TRUE(capabilities.rx_scatter);
+  EXPECT_EQ(576u, capabilities.min_mtu);
   EXPECT_EQ(9000u, capabilities.max_mtu);
+  EXPECT_EQ(kEtherOverhead, capabilities.rx_frame_overhead);
   EXPECT_EQ(info.rx_offload_capa, capabilities.rx_offload_capa);
   EXPECT_EQ(info.tx_offload_capa, capabilities.tx_offload_capa);
   EXPECT_EQ(info.dev_capa, capabilities.dev_capa);
 }
 
-TEST(PmdCapabilitiesTest, MtuFitsSingleMbufWithoutScatter) {
+TEST(PmdCapabilitiesTest, MtuAtFrameCapacityFitsSingleMbuf) {
   const PmdCapabilities capabilities =
-      PmdCapabilities::FromDeviceInfo(MakeDeviceInfo(9000, true));
+      PmdCapabilities::FromDeviceInfo(MakeDeviceInfo(576, 9000, true, 9018));
+  const uint32_t mtu = kUsableSingleMbufBytes - kEtherOverhead;
 
+  EXPECT_EQ(kUsableSingleMbufBytes,
+            capabilities.RxFrameLengthFor(mtu));
   EXPECT_EQ(RxMtuSupport::kSingleMbuf,
-            capabilities.RxMtuSupportFor(1500, kSingleMbufCapacity));
+            capabilities.RxMtuSupportFor(mtu, kUsableSingleMbufBytes));
 }
 
-TEST(PmdCapabilitiesTest, MtuExceedsRoomUsesScatter) {
+TEST(PmdCapabilitiesTest, MtuOneByteOverFrameCapacityUsesScatter) {
   const PmdCapabilities capabilities =
-      PmdCapabilities::FromDeviceInfo(MakeDeviceInfo(9000, true));
+      PmdCapabilities::FromDeviceInfo(MakeDeviceInfo(576, 9000, true, 9018));
+  const uint32_t mtu = kUsableSingleMbufBytes - kEtherOverhead + 1;
 
+  EXPECT_EQ(kUsableSingleMbufBytes + 1,
+            capabilities.RxFrameLengthFor(mtu));
   EXPECT_EQ(RxMtuSupport::kScatter,
-            capabilities.RxMtuSupportFor(9000, kSingleMbufCapacity));
+            capabilities.RxMtuSupportFor(mtu, kUsableSingleMbufBytes));
 }
 
-TEST(PmdCapabilitiesTest, MtuExceedsRoomWithoutScatterIsRejected) {
+TEST(PmdCapabilitiesTest, MtuOverFrameCapacityWithoutScatterIsRejected) {
   const PmdCapabilities capabilities =
-      PmdCapabilities::FromDeviceInfo(MakeDeviceInfo(9000, false));
+      PmdCapabilities::FromDeviceInfo(MakeDeviceInfo(576, 9000, false, 9018));
+  const uint32_t mtu = kUsableSingleMbufBytes - kEtherOverhead + 1;
 
   EXPECT_EQ(RxMtuSupport::kScatterUnsupported,
-            capabilities.RxMtuSupportFor(9000, kSingleMbufCapacity));
+            capabilities.RxMtuSupportFor(mtu, kUsableSingleMbufBytes));
+}
+
+TEST(PmdCapabilitiesTest, MtuBelowDeviceMinimumIsRejected) {
+  const PmdCapabilities capabilities =
+      PmdCapabilities::FromDeviceInfo(MakeDeviceInfo(576, 9000, true, 9018));
+
+  EXPECT_EQ(RxMtuSupport::kBelowDeviceMinMtu,
+            capabilities.RxMtuSupportFor(575, kUsableSingleMbufBytes));
 }
 
 TEST(PmdCapabilitiesTest, MtuAboveDeviceMaximumIsRejected) {
   const PmdCapabilities capabilities =
-      PmdCapabilities::FromDeviceInfo(MakeDeviceInfo(1500, true));
+      PmdCapabilities::FromDeviceInfo(MakeDeviceInfo(576, 1500, true, 1518));
 
   EXPECT_EQ(RxMtuSupport::kExceedsDeviceMtu,
-            capabilities.RxMtuSupportFor(1501, kSingleMbufCapacity));
+            capabilities.RxMtuSupportFor(1501, kUsableSingleMbufBytes));
 }
 
-TEST(PmdCapabilitiesTest, JumboMbufRoomDoesNotNeedScatter) {
+TEST(PmdCapabilitiesTest, JumboMbufRoomIncludesEthernetOverhead) {
   const PmdCapabilities capabilities =
-      PmdCapabilities::FromDeviceInfo(MakeDeviceInfo(9000, true));
+      PmdCapabilities::FromDeviceInfo(MakeDeviceInfo(576, 9000, true, 9018));
 
   EXPECT_EQ(RxMtuSupport::kSingleMbuf,
-            capabilities.RxMtuSupportFor(9000, 9000));
+            capabilities.RxMtuSupportFor(9000, 9000 + kEtherOverhead));
+}
+
+TEST(PmdCapabilitiesTest, UnknownDeviceOverheadUsesEthernetFallback) {
+  const PmdCapabilities capabilities = PmdCapabilities::FromDeviceInfo(
+      MakeDeviceInfo(576, UINT16_MAX, true, UINT32_MAX));
+
+  EXPECT_EQ(kEtherOverhead, capabilities.rx_frame_overhead);
 }
