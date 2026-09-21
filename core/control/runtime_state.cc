@@ -36,6 +36,7 @@
 #include "module.h"
 #include "port.h"
 #include "control/worker_manager.h"
+#include "rcu/rcu_domain.h"
 #include "traffic_class.h"
 #include "utils/common.h"
 
@@ -240,7 +241,12 @@ void TrafficClassRegistry::ReleaseAll() {
 // RuntimeState
 // ---------------------------------------------------------------------------
 
-RuntimeState::RuntimeState() : workers_(std::make_unique<WorkerManager>()) {}
+RuntimeState::RuntimeState()
+    : workers_(std::make_unique<WorkerManager>()),
+      // One domain for the whole runtime, sized by the worker id space: a
+      // worker registers when its thread starts and unregisters when it is
+      // done, so a recreated worker reuses its id.
+      rcu_(std::make_unique<rcu::RcuDomain>(Worker::kMaxWorkers)) {}
 
 RuntimeState::~RuntimeState() = default;
 
@@ -250,6 +256,14 @@ WorkerManager &RuntimeState::workers() {
 
 const WorkerManager &RuntimeState::workers() const {
   return *workers_;
+}
+
+rcu::RcuDomain &RuntimeState::rcu() {
+  return *rcu_;
+}
+
+const rcu::RcuDomain &RuntimeState::rcu() const {
+  return *rcu_;
 }
 
 RuntimeState &RuntimeState::Get() {

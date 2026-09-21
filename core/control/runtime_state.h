@@ -41,6 +41,12 @@ class Module;
 class Port;
 
 namespace bess {
+namespace rcu {
+class RcuDomain;
+}  // namespace rcu
+}  // namespace bess
+
+namespace bess {
 class TrafficClass;
 
 namespace control {
@@ -186,12 +192,19 @@ class RuntimeState {
   TrafficClassRegistry &traffic_classes() { return traffic_classes_; }
   WorkerManager &workers();
 
+  // The single dataplane reader domain (K1): workers register once and report
+  // quiescence, and every immutable dataplane object publishes and retires
+  // through it. Its lifetime is the runtime's, so it must outlive every
+  // registered reader.
+  rcu::RcuDomain &rcu();
+
   const PortRegistry &ports() const { return ports_; }
   const ModuleRegistry &modules() const { return modules_; }
   const TrafficClassRegistry &traffic_classes() const {
     return traffic_classes_;
   }
   const WorkerManager &workers() const;
+  const rcu::RcuDomain &rcu() const;
 
   // Monotonic control-plane generation: bumped exactly once per successful
   // state-changing transaction, never for reads, validation, planning, failed
@@ -210,6 +223,7 @@ class RuntimeState {
   ModuleRegistry modules_;
   TrafficClassRegistry traffic_classes_;
   std::unique_ptr<WorkerManager> workers_;
+  std::unique_ptr<rcu::RcuDomain> rcu_;
   uint64_t generation_ = 0;
 };
 

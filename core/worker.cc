@@ -52,6 +52,7 @@
 #include "packet_pool.h"
 #include "resume_hook.h"
 #include "control/runtime_state.h"
+#include "rcu/rcu_domain.h"
 #include "control/worker_manager.h"
 #include "resume_hooks/metadata.h"
 #include "scheduler.h"
@@ -185,12 +186,21 @@ int Worker::BlockWorker() {
   bess::control::worker_signal t;
   int ret;
 
+  // Leave the RCU reader domain *before* blocking (K1): a grace period must
+  // never depend on a thread that will not report quiescence until it is woken
+  // again. This is the offline-before-blocking rule.
+  bess::control::runtime().rcu().Offline(wid_);
+
   status_ = WORKER_PAUSED;
 
   ret = read(fd_event_, &t, sizeof(t));
   CHECK_EQ(ret, sizeof(t));
 
   if (t == bess::control::worker_signal::unblock) {
+    // Back online before any dataplane work resumes, and report quiescence so
+    // that a grace period started while this worker was paused can complete.
+    bess::control::runtime().rcu().Online(wid_);
+    bess::control::runtime().rcu().Quiescent(wid_);
     status_ = WORKER_RUNNING;
     return 0;
   }
@@ -278,6 +288,16 @@ void *Worker::Run(void *_arg) {
 
   bess::control::runtime().workers().Publish(wid_, this);
 
+  // Register as a reader, but stay offline: a worker that merely exists as a
+  // thread is not an active RCU participant. It goes online when dataplane
+  // execution is about to resume (BlockWorker's unblock path).
+  {
+    auto registered = bess::control::runtime().rcu().Register(wid_);
+    CHECK(registered.has_value())
+        << "RCU reader registration failed for worker " << wid_ << ": "
+        << registered.error().message;
+  }
+
   LOG(INFO) << "Worker " << wid_ << "(" << this << ") "
             << "is running on core " << core_ << " (socket " << socket_
             << ", DPDK lcore " << lcore_id << ")";
@@ -288,6 +308,12 @@ void *Worker::Run(void *_arg) {
   LOG(INFO) << "Worker " << wid_ << "(" << this << ") "
             << "is quitting... (core " << core_ << ", socket " << socket_
             << ")";
+
+  // The thread is finished with the dataplane: give the reader slot back
+  // before teardown, so a recreated worker with this id can register again and
+  // a grace period stops waiting for it.
+  bess::control::runtime().rcu().Offline(wid_);
+  bess::control::runtime().rcu().Unregister(wid_);
 
   delete scheduler_;
   delete rand_;
