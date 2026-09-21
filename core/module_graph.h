@@ -36,6 +36,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "control/runtime_state.h"
 #include "gate.h"
 #include "message.h"
 #include "metadata.h"
@@ -58,9 +59,8 @@ class ModuleGraph {
                               const google::protobuf::Any &arg,
                               pb_error_t *perr);
 
-  // Removes a module. Returns 0 on success, -errno
-  // otherwise.
-  static void DestroyModule(Module *m, bool erase = true);
+  // Removes a module from the runtime registry, destroys it and deletes it.
+  static void DestroyModule(Module *m);
   static void DestroyAllModules();
 
   static int ConnectModules(Module *module, gate_idx_t ogate_idx,
@@ -68,7 +68,8 @@ class ModuleGraph {
                             bool skip_default_hooks = false);
   static int DisconnectModule(Module *module, gate_idx_t ogate_idx);
 
-  static const std::map<std::string, Module *> &GetAllModules();
+  // Non-owning view of the runtime's module registry.
+  static const bess::control::ModuleRegistry::Map &GetAllModules();
 
   static std::string GenerateDefaultName(const std::string &class_name,
                                          const std::string &default_template);
@@ -95,12 +96,8 @@ class ModuleGraph {
   static void SetUniqueGateIdx();
   static void ConfigureTasks();
 
-  // All modules that are tasks in the current pipeline.
-  static std::unordered_set<std::string> tasks_;
-
-  // All modules
-  static std::map<std::string, Module *> all_modules_;
-
+  // Task membership, gate numbering and the dirty flag are graph state; module
+  // instances themselves live in the runtime's ModuleRegistry.
   static uint32_t gate_cnt_;
   // Check if any changes on module graphs
   static bool changes_made_;

@@ -30,6 +30,8 @@
 
 #include "queue_inc.h"
 
+#include "../control/runtime_state.h"
+
 #include "../port.h"
 #include "../utils/format.h"
 
@@ -48,11 +50,10 @@ CommandResponse QueueInc::Init(const bess::pb::QueueIncArg &arg) {
   port_name = arg.port().c_str();
   qid_ = arg.qid();
 
-  const auto &it = PortBuilder::all_ports().find(port_name);
-  if (it == PortBuilder::all_ports().end()) {
+  port_ = bess::control::runtime().ports().Find(port_name);
+  if (!port_) {
     return CommandFailure(ENODEV, "Port %s not found", port_name);
   }
-  port_ = it->second;
   burst_ = bess::PacketBatch::kMaxBurst;
 
   if (arg.prefetch()) {

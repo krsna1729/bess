@@ -110,17 +110,6 @@ class PortBuilder {
   // given name.
   Port *CreatePort(const std::string &name) const;
 
-  // Adds the given Port to the global Port collection.  Takes ownership of the
-  // pointer.  Returns true upon success.
-  static bool AddPort(Port *p);
-
-  // Returns 0 upon success, -errno upon failure.
-  static int DestroyPort(Port *p);
-
-  // Generates a name for a new port given the driver name and its template.
-  static std::string GenerateDefaultPortName(
-      const std::string &driver_name, const std::string &default_template);
-
   // Invokes one-time initialization of the corresponding port class.  Returns
   // true upon success.
   bool InitPortClass();
@@ -137,8 +126,6 @@ class PortBuilder {
                                 port_init_func_t init_func);
 
   static const std::map<std::string, PortBuilder> &all_port_builders();
-
-  static const std::map<std::string, Port *> &all_ports();
 
   const std::string &class_name() const { return class_name_; }
   const std::string &name_template() const { return name_template_; }
@@ -161,9 +148,6 @@ class PortBuilder {
 
   // A function that emits a new Port object of the type class_name.
   std::function<Port *()> port_generator_;
-
-  // Tracks all port instances.
-  static std::map<std::string, Port *> all_ports_;
 
   std::string class_name_;     // The name of this Port class.
   std::string name_template_;  // The port default name prefix.

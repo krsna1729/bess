@@ -5,6 +5,7 @@ core_sources = files(
   'bessd.cc',
   'control/control_error.cc',
   'control/control_plane.cc',
+  'control/runtime_state.cc',
   'debug.cc',
   'dpdk.cc',
   'event.cc',

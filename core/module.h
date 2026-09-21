@@ -103,6 +103,12 @@ static inline module_init_func_t MODULE_INIT_FUNC(
 
 class Module;
 
+namespace bess {
+namespace control {
+class ModuleRegistry;
+}  // namespace control
+}  // namespace bess
+
 // A class for managing modules of 'a particular type'.
 // Creates new modules and forwards module-specific commands.
 class ModuleBuilder {
@@ -240,6 +246,7 @@ class alignas(64) Module {
  public:
   friend class ModuleBuilder;
   friend class ModuleGraph;
+  friend class bess::control::ModuleRegistry;
 
   CommandResponse InitWithGenericArg(const google::protobuf::Any &arg);
 

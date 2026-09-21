@@ -29,6 +29,8 @@
 
 #include "control/control_plane.h"
 
+#include <memory>
+
 #include <cerrno>
 #include <cstdarg>
 #include <memory>
@@ -106,20 +108,18 @@ ControlResult<PortInfo> ControlPlane::CreatePort(const PortSpec& spec) {
     return std::unexpected(Err(EINVAL, "Invalid queue size"));
   }
 
+  PortRegistry &ports = runtime().ports();
   std::string port_name;
 
-  // NOTE(G0): preserved verbatim from the RPC handler, including its legacy
-  // silent-failure path -- re-creating a port under an existing name leaves a
-  // stale registry entry and reports success with an empty name. The
-  // registry-ownership commit fixes this properly.
   if (spec.name.length() > 0) {
-    if (PortBuilder::all_ports().count(spec.name)) {
-      p.reset(PortBuilder::all_ports().at(spec.name));
+    if (ports.Contains(spec.name)) {
+      return std::unexpected(
+          Err(EEXIST, "Port '%s' already exists", spec.name.c_str()));
     }
     port_name = spec.name;
   } else {
-    port_name = PortBuilder::GenerateDefaultPortName(driver.class_name(),
-                                                     driver.name_template());
+    port_name = ports.GenerateDefaultName(driver.class_name(),
+                                          driver.name_template());
   }
 
   // Try to create and initialize the port.
@@ -158,17 +158,15 @@ ControlResult<PortInfo> ControlPlane::CreatePort(const PortSpec& spec) {
         ErrorFromLegacy(ret.error().code(), ret.error().errmsg()));
   }
 
-  if (!PortBuilder::AddPort(p.get())) {
-    // Legacy silent failure (error code 0, empty message): keep the wire
-    // behavior identical until port ownership moves into RuntimeState.
-    return std::unexpected(ErrorFromLegacy(0, ""));
-  }
-
   PortInfo info;
   info.name = p->name();
   info.driver = driver.class_name();
   info.mac_addr = p->conf().mac_addr.ToString();
-  p.release();
+
+  if (!ports.Add(std::move(p))) {
+    return std::unexpected(
+        Err(EEXIST, "Port '%s' already exists", info.name.c_str()));
+  }
 
   return info;
 }
@@ -181,13 +179,10 @@ ControlResult<void> ControlPlane::DestroyPort(const std::string& name) {
         Err(EINVAL, "Argument must be a name in str"));
   }
 
-  const auto& it = PortBuilder::all_ports().find(name);
-  if (it == PortBuilder::all_ports().end()) {
-    return std::unexpected(
-        Err(ENOENT, "No port `%s' found", name.c_str()));
+  int ret = runtime().ports().Destroy(name);
+  if (ret == -ENOENT) {
+    return std::unexpected(Err(ENOENT, "No port `%s' found", name.c_str()));
   }
-
-  int ret = PortBuilder::DestroyPort(it->second);
   if (ret) {
     return std::unexpected(Errno(-ret));
   }
@@ -203,8 +198,8 @@ ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConf(
     return std::unexpected(Err(EINVAL, "Port name is not given"));
   }
 
-  const auto& it = PortBuilder::all_ports().find(name);
-  if (it == PortBuilder::all_ports().end()) {
+  Port *port = runtime().ports().Find(name);
+  if (!port) {
     return std::unexpected(Err(ENOENT, "No port `%s' found", name.c_str()));
   }
 
@@ -218,7 +213,7 @@ ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConf(
   }
 
   WorkerPauser wp;
-  return it->second->UpdateConf(conf);
+  return port->UpdateConf(conf);
 }
 
 ControlResult<void> ControlPlane::ResetPorts() {
@@ -229,17 +224,19 @@ ControlResult<void> ControlPlane::ResetPorts() {
 ControlResult<void> ControlPlane::ResetPortsLocked() {
   WorkerPauser wp;
 
-  for (auto it = PortBuilder::all_ports().cbegin();
-       it != PortBuilder::all_ports().end();) {
-    auto it_next = std::next(it);
-    ::Port* p = it->second;
+  PortRegistry &ports = runtime().ports();
 
-    int ret = PortBuilder::DestroyPort(p);
+  std::vector<std::string> names;
+  names.reserve(ports.Size());
+  for (const auto &pair : ports.All()) {
+    names.push_back(pair.first);
+  }
+
+  for (const std::string &name : names) {
+    int ret = ports.Destroy(name);
     if (ret) {
       return std::unexpected(Errno(-ret));
     }
-
-    it = it_next;
   }
 
   LOG(INFO) << "*** All ports have been destroyed ***";
@@ -267,8 +264,7 @@ ControlResult<std::string> ControlPlane::CreateModule(const ModuleSpec& spec) {
 
   std::string mod_name;
   if (spec.name.length()) {
-    const auto& it2 = ModuleGraph::GetAllModules().find(spec.name);
-    if (it2 != ModuleGraph::GetAllModules().end()) {
+    if (runtime().modules().Contains(spec.name)) {
       return std::unexpected(
           Err(EEXIST, "Module %s exists", spec.name.c_str()));
     }
@@ -302,11 +298,10 @@ ControlResult<void> ControlPlane::DestroyModule(const std::string& name) {
     return std::unexpected(Err(EINVAL, "Argument must be a name in str"));
   }
 
-  const auto& it = ModuleGraph::GetAllModules().find(name);
-  if (it == ModuleGraph::GetAllModules().end()) {
+  Module* m = runtime().modules().Find(name);
+  if (!m) {
     return std::unexpected(Err(ENOENT, "No module '%s' found", name.c_str()));
   }
-  Module* m = it->second;
 
   auto& resume_modules = bess::event_modules[bess::Event::PreResume];
   if (resume_modules.erase(m) > 0) {
@@ -342,19 +337,17 @@ ControlResult<void> ControlPlane::ConnectModules(const ConnectionSpec& spec) {
     return std::unexpected(Err(EINVAL, "Missing 'm1' or 'm2' field"));
   }
 
-  const auto& it1 = ModuleGraph::GetAllModules().find(spec.m1);
-  if (it1 == ModuleGraph::GetAllModules().end()) {
+  Module* m1 = runtime().modules().Find(spec.m1);
+  if (!m1) {
     return std::unexpected(
         Err(ENOENT, "No module '%s' found", spec.m1.c_str()));
   }
-  Module* m1 = it1->second;
 
-  const auto& it2 = ModuleGraph::GetAllModules().find(spec.m2);
-  if (it2 == ModuleGraph::GetAllModules().end()) {
+  Module* m2 = runtime().modules().Find(spec.m2);
+  if (!m2) {
     return std::unexpected(
         Err(ENOENT, "No module '%s' found", spec.m2.c_str()));
   }
-  Module* m2 = it2->second;
 
   int ret;
   if (is_any_worker_running()) {
@@ -393,12 +386,11 @@ ControlResult<void> ControlPlane::DisconnectModules(
     return std::unexpected(Err(EINVAL, "Missing 'name' field"));
   }
 
-  const auto& it = ModuleGraph::GetAllModules().find(spec.name);
-  if (it == ModuleGraph::GetAllModules().end()) {
+  Module* m = runtime().modules().Find(spec.name);
+  if (!m) {
     return std::unexpected(
         Err(ENOENT, "No module '%s' found", spec.name.c_str()));
   }
-  Module* m = it->second;
 
   int ret = ModuleGraph::DisconnectModule(m, spec.ogate);
   if (ret < 0) {
@@ -722,7 +714,7 @@ ControlPlane::CheckSchedulingConstraints() {
 
   // Check local constraints
   for (const auto& pair : ModuleGraph::GetAllModules()) {
-    const Module* m = pair.second;
+    const Module* m = pair.second.get();
     auto ret = m->CheckModuleConstraints();
     if (ret != CHECK_OK) {
       LOG(WARNING) << "Module " << m->name() << " failed check " << ret;
@@ -752,12 +744,11 @@ ControlResult<bess::TrafficClass*> ControlPlane::FindTc(
     c = it->second;
   } else if (spec.leaf_module_name.length() != 0) {
     const std::string& module_name = spec.leaf_module_name;
-    const auto& it = ModuleGraph::GetAllModules().find(module_name);
-    if (it == ModuleGraph::GetAllModules().end()) {
+    Module* m = runtime().modules().Find(module_name);
+    if (!m) {
       return std::unexpected(
           Err(ENOENT, "No module '%s' found", module_name.c_str()));
     }
-    Module* m = it->second;
 
     task_id_t tid = spec.leaf_module_taskid;
     if (tid >= MAX_TASKS_PER_MODULE) {
@@ -1014,7 +1005,7 @@ ControlResult<std::string> ControlPlane::ConfigureGateHook(
     for (const auto& it : ModuleGraph::GetAllModules()) {
       if (enable) {
         ControlResult<std::string> ret =
-            enable_hook_for_module(spec, it.second, builder->second);
+            enable_hook_for_module(spec, it.second.get(), builder->second);
         if (!ret) {
           return std::unexpected(ret.error());
         }
@@ -1022,7 +1013,8 @@ ControlResult<std::string> ControlPlane::ConfigureGateHook(
           created = *ret;
         }
       } else {
-        ControlResult<void> ret = disable_hook_for_module(spec, it.second);
+        ControlResult<void> ret =
+            disable_hook_for_module(spec, it.second.get());
         if (!ret) {
           return std::unexpected(ret.error());
         }
@@ -1032,15 +1024,15 @@ ControlResult<std::string> ControlPlane::ConfigureGateHook(
   }
 
   // Install this hook on the specified module
-  const auto& it = ModuleGraph::GetAllModules().find(spec.module_name);
-  if (it == ModuleGraph::GetAllModules().end()) {
+  Module *m = runtime().modules().Find(spec.module_name);
+  if (!m) {
     return std::unexpected(
         Err(ENOENT, "No module '%s' found", spec.module_name.c_str()));
   }
   if (enable) {
-    return enable_hook_for_module(spec, it->second, builder->second);
+    return enable_hook_for_module(spec, m, builder->second);
   }
-  ControlResult<void> ret = disable_hook_for_module(spec, it->second);
+  ControlResult<void> ret = disable_hook_for_module(spec, m);
   if (!ret) {
     return std::unexpected(ret.error());
   }

@@ -43,65 +43,11 @@
 
 #include "message.h"
 
-std::map<std::string, Port *> PortBuilder::all_ports_;
-
 Port *PortBuilder::CreatePort(const std::string &name) const {
   Port *p = port_generator_();
   p->set_name(name);
   p->set_port_builder(this);
   return p;
-}
-
-bool PortBuilder::AddPort(Port *p) {
-  return all_ports_.insert({p->name(), p}).second;
-}
-
-int PortBuilder::DestroyPort(Port *p) {
-  for (packet_dir_t dir : {PACKET_DIR_INC, PACKET_DIR_OUT}) {
-    for (queue_t i = 0; i < p->num_queues[dir]; i++) {
-      if (p->users[dir][i]) {
-        return -EBUSY;
-      }
-    }
-  }
-
-  all_ports_.erase(p->name());
-  p->DeInit();
-  delete p;
-
-  return 0;
-}
-
-std::string PortBuilder::GenerateDefaultPortName(
-    const std::string &driver_name, const std::string &default_template) {
-  std::string name_template;
-
-  if (default_template == "") {
-    std::ostringstream ss;
-    char last_char = '\0';
-    for (auto t : driver_name) {
-      if (last_char != '\0' && islower(last_char) && isupper(t))
-        ss << '_';
-
-      ss << char(tolower(t));
-      last_char = t;
-    }
-    name_template = ss.str();
-  } else {
-    name_template = default_template;
-  }
-
-  for (int i = 0;; i++) {
-    std::ostringstream ss;
-    ss << name_template << i;
-    std::string name = ss.str();
-
-    if (!all_ports_.count(name)) {
-      return name;  // found an unallocated name!
-    }
-  }
-
-  promise_unreachable();
 }
 
 bool PortBuilder::InitPortClass() {
@@ -151,10 +97,6 @@ std::map<std::string, PortBuilder> &PortBuilder::all_port_builders_holder(
   }
 
   return all_port_builders;
-}
-
-const std::map<std::string, Port *> &PortBuilder::all_ports() {
-  return all_ports_;
 }
 
 void Port::CollectStats(bool) {}

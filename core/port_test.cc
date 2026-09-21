@@ -29,6 +29,7 @@
 
 // Unit tests for port and portbuilder routines.
 
+#include "control/runtime_state.h"
 #include "port.h"
 
 #include <gtest/gtest.h>
@@ -92,7 +93,7 @@ class PortTest : public ::testing::Test {
 
   virtual void TearDown() {
     PortBuilder::all_port_builders_holder(true);
-    PortBuilder::all_ports_.clear();
+    bess::control::runtime().ports().Clear();
   }
 
   const PortBuilder *dummy_port_builder;
@@ -105,7 +106,10 @@ class PortBuilderTest : public ::testing::Test {
     ASSERT_TRUE(PortBuilder::all_port_builders().empty());
   }
 
-  virtual void TearDown() { PortBuilder::all_port_builders_holder(true); }
+  virtual void TearDown() {
+    PortBuilder::all_port_builders_holder(true);
+    bess::control::runtime().ports().Clear();
+  }
 };
 
 // Checks that when we create a port via the established PortBuilder, the right
@@ -129,14 +133,14 @@ TEST_F(PortTest, AddPort) {
   std::unique_ptr<Port> p(dummy_port_builder->CreatePort("port1"));
   ASSERT_NE(nullptr, p.get());
 
-  ASSERT_TRUE(PortBuilder::all_ports().empty());
-  PortBuilder::AddPort(p.get());
-  ASSERT_EQ(1, PortBuilder::all_ports().size());
+  ASSERT_TRUE(bess::control::runtime().ports().All().empty());
+  ASSERT_TRUE(bess::control::runtime().ports().Add(std::move(p)));
+  ASSERT_EQ(1, bess::control::runtime().ports().All().size());
 
-  const auto &it = PortBuilder::all_ports().find("port1");
-  ASSERT_NE(it, PortBuilder::all_ports().end());
+  const auto &it = bess::control::runtime().ports().All().find("port1");
+  ASSERT_NE(it, bess::control::runtime().ports().All().end());
 
-  const Port *p_fetched = it->second;
+  const Port *p_fetched = it->second.get();
   EXPECT_EQ("port1", p_fetched->name());
   EXPECT_EQ(dummy_port_builder, p_fetched->port_builder());
 }
@@ -146,12 +150,12 @@ TEST_F(PortTest, GetPortStats) {
   std::unique_ptr<Port> p(dummy_port_builder->CreatePort("port1"));
   ASSERT_NE(nullptr, p.get());
 
-  ASSERT_TRUE(PortBuilder::all_ports().empty());
-  PortBuilder::AddPort(p.get());
-  ASSERT_EQ(1, PortBuilder::all_ports().size());
+  ASSERT_TRUE(bess::control::runtime().ports().All().empty());
+  ASSERT_TRUE(bess::control::runtime().ports().Add(std::move(p)));
+  ASSERT_EQ(1, bess::control::runtime().ports().All().size());
 
-  const auto &it = PortBuilder::all_ports().find("port1");
-  ASSERT_NE(it, PortBuilder::all_ports().end());
+  const auto &it = bess::control::runtime().ports().All().find("port1");
+  ASSERT_NE(it, bess::control::runtime().ports().All().end());
 
   Port::PortStats stats = it->second->GetPortStats();
   EXPECT_EQ(0, stats.inc.packets);
@@ -169,12 +173,13 @@ TEST_F(PortTest, AcquireAndReleaseQueues) {
   p->num_queues[PACKET_DIR_OUT] = 1;
   ASSERT_NE(nullptr, p.get());
 
-  ASSERT_TRUE(PortBuilder::all_ports().empty());
-  PortBuilder::AddPort(p.get());
-  ASSERT_EQ(1, PortBuilder::all_ports().size());
+  ASSERT_TRUE(bess::control::runtime().ports().All().empty());
+  ASSERT_TRUE(bess::control::runtime().ports().Add(std::move(p)));
+  ASSERT_EQ(1, bess::control::runtime().ports().All().size());
 
-  const auto &it = PortBuilder::all_ports().find("port1");
-  ASSERT_NE(it, PortBuilder::all_ports().end());
+  const auto &it = bess::control::runtime().ports().All().find("port1");
+  ASSERT_NE(it, bess::control::runtime().ports().All().end());
+  Port *port = it->second.get();
 
   // Set up two dummy modules; this isn't safe, but the pointers shouldn't be
   // dereferenced by the called code so it should be fine for the test.
@@ -182,37 +187,37 @@ TEST_F(PortTest, AcquireAndReleaseQueues) {
   struct module *m2 = (struct module *)2;
 
   // First don't specify a valid direction, shouldn't work.
-  EXPECT_EQ(-EINVAL, p->AcquireQueues(m1, PACKET_DIRS, nullptr, 1));
+  EXPECT_EQ(-EINVAL, port->AcquireQueues(m1, PACKET_DIRS, nullptr, 1));
 
-  ASSERT_EQ(0, p->AcquireQueues(m1, PACKET_DIR_INC, nullptr, 1));
-  EXPECT_EQ(-EBUSY, p->AcquireQueues(m2, PACKET_DIR_INC, nullptr, 1));
-  p->ReleaseQueues(m1, PACKET_DIR_INC, nullptr, 1);
-  EXPECT_EQ(0, p->AcquireQueues(m2, PACKET_DIR_INC, nullptr, 1));
-  p->ReleaseQueues(m2, PACKET_DIR_INC, nullptr, 1);
+  ASSERT_EQ(0, port->AcquireQueues(m1, PACKET_DIR_INC, nullptr, 1));
+  EXPECT_EQ(-EBUSY, port->AcquireQueues(m2, PACKET_DIR_INC, nullptr, 1));
+  port->ReleaseQueues(m1, PACKET_DIR_INC, nullptr, 1);
+  EXPECT_EQ(0, port->AcquireQueues(m2, PACKET_DIR_INC, nullptr, 1));
+  port->ReleaseQueues(m2, PACKET_DIR_INC, nullptr, 1);
 
   queue_t queues;
   memset(&queues, 0, sizeof(queues));
 
-  ASSERT_EQ(0, p->AcquireQueues(m1, PACKET_DIR_INC, &queues, 1));
-  EXPECT_EQ(-EBUSY, p->AcquireQueues(m2, PACKET_DIR_INC, &queues, 1));
-  p->ReleaseQueues(m1, PACKET_DIR_INC, &queues, 1);
-  EXPECT_EQ(0, p->AcquireQueues(m2, PACKET_DIR_INC, &queues, 1));
-  p->ReleaseQueues(m2, PACKET_DIR_INC, &queues, 1);
+  ASSERT_EQ(0, port->AcquireQueues(m1, PACKET_DIR_INC, &queues, 1));
+  EXPECT_EQ(-EBUSY, port->AcquireQueues(m2, PACKET_DIR_INC, &queues, 1));
+  port->ReleaseQueues(m1, PACKET_DIR_INC, &queues, 1);
+  EXPECT_EQ(0, port->AcquireQueues(m2, PACKET_DIR_INC, &queues, 1));
+  port->ReleaseQueues(m2, PACKET_DIR_INC, &queues, 1);
 }
 
 // Checks that destroying a port works.
 TEST_F(PortTest, DestroyPort) {
-  Port *p = dummy_port_builder->CreatePort("port1");
-  ASSERT_NE(nullptr, p);
+  std::unique_ptr<Port> p(dummy_port_builder->CreatePort("port1"));
+  ASSERT_NE(nullptr, p.get());
 
-  ASSERT_TRUE(PortBuilder::all_ports().empty());
-  PortBuilder::AddPort(p);
-  ASSERT_EQ(1, PortBuilder::all_ports().size());
+  ASSERT_TRUE(bess::control::runtime().ports().All().empty());
+  ASSERT_TRUE(bess::control::runtime().ports().Add(std::move(p)));
+  ASSERT_EQ(1, bess::control::runtime().ports().All().size());
 
-  const auto &it = PortBuilder::all_ports().find("port1");
-  ASSERT_NE(it, PortBuilder::all_ports().end());
+  const auto &it = bess::control::runtime().ports().All().find("port1");
+  ASSERT_NE(it, bess::control::runtime().ports().All().end());
 
-  Port *p_fetched = it->second;
+  Port *p_fetched = it->second.get();
   EXPECT_EQ("port1", p_fetched->name());
   EXPECT_EQ(dummy_port_builder, p_fetched->port_builder());
 
@@ -220,42 +225,40 @@ TEST_F(PortTest, DestroyPort) {
   bool deinited = false;
   static_cast<DummyPort *>(p_fetched)->set_deinited(&deinited);
   ASSERT_FALSE(deinited);
-  int ret = PortBuilder::DestroyPort(p_fetched);
-  ASSERT_EQ(0, ret) << "DestroyPort returned -EBUSY? " << (ret == -EBUSY);
+  int ret = bess::control::runtime().ports().Destroy(p_fetched->name());
+  ASSERT_EQ(0, ret) << "Destroy returned -EBUSY? " << (ret == -EBUSY);
   ASSERT_TRUE(deinited);
 
-  EXPECT_TRUE(PortBuilder::all_ports().empty());
+  EXPECT_TRUE(bess::control::runtime().ports().All().empty());
 }
 
 // Checks that the logic for destroying multiple (all) ports works right.
 TEST_F(PortTest, DestroyAllPorts) {
-  Port *p1 = dummy_port_builder->CreatePort("port1");
-  Port *p2 = dummy_port_builder->CreatePort("port2");
-  ASSERT_NE(nullptr, p1);
-  ASSERT_NE(nullptr, p2);
+  std::unique_ptr<Port> p1(dummy_port_builder->CreatePort("port1"));
+  std::unique_ptr<Port> p2(dummy_port_builder->CreatePort("port2"));
+  ASSERT_NE(nullptr, p1.get());
+  ASSERT_NE(nullptr, p2.get());
 
-  ASSERT_TRUE(PortBuilder::all_ports().empty());
-  PortBuilder::AddPort(p1);
-  ASSERT_EQ(1, PortBuilder::all_ports().size());
-  PortBuilder::AddPort(p2);
-  ASSERT_EQ(2, PortBuilder::all_ports().size());
+  ASSERT_TRUE(bess::control::runtime().ports().All().empty());
+  ASSERT_TRUE(bess::control::runtime().ports().Add(std::move(p1)));
+  ASSERT_EQ(1, bess::control::runtime().ports().All().size());
+  ASSERT_TRUE(bess::control::runtime().ports().Add(std::move(p2)));
+  ASSERT_EQ(2, bess::control::runtime().ports().All().size());
 
-  ASSERT_TRUE(PortBuilder::all_ports().count("port1"));
-  ASSERT_TRUE(PortBuilder::all_ports().count("port2"));
+  ASSERT_TRUE(bess::control::runtime().ports().All().count("port1"));
+  ASSERT_TRUE(bess::control::runtime().ports().All().count("port2"));
 
   // Now destroy all ports; logic from snctl.cc.
-  for (auto it = PortBuilder::all_ports().cbegin();
-       it != PortBuilder::all_ports().end();) {
-    auto it_next = std::next(it);
-    Port *p = it->second;
-
-    int ret = PortBuilder::DestroyPort(p);
-    EXPECT_EQ(0, ret) << "DestroyPort returned -EBUSY? " << (ret == -EBUSY);
-
-    it = it_next;
+  std::vector<std::string> names;
+  for (const auto &pair : bess::control::runtime().ports().All()) {
+    names.push_back(pair.first);
+  }
+  for (const std::string &name : names) {
+    int ret = bess::control::runtime().ports().Destroy(name);
+    EXPECT_EQ(0, ret) << "Destroy returned -EBUSY? " << (ret == -EBUSY);
   }
 
-  EXPECT_TRUE(PortBuilder::all_ports().empty());
+  EXPECT_TRUE(bess::control::runtime().ports().All().empty());
 }
 
 // Checks that a port's driver is initialized when the port class is
@@ -318,12 +321,12 @@ TEST_F(PortBuilderTest, RegisterPortClassMacroCall) {
 
 // Checks that we can generate a proper port name given a template or not.
 TEST_F(PortBuilderTest, GenerateDefaultPortNameTemplate) {
-  std::string name1 = PortBuilder::GenerateDefaultPortName("FooPort", "foo");
+  std::string name1 = bess::control::runtime().ports().GenerateDefaultName("FooPort", "foo");
   EXPECT_EQ("foo0", name1);
 
-  std::string name2 = PortBuilder::GenerateDefaultPortName("FooPort", "");
+  std::string name2 = bess::control::runtime().ports().GenerateDefaultName("FooPort", "");
   EXPECT_EQ("foo_port0", name2);
 
-  std::string name3 = PortBuilder::GenerateDefaultPortName("FooABCPort", "");
+  std::string name3 = bess::control::runtime().ports().GenerateDefaultName("FooABCPort", "");
   EXPECT_EQ("foo_abcport0", name3);
 }

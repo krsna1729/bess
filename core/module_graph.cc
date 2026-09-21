@@ -38,8 +38,6 @@
 #include "scheduler.h"
 #include "utils/extended_priority_queue.h"
 
-std::map<std::string, Module *> ModuleGraph::all_modules_;
-std::unordered_set<std::string> ModuleGraph::tasks_;
 bool ModuleGraph::changes_made_ = false;
 uint32_t ModuleGraph::gate_cnt_;
 
@@ -146,7 +144,7 @@ void ModuleGraph::SetUniqueGateIdx() {
       igates_queue;
   std::unordered_set<bess::IGate *> igates_pushed;
 
-  for (auto const &e : all_modules_) {
+  for (auto const &e : bess::control::runtime().modules().All()) {
     std::vector<bess::OGate *> ogates = e.second->ogates();
     for (size_t i = 0; i < ogates.size(); i++) {
       if (!ogates[i]) {
@@ -206,11 +204,11 @@ void ModuleGraph::UpdateTaskGraph() {
 
   CleanTaskGraph();
 
-  for (auto const &task : tasks_) {
-    auto it = all_modules_.find(task);
-    if (it != all_modules_.end()) {
-      UpdateSingleTaskGraph(it->second);
-      SetIGatePriority(it->second);
+  for (auto const &task : bess::control::runtime().modules().TaskNames()) {
+    Module *m = bess::control::runtime().modules().Find(task);
+    if (m) {
+      UpdateSingleTaskGraph(m);
+      SetIGatePriority(m);
     }
   }
 
@@ -221,20 +219,20 @@ void ModuleGraph::UpdateTaskGraph() {
 }
 
 void ModuleGraph::CleanTaskGraph() {
-  for (auto const &task : tasks_) {
-    auto it = all_modules_.find(task);
-    if (it != all_modules_.end()) {
-      it->second->ClearParentTasks();
+  for (auto const &task : bess::control::runtime().modules().TaskNames()) {
+    Module *m = bess::control::runtime().modules().Find(task);
+    if (m) {
+      m->ClearParentTasks();
     }
   }
 }
 
-const std::map<std::string, Module *> &ModuleGraph::GetAllModules() {
-  return all_modules_;
+const bess::control::ModuleRegistry::Map &ModuleGraph::GetAllModules() {
+  return bess::control::runtime().modules().All();
 }
 
 bool ModuleGraph::HasModuleOfClass(const ModuleBuilder *builder) {
-  for (auto const &e : all_modules_) {
+  for (auto const &e : bess::control::runtime().modules().All()) {
     if (e.second->module_builder() == builder) {
       return true;
     }
@@ -247,8 +245,8 @@ Module *ModuleGraph::CreateModule(const ModuleBuilder &builder,
                                   const std::string &module_name,
                                   const google::protobuf::Any &arg,
                                   pb_error_t *perr) {
-  Module *m =
-      builder.CreateModule(module_name, &bess::metadata::default_pipeline);
+  std::unique_ptr<Module> m(
+      builder.CreateModule(module_name, &bess::metadata::default_pipeline));
 
   CommandResponse ret = m->InitWithGenericArg(arg);
   {
@@ -269,55 +267,49 @@ Module *ModuleGraph::CreateModule(const ModuleBuilder &builder,
     // and do not have their own destructors.  For now,
     // just call the teardown code here on failure.
     m->Destroy();
-    delete m;
     return nullptr;
   }
 
   if (m->is_task()) {
-    if (!tasks_.insert(m->name()).second) {
+    if (!bess::control::runtime().modules().MarkTask(m->name())) {
       *perr = pb_errno(ENOMEM);
       m->Destroy();
-      delete m;
       return nullptr;
     }
   }
 
-  bool module_added = all_modules_.insert({m->name(), m}).second;
-  if (!module_added) {
+  Module *raw = m.get();
+  if (!bess::control::runtime().modules().Add(std::move(m))) {
     *perr = pb_errno(ENOMEM);
-    m->Destroy();
-    delete m;
+    bess::control::runtime().modules().UnmarkTask(module_name);
+    raw->Destroy();
     return nullptr;
   }
 
-  return m;
+  return raw;
 }
 
-void ModuleGraph::DestroyModule(Module *m, bool erase) {
+void ModuleGraph::DestroyModule(Module *m) {
   changes_made_ = true;
 
-  m->Destroy();
-
-  if (erase) {
-    all_modules_.erase(m->name());
-  }
-
   if (m->is_task()) {
-    tasks_.erase(m->name());
+    bess::control::runtime().modules().UnmarkTask(m->name());
   }
 
-  delete m;
+  std::unique_ptr<Module> owned = bess::control::runtime().modules().Remove(m->name());
+  if (!owned) {
+    // Not registered (test-only path): keep the legacy behavior of destroying
+    // and deleting what the caller handed over.
+    owned.reset(m);
+  }
+
+  owned->Destroy();
 }
 
 void ModuleGraph::DestroyAllModules() {
   changes_made_ = true;
 
-  for (auto it = all_modules_.begin(); it != all_modules_.end();) {
-    auto it_next = std::next(it);
-    DestroyModule(it->second, false);
-    all_modules_.erase(it);
-    it = it_next;
-  }
+  bess::control::runtime().modules().Clear();
 }
 
 int ModuleGraph::ConnectModules(Module *module, gate_idx_t ogate_idx,
@@ -383,7 +375,7 @@ std::string ModuleGraph::GenerateDefaultName(
     ss << name_template << i;
     std::string name = ss.str();
 
-    if (!all_modules_.count(name))
+    if (!bess::control::runtime().modules().Contains(name))
       return name;
   }
 
@@ -391,8 +383,8 @@ std::string ModuleGraph::GenerateDefaultName(
 }
 
 void ModuleGraph::PropagateActiveWorker() {
-  for (auto &pair : all_modules_) {
-    Module *m = pair.second;
+  for (auto &pair : bess::control::runtime().modules().All()) {
+    Module *m = pair.second.get();
     m->ResetActiveWorkerSet();
   }
   for (int i = 0; i < Worker::kMaxWorkers; i++) {

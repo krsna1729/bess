@@ -66,7 +66,7 @@ static mt_offset_t ComputeNextOffset(mt_offset_t curr_offset, int8_t size) {
 // Generate warnings for modules that read metadata that never gets set.
 static void CheckOrphanReaders() {
   for (const auto &it : ModuleGraph::GetAllModules()) {
-    const Module *m = it.second;
+    const Module *m = it.second.get();
     if (!m) {
       break;
     }
@@ -124,7 +124,7 @@ bool ScopeComponent::DisjointFrom(const ScopeComponent &rhs) {
 
 int Pipeline::PrepareMetadataComputation() {
   for (const auto &it : ModuleGraph::GetAllModules()) {
-    Module *m = it.second;
+    Module *m = it.second.get();
     if (!m) {
       break;
     }
@@ -411,7 +411,7 @@ void Pipeline::LogAllScopes() const {
   }
 
   for (const auto &it : ModuleGraph::GetAllModules()) {
-    const Module *m = it.second;
+    const Module *m = it.second.get();
     if (!m) {
       break;
     }
@@ -451,7 +451,7 @@ int Pipeline::ComputeMetadataOffsets() {
   }
 
   for (const auto &it : ModuleGraph::GetAllModules()) {
-    Module *m = it.second;
+    Module *m = it.second.get();
     if (!m) {
       break;
     }

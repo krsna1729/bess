@@ -324,7 +324,7 @@ TEST_F(ModuleTester, GenerateTCGraph) {
   t4->SignalUnderload();
   ASSERT_EQ(0, t1->children_overload());
 
-  ModuleGraph::DestroyModule(t1, true);
+  ModuleGraph::DestroyModule(t1);
   ModuleGraph::CleanTaskGraph();
   ModuleGraph::UpdateTaskGraph();
 

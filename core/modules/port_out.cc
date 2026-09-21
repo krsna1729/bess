@@ -29,6 +29,8 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "port_out.h"
+
+#include "../control/runtime_state.h"
 #include "../utils/format.h"
 
 const Commands PortOut::cmds = {
@@ -46,11 +48,10 @@ CommandResponse PortOut::Init(const bess::pb::PortOutArg &arg) {
 
   port_name = arg.port().c_str();
 
-  const auto &it = PortBuilder::all_ports().find(port_name);
-  if (it == PortBuilder::all_ports().end()) {
+  port_ = bess::control::runtime().ports().Find(port_name);
+  if (!port_) {
     return CommandFailure(ENODEV, "Port %s not found", port_name);
   }
-  port_ = it->second;
 
   if (port_->num_queues[PACKET_DIR_OUT] == 0) {
     return CommandFailure(ENODEV, "Port %s has no outgoing queue", port_name);

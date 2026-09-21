@@ -539,8 +539,8 @@ class BESSControlImpl final : public BESSControl::Service {
                    ListPortsResponse* response) override {
     auto lock = control_plane_.AcquireLock();
 
-    for (const auto& pair : PortBuilder::all_ports()) {
-      const ::Port* p = pair.second;
+    for (const auto& pair : bess::control::runtime().ports().All()) {
+      const ::Port* p = pair.second.get();
       bess::pb::ListPortsResponse::Port* port = response->add_ports();
 
       port->set_name(p->name());
@@ -606,13 +606,13 @@ class BESSControlImpl final : public BESSControl::Service {
     }
 
     const char* port_name = request->name().c_str();
-    const auto& it = PortBuilder::all_ports().find(port_name);
-    if (it == PortBuilder::all_ports().end()) {
+    const ::Port* port = bess::control::runtime().ports().Find(port_name);
+    if (!port) {
       return return_with_error(response, ENOENT, "No port `%s' found",
                                port_name);
     }
 
-    Port::Conf conf = it->second->conf();
+    Port::Conf conf = port->conf();
     bess::pb::PortConf* pb_conf = response->mutable_conf();
 
     pb_conf->set_mac_addr(conf.mac_addr.ToString());
@@ -634,13 +634,13 @@ class BESSControlImpl final : public BESSControl::Service {
                       GetPortStatsResponse* response) override {
     auto lock = control_plane_.AcquireLock();
 
-    const auto& it = PortBuilder::all_ports().find(request->name());
-    if (it == PortBuilder::all_ports().end()) {
+    ::Port* port = bess::control::runtime().ports().Find(request->name());
+    if (!port) {
       return return_with_error(response, ENOENT, "No port '%s' found",
                                request->name().c_str());
     }
 
-    ::Port::PortStats stats = it->second->GetPortStats();
+    ::Port::PortStats stats = port->GetPortStats();
 
     response->mutable_inc()->set_packets(stats.inc.packets);
     response->mutable_inc()->set_dropped(stats.inc.dropped);
@@ -671,13 +671,13 @@ class BESSControlImpl final : public BESSControl::Service {
                        GetLinkStatusResponse* response) override {
     auto lock = control_plane_.AcquireLock();
 
-    const auto& it = PortBuilder::all_ports().find(request->name());
-    if (it == PortBuilder::all_ports().end()) {
+    ::Port* port = bess::control::runtime().ports().Find(request->name());
+    if (!port) {
       return return_with_error(response, ENOENT, "No port '%s' found",
                                request->name().c_str());
     }
 
-    ::Port::LinkStatus status = it->second->GetLinkStatus();
+    ::Port::LinkStatus status = port->GetLinkStatus();
 
     response->set_speed(status.speed);
     response->set_full_duplex(status.full_duplex);
@@ -700,7 +700,7 @@ class BESSControlImpl final : public BESSControl::Service {
     auto lock = control_plane_.AcquireLock();
 
     for (const auto& pair : ModuleGraph::GetAllModules()) {
-      const Module* m = pair.second;
+      const Module* m = pair.second.get();
       ListModulesResponse_Module* module = response->add_modules();
 
       module->set_name(m->name());
@@ -749,12 +749,11 @@ class BESSControlImpl final : public BESSControl::Service {
                                "Argument must be a name in str");
     m_name = request->name().c_str();
 
-    const auto& it = ModuleGraph::GetAllModules().find(request->name());
-    if (it == ModuleGraph::GetAllModules().end()) {
+    m = bess::control::runtime().modules().Find(request->name());
+    if (!m) {
       return return_with_error(response, ENOENT, "No module '%s' found",
                                m_name);
     }
-    m = it->second;
 
     response->set_name(m->name());
     response->set_mclass(m->module_builder()->class_name());
@@ -884,7 +883,7 @@ class BESSControlImpl final : public BESSControl::Service {
     auto lock = control_plane_.AcquireLock();
 
     for (const auto& pair : ModuleGraph::GetAllModules()) {
-      const Module* m = pair.second;
+      const Module* m = pair.second.get();
       for (auto& gate : m->igates()) {
         if (!gate) {
           continue;
@@ -951,12 +950,11 @@ class BESSControlImpl final : public BESSControl::Service {
     // No need to look up the hook builder: the gate either
     // has a hook instance with the right name, or doesn't.
     const bess::pb::GateHookInfo& rh = request->hook();
-    const auto& it = ModuleGraph::GetAllModules().find(rh.module_name());
-    if (it == ModuleGraph::GetAllModules().end()) {
+    Module* m = bess::control::runtime().modules().Find(rh.module_name());
+    if (!m) {
       return return_with_error(response, ENOENT, "No module '%s' found",
                                rh.module_name().c_str());
     }
-    Module* m = it->second;
     bool is_igate = rh.gate_case() == bess::pb::GateHookInfo::kIgate;
     gate_idx_t gate_idx = is_igate ? rh.igate() : rh.ogate();
     bess::Gate* g = module_gate(m, is_igate, gate_idx);
@@ -1098,7 +1096,7 @@ class BESSControlImpl final : public BESSControl::Service {
     // DPDK functions may be called, so be prepared
     current_worker.SetNonWorker();
 
-    Module* m = it->second;
+    Module* m = bess::control::runtime().modules().Find(request->name());
     *response = m->RunCommand(request->cmd(), request->arg());
     return Status::OK;
   }
