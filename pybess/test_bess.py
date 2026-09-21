@@ -34,8 +34,8 @@ import time
 from concurrent import futures
 
 from . import bess
-from .builtin_pb import bess_msg_pb2 as bess_msg
-from .builtin_pb import service_pb2_grpc
+from builtin_pb import bess_msg_pb2 as bess_msg
+from builtin_pb import service_pb2_grpc
 
 
 class DummyServiceImpl(service_pb2_grpc.BESSControlServicer):

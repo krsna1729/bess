@@ -102,4 +102,4 @@
 
     - name: BESS build dependencies installed
       debug:
-        msg: "You are now ready to build BESS using build.py"
+        msg: "Run tools/bootstrap_dpdk.py and the Meson build graph to build BESS"

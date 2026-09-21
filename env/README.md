@@ -34,10 +34,9 @@ $ ./container_build.py
 ```
 
 then the script will automatically fetch the container image
-(nefelinetworks/bess_build at hub.docker.com) and build BESS inside the
-container. Since the BESS binary is mostly static-linked to external libraries,
-the binary built in the container should be readily runnable in the host as
-well.
+(nefelinetworks/bess_build at hub.docker.com) and provide the Meson/Ninja
+toolchain and DPDK bootstrap environment.  Build output uses shared DPDK
+libraries and remains in the mounted source tree.
 
 ## Ansible scripts
 

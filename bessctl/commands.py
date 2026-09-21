@@ -37,8 +37,8 @@ import socket
 import fcntl
 import errno
 import re
+import shlex
 import subprocess
-import pprint
 import copy
 import time
 import inspect
@@ -679,8 +679,12 @@ def _do_start(cli, opts):
         opts = []
 
     # need -E to pass GCOV_* env variables through
-    cmd = 'sudo -E %s/core/bessd -k %s' % (os.path.dirname(cli.this_dir),
-                                           ' '.join(opts))
+    bessd = os.environ.get(
+        'BESSD_BINARY',
+        os.path.join(os.path.dirname(cli.this_dir), 'core', 'bessd'),
+    )
+    command = [bessd, '-k'] + list(opts)
+    cmd = 'sudo -E ' + ' '.join(shlex.quote(arg) for arg in command)
 
     cli.bess.disconnect()
 

@@ -24,3 +24,39 @@ To install BESS on Linux quickly, you can download the binary from [Release](htt
     bessctl/bessctl
 
 Documentation can be found [here](https://github.com/NetSys/bess/wiki/). Please consider [contributing](https://github.com/NetSys/bess/wiki/How-to-Contribute) to the project!
+
+## Build with Meson
+
+The supported developer build uses Meson and Ninja.  DPDK is pinned in
+`deps/dpdk.json`; the bootstrap helper verifies its SHA256 before extracting
+or building it.
+
+```bash
+tools/bootstrap_dpdk.py --af-xdp auto
+export PKG_CONFIG_PATH="$(tools/bootstrap_dpdk.py --print-pkg-config-path):${PKG_CONFIG_PATH}"
+meson setup build-meson -Dcpu=corei7 -Daf_xdp=auto
+meson compile -C build-meson
+meson test -C build-meson --print-errorlogs
+```
+
+CI uses `--af-xdp required`; this checks the libxdp/libbpf development
+packages, headers, and DPDK `net_af_xdp` shared and static artifacts.  Use
+`-Daf_xdp=required` locally for the same check.  `-Dcpu=native` is the
+default; choose a portable ISA such as `corei7` for distributable builds.
+DPDK is consumed through `pkg-config` and is dynamically linked by default.
+Use `-Ddpdk_link=static` only when a static DPDK link is intentional.
+
+Useful Meson-native checks:
+
+```bash
+meson test -C build-meson --suite python
+meson test -C build-meson --suite integration
+meson test -C build-meson --suite benchmarks
+meson setup build-asan -Db_sanitize=address,undefined -Db_coverage=true
+meson compile -C build-asan
+meson install -C build-meson --destdir "$PWD/stage"
+```
+
+Generated C++ and Python protobuf files, plus the version header, live only
+under the build directory.  The sample plugin is enabled by default and is
+built as `sample_plugin/libsequential_update.so`.

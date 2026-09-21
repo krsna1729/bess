@@ -49,14 +49,14 @@ class FooType final {
  public:
   FooType() : a_(1) { num_constructed++; }
   FooType(int x, int y) : a_(x + y) { num_constructed++; }
-  virtual ~FooType() { num_destructed++; }
+  ~FooType() { num_destructed++; }
   int a_;
 };
 
 class BarType final {
  public:
   BarType() : b_(2) { num_constructed++; }
-  virtual ~BarType() { num_destructed++; }
+  ~BarType() { num_destructed++; }
   int b_;
 };
 

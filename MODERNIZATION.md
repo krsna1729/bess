@@ -21,14 +21,13 @@ propose it unprompted.
   `-m 0` (no-hugepage mode — already a supported fallback path in
   `core/dpdk.cc`). `bessctl/run_module_tests.py` already does this
   (`daemon start -m 0`); do the same for any manual `bessd` invocation.
-- **DPDK build lives in `deps/dpdk-<ver>/`**, gitignored, built via
-  `./build.py dpdk` (Meson/Ninja, ~a few minutes). It survives disk restarts
-  but not `git clean`. Check `deps/dpdk-*/install/lib/pkgconfig/libdpdk.pc`
-  exists before assuming a rebuild is needed.
-- **Python deps aren't installed by default** in a fresh shell in this
-  sandbox. `pip3 install --break-system-packages --ignore-installed
-  typing-extensions -r requirements.txt` gets scapy/flask/grpcio/protobuf;
-  regenerate protobuf stubs with `./build.py protobuf` afterward.
+- **DPDK build lives in `deps/dpdk-<ver>/`**, gitignored, and is bootstrapped
+  with `tools/bootstrap_dpdk.py`.  It reads the single pinned source record
+  in `deps/dpdk.json`, verifies the SHA256 before extraction, and installs the
+  pkg-config file under `deps/dpdk-<ver>/install/lib/pkgconfig/`.
+- **Python dependencies are still external** in a fresh shell.  Install
+  `requirements.txt` with the environment's package manager before running
+  Python tests.  Meson generates all protobuf stubs in its build tree.
 - **Commit author identity**: the WSL sandbox auto-set a wrong identity
   (`root@PARAM.localdomain`). Environment-specific -- on the Arch machine this
   session moved to, commits are authored correctly (`Saikrishna Edupuganti
@@ -71,49 +70,54 @@ propose it unprompted.
   `bessctl/run_module_tests.py` needs root (the daemon refuses otherwise) —
   the CI runners have it, an unprivileged session does not.
 
-## How to build and verify (the loop this session used)
+## How to build and verify
 
 ```bash
-./build.py dpdk              # once; rebuilds only if deps/dpdk-*/install missing
-make -C core bessd all_test -j4
-cd core && ./all_test --gtest_shuffle   # unit tests
-cd .. && python3 bessctl/run_module_tests.py   # live integration tests (needs pip deps + protobuf stubs above)
+tools/bootstrap_dpdk.py --af-xdp auto
+export PKG_CONFIG_PATH="$(tools/bootstrap_dpdk.py --print-pkg-config-path):${PKG_CONFIG_PATH}"
+meson setup build-meson -Dcpu=corei7 -Daf_xdp=auto
+meson compile -C build-meson -j4
+meson test -C build-meson --print-errorlogs
+meson test -C build-meson --suite python --print-errorlogs
+meson test -C build-meson --suite integration --print-errorlogs
+meson test -C build-meson --suite benchmarks --print-errorlogs
 ```
 
-A known-flaky test: `CodelTest.{DropTest,ChangeStateTest}` fail under full
-suite load in this sandbox (timing-sensitive, pass cleanly in isolation via
-`--gtest_filter=CodelTest.*`). Not a regression from any commit here; don't
-chase it.
+CI configures `-Daf_xdp=required` and runs the same Meson graph with both GCC
+and Clang.  `-Db_sanitize=address,undefined` and `-Db_coverage=true` are
+Meson's native sanitizer and coverage controls.  The default DPDK linkage is
+shared; `-Ddpdk_link=static` is an explicit opt-in.
 
+The old `core/Makefile`, `core/extra.mk`, and top-level `build.py` are not part
+of the supported build.  Generated protobuf code is never written into the
+source tree.
+
+A live module integration run through `run_module_tests.py` still starts its
+daemon through sudo.  Local verification used the same gRPC reset/run path
+against a foreground `bessd -skip_root_check -m 0`, avoiding sudo while
+exercising all 22 module test files.
+
+## Phase E: Meson cutover
+
+Phase E is complete when this branch lands: Meson is the sole BESS build
+entrypoint; DPDK bootstrap is separate and checksum-pinned; C++ and Python
+protobuf generation is build-tree-only; native unit tests, Python tests,
+module integration, benchmarks, sample plugin, install layout, and AF_XDP
+artifact checks are first-class Meson targets.  No dataplane ownership,
+`MBUF_FAST_FREE`, `PortOut`, plugin ABI, or DPDK-version behavior changes are
+part of this phase.
 ## Status snapshot
 
-The completed-work log below is the authoritative record of landed
-modernization work. For current branch-head build/CI status, consult
-GitHub Actions -- this section deliberately records no SHAs, entry
-numbers, or "not yet pushed" lists; all three went stale within a commit
-or two every time they were written down here. Unpushed work, if any, is
-visible in `git status` / `git log origin/develop..develop`, which is
-where transient state belongs.
+This log records the Meson cutover work on `develop`; current uncommitted
+state remains visible in `git status` and branch diff until delivery.
 
-Both GCC and Clang CI jobs are expected to remain green. Each runs
-`./build.py bess`, `all_test --gtest_shuffle`, the benchmark smoke loop,
-`unittest discover`, and `run_module_tests.py`. Known timing-sensitive
-test flakes (not regressions -- do not chase): `CodelTest.*` under full-
-suite load, `timestamp.py::test_timestamped_and_measured`'s 1% histogram
-self-consistency check under runner load (see entry 30), and
-`TcpFlowReconstructTest.*` (seen once on 2026-09-19 under full-suite load:
-3 failures, then 3/3 passing with `--gtest_filter` and 185/185 on a rerun,
-with a working tree that touches neither the module nor its headers).
-
-**Verified working:** `bessd` builds and links against DPDK 25.11.3 via the
-new Meson/pkg-config build; a live `Source -> Sink` pipeline via `bessctl`
-processed 7.2B packets with no crash or corruption; `core/all_test` is
-185/185 (183 plus 2 new `PacketTest` cases from commit 16;
-previously-noted `CodelTest` flakes did not reproduce on the latest
-run — timing-sensitive, may still recur under load, not chased further);
-`bessctl/run_module_tests.py` passes cleanly with **no known failures** —
-the `url_filter.py` mismatch previously attributed to scapy version drift
-was actually a real checksum bug (see commit 9 below), now fixed.
+The active build graph is Meson/Ninja only.  GCC and Clang full Meson compiles
+succeed with the pinned DPDK 25.11.3.  GCC verification passes all 28 native
+C++ tests, both Python targets, all 10 benchmark smoke tests, the PMD null/ring
+smoke, and the sample-plugin registry load.  The 22-file module integration
+run passes against a no-hugepage daemon; `-Daf_xdp=required` configuration,
+install staging, generated build-tree protobuf imports, and source-tree
+hygiene checks also pass.
 
 ## Completed work (chronological, with commit hashes on `develop`)
 

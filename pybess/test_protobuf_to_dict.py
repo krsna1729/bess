@@ -32,15 +32,10 @@ import os
 import sys
 import unittest
 
-# See bess.py for why this is here.
-bipath = os.path.abspath(os.path.join(__file__, '..', 'builtin_pb'))
-if bipath not in sys.path:
-    sys.path.insert(1, bipath)
-del bipath
-
+# The generated protobuf package is provided by Meson in the build tree.
 from . import protobuf_to_dict as pb_conv
-from .builtin_pb import bess_msg_pb2 as bess_msg
-from .builtin_pb import test_msg_pb2 as test_msg
+from builtin_pb import bess_msg_pb2 as bess_msg
+from builtin_pb import test_msg_pb2 as test_msg
 
 
 class TestProtobufConvert(unittest.TestCase):

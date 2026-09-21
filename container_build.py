@@ -35,13 +35,11 @@ import sys
 import subprocess
 import os
 import os.path
-import re
 import argparse
 
 IMAGE = 'nefelinetworks/bess_build:latest' + os.getenv('TAG_SUFFIX', '')
 BESS_DIR_HOST = os.path.dirname(os.path.abspath(__file__))
 BESS_DIR_CONTAINER = '/build/bess'
-BUILD_SCRIPT = './build.py'
 PLUGINS = []
 
 CCACHE_DIR_HOST = '~/.ccache'
@@ -110,7 +108,7 @@ def shell_quote(cmd):
 
 
 def docker_env_args():
-    env_vars = ['V', 'CXX', 'DEBUG', 'SANITIZE']
+    env_vars = ['V', 'CC', 'CXX', 'CPU', 'AF_XDP', 'DEBUG', 'SANITIZE']
     return ' '.join(['-e %s' % var for var in env_vars])
 
 
@@ -125,21 +123,16 @@ def run_shell():
             (docker_env_args(), docker_mount_args(PLUGINS), IMAGE))
 
 
-def find_current_plugins():
-    "return list of existing plugins"
-    result = []
-    try:
-        for line in open('core/extra.mk').readlines():
-            match = re.match(r'PLUGINS \+= (.*)', line)
-            if match:
-                result.append(match.group(1))
-    except (OSError, IOError):
-        pass
-    return result
-
-
 def build_bess():
-    run_docker_cmd('%s bess' % BUILD_SCRIPT)
+    run_docker_cmd(
+        'tools/bootstrap_dpdk.py --af-xdp "${AF_XDP:-auto}" '
+        '--cpu "${CPU:-native}" && '
+        'export PKG_CONFIG_PATH="$(tools/bootstrap_dpdk.py '
+        '--print-pkg-config-path):${PKG_CONFIG_PATH}" && '
+        'meson setup build-container -Dcpu="${CPU:-native}" '
+        '-Daf_xdp="${AF_XDP:-auto}" -Dbuild_sample_plugin=true && '
+        'meson compile -C build-container -j4'
+    )
 
 
 def build_all():
@@ -147,11 +140,11 @@ def build_all():
 
 
 def do_clean():
-    run_docker_cmd('%s clean' % BUILD_SCRIPT)
+    run_docker_cmd('rm -rf build-container')
 
 
 def do_dist_clean():
-    run_docker_cmd('%s dist_clean' % BUILD_SCRIPT)
+    run_docker_cmd('rm -rf build-container deps/dpdk-*')
 
 
 def print_usage(parser):
@@ -185,7 +178,6 @@ def main():
     if args.verbose:
         os.environ['V'] = '1'
 
-    PLUGINS.extend(find_current_plugins())
 
     cmds[args.action]()
 

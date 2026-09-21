@@ -23,13 +23,14 @@ RUN apt-get -q update && \
 
 RUN mkdir -p /build/bess
 
-# Build DPDK testpmd (used in bessctl samples)
-ARG BESS_DPDK_BRANCH=master
+# The container image is a dependency/runtime image; BESS itself is built by
+# Meson after the image starts.
+ENV CPU=corei7
 ENV AF_XDP=required
+ARG BESS_DPDK_BRANCH=develop
 RUN cd /build/bess && \
 	curl -s -L https://github.com/NetSys/bess/archive/${BESS_DPDK_BRANCH}.tar.gz | tar zx --strip-components=1 && \
-	./build.py dpdk && \
-	cp /build/bess/deps/dpdk-25.11.3/build/app/dpdk-testpmd /usr/local/bin/ && \
+	tools/bootstrap_dpdk.py --af-xdp required --cpu "$CPU" && \
 	rm -rf /build/bess
 
 ENV CCACHE_DIR=/tmp/ccache

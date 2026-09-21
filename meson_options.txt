@@ -1,0 +1,22 @@
+option('cpu',
+       type: 'string',
+       value: 'native',
+       description: 'CPU ISA passed to BESS (for example native or corei7)')
+option('af_xdp',
+       type: 'combo',
+       choices: ['auto', 'required'],
+       value: 'auto',
+       description: 'Whether the DPDK AF_XDP PMD is required')
+option('dpdk_link',
+       type: 'combo',
+       choices: ['shared', 'static'],
+       value: 'shared',
+       description: 'DPDK linkage mode')
+option('build_benchmarks',
+       type: 'boolean',
+       value: true,
+       description: 'Build benchmark executables')
+option('build_sample_plugin',
+       type: 'boolean',
+       value: true,
+       description: 'Build the sample plugin')

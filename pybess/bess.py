@@ -42,17 +42,27 @@ from . import protobuf_to_dict as pb_conv
 # pseudo-module multi-importer, used to build module message types
 from . import pm_import as _pm
 
-# Ugh: builtin_pb and plugin_pb must be on path, as protoc generates python code
-# that assumes it can import files in that directory.
+# Generated protobuf packages are supplied by Meson in the build tree.  Keep
+# the source-tree paths as a fallback for installed or legacy environments.
 old_path = list(sys.path)
-p = os.path.abspath(os.path.dirname(__file__))
-if p not in sys.path:
-    sys.path.append(p)
-for extra in ('builtin_pb', 'plugin_pb'):
-    p = os.path.abspath(os.path.join(__file__, '..', extra))
+proto_root = os.environ.get('BESS_PROTOBUF_ROOT')
+if not proto_root:
+    installed_proto_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    if os.path.exists(os.path.join(installed_proto_root, 'builtin_pb')):
+        proto_root = installed_proto_root
+if proto_root:
+    proto_root = os.path.abspath(proto_root)
+    for extra in ('plugin_pb', 'builtin_pb'):
+        sys.path.insert(0, os.path.join(proto_root, extra))
+else:
+    p = os.path.abspath(os.path.dirname(__file__))
     if p not in sys.path:
         sys.path.append(p)
-del extra, p
+    for extra in ('builtin_pb', 'plugin_pb'):
+        p = os.path.abspath(os.path.join(__file__, '..', extra))
+        if p not in sys.path:
+            sys.path.append(p)
+del extra, proto_root
 
 from builtin_pb import service_pb2_grpc
 from builtin_pb import bess_msg_pb2 as bess_msg
