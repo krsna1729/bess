@@ -2027,6 +2027,39 @@ rather than one call site).
     sample-plugin load **40/40**, module integration 22/22 files, wire-parity
     script passes, `git diff --check` clean.
 
+46. **`8f528f52`** — **G0 commit 4/7: deterministic diff and dependency-ordered
+    planner.** `Diff(current, desired)` and `Plan(diff)`, both pure.
+
+    `core/control/pipeline_diff.{h,cc}` classifies every change as
+    create/remove/replace/update per resource class, comparing by name and
+    normalized value, never by pointer: "0 means driver default" in a desired
+    port matches what the runtime resolved (so re-applying an equivalent
+    description is an empty diff, not churn); a different driver or module
+    argument is a replace; connections are diffed from the graph itself;
+    internal traffic classes (`!leaf_*`, `!default_rr_*`) are skipped on both
+    sides because they belong to their modules and workers, not to desired
+    state; unchanged entries are dropped and everything is sorted.
+
+    `core/control/pipeline_plan.{h,cc}` turns that into typed operations
+    (`std::variant` of twelve op structs, not closures) in three dependency
+    phases: prepare (workers → ports → modules, since module Init resolves
+    ports), commit (disconnect → connect → create/reparent TCs) and retire (TCs
+    detach before their modules, modules release port queues before ports,
+    workers last). `SpecFromSnapshot()` reconstructs the desired-state
+    description of the running pipeline, which is what makes "apply what is
+    already running" a no-op; `ControlPlane::DiffPipeline()`/`PlanPipeline()`
+    expose both under the control-plane lock.
+
+    Tests: 7 new cases (21 total in `control_plane_test.cc`) — empty diff/plan
+    for identical state, create/remove classification, module-argument change
+    as replace with prepare+retire, connection add/remove → ConnectOp/
+    DisconnectOp, internal TCs invisible to desired state, phase ordering, and
+    diff stability across runs.
+
+    Verification: GCC + Clang builds clean, native tests + benchmarks +
+    sample-plugin load 40/40, module integration 22/22 files, wire-parity
+    script passes, `git diff --check` clean.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
