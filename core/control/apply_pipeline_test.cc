@@ -552,16 +552,33 @@ TEST_F(ApplyPipelineTest, AttachmentChangesAreReversibleUpdates) {
 
 // A different policy is a different class: refused, not silently ignored.
 TEST_F(ApplyPipelineTest, PolicyChangeIsRefusedTransactionally) {
-  ASSERT_TRUE(control_plane_->ApplyPipeline(FullPipeline(), {}).has_value());
+  // A weighted-fair parent with a round-robin child, so that the child can
+  // legitimately carry a share; the change is the child's policy.
+  PipelineSpec spec = FullPipeline();
+  spec.traffic_classes.clear();
+  bess::control::TrafficClassSpec parent;
+  parent.name = "wparent";
+  parent.policy = "weighted_fair";
+  parent.resource = "packet";
+  parent.wid = 0;
+  spec.traffic_classes.push_back(parent);
+  bess::control::TrafficClassSpec child;
+  child.name = "child";
+  child.policy = "round_robin";
+  child.parent = "wparent";
+  child.has_share = true;
+  child.share = 3;
+  spec.traffic_classes.push_back(child);
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
   const uint64_t generation = bess::control::runtime().generation();
 
-  PipelineSpec changed = FullPipeline();
+  PipelineSpec changed = spec;
   for (auto &tc : changed.traffic_classes) {
     if (tc.name == "child") {
-      tc.policy = "weighted_fair";
+      tc.policy = "rate_limit";
       tc.resource = "packet";
-      tc.has_share = true;
-      tc.share = 3;
+      tc.limit["packet"] = 1000;
+      tc.max_burst["packet"] = 100;
     }
   }
 
@@ -622,6 +639,144 @@ TEST_F(ApplyPipelineTest, RetirementPreconditionsAreProvenUpFront) {
   EXPECT_NE(std::string::npos, applied.error().message.find("still in use"));
   EXPECT_EQ(generation, bess::control::runtime().generation());
   EXPECT_TRUE(control_plane_->GetPipeline() == active);
+}
+
+// The acceptance test for the reparent ownership split: a refused move must
+// not lose the class, its siblings, or their priorities.
+TEST_F(ApplyPipelineTest, RefusedReparentKeepsEveryClassAndPlacement) {
+  PipelineSpec spec = FullPipeline();
+  spec.traffic_classes.clear();
+
+  bess::control::TrafficClassSpec parent;
+  parent.name = "prio";
+  parent.policy = "priority";
+  parent.wid = 0;
+  spec.traffic_classes.push_back(parent);
+
+  bess::control::TrafficClassSpec child_a;
+  child_a.name = "child_a";
+  child_a.policy = "round_robin";
+  child_a.parent = "prio";
+  child_a.has_priority = true;
+  child_a.priority = 10;
+  spec.traffic_classes.push_back(child_a);
+
+  bess::control::TrafficClassSpec child_b;
+  child_b.name = "child_b";
+  child_b.policy = "round_robin";
+  child_b.parent = "prio";
+  child_b.has_priority = true;
+  child_b.priority = 20;
+  spec.traffic_classes.push_back(child_b);
+
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+
+  const PipelineSnapshot active = control_plane_->GetPipeline();
+  const uint64_t generation = bess::control::runtime().generation();
+  const size_t tcs = bess::control::runtime().traffic_classes().Size();
+
+  // child_a would collide with child_b's priority: refused.
+  PipelineSpec collision = spec;
+  collision.traffic_classes[1].priority = 20;
+
+  auto applied = control_plane_->ApplyPipeline(collision, {});
+  ASSERT_FALSE(applied.has_value());
+
+  EXPECT_EQ(generation, bess::control::runtime().generation());
+  EXPECT_EQ(tcs, bess::control::runtime().traffic_classes().Size());
+  EXPECT_TRUE(control_plane_->GetPipeline() == active);
+  EXPECT_TRUE(bess::control::runtime().traffic_classes().Contains("child_a"));
+  EXPECT_TRUE(bess::control::runtime().traffic_classes().Contains("child_b"));
+
+  // Both children still hold their original priorities.
+  for (const auto &tc : control_plane_->GetPipeline().traffic_classes) {
+    if (tc.name == "child_a") {
+      EXPECT_TRUE(tc.has_priority);
+      EXPECT_EQ(10, tc.priority);
+    }
+    if (tc.name == "child_b") {
+      EXPECT_TRUE(tc.has_priority);
+      EXPECT_EQ(20, tc.priority);
+    }
+  }
+
+  // And the pipeline still diffs clean against its own description.
+  auto diff = control_plane_->DiffPipeline(spec);
+  ASSERT_TRUE(diff.has_value());
+  EXPECT_TRUE(diff->empty());
+}
+
+// An attach failure that validation cannot see (the parent's current child is
+// only removed in the same transaction's retire phase) must roll the whole
+// transaction back, including the class that was created for it.
+TEST_F(ApplyPipelineTest, AttachFailureDuringCommitRollsBackCleanly) {
+  PipelineSpec spec = FullPipeline();
+  spec.traffic_classes.clear();
+
+  bess::control::TrafficClassSpec limiter;
+  limiter.name = "limiter";
+  limiter.policy = "rate_limit";
+  limiter.resource = "bit";
+  limiter.limit["bit"] = 1000000;
+  limiter.max_burst["bit"] = 1000;
+  limiter.wid = 0;
+  spec.traffic_classes.push_back(limiter);
+
+  bess::control::TrafficClassSpec old_child;
+  old_child.name = "old_child";
+  old_child.policy = "round_robin";
+  old_child.parent = "limiter";
+  spec.traffic_classes.push_back(old_child);
+
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+
+  const PipelineSnapshot active = control_plane_->GetPipeline();
+  const uint64_t generation = bess::control::runtime().generation();
+  const size_t tcs = bess::control::runtime().traffic_classes().Size();
+
+  // Rename the child: the new class is created during the commit, while the old
+  // one is only retired afterwards, so the rate limiter still holds its child
+  // and the attach fails.
+  PipelineSpec renamed = spec;
+  renamed.traffic_classes[1].name = "new_child";
+
+  auto applied = control_plane_->ApplyPipeline(renamed, {});
+  ASSERT_FALSE(applied.has_value());
+
+  EXPECT_EQ(generation, bess::control::runtime().generation());
+  EXPECT_EQ(tcs, bess::control::runtime().traffic_classes().Size());
+  EXPECT_TRUE(bess::control::runtime().traffic_classes().Contains("old_child"));
+  EXPECT_FALSE(bess::control::runtime().traffic_classes().Contains("new_child"));
+  EXPECT_TRUE(control_plane_->GetPipeline() == active);
+}
+
+// Weighted-fair shares must be positive; validation refuses zero up front.
+TEST_F(ApplyPipelineTest, ZeroShareIsRejectedBeforeAnyChange) {
+  PipelineSpec spec = FullPipeline();
+  spec.traffic_classes.clear();
+
+  bess::control::TrafficClassSpec parent;
+  parent.name = "wparent";
+  parent.policy = "weighted_fair";
+  parent.resource = "packet";
+  parent.wid = 0;
+  spec.traffic_classes.push_back(parent);
+
+  bess::control::TrafficClassSpec child;
+  child.name = "child";
+  child.policy = "round_robin";
+  child.parent = "wparent";
+  child.has_share = true;
+  child.share = 0;
+  spec.traffic_classes.push_back(child);
+
+  const uint64_t generation = bess::control::runtime().generation();
+  auto applied = control_plane_->ApplyPipeline(spec, {});
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(EINVAL, applied.error().err);
+  EXPECT_EQ("share", applied.error().field);
+  EXPECT_EQ(generation, bess::control::runtime().generation());
+  EXPECT_TRUE(bess::control::runtime().traffic_classes().Empty());
 }
 
 // Pause duration is observable from the start.

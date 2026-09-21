@@ -221,6 +221,11 @@ class ControlPlane {
 
   ControlResult<void> AttachTc(bess::TrafficClass* c_,
                                const TrafficClassSpec& spec);
+  // Attaches a class that already exists. Never unregisters or destroys it on
+  // failure: the caller owns that decision (creation destroys, reparenting puts
+  // the class back where it was).
+  ControlResult<void> AttachExistingTcLocked(bess::TrafficClass* c,
+                                             const TrafficClassSpec& spec);
   ControlResult<bess::TrafficClass*> FindTc(const TrafficClassSpec& spec);
 
   // Locked by every public method, including the const readers (the snapshot

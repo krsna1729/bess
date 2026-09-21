@@ -34,6 +34,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "module.h"
 #include "port.h"
@@ -307,6 +308,97 @@ ControlResult<ValidatedPipeline> ValidatePipeline(const RuntimeState &runtime,
             "traffic class '" + tc.name + "': 'taskid' must be between 0 and " +
                 std::to_string(MAX_TASKS_PER_MODULE - 1)));
       }
+    }
+  }
+
+  // Attachment constraints: what a parent's policy requires of a child. These
+  // are the constraints the attach path enforces at commit time; catching them
+  // here means an impossible desired tree is refused before anything moves.
+  std::map<std::string, const TrafficClassSpec *> by_name;
+  for (const TrafficClassSpec &tc : spec.traffic_classes) {
+    by_name[tc.name] = &tc;
+  }
+
+  std::set<std::pair<std::string, int64_t>> priority_slots;
+  std::map<std::string, size_t> children_per_parent;
+
+  for (const TrafficClassSpec &tc : spec.traffic_classes) {
+    if (tc.parent.empty()) {
+      continue;
+    }
+
+    const auto parent_it = by_name.find(tc.parent);
+    if (parent_it == by_name.end()) {
+      continue;  // existence is reported above
+    }
+    const std::string &parent_policy = parent_it->second->policy;
+
+    if (parent_policy == TrafficPolicyName[POLICY_PRIORITY]) {
+      if (!tc.has_priority) {
+        return std::unexpected(
+            Invalid("tc", "priority",
+                    "traffic class '" + tc.name + "': a child of priority "
+                    "class '" + tc.parent + "' must specify a priority"));
+      }
+      if (tc.priority == static_cast<int64_t>(DEFAULT_PRIORITY)) {
+        return std::unexpected(
+            Invalid("tc", "priority",
+                    "traffic class '" + tc.name + "': priority " +
+                        std::to_string(DEFAULT_PRIORITY) + " is reserved"));
+      }
+      if (!priority_slots.insert({tc.parent, tc.priority}).second) {
+        return std::unexpected(Invalid(
+            "tc", "priority",
+            "traffic class '" + tc.name + "': priority " +
+                std::to_string(tc.priority) + " is already taken under '" +
+                tc.parent + "'"));
+      }
+      if (tc.has_share) {
+        return std::unexpected(Invalid(
+            "tc", "share",
+            "traffic class '" + tc.name +
+                "': a share is only meaningful under a weighted_fair parent"));
+      }
+    } else if (parent_policy == TrafficPolicyName[POLICY_WEIGHTED_FAIR]) {
+      if (!tc.has_share) {
+        return std::unexpected(
+            Invalid("tc", "share",
+                    "traffic class '" + tc.name + "': a child of "
+                    "weighted_fair class '" + tc.parent +
+                    "' must specify a share"));
+      }
+      if (tc.share <= 0) {
+        return std::unexpected(Invalid(
+            "tc", "share",
+            "traffic class '" + tc.name + "': share must be greater than zero"));
+      }
+      if (tc.has_priority) {
+        return std::unexpected(
+            Invalid("tc", "priority",
+                    "traffic class '" + tc.name + "': a priority is only "
+                    "meaningful under a priority parent"));
+      }
+    } else {
+      // round_robin and rate_limit take no attachment parameter.
+      if (tc.has_priority || tc.has_share) {
+        return std::unexpected(Invalid(
+            "tc", "parent",
+            "traffic class '" + tc.name + "': parent '" + tc.parent +
+                "' (" + parent_policy + ") takes no attachment parameter"));
+      }
+    }
+
+    children_per_parent[tc.parent]++;
+  }
+
+  for (const auto &entry : children_per_parent) {
+    const TrafficClassSpec *parent = by_name.at(entry.first);
+    if (parent->policy == TrafficPolicyName[POLICY_RATE_LIMIT] &&
+        entry.second > 1) {
+      return std::unexpected(Invalid(
+          "tc", "parent",
+          "rate_limit class '" + entry.first + "' takes a single child, but " +
+              std::to_string(entry.second) + " are defined"));
     }
   }
 

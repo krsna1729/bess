@@ -66,6 +66,64 @@ ControlError ErrorFromLegacy(int code, const std::string& message) {
   return ControlError{CodeFromErrno(code), code, message, "", ""};
 }
 
+// Describes how a live traffic class is attached right now, so a refused move
+// can put it back: parent (or root placement), plus the priority or share its
+// parent holds for it.
+TrafficClassSpec AttachmentSpecOf(const bess::TrafficClass* c) {
+  TrafficClassSpec spec;
+  spec.name = c->name();
+  spec.policy = (c->policy() >= 0 && c->policy() < NUM_POLICIES)
+                    ? TrafficPolicyName[c->policy()]
+                    : "";
+  spec.wid = c->WorkerId();
+
+  const bess::TrafficClass* parent = c->parent();
+  if (parent == nullptr) {
+    return spec;  // a root: wid is the placement
+  }
+
+  // An internal wrapper (a scheduler's default round-robin root) is not a
+  // reattach target: the class is a root that happens to sit under it.
+  if (!parent->name().empty() && parent->name()[0] == '!') {
+    spec.parent = "";
+    spec.wid = c->WorkerId();
+    return spec;
+  }
+
+  spec.parent = parent->name();
+  spec.wid = Worker::kAnyWorker;
+
+  switch (parent->policy()) {
+    case bess::POLICY_PRIORITY: {
+      const auto* prio = static_cast<const bess::PriorityTrafficClass*>(parent);
+      for (const auto& child : prio->children()) {
+        if (child.c_ == c) {
+          spec.has_priority = true;
+          spec.priority = child.priority_;
+          break;
+        }
+      }
+      break;
+    }
+    case bess::POLICY_WEIGHTED_FAIR: {
+      const auto* wrr =
+          static_cast<const bess::WeightedFairTrafficClass*>(parent);
+      for (const auto& child : wrr->children()) {
+        if (child.first == c) {
+          spec.has_share = true;
+          spec.share = child.second;
+          break;
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+
+  return spec;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -818,7 +876,22 @@ ControlResult<void> ControlPlane::UpdateTcParentLocked(const TrafficClassSpec& s
     }
   }
 
-  return AttachTc(c, spec);
+  // Keep the legacy rule for non-leaf classes (they may only move as orphans),
+  // but a refused reattach must not destroy the class: put it back.
+  const TrafficClassSpec previous = AttachmentSpecOf(c);
+
+  auto attached = AttachExistingTcLocked(c, spec);
+  if (!attached) {
+    auto restored = AttachExistingTcLocked(c, previous);
+    if (!restored) {
+      LOG(ERROR) << "Tc '" << spec.name
+                 << "' could not be restored to its previous attachment ("
+                 << restored.error().message << ")";
+    }
+    return std::unexpected(attached.error());
+  }
+
+  return {};
 }
 
 // A class that is waiting to be woken up must not stay reachable from a
@@ -874,13 +947,28 @@ ControlResult<void> ControlPlane::ReparentTcLocked(const TrafficClassSpec& spec)
                                spec.name.c_str()));
   }
 
+  // Where it is now, so a refused move can put it back.
+  const TrafficClassSpec previous = AttachmentSpecOf(c);
+
   RemoveSubtreeFromWakeupQueues(c);
 
   if (!detach_tc(c)) {
     return std::unexpected(Err(EBUSY, "Cannot detach '%s'", spec.name.c_str()));
   }
 
-  return AttachTc(c, spec);
+  auto attached = AttachExistingTcLocked(c, spec);
+  if (!attached) {
+    // The class is detached at this point: put it back rather than losing it.
+    auto restored = AttachExistingTcLocked(c, previous);
+    if (!restored) {
+      LOG(ERROR) << "Tc '" << spec.name
+                 << "' could not be restored to its previous attachment ("
+                 << restored.error().message << ")";
+    }
+    return std::unexpected(attached.error());
+  }
+
+  return {};
 }
 
 ControlResult<void> ControlPlane::ResetTcs() {
@@ -1009,25 +1097,17 @@ ControlResult<bess::TrafficClass*> ControlPlane::FindTc(
   return c;
 }
 
-ControlResult<void> ControlPlane::AttachTc(bess::TrafficClass* c_,
-                                           const TrafficClassSpec& spec) {
-  std::unique_ptr<bess::TrafficClass> c(c_);
-
-  // The class is already registered (it was created through
-  // TrafficClassBuilder), so a failure here has to give the registry entry back
-  // before the unique_ptr destroys the object -- otherwise the registry would
-  // keep a pointer to freed memory.
-  auto fail = [&](ControlError error) -> ControlResult<void> {
-    runtime().traffic_classes().Release(c.get());
-    return std::unexpected(error);
-  };
-
+ControlResult<void> ControlPlane::AttachExistingTcLocked(
+    bess::TrafficClass* c, const TrafficClassSpec& spec) {
+  // Never unregisters or destroys `c`: the class exists, and a failed attach
+  // has to leave it where it was. The caller decides whether it is destroyed,
+  // and only when it created the class for this operation.
   int wid = spec.wid;
 
   if (spec.parent == "") {
     if (wid != Worker::kAnyWorker && (wid < 0 || wid >= Worker::kMaxWorkers)) {
-      return fail(Err(EINVAL, "'wid' must be %d or between 0 and %d",
-                      Worker::kAnyWorker, Worker::kMaxWorkers - 1));
+      return std::unexpected(Err(EINVAL, "'wid' must be %d or between 0 and %d",
+                                 Worker::kAnyWorker, Worker::kMaxWorkers - 1));
     }
 
     int active_workers = runtime().workers().num_workers();
@@ -1036,24 +1116,24 @@ ControlResult<void> ControlPlane::AttachTc(bess::TrafficClass* c_,
       if (active_workers == 0 && (wid == 0 || wid == Worker::kAnyWorker)) {
         launch_worker(0, FLAGS_c);
       } else {
-        return fail(Err(EINVAL, "worker:%d does not exist",
-                        static_cast<int>(wid)));
+        return std::unexpected(
+            Err(EINVAL, "worker:%d does not exist", static_cast<int>(wid)));
       }
     }
 
-    add_tc_to_orphan(c.release(), wid);
+    add_tc_to_orphan(c, wid);
     return {};
   }
 
   if (wid != Worker::kAnyWorker) {
-    return fail(Err(EINVAL,
-                    "Both 'parent' and 'wid'"
-                    "have been specified"));
+    return std::unexpected(Err(EINVAL,
+                               "Both 'parent' and 'wid'"
+                               "have been specified"));
   }
 
   bess::TrafficClass* parent = TrafficClassBuilder::Find(spec.parent);
   if (!parent) {
-    return fail(
+    return std::unexpected(
         Err(ENOENT, "Parent TC '%s' not found", spec.parent.c_str()));
   }
 
@@ -1061,37 +1141,55 @@ ControlResult<void> ControlPlane::AttachTc(bess::TrafficClass* c_,
   switch (parent->policy()) {
     case bess::POLICY_PRIORITY: {
       if (!spec.has_priority) {
-        return fail(Err(EINVAL, "No priority specified"));
+        return std::unexpected(Err(EINVAL, "No priority specified"));
       }
       bess::priority_t pri = spec.priority;
       if (pri == DEFAULT_PRIORITY) {
-        return fail(Err(EINVAL, "Priority %d is reserved", DEFAULT_PRIORITY));
+        return std::unexpected(
+            Err(EINVAL, "Priority %d is reserved", DEFAULT_PRIORITY));
       }
       fail_add = !static_cast<bess::PriorityTrafficClass*>(parent)->AddChild(
-          c.get(), pri);
+          c, pri);
       break;
     }
     case bess::POLICY_WEIGHTED_FAIR:
       if (!spec.has_share) {
-        return fail(Err(EINVAL, "No share specified"));
+        return std::unexpected(Err(EINVAL, "No share specified"));
       }
       fail_add = !static_cast<bess::WeightedFairTrafficClass*>(parent)->AddChild(
-          c.get(), spec.share);
+          c, spec.share);
       break;
     case bess::POLICY_ROUND_ROBIN:
-      fail_add = !static_cast<bess::RoundRobinTrafficClass*>(parent)->AddChild(
-          c.get());
+      fail_add =
+          !static_cast<bess::RoundRobinTrafficClass*>(parent)->AddChild(c);
       break;
     case bess::POLICY_RATE_LIMIT:
-      fail_add = !static_cast<bess::RateLimitTrafficClass*>(parent)->AddChild(
-          c.get());
+      fail_add =
+          !static_cast<bess::RateLimitTrafficClass*>(parent)->AddChild(c);
       break;
     default:
-      return fail(Err(EPERM, "Parent tc doesn't support children"));
+      return std::unexpected(Err(EPERM, "Parent tc doesn't support children"));
   }
   if (fail_add) {
-    return fail(Err(EINVAL, "AddChild() failed"));
+    return std::unexpected(Err(EINVAL, "AddChild() failed"));
   }
+
+  return {};
+}
+
+// Attaches a class that was just created for this operation: on failure the
+// registry entry goes back and the unique_ptr destroys it, so a failed create
+// leaves nothing behind.
+ControlResult<void> ControlPlane::AttachTc(bess::TrafficClass* c_,
+                                           const TrafficClassSpec& spec) {
+  std::unique_ptr<bess::TrafficClass> c(c_);
+
+  auto attached = AttachExistingTcLocked(c.get(), spec);
+  if (!attached) {
+    runtime().traffic_classes().Release(c.get());
+    return std::unexpected(attached.error());
+  }
+
   c.release();
   return {};
 }

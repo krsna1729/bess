@@ -48,6 +48,17 @@ bool QueueMatches(uint64_t desired, uint64_t current) {
   return desired == 0 || desired == current;
 }
 
+// A class that hangs off a scheduler's internal default round-robin wrapper is
+// a root as far as desired state is concerned: the wrapper is where the
+// scheduler put it, not where the client asked for it.
+const std::string &EffectiveParent(const TrafficClassSnapshot &tc) {
+  static const std::string kNoParent;
+  if (tc.parent.empty() || tc.parent[0] == '!') {
+    return kNoParent;
+  }
+  return tc.parent;
+}
+
 // The legacy API carries rate-limit parameters as maps keyed by resource name.
 uint64_t DesiredLimit(const TrafficClassSpec &spec) {
   auto it = spec.limit.find(spec.resource);
@@ -241,7 +252,7 @@ PipelineDiff Diff(const PipelineSnapshot &current,
       // A different policy is a different class: it cannot be changed in place.
       diff.traffic_classes.push_back(
           TrafficClassChange{tc.name, ChangeKind::kReplace, tc});
-    } else if (active->parent != tc.parent ||
+    } else if (EffectiveParent(*active) != tc.parent ||
                active->has_priority != tc.has_priority ||
                active->priority != tc.priority ||
                active->has_share != tc.has_share ||
