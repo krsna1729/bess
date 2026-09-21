@@ -2219,6 +2219,35 @@ rather than one call site).
     tests + benchmarks + sample-plugin load 41/41, module integration 22/22
     files, wire-parity script passes, `git diff --check` clean.
 
+51. **`9affd519`** — **Unit-test death tests stop reporting crashes.**
+    `bessd_test` (8 death tests) and `memory_test` (3) assert on fatal paths by
+    forking a child that really aborts; each child reached systemd-coredump, so
+    a `bessd_test` run left six cores, a `memory_test` run one, every one logged
+    as a crash and firing a desktop notification — noise that buried the real
+    daemon cores during G0 development.
+
+    The unit-test binaries now link our own `core/gtest_main.cc` (dead code
+    since the Meson cutover, which is also why its death-test-style setting was
+    not in effect) instead of the packaged `gtest_main`. It makes the test
+    process non-dumpable and zeroes its core limit, both inherited by death-test
+    children. `RLIMIT_CORE=0` alone is insufficient — with a piped
+    `core_pattern` the kernel skips the limit, and systemd-coredump still logged
+    "terminated abnormally without generating a coredump" (measured) —
+    `prctl(PR_SET_DUMPABLE, 0)` is refused a core before that path, so nothing
+    is reported at all.
+
+    Measured: one run produced 7 entries before, none after; a full native-suite
+    run goes 458 → 458 entries while the suite stays 41/41 and the death tests
+    still execute their fatal paths. `BESS_TEST_CORE_DUMPS=1` opts out for
+    debugging. Scope is the unit-test binaries only: the daemon keeps its core
+    dumps, and no system configuration was touched.
+
+    Follow-up (not done, deliberate): the asserted fatal paths are environment
+    preconditions (no root, no hugepages, bad arguments) rather than programming
+    errors; returning errors instead of aborting is a product decision with
+    startup-semantics ripples, unlike the client-reachable paths where G0
+    already returns errors.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
