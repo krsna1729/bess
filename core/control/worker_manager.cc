@@ -258,6 +258,15 @@ Worker *WorkerManager::NextActive() {
   return ret;
 }
 
+void WorkerManager::AdjustSchedulerDefaults() {
+  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+    Worker *worker = workers_[wid].load();
+    if (worker) {
+      worker->scheduler()->AdjustDefault();
+    }
+  }
+}
+
 void WorkerManager::AttachOrphans() {
   CHECK(!AnyRunning());
   // Distribute all orphan TCs to workers.

@@ -184,6 +184,7 @@ bessd = executable(
 )
 
 unit_test_sources = [
+  'control/apply_pipeline_test.cc',
   'control/control_plane_test.cc',
   'bessd_test.cc',
   'gate_test.cc',

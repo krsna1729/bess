@@ -130,6 +130,10 @@ class WorkerManager {
   // ownership of the detached class to the caller.
   bool DetachTc(TrafficClass *c);
 
+  // Collapses the per-worker default round-robin wrappers that orphan
+  // attachment creates when a scheduler briefly holds more than one root.
+  void AdjustSchedulerDefaults();
+
   // Called by the worker thread itself once it is up.
   void Publish(int wid, Worker *worker) { workers_[wid].store(worker); }
 

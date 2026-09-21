@@ -38,6 +38,7 @@
 
 #include "control/control_plane.h"
 #include "control/runtime_state.h"
+#include "control/worker_manager.h"
 #include "worker.h"
 
 namespace bess {
@@ -210,6 +211,13 @@ void Transaction::Abort() noexcept {
   }
 
   undo_.clear();
+
+  // Undoing the operations is not quite enough: leaving the quiesced window
+  // attaches orphan traffic classes, and a scheduler that briefly held two
+  // roots keeps a default round-robin wrapper for them. Collapse those, so a
+  // failed transaction leaves no trace at all -- including in the structural
+  // snapshot.
+  runtime().workers().AdjustSchedulerDefaults();
 }
 
 ControlResult<void> Transaction::ExecutePrepareOp(const PlanOperation &op) {

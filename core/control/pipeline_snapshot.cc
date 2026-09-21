@@ -111,7 +111,11 @@ PipelineSpec SpecFromSnapshot(const PipelineSnapshot &snapshot) {
     }
     TrafficClassSpec entry;
     entry.name = tc.name;
-    entry.parent = tc.parent;
+    // An internal parent (a scheduler's default round-robin wrapper) is an
+    // implementation detail of where a class was attached, not desired state:
+    // the class is a root as far as a client is concerned.
+    entry.parent =
+        (!tc.parent.empty() && tc.parent[0] == '!') ? "" : tc.parent;
     entry.policy = tc.policy;
     entry.wid = tc.wid;
     entry.leaf_module_name = tc.leaf_module_name;
