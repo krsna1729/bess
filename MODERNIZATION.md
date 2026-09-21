@@ -1931,6 +1931,34 @@ rather than one call site).
     and workers (`workers[]`, `worker_threads[]`, `num_workers`,
     `orphan_tcs`).
 
+43. **`28761cd3`** — **G0 commit 2b/7: `RuntimeState` owns traffic classes.**
+    `TrafficClassRegistry` joins the runtime state: it owns `unique_ptr`s keyed
+    by name (`Register`/`Find`/`All`) and exposes the ownership handoff that
+    teardown needs — `Release`/`ReleaseTree`/`ReleaseAll` erase entries
+    *without* destroying objects, so the code that actually deletes a tree
+    (scheduler teardown, `AdjustDefault`, `Module::DestroyAllTasks`) stays in
+    charge of destruction and the registry is not a second owner.
+    `TrafficClassBuilder` keeps only the factory and forwards `all_tcs()`/
+    `Find()`; `all_tcs_` is gone; the five destructors that called
+    `TrafficClassBuilder::Clear(this)` no longer touch the registry; `~Scheduler`
+    releases its tree before `delete root_`; `ClearAll()` keeps its legacy
+    "forget, do not delete" meaning.
+
+    Bug caught by verification: `Release`/`ReleaseAll` initially used
+    `erase`/`clear` on the owning map, which destroys the object — the exact
+    double free the model is meant to prevent. It appeared as SIGSEGV in
+    `traffic_class_test`/`traffic_class_bench` and as a daemon abort ("double
+    free or corruption") during the module tests; both paths now `release()`
+    before erasing.
+
+    Verification: GCC + Clang builds clean, native tests + benchmarks +
+    sample-plugin load 39/39 (including the two that caught the bug), module
+    integration 22/22 files, wire-parity script passes, `git diff --check`
+    clean.
+
+    Remaining from commit 2: the worker globals behind an explicit
+    `WorkerManager`.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
