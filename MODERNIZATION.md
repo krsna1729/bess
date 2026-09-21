@@ -2175,6 +2175,50 @@ rather than one call site).
     sample-plugin load 41/41, module integration 22/22 files, wire-parity script
     passes, `git diff --check` clean.
 
+50. **`5fc0ee2a`** — **G0 closure follow-up: generation coherence,
+    traffic-class fidelity, retire contract.** Three gaps found in a review of
+    the finished G0 code.
+
+    **Generation coherence.** The counter was only advanced by
+    `ApplyPipeline()`, so a legacy structural RPC could mutate the runtime
+    without moving it and a stale writer would then be accepted. Every public
+    *structural* mutation now bumps exactly once on success (ports, modules,
+    connections, workers, traffic classes, and `Reset()` once for the whole
+    composition); the `*Locked()` primitives never bump, so `ApplyPipeline()`
+    still bumps once per multi-operation transaction. Reads, validation,
+    planning, diffing and pause/resume do not bump.
+
+    **Traffic-class fidelity.** `TrafficClassSnapshot` carried only identity,
+    placement and leaf ownership, and `Diff()` compared only parent and policy,
+    so a changed weighted-fair resource/share, a child's priority, or a rate
+    limit/burst was reported as *unchanged*. The snapshot now reconstructs the
+    full spec semantics — own `resource`/`limit`/`max_burst`, plus the
+    attachment parameters the parent holds (priority, share) — and the diff
+    classifies: policy → `kReplace` (refused), parent/priority/share →
+    `kUpdate` (detach and reattach), resource/limit/burst → `kUpdateParams`
+    (applied in place, undone by restoring the old values). New
+    `UpdateTcParamsOp` and `ReparentTcLocked()`; the latter purges the subtree
+    from the scheduler wakeup queues before moving it, so a class attached to a
+    worker can be moved safely (the legacy `UpdateTcParent` keeps its stricter
+    orphan-only rule).
+
+    **Retire contract.** `Retire()` only logged failures, so a successful
+    `ApplyPipeline()` could leave an object the desired state says should not
+    exist. Retirement preconditions are now proven before the commit: a plan
+    removing a port still in use by a surviving module, or a worker still
+    running a surviving module's tasks, is refused with
+    `kUnsupportedTransaction`. If a retire step still fails, the generation is
+    bumped (the commit happened) and the caller gets `kResourceFailure` saying
+    the pipeline was committed but retirement failed — never an ordinary
+    success. The new invariant test asserts
+    `Normalize(SpecFromSnapshot(GetPipeline())) == Normalize(desired)` after
+    creation, change and removal.
+
+    Tests: 10 new cases (29 in `control_plane_test.cc`, 12 in
+    `apply_pipeline_test.cc`). Verification: GCC + Clang builds clean, native
+    tests + benchmarks + sample-plugin load 41/41, module integration 22/22
+    files, wire-parity script passes, `git diff --check` clean.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -3278,6 +3322,20 @@ update, versus today's full stop.
 | 6 | a complete pipeline applied from C++ end to end, including "a failed commit keeps the active pipeline" |
 | 7 | failure injection over every operation of a real plan, leak/queue/orphan assertions, phase timings |
 
+**Closure follow-up (`5fc0ee2a`, entry 50)** — three correctness gaps found in
+review of the finished code, all about semantics rather than structure:
+
+- **generation coherence**: legacy structural mutations advance the same
+  generation as `ApplyPipeline()`, so a stale writer is detected no matter which
+  path changed the runtime;
+- **traffic-class fidelity**: the snapshot carries the full spec semantics
+  (resource, limit, burst, priority, share) and the diff classifies parameter
+  changes as `kUpdateParams` (applied in place, undoable) instead of calling
+  them unchanged;
+- **retire contract**: retirement preconditions are proven before the commit,
+  and a retire failure is reported as a failure — an ordinary successful apply
+  never claims a pipeline that does not exist.
+
 What G0 deliberately did **not** do, and where it lands instead:
 
 - **metadata layout validation** stays in `Prepare()`: a module's attributes only
@@ -3811,6 +3869,16 @@ relationships, publishes the generation and resumes. Record
 `validation_us` / `prepare_us` / `paused_commit_us` / `retire_us` at least in
 debug/test instrumentation — this will matter later.
 
+**Retirement is a contract, not a best effort.** A successful apply must leave
+exactly the desired state, so retire preconditions are proven *before* the
+commit — a plan that would remove a port still in use by a surviving module, or
+a worker still running a surviving module's tasks, is refused with
+`kUnsupportedTransaction` and the offending object named. If a retire step still
+fails, the commit has already happened: the generation is bumped (the state did
+change) and the caller gets `kResourceFailure` saying the pipeline was committed
+but retirement failed. Returning ordinary success there would claim a pipeline
+that does not exist.
+
 **Atomicity is not a lie to be told.** For accepted transactions, the target is:
 if the transaction returns failure, the previous logical runtime remains active.
 External resources can defeat this, so the planner must classify reversibility:
@@ -3841,8 +3909,17 @@ using Generation = uint64_t;
 ```
 
 Generation starts at a deterministic initial value and increments exactly once
-per successful state-changing transaction. It does not increment for reads,
-validation, planning, failed transactions or a no-op apply.
+per successful state-changing operation. It does not increment for reads,
+validation, planning, failed transactions, worker pause/resume or a no-op
+apply.
+
+**Both control paths share the sequence.** While the legacy RPC surface is still
+live, every public structural mutation (ports, modules, connections, workers,
+traffic classes, and `Reset()` as one operation) bumps once on success, and the
+`*Locked()` primitives never bump — so `ApplyPipeline()` still bumps exactly
+once for a whole multi-operation transaction. Without this, a legacy
+`CreateModule` would change the runtime while the generation stood still, and a
+stale `ApplyPipeline(expected_generation=...)` would be accepted.
 
 ```text
 generation 12 --Apply success--> 13
