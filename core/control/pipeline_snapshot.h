@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "control/pipeline_spec.h"
 #include "control/runtime_state.h"
 #include "gate.h"
 #include "message.h"
@@ -112,6 +113,13 @@ struct PipelineSnapshot {
 // Reads the active runtime into a snapshot. Pure: it never mutates the state it
 // is given.
 PipelineSnapshot SnapshotRuntime(const RuntimeState &runtime);
+
+// Reconstructs the desired-state description of an active runtime. Internal
+// traffic classes (module leaf classes and scheduler defaults, whose names
+// start with '!') are left out: they are consequences of the modules and
+// workers that own them, not desired-state objects. This is what makes
+// "apply the same pipeline again" a no-op.
+PipelineSpec SpecFromSnapshot(const PipelineSnapshot &snapshot);
 
 }  // namespace control
 }  // namespace bess

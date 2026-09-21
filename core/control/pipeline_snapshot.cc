@@ -65,6 +65,64 @@ bool ModuleSnapshot::operator==(const ModuleSnapshot &other) const {
          SameAny(arg, other.arg);
 }
 
+PipelineSpec SpecFromSnapshot(const PipelineSnapshot &snapshot) {
+  PipelineSpec spec;
+
+  for (const PortSnapshot &port : snapshot.ports) {
+    PortSpec entry;
+    entry.name = port.name;
+    entry.driver = port.driver;
+    entry.num_rx_queues = port.num_rx_queues;
+    entry.num_tx_queues = port.num_tx_queues;
+    entry.rx_queue_size = port.rx_queue_size;
+    entry.tx_queue_size = port.tx_queue_size;
+    entry.arg = port.driver_arg;
+    spec.ports.push_back(std::move(entry));
+  }
+
+  for (const ModuleSnapshot &module : snapshot.modules) {
+    ModuleSpec entry;
+    entry.name = module.name;
+    entry.mclass = module.mclass;
+    entry.arg = module.arg;
+    spec.modules.push_back(std::move(entry));
+  }
+
+  for (const ConnectionSnapshot &connection : snapshot.connections) {
+    ConnectionSpec entry;
+    entry.upstream = connection.upstream;
+    entry.ogate = connection.ogate;
+    entry.downstream = connection.downstream;
+    entry.igate = connection.igate;
+    spec.connections.push_back(std::move(entry));
+  }
+
+  for (const WorkerSnapshot &worker : snapshot.workers) {
+    WorkerSpec entry;
+    entry.wid = worker.wid;
+    entry.core = worker.core;
+    entry.scheduler = worker.scheduler;
+    spec.workers.push_back(std::move(entry));
+  }
+
+  for (const TrafficClassSnapshot &tc : snapshot.traffic_classes) {
+    if (!tc.name.empty() && tc.name[0] == '!') {
+      continue;
+    }
+    TrafficClassSpec entry;
+    entry.name = tc.name;
+    entry.parent = tc.parent;
+    entry.policy = tc.policy;
+    entry.wid = tc.wid;
+    entry.leaf_module_name = tc.leaf_module_name;
+    entry.leaf_module_taskid = tc.leaf_module_taskid;
+    spec.traffic_classes.push_back(std::move(entry));
+  }
+
+  Normalize(&spec);
+  return spec;
+}
+
 PipelineSnapshot SnapshotRuntime(const RuntimeState &runtime) {
   PipelineSnapshot snapshot;
 

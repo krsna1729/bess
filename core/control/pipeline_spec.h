@@ -84,6 +84,14 @@ struct ConnectionSpec {
   bool operator==(const ConnectionSpec &other) const = default;
 };
 
+// One end of a disconnect: the upstream module and the output gate to clear.
+struct DisconnectionSpec {
+  std::string name;
+  gate_idx_t ogate = 0;
+
+  bool operator==(const DisconnectionSpec &other) const = default;
+};
+
 struct WorkerSpec {
   int wid = -1;
   int core = -1;

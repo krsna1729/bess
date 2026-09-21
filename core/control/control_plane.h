@@ -38,6 +38,8 @@
 
 #include "control/control_error.h"
 #include "control/pipeline_spec.h"
+#include "control/pipeline_diff.h"
+#include "control/pipeline_plan.h"
 #include "control/pipeline_snapshot.h"
 #include "control/pipeline_validator.h"
 #include "message.h"
@@ -65,11 +67,6 @@ struct PortConfSpec {
   std::string mac_addr;
   uint32_t mtu = 1500;
   bool admin_up = true;
-};
-
-struct DisconnectionSpec {
-  std::string name;
-  gate_idx_t ogate = 0;
 };
 
 struct SchedulingConstraintViolation {
@@ -170,6 +167,11 @@ class ControlPlane {
   // planner and transaction engine; these two are its read-only half.
   ControlResult<ValidatedPipeline> ValidatePipeline(const PipelineSpec& desired);
   PipelineSnapshot GetPipeline() const;
+
+  // Validated desired state -> what has to change -> dependency-ordered plan.
+  // Pure with respect to the runtime; nothing here mutates anything.
+  ControlResult<PipelineDiff> DiffPipeline(const PipelineSpec& desired) const;
+  ControlResult<PipelinePlan> PlanPipeline(const PipelineSpec& desired) const;
 
   // -- composition --
   // Today's ResetAll: modules, then ports, then TCs, then workers. Composed
