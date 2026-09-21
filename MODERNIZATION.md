@@ -2351,6 +2351,28 @@ rather than one call site).
     request served, clean SIGTERM shutdown, no cores) and real foreground smoke
     (unchanged: normal stderr logging, gRPC served); `git diff --check` clean.
 
+55. **`45e5723a`** + **`81f62180`** — **K1.1/K1.2: the RCU domain, and workers as
+    its readers.** `core/rcu/rcu_domain.{h,cc}` is the BESS semantic interface
+    over DPDK's `rte_rcu_qsbr` backend: reader identity is the BESS `WorkerId`,
+    readers register/unregister and go online/offline, grace periods are started
+    and checked (or synchronised), and retired objects of any type are destroyed
+    by `ReclaimReady()`/`Drain()` on the calling control thread — never on a
+    packet worker. One grace period can retire several objects (the shape K2/K3
+    need), the retirement queue is bounded with control-side back-pressure, and
+    the QSBR memory is ordinary cache-line-aligned memory so a domain needs no
+    EAL (14 unit tests, including the teardown assertion as a death test).
+
+    `RuntimeState` then owns exactly one domain, and the worker lifecycle drives
+    it: the thread registers its reader on startup and stays *offline*;
+    `BlockWorker()` goes **offline before blocking** and **online before
+    dataplane work resumes** (reporting quiescence on the way); the thread
+    unregisters before teardown, so a destroyed worker stops blocking grace
+    periods and its id can be reused. 3 worker-level tests cover launch/resume/
+    pause/destroy/recreate and the pause-during-grace case.
+
+    Verification: GCC + Clang clean; 43/43 native tests + benchmarks + plugin
+    load; module integration 22/22; wire-parity passes.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
