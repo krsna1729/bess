@@ -586,9 +586,10 @@ class BenchPool {
     char name[64];
     snprintf(name, sizeof(name), "MempoolBench%u", next_id.fetch_add(1));
 
-    mp_ = rte_mempool_create_empty(name, kPoolCapacity,
-                                   bess::kPacketMempoolElementSize, cache_size,
-                                   sizeof(BenchPoolPrivate), SOCKET_ID_ANY, 0);
+    mp_ = rte_mempool_create_empty(
+        name, kPoolCapacity,
+        bess::PacketMempoolElementSize(bess::kDefaultPacketDataSize),
+        cache_size, sizeof(BenchPoolPrivate), SOCKET_ID_ANY, 0);
     if (mp_ == nullptr) {
       LOG(ERROR) << "rte_mempool_create_empty() failed: "
                  << rte_strerror(rte_errno);
@@ -631,7 +632,8 @@ class BenchPool {
     }
 
     BenchPoolPrivate priv = {};
-    priv.dpdk_priv.mbuf_data_room_size = bess::kPacketDataRoomSize;
+    priv.dpdk_priv.mbuf_data_room_size = static_cast<uint16_t>(
+        RTE_PKTMBUF_HEADROOM + bess::kDefaultPacketDataSize);
     priv.dpdk_priv.mbuf_priv_size = bess::kPacketPrivateSize;
     priv.dpdk_priv.flags = 0;
     rte_pktmbuf_pool_init(mp_, &priv.dpdk_priv);

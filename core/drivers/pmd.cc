@@ -44,10 +44,13 @@ static const rte_eth_conf default_eth_conf(const rte_eth_dev_info &dev_info,
                                            int nb_rxq) {
   rte_eth_conf ret = {};
 
-  ret.link_speeds = RTE_ETH_LINK_SPEED_AUTONEG;
   ret.rxmode.mq_mode = (nb_rxq > 1) ? RTE_ETH_MQ_RX_RSS : RTE_ETH_MQ_RX_NONE;
   ret.rxmode.offloads = 0;
-
+  // Keep the receive contract valid for both large single-segment mbufs and
+  // chains when a PMD advertises scatter support.
+  if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER) {
+    ret.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_SCATTER;
+  }
   ret.rx_adv_conf.rss_conf = {
       .rss_key = nullptr,
       .rss_key_len = 0,
@@ -380,9 +383,15 @@ CommandResponse PMDPort::UpdateConf(const Conf &conf) {
   rte_eth_dev_stop(dpdk_port_id_);  // need to restart before return
 
   if (conf_.mtu != conf.mtu && conf.mtu != 0) {
-    if (conf.mtu > SNBUF_DATA || conf.mtu < RTE_ETHER_MIN_MTU) {
+    uint32_t max_mtu = RTE_ETHER_MAX_JUMBO_FRAME_LEN;
+    rte_eth_dev_info mtu_dev_info = {};
+    if (rte_eth_dev_info_get(dpdk_port_id_, &mtu_dev_info) == 0 &&
+        mtu_dev_info.max_mtu != 0) {
+      max_mtu = mtu_dev_info.max_mtu;
+    }
+    if (conf.mtu > max_mtu || conf.mtu < RTE_ETHER_MIN_MTU) {
       resp = CommandFailure(EINVAL, "mtu should be >= %d and <= %d",
-                            RTE_ETHER_MIN_MTU, SNBUF_DATA);
+                            RTE_ETHER_MIN_MTU, max_mtu);
       goto restart;
     }
 

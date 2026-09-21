@@ -24,9 +24,13 @@ void HexDump(std::ostringstream *dump, const void *data, size_t len) {
 
 }  // namespace
 
+PacketHandle PacketClone(PacketHandle src) {
+  DCHECK(src != nullptr);
+  return rte_pktmbuf_clone(src, src->pool);
+}
+
 PacketHandle PacketCopy(PacketHandle src) {
   DCHECK(src != nullptr);
-  DCHECK_EQ(src->nb_segs, 1);
   return rte_pktmbuf_copy(src, src->pool, 0, src->pkt_len);
 }
 

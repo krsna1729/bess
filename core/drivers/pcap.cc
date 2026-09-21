@@ -74,44 +74,13 @@ int PCAPPort::RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
       break;
     }
 
-    bess::PacketHandle pkt = current_worker.packet_pool()->Alloc();
-    if (!pkt) {
+    bess::PacketHandle pkt =
+        current_worker.packet_pool()->AllocCopy(packet, caplen);
+    if (pkt == nullptr) {
       break;
     }
 
-    bess::PacketRef pkt_ref(pkt);
-    int copy_len = std::min(caplen, static_cast<int>(pkt_ref.tailroom()));
-    bess::utils::CopyInlined(pkt_ref.append(copy_len), packet, copy_len, true);
-
-    packet += copy_len;
-    caplen -= copy_len;
-    bess::PacketRef m = pkt_ref;
-
-    int nb_segs = 1;
-    while (caplen > 0) {
-      bess::PacketHandle next = current_worker.packet_pool()->Alloc();
-      if (!next) {
-        // Drop the whole chain if a later segment cannot be allocated.
-        bess::PacketFree(pkt);
-        pkt = nullptr;
-        break;
-      }
-
-      m.set_next(bess::PacketRef(next));
-      m = m.next();
-      nb_segs++;
-
-      copy_len = std::min(caplen, static_cast<int>(m.tailroom()));
-      bess::utils::Copy(m.append(copy_len), packet, copy_len, true);
-
-      packet += copy_len;
-      caplen -= copy_len;
-    }
-    if (!pkt) {
-      break;
-    }
-    pkt_ref.set_nb_segs(nb_segs);
-    pkts[recv_cnt] = pkt_ref.handle();
+    pkts[recv_cnt] = pkt;
     recv_cnt++;
   }
 

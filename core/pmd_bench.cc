@@ -67,6 +67,7 @@
 // Stage 2 must redesign, without it.
 
 #include <benchmark/benchmark.h>
+#include <vector>
 #include <glog/logging.h>
 
 #include "drivers/pmd.h"
@@ -245,6 +246,79 @@ void BM_PmdRingRoundTripEndToEnd(benchmark::State &state) {
   state.counters["tx_drops"] = benchmark::Counter(tx_drops);
 }
 BENCHMARK(BM_PmdRingRoundTripEndToEnd)->RangeMultiplier(2)->Range(1, bess::PacketBatch::kMaxBurst);
+
+void BM_PmdRingMultisegmentRoundTrip(benchmark::State &state) {
+  PmdFixture &fx = GetFixture();
+  bess::PacketPool *pool = DefaultPool();
+  const std::vector<uint8_t> payload(pool->data_room_size() + 64, 0x5a);
+  uint64_t packets = 0;
+
+  for (auto _ : state) {
+    bess::PacketHandle tx =
+        pool->AllocCopy(payload.data(), payload.size());
+    CHECK(tx != nullptr);
+
+    int sent = fx.ring_port.SendPackets(0, &tx, 1);
+    CHECK_EQ(sent, 1);
+
+    bess::PacketHandle rx = nullptr;
+    int recvd = fx.ring_port.RecvPackets(0, &rx, 1);
+    CHECK_EQ(recvd, 1);
+    CHECK_EQ(rx->nb_segs, 2);
+    CHECK_EQ(rx->pkt_len, payload.size());
+    bess::PacketFree(rx);
+    packets++;
+  }
+
+  state.SetItemsProcessed(packets);
+}
+BENCHMARK(BM_PmdRingMultisegmentRoundTrip)->Arg(1);
+
+struct ExternalBufferOwner {
+  uint64_t *free_count;
+};
+
+void FreeBenchExternalBuffer(void *addr, void *opaque) {
+  auto *owner = static_cast<ExternalBufferOwner *>(opaque);
+  ++*owner->free_count;
+  delete[] static_cast<unsigned char *>(addr);
+  delete owner;
+}
+
+void BM_PmdRingExternalRoundTrip(benchmark::State &state) {
+  PmdFixture &fx = GetFixture();
+  bess::PacketPool *pool = DefaultPool();
+  uint64_t packets = 0;
+
+  for (auto _ : state) {
+    uint64_t freed = 0;
+    auto *buffer = new unsigned char[4096];
+    auto *owner = new ExternalBufferOwner{&freed};
+    uint16_t buffer_len = 4096;
+    rte_mbuf_ext_shared_info *shinfo = rte_pktmbuf_ext_shinfo_init_helper(
+        buffer, &buffer_len, FreeBenchExternalBuffer, owner);
+    CHECK(shinfo != nullptr);
+
+    bess::PacketHandle tx =
+        pool->AllocExternal(buffer, RTE_BAD_IOVA, buffer_len, shinfo, kPktLen);
+    CHECK(tx != nullptr);
+    CHECK(RTE_MBUF_HAS_EXTBUF(tx));
+
+    int sent = fx.ring_port.SendPackets(0, &tx, 1);
+    CHECK_EQ(sent, 1);
+
+    bess::PacketHandle rx = nullptr;
+    int recvd = fx.ring_port.RecvPackets(0, &rx, 1);
+    CHECK_EQ(recvd, 1);
+    CHECK(RTE_MBUF_HAS_EXTBUF(rx));
+    bess::PacketFree(rx);
+    CHECK_EQ(freed, 1);
+    packets++;
+  }
+
+  state.SetItemsProcessed(packets);
+}
+BENCHMARK(BM_PmdRingExternalRoundTrip)->Arg(1);
 
 }  // namespace
 

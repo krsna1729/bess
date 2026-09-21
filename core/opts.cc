@@ -35,6 +35,7 @@
 
 #include "bessd.h"
 #include "worker.h"
+#include "packet.h"
 
 // Port this BESS instance listens on.
 // Panda came up with this default number
@@ -129,3 +130,17 @@ DEFINE_int32(buffers, 262144,
              " must be a power of 2.");
 static const bool _buffers_dummy[[maybe_unused]] =
     google::RegisterFlagValidator(&FLAGS_buffers, &ValidateBuffersPerSocket);
+
+static bool ValidatePacketDataRoom(const char *, uint32_t value) {
+  if (value == 0 || value > bess::kMaxPacketDataSize) {
+    LOG(ERROR) << "Invalid packet data room: " << value
+               << " (must be in [1," << bess::kMaxPacketDataSize << "])";
+    return false;
+  }
+  return true;
+}
+DEFINE_uint32(packet_data_room, bess::kDefaultPacketDataSize,
+              "Payload bytes in each packet mbuf data room.");
+static const bool _packet_data_room_dummy[[maybe_unused]] =
+    google::RegisterFlagValidator(&FLAGS_packet_data_room,
+                                  &ValidatePacketDataRoom);

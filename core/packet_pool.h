@@ -31,10 +31,13 @@ class PacketPool {
  public:
   static PacketPool *GetDefaultPool(int node) { return default_pools_[node]; }
 
-  static void CreateDefaultPools(size_t capacity = kDefaultCapacity);
+  static void CreateDefaultPools(
+      size_t capacity = kDefaultCapacity,
+      size_t data_room_size = kDefaultPacketDataSize);
 
-  // socket_id == -1 means "I don't care".
-  PacketPool(size_t capacity = kDefaultCapacity, int socket_id = -1);
+  // data_room_size is payload capacity; DPDK headroom is added internally.
+  PacketPool(size_t capacity = kDefaultCapacity, int socket_id = -1,
+             size_t data_room_size = kDefaultPacketDataSize);
   virtual ~PacketPool();
 
   PacketPool(const PacketPool &) = delete;
@@ -62,8 +65,27 @@ class PacketPool {
   // are allocated and initialized, or the function returns false.
   bool AllocBulk(PacketHandle *pkts, size_t count, size_t len = 0);
 
+  // Copy a byte buffer into one or more packet segments. The returned packet
+  // owns the complete chain; allocation failure frees every segment already
+  // allocated and returns nullptr.
+  PacketHandle AllocCopy(const void *data, size_t len);
+
+  // Allocate an mbuf and attach one caller-managed external buffer. On
+  // success, ownership of one external-buffer reference transfers to the
+  // returned packet and its shinfo callback releases it after the last free.
+  // On failure, the caller retains ownership.
+  PacketHandle AllocExternal(
+      void *buf_addr, rte_iova_t buf_iova, uint16_t buf_len,
+      rte_mbuf_ext_shared_info *shinfo, size_t data_len = 0,
+      uint16_t data_off = RTE_PKTMBUF_HEADROOM);
+
   size_t Capacity() const { return pool_->populated_size; }
   size_t Size() const { return rte_mempool_avail_count(pool_); }
+
+  size_t data_room_size() const { return data_room_size_; }
+  size_t mbuf_data_room_size() const {
+    return RTE_PKTMBUF_HEADROOM + data_room_size_;
+  }
 
   // Note: it would be ideal not to expose this.
   rte_mempool *pool() { return pool_; }
@@ -82,6 +104,7 @@ class PacketPool {
 
   std::string name_;
   rte_mempool *pool_;
+  const size_t data_room_size_;
 
  private:
   static PacketPool *default_pools_[RTE_MAX_NUMA_NODES];
@@ -89,7 +112,8 @@ class PacketPool {
 
 class PlainPacketPool : public PacketPool {
  public:
-  PlainPacketPool(size_t capacity = kDefaultCapacity, int socket_id = -1);
+  PlainPacketPool(size_t capacity = kDefaultCapacity, int socket_id = -1,
+                  size_t data_room_size = kDefaultPacketDataSize);
 
   bool IsVirtuallyContiguous() override { return true; }
   bool IsPhysicallyContiguous() override { return false; }
@@ -101,7 +125,8 @@ class PlainPacketPool : public PacketPool {
 
 class BessPacketPool : public PacketPool {
  public:
-  BessPacketPool(size_t capacity = kDefaultCapacity, int socket_id = -1);
+  BessPacketPool(size_t capacity = kDefaultCapacity, int socket_id = -1,
+                 size_t data_room_size = kDefaultPacketDataSize);
 
   bool IsVirtuallyContiguous() override { return true; }
   bool IsPhysicallyContiguous() override { return true; }
@@ -113,7 +138,8 @@ class BessPacketPool : public PacketPool {
 
 class DpdkPacketPool : public PacketPool {
  public:
-  DpdkPacketPool(size_t capacity = kDefaultCapacity, int socket_id = -1);
+  DpdkPacketPool(size_t capacity = kDefaultCapacity, int socket_id = -1,
+                 size_t data_room_size = kDefaultPacketDataSize);
 
   // TODO(sangjin): it may or may not be contiguous. Check it.
   bool IsVirtuallyContiguous() override { return false; }

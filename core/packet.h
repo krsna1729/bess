@@ -58,19 +58,25 @@ static_assert(sizeof(BessPacketPrivate) == SNBUF_METADATA + SNBUF_SCRATCHPAD,
 static_assert(sizeof(BessPacketPrivate) % RTE_MBUF_PRIV_ALIGN == 0,
               "BessPacketPrivate size must satisfy RTE_MBUF_PRIV_ALIGN");
 
-// One centralized native pktmbuf layout shared by every PacketPool backend and
-// the allocator benchmark. The data room includes DPDK headroom; BESS's
-// module-visible payload limit remains SNBUF_DATA.
 inline constexpr size_t kPacketPrivateSize = sizeof(BessPacketPrivate);
-inline constexpr size_t kPacketDataRoomSize =
-    RTE_PKTMBUF_HEADROOM + SNBUF_DATA;
-inline constexpr size_t kPacketMempoolElementSize =
-    sizeof(struct rte_mbuf) + sizeof(BessPacketPrivate) + kPacketDataRoomSize;
+
+// Every PacketPool chooses its payload capacity; the default retains the
+// historical BESS limit. The DPDK data room adds headroom to that capacity.
+inline constexpr size_t kDefaultPacketDataSize = SNBUF_DATA;
+inline constexpr size_t kMaxPacketDataSize =
+    std::numeric_limits<uint16_t>::max() - RTE_PKTMBUF_HEADROOM;
+inline constexpr size_t PacketMempoolElementSize(size_t data_room_size) {
+  return sizeof(struct rte_mbuf) + sizeof(BessPacketPrivate) +
+         RTE_PKTMBUF_HEADROOM + data_room_size;
+}
 
 static_assert(kPacketPrivateSize <= std::numeric_limits<uint16_t>::max(),
               "Bess private data must fit in rte_mbuf::priv_size");
-static_assert(kPacketDataRoomSize <= std::numeric_limits<uint16_t>::max(),
+static_assert(RTE_PKTMBUF_HEADROOM + kDefaultPacketDataSize <=
+                  std::numeric_limits<uint16_t>::max(),
               "Packet data room must fit in rte_mbuf::buf_len");
+static_assert(kMaxPacketDataSize > 0,
+              "DPDK headroom must fit in rte_mbuf::buf_len");
 
 // Non-owning view of one native packet mbuf. PacketRef is deliberately a value
 // type: one pointer wide, trivially copyable, and never an owner.
@@ -242,9 +248,13 @@ inline void PacketFreeBatch(PacketBatch *batch) {
   PacketFreeBulk(batch->handles(), batch->cnt());
 }
 
-// Deep-copies a linear packet's bytes using native DPDK facilities. The
-// linear-packet precondition is retained from the old PacketCopy contract;
-// rte_pktmbuf_copy deliberately does not copy BESS's private metadata.
+// Creates a shallow clone. The clone has independent mbuf headers but shares
+// every payload segment, including external-buffer ownership and refcounts;
+// BESS's private metadata is not copied.
+PacketHandle PacketClone(PacketHandle src);
+
+// Deep-copies a packet's bytes, including all segments, using native DPDK
+// facilities. BESS's private metadata is not copied.
 PacketHandle PacketCopy(PacketHandle src);
 
 // Defined here because both PacketRef and PacketBatch must be complete.

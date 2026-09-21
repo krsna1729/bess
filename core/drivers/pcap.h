@@ -39,8 +39,7 @@
 
 // Port to connect to a device via PCAP.
 // (Not recommended because PCAP is slow :-)
-// This driver is experimental. Currently does not support mbuf chaining and
-// needs more tests!
+// Captured packets are copied into one or more native mbuf segments.
 class PCAPPort final : public Port {
  public:
   CommandResponse Init(const bess::pb::PCAPPortArg &arg);

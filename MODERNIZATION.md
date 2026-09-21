@@ -1907,9 +1907,11 @@ Stage 2B completed the two backend boundaries:
   native handle array directly; no per-packet or per-burst wrap/unwrap
   conversion exists at the PMD boundary.
 
-Dynamic per-pool data-room sizing (jumbo frames, upstream `#1024`) remains a
-later change. Stage 2B keeps the existing 2048-byte BESS payload limit and
-the default `RTE_PKTMBUF_HEADROOM` data-room configuration.
+Stage 2C is staged rather than one cutover. Its first substage makes the
+payload data-room size a `PacketPool` property; the following sections record
+the jumbo/multisegment policy, external-buffer plumbing, and clone semantics.
+The default remains the existing 2048-byte BESS payload limit plus
+`RTE_PKTMBUF_HEADROOM`.
 
 The benchmark comparison and observed native-API costs are recorded in the
 completed Stage 2B section below. Follow-up performance work must preserve
@@ -2137,10 +2139,121 @@ field; BESS has no fresh-packet consumer requiring a zero hash, so Stage 2B
 follows DPDK's validity-state semantics rather than preserving that incidental
 initialization.
 
-Residual Stage 2 scope is explicit: dynamic data-room sizing, jumbo frames,
-AF_XDP/vhost external-buffer pool plumbing, clone semantics, hardware
-offloads, `MBUF_FAST_FREE`, `PortCapabilities`, `PacketBatch::kMaxBurst`
-changes, and real-NIC/cross-worker measurements remain future work.
+At the Stage 2B boundary, residual Stage 2 scope was explicit: jumbo/
+multisegment policy, AF_XDP/vhost external-buffer pool plumbing, clone
+semantics, hardware offloads, `MBUF_FAST_FREE`, `PortCapabilities`,
+`PacketBatch::kMaxBurst` changes, and real-NIC/cross-worker measurements
+remained future work. Stage 2C below records the portions now implemented.
+
+### Stage 2C.1 — variable packet data-room sizing (first substage)
+
+`PacketPool` now accepts a payload data-room size independently of pool
+capacity. The value is retained as a pool property, exposed through
+`data_room_size()`, and also used by `CreateDefaultPools()`. The centralized
+native element-size helper computes:
+
+```
+sizeof(struct rte_mbuf) + sizeof(BessPacketPrivate) +
+RTE_PKTMBUF_HEADROOM + payload_data_room
+```
+
+`PostPopulate()` passes the same room, including
+`RTE_PKTMBUF_HEADROOM`, to DPDK's pool-private initializer. The default remains
+`SNBUF_DATA`; it is a compatibility default, not a restriction on explicitly
+configured pools. Plain and BESS pool population use the actual system page
+shift, so small pools still populate their requested capacity.
+
+The `SNBUF_DATA` audit is intentional:
+
+| Use | Classification |
+| --- | --- |
+| `core/packet.h`, `core/snbuf_layout.h` | Historical default payload capacity |
+| `core/drivers/pmd.cc` MTU validation | Capacity-dependent; remains fixed until the jumbo policy substage |
+| `core/modules/source.cc` packet-size validation | Capacity-dependent; remains fixed until the jumbo policy substage |
+| `core/modules/random_update.cc`, `core/modules/update.cc`, `sample_plugin/modules/sequential_update.cc` | Fixed application-level packet-field offset contract |
+| `core/modules/set_metadata.cc` | Fixed application-level packet-field offset contract |
+
+The offset-contract uses are not allocator sizing. They must not be replaced
+with a larger pool room without separately changing the module's packet-field
+contract. The PMD and source checks are the remaining capacity consumers and
+are deliberately left for the jumbo/multisegment decision.
+
+The variable-room before/after gate was recaptured after the initial unpinned
+attempt: both `8ab929fd` and the working tree were built with clang++ against
+DPDK 25.11.3 and run with `taskset -c 2`, where CPU 2 is a P-core and its SMT
+sibling CPU 3 was offline for the runs. Both packet and PMD suites used
+`--benchmark_min_time=1.0s`; raw captures are under
+`scratch/phaseb-study/stage2c-pinned-baseline/` and
+`scratch/phaseb-study/stage2c-pinned-variable-room/`. This gate did not show a
+repeatable regression requiring investigation; CPU scaling remained enabled,
+so the numbers are protocol-consistent but not a fixed-frequency claim.
+
+### Stage 2C.2 — jumbo and multisegment policy
+
+Stage 2C supports both jumbo representations:
+
+- A pool configured with `data_room_size` (or the
+  `--packet_data_room` default-pool flag) carries a jumbo frame in one native
+  mbuf segment when its payload capacity is sufficient.
+- `PacketPool::AllocCopy()` falls back to a native mbuf chain when the source
+  exceeds one segment. PCAP receive uses this path, so captured packets do not
+  need a fixed `SNBUF_DATA` limit.
+
+PMD initialization enables `RTE_ETH_RX_OFFLOAD_SCATTER` when the device
+advertises it, and MTU validation uses the device's reported `max_mtu`
+instead of `SNBUF_DATA`. Native `PacketRef` operations remain segment-aware:
+prepend operates on the first segment, append follows DPDK's native
+last-segment behavior, and `tailroom()` reports the native tail segment's
+available room. No overlay-specific jumbo path was added.
+
+The packet suite covers large single-segment operations, PCAP-sized chains,
+partial-chain allocation cleanup, and deep copies of chained bytes. The
+`net_ring` PMD benchmark covers chained RX/TX and a large external-backed
+packet round trip.
+
+### Stage 2C.3 — external-buffer plumbing
+
+`PacketPool::AllocExternal()` accepts a caller-managed buffer, IOVA, length,
+and `rte_mbuf_ext_shared_info`, validates the DPDK external-buffer contract,
+and attaches it with `rte_pktmbuf_attach_extbuf()`. The caller retains
+ownership when validation or mbuf allocation fails; after attachment, DPDK's
+external-buffer reference count and free callback own the lifetime.
+
+Generic `PacketFree()` and `PacketFreeBulk()` continue to use native DPDK
+mbuf release, so the same free paths handle ordinary, indirect, and external
+mbufs without a BESS-specific ownership branch. The packet suite exercises
+the production allocator and callback behavior, and the `net_ring` PMD
+benchmark exercises an external-buffer receive/transmit round trip. AF_XDP
+and vhost-specific adapters still require their device integrations; this
+substage supplies the common native mbuf plumbing they can consume.
+
+### Stage 2C.4 — clone semantics
+
+`PacketClone()` is explicitly shallow: it creates independent mbuf headers
+that share every payload segment, including external-buffer storage and its
+DPDK reference count. BESS private metadata is not copied. Destruction in
+either order releases shared storage only after the last owner is freed.
+
+`PacketCopy()` is explicitly deep: it copies all bytes across linear or
+chained source segments into independent native mbufs and does not copy BESS
+private metadata. Tests cover destruction ordering, chained clones, and
+external-buffer callbacks waiting for the final clone.
+
+The combined Stage 2C.2–2C.4 gate was recaptured with clang++ and DPDK
+25.11.3 on `taskset -c 2`; CPU 3 was offline during each one-second run and
+restored afterward. Packet and PMD benchmark captures are under
+`scratch/phaseb-study/stage2c-pinned-jumbo-external-clone/`, with a repeat PMD
+capture under
+`scratch/phaseb-study/stage2c-pinned-jumbo-external-clone-repeat/`. The packet
+ownership suite passed all 21 tests, and the PMD suite passed the existing
+null/ring cases plus the multisegment and external-buffer round trips.
+
+Against the pinned variable-room capture, packet benchmark CPU times improved
+by 2.6%–18.2%. One PMD `BM_PmdNullTxEndToEnd/16` run exceeded the requested
+2% investigation threshold (+2.1%, then +16.0%); a focused pinned rerun
+measured 64.0 ns versus the 65.6 ns pinned reference, so the signal was not
+repeatable. No regression investigation was triggered. CPU scaling remained
+enabled, so these measurements are not a fixed-frequency claim.
 
 ### DPDK-proposal review notes (2026-09-18)
 

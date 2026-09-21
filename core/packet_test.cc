@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -54,7 +55,7 @@ TEST(PacketNativeLayoutTest, HandleAndPrivateAreaUseNativeMbuf) {
   EXPECT_EQ(rte_pktmbuf_priv_size(pool.pool()),
             static_cast<uint16_t>(sizeof(bess::BessPacketPrivate)));
   EXPECT_EQ(rte_pktmbuf_data_room_size(pool.pool()),
-            bess::kPacketDataRoomSize);
+            RTE_PKTMBUF_HEADROOM + pool.data_room_size());
 
   bess::PacketRef ref(pkt);
   EXPECT_EQ(ref.metadata<uintptr_t>(),
@@ -68,7 +69,7 @@ TEST(PacketNativeLayoutTest, HandleAndPrivateAreaUseNativeMbuf) {
   EXPECT_EQ(*ref.scratchpad<uint32_t *>(), 0xdeadbeefu);
 
   EXPECT_EQ(ref.headroom(), RTE_PKTMBUF_HEADROOM);
-  EXPECT_EQ(ref.tailroom(), SNBUF_DATA);
+  EXPECT_EQ(ref.tailroom(), pool.data_room_size());
   EXPECT_EQ(ref.nb_segs(), 1);
   EXPECT_TRUE(ref.is_linear());
   EXPECT_TRUE(ref.is_simple());
@@ -111,6 +112,26 @@ TEST(PacketRefTest, NativeDataOperationsUpdateMbufFields) {
   bess::PacketFree(pkt);
 }
 
+TEST(PacketRefTest, LargeSingleSegmentPreservesNativeRoomOperations) {
+  bess::PlainPacketPool pool(4, -1, 9000);
+  bess::PacketHandle pkt = pool.Alloc();
+  ASSERT_NE(pkt, nullptr);
+
+  bess::PacketRef ref(pkt);
+  ASSERT_NE(ref.append(4096), nullptr);
+  EXPECT_EQ(ref.tailroom(), 9000 - 4096);
+  ASSERT_NE(ref.prepend(32), nullptr);
+  EXPECT_EQ(ref.headroom(), RTE_PKTMBUF_HEADROOM - 32);
+  EXPECT_EQ(ref.data_len(), 4096 + 32);
+  EXPECT_EQ(ref.total_len(), 4096 + 32);
+  ref.trim(32);
+  EXPECT_EQ(ref.data_len(), 4096);
+  EXPECT_EQ(ref.total_len(), 4096);
+  EXPECT_EQ(ref.tailroom(), 9000 - 4096 + 32);
+
+  bess::PacketFree(pkt);
+}
+
 TEST(PacketRefTest, MultiSegmentTraversalAndChainFree) {
   bess::PlainPacketPool pool(16);
   bess::PacketHandle first = pool.Alloc();
@@ -133,6 +154,38 @@ TEST(PacketRefTest, MultiSegmentTraversalAndChainFree) {
 
   // rte_pktmbuf_free walks and returns the complete native chain.
   bess::PacketFree(first);
+}
+
+TEST(PacketPoolTest, AllocCopySupportsPcapSizedChains) {
+  bess::PlainPacketPool pool(8);
+  const size_t len = pool.data_room_size() + 64;
+  std::vector<uint8_t> input(len);
+  for (size_t i = 0; i < input.size(); i++) {
+    input[i] = static_cast<uint8_t>(i);
+  }
+
+  bess::PacketHandle pkt = pool.AllocCopy(input.data(), input.size());
+  ASSERT_NE(pkt, nullptr);
+  EXPECT_EQ(pkt->nb_segs, 2);
+  ASSERT_NE(pkt->next, nullptr);
+  EXPECT_EQ(pkt->data_len, pool.data_room_size());
+  EXPECT_EQ(pkt->next->data_len, 64);
+
+  std::vector<uint8_t> actual(len);
+  const void *read = rte_pktmbuf_read(pkt, 0, len, actual.data());
+  ASSERT_NE(read, nullptr);
+  EXPECT_EQ(std::memcmp(read, input.data(), len), 0);
+
+  bess::PacketFree(pkt);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+TEST(PacketPoolTest, AllocCopyFailureReclaimsPartialChain) {
+  bess::PlainPacketPool pool(2, -1, 64);
+  std::vector<uint8_t> input(129, 0xa5);
+
+  EXPECT_EQ(pool.AllocCopy(input.data(), input.size()), nullptr);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
 }
 
 TEST(PacketCopyTest, CopiesBytesWithoutBessPrivateMetadata) {
@@ -161,13 +214,44 @@ TEST(PacketCopyTest, CopiesBytesWithoutBessPrivateMetadata) {
   bess::PacketFree(src);
 }
 
+TEST(PacketCopyTest, CopiesChainedBytesIntoIndependentSegments) {
+  bess::PlainPacketPool pool(16);
+  const size_t len = pool.data_room_size() + 64;
+  std::vector<uint8_t> input(len);
+  for (size_t i = 0; i < input.size(); i++) {
+    input[i] = static_cast<uint8_t>(0xff - i);
+  }
+
+  bess::PacketHandle src = pool.AllocCopy(input.data(), input.size());
+  ASSERT_NE(src, nullptr);
+  bess::PacketRef(src).metadata<uint32_t *>()[0] = 0xdeadbeef;
+
+  bess::PacketHandle dup = bess::PacketCopy(src);
+  ASSERT_NE(dup, nullptr);
+  EXPECT_EQ(dup->nb_segs, 2);
+  EXPECT_EQ(dup->pkt_len, input.size());
+  EXPECT_NE(dup, src);
+  EXPECT_NE(dup->next, nullptr);
+  EXPECT_NE(dup->buf_addr, src->buf_addr);
+  EXPECT_NE(dup->next->buf_addr, src->next->buf_addr);
+
+  std::vector<uint8_t> actual(len);
+  const void *read = rte_pktmbuf_read(dup, 0, len, actual.data());
+  ASSERT_NE(read, nullptr);
+  EXPECT_EQ(std::memcmp(read, input.data(), len), 0);
+  EXPECT_NE(bess::PacketRef(dup).metadata<uint32_t *>()[0], 0xdeadbeef);
+
+  bess::PacketFree(dup);
+  bess::PacketFree(src);
+}
+
 TEST(PacketPoolTest, AllocationRejectsOversizeAndBulkFailureIsAtomic) {
   bess::PlainPacketPool pool(4);
 
-  EXPECT_EQ(pool.Alloc(SNBUF_DATA + 1), nullptr);
+  EXPECT_EQ(pool.Alloc(pool.data_room_size() + 1), nullptr);
 
   bess::PacketHandle held[4];
-  ASSERT_TRUE(pool.AllocBulk(held, 4, SNBUF_DATA));
+  ASSERT_TRUE(pool.AllocBulk(held, 4, pool.data_room_size()));
 
   bess::PacketHandle extra[1] = {nullptr};
   EXPECT_FALSE(pool.AllocBulk(extra, 1, 0));
@@ -176,10 +260,34 @@ TEST(PacketPoolTest, AllocationRejectsOversizeAndBulkFailureIsAtomic) {
   bess::PacketFreeBulk(held, 4);
 }
 
+TEST(PacketPoolTest, SupportsIndependentPayloadRoomSizes) {
+  bess::PlainPacketPool small_pool(4, -1, 512);
+  bess::PlainPacketPool large_pool(4, -1, 4096);
+
+  EXPECT_EQ(small_pool.data_room_size(), 512u);
+  EXPECT_EQ(large_pool.data_room_size(), 4096u);
+  EXPECT_EQ(rte_pktmbuf_data_room_size(small_pool.pool()),
+            RTE_PKTMBUF_HEADROOM + 512);
+  EXPECT_EQ(rte_pktmbuf_data_room_size(large_pool.pool()),
+            RTE_PKTMBUF_HEADROOM + 4096);
+
+  bess::PacketHandle small = small_pool.Alloc();
+  bess::PacketHandle large = large_pool.Alloc();
+  ASSERT_NE(small, nullptr);
+  ASSERT_NE(large, nullptr);
+  EXPECT_EQ(bess::PacketRef(small).tailroom(), 512);
+  EXPECT_EQ(bess::PacketRef(large).tailroom(), 4096);
+  EXPECT_EQ(small_pool.Alloc(513), nullptr);
+  EXPECT_EQ(large_pool.Alloc(4097), nullptr);
+
+  bess::PacketFree(small);
+  bess::PacketFree(large);
+}
+
 TEST(PacketPoolTest, BulkAllocationInitializesFreshNativeState) {
   bess::PlainPacketPool pool(8);
 
-  EXPECT_TRUE(pool.AllocBulk(nullptr, 0, SNBUF_DATA + 1));
+  EXPECT_TRUE(pool.AllocBulk(nullptr, 0, pool.data_room_size() + 1));
   bess::PacketFreeBulk(nullptr, 0);
 
   bess::PacketHandle pkts[4] = {};
@@ -311,7 +419,7 @@ TEST(PacketOwnershipTest, BulkFreeFallsBackForIndirectClone) {
   ASSERT_NE(original, nullptr);
   ASSERT_NE(bess::PacketRef(original).append(32), nullptr);
 
-  bess::PacketHandle clone = rte_pktmbuf_clone(original, pool.pool());
+  bess::PacketHandle clone = bess::PacketClone(original);
   ASSERT_NE(clone, nullptr);
   EXPECT_FALSE(RTE_MBUF_DIRECT(clone));
   EXPECT_FALSE(bess::detail::PacketFreeBulkRawEligible(&clone, 1));
@@ -362,8 +470,6 @@ void FreeExternalBuffer(void *addr, void *opaque) {
 
 TEST(PacketOwnershipTest, NativeExternalBufferFreeCallbackRuns) {
   bess::PlainPacketPool pool(4);
-  bess::PacketHandle pkt = pool.Alloc();
-  ASSERT_NE(pkt, nullptr);
 
   int free_count = 0;
   auto *buffer = new unsigned char[4096];
@@ -373,8 +479,9 @@ TEST(PacketOwnershipTest, NativeExternalBufferFreeCallbackRuns) {
       buffer, &buffer_len, FreeExternalBuffer, owner);
   ASSERT_NE(shinfo, nullptr);
 
-  rte_pktmbuf_attach_extbuf(pkt, buffer, RTE_BAD_IOVA, buffer_len, shinfo);
-  rte_pktmbuf_reset_headroom(pkt);
+  bess::PacketHandle pkt =
+      pool.AllocExternal(buffer, RTE_BAD_IOVA, buffer_len, shinfo);
+  ASSERT_NE(pkt, nullptr);
   bess::PacketRef ref(pkt);
 
   EXPECT_EQ(ref.head_data<const unsigned char *>(),
@@ -387,6 +494,83 @@ TEST(PacketOwnershipTest, NativeExternalBufferFreeCallbackRuns) {
   EXPECT_FALSE(bess::detail::PacketFreeBulkRawEligible(&pkt, 1));
   bess::PacketFreeBulk(&pkt, 1);
   EXPECT_EQ(free_count, 1);
+}
+
+TEST(PacketCloneTest, DestructionOrderingReleasesSharedStorage) {
+  bess::PlainPacketPool pool(8);
+
+  for (bool free_source_first : {true, false}) {
+    bess::PacketHandle source = pool.Alloc();
+    ASSERT_NE(source, nullptr);
+    ASSERT_NE(bess::PacketRef(source).append(32), nullptr);
+
+    bess::PacketHandle clone = bess::PacketClone(source);
+    ASSERT_NE(clone, nullptr);
+    EXPECT_FALSE(RTE_MBUF_DIRECT(clone));
+    EXPECT_EQ(rte_mbuf_refcnt_read(source), 2);
+    EXPECT_EQ(bess::PacketRef(clone).head_data(), bess::PacketRef(source).head_data());
+
+    if (free_source_first) {
+      bess::PacketFree(source);
+      EXPECT_EQ(pool.Size(), 6);
+      bess::PacketFree(clone);
+    } else {
+      bess::PacketFree(clone);
+      EXPECT_EQ(pool.Size(), 7);
+      bess::PacketFree(source);
+    }
+    EXPECT_EQ(pool.Size(), pool.Capacity());
+  }
+}
+
+TEST(PacketCloneTest, ClonesEverySegmentOfAChain) {
+  bess::PlainPacketPool pool(8);
+  const size_t len = pool.data_room_size() + 64;
+  std::vector<uint8_t> input(len, 0x5a);
+  bess::PacketHandle source = pool.AllocCopy(input.data(), input.size());
+  ASSERT_NE(source, nullptr);
+
+  bess::PacketHandle clone = bess::PacketClone(source);
+  ASSERT_NE(clone, nullptr);
+  ASSERT_NE(clone->next, nullptr);
+  EXPECT_EQ(clone->nb_segs, source->nb_segs);
+  EXPECT_EQ(clone->pkt_len, source->pkt_len);
+  EXPECT_TRUE(RTE_MBUF_CLONED(clone));
+  EXPECT_TRUE(RTE_MBUF_CLONED(clone->next));
+  EXPECT_EQ(rte_mbuf_refcnt_read(source), 2);
+  EXPECT_EQ(rte_mbuf_refcnt_read(source->next), 2);
+  EXPECT_EQ(clone->buf_addr, source->buf_addr);
+  EXPECT_EQ(clone->next->buf_addr, source->next->buf_addr);
+
+  bess::PacketFree(source);
+  EXPECT_EQ(pool.Size(), 4);
+  bess::PacketFree(clone);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+TEST(PacketCloneTest, ExternalBufferCallbackWaitsForLastClone) {
+  bess::PlainPacketPool pool(4);
+  int free_count = 0;
+  auto *buffer = new unsigned char[4096];
+  auto *owner = new ExternalBufferOwner{&free_count};
+  uint16_t buffer_len = 4096;
+  rte_mbuf_ext_shared_info *shinfo = rte_pktmbuf_ext_shinfo_init_helper(
+      buffer, &buffer_len, FreeExternalBuffer, owner);
+  ASSERT_NE(shinfo, nullptr);
+
+  bess::PacketHandle source =
+      pool.AllocExternal(buffer, RTE_BAD_IOVA, buffer_len, shinfo, 64);
+  ASSERT_NE(source, nullptr);
+  bess::PacketHandle clone = bess::PacketClone(source);
+  ASSERT_NE(clone, nullptr);
+  EXPECT_TRUE(RTE_MBUF_HAS_EXTBUF(clone));
+  EXPECT_EQ(rte_mbuf_ext_refcnt_read(shinfo), 2);
+
+  bess::PacketFree(source);
+  EXPECT_EQ(free_count, 0);
+  bess::PacketFree(clone);
+  EXPECT_EQ(free_count, 1);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
 }
 
 }  // namespace

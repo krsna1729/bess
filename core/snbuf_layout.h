@@ -31,10 +31,12 @@
 #ifndef BESS_SNBUFLAYOUT_H_
 #define BESS_SNBUFLAYOUT_H_
 
-/* BESS packet-private and payload sizes.
+/* BESS packet-private and default payload sizes.
  *
- * These are semantic BESS limits, not a C++ object-layout contract. Native
- * rte_mbuf storage supplies the mbuf, private area, and data-room boundaries.
+ * SNBUF_DATA is the historical default payload capacity and remains the
+ * limit for consumers with fixed application-level offset or MTU contracts.
+ * PacketPool data rooms are configurable and may be larger; these values are
+ * not a native mbuf layout contract.
  */
 #define SNBUF_METADATA 128
 #define SNBUF_SCRATCHPAD 64

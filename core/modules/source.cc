@@ -29,6 +29,17 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "source.h"
+#include "../packet_pool.h"
+
+namespace {
+
+size_t ConfiguredPacketDataRoom() {
+  const bess::PacketPool *pool = bess::PacketPool::GetDefaultPool(0);
+  return pool == nullptr ? bess::kDefaultPacketDataSize
+                          : pool->data_room_size();
+}
+
+}  // namespace
 
 const Commands Source::cmds = {
     {"set_pkt_size", "SourceCommandSetPktSizeArg",
@@ -48,8 +59,9 @@ CommandResponse Source::Init(const bess::pb::SourceArg &arg) {
   burst_ = bess::PacketBatch::kMaxBurst;
 
   if (arg.pkt_size() > 0) {
-    if (arg.pkt_size() > SNBUF_DATA) {
-      return CommandFailure(EINVAL, "Invalid packet size");
+    if (arg.pkt_size() > ConfiguredPacketDataRoom()) {
+      return CommandFailure(EINVAL, "Invalid packet size: maximum is %zu",
+                            ConfiguredPacketDataRoom());
     }
     pkt_size_ = arg.pkt_size();
   }
@@ -73,8 +85,9 @@ CommandResponse Source::CommandSetBurst(
 CommandResponse Source::CommandSetPktSize(
     const bess::pb::SourceCommandSetPktSizeArg &arg) {
   uint64_t val = arg.pkt_size();
-  if (val == 0 || val > SNBUF_DATA) {
-    return CommandFailure(EINVAL, "Invalid packet size");
+  if (val == 0 || val > ConfiguredPacketDataRoom()) {
+    return CommandFailure(EINVAL, "Invalid packet size: maximum is %zu",
+                          ConfiguredPacketDataRoom());
   }
   pkt_size_ = val;
   return CommandSuccess();
