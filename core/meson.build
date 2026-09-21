@@ -6,6 +6,7 @@ core_sources = files(
   'control/control_error.cc',
   'control/control_plane.cc',
   'control/runtime_state.cc',
+  'control/worker_manager.cc',
   'debug.cc',
   'dpdk.cc',
   'event.cc',

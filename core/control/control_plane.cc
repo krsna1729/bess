@@ -29,6 +29,8 @@
 
 #include "control/control_plane.h"
 
+#include "control/worker_manager.h"
+
 #include <memory>
 
 #include <cerrno>
@@ -433,12 +435,12 @@ ControlResult<void> ControlPlane::DestroyWorker(uint64_t wid) {
   if (wid >= Worker::kMaxWorkers) {
     return std::unexpected(Err(EINVAL, "Invalid worker id"));
   }
-  Worker* worker = workers[wid];
+  Worker* worker = runtime().workers().Get(wid);
   if (!worker) {
     return std::unexpected(Err(ENOENT, "Worker %d is not active", static_cast<int>(wid)));
   }
 
-  bess::TrafficClass* root = workers[wid]->scheduler()->root();
+  bess::TrafficClass* root = worker->scheduler()->root();
   if (root) {
     for (const auto& it : TrafficClassBuilder::all_tcs()) {
       bess::TrafficClass* c = it.second.get();
@@ -688,12 +690,13 @@ ControlPlane::CheckSchedulingConstraints() {
   // Check constraints around chains run by each worker. This checks that
   // global constraints are met.
   for (int i = 0; i < Worker::kMaxWorkers; i++) {
-    if (workers[i] == nullptr) {
+    Worker* worker = runtime().workers().Get(i);
+    if (worker == nullptr) {
       continue;
     }
-    int socket = 1ull << workers[i]->socket();
-    int core = workers[i]->core();
-    bess::TrafficClass* root = workers[i]->scheduler()->root();
+    int socket = 1ull << worker->socket();
+    int core = worker->core();
+    bess::TrafficClass* root = worker->scheduler()->root();
 
     for (const auto& tc_pair : TrafficClassBuilder::all_tcs()) {
       bess::TrafficClass* c = tc_pair.second.get();
@@ -704,9 +707,8 @@ ControlPlane::CheckSchedulingConstraints() {
           LOG(WARNING) << "Scheduler constraints are violated for wid " << i
                        << " socket " << socket << " constraint "
                        << constraints;
-          report.violations.push_back(
-              SchedulingConstraintViolation{c->name(), constraints,
-                                            workers[i]->socket(), core});
+          report.violations.push_back(SchedulingConstraintViolation{
+              c->name(), constraints, worker->socket(), core});
         }
       }
     }
@@ -784,9 +786,10 @@ ControlResult<void> ControlPlane::AttachTc(bess::TrafficClass* c_,
                                  Worker::kAnyWorker, Worker::kMaxWorkers - 1));
     }
 
+    int active_workers = runtime().workers().num_workers();
     if ((wid != Worker::kAnyWorker && !is_worker_active(wid)) ||
-        (wid == Worker::kAnyWorker && num_workers == 0)) {
-      if (num_workers == 0 && (wid == 0 || wid == Worker::kAnyWorker)) {
+        (wid == Worker::kAnyWorker && active_workers == 0)) {
+      if (active_workers == 0 && (wid == 0 || wid == Worker::kAnyWorker)) {
         launch_worker(0, FLAGS_c);
       } else {
         return std::unexpected(Err(EINVAL, "worker:%d does not exist", static_cast<int>(wid)));

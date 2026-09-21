@@ -154,10 +154,6 @@ static_assert(std::is_trivially_destructible<Worker>::value,
 
 // TODO: C++-ify
 
-extern int num_workers;
-extern std::thread worker_threads[Worker::kMaxWorkers];
-extern Worker *volatile workers[Worker::kMaxWorkers];
-
 /* ------------------------------------------------------------------------
  * functions below are invoked by non-worker threads (the master)
  * ------------------------------------------------------------------------ */
@@ -192,13 +188,9 @@ bool is_any_worker_running();
 
 int is_cpu_present(unsigned int core_id);
 
-static inline int is_worker_active(int wid) {
-  return workers[wid] != nullptr;
-}
+int is_worker_active(int wid);
 
-inline bool is_worker_running(int wid) {
-  return workers[wid] && workers[wid]->status() == WORKER_RUNNING;
-}
+bool is_worker_running(int wid);
 
 // arg (int) is the core id the worker should run on, and optionally the
 // scheduler to use.

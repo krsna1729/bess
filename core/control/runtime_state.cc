@@ -35,6 +35,7 @@
 
 #include "module.h"
 #include "port.h"
+#include "control/worker_manager.h"
 #include "traffic_class.h"
 #include "utils/common.h"
 
@@ -238,6 +239,14 @@ void TrafficClassRegistry::ReleaseAll() {
 // ---------------------------------------------------------------------------
 // RuntimeState
 // ---------------------------------------------------------------------------
+
+RuntimeState::RuntimeState() : workers_(std::make_unique<WorkerManager>()) {}
+
+RuntimeState::~RuntimeState() = default;
+
+WorkerManager &RuntimeState::workers() {
+  return *workers_;
+}
 
 RuntimeState &RuntimeState::Get() {
   static RuntimeState state;

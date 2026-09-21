@@ -45,6 +45,8 @@ class TrafficClass;
 
 namespace control {
 
+class WorkerManager;
+
 // Mutable instance state has an owner.
 //
 // The builders (`ModuleBuilder`, `PortBuilder`, `GateHookBuilder`,
@@ -182,16 +184,19 @@ class RuntimeState {
   PortRegistry &ports() { return ports_; }
   ModuleRegistry &modules() { return modules_; }
   TrafficClassRegistry &traffic_classes() { return traffic_classes_; }
+  WorkerManager &workers();
 
   RuntimeState(const RuntimeState &) = delete;
   RuntimeState &operator=(const RuntimeState &) = delete;
 
  private:
-  RuntimeState() = default;
+  RuntimeState();
+  ~RuntimeState();
 
   PortRegistry ports_;
   ModuleRegistry modules_;
   TrafficClassRegistry traffic_classes_;
+  std::unique_ptr<WorkerManager> workers_;
 };
 
 // Accessor for code that needs the runtime it is operating in. Module

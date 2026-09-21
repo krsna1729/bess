@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <sstream>
 
+#include "control/worker_manager.h"
 #include "gate.h"
 #include "module_graph.h"
 #include "scheduler.h"
@@ -233,7 +234,8 @@ CheckConstraintResult Module::CheckModuleConstraints() const {
 
   for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
     if (active_workers_[wid]) {
-      placement_constraint socket = 1ull << workers[wid]->socket();
+      placement_constraint socket =
+          1ull << bess::control::runtime().workers().Get(wid)->socket();
       if ((socket & node_constraints_) == 0) {
         LOG(ERROR) << "Worker wid " << wid
                    << " does not meet placement constraints for module "
@@ -399,7 +401,7 @@ void Module::DestroyAllTasks() {
 
     int wid = c->WorkerId();
     if (wid >= 0) {
-      bess::Scheduler *s = workers[wid]->scheduler();
+      bess::Scheduler *s = bess::control::runtime().workers().Get(wid)->scheduler();
       s->wakeup_queue().Remove(c);
     }
 

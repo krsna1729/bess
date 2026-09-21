@@ -32,6 +32,7 @@
 
 #include <glog/logging.h>
 
+#include "control/worker_manager.h"
 #include "gate.h"
 #include "gate_hooks/track.h"
 #include "module.h"
@@ -181,7 +182,7 @@ void ModuleGraph::SetUniqueGateIdx() {
 
 void ModuleGraph::ConfigureTasks() {
   for (int i = 0; i < Worker::kMaxWorkers; i++) {
-    if (workers[i] == nullptr) {
+    if (bess::control::runtime().workers().Get(i) == nullptr) {
       continue;
     }
 
@@ -388,10 +389,11 @@ void ModuleGraph::PropagateActiveWorker() {
     m->ResetActiveWorkerSet();
   }
   for (int i = 0; i < Worker::kMaxWorkers; i++) {
-    if (workers[i] == nullptr) {
+    if (bess::control::runtime().workers().Get(i) == nullptr) {
       continue;
     }
-    if (bess::TrafficClass *root = workers[i]->scheduler()->root()) {
+    if (bess::TrafficClass *root =
+            bess::control::runtime().workers().Get(i)->scheduler()->root()) {
       for (const auto &tc_pair : bess::TrafficClassBuilder::all_tcs()) {
         bess::TrafficClass *c = tc_pair.second.get();
         if (c->policy() == bess::POLICY_LEAF && c->Root() == root) {

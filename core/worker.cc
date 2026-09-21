@@ -51,6 +51,8 @@
 #include "opts.h"
 #include "packet_pool.h"
 #include "resume_hook.h"
+#include "control/runtime_state.h"
+#include "control/worker_manager.h"
 #include "resume_hooks/metadata.h"
 #include "scheduler.h"
 #include "utils/random.h"
@@ -60,24 +62,14 @@ using bess::DefaultScheduler;
 using bess::ExperimentalScheduler;
 using bess::Scheduler;
 
-int num_workers = 0;
-std::thread worker_threads[Worker::kMaxWorkers];
-Worker *volatile workers[Worker::kMaxWorkers];
 
 using bess::TrafficClassBuilder;
 using namespace bess::traffic_class_initializer_types;
 using bess::ResumeHookBuilder;
 
-std::list<std::pair<int, bess::TrafficClass *>> orphan_tcs;
 
 // See worker.h
 __thread Worker current_worker;
-
-struct thread_arg {
-  int wid;
-  int core;
-  Scheduler *scheduler;
-};
 
 #define SYS_CPU_DIR "/sys/devices/system/cpu/cpu%u"
 #define CORE_ID_FILE "topology/core_id"
@@ -96,161 +88,76 @@ int is_cpu_present(unsigned int core_id) {
   return 1;
 }
 
+int is_worker_active(int wid) {
+  return bess::control::runtime().workers().IsActive(wid);
+}
+
 int is_worker_core(int cpu) {
-  int wid;
-
-  for (wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    if (is_worker_active(wid) && workers[wid]->core() == cpu)
-      return 1;
-  }
-
-  return 0;
+  return bess::control::runtime().workers().IsCoreUsed(cpu);
 }
 
 void pause_worker(int wid) {
-  if (workers[wid] && workers[wid]->status() == WORKER_RUNNING) {
-    workers[wid]->set_status(WORKER_PAUSING);
-
-    FULL_BARRIER();
-
-    while (workers[wid]->status() == WORKER_PAUSING) {
-    } /* spin */
-  }
+  bess::control::runtime().workers().Pause(wid);
 }
 
 void pause_all_workers() {
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++)
-    pause_worker(wid);
+  bess::control::runtime().workers().PauseAll();
 }
-
-enum class worker_signal : uint64_t {
-  unblock = 1,
-  quit,
-};
 
 void resume_worker(int wid) {
-  if (workers[wid] && workers[wid]->status() == WORKER_PAUSED) {
-    int ret;
-    worker_signal sig = worker_signal::unblock;
-
-    ret = write(workers[wid]->fd_event(), &sig, sizeof(sig));
-    CHECK_EQ(ret, sizeof(uint64_t));
-
-    while (workers[wid]->status() == WORKER_PAUSED) {
-    } /* spin */
-  }
-}
-
-/*!
- * Attach orphan TCs to workers. Note this does not ensure optimal placement.
- * This method can only be called when all workers are paused.
- */
-void attach_orphans() {
-  CHECK(!is_any_worker_running());
-  // Distribute all orphan TCs to workers.
-  for (const auto &tc : orphan_tcs) {
-    bess::TrafficClass *c = tc.second;
-    if (c->parent()) {
-      continue;
-    }
-
-    Worker *w;
-
-    int wid = tc.first;
-    if (wid == Worker::kAnyWorker || workers[wid] == nullptr) {
-      w = get_next_active_worker();
-    } else {
-      w = workers[wid];
-    }
-
-    w->scheduler()->AttachOrphan(c, w->wid());
-  }
-
-  orphan_tcs.clear();
+  bess::control::runtime().workers().Resume(wid);
 }
 
 void resume_all_workers() {
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    if (workers[wid]) {
-      workers[wid]->scheduler()->AdjustDefault();
-    }
-  }
+  bess::control::runtime().workers().ResumeAll();
+}
 
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    resume_worker(wid);
-  }
+void attach_orphans() {
+  bess::control::runtime().workers().AttachOrphans();
 }
 
 void destroy_worker(int wid) {
-  pause_worker(wid);
-
-  if (workers[wid] && workers[wid]->status() == WORKER_PAUSED) {
-    int ret;
-    worker_signal sig = worker_signal::quit;
-
-    ret = write(workers[wid]->fd_event(), &sig, sizeof(sig));
-    CHECK_EQ(ret, sizeof(uint64_t));
-
-    while (workers[wid]->status() == WORKER_PAUSED) {
-    } /* spin */
-
-    // Wait for the OS thread to fully exit -- not just for status_ to
-    // have left WORKER_PAUSED, which happens earlier, inside
-    // BlockWorker() -- before returning. Worker::Run()'s teardown
-    // (`delete scheduler_`) recursively destroys the TC tree, and every
-    // ~TrafficClass calls TrafficClassBuilder::Clear(), which mutates the
-    // *global, unsynchronized* std::unordered_map
-    // TrafficClassBuilder::all_tcs_ (see traffic_class.cc). Without this
-    // join, the caller (e.g. destroy_all_workers(), or ResetAll's
-    // subsequent ResetTcs() which calls all_tcs_.clear()) could run
-    // concurrently with that teardown still executing on the worker
-    // thread -- a real, unsynchronized concurrent-mutation race on that
-    // map, not merely a benign timing quirk. This join serializes it.
-    worker_threads[wid].join();
-
-    workers[wid] = nullptr;
-
-    num_workers--;
-  }
-
-  if (num_workers > 0) {
-    return;
-  }
-
-  auto &hooks = bess::global_resume_hooks;
-  for (auto it = hooks.begin(); it != hooks.end();) {
-    if ((*it)->is_default()) {
-      it++;
-    } else {
-      it = hooks.erase(it);
-    }
-  }
+  bess::control::runtime().workers().Destroy(wid);
 }
 
 void destroy_all_workers() {
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    destroy_worker(wid);
-  }
+  bess::control::runtime().workers().DestroyAll();
 }
 
 void detach_all_worker_threads() {
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    if (worker_threads[wid].joinable()) {
-      worker_threads[wid].detach();
-    }
-  }
+  bess::control::runtime().workers().DetachAllThreads();
 }
 
 bool is_any_worker_running() {
-  int wid;
+  return bess::control::runtime().workers().AnyRunning();
+}
 
-  for (wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    if (is_worker_running(wid)) {
-      return true;
-    }
-  }
+bool is_worker_running(int wid) {
+  return bess::control::runtime().workers().IsRunning(wid);
+}
 
-  return false;
+void launch_worker(int wid, int core, const std::string &scheduler) {
+  bess::control::runtime().workers().Launch(wid, core, scheduler);
+}
+
+Worker *get_next_active_worker() {
+  return bess::control::runtime().workers().NextActive();
+}
+
+void add_tc_to_orphan(bess::TrafficClass *c, int wid) {
+  bess::control::runtime().workers().AddOrphan(c, wid);
+}
+
+bool remove_tc_from_orphan(bess::TrafficClass *c) {
+  return bess::control::runtime().workers().RemoveOrphan(c);
+}
+
+const std::list<std::pair<int, bess::TrafficClass *>> &list_orphan_tcs() {
+  return bess::control::runtime().workers().orphan_tcs();
+}
+
+bool detach_tc(bess::TrafficClass *c) {
+  return bess::control::runtime().workers().DetachTc(c);
 }
 
 void Worker::SetNonWorker() {
@@ -275,7 +182,7 @@ void Worker::SetNonWorker() {
 }
 
 int Worker::BlockWorker() {
-  worker_signal t;
+  bess::control::worker_signal t;
   int ret;
 
   status_ = WORKER_PAUSED;
@@ -283,12 +190,12 @@ int Worker::BlockWorker() {
   ret = read(fd_event_, &t, sizeof(t));
   CHECK_EQ(ret, sizeof(t));
 
-  if (t == worker_signal::unblock) {
+  if (t == bess::control::worker_signal::unblock) {
     status_ = WORKER_RUNNING;
     return 0;
   }
 
-  if (t == worker_signal::quit) {
+  if (t == bess::control::worker_signal::quit) {
     status_ = WORKER_FINISHED;
     return 1;
   }
@@ -299,7 +206,7 @@ int Worker::BlockWorker() {
 
 /* The entry point of worker threads */
 void *Worker::Run(void *_arg) {
-  struct thread_arg *arg = (struct thread_arg *)_arg;
+  bess::control::WorkerThreadArg *arg = (bess::control::WorkerThreadArg *)_arg;
   rand_ = new Random();
 
   cpu_set_t set;
@@ -369,8 +276,7 @@ void *Worker::Run(void *_arg) {
 
   STORE_BARRIER();
 
-  workers[wid_] = this;  // FIXME: consider making workers a static member
-                         // instead of a global
+  bess::control::runtime().workers().Publish(wid_, this);
 
   LOG(INFO) << "Worker " << wid_ << "(" << this << ") "
             << "is running on core " << core_ << " (socket " << socket_
@@ -392,133 +298,6 @@ void *Worker::Run(void *_arg) {
   rte_thread_unregister();
 
   return nullptr;
-}
-
-void *run_worker(void *_arg) {
-  // current_worker (a __thread/TLS object) should always start zeroed for
-  // a brand new OS thread -- glibc zeroes .tbss-backed TLS synchronously
-  // inside pthread_create(), before the new thread runs a single
-  // instruction, so this is NOT a TLS-reuse timing question. If this
-  // fires, either a real bug wrote to this thread's current_worker before
-  // it got here (which shouldn't be reachable: run_worker() is the
-  // thread's entry point), or -- more plausibly given destroy_worker()'s
-  // join() above exists specifically to prevent concurrent mutation of
-  // TrafficClassBuilder::all_tcs_ during worker teardown -- heap
-  // corruption from that same class of race elsewhere landed on this
-  // block. Either way this is not a condition to silently paper over:
-  // Worker::Run() also never (re)initializes silent_drops_/current_ns_,
-  // so a non-pristine block would otherwise leak stale values into
-  // reported stats forever. Reset explicitly (so the daemon doesn't go
-  // down over it), but log loudly with the actual stale/expected values
-  // so this is diagnosable if it ever fires again.
-  const Worker kZeroWorker{};
-  if (memcmp(&current_worker, &kZeroWorker, sizeof(Worker)) != 0) {
-    const auto *arg = static_cast<const struct thread_arg *>(_arg);
-    LOG(ERROR) << "current_worker was not pristine at the start of worker "
-               << arg->wid << " (core " << arg->core
-               << ") -- resetting. Stale values: wid=" << current_worker.wid()
-               << " core=" << current_worker.core()
-               << " socket=" << current_worker.socket()
-               << " fd_event=" << current_worker.fd_event();
-    memset(&current_worker, 0, sizeof(Worker));
-  }
-  return current_worker.Run(_arg);
-}
-
-void launch_worker(int wid, int core,
-                   [[maybe_unused]] const std::string &scheduler) {
-  struct thread_arg arg = {.wid = wid, .core = core, .scheduler = nullptr};
-  if (scheduler == "") {
-    arg.scheduler = new DefaultScheduler();
-  } else if (scheduler == "experimental") {
-    arg.scheduler = new ExperimentalScheduler();
-  } else {
-    CHECK(false) << "Scheduler " << scheduler << " is invalid.";
-  }
-
-  // std::thread::operator= calls std::terminate() if the target is still
-  // joinable. That should be impossible here -- destroy_worker() always
-  // joins this wid's thread before clearing workers[wid], and
-  // detach_all_worker_threads() (called once, at daemon shutdown) detaches
-  // any thread still joinable at that point -- but if that invariant is
-  // ever violated by a future change, better to CHECK loudly here than to
-  // let the assignment below abort the daemon with a bare "terminate
-  // called" and no context.
-  CHECK(!worker_threads[wid].joinable())
-      << "worker_threads[" << wid << "] is still joinable; "
-      << "destroy_worker() must join it before this wid can be reused.";
-  worker_threads[wid] = std::thread(run_worker, &arg);
-  // Not detached: destroy_worker() joins this thread on teardown to
-  // serialize it against concurrent mutation of the global
-  // TrafficClassBuilder::all_tcs_ map during ~Scheduler's TC-tree
-  // destruction (see the comment in destroy_worker() above). This means a
-  // worker thread stays joinable, not detached, until destroy_worker()
-  // (or detach_all_worker_threads() at shutdown) handles it.
-  INST_BARRIER();
-
-  /* spin until it becomes ready and fully paused */
-  while (!is_worker_active(wid) || workers[wid]->status() != WORKER_PAUSED) {
-    continue;
-  }
-
-  num_workers++;
-}
-
-Worker *get_next_active_worker() {
-  static int prev_wid = 0;
-  if (num_workers == 0) {
-    launch_worker(0, FLAGS_c);
-    return workers[0];
-  }
-
-  while (!is_worker_active(prev_wid)) {
-    prev_wid = (prev_wid + 1) % Worker::kMaxWorkers;
-  }
-
-  Worker *ret = workers[prev_wid];
-  prev_wid = (prev_wid + 1) % Worker::kMaxWorkers;
-  return ret;
-}
-
-void add_tc_to_orphan(bess::TrafficClass *c, int wid) {
-  orphan_tcs.emplace_back(wid, c);
-}
-
-bool remove_tc_from_orphan(bess::TrafficClass *c) {
-  for (auto it = orphan_tcs.begin(); it != orphan_tcs.end();) {
-    if (it->second == c) {
-      orphan_tcs.erase(it);
-      return true;
-    } else {
-      it++;
-    }
-  }
-
-  return false;
-}
-
-const std::list<std::pair<int, bess::TrafficClass *>> &list_orphan_tcs() {
-  return orphan_tcs;
-}
-
-bool detach_tc(bess::TrafficClass *c) {
-  bess::TrafficClass *parent = c->parent();
-  if (parent) {
-    return parent->RemoveChild(c);
-  }
-
-  // Try to remove from root of one of the schedulers
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    if (workers[wid]) {
-      bool found = workers[wid]->scheduler()->RemoveRoot(c);
-      if (found) {
-        return true;
-      }
-    }
-  }
-
-  // Try to remove from orphan_tcs
-  return remove_tc_from_orphan(c);
 }
 
 WorkerPauser::WorkerPauser() {

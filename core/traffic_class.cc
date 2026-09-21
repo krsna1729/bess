@@ -33,6 +33,7 @@
 #include <cinttypes>
 #include <string>
 
+#include "control/worker_manager.h"
 #include "opts.h"
 #include "scheduler.h"
 #include "utils/common.h"
@@ -54,7 +55,8 @@ int TrafficClass::WorkerId() const {
     if (!is_worker_active(wid))
       continue;
 
-    if (workers[wid]->scheduler()->root() == Root()) {
+    if (bess::control::runtime().workers().Get(wid)->scheduler()->root() ==
+        Root()) {
       return wid;
     }
   }

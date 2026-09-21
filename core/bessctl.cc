@@ -45,6 +45,7 @@
 #pragma GCC diagnostic pop
 
 #include "control/control_plane.h"
+#include "control/worker_manager.h"
 #include "bessd.h"
 #include "gate.h"
 #include "gate_hooks/tcpdump.h"
@@ -323,9 +324,10 @@ class BESSControlImpl final : public BESSControl::Service {
       ListWorkersResponse_WorkerStatus* status = response->add_workers_status();
       status->set_wid(wid);
       status->set_running(is_worker_running(wid));
-      status->set_core(workers[wid]->core());
-      status->set_num_tcs(workers[wid]->scheduler()->NumTcs());
-      status->set_silent_drops(workers[wid]->silent_drops());
+      Worker* worker = bess::control::runtime().workers().Get(wid);
+      status->set_core(worker->core());
+      status->set_num_tcs(worker->scheduler()->NumTcs());
+      status->set_silent_drops(worker->silent_drops());
     }
     return Status::OK;
   }
