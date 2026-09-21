@@ -2906,13 +2906,16 @@ update, versus today's full stop.
 
 ## 9. Phase G0 — C++ transactional control-plane core — NEXT
 
-This is the next major architecture surgery.
+This is the next major architecture surgery, and the first item in the active
+order of work.
 
 The goal is **not** "make every client C++".
 
 The goal is:
 
-> BESS-specific validation, planning, resource ordering, pause/RCU decisions, rollback, generation management, and commit semantics live in C++ inside `bessd`. Go/C++/other SDKs are thin typed bindings.
+> BESS-specific validation, planning, resource ordering, pause/RCU decisions,
+> rollback, generation management, and commit semantics live in C++ inside
+> `bessd`. Go/C++/other SDKs are thin typed bindings.
 
 Current BESS exposes many imperative RPCs:
 
@@ -2925,11 +2928,8 @@ AddTc
 ...
 ```
 
-and explicit pause/resume operations.
-
-That makes the client an orchestration engine.
-
-A client can currently reach states like:
+and explicit pause/resume operations, so the client is an orchestration engine
+and can reach partial states like:
 
 ```text
 CreatePort A       ✓
@@ -2940,7 +2940,47 @@ CreateModule Y     ✗
 client must somehow repair partial state
 ```
 
-That is the architectural problem to remove.
+The invariant G0 establishes:
+
+> The daemon owns resource dependency ordering and transaction semantics. A
+> client describes the requested state or transaction; it never performs BESS
+> rollback itself.
+
+Target shape:
+
+```text
+gRPC / future Go SDK / future C++ SDK
+                 │
+                 ▼
+          protocol adapters
+                 │
+                 ▼
+        C++ ControlPlane
+                 │
+      ┌──────────┼───────────┐
+      │          │           │
+   Validate     Diff        Plan
+                             │
+                             ▼
+                    Transaction engine
+                             │
+                   Prepare → Commit
+                             │
+                         Rollback
+                             │
+                             ▼
+                       RuntimeState
+                             │
+                             ▼
+                         dataplane
+```
+
+Baseline for the work: `e8c8e17684115e71ff9727134b5eb6e346db175b`.
+
+This is an architectural rewrite. Do not preserve the current RPC-handler-centric
+control architecture merely for compatibility: at the end of G0, `core/bessctl.cc`
+primarily translates protobuf requests/responses and no longer owns BESS
+resource lifecycle semantics.
 
 ### 9.1 Extract a real ControlPlane subsystem
 
@@ -2949,112 +2989,482 @@ That is the architectural problem to remove.
 - gRPC adapter; and
 - BESS control business logic.
 
-Target shape:
+Suggested tree (logical boundaries matter more than exact filenames; do not
+over-fragment tiny files to match it):
 
 ```text
-gRPC
-  │
-  ▼
-FromProto
-  │
-  ▼
-C++ ControlPlane
-  │
-  ├── validation
-  ├── diff
-  ├── planning
-  ├── preparation
-  ├── commit
-  ├── rollback/abort
-  └── generation management
-  │
-  ▼
-BESS runtime
+core/control/
+    control_plane.{h,cc}
+    runtime_state.{h,cc}
+    pipeline_spec.{h,cc}
+    pipeline_snapshot.{h,cc}
+    pipeline_validator.{h,cc}
+    pipeline_diff.{h,cc}
+    pipeline_plan.{h,cc}
+    transaction.{h,cc}
+    control_error.h
 ```
 
-The RPC layer should become a thin protocol adapter.
+Use C++23 where it improves the control plane — in particular
+`std::expected`. The internal C++ layer must not require callers to inspect
+protobuf `Error` messages:
 
-A useful internal shape is conceptually:
+```cpp
+struct ControlError {
+  int code;
+  std::string message;
+  std::string object;
+  std::string field;
+};
+
+template <typename T>
+using ControlResult = std::expected<T, ControlError>;
+```
+
+One internal error model, with codes such as:
+
+```cpp
+enum class ControlErrorCode {
+  InvalidArgument,
+  NotFound,
+  AlreadyExists,
+  Conflict,
+  ResourceBusy,
+  UnsupportedTransaction,
+  ResourceFailure,
+  Internal,
+};
+```
+
+It may preserve an `errno` where useful; the RPC adapters translate it to the
+existing protobuf error fields for now. Do not propagate random combinations of
+`errno`, protobuf errors, `CommandResponse`, `LOG(ERROR)` and `nullptr` through
+the new control layer.
+
+Consequences for the RPC layer:
+
+- handlers become thin adapters: protobuf request → C++ spec/request →
+  `ControlPlane` call → protobuf response;
+- handlers never call other handlers — composition moves into `ControlPlane`
+  (this is what lets the service drop its `std::recursive_mutex` for a plain
+  single-writer lock owned by the control plane);
+- `ResetAll()` becomes one C++ operation (`ControlPlane::Reset()`, or
+  `ApplyPipeline(empty_pipeline)` if the semantics match), not an internal
+  fan-out over other RPCs;
+- legacy imperative RPCs stay, but each becomes a **one-operation transaction**
+  (validate → apply → generation bump), so old clients inherit the new internal
+  correctness;
+- `ApplyPipeline()` and `GetPipeline()` exist in C++ first and do not need to be
+  public gRPC yet — tests call them directly.
 
 ```cpp
 class ControlPlane {
  public:
-  ValidationResult ValidatePipeline(const PipelineSpec &desired);
-  DiffResult DiffPipeline(const PipelineSpec &desired);
-  PlanResult PlanPipeline(const PipelineSpec &desired);
-  ApplyResult ApplyPipeline(const ApplyRequest &request);
+  ControlResult<ValidatedPipeline> Validate(const PipelineSpec &desired) const;
+  PipelineDiff Diff(const PipelineSnapshot &current, const ValidatedPipeline &desired);
+  PipelinePlan Plan(...);
 
+  ControlResult<ApplyResult> ApplyPipeline(const PipelineSpec &desired,
+                                           const ApplyOptions &options);
   PipelineSnapshot GetPipeline() const;
 };
 ```
 
-Do not commit to exact names before inspecting current object ownership, but preserve the separation of concerns.
+For G0, one control-plane writer at a time is entirely acceptable; do not try to
+make multiple concurrent writers lock-free.
 
-### 9.2 PipelineSpec / desired-state IR
-
-Introduce an internal desired-state representation for structural BESS configuration:
+Transaction logging carries a transaction ID for diagnostics (never per packet):
 
 ```text
-PipelineSpec
-  ├── workers
-  ├── ports
-  ├── modules
-  ├── connections
-  └── traffic classes
+tx=128 generation=42 desired_objects=17
+tx=128 validated / prepared / pause_workers / commit
+tx=128 generation=43
+tx=128 retire complete
+tx=129 prepare failed object=port:p0 ...
+tx=129 aborted active_generation=43
 ```
 
-Later it can reference generic mutable dataplane resources, but G0 should not invent APIs for resources that do not exist yet.
+Add introspection sufficient to inspect current generation, last successful
+transaction, last failed transaction, and current resource counts. This can
+start as C++/log/test-visible; the external telemetry API is not G0.
 
-This IR is the thing validated and planned.
+### 9.2 RuntimeState: explicit ownership of mutable instance state
 
-It is not merely a protobuf message passed directly into constructors.
+Two fundamentally different kinds of global state must be separated.
 
-### 9.3 Apply semantics
+**Keep process-global type registries** — these are registration metadata
+describing available types, not per-pipeline mutable runtime state:
 
-Target:
+```text
+ModuleBuilder::all_module_builders()
+PortBuilder::all_port_builders()
+GateHookBuilder::all_gate_hook_builders()
+ResumeHook registrations
+```
+
+**Remove mutable instance registries from builder/global ownership.** Today
+runtime state is spread across statics/globals:
+
+```text
+ModuleGraph::all_modules_
+ModuleGraph::tasks_
+PortBuilder::all_ports_
+TrafficClassBuilder::all_tcs_
+workers[]
+worker_threads[]
+num_workers
+orphan_tcs
+```
+
+That shape makes staging, snapshotting, testing and transactions unnecessarily
+difficult. Introduce an explicit runtime-state owner:
+
+```text
+RuntimeState
+  ├── ModuleRegistry          (module instances, graph connectivity, task membership)
+  ├── PortRegistry            (port instances)
+  ├── TrafficClassRegistry    (TC instances / hierarchy)
+  ├── WorkerManager           (workers, worker threads)
+  └── generation
+```
+
+The important property is: **mutable instance state has an owner**. Do not create
+a new collection of unrelated singleton managers that merely rename today's
+globals.
+
+Ownership rules:
+
+- use RAII and `std::unique_ptr<T>` for control-plane ownership;
+- do not introduce `shared_ptr` into the packet path;
+- raw pointers remain reasonable as non-owning dataplane references whose
+  lifetime is guaranteed by the active runtime generation;
+- the owner removes an object from its registry; **a destructor must not mutate
+  a global registry** (`TrafficClass` destruction currently mutates
+  `TrafficClassBuilder::all_tcs_` via destructor callbacks — that pattern is
+  hostile to transactions and has already contributed to concurrency problems,
+  and it must go with the introduction of `TrafficClassRegistry`);
+- `WorkerManager` owns worker lifecycle behind one explicit manager
+  (`Add`/`Remove`/`Get`/`PauseAll`/`ResumeAll`/`AnyRunning`), internally free to
+  keep fixed-size `std::array` storage; the public global `workers[]` must not
+  remain the architectural API. Packet/runtime code that needs its current
+  worker keeps using the existing worker/TLS mechanisms — this is about
+  management ownership, not new packet-path lookups;
+- modules resolve mutable runtime objects during **initialization** through a
+  narrow context (`ModuleInitContext` with `ports()`, `traffic_classes()`, …, or
+  `Module::runtime()`), not through `PortBuilder::all_ports()`-style globals.
+  Never pass `RuntimeState` through packet-processing calls — this is
+  control/initialization context, not packet-path context;
+- `ModuleGraph` splits its responsibilities (runtime module registry, topology,
+  task membership, gate-ID computation, task-graph propagation) as needed, but
+  the requirement is only that **one active `RuntimeState` clearly owns module
+  lifetime and graph state**;
+- graph recomputation (`UpdateTaskGraph`, `SetUniqueGateIdx`, `ConfigureTasks`,
+  `changes_made_`) operates on the candidate/active runtime object explicitly
+  (`runtime.graph().Recompute()`), never through process-global dirty flags, and
+  any recomputation failure happens **before** publication;
+- `Module::RegisterTask()` must stop being a hidden global side effect: module
+  task creation, TC creation, orphan registration and worker attachment get
+  explicit ownership and rollback behavior (ideal direction: module owns the
+  `Task`, the runtime/TC registry owns the scheduling node, the transaction
+  attaches scheduling state);
+- `Port::AcquireQueues()` / `Port::ReleaseQueues()` get explicit rollback
+  correctness: a failed module init or transaction rollback must never leave
+  `users[dir][qid]` pointing at a dead module.
+
+### 9.3 PipelineSpec / desired-state IR
+
+Introduce an internal desired-state representation for structural BESS
+configuration. Protobuf is not the in-process domain model.
+
+```cpp
+struct PortSpec {
+  std::string name;
+  std::string driver;
+  uint16_t num_rx_queues;
+  uint16_t num_tx_queues;
+  size_t rx_queue_size;
+  size_t tx_queue_size;
+  google::protobuf::Any driver_arg;
+  Port::Conf conf;
+};
+
+struct ModuleSpec {
+  std::string name;
+  std::string mclass;
+  google::protobuf::Any arg;
+};
+
+struct ConnectionSpec {
+  std::string upstream;
+  gate_idx_t ogate;
+  std::string downstream;
+  gate_idx_t igate;
+  bool skip_default_hooks;
+};
+
+struct WorkerSpec {
+  int wid;
+  int core;
+  std::string scheduler;
+};
+
+struct PipelineSpec {
+  std::vector<PortSpec> ports;
+  std::vector<ModuleSpec> modules;
+  std::vector<ConnectionSpec> connections;
+  std::vector<WorkerSpec> workers;
+  std::vector<TrafficClassSpec> traffic_classes;
+};
+```
+
+The TC representation must capture hierarchy cleanly — prefer explicit parent
+references or a tree over duplicating today's awkward mutation RPC model.
+
+Naming rule: `PipelineSpec` requires **explicit stable names**. Legacy
+`CreateModule(name="")` may still generate a name; desired state may not, because
+diff, reapply, idempotency, diagnostics and generation comparisons all depend on
+desired-state identity.
+
+G0 does not invent APIs for K-subsystem resources that do not exist yet.
+
+### 9.4 PipelineSnapshot
+
+The active runtime must serialize into a deterministic structural snapshot
+describing ports, modules, connections, workers, traffic classes and generation:
+
+```cpp
+PipelineSnapshot ControlPlane::Snapshot() const;
+```
+
+Rules:
+
+- no transient statistics;
+- no worker paused/running transitions as desired-state config unless
+  deliberately justified;
+- stable ordering; no pointer addresses; no unordered-map iteration order
+  leaking into output; normalized defaults.
+
+It is the basis for `GetPipeline`, diffing, tests and future SDK introspection.
+A successful apply must normalize back to the requested desired state:
+
+```text
+Apply(A)
+GetPipeline()
+normalize(result) == normalize(A)
+```
+
+### 9.5 Validation must be side-effect free
+
+```cpp
+ControlResult<ValidatedPipeline> Validate(const PipelineSpec &desired) const;
+```
+
+Validation must not create a PMD, allocate a live module, attach a worker,
+connect gates, acquire port queues, mutate metadata allocation, or modify
+scheduler trees. At minimum it checks:
+
+- **Names** — non-empty where required; unique ports, modules and traffic
+  classes; valid worker IDs.
+- **Types** — port driver exists; module class exists; scheduler name supported.
+- **References** — module connection endpoints exist; TC parent exists; leaf
+  module exists; worker reference exists; explicit port/module relationships
+  resolve.
+- **Gates** — ogate exists for the upstream class; igate exists for the
+  downstream class; no conflicting output-gate connection; indices fit BESS
+  limits.
+- **Workers** — `wid < Worker::kMaxWorkers`; CPU exists; duplicate cores handled
+  per BESS policy; scheduler value valid.
+- **Traffic classes** — policy, required policy arguments, parent compatibility,
+  hierarchy cycles, leaf task references, worker/root constraints.
+- **Port shape** — generic queue counts/sizes validated before driver creation.
+
+Driver-specific checks that genuinely require invoking a driver happen in
+`Prepare()`; do not pretend those are pure validation.
+
+**Metadata layout is part of validation.** Module metadata constraints are a
+pipeline-wide dependency, and a transaction must not discover metadata
+incompatibility after half the graph is committed: build a candidate metadata
+layout from the desired graph, validate it, and never mutate
+`bess::metadata::default_pipeline` during validation. Candidate metadata state
+must be stageable for side-effect-free validation to be possible at all.
+
+### 9.6 Diff and planner
+
+```cpp
+PipelineDiff Diff(const PipelineSnapshot &current,
+                  const ValidatedPipeline &desired);
+```
+
+Classify changes deterministically: ports (create/remove/replace/update/unchanged),
+modules (create/remove/replace/unchanged), connections
+(connect/disconnect/unchanged), workers (add/remove/replace-move/unchanged),
+traffic classes (create/remove/update/reparent/unchanged). No pointer equality;
+normalize config before diffing so default-equivalent states do not churn. A
+re-apply of identical desired state produces an empty diff, does not stop
+workers and does not increment the generation.
+
+The planner turns a validated diff into an explicit dependency-ordered plan — not
+`for (...) CreateWhatever()`:
+
+```text
+PrepareCreatePort(p0)
+PrepareCreateModule(src)
+Disconnect old connections
+Connect src → out
+Attach tasks / traffic classes
+Retire removed modules
+Retire removed ports
+```
+
+Ordering constraints to encode intentionally:
+
+```text
+port before PortInc/PortOut Init
+module before connection
+connection before graph propagation
+module task before leaf TC attachment
+worker before attaching scheduler root
+module releases port queues before port destruction
+TC/task references detached before module destruction
+```
+
+The plan is a real, inspectable data structure:
+
+```cpp
+using PlanOperation = std::variant<
+    CreatePortOp, RemovePortOp, UpdatePortOp,
+    CreateModuleOp, RemoveModuleOp,
+    ConnectOp, DisconnectOp,
+    AddWorkerOp, RemoveWorkerOp,
+    CreateTcOp, RemoveTcOp, ReparentTcOp>;
+
+struct PipelinePlan {
+  uint64_t based_on_generation;
+  std::vector<PlanOperation> prepare_ops;
+  std::vector<PlanOperation> commit_ops;
+  std::vector<PlanOperation> retire_ops;
+};
+```
+
+Typed operations (or virtual operation objects) are required over
+`std::vector<std::function<void()>>`: they can be inspected, tested, logged,
+serialized later, and reasoned about during rollback.
+
+### 9.7 Apply semantics and the transaction engine
 
 ```text
 PipelineSpec
     │
     ▼
-Normalize
+Normalize → Validate → Diff(current, desired) → Plan ordered operations
     │
     ▼
-Validate
-    │
-    ├── names/types
-    ├── module configs
-    ├── gate topology
-    ├── port configs/capabilities
-    ├── worker constraints
-    ├── scheduling constraints
-    └── object references
+Prepare   (allocate/create resources, reversible setup)
     │
     ▼
-Diff(current, desired)
-    │
-    ▼
-Plan ordered operations
-    │
-    ▼
-Prepare
-    │
-    ├── allocate/create resources
-    └── perform reversible setup
-    │
-    ▼
-Commit
-    │
-    ▼
-publish new generation/state
+Commit    (minimal quiesced window) → publish new generation/state
     │
     ▼
 Retire old state
 ```
 
-### 9.4 Transaction contract
+State machine:
 
-Publicly visible semantics should eventually be strong:
+```text
+Created → Validated → Prepared → Committing → Committed → Retired
+   failure at any stage  → Abort
+   failure while committing → Rollback
+```
+
+```cpp
+class Transaction {
+ public:
+  ControlResult<void> Prepare();
+  ControlResult<uint64_t> Commit();
+  void Abort() noexcept;
+};
+```
+
+**Quiescence is the engine's decision, not the client's.** Structural graph
+mutation currently requires pausing workers; that stays, but the contract is not
+"client calls `PauseAll`". Prepare as much as possible while workers run, then:
+
+```text
+pause required workers / all workers
+apply structural transition
+recompute graph/scheduler metadata
+publish
+resume
+```
+
+Model the requirement explicitly (`enum class Quiescence { None, Workers }`) and
+do not pause blindly for every future transaction — K1/K2/K3 will publish many
+dataplane-state transactions without structural pause.
+
+**Phase J must not regress:** a module/gate-hook command marked
+`CommandInfo.thread_safe` may still run without a global pause. Structural
+pipeline transactions are a different thing from thread-safe module table
+updates.
+
+**Preparation versus commit.** Expensive reversible setup (parse arguments,
+allocate ordinary memory, build candidate metadata plan, construct pure graph
+description, instantiate stageable resources) happens before the pause; the
+commit window installs resources, connects the graph, switches scheduler
+relationships, publishes the generation and resumes. Record
+`validation_us` / `prepare_us` / `paused_commit_us` / `retire_us` at least in
+debug/test instrumentation — this will matter later.
+
+**Atomicity is not a lie to be told.** For accepted transactions, the target is:
+if the transaction returns failure, the previous logical runtime remains active.
+External resources can defeat this, so the planner must classify reversibility:
+
+```cpp
+enum class Reversibility {
+  Reversible,
+  RequiresDestructiveCommit,
+  UnsupportedTransactionally,
+};
+```
+
+If an operation cannot currently be made safely reversible (e.g. replacing a
+physical device that cannot be opened twice), **reject the transactional plan**
+rather than attempting it and hoping rollback works. Correct refusal is better
+than false atomicity; §9.9 records which operations stay non-transactional.
+
+**K1 seam, not K1.** G0 leaves a clean seam for RCU but implements no half-baked
+RCU: structural transactions may pause workers, `RuntimeState` stays unique and
+quiesced during mutation, and no attempt is made to RCU-swap the whole
+`ModuleGraph`, `WorkerManager` or scheduler tree. `IPLookup` and `ExactMatch`
+keep their existing immutable `PublishedGeneration` mechanism unchanged.
+
+### 9.8 Generations, optimistic concurrency, and the transaction contract
+
+```cpp
+using Generation = uint64_t;
+```
+
+Generation starts at a deterministic initial value and increments exactly once
+per successful state-changing transaction. It does not increment for reads,
+validation, planning, failed transactions or a no-op apply.
+
+```text
+generation 12 --Apply success--> 13
+generation 12 --Apply failure--> 12
+```
+
+Requests carry an optional expected generation, internally now and publicly
+later:
+
+```cpp
+struct ApplyOptions {
+  std::optional<uint64_t> expected_generation;
+};
+```
+
+`current = 42, expected = 41` returns a **conflict before any side effect** — a
+distinct error, not hidden as generic `EINVAL`.
+
+Transaction contract, publicly visible eventually:
 
 ```text
 SUCCESS
@@ -3071,53 +3481,176 @@ COMMIT_FAILED
     previous active state retained/restored where contractually possible
 ```
 
-Irreversible external-resource operations must be modeled explicitly.
+Irreversible external-resource operations are modeled explicitly and kept few
+and late in the plan.
 
-Do not pretend physical devices and arbitrary external side effects have database-grade rollback if they do not.
+### 9.9 Tests, failure injection and acceptance gates
 
-Instead structure the plan so irreversible operations are minimized and late.
+Add substantial control-plane tests (`core/control/control_plane_test.cc` or
+several focused tests) covering:
 
-### 9.5 Generations and optimistic concurrency
+- empty → pipeline (worker, ports, modules, connections, TCs) and the final
+  snapshot;
+- pipeline → empty (all resources removed cleanly);
+- pipeline A → pipeline B (module add/remove, connection change, worker change,
+  TC change);
+- no-op apply `A → A`: no mutation, no pause, no generation change;
+- validation failure and prepare failure: zero runtime change;
+- commit failure: rollback to the exact previous snapshot;
+- stale expected generation: fail before mutation;
+- concurrent callers: writer serialization, generation ordering, no mixed state.
 
-The control plane should have a monotonically increasing generation.
+Failure injection is mandatory — correctness cannot be established from
+successful applies. Provide test-only hooks or fake resources (no
+environment-variable behavior in production) and inject failure after port
+creation, module creation, second module creation, connection, worker creation,
+TC creation, task attachment, and at a commit midpoint. After each injection
+assert: generation unchanged, snapshot equals the original, and **no** leaked
+module, port, TC, worker thread, acquired queue or orphan task.
 
-Conceptually:
+Test-only resource types (`TestPort`, `TestModule`) with configurable `Init`
+success/failure and recorded `DeInit` allow transaction tests without DPDK PMDs;
+real null/ring PMDs appear in integration smoke tests only after unit semantics
+are proven.
 
-```protobuf
-message ApplyRequest {
-  uint64 expected_generation = 1;
-  Pipeline desired = 2;
-}
-```
+Add at least one process/integration test proving the active pipeline survives a
+failed transaction: `Source → Measure/Sink` running on a worker, apply a new or
+invalid pipeline while traffic runs, and require the old graph to remain usable
+(bounded traffic pause is acceptable; a partially replaced or disconnected graph
+is not).
 
-If:
+Run the new control tests under ASan/UBSan and specifically look for leaked
+modules/tasks, double destruction, stale port-queue users, TC double deletes,
+detached worker threads and use-after-free after rollback.
+
+The work is not complete until every one of these holds:
 
 ```text
-active generation = 42
+[ ] invalid PipelineSpec produces no side effects
+[ ] prepare failure produces no active-state change
+[ ] failure at every tested commit operation rolls back
+[ ] generation changes once per successful transaction
+[ ] generation does not change on failure
+[ ] generation does not change on no-op Apply
+[ ] stale expected generation returns conflict
+[ ] concurrent writers cannot interleave state
+[ ] old pipeline remains valid after failed replacement
+[ ] successful Apply snapshot equals desired normalized state
+[ ] Apply(desired) twice is idempotent
+[ ] ResetAll is implemented through ControlPlane, not RPC-to-RPC calls
+[ ] RPC service no longer needs recursive locking
+[ ] mutable module/port/TC ownership is no longer hidden in builder globals
+[ ] failed module creation releases tasks/TCs/port queues
+[ ] failed port creation does not enter active registry
+[ ] worker creation/destruction rollback leaves no joinable/leaked thread
+[ ] structural commit pauses workers internally when required
+[ ] packet hot path contains no new transaction overhead
 ```
 
-and one writer commits generation 43, a second writer trying to commit based on generation 42 should receive a conflict rather than silently overwriting newer state.
+### 9.10 Performance and pause-time discipline
 
-The same concept should later apply to high-frequency generic resource transactions.
+A committed transaction must cost nothing per packet: no transaction locks,
+protobuf, planner state, `std::expected`, registry maps, `shared_ptr` or
+generation bookkeeping inside `ProcessBatch()`. The packet path keeps
+dereferencing ordinary stable runtime pointers. Run at minimum `packet_bench`,
+`pmd_bench`, `ring_bench` smoke and `traffic_class_bench` smoke; a repeatable
+>2% hot-path regression requires investigation.
 
-### 9.6 G0 scope discipline
+Structural transactions may pause workers, so make pause duration observable now
+(no premature optimization): a harness measuring no-op apply, a small graph
+update and a larger synthetic graph update, keeping validation/planning/prepare
+before the pause and retirement after resume where safe.
 
-G0 should establish the internal transaction architecture.
+### 9.11 Source organization and commit structure
 
-Do **not** yet require:
+Update Meson cleanly: add the new control sources explicitly (no globbing, no
+compatibility make files, no `build.py` revival), and make all new tests
+first-class Meson tests.
 
-- final public v2 protobuf API;
-- Go SDK;
-- C++ CLI replacement;
-- Python removal;
-- classifier/action/meter/route messages before those resources exist;
-- graph-level RCU publication for everything.
+The work lands as several reviewed commits under one roadmap item:
 
-The invariant G0 must establish is:
+```text
+1. Extract ControlPlane         — move mutation/read business logic out of
+                                  BESSControlImpl; RPCs delegate; no behavior change
+2. Explicit RuntimeState        — runtime-owned module/port/worker/TC managers;
+                                  remove instance registries from static builders;
+                                  update module init lookup paths
+3. PipelineSpec/Snapshot/Validate — deterministic desired state + pure validator
+4. Diff / Planner               — deterministic plans, dependency ordering
+5. Transaction/generation/rollback — prepare/commit/abort, conflict semantics
+6. Internal ApplyPipeline       — complete multi-object transactions from C++
+7. Failure injection / integration / performance / docs
+```
 
-> New important mutable BESS subsystems integrate with a C++ transaction engine rather than exposing client-orchestrated sequences of independent mutations.
+Do not wait until the final commit to run the full suite: every intermediate
+commit that materially changes ownership runs focused unit tests. Final gate:
 
----
+```text
+Meson GCC build
+Meson Clang build
+all native C++ tests
+Python unittest discovery
+module integration
+sample plugin load
+installed pybess smoke
+packet benchmarks smoke
+PMD null/ring smoke
+traffic-class benchmark smoke
+ASan/UBSan control-plane tests
+git diff --check
+source-tree hygiene
+```
+
+CI stays green on both compiler lanes.
+
+### 9.12 G0 scope discipline
+
+G0 establishes the internal transaction architecture. It does **not** include:
+
+```text
+glog daemon recursion fix            (separate small fix, §8 / Milestone 1)
+K1 RCU/QSBR implementation
+ActionId, new classifier, meters, routing abstraction
+Go SDK, C++ bessctl, final v2 public protobuf API
+Python removal, plugin ABI redesign
+real NIC work, AF_XDP changes
+MBUF_FAST_FREE, PortOut lock elimination, DPDK version upgrade, ARM/SIMD
+```
+
+Do not design the final G1 transactional protobuf API here (minor additions
+strictly needed to keep tests/introspection working are fine; no classifier,
+action, meter, route or SDK-facing messages — K does not exist yet). Do not write
+the Go SDK, and do not add transaction logic to `pybess` or `bessctl` Python:
+the existing Python tools must get correctness from routing through the C++
+control plane, not from new Python-side rollback.
+
+Design the engine so future Phase K resources can register transactional
+operations (a `PreparedResource`-style `Commit()`/`Abort()` seam is a useful
+direction, but do not over-generalize before concrete K resources exist).
+
+Ideal end state:
+
+```text
+current generation = N
+
+desired state → Validate → Plan → Prepare → Commit
+
+success:  generation = N + 1, complete new state active
+failure:  generation = N, previous state remains active
+```
+
+That is the foundation required before adding the generic mutable dataplane
+substrate and before exposing robust Go/C++ transactional SDKs. This is the point
+where a large invasive refactor is justified: `ModuleGraph::all_modules_`,
+`PortBuilder::all_ports_`, `TrafficClassBuilder::all_tcs_` and the worker globals
+are exactly what make real transactions difficult today, so G0 attacks that
+ownership model rather than building a transaction veneer over it.
+
+`MODERNIZATION.md` must record, as the work lands: the G0 architecture,
+RuntimeState ownership, transaction guarantees, generation semantics, the
+unsupported/non-reversible resource policy, the G0↔K1 boundary and the G0↔G1
+boundary — including which operations remain non-transactional and why. Never
+claim full atomicity for an operation the resource lifecycle cannot support.
 
 
 ## 10. Phase K — generic high-performance dataplane substrate
@@ -4971,6 +5504,7 @@ the rejected list for what's already been decided either way.
     latency, low-rate CPU consumption, and full-load throughput -- not
     packet rate. Not evaluable in this sandbox (no real NIC/power
     control). Track as a scheduler-redesign item first.
+
 
 
 
