@@ -187,6 +187,7 @@ bessd = executable(
 unit_test_sources = [
   'dataplane/object_table_test.cc',
   'dataplane/object_table_rcu_test.cc',
+  'dataplane/object_table_publication_test.cc',
   'rcu/rcu_test.cc',
   'rcu/rcu_ptr_test.cc',
   'rcu/rcu_worker_test.cc',
@@ -258,6 +259,7 @@ if get_option('build_benchmarks')
     'pmd_bench': ['pmd_bench.cc', benchmark_dep],
     'ring_bench': ['ring_bench.cc', benchmark_dep],
     'rcu_bench': ['rcu/rcu_bench.cc', benchmark_main_dep],
+    'object_table_bench': ['dataplane/object_table_bench.cc', benchmark_main_dep],
     'traffic_class_bench': ['traffic_class_bench.cc', benchmark_main_dep],
     'modules_url_filter_bench': ['modules/url_filter_bench.cc', benchmark_main_dep],
     'utils_checksum_bench': ['utils/checksum_bench.cc', benchmark_main_dep],

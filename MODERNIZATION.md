@@ -148,19 +148,28 @@ counter, optimistic concurrency and engine-decided quiescence. Verified on GCC
 and Clang: 41 native test binaries, 22/22 module integration files against a
 foreground daemon, and the wire-parity script.
 
-The modern-glog daemon-mode recursion is fixed (§8, entry 54) and **K1 is
-complete** (entries 55-57): `RuntimeState` owns one dataplane `RcuDomain`,
-workers register/online/offline/unregister around the pause boundary, the
-scheduler reports quiescence at a safe task boundary, `RcuPtr<T>` publishes and
-retires immutable state with an acquire-load read path, and `IPLookup` and
-`ExactMatch` are migrated onto it (with `PublishedGeneration` deleted). The next
-work follows the order in the roadmap below: K2 (ActionId + immutable
-action/object tables), then K3-K8, then G1. The active
+The modern-glog daemon-mode recursion is fixed (§8, entry 54), **K1 is
+complete** (entries 55-57) and **K2 is complete** (entries 58-60):
+`RuntimeState` owns one dataplane `RcuDomain`, workers register/online/offline/
+unregister around the pause boundary, the scheduler reports quiescence at a safe
+task boundary, `RcuPtr<T>` publishes and retires immutable state with an
+acquire-load read path, and `IPLookup` and `ExactMatch` are migrated onto it
+(with `PublishedGeneration` deleted). K2 adds `StrongId<Tag, Rep>`/`ActionId`,
+the immutable `ObjectTable<Id, T>` with a mutable builder, and the measurement
+that decided its representation: flat inline stays, because lookup differences
+between representations are sub-nanosecond in the regime the alternatives favour
+and run 3x the other way in the regime flat favours, while flat builds up to 25x
+faster and needs no pool lifetime outside the table. K2 has no production
+consumer yet by design. The next
+work follows the order in the roadmap below: K3 (unified runtime-schema
+classifier), then K4-K8, then G1. The active
 build graph is Meson/Ninja only. GCC and Clang full Meson compiles succeed
-with the pinned DPDK 25.11.3. GCC verification passes all 28 native C++
-tests, both Python targets, all 10 benchmark smoke tests, the PMD null/ring
-smoke, and the sample-plugin registry load. The 22-file module integration
-run passes against a no-hugepage daemon; `-Daf_xdp=required` configuration,
+with the pinned DPDK 25.11.3. GCC verification passes 52/52 registered Meson
+tests -- 37 native C++ test binaries, 12 benchmark smoke tests (including the
+PMD null/ring smoke), the sample-plugin registry load, the Python target and
+the module integration run. K2's two non-EAL test binaries also pass under
+ASan+UBSan; the EAL-backed one cannot, because DPDK cannot initialise under
+ASan. `-Daf_xdp=required` configuration,
 install staging, generated build-tree protobuf imports, and source-tree
 hygiene checks also pass.
 
@@ -2446,6 +2455,185 @@ rather than one call site).
     a worker destroyed before the module that owns its task, and a blocking
     `Synchronize()` while the reader was still online. Each is now pinned by the
     test that found it.
+
+58. **`35fdbbb1`** — **K2.1/K2.2: strongly typed ids and immutable object
+    tables.** The generic mechanism for when a lookup result is better carried as
+    a compact id than as an inline value: `Id -> const T *`.
+
+    - **`core/dataplane/strong_id.h`**: `StrongId<Tag, Rep>` — zero-overhead,
+      trivially copyable, standard layout, no implicit conversion from an integer,
+      none to one, and none between different id types, so an action id cannot
+      silently become a gate index or a next-hop id.
+    - **`core/dataplane/action_id.h`**: `ActionId = StrongId<ActionIdTag,
+      uint32_t>`, `ActionId{0}` reserved as invalid. It is a *continuation token*,
+      not a dispatch result: an output gate stays `gate_idx_t`, nothing in K2
+      requires classification to produce action ids, and no drop/pass ids exist
+      (§38 — invalid means "no object", the caller decides what that means).
+    - **`core/dataplane/object_table.h`**: `ObjectTable<Id, T>` (immutable) and
+      `ObjectTableBuilder<Id, T>` (mutable). One-based ids with slot 0 reserved,
+      so there is no subtract-one arithmetic and invalid-id handling is obvious.
+      `Lookup()` is an index, a bounds check and a validity check — no hashing, no
+      allocation, no lock, no refcount — plus a batch form over spans. Capacity is
+      runtime-configured; the id width never sizes the allocation. Storage is flat
+      and inline, so `T` need only be movable.
+
+    Two rules are deliberate and enforced where documented: published tables never
+    mutate (every update builds a replacement generation), and erasing an id leaves
+    a hole that is *never* automatically reused — RCU protects object memory
+    lifetime, not semantic id reuse, and handing a stale id to a different object
+    is an ABA problem the table cannot reason about. Stable ids across generations
+    are trivial, because nothing is compacted or renumbered. `ObjectTable` owns no
+    RCU domain and contains no RCU code: publication is `RcuPtr<ObjectTable<...>>`
+    plus the runtime's domain (K1).
+
+    Tests: `core/dataplane/object_table_test.cc`, 13 cases — the compile-time
+    contract (§29, including the uint64 `StrongId` escape hatch), lookup,
+    invalid/out-of-range ids, holes, no automatic reuse, replacement keeping the
+    id, capacity enforcement, move-only objects, exactly-once destruction, batch
+    lookup matching scalar lookup for valid/invalid/hole/out-of-range mixes at
+    batch sizes 1/8/32, and the introspection counters.
+
+    Two bugs found while writing the tests, both in the tests: the batch result
+    span was sized for one batch while the comparison indexed the whole id list,
+    and a replacement case used an id above the builder's capacity (correctly
+    rejected by the implementation under test).
+
+59. **`1be7deb1`** — **K2.3: the ObjectTable is proven through K1's publication
+    path.** Three integration tests, no production module involved — K2 has no
+    natural consumer yet, and inventing one so the phase looks used would be worse
+    than saying so (§35). The harness is a test-only task module in the test
+    binary.
+
+    - **A worker holding an old generation keeps it alive**: the task reads the
+      published table once, blocks, the control plane publishes a replacement for
+      the same `ActionId`, and only then does the task resolve the id — through the
+      old generation, still seeing the old object while a fresh read of the
+      published pointer sees the new one. The retired generation is not destroyed
+      while the worker holds it, becomes reclaimable once the worker reaches its
+      next quiescent state, and its destructor runs on the control thread, not on
+      the packet worker.
+    - **One grace period covers several tables** (§33): an action table and a
+      next-hop table are exchanged and retired against the same token, neither is
+      reclaimed while the reader is online, both are reclaimed after it reports
+      quiescence, and both replacements are active.
+    - **Publication storm** (§34): 10000 generations of the same table with a live
+      reader publishing and reclaiming continuously; exactly the active generation
+      remains, every retired generation is destroyed exactly once, the retirement
+      queue returns to zero.
+
+    The file is split by EAL dependence: the worker-holding test needs a real
+    worker and lives in `object_table_rcu_test.cc`; the shared-grace-period and
+    storm tests need nothing but the domain, so they live in
+    `object_table_publication_test.cc` and run under ASan/UBSan. That split is
+    forced by DPDK, not by taste: `rte_eal_init()` cannot succeed under ASan here
+    ("IOVA exceeding limits of current DMA mask"), so anything that launches a
+    worker is out of the sanitizer lane's reach, which is what §34's "non-EAL
+    parts" means in practice.
+
+    One bug found, again in the test: an assertion that expected one live action
+    where the retired generation plus the active one are both alive.
+
+60. **K2.4/K2.5: the representation question, measured and decided — flat inline
+    stays.** `core/dataplane/object_table_bench.cc` (new, kept).
+
+    The sweep is the full cross product, because the interesting behaviour is where
+    a table stops being cache-resident and that boundary moves with both axes:
+    four representations (raw indexed array, bare flat storage without the wrapper,
+    the shipped `ObjectTable`, indirect slots over a pooled object region) ×
+    payload 4/16/32/64/128/256 B × capacity 1K/10K/64K/100K/512K (+1M for payloads
+    up to 64 B), plus hot/uniform/mixed distributions, batch sizes 1/8/16/32, and
+    build and single-object replacement. Every row reports `storage_bytes` and
+    `touched_bytes`, so it is readable which side of L1d/L2/L3/DRAM it sits on.
+    Uniform and mixed access walk *every* slot once per iteration: sampling a fixed
+    4096 ids keeps the touched lines L2-resident no matter how large the table is,
+    and the table-size axis then measures nothing.
+
+    Two measurement bugs, both found by disbelieving a number. The first was that
+    fixed-id sampling above (a 136 MB table ran at 0.49 ns/lookup). The second was
+    consumption: `DoNotOptimize` on a local does not keep the load inside the loop,
+    so GCC sank the payload read out of the raw baseline's loop entirely — the
+    disassembly showed a 13-instruction body containing only the bounds check, and
+    the row was measuring an `assert`. Every lookup row now XORs the loaded value
+    into a sink (a one-cycle-wide chain that does not serialize the independent
+    loads), which is what holds the load in place.
+
+    Recorded numbers: pinned to CPU 2 with its SMT sibling offlined,
+    `--benchmark_min_time=0.1s --benchmark_repetitions=3`, best of three runs. The
+    sibling has to go: with it online 106 of 170 rows spread more than 15% between
+    runs, against 21 with it offlined.
+
+    Lookup, ns per lookup (best of three, uniform access):
+
+    ```text
+    capacity        1K      10K      64K     100K     512K       1M
+    raw            0.21     0.27     0.36    0.42     1.15      1.63     (4 B payload)
+    bare flat      0.45     0.49     0.64    0.78     1.68      2.87
+    ObjectTable    0.63     0.72     0.93    1.10     2.20      3.82
+    indirect       0.44     0.58     1.53    1.80     6.66     11.11
+
+    raw            0.39     0.53     1.48    1.93     8.69       -       (256 B payload)
+    bare flat      0.56     0.73     1.57    2.15     9.27       -
+    ObjectTable    0.74     0.97     1.81    2.18    10.70       -
+    indirect       0.45     0.65     1.96    2.53    10.78       -
+    ```
+
+    Read as: while the table is cache-resident (1K-10K) the shipped representation
+    costs 0.62-0.97 ns/lookup, about 0.2 ns more than either bare flat storage or
+    indirect slots. Once it is not, the two designs separate by payload size: at
+    512K-1M entries with a 4 B payload flat is 3x faster than indirect (2.20/3.82
+    vs 6.66/11.11), because indirect pays a dependent second access into a scattered
+    object region while flat walks one contiguous array; at 512K x 256 B (138 MB)
+    they are equal (10.70 vs 10.78), both DRAM-bound. Hot ids are 0.71-0.78 ns
+    whatever the table size, and mixed access with a quarter of ids invalid is
+    cheaper than uniform at 512K/64 B (5.60 vs 10.85) because an invalid id never
+    touches the slot.
+
+    Build and replacement, ns per generation (best of three):
+
+    ```text
+                        10K x 4B   100K x 4B   10K x 64B   100K x 64B   10K x 256B   100K x 256B
+    flat build               8200      88896       30045       471054       124867       2909761
+    indirect build         201118    2202196      204963      2357531       247190       4591253
+    flat replace             9694     103746       40200       573434       166724       3335546
+    indirect replace         1238      21640        1413        23466         1445         24344
+    ```
+
+    Build from scratch favours flat by 25x at 10K x 4 B and 1.6x at 100K x 256 B,
+    because indirect pays an allocation per object. Replacement of one object in an
+    existing generation favours indirect by 8x at 10K and 4.8x at 100K, because its
+    pool outlives generations and only the slot array is copied — the cost of that
+    is that the pool's lifetime has to be managed outside the table, and objects
+    shared across generations need ownership semantics K2 deliberately does not
+    have. Batch lookup is not a throughput win (1.15 ns/lookup at batch 32 vs 0.76
+    scalar, 16 B payload): it is an API shape for callers that already hold arrays.
+    Memory is equal at large payloads and better for flat at small ones (12.3 KB vs
+    16.4 KB at 1K x 4 B), with no per-object allocation and no external pool.
+
+    **Decision: flat inline stays.** The lookup differences are sub-nanosecond in
+    the regime indirect favours and run 3x the other way in the regime flat favours;
+    flat builds up to 25x faster and needs no lifetime machinery outside the table;
+    indirect's only real win is a small-change rebuild measured in tens of
+    microseconds at 100K objects, which is a control-plane cost, not a packet-path
+    one. If generation rebuild ever dominates a workload, the benchmark and the
+    numbers for the complex form are here, which is what §19 asked for before
+    implementing it.
+
+    Recorded, not fixed: the wrapper costs a consistent 0.15-0.25 ns/lookup over the
+    same storage without it (`ObjectTable` 0.63 vs bare flat 0.45 at 1K x 4 B, 10.70
+    vs 9.27 at 512K x 256 B). That is the `std::optional` validity check and member
+    access, it is sub-nanosecond, and it is not worth a second representation to
+    chase — but it is the number to look at if `Lookup` ever grows.
+
+    Scope held: no classifier migration (§36 — `ExactMatch`, `WildcardMatch`,
+    `IPLookup` still return gates), no `rte_hash` experiment (§37), no protobuf
+    (§39), no action semantic model (§40), no per-slot RCU (§28).
+
+    Verification: GCC and Clang builds clean; `object_table_test` and
+    `object_table_publication_test` pass under ASan+UBSan (13 + 2 cases); the
+    EAL-backed `object_table_rcu_test` passes natively; the benchmark is a
+    registered smoke test in the suite; the module integration run and the Python
+    targets are unchanged by K2 (nothing outside `core/dataplane/` and the two
+    test registrations is touched).
 
 ## Review process established this session
 

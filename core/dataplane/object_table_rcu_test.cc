@@ -33,6 +33,12 @@
 // generation is destroyed by the control thread after the worker reaches a
 // quiescent state. No production module takes part: K2 has no consumer yet, and
 // inventing one to make the phase look used would be worse than admitting that.
+//
+// This is the EAL-backed half of the proof (it needs a real worker). The parts
+// that need no EAL -- shared grace period, publication storm -- live in
+// `object_table_publication_test.cc`, which is what lets them run under
+// ASan/UBSan: DPDK cannot initialise under ASan (IOVA exceeds the DMA mask), so
+// anything that launches a worker is out of reach for the sanitizer lane.
 
 #include <gtest/gtest.h>
 
@@ -301,108 +307,6 @@ TEST_F(ObjectTableRcuTest, WorkerHoldingAnOldGenerationKeepsItAlive) {
   EXPECT_EQ(1, TestAction::alive) << "only the active generation remains";
   EXPECT_EQ(control_thread, TestAction::destroyed_on_thread.load())
       << "a packet worker must never destroy a retired generation";
-}
-
-// K1's shared-grace-period capability, exercised the way K2 needs it: several
-// tables published, one grace period retiring all of them.
-TEST_F(ObjectTableRcuTest, SharedGracePeriodCoversSeveralTables) {
-  struct NextHopIdTag;
-  using NextHopId = bess::dataplane::StrongId<NextHopIdTag, uint32_t>;
-  struct NextHop {
-    int port;
-  };
-
-  const uint32_t reader = 1;
-  ASSERT_TRUE(domain_->Register(reader).has_value());
-  domain_->Online(reader);
-
-  RcuPtr<ActionTable> actions(*domain_);
-  RcuPtr<ObjectTable<NextHopId, NextHop>> next_hops(*domain_);
-
-  actions.Initialize(BuildTable(1));
-  {
-    ObjectTableBuilder<NextHopId, NextHop> builder(8);
-    ASSERT_TRUE(builder.Emplace(NextHopId(1), NextHop{7}));
-    next_hops.Initialize(std::move(builder).Build());
-  }
-
-  std::unique_ptr<const ActionTable> old_actions = actions.Exchange(BuildTable(2));
-  std::unique_ptr<const ObjectTable<NextHopId, NextHop>> old_next_hops;
-  {
-    ObjectTableBuilder<NextHopId, NextHop> builder(8);
-    ASSERT_TRUE(builder.Emplace(NextHopId(1), NextHop{9}));
-    old_next_hops = next_hops.Exchange(std::move(builder).Build());
-  }
-  ASSERT_NE(nullptr, old_actions);
-  ASSERT_NE(nullptr, old_next_hops);
-
-  const GracePeriod token = domain_->StartGracePeriod();
-  domain_->Retire(token, std::move(old_actions));
-  domain_->Retire(token, std::move(old_next_hops));
-
-  // One token, two tables: neither may be reclaimed while the reader is online.
-  EXPECT_EQ(2u, domain_->Stats().pending_retired_objects);
-  EXPECT_FALSE(domain_->IsComplete(token));
-  EXPECT_EQ(0u, domain_->ReclaimReady());
-  EXPECT_EQ(2, TestAction::alive)
-      << "the retired generation's action and the new one are both alive";
-
-  domain_->Quiescent(reader);
-  EXPECT_TRUE(domain_->IsComplete(token));
-  EXPECT_EQ(2u, domain_->ReclaimReady());
-  EXPECT_EQ(0u, domain_->Stats().pending_retired_objects);
-
-  // Both replacements are active.
-  ASSERT_NE(nullptr, actions.Read()->Lookup(ActionId(1)));
-  EXPECT_EQ(2, actions.Read()->Lookup(ActionId(1))->value);
-  ASSERT_NE(nullptr, next_hops.Read()->Lookup(NextHopId(1)));
-  EXPECT_EQ(9, next_hops.Read()->Lookup(NextHopId(1))->port);
-
-  domain_->Offline(reader);
-  domain_->Unregister(reader);
-}
-
-// A long run of generations through the substrate: nothing leaks, nothing is
-// double-freed, and the active generation is never reclaimed.
-TEST_F(ObjectTableRcuTest, PublicationStormReclaimsEveryGeneration) {
-  const uint32_t reader = 2;
-  ASSERT_TRUE(domain_->Register(reader).has_value());
-  domain_->Online(reader);
-
-  g_published->Initialize(BuildTable(0));
-
-  constexpr int kGenerations = 10000;
-  std::atomic<bool> stop{false};
-  std::atomic<int> reader_rounds{0};
-
-  std::thread reader_thread([&]() {
-    while (!stop.load()) {
-      domain_->Quiescent(reader);
-      reader_rounds++;
-      const ActionTable *table = g_published->Read();
-      EXPECT_NE(nullptr, table->Lookup(ActionId(1)));
-    }
-  });
-
-  for (int i = 1; i <= kGenerations; i++) {
-    g_published->Publish(BuildTable(i));
-    domain_->ReclaimReady();
-  }
-
-  stop.store(true);
-  reader_thread.join();
-  EXPECT_GT(reader_rounds.load(), 0);
-
-  domain_->Offline(reader);
-  domain_->Synchronize();
-  domain_->ReclaimReady();
-
-  EXPECT_EQ(1, TestAction::alive) << "exactly the active generation remains";
-  EXPECT_EQ(0u, domain_->Stats().pending_retired_objects);
-  EXPECT_EQ(kGenerations, g_published->Read()->Lookup(ActionId(1))->value);
-  EXPECT_EQ(kGenerations, TestAction::destroyed.load());
-
-  domain_->Unregister(reader);
 }
 
 }  // namespace
