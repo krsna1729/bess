@@ -217,12 +217,37 @@ TEST(MaskedExactTest, DuplicateMaskAndValueKeepsBetterRank) {
   auto built = Backend::Build(1, rules.rules());
   ASSERT_TRUE(built.has_value());
   EXPECT_EQ(1u, built->tuple_count());
+  // Two rules submitted, one distinct (mask, value): the reported count is the
+  // effective stored count.
+  EXPECT_EQ(1u, built->rule_count());
 
   const std::array<std::byte, 1> keys = {Byte{0x07}};
   std::array<uint32_t, 1> results{};
   const uint64_t hits = built->lookup_batch(ConstBytes(keys), 1, results);
   EXPECT_EQ(0x1ull, hits);
   EXPECT_EQ(2u, results[0]);
+}
+
+TEST(MaskedExactTest, PaddedRowStrideIsAccepted) {
+  // Rows may be wider than the logical key; only the leading key_size bytes are
+  // examined.
+  RuleSet rules;
+  rules.Add({0x12}, {0xff}, 1, 5u);
+
+  auto built = Backend::Build(1, rules.rules());
+  ASSERT_TRUE(built.has_value());
+
+  // Stride 4, key size 1: the padding bytes must not participate.
+  const std::array<std::byte, 8> keys = {
+      Byte{0x12}, Byte{0xaa}, Byte{0xbb}, Byte{0xcc},
+      Byte{0x12}, Byte{0xdd}, Byte{0xee}, Byte{0xff},
+  };
+  std::array<uint32_t, 2> results{};
+  const uint64_t hits = built->lookup_batch(ConstBytes(keys), 4, results);
+
+  EXPECT_EQ(0x3ull, hits);
+  EXPECT_EQ(5u, results[0]);
+  EXPECT_EQ(5u, results[1]);
 }
 
 TEST(MaskedExactTest, AllMissLeavesResultsUntouched) {

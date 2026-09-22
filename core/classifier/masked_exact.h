@@ -105,8 +105,9 @@ void MaskBatchFixed(ConstBytes keys, size_t key_stride, ConstBytes mask,
   }
 }
 
-void MaskBatchVariable(ConstBytes keys, size_t key_stride, ConstBytes mask,
-                       size_t count, MutableBytes out) noexcept {
+inline void MaskBatchVariable(ConstBytes keys, size_t key_stride,
+                              ConstBytes mask, size_t count,
+                              MutableBytes out) noexcept {
   const size_t key_bytes = mask.size();
   for (size_t i = 0; i < count; i++) {
     const std::byte *src = keys.data() + i * key_stride;
@@ -227,9 +228,9 @@ class RuntimeMaskedBackend {
     RuntimeMaskedBackend backend;
     backend.key_size_ = key_size;
     backend.mask_batch_ = detail::SelectMaskBatch(key_size);
-    backend.rule_count_ = rules.size();
     backend.tuples_.reserve(masks.size());
 
+    size_t effective_rules = 0;
     for (size_t t = 0; t < masks.size(); t++) {
       auto &group = entries[t];
       // Equal masked values inside one tuple are the same lookup key. Keep the
@@ -266,8 +267,10 @@ class RuntimeMaskedBackend {
         return std::unexpected(std::move(built.error()));
       }
       backend.tuples_.push_back(Tuple{std::move(masks[t]), std::move(*built)});
+      effective_rules += deduped.size();
     }
 
+    backend.rule_count_ = effective_rules;
     return backend;
   }
 
@@ -280,14 +283,21 @@ class RuntimeMaskedBackend {
       return 0;
     }
     promise(count <= kMaxBatch);
+    promise(key_stride >= key_size_);
     promise(key_stride <= keys.size() / count);
 
-    // Stack bound: count * kMaskedMaxKeyBytes for the masked keys plus two
+    // Stack bound: kMaxBatch * kMaskedMaxKeyBytes for the masked keys plus two
     // rank buffers. Worst case (64 keys of 64 bytes, 32-byte results) is about
     // 12 KiB, well inside the batch-sized frames this codebase already uses.
-    std::array<std::byte, kMaxBatch * detail::kMaskedMaxKeyBytes> scratch{};
-    std::array<ranked_type, kMaxBatch> candidates{};
-    std::array<ranked_type, kMaxBatch> best{};
+    //
+    // Deliberately not value-initialized: the masking kernel writes every byte
+    // of the first `count` rows before anything reads them, `candidates[i]` is
+    // only read for a slot whose per-tuple hit bit is set, and `best[i]` only
+    // once `matched` says a previous tuple already wrote it. Zeroing ~7 KiB per
+    // call dominated the useful work at small batches.
+    std::array<std::byte, kMaxBatch * detail::kMaskedMaxKeyBytes> scratch;
+    std::array<ranked_type, kMaxBatch> candidates;
+    std::array<ranked_type, kMaxBatch> best;
     const size_t scratch_bytes = count * key_size_;
 
     uint64_t matched = 0;
@@ -316,6 +326,9 @@ class RuntimeMaskedBackend {
 
   [[nodiscard]] size_t tuple_count() const noexcept { return tuples_.size(); }
 
+  // Effective stored rule count: duplicate (mask, value) rules collapse to one
+  // entry at build time, so this is the number of distinct lookup keys the
+  // backend actually holds, not the number of rules submitted.
   [[nodiscard]] size_t rule_count() const noexcept { return rule_count_; }
 
   [[nodiscard]] MaskedBackendInfo info() const noexcept {

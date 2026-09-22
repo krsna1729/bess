@@ -101,6 +101,121 @@ class BessWildcardMatchTest(BessModuleTestCase):
         self.assertEqual(len(pkt_outs[3]), 1)
         self.assertSamePackets(pkt_outs[3][0], pkt_nomatch)
 
+    def test_wildcardmatch_nonprefix_masks(self):
+        # Masks that are not prefixes: arbitrary bit patterns inside each byte.
+        wm = WildcardMatch(fields=[{'offset': 26, 'num_bytes': 4}])
+        mask = [{'value_bin': bytes(bytearray([0x0f, 0xf0, 0x00, 0xff]))}]
+        value = [{'value_bin': bytes(bytearray([0x0a, 0x30, 0x00, 0x44]))}]
+        wm.add(gate=1, priority=1, masks=mask, values=value)
+        wm.set_default_gate(gate=2)
+
+        # Matches on the masked bits; the wildcard bits differ.
+        hit = get_tcp_packet(sip='26.51.119.68', dip='10.0.0.1')
+        miss = get_tcp_packet(sip='26.51.119.69', dip='10.0.0.1')
+
+        pkt_outs = self.run_module(wm, 0, [hit], range(3))
+        self.assertEqual(len(pkt_outs[1]), 1)
+        pkt_outs = self.run_module(wm, 0, [miss], range(3))
+        self.assertEqual(len(pkt_outs[2]), 1)
+
+    def test_wildcardmatch_mixed_field_sizes(self):
+        # 1-, 3-, and 7-byte fields, so the dense key is not a multiple of
+        # eight and no field is word-sized.
+        wm = WildcardMatch(fields=[{'offset': 26, 'num_bytes': 1},
+                                   {'offset': 27, 'num_bytes': 3},
+                                   {'offset': 30, 'num_bytes': 7}])
+        masks = vstring([0xff], [0xff, 0xff, 0xff],
+                        [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+        pkt = get_tcp_packet(sip='26.51.119.68', dip='10.0.0.1')
+        raw = bytes(pkt)
+        values = vstring([raw[26]], list(raw[27:30]), list(raw[30:37]))
+        wm.add(gate=1, priority=1, masks=masks, values=values)
+        wm.set_default_gate(gate=2)
+
+        pkt_outs = self.run_module(wm, 0, [pkt], range(3))
+        self.assertEqual(len(pkt_outs[1]), 1)
+
+        other = get_tcp_packet(sip='26.51.119.68', dip='10.0.0.9')
+        pkt_outs = self.run_module(wm, 0, [other], range(3))
+        self.assertEqual(len(pkt_outs[2]), 1)
+
+    def test_wildcardmatch_multiple_masks_priority_and_tie(self):
+        # Two different masks both match the same packet.
+        wm = WildcardMatch(fields=[{'offset': 26, 'num_bytes': 4}])
+        wild = [{'value_bin': bytes(bytearray([0x1a, 0x00, 0x00, 0x00]))}]
+        wild_mask = [{'value_bin': bytes(bytearray([0xff, 0x00, 0x00, 0x00]))}]
+        exact = [{'value_bin': bytes(bytearray([0x1a, 0x33, 0x77, 0x44]))}]
+        exact_mask = [{'value_bin': bytes(bytearray([0xff, 0xff, 0xff, 0xff]))}]
+        pkt = get_tcp_packet(sip='26.51.119.68', dip='10.0.0.1')
+
+        # Higher priority wins regardless of which mask was added first.
+        wm.add(gate=1, priority=1, masks=wild_mask, values=wild)
+        wm.add(gate=2, priority=9, masks=exact_mask, values=exact)
+        wm.set_default_gate(gate=3)
+        pkt_outs = self.run_module(wm, 0, [pkt], range(4))
+        self.assertEqual(len(pkt_outs[2]), 1)
+
+        # Equal priority: the later command wins.
+        wm2 = WildcardMatch(fields=[{'offset': 26, 'num_bytes': 4}])
+        wm2.add(gate=1, priority=5, masks=wild_mask, values=wild)
+        wm2.add(gate=2, priority=5, masks=exact_mask, values=exact)
+        wm2.set_default_gate(gate=3)
+        pkt_outs = self.run_module(wm2, 0, [pkt], range(4))
+        self.assertEqual(len(pkt_outs[2]), 1)
+
+        # ... and reversing the command order reverses the winner.
+        wm3 = WildcardMatch(fields=[{'offset': 26, 'num_bytes': 4}])
+        wm3.add(gate=2, priority=5, masks=exact_mask, values=exact)
+        wm3.add(gate=1, priority=5, masks=wild_mask, values=wild)
+        wm3.set_default_gate(gate=3)
+        pkt_outs = self.run_module(wm3, 0, [pkt], range(4))
+        self.assertEqual(len(pkt_outs[1]), 1)
+
+    def test_wildcardmatch_delete_and_clear(self):
+        wm = WildcardMatch(fields=[{'offset': 26, 'num_bytes': 4}])
+        mask = [{'value_bin': socket.inet_aton('255.255.255.255')}]
+        value = [{'value_bin': socket.inet_aton('26.51.119.68')}]
+        wm.add(gate=1, priority=1, masks=mask, values=value)
+        wm.set_default_gate(gate=2)
+        pkt = get_tcp_packet(sip='26.51.119.68', dip='10.0.0.1')
+
+        pkt_outs = self.run_module(wm, 0, [pkt], range(3))
+        self.assertEqual(len(pkt_outs[1]), 1)
+
+        wm.delete(masks=mask, values=value)
+        pkt_outs = self.run_module(wm, 0, [pkt], range(3))
+        self.assertEqual(len(pkt_outs[2]), 1)
+
+        # clear() must free tuple capacity, not just empty the tables: eight
+        # brand-new masks have to fit afterwards. The eighth re-added mask
+        # matches the probe packet, so reaching gate 1 proves the new masks are
+        # live (and the adds above would have failed on the wire if the old
+        # masks still occupied the tuple ceiling).
+        for i in range(8):
+            wm.add(gate=1, priority=1,
+                   masks=[{'value_bin': bytes(bytearray([0xff, 0, 0, i]))}],
+                   values=[{'value_bin': bytes(bytearray([0x1a, 0, 0, i]))}])
+        wm.clear()
+        for i in range(8):
+            wm.add(gate=1, priority=1,
+                   masks=[{'value_bin': bytes(bytearray([0, 0xff, i, 0]))}],
+                   values=[{'value_bin': bytes(bytearray([0, 0x33, i, 0]))}])
+        pkt_outs = self.run_module(wm, 0, [pkt], range(3))
+        self.assertEqual(len(pkt_outs[1]), 1)
+
+    def test_wildcardmatch_short_packet_takes_default_gate(self):
+        # A field reaching past the packet must not be read: the packet goes to
+        # the default gate.
+        wm = WildcardMatch(fields=[{'offset': 30, 'num_bytes': 4}])
+        mask = [{'value_bin': socket.inet_aton('255.255.255.255')}]
+        value = [{'value_bin': socket.inet_aton('0.0.0.0')}]
+        wm.add(gate=1, priority=1, masks=mask, values=value)
+        wm.set_default_gate(gate=2)
+
+        short = scapy.Raw(b'\x00' * 20)
+        pkt_outs = self.run_module(wm, 0, [short], range(3))
+        self.assertEqual(len(pkt_outs[2]), 1)
+
     def test_wildcardmatch_with_metadata(self):
         # One wildcard match field
         mask = vstring([0xff, 0xff])

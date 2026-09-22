@@ -30,6 +30,10 @@
 
 #include "wildcard_match.h"
 
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -38,22 +42,48 @@
 
 using bess::metadata::Attribute;
 
-// dst = src & mask. len must be a multiple of sizeof(uint64_t)
-static inline void mask(wm_hkey_t *dst, const wm_hkey_t &src,
-                        const wm_hkey_t &mask, size_t len) {
-  promise(len >= sizeof(uint64_t));
-  promise(len <= sizeof(wm_hkey_t));
+namespace {
 
-  for (size_t i = 0; i < len / 8; i++) {
-    dst->u64_arr[i] = src.u64_arr[i] & mask.u64_arr[i];
+bool IsValidGate(gate_idx_t gate) {
+  return gate < MAX_GATES || gate == DROP_GATE;
+}
+
+// Decodes one protobuf field value into `out`, sized to `field_size`.
+//
+// Binary input shorter than the field is zero-padded, which is what the legacy
+// stack-local decode did (locals started zeroed); longer input is rejected
+// instead of copied past the field word, which the legacy code did without
+// checking.
+bool DecodeFieldData(const bess::pb::FieldData &data, int field_size,
+                     std::vector<uint8_t> *out, const char *what, size_t idx,
+                     Error *err) {
+  const size_t want = static_cast<size_t>(field_size);
+  out->assign(want, 0);
+  if (data.encoding_case() == bess::pb::FieldData::kValueBin) {
+    const std::string &bin = data.value_bin();
+    if (bin.size() > want) {
+      *err = std::make_pair(
+          EINVAL,
+          bess::utils::Format("idx %zu: %s is %zu bytes, field is %zu", idx,
+                              what, bin.size(), want));
+      return false;
+    }
+    std::memcpy(out->data(), bin.data(), bin.size());
+    return true;
   }
+  uint64_t value = data.value_int();
+  if (!bess::utils::uint64_to_bin(out->data(), value, field_size,
+                                  /*big_endian=*/true)) {
+    *err = std::make_pair(EINVAL,
+                          bess::utils::Format("idx %zu: not a correct %d-byte "
+                                              "%s",
+                                              idx, field_size, what));
+    return false;
+  }
+  return true;
 }
 
-// XXX: this is repeated in many modules. get rid of them when converting .h to
-// .hh, etc... it's in defined in some old header
-static inline int is_valid_gate(gate_idx_t gate) {
-  return (gate < MAX_GATES || gate == DROP_GATE);
-}
+}  // namespace
 
 const Commands WildcardMatch::cmds = {
     {"get_initial_arg", "EmptyArg",
@@ -61,41 +91,50 @@ const Commands WildcardMatch::cmds = {
     {"get_runtime_config", "EmptyArg",
      MODULE_CMD_FUNC(&WildcardMatch::GetRuntimeConfig), Command::THREAD_SAFE},
     {"set_runtime_config", "WildcardMatchConfig",
-     MODULE_CMD_FUNC(&WildcardMatch::SetRuntimeConfig), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&WildcardMatch::SetRuntimeConfig), Command::THREAD_SAFE},
     {"add", "WildcardMatchCommandAddArg",
-     MODULE_CMD_FUNC(&WildcardMatch::CommandAdd), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&WildcardMatch::CommandAdd), Command::THREAD_SAFE},
     {"delete", "WildcardMatchCommandDeleteArg",
-     MODULE_CMD_FUNC(&WildcardMatch::CommandDelete), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&WildcardMatch::CommandDelete), Command::THREAD_SAFE},
     {"clear", "EmptyArg", MODULE_CMD_FUNC(&WildcardMatch::CommandClear),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_SAFE},
     {"set_default_gate", "WildcardMatchCommandSetDefaultGateArg",
      MODULE_CMD_FUNC(&WildcardMatch::CommandSetDefaultGate),
      Command::THREAD_SAFE}};
 
 CommandResponse WildcardMatch::AddFieldOne(const bess::pb::Field &field,
-                                           struct WmField *f) {
-  f->size = field.num_bytes();
+                                           int idx) {
+  FieldSpec spec;
+  spec.size = field.num_bytes();
 
-  if (f->size < 1 || f->size > MAX_FIELD_SIZE) {
-    return CommandFailure(EINVAL, "'size' must be 1-%d", MAX_FIELD_SIZE);
+  if (spec.size < 1 || static_cast<size_t>(spec.size) > kMaxFieldSize) {
+    return CommandFailure(EINVAL, "idx %d: 'size' must be 1-%zu", idx,
+                          kMaxFieldSize);
   }
 
   if (field.position_case() == bess::pb::Field::kOffset) {
-    f->attr_id = -1;
-    f->offset = field.offset();
-    if (f->offset < 0 || f->offset > 1024) {
-      return CommandFailure(EINVAL, "too small 'offset'");
+    spec.by_offset = true;
+    spec.offset = field.offset();
+    if (spec.offset < 0 || spec.offset > 1024) {
+      return CommandFailure(EINVAL, "idx %d: too small 'offset'", idx);
     }
   } else if (field.position_case() == bess::pb::Field::kAttrName) {
-    const char *attr = field.attr_name().c_str();
-    f->attr_id = AddMetadataAttr(attr, f->size, Attribute::AccessMode::kRead);
-    if (f->attr_id < 0) {
-      return CommandFailure(-f->attr_id, "add_metadata_attr() failed");
+    spec.by_offset = false;
+    spec.attr_name = field.attr_name();
+    // Resolve (register) the attribute here, once per module -- not per
+    // generation: a rebuild that re-registered it would fail with EEXIST.
+    spec.attr_id = AddMetadataAttr(spec.attr_name,
+                                   static_cast<size_t>(spec.size),
+                                   Attribute::AccessMode::kRead);
+    if (spec.attr_id < 0) {
+      return CommandFailure(-spec.attr_id, "idx %d: add_metadata_attr() failed",
+                            idx);
     }
   } else {
-    return CommandFailure(EINVAL, "specify 'offset' or 'attr'");
+    return CommandFailure(EINVAL, "idx %d: specify 'offset' or 'attr'", idx);
   }
 
+  field_specs_.push_back(std::move(spec));
   return CommandSuccess();
 }
 
@@ -109,248 +148,391 @@ CommandResponse WildcardMatch::AddFieldOne(const bess::pb::Field &field,
  * e.g.: WildcardMatch([{'name': 'nexthop', 'size': 4}, ...] */
 
 CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
-  int size_acc = 0;
+  // A module with no fields has no key: the legacy implementation computed a
+  // zero total key size and then indexed with (total_key_size_ - 1) / 8.
+  if (arg.fields_size() == 0) {
+    return CommandFailure(EINVAL, "must specify at least one field");
+  }
+  if (static_cast<size_t>(arg.fields_size()) > kMaxFields) {
+    return CommandFailure(EINVAL, "too many fields (max %zu)", kMaxFields);
+  }
 
+  field_specs_.clear();
   for (int i = 0; i < arg.fields_size(); i++) {
-    const auto &field = arg.fields(i);
-    CommandResponse err;
-    fields_.emplace_back();
-    struct WmField &f = fields_.back();
-
-    f.pos = size_acc;
-
-    err = AddFieldOne(field, &f);
+    CommandResponse err = AddFieldOne(arg.fields(i), i);
     if (err.error().code() != 0) {
       return err;
     }
-
-    size_acc += f.size;
   }
 
-  default_gate_ = DROP_GATE;
-  total_key_size_ = align_ceil(size_acc, sizeof(uint64_t));
+  Error err;
+  GenerationPtr gen = Build(/*rules=*/{}, /*default_gate=*/DROP_GATE, &err);
+  if (gen == nullptr) {
+    return CommandFailure(err.first, "%s", err.second.c_str());
+  }
+  published_.Initialize(std::move(gen));
 
   return CommandSuccess();
 }
 
-inline gate_idx_t WildcardMatch::LookupEntry(const wm_hkey_t &key,
-                                             gate_idx_t def_gate) {
-  struct WmData result = {
-      .priority = INT_MIN, .ogate = def_gate,
-  };
+bool WildcardMatch::ComputeLayout(bool tolerate_invalid_metadata,
+                                  KeyLayout *layout, Error *err) {
+  if (field_specs_.empty()) {
+    *err = std::make_pair(EINVAL, "must specify at least one field");
+    return false;
+  }
+  if (field_specs_.size() > kMaxFields) {
+    *err = std::make_pair(
+        EINVAL, bess::utils::Format("too many fields (max %zu)", kMaxFields));
+    return false;
+  }
 
-  for (auto &tuple : tuples_) {
-    const auto &ht = tuple.ht;
-    wm_hkey_t key_masked;
+  layout->key_size = 0;
+  layout->key_fields.clear();
+  layout->baked_offsets.clear();
+  layout->metadata_valid = true;
+  layout->key_fields.reserve(field_specs_.size());
+  layout->baked_offsets.reserve(field_specs_.size());
 
-    mask(&key_masked, key, tuple.mask, total_key_size_);
-
-    const auto *entry =
-        ht.Find(key_masked, wm_hash(total_key_size_), wm_eq(total_key_size_));
-
-    if (entry && entry->second.priority >= result.priority) {
-      result = entry->second;
+  size_t pos = 0;
+  for (size_t i = 0; i < field_specs_.size(); i++) {
+    const FieldSpec &spec = field_specs_[i];
+    const int idx = static_cast<int>(i);
+    if (spec.size < 1 || static_cast<size_t>(spec.size) > kMaxFieldSize) {
+      *err = std::make_pair(
+          EINVAL, bess::utils::Format("idx %d: 'size' must be in [1,%zu]", idx,
+                                      kMaxFieldSize));
+      return false;
     }
-  }
 
-  return result.ogate;
-}
-
-void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  gate_idx_t default_gate;
-
-  wm_hkey_t keys[bess::PacketBatch::kMaxBurst] __ymm_aligned;
-
-  int cnt = batch->cnt();
-
-  // Initialize the padding with zero
-  for (int i = 0; i < cnt; i++) {
-    keys[i].u64_arr[(total_key_size_ - 1) / 8] = 0;
-  }
-
-  default_gate = ACCESS_ONCE(default_gate_);
-
-  for (const auto &field : fields_) {
-    int offset;
-    int pos = field.pos;
-    int attr_id = field.attr_id;
-
-    if (attr_id < 0) {
-      offset = field.offset;
+    bess::classifier::RuntimeKeyField field;
+    field.key_offset = pos;
+    field.size = static_cast<size_t>(spec.size);
+    // Wildcard masks belong to the rules, not to extraction: no normalization.
+    size_t baked;
+    if (spec.by_offset) {
+      if (spec.offset < 0 || spec.offset > 1024) {
+        *err = std::make_pair(
+            EINVAL, bess::utils::Format("idx %d: invalid 'offset'", idx));
+        return false;
+      }
+      field.source = bess::classifier::SourceKind::kPacket;
+      field.source_offset = static_cast<size_t>(spec.offset);
+      baked = static_cast<size_t>(spec.offset);
     } else {
-      offset = attr_offset(attr_id);
-    }
-
-    for (int j = 0; j < cnt; j++) {
-      bess::PacketRef pkt = batch->packet(j);
-
-      // Offset-based attrs are relative to the packet header; metadata
-      // attrs live in BESS's own private per-packet area (see
-      // PacketRef::metadata()) -- these are two different regions, not one
-      // contiguous buffer at a fixed relative offset.
-      const char *base_addr =
-          (attr_id < 0) ? pkt.head_data<const char *>()
-                        : pkt.metadata<const char *>();
-
-      char *key = reinterpret_cast<char *>(keys[j].u64_arr) + pos;
-
-      *(reinterpret_cast<uint64_t *>(key)) =
-          *(reinterpret_cast<const uint64_t *>(base_addr + offset));
-    }
-  }
-
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
-    EmitPacket(ctx, pkt, LookupEntry(keys[i], default_gate));
-  }
-}
-
-std::string WildcardMatch::GetDesc() const {
-  int num_rules = 0;
-
-  for (const auto &tuple : tuples_) {
-    num_rules += tuple.ht.Count();
-  }
-
-  return bess::utils::Format("%zu fields, %d rules", fields_.size(), num_rules);
-}
-
-template <typename T>
-CommandResponse WildcardMatch::ExtractKeyMask(const T &arg, wm_hkey_t *key,
-                                              wm_hkey_t *mask) {
-  if ((size_t)arg.values_size() != fields_.size()) {
-    return CommandFailure(EINVAL, "must specify %zu values", fields_.size());
-  } else if ((size_t)arg.masks_size() != fields_.size()) {
-    return CommandFailure(EINVAL, "must specify %zu masks", fields_.size());
-  }
-
-  memset(key, 0, sizeof(*key));
-  memset(mask, 0, sizeof(*mask));
-
-  for (size_t i = 0; i < fields_.size(); i++) {
-    int field_size = fields_[i].size;
-    int field_pos = fields_[i].pos;
-
-    uint64_t v = 0;
-    uint64_t m = 0;
-
-    bess::pb::FieldData valuedata = arg.values(i);
-    if (valuedata.encoding_case() == bess::pb::FieldData::kValueInt) {
-      if (!bess::utils::uint64_to_bin(&v, valuedata.value_int(), field_size,
-                                      true)) {
-        return CommandFailure(EINVAL, "idx %zu: not a correct %d-byte value", i,
-                              field_size);
+      const bess::metadata::mt_offset_t offset =
+          attr_offset(static_cast<size_t>(spec.attr_id));
+      if (!bess::metadata::IsValidOffset(offset)) {
+        layout->metadata_valid = false;
+        if (!tolerate_invalid_metadata) {
+          *err = std::make_pair(
+              EINVAL,
+              bess::utils::Format(
+                  "idx %d: metadata attribute '%s' has no valid offset "
+                  "(pipeline graph changed?)",
+                  idx, spec.attr_name.c_str()));
+          return false;
+        }
+        baked = kInvalidOffset;
+        // Placeholder; the plan is never executed while invalid.
+        field.source_offset = 0;
+      } else {
+        baked = static_cast<size_t>(offset);
+        field.source_offset = baked;
       }
-    } else if (valuedata.encoding_case() == bess::pb::FieldData::kValueBin) {
-      bess::utils::Copy(reinterpret_cast<uint8_t *>(&v),
-                        valuedata.value_bin().c_str(),
-                        valuedata.value_bin().size());
+      field.source = bess::classifier::SourceKind::kMetadata;
     }
 
-    bess::pb::FieldData maskdata = arg.masks(i);
-    if (maskdata.encoding_case() == bess::pb::FieldData::kValueInt) {
-      if (!bess::utils::uint64_to_bin(&m, maskdata.value_int(), field_size,
-                                      true)) {
-        return CommandFailure(EINVAL, "idx %zu: not a correct %d-byte mask", i,
-                              field_size);
+    layout->key_fields.push_back(std::move(field));
+    layout->baked_offsets.push_back(baked);
+    pos += static_cast<size_t>(spec.size);
+  }
+  layout->key_size = pos;
+  return true;
+}
+
+WildcardMatch::GenerationPtr WildcardMatch::Build(const std::vector<Rule> &rules,
+                                                  gate_idx_t default_gate,
+                                                  Error *err) {
+  KeyLayout layout;
+  if (!ComputeLayout(/*tolerate_invalid_metadata=*/false, &layout, err)) {
+    return nullptr;
+  }
+
+  bess::classifier::RuntimeClassifierSchema schema;
+  schema.key_size = layout.key_size;
+  schema.bounds = bess::classifier::BoundsPolicy::kCheck;
+  schema.key_fields = layout.key_fields;
+  auto plan = bess::classifier::ExtractPlan::Compile(schema);
+  if (!plan) {
+    *err = std::make_pair(EINVAL, "extraction plan: " + plan.error().message);
+    return nullptr;
+  }
+
+  // Pack rule value/mask bytes densely in field order. The legacy table stored
+  // rule bytes verbatim and applied the mask at lookup time; the substrate does
+  // the same, so both value and mask go in unmodified.
+  std::vector<std::byte> value_storage(rules.size() * layout.key_size);
+  std::vector<std::byte> mask_storage(rules.size() * layout.key_size);
+  std::vector<bess::classifier::RuntimeMaskedRule<gate_idx_t, int64_t>>
+      masked_rules;
+  masked_rules.reserve(rules.size());
+  std::set<std::vector<std::byte>> distinct_masks;
+
+  for (size_t r = 0; r < rules.size(); r++) {
+    const Rule &rule = rules[r];
+    if (rule.values.size() != field_specs_.size() ||
+        rule.masks.size() != field_specs_.size()) {
+      *err = std::make_pair(
+          EINVAL, bess::utils::Format("rule should have %zu fields (has %zu)",
+                                      field_specs_.size(),
+                                      rule.values.size()));
+      return nullptr;
+    }
+    std::byte *value_dst = value_storage.data() + r * layout.key_size;
+    std::byte *mask_dst = mask_storage.data() + r * layout.key_size;
+    size_t pos = 0;
+    for (size_t i = 0; i < rule.values.size(); i++) {
+      const size_t want = static_cast<size_t>(field_specs_[i].size);
+      if (rule.values[i].size() != want || rule.masks[i].size() != want) {
+        *err = std::make_pair(
+            EINVAL,
+            bess::utils::Format("rule field %zu should have size %zu", i,
+                                want));
+        return nullptr;
       }
-    } else if (maskdata.encoding_case() == bess::pb::FieldData::kValueBin) {
-      bess::utils::Copy(reinterpret_cast<uint8_t *>(&m),
-                        maskdata.value_bin().c_str(),
-                        maskdata.value_bin().size());
+      std::memcpy(value_dst + pos, rule.values[i].data(), want);
+      std::memcpy(mask_dst + pos, rule.masks[i].data(), want);
+      pos += want;
     }
-
-    if (v & ~m) {
-      return CommandFailure(EINVAL,
-                            "idx %zu: invalid pair of "
-                            "value 0x%0*" PRIx64
-                            " and "
-                            "mask 0x%0*" PRIx64,
-                            i, field_size * 2, v, field_size * 2, m);
-    }
-
-    // Use memcpy, not utils::Copy, to workaround the false positive warning
-    // in g++-8
-    memcpy(reinterpret_cast<uint8_t *>(key) + field_pos, &v, field_size);
-    memcpy(reinterpret_cast<uint8_t *>(mask) + field_pos, &m, field_size);
+    distinct_masks.emplace(mask_dst, mask_dst + layout.key_size);
+    masked_rules.push_back(
+        bess::classifier::RuntimeMaskedRule<gate_idx_t, int64_t>{
+            .value = bess::classifier::ConstBytes(value_dst, layout.key_size),
+            .mask = bess::classifier::ConstBytes(mask_dst, layout.key_size),
+            .priority = rule.priority,
+            .result = rule.gate,
+        });
   }
 
-  return CommandSuccess();
+  // The module's wire-compatible tuple ceiling applies to the *active* distinct
+  // masks of the candidate generation, computed after last-write
+  // canonicalization. A rejected candidate leaves the published generation
+  // untouched, and masks freed by `clear` are genuinely gone.
+  if (distinct_masks.size() > kMaxTuples) {
+    *err = std::make_pair(
+        EINVAL, bess::utils::Format("too many distinct masks (%zu, max %zu)",
+                                    distinct_masks.size(), kMaxTuples));
+    return nullptr;
+  }
+
+  auto backend = bess::classifier::RuntimeMaskedBackend<gate_idx_t, int64_t>::
+      Build(layout.key_size, masked_rules);
+  if (!backend) {
+    *err = std::make_pair(EINVAL,
+                          "classifier backend: " + backend.error().message);
+    return nullptr;
+  }
+
+  return std::make_unique<Generation>(
+      rules, default_gate, std::move(*plan), std::move(*backend),
+      layout.key_size, /*extraction_valid=*/true, std::move(layout.baked_offsets));
 }
 
-int WildcardMatch::FindTuple(wm_hkey_t *mask) {
-  int i = 0;
+WildcardMatch::GenerationPtr WildcardMatch::BuildDegraded(
+    const std::vector<Rule> &rules, gate_idx_t default_gate) {
+  // Same layout machinery, tolerating unreadable metadata: the resulting plan
+  // is never executed (extraction_valid == false), so placeholder offsets are
+  // safe.
+  KeyLayout layout;
+  Error err;
+  if (!ComputeLayout(/*tolerate_invalid_metadata=*/true, &layout, &err)) {
+    CHECK(false) << "degraded WildcardMatch build failed: " << err.second;
+  }
+  CHECK_GT(layout.key_size, 0u);
 
-  for (const auto &tuple : tuples_) {
-    if (memcmp(&tuple.mask, mask, total_key_size_) == 0) {
-      return i;
+  bess::classifier::RuntimeClassifierSchema schema;
+  schema.key_size = layout.key_size;
+  schema.bounds = bess::classifier::BoundsPolicy::kCheck;
+  schema.key_fields = layout.key_fields;
+  auto plan = bess::classifier::ExtractPlan::Compile(schema);
+  CHECK(plan.has_value()) << "degraded WildcardMatch plan failed to compile";
+
+  return std::make_unique<Generation>(
+      rules, default_gate, std::move(*plan),
+      bess::classifier::RuntimeMaskedBackend<gate_idx_t, int64_t>{},
+      layout.key_size, /*extraction_valid=*/false,
+      std::move(layout.baked_offsets));
+}
+
+void WildcardMatch::RefreshForResume() {
+  const Generation *current = published_.Read();
+  if (current == nullptr) {
+    return;  // not initialized (or already deinitialized)
+  }
+
+  bool changed = false;
+  for (size_t i = 0; i < field_specs_.size(); i++) {
+    const FieldSpec &spec = field_specs_[i];
+    size_t now;
+    if (spec.by_offset) {
+      now = static_cast<size_t>(spec.offset);
+    } else {
+      const bess::metadata::mt_offset_t offset =
+          attr_offset(static_cast<size_t>(spec.attr_id));
+      now = bess::metadata::IsValidOffset(offset)
+                ? static_cast<size_t>(offset)
+                : kInvalidOffset;
     }
-    i++;
+    if (i >= current->baked_source_offsets.size() ||
+        current->baked_source_offsets[i] != now) {
+      changed = true;
+      break;
+    }
   }
-  return -ENOENT;
+  if (!changed) {
+    return;
+  }
+
+  Error err;
+  GenerationPtr next = Build(current->rules, current->default_gate, &err);
+  if (next != nullptr) {
+    published_.Publish(std::move(next));
+    bess::control::runtime().rcu().ReclaimReady();
+    return;
+  }
+
+  // The dispatcher ignores ordinary OnEvent errors and resume would proceed
+  // with a stale plan reading a reassigned metadata region. Fail closed
+  // instead: keep serving rules/default-gate introspection, but route every
+  // packet to the default gate.
+  LOG(ERROR) << "WildcardMatch '" << name() << "': metadata refresh failed ("
+             << err.second << "); routing all packets to the default gate";
+  published_.Publish(BuildDegraded(current->rules, current->default_gate));
+  bess::control::runtime().rcu().ReclaimReady();
 }
 
-int WildcardMatch::AddTuple(wm_hkey_t *mask) {
-  if (tuples_.size() >= MAX_TUPLES) {
-    return -ENOSPC;
+int WildcardMatch::OnEvent(bess::Event event) {
+  if (event != bess::Event::PreResume) {
+    return -ENOTSUP;
   }
-
-  tuples_.emplace_back();
-  struct WmTuple &tuple = tuples_.back();
-  bess::utils::Copy(&tuple.mask, mask, sizeof(*mask));
-
-  return int(tuples_.size() - 1);
+  RefreshForResume();
+  // Return 0 (not -ENOTSUP) to stay registered for future resumes.
+  return 0;
 }
 
-int WildcardMatch::DelEntry(int idx, wm_hkey_t *key) {
-  struct WmTuple &tuple = tuples_[idx];
-  int ret =
-      tuple.ht.Remove(*key, wm_hash(total_key_size_), wm_eq(total_key_size_));
-  if (ret) {
+void WildcardMatch::UpsertRule(std::vector<Rule> *rules, Rule rule) {
+  for (auto it = rules->begin(); it != rules->end(); ++it) {
+    if (it->masks == rule.masks && it->values == rule.values) {
+      rules->erase(it);
+      break;
+    }
+  }
+  rules->push_back(std::move(rule));
+}
+
+bool WildcardMatch::Publish(
+    const std::function<GenerationPtr(const Generation &)> &build,
+    Error *err) {
+  const Generation *current = published_.Read();
+  if (current == nullptr) {
+    *err = Error(EINVAL, "not initialized");
+    return false;  // not initialized (or already deinitialized)
+  }
+
+  GenerationPtr next = build(*current);
+  if (next == nullptr) {
+    return false;  // the builder owns reporting why
+  }
+
+  // Publish, retire the replaced generation against a fresh grace period, and
+  // reclaim whatever readers are already done with. This runs on the control
+  // thread, so a retired table is destroyed here -- never on a worker.
+  published_.Publish(std::move(next));
+  bess::control::runtime().rcu().ReclaimReady();
+  return true;
+}
+
+Error WildcardMatch::RuleFieldsFromPb(
+    const RepeatedPtrField<bess::pb::FieldData> &fields, size_t field_size,
+    std::vector<std::vector<uint8_t>> *out) {
+  out->clear();
+  out->reserve(field_size);
+  for (size_t i = 0; i < field_size; i++) {
+    out->emplace_back();
+    Error err;
+    if (!DecodeFieldData(fields.Get(static_cast<int>(i)),
+                         field_specs_[i].size, &out->back(), "field", i, &err)) {
+      return err;
+    }
+  }
+  return std::make_pair(0, std::string());
+}
+
+Error WildcardMatch::RuleFromPb(
+    const bess::pb::WildcardMatchCommandAddArg &arg, Rule *rule) {
+  gate_idx_t gate = arg.gate();
+
+  if (!IsValidGate(gate)) {
+    return std::make_pair(EINVAL,
+                          bess::utils::Format("Invalid gate: %hu", gate));
+  }
+  if (static_cast<size_t>(arg.values_size()) != field_specs_.size()) {
+    return std::make_pair(
+        EINVAL, bess::utils::Format("must specify %zu values",
+                                    field_specs_.size()));
+  }
+  if (static_cast<size_t>(arg.masks_size()) != field_specs_.size()) {
+    return std::make_pair(
+        EINVAL,
+        bess::utils::Format("must specify %zu masks", field_specs_.size()));
+  }
+
+  Error ret = RuleFieldsFromPb(arg.values(), field_specs_.size(),
+                               &rule->values);
+  if (ret.first) {
+    return ret;
+  }
+  ret = RuleFieldsFromPb(arg.masks(), field_specs_.size(), &rule->masks);
+  if (ret.first) {
     return ret;
   }
 
-  if (tuple.ht.Count() == 0) {
-    tuples_.erase(tuples_.begin() + idx);
+  // The canonical-rule invariant, checked per field exactly as the legacy
+  // per-field check did (and again on the dense key by the substrate).
+  for (size_t i = 0; i < field_specs_.size(); i++) {
+    for (size_t b = 0; b < rule->values[i].size(); b++) {
+      const uint8_t value = rule->values[i][b];
+      const uint8_t mask = rule->masks[i][b];
+      if ((value & static_cast<uint8_t>(~mask)) != 0) {
+        return std::make_pair(
+            EINVAL,
+            bess::utils::Format("idx %zu: invalid pair of value and mask", i));
+      }
+    }
   }
 
-  return 0;
+  rule->priority = arg.priority();
+  rule->gate = gate;
+  return std::make_pair(0, std::string());
 }
 
 CommandResponse WildcardMatch::CommandAdd(
     const bess::pb::WildcardMatchCommandAddArg &arg) {
-  gate_idx_t gate = arg.gate();
-  int priority = arg.priority();
-
-  wm_hkey_t key = {{0}};
-  wm_hkey_t mask = {{0}};
-
-  struct WmData data;
-
-  CommandResponse err = ExtractKeyMask(arg, &key, &mask);
-  if (err.error().code() != 0) {
-    return err;
+  Rule rule;
+  Error ret = RuleFromPb(arg, &rule);
+  if (ret.first) {
+    return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
 
-  if (!is_valid_gate(gate)) {
-    return CommandFailure(EINVAL, "Invalid gate: %hu", gate);
-  }
-
-  data.priority = priority;
-  data.ogate = gate;
-
-  int idx = FindTuple(&mask);
-  if (idx < 0) {
-    idx = AddTuple(&mask);
-    if (idx < 0) {
-      return CommandFailure(-idx, "failed to add a new wildcard pattern");
-    }
-  }
-
-  auto *ret = tuples_[idx].ht.Insert(key, data, wm_hash(total_key_size_),
-                                     wm_eq(total_key_size_));
-  if (ret == nullptr) {
-    return CommandFailure(EINVAL, "failed to add a rule");
+  Error err;
+  const bool published = Publish([&](const Generation &current) {
+    std::vector<Rule> rules = current.rules;
+    UpsertRule(&rules, std::move(rule));
+    return Build(rules, current.default_gate, &err);
+  }, &err);
+  if (!published) {
+    return CommandFailure(err.first, "%s", err.second.c_str());
   }
 
   return CommandSuccess();
@@ -358,100 +540,132 @@ CommandResponse WildcardMatch::CommandAdd(
 
 CommandResponse WildcardMatch::CommandDelete(
     const bess::pb::WildcardMatchCommandDeleteArg &arg) {
-  wm_hkey_t key;
-  wm_hkey_t mask;
-
-  CommandResponse err = ExtractKeyMask(arg, &key, &mask);
-  if (err.error().code() != 0) {
-    return err;
+  Rule rule;
+  if (static_cast<size_t>(arg.values_size()) != field_specs_.size() ||
+      static_cast<size_t>(arg.masks_size()) != field_specs_.size()) {
+    return CommandFailure(EINVAL, "must specify %zu values and masks",
+                          field_specs_.size());
+  }
+  Error ret =
+      RuleFieldsFromPb(arg.values(), field_specs_.size(), &rule.values);
+  if (ret.first) {
+    return CommandFailure(ret.first, "%s", ret.second.c_str());
+  }
+  ret = RuleFieldsFromPb(arg.masks(), field_specs_.size(), &rule.masks);
+  if (ret.first) {
+    return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
 
-  int idx = FindTuple(&mask);
-  if (idx < 0) {
-    return CommandFailure(-idx, "failed to delete a rule");
-  }
-
-  int ret = DelEntry(idx, &key);
-  if (ret < 0) {
-    return CommandFailure(-ret, "failed to delete a rule");
+  Error err;
+  bool found = false;
+  const bool published =
+      Publish([&](const Generation &current) -> GenerationPtr {
+        std::vector<Rule> rules;
+        rules.reserve(current.rules.size());
+        for (const Rule &r : current.rules) {
+          if (r.masks == rule.masks && r.values == rule.values) {
+            found = true;
+            continue;
+          }
+          rules.push_back(r);
+        }
+        if (!found) {
+          return nullptr;
+        }
+        return Build(rules, current.default_gate, &err);
+      }, &err);
+  if (!published) {
+    if (!found) {
+      return CommandFailure(ENOENT, "failed to delete a rule");
+    }
+    return CommandFailure(err.first, "%s", err.second.c_str());
   }
 
   return CommandSuccess();
 }
 
 CommandResponse WildcardMatch::CommandClear(const bess::pb::EmptyArg &) {
-  WildcardMatch::Clear();
+  // Rules go, the default gate stays. Tuple masks are freed with them: the
+  // generation carries no tuple state forward, so a clear genuinely restores
+  // tuple capacity.
+  Error err;
+  const bool published = Publish([&](const Generation &current) {
+    return Build(/*rules=*/{}, current.default_gate, &err);
+  }, &err);
+  if (!published) {
+    return CommandFailure(err.first, "%s", err.second.c_str());
+  }
+
   return CommandSuccess();
 }
 
-void WildcardMatch::Clear() {
-  for (auto &tuple : tuples_) {
-    tuple.ht.Clear();
+CommandResponse WildcardMatch::CommandSetDefaultGate(
+    const bess::pb::WildcardMatchCommandSetDefaultGateArg &arg) {
+  Error err;
+  const bool published = Publish([&](const Generation &current) {
+    return Build(current.rules, arg.gate(), &err);
+  }, &err);
+  if (!published) {
+    return CommandFailure(err.first, "%s", err.second.c_str());
   }
+
+  return CommandSuccess();
 }
 
 // Retrieves a WildcardMatchArg that would reconstruct this module.
 CommandResponse WildcardMatch::GetInitialArg(const bess::pb::EmptyArg &) {
   bess::pb::WildcardMatchArg resp;
-  for (auto &field : fields_) {
+  for (const FieldSpec &spec : field_specs_) {
     bess::pb::Field *f = resp.add_fields();
-    if (field.attr_id >= 0) {
-      f->set_attr_name(all_attrs().at(field.attr_id).name);
+    if (spec.by_offset) {
+      f->set_offset(spec.offset);
     } else {
-      f->set_offset(field.offset);
+      f->set_attr_name(spec.attr_name);
     }
-    f->set_num_bytes(field.size);
+    f->set_num_bytes(spec.size);
   }
   return CommandSuccess(resp);
 }
 
-// Retrieves a WildcardMatchConfig that would restore this module's
-// runtime configuration.
+// Retrieves a WildcardMatchConfig that would restore this module's runtime
+// configuration.
 CommandResponse WildcardMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
   bess::pb::WildcardMatchConfig resp;
   using rule_t = bess::pb::WildcardMatchCommandAddArg;
 
-  resp.set_default_gate(default_gate_);
+  const Generation *gen = published_.Read();
+  resp.set_default_gate(gen->default_gate);
 
-  // Each tuple provides a single mask, which may have many data-matches.
-  for (auto &tuple : tuples_) {
-    wm_hkey_t mask = tuple.mask;
-    // Each entry in the hash table has priority, ogate, and the data
-    // (one datum per field, under the mask for this field).
-    for (auto &entry : tuple.ht) {
-      // Create the rule instance
-      rule_t *rule = resp.add_rules();
-      rule->set_priority(entry.second.priority);
-      rule->set_gate(entry.second.ogate);
-
-      uint8_t *entry_data = reinterpret_cast<uint8_t *>(entry.first.u64_arr);
-      uint8_t *entry_mask = reinterpret_cast<uint8_t *>(mask.u64_arr);
-      // Then fill in each field
-      for (auto &field : fields_) {
-        bess::pb::FieldData *valuedata = rule->add_values();
-        valuedata->set_value_bin(entry_data + field.pos, field.size);
-        bess::pb::FieldData *maskdata = rule->add_masks();
-        maskdata->set_value_bin(entry_mask + field.pos, field.size);
-      }
+  for (const Rule &rule : gen->rules) {
+    rule_t *out = resp.add_rules();
+    out->set_priority(rule.priority);
+    out->set_gate(rule.gate);
+    for (size_t i = 0; i < rule.values.size(); i++) {
+      bess::pb::FieldData *value = out->add_values();
+      value->set_value_bin(reinterpret_cast<const char *>(rule.values[i].data()),
+                           rule.values[i].size());
+      bess::pb::FieldData *mask = out->add_masks();
+      mask->set_value_bin(reinterpret_cast<const char *>(rule.masks[i].data()),
+                          rule.masks[i].size());
     }
   }
-  // Sort the results so that they're always predictable.
+
+  // Sort the results so that they're always predictable: by priority, then
+  // gate, then masks, then values -- the legacy order.
   std::sort(resp.mutable_rules()->begin(), resp.mutable_rules()->end(),
-            [this](const rule_t &a, const rule_t &b) {
-              // Sort is by priority, then gate, then masks, then values.
-              // The precise order is not as important as consistency.
+            [](const rule_t &a, const rule_t &b) {
               if (a.priority() != b.priority()) {
                 return a.priority() < b.priority();
               }
               if (a.gate() != b.gate()) {
                 return a.gate() < b.gate();
               }
-              for (size_t i = 0; i < fields_.size(); i++) {
+              for (int i = 0; i < a.masks_size(); i++) {
                 if (a.masks(i).value_bin() != b.masks(i).value_bin()) {
                   return a.masks(i).value_bin() < b.masks(i).value_bin();
                 }
               }
-              for (size_t i = 0; i < fields_.size(); i++) {
+              for (int i = 0; i < a.values_size(); i++) {
                 if (a.values(i).value_bin() != b.values(i).value_bin()) {
                   return a.values(i).value_bin() < b.values(i).value_bin();
                 }
@@ -461,26 +675,107 @@ CommandResponse WildcardMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
   return CommandSuccess(resp);
 }
 
-CommandResponse WildcardMatch::CommandSetDefaultGate(
-    const bess::pb::WildcardMatchCommandSetDefaultGateArg &arg) {
-  default_gate_ = arg.gate();
+// Uses a WildcardMatchConfig to restore this module's runtime config.
+// The new configuration is built in full and swapped in, so an error leaves the
+// currently installed one serving unchanged -- no partially restored state,
+// which is what the old in-place version had to warn about.
+CommandResponse WildcardMatch::SetRuntimeConfig(
+    const bess::pb::WildcardMatchConfig &arg) {
+  std::vector<Rule> rules;
+  rules.reserve(static_cast<size_t>(arg.rules_size()));
+  for (int i = 0; i < arg.rules_size(); i++) {
+    Rule rule;
+    Error ret = RuleFromPb(arg.rules(i), &rule);
+    if (ret.first) {
+      return CommandFailure(ret.first, "%s", ret.second.c_str());
+    }
+    // Duplicates in the argument collapse to the last occurrence, the same
+    // canonicalization `add` performs.
+    UpsertRule(&rules, std::move(rule));
+  }
+
+  Error err;
+  const bool published = Publish([&](const Generation &) {
+    return Build(rules, arg.default_gate(), &err);
+  }, &err);
+  if (!published) {
+    return CommandFailure(err.first, "%s", err.second.c_str());
+  }
+
   return CommandSuccess();
 }
 
-// Uses a WildcardMatchConfig to restore this module's runtime config.
-// If this returns with an error, the state may be partially restored.
-// TODO(torek): consider vetting the entire argument before clobbering state.
-CommandResponse WildcardMatch::SetRuntimeConfig(
-    const bess::pb::WildcardMatchConfig &arg) {
-  WildcardMatch::Clear();
-  default_gate_ = arg.default_gate();
-  for (int i = 0; i < arg.rules_size(); i++) {
-    CommandResponse err = WildcardMatch::CommandAdd(arg.rules(i));
-    if (err.error().code() != 0) {
-      return err;
+void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+  // One snapshot for the whole batch: a concurrent command can neither swap
+  // the generation mid-batch nor free it under this lookup.
+  const Generation *gen = published_.Read();
+  const gate_idx_t default_gate = gen->default_gate;
+  const int cnt = batch->cnt();
+
+  if (!gen->extraction_valid) {
+    // Fail-closed generation (metadata offsets unreadable): route everything
+    // to the default gate without touching packet or metadata bytes.
+    for (int i = 0; i < cnt; i++) {
+      EmitPacket(ctx, batch->packet(i), default_gate);
+    }
+    return;
+  }
+
+  // Stack scratch only: no packet-path allocation.
+  const size_t key_size = gen->key_size;
+  std::array<bess::classifier::SourceView, bess::PacketBatch::kMaxBurst>
+      sources;
+  std::array<std::byte, bess::PacketBatch::kMaxBurst * kMaxKeyBytes> keys;
+  std::array<gate_idx_t, bess::PacketBatch::kMaxBurst> gates;
+
+  for (int i = 0; i < cnt; i++) {
+    bess::PacketRef pkt = batch->packet(i);
+    // Packet span is the first segment only: fields reaching past data_len (or
+    // into later segments) fail extraction under kCheck and take the default
+    // gate instead of over-reading, as the legacy 8-byte loads could.
+    sources[i].packet = bess::classifier::ConstBytes(
+        pkt.head_data<const std::byte *>(),
+        static_cast<size_t>(pkt.data_len()));
+    sources[i].metadata = bess::classifier::ConstBytes(
+        pkt.metadata<const std::byte *>(), SNBUF_METADATA);
+  }
+
+  const uint64_t valid = gen->extract.ExecuteBatch(
+      std::span<const bess::classifier::SourceView>(sources).first(
+          static_cast<size_t>(cnt)),
+      bess::classifier::MutableBytes(keys).first(static_cast<size_t>(cnt) *
+                                                 key_size),
+      key_size);
+  // The masked backend examines every row, so failed rows must hold
+  // well-defined bytes; their results are discarded through `valid` below
+  // regardless.
+  const uint64_t all_valid = (uint64_t{1} << static_cast<size_t>(cnt)) - 1;
+  if ((valid & all_valid) != all_valid) {
+    for (int i = 0; i < cnt; i++) {
+      if (!(valid & (uint64_t{1} << i))) {
+        std::memset(keys.data() + static_cast<size_t>(i) * key_size, 0,
+                    key_size);
+      }
     }
   }
-  return CommandSuccess();
+
+  uint64_t hits = gen->backend.lookup_batch(
+      bess::classifier::ConstBytes(keys.data(),
+                                   static_cast<size_t>(cnt) * key_size),
+      key_size, std::span<gate_idx_t>(gates).first(static_cast<size_t>(cnt)));
+  hits &= valid;
+
+  for (int i = 0; i < cnt; i++) {
+    const gate_idx_t gate =
+        (hits & (uint64_t{1} << i)) ? gates[i] : default_gate;
+    EmitPacket(ctx, batch->packet(i), gate);
+  }
+}
+
+std::string WildcardMatch::GetDesc() const {
+  const Generation *gen = published_.Read();
+  return bess::utils::Format("%zu fields, %zu rules", field_specs_.size(),
+                             gen->rules.size());
 }
 
 ADD_MODULE(WildcardMatch, "wm",
