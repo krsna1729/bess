@@ -31,7 +31,9 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <optional>
+
 
 #include "classifier/byte_key.h"
 #include "classifier/classifier.h"
@@ -289,6 +291,59 @@ TEST(CuckooExactBackend, StatefulFunctorsBoundToLogicalSize) {
   b.bytes[7] = static_cast<std::byte>(0xFF);
   EXPECT_EQ(h4(a), h4(b));
   EXPECT_NE(h8(a), h8(b));
+}
+
+template <size_t Width>
+void ExpectFixedProbeHashMatchesByteHash() {
+  using bess::classifier::detail::RuntimeCuckooFixedProbeHash;
+  using bess::classifier::detail::RuntimeCuckooHash;
+  using bess::classifier::detail::RuntimeCuckooKey;
+  using bess::classifier::detail::RuntimeCuckooProbe;
+  std::array<std::byte, 16> bytes{};
+  for (size_t i = 0; i < bytes.size(); i++) {
+    bytes[i] = static_cast<std::byte>(i * 17 + 3);
+  }
+  const RuntimeCuckooProbe probe{bytes.data(), Width};
+  EXPECT_EQ(RuntimeCuckooFixedProbeHash<Width>{}(probe),
+            rte_hash_crc(bytes.data(), Width, 0));
+  RuntimeCuckooKey<16> stored{};
+  std::memcpy(stored.bytes.data(), bytes.data(), Width);
+  EXPECT_EQ(RuntimeCuckooFixedProbeHash<Width>{}(probe),
+            RuntimeCuckooHash<16>{Width}(stored));
+}
+
+TEST(CuckooExactBackend, FixedProbeHashesMatchByteHash) {
+  ExpectFixedProbeHashMatchesByteHash<1>();
+  ExpectFixedProbeHashMatchesByteHash<2>();
+  ExpectFixedProbeHashMatchesByteHash<4>();
+  ExpectFixedProbeHashMatchesByteHash<8>();
+  ExpectFixedProbeHashMatchesByteHash<16>();
+}
+
+TEST(CuckooExactBackend, RuntimeLookupSelectsFixedWidthKernels) {
+  using gate_idx_t = uint16_t;
+  using bess::classifier::detail::RuntimeCuckooLookupBatchFixed;
+  using bess::classifier::detail::RuntimeCuckooLookupBatchVariable;
+  using bess::classifier::detail::SelectRuntimeCuckooLookup;
+
+  const auto fixed1 =
+      &RuntimeCuckooLookupBatchFixed<8, 1, gate_idx_t>;
+  const auto fixed2 =
+      &RuntimeCuckooLookupBatchFixed<8, 2, gate_idx_t>;
+  const auto fixed4 =
+      &RuntimeCuckooLookupBatchFixed<8, 4, gate_idx_t>;
+  const auto fixed8 =
+      &RuntimeCuckooLookupBatchFixed<8, 8, gate_idx_t>;
+  const auto variable8 = &RuntimeCuckooLookupBatchVariable<8, gate_idx_t>;
+  const auto fixed16 =
+      &RuntimeCuckooLookupBatchFixed<16, 16, gate_idx_t>;
+
+  EXPECT_EQ((SelectRuntimeCuckooLookup<8, gate_idx_t>(1)), fixed1);
+  EXPECT_EQ((SelectRuntimeCuckooLookup<8, gate_idx_t>(2)), fixed2);
+  EXPECT_EQ((SelectRuntimeCuckooLookup<8, gate_idx_t>(4)), fixed4);
+  EXPECT_EQ((SelectRuntimeCuckooLookup<8, gate_idx_t>(8)), fixed8);
+  EXPECT_EQ((SelectRuntimeCuckooLookup<8, gate_idx_t>(7)), variable8);
+  EXPECT_EQ((SelectRuntimeCuckooLookup<16, gate_idx_t>(16)), fixed16);
 }
 
 }  // namespace

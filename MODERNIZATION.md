@@ -176,8 +176,8 @@ and result-transport pressure fixes (`RuntimeExactBackend<Result>`, hit masks,
 classifier (forced Cuckoo backend, dense packed keys, per-packet extraction
 validity, `PreResume` metadata-offset refresh with fail-closed generations),
 proven by a legacy-vs-new differential test and before/after benchmarks.
-K3.3.1 is the working-tree fast-path follow-up recorded in entry 65; the
-next committed work is K3.4-K3.7, K4-K8, and G1. The active build graph is
+K3.3.1 and K3.3.2 are the working-tree fast-path follow-ups recorded in
+entries 65-66; the next committed work is K3.4-K3.7, K4-K8, and G1. The active build graph is
 Meson/Ninja only. GCC and Clang full Meson compiles succeed with pinned DPDK
 25.11.3. The registered suite is now 68 tests: 50 native C++ binaries, 13
 benchmark smoke tests (including the PMD null/ring smoke), the sample-plugin
@@ -2782,6 +2782,41 @@ rather than one call site).
        passes; after temporary 1440-minute passwordless sudo was enabled, the
        Python and module-integration targets each pass individually, covering
        all 68 registered targets.
+
+66. **K3.3.2 working tree — borrowed/prehashed runtime Cuckoo lookup recovery
+    (2026-09-22)** —
+    - `CuckooMap` now exposes heterogeneous `FindAs`, raw-hash
+      `FindPrehashedAs`, and diagnostic `FindPrehashedAsWithStats` APIs. The
+      probe type is distinct from the stored fixed-width key, so the runtime
+      batch loop can compare directly against packed key bytes without
+      constructing a `RuntimeCuckooKey` per packet.
+    - `cuckoo_exact.h` uses a short-lived borrowed `RuntimeCuckooProbe`,
+      computes each raw hash once, and binds exact-width 1/2/4/8/16-byte
+      probe hash/equality kernels at backend construction. The 1/2/4/8-byte
+      kernels use DPDK's scalar CRC entry points; other widths retain the
+      generic byte-range path.
+    - The lookup ladder is now explicit in `modules_exact_match_bench`:
+      legacy lookup, direct prebuilt runtime keys, materialized runtime keys,
+      borrowed lookup, prehashed borrowed lookup, fixed batch lookup, and the
+      type-erased production path. At variant 0 / batch 8 / alternating
+      hit-miss traffic, one final five-repetition run gave mean times of 33.3,
+      51.7, 41.4, 39.4, 22.9, 28.5, and 29.0 ns/batch respectively (CPU
+      scaling was enabled; absolute values are noisy).
+    - The same run measured 40.6 ns/batch for legacy extraction plus lookup
+      and 41.8 ns/batch for ExtractPlan plus the production runtime backend.
+      The complete schema/batch/mix matrix exits
+      successfully. Probe instrumentation observed 100% primary hits on
+      all-hit traffic, 100% misses on all-miss traffic, and
+      46.875% primary / 3.125% secondary / 50% miss at mixed batch 32.
+    - Fixed probe hashes for widths 1/2/4/8/16 are tested against
+      `rte_hash_crc`; the benchmark fixture also checks stored-key CRC and
+      the legacy 8-byte CRC helper on identical values. Focused Cuckoo,
+      runtime-backend, and migration tests pass, and the full GCC Meson build
+      passes.
+    - No batch pipelining or separate `rte_hash` comparison was justified:
+      the production type-erased lookup is within the legacy lookup rung and
+      the end-to-end result is within measurement drift. K3.4 remains
+      untouched.
 
 ## Review process established this session
 

@@ -33,8 +33,10 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <optional>
+#include <span>
 #include <utility>
 
 #include <rte_hash_crc.h>
@@ -132,8 +134,9 @@ struct alignas(8) RuntimeCuckooKey {
 // DPDK-backed; hardware CRC on x86) measured ~6.5x faster than the K3.3
 // byte-at-a-time FNV-1a on identical 8-byte keys (see modules/
 // exact_match_bench.cc BM_HashFNV_Key vs BM_HashCRC_Key). Always pass an
-// instance carrying the table's logical size to Insert()/Find(): the
-// default-constructed functor hashes zero bytes and must never be used.
+// instance carrying the table's logical size to direct stored-key
+// Insert()/Find(): the default-constructed functor hashes zero bytes and must
+// never be used.
 template <size_t StorageBytes>
 struct RuntimeCuckooHash {
   size_t logical_size = 0;
@@ -163,6 +166,88 @@ struct RuntimeCuckooEqual {
   }
 };
 
+// Borrowed lookup probe into the packed runtime key buffer. The probe is
+// short-lived and never owns or copies key bytes.
+struct RuntimeCuckooProbe {
+  const std::byte* data;
+  size_t size;
+};
+
+// Generic probe hash for logical widths without a construction-time fixed
+// kernel.
+struct RuntimeCuckooProbeHash {
+  size_t operator()(const RuntimeCuckooProbe& probe) const noexcept {
+    return static_cast<size_t>(
+        rte_hash_crc(probe.data, static_cast<uint32_t>(probe.size), 0));
+  }
+};
+
+// Construction-time fixed-width probe hash. The 1/2/4/8-byte kernels use
+// DPDK's scalar CRC entry points; wider keys use the byte-range entry point.
+template <size_t LogicalBytes>
+struct RuntimeCuckooFixedProbeHash {
+  size_t operator()(const RuntimeCuckooProbe& probe) const noexcept {
+    if constexpr (LogicalBytes == 1) {
+      return rte_hash_crc_1byte(std::to_integer<uint8_t>(probe.data[0]), 0);
+    } else if constexpr (LogicalBytes == 2) {
+      uint16_t value;
+      std::memcpy(&value, probe.data, sizeof(value));
+      return rte_hash_crc_2byte(value, 0);
+    } else if constexpr (LogicalBytes == 4) {
+      uint32_t value;
+      std::memcpy(&value, probe.data, sizeof(value));
+      return rte_hash_crc_4byte(value, 0);
+    } else if constexpr (LogicalBytes == 8) {
+      uint64_t value;
+      std::memcpy(&value, probe.data, sizeof(value));
+      return rte_hash_crc_8byte(value, 0);
+    } else {
+      return static_cast<size_t>(
+          rte_hash_crc(probe.data, LogicalBytes, 0));
+    }
+  }
+};
+
+template <size_t StorageBytes>
+struct RuntimeCuckooProbeEqual {
+  bool operator()(const RuntimeCuckooKey<StorageBytes> &stored,
+                  const RuntimeCuckooProbe &probe) const noexcept {
+    return std::memcmp(stored.bytes.data(), probe.data, probe.size) == 0;
+  }
+};
+
+template <size_t StorageBytes, size_t LogicalBytes>
+struct RuntimeCuckooFixedProbeEqual {
+  static_assert(LogicalBytes <= StorageBytes);
+
+  bool operator()(const RuntimeCuckooKey<StorageBytes> &stored,
+                  const RuntimeCuckooProbe &probe) const noexcept {
+    if constexpr (LogicalBytes == 1) {
+      return stored.bytes[0] == probe.data[0];
+    } else if constexpr (LogicalBytes == 2) {
+      uint16_t lhs;
+      uint16_t rhs;
+      std::memcpy(&lhs, stored.bytes.data(), sizeof(lhs));
+      std::memcpy(&rhs, probe.data, sizeof(rhs));
+      return lhs == rhs;
+    } else if constexpr (LogicalBytes == 4) {
+      uint32_t lhs;
+      uint32_t rhs;
+      std::memcpy(&lhs, stored.bytes.data(), sizeof(lhs));
+      std::memcpy(&rhs, probe.data, sizeof(rhs));
+      return lhs == rhs;
+    } else if constexpr (LogicalBytes == 8) {
+      uint64_t lhs;
+      uint64_t rhs;
+      std::memcpy(&lhs, stored.bytes.data(), sizeof(lhs));
+      std::memcpy(&rhs, probe.data, sizeof(rhs));
+      return lhs == rhs;
+    } else {
+      return std::memcmp(stored.bytes.data(), probe.data, LogicalBytes) == 0;
+    }
+  }
+};
+
 template <size_t StorageBytes, typename Result>
 struct RuntimeCuckooState {
   using MapType = bess::utils::CuckooMap<
@@ -172,33 +257,90 @@ struct RuntimeCuckooState {
   size_t logical_key_size = 0;
 };
 
-template <size_t StorageBytes, typename Result>
-uint64_t RuntimeCuckooLookupBatch(const void *raw_state, ConstBytes keys,
-                                  size_t key_stride,
-                                  std::span<Result> results) noexcept {
+// Probe directly from the packed key buffer. The hot loop computes the raw
+// hash once and passes the borrowed probe plus hash into CuckooMap.
+template <size_t StorageBytes, typename Result, typename ProbeHash,
+          typename ProbeEqual>
+uint64_t RuntimeCuckooLookupBatchPrehashedImpl(
+    const void *raw_state, ConstBytes keys, size_t key_stride,
+    std::span<Result> results, size_t logical_key_size,
+    const ProbeHash &hash, const ProbeEqual &equal) noexcept {
   auto *state =
       static_cast<const RuntimeCuckooState<StorageBytes, Result> *>(raw_state);
-  promise(key_stride >= state->logical_key_size);
+  promise(key_stride >= logical_key_size);
   promise(results.empty() ||
           key_stride <= keys.size() / results.size());
-  const RuntimeCuckooHash<StorageBytes> hash{state->logical_key_size};
-  const RuntimeCuckooEqual<StorageBytes> equal{state->logical_key_size};
   uint64_t hits = 0;
   const size_t n = results.size();
-  // Do not clear the whole storage class per batch; bytes beyond the logical
-  // key are never observed by the stateful hash/equality functors.
-  RuntimeCuckooKey<StorageBytes> key;
 
   for (size_t i = 0; i < n; i++) {
-    std::memcpy(key.bytes.data(), keys.data() + i * key_stride,
-                state->logical_key_size);
-    const auto *entry = state->map.Find(key, hash, equal);
+    const RuntimeCuckooProbe probe{
+        .data = keys.data() + i * key_stride,
+        .size = logical_key_size,
+    };
+    const auto *entry = state->map.FindPrehashedAs(
+        static_cast<bess::utils::HashResult>(hash(probe)), probe, equal);
     if (entry != nullptr) {
       results[i] = entry->second;
       hits |= (uint64_t{1} << i);
     }
   }
   return hits;
+}
+
+template <size_t StorageBytes, size_t LogicalBytes, typename Result>
+uint64_t RuntimeCuckooLookupBatchFixed(
+    const void *raw_state, ConstBytes keys, size_t key_stride,
+    std::span<Result> results) noexcept {
+  auto *state =
+      static_cast<const RuntimeCuckooState<StorageBytes, Result> *>(raw_state);
+  promise(state->logical_key_size == LogicalBytes);
+  return RuntimeCuckooLookupBatchPrehashedImpl<StorageBytes, Result>(
+      raw_state, keys, key_stride, results, LogicalBytes,
+      RuntimeCuckooFixedProbeHash<LogicalBytes>{},
+      RuntimeCuckooFixedProbeEqual<StorageBytes, LogicalBytes>{});
+}
+
+template <size_t StorageBytes, typename Result>
+uint64_t RuntimeCuckooLookupBatchVariable(
+    const void *raw_state, ConstBytes keys, size_t key_stride,
+    std::span<Result> results) noexcept {
+  auto *state =
+      static_cast<const RuntimeCuckooState<StorageBytes, Result> *>(raw_state);
+  return RuntimeCuckooLookupBatchPrehashedImpl<StorageBytes, Result>(
+      raw_state, keys, key_stride, results, state->logical_key_size,
+      RuntimeCuckooProbeHash{}, RuntimeCuckooProbeEqual<StorageBytes>{});
+}
+
+template <size_t StorageBytes, typename Result>
+uint64_t RuntimeCuckooLookupBatch(
+    const void *raw_state, ConstBytes keys, size_t key_stride,
+    std::span<Result> results) noexcept {
+  return RuntimeCuckooLookupBatchVariable<StorageBytes, Result>(
+      raw_state, keys, key_stride, results);
+}
+
+// Bind the exact-width hash/equality kernels once at construction time.
+template <size_t StorageBytes, typename Result>
+LookupBatchFn<Result> SelectRuntimeCuckooLookup(size_t logical_key_size) {
+  if (logical_key_size == 1) {
+    return RuntimeCuckooLookupBatchFixed<StorageBytes, 1, Result>;
+  }
+  if (logical_key_size == 2) {
+    return RuntimeCuckooLookupBatchFixed<StorageBytes, 2, Result>;
+  }
+  if (logical_key_size == 4) {
+    return RuntimeCuckooLookupBatchFixed<StorageBytes, 4, Result>;
+  }
+  if (logical_key_size == 8) {
+    return RuntimeCuckooLookupBatchFixed<StorageBytes, 8, Result>;
+  }
+  if constexpr (StorageBytes >= 16) {
+    if (logical_key_size == 16) {
+      return RuntimeCuckooLookupBatchFixed<StorageBytes, 16, Result>;
+    }
+  }
+  return RuntimeCuckooLookupBatchVariable<StorageBytes, Result>;
 }
 
 template <size_t StorageBytes, typename Result>
@@ -253,7 +395,8 @@ ClassifierResult<RuntimeExactBackend<Result>> BuildCuckooBackendImpl(
 
   const size_t rule_count = state->map.Count();
   RuntimeExactOps<Result> ops{
-      .lookup_batch = RuntimeCuckooLookupBatch<StorageBytes, Result>,
+      .lookup_batch =
+          SelectRuntimeCuckooLookup<StorageBytes, Result>(logical_key_size),
       .destroy = RuntimeCuckooDestroy<StorageBytes, Result>,
       .info = BackendInfo{
           .kind = ExactBackendKind::kCuckoo,

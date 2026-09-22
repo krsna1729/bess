@@ -76,7 +76,11 @@ template <typename K, typename V, typename H = std::hash<K>,
 class CuckooMap {
  public:
   typedef std::pair<K, V> Entry;
-
+  struct LookupStats {
+    size_t primary_hits = 0;
+    size_t secondary_hits = 0;
+    size_t misses = 0;
+  };
   class iterator {
    public:
     using difference_type = std::ptrdiff_t;
@@ -252,6 +256,37 @@ class CuckooMap {
     return ret;
   }
 
+  // Heterogeneous lookup with a probe type distinct from the stored key.
+  template <typename Probe, typename ProbeHash, typename StoredProbeEqual>
+  const Entry* FindAs(const Probe& probe, const ProbeHash& hasher,
+                      const StoredProbeEqual& eq) const {
+    return FindPrehashedAs(static_cast<HashResult>(hasher(probe)), probe, eq);
+  }
+
+  // Heterogeneous lookup when the caller already computed the raw hash.
+  template <typename Probe, typename StoredProbeEqual>
+  const Entry* FindPrehashedAs(HashResult hash, const Probe& probe,
+                               const StoredProbeEqual& eq) const {
+    EntryIndex idx = FindWithHash(NormalizeHash(hash), probe, eq);
+    if (idx == kInvalidEntryIdx) {
+      return nullptr;
+    }
+    return &entries_[idx];
+  }
+
+  // Instrumented heterogeneous lookup for benchmark diagnostics.
+  template <typename Probe, typename StoredProbeEqual>
+  const Entry* FindPrehashedAsWithStats(HashResult hash, const Probe& probe,
+                                         const StoredProbeEqual& eq,
+                                         LookupStats& stats) const {
+    EntryIndex idx =
+        FindWithHashStats(NormalizeHash(hash), probe, eq, stats);
+    if (idx == kInvalidEntryIdx) {
+      return nullptr;
+    }
+    return &entries_[idx];
+  }
+
   // Remove the stored entry by the key
   // Return false if not exist.
   bool Remove(const K& key, const H& hasher = H(), const E& eq = E()) {
@@ -371,11 +406,13 @@ class CuckooMap {
 
   // Find key from the bucket indexed by bucket_idx
   // Return the index of the entry if success. Otherwise return nullptr.
+  template <typename Probe, typename StoredProbeEqual>
   EntryIndex GetFromBucket(HashResult primary, HashResult bucket_idx,
-                           const K& key, const E& eq) const {
+                           const Probe& probe,
+                           const StoredProbeEqual& eq) const {
     const Bucket& bucket = buckets_[bucket_idx];
 
-    int slot_idx = FindSlot(bucket, primary, key, eq);
+    int slot_idx = FindSlot(bucket, primary, probe, eq);
     if (slot_idx == -1) {
       return kInvalidEntryIdx;
     }
@@ -428,15 +465,16 @@ class CuckooMap {
   }
 
   // Return the slot index in the bucket that matches the primary hash_value
-  // and the actual key. Return -1 if not found.
-  int FindSlot(const Bucket& bucket, HashResult primary, const K& key,
-               const E& eq) const {
+  // and the actual probe. Return -1 if not found.
+  template <typename Probe, typename StoredProbeEqual>
+  int FindSlot(const Bucket& bucket, HashResult primary, const Probe& probe,
+               const StoredProbeEqual& eq) const {
     for (int i = 0; i < kEntriesPerBucket; i++) {
       if (bucket.hash_values[i] == primary) {
         EntryIndex idx = bucket.entry_indices[i];
         const Entry& entry = entries_[idx];
 
-        if (likely(Eq(entry.first, key, eq))) {
+        if (likely(Eq(entry.first, probe, eq))) {
           return i;
         }
       }
@@ -489,13 +527,36 @@ class CuckooMap {
 
   // Get the entry given the primary hash value of the key.
   // Returns the pointer to the entry or nullptr if failed.
-  EntryIndex FindWithHash(HashResult primary, const K& key, const E& eq) const {
-    EntryIndex ret = GetFromBucket(primary, primary & bucket_mask_, key, eq);
+  template <typename Probe, typename StoredProbeEqual>
+  EntryIndex FindWithHash(HashResult primary, const Probe& probe,
+                          const StoredProbeEqual& eq) const {
+    EntryIndex ret =
+        GetFromBucket(primary, primary & bucket_mask_, probe, eq);
     if (ret != kInvalidEntryIdx) {
       return ret;
     }
-    return GetFromBucket(primary, HashSecondary(primary) & bucket_mask_, key,
+    return GetFromBucket(primary, HashSecondary(primary) & bucket_mask_, probe,
                          eq);
+  }
+
+  template <typename Probe, typename StoredProbeEqual>
+  EntryIndex FindWithHashStats(HashResult primary, const Probe& probe,
+                               const StoredProbeEqual& eq,
+                               LookupStats& stats) const {
+    EntryIndex ret =
+        GetFromBucket(primary, primary & bucket_mask_, probe, eq);
+    if (ret != kInvalidEntryIdx) {
+      stats.primary_hits++;
+      return ret;
+    }
+    ret = GetFromBucket(primary, HashSecondary(primary) & bucket_mask_, probe,
+                        eq);
+    if (ret != kInvalidEntryIdx) {
+      stats.secondary_hits++;
+    } else {
+      stats.misses++;
+    }
+    return ret;
   }
 
   // Secondary hash value
@@ -504,12 +565,18 @@ class CuckooMap {
     return primary ^ ((tag + 1) * 0x5bd1e995);
   }
 
-  // Primary hash value. Should always be non-zero (= not empty)
-  static HashResult Hash(const K& key, const H& hasher) {
-    return hasher(key) | (1u << 31);
+  static HashResult NormalizeHash(HashResult hash) {
+    return hash | (1u << 31);
   }
 
-  static bool Eq(const K& lhs, const K& rhs, const E& eq) {
+  // Primary hash value. Should always be non-zero (= not empty)
+  template <typename Probe, typename Hasher>
+  static HashResult Hash(const Probe& probe, const Hasher& hasher) {
+    return NormalizeHash(static_cast<HashResult>(hasher(probe)));
+  }
+
+  template <typename Stored, typename Probe, typename Equal>
+  static bool Eq(const Stored& lhs, const Probe& rhs, const Equal& eq) {
     return eq(lhs, rhs);
   }
 

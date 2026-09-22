@@ -27,14 +27,15 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-// K3.3.1 isolation benchmark: split the end-to-end migration comparison into
-// independently measurable stages so a dataplane gap can be attributed
-// instead of guessed:
+// K3.3.2 lookup isolation benchmark: split the end-to-end migration
+// comparison into independently measurable stages so a dataplane gap can be
+// attributed instead of guessed:
 //
 //   extraction : BM_LegacyExtract vs BM_NewExtract
-//   lookup     : BM_LegacyLookup vs BM_NewLookup (both over prebuilt keys)
-//   hashing    : BM_HashFNV_Key vs BM_HashCRC_Key vs BM_HashCRC_Bytes vs
-//                BM_HashLegacy_Chunk (identical logical bytes everywhere)
+//   lookup     : legacy, direct runtime, materialized runtime, borrowed,
+//                prehashed, batch, and type-erased runtime rungs
+//   hashing    : BM_HashFNV_Key vs BM_HashCRC_Key vs BM_HashCRC_FixedProbe
+//                vs BM_HashCRC_Bytes vs BM_HashLegacy_Chunk
 //   zeroing    : BM_Zero8 (the scratch memset, measured alone)
 //   end-to-end : BM_LegacyEndToEnd vs BM_NewEndToEnd
 //   control    : BM_RebuildCost (generation build at 1K/10K/100K rules)
@@ -86,6 +87,17 @@ using bess::classifier::SourceView;
 using bess::utils::ExactMatchKey;
 using bess::utils::ExactMatchRuleFields;
 using bess::utils::ExactMatchTable;
+using bess::classifier::detail::RuntimeCuckooEqual;
+
+using bess::classifier::detail::RuntimeCuckooFixedProbeEqual;
+using bess::classifier::detail::RuntimeCuckooFixedProbeHash;
+using bess::classifier::detail::RuntimeCuckooHash;
+using bess::classifier::detail::RuntimeCuckooKey;
+using bess::classifier::detail::RuntimeCuckooProbe;
+using bess::classifier::detail::RuntimeCuckooProbeEqual;
+using bess::classifier::detail::RuntimeCuckooProbeHash;
+using bess::classifier::detail::RuntimeCuckooLookupBatchFixed;
+using bess::classifier::detail::RuntimeCuckooState;
 
 constexpr size_t kMaxBatch = 32;
 constexpr size_t kBufBytes = 128;
@@ -150,6 +162,9 @@ struct Fixture {
                               .key_fields = std::vector<RuntimeKeyField>{
                                   {SourceKind::kPacket, 0, 0, kFieldBytes}}});
   bess::classifier::RuntimeExactBackend<gate_idx_t> backend;
+  using RuntimeState = RuntimeCuckooState<8, gate_idx_t>;
+  RuntimeState runtime_state;
+
   std::array<std::array<uint8_t, kBufBytes>, kMaxBatch> packets{};
   std::array<std::array<uint8_t, kMetaBytes>, kMaxBatch> metas{};
   std::array<SourceView, kMaxBatch> views{};
@@ -234,6 +249,22 @@ struct Fixture {
       return false;
     }
     backend = std::move(*be);
+    runtime_state.logical_key_size = kKeySize;
+    const RuntimeCuckooHash<8> runtime_hash{kKeySize};
+    const bess::classifier::detail::RuntimeCuckooEqual<8> runtime_equal{
+        kKeySize};
+    for (const auto &rule : backend_rules) {
+      RuntimeCuckooKey<8> key{};
+      std::memcpy(key.bytes.data(), rule.key.data(), kKeySize);
+      if (runtime_state.map.Insert(key, rule.result, runtime_hash,
+                                   runtime_equal) == nullptr) {
+        return false;
+      }
+    }
+
+    if (!VerifyHashParity()) {
+      return false;
+    }
 
     for (size_t i = 0; i < kMaxBatch; i++) {
       views[i].packet = ConstBytes(
@@ -245,6 +276,24 @@ struct Fixture {
             desc[f].is_meta
                 ? metas[i].data() + desc[f].meta_offset
                 : packets[i].data() + desc[f].pkt_offset;
+      }
+    }
+    return true;
+  }
+  bool VerifyHashParity() const {
+
+    const auto values = HashValues();
+    const RuntimeCuckooHash<8> stored_hash{kKeySize};
+    const RuntimeCuckooFixedProbeHash<8> probe_hash;
+    for (size_t i = 0; i < values.size(); i++) {
+      RuntimeCuckooKey<8> stored{};
+      std::memcpy(stored.bytes.data(), values[i].data(), kKeySize);
+      const RuntimeCuckooProbe probe{values[i].data(), kKeySize};
+      const size_t fixed = probe_hash(probe);
+      if (fixed != stored_hash(stored) ||
+          fixed != rte_hash_crc(values[i].data(), kKeySize, 0) ||
+          fixed != crc32c_sse42_u64(kHashValues[i], 0)) {
+        return false;
       }
     }
     return true;
@@ -373,6 +422,7 @@ void BM_Zero8(benchmark::State &state) {
 struct LookupFixture : Fixture {
   std::array<ExactMatchKey, kMaxBatch> legacy_keys{};
   std::array<std::byte, kMaxBatch * kKeySize> packed_keys{};
+  std::array<RuntimeCuckooKey<8>, kMaxBatch> runtime_keys{};
 
   bool InitLookup(int in_variant, size_t batch, int mix) {
     if (!Init(in_variant)) {
@@ -394,6 +444,11 @@ struct LookupFixture : Fixture {
     if (valid != AllValidMask(batch)) {
       return false;
     }
+    for (size_t i = 0; i < batch; i++) {
+      runtime_keys[i] = RuntimeCuckooKey<8>{};
+      std::memcpy(runtime_keys[i].bytes.data(),
+                  packed_keys.data() + i * kKeySize, kKeySize);
+    }
     return true;
   }
 };
@@ -412,6 +467,187 @@ void BM_LegacyLookup(benchmark::State &state) {
     fix.legacy.Find(fix.legacy_keys.data(), gates.data(), batch, 0);
     benchmark::DoNotOptimize(gates);
   }
+  state.SetItemsProcessed(state.iterations() * batch);
+}
+
+void BM_RuntimeDirectLookup(benchmark::State &state) {
+  const int variant = static_cast<int>(state.range(0));
+  const size_t batch = static_cast<size_t>(state.range(1));
+  const int mix = static_cast<int>(state.range(2));
+  LookupFixture fix;
+  if (!fix.InitLookup(variant, batch, mix)) {
+    state.SkipWithError("runtime direct lookup fixture build failed");
+    return;
+  }
+  const RuntimeCuckooHash<8> hash{kKeySize};
+  const RuntimeCuckooEqual<8> equal{kKeySize};
+  std::array<gate_idx_t, kMaxBatch> gates{};
+  for (auto _ : state) {
+    uint64_t hits = 0;
+    for (size_t i = 0; i < batch; i++) {
+      const auto *entry =
+          fix.runtime_state.map.Find(fix.runtime_keys[i], hash, equal);
+      if (entry != nullptr) {
+        gates[i] = entry->second;
+        hits |= (uint64_t{1} << i);
+      }
+    }
+    benchmark::DoNotOptimize(hits);
+    benchmark::DoNotOptimize(gates);
+  }
+  state.SetItemsProcessed(state.iterations() * batch);
+}
+
+void BM_RuntimeMaterializedLookup(benchmark::State &state) {
+  const int variant = static_cast<int>(state.range(0));
+  const size_t batch = static_cast<size_t>(state.range(1));
+  const int mix = static_cast<int>(state.range(2));
+  LookupFixture fix;
+  if (!fix.InitLookup(variant, batch, mix)) {
+    state.SkipWithError("runtime materialized lookup fixture build failed");
+    return;
+  }
+  const RuntimeCuckooHash<8> hash{kKeySize};
+  const RuntimeCuckooEqual<8> equal{kKeySize};
+  RuntimeCuckooKey<8> key;
+  std::array<gate_idx_t, kMaxBatch> gates{};
+  for (auto _ : state) {
+    uint64_t hits = 0;
+    for (size_t i = 0; i < batch; i++) {
+      std::memcpy(key.bytes.data(),
+                  fix.packed_keys.data() + i * kKeySize, kKeySize);
+      const auto *entry = fix.runtime_state.map.Find(key, hash, equal);
+      if (entry != nullptr) {
+        gates[i] = entry->second;
+        hits |= (uint64_t{1} << i);
+      }
+    }
+    benchmark::DoNotOptimize(hits);
+    benchmark::DoNotOptimize(gates);
+  }
+  state.SetItemsProcessed(state.iterations() * batch);
+}
+
+void BM_RuntimeBorrowedLookup(benchmark::State &state) {
+  const int variant = static_cast<int>(state.range(0));
+  const size_t batch = static_cast<size_t>(state.range(1));
+  const int mix = static_cast<int>(state.range(2));
+  LookupFixture fix;
+  if (!fix.InitLookup(variant, batch, mix)) {
+    state.SkipWithError("runtime borrowed lookup fixture build failed");
+    return;
+  }
+  const RuntimeCuckooProbeHash hash;
+  const RuntimeCuckooProbeEqual<8> equal;
+  std::array<gate_idx_t, kMaxBatch> gates{};
+  for (auto _ : state) {
+    uint64_t hits = 0;
+    for (size_t i = 0; i < batch; i++) {
+      const RuntimeCuckooProbe probe{
+          fix.packed_keys.data() + i * kKeySize, kKeySize};
+      const auto *entry = fix.runtime_state.map.FindAs(probe, hash, equal);
+      if (entry != nullptr) {
+        gates[i] = entry->second;
+        hits |= (uint64_t{1} << i);
+      }
+    }
+    benchmark::DoNotOptimize(hits);
+    benchmark::DoNotOptimize(gates);
+  }
+  state.SetItemsProcessed(state.iterations() * batch);
+}
+
+void BM_RuntimePrehashedLookup(benchmark::State &state) {
+  const int variant = static_cast<int>(state.range(0));
+  const size_t batch = static_cast<size_t>(state.range(1));
+  const int mix = static_cast<int>(state.range(2));
+  LookupFixture fix;
+  if (!fix.InitLookup(variant, batch, mix)) {
+    state.SkipWithError("runtime prehashed lookup fixture build failed");
+    return;
+  }
+  const RuntimeCuckooProbeHash hash;
+  const RuntimeCuckooProbeEqual<8> equal;
+  std::array<gate_idx_t, kMaxBatch> gates{};
+  for (auto _ : state) {
+    uint64_t hits = 0;
+    for (size_t i = 0; i < batch; i++) {
+      const RuntimeCuckooProbe probe{
+          fix.packed_keys.data() + i * kKeySize, kKeySize};
+      const auto *entry = fix.runtime_state.map.FindPrehashedAs(
+          static_cast<bess::utils::HashResult>(hash(probe)), probe, equal);
+      if (entry != nullptr) {
+        gates[i] = entry->second;
+        hits |= (uint64_t{1} << i);
+      }
+    }
+    benchmark::DoNotOptimize(hits);
+    benchmark::DoNotOptimize(gates);
+  }
+  state.SetItemsProcessed(state.iterations() * batch);
+}
+
+void BM_RuntimeBatchLookup(benchmark::State &state) {
+  const int variant = static_cast<int>(state.range(0));
+  const size_t batch = static_cast<size_t>(state.range(1));
+  const int mix = static_cast<int>(state.range(2));
+  LookupFixture fix;
+  if (!fix.InitLookup(variant, batch, mix)) {
+    state.SkipWithError("runtime batch lookup fixture build failed");
+    return;
+  }
+  std::array<gate_idx_t, kMaxBatch> gates{};
+  for (auto _ : state) {
+    const uint64_t hits = RuntimeCuckooLookupBatchFixed<8, 8, gate_idx_t>(
+        &fix.runtime_state,
+        ConstBytes(fix.packed_keys.data(), batch * kKeySize), kKeySize,
+        std::span<gate_idx_t>(gates).first(batch));
+    benchmark::DoNotOptimize(hits);
+    benchmark::DoNotOptimize(gates);
+  }
+  state.SetItemsProcessed(state.iterations() * batch);
+}
+
+void BM_RuntimeProbeStats(benchmark::State &state) {
+  const int variant = static_cast<int>(state.range(0));
+  const size_t batch = static_cast<size_t>(state.range(1));
+  const int mix = static_cast<int>(state.range(2));
+  LookupFixture fix;
+  if (!fix.InitLookup(variant, batch, mix)) {
+    state.SkipWithError("runtime probe stats fixture build failed");
+    return;
+  }
+  const RuntimeCuckooFixedProbeHash<8> hash;
+  const RuntimeCuckooFixedProbeEqual<8, 8> equal;
+  using RuntimeMap =
+      bess::utils::CuckooMap<RuntimeCuckooKey<8>, gate_idx_t,
+                             RuntimeCuckooHash<8>, RuntimeCuckooEqual<8>>;
+  RuntimeMap::LookupStats stats;
+  std::array<gate_idx_t, kMaxBatch> gates{};
+  for (auto _ : state) {
+    uint64_t hits = 0;
+    for (size_t i = 0; i < batch; i++) {
+      const RuntimeCuckooProbe probe{
+          fix.packed_keys.data() + i * kKeySize, kKeySize};
+      const auto *entry = fix.runtime_state.map.FindPrehashedAsWithStats(
+          static_cast<bess::utils::HashResult>(hash(probe)), probe, equal,
+          stats);
+      if (entry != nullptr) {
+        gates[i] = entry->second;
+        hits |= (uint64_t{1} << i);
+      }
+    }
+    benchmark::DoNotOptimize(hits);
+    benchmark::DoNotOptimize(gates);
+  }
+  const double total =
+      static_cast<double>(state.iterations() * static_cast<int64_t>(batch));
+  state.counters["primary_pct"] =
+      benchmark::Counter(100.0 * stats.primary_hits / total);
+  state.counters["secondary_pct"] =
+      benchmark::Counter(100.0 * stats.secondary_hits / total);
+  state.counters["miss_pct"] =
+      benchmark::Counter(100.0 * stats.misses / total);
   state.SetItemsProcessed(state.iterations() * batch);
 }
 
@@ -440,8 +676,6 @@ void BM_NewLookup(benchmark::State &state) {
 // FNV-1a below is the retired K3.3 runtime hash, kept as a local reference so
 // the CRC adoption stays measured; the live runtime functor is exercised by
 // BM_HashCRC_Key and BM_NewLookup.
-using bess::classifier::detail::RuntimeCuckooHash;
-using bess::classifier::detail::RuntimeCuckooKey;
 size_t Fnv1aRetired(const Byte *bytes, size_t len) {
   uint64_t hash = 14695981039346656037ull;
   for (size_t i = 0; i < len; i++) {
@@ -476,6 +710,21 @@ void BM_HashCRC_Key(benchmark::State &state) {
       RuntimeCuckooKey<8> key{};
       std::memcpy(key.bytes.data(), values[i % 4].data(), 8);
       sink += hasher(key);
+    }
+    benchmark::DoNotOptimize(sink);
+  }
+  state.SetItemsProcessed(state.iterations() * batch);
+}
+
+void BM_HashCRC_FixedProbe(benchmark::State &state) {
+  const size_t batch = static_cast<size_t>(state.range(0));
+  auto values = HashValues();
+  const RuntimeCuckooFixedProbeHash<8> hasher;
+  size_t sink = 0;
+  for (auto _ : state) {
+    for (size_t i = 0; i < batch; i++) {
+      const RuntimeCuckooProbe probe{values[i % 4].data(), 8};
+      sink += hasher(probe);
     }
     benchmark::DoNotOptimize(sink);
   }
@@ -618,12 +867,19 @@ void BM_RebuildCost(benchmark::State &state) {
 EM_MATRIX_ARGS(BENCHMARK(BM_LegacyExtract));
 EM_MATRIX_ARGS(BENCHMARK(BM_NewExtract));
 EM_MATRIX_ARGS(BENCHMARK(BM_LegacyLookup));
+EM_MATRIX_ARGS(BENCHMARK(BM_RuntimeDirectLookup));
+EM_MATRIX_ARGS(BENCHMARK(BM_RuntimeMaterializedLookup));
+EM_MATRIX_ARGS(BENCHMARK(BM_RuntimeBorrowedLookup));
+EM_MATRIX_ARGS(BENCHMARK(BM_RuntimePrehashedLookup));
+EM_MATRIX_ARGS(BENCHMARK(BM_RuntimeBatchLookup));
+EM_MATRIX_ARGS(BENCHMARK(BM_RuntimeProbeStats));
 EM_MATRIX_ARGS(BENCHMARK(BM_NewLookup));
 EM_MATRIX_ARGS(BENCHMARK(BM_LegacyEndToEnd));
 EM_MATRIX_ARGS(BENCHMARK(BM_NewEndToEnd));
 BENCHMARK(BM_Zero8)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
 BENCHMARK(BM_HashFNV_Key)->Arg(1)->Arg(8)->Arg(32);
 BENCHMARK(BM_HashCRC_Key)->Arg(1)->Arg(8)->Arg(32);
+BENCHMARK(BM_HashCRC_FixedProbe)->Arg(1)->Arg(8)->Arg(32);
 BENCHMARK(BM_HashCRC_Bytes)->Arg(1)->Arg(8)->Arg(32);
 BENCHMARK(BM_HashLegacy_Chunk)->Arg(1)->Arg(8)->Arg(32);
 BENCHMARK(BM_RebuildCost)->Arg(1000)->Arg(10000)->Arg(100000);

@@ -87,6 +87,23 @@ namespace {
 
 using bess::utils::CuckooMap;
 
+struct Uint32Probe {
+  const uint32_t *value;
+};
+
+struct Uint32ProbeHash {
+  size_t operator()(const Uint32Probe &probe) const noexcept {
+    return *probe.value;
+  }
+};
+
+struct Uint32ProbeEqual {
+  bool operator()(uint32_t stored, const Uint32Probe &probe) const noexcept {
+    return stored == *probe.value;
+  }
+};
+
+
 // Test Insert function
 TEST(CuckooMapTest, Insert) {
   CuckooMap<uint32_t, uint16_t> cuckoo;
@@ -168,6 +185,46 @@ TEST(CuckooMapTest, Find) {
   EXPECT_EQ(cuckoo.Find(3), nullptr);
   EXPECT_EQ(cuckoo.Find(4), nullptr);
 }
+
+TEST(CuckooMapTest, HeterogeneousFind) {
+  CuckooMap<uint32_t, uint16_t> cuckoo;
+  ASSERT_NE(nullptr, cuckoo.Insert(1, 99));
+  ASSERT_NE(nullptr, cuckoo.Insert(2, 98));
+
+  Uint32Probe probe{nullptr};
+  Uint32ProbeHash hash;
+  Uint32ProbeEqual equal;
+
+  uint32_t value = 2;
+  probe.value = &value;
+  const auto *entry = cuckoo.FindAs(probe, hash, equal);
+  ASSERT_NE(nullptr, entry);
+  EXPECT_EQ(98, entry->second);
+
+  entry = cuckoo.FindPrehashedAs(
+      static_cast<bess::utils::HashResult>(hash(probe)), probe, equal);
+  ASSERT_NE(nullptr, entry);
+  EXPECT_EQ(98, entry->second);
+
+  bess::utils::CuckooMap<uint32_t, uint16_t>::LookupStats stats;
+  entry = cuckoo.FindPrehashedAsWithStats(
+      static_cast<bess::utils::HashResult>(hash(probe)), probe, equal, stats);
+  ASSERT_NE(nullptr, entry);
+  EXPECT_EQ(98, entry->second);
+  EXPECT_EQ(1u, stats.primary_hits + stats.secondary_hits);
+  EXPECT_EQ(0u, stats.misses);
+
+  value = 3;
+  entry = cuckoo.FindAs(probe, hash, equal);
+  EXPECT_EQ(nullptr, entry);
+  stats = {};
+  entry = cuckoo.FindPrehashedAsWithStats(
+      static_cast<bess::utils::HashResult>(hash(probe)), probe, equal, stats);
+  EXPECT_EQ(nullptr, entry);
+  EXPECT_EQ(0u, stats.primary_hits + stats.secondary_hits);
+  EXPECT_EQ(1u, stats.misses);
+}
+
 
 // Test Remove function
 TEST(CuckooMapTest, Remove) {
