@@ -181,14 +181,15 @@ next committed work is K3.4-K3.7, K4-K8, and G1. The active build graph is
 Meson/Ninja only. GCC and Clang full Meson compiles succeed with pinned DPDK
 25.11.3. The registered suite is now 68 tests: 50 native C++ binaries, 13
 benchmark smoke tests (including the PMD null/ring smoke), the sample-plugin
-registry load, the Python target, and the module integration run. The full
-68-test suite records 66 passes; the Python and module-integration targets
-remain environment-blocked because starting BESS daemon requires sudo
-credentials. The classifier extract-plan, Cuckoo, and migration tests pass
-under ASan+UBSan; the Rte hash classifier test remains environment-
-incompatible because DPDK EAL cannot allocate its required memory under
-sanitizer. `-Daf_xdp=required` configuration, install staging, generated
-build-tree protobuf imports, and source-tree hygiene checks also pass.
+registry load, the Python target, and the module integration run. All 68
+registered targets have now passed verification: the prior full run passed
+66, and the Python and module-integration targets each pass individually
+after temporary 1440-minute passwordless sudo was enabled for daemon startup.
+The classifier extract-plan, Cuckoo, and migration tests pass under ASan+UBSan;
+the Rte hash classifier test remains environment-incompatible because DPDK EAL
+cannot allocate its required memory under sanitizer. `-Daf_xdp=required`
+configuration, install staging, generated build-tree protobuf imports, and
+source-tree hygiene checks also pass.
 
 ## Completed work (chronological, with commit hashes on `develop`)
 
@@ -2751,7 +2752,7 @@ rather than one call site).
        instead of OOB-crashing on the first batch; commands fail fast when a
        metadata attribute has no valid offset instead of serving crashes.
 
-65. **K3.3.1 runtime exact fast-path recovery (working tree, 2026-09-22)** —
+65. **`6e074b86` — K3.3.1 runtime exact fast-path recovery (2026-09-22)** —
      review follow-up to K3.3, intentionally before K3.4:
      - `RuntimeCuckooKey<StorageBytes>` now stores only fixed-width key bytes;
        logical length is stateful hash/equality configuration, entries are
@@ -2777,8 +2778,10 @@ rather than one call site).
        and ASan+UBSan full builds complete. ASan+UBSan focused coverage passes
        ExtractPlan, Cuckoo, and migration tests; the Rte hash classifier test
        cannot initialize DPDK EAL under sanitizer because its memory allocation
-       fails in this environment. The 68-test GCC suite records 66 passes; the
-       Python and module-integration targets remain blocked by sudo credentials.
+       fails in this environment. The prior full GCC suite run recorded 66
+       passes; after temporary 1440-minute passwordless sudo was enabled, the
+       Python and module-integration targets each pass individually, covering
+       all 68 registered targets.
 
 ## Review process established this session
 
