@@ -2559,7 +2559,7 @@ rather than one call site).
     so the replacement result is a lower bound for the unsafe/simple lifetime
     model. The flat generation remains the boring correct baseline.
 
-61. **`c9e8d4ce`** — **K2.6 hardening** — the narrow follow-up requested
+61. **`f6624799`** — **K2.6 hardening** — the narrow follow-up requested
     before K3:
 
     - **`core/dataplane/strong_id.h`** now constrains `Rep` with
