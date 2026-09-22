@@ -1,0 +1,192 @@
+// Copyright (c) 2026, Nefeli Networks, Inc.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice, this
+// list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice,
+// this list of conditions and the following disclaimer in the documentation
+// and/or other materials provided with the distribution.
+//
+// * Neither the names of the copyright holders nor their contributors may be
+// used to endorse or promote products derived from this software without
+// specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+#include <gtest/gtest.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+#include "classifier/extract_plan.h"
+
+namespace {
+
+using bess::classifier::BoundsPolicy;
+using bess::classifier::ConstBytes;
+using bess::classifier::ExtractKernel;
+using bess::classifier::ExtractPlan;
+using bess::classifier::MutableBytes;
+using bess::classifier::RuntimeClassifierSchema;
+using bess::classifier::SourceKind;
+using bess::classifier::SourceView;
+
+std::byte Byte(unsigned value) {
+  return static_cast<std::byte>(value);
+}
+
+ConstBytes Source(const SourceView &source, SourceKind kind) {
+  return kind == SourceKind::kPacket ? source.packet : source.metadata;
+}
+
+bool Fits(size_t offset, size_t size, size_t limit) {
+  return offset <= limit && size <= limit - offset;
+}
+
+bool ReferenceExtract(const RuntimeClassifierSchema &schema,
+                      const SourceView &source, MutableBytes key) {
+  if (key.size() < schema.key_size) {
+    return false;
+  }
+  for (const auto &field : schema.key_fields) {
+    ConstBytes bytes = Source(source, field.source);
+    if (schema.bounds == bess::classifier::BoundsPolicy::kCheck &&
+        !Fits(field.source_offset, field.size, bytes.size())) {
+      return false;
+    }
+    if (!Fits(field.key_offset, field.size, key.size())) {
+      return false;
+    }
+    std::memcpy(key.data() + field.key_offset,
+                bytes.data() + field.source_offset, field.size);
+  }
+  return true;
+}
+
+TEST(ExtractPlanTest, CopiesPacketAndMetadataFieldsExactly) {
+  RuntimeClassifierSchema schema{
+      .key_size = 9,
+      .key_fields = {{SourceKind::kMetadata, 2, 0, 4},
+                     {SourceKind::kPacket, 1, 4, 3},
+                     {SourceKind::kPacket, 4, 7, 2}},
+  };
+  auto compiled = ExtractPlan::Compile(schema);
+  ASSERT_TRUE(compiled);
+  const ExtractPlan &plan = *compiled;
+  EXPECT_EQ(ExtractKernel::kGeneric, plan.kernel());
+
+  const std::array<std::byte, 6> packet =
+      {Byte(0), Byte(1), Byte(2), Byte(3), Byte(4), Byte(5)};
+  const std::array<std::byte, 7> metadata =
+      {Byte(10), Byte(11), Byte(12), Byte(13), Byte(14), Byte(15), Byte(16)};
+  const SourceView source{packet, metadata};
+  std::array<std::byte, 9> expected{};
+  std::array<std::byte, 9> key{};
+  ASSERT_TRUE(ReferenceExtract(schema, source, MutableBytes(expected)));
+  ASSERT_TRUE(plan.Execute(source, MutableBytes(key)));
+  EXPECT_EQ(expected, key);
+}
+
+TEST(ExtractPlanTest, CoalescesAdjacentFieldsAndUsesSingleKernel) {
+  RuntimeClassifierSchema schema{
+      .key_size = 6,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 2},
+                     {SourceKind::kPacket, 2, 2, 4}},
+  };
+  auto compiled = ExtractPlan::Compile(schema);
+  ASSERT_TRUE(compiled);
+  EXPECT_EQ(1u, compiled->ops().size());
+  EXPECT_EQ(ExtractKernel::kSinglePacket, compiled->kernel());
+}
+
+TEST(ExtractPlanTest, BatchStrideIsExplicitAndNoAllocationOccurs) {
+  RuntimeClassifierSchema schema{
+      .key_size = 3,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 3}},
+  };
+  auto compiled = ExtractPlan::Compile(schema);
+  ASSERT_TRUE(compiled);
+
+  const std::array<std::byte, 3> first = {Byte(1), Byte(2), Byte(3)};
+  const std::array<std::byte, 3> second = {Byte(4), Byte(5), Byte(6)};
+  const std::array<SourceView, 2> sources = {
+      SourceView{first, {}}, SourceView{second, {}}};
+  std::array<std::byte, 10> output{};
+
+  ASSERT_TRUE(compiled->ExecuteBatch(sources, MutableBytes(output), 5));
+  EXPECT_EQ(Byte(1), output[0]);
+  EXPECT_EQ(Byte(2), output[1]);
+  EXPECT_EQ(Byte(3), output[2]);
+  EXPECT_EQ(Byte(4), output[5]);
+  EXPECT_EQ(Byte(5), output[6]);
+  EXPECT_EQ(Byte(6), output[7]);
+  EXPECT_FALSE(compiled->ExecuteBatch(sources, MutableBytes(output), 2));
+}
+
+TEST(ExtractPlanTest, ExactBoundaryFieldsDoNotOverRead) {
+  RuntimeClassifierSchema schema{
+      .key_size = 11,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 1},
+                     {SourceKind::kPacket, 1, 1, 3},
+                     {SourceKind::kPacket, 4, 4, 7}},
+  };
+  auto compiled = ExtractPlan::Compile(schema);
+  ASSERT_TRUE(compiled);
+
+  const std::array<std::byte, 11> packet = {
+      Byte(0), Byte(1), Byte(2), Byte(3), Byte(4), Byte(5),
+      Byte(6), Byte(7), Byte(8), Byte(9), Byte(10)};
+  std::array<std::byte, 11> key{};
+  ASSERT_TRUE(compiled->Execute(SourceView{packet, {}}, MutableBytes(key)));
+  EXPECT_EQ(packet, key);
+
+  const std::array<std::byte, 10> short_packet{};
+  EXPECT_FALSE(
+      compiled->Execute(SourceView{short_packet, {}}, MutableBytes(key)));
+}
+
+TEST(ExtractPlanTest, ExactWidthFieldsEndAtTheSourceBoundary) {
+  const auto check_width = [](size_t width) {
+    RuntimeClassifierSchema schema{
+        .key_size = width,
+        .key_fields = {{SourceKind::kPacket, 0, 0, width}},
+    };
+    auto compiled = ExtractPlan::Compile(schema);
+    EXPECT_TRUE(compiled);
+    if (!compiled) {
+      return;
+    }
+
+    std::vector<std::byte> packet(width);
+    std::vector<std::byte> key(width);
+    for (size_t i = 0; i < width; i++) {
+      packet[i] = Byte(static_cast<unsigned>(i + 1));
+    }
+    EXPECT_TRUE(compiled->Execute(
+        SourceView{ConstBytes(packet), {}}, MutableBytes(key)));
+    EXPECT_EQ(packet, key);
+  };
+
+  check_width(1);
+  check_width(3);
+  check_width(7);
+}
+
+}  // namespace

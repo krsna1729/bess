@@ -13,6 +13,9 @@ core_sources = files(
   'control/runtime_state.cc',
   'control/transaction.cc',
   'control/worker_manager.cc',
+  'classifier/extract_plan.cc',
+  'classifier/result_plan.cc',
+  'classifier/runtime_schema.cc',
   'debug.cc',
   'dpdk.cc',
   'event.cc',
@@ -185,6 +188,14 @@ bessd = executable(
 )
 
 unit_test_sources = [
+  'classifier/classifier_test.cc',
+  'classifier/classifier_api_test.cc',
+  'classifier/backend_test.cc',
+  'classifier/runtime_schema_test.cc',
+  'classifier/extract_plan_test.cc',
+  'classifier/result_plan_test.cc',
+  'classifier/typed_exact_test.cc',
+  'classifier/generation_test.cc',
   'dataplane/object_table_test.cc',
   'dataplane/object_table_rcu_test.cc',
   'dataplane/object_table_publication_test.cc',
@@ -259,6 +270,7 @@ if get_option('build_benchmarks')
     'pmd_bench': ['pmd_bench.cc', benchmark_dep],
     'ring_bench': ['ring_bench.cc', benchmark_dep],
     'rcu_bench': ['rcu/rcu_bench.cc', benchmark_main_dep],
+    'classifier_bench': ['classifier/classifier_bench.cc', benchmark_main_dep],
     'object_table_bench': ['dataplane/object_table_bench.cc', benchmark_main_dep],
     'traffic_class_bench': ['traffic_class_bench.cc', benchmark_main_dep],
     'modules_url_filter_bench': ['modules/url_filter_bench.cc', benchmark_main_dep],
