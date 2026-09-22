@@ -176,8 +176,8 @@ and result-transport pressure fixes (`RuntimeExactBackend<Result>`, hit masks,
 classifier (forced Cuckoo backend, dense packed keys, per-packet extraction
 validity, `PreResume` metadata-offset refresh with fail-closed generations),
 proven by a legacy-vs-new differential test and before/after benchmarks.
-K3.3.1 and K3.3.2 are the working-tree fast-path follow-ups recorded in
-entries 65-66; the next committed work is K3.4-K3.7, K4-K8, and G1. The active build graph is
+K3.3.1 and K3.3.2 are committed fast-path follow-ups recorded in entries
+65-66; the next milestone is K3.4-K3.7, K4-K8, and G1. The active build graph is
 Meson/Ninja only. GCC and Clang full Meson compiles succeed with pinned DPDK
 25.11.3. The registered suite is now 68 tests: 50 native C++ binaries, 13
 benchmark smoke tests (including the PMD null/ring smoke), the sample-plugin
@@ -2783,7 +2783,7 @@ rather than one call site).
        Python and module-integration targets each pass individually, covering
        all 68 registered targets.
 
-66. **K3.3.2 working tree — borrowed/prehashed runtime Cuckoo lookup recovery
+66. **`0e1d00fd` — K3.3.2 borrowed/prehashed runtime Cuckoo lookup recovery
     (2026-09-22)** —
     - `CuckooMap` now exposes heterogeneous `FindAs`, raw-hash
       `FindPrehashedAs`, and diagnostic `FindPrehashedAsWithStats` APIs. The
