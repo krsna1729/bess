@@ -106,12 +106,10 @@ void BM_CompiledExtract(benchmark::State &state) {
     return;
   }
   for (auto _ : state) {
-    if (!plan->ExecuteBatch(
-            std::span<const SourceView>(sources).first(batch),
-            MutableBytes(output), 16)) {
-      state.SkipWithError("extraction plan execution failed");
-      return;
-    }
+    uint64_t valid = plan->ExecuteBatch(
+        std::span<const SourceView>(sources).first(batch),
+        MutableBytes(output), 16);
+    benchmark::DoNotOptimize(valid);
     benchmark::DoNotOptimize(output);
   }
   state.SetItemsProcessed(state.iterations() * batch);
@@ -222,6 +220,14 @@ BENCHMARK(BM_TypedTableLookup)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
 
 // ---------------------------------------------------------------------------
 // K3.2 Backend Laboratory Benchmarks
+//
+// SMOKE BASELINES ONLY — not a backend-selection experiment. Fixed 8-byte
+// keys, all-hit traffic, fixed 32-rule Small and 64-rule Cuckoo/rte_hash
+// cases, batches 1/8/16/32. No rule-count sweep, miss mix, key-width sweep,
+// runtime-erased Cuckoo, SortedFlat measurement, build/rebuild cost, or memory
+// comparison. Cuckoo uses ByteKeyHash/FNV while rte_hash uses its default
+// hash, so figures measure backend+hash choice, not just table
+// implementation. Do NOT derive Auto thresholds from these numbers.
 // ---------------------------------------------------------------------------
 
 using bess::classifier::CuckooExactBackend;

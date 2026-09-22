@@ -43,7 +43,7 @@
 #include "classifier/backend.h"
 #include "classifier/classifier.h"
 #include "classifier/typed_exact.h"
-
+#include "utils/common.h"
 namespace bess::classifier {
 
 // Experimental bounded direct array lookup backend for 1-byte or 2-byte keys.
@@ -95,8 +95,8 @@ class DirectExactBackend {
   // Native batch lookup returning hit mask
   [[nodiscard]] uint64_t lookup_batch(std::span<const Key> keys,
                                       std::span<Result> results) const noexcept {
-    assert(keys.size() == results.size());
-    assert(keys.size() <= 64);
+    promise(keys.size() == results.size());
+    promise(keys.size() <= 64);
     uint64_t hits = 0;
     for (size_t i = 0; i < keys.size(); i++) {
       const Result *r = lookup(keys[i]);

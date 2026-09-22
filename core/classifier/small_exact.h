@@ -41,7 +41,7 @@
 
 #include "classifier/backend.h"
 #include "classifier/classifier.h"
-
+#include "utils/common.h"
 namespace bess::classifier {
 
 // Immutable contiguous linear-scan exact backend.
@@ -97,8 +97,8 @@ class SmallExactBackend {
   // Batch via scalar fallback. Returns hit mask.
   [[nodiscard]] uint64_t lookup_batch(std::span<const Key> keys,
                                       std::span<Result> results) const noexcept {
-    assert(keys.size() == results.size());
-    assert(keys.size() <= 64);
+    promise(keys.size() == results.size());
+    promise(keys.size() <= 64);
     uint64_t hits = 0;
     for (size_t i = 0; i < keys.size(); i++) {
       const Result *r = lookup(keys[i]);
@@ -175,8 +175,8 @@ class SortedFlatBackend {
 
   [[nodiscard]] uint64_t lookup_batch(std::span<const Key> keys,
                                       std::span<Result> results) const noexcept {
-    assert(keys.size() == results.size());
-    assert(keys.size() <= 64);
+    promise(keys.size() == results.size());
+    promise(keys.size() <= 64);
     uint64_t hits = 0;
     for (size_t i = 0; i < keys.size(); i++) {
       const Result *r = lookup(keys[i]);

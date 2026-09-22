@@ -69,7 +69,10 @@ class Generation {
   BackendInfo info_;
 };
 
-using RuntimeClassifierGeneration = Generation<RuntimeExactBackend<ResultSlot>>;
+template <typename Result = ResultSlot>
+using RuntimeClassifierGeneration = Generation<RuntimeExactBackend<Result>>;
+
+using RuntimeSlotClassifierGeneration = RuntimeClassifierGeneration<ResultSlot>;
 
 }  // namespace bess::classifier
 

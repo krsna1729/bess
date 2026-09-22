@@ -130,14 +130,13 @@ TEST(ExtractPlanTest, BatchStrideIsExplicitAndNoAllocationOccurs) {
       SourceView{first, {}}, SourceView{second, {}}};
   std::array<std::byte, 10> output{};
 
-  ASSERT_TRUE(compiled->ExecuteBatch(sources, MutableBytes(output), 5));
+  EXPECT_EQ(0x3ull, compiled->ExecuteBatch(sources, MutableBytes(output), 5));
   EXPECT_EQ(Byte(1), output[0]);
   EXPECT_EQ(Byte(2), output[1]);
   EXPECT_EQ(Byte(3), output[2]);
   EXPECT_EQ(Byte(4), output[5]);
   EXPECT_EQ(Byte(5), output[6]);
   EXPECT_EQ(Byte(6), output[7]);
-  EXPECT_FALSE(compiled->ExecuteBatch(sources, MutableBytes(output), 2));
 }
 
 TEST(ExtractPlanTest, ExactBoundaryFieldsDoNotOverRead) {
@@ -218,7 +217,7 @@ TEST(ExtractPlanTest, NormalizationMaskApplied) {
   // Also verify via ExecuteBatch.
   std::array<std::byte, 4> batch_out{};
   const std::array<SourceView, 1> views = {SourceView{packet, {}}};
-  ASSERT_TRUE(compiled->ExecuteBatch(views, MutableBytes(batch_out), 4));
+  EXPECT_EQ(0x1ull, compiled->ExecuteBatch(views, MutableBytes(batch_out), 4));
   EXPECT_EQ(key, batch_out);
 }
 
@@ -249,6 +248,44 @@ TEST(ExtractPlanTest, AllOnesMaskEqualsNoMask) {
   ASSERT_TRUE(masked->Execute(SourceView{packet, {}}, MutableBytes(key_masked)));
   ASSERT_TRUE(plain->Execute(SourceView{packet, {}}, MutableBytes(key_plain)));
   EXPECT_EQ(key_plain, key_masked);
+}
+
+TEST(ExtractPlanTest, PerPacketBoundsFailureInExecuteBatch) {
+  RuntimeClassifierSchema schema{
+      .key_size = 4,
+      .bounds = BoundsPolicy::kCheck,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 4}},
+  };
+  auto compiled = ExtractPlan::Compile(schema);
+  ASSERT_TRUE(compiled);
+
+  const std::array<std::byte, 4> good_packet = {Byte(1), Byte(2), Byte(3), Byte(4)};
+  const std::array<std::byte, 2> short_packet = {Byte(5), Byte(6)};
+  const std::array<std::byte, 4> another_good = {Byte(7), Byte(8), Byte(9), Byte(10)};
+
+  const std::array<SourceView, 3> sources = {
+      SourceView{good_packet, {}},
+      SourceView{short_packet, {}},
+      SourceView{another_good, {}},
+  };
+  std::array<std::byte, 3 * 4> output{};
+
+  // Packet 0 is valid (bit 0), packet 1 truncated (bit 1 clear), packet 2 valid (bit 2)
+  // Expected mask: 0b101 = 5
+  const uint64_t valid_mask = compiled->ExecuteBatch(sources, MutableBytes(output), 4);
+  EXPECT_EQ(0x5ull, valid_mask);
+
+  // Packet 0 output correct
+  EXPECT_EQ(Byte(1), output[0]);
+  EXPECT_EQ(Byte(2), output[1]);
+  EXPECT_EQ(Byte(3), output[2]);
+  EXPECT_EQ(Byte(4), output[3]);
+
+  // Packet 2 output correct
+  EXPECT_EQ(Byte(7), output[8]);
+  EXPECT_EQ(Byte(8), output[9]);
+  EXPECT_EQ(Byte(9), output[10]);
+  EXPECT_EQ(Byte(10), output[11]);
 }
 
 }  // namespace

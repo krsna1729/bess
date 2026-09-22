@@ -39,6 +39,7 @@
 #include "classifier/byte_key.h"
 #include "classifier/classifier.h"
 #include "classifier/typed_exact.h"
+#include "utils/common.h"
 #include "utils/cuckoo_map.h"
 
 namespace bess::classifier {
@@ -103,6 +104,12 @@ class CuckooExactBackend {
   bess::utils::CuckooMap<Key, Result, Hash, Equal> map_;
 };
 
+template <typename Result>
+struct RuntimeExactRule {
+  ConstBytes key;
+  Result result;
+};
+
 namespace detail {
 
 // Internal fixed-width storage classes for adapting CuckooMap to runtime keys.
@@ -146,8 +153,11 @@ uint64_t RuntimeCuckooLookupBatch(const void *raw_state, ConstBytes keys,
                                   size_t key_stride,
                                   std::span<Result> results) noexcept {
   auto *state = static_cast<const RuntimeCuckooState<StorageBytes, Result> *>(raw_state);
+  promise(key_stride >= state->logical_key_size);
+  promise(keys.size() >= results.size() * key_stride);
+  promise(results.size() <= 64);
   uint64_t hits = 0;
-  const size_t n = std::min(key_stride == 0 ? 0 : keys.size() / key_stride, results.size());
+  const size_t n = results.size();
   RuntimeCuckooKey<StorageBytes> key{};
   key.logical_size = state->logical_key_size;
 
@@ -169,44 +179,88 @@ void RuntimeCuckooDestroy(void *raw_state) noexcept {
 }
 
 template <size_t StorageBytes, typename Result>
-RuntimeExactBackend<Result> CreateCuckooBackendImpl(size_t logical_key_size) {
+ClassifierResult<RuntimeExactBackend<Result>> BuildCuckooBackendImpl(
+    size_t logical_key_size,
+    std::span<const RuntimeExactRule<Result>> rules) {
   auto *state = new RuntimeCuckooState<StorageBytes, Result>();
   state->logical_key_size = logical_key_size;
+
+  RuntimeCuckooKey<StorageBytes> key{};
+  key.logical_size = logical_key_size;
+
+  for (size_t i = 0; i < rules.size(); i++) {
+    const auto &rule = rules[i];
+    if (rule.key.size() != logical_key_size) {
+      delete state;
+      return std::unexpected(ClassifierError{
+          .code = ClassifierErrorCode::kInvalidPlan,
+          .message = "rule key size mismatch with backend key size",
+          .field_index = i,
+      });
+    }
+    std::memcpy(key.bytes.data(), rule.key.data(), logical_key_size);
+    if (state->map.Insert(key, rule.result) == nullptr) {
+      delete state;
+      return std::unexpected(ClassifierError{
+          .code = ClassifierErrorCode::kInvalidPlan,
+          .message = "cuckoo table insertion failed (capacity exceeded)",
+          .field_index = i,
+      });
+    }
+  }
+
   RuntimeExactOps<Result> ops{
       .lookup_batch = RuntimeCuckooLookupBatch<StorageBytes, Result>,
       .destroy = RuntimeCuckooDestroy<StorageBytes, Result>,
       .info = BackendInfo{
           .kind = ExactBackendKind::kCuckoo,
-          .rule_count = 0,
+          .rule_count = rules.size(),
           .key_size = logical_key_size,
           .result_size = sizeof(Result),
-          .storage_bytes = StorageBytes,
+          .storage_bytes = 0,
       },
   };
   return RuntimeExactBackend<Result>(ops, state);
 }
 
-// Factory for building a runtime-erased CuckooMap backend adapted to an arbitrary
+}  // namespace detail
+
+// Factory for building a populated runtime-erased CuckooMap backend adapted to an arbitrary
 // runtime key width using the 8/16/32/64/128/256 internal storage class hierarchy.
 template <typename Result>
-RuntimeExactBackend<Result> MakeRuntimeCuckooBackend(size_t logical_key_size) {
-  if (logical_key_size <= 8) {
-    return CreateCuckooBackendImpl<8, Result>(logical_key_size);
-  } else if (logical_key_size <= 16) {
-    return CreateCuckooBackendImpl<16, Result>(logical_key_size);
-  } else if (logical_key_size <= 32) {
-    return CreateCuckooBackendImpl<32, Result>(logical_key_size);
-  } else if (logical_key_size <= 64) {
-    return CreateCuckooBackendImpl<64, Result>(logical_key_size);
-  } else if (logical_key_size <= 128) {
-    return CreateCuckooBackendImpl<128, Result>(logical_key_size);
-  } else if (logical_key_size <= 256) {
-    return CreateCuckooBackendImpl<256, Result>(logical_key_size);
+ClassifierResult<RuntimeExactBackend<Result>> BuildRuntimeCuckooBackend(
+    size_t logical_key_size,
+    std::span<const RuntimeExactRule<Result>> rules) {
+  if (logical_key_size == 0) {
+    return std::unexpected(ClassifierError{
+        .code = ClassifierErrorCode::kEmptyKey,
+        .message = "logical key size cannot be 0",
+    });
   }
-  return {};
+  if (logical_key_size <= 8) {
+    return detail::BuildCuckooBackendImpl<8, Result>(logical_key_size, rules);
+  } else if (logical_key_size <= 16) {
+    return detail::BuildCuckooBackendImpl<16, Result>(logical_key_size, rules);
+  } else if (logical_key_size <= 32) {
+    return detail::BuildCuckooBackendImpl<32, Result>(logical_key_size, rules);
+  } else if (logical_key_size <= 64) {
+    return detail::BuildCuckooBackendImpl<64, Result>(logical_key_size, rules);
+  } else if (logical_key_size <= 128) {
+    return detail::BuildCuckooBackendImpl<128, Result>(logical_key_size, rules);
+  } else if (logical_key_size <= 256) {
+    return detail::BuildCuckooBackendImpl<256, Result>(logical_key_size, rules);
+  }
+  return std::unexpected(ClassifierError{
+      .code = ClassifierErrorCode::kInvalidPlan,
+      .message = "logical key size exceeds maximum supported 256 bytes",
+  });
 }
 
-}  // namespace detail
+template <typename Result>
+RuntimeExactBackend<Result> MakeRuntimeCuckooBackend(size_t logical_key_size) {
+  auto res = BuildRuntimeCuckooBackend<Result>(logical_key_size, {});
+  return res.has_value() ? std::move(*res) : RuntimeExactBackend<Result>{};
+}
 
 }  // namespace bess::classifier
 

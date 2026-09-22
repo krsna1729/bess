@@ -32,6 +32,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "classifier/classifier.h"
@@ -243,6 +244,58 @@ TEST(RteHashPositionBackendTest, PositionMappedThroughPackedValueStore) {
 
   EXPECT_EQ(v0.size(), resolved_val.size());
   EXPECT_EQ(0, std::memcmp(v0.data(), resolved_val.data(), v0.size()));
+}
+
+TEST(RteHashPositionBackendTest, LookupBatchPackedStride) {
+  RteHashPositionBackend backend(4, 64);
+  ASSERT_TRUE(backend.valid());
+
+  const std::array<Byte, 4> k0 = {Byte{10}, Byte{0}, Byte{0}, Byte{1}};
+  const std::array<Byte, 4> k1 = {Byte{10}, Byte{0}, Byte{0}, Byte{2}};
+  const std::array<Byte, 4> miss = {Byte{10}, Byte{0}, Byte{0}, Byte{99}};
+
+  int32_t p0 = backend.add_key(k0);
+  int32_t p1 = backend.add_key(k1);
+  ASSERT_GE(p0, 0);
+  ASSERT_GE(p1, 0);
+
+  // Packed keys with stride 8 (key_len 4 + 4 padding): k0, miss, k1.
+  std::array<Byte, 3 * 8> packed{};
+  std::memcpy(packed.data(), k0.data(), 4);
+  std::memcpy(packed.data() + 8, miss.data(), 4);
+  std::memcpy(packed.data() + 16, k1.data(), 4);
+  std::array<int32_t, 3> results{};
+
+  uint64_t hits =
+      backend.lookup_batch_packed(ConstBytes(packed), 8, results);
+  EXPECT_EQ(0x5ull, hits);
+  EXPECT_EQ(p0, results[0]);
+  EXPECT_EQ(p1, results[2]);
+}
+
+TEST(RteHashDataBackendTest, LookupBatchPackedStride) {
+  using gate_idx_t = uint16_t;
+  RteHashDataBackend<gate_idx_t> backend(4, 64);
+  ASSERT_TRUE(backend.valid());
+
+  const std::array<Byte, 4> k0 = {Byte{192}, Byte{168}, Byte{1}, Byte{1}};
+  const std::array<Byte, 4> k1 = {Byte{192}, Byte{168}, Byte{1}, Byte{2}};
+  const std::array<Byte, 4> miss = {Byte{10}, Byte{0}, Byte{0}, Byte{1}};
+
+  ASSERT_TRUE(backend.add_key_data(k0, gate_idx_t{100}));
+  ASSERT_TRUE(backend.add_key_data(k1, gate_idx_t{200}));
+
+  std::array<Byte, 3 * 8> packed{};
+  std::memcpy(packed.data(), k0.data(), 4);
+  std::memcpy(packed.data() + 8, miss.data(), 4);
+  std::memcpy(packed.data() + 16, k1.data(), 4);
+  std::array<gate_idx_t, 3> results{};
+
+  uint64_t hits =
+      backend.lookup_batch_packed(ConstBytes(packed), 8, results);
+  EXPECT_EQ(0x5ull, hits);
+  EXPECT_EQ(100u, results[0]);
+  EXPECT_EQ(200u, results[2]);
 }
 
 }  // namespace

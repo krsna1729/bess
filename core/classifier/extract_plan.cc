@@ -29,6 +29,8 @@
 
 #include "classifier/extract_plan.h"
 
+#include "utils/common.h"
+
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -161,57 +163,60 @@ bool ExtractPlan::Execute(const SourceView &source,
   return ExecuteOne(source, key);
 }
 
-bool ExtractPlan::ExecuteBatch(std::span<const SourceView> sources,
-                               MutableBytes output,
-                               size_t key_stride) const noexcept {
+uint64_t ExtractPlan::ExecuteBatch(std::span<const SourceView> sources,
+                                   MutableBytes output,
+                                   size_t key_stride) const noexcept {
+  promise(sources.size() <= 64);
+  promise(key_stride >= key_size_);
+  promise(output.size() >= sources.size() * key_stride);
   if (sources.empty()) {
-    return true;
-  }
-  if (key_stride < key_size_ || sources.size() > output.size() / key_stride) {
-    return false;
+    return 0;
   }
   return kernel_(*this, sources, output, key_stride);
 }
 
-bool ExtractPlan::ExecuteGeneric(const ExtractPlan &plan,
-                                 std::span<const SourceView> sources,
-                                 MutableBytes output,
-                                 size_t key_stride) noexcept {
+uint64_t ExtractPlan::ExecuteGeneric(const ExtractPlan &plan,
+                                     std::span<const SourceView> sources,
+                                     MutableBytes output,
+                                     size_t key_stride) noexcept {
+  uint64_t valid = 0;
   for (size_t i = 0; i < sources.size(); i++) {
-    if (!plan.ExecuteOne(sources[i], output.subspan(i * key_stride,
+    if (plan.ExecuteOne(sources[i], output.subspan(i * key_stride,
                                                    plan.key_size()))) {
-      return false;
+      valid |= (uint64_t{1} << i);
     }
   }
-  return true;
+  return valid;
 }
 
-bool ExtractPlan::ExecuteSinglePacket(const ExtractPlan &plan,
-                                      std::span<const SourceView> sources,
-                                      MutableBytes output,
-                                      size_t key_stride) noexcept {
+uint64_t ExtractPlan::ExecuteSinglePacket(const ExtractPlan &plan,
+                                          std::span<const SourceView> sources,
+                                          MutableBytes output,
+                                          size_t key_stride) noexcept {
+  uint64_t valid = 0;
   const ExtractOp &op = plan.ops_[0];
   for (size_t i = 0; i < sources.size(); i++) {
-    if (!CopySingle(plan, op, sources[i].packet,
-                    output.data() + i * key_stride + op.destination_offset)) {
-      return false;
+    if (CopySingle(plan, op, sources[i].packet,
+                   output.data() + i * key_stride + op.destination_offset)) {
+      valid |= (uint64_t{1} << i);
     }
   }
-  return true;
+  return valid;
 }
 
-bool ExtractPlan::ExecuteSingleMetadata(const ExtractPlan &plan,
-                                        std::span<const SourceView> sources,
-                                        MutableBytes output,
-                                        size_t key_stride) noexcept {
+uint64_t ExtractPlan::ExecuteSingleMetadata(const ExtractPlan &plan,
+                                            std::span<const SourceView> sources,
+                                            MutableBytes output,
+                                            size_t key_stride) noexcept {
+  uint64_t valid = 0;
   const ExtractOp &op = plan.ops_[0];
   for (size_t i = 0; i < sources.size(); i++) {
-    if (!CopySingle(plan, op, sources[i].metadata,
-                    output.data() + i * key_stride + op.destination_offset)) {
-      return false;
+    if (CopySingle(plan, op, sources[i].metadata,
+                   output.data() + i * key_stride + op.destination_offset)) {
+      valid |= (uint64_t{1} << i);
     }
   }
-  return true;
+  return valid;
 }
 
 }  // namespace bess::classifier

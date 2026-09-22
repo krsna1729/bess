@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "classifier/runtime_schema.h"
+#include "utils/common.h"
 
 namespace bess::classifier {
 
@@ -60,9 +61,9 @@ enum class ExtractKernel : uint8_t {
 };
 
 class ExtractPlan;
-using ExtractBatchFn = bool (*)(const ExtractPlan &,
-                                std::span<const SourceView>, MutableBytes,
-                                size_t key_stride) noexcept;
+using ExtractBatchFn = uint64_t (*)(const ExtractPlan &,
+                                    std::span<const SourceView>, MutableBytes,
+                                    size_t key_stride) noexcept;
 
 class ExtractPlan {
  public:
@@ -73,11 +74,13 @@ class ExtractPlan {
   [[nodiscard]] bool Execute(const SourceView &source,
                              MutableBytes key) const noexcept;
 
-  // `output` contains one key per source at `key_stride` bytes. The function
-  // returns false if an output or checked source range is insufficient.
-  [[nodiscard]] bool ExecuteBatch(std::span<const SourceView> sources,
-                                  MutableBytes output,
-                                  size_t key_stride) const noexcept;
+  // `output` contains one key per source at `key_stride` bytes.
+  // Returns a 64-bit mask where bit i is set iff extraction for source i succeeded.
+  // Under BoundsPolicy::kCheck, a short/truncated source clears bit i without
+  // stopping extraction for other packets in the batch.
+  [[nodiscard]] uint64_t ExecuteBatch(std::span<const SourceView> sources,
+                                      MutableBytes output,
+                                      size_t key_stride) const noexcept;
 
   [[nodiscard]] size_t key_size() const noexcept { return key_size_; }
   [[nodiscard]] BoundsPolicy bounds() const noexcept { return bounds_; }
@@ -95,14 +98,14 @@ class ExtractPlan {
 
   [[nodiscard]] bool ExecuteOne(const SourceView &source,
                                 MutableBytes key) const noexcept;
-  static bool ExecuteGeneric(const ExtractPlan &, std::span<const SourceView>,
-                             MutableBytes, size_t) noexcept;
-  static bool ExecuteSinglePacket(const ExtractPlan &,
-                                  std::span<const SourceView>, MutableBytes,
-                                  size_t) noexcept;
-  static bool ExecuteSingleMetadata(const ExtractPlan &,
-                                    std::span<const SourceView>, MutableBytes,
-                                    size_t) noexcept;
+  static uint64_t ExecuteGeneric(const ExtractPlan &, std::span<const SourceView>,
+                                 MutableBytes, size_t) noexcept;
+  static uint64_t ExecuteSinglePacket(const ExtractPlan &,
+                                      std::span<const SourceView>, MutableBytes,
+                                      size_t) noexcept;
+  static uint64_t ExecuteSingleMetadata(const ExtractPlan &,
+                                        std::span<const SourceView>, MutableBytes,
+                                        size_t) noexcept;
 
   size_t key_size_;
   BoundsPolicy bounds_;

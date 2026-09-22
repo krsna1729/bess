@@ -50,25 +50,26 @@ namespace bess::classifier {
 // Layout: values_[0..value_size-1] = slot 1,
 //         values_[value_size..2*value_size-1] = slot 2, ...
 //
-// value_size == 0 is permitted (zero-payload classifiers).
+// Value stores require value_size > 0. Zero-payload classifiers represent presence
+// entirely through hit masks without allocating or indexing payload storage.
 class PackedValueStore {
  public:
-  // value_size: byte width of each stored value.
+  // value_size: byte width of each stored value (must be > 0).
   explicit PackedValueStore(size_t value_size) : value_size_(value_size) {}
 
+  [[nodiscard]] bool valid() const noexcept { return value_size_ > 0; }
+
   // Build path (control plane). Appends a copy of `value` and returns the
-  // 1-based slot assigned to it. The caller must ensure value.size() ==
-  // value_size() (asserts in debug). Returns ResultSlot(0) on mismatch.
+  // 1-based slot assigned to it. Returns ResultSlot(0) if value_size == 0
+  // or on size mismatch.
   ResultSlot Add(ConstBytes value) {
-    if (value.size() != value_size_) {
+    if (value_size_ == 0 || value.size() != value_size_) {
       return ResultSlot(0);
     }
     const uint32_t slot = static_cast<uint32_t>(size()) + 1;
     const size_t old = values_.size();
     values_.resize(old + value_size_);
-    if (value_size_ > 0) {
-      std::memcpy(values_.data() + old, value.data(), value_size_);
-    }
+    std::memcpy(values_.data() + old, value.data(), value_size_);
     return ResultSlot(slot);
   }
 
@@ -90,7 +91,6 @@ class PackedValueStore {
   [[nodiscard]] size_t size() const noexcept {
     return value_size_ == 0 ? 0 : values_.size() / value_size_;
   }
-
   [[nodiscard]] size_t storage_bytes() const noexcept { return values_.size(); }
 
  private:

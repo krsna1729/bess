@@ -52,6 +52,7 @@
 #include "classifier/classifier.h"
 #include "classifier/typed_exact.h"
 #include "dpdk.h"
+#include "utils/common.h"
 
 namespace bess::classifier {
 
@@ -173,18 +174,50 @@ class RteHashPositionBackend {
   // Returns hit mask. results[i] receives the position for hits.
   [[nodiscard]] uint64_t lookup_batch(std::span<const ConstBytes> keys,
                                       std::span<int32_t> results) const noexcept {
+    promise(keys.size() == results.size());
+    promise(keys.size() <= RTE_HASH_LOOKUP_BULK_MAX);
     if (table_ == nullptr || keys.empty()) {
       return 0;
     }
-    const size_t n = std::min(keys.size(), results.size());
-    const uint32_t num_keys = static_cast<uint32_t>(std::min(n, size_t{RTE_HASH_LOOKUP_BULK_MAX}));
+    const uint32_t num_keys = static_cast<uint32_t>(keys.size());
 
     const void *key_ptrs[RTE_HASH_LOOKUP_BULK_MAX];
     for (uint32_t i = 0; i < num_keys; i++) {
+      promise(keys[i].size() == key_len_);
       key_ptrs[i] = keys[i].data();
     }
     int32_t positions[RTE_HASH_LOOKUP_BULK_MAX];
-    rte_hash_lookup_bulk(table_, key_ptrs, num_keys, positions);
+    int ret = rte_hash_lookup_bulk(table_, key_ptrs, num_keys, positions);
+    promise(ret >= 0);
+
+    uint64_t hits = 0;
+    for (uint32_t i = 0; i < num_keys; i++) {
+      results[i] = positions[i];
+      if (positions[i] >= 0) {
+        hits |= (uint64_t{1} << i);
+      }
+    }
+    return hits;
+  }
+
+  // Packed-key bulk lookup where keys are stored contiguously at key_stride bytes.
+  // Structurally guarantees key storage without per-key span metadata.
+  [[nodiscard]] uint64_t lookup_batch_packed(ConstBytes keys, size_t key_stride,
+                                             std::span<int32_t> results) const noexcept {
+    promise(key_stride >= key_len_);
+    promise(keys.size() >= results.size() * key_stride);
+    promise(results.size() <= RTE_HASH_LOOKUP_BULK_MAX);
+    if (table_ == nullptr || results.empty()) {
+      return 0;
+    }
+    const uint32_t num_keys = static_cast<uint32_t>(results.size());
+    const void *key_ptrs[RTE_HASH_LOOKUP_BULK_MAX];
+    for (uint32_t i = 0; i < num_keys; i++) {
+      key_ptrs[i] = keys.data() + i * key_stride;
+    }
+    int32_t positions[RTE_HASH_LOOKUP_BULK_MAX];
+    int ret = rte_hash_lookup_bulk(table_, key_ptrs, num_keys, positions);
+    promise(ret >= 0);
 
     uint64_t hits = 0;
     for (uint32_t i = 0; i < num_keys; i++) {
@@ -322,19 +355,50 @@ class RteHashDataBackend {
   // Returns hit mask natively, copying out results for set bits.
   [[nodiscard]] uint64_t lookup_batch(std::span<const ConstBytes> keys,
                                       std::span<Result> results) const noexcept {
+    promise(keys.size() == results.size());
+    promise(keys.size() <= RTE_HASH_LOOKUP_BULK_MAX);
     if (table_ == nullptr || keys.empty()) {
       return 0;
     }
-    const size_t n = std::min(keys.size(), results.size());
-    const uint32_t num_keys = static_cast<uint32_t>(std::min(n, size_t{RTE_HASH_LOOKUP_BULK_MAX}));
+    const uint32_t num_keys = static_cast<uint32_t>(keys.size());
 
     const void *key_ptrs[RTE_HASH_LOOKUP_BULK_MAX];
     void *data_ptrs[RTE_HASH_LOOKUP_BULK_MAX];
     for (uint32_t i = 0; i < num_keys; i++) {
+      promise(keys[i].size() == key_len_);
       key_ptrs[i] = keys[i].data();
     }
     uint64_t hit_mask = 0;
-    rte_hash_lookup_bulk_data(table_, key_ptrs, num_keys, &hit_mask, data_ptrs);
+    int ret = rte_hash_lookup_bulk_data(table_, key_ptrs, num_keys, &hit_mask, data_ptrs);
+    promise(ret >= 0);
+
+    for (uint32_t i = 0; i < num_keys; i++) {
+      if (hit_mask & (uint64_t{1} << i)) {
+        uintptr_t encoded = reinterpret_cast<uintptr_t>(data_ptrs[i]);
+        std::memcpy(&results[i], &encoded, sizeof(Result));
+      }
+    }
+    return hit_mask;
+  }
+
+  // Packed-key bulk lookup
+  [[nodiscard]] uint64_t lookup_batch_packed(ConstBytes keys, size_t key_stride,
+                                             std::span<Result> results) const noexcept {
+    promise(key_stride >= key_len_);
+    promise(keys.size() >= results.size() * key_stride);
+    promise(results.size() <= RTE_HASH_LOOKUP_BULK_MAX);
+    if (table_ == nullptr || results.empty()) {
+      return 0;
+    }
+    const uint32_t num_keys = static_cast<uint32_t>(results.size());
+    const void *key_ptrs[RTE_HASH_LOOKUP_BULK_MAX];
+    void *data_ptrs[RTE_HASH_LOOKUP_BULK_MAX];
+    for (uint32_t i = 0; i < num_keys; i++) {
+      key_ptrs[i] = keys.data() + i * key_stride;
+    }
+    uint64_t hit_mask = 0;
+    int ret = rte_hash_lookup_bulk_data(table_, key_ptrs, num_keys, &hit_mask, data_ptrs);
+    promise(ret >= 0);
 
     for (uint32_t i = 0; i < num_keys; i++) {
       if (hit_mask & (uint64_t{1} << i)) {

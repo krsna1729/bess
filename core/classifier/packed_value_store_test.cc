@@ -204,12 +204,13 @@ TEST(PackedValueStoreTest, SizeMismatchReturnsSlot0) {
 }
 
 // ---------------------------------------------------------------------------
-// Zero value_size: compiles and size() == 0
+// Zero value_size: rejected and Add returns slot 0
 // ---------------------------------------------------------------------------
 
-TEST(PackedValueStoreTest, ZeroValueSize) {
+TEST(PackedValueStoreTest, ZeroValueSizeRejected) {
   PackedValueStore store(0);
 
+  EXPECT_FALSE(store.valid());
   EXPECT_EQ(0u, store.value_size());
   EXPECT_EQ(0u, store.size());
   EXPECT_EQ(0u, store.storage_bytes());
@@ -217,12 +218,10 @@ TEST(PackedValueStoreTest, ZeroValueSize) {
   // lookup on slot 0 must be empty
   EXPECT_TRUE(store.lookup(ResultSlot(0)).empty());
 
-  // Add an empty-span value (size 0 matches value_size 0)
+  // Zero-width store rejects all Adds and returns ResultSlot(0)
   const ConstBytes empty_val{};
-  // This is a valid Add for value_size==0: span.size()==0 == value_size_==0
-  // The returned slot is 1-based but size() stays 0 (special case in size()).
-  // We just verify it compiles and doesn't crash.
-  (void)store.Add(empty_val);
+  EXPECT_EQ(ResultSlot(0), store.Add(empty_val));
+  EXPECT_EQ(0u, store.size());
 }
 
 }  // namespace

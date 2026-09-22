@@ -190,4 +190,51 @@ TEST(CuckooExactBackend, UsedInExactTable) {
   EXPECT_EQ(nullptr, results[1]);
 }
 
+TEST(CuckooExactBackend, BuildRuntimeCuckooBackendPopulatesAndDispatches) {
+  using gate_idx_t = uint16_t;
+  using bess::classifier::Byte;
+  using bess::classifier::ConstBytes;
+  using bess::classifier::RuntimeExactRule;
+  using bess::classifier::BuildRuntimeCuckooBackend;
+
+  const std::array<Byte, 4> k1 = {Byte{1}, Byte{2}, Byte{3}, Byte{4}};
+  const std::array<Byte, 4> k2 = {Byte{5}, Byte{6}, Byte{7}, Byte{8}};
+  const std::array<Byte, 4> miss = {Byte{9}, Byte{9}, Byte{9}, Byte{9}};
+
+  const std::array<RuntimeExactRule<gate_idx_t>, 2> rules = {
+      RuntimeExactRule<gate_idx_t>{.key = ConstBytes(k1), .result = 7},
+      RuntimeExactRule<gate_idx_t>{.key = ConstBytes(k2), .result = 42},
+  };
+
+  auto backend_res = BuildRuntimeCuckooBackend<gate_idx_t>(4, rules);
+  ASSERT_TRUE(backend_res.has_value());
+  auto backend = std::move(*backend_res);
+  ASSERT_TRUE(backend);
+  EXPECT_EQ(2u, backend.info().rule_count);
+  EXPECT_EQ(4u, backend.info().key_size);
+  EXPECT_EQ(0u, backend.info().storage_bytes);  // storage_bytes truthful / not misleading
+
+  // Packed keys input: k1, miss, k2 (stride = 4)
+  std::array<Byte, 3 * 4> packed_keys{};
+  std::memcpy(packed_keys.data(), k1.data(), 4);
+  std::memcpy(packed_keys.data() + 4, miss.data(), 4);
+  std::memcpy(packed_keys.data() + 8, k2.data(), 4);
+
+  std::array<gate_idx_t, 3> results{};
+  uint64_t hits = backend.lookup_batch(ConstBytes(packed_keys), 4, results);
+
+  // Bits 0 and 2 set -> 0b101 = 5
+  EXPECT_EQ(0x5ull, hits);
+  EXPECT_EQ(7u, results[0]);
+  EXPECT_EQ(42u, results[2]);
+
+  // Rule key size mismatch returns error
+  const std::array<Byte, 3> bad_key = {Byte{1}, Byte{2}, Byte{3}};
+  const std::array<RuntimeExactRule<gate_idx_t>, 1> bad_rules = {
+      RuntimeExactRule<gate_idx_t>{.key = ConstBytes(bad_key), .result = 99},
+  };
+  auto bad_res = BuildRuntimeCuckooBackend<gate_idx_t>(4, bad_rules);
+  EXPECT_FALSE(bad_res.has_value());
+}
+
 }  // namespace

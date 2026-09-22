@@ -2678,10 +2678,16 @@ rather than one call site).
       `SortedFlatBackend` provides binary search over packed arrays;
       `DirectExactBackend` provides bounded direct array indexing for 1-byte
       and 2-byte key domains.
-    - **Measurements (`classifier_bench.cc`)**: added benchmark coverage for
+    - **Measurements (`classifier_bench.cc`)**: added smoke-baseline coverage for
       DirectExact (1.08 ns / 1.51 Glookups/s), SmallExact (~4.1 ns/lookup),
       CuckooExact (~5.8 ns/lookup), and rte_hash position/data bulk (~10 ns/lookup)
-      across batches of 1, 8, 16, and 32.
+      across batches of 1, 8, 16, and 32. These are **not a backend-selection
+      experiment**: fixed 8-byte keys, all-hit traffic, fixed 32-rule Small and
+      64-rule Cuckoo/rte_hash cases, no rule-count sweep, miss mix, key-width
+      sweep, runtime-erased Cuckoo, SortedFlat measurement, build/rebuild cost,
+      or memory comparison. Cuckoo uses `ByteKeyHash`/FNV while rte_hash uses
+      its default hash, so the numbers measure backend + hash choice, not just
+      the table implementation. Do not derive `Auto` thresholds from them.
 
 ## Review process established this session
 
