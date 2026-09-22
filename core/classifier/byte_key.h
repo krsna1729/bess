@@ -84,9 +84,21 @@ struct KeyTraits<ByteKey<N>> {
 // Use a registered equality operation when one exists; otherwise, typed
 // backends fall back to the author's operator==. Hashing has no such
 // fallback: arbitrary object representation is never hashed implicitly.
+//
+// Conditionally noexcept: the packet path is noexcept, so a throwing
+// operator== must be reported by the concept below rather than terminating
+// inside a lookup.
+template <typename Key>
+struct TypedKeyEqual {
+  constexpr bool operator()(const Key &lhs, const Key &rhs) const
+      noexcept(noexcept(lhs == rhs)) {
+    return lhs == rhs;
+  }
+};
+
 template <typename Key, typename = void>
 struct DefaultTypedEqual {
-  using type = std::equal_to<Key>;
+  using type = TypedKeyEqual<Key>;
 };
 
 template <typename Key>
@@ -97,16 +109,24 @@ struct DefaultTypedEqual<Key, std::void_t<typename KeyTraits<Key>::equal_type>> 
 template <typename Key>
 using DefaultTypedEqualT = typename DefaultTypedEqual<Key>::type;
 
+// The typed backends construct their hash and equality operations as Hash{}
+// and Equal{} and call them from noexcept packet-path methods. This concept is
+// that contract: stateless, default-constructible, and non-throwing. A
+// stateful or throwing functor is a compile error here, not a runtime
+// surprise. Stateful hashing stays available on the runtime path, whose
+// functors are bound to a logical key size at construction.
 template <typename Key, typename Equal>
 concept TypedKeyEquality =
-    std::is_object_v<Key> && requires(const Key &lhs, const Key &rhs) {
-      { std::declval<Equal>()(lhs, rhs) } -> std::same_as<bool>;
+    std::is_object_v<Key> && std::default_initializable<Equal> &&
+    requires(const Key &lhs, const Key &rhs) {
+      { Equal{}(lhs, rhs) } noexcept -> std::same_as<bool>;
     };
 
 template <typename Key, typename Hash, typename Equal>
 concept TypedKeyOperations =
-    TypedKeyEquality<Key, Equal> && requires(const Key &key) {
-      { std::declval<Hash>()(key) } -> std::convertible_to<size_t>;
+    TypedKeyEquality<Key, Equal> && std::default_initializable<Hash> &&
+    requires(const Key &key) {
+      { Hash{}(key) } noexcept -> std::convertible_to<size_t>;
     };
 
 template <typename Key>
@@ -114,16 +134,12 @@ concept CanonicalByteKey =
     std::is_trivially_copyable_v<Key> &&
     KeyTraits<Key>::canonical_representation;
 
+// Registered-key form of the same contract: a KeyTraits specialization must
+// provide default-constructible, non-throwing operations too.
 template <typename Key>
-concept TypedClassifierKey =
-    std::is_object_v<Key> && requires(const Key &lhs, const Key &rhs) {
-      typename KeyTraits<Key>::hash_type;
-      typename KeyTraits<Key>::equal_type;
-      { std::declval<typename KeyTraits<Key>::hash_type>()(lhs) } ->
-          std::convertible_to<size_t>;
-      { std::declval<typename KeyTraits<Key>::equal_type>()(lhs, rhs) } ->
-          std::same_as<bool>;
-    };
+concept TypedClassifierKey = TypedKeyOperations<
+    Key, typename KeyTraits<Key>::hash_type,
+    typename KeyTraits<Key>::equal_type>;
 
 template <typename Key>
 concept ClassifierKey = CanonicalByteKey<Key> || TypedClassifierKey<Key>;

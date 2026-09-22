@@ -113,6 +113,16 @@ struct BackendInfo {
   size_t storage_bytes = 0;
 };
 
+// Masked/ternary classification is a different problem shape from exact
+// matching, so its metrics are not reported through BackendInfo.
+struct MaskedBackendInfo {
+  WildcardBackendKind kind = WildcardBackendKind::kTupleSpace;
+  size_t tuple_count = 0;
+  size_t rule_count = 0;
+  size_t key_size = 0;
+  size_t result_size = 0;
+};
+
 }  // namespace bess::classifier
 
 #endif  // BESS_CLASSIFIER_CLASSIFIER_H_

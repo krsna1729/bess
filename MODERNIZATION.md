@@ -182,16 +182,17 @@ typed backends accept an author's own `Key`/`Hash`/`Equal` without a
 `KeyTraits` registration or `ByteKey`, `ExactTable` is decoupled from the key
 concept, `BatchExactBackend` names the result type explicitly, and a
 three-rung benchmark (author loop / `ExactTable` / runtime-generic) records the
-comparison without declaring a winner. The next milestone is K3.5-K3.7,
-K4-K8, and G1. The active build graph is
+comparison without declaring a winner. K3.5 adds the generic masked/tuple-space
+substrate (`classifier/masked_exact.h`) as a library, leaving `WildcardMatch`
+untouched; K3.6 is its cutover plus the module defects listed below. The next
+milestone is K3.6-K3.7, K4-K8, and G1. The active build graph is
 Meson/Ninja only. GCC and Clang full Meson compiles succeed with pinned DPDK
-25.11.3. The registered suite is now 69 tests: 51 native C++ binaries, 15
+25.11.3. The registered suite is now 71 tests: 52 native C++ binaries, 16
 benchmark smoke tests (including the PMD null/ring smoke), the sample-plugin
-registry load, the Python target, and the module integration run. All 69
-registered targets pass in the current tree: the 54 non-benchmark targets in
-one full run and the 15 benchmark smoke targets in another. K3.4's own targets
-(the four typed-backend unit binaries and `classifier_typed_bench`) pass under
-GCC, Clang, and ASan+UBSan.
+registry load, the Python target, and the module integration run. All 55
+non-benchmark targets pass in one full run; K3.4's and K3.5's own targets (the
+typed- and masked-backend unit binaries plus `classifier_typed_bench` and
+`classifier_masked_bench`) pass under GCC, Clang, and ASan+UBSan.
 The classifier extract-plan, Cuckoo, and migration tests pass under ASan+UBSan;
 the Rte hash classifier test remains environment-incompatible because DPDK EAL
 cannot allocate its required memory under sanitizer. `-Daf_xdp=required`
@@ -2896,6 +2897,67 @@ rather than one call site).
       ASan+UBSan; the full 2112-registration typed benchmark matrix exits 0; the
       whole registered suite passes (54 non-benchmark targets in one run, 15
       benchmark smoke targets in another).
+
+68. **K3.5 generic masked/tuple-space substrate** — the mechanism behind
+    `WildcardMatch`, extracted as a library with no module changes:
+    - **Contract** (`classifier/masked_exact.h`): `RuntimeMaskedRule<Result,
+      Priority>` is `{value, mask, priority, result}`; `RankedResult<Result,
+      Priority>` is the per-tuple candidate `{priority, ordinal, result}`;
+      `RuntimeMaskedBackend<Result, Priority>` owns one tuple per distinct mask,
+      each holding a `RuntimeExactBackend<RankedResult<…>>` keyed by the masked
+      value. Lookup is tuple-major, batch-minor: mask the batch once per tuple,
+      exact-look it up, merge by rank. No second hash table — the packed keys,
+      borrowed probes, hit masks, and immutable generations are the K3.3.2
+      machinery reused as-is.
+    - **Semantics fixed in the substrate, not inherited from the module**:
+      `value & ~mask == 0` is required and a violation is rejected at build time
+      rather than normalized; tuple count is unbounded (the module's
+      `MAX_TUPLES = 8` stays a wire-compatibility concern); priority is
+      `int64_t` by default with no narrowing; equal priorities resolve by
+      `(priority, ordinal)` with the later rule winning, so the outcome does not
+      depend on tuple iteration order — proven by a test that swaps the rule
+      order and asserts the winner swaps with it. Duplicate `(mask, value)`
+      entries collapse deterministically to the better rank instead of
+      depending on insertion order. Key width is capped at 64 bytes at build
+      time, which bounds the packet path's stack scratch.
+    - **`MaskedBackendInfo`** (new, in `classifier.h`) reports tuple-space
+      metrics through `WildcardBackendKind::kTupleSpace` rather than being
+      forced through the exact-matching `BackendInfo`.
+    - **`classifier_masked_bench.cc`** compares three rungs — naive linear rule
+      scan, legacy-style tuple-space (per-tuple `CuckooMap` over 8-byte-word
+      keys with the module's CRC32C-chained hash, reimplemented so no module
+      code is involved), and the substrate — plus two isolations, mask-only and
+      a single tuple's exact lookup. Masks are arbitrary bit patterns, never
+      prefixes; each configuration reports its measured average tuple-match
+      count so the distribution labels are checked against the data. The sweep
+      varies key width 4/8/16/32/64, tuple count 1/2/4/8/16/32, rules per tuple
+      4/16/64, mask density 50/75/100, identical-vs-diverse masks, batch
+      1/8/16/32, and one-tuple/multi-tuple/all-miss traffic; 162 registrations
+      exit 0.
+    - **Representative means** (5 repetitions, batch 8, 8-byte keys, 16
+      rules/tuple, density 75, diverse masks, one-tuple traffic; CPU scaling
+      enabled): tuple count 1/2/4/8/16/32 gives substrate 66.6/101/167/349/621/
+      1187 ns against legacy 63.2/127/247/496/818/1364 ns and naive
+      174/271/485/900/1723/3432 ns. The substrate and the legacy mechanism are
+      equal within noise at one tuple (where the substrate still runs its merge)
+      and separate from two tuples upward. At four tuples the isolation
+      measures mask-only ≈ 31 ns and one tuple's exact lookup ≈ 22 ns, so
+      31 + 4×22 ≈ 119 ns of the measured 167 ns is masking plus exact lookup and
+      the remainder is the merge — the decomposition the isolation exists to
+      provide.
+    - **Deliberate non-changes**: `WildcardMatch` is untouched. Its defects
+      (`ProcessBatch()`'s unchecked fixed 8-byte loads, the
+      `total_key_size_ == 0` underflow, `DelEntry()`'s inverted
+      `CuckooMap::Remove()` handling, `Clear()` leaving tuple objects behind,
+      partially-applied `SetRuntimeConfig()`, `int64` priority narrowed to
+      `int`, and unvalidated value/mask lengths) are K3.6 work with regression
+      tests written first; none of them is encoded in the substrate.
+    - **Verification**: `classifier_masked_exact_test` (14 tests) passes under
+      GCC, Clang, and ASan+UBSan. ASan caught a real defect while writing it —
+      rule spans pointing into temporary byte vectors — which is why the tests
+      now build rules through an owning `RuleSet` instead of a helper that
+      accepts temporaries. GCC and Clang full builds pass; the 55
+      non-benchmark targets pass in one full run.
 
 ## Review process established this session
 

@@ -1,0 +1,364 @@
+// Copyright (c) 2026, Nefeli Networks, Inc.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice, this
+// list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice,
+// this list of conditions and the following disclaimer in the documentation
+// and/or other materials provided with the distribution.
+//
+// * Neither the names of the copyright holders nor the names of their
+// contributors may be used to endorse or promote products derived from this
+// software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+#ifndef BESS_CLASSIFIER_MASKED_EXACT_H_
+#define BESS_CLASSIFIER_MASKED_EXACT_H_
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <map>
+#include <span>
+#include <utility>
+#include <vector>
+
+#include "classifier/backend.h"
+#include "classifier/classifier.h"
+#include "classifier/cuckoo_exact.h"
+#include "classifier/runtime_schema.h"
+#include "utils/common.h"
+
+namespace bess::classifier {
+
+// One masked (ternary) rule: the key masked by `mask` must equal `value`. The
+// canonical form is required, not normalized:
+//
+//     value & ~mask == 0
+//
+// A pair violating it is a configuration error and is rejected at build time,
+// matching the check the existing WildcardMatch module already performs.
+template <typename Result, typename Priority = int64_t>
+struct RuntimeMaskedRule {
+  ConstBytes value;
+  ConstBytes mask;
+  Priority priority{};
+  Result result{};
+};
+
+// A rule's rank and its result, as stored in the tuple's exact table.
+//
+// `ordinal` is the rule's index in the generation's rule vector. Equal
+// priorities are resolved by larger ordinal (later rule wins), so the outcome
+// never depends on tuple iteration order. The substrate therefore defines tie
+// behavior even though the current WildcardMatch protobuf leaves it undefined;
+// a module may keep that promise narrower.
+template <typename Result, typename Priority = int64_t>
+struct RankedResult {
+  Priority priority{};
+  uint64_t ordinal = 0;
+  Result result{};
+};
+
+namespace detail {
+
+// Largest logical key width the masked substrate accepts. Bounds the batch
+// scratch the packet path keeps on the stack; a wider key is a build error
+// rather than a silent stack growth.
+inline constexpr size_t kMaskedMaxKeyBytes = 64;
+
+using MaskBatchFn = void (*)(ConstBytes keys, size_t key_stride,
+                             ConstBytes mask, size_t count,
+                             MutableBytes out) noexcept;
+
+template <size_t Width>
+void MaskBatchFixed(ConstBytes keys, size_t key_stride, ConstBytes mask,
+                    size_t count, MutableBytes out) noexcept {
+  using Word = std::conditional_t<
+      Width == 1, uint8_t,
+      std::conditional_t<Width == 2, uint16_t,
+                         std::conditional_t<Width == 4, uint32_t, uint64_t>>>;
+  Word mask_word;
+  std::memcpy(&mask_word, mask.data(), sizeof(mask_word));
+  for (size_t i = 0; i < count; i++) {
+    Word value;
+    std::memcpy(&value, keys.data() + i * key_stride, sizeof(value));
+    value &= mask_word;
+    std::memcpy(out.data() + i * Width, &value, sizeof(value));
+  }
+}
+
+void MaskBatchVariable(ConstBytes keys, size_t key_stride, ConstBytes mask,
+                       size_t count, MutableBytes out) noexcept {
+  const size_t key_bytes = mask.size();
+  for (size_t i = 0; i < count; i++) {
+    const std::byte *src = keys.data() + i * key_stride;
+    std::byte *dst = out.data() + i * key_bytes;
+    for (size_t b = 0; b < key_bytes; b++) {
+      dst[b] = src[b] & mask[b];
+    }
+  }
+}
+
+// Bind the masking kernel to the key width once at build time.
+inline MaskBatchFn SelectMaskBatch(size_t key_bytes) {
+  switch (key_bytes) {
+    case 1:
+      return MaskBatchFixed<1>;
+    case 2:
+      return MaskBatchFixed<2>;
+    case 4:
+      return MaskBatchFixed<4>;
+    case 8:
+      return MaskBatchFixed<8>;
+    default:
+      return MaskBatchVariable;
+  }
+}
+
+}  // namespace detail
+
+// Generation-owned masked classifier: one tuple per distinct mask, each tuple
+// owning an exact table keyed by the masked value.
+//
+//     RuntimeMaskedBackend<Result>
+//         ├── Tuple(mask A) → RuntimeExactBackend<RankedResult<Result>>
+//         ├── Tuple(mask B) → RuntimeExactBackend<RankedResult<Result>>
+//         └── ...
+//
+// Lookup is tuple-major, batch-minor: mask the batch once per tuple, exact-look
+// it up, then merge by rank. The exact machinery is the one the runtime exact
+// path already uses — packed keys, borrowed probes, hit masks — so there is no
+// second hash table here.
+//
+// Tuple count is unbounded; the eight-tuple ceiling belongs to the existing
+// module's wire compatibility, not to this substrate.
+//
+// Build contract: construction is control-plane only. Once published the
+// backend is immutable, and `lookup_batch()` is safe from concurrent readers.
+template <typename Result, typename Priority = int64_t>
+class RuntimeMaskedBackend {
+ public:
+  using ranked_type = RankedResult<Result, Priority>;
+
+  static constexpr size_t kMaxBatch = 64;
+
+  RuntimeMaskedBackend() = default;
+  RuntimeMaskedBackend(const RuntimeMaskedBackend &) = delete;
+  RuntimeMaskedBackend &operator=(const RuntimeMaskedBackend &) = delete;
+  RuntimeMaskedBackend(RuntimeMaskedBackend &&) = default;
+  RuntimeMaskedBackend &operator=(RuntimeMaskedBackend &&) = default;
+
+  // Rejects an empty key size, a key size above `kMaskedMaxKeyBytes`, a rule
+  // whose value/mask lengths disagree with the key size, and a rule violating
+  // `value & ~mask == 0`.
+  static ClassifierResult<RuntimeMaskedBackend> Build(
+      size_t key_size,
+      std::span<const RuntimeMaskedRule<Result, Priority>> rules) {
+    if (key_size == 0) {
+      return std::unexpected(ClassifierError{
+          .code = ClassifierErrorCode::kEmptyKey,
+          .message = "key size cannot be 0",
+      });
+    }
+    if (key_size > detail::kMaskedMaxKeyBytes) {
+      return std::unexpected(ClassifierError{
+          .code = ClassifierErrorCode::kKeyOutOfBounds,
+          .message = "key size exceeds the masked substrate maximum",
+      });
+    }
+
+    // Group rules by mask, in first-seen order: a tuple is a mask class, not a
+    // priority class.
+    std::map<std::vector<std::byte>, size_t> tuple_of_mask;
+    std::vector<std::vector<std::byte>> masks;
+    std::vector<std::vector<std::pair<std::vector<std::byte>, ranked_type>>>
+        entries;
+
+    for (size_t i = 0; i < rules.size(); i++) {
+      const auto &rule = rules[i];
+      if (rule.value.size() != key_size || rule.mask.size() != key_size) {
+        return std::unexpected(ClassifierError{
+            .code = ClassifierErrorCode::kInvalidPlan,
+            .message = "rule value/mask length does not match the key size",
+            .field_index = i,
+        });
+      }
+      if (!IsCanonical(rule)) {
+        return std::unexpected(ClassifierError{
+            .code = ClassifierErrorCode::kInvalidPlan,
+            .message =
+                "rule is not canonical: value has bits set outside its mask",
+            .field_index = i,
+        });
+      }
+
+      std::vector<std::byte> mask(rule.mask.begin(), rule.mask.end());
+      auto [it, inserted] = tuple_of_mask.emplace(mask, masks.size());
+      if (inserted) {
+        masks.push_back(std::move(mask));
+        entries.emplace_back();
+      }
+      std::vector<std::byte> value(rule.value.begin(), rule.value.end());
+      entries[it->second].emplace_back(
+          std::move(value),
+          ranked_type{.priority = rule.priority,
+                      .ordinal = static_cast<uint64_t>(i),
+                      .result = rule.result});
+    }
+
+    RuntimeMaskedBackend backend;
+    backend.key_size_ = key_size;
+    backend.mask_batch_ = detail::SelectMaskBatch(key_size);
+    backend.rule_count_ = rules.size();
+    backend.tuples_.reserve(masks.size());
+
+    for (size_t t = 0; t < masks.size(); t++) {
+      auto &group = entries[t];
+      // Equal masked values inside one tuple are the same lookup key. Keep the
+      // better rank deterministically: the exact builder rejects duplicate
+      // keys, and leaving the choice to insertion order would make the outcome
+      // depend on rule order in a way this substrate does not promise.
+      std::sort(group.begin(), group.end(),
+                [](const auto &lhs, const auto &rhs) {
+                  return lhs.first < rhs.first;
+                });
+      std::vector<std::pair<std::vector<std::byte>, ranked_type>> deduped;
+      deduped.reserve(group.size());
+      for (auto &entry : group) {
+        if (!deduped.empty() && deduped.back().first == entry.first) {
+          if (BetterRank(entry.second, deduped.back().second)) {
+            deduped.back().second = entry.second;
+          }
+          continue;
+        }
+        deduped.push_back(std::move(entry));
+      }
+
+      std::vector<RuntimeExactRule<ranked_type>> exact_rules;
+      exact_rules.reserve(deduped.size());
+      for (const auto &entry : deduped) {
+        exact_rules.push_back(RuntimeExactRule<ranked_type>{
+            .key = ConstBytes(entry.first.data(), entry.first.size()),
+            .result = entry.second,
+        });
+      }
+
+      auto built = BuildRuntimeCuckooBackend<ranked_type>(key_size, exact_rules);
+      if (!built) {
+        return std::unexpected(std::move(built.error()));
+      }
+      backend.tuples_.push_back(Tuple{std::move(masks[t]), std::move(*built)});
+    }
+
+    return backend;
+  }
+
+  // Packet path. Bit i of the return value is set iff `results[i]` was
+  // written. A slot that no tuple matched is left untouched.
+  [[nodiscard]] uint64_t lookup_batch(ConstBytes keys, size_t key_stride,
+                                      std::span<Result> results) const noexcept {
+    const size_t count = results.size();
+    if (count == 0 || tuples_.empty()) {
+      return 0;
+    }
+    promise(count <= kMaxBatch);
+    promise(key_stride <= keys.size() / count);
+
+    // Stack bound: count * kMaskedMaxKeyBytes for the masked keys plus two
+    // rank buffers. Worst case (64 keys of 64 bytes, 32-byte results) is about
+    // 12 KiB, well inside the batch-sized frames this codebase already uses.
+    std::array<std::byte, kMaxBatch * detail::kMaskedMaxKeyBytes> scratch{};
+    std::array<ranked_type, kMaxBatch> candidates{};
+    std::array<ranked_type, kMaxBatch> best{};
+    const size_t scratch_bytes = count * key_size_;
+
+    uint64_t matched = 0;
+    for (const Tuple &tuple : tuples_) {
+      mask_batch_(keys, key_stride, ConstBytes(tuple.mask), count,
+                  MutableBytes(scratch).first(scratch_bytes));
+      const uint64_t hits = tuple.backend.lookup_batch(
+          ConstBytes(scratch).first(scratch_bytes), key_size_,
+          std::span<ranked_type>(candidates).first(count));
+      for (size_t i = 0; i < count; i++) {
+        const uint64_t bit = uint64_t{1} << i;
+        if ((hits & bit) == 0) {
+          continue;
+        }
+        if ((matched & bit) == 0 || BetterRank(candidates[i], best[i])) {
+          best[i] = candidates[i];
+          results[i] = candidates[i].result;
+          matched |= bit;
+        }
+      }
+    }
+    return matched;
+  }
+
+  [[nodiscard]] size_t key_size() const noexcept { return key_size_; }
+
+  [[nodiscard]] size_t tuple_count() const noexcept { return tuples_.size(); }
+
+  [[nodiscard]] size_t rule_count() const noexcept { return rule_count_; }
+
+  [[nodiscard]] MaskedBackendInfo info() const noexcept {
+    return MaskedBackendInfo{
+        .kind = WildcardBackendKind::kTupleSpace,
+        .tuple_count = tuples_.size(),
+        .rule_count = rule_count_,
+        .key_size = key_size_,
+        .result_size = sizeof(Result),
+    };
+  }
+
+ private:
+  struct Tuple {
+    std::vector<std::byte> mask;
+    RuntimeExactBackend<ranked_type> backend;
+  };
+
+  static bool IsCanonical(const RuntimeMaskedRule<Result, Priority> &rule) {
+    for (size_t b = 0; b < rule.mask.size(); b++) {
+      const uint8_t value = std::to_integer<uint8_t>(rule.value[b]);
+      const uint8_t mask = std::to_integer<uint8_t>(rule.mask[b]);
+      if ((value & static_cast<uint8_t>(~mask)) != 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool BetterRank(const ranked_type &candidate,
+                         const ranked_type &incumbent) {
+    if (candidate.priority != incumbent.priority) {
+      return candidate.priority > incumbent.priority;
+    }
+    return candidate.ordinal > incumbent.ordinal;
+  }
+
+  size_t key_size_ = 0;
+  size_t rule_count_ = 0;
+  detail::MaskBatchFn mask_batch_ = nullptr;
+  std::vector<Tuple> tuples_;
+};
+
+}  // namespace bess::classifier
+
+#endif  // BESS_CLASSIFIER_MASKED_EXACT_H_

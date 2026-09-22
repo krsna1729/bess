@@ -95,6 +95,54 @@ static_assert(InlineResult<uint32_t>);
 static_assert(!ReferencedResult<uint32_t>);
 static_assert(!std::is_same_v<ResultSlot, bess::dataplane::ActionId>);
 
+// The typed contract is the stateless, non-throwing model the backends actually
+// instantiate: Hash{} and Equal{} called from noexcept packet-path methods.
+// These assertions are the constraint, not a stylistic preference.
+struct StatefulHash {
+  size_t seed;
+
+  explicit StatefulHash(size_t value) : seed(value) {}
+  size_t operator()(const FlowKey &) const noexcept { return seed; }
+};
+
+struct ThrowingEqual {
+  bool operator()(const FlowKey &, const FlowKey &) const { return true; }
+};
+
+struct StatefulEqual {
+  size_t unused;
+
+  explicit StatefulEqual(size_t value) : unused(value) {}
+  bool operator()(const FlowKey &, const FlowKey &) const noexcept {
+    return true;
+  }
+};
+
+static_assert(bess::classifier::TypedKeyOperations<FlowKey, FlowKeyHash,
+                                                   FlowKeyEqual>);
+static_assert(!bess::classifier::TypedKeyOperations<FlowKey, StatefulHash,
+                                                    FlowKeyEqual>);
+static_assert(!bess::classifier::TypedKeyOperations<FlowKey, FlowKeyHash,
+                                                    ThrowingEqual>);
+static_assert(!bess::classifier::TypedKeyEquality<FlowKey, StatefulEqual>);
+
+// TypedKeyEqual is the no-registration fallback and requires the author's own
+// operator==, which FlowKey (registered through KeyTraits) does not define.
+struct ComparableKey {
+  uint32_t value;
+
+  friend bool operator==(const ComparableKey &, const ComparableKey &) = default;
+};
+
+static_assert(bess::classifier::TypedKeyEquality<
+              ComparableKey, bess::classifier::TypedKeyEqual<ComparableKey>>);
+
+TEST(TypedExactTest, DefaultEqualityUsesAuthorOperator) {
+  const bess::classifier::TypedKeyEqual<ComparableKey> equal;
+  EXPECT_TRUE(equal(ComparableKey{7}, ComparableKey{7}));
+  EXPECT_FALSE(equal(ComparableKey{7}, ComparableKey{8}));
+}
+
 struct FakeBackend {
   uint32_t result = 0;
 
