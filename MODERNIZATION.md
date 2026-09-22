@@ -149,28 +149,34 @@ and Clang: 41 native test binaries, 22/22 module integration files against a
 foreground daemon, and the wire-parity script.
 
 The modern-glog daemon-mode recursion is fixed (§8, entry 54), **K1 is
-complete** (entries 55-57), **K2 and K2.6 are complete** (entries 58-61):
+complete** (entries 55-57), and **K2, K2.6, and K3.1 are complete** (entries
+58-62):
 `RuntimeState` owns one dataplane `RcuDomain`, workers register/online/offline/
 unregister around the pause boundary, the scheduler reports quiescence at a safe
-task boundary, `RcuPtr<T>` publishes and retires immutable state with an
-acquire-load read path, and `IPLookup` and `ExactMatch` are migrated onto it
-(with `PublishedGeneration` deleted). K2 adds `StrongId<Tag, Rep>`/`ActionId`,
-the immutable `ObjectTable<Id, T>` with a mutable builder, and a benchmarked
-flat inline generation-owned representation. K2.6 constrains the id/hash
-substrate, makes batch-size mismatch a caller precondition, corrects the
-benchmark's exact object sizes and hot-field layout, and measures sparse
-high-water occupancy against a flat validity bitmap and indirect storage.
+task boundary, and `RcuPtr<T>` publishes and retires immutable state with an
+acquire-load read path. K2 adds `StrongId<Tag, Rep>`/`ActionId`, the immutable
+`ObjectTable<Id, T>` with a mutable builder, and a benchmarked flat
+inline generation-owned representation. K2.6 constrains the id/hash substrate,
+makes batch-size mismatch a caller precondition, corrects the benchmark's exact
+object sizes and hot-field layout, and measures sparse high-water occupancy
+against a flat validity bitmap and indirect storage. K3.1 adds the reusable
+`bess::classifier` substrate without touching `ExactMatch`, `WildcardMatch`, or
+`ACL`: resolved runtime schemas compile into exact-width extraction and result
+placement plans, typed users get a metadata-free constrained API, runtime
+backend selection is generation-level type erasure, and one immutable generation
+owns extraction, backend, and placement state.
 Generation ownership remains flat; `optional<T>` is kept for its general
 move-only semantics, while sparse bitmap/indirect policies remain benchmark
-candidates rather than public types. K2 has no production consumer yet by
-design. The next work follows the order in the roadmap below: K3 (unified
-runtime-schema classifier), then K4-K8, then G1. The active build graph is
-Meson/Ninja only. GCC and Clang full Meson compiles succeed with the pinned DPDK
-25.11.3. GCC verification passes 52/52 registered Meson tests -- 37 native C++
-test binaries, 12 benchmark smoke tests (including the PMD null/ring smoke),
-the sample-plugin registry load, the Python target and the module integration
-run. K2's two non-EAL test binaries also pass under ASan+UBSan; the EAL-backed
-one cannot, because DPDK cannot initialise under ASan. `-Daf_xdp=required`
+candidates rather than public types. K2 and K3.1 have no production consumer yet
+by design. The next work follows the order in the roadmap below: K3.2 exact
+backend implementations and measurements, then K3.3+ module cutovers, followed
+by K4-K8 and G1. The active build graph is Meson/Ninja only.
+GCC and Clang full Meson compiles succeed with pinned DPDK 25.11.3. The
+registered suite is now 61 tests: 45 native C++ binaries, 13 benchmark smoke
+tests (including the PMD null/ring smoke), the sample-plugin registry load, the
+Python target, and the module integration run. K3.1's eight classifier tests
+also pass under ASan+UBSan; the existing EAL-backed sanitizer test remains
+incompatible with DPDK initialization under ASan. `-Daf_xdp=required`
 configuration, install staging, generated build-tree protobuf imports, and
 source-tree hygiene checks also pass.
 
@@ -2594,6 +2600,39 @@ rather than one call site).
     GCC; `core/dataplane_object_table_test` passes all 13 cases; and the
     sparse benchmark executes all 270 rows. The full Meson graph remains the
     required closeout check after the final K2.6 edit.
+
+62. **`9420ba12`** — **K3.1 classifier substrate** — the reusable runtime and
+    typed frontend contracts now exist under `core/classifier/`, without
+    changing `ExactMatch`, `WildcardMatch`, or `ACL`:
+
+    - **`classifier.h` / `runtime_schema.h`** define `bess::classifier`,
+      `ClassifierError`/`std::expected` construction results, explicit packet
+      versus metadata sources, checked versus caller-guaranteed bounds, result
+      modes, backend vocabulary, `BackendInfo`, and `ResultSlot` as a strong
+      type distinct from `ActionId`.
+    - **`ExtractPlan`** compiles resolved arbitrary-width runtime fields into
+      coalesced operations, exact-size `memcpy` kernels, explicit batch stride,
+      and single-packet/single-metadata/generic batch kernels. **`ResultPlan`**
+      independently compiles and coalesces value-to-metadata placement.
+      Neither plan carries protobuf objects, metadata names, strings, or
+      `Module` pointers into packet execution.
+    - **`byte_key.h` / `typed_exact.h`** provide canonical `ByteKey<N>`,
+      explicit `KeyTraits`, safe endian/bit-cast helpers, constrained backend
+      concepts, and a metadata-free `ExactTable<Key, Result, Backend>`.
+      Typed lookup remains ordinary template code with no mandatory virtual
+      dispatch; empty and move-only backends are covered by static/runtime
+      tests.
+    - **`backend.h` / `generation.h`** provide generation-level runtime
+      function-pointer type erasure (one batch dispatch), immutable ownership of
+      extraction/backend/result state, and the `RuntimeClassifierGeneration`
+      seam for K1 `RcuPtr` publication. The fake-generation test proves an old
+      generation remains coherent until its grace period completes.
+    - Meson registers eight classifier unit-test binaries and
+      `core/classifier_bench`. The benchmark compares direct versus compiled
+      extraction and placement independently, and direct versus typed-wrapper
+      lookup. These are smoke/abstraction-cost measurements, not backend
+      winner claims. K3.2 remains responsible for Cuckoo/rte_hash implementations
+      and selection measurements.
 
 ## Review process established this session
 
