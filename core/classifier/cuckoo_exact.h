@@ -31,9 +31,13 @@
 #ifndef BESS_CLASSIFIER_CUCKOO_EXACT_H_
 #define BESS_CLASSIFIER_CUCKOO_EXACT_H_
 
+#include <array>
 #include <cstddef>
+#include <cstring>
 #include <optional>
 #include <utility>
+
+#include <rte_hash_crc.h>
 
 #include "classifier/backend.h"
 #include "classifier/byte_key.h"
@@ -113,29 +117,49 @@ struct RuntimeExactRule {
 namespace detail {
 
 // Internal fixed-width storage classes for adapting CuckooMap to runtime keys.
-// Storage classes: 8, 16, 32, 64, 128, 256 bytes.
-// Logical size is checked in equality and hashing; bytes beyond logical_size
-// are ignored.
+// Storage classes: 8, 16, 32, 64, 128, 256 bytes. The logical key length
+// lives in the state (and in the stateful hash/equality functors below), not
+// in every stored entry: an 8-byte logical key occupies an 8-byte entry.
 template <size_t StorageBytes>
-struct RuntimeCuckooKey {
-  std::array<std::byte, StorageBytes> bytes{};
+struct alignas(8) RuntimeCuckooKey {
+  // The tail is intentionally not initialized: stateful hash/equality only
+  // inspect the leading logical bytes. Builders use value-initialization when
+  // they need deterministic stored padding.
+  std::array<std::byte, StorageBytes> bytes;
+};
+
+// Stateful hash over the leading logical_size bytes. CRC32C (portable
+// DPDK-backed; hardware CRC on x86) measured ~6.5x faster than the K3.3
+// byte-at-a-time FNV-1a on identical 8-byte keys (see modules/
+// exact_match_bench.cc BM_HashFNV_Key vs BM_HashCRC_Key). Always pass an
+// instance carrying the table's logical size to Insert()/Find(): the
+// default-constructed functor hashes zero bytes and must never be used.
+template <size_t StorageBytes>
+struct RuntimeCuckooHash {
   size_t logical_size = 0;
 
-  bool operator==(const RuntimeCuckooKey &other) const noexcept {
-    return logical_size == other.logical_size &&
-           std::memcmp(bytes.data(), other.bytes.data(), logical_size) == 0;
+  size_t operator()(const RuntimeCuckooKey<StorageBytes> &k) const noexcept {
+    return static_cast<size_t>(rte_hash_crc(
+        k.bytes.data(), static_cast<uint32_t>(logical_size), 0));
   }
 };
 
+// Stateful equality over the leading logical_size bytes. Same caveat as the
+// hash: always pass the instance carrying the table's logical size.
 template <size_t StorageBytes>
-struct RuntimeCuckooHash {
-  size_t operator()(const RuntimeCuckooKey<StorageBytes> &k) const noexcept {
-    uint64_t hash = 14695981039346656037ull;
-    for (size_t i = 0; i < k.logical_size; i++) {
-      hash ^= static_cast<uint8_t>(k.bytes[i]);
-      hash *= 1099511628211ull;
+struct RuntimeCuckooEqual {
+  size_t logical_size = 0;
+
+  bool operator()(const RuntimeCuckooKey<StorageBytes> &a,
+                  const RuntimeCuckooKey<StorageBytes> &b) const noexcept {
+    if (logical_size == sizeof(uint64_t)) {
+      uint64_t lhs;
+      uint64_t rhs;
+      std::memcpy(&lhs, a.bytes.data(), sizeof(lhs));
+      std::memcpy(&rhs, b.bytes.data(), sizeof(rhs));
+      return lhs == rhs;
     }
-    return static_cast<size_t>(hash);
+    return std::memcmp(a.bytes.data(), b.bytes.data(), logical_size) == 0;
   }
 };
 
@@ -143,7 +167,7 @@ template <size_t StorageBytes, typename Result>
 struct RuntimeCuckooState {
   using MapType = bess::utils::CuckooMap<
       RuntimeCuckooKey<StorageBytes>, Result,
-      RuntimeCuckooHash<StorageBytes>>;
+      RuntimeCuckooHash<StorageBytes>, RuntimeCuckooEqual<StorageBytes>>;
   MapType map;
   size_t logical_key_size = 0;
 };
@@ -152,19 +176,23 @@ template <size_t StorageBytes, typename Result>
 uint64_t RuntimeCuckooLookupBatch(const void *raw_state, ConstBytes keys,
                                   size_t key_stride,
                                   std::span<Result> results) noexcept {
-  auto *state = static_cast<const RuntimeCuckooState<StorageBytes, Result> *>(raw_state);
+  auto *state =
+      static_cast<const RuntimeCuckooState<StorageBytes, Result> *>(raw_state);
   promise(key_stride >= state->logical_key_size);
-  promise(keys.size() >= results.size() * key_stride);
-  promise(results.size() <= 64);
+  promise(results.empty() ||
+          key_stride <= keys.size() / results.size());
+  const RuntimeCuckooHash<StorageBytes> hash{state->logical_key_size};
+  const RuntimeCuckooEqual<StorageBytes> equal{state->logical_key_size};
   uint64_t hits = 0;
   const size_t n = results.size();
-  RuntimeCuckooKey<StorageBytes> key{};
-  key.logical_size = state->logical_key_size;
+  // Do not clear the whole storage class per batch; bytes beyond the logical
+  // key are never observed by the stateful hash/equality functors.
+  RuntimeCuckooKey<StorageBytes> key;
 
   for (size_t i = 0; i < n; i++) {
     std::memcpy(key.bytes.data(), keys.data() + i * key_stride,
                 state->logical_key_size);
-    const auto *entry = state->map.Find(key);
+    const auto *entry = state->map.Find(key, hash, equal);
     if (entry != nullptr) {
       results[i] = entry->second;
       hits |= (uint64_t{1} << i);
@@ -184,9 +212,10 @@ ClassifierResult<RuntimeExactBackend<Result>> BuildCuckooBackendImpl(
     std::span<const RuntimeExactRule<Result>> rules) {
   auto *state = new RuntimeCuckooState<StorageBytes, Result>();
   state->logical_key_size = logical_key_size;
+  const RuntimeCuckooHash<StorageBytes> hash{logical_key_size};
+  const RuntimeCuckooEqual<StorageBytes> equal{logical_key_size};
 
   RuntimeCuckooKey<StorageBytes> key{};
-  key.logical_size = logical_key_size;
 
   for (size_t i = 0; i < rules.size(); i++) {
     const auto &rule = rules[i];
@@ -199,7 +228,8 @@ ClassifierResult<RuntimeExactBackend<Result>> BuildCuckooBackendImpl(
       });
     }
     std::memcpy(key.bytes.data(), rule.key.data(), logical_key_size);
-    if (state->map.Insert(key, rule.result) == nullptr) {
+    const size_t before = state->map.Count();
+    if (state->map.Insert(key, rule.result, hash, equal) == nullptr) {
       delete state;
       return std::unexpected(ClassifierError{
           .code = ClassifierErrorCode::kInvalidPlan,
@@ -207,14 +237,27 @@ ClassifierResult<RuntimeExactBackend<Result>> BuildCuckooBackendImpl(
           .field_index = i,
       });
     }
+    if (state->map.Count() == before) {
+      // CuckooMap::Insert overwrites an existing key in place, so an
+      // unchanged count means this rule duplicates an earlier key. Report
+      // it: the caller must canonicalize (last-wins, first-wins, or reject)
+      // instead of silently depending on overwrite order.
+      delete state;
+      return std::unexpected(ClassifierError{
+          .code = ClassifierErrorCode::kInvalidPlan,
+          .message = "duplicate rule key",
+          .field_index = i,
+      });
+    }
   }
 
+  const size_t rule_count = state->map.Count();
   RuntimeExactOps<Result> ops{
       .lookup_batch = RuntimeCuckooLookupBatch<StorageBytes, Result>,
       .destroy = RuntimeCuckooDestroy<StorageBytes, Result>,
       .info = BackendInfo{
           .kind = ExactBackendKind::kCuckoo,
-          .rule_count = rules.size(),
+          .rule_count = rule_count,
           .key_size = logical_key_size,
           .result_size = sizeof(Result),
           .storage_bytes = 0,

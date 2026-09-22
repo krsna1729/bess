@@ -149,8 +149,8 @@ and Clang: 41 native test binaries, 22/22 module integration files against a
 foreground daemon, and the wire-parity script.
 
 The modern-glog daemon-mode recursion is fixed (§8, entry 54), **K1 is
-complete** (entries 55-57), and **K2, K2.6, K3.1, and K3.2 are complete** (entries
-58-63):
+complete** (entries 55-57), and **K2, K2.6, K3.1, K3.2, and K3.3 are
+complete** (entries 58-64):
 `RuntimeState` owns one dataplane `RcuDomain`, workers register/online/offline/
 unregister around the pause boundary, the scheduler reports quiescence at a safe
 task boundary, and `RcuPtr<T>` publishes and retires immutable state with an
@@ -172,19 +172,23 @@ and result-transport pressure fixes (`RuntimeExactBackend<Result>`, hit masks,
 `PackedValueStore`, `CuckooExactBackend`, `RteHashPositionBackend`,
 `RteHashDataBackend`, `SmallExactBackend`, `DirectExactBackend`, and normalization
  masks), benchmarked across multiple batch sizes and rule counts, while leaving
- `ExactMatch` untouched until K3.3. K3.3 migrates `ExactMatch` onto the runtime
- classifier (forced Cuckoo backend, dense packed keys, per-packet extraction
- validity, `PreResume` metadata-offset refresh with fail-closed generations),
- proven by a legacy-vs-new differential test and before/after benchmarks. The
- next work is K3.4-K3.7, K4-K8, and G1. The active build graph is Meson/Ninja only.
-GCC and Clang full Meson compiles succeed with pinned DPDK 25.11.3. The
-registered suite is now 66 tests: 50 native C++ binaries, 13 benchmark smoke
-tests (including the PMD null/ring smoke), the sample-plugin registry load, the
-Python target, and the module integration run. All classifier tests also pass
-under ASan+UBSan; the existing EAL-backed sanitizer test remains
-incompatible with DPDK initialization under ASan. `-Daf_xdp=required`
-configuration, install staging, generated build-tree protobuf imports, and
-source-tree hygiene checks also pass.
+`ExactMatch` untouched until K3.3. K3.3 migrates `ExactMatch` onto the runtime
+classifier (forced Cuckoo backend, dense packed keys, per-packet extraction
+validity, `PreResume` metadata-offset refresh with fail-closed generations),
+proven by a legacy-vs-new differential test and before/after benchmarks.
+K3.3.1 is the working-tree fast-path follow-up recorded in entry 65; the
+next committed work is K3.4-K3.7, K4-K8, and G1. The active build graph is
+Meson/Ninja only. GCC and Clang full Meson compiles succeed with pinned DPDK
+25.11.3. The registered suite is now 68 tests: 50 native C++ binaries, 13
+benchmark smoke tests (including the PMD null/ring smoke), the sample-plugin
+registry load, the Python target, and the module integration run. The full
+68-test suite records 66 passes; the Python and module-integration targets
+remain environment-blocked because starting BESS daemon requires sudo
+credentials. The classifier extract-plan, Cuckoo, and migration tests pass
+under ASan+UBSan; the Rte hash classifier test remains environment-
+incompatible because DPDK EAL cannot allocate its required memory under
+sanitizer. `-Daf_xdp=required` configuration, install staging, generated
+build-tree protobuf imports, and source-tree hygiene checks also pass.
 
 ## Completed work (chronological, with commit hashes on `develop`)
 
@@ -2746,6 +2750,35 @@ rather than one call site).
        overflowing the stack mask word; zero-field modules fail `Init`
        instead of OOB-crashing on the first batch; commands fail fast when a
        metadata attribute has no valid offset instead of serving crashes.
+
+65. **K3.3.1 runtime exact fast-path recovery (working tree, 2026-09-22)** —
+     review follow-up to K3.3, intentionally before K3.4:
+     - `RuntimeCuckooKey<StorageBytes>` now stores only fixed-width key bytes;
+       logical length is stateful hash/equality configuration, entries are
+       naturally aligned without per-entry size metadata, and duplicate
+       generic rule keys are rejected while `BackendInfo::rule_count` reports
+       the actual map count.
+     - Runtime Cuckoo hashing uses DPDK CRC32C instead of the retired FNV-1a
+       byte loop. `exact_match_bench` now measures FNV, runtime CRC, legacy
+       CRC, and the key-materialization cost over identical 8-byte values.
+     - `ExtractPlan` precomputes required packet/metadata extents, executes
+       exact-width masked copies for 1/2/4/8-byte fields, returns a per-packet
+       validity mask, and exposes dense key coverage. `ExactMatch` skips dense
+       scratch zeroing on the all-valid path and zeroes only invalid rows
+       before the backend lookup.
+     - `modules/exact_match_bench` splits extraction, prebuilt lookup,
+       end-to-end, hashing, zeroing, and rebuild measurements. Its matrix now
+       covers default-mask contiguous, masked, non-contiguous packet, and
+       packet-plus-metadata schemas. The mixed-source legacy comparison uses a
+       safe semantic mirror because `MakeKeys(const void **)` has no metadata
+       input.
+     - Focused GCC and Clang tests, the ExactMatch differential suite, and the
+       complete K3.3.1 benchmark matrix pass in the current tree. GCC, Clang,
+       and ASan+UBSan full builds complete. ASan+UBSan focused coverage passes
+       ExtractPlan, Cuckoo, and migration tests; the Rte hash classifier test
+       cannot initialize DPDK EAL under sanitizer because its memory allocation
+       fails in this environment. The 68-test GCC suite records 66 passes; the
+       Python and module-integration targets remain blocked by sudo credentials.
 
 ## Review process established this session
 

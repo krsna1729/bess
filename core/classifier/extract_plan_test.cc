@@ -45,6 +45,7 @@ using bess::classifier::ExtractKernel;
 using bess::classifier::ExtractPlan;
 using bess::classifier::MutableBytes;
 using bess::classifier::RuntimeClassifierSchema;
+using bess::classifier::RuntimeKeyField;
 using bess::classifier::SourceKind;
 using bess::classifier::SourceView;
 
@@ -221,10 +222,40 @@ TEST(ExtractPlanTest, NormalizationMaskApplied) {
   EXPECT_EQ(key, batch_out);
 }
 
+TEST(ExtractPlanTest, MaskedExactWidthsStayInBounds) {
+  for (size_t width : {1u, 2u, 4u, 8u}) {
+    RuntimeClassifierSchema schema;
+    schema.key_size = width;
+
+    std::vector<std::byte> packet(width);
+    std::vector<std::byte> expected(width);
+    std::vector<std::byte> output(width);
+    RuntimeKeyField field{SourceKind::kPacket, 0, 0, width};
+    field.normalization.mask.resize(width);
+    for (size_t i = 0; i < width; i++) {
+      packet[i] = Byte(0xA0u + static_cast<unsigned>(i));
+      field.normalization.mask[i] =
+          Byte(0xF0u | static_cast<unsigned>(i));
+      expected[i] = packet[i] & field.normalization.mask[i];
+    }
+    schema.key_fields.push_back(std::move(field));
+
+    auto compiled = ExtractPlan::Compile(schema);
+    ASSERT_TRUE(compiled) << "width=" << width;
+
+    const std::array<SourceView, 1> sources = {
+        SourceView{ConstBytes(packet), {}}};
+    EXPECT_EQ(1ull, compiled->ExecuteBatch(sources, MutableBytes(output),
+                                            width))
+        << "width=" << width;
+    EXPECT_EQ(expected, output) << "width=" << width;
+  }
+}
+
 TEST(ExtractPlanTest, AllOnesMaskEqualsNoMask) {
-  // Two adjacent fields; all-0xFF mask on one should NOT block coalescing.
-  // But they are separate fields, so coalescing logic applies normally.
-  // Verify that all-0xFF mask produces same output as no mask.
+  // All-ones normalization preserves the extracted bytes. Explicit masks
+  // remain normalization operations, so this test checks semantics rather
+  // than coalescing.
   RuntimeClassifierSchema schema_masked{
       .key_size = 3,
       .key_fields = {{SourceKind::kPacket, 0, 0, 3,
@@ -318,6 +349,69 @@ TEST(ExtractPlanTest, GappedLayoutLeavesGapBytesUntouched) {
   }
   EXPECT_EQ(Byte(11), output[6]);
   EXPECT_EQ(Byte(12), output[7]);
+}
+
+TEST(ExtractPlanTest, FullyCoversKeyDenseLayouts) {
+  // Dense layouts (single or multi-op, masked or not) tile [0, key_size).
+  const auto expect_covered = [](RuntimeClassifierSchema schema) {
+    auto compiled = ExtractPlan::Compile(schema);
+    ASSERT_TRUE(compiled);
+    EXPECT_TRUE(compiled->fully_covers_key());
+  };
+  expect_covered(RuntimeClassifierSchema{
+      .key_size = 4,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 4}}});
+  expect_covered(RuntimeClassifierSchema{
+      .key_size = 8,
+      .key_fields = {{SourceKind::kPacket, 26, 0, 4},
+                     {SourceKind::kPacket, 30, 4, 4}}});
+  expect_covered(RuntimeClassifierSchema{
+      .key_size = 8,
+      .key_fields = {{SourceKind::kPacket, 26, 0, 4,
+                      bess::classifier::Normalization{
+                          {Byte(0xFF), Byte(0x00), Byte(0xFF), Byte(0x0F)}}},
+                     {SourceKind::kMetadata, 16, 4, 4}}});
+}
+
+TEST(ExtractPlanTest, FullyCoversKeyRejectsGapsAndSlack) {
+  const auto expect_gapped = [](RuntimeClassifierSchema schema) {
+    auto compiled = ExtractPlan::Compile(schema);
+    ASSERT_TRUE(compiled);
+    EXPECT_FALSE(compiled->fully_covers_key());
+  };
+  // Interior gap between fields.
+  expect_gapped(RuntimeClassifierSchema{
+      .key_size = 8,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 2},
+                     {SourceKind::kPacket, 10, 6, 2}}});
+  // Trailing slack past the last field.
+  expect_gapped(RuntimeClassifierSchema{
+      .key_size = 8,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 4}}});
+}
+
+TEST(ExtractPlanTest, FailedExtractionWritesNothing) {
+  // One required-bytes check per source runs before any copy: a short
+  // source fails without partial writes, so the caller's invalid-row zero
+  // sees pristine scratch.
+  RuntimeClassifierSchema schema{
+      .key_size = 8,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 4},
+                     {SourceKind::kPacket, 10, 4, 4}},
+  };
+  auto compiled = ExtractPlan::Compile(schema);
+  ASSERT_TRUE(compiled);
+  ASSERT_TRUE(compiled->fully_covers_key());
+
+  const std::array<std::byte, 6> short_packet = {
+      Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6)};
+  const std::array<SourceView, 1> sources = {SourceView{short_packet, {}}};
+  std::array<std::byte, 8> output;
+  output.fill(Byte(0xA5));
+  EXPECT_EQ(0u, compiled->ExecuteBatch(sources, MutableBytes(output), 8));
+  for (size_t i = 0; i < 8; i++) {
+    EXPECT_EQ(Byte(0xA5), output[i]) << "byte " << i;
+  }
 }
 
 }  // namespace

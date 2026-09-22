@@ -34,7 +34,6 @@
 #include <array>
 #include <cstring>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -619,15 +618,18 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     return;
   }
 
-  // Stack scratch only: no packet-path allocation. The used key region is
-  // zeroed so every key byte is deterministic -- packets that fail
-  // extraction (short first segment) still present a well-defined key to
-  // the backend, and their results are discarded through the validity mask
-  // below.
+  // Stack scratch only: no packet-path allocation. ExactMatch's key layout
+  // is dense, so a fully-covering plan writes every byte of every valid row
+  // and the used region needs no pre-zeroing; a failed extraction writes
+  // nothing, and invalid rows are zeroed below before the backend (which
+  // looks up all rows) sees them. Gapped generic schemas keep the
+  // caller-initializes-gap contract and pre-zero instead.
   const size_t key_size = gen->key_size;
   std::array<classifier::SourceView, bess::PacketBatch::kMaxBurst> sources;
   std::array<std::byte, bess::PacketBatch::kMaxBurst * kMaxKeyBytes> keys;
-  std::memset(keys.data(), 0, static_cast<size_t>(cnt) * key_size);
+  if (!gen->extract.fully_covers_key()) {
+    std::memset(keys.data(), 0, static_cast<size_t>(cnt) * key_size);
+  }
   std::array<gate_idx_t, bess::PacketBatch::kMaxBurst> gates;
 
   for (int i = 0; i < cnt; i++) {
@@ -651,6 +653,19 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       classifier::MutableBytes(keys).first(static_cast<size_t>(cnt) *
                                            key_size),
       key_size);
+  // Invalid rows hold stale scratch (or partial gap bytes); zero them so the
+  // backend sees well-defined keys. Their results are discarded through the
+  // validity mask below regardless.
+  const uint64_t all_valid =
+      (uint64_t{1} << static_cast<size_t>(cnt)) - 1;
+  if ((valid & all_valid) != all_valid) {
+    for (int i = 0; i < cnt; i++) {
+      if (!(valid & (uint64_t{1} << i))) {
+        std::memset(keys.data() + static_cast<size_t>(i) * key_size, 0,
+                    key_size);
+      }
+    }
+  }
   uint64_t hits = gen->backend.lookup_batch(
       classifier::ConstBytes(keys.data(),
                              static_cast<size_t>(cnt) * key_size),

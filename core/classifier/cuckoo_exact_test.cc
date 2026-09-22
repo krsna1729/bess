@@ -237,4 +237,58 @@ TEST(CuckooExactBackend, BuildRuntimeCuckooBackendPopulatesAndDispatches) {
   EXPECT_FALSE(bad_res.has_value());
 }
 
+TEST(CuckooExactBackend, BuildRuntimeCuckooBackendRejectsDuplicateKeys) {
+  using gate_idx_t = uint16_t;
+  using bess::classifier::Byte;
+  using bess::classifier::ConstBytes;
+  using bess::classifier::RuntimeExactRule;
+  using bess::classifier::BuildRuntimeCuckooBackend;
+
+  const std::array<Byte, 4> k1 = {Byte{1}, Byte{2}, Byte{3}, Byte{4}};
+
+  const std::array<RuntimeExactRule<gate_idx_t>, 2> rules = {
+      RuntimeExactRule<gate_idx_t>{.key = ConstBytes(k1), .result = 7},
+      RuntimeExactRule<gate_idx_t>{.key = ConstBytes(k1), .result = 42},
+  };
+  auto dup_res = BuildRuntimeCuckooBackend<gate_idx_t>(4, rules);
+  EXPECT_FALSE(dup_res.has_value());
+}
+
+TEST(CuckooExactBackend, RuntimeCuckooKeyHasNoPerEntrySize) {
+  // The logical key length lives in the state/functors, not in every entry:
+  // an 8-byte logical key occupies an 8-byte, naturally aligned entry.
+  static_assert(sizeof(bess::classifier::detail::RuntimeCuckooKey<8>) == 8);
+  static_assert(sizeof(bess::classifier::detail::RuntimeCuckooKey<16>) == 16);
+  static_assert(alignof(bess::classifier::detail::RuntimeCuckooKey<8>) >=
+                alignof(uint64_t));
+}
+
+TEST(CuckooExactBackend, StatefulFunctorsBoundToLogicalSize) {
+  using bess::classifier::detail::RuntimeCuckooEqual;
+  using bess::classifier::detail::RuntimeCuckooHash;
+  using bess::classifier::detail::RuntimeCuckooKey;
+
+  RuntimeCuckooKey<8> a{};
+  RuntimeCuckooKey<8> b{};
+  for (size_t i = 0; i < 8; i++) {
+    a.bytes[i] = b.bytes[i] = static_cast<std::byte>(i + 1);
+  }
+  // Trailing garbage beyond the logical size must not affect equality.
+  RuntimeCuckooEqual<8> eq4{4};
+  EXPECT_TRUE(eq4(a, b));
+
+  // ... but logical bytes do.
+  b.bytes[3] = static_cast<std::byte>(0xFF);
+  EXPECT_FALSE(eq4(a, b));
+  b.bytes[3] = static_cast<std::byte>(4);
+
+  // Hash covers exactly the logical bytes.
+  RuntimeCuckooHash<8> h4{4};
+  RuntimeCuckooHash<8> h8{8};
+  EXPECT_EQ(h4(a), h4(b));
+  b.bytes[7] = static_cast<std::byte>(0xFF);
+  EXPECT_EQ(h4(a), h4(b));
+  EXPECT_NE(h8(a), h8(b));
+}
+
 }  // namespace

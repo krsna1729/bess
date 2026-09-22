@@ -31,12 +31,10 @@
 #ifndef BESS_MODULES_EXACTMATCH_H_
 #define BESS_MODULES_EXACTMATCH_H_
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -162,15 +160,15 @@ class ExactMatch final : public Module {
                          std::vector<std::vector<uint8_t>> *rule);
   // Turns a command argument into a `Rule`, validating gate and fields.
   Error RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg, Rule *rule);
-  // Builds a generation for `rules`; nullptr with *err set on failure. Runs on
-  // the control plane under the writer lock, off the data path.
   // Replaces the published generation with `build(current)`, or leaves the
-  // active one alone when the builder returns nullptr (with *err set). The
-  // writer protocol lives here so no call site can publish without retiring,
-  // or retire before publishing (K1).
+  // active one alone when the builder returns nullptr (with *err set). Runs
+  // only on the control plane, where command and graph mutations are
+  // serialized; never on a packet worker.
   bool Publish(const std::function<GenerationPtr(const Generation &)> &build,
                Error *err);
 
+  // Builds a generation for `rules`; nullptr with *err set on failure. Runs
+  // on the control plane, off the data path.
   GenerationPtr Build(const std::vector<Rule> &rules, gate_idx_t default_gate,
                       Error *err);
   // Per-field key layout resolved from the module's FieldSpecs and the

@@ -32,6 +32,7 @@
 #include "utils/common.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -39,12 +40,90 @@
 namespace bess::classifier {
 namespace {
 
-bool Fits(size_t offset, size_t size, size_t limit) {
-  return offset <= limit && size <= limit - offset;
-}
-
 ConstBytes Source(const SourceView &view, SourceKind kind) {
   return kind == SourceKind::kPacket ? view.packet : view.metadata;
+}
+
+// Exact-width copy: constant sizes compile to single loads/stores (no libc
+// memcpy call for the common 1/2/4/8-byte fields); unaligned-safe via memcpy
+// semantics. Never over-reads: exactly `size` source bytes are touched.
+inline void CopyBytes(std::byte *dst, const std::byte *src,
+                      size_t size) noexcept {
+  switch (size) {
+    case 1:
+      dst[0] = src[0];
+      break;
+    case 2:
+      std::memcpy(dst, src, 2);
+      break;
+    case 4:
+      std::memcpy(dst, src, 4);
+      break;
+    case 8:
+      std::memcpy(dst, src, 8);
+      break;
+    default:
+      std::memcpy(dst, src, size);
+      break;
+  }
+}
+
+// Exact-width copy + mask. Width-specific ANDs keep masked 1/2/4/8-byte
+// fields on the same single-instruction path as unmasked ones.
+inline void CopyMasked(std::byte *dst, const std::byte *src, size_t size,
+                       const std::byte *mask) noexcept {
+  switch (size) {
+    case 1:
+      dst[0] = static_cast<std::byte>(src[0] & mask[0]);
+      break;
+    case 2: {
+      uint16_t v;
+      uint16_t m;
+      std::memcpy(&v, src, 2);
+      std::memcpy(&m, mask, 2);
+      v &= m;
+      std::memcpy(dst, &v, 2);
+      break;
+    }
+    case 4: {
+      uint32_t v;
+      uint32_t m;
+      std::memcpy(&v, src, 4);
+      std::memcpy(&m, mask, 4);
+      v &= m;
+      std::memcpy(dst, &v, 4);
+      break;
+    }
+    case 8: {
+      uint64_t v;
+      uint64_t m;
+      std::memcpy(&v, src, 8);
+      std::memcpy(&m, mask, 8);
+      v &= m;
+      std::memcpy(dst, &v, 8);
+      break;
+    }
+    default:
+      std::memcpy(dst, src, size);
+      for (size_t k = 0; k < size; k++) {
+        dst[k] &= mask[k];
+      }
+      break;
+  }
+}
+
+// Unchecked op execution: the caller has established that the source spans
+// cover every op (one required-bytes check per packet) and that the key span
+// covers the key (key.size() >= key_size_, with destination ranges validated
+// at Compile time).
+inline void CopyOpUnchecked(const ExtractOp &op, ConstBytes source_bytes,
+                            std::byte *dst) noexcept {
+  const std::byte *src = source_bytes.data() + op.source_offset;
+  if (op.mask.empty()) {
+    CopyBytes(dst + op.destination_offset, src, op.size);
+  } else {
+    CopyMasked(dst + op.destination_offset, src, op.size, op.mask.data());
+  }
 }
 
 bool CanCoalesce(const ExtractOp &previous, const ExtractOp &current) {
@@ -59,39 +138,24 @@ bool CanCoalesce(const ExtractOp &previous, const ExtractOp &current) {
          previous.size <= std::numeric_limits<size_t>::max() - current.size;
 }
 
-bool CopyOperation(const ExtractPlan &plan, const ExtractOp &op,
-                   MutableBytes key, ConstBytes source_bytes) noexcept {
-  if (!Fits(op.destination_offset, op.size, key.size())) {
-    return false;
+// Width dispatch for one op whose source range is already established:
+// `src` points at the op's first source byte, `dst` at its first key byte.
+inline void CopySingleUnchecked(const ExtractOp &op, const std::byte *src,
+                                std::byte *dst) noexcept {
+  if (op.mask.empty()) {
+    CopyBytes(dst, src, op.size);
+  } else {
+    CopyMasked(dst, src, op.size, op.mask.data());
   }
-  if (plan.bounds() == BoundsPolicy::kCheck &&
-      !Fits(op.source_offset, op.size, source_bytes.size())) {
-    return false;
-  }
-
-  std::byte *dst = key.data() + op.destination_offset;
-  std::memcpy(dst, source_bytes.data() + op.source_offset, op.size);
-  if (!op.mask.empty()) {
-    for (size_t k = 0; k < op.size; k++) {
-      dst[k] &= op.mask[k];
-    }
-  }
-  return true;
 }
 
-bool CopySingle(const ExtractPlan &plan, const ExtractOp &op,
-                ConstBytes source, std::byte *destination) noexcept {
-  if (plan.bounds() == BoundsPolicy::kCheck &&
-      !Fits(op.source_offset, op.size, source.size())) {
-    return false;
+// Saturating end computation for required-bytes precomputation: source
+// offsets are runtime values, so guard against offset + size overflow.
+size_t SaturatingEnd(size_t offset, size_t size) {
+  if (size > std::numeric_limits<size_t>::max() - offset) {
+    return std::numeric_limits<size_t>::max();
   }
-  std::memcpy(destination, source.data() + op.source_offset, op.size);
-  if (!op.mask.empty()) {
-    for (size_t k = 0; k < op.size; k++) {
-      destination[k] &= op.mask[k];
-    }
-  }
-  return true;
+  return offset + size;
 }
 
 }  // namespace
@@ -141,8 +205,36 @@ ClassifierResult<ExtractPlan> ExtractPlan::Compile(
     }
   }
 
+  // One required-bytes check per source per packet is equivalent to checking
+  // every op: all ops fit iff the furthest op end fits.
+  size_t required_packet_bytes = 0;
+  size_t required_metadata_bytes = 0;
+  for (const ExtractOp &op : coalesced) {
+    const size_t end = SaturatingEnd(op.source_offset, op.size);
+    if (op.source == SourceKind::kPacket) {
+      required_packet_bytes = std::max(required_packet_bytes, end);
+    } else {
+      required_metadata_bytes = std::max(required_metadata_bytes, end);
+    }
+  }
+
+  // Dense coverage: ops (sorted by destination) tile [0, key_size) exactly.
+  // Validation already rejects overlaps and out-of-key destinations, so
+  // checking exact tiling suffices.
+  size_t covered_end = 0;
+  bool covers = true;
+  for (const ExtractOp &op : coalesced) {
+    if (op.destination_offset != covered_end) {
+      covers = false;
+      break;
+    }
+    covered_end += op.size;
+  }
+  covers = covers && covered_end == schema.key_size;
+
   return ExtractPlan(schema.key_size, schema.bounds, std::move(coalesced),
-                     kernel, kernel_kind);
+                     kernel, kernel_kind, required_packet_bytes,
+                     required_metadata_bytes, covers);
 }
 
 bool ExtractPlan::ExecuteOne(const SourceView &source,
@@ -150,10 +242,20 @@ bool ExtractPlan::ExecuteOne(const SourceView &source,
   if (key.size() < key_size_) {
     return false;
   }
-  for (const ExtractOp &op : ops_) {
-    if (!CopyOperation(*this, op, key, Source(source, op.source))) {
+  // One check per source covers every op (see Compile); a failed check
+  // writes nothing, so invalid rows stay pristine for the caller to zero.
+  if (bounds_ == BoundsPolicy::kCheck) {
+    if (source.packet.size() < required_packet_bytes_) {
       return false;
     }
+    if (source.metadata.size() < required_metadata_bytes_) {
+      return false;
+    }
+  }
+  for (const ExtractOp &op : ops_) {
+    // Destination ranges are validated at Compile time against key_size_,
+    // which key.size() covers.
+    CopyOpUnchecked(op, Source(source, op.source), key.data());
   }
   return true;
 }
@@ -168,7 +270,7 @@ uint64_t ExtractPlan::ExecuteBatch(std::span<const SourceView> sources,
                                    size_t key_stride) const noexcept {
   promise(sources.size() <= 64);
   promise(key_stride >= key_size_);
-  promise(output.size() >= sources.size() * key_stride);
+  promise(sources.empty() || key_stride <= output.size() / sources.size());
   if (sources.empty()) {
     return 0;
   }
@@ -180,11 +282,20 @@ uint64_t ExtractPlan::ExecuteGeneric(const ExtractPlan &plan,
                                      MutableBytes output,
                                      size_t key_stride) noexcept {
   uint64_t valid = 0;
+  const bool check = plan.bounds_ == BoundsPolicy::kCheck;
+  const size_t need_packet = plan.required_packet_bytes_;
+  const size_t need_metadata = plan.required_metadata_bytes_;
   for (size_t i = 0; i < sources.size(); i++) {
-    if (plan.ExecuteOne(sources[i], output.subspan(i * key_stride,
-                                                   plan.key_size()))) {
-      valid |= (uint64_t{1} << i);
+    const SourceView &source = sources[i];
+    if (check && (source.packet.size() < need_packet ||
+                  source.metadata.size() < need_metadata)) {
+      continue;
     }
+    std::byte *dst = output.data() + i * key_stride;
+    for (const ExtractOp &op : plan.ops_) {
+      CopyOpUnchecked(op, Source(source, op.source), dst);
+    }
+    valid |= (uint64_t{1} << i);
   }
   return valid;
 }
@@ -195,11 +306,17 @@ uint64_t ExtractPlan::ExecuteSinglePacket(const ExtractPlan &plan,
                                           size_t key_stride) noexcept {
   uint64_t valid = 0;
   const ExtractOp &op = plan.ops_[0];
+  const bool check = plan.bounds_ == BoundsPolicy::kCheck;
+  const size_t need = plan.required_packet_bytes_;
   for (size_t i = 0; i < sources.size(); i++) {
-    if (CopySingle(plan, op, sources[i].packet,
-                   output.data() + i * key_stride + op.destination_offset)) {
-      valid |= (uint64_t{1} << i);
+    const ConstBytes packet = sources[i].packet;
+    if (check && packet.size() < need) {
+      continue;
     }
+    CopySingleUnchecked(op, packet.data() + op.source_offset,
+                        output.data() + i * key_stride +
+                            op.destination_offset);
+    valid |= (uint64_t{1} << i);
   }
   return valid;
 }
@@ -210,11 +327,17 @@ uint64_t ExtractPlan::ExecuteSingleMetadata(const ExtractPlan &plan,
                                             size_t key_stride) noexcept {
   uint64_t valid = 0;
   const ExtractOp &op = plan.ops_[0];
+  const bool check = plan.bounds_ == BoundsPolicy::kCheck;
+  const size_t need = plan.required_metadata_bytes_;
   for (size_t i = 0; i < sources.size(); i++) {
-    if (CopySingle(plan, op, sources[i].metadata,
-                   output.data() + i * key_stride + op.destination_offset)) {
-      valid |= (uint64_t{1} << i);
+    const ConstBytes metadata = sources[i].metadata;
+    if (check && metadata.size() < need) {
+      continue;
     }
+    CopySingleUnchecked(op, metadata.data() + op.source_offset,
+                        output.data() + i * key_stride +
+                            op.destination_offset);
+    valid |= (uint64_t{1} << i);
   }
   return valid;
 }

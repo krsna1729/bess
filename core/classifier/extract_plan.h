@@ -78,6 +78,16 @@ class ExtractPlan {
   // Returns a 64-bit mask where bit i is set iff extraction for source i succeeded.
   // Under BoundsPolicy::kCheck, a short/truncated source clears bit i without
   // stopping extraction for other packets in the batch.
+  //
+  // Output initialization is the caller's job and depends on
+  // fully_covers_key():
+  //   - fully covered: a successful extraction writes every byte of the key
+  //     row, so scratch needs no pre-zeroing; the caller must zero invalid
+  //     rows before handing them to a backend that still looks up all rows
+  //     (a failed extraction writes nothing, but scratch rows are reused).
+  //   - gapped: gap bytes are never written, so the caller must pre-zero
+  //     (or otherwise initialize) them; invalid rows must still be zeroed
+  //     before a look-up-all-rows backend.
   [[nodiscard]] uint64_t ExecuteBatch(std::span<const SourceView> sources,
                                       MutableBytes output,
                                       size_t key_stride) const noexcept;
@@ -86,15 +96,26 @@ class ExtractPlan {
   [[nodiscard]] BoundsPolicy bounds() const noexcept { return bounds_; }
   [[nodiscard]] ExtractKernel kernel() const noexcept { return kernel_kind_; }
   [[nodiscard]] std::span<const ExtractOp> ops() const noexcept { return ops_; }
+  // True when the coalesced ops write every key byte densely from offset 0
+  // (no gaps, no trailing slack). Successful extraction then fully defines
+  // the key row; see ExecuteBatch for the caller contract.
+  [[nodiscard]] bool fully_covers_key() const noexcept {
+    return fully_covers_key_;
+  }
 
  private:
   ExtractPlan(size_t key_size, BoundsPolicy bounds, std::vector<ExtractOp> ops,
-              ExtractBatchFn kernel, ExtractKernel kernel_kind)
+              ExtractBatchFn kernel, ExtractKernel kernel_kind,
+              size_t required_packet_bytes, size_t required_metadata_bytes,
+              bool fully_covers_key)
       : key_size_(key_size),
         bounds_(bounds),
         ops_(std::move(ops)),
         kernel_(kernel),
-        kernel_kind_(kernel_kind) {}
+        kernel_kind_(kernel_kind),
+        required_packet_bytes_(required_packet_bytes),
+        required_metadata_bytes_(required_metadata_bytes),
+        fully_covers_key_(fully_covers_key) {}
 
   [[nodiscard]] bool ExecuteOne(const SourceView &source,
                                 MutableBytes key) const noexcept;
@@ -112,6 +133,13 @@ class ExtractPlan {
   std::vector<ExtractOp> ops_;
   ExtractBatchFn kernel_;
   ExtractKernel kernel_kind_;
+  // Max source end (offset + size) over the ops reading each source. Under
+  // kCheck, one comparison of the source length against the required bytes is
+  // equivalent to checking every op's range, so kernels check once per
+  // packet and then run exact-width copies unchecked.
+  size_t required_packet_bytes_ = 0;
+  size_t required_metadata_bytes_ = 0;
+  bool fully_covers_key_ = false;
 };
 
 }  // namespace bess::classifier

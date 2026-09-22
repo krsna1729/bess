@@ -205,7 +205,8 @@ class RteHashPositionBackend {
   [[nodiscard]] uint64_t lookup_batch_packed(ConstBytes keys, size_t key_stride,
                                              std::span<int32_t> results) const noexcept {
     promise(key_stride >= key_len_);
-    promise(keys.size() >= results.size() * key_stride);
+    promise(results.empty() ||
+            key_stride <= keys.size() / results.size());
     promise(results.size() <= RTE_HASH_LOOKUP_BULK_MAX);
     if (table_ == nullptr || results.empty()) {
       return 0;
@@ -385,7 +386,8 @@ class RteHashDataBackend {
   [[nodiscard]] uint64_t lookup_batch_packed(ConstBytes keys, size_t key_stride,
                                              std::span<Result> results) const noexcept {
     promise(key_stride >= key_len_);
-    promise(keys.size() >= results.size() * key_stride);
+    promise(results.empty() ||
+            key_stride <= keys.size() / results.size());
     promise(results.size() <= RTE_HASH_LOOKUP_BULK_MAX);
     if (table_ == nullptr || results.empty()) {
       return 0;
