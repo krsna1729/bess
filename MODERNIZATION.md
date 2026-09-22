@@ -2583,29 +2583,32 @@ rather than one call site).
     512K-1M entries with a 4 B payload flat is 3x faster than indirect (2.20/3.82
     vs 6.66/11.11), because indirect pays a dependent second access into a scattered
     object region while flat walks one contiguous array; at 512K x 256 B (138 MB)
-    they are equal (10.70 vs 10.78), both DRAM-bound. Hot ids are 0.71-0.78 ns
+    they are equal (10.70 vs 10.78), both DRAM-bound. Hot ids are 0.63-0.66 ns
     whatever the table size, and mixed access with a quarter of ids invalid is
-    cheaper than uniform at 512K/64 B (5.60 vs 10.85) because an invalid id never
+    cheaper than uniform at 512K/64 B (7.66 vs 9.46) because an invalid id never
     touches the slot.
 
     Build and replacement, ns per generation (best of three):
 
     ```text
                         10K x 4B   100K x 4B   10K x 64B   100K x 64B   10K x 256B   100K x 256B
-    flat build               8200      88896       30045       471054       124867       2909761
-    indirect build         201118    2202196      204963      2357531       247190       4591253
-    flat replace             9694     103746       40200       573434       166724       3335546
-    indirect replace         1238      21640        1413        23466         1445         24344
+    flat build               7827      85268       29888       499618       137243       3416303
+    indirect build         187479    1998476      189223      2477985       268657       7741449
+    flat replace             9261      99894       39564       615973       182280       4004368
+    indirect replace         1316      21068        1351        22671         1336         22851
     ```
 
-    Build from scratch favours flat by 25x at 10K x 4 B and 1.6x at 100K x 256 B,
+    Build from scratch favours flat by 24x at 10K x 4 B and 2.3x at 100K x 256 B,
     because indirect pays an allocation per object. Replacement of one object in an
-    existing generation favours indirect by 8x at 10K and 4.8x at 100K, because its
+    existing generation favours indirect by 7x at 10K and 4.7x at 100K, because its
     pool outlives generations and only the slot array is copied — the cost of that
     is that the pool's lifetime has to be managed outside the table, and objects
     shared across generations need ownership semantics K2 deliberately does not
-    have. Batch lookup is not a throughput win (1.15 ns/lookup at batch 32 vs 0.76
-    scalar, 16 B payload): it is an API shape for callers that already hold arrays.
+    have. Batch lookup amortizes its own per-call cost (2.64 ns/lookup at batch 1 down
+    to 1.08 at batch 32, 16 B payload, 4096 entries, mixed access) but does not beat
+    the scalar loop's 0.6-0.9 ns/lookup at comparable sizes: it writes results into a
+    caller array where the scalar loop consumes them from registers. It is an API
+    shape for callers that already hold arrays, not a throughput win.
     Memory is equal at large payloads and better for flat at small ones (12.3 KB vs
     16.4 KB at 1K x 4 B), with no per-object allocation and no external pool.
 
