@@ -288,4 +288,36 @@ TEST(ExtractPlanTest, PerPacketBoundsFailureInExecuteBatch) {
   EXPECT_EQ(Byte(10), output[11]);
 }
 
+TEST(ExtractPlanTest, GappedLayoutLeavesGapBytesUntouched) {
+  // The general schema permits gaps between key fields. Extraction writes
+  // only the covered bytes; full-key initialization is the caller's job
+  // (ExactMatch zero-fills its batch scratch for this reason).
+  RuntimeClassifierSchema schema{
+      .key_size = 8,
+      .bounds = BoundsPolicy::kCheck,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 2},
+                     {SourceKind::kPacket, 10, 6, 2}},
+  };
+  auto compiled = ExtractPlan::Compile(schema);
+  ASSERT_TRUE(compiled);
+
+  const std::array<std::byte, 12> packet = {Byte(1), Byte(2), Byte(3), Byte(4),
+                                            Byte(5), Byte(6), Byte(7), Byte(8),
+                                            Byte(9), Byte(10), Byte(11),
+                                            Byte(12)};
+  const std::array<SourceView, 1> sources = {SourceView{packet, {}}};
+  // Pre-fill with a marker: gap bytes [2,6) must survive extraction.
+  std::array<std::byte, 8> output;
+  output.fill(Byte(0xA5));
+
+  EXPECT_EQ(0x1ull, compiled->ExecuteBatch(sources, MutableBytes(output), 8));
+  EXPECT_EQ(Byte(1), output[0]);
+  EXPECT_EQ(Byte(2), output[1]);
+  for (size_t i = 2; i < 6; i++) {
+    EXPECT_EQ(Byte(0xA5), output[i]) << "gap byte " << i;
+  }
+  EXPECT_EQ(Byte(11), output[6]);
+  EXPECT_EQ(Byte(12), output[7]);
+}
+
 }  // namespace

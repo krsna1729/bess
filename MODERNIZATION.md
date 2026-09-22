@@ -171,9 +171,12 @@ candidates rather than public types. K3.2 delivers the exact-backend laboratory
 and result-transport pressure fixes (`RuntimeExactBackend<Result>`, hit masks,
 `PackedValueStore`, `CuckooExactBackend`, `RteHashPositionBackend`,
 `RteHashDataBackend`, `SmallExactBackend`, `DirectExactBackend`, and normalization
-masks), benchmarked across multiple batch sizes and rule counts, while leaving
-`ExactMatch` untouched until K3.3. The next work is K3.3 `ExactMatch` module cutover,
-followed by K3.4-K3.7, K4-K8, and G1. The active build graph is Meson/Ninja only.
+ masks), benchmarked across multiple batch sizes and rule counts, while leaving
+ `ExactMatch` untouched until K3.3. K3.3 migrates `ExactMatch` onto the runtime
+ classifier (forced Cuckoo backend, dense packed keys, per-packet extraction
+ validity, `PreResume` metadata-offset refresh with fail-closed generations),
+ proven by a legacy-vs-new differential test and before/after benchmarks. The
+ next work is K3.4-K3.7, K4-K8, and G1. The active build graph is Meson/Ninja only.
 GCC and Clang full Meson compiles succeed with pinned DPDK 25.11.3. The
 registered suite is now 66 tests: 50 native C++ binaries, 13 benchmark smoke
 tests (including the PMD null/ring smoke), the sample-plugin registry load, the
@@ -2688,6 +2691,61 @@ rather than one call site).
       or memory comparison. Cuckoo uses `ByteKeyHash`/FNV while rte_hash uses
       its default hash, so the numbers measure backend + hash choice, not just
       the table implementation. Do not derive `Auto` thresholds from them.
+
+ 64. **K3.3 `ExactMatch` cutover to the runtime classifier** — the module no
+     longer owns `ExactMatchTable`/`ExactMatchKey`/`MakeKeys()`; each immutable
+     generation owns a compiled `ExtractPlan` (kCheck), a forced-Cuckoo
+     `RuntimeExactBackend<gate_idx_t>` over densely packed keys, the default
+     gate, and the control-plane rule vector, published through the existing
+     `RcuPtr`:
+     - **Matching semantics preserved**: rule bytes pack verbatim (legacy
+       `gather_key` applied no mask) while packet/metadata bytes are masked on
+       extraction with the legacy BE/LE converted mask bytes, so rules with
+       nonzero masked-off bits stay unmatchable exactly as before. Module
+       limits (8 fields, 1-8 bytes, packet offset 0-1024) are unchanged;
+       protobuf API, commands, gates, duplicate-overwrite, delete-not-found,
+       clear-keeps-default, runtime-config replacement, and introspection
+       output are unchanged. `GetInitialArg` emits the same converted mask
+       bytes. `utils/exact_match_table.h` stays for `hash_lb` (key
+       construction only).
+     - **Metadata offsets at the right lifecycle point**: attribute IDs are
+       still registered once at `Init()`; physical offsets are baked into the
+       plan at every build and refreshed at `PreResume` (which runs after
+       `SetupMetadata` recomputes offsets on the global-resume path and for
+       every module attached to paused workers on the `WorkerPauser` path).
+       `ControlPlane::ResumeWorker()` runs no hooks and recomputes no
+       offsets, so it cannot stale the plan (audited, not changed). Refresh
+       failure cannot leave a stale plan: the dispatcher ignores ordinary
+       `OnEvent` errors, so failure publishes a fail-closed generation that
+       routes everything to the default gate and logs the cause.
+     - **No over-reads**: the packet span is the first segment only
+       (`head_data`/`data_len`); metadata is the 128-byte region. Short
+       packets fail extraction per packet under kCheck and take the default
+       gate. Batch key scratch is zeroed over the used region only, so every
+       hashed byte is initialized and `valid & hits` selects the gate.
+       `ProcessBatch()` does one RCU read, one extraction dispatch, one
+       backend dispatch, and no allocation, name resolution, or config
+       parsing (verified by inspection).
+     - **Proof**: `modules/exact_match_migration_test` differentials the
+       legacy table against the new path over thousands of random
+       packet/metadata inputs across 5 field/mask/rule configurations plus
+       planted hits (including unmatchable masked-off-bit rules), short
+       packets, and multisegment tails; `extract_plan_test` pins gap-byte
+       behavior; `exact_match.py` gains a masked-off-bits integration test.
+       `modules/exact_match_bench` measures complete old
+       (`MakeKeys`+`CuckooMap`) vs new (`ExtractPlan`+runtime Cuckoo) paths:
+       at 2 fields/batch 8 the new path costs ~2.5x per packet (~14ns vs
+       ~6ns; new also pays bounds checks while legacy loads are unchecked),
+       scaling similarly at 1/8/16/32 and 1/2/4/8 fields across hit/miss/mixed
+       traffic. Rebuild costs 117us/1K, 968us/10K, 9.1ms/100K rules.
+       Follow-ups: compact-scatter for invalid keys, CRC-family hashing for
+       the runtime Cuckoo backend, and richer miss/key-width sweeps before any
+       `Auto` policy work.
+     - **Deliberate deviations from legacy** (all previously UB or crash):
+       value_bin masks longer than 8 bytes are rejected instead of
+       overflowing the stack mask word; zero-field modules fail `Init`
+       instead of OOB-crashing on the first batch; commands fail fast when a
+       metadata attribute has no valid offset instead of serving crashes.
 
 ## Review process established this session
 

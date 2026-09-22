@@ -209,6 +209,40 @@ class BessExactMatchTest(BessModuleTestCase):
         with self.assertRaises(bess.Error):
             em.delete(fields=[field])
 
+    def test_exactmatch_masked_off_rule_bits_stay_unmatchable(self):
+        """Rule bytes are stored without the mask; packet bytes are masked.
+
+        With a 2-byte field on the first two IP-src bytes whose mask keeps
+        only the first byte, a rule carrying a nonzero second byte can never
+        match (its stored bytes keep the nonzero value while every extracted
+        key has zero there). A rule with a zero second byte matches
+        regardless of the packet's second byte.
+        """
+        em = ExactMatch(fields=[{'offset': 26, 'num_bytes': 2}],
+                        masks=[{'value_bin': b'\x00\xff'}])
+        em.add(fields=[{'value_bin': b'A\xbb'}], gate=1)
+        em.add(fields=[{'value_bin': b'A\x00'}], gate=2)
+        em.set_default_gate(gate=3)
+
+        # Converted mask is stored big-endian for packet fields.
+        arg = pb_conv.protobuf_to_dict(em.get_initial_arg())
+        assert arg['masks'] == [{'value_bin': b'\xff\x00'}], arg
+
+        pkt_hit = get_tcp_packet(sip='65.43.21.0', dip='12.34.56.78')
+        pkt_hit_any_second = get_tcp_packet(sip='65.99.99.99',
+                                            dip='12.34.56.78')
+        pkt_miss = get_tcp_packet(sip='66.43.21.0', dip='12.34.56.78')
+
+        pkt_outs = self.run_module(em, 0, [pkt_hit], [0, 1, 2, 3])
+        self.assertEqual(len(pkt_outs[2]), 1)
+
+        pkt_outs = self.run_module(em, 0, [pkt_hit_any_second], [0, 1, 2, 3])
+        self.assertEqual(len(pkt_outs[2]), 1)
+
+        pkt_outs = self.run_module(em, 0, [pkt_miss], [0, 1, 2, 3])
+        self.assertEqual(len(pkt_outs[3]), 1)
+        self.assertEqual(len(pkt_outs[1]), 0)
+
 
 suite = unittest.TestLoader().loadTestsFromTestCase(BessExactMatchTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)

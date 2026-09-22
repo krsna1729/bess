@@ -31,10 +31,9 @@
 #ifndef BESS_MODULES_EXACTMATCH_H_
 #define BESS_MODULES_EXACTMATCH_H_
 
-#include <rte_config.h>
-#include <rte_hash_crc.h>
-
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -42,24 +41,33 @@
 #include <utility>
 #include <vector>
 
+#include "../classifier/backend.h"
+#include "../classifier/cuckoo_exact.h"
+#include "../classifier/extract_plan.h"
+#include "../classifier/runtime_schema.h"
 #include "../control/runtime_state.h"
+#include "../event.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
-#include "../utils/exact_match_table.h"
 #include "../rcu/rcu_ptr.h"
 
 using google::protobuf::RepeatedPtrField;
-using bess::utils::ExactMatchField;
-using bess::utils::ExactMatchKey;
-using bess::utils::ExactMatchRuleFields;
-using bess::utils::ExactMatchTable;
-using bess::utils::Error;
+// (bess::utils::Error is the same alias; defined locally so this module no
+// longer depends on utils/exact_match_table.h, which hash_lb still uses.)
+using Error = std::pair<int, std::string>;
 
 class ExactMatch final : public Module {
  public:
   static const gate_idx_t kNumOGates = MAX_GATES;
 
   static const Commands cmds;
+
+  // Module-level limits, preserved from the legacy ExactMatchTable-based
+  // implementation for protobuf API compatibility. The classifier library
+  // itself supports arbitrary widths; these bounds are ExactMatch's own.
+  static constexpr size_t kMaxFields = 8;
+  static constexpr size_t kMaxFieldSize = 8;
+  static constexpr size_t kMaxKeyBytes = kMaxFields * kMaxFieldSize;
 
   ExactMatch()
       : Module(), published_(bess::control::runtime().rcu()) {
@@ -69,6 +77,11 @@ class ExactMatch final : public Module {
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
   std::string GetDesc() const override;
+
+  // Recompiles the extraction plan when metadata offsets are reassigned by a
+  // pipeline-graph change. Returning 0 (rather than -ENOTSUP) keeps this
+  // module registered for PreResume.
+  int OnEvent(bess::Event event) override;
 
   CommandResponse Init(const bess::pb::ExactMatchArg &arg);
   CommandResponse GetInitialArg(const bess::pb::EmptyArg &arg);
@@ -85,29 +98,68 @@ class ExactMatch final : public Module {
   // One configured rule: the field values to match (in field order) and the
   // gate that matching packets go to.
   struct Rule {
-    ExactMatchRuleFields fields;
+    // Per-field raw bytes, exactly as decoded from the protobuf (value_bin
+    // verbatim, value_int little-endian). Mirrors the legacy
+    // ExactMatchRuleFields: rule bytes are stored WITHOUT applying the
+    // configured mask, while packet/metadata bytes ARE masked on extraction.
+    std::vector<std::vector<uint8_t>> fields;
     gate_idx_t gate;
   };
 
   // A whole matching generation: the rule list it was built from, the default
-  // gate to use when nothing matches, and the table built from that list.
-  // Immutable once published -- commands build a replacement and swap it in,
-  // so a batch sees either the old generation or the new one, never a
-  // half-applied change.
+  // gate to use when nothing matches, and the compiled classifier state built
+  // from that list. Immutable once published -- commands build a replacement
+  // and swap it in, so a batch sees either the old generation or the new one,
+  // never a half-applied change.
   struct Generation {
+    Generation(std::vector<Rule> r, gate_idx_t d,
+               bess::classifier::ExtractPlan e,
+               bess::classifier::RuntimeExactBackend<gate_idx_t> b,
+               size_t k, bool valid,
+               std::vector<std::vector<std::byte>> masks,
+               std::vector<size_t> offsets)
+        : rules(std::move(r)),
+          default_gate(d),
+          extract(std::move(e)),
+          backend(std::move(b)),
+          key_size(k),
+          extraction_valid(valid),
+          converted_masks(std::move(masks)),
+          baked_source_offsets(std::move(offsets)) {}
+
     std::vector<Rule> rules;
     gate_idx_t default_gate = DROP_GATE;
-    ExactMatchTable<gate_idx_t> table;
+    bess::classifier::ExtractPlan extract;
+    // Forced Cuckoo backend for the K3.3 migration. Backend auto-selection
+    // remains a later, benchmark-driven decision.
+    bess::classifier::RuntimeExactBackend<gate_idx_t> backend;
+    // Dense packed key width: sum of field sizes. Also the extraction stride.
+    size_t key_size = 0;
+    // False when metadata offsets were invalid at (re)build time. The packet
+    // path then routes everything to the default gate instead of reading an
+    // incorrect metadata region (fail-closed).
+    bool extraction_valid = true;
+    // Per-field converted mask bytes (legacy ExactMatchField::mask byte
+    // order), for GetInitialArg serialization.
+    std::vector<std::vector<std::byte>> converted_masks;
+    // Per-field source offset baked into `extract` (packet byte offset, or
+    // metadata attr offset, or kInvalidOffset for unreadable metadata).
+    // Compared at PreResume to detect graph-driven offset reassignment.
+    std::vector<size_t> baked_source_offsets;
   };
 
   using GenerationPtr = std::unique_ptr<const Generation>;
+
+  // Sentinel for a metadata field whose attribute currently has no valid
+  // physical offset (e.g. orphan reader, out of space).
+  static constexpr size_t kInvalidOffset = static_cast<size_t>(-1);
 
   CommandResponse AddFieldOne(const bess::pb::Field &field,
                               const bess::pb::FieldData &mask, int idx);
   // Turns a rule's protobuf fields into `rule`'s field list, validating the
   // count against the module's configured fields.
   Error RuleFieldsFromPb(const RepeatedPtrField<bess::pb::FieldData> &fields,
-                         bess::utils::ExactMatchRuleFields *rule);
+                         std::vector<std::vector<uint8_t>> *rule);
   // Turns a command argument into a `Rule`, validating gate and fields.
   Error RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg, Rule *rule);
   // Builds a generation for `rules`; nullptr with *err set on failure. Runs on
@@ -121,24 +173,49 @@ class ExactMatch final : public Module {
 
   GenerationPtr Build(const std::vector<Rule> &rules, gate_idx_t default_gate,
                       Error *err);
-  // Applies the module's configured fields (fixed at Init() time; a table
-  // starts out empty) to `table`. Metadata attributes were resolved once at
-  // Init(); this only configures the table, never registers anything.
-  Error ApplyFields(ExactMatchTable<gate_idx_t> *table);
+  // Per-field key layout resolved from the module's FieldSpecs and the
+  // current metadata offsets.
+  struct KeyLayout {
+    size_t key_size = 0;
+    std::vector<bess::classifier::RuntimeKeyField> key_fields;
+    // Converted mask bytes per field, in legacy ExactMatchField::mask byte
+    // order (for GetInitialArg serialization).
+    std::vector<std::vector<std::byte>> converted_masks;
+    // Source offset baked into the plan per field, or kInvalidOffset for
+    // unreadable metadata.
+    std::vector<size_t> baked_offsets;
+    // False when a metadata field has no valid physical offset.
+    bool metadata_valid = true;
+  };
+  // Resolves FieldSpecs into a dense packed layout using current metadata
+  // offsets. With `tolerate_invalid_metadata`, unreadable metadata marks the
+  // layout invalid (fail-closed path) instead of failing.
+  bool ComputeLayout(bool tolerate_invalid_metadata, KeyLayout *layout,
+                     Error *err);  // Fail-closed generation for unrecoverable (re)build failures on the resume
+  // path: same rules/default for introspection, but extraction disabled so
+  // the packet path routes everything to the default gate.
+  GenerationPtr BuildDegraded(const std::vector<Rule> &rules,
+                              gate_idx_t default_gate);
+  // Rebuilds and republishes the generation when metadata offsets changed
+  // under it (graph reconfiguration + resume). Runs on the control thread
+  // with workers paused. Never leaves a stale plan reading a reassigned
+  // metadata region: refresh failure publishes a fail-closed generation.
+  void RefreshForResume();
   // Inserts `rule` into `rules` or, if a rule with the same match values is
   // already there, overwrites its gate -- the same operation inserting an
   // existing key into the live table performed. Shared by the add command and
   // SetRuntimeConfig so both canonicalize identically.
   static void UpsertRule(std::vector<Rule> *rules, Rule rule);
-  // Field configuration, fixed at Init() time; every generation's table gets
+  // Field configuration, fixed at Init() time; every generation's plan gets
   // it, so a rebuild reproduces the module's matching exactly.
   struct FieldSpec {
-    bool by_offset;
-    int offset;             // valid when by_offset
-    std::string attr_name;  // otherwise (for GetInitialArg)
-    int attr_id;            // resolved once at Init() when !by_offset
-    int size;
-    uint64_t mask;
+    bool by_offset = true;
+    int offset = 0;             // valid when by_offset
+    std::string attr_name;      // otherwise (for GetInitialArg)
+    int attr_id = -1;           // resolved once at Init() when !by_offset
+    int size = 0;
+    uint64_t mask = 0;          // raw configured mask (0 == default all-ones)
+    size_t mask_bin_len = 0;    // value_bin length; 0 for value_int/empty
   };
   std::vector<FieldSpec> field_specs_;
   bool empty_masks_;  // mainly for GetInitialArg
