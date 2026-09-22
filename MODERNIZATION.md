@@ -149,8 +149,8 @@ and Clang: 41 native test binaries, 22/22 module integration files against a
 foreground daemon, and the wire-parity script.
 
 The modern-glog daemon-mode recursion is fixed (§8, entry 54), **K1 is
-complete** (entries 55-57), and **K2, K2.6, and K3.1 are complete** (entries
-58-62):
+complete** (entries 55-57), and **K2, K2.6, K3.1, and K3.2 are complete** (entries
+58-63):
 `RuntimeState` owns one dataplane `RcuDomain`, workers register/online/offline/
 unregister around the pause boundary, the scheduler reports quiescence at a safe
 task boundary, and `RcuPtr<T>` publishes and retires immutable state with an
@@ -167,15 +167,18 @@ backend selection is generation-level type erasure, and one immutable generation
 owns extraction, backend, and placement state.
 Generation ownership remains flat; `optional<T>` is kept for its general
 move-only semantics, while sparse bitmap/indirect policies remain benchmark
-candidates rather than public types. K2 and K3.1 have no production consumer yet
-by design. The next work follows the order in the roadmap below: K3.2 exact
-backend implementations and measurements, then K3.3+ module cutovers, followed
-by K4-K8 and G1. The active build graph is Meson/Ninja only.
+candidates rather than public types. K3.2 delivers the exact-backend laboratory
+and result-transport pressure fixes (`RuntimeExactBackend<Result>`, hit masks,
+`PackedValueStore`, `CuckooExactBackend`, `RteHashPositionBackend`,
+`RteHashDataBackend`, `SmallExactBackend`, `DirectExactBackend`, and normalization
+masks), benchmarked across multiple batch sizes and rule counts, while leaving
+`ExactMatch` untouched until K3.3. The next work is K3.3 `ExactMatch` module cutover,
+followed by K3.4-K3.7, K4-K8, and G1. The active build graph is Meson/Ninja only.
 GCC and Clang full Meson compiles succeed with pinned DPDK 25.11.3. The
-registered suite is now 61 tests: 45 native C++ binaries, 13 benchmark smoke
+registered suite is now 66 tests: 50 native C++ binaries, 13 benchmark smoke
 tests (including the PMD null/ring smoke), the sample-plugin registry load, the
-Python target, and the module integration run. K3.1's eight classifier tests
-also pass under ASan+UBSan; the existing EAL-backed sanitizer test remains
+Python target, and the module integration run. All classifier tests also pass
+under ASan+UBSan; the existing EAL-backed sanitizer test remains
 incompatible with DPDK initialization under ASan. `-Daf_xdp=required`
 configuration, install staging, generated build-tree protobuf imports, and
 source-tree hygiene checks also pass.
@@ -2633,6 +2636,52 @@ rather than one call site).
       lookup. These are smoke/abstraction-cost measurements, not backend
       winner claims. K3.2 remains responsible for Cuckoo/rte_hash implementations
       and selection measurements.
+
+63. **`e41f2044`** — **K3.2 exact-backend laboratory and contract pressure fixes** —
+    the exact classifier backends, runtime result transport, and normalization
+    contracts now exist and are measured across multiple representation and
+    workload axes, leaving `ExactMatch` untouched until K3.3:
+
+    - **Result transport and hit masks (`backend.h`)**: `RuntimeExactBackend<Result>`
+      is parameterized on the semantic result type (`gate_idx_t`, `ResultSlot`,
+      or `ActionId`) rather than hard-wiring `ResultSlot`. Batch lookup
+      returns a 64-bit hit mask (`uint64_t`) where bit $i$ is set iff `results[i]`
+      is valid, avoiding per-packet optional allocations and sentinel values.
+    - **Orthogonal concepts and native batch dispatch (`typed_exact.h`)**:
+      replaced monolithic `ExactBackend` with `ScalarExactBackend<B, Key>`,
+      `BatchExactBackend<B, Key>`, and `MeasurableBackend<B>`.
+      `ExactTable::lookup_batch` dispatches natively via `if constexpr`
+      when `BatchExactBackend` is satisfied, and gracefully falls back to a
+      scalar loop setting one hit bit per valid result otherwise.
+    - **Packed value store (`packed_value_store.h`)**: contiguous, generation-owned
+      store indexed by 1-based `ResultSlot` (slot 0 reserved for invalid/miss).
+      Allows arbitrary runtime byte payloads to be resolved from internal position
+      tokens without leaking semantic IDs.
+    - **Per-field normalization mask (`runtime_schema.h`, `extract_plan.h`)**:
+      `RuntimeKeyField` carries a byte-width `Normalization` mask (empty = plain exact
+      all-ones). `ExtractOp` applies the mask in-place after copying, preserving
+      odd-size generic key boundaries while supporting field masking without
+      regressing to 8-byte integers.
+    - **CuckooMap exact adapter (`cuckoo_exact.h`)**: typed `CuckooExactBackend<Key, Result>`
+      wrapping `bess::utils::CuckooMap`, satisfying `ScalarExactBackend` and
+      `MeasurableBackend`. Internal storage classes (`8`, `16`, `32`, `64`, `128`,
+      `256` bytes) under `detail::` adapt CuckooMap to runtime keys while hashing
+      and comparing only logical key bytes.
+    - **DPDK hash backend (`rte_hash_exact.h`)**: `RteHashPositionBackend` and
+      `RteHashDataBackend<Result>` provide position-mode and direct-data lookups.
+      `lookup_batch` utilizes DPDK's native `rte_hash_lookup_bulk` and
+      `rte_hash_lookup_bulk_data` with hit masks. DPDK concurrency features
+      (`RW_CONCURRENCY`, `RW_CONCURRENCY_LF`, internal QSBR) are kept off;
+      whole-generation RCU handles updates.
+    - **Small and Direct baselines (`small_exact.h`, `direct_exact.h`)**:
+      `SmallExactBackend` provides a linear-scan baseline for $\le 64$ rules;
+      `SortedFlatBackend` provides binary search over packed arrays;
+      `DirectExactBackend` provides bounded direct array indexing for 1-byte
+      and 2-byte key domains.
+    - **Measurements (`classifier_bench.cc`)**: added benchmark coverage for
+      DirectExact (1.08 ns / 1.51 Glookups/s), SmallExact (~4.1 ns/lookup),
+      CuckooExact (~5.8 ns/lookup), and rte_hash position/data bulk (~10 ns/lookup)
+      across batches of 1, 8, 16, and 32.
 
 ## Review process established this session
 
