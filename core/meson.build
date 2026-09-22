@@ -186,6 +186,7 @@ bessd = executable(
 
 unit_test_sources = [
   'dataplane/object_table_test.cc',
+  'dataplane/object_table_rcu_test.cc',
   'rcu/rcu_test.cc',
   'rcu/rcu_ptr_test.cc',
   'rcu/rcu_worker_test.cc',
