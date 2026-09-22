@@ -30,8 +30,10 @@
 #ifndef BESS_DATAPLANE_STRONG_ID_H_
 #define BESS_DATAPLANE_STRONG_ID_H_
 
-#include <compare>
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace bess {
 namespace dataplane {
@@ -50,7 +52,7 @@ namespace dataplane {
 //
 // `Tag` is an incomplete type used only to make each id its own type; it never
 // needs a definition.
-template <typename Tag, typename Rep>
+template <typename Tag, std::unsigned_integral Rep>
 class StrongId {
  public:
   using rep_type = Rep;
@@ -70,6 +72,20 @@ class StrongId {
   Rep value_{};
 };
 
+
+// Hash support is explicit so a strong id can be used in unordered containers
+// without exposing an implicit conversion to its underlying representation.
+template <typename Id>
+struct StrongIdHash;
+
+template <typename Tag, std::unsigned_integral Rep>
+struct StrongIdHash<StrongId<Tag, Rep>> {
+  using id_type = StrongId<Tag, Rep>;
+
+  size_t operator()(id_type id) const noexcept {
+    return std::hash<Rep>{}(id.value());
+  }
+};
 }  // namespace dataplane
 }  // namespace bess
 

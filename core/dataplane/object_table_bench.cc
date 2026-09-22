@@ -27,8 +27,8 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-// K2.4: what the object table costs, and whether the shipped representation is
-// the right one.
+// K2.4/K2.6: what the object table costs, and whether the shipped
+// representation is the right one.
 //
 // Three things are measured, because they pull in different directions:
 //
@@ -43,7 +43,7 @@
 // axes:
 //
 //   payload bytes   4  16  32  64 128 256      (object size)
-//   capacity       1K  8K 64K 512K [1M]        (table size)
+//   capacity       1K  10K 64K 100K 512K [1M]   (table size)
 //   representation raw  bare-flat  ObjectTable  indirect
 //
 // Every row reports `storage_bytes`, so it is readable which side of L1d (48 KiB
@@ -51,13 +51,20 @@
 // object inline, so the whole footprint is walked by a lookup; indirect storage
 // keeps an 8-byte-per-slot pointer array (cache-resident far longer) and pushes
 // the objects into a separate region.
+// K2.6 adds sparse high-water ranges: 100/75/50/10/1% live occupancy, compact
+// low ids, uniformly scattered ids, and churn-style holes. It compares the
+// shipped optional slots with flat raw storage plus a validity bitmap and with
+// the indirect pointer layout. Uniform sparse lookup walks the whole
+// high-water range so the cost of holes is not hidden by a small sample.
 //
 // The raw indexed array is the baseline: if `ObjectTable::Lookup()` is not
 // effectively that, the abstraction is the problem. The bare-flat variant is the
 // same storage as ObjectTable with no wrapper, which separates "flat costs X"
 // from "the wrapper costs Y". The indirect variant exists only here, as a
-// benchmark alternative -- K2 ships one representation, and alternative storage
-// layouts are not public types.
+// benchmark alternative -- K2 ships one representation, and alternative
+// storage layouts are not public types. Its one-object replacement path is
+// intentionally an unsafe/simple lower bound because it destroys the old
+// pooled object immediately; an RCU-correct design would defer retirement.
 //
 // Methodology: these are random-access loops, so they are dominated by cache
 // behaviour and are extremely sensitive to anything else running on the machine.
@@ -94,19 +101,46 @@ using bess::dataplane::ObjectTableBuilder;
 
 // A payload of a given size: the point of an object table is values that are
 // too large to keep in a classifier's result slot, so the size sweep is the
-// interesting axis.
+// interesting axis. The tag is deliberately first: real action objects tend
+// to put their hot discriminator/reference fields before cold trailing data.
 template <size_t Bytes>
 struct Payload {
-  std::array<uint8_t, Bytes> data;
+  static_assert(Bytes > sizeof(uint32_t));
+
+  uint32_t tag;
+  std::array<uint8_t, Bytes - sizeof(uint32_t)> data;
+
+  explicit Payload(uint32_t t = 0) : tag(t), data{} {}
+};
+
+template <>
+struct Payload<sizeof(uint32_t)> {
   uint32_t tag;
 
-  explicit Payload(uint32_t t = 0) : data{}, tag(t) {}
+  explicit Payload(uint32_t t = 0) : tag(t) {}
 };
+
+static_assert(sizeof(Payload<4>) == 4);
+static_assert(sizeof(Payload<16>) == 16);
 
 enum class Access {
   kHot,      // a handful of ids, all valid
   kUniform,  // uniform random over the whole table, all valid
   kMixed,    // uniform random, a quarter of them invalid or out of range
+};
+
+enum class Occupancy : int {
+  k100 = 100,
+  k75 = 75,
+  k50 = 50,
+  k10 = 10,
+  k1 = 1,
+};
+
+enum class LiveDistribution : int {
+  kCompactLow = 0,
+  kUniformHighWater = 1,
+  kChurnHoles = 2,
 };
 
 // The ids a lookup loop walks, precomputed so the timed loop is only the
@@ -161,6 +195,87 @@ std::vector<Id> MakeIds(size_t capacity, Access access) {
   return ids;
 }
 
+template <typename Id>
+std::vector<Id> MakeLiveIds(size_t capacity, Occupancy occupancy,
+                            LiveDistribution distribution) {
+  const size_t live_count = std::max<size_t>(
+      1, capacity * static_cast<size_t>(occupancy) / 100);
+  std::vector<Id> ids;
+  ids.reserve(live_count);
+
+  switch (distribution) {
+    case LiveDistribution::kCompactLow:
+      for (size_t i = 0; i < live_count; i++) {
+        ids.push_back(Id(static_cast<uint32_t>(i + 1)));
+      }
+      break;
+    case LiveDistribution::kUniformHighWater: {
+      ids.reserve(capacity);
+      for (size_t i = 0; i < capacity; i++) {
+        ids.push_back(Id(static_cast<uint32_t>(i + 1)));
+      }
+      std::mt19937 rng(5678);
+      std::shuffle(ids.begin(), ids.end(), rng);
+      ids.resize(live_count);
+      break;
+    }
+    case LiveDistribution::kChurnHoles:
+      // A long-lived allocator can leave stable ids spread across the
+      // high-water range after repeated insert/erase cycles. Keep survivors
+      // evenly spaced to model that hole pattern without timing setup work.
+      for (size_t i = 0; i < live_count; i++) {
+        const size_t index = i * capacity / live_count + 1;
+        ids.push_back(Id(static_cast<uint32_t>(index)));
+      }
+      break;
+  }
+  return ids;
+}
+
+template <typename Id>
+std::vector<Id> MakeSparseLookupIds(size_t capacity,
+                                    std::span<const Id> live_ids,
+                                    Access access) {
+  std::vector<Id> ids;
+  std::mt19937 rng(1234);
+
+  switch (access) {
+    case Access::kHot: {
+      constexpr size_t kHotIds = 8;
+      ids.reserve(kHotIds);
+      for (size_t i = 0; i < kHotIds; i++) {
+        ids.push_back(live_ids[i % live_ids.size()]);
+      }
+      break;
+    }
+    case Access::kUniform:
+      ids.reserve(capacity);
+      for (size_t i = 0; i < capacity; i++) {
+        ids.push_back(Id(static_cast<uint32_t>(i + 1)));
+      }
+      std::shuffle(ids.begin(), ids.end(), rng);
+      break;
+    case Access::kMixed: {
+      // Keep the high-water walk but replace one quarter with invalid ids.
+      // The remaining three quarters include both live objects and holes.
+      ids.reserve(capacity);
+      for (size_t i = 0; i < capacity; i++) {
+        ids.push_back(Id(static_cast<uint32_t>(i + 1)));
+      }
+      const size_t invalid = capacity / 4;
+      for (size_t i = 0; i < invalid; i++) {
+        ids[i] = i % 2 == 0
+                     ? Id(0)
+                     : Id(static_cast<uint32_t>(capacity + 1 + i % 1024));
+      }
+      std::shuffle(ids.begin(), ids.end(), rng);
+      break;
+    }
+  }
+  return ids;
+}
+
+
 // The working set a row actually walks: the point of the sweep is which side of
 // L1d/L2/L3 this lands on.
 double TouchedBytes(size_t valid_ids, size_t bytes_per_slot) {
@@ -187,6 +302,58 @@ class IndirectSlots {
   std::vector<const T *> slots_;
 };
 
+// Flat object storage with an external validity bitmap. This is benchmark-only:
+// it shows the cost of replacing optional's per-slot tag with bit-packed
+// validity while retaining inline object storage. Raw storage lets the
+// candidate support non-default-constructible T as well.
+template <typename T>
+class BitmapSlots {
+ public:
+  explicit BitmapSlots(size_t capacity)
+      : capacity_(capacity),
+        bitmap_((capacity + 64) / 64, 0),
+        storage_(allocator_.allocate(capacity + 1)) {}
+
+  BitmapSlots(const BitmapSlots &) = delete;
+  BitmapSlots &operator=(const BitmapSlots &) = delete;
+
+  ~BitmapSlots() {
+    for (size_t i = 1; i <= capacity_; i++) {
+      if (Contains(static_cast<uint32_t>(i))) {
+        std::destroy_at(storage_ + i);
+      }
+    }
+    allocator_.deallocate(storage_, capacity_ + 1);
+  }
+
+  template <typename... Args>
+  void Emplace(uint32_t id, Args &&...args) {
+    std::construct_at(storage_ + id, std::forward<Args>(args)...);
+    bitmap_[id >> 6] |= uint64_t{1} << (id & 63);
+  }
+
+  const T *Lookup(uint32_t id) const noexcept {
+    return Contains(id) ? storage_ + id : nullptr;
+  }
+
+  size_t storage_bytes() const {
+    return (capacity_ + 1) * sizeof(T) +
+           bitmap_.size() * sizeof(uint64_t);
+  }
+
+ private:
+  bool Contains(uint32_t id) const noexcept {
+    return id != 0 && id <= capacity_ &&
+           (bitmap_[id >> 6] & (uint64_t{1} << (id & 63))) != 0;
+  }
+
+  size_t capacity_;
+  std::vector<uint64_t> bitmap_;
+  std::allocator<T> allocator_;
+  T *storage_;
+};
+
+
 // One-based slot array over a pool: slot 0 reserved, so invalid handling matches
 // ObjectTable's.
 template <typename T>
@@ -208,6 +375,29 @@ std::vector<std::unique_ptr<const T>> MakeIndirectPool(size_t capacity) {
   }
   return objects;
 }
+
+template <typename T, typename Id>
+std::vector<const T *> MakeSparseIndirectSlots(
+    size_t capacity, std::span<const Id> live_ids,
+    const std::vector<std::unique_ptr<const T>> &objects) {
+  std::vector<const T *> slots(capacity + 1, nullptr);
+  for (size_t i = 0; i < live_ids.size(); i++) {
+    slots[live_ids[i].value()] = objects[i].get();
+  }
+  return slots;
+}
+
+template <typename T, typename Id>
+std::vector<std::unique_ptr<const T>> MakeSparseIndirectPool(
+    std::span<const Id> live_ids) {
+  std::vector<std::unique_ptr<const T>> objects;
+  objects.reserve(live_ids.size());
+  for (Id id : live_ids) {
+    objects.push_back(std::make_unique<const T>(id.value()));
+  }
+  return objects;
+}
+
 
 // The source of truth a generation is built from.
 template <typename T>
@@ -360,6 +550,129 @@ void BM_IndirectLookup(benchmark::State &state) {
       TouchedBytes(access == Access::kHot ? 8 : capacity, sizeof(P));
 }
 
+// -- sparse high-water-range lookup ------------------------------------------
+
+template <size_t Bytes>
+void BM_ObjectTableSparseLookup(benchmark::State &state) {
+  const size_t capacity = state.range(0);
+  const Occupancy occupancy = static_cast<Occupancy>(state.range(1));
+  const LiveDistribution distribution =
+      static_cast<LiveDistribution>(state.range(2));
+  const Access access = static_cast<Access>(state.range(3));
+  using P = Payload<Bytes>;
+
+  const std::vector<ActionId> live_ids =
+      MakeLiveIds<ActionId>(capacity, occupancy, distribution);
+  const std::span<const ActionId> live_span(live_ids);
+  ObjectTableBuilder<ActionId, P> builder(capacity);
+  for (ActionId id : live_ids) {
+    builder.Emplace(id, id.value());
+  }
+  const std::unique_ptr<const ObjectTable<ActionId, P>> table =
+      std::move(builder).Build();
+  const std::vector<ActionId> ids =
+      MakeSparseLookupIds<ActionId>(capacity, live_span, access);
+
+  uint32_t sink = 0;
+  for (auto _ : state) {
+    for (ActionId id : ids) {
+      const P *object = table->Lookup(id);
+      sink ^= object == nullptr ? 0u : object->tag;
+    }
+    benchmark::DoNotOptimize(sink);
+  }
+  state.SetItemsProcessed(state.iterations() * ids.size());
+  state.counters["occupancy_pct"] = static_cast<double>(state.range(1));
+  state.counters["live_objects"] = static_cast<double>(live_ids.size());
+  state.counters["distribution"] = static_cast<double>(state.range(2));
+  state.counters["bytes_per_object"] = static_cast<double>(sizeof(P));
+  state.counters["storage_bytes"] = static_cast<double>(table->storage_bytes());
+  state.counters["touched_bytes"] =
+      TouchedBytes(access == Access::kHot ? 8 : capacity,
+                   table->storage_bytes() / (capacity + 1));
+}
+
+template <size_t Bytes>
+void BM_BitmapSparseLookup(benchmark::State &state) {
+  const size_t capacity = state.range(0);
+  const Occupancy occupancy = static_cast<Occupancy>(state.range(1));
+  const LiveDistribution distribution =
+      static_cast<LiveDistribution>(state.range(2));
+  const Access access = static_cast<Access>(state.range(3));
+  using P = Payload<Bytes>;
+
+  const std::vector<ActionId> live_ids =
+      MakeLiveIds<ActionId>(capacity, occupancy, distribution);
+  const std::span<const ActionId> live_span(live_ids);
+  BitmapSlots<P> table(capacity);
+  for (ActionId id : live_ids) {
+    table.Emplace(id.value(), id.value());
+  }
+  const std::vector<ActionId> ids =
+      MakeSparseLookupIds<ActionId>(capacity, live_span, access);
+
+  uint32_t sink = 0;
+  for (auto _ : state) {
+    for (ActionId id : ids) {
+      const P *object = table.Lookup(id.value());
+      sink ^= object == nullptr ? 0u : object->tag;
+    }
+    benchmark::DoNotOptimize(sink);
+  }
+  state.SetItemsProcessed(state.iterations() * ids.size());
+  state.counters["occupancy_pct"] = static_cast<double>(state.range(1));
+  state.counters["live_objects"] = static_cast<double>(live_ids.size());
+  state.counters["distribution"] = static_cast<double>(state.range(2));
+  state.counters["bytes_per_object"] = static_cast<double>(sizeof(P));
+  state.counters["storage_bytes"] = static_cast<double>(table.storage_bytes());
+  state.counters["touched_bytes"] =
+      TouchedBytes(access == Access::kHot ? 8 : capacity, sizeof(P));
+  state.counters["touched_bitmap_bytes"] =
+      TouchedBytes(access == Access::kHot ? 8 : capacity, sizeof(uint64_t)) /
+      64.0;
+}
+
+template <size_t Bytes>
+void BM_IndirectSparseLookup(benchmark::State &state) {
+  const size_t capacity = state.range(0);
+  const Occupancy occupancy = static_cast<Occupancy>(state.range(1));
+  const LiveDistribution distribution =
+      static_cast<LiveDistribution>(state.range(2));
+  const Access access = static_cast<Access>(state.range(3));
+  using P = Payload<Bytes>;
+
+  const std::vector<ActionId> live_ids =
+      MakeLiveIds<ActionId>(capacity, occupancy, distribution);
+  const std::span<const ActionId> live_span(live_ids);
+  const std::vector<std::unique_ptr<const P>> pool =
+      MakeSparseIndirectPool<P>(live_span);
+  const IndirectSlots<P> table(
+      MakeSparseIndirectSlots(capacity, live_span, pool));
+  const std::vector<ActionId> ids =
+      MakeSparseLookupIds<ActionId>(capacity, live_span, access);
+
+  uint32_t sink = 0;
+  for (auto _ : state) {
+    for (ActionId id : ids) {
+      const P *object = table.Lookup(id.value());
+      sink ^= object == nullptr ? 0u : object->tag;
+    }
+    benchmark::DoNotOptimize(sink);
+  }
+  state.SetItemsProcessed(state.iterations() * ids.size());
+  state.counters["occupancy_pct"] = static_cast<double>(state.range(1));
+  state.counters["live_objects"] = static_cast<double>(live_ids.size());
+  state.counters["distribution"] = static_cast<double>(state.range(2));
+  state.counters["bytes_per_object"] = static_cast<double>(sizeof(P));
+  state.counters["storage_bytes"] =
+      static_cast<double>(table.storage_bytes() + live_ids.size() * sizeof(P));
+  state.counters["touched_bytes"] =
+      TouchedBytes(access == Access::kHot ? 8 : capacity, sizeof(const P *));
+  state.counters["touched_object_bytes"] =
+      TouchedBytes(access == Access::kHot ? 8 : live_ids.size(), sizeof(P));
+}
+
+
 // -- batch lookup ------------------------------------------------------------
 
 template <size_t Bytes>
@@ -481,9 +794,11 @@ void BM_IndirectReplace(benchmark::State &state) {
   const size_t capacity = state.range(0);
   using P = Payload<Bytes>;
 
-  // The pool outlives every generation, so unchanged objects are shared rather
-  // than copied. That is the representation's whole advantage here -- and the
-  // reason its lifetime has to be managed outside the table.
+  // This is deliberately the unsafe/simple replacement lower bound: assigning
+  // pool[0] destroys the previous object immediately, even though a published
+  // generation could still point at it. An RCU-correct indirect design would
+  // defer object retirement or version its ownership, so these replacement
+  // numbers do not include that lifetime machinery.
   std::vector<std::unique_ptr<const P>> pool = MakeIndirectPool<P>(capacity);
   const std::vector<const P *> pointers = MakeIndirectSlots(pool);
   uint32_t gen = 0;
@@ -537,6 +852,56 @@ K24_LOOKUP_SWEEP(BM_RawArrayLookup)
 K24_LOOKUP_SWEEP(BM_BareFlatLookup)
 K24_LOOKUP_SWEEP(BM_ObjectTableLookup)
 K24_LOOKUP_SWEEP(BM_IndirectLookup)
+
+// Sparse high-water ranges: five live occupancies and three live-id layouts,
+// at cache-resident and million-id capacities. Uniform lookup walks the whole
+// high-water range so holes, bitmap words and pointer slots are all exercised.
+#define K26_SPARSE_ROWS(capacity)                                      \
+  ->Args({capacity, (int)Occupancy::k100,                         \
+          (int)LiveDistribution::kCompactLow, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k100,                         \
+          (int)LiveDistribution::kUniformHighWater, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k100,                         \
+          (int)LiveDistribution::kChurnHoles, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k75,                          \
+          (int)LiveDistribution::kCompactLow, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k75,                          \
+          (int)LiveDistribution::kUniformHighWater, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k75,                          \
+          (int)LiveDistribution::kChurnHoles, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k50,                          \
+          (int)LiveDistribution::kCompactLow, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k50,                          \
+          (int)LiveDistribution::kUniformHighWater, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k50,                          \
+          (int)LiveDistribution::kChurnHoles, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k10,                          \
+          (int)LiveDistribution::kCompactLow, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k10,                          \
+          (int)LiveDistribution::kUniformHighWater, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k10,                          \
+          (int)LiveDistribution::kChurnHoles, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k1,                           \
+          (int)LiveDistribution::kCompactLow, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k1,                           \
+          (int)LiveDistribution::kUniformHighWater, (int)Access::kUniform}) \
+  ->Args({capacity, (int)Occupancy::k1,                           \
+          (int)LiveDistribution::kChurnHoles, (int)Access::kUniform})
+
+#define K26_SPARSE_SWEEP(fn)        \
+  BENCHMARK_TEMPLATE(fn, 16)        \
+      K26_SPARSE_ROWS(65536)        \
+      K26_SPARSE_ROWS(1048576);     \
+  BENCHMARK_TEMPLATE(fn, 64)        \
+      K26_SPARSE_ROWS(65536)        \
+      K26_SPARSE_ROWS(1048576);     \
+  BENCHMARK_TEMPLATE(fn, 256)       \
+      K26_SPARSE_ROWS(65536)        \
+      K26_SPARSE_ROWS(1048576);
+
+K26_SPARSE_SWEEP(BM_ObjectTableSparseLookup)
+K26_SPARSE_SWEEP(BM_BitmapSparseLookup)
+K26_SPARSE_SWEEP(BM_IndirectSparseLookup)
 
 // Access-distribution rows, on the shipped representation only: how much of the
 // lookup cost is the index/validity work and how much is the miss.

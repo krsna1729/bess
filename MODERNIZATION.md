@@ -149,29 +149,30 @@ and Clang: 41 native test binaries, 22/22 module integration files against a
 foreground daemon, and the wire-parity script.
 
 The modern-glog daemon-mode recursion is fixed (§8, entry 54), **K1 is
-complete** (entries 55-57) and **K2 is complete** (entries 58-60):
+complete** (entries 55-57), **K2 and K2.6 are complete** (entries 58-61):
 `RuntimeState` owns one dataplane `RcuDomain`, workers register/online/offline/
 unregister around the pause boundary, the scheduler reports quiescence at a safe
 task boundary, `RcuPtr<T>` publishes and retires immutable state with an
 acquire-load read path, and `IPLookup` and `ExactMatch` are migrated onto it
 (with `PublishedGeneration` deleted). K2 adds `StrongId<Tag, Rep>`/`ActionId`,
-the immutable `ObjectTable<Id, T>` with a mutable builder, and the measurement
-that decided its representation: flat inline stays, because lookup differences
-between representations are sub-nanosecond in the regime the alternatives favour
-and run 3x the other way in the regime flat favours, while flat builds up to 25x
-faster and needs no pool lifetime outside the table. K2 has no production
-consumer yet by design. The next
-work follows the order in the roadmap below: K3 (unified runtime-schema
-classifier), then K4-K8, then G1. The active
-build graph is Meson/Ninja only. GCC and Clang full Meson compiles succeed
-with the pinned DPDK 25.11.3. GCC verification passes 52/52 registered Meson
-tests -- 37 native C++ test binaries, 12 benchmark smoke tests (including the
-PMD null/ring smoke), the sample-plugin registry load, the Python target and
-the module integration run. K2's two non-EAL test binaries also pass under
-ASan+UBSan; the EAL-backed one cannot, because DPDK cannot initialise under
-ASan. `-Daf_xdp=required` configuration,
-install staging, generated build-tree protobuf imports, and source-tree
-hygiene checks also pass.
+the immutable `ObjectTable<Id, T>` with a mutable builder, and a benchmarked
+flat inline generation-owned representation. K2.6 constrains the id/hash
+substrate, makes batch-size mismatch a caller precondition, corrects the
+benchmark's exact object sizes and hot-field layout, and measures sparse
+high-water occupancy against a flat validity bitmap and indirect storage.
+Generation ownership remains flat; `optional<T>` is kept for its general
+move-only semantics, while sparse bitmap/indirect policies remain benchmark
+candidates rather than public types. K2 has no production consumer yet by
+design. The next work follows the order in the roadmap below: K3 (unified
+runtime-schema classifier), then K4-K8, then G1. The active build graph is
+Meson/Ninja only. GCC and Clang full Meson compiles succeed with the pinned DPDK
+25.11.3. GCC verification passes 52/52 registered Meson tests -- 37 native C++
+test binaries, 12 benchmark smoke tests (including the PMD null/ring smoke),
+the sample-plugin registry load, the Python target and the module integration
+run. K2's two non-EAL test binaries also pass under ASan+UBSan; the EAL-backed
+one cannot, because DPDK cannot initialise under ASan. `-Daf_xdp=required`
+configuration, install staging, generated build-tree protobuf imports, and
+source-tree hygiene checks also pass.
 
 ## Completed work (chronological, with commit hashes on `develop`)
 
@@ -2533,110 +2534,66 @@ rather than one call site).
     One bug found, again in the test: an assertion that expected one live action
     where the retired generation plus the active one are both alive.
 
-60. **K2.4/K2.5: the representation question, measured and decided — flat inline
-    stays.** `core/dataplane/object_table_bench.cc` (new, kept).
+60. **`38467dbb` plus `9049ba11`** — **K2.4/K2.5: the representation
+    question, measured and decided — flat inline remains the generation
+    ownership model.** `core/dataplane/object_table_bench.cc` contains the
+    dense cross-product baseline: raw indexed storage, bare flat storage,
+    `ObjectTable`, and benchmark-only indirect slots across payload sizes,
+    table capacities, access distributions, batches, full builds and
+    one-object replacements. Uniform and mixed access walk the table rather
+    than sampling a fixed 4096 ids, and every lookup consumes the payload tag,
+    so the benchmark measures cache footprint and the loaded object rather than
+    an optimized-away pointer calculation.
 
-    The sweep is the full cross product, because the interesting behaviour is where
-    a table stops being cache-resident and that boundary moves with both axes:
-    four representations (raw indexed array, bare flat storage without the wrapper,
-    the shipped `ObjectTable`, indirect slots over a pooled object region) ×
-    payload 4/16/32/64/128/256 B × capacity 1K/10K/64K/100K/512K (+1M for payloads
-    up to 64 B), plus hot/uniform/mixed distributions, batch sizes 1/8/16/32, and
-    build and single-object replacement. Every row reports `storage_bytes` and
-    `touched_bytes`, so it is readable which side of L1d/L2/L3/DRAM it sits on.
-    Uniform and mixed access walk *every* slot once per iteration: sampling a fixed
-    4096 ids keeps the touched lines L2-resident no matter how large the table is,
-    and the table-size axis then measures nothing.
+    The original K2.4 numbers were recorded before K2.6 corrected the benchmark
+    payload layout. They are retained in the earlier history for provenance,
+    but are not treated as final numbers: `Payload<4>` was eight bytes because
+    its tag followed a zero-length `std::array`, and the consumed field was at
+    the end of the object. K2.6 reruns the dense rows with exact sizes and a
+    front-loaded hot field.
 
-    Two measurement bugs, both found by disbelieving a number. The first was that
-    fixed-id sampling above (a 136 MB table ran at 0.49 ns/lookup). The second was
-    consumption: `DoNotOptimize` on a local does not keep the load inside the loop,
-    so GCC sank the payload read out of the raw baseline's loop entirely — the
-    disassembly showed a 13-instruction body containing only the bounds check, and
-    the row was measuring an `assert`. Every lookup row now XORs the loaded value
-    into a sink (a one-cycle-wide chain that does not serialize the independent
-    loads), which is what holds the load in place.
+    The indirect replacement row is intentionally not a production comparison.
+    Its pooled object replacement destroys the old object immediately; a
+    published pointer table could still reference that object. An RCU-correct
+    indirect representation would defer object retirement or version ownership,
+    so the replacement result is a lower bound for the unsafe/simple lifetime
+    model. The flat generation remains the boring correct baseline.
 
-    Recorded numbers: pinned to CPU 2 with its SMT sibling offlined,
-    `--benchmark_min_time=0.1s --benchmark_repetitions=3`, best of three runs. The
-    sibling has to go: with it online 106 of 170 rows spread more than 15% between
-    runs, against 21 with it offlined.
+61. **`c9e8d4ce`** — **K2.6 hardening** — the narrow follow-up requested
+    before K3:
 
-    Lookup, ns per lookup (best of three, uniform access):
+    - **`core/dataplane/strong_id.h`** now constrains `Rep` with
+      `std::unsigned_integral` and provides `StrongIdHash<Id>` without adding
+      implicit representation conversions. `object_table_test` proves the
+      typed id works as an `unordered_set` key.
+    - **`core/dataplane/object_table.h`** now treats unequal `LookupBatch`
+      spans as a caller precondition (`promise`); it no longer silently
+      truncates to the shorter span. The old shorter-result test was removed
+      because it tested the rejected contract.
+    - The benchmark payload has exact sizes (`sizeof(Payload<4>) == 4`,
+      `sizeof(Payload<16>) == 16`) and places the consumed tag first.
+    - The benchmark adds the requested sparse high-water matrix: 100/75/50/
+      10/1% occupancy, compact-low/uniform-high-water/churn-style hole
+      distributions, 64K and 1M high-water capacities, 16/64/256-byte
+      payloads, and three benchmark-only representations:
+      `ObjectTable`, flat raw storage plus a validity bitmap, and indirect
+      pointer slots. Uniform sparse lookup walks every high-water id, so
+      holes are part of the measured working set. The bitmap candidate reduces
+      validity metadata to one bit per slot but still reserves the full flat
+      object range; indirect storage reduces sparse memory but needs deferred
+      object retirement under RCU. Neither alternative becomes a public
+      representation in K2.6.
 
-    ```text
-    capacity        1K      10K      64K     100K     512K       1M
-    raw            0.21     0.27     0.36    0.42     1.15      1.63     (4 B payload)
-    bare flat      0.45     0.49     0.64    0.78     1.68      2.87
-    ObjectTable    0.63     0.72     0.93    1.10     2.20      3.82
-    indirect       0.44     0.58     1.53    1.80     6.66     11.11
+    The sparse matrix completed as 270 registered rows in the focused
+    benchmark run. It is a workload characterization, not a claim that one
+    layout wins every occupancy/payload regime: K3 must keep generation
+    ownership, result semantics, and any storage policy independently
+    selectable.
 
-    raw            0.39     0.53     1.48    1.93     8.69       -       (256 B payload)
-    bare flat      0.56     0.73     1.57    2.15     9.27       -
-    ObjectTable    0.74     0.97     1.81    2.18    10.70       -
-    indirect       0.45     0.65     1.96    2.53    10.78       -
-    ```
-
-    Read as: while the table is cache-resident (1K-10K) the shipped representation
-    costs 0.62-0.97 ns/lookup, about 0.2 ns more than either bare flat storage or
-    indirect slots. Once it is not, the two designs separate by payload size: at
-    512K-1M entries with a 4 B payload flat is 3x faster than indirect (2.20/3.82
-    vs 6.66/11.11), because indirect pays a dependent second access into a scattered
-    object region while flat walks one contiguous array; at 512K x 256 B (138 MB)
-    they are equal (10.70 vs 10.78), both DRAM-bound. Hot ids are 0.63-0.66 ns
-    whatever the table size, and mixed access with a quarter of ids invalid is
-    cheaper than uniform at 512K/64 B (7.66 vs 9.46) because an invalid id never
-    touches the slot.
-
-    Build and replacement, ns per generation (best of three):
-
-    ```text
-                        10K x 4B   100K x 4B   10K x 64B   100K x 64B   10K x 256B   100K x 256B
-    flat build               7827      85268       29888       499618       137243       3416303
-    indirect build         187479    1998476      189223      2477985       268657       7741449
-    flat replace             9261      99894       39564       615973       182280       4004368
-    indirect replace         1316      21068        1351        22671         1336         22851
-    ```
-
-    Build from scratch favours flat by 24x at 10K x 4 B and 2.3x at 100K x 256 B,
-    because indirect pays an allocation per object. Replacement of one object in an
-    existing generation favours indirect by 7x at 10K and 4.7x at 100K, because its
-    pool outlives generations and only the slot array is copied — the cost of that
-    is that the pool's lifetime has to be managed outside the table, and objects
-    shared across generations need ownership semantics K2 deliberately does not
-    have. Batch lookup amortizes its own per-call cost (2.64 ns/lookup at batch 1 down
-    to 1.08 at batch 32, 16 B payload, 4096 entries, mixed access) but does not beat
-    the scalar loop's 0.6-0.9 ns/lookup at comparable sizes: it writes results into a
-    caller array where the scalar loop consumes them from registers. It is an API
-    shape for callers that already hold arrays, not a throughput win.
-    Memory is equal at large payloads and better for flat at small ones (12.3 KB vs
-    16.4 KB at 1K x 4 B), with no per-object allocation and no external pool.
-
-    **Decision: flat inline stays.** The lookup differences are sub-nanosecond in
-    the regime indirect favours and run 3x the other way in the regime flat favours;
-    flat builds up to 25x faster and needs no lifetime machinery outside the table;
-    indirect's only real win is a small-change rebuild measured in tens of
-    microseconds at 100K objects, which is a control-plane cost, not a packet-path
-    one. If generation rebuild ever dominates a workload, the benchmark and the
-    numbers for the complex form are here, which is what §19 asked for before
-    implementing it.
-
-    Recorded, not fixed: the wrapper costs a consistent 0.15-0.25 ns/lookup over the
-    same storage without it (`ObjectTable` 0.63 vs bare flat 0.45 at 1K x 4 B, 10.70
-    vs 9.27 at 512K x 256 B). That is the `std::optional` validity check and member
-    access, it is sub-nanosecond, and it is not worth a second representation to
-    chase — but it is the number to look at if `Lookup` ever grows.
-
-    Scope held: no classifier migration (§36 — `ExactMatch`, `WildcardMatch`,
-    `IPLookup` still return gates), no `rte_hash` experiment (§37), no protobuf
-    (§39), no action semantic model (§40), no per-slot RCU (§28).
-
-    Verification: GCC and Clang builds clean; `object_table_test` and
-    `object_table_publication_test` pass under ASan+UBSan (13 + 2 cases); the
-    EAL-backed `object_table_rcu_test` passes natively; the benchmark is a
-    registered smoke test in the suite; the module integration run and the Python
-    targets are unchanged by K2 (nothing outside `core/dataplane/` and the two
-    test registrations is touched).
+    Verification for this follow-up: `core/object_table_bench` builds with
+    GCC; `core/dataplane_object_table_test` passes all 13 cases; and the
+    sparse benchmark executes all 270 rows. The full Meson graph remains the
+    required closeout check after the final K2.6 edit.
 
 ## Review process established this session
 

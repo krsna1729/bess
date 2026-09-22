@@ -38,6 +38,8 @@
 #include <utility>
 #include <vector>
 
+#include "utils/common.h"
+
 namespace bess {
 namespace dataplane {
 
@@ -88,12 +90,12 @@ class ObjectTable {
   }
 
   // Resolves a batch. Results line up with `ids`; the same rules as Lookup()
-  // apply per element. No allocation or synchronization.
+  // apply per element. No allocation or synchronization. The spans must have
+  // equal sizes; a mismatch violates the caller precondition.
   void LookupBatch(std::span<const Id> ids,
                    std::span<const T *> results) const noexcept {
-    const size_t count = ids.size() < results.size() ? ids.size()
-                                                     : results.size();
-    for (size_t i = 0; i < count; i++) {
+    promise(ids.size() == results.size());
+    for (size_t i = 0; i < ids.size(); i++) {
       results[i] = Lookup(ids[i]);
     }
   }

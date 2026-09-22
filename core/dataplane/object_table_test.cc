@@ -35,6 +35,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #include "dataplane/action_id.h"
@@ -48,6 +49,7 @@ using bess::dataplane::kInvalidActionId;
 using bess::dataplane::ObjectTable;
 using bess::dataplane::ObjectTableBuilder;
 using bess::dataplane::StrongId;
+using bess::dataplane::StrongIdHash;
 
 // A second id type, to pin that different ids are different types.
 struct NextHopIdTag;
@@ -93,6 +95,16 @@ TEST(StrongIdTest, ZeroIsInvalidAndValuesArePreserved) {
 
   // The escape hatch: a 64-bit id keeps its full value.
   EXPECT_EQ(0x1'0000'0001ull, WideId(0x1'0000'0001ull).value());
+}
+
+TEST(StrongIdTest, TypedHashCanIndexIds) {
+  std::unordered_set<ActionId, StrongIdHash<ActionId>> ids;
+  ids.insert(ActionId(7));
+  ids.insert(ActionId(11));
+
+  EXPECT_TRUE(ids.contains(ActionId(7)));
+  EXPECT_TRUE(ids.contains(ActionId(11)));
+  EXPECT_FALSE(ids.contains(ActionId(13)));
 }
 
 // -- ObjectTable -------------------------------------------------------------
@@ -317,18 +329,8 @@ TEST(ObjectTableBatchTest, MatchesScalarLookupForEveryCase) {
   }
 }
 
-TEST(ObjectTableBatchTest, ShorterResultSpanIsNotOverrun) {
-  ObjectTableBuilder<ActionId, Action> builder(4);
-  ASSERT_TRUE(builder.Set(ActionId(1), Action{1, "one"}));
-  std::unique_ptr<const Table> table = std::move(builder).Build();
-
-  const std::array<ActionId, 4> ids = {ActionId(1), ActionId(1), ActionId(1),
-                                       ActionId(1)};
-  std::array<const Action *, 2> results = {nullptr, nullptr};
-  table->LookupBatch(ids, results);
-  EXPECT_NE(nullptr, results[0]);
-  EXPECT_NE(nullptr, results[1]);
-}
+// A mismatched output span violates LookupBatch's precondition. Callers must
+// provide one output slot for every input id.
 
 // -- Introspection -----------------------------------------------------------
 
