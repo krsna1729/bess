@@ -157,12 +157,18 @@ TEST(TypedExactTest, UsesTypedKeyAndResultWithoutMetadata) {
 
   const std::array<FlowKey, 2> keys = {FlowKey{7, 80}, FlowKey{8, 80}};
   std::array<std::optional<uint32_t>, 2> results;
-  table.lookup_batch(keys, results);
+  const uint64_t hits = table.lookup_batch(keys, results);
+  EXPECT_EQ(0x1ull, hits);
   EXPECT_EQ(42u, *results[0]);
   EXPECT_FALSE(results[1].has_value());
   EXPECT_EQ(1u, table.size());
-}
 
+  // Overload 2: direct Result output with hit mask
+  std::array<uint32_t, 2> direct_results{};
+  const uint64_t direct_hits = table.lookup_batch(keys, direct_results);
+  EXPECT_EQ(0x1ull, direct_hits);
+  EXPECT_EQ(42u, direct_results[0]);
+}
 TEST(TypedExactTest, SupportsMoveOnlyBackendsAndStrongSlots) {
   MoveOnlyFlowTable move_only(MoveOnlyBackend(17));
   ASSERT_NE(nullptr, move_only.lookup(FlowKey{7, 80}));

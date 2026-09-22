@@ -189,4 +189,66 @@ TEST(ExtractPlanTest, ExactWidthFieldsEndAtTheSourceBoundary) {
   check_width(7);
 }
 
+TEST(ExtractPlanTest, NormalizationMaskApplied) {
+  // Single 4-byte packet field with mask {0xFF, 0x00, 0xFF, 0x0F}.
+  // Source bytes 0xAB, 0xCD, 0xEF, 0x12 → masked: 0xAB, 0x00, 0xEF, 0x02.
+  RuntimeClassifierSchema schema{
+      .key_size = 4,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 4,
+                      bess::classifier::Normalization{
+                          {Byte(0xFF), Byte(0x00), Byte(0xFF), Byte(0x0F)}}}},
+  };
+  auto compiled = ExtractPlan::Compile(schema);
+  ASSERT_TRUE(compiled);
+
+  const std::array<std::byte, 4> packet = {Byte(0xAB), Byte(0xCD), Byte(0xEF),
+                                           Byte(0x12)};
+  std::array<std::byte, 4> key{};
+  ASSERT_TRUE(compiled->Execute(SourceView{packet, {}}, MutableBytes(key)));
+
+  EXPECT_EQ(Byte(0xAB), key[0]);
+  EXPECT_EQ(Byte(0x00), key[1]);
+  EXPECT_EQ(Byte(0xEF), key[2]);
+  EXPECT_EQ(Byte(0x02), key[3]);
+
+  // Coalescing must NOT merge masked ops into single kernel.
+  EXPECT_EQ(1u, compiled->ops().size());
+  EXPECT_EQ(ExtractKernel::kSinglePacket, compiled->kernel());
+
+  // Also verify via ExecuteBatch.
+  std::array<std::byte, 4> batch_out{};
+  const std::array<SourceView, 1> views = {SourceView{packet, {}}};
+  ASSERT_TRUE(compiled->ExecuteBatch(views, MutableBytes(batch_out), 4));
+  EXPECT_EQ(key, batch_out);
+}
+
+TEST(ExtractPlanTest, AllOnesMaskEqualsNoMask) {
+  // Two adjacent fields; all-0xFF mask on one should NOT block coalescing.
+  // But they are separate fields, so coalescing logic applies normally.
+  // Verify that all-0xFF mask produces same output as no mask.
+  RuntimeClassifierSchema schema_masked{
+      .key_size = 3,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 3,
+                      bess::classifier::Normalization{
+                          {Byte(0xFF), Byte(0xFF), Byte(0xFF)}}}},
+  };
+  RuntimeClassifierSchema schema_plain{
+      .key_size = 3,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 3}},
+  };
+
+  auto masked = ExtractPlan::Compile(schema_masked);
+  auto plain = ExtractPlan::Compile(schema_plain);
+  ASSERT_TRUE(masked);
+  ASSERT_TRUE(plain);
+
+  const std::array<std::byte, 3> packet = {Byte(0xDE), Byte(0xAD), Byte(0xBE)};
+  std::array<std::byte, 3> key_masked{};
+  std::array<std::byte, 3> key_plain{};
+
+  ASSERT_TRUE(masked->Execute(SourceView{packet, {}}, MutableBytes(key_masked)));
+  ASSERT_TRUE(plain->Execute(SourceView{packet, {}}, MutableBytes(key_plain)));
+  EXPECT_EQ(key_plain, key_masked);
+}
+
 }  // namespace

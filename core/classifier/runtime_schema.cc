@@ -78,8 +78,12 @@ ClassifierResult<void> RuntimeClassifierSchema::Validate() const {
       return Error(ClassifierErrorCode::kKeyOutOfBounds,
                    "classifier key field exceeds normalized key size", i);
     }
+    if (!field.normalization.mask.empty() &&
+        field.normalization.mask.size() != field.size) {
+      return Error(ClassifierErrorCode::kInvalidPlan,
+                   "classifier key field normalization mask size mismatch", i);
+    }
   }
-
   for (size_t i = 0; i < key_fields.size(); i++) {
     for (size_t j = i + 1; j < key_fields.size(); j++) {
       if (Overlaps(key_fields[i], key_fields[j],

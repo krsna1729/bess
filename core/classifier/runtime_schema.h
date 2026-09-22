@@ -37,11 +37,19 @@
 
 namespace bess::classifier {
 
+// Per-field normalization applied after extraction. An empty mask means
+// plain exact matching (all-ones). When non-empty, mask.size() must equal
+// the field size and is ANDed byte-by-byte into the key output region.
+struct Normalization {
+  std::vector<std::byte> mask;  // empty == all-ones; non-empty must match size
+};
+
 struct RuntimeKeyField {
   SourceKind source = SourceKind::kPacket;
   size_t source_offset = 0;
   size_t key_offset = 0;
   size_t size = 0;
+  Normalization normalization;
 };
 
 struct RuntimeResultField {

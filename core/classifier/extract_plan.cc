@@ -46,6 +46,9 @@ ConstBytes Source(const SourceView &view, SourceKind kind) {
 }
 
 bool CanCoalesce(const ExtractOp &previous, const ExtractOp &current) {
+  if (!previous.mask.empty() || !current.mask.empty()) {
+    return false;
+  }
   return previous.source == current.source &&
          current.source_offset >= previous.source_offset &&
          current.source_offset - previous.source_offset == previous.size &&
@@ -64,8 +67,13 @@ bool CopyOperation(const ExtractPlan &plan, const ExtractOp &op,
     return false;
   }
 
-  std::memcpy(key.data() + op.destination_offset,
-              source_bytes.data() + op.source_offset, op.size);
+  std::byte *dst = key.data() + op.destination_offset;
+  std::memcpy(dst, source_bytes.data() + op.source_offset, op.size);
+  if (!op.mask.empty()) {
+    for (size_t k = 0; k < op.size; k++) {
+      dst[k] &= op.mask[k];
+    }
+  }
   return true;
 }
 
@@ -76,6 +84,11 @@ bool CopySingle(const ExtractPlan &plan, const ExtractOp &op,
     return false;
   }
   std::memcpy(destination, source.data() + op.source_offset, op.size);
+  if (!op.mask.empty()) {
+    for (size_t k = 0; k < op.size; k++) {
+      destination[k] &= op.mask[k];
+    }
+  }
   return true;
 }
 
@@ -91,8 +104,9 @@ ClassifierResult<ExtractPlan> ExtractPlan::Compile(
   std::vector<ExtractOp> ops;
   ops.reserve(schema.key_fields.size());
   for (const RuntimeKeyField &field : schema.key_fields) {
-    ops.push_back(ExtractOp{field.source, field.source_offset, field.key_offset,
-                            field.size});
+    ExtractOp op{field.source, field.source_offset, field.key_offset,
+                 field.size, field.normalization.mask};
+    ops.push_back(std::move(op));
   }
   std::stable_sort(ops.begin(), ops.end(),
                    [](const ExtractOp &lhs, const ExtractOp &rhs) {

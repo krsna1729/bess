@@ -50,6 +50,7 @@ struct ExtractOp {
   size_t source_offset = 0;
   size_t destination_offset = 0;
   size_t size = 0;
+  std::vector<std::byte> mask;  // empty = no masking; non-empty ANDed after copy
 };
 
 enum class ExtractKernel : uint8_t {
