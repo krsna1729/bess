@@ -59,15 +59,17 @@ using bess::classifier::ScalarExactBackend;
 // ---------------------------------------------------------------------------
 
 static_assert(ScalarExactBackend<RteHashPositionBackend, ConstBytes>);
-static_assert(BatchExactBackend<RteHashPositionBackend, ConstBytes>);
+static_assert(BatchExactBackend<RteHashPositionBackend, ConstBytes, int32_t>);
 static_assert(MeasurableBackend<RteHashPositionBackend>);
 
 static_assert(ScalarExactBackend<RteHashDataBackend<uint16_t>, ConstBytes>);
-static_assert(BatchExactBackend<RteHashDataBackend<uint16_t>, ConstBytes>);
+static_assert(BatchExactBackend<RteHashDataBackend<uint16_t>, ConstBytes,
+                                uint16_t>);
 static_assert(MeasurableBackend<RteHashDataBackend<uint16_t>>);
 
 static_assert(ScalarExactBackend<RteHashDataBackend<uint32_t>, ConstBytes>);
-static_assert(BatchExactBackend<RteHashDataBackend<uint32_t>, ConstBytes>);
+static_assert(BatchExactBackend<RteHashDataBackend<uint32_t>, ConstBytes,
+                                uint32_t>);
 static_assert(MeasurableBackend<RteHashDataBackend<uint32_t>>);
 
 // ---------------------------------------------------------------------------

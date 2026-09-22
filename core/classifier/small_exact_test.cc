@@ -59,6 +59,12 @@ struct FlowKeyEqual {
   }
 };
 
+struct NaturalKey {
+  uint32_t value;
+
+  friend bool operator==(const NaturalKey &, const NaturalKey &) = default;
+};
+
 namespace bess::classifier {
 
 template <>
@@ -77,16 +83,28 @@ using bess::classifier::BatchExactBackend;
 using bess::classifier::ExactBackendKind;
 using bess::classifier::MeasurableBackend;
 using bess::classifier::SmallExactBackend;
+using bess::classifier::ScalarExactBackend;
 using bess::classifier::SortedFlatBackend;
 
 // ---------------------------------------------------------------------------
 // Concept assertions
 // ---------------------------------------------------------------------------
 
-static_assert(BatchExactBackend<SmallExactBackend<FlowKey, uint32_t>, FlowKey>,
+static_assert(BatchExactBackend<SmallExactBackend<FlowKey, uint32_t>, FlowKey,
+                                uint32_t>,
               "SmallExactBackend must satisfy BatchExactBackend");
 static_assert(MeasurableBackend<SmallExactBackend<FlowKey, uint32_t>>,
               "SmallExactBackend must satisfy MeasurableBackend");
+static_assert(ScalarExactBackend<SmallExactBackend<NaturalKey, uint32_t>,
+                                 NaturalKey>);
+
+TEST(SmallExact, AcceptsNaturalKeyWithoutTraits) {
+  SmallExactBackend<NaturalKey, uint32_t> backend;
+  ASSERT_TRUE(backend.insert(NaturalKey{7}, 42u));
+  const uint32_t *result = backend.lookup(NaturalKey{7});
+  ASSERT_NE(nullptr, result);
+  EXPECT_EQ(42u, *result);
+}
 
 // ---------------------------------------------------------------------------
 // SmallExactBackend tests

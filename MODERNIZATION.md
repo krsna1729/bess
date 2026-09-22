@@ -177,14 +177,21 @@ classifier (forced Cuckoo backend, dense packed keys, per-packet extraction
 validity, `PreResume` metadata-offset refresh with fail-closed generations),
 proven by a legacy-vs-new differential test and before/after benchmarks.
 K3.3.1 and K3.3.2 are committed fast-path follow-ups recorded in entries
-65-66; the next milestone is K3.4-K3.7, K4-K8, and G1. The active build graph is
+65-66. K3.4 adds the typed-author surface for the same exact-match family: the
+typed backends accept an author's own `Key`/`Hash`/`Equal` without a
+`KeyTraits` registration or `ByteKey`, `ExactTable` is decoupled from the key
+concept, `BatchExactBackend` names the result type explicitly, and a
+three-rung benchmark (author loop / `ExactTable` / runtime-generic) records the
+comparison without declaring a winner. The next milestone is K3.5-K3.7,
+K4-K8, and G1. The active build graph is
 Meson/Ninja only. GCC and Clang full Meson compiles succeed with pinned DPDK
-25.11.3. The registered suite is now 68 tests: 50 native C++ binaries, 13
+25.11.3. The registered suite is now 69 tests: 51 native C++ binaries, 15
 benchmark smoke tests (including the PMD null/ring smoke), the sample-plugin
-registry load, the Python target, and the module integration run. All 68
-registered targets have now passed verification: the prior full run passed
-66, and the Python and module-integration targets each pass individually
-after temporary 1440-minute passwordless sudo was enabled for daemon startup.
+registry load, the Python target, and the module integration run. All 69
+registered targets pass in the current tree: the 54 non-benchmark targets in
+one full run and the 15 benchmark smoke targets in another. K3.4's own targets
+(the four typed-backend unit binaries and `classifier_typed_bench`) pass under
+GCC, Clang, and ASan+UBSan.
 The classifier extract-plan, Cuckoo, and migration tests pass under ASan+UBSan;
 the Rte hash classifier test remains environment-incompatible because DPDK EAL
 cannot allocate its required memory under sanitizer. `-Daf_xdp=required`
@@ -2817,6 +2824,78 @@ rather than one call site).
       the production type-erased lookup is within the legacy lookup rung and
       the end-to-end result is within measurement drift. K3.4 remains
       untouched.
+
+67. **K3.4 typed exact-classifier author surface** — the second first-class
+    consumer model, proven without touching any module:
+    - **Typed keys need no registration.** `CuckooExactBackend` and
+      `SmallExactBackend` no longer require `ClassifierKey`. They accept an
+      author's own `Key`/`Hash`/`Equal`, so a natural `struct FlowKey` with
+      `operator==` and a hand-written hash works with no `KeyTraits`
+      specialization and no `ByteKey`. `DefaultTypedEqualT<Key>` uses a
+      registered `KeyTraits<Key>::equal_type` when present and otherwise falls
+      back to the author's `operator==`; hashing has no fallback, because
+      object representation is never hashed implicitly. The
+      `ClassifierKey`/`CanonicalByteKey`/`TypedClassifierKey` concepts stay for
+      the generic paths that do want representation-level hashing.
+    - **`ExactTable` is decoupled from the key concept** and now requires only
+      `std::is_object_v<Key>` plus `ScalarExactBackend<Backend, Key>`. It owns
+      the backend with `[[no_unique_address]]`, has no virtuals, and adds no
+      storage (`static_assert(sizeof(ExactTable) == sizeof(Backend))`).
+    - **`BatchExactBackend` names the result type explicitly**
+      (`BatchExactBackend<Backend, Key, Result>`). This replaced a
+      `detail::backend_result_type_t` trait that defaulted to `void`; a backend
+      with a native `lookup_batch` but no `result_type` alias previously
+      hard-errored while forming `std::span<void>` inside the concept. Scalar
+      lookup stays mandatory, native batch stays an orthogonal capability, and
+      `ExactTable` selects it with `if constexpr`.
+    - **Typed results are unrestricted.** `gate_idx_t`, `ActionId`, 2/4/8/16/32
+      byte structs, `ResultSlot`, and pointer-returning backends all work
+      directly; a 32-byte decision needs no `ResultSlot` and no indirection.
+      `Small`/`Direct`/`Cuckoo` are asserted to agree on hits and results for
+      identical rules and keys, and a backend whose native batch path is
+      reachable is asserted to have that path reach the caller unchanged.
+    - **Assembly equivalence is exact, not approximate.** Two translation
+      units, one exercising the author-written `backend.lookup()` loop and one
+      calling `ExactTable::lookup_batch`, compiled with the production flags:
+      the Cuckoo configuration used by the benchmark is byte-identical (122
+      instructions, zero `call`s) and Small is identical modulo label
+      numbering (34 instructions, zero `call`s). Neither unit contains
+      `operator new`/`malloc`, and neither references `ExtractPlan`,
+      `RuntimeExactBackend`, `RuntimeClassifierSchema`, `ConstBytes`, or
+      protobuf — the typed path pulls in no runtime-generic machinery.
+    - **`classifier/typed_exact_bench.cc`** measures three rungs over one
+      logical workload: the author-written loop, the same backend behind
+      `ExactTable`, and the runtime-generic equivalent. Both sides hash with
+      DPDK CRC32C so a rung difference is framework cost rather than a hash
+      artifact. Workloads are generic (4/8/16/32-byte byte keys, a `uint16_t`
+      domain for `Direct`/`Small`, a 13-byte natural flow struct parsed from
+      packet bytes, 2/4/8/16/32-byte results, 4/16/64/1K/10K/100K rules, batch
+      1/8/16/32, hit/miss/alternating/hot-four distributions); 2112
+      registrations complete with zero errors. One packet-parser benchmark
+      compares `Packet → authored parser → typed Key → typed backend` against
+      `Packet → ExtractPlan → packed bytes → runtime backend`, so neither side
+      imitates the other's representation.
+    - **Representative means** (5 repetitions, batch 8, alternating hit/miss,
+      CPU scaling enabled — absolute values are noisy): Cuckoo K8/R4 at 64
+      rules 33.8 / 39.6 / 24.8 ns, Cuckoo K32/R32 at 10K rules 67.6 / 71.8 /
+      76.4 ns, Small K4/R2 at 64 rules 99.5 / 108 / 31.3 ns, scalar `Direct`
+      R4 at 64 rules 6.29 / 5.39 / 29.6 ns, and the packet-parser flow
+      workload 38.8 / 46.8 / 110 ns for Direct / Table / Runtime. The rungs
+      differ by backend, hash-free framework cost, and representation; the
+      Cuckoo K8 gap is code layout, since that exact configuration is
+      byte-identical in assembly. **No universal backend winner is declared.**
+    - **Deliberate non-changes**: no `Auto` policy, no batch-prefetch
+      machinery, no migration of another module, and no runtime-generic
+      machinery in the typed path. `FindPrehashedAsWithStats` stays diagnostic
+      with a caller-owned `LookupStats&`; probe counters are not production
+      `CuckooMap` state.
+    - **Verification**: GCC and Clang full builds; `classifier_typed_exact_test`,
+      `classifier_cuckoo_exact_test`, `classifier_small_exact_test`,
+      `classifier_direct_exact_test`, `classifier_rte_hash_exact_test`, and
+      `modules_exact_match_migration_test` pass under GCC, Clang, and
+      ASan+UBSan; the full 2112-registration typed benchmark matrix exits 0; the
+      whole registered suite passes (54 non-benchmark targets in one run, 15
+      benchmark smoke targets in another).
 
 ## Review process established this session
 

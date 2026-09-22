@@ -61,6 +61,24 @@ struct FlowKeyEqual {
   }
 };
 
+struct AuthorKey {
+  uint32_t src;
+  uint32_t dst;
+
+  friend bool operator==(const AuthorKey &, const AuthorKey &) = default;
+};
+
+struct AuthorKeyHash {
+  size_t operator()(const AuthorKey &key) const noexcept {
+    return (static_cast<size_t>(key.src) << 32) ^ key.dst;
+  }
+};
+
+struct AuthorDecision {
+  uint16_t gate;
+  bess::dataplane::ActionId action;
+};
+
 // Register FlowKey with the classifier key infrastructure.
 namespace bess::classifier {
 
@@ -88,13 +106,18 @@ using bess::classifier::ScalarExactBackend;
 
 using Backend = CuckooExactBackend<FlowKey, uint32_t>;
 
+using AuthorBackend =
+    CuckooExactBackend<AuthorKey, AuthorDecision, AuthorKeyHash>;
+static_assert(ScalarExactBackend<AuthorBackend, AuthorKey>);
+static_assert(MeasurableBackend<AuthorBackend>);
+
 static_assert(ScalarExactBackend<Backend, FlowKey>,
               "CuckooExactBackend must satisfy ScalarExactBackend");
 
 static_assert(MeasurableBackend<Backend>,
               "CuckooExactBackend must satisfy MeasurableBackend");
 
-static_assert(!BatchExactBackend<Backend, FlowKey>,
+static_assert(!BatchExactBackend<Backend, FlowKey, uint32_t>,
               "CuckooExactBackend must NOT satisfy BatchExactBackend: "
               "it has no native bulk lookup; ExactTable uses scalar fallback");
 
@@ -158,7 +181,7 @@ TEST(CuckooExactBackend, MeasurableBackendConcept) {
 }
 
 TEST(CuckooExactBackend, NotBatchExactBackend) {
-  static_assert(!BatchExactBackend<Backend, FlowKey>);
+  static_assert(!BatchExactBackend<Backend, FlowKey, uint32_t>);
 }
 
 // ExactTable with CuckooExactBackend exercises the scalar-fallback path in
@@ -190,6 +213,26 @@ TEST(CuckooExactBackend, UsedInExactTable) {
   // Bit 1 clear: key[1] was a miss.
   EXPECT_EQ(0u, hits & (uint64_t{1} << 1));
   EXPECT_EQ(nullptr, results[1]);
+}
+
+TEST(CuckooExactBackend, AcceptsAuthorDefinedKeyAndResult) {
+  AuthorBackend backend;
+  const AuthorDecision decision{
+      .gate = 3, .action = bess::dataplane::ActionId{11}};
+  ASSERT_TRUE(backend.insert(AuthorKey{1, 2}, decision));
+
+  using Table = ExactTable<AuthorKey, AuthorDecision, AuthorBackend>;
+  Table table(std::move(backend));
+
+  const std::array<AuthorKey, 2> keys = {
+      AuthorKey{1, 2}, AuthorKey{9, 9}};
+  std::array<AuthorDecision, 2> results{};
+  const uint64_t hits = table.lookup_batch(keys, results);
+
+  EXPECT_EQ(0x1ull, hits);
+  EXPECT_EQ(3u, results[0].gate);
+  EXPECT_EQ(bess::dataplane::ActionId{11}, results[0].action);
+  EXPECT_EQ(nullptr, table.lookup(AuthorKey{9, 9}));
 }
 
 TEST(CuckooExactBackend, BuildRuntimeCuckooBackendPopulatesAndDispatches) {

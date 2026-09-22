@@ -53,20 +53,6 @@ struct is_optional<std::optional<T>> : std::true_type {};
 
 template <typename T>
 inline constexpr bool is_optional_v = is_optional<T>::value;
-
-template <typename T>
-struct backend_result_type {
-  using type = void;
-};
-
-template <typename T>
-  requires requires { typename T::result_type; }
-struct backend_result_type<T> {
-  using type = typename T::result_type;
-};
-
-template <typename T>
-using backend_result_type_t = typename backend_result_type<T>::type;
 }  // namespace detail
 
 // A backend that can look up one key at a time.
@@ -83,12 +69,14 @@ concept ScalarExactBackend =
          std::declval<const B &>().lookup(std::declval<const Key &>()))>);
 
 // A backend that additionally exposes a native batch lookup returning a hit
-// mask. Bit i of the return value is set iff results[i] is valid.
-template <typename B, typename Key>
+// mask. Bit i of the return value is set iff results[i] is valid. The result
+// type is supplied by the caller, so a backend does not need to declare a
+// result_type alias to participate.
+template <typename B, typename Key, typename Result>
 concept BatchExactBackend =
     ScalarExactBackend<B, Key> &&
     requires(const B &b, std::span<const Key> keys,
-             std::span<detail::backend_result_type_t<B>> results) {
+             std::span<Result> results) {
       { b.lookup_batch(keys, results) } -> std::same_as<uint64_t>;
     };
 
@@ -98,11 +86,11 @@ concept MeasurableBackend = requires(const B &b) {
   { b.info() } -> std::convertible_to<BackendInfo>;
 };
 
-// Static module authors use their real Key/Result types and a backend whose
-// lookup is directly visible to the compiler. Runtime schema plans are not part
-// of this type.
-template <ClassifierKey Key, typename Result, typename Backend>
-  requires ScalarExactBackend<Backend, Key>
+// ExactTable owns a typed backend and never serializes Key or Result. The
+// backend's explicit operations define their semantics; ByteKey is optional,
+// not an implicit requirement for natural author-defined structs.
+template <typename Key, typename Result, typename Backend>
+  requires(std::is_object_v<Key> && ScalarExactBackend<Backend, Key>)
 class ExactTable {
  public:
   using key_type = Key;
@@ -144,7 +132,7 @@ class ExactTable {
     requires(!std::same_as<Result, lookup_result>) {
     promise(keys.size() == results.size());
     promise(keys.size() <= 64);
-    if constexpr (BatchExactBackend<Backend, Key>) {
+    if constexpr (BatchExactBackend<Backend, Key, Result>) {
       return backend_.lookup_batch(keys, results);
     } else {
       uint64_t hits = 0;

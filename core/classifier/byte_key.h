@@ -81,6 +81,34 @@ struct KeyTraits<ByteKey<N>> {
   using equal_type = ByteKeyEqual<N>;
 };
 
+// Use a registered equality operation when one exists; otherwise, typed
+// backends fall back to the author's operator==. Hashing has no such
+// fallback: arbitrary object representation is never hashed implicitly.
+template <typename Key, typename = void>
+struct DefaultTypedEqual {
+  using type = std::equal_to<Key>;
+};
+
+template <typename Key>
+struct DefaultTypedEqual<Key, std::void_t<typename KeyTraits<Key>::equal_type>> {
+  using type = typename KeyTraits<Key>::equal_type;
+};
+
+template <typename Key>
+using DefaultTypedEqualT = typename DefaultTypedEqual<Key>::type;
+
+template <typename Key, typename Equal>
+concept TypedKeyEquality =
+    std::is_object_v<Key> && requires(const Key &lhs, const Key &rhs) {
+      { std::declval<Equal>()(lhs, rhs) } -> std::same_as<bool>;
+    };
+
+template <typename Key, typename Hash, typename Equal>
+concept TypedKeyOperations =
+    TypedKeyEquality<Key, Equal> && requires(const Key &key) {
+      { std::declval<Hash>()(key) } -> std::convertible_to<size_t>;
+    };
+
 template <typename Key>
 concept CanonicalByteKey =
     std::is_trivially_copyable_v<Key> &&

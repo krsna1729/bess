@@ -45,12 +45,13 @@
 namespace bess::classifier {
 
 // Immutable contiguous linear-scan exact backend.
-// Satisfies ScalarExactBackend and MeasurableBackend. lookup_batch falls back
-// to scalar loop and returns hit mask, so it also satisfies BatchExactBackend
-// in ExactTable's if constexpr sense — but only via the scalar path.
+// Satisfies ScalarExactBackend and MeasurableBackend. lookup_batch scans with
+// the same equality and returns a hit mask, so it also satisfies
+// BatchExactBackend — but the work is the scalar scan, not a vectorized path.
 // Intended for tiny rule counts (≤64); no SIMD, no hashing.
-template <ClassifierKey Key, typename Result,
-          typename Equal = typename KeyTraits<Key>::equal_type>
+template <typename Key, typename Result,
+          typename Equal = DefaultTypedEqualT<Key>>
+  requires TypedKeyEquality<Key, Equal>
 class SmallExactBackend {
  public:
   using key_type = Key;

@@ -57,14 +57,16 @@ namespace bess::classifier {
 //
 // Does NOT satisfy BatchExactBackend — it has no native bulk lookup path.
 // ExactTable<Key, Result, CuckooExactBackend<...>> falls back to the scalar
-// loop, setting one hit-mask bit per non-null result.
+// loop, setting one hit-mask bit per non-null result. A typed author who wants
+// a batch entry point at all can supply one; the contract stays scalar-first.
 //
-// Build contract: insert()/remove() are control-plane only. Once the generation
-// is published, the table is immutable; only lookup() and info() are called on
-// the packet path.
-template <ClassifierKey Key, typename Result,
+// The key need not be a ByteKey or a KeyTraits specialization when the author
+// supplies explicit Hash and Equal operations. No object-representation hash
+// is inferred.
+template <typename Key, typename Result,
           typename Hash = typename KeyTraits<Key>::hash_type,
-          typename Equal = typename KeyTraits<Key>::equal_type>
+          typename Equal = DefaultTypedEqualT<Key>>
+  requires TypedKeyOperations<Key, Hash, Equal>
 class CuckooExactBackend {
  public:
   using key_type = Key;

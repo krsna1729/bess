@@ -68,7 +68,7 @@ inline std::string UniqueRteHashName() {
 // (>= 0), which map into an external generation-owned PackedValueStore.
 //
 // Satisfies ScalarExactBackend<RteHashPositionBackend, ConstBytes>,
-// BatchExactBackend<RteHashPositionBackend, ConstBytes>, and
+// BatchExactBackend<RteHashPositionBackend, ConstBytes, int32_t>, and
 // MeasurableBackend<RteHashPositionBackend>.
 //
 // Concurrency: single-writer/control-plane construction; immutable concurrent
@@ -252,7 +252,7 @@ class RteHashPositionBackend {
 // Suitable for scalar results like gate_idx_t, ActionId, or uint32_t.
 //
 // Satisfies ScalarExactBackend<RteHashDataBackend<Result>, ConstBytes>,
-// BatchExactBackend<RteHashDataBackend<Result>, ConstBytes>, and
+// BatchExactBackend<RteHashDataBackend<Result>, ConstBytes, Result>, and
 // MeasurableBackend<RteHashDataBackend<Result>>.
 template <typename Result>
   requires(std::is_trivially_copyable_v<Result> && sizeof(Result) <= sizeof(uintptr_t))

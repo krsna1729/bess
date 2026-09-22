@@ -46,7 +46,8 @@ using bess::classifier::MeasurableBackend;
 using bess::classifier::ScalarExactBackend;
 
 static_assert(ScalarExactBackend<DirectExactBackend<uint8_t, uint32_t>, uint8_t>);
-static_assert(BatchExactBackend<DirectExactBackend<uint8_t, uint32_t>, uint8_t>);
+static_assert(BatchExactBackend<DirectExactBackend<uint8_t, uint32_t>, uint8_t,
+                                uint32_t>);
 static_assert(MeasurableBackend<DirectExactBackend<uint8_t, uint32_t>>);
 
 TEST(DirectExactBackendTest, InsertLookupRemove8Bit) {
