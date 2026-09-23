@@ -74,14 +74,19 @@ namespace {
 
 using bess::classifier::Byte;
 using bess::classifier::ConstBytes;
-using bess::classifier::RankedResult;
 using bess::classifier::RuntimeMaskedBackend;
 using bess::classifier::RuntimeMaskedRule;
 using bess::utils::CuckooMap;
 using bess::utils::HashResult;
 
 using Result = uint32_t;
-using Ranked = RankedResult<Result>;
+
+struct Ranked {
+  int64_t priority;
+  uint64_t ordinal;
+  Result result;
+};
+
 using Masked = RuntimeMaskedBackend<Result>;
 
 constexpr size_t kMaxBatch = 32;

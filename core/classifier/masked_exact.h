@@ -35,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <span>
 #include <utility>
@@ -44,6 +45,7 @@
 #include "classifier/classifier.h"
 #include "classifier/cuckoo_exact.h"
 #include "classifier/runtime_schema.h"
+#include "dataplane/strong_id.h"
 #include "utils/common.h"
 
 namespace bess::classifier {
@@ -63,26 +65,9 @@ struct RuntimeMaskedRule {
   Result result{};
 };
 
-// A rule's rank and its result, as stored in the tuple's exact table.
-//
-// `ordinal` is the rule's index in the generation's rule vector. Equal
-// priorities are resolved by larger ordinal (later rule wins), so the outcome
-// never depends on tuple iteration order. The substrate therefore defines tie
-// behavior even though the current WildcardMatch protobuf leaves it undefined;
-// a module may keep that promise narrower.
-//
-// Deliberately a trivial aggregate with NO default member initializers: the
-// packet path keeps `std::array<RankedResult, kMaxBatch>` scratch, and default
-// member initializers would make that a non-trivial default construction,
-// requiring `Result` to be default-constructible and running one `Result`
-// initialization per scratch slot per lookup. Triviality keeps the scratch
-// free, and the packet path only reads a slot it has already written.
-template <typename Result, typename Priority = int64_t>
-struct RankedResult {
-  Priority priority;
-  uint64_t ordinal;
-  Result result;
-};
+struct MaskedCandidateTag;
+using MaskedCandidateId =
+    dataplane::StrongId<MaskedCandidateTag, uint32_t>;
 
 namespace detail {
 
@@ -144,11 +129,13 @@ inline MaskBatchFn SelectMaskBatch(size_t key_bytes) {
 }  // namespace detail
 
 // Generation-owned masked classifier: one tuple per distinct mask, each tuple
-// owning an exact table keyed by the masked value.
+// owning an exact table keyed by the masked value. Exact tables return a
+// generation-owned candidate ID; packet scratch therefore never contains the
+// user result object or its rank metadata.
 //
 //     RuntimeMaskedBackend<Result>
-//         ├── Tuple(mask A) → RuntimeExactBackend<RankedResult<Result>>
-//         ├── Tuple(mask B) → RuntimeExactBackend<RankedResult<Result>>
+//         ├── Tuple(mask A) → RuntimeExactBackend<MaskedCandidateId>
+//         ├── Tuple(mask B) → RuntimeExactBackend<MaskedCandidateId>
 //         └── ...
 //
 // Lookup is tuple-major, batch-minor: mask the batch once per tuple, exact-look
@@ -163,17 +150,15 @@ inline MaskBatchFn SelectMaskBatch(size_t key_bytes) {
 // backend is immutable, and `lookup_batch()` is safe from concurrent readers.
 template <typename Result, typename Priority = int64_t>
 class RuntimeMaskedBackend {
- public:
-  using ranked_type = RankedResult<Result, Priority>;
+  struct Candidate {
+    Priority priority;
+    uint64_t ordinal;
+    Result result;
+  };
 
-  // The scratch and merge buffers below are `std::array<ranked_type, kMaxBatch>`
-  // held inline, so `Result` must be default-constructible and copy-assignable
-  // and the packet path's stack cost grows with `sizeof(Result)`. Replacing the
-  // inline merge buffer with a generation-owned candidate token is the planned
-  // way to make that independent of `Result`; until then the bound is explicit
-  // rather than implicit.
-  static_assert(std::is_default_constructible_v<ranked_type>);
-  static_assert(std::is_copy_assignable_v<ranked_type>);
+  using candidate_id = MaskedCandidateId;
+
+ public:
 
   static constexpr size_t kMaxBatch = 64;
 
@@ -206,7 +191,7 @@ class RuntimeMaskedBackend {
     // priority class.
     std::map<std::vector<std::byte>, size_t> tuple_of_mask;
     std::vector<std::vector<std::byte>> masks;
-    std::vector<std::vector<std::pair<std::vector<std::byte>, ranked_type>>>
+    std::vector<std::vector<std::pair<std::vector<std::byte>, Candidate>>>
         entries;
 
     for (size_t i = 0; i < rules.size(); i++) {
@@ -236,14 +221,15 @@ class RuntimeMaskedBackend {
       std::vector<std::byte> value(rule.value.begin(), rule.value.end());
       entries[it->second].emplace_back(
           std::move(value),
-          ranked_type{.priority = rule.priority,
-                      .ordinal = static_cast<uint64_t>(i),
-                      .result = rule.result});
+          Candidate{.priority = rule.priority,
+                    .ordinal = static_cast<uint64_t>(i),
+                    .result = rule.result});
     }
 
     RuntimeMaskedBackend backend;
     backend.key_size_ = key_size;
     backend.mask_batch_ = detail::SelectMaskBatch(key_size);
+    backend.candidates_.reserve(rules.size());
     backend.tuples_.reserve(masks.size());
 
     size_t effective_rules = 0;
@@ -257,7 +243,7 @@ class RuntimeMaskedBackend {
                 [](const auto &lhs, const auto &rhs) {
                   return lhs.first < rhs.first;
                 });
-      std::vector<std::pair<std::vector<std::byte>, ranked_type>> deduped;
+      std::vector<std::pair<std::vector<std::byte>, Candidate>> deduped;
       deduped.reserve(group.size());
       for (auto &entry : group) {
         if (!deduped.empty() && deduped.back().first == entry.first) {
@@ -269,16 +255,27 @@ class RuntimeMaskedBackend {
         deduped.push_back(std::move(entry));
       }
 
-      std::vector<RuntimeExactRule<ranked_type>> exact_rules;
+      std::vector<RuntimeExactRule<candidate_id>> exact_rules;
       exact_rules.reserve(deduped.size());
-      for (const auto &entry : deduped) {
-        exact_rules.push_back(RuntimeExactRule<ranked_type>{
+      for (auto &entry : deduped) {
+        if (backend.candidates_.size() >
+            std::numeric_limits<typename candidate_id::rep_type>::max()) {
+          return std::unexpected(ClassifierError{
+              .code = ClassifierErrorCode::kResultOutOfBounds,
+              .message = "masked candidate ID space exhausted",
+          });
+        }
+        const candidate_id id(static_cast<typename candidate_id::rep_type>(
+            backend.candidates_.size()));
+        backend.candidates_.push_back(std::move(entry.second));
+        exact_rules.push_back(RuntimeExactRule<candidate_id>{
             .key = ConstBytes(entry.first.data(), entry.first.size()),
-            .result = entry.second,
+            .result = id,
         });
       }
 
-      auto built = BuildRuntimeCuckooBackend<ranked_type>(key_size, exact_rules);
+      auto built =
+          BuildRuntimeCuckooBackend<candidate_id>(key_size, exact_rules);
       if (!built) {
         return std::unexpected(std::move(built.error()));
       }
@@ -303,19 +300,12 @@ class RuntimeMaskedBackend {
     promise(key_stride <= keys.size() / count);
 
     // Stack bound: kMaxBatch * kMaskedMaxKeyBytes for the masked keys plus two
-    // rank buffers of kMaxBatch entries each. The key half is bounded by the
-    // 64-byte key ceiling; the rank half is 2 * kMaxBatch * sizeof(ranked_type)
-    // and therefore grows with the result type (12 KiB total at the current
-    // gate_idx_t instantiation).
-    //
-    // Deliberately not value-initialized: the masking kernel writes every byte
-    // of the first `count` rows before anything reads them, `candidates[i]` is
-    // only read for a slot whose per-tuple hit bit is set, and `best[i]` only
-    // once `matched` says a previous tuple already wrote it. Zeroing ~7 KiB per
-    // call dominated the useful work at small batches.
+    // fixed-width candidate-ID buffers. The key half is bounded by the
+    // 64-byte key ceiling; the merge half is always 2 * kMaxBatch *
+    // sizeof(candidate_id), independent of `Result`.
     std::array<std::byte, kMaxBatch * detail::kMaskedMaxKeyBytes> scratch;
-    std::array<ranked_type, kMaxBatch> candidates;
-    std::array<ranked_type, kMaxBatch> best;
+    std::array<candidate_id, kMaxBatch> candidates;
+    std::array<candidate_id, kMaxBatch> best;
     const size_t scratch_bytes = count * key_size_;
 
     uint64_t matched = 0;
@@ -324,15 +314,17 @@ class RuntimeMaskedBackend {
                   MutableBytes(scratch).first(scratch_bytes));
       const uint64_t hits = tuple.backend.lookup_batch(
           ConstBytes(scratch).first(scratch_bytes), key_size_,
-          std::span<ranked_type>(candidates).first(count));
+          std::span<candidate_id>(candidates).first(count));
       for (size_t i = 0; i < count; i++) {
         const uint64_t bit = uint64_t{1} << i;
         if ((hits & bit) == 0) {
           continue;
         }
-        if ((matched & bit) == 0 || BetterRank(candidates[i], best[i])) {
+        const Candidate &candidate = candidates_[candidates[i].value()];
+        if ((matched & bit) == 0 ||
+            BetterRank(candidate, candidates_[best[i].value()])) {
           best[i] = candidates[i];
-          results[i] = candidates[i].result;
+          results[i] = candidate.result;
           matched |= bit;
         }
       }
@@ -362,7 +354,7 @@ class RuntimeMaskedBackend {
  private:
   struct Tuple {
     std::vector<std::byte> mask;
-    RuntimeExactBackend<ranked_type> backend;
+    RuntimeExactBackend<candidate_id> backend;
   };
 
   static bool IsCanonical(const RuntimeMaskedRule<Result, Priority> &rule) {
@@ -376,8 +368,8 @@ class RuntimeMaskedBackend {
     return true;
   }
 
-  static bool BetterRank(const ranked_type &candidate,
-                         const ranked_type &incumbent) {
+  static bool BetterRank(const Candidate &candidate,
+                         const Candidate &incumbent) {
     if (candidate.priority != incumbent.priority) {
       return candidate.priority > incumbent.priority;
     }
@@ -387,6 +379,7 @@ class RuntimeMaskedBackend {
   size_t key_size_ = 0;
   size_t rule_count_ = 0;
   detail::MaskBatchFn mask_batch_ = nullptr;
+  std::vector<Candidate> candidates_;
   std::vector<Tuple> tuples_;
 };
 

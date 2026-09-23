@@ -189,9 +189,10 @@ onto it: immutable RCU generations, dense `ExtractPlan` extraction under
 `kCheck`, last-write rule canonicalization, the module's own field/tuple
 ceilings, and all seven documented legacy defects plus the missing
 `MAX_FIELDS` check fixed by the new ownership model. K3.6.1 and K3.7
-attribution now also pin the benchmark source/priority oracle, reject wide
-gates before narrowing, document the masked-backend scratch invariant, and
-separate extraction from backend cost. The active build graph is K4-K8 and G1.
+attribution pin the benchmark source/priority oracle, and K3.7.1 now validates
+wide default gates before narrowing in both migrated modules, removes the
+masked-backend result scratch from the packet stack, and records the candidate
+ID storage contract. The active build graph is K4-K8 and G1; K1-K3 are closed.
 The build graph is Meson/Ninja only. GCC and Clang full Meson compiles succeed
 with pinned DPDK 25.11.3. The registered suite has 73 tests: 53 native C++
 binaries, 17 benchmark smoke tests (including the PMD null/ring smoke), the
@@ -3064,32 +3065,39 @@ rather than one call site).
     - **Two real defects found while doing this**: `detail::MaskBatchVariable`
       was a non-inline function defined in a header, which only linked because a
       single TU had included it — `wildcard_match.cc` made it a multiple
-      definition. And `RuntimeMaskedBackend::lookup_batch` value-initialized its
-      ~7 KiB of stack scratch and rank buffers on every call, which dominated
-      the useful work at small batches; the buffers are now left
-      uninitialized with the write-before-read argument recorded in the code
-      (masking writes every byte of the used rows; `candidates[i]` is read only
-      on a per-tuple hit bit; `best[i]` only once `matched` says a previous
-      tuple wrote it). The K3.5 numbers in entry 68 were taken before that
-      second fix, so the substrate is faster there than those figures show.
-      `RankedResult` is deliberately a trivial aggregate rather than a
-      value-initialized scratch object; the lookup contract writes every
-      candidate and best field before any read, and the static assertions pin
-      that the inline arrays remain default-constructible and copy-assignable.
+      definition. And `RuntimeMaskedBackend::lookup_batch` carried rank and
+      result objects in inline arrays on every call. The cleanup now stores
+      `{ priority, ordinal, result }` once per generation-owned candidate and
+      makes each exact tuple table return a `MaskedCandidateId`. Packet scratch
+      is two fixed-width candidate-ID arrays, so it no longer default-constructs
+      or copies `Result` objects and its size is independent of `sizeof(Result)`.
+      Candidate IDs are checked for `uint32_t` exhaustion at build time.
+    - **K3.7.1 benchmark**: `BM_Masked_Substrate/8/4/16/75/1/32/0` measured
+      402 ns mean / 400 ns median before the candidate-ID cleanup (5
+      repetitions) and 467 ns mean / 467 ns median after it (10 repetitions).
+      The benchmark wrapper reported 493 MHz and low load for the first run but
+      5200 MHz and load 6.77 for the second, so this pair is a recorded smoke
+      comparison, not a performance verdict; the fixed-width scratch contract
+      is the accepted result.
+    - **Wide-gate regressions**: both `WildcardMatch` and `ExactMatch` reject
+      `set_runtime_config` with protobuf gate `65536` before narrowing it to
+      `gate_idx_t`; `WildcardMatch` also retains the direct `add` and
+      `set_default_gate` checks.
     - **Verification**: GCC and Clang full builds with `ninja -j8`; the full
       Meson suite passes 73/73, including the 9-test WildcardMatch integration
       suite and 17 benchmark smoke targets. Direct GCC and Clang checks pass:
-      `classifier_extract_plan_test` (14), `classifier_masked_exact_test` (15),
+      `classifier_extract_plan_test` (14), `classifier_masked_exact_test` (14),
       `classifier_typed_exact_test` (8), `modules_wildcard_match_test` (12),
-      and `modules_exact_match_migration_test` (7). The live `bessctl` run
+      and `modules_exact_match_migration_test` (8). The live `bessctl` run
       passes all 9 packet tests against the GCC daemon; the WildcardMatch
       benchmark lists 245 registrations and exits successfully. ASan+UBSan
-      extract-plan (14), masked-backend (15), and migration (7) binaries pass;
-      the migration binary retains an existing misaligned-store UBSan
-      diagnostic. The ASan module test cannot run: it hits the same
-      `Any::PackFrom` null-descriptor SEGV as the pre-existing `module_test` in
-      this build, so the module's packet path has no sanitizer coverage while
-      the substrate does.
+      extract-plan (14), masked-backend (14), and the seven legacy migration
+      paths pass; the migration path retains an existing misaligned-store UBSan
+      diagnostic. The new ExactMatch gate regression and the WildcardMatch
+      module test cannot run under this ASan build because generated protobuf
+      `CommandResponse`/`Any` handling hits the known null-descriptor SEGV;
+      this leaves the module-facing sanitizer coverage unavailable while the
+      classifier substrate remains covered.
 
 ## Review process established this session
 

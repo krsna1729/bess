@@ -684,6 +684,12 @@ CommandResponse WildcardMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
 // which is what the old in-place version had to warn about.
 CommandResponse WildcardMatch::SetRuntimeConfig(
     const bess::pb::WildcardMatchConfig &arg) {
+  if (!bess::IsValidGateValue(arg.default_gate())) {
+    return CommandFailure(
+        EINVAL, "Invalid default gate: %llu",
+        static_cast<unsigned long long>(arg.default_gate()));
+  }
+  const gate_idx_t default_gate = static_cast<gate_idx_t>(arg.default_gate());
   std::vector<Rule> rules;
   rules.reserve(static_cast<size_t>(arg.rules_size()));
   for (int i = 0; i < arg.rules_size(); i++) {
@@ -699,7 +705,7 @@ CommandResponse WildcardMatch::SetRuntimeConfig(
 
   Error err;
   const bool published = Publish([&](const Generation &) {
-    return Build(rules, arg.default_gate(), &err);
+    return Build(rules, default_gate, &err);
   }, &err);
   if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());

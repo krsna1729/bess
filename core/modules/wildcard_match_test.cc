@@ -398,6 +398,9 @@ TEST_F(WildcardMatchTest, RejectsWideGateBeforeNarrowing) {
   EXPECT_NE(0, Run(m, "set_default_gate", Pack(default_gate))
                    .error()
                    .code());
+  WildcardMatchConfig config;
+  config.set_default_gate(65536);
+  EXPECT_NE(0, Run(m, "set_runtime_config", Pack(config)).error().code());
 }
 
 }  // namespace

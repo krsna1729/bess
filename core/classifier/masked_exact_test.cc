@@ -45,7 +45,6 @@ using bess::classifier::Byte;
 using bess::classifier::ClassifierErrorCode;
 using bess::classifier::ConstBytes;
 using bess::classifier::MaskedBackendInfo;
-using bess::classifier::RankedResult;
 using bess::classifier::RuntimeMaskedBackend;
 using bess::classifier::RuntimeMaskedRule;
 using bess::classifier::WildcardBackendKind;
@@ -338,15 +337,5 @@ TEST(MaskedExactTest, WideKeysUseTheGenericMaskPath) {
   EXPECT_EQ(9u, results[0]);
 }
 
-TEST(MaskedExactTest, RankedResultOrdersByPriorityThenOrdinal) {
-  const RankedResult<uint32_t> a{.priority = 1, .ordinal = 100, .result = 1u};
-  const RankedResult<uint32_t> b{.priority = 2, .ordinal = 0, .result = 2u};
-  const RankedResult<uint32_t> c{.priority = 2, .ordinal = 5, .result = 3u};
-
-  EXPECT_LT(a.priority, b.priority);
-  EXPECT_LT(b.ordinal, c.ordinal);
-  EXPECT_EQ(2u, b.result);
-  EXPECT_EQ(3u, c.result);
-}
 
 }  // namespace
