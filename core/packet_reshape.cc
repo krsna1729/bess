@@ -241,13 +241,16 @@ std::expected<MutableBytes, ReshapeError> EnsureContiguous(
     segment = segment->next;
   }
 
-  const auto writable = EnsureWritable(packet);
-  if (!writable) {
-    return std::unexpected(writable.error());
-  }
-  const auto linear = EnsureLinear(packet);
-  if (!linear) {
-    return std::unexpected(linear.error());
+  if (chain->nb_segs == 1) {
+    const auto writable = EnsureWritable(packet);
+    if (!writable) {
+      return std::unexpected(writable.error());
+    }
+  } else {
+    const auto linear = EnsureLinear(packet);
+    if (!linear) {
+      return std::unexpected(linear.error());
+    }
   }
   return MutableBytes(::bess::PacketRef(packet).head_data<std::byte *>(
                           static_cast<uint16_t>(offset)),

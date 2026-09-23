@@ -759,6 +759,23 @@ bess::PacketHandle BuildFixedReshapeChain(bess::PlainPacketPool &pool,
   return head;
 }
 
+bess::PacketHandle BuildWritableHeadSharedTailReshapePacket(
+    bess::PlainPacketPool &pool, bess::PacketHandle *tail_owner_out) {
+  constexpr size_t kSegmentLength = 64;
+  bess::PacketHandle head = pool.Alloc(kSegmentLength);
+  CHECK(head != nullptr);
+  std::memset(bess::PacketRef(head).head_data(), 0, kSegmentLength);
+  *tail_owner_out = pool.Alloc(kSegmentLength);
+  CHECK(*tail_owner_out != nullptr);
+  std::memset(bess::PacketRef(*tail_owner_out).head_data(), 0, kSegmentLength);
+  bess::PacketHandle shared_tail = bess::PacketClone(*tail_owner_out);
+  CHECK(shared_tail != nullptr);
+  head->next = shared_tail;
+  head->pkt_len = 2 * kSegmentLength;
+  head->nb_segs = 2;
+  return head;
+}
+
 void RunEnsureLinearBenchmark(benchmark::State &state,
                               EnsureLinearBenchmarkPath path) {
   bess::PlainPacketPool &pool = GetPool();
@@ -856,6 +873,7 @@ enum class EnsureContiguousBenchmarkPath : uint8_t {
   kSameSegmentWritable,
   kSameSegmentShared,
   kCrossesTwoSegments,
+  kCrossesTwoSegmentsSharedTail,
   kCrossesFourSegments,
 };
 
@@ -863,12 +881,14 @@ void RunEnsureContiguousBenchmark(benchmark::State &state,
                                   EnsureContiguousBenchmarkPath path) {
   bess::PlainPacketPool &pool = GetPool();
   const bool shared = path == EnsureContiguousBenchmarkPath::kSameSegmentShared;
+  const bool shared_tail =
+      path == EnsureContiguousBenchmarkPath::kCrossesTwoSegmentsSharedTail;
   const bool same_segment =
       path == EnsureContiguousBenchmarkPath::kSameSegmentWritable || shared;
   const size_t segments =
       path == EnsureContiguousBenchmarkPath::kCrossesFourSegments ? 4 : 2;
   const size_t total_bytes = same_segment ? 128 : segments * 64;
-  const size_t offset = same_segment ? 16 : 16;
+  const size_t offset = 16;
   const size_t bytes = same_segment ? 32 : total_bytes - 32;
 
   bess::PacketHandle packet = nullptr;
@@ -879,6 +899,8 @@ void RunEnsureContiguousBenchmark(benchmark::State &state,
     std::memset(bess::PacketRef(sibling).head_data(), 0, total_bytes);
     packet = bess::PacketClone(sibling);
     CHECK(packet != nullptr);
+  } else if (shared_tail) {
+    packet = BuildWritableHeadSharedTailReshapePacket(pool, &sibling);
   } else if (same_segment) {
     packet = pool.Alloc(total_bytes);
     CHECK(packet != nullptr);
@@ -893,11 +915,16 @@ void RunEnsureContiguousBenchmark(benchmark::State &state,
     benchmark::DoNotOptimize(result);
     benchmark::DoNotOptimize(packet);
 
-    if (shared) {
+    if (shared || shared_tail) {
       state.PauseTiming();
       bess::PacketFree(packet);
-      packet = bess::PacketClone(sibling);
-      CHECK(packet != nullptr);
+      if (shared) {
+        packet = bess::PacketClone(sibling);
+        CHECK(packet != nullptr);
+      } else {
+        bess::PacketFree(sibling);
+        packet = BuildWritableHeadSharedTailReshapePacket(pool, &sibling);
+      }
       state.ResumeTiming();
     } else if (!same_segment) {
       state.PauseTiming();
@@ -909,11 +936,12 @@ void RunEnsureContiguousBenchmark(benchmark::State &state,
 
   state.SetItemsProcessed(state.iterations());
   state.counters["allocations"] = shared ? 1 : 0;
-  state.counters["bytes_copied"] = shared ? static_cast<double>(total_bytes)
+  state.counters["bytes_copied"] = shared_tail ? 64
+                                   : shared ? static_cast<double>(total_bytes)
                                    : same_segment
                                        ? 0
                                        : static_cast<double>(total_bytes - 64);
-  state.counters["segments_freed"] = shared ? 1
+  state.counters["segments_freed"] = shared || shared_tail ? 1
                                      : same_segment
                                          ? 0
                                          : static_cast<double>(segments - 1);
@@ -945,10 +973,16 @@ void BM_EnsureContiguousCrossesFourSegments(benchmark::State &state) {
       state, EnsureContiguousBenchmarkPath::kCrossesFourSegments);
 }
 
+void BM_EnsureContiguousCrossesTwoSegmentsSharedTail(benchmark::State &state) {
+  RunEnsureContiguousBenchmark(
+      state, EnsureContiguousBenchmarkPath::kCrossesTwoSegmentsSharedTail);
+}
+
 BENCHMARK(BM_EnsureContiguousSameSegmentWritable);
 BENCHMARK(BM_EnsureContiguousSameSegmentShared);
 BENCHMARK(BM_EnsureContiguousCrossesTwoSegments);
 BENCHMARK(BM_EnsureContiguousCrossesFourSegments);
+BENCHMARK(BM_EnsureContiguousCrossesTwoSegmentsSharedTail);
 
 void BM_PacketCursorChainRead(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();

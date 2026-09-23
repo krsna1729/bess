@@ -620,7 +620,7 @@ TEST(PacketReshapeTest, EnsureLinearUsesNativePathForWritableHead) {
   PacketFree(packet);
 }
 
-TEST(PacketReshapeTest, EnsureLinearNativePathReadsSharedTailWithoutCOW) {
+TEST(PacketReshapeTest, EnsureContiguousLinearizesWritableHeadWithSharedTail) {
   PlainPacketPool pool(8, -1, 256);
   const std::vector<std::byte> head_bytes = Pattern(64);
   const std::vector<std::byte> tail_bytes = Pattern(64);
@@ -629,24 +629,144 @@ TEST(PacketReshapeTest, EnsureLinearNativePathReadsSharedTailWithoutCOW) {
       BuildWritableHeadSharedTail(pool, head_bytes, tail_bytes, &tail_owner);
   ASSERT_NE(packet, nullptr);
   ASSERT_NE(tail_owner, nullptr);
-  ASSERT_EQ(rte_mbuf_refcnt_read(tail_owner), 2);
+  SeedHeadMetadata(packet);
+  SetPrivate(packet, static_cast<std::byte>(0x63));
+  const HeadState before = TakeHeadState(packet);
   const PacketHandle original = packet;
+  const PacketHandle shared_tail = packet->next;
+  const size_t available_before = pool.Size();
+  ASSERT_EQ(rte_mbuf_refcnt_read(tail_owner), 2);
 
-  auto result = EnsureLinear(packet);
+  auto result = EnsureContiguous(packet, 32, 64);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(packet, original);
   EXPECT_EQ(packet->nb_segs, 1);
   EXPECT_EQ(packet->next, nullptr);
-  EXPECT_EQ(PacketBytes(packet), [&] {
-    std::vector<std::byte> expected = head_bytes;
-    expected.insert(expected.end(), tail_bytes.begin(), tail_bytes.end());
-    return expected;
-  }());
+  EXPECT_EQ(pool.Size(), available_before + 1);
   EXPECT_EQ(rte_mbuf_refcnt_read(tail_owner), 1);
   EXPECT_EQ(PacketBytes(tail_owner), tail_bytes);
+  EXPECT_EQ(packet->port, before.port);
+  EXPECT_EQ(packet->packet_type, before.packet_type);
+  EXPECT_EQ(packet->tx_offload, before.tx_offload);
+  EXPECT_EQ(packet->hash.rss, before.hash_rss);
+  EXPECT_EQ(packet->timesync, before.timesync);
+  EXPECT_EQ(PrivateBytes(packet), before.private_bytes);
+
+  std::vector<std::byte> expected = head_bytes;
+  expected.insert(expected.end(), tail_bytes.begin(), tail_bytes.end());
+  std::fill(expected.begin() + 32, expected.begin() + 96,
+            static_cast<std::byte>(0xd3));
+  EXPECT_EQ(result->data(), PacketRef(packet).head_data<std::byte *>(32));
+  std::fill(result->begin(), result->end(), static_cast<std::byte>(0xd3));
+  EXPECT_EQ(PacketBytes(packet), expected);
+  EXPECT_NE(shared_tail, packet->next);
 
   PacketFree(packet);
   PacketFree(tail_owner);
+}
+
+TEST(PacketReshapeTest,
+     EnsureContiguousCapacityFailurePreservesSharedChainAtomically) {
+  PlainPacketPool pool(16, -1, 128);
+  const std::vector<std::byte> bytes = Pattern(300);
+  const std::array<size_t, 3> lengths = {128, 128, 44};
+  PacketHandle source = BuildChain(pool, lengths, bytes);
+  ASSERT_NE(source, nullptr);
+  SeedHeadMetadata(source);
+  SetPrivate(source, static_cast<std::byte>(0x1c));
+  PacketHandle packet = bess::PacketClone(source);
+  ASSERT_NE(packet, nullptr);
+  SetPrivate(packet, static_cast<std::byte>(0x8e));
+
+  const HeadState source_before = TakeHeadState(source);
+  const HeadState packet_before = TakeHeadState(packet);
+  const PacketHandle original = packet;
+  std::array<PacketHandle, 3> source_segments{};
+  std::array<PacketHandle, 3> packet_segments{};
+  std::array<uint16_t, 3> source_refcounts{};
+  std::array<uint16_t, 3> packet_refcounts{};
+  PacketHandle source_segment = source;
+  PacketHandle packet_segment = packet;
+  for (size_t i = 0; i < source_segments.size(); i++) {
+    ASSERT_NE(source_segment, nullptr);
+    ASSERT_NE(packet_segment, nullptr);
+    source_segments[i] = source_segment;
+    packet_segments[i] = packet_segment;
+    source_refcounts[i] = rte_mbuf_refcnt_read(source_segment);
+    packet_refcounts[i] = rte_mbuf_refcnt_read(packet_segment);
+    source_segment = source_segment->next;
+    packet_segment = packet_segment->next;
+  }
+  ASSERT_EQ(source_segment, nullptr);
+  ASSERT_EQ(packet_segment, nullptr);
+  const size_t available_before = pool.Size();
+
+  auto result = EnsureContiguous(packet, 120, 20);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), ReshapeError::kInsufficientContiguousCapacity);
+  EXPECT_EQ(packet, original);
+  EXPECT_EQ(pool.Size(), available_before);
+  ExpectHeadStateUnchanged(packet, packet_before);
+  ExpectHeadStateUnchanged(source, source_before);
+  for (size_t i = 0; i < source_segments.size(); i++) {
+    EXPECT_EQ(source_segments[i]->next, i + 1 == source_segments.size()
+                                            ? nullptr
+                                            : source_segments[i + 1]);
+    EXPECT_EQ(packet_segments[i]->next, i + 1 == packet_segments.size()
+                                            ? nullptr
+                                            : packet_segments[i + 1]);
+    EXPECT_EQ(rte_mbuf_refcnt_read(source_segments[i]), source_refcounts[i]);
+    EXPECT_EQ(rte_mbuf_refcnt_read(packet_segments[i]), packet_refcounts[i]);
+  }
+
+  PacketFree(packet);
+  PacketFree(source);
+}
+
+TEST(PacketReshapeTest,
+     EnsureContiguousAllocationFailurePreservesSharedChainAtomically) {
+  PlainPacketPool pool(6, -1, 256);
+  const std::vector<std::byte> bytes = Pattern(128);
+  const std::array<size_t, 2> lengths = {64, 64};
+  PacketHandle source = BuildChain(pool, lengths, bytes);
+  ASSERT_NE(source, nullptr);
+  SeedHeadMetadata(source);
+  PacketHandle packet = bess::PacketClone(source);
+  ASSERT_NE(packet, nullptr);
+  SetPrivate(packet, static_cast<std::byte>(0x57));
+  std::array<PacketHandle, 2> fillers{};
+  ASSERT_TRUE(pool.AllocBulk(fillers.data(), fillers.size(), 16));
+  ASSERT_EQ(pool.Size(), 0);
+
+  const HeadState source_before = TakeHeadState(source);
+  const HeadState packet_before = TakeHeadState(packet);
+  const PacketHandle original = packet;
+  const PacketHandle source_tail = source->next;
+  const PacketHandle packet_tail = packet->next;
+  const uint16_t source_head_refcount = rte_mbuf_refcnt_read(source);
+  const uint16_t source_tail_refcount = rte_mbuf_refcnt_read(source_tail);
+  const uint16_t packet_head_refcount = rte_mbuf_refcnt_read(packet);
+  const uint16_t packet_tail_refcount = rte_mbuf_refcnt_read(packet_tail);
+
+  auto result = EnsureContiguous(packet, 48, 32);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), ReshapeError::kAllocationFailed);
+  EXPECT_EQ(packet, original);
+  EXPECT_EQ(pool.Size(), 0);
+  ExpectHeadStateUnchanged(packet, packet_before);
+  ExpectHeadStateUnchanged(source, source_before);
+  EXPECT_EQ(packet->next, packet_tail);
+  EXPECT_EQ(packet_tail->next, nullptr);
+  EXPECT_EQ(source->next, source_tail);
+  EXPECT_EQ(source_tail->next, nullptr);
+  EXPECT_EQ(rte_mbuf_refcnt_read(source), source_head_refcount);
+  EXPECT_EQ(rte_mbuf_refcnt_read(source_tail), source_tail_refcount);
+  EXPECT_EQ(rte_mbuf_refcnt_read(packet), packet_head_refcount);
+  EXPECT_EQ(rte_mbuf_refcnt_read(packet_tail), packet_tail_refcount);
+
+  bess::PacketFreeBulk(fillers.data(), fillers.size());
+  PacketFree(packet);
+  PacketFree(source);
 }
 
 TEST(PacketReshapeTest, EnsureLinearDoesNotWriteSharedZeroLengthHead) {
@@ -806,7 +926,7 @@ TEST(PacketReshapeTest, EnsureContiguousUsesWritableSameSegmentFastPath) {
 }
 
 TEST(PacketReshapeTest,
-     EnsureContiguousCOWsSharedSameSegmentAndPreservesMetadata) {
+     EnsureContiguousSharedLinearPacketUsesCOWWithoutChangingTopology) {
   PlainPacketPool pool(16, -1, 256);
   const std::vector<std::byte> bytes = Pattern(128);
   PacketHandle source = pool.AllocCopy(bytes.data(), bytes.size());
@@ -818,12 +938,18 @@ TEST(PacketReshapeTest,
   const HeadState before = TakeHeadState(packet);
   const PacketHandle original = packet;
   const std::vector<std::byte> source_before = PacketBytes(source);
+  const size_t available_before = pool.Size();
+  ASSERT_EQ(packet->nb_segs, 1);
+  ASSERT_EQ(packet->next, nullptr);
 
   auto result = EnsureContiguous(packet, 12, 24);
   ASSERT_TRUE(result.has_value());
   EXPECT_NE(packet, original);
   EXPECT_TRUE(RTE_MBUF_DIRECT(packet));
   EXPECT_EQ(packet->nb_segs, 1);
+  EXPECT_EQ(packet->next, nullptr);
+  EXPECT_EQ(pool.Size(), available_before);
+  EXPECT_EQ(rte_mbuf_refcnt_read(source), 1);
   ExpectCopiedHeadState(packet, before);
   std::fill(result->begin(), result->end(), static_cast<std::byte>(0x92));
   EXPECT_EQ(PacketBytes(source), source_before);
