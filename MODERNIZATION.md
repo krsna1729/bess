@@ -195,21 +195,25 @@ masked-backend result scratch from the packet stack, and records the candidate
 ID storage contract. K4.1 now adds the read-only packet-chain cursor described
 below; K4.1.1 hardened its 32-bit length boundary, typed-read fast path, and
 benchmark attribution; K4.2/K4.2.1 now add checked in-place mutation,
-payload-ownership, and descriptor-ownership primitives. K4.3a adds
-transactional packet writability and full-packet COW; K4.3b adds topology
-reshape/linearization, with K4.3b.1 preserving transactionality across
-`EnsureContiguous`. Next: cross-segment prefix/suffix removal, then K4.4
-checksums/TX offloads and the K4.5 batch-execution experiment.
+payload-ownership, and descriptor-ownership primitives. K4.3a, K4.3a.1,
+K4.3b, and K4.3b.1 are CLOSED; K4.3c adds allocation-free cross-segment
+prefix/suffix removal and completes K4 packet topology/ownership mechanics.
+Next: K4.4 checksum/TX-offload primitives, then the performance-gated K4.5
+batch-execution experiment.
 The active build K1-K3 are closed. The build graph is Meson/Ninja only. GCC and
 Clang full Meson compiles succeed with pinned DPDK 25.11.3. The registered
 suite has 75 tests: 55 native C++ binaries, benchmark smoke tests (including
 the PMD null/ring smoke), the sample-plugin registry load, the Python target,
 and the module integration run.
-Full GCC and Clang Meson test runs pass all 75 targets. K3.4-K3.7's own
-targets (the typed-, masked-backend, extract-plan, and migration unit binaries,
-the WildcardMatch module test, `classifier_typed_bench`,
-`classifier_masked_bench`, and `modules_wildcard_match_bench`) pass under GCC
-and Clang, with the sanitizer coverage noted below.
+Previous full GCC and Clang Meson runs passed all 75 targets. The K4.3c
+75-target runs passed 73/75 under both compilers: `python_unittest_discover`
+and `module_integration` require root to start the BESS daemon, unavailable in
+this unprivileged session. The other 73 targets, including `packet_reshape_test`
+and benchmark smoke tests, passed under both compilers. K3.4-K3.7's own targets
+(the typed-, masked-backend, extract-plan, and migration unit binaries, the
+WildcardMatch module test, `classifier_typed_bench`, `classifier_masked_bench`,
+and `modules_wildcard_match_bench`) pass under GCC and Clang, with the sanitizer
+coverage noted below.
 The classifier extract-plan and masked-backend tests pass under ASan+UBSan.
 The new `packet_cursor_test` is sanitizer-compiled but cannot execute here:
 DPDK EAL fails its VA/legacy-memory initialization under ASan with an IOVA
@@ -3215,6 +3219,18 @@ rather than one call site).
     `head_replacements=0`. CPU2 diagnostics observed 126 `iwlwifi:queue_2`
     IRQs and 126 `NET_RX` softirqs, plus timer/scheduler/RCU activity; this is
     smoke data only, not a performance result.
+77. **`e9fb5ab3`** — **K4.3c allocation-free topology-changing edge removal.**
+    Added validated `RemovePrefix` and `TrimSuffix` with preflighted errors,
+    exact zero-byte no-op semantics, no payload allocation/copy, logical-head
+    metadata promotion, preserved survivor storage/representation, and
+    zero-length original-head retention on full removal. GCC and Clang focused
+    reshape targets pass. Each full 75-target run passed 73/75; the two
+    daemon-dependent Python and module integration targets require root,
+    unavailable in this session. Six benchmark paths reported operation
+    attribution counters; CPU2 diagnostics observed IRQ/softirq traffic, so no
+    timing result is treated as a performance verdict. GCC and Clang builds
+    used `-j4`, respecting the existing hard cap.
+    Fresh independent review of `e9fb5ab3` found no actionable findings.
 
 ## Review process established this session
 
@@ -5630,13 +5646,50 @@ segment-local COW even when the complete packet cannot fit in one mbuf.
 and returns `kInsufficientContiguousCapacity`. Add partial COW only if
 benchmarks justify the added topology machinery.
 
-The next packet milestones are ordered: cross-segment prefix/suffix removal,
-then K4.4 checksum and TX-offload primitives, then K4.5 batch-execution
-experiments against handwritten loops. K4.5 remains performance-gated; no
-automatic loop migration or prefetch policy is adopted without measured
-benefit.
+#### K4.3c — allocation-free cross-segment prefix/suffix removal
 
-K4.4 remains the future checksum and TX-offload semantic layer.
+K4.3c is CLOSED. `RemovePrefix(PacketHandle&, size_t) noexcept` and
+`TrimSuffix(PacketHandle&, size_t) noexcept` return
+`std::expected<void, ReshapeError>`. Both preflight the complete chain before
+mutation. Null packets return `kNullPacket`, malformed chains return
+`kMalformedChain`, and lengths above `pkt_len` return `kLengthOutOfRange`;
+these errors leave the packet unchanged. A zero-byte request is an exact
+no-op. The caller must exclusively own the descriptor chain, but payload
+backing may remain shared. Successful paths adjust descriptor topology/lengths
+and, for promotion, copy logical head metadata; they allocate no descriptors
+and copy no payload bytes.
+
+Prefix removal promotes the first surviving descriptor when the old head is
+removed. Promotion copies logical DPDK head metadata and `BessPacketPrivate`
+while preserving the survivor's buffer address/IOVA, pool, reference count,
+external shared-info, and `INDIRECT`/`EXTERNAL` representation. Suffix trim
+shortens the last kept segment and detaches the discarded suffix before
+freeing it. For full removal, both APIs retain the original head as a valid
+zero-length single-segment packet.
+
+The reshape tests cover null and invalid inputs, exact zero-byte no-ops,
+one-byte and within-segment edits, segment boundaries, two- and four-segment
+cuts, full removal, metadata and direct/indirect/external representation,
+external callback lifetime, shared-backing sibling isolation/refcounts, and
+successful operation with no pool entries available.
+
+The six attribution benchmarks were run through `omarchy-benchmark` with
+diagnostics. All paths reported zero allocations and zero copied bytes:
+
+| Path | Allocations | Bytes copied | Segments freed | Head replacements | Bytes removed |
+|------|-------------|--------------|----------------|-------------------|---------------|
+| Prefix within head | 0 | 0 | 0 | 0 | 16 |
+| Prefix across two segments | 0 | 0 | 1 | 1 | 80 |
+| Prefix across four segments | 0 | 0 | 3 | 1 | 200 |
+| Suffix within tail | 0 | 0 | 0 | 0 | 16 |
+| Suffix across two segments | 0 | 0 | 1 | 0 | 80 |
+| Suffix across four segments | 0 | 0 | 3 | 0 | 200 |
+
+CPU2 diagnostics observed IRQ and softirq activity, so timing is smoke data
+only and not a performance verdict. K4 topology/ownership mechanics are
+complete. Next: K4.4 checksum and TX-offload primitives, then performance-gated
+K4.5 batch/ILP experiments; no loop migration or prefetch policy without
+measured benefit.
 
 ---
 
