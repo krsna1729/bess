@@ -203,6 +203,11 @@ ClassifierResult<ExtractPlan> ExtractPlan::Compile(
       kernel = &ExtractPlan::ExecuteSingleMetadata;
       kernel_kind = ExtractKernel::kSingleMetadata;
     }
+  } else if (coalesced.size() == 2) {
+    // The measured two-field module case has no coalescing opportunity. Keep
+    // its two exact-width copies but remove the per-row op-range loop.
+    kernel = &ExtractPlan::ExecuteTwoOps;
+    kernel_kind = ExtractKernel::kTwoOp;
   }
 
   // One required-bytes check per source per packet is equivalent to checking
@@ -295,6 +300,30 @@ uint64_t ExtractPlan::ExecuteGeneric(const ExtractPlan &plan,
     for (const ExtractOp &op : plan.ops_) {
       CopyOpUnchecked(op, Source(source, op.source), dst);
     }
+    valid |= (uint64_t{1} << i);
+  }
+  return valid;
+}
+
+uint64_t ExtractPlan::ExecuteTwoOps(const ExtractPlan &plan,
+                                    std::span<const SourceView> sources,
+                                    MutableBytes output,
+                                    size_t key_stride) noexcept {
+  uint64_t valid = 0;
+  const ExtractOp &first = plan.ops_[0];
+  const ExtractOp &second = plan.ops_[1];
+  const bool check = plan.bounds_ == BoundsPolicy::kCheck;
+  const size_t need_packet = plan.required_packet_bytes_;
+  const size_t need_metadata = plan.required_metadata_bytes_;
+  for (size_t i = 0; i < sources.size(); i++) {
+    const SourceView &source = sources[i];
+    if (check && (source.packet.size() < need_packet ||
+                  source.metadata.size() < need_metadata)) {
+      continue;
+    }
+    std::byte *dst = output.data() + i * key_stride;
+    CopyOpUnchecked(first, Source(source, first.source), dst);
+    CopyOpUnchecked(second, Source(source, second.source), dst);
     valid |= (uint64_t{1} << i);
   }
   return valid;

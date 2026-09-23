@@ -44,10 +44,6 @@ using bess::metadata::Attribute;
 
 namespace {
 
-bool IsValidGate(gate_idx_t gate) {
-  return gate < MAX_GATES || gate == DROP_GATE;
-}
-
 // Decodes one protobuf field value into `out`, sized to `field_size`.
 //
 // Binary input shorter than the field is zero-padded, which is what the legacy
@@ -471,12 +467,14 @@ Error WildcardMatch::RuleFieldsFromPb(
 
 Error WildcardMatch::RuleFromPb(
     const bess::pb::WildcardMatchCommandAddArg &arg, Rule *rule) {
-  gate_idx_t gate = arg.gate();
-
-  if (!IsValidGate(gate)) {
-    return std::make_pair(EINVAL,
-                          bess::utils::Format("Invalid gate: %hu", gate));
+  // Validate the 64-bit wire value before narrowing: gate_idx_t is 16-bit, so
+  // a post-cast check would accept e.g. 65536 as gate 0.
+  if (!bess::IsValidGateValue(arg.gate())) {
+    return std::make_pair(
+        EINVAL, bess::utils::Format("Invalid gate: %llu",
+                                    static_cast<unsigned long long>(arg.gate())));
   }
+  const gate_idx_t gate = static_cast<gate_idx_t>(arg.gate());
   if (static_cast<size_t>(arg.values_size()) != field_specs_.size()) {
     return std::make_pair(
         EINVAL, bess::utils::Format("must specify %zu values",
@@ -601,9 +599,14 @@ CommandResponse WildcardMatch::CommandClear(const bess::pb::EmptyArg &) {
 
 CommandResponse WildcardMatch::CommandSetDefaultGate(
     const bess::pb::WildcardMatchCommandSetDefaultGateArg &arg) {
+  if (!bess::IsValidGateValue(arg.gate())) {
+    return CommandFailure(EINVAL, "Invalid gate: %llu",
+                          static_cast<unsigned long long>(arg.gate()));
+  }
+  const gate_idx_t gate = static_cast<gate_idx_t>(arg.gate());
   Error err;
   const bool published = Publish([&](const Generation &current) {
-    return Build(current.rules, arg.gate(), &err);
+    return Build(current.rules, gate, &err);
   }, &err);
   if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());

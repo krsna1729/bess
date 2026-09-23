@@ -182,30 +182,33 @@ typed backends accept an author's own `Key`/`Hash`/`Equal` without a
 `KeyTraits` registration or `ByteKey`, `ExactTable` is decoupled from the key
 concept, `BatchExactBackend` names the result type explicitly, and a
 three-rung benchmark (author loop / `ExactTable` / runtime-generic) records the
-comparison without declaring a winner. K3.5 adds the generic masked/tuple-space
-substrate (`classifier/masked_exact.h`) as a library. K3.6 migrates
-`WildcardMatch` onto it: immutable RCU generations, dense `ExtractPlan`
-extraction under `kCheck`, last-write rule canonicalization, the module's own
-field/tuple ceilings, and all seven documented legacy defects plus the missing
-`MAX_FIELDS` check fixed by the new ownership model. The next milestone is
-K3.7, K4-K8, and G1. The active build graph is
-Meson/Ninja only. GCC and Clang full Meson compiles succeed with pinned DPDK
-25.11.3. The registered suite is now 73 tests: 53 native C++ binaries, 17
-benchmark smoke tests (including the PMD null/ring smoke), the sample-plugin
-registry load, the Python target, and the module integration run. All 56
-non-benchmark targets pass in one full run; K3.4-K3.6's own targets (the typed-
-and masked-backend unit binaries, the WildcardMatch module test, and
-`classifier_typed_bench`, `classifier_masked_bench`, and
-`modules_wildcard_match_bench`) pass under GCC and Clang, with the sanitizer
-coverage noted below.
+comparison without declaring a winner.
+K3.5 adds the generic masked/tuple-space substrate
+(`classifier/masked_exact.h`) as a library. K3.6 migrates `WildcardMatch`
+onto it: immutable RCU generations, dense `ExtractPlan` extraction under
+`kCheck`, last-write rule canonicalization, the module's own field/tuple
+ceilings, and all seven documented legacy defects plus the missing
+`MAX_FIELDS` check fixed by the new ownership model. K3.6.1 and K3.7
+attribution now also pin the benchmark source/priority oracle, reject wide
+gates before narrowing, document the masked-backend scratch invariant, and
+separate extraction from backend cost. The active build graph is K4-K8 and G1.
+The build graph is Meson/Ninja only. GCC and Clang full Meson compiles succeed
+with pinned DPDK 25.11.3. The registered suite has 73 tests: 53 native C++
+binaries, 17 benchmark smoke tests (including the PMD null/ring smoke), the
+sample-plugin registry load, the Python target, and the module integration run.
+A full Meson test run passes all 73 targets. K3.4-K3.7's own targets (the
+typed-, masked-backend, extract-plan, and migration unit binaries, the
+WildcardMatch module test, `classifier_typed_bench`, `classifier_masked_bench`,
+and `modules_wildcard_match_bench`) pass under GCC and Clang, with the
+sanitizer coverage noted below.
 The classifier extract-plan, Cuckoo, masked, and migration tests pass under
 ASan+UBSan. Two targets remain environment-incompatible under sanitizer for
-pre-existing reasons unrelated to this work: the Rte hash classifier test (DPDK
-EAL cannot allocate its required memory) and `modules_wildcard_match_test`,
+pre-existing reasons unrelated to this work: the Rte hash classifier test
+(DPDK EAL cannot allocate its required memory) and `modules_wildcard_match_test`,
 which hits the same `Any::PackFrom` null-descriptor SEGV as the pre-existing
-`module_test` under this ASan build. `-Daf_xdp=required`
-configuration, install staging, generated build-tree protobuf imports, and
-source-tree hygiene checks also pass.
+`module_test` under this ASan build. `-Daf_xdp=required` configuration, install
+staging, generated build-tree protobuf imports, and source-tree hygiene checks
+also pass.
 
 ## Completed work (chronological, with commit hashes on `develop`)
 
@@ -2960,12 +2963,12 @@ rather than one call site).
       partially-applied `SetRuntimeConfig()`, `int64` priority narrowed to
       `int`, and unvalidated value/mask lengths) are K3.6 work with regression
       tests written first; none of them is encoded in the substrate.
-    - **Verification**: `classifier_masked_exact_test` (14 tests) passes under
+    - **Verification**: `classifier_masked_exact_test` (15 tests) passes under
       GCC, Clang, and ASan+UBSan. ASan caught a real defect while writing it —
       rule spans pointing into temporary byte vectors — which is why the tests
       now build rules through an owning `RuleSet` instead of a helper that
-      accepts temporaries. GCC and Clang full builds pass; the 55
-      non-benchmark targets pass in one full run.
+      accepts temporaries. GCC and Clang full builds pass; the full 73-target
+      Meson suite passes in one run.
 
 69. **K3.6 `WildcardMatch` cutover to the masked substrate** — the module no
     longer owns `wm_hkey_t`, `wm_hash`, `wm_eq`, per-tuple `CuckooMap`s, or a
@@ -3019,33 +3022,42 @@ rather than one call site).
       field are accepted and zero-padded (the legacy stack-local decode started
       zeroed); longer input is rejected instead of copied past the field word.
       `value_int` keeps its legacy big-endian field encoding.
-    - **Proof**: `modules_wildcard_match_test` (11 tests) covers the module
+    - **Proof**: `modules_wildcard_match_test` (12 tests) covers the module
       limits, duplicate overwrite, the tuple ceiling and clear-restores-capacity,
-      delete existing/missing, binary length rules, non-canonical rejection, full
-      `int64` priority round trip, atomic failed `set_runtime_config`,
-      `get_runtime_config` byte-identical round trip, `get_initial_arg`, and
-      integer-encoded rules. `bessctl/module_tests/wildcard_match.py` grew from
-      4 to 9 packet-level tests: non-prefix masks, mixed 1/3/7-byte fields,
-      multi-mask priority plus equal-priority tie order (asserted both ways),
-      delete/clear with capacity reuse, and a short packet taking the default
-      gate. The pre-existing tests (priority override, metadata matching,
-      `get_initial_arg`/`set_runtime_config` parity) still pass unchanged.
+      wide-gate rejection before narrowing, delete existing/missing, binary
+      length rules, non-canonical rejection, full `int64` priority round trip,
+      atomic failed `set_runtime_config`, `get_runtime_config` byte-identical
+      round trip, `get_initial_arg`, and integer-encoded rules.
+      `bessctl/module_tests/wildcard_match.py` has 9 packet-level tests:
+      non-prefix masks, mixed 1/3/7-byte fields, multi-mask priority plus
+      equal-priority tie order (asserted both ways), delete/clear with capacity
+      reuse, and a short packet taking the default gate. The pre-existing tests
+      (priority override, metadata matching, `get_initial_arg`/`set_runtime_config`
+      parity) still pass unchanged.
     - **Integration tax** (`modules_wildcard_match_bench.cc`, 5 repetitions,
-      mean ns/batch, packet-only, single-hit traffic): the migrated path is
-      slower at one field/small batch — 55.6 vs 48.6 at 1 tuple/batch 8, 174 vs
-      199 at 1 tuple/batch 32 — and faster from two tuples upward: 4 tuples/batch
-      32 539 vs 655, 8 tuples/batch 32 986 vs 1480. The one-tuple deficit is the
-      price of `kCheck` extraction and the merge; the ≥2-tuple win is the
-      substrate's masking/merge against per-tuple `CuckooMap` lookups.
-    - **Measured finding, not fixed here**: the integration cost is dominated by
-      **field count, not by metadata**. At 4 tuples/batch 32 the migrated path
-      costs 492 ns for one 4-byte packet field and 1235 ns for two fields, and
-      the two-field case is 1238 ns with the second field read from metadata
-      versus 1235 ns from the packet — identical. `ExtractPlan` has
-      single-source fast kernels (`kSinglePacket`/`kSingleMetadata`) and a
-      generic per-op kernel, so a second field leaves the fast path. That is
-      K3.7 material (a multi-field extraction kernel), recorded here rather than
-      papered over.
+      mean ns/batch, packet-only, single-hit traffic): after the scratch-buffer
+      fix the migrated path is slower at one field/small batch — 55.6 vs 48.6
+      at 1 tuple/batch 8, 174 vs 199 at 1 tuple/batch 32 — and faster from two
+      tuples upward: 4 tuples/batch 32 539 vs 655, 8 tuples/batch 32 986 vs
+      1480. The one-tuple deficit is the price of `kCheck` extraction and the
+      merge; the >=2-tuple win is the substrate's masking/merge against
+      per-tuple `CuckooMap` lookups.
+    - **K3.7 attribution**: the benchmark's existing `metadata` selector now
+      controls four explicit layouts: `0` is one 4-byte packet field, `1` is
+      packet 4 + metadata 2, `2` is packet 4 + packet 2 (same six-byte width,
+      source control), and `3` is one six-byte packet field (width control).
+      The old priority oracle and the layout-2 source bug are fixed. Dedicated
+      `BM_Wm_Extract` and `BM_Wm_Backend` rungs isolate extraction and masked
+      lookup; the complete binary lists 245 registrations.
+    - **Measured decision**: same-width packet+metadata and packet+packet
+      extraction/backend stages remain within run noise; the one six-byte
+      control prevents attributing a width effect to metadata. No
+      metadata-specific backend branch was justified. The only accepted
+      extraction specialization is `ExtractPlan::kTwoOp` for exactly two
+      coalesced operations, with the generic checked semantics retained for
+      bounds failure. `ExtractPlanTest.TwoOpKernelCopiesMixedFields` pins the
+      selection and copied bytes; the stage matrix and end-to-end module rung
+      both exit successfully under the performance-governor benchmark wrapper.
     - **Rebuild cost**: plan compile + masked-backend build is 0.7 us (1 tuple,
       8 rules), 3.05 us (4 tuples, 8 rules), 6.8 us (8 tuples, 8 rules), 112 us
       (8 tuples, 64 rules), and 500 us (8 tuples, 256 rules).
@@ -3060,14 +3072,24 @@ rather than one call site).
       on a per-tuple hit bit; `best[i]` only once `matched` says a previous
       tuple wrote it). The K3.5 numbers in entry 68 were taken before that
       second fix, so the substrate is faster there than those figures show.
-    - **Verification**: GCC and Clang full builds; the 56 non-benchmark targets
-      pass in one full run, including the 9-test WildcardMatch integration
-      suite; `classifier_masked_exact_test` and the module test pass under
-      Clang; the 162-registration WildcardMatch benchmark matrix exits 0. Under
-      ASan+UBSan the module test cannot run: it hits the same `Any::PackFrom`
-      null-descriptor SEGV that the pre-existing `module_test` hits in this ASan
-      build (verified by running both), so the module's packet path has no
-      sanitizer coverage and the substrate's does.
+      `RankedResult` is deliberately a trivial aggregate rather than a
+      value-initialized scratch object; the lookup contract writes every
+      candidate and best field before any read, and the static assertions pin
+      that the inline arrays remain default-constructible and copy-assignable.
+    - **Verification**: GCC and Clang full builds with `ninja -j8`; the full
+      Meson suite passes 73/73, including the 9-test WildcardMatch integration
+      suite and 17 benchmark smoke targets. Direct GCC and Clang checks pass:
+      `classifier_extract_plan_test` (14), `classifier_masked_exact_test` (15),
+      `classifier_typed_exact_test` (8), `modules_wildcard_match_test` (12),
+      and `modules_exact_match_migration_test` (7). The live `bessctl` run
+      passes all 9 packet tests against the GCC daemon; the WildcardMatch
+      benchmark lists 245 registrations and exits successfully. ASan+UBSan
+      extract-plan (14), masked-backend (15), and migration (7) binaries pass;
+      the migration binary retains an existing misaligned-store UBSan
+      diagnostic. The ASan module test cannot run: it hits the same
+      `Any::PackFrom` null-descriptor SEGV as the pre-existing `module_test` in
+      this build, so the module's packet path has no sanitizer coverage while
+      the substrate does.
 
 ## Review process established this session
 

@@ -70,11 +70,18 @@ struct RuntimeMaskedRule {
 // never depends on tuple iteration order. The substrate therefore defines tie
 // behavior even though the current WildcardMatch protobuf leaves it undefined;
 // a module may keep that promise narrower.
+//
+// Deliberately a trivial aggregate with NO default member initializers: the
+// packet path keeps `std::array<RankedResult, kMaxBatch>` scratch, and default
+// member initializers would make that a non-trivial default construction,
+// requiring `Result` to be default-constructible and running one `Result`
+// initialization per scratch slot per lookup. Triviality keeps the scratch
+// free, and the packet path only reads a slot it has already written.
 template <typename Result, typename Priority = int64_t>
 struct RankedResult {
-  Priority priority{};
-  uint64_t ordinal = 0;
-  Result result{};
+  Priority priority;
+  uint64_t ordinal;
+  Result result;
 };
 
 namespace detail {
@@ -158,6 +165,15 @@ template <typename Result, typename Priority = int64_t>
 class RuntimeMaskedBackend {
  public:
   using ranked_type = RankedResult<Result, Priority>;
+
+  // The scratch and merge buffers below are `std::array<ranked_type, kMaxBatch>`
+  // held inline, so `Result` must be default-constructible and copy-assignable
+  // and the packet path's stack cost grows with `sizeof(Result)`. Replacing the
+  // inline merge buffer with a generation-owned candidate token is the planned
+  // way to make that independent of `Result`; until then the bound is explicit
+  // rather than implicit.
+  static_assert(std::is_default_constructible_v<ranked_type>);
+  static_assert(std::is_copy_assignable_v<ranked_type>);
 
   static constexpr size_t kMaxBatch = 64;
 
@@ -287,8 +303,10 @@ class RuntimeMaskedBackend {
     promise(key_stride <= keys.size() / count);
 
     // Stack bound: kMaxBatch * kMaskedMaxKeyBytes for the masked keys plus two
-    // rank buffers. Worst case (64 keys of 64 bytes, 32-byte results) is about
-    // 12 KiB, well inside the batch-sized frames this codebase already uses.
+    // rank buffers of kMaxBatch entries each. The key half is bounded by the
+    // 64-byte key ceiling; the rank half is 2 * kMaxBatch * sizeof(ranked_type)
+    // and therefore grows with the result type (12 KiB total at the current
+    // gate_idx_t instantiation).
     //
     // Deliberately not value-initialized: the masking kernel writes every byte
     // of the first `count` rows before anything reads them, `candidates[i]` is

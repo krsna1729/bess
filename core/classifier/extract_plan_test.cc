@@ -91,7 +91,7 @@ TEST(ExtractPlanTest, CopiesPacketAndMetadataFieldsExactly) {
   auto compiled = ExtractPlan::Compile(schema);
   ASSERT_TRUE(compiled);
   const ExtractPlan &plan = *compiled;
-  EXPECT_EQ(ExtractKernel::kGeneric, plan.kernel());
+  EXPECT_EQ(ExtractKernel::kTwoOp, plan.kernel());
 
   const std::array<std::byte, 6> packet =
       {Byte(0), Byte(1), Byte(2), Byte(3), Byte(4), Byte(5)};
@@ -115,6 +115,33 @@ TEST(ExtractPlanTest, CoalescesAdjacentFieldsAndUsesSingleKernel) {
   ASSERT_TRUE(compiled);
   EXPECT_EQ(1u, compiled->ops().size());
   EXPECT_EQ(ExtractKernel::kSinglePacket, compiled->kernel());
+}
+
+TEST(ExtractPlanTest, TwoOpKernelCopiesMixedFields) {
+  RuntimeClassifierSchema schema{
+      .key_size = 6,
+      .key_fields = {{SourceKind::kPacket, 1, 0, 4},
+                     {SourceKind::kMetadata, 2, 4, 2}},
+  };
+  auto compiled = ExtractPlan::Compile(schema);
+  ASSERT_TRUE(compiled);
+  ASSERT_EQ(2u, compiled->ops().size());
+  EXPECT_EQ(ExtractKernel::kTwoOp, compiled->kernel());
+
+  const std::array<std::byte, 6> packet =
+      {Byte(0), Byte(1), Byte(2), Byte(3), Byte(4), Byte(5)};
+  const std::array<std::byte, 4> metadata =
+      {Byte(10), Byte(11), Byte(12), Byte(13)};
+  const std::array<SourceView, 1> sources = {SourceView{packet, metadata}};
+  std::array<std::byte, 6> key{};
+
+  ASSERT_EQ(1ull, compiled->ExecuteBatch(sources, MutableBytes(key), 6));
+  EXPECT_EQ(Byte(1), key[0]);
+  EXPECT_EQ(Byte(2), key[1]);
+  EXPECT_EQ(Byte(3), key[2]);
+  EXPECT_EQ(Byte(4), key[3]);
+  EXPECT_EQ(Byte(12), key[4]);
+  EXPECT_EQ(Byte(13), key[5]);
 }
 
 TEST(ExtractPlanTest, BatchStrideIsExplicitAndNoAllocationOccurs) {

@@ -383,4 +383,21 @@ TEST_F(WildcardMatchTest, IntegerEncodedRulesAreAccepted) {
   EXPECT_EQ(std::string("\x12\x34", 2), config.rules(0).values(0).value_bin());
 }
 
+TEST_F(WildcardMatchTest, RejectsWideGateBeforeNarrowing) {
+  WildcardMatch *m = Create(TwoByteField());
+  ASSERT_NE(nullptr, m);
+
+  // Protobuf stores gate as uint64; 65536 would wrap to gate 0 if checked
+  // only after narrowing to gate_idx_t.
+  EXPECT_NE(0, Run(m, "add", Pack(Rule(0x1234, 0xffff, 1, 65536)))
+                   .error()
+                   .code());
+
+  bess::pb::WildcardMatchCommandSetDefaultGateArg default_gate;
+  default_gate.set_gate(65536);
+  EXPECT_NE(0, Run(m, "set_default_gate", Pack(default_gate))
+                   .error()
+                   .code());
+}
+
 }  // namespace

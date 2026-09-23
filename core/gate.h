@@ -31,6 +31,8 @@
 #ifndef BESS_GATE_H_
 #define BESS_GATE_H_
 
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -58,6 +60,18 @@ typedef uint16_t gate_idx_t;
 #define DROP_GATE MAX_GATES
 static_assert(MAX_GATES < INVALID_GATE, "invalid macro value");
 static_assert(DROP_GATE <= MAX_GATES, "invalid macro value");
+
+// Validates a gate as it arrives from the wire, before any narrowing to
+// gate_idx_t. Protobuf gate fields are 64-bit while gate_idx_t is 16-bit, so
+// checking after the cast accepts values that wrap into a different gate -- for
+// example 65536 becomes 0, which passes a post-cast range check.
+inline bool IsValidGateValue(uint64_t raw) {
+  if (raw > std::numeric_limits<gate_idx_t>::max()) {
+    return false;
+  }
+  const gate_idx_t gate = static_cast<gate_idx_t>(raw);
+  return gate < MAX_GATES || gate == DROP_GATE;
+}
 
 class Gate;
 class GateHookBuilder;

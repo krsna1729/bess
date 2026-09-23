@@ -57,6 +57,7 @@ struct ExtractOp {
 enum class ExtractKernel : uint8_t {
   kSinglePacket,
   kSingleMetadata,
+  kTwoOp,
   kGeneric,
 };
 
@@ -121,6 +122,8 @@ class ExtractPlan {
                                 MutableBytes key) const noexcept;
   static uint64_t ExecuteGeneric(const ExtractPlan &, std::span<const SourceView>,
                                  MutableBytes, size_t) noexcept;
+  static uint64_t ExecuteTwoOps(const ExtractPlan &, std::span<const SourceView>,
+                                MutableBytes, size_t) noexcept;
   static uint64_t ExecuteSinglePacket(const ExtractPlan &,
                                       std::span<const SourceView>, MutableBytes,
                                       size_t) noexcept;

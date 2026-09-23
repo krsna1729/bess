@@ -47,12 +47,6 @@
 
 namespace classifier = bess::classifier;
 
-// XXX: this is repeated in many modules. get rid of them when converting .h to
-// .hh, etc... it's in defined in some old header
-static inline int is_valid_gate(gate_idx_t gate) {
-  return (gate < MAX_GATES || gate == DROP_GATE);
-}
-
 const Commands ExactMatch::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&ExactMatch::GetInitialArg),
      Command::THREAD_SAFE},
@@ -551,12 +545,15 @@ CommandResponse ExactMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
 
 Error ExactMatch::RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg,
                              Rule *rule) {
-  gate_idx_t gate = arg.gate();
-
-  if (!is_valid_gate(gate)) {
-    return std::make_pair(EINVAL,
-                          bess::utils::Format("Invalid gate: %hu", gate));
+  // Validate the 64-bit wire value before narrowing: gate_idx_t is 16-bit, so
+  // a post-cast check would accept e.g. 65536 as gate 0.
+  if (!bess::IsValidGateValue(arg.gate())) {
+    return std::make_pair(
+        EINVAL,
+        bess::utils::Format("Invalid gate: %llu",
+                            static_cast<unsigned long long>(arg.gate())));
   }
+  const gate_idx_t gate = static_cast<gate_idx_t>(arg.gate());
 
   if (arg.fields_size() == 0) {
     return std::make_pair(EINVAL, "'fields' must be a list");
@@ -793,9 +790,14 @@ CommandResponse ExactMatch::CommandClear(const bess::pb::EmptyArg &) {
 
 CommandResponse ExactMatch::CommandSetDefaultGate(
     const bess::pb::ExactMatchCommandSetDefaultGateArg &arg) {
+  if (!bess::IsValidGateValue(arg.gate())) {
+    return CommandFailure(EINVAL, "Invalid gate: %llu",
+                          static_cast<unsigned long long>(arg.gate()));
+  }
+  const gate_idx_t gate = static_cast<gate_idx_t>(arg.gate());
   Error err;
   const bool published = Publish([&](const Generation &current) {
-    return Build(current.rules, arg.gate(), &err);
+    return Build(current.rules, gate, &err);
   }, &err);
   if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());

@@ -43,10 +43,10 @@
 //
 // Args: {tuples, batch, dist, metadata} where
 //   dist: 0 = single hit, 1 = multi-tuple hit, 2 = all miss
-//   metadata: 0 = packet-only fields, 1 = one packet field + one metadata field
-//
-// Field layout mirrors the module test: one 4-byte packet field at IP src
-// (offset 26) plus, for the mixed case, a 2-byte metadata field.
+//   metadata: 0 = one 4-byte packet field, 1 = packet + metadata,
+//             2 = packet + packet, 3 = one 6-byte packet field.
+// Layouts 1/2/3 keep the key width at six bytes; 1/2 isolate source kind
+// from field count, while 3 isolates field count from key width.
 
 #include <benchmark/benchmark.h>
 
@@ -99,8 +99,9 @@ struct WmConfig {
   size_t tuples = 4;
   size_t batch = 8;
   int dist = 0;
+  // Layout selector: 0 = one 4-byte packet field, 1 = packet + metadata,
+  // 2 = packet + packet, 3 = one 6-byte packet field.
   int metadata = 0;
-
   static WmConfig FromArgs(const benchmark::State &state) {
     return WmConfig{
         .tuples = static_cast<size_t>(state.range(0)),
@@ -152,18 +153,23 @@ struct WmWorkload {
 
   bool Build() {
     if (config.tuples == 0 || config.tuples > kMaxTuples || config.batch == 0 ||
-        config.batch > kMaxBatch) {
+        config.batch > kMaxBatch || config.metadata < 0 ||
+        config.metadata > 3) {
       return false;
     }
-    field_sizes = {4};
-    packet_offsets = {26};
-    if (config.metadata) {
-      field_sizes.push_back(2);
-      packet_offsets.push_back(0);  // unused for metadata
+    if (config.metadata == 3) {
+      field_sizes = {6};
+      packet_offsets = {26};
+    } else {
+      field_sizes = {4};
+      packet_offsets = {26};
+      if (config.metadata == 1 || config.metadata == 2) {
+        field_sizes.push_back(2);
+        packet_offsets.push_back(0);  // unused for metadata
+      }
     }
-    // metadata == 2 is the control for metadata == 1: same field count and key
-    // width, but the second field reads packet bytes instead of metadata, so a
-    // difference isolates the metadata source from the extra field.
+    // Layout 2 is the control for layout 1: same field count and key width,
+    // but the second field reads packet bytes instead of metadata.
     const bool second_is_packet = config.metadata == 2;
     key_size = 0;
     for (size_t s : field_sizes) {
@@ -228,12 +234,16 @@ struct WmWorkload {
       }
       packets[i].fill(0);
       metas[i].fill(0);
-      // Packet field 0 is 4 bytes at offset 26; the second field follows.
-      std::memcpy(packets[i].data() + 26, key_bytes.data(), 4);
-      if (config.metadata == 1) {
-        std::memcpy(metas[i].data() + 16, key_bytes.data() + 4, 2);
-      } else if (second_is_packet) {
-        std::memcpy(packets[i].data() + 40, key_bytes.data() + 4, 2);
+      if (config.metadata == 3) {
+        std::memcpy(packets[i].data() + 26, key_bytes.data(), 6);
+      } else {
+        // Packet field 0 is 4 bytes at offset 26; the second field follows.
+        std::memcpy(packets[i].data() + 26, key_bytes.data(), 4);
+        if (config.metadata == 1) {
+          std::memcpy(metas[i].data() + 16, key_bytes.data() + 4, 2);
+        } else if (second_is_packet) {
+          std::memcpy(packets[i].data() + 40, key_bytes.data() + 4, 2);
+        }
       }
       views[i].packet = ConstBytes(
           reinterpret_cast<const Byte *>(packets[i].data()), kPacketBytes);
@@ -250,9 +260,15 @@ struct WmWorkload {
     for (size_t i = 0; i < config.batch; i++) {
       // Reconstruct the dense key the extraction would produce.
       std::vector<uint8_t> key(key_size);
-      std::memcpy(key.data(), packets[i].data() + 26, 4);
-      if (config.metadata) {
-        std::memcpy(key.data() + 4, metas[i].data() + 16, 2);
+      if (config.metadata == 3) {
+        std::memcpy(key.data(), packets[i].data() + 26, 6);
+      } else {
+        std::memcpy(key.data(), packets[i].data() + 26, 4);
+        if (config.metadata == 1) {
+          std::memcpy(key.data() + 4, metas[i].data() + 16, 2);
+        } else if (config.metadata == 2) {
+          std::memcpy(key.data() + 4, packets[i].data() + 40, 2);
+        }
       }
       for (size_t t = 0; t < config.tuples; t++) {
         bool matched = false;
@@ -349,9 +365,17 @@ struct WmLegacyEqual {
   }
 };
 
+// The legacy module stored {priority, ogate} per entry; the benchmark must do
+// the same, or the multi-tuple comparison would be ranking by a reconstructed
+// value rather than the rule's real priority.
+struct WmLegacyData {
+  int priority;
+  gate_idx_t ogate;
+};
+
 struct WmLegacyTuple {
   WmWordKey mask{};
-  CuckooMap<WmWordKey, gate_idx_t, WmLegacyHash, WmLegacyEqual> table;
+  CuckooMap<WmWordKey, WmLegacyData, WmLegacyHash, WmLegacyEqual> table;
 };
 
 void BM_Wm_Legacy(benchmark::State &state) {
@@ -372,8 +396,11 @@ void BM_Wm_Legacy(benchmark::State &state) {
     for (size_t r = 0; r < kRulesPerTuple; r++) {
       WmWordKey key{};
       std::memcpy(&key, workload.Value(t, r).data(), total_bytes);
-      if (tuples[t].table.Insert(key, static_cast<gate_idx_t>(t + 1),
-                                 WmLegacyHash{words},
+      const WmLegacyData data{
+          .priority = static_cast<int>(r),
+          .ogate = static_cast<gate_idx_t>(t + 1),
+      };
+      if (tuples[t].table.Insert(key, data, WmLegacyHash{words},
                                  WmLegacyEqual{words}) == nullptr) {
         state.SkipWithError("legacy table insertion failed");
         return;
@@ -385,15 +412,19 @@ void BM_Wm_Legacy(benchmark::State &state) {
   for (auto _ : state) {
     for (size_t i = 0; i < config.batch; i++) {
       // Legacy key build: one unaligned 8-byte load per field, written at the
-      // field's cumulative position.
+      // field's cumulative position. The second field's source follows the
+      // configured variant (metadata == 2 is the packet-sourced control).
       WmWordKey key{};
       std::memcpy(&key, workload.packets[i].data() + 26, 8);
-      if (config.metadata) {
+      if (config.metadata == 1) {
         std::memcpy(reinterpret_cast<uint8_t *>(&key) + 4,
                     workload.metas[i].data() + 16, 8);
+      } else if (config.metadata == 2) {
+        std::memcpy(reinterpret_cast<uint8_t *>(&key) + 4,
+                    workload.packets[i].data() + 40, 8);
       }
       gate_idx_t best = kDefaultGate;
-      int64_t best_priority = INT64_MIN;
+      int best_priority = INT_MIN;
       for (const WmLegacyTuple &tuple : tuples) {
         WmWordKey masked{};
         for (size_t w = 0; w < words; w++) {
@@ -401,15 +432,9 @@ void BM_Wm_Legacy(benchmark::State &state) {
         }
         const auto *entry = tuple.table.Find(masked, WmLegacyHash{words},
                                              WmLegacyEqual{words});
-        if (entry != nullptr) {
-          // The legacy table stored {priority, ogate}; priorities here are the
-          // per-tuple rule index, so recover it from the stored gate's tuple.
-          const int64_t priority = static_cast<int64_t>(
-              (static_cast<size_t>(entry->second) - 1) % kRulesPerTuple);
-          if (priority >= best_priority) {
-            best_priority = priority;
-            best = entry->second;
-          }
+        if (entry != nullptr && entry->second.priority >= best_priority) {
+          best_priority = entry->second.priority;
+          best = entry->second.ogate;
         }
       }
       gates[i] = best;
@@ -474,6 +499,83 @@ void BM_Wm_Module(benchmark::State &state) {
       benchmark::Counter(static_cast<double>(backend.tuple_count()));
   state.counters["avg_tuple_matches"] =
       benchmark::Counter(workload.avg_tuple_matches);
+  state.SetItemsProcessed(state.iterations() * config.batch);
+}
+
+// ---------------------------------------------------------------------------
+// Stage attribution: extraction and backend lookup with setup removed from
+// the timed region. The 1/2/3 layouts all use six-byte keys.
+// ---------------------------------------------------------------------------
+
+void BM_Wm_Extract(benchmark::State &state) {
+  WmWorkload workload;
+  workload.config = WmConfig::FromArgs(state);
+  if (!workload.Build()) {
+    state.SkipWithError("workload build failed");
+    return;
+  }
+  auto plan = ExtractPlan::Compile(workload.Schema());
+  if (!plan) {
+    state.SkipWithError("extraction plan compile failed");
+    return;
+  }
+  const WmConfig &config = workload.config;
+  std::array<std::byte, kMaxBatch * 64> keys{};
+  for (auto _ : state) {
+    const uint64_t valid = plan->ExecuteBatch(
+        std::span<const SourceView>(workload.views).first(config.batch),
+        MutableBytes(keys).first(config.batch * workload.key_size),
+        workload.key_size);
+    benchmark::DoNotOptimize(valid);
+    benchmark::DoNotOptimize(keys);
+  }
+  state.counters["key_bytes"] =
+      benchmark::Counter(static_cast<double>(workload.key_size));
+  state.SetItemsProcessed(state.iterations() * config.batch);
+}
+
+void BM_Wm_Backend(benchmark::State &state) {
+  WmWorkload workload;
+  workload.config = WmConfig::FromArgs(state);
+  if (!workload.Build()) {
+    state.SkipWithError("workload build failed");
+    return;
+  }
+  const WmConfig &config = workload.config;
+  auto plan = ExtractPlan::Compile(workload.Schema());
+  if (!plan) {
+    state.SkipWithError("extraction plan compile failed");
+    return;
+  }
+  const auto rules = workload.Rules();
+  auto built =
+      RuntimeMaskedBackend<gate_idx_t, int64_t>::Build(workload.key_size, rules);
+  if (!built) {
+    state.SkipWithError(built.error().message.c_str());
+    return;
+  }
+  const auto &backend = *built;
+  std::array<std::byte, kMaxBatch * 64> keys{};
+  const uint64_t valid = plan->ExecuteBatch(
+      std::span<const SourceView>(workload.views).first(config.batch),
+      MutableBytes(keys).first(config.batch * workload.key_size),
+      workload.key_size);
+  const uint64_t all_valid = (uint64_t{1} << config.batch) - 1;
+  if (valid != all_valid) {
+    state.SkipWithError("workload extraction unexpectedly failed");
+    return;
+  }
+
+  std::array<gate_idx_t, kMaxBatch> gates{};
+  for (auto _ : state) {
+    const uint64_t hits = backend.lookup_batch(
+        ConstBytes(keys.data(), config.batch * workload.key_size),
+        workload.key_size, std::span<gate_idx_t>(gates).first(config.batch));
+    benchmark::DoNotOptimize(hits);
+    benchmark::DoNotOptimize(gates);
+  }
+  state.counters["tuples"] =
+      benchmark::Counter(static_cast<double>(backend.tuple_count()));
   state.SetItemsProcessed(state.iterations() * config.batch);
 }
 
@@ -559,12 +661,24 @@ void RegisterWm(const char *name, BenchFn fn, const WmConfig &config) {
       for (int dist : {0, 2}) {
         add(WmConfig{tuples, batch, dist, 1});
         add(WmConfig{tuples, batch, dist, 2});
+        add(WmConfig{tuples, batch, dist, 3});
       }
     }
   }
   for (const WmConfig &config : points) {
     RegisterWm("BM_Wm_Legacy", &BM_Wm_Legacy, config);
     RegisterWm("BM_Wm_Module", &BM_Wm_Module, config);
+  }
+  for (size_t tuples : {size_t{1}, size_t{4}, size_t{8}}) {
+    for (size_t batch : {size_t{8}, size_t{32}}) {
+      for (int dist : {0, 2}) {
+        for (int layout : {1, 2, 3}) {
+          const WmConfig config{tuples, batch, dist, layout};
+          RegisterWm("BM_Wm_Extract", &BM_Wm_Extract, config);
+          RegisterWm("BM_Wm_Backend", &BM_Wm_Backend, config);
+        }
+      }
+    }
   }
   BENCHMARK(BM_Wm_Rebuild)
       ->Args({1, 8})
