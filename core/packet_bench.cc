@@ -50,6 +50,7 @@
 
 #include "packet.h"
 #include "packet_cursor.h"
+#include "packet_mutation.h"
 #include "packet_pool.h"
 #include "pktbatch.h"
 
@@ -341,6 +342,276 @@ BENCHMARK(BM_PacketCursorPositionedRead)
 BENCHMARK(BM_PacketCursorSequentialRead)
     ->ArgsProduct({{1, 8, 32}})
     ->ArgNames({"batch"});
+
+enum class MutationBenchmarkOp : uint8_t {
+  kPrepend,
+  kAppend,
+  kRemovePrefix,
+  kTrimSuffix,
+};
+
+bess::PacketHandle BuildMutationBenchmarkPacket(
+    bess::PlainPacketPool &pool, size_t shape) {
+  const std::array<std::array<size_t, 2>, 2> lengths = {{
+      {128, 0},
+      {64, 64},
+  }};
+  const std::array<size_t, 2> counts = {1, 2};
+  CHECK_LT(shape, lengths.size());
+
+  bess::PacketHandle head = nullptr;
+  bess::PacketHandle previous = nullptr;
+  size_t total_len = 0;
+  for (size_t i = 0; i < counts[shape]; i++) {
+    const size_t length = lengths[shape][i];
+    bess::PacketHandle segment = pool.Alloc(length);
+    CHECK(segment != nullptr);
+    if (head == nullptr) {
+      head = segment;
+    } else {
+      previous->next = segment;
+    }
+    previous = segment;
+    std::memset(bess::PacketRef(segment).head_data(), 0, length);
+    total_len += length;
+  }
+  head->pkt_len = static_cast<uint32_t>(total_len);
+  head->nb_segs = static_cast<uint16_t>(counts[shape]);
+  return head;
+}
+
+template <bool Checked>
+void RunMutationBenchmark(benchmark::State &state,
+                          MutationBenchmarkOp operation) {
+  bess::PlainPacketPool &pool = GetPool();
+  const size_t bytes = static_cast<size_t>(state.range(0));
+  const size_t shape = static_cast<size_t>(state.range(1));
+  const size_t batch = static_cast<size_t>(state.range(2));
+  constexpr size_t kMaxBatch = 32;
+  std::array<bess::PacketHandle, kMaxBatch> pkts{};
+  for (size_t i = 0; i < batch; i++) {
+    pkts[i] = BuildMutationBenchmarkPacket(pool, shape);
+  }
+
+  auto apply = [&](bess::PacketHandle packet) {
+    bess::PacketRef ref(packet);
+    if constexpr (Checked) {
+      switch (operation) {
+        case MutationBenchmarkOp::kPrepend:
+          benchmark::DoNotOptimize(
+              bess::packet::PrependInPlace(ref, bytes));
+          break;
+        case MutationBenchmarkOp::kAppend:
+          benchmark::DoNotOptimize(bess::packet::AppendInPlace(ref, bytes));
+          break;
+        case MutationBenchmarkOp::kRemovePrefix:
+          benchmark::DoNotOptimize(
+              bess::packet::RemovePrefixInPlace(ref, bytes));
+          break;
+        case MutationBenchmarkOp::kTrimSuffix:
+          benchmark::DoNotOptimize(
+              bess::packet::TrimSuffixInPlace(ref, bytes));
+          break;
+      }
+    } else {
+      switch (operation) {
+        case MutationBenchmarkOp::kPrepend:
+          benchmark::DoNotOptimize(
+              rte_pktmbuf_prepend(packet, static_cast<uint16_t>(bytes)));
+          break;
+        case MutationBenchmarkOp::kAppend:
+          benchmark::DoNotOptimize(
+              rte_pktmbuf_append(packet, static_cast<uint16_t>(bytes)));
+          break;
+        case MutationBenchmarkOp::kRemovePrefix:
+          benchmark::DoNotOptimize(
+              rte_pktmbuf_adj(packet, static_cast<uint16_t>(bytes)));
+          break;
+        case MutationBenchmarkOp::kTrimSuffix:
+          benchmark::DoNotOptimize(
+              rte_pktmbuf_trim(packet, static_cast<uint16_t>(bytes)));
+          break;
+      }
+    }
+  };
+
+  auto reset = [&](bess::PacketHandle packet) {
+    switch (operation) {
+      case MutationBenchmarkOp::kPrepend:
+        CHECK(rte_pktmbuf_adj(packet, static_cast<uint16_t>(bytes)) !=
+              nullptr);
+        break;
+      case MutationBenchmarkOp::kAppend:
+        CHECK(rte_pktmbuf_trim(packet, static_cast<uint16_t>(bytes)) == 0);
+        break;
+      case MutationBenchmarkOp::kRemovePrefix:
+        CHECK(rte_pktmbuf_prepend(packet, static_cast<uint16_t>(bytes)) !=
+              nullptr);
+        break;
+      case MutationBenchmarkOp::kTrimSuffix:
+        CHECK(rte_pktmbuf_append(packet, static_cast<uint16_t>(bytes)) !=
+              nullptr);
+        break;
+    }
+  };
+
+  apply(pkts[0]);
+  reset(pkts[0]);
+  for (auto _ : state) {
+    for (size_t i = 0; i < batch; i++) {
+      apply(pkts[i]);
+    }
+    state.PauseTiming();
+    for (size_t i = 0; i < batch; i++) {
+      reset(pkts[i]);
+    }
+    state.ResumeTiming();
+  }
+  state.SetItemsProcessed(state.iterations() * batch);
+  state.counters["bytes/mutation"] = static_cast<double>(bytes);
+  state.counters["segments/mutation"] = shape == 0 ? 1 : 2;
+
+  bess::PacketFreeBulk(pkts.data(), batch);
+}
+
+void BM_PacketRawPrepend(benchmark::State &state) {
+  RunMutationBenchmark<false>(state, MutationBenchmarkOp::kPrepend);
+}
+
+void BM_PacketCheckedPrepend(benchmark::State &state) {
+  RunMutationBenchmark<true>(state, MutationBenchmarkOp::kPrepend);
+}
+
+void BM_PacketRawAppend(benchmark::State &state) {
+  RunMutationBenchmark<false>(state, MutationBenchmarkOp::kAppend);
+}
+
+void BM_PacketCheckedAppend(benchmark::State &state) {
+  RunMutationBenchmark<true>(state, MutationBenchmarkOp::kAppend);
+}
+
+void BM_PacketRawRemovePrefix(benchmark::State &state) {
+  RunMutationBenchmark<false>(state, MutationBenchmarkOp::kRemovePrefix);
+}
+
+void BM_PacketCheckedRemovePrefix(benchmark::State &state) {
+  RunMutationBenchmark<true>(state, MutationBenchmarkOp::kRemovePrefix);
+}
+
+void BM_PacketRawTrimSuffix(benchmark::State &state) {
+  RunMutationBenchmark<false>(state, MutationBenchmarkOp::kTrimSuffix);
+}
+
+void BM_PacketCheckedTrimSuffix(benchmark::State &state) {
+  RunMutationBenchmark<true>(state, MutationBenchmarkOp::kTrimSuffix);
+}
+
+struct MutationBenchExternalOwner {
+  int *free_count;
+};
+
+void FreeMutationBenchExternal(void *address, void *opaque) {
+  auto *owner = static_cast<MutationBenchExternalOwner *>(opaque);
+  ++*owner->free_count;
+  delete[] static_cast<unsigned char *>(address);
+  delete owner;
+}
+
+bess::PacketHandle BuildMutationBenchExternal(
+    bess::PlainPacketPool &pool, int *free_count,
+    rte_mbuf_ext_shared_info **shinfo_out) {
+  auto *buffer = new unsigned char[4096];
+  auto *owner = new MutationBenchExternalOwner{free_count};
+  uint16_t buffer_len = 4096;
+  auto *shinfo = rte_pktmbuf_ext_shinfo_init_helper(
+      buffer, &buffer_len, FreeMutationBenchExternal, owner);
+  CHECK(shinfo != nullptr);
+  bess::PacketHandle packet =
+      pool.AllocExternal(buffer, RTE_BAD_IOVA, buffer_len, shinfo, 64);
+  CHECK(packet != nullptr);
+  *shinfo_out = shinfo;
+  return packet;
+}
+
+void BM_PayloadWriteability(benchmark::State &state) {
+  bess::PlainPacketPool &pool = GetPool();
+  const size_t kind = static_cast<size_t>(state.range(0));
+  CHECK_LT(kind, 4u);
+  int free_count = 0;
+  rte_mbuf_ext_shared_info *shinfo = nullptr;
+  bess::PacketHandle packet = nullptr;
+  bess::PacketHandle sibling = nullptr;
+
+  switch (kind) {
+    case 0:
+      packet = pool.Alloc(64);
+      break;
+    case 1: {
+      sibling = pool.Alloc(64);
+      CHECK(sibling != nullptr);
+      packet = bess::PacketClone(sibling);
+      CHECK(packet != nullptr);
+      break;
+    }
+    case 2:
+      packet = BuildMutationBenchExternal(pool, &free_count, &shinfo);
+      break;
+    case 3: {
+      sibling = BuildMutationBenchExternal(pool, &free_count, &shinfo);
+      packet = bess::PacketClone(sibling);
+      CHECK(packet != nullptr);
+      break;
+    }
+  }
+  CHECK(packet != nullptr);
+
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(
+        bess::packet::PayloadWriteabilityOf(bess::PacketRef(packet)));
+  }
+  state.SetItemsProcessed(state.iterations());
+  state.counters["writable"] =
+      bess::packet::PayloadWriteabilityOf(bess::PacketRef(packet)) ==
+              bess::packet::PayloadWriteability::kWritable
+          ? 1
+          : 0;
+
+  if (sibling != nullptr) {
+    bess::PacketFree(packet);
+    bess::PacketFree(sibling);
+  } else {
+    bess::PacketFree(packet);
+  }
+  CHECK_EQ(free_count, kind >= 2 ? 1 : 0);
+}
+
+BENCHMARK(BM_PacketRawPrepend)
+    ->ArgsProduct({{14, 20, 36, 64}, {0, 1}, {1, 8, 32}})
+    ->ArgNames({"bytes", "shape", "batch"});
+BENCHMARK(BM_PacketCheckedPrepend)
+    ->ArgsProduct({{14, 20, 36, 64}, {0, 1}, {1, 8, 32}})
+    ->ArgNames({"bytes", "shape", "batch"});
+BENCHMARK(BM_PacketRawAppend)
+    ->ArgsProduct({{8, 32, 64}, {0, 1}, {1, 8, 32}})
+    ->ArgNames({"bytes", "shape", "batch"});
+BENCHMARK(BM_PacketCheckedAppend)
+    ->ArgsProduct({{8, 32, 64}, {0, 1}, {1, 8, 32}})
+    ->ArgNames({"bytes", "shape", "batch"});
+BENCHMARK(BM_PacketRawRemovePrefix)
+    ->ArgsProduct({{14, 20, 36}, {0, 1}, {1, 8, 32}})
+    ->ArgNames({"bytes", "shape", "batch"});
+BENCHMARK(BM_PacketCheckedRemovePrefix)
+    ->ArgsProduct({{14, 20, 36}, {0, 1}, {1, 8, 32}})
+    ->ArgNames({"bytes", "shape", "batch"});
+BENCHMARK(BM_PacketRawTrimSuffix)
+    ->ArgsProduct({{14, 20, 36}, {0, 1}, {1, 8, 32}})
+    ->ArgNames({"bytes", "shape", "batch"});
+BENCHMARK(BM_PacketCheckedTrimSuffix)
+    ->ArgsProduct({{14, 20, 36}, {0, 1}, {1, 8, 32}})
+    ->ArgNames({"bytes", "shape", "batch"});
+BENCHMARK(BM_PayloadWriteability)
+    ->ArgsProduct({{0, 1, 2, 3}})
+    ->ArgNames({"storage"});
 
 void BM_PacketCursorChainRead(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();

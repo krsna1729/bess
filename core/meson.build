@@ -219,6 +219,7 @@ unit_test_sources = [
   'modules/exact_match_migration_test.cc',
   'modules/wildcard_match_test.cc',
   'packet_cursor_test.cc',
+  'packet_mutation_test.cc',
   'port_test.cc',
   'shared_obj_test.cc',
   'registry_test.cc',

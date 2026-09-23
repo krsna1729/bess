@@ -131,6 +131,8 @@ class PacketRef {
     rte_pktmbuf_reset(pkt_);
   }
 
+  // Raw native DPDK escape hatches. Callers own all preconditions; checked
+  // generic module-facing wrappers live in packet_mutation.h.
   void *prepend(uint16_t len) { return rte_pktmbuf_prepend(pkt_, len); }
   void *adj(uint16_t len) { return rte_pktmbuf_adj(pkt_, len); }
   void *append(uint16_t len) { return rte_pktmbuf_append(pkt_, len); }
