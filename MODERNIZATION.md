@@ -5535,10 +5535,24 @@ bytes copied, segments per operation, head replacement, and allocation
 attribution. These are environment-specific smoke measurements, not a
 performance verdict.
 
-K4.3b remains the future linearization and contiguous-prefix layer:
-`EnsureLinear`, `EnsureContiguousPrefix`, partial-segment COW, and
-cross-segment remove/trim semantics. K4.4 remains the future checksum and
-TX-offload semantic layer.
+K4.3b remains the future topology and linearization layer.
+`EnsureLinear(PacketHandle&)` guarantees `nb_segs == 1` and is an exact
+no-op for an already-linear packet; it says nothing about payload
+exclusivity. The generic primitive is
+`EnsureContiguous(PacketHandle&, size_t offset, size_t bytes)`, which
+guarantees that the requested range is contiguous and writable;
+`EnsureContiguousPrefix(packet, bytes)` may be a convenience wrapper. The
+initial slow path may use `EnsureWritable` followed by `EnsureLinear`.
+Partial/segment-local COW is a benchmark-gated future optimization, not a
+K4.3b requirement. Cross-segment remove/trim semantics remain future work.
+
+In DPDK 25.11.3, `rte_pktmbuf_linearize` is an exact no-op for an already
+contiguous packet. Its multisegment implementation checks required tailroom
+before mutating the first mbuf, then copies and frees segments without a
+fallible return path. BESS must still preflight chain lengths, physical
+bounds, and writable ownership; when those preconditions cannot be
+guaranteed, replacement-copy semantics remain the safe fallback. K4.4
+remains the future checksum and TX-offload semantic layer.
 
 ---
 
