@@ -5546,9 +5546,10 @@ refcount `1`.
 
 #### K4.3a — transactional packet writability and full-packet COW
 
-`EnsureWritable(PacketHandle &packet) noexcept` is the first topology-safe
-boundary for mutations that need writable payload storage. It returns
-`std::expected<void, ReshapeError>` with this fixed error set:
+`EnsureWritable(PacketHandle &packet) noexcept` is semantic packet COW for
+mutations requiring writable payload storage; a successful deep copy may
+change segmentation. It returns `std::expected<void, ReshapeError>`. The shared
+`ReshapeError` set is:
 
 ```text
 kNullPacket
@@ -5570,15 +5571,15 @@ through `PayloadWriteabilityOf`.
 If every segment is writable, `EnsureWritable` returns the same handle and
 topology without allocation. If any payload segment is shared—direct,
 indirect, or external—it deep-copies the complete packet with native
-`PacketCopy` from the source packet's existing mempool, copies the complete
-`BessPacketPrivate` head region, replaces the caller's handle, and only then
-frees the old chain. Allocation failure therefore leaves the original handle,
-descriptor chain, payload, and metadata unchanged. `BessPacketPrivate` is
-logical packet-head state; continuation-segment private areas carry no
-packet-level semantic state and are not copied as independent metadata.
-Native DPDK packet-header metadata remains covered by `PacketCopy`, including
-port, packet type, hash, VLAN fields, TX offload, dynamic fields, and semantic
-offload flags.
+`PacketCopy` from the source packet's existing mempool. The copy may resegment
+to fit destination mbuf capacity. It copies the complete `BessPacketPrivate`
+head region, replaces the caller's handle, and only then frees the old chain.
+Allocation failure leaves the original handle, descriptor chain, payload, and
+metadata unchanged. `BessPacketPrivate` is logical packet-head state;
+continuation-segment private areas carry no packet-level semantic state and are
+not copied as independent metadata. Native DPDK packet-header metadata remains
+covered by `PacketCopy`, including port, packet type, hash, VLAN fields, TX
+offload, dynamic fields, and semantic offload flags.
 
 The regression target covers null and unique no-op paths, direct/indirect and
 external COW, backing-release lifecycle recovery, payload equivalence and
@@ -5611,8 +5612,9 @@ returns `std::expected<MutableBytes, ReshapeError>`. It validates ranges with
 subtraction-style bounds checks. A zero-length range at any offset through
 `pkt_len` returns an empty span without COW or topology changes. A non-empty
 range wholly inside one writable segment borrows that segment directly. The
-slow path calls `EnsureWritable` only for a single-segment packet; a
-multisegment packet goes directly through `EnsureLinear`, avoiding a
+slow path uses the internal topology-preserving COW helper only for a
+single-segment packet, because the returned offset is relative to that segment.
+A multisegment packet goes directly through `EnsureLinear`, avoiding a
 preliminary whole-packet COW and preserving the original packet on linear
 capacity/allocation failure. Partial or segment-local COW remains outside
 K4.3b.
@@ -5620,11 +5622,12 @@ K4.3b.
 The reshape target now covers the null and malformed contracts, shared
 already-linear no-op, native two-segment linearization, writable-head/shared-
 tail reads, zero-length shared heads, replacement capacity and allocation
-failures, metadata/private-state preservation, same-segment writable and COW
-ranges, cross-segment two- and four-segment ranges, byte boundaries, and
-replacement 2/4-segment, same-segment writable/shared, cross 2/4-segment, and
-writable-head/shared-tail native paths with `allocations`, `bytes_copied`,
-`segments_freed`, and `head_replacements` counters.
+failures, oversized shared single-segment COW capacity failure, metadata/
+private-state preservation, same-segment writable and COW ranges, cross-
+segment two- and four-segment ranges, byte boundaries, and replacement 2/4-
+segment, same-segment writable/shared, cross 2/4-segment, and writable-head/
+shared-tail native paths with `allocations`, `bytes_copied`, `segments_freed`,
+and `head_replacements` counters.
 
 In DPDK 25.11.3, `rte_pktmbuf_linearize` is an exact no-op for an already
 contiguous packet. Its multisegment implementation checks required tailroom
@@ -5640,8 +5643,8 @@ For a non-empty multisegment range, `EnsureContiguous` now calls
 leaves the caller's handle, descriptor topology, payload references, metadata,
 bytes, and pool availability unchanged. Native linearization can also consume
 a writable head and read-only shared tail without allocating or first copying
-the complete packet. A single-segment shared range still uses only
-`EnsureWritable`.
+the complete packet. Single-segment shared ranges use the topology-preserving
+internal helper; failure preserves the original packet unchanged.
 
 One performance limitation remains deliberate: a requested range wholly
 inside a shared segment of a multisegment jumbo packet may be writable through
@@ -5726,6 +5729,10 @@ std::expected<void, ChecksumError> ApplySoftwareChecksums(
     PacketHandle &packet, const ChecksumPlan &plan) noexcept;
 ```
 
+K4.4a.1 is complete: generic `EnsureWritable` retains semantic COW and may
+resegment; `ApplySoftwareChecksums` and `EnsureContiguous` use internal
+topology-preserving COW where existing segment offsets must remain valid.
+
 `ComputeChecksums` validates the descriptor chain and reads headers through
 `PacketCursor`; range summation walks segment backing directly and preserves
 one's-complement odd-byte pairing across segment boundaries. It never
@@ -5738,12 +5745,13 @@ rejected. A computed UDP checksum of zero is encoded as `0xffff`.
 
 `ApplySoftwareChecksums` computes every requested value and stages all writes
 before mutation. It preflights each checksum-field range and checks only the
-backing that contains those bytes; `EnsureWritable` is called only when a
-target byte is shared, so unrelated shared tail backing does not force a copy.
-`EnsureWritable` retains segment boundaries and per-segment lengths during COW.
-If the destination pool cannot hold a source segment at its existing boundary,
-the operation returns `kInsufficientWritableCapacity` before changing the
-packet.
+backing that contains those bytes. `detail::EnsureWritablePreservingTopology`
+is called only when a target byte is shared, so unrelated shared tail backing
+does not force a copy. It retains segment boundaries and per-segment lengths.
+Generic public `EnsureWritable` keeps its semantic deep-copy contract and may
+change segmentation topology. If a source segment cannot fit in one direct
+destination mbuf, checksum apply returns `kInsufficientWritableCapacity`
+before changing the packet.
 The writer handles fields split across segments without flattening. No
 fallible operation follows the first byte write; errors leave packet bytes,
 topology, and metadata unchanged.
@@ -5756,23 +5764,36 @@ malformed lengths; IPv4/IPv6 fragment, extension, and jumbo rejection; cloned
 and external backing; unrelated shared tails; and COW allocation-, capacity-,
 and packet-state failure cases.
 
-`core/packet_checksum_bench.cc` covers contiguous, two-segment split-header,
-two-segment split-checksum, four-segment split-header/checksum, writable-head
-with shared-tail, and shared-header COW paths. It varies packet sizes 64, 1500,
-and 4096 bytes; read-only cases rotate a hot single packet or a 128-packet
-working set.
-The focused checksum and reshape tests passed with:
+`core/packet_checksum_bench.cc` measures raw BESS and DPDK contiguous checksum
+arithmetic, DPDK `rte_ipv4_udptcp_cksum_mbuf` over chains, equivalent-validation
+BESS/DPDK references, and the full `ComputeChecksums` and
+`ApplySoftwareChecksums` APIs. Cases distinguish IPv4 UDP/TCP, network-only,
+transport-only, and both checksums; packet sizes are 64, 1500, and 4096 bytes.
+Packet shapes cover contiguous, split header, split checksum, four-segment
+header/checksum splits, shared tail, and shared-header COW. Read-only API cases
+include hot-single-packet and 128-packet rotation.
 
-```sh
-meson test -C build-meson packet_checksum_test packet_reshape_test --print-errorlogs
-```
+Across 437 distinct benchmark cases, five isolated repetitions (20 ms minimum
+each) had a `ComputeChecksums` median coefficient of variation of 0.73% at
+1500 bytes and 0.74% at 4096 bytes for UDP-both contiguous packets. Medians:
 
-The focused checksum and reshape tests passed with
-`meson test -C build-meson packet_checksum_test packet_reshape_test --print-errorlogs`.
-All checksum benchmark smoke cases passed using `omarchy-benchmark --isolate`;
-no performance verdict is claimed.
+| Packet bytes | Raw BESS | Validated BESS reference | `ComputeChecksums` | `ApplySoftwareChecksums` |
+| ---: | ---: | ---: | ---: | ---: |
+| 1500 | 38.3 ns | 112.2 ns | 78.8 ns | 85.9 ns |
+| 4096 | 110.2 ns | 182.8 ns | 146.9 ns | 153.7 ns |
 
-#### K4.4b — semantic TX checksum-offload plan
+The optimized accumulator uses `utils::CalculateSum` for aligned even-length
+spans while carrying odd bytes across segment boundaries. The full API is
+slower than raw arithmetic, as expected, but faster than the equivalently
+validated BESS reference in these cases; no further engine change is warranted.
+Pinned DPDK 25.11.3's mbuf helper disagrees with the semantic API when a UDP or
+TCP checksum field crosses the two-segment checksum split. Such rows report
+`dpdk_checksum_mismatch=1` and are not treated as valid DPDK performance wins.
+
+`packet_checksum_test` and `packet_reshape_test` pass in both GCC (`build-meson`)
+and Clang (`build-meson-clang`) builds.
+
+#### K4.4b — semantic TX checksum-offload plan (deferred)
 
 K4.4b expresses checksum intent and device support semantically, then maps
 that plan to PMD-specific metadata at the transmit boundary. `PmdCapabilities`

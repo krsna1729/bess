@@ -105,7 +105,7 @@ void CopyPacketHeadMetadata(::bess::PacketHandle destination,
   destination->ol_flags =
       source->ol_flags & ~(RTE_MBUF_F_INDIRECT | RTE_MBUF_F_EXTERNAL);
 }
-std::expected<::bess::PacketHandle, ReshapeError> CopyPacketForReplacement(
+std::expected<::bess::PacketHandle, ReshapeError> CopyPacketPreservingTopology(
     ::bess::PacketHandle source) noexcept {
   ::bess::PacketHandle destination_head = nullptr;
   ::bess::PacketHandle destination_tail = nullptr;
@@ -151,6 +151,28 @@ std::expected<::bess::PacketHandle, ReshapeError> CopyPacketForReplacement(
   destination_head->nb_segs = source->nb_segs;
   return destination_head;
 }
+std::expected<void, ReshapeError> EnsureWritablePreservingTopology(
+    ::bess::PacketHandle &packet) noexcept {
+  const auto writable = ChainPayloadWritable(packet);
+  if (!writable) {
+    return std::unexpected(writable.error());
+  }
+  if (*writable) {
+    return {};
+  }
+
+  auto replacement = CopyPacketPreservingTopology(packet);
+  if (!replacement) {
+    return std::unexpected(replacement.error());
+  }
+  CopyBessPacketPrivate(*replacement, packet);
+
+  ::bess::PacketHandle original = packet;
+  packet = *replacement;
+  ::bess::PacketFree(original);
+  return {};
+}
+
 
 // Promotion changes logical packet-head state, not the surviving segment's
 // payload representation or storage.
@@ -219,14 +241,14 @@ std::expected<void, ReshapeError> EnsureWritable(
     return {};
   }
 
-  auto replacement = detail::CopyPacketForReplacement(packet);
-  if (!replacement) {
-    return std::unexpected(replacement.error());
+  ::bess::PacketHandle replacement = ::bess::PacketCopy(packet);
+  if (replacement == nullptr) {
+    return std::unexpected(ReshapeError::kAllocationFailed);
   }
-  detail::CopyBessPacketPrivate(*replacement, packet);
+  detail::CopyBessPacketPrivate(replacement, packet);
 
   ::bess::PacketHandle original = packet;
-  packet = *replacement;
+  packet = replacement;
   ::bess::PacketFree(original);
   return {};
 }
@@ -297,7 +319,8 @@ std::expected<MutableBytes, ReshapeError> EnsureContiguous(
   }
 
   if (chain->nb_segs == 1) {
-    const auto writable = EnsureWritable(packet);
+    const auto writable =
+        detail::EnsureWritablePreservingTopology(packet);
     if (!writable) {
       return std::unexpected(writable.error());
     }

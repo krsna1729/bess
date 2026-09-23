@@ -426,11 +426,9 @@ TEST(PacketReshapeTest, SharedDirectAndIndirectPacketsUseWholePacketCOW) {
   ASSERT_TRUE(result.has_value());
   EXPECT_NE(clone, old_clone);
   EXPECT_TRUE(RTE_MBUF_DIRECT(clone));
-  EXPECT_EQ(clone->nb_segs, 2);
-  ASSERT_NE(clone->next, nullptr);
-  EXPECT_EQ(clone->data_len, 128);
-  EXPECT_EQ(clone->next->data_len, 128);
-  EXPECT_EQ(clone->next->next, nullptr);
+  EXPECT_EQ(clone->nb_segs, 1);
+  EXPECT_EQ(clone->next, nullptr);
+  EXPECT_EQ(clone->data_len, 256);
   EXPECT_TRUE(ChainPayloadWritable(clone));
   ExpectCopiedHeadState(clone, clone_before);
   EXPECT_EQ(rte_mbuf_refcnt_read(source), 1);
@@ -444,6 +442,41 @@ TEST(PacketReshapeTest, SharedDirectAndIndirectPacketsUseWholePacketCOW) {
   PacketFree(clone);
   PacketFree(source);
 }
+
+TEST(PacketReshapeTest,
+     GenericEnsureWritableResegmentsOversizedExternalSegment) {
+  PlainPacketPool pool(16, -1, 64);
+  int free_count = 0;
+  rte_mbuf_ext_shared_info *shinfo = nullptr;
+  PacketHandle source = MakeExternal(pool, &free_count, &shinfo, 256);
+  ASSERT_NE(source, nullptr);
+  SeedHeadMetadata(source);
+  PacketHandle clone = bess::PacketClone(source);
+  ASSERT_NE(clone, nullptr);
+  ASSERT_TRUE(RTE_MBUF_HAS_EXTBUF(clone));
+  const HeadState clone_before = TakeHeadState(clone);
+  const std::vector<std::byte> source_bytes = PacketBytes(source);
+  const PacketHandle old_clone = clone;
+  EXPECT_EQ(rte_mbuf_ext_refcnt_read(shinfo), 2);
+
+  auto result = EnsureWritable(clone);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_NE(clone, old_clone);
+  EXPECT_TRUE(RTE_MBUF_DIRECT(clone));
+  EXPECT_GT(clone->nb_segs, 1);
+  EXPECT_EQ(clone->pkt_len, source->pkt_len);
+  EXPECT_TRUE(ChainPayloadWritable(clone));
+  ExpectCopiedHeadState(clone, clone_before);
+  EXPECT_EQ(PacketBytes(clone), source_bytes);
+  EXPECT_EQ(PacketBytes(source), source_bytes);
+
+  FillChain(clone, static_cast<std::byte>(0xd6));
+  EXPECT_EQ(PacketBytes(source), source_bytes);
+  PacketFree(clone);
+  PacketFree(source);
+  EXPECT_EQ(free_count, 1);
+}
+
 
 TEST(PacketReshapeTest, SharedExternalPacketUsesWholePacketCOW) {
   PlainPacketPool pool(16, -1, 128);
@@ -999,6 +1032,38 @@ TEST(PacketReshapeTest,
 
   PacketFree(packet);
   PacketFree(source);
+}
+
+TEST(PacketReshapeTest,
+     EnsureContiguousOversizedSharedExternalSegmentFailsUnchanged) {
+  PlainPacketPool pool(16, -1, 64);
+  int free_count = 0;
+  rte_mbuf_ext_shared_info *shinfo = nullptr;
+  PacketHandle source = MakeExternal(pool, &free_count, &shinfo, 256);
+  ASSERT_NE(source, nullptr);
+  PacketHandle packet = bess::PacketClone(source);
+  ASSERT_NE(packet, nullptr);
+  EXPECT_EQ(rte_mbuf_ext_refcnt_read(shinfo), 2);
+  const PacketHandle original = packet;
+  const HeadState before = TakeHeadState(packet);
+  const std::vector<std::byte> bytes = PacketBytes(packet);
+  const size_t available_before = pool.Size();
+
+  auto result = EnsureContiguous(packet, 200, 4);
+  EXPECT_FALSE(result.has_value());
+  if (!result.has_value()) {
+    EXPECT_EQ(result.error(), ReshapeError::kInsufficientContiguousCapacity);
+  }
+  EXPECT_EQ(packet, original);
+  EXPECT_EQ(pool.Size(), available_before);
+  EXPECT_EQ(rte_mbuf_ext_refcnt_read(shinfo), 2);
+  ExpectHeadStateUnchanged(packet, before);
+  EXPECT_EQ(PacketBytes(packet), bytes);
+  EXPECT_EQ(PacketBytes(source), bytes);
+
+  PacketFree(packet);
+  PacketFree(source);
+  EXPECT_EQ(free_count, 1);
 }
 
 TEST(PacketReshapeTest, EnsureContiguousLinearizesCrossSegmentRange) {

@@ -46,13 +46,21 @@ enum class ReshapeError : uint8_t {
   kMalformedChain,
 };
 
-// Ensures that packet's payload storage is writable by atomically replacing a
-// shared packet with a semantic deep copy that retains segment boundaries.
-// The caller must exclusively own the descriptor chain referenced by packet;
-// packet may be replaced on success. If a segment cannot fit without
-// changing its boundary, returns kInsufficientContiguousCapacity unchanged.
+// Ensures packet payload storage is writable with a semantic deep copy. The
+// caller must exclusively own the descriptor chain; packet may be replaced on
+// success. Copying may change segment topology.
 std::expected<void, ReshapeError> EnsureWritable(
     ::bess::PacketHandle &packet) noexcept;
+
+namespace detail {
+
+// Internal COW variant for operations whose offsets depend on the existing
+// segment topology. Fails unchanged if a source segment cannot fit in one
+// direct mbuf.
+std::expected<void, ReshapeError> EnsureWritablePreservingTopology(
+    ::bess::PacketHandle &packet) noexcept;
+
+}  // namespace detail
 
 // Ensures that packet has one segment. The caller must exclusively own the
 // descriptor chain; payload backing may remain shared when packet is already

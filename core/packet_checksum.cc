@@ -43,6 +43,7 @@
 #include "packet_cursor.h"
 #include "packet_mutation.h"
 #include "packet_reshape.h"
+#include "utils/checksum.h"
 #include "utils/ip.h"
 #include "utils/tcp.h"
 #include "utils/udp.h"
@@ -120,11 +121,14 @@ class ChecksumAccumulator {
       offset = 1;
     }
 
-    while (offset + 1 < bytes.size()) {
-      sum_ += (static_cast<uint16_t>(std::to_integer<uint8_t>(bytes[offset]))
-               << 8) |
-              std::to_integer<uint8_t>(bytes[offset + 1]);
-      offset += 2;
+    const size_t remaining = bytes.size() - offset;
+    const size_t even_length = remaining & ~size_t{1};
+    if (even_length != 0) {
+      uint32_t folded = utils::CalculateSum(bytes.data() + offset, even_length);
+      folded = (folded >> 16) + (folded & 0xffff);
+      folded += folded >> 16;
+      sum_ += rte_be_to_cpu_16(static_cast<uint16_t>(folded));
+      offset += even_length;
     }
     if (offset < bytes.size()) {
       pending_byte_ = std::to_integer<uint8_t>(bytes[offset]);
@@ -609,7 +613,7 @@ std::expected<void, ChecksumError> ApplySoftwareChecksums(
   }
 
   if (needs_copy_on_write) {
-    const auto writable = EnsureWritable(packet);
+    const auto writable = detail::EnsureWritablePreservingTopology(packet);
     if (!writable) {
       if (writable.error() == ReshapeError::kAllocationFailed) {
         return std::unexpected(ChecksumError::kAllocationFailed);
