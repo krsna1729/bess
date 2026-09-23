@@ -361,6 +361,13 @@ TEST(PacketMutationTest, ExternalPayloadWriteabilityTracksShinfoReferences) {
   ExpectUnchanged(external, before);
 
   PacketFree(clone);
+  EXPECT_EQ(rte_mbuf_ext_refcnt_read(shared_shinfo), 1);
+  EXPECT_EQ(PayloadWriteabilityOf(PacketRef(external)),
+            PayloadWriteability::kWritable);
+  auto recovered_append = AppendInPlace(PacketRef(external), 8);
+  ASSERT_TRUE(recovered_append.has_value());
+  std::fill(recovered_append->begin(), recovered_append->end(),
+            static_cast<std::byte>(0xf6));
   PacketFree(external);
   EXPECT_EQ(shared_free_count, 1);
 }

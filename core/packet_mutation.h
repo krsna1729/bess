@@ -56,6 +56,11 @@ enum class PayloadWriteability : uint8_t {
   kShared,
 };
 
+// Ownership contract:
+// The caller exclusively owns the mbuf descriptor chain being mutated.
+// Payload storage itself may be shared; operations that expose writable
+// payload bytes additionally enforce PayloadWriteabilityOf().
+
 // Reports whether bytes addressed through one mbuf segment can be changed
 // without changing the payload observed by another live mbuf. Descriptor
 // metadata ownership is a separate concern: this predicate only covers the
