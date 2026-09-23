@@ -193,18 +193,20 @@ attribution pin the benchmark source/priority oracle, and K3.7.1 now validates
 wide default gates before narrowing in both migrated modules, removes the
 masked-backend result scratch from the packet stack, and records the candidate
 ID storage contract. K4.1 now adds the read-only packet-chain cursor described
-below; K4.1.1 hardens its 32-bit length boundary, typed-read fast path, and
-benchmark attribution; K4.2 and later mutation/ownership primitives remain
-future work. The active build graph is K4-K8 and G1; K1-K3 are closed. The
-build graph is Meson/Ninja only. GCC and Clang full Meson compiles succeed with
-pinned DPDK 25.11.3. The registered suite has 73 tests: 53 native C++ binaries,
-benchmark smoke tests (including the PMD null/ring smoke), the sample-plugin
-registry load, the Python target, and the module integration run. Full GCC and
-Clang Meson test runs pass all 73 targets. K3.4-K3.7's own targets (the
-typed-, masked-backend, extract-plan, and migration unit binaries, the
-WildcardMatch module test, `classifier_typed_bench`, `classifier_masked_bench`,
-and `modules_wildcard_match_bench`) pass under GCC and Clang, with the
-sanitizer coverage noted below.
+below; K4.1.1 hardened its 32-bit length boundary, typed-read fast path, and
+benchmark attribution; K4.2 now adds checked in-place mutation and
+payload-ownership primitives. K4.3+ topology/COW/linearization and K4.4
+checksum/TX-offload work remain future. The active build graph is K4-K8 and G1;
+K1-K3 are closed. The build graph is Meson/Ninja only. GCC and Clang full
+Meson compiles succeed with pinned DPDK 25.11.3. The registered suite has 74
+tests: 54 native C++ binaries, benchmark smoke tests (including the PMD
+null/ring smoke), the sample-plugin registry load, the Python target, and the
+module integration run.
+Full GCC and Clang Meson test runs pass all 74 targets. K3.4-K3.7's own
+targets (the typed-, masked-backend, extract-plan, and migration unit binaries,
+the WildcardMatch module test, `classifier_typed_bench`,
+`classifier_masked_bench`, and `modules_wildcard_match_bench`) pass under GCC
+and Clang, with the sanitizer coverage noted below.
 The classifier extract-plan and masked-backend tests pass under ASan+UBSan.
 The new `packet_cursor_test` is sanitizer-compiled but cannot execute here:
 DPDK EAL fails its VA/legacy-memory initialization under ASan with an IOVA
@@ -3132,6 +3134,28 @@ rather than one call site).
     compile, while cursor runtime remains blocked by the known DPDK EAL
     IOVA/DMA-mask allocation failure.
 
+72. **`3a6417f1`** — **K4.2 checked in-place mutation and payload ownership.**
+    Added `core/packet_mutation.h` with allocation-free, topology-preserving
+    `PrependInPlace`, `AppendInPlace`, `RemovePrefixInPlace`, and
+    `TrimSuffixInPlace` wrappers returning `std::expected`. The six explicit
+    errors distinguish null packets, `uint16_t`/`pkt_len` length rejection,
+    headroom, tailroom, cross-segment requests, and shared backing storage.
+    `PayloadWriteabilityOf` derives payload exclusivity from direct mbuf,
+    indirect backing, or external shinfo reference counts; header-only
+    removal and trimming remain valid on shared payloads.
+    The registered mutation target has eight tests covering direct,
+    indirect/clone, external, zero/max length, segment-boundary, failure
+    snapshot, returned-span, and null-packet behavior. Raw `PacketRef`
+    prepend/adj/append/trim methods remain documented native DPDK escape
+    hatches; checked wrappers are the generic module-facing boundary.
+    The packet benchmark compares raw and checked prepend/append/adj/trim
+    across linear and two-segment edge shapes, widths, and batches, and
+    isolates the writeability helper across direct, indirect, and external
+    storage.
+    Verification: GCC and Clang full Meson suites pass 74/74; the filtered GCC
+    benchmark smoke completes all K4.2 registrations. These measurements are
+    environment-specific smoke data, not a performance verdict.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -5362,6 +5386,68 @@ three-repetition GCC run, representative batch-1 means were `0.71 ns` for
 construction, `7.37 ns` for a pre-positioned width-4 read, `15.1 ns` for four
 sequential fields, and `1.37/6.81 ns` for direct/cursor one-shot width-4 reads.
 These are environment-specific smoke measurements, not a performance verdict.
+
+#### K4.2 — checked in-place mutation and payload ownership
+
+K4.2 adds `core/packet_mutation.h` as the checked generic boundary:
+
+```text
+MutationError
+MutableBytes = std::span<std::byte>
+PayloadWriteabilityOf(PacketRef)
+PrependInPlace(PacketRef, size_t)
+AppendInPlace(PacketRef, size_t)
+RemovePrefixInPlace(PacketRef, size_t)
+TrimSuffixInPlace(PacketRef, size_t)
+```
+
+The four operations are strictly in-place. They never allocate, create or
+destroy a segment, linearize, copy-on-write, or replace the packet head.
+Prepend and append return a writable span over exactly the newly exposed bytes;
+remove-prefix and trim-suffix return `std::expected<void, MutationError>`.
+Every operation rejects lengths that do not fit the native `uint16_t` DPDK
+operation width. Prepend and append also reject `uint32_t pkt_len` overflow.
+Zero-length operations succeed without mutation for a non-null packet.
+
+`MutationError` makes the failure contract explicit:
+
+```text
+kNullPacket
+kLengthOutOfRange
+kInsufficientHeadroom
+kInsufficientTailroom
+kCrossesSegment
+kSharedStorage
+```
+
+`PayloadWriteabilityOf` reports writable payload only when the referenced
+storage is exclusive: a direct mbuf requires direct refcnt `1`, an indirect
+mbuf requires its backing direct mbuf refcnt `1`, and external storage requires
+external shinfo refcnt `1`. Prepend and append require that result before
+returning mutable bytes. Header-only remove-prefix and trim-suffix do not
+require payload exclusivity, but they reject requests that cross a segment.
+The native `PacketRef` methods remain raw DPDK escape hatches with caller-owned
+preconditions; callers needing the generic checked contract use
+`packet_mutation.h`.
+
+The eight registered mutation tests cover unique direct spans, shared direct
+and indirect clones, backing-release writeability, unique and shared external
+buffers, null/zero/max/overflow lengths, exact headroom/tailroom, segment
+boundaries, topology/head identity, failure snapshots, and sibling isolation
+of returned-span writes. GCC and Clang full Meson suites both pass 74/74.
+The benchmark matrix compares raw and checked prepend/append/adj/trim paths
+over the requested widths, linear/two-segment edge shapes, and batches
+`1/8/32`; a separate matrix isolates `PayloadWriteabilityOf` for direct,
+indirect, and external storage. A filtered GCC run reported representative
+batch-1 linear raw/checked means of `132/132 ns` for prepend width 14,
+`134/139 ns` for append width 32, `146/146 ns` for remove-prefix width 14,
+and `129/129 ns` for trim-suffix width 20. The writeability helper reported
+`0.52 ns` direct-unique, `0.67 ns` indirect-shared, `0.56 ns` external-unique,
+and `0.56 ns` external-shared means in that run. These are
+environment-specific smoke measurements, not a performance verdict.
+
+K4.3 remains the future topology/COW/linearization layer; K4.4 remains the
+future checksum and TX-offload semantic layer.
 
 ---
 
