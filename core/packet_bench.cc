@@ -42,7 +42,13 @@
 #include <benchmark/benchmark.h>
 #include <glog/logging.h>
 
+#include <array>
+#include <cstddef>
+#include <cstring>
+#include <span>
+
 #include "packet.h"
+#include "packet_cursor.h"
 #include "packet_pool.h"
 #include "pktbatch.h"
 
@@ -166,6 +172,168 @@ void BM_BatchForward(benchmark::State &state) {
 }
 BENCHMARK(BM_BatchForward);
 
+// Build the chain shapes used by the cursor benchmark. Shape 0 is contiguous;
+// shapes 1 and 2 are a two-segment packet with a read before or at the
+// boundary; shape 3 crosses two boundaries.
+bess::PacketHandle BuildCursorBenchmarkChain(bess::PlainPacketPool &pool,
+                                             size_t shape) {
+  const std::array<std::array<size_t, 4>, 4> lengths = {{
+      {128, 0, 0, 0},
+      {64, 64, 0, 0},
+      {64, 64, 0, 0},
+      {16, 16, 16, 80},
+  }};
+  const std::array<size_t, 4> counts = {1, 2, 2, 4};
+  CHECK_LT(shape, lengths.size());
+
+  bess::PacketHandle head = nullptr;
+  bess::PacketHandle previous = nullptr;
+  size_t total_len = 0;
+  for (size_t i = 0; i < counts[shape]; i++) {
+    const size_t length = lengths[shape][i];
+    bess::PacketHandle segment = pool.Alloc(length);
+    CHECK(segment != nullptr);
+    if (head == nullptr) {
+      head = segment;
+    } else {
+      previous->next = segment;
+    }
+    previous = segment;
+    std::memset(bess::PacketRef(segment).head_data(), 0, length);
+    total_len += length;
+  }
+  head->pkt_len = static_cast<uint32_t>(total_len);
+  head->nb_segs = static_cast<uint16_t>(counts[shape]);
+  return head;
+}
+
+template <size_t Width>
+void ReadCursorWidth(bess::packet::PacketCursor &cursor) {
+  if constexpr (Width == 1) {
+    benchmark::DoNotOptimize(cursor.Read<uint8_t>());
+  } else if constexpr (Width == 2) {
+    benchmark::DoNotOptimize(cursor.Read<uint16_t>());
+  } else if constexpr (Width == 4) {
+    benchmark::DoNotOptimize(cursor.Read<uint32_t>());
+  } else if constexpr (Width == 8) {
+    benchmark::DoNotOptimize(cursor.Read<uint64_t>());
+  } else {
+    using Bytes = std::array<std::byte, Width>;
+    benchmark::DoNotOptimize(cursor.Read<Bytes>());
+  }
+}
+
+void ReadCursorWidth(bess::packet::PacketCursor &cursor, size_t width) {
+  switch (width) {
+    case 1:
+      ReadCursorWidth<1>(cursor);
+      break;
+    case 2:
+      ReadCursorWidth<2>(cursor);
+      break;
+    case 4:
+      ReadCursorWidth<4>(cursor);
+      break;
+    case 8:
+      ReadCursorWidth<8>(cursor);
+      break;
+    case 16:
+      ReadCursorWidth<16>(cursor);
+      break;
+    case 32:
+      ReadCursorWidth<32>(cursor);
+      break;
+    default:
+      CHECK(false) << "unsupported cursor benchmark width: " << width;
+  }
+}
+
+void BM_PacketCursorChainRead(benchmark::State &state) {
+  bess::PlainPacketPool &pool = GetPool();
+  const size_t width = static_cast<size_t>(state.range(0));
+  const size_t shape = static_cast<size_t>(state.range(1));
+  const size_t batch = static_cast<size_t>(state.range(2));
+  const size_t offset = shape == 2 ? 64 : 14;
+  constexpr size_t kMaxBatch = 32;
+  std::array<bess::PacketHandle, kMaxBatch> pkts{};
+
+  for (size_t i = 0; i < batch; i++) {
+    pkts[i] = BuildCursorBenchmarkChain(pool, shape);
+  }
+
+  for (auto _ : state) {
+    for (size_t i = 0; i < batch; i++) {
+      bess::packet::PacketCursor cursor{bess::PacketRef(pkts[i])};
+      benchmark::DoNotOptimize(cursor.Skip(offset));
+      ReadCursorWidth(cursor, width);
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetBytesProcessed(state.iterations() * batch * width);
+  size_t transitions = 0;
+  if (shape == 2) {
+    transitions = 1;
+  } else if (shape == 3) {
+    transitions = (offset + width - 1) / 16 - offset / 16;
+  }
+  state.counters["bytes_copied/read"] = static_cast<double>(width);
+  state.counters["segment_transitions/read"] =
+      static_cast<double>(transitions);
+
+  bess::PacketFreeBulk(pkts.data(), batch);
+}
+
+BENCHMARK(BM_PacketCursorChainRead)
+    ->ArgsProduct({{1, 4, 8, 16, 32}, {0, 1, 2, 3}, {1, 8, 32}})
+    ->ArgNames({"width", "shape", "batch"});
+
+template <bool UseCursor>
+void BM_PacketRead(benchmark::State &state) {
+  bess::PlainPacketPool &pool = GetPool();
+  const size_t width = static_cast<size_t>(state.range(0));
+  const size_t offset = static_cast<size_t>(state.range(1));
+  const size_t batch = static_cast<size_t>(state.range(2));
+  constexpr size_t kMaxBatch = 32;
+  std::array<bess::PacketHandle, kMaxBatch> pkts{};
+  CHECK(pool.AllocBulk(pkts.data(), batch, 128));
+  std::array<std::byte, 32> out{};
+
+  for (auto _ : state) {
+    for (size_t i = 0; i < batch; i++) {
+      bess::PacketRef packet(pkts[i]);
+      if constexpr (UseCursor) {
+        bess::packet::PacketCursor cursor{packet};
+        benchmark::DoNotOptimize(cursor.Skip(offset));
+        ReadCursorWidth(cursor, width);
+      } else {
+        std::memcpy(out.data(),
+                    packet.head_data<const std::byte *>() + offset, width);
+      }
+      benchmark::DoNotOptimize(out);
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetBytesProcessed(state.iterations() * batch * width);
+  state.counters["bytes_copied/read"] = static_cast<double>(width);
+  state.counters["segment_transitions/read"] = 0;
+
+  bess::PacketFreeBulk(pkts.data(), batch);
+}
+
+void BM_PacketDirectRead(benchmark::State &state) {
+  BM_PacketRead<false>(state);
+}
+
+void BM_PacketCursorRead(benchmark::State &state) {
+  BM_PacketRead<true>(state);
+}
+
+BENCHMARK(BM_PacketDirectRead)
+    ->ArgsProduct({{1, 2, 4, 8, 16, 32}, {0, 14, 34, 64}, {1, 8, 32}})
+    ->ArgNames({"width", "offset", "batch"});
+BENCHMARK(BM_PacketCursorRead)
+    ->ArgsProduct({{1, 2, 4, 8, 16, 32}, {0, 14, 34, 64}, {1, 8, 32}})
+    ->ArgNames({"width", "offset", "batch"});
 
 }  // namespace
 

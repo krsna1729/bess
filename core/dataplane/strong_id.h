@@ -46,9 +46,9 @@ namespace dataplane {
 // type is deliberately zero-overhead -- a single `Rep` member with defaulted
 // special members, so it is trivially copyable, standard layout where the
 // representation allows it, and the same size as `Rep`.
-//
-// The zero value is reserved by convention as "invalid" (see `ActionId`): the
-// table treats it as "no object" rather than assigning it meaning of its own.
+// `StrongId` itself does not assign validity semantics to any representation
+// value. Individual ID domains may reserve a value: `ActionId` reserves zero,
+// while an index-like domain may use zero as its first valid object.
 //
 // `Tag` is an incomplete type used only to make each id its own type; it never
 // needs a definition.

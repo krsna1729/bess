@@ -65,6 +65,8 @@ struct RuntimeMaskedRule {
   Result result{};
 };
 
+// Zero is a valid value here: the ID is a direct index into the immutable
+// candidate vector, unlike `ActionId`, whose domain reserves zero.
 struct MaskedCandidateTag;
 using MaskedCandidateId =
     dataplane::StrongId<MaskedCandidateTag, uint32_t>;
