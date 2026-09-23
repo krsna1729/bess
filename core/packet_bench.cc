@@ -729,6 +729,227 @@ BENCHMARK(BM_EnsureWritableSharedCow)
     ->ArgsProduct({{64, 256, 1500, 4096}})
     ->ArgNames({"bytes"});
 
+enum class EnsureLinearBenchmarkPath : uint8_t {
+  kAlreadyLinear,
+  kNativeTwoSegment,
+  kNativeFourSegment,
+  kReplacementTwoSegment,
+  kReplacementFourSegment,
+};
+
+bess::PacketHandle BuildFixedReshapeChain(bess::PlainPacketPool &pool,
+                                          size_t segments) {
+  constexpr size_t kSegmentLength = 64;
+  bess::PacketHandle head = nullptr;
+  bess::PacketHandle previous = nullptr;
+  for (size_t i = 0; i < segments; i++) {
+    bess::PacketHandle segment = pool.Alloc(kSegmentLength);
+    CHECK(segment != nullptr);
+    std::memset(bess::PacketRef(segment).head_data(), 0, kSegmentLength);
+    if (head == nullptr) {
+      head = segment;
+    } else {
+      previous->next = segment;
+    }
+    previous = segment;
+  }
+  CHECK(head != nullptr);
+  head->pkt_len = static_cast<uint32_t>(segments * kSegmentLength);
+  head->nb_segs = static_cast<uint16_t>(segments);
+  return head;
+}
+
+void RunEnsureLinearBenchmark(benchmark::State &state,
+                              EnsureLinearBenchmarkPath path) {
+  bess::PlainPacketPool &pool = GetPool();
+  const bool already_linear = path == EnsureLinearBenchmarkPath::kAlreadyLinear;
+  const bool native = path == EnsureLinearBenchmarkPath::kNativeTwoSegment ||
+                      path == EnsureLinearBenchmarkPath::kNativeFourSegment;
+  const size_t segments =
+      path == EnsureLinearBenchmarkPath::kNativeFourSegment ||
+              path == EnsureLinearBenchmarkPath::kReplacementFourSegment
+          ? 4
+          : 2;
+  const size_t bytes = already_linear ? 64 : segments * 64;
+
+  bess::PacketHandle packet = nullptr;
+  bess::PacketHandle sibling = nullptr;
+  if (already_linear) {
+    packet = pool.Alloc(bytes);
+    CHECK(packet != nullptr);
+    std::memset(bess::PacketRef(packet).head_data(), 0, bytes);
+  } else if (native) {
+    packet = BuildFixedReshapeChain(pool, segments);
+  } else {
+    sibling = BuildFixedReshapeChain(pool, segments);
+    packet = bess::PacketClone(sibling);
+    CHECK(packet != nullptr);
+  }
+
+  for (auto _ : state) {
+    auto result = bess::packet::EnsureLinear(packet);
+    CHECK(result.has_value());
+    benchmark::DoNotOptimize(result);
+    benchmark::DoNotOptimize(packet);
+
+    if (native) {
+      state.PauseTiming();
+      bess::PacketFree(packet);
+      packet = BuildFixedReshapeChain(pool, segments);
+      state.ResumeTiming();
+    } else if (!already_linear) {
+      state.PauseTiming();
+      bess::PacketFree(packet);
+      packet = bess::PacketClone(sibling);
+      CHECK(packet != nullptr);
+      state.ResumeTiming();
+    }
+  }
+
+  state.SetItemsProcessed(state.iterations());
+  state.counters["allocations"] = native || already_linear ? 0 : 1;
+  state.counters["bytes_copied"] =
+      already_linear
+          ? 0
+          : static_cast<double>(native ? (segments - 1) * 64 : segments * 64);
+  state.counters["segments_freed"] =
+      already_linear ? 0
+                     : static_cast<double>(native ? segments - 1 : segments);
+  state.counters["head_replacements"] = native || already_linear ? 0 : 1;
+
+  bess::PacketFree(packet);
+  if (sibling != nullptr) {
+    bess::PacketFree(sibling);
+  }
+}
+
+void BM_EnsureLinearAlreadyLinear(benchmark::State &state) {
+  RunEnsureLinearBenchmark(state, EnsureLinearBenchmarkPath::kAlreadyLinear);
+}
+
+void BM_EnsureLinearNativeTwoSegment(benchmark::State &state) {
+  RunEnsureLinearBenchmark(state, EnsureLinearBenchmarkPath::kNativeTwoSegment);
+}
+
+void BM_EnsureLinearNativeFourSegment(benchmark::State &state) {
+  RunEnsureLinearBenchmark(state,
+                           EnsureLinearBenchmarkPath::kNativeFourSegment);
+}
+
+void BM_EnsureLinearReplacementTwoSegment(benchmark::State &state) {
+  RunEnsureLinearBenchmark(state,
+                           EnsureLinearBenchmarkPath::kReplacementTwoSegment);
+}
+
+void BM_EnsureLinearReplacementFourSegment(benchmark::State &state) {
+  RunEnsureLinearBenchmark(state,
+                           EnsureLinearBenchmarkPath::kReplacementFourSegment);
+}
+
+BENCHMARK(BM_EnsureLinearAlreadyLinear);
+BENCHMARK(BM_EnsureLinearNativeTwoSegment);
+BENCHMARK(BM_EnsureLinearNativeFourSegment);
+BENCHMARK(BM_EnsureLinearReplacementTwoSegment);
+BENCHMARK(BM_EnsureLinearReplacementFourSegment);
+
+enum class EnsureContiguousBenchmarkPath : uint8_t {
+  kSameSegmentWritable,
+  kSameSegmentShared,
+  kCrossesTwoSegments,
+  kCrossesFourSegments,
+};
+
+void RunEnsureContiguousBenchmark(benchmark::State &state,
+                                  EnsureContiguousBenchmarkPath path) {
+  bess::PlainPacketPool &pool = GetPool();
+  const bool shared = path == EnsureContiguousBenchmarkPath::kSameSegmentShared;
+  const bool same_segment =
+      path == EnsureContiguousBenchmarkPath::kSameSegmentWritable || shared;
+  const size_t segments =
+      path == EnsureContiguousBenchmarkPath::kCrossesFourSegments ? 4 : 2;
+  const size_t total_bytes = same_segment ? 128 : segments * 64;
+  const size_t offset = same_segment ? 16 : 16;
+  const size_t bytes = same_segment ? 32 : total_bytes - 32;
+
+  bess::PacketHandle packet = nullptr;
+  bess::PacketHandle sibling = nullptr;
+  if (shared) {
+    sibling = pool.Alloc(total_bytes);
+    CHECK(sibling != nullptr);
+    std::memset(bess::PacketRef(sibling).head_data(), 0, total_bytes);
+    packet = bess::PacketClone(sibling);
+    CHECK(packet != nullptr);
+  } else if (same_segment) {
+    packet = pool.Alloc(total_bytes);
+    CHECK(packet != nullptr);
+    std::memset(bess::PacketRef(packet).head_data(), 0, total_bytes);
+  } else {
+    packet = BuildFixedReshapeChain(pool, segments);
+  }
+
+  for (auto _ : state) {
+    auto result = bess::packet::EnsureContiguous(packet, offset, bytes);
+    CHECK(result.has_value());
+    benchmark::DoNotOptimize(result);
+    benchmark::DoNotOptimize(packet);
+
+    if (shared) {
+      state.PauseTiming();
+      bess::PacketFree(packet);
+      packet = bess::PacketClone(sibling);
+      CHECK(packet != nullptr);
+      state.ResumeTiming();
+    } else if (!same_segment) {
+      state.PauseTiming();
+      bess::PacketFree(packet);
+      packet = BuildFixedReshapeChain(pool, segments);
+      state.ResumeTiming();
+    }
+  }
+
+  state.SetItemsProcessed(state.iterations());
+  state.counters["allocations"] = shared ? 1 : 0;
+  state.counters["bytes_copied"] = shared ? static_cast<double>(total_bytes)
+                                   : same_segment
+                                       ? 0
+                                       : static_cast<double>(total_bytes - 64);
+  state.counters["segments_freed"] = shared ? 1
+                                     : same_segment
+                                         ? 0
+                                         : static_cast<double>(segments - 1);
+  state.counters["head_replacements"] = shared ? 1 : 0;
+
+  bess::PacketFree(packet);
+  if (sibling != nullptr) {
+    bess::PacketFree(sibling);
+  }
+}
+
+void BM_EnsureContiguousSameSegmentWritable(benchmark::State &state) {
+  RunEnsureContiguousBenchmark(
+      state, EnsureContiguousBenchmarkPath::kSameSegmentWritable);
+}
+
+void BM_EnsureContiguousSameSegmentShared(benchmark::State &state) {
+  RunEnsureContiguousBenchmark(
+      state, EnsureContiguousBenchmarkPath::kSameSegmentShared);
+}
+
+void BM_EnsureContiguousCrossesTwoSegments(benchmark::State &state) {
+  RunEnsureContiguousBenchmark(
+      state, EnsureContiguousBenchmarkPath::kCrossesTwoSegments);
+}
+
+void BM_EnsureContiguousCrossesFourSegments(benchmark::State &state) {
+  RunEnsureContiguousBenchmark(
+      state, EnsureContiguousBenchmarkPath::kCrossesFourSegments);
+}
+
+BENCHMARK(BM_EnsureContiguousSameSegmentWritable);
+BENCHMARK(BM_EnsureContiguousSameSegmentShared);
+BENCHMARK(BM_EnsureContiguousCrossesTwoSegments);
+BENCHMARK(BM_EnsureContiguousCrossesFourSegments);
+
 void BM_PacketCursorChainRead(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();
   const size_t width = static_cast<size_t>(state.range(0));

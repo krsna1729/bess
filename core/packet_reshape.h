@@ -30,10 +30,11 @@
 #ifndef BESS_PACKET_RESHAPE_H_
 #define BESS_PACKET_RESHAPE_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 
-#include "packet.h"
+#include "packet_mutation.h"
 
 namespace bess::packet {
 
@@ -50,6 +51,17 @@ enum class ReshapeError : uint8_t {
 // descriptor chain referenced by packet; packet may be replaced on success.
 std::expected<void, ReshapeError> EnsureWritable(
     ::bess::PacketHandle &packet) noexcept;
+
+// Ensures that packet has one segment. The caller must exclusively own the
+// descriptor chain; payload backing may remain shared when packet is already
+// linear.
+std::expected<void, ReshapeError> EnsureLinear(
+    ::bess::PacketHandle &packet) noexcept;
+
+// Ensures that [offset, offset + bytes) is contiguous and writable. A zero
+// length range is valid at any offset through pkt_len and never changes packet.
+std::expected<MutableBytes, ReshapeError> EnsureContiguous(
+    ::bess::PacketHandle &packet, size_t offset, size_t bytes) noexcept;
 
 }  // namespace bess::packet
 
