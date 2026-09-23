@@ -45,6 +45,7 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <optional>
 #include <span>
 
 #include "packet.h"
@@ -247,6 +248,99 @@ void ReadCursorWidth(bess::packet::PacketCursor &cursor, size_t width) {
       CHECK(false) << "unsupported cursor benchmark width: " << width;
   }
 }
+
+void BM_PacketCursorConstruct(benchmark::State &state) {
+  bess::PlainPacketPool &pool = GetPool();
+  const size_t batch = static_cast<size_t>(state.range(0));
+  constexpr size_t kMaxBatch = 32;
+  std::array<bess::PacketHandle, kMaxBatch> pkts{};
+  CHECK(pool.AllocBulk(pkts.data(), batch, 128));
+
+  for (auto _ : state) {
+    for (size_t i = 0; i < batch; i++) {
+      bess::packet::PacketCursor cursor{bess::PacketRef(pkts[i])};
+      benchmark::DoNotOptimize(cursor);
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * batch);
+  state.counters["cursor_constructs/read"] = 1;
+  state.counters["bytes_copied/read"] = 0;
+
+  bess::PacketFreeBulk(pkts.data(), batch);
+}
+
+void BM_PacketCursorPositionedRead(benchmark::State &state) {
+  bess::PlainPacketPool &pool = GetPool();
+  const size_t width = static_cast<size_t>(state.range(0));
+  const size_t offset = static_cast<size_t>(state.range(1));
+  const size_t batch = static_cast<size_t>(state.range(2));
+  constexpr size_t kMaxBatch = 32;
+  std::array<bess::PacketHandle, kMaxBatch> pkts{};
+  std::array<std::optional<bess::packet::PacketCursor>, kMaxBatch> cursors{};
+  CHECK(pool.AllocBulk(pkts.data(), batch, 128));
+  for (size_t i = 0; i < batch; i++) {
+    cursors[i].emplace(bess::PacketRef(pkts[i]));
+    CHECK(cursors[i]->Skip(offset));
+  }
+
+  for (auto _ : state) {
+    for (size_t i = 0; i < batch; i++) {
+      bess::packet::PacketCursor cursor = *cursors[i];
+      ReadCursorWidth(cursor, width);
+      benchmark::DoNotOptimize(cursor);
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetBytesProcessed(state.iterations() * batch * width);
+  state.counters["cursor_copies/read"] = 1;
+  state.counters["bytes_copied/read"] = static_cast<double>(width);
+  state.counters["segment_transitions/read"] = 0;
+
+  bess::PacketFreeBulk(pkts.data(), batch);
+}
+
+void ReadSequentialFields(bess::packet::PacketCursor &cursor) {
+  benchmark::DoNotOptimize(cursor.Read<uint8_t>());
+  benchmark::DoNotOptimize(cursor.Read<uint16_t>());
+  benchmark::DoNotOptimize(cursor.Read<uint32_t>());
+  benchmark::DoNotOptimize(cursor.Read<uint64_t>());
+}
+
+void BM_PacketCursorSequentialRead(benchmark::State &state) {
+  bess::PlainPacketPool &pool = GetPool();
+  const size_t batch = static_cast<size_t>(state.range(0));
+  constexpr size_t kMaxBatch = 32;
+  constexpr size_t kBytesPerRead = sizeof(uint8_t) + sizeof(uint16_t) +
+                                   sizeof(uint32_t) + sizeof(uint64_t);
+  std::array<bess::PacketHandle, kMaxBatch> pkts{};
+  CHECK(pool.AllocBulk(pkts.data(), batch, 32));
+
+  for (auto _ : state) {
+    for (size_t i = 0; i < batch; i++) {
+      bess::packet::PacketCursor cursor{bess::PacketRef(pkts[i])};
+      ReadSequentialFields(cursor);
+      benchmark::DoNotOptimize(cursor);
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * batch * 4);
+  state.SetBytesProcessed(state.iterations() * batch * kBytesPerRead);
+  state.counters["fields/read"] = 4;
+  state.counters["bytes_copied/read"] =
+      static_cast<double>(kBytesPerRead);
+  state.counters["segment_transitions/read"] = 0;
+
+  bess::PacketFreeBulk(pkts.data(), batch);
+}
+
+BENCHMARK(BM_PacketCursorConstruct)
+    ->ArgsProduct({{1, 8, 32}})
+    ->ArgNames({"batch"});
+BENCHMARK(BM_PacketCursorPositionedRead)
+    ->ArgsProduct({{1, 2, 4, 8, 16, 32}, {0, 14, 34, 64}, {1, 8, 32}})
+    ->ArgNames({"width", "offset", "batch"});
+BENCHMARK(BM_PacketCursorSequentialRead)
+    ->ArgsProduct({{1, 8, 32}})
+    ->ArgNames({"batch"});
 
 void BM_PacketCursorChainRead(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();

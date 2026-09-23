@@ -100,7 +100,7 @@ class DRR final : public Module {
   // stores the metrics of the flow, a timer and the queue to store the packets
   // in.
   struct Flow {
-    int deficit;                   // the allocated bytes to the flow
+    uint32_t deficit;                // the allocated bytes to the flow
     double timer;                  // to determine if TTL should be used
     FlowId id;                     // allows the flow to remove itself from the map
     struct rte_ring *queue;        // queue to store current packets for flow

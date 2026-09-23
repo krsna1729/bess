@@ -91,6 +91,8 @@ class PacketCursor {
     return std::span<const std::byte>(data, bytes);
   }
 
+  // If the physical chain ends before the logical length, failure rolls back
+  // the cursor but not destination bytes already copied.
   [[nodiscard]] bool ReadBytes(std::span<std::byte> out) noexcept {
     if (out.size() > remaining_) {
       return false;
@@ -111,9 +113,7 @@ class PacketCursor {
     if (auto contiguous = PeekContiguous(sizeof(T));
         contiguous.size() == sizeof(T)) {
       std::memcpy(raw.data(), contiguous.data(), sizeof(T));
-      if (!Skip(sizeof(T))) {
-        return std::nullopt;
-      }
+      AdvanceContiguousUnchecked(sizeof(T));
     } else if (!ReadBytes(raw)) {
       return std::nullopt;
     }
@@ -127,6 +127,13 @@ class PacketCursor {
       segment_ = segment_.next();
       segment_offset_ = 0;
     }
+  }
+
+  void AdvanceContiguousUnchecked(size_t bytes) noexcept {
+    segment_offset_ += bytes;
+    packet_offset_ += bytes;
+    remaining_ -= bytes;
+    Normalize();
   }
 
   [[nodiscard]] bool SkipUnchecked(size_t bytes) noexcept {

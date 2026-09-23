@@ -229,7 +229,7 @@ void Pcapng::ProcessBatch(const bess::PacketBatch *batch) {
     struct iovec vec[8] = {
         {&epb, sizeof(epb)},
         {pkt.head_data(), static_cast<size_t>(pkt.head_len())},
-        {&padding, static_cast<size_t>(PadSize(pkt.head_len(), 4))},
+        {&padding, static_cast<size_t>(PadSize<uint32_t>(pkt.head_len(), 4))},
 
         {&opt_comment, sizeof(opt_comment)},
         {attr_template_.data(), comment_size},

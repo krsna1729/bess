@@ -112,9 +112,9 @@ class PacketRef {
   uint16_t data_len() const { return pkt_->data_len; }
   void set_data_len(uint16_t len) { pkt_->data_len = len; }
 
-  int head_len() const { return pkt_->data_len; }
+  uint16_t head_len() const noexcept { return pkt_->data_len; }
 
-  int total_len() const { return pkt_->pkt_len; }
+  uint32_t total_len() const noexcept { return pkt_->pkt_len; }
   void set_total_len(uint32_t len) { pkt_->pkt_len = len; }
 
   uint16_t headroom() const { return rte_pktmbuf_headroom(pkt_); }

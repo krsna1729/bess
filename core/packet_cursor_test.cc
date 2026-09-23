@@ -236,12 +236,14 @@ TEST(PacketCursorTest, FailedReadsAndSkipsAreTransactional) {
   PacketHandle malformed = BuildChain(malformed_pool, short_lengths,
                                       std::span<const std::byte>(bytes).first(4));
   ASSERT_NE(malformed, nullptr);
-  malformed->pkt_len = 8;
+  malformed->pkt_len = UINT32_C(0x80000001);
   PacketCursor malformed_cursor{PacketRef(malformed)};
   std::array<std::byte, 8> malformed_output{};
+  // Cursor rollback does not promise rollback of destination bytes.
   EXPECT_FALSE(malformed_cursor.ReadBytes(malformed_output));
   EXPECT_EQ(malformed_cursor.offset(), 0u);
-  EXPECT_EQ(malformed_cursor.remaining(), 8u);
+  EXPECT_EQ(malformed_cursor.remaining(),
+            size_t{UINT32_C(0x80000001)});
   PacketFree(malformed);
 }
 
