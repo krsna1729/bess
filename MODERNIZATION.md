@@ -196,8 +196,10 @@ ID storage contract. K4.1 now adds the read-only packet-chain cursor described
 below; K4.1.1 hardened its 32-bit length boundary, typed-read fast path, and
 benchmark attribution; K4.2/K4.2.1 now add checked in-place mutation,
 payload-ownership, and descriptor-ownership primitives. K4.3a adds
-transactional packet writability and full-packet COW; K4.3b now adds
-topology reshape/linearization. K4.4 checksum/TX-offload work remains future.
+transactional packet writability and full-packet COW; K4.3b adds topology
+reshape/linearization, with K4.3b.1 preserving transactionality across
+`EnsureContiguous`. Next: cross-segment prefix/suffix removal, then K4.4
+checksums/TX offloads and the K4.5 batch-execution experiment.
 The active build K1-K3 are closed. The build graph is Meson/Ninja only. GCC and
 Clang full Meson compiles succeed with pinned DPDK 25.11.3. The registered
 suite has 75 tests: 55 native C++ binaries, benchmark smoke tests (including
@@ -3195,6 +3197,24 @@ rather than one call site).
     flags. GCC and Clang focused reshape targets pass 22 tests; the full Meson
     suites pass 75/75. The benchmark reports allocation, copied-byte,
     freed-segment, and head-replacement attribution for all K4.3b paths.
+76. **`8240aab3`** — **K4.3b.1 transactional contiguous slow path.**
+    `EnsureContiguous` now calls `EnsureWritable` only for a single-segment
+    source and goes directly through `EnsureLinear` for multisegment packets,
+    preserving the original shared chain on capacity/allocation errors. Added
+    regressions for both atomic error paths, native linearization with a
+    writable head/shared tail, and shared linear COW. Added
+    `BM_EnsureContiguousCrossesTwoSegmentsSharedTail` with allocation, copied-
+    byte, freed-segment, and head-replacement attribution. The shared-segment
+    jumbo limitation and follow-on milestone order are recorded in the section
+    above.
+    GCC and Clang focused reshape targets pass 24 tests each; the full Meson
+    suites pass 75/75 under both compilers. Meson compiles used `-j8`; test
+    runs used `--no-rebuild --num-processes 8`. The DPDK-linked shared-tail
+    smoke, run through `omarchy-benchmark`, reported `150 ns`,
+    `allocations=0`, `bytes_copied=64`, `segments_freed=1`, and
+    `head_replacements=0`. CPU2 diagnostics observed 126 `iwlwifi:queue_2`
+    IRQs and 126 `NET_RX` softirqs, plus timer/scheduler/RCU activity; this is
+    smoke data only, not a performance result.
 
 ## Review process established this session
 
@@ -5570,28 +5590,53 @@ original chain untouched.
 returns `std::expected<MutableBytes, ReshapeError>`. It validates ranges with
 subtraction-style bounds checks. A zero-length range at any offset through
 `pkt_len` returns an empty span without COW or topology changes. A non-empty
-range wholly inside one writable segment borrows that segment directly;
-shared or cross-segment ranges use `EnsureWritable` followed by `EnsureLinear`
-and return a span into the resulting linear packet. Partial or segment-local
-COW remains outside K4.3b.
+range wholly inside one writable segment borrows that segment directly. The
+slow path calls `EnsureWritable` only for a single-segment packet; a
+multisegment packet goes directly through `EnsureLinear`, avoiding a
+preliminary whole-packet COW and preserving the original packet on linear
+capacity/allocation failure. Partial or segment-local COW remains outside
+K4.3b.
 
 The reshape target now covers the null and malformed contracts, shared
 already-linear no-op, native two-segment linearization, writable-head/shared-
 tail reads, zero-length shared heads, replacement capacity and allocation
 failures, metadata/private-state preservation, same-segment writable and COW
 ranges, cross-segment two- and four-segment ranges, byte boundaries, and
-zero-length boundaries. The benchmark adds already-linear, native 2/4-segment,
-replacement 2/4-segment, same-segment writable/shared, and cross 2/4-segment
-paths with `allocations`, `bytes_copied`, `segments_freed`, and
-`head_replacements` counters.
+replacement 2/4-segment, same-segment writable/shared, cross 2/4-segment, and
+writable-head/shared-tail native paths with `allocations`, `bytes_copied`,
+`segments_freed`, and `head_replacements` counters.
 
 In DPDK 25.11.3, `rte_pktmbuf_linearize` is an exact no-op for an already
 contiguous packet. Its multisegment implementation checks required tailroom
 before mutating the first mbuf, then copies and frees segments without a
 fallible return path. BESS still preflights chain topology, physical bounds,
 head writeability, and one-mbuf capacity; replacement-copy semantics are the
-safe fallback when native preconditions do not hold. K4.4 remains the future
-checksum and TX-offload semantic layer.
+safe fallback when native preconditions do not hold.
+
+#### K4.3b.1 — transactional contiguous slow path
+
+For a non-empty multisegment range, `EnsureContiguous` now calls
+`EnsureLinear` directly. A capacity or replacement-allocation error therefore
+leaves the caller's handle, descriptor topology, payload references, metadata,
+bytes, and pool availability unchanged. Native linearization can also consume
+a writable head and read-only shared tail without allocating or first copying
+the complete packet. A single-segment shared range still uses only
+`EnsureWritable`.
+
+One performance limitation remains deliberate: a requested range wholly
+inside a shared segment of a multisegment jumbo packet may be writable through
+segment-local COW even when the complete packet cannot fit in one mbuf.
+`EnsureContiguous` currently requires whole-packet linearization in that case
+and returns `kInsufficientContiguousCapacity`. Add partial COW only if
+benchmarks justify the added topology machinery.
+
+The next packet milestones are ordered: cross-segment prefix/suffix removal,
+then K4.4 checksum and TX-offload primitives, then K4.5 batch-execution
+experiments against handwritten loops. K4.5 remains performance-gated; no
+automatic loop migration or prefetch policy is adopted without measured
+benefit.
+
+K4.4 remains the future checksum and TX-offload semantic layer.
 
 ---
 
