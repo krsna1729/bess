@@ -53,6 +53,11 @@ std::expected<bool, ReshapeError> ChainPayloadWritable(
     if (segment == nullptr) {
       return std::unexpected(ReshapeError::kMalformedChain);
     }
+    if (segment->pool == nullptr ||
+        segment->data_off > segment->buf_len ||
+        segment->data_len > segment->buf_len - segment->data_off) {
+      return std::unexpected(ReshapeError::kMalformedChain);
+    }
     logical_length += segment->data_len;
     if (logical_length > std::numeric_limits<uint32_t>::max()) {
       return std::unexpected(ReshapeError::kMalformedChain);

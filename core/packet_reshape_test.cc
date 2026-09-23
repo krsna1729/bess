@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -483,34 +484,191 @@ TEST(PacketReshapeTest, AllocationFailurePreservesOriginalPacketAtomically) {
   PacketFree(source);
 }
 
-TEST(PacketReshapeTest, MalformedChainFailsWithoutMutation) {
-  PlainPacketPool pool(4, -1, 64);
-  PacketHandle packet = pool.Alloc(16);
-  ASSERT_NE(packet, nullptr);
-  const HeadState before = TakeHeadState(packet);
-  const PacketHandle original = packet;
-  packet->pkt_len = 17;
+TEST(PacketReshapeTest,
+     PartialReplacementAllocationFailurePreservesOriginalAtomically) {
+  PlainPacketPool pool(8, -1, 128);
+  const std::vector<std::byte> bytes = Pattern(300);
+  PacketHandle source = pool.AllocCopy(bytes.data(), bytes.size());
+  ASSERT_NE(source, nullptr);
+  ASSERT_EQ(source->nb_segs, 3);
+  SetPrivate(source, static_cast<std::byte>(0x2a));
 
-  auto result = EnsureWritable(packet);
+  PacketHandle clone = bess::PacketClone(source);
+  ASSERT_NE(clone, nullptr);
+  ASSERT_EQ(clone->nb_segs, 3);
+  SetPrivate(clone, static_cast<std::byte>(0x7b));
+  ASSERT_EQ(pool.Size(), 2);
+
+  const HeadState clone_before = TakeHeadState(clone);
+  const HeadState source_before = TakeHeadState(source);
+  const PacketHandle original = clone;
+  std::array<PacketHandle, 3> clone_segments{};
+  std::array<uint16_t, 3> clone_data_lengths{};
+  std::array<uint16_t, 3> clone_refcounts{};
+  PacketHandle segment = clone;
+  for (size_t i = 0; i < clone_segments.size(); i++) {
+    ASSERT_NE(segment, nullptr);
+    clone_segments[i] = segment;
+    clone_data_lengths[i] = segment->data_len;
+    clone_refcounts[i] = rte_mbuf_refcnt_read(segment);
+    segment = segment->next;
+  }
+  ASSERT_EQ(segment, nullptr);
+
+  const size_t available_before = pool.Size();
+  auto result = EnsureWritable(clone);
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error(), ReshapeError::kMalformedChain);
-  EXPECT_EQ(packet, original);
-  EXPECT_EQ(packet->next, before.next);
-  EXPECT_EQ(packet->data_off, before.data_off);
-  EXPECT_EQ(packet->data_len, before.data_len);
-  EXPECT_EQ(packet->nb_segs, before.nb_segs);
-  EXPECT_EQ(packet->port, before.port);
-  EXPECT_EQ(packet->vlan_tci, before.vlan_tci);
-  EXPECT_EQ(packet->vlan_tci_outer, before.vlan_tci_outer);
-  EXPECT_EQ(packet->packet_type, before.packet_type);
-  EXPECT_EQ(packet->ol_flags, before.ol_flags);
-  EXPECT_EQ(packet->tx_offload, before.tx_offload);
-  EXPECT_EQ(packet->hash.rss, before.hash_rss);
-  EXPECT_EQ(PrivateBytes(packet), before.private_bytes);
-  std::vector<std::byte> payload(packet->data_len);
-  std::memcpy(payload.data(), PacketRef(packet).head_data(), payload.size());
-  EXPECT_EQ(payload, before.payload);
-  PacketFree(packet);
+  EXPECT_EQ(result.error(), ReshapeError::kAllocationFailed);
+  EXPECT_EQ(clone, original);
+  EXPECT_EQ(pool.Size(), available_before);
+  ExpectHeadStateUnchanged(clone, clone_before);
+  ExpectHeadStateUnchanged(source, source_before);
+
+  segment = clone;
+  for (size_t i = 0; i < clone_segments.size(); i++) {
+    ASSERT_NE(segment, nullptr);
+    EXPECT_EQ(segment, clone_segments[i]);
+    EXPECT_EQ(segment->data_len, clone_data_lengths[i]);
+    EXPECT_EQ(rte_mbuf_refcnt_read(segment), clone_refcounts[i]);
+    segment = segment->next;
+  }
+  EXPECT_EQ(segment, nullptr);
+
+  PacketFree(clone);
+  PacketFree(source);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+TEST(PacketReshapeTest, MalformedChainFailsWithoutMutation) {
+  enum class Case : uint8_t {
+    kZeroSegments,
+    kTooManySegments,
+    kExtraNext,
+    kLengthMismatch,
+    kDataOffsetPastBuffer,
+    kDataRangePastBuffer,
+    kMissingPool,
+  };
+  const std::array<const char *, 7> names = {
+      "nb_segs == 0",
+      "nb_segs exceeds actual chain",
+      "extra next beyond nb_segs",
+      "sum(data_len) != pkt_len",
+      "data_off > buf_len",
+      "data_off + data_len > buf_len",
+      "pool == nullptr",
+  };
+  const std::array<Case, 7> cases = {
+      Case::kZeroSegments,       Case::kTooManySegments,
+      Case::kExtraNext,          Case::kLengthMismatch,
+      Case::kDataOffsetPastBuffer, Case::kDataRangePastBuffer,
+      Case::kMissingPool};
+
+  for (size_t case_index = 0; case_index < cases.size(); case_index++) {
+    SCOPED_TRACE(names[case_index]);
+    PlainPacketPool pool(8, -1, 64);
+    const std::vector<std::byte> bytes = Pattern(16);
+    PacketHandle packet = pool.AllocCopy(bytes.data(), bytes.size());
+    ASSERT_NE(packet, nullptr);
+
+    const HeadState before = TakeHeadState(packet);
+    const PacketHandle original = packet;
+    rte_mempool *initial_pool = packet->pool;
+    const uint16_t initial_data_off = packet->data_off;
+    const uint16_t initial_data_len = packet->data_len;
+    const uint16_t initial_nb_segs = packet->nb_segs;
+    const uint32_t initial_pkt_len = packet->pkt_len;
+    const uint16_t initial_buf_len = packet->buf_len;
+    PacketHandle extra = nullptr;
+
+    switch (cases[case_index]) {
+      case Case::kZeroSegments:
+        packet->nb_segs = 0;
+        break;
+      case Case::kTooManySegments:
+        packet->nb_segs = 2;
+        break;
+      case Case::kExtraNext:
+        extra = pool.Alloc();
+        ASSERT_NE(extra, nullptr);
+        packet->next = extra;
+        packet->nb_segs = 1;
+        break;
+      case Case::kLengthMismatch:
+        packet->pkt_len = initial_pkt_len + 1;
+        break;
+      case Case::kDataOffsetPastBuffer:
+        ASSERT_LT(packet->buf_len, std::numeric_limits<uint16_t>::max());
+        packet->data_off = static_cast<uint16_t>(packet->buf_len + 1);
+        break;
+      case Case::kDataRangePastBuffer:
+        ASSERT_GT(packet->buf_len, packet->data_len);
+        packet->data_off = static_cast<uint16_t>(
+            packet->buf_len - packet->data_len + 1);
+        break;
+      case Case::kMissingPool:
+        packet->pool = nullptr;
+        break;
+    }
+
+    const PacketHandle expected_next = packet->next;
+    rte_mempool *expected_pool = packet->pool;
+    const uint16_t expected_data_off = packet->data_off;
+    const uint16_t expected_data_len = packet->data_len;
+    const uint16_t expected_nb_segs = packet->nb_segs;
+    const uint32_t expected_pkt_len = packet->pkt_len;
+    const size_t available_before = pool.Size();
+
+    auto result = EnsureWritable(packet);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ReshapeError::kMalformedChain);
+    EXPECT_EQ(packet, original);
+    EXPECT_EQ(pool.Size(), available_before);
+    EXPECT_EQ(packet->next, expected_next);
+    EXPECT_EQ(packet->pool, expected_pool);
+    EXPECT_EQ(packet->data_off, expected_data_off);
+    EXPECT_EQ(packet->data_len, expected_data_len);
+    EXPECT_EQ(packet->nb_segs, expected_nb_segs);
+    EXPECT_EQ(packet->pkt_len, expected_pkt_len);
+    EXPECT_EQ(packet->buf_len, initial_buf_len);
+    EXPECT_EQ(packet->priv_size, before.priv_size);
+    EXPECT_EQ(packet->timesync, before.timesync);
+    EXPECT_EQ(packet->port, before.port);
+    EXPECT_EQ(packet->vlan_tci, before.vlan_tci);
+    EXPECT_EQ(packet->vlan_tci_outer, before.vlan_tci_outer);
+    EXPECT_EQ(packet->packet_type, before.packet_type);
+    EXPECT_EQ(packet->ol_flags, before.ol_flags);
+    EXPECT_EQ(packet->tx_offload, before.tx_offload);
+    EXPECT_EQ(packet->hash.rss, before.hash_rss);
+    EXPECT_EQ(rte_mbuf_refcnt_read(packet), before.refcnt);
+    std::array<uint32_t, 9> actual_dynfield1;
+    std::copy(std::begin(packet->dynfield1), std::end(packet->dynfield1),
+              actual_dynfield1.begin());
+    EXPECT_EQ(actual_dynfield1, before.dynfield1);
+    EXPECT_EQ(PrivateBytes(packet), before.private_bytes);
+
+    const bool invalid_payload_bounds =
+        cases[case_index] == Case::kDataOffsetPastBuffer ||
+        cases[case_index] == Case::kDataRangePastBuffer;
+    if (!invalid_payload_bounds) {
+      std::vector<std::byte> actual_payload(packet->data_len);
+      std::memcpy(actual_payload.data(), PacketRef(packet).head_data(),
+                  actual_payload.size());
+      EXPECT_EQ(actual_payload, before.payload);
+    }
+
+    packet->next = nullptr;
+    packet->data_off = initial_data_off;
+    packet->data_len = initial_data_len;
+    packet->nb_segs = initial_nb_segs;
+    packet->pkt_len = initial_pkt_len;
+    packet->pool = initial_pool;
+    if (extra != nullptr) {
+      PacketFree(extra);
+    }
+    PacketFree(packet);
+    EXPECT_EQ(pool.Size(), pool.Capacity());
+  }
 }
 
 }  // namespace
