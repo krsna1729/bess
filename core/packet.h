@@ -47,7 +47,9 @@
 namespace bess {
 
 // BESS's application-private packet area. DPDK places this immediately after
-// struct rte_mbuf and exposes it through rte_mbuf_to_priv().
+// struct rte_mbuf and exposes it through rte_mbuf_to_priv(). It is logical
+// packet-head state: continuation-segment private areas carry no packet-level
+// semantic state and must not be treated as independent packet metadata.
 struct BessPacketPrivate {
   char metadata_[SNBUF_METADATA];
   char scratchpad_[SNBUF_SCRATCHPAD];

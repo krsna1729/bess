@@ -42,15 +42,18 @@
 #include <benchmark/benchmark.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstring>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "packet.h"
 #include "packet_cursor.h"
 #include "packet_mutation.h"
+#include "packet_reshape.h"
 #include "packet_pool.h"
 #include "pktbatch.h"
 
@@ -612,6 +615,119 @@ BENCHMARK(BM_PacketCheckedTrimSuffix)
 BENCHMARK(BM_PayloadWriteability)
     ->ArgsProduct({{0, 1, 2, 3}})
     ->ArgNames({"storage"});
+
+enum class EnsureWritableBenchmarkPath : uint8_t {
+  kUniqueDirect,
+  kUniqueMultisegment,
+  kSharedCow,
+};
+
+bess::PacketHandle BuildReshapeBenchmarkPacket(
+    bess::PlainPacketPool &pool, size_t bytes, bool multisegment) {
+  if (!multisegment) {
+    bess::PacketHandle packet = pool.Alloc(bytes);
+    CHECK(packet != nullptr);
+    std::memset(bess::PacketRef(packet).head_data(), 0, bytes);
+    return packet;
+  }
+
+  constexpr size_t kSegmentCapacity = 1024;
+  bess::PacketHandle head = nullptr;
+  bess::PacketHandle previous = nullptr;
+  size_t remaining = bytes;
+  uint16_t segment_count = 0;
+  while (remaining != 0) {
+    const size_t length = std::min(remaining, kSegmentCapacity);
+    bess::PacketHandle segment = pool.Alloc(length);
+    CHECK(segment != nullptr);
+    if (head == nullptr) {
+      head = segment;
+    } else {
+      previous->next = segment;
+    }
+    previous = segment;
+    std::memset(bess::PacketRef(segment).head_data(), 0, length);
+    remaining -= length;
+    segment_count++;
+  }
+  CHECK(head != nullptr);
+  head->pkt_len = static_cast<uint32_t>(bytes);
+  head->nb_segs = segment_count;
+  return head;
+}
+
+void RunEnsureWritableBenchmark(benchmark::State &state,
+                                EnsureWritableBenchmarkPath path) {
+  bess::PlainPacketPool &pool = GetPool();
+  const size_t bytes = static_cast<size_t>(state.range(0));
+  const bool shared = path == EnsureWritableBenchmarkPath::kSharedCow;
+  const bool multisegment =
+      path == EnsureWritableBenchmarkPath::kUniqueMultisegment;
+
+  bess::PacketHandle packet = nullptr;
+  bess::PacketHandle sibling = nullptr;
+  if (shared) {
+    std::vector<std::byte> payload(bytes);
+    sibling = pool.AllocCopy(payload.data(), payload.size());
+    CHECK(sibling != nullptr);
+    packet = bess::PacketClone(sibling);
+    CHECK(packet != nullptr);
+  } else {
+    packet = BuildReshapeBenchmarkPacket(pool, bytes, multisegment);
+  }
+  const uint16_t baseline_segments = packet->nb_segs;
+
+  for (auto _ : state) {
+    auto result = bess::packet::EnsureWritable(packet);
+    CHECK(result.has_value());
+    benchmark::DoNotOptimize(result);
+    benchmark::DoNotOptimize(packet);
+    if (shared) {
+      state.PauseTiming();
+      bess::PacketFree(packet);
+      packet = bess::PacketClone(sibling);
+      CHECK(packet != nullptr);
+      state.ResumeTiming();
+    }
+  }
+
+  state.SetItemsProcessed(state.iterations());
+  state.counters["bytes_copied/op"] =
+      shared ? static_cast<double>(bytes) : 0;
+  state.counters["segments/op"] = baseline_segments;
+  state.counters["head_replaced/op"] = shared ? 1 : 0;
+  state.counters["allocation/op"] = shared ? 1 : 0;
+
+  if (sibling != nullptr) {
+    bess::PacketFree(packet);
+    bess::PacketFree(sibling);
+  } else {
+    bess::PacketFree(packet);
+  }
+}
+
+void BM_EnsureWritableUniqueDirect(benchmark::State &state) {
+  RunEnsureWritableBenchmark(state, EnsureWritableBenchmarkPath::kUniqueDirect);
+}
+
+void BM_EnsureWritableUniqueMultisegment(benchmark::State &state) {
+  RunEnsureWritableBenchmark(state,
+                             EnsureWritableBenchmarkPath::kUniqueMultisegment);
+}
+
+void BM_EnsureWritableSharedCow(benchmark::State &state) {
+  RunEnsureWritableBenchmark(state, EnsureWritableBenchmarkPath::kSharedCow);
+}
+
+BENCHMARK(BM_EnsureWritableUniqueDirect)
+    ->ArgsProduct({{64, 256, 1500}})
+    ->ArgNames({"bytes"});
+BENCHMARK(BM_EnsureWritableUniqueMultisegment)
+    ->ArgsProduct({{256, 1500, 4096}})
+    ->ArgNames({"bytes"});
+BENCHMARK(BM_EnsureWritableSharedCow)
+    ->ArgsProduct({{64, 256, 1500, 4096}})
+    ->ArgNames({"bytes"});
 
 void BM_PacketCursorChainRead(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();
