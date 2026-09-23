@@ -194,15 +194,16 @@ wide default gates before narrowing in both migrated modules, removes the
 masked-backend result scratch from the packet stack, and records the candidate
 ID storage contract. K4.1 now adds the read-only packet-chain cursor described
 below; K4.1.1 hardened its 32-bit length boundary, typed-read fast path, and
-benchmark attribution; K4.2/K4.2.1 now add checked in-place mutation and
-payload-ownership and descriptor-ownership primitives. K4.3+ topology/COW/
-linearization and K4.4 checksum/TX-offload work remain future. The active build
-K1-K3 are closed. The build graph is Meson/Ninja only. GCC and Clang full
-Meson compiles succeed with pinned DPDK 25.11.3. The registered suite has 74
-tests: 54 native C++ binaries, benchmark smoke tests (including the PMD
-null/ring smoke), the sample-plugin registry load, the Python target, and the
-module integration run.
-Full GCC and Clang Meson test runs pass all 74 targets. K3.4-K3.7's own
+benchmark attribution; K4.2/K4.2.1 now add checked in-place mutation,
+payload-ownership, and descriptor-ownership primitives. K4.3a now adds
+transactional packet writability and full-packet COW; K4.3b topology
+reshape/linearization and K4.4 checksum/TX-offload work remain future. The
+active build K1-K3 are closed. The build graph is Meson/Ninja only. GCC and
+Clang full Meson compiles succeed with pinned DPDK 25.11.3. The registered
+suite has 75 tests: 55 native C++ binaries, benchmark smoke tests (including
+the PMD null/ring smoke), the sample-plugin registry load, the Python target,
+and the module integration run.
+Full GCC and Clang Meson test runs pass all 75 targets. K3.4-K3.7's own
 targets (the typed-, masked-backend, extract-plan, and migration unit binaries,
 the WildcardMatch module test, `classifier_typed_bench`,
 `classifier_masked_bench`, and `modules_wildcard_match_bench`) pass under GCC
@@ -3165,6 +3166,23 @@ rather than one call site).
     `1`, and the original packet can append and write again. GCC and Clang
     mutation targets both pass all eight tests.
 
+74. **`0844129a`** — **K4.3a transactional packet writability and full-packet
+    COW.** Added `EnsureWritable(PacketHandle&) noexcept`, returning
+    `std::expected<void, ReshapeError>` with the fixed null, length,
+    allocation, contiguous-capacity, and malformed-chain error set.
+    `ChainPayloadWritable` validates the complete descriptor topology and
+    checks every non-empty segment's direct, indirect, or external payload
+    ownership. Unique payload storage returns the original handle unchanged;
+    shared storage uses `PacketCopy` from the source pool, copies the complete
+    logical packet-head `BessPacketPrivate` region, then atomically replaces
+    the caller's handle. Allocation failure leaves the original chain intact.
+    Regression coverage includes direct, indirect, external, lifecycle,
+    payload-isolation, metadata/private-state, malformed-chain, and
+    allocation-failure paths. The new COW benchmark reports bytes copied,
+    segments, head replacement, and allocation attribution for unique direct,
+    unique multisegment, and shared deep-copy paths. GCC and Clang full Meson
+    suites pass 75/75.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -5473,8 +5491,54 @@ refcount from `1` to `2`, writable append is rejected while shared, and
 freeing the clone returns the original external packet to writable state at
 refcount `1`.
 
-K4.3 remains the future topology/COW/linearization layer; K4.4 remains the
-future checksum and TX-offload semantic layer.
+#### K4.3a — transactional packet writability and full-packet COW
+
+`EnsureWritable(PacketHandle &packet) noexcept` is the first topology-safe
+boundary for mutations that need writable payload storage. It returns
+`std::expected<void, ReshapeError>` with this fixed error set:
+
+```text
+kNullPacket
+kLengthOutOfRange
+kAllocationFailed
+kInsufficientContiguousCapacity
+kMalformedChain
+```
+
+K4.3a uses `kNullPacket`, `kMalformedChain`, and `kAllocationFailed`;
+`kLengthOutOfRange` and `kInsufficientContiguousCapacity` reserve later
+reshape operations. The caller exclusively owns the descriptor chain.
+`ChainPayloadWritable` walks exactly `nb_segs`, rejects missing or extra
+segments and a logical-length mismatch, and checks every non-empty segment's
+payload storage through `PayloadWriteabilityOf`.
+
+If every segment is writable, `EnsureWritable` returns the same handle and
+topology without allocation. If any payload segment is shared—direct,
+indirect, or external—it deep-copies the complete packet with native
+`PacketCopy` from the source packet's existing mempool, copies the complete
+`BessPacketPrivate` head region, replaces the caller's handle, and only then
+frees the old chain. Allocation failure therefore leaves the original handle,
+descriptor chain, payload, and metadata unchanged. `BessPacketPrivate` is
+logical packet-head state; continuation-segment private areas carry no
+packet-level semantic state and are not copied as independent metadata.
+Native DPDK packet-header metadata remains covered by `PacketCopy`, including
+port, packet type, hash, VLAN fields, TX offload, dynamic fields, and semantic
+offload flags.
+
+The regression target covers null and unique no-op paths, direct/indirect and
+external COW, backing-release lifecycle recovery, payload equivalence and
+sibling isolation, full private-state and DPDK metadata preservation,
+malformed chains, and allocation-failure transactionality. GCC and Clang full
+Meson suites pass 75/75. The benchmark isolates unique direct no-op, unique
+multisegment no-op, and shared deep-COW paths across packet sizes and reports
+bytes copied, segments per operation, head replacement, and allocation
+attribution. These are environment-specific smoke measurements, not a
+performance verdict.
+
+K4.3b remains the future linearization and contiguous-prefix layer:
+`EnsureLinear`, `EnsureContiguousPrefix`, partial-segment COW, and
+cross-segment remove/trim semantics. K4.4 remains the future checksum and
+TX-offload semantic layer.
 
 ---
 
