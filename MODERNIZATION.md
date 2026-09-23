@@ -193,10 +193,11 @@ attribution pin the benchmark source/priority oracle, and K3.7.1 now validates
 wide default gates before narrowing in both migrated modules, removes the
 masked-backend result scratch from the packet stack, and records the candidate
 ID storage contract. K4.1 now adds the read-only packet-chain cursor described
-below; K4.2 and later mutation/ownership primitives remain future work. The
-active build graph is K4-K8 and G1; K1-K3 are closed. The build graph is
-Meson/Ninja only. GCC and Clang full Meson compiles succeed with pinned DPDK
-25.11.3. The registered suite has 73 tests: 53 native C++ binaries, 17
+below; K4.1.1 hardens its 32-bit length boundary, typed-read fast path, and
+benchmark attribution; K4.2 and later mutation/ownership primitives remain
+future work. The active build graph is K4-K8 and G1; K1-K3 are closed. The
+build graph is Meson/Ninja only. GCC and Clang full Meson compiles succeed with
+pinned DPDK 25.11.3. The registered suite has 73 tests: 53 native C++ binaries,
 benchmark smoke tests (including the PMD null/ring smoke), the sample-plugin
 registry load, the Python target, and the module integration run. Full GCC and
 Clang Meson test runs pass all 73 targets. K3.4-K3.7's own targets (the
@@ -3120,6 +3121,17 @@ rather than one call site).
     requested counters; measurements are recorded in the K4.1 section above,
     not treated as a performance verdict.
 
+71. **`433a042f`** — **K4.1.1 cursor hardening and benchmark attribution.**
+    `PacketRef` now preserves native `rte_mbuf` length widths, the cursor's
+    contiguous typed-read path uses a private non-failing advance, and the
+    failed-read destination-write contract is explicit. The regression suite
+    pins a high-bit logical length on a tiny malformed chain. New benchmark
+    isolations separate construction, pre-positioned copy plus typed read, and
+    packet cursor and benchmark targets build under GCC and Clang with
+    `ninja -j8`; the six cursor tests pass under both. The ASan+UBSan targets
+    compile, while cursor runtime remains blocked by the known DPDK EAL
+    IOVA/DMA-mask allocation failure.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -5327,6 +5339,29 @@ zero, representative direct/cursor means were `1.31/6.02 ns` for width 4 and
 segment transitions per read for the linear, boundary, and two-boundary
 shapes. These are environment-specific measurements, not a predeclared
 performance verdict.
+
+#### K4.1.1 — length correctness, typed-read fast path, and attribution
+
+K4.1.1 makes `PacketRef::head_len()` return `uint16_t` and
+`PacketRef::total_len()` return `uint32_t`, both `noexcept`, preserving the
+native mbuf field widths. The DRR byte budget follows the same unsigned
+representation, and the pcapng padding callsite names its `uint32_t` template
+argument explicitly. A tiny malformed-chain regression sets `pkt_len` to
+`0x80000001` without allocating a large packet and verifies that the cursor
+reports the full value.
+
+Contiguous `Read<T>()` now advances through a private known-good path after
+`PeekContiguous()` succeeds, avoiding the public transactional cursor copy.
+`ReadBytes()` explicitly guarantees cursor rollback only: if a malformed
+physical chain ends after a prefix, bytes already copied into the destination
+may remain there.
+
+The benchmark now isolates cursor construction, pre-positioned cursor copy plus
+typed read, and one cursor parsing four sequential fields. In a latest
+three-repetition GCC run, representative batch-1 means were `0.71 ns` for
+construction, `7.37 ns` for a pre-positioned width-4 read, `15.1 ns` for four
+sequential fields, and `1.37/6.81 ns` for direct/cursor one-shot width-4 reads.
+These are environment-specific smoke measurements, not a performance verdict.
 
 ---
 
