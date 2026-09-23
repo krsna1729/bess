@@ -406,7 +406,7 @@ TEST(PacketReshapeTest, NullAndUniquePacketsAreStrictNoOps) {
 }
 
 TEST(PacketReshapeTest, SharedDirectAndIndirectPacketsUseWholePacketCOW) {
-  PlainPacketPool pool(32, -1, 128);
+  PlainPacketPool pool(32, -1, 256);
   const std::vector<std::byte> bytes = Pattern(256);
   const std::array<size_t, 2> lengths = {128, 128};
   PacketHandle source = BuildChain(pool, lengths, bytes);
@@ -426,6 +426,11 @@ TEST(PacketReshapeTest, SharedDirectAndIndirectPacketsUseWholePacketCOW) {
   ASSERT_TRUE(result.has_value());
   EXPECT_NE(clone, old_clone);
   EXPECT_TRUE(RTE_MBUF_DIRECT(clone));
+  EXPECT_EQ(clone->nb_segs, 2);
+  ASSERT_NE(clone->next, nullptr);
+  EXPECT_EQ(clone->data_len, 128);
+  EXPECT_EQ(clone->next->data_len, 128);
+  EXPECT_EQ(clone->next->next, nullptr);
   EXPECT_TRUE(ChainPayloadWritable(clone));
   ExpectCopiedHeadState(clone, clone_before);
   EXPECT_EQ(rte_mbuf_refcnt_read(source), 1);

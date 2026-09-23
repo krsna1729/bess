@@ -92,11 +92,6 @@ std::expected<bool, ReshapeError> ChainPayloadWritable(
   return writable;
 }
 
-::bess::PacketHandle CopyPacketForReplacement(
-    ::bess::PacketHandle source) noexcept {
-  return ::bess::PacketCopy(source);
-}
-
 void CopyBessPacketPrivate(::bess::PacketHandle destination,
                            ::bess::PacketHandle source) noexcept {
   std::memcpy(rte_mbuf_to_priv(destination), rte_mbuf_to_priv(source),
@@ -109,6 +104,52 @@ void CopyPacketHeadMetadata(::bess::PacketHandle destination,
   destination->timesync = source->timesync;
   destination->ol_flags =
       source->ol_flags & ~(RTE_MBUF_F_INDIRECT | RTE_MBUF_F_EXTERNAL);
+}
+std::expected<::bess::PacketHandle, ReshapeError> CopyPacketForReplacement(
+    ::bess::PacketHandle source) noexcept {
+  ::bess::PacketHandle destination_head = nullptr;
+  ::bess::PacketHandle destination_tail = nullptr;
+  for (::bess::PacketHandle segment = source; segment != nullptr;
+       segment = segment->next) {
+    ::bess::PacketHandle copy = rte_pktmbuf_alloc(segment->pool);
+    if (copy == nullptr) {
+      if (destination_head != nullptr) {
+        ::bess::PacketFree(destination_head);
+      }
+      return std::unexpected(ReshapeError::kAllocationFailed);
+    }
+    if (segment->data_off > copy->buf_len ||
+        segment->data_len > copy->buf_len - segment->data_off) {
+      rte_pktmbuf_free(copy);
+      if (destination_head != nullptr) {
+        ::bess::PacketFree(destination_head);
+      }
+      return std::unexpected(ReshapeError::kInsufficientContiguousCapacity);
+    }
+
+    copy->data_off = segment->data_off;
+    copy->data_len = segment->data_len;
+    copy->pkt_len = segment->data_len;
+    if (segment->data_len != 0) {
+      std::memcpy(::bess::PacketRef(copy).head_data<std::byte *>(),
+                  ::bess::PacketRef(segment).head_data<const std::byte *>(),
+                  segment->data_len);
+    }
+
+    if (destination_head == nullptr) {
+      destination_head = copy;
+      CopyPacketHeadMetadata(destination_head, source);
+    } else {
+      destination_tail->next = copy;
+    }
+    destination_tail = copy;
+  }
+  if (destination_head == nullptr) {
+    return std::unexpected(ReshapeError::kMalformedChain);
+  }
+  destination_head->pkt_len = source->pkt_len;
+  destination_head->nb_segs = source->nb_segs;
+  return destination_head;
 }
 
 // Promotion changes logical packet-head state, not the surviving segment's
@@ -178,14 +219,14 @@ std::expected<void, ReshapeError> EnsureWritable(
     return {};
   }
 
-  ::bess::PacketHandle replacement = detail::CopyPacketForReplacement(packet);
-  if (replacement == nullptr) {
-    return std::unexpected(ReshapeError::kAllocationFailed);
+  auto replacement = detail::CopyPacketForReplacement(packet);
+  if (!replacement) {
+    return std::unexpected(replacement.error());
   }
-  detail::CopyBessPacketPrivate(replacement, packet);
+  detail::CopyBessPacketPrivate(*replacement, packet);
 
   ::bess::PacketHandle original = packet;
-  packet = replacement;
+  packet = *replacement;
   ::bess::PacketFree(original);
   return {};
 }

@@ -5696,62 +5696,81 @@ semantic TX-offload planning (K4.4b). K4.5 follows both and remains
 performance-gated; no backend winner, loop migration, or prefetch policy is
 adopted without measured benefit.
 
-#### K4.4a — packet-aware software checksum plan
+#### K4.4a — packet-aware software checksum semantics (implemented)
 
-K4.4a defines generic packet checksum semantics independently of Ethernet
-encapsulation, tunnels, NAT, modules, or a particular backend. Existing
-`core/utils/checksum.h` contains contiguous-buffer checksum machinery and
-IPv4 header/UDP/TCP routines. The pinned DPDK 25.11.3 headers also provide
-chain-aware `rte_raw_cksum_mbuf`, `rte_ipv4_udptcp_cksum_mbuf`, and
-`rte_ipv6_udptcp_cksum_mbuf` routines for comparison and implementation
-options.
-
-A candidate API (names remain subject to review):
+K4.4a is implemented in `core/packet_checksum.h` and
+`core/packet_checksum.cc`. Its semantic API is backend-neutral and independent
+of Ethernet encapsulation, tunnels, NAT, or modules:
 
 ```cpp
 enum class IpVersion : uint8_t { kIpv4, kIpv6 };
-enum class TransportProtocol : uint8_t { kNone, kUdp, kTcp };
+enum class NetworkChecksum : uint8_t { kNone, kIpv4Header };
+enum class TransportChecksum : uint8_t { kNone, kUdp, kTcp };
 
 struct ChecksumPlan {
   size_t network_offset;
   size_t transport_offset;
   IpVersion ip_version;
-  TransportProtocol transport;
-  bool network_checksum;   // IPv4 header checksum only
-  bool transport_checksum;
+  NetworkChecksum network;
+  TransportChecksum transport;
 };
 
+struct ChecksumValues {
+  std::optional<utils::be16_t> network;
+  std::optional<utils::be16_t> transport;
+};
+
+std::expected<ChecksumValues, ChecksumError> ComputeChecksums(
+    PacketRef packet, const ChecksumPlan &plan) noexcept;
 std::expected<void, ChecksumError> ApplySoftwareChecksums(
     PacketHandle &packet, const ChecksumPlan &plan) noexcept;
 ```
 
-Validate and read headers with `PacketCursor`; calculate over the logical
-packet chain without flattening it. A chain-aware raw checksum can consume
-payload in place. DPDK's IPv4/IPv6 mbuf helpers still require a contiguous IP
-header argument, so split headers need cursor reads or a small header
-snapshot—not payload linearization. The IPv6 DPDK helper requires no
-extension headers and a zeroed L4 checksum field; K4.4a must either handle
-extension-header lengths explicitly or reject them, rather than silently
-assuming the helper covers them. Define fragmented-datagram behavior too.
+`ComputeChecksums` validates the descriptor chain and reads headers through
+`PacketCursor`; range summation walks segment backing directly and preserves
+one's-complement odd-byte pairing across segment boundaries. It never
+linearizes or mutates the packet. IPv4 header checksums include options; UDP
+and TCP are supported over IPv4 and the IPv6 base header. Checksums are bounded
+by the IP-declared length, not by trailing mbuf bytes, and UDP length must
+match the IP transport extent. IPv4 transport checksums reject fragmented
+datagrams. IPv6 extension/fragment headers and jumbograms are explicitly
+rejected. A computed UDP checksum of zero is encoded as `0xffff`.
 
-Writing the resulting checksum is distinct from reading/checksumming the
-payload. `EnsureContiguous` can return an in-segment writable range directly,
-but a range that crosses segments causes the current implementation to call
-`EnsureLinear` on the full packet. K4.4a must make this split-field write
-tradeoff explicit and test it; do not claim a narrow, payload-preserving write
-path from `EnsureContiguous` alone.
+`ApplySoftwareChecksums` computes every requested value and stages all writes
+before mutation. It preflights each checksum-field range and checks only the
+backing that contains those bytes; `EnsureWritable` is called only when a
+target byte is shared, so unrelated shared tail backing does not force a copy.
+`EnsureWritable` retains segment boundaries and per-segment lengths during COW.
+If the destination pool cannot hold a source segment at its existing boundary,
+the operation returns `kInsufficientWritableCapacity` before changing the
+packet.
+The writer handles fields split across segments without flattening. No
+fallible operation follows the first byte write; errors leave packet bytes,
+topology, and metadata unchanged.
 
-Coverage and acceptance:
+Coverage includes fixed IPv4/IPv6 UDP vectors and computed-zero UDP encoding;
+IPv4 options and TCP; IPv6 TCP; every two-segment split position for
+IPv4/IPv6 UDP; two-/four-segment split headers and checksum fields; BESS and
+DPDK contiguous/mbuf differential oracles; declared-length trailing data;
+malformed lengths; IPv4/IPv6 fragment, extension, and jumbo rejection; cloned
+and external backing; unrelated shared tails; and COW allocation-, capacity-,
+and packet-state failure cases.
 
-- IPv4 header checksums, including IPv4 options; UDP/TCP over IPv4 and IPv6.
-- Known-good wire vectors, including protocol-specific UDP zero-checksum
-  behavior; exercise IP/transport headers split at every relevant segment
-  boundary, including checksum-field splits.
-- Two- and four-segment payloads, cloned packets, external buffers, and
-  malformed or incomplete lengths with explicit errors.
-- Compare bytes against existing BESS routines where applicable and DPDK
-  contiguous/chain-aware routines on supported inputs. DPDK helpers may return
-  dummy values for invalid inputs, so they are references, not validation.
+`core/packet_checksum_bench.cc` covers contiguous, two-segment split-header,
+two-segment split-checksum, four-segment split-header/checksum, writable-head
+with shared-tail, and shared-header COW paths. It varies packet sizes 64, 1500,
+and 4096 bytes; read-only cases rotate a hot single packet or a 128-packet
+working set.
+The focused checksum and reshape tests passed with:
+
+```sh
+meson test -C build-meson packet_checksum_test packet_reshape_test --print-errorlogs
+```
+
+The focused checksum and reshape tests passed with
+`meson test -C build-meson packet_checksum_test packet_reshape_test --print-errorlogs`.
+All checksum benchmark smoke cases passed using `omarchy-benchmark --isolate`;
+no performance verdict is claimed.
 
 #### K4.4b — semantic TX checksum-offload plan
 

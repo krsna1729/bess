@@ -47,8 +47,10 @@ enum class ReshapeError : uint8_t {
 };
 
 // Ensures that packet's payload storage is writable by atomically replacing a
-// shared packet with a semantic deep copy. The caller must exclusively own the
-// descriptor chain referenced by packet; packet may be replaced on success.
+// shared packet with a semantic deep copy that retains segment boundaries.
+// The caller must exclusively own the descriptor chain referenced by packet;
+// packet may be replaced on success. If a segment cannot fit without
+// changing its boundary, returns kInsufficientContiguousCapacity unchanged.
 std::expected<void, ReshapeError> EnsureWritable(
     ::bess::PacketHandle &packet) noexcept;
 
