@@ -194,9 +194,9 @@ wide default gates before narrowing in both migrated modules, removes the
 masked-backend result scratch from the packet stack, and records the candidate
 ID storage contract. K4.1 now adds the read-only packet-chain cursor described
 below; K4.1.1 hardened its 32-bit length boundary, typed-read fast path, and
-benchmark attribution; K4.2 now adds checked in-place mutation and
-payload-ownership primitives. K4.3+ topology/COW/linearization and K4.4
-checksum/TX-offload work remain future. The active build graph is K4-K8 and G1;
+benchmark attribution; K4.2/K4.2.1 now add checked in-place mutation and
+payload-ownership and descriptor-ownership primitives. K4.3+ topology/COW/
+linearization and K4.4 checksum/TX-offload work remain future. The active build
 K1-K3 are closed. The build graph is Meson/Ninja only. GCC and Clang full
 Meson compiles succeed with pinned DPDK 25.11.3. The registered suite has 74
 tests: 54 native C++ binaries, benchmark smoke tests (including the PMD
@@ -3156,6 +3156,15 @@ rather than one call site).
     benchmark smoke completes all K4.2 registrations. These measurements are
     environment-specific smoke data, not a performance verdict.
 
+73. **`0bdc77e6`** — **K4.2.1 descriptor ownership and external lifecycle.**
+    The checked mutation contract now explicitly requires caller-exclusive
+    ownership of the mbuf descriptor chain; `PayloadWriteabilityOf` only
+    answers whether backing bytes are exclusive and does not prove descriptor
+    alias absence. External-buffer coverage pins the `shinfo` lifecycle:
+    clone refcnt `2` rejects writable append, freeing the clone returns refcnt
+    `1`, and the original packet can append and write again. GCC and Clang
+    mutation targets both pass all eight tests.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -5420,6 +5429,12 @@ kCrossesSegment
 kSharedStorage
 ```
 
+The descriptor-chain ownership contract is separate from payload
+writeability: the caller must exclusively own the mbuf descriptor chain being
+mutated. Payload storage may still be shared; operations that expose writable
+payload bytes additionally enforce `PayloadWriteabilityOf`. The helper cannot
+detect an aliased `rte_mbuf *` descriptor, and its refcount must not be
+repurposed for that purpose.
 `PayloadWriteabilityOf` reports writable payload only when the referenced
 storage is exclusive: a direct mbuf requires direct refcnt `1`, an indirect
 mbuf requires its backing direct mbuf refcnt `1`, and external storage requires
@@ -5432,9 +5447,10 @@ preconditions; callers needing the generic checked contract use
 
 The eight registered mutation tests cover unique direct spans, shared direct
 and indirect clones, backing-release writeability, unique and shared external
-buffers, null/zero/max/overflow lengths, exact headroom/tailroom, segment
-boundaries, topology/head identity, failure snapshots, and sibling isolation
-of returned-span writes. GCC and Clang full Meson suites both pass 74/74.
+buffers, the external shared-to-unique `shinfo` lifecycle, null/zero/max/
+overflow lengths, exact headroom/tailroom, segment boundaries, topology/head
+identity, failure snapshots, and sibling isolation of returned-span writes.
+GCC and Clang full Meson suites both pass 74/74.
 The benchmark matrix compares raw and checked prepend/append/adj/trim paths
 over the requested widths, linear/two-segment edge shapes, and batches
 `1/8/32`; a separate matrix isolates `PayloadWriteabilityOf` for direct,
@@ -5445,6 +5461,17 @@ and `129/129 ns` for trim-suffix width 20. The writeability helper reported
 `0.52 ns` direct-unique, `0.67 ns` indirect-shared, `0.56 ns` external-unique,
 and `0.56 ns` external-shared means in that run. These are
 environment-specific smoke measurements, not a performance verdict.
+
+#### K4.2.1 — descriptor ownership and external lifecycle
+
+K4.2.1 pins the ownership boundary before topology-changing work begins:
+`PacketRef` mutation requires caller-exclusive ownership of the descriptor
+chain, while payload sharing remains legal for header-only removal and
+trimming. `PayloadWriteabilityOf` deliberately answers only the backing-byte
+question. The external-buffer regression proves that a clone takes the shinfo
+refcount from `1` to `2`, writable append is rejected while shared, and
+freeing the clone returns the original external packet to writable state at
+refcount `1`.
 
 K4.3 remains the future topology/COW/linearization layer; K4.4 remains the
 future checksum and TX-offload semantic layer.
