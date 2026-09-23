@@ -192,24 +192,26 @@ ceilings, and all seven documented legacy defects plus the missing
 attribution pin the benchmark source/priority oracle, and K3.7.1 now validates
 wide default gates before narrowing in both migrated modules, removes the
 masked-backend result scratch from the packet stack, and records the candidate
-ID storage contract. The active build graph is K4-K8 and G1; K1-K3 are closed.
-The build graph is Meson/Ninja only. GCC and Clang full Meson compiles succeed
-with pinned DPDK 25.11.3. The registered suite has 73 tests: 53 native C++
-binaries, 17 benchmark smoke tests (including the PMD null/ring smoke), the
-sample-plugin registry load, the Python target, and the module integration run.
-A full Meson test run passes all 73 targets. K3.4-K3.7's own targets (the
+ID storage contract. K4.1 now adds the read-only packet-chain cursor described
+below; K4.2 and later mutation/ownership primitives remain future work. The
+active build graph is K4-K8 and G1; K1-K3 are closed. The build graph is
+Meson/Ninja only. GCC and Clang full Meson compiles succeed with pinned DPDK
+25.11.3. The registered suite has 73 tests: 53 native C++ binaries, 17
+benchmark smoke tests (including the PMD null/ring smoke), the sample-plugin
+registry load, the Python target, and the module integration run. Full GCC and
+Clang Meson test runs pass all 73 targets. K3.4-K3.7's own targets (the
 typed-, masked-backend, extract-plan, and migration unit binaries, the
 WildcardMatch module test, `classifier_typed_bench`, `classifier_masked_bench`,
 and `modules_wildcard_match_bench`) pass under GCC and Clang, with the
 sanitizer coverage noted below.
-The classifier extract-plan, Cuckoo, masked, and migration tests pass under
-ASan+UBSan. Two targets remain environment-incompatible under sanitizer for
-pre-existing reasons unrelated to this work: the Rte hash classifier test
-(DPDK EAL cannot allocate its required memory) and `modules_wildcard_match_test`,
-which hits the same `Any::PackFrom` null-descriptor SEGV as the pre-existing
-`module_test` under this ASan build. `-Daf_xdp=required` configuration, install
-staging, generated build-tree protobuf imports, and source-tree hygiene checks
-also pass.
+The classifier extract-plan and masked-backend tests pass under ASan+UBSan.
+The new `packet_cursor_test` is sanitizer-compiled but cannot execute here:
+DPDK EAL fails its VA/legacy-memory initialization under ASan with an IOVA
+DMA-mask allocation error. `modules_exact_match_migration_test` retains the
+pre-existing generated-protobuf `CommandResponse`/`Any` null-descriptor SEGV;
+the same environment issue remains in `modules_wildcard_match_test`.
+`-Daf_xdp=required` configuration, install staging, generated build-tree
+protobuf imports, and source-tree hygiene checks also pass.
 
 ## Completed work (chronological, with commit hashes on `develop`)
 
@@ -3099,6 +3101,25 @@ rather than one call site).
       this leaves the module-facing sanitizer coverage unavailable while the
       classifier substrate remains covered.
 
+70. **`71f0f9aa`** — **K4.1 read-only packet cursor substrate.** Added
+    `bess::packet::PacketCursor` in `core/packet_cursor.h` with logical
+    `pkt_len` bounds, cached-segment traversal, transactional `Skip`/`ReadBytes`,
+    contiguous borrowing, typed trivially-copyable reads, and copy-based
+    mark/restore. The cursor has no mutation or linearization primitives.
+    Adversarial coverage exercises widths `1/2/3/4/7/8/16/32`, every
+    two-segment split, three-segment traversal, empty and malformed chains,
+    direct/external/cloned storage, null packets, and failed-operation
+    transactionality. The packet benchmark adds direct/cursor contiguous and
+    chained matrices across the requested widths, offsets, batches, and chain
+    shapes, with bytes-copied and segment-transition counters.
+    Verification: GCC and Clang full builds and full Meson suites pass 73/73;
+    the six cursor tests pass under both compilers. The ASan+UBSan build
+    succeeds; cursor runtime is blocked by DPDK EAL's IOVA/DMA-mask allocation
+    failure, while the ASan extract-plan and masked-backend tests pass.
+    The GCC benchmark wrapper completes three repetitions and reports the
+    requested counters; measurements are recorded in the K4.1 section above,
+    not treated as a performance verdict.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -5277,6 +5298,35 @@ Goals:
 - keep protocol semantics out of BESS generic code.
 
 OMEC may use these primitives to implement GTP-U operations, but BESS should not interpret PFCP/GTP policy.
+
+#### K4.1 — read-only packet cursor
+
+K4.1 lands the first K4 primitive as a read-only `bess::packet::PacketCursor`
+in `core/packet_cursor.h`. The cursor is a value view over a native packet
+chain:
+
+- `offset()` and `remaining()` are bounded by the head packet's logical
+  `pkt_len`, not by the sum of unchecked segment storage;
+- `Skip()` and `ReadBytes()` are transactional on failure;
+- the current segment is cached, and empty segments are crossed lazily without a
+  constructor-time chain scan;
+- `PeekContiguous()` borrows a span from the current segment, while
+  `ReadBytes()` and `Read<T>()` copy bytes across segment boundaries;
+- copying the cursor is the mark/restore operation for optional parsing;
+- no cursor operation linearizes, mutates, prepends, trims, appends, clones, or
+  computes checksums.
+
+The adversarial tests cover contiguous, externally owned, cloned, two-segment,
+multi-segment, empty-segment, malformed-length, null-packet, and failed-read
+cases. The benchmark matrix compares direct contiguous reads with cursor reads
+over widths `1/2/4/8/16/32`, offsets `0/14/34/64`, batches `1/8/32`, and
+contiguous/two-segment/four-segment chain shapes.
+The GCC benchmark wrapper completed three repetitions. For batch 1 at offset
+zero, representative direct/cursor means were `1.31/6.02 ns` for width 4 and
+`1.28/4.34 ns` for width 32; the chain counter reported `0`, `1`, and `2`
+segment transitions per read for the linear, boundary, and two-boundary
+shapes. These are environment-specific measurements, not a predeclared
+performance verdict.
 
 ---
 
