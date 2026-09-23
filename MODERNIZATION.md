@@ -195,10 +195,10 @@ masked-backend result scratch from the packet stack, and records the candidate
 ID storage contract. K4.1 now adds the read-only packet-chain cursor described
 below; K4.1.1 hardened its 32-bit length boundary, typed-read fast path, and
 benchmark attribution; K4.2/K4.2.1 now add checked in-place mutation,
-payload-ownership, and descriptor-ownership primitives. K4.3a now adds
-transactional packet writability and full-packet COW; K4.3b topology
-reshape/linearization and K4.4 checksum/TX-offload work remain future. The
-active build K1-K3 are closed. The build graph is Meson/Ninja only. GCC and
+payload-ownership, and descriptor-ownership primitives. K4.3a adds
+transactional packet writability and full-packet COW; K4.3b now adds
+topology reshape/linearization. K4.4 checksum/TX-offload work remains future.
+The active build K1-K3 are closed. The build graph is Meson/Ninja only. GCC and
 Clang full Meson compiles succeed with pinned DPDK 25.11.3. The registered
 suite has 75 tests: 55 native C++ binaries, benchmark smoke tests (including
 the PMD null/ring smoke), the sample-plugin registry load, the Python target,
@@ -3183,6 +3183,19 @@ rather than one call site).
     unique multisegment, and shared deep-copy paths. GCC and Clang full Meson
     suites pass 75/75.
 
+75. **`3061c9d0`** — **K4.3b transactional topology reshape and contiguous
+    mutable ranges.** Added `EnsureLinear(PacketHandle&) noexcept` with exact
+    already-linear no-op semantics, native DPDK linearization when the head
+    backing and tailroom are safe, and a transactional one-mbuf replacement
+    fallback with source-pool capacity preflight. Added
+    `EnsureContiguous(PacketHandle&, size_t, size_t)` with zero-length
+    no-COW semantics, same-segment writable borrowing, and whole-packet
+    writable-plus-linear slow paths. The replacement copies logical payload,
+    DPDK head metadata, and `BessPacketPrivate` while clearing representation
+    flags. GCC and Clang focused reshape targets pass 22 tests; the full Meson
+    suites pass 75/75. The benchmark reports allocation, copied-byte,
+    freed-segment, and head-replacement attribution for all K4.3b paths.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -5506,11 +5519,13 @@ kMalformedChain
 ```
 
 K4.3a uses `kNullPacket`, `kMalformedChain`, and `kAllocationFailed`;
-`kLengthOutOfRange` and `kInsufficientContiguousCapacity` reserve later
-reshape operations. The caller exclusively owns the descriptor chain.
-`ChainPayloadWritable` walks exactly `nb_segs`, rejects missing or extra
-segments and a logical-length mismatch, and checks every non-empty segment's
-payload storage through `PayloadWriteabilityOf`.
+K4.3b consumes `kLengthOutOfRange` and
+`kInsufficientContiguousCapacity`. The caller exclusively owns the descriptor
+chain.
+`ValidateChain` walks exactly `nb_segs`, rejects missing or extra segments, a
+logical-length mismatch, missing pools, and physical payload bounds.
+`ChainPayloadWritable` then checks every non-empty segment's payload storage
+through `PayloadWriteabilityOf`.
 
 If every segment is writable, `EnsureWritable` returns the same handle and
 topology without allocation. If any payload segment is shared—direct,
@@ -5535,24 +5550,48 @@ bytes copied, segments per operation, head replacement, and allocation
 attribution. These are environment-specific smoke measurements, not a
 performance verdict.
 
-K4.3b remains the future topology and linearization layer.
-`EnsureLinear(PacketHandle&)` guarantees `nb_segs == 1` and is an exact
-no-op for an already-linear packet; it says nothing about payload
-exclusivity. The generic primitive is
-`EnsureContiguous(PacketHandle&, size_t offset, size_t bytes)`, which
-guarantees that the requested range is contiguous and writable;
-`EnsureContiguousPrefix(packet, bytes)` may be a convenience wrapper. The
-initial slow path may use `EnsureWritable` followed by `EnsureLinear`.
-Partial/segment-local COW is a benchmark-gated future optimization, not a
-K4.3b requirement. Cross-segment remove/trim semantics remain future work.
+#### K4.3b — transactional topology reshape and contiguous mutable ranges
+
+K4.3b adds `EnsureLinear(PacketHandle&) noexcept`, returning
+`std::expected<void, ReshapeError>`. It validates the complete descriptor
+chain, returns an exact no-op for `nb_segs == 1` even when the payload backing
+is shared, and otherwise guarantees one segment. The native path is used only
+when the head payload backing is writable—including a zero-length head—and
+its tailroom can hold `pkt_len - head->data_len`; later segments may remain
+read-only because native linearization only reads and frees them. All other
+multisegment paths use a transactional one-mbuf replacement from the source
+pool. The replacement preflights source-pool capacity, copies the complete
+logical payload, DPDK head metadata, and `BessPacketPrivate`, clears indirect
+and external representation flags, and swaps the caller's handle only after
+the replacement is complete. Capacity and allocation failures leave the
+original chain untouched.
+
+`EnsureContiguous(PacketHandle&, size_t offset, size_t bytes) noexcept`
+returns `std::expected<MutableBytes, ReshapeError>`. It validates ranges with
+subtraction-style bounds checks. A zero-length range at any offset through
+`pkt_len` returns an empty span without COW or topology changes. A non-empty
+range wholly inside one writable segment borrows that segment directly;
+shared or cross-segment ranges use `EnsureWritable` followed by `EnsureLinear`
+and return a span into the resulting linear packet. Partial or segment-local
+COW remains outside K4.3b.
+
+The reshape target now covers the null and malformed contracts, shared
+already-linear no-op, native two-segment linearization, writable-head/shared-
+tail reads, zero-length shared heads, replacement capacity and allocation
+failures, metadata/private-state preservation, same-segment writable and COW
+ranges, cross-segment two- and four-segment ranges, byte boundaries, and
+zero-length boundaries. The benchmark adds already-linear, native 2/4-segment,
+replacement 2/4-segment, same-segment writable/shared, and cross 2/4-segment
+paths with `allocations`, `bytes_copied`, `segments_freed`, and
+`head_replacements` counters.
 
 In DPDK 25.11.3, `rte_pktmbuf_linearize` is an exact no-op for an already
 contiguous packet. Its multisegment implementation checks required tailroom
 before mutating the first mbuf, then copies and frees segments without a
-fallible return path. BESS must still preflight chain lengths, physical
-bounds, and writable ownership; when those preconditions cannot be
-guaranteed, replacement-copy semantics remain the safe fallback. K4.4
-remains the future checksum and TX-offload semantic layer.
+fallible return path. BESS still preflights chain topology, physical bounds,
+head writeability, and one-mbuf capacity; replacement-copy semantics are the
+safe fallback when native preconditions do not hold. K4.4 remains the future
+checksum and TX-offload semantic layer.
 
 ---
 
