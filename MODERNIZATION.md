@@ -198,22 +198,24 @@ benchmark attribution; K4.2/K4.2.1 now add checked in-place mutation,
 payload-ownership, and descriptor-ownership primitives. K4.3a, K4.3a.1,
 K4.3b, and K4.3b.1 are CLOSED; K4.3c adds allocation-free cross-segment
 prefix/suffix removal and completes K4 packet topology/ownership mechanics.
-Next: K4.4 checksum/TX-offload primitives, then the performance-gated K4.5
-batch-execution experiment.
+Next: K4.4a packet-aware software checksum semantics, then K4.4b semantic
+TX-offload planning; performance-gated K4.5 follows both.
 The active build K1-K3 are closed. The build graph is Meson/Ninja only. GCC and
 Clang full Meson compiles succeed with pinned DPDK 25.11.3. The registered
 suite has 75 tests: 55 native C++ binaries, benchmark smoke tests (including
 the PMD null/ring smoke), the sample-plugin registry load, the Python target,
 and the module integration run.
-Previous full GCC and Clang Meson runs passed all 75 targets. The K4.3c
-75-target runs passed 73/75 under both compilers: `python_unittest_discover`
-and `module_integration` require root to start the BESS daemon, unavailable in
-this unprivileged session. The other 73 targets, including `packet_reshape_test`
-and benchmark smoke tests, passed under both compilers. K3.4-K3.7's own targets
-(the typed-, masked-backend, extract-plan, and migration unit binaries, the
-WildcardMatch module test, `classifier_typed_bench`, `classifier_masked_bench`,
-and `modules_wildcard_match_bench`) pass under GCC and Clang, with the sanitizer
-coverage noted below.
+Previous full GCC and Clang Meson runs passed all 75 targets. The ordinary
+K4.3c Meson invocations attempted daemon startup through the root-dependent
+launcher; 73/75 targets ran successfully in this unprivileged session.
+`python_unittest_discover` and `module_integration` failed during launcher
+startup. Module integration can separately be exercised against a foreground
+`bessd -skip_root_check -m 0` using the normal gRPC reset/run path documented
+above.
+K3.4-K3.7's own targets (the typed-, masked-backend, extract-plan, and
+migration unit binaries, the WildcardMatch module test, `classifier_typed_bench`,
+`classifier_masked_bench`, and `modules_wildcard_match_bench`) pass under GCC
+and Clang, with the sanitizer coverage noted below.
 The classifier extract-plan and masked-backend tests pass under ASan+UBSan.
 The new `packet_cursor_test` is sanitizer-compiled but cannot execute here:
 DPDK EAL fails its VA/legacy-memory initialization under ASan with an IOVA
@@ -3224,9 +3226,11 @@ rather than one call site).
     exact zero-byte no-op semantics, no payload allocation/copy, logical-head
     metadata promotion, preserved survivor storage/representation, and
     zero-length original-head retention on full removal. GCC and Clang focused
-    reshape targets pass. Each full 75-target run passed 73/75; the two
-    daemon-dependent Python and module integration targets require root,
-    unavailable in this session. Six benchmark paths reported operation
+    reshape targets pass. Each ordinary full 75-target Meson invocation ran
+    73/75 targets; `python_unittest_discover` and `module_integration` failed
+    at root-dependent daemon startup. A foreground `bessd -skip_root_check -m 0`
+    supports a separate module-integration gRPC reset/run path. Six benchmark
+
     attribution counters; CPU2 diagnostics observed IRQ/softirq traffic, so no
     timing result is treated as a performance verdict. GCC and Clang builds
     used `-j4`, respecting the existing hard cap.
@@ -5687,9 +5691,95 @@ diagnostics. All paths reported zero allocations and zero copied bytes:
 
 CPU2 diagnostics observed IRQ and softirq activity, so timing is smoke data
 only and not a performance verdict. K4 topology/ownership mechanics are
-complete. Next: K4.4 checksum and TX-offload primitives, then performance-gated
-K4.5 batch/ILP experiments; no loop migration or prefetch policy without
-measured benefit.
+complete. K4.4 is split below into software checksum semantics (K4.4a) and
+semantic TX-offload planning (K4.4b). K4.5 follows both and remains
+performance-gated; no backend winner, loop migration, or prefetch policy is
+adopted without measured benefit.
+
+#### K4.4a — packet-aware software checksum plan
+
+K4.4a defines generic packet checksum semantics independently of Ethernet
+encapsulation, tunnels, NAT, modules, or a particular backend. Existing
+`core/utils/checksum.h` contains contiguous-buffer checksum machinery and
+IPv4 header/UDP/TCP routines. The pinned DPDK 25.11.3 headers also provide
+chain-aware `rte_raw_cksum_mbuf`, `rte_ipv4_udptcp_cksum_mbuf`, and
+`rte_ipv6_udptcp_cksum_mbuf` routines for comparison and implementation
+options.
+
+A candidate API (names remain subject to review):
+
+```cpp
+enum class IpVersion : uint8_t { kIpv4, kIpv6 };
+enum class TransportProtocol : uint8_t { kNone, kUdp, kTcp };
+
+struct ChecksumPlan {
+  size_t network_offset;
+  size_t transport_offset;
+  IpVersion ip_version;
+  TransportProtocol transport;
+  bool network_checksum;   // IPv4 header checksum only
+  bool transport_checksum;
+};
+
+std::expected<void, ChecksumError> ApplySoftwareChecksums(
+    PacketHandle &packet, const ChecksumPlan &plan) noexcept;
+```
+
+Validate and read headers with `PacketCursor`; calculate over the logical
+packet chain without flattening it. A chain-aware raw checksum can consume
+payload in place. DPDK's IPv4/IPv6 mbuf helpers still require a contiguous IP
+header argument, so split headers need cursor reads or a small header
+snapshot—not payload linearization. The IPv6 DPDK helper requires no
+extension headers and a zeroed L4 checksum field; K4.4a must either handle
+extension-header lengths explicitly or reject them, rather than silently
+assuming the helper covers them. Define fragmented-datagram behavior too.
+
+Writing the resulting checksum is distinct from reading/checksumming the
+payload. `EnsureContiguous` can return an in-segment writable range directly,
+but a range that crosses segments causes the current implementation to call
+`EnsureLinear` on the full packet. K4.4a must make this split-field write
+tradeoff explicit and test it; do not claim a narrow, payload-preserving write
+path from `EnsureContiguous` alone.
+
+Coverage and acceptance:
+
+- IPv4 header checksums, including IPv4 options; UDP/TCP over IPv4 and IPv6.
+- Known-good wire vectors, including protocol-specific UDP zero-checksum
+  behavior; exercise IP/transport headers split at every relevant segment
+  boundary, including checksum-field splits.
+- Two- and four-segment payloads, cloned packets, external buffers, and
+  malformed or incomplete lengths with explicit errors.
+- Compare bytes against existing BESS routines where applicable and DPDK
+  contiguous/chain-aware routines on supported inputs. DPDK helpers may return
+  dummy values for invalid inputs, so they are references, not validation.
+
+#### K4.4b — semantic TX checksum-offload plan
+
+K4.4b expresses checksum intent and device support semantically, then maps
+that plan to PMD-specific metadata at the transmit boundary. `PmdCapabilities`
+already retains `tx_offload_capa`, while the current `default_eth_conf`
+configures RX scatter and leaves TX offloads disabled.
+
+Derive `TxChecksumCapabilities` from `PmdCapabilities::tx_offload_capa`.
+Keep `TxChecksumCapabilities` and `TxOffloadPlan` backend-neutral at module
+boundaries; translate them to DPDK offload flags and mbuf `l2_len`/`l3_len`
+only inside PMD integration. The K4.4a software path is the semantic oracle:
+hardware preparation is valid only when the device supports the requested
+operation and yields equivalent packet bytes/checksum semantics; unsupported
+layouts use the software path.
+
+Checksum metadata must not survive mutation of covered bytes or header
+offsets. Establish the actual mutation/enqueue boundary before enabling
+offloads, and build or validate the final plan after the last relevant packet
+mutation; avoid a graph-wide invalidation mechanism without a proven need.
+
+K4.4 checksum measurements should compare five cases: existing BESS
+contiguous checksums; DPDK contiguous checksums; chain-aware DPDK/BESS
+checksums; the generic K4.4 software plan; and TX-offload metadata preparation
+only. Report topology and operation-attribution counters separately from
+timing. Do not choose a checksum backend without repeatable measurements.
+K4.5 batch/ILP experiments remain downstream of both K4.4a and K4.4b.
+
 
 ---
 
