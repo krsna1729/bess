@@ -63,6 +63,20 @@ std::expected<void, ReshapeError> EnsureLinear(
 std::expected<MutableBytes, ReshapeError> EnsureContiguous(
     ::bess::PacketHandle &packet, size_t offset, size_t bytes) noexcept;
 
+// Removes a prefix across the descriptor chain without copying payload bytes
+// or requiring exclusive payload backing. The caller must exclusively own
+// the descriptor chain. Removing the full packet retains its existing head
+// as a valid zero-length, single-segment packet.
+std::expected<void, ReshapeError> RemovePrefix(::bess::PacketHandle &packet,
+                                               size_t bytes) noexcept;
+
+// Trims a suffix across the descriptor chain without copying payload bytes or
+// requiring exclusive payload backing. The caller must exclusively own the
+// descriptor chain. Removing the full packet retains its existing head as a
+// valid zero-length, single-segment packet.
+std::expected<void, ReshapeError> TrimSuffix(::bess::PacketHandle &packet,
+                                             size_t bytes) noexcept;
+
 }  // namespace bess::packet
 
 #endif  // BESS_PACKET_RESHAPE_H_

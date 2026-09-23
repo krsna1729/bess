@@ -53,8 +53,8 @@
 #include "packet.h"
 #include "packet_cursor.h"
 #include "packet_mutation.h"
-#include "packet_reshape.h"
 #include "packet_pool.h"
+#include "packet_reshape.h"
 #include "pktbatch.h"
 
 namespace {
@@ -127,7 +127,6 @@ void BM_PacketAppendTrim(benchmark::State &state) {
   bess::PacketFree(pkt_handle);
 }
 BENCHMARK(BM_PacketAppendTrim);
-
 
 // Every module attribute read/write (Module::get_attr/set_attr/ptr_attr,
 // module.h) funnels through PacketRef::metadata<T>(), which resolves via
@@ -314,8 +313,8 @@ void BM_PacketCursorSequentialRead(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();
   const size_t batch = static_cast<size_t>(state.range(0));
   constexpr size_t kMaxBatch = 32;
-  constexpr size_t kBytesPerRead = sizeof(uint8_t) + sizeof(uint16_t) +
-                                   sizeof(uint32_t) + sizeof(uint64_t);
+  constexpr size_t kBytesPerRead =
+      sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint32_t) + sizeof(uint64_t);
   std::array<bess::PacketHandle, kMaxBatch> pkts{};
   CHECK(pool.AllocBulk(pkts.data(), batch, 32));
 
@@ -329,8 +328,7 @@ void BM_PacketCursorSequentialRead(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations() * batch * 4);
   state.SetBytesProcessed(state.iterations() * batch * kBytesPerRead);
   state.counters["fields/read"] = 4;
-  state.counters["bytes_copied/read"] =
-      static_cast<double>(kBytesPerRead);
+  state.counters["bytes_copied/read"] = static_cast<double>(kBytesPerRead);
   state.counters["segment_transitions/read"] = 0;
 
   bess::PacketFreeBulk(pkts.data(), batch);
@@ -353,8 +351,8 @@ enum class MutationBenchmarkOp : uint8_t {
   kTrimSuffix,
 };
 
-bess::PacketHandle BuildMutationBenchmarkPacket(
-    bess::PlainPacketPool &pool, size_t shape) {
+bess::PacketHandle BuildMutationBenchmarkPacket(bess::PlainPacketPool &pool,
+                                                size_t shape) {
   const std::array<std::array<size_t, 2>, 2> lengths = {{
       {128, 0},
       {64, 64},
@@ -401,8 +399,7 @@ void RunMutationBenchmark(benchmark::State &state,
     if constexpr (Checked) {
       switch (operation) {
         case MutationBenchmarkOp::kPrepend:
-          benchmark::DoNotOptimize(
-              bess::packet::PrependInPlace(ref, bytes));
+          benchmark::DoNotOptimize(bess::packet::PrependInPlace(ref, bytes));
           break;
         case MutationBenchmarkOp::kAppend:
           benchmark::DoNotOptimize(bess::packet::AppendInPlace(ref, bytes));
@@ -412,8 +409,7 @@ void RunMutationBenchmark(benchmark::State &state,
               bess::packet::RemovePrefixInPlace(ref, bytes));
           break;
         case MutationBenchmarkOp::kTrimSuffix:
-          benchmark::DoNotOptimize(
-              bess::packet::TrimSuffixInPlace(ref, bytes));
+          benchmark::DoNotOptimize(bess::packet::TrimSuffixInPlace(ref, bytes));
           break;
       }
     } else {
@@ -441,8 +437,7 @@ void RunMutationBenchmark(benchmark::State &state,
   auto reset = [&](bess::PacketHandle packet) {
     switch (operation) {
       case MutationBenchmarkOp::kPrepend:
-        CHECK(rte_pktmbuf_adj(packet, static_cast<uint16_t>(bytes)) !=
-              nullptr);
+        CHECK(rte_pktmbuf_adj(packet, static_cast<uint16_t>(bytes)) != nullptr);
         break;
       case MutationBenchmarkOp::kAppend:
         CHECK(rte_pktmbuf_trim(packet, static_cast<uint16_t>(bytes)) == 0);
@@ -622,8 +617,9 @@ enum class EnsureWritableBenchmarkPath : uint8_t {
   kSharedCow,
 };
 
-bess::PacketHandle BuildReshapeBenchmarkPacket(
-    bess::PlainPacketPool &pool, size_t bytes, bool multisegment) {
+bess::PacketHandle BuildReshapeBenchmarkPacket(bess::PlainPacketPool &pool,
+                                               size_t bytes,
+                                               bool multisegment) {
   if (!multisegment) {
     bess::PacketHandle packet = pool.Alloc(bytes);
     CHECK(packet != nullptr);
@@ -692,8 +688,7 @@ void RunEnsureWritableBenchmark(benchmark::State &state,
   }
 
   state.SetItemsProcessed(state.iterations());
-  state.counters["bytes_copied/op"] =
-      shared ? static_cast<double>(bytes) : 0;
+  state.counters["bytes_copied/op"] = shared ? static_cast<double>(bytes) : 0;
   state.counters["segments/op"] = baseline_segments;
   state.counters["head_replaced/op"] = shared ? 1 : 0;
   state.counters["allocation/op"] = shared ? 1 : 0;
@@ -984,6 +979,121 @@ BENCHMARK(BM_EnsureContiguousCrossesTwoSegments);
 BENCHMARK(BM_EnsureContiguousCrossesFourSegments);
 BENCHMARK(BM_EnsureContiguousCrossesTwoSegmentsSharedTail);
 
+enum class TopologyRemovalBenchmarkPath : uint8_t {
+  kPrefixWithinHead,
+  kPrefixAcrossTwoSegments,
+  kPrefixAcrossFourSegments,
+  kSuffixWithinTail,
+  kSuffixAcrossTwoSegments,
+  kSuffixAcrossFourSegments,
+};
+
+void RunTopologyRemovalBenchmark(benchmark::State &state,
+                                 TopologyRemovalBenchmarkPath path) {
+  bess::PlainPacketPool &pool = GetPool();
+  bool remove_prefix = false;
+  size_t segments = 0;
+  size_t bytes_removed = 0;
+  size_t segments_freed = 0;
+  size_t head_replacements = 0;
+  switch (path) {
+    case TopologyRemovalBenchmarkPath::kPrefixWithinHead:
+      remove_prefix = true;
+      segments = 2;
+      bytes_removed = 16;
+      break;
+    case TopologyRemovalBenchmarkPath::kPrefixAcrossTwoSegments:
+      remove_prefix = true;
+      segments = 2;
+      bytes_removed = 80;
+      segments_freed = 1;
+      head_replacements = 1;
+      break;
+    case TopologyRemovalBenchmarkPath::kPrefixAcrossFourSegments:
+      remove_prefix = true;
+      segments = 4;
+      bytes_removed = 200;
+      segments_freed = 3;
+      head_replacements = 1;
+      break;
+    case TopologyRemovalBenchmarkPath::kSuffixWithinTail:
+      segments = 2;
+      bytes_removed = 16;
+      break;
+    case TopologyRemovalBenchmarkPath::kSuffixAcrossTwoSegments:
+      segments = 2;
+      bytes_removed = 80;
+      segments_freed = 1;
+      break;
+    case TopologyRemovalBenchmarkPath::kSuffixAcrossFourSegments:
+      segments = 4;
+      bytes_removed = 200;
+      segments_freed = 3;
+      break;
+  }
+
+  bess::PacketHandle packet = BuildFixedReshapeChain(pool, segments);
+  for (auto _ : state) {
+    const auto result = remove_prefix
+                            ? bess::packet::RemovePrefix(packet, bytes_removed)
+                            : bess::packet::TrimSuffix(packet, bytes_removed);
+    CHECK(result.has_value());
+    CHECK_EQ(packet->pkt_len, segments * 64 - bytes_removed);
+    CHECK_EQ(packet->nb_segs, segments - segments_freed);
+    benchmark::DoNotOptimize(packet);
+
+    state.PauseTiming();
+    bess::PacketFree(packet);
+    packet = BuildFixedReshapeChain(pool, segments);
+    state.ResumeTiming();
+  }
+
+  state.SetItemsProcessed(state.iterations());
+  state.counters["allocations"] = 0;
+  state.counters["bytes_copied"] = 0;
+  state.counters["segments_freed"] = segments_freed;
+  state.counters["head_replacements"] = head_replacements;
+  state.counters["bytes_removed"] = bytes_removed;
+  bess::PacketFree(packet);
+}
+
+void BM_RemovePrefixWithinHead(benchmark::State &state) {
+  RunTopologyRemovalBenchmark(state,
+                              TopologyRemovalBenchmarkPath::kPrefixWithinHead);
+}
+
+void BM_RemovePrefixAcrossTwoSegments(benchmark::State &state) {
+  RunTopologyRemovalBenchmark(
+      state, TopologyRemovalBenchmarkPath::kPrefixAcrossTwoSegments);
+}
+
+void BM_RemovePrefixAcrossFourSegments(benchmark::State &state) {
+  RunTopologyRemovalBenchmark(
+      state, TopologyRemovalBenchmarkPath::kPrefixAcrossFourSegments);
+}
+
+void BM_TrimSuffixWithinTail(benchmark::State &state) {
+  RunTopologyRemovalBenchmark(state,
+                              TopologyRemovalBenchmarkPath::kSuffixWithinTail);
+}
+
+void BM_TrimSuffixAcrossTwoSegments(benchmark::State &state) {
+  RunTopologyRemovalBenchmark(
+      state, TopologyRemovalBenchmarkPath::kSuffixAcrossTwoSegments);
+}
+
+void BM_TrimSuffixAcrossFourSegments(benchmark::State &state) {
+  RunTopologyRemovalBenchmark(
+      state, TopologyRemovalBenchmarkPath::kSuffixAcrossFourSegments);
+}
+
+BENCHMARK(BM_RemovePrefixWithinHead);
+BENCHMARK(BM_RemovePrefixAcrossTwoSegments);
+BENCHMARK(BM_RemovePrefixAcrossFourSegments);
+BENCHMARK(BM_TrimSuffixWithinTail);
+BENCHMARK(BM_TrimSuffixAcrossTwoSegments);
+BENCHMARK(BM_TrimSuffixAcrossFourSegments);
+
 void BM_PacketCursorChainRead(benchmark::State &state) {
   bess::PlainPacketPool &pool = GetPool();
   const size_t width = static_cast<size_t>(state.range(0));
@@ -1013,8 +1123,7 @@ void BM_PacketCursorChainRead(benchmark::State &state) {
     transitions = (offset + width - 1) / 16 - offset / 16;
   }
   state.counters["bytes_copied/read"] = static_cast<double>(width);
-  state.counters["segment_transitions/read"] =
-      static_cast<double>(transitions);
+  state.counters["segment_transitions/read"] = static_cast<double>(transitions);
 
   bess::PacketFreeBulk(pkts.data(), batch);
 }
@@ -1042,8 +1151,8 @@ void BM_PacketRead(benchmark::State &state) {
         benchmark::DoNotOptimize(cursor.Skip(offset));
         ReadCursorWidth(cursor, width);
       } else {
-        std::memcpy(out.data(),
-                    packet.head_data<const std::byte *>() + offset, width);
+        std::memcpy(out.data(), packet.head_data<const std::byte *>() + offset,
+                    width);
       }
       benchmark::DoNotOptimize(out);
     }

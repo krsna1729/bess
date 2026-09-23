@@ -44,17 +44,19 @@
 
 namespace {
 
+using bess::kPacketPrivateSize;
 using bess::PacketFree;
 using bess::PacketHandle;
 using bess::PacketRef;
 using bess::PlainPacketPool;
-using bess::kPacketPrivateSize;
 using bess::packet::EnsureContiguous;
 using bess::packet::EnsureLinear;
 using bess::packet::EnsureWritable;
 using bess::packet::PayloadWriteability;
 using bess::packet::PayloadWriteabilityOf;
+using bess::packet::RemovePrefix;
 using bess::packet::ReshapeError;
+using bess::packet::TrimSuffix;
 
 std::vector<std::byte> Pattern(size_t size) {
   std::vector<std::byte> bytes(size);
@@ -149,16 +151,16 @@ PacketHandle MakeExternal(PlainPacketPool &pool, int *free_count,
   auto *buffer = new unsigned char[4096];
   auto *owner = new ExternalBufferOwner{free_count};
   uint16_t buffer_len = 4096;
-  auto *shinfo = rte_pktmbuf_ext_shinfo_init_helper(
-      buffer, &buffer_len, FreeExternalBuffer, owner);
+  auto *shinfo = rte_pktmbuf_ext_shinfo_init_helper(buffer, &buffer_len,
+                                                    FreeExternalBuffer, owner);
   if (shinfo == nullptr) {
     delete[] buffer;
     delete owner;
     return nullptr;
   }
 
-  PacketHandle packet = pool.AllocExternal(
-      buffer, RTE_BAD_IOVA, buffer_len, shinfo, data_len);
+  PacketHandle packet =
+      pool.AllocExternal(buffer, RTE_BAD_IOVA, buffer_len, shinfo, data_len);
   if (packet == nullptr) {
     delete[] buffer;
     delete owner;
@@ -198,6 +200,11 @@ void SetPrivate(PacketHandle packet, std::byte value) {
 struct HeadState {
   PacketHandle handle;
   PacketHandle next;
+  void *buf_addr;
+  rte_iova_t buf_iova;
+  rte_mempool *pool;
+  rte_mbuf_ext_shared_info *shinfo;
+  uint16_t buf_len;
   uint16_t data_off;
   uint16_t data_len;
   uint16_t nb_segs;
@@ -221,6 +228,11 @@ HeadState TakeHeadState(PacketHandle packet) {
   HeadState state;
   state.handle = packet;
   state.next = packet->next;
+  state.buf_addr = packet->buf_addr;
+  state.buf_iova = packet->buf_iova;
+  state.pool = packet->pool;
+  state.shinfo = packet->shinfo;
+  state.buf_len = packet->buf_len;
   state.data_off = packet->data_off;
   state.data_len = packet->data_len;
   state.nb_segs = packet->nb_segs;
@@ -246,6 +258,11 @@ void ExpectHeadStateUnchanged(PacketHandle packet, const HeadState &expected) {
   const HeadState actual = TakeHeadState(packet);
   EXPECT_EQ(actual.handle, expected.handle);
   EXPECT_EQ(actual.next, expected.next);
+  EXPECT_EQ(actual.buf_addr, expected.buf_addr);
+  EXPECT_EQ(actual.buf_iova, expected.buf_iova);
+  EXPECT_EQ(actual.pool, expected.pool);
+  EXPECT_EQ(actual.shinfo, expected.shinfo);
+  EXPECT_EQ(actual.buf_len, expected.buf_len);
   EXPECT_EQ(actual.data_off, expected.data_off);
   EXPECT_EQ(actual.data_len, expected.data_len);
   EXPECT_EQ(actual.nb_segs, expected.nb_segs);
@@ -287,10 +304,30 @@ void ExpectCopiedHeadState(PacketHandle packet, const HeadState &expected) {
   EXPECT_EQ(packet->ol_flags, expected.ol_flags & ~representation_flags);
 }
 
+void ExpectPromotedHeadMetadata(PacketHandle packet,
+                                const HeadState &expected) {
+  EXPECT_EQ(packet->port, expected.port);
+  EXPECT_EQ(packet->vlan_tci, expected.vlan_tci);
+  EXPECT_EQ(packet->vlan_tci_outer, expected.vlan_tci_outer);
+  EXPECT_EQ(packet->timesync, expected.timesync);
+  EXPECT_EQ(packet->packet_type, expected.packet_type);
+  EXPECT_EQ(packet->tx_offload, expected.tx_offload);
+  EXPECT_EQ(packet->hash.rss, expected.hash_rss);
+  const uint64_t representation_flags =
+      RTE_MBUF_F_INDIRECT | RTE_MBUF_F_EXTERNAL;
+  EXPECT_EQ(packet->ol_flags & ~representation_flags,
+            expected.ol_flags & ~representation_flags);
+  std::array<uint32_t, 9> actual_dynfield1;
+  std::copy(std::begin(packet->dynfield1), std::end(packet->dynfield1),
+            actual_dynfield1.begin());
+  EXPECT_EQ(actual_dynfield1, expected.dynfield1);
+  EXPECT_EQ(PrivateBytes(packet), expected.private_bytes);
+}
+
 void SeedHeadMetadata(PacketHandle packet) {
   packet->port = 0x1234;
-  packet->packet_type = RTE_PTYPE_L2_ETHER | RTE_PTYPE_L3_IPV4 |
-                        RTE_PTYPE_L4_UDP;
+  packet->packet_type =
+      RTE_PTYPE_L2_ETHER | RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L4_UDP;
   packet->hash.rss = 0x89abcdef;
   packet->vlan_tci = 0x1357;
   packet->vlan_tci_outer = 0x2468;
@@ -308,9 +345,8 @@ void SeedHeadMetadata(PacketHandle packet) {
 bool ChainPayloadWritable(PacketHandle packet) {
   for (PacketHandle segment = packet; segment != nullptr;
        segment = segment->next) {
-    if (segment->data_len != 0 &&
-        PayloadWriteabilityOf(PacketRef(segment)) !=
-            PayloadWriteability::kWritable) {
+    if (segment->data_len != 0 && PayloadWriteabilityOf(PacketRef(segment)) !=
+                                      PayloadWriteability::kWritable) {
       return false;
     }
   }
@@ -341,7 +377,8 @@ TEST(PacketReshapeTest, NullAndUniquePacketsAreStrictNoOps) {
 
   PlainPacketPool pool(32, -1, 256);
   const std::vector<std::byte> direct_bytes = Pattern(64);
-  PacketHandle direct = pool.AllocCopy(direct_bytes.data(), direct_bytes.size());
+  PacketHandle direct =
+      pool.AllocCopy(direct_bytes.data(), direct_bytes.size());
   ASSERT_NE(direct, nullptr);
   const PacketHandle direct_head = direct;
   const size_t direct_available = pool.Size();
@@ -1080,11 +1117,13 @@ TEST(PacketReshapeTest, MalformedChainFailsWithoutMutation) {
       "data_off + data_len > buf_len",
       "pool == nullptr",
   };
-  const std::array<Case, 7> cases = {
-      Case::kZeroSegments,       Case::kTooManySegments,
-      Case::kExtraNext,          Case::kLengthMismatch,
-      Case::kDataOffsetPastBuffer, Case::kDataRangePastBuffer,
-      Case::kMissingPool};
+  const std::array<Case, 7> cases = {Case::kZeroSegments,
+                                     Case::kTooManySegments,
+                                     Case::kExtraNext,
+                                     Case::kLengthMismatch,
+                                     Case::kDataOffsetPastBuffer,
+                                     Case::kDataRangePastBuffer,
+                                     Case::kMissingPool};
 
   for (size_t case_index = 0; case_index < cases.size(); case_index++) {
     SCOPED_TRACE(names[case_index]);
@@ -1125,8 +1164,8 @@ TEST(PacketReshapeTest, MalformedChainFailsWithoutMutation) {
         break;
       case Case::kDataRangePastBuffer:
         ASSERT_GT(packet->buf_len, packet->data_len);
-        packet->data_off = static_cast<uint16_t>(
-            packet->buf_len - packet->data_len + 1);
+        packet->data_off =
+            static_cast<uint16_t>(packet->buf_len - packet->data_len + 1);
         break;
       case Case::kMissingPool:
         packet->pool = nullptr;
@@ -1200,4 +1239,543 @@ TEST(PacketReshapeTest, MalformedChainFailsWithoutMutation) {
   }
 }
 
+TEST(PacketReshapeTest, TopologyRemovalValidatesAndPreservesNoOps) {
+  PacketHandle null_packet = nullptr;
+  auto null_prefix = RemovePrefix(null_packet, 0);
+  ASSERT_FALSE(null_prefix.has_value());
+  EXPECT_EQ(null_prefix.error(), ReshapeError::kNullPacket);
+  auto null_suffix = TrimSuffix(null_packet, 0);
+  ASSERT_FALSE(null_suffix.has_value());
+  EXPECT_EQ(null_suffix.error(), ReshapeError::kNullPacket);
+
+  PlainPacketPool pool(8, -1, 128);
+  const std::vector<std::byte> bytes = Pattern(64);
+  const std::array<size_t, 2> lengths = {32, 32};
+  PacketHandle packet = BuildChain(pool, lengths, bytes);
+  ASSERT_NE(packet, nullptr);
+  SeedHeadMetadata(packet);
+  SetPrivate(packet, static_cast<std::byte>(0x61));
+  PacketHandle tail = packet->next;
+  SetPrivate(tail, static_cast<std::byte>(0x2a));
+  const PacketHandle original = packet;
+  const HeadState head_before = TakeHeadState(packet);
+  const HeadState tail_before = TakeHeadState(tail);
+  const size_t available_before = pool.Size();
+
+  auto zero_prefix = RemovePrefix(packet, 0);
+  ASSERT_TRUE(zero_prefix.has_value());
+  auto zero_suffix = TrimSuffix(packet, 0);
+  ASSERT_TRUE(zero_suffix.has_value());
+  EXPECT_EQ(packet, original);
+  ExpectHeadStateUnchanged(packet, head_before);
+  ExpectHeadStateUnchanged(tail, tail_before);
+  EXPECT_EQ(pool.Size(), available_before);
+
+  auto out_of_range_prefix = RemovePrefix(packet, bytes.size() + 1);
+  ASSERT_FALSE(out_of_range_prefix.has_value());
+  EXPECT_EQ(out_of_range_prefix.error(), ReshapeError::kLengthOutOfRange);
+  auto out_of_range_suffix = TrimSuffix(packet, bytes.size() + 1);
+  ASSERT_FALSE(out_of_range_suffix.has_value());
+  EXPECT_EQ(out_of_range_suffix.error(), ReshapeError::kLengthOutOfRange);
+  EXPECT_EQ(packet, original);
+  ExpectHeadStateUnchanged(packet, head_before);
+  ExpectHeadStateUnchanged(tail, tail_before);
+  EXPECT_EQ(pool.Size(), available_before);
+
+  packet->nb_segs = 1;
+  const HeadState malformed_head_before = TakeHeadState(packet);
+  const HeadState malformed_tail_before = TakeHeadState(tail);
+  auto malformed_prefix = RemovePrefix(packet, 1);
+  ASSERT_FALSE(malformed_prefix.has_value());
+  EXPECT_EQ(malformed_prefix.error(), ReshapeError::kMalformedChain);
+  auto malformed_suffix = TrimSuffix(packet, 1);
+  ASSERT_FALSE(malformed_suffix.has_value());
+  EXPECT_EQ(malformed_suffix.error(), ReshapeError::kMalformedChain);
+  EXPECT_EQ(packet, original);
+  ExpectHeadStateUnchanged(packet, malformed_head_before);
+  ExpectHeadStateUnchanged(tail, malformed_tail_before);
+  EXPECT_EQ(pool.Size(), available_before);
+
+  packet->nb_segs = 2;
+  PacketFree(packet);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+TEST(PacketReshapeTest, PrefixRemovalHandlesBoundariesAndCrossings) {
+  struct Case {
+    size_t bytes_removed;
+    size_t first_kept_segment;
+    uint16_t first_kept_length;
+  };
+  constexpr std::array<Case, 6> cases = {{
+      {1, 0, 31},
+      {16, 0, 16},
+      {32, 1, 32},
+      {40, 1, 24},
+      {64, 2, 32},
+      {100, 3, 28},
+  }};
+  const std::array<size_t, 4> lengths = {32, 32, 32, 32};
+  const std::vector<std::byte> bytes = Pattern(128);
+  PlainPacketPool pool(32, -1, 128);
+
+  for (const Case &test_case : cases) {
+    SCOPED_TRACE(test_case.bytes_removed);
+    PacketHandle packet = BuildChain(pool, lengths, bytes);
+    ASSERT_NE(packet, nullptr);
+    SeedHeadMetadata(packet);
+    SetPrivate(packet, static_cast<std::byte>(0x73));
+    const HeadState logical_head = TakeHeadState(packet);
+    std::array<PacketHandle, 4> segments{};
+    std::array<HeadState, 4> segment_states{};
+    segments[0] = packet;
+    for (size_t i = 1; i < segments.size(); i++) {
+      segments[i] = segments[i - 1]->next;
+    }
+    for (size_t i = 0; i < segments.size(); i++) {
+      segment_states[i] = TakeHeadState(segments[i]);
+    }
+    const size_t available_before = pool.Size();
+
+    auto result = RemovePrefix(packet, test_case.bytes_removed);
+    ASSERT_TRUE(result.has_value());
+    const size_t bytes_into_head =
+        test_case.bytes_removed - test_case.first_kept_segment * 32;
+    EXPECT_EQ(packet, segments[test_case.first_kept_segment]);
+    EXPECT_EQ(packet->data_off,
+              segment_states[test_case.first_kept_segment].data_off +
+                  bytes_into_head);
+    EXPECT_EQ(packet->data_len, test_case.first_kept_length);
+    EXPECT_EQ(packet->pkt_len, bytes.size() - test_case.bytes_removed);
+    EXPECT_EQ(packet->nb_segs, segments.size() - test_case.first_kept_segment);
+    EXPECT_EQ(packet->next, test_case.first_kept_segment + 1 < segments.size()
+                                ? segments[test_case.first_kept_segment + 1]
+                                : nullptr);
+    EXPECT_EQ(packet->buf_addr,
+              segment_states[test_case.first_kept_segment].buf_addr);
+    EXPECT_EQ(packet->buf_iova,
+              segment_states[test_case.first_kept_segment].buf_iova);
+    EXPECT_EQ(packet->buf_len,
+              segment_states[test_case.first_kept_segment].buf_len);
+    EXPECT_EQ(packet->pool, segment_states[test_case.first_kept_segment].pool);
+    EXPECT_EQ(rte_mbuf_refcnt_read(packet),
+              segment_states[test_case.first_kept_segment].refcnt);
+    ExpectPromotedHeadMetadata(packet, logical_head);
+    EXPECT_EQ(PacketBytes(packet),
+              std::vector<std::byte>(bytes.begin() + test_case.bytes_removed,
+                                     bytes.end()));
+    EXPECT_EQ(pool.Size(), available_before + test_case.first_kept_segment);
+    for (size_t i = test_case.first_kept_segment; i < segments.size(); i++) {
+      EXPECT_EQ(segments[i]->buf_addr, segment_states[i].buf_addr);
+      EXPECT_EQ(segments[i]->buf_iova, segment_states[i].buf_iova);
+    }
+
+    PacketFree(packet);
+    EXPECT_EQ(pool.Size(), pool.Capacity());
+  }
+}
+
+TEST(PacketReshapeTest, SuffixTrimHandlesBoundariesAndCrossings) {
+  struct Case {
+    size_t bytes_removed;
+    size_t kept_segments;
+    uint16_t last_kept_length;
+  };
+  constexpr std::array<Case, 6> cases = {{
+      {1, 4, 31},
+      {16, 4, 16},
+      {32, 3, 32},
+      {40, 3, 24},
+      {64, 2, 32},
+      {100, 1, 28},
+  }};
+  const std::array<size_t, 4> lengths = {32, 32, 32, 32};
+  const std::vector<std::byte> bytes = Pattern(128);
+  PlainPacketPool pool(32, -1, 128);
+
+  for (const Case &test_case : cases) {
+    SCOPED_TRACE(test_case.bytes_removed);
+    PacketHandle packet = BuildChain(pool, lengths, bytes);
+    ASSERT_NE(packet, nullptr);
+    SeedHeadMetadata(packet);
+    SetPrivate(packet, static_cast<std::byte>(0x85));
+    const HeadState logical_head = TakeHeadState(packet);
+    std::array<PacketHandle, 4> segments{};
+    std::array<HeadState, 4> segment_states{};
+    segments[0] = packet;
+    for (size_t i = 1; i < segments.size(); i++) {
+      segments[i] = segments[i - 1]->next;
+    }
+    for (size_t i = 0; i < segments.size(); i++) {
+      segment_states[i] = TakeHeadState(segments[i]);
+    }
+    const size_t available_before = pool.Size();
+
+    auto result = TrimSuffix(packet, test_case.bytes_removed);
+    ASSERT_TRUE(result.has_value());
+    const size_t kept_length = bytes.size() - test_case.bytes_removed;
+    const size_t last_kept = test_case.kept_segments - 1;
+    EXPECT_EQ(packet, segments[0]);
+    EXPECT_EQ(packet->data_off, segment_states[0].data_off);
+    EXPECT_EQ(packet->data_len, test_case.kept_segments == 1
+                                    ? test_case.last_kept_length
+                                    : segment_states[0].data_len);
+    EXPECT_EQ(packet->pkt_len, kept_length);
+    EXPECT_EQ(packet->nb_segs, test_case.kept_segments);
+    EXPECT_EQ(segments[last_kept]->data_len, test_case.last_kept_length);
+    EXPECT_EQ(segments[last_kept]->next, nullptr);
+    EXPECT_EQ(packet->buf_addr, segment_states[0].buf_addr);
+    EXPECT_EQ(packet->buf_iova, segment_states[0].buf_iova);
+    EXPECT_EQ(packet->buf_len, segment_states[0].buf_len);
+    EXPECT_EQ(packet->pool, segment_states[0].pool);
+    EXPECT_EQ(rte_mbuf_refcnt_read(packet), segment_states[0].refcnt);
+    ExpectPromotedHeadMetadata(packet, logical_head);
+    EXPECT_EQ(
+        PacketBytes(packet),
+        std::vector<std::byte>(bytes.begin(), bytes.begin() + kept_length));
+    EXPECT_EQ(pool.Size(),
+              available_before + segments.size() - test_case.kept_segments);
+    for (size_t i = 0; i < test_case.kept_segments; i++) {
+      EXPECT_EQ(segments[i]->buf_addr, segment_states[i].buf_addr);
+      EXPECT_EQ(segments[i]->buf_iova, segment_states[i].buf_iova);
+    }
+
+    PacketFree(packet);
+    EXPECT_EQ(pool.Size(), pool.Capacity());
+  }
+}
+
+TEST(PacketReshapeTest, FullRemovalRetainsExistingZeroLengthHead) {
+  const std::array<size_t, 2> lengths = {32, 32};
+  const std::vector<std::byte> bytes = Pattern(64);
+
+  for (bool remove_prefix : {true, false}) {
+    SCOPED_TRACE(remove_prefix ? "prefix" : "suffix");
+    PlainPacketPool pool(8, -1, 128);
+    PacketHandle packet = BuildChain(pool, lengths, bytes);
+    ASSERT_NE(packet, nullptr);
+    SeedHeadMetadata(packet);
+    SetPrivate(packet, static_cast<std::byte>(0x4a));
+    const PacketHandle original = packet;
+    const HeadState before = TakeHeadState(packet);
+    const size_t available_before = pool.Size();
+
+    auto result = remove_prefix ? RemovePrefix(packet, bytes.size())
+                                : TrimSuffix(packet, bytes.size());
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(packet, original);
+    EXPECT_EQ(packet->next, nullptr);
+    EXPECT_EQ(packet->data_off, before.data_off);
+    EXPECT_EQ(packet->data_len, 0);
+    EXPECT_EQ(packet->pkt_len, 0);
+    EXPECT_EQ(packet->nb_segs, 1);
+    EXPECT_EQ(PacketBytes(packet), std::vector<std::byte>{});
+    ExpectPromotedHeadMetadata(packet, before);
+    EXPECT_EQ(pool.Size(), available_before + 1);
+
+    PacketFree(packet);
+    EXPECT_EQ(pool.Size(), pool.Capacity());
+  }
+}
+
+TEST(PacketReshapeTest, SuccessfulRemovalNeedsNoAvailablePoolEntries) {
+  const std::array<size_t, 4> lengths = {32, 32, 32, 32};
+  const std::vector<std::byte> bytes = Pattern(128);
+
+  {
+    PlainPacketPool pool(8, -1, 128);
+    PacketHandle packet = BuildChain(pool, lengths, bytes);
+    ASSERT_NE(packet, nullptr);
+    std::array<PacketHandle, 4> segments{};
+    segments[0] = packet;
+    for (size_t i = 1; i < segments.size(); i++) {
+      segments[i] = segments[i - 1]->next;
+    }
+    std::array<PacketHandle, 4> fillers{};
+    for (PacketHandle &filler : fillers) {
+      filler = pool.Alloc();
+      ASSERT_NE(filler, nullptr);
+    }
+    ASSERT_EQ(pool.Size(), 0);
+
+    auto result = RemovePrefix(packet, 40);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(packet, segments[1]);
+    EXPECT_EQ(packet->pkt_len, 88);
+    EXPECT_EQ(pool.Size(), 1);
+    EXPECT_EQ(PacketBytes(packet),
+              std::vector<std::byte>(bytes.begin() + 40, bytes.end()));
+
+    PacketFree(packet);
+    for (PacketHandle filler : fillers) {
+      PacketFree(filler);
+    }
+    EXPECT_EQ(pool.Size(), pool.Capacity());
+  }
+
+  {
+    PlainPacketPool pool(8, -1, 128);
+    PacketHandle packet = BuildChain(pool, lengths, bytes);
+    ASSERT_NE(packet, nullptr);
+    std::array<PacketHandle, 4> segments{};
+    segments[0] = packet;
+    for (size_t i = 1; i < segments.size(); i++) {
+      segments[i] = segments[i - 1]->next;
+    }
+    std::array<PacketHandle, 4> fillers{};
+    for (PacketHandle &filler : fillers) {
+      filler = pool.Alloc();
+      ASSERT_NE(filler, nullptr);
+    }
+    ASSERT_EQ(pool.Size(), 0);
+
+    auto result = TrimSuffix(packet, 100);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(packet, segments[0]);
+    EXPECT_EQ(packet->pkt_len, 28);
+    EXPECT_EQ(packet->nb_segs, 1);
+    EXPECT_EQ(packet->data_len, 28);
+    EXPECT_EQ(pool.Size(), 3);
+    EXPECT_EQ(PacketBytes(packet),
+              std::vector<std::byte>(bytes.begin(), bytes.begin() + 28));
+
+    PacketFree(packet);
+    for (PacketHandle filler : fillers) {
+      PacketFree(filler);
+    }
+    EXPECT_EQ(pool.Size(), pool.Capacity());
+  }
+}
+
+TEST(PacketReshapeTest, HeadPromotionCopiesLogicalMetadataAndKeepsStorage) {
+  PlainPacketPool pool(16, -1, 128);
+  const std::vector<std::byte> bytes = Pattern(96);
+  const std::array<size_t, 3> lengths = {32, 32, 32};
+  PacketHandle packet = BuildChain(pool, lengths, bytes);
+  ASSERT_NE(packet, nullptr);
+  SeedHeadMetadata(packet);
+  SetPrivate(packet, static_cast<std::byte>(0x6d));
+  const HeadState logical_head = TakeHeadState(packet);
+
+  PacketHandle promoted = packet->next;
+  SeedHeadMetadata(promoted);
+  promoted->ol_flags &= RTE_MBUF_F_INDIRECT | RTE_MBUF_F_EXTERNAL;
+  promoted->port = 0x4321;
+  promoted->packet_type = 0x76543210;
+  promoted->hash.rss = 0x10293847;
+  promoted->vlan_tci = 0x2468;
+  promoted->vlan_tci_outer = 0x1357;
+  promoted->tx_offload = 0xfedcba9876543210ULL;
+  promoted->timesync = 0x3344;
+  for (size_t i = 0; i < std::size(promoted->dynfield1); i++) {
+    promoted->dynfield1[i] = static_cast<uint32_t>(0x9000 + i);
+  }
+  SetPrivate(promoted, static_cast<std::byte>(0x11));
+  const HeadState promoted_before = TakeHeadState(promoted);
+  const PacketHandle next = promoted->next;
+  const size_t available_before = pool.Size();
+
+  auto result = RemovePrefix(packet, lengths[0]);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(packet, promoted);
+  EXPECT_EQ(packet->buf_addr, promoted_before.buf_addr);
+  EXPECT_EQ(packet->buf_iova, promoted_before.buf_iova);
+  EXPECT_EQ(packet->buf_len, promoted_before.buf_len);
+  EXPECT_EQ(packet->data_off, promoted_before.data_off);
+  EXPECT_EQ(packet->data_len, promoted_before.data_len);
+  EXPECT_EQ(packet->pool, promoted_before.pool);
+  EXPECT_EQ(packet->priv_size, promoted_before.priv_size);
+  EXPECT_EQ(packet->shinfo, promoted_before.shinfo);
+  EXPECT_EQ(rte_mbuf_refcnt_read(packet), promoted_before.refcnt);
+  EXPECT_EQ(packet->next, next);
+  EXPECT_EQ(packet->pkt_len, bytes.size() - lengths[0]);
+  EXPECT_EQ(packet->nb_segs, 2);
+  ExpectPromotedHeadMetadata(packet, logical_head);
+  EXPECT_EQ(PacketBytes(packet),
+            std::vector<std::byte>(bytes.begin() + lengths[0], bytes.end()));
+  EXPECT_EQ(pool.Size(), available_before + 1);
+
+  PacketFree(packet);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+TEST(PacketReshapeTest, PromotedIndirectSegmentRetainsItsRepresentation) {
+  PlainPacketPool pool(16, -1, 128);
+  const std::vector<std::byte> prefix_bytes = Pattern(32);
+  const std::vector<std::byte> tail_bytes = Pattern(32);
+  PacketHandle owner = pool.AllocCopy(tail_bytes.data(), tail_bytes.size());
+  ASSERT_NE(owner, nullptr);
+  PacketHandle indirect = bess::PacketClone(owner);
+  ASSERT_NE(indirect, nullptr);
+  ASSERT_FALSE(RTE_MBUF_DIRECT(indirect));
+
+  PacketHandle packet =
+      pool.AllocCopy(prefix_bytes.data(), prefix_bytes.size());
+  ASSERT_NE(packet, nullptr);
+  packet->next = indirect;
+  packet->pkt_len = prefix_bytes.size() + tail_bytes.size();
+  packet->nb_segs = 2;
+  SeedHeadMetadata(packet);
+  SetPrivate(packet, static_cast<std::byte>(0x3e));
+  const HeadState logical_head = TakeHeadState(packet);
+  const HeadState promoted_before = TakeHeadState(indirect);
+  const uint64_t representation_flags =
+      indirect->ol_flags & (RTE_MBUF_F_INDIRECT | RTE_MBUF_F_EXTERNAL);
+  const size_t available_before = pool.Size();
+
+  auto result = RemovePrefix(packet, prefix_bytes.size());
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(packet, indirect);
+  EXPECT_FALSE(RTE_MBUF_DIRECT(packet));
+  EXPECT_EQ(packet->ol_flags & (RTE_MBUF_F_INDIRECT | RTE_MBUF_F_EXTERNAL),
+            representation_flags);
+  EXPECT_EQ(packet->buf_addr, promoted_before.buf_addr);
+  EXPECT_EQ(packet->buf_iova, promoted_before.buf_iova);
+  EXPECT_EQ(packet->buf_len, promoted_before.buf_len);
+  EXPECT_EQ(packet->data_off, promoted_before.data_off);
+  EXPECT_EQ(packet->data_len, promoted_before.data_len);
+  EXPECT_EQ(packet->pool, promoted_before.pool);
+  EXPECT_EQ(packet->priv_size, promoted_before.priv_size);
+  EXPECT_EQ(packet->shinfo, promoted_before.shinfo);
+  EXPECT_EQ(rte_mbuf_refcnt_read(packet), promoted_before.refcnt);
+  EXPECT_EQ(packet->pkt_len, tail_bytes.size());
+  EXPECT_EQ(packet->nb_segs, 1);
+  EXPECT_EQ(PayloadWriteabilityOf(PacketRef(packet)),
+            PayloadWriteability::kShared);
+  ExpectPromotedHeadMetadata(packet, logical_head);
+  EXPECT_EQ(PacketBytes(packet), tail_bytes);
+  EXPECT_EQ(pool.Size(), available_before + 1);
+
+  PacketFree(packet);
+  PacketFree(owner);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+TEST(PacketReshapeTest, PromotedExternalSegmentRetainsCallbackOwnership) {
+  PlainPacketPool pool(16, -1, 128);
+  int free_count = 0;
+  rte_mbuf_ext_shared_info *shinfo = nullptr;
+  PacketHandle external = MakeExternal(pool, &free_count, &shinfo, 32);
+  ASSERT_NE(external, nullptr);
+  const std::vector<std::byte> prefix_bytes = Pattern(32);
+  PacketHandle packet =
+      pool.AllocCopy(prefix_bytes.data(), prefix_bytes.size());
+  ASSERT_NE(packet, nullptr);
+  packet->next = external;
+  packet->pkt_len = 64;
+  packet->nb_segs = 2;
+  SeedHeadMetadata(packet);
+  SetPrivate(packet, static_cast<std::byte>(0x5b));
+  const HeadState logical_head = TakeHeadState(packet);
+  PacketHandle sibling = bess::PacketClone(packet);
+  ASSERT_NE(sibling, nullptr);
+  ASSERT_TRUE(RTE_MBUF_HAS_EXTBUF(sibling->next));
+  ASSERT_EQ(rte_mbuf_ext_refcnt_read(shinfo), 2);
+  const HeadState promoted_before = TakeHeadState(external);
+  const uint64_t representation_flags =
+      external->ol_flags & (RTE_MBUF_F_INDIRECT | RTE_MBUF_F_EXTERNAL);
+  const std::vector<std::byte> original_bytes = PacketBytes(packet);
+  const size_t available_before = pool.Size();
+
+  auto result = RemovePrefix(packet, prefix_bytes.size());
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(packet, external);
+  EXPECT_TRUE(RTE_MBUF_HAS_EXTBUF(packet));
+  EXPECT_EQ(packet->ol_flags & (RTE_MBUF_F_INDIRECT | RTE_MBUF_F_EXTERNAL),
+            representation_flags);
+  EXPECT_EQ(packet->buf_addr, promoted_before.buf_addr);
+  EXPECT_EQ(packet->buf_iova, promoted_before.buf_iova);
+  EXPECT_EQ(packet->buf_len, promoted_before.buf_len);
+  EXPECT_EQ(packet->data_off, promoted_before.data_off);
+  EXPECT_EQ(packet->data_len, promoted_before.data_len);
+  EXPECT_EQ(packet->pool, promoted_before.pool);
+  EXPECT_EQ(packet->priv_size, promoted_before.priv_size);
+  EXPECT_EQ(packet->shinfo, shinfo);
+  EXPECT_EQ(rte_mbuf_refcnt_read(packet), promoted_before.refcnt);
+  EXPECT_EQ(packet->pkt_len, 32);
+  EXPECT_EQ(packet->nb_segs, 1);
+  EXPECT_EQ(rte_mbuf_ext_refcnt_read(shinfo), 2);
+  EXPECT_EQ(free_count, 0);
+  ExpectPromotedHeadMetadata(packet, logical_head);
+  EXPECT_EQ(PacketBytes(packet), PacketBytes(external));
+  EXPECT_EQ(PacketBytes(sibling), original_bytes);
+  EXPECT_EQ(pool.Size(), available_before);
+
+  PacketFree(packet);
+  EXPECT_EQ(free_count, 0);
+  PacketFree(sibling);
+  EXPECT_EQ(free_count, 1);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+
+  free_count = 0;
+  shinfo = nullptr;
+  external = MakeExternal(pool, &free_count, &shinfo, 32);
+  ASSERT_NE(external, nullptr);
+  packet = pool.AllocCopy(prefix_bytes.data(), prefix_bytes.size());
+  ASSERT_NE(packet, nullptr);
+  packet->next = external;
+  packet->pkt_len = 64;
+  packet->nb_segs = 2;
+  auto trim = TrimSuffix(packet, 32);
+  ASSERT_TRUE(trim.has_value());
+  EXPECT_EQ(packet->next, nullptr);
+  EXPECT_EQ(packet->pkt_len, 32);
+  EXPECT_EQ(free_count, 1);
+  PacketFree(packet);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+TEST(PacketReshapeTest, SharedBackingRemovalsPreserveSiblingPayloads) {
+  PlainPacketPool pool(32, -1, 128);
+  const std::vector<std::byte> bytes = Pattern(128);
+  const std::array<size_t, 4> lengths = {32, 32, 32, 32};
+
+  PacketHandle source = BuildChain(pool, lengths, bytes);
+  ASSERT_NE(source, nullptr);
+  PacketHandle sibling = bess::PacketClone(source);
+  ASSERT_NE(sibling, nullptr);
+  const PacketHandle promoted = source->next;
+  ASSERT_EQ(rte_mbuf_refcnt_read(promoted), 2);
+  const size_t prefix_available_before = pool.Size();
+
+  auto prefix = RemovePrefix(source, 32);
+  ASSERT_TRUE(prefix.has_value());
+  EXPECT_EQ(source, promoted);
+  EXPECT_EQ(rte_mbuf_refcnt_read(source), 2);
+  EXPECT_EQ(PayloadWriteabilityOf(PacketRef(source)),
+            PayloadWriteability::kShared);
+  EXPECT_EQ(PacketBytes(source),
+            std::vector<std::byte>(bytes.begin() + 32, bytes.end()));
+  EXPECT_EQ(PacketBytes(sibling), bytes);
+  EXPECT_EQ(pool.Size(), prefix_available_before);
+
+  PacketFree(source);
+  PacketFree(sibling);
+
+  source = BuildChain(pool, lengths, bytes);
+  ASSERT_NE(source, nullptr);
+  sibling = bess::PacketClone(source);
+  ASSERT_NE(sibling, nullptr);
+  const PacketHandle original_head = source;
+  const PacketHandle retained_tail = source->next;
+  ASSERT_EQ(rte_mbuf_refcnt_read(retained_tail), 2);
+  const size_t suffix_available_before = pool.Size();
+
+  auto suffix = TrimSuffix(source, 64);
+  ASSERT_TRUE(suffix.has_value());
+  EXPECT_EQ(source, original_head);
+  EXPECT_EQ(source->nb_segs, 2);
+  EXPECT_EQ(source->pkt_len, 64);
+  EXPECT_EQ(rte_mbuf_refcnt_read(retained_tail), 2);
+  EXPECT_EQ(PayloadWriteabilityOf(PacketRef(retained_tail)),
+            PayloadWriteability::kShared);
+  EXPECT_EQ(PacketBytes(source),
+            std::vector<std::byte>(bytes.begin(), bytes.begin() + 64));
+  EXPECT_EQ(PacketBytes(sibling), bytes);
+  EXPECT_EQ(pool.Size(), suffix_available_before);
+
+  PacketFree(source);
+  PacketFree(sibling);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
 }  // namespace

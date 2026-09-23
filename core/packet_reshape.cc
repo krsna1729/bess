@@ -111,6 +111,21 @@ void CopyPacketHeadMetadata(::bess::PacketHandle destination,
       source->ol_flags & ~(RTE_MBUF_F_INDIRECT | RTE_MBUF_F_EXTERNAL);
 }
 
+// Promotion changes logical packet-head state, not the surviving segment's
+// payload representation or storage.
+void PromoteLogicalHeadState(::bess::PacketHandle destination,
+                             ::bess::PacketHandle source) noexcept {
+  constexpr uint64_t kRepresentationFlags =
+      RTE_MBUF_F_INDIRECT | RTE_MBUF_F_EXTERNAL;
+  const uint64_t destination_representation_flags =
+      destination->ol_flags & kRepresentationFlags;
+  __rte_pktmbuf_copy_hdr(destination, source);
+  destination->timesync = source->timesync;
+  destination->ol_flags = (source->ol_flags & ~kRepresentationFlags) |
+                          destination_representation_flags;
+  CopyBessPacketPrivate(destination, source);
+}
+
 std::expected<::bess::PacketHandle, ReshapeError> CopyPacketLinear(
     ::bess::PacketHandle source) noexcept {
   const uint16_t data_room = rte_pktmbuf_data_room_size(source->pool);
@@ -163,8 +178,7 @@ std::expected<void, ReshapeError> EnsureWritable(
     return {};
   }
 
-  ::bess::PacketHandle replacement =
-      detail::CopyPacketForReplacement(packet);
+  ::bess::PacketHandle replacement = detail::CopyPacketForReplacement(packet);
   if (replacement == nullptr) {
     return std::unexpected(ReshapeError::kAllocationFailed);
   }
@@ -255,6 +269,158 @@ std::expected<MutableBytes, ReshapeError> EnsureContiguous(
   return MutableBytes(::bess::PacketRef(packet).head_data<std::byte *>(
                           static_cast<uint16_t>(offset)),
                       bytes);
+}
+
+std::expected<void, ReshapeError> RemovePrefix(::bess::PacketHandle &packet,
+                                               size_t bytes) noexcept {
+  const auto chain = detail::ValidateChain(packet);
+  if (!chain) {
+    return std::unexpected(chain.error());
+  }
+  if (bytes > chain->pkt_len) {
+    return std::unexpected(ReshapeError::kLengthOutOfRange);
+  }
+  if (bytes == 0) {
+    return {};
+  }
+  if (bytes == chain->pkt_len) {
+    ::bess::PacketHandle removed = packet->next;
+    packet->next = nullptr;
+    packet->data_len = 0;
+    packet->pkt_len = 0;
+    packet->nb_segs = 1;
+    if (removed != nullptr) {
+      ::bess::PacketFree(removed);
+    }
+    return {};
+  }
+  if (bytes < packet->data_len) {
+    packet->data_off = static_cast<uint16_t>(packet->data_off + bytes);
+    packet->data_len = static_cast<uint16_t>(packet->data_len - bytes);
+    packet->pkt_len = chain->pkt_len - static_cast<uint32_t>(bytes);
+    return {};
+  }
+
+  size_t remaining = bytes;
+  ::bess::PacketHandle segment = packet;
+  ::bess::PacketHandle last_removed = nullptr;
+  ::bess::PacketHandle survivor = nullptr;
+  size_t removed_segments = 0;
+  size_t bytes_into_survivor = 0;
+  while (segment != nullptr) {
+    if (remaining < segment->data_len) {
+      survivor = segment;
+      bytes_into_survivor = remaining;
+      break;
+    }
+    remaining -= segment->data_len;
+    last_removed = segment;
+    ++removed_segments;
+    if (remaining == 0) {
+      survivor = segment->next;
+      break;
+    }
+    segment = segment->next;
+  }
+  if (survivor == nullptr || last_removed == nullptr ||
+      removed_segments >= chain->nb_segs) {
+    return std::unexpected(ReshapeError::kMalformedChain);
+  }
+
+  if (packet->priv_size < ::bess::kPacketPrivateSize ||
+      survivor->priv_size < ::bess::kPacketPrivateSize) {
+    return std::unexpected(ReshapeError::kMalformedChain);
+  }
+
+  detail::PromoteLogicalHeadState(survivor, packet);
+  if (bytes_into_survivor != 0) {
+    survivor->data_off =
+        static_cast<uint16_t>(survivor->data_off + bytes_into_survivor);
+    survivor->data_len =
+        static_cast<uint16_t>(survivor->data_len - bytes_into_survivor);
+  }
+  survivor->pkt_len = chain->pkt_len - static_cast<uint32_t>(bytes);
+  survivor->nb_segs = static_cast<uint16_t>(chain->nb_segs - removed_segments);
+
+  last_removed->next = nullptr;
+  ::bess::PacketHandle original = packet;
+  ::bess::PacketFree(original);
+  packet = survivor;
+  return {};
+}
+
+std::expected<void, ReshapeError> TrimSuffix(::bess::PacketHandle &packet,
+                                             size_t bytes) noexcept {
+  const auto chain = detail::ValidateChain(packet);
+  if (!chain) {
+    return std::unexpected(chain.error());
+  }
+  if (bytes > chain->pkt_len) {
+    return std::unexpected(ReshapeError::kLengthOutOfRange);
+  }
+  if (bytes == 0) {
+    return {};
+  }
+  if (bytes == chain->pkt_len) {
+    ::bess::PacketHandle removed = packet->next;
+    packet->next = nullptr;
+    packet->data_len = 0;
+    packet->pkt_len = 0;
+    packet->nb_segs = 1;
+    if (removed != nullptr) {
+      ::bess::PacketFree(removed);
+    }
+    return {};
+  }
+
+  const size_t kept_length = chain->pkt_len - static_cast<uint32_t>(bytes);
+  size_t prefix_length = 0;
+  size_t last_segment_length = 0;
+  size_t kept_segments = 0;
+  bool cut_found = false;
+  ::bess::PacketHandle segment = packet;
+  ::bess::PacketHandle last_kept = nullptr;
+  ::bess::PacketHandle first_removed = nullptr;
+  while (segment != nullptr) {
+    if (kept_length == prefix_length) {
+      first_removed = segment;
+      cut_found = true;
+      break;
+    }
+
+    const size_t segment_length = segment->data_len;
+    const size_t keep_in_segment = kept_length - prefix_length;
+    if (keep_in_segment > segment_length) {
+      prefix_length += segment_length;
+      last_segment_length = segment_length;
+      last_kept = segment;
+      ++kept_segments;
+      segment = segment->next;
+      continue;
+    }
+
+    last_segment_length = keep_in_segment;
+    last_kept = segment;
+    ++kept_segments;
+    first_removed = segment->next;
+    cut_found = true;
+    break;
+  }
+  if (!cut_found || last_kept == nullptr || kept_segments == 0 ||
+      kept_segments > chain->nb_segs) {
+    return std::unexpected(ReshapeError::kMalformedChain);
+  }
+
+  if (last_segment_length < last_kept->data_len) {
+    last_kept->data_len = static_cast<uint16_t>(last_segment_length);
+  }
+  last_kept->next = nullptr;
+  packet->pkt_len = static_cast<uint32_t>(kept_length);
+  packet->nb_segs = static_cast<uint16_t>(kept_segments);
+  if (first_removed != nullptr) {
+    ::bess::PacketFree(first_removed);
+  }
+  return {};
 }
 
 }  // namespace bess::packet
