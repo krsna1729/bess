@@ -132,7 +132,7 @@ BENCHMARK_DEFINE_F(CopyFixture, Memcpy)(benchmark::State &state) {
   state.SetBytesProcessed(size_ * state.iterations());
 }
 
-static void SetArguments(benchmark::Benchmark *b) {
+static constexpr auto SetArguments = [](auto *b) {
   // skip argument names for brevity
   //b->ArgNames({"dst_align", "src_align", "size"});
   b->Args({0, 0, 4})
@@ -166,7 +166,7 @@ static void SetArguments(benchmark::Benchmark *b) {
       ->Args({0, 0, 1518})
       ->Args({19, 4, 2047})
       ->Args({0, 0, 4096});
-}
+};
 
 BENCHMARK_REGISTER_F(CopyFixture, Copy)->Apply(SetArguments);
 BENCHMARK_REGISTER_F(CopyFixture, CopySloppy)->Apply(SetArguments);

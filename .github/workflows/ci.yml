@@ -22,11 +22,10 @@ jobs:
           - name: gcc
             cc: gcc
             cxx: g++
-            cxxflags: ''
+          # Clang 19 updates __cpp_concepts for libstdc++'s C++23 <expected>.
           - name: clang
-            cc: clang
-            cxx: clang++
-            cxxflags: --gcc-toolchain=/usr -stdlib=libstdc++
+            cc: clang-19
+            cxx: clang++-19
 
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +40,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential g++-14 clang meson ninja-build pkg-config \
+            build-essential clang-19 meson ninja-build pkg-config \
             python3-pip python3-pyelftools xz-utils \
             libnuma-dev libpcap-dev zlib1g-dev libunwind-dev \
             libbpf-dev libxdp-dev \
@@ -60,7 +59,6 @@ jobs:
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
-          CXXFLAGS: ${{ matrix.cxxflags }}
         run: |
           tools/bootstrap_dpdk.py --af-xdp required --cpu "$CPU"
           echo "PKG_CONFIG_PATH=$(tools/bootstrap_dpdk.py --print-pkg-config-path)" >> "$GITHUB_ENV"
@@ -69,7 +67,6 @@ jobs:
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
-          CXXFLAGS: ${{ matrix.cxxflags }}
         run: |
           meson setup "build-${{ matrix.name }}" \
             -Dcpu="$CPU" \
