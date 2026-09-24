@@ -495,7 +495,7 @@ BENCHMARK(BenchmarkQueueOutEgress)
     ->ArgsProduct({{64, 1500, 4096}, {0, 1}, {1, 8, 32}, {0, 1}})
     ->ArgNames({"packet_bytes", "protocol", "batch", "profile"});
 
-BENCHMARK(BenchmarkTxFinalization)->Apply([](benchmark::Benchmark *benchmark) {
+BENCHMARK(BenchmarkTxFinalization)->Apply([](auto *benchmark) {
   constexpr int64_t kVariants[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
   constexpr int64_t kProtocols[] = {0, 1};
   constexpr int64_t kSizes[] = {64, 1500, 4096};
