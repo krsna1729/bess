@@ -485,7 +485,7 @@ void BM_Masked_Substrate(benchmark::State &state) {
 
   std::array<Result, kMaxBatch> results{};
   for (auto _ : state) {
-    const uint64_t hits = backend.lookup_batch(
+    uint64_t hits = backend.lookup_batch(
         ConstBytes(workload.packed_keys.data(),
                    config.batch * config.key_bytes),
         config.key_bytes, std::span<Result>(results).first(config.batch));
@@ -569,7 +569,7 @@ void BM_Masked_ExactOnly(benchmark::State &state) {
   std::array<Ranked, kMaxBatch> candidates{};
 
   for (auto _ : state) {
-    const uint64_t hits = backend.lookup_batch(
+    uint64_t hits = backend.lookup_batch(
         ConstBytes(masked_keys.data(), config.batch * config.key_bytes),
         config.key_bytes, std::span<Ranked>(candidates).first(config.batch));
     benchmark::DoNotOptimize(hits);

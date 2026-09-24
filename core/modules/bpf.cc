@@ -97,10 +97,14 @@ CommandResponse BPF::CommandAdd(const bess::pb::BPFArg &arg) {
     filter.exp = f.filter();
 
     struct bpf_program il;
-    if (pcap_compile_nopcap(SNAPLEN, DLT_EN10MB,  // Ethernet
-                            &il, filter.exp.c_str(),
-                            1,  // optimize (IL only)
-                            PCAP_NETMASK_UNKNOWN) == -1) {
+    pcap_t *pcap = pcap_open_dead(DLT_EN10MB, SNAPLEN);
+    if (!pcap) {
+      return CommandFailure(ENOMEM, "failed to create BPF compile context");
+    }
+    const int compile_ret = pcap_compile(pcap, &il, filter.exp.c_str(),
+                                         1, PCAP_NETMASK_UNKNOWN);
+    pcap_close(pcap);
+    if (compile_ret == -1) {
       return CommandFailure(EINVAL, "BPF compilation error");
     }
 

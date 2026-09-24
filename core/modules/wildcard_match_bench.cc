@@ -475,7 +475,7 @@ void BM_Wm_Module(benchmark::State &state) {
   std::array<std::byte, kMaxBatch * 64> keys{};
   std::array<gate_idx_t, kMaxBatch> gates{};
   for (auto _ : state) {
-    const uint64_t valid = plan->ExecuteBatch(
+    uint64_t valid = plan->ExecuteBatch(
         std::span<const SourceView>(workload.views).first(config.batch),
         MutableBytes(keys).first(config.batch * workload.key_size),
         workload.key_size);
@@ -522,7 +522,7 @@ void BM_Wm_Extract(benchmark::State &state) {
   const WmConfig &config = workload.config;
   std::array<std::byte, kMaxBatch * 64> keys{};
   for (auto _ : state) {
-    const uint64_t valid = plan->ExecuteBatch(
+    uint64_t valid = plan->ExecuteBatch(
         std::span<const SourceView>(workload.views).first(config.batch),
         MutableBytes(keys).first(config.batch * workload.key_size),
         workload.key_size);
@@ -556,7 +556,7 @@ void BM_Wm_Backend(benchmark::State &state) {
   }
   const auto &backend = *built;
   std::array<std::byte, kMaxBatch * 64> keys{};
-  const uint64_t valid = plan->ExecuteBatch(
+  uint64_t valid = plan->ExecuteBatch(
       std::span<const SourceView>(workload.views).first(config.batch),
       MutableBytes(keys).first(config.batch * workload.key_size),
       workload.key_size);
@@ -568,7 +568,7 @@ void BM_Wm_Backend(benchmark::State &state) {
 
   std::array<gate_idx_t, kMaxBatch> gates{};
   for (auto _ : state) {
-    const uint64_t hits = backend.lookup_batch(
+    uint64_t hits = backend.lookup_batch(
         ConstBytes(keys.data(), config.batch * workload.key_size),
         workload.key_size, std::span<gate_idx_t>(gates).first(config.batch));
     benchmark::DoNotOptimize(hits);

@@ -399,7 +399,7 @@ void BM_NewExtract(benchmark::State &state) {
   std::array<std::byte, kMaxBatch * kKeySize> keys{};
   for (auto _ : state) {
     // Pure extraction: no pre-zeroing (measured separately as BM_Zero8).
-    const uint64_t valid = fix.plan.ExecuteBatch(
+    uint64_t valid = fix.plan.ExecuteBatch(
         std::span<const SourceView>(fix.views).first(batch),
         MutableBytes(keys).first(batch * kKeySize), kKeySize);
     benchmark::DoNotOptimize(valid);
@@ -438,7 +438,7 @@ struct LookupFixture : Fixture {
       }
       LegacyExtractPacket(bufs.data(), legacy_keys.data(), batch);
     }
-    const uint64_t valid = plan.ExecuteBatch(
+    uint64_t valid = plan.ExecuteBatch(
         std::span<const SourceView>(views).first(batch),
         MutableBytes(packed_keys).first(batch * kKeySize), kKeySize);
     if (valid != AllValidMask(batch)) {
@@ -598,7 +598,7 @@ void BM_RuntimeBatchLookup(benchmark::State &state) {
   }
   std::array<gate_idx_t, kMaxBatch> gates{};
   for (auto _ : state) {
-    const uint64_t hits = RuntimeCuckooLookupBatchFixed<8, 8, gate_idx_t>(
+    uint64_t hits = RuntimeCuckooLookupBatchFixed<8, 8, gate_idx_t>(
         &fix.runtime_state,
         ConstBytes(fix.packed_keys.data(), batch * kKeySize), kKeySize,
         std::span<gate_idx_t>(gates).first(batch));
@@ -809,7 +809,7 @@ void BM_NewEndToEnd(benchmark::State &state) {
   const uint64_t all_valid = AllValidMask(batch);
   for (auto _ : state) {
     // Covered plan: no pre-zero; zero only invalid rows before lookup.
-    const uint64_t valid = fix.plan.ExecuteBatch(
+    uint64_t valid = fix.plan.ExecuteBatch(
         std::span<const SourceView>(fix.views).first(batch),
         MutableBytes(keys).first(batch * kKeySize), kKeySize);
     if ((valid & all_valid) != all_valid) {

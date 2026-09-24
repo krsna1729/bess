@@ -301,7 +301,7 @@ void BM_K34ByteTable(benchmark::State &state) {
   std::array<Result, kK34Batch> results{};
 
   for (auto _ : state) {
-    const uint64_t hits = table.lookup_batch(
+    uint64_t hits = table.lookup_batch(
         std::span<const Key>(keys).first(batch),
         std::span<Result>(results).first(batch));
     benchmark::DoNotOptimize(hits);
@@ -333,7 +333,7 @@ void BM_K34ByteRuntime(benchmark::State &state) {
   std::array<Result, kK34Batch> results{};
 
   for (auto _ : state) {
-    const uint64_t hits = backend->lookup_batch(
+    uint64_t hits = backend->lookup_batch(
         ConstBytes(packed_keys.data(), batch * KeyBytes), KeyBytes,
         std::span<Result>(results).first(batch));
     benchmark::DoNotOptimize(hits);
@@ -425,7 +425,7 @@ void BM_K34ScalarTable(benchmark::State &state) {
   std::array<Result, kK34Batch> results{};
 
   for (auto _ : state) {
-    const uint64_t hits = table.lookup_batch(
+    uint64_t hits = table.lookup_batch(
         std::span<const Key>(keys).first(batch),
         std::span<Result>(results).first(batch));
     benchmark::DoNotOptimize(hits);
@@ -469,7 +469,7 @@ void BM_K34ScalarRuntime(benchmark::State &state) {
   std::array<Result, kK34Batch> results{};
 
   for (auto _ : state) {
-    const uint64_t hits = backend.lookup_batch(
+    uint64_t hits = backend.lookup_batch(
         ConstBytes(packed_keys.data(), batch * sizeof(uint16_t)),
         sizeof(uint16_t), std::span<Result>(results).first(batch));
     benchmark::DoNotOptimize(hits);
@@ -656,7 +656,7 @@ void BM_K34FlowTable(benchmark::State &state) {
     for (size_t i = 0; i < batch; i++) {
       keys[i] = ParseK34FlowPacket(inputs.packets[i]);
     }
-    const uint64_t hits = table.lookup_batch(
+    uint64_t hits = table.lookup_batch(
         std::span<const K34FlowKey>(keys).first(batch),
         std::span<K34FlowResult>(results).first(batch));
     benchmark::DoNotOptimize(hits);
@@ -686,10 +686,10 @@ void BM_K34FlowRuntime(benchmark::State &state) {
   std::array<K34FlowResult, kK34Batch> results{};
 
   for (auto _ : state) {
-    const uint64_t valid = plan->ExecuteBatch(
+    uint64_t valid = plan->ExecuteBatch(
         std::span<const SourceView>(inputs.sources).first(batch),
         MutableBytes(packed_keys).first(batch * kKeyBytes), kKeyBytes);
-    const uint64_t hits = backend->lookup_batch(
+    uint64_t hits = backend->lookup_batch(
         ConstBytes(packed_keys.data(), batch * kKeyBytes), kKeyBytes,
         std::span<K34FlowResult>(results).first(batch));
     benchmark::DoNotOptimize(valid);
