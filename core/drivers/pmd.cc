@@ -550,9 +550,15 @@ bool PMDPort::HasActiveOutputUsers() const {
 }
 
 CommandResponse PMDPort::UpdateConf(const Conf &conf) {
-  CommandResponse resp = CommandSuccess();
-  rte_eth_dev_stop(dpdk_port_id_);  // need to restart before return
+  const bool was_admin_up = conf_.admin_up;
+  const bool old_rx_scatter_enabled = rx_scatter_enabled_;
+  bool need_rx_reconfigure = false;
+  bool rx_reconfigure_attempted = false;
+  bool enable_rx_scatter = rx_scatter_enabled_;
+  rte_eth_dev_info dev_info = {};
 
+  // Validate all configuration that can be rejected before stopping the
+  // device. A rejected request must not interrupt an otherwise running port.
   if (conf_.mtu != conf.mtu && conf.mtu != 0) {
     int sid = rte_eth_dev_socket_id(dpdk_port_id_);
     if (sid < 0 || sid > RTE_MAX_NUMA_NODES) {
@@ -560,9 +566,7 @@ CommandResponse PMDPort::UpdateConf(const Conf &conf) {
     }
     bess::PacketPool *pool = bess::PacketPool::GetDefaultPool(sid);
     if (!pool) {
-      resp = CommandFailure(ENODEV, "No default packet pool for socket %d",
-                            sid);
-      goto restart;
+      return CommandFailure(ENODEV, "No default packet pool for socket %d", sid);
     }
 
     const size_t usable_single_mbuf_bytes = single_mbuf_rx_capacity(*pool);
@@ -570,49 +574,56 @@ CommandResponse PMDPort::UpdateConf(const Conf &conf) {
         conf.mtu, usable_single_mbuf_bytes);
     if (rx_mtu_support ==
         PmdCapabilities::RxMtuSupport::kBelowDeviceMinMtu) {
-      resp = CommandFailure(EINVAL, "mtu %u is below PMD min_mtu %u", conf.mtu,
+      return CommandFailure(EINVAL, "mtu %u is below PMD min_mtu %u", conf.mtu,
                             capabilities_.min_mtu);
-      goto restart;
     }
     if (rx_mtu_support ==
         PmdCapabilities::RxMtuSupport::kExceedsDeviceMtu) {
-      resp = CommandFailure(EINVAL, "mtu %u exceeds PMD max_mtu %u", conf.mtu,
+      return CommandFailure(EINVAL, "mtu %u exceeds PMD max_mtu %u", conf.mtu,
                             capabilities_.max_mtu);
-      goto restart;
     }
     if (rx_mtu_support ==
         PmdCapabilities::RxMtuSupport::kScatterUnsupported) {
-      resp = CommandFailure(
+      return CommandFailure(
           EINVAL,
           "mtu %u requires RX frame length %zu, exceeds usable single-mbuf "
           "RX capacity %zu and PMD does not support RX scatter",
           conf.mtu, capabilities_.RxFrameLengthFor(conf.mtu),
           usable_single_mbuf_bytes);
-      goto restart;
     }
 
-    const bool enable_rx_scatter =
+    enable_rx_scatter =
         rx_mtu_support == PmdCapabilities::RxMtuSupport::kScatter;
     if (enable_rx_scatter != rx_scatter_enabled_) {
       if (HasActiveOutputUsers()) {
-        resp = CommandFailure(
+        return CommandFailure(
             EBUSY,
             "cannot change RX scatter while an output module owns a TX queue");
-        goto restart;
       }
-      rte_eth_dev_info dev_info = {};
       int ret = rte_eth_dev_info_get(dpdk_port_id_, &dev_info);
       if (ret != 0) {
-        resp = CommandFailure(-ret, "rte_eth_dev_info_get() failed");
-        goto restart;
+        return CommandFailure(-ret, "rte_eth_dev_info_get() failed");
       }
+      need_rx_reconfigure = true;
+    }
+  }
+
+  int ret = rte_eth_dev_stop(dpdk_port_id_);
+  if (ret != 0) {
+    return CommandFailure(-ret, "rte_eth_dev_stop() failed");
+  }
+
+  CommandResponse resp = CommandSuccess();
+  if (conf_.mtu != conf.mtu && conf.mtu != 0) {
+    if (need_rx_reconfigure) {
+      rx_reconfigure_attempted = true;
       resp = ConfigureDevice(dpdk_port_id_, dev_info, enable_rx_scatter);
       if (resp.error().code() != 0) {
         goto restart;
       }
     }
 
-    int ret = rte_eth_dev_set_mtu(dpdk_port_id_, conf.mtu);
+    ret = rte_eth_dev_set_mtu(dpdk_port_id_, conf.mtu);
     if (ret == 0) {
       conf_.mtu = conf.mtu;
     } else {
@@ -625,7 +636,7 @@ CommandResponse PMDPort::UpdateConf(const Conf &conf) {
     rte_ether_addr tmp;
     rte_ether_addr_copy(
         reinterpret_cast<const rte_ether_addr *>(&conf.mac_addr.bytes), &tmp);
-    int ret = rte_eth_dev_default_mac_addr_set(dpdk_port_id_, &tmp);
+    ret = rte_eth_dev_default_mac_addr_set(dpdk_port_id_, &tmp);
     if (ret == 0) {
       conf_.mac_addr = conf.mac_addr;
     } else {
@@ -634,16 +645,39 @@ CommandResponse PMDPort::UpdateConf(const Conf &conf) {
     }
   }
 
-restart:
   if (conf.admin_up) {
-    int ret = rte_eth_dev_start(dpdk_port_id_);
-    if (ret == 0) {
-      conf_.admin_up = true;
-    } else {
-      return CommandFailure(-ret, "rte_eth_dev_start() failed");
+    ret = rte_eth_dev_start(dpdk_port_id_);
+    if (ret != 0) {
+      resp = CommandFailure(-ret, "rte_eth_dev_start() failed");
+      goto restart;
+    }
+    conf_.admin_up = true;
+  } else {
+    conf_.admin_up = false;
+  }
+  return resp;
+
+restart:
+  if (rx_reconfigure_attempted) {
+    CommandResponse restore = ConfigureDevice(
+        dpdk_port_id_, dev_info, old_rx_scatter_enabled);
+    if (restore.error().code() != 0) {
+      return CommandFailure(EIO,
+                            "failed to restore RX configuration after update "
+                            "failure");
     }
   }
 
+  if (was_admin_up) {
+    ret = rte_eth_dev_start(dpdk_port_id_);
+    if (ret != 0) {
+      conf_.admin_up = false;
+      return CommandFailure(-ret, "rte_eth_dev_start() recovery failed");
+    }
+    conf_.admin_up = true;
+  } else {
+    conf_.admin_up = false;
+  }
   return resp;
 }
 
