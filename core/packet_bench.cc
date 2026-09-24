@@ -1531,7 +1531,7 @@ void ProcessPipelineRuntimePrefetch4(
     std::array<uint64_t, bess::PacketBatch::kMaxBurst> &results) {
   size_t i = 0;
   for (; i + 4 <= count; i += 4) {
-    if (i + 4 < count) {
+    if (i + 8 <= count) {
       __builtin_prefetch(batch.packet(i + 4).head_data<const void *>(), 0, 1);
       __builtin_prefetch(batch.packet(i + 5).head_data<const void *>(), 0, 1);
       __builtin_prefetch(batch.packet(i + 6).head_data<const void *>(), 0, 1);
@@ -1945,8 +1945,8 @@ BENCHMARK(BM_PacketBatchRuntimePipelineUnrolled4)
                    {8, 12, 16}})
     ->ArgNames({"batch", "shape", "field_plan", "lookup_mode", "table_log2"});
 BENCHMARK(BM_PacketBatchRuntimePipelinePrefetch4)
-    ->ArgsProduct({{1, 8, 16, 32}, {0, 1, 2, 3}, {0, 1}, {0, 1, 2, 3},
-                   {8, 12, 16}})
+    ->ArgsProduct({{1, 7, 8, 15, 16, 31, 32}, {0, 1, 2, 3}, {0, 1},
+                   {0, 1, 2, 3}, {8, 12, 16}})
     ->ArgNames({"batch", "shape", "field_plan", "lookup_mode", "table_log2"});
 BENCHMARK(BM_PacketBatchTypedPipelineScalar)
     ->ArgsProduct({{1, 8, 16, 32}, {0, 1, 2, 3}, {0, 1}, {0, 1, 2, 3},
