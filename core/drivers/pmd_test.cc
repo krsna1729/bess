@@ -70,6 +70,53 @@ TEST(PmdCapabilitiesTest, CopiesDeviceCapabilitiesAndRxGeometry) {
   EXPECT_EQ(info.dev_capa, capabilities.dev_capa);
 }
 
+TEST(PmdCapabilitiesTest, MapsDpdkTxFlagsToSemanticChecksumCapabilities) {
+  rte_eth_dev_info info = {};
+  info.tx_offload_capa =
+      RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+
+  auto capabilities = PmdCapabilities::FromDeviceInfo(info)
+                          .ToTxChecksumCapabilities();
+  EXPECT_TRUE(capabilities.ipv4_header);
+  EXPECT_TRUE(capabilities.udp);
+  EXPECT_FALSE(capabilities.tcp);
+  EXPECT_FALSE(capabilities.outer_ipv4_header);
+  EXPECT_FALSE(capabilities.outer_udp);
+  EXPECT_FALSE(capabilities.ip_tunnel);
+  EXPECT_FALSE(capabilities.udp_tunnel);
+  EXPECT_FALSE(capabilities.multi_segment_tx);
+
+  info.tx_offload_capa =
+      RTE_ETH_TX_OFFLOAD_TCP_CKSUM |
+      RTE_ETH_TX_OFFLOAD_OUTER_IPV4_CKSUM |
+      RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM |
+      RTE_ETH_TX_OFFLOAD_IP_TNL_TSO |
+      RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO |
+      RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+  capabilities = PmdCapabilities::FromDeviceInfo(info)
+                     .ToTxChecksumCapabilities();
+  EXPECT_FALSE(capabilities.ipv4_header);
+  EXPECT_FALSE(capabilities.udp);
+  EXPECT_TRUE(capabilities.tcp);
+  EXPECT_TRUE(capabilities.outer_ipv4_header);
+  EXPECT_TRUE(capabilities.outer_udp);
+  EXPECT_TRUE(capabilities.ip_tunnel);
+  EXPECT_TRUE(capabilities.udp_tunnel);
+  EXPECT_TRUE(capabilities.multi_segment_tx);
+}
+
+TEST(PmdCapabilitiesTest, ConfiguresOnlySupportedChecksumOffloads) {
+  rte_eth_dev_info info = {};
+  info.tx_offload_capa =
+      RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM |
+      RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO | RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+  const auto capabilities = PmdCapabilities::FromDeviceInfo(info);
+  EXPECT_EQ(RTE_ETH_TX_OFFLOAD_IPV4_CKSUM |
+                RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM |
+                RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO,
+            capabilities.ConfiguredTxOffloads());
+}
+
 TEST(PmdCapabilitiesTest, MtuAtFrameCapacityFitsSingleMbuf) {
   const PmdCapabilities capabilities =
       PmdCapabilities::FromDeviceInfo(MakeDeviceInfo(576, 9000, true, 9018));

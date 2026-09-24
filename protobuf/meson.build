@@ -241,8 +241,8 @@ protobuf_runtime_deps = [
 ]
 
 core_cpp_include = [
-  '-I' + join_paths(cpp_proto_root, 'core'),
   '-I' + join_paths(cpp_proto_root, 'core', 'pb'),
+  '-I' + join_paths(cpp_proto_root, 'core'),
 ]
 bess_proto_lib = static_library(
   'bess_proto',

@@ -645,6 +645,8 @@ class BESSControlImpl final : public BESSControl::Service {
     response->mutable_inc()->set_packets(stats.inc.packets);
     response->mutable_inc()->set_dropped(stats.inc.dropped);
     response->mutable_inc()->set_bytes(stats.inc.bytes);
+    response->mutable_inc()->set_tx_prepare_errors(
+        stats.inc.tx_prepare_errors);
     *response->mutable_inc()->mutable_requested_hist() = {
         stats.inc.requested_hist.begin(), stats.inc.requested_hist.end()};
     *response->mutable_inc()->mutable_actual_hist() = {
@@ -654,6 +656,8 @@ class BESSControlImpl final : public BESSControl::Service {
 
     response->mutable_out()->set_packets(stats.out.packets);
     response->mutable_out()->set_dropped(stats.out.dropped);
+    response->mutable_out()->set_tx_prepare_errors(
+        stats.out.tx_prepare_errors);
     response->mutable_out()->set_bytes(stats.out.bytes);
     *response->mutable_out()->mutable_requested_hist() = {
         stats.out.requested_hist.begin(), stats.out.requested_hist.end()};

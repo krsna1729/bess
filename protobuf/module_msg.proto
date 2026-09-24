@@ -760,6 +760,51 @@ message PortIncArg {
   bool prefetch = 2; /// Whether or not to prefetch packets from the port.
 }
 
+
+enum ChecksumIpVersion {
+  CHECKSUM_IP_VERSION_UNSPECIFIED = 0;
+  CHECKSUM_IP_VERSION_IPV4 = 1;
+  CHECKSUM_IP_VERSION_IPV6 = 2;
+}
+
+enum TxChecksumNetwork {
+  TX_CHECKSUM_NETWORK_NONE = 0;
+  TX_CHECKSUM_NETWORK_IPV4_HEADER = 1;
+}
+
+enum TxChecksumTransport {
+  TX_CHECKSUM_TRANSPORT_NONE = 0;
+  TX_CHECKSUM_TRANSPORT_UDP = 1;
+  TX_CHECKSUM_TRANSPORT_TCP = 2;
+}
+
+enum TxEncapsulationKind {
+  TX_ENCAPSULATION_NONE = 0;
+  TX_ENCAPSULATION_IP = 1;
+  TX_ENCAPSULATION_UDP = 2;
+}
+
+message TxChecksumDomain {
+  uint64 network_offset = 1;
+  uint64 transport_offset = 2;
+  ChecksumIpVersion ip_version = 3;
+  TxChecksumNetwork network = 4;
+  TxChecksumTransport transport = 5;
+}
+
+message TxChecksumEncapsulation {
+  TxEncapsulationKind kind = 1;
+  ChecksumIpVersion outer_ip_version = 2;
+  uint64 outer_network_offset = 3;
+}
+
+// Fixed two-domain checksum intent. Leave encapsulation unset for ordinary IP.
+message TxChecksumProfile {
+  TxChecksumEncapsulation encapsulation = 1;
+  TxChecksumDomain outer = 2;
+  TxChecksumDomain inner = 3;
+}
+
 /**
  * The PortOut module connects to a physical or virtual port and pushes
  * packets to it. For details on how to configure PortOut with DPDK,
@@ -770,6 +815,7 @@ message PortIncArg {
  */
 message PortOutArg {
   string port = 1; /// The portname to connect to.
+  TxChecksumProfile tx_checksum_profile = 2; /// Optional fixed egress checksum profile.
 }
 
 /**
@@ -799,6 +845,7 @@ message QueueIncArg {
 message QueueOutArg {
   string port = 1; /// The portname to connect to.
   uint64 qid = 2; /// The queue on that port to write out to.
+  TxChecksumProfile tx_checksum_profile = 3; /// Optional fixed egress checksum profile.
 }
 
 /**

@@ -119,6 +119,7 @@ Port::PortStats Port::GetPortStats() {
 
     ret.inc.packets += inc.packets;
     ret.inc.dropped += inc.dropped;
+    ret.inc.tx_prepare_errors += inc.tx_prepare_errors;
     ret.inc.bytes += inc.bytes;
     ret.inc.requested_hist += inc.requested_hist;
     ret.inc.actual_hist += inc.actual_hist;
@@ -129,6 +130,7 @@ Port::PortStats Port::GetPortStats() {
     const QueueStats &out = queue_stats[PACKET_DIR_OUT][qid];
     ret.out.packets += out.packets;
     ret.out.dropped += out.dropped;
+    ret.out.tx_prepare_errors += out.tx_prepare_errors;
     ret.out.bytes += out.bytes;
     ret.out.requested_hist += out.requested_hist;
     ret.out.actual_hist += out.actual_hist;

@@ -5786,39 +5786,101 @@ The optimized accumulator uses `utils::CalculateSum` for aligned even-length
 spans while carrying odd bytes across segment boundaries. The full API is
 slower than raw arithmetic, as expected, but faster than the equivalently
 validated BESS reference in these cases; no further engine change is warranted.
-Pinned DPDK 25.11.3's mbuf helper disagrees with the semantic API when a UDP or
-TCP checksum field crosses the two-segment checksum split. Such rows report
-`dpdk_checksum_mismatch=1` and are not treated as valid DPDK performance wins.
+Pinned DPDK 25.11.3's `rte_raw_cksum_mbuf()` calls
+`__rte_raw_cksum()` for each mbuf chunk. When the cumulative `done` length is
+odd, it casts the 32-bit unreduced chunk sum to `uint16_t` before
+`rte_bswap16()`, discarding upper carries before final reduction. The IPv4
+`rte_ipv4_udptcp_cksum_mbuf()` helper delegates its L4 range to this routine.
+For UDP, the observed two-segment split starts L4 at byte 34 and leaves a
+seven-byte first L4 chunk before the long second chunk. The TCP case likewise
+has an odd first chunk. The four-segment shape inserts a one-byte chunk before
+the remaining long segment, restoring even parity before that long chunk.
+This matches the observed discrepancy; it does not assert an upstream fix or
+root-cause report. Such rows are marked `dpdk_checksum_mismatch=1` and are
+retained for diagnosis only, not valid checksum-correctness or performance
+references. See [DPDK 25.11.3
+`rte_cksum.h`](https://doc.dpdk.org/api-25.11/rte__cksum_8h_source.html) and
+[`rte_ip4.h`](https://doc.dpdk.org/api-25.11/rte__ip4_8h_source.html).
 
 `packet_checksum_test` and `packet_reshape_test` pass in both GCC (`build-meson`)
 and Clang (`build-meson-clang`) builds.
 
-#### K4.4b — semantic TX checksum-offload plan (deferred)
+#### K4.4b — semantic TX checksum finalization (implemented)
 
-K4.4b expresses checksum intent and device support semantically, then maps
-that plan to PMD-specific metadata at the transmit boundary. `PmdCapabilities`
-already retains `tx_offload_capa`, while the current `default_eth_conf`
-configures RX scatter and leaves TX offloads disabled.
+`Port::GetTxChecksumCapabilities()` exposes backend-neutral checksum support.
+`PmdCapabilities` maps DPDK TX capability bits and `default_eth_conf` enables the
+supported checksum, generic tunnel, and multi-segment TX offloads. Non-PMD
+ports report no hardware capabilities and use software finalization.
 
-Derive `TxChecksumCapabilities` from `PmdCapabilities::tx_offload_capa`.
-Keep `TxChecksumCapabilities` and `TxOffloadPlan` backend-neutral at module
-boundaries; translate them to DPDK offload flags and mbuf `l2_len`/`l3_len`
-only inside PMD integration. The K4.4a software path is the semantic oracle:
-hardware preparation is valid only when the device supports the requested
-operation and yields equivalent packet bytes/checksum semantics; unsupported
-layouts use the software path.
+`PortOutArg` and `QueueOutArg` accept an optional `TxChecksumProfile`. Each
+output-module instance stores and binds its own profile during `Init`. A profile
+has at most two checksum domains: `outer` (the ordinary packet's IP domain, or
+the encapsulating IP domain) and `inner` (one encapsulated IP domain). Each
+domain fixes its IP version, network and transport offsets, and requested IPv4
+header / UDP / TCP checksums. The network and transport components bind to
+software or hardware independently. The optional generic `IP` or `UDP`
+encapsulation description exists only for tunneled inner offload metadata; it
+does not select checksum intent or a tunnel protocol.
 
-Checksum metadata must not survive mutation of covered bytes or header
-offsets. Establish the actual mutation/enqueue boundary before enabling
-offloads, and build or validate the final plan after the last relevant packet
-mutation; avoid a graph-wide invalidation mechanism without a proven need.
+The protobuf profile contains no PMD flags, mbuf `ol_flags`, or DPDK header
+length fields. `Port` remains policy-free, and the output path never infers
+intent or offsets from packet bytes. A fixed profile must match each packet;
+different layouts use separate output instances. There is no packet sidecar,
+graph-wide plan, protocol-specific PFCP/UPF behavior, or nesting beyond two
+checksum domains. `L4Checksum` remains an explicit compute/verify module; TX
+finalization is a distinct last egress step.
 
-K4.4 checksum measurements should compare five cases: existing BESS
-contiguous checksums; DPDK contiguous checksums; chain-aware DPDK/BESS
-checksums; the generic K4.4 software plan; and TX-offload metadata preparation
-only. Report topology and operation-attribution counters separately from
-timing. Do not choose a checksum backend without repeatable measurements.
-K4.5 batch/ILP experiments remain downstream of both K4.4a and K4.4b.
+Immediately before `SendPackets`, the finalizer validates the configured
+layout, applies software-bound components through K4.4a, writes DPDK checksum
+seeds or zero fields, and installs the required flags and header lengths for
+hardware-bound components. Hardware offload requires contiguous header fields;
+chained payloads are accepted only when the PMD advertises multi-segment TX.
+When an outer UDP checksum is software-computed but an inner checksum is
+hardware-bound, the inner checksum is temporarily computed in software before
+the outer checksum, then replaced with its DPDK seed. This preserves the final
+wire checksum dependency. Invalid layouts and preparation failures are freed
+before send and counted separately as `tx_prepare_errors`; driver drops remain
+in the existing drop counter. The no-profile path leaves packet bytes and
+metadata unchanged.
+
+The implementation follows the pinned DPDK 25.11.3 checksum-seed and generic
+tunnel-metadata contract. K4.5 generalized execution machinery remains
+deferred.
+
+##### Benchmark evidence
+
+`packet_tx_checksum_bench` was run with
+`--benchmark_min_time=0.005s --benchmark_repetitions=3
+--benchmark_report_aggregates_only=true --benchmark_format=json`. All 276
+aggregate means completed without errors: 240 finalizer-preparation cases and
+36 fixed-queue `QueueOut` cases. The latter calls `QueueOut::ProcessBatch`
+against an in-process port whose `SendPackets` accepts the full batch; it
+measures the module, stats, and finalization path, not NIC throughput or
+`PortOut` worker-to-queue mapping.
+
+| Fixed-queue output case | No profile (ns/batch) | Software profile (ns/batch) | Added (ns/packet) |
+| --- | ---: | ---: | ---: |
+| 64B UDP, batch 1 | 3.6 | 114.1 | 110.5 |
+| 1500B TCP, batch 32 | 11.2 | 4286.3 | 133.6 |
+| 4096B UDP, batch 32 | 12.0 | 6560.3 | 204.6 |
+
+The direct preparation matrix isolates checksum preparation from output
+dispatch. Representative CPU time per packet:
+
+| Packet case | K4.4a software | Software profile | One-domain hardware | Two-domain hardware | Mixed SW/HW |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 64B UDP, batch 1, contiguous | 75.6 ns | 119.5 ns | 71.6 ns | 97.5 ns | 217.3 ns |
+| 1500B TCP, batch 32, contiguous | 90.3 ns | 157.5 ns | 80.8 ns | 134.8 ns | 235.2 ns |
+| 4096B UDP, batch 32, chained | 172.3 ns | 227.0 ns | 62.9 ns | 140.1 ns | 401.7 ns |
+
+Measurements are host-specific and comparative. This host has no DPDK Ethernet
+device; on-wire byte-equivalence testing was unavailable.
+
+##### Full-suite verification
+
+After the final source changes, the full Meson suite passed 80/80 tests with
+Clang in `build-meson-clang` (469.72 s) and GCC in `build-meson`
+(362.98 s).
 
 
 ---

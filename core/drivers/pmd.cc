@@ -60,6 +60,33 @@ PmdCapabilities PmdCapabilities::FromDeviceInfo(
   return ret;
 }
 
+bess::packet::TxChecksumCapabilities
+PmdCapabilities::ToTxChecksumCapabilities() const {
+  return {
+      .ipv4_header =
+          (tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0,
+      .udp = (tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0,
+      .tcp = (tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM) != 0,
+      .outer_ipv4_header =
+          (tx_offload_capa & RTE_ETH_TX_OFFLOAD_OUTER_IPV4_CKSUM) != 0,
+      .outer_udp =
+          (tx_offload_capa & RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM) != 0,
+      .ip_tunnel = (tx_offload_capa & RTE_ETH_TX_OFFLOAD_IP_TNL_TSO) != 0,
+      .udp_tunnel = (tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO) != 0,
+      .multi_segment_tx =
+          (tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) != 0,
+  };
+}
+
+uint64_t PmdCapabilities::ConfiguredTxOffloads() const {
+  constexpr uint64_t kTxChecksumOffloads =
+      RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
+      RTE_ETH_TX_OFFLOAD_TCP_CKSUM | RTE_ETH_TX_OFFLOAD_OUTER_IPV4_CKSUM |
+      RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM | RTE_ETH_TX_OFFLOAD_IP_TNL_TSO |
+      RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO | RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+  return tx_offload_capa & kTxChecksumOffloads;
+}
+
 size_t PmdCapabilities::RxFrameLengthFor(uint32_t mtu) const {
   return static_cast<size_t>(mtu) + rx_frame_overhead;
 }
@@ -93,6 +120,8 @@ static const rte_eth_conf default_eth_conf(const rte_eth_dev_info &dev_info,
 
   ret.rxmode.mq_mode = (nb_rxq > 1) ? RTE_ETH_MQ_RX_RSS : RTE_ETH_MQ_RX_NONE;
   ret.rxmode.offloads = 0;
+  ret.txmode.offloads =
+      PmdCapabilities::FromDeviceInfo(dev_info).ConfiguredTxOffloads();
   if (enable_rx_scatter) {
     ret.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_SCATTER;
   }

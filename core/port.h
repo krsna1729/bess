@@ -44,6 +44,7 @@
 #include "message.h"
 #include "module.h"
 #include "packet.h"
+#include "packet_checksum.h"
 #include "pb/port_msg.pb.h"
 #include "pktbatch.h"
 #include "utils/common.h"
@@ -172,6 +173,7 @@ struct BatchHistogram
 struct QueueStats {
   uint64_t packets;
   uint64_t dropped;  // Not all drivers support this for INC direction
+  uint64_t tx_prepare_errors = 0;
   uint64_t bytes;    // It doesn't include Ethernet overhead
   BatchHistogram requested_hist;
   BatchHistogram actual_hist;
@@ -225,6 +227,12 @@ class Port {
 
   virtual int RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) = 0;
   virtual int SendPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) = 0;
+
+  // Reports packet checksum operations supported by this port's hardware.
+  virtual bess::packet::TxChecksumCapabilities GetTxChecksumCapabilities()
+      const {
+    return {};
+  }
 
   // For custom incoming / outgoing queue sizes (optional).
   virtual size_t DefaultIncQueueSize() const { return kDefaultIncQueueSize; }

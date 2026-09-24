@@ -40,6 +40,7 @@
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 
+#include "../packet_checksum.h"
 #include "../module.h"
 #include "../port.h"
 
@@ -65,6 +66,8 @@ struct PmdCapabilities {
   // usable_single_mbuf_bytes excludes RTE_PKTMBUF_HEADROOM.
   RxMtuSupport RxMtuSupportFor(
       uint32_t mtu, size_t usable_single_mbuf_bytes) const;
+  uint64_t ConfiguredTxOffloads() const;
+  bess::packet::TxChecksumCapabilities ToTxChecksumCapabilities() const;
 
   bool rx_scatter = false;
   uint32_t min_mtu = RTE_ETHER_MIN_MTU;
@@ -158,6 +161,11 @@ class PMDPort final : public Port {
 
   uint64_t GetFlags() const override {
     return DRIVER_FLAG_SELF_INC_STATS | DRIVER_FLAG_SELF_OUT_STATS;
+  }
+
+  bess::packet::TxChecksumCapabilities GetTxChecksumCapabilities()
+      const override {
+    return capabilities_.ToTxChecksumCapabilities();
   }
 
   LinkStatus GetLinkStatus() override;

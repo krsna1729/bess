@@ -34,6 +34,7 @@
 
 #include "../port.h"
 #include "../utils/format.h"
+#include "tx_checksum_profile.h"
 
 CommandResponse QueueOut::Init(const bess::pb::QueueOutArg &arg) {
   const char *port_name;
@@ -49,6 +50,21 @@ CommandResponse QueueOut::Init(const bess::pb::QueueOutArg &arg) {
   port_ = bess::control::runtime().ports().Find(port_name);
   if (!port_) {
     return CommandFailure(ENODEV, "Port %s not found", port_name);
+  }
+
+  tx_checksum_profile_ = {};
+  if (arg.has_tx_checksum_profile()) {
+    const auto profile =
+        bess::modules::ParseTxChecksumProfile(arg.tx_checksum_profile());
+    if (!profile) {
+      return CommandFailure(EINVAL, "Invalid tx_checksum_profile");
+    }
+    const auto bound = bess::packet::BindTxFinalizationProfile(
+        *profile, port_->GetTxChecksumCapabilities());
+    if (!bound) {
+      return CommandFailure(EINVAL, "Invalid tx_checksum_profile");
+    }
+    tx_checksum_profile_ = *bound;
   }
 
   node_constraints_ = port_->GetNodePlacementConstraint();
@@ -76,30 +92,38 @@ std::string QueueOut::GetDesc() const {
 
 void QueueOut::ProcessBatch(Context *, bess::PacketBatch *batch) {
   Port *p = port_;
-
   const queue_t qid = qid_;
-
   uint64_t sent_bytes = 0;
+  uint64_t prepare_errors = 0;
   int sent_pkts = 0;
 
   if (p->conf().admin_up) {
-    sent_pkts = p->SendPackets(qid, batch->handles(), batch->cnt());
+    if (tx_checksum_profile_.enabled()) {
+      prepare_errors = bess::packet::FinalizeTxPacketBatch(
+                           *batch, tx_checksum_profile_)
+                           .rejected;
+    }
+    if (batch->cnt() != 0) {
+      sent_pkts = p->SendPackets(qid, batch->handles(), batch->cnt());
+    }
   }
 
+  const packet_dir_t dir = PACKET_DIR_OUT;
+  QueueStats &stats = p->queue_stats[dir][qid];
+  stats.tx_prepare_errors += prepare_errors;
   if (!(p->GetFlags() & DRIVER_FLAG_SELF_OUT_STATS)) {
-    const packet_dir_t dir = PACKET_DIR_OUT;
-
     for (int i = 0; i < sent_pkts; i++) {
       sent_bytes += batch->packet(i).total_len();
     }
 
-    p->queue_stats[dir][qid].packets += sent_pkts;
-    p->queue_stats[dir][qid].dropped += (batch->cnt() - sent_pkts);
-    p->queue_stats[dir][qid].bytes += sent_bytes;
+    stats.packets += sent_pkts;
+    stats.dropped += prepare_errors + (batch->cnt() - sent_pkts);
+    stats.bytes += sent_bytes;
   }
 
   if (sent_pkts < batch->cnt()) {
-    bess::PacketFreeBulk(batch->handles() + sent_pkts, batch->cnt() - sent_pkts);
+    bess::PacketFreeBulk(batch->handles() + sent_pkts,
+                         batch->cnt() - sent_pkts);
   }
 }
 

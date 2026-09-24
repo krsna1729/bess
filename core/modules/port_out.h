@@ -34,6 +34,7 @@
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../port.h"
+#include "../packet_tx_checksum.h"
 #include "../utils/mcslock.h"
 #include "../worker.h"
 
@@ -45,7 +46,14 @@ class PortOut final : public Module {
   static const Commands cmds;
 
   PortOut()
-      : Module(), port_(), worker_queues_(), queue_users_(), queue_locks_() {
+      : Module(),
+        port_(),
+        tx_checksum_profile_(),
+        tx_checksum_profile_arg_(),
+        has_tx_checksum_profile_(false),
+        worker_queues_(),
+        queue_users_(),
+        queue_locks_() {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 
@@ -62,6 +70,10 @@ class PortOut final : public Module {
 
  private:
   Port *port_;
+
+  bess::packet::BoundTxFinalizationProfile tx_checksum_profile_;
+  bess::pb::TxChecksumProfile tx_checksum_profile_arg_;
+  bool has_tx_checksum_profile_;
 
   int worker_queues_[Worker::kMaxWorkers];
 

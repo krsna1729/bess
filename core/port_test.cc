@@ -128,6 +128,21 @@ TEST_F(PortTest, CreatePort) {
   EXPECT_EQ(42, err.error().code());
 }
 
+TEST_F(PortTest, NonPmdPortHasNoTxChecksumCapabilities) {
+  std::unique_ptr<Port> port(dummy_port_builder->CreatePort("port1"));
+  ASSERT_NE(nullptr, port.get());
+
+  const auto capabilities = port->GetTxChecksumCapabilities();
+  EXPECT_FALSE(capabilities.ipv4_header);
+  EXPECT_FALSE(capabilities.udp);
+  EXPECT_FALSE(capabilities.tcp);
+  EXPECT_FALSE(capabilities.outer_ipv4_header);
+  EXPECT_FALSE(capabilities.outer_udp);
+  EXPECT_FALSE(capabilities.ip_tunnel);
+  EXPECT_FALSE(capabilities.udp_tunnel);
+  EXPECT_FALSE(capabilities.multi_segment_tx);
+}
+
 // Checks that adding a port puts it into the global port collection.
 TEST_F(PortTest, AddPort) {
   std::unique_ptr<Port> p(dummy_port_builder->CreatePort("port1"));
@@ -164,6 +179,16 @@ TEST_F(PortTest, GetPortStats) {
   EXPECT_EQ(0, stats.out.packets);
   EXPECT_EQ(0, stats.out.dropped);
   EXPECT_EQ(0, stats.out.bytes);
+
+  Port *port = it->second.get();
+  port->num_queues[PACKET_DIR_OUT] = 2;
+  port->queue_stats[PACKET_DIR_OUT][0].dropped = 2;
+  port->queue_stats[PACKET_DIR_OUT][0].tx_prepare_errors = 3;
+  port->queue_stats[PACKET_DIR_OUT][1].dropped = 1;
+  port->queue_stats[PACKET_DIR_OUT][1].tx_prepare_errors = 4;
+  stats = port->GetPortStats();
+  EXPECT_EQ(3, stats.out.dropped);
+  EXPECT_EQ(7, stats.out.tx_prepare_errors);
 }
 
 // Checks that we can acquire and release queues.

@@ -63,6 +63,33 @@ struct ChecksumPlan {
   TransportChecksum transport = TransportChecksum::kNone;
 };
 
+struct ChecksumLayout {
+  size_t network_header_length = 0;
+  size_t network_length = 0;
+  size_t transport_length = 0;
+  size_t transport_header_length = 0;
+  size_t network_checksum_offset = 0;
+  size_t transport_checksum_offset = 0;
+  uint8_t transport_protocol = 0;
+};
+
+
+struct TxChecksumCapabilities {
+  // These capabilities apply to regular packets and tunneled inner headers.
+  bool ipv4_header = false;
+  bool udp = false;  // IPv4 and IPv6 transport checksums.
+  bool tcp = false;  // IPv4 and IPv6 transport checksums.
+
+  // DPDK exposes outer-header checksum bits separately.
+  bool outer_ipv4_header = false;
+  bool outer_udp = false;
+
+  // Generic encapsulation support required for tunneled inner offloads.
+  bool ip_tunnel = false;
+  bool udp_tunnel = false;
+  bool multi_segment_tx = false;
+};
+
 struct ChecksumValues {
   std::optional<utils::be16_t> network;
   std::optional<utils::be16_t> transport;
@@ -82,6 +109,7 @@ enum class ChecksumError : uint8_t {
   kUnsupportedJumbogram,
   kAllocationFailed,
   kInsufficientWritableCapacity,
+  kUnsupportedOffloadLayout,
 };
 
 // Computes requested checksums from the packet's logical bytes. This is
@@ -90,6 +118,12 @@ enum class ChecksumError : uint8_t {
 // are encoded as 0xffff. The caller may share payload backing.
 std::expected<ChecksumValues, ChecksumError> ComputeChecksums(
     PacketRef packet, const ChecksumPlan &plan) noexcept;
+
+// Validates a checksum plan and reports the parsed fixed header lengths and
+// checksum-field offsets without computing checksums or mutating the packet.
+std::expected<ChecksumLayout, ChecksumError> InspectChecksumPlan(
+    PacketRef packet, const ChecksumPlan &plan) noexcept;
+
 
 // Applies all requested checksums transactionally. The caller must exclusively
 // own the descriptor chain; shared backing is copied only when a target

@@ -282,12 +282,12 @@ bool IsValidPlan(const ChecksumPlan &plan) noexcept {
   return true;
 }
 
-std::expected<ChecksumValues, ChecksumError> ComputeIpv4Checksums(
+std::expected<ChecksumLayout, ChecksumError> InspectIpv4ChecksumPlan(
     PacketRef packet, const ChecksumPlan &plan) noexcept {
-  ChecksumValues values;
+  ChecksumLayout layout;
   if (plan.network == NetworkChecksum::kNone &&
       plan.transport == TransportChecksum::kNone) {
-    return values;
+    return layout;
   }
 
   const size_t packet_length = packet.total_len();
@@ -309,18 +309,13 @@ std::expected<ChecksumValues, ChecksumError> ComputeIpv4Checksums(
     return std::unexpected(ChecksumError::kLengthOutOfRange);
   }
 
-  if (plan.network == NetworkChecksum::kIpv4Header) {
-    ChecksumAccumulator sum;
-    const size_t field_offset = plan.network_offset + kIpv4ChecksumOffset;
-    if (!AddPacketRangeWithZeroField(packet, plan.network_offset,
-                                     ip_header_length, field_offset, sum)) {
-      return std::unexpected(ChecksumError::kMalformedChain);
-    }
-    values.network.emplace(sum.Finish());
-  }
-
+  layout.network_header_length = ip_header_length;
+  layout.network_length = ip_total_length;
+  layout.network_checksum_offset =
+      plan.network_offset + kIpv4ChecksumOffset;
+  layout.transport_protocol = ip.protocol;
   if (plan.transport == TransportChecksum::kNone) {
-    return values;
+    return layout;
   }
 
   const uint8_t expected_protocol = plan.transport == TransportChecksum::kUdp
@@ -346,8 +341,8 @@ std::expected<ChecksumValues, ChecksumError> ComputeIpv4Checksums(
   if (transport_length > UINT16_MAX) {
     return std::unexpected(ChecksumError::kInvalidIpv4Header);
   }
+  layout.transport_length = transport_length;
 
-  size_t checksum_field_offset = 0;
   if (plan.transport == TransportChecksum::kUdp) {
     if (transport_length < sizeof(utils::Udp)) {
       return std::unexpected(ChecksumError::kInvalidTransportHeader);
@@ -359,7 +354,9 @@ std::expected<ChecksumValues, ChecksumError> ComputeIpv4Checksums(
     if (udp->length.value() != transport_length) {
       return std::unexpected(ChecksumError::kInvalidTransportHeader);
     }
-    checksum_field_offset = plan.transport_offset + kUdpChecksumOffset;
+    layout.transport_header_length = sizeof(utils::Udp);
+    layout.transport_checksum_offset =
+        plan.transport_offset + kUdpChecksumOffset;
   } else {
     if (transport_length < sizeof(utils::Tcp)) {
       return std::unexpected(ChecksumError::kInvalidTransportHeader);
@@ -373,33 +370,21 @@ std::expected<ChecksumValues, ChecksumError> ComputeIpv4Checksums(
         tcp_header_length > transport_length) {
       return std::unexpected(ChecksumError::kInvalidTransportHeader);
     }
-    checksum_field_offset = plan.transport_offset + kTcpChecksumOffset;
+    layout.transport_header_length = tcp_header_length;
+    layout.transport_checksum_offset =
+        plan.transport_offset + kTcpChecksumOffset;
   }
-
-  ChecksumAccumulator sum;
-  AddIpv4PseudoHeader(sum, ip, expected_protocol,
-                      static_cast<uint16_t>(transport_length));
-  if (!AddPacketRangeWithZeroField(packet, plan.transport_offset,
-                                   transport_length, checksum_field_offset,
-                                   sum)) {
-    return std::unexpected(ChecksumError::kMalformedChain);
-  }
-  uint16_t checksum = sum.Finish();
-  if (plan.transport == TransportChecksum::kUdp && checksum == 0) {
-    checksum = 0xffff;
-  }
-  values.transport.emplace(checksum);
-  return values;
+  return layout;
 }
 
-std::expected<ChecksumValues, ChecksumError> ComputeIpv6Checksums(
+std::expected<ChecksumLayout, ChecksumError> InspectIpv6ChecksumPlan(
     PacketRef packet, const ChecksumPlan &plan) noexcept {
-  ChecksumValues values;
+  ChecksumLayout layout;
   if (plan.network != NetworkChecksum::kNone) {
     return std::unexpected(ChecksumError::kInvalidPlan);
   }
   if (plan.transport == TransportChecksum::kNone) {
-    return values;
+    return layout;
   }
 
   const auto ip_header =
@@ -438,22 +423,26 @@ std::expected<ChecksumValues, ChecksumError> ComputeIpv6Checksums(
   if (plan.transport_offset != expected_transport_offset) {
     return std::unexpected(ChecksumError::kInvalidPlan);
   }
-  const size_t transport_length = payload_length;
-  size_t checksum_field_offset = 0;
+  layout.network_header_length = sizeof(rte_ipv6_hdr);
+  layout.network_length = sizeof(rte_ipv6_hdr) + payload_length;
+  layout.transport_length = payload_length;
+  layout.transport_protocol = ip.proto;
   if (plan.transport == TransportChecksum::kUdp) {
-    if (transport_length < sizeof(utils::Udp)) {
+    if (payload_length < sizeof(utils::Udp)) {
       return std::unexpected(ChecksumError::kInvalidTransportHeader);
     }
     const auto udp = ReadHeaderAt<utils::Udp>(packet, plan.transport_offset);
     if (!udp) {
       return std::unexpected(ChecksumError::kLengthOutOfRange);
     }
-    if (udp->length.value() != transport_length) {
+    if (udp->length.value() != payload_length) {
       return std::unexpected(ChecksumError::kInvalidTransportHeader);
     }
-    checksum_field_offset = plan.transport_offset + kUdpChecksumOffset;
+    layout.transport_header_length = sizeof(utils::Udp);
+    layout.transport_checksum_offset =
+        plan.transport_offset + kUdpChecksumOffset;
   } else {
-    if (transport_length < sizeof(utils::Tcp)) {
+    if (payload_length < sizeof(utils::Tcp)) {
       return std::unexpected(ChecksumError::kInvalidTransportHeader);
     }
     const auto tcp = ReadHeaderAt<utils::Tcp>(packet, plan.transport_offset);
@@ -462,18 +451,81 @@ std::expected<ChecksumValues, ChecksumError> ComputeIpv6Checksums(
     }
     const size_t tcp_header_length = static_cast<size_t>(tcp->offset) * 4;
     if (tcp_header_length < sizeof(utils::Tcp) ||
-        tcp_header_length > transport_length) {
+        tcp_header_length > payload_length) {
       return std::unexpected(ChecksumError::kInvalidTransportHeader);
     }
-    checksum_field_offset = plan.transport_offset + kTcpChecksumOffset;
+    layout.transport_header_length = tcp_header_length;
+    layout.transport_checksum_offset =
+        plan.transport_offset + kTcpChecksumOffset;
+  }
+  return layout;
+}
+
+std::expected<ChecksumValues, ChecksumError> ComputeIpv4Checksums(
+    PacketRef packet, const ChecksumPlan &plan) noexcept {
+  ChecksumValues values;
+  const auto layout = InspectIpv4ChecksumPlan(packet, plan);
+  if (!layout) {
+    return std::unexpected(layout.error());
   }
 
+  if (plan.network == NetworkChecksum::kIpv4Header) {
+    ChecksumAccumulator sum;
+    if (!AddPacketRangeWithZeroField(
+            packet, plan.network_offset, layout->network_header_length,
+            layout->network_checksum_offset, sum)) {
+      return std::unexpected(ChecksumError::kMalformedChain);
+    }
+    values.network.emplace(sum.Finish());
+  }
+
+  if (plan.transport == TransportChecksum::kNone) {
+    return values;
+  }
+  const auto ip_header = ReadHeaderAt<utils::Ipv4>(packet, plan.network_offset);
+  if (!ip_header) {
+    return std::unexpected(ChecksumError::kLengthOutOfRange);
+  }
+  const utils::Ipv4 &ip = *ip_header;
   ChecksumAccumulator sum;
-  AddIpv6PseudoHeader(sum, ip, expected_protocol,
-                      static_cast<uint16_t>(transport_length));
+  AddIpv4PseudoHeader(sum, ip, layout->transport_protocol,
+                      static_cast<uint16_t>(layout->transport_length));
   if (!AddPacketRangeWithZeroField(packet, plan.transport_offset,
-                                   transport_length, checksum_field_offset,
-                                   sum)) {
+                                   layout->transport_length,
+                                   layout->transport_checksum_offset, sum)) {
+    return std::unexpected(ChecksumError::kMalformedChain);
+  }
+  uint16_t checksum = sum.Finish();
+  if (plan.transport == TransportChecksum::kUdp && checksum == 0) {
+    checksum = 0xffff;
+  }
+  values.transport.emplace(checksum);
+  return values;
+}
+
+std::expected<ChecksumValues, ChecksumError> ComputeIpv6Checksums(
+    PacketRef packet, const ChecksumPlan &plan) noexcept {
+  ChecksumValues values;
+  const auto layout = InspectIpv6ChecksumPlan(packet, plan);
+  if (!layout) {
+    return std::unexpected(layout.error());
+  }
+  if (plan.transport == TransportChecksum::kNone) {
+    return values;
+  }
+
+  const auto ip_header =
+      ReadHeaderAt<rte_ipv6_hdr>(packet, plan.network_offset);
+  if (!ip_header) {
+    return std::unexpected(ChecksumError::kLengthOutOfRange);
+  }
+  const rte_ipv6_hdr &ip = *ip_header;
+  ChecksumAccumulator sum;
+  AddIpv6PseudoHeader(sum, ip, layout->transport_protocol,
+                      static_cast<uint16_t>(layout->transport_length));
+  if (!AddPacketRangeWithZeroField(packet, plan.transport_offset,
+                                   layout->transport_length,
+                                   layout->transport_checksum_offset, sum)) {
     return std::unexpected(ChecksumError::kMalformedChain);
   }
   uint16_t checksum = sum.Finish();
@@ -556,6 +608,24 @@ void WriteBytesUnchecked(PacketHandle packet, size_t offset,
 }
 
 }  // namespace
+
+std::expected<ChecksumLayout, ChecksumError> InspectChecksumPlan(
+    PacketRef packet, const ChecksumPlan &plan) noexcept {
+  const auto chain = ValidateChain(packet.handle());
+  if (!chain) {
+    return std::unexpected(chain.error());
+  }
+  if (!IsValidPlan(plan)) {
+    return std::unexpected(ChecksumError::kInvalidPlan);
+  }
+  switch (plan.ip_version) {
+    case IpVersion::kIpv4:
+      return InspectIpv4ChecksumPlan(packet, plan);
+    case IpVersion::kIpv6:
+      return InspectIpv6ChecksumPlan(packet, plan);
+  }
+  return std::unexpected(ChecksumError::kInvalidPlan);
+}
 
 std::expected<ChecksumValues, ChecksumError> ComputeChecksums(
     PacketRef packet, const ChecksumPlan &plan) noexcept {

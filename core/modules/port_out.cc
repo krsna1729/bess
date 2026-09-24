@@ -32,6 +32,7 @@
 
 #include "../control/runtime_state.h"
 #include "../utils/format.h"
+#include "tx_checksum_profile.h"
 
 const Commands PortOut::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&PortOut::GetInitialArg),
@@ -42,6 +43,10 @@ CommandResponse PortOut::Init(const bess::pb::PortOutArg &arg) {
   const char *port_name;
   int ret;
 
+  has_tx_checksum_profile_ = false;
+  tx_checksum_profile_ = {};
+  tx_checksum_profile_arg_.Clear();
+
   if (!arg.port().length()) {
     return CommandFailure(EINVAL, "'port' must be given as a string");
   }
@@ -51,6 +56,22 @@ CommandResponse PortOut::Init(const bess::pb::PortOutArg &arg) {
   port_ = bess::control::runtime().ports().Find(port_name);
   if (!port_) {
     return CommandFailure(ENODEV, "Port %s not found", port_name);
+  }
+
+  if (arg.has_tx_checksum_profile()) {
+    const auto profile =
+        bess::modules::ParseTxChecksumProfile(arg.tx_checksum_profile());
+    if (!profile) {
+      return CommandFailure(EINVAL, "Invalid tx_checksum_profile");
+    }
+    const auto bound = bess::packet::BindTxFinalizationProfile(
+        *profile, port_->GetTxChecksumCapabilities());
+    if (!bound) {
+      return CommandFailure(EINVAL, "Invalid tx_checksum_profile");
+    }
+    tx_checksum_profile_ = *bound;
+    tx_checksum_profile_arg_ = arg.tx_checksum_profile();
+    has_tx_checksum_profile_ = true;
   }
 
   if (port_->num_queues[PACKET_DIR_OUT] == 0) {
@@ -76,6 +97,9 @@ CommandResponse PortOut::Init(const bess::pb::PortOutArg &arg) {
 CommandResponse PortOut::GetInitialArg(const bess::pb::EmptyArg &) {
   bess::pb::PortOutArg arg;
   arg.set_port(port_->name());
+  if (has_tx_checksum_profile_) {
+    *arg.mutable_tx_checksum_profile() = tx_checksum_profile_arg_;
+  }
   return CommandSuccess(arg);
 }
 
@@ -91,24 +115,34 @@ std::string PortOut::GetDesc() const {
                              port_->port_builder()->class_name().c_str());
 }
 
-static inline int SendBatch(bess::PacketBatch *batch, Port *p, queue_t qid) {
+static inline int SendBatch(
+    bess::PacketBatch *batch, Port *p, queue_t qid,
+    const bess::packet::BoundTxFinalizationProfile &profile) {
   uint64_t sent_bytes = 0;
+  uint64_t prepare_errors = 0;
   int sent_pkts = 0;
 
   if (p->conf().admin_up) {
-    sent_pkts = p->SendPackets(qid, batch->handles(), batch->cnt());
+    if (profile.enabled()) {
+      prepare_errors =
+          bess::packet::FinalizeTxPacketBatch(*batch, profile).rejected;
+    }
+    if (batch->cnt() != 0) {
+      sent_pkts = p->SendPackets(qid, batch->handles(), batch->cnt());
+    }
   }
 
+  const packet_dir_t dir = PACKET_DIR_OUT;
+  QueueStats &stats = p->queue_stats[dir][qid];
+  stats.tx_prepare_errors += prepare_errors;
   if (!(p->GetFlags() & DRIVER_FLAG_SELF_OUT_STATS)) {
-    const packet_dir_t dir = PACKET_DIR_OUT;
-
     for (int i = 0; i < sent_pkts; i++) {
       sent_bytes += batch->packet(i).total_len();
     }
 
-    p->queue_stats[dir][qid].packets += sent_pkts;
-    p->queue_stats[dir][qid].dropped += (batch->cnt() - sent_pkts);
-    p->queue_stats[dir][qid].bytes += sent_bytes;
+    stats.packets += sent_pkts;
+    stats.dropped += prepare_errors + (batch->cnt() - sent_pkts);
+    stats.bytes += sent_bytes;
   }
 
   return sent_pkts;
@@ -122,11 +156,11 @@ void PortOut::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int sent_pkts = 0;
 
   if (queue_users_[qid] == 1) {
-    sent_pkts = SendBatch(batch, p, qid);
+    sent_pkts = SendBatch(batch, p, qid, tx_checksum_profile_);
   } else {
     mcslock_node_t me;
     mcs_lock(&queue_locks_[qid], &me);
-    sent_pkts = SendBatch(batch, p, qid);
+    sent_pkts = SendBatch(batch, p, qid, tx_checksum_profile_);
     mcs_unlock(&queue_locks_[qid], &me);
   }
 
