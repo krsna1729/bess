@@ -202,15 +202,20 @@ benchmark attribution; K4.2/K4.2.1 now add checked in-place mutation,
 payload-ownership, and descriptor-ownership primitives. K4.3a, K4.3a.1,
 K4.3b, and K4.3b.1 are CLOSED; K4.3c adds allocation-free cross-segment
 prefix/suffix removal and completes K4 packet topology/ownership mechanics.
-K4.4a/b software checksum semantics and TX finalization are complete. K4.5
+K4.4a/b software checksum semantics and TX finalization are complete. PMD
+reconfiguration now prevalidates rejectable MTU/scatter changes before stopping,
+updates administrative state on both up and down transitions, and restores the
+previous RX configuration and admin state after a post-stop failure. K4.5
 records a benchmark-only comparison of runtime-generic and compile-time-
 specialized batch bodies; no production executor, loop migration, or prefetch
-policy is adopted. Its lookup study now separates the fixed-batch hot-loop
-floor from a pre-generated working-set run: tables are populated to 50% load,
-lookup modes are hot-hit, uniform-hit, miss, and 50/50 mixed, and the working
-set cycles through 32 deterministic batches (up to 1,024 packets). The
-separate real-PMD/NIC interoperability matrix remains pending because no
-suitable device is available; it does not block K4 software closure.
+policy is adopted. Its lookup study separates the fixed-batch hot-loop floor
+from a pre-generated working-set run: tables are populated to 50% load, lookup
+modes are hot-hit, uniform-hit, miss, and 50/50 mixed, and the working set
+cycles through 32 deterministic batches (up to 1,024 packets). Isolated GCC
+and Clang JSON matrices are retained under the two build directories; the
+working-set matrix contains 384 cases per compiler. The separate real-PMD/NIC
+interoperability matrix remains pending because no suitable device is
+available; it does not block K4 software closure.
 The active software scope K1-K4 is closed. Meson/Ninja remains the build graph,
 with pinned DPDK 25.11.3. The registered Meson suite has 80 targets. The
 current bounded GCC and Clang runs compiled with `taskset -c 0-3 meson compile -j4`,
@@ -5839,9 +5844,10 @@ bits with the bits actually configured at device or queue scope. BESS sets
 `txmode.offloads` only for advertised device-scope checksum, multi-segment,
 and generic-tunnel prerequisites. `rte_eth_tx_queue_setup(..., NULL)` uses
 `dev_info.default_txconf`; after setup, BESS reads `rte_eth_tx_queue_info_get`
-and uses `qinfo.conf.offloads`, falling back to the advertised queue-scoped
-bits from `default_txconf` only if the query fails. Device flags are removed
-from the queue mask before calculating effective queue support.
+and uses `qinfo.conf.offloads`. If queue introspection fails, BESS treats
+queue-scoped offloads as unavailable and falls back to software rather than
+inferring them from `default_txconf`. Device flags are removed from the queue
+mask before calculating effective queue support.
 
 DPDK 25.11.3 requires `RTE_ETH_TX_OFFLOAD_IP_TNL_TSO` when an application sets
 `RTE_MBUF_F_TX_TUNNEL_IP`, and `RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO` for
