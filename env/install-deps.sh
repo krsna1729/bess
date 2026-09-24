@@ -65,10 +65,7 @@ if [[ "$mode" == runtime ]]; then
     exit 1
   fi
 
-  # Ubuntu may ship an older dpkg-managed version than grpcio requires.
-  # Install the compatible wheel without trying to uninstall that package.
+  # Keep apt-owned Python modules intact when newer PyPI dependencies are needed.
   python3 -m pip install --break-system-packages --disable-pip-version-check \
-    --no-cache-dir --ignore-installed --no-deps 'typing-extensions~=4.12'
-  python3 -m pip install --break-system-packages --disable-pip-version-check \
-    --no-cache-dir -r "$requirements_file"
+    --no-cache-dir --ignore-installed -r "$requirements_file"
 fi
