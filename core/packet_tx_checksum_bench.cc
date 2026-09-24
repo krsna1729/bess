@@ -29,6 +29,7 @@
 
 #include <benchmark/benchmark.h>
 #include <glog/logging.h>
+#include <rte_ip.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -49,6 +50,7 @@
 namespace {
 
 using bess::PacketBatch;
+using bess::PacketClone;
 using bess::PacketFree;
 using bess::PacketHandle;
 using bess::PacketRef;
@@ -58,11 +60,13 @@ using bess::packet::BindTxFinalizationProfile;
 using bess::packet::BoundTxFinalizationProfile;
 using bess::packet::ChecksumPlan;
 using bess::packet::FinalizeTxPacketBatch;
+using bess::packet::FinalizeTxPacket;
+using bess::packet::InspectChecksumPlan;
 using bess::packet::IpVersion;
 using bess::packet::NetworkChecksum;
 using bess::packet::TransportChecksum;
-using bess::packet::TxChecksumCapabilities;
-using bess::packet::TxEncapsulationKind;
+using bess::packet::TxOffloadCapabilities;
+using bess::packet::TxTunnelEncoding;
 using bess::packet::TxFinalizationProfile;
 
 enum class Variant : int64_t {
@@ -73,6 +77,10 @@ enum class Variant : int64_t {
   kOneDomainHardware = 4,
   kTwoDomainHardware = 5,
   kMixedSoftwareHardware = 6,
+  kValidationOnly = 7,
+  kPseudoHeaderSeedOnly = 8,
+  kCloneBaseline = 9,
+  kOneDomainHardwareCow = 10,
 };
 
 enum class Protocol : int64_t {
@@ -153,7 +161,7 @@ TxFinalizationProfile MakeProfile(Variant variant, Protocol protocol) {
   TxFinalizationProfile profile;
   if (variant == Variant::kTwoDomainHardware ||
       variant == Variant::kMixedSoftwareHardware) {
-    profile.encapsulation = {.kind = TxEncapsulationKind::kUdp,
+    profile.encapsulation = {.encoding = TxTunnelEncoding::kGenericUdp,
                              .outer_ip_version = IpVersion::kIpv4,
                              .outer_network_offset = 0};
     profile.outer = OuterPlan(variant == Variant::kTwoDomainHardware);
@@ -165,27 +173,30 @@ TxFinalizationProfile MakeProfile(Variant variant, Protocol protocol) {
   return profile;
 }
 
-TxChecksumCapabilities CapabilitiesFor(Variant variant) {
+TxOffloadCapabilities CapabilitiesFor(Variant variant) {
   switch (variant) {
     case Variant::kOneDomainHardware:
-      return {.ipv4_header = true,
-              .udp = true,
-              .tcp = true,
-              .multi_segment_tx = true};
+    case Variant::kOneDomainHardwareCow:
+      return {
+          .checksums = {.ipv4_header = true, .udp = true, .tcp = true},
+          .multi_segment_tx = true,
+      };
     case Variant::kTwoDomainHardware:
-      return {.ipv4_header = true,
-              .udp = true,
-              .tcp = true,
-              .outer_ipv4_header = true,
-              .outer_udp = true,
-              .ip_tunnel = true,
-              .udp_tunnel = true,
-              .multi_segment_tx = true};
+      return {
+          .checksums = {.ipv4_header = true,
+                        .udp = true,
+                        .tcp = true,
+                        .outer_ipv4_header = true,
+                        .outer_udp = true},
+          .tunnel_encodings = {.generic_udp = true},
+          .multi_segment_tx = true,
+      };
     case Variant::kMixedSoftwareHardware:
-      return {.udp = true,
-              .tcp = true,
-              .udp_tunnel = true,
-              .multi_segment_tx = true};
+      return {
+          .checksums = {.udp = true, .tcp = true},
+          .tunnel_encodings = {.generic_udp = true},
+          .multi_segment_tx = true,
+      };
     default:
       return {};
   }
@@ -314,16 +325,18 @@ void BenchmarkTxFinalization(benchmark::State &state) {
 
   TxFinalizationProfile requested_profile;
   BoundTxFinalizationProfile bound_profile;
-  if (variant != Variant::kNoProfilePath &&
-      variant != Variant::kEmptyProfileHelper &&
-      variant != Variant::kSoftwarePrimitive) {
+  if (variant == Variant::kSoftwarePrimitive ||
+      variant == Variant::kValidationOnly ||
+      variant == Variant::kPseudoHeaderSeedOnly) {
+    requested_profile = MakeProfile(Variant::kSoftwareProfile, protocol);
+  } else if (variant != Variant::kNoProfilePath &&
+             variant != Variant::kEmptyProfileHelper &&
+             variant != Variant::kCloneBaseline) {
     requested_profile = MakeProfile(variant, protocol);
     const auto bound =
         BindTxFinalizationProfile(requested_profile, CapabilitiesFor(variant));
     CHECK(bound.has_value());
     bound_profile = *bound;
-  } else if (variant == Variant::kSoftwarePrimitive) {
-    requested_profile = MakeProfile(Variant::kSoftwareProfile, protocol);
   }
 
   PacketBatch batch;
@@ -350,7 +363,7 @@ void BenchmarkTxFinalization(benchmark::State &state) {
     case Variant::kEmptyProfileHelper:
       for (auto _ : state) {
         const auto result = FinalizeTxPacketBatch(batch, {});
-        benchmark::DoNotOptimize(result.rejected);
+        benchmark::DoNotOptimize(&result.rejected);
         benchmark::ClobberMemory();
       }
       break;
@@ -365,6 +378,38 @@ void BenchmarkTxFinalization(benchmark::State &state) {
       }
       break;
     }
+    case Variant::kValidationOnly: {
+      const auto plan = *requested_profile.outer;
+      for (auto _ : state) {
+        for (int i = 0; i < batch_size; i++) {
+          const auto layout = InspectChecksumPlan(PacketRef(packets[i]), plan);
+          CHECK(layout.has_value()) << "checksum validation failed";
+          benchmark::DoNotOptimize(&*layout);
+        }
+        benchmark::ClobberMemory();
+      }
+      break;
+    }
+    case Variant::kPseudoHeaderSeedOnly:
+      for (auto _ : state) {
+        for (int i = 0; i < batch_size; i++) {
+          const auto *ip = PacketRef(packets[i])
+                               .head_data<const rte_ipv4_hdr *>();
+          benchmark::DoNotOptimize(rte_ipv4_phdr_cksum(ip, 0));
+        }
+        benchmark::ClobberMemory();
+      }
+      break;
+    case Variant::kCloneBaseline:
+      for (auto _ : state) {
+        for (int i = 0; i < batch_size; i++) {
+          PacketHandle clone = PacketClone(packets[i]);
+          CHECK(clone != nullptr);
+          PacketFree(clone);
+        }
+        benchmark::ClobberMemory();
+      }
+      break;
     case Variant::kSoftwareProfile:
     case Variant::kOneDomainHardware:
     case Variant::kTwoDomainHardware:
@@ -373,7 +418,19 @@ void BenchmarkTxFinalization(benchmark::State &state) {
         const auto result = FinalizeTxPacketBatch(batch, bound_profile);
         CHECK_EQ(result.rejected, 0U)
             << "finalizer rejected a benchmark packet";
-        benchmark::DoNotOptimize(result.rejected);
+        benchmark::DoNotOptimize(&result.rejected);
+        benchmark::ClobberMemory();
+      }
+      break;
+    case Variant::kOneDomainHardwareCow:
+      for (auto _ : state) {
+        for (int i = 0; i < batch_size; i++) {
+          PacketHandle clone = PacketClone(packets[i]);
+          CHECK(clone != nullptr);
+          const auto result = FinalizeTxPacket(clone, bound_profile);
+          CHECK(result.has_value()) << "COW finalizer failed";
+          PacketFree(clone);
+        }
         benchmark::ClobberMemory();
       }
       break;
@@ -439,7 +496,7 @@ BENCHMARK(BenchmarkQueueOutEgress)
     ->ArgNames({"packet_bytes", "protocol", "batch", "profile"});
 
 BENCHMARK(BenchmarkTxFinalization)->Apply([](benchmark::Benchmark *benchmark) {
-  constexpr int64_t kVariants[] = {0, 1, 2, 3, 4, 5, 6};
+  constexpr int64_t kVariants[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
   constexpr int64_t kProtocols[] = {0, 1};
   constexpr int64_t kSizes[] = {64, 1500, 4096};
   constexpr int64_t kBatchSizes[] = {1, 8, 32};
@@ -469,6 +526,6 @@ BENCHMARK(BenchmarkTxFinalization)->Apply([](benchmark::Benchmark *benchmark) {
       }
     }
   }
-});
+})->ArgNames({"variant", "protocol", "packet_bytes", "batch", "shape"});
 
 }  // namespace

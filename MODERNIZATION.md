@@ -13,9 +13,13 @@ propose it unprompted.
 
 ## Before you touch anything: sandbox constraints
 
-- **Cap build parallelism at `-j4`.** A `-j20` build previously exhausted
-  memory and crashed the whole WSL VM (~7.6GB RAM total). This is a hard
-  constraint from the user, not a suggestion.
+- **Cap every build tool and nested build subprocess at four jobs.** Use
+  `meson compile -C <build-dir> -j4`, then
+  `meson test -C <build-dir> --no-rebuild --print-errorlogs -j4`. The test
+  runner's `-j4` is not a substitute for an explicit build-tool job limit.
+  Pass `-j4` directly to Ninja or any other child build tool. This is a hard
+  user constraint: a prior `-j20` build exhausted memory and crashed the WSL
+  VM (~7.6GB RAM).
 - **No real hugepages or NIC in this sandbox.** `/proc/meminfo` shows only
   ~256MB of hugepage capacity, often already exhausted. Run `bessd` with
   `-m 0` (no-hugepage mode — already a supported fallback path in
@@ -77,10 +81,10 @@ tools/bootstrap_dpdk.py --af-xdp auto
 export PKG_CONFIG_PATH="$(tools/bootstrap_dpdk.py --print-pkg-config-path):${PKG_CONFIG_PATH}"
 meson setup build-meson -Dcpu=corei7 -Daf_xdp=auto
 meson compile -C build-meson -j4
-meson test -C build-meson --print-errorlogs
-meson test -C build-meson --suite python --print-errorlogs
-meson test -C build-meson --suite integration --print-errorlogs
-meson test -C build-meson --suite benchmarks --print-errorlogs
+meson test -C build-meson --no-rebuild --print-errorlogs -j4
+meson test -C build-meson --no-rebuild --suite python --print-errorlogs -j4
+meson test -C build-meson --no-rebuild --suite integration --print-errorlogs -j4
+meson test -C build-meson --no-rebuild --suite benchmarks --print-errorlogs -j4
 ```
 
 CI configures `-Daf_xdp=required` and runs the same Meson graph with both GCC
@@ -198,20 +202,18 @@ benchmark attribution; K4.2/K4.2.1 now add checked in-place mutation,
 payload-ownership, and descriptor-ownership primitives. K4.3a, K4.3a.1,
 K4.3b, and K4.3b.1 are CLOSED; K4.3c adds allocation-free cross-segment
 prefix/suffix removal and completes K4 packet topology/ownership mechanics.
-Next: K4.4a packet-aware software checksum semantics, then K4.4b semantic
-TX-offload planning; performance-gated K4.5 follows both.
-The active build K1-K3 are closed. The build graph is Meson/Ninja only. GCC and
-Clang full Meson compiles succeed with pinned DPDK 25.11.3. The registered
-suite has 75 tests: 55 native C++ binaries, benchmark smoke tests (including
-the PMD null/ring smoke), the sample-plugin registry load, the Python target,
-and the module integration run.
-Previous full GCC and Clang Meson runs passed all 75 targets. The ordinary
-K4.3c Meson invocations attempted daemon startup through the root-dependent
-launcher; 73/75 targets ran successfully in this unprivileged session.
-`python_unittest_discover` and `module_integration` failed during launcher
-startup. Module integration can separately be exercised against a foreground
-`bessd -skip_root_check -m 0` using the normal gRPC reset/run path documented
-above.
+K4.4a/b software checksum semantics and TX finalization are complete. K4.5
+records a benchmark-only comparison of runtime-generic and compile-time-
+specialized batch bodies; no production executor, loop migration, or prefetch
+policy is adopted. The separate real-PMD/NIC interoperability matrix remains
+pending because no suitable device is available; it does not block K4 software
+closure.
+The active software scope K1-K4 is closed. Meson/Ninja remains the build graph,
+with pinned DPDK 25.11.3. The registered Meson suite has 80 targets. The
+current bounded GCC and Clang runs compiled with `meson compile -j4`, then ran
+`meson test --no-rebuild --print-errorlogs -j4`; both passed all 80 targets,
+including native tests, Python tests, module integration, benchmark smoke
+tests, and the sample-plugin load.
 K3.4-K3.7's own targets (the typed-, masked-backend, extract-plan, and
 migration unit binaries, the WildcardMatch module test, `classifier_typed_bench`,
 `classifier_masked_bench`, and `modules_wildcard_match_bench`) pass under GCC
@@ -5695,9 +5697,10 @@ diagnostics. All paths reported zero allocations and zero copied bytes:
 CPU2 diagnostics observed IRQ and softirq activity, so timing is smoke data
 only and not a performance verdict. K4 topology/ownership mechanics are
 complete. K4.4 is split below into software checksum semantics (K4.4a) and
-semantic TX-offload planning (K4.4b). K4.5 follows both and remains
-performance-gated; no backend winner, loop migration, or prefetch policy is
-adopted without measured benefit.
+semantic TX-offload planning (K4.4b). K4.5 measures runtime-generic and
+compile-time-specialized packet-batch bodies; it remains performance-gated.
+No production loop migration or prefetch policy is adopted without measured
+benefit.
 
 #### K4.4a — packet-aware software checksum semantics (implemented)
 
@@ -5805,83 +5808,338 @@ references. See [DPDK 25.11.3
 `packet_checksum_test` and `packet_reshape_test` pass in both GCC (`build-meson`)
 and Clang (`build-meson-clang`) builds.
 
-#### K4.4b — semantic TX checksum finalization (implemented)
+#### K4.4b — semantic TX checksum finalization (software implementation complete; NIC gate pending)
 
-`Port::GetTxChecksumCapabilities()` exposes backend-neutral checksum support.
-`PmdCapabilities` maps DPDK TX capability bits and `default_eth_conf` enables the
-supported checksum, generic tunnel, and multi-segment TX offloads. Non-PMD
-ports report no hardware capabilities and use software finalization.
+The TX profile is semantic and fixed at output-module initialization. It has
+up to two checksum domains (`outer` and `inner`) plus an explicit tunnel
+encoding. `TxChecksumCapabilities` describes ordinary and outer checksum
+operations; `TxTunnelEncodingCapabilities` independently describes generic IP,
+generic UDP, and GTP encodings. Per-domain IPv4-header, UDP, and TCP operations
+bind independently to software or hardware. Tunnel TSO is never treated as a
+checksum capability.
 
-`PortOutArg` and `QueueOutArg` accept an optional `TxChecksumProfile`. Each
-output-module instance stores and binds its own profile during `Init`. A profile
-has at most two checksum domains: `outer` (the ordinary packet's IP domain, or
-the encapsulating IP domain) and `inner` (one encapsulated IP domain). Each
-domain fixes its IP version, network and transport offsets, and requested IPv4
-header / UDP / TCP checksums. The network and transport components bind to
-software or hardware independently. The optional generic `IP` or `UDP`
-encapsulation description exists only for tunneled inner offload metadata; it
-does not select checksum intent or a tunnel protocol.
+`PortOutArg` and `QueueOutArg` accept an optional `TxChecksumProfile`. The
+protobuf fields and existing enum values are unchanged; `GTP` is appended as
+encoding value `3`. `Port` exposes `GetTxOffloadCapabilities()`. `PortOut`
+binds against capabilities common to all TX queues; `QueueOut` binds against
+its exact `qid`. The finalizer does not infer offsets, protocol intent, or
+GTP-U structure from packet bytes. Callers supply explicit offsets, including
+when GTP extension headers precede the inner packet. There is no sidecar,
+graph-wide checksum plan, protocol-specific PFCP/UPF state, or nesting beyond
+two domains. `L4Checksum` remains the explicit compute/verify module.
 
-The protobuf profile contains no PMD flags, mbuf `ol_flags`, or DPDK header
-length fields. `Port` remains policy-free, and the output path never infers
-intent or offsets from packet bytes. A fixed profile must match each packet;
-different layouts use separate output instances. There is no packet sidecar,
-graph-wide plan, protocol-specific PFCP/UPF behavior, or nesting beyond two
-checksum domains. `L4Checksum` remains an explicit compute/verify module; TX
-finalization is a distinct last egress step.
+##### Capability states and DPDK configuration
+
+`PmdCapabilities` retains device-advertised `tx_offload_capa` and
+`tx_queue_offload_capa`. Effective support is the intersection of advertised
+bits with the bits actually configured at device or queue scope. BESS sets
+`txmode.offloads` only for advertised device-scope checksum, multi-segment,
+and generic-tunnel prerequisites. `rte_eth_tx_queue_setup(..., NULL)` uses
+`dev_info.default_txconf`; after setup, BESS reads `rte_eth_tx_queue_info_get`
+and uses `qinfo.conf.offloads`, falling back to the advertised queue-scoped
+bits from `default_txconf` only if the query fails. Device flags are removed
+from the queue mask before calculating effective queue support.
+
+DPDK 25.11.3 requires `RTE_ETH_TX_OFFLOAD_IP_TNL_TSO` when an application sets
+`RTE_MBUF_F_TX_TUNNEL_IP`, and `RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO` for
+`RTE_MBUF_F_TX_TUNNEL_UDP`, including checksum-only inner requests. Those
+configuration bits are segmentation features, not evidence that IPv4, UDP,
+or TCP checksum hardware exists. BESS enables each generic prerequisite only
+when that exact flag is advertised, does not enable unrelated tunnel-specific
+TSO bits, and binds the checksum operation only when its independent checksum
+capability is also effective. Specific tunnel TSO support does not imply
+generic tunnel support.
+
+The relevant pinned DPDK contracts are in
+[`rte_mbuf_core.h`](deps/dpdk-25.11.3/lib/mbuf/rte_mbuf_core.h#L198-L274),
+[`rte_ethdev.c`](deps/dpdk-25.11.3/lib/ethdev/rte_ethdev.c#L2680-L2716), and
+[`rte_ethdev.h`](deps/dpdk-25.11.3/lib/ethdev/rte_ethdev.h#L6751-L6777).
+
+##### Mbuf flags and header-length mapping
+
+DPDK's `RTE_MBUF_F_TX_IPV4`/`TX_IPV6`, `TX_IP_CKSUM`, and `TX_L4_MASK`
+describe the main (inner, when tunneled) network and transport headers.
+`TX_IPV4`/`TX_IPV6` identifies that IP header; `TX_IP_CKSUM` requests its
+IPv4-header checksum; `TX_L4_MASK` selects TCP or UDP checksum work. BESS sets
+the selected transport flag only for a hardware-bound transport component. An
+unencapsulated hardware request also carries the main IP version flag. For
+tunnels, main flags describe the inner domain only; outer requests use the
+outer-prefixed flags.
+
+`TX_OUTER_IPV4`/`TX_OUTER_IPV6`, `TX_OUTER_IP_CKSUM`, and
+`TX_OUTER_UDP_CKSUM` apply only to the encapsulating headers. Outer IP checksum
+offload is IPv4-only; outer transport offload is UDP-only. The outer UDP flag
+requires an explicit outer-IP version flag and both outer lengths. Its checksum
+capability is independent of inner TCP/UDP support.
+
+For an unencapsulated packet, `l2_len` is the network-header offset, `l3_len`
+is the IP-header length, and `l4_len` is the transport-header length only when
+transport checksum work is hardware-bound (otherwise zero). For a tunnel,
+`outer_l2_len` is the outer network-header offset and `outer_l3_len` is the
+outer IP-header length; the main `l2_len` spans from the end of that outer IP
+header through the tunnel/inner link header to the inner IP header, `l3_len`
+is the inner IP-header length, and `l4_len` follows the same hardware-only
+rule. DPDK has no separate outer L4-length field. The actual
+`RTE_MBUF_F_TX_TUNNEL_*` encoding is set when inner checksum offload or outer
+UDP checksum offload needs it; outer IPv4-header checksum alone does not imply
+an inner/tunnel request. BESS derives these fields from caller-supplied offsets,
+not packet parsing. See pinned [`rte_mbuf_core.h`](deps/dpdk-25.11.3/lib/mbuf/rte_mbuf_core.h#L297-L373)
+and [`BuildMetadata`](core/packet_tx_checksum.cc#L388-L528).
+
+##### Source-verified PMD boundaries
+
+Ordinary and outer checksum semantics are mapped from effective DPDK flags.
+Tunnel encodings are more conservative:
+
+| DPDK 25.11.3 source evidence | BESS binding consequence |
+| --- | --- |
+| `drivers/net/intel/i40e/i40e_rxtx.c:275-312` maps GTP/VXLAN/Geneve tunnel descriptors; `i40e_ethdev.c:3870-3888` advertises ordinary checksums and specific TSO flags, and adds outer UDP checksum only for `I40E_MAC_X722`. | `net_i40e` is eligible for GTP encoding. Outer UDP hardware still requires the advertised/configured bit; it is not inferred for non-X722 hardware. i40e does not advertise the generic IP/UDP TSO prerequisites. |
+| `drivers/net/intel/ice/ice_rxtx.c:2914-2953` maps GTP/VXLAN-GPE/Geneve; `ice_ethdev.c:4579-4598` advertises ordinary and outer checksums plus specific, not generic, tunnel TSO bits. | `net_ice` is eligible for GTP encoding. Generic IP/UDP inner hardware remains unavailable unless the corresponding generic capability is separately advertised and configured. |
+| `drivers/net/intel/iavf/iavf_rxtx.c:2452-2467` maps GTP/VXLAN-GPE/Geneve; `iavf_ethdev.c:1179-1196` conditionally advertises outer UDP checksum for supported MAC types. | `net_iavf` is eligible for GTP encoding. The driver-advertised capability remains the gate for outer UDP; the X710/XL710 family exclusion is preserved. |
+| `drivers/net/mlx5/mlx5_txq.c:103-140` advertises generic IP/UDP TSO prerequisites only with the software-parser TSO capability; `mlx5_tx.h:450-484` handles the generic IP and UDP tunnel types. | Generic encoding is allowed only when its effective generic prerequisite exists. GTP is not inferred from other specific tunnel support and is not in BESS's GTP driver allowlist. |
+| `drivers/net/cnxk/cnxk_ethdev.h:64-72` lists checksum and specific tunnel TSO flags; `cnxk_ethdev_ops.c:26-30` reports zero queue-scoped offloads; `cn10k_tx.h:1046-1080` consumes outer and inner lengths. | Standard/outer checksum support follows the effective advertised flags. Specific tunnel flags do not create generic IP/UDP or GTP capability. |
+| `drivers/net/hns3/hns3_rxtx.c:3999-4018` adds `outer_l2_len + outer_l3_len` to the inner L4 start for tunneled packets. | Header offsets are supplied explicitly; unsupported encoding/checksum combinations use software rather than inferred tunnel parsing. |
+| `drivers/net/sfc/sfc_ef100_tx.c:204-205` invokes `rte_net_intel_cksum_flags_prepare()` during its prepare path; the device/queue capability reporting is queue-scoped. | The BESS finalizer does not invoke that helper blindly. Its mutations are accounted for below; advertised queue capabilities remain subject to the exact queue configuration. |
+
+The GTP encoding allowlist is the source-verified `net_ice`, `net_i40e`, and
+`net_iavf` mapping. It does not grant checksum capability: the requested inner
+or outer operation must independently bind from effective checksum flags.
+Unknown tunnel driver names and unsupported requested components bind to
+software; standard checksum operations still follow their effective advertised
+bits. In particular, outer-only UDP hardware still needs the correct tunnel-type
+flag (GTP for a GTP profile); when that encoding is unavailable, outer UDP is
+computed in software.
+
+`TxTunnelEncoding::kGtp` maps to DPDK's specific
+`RTE_MBUF_F_TX_TUNNEL_GTP` flag; it is not encoded as generic
+`RTE_MBUF_F_TX_TUNNEL_UDP` or `RTE_MBUF_F_TX_TUNNEL_IP`. The latter two map
+only to their matching generic BESS encodings and have separate ethdev
+configuration prerequisites described above. DPDK's specific GTP flag does not
+grant checksum capability or imply that the PMD updates GTP-specific payload
+fields. The protobuf value `3` is appended without changing existing enum
+numbers. See [`rte_mbuf_core.h`](deps/dpdk-25.11.3/lib/mbuf/rte_mbuf_core.h#L230-L272).
+
+##### Finalization, ordering, and ownership
 
 Immediately before `SendPackets`, the finalizer validates the configured
-layout, applies software-bound components through K4.4a, writes DPDK checksum
-seeds or zero fields, and installs the required flags and header lengths for
-hardware-bound components. Hardware offload requires contiguous header fields;
-chained payloads are accepted only when the PMD advertises multi-segment TX.
-When an outer UDP checksum is software-computed but an inner checksum is
-hardware-bound, the inner checksum is temporarily computed in software before
-the outer checksum, then replaced with its DPDK seed. This preserves the final
-wire checksum dependency. Invalid layouts and preparation failures are freed
-before send and counted separately as `tx_prepare_errors`; driver drops remain
-in the existing drop counter. The no-profile path leaves packet bytes and
-metadata unchanged.
+layout, computes software-bound components, writes DPDK pseudoheader seeds or
+zero fields for hardware-bound components, then commits mbuf flags and header
+lengths. Hardware layouts require checksum fields and headers to fit the head
+segment; chained payload is supported only when multi-segment TX is effective.
+A valid layout that the selected hardware cannot represent falls back to
+software. Invalid checksum semantics, protocol mismatches, truncation, and
+malformed chains fail closed.
 
-The implementation follows the pinned DPDK 25.11.3 checksum-seed and generic
-tunnel-metadata contract. K4.5 generalized execution machinery remains
-deferred.
+For a software outer UDP checksum plus hardware inner checksum, BESS first
+completes the inner checksum in software, computes outer UDP over those final
+inner bytes, then replaces the inner field with its hardware pseudoheader
+seed. Hardware outer UDP is explicitly seeded using the outer IP
+pseudoheader. No `rte_eth_tx_prepare()` call is added: BESS's PMD send path
+calls `rte_eth_tx_burst()` directly. DPDK's
+`rte_net_intel_cksum_flags_prepare()` seeds outer UDP only when
+`RTE_MBUF_F_TX_OUTER_UDP_CKSUM` is set; if an inner checksum is requested
+without that outer flag, it zeros an outer UDP field. The helper also prepares
+inner checksum fields. The finalizer owns these writes and avoids that
+software-outer-checksum hazard.
 
-##### Benchmark evidence
+Single-packet finalization errors leave packet ownership with the caller; the
+packet may already contain software checksum writes, so callers must discard
+it rather than assume transactionality. Batch finalization frees rejected
+packets and compacts successes; an error can follow partial software writes
+before that free. Output modules count preparation failures separately as
+`tx_prepare_errors`; driver send drops remain in the existing drop counter.
+The no-profile path does not call capability binding or checksum finalization,
+and leaves packet bytes and metadata unchanged. No live PMD reconfiguration
+path was introduced.
 
-`packet_tx_checksum_bench` was run with
-`--benchmark_min_time=0.005s --benchmark_repetitions=3
---benchmark_report_aggregates_only=true --benchmark_format=json`. All 276
-aggregate means completed without errors: 240 finalizer-preparation cases and
-36 fixed-queue `QueueOut` cases. The latter calls `QueueOut::ProcessBatch`
-against an in-process port whose `SendPackets` accepts the full batch; it
-measures the module, stats, and finalization path, not NIC throughput or
-`PortOut` worker-to-queue mapping.
+##### Regression and benchmark evidence
 
-| Fixed-queue output case | No profile (ns/batch) | Software profile (ns/batch) | Added (ns/packet) |
-| --- | ---: | ---: | ---: |
-| 64B UDP, batch 1 | 3.6 | 114.1 | 110.5 |
-| 1500B TCP, batch 32 | 11.2 | 4286.3 | 133.6 |
-| 4096B UDP, batch 32 | 12.0 | 6560.3 | 204.6 |
+The focused current-source Meson targets pass 4/4 under GCC (`build-meson`)
+and 4/4 under Clang (`build-meson-clang`): `packet_tx_checksum_test`,
+`modules_queue_out_test`, `drivers_pmd_test`, and `port_test`. Coverage includes
+IPv4/IPv6 UDP/TCP, independent checksum backends, outer-only UDP, GTP's
+distinct tunnel type and explicit extension offsets, mixed software/hardware
+ordering, hns3-style offsets, the Intel helper mutation hazard, malformed and
+unsupported layouts, shared-payload COW, and no-profile output.
 
-The direct preparation matrix isolates checksum preparation from output
-dispatch. Representative CPU time per packet:
+The expanded `packet_tx_checksum_bench` matrix used 11 direct-finalizer
+variants over UDP/TCP, 64/1500/4096-byte packets, batch sizes 1/8/32, and
+contiguous/chained shapes where headers fit (384 direct cases), plus 36
+fixed-queue `QueueOut` cases. All 420 cases produced three repetitions. The
+direct variants are: no-op baseline, empty-profile helper, K4.4a software
+primitive, software-bound finalizer, one-domain hardware, two-domain
+tunnel-hardware, mixed software/hardware tunnel, plan validation, IPv4
+pseudoheader seed, clone-only COW control, and one-domain hardware finalization
+on a shared clone. The `QueueOut` case calls `QueueOut::ProcessBatch` against
+an in-process port that accepts the full batch; it measures BESS egress
+dispatch/finalization, not NIC throughput or `PortOut` worker mapping.
 
-| Packet case | K4.4a software | Software profile | One-domain hardware | Two-domain hardware | Mixed SW/HW |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 64B UDP, batch 1, contiguous | 75.6 ns | 119.5 ns | 71.6 ns | 97.5 ns | 217.3 ns |
-| 1500B TCP, batch 32, contiguous | 90.3 ns | 157.5 ns | 80.8 ns | 134.8 ns | 235.2 ns |
-| 4096B UDP, batch 32, chained | 172.3 ns | 227.0 ns | 62.9 ns | 140.1 ns | 401.7 ns |
+Run command:
 
-Measurements are host-specific and comparative. This host has no DPDK Ethernet
-device; on-wire byte-equivalence testing was unavailable.
+```text
+omarchy-benchmark --isolate --cpu 0 --diagnose -- \
+  env LD_LIBRARY_PATH=deps/dpdk-25.11.3/install/lib \
+  build-meson/core/packet_tx_checksum_bench \
+  --benchmark_min_time=0.02s --benchmark_repetitions=3 \
+  --benchmark_format=json \
+  --benchmark_out=build-meson/tx-checksum-matrix-isolated.json
+```
 
-##### Full-suite verification
+The Omarchy wrapper isolated CPU 0 in a cgroup v2 partition and temporarily
+offlined its SMT sibling CPU 1; CPUs 2-19 were housekeeping CPUs. It selected
+the performance governor, preserved turbo, and temporarily lowered
+`kernel.perf_event_paranoid` from 2 to 0 for diagnostics. The wrapper exited
+successfully and restored the online CPU set to `0-19`; the cgroup isolated
+CPU set is empty after the run. Google Benchmark reported 19 online CPUs
+during measurement and frequency scaling disabled. The run began at
+`2026-09-24T12:36:33+05:30` with host load average `39.40/30.13/16.25`.
+Diagnostics observed no IRQ or softirq deltas on CPU 0, 929 context switches,
+and one CPU migration. Treat these as CPU-isolated measurements with a loaded
+host, not as a claim that every source of system noise was absent. The
+no-profile `QueueOut` measurement does not bind a profile: binding happens
+only at module initialization when a profile is present, outside the timed
+`ProcessBatch` loop.
 
-After the final source changes, the full Meson suite passed 80/80 tests with
-Clang in `build-meson-clang` (469.72 s) and GCC in `build-meson`
-(362.98 s).
+Fixed-queue `QueueOut` CPU medians (ns per batch):
 
+| Packet case | Prior K4.4b no-profile baseline | Current no profile | Software profile | Added profile cost (ns/packet) |
+| --- | ---: | ---: | ---: | ---: |
+| 64B UDP, batch 1 | 3.6 | 3.79 | 121.19 | 117.40 |
+| 1500B TCP, batch 32 | 11.2 | 11.69 | 4689.14 | 146.17 |
+| 4096B UDP, batch 32 | 12.0 | 11.50 | 7258.70 | 226.48 |
+
+The prior no-profile figures and current Omarchy-isolated run are regression
+references, not a controlled A/B on identical isolation. The direct finalizer
+medians below are CPU ns/packet for 64B UDP, batch 1, contiguous; the two
+tunnel rows use an outer UDP envelope:
+
+| Direct operation | CPU ns/packet |
+| --- | ---: |
+| Empty-profile helper | 8.39 |
+| K4.4a software primitive | 73.83 |
+| Software-bound finalizer | 114.58 |
+| One-domain hardware metadata | 53.75 |
+| Two-domain tunnel hardware | 102.96 |
+| Mixed software-outer/hardware-inner tunnel | 187.41 |
+| Plan validation only | 14.71 |
+| IPv4 pseudoheader seed only | 5.50 |
+| Clone-only COW control | 19.36 |
+| One-domain hardware finalizer on shared clone | 82.93 |
+
+The one-domain hardware variant measured 53.75/52.73/53.20 ns per packet for
+64/1500/4096-byte contiguous UDP packets at batch 1. For 1500B UDP at batch 8,
+contiguous/chained-payload medians were 51.73/54.17 ns per packet. These
+measurements isolate CPU preparation and are not wire-rate claims.
+
+The complete isolated JSON output is retained locally at
+`build-meson/tx-checksum-matrix-isolated.json`. The odd-boundary checksum
+discrepancy with DPDK's chained-buffer helper remains separately documented
+under K4.4a; those mismatching rows are diagnostic only.
+
+The final GCC and Clang builds used `meson compile -j4`; each full suite passed
+80/80 using `meson test --no-rebuild --print-errorlogs -j4`. The focused
+`packet_tx_checksum_test`, `modules_queue_out_test`, `drivers_pmd_test`, and
+`port_test` targets passed under both compilers as part of those runs.
+
+##### Separate real-NIC interoperability gate (pending)
+
+No suitable DPDK Ethernet device is available in this environment. This is an
+independent hardware gate, not a blocker for K4 software closure or K4.5. When
+hardware is available, run ordinary IPv4/IPv6 UDP/TCP with software,
+advertised hardware, and mixed network/transport backends; tunneled
+outer-IPv4/UDP and outer-IPv6/UDP with inner IPv4/IPv6 UDP/TCP; outer-only,
+inner-only, combined, and mixed software/hardware domains; and chained TX only
+when the PMD advertises multi-segment support. Include GTP-U-shaped packets
+with explicit offsets and extension headers; do not infer parsing behavior.
+
+Compare captured bytes with the K4.4a oracle. Record device, PMD, firmware,
+DPDK version, advertised/configured/effective offload bits, selected backend
+per domain, and pass/fail/unsupported combinations. Never infer inner checksum
+support from a tunnel-TSO bit.
+
+#### K4.5 — generic batch execution and ILP experiment (benchmark-only)
+
+`Module::ProcessBatch` remains the virtual module entry point;
+`PacketBatch` remains a fixed 32-handle container with `packet(i)` views. The
+experiment adds no production executor or module API. `core/packet_bench.cc`
+compares four module-like batch bodies: runtime-generic scalar,
+runtime-generic ILP4, compile-time-specialized scalar, and
+compile-time-specialized ILP4. Each reads two 32-bit fields and emits the same
+64-bit result. Runtime plans use offsets `(14, 62)` or `(30, 94)`; specialized
+authors bake those offsets into templates. The specialized path reads directly
+when each field is wholly in the head segment and falls back to `PacketCursor`
+when a field crosses a segment.
+
+The matrix covers batch sizes `1/8/32`, contiguous packets, two-segment packets
+with a field split at byte 64, and four-segment packets. A pre-timing check
+compares every variant with the runtime-generic scalar result. ILP4 interleaves
+independent field reads from four packets. The experiment uses arbitrary byte
+offsets and no Ethernet, IP, GTP-U, PFCP, or UPF semantics.
+
+Run the GCC and Clang matrices serially with the Omarchy isolated benchmark
+CPU:
+
+```text
+omarchy-benchmark --isolate --cpu 0 --diagnose -- \
+  env LD_LIBRARY_PATH=deps/dpdk-25.11.3/install/lib \
+  build-meson/core/packet_bench --benchmark_filter=BM_PacketBatch \
+  --benchmark_min_time=0.02s --benchmark_repetitions=5 \
+  --benchmark_format=json \
+  --benchmark_out=build-meson/packet-batch-k45-gcc-isolated.json
+
+omarchy-benchmark --isolate --cpu 0 --diagnose -- \
+  env LD_LIBRARY_PATH=deps/dpdk-25.11.3/install/lib \
+  build-meson-clang/core/packet_bench --benchmark_filter=BM_PacketBatch \
+  --benchmark_min_time=0.02s --benchmark_repetitions=5 \
+  --benchmark_format=json \
+  --benchmark_out=build-meson-clang/packet-batch-k45-clang-isolated.json
+```
+
+Each compiler produced 72 median cases (four bodies, three batch sizes, three
+packet shapes, and two field plans), each with five repetitions. The tables
+use batch 32 and plan `(14, 62)`, normalized from CPU nanoseconds per batch to
+nanoseconds per packet:
+
+GCC:
+
+| Packet shape | Runtime scalar | Runtime ILP4 | Specialized scalar | Specialized ILP4 |
+| --- | ---: | ---: | ---: | ---: |
+| Contiguous | 5.069 | 6.326 | 0.831 | 1.877 |
+| Two segments, field crosses byte 64 | 11.313 | 12.588 | 8.474 | 10.674 |
+| Four segments | 15.281 | 16.846 | 15.150 | 16.889 |
+
+Clang:
+
+| Packet shape | Runtime scalar | Runtime ILP4 | Specialized scalar | Specialized ILP4 |
+| --- | ---: | ---: | ---: | ---: |
+| Contiguous | 8.540 | 8.975 | 1.017 | 1.036 |
+| Two segments, field crosses byte 64 | 15.210 | 15.114 | 10.085 | 10.528 |
+| Four segments | 17.447 | 18.042 | 17.326 | 18.331 |
+
+Both five-repetition runs used `omarchy-benchmark --isolate --cpu 0
+--diagnose` on the i9-13900H. The wrapper created a cgroup v2 isolated
+partition for P-core 0, offlined SMT sibling 1, and left CPUs 2-19 as
+housekeeping; it selected the performance governor and preserved enabled
+turbo. Google Benchmark reported frequency scaling disabled. GCC ran at
+`2026-09-24T12:56:33+05:30` with load average `1.28/2.19/5.66`; Clang ran at
+`2026-09-24T12:57:37+05:30` with load average `0.89/1.88/5.31`. Diagnostics
+observed no IRQ or softirq deltas on CPU 0. Perf counters recorded 272 context
+switches and one CPU migration for GCC, and 180 context switches and one
+migration for Clang. After both successful wrapper exits, CPUs `0-19` were
+online, the cgroup isolated CPU set was empty, and
+`kernel.perf_event_paranoid` was restored to `2`.
+
+Compile-time direct access helped contiguous packets (6.1x GCC, 8.4x Clang)
+and split-field two-segment packets (1.3x GCC, 1.5x Clang), but showed no
+meaningful four-segment benefit (about 1.01x under either compiler). ILP4 was
+slower than scalar in every GCC shape and every specialized Clang shape.
+Clang generic ILP4 was slower for contiguous and four-segment packets and
+about 0.6% lower for only the split-field case; that isolated difference is
+not evidence of a consistent ILP win. The measured body excludes scheduler
+and virtual dispatch, a live module graph, and NIC traffic. No production API,
+loop migration, or ILP policy is adopted. JSON outputs are retained locally
+at `build-meson/packet-batch-k45-gcc-isolated.json` and
+`build-meson-clang/packet-batch-k45-clang-isolated.json`.
 
 ---
 

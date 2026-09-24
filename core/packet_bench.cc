@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <optional>
 #include <span>
@@ -1179,6 +1180,243 @@ BENCHMARK(BM_PacketDirectRead)
 BENCHMARK(BM_PacketCursorRead)
     ->ArgsProduct({{1, 2, 4, 8, 16, 32}, {0, 14, 34, 64}, {1, 8, 32}})
     ->ArgNames({"width", "offset", "batch"});
+
+// K4.5 compares module-like batch bodies, excluding scheduler/virtual dispatch.
+// Runtime readers consume offsets; specialized readers bake offsets and use a
+// contiguous-head fast path with PacketCursor fallback. ILP4 interleaves reads
+// from four packets.
+struct BatchFieldPlan {
+  size_t first_offset;
+  size_t second_offset;
+};
+
+uint32_t ReadBatchFieldRuntime(bess::PacketRef packet, size_t offset) {
+  bess::packet::PacketCursor cursor{packet};
+  CHECK(cursor.Skip(offset));
+  const auto value = cursor.Read<uint32_t>();
+  CHECK(value.has_value());
+  return *value;
+}
+
+template <size_t Offset>
+uint32_t ReadBatchFieldSpecialized(bess::PacketRef packet) {
+  if (packet.data_len() >= Offset + sizeof(uint32_t)) {
+    uint32_t value;
+    std::memcpy(
+        &value,
+        packet.head_data<const std::byte *>(static_cast<uint16_t>(Offset)),
+        sizeof(value));
+    return value;
+  }
+  return ReadBatchFieldRuntime(packet, Offset);
+}
+
+uint64_t CombineBatchFields(uint32_t first, uint32_t second) {
+  return (static_cast<uint64_t>(first) << 32) | second;
+}
+
+void ProcessRuntimeGenericScalar(
+    const bess::PacketBatch &batch, size_t count, BatchFieldPlan plan,
+    std::array<uint64_t, bess::PacketBatch::kMaxBurst> &results) {
+  for (size_t i = 0; i < count; i++) {
+    const bess::PacketRef packet = batch.packet(i);
+    results[i] =
+        CombineBatchFields(ReadBatchFieldRuntime(packet, plan.first_offset),
+                           ReadBatchFieldRuntime(packet, plan.second_offset));
+  }
+}
+
+void ProcessRuntimeGenericIlp4(
+    const bess::PacketBatch &batch, size_t count, BatchFieldPlan plan,
+    std::array<uint64_t, bess::PacketBatch::kMaxBurst> &results) {
+  size_t i = 0;
+  for (; i + 4 <= count; i += 4) {
+    std::array<uint32_t, 4> first;
+    std::array<uint32_t, 4> second;
+    for (size_t lane = 0; lane < 4; lane++) {
+      first[lane] =
+          ReadBatchFieldRuntime(batch.packet(i + lane), plan.first_offset);
+    }
+    for (size_t lane = 0; lane < 4; lane++) {
+      second[lane] =
+          ReadBatchFieldRuntime(batch.packet(i + lane), plan.second_offset);
+    }
+    for (size_t lane = 0; lane < 4; lane++) {
+      results[i + lane] = CombineBatchFields(first[lane], second[lane]);
+    }
+  }
+  for (; i < count; i++) {
+    const bess::PacketRef packet = batch.packet(i);
+    results[i] =
+        CombineBatchFields(ReadBatchFieldRuntime(packet, plan.first_offset),
+                           ReadBatchFieldRuntime(packet, plan.second_offset));
+  }
+}
+
+template <size_t FirstOffset, size_t SecondOffset>
+void ProcessCompileTimeSpecializedScalar(
+    const bess::PacketBatch &batch, size_t count,
+    std::array<uint64_t, bess::PacketBatch::kMaxBurst> &results) {
+  for (size_t i = 0; i < count; i++) {
+    const bess::PacketRef packet = batch.packet(i);
+    results[i] =
+        CombineBatchFields(ReadBatchFieldSpecialized<FirstOffset>(packet),
+                           ReadBatchFieldSpecialized<SecondOffset>(packet));
+  }
+}
+
+template <size_t FirstOffset, size_t SecondOffset>
+void ProcessCompileTimeSpecializedIlp4(
+    const bess::PacketBatch &batch, size_t count,
+    std::array<uint64_t, bess::PacketBatch::kMaxBurst> &results) {
+  size_t i = 0;
+  for (; i + 4 <= count; i += 4) {
+    std::array<uint32_t, 4> first;
+    std::array<uint32_t, 4> second;
+    for (size_t lane = 0; lane < 4; lane++) {
+      first[lane] =
+          ReadBatchFieldSpecialized<FirstOffset>(batch.packet(i + lane));
+    }
+    for (size_t lane = 0; lane < 4; lane++) {
+      second[lane] =
+          ReadBatchFieldSpecialized<SecondOffset>(batch.packet(i + lane));
+    }
+    for (size_t lane = 0; lane < 4; lane++) {
+      results[i + lane] = CombineBatchFields(first[lane], second[lane]);
+    }
+  }
+  for (; i < count; i++) {
+    const bess::PacketRef packet = batch.packet(i);
+    results[i] =
+        CombineBatchFields(ReadBatchFieldSpecialized<FirstOffset>(packet),
+                           ReadBatchFieldSpecialized<SecondOffset>(packet));
+  }
+}
+
+void FillCursorBenchmarkChain(bess::PacketHandle packet) {
+  size_t packet_offset = 0;
+  for (bess::PacketHandle segment = packet; segment != nullptr;
+       segment = segment->next) {
+    bess::PacketRef segment_ref(segment);
+    auto *data = segment_ref.head_data<std::byte *>();
+    for (size_t i = 0; i < segment_ref.data_len(); i++) {
+      data[i] = static_cast<std::byte>((packet_offset + i) * 37 + 19);
+    }
+    packet_offset += segment_ref.data_len();
+  }
+}
+
+template <typename Process>
+void RunPacketBatchExecutionBenchmark(benchmark::State &state,
+                                      BatchFieldPlan plan, Process process,
+                                      size_t ilp_lanes) {
+  constexpr size_t kMaxBatch = bess::PacketBatch::kMaxBurst;
+  const size_t count = static_cast<size_t>(state.range(0));
+  const size_t shape = static_cast<size_t>(state.range(1));
+  CHECK_LE(count, kMaxBatch);
+
+  bess::PlainPacketPool &pool = GetPool();
+  std::array<bess::PacketHandle, kMaxBatch> packets{};
+  bess::PacketBatch batch;
+  batch.clear();
+  for (size_t i = 0; i < count; i++) {
+    packets[i] = BuildCursorBenchmarkChain(pool, shape);
+    FillCursorBenchmarkChain(packets[i]);
+    batch.add(packets[i]);
+  }
+
+  std::array<uint64_t, kMaxBatch> expected{};
+  std::array<uint64_t, kMaxBatch> results{};
+  ProcessRuntimeGenericScalar(batch, count, plan, expected);
+  process(batch, count, plan, results);
+  CHECK(
+      std::equal(expected.begin(), expected.begin() + count, results.begin()));
+
+  for (auto _ : state) {
+    process(batch, count, plan, results);
+    benchmark::DoNotOptimize(results);
+  }
+  state.SetItemsProcessed(state.iterations() * count);
+  state.counters["fields/packet"] = 2;
+  state.counters["packet_bytes/read"] = 8;
+  state.counters["ilp_lanes"] = static_cast<double>(ilp_lanes);
+  for (size_t i = 0; i < count; i++) {
+    bess::PacketFree(packets[i]);
+  }
+}
+
+template <bool Ilp4>
+void RunRuntimeGenericBatchBenchmark(benchmark::State &state) {
+  constexpr std::array<BatchFieldPlan, 2> kPlans = {BatchFieldPlan{14, 62},
+                                                    BatchFieldPlan{30, 94}};
+  const size_t plan_index = static_cast<size_t>(state.range(2));
+  CHECK_LT(plan_index, kPlans.size());
+  RunPacketBatchExecutionBenchmark(
+      state, kPlans[plan_index],
+      [](const bess::PacketBatch &batch, size_t count, BatchFieldPlan plan,
+         std::array<uint64_t, bess::PacketBatch::kMaxBurst> &results) {
+        if constexpr (Ilp4) {
+          ProcessRuntimeGenericIlp4(batch, count, plan, results);
+        } else {
+          ProcessRuntimeGenericScalar(batch, count, plan, results);
+        }
+      },
+      Ilp4 ? 4 : 1);
+}
+
+template <size_t FirstOffset, size_t SecondOffset, bool Ilp4>
+void RunCompileTimeSpecializedBatchBenchmark(benchmark::State &state) {
+  RunPacketBatchExecutionBenchmark(
+      state, BatchFieldPlan{FirstOffset, SecondOffset},
+      [](const bess::PacketBatch &batch, size_t count, BatchFieldPlan,
+         std::array<uint64_t, bess::PacketBatch::kMaxBurst> &results) {
+        if constexpr (Ilp4) {
+          ProcessCompileTimeSpecializedIlp4<FirstOffset, SecondOffset>(
+              batch, count, results);
+        } else {
+          ProcessCompileTimeSpecializedScalar<FirstOffset, SecondOffset>(
+              batch, count, results);
+        }
+      },
+      Ilp4 ? 4 : 1);
+}
+
+void BM_PacketBatchRuntimeGenericScalar(benchmark::State &state) {
+  RunRuntimeGenericBatchBenchmark<false>(state);
+}
+
+void BM_PacketBatchRuntimeGenericIlp4(benchmark::State &state) {
+  RunRuntimeGenericBatchBenchmark<true>(state);
+}
+
+void BM_PacketBatchCompileTimeSpecializedScalar(benchmark::State &state) {
+  if (state.range(2) == 0) {
+    RunCompileTimeSpecializedBatchBenchmark<14, 62, false>(state);
+  } else {
+    RunCompileTimeSpecializedBatchBenchmark<30, 94, false>(state);
+  }
+}
+
+void BM_PacketBatchCompileTimeSpecializedIlp4(benchmark::State &state) {
+  if (state.range(2) == 0) {
+    RunCompileTimeSpecializedBatchBenchmark<14, 62, true>(state);
+  } else {
+    RunCompileTimeSpecializedBatchBenchmark<30, 94, true>(state);
+  }
+}
+
+BENCHMARK(BM_PacketBatchRuntimeGenericScalar)
+    ->ArgsProduct({{1, 8, 32}, {0, 1, 3}, {0, 1}})
+    ->ArgNames({"batch", "shape", "field_plan"});
+BENCHMARK(BM_PacketBatchRuntimeGenericIlp4)
+    ->ArgsProduct({{1, 8, 32}, {0, 1, 3}, {0, 1}})
+    ->ArgNames({"batch", "shape", "field_plan"});
+BENCHMARK(BM_PacketBatchCompileTimeSpecializedScalar)
+    ->ArgsProduct({{1, 8, 32}, {0, 1, 3}, {0, 1}})
+    ->ArgNames({"batch", "shape", "field_plan"});
+BENCHMARK(BM_PacketBatchCompileTimeSpecializedIlp4)
+    ->ArgsProduct({{1, 8, 32}, {0, 1, 3}, {0, 1}})
+    ->ArgNames({"batch", "shape", "field_plan"});
 
 }  // namespace
 
