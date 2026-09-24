@@ -128,19 +128,22 @@ TEST_F(PortTest, CreatePort) {
   EXPECT_EQ(42, err.error().code());
 }
 
-TEST_F(PortTest, NonPmdPortHasNoTxChecksumCapabilities) {
+TEST_F(PortTest, NonPmdPortHasNoTxOffloadCapabilities) {
   std::unique_ptr<Port> port(dummy_port_builder->CreatePort("port1"));
   ASSERT_NE(nullptr, port.get());
 
-  const auto capabilities = port->GetTxChecksumCapabilities();
-  EXPECT_FALSE(capabilities.ipv4_header);
-  EXPECT_FALSE(capabilities.udp);
-  EXPECT_FALSE(capabilities.tcp);
-  EXPECT_FALSE(capabilities.outer_ipv4_header);
-  EXPECT_FALSE(capabilities.outer_udp);
-  EXPECT_FALSE(capabilities.ip_tunnel);
-  EXPECT_FALSE(capabilities.udp_tunnel);
+  const auto capabilities = port->GetTxOffloadCapabilities();
+  const auto queue_capabilities = port->GetTxOffloadCapabilities(0);
+  EXPECT_FALSE(capabilities.checksums.ipv4_header);
+  EXPECT_FALSE(capabilities.checksums.udp);
+  EXPECT_FALSE(capabilities.checksums.tcp);
+  EXPECT_FALSE(capabilities.checksums.outer_ipv4_header);
+  EXPECT_FALSE(capabilities.checksums.outer_udp);
+  EXPECT_FALSE(capabilities.tunnel_encodings.generic_ip);
+  EXPECT_FALSE(capabilities.tunnel_encodings.generic_udp);
+  EXPECT_FALSE(capabilities.tunnel_encodings.gtp);
   EXPECT_FALSE(capabilities.multi_segment_tx);
+  EXPECT_FALSE(queue_capabilities.checksums.ipv4_header);
 }
 
 // Checks that adding a port puts it into the global port collection.

@@ -782,6 +782,7 @@ enum TxEncapsulationKind {
   TX_ENCAPSULATION_NONE = 0;
   TX_ENCAPSULATION_IP = 1;
   TX_ENCAPSULATION_UDP = 2;
+  TX_ENCAPSULATION_GTP = 3;
 }
 
 message TxChecksumDomain {

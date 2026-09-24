@@ -39,6 +39,7 @@
 
 #include "control/runtime_state.h"
 #include "modules/queue_out.h"
+#include "modules/port_out.h"
 #include "packet_checksum.h"
 #include "packet_pool.h"
 
@@ -239,6 +240,44 @@ TEST_F(QueueOutChecksumTest, NoProfilePreservesPacketBytesAndMetadata) {
   EXPECT_EQ(port_->sent_l4_len, 11);
   const Port::PortStats stats = port_->GetPortStats();
   EXPECT_EQ(stats.out.tx_prepare_errors, 0);
+  PacketFree(packet);
+}
+
+TEST_F(QueueOutChecksumTest, PortOutNoProfilePreservesPacketBytesAndMetadata) {
+  PortOut output;
+  bess::pb::PortOutArg arg;
+  arg.set_port("queue-out-test");
+  ASSERT_FALSE(output.Init(arg).has_error());
+
+  PlainPacketPool pool(8);
+  PacketHandle packet = Build(pool, kIpv4Udp);
+  ASSERT_NE(packet, nullptr);
+  packet->ol_flags = RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_UDP_CKSUM |
+                     RTE_MBUF_F_TX_TUNNEL_UDP;
+  packet->l2_len = 17;
+  packet->l3_len = 23;
+  packet->l4_len = 11;
+  const auto original_bytes = PacketBytes(packet);
+  const uint64_t original_flags = packet->ol_flags;
+
+  PacketBatch batch;
+  batch.clear();
+  batch.add(packet);
+  Context context{};
+  context.wid = 0;
+  output.ProcessBatch(&context, &batch);
+  output.DeInit();
+
+  EXPECT_EQ(port_->send_calls, 1);
+  EXPECT_EQ(port_->attempted_packets, 1);
+  EXPECT_EQ(port_->sent_packet, packet);
+  EXPECT_EQ(port_->sent_bytes, original_bytes);
+  EXPECT_EQ(PacketBytes(packet), original_bytes);
+  EXPECT_EQ(port_->sent_flags, original_flags);
+  EXPECT_EQ(port_->sent_l2_len, 17);
+  EXPECT_EQ(port_->sent_l3_len, 23);
+  EXPECT_EQ(port_->sent_l4_len, 11);
+  EXPECT_EQ(port_->GetPortStats().out.tx_prepare_errors, 0);
   PacketFree(packet);
 }
 

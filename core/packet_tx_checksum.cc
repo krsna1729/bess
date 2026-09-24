@@ -240,14 +240,16 @@ std::expected<OuterIpLayout, ChecksumError> ReadOuterIp(
 std::expected<OuterIpLayout, ChecksumError> ValidateEncapsulation(
     PacketRef packet, const BoundTxFinalizationProfile &profile,
     const std::optional<ChecksumLayout> &inner_layout) noexcept {
-  if (profile.encapsulation.kind == TxEncapsulationKind::kNone) {
+  const TxTunnelEncoding encoding = profile.encapsulation.encoding;
+  if (encoding == TxTunnelEncoding::kNone) {
     if (profile.inner) {
       return std::unexpected(ChecksumError::kInvalidPlan);
     }
     return OuterIpLayout{};
   }
-  if (profile.encapsulation.kind != TxEncapsulationKind::kIp &&
-      profile.encapsulation.kind != TxEncapsulationKind::kUdp) {
+  if (encoding != TxTunnelEncoding::kGenericIp &&
+      encoding != TxTunnelEncoding::kGenericUdp &&
+      encoding != TxTunnelEncoding::kGtp) {
     return std::unexpected(ChecksumError::kInvalidPlan);
   }
   if (!IsValidIpVersion(profile.encapsulation.outer_ip_version)) {
@@ -261,7 +263,7 @@ std::expected<OuterIpLayout, ChecksumError> ValidateEncapsulation(
     return std::unexpected(outer.error());
   }
 
-  if (profile.encapsulation.kind == TxEncapsulationKind::kIp) {
+  if (encoding == TxTunnelEncoding::kGenericIp) {
     if (outer->protocol != 4 && outer->protocol != 41) {
       return std::unexpected(ChecksumError::kProtocolMismatch);
     }
@@ -297,6 +299,8 @@ std::expected<OuterIpLayout, ChecksumError> ValidateEncapsulation(
     return std::unexpected(ChecksumError::kInvalidTransportHeader);
   }
   if (profile.inner) {
+    // Generic UDP and GTP share the outer UDP envelope. The caller supplies
+    // the exact inner offsets; GTP and its extension headers are not parsed.
     const size_t inner_offset = profile.inner->plan.network_offset;
     const size_t encapsulation_end = udp_offset + udp_length;
     if (inner_offset < udp_offset + sizeof(utils::Udp) || !inner_layout ||
@@ -341,11 +345,24 @@ void AddZeroHardwareWrite(TxChecksumMetadata *metadata,
   const uint16_t zero = 0;
   AddHardwareWrite(metadata, offset, &zero);
 }
+uint64_t TunnelFlag(TxTunnelEncoding encoding) noexcept {
+  switch (encoding) {
+    case TxTunnelEncoding::kGenericIp:
+      return RTE_MBUF_F_TX_TUNNEL_IP;
+    case TxTunnelEncoding::kGenericUdp:
+      return RTE_MBUF_F_TX_TUNNEL_UDP;
+    case TxTunnelEncoding::kGtp:
+      return RTE_MBUF_F_TX_TUNNEL_GTP;
+    case TxTunnelEncoding::kNone:
+      return 0;
+  }
+  return 0;
+}
+
 
 std::expected<void, ChecksumError> AddDomainHardwareWrites(
     PacketRef packet, const BoundTxChecksumDomain &domain,
-    const ChecksumLayout &layout, bool outer_tunnel,
-    TxChecksumMetadata *metadata) noexcept {
+    const ChecksumLayout &layout, TxChecksumMetadata *metadata) noexcept {
   if (IsHardware(domain.network_backend)) {
     if (domain.plan.network != NetworkChecksum::kIpv4Header) {
       return std::unexpected(ChecksumError::kInvalidPlan);
@@ -353,11 +370,9 @@ std::expected<void, ChecksumError> AddDomainHardwareWrites(
     AddZeroHardwareWrite(metadata, layout.network_checksum_offset);
   }
   if (IsHardware(domain.transport_backend)) {
-    if (domain.plan.transport == TransportChecksum::kUdp && outer_tunnel) {
-      // DPDK's outer-UDP offload consumes the checksum field as zero.
-      AddZeroHardwareWrite(metadata, layout.transport_checksum_offset);
-    } else if (domain.plan.transport == TransportChecksum::kUdp ||
-               domain.plan.transport == TransportChecksum::kTcp) {
+    if (domain.plan.transport == TransportChecksum::kUdp ||
+        domain.plan.transport == TransportChecksum::kTcp) {
+      // DPDK checksum offloads consume the pseudoheader seed in the field.
       const auto seed = PseudoHeaderSeed(packet, domain.plan);
       if (!seed) {
         return std::unexpected(seed.error());
@@ -377,7 +392,7 @@ std::expected<TxChecksumMetadata, ChecksumError> BuildMetadata(
     const std::optional<OuterIpLayout> &outer_ip) noexcept {
   TxChecksumMetadata metadata;
   const bool tunneled =
-      profile.encapsulation.kind != TxEncapsulationKind::kNone;
+      profile.encapsulation.encoding != TxTunnelEncoding::kNone;
 
   if (!tunneled && profile.outer && HasHardware(*profile.outer)) {
     if (!outer_layout) {
@@ -413,7 +428,7 @@ std::expected<TxChecksumMetadata, ChecksumError> BuildMetadata(
     metadata.l4_len = *l4_len;
     metadata.set_main_lengths = true;
     const auto writes =
-        AddDomainHardwareWrites(packet, domain, layout, false, &metadata);
+        AddDomainHardwareWrites(packet, domain, layout, &metadata);
     if (!writes) {
       return std::unexpected(writes.error());
     }
@@ -428,6 +443,18 @@ std::expected<TxChecksumMetadata, ChecksumError> BuildMetadata(
   const bool inner_hardware = profile.inner && HasHardware(*profile.inner);
   if (!outer_ip) {
     return std::unexpected(ChecksumError::kInvalidPlan);
+  }
+
+  const bool outer_udp_hardware =
+      outer_hardware && profile.outer &&
+      profile.outer->plan.transport == TransportChecksum::kUdp &&
+      IsHardware(profile.outer->transport_backend);
+  if (inner_hardware || outer_udp_hardware) {
+    const uint64_t tunnel_flag = TunnelFlag(profile.encapsulation.encoding);
+    if (tunnel_flag == 0) {
+      return std::unexpected(ChecksumError::kInvalidPlan);
+    }
+    metadata.flags |= tunnel_flag;
   }
 
   if (outer_hardware || inner_hardware) {
@@ -461,7 +488,7 @@ std::expected<TxChecksumMetadata, ChecksumError> BuildMetadata(
       metadata.flags |= RTE_MBUF_F_TX_OUTER_UDP_CKSUM;
     }
     const auto writes =
-        AddDomainHardwareWrites(packet, domain, *outer_layout, true, &metadata);
+        AddDomainHardwareWrites(packet, domain, *outer_layout, &metadata);
     if (!writes) {
       return std::unexpected(writes.error());
     }
@@ -483,9 +510,6 @@ std::expected<TxChecksumMetadata, ChecksumError> BuildMetadata(
                             ? RTE_MBUF_F_TX_UDP_CKSUM
                             : RTE_MBUF_F_TX_TCP_CKSUM;
     }
-    metadata.flags |= profile.encapsulation.kind == TxEncapsulationKind::kIp
-                           ? RTE_MBUF_F_TX_TUNNEL_IP
-                           : RTE_MBUF_F_TX_TUNNEL_UDP;
 
     const size_t inner_l2_start =
         profile.encapsulation.outer_network_offset + outer_ip->header_length;
@@ -510,7 +534,7 @@ std::expected<TxChecksumMetadata, ChecksumError> BuildMetadata(
     metadata.l4_len = *l4_len;
     metadata.set_main_lengths = true;
     const auto writes =
-        AddDomainHardwareWrites(packet, domain, *inner_layout, false, &metadata);
+        AddDomainHardwareWrites(packet, domain, *inner_layout, &metadata);
     if (!writes) {
       return std::unexpected(writes.error());
     }
@@ -524,7 +548,7 @@ std::expected<void, ChecksumError> ValidateHardwareLayout(
     const std::optional<ChecksumLayout> &inner_layout,
     const std::optional<OuterIpLayout> &outer_ip) noexcept {
   const bool tunneled =
-      profile.encapsulation.kind != TxEncapsulationKind::kNone;
+      profile.encapsulation.encoding != TxTunnelEncoding::kNone;
   const bool outer_hardware = profile.outer && HasHardware(*profile.outer);
   const bool inner_hardware = profile.inner && HasHardware(*profile.inner);
   if (!outer_hardware && !inner_hardware) {
@@ -644,16 +668,34 @@ void CommitMetadataAndSeeds(PacketHandle packet,
   packet->ol_flags = (packet->ol_flags & ~kTxChecksumFlags) | metadata.flags;
 }
 
+void DisableHardwareBackends(
+    BoundTxFinalizationProfile *profile) noexcept {
+  const auto disable = [](std::optional<BoundTxChecksumDomain> &domain) {
+    if (!domain) {
+      return;
+    }
+    if (domain->plan.network != NetworkChecksum::kNone) {
+      domain->network_backend = TxChecksumBackend::kSoftware;
+    }
+    if (domain->plan.transport != TransportChecksum::kNone) {
+      domain->transport_backend = TxChecksumBackend::kSoftware;
+    }
+  };
+  disable(profile->outer);
+  disable(profile->inner);
+}
+
 }  // namespace
 
 std::expected<BoundTxFinalizationProfile, ChecksumError>
 BindTxFinalizationProfile(const TxFinalizationProfile &profile,
-                          const TxChecksumCapabilities &capabilities) noexcept {
-  const bool tunneled =
-      profile.encapsulation.kind != TxEncapsulationKind::kNone;
-  if (profile.encapsulation.kind != TxEncapsulationKind::kNone &&
-      profile.encapsulation.kind != TxEncapsulationKind::kIp &&
-      profile.encapsulation.kind != TxEncapsulationKind::kUdp) {
+                          const TxOffloadCapabilities &capabilities) noexcept {
+  const TxTunnelEncoding encoding = profile.encapsulation.encoding;
+  const bool tunneled = encoding != TxTunnelEncoding::kNone;
+  if (encoding != TxTunnelEncoding::kNone &&
+      encoding != TxTunnelEncoding::kGenericIp &&
+      encoding != TxTunnelEncoding::kGenericUdp &&
+      encoding != TxTunnelEncoding::kGtp) {
     return std::unexpected(ChecksumError::kInvalidPlan);
   }
   if (!tunneled &&
@@ -671,13 +713,10 @@ BindTxFinalizationProfile(const TxFinalizationProfile &profile,
     return std::unexpected(ChecksumError::kInvalidPlan);
   }
 
-  auto validate_domain = [](const ChecksumPlan &plan) {
-    return IsValidChecksumPlan(plan);
-  };
-  if (profile.outer && !validate_domain(*profile.outer)) {
+  if (profile.outer && !IsValidChecksumPlan(*profile.outer)) {
     return std::unexpected(ChecksumError::kInvalidPlan);
   }
-  if (profile.inner && !validate_domain(*profile.inner)) {
+  if (profile.inner && !IsValidChecksumPlan(*profile.inner)) {
     return std::unexpected(ChecksumError::kInvalidPlan);
   }
   if (tunneled) {
@@ -687,11 +726,13 @@ BindTxFinalizationProfile(const TxFinalizationProfile &profile,
          profile.outer->ip_version != profile.encapsulation.outer_ip_version)) {
       return std::unexpected(ChecksumError::kInvalidPlan);
     }
-    if (profile.outer && profile.encapsulation.kind == TxEncapsulationKind::kIp &&
+    if (profile.outer && encoding == TxTunnelEncoding::kGenericIp &&
         profile.outer->transport != TransportChecksum::kNone) {
       return std::unexpected(ChecksumError::kInvalidPlan);
     }
-    if (profile.outer && profile.encapsulation.kind == TxEncapsulationKind::kUdp &&
+    if (profile.outer &&
+        (encoding == TxTunnelEncoding::kGenericUdp ||
+         encoding == TxTunnelEncoding::kGtp) &&
         profile.outer->transport != TransportChecksum::kNone &&
         profile.outer->transport != TransportChecksum::kUdp) {
       return std::unexpected(ChecksumError::kInvalidPlan);
@@ -703,36 +744,48 @@ BindTxFinalizationProfile(const TxFinalizationProfile &profile,
     }
   }
 
-  const bool generic_tunnel_supported =
-      !tunneled ||
-      (profile.encapsulation.kind == TxEncapsulationKind::kIp
-           ? capabilities.ip_tunnel
-           : capabilities.udp_tunnel);
-  auto bind_domain = [&](const ChecksumPlan &plan, bool is_tunneled_outer,
-                         bool is_inner) {
+  const auto encoding_supported = [&] {
+    switch (encoding) {
+      case TxTunnelEncoding::kNone:
+        return true;
+      case TxTunnelEncoding::kGenericIp:
+        return capabilities.tunnel_encodings.generic_ip;
+      case TxTunnelEncoding::kGenericUdp:
+        return capabilities.tunnel_encodings.generic_udp;
+      case TxTunnelEncoding::kGtp:
+        return capabilities.tunnel_encodings.gtp;
+    }
+    return false;
+  }();
+
+  auto bind_domain = [&](const ChecksumPlan &plan, bool tunneled_outer,
+                         bool inner) {
     BoundTxChecksumDomain bound;
     bound.plan = plan;
     if (plan.network == NetworkChecksum::kIpv4Header) {
-      const bool supported =
-          is_tunneled_outer
-              ? capabilities.outer_ipv4_header
-              : capabilities.ipv4_header &&
-                    (!is_inner || generic_tunnel_supported);
+      bool supported = tunneled_outer
+                           ? capabilities.checksums.outer_ipv4_header
+                           : capabilities.checksums.ipv4_header;
+      if (inner && !encoding_supported) {
+        supported = false;
+      }
       bound.network_backend = supported ? TxChecksumBackend::kHardware
                                          : TxChecksumBackend::kSoftware;
     }
     if (plan.transport != TransportChecksum::kNone) {
       bool supported = false;
-      if (is_tunneled_outer) {
+      if (tunneled_outer) {
         supported = plan.transport == TransportChecksum::kUdp &&
-                    capabilities.outer_udp;
+                    capabilities.checksums.outer_udp && encoding_supported;
+      } else if (inner) {
+        supported = encoding_supported &&
+                    (plan.transport == TransportChecksum::kUdp
+                         ? capabilities.checksums.udp
+                         : capabilities.checksums.tcp);
       } else {
         supported = plan.transport == TransportChecksum::kUdp
-                        ? capabilities.udp
-                        : capabilities.tcp;
-        if (is_inner) {
-          supported = supported && generic_tunnel_supported;
-        }
+                        ? capabilities.checksums.udp
+                        : capabilities.checksums.tcp;
       }
       bound.transport_backend = supported ? TxChecksumBackend::kHardware
                                            : TxChecksumBackend::kSoftware;
@@ -779,7 +832,7 @@ std::expected<void, ChecksumError> FinalizeTxPacket(
   }
 
   std::optional<OuterIpLayout> outer_ip;
-  if (profile.encapsulation.kind != TxEncapsulationKind::kNone) {
+  if (profile.encapsulation.encoding != TxTunnelEncoding::kNone) {
     const auto layout =
         ValidateEncapsulation(PacketRef(packet), profile, inner_layout);
     if (!layout) {
@@ -792,7 +845,10 @@ std::expected<void, ChecksumError> FinalizeTxPacket(
 
   PacketHandle segment = packet;
   for (uint16_t index = 0; index < packet->nb_segs; index++) {
-    if (segment == nullptr || rte_mbuf_refcnt_read(segment) != 1) {
+    if (segment == nullptr) {
+      return std::unexpected(ChecksumError::kMalformedChain);
+    }
+    if (rte_mbuf_refcnt_read(segment) != 1) {
       return std::unexpected(ChecksumError::kUnsupportedOffloadLayout);
     }
     segment = segment->next;
@@ -800,43 +856,65 @@ std::expected<void, ChecksumError> FinalizeTxPacket(
   if (segment != nullptr) {
     return std::unexpected(ChecksumError::kMalformedChain);
   }
+
+  BoundTxFinalizationProfile effective_profile = profile;
   const auto hardware_layout = ValidateHardwareLayout(
-      packet, profile, outer_layout, inner_layout, outer_ip);
+      packet, effective_profile, outer_layout, inner_layout, outer_ip);
   if (!hardware_layout) {
-    return std::unexpected(hardware_layout.error());
+    if (hardware_layout.error() !=
+        ChecksumError::kUnsupportedOffloadLayout) {
+      return std::unexpected(hardware_layout.error());
+    }
+    DisableHardwareBackends(&effective_profile);
   }
 
-  auto metadata = BuildMetadata(PacketRef(packet), profile, outer_layout,
-                                inner_layout, outer_ip);
+  auto metadata = BuildMetadata(PacketRef(packet), effective_profile,
+                                outer_layout, inner_layout, outer_ip);
+  if (!metadata &&
+      metadata.error() == ChecksumError::kUnsupportedOffloadLayout) {
+    DisableHardwareBackends(&effective_profile);
+    metadata = BuildMetadata(PacketRef(packet), effective_profile, outer_layout,
+                             inner_layout, outer_ip);
+  }
   if (!metadata) {
     return std::unexpected(metadata.error());
   }
-  if (metadata->write_count > 0) {
-    for (size_t index = 0; index < metadata->write_count; index++) {
-      const size_t offset = metadata->writes[index].offset;
-      if (offset > UINT16_MAX || !FitsHeadSegment(packet, offset,
-                                                  sizeof(uint16_t))) {
-        return std::unexpected(ChecksumError::kUnsupportedOffloadLayout);
-      }
+
+  bool writes_fit = true;
+  for (size_t index = 0; index < metadata->write_count; index++) {
+    const size_t offset = metadata->writes[index].offset;
+    if (offset > UINT16_MAX ||
+        !FitsHeadSegment(packet, offset, sizeof(uint16_t))) {
+      writes_fit = false;
+      break;
+    }
+  }
+  if (!writes_fit) {
+    DisableHardwareBackends(&effective_profile);
+    metadata = BuildMetadata(PacketRef(packet), effective_profile, outer_layout,
+                             inner_layout, outer_ip);
+    if (!metadata) {
+      return std::unexpected(metadata.error());
     }
   }
 
   const bool software_outer_udp_depends_on_inner_hw =
-      profile.encapsulation.kind != TxEncapsulationKind::kNone &&
-      profile.outer && profile.inner &&
-      profile.outer->plan.transport == TransportChecksum::kUdp &&
-      IsSoftware(profile.outer->transport_backend) &&
-      HasHardware(*profile.inner);
-  if (profile.inner) {
+      effective_profile.encapsulation.encoding != TxTunnelEncoding::kNone &&
+      effective_profile.outer && effective_profile.inner &&
+      effective_profile.outer->plan.transport == TransportChecksum::kUdp &&
+      IsSoftware(effective_profile.outer->transport_backend) &&
+      HasHardware(*effective_profile.inner);
+  if (effective_profile.inner) {
     const auto software = ApplyBoundSoftwareChecksums(
-        packet, *profile.inner, software_outer_udp_depends_on_inner_hw);
+        packet, *effective_profile.inner,
+        software_outer_udp_depends_on_inner_hw);
     if (!software) {
       return std::unexpected(software.error());
     }
   }
-  if (profile.outer) {
-    const auto software =
-        ApplyBoundSoftwareChecksums(packet, *profile.outer, false);
+  if (effective_profile.outer) {
+    const auto software = ApplyBoundSoftwareChecksums(
+        packet, *effective_profile.outer, false);
     if (!software) {
       return std::unexpected(software.error());
     }

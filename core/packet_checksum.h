@@ -75,18 +75,25 @@ struct ChecksumLayout {
 
 
 struct TxChecksumCapabilities {
-  // These capabilities apply to regular packets and tunneled inner headers.
   bool ipv4_header = false;
   bool udp = false;  // IPv4 and IPv6 transport checksums.
   bool tcp = false;  // IPv4 and IPv6 transport checksums.
-
-  // DPDK exposes outer-header checksum bits separately.
   bool outer_ipv4_header = false;
   bool outer_udp = false;
+};
 
-  // Generic encapsulation support required for tunneled inner offloads.
-  bool ip_tunnel = false;
-  bool udp_tunnel = false;
+
+struct TxTunnelEncodingCapabilities {
+  bool generic_ip = false;
+  bool generic_udp = false;
+  bool gtp = false;
+};
+
+// Effective capabilities available to an output queue after intersecting
+// advertised offloads with the configuration actually accepted by the PMD.
+struct TxOffloadCapabilities {
+  TxChecksumCapabilities checksums;
+  TxTunnelEncodingCapabilities tunnel_encodings;
   bool multi_segment_tx = false;
 };
 

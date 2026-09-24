@@ -31,6 +31,7 @@
 #ifndef BESS_DRIVERS_PMD_H_
 #define BESS_DRIVERS_PMD_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -66,8 +67,12 @@ struct PmdCapabilities {
   // usable_single_mbuf_bytes excludes RTE_PKTMBUF_HEADROOM.
   RxMtuSupport RxMtuSupportFor(
       uint32_t mtu, size_t usable_single_mbuf_bytes) const;
+  // Advertised device capabilities, configured device defaults, and
+  // queue-scoped defaults are kept separate until effective capabilities are
+  // derived for a specific queue.
   uint64_t ConfiguredTxOffloads() const;
-  bess::packet::TxChecksumCapabilities ToTxChecksumCapabilities() const;
+  bess::packet::TxOffloadCapabilities ToTxOffloadCapabilities(
+      uint64_t device_tx_offloads, uint64_t queue_tx_offloads) const;
 
   bool rx_scatter = false;
   uint32_t min_mtu = RTE_ETHER_MIN_MTU;
@@ -75,8 +80,11 @@ struct PmdCapabilities {
   uint32_t rx_frame_overhead = RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN;
   uint64_t rx_offload_capa = 0;
   uint64_t tx_offload_capa = 0;
+  uint64_t tx_queue_offload_capa = 0;
   uint64_t dev_capa = 0;
+  std::string driver_name;
 };
+
 
 /*!
  * This driver binds a port to a device using DPDK.
@@ -163,10 +171,10 @@ class PMDPort final : public Port {
     return DRIVER_FLAG_SELF_INC_STATS | DRIVER_FLAG_SELF_OUT_STATS;
   }
 
-  bess::packet::TxChecksumCapabilities GetTxChecksumCapabilities()
-      const override {
-    return capabilities_.ToTxChecksumCapabilities();
-  }
+  bess::packet::TxOffloadCapabilities GetTxOffloadCapabilities()
+      const override;
+  bess::packet::TxOffloadCapabilities GetTxOffloadCapabilities(
+      queue_t qid) const override;
 
   LinkStatus GetLinkStatus() override;
 
@@ -181,6 +189,8 @@ class PMDPort final : public Port {
   }
 
  private:
+  friend class PMDPortTestAccess;
+
   CommandResponse ConfigureDevice(dpdk_port_t port_id,
                                   const rte_eth_dev_info &dev_info,
                                   bool enable_rx_scatter);
@@ -201,6 +211,8 @@ class PMDPort final : public Port {
    */
   placement_constraint node_placement_;
   PmdCapabilities capabilities_;
+  uint64_t tx_device_offloads_enabled_ = 0;
+  std::array<uint64_t, MAX_QUEUES_PER_DIR> tx_queue_offloads_enabled_{};
   bool rx_scatter_enabled_;
   bool loopback_;
   int vlan_offload_mask_;

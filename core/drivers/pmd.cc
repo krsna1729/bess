@@ -56,36 +56,57 @@ PmdCapabilities PmdCapabilities::FromDeviceInfo(
   }
   ret.rx_offload_capa = dev_info.rx_offload_capa;
   ret.tx_offload_capa = dev_info.tx_offload_capa;
+  ret.tx_queue_offload_capa = dev_info.tx_queue_offload_capa;
   ret.dev_capa = dev_info.dev_capa;
+  ret.driver_name = dev_info.driver_name ? dev_info.driver_name : "";
   return ret;
 }
 
-bess::packet::TxChecksumCapabilities
-PmdCapabilities::ToTxChecksumCapabilities() const {
+bess::packet::TxOffloadCapabilities
+PmdCapabilities::ToTxOffloadCapabilities(uint64_t device_tx_offloads,
+                                         uint64_t queue_tx_offloads) const {
+  const uint64_t device_enabled =
+      tx_offload_capa & ~tx_queue_offload_capa & device_tx_offloads;
+  const uint64_t queue_enabled =
+      tx_offload_capa & tx_queue_offload_capa & queue_tx_offloads;
+  const uint64_t effective = device_enabled | queue_enabled;
+  const bool gtp_supported = driver_name == "net_ice" ||
+                             driver_name == "net_i40e" ||
+                             driver_name == "net_iavf";
   return {
-      .ipv4_header =
-          (tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0,
-      .udp = (tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0,
-      .tcp = (tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM) != 0,
-      .outer_ipv4_header =
-          (tx_offload_capa & RTE_ETH_TX_OFFLOAD_OUTER_IPV4_CKSUM) != 0,
-      .outer_udp =
-          (tx_offload_capa & RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM) != 0,
-      .ip_tunnel = (tx_offload_capa & RTE_ETH_TX_OFFLOAD_IP_TNL_TSO) != 0,
-      .udp_tunnel = (tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO) != 0,
+      .checksums =
+          {
+              .ipv4_header =
+                  (effective & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0,
+              .udp = (effective & RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0,
+              .tcp = (effective & RTE_ETH_TX_OFFLOAD_TCP_CKSUM) != 0,
+              .outer_ipv4_header =
+                  (effective & RTE_ETH_TX_OFFLOAD_OUTER_IPV4_CKSUM) != 0,
+              .outer_udp =
+                  (effective & RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM) != 0,
+          },
+      .tunnel_encodings =
+          {
+              .generic_ip =
+                  (device_enabled & RTE_ETH_TX_OFFLOAD_IP_TNL_TSO) != 0,
+              .generic_udp =
+                  (device_enabled & RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO) != 0,
+              .gtp = gtp_supported,
+          },
       .multi_segment_tx =
-          (tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) != 0,
+          (effective & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) != 0,
   };
 }
 
 uint64_t PmdCapabilities::ConfiguredTxOffloads() const {
-  constexpr uint64_t kTxChecksumOffloads =
+  constexpr uint64_t kTxOffloads =
       RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
       RTE_ETH_TX_OFFLOAD_TCP_CKSUM | RTE_ETH_TX_OFFLOAD_OUTER_IPV4_CKSUM |
-      RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM | RTE_ETH_TX_OFFLOAD_IP_TNL_TSO |
-      RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO | RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
-  return tx_offload_capa & kTxChecksumOffloads;
+      RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM | RTE_ETH_TX_OFFLOAD_MULTI_SEGS |
+      RTE_ETH_TX_OFFLOAD_IP_TNL_TSO | RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO;
+  return tx_offload_capa & ~tx_queue_offload_capa & kTxOffloads;
 }
+
 
 size_t PmdCapabilities::RxFrameLengthFor(uint32_t mtu) const {
   return static_cast<size_t>(mtu) + rx_frame_overhead;
@@ -141,8 +162,9 @@ static const rte_eth_conf default_eth_conf(const rte_eth_dev_info &dev_info,
 CommandResponse PMDPort::ConfigureDevice(dpdk_port_t port_id,
                                           const rte_eth_dev_info &dev_info,
                                           bool enable_rx_scatter) {
-  const int num_txq = num_queues[PACKET_DIR_OUT];
+  std::array<uint64_t, MAX_QUEUES_PER_DIR> configured_queue_offloads{};
   const int num_rxq = num_queues[PACKET_DIR_INC];
+  const int num_txq = num_queues[PACKET_DIR_OUT];
 
   int sid = rte_eth_dev_socket_id(port_id);
   if (sid < 0 || sid > RTE_MAX_NUMA_NODES) {
@@ -162,6 +184,7 @@ CommandResponse PMDPort::ConfigureDevice(dpdk_port_t port_id,
   if (ret != 0) {
     return CommandFailure(-ret, "rte_eth_dev_configure() failed");
   }
+  const uint64_t configured_device_offloads = eth_conf.txmode.offloads;
 
   rte_eth_rxconf eth_rxconf = dev_info.default_rxconf;
   eth_rxconf.rx_drop_en = 1;
@@ -180,6 +203,15 @@ CommandResponse PMDPort::ConfigureDevice(dpdk_port_t port_id,
     if (ret != 0) {
       return CommandFailure(-ret, "rte_eth_tx_queue_setup() failed");
     }
+    rte_eth_txq_info queue_info{};
+    if (rte_eth_tx_queue_info_get(port_id, i, &queue_info) == 0) {
+      configured_queue_offloads[i] = queue_info.conf.offloads;
+    } else {
+      configured_queue_offloads[i] =
+          dev_info.default_txconf.offloads &
+          capabilities_.tx_queue_offload_capa;
+    }
+    configured_queue_offloads[i] &= ~configured_device_offloads;
   }
 
   rte_eth_promiscuous_enable(port_id);
@@ -190,6 +222,8 @@ CommandResponse PMDPort::ConfigureDevice(dpdk_port_t port_id,
     }
   }
 
+  tx_device_offloads_enabled_ = configured_device_offloads;
+  tx_queue_offloads_enabled_ = configured_queue_offloads;
   rx_scatter_enabled_ = enable_rx_scatter;
   return CommandSuccess();
 }
@@ -686,6 +720,38 @@ int PMDPort::SendPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
   stats.actual_hist[sent]++;
   stats.diff_hist[dropped]++;
   return sent;
+}
+
+bess::packet::TxOffloadCapabilities PMDPort::GetTxOffloadCapabilities()
+    const {
+  const size_t queue_count = num_queues[PACKET_DIR_OUT];
+  if (queue_count == 0 || queue_count > MAX_QUEUES_PER_DIR) {
+    return {};
+  }
+  auto common = GetTxOffloadCapabilities(0);
+  for (size_t index = 1; index < queue_count; index++) {
+    const auto queue =
+        GetTxOffloadCapabilities(static_cast<queue_t>(index));
+    common.checksums.ipv4_header &= queue.checksums.ipv4_header;
+    common.checksums.udp &= queue.checksums.udp;
+    common.checksums.tcp &= queue.checksums.tcp;
+    common.checksums.outer_ipv4_header &= queue.checksums.outer_ipv4_header;
+    common.checksums.outer_udp &= queue.checksums.outer_udp;
+    common.tunnel_encodings.generic_ip &= queue.tunnel_encodings.generic_ip;
+    common.tunnel_encodings.generic_udp &= queue.tunnel_encodings.generic_udp;
+    common.tunnel_encodings.gtp &= queue.tunnel_encodings.gtp;
+    common.multi_segment_tx &= queue.multi_segment_tx;
+  }
+  return common;
+}
+
+bess::packet::TxOffloadCapabilities PMDPort::GetTxOffloadCapabilities(
+    queue_t qid) const {
+  if (qid >= num_queues[PACKET_DIR_OUT] || qid >= MAX_QUEUES_PER_DIR) {
+    return {};
+  }
+  return capabilities_.ToTxOffloadCapabilities(
+      tx_device_offloads_enabled_, tx_queue_offloads_enabled_[qid]);
 }
 
 Port::LinkStatus PMDPort::GetLinkStatus() {

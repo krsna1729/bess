@@ -39,17 +39,16 @@
 
 namespace bess::packet {
 
-// DPDK requires a generic IP or UDP tunnel kind to describe offloads for
-// tunneled inner headers. This describes encapsulation only; it does not imply
-// which checksum operations the profile requests.
-enum class TxEncapsulationKind : uint8_t {
+// DPDK tunnel type metadata describes encapsulation, not checksum support.
+enum class TxTunnelEncoding : uint8_t {
   kNone,
-  kIp,
-  kUdp,
+  kGenericIp,
+  kGenericUdp,
+  kGtp,
 };
 
 struct TxEncapsulationLayout {
-  TxEncapsulationKind kind = TxEncapsulationKind::kNone;
+  TxTunnelEncoding encoding = TxTunnelEncoding::kNone;
   IpVersion outer_ip_version = IpVersion::kIpv4;
   size_t outer_network_offset = 0;
 };
@@ -92,15 +91,18 @@ struct TxPacketBatchFinalizeResult {
 
 std::expected<BoundTxFinalizationProfile, ChecksumError>
 BindTxFinalizationProfile(const TxFinalizationProfile &profile,
-                          const TxChecksumCapabilities &capabilities) noexcept;
-
+                          const TxOffloadCapabilities &capabilities) noexcept;
 // Validates the fixed profile against this packet, computes software-bound
 // fields, and prepares hardware-bound metadata as one final pre-send step.
+// Caller retains ownership on success and failure. An error may follow
+// software checksum writes, so discard a failed packet rather than retrying or
+// transmitting it. TX offload flags and lengths commit only on success.
 std::expected<void, ChecksumError> FinalizeTxPacket(
     PacketHandle &packet, const BoundTxFinalizationProfile &profile) noexcept;
 
 // Finalizes valid packets in place, frees rejected packets, and compacts the
-// batch before output. An empty profile is a no-op.
+// batch before output. Failed packets may already contain software writes.
+// An empty profile is a no-op.
 TxPacketBatchFinalizeResult FinalizeTxPacketBatch(
     PacketBatch &batch, const BoundTxFinalizationProfile &profile) noexcept;
 

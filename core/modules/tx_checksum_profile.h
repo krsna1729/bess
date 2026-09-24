@@ -116,10 +116,13 @@ ParseTxChecksumProfile(const pb::TxChecksumProfile &arg) noexcept {
     }
     switch (encapsulation.kind()) {
       case pb::TX_ENCAPSULATION_IP:
-        profile.encapsulation.kind = packet::TxEncapsulationKind::kIp;
+        profile.encapsulation.encoding = packet::TxTunnelEncoding::kGenericIp;
         break;
       case pb::TX_ENCAPSULATION_UDP:
-        profile.encapsulation.kind = packet::TxEncapsulationKind::kUdp;
+        profile.encapsulation.encoding = packet::TxTunnelEncoding::kGenericUdp;
+        break;
+      case pb::TX_ENCAPSULATION_GTP:
+        profile.encapsulation.encoding = packet::TxTunnelEncoding::kGtp;
         break;
       case pb::TX_ENCAPSULATION_NONE:
         return std::unexpected(packet::ChecksumError::kInvalidPlan);

@@ -65,7 +65,7 @@ CommandResponse PortOut::Init(const bess::pb::PortOutArg &arg) {
       return CommandFailure(EINVAL, "Invalid tx_checksum_profile");
     }
     const auto bound = bess::packet::BindTxFinalizationProfile(
-        *profile, port_->GetTxChecksumCapabilities());
+        *profile, port_->GetTxOffloadCapabilities());
     if (!bound) {
       return CommandFailure(EINVAL, "Invalid tx_checksum_profile");
     }

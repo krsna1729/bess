@@ -60,7 +60,7 @@ CommandResponse QueueOut::Init(const bess::pb::QueueOutArg &arg) {
       return CommandFailure(EINVAL, "Invalid tx_checksum_profile");
     }
     const auto bound = bess::packet::BindTxFinalizationProfile(
-        *profile, port_->GetTxChecksumCapabilities());
+        *profile, port_->GetTxOffloadCapabilities(qid_));
     if (!bound) {
       return CommandFailure(EINVAL, "Invalid tx_checksum_profile");
     }

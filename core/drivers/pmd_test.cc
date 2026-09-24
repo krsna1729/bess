@@ -56,10 +56,29 @@ using RxMtuSupport = PmdCapabilities::RxMtuSupport;
 
 }  // namespace
 
+class PMDPortTestAccess {
+ public:
+  static void ConfigureDifferentQueueCapabilities(PMDPort &port) {
+    rte_eth_dev_info info = {};
+    info.driver_name = "net_ice";
+    info.tx_offload_capa = RTE_ETH_TX_OFFLOAD_TCP_CKSUM |
+                           RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
+                           RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM;
+    info.tx_queue_offload_capa = RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
+                                 RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM;
+    port.capabilities_ = PmdCapabilities::FromDeviceInfo(info);
+    port.num_queues[PACKET_DIR_OUT] = 2;
+    port.tx_device_offloads_enabled_ = RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
+    port.tx_queue_offloads_enabled_[0] = RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+    port.tx_queue_offloads_enabled_[1] = RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM;
+  }
+};
+
 TEST(PmdCapabilitiesTest, CopiesDeviceCapabilitiesAndRxGeometry) {
-  const rte_eth_dev_info info = MakeDeviceInfo(576, 9000, true, 9018);
-  const PmdCapabilities capabilities =
-      PmdCapabilities::FromDeviceInfo(info);
+  rte_eth_dev_info info = MakeDeviceInfo(576, 9000, true, 9018);
+  info.tx_queue_offload_capa = 0x20;
+  info.driver_name = "net_ice";
+  const PmdCapabilities capabilities = PmdCapabilities::FromDeviceInfo(info);
 
   EXPECT_TRUE(capabilities.rx_scatter);
   EXPECT_EQ(576u, capabilities.min_mtu);
@@ -67,52 +86,129 @@ TEST(PmdCapabilitiesTest, CopiesDeviceCapabilitiesAndRxGeometry) {
   EXPECT_EQ(kEtherOverhead, capabilities.rx_frame_overhead);
   EXPECT_EQ(info.rx_offload_capa, capabilities.rx_offload_capa);
   EXPECT_EQ(info.tx_offload_capa, capabilities.tx_offload_capa);
+  EXPECT_EQ(info.tx_queue_offload_capa, capabilities.tx_queue_offload_capa);
   EXPECT_EQ(info.dev_capa, capabilities.dev_capa);
+  EXPECT_EQ("net_ice", capabilities.driver_name);
 }
 
-TEST(PmdCapabilitiesTest, MapsDpdkTxFlagsToSemanticChecksumCapabilities) {
+TEST(PmdCapabilitiesTest,
+     SeparatesAdvertisedConfiguredAndEffectiveTxOffloads) {
   rte_eth_dev_info info = {};
   info.tx_offload_capa =
-      RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+      RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
+      RTE_ETH_TX_OFFLOAD_TCP_CKSUM | RTE_ETH_TX_OFFLOAD_OUTER_IPV4_CKSUM |
+      RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM | RTE_ETH_TX_OFFLOAD_MULTI_SEGS |
+      RTE_ETH_TX_OFFLOAD_IP_TNL_TSO | RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO;
+  const auto advertised = PmdCapabilities::FromDeviceInfo(info);
+  const auto disabled = advertised.ToTxOffloadCapabilities(0, 0);
+  EXPECT_FALSE(disabled.checksums.ipv4_header);
+  EXPECT_FALSE(disabled.checksums.udp);
+  EXPECT_FALSE(disabled.checksums.tcp);
+  EXPECT_FALSE(disabled.checksums.outer_ipv4_header);
+  EXPECT_FALSE(disabled.checksums.outer_udp);
+  EXPECT_FALSE(disabled.tunnel_encodings.generic_ip);
+  EXPECT_FALSE(disabled.tunnel_encodings.generic_udp);
+  EXPECT_FALSE(disabled.multi_segment_tx);
 
-  auto capabilities = PmdCapabilities::FromDeviceInfo(info)
-                          .ToTxChecksumCapabilities();
-  EXPECT_TRUE(capabilities.ipv4_header);
-  EXPECT_TRUE(capabilities.udp);
-  EXPECT_FALSE(capabilities.tcp);
-  EXPECT_FALSE(capabilities.outer_ipv4_header);
-  EXPECT_FALSE(capabilities.outer_udp);
-  EXPECT_FALSE(capabilities.ip_tunnel);
-  EXPECT_FALSE(capabilities.udp_tunnel);
-  EXPECT_FALSE(capabilities.multi_segment_tx);
-
-  info.tx_offload_capa =
-      RTE_ETH_TX_OFFLOAD_TCP_CKSUM |
-      RTE_ETH_TX_OFFLOAD_OUTER_IPV4_CKSUM |
-      RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM |
-      RTE_ETH_TX_OFFLOAD_IP_TNL_TSO |
-      RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO |
-      RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
-  capabilities = PmdCapabilities::FromDeviceInfo(info)
-                     .ToTxChecksumCapabilities();
-  EXPECT_FALSE(capabilities.ipv4_header);
-  EXPECT_FALSE(capabilities.udp);
-  EXPECT_TRUE(capabilities.tcp);
-  EXPECT_TRUE(capabilities.outer_ipv4_header);
-  EXPECT_TRUE(capabilities.outer_udp);
-  EXPECT_TRUE(capabilities.ip_tunnel);
-  EXPECT_TRUE(capabilities.udp_tunnel);
-  EXPECT_TRUE(capabilities.multi_segment_tx);
+  const uint64_t configured =
+      RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
+      RTE_ETH_TX_OFFLOAD_IP_TNL_TSO;
+  const auto effective =
+      advertised.ToTxOffloadCapabilities(configured, 0);
+  EXPECT_TRUE(effective.checksums.ipv4_header);
+  EXPECT_TRUE(effective.checksums.udp);
+  EXPECT_FALSE(effective.checksums.tcp);
+  EXPECT_FALSE(effective.checksums.outer_ipv4_header);
+  EXPECT_FALSE(effective.checksums.outer_udp);
+  EXPECT_TRUE(effective.tunnel_encodings.generic_ip);
+  EXPECT_FALSE(effective.tunnel_encodings.generic_udp);
+  EXPECT_FALSE(effective.multi_segment_tx);
 }
 
-TEST(PmdCapabilitiesTest, ConfiguresOnlySupportedChecksumOffloads) {
+TEST(PmdCapabilitiesTest, UsesConfiguredQueueDefaultsOnlyForAdvertisedQueueBits) {
+  rte_eth_dev_info info = {};
+  info.tx_offload_capa = RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
+                         RTE_ETH_TX_OFFLOAD_TCP_CKSUM |
+                         RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM;
+  info.tx_queue_offload_capa = RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
+                               RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM;
+  const auto capabilities = PmdCapabilities::FromDeviceInfo(info);
+  EXPECT_EQ(RTE_ETH_TX_OFFLOAD_TCP_CKSUM,
+            capabilities.ConfiguredTxOffloads());
+
+  const auto effective = capabilities.ToTxOffloadCapabilities(
+      0,
+      RTE_ETH_TX_OFFLOAD_UDP_CKSUM | RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM);
+  EXPECT_FALSE(effective.checksums.tcp);
+  EXPECT_TRUE(effective.checksums.udp);
+  EXPECT_TRUE(effective.checksums.outer_udp);
+}
+TEST(PMDPortCapabilitiesTest,
+     PortUsesCommonCapabilitiesAndQueueOutUsesExactQueue) {
+  PMDPort port;
+  PMDPortTestAccess::ConfigureDifferentQueueCapabilities(port);
+
+  const auto queue_zero = port.GetTxOffloadCapabilities(0);
+  const auto queue_one = port.GetTxOffloadCapabilities(1);
+  const auto common = port.GetTxOffloadCapabilities();
+  EXPECT_TRUE(queue_zero.checksums.tcp);
+  EXPECT_TRUE(queue_zero.checksums.udp);
+  EXPECT_FALSE(queue_zero.checksums.outer_udp);
+  EXPECT_TRUE(queue_one.checksums.tcp);
+  EXPECT_FALSE(queue_one.checksums.udp);
+  EXPECT_TRUE(queue_one.checksums.outer_udp);
+  EXPECT_TRUE(common.checksums.tcp);
+  EXPECT_FALSE(common.checksums.udp);
+  EXPECT_FALSE(common.checksums.outer_udp);
+  EXPECT_FALSE(port.GetTxOffloadCapabilities(2).checksums.tcp);
+}
+
+
+TEST(PmdCapabilitiesTest, MapsGtpOnlyForSourceVerifiedIntelDrivers) {
+  rte_eth_dev_info info = {};
+  info.tx_offload_capa = RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
+  for (const char *driver : {"net_ice", "net_i40e", "net_iavf"}) {
+    info.driver_name = driver;
+    const auto effective =
+        PmdCapabilities::FromDeviceInfo(info).ToTxOffloadCapabilities(
+            RTE_ETH_TX_OFFLOAD_TCP_CKSUM, 0);
+    EXPECT_TRUE(effective.tunnel_encodings.gtp);
+    EXPECT_TRUE(effective.checksums.tcp);
+  }
+  info.driver_name = "net_unknown";
+  const auto unknown =
+      PmdCapabilities::FromDeviceInfo(info).ToTxOffloadCapabilities(
+          RTE_ETH_TX_OFFLOAD_TCP_CKSUM, 0);
+  EXPECT_FALSE(unknown.tunnel_encodings.gtp);
+}
+
+TEST(PmdCapabilitiesTest,
+     UsesAdvertisedI40eOuterUdpBitOnlyForSupportedDeviceVariant) {
+  rte_eth_dev_info info = {};
+  info.driver_name = "net_i40e";
+  info.tx_offload_capa = RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM;
+  auto effective =
+      PmdCapabilities::FromDeviceInfo(info).ToTxOffloadCapabilities(
+          RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM, 0);
+  EXPECT_TRUE(effective.checksums.outer_udp);
+
+  info.tx_offload_capa = 0;
+  effective = PmdCapabilities::FromDeviceInfo(info).ToTxOffloadCapabilities(
+      RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM, 0);
+  EXPECT_FALSE(effective.checksums.outer_udp);
+}
+
+TEST(PmdCapabilitiesTest, ConfiguresOnlySupportedChecksumAndGenericTunnelFlags) {
   rte_eth_dev_info info = {};
   info.tx_offload_capa =
       RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM |
-      RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO | RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+      RTE_ETH_TX_OFFLOAD_IP_TNL_TSO | RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO |
+      RTE_ETH_TX_OFFLOAD_TCP_TSO | RTE_ETH_TX_OFFLOAD_VXLAN_TNL_TSO |
+      RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
   const auto capabilities = PmdCapabilities::FromDeviceInfo(info);
   EXPECT_EQ(RTE_ETH_TX_OFFLOAD_IPV4_CKSUM |
                 RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM |
+                RTE_ETH_TX_OFFLOAD_IP_TNL_TSO |
                 RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO,
             capabilities.ConfiguredTxOffloads());
 }

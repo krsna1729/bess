@@ -228,10 +228,15 @@ class Port {
   virtual int RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) = 0;
   virtual int SendPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) = 0;
 
-  // Reports packet checksum operations supported by this port's hardware.
-  virtual bess::packet::TxChecksumCapabilities GetTxChecksumCapabilities()
+  // No-argument queries return capabilities common to all TX queues. A
+  // queue-specific query returns that queue's effective capabilities.
+  virtual bess::packet::TxOffloadCapabilities GetTxOffloadCapabilities()
       const {
     return {};
+  }
+  virtual bess::packet::TxOffloadCapabilities GetTxOffloadCapabilities(
+      queue_t) const {
+    return GetTxOffloadCapabilities();
   }
 
   // For custom incoming / outgoing queue sizes (optional).
