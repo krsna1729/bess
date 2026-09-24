@@ -64,6 +64,11 @@ if [[ "$mode" == runtime ]]; then
     echo "Python requirements file not found: $requirements_file" >&2
     exit 1
   fi
+
+  # Ubuntu may ship an older dpkg-managed version than grpcio requires.
+  # Install the compatible wheel without trying to uninstall that package.
+  python3 -m pip install --break-system-packages --disable-pip-version-check \
+    --no-cache-dir --ignore-installed --no-deps 'typing-extensions~=4.12'
   python3 -m pip install --break-system-packages --disable-pip-version-check \
     --no-cache-dir -r "$requirements_file"
 fi
