@@ -137,7 +137,9 @@ static inline typename bess::ResumeHook::init_func_t
 InitResumeHookWithGenericArg(CommandResponse (H::*fn)(const A &)) {
   return [fn](bess::ResumeHook *h, const google::protobuf::Any &arg) {
     A arg_;
-    arg.UnpackTo(&arg_);
+    if (!arg.UnpackTo(&arg_)) {
+      return CommandFailure(EINVAL, "invalid protobuf argument");
+    }
     auto base_fn = std::mem_fn(fn);
     return base_fn(static_cast<H *>(h), arg_);
   };

@@ -334,8 +334,6 @@ CommandResponse FlowGen::CommandUpdate(const bess::pb::FlowGenArg &arg) {
 
 CommandResponse FlowGen::CommandSetBurst(
     const bess::pb::FlowGenCommandSetBurstArg &arg) {
-  CommandResponse response;
-
   if (arg.burst() <= bess::PacketBatch::kMaxBurst) {
     burst_ = arg.burst();
   } else {

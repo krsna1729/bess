@@ -84,7 +84,9 @@ static inline module_cmd_func_t MODULE_CMD_FUNC(
     CommandResponse (M::*fn)(const T &)) {
   return [fn](Module *m, const google::protobuf::Any &arg) {
     T arg_;
-    arg.UnpackTo(&arg_);
+    if (!arg.UnpackTo(&arg_)) {
+      return CommandFailure(EINVAL, "invalid protobuf argument");
+    }
     auto base_fn = std::mem_fn(fn);
     return base_fn(static_cast<M *>(m), arg_);
   };
@@ -95,7 +97,9 @@ static inline module_init_func_t MODULE_INIT_FUNC(
     CommandResponse (M::*fn)(const T &)) {
   return [fn](Module *m, const google::protobuf::Any &arg) {
     T arg_;
-    arg.UnpackTo(&arg_);
+    if (!arg.UnpackTo(&arg_)) {
+      return CommandFailure(EINVAL, "invalid protobuf argument");
+    }
     auto base_fn = std::mem_fn(fn);
     return base_fn(static_cast<M *>(m), arg_);
   };

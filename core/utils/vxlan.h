@@ -30,6 +30,8 @@
 #ifndef BESS_UTILS_VXLAN_H_
 #define BESS_UTILS_VXLAN_H_
 
+#include <type_traits>
+
 namespace bess {
 namespace utils {
 
@@ -44,7 +46,9 @@ struct[[gnu::packed]] Vxlan {
   be32_t vx_vni;
 };
 
-static_assert(std::is_pod<Vxlan>::value, "not a POD type");
+static_assert(std::is_standard_layout<Vxlan>::value &&
+                  std::is_trivial<Vxlan>::value,
+              "Vxlan must be standard-layout and trivial");
 static_assert(sizeof(Vxlan) == 8, "struct Vxlan is incorrect");
 
 }  // namespace utils

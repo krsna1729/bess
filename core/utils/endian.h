@@ -173,9 +173,15 @@ using be64_t = BigEndian<uint64_t>;
 
 // POD means trivial (no special constructor/destructor) and
 // standard layout (i.e., binary compatible with C struct)
-static_assert(std::is_pod<be16_t>::value, "not a POD type");
-static_assert(std::is_pod<be32_t>::value, "not a POD type");
-static_assert(std::is_pod<be64_t>::value, "not a POD type");
+static_assert(std::is_standard_layout<be16_t>::value &&
+                  std::is_trivial<be16_t>::value,
+              "be16_t must be standard-layout and trivial");
+static_assert(std::is_standard_layout<be32_t>::value &&
+                  std::is_trivial<be32_t>::value,
+              "be32_t must be standard-layout and trivial");
+static_assert(std::is_standard_layout<be64_t>::value &&
+                  std::is_trivial<be64_t>::value,
+              "be64_t must be standard-layout and trivial");
 
 static_assert(sizeof(be16_t) == 2, "be16_t is not 2 bytes");
 static_assert(sizeof(be32_t) == 4, "be32_t is not 4 bytes");

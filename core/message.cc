@@ -57,7 +57,9 @@ CommandResponse CommandSuccess() {
 
 CommandResponse CommandSuccess(const google::protobuf::Message &return_data) {
   CommandResponse ret;
-  ret.mutable_data()->PackFrom(return_data);
+  if (!ret.mutable_data()->PackFrom(return_data)) {
+    return CommandFailure(EINVAL, "failed to pack command response");
+  }
   return ret;
 }
 

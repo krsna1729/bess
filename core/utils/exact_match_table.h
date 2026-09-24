@@ -139,8 +139,9 @@ struct ExactMatchField {
   int size;  // in bytes. 1 <= size <= MAX_FIELD_SIZE
 };
 
-static_assert(std::is_pod<ExactMatchField>::value,
-              "ExactMatchField is not a POD type");
+static_assert(std::is_standard_layout<ExactMatchField>::value &&
+                  std::is_trivial<ExactMatchField>::value,
+              "ExactMatchField must be standard-layout and trivial");
 
 // ExactMatchRuleFields specifies the values for each of the fields defined in
 // an ExactMatchTable for a rule.  For example, if your ExactMatchTable was

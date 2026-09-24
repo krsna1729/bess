@@ -86,7 +86,9 @@ class PacketBatch {
   PacketHandle pkts_[kMaxBurst];
 };
 
-static_assert(std::is_pod<PacketBatch>::value, "PacketBatch is not a POD Type");
+static_assert(std::is_standard_layout<PacketBatch>::value &&
+                  std::is_trivial<PacketBatch>::value,
+              "PacketBatch must be standard-layout and trivial");
 
 }  // namespace bess
 

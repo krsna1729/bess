@@ -49,7 +49,6 @@ const Commands Source::cmds = {
 };
 
 CommandResponse Source::Init(const bess::pb::SourceArg &arg) {
-  CommandResponse err;
 
   task_id_t tid = RegisterTask(nullptr);
   if (tid == INVALID_TASK_ID)

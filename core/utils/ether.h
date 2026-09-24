@@ -119,10 +119,16 @@ struct [[gnu::packed]] Vlan {
   be16_t ether_type;
 };
 
-static_assert(std::is_pod<Ethernet>::value, "not a POD type");
-static_assert(std::is_pod<Ethernet::Address>::value, "not a POD type");
+static_assert(std::is_standard_layout<Ethernet>::value &&
+                  std::is_trivial<Ethernet>::value,
+              "Ethernet must be standard-layout and trivial");
+static_assert(std::is_standard_layout<Ethernet::Address>::value &&
+                  std::is_trivial<Ethernet::Address>::value,
+              "Ethernet::Address must be standard-layout and trivial");
 static_assert(sizeof(Ethernet) == 14, "struct Ethernet is incorrect");
-static_assert(std::is_pod<Vlan>::value, "not a POD type");
+static_assert(std::is_standard_layout<Vlan>::value &&
+                  std::is_trivial<Vlan>::value,
+              "Vlan must be standard-layout and trivial");
 static_assert(sizeof(Vlan) == 4, "struct Vlan is incorrectly sized");
 
 }  // namespace utils

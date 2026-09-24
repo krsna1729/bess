@@ -35,7 +35,6 @@ const Commands Replicate::cmds = {
 };
 
 CommandResponse Replicate::Init(const bess::pb::ReplicateArg &arg) {
-  CommandResponse err;
 
   if (arg.gates_size() > kMaxGates) {
     return CommandFailure(EINVAL, "no more than %d gates", kMaxGates);

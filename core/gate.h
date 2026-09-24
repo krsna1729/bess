@@ -132,9 +132,9 @@ class GateHook {
   DISALLOW_COPY_AND_ASSIGN(GateHook);
 };
 
-struct CompareGatehookName : public std::unary_function<GateHook, GateHook> {
+struct CompareGatehookName {
   explicit CompareGatehookName(const std::string &name) : name_(name) {}
-  bool operator()(const GateHook *gatehook) {
+  bool operator()(const GateHook *gatehook) const {
     return name_ == gatehook->name();
   }
   std::string name_;
@@ -306,7 +306,9 @@ static inline gate_hook_cmd_func_t GATE_HOOK_CMD_FUNC(
     CommandResponse (H::*fn)(const T &)) {
   return [fn](bess::GateHook *h, const google::protobuf::Any &arg) {
     T arg_;
-    arg.UnpackTo(&arg_);
+    if (!arg.UnpackTo(&arg_)) {
+      return CommandFailure(EINVAL, "invalid protobuf argument");
+    }
     auto base_fn = std::mem_fn(fn);
     return base_fn(static_cast<H *>(h), arg_);
   };
@@ -318,7 +320,9 @@ static inline bess::GateHook::init_func_t InitGateHookWithGenericArg(
   return [fn](bess::GateHook *h, const bess::Gate *g,
               const google::protobuf::Any &arg) {
     A arg_;
-    arg.UnpackTo(&arg_);
+    if (!arg.UnpackTo(&arg_)) {
+      return CommandFailure(EINVAL, "invalid protobuf argument");
+    }
     auto base_fn = std::mem_fn(fn);
     return base_fn(static_cast<H *>(h), g, arg_);
   };

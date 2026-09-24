@@ -245,7 +245,7 @@ void OGate::AddTrackHook() {
     // A new Track() instance takes an argument that has a "bits" flag.
     static bess::pb::TrackArg track_arg;
     track_arg.set_bits(false);
-    arg.PackFrom(track_arg);
+    CHECK(arg.PackFrom(track_arg));
   }
   pb_error_t error;
   this->CreateGateHook(track_builder, this, "", arg, &error);

@@ -44,7 +44,6 @@ CommandResponse PortInc::Init(const bess::pb::PortIncArg &arg) {
   const char *port_name;
   queue_t num_inc_q;
   int ret;
-  CommandResponse err;
   placement_constraint placement;
 
   burst_ = bess::PacketBatch::kMaxBurst;

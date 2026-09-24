@@ -38,7 +38,6 @@ const Commands RoundRobin::cmds = {
 };
 
 CommandResponse RoundRobin::Init(const bess::pb::RoundRobinArg &arg) {
-  CommandResponse err;
 
   if (arg.gates_size() > MAX_RR_GATES) {
     return CommandFailure(EINVAL, "no more than %d gates", MAX_RR_GATES);

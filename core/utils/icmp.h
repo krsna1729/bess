@@ -28,6 +28,9 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #ifndef BESS_UTILS_ICMP_H_
+#define BESS_UTILS_ICMP_H_
+
+#include <type_traits>
 
 namespace bess {
 namespace utils {
@@ -41,7 +44,9 @@ struct[[gnu::packed]] Icmp {
   be16_t seq_num;     // ICMP packet sequence number
 };
 
-static_assert(std::is_pod<Icmp>::value, "not a POD type");
+static_assert(std::is_standard_layout<Icmp>::value &&
+                  std::is_trivial<Icmp>::value,
+              "Icmp must be standard-layout and trivial");
 static_assert(sizeof(Icmp) == 8, "struct Icmp is incorrect");
 
 }  // namespace utils

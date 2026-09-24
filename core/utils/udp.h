@@ -30,6 +30,8 @@
 #ifndef BESS_UTILS_UDP_H_
 #define BESS_UTILS_UDP_H_
 
+#include <type_traits>
+
 namespace bess {
 namespace utils {
 
@@ -41,7 +43,9 @@ struct[[gnu::packed]] Udp {
   uint16_t checksum;  // Checksum.
 };
 
-static_assert(std::is_pod<Udp>::value, "not a POD type");
+static_assert(std::is_standard_layout<Udp>::value &&
+                  std::is_trivial<Udp>::value,
+              "Udp must be standard-layout and trivial");
 static_assert(sizeof(Udp) == 8, "struct Udp is incorrect");
 
 }  // namespace utils

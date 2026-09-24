@@ -42,7 +42,6 @@ const Commands QueueInc::cmds = {{"set_burst", "QueueIncCommandSetBurstArg",
 CommandResponse QueueInc::Init(const bess::pb::QueueIncArg &arg) {
   const char *port_name;
   task_id_t tid;
-  CommandResponse err;
   burst_ = bess::PacketBatch::kMaxBurst;
   if (!arg.port().length()) {
     return CommandFailure(EINVAL, "Field 'port' must be specified");

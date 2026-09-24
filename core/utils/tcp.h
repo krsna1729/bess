@@ -30,6 +30,8 @@
 #ifndef BESS_UTILS_TCP_H_
 #define BESS_UTILS_TCP_H_
 
+#include <type_traits>
+
 namespace bess {
 namespace utils {
 
@@ -63,7 +65,9 @@ struct[[gnu::packed]] Tcp {
   be16_t urgent_ptr;  // Urgent pointer.
 };
 
-static_assert(std::is_pod<Tcp>::value, "not a POD type");
+static_assert(std::is_standard_layout<Tcp>::value &&
+                  std::is_trivial<Tcp>::value,
+              "Tcp must be standard-layout and trivial");
 static_assert(sizeof(Tcp) == 20, "struct Tcp is incorrect");
 
 }  // namespace utils

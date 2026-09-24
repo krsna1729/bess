@@ -30,6 +30,8 @@
 #ifndef BESS_UTILS_IP_H_
 #define BESS_UTILS_IP_H_
 
+#include <type_traits>
+
 #include <string>
 
 #include "endian.h"
@@ -86,7 +88,9 @@ struct[[gnu::packed]] Ipv4 {
   be32_t dst;               // Destination address.
 };
 
-static_assert(std::is_pod<Ipv4>::value, "not a POD type");
+static_assert(std::is_standard_layout<Ipv4>::value &&
+                  std::is_trivial<Ipv4>::value,
+              "Ipv4 must be standard-layout and trivial");
 static_assert(sizeof(Ipv4) == 20, "struct Ipv4 is incorrect");
 
 struct Ipv4Prefix {
