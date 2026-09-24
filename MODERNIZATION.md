@@ -143,6 +143,33 @@ separately.
 
 ## Status snapshot
 
+### Roadmap phase audit (2026-09-24)
+
+| Workstream | Status | Boundary / next step |
+|---|---|---|
+| A — DPDK/build | Complete | Version/API migration and dependency pinning are closed. |
+| B — packet/mbuf | Software complete | Hardware-only validation remains in C-HW. |
+| C — Linux I/O | Software complete | Physical-NIC validation/acceleration remains in C-HW. |
+| C-HW — hardware | Deferred | Separate NIC/lab program; does not block software work. |
+| D — portability/ARM | Not started | D1–D4 remain, including the D3 `rte_bpf` evaluation. |
+| E — Meson | Complete | Meson is the BESS build/test/install graph. |
+| F — operations | Partial | Packaging, releases, SBOM, observability, and tooling lanes remain. |
+| G0 — transactional core | Complete | Internal C++ desired-state/transaction engine is landed. |
+| G1 — public API/SDKs | Not started | Design after K5–K7 establish real resource semantics. |
+| H / I — language and type safety | Partial | Continue incrementally with later work. |
+| J — live table updates | Complete, subsumed | Pilot succeeded; current lifetime mechanism is K1 `RcuDomain`/`RcuPtr`. |
+| K — dataplane substrate | K1–K4 complete | K5 is next; K6–K7 follow; K8 is consumer-driven. |
+
+Current software sequence: **K5 → K6 → K7 → G1 → D → F**, with H/I
+hardening alongside those stages. K8 is lower priority and should start when a
+consumer requires fragmentation/reassembly. C-HW stays a separate, non-blocking
+hardware gate.
+
+**Historical G0 closure evidence:** The counts in the following paragraph record
+G0's original verification checkpoint, not the current full-suite count. Current
+roadmap status and the later GCC/Clang suite checkpoint are summarized here and
+in the current handoff below.
+
 Phase E is closed, and **Phase G0 is complete** (seven commits, entries 41-49):
 the control plane is a real C++ subsystem -- `RuntimeState` owns every mutable
 instance, `PipelineSpec`/`PipelineSnapshot` describe desired and active state,
@@ -152,9 +179,9 @@ counter, optimistic concurrency and engine-decided quiescence. Verified on GCC
 and Clang: 41 native test binaries, 22/22 module integration files against a
 foreground daemon, and the wire-parity script.
 
-The modern-glog daemon-mode recursion is fixed (§8, entry 54), **K1 is
-complete** (entries 55-57), and **K2, K2.6, K3.1, K3.2, and K3.3 are
-complete** (entries 58-64):
+**Earlier K1–K3.3 completion checkpoint (entries 54–64; later K3 and K4 work
+follows below):** The modern-glog daemon-mode recursion was fixed, **K1
+completed** (entries 55-57), and **K2, K2.6, K3.1, K3.2, and K3.3 completed**:
 `RuntimeState` owns one dataplane `RcuDomain`, workers register/online/offline/
 unregister around the pause boundary, the scheduler reports quiescence at a safe
 task boundary, and `RcuPtr<T>` publishes and retires immutable state with an
@@ -205,8 +232,10 @@ prefix/suffix removal and completes K4 packet topology/ownership mechanics.
 K4.4a/b software checksum semantics and TX finalization are complete. PMD
 reconfiguration now prevalidates rejectable MTU/scatter changes before stopping,
 updates administrative state on both up and down transitions, and restores the
-previous RX configuration and admin state after a post-stop failure. K4.5
-records a benchmark-only comparison of runtime-generic and compile-time-
+previous RX configuration and admin state after a post-stop failure. If rollback
+itself fails, PMD state is marked degraded and further updates are rejected
+until reinitialization rather than claiming the old hardware state was restored.
+K4.5 records a benchmark-only comparison of runtime-generic and compile-time-
 specialized batch bodies; no production executor, loop migration, or prefetch
 policy is adopted. Its lookup study separates the fixed-batch hot-loop floor
 from a pre-generated working-set run: tables are populated to 50% load, lookup
@@ -3413,40 +3442,29 @@ Add a regression test or process-level smoke that launches actual daemon mode un
 
 ## Order of work
 
-The active order is deliberately **not** phase-number order (consolidated roadmap
-§1 and §26):
+The roadmap letters are workstream labels, not an execution sequence. The
+foundations below are complete; the remaining plan starts at K5:
 
 ```text
-fix modern-glog daemon mode            DONE (§8, entry 54)
-  |
-  v
-G0   C++ transactional control-plane core   DONE (§9, entries 41-53)
-  |
-  v
-K1   generic RCU/QSBR publication and reclamation   DONE (entries 55-57)
-K2   ActionId + immutable action/object tables
-K3   unified runtime-schema classifier framework
-K4   packet parsing/mutation primitives
-K5   generic software metering
-K6   worker-local statistics/snapshots
-K7   route and next-hop abstraction
-K8   generic fragmentation/reassembly                     §10
-  |
-  v
-G1   desired-state API + Go/C++ SDKs + C++ bessctl        §14
-  |
-  v
-D    ARM64 / runtime SIMD / rte_bpf                       §16
-  |
-  v
-F    release, packaging, observability, CI                §17
-  |
-  v
-H/I  language / tooling / type-safety hardening           §18, §19
+COMPLETE
+A / B / C-software / E
+J live-update pilot (subsumed by K1)
+G0 transactional control core
+K1 RCU/QSBR -> K2 object/action tables -> K3 classifiers -> K4 packet primitives
+
+NEXT
+K5 generic metering -> K6 worker-local stats -> K7 routes/next hops -> G1 -> D -> F
+
+K8 fragmentation/reassembly: start when a consumer requires it.
+H/I hardening: proceed incrementally alongside the sequence.
+C-HW: separate hardware/lab program; it does not block software work.
 ```
 
-Hardware-gated work is parked under **Phase C-HW** (§5) and must not block this
-sequence.
+K was added later as a home for reusable dataplane resources that did not fit
+cleanly under A–I. J was a successful live-table pilot; K1 generalized its
+lifetime mechanism. Phase D, F, H, and I are deferred or partial by plan, not
+silently skipped. See the phase audit at the top of this document for their
+current status.
 
 ### Naming map: older roadmap text -> current sections
 
@@ -4234,6 +4252,13 @@ See the Phase E summary and CI evidence at the top of this document.
 
 ### Phase J — Live table updates without stopping the world (done 2026-09-19: entries 35-38)
 
+**Current status:** J's live-update pilot is complete and subsumed by K1. The
+`std::atomic<std::shared_ptr>` / `PublishedGeneration` implementation and
+backend recommendation described below are historical pilot material, not the
+current mechanism. `IPLookup` and `ExactMatch` now use K1's
+`bess::rcu::RcuPtr<Generation>` backed by the runtime `RcuDomain`; no parallel
+J RCU subsystem remains.
+
 Cross-cutting phase, not a natural fit under A–I: touches the control
 plane (Phase G), the module command API, and the scheduler loop. Emerged
 from an Opus review of an external DPDK-modernization proposal (see the
@@ -4283,7 +4308,7 @@ dependency, reader cost is one `rte_rcu_qsbr_quiescent()` store per
 pointers (not production-ready anywhere yet, per Phase H -- the eventual
 target, not a near-term option).
 
-**Recommendation: prototype the first backend as
+**Historical recommendation (superseded by K1): prototype the first backend as
 `std::atomic<std::shared_ptr<T>>`, not the hand-rolled epoch scheme and
 not `rte_rcu_qsbr` yet.** Two reasons, both concrete rather than
 theoretical: (1) this session already found a real, hard-to-reproduce
@@ -4319,15 +4344,15 @@ pointer, its three mutating commands are all `THREAD_UNSAFE`, the
 rebuild-and-swap cost is bounded, and `rte_fib` (Phase D, above) has
 native RCU support if the table migrates there anyway. `ExactMatch` is the
 natural second. Only after two modules work should this generalize into a
-`Module`-level contract. *(Status: complete. `IPLookup` (entry 35) and
-`ExactMatch` (entry 36, plus the review-follow-up fixes `a0688fcf`) publish
-generations instead of mutating live tables; the snapshot, publication and
-writer-side reclamation mechanism they share lives in
-`bess::utils::PublishedGeneration` (entry 37); and the capability is reachable
-through the normal CLI, which now pauses only for commands the daemon reports
-as not thread-safe (entry 38). Deliberately out of scope, unchanged: QSBR/RCU
-machinery, the `ModuleGraph`/traffic-class tree, and removing the
-user-supplied `ARG_TYPE` from `command module`.)* Explicitly **not** in scope for the first pass:
+`Module`-level contract. *(Status: complete as a pilot. `IPLookup` (entry 35)
+and `ExactMatch` (entry 36, plus review-follow-up fixes `a0688fcf`) publish
+generations instead of mutating live tables. The pilot's
+`bess::utils::PublishedGeneration` (entry 37) was later superseded by K1:
+current code uses `bess::rcu::RcuPtr` backed by the runtime `RcuDomain`. The
+capability is reachable through the normal CLI, which pauses only for commands
+the daemon reports as not thread-safe (entry 38). Deliberately out of scope:
+RCU-swapping the `ModuleGraph`/traffic-class tree or removing the user-supplied
+`ARG_TYPE` from `command module`.)* Explicitly **not** in scope for the first pass:
 RCU-swapping the `ModuleGraph`, gate adjacency, or the traffic-class tree
 -- those are Phase G/H territory (live reconfiguration), not this phase's
 narrower table-update goal.
@@ -4393,15 +4418,16 @@ What G0 deliberately did **not** do, and where it lands instead:
 - **transactional replacement** (port reconfiguration, module rebuild,
   traffic-class policy change) is refused with `kUnsupportedTransaction` rather
   than attempted -- correct refusal beats false atomicity;
-- **RCU/QSBR** is K1's job: `RuntimeState` is unique and quiesced during
-  mutation, and `IPLookup`/`ExactMatch` keep their existing immutable-generation
-  mechanism untouched;
+- **RCU/QSBR** was left to K1: at G0's landing, structural transactions kept
+  `RuntimeState` unique and quiesced during mutation. K1 is now complete and
+  migrated the J pilot tables to `RcuPtr`/`RcuDomain`; the whole `ModuleGraph`
+  remains outside RCU.
 - **the public desired-state API** is G1's job: `ApplyPipeline()` is C++-internal,
   and the RPC surface still exposes the legacy imperative calls (now thin
   adapters over one-operation transactions).
 
-This was the next major architecture surgery, and the first item in the active
-order of work.
+This was the next major architecture surgery when the plan was written; G0 is
+now complete. See the current order of work above for the active sequence.
 
 The goal is **not** "make every client C++".
 
@@ -4945,11 +4971,13 @@ physical device that cannot be opened twice), **reject the transactional plan**
 rather than attempting it and hoping rollback works. Correct refusal is better
 than false atomicity; §9.9 records which operations stay non-transactional.
 
-**K1 seam, not K1.** G0 leaves a clean seam for RCU but implements no half-baked
-RCU: structural transactions may pause workers, `RuntimeState` stays unique and
-quiesced during mutation, and no attempt is made to RCU-swap the whole
-`ModuleGraph`, `WorkerManager` or scheduler tree. `IPLookup` and `ExactMatch`
-keep their existing immutable `PublishedGeneration` mechanism unchanged.
+**K1 seam, not K1.** G0 leaves a clean seam for RCU but implemented no
+half-baked RCU: structural transactions may pause workers, `RuntimeState`
+stays unique and quiesced during mutation, and no attempt is made to RCU-swap
+the whole `ModuleGraph`, `WorkerManager` or scheduler tree. At G0's landing,
+`IPLookup` and `ExactMatch` still used the immutable `PublishedGeneration`
+pilot; K1 later generalized that mechanism, and current code uses
+`bess::rcu::RcuPtr` backed by `RcuDomain`.
 
 ### 9.8 Generations, optimistic concurrency, and the transaction contract
 
@@ -5131,7 +5159,7 @@ CI stays green on both compiler lanes.
 G0 establishes the internal transaction architecture. It does **not** include:
 
 ```text
-glog daemon recursion fix            (separate small fix, §8 / Milestone 1)
+glog daemon recursion fix            (separate fix; already complete)
 K1 RCU/QSBR implementation
 ActionId, new classifier, meters, routing abstraction
 Go SDK, C++ bessctl, final v2 public protobuf API
@@ -5140,16 +5168,16 @@ real NIC work, AF_XDP changes
 MBUF_FAST_FREE, PortOut lock elimination, DPDK version upgrade, ARM/SIMD
 ```
 
-Do not design the final G1 transactional protobuf API here (minor additions
-strictly needed to keep tests/introspection working are fine; no classifier,
-action, meter, route or SDK-facing messages — K does not exist yet). Do not write
-the Go SDK, and do not add transaction logic to `pybess` or `bessctl` Python:
-the existing Python tools must get correctness from routing through the C++
-control plane, not from new Python-side rollback.
+The boundary below reflects G0's original scope: when G0 was implemented, K did
+not yet exist. K1–K4 are now complete and K5–K7 remain ahead; keep public API
+work in G1 until those resource semantics are established. Do not build a Go
+SDK yet or add transaction logic to `pybess`/Python `bessctl`: the existing
+Python tools should get correctness by routing through the C++ control plane,
+not by growing a second rollback implementation.
 
-Design the engine so future Phase K resources can register transactional
-operations (a `PreparedResource`-style `Commit()`/`Abort()` seam is a useful
-direction, but do not over-generalize before concrete K resources exist).
+Design the engine so future K5+ resources can register transactional operations
+(a `PreparedResource`-style `Commit()`/`Abort()` seam is a useful direction, but
+do not over-generalize before concrete resource requirements exist).
 
 Ideal end state:
 
@@ -5218,7 +5246,11 @@ OMEC should compile these semantics into generic BESS dataplane resources.
 
 ---
 
-### K1 — generic RCU/QSBR lifetime and publication
+### K1 — generic RCU/QSBR lifetime and publication — COMPLETE
+
+**Status:** complete. This section records the original design; production
+publication/reclamation now uses `RcuDomain`/`RcuPtr`, including `RuntimeState`
+and the live-table modules.
 
 Phase J proved immutable generation swapping in selected modules, but it intentionally did not add general read-side reclamation.
 
@@ -5259,7 +5291,10 @@ DPDK QSBR is an obvious candidate implementation, but callers should depend on a
 
 ---
 
-### K2 — ActionId and immutable object/action tables
+### K2 — ActionId and immutable object/action tables — COMPLETE
+
+**Status:** complete, including the K2.6 follow-ups. The requirements below are
+the original design record, not pending work.
 
 Introduce a generic stable dataplane object reference:
 
@@ -5306,7 +5341,10 @@ For OMEC, `PdrAction`, `FarAction`, etc. remain OMEC-defined types layered on th
 
 ---
 
-### K3 — unified runtime-schema classifier framework
+### K3 — unified runtime-schema classifier framework — COMPLETE
+
+**Status:** complete through K3.7.1. The requirements below are the original
+design and acceptance record, not pending work.
 
 This is one of the highest-value missing generic BESS facilities.
 
@@ -5403,7 +5441,11 @@ A gate may be part of an action, but classification and graph topology should no
 
 ---
 
-### K4 — packet parsing and mutation primitives
+### K4 — packet parsing and mutation primitives — COMPLETE
+
+**Status:** complete through K4.5 for software behavior; physical-NIC/offload
+interoperability remains in C-HW. The requirements below are the original
+design record, not pending work.
 
 Stage 2 established correct packet storage/ownership. The next layer is ergonomic and safe packet manipulation.
 
@@ -6216,9 +6258,11 @@ original extraction/body JSON outputs remain historical K4.5a evidence.
 
 ---
 
-### K5 — generic software metering
+### K5 — generic software metering — NEXT (not started)
 
-Add a generic meter abstraction with a software backend built on DPDK metering primitives.
+**Status: not started; this is the next software phase.** Build the generic
+meter resource and lifecycle layer on DPDK's `rte_meter` software algorithms.
+The hardware meter backend remains a separate C-HW decision.
 
 Conceptually:
 
@@ -6245,12 +6289,13 @@ HardwareMeterBackend
 
 The hardware backend is C-HW gated.
 
-BESS owns:
+BESS owns the generic resource contract and integration:
 
-- token-bucket/trTCM mechanics;
-- state placement/lifetime;
-- batch-friendly execution;
-- worker-safe ownership model.
+- profile/state/handle/color types and validation;
+- stable IDs, generation-safe publication, and state placement/lifetime;
+- worker-safe ownership and batch-friendly invocation.
+
+DPDK `rte_meter` owns the srTCM/trTCM token-bucket algorithm mechanics.
 
 OMEC owns:
 
@@ -6261,7 +6306,7 @@ OMEC owns:
 
 ---
 
-### K6 — worker-local statistics and snapshots
+### K6 — worker-local statistics and snapshots — PENDING
 
 Build the data mechanism before building more exporters.
 
@@ -6300,7 +6345,7 @@ For OMEC, subscriber/PDR/URR identities remain application-level semantics.
 
 ---
 
-### K7 — route and next-hop abstraction
+### K7 — route and next-hop abstraction — PENDING
 
 Introduce a generic routing layer:
 
@@ -6336,7 +6381,7 @@ RouteTable API
 
 ---
 
-### K8 — generic IPv4 fragmentation/reassembly
+### K8 — generic IPv4 fragmentation/reassembly — PENDING (consumer-driven)
 
 Add generic packet mechanisms around DPDK fragmentation/reassembly facilities.
 
@@ -6356,9 +6401,10 @@ Lower priority than K1–K3 and K5/K6.
 ---
 
 
-## 14. Phase G1 — desired-state API and thin language SDKs
+## 14. Phase G1 — desired-state API and thin language SDKs — NOT STARTED
 
-After G0 and enough K resources exist to design against real semantics, expose the new public API.
+After G0 and enough K resources exist to design against real semantics, expose
+the new public API. Start G1 after K5–K7 establish the resource contracts.
 
 The old imperative API should not constrain the ideal end state.
 
@@ -6485,9 +6531,11 @@ Do not fold the CLI into the privileged daemon merely because both are C++.
 ---
 
 
-## 16. Phase D — ARM64 + portable architecture
+## 16. Phase D — ARM64 + portable architecture — NOT STARTED
 
-Phase D remains important but no longer blocks G0/K.
+Phase D remains important but no longer blocks completed G0/K1–K4 or the next
+K stages. D1–D4 are not started; real ARM performance remains a separate
+hardware gate.
 
 ### D1 — architecture layer
 
@@ -6524,9 +6572,11 @@ Supporting AVX-512 does not mean every workload should always use it.
 
 Selection should occur outside the inner packet loop.
 
-### D3 — `rte_bpf` experiment
+### D3 — `rte_bpf` experiment — NOT STARTED
 
 BESS currently carries a large architecture-specific BPF execution/JIT path.
+There is no `rte_bpf` implementation in the current source tree; this evaluation
+and adoption decision remain open.
 
 Evaluate DPDK BPF as a replacement.
 
@@ -7513,60 +7563,54 @@ the reviewing document's word alone.
   gRPC/UDS direction rather than changing it).
 
 
-## 26. Immediate execution plan
+## 26. Current execution plan (2026-09-24)
 
-### Milestone 1 — fix modern glog daemon mode
+K1–K4, G0, A, B, C-software, E, and the J live-update pilot are closed. The
+next software phase is K5; do not restart already-closed architecture work.
 
-Small independent correctness fix.
+### Next — K5 generic metering (not started)
 
-Do not let it grow into G0.
+Use DPDK `rte_meter` for srTCM/trTCM algorithm mechanics. Do not duplicate the
+token-bucket/color algorithms in BESS. BESS owns the semantic resource layer:
+`MeterProfile`, `MeterState`, `MeterHandle`, `MeterColor`, validation, stable
+IDs, state placement/lifetime, worker-safe ownership, generation-aware
+publication, and runtime/typed binding.
 
-Acceptance:
+Keep the initial work software-only. The `rte_mtr`/hardware-meter backend stays
+in C-HW until supported hardware and a concrete consumer justify it. Define the
+BESS API around resource semantics rather than exposing raw DPDK structs.
 
-- foreground mode still works;
-- daemon mode works on glog >= 0.7;
-- Ubuntu CI behavior remains correct;
-- no recursive logging through replaced stdio streams.
+### Following K stages
 
-### Milestone 2 — G0 transactional C++ control core
+1. **K6 — worker-local statistics/snapshots (pending):** workers update local
+   state; the controller aggregates snapshots. This is the foundation for the
+   Phase F metrics exporter.
+2. **K7 — routes/next hops (pending):** add reusable route, next-hop, neighbor,
+   egress, and rewrite resources. Keep `rte_lpm` as the trusted default; do not
+   promote `rte_fib` without correctness evidence and a real consumer.
+3. **G1 — public API/SDKs (not started):** after K5–K7 stabilize real resource
+   semantics, expose desired-state and dataplane transactions, then thin Go and
+   C++ SDKs. G0 remains the internal transactional engine.
+4. **K8 — fragmentation/reassembly (pending, consumer-driven):** schedule when
+   a real consumer needs it; bound resources and test partial-failure cleanup.
 
-First major project.
+### Parallel and deferred work
 
-Deliver:
-
-1. extract `ControlPlane`;
-2. define internal `PipelineSpec`;
-3. implement validation;
-4. implement current-vs-desired diff;
-5. define explicit operation plan;
-6. separate prepare/commit/abort lifecycle;
-7. introduce generation IDs;
-8. introduce optimistic expected-generation conflict checks;
-9. route existing RPC mutations through the new C++ core where practical;
-10. prove failure does not leave half-applied structural state.
-
-Do not build Go SDK yet.
-
-### Milestone 3 — K1 RCU/QSBR
-
-Implement generic read-side lifetime mechanism integrated with workers.
-
-### Milestone 4 — K2 ActionId/object tables
-
-Make immutable generic actions a first-class continuation target.
-
-### Milestone 5 — K3 classifier framework
-
-Build runtime-schema classifier and benchmark backends.
-
-Once these three are in place, modern OMEC UPF work can begin depending on stable generic BESS primitives rather than inventing them inside the UPF tree.
+- **D (not started):** D1–D4, including the D3 `rte_bpf` evaluation and ARM
+  build/test validation.
+- **F (partial):** packaging, SBOM, signed/reproducible releases, sanitizer and
+  static-analysis lanes, and metrics export (after K6).
+- **H/I (partial):** continue toolchain hardening and stronger types alongside
+  concrete K/G1 APIs, rather than as a broad standalone refactor.
+- **C-HW (deferred):** real-NIC, offload, RSS, zero-copy, and hardware-meter
+  validation remain a separate lab program and do not block K5 or software work.
 
 ---
 
 
 ## 25. Known lower-priority research/backlog
 
-These remain useful but should not distract from G0/K.
+These remain useful, but should not distract from the active K5–K7 → G1 sequence.
 
 - symmetric RSS configuration as a generic PMD capability;
 - RETA control if a real consumer appears;
@@ -7683,26 +7727,27 @@ Every hardware acceleration must retain a software fallback with identical BESS 
 
 ### 30. Current handoff
 
-Current reviewed `develop` baseline:
+Verified repository baseline before this documentation-only roadmap refresh:
 
 ```text
-e8c8e17684115e71ff9727134b5eb6e346db175b
-Fix Meson packaging and CI coverage
+2c34621d4162ecc6475bbb2636f19d992554cfd8
 ```
 
-Phase E is closed.
+This roadmap refresh starts from the docs-only follow-up commit `2c34621d` to
+the CI-verified revision `61a6bb43`; local `develop` and `origin/develop`
+matched `2c34621d` when the audit began. The GCC and Clang full local Meson
+suites passed, and GitHub Actions run `36040126078` passed both compiler lanes
+at `61a6bb43`.
 
-The next architecture work is:
+Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K4.
+Partial: F, H, and I. Not started: D, G1, and K5–K8 (K8 is consumer-driven).
+C-HW remains a separate deferred hardware-validation track.
 
-```text
-1. glog >= 0.7 daemon-mode recursion fix
-2. G0 C++ transactional control-plane core
-3. K1 RCU/QSBR
-4. K2 ActionId/object tables
-5. K3 unified classifier
-```
-
-Do not block this sequence on real-NIC work.
+**Next software work: K5 generic metering**, using `rte_meter` for algorithm
+mechanics and BESS for the resource/API/lifecycle integration. Follow with K6
+worker-local statistics and K7 routes/next hops, then G1 public API/SDKs. Do not
+reopen closed K architecture; do not block the software sequence on real-NIC
+work.
 
 
 ## Benchmark / experiment backlog (from the 2026-09-18 DPDK-proposal review)
