@@ -532,6 +532,7 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
   // Reset hardware stat counters, as they may still contain previous data
   CollectStats(true);
 
+  conf_state_degraded_ = false;
   driver_ = dev_info.driver_name ?: "unknown";
 
   return CommandSuccess();
@@ -556,8 +557,11 @@ CommandResponse PMDPort::UpdateConfWithOps(const Conf &conf,
   const bool mac_requested = old_conf.mac_addr != conf.mac_addr &&
                              !conf.mac_addr.IsZero();
   bool rx_reconfigure_attempted = false;
+  bool rx_reconfigure_applied = false;
   bool mtu_update_attempted = false;
+  bool mtu_update_applied = false;
   bool mac_update_attempted = false;
+  bool mac_update_applied = false;
   bool mtu_restore_ok = true;
   bool mac_restore_ok = true;
   bool rx_restore_ok = true;
@@ -574,6 +578,7 @@ CommandResponse PMDPort::UpdateConfWithOps(const Conf &conf,
     if (resp.error().code() != 0) {
       goto restart;
     }
+    rx_reconfigure_applied = true;
   }
 
   if (mtu_requested) {
@@ -583,6 +588,7 @@ CommandResponse PMDPort::UpdateConfWithOps(const Conf &conf,
       resp = CommandFailure(-ret, "rte_eth_dev_set_mtu() failed");
       goto restart;
     }
+    mtu_update_applied = true;
   }
 
   if (mac_requested) {
@@ -595,6 +601,7 @@ CommandResponse PMDPort::UpdateConfWithOps(const Conf &conf,
       resp = CommandFailure(-ret, "rte_eth_dev_default_mac_addr_set() failed");
       goto restart;
     }
+    mac_update_applied = true;
   }
 
   if (conf.admin_up) {
@@ -616,6 +623,7 @@ CommandResponse PMDPort::UpdateConfWithOps(const Conf &conf,
   if (need_rx_reconfigure) {
     rx_scatter_enabled_ = enable_rx_scatter;
   }
+  conf_state_degraded_ = false;
   return CommandSuccess();
 
 restart:
@@ -652,24 +660,36 @@ restart:
       !admin_restore_ok) {
     conf_ = old_conf;
     conf_.admin_up = false;
-    if (rx_reconfigure_attempted && rx_restore_ok) {
-      rx_scatter_enabled_ = old_rx_scatter_enabled;
+    if (rx_reconfigure_attempted) {
+      if (rx_restore_ok) {
+        rx_scatter_enabled_ = old_rx_scatter_enabled;
+      } else if (rx_reconfigure_applied) {
+        rx_scatter_enabled_ = enable_rx_scatter;
+      }
     }
-    if (mtu_update_attempted && mtu_restore_ok) {
-      conf_.mtu = old_conf.mtu;
+    if (mtu_update_applied && !mtu_restore_ok) {
+      conf_.mtu = conf.mtu;
     }
-    if (mac_update_attempted && mac_restore_ok) {
-      conf_.mac_addr = old_conf.mac_addr;
+    if (mac_update_applied && !mac_restore_ok) {
+      conf_.mac_addr = conf.mac_addr;
     }
+    conf_state_degraded_ = true;
     return CommandFailure(EIO, "PMD update failed and state recovery failed");
   }
 
   conf_ = old_conf;
   rx_scatter_enabled_ = old_rx_scatter_enabled;
+  conf_state_degraded_ = false;
   return resp;
 }
 
 CommandResponse PMDPort::UpdateConf(const Conf &conf) {
+  if (conf_state_degraded_) {
+    return CommandFailure(EIO,
+                          "PMD configuration state is degraded; reinitialize "
+                          "the port before updating it");
+  }
+
   bool need_rx_reconfigure = false;
   bool enable_rx_scatter = rx_scatter_enabled_;
   rte_eth_dev_info dev_info = {};

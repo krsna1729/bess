@@ -102,6 +102,7 @@ class PMDPort final : public Port {
         node_placement_(UNCONSTRAINED_SOCKET),
         capabilities_(),
         rx_scatter_enabled_(false),
+        conf_state_degraded_(false),
         loopback_(false),
         vlan_offload_mask_(0) {}
 
@@ -231,6 +232,7 @@ class PMDPort final : public Port {
   uint64_t tx_device_offloads_enabled_ = 0;
   std::array<uint64_t, MAX_QUEUES_PER_DIR> tx_queue_offloads_enabled_{};
   bool rx_scatter_enabled_;
+  bool conf_state_degraded_;
   bool loopback_;
   int vlan_offload_mask_;
 

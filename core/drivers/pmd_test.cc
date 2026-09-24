@@ -89,6 +89,14 @@ class PMDPortTestAccess {
 
   static Port::Conf GetConf(const PMDPort &port) { return port.conf_; }
 
+  static bool ConfStateDegraded(const PMDPort &port) {
+    return port.conf_state_degraded_;
+  }
+
+  static void SetConfStateDegraded(PMDPort &port, bool degraded) {
+    port.conf_state_degraded_ = degraded;
+  }
+
   static CommandResponse RunUpdateConf(
       PMDPort &port, const Port::Conf &conf, bool need_rx_reconfigure,
       bool enable_rx_scatter, std::function<int()> stop,
@@ -193,6 +201,86 @@ TEST(PMDPortUpdateConfTest, RollsBackScatterAndConfigWhenStartFails) {
   EXPECT_EQ(old_conf.mtu, PMDPortTestAccess::GetConf(port).mtu);
   EXPECT_EQ(old_conf.mac_addr, PMDPortTestAccess::GetConf(port).mac_addr);
   EXPECT_TRUE(PMDPortTestAccess::GetConf(port).admin_up);
+}
+
+TEST(PMDPortUpdateConfTest, TracksAppliedMtuWhenMtuRollbackFails) {
+  PMDPort port;
+  Port::Conf old_conf = PMDPortTestAccess::GetConf(port);
+  old_conf.mtu = 1500;
+  old_conf.admin_up = true;
+  old_conf.mac_addr = bess::utils::Ethernet::Address("02:00:00:00:00:01");
+  PMDPortTestAccess::SetConf(port, old_conf);
+
+  Port::Conf requested = old_conf;
+  requested.mtu = 9000;
+  requested.mac_addr = bess::utils::Ethernet::Address("02:00:00:00:00:02");
+  uint32_t hardware_mtu = old_conf.mtu;
+  int set_mtu_calls = 0;
+  int set_mac_calls = 0;
+
+  const auto response = PMDPortTestAccess::RunUpdateConf(
+      port, requested, false, false, [] { return 0; }, [] { return 0; },
+      [&](uint32_t mtu) {
+        ++set_mtu_calls;
+        if (set_mtu_calls == 1) {
+          hardware_mtu = mtu;
+          return 0;
+        }
+        return -EIO;
+      },
+      [&](rte_ether_addr *) {
+        return ++set_mac_calls == 1 ? -EIO : 0;
+      },
+      [](bool) { return CommandSuccess(); });
+
+  EXPECT_EQ(EIO, response.error().code());
+  EXPECT_EQ(9000u, hardware_mtu);
+  EXPECT_EQ(9000u, PMDPortTestAccess::GetConf(port).mtu);
+  EXPECT_FALSE(PMDPortTestAccess::GetConf(port).admin_up);
+  EXPECT_TRUE(PMDPortTestAccess::ConfStateDegraded(port));
+}
+
+TEST(PMDPortUpdateConfTest, TracksAppliedMacWhenMacRollbackFails) {
+  PMDPort port;
+  Port::Conf old_conf = PMDPortTestAccess::GetConf(port);
+  old_conf.admin_up = true;
+  old_conf.mac_addr = bess::utils::Ethernet::Address("02:00:00:00:00:01");
+  PMDPortTestAccess::SetConf(port, old_conf);
+
+  Port::Conf requested = old_conf;
+  requested.mac_addr = bess::utils::Ethernet::Address("02:00:00:00:00:02");
+  auto hardware_mac = old_conf.mac_addr;
+  int set_mac_calls = 0;
+  int start_calls = 0;
+
+  const auto response = PMDPortTestAccess::RunUpdateConf(
+      port, requested, false, false, [] { return 0; },
+      [&] { return ++start_calls == 1 ? -EIO : 0; },
+      [](uint32_t) { return 0; },
+      [&](rte_ether_addr *mac) {
+        ++set_mac_calls;
+        if (set_mac_calls == 2) {
+          return -EIO;
+        }
+        hardware_mac = bess::utils::Ethernet::Address(mac->addr_bytes);
+        return 0;
+      },
+      [](bool) { return CommandSuccess(); });
+
+  EXPECT_EQ(EIO, response.error().code());
+  EXPECT_EQ(requested.mac_addr, hardware_mac);
+  EXPECT_EQ(requested.mac_addr, PMDPortTestAccess::GetConf(port).mac_addr);
+  EXPECT_FALSE(PMDPortTestAccess::GetConf(port).admin_up);
+  EXPECT_TRUE(PMDPortTestAccess::ConfStateDegraded(port));
+}
+
+TEST(PMDPortUpdateConfTest, RejectsUpdatesWhenConfigurationIsDegraded) {
+  PMDPort port;
+  PMDPortTestAccess::SetConfStateDegraded(port, true);
+
+  const auto response = port.UpdateConf(PMDPortTestAccess::GetConf(port));
+
+  EXPECT_EQ(EIO, response.error().code());
 }
 
 TEST(PMDPortUpdateConfTest, RecoveryStartFailureMarksPortDown) {
