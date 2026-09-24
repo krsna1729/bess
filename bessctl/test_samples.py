@@ -39,7 +39,9 @@ import unittest
 
 
 this_dir = os.path.dirname(os.path.realpath(__file__))
-bessctl = os.path.join(this_dir, 'bessctl')
+bessctl_path = os.path.join(this_dir, 'bessctl')
+bessctl = '%s %s' % (shlex.quote(sys.executable),
+                      shlex.quote(bessctl_path))
 sample_dir = os.path.join(this_dir, 'conf/samples')
 
 

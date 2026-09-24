@@ -27,7 +27,7 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-import multiprocessing as mp
+import os
 from test_utils import *
 
 
@@ -64,14 +64,15 @@ class BessWorkerSplitTest(BessModuleTestCase):
             bess.reset_all()
 
     def test_worker_split_fancy(self):
-        NUM_WORKERS = mp.cpu_count()
+        worker_cores = sorted(os.sched_getaffinity(0))
+        NUM_WORKERS = len(worker_cores)
 
         gates = dict()
         for i in range(NUM_WORKERS):
             gates[i] = i & 1
 
         for i in range(NUM_WORKERS):
-            bess.add_worker(wid=i, core=i)
+            bess.add_worker(wid=i, core=worker_cores[i])
             bess.add_tc('rl_{}'.format(i), policy='rate_limit', wid=i,
                         resource='count', limit={'count': 1})
         bess.pause_all()

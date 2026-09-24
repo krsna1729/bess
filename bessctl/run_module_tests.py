@@ -39,7 +39,9 @@ import sys
 import unittest
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-bessctl = os.path.join(this_dir, 'bessctl')
+bessctl_path = os.path.join(this_dir, 'bessctl')
+bessctl = '%s %s' % (shlex.quote(sys.executable),
+                      shlex.quote(bessctl_path))
 default_test_dir = os.path.join(this_dir, 'module_tests')
 
 

@@ -57,18 +57,22 @@
 // `Queue` that already knows its mode), and the explicit forms are
 // exactly what the migrated `Queue` calls.
 //
-// Each (variant, producer count) runs in two phases: an untimed
-// correctness phase moving the full quota with exact per-producer
-// sequence verification, then the timed loop where the consumer only
-// counts (a verifying consumer becomes the ceiling at high producer
-// counts and would hide producer-side differences). Pass --pin_threads
-// to pin producers best-effort to distinct allowed CPUs (placement always
-// derives from a snapshot of the process's original mask, taken in main
-// before any pinning -- deriving it from an already-pinned thread would
-// collapse every producer onto one CPU); the default is unpinned, for
-// comparability with CI/sandbox runs. The benchmark thread itself is
-// never pinned, which also keeps Google Benchmark's per-thread CPU timer
-// accounting the real consumer work.
+// By default, the producer-count sweep is bounded by the process's effective
+// CPU affinity, reserving one CPU for the benchmark-thread consumer. This
+// keeps the default smoke run meaningful when taskset/cgroups expose only a
+// small CPU set. Pass --allow_oversubscription for an explicit scaling study
+// that intentionally runs more producers than available CPUs.
+//
+// Each (variant, producer count) runs in two phases: an untimed correctness
+// phase moving the full quota with exact per-producer sequence verification,
+// then the timed loop where the consumer only counts (a verifying consumer
+// becomes the ceiling at high producer counts and would hide producer-side
+// differences). Pass --pin_threads to pin producers best-effort to distinct
+// allowed CPUs (placement always derives from a snapshot of the process's
+// original mask, taken in main before any pinning). The default is unpinned,
+// for comparability with CI/sandbox runs. The benchmark thread itself is
+// never pinned, which keeps Google Benchmark's per-thread CPU accounting
+// focused on the consumer work.
 //
 // Needs no EAL, no hugepages, no daemon: rings live in plain caller-owned
 // memory via the shared `utils/rte_ring_alloc.h` helpers.
@@ -159,6 +163,7 @@ struct RteHtsOps : public RteRingOps<RING_F_SC_DEQ | RING_F_MP_HTS_ENQ> {
 // usually places threads better than any static assignment; enable
 // explicitly for scaling studies on a quiet/dedicated machine.
 bool g_pin_threads = false;
+bool g_allow_oversubscription = false;
 
 // The process's CPU allowance, snapshotted once in main before any thread
 // pins itself. Placement must ALWAYS derive from this snapshot, never from
@@ -168,6 +173,11 @@ bool g_pin_threads = false;
 // one core -- measured ~500x slower before this was fixed, originally
 // misattributed to host noise).
 cpu_set_t g_allowed_cpus;
+
+int MaxDefaultProducers() {
+  const int allowed_cpus = CPU_COUNT(&g_allowed_cpus);
+  return allowed_cpus > 1 ? allowed_cpus - 1 : 1;
+}
 
 void PinThread(int idx) {
   if (!g_pin_threads) {
@@ -285,6 +295,13 @@ void VerifyRing(int num_producers) {
 template <typename Ops>
 void RunRingBenchmark(benchmark::State &state) {
   const int num_producers = static_cast<int>(state.range(0));
+  const int max_default_producers = MaxDefaultProducers();
+  if (!g_allow_oversubscription && num_producers > max_default_producers) {
+    state.SkipWithMessage(
+        "producer count exceeds affinity-derived limit; pass "
+        "--allow_oversubscription for scaling studies");
+    return;
+  }
   const uint64_t total = kItemsPerProducer * static_cast<uint64_t>(num_producers);
 
   VerifyRing<Ops>(num_producers);
@@ -345,6 +362,8 @@ int main(int argc, char **argv) {
   for (int r = 1; r < argc; r++) {
     if (std::string(argv[r]) == "--pin_threads") {
       g_pin_threads = true;
+    } else if (std::string(argv[r]) == "--allow_oversubscription") {
+      g_allow_oversubscription = true;
     } else {
       argv[w++] = argv[r];
     }

@@ -1,4 +1,4 @@
 scapy>=2.5.0
 flask>=3.0.0
 grpcio>=1.60.0
-protobuf>=4.25.0
+protobuf>=7.36.1,<8
