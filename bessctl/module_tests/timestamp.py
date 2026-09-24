@@ -77,11 +77,14 @@ class BessTimestampTest(BessModuleTestCase):
         print()
         print('min ns =', stats.latency.min_ns)
         print('avg ns =', stats.latency.avg_ns)
-        # these two should be approximately equal - within about 1%
-        a = stats.latency.avg_ns * stats.latency.count
-        b = stats.latency.total_ns
-        diff = abs(a - b) / float(b) * 100.0
-        self.assertLessEqual(diff, 1.0)
+        # Integer division truncates avg_ns, so reconstructing the total may
+        # differ by less than one nanosecond per sample.
+        count = stats.latency.count
+        avg_ns = stats.latency.avg_ns
+        total_ns = stats.latency.total_ns
+        self.assertGreater(count, 0)
+        self.assertLessEqual(avg_ns * count, total_ns)
+        self.assertLess(total_ns, (avg_ns + 1) * count)
 
 
 suite = unittest.TestLoader().loadTestsFromTestCase(BessTimestampTest)
