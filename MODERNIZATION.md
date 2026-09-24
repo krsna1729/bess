@@ -223,8 +223,12 @@ both passed all 80 targets on CPUs 0–3. After the final benchmark-registration
 portability change, `utils_copy_bench` was rebuilt in both build trees; the
 `utils_copy_bench` and `packet_tx_checksum_bench` smoke tests then passed 2/2
 under each compiler before the full no-rebuild suites. The full suite command
-was `taskset -c 0-3 meson test --no-rebuild --print-errorlogs -j4`. The CI
-workflow still needs a remote rerun after the Clang 19 toolchain update below.
+was `taskset -c 0-3 meson test --no-rebuild --print-errorlogs -j4`. GitHub
+Actions run `36040126078` then passed both GCC and Clang builds, full Meson
+suites, AF_XDP artifact checks, install-tree checks, and the installed
+Python-client check on code revision `61a6bb43`. Its only annotation was the
+non-blocking Node.js 20 deprecation notice on the existing cache/checkout
+actions.
 K3.4-K3.7's own targets (the typed-, masked-backend, extract-plan, and
 migration unit binaries, the WildcardMatch module test, `classifier_typed_bench`,
 `classifier_masked_bench`, and `modules_wildcard_match_bench`) pass under GCC
