@@ -34,11 +34,14 @@ from test_utils import *
 class BessWorkerSplitTest(BessModuleTestCase):
 
     def test_worker_split_default(self):
-        NUM_WORKERS = 2
+        worker_cores = sorted(os.sched_getaffinity(0))
+        if len(worker_cores) < 2:
+            self.skipTest('worker split requires at least two allowed CPUs')
+        NUM_WORKERS = min(2, len(worker_cores), 64)
 
         for wid in range(NUM_WORKERS):
             for i in range(NUM_WORKERS):
-                bess.add_worker(wid=i, core=i)
+                bess.add_worker(wid=i, core=worker_cores[i])
 
             src = Source()
             ws = WorkerSplit()
@@ -65,7 +68,9 @@ class BessWorkerSplitTest(BessModuleTestCase):
 
     def test_worker_split_fancy(self):
         worker_cores = sorted(os.sched_getaffinity(0))
-        NUM_WORKERS = len(worker_cores)
+        if len(worker_cores) < 2:
+            self.skipTest('worker split requires at least two allowed CPUs')
+        NUM_WORKERS = min(len(worker_cores), 64)
 
         gates = dict()
         for i in range(NUM_WORKERS):
@@ -102,7 +107,7 @@ class BessWorkerSplitTest(BessModuleTestCase):
         ws_ogates = bess.get_module_info(ws.name).ogates
         for ogate in ws_ogates:
             if ogate.ogate == 0:
-                self.assertEqual(ogate.pkts, odd_pkts)
+                self.assertEqual(ogate.pkts, even_pkts)
             elif ogate.ogate == 1:
                 self.assertEqual(ogate.pkts, odd_pkts)
 
