@@ -43,7 +43,7 @@ class DummyPort : public Port {
 
   void InitDriver() override { initialized_ = true; }
 
-  CommandResponse Init(const google::protobuf::Any &) {
+  CommandResponse Init(const bess::pb::EmptyArg &) {
     return CommandFailure(42);
   }
 
@@ -123,7 +123,7 @@ TEST_F(PortTest, CreatePort) {
 
   bess::pb::EmptyArg arg_;
   google::protobuf::Any arg;
-  arg.PackFrom(arg_);
+  EXPECT_TRUE(arg.PackFrom(arg_));
   CommandResponse err = p->InitWithGenericArg(arg);
   EXPECT_EQ(42, err.error().code());
 }

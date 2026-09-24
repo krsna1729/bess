@@ -306,7 +306,7 @@ static inline gate_hook_cmd_func_t GATE_HOOK_CMD_FUNC(
     CommandResponse (H::*fn)(const T &)) {
   return [fn](bess::GateHook *h, const google::protobuf::Any &arg) {
     T arg_;
-    if (!arg.UnpackTo(&arg_)) {
+    if (!arg.UnpackTo(&arg_) && !arg.type_url().empty()) {
       return CommandFailure(EINVAL, "invalid protobuf argument");
     }
     auto base_fn = std::mem_fn(fn);
@@ -320,7 +320,7 @@ static inline bess::GateHook::init_func_t InitGateHookWithGenericArg(
   return [fn](bess::GateHook *h, const bess::Gate *g,
               const google::protobuf::Any &arg) {
     A arg_;
-    if (!arg.UnpackTo(&arg_)) {
+    if (!arg.UnpackTo(&arg_) && !arg.type_url().empty()) {
       return CommandFailure(EINVAL, "invalid protobuf argument");
     }
     auto base_fn = std::mem_fn(fn);

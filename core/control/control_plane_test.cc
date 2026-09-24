@@ -434,11 +434,11 @@ TEST_F(ControlPlaneTest, DiffClassifiesCreateAndRemove) {
 TEST_F(ControlPlaneTest, DiffReplacesModuleWithDifferentArg) {
   ControlPlane control_plane;
 
-  bess::pb::EmptyArg empty;
+  bess::pb::BypassArg empty;
   ModuleSpec original;
   original.name = "m0";
   original.mclass = "Bypass";
-  original.arg.PackFrom(empty);
+  EXPECT_TRUE(original.arg.PackFrom(empty));
   ASSERT_TRUE(control_plane.CreateModule(original).has_value());
 
   PipelineSpec desired;
@@ -697,11 +697,11 @@ TEST_F(ControlPlaneTest, FailedTransactionRollsBackWhatItDid) {
 TEST_F(ControlPlaneTest, ReplacementIsRefusedTransactionally) {
   ControlPlane control_plane;
 
-  bess::pb::EmptyArg empty;
+  bess::pb::BypassArg empty;
   ModuleSpec original;
   original.name = "r0";
   original.mclass = "Bypass";
-  original.arg.PackFrom(empty);
+  EXPECT_TRUE(original.arg.PackFrom(empty));
   ASSERT_TRUE(control_plane.CreateModule(original).has_value());
 
   PipelineSpec desired;

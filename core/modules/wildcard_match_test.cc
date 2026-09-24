@@ -68,7 +68,7 @@ class WildcardMatchTest : public ::testing::Test {
       return nullptr;
     }
     google::protobuf::Any packed;
-    packed.PackFrom(arg);
+    EXPECT_TRUE(packed.PackFrom(arg));
     pb_error_t perr;
     Module *m = ModuleGraph::CreateModule(it->second, "wm", packed, &perr);
     if (m == nullptr || perr.code() != 0) {

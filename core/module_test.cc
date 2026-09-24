@@ -111,7 +111,7 @@ Module *create_acme(const char *name, pb_error_t *perr) {
 
   bess::pb::EmptyArg arg_;
   google::protobuf::Any arg;
-  arg.PackFrom(arg_);
+  EXPECT_TRUE(arg.PackFrom(arg_));
 
   Module *m = ModuleGraph::CreateModule(builder, mod_name, arg, perr);
 
@@ -139,7 +139,7 @@ Module *create_acme_with_task(const char *name, pb_error_t *perr) {
 
   bess::pb::EmptyArg arg_;
   google::protobuf::Any arg;
-  arg.PackFrom(arg_);
+  EXPECT_TRUE(arg.PackFrom(arg_));
 
   Module *m = ModuleGraph::CreateModule(builder, name, arg, perr);
   if (!m) {
@@ -220,7 +220,7 @@ TEST_F(ModuleTester, RunCommand) {
   ASSERT_NE(nullptr, m = create_acme(nullptr, &perr));
   bess::pb::EmptyArg arg_;
   google::protobuf::Any arg;
-  arg.PackFrom(arg_);
+  EXPECT_TRUE(arg.PackFrom(arg_));
 
   CommandResponse response;
 

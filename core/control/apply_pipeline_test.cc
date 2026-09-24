@@ -608,7 +608,7 @@ TEST_F(ApplyPipelineTest, RetirementPreconditionsAreProvenUpFront) {
   port.num_tx_queues = 1;
   port.rx_queue_size = 1024;
   port.tx_queue_size = 1024;
-  port.arg.PackFrom(port_arg);
+  EXPECT_TRUE(port.arg.PackFrom(port_arg));
   spec.ports.push_back(port);
 
   bess::pb::QueueIncArg queue_arg;
@@ -617,7 +617,7 @@ TEST_F(ApplyPipelineTest, RetirementPreconditionsAreProvenUpFront) {
   bess::control::ModuleSpec reader;
   reader.name = "reader";
   reader.mclass = "QueueInc";
-  reader.arg.PackFrom(queue_arg);
+  EXPECT_TRUE(reader.arg.PackFrom(queue_arg));
   spec.modules.push_back(reader);
 
   ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
@@ -810,7 +810,7 @@ TEST_F(ApplyPipelineTest, LegacyReparentRestoresTheOriginalAttachment) {
   port.num_tx_queues = 1;
   port.rx_queue_size = 1024;
   port.tx_queue_size = 1024;
-  port.arg.PackFrom(port_arg);
+  EXPECT_TRUE(port.arg.PackFrom(port_arg));
   spec.ports.push_back(port);
 
   bess::pb::QueueIncArg queue_arg;
@@ -819,7 +819,7 @@ TEST_F(ApplyPipelineTest, LegacyReparentRestoresTheOriginalAttachment) {
   bess::control::ModuleSpec reader;
   reader.name = "reader";
   reader.mclass = "QueueInc";
-  reader.arg.PackFrom(queue_arg);
+  EXPECT_TRUE(reader.arg.PackFrom(queue_arg));
   spec.modules.push_back(reader);
 
   // A round-robin home for the leaf, and a priority class whose slot is taken.

@@ -59,7 +59,7 @@ Module *create_foo(const std::string name = "") {
 
   bess::pb::EmptyArg arg_;
   google::protobuf::Any arg;
-  arg.PackFrom(arg_);
+  EXPECT_TRUE(arg.PackFrom(arg_));
 
   if (name.size() == 0) {
     const std::string &mod_name = ModuleGraph::GenerateDefaultName(

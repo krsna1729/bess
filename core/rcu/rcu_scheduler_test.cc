@@ -189,7 +189,7 @@ TEST_F(RcuSchedulerTest, TaskHoldingAPointerKeepsItAliveUntilItReturns) {
 
   bess::pb::EmptyArg arg;
   google::protobuf::Any packed;
-  packed.PackFrom(arg);
+  EXPECT_TRUE(packed.PackFrom(arg));
 
   const auto &builders = ModuleBuilder::all_module_builders();
   const auto it = builders.find("RcuHoldModule");
