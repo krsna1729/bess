@@ -59,6 +59,8 @@ class ArpResponder final : public Module {
 
   static const Commands cmds;
 
+  CommandResponse Init(const bess::pb::ArpResponderArg &arg);
+
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
   CommandResponse CommandAdd(const bess::pb::ArpResponderArg &arg);

@@ -38,6 +38,8 @@ class Buffer final : public Module {
  public:
   Buffer() : Module(), buf_() {}
 
+  CommandResponse Init(const bess::pb::BufferArg &) { return CommandSuccess(); }
+
   void DeInit() override;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;

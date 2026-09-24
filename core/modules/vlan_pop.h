@@ -37,6 +37,8 @@ class VLANPop final : public Module {
  public:
   VLANPop() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 
+  CommandResponse Init(const bess::pb::VLANPopArg &) { return CommandSuccess(); }
+
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 };
 

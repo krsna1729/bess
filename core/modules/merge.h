@@ -37,6 +37,8 @@ class Merge final : public Module {
  public:
   Merge() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 
+  CommandResponse Init(const bess::pb::MergeArg &) { return CommandSuccess(); }
+
   static const gate_idx_t kNumIGates = MAX_GATES;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;

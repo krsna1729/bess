@@ -39,6 +39,8 @@ class Sink final : public Module {
 
   static const gate_idx_t kNumOGates = 0;
 
+  CommandResponse Init(const bess::pb::SinkArg &) { return CommandSuccess(); }
+
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 };
 

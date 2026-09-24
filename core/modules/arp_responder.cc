@@ -39,6 +39,13 @@ const Commands ArpResponder::cmds = {
     {"add", "ArpResponderArg", MODULE_CMD_FUNC(&ArpResponder::CommandAdd),
      Command::THREAD_UNSAFE}};
 
+CommandResponse ArpResponder::Init(const bess::pb::ArpResponderArg &arg) {
+  if (arg.ip().empty() && arg.mac_addr().empty()) {
+    return CommandSuccess();
+  }
+  return CommandAdd(arg);
+}
+
 CommandResponse ArpResponder::CommandAdd(const bess::pb::ArpResponderArg &arg) {
   be32_t ip_addr;
   arp_entry entry;
