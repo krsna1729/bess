@@ -205,15 +205,18 @@ prefix/suffix removal and completes K4 packet topology/ownership mechanics.
 K4.4a/b software checksum semantics and TX finalization are complete. K4.5
 records a benchmark-only comparison of runtime-generic and compile-time-
 specialized batch bodies; no production executor, loop migration, or prefetch
-policy is adopted. The separate real-PMD/NIC interoperability matrix remains
-pending because no suitable device is available; it does not block K4 software
-closure.
+policy is adopted. Its lookup study now separates the fixed-batch hot-loop
+floor from a pre-generated working-set run: tables are populated to 50% load,
+lookup modes are hot-hit, uniform-hit, miss, and 50/50 mixed, and the working
+set cycles through 32 deterministic batches (up to 1,024 packets). The
+separate real-PMD/NIC interoperability matrix remains pending because no
+suitable device is available; it does not block K4 software closure.
 The active software scope K1-K4 is closed. Meson/Ninja remains the build graph,
 with pinned DPDK 25.11.3. The registered Meson suite has 80 targets. The
-current bounded GCC and Clang runs compiled with `meson compile -j4`, then ran
-`meson test --no-rebuild --print-errorlogs -j4`; both passed all 80 targets,
-including native tests, Python tests, module integration, benchmark smoke
-tests, and the sample-plugin load.
+current bounded GCC and Clang runs compiled with `taskset -c 0-3 meson compile -j4`,
+then ran `taskset -c 0-3 meson test --no-rebuild --print-errorlogs -j4`; both
+passed all 80 targets, including native tests, Python tests, module integration,
+benchmark smoke tests, and the sample-plugin load.
 K3.4-K3.7's own targets (the typed-, masked-backend, extract-plan, and
 migration unit binaries, the WildcardMatch module test, `classifier_typed_bench`,
 `classifier_masked_bench`, and `modules_wildcard_match_bench`) pass under GCC
