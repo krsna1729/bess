@@ -55,6 +55,8 @@ constexpr uint64_t kTxChecksumFlags =
     RTE_MBUF_F_TX_L4_MASK | RTE_MBUF_F_TX_OUTER_IP_CKSUM |
     RTE_MBUF_F_TX_OUTER_UDP_CKSUM | RTE_MBUF_F_TX_OUTER_IPV4 |
     RTE_MBUF_F_TX_OUTER_IPV6 | RTE_MBUF_F_TX_TUNNEL_MASK;
+constexpr uint64_t kTxSegmentationFlags =
+    RTE_MBUF_F_TX_TCP_SEG | RTE_MBUF_F_TX_UDP_SEG;
 
 struct OuterIpLayout {
   IpVersion version = IpVersion::kIpv4;
@@ -812,6 +814,9 @@ std::expected<void, ChecksumError> FinalizeTxPacket(
   }
   if (packet == nullptr) {
     return std::unexpected(ChecksumError::kNullPacket);
+  }
+  if ((packet->ol_flags & kTxSegmentationFlags) != 0) {
+    return std::unexpected(ChecksumError::kInvalidPlan);
   }
 
   std::optional<ChecksumLayout> outer_layout;

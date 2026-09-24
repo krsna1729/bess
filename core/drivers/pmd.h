@@ -71,6 +71,8 @@ struct PmdCapabilities {
   // queue-scoped defaults are kept separate until effective capabilities are
   // derived for a specific queue.
   uint64_t ConfiguredTxOffloads() const;
+  uint64_t EffectiveQueueOffloads(bool introspection_succeeded,
+                                  uint64_t queue_tx_offloads) const;
   bess::packet::TxOffloadCapabilities ToTxOffloadCapabilities(
       uint64_t device_tx_offloads, uint64_t queue_tx_offloads) const;
 
@@ -179,6 +181,7 @@ class PMDPort final : public Port {
   LinkStatus GetLinkStatus() override;
 
   CommandResponse UpdateConf(const Conf &conf) override;
+  bool HasActiveOutputUsers() const;
 
   /*!
    * Get any placement constraints that need to be met when receiving from this

@@ -108,6 +108,14 @@ uint64_t PmdCapabilities::ConfiguredTxOffloads() const {
 }
 
 
+uint64_t PmdCapabilities::EffectiveQueueOffloads(
+    bool introspection_succeeded, uint64_t queue_tx_offloads) const {
+  if (!introspection_succeeded) {
+    return 0;
+  }
+  return queue_tx_offloads & tx_queue_offload_capa;
+}
+
 size_t PmdCapabilities::RxFrameLengthFor(uint32_t mtu) const {
   return static_cast<size_t>(mtu) + rx_frame_overhead;
 }
@@ -204,13 +212,11 @@ CommandResponse PMDPort::ConfigureDevice(dpdk_port_t port_id,
       return CommandFailure(-ret, "rte_eth_tx_queue_setup() failed");
     }
     rte_eth_txq_info queue_info{};
-    if (rte_eth_tx_queue_info_get(port_id, i, &queue_info) == 0) {
-      configured_queue_offloads[i] = queue_info.conf.offloads;
-    } else {
-      configured_queue_offloads[i] =
-          dev_info.default_txconf.offloads &
-          capabilities_.tx_queue_offload_capa;
-    }
+    const int queue_info_ret = rte_eth_tx_queue_info_get(port_id, i,
+                                                         &queue_info);
+    configured_queue_offloads[i] = capabilities_.EffectiveQueueOffloads(
+        queue_info_ret == 0,
+        queue_info_ret == 0 ? queue_info.conf.offloads : 0);
     configured_queue_offloads[i] &= ~configured_device_offloads;
   }
 
@@ -534,6 +540,15 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
   return CommandSuccess();
 }
 
+bool PMDPort::HasActiveOutputUsers() const {
+  for (queue_t qid = 0; qid < num_queues[PACKET_DIR_OUT]; qid++) {
+    if (users[PACKET_DIR_OUT][qid] != nullptr) {
+      return true;
+    }
+  }
+  return false;
+}
+
 CommandResponse PMDPort::UpdateConf(const Conf &conf) {
   CommandResponse resp = CommandSuccess();
   rte_eth_dev_stop(dpdk_port_id_);  // need to restart before return
@@ -579,6 +594,12 @@ CommandResponse PMDPort::UpdateConf(const Conf &conf) {
     const bool enable_rx_scatter =
         rx_mtu_support == PmdCapabilities::RxMtuSupport::kScatter;
     if (enable_rx_scatter != rx_scatter_enabled_) {
+      if (HasActiveOutputUsers()) {
+        resp = CommandFailure(
+            EBUSY,
+            "cannot change RX scatter while an output module owns a TX queue");
+        goto restart;
+      }
       rte_eth_dev_info dev_info = {};
       int ret = rte_eth_dev_info_get(dpdk_port_id_, &dev_info);
       if (ret != 0) {

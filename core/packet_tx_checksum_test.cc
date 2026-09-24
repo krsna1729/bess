@@ -57,6 +57,7 @@ using bess::PlainPacketPool;
 using bess::packet::ApplySoftwareChecksums;
 using bess::packet::BindTxFinalizationProfile;
 using bess::packet::BoundTxFinalizationProfile;
+using bess::packet::ChecksumError;
 using bess::packet::ChecksumPlan;
 using bess::packet::FinalizeTxPacket;
 using bess::packet::FinalizeTxPacketBatch;
@@ -542,6 +543,21 @@ TEST(PacketTxChecksumTest, EmptyProfileLeavesPacketAndMetadataUntouched) {
   EXPECT_EQ(packet->l4_len, 11);
   EXPECT_EQ(packet->outer_l2_len, 7);
   EXPECT_EQ(packet->outer_l3_len, 9);
+  PacketFree(packet);
+}
+
+TEST(PacketTxChecksumTest, RejectsPreexistingSegmentationIntent) {
+  PlainPacketPool pool(8);
+  PacketHandle packet = Build(pool, kIpv4Udp);
+  ASSERT_NE(packet, nullptr);
+  packet->ol_flags = RTE_MBUF_F_TX_TCP_SEG;
+
+  const auto bound = BindTxFinalizationProfile(V4Profile(V4UdpPlan()), {});
+  ASSERT_TRUE(bound.has_value());
+  const auto result = FinalizeTxPacket(packet, *bound);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), ChecksumError::kInvalidPlan);
   PacketFree(packet);
 }
 

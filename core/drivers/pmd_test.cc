@@ -125,6 +125,25 @@ TEST(PmdCapabilitiesTest,
   EXPECT_FALSE(effective.multi_segment_tx);
 }
 
+TEST(PmdCapabilitiesTest, UnknownQueueConfigurationDisablesQueueOffloads) {
+  rte_eth_dev_info info = {};
+  info.tx_offload_capa = RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
+                         RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM;
+  info.tx_queue_offload_capa = RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
+                               RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM;
+  const auto capabilities = PmdCapabilities::FromDeviceInfo(info);
+
+  EXPECT_EQ(0u, capabilities.EffectiveQueueOffloads(
+                    false, info.tx_queue_offload_capa));
+  EXPECT_EQ(info.tx_queue_offload_capa,
+            capabilities.EffectiveQueueOffloads(
+                true, info.tx_queue_offload_capa));
+  EXPECT_EQ(RTE_ETH_TX_OFFLOAD_UDP_CKSUM,
+            capabilities.EffectiveQueueOffloads(
+                true, RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
+                          RTE_ETH_TX_OFFLOAD_TCP_CKSUM));
+}
+
 TEST(PmdCapabilitiesTest, UsesConfiguredQueueDefaultsOnlyForAdvertisedQueueBits) {
   rte_eth_dev_info info = {};
   info.tx_offload_capa = RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
@@ -163,6 +182,15 @@ TEST(PMDPortCapabilitiesTest,
   EXPECT_FALSE(port.GetTxOffloadCapabilities(2).checksums.tcp);
 }
 
+
+TEST(PMDPortCapabilitiesTest, DetectsActiveOutputUsers) {
+  PMDPort port;
+  port.num_queues[PACKET_DIR_OUT] = 2;
+  EXPECT_FALSE(port.HasActiveOutputUsers());
+
+  port.users[PACKET_DIR_OUT][1] = reinterpret_cast<const module *>(1);
+  EXPECT_TRUE(port.HasActiveOutputUsers());
+}
 
 TEST(PmdCapabilitiesTest, MapsGtpOnlyForSourceVerifiedIntelDrivers) {
   rte_eth_dev_info info = {};
