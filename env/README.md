@@ -1,60 +1,40 @@
-This directory contains various scripts to help users start trying BESS without
-much pain. There is a Vagrant script that allows you to bring up a VM that is
-pre-configured with all required dependencies. There are also Ansible scripts in
-case you want to build and run BESS on a native Linux environment, either your
-laptop or server.
+This directory contains the canonical dependency installer and Dockerfile.
+Supported host systems are Ubuntu 24.04 or newer.
 
-## Playing with BESS VM
+## Install dependencies on a host
 
-You can launch a fully conigured VM on which you can build and test BESS at your
-fingertips. We don't provide a binary VM image though. Instead, We provide a
-Vagrant (https://vagrantup.com) script that automatically generates a VM based
-on Ubuntu 18.04. You can install Vagrant not only on Linux, but also on Windows
-or macOS. Once you have `vagrant` installed, in the current (env/) directory,
-you can simply run:
+Run from the repository root:
 
 ```sh
-$ vagrant up
+sudo bash env/install-deps.sh runtime
+sudo bash env/install-deps.sh build
 ```
 
-to launch a VM. The current BESS directory is mapped to `/opt/bess` in the VM. 
-You can connect to the VM with `vagrant ssh`. All compilers and libraries are
-readiliy available.
-
-## Building BESS without installing dependencies
-
-If you want to do something more serious than playing within a sandbox VM, but
-still without getting your hands dirty, you can use our Docker container to
-build BESS. The container is, similarly to the Vagrant VM, configured with all
-software packages required by BESS. With Docker available, just run (in the top
-directory):
+The `runtime` mode installs runtime libraries and the Python packages from
+`requirements.txt`. The `build` mode adds the compiler, Meson/Ninja, and native
+development dependencies. The `vm` mode installs QEMU/KVM, NUMA, and
+cloud-image tools for the vhost VM helper:
 
 ```sh
-$ ./container_build.py
+sudo bash env/install-deps.sh vm
 ```
 
-then the script will automatically fetch the container image
-(nefelinetworks/bess_build at hub.docker.com) and provide the Meson/Ninja
-toolchain and dependency environment.  `container_build.py` mounts the
-checkout and runs its checksum-pinned DPDK bootstrap helper; build output uses
-shared DPDK libraries and remains in the mounted source tree.
+## Docker build environment
 
-## Ansible scripts
-
-If you plan to build BESS from source and test it without using a VM or
-a container, you must install required packages on your Linux machine. There are
-various Ansible script files you can use for those dependencies.
+`env/Dockerfile` is the canonical definition. Its `runtime` stage installs the
+same runtime dependencies as the host script; its final `build` stage adds the
+build toolchain. Build either stage from the repository root:
 
 ```sh
-$ ./ansible-playbook -K -i localhost, -c local <YAML script>
+docker build -f env/Dockerfile --target runtime -t bess-runtime .
+docker build -f env/Dockerfile --target build -t bess-build .
 ```
 
-Replace `<YAML script>` with one of the following with different flavors:
+The published `nefelinetworks/bess_build:latest` image is consumed by
+`container_build.py`. That helper mounts the checkout and runs the
+checksum-pinned DPDK bootstrap; build output remains in the mounted source
+tree. Rebuild the published image with:
 
-* `env/runtime.yml`: In case you already have a compiled binary of BESS, this
-    file includes software packages for the runtime. It also configures
-    hugepages.
-* `env/build-dep.yml`: This file contains minimum software requirements for 
-    building BESS.
-* `env/dev.yml`: This script has all packages included in the both files above,
-    also with some optional yet recommended packages for developers.
+```sh
+python3 env/rebuild_images.py noble64
+```

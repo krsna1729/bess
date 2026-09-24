@@ -37,6 +37,8 @@ import sys
 import time
 
 TARGET_REPO = 'nefelinetworks/bess_build'
+DOCKER_CONTEXT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+DOCKERFILE = os.path.join(os.path.dirname(__file__), 'Dockerfile')
 
 imgs = {
     'noble64': {'base': 'ubuntu:noble', 'tag_suffix': ''},
@@ -50,22 +52,25 @@ def print_usage(prog):
 def run_cmd(cmd, shell=False):
     if shell:
         subprocess.check_call(cmd, shell=True)
-    else:
+    elif isinstance(cmd, str):
         subprocess.check_call(shlex.split(cmd))
+    else:
+        subprocess.check_call(cmd)
 
 
 def build(env):
     base = imgs[env]['base']
     tag_suffix = imgs[env]['tag_suffix']
-    bess_dpdk_branch = os.getenv('BESS_DPDK_BRANCH', 'master')
     version = time.strftime('%y%m%d')
 
-    run_cmd('docker build '
-            '--build-arg BASE_IMAGE={base} '
-            '--build-arg BESS_DPDK_BRANCH={branch} '
-            '-t {target}:latest{suffix} -t {target}:{version}{suffix} '
-            '.'.format(base=base, branch=bess_dpdk_branch, target=TARGET_REPO,
-                       version=version, suffix=tag_suffix))
+    run_cmd([
+        'docker', 'build',
+        '--file', DOCKERFILE,
+        '--build-arg', 'BASE_IMAGE={}'.format(base),
+        '-t', '{}:latest{}'.format(TARGET_REPO, tag_suffix),
+        '-t', '{}:{}{}'.format(TARGET_REPO, version, tag_suffix),
+        DOCKER_CONTEXT,
+    ])
 
     print('Build succeeded: {}:{}{}'.format(TARGET_REPO, version, tag_suffix))
     print('Build succeeded: {}:latest{}'.format(TARGET_REPO, tag_suffix))
@@ -86,16 +91,10 @@ def main(argv):
 
     version, tag_suffix = build(argv[1])
 
-    try:
-        prompt = raw_input  # Python 2
-    except NameError:
-        prompt = input      # Python 3
-
-    if prompt('Do you wish to push the image? [y/N] ').lower() in ['y', 'yes']:
+    if input('Do you wish to push the image? [y/N] ').lower() in ['y', 'yes']:
         push(version, tag_suffix)
     else:
         print('The image was not pushed')
-
     return 0
 
 

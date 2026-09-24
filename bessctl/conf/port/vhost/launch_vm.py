@@ -29,6 +29,7 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import json
 import os
 import sys
 import subprocess
@@ -65,6 +66,7 @@ qemu_cmd_template = \
         '-qmp unix:/tmp/qmp{vm}.sock,server,nowait ' \
         '-device virtio-net-pci,netdev=mgmt,mac=52:54:00:12:34:56 ' \
         '-netdev user,id=mgmt,hostfwd=tcp:127.0.0.1:2200{vm}-:22 ' \
+        '-drive file=vm-seed.iso,format=raw,if=virtio,readonly=on ' \
         '-vnc 127.0.0.1:{vm} -k en-us ' \
         'vm.qcow2' % HUGEPAGES_PATH
 
@@ -75,6 +77,10 @@ vhost_opt_template = \
 
 this_dir = os.path.dirname(os.path.realpath(__file__))
 bess_dir = os.path.join(this_dir, '../../../../')
+with open(os.path.join(bess_dir, 'deps/dpdk.json')) as dpdk_config:
+    dpdk_dir = json.load(dpdk_config)['directory']
+testpmd_binary = os.path.join(
+    bess_dir, 'deps', dpdk_dir, 'install', 'bin', 'dpdk-testpmd')
 
 # Return the thread ID of each vcpu
 
@@ -100,13 +106,13 @@ def get_threads(path):
 
 
 def scp(vm_id, localpath, remotepath):
-    cmd = "scp -q -i vm.key -oStrictHostKeyChecking=no -P 2200{} -r {} vagrant@localhost:{}".format(
+    cmd = "scp -q -i vm.key -oStrictHostKeyChecking=no -P 2200{} -r {} ubuntu@localhost:{}".format(
         vm_id, localpath, remotepath)
     subprocess.check_call(shlex.split(cmd))
 
 
 def ssh_cmd(vm_id, cmd=''):
-    ret = "ssh -q -i vm.key -oStrictHostKeyChecking=no -p 2200{vm} vagrant@localhost".format(
+    ret = "ssh -q -i vm.key -oStrictHostKeyChecking=no -p 2200{vm} ubuntu@localhost".format(
         vm=vm_id)
     if cmd:
         ret += " '{cmd}'".format(cmd=cmd)
@@ -173,7 +179,7 @@ def run_forward(vm_id, num_nics):
         nics += ' 00:1{nic}.0'.format(nic=i)
 
     scp(vm_id, os.path.join(bess_dir, 'bin/dpdk-devbind.py'), '')
-    scp(vm_id, os.path.join(bess_dir, 'deps/dpdk-19.11.4/build/app/testpmd'), '')
+    scp(vm_id, testpmd_binary, 'testpmd')
 
     # virtio-pci devices should not be bound to any driver
     cmd = ssh_cmd(vm_id, 'sudo ./dpdk-devbind.py -u %s' % nics)

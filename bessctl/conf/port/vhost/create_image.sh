@@ -30,19 +30,27 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-# We download a Vagrant box and convert into a qcow2 image...
-BOX_URL=https://app.vagrantup.com/bento/boxes/ubuntu-18.04/versions/202003.31.0/providers/virtualbox.box
-curl -L $BOX_URL | tar zx ubuntu-18.04-amd64-disk001.vmdk
+# Build a QEMU guest from Ubuntu's 24.04 cloud image.
+set -euo pipefail
 
-echo Converting image...
-qemu-img convert -c -O qcow2 ubuntu-18.04-amd64-disk001.vmdk vm.qcow2
-rm -f ubuntu-18.04-amd64-disk001.vmdk
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+image_url=https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
 
-# The default "insecure" key pair for Vagrant boxes.
-# Do not expose this VM to the wild Internet.
-KEY_URL=https://raw.githubusercontent.com/mitchellh/vagrant/master/keys/vagrant
-rm -f vm.key
-curl -L $KEY_URL > vm.key
+curl --fail --location --retry 3 "$image_url" -o "$tmpdir/ubuntu.img"
+echo "Converting Ubuntu 24.04 cloud image..."
+qemu-img convert -c -O qcow2 "$tmpdir/ubuntu.img" vm.qcow2
+
+ssh-keygen -q -t ed25519 -N '' -f "$tmpdir/vm.key"
+cp "$tmpdir/vm.key" vm.key
 chmod 400 vm.key
+cat > "$tmpdir/user-data" <<EOF
+#cloud-config
+ssh_authorized_keys:
+  - $(<"$tmpdir/vm.key.pub")
+EOF
+printf 'instance-id: bess-vhost\nlocal-hostname: bess-vhost\n' > "$tmpdir/meta-data"
+cloud-localds vm-seed.iso "$tmpdir/user-data" "$tmpdir/meta-data"
 
-echo Done: image vm.qcow2 is ready. Now you can run launch_vm.sh
+echo "Done: vm.qcow2 and vm-seed.iso are ready. Run launch_vm.py from this directory."

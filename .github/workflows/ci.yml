@@ -38,16 +38,9 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang-19 meson ninja-build pkg-config \
-            python3-pip python3-pyelftools xz-utils \
-            libnuma-dev libpcap-dev zlib1g-dev libunwind-dev \
-            libbpf-dev libxdp-dev \
-            libgoogle-glog-dev libgflags-dev libgtest-dev libbenchmark-dev \
-            libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev \
-            protobuf-compiler libsystemd-dev libc-ares-dev libcap-dev
-          pip3 install --break-system-packages -r requirements.txt coverage
+          sudo bash env/install-deps.sh runtime
+          sudo bash env/install-deps.sh build
+          pip3 install --break-system-packages coverage
 
       - name: Cache DPDK
         uses: actions/cache@v6

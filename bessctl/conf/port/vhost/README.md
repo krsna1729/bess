@@ -2,10 +2,8 @@ This example is to demonstrate how to connect BESS to VMs or containers.
 
 ### Requirements
 
-* Install these packages:
-  * numactl
-  * qemu-kvm
-  * Docker
+* Install the VM tools from the repository root: `sudo bash env/install-deps.sh vm`.
+* Install Docker if using the container example.
 * Reserve at least 3GB of hugepages. 4GB if running on a NUMA machine
   * Each VM requires 2GB. BESS takes 1GB per socket.
   * On NUMA, check each socket has enough free hugepages.
@@ -28,9 +26,11 @@ ports. Each port has `BESS_QUEUES` RX/TX queue pairs. The datapath is simple:
 
 ### create\_image.sh
 
-This script generates a vm.qcow2 image file that can be used with QEMU.
-The image is based on Ubuntu 14.04. You must create an image before launching
-VMs below.
+From the repository root, install the image tools with
+`sudo bash env/install-deps.sh vm`, then run this script from this directory.
+It downloads Ubuntu 24.04's cloud image and generates `vm.qcow2` and the
+cloud-init seed `vm-seed.iso`, plus a per-image SSH key. Create the image
+before launching VMs.
 
 
 ### launch\_vm.py

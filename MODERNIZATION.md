@@ -965,18 +965,22 @@ rather than one call site).
     enum/switch/hardcoded list anywhere needed updating), and the dead
     `ZeroCopyVPortTest` friend declaration.
 
-    **Flagged, not fixed** (legacy packaging/provisioning scaffolding,
-    not part of the current build/CI path at all -- same "already-dead,
-    pre-2026-CI-rewrite" bucket as the Bionic/Travis container this
-    session's `ci.yml` already documents replacing): `env/after_install.sh`
-    still runs `make -C .../core/kmod && insmod .../bess.ko` as part of a
-    package post-install hook; `env/ci.yml`, `env/kmod.yml`,
-    `env/Dockerfile` are Ansible/Vagrant provisioning that installs
-    kernel headers for the now-gone module. None of these are invoked by
-    `.github/workflows/ci.yml` or `container_build.py`'s current code
-    paths -- left as backlog rather than fixed blind, since this
-    sandbox has no way to actually exercise/verify a packaging or
+    **Flagged in that review, then resolved below** (legacy
+    packaging/provisioning scaffolding, not part of the build/CI path then
+    -- the same "already-dead, pre-2026-CI-rewrite" bucket as the
+    Bionic/Travis container this session's `ci.yml` documents replacing):
+    `env/after_install.sh` then ran `make -C .../core/kmod && insmod
+    .../bess.ko` as a package post-install hook; `env/ci.yml`,
+    `env/kmod.yml`, and the old `env/Dockerfile` were Ansible/Vagrant
+    provisioning for the now-gone module. None were invoked by
+    `.github/workflows/ci.yml` or `container_build.py`. That pass left
+    them as backlog because its sandbox could not exercise the packaging or
     Vagrant/Ansible flow.
+
+    Resolved in the later environment cleanup: removed the unused Ansible
+    playbooks, Vagrantfile, and obsolete post-install hooks. `env/Dockerfile`
+    now provides `runtime` and `build` stages; host setup and Docker share
+    `env/install-deps.sh`, and the vhost guest uses Ubuntu 24.04 cloud-init.
 24. **`705782b3`** — Fixed the real regression and the missed cleanup entry
     23's review found: dropped the `VPort` block from
     `pybess/test_bess.py::test_create_port` (the actual bug -- see entry
