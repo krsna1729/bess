@@ -37,6 +37,15 @@
 #include "pb/error.pb.h"
 #include "pb/module_msg.pb.h"
 
+template <typename T>
+static inline bool UnpackTypedArgument(const google::protobuf::Any &input,
+                                       T *output) {
+  if (input.type_url().empty() && input.value().empty()) {
+    output->Clear();
+    return true;
+  }
+  return input.UnpackTo(output);
+}
 typedef bess::pb::Error pb_error_t;
 
 using CommandResponse = bess::pb::CommandResponse;

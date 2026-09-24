@@ -82,7 +82,7 @@ static inline port_init_func_t PORT_INIT_FUNC(
     CommandResponse (P::*fn)(const T &)) {
   return [fn](Port *p, const google::protobuf::Any &arg) {
     T arg_;
-    if (!arg.UnpackTo(&arg_) && !arg.type_url().empty()) {
+    if (!UnpackTypedArgument(arg, &arg_)) {
       return CommandFailure(EINVAL, "invalid protobuf argument");
     }
     auto base_fn = std::mem_fn(fn);

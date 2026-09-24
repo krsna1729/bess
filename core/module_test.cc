@@ -213,6 +213,51 @@ TEST_F(ModuleTester, CreateModuleGenerateName) {
   EXPECT_EQ(1, ModuleGraph::GetAllModules().count("acme_module1"));
 }
 
+TEST(UnpackTypedArgumentTest, AcceptsTrulyEmptyAnyAsDefault) {
+  google::protobuf::Any input;
+  bess::pb::BypassArg output;
+  output.set_cycles_per_batch(17);
+
+  EXPECT_TRUE(UnpackTypedArgument(input, &output));
+  EXPECT_EQ(0, output.cycles_per_batch());
+}
+
+TEST(UnpackTypedArgumentTest, AcceptsMatchingTypedAny) {
+  bess::pb::BypassArg source;
+  source.set_cycles_per_batch(42);
+  google::protobuf::Any input;
+  ASSERT_TRUE(input.PackFrom(source));
+  bess::pb::BypassArg output;
+
+  EXPECT_TRUE(UnpackTypedArgument(input, &output));
+  EXPECT_EQ(42, output.cycles_per_batch());
+}
+
+TEST(UnpackTypedArgumentTest, RejectsDifferentMessageType) {
+  bess::pb::EmptyArg source;
+  google::protobuf::Any input;
+  ASSERT_TRUE(input.PackFrom(source));
+  bess::pb::BypassArg output;
+
+  EXPECT_FALSE(UnpackTypedArgument(input, &output));
+}
+
+TEST(UnpackTypedArgumentTest, RejectsValueWithoutTypeUrl) {
+  google::protobuf::Any input;
+  input.set_value("!", 1);
+  bess::pb::BypassArg output;
+
+  EXPECT_FALSE(UnpackTypedArgument(input, &output));
+}
+
+TEST(UnpackTypedArgumentTest, RejectsUnknownTypeUrl) {
+  google::protobuf::Any input;
+  input.set_type_url("type.googleapis.com/not.a.real.Message");
+  bess::pb::BypassArg output;
+
+  EXPECT_FALSE(UnpackTypedArgument(input, &output));
+}
+
 TEST_F(ModuleTester, RunCommand) {
   Module *m;
   pb_error_t perr;
@@ -228,6 +273,19 @@ TEST_F(ModuleTester, RunCommand) {
     response = m->RunCommand("foo", arg);
     EXPECT_EQ(0, response.error().code());
   }
+  EXPECT_EQ(10, (static_cast<AcmeModule *>(m))->n);
+
+  google::protobuf::Any malformed;
+  malformed.set_value("!", 1);
+  response = m->RunCommand("foo", malformed);
+  EXPECT_EQ(EINVAL, response.error().code());
+  EXPECT_EQ(10, (static_cast<AcmeModule *>(m))->n);
+
+  bess::pb::BypassArg wrong_type;
+  google::protobuf::Any wrong_type_arg;
+  ASSERT_TRUE(wrong_type_arg.PackFrom(wrong_type));
+  response = m->RunCommand("foo", wrong_type_arg);
+  EXPECT_EQ(EINVAL, response.error().code());
   EXPECT_EQ(10, (static_cast<AcmeModule *>(m))->n);
 
   response = m->RunCommand("bar", arg);
