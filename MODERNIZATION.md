@@ -217,11 +217,14 @@ working-set matrix contains 384 cases per compiler. The separate real-PMD/NIC
 interoperability matrix remains pending because no suitable device is
 available; it does not block K4 software closure.
 The active software scope K1-K4 is closed. Meson/Ninja remains the build graph,
-with pinned DPDK 25.11.3. The registered Meson suite has 80 targets. The
-current bounded GCC and Clang runs compiled with `taskset -c 0-3 meson compile -j4`,
-then ran `taskset -c 0-3 meson test --no-rebuild --print-errorlogs -j4`; both
-passed all 80 targets, including native tests, Python tests, module integration,
-benchmark smoke tests, and the sample-plugin load.
+with pinned DPDK 25.11.3. The registered Meson suite has 80 targets. At the
+2026-09-24 local verification checkpoint, the full GCC and Clang test suites
+both passed all 80 targets on CPUs 0–3. After the final benchmark-registration
+portability change, `utils_copy_bench` was rebuilt in both build trees; the
+`utils_copy_bench` and `packet_tx_checksum_bench` smoke tests then passed 2/2
+under each compiler before the full no-rebuild suites. The full suite command
+was `taskset -c 0-3 meson test --no-rebuild --print-errorlogs -j4`. The CI
+workflow still needs a remote rerun after the Clang 19 toolchain update below.
 K3.4-K3.7's own targets (the typed-, masked-backend, extract-plan, and
 migration unit binaries, the WildcardMatch module test, `classifier_typed_bench`,
 `classifier_masked_bench`, and `modules_wildcard_match_bench`) pass under GCC
@@ -6066,19 +6069,21 @@ DPDK version, advertised/configured/effective offload bits, selected backend
 per domain, and pass/fail/unsupported combinations. Never infer inner checksum
 support from a tunnel-TSO bit.
 
-#### K4.5 — generic batch execution and ILP experiment (benchmark-only)
+#### K4.5 — packet-batch performance study (benchmark-only)
 
-`Module::ProcessBatch` remains the virtual module entry point;
-`PacketBatch` remains a fixed 32-handle container with `packet(i)` views. The
-experiment adds no production executor or module API. `core/packet_bench.cc`
-compares four module-like batch bodies: runtime-generic scalar,
-runtime-generic ILP4, compile-time-specialized scalar, and
-compile-time-specialized ILP4. Each reads two 32-bit fields and emits the same
-64-bit result. Runtime plans use offsets `(14, 62)` or `(30, 94)`; specialized
-authors bake those offsets into templates. The specialized path reads directly
-when each field is wholly in the head segment and falls back to `PacketCursor`
-when a field crosses a segment.
+K4.5 is split into three benchmark-only studies. `Module::ProcessBatch`
+remains the virtual module entry point; `PacketBatch` remains a fixed 32-handle
+container. No production executor, module API, loop migration, classifier
+redesign, or global prefetch policy is inferred from these measurements.
 
+##### K4.5a — extraction/body microbenchmark
+
+The original `core/packet_bench.cc` experiment compares four module-like batch
+bodies: runtime-generic scalar, runtime-generic ILP4, compile-time-specialized
+scalar, and compile-time-specialized ILP4. Each reads two 32-bit fields and
+emits the same 64-bit result. Runtime plans use offsets `(14, 62)` or `(30, 94)`;
+specialized authors bake those offsets into templates. This is the historical
+72-case-per-compiler extraction/body matrix documented below.
 The matrix covers batch sizes `1/8/32`, contiguous packets, two-segment packets
 with a field split at byte 64, and four-segment packets. A pre-timing check
 compares every variant with the runtime-generic scalar result. ILP4 interleaves
@@ -6104,10 +6109,17 @@ omarchy-benchmark --isolate --cpu 0 --diagnose -- \
   --benchmark_out=build-meson-clang/packet-batch-k45-clang-isolated.json
 ```
 
-Each compiler produced 72 median cases (four bodies, three batch sizes, three
-packet shapes, and two field plans), each with five repetitions. The tables
-use batch 32 and plan `(14, 62)`, normalized from CPU nanoseconds per batch to
-nanoseconds per packet:
+Each compiler tested 72 distinct parameter configurations (four bodies, three
+batch sizes, three packet shapes, and two field plans), each with five timed
+repetitions (360 iteration rows). Each JSON file contains 648 rows total: the
+360 timed iterations plus mean, median, standard-deviation, and coefficient-of-
+variation aggregates for all 72 configurations. The median across the 72
+per-configuration median rows was 52.816 ns/batch for GCC and 76.028 ns/batch
+for Clang; the per-configuration median ranges were 1.724–552.772 ns/batch and
+0.926–593.246 ns/batch, respectively. These ranges span different batch sizes,
+packet shapes, and field plans, so they are not a single comparable workload.
+The table below selects batch 32 and plan `(14, 62)`, normalized from CPU
+nanoseconds per batch to nanoseconds per packet:
 
 GCC:
 
@@ -6149,6 +6161,54 @@ and virtual dispatch, a live module graph, and NIC traffic. No production API,
 loop migration, or ILP policy is adopted. JSON outputs are retained locally
 at `build-meson/packet-batch-k45-gcc-isolated.json` and
 `build-meson-clang/packet-batch-k45-clang-isolated.json`.
+
+##### K4.5b — populated-table lookup pipeline
+
+The follow-up keeps the fixed-batch hot-loop floor but populates a synthetic
+linear-probing table to a deterministic 50% load factor. It measures hot-hit,
+uniform-hit, miss, and 50/50 mixed lookup distributions across table sizes
+256, 4,096, and 65,536 entries, batch sizes 1/8/16/32, packet shapes, and
+runtime-generic versus typed extraction. Table population and correctness
+checks are outside the timed region.
+
+##### K4.5c — rotating working-set experiment
+
+The working-set variant prepares 32 deterministic batches outside timing and
+rotates through corpora of 256 and 1,024 packets. Each compiler produced 384
+records: 192 runtime-generic and 192 typed cases, with one reported result row
+per case and no across-run repetitions. Across the full matrix, GCC's median row
+was 298.923 ns/batch (range 37.597–1,963.602); Clang's was 216.983 ns/batch
+(range 34.225–1,723.021). These are descriptive summaries of the matrix, not
+repeated-trial estimates. CPU-time medians grouped by corpus and body were:
+
+| Compiler/body | 256-packet corpus | 1,024-packet corpus |
+| --- | ---: | ---: |
+| GCC runtime-generic | 239.5 ns/batch | 1,038.0 ns/batch |
+| GCC typed/specialized | 170.8 ns/batch | 703.1 ns/batch |
+| Clang runtime-generic | 152.3 ns/batch | 715.4 ns/batch |
+| Clang typed/specialized | 108.1 ns/batch | 500.0 ns/batch |
+
+Across lookup modes, GCC runtime medians were 498.5/559.7/587.2/567.8 ns per
+batch for hot/uniform/miss/mixed; GCC typed medians were
+217.8/259.4/247.7/249.9 ns. Clang runtime medians were
+279.0/325.2/413.0/373.2 ns; Clang typed medians were
+164.0/190.1/191.3/199.8 ns. These are synthetic fixture measurements, not
+NIC throughput or a claim about a production classifier's cache behavior.
+
+The corrected prefetch body now requires eight packets before reading
+`i+4..i+7` and explicitly exercises remainder batches 7/15/31. The CPU-pinned
+GCC smoke matrix covered 672 prefetch cases; across the matrix `cpu_time` had a
+median of 341.472 ns/batch and ranged from 20.891 to 1,100.833 ns/batch. The
+batch-specific medians for batch sizes 1/7/8/15/16/31/32 were
+26.052/177.913/200.495/371.515/404.260/785.243/825.039 ns/batch. The corrected
+prefetch subset was not rerun under exclusive Omarchy isolation because
+another global benchmark reservation was held; this is correctness evidence
+only, not a performance conclusion.
+
+The working-set JSON outputs are retained locally at
+`build-meson/packet-batch-k45-working-set-gcc-isolated.json` and
+`build-meson-clang/packet-batch-k45-working-set-clang-isolated.json`. The
+original extraction/body JSON outputs remain historical K4.5a evidence.
 
 ---
 
