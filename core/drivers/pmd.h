@@ -35,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <functional>
 #include <string>
 
 #include <rte_config.h>
@@ -193,6 +194,19 @@ class PMDPort final : public Port {
 
  private:
   friend class PMDPortTestAccess;
+
+  struct UpdateConfOps {
+    std::function<int()> stop;
+    std::function<int()> start;
+    std::function<int(uint32_t)> set_mtu;
+    std::function<int(rte_ether_addr *)> set_mac;
+    std::function<CommandResponse(bool)> configure_rx;
+  };
+
+  CommandResponse UpdateConfWithOps(const Conf &conf,
+                                    bool need_rx_reconfigure,
+                                    bool enable_rx_scatter,
+                                    const UpdateConfOps &ops);
 
   CommandResponse ConfigureDevice(dpdk_port_t port_id,
                                   const rte_eth_dev_info &dev_info,

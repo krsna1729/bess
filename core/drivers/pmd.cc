@@ -404,9 +404,6 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
   dpdk_port_t ret_port_id = DPDK_PORT_UNKNOWN;
   rte_eth_dev_info dev_info;
 
-  int num_txq = num_queues[PACKET_DIR_OUT];
-  int num_rxq = num_queues[PACKET_DIR_INC];
-
   int ret;
 
   CommandResponse err;
@@ -549,11 +546,131 @@ bool PMDPort::HasActiveOutputUsers() const {
   return false;
 }
 
-CommandResponse PMDPort::UpdateConf(const Conf &conf) {
-  const bool was_admin_up = conf_.admin_up;
+CommandResponse PMDPort::UpdateConfWithOps(const Conf &conf,
+                                            bool need_rx_reconfigure,
+                                            bool enable_rx_scatter,
+                                            const UpdateConfOps &ops) {
+  const Conf old_conf = conf_;
   const bool old_rx_scatter_enabled = rx_scatter_enabled_;
-  bool need_rx_reconfigure = false;
+  const bool mtu_requested = old_conf.mtu != conf.mtu && conf.mtu != 0;
+  const bool mac_requested = old_conf.mac_addr != conf.mac_addr &&
+                             !conf.mac_addr.IsZero();
   bool rx_reconfigure_attempted = false;
+  bool mtu_update_attempted = false;
+  bool mac_update_attempted = false;
+  bool mtu_restore_ok = true;
+  bool mac_restore_ok = true;
+  bool rx_restore_ok = true;
+
+  int ret = ops.stop();
+  if (ret != 0) {
+    return CommandFailure(-ret, "rte_eth_dev_stop() failed");
+  }
+
+  CommandResponse resp = CommandSuccess();
+  if (need_rx_reconfigure) {
+    rx_reconfigure_attempted = true;
+    resp = ops.configure_rx(enable_rx_scatter);
+    if (resp.error().code() != 0) {
+      goto restart;
+    }
+  }
+
+  if (mtu_requested) {
+    mtu_update_attempted = true;
+    ret = ops.set_mtu(conf.mtu);
+    if (ret != 0) {
+      resp = CommandFailure(-ret, "rte_eth_dev_set_mtu() failed");
+      goto restart;
+    }
+  }
+
+  if (mac_requested) {
+    mac_update_attempted = true;
+    rte_ether_addr tmp;
+    rte_ether_addr_copy(
+        reinterpret_cast<const rte_ether_addr *>(&conf.mac_addr.bytes), &tmp);
+    ret = ops.set_mac(&tmp);
+    if (ret != 0) {
+      resp = CommandFailure(-ret, "rte_eth_dev_default_mac_addr_set() failed");
+      goto restart;
+    }
+  }
+
+  if (conf.admin_up) {
+    ret = ops.start();
+    if (ret != 0) {
+      resp = CommandFailure(-ret, "rte_eth_dev_start() failed");
+      goto restart;
+    }
+  }
+
+  conf_ = old_conf;
+  if (mtu_requested) {
+    conf_.mtu = conf.mtu;
+  }
+  if (mac_requested) {
+    conf_.mac_addr = conf.mac_addr;
+  }
+  conf_.admin_up = conf.admin_up;
+  if (need_rx_reconfigure) {
+    rx_scatter_enabled_ = enable_rx_scatter;
+  }
+  return CommandSuccess();
+
+restart:
+  if (rx_reconfigure_attempted) {
+    CommandResponse restore = ops.configure_rx(old_rx_scatter_enabled);
+    rx_restore_ok = restore.error().code() == 0;
+  }
+
+  if (mtu_update_attempted) {
+    ret = ops.set_mtu(old_conf.mtu);
+    mtu_restore_ok = ret == 0;
+  }
+
+  if (mac_update_attempted) {
+    if (old_conf.mac_addr.IsZero()) {
+      mac_restore_ok = false;
+    } else {
+      rte_ether_addr old_mac;
+      rte_ether_addr_copy(
+          reinterpret_cast<const rte_ether_addr *>(&old_conf.mac_addr.bytes),
+          &old_mac);
+      ret = ops.set_mac(&old_mac);
+      mac_restore_ok = ret == 0;
+    }
+  }
+
+  bool admin_restore_ok = true;
+  if (old_conf.admin_up) {
+    ret = ops.start();
+    admin_restore_ok = ret == 0;
+  }
+
+  if (!rx_restore_ok || !mtu_restore_ok || !mac_restore_ok ||
+      !admin_restore_ok) {
+    conf_ = old_conf;
+    conf_.admin_up = false;
+    if (rx_reconfigure_attempted && rx_restore_ok) {
+      rx_scatter_enabled_ = old_rx_scatter_enabled;
+    }
+    if (mtu_update_attempted && mtu_restore_ok) {
+      conf_.mtu = old_conf.mtu;
+    }
+    if (mac_update_attempted && mac_restore_ok) {
+      conf_.mac_addr = old_conf.mac_addr;
+    }
+    return CommandFailure(EIO, "PMD update failed and state recovery failed");
+  }
+
+  conf_ = old_conf;
+  rx_scatter_enabled_ = old_rx_scatter_enabled;
+  return resp;
+}
+
+CommandResponse PMDPort::UpdateConf(const Conf &conf) {
+  bool need_rx_reconfigure = false;
   bool enable_rx_scatter = rx_scatter_enabled_;
   rte_eth_dev_info dev_info = {};
 
@@ -608,77 +725,19 @@ CommandResponse PMDPort::UpdateConf(const Conf &conf) {
     }
   }
 
-  int ret = rte_eth_dev_stop(dpdk_port_id_);
-  if (ret != 0) {
-    return CommandFailure(-ret, "rte_eth_dev_stop() failed");
-  }
-
-  CommandResponse resp = CommandSuccess();
-  if (conf_.mtu != conf.mtu && conf.mtu != 0) {
-    if (need_rx_reconfigure) {
-      rx_reconfigure_attempted = true;
-      resp = ConfigureDevice(dpdk_port_id_, dev_info, enable_rx_scatter);
-      if (resp.error().code() != 0) {
-        goto restart;
-      }
-    }
-
-    ret = rte_eth_dev_set_mtu(dpdk_port_id_, conf.mtu);
-    if (ret == 0) {
-      conf_.mtu = conf.mtu;
-    } else {
-      resp = CommandFailure(-ret, "rte_eth_dev_set_mtu() failed");
-      goto restart;
-    }
-  }
-
-  if (conf_.mac_addr != conf.mac_addr && !conf.mac_addr.IsZero()) {
-    rte_ether_addr tmp;
-    rte_ether_addr_copy(
-        reinterpret_cast<const rte_ether_addr *>(&conf.mac_addr.bytes), &tmp);
-    ret = rte_eth_dev_default_mac_addr_set(dpdk_port_id_, &tmp);
-    if (ret == 0) {
-      conf_.mac_addr = conf.mac_addr;
-    } else {
-      resp = CommandFailure(-ret, "rte_eth_dev_default_mac_addr_set() failed");
-      goto restart;
-    }
-  }
-
-  if (conf.admin_up) {
-    ret = rte_eth_dev_start(dpdk_port_id_);
-    if (ret != 0) {
-      resp = CommandFailure(-ret, "rte_eth_dev_start() failed");
-      goto restart;
-    }
-    conf_.admin_up = true;
-  } else {
-    conf_.admin_up = false;
-  }
-  return resp;
-
-restart:
-  if (rx_reconfigure_attempted) {
-    CommandResponse restore = ConfigureDevice(
-        dpdk_port_id_, dev_info, old_rx_scatter_enabled);
-    if (restore.error().code() != 0) {
-      return CommandFailure(EIO,
-                            "failed to restore RX configuration after update "
-                            "failure");
-    }
-  }
-
-  if (was_admin_up) {
-    ret = rte_eth_dev_start(dpdk_port_id_);
-    if (ret != 0) {
-      conf_.admin_up = false;
-      return CommandFailure(-ret, "rte_eth_dev_start() recovery failed");
-    }
-    conf_.admin_up = true;
-  } else {
-    conf_.admin_up = false;
-  }
-  return resp;
+  UpdateConfOps ops;
+  ops.stop = [this] { return rte_eth_dev_stop(dpdk_port_id_); };
+  ops.start = [this] { return rte_eth_dev_start(dpdk_port_id_); };
+  ops.set_mtu = [this](uint32_t mtu) {
+    return rte_eth_dev_set_mtu(dpdk_port_id_, mtu);
+  };
+  ops.set_mac = [this](rte_ether_addr *mac) {
+    return rte_eth_dev_default_mac_addr_set(dpdk_port_id_, mac);
+  };
+  ops.configure_rx = [this, &dev_info](bool enable) {
+    return ConfigureDevice(dpdk_port_id_, dev_info, enable);
+  };
+  return UpdateConfWithOps(conf, need_rx_reconfigure, enable_rx_scatter, ops);
 }
 
 void PMDPort::DeInit() {

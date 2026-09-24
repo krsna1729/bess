@@ -31,6 +31,8 @@
 
 #include <gtest/gtest.h>
 
+#include <utility>
+
 namespace {
 
 rte_eth_dev_info MakeDeviceInfo(uint16_t min_mtu, uint16_t max_mtu,
@@ -72,7 +74,149 @@ class PMDPortTestAccess {
     port.tx_queue_offloads_enabled_[0] = RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
     port.tx_queue_offloads_enabled_[1] = RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM;
   }
+
+  static bool RxScatterEnabled(const PMDPort &port) {
+    return port.rx_scatter_enabled_;
+  }
+
+  static void SetRxScatterEnabled(PMDPort &port, bool enabled) {
+    port.rx_scatter_enabled_ = enabled;
+  }
+
+  static void SetConf(PMDPort &port, const Port::Conf &conf) {
+    port.conf_ = conf;
+  }
+
+  static Port::Conf GetConf(const PMDPort &port) { return port.conf_; }
+
+  static CommandResponse RunUpdateConf(
+      PMDPort &port, const Port::Conf &conf, bool need_rx_reconfigure,
+      bool enable_rx_scatter, std::function<int()> stop,
+      std::function<int()> start, std::function<int(uint32_t)> set_mtu,
+ std::function<int(rte_ether_addr *)> set_mac,
+      std::function<CommandResponse(bool)> configure_rx) {
+    PMDPort::UpdateConfOps ops{std::move(stop), std::move(start),
+                               std::move(set_mtu), std::move(set_mac),
+                               std::move(configure_rx)};
+    return port.UpdateConfWithOps(conf, need_rx_reconfigure,
+                                  enable_rx_scatter, ops);
+  }
 };
+
+TEST(PMDPortUpdateConfTest, RollsBackMtuWhenMacUpdateFails) {
+  PMDPort port;
+  Port::Conf old_conf = PMDPortTestAccess::GetConf(port);
+  old_conf.mtu = 1500;
+  old_conf.admin_up = true;
+  old_conf.mac_addr = bess::utils::Ethernet::Address("02:00:00:00:00:01");
+  PMDPortTestAccess::SetConf(port, old_conf);
+
+  Port::Conf requested = old_conf;
+  requested.mtu = 9000;
+  requested.mac_addr = bess::utils::Ethernet::Address("02:00:00:00:00:02");
+  uint32_t hardware_mtu = old_conf.mtu;
+  auto hardware_mac = old_conf.mac_addr;
+  int stop_calls = 0;
+  int start_calls = 0;
+  int mac_calls = 0;
+
+  const auto response = PMDPortTestAccess::RunUpdateConf(
+      port, requested, false, false,
+      [&] { ++stop_calls; return 0; },
+      [&] { ++start_calls; return 0; },
+      [&](uint32_t mtu) {
+        hardware_mtu = mtu;
+        return 0;
+      },
+      [&](rte_ether_addr *) {
+        ++mac_calls;
+        return mac_calls == 1 ? -EIO : 0;
+      },
+      [](bool) { return CommandSuccess(); });
+
+  EXPECT_NE(0, response.error().code());
+  EXPECT_EQ(1, stop_calls);
+  EXPECT_EQ(1, start_calls);
+  EXPECT_EQ(old_conf.mtu, hardware_mtu);
+  EXPECT_EQ(old_conf.mac_addr, hardware_mac);
+  EXPECT_EQ(old_conf.mtu, PMDPortTestAccess::GetConf(port).mtu);
+  EXPECT_EQ(old_conf.mac_addr, PMDPortTestAccess::GetConf(port).mac_addr);
+  EXPECT_EQ(old_conf.admin_up, PMDPortTestAccess::GetConf(port).admin_up);
+}
+
+TEST(PMDPortUpdateConfTest, RollsBackScatterAndConfigWhenStartFails) {
+  PMDPort port;
+  Port::Conf old_conf = PMDPortTestAccess::GetConf(port);
+  old_conf.mtu = 1500;
+  old_conf.admin_up = true;
+  old_conf.mac_addr = bess::utils::Ethernet::Address("02:00:00:00:00:01");
+  PMDPortTestAccess::SetConf(port, old_conf);
+  PMDPortTestAccess::SetRxScatterEnabled(port, false);
+
+  Port::Conf requested = old_conf;
+  requested.mtu = 9000;
+  requested.mac_addr = bess::utils::Ethernet::Address("02:00:00:00:00:02");
+  uint32_t hardware_mtu = old_conf.mtu;
+  auto hardware_mac = old_conf.mac_addr;
+  bool hardware_scatter = false;
+  int start_calls = 0;
+  int configure_calls = 0;
+
+  const auto response = PMDPortTestAccess::RunUpdateConf(
+      port, requested, true, true,
+      [] { return 0; },
+      [&] {
+        ++start_calls;
+        return start_calls == 1 ? -EIO : 0;
+      },
+      [&](uint32_t mtu) {
+        hardware_mtu = mtu;
+        return 0;
+      },
+      [&](rte_ether_addr *mac) {
+        hardware_mac = bess::utils::Ethernet::Address(mac->addr_bytes);
+        return 0;
+      },
+      [&](bool enable) {
+        ++configure_calls;
+        hardware_scatter = enable;
+        return CommandSuccess();
+      });
+
+  EXPECT_NE(0, response.error().code());
+  EXPECT_EQ(2, start_calls);
+  EXPECT_EQ(2, configure_calls);
+  EXPECT_EQ(old_conf.mtu, hardware_mtu);
+  EXPECT_EQ(old_conf.mac_addr, hardware_mac);
+  EXPECT_FALSE(hardware_scatter);
+  EXPECT_FALSE(PMDPortTestAccess::RxScatterEnabled(port));
+  EXPECT_EQ(old_conf.mtu, PMDPortTestAccess::GetConf(port).mtu);
+  EXPECT_EQ(old_conf.mac_addr, PMDPortTestAccess::GetConf(port).mac_addr);
+  EXPECT_TRUE(PMDPortTestAccess::GetConf(port).admin_up);
+}
+
+TEST(PMDPortUpdateConfTest, RecoveryStartFailureMarksPortDown) {
+  PMDPort port;
+  Port::Conf old_conf = PMDPortTestAccess::GetConf(port);
+  old_conf.admin_up = true;
+  PMDPortTestAccess::SetConf(port, old_conf);
+  int start_calls = 0;
+
+  const auto response = PMDPortTestAccess::RunUpdateConf(
+      port, old_conf, false, false,
+      [] { return 0; },
+      [&] {
+        ++start_calls;
+        return -EIO;
+      },
+      [](uint32_t) { return 0; },
+      [](rte_ether_addr *) { return 0; },
+      [](bool) { return CommandSuccess(); });
+
+  EXPECT_NE(0, response.error().code());
+  EXPECT_EQ(2, start_calls);
+  EXPECT_FALSE(PMDPortTestAccess::GetConf(port).admin_up);
+}
 
 TEST(PmdCapabilitiesTest, CopiesDeviceCapabilitiesAndRxGeometry) {
   rte_eth_dev_info info = MakeDeviceInfo(576, 9000, true, 9018);
