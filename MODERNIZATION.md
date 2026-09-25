@@ -3473,6 +3473,23 @@ rather than one call site).
     backend, the `ActionId`/`ResultSlot` contract, the K2 scale gate, the G1.4
     event channel, K9 bounded packet store, and plugin packaging.
 
+88. **G1.2 update modes.** Following the user's questions (why rebuild? use
+    DPDK's concurrent `rte_hash`? message-pass inserts to workers between
+    graph rounds? cover existing modules, not just UPF), replaced the
+    bespoke live-cuckoo plan in section 14.5 with three per-table update
+    modes. C: a concurrent shared table with direct O(1) control-thread
+    insert, using DPDK 25.11's `RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF` +
+    `rte_hash_rcu_qsbr_add` on the runtime QSBR (as K7 does for `rte_lpm`)
+    and write-once object slots. W: per-worker SPSC op rings drained at the
+    end of each scheduler round into worker-private replicas or owned
+    shards, giving zero hot-path synchronization and per-worker
+    all-at-once visibility of a transaction. G: generation swap for bulk
+    and tiny tables. Automatic mode selection by size and workers.
+    Existing-module mapping recorded: ExactMatch/WildcardMatch rebuild per
+    add today; L2Forward/ACL/HashLB pause every worker per command; NAT
+    writes on the data path. G1.2a now starts by measuring LF `rte_hash`
+    lookup cost against today's cuckoo.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -7146,68 +7163,105 @@ the same O(table)-per-change pattern. Only K7 routes (in place, 0.5-33 us) are
 already O(change). Live safety was bought with O(n) writes; G1.2 buys it back
 without giving up live safety.
 
-#### Mechanism: live tables, two-phase at entry granularity
+#### Why tables are rebuilt today, and why that has to go
 
-The generation swap stays for bulk replace (load a whole table, `Clear()`).
-Single-entry changes move to structures a single writer updates in place,
-with readers unchanged:
+Phase J and K3 made every table update build a new immutable generation and
+publish it through RCU. That gave lock-free readers, simple reasoning, and
+atomic multi-rule visibility -- at O(table) per insert. It cannot reach
+millions of entries. Other modules are worse off: L2Forward's `add`/`delete`,
+ACL's rules and HashLB's gates are `THREAD_UNSAFE`, so each change pauses
+every worker.
 
-- **Write-once object slots (K2 actions, K5 meters):** a new object is written
-  into a free slot that nothing references, followed by a release fence. It
-  becomes reachable only when a referrer publishes its id. Objects are never
-  mutated in place: a modify writes a new slot and swings the referrer. The
-  reader's lookup is the flat `table[id]` access it has today. Slots and ids
-  are reused only after a grace period.
-- **In-place exact tables (K3 cuckoo, ExactMatch; WildcardMatch tuples):**
-  insert = write key and value into a reserved slot, then publish the bucket's
-  hash signature with one release store. Delete = clear the signature, and
-  reuse the slot after a grace period. Entry storage is a pre-sized arena
-  (no reallocation under readers). A new mask swaps a WildcardMatch's
-  tuple list (rare, O(tuples)).
-- **Cuckoo displacement** is the one structural move. It is done copy-then-clear,
-  so a key is always present somewhere. The only reader-visible effect is a
-  possible transient miss when a key moves back toward its primary bucket;
-  that is closed by a per-bucket change counter checked **only on the miss
-  path** (hits pay nothing). The counter is added only if a mutation-checked
-  concurrent test shows the miss, and its cost goes on the miss rows.
-  Capacity headroom keeps displacement rare; growth is a background rebuild
-  and swap, never done inside a transaction.
-- **LPM (K7):** already in place.
+#### Mechanism: three update modes, chosen per table
 
-Every transaction runs in two phases:
+A module picks, or the runtime picks for it, how each of its tables is
+updated. The module's lookup code stays an ordinary lookup in every mode.
 
-- **Reserve.** Everything that can fail happens here, while nothing is
-  visible: validation, id and slot allocation, capacity checks (a
-  conservative tbl8 estimate for LPM), and writing entries into reserved
-  slots with unpublished signatures. On any failure, release the
-  reservations: no reader ever saw anything.
-- **Publish.** A sequence of single atomic stores that cannot fail: new
-  referents first (they are write-once and invisible anyway), then referrer
-  signatures and swings. Removals run in reverse: unlink referrers now,
-  retire referents under one grace-period token for the whole transaction,
-  reclaimed asynchronously by the control thread -- the writer never waits.
+**Mode C -- concurrent shared table, direct insert (the default for large
+tables).** One shared table; the control thread is its single writer and
+inserts directly, O(1); workers read lock-free. BESS writes no new concurrent
+data structures. It uses DPDK's:
 
-Cost is O(ops): a few hundred nanoseconds per op plus validation. No rebuild,
-no pause, and the hot path is unchanged.
+- `rte_hash` with `RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF` for exact matches,
+  plus `rte_hash_rcu_qsbr_add` (defer-queue mode) on the runtime's `RcuDomain`
+  QSBR, so deleted key slots are reused only after workers quiesce. This is
+  the same wiring K7 uses for `rte_lpm`.
+- `rte_lpm` + QSBR for prefixes (K7, done).
+- Write-once object slots for K2 actions and K5 meters, reached through an
+  atomically stored id or pointer.
 
-#### Scope atomicity (opt-in)
+The one hot-path question is the cost of `rte_hash`'s lock-free lookup: it
+re-reads a table change counter to catch concurrent key moves. That must be
+measured against today's generation cuckoo before adoption (G1.2a).
 
-Per-op publish means a multi-rule change becomes visible rule by rule (each
-reference-safe). A consumer that needs a whole scope to switch at once -- a
-UPF session modification -- routes the scope's rules through one indirection
-cell: `classifier -> CellId`, and `cell[CellId]` holds the current program
-id. A modification writes the new program into write-once slots and switches
-the entire session with **one store** to the cell. This costs one extra
-dependent load on that consumer's hot path, and nothing for anyone else.
-It is the performance-shaped form of v4's aggregate `UpfGeneration`: O(session)
-per change instead of O(all sessions).
+**Mode W -- worker-applied, by message passing (for tables that must stay
+plain).** The control thread posts typed ops to a per-worker SPSC ring
+(`rte_ring`, one producer and one consumer). Each worker drains its ring
+**at the end of a scheduler round, before the next one** -- the same point
+where it already reports RCU quiescence -- and applies the ops to a table
+only it touches:
+
+- a **replica** per worker (for small/medium read-mostly tables: L2Forward's
+  MACs, ACL rules, HashLB gates); or
+- a **shard** it owns (flow and session state already partitioned by RSS:
+  NAT flows, future UPF session state).
+
+The hot path pays nothing: the table needs no synchronization at all, and the
+only added work is one ring-empty check per scheduler round, not per packet.
+The worker acks each ring batch through a completion counter. The control
+thread returns when every worker has acked, or returns a generation to wait
+on. All ops of one transaction are applied between the same two rounds, so a
+worker never processes a batch that sees half a transaction -- **per-worker
+atomicity across modules, with no indirection cell**. Costs: replicas
+multiply memory by the worker count, and an update takes effect within one
+round (microseconds under load; an idle worker drains on wake-up). Prevalidation
+runs once on the control side against a control-side copy, so every worker's
+apply is deterministic and cannot fail.
+
+**Mode G -- generation swap (bulk and tiny).** Build and swap: for loading or
+replacing a whole table, and for tiny configuration (a few ACL rules, a gate
+list) where rebuild cost is irrelevant. This is today's mechanism, kept where
+it fits.
+
+**Automatic selection.** Like `ResolveLookupBody`: the runtime chooses from
+table size, worker count and structure -- W-replica while
+`table_bytes x workers` fits a memory budget, C beyond that or when the table
+is written by the data path, G for bulk. A module can force a mode;
+`BESS_UPDATE_MODE` overrides it for experiments.
+
+#### Existing modules under the modes
+
+| module | today | target |
+|---|---|---|
+| ExactMatch | K3 generation rebuilt per add (7.9 ms at 100K) | C: `rte_hash` LF + QSBR (K3 already has rte_hash backends, currently built without concurrency flags); W-replica for small tables; G for bulk load |
+| WildcardMatch | generation rebuilt per add | C: one LF `rte_hash` per tuple; a new mask is a G swap of the tuple list (O(tuples)) |
+| IPLookup | K7 in place + QSBR | C (done) |
+| L2Forward | own table; add/delete pause every worker | W-replica (small tables), or C by moving to LF `rte_hash` |
+| ACL / HashLB / other small config | pause every worker per change | W-replica or G (tiny); no global pause |
+| NAT | flow table written on the data path | W-shard: each worker owns its flows; control queries via ring |
+| K5 meters | builder rebuild per change | C: slab slot + atomic pointer store |
+| K2 action tables | builder rebuild per change | C: write-once slots, atomic id publish |
+
+#### Transactions on top of the modes
+
+- **Reserve (all fallible work, nothing visible):** validate against the
+  control-side copies; allocate ids and slots; check capacity; for C tables
+  write entries into reserved slots without publishing them; for W tables
+  prebuild the per-worker op batches.
+- **Publish (infallible):** C tables publish in dependency order (referents
+  before referrers; removal in reverse, with retirement under one grace token
+  per transaction, reclaimed asynchronously). W tables post one batch per
+  worker and apply it between rounds. A transaction that spans both publishes
+  C referents first, then the W batches, then C referrers.
+- **Scope atomicity:** free per worker in mode W; opt-in with one indirection
+  cell (one extra load, only for modules that choose it) for C tables.
 
 #### What BESS provides on top
 
 1. **Resources.** A module or plugin may register named resources
    (`upf/pdr-v4`, `upf/actions`, `upf/meters`, `em0/rules`) implemented by the
-   live tables above. Registration is opt-in; `ModuleCommand` is unchanged,
-   and gets the O(1) insert too, because it drives the same live table.
+   update modes above. Registration is opt-in; `ModuleCommand` is unchanged,
+   and gets the O(1) insert too, because it drives the same table.
 2. **Scopes and `ReplaceScope(scope, objects)`,** the desired-state primitive:
    BESS diffs a scope's current objects against the desired set and emits the
    minimal op list.
@@ -7243,7 +7297,9 @@ per change instead of O(all sessions).
 | Batched ops over one RPC | one RPC per op | >= 500K ops/s |
 | UPF-shaped session (about 8 objects) in process | N RPCs + client rollback | >= 100K sessions/s |
 | Hit-path lookup (exact, masked, LPM, action) | -- | unchanged within run-to-run noise |
-| Miss-path lookup with the displacement counter, if added | -- | < 2% |
+| LF `rte_hash` lookup vs today's generation cuckoo | -- | measured; adopt C only within noise, else W-replica or a C++ variant chosen by benchmark |
+| Mode-W cost per scheduler round (empty ring) | -- | a single check; no per-packet cost |
+| Update latency, mode W | -- | at most one scheduler round |
 
 #### Worked examples (Go SDK sketches; PFCP semantics stay in OMEC)
 
@@ -7292,22 +7348,23 @@ the Cartesian product of ternary entries disappears from Go.
 
 #### Build order and gates
 
-1. **G1.2a — measure, then make single-module inserts O(1).**
-   - Baseline per-op cost in process and via `ModuleCommand` RPC for
-     ExactMatch, WildcardMatch, IPLookup, meters and K2 tables at 1K/100K/1M
-     entries.
-   - Build the live exact table (write-once entries, signature publish,
-     copy-then-clear displacement, pre-sized arena) and the write-once object
-     arena.
-   - Move ExactMatch and WildcardMatch `add`/`delete` onto them (bulk replace
-     keeps the swap).
-   - Prove hit-path lookups unchanged with the existing classifier and module
-     benchmarks.
-   - Concurrent reader tests, mutation-checked, show no false miss and no torn
-     entry -- or show the miss, and then add the miss-path counter and
-     measure it.
-   This step alone fixes today's O(n) inserts, independent of any
-   transaction API.
+1. **G1.2a -- measure, then make single-module inserts O(1).**
+   - **Measure first.** LF `rte_hash` (+QSBR) lookup against today's
+     generation cuckoo, hit and miss, from 1K to 10M entries; insert and
+     delete rates; per-op cost in process and via `ModuleCommand` RPC for
+     ExactMatch, WildcardMatch, L2Forward, IPLookup and meters.
+   - **Build the two mechanisms.** Mode C wiring (`rte_hash` LF + runtime
+     QSBR, write-once object slots) and mode W (per-worker SPSC op rings
+     drained at the scheduler-round boundary, completion counters, the
+     control-side prevalidation copy). Mutation-checked concurrency tests for
+     both: no false miss or torn entry in C; no half-applied batch in W.
+   - **Move the modules.** ExactMatch and WildcardMatch to C (or W-replica
+     when small), L2Forward, ACL and HashLB off the global pause (W or G),
+     with the automatic mode choice.
+   - **Prove the hot path is unchanged** with the existing classifier,
+     module and table-scale benchmarks.
+   This step alone fixes today's O(n) inserts and pause-per-command modules,
+   independent of any transaction API.
 2. **G1.2b — resources and transactions in C++:** a registry in
    `RuntimeState`; reserve/publish with reference validation;
    dependency-ordered publish; grace-period retirement batched per
@@ -8487,7 +8544,10 @@ requirement: live single-writer tables with O(1) in-place inserts and
 unchanged reader hot paths, reserve-then-publish transactions, an opt-in scope
 cell for session atomicity, and idempotent `request_id`. It starts with
 G1.2a: today's single insert is O(table) (ExactMatch 7.9 ms at 100K rules);
-make it O(1) first. Then G1.3 capabilities, G1.4 stats, and
+make it O(1) first, with three update modes covering all modules: C (DPDK
+lock-free `rte_hash`/`rte_lpm` + runtime QSBR, direct insert), W
+(per-worker op rings applied at the scheduler-round boundary, for replicas and
+shards), and G (generation swap for bulk and tiny tables). Then G1.3 capabilities, G1.4 stats, and
 the Go/C++ SDKs. The OMEC UPF program (section 28) is the driving consumer.
 
 ### Following stages
