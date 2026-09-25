@@ -155,12 +155,12 @@ separately.
 | E — Meson | Complete | Meson is the BESS build/test/install graph. |
 | F — operations | Partial | Packaging, releases, SBOM, observability, and tooling lanes remain. |
 | G0 — transactional core | Complete | Internal C++ desired-state/transaction engine is landed. |
-| G1 — public API/SDKs | Not started | Design after K7 establishes the remaining resource semantics. |
+| G1 — public API/SDKs | Not started | Next: K1–K7 now define the resources it exposes. |
 | H / I — language and type safety | Partial | Continue incrementally; K6 added a typed `WorkerId`. |
 | J — live table updates | Complete, subsumed | Pilot succeeded; current lifetime mechanism is K1 `RcuDomain`/`RcuPtr`. |
-| K — dataplane substrate | K1–K6 complete | K7 is next; K8 is consumer-driven. |
+| K — dataplane substrate | K1–K7 complete | K8 is consumer-driven; G1 is next. |
 
-Current software sequence: **K7 → G1 → D → F**, with H/I
+Current software sequence: **G1 → D → F**, with H/I
 hardening alongside those stages. K8 is lower priority and should start when a
 consumer requires fragmentation/reassembly. C-HW stays a separate, non-blocking
 hardware gate.
@@ -263,7 +263,17 @@ plus a typed `dataplane::WorkerId`. The `Track` gate hook is migrated onto it
 (its reset no longer pauses workers). GCC and Clang full Meson suites pass
 85/85.
 
-The active software scope K1-K6 is closed. Meson/Ninja remains the build graph,
+**K7 routes and next hops is complete (2026-09-25, entry 80).** `core/route/`
+adds `LpmRouteTable`/`RouteTable<Value>` (a live `rte_lpm` updated in place
+by one serialized writer, lock-free readers, tbl8 reclamation through the
+runtime's own QSBR), `Router` (routes -> `NextHopId` -> `NextHop` with
+egress, neighbor state and L2 addresses, publication ordering enforced), and
+`RewriteL2`. `IPLookup` is migrated: a route change is one in-place update
+(0.5-33 us) instead of a full rebuild (9-341 ms).
+
+GCC and Clang full Meson suites pass 87/87.
+
+The active software scope K1-K7 is closed. Meson/Ninja remains the build graph,
 with pinned DPDK 25.11.3. The registered Meson suite has 80 targets. At the
 2026-09-24 local verification checkpoint, the full GCC and Clang test suites
 both passed all 80 targets on CPUs 0–3. After the final benchmark-registration
@@ -3339,6 +3349,26 @@ rather than one call site).
     fall 88.7 -> 41.7 M/s. GCC and Clang full Meson suites pass 85/85.
     Details in the K6 section.
 
+80. **K7** — **routes and next hops.** Added `core/route/`:
+    `Ipv4Prefix`, `LpmRouteTable`/`RouteTable<Value>` (live `rte_lpm` changed
+    in place by one serialized writer; lock-free readers; tbl8 reclamation
+    through the runtime QSBR via new `RcuDomain::dpdk_qsbr()`; /0 as an
+    atomic default; `Clear()` as an RCU swap; x4 batch lookup with SIMD hit
+    mask), `Router` (`NextHopId` -> `NextHop` {egress, neighbor state, MACs}
+    in a K2 `ObjectTable` generation; next hop published before routes that
+    use it, readers fence between route and next-hop loads, referenced hops
+    cannot be removed, removals wait a grace period) and `RewriteL2`.
+    Migrated `IPLookup` off per-change full rebuilds. 11 new tests including
+    entry 34's arbitrary-order LPM gate (32K routes, 98K keys, through churn)
+    and two mutation-checked concurrency tests (QSBR removed: 3/3 fail with
+    unjustified answers; removal grace period removed: 3/3 fail with lost
+    next hops). Benchmarks via `omarchy-benchmark --cpu 2 --isolate`:
+    `RouteTable` batch lookup (single-pass scalar, chosen by a body study)
+    117-127 ns per 32 vs 114-134 ns for the old x4 loop on hugepages; one route
+    change 0.53/7.96/32.7 us in place vs 9.4/34.5/341 ms by rebuild at
+    1K/16K/64K routes. GCC and Clang full Meson suites pass 87/87. Details
+    in the K7 section.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -3500,7 +3530,7 @@ Add a regression test or process-level smoke that launches actual daemon mode un
 ## Order of work
 
 The roadmap letters are workstream labels, not an execution sequence. The
-foundations below are complete; the remaining plan starts at K7:
+foundations below are complete; the remaining plan starts at G1:
 
 ```text
 COMPLETE
@@ -3508,10 +3538,10 @@ A / B / C-software / E
 J live-update pilot (subsumed by K1)
 G0 transactional control core
 K1 RCU/QSBR -> K2 object/action tables -> K3 classifiers -> K4 packet primitives
-  -> K5 metering -> K6 worker-local stats
+  -> K5 metering -> K6 worker-local stats -> K7 routes/next hops
 
 NEXT
-K7 routes/next hops -> G1 -> D -> F
+G1 public API/SDKs -> D -> F
 
 K8 fragmentation/reassembly: start when a consumer requires it.
 H/I hardening: proceed incrementally alongside the sequence.
@@ -4313,9 +4343,10 @@ See the Phase E summary and CI evidence at the top of this document.
 **Current status:** J's live-update pilot is complete and subsumed by K1. The
 `std::atomic<std::shared_ptr>` / `PublishedGeneration` implementation and
 backend recommendation described below are historical pilot material, not the
-current mechanism. `IPLookup` and `ExactMatch` now use K1's
-`bess::rcu::RcuPtr<Generation>` backed by the runtime `RcuDomain`; no parallel
-J RCU subsystem remains.
+current mechanism. `ExactMatch` uses K1's `bess::rcu::RcuPtr<Generation>`
+backed by the runtime `RcuDomain`; `IPLookup` moved further in K7 (entry 80),
+from rebuild-and-swap to an in-place `rte_lpm` under the same runtime QSBR.
+No parallel J RCU subsystem remains.
 
 Cross-cutting phase, not a natural fit under A–I: touches the control
 plane (Phase G), the module command API, and the scheduler loop. Emerged
@@ -5227,7 +5258,7 @@ MBUF_FAST_FREE, PortOut lock elimination, DPDK version upgrade, ARM/SIMD
 ```
 
 The boundary below reflects G0's original scope: when G0 was implemented, K did
-not yet exist. K1–K6 are now complete and K7 remains ahead; keep public API
+not yet exist. K1–K7 are now complete; keep public API
 work in G1 until those resource semantics are established. Do not build a Go
 SDK yet or add transaction logic to `pybess`/Python `bessctl`: the existing
 Python tools should get correctness by routing through the C++ control plane,
@@ -6587,41 +6618,132 @@ Control side: a 3-counter snapshot of all 64 worker slots costs 384 ns
 
 ---
 
-### K7 — route and next-hop abstraction — PENDING
+### K7 — route and next-hop abstraction — COMPLETE
 
-Introduce a generic routing layer:
-
-```text
-RouteTable
-NextHopId
-NextHop
-neighbor state
-egress port
-L2 rewrite
-bulk lookup
-route generation
-```
-
-Do not couple application logic directly to a specific DPDK table implementation.
-
-Current trusted backend:
+**Status: complete (2026-09-25, entry 80).** Source: `core/route/`
+(`route_table.{h,cc}`, `router.{h,cc}`), `RcuDomain::dpdk_qsbr()`; tests
+`route_test.cc`; benchmark `route_bench.cc`; `IPLookup` migrated.
 
 ```text
-rte_lpm
+IPv4 dst --LpmRouteTable (rte_lpm)--> 24-bit value
+RouteTable<Value>                      typed face (IPLookup: a gate)
+Router:  dst --LPM--> NextHopId --ObjectTable--> NextHop
+NextHop  egress gate, NeighborState {resolved, incomplete, unreachable},
+         dst/src MAC; RewriteL2(pkt, hop) via K4 writeability checks
 ```
 
-`rte_fib` was benchmarked and showed order-dependent correctness failures at large arbitrary-order route sets. It must **not** become the default until that issue is resolved and independently revalidated.
+Ownership: DPDK `rte_lpm` owns the longest-prefix-match algorithm and its
+concurrent-reader design; BESS owns prefix validation, the authoritative rule
+set (rte_lpm cannot be read back), typed values, the default route, QSBR
+wiring, the route/next-hop split and its publication ordering. Applications
+own neighbor resolution (ARP/ND), what an unresolved neighbor means, and
+policy routing.
 
-Desired shape:
+#### Decisions and evidence
 
-```text
-RouteTable API
-   │
-   ├── rte_lpm backend       trusted/default
-   └── rte_fib backend       disabled/experimental until correctness fixed
-```
+1. **In place, not rebuild-and-swap.** `rte_lpm`'s build is quadratic (its
+   per-depth rule array is searched linearly on every add), so rebuilding per
+   change -- what `IPLookup` did since Phase J -- costs a whole table per
+   route. DPDK 25.11's `rte_lpm` is designed for one writer changing it in
+   place under lock-free readers: every entry is written with
+   `rte_atomic_store_explicit`, a new tbl8 group is populated before the
+   tbl24 entry pointing to it is published behind a release fence, and freed
+   tbl8 groups go through a QSBR defer queue. BESS attaches the runtime's
+   `RcuDomain` QSBR (`RTE_LPM_QSBR_MODE_DQ`; new `RcuDomain::dpdk_qsbr()`), so
+   reclamation waits on the same worker quiescence as K1 and never blocks the
+   writer. This is a deliberate, documented exception to "published objects
+   are immutable": the concurrency design is DPDK's own. Consequence stated
+   in the API: each route change is atomic to readers; a sequence of changes
+   is not one transaction. `Clear()` (wholesale) still builds a fresh
+   instance and publishes it via `RcuPtr`.
+2. **Correctness gate (entry 34's).** 32,768 routes (mostly /24, /8-/23, and
+   /25-/32 nested under earlier /24s) inserted in arbitrary order agree with
+   an independent per-length hash LPM on 98,304 keys through both the batch
+   and single lookups, and still agree after deleting a third, re-pointing a
+   third and re-adding. (This is the gate `rte_fib` failed; `rte_fib` stays
+   unimplemented here.)
+3. **Concurrent readers only see justified answers.** Two registered readers
+   look up keys while the writer churns /26 routes for 500 ms with a 4-group
+   tbl8 pool, so nearly every add reuses a just-freed group. Every answer must
+   be the covering /16's value or the /26's. With QSBR attached: 0 bad of
+   ~3x10^8 lookups per run (3 runs). With `rte_lpm_rcu_qsbr_add` removed: the
+   test fails 3/3 (7 unjustified answers in one ~3x10^8-lookup run) -- tbl8
+   reuse under a reader is real and the QSBR wiring is what prevents it.
+4. **Route/next-hop publication ordering.** Routes live in the in-place LPM,
+   next hops in a K2 `ObjectTable` generation behind `RcuPtr`, so a neighbor
+   update republishes only next hops and a route change never copies them.
+   Rules enforced in `Router`: a route may only name an existing next hop,
+   published first with a release fence before the LPM store; readers resolve
+   routes, then an acquire fence, then load the next-hop generation; a next
+   hop cannot be removed while referenced (`kNextHopInUse`), and its removal
+   is published only after `RcuDomain::Synchronize()`.
+   `ConcurrentChurnNeverLosesANextHop` (2 readers, 500 ms of
+   add-hop/add-route/remove-route/remove-hop churn, ~290K rounds): 0 lost; with
+   the grace period removed it fails 3/3 (2-7 lost of ~7.6M batches).
+5. **Batch lookup body, chosen by measurement.** `LookupBatch` is a single
+   pass of scalar `rte_lpm_lookup` with the hit test and default folded in
+   (branch-free), not the `rte_lpm_lookupx4` path `IPLookup` used. A
+   K4.5-style body study (`BM_LookupBody`, same table and keys, hugepages)
+   found x4 never the fastest body; isolated scalar/bulk bodies were up to
+   30% faster on cache-resident tables. Composed into the real path, a
+   separate bulk-then-fix-up pass lost to x4 with a SIMD mask, and the
+   single-pass scalar body won: 117-127 ns vs 114-134 ns for the raw x4 loop
+   on cached rows, and 268-298 ns vs 333-482 ns for the composed x4 version
+   on a DRAM-bound 4M-key stream. Prefetching tbl24 entries gave no
+   consistent win (-15% to +15%): one independent load per lookup is already
+   overlapped by the out-of-order core. Scalar is also the portable path.
+6. **`IPLookup` migration.** Its private generation/rebuild code is gone:
+   `add`/`delete` are single in-place changes, `clear` swaps a fresh table,
+   the /0 route is the default gate, and error codes are preserved (`ENOENT`
+   "no such rule"; deleting an unset default succeeds).
 
----
+#### Benchmark evidence
+
+`route_bench`, GCC release, `omarchy-benchmark --cpu 2 --isolate`, medians of
+3, `--benchmark_min_time=0.3s`, EAL on the host's 1 GiB hugepage
+(`BESS_DPDK_HUGEPAGE_MB=1024`). ns per 32-address batch; "cached" = a 32K-key
+stream drawn from the routes, "DRAM" = 4M uniformly random keys walking the
+64 MiB tbl24:
+
+| routes | raw x4 + SSE swap (pre-K7 shape), cached / DRAM | `RouteTable::LookupBatch`, cached / DRAM | `Router::ResolveBatch`, cached |
+|---:|---:|---:|---:|
+| 1,024 | 114 / 307 | 127 / 268 | 167 |
+| 16,384 | 133 / 259 | 117 / 298 | 167 |
+| 65,536 | 134 / 222 | 126 / 279 | 168 |
+
+Body study (raw table, ns per 32, hugepages):
+
+| rows | x4 | scalar | bulk | pf+x4 | pf+scalar |
+|---|---:|---:|---:|---:|---:|
+| 1K, cached | 118 | 82 | 82 | 114 | 84 |
+| 64K, cached | 132 | 106 | 107 | 112 | 90 |
+| 1K, DRAM | 312 | 240 | 214 | 244 | 225 |
+| 64K, DRAM | 220 | 240 | 213 | 216 | 276 |
+
+One route change (4 KiB pages; the rebuild row is rte_lpm build cost):
+
+| routes | in place (K7) | full rebuild (pre-K7 IPLookup) | ratio |
+|---:|---:|---:|---:|
+| 1,024 | 0.53 us | 9.4 ms | ~17,700x |
+| 16,384 | 7.96 us | 34.5 ms | ~4,300x |
+| 65,536 | 32.7 us | 341 ms | ~10,400x |
+
+(The 1K rebuild is dominated by zeroing `rte_lpm`'s fixed 64 MiB tbl24; the
+in-place cost grows with the rules at a depth because `rte_lpm_add` searches
+them linearly.) A neighbor update (`SetNextHop`) republishes the next-hop
+table: 1.09 us at 1,024 next hops, 80.7 us at 65,536.
+
+#### Not in K7 (deliberately)
+
+- IPv6 (`rte_lpm6`): same design when a consumer needs it.
+- `rte_fib`: still excluded; entry 34's arbitrary-order failure is not
+  revalidated, and this gate is the one it must pass first.
+- Multi-route atomic transactions: in-place updates are per-route atomic;
+  G1's dataplane transaction decides whether to batch via `Clear()`-style
+  rebuild or accept per-route visibility.
+- ECMP/next-hop groups, per-route/next-hop K6 counters, neighbor resolution.
+- Memory: every table carries `rte_lpm`'s 64 MiB tbl24, and `Clear()`
+  briefly holds two until the old one is reclaimed.
 
 ### K8 — generic IPv4 fragmentation/reassembly — PENDING (consumer-driven)
 
@@ -6646,7 +6768,7 @@ Lower priority than K1–K3 and K5/K6.
 ## 14. Phase G1 — desired-state API and thin language SDKs — NOT STARTED
 
 After G0 and enough K resources exist to design against real semantics, expose
-the new public API. Start G1 after K7 completes the resource contracts.
+the new public API. K1–K7 now provide the resource contracts G1 exposes.
 
 The old imperative API should not constrain the ideal end state.
 
@@ -6775,7 +6897,7 @@ Do not fold the CLI into the privileged daemon merely because both are C++.
 
 ## 16. Phase D — ARM64 + portable architecture — NOT STARTED
 
-Phase D remains important but no longer blocks completed G0/K1–K6 or the next
+Phase D remains important but no longer blocks completed G0/K1–K7 or the next
 K stages. D1–D4 are not started; real ARM performance remains a separate
 hardware gate.
 
@@ -7807,8 +7929,8 @@ the reviewing document's word alone.
 
 ## 26. Current execution plan (2026-09-25)
 
-K1–K6, G0, A, B, C-software, E, and the J live-update pilot are closed. The
-next software phase is K7; do not restart already-closed architecture work.
+K1–K7, G0, A, B, C-software, E, and the J live-update pilot are closed. The
+next software phase is G1; do not restart already-closed architecture work.
 
 ### Done — K5 generic metering (2026-09-25)
 
@@ -7823,20 +7945,23 @@ K5 section for decisions and benchmark evidence.
 `CounterSet`, `WorkerHistogram`, stamped snapshots, baseline resets, checked
 deltas, typed `WorkerId`; `Track` migrated. See the K6 section.
 
-### Next — K7 routes/next hops (not started)
+### Done — K7 routes and next hops (2026-09-25)
 
-Add reusable route, next-hop, neighbor, egress, and rewrite resources. Keep
-`rte_lpm` as the trusted default; do not promote `rte_fib` without correctness
-evidence and a real consumer. Reuse K2 ids/tables, K1 publication, K4 rewrite
-primitives, and K6 counters for per-route/next-hop accounting.
+`core/route/`: in-place `rte_lpm` route tables under the runtime QSBR,
+`Router` with ordered route/next-hop publication, `RewriteL2`; `IPLookup`
+migrated. See the K7 section.
+
+### Next — G1 public desired-state API and SDKs (not started)
+
+Expose G0's desired-state engine and the K resources (classifier entries,
+actions, meters, routes, next hops) through a public v2 API with a dataplane
+transaction RPC, capability and stats (K6 snapshot) surfaces, then thin Go
+and C++ SDKs. Decide per resource how transactions map onto its update model
+(K7 routes are per-change atomic in place; K2/K3/K5 are generation swaps).
 
 ### Following stages
 
-1. **G1 — public API/SDKs (not started):** after K7 stabilizes, expose
-   desired-state and dataplane transactions (classifier entries, actions,
-   meters, routes, next hops) and stats snapshots, then thin Go and C++ SDKs.
-   G0 remains the internal transactional engine.
-2. **K8 — fragmentation/reassembly (pending, consumer-driven):** schedule when
+1. **K8 — fragmentation/reassembly (pending, consumer-driven):** schedule when
    a real consumer needs it; bound resources and test partial-failure cleanup.
 
 ### Parallel and deferred work
@@ -7855,7 +7980,7 @@ primitives, and K6 counters for per-route/next-hop accounting.
 
 ## 25. Known lower-priority research/backlog
 
-These remain useful, but should not distract from the active K7 → G1 sequence.
+These remain useful, but should not distract from the active G1 work.
 
 - symmetric RSS configuration as a generic PMD capability;
 - RETA control if a real consumer appears;
@@ -7972,21 +8097,26 @@ Every hardware acceleration must retain a software fallback with identical BESS 
 
 ### 30. Current handoff
 
-K5 (`990f6726`, entry 78) and K6 (entry 79) landed on `develop` on
-2026-09-25 on top of the maintenance-only baseline `6959bd27`. GCC and Clang
-full local Meson suites pass 85/85 (80 pre-K5 targets plus `meter_meter_test`,
-`meter_meter_set_test`, `meter_bench`, `stats_stats_test`, `stats_bench`).
+K5 (`990f6726`, entry 78), K6 (`ce6241bf`, entry 79) and K7 (entry 80)
+landed on `develop` on 2026-09-25 on top of the maintenance-only baseline
+`6959bd27`. GCC and Clang full local Meson suites pass 87/87 (80 pre-K5
+targets plus `meter_meter_test`, `meter_meter_set_test`, `meter_bench`,
+`stats_stats_test`, `stats_bench`, `route_route_test`, `route_bench`).
 
-Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K6.
-Partial: F, H, and I. Not started: D, G1, K7, and K8 (K8 is consumer-driven).
+Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K7.
+Partial: F, H, and I. Not started: D, G1, and K8 (consumer-driven).
 C-HW remains a separate deferred hardware-validation track.
 
-**Next software work: K7 routes/next hops**, then G1 public API/SDKs. Do not
-reopen closed K architecture; do not block the software sequence on real-NIC
-work. Benchmarks are run through `omarchy-benchmark` (pinned, isolated,
+**Next software work: G1 public API/SDKs.** Do not reopen closed K
+architecture; do not block the software sequence on real-NIC work.
+Benchmarks are run through `omarchy-benchmark` (pinned, isolated,
 performance governor); multithreaded gbench rows must self-pin each thread,
 because the EAL pins the main thread and isolated partitions do not load
-balance.
+balance. Concurrency tests are mutation-checked: remove the mechanism under
+test and confirm the test fails before trusting a pass. Beyond-cache rows
+must use key streams far larger than the caches (a small cycling stream stays
+resident -- K2.6, K4.5c, K7 all hit this), and DPDK-memory rows should run
+with `BESS_DPDK_HUGEPAGE_MB=1024` (one 1 GiB page on this host).
 
 
 ## Benchmark / experiment backlog (from the 2026-09-18 DPDK-proposal review)

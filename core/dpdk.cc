@@ -239,6 +239,22 @@ void InitDpdk(int dpdk_mb_per_socket) {
 
   if (!is_initialized) {
     is_initialized = true;
+    // Test and benchmark binaries bring the EAL up lazily with no hugepages.
+    // BESS_DPDK_HUGEPAGE_MB=<MB per socket> opts them into hugepage memory
+    // (so tables beyond the TLB reach are measured the way a hugepage bessd
+    // runs them). An unprivileged process cannot resolve physical addresses,
+    // so this path uses IOVA-as-VA unless -iova says otherwise.
+    if (dpdk_mb_per_socket <= 0) {
+      if (const char *env = std::getenv("BESS_DPDK_HUGEPAGE_MB")) {
+        const int mb = std::atoi(env);
+        if (mb > 0) {
+          dpdk_mb_per_socket = mb;
+          if (FLAGS_iova.empty()) {
+            FLAGS_iova = "va";
+          }
+        }
+      }
+    }
     init_eal(dpdk_mb_per_socket, GetNonWorkerCoreList());
   }
 }

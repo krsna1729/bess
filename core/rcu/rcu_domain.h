@@ -156,6 +156,12 @@ class RcuDomain {
 
   RcuStats Stats() const;
 
+  // The underlying DPDK QSBR variable, for DPDK libraries with native QSBR
+  // integration (K7: `rte_lpm_rcu_qsbr_add`), so their internal reclamation
+  // waits on the same worker quiescent states as everything else. Hand it to
+  // such a library only; BESS code uses the semantic API above.
+  struct rte_rcu_qsbr *dpdk_qsbr() const noexcept { return qsbr_; }
+
  private:
   struct RetiredObject {
     GracePeriod token;

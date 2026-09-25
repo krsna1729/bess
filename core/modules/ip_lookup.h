@@ -31,18 +31,15 @@
 #ifndef BESS_MODULES_IPLOOKUP_H_
 #define BESS_MODULES_IPLOOKUP_H_
 
-#include <atomic>
-#include <functional>
 #include <memory>
-#include <mutex>
+#include <string>
 #include <tuple>
-#include <vector>
 
-#include "../control/runtime_state.h"
+#include "../dataplane/strong_id.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
+#include "../route/route_table.h"
 #include "../utils/endian.h"
-#include "../rcu/rcu_ptr.h"
 
 using bess::utils::be32_t;
 using ParsedPrefix = std::tuple<int, std::string, be32_t>;
@@ -53,10 +50,7 @@ class IPLookup final : public Module {
 
   static const Commands cmds;
 
-  IPLookup()
-      : Module(), published_(bess::control::runtime().rcu()) {
-    max_allowed_workers_ = Worker::kMaxWorkers;
-  }
+  IPLookup() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 
   CommandResponse Init(const bess::pb::IPLookupArg &arg);
 
@@ -69,53 +63,17 @@ class IPLookup final : public Module {
   CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
 
  private:
-  // One rule as the control plane last set it. This list, not rte_lpm, is the
-  // source of truth a rebuild is made from -- rte_lpm cannot be read back.
-  struct Route {
-    be32_t prefix;
-    uint8_t prefix_len;
-    gate_idx_t gate;
-  };
-
-  // One immutable routing generation. ProcessBatch() takes a snapshot of the
-  // current generation once per batch and never observes a *mutated* table:
-  // each routing command builds a replacement off the data path and publishes
-  // it atomically, and a retired generation is freed by shared_ptr as soon as
-  // the last batch holding it returns. That is what lets route updates run
-  // while workers keep forwarding, instead of requiring workers to be paused
-  // (MODERNIZATION.md entry 35).
-  struct Generation {
-    ~Generation();
-
-    std::vector<Route> routes;
-    struct rte_lpm *lpm = nullptr;
-    gate_idx_t default_gate = DROP_GATE;
-  };
-
-  using GenerationPtr = std::unique_ptr<const Generation>;
-
-  // Builds a generation from `routes`, or returns nullptr with `*err` set to
-  // the errno a caller can report. Called with the writer lock held, or before
-  // the module is running.
-  GenerationPtr Build(const std::vector<Route> &routes, gate_idx_t default_gate,
-                      int *err);
-
-  // Replaces the published generation with `build(current)`, or leaves the
-  // active one alone when the builder returns nullptr (with *err set). The
-  // writer protocol lives here so no call site can publish without retiring,
-  // or retire before publishing (K1).
-  bool Publish(const std::function<GenerationPtr(const Generation &)> &build,
-               int *err);
+  // A route's value is an output gate (DROP_GATE included), stored directly:
+  // this module's result *is* a gate, so there is no next-hop indirection.
+  struct GateRouteTag;
+  using GateRoute = bess::dataplane::StrongId<GateRouteTag, uint32_t>;
 
   ParsedPrefix ParseIpv4Prefix(const std::string &prefix, uint64_t prefix_len);
 
-  // Publication and reclamation (bess::rcu::RcuPtr + the runtime's RcuDomain):
-  // one acquire load per batch on the data path, serialized rebuilds off it,
-  // and the retired generation is destroyed by a control thread rather than on
-  // a packet worker.
-  bess::rcu::RcuPtr<Generation> published_;
-  uint32_t max_rules_ = 0;    // from Init(), reused for every rebuild
-  uint32_t max_tbl8s_ = 0;
+  // K7 route table: a live rte_lpm updated in place under the runtime's QSBR
+  // (one rule insertion per add, not a rebuild), read lock-free per batch.
+  // The /0 route is the default gate; with none, misses go to DROP_GATE.
+  std::unique_ptr<bess::route::RouteTable<GateRoute>> routes_;
 };
 
 #endif  // BESS_MODULES_IPLOOKUP_H_
