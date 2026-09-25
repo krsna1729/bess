@@ -40,6 +40,7 @@
 #include <span>
 #include <vector>
 
+#include "dataplane/batch_stages.h"
 #include "meter/meter.h"
 #include "utils/common.h"
 
@@ -97,15 +98,24 @@ class MeterSet {
                       uint64_t now) const noexcept {
     promise(ids.size() == bytes.size() && ids.size() == colors.size());
     promise(ids.size() <= kMaxBatch);
+    // Stage-major: resolve every id and write-prefetch its state line, then
+    // run the checks, so a batch's state misses overlap (K5/K4.6).
     std::array<MeterState *, kMaxBatch> meters;
-    Resolve(ids, meters);
     uint64_t resolved = 0;
-    for (size_t i = 0; i < ids.size(); i++) {
-      if (MeterState *meter = meters[i]) {
-        colors[i] = meter->Check(now, bytes[i]);
-        resolved |= uint64_t{1} << i;
-      }
-    }
+    dataplane::RunStages(
+        ids.size(),
+        [&](size_t i) {
+          meters[i] = Lookup(ids[i]);
+          if (meters[i] != nullptr) {
+            dataplane::Prefetch<dataplane::PrefetchIntent::kWrite>(meters[i]);
+          }
+        },
+        [&](size_t i) {
+          if (MeterState *meter = meters[i]) {
+            colors[i] = meter->Check(now, bytes[i]);
+            resolved |= uint64_t{1} << i;
+          }
+        });
     return resolved;
   }
 
@@ -117,15 +127,24 @@ class MeterSet {
                                 uint64_t now) const noexcept {
     promise(ids.size() == bytes.size() && ids.size() == colors.size());
     promise(ids.size() <= kMaxBatch);
+    // Stage-major: resolve every id and write-prefetch its state line, then
+    // run the checks, so a batch's state misses overlap (K5/K4.6).
     std::array<MeterState *, kMaxBatch> meters;
-    Resolve(ids, meters);
     uint64_t resolved = 0;
-    for (size_t i = 0; i < ids.size(); i++) {
-      if (MeterState *meter = meters[i]) {
-        colors[i] = meter->CheckColorAware(now, bytes[i], colors[i]);
-        resolved |= uint64_t{1} << i;
-      }
-    }
+    dataplane::RunStages(
+        ids.size(),
+        [&](size_t i) {
+          meters[i] = Lookup(ids[i]);
+          if (meters[i] != nullptr) {
+            dataplane::Prefetch<dataplane::PrefetchIntent::kWrite>(meters[i]);
+          }
+        },
+        [&](size_t i) {
+          if (MeterState *meter = meters[i]) {
+            colors[i] = meter->CheckColorAware(now, bytes[i], colors[i]);
+            resolved |= uint64_t{1} << i;
+          }
+        });
     return resolved;
   }
 
@@ -138,20 +157,6 @@ class MeterSet {
 
  private:
   friend class MeterSetBuilder;
-
-  // First pass of a batch: resolve every id and prefetch every state line, so
-  // the checks that follow overlap their cache misses instead of taking them
-  // one at a time. Meter state is read-modify-write, hence the write
-  // prefetch.
-  void Resolve(std::span<const MeterId> ids,
-               std::array<MeterState *, kMaxBatch> &meters) const noexcept {
-    for (size_t i = 0; i < ids.size(); i++) {
-      meters[i] = Lookup(ids[i]);
-      if (meters[i] != nullptr) {
-        __builtin_prefetch(meters[i], 1);
-      }
-    }
-  }
 
   MeterSet(std::vector<MeterState *> states,
            std::vector<std::shared_ptr<MeterState>> owners,

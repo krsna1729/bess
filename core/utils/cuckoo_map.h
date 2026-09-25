@@ -274,6 +274,27 @@ class CuckooMap {
     return &entries_[idx];
   }
 
+  // Batch pipelining hooks: a batch lookup can hash every key and prefetch its
+  // primary bucket, then (once buckets are cached) prefetch each candidate
+  // entry, before probing -- so one batch's cache misses overlap instead of
+  // each key paying its dependent bucket -> entry misses in turn. Both are
+  // hints only; skipping them changes nothing but speed.
+  void PrefetchBucketPrehashed(HashResult hash) const {
+    __builtin_prefetch(&buckets_[NormalizeHash(hash) & bucket_mask_], 0, 3);
+  }
+  // (utils/ stays free of dataplane/ headers, hence the raw builtin here.)
+
+  void PrefetchEntryPrehashed(HashResult hash) const {
+    const HashResult primary = NormalizeHash(hash);
+    const Bucket& bucket = buckets_[primary & bucket_mask_];
+    for (int i = 0; i < kEntriesPerBucket; i++) {
+      if (bucket.hash_values[i] == primary) {
+        __builtin_prefetch(&entries_[bucket.entry_indices[i]], 0, 3);
+        return;
+      }
+    }
+  }
+
   // Instrumented heterogeneous lookup for benchmark diagnostics.
   template <typename Probe, typename StoredProbeEqual>
   const Entry* FindPrehashedAsWithStats(HashResult hash, const Probe& probe,

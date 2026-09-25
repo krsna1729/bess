@@ -271,7 +271,12 @@ egress, neighbor state and L2 addresses, publication ordering enforced), and
 `RewriteL2`. `IPLookup` is migrated: a route change is one in-place update
 (0.5-33 us) instead of a full rebuild (9-341 ms).
 
-GCC and Clang full Meson suites pass 87/87.
+**K4.6 (entry 81) revisited K4.5:** its "no generic prefetch policy" stands,
+but its evidence never reached dependent-miss tables. Stage-major batch
+execution (`dataplane::RunStages`) now drives ExactMatch's cuckoo lookup
+(-26% at 16K entries, up to -48% at 1M with 32-byte keys) and `MeterSet`;
+`rte_lpm` measured no gain and stays plain. GCC and Clang full Meson suites
+pass 89/89.
 
 The active software scope K1-K7 is closed. Meson/Ninja remains the build graph,
 with pinned DPDK 25.11.3. The registered Meson suite has 80 targets. At the
@@ -3366,8 +3371,21 @@ rather than one call site).
     `RouteTable` batch lookup (single-pass scalar, chosen by a body study)
     117-127 ns per 32 vs 114-134 ns for the old x4 loop on hugepages; one route
     change 0.53/7.96/32.7 us in place vs 9.4/34.5/341 ms by rebuild at
-    1K/16K/64K routes. GCC and Clang full Meson suites pass 87/87. Details
+    1K/16K/64K routes. GCC and Clang full Meson suites pass 89/89 (with
+    K4.6). Details
     in the K7 section.
+
+81. **K4.6** — **K4.5 revisited; stage-major batch pipelining where it
+    pays.** Found K4.5's prefetch evidence blind to dependent-miss tables
+    (<= 1 MiB tables, packet-head prefetch only). Added
+    `dataplane/batch_stages.h` (`RunStages`, typed `Prefetch`), `CuckooMap`
+    bucket/entry prefetch hooks, `classifier_cuckoo_scale_bench` (tables 256
+    to 4M entries; keys 8/32/64 B; values 2/16/64 B), and the opt-in
+    `BESS_DPDK_HUGEPAGE_MB` EAL knob. ExactMatch's cuckoo batch lookup is now
+    staged: -26% at 16K entries, -32..-48% at 1M-4M, growing with key size;
+    ~8% slower only in the hot-repeat 256-rule microbenchmark. `MeterSet`
+    uses the helper with no regression. `rte_lpm` gets no prefetch (measured
+    no win). Details in the K4.6 section.
 
 ## Review process established this session
 
@@ -6347,6 +6365,77 @@ original extraction/body JSON outputs remain historical K4.5a evidence.
 
 ---
 
+#### K4.6 — K4.5 revisited: batch pipelining where it pays (2026-09-25, entry 81)
+
+K4.5 concluded "no universal ILP policy, no generic prefetch policy, no new
+executor". A second look, prompted by VPP's emphasis on these techniques and
+by K5's 3x prefetch win beyond L3, found the conclusions right but the
+evidence blind to the case that matters:
+
+- K4.5's largest table was 65,536 small entries (~1 MiB, L2-resident), and
+  its prefetch variant prefetched only packet heads -- already hot in a
+  fixture of reused packets. It never prefetched *table* state and never ran
+  a working set beyond the caches, so it could not observe the regime where
+  batch pipelining helps: dependent cache misses.
+- **What stands:** ILP4 interleaving is not a win. The same held for
+  `rte_lpm_lookupx4` (K7: never the best body). And prefetch is not a
+  generic policy: for `rte_lpm`, one independent tbl24 load per lookup, the
+  out-of-order core already overlaps a batch's misses and prefetch varied
+  -15%..+15%.
+- **What K4.5 missed:** structures where each lookup is a chain of dependent
+  misses gain a lot from stage-major execution (hash/resolve and prefetch the
+  whole batch, then probe). Measured on the production ExactMatch cuckoo
+  state (`classifier_cuckoo_scale_bench`, 4M-lookup random-hit stream, 32 per
+  batch, `omarchy-benchmark --cpu 2 --isolate`, medians of 3, ns per batch):
+
+  | key/value bytes | entries | one-at-a-time | staged (shipped) | change |
+  |---|---:|---:|---:|---:|
+  | 8 / 2 | 256 | 336 | 331 | -1% |
+  | 8 / 2 | 4,096 | 413 | 348 | -16% |
+  | 8 / 2 | 16,384 | 469 | 347 | -26% |
+  | 8 / 2 | 1M | 1391 | 951 | -32% |
+  | 8 / 2 | 4M | 1727 | 1142 | -34% |
+  | 32 / 2 | 1M | 2424 | 1261 | -48% |
+  | 64 / 2 | 1M | 2798 | 1527 | -45% |
+  | 64 / 2 | 4M | 3171 | 1802 | -43% |
+  | 8 / 16 | 1M | 1517 | 1024 | -32% |
+  | 8 / 64 | 1M | 1773 | 1237 | -30% |
+
+  Bigger keys and entries mean more lines per lookup and a bigger win. A
+  two-stage variant (then also prefetch each candidate entry) helped only
+  large keys at DRAM sizes and cost ~40% on cached tables, so it is not
+  shipped. K5's meters (id -> state pointer -> state) are the same shape
+  (~3x beyond L3).
+
+What changed:
+
+1. `core/dataplane/batch_stages.h`: `RunStages(n, stage...)` runs each stage
+   lambda over the whole batch before the next (a fold over inlined loops;
+   no allocation, erasure or indirect call), and `Prefetch<Intent,
+   Locality>()` is a typed prefetch hint. Opt-in: nothing requires them, and
+   the header says when they pay and when they do not.
+2. `CuckooMap::PrefetchBucketPrehashed()` / `PrefetchEntryPrehashed()` hooks.
+3. ExactMatch's runtime cuckoo batch lookup
+   (`RuntimeCuckooLookupBatchPrehashedImpl`) is now staged via `RunStages`.
+   Caveat recorded honestly: the module microbenchmark that repeats the same
+   32 hot keys on a 256-rule table got ~8% slower (97.7 -> 106 ns per batch;
+   end to end 155 -> 166 ns) -- with everything in L1 there is nothing to
+   hide. With a realistic key stream a 256-entry table is at parity, and
+   every larger table gains, so it ships unconditionally.
+4. `MeterSet::CheckBatch*` expresses its K5 two-pass shape with `RunStages`
+   and a write-intent `Prefetch`; ratios to the raw floor are unchanged
+   (1.21/1.07/1.10/1.74/1.62 vs 1.16/1.04/1.09/1.86/1.61 in K5).
+5. (Landed with K7.) `BESS_DPDK_HUGEPAGE_MB=<MB>` lets EAL-lazy tests and benchmarks run on
+   hugepages (IOVA-as-VA for unprivileged use); `bessd` is unaffected. The
+   host has one 1 GiB page mounted at `/dev/hugepages`. Leave it unset in the
+   parallel Meson suite: each binary would claim the same page.
+
+Candidates not yet measured: WildcardMatch's masked tuple-space probe (one
+hash lookup per tuple -- the same dependent shape, multiplied), and the
+legacy `utils/ExactMatchTable`/`CuckooMap` users (NAT, L2Forward).
+
+---
+
 ### K5 — generic software metering — COMPLETE
 
 **Status: complete (2026-09-25, entry 78).** Software metering is a BESS
@@ -8097,11 +8186,13 @@ Every hardware acceleration must retain a software fallback with identical BESS 
 
 ### 30. Current handoff
 
-K5 (`990f6726`, entry 78), K6 (`ce6241bf`, entry 79) and K7 (entry 80)
-landed on `develop` on 2026-09-25 on top of the maintenance-only baseline
-`6959bd27`. GCC and Clang full local Meson suites pass 87/87 (80 pre-K5
-targets plus `meter_meter_test`, `meter_meter_set_test`, `meter_bench`,
-`stats_stats_test`, `stats_bench`, `route_route_test`, `route_bench`).
+K5 (`990f6726`, entry 78), K6 (`ce6241bf`, entry 79), K7 (`9535d5e3`, entry 80) and
+K4.6 (entry 81) landed on `develop` on 2026-09-25 on top of the
+maintenance-only baseline `6959bd27`. GCC and Clang full local Meson suites
+pass 89/89 (80 pre-K5 targets plus `meter_meter_test`, `meter_meter_set_test`,
+`meter_bench`, `stats_stats_test`, `stats_bench`, `route_route_test`,
+`route_bench`, `dataplane_batch_stages_test`,
+`classifier_cuckoo_scale_bench`).
 
 Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K7.
 Partial: F, H, and I. Not started: D, G1, and K8 (consumer-driven).
