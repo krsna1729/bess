@@ -78,14 +78,23 @@ def main():
     except CommandError:
         raise Exception('bess daemon could not start')
 
-    for file_name in glob.glob(os.path.join(args.test_dir, "{}.py".format(args.test_name))):
-        print('Running test %s' % file_name)
+    try:
+        for file_name in glob.glob(
+                os.path.join(args.test_dir, "{}.py".format(args.test_name))):
+            print('Running test %s' % file_name)
 
+            try:
+                run_cmd('%s daemon reset -- run file %s' % (bessctl, file_name))
+            except CommandError:
+                any_failure = 1
+                run_cmd('%s daemon start -m 0' % bessctl)
+    finally:
+        # The daemon runs as root (bessctl starts it through sudo); leaving it
+        # behind after the suite outlives the test run and holds its memory.
         try:
-            run_cmd('%s daemon reset -- run file %s' % (bessctl, file_name))
+            run_cmd('%s daemon stop' % bessctl)
         except CommandError:
-            any_failure = 1
-            run_cmd('%s daemon start -m 0' % bessctl)
+            pass
 
     sys.exit(any_failure)
 

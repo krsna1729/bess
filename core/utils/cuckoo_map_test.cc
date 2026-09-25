@@ -380,4 +380,23 @@ TEST(CuckooMapTest, RandomTest) {
   }
 }
 
+// PrefetchBatch is a hint only: lookups after it are unchanged, for a table
+// small enough to skip it and for one large enough to use it, including after
+// inserts that reallocate the table.
+TEST(CuckooMapTest, PrefetchBatchIsOnlyAHint) {
+  bess::utils::CuckooMap<uint32_t, uint64_t> small, large;
+  for (uint32_t i = 1; i <= 16; i++) small.Insert(i, i * 10);
+  for (uint32_t i = 1; i <= 200000; i++) large.Insert(i, i * 10);
+  std::vector<uint32_t> keys = {1, 7, 16, 17, 150000, 999999};
+  small.PrefetchBatch(keys);
+  large.PrefetchBatch(keys);
+  EXPECT_EQ(70u, small.Find(7)->second);
+  EXPECT_EQ(nullptr, small.Find(17));
+  EXPECT_EQ(1500000u, large.Find(150000)->second);
+  large.PrefetchBatch(keys);
+  for (uint32_t i = 200001; i <= 300000; i++) large.Insert(i, i);
+  EXPECT_EQ(300000u, large.Find(300000)->second);
+  EXPECT_EQ(nullptr, large.Find(999999));
+}
+
 }  // namespace

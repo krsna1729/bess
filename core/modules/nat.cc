@@ -29,7 +29,7 @@
 
 #include "nat.h"
 
-#include "../dataplane/batch_stages.h"
+#include <span>
 
 #include <algorithm>
 #include <numeric>
@@ -327,65 +327,50 @@ inline void Stamp(Ipv4 *ip, void *l4, const Endpoint &before,
 template <NAT::Direction dir>
 inline void NAT::DoProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   gate_idx_t ogate_idx = dir == kForward ? 1 : 0;
-  const size_t cnt = batch->cnt();
+  const int cnt = batch->cnt();
   uint64_t now = ctx->current_ns;
 
-  // The flow table grows on the data path, so the batch body is re-resolved
-  // per batch (a few compares): staged once the table outgrows L1d (K4.6).
-  const auto body = bess::dataplane::ResolveLookupBody(
-      bess::dataplane::LookupBody::kAuto,
-      {.table_bytes = map_.MemoryBytes(),
-       .dependent_lines = 2,
-       .branches_on_loaded_data = true});
+  // Parse first so the flow table can warm every packet's bucket before the
+  // lookups (a no-op for a table that fits in L1d; K4.6b).
+  Endpoint keys[bess::PacketBatch::kMaxBurst];
+  bool valid[bess::PacketBatch::kMaxBurst];
+  Ipv4 *ips[bess::PacketBatch::kMaxBurst];
+  void *l4s[bess::PacketBatch::kMaxBurst];
+  for (int i = 0; i < cnt; i++) {
+    Ethernet *eth = batch->packet(i).head_data<Ethernet *>();
+    ips[i] = reinterpret_cast<Ipv4 *>(eth + 1);
+    size_t ip_bytes = (ips[i]->header_length) << 2;
+    l4s[i] = reinterpret_cast<uint8_t *>(ips[i]) + ip_bytes;
+    std::tie(valid[i], keys[i]) = ExtractEndpoint(ips[i], l4s[i], dir);
+  }
+  map_.PrefetchBatch(std::span<const Endpoint>(keys, cnt));
 
-  struct Parsed {
-    Ipv4 *ip;
-    void *l4;
-    Endpoint before;
-    bool valid;
-  };
-  Parsed parsed[bess::PacketBatch::kMaxBurst];
-  const Endpoint::Hash hasher;
+  for (int i = 0; i < cnt; i++) {
+    bess::PacketRef pkt = batch->packet(i);
+    const Endpoint &before = keys[i];
 
-  bess::dataplane::RunBatch(
-      body, cnt,
-      [&](size_t i) {
-        Parsed &p = parsed[i];
-        Ethernet *eth = batch->packet(i).head_data<Ethernet *>();
-        p.ip = reinterpret_cast<Ipv4 *>(eth + 1);
-        const size_t ip_bytes = (p.ip->header_length) << 2;
-        p.l4 = reinterpret_cast<uint8_t *>(p.ip) + ip_bytes;
-        std::tie(p.valid, p.before) = ExtractEndpoint(p.ip, p.l4, dir);
-        if (p.valid) {
-          map_.PrefetchBucketPrehashed(
-              static_cast<bess::utils::HashResult>(hasher(p.before)));
-        }
-      },
-      [&](size_t i) {
-        Parsed &p = parsed[i];
-        bess::PacketRef pkt = batch->packet(i);
-        if (!p.valid) {
-          DropPacket(ctx, pkt);
-          return;
-        }
+    if (!valid[i]) {
+      DropPacket(ctx, pkt);
+      continue;
+    }
 
-        auto *hash_item = map_.Find(p.before);
+    auto *hash_item = map_.Find(before);
 
-        if (hash_item == nullptr) {
-          if (dir != kForward || !(hash_item = CreateNewEntry(p.before, now))) {
-            DropPacket(ctx, pkt);
-            return;
-          }
-        }
+    if (hash_item == nullptr) {
+      if (dir != kForward || !(hash_item = CreateNewEntry(before, now))) {
+        DropPacket(ctx, pkt);
+        continue;
+      }
+    }
 
-        // only refresh for outbound packets, rfc4787 REQ-6
-        if (dir == kForward) {
-          hash_item->second.last_refresh = now;
-        }
+    // only refresh for outbound packets, rfc4787 REQ-6
+    if (dir == kForward) {
+      hash_item->second.last_refresh = now;
+    }
 
-        Stamp<dir>(p.ip, p.l4, p.before, hash_item->second.endpoint);
-        EmitPacket(ctx, pkt, ogate_idx);
-      });
+    Stamp<dir>(ips[i], l4s[i], before, hash_item->second.endpoint);
+    EmitPacket(ctx, pkt, ogate_idx);
+  }
 }
 
 void NAT::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {

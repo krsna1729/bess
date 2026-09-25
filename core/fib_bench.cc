@@ -96,6 +96,8 @@
 // (`bessd -m 0` shape), so this builds and runs in CI and the sandbox alike.
 
 #include <benchmark/benchmark.h>
+
+#include <cstdlib>
 #include <glog/logging.h>
 
 #include <rte_errno.h>
@@ -620,6 +622,20 @@ int main(int argc, char **argv) {
   // Same sandbox-safe EAL as the other benchmarks in this tree: --no-huge,
   // malloc-backed, which is also what rte_lpm/rte_fib allocate from.
   bess::InitDpdk(0);
+
+  // BESS_FIB_GATE=1 re-registers the two rows rte_fib failed in entry 34 --
+  // the 512K arbitrary-order build and the 64K delete+add churn -- whose
+  // built-in verification against the reference LPM aborts on a wrong answer.
+  // Run it on every DPDK version change (deps/dpdk.json); rte_fib may be
+  // reconsidered only once both rows pass.
+  if (const char *gate = std::getenv("BESS_FIB_GATE");
+      gate != nullptr && gate[0] == '1') {
+    benchmark::RegisterBenchmark("BM_LookupFib/routes:524288", BM_LookupFib)
+        ->Arg(1 << 19);
+    benchmark::RegisterBenchmark("BM_AddDeleteFib/routes:65536",
+                                 BM_AddDeleteFib)
+        ->Arg(1 << 16);
+  }
 
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {

@@ -44,6 +44,7 @@
 #include <glog/logging.h>
 #include <rte_hash_crc.h>
 
+#include "../dataplane/batch_stages.h"
 #include "../gate.h"
 
 using bess::gate_idx_t;
@@ -73,6 +74,8 @@ struct l2_table {
   uint64_t size_power;
   uint64_t bucket;
   uint64_t count;
+  // Batch-lookup body, fixed at l2_init from the table size (K4.6b).
+  bess::dataplane::LookupBody lookup_body;
 };
 
 #define MAX_TABLE_SIZE (1048576 * 64)
@@ -117,6 +120,12 @@ inline int l2_init(struct l2_table *l2tbl, int size, int bucket) {
     return -ENOMEM;
   }
   memset(l2tbl->table, 0, bytes);
+  // A probe branches on the loaded bucket (hit? primary or alternate?).
+  l2tbl->lookup_body = bess::dataplane::ResolveLookupBody(
+      bess::dataplane::LookupBody::kAuto,
+      {.table_bytes = bytes,
+       .dependent_lines = 1,
+       .branches_on_loaded_data = true});
 
   l2tbl->size = size;
   l2tbl->bucket = bucket;
@@ -265,6 +274,20 @@ inline int l2_find(struct l2_table *l2tbl, uint64_t addr,
   }
 
   return ret;
+}
+
+// Looks up `n` addresses (n <= 64). Writes gates[i] and sets bit i of the
+// result for each hit; misses leave gates[i] untouched. Staged or plain as
+// chosen at l2_init.
+inline uint64_t l2_find_batch(struct l2_table *l2tbl, const uint64_t *addrs,
+                              gate_idx_t *gates, size_t n) {
+  uint64_t hits = 0;
+  bess::dataplane::RunBatch(
+      l2tbl->lookup_body, n, [&](size_t i) { l2_prefetch(l2tbl, addrs[i]); },
+      [&](size_t i) {
+        hits |= uint64_t{l2_find(l2tbl, addrs[i], &gates[i]) == 0} << i;
+      });
+  return hits;
 }
 
 inline int l2_find_offset(struct l2_table *l2tbl, uint64_t addr,

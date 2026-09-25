@@ -34,7 +34,6 @@
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "l2_table.h"
-#include "../dataplane/batch_tuning.h"
 
 #if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error this code assumes little endian architecture (x86)
@@ -67,8 +66,6 @@ class L2Forward final : public Module {
  private:
   struct l2_table l2_table_;
   gate_idx_t default_gate_;
-  // Chosen at Init from the table size and host caches (K4.6).
-  bess::dataplane::LookupBody lookup_body_ = bess::dataplane::LookupBody::kPlain;
 };
 
 #endif  // BESS_MODULES_L2FORWARD_H_

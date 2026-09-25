@@ -30,7 +30,6 @@
 
 #include "l2_forward.h"
 
-#include "../dataplane/batch_stages.h"
 
 #include <rte_hash_crc.h>
 
@@ -254,13 +253,6 @@ CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
                           size, bucket);
   }
 
-  // The table's size is fixed here, so the batch body is too (K4.6): a probe
-  // branches on the loaded bucket (hit? primary or alternate?).
-  lookup_body_ = bess::dataplane::ResolveLookupBody(
-      bess::dataplane::LookupBody::kAuto,
-      {.table_bytes = l2_table_bytes(&l2_table_),
-       .dependent_lines = 1,
-       .branches_on_loaded_data = true});
 
   return CommandSuccess();
 }
@@ -272,20 +264,18 @@ void L2Forward::DeInit() {
 void L2Forward::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   gate_idx_t default_gate = ACCESS_ONCE(default_gate_);
 
-  const size_t cnt = batch->cnt();
+  const int cnt = batch->cnt();
   uint64_t dst[bess::PacketBatch::kMaxBurst];
-  bess::dataplane::RunBatch(
-      lookup_body_, cnt,
-      [&](size_t i) {
-        // destination MAC (first 6 bytes); assumes little endian
-        dst[i] = *(batch->packet(i).head_data<uint64_t *>()) & 0x0000ffffffffffff;
-        l2_prefetch(&l2_table_, dst[i]);
-      },
-      [&](size_t i) {
-        gate_idx_t out_gate;
-        const int ret = l2_find(&l2_table_, dst[i], &out_gate);
-        EmitPacket(ctx, batch->packet(i), ret != 0 ? default_gate : out_gate);
-      });
+  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
+  for (int i = 0; i < cnt; i++) {
+    // destination MAC (first 6 bytes); assumes little endian
+    dst[i] = *(batch->packet(i).head_data<uint64_t *>()) & 0x0000ffffffffffff;
+  }
+
+  const uint64_t hits = l2_find_batch(&l2_table_, dst, gates, cnt);
+  for (int i = 0; i < cnt; i++) {
+    EmitPacket(ctx, batch->packet(i), (hits >> i) & 1 ? gates[i] : default_gate);
+  }
 }
 
 CommandResponse L2Forward::CommandAdd(

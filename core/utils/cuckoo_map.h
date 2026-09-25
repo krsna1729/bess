@@ -49,6 +49,7 @@
 #include <glog/logging.h>
 
 #include "../debug.h"
+#include "../dataplane/batch_tuning.h"
 #include "common.h"
 
 namespace bess {
@@ -343,6 +344,27 @@ class CuckooMap {
 
   // Return the number of stored entries
   size_t Count() const { return num_entries_; }
+
+  // Warms the primary bucket of every key in a batch, when the table is big
+  // enough for that to pay (dataplane::ResolveLookupBody: beyond L1d; a probe
+  // walks bucket -> entry and branches on which slot matched). A plain loop of
+  // Find() calls after it then finds its buckets in cache. Does nothing for a
+  // small table. It only prefetches, so it stays correct however the table
+  // changes afterwards -- including inserts that reallocate.
+  template <typename KeyRange>
+  void PrefetchBatch(const KeyRange& keys, const H& hasher = H()) const {
+    const bess::dataplane::LookupBody body = bess::dataplane::ResolveLookupBody(
+        bess::dataplane::LookupBody::kAuto,
+        {.table_bytes = MemoryBytes(),
+         .dependent_lines = 2,
+         .branches_on_loaded_data = true});
+    if (body != bess::dataplane::LookupBody::kStaged) {
+      return;
+    }
+    for (const K& key : keys) {
+      PrefetchBucketPrehashed(static_cast<HashResult>(hasher(key)));
+    }
+  }
 
   // Bytes of bucket and entry storage: what a lookup's misses spread over.
   size_t MemoryBytes() const {

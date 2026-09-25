@@ -77,4 +77,37 @@ TEST_P(L2TableTest, EveryAddedEntryIsFound) {
 
 INSTANTIATE_TEST_SUITE_P(Buckets, L2TableTest, ::testing::Values(1, 2, 4));
 
+// l2_find_batch agrees with l2_find for hits and misses, whichever body the
+// table uses.
+TEST(L2TableBatchTest, MatchesSingleLookupsUnderBothBodies) {
+  l2_table table = {};
+  ASSERT_EQ(0, l2_init(&table, 1024, 4));
+  std::mt19937_64 rng(0x34);
+  std::vector<uint64_t> keys;
+  for (int i = 0; i < 2000; i++) {
+    const uint64_t mac = rng() & 0xffffffffffffull;
+    if (l2_add_entry(&table, mac, static_cast<gate_idx_t>(i % 512)) == 0) {
+      keys.push_back(mac);
+    }
+    keys.push_back(rng() & 0xffffffffffffull);  // mostly misses
+  }
+  for (auto body : {bess::dataplane::LookupBody::kPlain,
+                    bess::dataplane::LookupBody::kStaged}) {
+    table.lookup_body = body;
+    for (size_t base = 0; base + 32 <= keys.size(); base += 32) {
+      gate_idx_t gates[32];
+      const uint64_t hits = l2_find_batch(&table, &keys[base], gates, 32);
+      for (size_t i = 0; i < 32; i++) {
+        gate_idx_t expected;
+        const bool hit = l2_find(&table, keys[base + i], &expected) == 0;
+        ASSERT_EQ(hit, ((hits >> i) & 1) != 0) << i;
+        if (hit) {
+          ASSERT_EQ(expected, gates[i]);
+        }
+      }
+    }
+  }
+  l2_deinit(&table);
+}
+
 }  // namespace
