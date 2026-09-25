@@ -37,7 +37,7 @@ runtime_packages=(
 )
 
 build_packages=(
-  build-essential clang-19 ccache meson ninja-build pkg-config
+  build-essential gcc-14 g++-14 clang-19 ccache meson ninja-build pkg-config
   python3-pyelftools xz-utils
   libnuma-dev libpcap-dev zlib1g-dev libunwind-dev libbpf-dev libxdp-dev
   libgoogle-glog-dev libgflags-dev libgtest-dev libbenchmark-dev

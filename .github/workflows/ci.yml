@@ -19,9 +19,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # GCC 14 (Ubuntu 24.04 noble-updates): the distro default is 13,
+          # which lacks C++23 features the codebase may use (deducing this).
           - name: gcc
-            cc: gcc
-            cxx: g++
+            cc: gcc-14
+            cxx: g++-14
           # Clang 19 updates __cpp_concepts for libstdc++'s C++23 <expected>.
           - name: clang
             cc: clang-19

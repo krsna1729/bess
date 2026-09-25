@@ -16,7 +16,7 @@ This is a source-level inventory of explicit dependency declarations in tracked 
 | GitHub Actions checkout | `actions/checkout@v7` | `.github/workflows/ci.yml`; major tag, not an immutable commit SHA. |
 | GitHub Actions cache | `actions/cache@v6` | `.github/workflows/ci.yml`; major tag, not an immutable commit SHA. |
 | GitHub-hosted runner | `ubuntu-24.04` | `.github/workflows/ci.yml`; OS release label, not an image digest. |
-| Clang in current CI | `clang-19` / `clang++-19` | `.github/workflows/ci.yml`; major package/tool names, not exact package builds. GCC/G++ are selected as `gcc`/`g++` without a version. |
+| Compilers in current CI | `gcc-14` / `g++-14` and `clang-19` / `clang++-19` | `.github/workflows/ci.yml`, installed by `env/install-deps.sh build`; major package/tool names, not exact package builds. GCC 14 replaced the distro-default GCC 13 on 2026-09-25 (C++23 deducing `this`). |
 | BESS project metadata | `0.1.0` | `meson.build`; project version, not a dependency. |
 | C++ language level | C++23 | `meson.build`; language-standard requirement, not a compiler version pin. |
 
@@ -61,7 +61,7 @@ below.
 | Installer mode | Explicit package names |
 |---|---|
 | `runtime` | `python3`, `python3-pip`, `python3-venv`, `libnuma1`, `libpcap0.8t64`, `zlib1g`, `libunwind8`, `libbpf1`, `libxdp1`, `libgoogle-glog0v6t64`, `libgflags2.2`, `libprotobuf32t64`, `libgrpc++1.51t64`, `libc-ares2`, `libsystemd0`, `libcap2`, `libelf1t64`, `libarchive13t64`, `libjansson4`, `libgraph-easy-perl`, `tcpdump`. |
-| `build` | `build-essential`, `clang-19`, `ccache`, `meson`, `ninja-build`, `pkg-config`, `python3-pyelftools`, `xz-utils`, `libnuma-dev`, `libpcap-dev`, `zlib1g-dev`, `libunwind-dev`, `libbpf-dev`, `libxdp-dev`, `libgoogle-glog-dev`, `libgflags-dev`, `libgtest-dev`, `libbenchmark-dev`, `libgrpc++-dev`, `protobuf-compiler-grpc`, `libprotobuf-dev`, `protobuf-compiler`, `libsystemd-dev`, `libc-ares-dev`, `libcap-dev`. |
+| `build` | `build-essential`, `gcc-14`, `g++-14`, `clang-19`, `ccache`, `meson`, `ninja-build`, `pkg-config`, `python3-pyelftools`, `xz-utils`, `libnuma-dev`, `libpcap-dev`, `zlib1g-dev`, `libunwind-dev`, `libbpf-dev`, `libxdp-dev`, `libgoogle-glog-dev`, `libgflags-dev`, `libgtest-dev`, `libbenchmark-dev`, `libgrpc++-dev`, `protobuf-compiler-grpc`, `libprotobuf-dev`, `protobuf-compiler`, `libsystemd-dev`, `libc-ares-dev`, `libcap-dev`. |
 | `vm` | `cloud-image-utils`, `curl`, `numactl`, `openssh-client`, `qemu-kvm`, `qemu-utils`. |
 | README binary quick-install | `python3-venv`, `libgraph-easy-perl`. |
 
@@ -83,7 +83,7 @@ These explicit version mentions in repository documentation or compatibility cod
 - `MODERNIZATION.md` records migration **DPDK 19.11.4 → 25.11.3** and mentions DPDK 20.11+/21.11 behavior. The current authoritative pin is `deps/dpdk.json` at 25.11.3.
 - `MODERNIZATION.md` records observed toolchains GCC 13.3/15/16, Clang 18.1.3/20, g++ 16, and MSVC 19.44; glibc 2.42+; and observed libraries glog 0.7/0.7.1, protobuf 36, gRPC 1.83, libxdp 1.6.3, and libbpf 1.7.0. It also mentions Python 3.12 compatibility. These are environment observations or compatibility references, not current constraints.
 - The same notes record Ubuntu package builds `libxdp-dev 1.4.2-1ubuntu4` and `libbpf-dev 1:1.3.0-2build2`; these are observations from a disposable environment, not apt pins.
-- A historical `MODERNIZATION.md` section says “current Ubuntu CI GCC 13.3 / Clang 18.1”, while the current workflow selects `clang-19` and leaves GCC unversioned. Treat that prose as a stale snapshot.
+- A historical `MODERNIZATION.md` section says “current Ubuntu CI GCC 13.3 / Clang 18.1”, while the current workflow selects `gcc-14` and `clang-19`. Treat that prose as a stale snapshot.
 - `core/bessd.cc` and its tests discuss glog `>=0.7` and an observed `google-glog 0.7.1-2`; this is compatibility context, not a Meson minimum.
 - `core/utils/endian.h` mentions GCC 4.9+ as an optimization note, not a supported-toolchain declaration.
 

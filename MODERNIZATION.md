@@ -159,6 +159,7 @@ separately.
 | H / I — language and type safety | Partial | Continue incrementally; K6 added a typed `WorkerId`. |
 | J — live table updates | Complete, subsumed | Pilot succeeded; current lifetime mechanism is K1 `RcuDomain`/`RcuPtr`. |
 | K — dataplane substrate | K1–K7 complete | K8 is consumer-driven; G1 is next. |
+| L — batch runtime (VPP-derived) | Planned | Parallel performance track (section 27): L1 measurability first. |
 
 Current software sequence: **G1 → D → F**, with H/I
 hardening alongside those stages. K8 is lower priority and should start when a
@@ -3401,6 +3402,25 @@ rather than one call site).
     L2Forward's 2017 `alignas(32)` slot-stride bug (75% of entries unreachable
     in full 4-way tables) and a cuckoo-move slot bug. Details in K4.6b.
 
+83. **CI on GCC 14.** The CI GCC job now uses `gcc-14`/`g++-14` (Ubuntu 24.04
+    `noble-updates`), installed by `env/install-deps.sh build`; the distro
+    default GCC 13 lacks deducing `this`. Verified in a clean `ubuntu:24.04`
+    container following the workflow's steps: install deps, bootstrap DPDK
+    with `CC=gcc-14`, build the whole tree, unit suite 65/65 (integration,
+    python and benchmark suites excluded). Entry 20's GCC 14 link failure
+    (an LTO-tagged static `libunwind.a`) does not occur with the current
+    shared-link build.
+84. **External-review audit and Phase L.** The earlier BESS-vs-VPP / DPDK-audit
+    design conversation was re-read and every proposal dispositioned
+    (section 27): adopted items mapped to K4.5-K7, rejected-on-evidence
+    items recorded, and the unrecorded VPP-derived batch-runtime program
+    added as Phase L (L1 measurability -> L2 bulk output partitioning -> L3
+    cross-worker handoff -> L4 batch-size study -> L5 ready set), with
+    columnar sidecars, SoA/AVX kernels, frame scheduling and 32-bit handles
+    deferred behind evidence. DPDK-audit leftovers: RX buffer split -> C-HW,
+    mbuf history -> F debug lanes, `rte_ptr_compress` -> L3, `--legacy-mem`
+    newly testable on hugepages.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -6524,10 +6544,16 @@ WildcardMatch tuples +3..+5%).
 
 **C++ note.** `RunStages`/`RunBatch` need only C++20 (concepts and a fold over
 lambdas). A deducing-`this` (C++23) mixin would be a nicer way for table
-types to get both bodies, but CI's Ubuntu 24.04 GCC is 13, which lacks it
-(GCC 14+). C++23 features that remain candidates without a CI change:
-`[[assume]]` in place of `promise()`, `std::views::chunk` for the >32-key
-chunking, `std::mdspan` for the `(keys, stride)` batch pairs.
+types to get both bodies; CI's GCC job was on Ubuntu 24.04's default GCC 13,
+which lacks it, so CI moved to `gcc-14`/`g++-14` (entry 83). Other C++23
+candidates: `[[assume]]` in place of `promise()`, `std::views::chunk` for the
+>32-key chunking, `std::mdspan` for the `(keys, stride)` batch pairs.
+
+Cache geometry needs no privileges: `/sys/devices/system/cpu/*/cache` is
+world-readable. Without sysfs (a restricted container), `sysconf` is used, and
+without that, conservative defaults (L1d 32 KiB, L2 1 MiB, L3 8 MiB) -- a
+too-small L1d only makes staging start slightly earlier, which the sweep shows
+costs at most a few percent near the boundary.
 
 ### K5 — generic software metering — COMPLETE
 
@@ -8143,7 +8169,10 @@ and C++ SDKs. Decide per resource how transactions map onto its update model
 
 ### Following stages
 
-1. **K8 — fragmentation/reassembly (pending, consumer-driven):** schedule when
+1. **Phase L — batch runtime (parallel performance track; section 27):**
+   L1 measurability first, then bulk output partitioning, cross-worker
+   handoff, and a measured batch-size study.
+2. **K8 — fragmentation/reassembly (pending, consumer-driven):** schedule when
    a real consumer needs it; bound resources and test partial-failure cleanup.
 
 ### Parallel and deferred work
@@ -8159,6 +8188,94 @@ and C++ SDKs. Decide per resource how transactions map onto its update model
 
 ---
 
+
+## 27. Phase L — batch runtime (VPP-derived), and the external-review audit (2026-09-25)
+
+The user's earlier external design conversation (BESS vs VPP deep dive, a
+redone VPP-concept experiment list using deeper BESS knowledge, software
+pipelining as a BESS primitive, and the 2017->2026 DPDK delta audit) was
+re-read end to end and every proposal checked against this roadmap. The DPDK
+audit had already been folded in item by item (entry 25: 6 adopted, 4
+experiments, Phase J, 16 rejected with reasons); its three leftovers are
+dispositioned below. The VPP material had not been recorded beyond K4.5/K4.6.
+Its later, refined list (which supersedes the first) is the basis of Phase L.
+
+### Already adopted or settled by evidence
+
+| proposal | disposition |
+|---|---|
+| Staged "extract/hash/prefetch, then lookup/modify" per batch (WorkItem stages) | **Adopted** — `dataplane::RunStages`/`RunBatch` (K4.6, K4.6b); NAT, L2Forward, ExactMatch/WildcardMatch, meters |
+| Runtime-selectable body without per-packet cost; all variants in one executable | **Adopted** — `ResolveLookupBody` chooses at build/init; `BESS_LOOKUP_BODY` forces a mode |
+| Sweep table size from L1 to beyond LLC | **Done** — `classifier_cuckoo_scale_bench`, `modules_table_scale_bench`, `route_bench` |
+| x2/x4 multi-packet interleaving (ILP) | **Rejected on evidence** — never a win (K4.5; `rte_lpm_lookupx4` never the best body, K7) |
+| Prefetch-distance sweep (0..12) | **Subsumed** — whole-batch staging (distance = batch) wins for <= 32; revisit only with larger batches (L4) |
+| Fluent pipeline API, coroutines/`std::generator`, virtual stages, `std::function` | **Rejected** — per-packet overhead; both reviews agreed |
+| `llring` vs modern `rte_ring` | **Done** — `llring` deleted (entry 28) |
+| Multiarch runtime dispatch | **Planned** — Phase D2 (runtime SIMD policy) |
+| Compile-time width policy / `static_for` | **Not needed** — no width parameter survived the ILP result |
+
+### Phase L — planned, in order, each step gated on the previous one's data
+
+Parallel performance track; does not block G1.
+
+1. **L1 — make the batch runtime measurable.** Per-module batch-occupancy
+   histograms, packets per call, module calls per packet, and cycles per
+   module, built on K6 (`WorkerHistogram`/`CounterSet`, so no hot-path lock);
+   a `task_graph_bench` for controlled graph depth/fan-out; and the
+   cross-worker `PortInc -> Queue -> PortOut` harness still open from backlog
+   item 1 (`queue_handoff_bench`). Collect perf top-down counters (frontend-
+   and backend-bound, L1I/L1D/LLC/DTLB MPKI, branch misses) through
+   `omarchy-benchmark --diagnose`. First question to answer: how full are
+   batches in practice?
+2. **L2 — bulk output partitioning (`EmitBatch`).** BESS already queues
+   rather than executes on `EmitPacket` (`AddToRun` schedules, and output
+   batches merge), so the delta is bulk per-gate partitioning with fast
+   paths: every packet to the same gate, a two-way split, small K, and runs.
+   Convert `IPLookup` first, then ExactMatch/HashLB; test a fan-out matrix
+   (1 gate; 90/10; 50/50; 4 uniform; 8 Zipf).
+3. **L3 — cross-worker handoff.** `rte_ring` MP/SC vs RTS/HTS sync modes, the
+   25.11 ring zero-copy API (`rte_ring_*_zc_burst_*`), a VPP-style slot queue,
+   and `rte_ptr_compress` pointer compression for the 64-bit handles in
+   flight (DPDK-audit leftover).
+4. **L4 — batch size, measured before changed.** Controlled B = 1..32 to fit
+   C(B) = C_packet + C_batch/B; instrument `Task`'s `pbatch_idx_` batch pool
+   and the `Buffer` module; only if the fit predicts a gain, try 64/128
+   capacity with smaller/dynamic scratch-frame pools, and always plot
+   throughput against p99 latency. Supersedes backlog item 8.
+5. **L5 — ready-set implementation.** Only if L1's pending-heap metrics
+   justify it: topology buckets/bitsets instead of the ready heap.
+
+### Deferred — each needs evidence from Phase L first
+
+- **Batch-local columnar sidecar / typed scratchpad / lazy column
+  materialization.** The later review itself cautioned against it; do it only
+  if L1 shows repeated parsing cost across modules. BESS's metadata
+  attributes already carry parse-once results through the graph (the
+  "hot/cold metadata" idea).
+- **SoA + AVX2/AVX-512 kernels.** Only on data that staging has made
+  contiguous; through D2's dispatch; measure CPU frequency with AVX-512.
+- **Frame-scheduling / I-cache experiment.** Only if L1 frontend metrics show
+  I-cache or iTLB pressure. The claim that BESS is depth-first and thrashes
+  the I-cache was found incorrect as stated.
+- **32-bit packet handles.** Last, if ever.
+- **C++26 `std::simd`.** Phase H research.
+- **BESS vs VPP head-to-head on one NF.** Out of scope for this fork (needs a
+  VPP build and an identical NF); the mechanism-level experiments above
+  answer the useful questions.
+- **Benchmark workloads:** 64 B, 128 B, 512 B, 1518 B and IMIX traffic need
+  real packet generation. Module-level rows come with L1's harness; NIC rows
+  are C-HW.
+
+### DPDK-audit leftovers
+
+- **RX buffer split / multiple RX pools:** defer to C-HW (needs PMD/NIC
+  support to evaluate).
+- **25.11 mbuf history tracking:** plan as an option for the Phase F debug and
+  sanitizer lanes, not a production feature.
+- **`rte_ptr_compress`:** folded into L3.
+- **Dropping `--legacy-mem`:** was blocked on "no hugepages, no NIC". The host
+  now has a 1 GiB hugepage (entry 81), so the memory-model half can be tested
+  (dynamic memory with hugepages); PMD behaviour still needs C-HW.
 
 ## 25. Known lower-priority research/backlog
 
@@ -8292,7 +8409,8 @@ Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K7.
 Partial: F, H, and I. Not started: D, G1, and K8 (consumer-driven).
 C-HW remains a separate deferred hardware-validation track.
 
-**Next software work: G1 public API/SDKs.** Do not reopen closed K
+**Next software work: G1 public API/SDKs**, with Phase L (section 27) as a
+parallel performance track starting at L1 measurability. Do not reopen closed K
 architecture; do not block the software sequence on real-NIC work.
 Benchmarks are run through `omarchy-benchmark` (pinned, isolated,
 performance governor); multithreaded gbench rows must self-pin each thread,
@@ -8388,7 +8506,7 @@ the rejected list for what's already been decided either way.
 7. **`PortOut` MCS lock vs PMD MT-lockfree Tx** — 2/4/8 workers on one Tx
    queue, on a PMD advertising the capability. Low priority; few PMDs
    support it.
-8. **Burst size sweep** — 32 (current `PacketBatch::kMaxBurst`) / 64 /
+8. **Burst size sweep** (superseded by Phase L4, section 27) — 32 (current `PacketBatch::kMaxBurst`) / 64 /
    128 / 256, through `traffic_class_bench` and the new PMD loopback
    bench from (1), to check DPDK's own claim that 256 is a common sweet
    spot on server x86/ARM64. Informational only -- `kMaxBurst` is deeply
