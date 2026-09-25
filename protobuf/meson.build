@@ -12,6 +12,7 @@ core_proto_names = [
   'error.proto',
   'ports/port_msg.proto',
   'tests/test_msg.proto',
+  'tests/ingress_bench.proto',
 ]
 core_proto_files = files(
   'bess_msg.proto',
@@ -22,6 +23,7 @@ core_proto_files = files(
   'error.proto',
   'ports/port_msg.proto',
   'tests/test_msg.proto',
+  'tests/ingress_bench.proto',
 )
 
 python_generated_install_entries = []

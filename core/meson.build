@@ -309,6 +309,7 @@ if get_option('build_benchmarks')
     'classifier_cuckoo_scale_bench': ['classifier/cuckoo_scale_bench.cc', benchmark_main_dep],
     'object_table_bench': ['dataplane/object_table_bench.cc', benchmark_main_dep],
     'update_scale_bench': ['dataplane/update_scale_bench.cc', benchmark_dep],
+    'ingress_bench': ['dataplane/ingress_bench.cc', benchmark_dep],
     'meter_bench': ['meter/meter_bench.cc', benchmark_main_dep],
     'stats_bench': ['stats/stats_bench.cc', benchmark_main_dep],
     'route_bench': ['route/route_bench.cc', benchmark_main_dep],

@@ -3506,6 +3506,18 @@ rather than one call site).
     as the likely bottleneck -- E4 next). Harness bugs fixed and recorded
     (correlated CRC partitioning; timing before inputs were ready).
 
+90. **E-core runs and E4 ingress.** E1/E2 on E-cores: the same shapes at
+    55-60% of P-core throughput; today's cuckoo is 13-20% faster than
+    `rte_hash` for cache-resident tables on E-cores (not on P-cores), and
+    `rte_hash` wins from 1M up. E4 (`ingress_bench`, benchmark-only proto):
+    one RPC per op caps ingress near 15K ops/s; a client-streaming RPC with
+    packed 16-byte op records carries about 20M ops/s including the apply;
+    a pinned two-process shared-memory ring decodes 78-275M ops/s. Decision:
+    keep gRPC, with a streaming, packed-record transaction API. Shared memory
+    stays a measured option past about 20M ops/s per stream. Recorded the
+    capacity per layer and the plan to consolidate the backend laboratory
+    after mode C lands.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -7319,6 +7331,54 @@ What the data says:
   crowded every shard into a quarter of its buckets; (2) timing must start
   only after every thread has built its inputs.
 
+**E-cores (CPUs 12-19; E2 on 12-15 + control 16).** Same shapes at about
+55-60% of P-core lookup throughput, with one difference that matters when
+options are consolidated: **on E-cores today's cuckoo beats `rte_hash` for
+cache-resident tables** (1K: 15.3 vs 17.6 ns hit; 64K: 16.4 vs 20.7), while
+`rte_hash` wins from 1M up (1M: 25.0 vs 35.5; 10M: 43.4 vs 56.5). LF churn is
+90-366 ns per op. E2 on E-cores at 10M: shared 72.6 Mlookups/s idle and 81.9
+at 1M mods/s; writer peak 3.2M ops/s; partitioned apply 10-41M ops/s.
+
+**E4 -- ingress (`core/dataplane/ingress_bench.cc`, benchmark-only service
+`protobuf/tests/ingress_bench.proto`).** M ops/s decoded, and decoded +
+applied into a 1M-key LF `rte_hash` (one writer, no concurrent readers):
+
+| transport (P-cores) | batch 1 | 16 | 256 | 4096 |
+|---|---:|---:|---:|---:|
+| unary RPC, one message per op (UDS) | 0.015 | 0.23 | 2.8 | 8.4 / 6.3 applied |
+| unary RPC, packed 16 B records (UDS) | 0.014 | 0.22 | 3.0 | 26 / 10 applied |
+| client stream, packed (UDS) | 0.12 | 2.0 | **19 / 18 applied** | 71 / 14 applied |
+| client stream, packed (TCP loopback) | 0.11 | 1.7 | 20 / 20 applied | 75 / 15 applied |
+| shared-memory SPSC ring, two processes (pinned) | -- | -- | -- | 78-275 decode / 18-24 applied |
+
+E-cores give the same picture: stream-packed at 256 is 18-21M ops/s;
+shm-ring decodes 169-176M.
+
+Conclusions:
+
+- **One RPC per operation -- the pattern today's controllers use -- caps
+  ingress near 15K ops/s** (about 70 us per round trip). That is the real
+  limit of the current approach, not gRPC itself.
+- **gRPC is not the bottleneck when the API streams packed batches:** 256-op
+  batches on one stream carry about 20M ops/s including the table apply.
+  Beyond that the single table writer limits, not the transport. **Decision:
+  keep gRPC for G1.2c, and make the transaction API streaming with packed
+  fixed-width op records** (a repeated message per op costs 2-3x at large
+  batches).
+- **A shared-memory channel (the VPP API's model) is 10x+ beyond any table
+  writer** -- worth it only past about 20M ops/s per stream, or for latency.
+  Keep it as a measured option (a plain SPSC ring of fixed records is
+  enough). Zero-copy IPC frameworks (iceoryx2, Cap'n Proto/FlatBuffers over
+  shared memory) solve a problem this workload does not have yet.
+
+**Capacity by layer (measured, this laptop):** unary per op about 15K ops/s;
+gRPC stream about 20M ops/s per stream; one shared LF table writer about
+4.3M ops/s with 4 workers reading (14-24M with none); worker-owned shards
+34-148M ops/s; shm ring 78-275M ops/s decode. So "1M modifications/s at 30
+Mpps" is far from any limit. The dimensioning ceiling is about 4M ops/s per
+shared table, scaled out with a writer per table and with worker-owned
+shards, fed by one or more gRPC streams.
+
 #### Designing for 1M modifications/s at 30 Mpps
 
 Budget: 30 Mpps with 1-3 table lookups per packet is 30-90M lookups/s. From
@@ -7336,13 +7396,14 @@ roughly 150-300 ns per-packet budget, needs about 5-9 workers. Plan:
    SPSC rings. Where one table's rate exceeds a writer (above ~4M ops/s), or
    the data path writes it, the table becomes worker-owned (W-shard, 34M+
    ops/s).
-3. **Control ingress:** almost certainly the real bottleneck. At 1M ops/s,
+3. **Control ingress (measured in E4 -- not the bottleneck when streamed):** At 1M ops/s,
    unary gRPC per op (tens of microseconds) and a protobuf `Any` per op do not
    fit. Use batched or streaming RPCs (hundreds to thousands of ops per
    message), a compact packed op encoding (fixed-width records rather than
    nested `Any`), and several ingestion threads decoding in parallel,
-   partitioned by table or scope so writers never contend. **E4 (next): the
-   ingress rate of `ApplyDataplaneTransaction` batches.**
+   partitioned by table or scope so writers never contend. E4: 256-op
+   packed batches on one gRPC stream carry about 20M ops/s including the
+   apply.
 4. **Reclamation:** batched grace tokens (one per transaction or per writer
    batch), reclaimed by the writer threads; the defer-queue depth follows the
    headroom rule.
@@ -7351,6 +7412,18 @@ roughly 150-300 ns per-packet budget, needs about 5-9 workers. Plan:
    per writer.
 6. **Hot path:** unchanged -- workers run the same lookups, report quiescence
    where they already do, and (for W tables) check one ring per round.
+
+#### Consolidating options afterwards
+
+Once mode C is in the modules and measured, the backend laboratory shrinks
+(user direction): K3 today carries Cuckoo, `rte_hash` position and data,
+direct and small exact backends, and CuckooMap underpins several modules.
+Keep one default per shape, chosen by the E1 evidence: LF `rte_hash` for
+shared exact tables beyond cache on every core type, plus -- only if an
+E-core or small-table deployment needs it -- the cuckoo path for
+cache-resident tables, where it is 13-20% faster on E-cores. Direct/small
+backends stay only where a module has a measured need. Retire the rest in
+one reviewed change, with benchmarks before and after.
 
 #### Existing modules under the modes
 
