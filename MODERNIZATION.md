@@ -155,12 +155,12 @@ separately.
 | E — Meson | Complete | Meson is the BESS build/test/install graph. |
 | F — operations | Partial | Packaging, releases, SBOM, observability, and tooling lanes remain. |
 | G0 — transactional core | Complete | Internal C++ desired-state/transaction engine is landed. |
-| G1 — public API/SDKs | Not started | Design after K5–K7 establish real resource semantics. |
+| G1 — public API/SDKs | Not started | Design after K6–K7 establish the remaining resource semantics. |
 | H / I — language and type safety | Partial | Continue incrementally with later work. |
 | J — live table updates | Complete, subsumed | Pilot succeeded; current lifetime mechanism is K1 `RcuDomain`/`RcuPtr`. |
-| K — dataplane substrate | K1–K4 complete | K5 is next; K6–K7 follow; K8 is consumer-driven. |
+| K — dataplane substrate | K1–K5 complete | K6 is next; K7 follows; K8 is consumer-driven. |
 
-Current software sequence: **K5 → K6 → K7 → G1 → D → F**, with H/I
+Current software sequence: **K6 → K7 → G1 → D → F**, with H/I
 hardening alongside those stages. K8 is lower priority and should start when a
 consumer requires fragmentation/reassembly. C-HW stays a separate, non-blocking
 hardware gate.
@@ -245,7 +245,17 @@ and Clang JSON matrices are retained under the two build directories; the
 working-set matrix contains 384 cases per compiler. The separate real-PMD/NIC
 interoperability matrix remains pending because no suitable device is
 available; it does not block K4 software closure.
-The active software scope K1-K4 is closed. Meson/Ninja remains the build graph,
+**K5 generic metering is complete (2026-09-25, entry 78).** `core/meter/`
+wraps DPDK `rte_meter` (srTCM, trTCM, RFC 4115 trTCM) in a BESS resource
+layer: typed specs with per-rule validation, interned immutable profiles,
+one-cache-line states bound to their profile, explicit worker-exclusive vs
+shared (spinlocked) placement, a monotonic clock clamp, and `MeterSet`
+generations whose states are shared across generations and carved from
+per-socket slabs whose slots return only when the last referencing generation
+is destroyed. Differential tests prove colour-for-colour agreement with raw
+`rte_meter`; GCC and Clang full Meson suites pass 83/83.
+
+The active software scope K1-K5 is closed. Meson/Ninja remains the build graph,
 with pinned DPDK 25.11.3. The registered Meson suite has 80 targets. At the
 2026-09-24 local verification checkpoint, the full GCC and Clang test suites
 both passed all 80 targets on CPUs 0–3. After the final benchmark-registration
@@ -3286,6 +3296,25 @@ rather than one call site).
     used `-j4`, respecting the existing hard cap.
     Fresh independent review of `e9fb5ab3` found no actionable findings.
 
+78. **K5** — **generic software metering on `rte_meter`.** Added
+    `core/meter/meter.{h,cc}` (`MeterColor`, `MeterAlgorithm`, typed
+    `MeterProfileSpec` variant, `MeterError`, `MeterProfile`, one-cache-line
+    `MeterState` bound to its profile, `MeterSharing`, `MeterId`) and
+    `core/meter/meter_set.{h,cc}` (`MeterSet` generation + long-lived
+    `MeterSetBuilder` with profile interning and per-socket state slabs).
+    `rte_meter` owns all algorithm mechanics; BESS adds validation reasons,
+    EAL-on-demand for the TSC frequency, a monotonic clock clamp, explicit
+    exclusive/shared (spinlock) concurrency, generation-shared state with
+    RCU-deferred slot reuse, and prefetching batch checks. 31 new tests,
+    including a 9-mode randomized differential against raw `rte_meter`
+    (20,000 packets each) and mutation-verified clamp and lock tests.
+    Benchmarks via `omarchy-benchmark --isolate`: exclusive check 5.42 ns vs
+    4.71 ns raw; 32-packet batches within 3-15% of raw up to 1 MiB of state,
+    1.6-1.9x the prefetching raw floor beyond L3; exclusive meters scale
+    113 -> 451 M/s on 1 -> 4 CPUs while one contended shared meter falls
+    54 -> 9 M/s. GCC and Clang full Meson suites pass 83/83. Details in the
+    K5 section.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -3447,7 +3476,7 @@ Add a regression test or process-level smoke that launches actual daemon mode un
 ## Order of work
 
 The roadmap letters are workstream labels, not an execution sequence. The
-foundations below are complete; the remaining plan starts at K5:
+foundations below are complete; the remaining plan starts at K6:
 
 ```text
 COMPLETE
@@ -3455,9 +3484,10 @@ A / B / C-software / E
 J live-update pilot (subsumed by K1)
 G0 transactional control core
 K1 RCU/QSBR -> K2 object/action tables -> K3 classifiers -> K4 packet primitives
+  -> K5 metering
 
 NEXT
-K5 generic metering -> K6 worker-local stats -> K7 routes/next hops -> G1 -> D -> F
+K6 worker-local stats -> K7 routes/next hops -> G1 -> D -> F
 
 K8 fragmentation/reassembly: start when a consumer requires it.
 H/I hardening: proceed incrementally alongside the sequence.
@@ -5173,7 +5203,7 @@ MBUF_FAST_FREE, PortOut lock elimination, DPDK version upgrade, ARM/SIMD
 ```
 
 The boundary below reflects G0's original scope: when G0 was implemented, K did
-not yet exist. K1–K4 are now complete and K5–K7 remain ahead; keep public API
+not yet exist. K1–K5 are now complete and K6–K7 remain ahead; keep public API
 work in G1 until those resource semantics are established. Do not build a Go
 SDK yet or add transaction logic to `pybess`/Python `bessctl`: the existing
 Python tools should get correctness by routing through the C++ control plane,
@@ -6262,44 +6292,152 @@ original extraction/body JSON outputs remain historical K4.5a evidence.
 
 ---
 
-### K5 — generic software metering — NEXT (not started)
+### K5 — generic software metering — COMPLETE
 
-**Status: not started; this is the next software phase.** Build the generic
-meter resource and lifecycle layer on DPDK's `rte_meter` software algorithms.
-The hardware meter backend remains a separate C-HW decision.
+**Status: complete (2026-09-25, entry 78).** Software metering is a BESS
+resource layer on DPDK `rte_meter`; the hardware backend (`rte_mtr`/`rte_flow`)
+stays C-HW gated. Source: `core/meter/meter.{h,cc}`,
+`core/meter/meter_set.{h,cc}`, tests `meter_test.cc`/`meter_set_test.cc`,
+benchmark `meter_bench.cc`.
 
-Conceptually:
+Ownership split, as implemented:
 
-```text
-MeterProfile
-MeterState
-MeterHandle
-MeterColor
-```
+- **DPDK `rte_meter` owns the algorithms**: srTCM (RFC 2697), trTCM
+  (RFC 2698), trTCM (RFC 4115); token-bucket refill arithmetic, bucket limits,
+  colour decisions, colour-blind and colour-aware modes. Nothing is
+  reimplemented; a differential test pins colour-for-colour equality.
+- **BESS owns the resource**: typed specs, validation, profile interning,
+  stable ids, state placement and lifetime, concurrency policy, generation
+  publication, and the batch surface.
+- **Applications own meaning**: which bytes are counted, what each colour does,
+  and any meter hierarchy (QER/session/APN/slice for OMEC).
 
-Backend:
-
-```text
-SoftwareMeterBackend
-    → rte_meter
-```
-
-Future hardware backend:
+#### Types
 
 ```text
-HardwareMeterBackend
-    → rte_mtr / rte_flow
+MeterColor        enum class, values identical to rte_color (cast either way)
+MeterAlgorithm    kSrTcm | kTrTcm | kTrTcmRfc4115
+MeterProfileSpec  std::variant<SrTcmSpec, TrTcmSpec, TrTcmRfc4115Spec>
+MeterError        one enumerator per validation rule + id/memory/clock errors
+MeterProfile      immutable compiled rte_meter_*_profile (+ spec, tsc_hz)
+MeterState        one cache line: rte buckets, profile*, last_time, lock, sharing
+MeterSharing      kWorkerExclusive | kShared
+MeterId           StrongId<MeterIdTag, uint32_t>, one-based, 0 invalid
+MeterSet          published generation: MeterId -> MeterState *
+MeterSetBuilder   long-lived control-side desired state -> Build()
 ```
 
-The hardware backend is C-HW gated.
+The roadmap's conceptual `MeterHandle` became the resolved `MeterState *`
+itself: a state carries its profile pointer, so a meter cannot be checked
+against the wrong parameters and the lookup result is one pointer.
 
-BESS owns the generic resource contract and integration:
+#### Decisions and the evidence behind them
 
-- profile/state/handle/color types and validation;
-- stable IDs, generation-safe publication, and state placement/lifetime;
-- worker-safe ownership and batch-friendly invocation.
+1. **Validation is BESS's, with reasons.** Every `rte_meter` parameter rule is
+   checked first with a distinct `MeterError`; the one stricter rule refuses an
+   RFC 4115 profile with both rates zero (it can only colour red).
+2. **Profiles need the TSC frequency.** `rte_meter_*_profile_config` reads
+   `rte_get_tsc_hz()`, which is zero before EAL init and would compile a zero
+   refill period (division by zero on the first check). `MeterProfile::Create`
+   brings up the EAL on demand (same pattern as `RteHashPositionBackend`) and
+   refuses `hz == 0` with `kClockUnavailable`. Consequence: meter tests are
+   EAL-backed and, like the other EAL tests, cannot run under ASan.
+3. **Monotonic clock clamp.** `rte_meter` computes `now - last_update` in
+   unsigned arithmetic, so an older `now` (a stale batch timestamp, or two
+   workers' timestamps reaching a shared meter out of order) wraps and refills
+   the buckets completely. `MeterState` clamps `now` to the latest time it has
+   seen, which can only be stricter. `StaleTimestampDoesNotRefill` shows raw
+   `rte_meter` refilling (GREEN) where the BESS state stays RED, and fails if
+   the clamp is removed. A fresh state's `last_time_` is a fenced TSC read
+   after `rte_*_config`, bounding the config stamp from above.
+4. **Concurrency is an explicit per-meter choice.** `rte_meter` state is a
+   non-atomic read-modify-write. `kWorkerExclusive` does no synchronization
+   (one worker runs it; running it from two is a caller bug); `kShared` takes
+   the meter's own `rte_spinlock`. `SharedMeterLosesNoUpdatesUnderContention`
+   (4 threads x 5000 checks, 1 B/s rates) requires exactly 100 green and 100
+   yellow 100-byte packets; with the lock removed, three runs admitted 156,
+   111 and 137 greens.
+5. **State is shared across generations, not copied.** Publishing a set for an
+   unrelated change must not refill every bucket. A surviving meter keeps its
+   `MeterState`; each generation owns references to every state and profile it
+   maps; a state is released only when no generation references it, i.e.
+   after RCU reclamation destroys the last one. `Reconfigure` with an identical
+   spec keeps state; a different spec or `Reset` starts fresh full buckets
+   (`rte_meter` has no rebind, and copying live token counts would read a
+   state a worker may be mutating). Erase + re-add is a new meter.
+6. **Slab placement.** The first design allocated each state with its own
+   `rte_malloc` behind a 24-byte `ObjectTable` slot: at 262,144 meters a
+   32-packet batch cost 2.5 us vs 0.5 us for a raw `rte_meter` array. States
+   now come from per-socket slabs of 1024 cache-line slots (64 KiB chunks,
+   address-ordered hand-out, locked free list, never moved), and the lookup
+   is a dense `vector<MeterState *>`. A slot returns to its slab from the
+   state's deleter -- only after the last generation referencing it is
+   destroyed -- so RCU, not the builder, decides reuse
+   (`SlabSlotReusedOnlyAfterLastGeneration`).
+7. **Batch prefetch.** `CheckBatch` resolves all ids and write-prefetches every
+   state line before running the checks, so a batch's misses overlap. This is
+   a batch-local optimization inside the substrate, not the generic prefetch
+   policy K4.5 declined.
 
-DPDK `rte_meter` owns the srTCM/trTCM token-bucket algorithm mechanics.
+#### Benchmark evidence
+
+`meter_bench`, GCC release build, TrTCM 1 Gb/s CIR / 2 Gb/s PIR / 64 KiB bursts,
+random 64-1500 B lengths, synthetic time step. Medians of 3 repetitions,
+`--benchmark_min_time=0.2s`. Single/batch rows:
+`omarchy-benchmark --cpu 2 --isolate`; thread rows:
+`omarchy-benchmark --cpu 0,2,8,10 --isolate` (each benchmark thread pins itself
+to one CPU of the launch mask, since the EAL pins the main thread and an
+isolated partition does no load balancing). `--no-huge` EAL memory (4 KiB
+pages), so the DRAM rows are TLB-pessimistic.
+
+| row | ns | M checks/s |
+|---|---:|---:|
+| raw `rte_meter_trtcm_color_blind_check`, one meter | 4.71 | 212.7 |
+| `MeterState::Check`, exclusive | 5.42 | 184.9 |
+| `MeterState::Check`, shared (uncontended lock) | 8.56 | 117.0 |
+
+32-packet batches, ns per batch (state footprint in parentheses):
+
+| meters | raw array | raw + prefetch | `MeterSet` exclusive | `MeterSet` shared |
+|---:|---:|---:|---:|---:|
+| 1 | 148 | 153 | 178 | 335 |
+| 1,024 (64 KiB) | 136 | 147 | 153 | 290 |
+| 16,384 (1 MiB) | 142 | 151 | 164 | 298 |
+| 262,144 (16 MiB) | 324 | 200 | 371 | 502 |
+| 1,048,576 (64 MiB) | 907 | 420 | 678 | 790 |
+
+The raw array stores 32-byte contexts with one shared profile; `MeterSet`
+stores 64-byte states (clamp time, profile pointer, lock) plus an 8-byte
+pointer per id. Up to L2-resident sets the wrapper costs 3-15%; beyond L3 it
+is 1.6-1.9x the prefetching raw floor (twice the footprint, one extra
+dependent load) and faster than the non-prefetching raw loop. Before slab
+placement and prefetch the 262,144 row was 1147 ns exclusive (per-state
+`rte_malloc`, dense pointer table) and 2482 ns in the first ObjectTable-based
+version (unisolated run).
+
+Threads (real time per check, total throughput):
+
+| threads | one shared meter | one exclusive meter per thread |
+|---:|---:|---:|
+| 1 | 18.6 ns, 53.8 M/s | 8.85 ns, 113.0 M/s |
+| 2 | 74.2 ns, 27.0 M/s | 8.77 ns, 228.0 M/s |
+| 4 | 429 ns, 9.3 M/s | 8.86 ns, 451.4 M/s |
+
+(These rows read the TSC per check, hence 8.9 ns rather than 5.4 ns.)
+Exclusive meters scale linearly; a contended shared meter collapses. Shared
+meters are for genuinely aggregate policers at modest rates; per-flow and
+per-session meters belong on the worker their traffic is pinned to.
+
+#### Not in K5 (deliberately)
+
+- No BESS module or protobuf/gRPC surface: exposing meters is G1's
+  dataplane-transaction work, and the first real consumer defines the module.
+- No hierarchical meter composition: application policy (OMEC QER/APN/slice).
+- No `rte_mtr`/`rte_flow` hardware backend: C-HW.
+- No debug-build worker-ownership assertion for exclusive meters; revisit with
+  Phase I `WorkerId` typing.
+- No G0 transaction wiring: `MeterSetBuilder` + `Build()` + `RcuPtr::Publish`
+  is the prepare/commit primitive G1 will drive.
 
 OMEC owns:
 
@@ -6408,7 +6546,7 @@ Lower priority than K1–K3 and K5/K6.
 ## 14. Phase G1 — desired-state API and thin language SDKs — NOT STARTED
 
 After G0 and enough K resources exist to design against real semantics, expose
-the new public API. Start G1 after K5–K7 establish the resource contracts.
+the new public API. Start G1 after K6–K7 complete the resource contracts.
 
 The old imperative API should not constrain the ideal end state.
 
@@ -6537,7 +6675,7 @@ Do not fold the CLI into the privileged daemon merely because both are C++.
 
 ## 16. Phase D — ARM64 + portable architecture — NOT STARTED
 
-Phase D remains important but no longer blocks completed G0/K1–K4 or the next
+Phase D remains important but no longer blocks completed G0/K1–K5 or the next
 K stages. D1–D4 are not started; real ARM performance remains a separate
 hardware gate.
 
@@ -7567,35 +7705,35 @@ the reviewing document's word alone.
   gRPC/UDS direction rather than changing it).
 
 
-## 26. Current execution plan (2026-09-24)
+## 26. Current execution plan (2026-09-25)
 
-K1–K4, G0, A, B, C-software, E, and the J live-update pilot are closed. The
-next software phase is K5; do not restart already-closed architecture work.
+K1–K5, G0, A, B, C-software, E, and the J live-update pilot are closed. The
+next software phase is K6; do not restart already-closed architecture work.
 
-### Next — K5 generic metering (not started)
+### Done — K5 generic metering (2026-09-25)
 
-Use DPDK `rte_meter` for srTCM/trTCM algorithm mechanics. Do not duplicate the
-token-bucket/color algorithms in BESS. BESS owns the semantic resource layer:
-`MeterProfile`, `MeterState`, `MeterHandle`, `MeterColor`, validation, stable
-IDs, state placement/lifetime, worker-safe ownership, generation-aware
-publication, and runtime/typed binding.
+`core/meter/`: `rte_meter` algorithms behind a BESS resource layer (validation,
+interned profiles, cache-line states, exclusive/shared placement, monotonic
+clamp, slab-backed `MeterSet` generations, prefetching batch checks). See the
+K5 section for decisions and benchmark evidence.
 
-Keep the initial work software-only. The `rte_mtr`/hardware-meter backend stays
-in C-HW until supported hardware and a concrete consumer justify it. Define the
-BESS API around resource semantics rather than exposing raw DPDK structs.
+### Next — K6 worker-local statistics/snapshots (not started)
 
-### Following K stages
+Workers update local state; the controller aggregates snapshots. This is the
+foundation for the Phase F metrics exporter. K5's thread rows are the
+motivating evidence: a contended shared cache line collapses from 54 M/s to
+9 M/s at four workers, while per-worker state scales linearly.
 
-1. **K6 — worker-local statistics/snapshots (pending):** workers update local
-   state; the controller aggregates snapshots. This is the foundation for the
-   Phase F metrics exporter.
-2. **K7 — routes/next hops (pending):** add reusable route, next-hop, neighbor,
+### Following stages
+
+1. **K7 — routes/next hops (pending):** add reusable route, next-hop, neighbor,
    egress, and rewrite resources. Keep `rte_lpm` as the trusted default; do not
    promote `rte_fib` without correctness evidence and a real consumer.
-3. **G1 — public API/SDKs (not started):** after K5–K7 stabilize real resource
-   semantics, expose desired-state and dataplane transactions, then thin Go and
-   C++ SDKs. G0 remains the internal transactional engine.
-4. **K8 — fragmentation/reassembly (pending, consumer-driven):** schedule when
+2. **G1 — public API/SDKs (not started):** after K6–K7 stabilize, expose
+   desired-state and dataplane transactions (classifier entries, actions,
+   meters, routes, next hops), then thin Go and C++ SDKs. G0 remains the
+   internal transactional engine.
+3. **K8 — fragmentation/reassembly (pending, consumer-driven):** schedule when
    a real consumer needs it; bound resources and test partial-failure cleanup.
 
 ### Parallel and deferred work
@@ -7607,14 +7745,14 @@ BESS API around resource semantics rather than exposing raw DPDK structs.
 - **H/I (partial):** continue toolchain hardening and stronger types alongside
   concrete K/G1 APIs, rather than as a broad standalone refactor.
 - **C-HW (deferred):** real-NIC, offload, RSS, zero-copy, and hardware-meter
-  validation remain a separate lab program and do not block K5 or software work.
+  validation remain a separate lab program and do not block software work.
 
 ---
 
 
 ## 25. Known lower-priority research/backlog
 
-These remain useful, but should not distract from the active K5–K7 → G1 sequence.
+These remain useful, but should not distract from the active K6–K7 → G1 sequence.
 
 - symmetric RSS configuration as a generic PMD capability;
 - RETA control if a real consumer appears;
@@ -7731,27 +7869,20 @@ Every hardware acceleration must retain a software fallback with identical BESS 
 
 ### 30. Current handoff
 
-Verified repository baseline before this documentation-only roadmap refresh:
+Baseline before K5: `6959bd27` (the commits after the 2026-09-24 roadmap
+refresh `d588d86f` were maintenance only: CI action upgrades, dependency
+inventory, Ubuntu 24.04 setup). K5 landed on top of it (entry 78); GCC and
+Clang full local Meson suites pass 83/83 (80 previous targets plus
+`meter_meter_test`, `meter_meter_set_test`, `meter_bench`).
 
-```text
-2c34621d4162ecc6475bbb2636f19d992554cfd8
-```
-
-This roadmap refresh starts from the docs-only follow-up commit `2c34621d` to
-the CI-verified revision `61a6bb43`; local `develop` and `origin/develop`
-matched `2c34621d` when the audit began. The GCC and Clang full local Meson
-suites passed, and GitHub Actions run `36040126078` passed both compiler lanes
-at `61a6bb43`.
-
-Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K4.
-Partial: F, H, and I. Not started: D, G1, and K5–K8 (K8 is consumer-driven).
+Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K5.
+Partial: F, H, and I. Not started: D, G1, and K6–K8 (K8 is consumer-driven).
 C-HW remains a separate deferred hardware-validation track.
 
-**Next software work: K5 generic metering**, using `rte_meter` for algorithm
-mechanics and BESS for the resource/API/lifecycle integration. Follow with K6
-worker-local statistics and K7 routes/next hops, then G1 public API/SDKs. Do not
-reopen closed K architecture; do not block the software sequence on real-NIC
-work.
+**Next software work: K6 worker-local statistics/snapshots**, then K7 routes/
+next hops, then G1 public API/SDKs. Do not reopen closed K architecture; do not
+block the software sequence on real-NIC work. Benchmarks are run through
+`omarchy-benchmark` (pinned, isolated, performance governor).
 
 
 ## Benchmark / experiment backlog (from the 2026-09-18 DPDK-proposal review)
