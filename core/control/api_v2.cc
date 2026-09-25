@@ -29,11 +29,13 @@
 
 #include "control/api_v2.h"
 
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <variant>
 
 #include "control/pipeline_snapshot.h"
+#include "control/wire_narrow.h"
 #include "worker.h"
 
 namespace bess {
@@ -43,14 +45,22 @@ namespace v2 = pb::v2;
 
 // -- desired state ------------------------------------------------------------
 
-PipelineSpec FromProto(const v2::Pipeline &pipeline) {
+ControlResult<PipelineSpec> FromProto(const v2::Pipeline &pipeline) {
   PipelineSpec spec;
+  int index = 0;
   for (const auto &p : pipeline.ports()) {
     PortSpec port;
     port.name = p.name();
     port.driver = p.driver();
-    port.num_rx_queues = static_cast<queue_t>(p.num_rx_queues());
-    port.num_tx_queues = static_cast<queue_t>(p.num_tx_queues());
+    auto rx = WireNarrow<queue_t>(p.num_rx_queues(), "port", "num_rx_queues",
+                                  index);
+    auto tx = WireNarrow<queue_t>(p.num_tx_queues(), "port", "num_tx_queues",
+                                  index);
+    if (!rx) return std::unexpected(rx.error());
+    if (!tx) return std::unexpected(tx.error());
+    port.num_rx_queues = *rx;
+    port.num_tx_queues = *tx;
+    index++;
     port.rx_queue_size = p.rx_queue_size();
     port.tx_queue_size = p.tx_queue_size();
     port.arg = p.arg();
@@ -59,11 +69,17 @@ PipelineSpec FromProto(const v2::Pipeline &pipeline) {
   for (const auto &m : pipeline.modules()) {
     spec.modules.push_back({m.name(), m.mclass(), m.arg()});
   }
+  index = 0;
   for (const auto &c : pipeline.connections()) {
-    spec.connections.push_back({c.upstream(), static_cast<gate_idx_t>(c.ogate()),
-                                c.downstream(),
-                                static_cast<gate_idx_t>(c.igate()),
+    auto ogate =
+        WireNarrow<gate_idx_t>(c.ogate(), "connection", "ogate", index);
+    auto igate =
+        WireNarrow<gate_idx_t>(c.igate(), "connection", "igate", index);
+    if (!ogate) return std::unexpected(ogate.error());
+    if (!igate) return std::unexpected(igate.error());
+    spec.connections.push_back({c.upstream(), *ogate, c.downstream(), *igate,
                                 c.skip_default_hooks()});
+    index++;
   }
   for (const auto &w : pipeline.workers()) {
     spec.workers.push_back({w.wid(), w.core(), w.scheduler()});
@@ -366,8 +382,11 @@ grpc::Status ControlV2Service::GetPipeline(grpc::ServerContext *,
 grpc::Status ControlV2Service::ValidatePipeline(
     grpc::ServerContext *context, const v2::ValidatePipelineRequest *request,
     v2::ValidatePipelineResponse *response) {
-  auto validated =
-      control_plane_.ValidatePipeline(FromProto(request->pipeline()));
+  auto desired = FromProto(request->pipeline());
+  if (!desired) {
+    return ToStatus(desired.error(), context);
+  }
+  auto validated = control_plane_.ValidatePipeline(*desired);
   if (!validated) {
     return ToStatus(validated.error(), context);
   }
@@ -378,7 +397,11 @@ grpc::Status ControlV2Service::ValidatePipeline(
 grpc::Status ControlV2Service::DiffPipeline(
     grpc::ServerContext *context, const v2::DiffPipelineRequest *request,
     v2::DiffPipelineResponse *response) {
-  auto diff = control_plane_.DiffPipelineVersioned(FromProto(request->pipeline()));
+  auto desired = FromProto(request->pipeline());
+  if (!desired) {
+    return ToStatus(desired.error(), context);
+  }
+  auto diff = control_plane_.DiffPipelineVersioned(*desired);
   if (!diff) {
     return ToStatus(diff.error(), context);
   }
@@ -390,7 +413,11 @@ grpc::Status ControlV2Service::DiffPipeline(
 grpc::Status ControlV2Service::PlanPipeline(
     grpc::ServerContext *context, const v2::PlanPipelineRequest *request,
     v2::PlanPipelineResponse *response) {
-  auto plan = control_plane_.PlanPipelineVersioned(FromProto(request->pipeline()));
+  auto desired = FromProto(request->pipeline());
+  if (!desired) {
+    return ToStatus(desired.error(), context);
+  }
+  auto plan = control_plane_.PlanPipelineVersioned(*desired);
   if (!plan) {
     return ToStatus(plan.error(), context);
   }
@@ -409,8 +436,11 @@ grpc::Status ControlV2Service::ApplyPipeline(
   if (request->has_expected_generation()) {
     options.expected_generation = request->expected_generation();
   }
-  auto applied =
-      control_plane_.ApplyPipeline(FromProto(request->pipeline()), options);
+  auto desired = FromProto(request->pipeline());
+  if (!desired) {
+    return ToStatus(desired.error(), context);
+  }
+  auto applied = control_plane_.ApplyPipeline(*desired, options);
   if (!applied) {
     return ToStatus(applied.error(), context);
   }

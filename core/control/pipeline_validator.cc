@@ -37,6 +37,8 @@
 #include <utility>
 
 #include "module.h"
+#include <limits>
+
 #include "port.h"
 #include "traffic_class.h"
 #include "worker.h"
@@ -292,6 +294,41 @@ ControlResult<ValidatedPipeline> ValidatePipeline(const RuntimeState &runtime,
         return std::unexpected(
             NotFound("tc", "parent", "traffic class '" + tc.name +
                                          "': no parent '" + tc.parent + "'"));
+      }
+    }
+
+    // The spec carries these as int64 (the wire type); the scheduler takes
+    // narrower types. Out-of-range values are refused here, not narrowed.
+    if (tc.has_priority &&
+        (tc.priority < 0 ||
+         tc.priority > std::numeric_limits<bess::priority_t>::max())) {
+      return std::unexpected(Invalid(
+          "tc", "priority",
+          "traffic class '" + tc.name + "': priority " +
+              std::to_string(tc.priority) + " is out of range (0 to " +
+              std::to_string(std::numeric_limits<bess::priority_t>::max()) +
+              ")"));
+    }
+    if (tc.has_share &&
+        (tc.share < 1 ||
+         tc.share > std::numeric_limits<bess::resource_share_t>::max())) {
+      return std::unexpected(Invalid(
+          "tc", "share",
+          "traffic class '" + tc.name + "': share " +
+              std::to_string(tc.share) + " is out of range (1 to " +
+              std::to_string(
+                  std::numeric_limits<bess::resource_share_t>::max()) +
+              ")"));
+    }
+    for (const auto *map : {&tc.limit, &tc.max_burst}) {
+      for (const auto &[resource, value] : *map) {
+        if (value < 0) {
+          return std::unexpected(Invalid(
+              "tc", map == &tc.limit ? "limit" : "max_burst",
+              "traffic class '" + tc.name + "': " +
+                  (map == &tc.limit ? "limit" : "max_burst") + " for '" +
+                  resource + "' must not be negative"));
+        }
       }
     }
 

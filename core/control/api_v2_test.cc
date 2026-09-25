@@ -32,10 +32,13 @@
 // typed error trailer included.
 
 #include "control/api_v2.h"
+#include "traffic_class.h"
 
 #include <google/protobuf/util/message_differencer.h>
 #include <grpc++/grpc++.h>
 #include <gtest/gtest.h>
+
+#include <functional>
 
 #include <memory>
 #include <string>
@@ -108,9 +111,57 @@ TEST(ApiV2AdapterTest, PipelineRoundTrips) {
   (*rl->mutable_limit())["bit"] = 1000000;
   (*rl->mutable_max_burst())["bit"] = 5000;
 
-  const v2::Pipeline back = bess::control::ToProto(bess::control::FromProto(p));
+  const auto spec = bess::control::FromProto(p);
+  ASSERT_TRUE(spec.has_value()) << spec.error().message;
+  const v2::Pipeline back = bess::control::ToProto(*spec);
   EXPECT_TRUE(MessageDifferencer::Equals(p, back))
       << p.DebugString() << "\nvs\n" << back.DebugString();
+}
+
+// Wire integers wider than their C++ field are refused before the cast. Each
+// rejected value is one that would otherwise wrap to a *valid* low value
+// (65536 -> gate 0, 256 -> "one queue"), so no later validator could catch
+// it; the maximum that fits is accepted.
+TEST(ApiV2AdapterTest, NarrowingIsCheckedBeforeTheCast) {
+  struct Case {
+    const char *field;
+    std::function<void(v2::Pipeline *, uint32_t)> set;
+    uint32_t max;
+  };
+  const Case cases[] = {
+      {"ogate",
+       [](v2::Pipeline *p, uint32_t v) { p->mutable_connections(0)->set_ogate(v); },
+       0xffff},
+      {"igate",
+       [](v2::Pipeline *p, uint32_t v) { p->mutable_connections(0)->set_igate(v); },
+       0xffff},
+      {"num_rx_queues",
+       [](v2::Pipeline *p, uint32_t v) { p->mutable_ports(0)->set_num_rx_queues(v); },
+       0xff},
+      {"num_tx_queues",
+       [](v2::Pipeline *p, uint32_t v) { p->mutable_ports(0)->set_num_tx_queues(v); },
+       0xff},
+  };
+  for (const Case &c : cases) {
+    SCOPED_TRACE(c.field);
+    for (uint32_t wraps : {c.max + 1, c.max + 2, 0xffffffffu}) {
+      v2::Pipeline p = SamplePipeline();
+      auto *port = p.add_ports();
+      port->set_name("p0");
+      port->set_driver("PMDPort");
+      c.set(&p, wraps);
+      const auto spec = bess::control::FromProto(p);
+      ASSERT_FALSE(spec.has_value()) << wraps << " was narrowed silently";
+      EXPECT_EQ(c.field, spec.error().field);
+      EXPECT_EQ(EINVAL, spec.error().err);
+    }
+    v2::Pipeline p = SamplePipeline();
+    auto *port = p.add_ports();
+    port->set_name("p0");
+    port->set_driver("PMDPort");
+    c.set(&p, c.max);
+    EXPECT_TRUE(bess::control::FromProto(p).has_value()) << "max must fit";
+  }
 }
 
 TEST(ApiV2AdapterTest, ErrorsMapToGrpcCodes) {
@@ -289,4 +340,137 @@ TEST_F(ApiV2ServiceTest, InvalidPipelineIsRejectedBeforeAnySideEffect) {
   EXPECT_EQ(0, current.pipeline().modules_size());
 }
 
+
+// Every RPC that takes a pipeline refuses a wrapping wire value with a typed
+// INVALID_ARGUMENT and changes nothing.
+TEST_F(ApiV2ServiceTest, OutOfRangeWireValuesAreRefusedEverywhere) {
+  v2::Pipeline bad = SamplePipeline();
+  bad.mutable_connections(0)->set_ogate(65536);  // would be gate 0
+  const uint64_t generation = bess::control::runtime().generation();
+
+  const auto check = [&](grpc::ClientContext &ctx, const grpc::Status &st) {
+    EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, st.error_code());
+    EXPECT_EQ("ogate", DetailOf(ctx).field());
+  };
+  {
+    grpc::ClientContext ctx;
+    v2::ValidatePipelineRequest req;
+    *req.mutable_pipeline() = bad;
+    v2::ValidatePipelineResponse resp;
+    check(ctx, stub_->ValidatePipeline(&ctx, req, &resp));
+  }
+  {
+    grpc::ClientContext ctx;
+    v2::DiffPipelineRequest req;
+    *req.mutable_pipeline() = bad;
+    v2::DiffPipelineResponse resp;
+    check(ctx, stub_->DiffPipeline(&ctx, req, &resp));
+  }
+  {
+    grpc::ClientContext ctx;
+    v2::PlanPipelineRequest req;
+    *req.mutable_pipeline() = bad;
+    v2::PlanPipelineResponse resp;
+    check(ctx, stub_->PlanPipeline(&ctx, req, &resp));
+  }
+  {
+    grpc::ClientContext ctx;
+    v2::ApplyPipelineRequest req;
+    *req.mutable_pipeline() = bad;
+    v2::ApplyPipelineResponse resp;
+    check(ctx, stub_->ApplyPipeline(&ctx, req, &resp));
+  }
+  EXPECT_EQ(generation, bess::control::runtime().generation());
+  grpc::ClientContext ctx;
+  v2::GetPipelineResponse resp;
+  ASSERT_TRUE(stub_->GetPipeline(&ctx, {}, &resp).ok());
+  EXPECT_EQ(0, resp.pipeline().modules_size()) << "nothing was created";
+}
+
+// The int64 traffic-class fields are range-checked against the scheduler's
+// narrower types instead of being narrowed: priority 2^32 + 5 would become 5,
+// share 2^32 + 1 would become 1.
+TEST_F(ApiV2ServiceTest, TrafficClassRangesAreValidatedNotNarrowed) {
+  struct Case {
+    const char *field;
+    std::function<void(v2::TrafficClass *)> set;
+  };
+  const Case cases[] = {
+      {"priority", [](v2::TrafficClass *t) { t->set_priority((int64_t{1} << 32) + 5); }},
+      {"priority", [](v2::TrafficClass *t) { t->set_priority(-1); }},
+      {"share", [](v2::TrafficClass *t) { t->set_share((int64_t{1} << 32) + 1); }},
+      {"share", [](v2::TrafficClass *t) { t->set_share(0); }},
+      {"share", [](v2::TrafficClass *t) { t->set_share(-3); }},
+      {"limit", [](v2::TrafficClass *t) { (*t->mutable_limit())["count"] = -1; }},
+      {"max_burst", [](v2::TrafficClass *t) { (*t->mutable_max_burst())["count"] = -1; }},
+  };
+  for (const Case &c : cases) {
+    SCOPED_TRACE(c.field);
+    v2::Pipeline p = SamplePipeline();
+    auto *tc = p.mutable_traffic_classes(1);  // "child"
+    tc->clear_share();
+    c.set(tc);
+    grpc::ClientContext ctx;
+    v2::ValidatePipelineRequest req;
+    *req.mutable_pipeline() = p;
+    v2::ValidatePipelineResponse resp;
+    const grpc::Status st = stub_->ValidatePipeline(&ctx, req, &resp);
+    EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, st.error_code());
+    EXPECT_EQ(c.field, DetailOf(ctx).field());
+  }
+}
+
+// The legacy (v1) path reaches AddTc without the pipeline validator, so the
+// shared path range-checks the int64 fields before narrowing them to the
+// scheduler's types: priority 2^32 + 5 must not become 5, share 2^32 + 1 must
+// not become 1, a negative limit must not become ~1.8e19. A refused class is
+// not created.
+TEST_F(ApiV2ServiceTest, LegacyAddTcRangeChecksBeforeNarrowing) {
+  ControlPlane &control_plane = *control_plane_;
+  bess::control::TrafficClassSpec prio;
+  prio.name = "rc_prio";
+  prio.policy = "priority";
+  ASSERT_TRUE(control_plane.AddTc(prio).has_value());
+  bess::control::TrafficClassSpec wfq;
+  wfq.name = "rc_wfq";
+  wfq.policy = "weighted_fair";
+  wfq.resource = "count";
+  ASSERT_TRUE(control_plane.AddTc(wfq).has_value());
+
+  bess::control::TrafficClassSpec child;
+  child.name = "rc_child";
+  child.policy = "round_robin";
+  child.parent = "rc_prio";
+  child.has_priority = true;
+  child.priority = (int64_t{1} << 32) + 5;
+  EXPECT_EQ(EINVAL, control_plane.AddTc(child).error().err);
+  child.priority = -1;
+  EXPECT_EQ(EINVAL, control_plane.AddTc(child).error().err);
+
+  child.parent = "rc_wfq";
+  child.has_priority = false;
+  child.has_share = true;
+  for (int64_t share : {(int64_t{1} << 32) + 1, int64_t{0}, int64_t{-3}}) {
+    child.share = share;
+    EXPECT_EQ(EINVAL, control_plane.AddTc(child).error().err) << share;
+  }
+  EXPECT_EQ(nullptr, bess::TrafficClassBuilder::Find("rc_child"))
+      << "a refused class must not be left behind";
+
+  bess::control::TrafficClassSpec limited;
+  limited.name = "rc_limited";
+  limited.policy = "rate_limit";
+  limited.resource = "count";
+  limited.limit["count"] = -1;
+  EXPECT_EQ(EINVAL, control_plane.AddTc(limited).error().err);
+  limited.limit["count"] = 1000;
+  limited.max_burst["count"] = -1;
+  EXPECT_EQ(EINVAL, control_plane.AddTc(limited).error().err);
+  EXPECT_EQ(nullptr, bess::TrafficClassBuilder::Find("rc_limited"));
+
+  child.share = 5;  // in range: accepted
+  EXPECT_TRUE(control_plane.AddTc(child).has_value());
+}
+
 }  // namespace
+

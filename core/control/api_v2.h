@@ -49,7 +49,10 @@ namespace control {
 // Every decision (validation, diff, ordering, pause, rollback, generations)
 // is the ControlPlane's; this layer only translates.
 
-PipelineSpec FromProto(const pb::v2::Pipeline &pipeline);
+// Fallible: a wire value that does not fit the narrower C++ field (a gate
+// above gate_idx_t, a queue count above queue_t) is rejected here, before the
+// cast, because after it the evidence is gone -- 65536 would arrive as gate 0.
+ControlResult<PipelineSpec> FromProto(const pb::v2::Pipeline &pipeline);
 pb::v2::Pipeline ToProto(const PipelineSpec &spec);
 pb::v2::PipelineDiff ToProto(const PipelineDiff &diff);
 void AppendPlanSteps(const PipelinePlan &plan,

@@ -44,6 +44,7 @@
 #include "pb/service.grpc.pb.h"
 #pragma GCC diagnostic pop
 
+#include "control/wire_narrow.h"
 #include "control/api_v2.h"
 #include "control/control_plane.h"
 #include "control/worker_manager.h"
@@ -570,8 +571,18 @@ class BESSControlImpl final : public BESSControl::Service {
     bess::control::PortSpec spec;
     spec.name = request->name();
     spec.driver = request->driver();
-    spec.num_rx_queues = request->num_inc_q();
-    spec.num_tx_queues = request->num_out_q();
+    auto rx = bess::control::WireNarrow<queue_t>(request->num_inc_q(), "port",
+                                                 "num_inc_q");
+    if (!rx) {
+      return return_with_control_error(response, rx.error());
+    }
+    auto tx = bess::control::WireNarrow<queue_t>(request->num_out_q(), "port",
+                                                 "num_out_q");
+    if (!tx) {
+      return return_with_control_error(response, tx.error());
+    }
+    spec.num_rx_queues = *rx;
+    spec.num_tx_queues = *tx;
     spec.rx_queue_size = request->size_inc_q();
     spec.tx_queue_size = request->size_out_q();
     spec.arg = request->arg();
@@ -785,8 +796,18 @@ class BESSControlImpl final : public BESSControl::Service {
     bess::control::ConnectionSpec spec;
     spec.upstream = request->m1();
     spec.downstream = request->m2();
-    spec.ogate = request->ogate();
-    spec.igate = request->igate();
+    auto ogate = bess::control::WireNarrow<gate_idx_t>(request->ogate(),
+                                                       "connection", "ogate");
+    if (!ogate) {
+      return return_with_control_error(response, ogate.error());
+    }
+    auto igate = bess::control::WireNarrow<gate_idx_t>(request->igate(),
+                                                       "connection", "igate");
+    if (!igate) {
+      return return_with_control_error(response, igate.error());
+    }
+    spec.ogate = *ogate;
+    spec.igate = *igate;
     spec.skip_default_hooks = request->skip_default_hooks();
 
     if (auto ret = control_plane_.ConnectModules(spec); !ret) {
@@ -800,7 +821,12 @@ class BESSControlImpl final : public BESSControl::Service {
                            EmptyResponse* response) override {
     bess::control::DisconnectionSpec spec;
     spec.name = request->name();
-    spec.ogate = request->ogate();
+    auto ogate = bess::control::WireNarrow<gate_idx_t>(request->ogate(),
+                                                       "disconnection", "ogate");
+    if (!ogate) {
+      return return_with_control_error(response, ogate.error());
+    }
+    spec.ogate = *ogate;
 
     if (auto ret = control_plane_.DisconnectModules(spec); !ret) {
       return return_with_control_error(response, ret.error());

@@ -31,6 +31,8 @@
 
 #include "control/worker_manager.h"
 
+#include <limits>
+#include <optional>
 #include <memory>
 
 #include <cerrno>
@@ -122,6 +124,21 @@ TrafficClassSpec AttachmentSpecOf(const bess::TrafficClass* c) {
   }
 
   return spec;
+}
+
+// A rate limit or burst below zero would wrap when narrowed to the
+// scheduler's unsigned fields; refuse it instead (v1 and v2 share this path).
+std::optional<ControlError> NegativeRate(const TrafficClassSpec &spec) {
+  for (const auto *map : {&spec.limit, &spec.max_burst}) {
+    for (const auto &[resource, value] : *map) {
+      if (value < 0) {
+        return Err(EINVAL, "%s for '%s' must not be negative (%lld)",
+                   map == &spec.limit ? "limit" : "max_burst",
+                   resource.c_str(), static_cast<long long>(value));
+      }
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace
@@ -760,6 +777,9 @@ ControlResult<void> ControlPlane::AddTcLocked(const TrafficClassSpec& spec) {
     if (bess::ResourceMap.count(spec.resource) == 0) {
       return std::unexpected(Err(EINVAL, "Invalid resource"));
     }
+    if (auto bad = NegativeRate(spec)) {
+      return std::unexpected(*bad);
+    }
     if (spec.limit.find(spec.resource) != spec.limit.end()) {
       limit = spec.limit.at(spec.resource);
     }
@@ -808,6 +828,10 @@ ControlResult<void> ControlPlane::UpdateTcParamsLocked(
         reinterpret_cast<bess::RateLimitTrafficClass*>(c);
     if (bess::ResourceMap.count(spec.resource) == 0) {
       return std::unexpected(Err(EINVAL, "Invalid resource"));
+    }
+    // Before any mutation: a refused update must change nothing.
+    if (auto bad = NegativeRate(spec)) {
+      return std::unexpected(*bad);
     }
     tc->set_resource(bess::ResourceMap.at(spec.resource));
     if (spec.limit.find(spec.resource) != spec.limit.end()) {
@@ -1147,7 +1171,12 @@ ControlResult<void> ControlPlane::AttachExistingTcLocked(
       if (!spec.has_priority) {
         return std::unexpected(Err(EINVAL, "No priority specified"));
       }
-      bess::priority_t pri = spec.priority;
+      if (spec.priority < 0 ||
+          spec.priority > std::numeric_limits<bess::priority_t>::max()) {
+        return std::unexpected(Err(EINVAL, "Priority %lld is out of range",
+                                   static_cast<long long>(spec.priority)));
+      }
+      const auto pri = static_cast<bess::priority_t>(spec.priority);
       if (pri == DEFAULT_PRIORITY) {
         return std::unexpected(
             Err(EINVAL, "Priority %d is reserved", DEFAULT_PRIORITY));
@@ -1160,8 +1189,13 @@ ControlResult<void> ControlPlane::AttachExistingTcLocked(
       if (!spec.has_share) {
         return std::unexpected(Err(EINVAL, "No share specified"));
       }
+      if (spec.share < 1 ||
+          spec.share > std::numeric_limits<bess::resource_share_t>::max()) {
+        return std::unexpected(Err(EINVAL, "Share %lld is out of range",
+                                   static_cast<long long>(spec.share)));
+      }
       fail_add = !static_cast<bess::WeightedFairTrafficClass*>(parent)->AddChild(
-          c, spec.share);
+          c, static_cast<bess::resource_share_t>(spec.share));
       break;
     case bess::POLICY_ROUND_ROBIN:
       fail_add =
