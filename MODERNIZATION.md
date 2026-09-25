@@ -3490,6 +3490,22 @@ rather than one call site).
     writes on the data path. G1.2a now starts by measuring LF `rte_hash`
     lookup cost against today's cuckoo.
 
+89. **G1.2a experiments E1-E3.** `core/dataplane/update_scale_bench.cc`.
+    Lock-free `rte_hash` (+QSBR) has no lookup regression against today's
+    ExactMatch table (hits equal or better; misses 30-35% faster from 1M up)
+    and brings inserts from O(table) to 52-270 ns (1K-10M). With 4 workers,
+    1M modifications/s into a shared 10M table costs lookups <2% and a
+    quarter of one writer core (writer peak 4.2-4.5M ops/s). Worker-owned
+    partitions scale modifications to 34-148M ops/s but did not improve
+    multi-worker lookups on this laptop (unexplained 3-4-worker penalty;
+    Phase L1 counters). Headroom rule: spare slots >= rate x grace period.
+    Mode G restricted to bulk loads and structures with no incremental
+    update (`rte_acl`), per the user. Recorded the design for 1M
+    modifications/s at 30 Mpps (C tables, per-table writers, W-shards
+    beyond one writer or for data-path-written state, batched/packed ingress
+    as the likely bottleneck -- E4 next). Harness bugs fixed and recorded
+    (correlated CRC partitioning; timing before inputs were ready).
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -7218,22 +7234,129 @@ round (microseconds under load; an idle worker drains on wake-up). Prevalidation
 runs once on the control side against a control-side copy, so every worker's
 apply is deterministic and cannot fail.
 
-**Mode G -- generation swap (bulk and tiny).** Build and swap: for loading or
-replacing a whole table, and for tiny configuration (a few ACL rules, a gate
-list) where rebuild cost is irrelevant. This is today's mechanism, kept where
-it fits.
+**Mode G -- generation swap: last resort only.** User direction
+(2026-09-25): never rebuild a table unless the problem is unsolvable any other
+way. G remains for a few special scenarios: a deliberate bulk load or replace
+of a whole table (an initial million-route load, a restore), and structures
+that have no incremental update at all -- `rte_acl` compiles its whole trie
+on every build. Small ACLs therefore go to W (replicas updated in place, no
+compile), and a large, frequently changing rule set waits for K3.8's range
+backend to decide its update path. Small configuration (gate lists, a few
+rules) goes to W, not G.
 
 **Automatic selection.** Like `ResolveLookupBody`: the runtime chooses from
-table size, worker count and structure -- W-replica while
-`table_bytes x workers` fits a memory budget, C beyond that or when the table
-is written by the data path, G for bulk. A module can force a mode;
-`BESS_UPDATE_MODE` overrides it for experiments.
+table size, worker count, modification rate and who writes the table. The
+default is C for shared tables. W-shard is for tables the data path writes
+(flows) and for modification rates beyond one writer. W-replica is for small
+tables while `table_bytes x workers` fits a memory budget. G is only for an
+explicit bulk load. A module can force a mode; `BESS_UPDATE_MODE` overrides
+it for experiments.
+
+#### G1.2a experiment results (2026-09-25)
+
+`update_scale_bench` (`core/dataplane/`), GCC release, 8-byte keys, the EAL on
+the host's 1 GiB hugepage, `omarchy-benchmark --isolate`. Mode C is DPDK
+`rte_hash` with `RW_CONCURRENCY_LF` plus `rte_hash_rcu_qsbr_add` (defer
+queue); "cuckoo-gen" is today's ExactMatch table (CuckooMap with the staged
+batch probe).
+
+**E1 -- one table, one thread (ns per key; churn = delete + insert, ns per op):**
+
+| entries | cuckoo-gen hit / miss | rte_hash hit / miss / churn | rte_hash-LF hit / miss / churn |
+|---:|---|---|---|
+| 1K | 11.1 / 4.1 (insert: O(n) rebuild) | 9.7 / 5.6 / 25 | 9.8 / 5.8 / 52 |
+| 64K | 12.2 / 5.1 | 11.5 / 5.8 / 35 | 11.5 / 5.8 / 61 |
+| 1M | 25.6 / 18.8 | 22.9 / 11.0 / 128 | 24.0 / 13.2 / 235 |
+| 4M | 33.7 / 32.3 | 33.9 / 21.3 / 139 | 33.6 / 21.5 / 260 |
+| 10M | 38.0 / 35.2 | 36.0 / 23.7 / 147 | 37.3 / 24.2 / 270 |
+
+Lock-free `rte_hash` lookups equal or beat today's table on hits at every size
+and are 30-35% faster on misses from 1M up; its change-counter check costs
+about nothing over plain `rte_hash`. Inserts go from O(table) (7.9 ms at 100K)
+to 52-270 ns. **Mode C has no hot-path regression and is the default.**
+
+**E2 -- 4 workers (CPUs 0, 2, 8, 10) plus 1 control thread (CPU 4); Mlookups/s
+total, modifications/s applied:**
+
+| entries | churn | shared-LF lookups / mods | partitioned lookups / mods |
+|---:|---|---|---|
+| 1M | 0 | 232.6 / -- | 229.5 / -- |
+| 1M | 1M/s | 194.5 / 0.995M | 185.8 / 0.993M |
+| 1M | max | 248.9 / **4.5M** | 109.0 / **36.6M** |
+| 4M | 1M/s | 128.7 / 0.990M | 89.5 / 0.987M |
+| 4M | max | 126.8 / **4.2M** | 14.2 / **36.5M** |
+| 10M | 0 | 134.6 / -- | 87.8 / -- |
+| 10M | 1M/s | 111.8 / 0.981M | 80.6 / 0.973M |
+| 10M | max | 104.9 / **4.3M** | 10.1 / **34.3M** |
+
+(Under churn, hit% falls in both modes alike, because workers keep probing
+the original keys; the ~100 Mlookups/s-level rows are comparable. At "max",
+partitioned lookups collapse because the rings are always full: the workers
+are spending their time applying ops, by construction.)
+
+What the data says:
+
+- **1M modifications/s against a shared 10M-entry table costs lookups almost
+  nothing** (113.7 -> 111.8 Mlookups/s) and uses about a quarter of one writer
+  core (one writer peaks at 4.2-4.5M ops/s).
+- **Worker-owned partitions scale writes, not reads, on this machine.**
+  Aggregate apply capacity is 34-148M ops/s -- workers apply their own ops
+  and free deleted slots at once, with no grace period. Lookups are equal to
+  shared at 1-2 workers and **slower** at 3-4 workers for large tables, even
+  though a lone shard is 38% faster single-threaded (E3: 23 ns vs 37 ns at
+  10M/4). The multi-worker penalty is not explained yet; it needs hardware
+  counters (Phase L1) and a server-class part before any conclusion.
+  **Partitioning becomes first-class for write-heavy tables and
+  data-path-written state, not as a lookup-cache optimization.**
+- **Headroom must cover churn times grace period.** A 1K-entry shared table
+  with 25% headroom stalled 231K times at 1M/s (adds waiting for the defer
+  queue); from 64K up there were no stalls. Sizing rule: spare slots >=
+  modification rate x the longest expected grace period, times a safety
+  factor.
+- **Two harness bugs, found and fixed,** recorded so later experiments avoid
+  them: (1) partitioning by a CRC with a different seed is not independent of
+  the table's CRC for fixed-length keys (it differs by a constant XOR), which
+  crowded every shard into a quarter of its buckets; (2) timing must start
+  only after every thread has built its inputs.
+
+#### Designing for 1M modifications/s at 30 Mpps
+
+Budget: 30 Mpps with 1-3 table lookups per packet is 30-90M lookups/s. From
+E2, 10M-entry shared tables serve about 26-34M lookups/s per worker, so
+lookups alone take 1-3 workers' worth of time. The whole pipeline, at a
+roughly 150-300 ns per-packet budget, needs about 5-9 workers. Plan:
+
+1. **Tables:** mode C (DPDK lock-free `rte_hash`, `rte_lpm`, write-once object
+   slots) sized with churn headroom. The measured hot-path cost of 1M/s churn
+   is under 2%.
+2. **Writers:** one writer thread per shared table, not one control thread
+   for everything. A 1M/s session rate is 2-3 table ops per modification
+   (classifier + action + meter), about 2.5M table ops/s -- more than half of
+   one writer's peak -- so independent tables get independent writers, fed by
+   SPSC rings. Where one table's rate exceeds a writer (above ~4M ops/s), or
+   the data path writes it, the table becomes worker-owned (W-shard, 34M+
+   ops/s).
+3. **Control ingress:** almost certainly the real bottleneck. At 1M ops/s,
+   unary gRPC per op (tens of microseconds) and a protobuf `Any` per op do not
+   fit. Use batched or streaming RPCs (hundreds to thousands of ops per
+   message), a compact packed op encoding (fixed-width records rather than
+   nested `Any`), and several ingestion threads decoding in parallel,
+   partitioned by table or scope so writers never contend. **E4 (next): the
+   ingress rate of `ApplyDataplaneTransaction` batches.**
+4. **Reclamation:** batched grace tokens (one per transaction or per writer
+   batch), reclaimed by the writer threads; the defer-queue depth follows the
+   headroom rule.
+5. **Transactions:** reserve/publish as above; the publish stores are
+   nanoseconds -- the cost is validation and reservation, which parallelizes
+   per writer.
+6. **Hot path:** unchanged -- workers run the same lookups, report quiescence
+   where they already do, and (for W tables) check one ring per round.
 
 #### Existing modules under the modes
 
 | module | today | target |
 |---|---|---|
-| ExactMatch | K3 generation rebuilt per add (7.9 ms at 100K) | C: `rte_hash` LF + QSBR (K3 already has rte_hash backends, currently built without concurrency flags); W-replica for small tables; G for bulk load |
+| ExactMatch | K3 generation rebuilt per add (7.9 ms at 100K) | C: `rte_hash` LF + QSBR (K3 already has rte_hash backends, currently built without concurrency flags) -- measured: no lookup regression, 52-270 ns inserts |
 | WildcardMatch | generation rebuilt per add | C: one LF `rte_hash` per tuple; a new mask is a G swap of the tuple list (O(tuples)) |
 | IPLookup | K7 in place + QSBR | C (done) |
 | L2Forward | own table; add/delete pause every worker | W-replica (small tables), or C by moving to LF `rte_hash` |
