@@ -155,12 +155,12 @@ separately.
 | E — Meson | Complete | Meson is the BESS build/test/install graph. |
 | F — operations | Partial | Packaging, releases, SBOM, observability, and tooling lanes remain. |
 | G0 — transactional core | Complete | Internal C++ desired-state/transaction engine is landed. |
-| G1 — public API/SDKs | Not started | Design after K6–K7 establish the remaining resource semantics. |
-| H / I — language and type safety | Partial | Continue incrementally with later work. |
+| G1 — public API/SDKs | Not started | Design after K7 establishes the remaining resource semantics. |
+| H / I — language and type safety | Partial | Continue incrementally; K6 added a typed `WorkerId`. |
 | J — live table updates | Complete, subsumed | Pilot succeeded; current lifetime mechanism is K1 `RcuDomain`/`RcuPtr`. |
-| K — dataplane substrate | K1–K5 complete | K6 is next; K7 follows; K8 is consumer-driven. |
+| K — dataplane substrate | K1–K6 complete | K7 is next; K8 is consumer-driven. |
 
-Current software sequence: **K6 → K7 → G1 → D → F**, with H/I
+Current software sequence: **K7 → G1 → D → F**, with H/I
 hardening alongside those stages. K8 is lower priority and should start when a
 consumer requires fragmentation/reassembly. C-HW stays a separate, non-blocking
 hardware gate.
@@ -255,7 +255,15 @@ per-socket slabs whose slots return only when the last referencing generation
 is destroyed. Differential tests prove colour-for-colour agreement with raw
 `rte_meter`; GCC and Clang full Meson suites pass 83/83.
 
-The active software scope K1-K5 is closed. Meson/Ninja remains the build graph,
+**K6 worker-local statistics is complete (2026-09-25, entry 79).**
+`core/stats/` adds `WorkerLocal<T>`, a seqlock-grouped single-writer
+`WorkerSlots` store, `CounterSet` and `WorkerHistogram` with generation- and
+epoch-stamped snapshots, controller-side baseline resets and checked deltas,
+plus a typed `dataplane::WorkerId`. The `Track` gate hook is migrated onto it
+(its reset no longer pauses workers). GCC and Clang full Meson suites pass
+85/85.
+
+The active software scope K1-K6 is closed. Meson/Ninja remains the build graph,
 with pinned DPDK 25.11.3. The registered Meson suite has 80 targets. At the
 2026-09-24 local verification checkpoint, the full GCC and Clang test suites
 both passed all 80 targets on CPUs 0–3. After the final benchmark-registration
@@ -3315,6 +3323,22 @@ rather than one call site).
     54 -> 9 M/s. GCC and Clang full Meson suites pass 83/83. Details in the
     K5 section.
 
+79. **K6** — **worker-local statistics and snapshots.** Added
+    `core/dataplane/worker_id.h` (typed `WorkerId`) and `core/stats/`:
+    `WorkerLocal<T>`, `WorkerSlots` (single-writer atomic cells plus a
+    one-writer seqlock per worker slot), `CounterSet` and `WorkerHistogram`
+    (log2 / linear) with source/generation/epoch/TSC-stamped snapshots,
+    controller-side baseline `Reset()`, and checked `Delta()`. Migrated the
+    `Track` gate hook (grouped batch/packet/byte update, one-snapshot
+    `Totals` in `bessctl`, reset no longer pauses workers). 12 new tests,
+    EAL-free (ASan lane), 12/12 under a standalone TSan build; both
+    concurrency tests fail 3/3 with the seqlock removed. Benchmarks via
+    `omarchy-benchmark --isolate`: a batch's 3-counter update costs 0.52 ns
+    ungrouped / 1.25 ns grouped vs 10.7 ns for shared `fetch_add`s;
+    worker-local scales 850 -> 3374 M/s on 1 -> 4 CPUs while shared atomics
+    fall 88.7 -> 41.7 M/s. GCC and Clang full Meson suites pass 85/85.
+    Details in the K6 section.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -3476,7 +3500,7 @@ Add a regression test or process-level smoke that launches actual daemon mode un
 ## Order of work
 
 The roadmap letters are workstream labels, not an execution sequence. The
-foundations below are complete; the remaining plan starts at K6:
+foundations below are complete; the remaining plan starts at K7:
 
 ```text
 COMPLETE
@@ -3484,10 +3508,10 @@ A / B / C-software / E
 J live-update pilot (subsumed by K1)
 G0 transactional control core
 K1 RCU/QSBR -> K2 object/action tables -> K3 classifiers -> K4 packet primitives
-  -> K5 metering
+  -> K5 metering -> K6 worker-local stats
 
 NEXT
-K6 worker-local stats -> K7 routes/next hops -> G1 -> D -> F
+K7 routes/next hops -> G1 -> D -> F
 
 K8 fragmentation/reassembly: start when a consumer requires it.
 H/I hardening: proceed incrementally alongside the sequence.
@@ -5203,7 +5227,7 @@ MBUF_FAST_FREE, PortOut lock elimination, DPDK version upgrade, ARM/SIMD
 ```
 
 The boundary below reflects G0's original scope: when G0 was implemented, K did
-not yet exist. K1–K5 are now complete and K6–K7 remain ahead; keep public API
+not yet exist. K1–K6 are now complete and K7 remains ahead; keep public API
 work in G1 until those resource semantics are established. Do not build a Go
 SDK yet or add transaction logic to `pybess`/Python `bessctl`: the existing
 Python tools should get correctness by routing through the C++ control plane,
@@ -6448,42 +6472,118 @@ OMEC owns:
 
 ---
 
-### K6 — worker-local statistics and snapshots — PENDING
+### K6 — worker-local statistics and snapshots — COMPLETE
 
-Build the data mechanism before building more exporters.
+**Status: complete (2026-09-25, entry 79).** Source: `core/stats/`
+(`worker_local.h`, `worker_slots.h`, `counter_set.{h,cc}`,
+`worker_histogram.{h,cc}`, `current_worker.h`), `core/dataplane/worker_id.h`;
+tests `stats_test.cc`; benchmark `stats_bench.cc`. There is no DPDK facility
+for this (DPDK's own stats are per-port/per-queue xstats), so K6 is BESS code
+by necessity, not duplication.
 
-Desired primitives:
-
-```text
-WorkerLocal<T>
-CounterSet
-EpochCounter
-Histogram
-SnapshotGeneration
-```
-
-Rule:
+Rule, as implemented:
 
 ```text
-worker writes local state
-controller aggregates snapshots
+worker writes its own slot (no lock, no atomic RMW, no shared line)
+controller reads all slots, sums, stamps, and keeps any reset baseline
 ```
 
-Packet path must not take a shared statistics mutex.
+#### Primitives
 
-Support:
+```text
+WorkerId          StrongId<WorkerIdTag, uint16_t>; index-like, 0 valid;
+                  kMaxWorkers (== Worker::kMaxWorkers, static_asserted)
+WorkerLocal<T>    one T per worker, each cache-line aligned, heap-allocated
+WorkerSlots       per worker: one sequence word + N 64-bit cells, padded to
+                  cache lines; single-writer atomic cells; seqlock grouping
+CounterSet        named monotonic counters; ForWorker(w).Add / Updating(w)
+CounterSnapshot   source, generation, epoch, tsc, totals, optional per-worker
+Delta()           counter deltas + elapsed TSC; refused across a reset
+WorkerHistogram   Log2 (65 buckets, any uint64) or Linear(width, n)+overflow;
+                  Record / RecordBatch; count/sum/buckets always consistent
+HistogramSnapshot same stamps; PercentileUpperBound(p)
+```
 
-- monotonic counters;
-- deltas;
-- histograms;
-- reset/epoch semantics;
-- per-worker aggregation;
-- consistent-enough snapshot generation;
-- low-cost batch updates.
+The roadmap's `EpochCounter` and `SnapshotGeneration` are properties of every
+snapshot (`epoch`, `generation`) rather than separate types.
 
-The future Prometheus exporter in Phase F should consume this mechanism rather than invent another counter ownership model.
+#### Decisions and evidence
 
-For OMEC, subscriber/PDR/URR identities remain application-level semantics.
+1. **Single-writer atomic cells.** A cell update is relaxed load + add +
+   relaxed store; on x86 that is the same `mov/add/mov` as a plain `+=`
+   (verified in the benchmark disassembly), with no `lock` prefix. The atomics
+   exist so the controller's concurrent read is defined behaviour -- the
+   pre-K6 `Track` read plain `uint64_t`s being written by workers, a data race.
+2. **Grouping by a one-writer seqlock.** An `Update` bumps the slot's sequence
+   word odd before and even after (release fence / release store); the reader
+   retries until it sees the same even value around its reads (acquire load,
+   acquire fence). A snapshot never shows half an update: a batch's packets
+   without its bytes, or a histogram count without its bucket.
+   `SnapshotsNeverSplitAnUpdate` (4 writers x 2M updates, concurrent snapshots
+   and resets) and `SnapshotsAreInternallyConsistent` (4 writers x 1M records)
+   assert zero split reads; with the sequence bumps removed both fail in 3/3
+   runs (split observed within 227-7094 snapshots).
+3. **Reset is a controller baseline, never a write to worker cells.** A
+   controller store would race the worker's load-add-store and could be lost or
+   erase increments. `Reset()` snapshots raw per-worker values as the baseline
+   and bumps the epoch; snapshots subtract it. Worker cells are monotonic for
+   the set's life. `Delta()` refuses snapshots from different sources, out of
+   order, or across an epoch change.
+4. **Consistency statement.** Each worker's contribution is an instant image
+   of that worker; workers are read one after another, so a snapshot is not a
+   global instant. Totals are exact sums of per-worker instants.
+5. **Concurrent-access verification.** The stats tests need no EAL, so they
+   run in the ASan lane and were also built standalone with
+   `-fsanitize=thread`: 12/12 pass with no reports. TSan does not model
+   standalone fences (`-Wtsan`), so TSan proves every cross-thread access is
+   atomic; the mutation runs above are the evidence for the fence ordering.
+6. **First consumer: `Track`.** The gate hook's per-worker plain structs became
+   a `CounterSet` {batches, packets, bytes}; a batch's three counts are one
+   `Update`; `bessctl` reads one `Totals` snapshot instead of three racing
+   sums; `reset` changed from `THREAD_UNSAFE` (pause all workers) to
+   `THREAD_SAFE`.
+
+#### Benchmark evidence
+
+`stats_bench`, GCC release, medians of 3, `--benchmark_min_time=0.2s`.
+Single-thread rows: `omarchy-benchmark --cpu 2 --isolate`; thread rows:
+`omarchy-benchmark --cpu 0,2,8,10 --isolate` (threads self-pin).
+
+| row (one batch's accounting = 3 counters) | ns | M/s |
+|---|---:|---:|
+| worker cells, ungrouped | 0.52 | 1939 |
+| worker cells in one `Update` (seqlock pair) | 1.25 | 801 |
+| shared line, 3 x `lock xadd` (`fetch_add`) | 10.7 | 94 |
+| histogram `Record`, log2 | 1.93 | 519 |
+| histogram `Record`, linear 64 x 256 | 2.49 | 403 |
+| histogram `RecordBatch` of 32 (per value) | 0.97 | 1036 |
+
+| threads | worker-local `Update` total | shared `fetch_add` total |
+|---:|---:|---:|
+| 1 | 850 M/s | 88.7 M/s |
+| 2 | 1677 M/s | 51.9 M/s |
+| 4 | 3374 M/s | 41.7 M/s |
+
+Worker-local accounting scales linearly; a shared atomic counter set gets
+slower in total as workers are added (81x apart at four workers). A packed
+per-thread layout (correct ownership, one shared line) did not show a
+penalty in this tight loop -- store-to-load forwarding hides the line
+ping-pong there -- so that row is recorded as a lower bound, not as evidence;
+worker slots are padded regardless.
+
+Control side: a 3-counter snapshot of all 64 worker slots costs 384 ns
+(4 KiB of slots); 32 counters 2.46 us (20 KiB); a log2 histogram 3.9 us
+(36 KiB).
+
+#### Not in K6 (deliberately)
+
+- Gauges (set/max semantics) -- add with the first consumer that needs one.
+- A registry/exporter: Phase F's Prometheus exporter consumes `CounterSet` /
+  `WorkerHistogram` snapshots and owns naming/labels.
+- Migrating other ad hoc per-worker arrays (`Module::deadends_`, port queue
+  stats, `Measure`'s histogram): do it as those areas are touched.
+- Per-slot NUMA placement (slots of all workers are one allocation).
+- For OMEC, subscriber/PDR/URR identities remain application-level semantics.
 
 ---
 
@@ -6546,7 +6646,7 @@ Lower priority than K1–K3 and K5/K6.
 ## 14. Phase G1 — desired-state API and thin language SDKs — NOT STARTED
 
 After G0 and enough K resources exist to design against real semantics, expose
-the new public API. Start G1 after K6–K7 complete the resource contracts.
+the new public API. Start G1 after K7 completes the resource contracts.
 
 The old imperative API should not constrain the ideal end state.
 
@@ -6675,7 +6775,7 @@ Do not fold the CLI into the privileged daemon merely because both are C++.
 
 ## 16. Phase D — ARM64 + portable architecture — NOT STARTED
 
-Phase D remains important but no longer blocks completed G0/K1–K5 or the next
+Phase D remains important but no longer blocks completed G0/K1–K6 or the next
 K stages. D1–D4 are not started; real ARM performance remains a separate
 hardware gate.
 
@@ -7707,8 +7807,8 @@ the reviewing document's word alone.
 
 ## 26. Current execution plan (2026-09-25)
 
-K1–K5, G0, A, B, C-software, E, and the J live-update pilot are closed. The
-next software phase is K6; do not restart already-closed architecture work.
+K1–K6, G0, A, B, C-software, E, and the J live-update pilot are closed. The
+next software phase is K7; do not restart already-closed architecture work.
 
 ### Done — K5 generic metering (2026-09-25)
 
@@ -7717,23 +7817,26 @@ interned profiles, cache-line states, exclusive/shared placement, monotonic
 clamp, slab-backed `MeterSet` generations, prefetching batch checks). See the
 K5 section for decisions and benchmark evidence.
 
-### Next — K6 worker-local statistics/snapshots (not started)
+### Done — K6 worker-local statistics (2026-09-25)
 
-Workers update local state; the controller aggregates snapshots. This is the
-foundation for the Phase F metrics exporter. K5's thread rows are the
-motivating evidence: a contended shared cache line collapses from 54 M/s to
-9 M/s at four workers, while per-worker state scales linearly.
+`core/stats/`: `WorkerLocal<T>`, seqlock-grouped single-writer slots,
+`CounterSet`, `WorkerHistogram`, stamped snapshots, baseline resets, checked
+deltas, typed `WorkerId`; `Track` migrated. See the K6 section.
+
+### Next — K7 routes/next hops (not started)
+
+Add reusable route, next-hop, neighbor, egress, and rewrite resources. Keep
+`rte_lpm` as the trusted default; do not promote `rte_fib` without correctness
+evidence and a real consumer. Reuse K2 ids/tables, K1 publication, K4 rewrite
+primitives, and K6 counters for per-route/next-hop accounting.
 
 ### Following stages
 
-1. **K7 — routes/next hops (pending):** add reusable route, next-hop, neighbor,
-   egress, and rewrite resources. Keep `rte_lpm` as the trusted default; do not
-   promote `rte_fib` without correctness evidence and a real consumer.
-2. **G1 — public API/SDKs (not started):** after K6–K7 stabilize, expose
+1. **G1 — public API/SDKs (not started):** after K7 stabilizes, expose
    desired-state and dataplane transactions (classifier entries, actions,
-   meters, routes, next hops), then thin Go and C++ SDKs. G0 remains the
-   internal transactional engine.
-3. **K8 — fragmentation/reassembly (pending, consumer-driven):** schedule when
+   meters, routes, next hops) and stats snapshots, then thin Go and C++ SDKs.
+   G0 remains the internal transactional engine.
+2. **K8 — fragmentation/reassembly (pending, consumer-driven):** schedule when
    a real consumer needs it; bound resources and test partial-failure cleanup.
 
 ### Parallel and deferred work
@@ -7741,7 +7844,7 @@ motivating evidence: a contended shared cache line collapses from 54 M/s to
 - **D (not started):** D1–D4, including the D3 `rte_bpf` evaluation and ARM
   build/test validation.
 - **F (partial):** packaging, SBOM, signed/reproducible releases, sanitizer and
-  static-analysis lanes, and metrics export (after K6).
+  static-analysis lanes, and a metrics exporter over K6 snapshots.
 - **H/I (partial):** continue toolchain hardening and stronger types alongside
   concrete K/G1 APIs, rather than as a broad standalone refactor.
 - **C-HW (deferred):** real-NIC, offload, RSS, zero-copy, and hardware-meter
@@ -7752,7 +7855,7 @@ motivating evidence: a contended shared cache line collapses from 54 M/s to
 
 ## 25. Known lower-priority research/backlog
 
-These remain useful, but should not distract from the active K6–K7 → G1 sequence.
+These remain useful, but should not distract from the active K7 → G1 sequence.
 
 - symmetric RSS configuration as a generic PMD capability;
 - RETA control if a real consumer appears;
@@ -7869,20 +7972,21 @@ Every hardware acceleration must retain a software fallback with identical BESS 
 
 ### 30. Current handoff
 
-Baseline before K5: `6959bd27` (the commits after the 2026-09-24 roadmap
-refresh `d588d86f` were maintenance only: CI action upgrades, dependency
-inventory, Ubuntu 24.04 setup). K5 landed on top of it (entry 78); GCC and
-Clang full local Meson suites pass 83/83 (80 previous targets plus
-`meter_meter_test`, `meter_meter_set_test`, `meter_bench`).
+K5 (`990f6726`, entry 78) and K6 (entry 79) landed on `develop` on
+2026-09-25 on top of the maintenance-only baseline `6959bd27`. GCC and Clang
+full local Meson suites pass 85/85 (80 pre-K5 targets plus `meter_meter_test`,
+`meter_meter_set_test`, `meter_bench`, `stats_stats_test`, `stats_bench`).
 
-Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K5.
-Partial: F, H, and I. Not started: D, G1, and K6–K8 (K8 is consumer-driven).
+Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K6.
+Partial: F, H, and I. Not started: D, G1, K7, and K8 (K8 is consumer-driven).
 C-HW remains a separate deferred hardware-validation track.
 
-**Next software work: K6 worker-local statistics/snapshots**, then K7 routes/
-next hops, then G1 public API/SDKs. Do not reopen closed K architecture; do not
-block the software sequence on real-NIC work. Benchmarks are run through
-`omarchy-benchmark` (pinned, isolated, performance governor).
+**Next software work: K7 routes/next hops**, then G1 public API/SDKs. Do not
+reopen closed K architecture; do not block the software sequence on real-NIC
+work. Benchmarks are run through `omarchy-benchmark` (pinned, isolated,
+performance governor); multithreaded gbench rows must self-pin each thread,
+because the EAL pins the main thread and isolated partitions do not load
+balance.
 
 
 ## Benchmark / experiment backlog (from the 2026-09-18 DPDK-proposal review)

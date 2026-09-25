@@ -33,8 +33,14 @@
 
 #include "../message.h"
 #include "../module.h"
+#include "../stats/counter_set.h"
 
 // TrackGate counts the number of packets, batches and bytes seen by a gate.
+//
+// The counts are K6 worker-local counters: each worker adds to its own slot
+// with no lock, a batch's three counts are one grouped update (a reading
+// never sees a batch's packets without its bytes), and reset is a
+// controller-side baseline, so it needs no worker pause.
 class Track final : public bess::GateHook {
  public:
   Track();
@@ -43,29 +49,18 @@ class Track final : public bess::GateHook {
 
   CommandResponse Init(const bess::Gate *, const bess::pb::TrackArg &);
 
-  uint64_t cnt() const {
-    uint64_t cnt = 0;
-    for (int i = 0; i < Worker::kMaxWorkers; i++) {
-      cnt += worker_stats_[i].cnt;
-    }
-    return cnt;
-  }
+  struct Totals {
+    uint64_t cnt;    // batches
+    uint64_t pkts;
+    uint64_t bytes;  // zero unless byte tracking is on
+  };
 
-  uint64_t pkts() const {
-    uint64_t pkts = 0;
-    for (int i = 0; i < Worker::kMaxWorkers; i++) {
-      pkts += worker_stats_[i].pkts;
-    }
-    return pkts;
-  }
+  // One consistent reading of all three counts.
+  Totals totals() const;
 
-  uint64_t bytes() const {
-    uint64_t bytes = 0;
-    for (int i = 0; i < Worker::kMaxWorkers; i++) {
-      bytes += worker_stats_[i].bytes;
-    }
-    return bytes;
-  }
+  uint64_t cnt() const { return totals().cnt; }
+  uint64_t pkts() const { return totals().pkts; }
+  uint64_t bytes() const { return totals().bytes; }
 
   void set_track_bytes(bool track) { track_bytes_ = track; }
 
@@ -77,14 +72,10 @@ class Track final : public bess::GateHook {
   static const std::string kName;
 
  private:
-  bool track_bytes_;
-  struct alignas(64) TrackStats {
-    uint64_t cnt;
-    uint64_t pkts;
-    uint64_t bytes;
-  };
+  enum Counter : size_t { kBatches, kPackets, kBytes };
 
-  std::array<TrackStats, Worker::kMaxWorkers> worker_stats_;
+  bool track_bytes_;
+  bess::stats::CounterSet counters_;
 };
 
 #endif  // BESS_GATE_HOOKS_TRACK_

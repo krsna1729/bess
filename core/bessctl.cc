@@ -120,9 +120,10 @@ static int collect_igates(Module* m, GetModuleInfoResponse* response) {
     Track* t = reinterpret_cast<Track*>(g->FindHookByClass(Track::kName));
 
     if (t) {
-      igate->set_cnt(t->cnt());
-      igate->set_pkts(t->pkts());
-      igate->set_bytes(t->bytes());
+      const Track::Totals totals = t->totals();
+      igate->set_cnt(totals.cnt);
+      igate->set_pkts(totals.pkts);
+      igate->set_bytes(totals.bytes);
       igate->set_timestamp(get_epoch_time());
     }
 
@@ -154,9 +155,10 @@ static int collect_ogates(Module* m, GetModuleInfoResponse* response) {
     ogate->set_ogate(g->gate_idx());
     Track* t = reinterpret_cast<Track*>(g->FindHookByClass(Track::kName));
     if (t) {
-      ogate->set_cnt(t->cnt());
-      ogate->set_pkts(t->pkts());
-      ogate->set_bytes(t->bytes());
+      const Track::Totals totals = t->totals();
+      ogate->set_cnt(totals.cnt);
+      ogate->set_pkts(totals.pkts);
+      ogate->set_bytes(totals.bytes);
       ogate->set_timestamp(get_epoch_time());
     }
     ogate->set_name(g->igate()->module()->name());
