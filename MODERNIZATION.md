@@ -3451,6 +3451,28 @@ rather than one call site).
     (prepare worker/modules, commit connect) -> apply (generation 0 -> 1,
     4 ops) -> stale reapply `ABORTED` -> get.
 
+87. **G1.2 planned against the UPF consumer.** Read the user's v4 UPF
+    end-state document and `omec-project/upf` `pfcpiface` (`bess.go`,
+    `messages_session.go`). Recorded the concrete controller burden (a
+    goroutine and `ModuleCommand` per PDR/FAR/QER, unordered; Cartesian
+    port-range expansion; client-side establishment and modification
+    rollback; unknown partial state on timeout). Wrote the G1.2 design
+    (section 14.5): registered resources with stage/commit/abort, scopes and
+    `ReplaceScope`, one staged-then-committed transaction per RPC with
+    reference validation and dependency-ordered publication, `request_id`
+    idempotency and `GetTransaction`, precisely stated semantics, and worked
+    PFCP examples. Revised the same day for the user's performance direction
+    (single-module inserts must not regress; hot path untouched): measured
+    that K3 inserts are O(table) today (ExactMatch rebuild 86 us / 0.78 ms /
+    7.9 ms per add at 1K/10K/100K rules), and redesigned G1.2 around live
+    single-writer tables (write-once object slots, in-place cuckoo with
+    signature publish and copy-then-clear displacement), reserve-then-publish
+    transactions whose publish phase is infallible atomic stores, and an
+    opt-in scope cell for one-store session switches. Added section 28, the BESS-side items the v4 document
+    needs that the roadmap lacked: K7.1 route domains, K3.8 `rte_acl` range
+    backend, the `ActionId`/`ResultSlot` contract, the K2 scale gate, the G1.4
+    event channel, K9 bounded packet store, and plugin packaging.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -7029,15 +7051,9 @@ the new public API. K1–K7 now provide the resource contracts G1 exposes.
   generation conflict) plus a typed `ErrorDetail` in the `bess-error-bin`
   trailer. Verified in process over a real gRPC channel
   (`control_api_v2_test`) and against a running `bessd` from Python.
-- **G1.2 — dataplane resource transactions: NEXT.** `ApplyDataplaneTransaction`
-  over classifier entries, actions, meters, routes and next hops. Design
-  first: those K resources live inside modules today, so this needs a
-  resource registry (a module exposes typed resource tables by name; the
-  transaction names `(module, resource, op)`), per-resource transaction
-  semantics (K2/K3/K5 are generation swaps and can be atomic across a batch;
-  K7 routes are per-change atomic in place, so a multi-route transaction
-  either uses `Clear()`-style rebuild or states its visibility), and a
-  generation for dataplane state.
+- **G1.2 — dataplane resource transactions: NEXT.** Design, worked PFCP
+  examples, semantics and build order in section 14.5. Driven by the OMEC UPF
+  consumer (section 28).
 - **G1.3 — `GetSystem` / `GetCapabilities`:** version, workers/CPUs, cache
   geometry (K4.6b), module/driver classes and their resources, PMD
   capabilities.
@@ -7076,6 +7092,235 @@ service Bess {
 ```
 
 Exact API should be designed only after G0/K primitives exist.
+
+### 14.5 G1.2 — dataplane resource transactions (design, 2026-09-25)
+
+#### Why: controllers do ordering and rollback today
+
+The `ModuleCommand` path works: each command is live-safe and atomic to packets
+(Phase J, K1–K7). What it cannot express is a change that spans entries or
+modules. The OMEC UPF (`omec-project/upf`, `pfcpiface/`) shows the cost
+concretely:
+
+- `bess.go: SendMsgToUPFWithCompletion` programs one PFCP session by spawning
+  one goroutine per PDR/FAR/QER. Each fires its own `ModuleCommand` at a
+  different module (`pdrLookup` WildcardMatch, the FAR ExactMatch, the session
+  and application QoS tables), concurrently and in no order. Packets can
+  observe a PDR whose FAR or QER is not there yet.
+- `addPDR` expands each PDR's port ranges in Go into a Cartesian product of
+  ternary WildcardMatch entries, one RPC per entry, and uses only the first
+  QER of the PDR.
+- On a timeout "an unknown subset of its rules [is] programmed and still in
+  flight", so the controller has to answer "accepted" for a session it cannot
+  verify.
+- `messages_session.go` implements rollback in the client: a compensating
+  delete after a rejected establishment, and a restore-after-remove sequence
+  for a rejected modification. About 80 lines of comments reason about
+  stranded rules, moved keys, and "a window rather than a wrong state" in
+  which packets are blackholed.
+
+Principle (section 14.2, user-confirmed 2026-09-25): **clients do not order
+BESS internals or roll anything back.** The v4 UPF end-state document
+(`modernized_bess_omec_upf_end_state_v4.md`, sections 26 and 46–48, M4)
+reaches the same conclusion, and sequences it as: an OMEC-owned immutable
+aggregate `UpfGeneration` first, then the generic G1 mechanism extracted from
+real shared consumers. G1.2 follows that sequencing.
+
+#### Performance requirements (user direction, 2026-09-25)
+
+Insertion speed matters. Borrow nothing from how today's controllers work
+around the API. Specifically:
+
+1. **Single-module inserts must not regress, and should get faster.**
+2. **No impact on the dataplane hot path:** a lookup that hits executes the
+   same loads it does today.
+3. **Cross-module transactions stay fast,** with at most one extra dependent
+   load, and only for consumers that opt into scope atomicity.
+
+Baseline measured 2026-09-25 (`modules_exact_match_bench` `BM_RebuildCost`,
+`omarchy-benchmark --cpu 2 --isolate`). The Phase J/K3 immutable-generation
+design rebuilds the whole classifier on every `add`: **86 us at 1K rules,
+0.78 ms at 10K, 7.9 ms at 100K per insert -- about 126 inserts/s at 100K.**
+WildcardMatch, K5 `MeterSetBuilder::Build` and K2 `ObjectTableBuilder` follow
+the same O(table)-per-change pattern. Only K7 routes (in place, 0.5-33 us) are
+already O(change). Live safety was bought with O(n) writes; G1.2 buys it back
+without giving up live safety.
+
+#### Mechanism: live tables, two-phase at entry granularity
+
+The generation swap stays for bulk replace (load a whole table, `Clear()`).
+Single-entry changes move to structures a single writer updates in place,
+with readers unchanged:
+
+- **Write-once object slots (K2 actions, K5 meters):** a new object is written
+  into a free slot that nothing references, followed by a release fence. It
+  becomes reachable only when a referrer publishes its id. Objects are never
+  mutated in place: a modify writes a new slot and swings the referrer. The
+  reader's lookup is the flat `table[id]` access it has today. Slots and ids
+  are reused only after a grace period.
+- **In-place exact tables (K3 cuckoo, ExactMatch; WildcardMatch tuples):**
+  insert = write key and value into a reserved slot, then publish the bucket's
+  hash signature with one release store. Delete = clear the signature, and
+  reuse the slot after a grace period. Entry storage is a pre-sized arena
+  (no reallocation under readers). A new mask swaps a WildcardMatch's
+  tuple list (rare, O(tuples)).
+- **Cuckoo displacement** is the one structural move. It is done copy-then-clear,
+  so a key is always present somewhere. The only reader-visible effect is a
+  possible transient miss when a key moves back toward its primary bucket;
+  that is closed by a per-bucket change counter checked **only on the miss
+  path** (hits pay nothing). The counter is added only if a mutation-checked
+  concurrent test shows the miss, and its cost goes on the miss rows.
+  Capacity headroom keeps displacement rare; growth is a background rebuild
+  and swap, never done inside a transaction.
+- **LPM (K7):** already in place.
+
+Every transaction runs in two phases:
+
+- **Reserve.** Everything that can fail happens here, while nothing is
+  visible: validation, id and slot allocation, capacity checks (a
+  conservative tbl8 estimate for LPM), and writing entries into reserved
+  slots with unpublished signatures. On any failure, release the
+  reservations: no reader ever saw anything.
+- **Publish.** A sequence of single atomic stores that cannot fail: new
+  referents first (they are write-once and invisible anyway), then referrer
+  signatures and swings. Removals run in reverse: unlink referrers now,
+  retire referents under one grace-period token for the whole transaction,
+  reclaimed asynchronously by the control thread -- the writer never waits.
+
+Cost is O(ops): a few hundred nanoseconds per op plus validation. No rebuild,
+no pause, and the hot path is unchanged.
+
+#### Scope atomicity (opt-in)
+
+Per-op publish means a multi-rule change becomes visible rule by rule (each
+reference-safe). A consumer that needs a whole scope to switch at once -- a
+UPF session modification -- routes the scope's rules through one indirection
+cell: `classifier -> CellId`, and `cell[CellId]` holds the current program
+id. A modification writes the new program into write-once slots and switches
+the entire session with **one store** to the cell. This costs one extra
+dependent load on that consumer's hot path, and nothing for anyone else.
+It is the performance-shaped form of v4's aggregate `UpfGeneration`: O(session)
+per change instead of O(all sessions).
+
+#### What BESS provides on top
+
+1. **Resources.** A module or plugin may register named resources
+   (`upf/pdr-v4`, `upf/actions`, `upf/meters`, `em0/rules`) implemented by the
+   live tables above. Registration is opt-in; `ModuleCommand` is unchanged,
+   and gets the O(1) insert too, because it drives the same live table.
+2. **Scopes and `ReplaceScope(scope, objects)`,** the desired-state primitive:
+   BESS diffs a scope's current objects against the desired set and emits the
+   minimal op list.
+3. **One transaction per RPC** -- `ApplyDataplaneTransaction{request_id,
+   expected_generation?, replace_scopes[], ops[]}` -- running reserve/publish.
+   A batch of plain ops (no scope) is also the fast bulk path: one RPC, many
+   entries, which amortizes the per-RPC cost that one-RPC-per-entry clients pay
+   today.
+4. **Idempotency:** a bounded `request_id` window; `GetTransaction(request_id)`
+   for timeouts.
+5. **Conflicts:** `expected_generation`, rejected with `ABORTED` before
+   reserving.
+
+#### Semantics, stated precisely
+
+- **All-or-nothing:** a failed transaction was never visible.
+- **Reference-safe:** a packet never resolves an id to a missing object.
+- **Per-op atomic** by default; **per-scope atomic** with the opt-in cell.
+- **Mutable state survives modifies:** a meter or counter keeps its state when
+  its spec is unchanged (the write-once slot holds the policy; the state is
+  referenced, not copied).
+- **Id reuse is deferred** past a grace period, and past RX-queue drain once
+  C-HW MARK offload exists (v4 section 48).
+- **Routes are separate from sessions:** `ApplyRouteSet(domain, routes)`,
+  with a whole-set replace done as a K7 build-and-swap.
+
+#### Acceptance targets (measured in G1.2a/b; recorded, not promised)
+
+| measure | today | target |
+|---|---:|---:|
+| ExactMatch single insert at 100K rules, in process | 7.9 ms | < 1 us (O(1)) |
+| K2 action / K5 meter insert, in process | O(capacity) rebuild | < 0.5 us |
+| Batched ops over one RPC | one RPC per op | >= 500K ops/s |
+| UPF-shaped session (about 8 objects) in process | N RPCs + client rollback | >= 100K sessions/s |
+| Hit-path lookup (exact, masked, LPM, action) | -- | unchanged within run-to-run noise |
+| Miss-path lookup with the displacement counter, if added | -- | < 2% |
+
+#### Worked examples (Go SDK sketches; PFCP semantics stay in OMEC)
+
+Establishment. Today: N concurrent `ModuleCommand`s plus a compensating
+delete. With G1.2:
+
+```go
+tx := bess.NewTransaction(requestID)
+tx.ReplaceScope("session:0x1a2b",
+    bess.Obj("upf/meters",  meterID, &bess.TrTcm{Cir: 12_500_000, Cbs: 64 << 10, Pir: 25_000_000, Pbs: 128 << 10}),
+    bess.Obj("upf/actions", actUL,   &upfpb.PdrAction{Far: farPlanUL, Qers: []uint32{meterID}}),
+    bess.Obj("upf/actions", actDL,   &upfpb.PdrAction{Far: farPlanDL, Qers: []uint32{meterID}}),
+    bess.Obj("upf/pdr-v4",  keyUL,   &upfpb.PdrRule{Precedence: 100, Action: actUL}),
+    bess.Obj("upf/pdr-v4",  keyDL,   &upfpb.PdrRule{Precedence: 100, Action: actDL}),
+)
+res, err := client.Apply(ctx, tx) // one RPC: Applied, or Rejected with nothing visible
+```
+
+Modification. Today, `messages_session.go`'s restore-after-remove rollback.
+With G1.2, the same call with the desired v17 objects. BESS computes that only
+`actDL` changed (a new FAR plan) and reserves one write-once action slot for
+the new plan. With the scope cell, it writes the session's new program slot
+and publishes it with one store; without it, it swings the downlink PDR's
+value to the new action id. The meter keeps its token state (unchanged spec).
+The old action slot is retired after a grace period. A rejection happens
+entirely in the reserve phase, so v16 was never disturbed and there is
+nothing for the client to restore.
+
+Deletion. `tx.ReplaceScope("session:0x1a2b")` with no objects. BESS clears
+the PDR signatures first, so no new packet can acquire the session's actions,
+then retires the actions and meters under one grace-period token, and
+releases their ids only after it. This is v4 section 48's order, executed in
+`bessd` rather than by the controller, and the writer does not wait for it.
+
+Timeout. The Go side's context expires. It calls
+`client.GetTransaction(ctx, requestID)`, which returns `Applied`, `Rejected`
+or `NotFound` (never received). On `NotFound`, retrying with the same
+`requestID` is safe.
+
+Conflict. Two controllers race. Each sends the generation it read; the loser
+gets `ABORTED`/`CONFLICT` and re-reads.
+
+Port ranges. The PDR carries semantic `[lo, hi]` intervals. The resource
+compiles them via K3 (the pending `rte_acl` range backend, section 28), and
+the Cartesian product of ternary entries disappears from Go.
+
+#### Build order and gates
+
+1. **G1.2a — measure, then make single-module inserts O(1).**
+   - Baseline per-op cost in process and via `ModuleCommand` RPC for
+     ExactMatch, WildcardMatch, IPLookup, meters and K2 tables at 1K/100K/1M
+     entries.
+   - Build the live exact table (write-once entries, signature publish,
+     copy-then-clear displacement, pre-sized arena) and the write-once object
+     arena.
+   - Move ExactMatch and WildcardMatch `add`/`delete` onto them (bulk replace
+     keeps the swap).
+   - Prove hit-path lookups unchanged with the existing classifier and module
+     benchmarks.
+   - Concurrent reader tests, mutation-checked, show no false miss and no torn
+     entry -- or show the miss, and then add the miss-path counter and
+     measure it.
+   This step alone fixes today's O(n) inserts, independent of any
+   transaction API.
+2. **G1.2b — resources and transactions in C++:** a registry in
+   `RuntimeState`; reserve/publish with reference validation;
+   dependency-ordered publish; grace-period retirement batched per
+   transaction; deferred id reuse; the opt-in scope cell. Unit-tested without
+   RPC; the session-rate target measured.
+3. **G1.2c — RPC:** `ApplyDataplaneTransaction` and `GetTransaction` in
+   `control_v2.proto`, the idempotency window, and ExactMatch/WildcardMatch
+   rule sets exposed as resources (`ModuleCommand` kept). Batched-op RPC
+   rate measured.
+4. **G1.2d — first real consumer:** the in-tree OMEC UPF plugin (v4 M1) on
+   `upf/pdr-v4`, `upf/actions`, `upf/meters` plus the scope cell; its interim
+   `ApplySession` becomes a `ReplaceScope` client. G1.5's Go SDK carries the
+   builder.
 
 ### 14.1 C++ remains authoritative
 
@@ -8236,11 +8481,14 @@ migrated. See the K7 section.
 
 ### Next — G1.2 dataplane resource transactions
 
-G1.1 (the v2 pipeline API) is done. Next is designing and implementing
-`ApplyDataplaneTransaction` (section 14): a resource registry so the module-owned
-K resources (classifier entries, actions, meters, routes, next hops) can be
-named and changed in one transaction, with per-resource visibility semantics
-stated. Then G1.3 capabilities, G1.4 stats, and the Go/C++ SDKs.
+G1.1 (the v2 pipeline API) is done. G1.2 (section 14.5) moves session ordering
+and rollback from controllers into `bessd` with performance as a hard
+requirement: live single-writer tables with O(1) in-place inserts and
+unchanged reader hot paths, reserve-then-publish transactions, an opt-in scope
+cell for session atomicity, and idempotent `request_id`. It starts with
+G1.2a: today's single insert is O(table) (ExactMatch 7.9 ms at 100K rules);
+make it O(1) first. Then G1.3 capabilities, G1.4 stats, and
+the Go/C++ SDKs. The OMEC UPF program (section 28) is the driving consumer.
 
 ### Following stages
 
@@ -8383,6 +8631,43 @@ two shapes above it takes.
 - **Dropping `--legacy-mem`:** was blocked on "no hugepages, no NIC". The host
   now has a 1 GiB hugepage (entry 81), so the memory-model half can be tested
   (dynamic memory with hugepages); PMD behaviour still needs C-HW.
+
+## 28. OMEC UPF consumer program — BESS-side items (from the v4 end-state document, 2026-09-25)
+
+The user's `modernized_bess_omec_upf_end_state_v4.md` (source-grounded
+against `develop` at `ea5e52af`, 2026-09-24) sets the UPF end state and the
+BESS/OMEC boundary. Its review rule decides placement: *could a firewall,
+NAT, router, load balancer or tunnel application use this without
+understanding 3GPP?* If yes, it belongs in BESS; PFCP/PDR/FAR/QER semantics
+stay in OMEC. Where it now stands against this roadmap:
+
+| v4 BESS-side item | Status here | Placement |
+|---|---|---|
+| Reuse K1-K4 unchanged; no parallel RCU/packet/classifier/checksum systems | Honored | -- |
+| K5 metering as thin `rte_meter` adapter | **Done** (K5) | -- |
+| K6 worker-local counters/snapshots | **Done** (K6) | Stats API: G1.4 |
+| K7 routes/next hops on proven `rte_lpm`; `rte_fib` only after an oracle gate | **Done**; the `rte_fib` gate is a one-command check (entry 85) | -- |
+| **K7 route domains (`RouteDomainId`, VRF-like) for Network Instance** | **Missing** | **K7.1:** a domain id per `RouteTable`/`Router`, and `ApplyRouteSet(domain, routes)` |
+| IPv6 as a separate key/table family (no universal key) | Missing (K7 is IPv4) | K7.2 when the UPF v6 path starts (`rte_lpm6`) |
+| **K3 `rte_acl` RANGE backend** (source+destination arbitrary closed ranges, precedence), differential vs a scalar reference | **Missing** (K3 closed without it) | **K3.8:** replaces the Go-side Cartesian port expansion; any LUT/SIMD specialization only on benchmark evidence (v4 13.7) |
+| Hierarchical classifier composition (v4 13.8) | Not planned | Decide in K3.8's design, from UPF's exact+residual-range grouping |
+| **`ActionId` vs `ResultSlot` contract**: a UPF typed classifier returns `ActionId` directly, with no `PackedValueStore` hop | Implicit only | Document in the K2/K3 sections alongside K3.8 (v4 "immediate" course correction) |
+| **K2/K3 update cost at 100K/1M entries and production PFCP rates** | **Measured: O(table) per insert** (ExactMatch 7.9 ms at 100K) | **G1.2a:** live tables with O(1) in-place inserts (section 14.5) |
+| Frequent session-state transaction; `request_id` idempotency; `Unknown` reconciliation; no client rollback | Planned | **G1.2** (section 14.5) |
+| Bounded dataplane->control event channel (DDN, URR thresholds, offload state) | Planned only as `WatchEvents` | **G1.4:** bounded, backpressure-aware, correlated to scope/action |
+| Packet replication (clone) | Done (K4 clone/copy) | -- |
+| **Bounded packet store** (for BUFF/BAR buffering; OMEC owns the policy) | **Missing** | **K9:** generic ownership-safe packet store with limits and release/discard, when BAR work starts |
+| Session-owner worker affinity; UL/DL same-owner RSS; worker handoff with direct action resolution | Partial (Phase L3 queues; C-HW RSS) | L3 (handoff) + C-HW H1 (effective directional inner/outer RSS) |
+| Narrow flow-steering seam (MARK+QUEUE+COUNT), mark tombstones, drain-before-reuse | C-HW | C-HW H2; ID-reuse deferral already in G1.2 semantics |
+| K4.4b mixed GTP/PSC TX profiles tested (plain v4, outer v4/GTP+inner v4, with and without PSC) | Profiles exist, UPF layouts untested | Test with the UPF plugin (v4 acceptance test 4) |
+| Stable external plugin build/ABI, so OMEC can stop vendoring BESS | Missing | **Phase F:** plugin devel package (v4 M6) |
+| Structural graph via G0 only; never `ApplyPipeline` per PFCP rule | Honored (G1.1 is topology only) | -- |
+
+Sequencing, per v4 section 64: M1, an in-tree UPF plugin on the existing
+substrate (static G0 graph, typed `ActionId` classifier, aggregate
+`UpfGeneration`) -> M2, K3.8 ranges -> M3, K5/K6/K7 (done here) plus K7.1
+domains -> M4, G1.2 generic transactions and the Go SDK -> M5, NIC lab
+(C-HW H1, then H2) -> M6, external plugin packaging.
 
 ## 25. Known lower-priority research/backlog
 
