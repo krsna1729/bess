@@ -33,6 +33,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <memory>
 #include <string>
@@ -40,7 +41,7 @@
 #include <vector>
 
 #include "../classifier/backend.h"
-#include "../classifier/cuckoo_exact.h"
+#include "../classifier/concurrent_exact.h"
 #include "../classifier/extract_plan.h"
 #include "../classifier/runtime_schema.h"
 #include "../control/runtime_state.h"
@@ -104,33 +105,35 @@ class ExactMatch final : public Module {
     gate_idx_t gate;
   };
 
-  // A whole matching generation: the rule list it was built from, the default
-  // gate to use when nothing matches, and the compiled classifier state built
-  // from that list. Immutable once published -- commands build a replacement
-  // and swap it in, so a batch sees either the old generation or the new one,
-  // never a half-applied change.
+  // The configuration a batch runs against: the compiled extraction plan, the
+  // default gate, and the rule table. Immutable once published; it changes
+  // only when configuration does (default gate, metadata offsets, a restore,
+  // or table growth).
+  //
+  // Rules are NOT part of a generation (G1.2 mode C). They live in a
+  // ConcurrentExactTable -- DPDK's lock-free rte_hash under the runtime
+  // QSBR -- that add/delete update in place, O(1), while workers keep
+  // reading. The earlier design rebuilt the whole generation per rule
+  // (7.9 ms per add at 100K rules). Generations share the table.
   struct Generation {
-    Generation(std::vector<Rule> r, gate_idx_t d,
-               bess::classifier::ExtractPlan e,
-               bess::classifier::RuntimeExactBackend<gate_idx_t> b,
+    Generation(gate_idx_t d, bess::classifier::ExtractPlan e,
+               std::shared_ptr<bess::classifier::ConcurrentExactTable> t,
                size_t k, bool valid,
                std::vector<std::vector<std::byte>> masks,
                std::vector<size_t> offsets)
-        : rules(std::move(r)),
-          default_gate(d),
+        : default_gate(d),
           extract(std::move(e)),
-          backend(std::move(b)),
+          table(std::move(t)),
           key_size(k),
           extraction_valid(valid),
           converted_masks(std::move(masks)),
           baked_source_offsets(std::move(offsets)) {}
 
-    std::vector<Rule> rules;
     gate_idx_t default_gate = DROP_GATE;
     bess::classifier::ExtractPlan extract;
-    // Forced Cuckoo backend for the K3.3 migration. Backend auto-selection
-    // remains a later, benchmark-driven decision.
-    bess::classifier::RuntimeExactBackend<gate_idx_t> backend;
+    // Shared, updated in place; owned by every generation that maps it (a
+    // retired generation keeps a replaced table alive for its grace period).
+    std::shared_ptr<bess::classifier::ConcurrentExactTable> table;
     // Dense packed key width: sum of field sizes. Also the extraction stride.
     size_t key_size = 0;
     // False when metadata offsets were invalid at (re)build time. The packet
@@ -167,10 +170,27 @@ class ExactMatch final : public Module {
   bool Publish(const std::function<GenerationPtr(const Generation &)> &build,
                Error *err);
 
-  // Builds a generation for `rules`; nullptr with *err set on failure. Runs
-  // on the control plane, off the data path.
-  GenerationPtr Build(const std::vector<Rule> &rules, gate_idx_t default_gate,
-                      Error *err);
+  // Builds a generation over `table`; nullptr with *err set on failure. Runs
+  // on the control plane, off the data path. Cost is the plan, not the rules.
+  GenerationPtr Build(
+      std::shared_ptr<bess::classifier::ConcurrentExactTable> table,
+      gate_idx_t default_gate, Error *err);
+  // Packs a rule's fields into the dense table key, validating each field's
+  // size against the configuration.
+  Error PackKey(const std::vector<std::vector<uint8_t>> &fields,
+                std::vector<std::byte> *key) const;
+  // A new, empty table sized for `rules` entries with growth headroom.
+  std::expected<std::shared_ptr<bess::classifier::ConcurrentExactTable>, Error>
+  NewTable(size_t rules) const;
+  // Grows the table (a larger copy, published as a new generation) when one
+  // more insert would pass the load limit. Amortized O(1) per insert.
+  // A table for at least `rules` rules, filled by `fill` (false = an insert
+  // hit kFull; the table is then rebuilt at twice the size).
+  std::expected<std::shared_ptr<bess::classifier::ConcurrentExactTable>, Error>
+  FillTable(size_t rules,
+            const std::function<bool(bess::classifier::ConcurrentExactTable &)>
+                &fill) const;
+  bool EnsureCapacity(bool force, Error *err);
   // Per-field key layout resolved from the module's FieldSpecs and the
   // current metadata offsets.
   struct KeyLayout {
@@ -192,18 +212,14 @@ class ExactMatch final : public Module {
                      Error *err);  // Fail-closed generation for unrecoverable (re)build failures on the resume
   // path: same rules/default for introspection, but extraction disabled so
   // the packet path routes everything to the default gate.
-  GenerationPtr BuildDegraded(const std::vector<Rule> &rules,
-                              gate_idx_t default_gate);
+  GenerationPtr BuildDegraded(
+      std::shared_ptr<bess::classifier::ConcurrentExactTable> table,
+      gate_idx_t default_gate);
   // Rebuilds and republishes the generation when metadata offsets changed
   // under it (graph reconfiguration + resume). Runs on the control thread
   // with workers paused. Never leaves a stale plan reading a reassigned
   // metadata region: refresh failure publishes a fail-closed generation.
   void RefreshForResume();
-  // Inserts `rule` into `rules` or, if a rule with the same match values is
-  // already there, overwrites its gate -- the same operation inserting an
-  // existing key into the live table performed. Shared by the add command and
-  // SetRuntimeConfig so both canonicalize identically.
-  static void UpsertRule(std::vector<Rule> *rules, Rule rule);
   // Field configuration, fixed at Init() time; every generation's plan gets
   // it, so a rebuild reproduces the module's matching exactly.
   struct FieldSpec {
@@ -226,6 +242,9 @@ class ExactMatch final : public Module {
   // (the generation is released with the module, workers already paused), and
   // every command publishes a replacement rather than clearing it.
   bess::rcu::RcuPtr<Generation> published_;
+
+  // The table the command path writes (always the current generation's).
+  std::shared_ptr<bess::classifier::ConcurrentExactTable> table_;
 };
 
 #endif  // BESS_MODULES_EXACTMATCH_H_

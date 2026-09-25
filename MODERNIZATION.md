@@ -3517,6 +3517,172 @@ rather than one call site).
     stays a measured option past about 20M ops/s per stream. Recorded the
     capacity per layer and the plan to consolidate the backend laboratory
     after mode C lands.
+91. **G1.2a mode C in ExactMatch.** ExactMatch no longer rebuilds per rule.
+    Rules live in `classifier::ConcurrentExactTable`
+    (`core/classifier/concurrent_exact.{h,cc}`): DPDK `rte_hash` with
+    `RW_CONCURRENCY_LF`, attached to the runtime QSBR in defer-queue mode.
+    `add`/`delete`/`clear` write it in place from the command thread while
+    workers keep reading. A generation now carries only the extraction plan,
+    the default gate and a `shared_ptr` to the table; it is republished only
+    for configuration changes (default gate, metadata offsets, restore) and
+    for growth (copy into a 2x table past 3/4 load, amortized O(1)).
+    `set_runtime_config` stays a bulk build (mode G, restore only).
+    Module API and semantics are unchanged; the authoring model is untouched.
+    - Insert, through the module command API (`modules_exact_match_update_bench`,
+      one add + one delete per iteration, per op; `omarchy-benchmark --cpu N
+      --isolate`). The same bench was built against the previous commit:
+
+      | rules | before P-core | after P-core | before E-core | after E-core |
+      |---|---|---|---|---|
+      | 1K | 426 us | 0.31 us | 600 us | 0.42 us |
+      | 10K | 4.35 ms | 0.30 us | 6.3 ms | 0.42 us |
+      | 100K | 47 ms | 0.30 us | 69 ms | 0.42 us |
+      | 1M | 645 ms | 0.35 us | not measured (killed after 52 min) | 0.45 us |
+
+      That is 1,400x at 1K and 1.8Mx at 1M. The insert cost is now flat in
+      table size: about 3.2M ops/s on a P-core, 2.3M on an E-core,
+      protobuf decode included.
+    - Lookup, the packet-path call (`BM_Lookup`, 32 random 8-byte keys per
+      batch, ns per batch):
+
+      | rules | hit P cuckoo / LF | miss P cuckoo / LF | hit E cuckoo / LF | miss E cuckoo / LF |
+      |---|---|---|---|---|
+      | 1K | 326 / 341 | 136 / 202 | 414 / 552 | 221 / 354 |
+      | 16K | 342 / 340 | 150 / 204 | 483 / 583 | 268 / 390 |
+      | 128K | 369 / 362 | 188 / 210 | 522 / 631 | 319 / 397 |
+      | 1M | 639 / 572 | 658 / 369 | 1036 / 796 | 784 / 463 |
+
+      Hits on P-cores are unchanged up to 128K, and 10% faster at 1M. Misses
+      in cache-resident tables cost more: +0.7 to 2 ns per packet on P-cores,
+      +2.5 to 4 ns on E-cores, as E1 predicted. From 1M rules both hits and
+      misses are faster (misses 44% on P, 41% on E). Recorded rather than
+      hidden: a miss-heavy flow on a small table on E-cores pays up to
+      4 ns per packet. The remedy, if it matters, is our own LF probe over
+      the same layout (Phase L), not a return to rebuilds.
+    - **`rte_hash` modes, read from the DPDK 25.11.3 source**
+      (`lib/hash/rte_cuckoo_hash.c`, `lib/rcu/rte_rcu_qsbr.c`). This is the
+      basis for the flag choices. Layout: buckets of 8 × (16-bit signature,
+      32-bit key index), one cache line each, `align32pow2(entries)/8` of
+      them. The key store is separate: `align16(8 + key_len)` bytes per slot
+      (value pointer, then key), with slot 0 a dummy. Free slots sit in an
+      `rte_ring`.
+
+      | flag | effect | used? |
+      |---|---|---|
+      | `RW_CONCURRENCY` | readers take an `rte_rwlock`; the writer takes it too | no: a lock on the packet path |
+      | `RW_CONCURRENCY_LF` | lock-free readers; cuckoo moves bump `tbl_chng_cnt`, readers retry; forces `NO_FREE_ON_DEL` | **yes** |
+      | `MULTI_WRITER_ADD` | writer lock plus per-lcore free-slot caches (reserves up to 63 extra slots per lcore) | no: one writer (the control thread) |
+      | `TRANS_MEM_SUPPORT` | TSX for the writer lock | no |
+      | `NO_FREE_ON_DEL` | delete leaves the slot allocated; `rte_hash_free_key_with_position` frees it | implied by LF |
+      | `EXT_TABLE` | linked overflow buckets; an add fails only when slots run out; overflow buckets are recycled with the key slot | measured below |
+
+      - RCU is attached with `rte_hash_rcu_qsbr_add`.
+        - **DQ mode (used):** a delete takes a token (`rte_rcu_qsbr_start`,
+          one atomic on the QSBR variable the workers read at each
+          quiescent report) and queues the slot.
+        - The queue holds entries+1, so it can never be full. If an enqueue
+          did fail, DPDK falls back to a blocking `synchronize`.
+        - Every enqueue past `trigger_reclaim_limit` (default 0) reclaims up
+          to `max_reclaim_size` (default 16) ready slots, and `add` reclaims
+          once more when the free ring is empty.
+        - **SYNC mode** blocks every delete until all readers pass
+          quiescence. That is unusable from the command thread.
+      - Lookup order under LF (both single and bulk):
+        1. signature compare (SSE2 over the 8 signatures of both buckets);
+        2. acquire-load the key index;
+        3. full key compare;
+        4. only then acquire-load the value.
+
+        That order is why a slot reused inside a grace period could give a
+        reader another key's value, and why QSBR is required.
+      - Deletes do not bump the change counter; only cuckoo moves and
+        overflow-bucket compaction do.
+      - Updating an existing key swaps the value with an atomic exchange, so
+        a gate change is atomic to readers. `rte_hash_add_key_data` returns
+        0 for both insert and update; `Upsert` distinguishes them with a
+        lookup first.
+      - Key compare: specialized SIMD compares exist only for 16/32/.../128-
+        byte keys; every other length uses `memcmp` through a function
+        pointer. The hash is `rte_hash_crc` through a function pointer (the
+        x86 default).
+      - The bulk lookup computes hashes and prefetches buckets for all keys,
+        then compares signatures and prefetches the first matching key slot,
+        then compares keys. On x86 it zeroes two 64-entry hit-mask buffers
+        every call, whatever the batch size. These are the likely sources of
+        the small-table miss overhead above.
+      - Two options measured and **not adopted**. Medians of 5, ns per
+        32-key batch, `omarchy-benchmark --isolate`:
+
+        | rules, kind | P: LF / prehash | E: LF / prehash |
+        |---|---|---|
+        | 1K hit | 348 / 332 | 591 / 537 |
+        | 1K miss | 183 / 169 | 397 / 324 |
+        | 128K miss | 184 / 178 | 392 / 332 |
+        | 1M hit | 573 / 634 | 976 / 982 |
+        | 1M miss | 240 / 273 | 426 / 417 |
+
+        - *Prehashing* (compute the CRC inline, call
+          `rte_hash_lookup_with_hash_bulk_data`) removes the per-key
+          indirect hash call. It helps cache-resident tables, most on
+          E-cores (misses −18%), but costs 10-14% at 1M on P-cores, where
+          DPDK's own loop interleaves each hash with its bucket prefetch.
+          It is not a uniform win, and adopting it means a size-selected
+          second path.
+        - *`EXT_TABLE`* was within about 5% of plain LF everywhere (P-core
+          1K miss 214 vs 203, 1M miss 404 vs 381) and costs 8 bytes per
+          entry. Growth-on-`kFull` already covers what it would buy.
+        - What remains for small-table misses (P-core 169-183 vs cuckoo's
+          118) is inside `__bulk_lookup_lf`: the hit-mask buffer zeroing and
+          the change-counter protocol. Closing that gap means our own LF
+          probe over the same layout (Phase L), which is noted, not
+          scheduled.
+        - Adopted from the reading: `Upsert` hashes once and passes the hash
+          to both the lookup and the add.
+    - Correctness:
+      - `concurrent_exact_test`:
+        - CRUD and iteration; full, then erased slots reused.
+        - `ErasedSlotWaitsForOnlineReaders` (deterministic): with a
+          registered reader online and not quiescent, 60 deletes and 50
+          add/delete churns release no slot (`slots_in_use` 150, live 90).
+          After it reports quiescence, reclaim returns all 60 slots.
+        - `ConcurrentReadersOnlySeeJustifiedAnswers` (stress): two readers,
+          a 256-slot table at its limit, more than 100K churn ops in 500 ms.
+          Stable keys must always hit, and any hit must carry that key's
+          own value.
+      - Mutations, each failing 3/3 with its own message:
+        - Free the slot at delete time without QSBR: "a deleted slot was
+          released while a reader was mid-grace-period".
+        - No QSBR attach: "slots never came back". With the LF flag, DPDK
+          never frees a slot on delete by itself.
+        - No LF flag: the writer loses keys.
+      - Why the grace period matters: DPDK's LF lookup compares the key and
+        then loads the value. A slot freed and refilled between those two
+        steps would hand a reader another key's value. That window is a few
+        instructions, which is why only the deterministic test catches the
+        first mutation; the stress test alone passed it.
+      - Fixed after independent review (opus reviewer, pre-commit):
+        - Growth quadrupled instead of doubling; it now doubles.
+        - The growth copy and the restore ignored a cuckoo `kFull`, which
+          could drop a rule. `FillTable` now retries at twice the size, and
+          no rule is ever dropped.
+        - An add hitting `kFull` below the load limit (deleted slots still in
+          their grace period behind a slow worker) returned ENOSPC. It now
+          grows. `ChurnDuringLongGracePeriodGrowsInsteadOfFailing` has one
+          reader never quiescent across 2,000 add/delete churns on a
+          700-rule module; without the fix it fails at churn 324 with
+          "rule table is full".
+        - Corrected the `rte_hash_free` comment: the defer queue must already
+          be past its grace period. Owners guarantee that because the table
+          dies with its last generation, which is retired through the same
+          QSBR.
+      - `modules_exact_match_test`: add/update/delete/ENOENT/clear; the
+        default gate survives rule changes; field count and size are
+        rejected; 20K adds with 4K interleaved deletes across growths;
+        restore replaces rules and collapses duplicates, and a bad restore
+        changes nothing.
+      - Also passing: `exact_match_migration_test` 8/8, the live-daemon
+        `exact_match.py` 7/7 and all 22 module-test files, and the full
+        suite on GCC 14 and Clang (97/97 each).
 
 ## Review process established this session
 
@@ -7429,7 +7595,7 @@ one reviewed change, with benchmarks before and after.
 
 | module | today | target |
 |---|---|---|
-| ExactMatch | K3 generation rebuilt per add (7.9 ms at 100K) | C: `rte_hash` LF + QSBR (K3 already has rte_hash backends, currently built without concurrency flags) -- measured: no lookup regression, 52-270 ns inserts |
+| ExactMatch | **done (entry 91)**: was a K3 generation rebuilt per add (47 ms at 100K through the module) | C: `rte_hash` LF + QSBR, 0.30 us per add at any size; P-core hits unchanged, small-table misses +0.7-2 ns/pkt |
 | WildcardMatch | generation rebuilt per add | C: one LF `rte_hash` per tuple; a new mask is a G swap of the tuple list (O(tuples)) |
 | IPLookup | K7 in place + QSBR | C (done) |
 | L2Forward | own table; add/delete pause every worker | W-replica (small tables), or C by moving to LF `rte_hash` |

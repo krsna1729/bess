@@ -254,9 +254,108 @@ bool ExactMatch::ComputeLayout(bool tolerate_invalid_metadata,
   return true;
 }
 
-ExactMatch::GenerationPtr ExactMatch::Build(const std::vector<Rule> &rules,
-                                            gate_idx_t default_gate,
-                                            Error *err) {
+Error ExactMatch::PackKey(const std::vector<std::vector<uint8_t>> &fields,
+                         std::vector<std::byte> *key) const {
+  if (fields.size() != field_specs_.size()) {
+    return std::make_pair(
+        EINVAL, bess::utils::Format("rule should have %zu fields (has %zu)",
+                                    field_specs_.size(), fields.size()));
+  }
+  // Rule bytes are packed densely in field order WITHOUT applying the mask --
+  // the legacy table copied rule bytes verbatim while masking only extracted
+  // packet/metadata bytes. Preserve that distinction.
+  key->clear();
+  for (size_t i = 0; i < fields.size(); i++) {
+    const size_t want = static_cast<size_t>(field_specs_[i].size);
+    if (fields[i].size() != want) {
+      return std::make_pair(
+          EINVAL,
+          bess::utils::Format("rule field %zu should have size %zu (has %zu)",
+                              i, want, fields[i].size()));
+    }
+    const auto *bytes = reinterpret_cast<const std::byte *>(fields[i].data());
+    key->insert(key->end(), bytes, bytes + want);
+  }
+  return std::make_pair(0, std::string());
+}
+
+std::expected<std::shared_ptr<classifier::ConcurrentExactTable>, Error>
+ExactMatch::NewTable(size_t rules) const {
+  size_t key_size = 0;
+  for (const FieldSpec &spec : field_specs_) {
+    key_size += static_cast<size_t>(spec.size);
+  }
+  // At least 1K entries, and room for `rules` at the load limit (3/4).
+  size_t capacity = 1024;
+  while (capacity * 3 / 4 < rules + 1) {
+    capacity *= 2;
+  }
+  auto table = classifier::ConcurrentExactTable::Create(
+      static_cast<uint32_t>(key_size), static_cast<uint32_t>(capacity),
+      bess::control::runtime().rcu());
+  if (!table) {
+    return std::unexpected(std::make_pair(ENOMEM, table.error()));
+  }
+  return std::shared_ptr<classifier::ConcurrentExactTable>(std::move(*table));
+}
+
+std::expected<std::shared_ptr<classifier::ConcurrentExactTable>, Error>
+ExactMatch::FillTable(
+    size_t rules,
+    const std::function<bool(classifier::ConcurrentExactTable &)> &fill)
+    const {
+  // A cuckoo insert can fail before the load limit (an unlucky key set); a
+  // rule is never dropped for it -- retry at twice the size.
+  for (int attempt = 0; attempt < 4; attempt++) {
+    auto table = NewTable(rules);
+    if (!table) {
+      return table;
+    }
+    if (fill(**table)) {
+      return table;
+    }
+    rules = size_t{(*table)->capacity()};
+  }
+  return std::unexpected(
+      std::make_pair(ENOSPC, std::string("rule table could not be built")));
+}
+
+bool ExactMatch::EnsureCapacity(bool force, Error *err) {
+  if (!force && (table_->size() + 1) * 4 <= size_t{table_->capacity()} * 3) {
+    return true;
+  }
+  // Growth: copy into a table twice the size and publish it. Rare -- doubling
+  // makes it amortized O(1) per insert -- and never on the packet path.
+  // `force`: the table reported full below the load limit, because deleted
+  // slots are still waiting out a reader grace period.
+  auto bigger = FillTable(size_t{table_->capacity()},
+                          [&](classifier::ConcurrentExactTable &next) {
+                            bool ok = true;
+                            table_->ForEach([&](classifier::ConstBytes key,
+                                                uint64_t value) {
+                              ok = ok && next.Upsert(key, value) !=
+                                             classifier::ConcurrentExactTable::
+                                                 UpsertResult::kFull;
+                            });
+                            return ok;
+                          });
+  if (!bigger) {
+    *err = bigger.error();
+    return false;
+  }
+  auto next_table = *bigger;
+  const bool published = Publish([&](const Generation &current) {
+    return Build(next_table, current.default_gate, err);
+  }, err);
+  if (published) {
+    table_ = std::move(next_table);
+  }
+  return published;
+}
+
+ExactMatch::GenerationPtr ExactMatch::Build(
+    std::shared_ptr<classifier::ConcurrentExactTable> table,
+    gate_idx_t default_gate, Error *err) {
   KeyLayout layout;
   if (!ComputeLayout(/*tolerate_invalid_metadata=*/false, &layout, err)) {
     return nullptr;
@@ -272,61 +371,17 @@ ExactMatch::GenerationPtr ExactMatch::Build(const std::vector<Rule> &rules,
     *err = std::make_pair(EINVAL, "extraction plan: " + e.message);
     return nullptr;
   }
-
-  // Pack rule bytes densely in field order, WITHOUT applying the mask --
-  // the legacy table copied rule bytes verbatim (gather_key) while masking
-  // only extracted packet/metadata bytes. Preserve that distinction.
-  std::vector<std::byte> key_storage;
-  key_storage.resize(rules.size() * layout.key_size);
-  std::vector<classifier::RuntimeExactRule<gate_idx_t>> backend_rules;
-  backend_rules.reserve(rules.size());
-  for (size_t r = 0; r < rules.size(); r++) {
-    const Rule &rule = rules[r];
-    if (rule.fields.size() != field_specs_.size()) {
-      *err = std::make_pair(
-          EINVAL, bess::utils::Format("rule should have %zu fields (has %zu)",
-                                      field_specs_.size(),
-                                      rule.fields.size()));
-      return nullptr;
-    }
-    std::byte *dst = key_storage.data() + r * layout.key_size;
-    size_t pos = 0;
-    for (size_t i = 0; i < rule.fields.size(); i++) {
-      const size_t want = static_cast<size_t>(field_specs_[i].size);
-      if (rule.fields[i].size() != want) {
-        *err = std::make_pair(
-            EINVAL,
-            bess::utils::Format("rule field %zu should have size %zu (has %zu)",
-                                i, want, rule.fields[i].size()));
-        return nullptr;
-      }
-      std::memcpy(dst + pos, rule.fields[i].data(), want);
-      pos += want;
-    }
-    backend_rules.push_back(classifier::RuntimeExactRule<gate_idx_t>{
-        .key = classifier::ConstBytes(dst, layout.key_size),
-        .result = rule.gate,
-    });
-  }
-
-  auto backend =
-      classifier::BuildRuntimeCuckooBackend<gate_idx_t>(layout.key_size,
-                                                        backend_rules);
-  if (!backend) {
-    const auto &e = backend.error();
-    *err = std::make_pair(EINVAL, "classifier backend: " + e.message);
-    return nullptr;
-  }
-  CHECK_EQ(backend->info().rule_count, rules.size());
+  CHECK_EQ(layout.key_size, table->key_len());
 
   return std::make_unique<Generation>(
-      rules, default_gate, std::move(*plan), std::move(*backend),
-      layout.key_size, /*extraction_valid=*/true,
-      std::move(layout.converted_masks), std::move(layout.baked_offsets));
+      default_gate, std::move(*plan), std::move(table), layout.key_size,
+      /*extraction_valid=*/true, std::move(layout.converted_masks),
+      std::move(layout.baked_offsets));
 }
 
 ExactMatch::GenerationPtr ExactMatch::BuildDegraded(
-    const std::vector<Rule> &rules, gate_idx_t default_gate) {
+    std::shared_ptr<classifier::ConcurrentExactTable> table,
+    gate_idx_t default_gate) {
   // Same layout machinery, tolerating unreadable metadata: the resulting plan
   // is never executed (extraction_valid == false), so placeholder offsets are
   // safe. Only reachable for established generations, hence key_size > 0.
@@ -347,8 +402,7 @@ ExactMatch::GenerationPtr ExactMatch::BuildDegraded(
   CHECK(plan.has_value()) << "degraded ExactMatch plan failed to compile";
 
   return std::make_unique<Generation>(
-      rules, default_gate, std::move(*plan),
-      classifier::RuntimeExactBackend<gate_idx_t>{}, layout.key_size,
+      default_gate, std::move(*plan), std::move(table), layout.key_size,
       /*extraction_valid=*/false, std::move(layout.converted_masks),
       std::move(layout.baked_offsets));
 }
@@ -383,7 +437,7 @@ void ExactMatch::RefreshForResume() {
   }
 
   Error err;
-  GenerationPtr next = Build(current->rules, current->default_gate, &err);
+  GenerationPtr next = Build(current->table, current->default_gate, &err);
   if (next != nullptr) {
     published_.Publish(std::move(next));
     bess::control::runtime().rcu().ReclaimReady();
@@ -397,7 +451,7 @@ void ExactMatch::RefreshForResume() {
   LOG(ERROR) << "ExactMatch '" << name()
              << "': metadata refresh failed (" << err.second
              << "); routing all packets to the default gate";
-  published_.Publish(BuildDegraded(current->rules, current->default_gate));
+  published_.Publish(BuildDegraded(current->table, current->default_gate));
   bess::control::runtime().rcu().ReclaimReady();
 }
 
@@ -408,18 +462,6 @@ int ExactMatch::OnEvent(bess::Event event) {
   RefreshForResume();
   // Return 0 (not -ENOTSUP) to stay registered for future resumes.
   return 0;
-}
-
-void ExactMatch::UpsertRule(std::vector<Rule> *rules, Rule rule) {
-  for (Rule &r : *rules) {
-    // Same match values: overwrite the gate, the way inserting the same key
-    // into the live table did.
-    if (r.fields == rule.fields) {
-      r.gate = rule.gate;
-      return;
-    }
-  }
-  rules->push_back(std::move(rule));
 }
 
 bool ExactMatch::Publish(
@@ -469,11 +511,17 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
     }
   }
 
+  auto table = NewTable(0);
+  if (!table) {
+    return CommandFailure(table.error().first, "%s",
+                          table.error().second.c_str());
+  }
   Error err;
-  GenerationPtr gen = Build(/*rules=*/{}, /*default_gate=*/DROP_GATE, &err);
+  GenerationPtr gen = Build(*table, /*default_gate=*/DROP_GATE, &err);
   if (gen == nullptr) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
+  table_ = std::move(*table);
   published_.Initialize(std::move(gen));
 
   return CommandSuccess();
@@ -513,17 +561,20 @@ CommandResponse ExactMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
 
   const Generation *gen = published_.Read();
   r.set_default_gate(gen->default_gate);
-  for (const Rule &rule : gen->rules) {
+  // The table is the source of truth: each key is the rule's fields packed
+  // in field order.
+  table_->ForEach([&](classifier::ConstBytes key, uint64_t value) {
     rule_t *out = r.add_rules();
-    out->set_gate(rule.gate);
-    for (size_t i = 0; i < rule.fields.size(); i++) {
+    out->set_gate(static_cast<gate_idx_t>(value));
+    size_t pos = 0;
+    for (const FieldSpec &spec : field_specs_) {
       bess::pb::FieldData *field = out->add_fields();
-
       // See GetInitialArg above for why we only set_value_bin here.
-      const char *ptr = reinterpret_cast<const char *>(rule.fields[i].data());
-      field->set_value_bin(ptr, rule.fields[i].size());
+      field->set_value_bin(reinterpret_cast<const char *>(key.data() + pos),
+                           static_cast<size_t>(spec.size));
+      pos += static_cast<size_t>(spec.size);
     }
-  }
+  });
   std::sort(r.mutable_rules()->begin(), r.mutable_rules()->end(),
             [](const rule_t &a, const rule_t &b) {
               // Primary sort key is gate number.
@@ -580,28 +631,48 @@ CommandResponse ExactMatch::SetRuntimeConfig(
         static_cast<unsigned long long>(arg.default_gate()));
   }
   const gate_idx_t default_gate = static_cast<gate_idx_t>(arg.default_gate());
-  std::vector<Rule> rules;
-  rules.reserve(arg.rules_size());
+
+  // A whole-configuration restore: one of the few deliberate rebuilds (G1.2
+  // mode G, bulk load). Build a fresh table, then publish it in one step.
+  std::vector<std::pair<std::vector<std::byte>, gate_idx_t>> rules;
+  rules.reserve(static_cast<size_t>(arg.rules_size()));
   for (auto i = 0; i < arg.rules_size(); i++) {
     Rule rule;
+    std::vector<std::byte> key;
     Error ret = RuleFromPb(arg.rules(i), &rule);
+    if (!ret.first) {
+      ret = PackKey(rule.fields, &key);
+    }
     if (ret.first) {
       return CommandFailure(ret.first, "%s", ret.second.c_str());
     }
-    // Duplicates in the argument collapse to one rule with the last gate,
-    // which is what inserting them into the table did -- and keeps the rule
-    // list from disagreeing with the table.
-    UpsertRule(&rules, std::move(rule));
+    rules.emplace_back(std::move(key), rule.gate);
+  }
+  // Duplicates collapse to one rule with the last gate, as inserting them
+  // into the table always did.
+  auto table = FillTable(rules.size(), [&](classifier::ConcurrentExactTable &t) {
+    for (const auto &[key, gate] : rules) {
+      if (t.Upsert(classifier::ConstBytes(key.data(), key.size()), gate) ==
+          classifier::ConcurrentExactTable::UpsertResult::kFull) {
+        return false;
+      }
+    }
+    return true;
+  });
+  if (!table) {
+    return CommandFailure(table.error().first, "%s",
+                          table.error().second.c_str());
   }
 
   Error err;
+  auto next_table = *table;
   const bool published = Publish([&](const Generation &) {
-    return Build(rules, default_gate, &err);
+    return Build(next_table, default_gate, &err);
   }, &err);
   if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
-
+  table_ = std::move(next_table);
   return CommandSuccess();
 }
 
@@ -633,7 +704,7 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   if (!gen->extract.fully_covers_key()) {
     std::memset(keys.data(), 0, static_cast<size_t>(cnt) * key_size);
   }
-  std::array<gate_idx_t, bess::PacketBatch::kMaxBurst> gates;
+  std::array<uint64_t, bess::PacketBatch::kMaxBurst> gates;
 
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
@@ -669,24 +740,23 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       }
     }
   }
-  uint64_t hits = gen->backend.lookup_batch(
+  uint64_t hits = gen->table->LookupBatch(
       classifier::ConstBytes(keys.data(),
                              static_cast<size_t>(cnt) * key_size),
-      key_size,
-      std::span<gate_idx_t>(gates).first(static_cast<size_t>(cnt)));
+      key_size, gates.data(), static_cast<size_t>(cnt));
   hits &= valid;
 
   for (int i = 0; i < cnt; i++) {
-    const gate_idx_t gate =
-        (hits & (uint64_t{1} << i)) ? gates[i] : default_gate;
+    const gate_idx_t gate = (hits & (uint64_t{1} << i))
+                                ? static_cast<gate_idx_t>(gates[i])
+                                : default_gate;
     EmitPacket(ctx, batch->packet(i), gate);
   }
 }
 
 std::string ExactMatch::GetDesc() const {
-  const Generation *gen = published_.Read();
   return bess::utils::Format("%zu fields, %zu rules", field_specs_.size(),
-                             gen->rules.size());
+                             table_->size());
 }
 
 Error ExactMatch::RuleFieldsFromPb(
@@ -719,24 +789,36 @@ Error ExactMatch::RuleFieldsFromPb(
   return std::make_pair(0, std::string());
 }
 
+// add/delete/clear write the shared table in place (G1.2 mode C): one
+// rte_hash operation each, with workers reading throughout. No generation is
+// built -- except the rare, amortized growth in EnsureCapacity.
 CommandResponse ExactMatch::CommandAdd(
     const bess::pb::ExactMatchCommandAddArg &arg) {
   Rule rule;
   Error ret = RuleFromPb(arg, &rule);
+  std::vector<std::byte> key;
+  if (!ret.first) {
+    ret = PackKey(rule.fields, &key);
+  }
   if (ret.first) {
     return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
-
-  Error err;
-  const bool published = Publish([&](const Generation &current) {
-    std::vector<Rule> rules = current.rules;
-    UpsertRule(&rules, rule);
-    return Build(rules, current.default_gate, &err);
-  }, &err);
-  if (!published) {
-    return CommandFailure(err.first, "%s", err.second.c_str());
+  if (!EnsureCapacity(/*force=*/false, &ret)) {
+    return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
-
+  const classifier::ConstBytes k(key.data(), key.size());
+  using classifier::ConcurrentExactTable;
+  if (table_->Upsert(k, rule.gate) == ConcurrentExactTable::UpsertResult::kFull) {
+    // Full below the load limit: slots from recent deletes are still in a
+    // grace period (or the cuckoo paths ran out). Grow rather than refuse.
+    if (!EnsureCapacity(/*force=*/true, &ret)) {
+      return CommandFailure(ret.first, "%s", ret.second.c_str());
+    }
+    if (table_->Upsert(k, rule.gate) ==
+        ConcurrentExactTable::UpsertResult::kFull) {
+      return CommandFailure(ENOSPC, "rule table is full");
+    }
+  }
   return CommandSuccess();
 }
 
@@ -748,49 +830,30 @@ CommandResponse ExactMatch::CommandDelete(
 
   std::vector<std::vector<uint8_t>> fields;
   Error ret = RuleFieldsFromPb(arg.fields(), &fields);
+  std::vector<std::byte> key;
+  if (!ret.first) {
+    ret = PackKey(fields, &key);
+  }
   if (ret.first) {
     return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
-
-  Error err;
-  bool found = false;
-  const bool published =
-      Publish([&](const Generation &current) -> GenerationPtr {
-        std::vector<Rule> rules;
-        rules.reserve(current.rules.size());
-        for (const Rule &r : current.rules) {
-          if (r.fields == fields) {
-            found = true;
-            continue;
-          }
-          rules.push_back(r);
-        }
-        if (!found) {
-          return nullptr;
-        }
-        return Build(rules, current.default_gate, &err);
-      }, &err);
-  if (!published) {
-    if (!found) {
-      return CommandFailure(ENOENT, "rule doesn't exist");
-    }
-    return CommandFailure(err.first, "%s", err.second.c_str());
+  if (!table_->Erase(classifier::ConstBytes(key.data(), key.size()))) {
+    return CommandFailure(ENOENT, "rule doesn't exist");
   }
-
   return CommandSuccess();
 }
 
 CommandResponse ExactMatch::CommandClear(const bess::pb::EmptyArg &) {
   // Rules go, the default gate stays -- what ClearRules() did to the live
-  // table.
-  Error err;
-  const bool published = Publish([&](const Generation &current) {
-    return Build(/*rules=*/{}, current.default_gate, &err);
-  }, &err);
-  if (!published) {
-    return CommandFailure(err.first, "%s", err.second.c_str());
+  // table. Deleted in place, rule by rule; workers never stop reading.
+  std::vector<std::vector<std::byte>> keys;
+  keys.reserve(table_->size());
+  table_->ForEach([&](classifier::ConstBytes key, uint64_t) {
+    keys.emplace_back(key.begin(), key.end());
+  });
+  for (const auto &key : keys) {
+    table_->Erase(classifier::ConstBytes(key.data(), key.size()));
   }
-
   return CommandSuccess();
 }
 
@@ -803,7 +866,7 @@ CommandResponse ExactMatch::CommandSetDefaultGate(
   const gate_idx_t gate = static_cast<gate_idx_t>(arg.gate());
   Error err;
   const bool published = Publish([&](const Generation &current) {
-    return Build(current.rules, gate, &err);
+    return Build(current.table, gate, &err);
   }, &err);
   if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());

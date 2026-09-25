@@ -158,7 +158,8 @@ class ApiV2ServiceTest : public ::testing::Test {
     const auto &trailers = context.GetServerTrailingMetadata();
     const auto it = trailers.find("bess-error-bin");
     if (it != trailers.end()) {
-      detail.ParseFromString(std::string(it->second.data(), it->second.size()));
+      EXPECT_TRUE(detail.ParseFromString(
+          std::string(it->second.data(), it->second.size())));
     }
     return detail;
   }
