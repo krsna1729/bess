@@ -300,6 +300,7 @@ Run a benchmark pinned to one isolated core. The tables above name each one.
 | decision | benchmark |
 |---|---|
 | exact-match backend and its insert cost | `modules_exact_match_update_bench` (`BM_Lookup`, `BM_ModuleAddDelete`) |
+| occupancy before a failed add, add cost as tables fill, churn failures versus grace periods | `occupancy_bench [fill\|churn\|all] [max_log2_entries]` |
 | update-mode thresholds, writer rate | `update_scale_bench` |
 | control-ingress transport | `ingress_bench` |
 | plain vs staged body rule | `modules_table_scale_bench`, `classifier_cuckoo_scale_bench` |

@@ -30,6 +30,7 @@ file is the reasoning.
 | D-007 | DPDK behaviours we depend on are deterministic CI tests | accepted |
 | D-008 | UPF is a consumer of the framework, not its driver | accepted |
 | D-009 | Consolidate the exact-match backends | open |
+| D-010 | Size concurrent tables for occupancy and grace-period headroom, not a fixed 75% | proposed |
 
 ---
 
@@ -355,3 +356,76 @@ helps experts; one obvious path helps authors.
 
 **Decide when:** WildcardMatch and L2Forward have moved to the update modes
 of D-004, so the real users of each backend are known.
+
+## D-010 Size concurrent tables for occupancy and grace-period headroom, not a fixed 75%
+
+**Status:** proposed (2026-09-25).
+**Code:** `ExactMatch::NewTable` / `EnsureCapacity` (grows past 3/4 load
+today); `ConcurrentExactTable::Create`.
+
+**Context.** The 3/4 growth threshold was a guess, so a quarter of every table
+is kept empty. Two separate things can make an add fail: cuckoo displacement
+running out of room, and key slots held by deletes still waiting out a grace
+period.
+
+**Evidence** (`occupancy_bench`, 8-byte keys, five seeds for fill and three
+for churn):
+
+- **`rte_hash` occupancy at the first failed add** (entries a power of two,
+  so bucket positions = key slots):
+  - random keys: 99.5% at 1K entries, 98.8% at 16K, 98.3% at 256K, 97.4% at
+    4M (worst seed 97.0%);
+  - sequential and IP×port keys: 100% at every size.
+
+  With 64 more attempts, 99.7% or more is reachable. CRC spreads sequential
+  keys evenly, so TEIDs and address pools are the easy case.
+- **Sizing `entries` at 3/4 of the bucket power of two** (bucket positions =
+  4/3 of the key slots) reaches 100% of slots with every key shape.
+- **`EXT_TABLE`** also reaches 100%.
+- **Mean add cost as the table fills** (4M entries, random keys, ns):
+
+  | load | power of two, CPU 2 | power of two, CPU 14 | 3/4 sizing, CPU 2 | 3/4 sizing, CPU 14 |
+  |---|---|---|---|---|
+  | up to 80-90% | ≤ 150 | ≤ 160 | ≤ 180 | ≤ 170 |
+  | last 10% | 643 | 1161 | 198 | 189 |
+
+  The single-sample worst cases (5-40 µs) appear at every load and are
+  outliers, not displacement cost.
+- **Steady churn** (erase one, add one) with no reader holding grace periods:
+  zero failed adds up to 95% load, for every sizing and key shape.
+- **Failures appear exactly when deletes waiting out a grace period outnumber
+  the spare slots.** At 1K entries:
+
+  | load | reader quiescent every 64 ops | every 1024 ops |
+  |---|---|---|
+  | 95% (51 spare slots) | 17% of adds fail | — |
+  | 75% (256 spare slots) | — | 75% of adds fail |
+
+  At 64K entries (3,277 spare slots at 95%) nothing fails in either case.
+  This is the headroom rule: spare slots ≥ update rate × grace period.
+- **`CuckooMap`** (for comparison; it grows instead of failing):
+  - random keys: it doubles its buckets at 80-95% load (median 89%);
+  - sequential keys: it doubles only when completely full;
+  - IP×port keys: some doublings happen at 35% load, and a table of 4M
+    such keys ended at **25%** load.
+
+  Its displacement search is shallow (4-way buckets, depth 3), and its
+  secondary hash is derived from the primary. NAT keeps its flow table in
+  `CuckooMap` with endpoint keys, so its memory use deserves a measurement
+  of its own.
+
+**Proposed decision.**
+
+- Create tables with `entries` = 3/4 of the bucket power of two.
+- Grow when live entries plus deletes pending reclaim exceed the slots less
+  a headroom. Headroom = max(5% of slots, expected update rate × grace
+  period).
+- Keep grow-on-`kFull` as the backstop.
+
+For the same rule count this stores about a fifth fewer key slots than
+today's rule, and it removes the near-full add-cost cliff.
+
+**Revisit when:** a DPDK upgrade changes `rte_hash`'s displacement search,
+or measured grace periods under real worker load are far longer than
+assumed.
+
