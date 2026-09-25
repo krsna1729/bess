@@ -174,6 +174,20 @@ class ControlPlane {
   ControlResult<PipelineDiff> DiffPipeline(const PipelineSpec& desired) const;
   ControlResult<PipelinePlan> PlanPipeline(const PipelineSpec& desired) const;
 
+  // The same reads, paired with the generation they observed, taken under
+  // one lock acquisition -- what a client needs to follow up with an
+  // ApplyPipeline(expected_generation) (G1).
+  template <typename T>
+  struct Versioned {
+    T value;
+    uint64_t generation = 0;
+  };
+  Versioned<PipelineSnapshot> GetPipelineVersioned() const;
+  ControlResult<Versioned<PipelineDiff>> DiffPipelineVersioned(
+      const PipelineSpec& desired) const;
+  ControlResult<Versioned<PipelinePlan>> PlanPipelineVersioned(
+      const PipelineSpec& desired) const;
+
   // -- transactions --
   // The transactional path (section 9.7): validate, check the expected
   // generation, diff, plan, then run the plan as a transaction. A failure

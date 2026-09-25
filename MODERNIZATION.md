@@ -155,7 +155,7 @@ separately.
 | E — Meson | Complete | Meson is the BESS build/test/install graph. |
 | F — operations | Partial | Packaging, releases, SBOM, observability, and tooling lanes remain. |
 | G0 — transactional core | Complete | Internal C++ desired-state/transaction engine is landed. |
-| G1 — public API/SDKs | Not started | Next: K1–K7 now define the resources it exposes. |
+| G1 — public API/SDKs | In progress | G1.1 pipeline API done; G1.2 dataplane resource transactions next. |
 | H / I — language and type safety | Partial | Continue incrementally; K6 added a typed `WorkerId`. |
 | J — live table updates | Complete, subsumed | Pilot succeeded; current lifetime mechanism is K1 `RcuDomain`/`RcuPtr`. |
 | K — dataplane substrate | K1–K7 complete | K8 is consumer-driven; G1 is next. |
@@ -3425,6 +3425,32 @@ rather than one call site).
     mbuf history -> F debug lanes, `rte_ptr_compress` -> L3, `--legacy-mem`
     newly testable on hugepages.
 
+85. **Small open items closed.** (1) `run_module_tests.py` stopped its daemon
+    in a `finally` (it started a root `bessd -k` via `bessctl` and never
+    stopped it, leaving one behind after every integration run). (2) NAT and
+    L2Forward module loops made plain again by moving K4.6b staging into the
+    tables: `CuckooMap::PrefetchBatch` (hint-only, safe under reallocating
+    inserts) and `l2_find_batch` with the body fixed at `l2_init`; new tests
+    `L2TableBatchTest.MatchesSingleLookupsUnderBothBodies` and
+    `CuckooMapTest.PrefetchBatchIsOnlyAHint`. (3) `rte_fib` revalidation made
+    a one-command gate (`BESS_FIB_GATE=1 fib_bench`), run on every DPDK
+    change; rerun on 25.11.3 reproduces entry 34 exactly.
+86. **G1.1 — v2 pipeline API.** `protobuf/control_v2.proto`
+    (`bess.pb.v2.Control`: Get/Validate/Diff/Plan/ApplyPipeline, desired-state
+    `Pipeline`, `PipelineDiff`, `PlanStep`, `ErrorDetail`),
+    `core/control/api_v2.{h,cc}` (adapters, gRPC code mapping, typed
+    `bess-error-bin` trailer, `ControlV2Service`), `ControlPlane::*Versioned`
+    reads (result and generation under one lock), and one `ControlPlane`
+    shared by the legacy and v2 services in `ApiServer::Run`.
+    `control_api_v2_test` (5 tests): lossless proto round-trip, code mapping,
+    and the full flow over an in-process gRPC channel (validate, diff, plan
+    in phase order, apply with the diff's generation, get, no-op reapply,
+    stale-generation `ABORTED`/`CONFLICT` with nothing applied, invalid
+    pipeline rejected with a typed detail and nothing applied). Smoke-tested
+    against a running unprivileged `bessd` from Python: diff -> plan
+    (prepare worker/modules, commit connect) -> apply (generation 0 -> 1,
+    4 ops) -> stale reapply `ABORTED` -> get.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -6525,8 +6551,14 @@ WildcardMatch tuples +3..+5%).
 - Where it is decided: the cuckoo backend at generation build (ExactMatch,
   and each WildcardMatch tuple on its own footprint; recorded in
   `BackendInfo::lookup_body`, which now also reports real `storage_bytes`);
-  L2Forward at `Init` (fixed table size); NAT per batch from the live table
-  size (a few compares -- its table grows on the data path).
+  the L2 table at `l2_init` (fixed size); NAT's flow table per batch from its
+  live size (a few compares -- it grows on the data path).
+- Module code stays plain (entry 85): the staging lives in the tables.
+  L2Forward's `ProcessBatch` is "gather MACs, `l2_find_batch`, emit" --
+  the same shape as `IPLookup`. NAT keeps its original per-packet body after
+  a parse loop and one `map_.PrefetchBatch(keys)`. That call only warms
+  buckets, so it stays correct even when a mid-batch insert reallocates the
+  table; a precomputed batch of entry pointers would not.
 - Validation: an `auto` row per structure picked the faster body on every
   L2Forward and NAT row and matched the best WildcardMatch body within
   run-to-run noise.
@@ -6977,10 +7009,43 @@ Lower priority than K1–K3 and K5/K6.
 ---
 
 
-## 14. Phase G1 — desired-state API and thin language SDKs — NOT STARTED
+## 14. Phase G1 — desired-state API and thin language SDKs — IN PROGRESS
 
 After G0 and enough K resources exist to design against real semantics, expose
 the new public API. K1–K7 now provide the resource contracts G1 exposes.
+
+### G1 status and plan
+
+- **G1.1 — pipeline API: DONE (2026-09-25, entry 86).**
+  `protobuf/control_v2.proto` defines service `bess.pb.v2.Control`
+  (`GetPipeline`, `ValidatePipeline`, `DiffPipeline`, `PlanPipeline`,
+  `ApplyPipeline`) over desired-state messages (`Pipeline` of ports, modules,
+  connections, workers, traffic classes). `core/control/api_v2.{h,cc}` is a
+  pure adapter: `FromProto -> ControlPlane -> ToProto`. It is served beside the
+  legacy `BESSControl` from one shared `ControlPlane`, so both APIs see one
+  runtime, lock and generation. Reads return the generation they observed,
+  taken under the same lock (`ControlPlane::*Versioned`), so a client can
+  apply with `expected_generation`. Errors are gRPC codes (`ABORTED` for a
+  generation conflict) plus a typed `ErrorDetail` in the `bess-error-bin`
+  trailer. Verified in process over a real gRPC channel
+  (`control_api_v2_test`) and against a running `bessd` from Python.
+- **G1.2 — dataplane resource transactions: NEXT.** `ApplyDataplaneTransaction`
+  over classifier entries, actions, meters, routes and next hops. Design
+  first: those K resources live inside modules today, so this needs a
+  resource registry (a module exposes typed resource tables by name; the
+  transaction names `(module, resource, op)`), per-resource transaction
+  semantics (K2/K3/K5 are generation swaps and can be atomic across a batch;
+  K7 routes are per-change atomic in place, so a multi-route transaction
+  either uses `Clear()`-style rebuild or states its visibility), and a
+  generation for dataplane state.
+- **G1.3 — `GetSystem` / `GetCapabilities`:** version, workers/CPUs, cache
+  geometry (K4.6b), module/driver classes and their resources, PMD
+  capabilities.
+- **G1.4 — stats:** `GetStats` / `WatchStats` over K6 snapshots (generation,
+  epoch, deltas); `WatchEvents` for generation changes.
+- **G1.5 / G1.6 — thin Go and C++ SDKs:** typed builders, one-RPC
+  transactions, typed errors from `ErrorDetail`, generation/conflict retry
+  helpers. G1.7 — C++ `bessctl` on the v2 API.
 
 The old imperative API should not constrain the ideal end state.
 
@@ -7960,7 +8025,13 @@ Build the new classifier framework with explicit modern semantics.
 
 #### Do not adopt `rte_fib` as routing default yet
 
-The existing benchmark found correctness failures.
+The existing benchmark found correctness failures. Revalidation is one command
+and must be rerun on every DPDK version change (`deps/dpdk.json`):
+`BESS_FIB_GATE=1 build-meson/core/fib_bench --benchmark_filter='Fib/routes:(524288|65536)'`.
+It re-registers entry 34's two failing rows (512K arbitrary-order build, 64K
+churn), whose built-in reference check aborts on a wrong answer. Rerun
+2026-09-25 on DPDK 25.11.3: still fails identically (key `0x20b7b6c2` -> 7207
+instead of 5986 from the /12).
 
 #### Do not treat RCU as a multi-writer synchronization primitive
 
@@ -8163,13 +8234,13 @@ deltas, typed `WorkerId`; `Track` migrated. See the K6 section.
 `Router` with ordered route/next-hop publication, `RewriteL2`; `IPLookup`
 migrated. See the K7 section.
 
-### Next — G1 public desired-state API and SDKs (not started)
+### Next — G1.2 dataplane resource transactions
 
-Expose G0's desired-state engine and the K resources (classifier entries,
-actions, meters, routes, next hops) through a public v2 API with a dataplane
-transaction RPC, capability and stats (K6 snapshot) surfaces, then thin Go
-and C++ SDKs. Decide per resource how transactions map onto its update model
-(K7 routes are per-change atomic in place; K2/K3/K5 are generation swaps).
+G1.1 (the v2 pipeline API) is done. Next is designing and implementing
+`ApplyDataplaneTransaction` (section 14): a resource registry so the module-owned
+K resources (classifier entries, actions, meters, routes, next hops) can be
+named and changed in one transaction, with per-resource visibility semantics
+stated. Then G1.3 capabilities, G1.4 stats, and the Go/C++ SDKs.
 
 ### Following stages
 
@@ -8445,8 +8516,9 @@ Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K7.
 Partial: F, H, and I. Not started: D, G1, and K8 (consumer-driven).
 C-HW remains a separate deferred hardware-validation track.
 
-**Next software work: G1 public API/SDKs**, with Phase L (section 27) as a
-parallel performance track starting at L1 measurability. Do not reopen closed K
+**Next software work: G1.2 dataplane resource transactions** (G1.1, the v2
+pipeline API, is done), with Phase L (section 27) as a parallel performance
+track starting at L1 measurability. Do not reopen closed K
 architecture; do not block the software sequence on real-NIC work.
 Benchmarks are run through `omarchy-benchmark` (pinned, isolated,
 performance governor); multithreaded gbench rows must self-pin each thread,

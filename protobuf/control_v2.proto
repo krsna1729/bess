@@ -1,0 +1,225 @@
+// Copyright (c) 2026, Nefeli Networks, Inc.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice, this
+// list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice,
+// this list of conditions and the following disclaimer in the documentation
+// and/or other materials provided with the distribution.
+//
+// * Neither the names of the copyright holders nor the names of their
+// contributors may be used to endorse or promote products derived from this
+// software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+syntax = "proto3";
+
+import "google/protobuf/any.proto";
+
+package bess.pb.v2;
+
+// BESS v2 control API (G1): coarse-grained and desired-state oriented.
+//
+// A client describes the whole pipeline it wants; bessd validates it, works
+// out what has to change, and applies it as one transaction with rollback --
+// the G0 engine (core/control/). No client orders BESS internals or rolls
+// anything back itself.
+//
+// Errors are gRPC status codes (INVALID_ARGUMENT, NOT_FOUND, ALREADY_EXISTS,
+// ABORTED for a generation conflict, FAILED_PRECONDITION for a busy
+// resource, UNIMPLEMENTED for a change that cannot be made transactionally,
+// INTERNAL), with an ErrorDetail serialized into the "bess-error-bin"
+// trailing metadata for typed client handling.
+//
+// The legacy imperative BESSControl service is unchanged and served alongside.
+
+// -- desired state ------------------------------------------------------------
+
+message Port {
+  string name = 1;    // required: desired state is keyed by stable names
+  string driver = 2;
+  uint32 num_rx_queues = 3;   // 0: one queue
+  uint32 num_tx_queues = 4;
+  uint64 rx_queue_size = 5;   // 0: driver default
+  uint64 tx_queue_size = 6;
+  google.protobuf.Any arg = 7;  // driver-specific argument
+}
+
+message Module {
+  string name = 1;
+  string mclass = 2;
+  google.protobuf.Any arg = 3;  // module Init argument (module_msg.proto)
+}
+
+message Connection {
+  string upstream = 1;
+  uint32 ogate = 2;
+  string downstream = 3;
+  uint32 igate = 4;
+  bool skip_default_hooks = 5;
+}
+
+message Worker {
+  int32 wid = 1;
+  int32 core = 2;
+  string scheduler = 3;
+}
+
+message TrafficClass {
+  string name = 1;
+  string parent = 2;
+  string policy = 3;    // "priority", "weighted_fair", "round_robin", "rate_limit", "leaf"
+  string resource = 4;  // "count", "cycle", "packet", "bit"
+  int32 wid = 5;        // -1: any
+  optional int64 priority = 6;
+  optional int64 share = 7;
+  map<string, int64> limit = 8;
+  map<string, int64> max_burst = 9;
+  string leaf_module_name = 10;
+  uint64 leaf_module_taskid = 11;
+}
+
+message Pipeline {
+  repeated Port ports = 1;
+  repeated Module modules = 2;
+  repeated Connection connections = 3;
+  repeated Worker workers = 4;
+  repeated TrafficClass traffic_classes = 5;
+}
+
+// -- diff and plan --------------------------------------------------------------
+
+enum ObjectType {
+  OBJECT_TYPE_UNSPECIFIED = 0;
+  PORT = 1;
+  MODULE = 2;
+  CONNECTION = 3;
+  WORKER = 4;
+  TRAFFIC_CLASS = 5;
+}
+
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  CREATE = 1;
+  REMOVE = 2;
+  REPLACE = 3;        // cannot change in place: rebuilt
+  UPDATE = 4;         // reattached (traffic class parent/priority/share)
+  UPDATE_PARAMS = 5;  // parameters changed in place
+}
+
+message Change {
+  ObjectType type = 1;
+  // Object name; for a connection "upstream:ogate->downstream:igate"; for a
+  // worker its wid.
+  string object = 2;
+  ChangeKind kind = 3;
+}
+
+message PipelineDiff {
+  repeated Change changes = 1;  // unchanged objects are not listed
+}
+
+enum PlanPhase {
+  PLAN_PHASE_UNSPECIFIED = 0;
+  PREPARE = 1;  // side effects that need no pause and are undoable
+  COMMIT = 2;   // the switch-over (may pause workers)
+  RETIRE = 3;   // teardown of what was replaced, after the commit
+}
+
+message PlanStep {
+  PlanPhase phase = 1;
+  string operation = 2;  // e.g. "create_port", "connect", "remove_tc"
+  ObjectType type = 3;
+  string object = 4;
+}
+
+// -- requests and responses -----------------------------------------------------
+
+message GetPipelineRequest {}
+message GetPipelineResponse {
+  Pipeline pipeline = 1;   // the active runtime as desired state
+  uint64 generation = 2;
+}
+
+message ValidatePipelineRequest {
+  Pipeline pipeline = 1;
+}
+message ValidatePipelineResponse {
+  Pipeline normalized = 1;  // canonical form (stable order, defaults filled)
+}
+
+message DiffPipelineRequest {
+  Pipeline pipeline = 1;
+}
+message DiffPipelineResponse {
+  PipelineDiff diff = 1;
+  uint64 generation = 2;  // the active generation the diff was taken against
+}
+
+message PlanPipelineRequest {
+  Pipeline pipeline = 1;
+}
+message PlanPipelineResponse {
+  repeated PlanStep steps = 1;
+  uint64 generation = 2;
+}
+
+message ApplyPipelineRequest {
+  Pipeline pipeline = 1;
+  // Optimistic concurrency: rejected with ABORTED, before any side effect,
+  // if the active generation differs.
+  optional uint64 expected_generation = 2;
+}
+message ApplyPipelineResponse {
+  uint64 generation = 1;     // after the apply (unchanged for a no-op)
+  uint64 applied_ops = 2;
+  bool workers_paused = 3;
+  uint64 validation_us = 4;
+  uint64 prepare_us = 5;
+  uint64 paused_commit_us = 6;
+  uint64 retire_us = 7;
+}
+
+// Carried in the "bess-error-bin" trailer of a failed call.
+message ErrorDetail {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    INVALID_ARGUMENT = 1;
+    NOT_FOUND = 2;
+    ALREADY_EXISTS = 3;
+    CONFLICT = 4;
+    RESOURCE_BUSY = 5;
+    UNSUPPORTED_TRANSACTION = 6;
+    RESOURCE_FAILURE = 7;
+    INTERNAL = 8;
+  }
+  Code code = 1;
+  int32 errno_value = 2;  // errno-compatible cause, 0 if none
+  string message = 3;
+  string object = 4;      // offending object, when known
+  string field = 5;       // offending field, when known
+}
+
+service Control {
+  rpc GetPipeline(GetPipelineRequest) returns (GetPipelineResponse) {}
+  rpc ValidatePipeline(ValidatePipelineRequest)
+      returns (ValidatePipelineResponse) {}
+  rpc DiffPipeline(DiffPipelineRequest) returns (DiffPipelineResponse) {}
+  rpc PlanPipeline(PlanPipelineRequest) returns (PlanPipelineResponse) {}
+  rpc ApplyPipeline(ApplyPipelineRequest) returns (ApplyPipelineResponse) {}
+}

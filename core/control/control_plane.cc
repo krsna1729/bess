@@ -1567,6 +1567,33 @@ ControlResult<PipelineDiff> ControlPlane::DiffPipeline(
   return Diff(SnapshotRuntime(runtime()), validated->spec);
 }
 
+ControlPlane::Versioned<PipelineSnapshot> ControlPlane::GetPipelineVersioned()
+    const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return {SnapshotRuntime(runtime()), runtime().generation()};
+}
+
+ControlResult<ControlPlane::Versioned<PipelineDiff>>
+ControlPlane::DiffPipelineVersioned(const PipelineSpec &desired) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto validated = bess::control::ValidatePipeline(runtime(), desired);
+  if (!validated) {
+    return std::unexpected(validated.error());
+  }
+  return Versioned<PipelineDiff>{
+      Diff(SnapshotRuntime(runtime()), validated->spec),
+      runtime().generation()};
+}
+
+ControlResult<ControlPlane::Versioned<PipelinePlan>>
+ControlPlane::PlanPipelineVersioned(const PipelineSpec &desired) const {
+  auto diff = DiffPipelineVersioned(desired);
+  if (!diff) {
+    return std::unexpected(diff.error());
+  }
+  return Versioned<PipelinePlan>{Plan(diff->value), diff->generation};
+}
+
 ControlResult<PipelinePlan> ControlPlane::PlanPipeline(
     const PipelineSpec &desired) const {
   auto diff = DiffPipeline(desired);

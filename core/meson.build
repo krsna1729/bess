@@ -3,6 +3,7 @@ core_include = include_directories('.', '..')
 core_sources = files(
   'bessctl.cc',
   'bessd.cc',
+  'control/api_v2.cc',
   'control/control_error.cc',
   'control/control_plane.cc',
   'control/pipeline_diff.cc',
@@ -224,6 +225,7 @@ unit_test_sources = [
   'rcu/rcu_ptr_test.cc',
   'rcu/rcu_worker_test.cc',
   'rcu/rcu_scheduler_test.cc',
+  'control/api_v2_test.cc',
   'control/apply_pipeline_test.cc',
   'control/control_plane_test.cc',
   'bessd_test.cc',

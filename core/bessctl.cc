@@ -44,6 +44,7 @@
 #include "pb/service.grpc.pb.h"
 #pragma GCC diagnostic pop
 
+#include "control/api_v2.h"
 #include "control/control_plane.h"
 #include "control/worker_manager.h"
 #include "bessd.h"
@@ -266,6 +267,9 @@ static void collect_tc(const bess::TrafficClass* c, int wid,
 
 class BESSControlImpl final : public BESSControl::Service {
  public:
+  explicit BESSControlImpl(bess::control::ControlPlane& control_plane)
+      : control_plane_(control_plane) {}
+
   void set_shutdown_func(const std::function<void()>& func) {
     shutdown_func_ = func;
   }
@@ -1108,9 +1112,11 @@ class BESSControlImpl final : public BESSControl::Service {
   }
 
  private:
-  // BESS control-plane semantics live here; this class is a protocol
-  // adapter. The control plane owns the (non-recursive) lock.
-  bess::control::ControlPlane control_plane_;
+  // BESS control-plane semantics live in ControlPlane; this class is a
+  // protocol adapter. The control plane owns the (non-recursive) lock and is
+  // shared with the v2 service, so both APIs see one runtime and one
+  // generation.
+  bess::control::ControlPlane& control_plane_;
 
   std::function<void()> shutdown_func_;
 
@@ -1132,8 +1138,13 @@ void ApiServer::Run() {
     return;
   }
 
-  BESSControlImpl service;
+  // One control plane behind both APIs: the legacy imperative BESSControl
+  // service and the v2 desired-state service (G1).
+  bess::control::ControlPlane control_plane;
+  BESSControlImpl service(control_plane);
+  bess::control::ControlV2Service service_v2(control_plane);
   builder_->RegisterService(&service);
+  builder_->RegisterService(&service_v2);
   builder_->SetSyncServerOption(grpc::ServerBuilder::MAX_POLLERS, 1);
 
   std::unique_ptr<grpc::Server> server = builder_->BuildAndStart();
