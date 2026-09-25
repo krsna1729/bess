@@ -29,6 +29,8 @@
 
 #include "nat.h"
 
+#include "../dataplane/batch_stages.h"
+
 #include <algorithm>
 #include <numeric>
 #include <string>
@@ -325,43 +327,65 @@ inline void Stamp(Ipv4 *ip, void *l4, const Endpoint &before,
 template <NAT::Direction dir>
 inline void NAT::DoProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   gate_idx_t ogate_idx = dir == kForward ? 1 : 0;
-  int cnt = batch->cnt();
+  const size_t cnt = batch->cnt();
   uint64_t now = ctx->current_ns;
 
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
+  // The flow table grows on the data path, so the batch body is re-resolved
+  // per batch (a few compares): staged once the table outgrows L1d (K4.6).
+  const auto body = bess::dataplane::ResolveLookupBody(
+      bess::dataplane::LookupBody::kAuto,
+      {.table_bytes = map_.MemoryBytes(),
+       .dependent_lines = 2,
+       .branches_on_loaded_data = true});
 
-    Ethernet *eth = pkt.head_data<Ethernet *>();
-    Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
-    size_t ip_bytes = (ip->header_length) << 2;
-    void *l4 = reinterpret_cast<uint8_t *>(ip) + ip_bytes;
-
-    bool valid_protocol;
+  struct Parsed {
+    Ipv4 *ip;
+    void *l4;
     Endpoint before;
-    std::tie(valid_protocol, before) = ExtractEndpoint(ip, l4, dir);
+    bool valid;
+  };
+  Parsed parsed[bess::PacketBatch::kMaxBurst];
+  const Endpoint::Hash hasher;
 
-    if (!valid_protocol) {
-      DropPacket(ctx, pkt);
-      continue;
-    }
+  bess::dataplane::RunBatch(
+      body, cnt,
+      [&](size_t i) {
+        Parsed &p = parsed[i];
+        Ethernet *eth = batch->packet(i).head_data<Ethernet *>();
+        p.ip = reinterpret_cast<Ipv4 *>(eth + 1);
+        const size_t ip_bytes = (p.ip->header_length) << 2;
+        p.l4 = reinterpret_cast<uint8_t *>(p.ip) + ip_bytes;
+        std::tie(p.valid, p.before) = ExtractEndpoint(p.ip, p.l4, dir);
+        if (p.valid) {
+          map_.PrefetchBucketPrehashed(
+              static_cast<bess::utils::HashResult>(hasher(p.before)));
+        }
+      },
+      [&](size_t i) {
+        Parsed &p = parsed[i];
+        bess::PacketRef pkt = batch->packet(i);
+        if (!p.valid) {
+          DropPacket(ctx, pkt);
+          return;
+        }
 
-    auto *hash_item = map_.Find(before);
+        auto *hash_item = map_.Find(p.before);
 
-    if (hash_item == nullptr) {
-      if (dir != kForward || !(hash_item = CreateNewEntry(before, now))) {
-        DropPacket(ctx, pkt);
-        continue;
-      }
-    }
+        if (hash_item == nullptr) {
+          if (dir != kForward || !(hash_item = CreateNewEntry(p.before, now))) {
+            DropPacket(ctx, pkt);
+            return;
+          }
+        }
 
-    // only refresh for outbound packets, rfc4787 REQ-6
-    if (dir == kForward) {
-      hash_item->second.last_refresh = now;
-    }
+        // only refresh for outbound packets, rfc4787 REQ-6
+        if (dir == kForward) {
+          hash_item->second.last_refresh = now;
+        }
 
-    Stamp<dir>(ip, l4, before, hash_item->second.endpoint);
-    EmitPacket(ctx, pkt, ogate_idx);
-  }
+        Stamp<dir>(p.ip, p.l4, p.before, hash_item->second.endpoint);
+        EmitPacket(ctx, pkt, ogate_idx);
+      });
 }
 
 void NAT::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {

@@ -47,6 +47,7 @@
 #include "classifier/typed_exact.h"
 #include "utils/common.h"
 #include "dataplane/batch_stages.h"
+#include "dataplane/batch_tuning.h"
 #include "utils/cuckoo_map.h"
 
 namespace bess::classifier {
@@ -262,8 +263,8 @@ struct RuntimeCuckooState {
 
 // Probe directly from the packed key buffer. The hot loop computes the raw
 // hash once and passes the borrowed probe plus hash into CuckooMap.
-template <size_t StorageBytes, typename Result, typename ProbeHash,
-          typename ProbeEqual>
+template <bool kStaged, size_t StorageBytes, typename Result,
+          typename ProbeHash, typename ProbeEqual>
 uint64_t RuntimeCuckooLookupBatchPrehashedImpl(
     const void *raw_state, ConstBytes keys, size_t key_stride,
     std::span<Result> results, size_t logical_key_size,
@@ -282,10 +283,23 @@ uint64_t RuntimeCuckooLookupBatchPrehashedImpl(
     };
   };
 
+  if constexpr (!kStaged) {
+    for (size_t i = 0; i < n; i++) {
+      const RuntimeCuckooProbe probe = probe_at(i);
+      const auto *entry = state->map.FindPrehashedAs(
+          static_cast<bess::utils::HashResult>(hash(probe)), probe, equal);
+      if (entry != nullptr) {
+        results[i] = entry->second;
+        hits |= (uint64_t{1} << i);
+      }
+    }
+    return hits;
+  }
+
   // Stage-major (K4.6): hash every key and prefetch its primary bucket, then
-  // probe. The bucket -> entry misses of a batch overlap instead of being paid
-  // one key at a time: 20% faster on a cache-resident table, 28-46% beyond L3
-  // (classifier/cuckoo_scale_bench.cc).
+  // probe, so the bucket -> entry misses of a batch overlap instead of being
+  // paid one key at a time (classifier/cuckoo_scale_bench.cc). Chosen per
+  // generation by dataplane::ResolveLookupBody().
   constexpr size_t kChunk = 32;
   bess::utils::HashResult hashes[kChunk];
   for (size_t base = 0; base < n; base += kChunk) {
@@ -309,26 +323,27 @@ uint64_t RuntimeCuckooLookupBatchPrehashedImpl(
   return hits;
 }
 
-template <size_t StorageBytes, size_t LogicalBytes, typename Result>
+template <size_t StorageBytes, size_t LogicalBytes, typename Result,
+          bool kStaged = true>
 uint64_t RuntimeCuckooLookupBatchFixed(
     const void *raw_state, ConstBytes keys, size_t key_stride,
     std::span<Result> results) noexcept {
   auto *state =
       static_cast<const RuntimeCuckooState<StorageBytes, Result> *>(raw_state);
   promise(state->logical_key_size == LogicalBytes);
-  return RuntimeCuckooLookupBatchPrehashedImpl<StorageBytes, Result>(
+  return RuntimeCuckooLookupBatchPrehashedImpl<kStaged, StorageBytes, Result>(
       raw_state, keys, key_stride, results, LogicalBytes,
       RuntimeCuckooFixedProbeHash<LogicalBytes>{},
       RuntimeCuckooFixedProbeEqual<StorageBytes, LogicalBytes>{});
 }
 
-template <size_t StorageBytes, typename Result>
+template <size_t StorageBytes, typename Result, bool kStaged = true>
 uint64_t RuntimeCuckooLookupBatchVariable(
     const void *raw_state, ConstBytes keys, size_t key_stride,
     std::span<Result> results) noexcept {
   auto *state =
       static_cast<const RuntimeCuckooState<StorageBytes, Result> *>(raw_state);
-  return RuntimeCuckooLookupBatchPrehashedImpl<StorageBytes, Result>(
+  return RuntimeCuckooLookupBatchPrehashedImpl<kStaged, StorageBytes, Result>(
       raw_state, keys, key_stride, results, state->logical_key_size,
       RuntimeCuckooProbeHash{}, RuntimeCuckooProbeEqual<StorageBytes>{});
 }
@@ -341,27 +356,39 @@ uint64_t RuntimeCuckooLookupBatch(
       raw_state, keys, key_stride, results);
 }
 
-// Bind the exact-width hash/equality kernels once at construction time.
-template <size_t StorageBytes, typename Result>
-LookupBatchFn<Result> SelectRuntimeCuckooLookup(size_t logical_key_size) {
+// Bind the exact-width hash/equality kernels and the batch body once at
+// construction time.
+template <size_t StorageBytes, typename Result, bool kStaged>
+LookupBatchFn<Result> SelectRuntimeCuckooLookupBody(size_t logical_key_size) {
   if (logical_key_size == 1) {
-    return RuntimeCuckooLookupBatchFixed<StorageBytes, 1, Result>;
+    return RuntimeCuckooLookupBatchFixed<StorageBytes, 1, Result, kStaged>;
   }
   if (logical_key_size == 2) {
-    return RuntimeCuckooLookupBatchFixed<StorageBytes, 2, Result>;
+    return RuntimeCuckooLookupBatchFixed<StorageBytes, 2, Result, kStaged>;
   }
   if (logical_key_size == 4) {
-    return RuntimeCuckooLookupBatchFixed<StorageBytes, 4, Result>;
+    return RuntimeCuckooLookupBatchFixed<StorageBytes, 4, Result, kStaged>;
   }
   if (logical_key_size == 8) {
-    return RuntimeCuckooLookupBatchFixed<StorageBytes, 8, Result>;
+    return RuntimeCuckooLookupBatchFixed<StorageBytes, 8, Result, kStaged>;
   }
   if constexpr (StorageBytes >= 16) {
     if (logical_key_size == 16) {
-      return RuntimeCuckooLookupBatchFixed<StorageBytes, 16, Result>;
+      return RuntimeCuckooLookupBatchFixed<StorageBytes, 16, Result, kStaged>;
     }
   }
-  return RuntimeCuckooLookupBatchVariable<StorageBytes, Result>;
+  return RuntimeCuckooLookupBatchVariable<StorageBytes, Result, kStaged>;
+}
+
+template <size_t StorageBytes, typename Result>
+LookupBatchFn<Result> SelectRuntimeCuckooLookup(
+    size_t logical_key_size,
+    dataplane::LookupBody body = dataplane::LookupBody::kStaged) {
+  return body == dataplane::LookupBody::kPlain
+             ? SelectRuntimeCuckooLookupBody<StorageBytes, Result, false>(
+                   logical_key_size)
+             : SelectRuntimeCuckooLookupBody<StorageBytes, Result, true>(
+                   logical_key_size);
 }
 
 template <size_t StorageBytes, typename Result>
@@ -372,7 +399,8 @@ void RuntimeCuckooDestroy(void *raw_state) noexcept {
 template <size_t StorageBytes, typename Result>
 ClassifierResult<RuntimeExactBackend<Result>> BuildCuckooBackendImpl(
     size_t logical_key_size,
-    std::span<const RuntimeExactRule<Result>> rules) {
+    std::span<const RuntimeExactRule<Result>> rules,
+    dataplane::LookupBody body) {
   auto *state = new RuntimeCuckooState<StorageBytes, Result>();
   state->logical_key_size = logical_key_size;
   const RuntimeCuckooHash<StorageBytes> hash{logical_key_size};
@@ -415,16 +443,24 @@ ClassifierResult<RuntimeExactBackend<Result>> BuildCuckooBackendImpl(
   }
 
   const size_t rule_count = state->map.Count();
+  // A cuckoo hit walks two dependent lines (bucket, then entry) and branches
+  // on which slot matched.
+  const size_t storage = state->map.MemoryBytes();
+  const dataplane::LookupBody chosen = dataplane::ResolveLookupBody(
+      body, dataplane::LookupShape{.table_bytes = storage,
+                                   .dependent_lines = 2,
+                                   .branches_on_loaded_data = true});
   RuntimeExactOps<Result> ops{
-      .lookup_batch =
-          SelectRuntimeCuckooLookup<StorageBytes, Result>(logical_key_size),
+      .lookup_batch = SelectRuntimeCuckooLookup<StorageBytes, Result>(
+          logical_key_size, chosen),
       .destroy = RuntimeCuckooDestroy<StorageBytes, Result>,
       .info = BackendInfo{
           .kind = ExactBackendKind::kCuckoo,
           .rule_count = rule_count,
           .key_size = logical_key_size,
           .result_size = sizeof(Result),
-          .storage_bytes = 0,
+          .storage_bytes = storage,
+          .lookup_body = chosen,
       },
   };
   return RuntimeExactBackend<Result>(ops, state);
@@ -434,10 +470,13 @@ ClassifierResult<RuntimeExactBackend<Result>> BuildCuckooBackendImpl(
 
 // Factory for building a populated runtime-erased CuckooMap backend adapted to an arbitrary
 // runtime key width using the 8/16/32/64/128/256 internal storage class hierarchy.
+// `body` defaults to kAuto: the lookup body is chosen from the built table's
+// footprint and the host cache geometry (dataplane/batch_tuning.h).
 template <typename Result>
 ClassifierResult<RuntimeExactBackend<Result>> BuildRuntimeCuckooBackend(
     size_t logical_key_size,
-    std::span<const RuntimeExactRule<Result>> rules) {
+    std::span<const RuntimeExactRule<Result>> rules,
+    dataplane::LookupBody body = dataplane::LookupBody::kAuto) {
   if (logical_key_size == 0) {
     return std::unexpected(ClassifierError{
         .code = ClassifierErrorCode::kEmptyKey,
@@ -445,17 +484,23 @@ ClassifierResult<RuntimeExactBackend<Result>> BuildRuntimeCuckooBackend(
     });
   }
   if (logical_key_size <= 8) {
-    return detail::BuildCuckooBackendImpl<8, Result>(logical_key_size, rules);
+    return detail::BuildCuckooBackendImpl<8, Result>(logical_key_size, rules,
+                                                     body);
   } else if (logical_key_size <= 16) {
-    return detail::BuildCuckooBackendImpl<16, Result>(logical_key_size, rules);
+    return detail::BuildCuckooBackendImpl<16, Result>(logical_key_size, rules,
+                                                     body);
   } else if (logical_key_size <= 32) {
-    return detail::BuildCuckooBackendImpl<32, Result>(logical_key_size, rules);
+    return detail::BuildCuckooBackendImpl<32, Result>(logical_key_size, rules,
+                                                     body);
   } else if (logical_key_size <= 64) {
-    return detail::BuildCuckooBackendImpl<64, Result>(logical_key_size, rules);
+    return detail::BuildCuckooBackendImpl<64, Result>(logical_key_size, rules,
+                                                     body);
   } else if (logical_key_size <= 128) {
-    return detail::BuildCuckooBackendImpl<128, Result>(logical_key_size, rules);
+    return detail::BuildCuckooBackendImpl<128, Result>(logical_key_size, rules,
+                                                     body);
   } else if (logical_key_size <= 256) {
-    return detail::BuildCuckooBackendImpl<256, Result>(logical_key_size, rules);
+    return detail::BuildCuckooBackendImpl<256, Result>(logical_key_size, rules,
+                                                     body);
   }
   return std::unexpected(ClassifierError{
       .code = ClassifierErrorCode::kInvalidPlan,

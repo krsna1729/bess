@@ -275,8 +275,11 @@ egress, neighbor state and L2 addresses, publication ordering enforced), and
 but its evidence never reached dependent-miss tables. Stage-major batch
 execution (`dataplane::RunStages`) now drives ExactMatch's cuckoo lookup
 (-26% at 16K entries, up to -48% at 1M with 32-byte keys) and `MeterSet`;
-`rte_lpm` measured no gain and stays plain. GCC and Clang full Meson suites
-pass 89/89.
+`rte_lpm` measured no gain and stays plain. **K4.6b (entry 82)** extended the
+sweep to NAT, L2Forward and WildcardMatch, replaced the hand-chosen body with a
+cache-geometry-aware selector (`ResolveLookupBody`), and fixed two L2Forward
+table bugs (a 2017 slot-stride bug left 75% of entries in full 4-way tables
+unreachable). GCC and Clang full Meson suites pass 91/91.
 
 The active software scope K1-K7 is closed. Meson/Ninja remains the build graph,
 with pinned DPDK 25.11.3. The registered Meson suite has 80 targets. At the
@@ -3387,6 +3390,17 @@ rather than one call site).
     uses the helper with no regression. `rte_lpm` gets no prefetch (measured
     no win). Details in the K4.6 section.
 
+82. **K4.6b** — **cross-structure sweep, table-aware body selector, and two
+    L2Forward bugs.** Added `dataplane/batch_tuning.{h,cc}`
+    (`CacheGeometry` from sysfs per CPU, `LookupShape`, `ResolveLookupBody`),
+    `RunBatch`, `modules/l2_table.h` (L2Forward's table moved out for
+    testing), `modules_l2_table_test`, `modules_table_scale_bench`. The cuckoo
+    backend (ExactMatch, WildcardMatch tuples) now chooses its body at build;
+    L2Forward at Init; NAT per batch. Measured beyond L3: L2Forward -41%, NAT
+    -30..-34%, WildcardMatch -26..-40%; L1d-resident tables stay plain. Fixed
+    L2Forward's 2017 `alignas(32)` slot-stride bug (75% of entries unreachable
+    in full 4-way tables) and a cuckoo-move slot bug. Details in K4.6b.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -6436,6 +6450,85 @@ legacy `utils/ExactMatchTable`/`CuckooMap` users (NAT, L2Forward).
 
 ---
 
+#### K4.6b — the rule across structures, a table-aware selector, and an L2Forward fix (2026-09-25, entry 82)
+
+The K4.6 question "does stage-major batching pay?" was extended to every
+table-backed module on the packet path (`modules_table_scale_bench`,
+`omarchy-benchmark --cpu 2 --isolate`, medians of 3, 4M-key random-hit
+streams, ns per 32-key batch; plain -> staged):
+
+| structure | 4K entries | 64K | 1M | 4M |
+|---|---:|---:|---:|---:|
+| L2Forward MAC table (inline 4-way buckets) | 371 -> 355 | 452 -> 380 | 921 -> 538 | 1138 -> 671 |
+| NAT flow table (`CuckooMap<Endpoint, NatEntry>`) | 400 -> 339 | 506 -> 405 | 1587 -> 1055 | 1785 -> 1255 |
+| WildcardMatch, 1 tuple | 685 -> 631 | 952 -> 819 | 3202 -> 2351 | |
+| WildcardMatch, 4 tuples | 2098 -> 2078 | 2609 -> 2420 | 9182 -> 5553 | |
+| WildcardMatch, 8 tuples | 3545 -> 3590 | 4383 -> 4247 | 16657 -> 12001 | |
+
+(WildcardMatch rows rebuild their fixture per row, and the 8-tuple/64K and
+4-tuple/1M rows varied up to ±25% between runs; the plain/staged ordering held.)
+
+**The discriminator is not "dependent lines".** L2Forward touches one line
+per lookup, like `rte_lpm`, yet gains 33% beyond L3. The difference is control
+flow: L2Forward's probe branches on the loaded bucket (hit? which slot?
+primary or alternate?), and a mispredicted data-dependent branch squashes the
+speculative loads of the following keys, so the core stops overlapping them.
+`rte_lpm`'s loop has no such branch, and staging never helped it. The rule
+that fits every measured point (cuckoo, NAT, L2Forward, WildcardMatch tuples,
+meters, LPM):
+
+```text
+staged  iff  table_bytes > L1d  and  (dependent_lines >= 2 or branches_on_loaded_data)
+```
+
+L1d-resident tables never gained (cuckoo 256 entries -1%; 512-1K-entry
+WildcardMatch tuples +3..+5%).
+
+**Selector (`dataplane/batch_tuning.{h,cc}`):**
+
+- `CacheGeometry::ForCpu(cpu)` reads L1d/L2/L3 directly from sysfs, falling
+  back to `sysconf` and then defaults; no inference test is needed on Linux.
+  Hybrid CPUs differ per core type (this host: P-core L1d 48 KiB / L2
+  1.25 MiB; `sysconf` reports 32 KiB / 2 MiB), so `Smallest()` -- the
+  element-wise minimum over online CPUs -- is the default when the CPUs that
+  will run a table are not yet known.
+- `ResolveLookupBody(kAuto, LookupShape{table_bytes, dependent_lines,
+  branches_on_loaded_data})` applies the rule; `BESS_LOOKUP_BODY=plain|staged`
+  forces a body for experiments (read once).
+- `dataplane::RunBatch(body, n, stages...)`: authors write their stages once;
+  `kStaged` runs them stage-major, `kPlain` element-major (the ordinary loop).
+  One branch per batch, both bodies inlined.
+- Where it is decided: the cuckoo backend at generation build (ExactMatch,
+  and each WildcardMatch tuple on its own footprint; recorded in
+  `BackendInfo::lookup_body`, which now also reports real `storage_bytes`);
+  L2Forward at `Init` (fixed table size); NAT per batch from the live table
+  size (a few compares -- its table grows on the data path).
+- Validation: an `auto` row per structure picked the faster body on every
+  L2Forward and NAT row and matched the best WildcardMatch body within
+  run-to-run noise.
+
+**L2Forward bugs found by the move to a testable header
+(`modules/l2_table.h`, `modules_l2_table_test`):**
+
+1. Since upstream `919ce4bc` (2017, "Fix potential misalignment"), `l2_entry`
+   was `alignas(32)`: each 8-byte slot took 32 bytes, but the 4-way lookup
+   reads a bucket as four consecutive `uint64_t`, so slots 1-3 of every bucket
+   were unreachable. In a 1024x4 table filled to capacity, 2,849 of 3,794
+   added MACs (75%) could not be found and 356 could be added a second time.
+   Default L2Forward tables are 4-way. Fixed: 8-byte slots, table allocated
+   64-byte aligned (keeps the AVX load aligned), which also shrinks the table
+   4x.
+2. `l2_find_slot` returned slot 0 after moving an entry out of slot `i`,
+   overwriting whatever occupied slot 0 (2-way table: 84 of 1,720 entries
+   lost). Fixed to return `i`.
+
+**C++ note.** `RunStages`/`RunBatch` need only C++20 (concepts and a fold over
+lambdas). A deducing-`this` (C++23) mixin would be a nicer way for table
+types to get both bodies, but CI's Ubuntu 24.04 GCC is 13, which lacks it
+(GCC 14+). C++23 features that remain candidates without a CI change:
+`[[assume]]` in place of `promise()`, `std::views::chunk` for the >32-key
+chunking, `std::mdspan` for the `(keys, stride)` batch pairs.
+
 ### K5 — generic software metering — COMPLETE
 
 **Status: complete (2026-09-25, entry 78).** Software metering is a BESS
@@ -8186,13 +8279,14 @@ Every hardware acceleration must retain a software fallback with identical BESS 
 
 ### 30. Current handoff
 
-K5 (`990f6726`, entry 78), K6 (`ce6241bf`, entry 79), K7 (`9535d5e3`, entry 80) and
-K4.6 (entry 81) landed on `develop` on 2026-09-25 on top of the
-maintenance-only baseline `6959bd27`. GCC and Clang full local Meson suites
-pass 89/89 (80 pre-K5 targets plus `meter_meter_test`, `meter_meter_set_test`,
-`meter_bench`, `stats_stats_test`, `stats_bench`, `route_route_test`,
-`route_bench`, `dataplane_batch_stages_test`,
-`classifier_cuckoo_scale_bench`).
+K5 (`990f6726`, entry 78), K6 (`ce6241bf`, entry 79), K7 (`9535d5e3`, entry
+80), K4.6 (`173e93e8`, entry 81) and K4.6b (entry 82) landed on `develop` on
+2026-09-25 on top of the maintenance-only baseline `6959bd27`. GCC and Clang
+full local Meson suites pass 91/91 (80 pre-K5 targets plus
+`meter_meter_test`, `meter_meter_set_test`, `meter_bench`, `stats_stats_test`,
+`stats_bench`, `route_route_test`, `route_bench`,
+`dataplane_batch_stages_test`, `classifier_cuckoo_scale_bench`,
+`modules_l2_table_test`, `modules_table_scale_bench`).
 
 Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K7.
 Partial: F, H, and I. Not started: D, G1, and K8 (consumer-driven).

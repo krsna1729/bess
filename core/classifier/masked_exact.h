@@ -173,9 +173,12 @@ class RuntimeMaskedBackend {
   // Rejects an empty key size, a key size above `kMaskedMaxKeyBytes`, a rule
   // whose value/mask lengths disagree with the key size, and a rule violating
   // `value & ~mask == 0`.
+  // `body` is passed to every tuple's cuckoo backend; with kAuto each tuple
+  // chooses from its own footprint (dataplane/batch_tuning.h).
   static ClassifierResult<RuntimeMaskedBackend> Build(
       size_t key_size,
-      std::span<const RuntimeMaskedRule<Result, Priority>> rules) {
+      std::span<const RuntimeMaskedRule<Result, Priority>> rules,
+      dataplane::LookupBody body = dataplane::LookupBody::kAuto) {
     if (key_size == 0) {
       return std::unexpected(ClassifierError{
           .code = ClassifierErrorCode::kEmptyKey,
@@ -277,7 +280,7 @@ class RuntimeMaskedBackend {
       }
 
       auto built =
-          BuildRuntimeCuckooBackend<candidate_id>(key_size, exact_rules);
+          BuildRuntimeCuckooBackend<candidate_id>(key_size, exact_rules, body);
       if (!built) {
         return std::unexpected(std::move(built.error()));
       }

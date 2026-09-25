@@ -257,7 +257,10 @@ TEST(CuckooExactBackend, BuildRuntimeCuckooBackendPopulatesAndDispatches) {
   ASSERT_TRUE(backend);
   EXPECT_EQ(2u, backend.info().rule_count);
   EXPECT_EQ(4u, backend.info().key_size);
-  EXPECT_EQ(0u, backend.info().storage_bytes);  // storage_bytes truthful / not misleading
+  // Real bucket + entry storage since K4.6, and a table that small (well
+  // inside L1d) gets the plain batch body.
+  EXPECT_GT(backend.info().storage_bytes, 0u);
+  EXPECT_EQ(bess::dataplane::LookupBody::kPlain, backend.info().lookup_body);  // storage_bytes truthful / not misleading
 
   // Packed keys input: k1, miss, k2 (stride = 4)
   std::array<Byte, 3 * 4> packed_keys{};

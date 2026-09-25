@@ -33,6 +33,8 @@
 #include <concepts>
 #include <cstddef>
 
+#include "dataplane/batch_tuning.h"
+
 namespace bess::dataplane {
 
 // Stage-major batch execution: the VPP-style "prefetch the whole batch, then
@@ -49,15 +51,16 @@ namespace bess::dataplane {
 // Nothing else happens: no allocation, no type erasure, no indirect call --
 // each stage is inlined into its own loop.
 //
-// When it pays (measured, MODERNIZATION.md "K4.6"): structures where each
-// lookup is a chain of *dependent* misses -- a hash bucket, then the entry it
-// points to (ExactMatch's cuckoo table: 20-46% per batch, growing with key
-// size and table size), a meter id, then the meter's state (K5: ~3x beyond
-// L3). When it does not: a lookup that is one independent load per element
-// (rte_lpm's tbl24): the out-of-order core already overlaps those, and an
-// extra pass only costs (K7). So this is a tool, not a policy: nothing in BESS
-// requires it, and a plain loop remains the right default until a benchmark
-// says otherwise.
+// When it pays (measured, MODERNIZATION.md "K4.6"): tables bigger than L1d
+// whose lookups either walk dependent lines (a cuckoo bucket, then its entry;
+// a meter id, then its state) or branch on the loaded data (which slot, which
+// bucket, hit or miss) -- a mispredicted data-dependent branch squashes the
+// speculative loads of the keys after it, so the core stops overlapping them
+// on its own. Measured: ExactMatch and NAT cuckoo tables -18..-48%, L2Forward
+// -18..-33%, WildcardMatch tuples up to -49%, meters ~3x beyond L3. When it
+// does not: one independent, branch-free load per element (rte_lpm's tbl24),
+// which the out-of-order core already overlaps (K7). ResolveLookupBody()
+// encodes exactly that rule; nothing in BESS requires staging.
 template <typename... Stages>
   requires(std::invocable<Stages &, size_t> && ...)
 inline void RunStages(size_t n, Stages &&...stages) {
@@ -68,6 +71,25 @@ inline void RunStages(size_t n, Stages &&...stages) {
         }
       }(),
       ...);
+}
+
+// The same stages, with the batch body chosen at run time: kStaged runs them
+// stage-major (RunStages); kPlain runs them element-major -- every stage for
+// element 0, then element 1, ... -- which is the ordinary loop (a prefetch
+// stage then touches a line the next stage uses immediately, at no real
+// cost). Authors write the stages once; which body a table uses is decided
+// at init by ResolveLookupBody() (batch_tuning.h) from its size and the host
+// caches. One branch per batch; both bodies are fully inlined.
+template <typename... Stages>
+  requires(std::invocable<Stages &, size_t> && ...)
+inline void RunBatch(LookupBody body, size_t n, Stages &&...stages) {
+  if (body == LookupBody::kStaged) {
+    RunStages(n, stages...);
+    return;
+  }
+  for (size_t i = 0; i < n; i++) {
+    (stages(i), ...);
+  }
 }
 
 // A typed prefetch hint. Intent matters on some CPUs (a write prefetch asks

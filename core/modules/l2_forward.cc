@@ -30,335 +30,12 @@
 
 #include "l2_forward.h"
 
+#include "../dataplane/batch_stages.h"
+
 #include <rte_hash_crc.h>
 
 #include "../utils/endian.h"
 #include "../utils/simd.h"
-
-#define MAX_TABLE_SIZE (1048576 * 64)
-#define DEFAULT_TABLE_SIZE 1024
-#define MAX_BUCKET_SIZE 4
-
-typedef uint64_t mac_addr_t;
-
-static int is_power_of_2(uint64_t n) {
-  return (n != 0 && ((n & (n - 1)) == 0));
-}
-
-/*
- * l2_init:
- *  Initilizes the l2_table.
- *  It creates the slots of MAX_TABLE_SIZE multiplied by MAX_BUCKET_SIZE.
- *
- * @l2tbl: pointer to
- * @size: number of hash value entries. must be power of 2, greater than 0, and
- *        less than equal to MAX_TABLE_SIZE (2^30)
- * @bucket: number of slots per hash value. must be power of 2, greater than 0,
- *        and less than equal to MAX_BUCKET_SIZE (4)
- */
-static int l2_init(struct l2_table *l2tbl, int size, int bucket) {
-  if (size <= 0 || size > MAX_TABLE_SIZE || !is_power_of_2(size)) {
-    return -EINVAL;
-  }
-
-  if (bucket <= 0 || bucket > MAX_BUCKET_SIZE || !is_power_of_2(bucket)) {
-    return -EINVAL;
-  }
-
-  if (l2tbl == nullptr) {
-    return -EINVAL;
-  }
-
-  l2tbl->table = new(std::nothrow) l2_entry[size * bucket]{};
-
-  if (l2tbl->table == nullptr) {
-    return -ENOMEM;
-  }
-
-  l2tbl->size = size;
-  l2tbl->bucket = bucket;
-
-  /* calculates the log_2 (size) */
-  l2tbl->size_power = 0;
-  while (size > 1) {
-    size = size >> 1;
-    l2tbl->size_power += 1;
-  }
-
-  return 0;
-}
-
-static int l2_deinit(struct l2_table *l2tbl) {
-  if (l2tbl == nullptr || l2tbl->table == nullptr || l2tbl->size == 0 ||
-      l2tbl->bucket == 0) {
-    return -EINVAL;
-  }
-
-  delete[] l2tbl->table;
-  *l2tbl = {};
-  return 0;
-}
-
-static uint32_t l2_ib_to_offset(struct l2_table *l2tbl, int index, int bucket) {
-  return index * l2tbl->bucket + bucket;
-}
-
-static uint32_t l2_hash(mac_addr_t addr) {
-  return rte_hash_crc_8byte(addr, 0);
-}
-
-static uint32_t l2_hash_to_index(uint32_t hash, uint32_t size) {
-  return hash & (size - 1);
-}
-
-static uint32_t l2_alt_index(uint32_t hash, uint32_t size_power,
-                             uint32_t index) {
-  uint64_t tag = (hash >> size_power) + 1;
-  tag = tag * 0x5bd1e995;
-  return (index ^ tag) & ((0x1lu << (size_power - 1)) - 1);
-}
-
-#if __AVX__
-const union {
-  uint64_t val[4];
-  __m256d _mask;
-} _mask = {.val = {0x8000ffffFFFFffffull, 0x8000ffffFFFFffffull,
-                   0x8000ffffFFFFffffull, 0x8000ffffFFFFffffull}};
-
-// Do not call these functions directly. Use find_index() instead. See below.
-static inline int find_index_avx(uint64_t addr, uint64_t *table) {
-  DCHECK(reinterpret_cast<uintptr_t>(table) % 32 == 0);
-  __m256d _addr = (__m256d)_mm256_set1_epi64x(addr | (1ull << 63));
-  __m256d _table = _mm256_load_pd((double *)table);
-  _table = _mm256_and_pd(_table, _mask._mask);
-  __m256d cmp = _mm256_cmp_pd(_addr, _table, _CMP_EQ_OQ);
-
-  return __builtin_ffs(_mm256_movemask_pd(cmp));
-}
-#else
-static inline int find_index_basic(uint64_t addr, uint64_t *table) {
-  for (int i = 0; i < 4; i++) {
-    if ((addr | (1ull << 63)) == (table[i] & 0x8000ffffFFFFffffull)) {
-      return i + 1;
-    }
-  }
-
-  return 0;
-}
-#endif
-
-// Finds addr from a 4-way bucket *table and returns its index + 1.
-// Returns zero if not found.
-static inline int find_index(uint64_t addr, uint64_t *table, const uint64_t) {
-#if __AVX__
-  return find_index_avx(addr, table);
-#else
-  return find_index_basic(addr, table);
-#endif
-}
-
-static inline int l2_find(struct l2_table *l2tbl, uint64_t addr,
-                          gate_idx_t *gate) {
-  size_t i;
-  int ret = -ENOENT;
-  uint32_t hash, idx1, offset;
-  struct l2_entry *tbl = l2tbl->table;
-
-  hash = l2_hash(addr);
-  idx1 = l2_hash_to_index(hash, l2tbl->size);
-
-  offset = l2_ib_to_offset(l2tbl, idx1, 0);
-
-  if (l2tbl->bucket == 4) {
-    int tmp1 = find_index(addr, &tbl[offset].entry, l2tbl->count);
-    if (tmp1) {
-      *gate = tbl[offset + tmp1 - 1].gate;
-      return 0;
-    }
-
-    idx1 = l2_alt_index(hash, l2tbl->size_power, idx1);
-    offset = l2_ib_to_offset(l2tbl, idx1, 0);
-
-    int tmp2 = find_index(addr, &tbl[offset].entry, l2tbl->count);
-
-    if (tmp2) {
-      *gate = tbl[offset + tmp2 - 1].gate;
-      return 0;
-    }
-
-  } else {
-    /* search buckets for first index */
-    for (i = 0; i < l2tbl->bucket; i++) {
-      if (tbl[offset].occupied && addr == tbl[offset].addr) {
-        *gate = tbl[offset].gate;
-        return 0;
-      }
-
-      offset++;
-    }
-
-    idx1 = l2_alt_index(hash, l2tbl->size_power, idx1);
-    offset = l2_ib_to_offset(l2tbl, idx1, 0);
-    /* search buckets for alternate index */
-    for (i = 0; i < l2tbl->bucket; i++) {
-      if (tbl[offset].occupied && addr == tbl[offset].addr) {
-        *gate = tbl[offset].gate;
-        return 0;
-      }
-
-      offset++;
-    }
-  }
-
-  return ret;
-}
-
-static int l2_find_offset(struct l2_table *l2tbl, uint64_t addr,
-                          uint32_t *offset_out) {
-  size_t i;
-  uint32_t hash, idx1, offset;
-  struct l2_entry *tbl = l2tbl->table;
-
-  hash = l2_hash(addr);
-  idx1 = l2_hash_to_index(hash, l2tbl->size);
-
-  offset = l2_ib_to_offset(l2tbl, idx1, 0);
-  /* search buckets for first index */
-  for (i = 0; i < l2tbl->bucket; i++) {
-    if (tbl[offset].occupied && addr == tbl[offset].addr) {
-      *offset_out = offset;
-      return 0;
-    }
-
-    offset++;
-  }
-
-  idx1 = l2_alt_index(hash, l2tbl->size_power, idx1);
-  offset = l2_ib_to_offset(l2tbl, idx1, 0);
-  /* search buckets for alternate index */
-  for (i = 0; i < l2tbl->bucket; i++) {
-    if (tbl[offset].occupied && addr == tbl[offset].addr) {
-      *offset_out = offset;
-      return 0;
-    }
-
-    offset++;
-  }
-
-  return -ENOENT;
-}
-
-static int l2_find_slot(struct l2_table *l2tbl, mac_addr_t addr, uint32_t *idx,
-                        uint32_t *bucket) {
-  size_t i, j;
-  uint32_t hash;
-  uint32_t idx1, idx_v1, idx_v2;
-  uint32_t offset1, offset2;
-  struct l2_entry *tbl = l2tbl->table;
-
-  hash = l2_hash(addr);
-  idx1 = l2_hash_to_index(hash, l2tbl->size);
-
-  /* if there is available slot */
-  for (i = 0; i < l2tbl->bucket; i++) {
-    offset1 = l2_ib_to_offset(l2tbl, idx1, i);
-    if (!tbl[offset1].occupied) {
-      *idx = idx1;
-      *bucket = i;
-      return 0;
-    }
-  }
-
-  offset1 = l2_ib_to_offset(l2tbl, idx1, 0);
-
-  /* try moving */
-  for (i = 0; i < l2tbl->bucket; i++) {
-    offset1 = l2_ib_to_offset(l2tbl, idx1, i);
-    hash = l2_hash(tbl[offset1].addr);
-    idx_v1 = l2_hash_to_index(hash, l2tbl->size);
-    idx_v2 = l2_alt_index(hash, l2tbl->size_power, idx_v1);
-
-    /* if the alternate bucket is same as original skip it */
-    if (idx_v1 == idx_v2 || idx1 == idx_v2)
-      break;
-
-    for (j = 0; j < l2tbl->bucket; j++) {
-      offset2 = l2_ib_to_offset(l2tbl, idx_v2, j);
-      if (!tbl[offset2].occupied) {
-        /* move offset1 to offset2 */
-        tbl[offset2] = tbl[offset1];
-        /* clear offset1 */
-        tbl[offset1].occupied = 0;
-
-        *idx = idx1;
-        *bucket = 0;
-        return 0;
-      }
-    }
-  }
-
-  /* TODO:if alternate index is also full then start move */
-  return -ENOMEM;
-}
-
-static int l2_add_entry(struct l2_table *l2tbl, mac_addr_t addr,
-                        gate_idx_t gate) {
-  uint32_t offset;
-  uint32_t index;
-  uint32_t bucket;
-  gate_idx_t gate_idx_tmp;
-
-  /* if addr already exist then fail */
-  if (l2_find(l2tbl, addr, &gate_idx_tmp) == 0) {
-    return -EEXIST;
-  }
-
-  /* find slots to put entry */
-  if (l2_find_slot(l2tbl, addr, &index, &bucket) != 0) {
-    return -ENOMEM;
-  }
-
-  /* insert entry into empty slot */
-  offset = l2_ib_to_offset(l2tbl, index, bucket);
-
-  l2tbl->table[offset].addr = addr;
-  l2tbl->table[offset].gate = gate;
-  l2tbl->table[offset].occupied = 1;
-  l2tbl->count++;
-  return 0;
-}
-
-static int l2_del_entry(struct l2_table *l2tbl, uint64_t addr) {
-  uint32_t offset = 0xFFFFFFFF;
-
-  if (l2_find_offset(l2tbl, addr, &offset)) {
-    return -ENOENT;
-  }
-
-  l2tbl->table[offset].addr = 0;
-  l2tbl->table[offset].gate = 0;
-  l2tbl->table[offset].occupied = 0;
-  l2tbl->count--;
-  return 0;
-}
-
-static int l2_flush(struct l2_table *l2tbl) {
-  if (nullptr == l2tbl || nullptr == l2tbl->table) {
-    return -EINVAL;
-  }
-
-  memset(l2tbl->table, 0,
-         sizeof(struct l2_entry) * l2tbl->size * l2tbl->bucket);
-
-  return 0;
-}
-
-static uint64_t l2_addr_to_u64(char *addr) {
-  uint64_t a = *(reinterpret_cast<uint32_t *>(addr));
-  uint64_t b = *(reinterpret_cast<uint16_t *>(addr + 4));
-
-  return a | (b << 32);
-}
 
 /******************************************************************************/
 // TODO(barath): Move this test code elsewhere.
@@ -577,6 +254,14 @@ CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
                           size, bucket);
   }
 
+  // The table's size is fixed here, so the batch body is too (K4.6): a probe
+  // branches on the loaded bucket (hit? primary or alternate?).
+  lookup_body_ = bess::dataplane::ResolveLookupBody(
+      bess::dataplane::LookupBody::kAuto,
+      {.table_bytes = l2_table_bytes(&l2_table_),
+       .dependent_lines = 1,
+       .branches_on_loaded_data = true});
+
   return CommandSuccess();
 }
 
@@ -587,22 +272,20 @@ void L2Forward::DeInit() {
 void L2Forward::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   gate_idx_t default_gate = ACCESS_ONCE(default_gate_);
 
-  int cnt = batch->cnt();
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef snb = batch->packet(i);
-
-    gate_idx_t out_gate;
-    // read destination MAC address (first 6 bytes)
-    // NOTE: assumes little endian
-    int ret = l2_find(&l2_table_,
-                      *(snb.head_data<uint64_t *>()) & 0x0000ffffffffffff,
-                      &out_gate);
-    if (ret != 0) {
-      EmitPacket(ctx, snb, default_gate);
-    } else {
-      EmitPacket(ctx, snb, out_gate);
-    }
-  }
+  const size_t cnt = batch->cnt();
+  uint64_t dst[bess::PacketBatch::kMaxBurst];
+  bess::dataplane::RunBatch(
+      lookup_body_, cnt,
+      [&](size_t i) {
+        // destination MAC (first 6 bytes); assumes little endian
+        dst[i] = *(batch->packet(i).head_data<uint64_t *>()) & 0x0000ffffffffffff;
+        l2_prefetch(&l2_table_, dst[i]);
+      },
+      [&](size_t i) {
+        gate_idx_t out_gate;
+        const int ret = l2_find(&l2_table_, dst[i], &out_gate);
+        EmitPacket(ctx, batch->packet(i), ret != 0 ? default_gate : out_gate);
+      });
 }
 
 CommandResponse L2Forward::CommandAdd(

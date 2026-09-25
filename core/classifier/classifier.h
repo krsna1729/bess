@@ -39,6 +39,7 @@
 #include <type_traits>
 
 #include "dataplane/action_id.h"
+#include "dataplane/batch_tuning.h"
 #include "dataplane/strong_id.h"
 
 namespace bess::classifier {
@@ -111,6 +112,8 @@ struct BackendInfo {
   size_t key_size = 0;
   size_t result_size = 0;
   size_t storage_bytes = 0;
+  // The batch-lookup body chosen at build (K4.6); kAuto when not applicable.
+  dataplane::LookupBody lookup_body = dataplane::LookupBody::kAuto;
 };
 
 // Masked/ternary classification is a different problem shape from exact

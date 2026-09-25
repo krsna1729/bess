@@ -344,6 +344,11 @@ class CuckooMap {
   // Return the number of stored entries
   size_t Count() const { return num_entries_; }
 
+  // Bytes of bucket and entry storage: what a lookup's misses spread over.
+  size_t MemoryBytes() const {
+    return buckets_.size() * sizeof(Bucket) + entries_.size() * sizeof(Entry);
+  }
+
  protected:
   // Tunable macros
   static const int kInitNumBucket = 4;

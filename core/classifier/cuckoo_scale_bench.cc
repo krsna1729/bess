@@ -144,7 +144,7 @@ void BM_CuckooBatch(benchmark::State &st) {
     if (body == 3) {
       std::array<Value<ValueBytes>, kBatch> out;
       hits = detail::RuntimeCuckooLookupBatchFixed<KeyBytes, KeyBytes,
-                                                   Value<ValueBytes>>(
+                                                   Value<ValueBytes>, true>(
           &f.state,
           bess::classifier::ConstBytes(keys[0].data(), kBatch * KeyBytes),
           KeyBytes, std::span(out));
