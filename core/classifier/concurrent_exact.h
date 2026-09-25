@@ -51,11 +51,11 @@ namespace bess::classifier {
 // after the runtime RcuDomain's QSBR grace period (rte_hash_rcu_qsbr_add,
 // defer-queue mode), the same wiring K7 uses for rte_lpm.
 //
-// Why not the K3 generation swap: that rebuilt the whole table per insert
-// (ExactMatch: 7.9 ms at 100K rules). Here an insert or delete is one
-// rte_hash operation (52-270 ns from 1K to 10M entries, G1.2a E1), and the
-// lookup is as fast or faster (hits equal or better, misses 30-35% faster
-// from 1M up on P-cores).
+// Why not a generation swap: that rebuilds the whole table per insert
+// (ExactMatch: 47 ms per add at 100K rules). Here an insert or delete is one
+// rte_hash operation, flat in table size. Lookup cost, the rte_hash modes
+// chosen, and the DPDK behaviours this relies on (each pinned by a test) are
+// in docs/dataplane-tables.md; Decisions D-001, D-002 (docs/decisions.md).
 //
 // Values are up to eight bytes, stored in rte_hash's data pointer. Writers
 // must be serialized by the caller (a module's command path is). Capacity is

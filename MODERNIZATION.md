@@ -3683,6 +3683,23 @@ rather than one call site).
       - Also passing: `exact_match_migration_test` 8/8, the live-daemon
         `exact_match.py` 7/7 and all 22 module-test files, and the full
         suite on GCC 14 and Clang (97/97 each).
+92. **Table docs and DPDK contract tests.** `docs/dataplane-tables.md` is
+    now the source of truth for table choices. It covers the structures
+    module authors can use, the update modes, the table and update mode of
+    each built-in module, and the decisions with their measurements. It
+    also lists the DPDK behaviours we rely on, each pinned by a CI test.
+    It does not depend on this file.
+    - New deterministic test: `RouteTableTest.FreedTbl8GroupWaitsForOnlineReaders`.
+      A one-group tbl8 pool shows a freed group is not reused while a
+      reader is online, and is reclaimed after quiescence. Without
+      `rte_lpm_rcu_qsbr_add` it fails 3/3.
+    - Added the `rte_hash` update-in-place slot check.
+    - Policy: behaviour we depend on from DPDK (an API or ABI guarantee) is
+      written as a regular deterministic test in CI. Mutation checks are a
+      one-time validation at authoring time, not kept as artifacts.
+    - Found while writing the doc (not fixed): DRR allows several workers
+      but writes its flow `CuckooMap` from `ProcessBatch` without
+      synchronization.
 
 ## Review process established this session
 
@@ -8910,10 +8927,30 @@ make it O(1) first, with three update modes covering all modules: C (DPDK
 lock-free `rte_hash`/`rte_lpm` + runtime QSBR, direct insert), W
 (per-worker op rings applied at the scheduler-round boundary, for replicas and
 shards), and G (generation swap for bulk and tiny tables). Then G1.3 capabilities, G1.4 stats, and
-the Go/C++ SDKs. The OMEC UPF program (section 28) is the driving consumer.
+the Go/C++ SDKs.
+
+- The OMEC UPF program (section 28) is the strongest consumer, but not the
+  driver ([docs/decisions.md](docs/decisions.md) D-008). A core feature
+  needs at least two non-UPF consumers, and the network-function catalogue
+  (section 29) supplies them.
+- G1.2a progress:
+  - ExactMatch is on mode C (entry 91, D-001);
+  - DPDK behaviours are pinned by deterministic CI tests (entry 92, D-007).
+- Next in G1.2a:
+  1. WildcardMatch on C (a `ConcurrentExactTable` per tuple);
+  2. L2Forward, ACL and HashLB off the global pause;
+  3. the mode W infrastructure.
+- Before G1.2b, study prior art for multi-table atomicity and record what
+  we borrow as decisions: DPDK `rte_swx` table staging with commit/abort,
+  P4Runtime write atomicity (continue-on-error, rollback-on-error,
+  dataplane-atomic), and VPP's bihash and binary API.
 
 ### Following stages
 
+0. **Phase N — network-function catalogue and service pipelines
+   (section 29):** reference NFs that exercise every framework choice, plus
+   the generic mechanisms they expose. They are interleaved with G1.2, and
+   each stage's migrated modules and new NFs serve as its test consumers.
 1. **Phase L — batch runtime (parallel performance track; section 27):**
    L1 measurability first, then bulk output partitioning, cross-worker
    handoff, and a measured batch-size study.
@@ -8928,6 +8965,17 @@ the Go/C++ SDKs. The OMEC UPF program (section 28) is the driving consumer.
   static-analysis lanes, and a metrics exporter over K6 snapshots.
 - **H/I (partial):** continue toolchain hardening and stronger types alongside
   concrete K/G1 APIs, rather than as a broad standalone refactor.
+- **Decision benchmarks (agreed 2026-09-25, not started):** a manifest
+  (`bench/decisions.json`) and `tools/decision_bench.py`.
+  - Each entry names the `docs/decisions.md` id and the code it justifies,
+    the benchmark binary and filter, a baseline recording the machine it ran
+    on (CPU model, DPDK, compiler), and the comparison that says the
+    decision still holds.
+  - The runner takes a list of CPUs to pin to and a wrapper command
+    (default `taskset`), with nothing machine-specific. It prints current vs
+    recorded and flags any decision that flipped.
+  - Run by hand on a DPDK pin change, a compiler bump, or new hardware.
+    Correctness gates (`fib_bench` with `BESS_FIB_GATE=1`) may run in CI.
 - **C-HW (deferred):** real-NIC, offload, RSS, zero-copy, and hardware-meter
   validation remain a separate lab program and do not block software work.
 
@@ -9090,6 +9138,135 @@ substrate (static G0 graph, typed `ActionId` classifier, aggregate
 `UpfGeneration`) -> M2, K3.8 ranges -> M3, K5/K6/K7 (done here) plus K7.1
 domains -> M4, G1.2 generic transactions and the Go SDK -> M5, NIC lab
 (C-HW H1, then H2) -> M6, external plugin packaging.
+
+## 29. Phase N — network-function catalogue and service pipelines (2026-09-25)
+
+Recorded at the user's request, so this does not slip.
+
+### 29.1 Why
+
+The built-in modules mostly demonstrate one mechanism each: ExactMatch shows
+exact match, WildcardMatch shows ternary match. Nothing shows a complete
+network function built from the framework, and basic L2/L3 services are
+missing. That leaves three problems:
+
+1. Nobody can see what composing a real dataplane from BESS looks like.
+2. There is no proof that the framework's choices (tables, update modes,
+   transactions, counters, meters) serve more than one use case.
+3. UPF would be the only real consumer, which is the over-fitting risk D-008
+   warns against.
+
+Phase N adds reference NFs, reusable NF building blocks, and service
+pipelines that compose them. UPF can later reuse the same services as
+value-add features: a firewall, CGNAT, rate limiting, mirroring.
+
+### 29.2 What exists today
+
+- **L2:** L2Forward (a static MAC table: no learning, no aging, no flooding
+  domains), VLAN push/pop/split, ArpResponder (static entries).
+- **L3:** IPLookup (LPM only), UpdateTTL, IPChecksum. `core/route/Router`
+  (next hops, L2 rewrite) exists, but no module uses it.
+- **L4 and state:** NAT (basic, one worker), StaticNAT, ACL (a linear scan),
+  HashLB (a hash over fields), URLFilter, BPF.
+- **Tunnels:** VXLAN encap/decap, generic encap/decap, MPLS pop.
+- **Queueing:** Queue, DRR. DRR allows several workers, yet writes its flow
+  map from `ProcessBatch` without synchronization (entry 92); this is an
+  open issue.
+
+### 29.3 Missing basics (L2/L3)
+
+- **N1. Learning bridge.**
+  - MAC learning with aging;
+  - bridge domains and per-VLAN learning;
+  - flooding of unknown unicast and broadcast (Replicate);
+  - static entries;
+  - learning is rate-limited against MAC floods.
+- **N2. IPv4 router pipeline**, built on `Router`:
+  - input checks: header validity, checksum, TTL;
+  - TTL expiry answered with an ICMP time-exceeded;
+  - an ICMP echo responder for router addresses;
+  - local delivery / punt;
+  - LPM → next hop → L2 rewrite;
+  - neighbour resolution: an ARP request/reply state machine, a neighbour
+    cache with timers, and a bounded queue of packets pending resolution;
+  - MTU checks (fragmentation stays with K8 when needed).
+- **N3. ECMP.** Next-hop groups in `Router`: a hash over a configurable
+  5-tuple, stable (resilient) hashing when a member changes, and
+  per-member counters.
+- **N4. IPv6.** LPM6 (`rte_lpm6` or `rte_fib6`, measured and gated the same
+  way as D-003), NDP (the neighbour state machine shared with ARP), ICMPv6
+  basics.
+- **N5. VRFs / route domains** (K7.1). Several route tables, selected by a
+  metadata tag.
+- **N6. Policer and shaper modules.** A policer on `MeterSet` (per flow or
+  per class, with colour marking or dropping), and a hierarchical shaper
+  over `rte_sched`.
+- **N7. Mirroring and tapping.** Filtered copy to a port or tunnel
+  (Replicate plus a classifier), with a snap length.
+
+### 29.4 Reference stateful NFs
+
+Each NF is chosen to exercise specific framework mechanisms:
+
+| NF | what it exercises |
+|---|---|
+| **N8. Connection tracking + stateful firewall** | TCP/UDP/ICMP state machine; per-worker flow shards with RSS affinity (worker-owned or mode W); policy as a WildcardMatch table (C once migrated); per-rule counters (K6); flow aging by timers |
+| **N9. CGNAT** | port-block allocation from the control plane (C tables); endpoint-independent mapping and filtering; per-worker session shards; session-create/delete logging events to control; per-subscriber limits; hairpinning |
+| **N10. L4 load balancer** | a VIP table (C); Maglev consistent hashing, where the lookup table is rebuilt as a generation when backends change (G is right here: small, and must switch atomically); connection affinity via conntrack (N8); backend health state; optional DSR |
+| **N11. IPFIX/flow export** | K6 snapshots plus flow-end events; exercises the event path and per-object counters |
+| **N12. IPsec gateway** (later) | `rte_security` / `lib/ipsec`; SA tables (C) and SPD (masked); crypto devices |
+
+### 29.5 Generic framework gaps these expose
+
+These are the core candidates. Each lists its consumers, so D-008's
+two-consumer rule is visible:
+
+| gap | consumers |
+|---|---|
+| **Dataplane → control event path.** A bounded per-worker ring of typed events (learned MAC, neighbour miss, new NAT session, quota reached, flow end) drained by the control thread and delivered to subscribers via the v2 API | N1, N2, N9, N11, UPF usage reporting and idle-UE downlink notification |
+| **Per-worker timers / aging.** A timer wheel run between scheduler rounds, with bounded work per round | N1, N2, N8, N9, UPF inactivity timers |
+| **Flow affinity.** RSS/steering configuration, and worker-owned sharded flow tables with a documented rule for which worker owns a flow (this is mode W) | N8, N9, N10, UPF sessions |
+| **Per-object counters at large scale.** Counters indexed by object id (millions of flows or sessions), worker-local, snapshotted per object or in ranges | N8, N9, N10, N11, UPF usage reporting |
+| **Exception path to the kernel.** TAP or virtio-user punt/inject for control protocols (ARP/ND, routing daemons, BFD) | N2, N4, UPF (GTP echo, PFCP when co-located) |
+| **Multi-table transactions** (G1.2b) | N2 (route + next hop + neighbour), N10 (VIP + backends + Maglev table), N9 (pool + mapping), UPF sessions |
+| **IPv6 in the table substrate** | N4, N8, N9, N10, UPF |
+
+### 29.6 Service pipelines
+
+- **Pipeline composition:** reusable NF modules plus a classifier that
+  assigns traffic to a service chain via metadata. Each NF module reads the
+  chain tag and passes packets it is not responsible for through, the way
+  SFC/NSH does, but inside one BESS pipeline.
+- **Management:** a pipeline is described and changed as desired state
+  through the v2 API (G1.1), so adding a firewall to a chain is one
+  transaction.
+- **Reference pipelines** (examples in `bessctl/conf/` plus an end-to-end
+  benchmark each):
+  1. **Edge router / CPE:** learning bridge → IPv4 router with ECMP →
+     stateful firewall → CGNAT → policer.
+  2. **L4 load balancer:** VIP classify → conntrack → Maglev → encap or DSR.
+  3. **UPF with value-add services:** PDR classify → firewall / CGNAT / rate
+     limit / mirror chains → FAR, reusing (1)'s NFs unmodified. This one is
+     built last, per D-008.
+
+### 29.7 Order and exit criteria
+
+1. **N1 + N2 + N3 first.** They are basic services, and they are the first
+   non-UPF consumers of the event path, timers and transactions.
+2. **N8 + N9 next.** They make mode W and per-object counters concrete.
+3. **N10, N11, then the pipelines.**
+
+Exit criteria for each NF:
+
+- a module test through the live daemon;
+- a deterministic invariant test for any concurrency it adds (D-007);
+- a benchmark row;
+- an entry in `docs/dataplane-tables.md` saying which structures it uses and
+  why;
+- a D-entry for any new choice.
+
+Generic mechanisms go into core only when their consumer list has at least
+two non-UPF entries.
 
 ## 25. Known lower-priority research/backlog
 

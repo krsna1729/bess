@@ -84,7 +84,8 @@ class Ipv4Prefix {
 };
 
 // IPv4 longest-prefix match on DPDK `rte_lpm` (K7), mapping a prefix to a
-// 24-bit value. Untyped; RouteTable<Value> is the typed face.
+// 24-bit value. Untyped; RouteTable<Value> is the typed face. Decision D-003
+// (docs/decisions.md).
 //
 // DPDK owns the algorithm and the concurrency design: lookups are lock-free
 // and run while a single writer adds or deletes rules in place -- every entry

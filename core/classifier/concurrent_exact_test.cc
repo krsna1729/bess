@@ -81,6 +81,9 @@ TEST(ConcurrentExactTableTest, InsertUpdateEraseAndIterate) {
   EXPECT_EQ(R::kInserted, t->Upsert(B(K(2)), V(2)));
   EXPECT_EQ(R::kUpdated, t->Upsert(B(K(2)), V(7)));
   EXPECT_EQ(2u, t->size());
+  // DPDK contract: adding an existing key swaps its value in place (an
+  // atomic exchange readers see whole) and takes no new key slot.
+  EXPECT_EQ(2u, t->slots_in_use());
 
   uint64_t v = 0;
   EXPECT_EQ(1u, Lookup(*t, 2, &v));
@@ -124,7 +127,8 @@ TEST(ConcurrentExactTableTest, ReportsFullAndReusesErasedSlots) {
   }
 }
 
-// The QSBR contract, deterministically: a deleted key's slot is not handed
+// DPDK contract (rte_hash LF with QSBR in defer-queue mode), deterministically:
+// a deleted key's slot is not handed
 // back while a registered reader that was online before the delete has not
 // reported quiescence -- that reader may have matched the key and be about
 // to load its value (DPDK's LF lookup compares the key, then loads the

@@ -290,6 +290,37 @@ TEST(RouteTableTest, LargeArbitraryOrderMatchesReferenceThroughChurn) {
 
 // -- concurrent in-place updates ---------------------------------------------------
 
+// DPDK contract (rte_lpm with QSBR in defer-queue mode), deterministically: a
+// tbl8 group freed by a delete is not handed to another /24 while a reader
+// that was online before the delete has not reported quiescence -- that
+// reader may have loaded the old tbl24 entry and be about to read the group.
+// Once the reader is quiescent, the next add reclaims the group. The pool
+// holds one group, so the second /24's add can only succeed by reuse.
+TEST(RouteTableTest, FreedTbl8GroupWaitsForOnlineReaders) {
+  rcu::RcuDomain &domain = control::runtime().rcu();
+  auto table = MakeTable(64, /*tbl8=*/1);
+  const Ipv4Prefix a = P(Ip(10, 1, 1, 64), 26);
+  const Ipv4Prefix b = P(Ip(10, 2, 2, 64), 26);
+  ASSERT_TRUE(table->Upsert(a, Value(1)));
+  auto no_group = table->Upsert(b, Value(2));
+  ASSERT_FALSE(no_group);
+  ASSERT_EQ(RouteError::kTableFull, no_group.error()) << "pool is one group";
+
+  constexpr uint32_t kReader = 22;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);
+  ASSERT_TRUE(table->Erase(a));
+  auto held = table->Upsert(b, Value(2));
+  EXPECT_FALSE(held) << "a freed tbl8 group was reused mid-grace-period";
+
+  domain.Quiescent(kReader);
+  EXPECT_TRUE(table->Upsert(b, Value(2)))
+      << "the group never came back after the reader passed quiescence";
+  EXPECT_EQ(Value(2), table->Find(b));
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
+}
+
 // Readers (registered RCU readers reporting quiescence between batches, as
 // workers do) look up a fixed key set while the writer churns /26 routes,
 // each of which needs a tbl8 group. The pool is deliberately tiny, so nearly

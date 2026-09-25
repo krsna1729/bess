@@ -17,6 +17,12 @@ Please respect the following coding styles. Let's not be too dogmatic, though.
 * Python: [PEP 8 -- Style Guide for Python Code](https://www.python.org/dev/peps/pep-0008/)
   * For new code, please make it compatible with both Python 2 and 3.
 
+### Dataplane tables
+Before adding a lookup table to a module, read
+[docs/dataplane-tables.md](docs/dataplane-tables.md). It explains which
+structures exist, how rule changes reach workers without stopping traffic,
+and which DPDK behaviours are pinned by tests.
+
 ### Running Tests
 For C++ and Python code updates, we recommend adding unit tests with [Google Test](https://github.com/google/googletest) and [unittest.py](https://docs.python.org/2/library/unittest.html). Also, please run existing tests to make sure your changes to avoid regressions.
 

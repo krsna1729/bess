@@ -74,7 +74,8 @@ struct LookupShape {
   bool branches_on_loaded_data = false;
 };
 
-// Resolves kAuto (explicit kPlain/kStaged pass through). The rule is the one
+// Resolves kAuto (explicit kPlain/kStaged pass through). Decision D-006
+// (docs/decisions.md). The rule is the one
 // the K4.6 measurements support; see ChooseLookupBody()'s definition for the
 // evidence. BESS_LOOKUP_BODY=plain|staged in the environment overrides kAuto
 // for experiments.
