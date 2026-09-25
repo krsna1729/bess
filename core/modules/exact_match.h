@@ -179,11 +179,12 @@ class ExactMatch final : public Module {
   // size against the configuration.
   Error PackKey(const std::vector<std::vector<uint8_t>> &fields,
                 std::vector<std::byte> *key) const;
-  // A new, empty table sized for `rules` entries with growth headroom.
+  // A new, empty table sized for `rules` entries plus headroom (D-010).
   std::expected<std::shared_ptr<bess::classifier::ConcurrentExactTable>, Error>
   NewTable(size_t rules) const;
   // Grows the table (a larger copy, published as a new generation) when one
-  // more insert would pass the load limit. Amortized O(1) per insert.
+  // more insert would eat into the grace-period headroom, or unconditionally
+  // with `force`. Amortized O(1) per insert.
   // A table for at least `rules` rules, filled by `fill` (false = an insert
   // hit kFull; the table is then rebuilt at twice the size).
   std::expected<std::shared_ptr<bess::classifier::ConcurrentExactTable>, Error>

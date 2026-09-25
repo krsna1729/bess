@@ -136,10 +136,8 @@ const char *LookupBodyName(LookupBody body) {
   return "unknown";
 }
 
-namespace {
-
 // BESS_LOOKUP_BODY is read once: ResolveLookupBody may run per batch.
-LookupBody EnvironmentOverride() {
+LookupBody LookupBodyOverride() {
   static const LookupBody forced = [] {
     const char *env = std::getenv("BESS_LOOKUP_BODY");
     if (env != nullptr && std::strcmp(env, "plain") == 0) {
@@ -153,14 +151,12 @@ LookupBody EnvironmentOverride() {
   return forced;
 }
 
-}  // namespace
-
 LookupBody ResolveLookupBody(LookupBody requested, const LookupShape &shape,
                              const CacheGeometry &cache) {
   if (requested != LookupBody::kAuto) {
     return requested;
   }
-  if (const LookupBody forced = EnvironmentOverride();
+  if (const LookupBody forced = LookupBodyOverride();
       forced != LookupBody::kAuto) {
     return forced;
   }

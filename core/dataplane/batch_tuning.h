@@ -54,6 +54,10 @@ struct CacheGeometry {
 };
 
 // Which batch-lookup body a table uses.
+enum class LookupBody : uint8_t;
+// BESS_LOOKUP_BODY=plain|staged, read once per process; kAuto when unset.
+LookupBody LookupBodyOverride();
+
 enum class LookupBody : uint8_t {
   kAuto,    // decide from the table's shape and the cache geometry
   kPlain,   // one lookup at a time

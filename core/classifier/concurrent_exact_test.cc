@@ -169,6 +169,45 @@ TEST(ConcurrentExactTableTest, ErasedSlotWaitsForOnlineReaders) {
   domain.Unregister(kReader);
 }
 
+// Decision D-010 sizing: capacities are 3/4 of a power of two with room for
+// the rules plus headroom, and deletes still in a grace period count against
+// that headroom until they are reclaimed.
+TEST(ConcurrentExactTableTest, SizingCountsPendingDeletesAgainstHeadroom) {
+  using T = ConcurrentExactTable;
+  EXPECT_EQ(768u, T::CapacityFor(0));
+  EXPECT_EQ(768u, T::CapacityFor(511));
+  EXPECT_EQ(1536u, T::CapacityFor(512));
+  EXPECT_EQ(3u << 19, T::CapacityFor(1000000));  // 1572864 slots, 5% spare
+  EXPECT_EQ(256u, T::Headroom(768));
+  EXPECT_EQ(78643u, T::Headroom(3u << 19));
+
+  rcu::RcuDomain &domain = control::runtime().rcu();
+  auto t = MakeTable(T::CapacityFor(0));
+  ASSERT_EQ(768u, t->capacity());
+  for (uint32_t id = 0; id < 500; id++) {
+    ASSERT_EQ(T::UpsertResult::kInserted, t->Upsert(B(K(id)), V(id)));
+  }
+  constexpr uint32_t kReader = 23;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);
+  for (uint32_t id = 0; id < 20; id++) {
+    ASSERT_TRUE(t->Erase(B(K(id))));
+  }
+  EXPECT_EQ(480u, t->size());
+  EXPECT_TRUE(t->HasRoomForOne());  // 500 slots taken + 1 + 256 <= 768
+  for (uint32_t id = 500; id < 512; id++) {
+    ASSERT_EQ(T::UpsertResult::kInserted, t->Upsert(B(K(id)), V(id)));
+  }
+  EXPECT_FALSE(t->HasRoomForOne())
+      << "deletes still in their grace period must count against headroom";
+
+  domain.Quiescent(kReader);
+  EXPECT_TRUE(t->HasRoomForOne()) << "reclaimed slots must count as free";
+  EXPECT_EQ(492u, t->slots_in_use());
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
+}
+
 // The mode C contract: while one writer churns the table, readers never miss
 // a key that stays present, and never see a value that belongs to another
 // key. The table is small and nearly full, so nearly every insert reuses a

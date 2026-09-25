@@ -76,10 +76,14 @@
 
 namespace {
 
-enum class Dist { kRandom, kSequential, kIpPort };
+enum class Dist { kRandom, kSequential, kIpPort, kNat };
 const char *DistName(Dist d) {
-  return d == Dist::kRandom ? "random" : d == Dist::kSequential ? "sequential"
-                                                                : "ip-port";
+  switch (d) {
+    case Dist::kRandom: return "random";
+    case Dist::kSequential: return "sequential";
+    case Dist::kIpPort: return "ip-port";
+    default: return "nat";
+  }
 }
 
 uint64_t SplitMix(uint64_t x) {
@@ -96,11 +100,30 @@ uint64_t KeyAt(Dist d, uint64_t seed, uint64_t i) {
       return SplitMix(seed * 0x1000000000ull + i);
     case Dist::kSequential:
       return (seed << 40) + i;
-    case Dist::kIpPort:
-    default: {
+    case Dist::kIpPort: {
       const uint64_t ip = 0x0a000000u + seed * 0x10000 + (i % 4096);
       const uint64_t port = 1024 + i / 4096;
       return (ip << 16) | port;
+    }
+    case Dist::kNat:
+    default: {
+      // The NAT module's flow key (modules/nat.h Endpoint, hashed as one
+      // u64): big-endian address << 32 | big-endian port << 16 | protocol.
+      // Its table holds both directions of every mapping, so keys alternate
+      // between an internal endpoint (4096 hosts x ephemeral ports) and the
+      // external endpoint it was mapped to (4 addresses x sequential ports).
+      const uint64_t flow = i / 2;
+      uint32_t addr;
+      uint16_t port;
+      if (i % 2 == 0) {
+        addr = 0x0a000000u + seed * 0x10000 + flow % 4096;
+        port = static_cast<uint16_t>(32768 + (flow / 4096) % 28000);
+      } else {
+        addr = 0xc6336400u + seed * 0x10 + flow % 4;
+        port = static_cast<uint16_t>(1024 + (flow / 4) % 64000);
+      }
+      return (uint64_t{__builtin_bswap32(addr)} << 32) |
+             (uint64_t{__builtin_bswap16(port)} << 16) | 6;
     }
   }
 }
@@ -195,18 +218,33 @@ struct Crc64 {
     return rte_hash_crc_8byte(k, 0);
   }
 };
+// CRC followed by murmur3's 32-bit finalizer: breaks CRC's linearity so a
+// lattice of keys does not map onto a subset of buckets.
+struct Crc64Mixed {
+  uint32_t operator()(const uint64_t &k) const {
+    uint32_t h = rte_hash_crc_8byte(k, 0);
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+  }
+};
 struct Eq64 {
   bool operator()(const uint64_t &a, const uint64_t &b) const { return a == b; }
 };
-struct Inspectable : bess::utils::CuckooMap<uint64_t, uint64_t, Crc64, Eq64> {
+template <typename H>
+struct Inspectable : bess::utils::CuckooMap<uint64_t, uint64_t, H, Eq64> {
   size_t buckets() const { return this->buckets_.size(); }
 };
 
 // Load (entries / (buckets * 4)) just before each bucket doubling, over the
 // last few doublings of a fill to `target` keys, and the final load.
+template <typename H>
 void FillCuckooMap(uint64_t target, Dist dist, uint64_t seed,
                    std::vector<double> *at_doubling, double *final_load) {
-  Inspectable m;
+  Inspectable<H> m;
   size_t buckets = m.buckets();
   for (uint64_t i = 0; i < target; i++) {
     const uint64_t key = KeyAt(dist, seed, i);
@@ -231,7 +269,8 @@ void RunFill(int max_log2) {
   for (int lg = 10; lg <= max_log2; lg += 4) {
     const uint32_t pow2 = 1u << lg;
     for (Kind kind : {Kind::kPow2, Kind::kThreeQuarter, Kind::kExt}) {
-      for (Dist dist : {Dist::kRandom, Dist::kSequential, Dist::kIpPort}) {
+      for (Dist dist :
+           {Dist::kRandom, Dist::kSequential, Dist::kIpPort, Dist::kNat}) {
         std::vector<double> first, reach;
         FillResult last;
         for (uint64_t seed = 1; seed <= 5; seed++) {
@@ -270,26 +309,37 @@ void RunFill(int max_log2) {
   }
 
   std::printf("\n## CuckooMap: load at each bucket doubling (tables >= 1K "
-              "buckets), filling to 2^%d keys\n\n| keys | load at doubling "
-              "(min / median / max) | final load |\n|---|---|---|\n",
+              "buckets), filling to 2^%d keys\n\n| hash | keys | load at "
+              "doubling (min / median / max) | final load |\n"
+              "|---|---|---|---|\n",
               max_log2);
-  for (Dist dist : {Dist::kRandom, Dist::kSequential, Dist::kIpPort}) {
-    std::vector<double> at;
-    std::vector<double> finals;
-    for (uint64_t seed = 1; seed <= 5; seed++) {
-      double final_load;
-      FillCuckooMap(1ull << max_log2, dist, seed, &at, &final_load);
-      finals.push_back(final_load);
+  for (int mixed = 0; mixed < 2; mixed++) {
+    for (Dist dist :
+         {Dist::kRandom, Dist::kSequential, Dist::kIpPort, Dist::kNat}) {
+      std::vector<double> at;
+      std::vector<double> finals;
+      for (uint64_t seed = 1; seed <= 5; seed++) {
+        double final_load;
+        if (mixed) {
+          FillCuckooMap<Crc64Mixed>(1ull << max_log2, dist, seed, &at,
+                                    &final_load);
+        } else {
+          FillCuckooMap<Crc64>(1ull << max_log2, dist, seed, &at,
+                               &final_load);
+        }
+        finals.push_back(final_load);
+      }
+      std::sort(at.begin(), at.end());
+      const char *hash = mixed ? "crc+fmix32" : "crc";
+      if (at.empty()) {
+        std::printf("| %s | %s | - | %.1f%% |\n", hash, DistName(dist),
+                    100 * Median(finals));
+        continue;
+      }
+      std::printf("| %s | %s | %.1f%% / %.1f%% / %.1f%% | %.1f%% |\n", hash,
+                  DistName(dist), 100 * at.front(), 100 * Median(at),
+                  100 * at.back(), 100 * Median(finals));
     }
-    std::sort(at.begin(), at.end());
-    if (at.empty()) {
-      std::printf("| %s | - | %.1f%% |\n", DistName(dist),
-                  100 * Median(finals));
-      continue;
-    }
-    std::printf("| %s | %.1f%% / %.1f%% / %.1f%% | %.1f%% |\n",
-                DistName(dist), 100 * at.front(), 100 * Median(at),
-                100 * at.back(), 100 * Median(finals));
   }
 }
 

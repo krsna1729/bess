@@ -285,13 +285,10 @@ ExactMatch::NewTable(size_t rules) const {
   for (const FieldSpec &spec : field_specs_) {
     key_size += static_cast<size_t>(spec.size);
   }
-  // At least 1K entries, and room for `rules` at the load limit (3/4).
-  size_t capacity = 1024;
-  while (capacity * 3 / 4 < rules + 1) {
-    capacity *= 2;
-  }
+  // Decision D-010: room for `rules` plus the grace-period headroom.
   auto table = classifier::ConcurrentExactTable::Create(
-      static_cast<uint32_t>(key_size), static_cast<uint32_t>(capacity),
+      static_cast<uint32_t>(key_size),
+      classifier::ConcurrentExactTable::CapacityFor(rules),
       bess::control::runtime().rcu());
   if (!table) {
     return std::unexpected(std::make_pair(ENOMEM, table.error()));
@@ -304,7 +301,7 @@ ExactMatch::FillTable(
     size_t rules,
     const std::function<bool(classifier::ConcurrentExactTable &)> &fill)
     const {
-  // A cuckoo insert can fail before the load limit (an unlucky key set); a
+  // A cuckoo insert can fail before a table is full (an unlucky key set); a
   // rule is never dropped for it -- retry at twice the size.
   for (int attempt = 0; attempt < 4; attempt++) {
     auto table = NewTable(rules);
@@ -321,13 +318,14 @@ ExactMatch::FillTable(
 }
 
 bool ExactMatch::EnsureCapacity(bool force, Error *err) {
-  if (!force && (table_->size() + 1) * 4 <= size_t{table_->capacity()} * 3) {
+  if (!force && table_->HasRoomForOne()) {
     return true;
   }
   // Growth: copy into a table twice the size and publish it. Rare -- doubling
   // makes it amortized O(1) per insert -- and never on the packet path.
-  // `force`: the table reported full below the load limit, because deleted
-  // slots are still waiting out a reader grace period.
+  // Growth is due when live keys plus deletes still in a grace period eat
+  // into the headroom (D-010). `force`: an add failed anyway -- a burst of
+  // deletes outran the headroom, or displacement ran out of room.
   auto bigger = FillTable(size_t{table_->capacity()},
                           [&](classifier::ConcurrentExactTable &next) {
                             bool ok = true;
@@ -809,8 +807,9 @@ CommandResponse ExactMatch::CommandAdd(
   const classifier::ConstBytes k(key.data(), key.size());
   using classifier::ConcurrentExactTable;
   if (table_->Upsert(k, rule.gate) == ConcurrentExactTable::UpsertResult::kFull) {
-    // Full below the load limit: slots from recent deletes are still in a
-    // grace period (or the cuckoo paths ran out). Grow rather than refuse.
+    // Full inside the headroom: a burst of deletes still in their grace
+    // period outran it (or displacement ran out of room). Grow rather than
+    // refuse.
     if (!EnsureCapacity(/*force=*/true, &ret)) {
       return CommandFailure(ret.first, "%s", ret.second.c_str());
     }

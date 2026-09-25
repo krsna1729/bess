@@ -39,8 +39,10 @@
 //   BM_Lookup/impl/N      the per-batch lookup the packet path makes: 32
 //                         random 8-byte keys against N rules. impl 0 = the
 //                         K3 cuckoo generation backend ExactMatch used, 1 =
-//                         ConcurrentExactTable (rte_hash LF + QSBR). arg 3:
-//                         0 = all hits, 1 = all misses.
+//                         ConcurrentExactTable (rte_hash LF + QSBR) sized as
+//                         the module sizes it (D-010), 2 = the same table
+//                         with the earlier power-of-two sizing. arg 3: 0 =
+//                         all hits, 1 = all misses.
 
 #include <benchmark/benchmark.h>
 
@@ -139,6 +141,7 @@ constexpr size_t kStream = size_t{1} << 20;
 struct LookupFixture {
   bess::classifier::RuntimeExactBackend<gate_idx_t> cuckoo;
   std::unique_ptr<ConcurrentExactTable> concurrent;
+  std::unique_ptr<ConcurrentExactTable> concurrent_pow2;
   std::vector<uint64_t> stream;
 };
 
@@ -163,14 +166,22 @@ LookupFixture &FixtureFor(size_t n, bool miss) {
       8, rules);
   if (!cuckoo) std::abort();
   f->cuckoo = std::move(*cuckoo);
-  uint32_t cap = 1024;
-  while (cap * 3 / 4 < n) cap *= 2;  // the module's load limit
-  auto table = ConcurrentExactTable::Create(8, cap,
+  // The module's sizing (D-010).
+  auto table = ConcurrentExactTable::Create(8,
+                                            ConcurrentExactTable::CapacityFor(n),
                                             bess::control::runtime().rcu());
   if (!table) std::abort();
   f->concurrent = std::move(*table);
+  // The pre-D-010 sizing, for an in-process A/B: a power of two at 3/4 load.
+  uint32_t pow2 = 1024;
+  while (pow2 * 3 / 4 < n) pow2 *= 2;
+  auto old = ConcurrentExactTable::Create(8, pow2,
+                                          bess::control::runtime().rcu());
+  if (!old) std::abort();
+  f->concurrent_pow2 = std::move(*old);
   for (size_t i = 0; i < n; i++) {
     f->concurrent->Upsert(rules[i].key, i & 0xff);
+    f->concurrent_pow2->Upsert(rules[i].key, i & 0xff);
   }
   f->stream.resize(kStream);
   for (auto &k : f->stream) {
@@ -192,8 +203,10 @@ void BM_Lookup(benchmark::State &st) {
     const ConstBytes keys(
         reinterpret_cast<const std::byte *>(&f.stream[offset]), kBatch * 8);
     const uint64_t hits =
-        impl == 1 ? f.concurrent->LookupBatch(keys, 8, values.data(), kBatch)
-                  : f.cuckoo.lookup_batch(keys, 8, gates);
+        impl == 1   ? f.concurrent->LookupBatch(keys, 8, values.data(), kBatch)
+        : impl == 2 ? f.concurrent_pow2->LookupBatch(keys, 8, values.data(),
+                                                     kBatch)
+                    : f.cuckoo.lookup_batch(keys, 8, gates);
     found += static_cast<uint64_t>(__builtin_popcountll(hits));
     benchmark::DoNotOptimize(gates);
     benchmark::DoNotOptimize(values);
@@ -203,12 +216,13 @@ void BM_Lookup(benchmark::State &st) {
     st.SkipWithError("wrong hit count");
   }
   st.SetItemsProcessed(st.iterations() * kBatch);
-  static const char *const kImpl[] = {"cuckoo-gen", "rte_hash-LF"};
+  static const char *const kImpl[] = {"cuckoo-gen", "rte_hash-LF",
+                                      "rte_hash-LF/pow2-sizing"};
   st.SetLabel(std::string(kImpl[impl]) +
               (miss ? " miss" : " hit"));
 }
 BENCHMARK(BM_Lookup)->ArgsProduct(
-    {{0, 1}, {1000, 16000, 128000, 1000000}, {0, 1}});
+    {{0, 1, 2}, {1000, 16000, 128000, 1000000}, {0, 1}});
 
 #endif  // HAVE_CONCURRENT_EXACT
 

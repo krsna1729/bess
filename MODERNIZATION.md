@@ -3700,6 +3700,51 @@ rather than one call site).
     - Found while writing the doc (not fixed): DRR allows several workers
       but writes its flow `CuckooMap` from `ProcessBatch` without
       synchronization.
+93. **Wire-range narrowing fixed, v1 and v2.** An external review found that
+    the v2 `FromProto()` cast `uint32` gates and queue counts to
+    `gate_idx_t`/`queue_t` before validation, so wire gate 65536 became
+    gate 0 and 256 queues became "one queue". Both look valid, so no later
+    validator could see it.
+    - The audit found the same bug in more places:
+      - the **v1** API: `ConnectModules`/`DisconnectModules` narrowed
+        `uint64` gates implicitly, and `CreatePort` narrowed `uint64` queue
+        counts into `uint8_t`;
+      - the shared apply path (both APIs): `AddTc` narrowed an `int64`
+        priority to `uint32_t` (2^32 + 5 became 5) and an `int64` share to
+        `int32_t` (2^32 + 1 became 1; negative shares passed), and
+        negative limits and bursts became huge `uint64_t`.
+    - Fix:
+      - `control/wire_narrow.h` `WireNarrow<To>()` checks before the cast,
+        at every API boundary;
+      - v2 `FromProto` is fallible;
+      - the spec validator and `AddTc` range-check priority (0 to 2^32−1),
+        share (1 to 2^31−1), limit and burst (≥ 0), before any mutation.
+    - Tests:
+      - `ApiV2AdapterTest.NarrowingIsCheckedBeforeTheCast` (max+1, max+2
+        and 2^32−1 rejected, max accepted, for all four fields);
+      - `OutOfRangeWireValuesAreRefusedEverywhere` (all four RPCs, typed
+        detail, no side effects);
+      - `TrafficClassRangesAreValidatedNotNarrowed`;
+      - `LegacyAddTcRangeChecksBeforeNarrowing`;
+      - the live-daemon `module_tests/api_wire_ranges.py`, which fails
+        2/2 against the unfixed v1 code ("connect_modules(..., 65536, 0)
+        was accepted").
+
+94. **D-010 sizing (in part), occupancy follow-ups, tuning documented.**
+    - `ConcurrentExactTable::CapacityFor/Headroom/HasRoomForOne/ReclaimAll`:
+      3/4-power-of-two capacity, and growth when live keys plus pending
+      deletes eat into the headroom.
+    - The headroom constant (256, or 5%) is provisional until the QSBR
+      grace-period distribution is measured; the review's point, recorded
+      in D-010.
+    - In-process lookup A/B against the old sizing: no sizing effect.
+    - NAT's real key shape does not have `CuckooMap`'s low-occupancy
+      problem.
+    - The daemon logs the cache geometry and lookup-body override it
+      detects.
+    - `docs/dataplane-tables.md` section 6a and D-011 document what is
+      decided once per process (host facts) versus per table at build
+      (lookup body, sizing), and what is deliberately not done.
 
 ## Review process established this session
 
@@ -8937,7 +8982,17 @@ the Go/C++ SDKs.
   - ExactMatch is on mode C (entry 91, D-001);
   - DPDK behaviours are pinned by deterministic CI tests (entry 92, D-007).
 - Next in G1.2a:
+  0. Measure the QSBR grace-period distribution (p50/p95/p99/max) under
+     representative workers, including slow modules and pauses, and set
+     D-010's headroom constant from it.
   1. WildcardMatch on C (a `ConcurrentExactTable` per tuple);
+     Also make `Router::RemoveNextHop()` defer instead of block. Today it
+     calls `RcuDomain::Synchronize()` holding the Router mutex on the
+     command thread, so each removal waits a full grace period, removals
+     run one after another, and a stalled worker stalls the command path.
+     Retire the id through the domain and keep it reserved until
+     reclaimed, as table slots already are; a transaction must not hold a
+     blocking wait.
   2. L2Forward, ACL and HashLB off the global pause;
   3. the mode W infrastructure.
 - Before G1.2b, study prior art for multi-table atomicity and record what

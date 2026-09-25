@@ -32,6 +32,7 @@
 
 #include <glog/logging.h>
 
+#include "dataplane/batch_tuning.h"
 #include "bessctl.h"
 #include "bessd.h"
 #include "debug.h"
@@ -91,6 +92,19 @@ int main(int argc, char *argv[]) {
   bess::PacketPool::CreateDefaultPools(FLAGS_buffers, FLAGS_packet_data_room);
 
   PortBuilder::InitDrivers();
+
+  // Host facts that table-build-time tuning uses (docs/dataplane-tables.md,
+  // "What is tuned, and when"). Computed here once so they are logged; every
+  // table built later reuses the cached values.
+  {
+    const auto &cache = bess::dataplane::CacheGeometry::Smallest();
+    LOG(INFO) << "Cache geometry (smallest over online CPUs): L1d "
+              << cache.l1d_bytes / 1024 << " KiB, L2 " << cache.l2_bytes / 1024
+              << " KiB, L3 " << cache.l3_bytes / 1024 << " KiB, line "
+              << cache.line_bytes << " B; lookup body override: "
+              << bess::dataplane::LookupBodyName(
+                     bess::dataplane::LookupBodyOverride());
+  }
 
   {
     ApiServer server;

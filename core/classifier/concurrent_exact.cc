@@ -107,6 +107,27 @@ ConcurrentExactTable::UpsertResult ConcurrentExactTable::Upsert(
   return UpsertResult::kInserted;
 }
 
+uint32_t ConcurrentExactTable::CapacityFor(size_t rules) noexcept {
+  uint64_t pow2 = 1024;
+  while (pow2 / 4 * 3 - Headroom(static_cast<uint32_t>(pow2 / 4 * 3)) <
+         rules + 1) {
+    pow2 *= 2;
+  }
+  return static_cast<uint32_t>(pow2 / 4 * 3);
+}
+
+bool ConcurrentExactTable::HasRoomForOne() {
+  ReclaimAll();
+  return slots_in_use() + 1 + Headroom(capacity_) <= capacity_;
+}
+
+void ConcurrentExactTable::ReclaimAll() {
+  unsigned freed = 0, pending = 0, available = 0;
+  do {
+    rte_hash_rcu_qsbr_dq_reclaim(table_, &freed, &pending, &available);
+  } while (freed > 0 && pending > 0);
+}
+
 void ConcurrentExactTable::Reclaim() {
   unsigned freed, pending, available;
   rte_hash_rcu_qsbr_dq_reclaim(table_, &freed, &pending, &available);

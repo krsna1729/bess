@@ -30,6 +30,7 @@
 #ifndef BESS_CLASSIFIER_CONCURRENT_EXACT_H_
 #define BESS_CLASSIFIER_CONCURRENT_EXACT_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -58,13 +59,38 @@ namespace bess::classifier {
 // in docs/dataplane-tables.md; Decisions D-001, D-002 (docs/decisions.md).
 //
 // Values are up to eight bytes, stored in rte_hash's data pointer. Writers
-// must be serialized by the caller (a module's command path is). Capacity is
-// fixed at creation; `Upsert` reports kFull and the owner grows by building a
+// must be serialized by the caller (a module's command path is).
+//
+// Sizing (Decision D-010). Capacity is key slots, fixed at creation; the
+// owner grows by building a larger table. Owners create tables with
+// CapacityFor(rules): three quarters of a power of two, so rte_hash's bucket
+// array (rounded up to the next power of two) has 4/3 as many positions as
+// slots and every slot is reachable (occupancy_bench: 100% for every key
+// shape, and the last 10% of a fill still costs ~200 ns per add). Owners grow
+// when HasRoomForOne() is false: live keys plus deletes still waiting out a
+// grace period must leave Headroom() slots free, because a delete's slot is
+// reusable only after every worker's next quiescent point. `Upsert` reporting
+// kFull remains the backstop. Capacity is
 // larger table (a deliberate, rare, amortized rebuild).
 class ConcurrentExactTable {
  public:
   enum class UpsertResult : uint8_t { kInserted, kUpdated, kFull };
 
+  // Slots of reserve for deletes pending a grace period, at least: one
+  // writer's measured peak (~4M ops/s with readers present, update_scale_bench
+  // E2) times a 64 us grace period. Tables also keep 5% of their slots.
+  static constexpr uint32_t kMinHeadroom = 256;
+
+  static uint32_t Headroom(uint32_t capacity) noexcept {
+    return std::max(capacity / 20, kMinHeadroom);
+  }
+
+  // The smallest capacity (3/4 of a power of two, at least 768) that holds
+  // `rules` keys plus its headroom.
+  static uint32_t CapacityFor(size_t rules) noexcept;
+
+  // `capacity` key slots exactly; pass CapacityFor(rules) for the D-010
+  // sizing.
   static std::expected<std::unique_ptr<ConcurrentExactTable>, std::string>
   Create(uint32_t key_len, uint32_t capacity, rcu::RcuDomain &domain,
          int socket = SOCKET_ID_ANY);
@@ -79,6 +105,13 @@ class ConcurrentExactTable {
   UpsertResult Upsert(ConstBytes key, uint64_t value);
   // False if the key is absent.
   bool Erase(ConstBytes key);
+
+  // Whether one more key fits with Headroom() slots to spare, counting
+  // deletes still waiting out a grace period (reclaims what is ready first).
+  bool HasRoomForOne();
+
+  // Reclaims every deleted slot whose grace period has passed.
+  void ReclaimAll();
 
   // Returns to the free list the deleted slots whose grace period has
   // passed (up to DPDK's per-call batch). Adds and deletes do this on their

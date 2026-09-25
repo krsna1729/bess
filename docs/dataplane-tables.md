@@ -106,11 +106,17 @@ state through G, C or W.
     still waiting out a grace period).
 - **Reader API:** `LookupBatch(keys, stride, values, n)` for up to 64 keys.
   It returns a hit mask; misses leave `values[i]` untouched.
-- **Capacity:** fixed at creation. The owner grows it:
-  - past 3/4 load, copy into a table twice the size and publish that
+- **Capacity:** fixed at creation, in key slots. The sizing policy is
+  [D-010](decisions.md#d-010-size-concurrent-tables-for-occupancy-and-grace-period-headroom-not-a-fixed-75):
+  - create with `CapacityFor(rules)`: 3/4 of a power of two, so every slot
+    is reachable;
+  - before an add, check `HasRoomForOne()`. Live keys plus deletes still
+    waiting out a grace period must leave `Headroom()` slots free: the
+    larger of 5% and 256, which covers one writer's peak rate over a 64 µs
+    grace period;
+  - when there's no room, copy into a table twice the size and publish that
     (amortized O(1));
-  - on `kFull` below the load limit (deleted slots still in their grace
-    period), grow instead of failing.
+  - if an add returns `kFull` anyway, grow instead of failing.
   - `ExactMatch::EnsureCapacity`/`FillTable` is the reference
     implementation.
 - **Guarantees to readers:**
@@ -256,7 +262,49 @@ The reasoning, rejected alternatives, evidence and revisit triggers are in
 - [D-007](decisions.md#d-007-dpdk-behaviours-we-depend-on-are-deterministic-ci-tests)
   how DPDK behaviours are pinned;
 - [D-009](decisions.md#d-009-consolidate-the-exact-match-backends)
-  the exact-match backend consolidation (open).
+  the exact-match backend consolidation (open);
+- [D-010](decisions.md#d-010-size-concurrent-tables-for-occupancy-and-grace-period-headroom-not-a-fixed-75)
+  table sizing and grace-period headroom;
+- [D-011](decisions.md#d-011-tune-per-table-at-build-time-from-host-facts-discovered-once-per-process)
+  what is tuned at daemon start and what per table (section 6a).
+
+## 6a. What is tuned, and when
+
+BESS discovers host facts once per process, and decides everything that
+depends on a particular table when that table is built. Nothing is tuned
+while packets flow except NAT's per-batch prefetch check (below), and
+nothing needs privileges.
+
+**Once per process (the daemon logs these at startup):**
+
+| fact | how | used by |
+|---|---|---|
+| cache sizes (L1d/L2/L3, line) | `CacheGeometry::Smallest()`: each online CPU's `/sys/devices/system/cpu/cpuN/cache`, falling back to `sysconf`, then defaults; the minimum over all CPUs, because which CPU will run a table is not known when it is built | every table-build decision below |
+| lookup-body override | `BESS_LOOKUP_BODY=plain\|staged`, read once (`LookupBodyOverride()`) | forces every `kAuto` choice, for experiments |
+| DPDK's CRC implementation | DPDK selects SSE4.2 / ARMv8 CRC at EAL init | `rte_hash`, and every CRC-hashed table |
+
+**When a table is built or created:**
+
+| table | decided | how |
+|---|---|---|
+| cuckoo backends (WildcardMatch tuples, typed `ExactTable`) | plain or staged body, at generation build | `ResolveLookupBody()` from the built table's footprint and lookup shape |
+| L2Forward's `l2_table` | plain or staged body, at `l2_init` (module Init) | same |
+| NAT's `CuckooMap` | whether to prefetch, **per batch** | `PrefetchBatch()` re-checks the footprint each batch, because the table grows while packets flow; the check is a size comparison |
+| `ConcurrentExactTable` (ExactMatch) | capacity, at create and on growth | `CapacityFor(rules)` and `Headroom()` (D-010); DPDK's own bulk lookup, no body choice |
+| `ConcurrentExactTable`, inside `rte_hash` | signature and key compare functions, at create | DPDK picks SSE2 signature compare, and a SIMD key compare for 16/32/…/128-byte keys (`memcmp` otherwise) |
+| `RouteTable` (`rte_lpm`) | nothing | always plain: one independent load per packet |
+
+**Not done, deliberately:**
+
+- *No start-up micro-benchmark calibration.* Cache sizes from sysfs were
+  enough to reproduce the measured plain/staged crossovers.
+- *No per-worker geometry.* The smallest CPU is the safe choice when a table
+  may be read by any worker.
+- *No retuning when workers move or the host changes load.* Revisit if
+  tables become pinned to known workers (mode W shards), since then the
+  owner's actual CPU is known.
+
+See D-006 and D-011.
 
 ## 7. DPDK behaviours we depend on, and the tests that pin them
 

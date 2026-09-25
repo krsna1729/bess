@@ -30,7 +30,8 @@ file is the reasoning.
 | D-007 | DPDK behaviours we depend on are deterministic CI tests | accepted |
 | D-008 | UPF is a consumer of the framework, not its driver | accepted |
 | D-009 | Consolidate the exact-match backends | open |
-| D-010 | Size concurrent tables for occupancy and grace-period headroom, not a fixed 75% | proposed |
+| D-010 | Size concurrent tables for occupancy and grace-period headroom, not a fixed 75% | accepted in part |
+| D-011 | Tune per table at build time from host facts discovered once per process | accepted |
 
 ---
 
@@ -53,8 +54,9 @@ network function driven by a controller.
   `RcuDomain`.
 - A generation holds only configuration: the extraction plan and the default
   gate.
-- The owner grows the table by copying it into one twice the size, both past
-  3/4 load and whenever `kFull` comes back below that limit.
+- The owner grows the table by copying it into one twice the size when live
+  keys plus pending deletes eat into the headroom, and whenever an add
+  returns `kFull` (sizing: D-010).
 
 **Evidence.**
 
@@ -359,9 +361,27 @@ of D-004, so the real users of each backend are known.
 
 ## D-010 Size concurrent tables for occupancy and grace-period headroom, not a fixed 75%
 
-**Status:** proposed (2026-09-25).
-**Code:** `ExactMatch::NewTable` / `EnsureCapacity` (grows past 3/4 load
-today); `ConcurrentExactTable::Create`.
+**Status:** accepted in part (2026-09-26):
+
+- **Accepted:** the 3/4 sizing, counting pending deletes against headroom,
+  and growth (never failure) whenever headroom is short or an add returns
+  `kFull`.
+- **Provisional:** the headroom constant (`kMinHeadroom` = 256, or 5%). It
+  assumes a 64 µs grace period, which has not been measured.
+- **Next:** measure the grace-period distribution (p50/p95/p99/max) under
+  representative workers, including slow modules and pauses, then set the
+  constant from it.
+- A review pointed out that a QSBR grace period is not a fixed constant. It
+  depends on batch duration, scheduling, pauses and slow modules, so
+  "update rate × grace period" has an input we have not measured.
+- The implementation is safe either way. A longer grace period only makes
+  the table grow earlier or more often; adds do not fail. Growth is
+  amortized, but repeated growth under pathological grace periods costs
+  memory. That is what the measurement will bound.
+
+**Code:** `ConcurrentExactTable::CapacityFor`, `Headroom`, `HasRoomForOne`;
+`ExactMatch::NewTable` / `EnsureCapacity`; the test
+`ConcurrentExactTableTest.SizingCountsPendingDeletesAgainstHeadroom`.
 
 **Context.** The 3/4 growth threshold was a guess, so a quarter of every table
 is kept empty. Two separate things can make an add fail: cuckoo displacement
@@ -414,7 +434,7 @@ for churn):
   `CuckooMap` with endpoint keys, so its memory use deserves a measurement
   of its own.
 
-**Proposed decision.**
+**Decision.**
 
 - Create tables with `entries` = 3/4 of the bucket power of two.
 - Grow when live entries plus deletes pending reclaim exceed the slots less
@@ -422,10 +442,70 @@ for churn):
   period).
 - Keep grow-on-`kFull` as the backstop.
 
-For the same rule count this stores about a fifth fewer key slots than
-today's rule, and it removes the near-full add-cost cliff.
+For the same rule count this stores about a fifth fewer **key slots** than
+the old rule, and it removes the near-full add-cost cliff.
+
+- That is a statement about key slots only, not "20-25% less `rte_hash`
+  memory". The bucket array is unchanged at equal rule counts, and total
+  memory also includes the free-slot ring, the defer queue and allocator
+  overhead, none of which has been measured.
+- Lookups, in an in-process A/B against the old sizing: bucket arrays are
+  identical at equal rule counts, and the results differ by ±8% in both
+  directions, which is placement noise, not a sizing effect.
+- Add cost through the module is unchanged: 0.58-0.74 µs per add+delete on
+  CPU 2 (the headroom check adds one reclaim attempt and one ring count).
 
 **Revisit when:** a DPDK upgrade changes `rte_hash`'s displacement search,
 or measured grace periods under real worker load are far longer than
 assumed.
+
+## D-011 Tune per table at build time from host facts discovered once per process
+
+**Status:** accepted (2026-09-26).
+**Code:** `core/dataplane/batch_tuning.{h,cc}` (`CacheGeometry::Smallest`,
+`LookupBodyOverride`, `ResolveLookupBody`); the startup log in `core/main.cc`;
+the callers listed in [dataplane-tables.md](dataplane-tables.md) section 6a.
+
+**Context.** Several choices depend on the host (cache sizes) and on the
+table (its footprint and lookup shape): plain or staged batch lookups, and
+table sizing. They could be decided at daemon start, at module init, when a
+table is built, or continuously.
+
+**Decision.**
+
+- The daemon only **discovers facts**, once per process: cache geometry from
+  sysfs (the smallest over online CPUs), and the `BESS_LOOKUP_BODY`
+  override. It logs them at startup.
+- **Each table decides** when it is built or created, from those facts plus
+  its own footprint and shape. Module authors need not call anything: the
+  backends do it.
+- One exception runs per batch: NAT's `CuckooMap` prefetch check, because
+  that table grows while packets flow; the check is a size comparison.
+- No privileges are needed. There is no start-up micro-benchmark, and
+  nothing is retuned while traffic runs.
+
+**Evidence.**
+
+- The plain/staged crossovers in D-006 were reproduced from sysfs cache
+  sizes alone.
+- On this hybrid CPU, sysfs gives per-core-type sizes (P-core L1d 48 KiB,
+  L2 1.25 MiB). `sysconf` reports 32 KiB / 2 MiB, which is why sysfs comes
+  first.
+
+**Rejected.**
+
+- *Calibrating with micro-benchmarks at daemon start:* it adds start-up time
+  and noise, and sysfs was sufficient.
+- *Per-worker tuning:* a shared table is read by any worker, so the smallest
+  CPU is the safe choice.
+- *Continuous retuning:* no evidence it pays, and it would put decisions on
+  the packet path.
+
+**Revisit when:**
+
+- mode W shards pin tables to known workers, so the owner's real CPU is
+  known;
+- a platform exposes no sysfs cache information, so the fallback defaults
+  start deciding;
+- measurements on a new CPU generation disagree with the rule.
 
