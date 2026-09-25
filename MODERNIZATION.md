@@ -3416,8 +3416,12 @@ rather than one call site).
     items recorded, and the unrecorded VPP-derived batch-runtime program
     added as Phase L (L1 measurability -> L2 bulk output partitioning -> L3
     cross-worker handoff -> L4 batch-size study -> L5 ready set), with
-    columnar sidecars, SoA/AVX kernels, frame scheduling and 32-bit handles
-    deferred behind evidence. DPDK-audit leftovers: RX buffer split -> C-HW,
+    SoA/AVX kernels and frame scheduling deferred behind evidence. A
+    follow-up the same day made the module author's default experience a
+    hard rule for Phase L (invisible or opt-in only): columnar module APIs,
+    32-bit handles and VPP-style macros moved from deferred to rejected, and
+    L2 became "make EmitPacket cheaper first; optional EmitBatch only if a
+    gap remains". DPDK-audit leftovers: RX buffer split -> C-HW,
     mbuf history -> F debug lanes, `rte_ptr_compress` -> L3, `--legacy-mem`
     newly testable on hugepages.
 
@@ -8214,11 +8218,32 @@ Its later, refined list (which supersedes the first) is the basis of Phase L.
 | Multiarch runtime dispatch | **Planned** — Phase D2 (runtime SIMD policy) |
 | Compile-time width policy / `static_for` | **Not needed** — no width parameter survived the ILP result |
 
+### Guiding rule: the module author's default experience does not change
+
+BESS's value over VPP is how simple a module is to write: a plain
+`ProcessBatch` loop over `PacketBatch`/`PacketRef`, `EmitPacket` to a gate,
+nothing else to learn. The user's direction (2026-09-25): do not make BESS
+look like VPP for its own sake; VPP is powerful but unwieldy to write
+against. Every Phase L item must therefore be one of:
+
+- **invisible** -- a framework-internal change (scheduler, `Task`, output
+  batching, queues) that existing modules benefit from unmodified; or
+- **opt-in** -- a helper an author may reach for, like `RunBatch`, that is
+  shorter or no longer than the plain loop, with a measured win.
+
+Anything that would change the default authoring model -- mandatory
+multi-stage structuring, node/vector macros, frame or column abstractions
+in the module API, index-based packet handles -- is **rejected**, not
+deferred. A performance win does not justify it; it has to be delivered in
+the framework instead.
+
 ### Phase L — planned, in order, each step gated on the previous one's data
 
-Parallel performance track; does not block G1.
+Parallel performance track; does not block G1. Each item says which of the
+two shapes above it takes.
 
-1. **L1 — make the batch runtime measurable.** Per-module batch-occupancy
+1. **L1 — make the batch runtime measurable** (invisible: framework
+   instrumentation). Per-module batch-occupancy
    histograms, packets per call, module calls per packet, and cycles per
    module, built on K6 (`WorkerHistogram`/`CounterSet`, so no hot-path lock);
    a `task_graph_bench` for controlled graph depth/fan-out; and the
@@ -8227,38 +8252,49 @@ Parallel performance track; does not block G1.
    and backend-bound, L1I/L1D/LLC/DTLB MPKI, branch misses) through
    `omarchy-benchmark --diagnose`. First question to answer: how full are
    batches in practice?
-2. **L2 — bulk output partitioning (`EmitBatch`).** BESS already queues
+2. **L2 — cheaper output batching** (invisible first). BESS already queues
    rather than executes on `EmitPacket` (`AddToRun` schedules, and output
-   batches merge), so the delta is bulk per-gate partitioning with fast
-   paths: every packet to the same gate, a two-way split, small K, and runs.
-   Convert `IPLookup` first, then ExactMatch/HashLB; test a fan-out matrix
-   (1 gate; 90/10; 50/50; 4 uniform; 8 Zipf).
-3. **L3 — cross-worker handoff.** `rte_ring` MP/SC vs RTS/HTS sync modes, the
+   batches merge). First make the existing `EmitPacket` path cheaper
+   internally (the all-same-gate and run cases, detected inside the
+   framework). Only if that leaves a measured gap, offer an optional bulk
+   `EmitBatch(gates[])` helper for modules that already compute per-packet
+   gates in an array (`IPLookup`, ExactMatch, HashLB); `EmitPacket` stays
+   the documented default. Fan-out matrix: 1 gate; 90/10; 50/50; 4 uniform;
+   8 Zipf.
+3. **L3 — cross-worker handoff** (invisible: `Queue`/`PortOut` internals). `rte_ring` MP/SC vs RTS/HTS sync modes, the
    25.11 ring zero-copy API (`rte_ring_*_zc_burst_*`), a VPP-style slot queue,
    and `rte_ptr_compress` pointer compression for the 64-bit handles in
    flight (DPDK-audit leftover).
-4. **L4 — batch size, measured before changed.** Controlled B = 1..32 to fit
+4. **L4 — batch size, measured before changed** (invisible: `PacketBatch`
+   capacity is not part of how a module is written). Controlled B = 1..32 to fit
    C(B) = C_packet + C_batch/B; instrument `Task`'s `pbatch_idx_` batch pool
    and the `Buffer` module; only if the fit predicts a gain, try 64/128
    capacity with smaller/dynamic scratch-frame pools, and always plot
    throughput against p99 latency. Supersedes backlog item 8.
-5. **L5 — ready-set implementation.** Only if L1's pending-heap metrics
+5. **L5 — ready-set implementation** (invisible: scheduler internals). Only if L1's pending-heap metrics
    justify it: topology buckets/bitsets instead of the ready heap.
 
-### Deferred — each needs evidence from Phase L first
+### Rejected on the ergonomics rule
 
 - **Batch-local columnar sidecar / typed scratchpad / lazy column
-  materialization.** The later review itself cautioned against it; do it only
-  if L1 shows repeated parsing cost across modules. BESS's metadata
-  attributes already carry parse-once results through the graph (the
-  "hot/cold metadata" idea).
-- **SoA + AVX2/AVX-512 kernels.** Only on data that staging has made
-  contiguous; through D2's dispatch; measure CPU frequency with AVX-512.
-- **Frame-scheduling / I-cache experiment.** Only if L1 frontend metrics show
-  I-cache or iTLB pressure. The claim that BESS is depth-first and thrashes
-  the I-cache was found incorrect as stated.
-- **32-bit packet handles.** Last, if ever.
-- **C++26 `std::simd`.** Phase H research.
+  materialization as a module-facing API.** It would change how modules are
+  written. If L1 shows repeated parsing cost across modules, the fix goes in
+  the framework (BESS's metadata attributes already carry parse-once
+  results through the graph), not into every author's code.
+- **32-bit packet handles / index-based batches.** Changes `PacketBatch` and
+  `PacketRef` for every module; a VPP trait with no measured need.
+- **VPP-style node/vector macros, mandatory x2/x4 loop templates,
+  frame-oriented module APIs.**
+
+### Deferred — each needs evidence from Phase L first, and must stay invisible or opt-in
+
+- **SoA + AVX2/AVX-512 kernels.** Inside library helpers and tables only
+  (like the cuckoo backend), through D2's dispatch; measure CPU frequency
+  with AVX-512.
+- **Frame-scheduling / I-cache experiment.** A scheduler-internal policy,
+  only if L1 frontend metrics show I-cache or iTLB pressure. The claim that
+  BESS is depth-first and thrashes the I-cache was found incorrect as stated.
+- **C++26 `std::simd`.** Phase H research, inside helpers only.
 - **BESS vs VPP head-to-head on one NF.** Out of scope for this fork (needs a
   VPP build and an identical NF); the mechanism-level experiments above
   answer the useful questions.
