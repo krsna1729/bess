@@ -9745,10 +9745,18 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
   - **For pattern matching, explore Intel Hyperscan** (multi-pattern regex
     and literal matching, SIMD, streaming mode across segments; the user
     asked for this note):
-    - Intel's releases after 5.4 are no longer BSD-licensed;
-    - **Vectorscan** is the open-source (BSD) continuation, and also
-      portable to ARM (NEON/SVE), so it is the likely candidate (Phase D
-      fit);
+    - **licensing** (checked 2026-09-27):
+      - `github.com/intel/hyperscan` is BSD-3 and still gets maintenance
+        on the 5.4 line (security fixes in Aug/Sep 2026; tag
+        `v5.4.2.1`; last GitHub release v5.4.2, Apr 2023);
+      - Intel's new versions (5.5+) are developed internally under the
+        Intel Proprietary License. That is Intel's statement, quoted in
+        Vectorscan's README;
+    - **Vectorscan** (VectorCamp) is a BSD fork of 5.4 with regular
+      releases (5.4.13, Aug 2026), for x86, Arm NEON/SVE and POWER. The
+      API is the same, so the two are interchangeable at build time.
+      Vectorscan is the likely candidate (Phase D fit), with Intel's 5.4
+      line as the alternative on x86;
     - evaluate against a plain host trie or `rte_hash` for exact names;
     - pattern databases compile once per rule-set change, so this is a
       mode G swap, with the old database freed after a grace period.
