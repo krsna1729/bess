@@ -9009,12 +9009,10 @@ the Go/C++ SDKs.
 - G1.2a progress:
   - ExactMatch is on mode C (entry 91, D-001);
   - DPDK behaviours are pinned by deterministic CI tests (entry 92, D-007).
-- Next in G1.2a:
-  1. WildcardMatch on C (a `ConcurrentExactTable` per tuple);
-     (Done since: grace periods measured and bounded, entry 95; RemoveNextHop
-     deferred, entry 96.)
-  2. L2Forward, ACL and HashLB off the global pause;
-  3. the mode W infrastructure.
+- Next in G1.2a: see section 31 (the work queue). WildcardMatch on mode C
+  is implemented and awaiting its native benchmark (§31.2), and grace
+  periods and `RemoveNextHop` are done (entries 95 and 96). Then mode W,
+  and taking the remaining modules off the global pause (§31.3).
 - Before G1.2b, study prior art for multi-table atomicity and record what
   we borrow as decisions: DPDK `rte_swx` table staging with commit/abort,
   P4Runtime write atomicity (continue-on-error, rollback-on-error,
@@ -9343,6 +9341,279 @@ Exit criteria for each NF:
 Generic mechanisms go into core only when their consumer list has at least
 two non-UPF entries.
 
+## 31. Work queue and open ideas — for any agent (2026-09-26)
+
+Everything discussed and not yet finished, so nothing slips. Each item has a
+status, where the reasoning lives, the next step and what "done" means. The
+decisions it cites are in [docs/decisions.md](docs/decisions.md); the table
+guide is [docs/dataplane-tables.md](docs/dataplane-tables.md). Pick any item
+whose prerequisites are met; update its status here when you start and
+finish.
+
+### 31.1 How to work in this repo (read first)
+
+- **Benchmarks**
+  - Build: `meson setup build-bench -Dcpu=native --buildtype=release`, or
+    at least `-Dcpu=x86-64-v3`. Never quote numbers from `build-meson`:
+    it is `-Dcpu=corei7`, CI's portable baseline, with no AVX2/BMI (it
+    emits `bsf` instead of `tzcnt`, which is 6 uops on Zen 3). All numbers
+    before 2026-09-26 in entries 88-96 were measured on corei7 builds of
+    BESS code (DPDK was native) and are superseded where re-measured.
+  - Run through `omarchy-benchmark --cpu N --isolate` (performance
+    governor, isolated cgroup partition, SMT sibling offline).
+  - Compare with `tools/ab_bench.py A B --filter ... --wrap
+    "omarchy-benchmark --cpu N --isolate --"`. It runs A and B in ABBA
+    order, pairs adjacent runs, and calls a difference only outside a ±3%
+    noise band with at least 3/4 of pairs agreeing. It also pairs two
+    implementations in one binary: `--filter-b` plus `--rename-b`.
+  - Measure on a P-core (CPU 2) and an E-core (CPU 14) of this i9-13900H.
+  - `BESS_DPDK_HUGEPAGE_MB=1024`: one 1 GiB page on this host, so only one
+    DPDK process at a time. A running bessd (module tests) blocks
+    benchmarks.
+  - Long suites: `omarchy-benchmark` needs `sudo` to restore state. Keep
+    it authorized (`sudo -n -v` every few minutes). If `sudo` expires
+    mid-run, CPUs stay offline and the cgroup stays isolated; run
+    `omarchy-benchmark --reset --force`.
+- **Builds:** compile at `-j4` at most. This host has 15 GiB, and `-j16`
+  was killed for memory. Release builds work since the protobuf
+  `-Wno-error=(maybe-)uninitialized` fix.
+- **Live-daemon module tests:**
+  ```
+  G=$PWD/build-meson/protobuf/generated/python
+  sudo env LD_LIBRARY_PATH=... BESS_DPDK_HUGEPAGE_MB=1024 PYTHONPATH=$G \
+      BESS_PROTOBUF_ROOT=$G BESSD_BINARY=$PWD/build-meson/core/bessd \
+      python3 bessctl/run_module_tests.py [--test_name NAME]
+  ```
+  Then `sudo chown -R $USER build-meson`.
+- **Shell hygiene:** never `pkill -f PATTERN` or `pgrep -f PATTERN` in a
+  loop where the pattern appears in your own command line; it matches
+  itself. Kill by PID.
+- **Concurrency guarantees are deterministic tests** (D-007). Mutation-check
+  each new one once, by removing the protection and watching it fail. Put
+  the result in the commit message, not in a patch file.
+- **Decisions** go in `docs/decisions.md` (a new D-nnn, never rewritten,
+  only superseded). Code that embodies one cites its id.
+
+### 31.2 In progress (uncommitted at the time of writing; commit when §31.2.1 numbers are in)
+
+1. **WildcardMatch on mode C, D-014 (to write).**
+   - Done:
+     - `classifier::ConcurrentMaskedTable` (`core/classifier/concurrent_masked.*`):
+       one `ConcurrentExactTable` per mask, write-once rule records with
+       retire-then-reuse ids, an RCU-published tuple list, and the result
+       packed with the id so single matches skip the record load;
+     - WildcardMatch switched to it, with add/delete/clear in place and the
+       default gate and restore via generation;
+     - tests: 6 table tests (including the deterministic
+       `RetiredRuleIdWaitsForOnlineReaders`, which fails 3/3 without the
+       grace period), WildcardMatch 12/12, live `wildcard_match.py` 9/9;
+     - `modules/wildcard_match_update_bench.cc`.
+   - Measured on corei7 builds: add+delete ~1.1 µs, flat in rules and
+     masks.
+   - Lookup, after the hashing fixes below: faster than the old generation
+     table from 128K rules (−18..−62%). Residual regressions: +11..15% at
+     4 tuples and 1K-16K rules, and +6% for 1 tuple at 1M rules on the
+     P-core.
+   - The user accepted trading these off, pending the native re-measurement
+     (§31.2.1).
+2. **ConcurrentExactTable lookup overheads, D-015 (to write).** Profiled on
+   the 4-tuple lookup:
+   - `rte_hash` hashed each key through a function pointer into the
+     generic any-length `rte_hash_crc` (~20%). Now a fixed-width inline
+     CRC32C kernel (one `crc32` per 8 bytes) plus DPDK's own
+     `rte_hash_lookup_with_hash_bulk_data`, bit-identical. Test:
+     `InlineHashIsBitIdenticalToRteHash`, every width 1-64 at all 8
+     alignments; changing the seed fails it.
+   - Keys whose width is not a multiple of 16 were compared with libc
+     `memcmp` through a pointer (~9%). Now `rte_hash_set_cmp_func` with an
+     equality-only fixed-width compare: `load; cmp; setne` for 8 bytes.
+     Test: `FixedWidthCompareIsExactEquality`. The first attempt used a
+     constant-size `memcmp`, which GCC still tail-called because memcmp's
+     ordering had to be preserved.
+   - Result: ExactMatch lookups are faster than the old cuckoo at every
+     size on both core types (−2..−55%, corei7 build).
+3. **Release-build fix:** `protobuf/meson.build` keeps
+   `(maybe-)uninitialized` as warnings, not errors, for protoc-generated
+   code only. GCC reports false positives in protobuf's headers at -O3, so
+   `buildtype=release` did not build at all.
+4. **`tools/ab_bench.py`:** the ABBA paired-comparison tool (§31.1).
+
+#### 31.2.1 Measurement running at handoff
+
+The native/release ABBA suite (`/var/tmp/run_abba.sh`, log
+`/var/tmp/abba_native.log`):
+
+1. updates, old module against new;
+2. WildcardMatch old-vs-new lookups and 2b, ExactMatch old-vs-new, on CPUs
+   2 and 14;
+3. the ISA effect: the same code built corei7 against native.
+
+Record its results in D-014/D-015 and the new entries; they decide §31.4
+item 1.
+
+### 31.3 Next, in order (G1.2a completion)
+
+1. **Regression second pass, continued** (the user asked why, and is open to
+   trade-offs):
+   - 4-tuple small tables: what remains is `rte_hash`'s per-call setup in
+     `__bulk_lookup_lf` (512 B hit-mask zeroing, positions init, change
+     counter), paid once per tuple. It can only be removed by our own
+     lock-free cuckoo (§31.5 item 1).
+   - 1 tuple at 1M rules (+6%, P-core): the hypothesis is prefetch pacing.
+     Computing all hashes first delays the first bucket prefetch; DPDK's own
+     path interleaves hash and prefetch. Test with a per-table choice (DPDK
+     hashing for tables beyond L3, inline below; decided at create per
+     D-011), or by interleaving, and measure ABBA.
+2. **Mode W infrastructure:** per-worker SPSC operation rings, drained at
+   the scheduler-round boundary into worker-private replicas or shards, with
+   completion counters. No grace period or pause is needed for W-owned
+   state (D-013).
+3. **Take the pause-bound commands off the global worker pause:**
+   L2Forward (add/delete/populate), ACL (add/clear), HashLB
+   (set_mode/set_gates), URLFilter, BPF. Choose C, W or G per table
+   (dataplane-tables.md §3).
+4. **Fix DRR:** it allows several workers, but `ProcessBatch` writes the
+   flow `CuckooMap` with no synchronization. Either restrict it to one
+   worker or make the flow state worker-owned (W).
+5. **Prior-art study before transactions:** DPDK `rte_swx` table staging
+   with commit/abort, P4Runtime write atomicity (continue-on-error,
+   rollback-on-error, dataplane-atomic), and VPP bihash and binary API.
+   Record what is borrowed as decisions.
+6. **G1.2b transactions** across tables with different update modes. The
+   hard question, per an external review: how one transaction combines C
+   tables, W state, published generations and meter state without
+   pretending they are one mechanism. Planned approach, D-013:
+   - insert in dependency order (referenced objects first, unreachable
+     until referenced);
+   - delete in reverse, with retirement after a grace period;
+   - an opt-in scope cell (one atomic word) for all-at-once cutover;
+   - no worker pause for data transactions.
+7. **Graph changes without pauses:** publish connections and tasks via RCU.
+   Destroying a module then waits for a grace period, never a pause
+   (D-013).
+
+### 31.4 Performance and ISA (per the user: compiler features first, hand-rolled last)
+
+1. **Function multiversioning, if §31.2.1 section 3 shows native materially
+   beats corei7.** Order of preference:
+   - build flags (native/v3 for deployment);
+   - compiler multiversioning: GCC/Clang
+     `target_clones("default","arch=x86-64-v3","arch=x86-64-v4")` on
+     batch-level kernels only, never inlined helpers (each call pays an
+     `ifunc` indirection). Candidates: mask batch, hash batch, ExtractPlan
+     `ExecuteBatch`, the staged probe loops, the masked merge;
+   - portable SIMD (`std::experimental::simd`, C++26 `std::simd`);
+   - hand-written intrinsics or per-ISA copies only with a measured need.
+
+   DPDK's model, for reference: compile-time `machine`, plus runtime
+   dispatch for a few libraries (`acl`, `fib`, `net` CRC, `member`, `efd`
+   and `hash` CRC) via `rte_cpu_get_flag_enabled` and
+   `rte_vect_get_max_simd_bitwidth`.
+2. **ISA review findings** (uops.info, Alder Lake-P/E and Zen 3/4/5):
+
+   | operation | finding | action |
+   |---|---|---|
+   | `crc32 r64` | 1 uop, 3-cycle latency, 1/cycle (3/cycle on Zen 5) | optimal for keys up to 64 B; per-key chains overlap out of order; nothing to do |
+   | `bsf` vs `tzcnt` | equal on Intel and Zen 4/5; `bsf` is 6 uops, 1 per 3 cycles on **Zen 3** against `tzcnt`'s 2 uops, 2 per cycle | needs BMI1: native/v3 builds or multiversioning |
+   | `blsr` (`x & (x-1)`) | 1 uop with BMI1, 2 instructions without | same |
+   | key compare | fixed | equality-only kernel (§31.2 item 2) |
+   | masking | one scalar AND per 8-byte key; wider keys vectorize on native | fine |
+   | signature compare (inside `rte_hash`) | SSE2 `pcmpeqw` twice per lookup; AVX2 `vpcmpeqw ymm` could do both buckets | one uop, inside DPDK; not pursued |
+   | `pause` | ~160 cycles on the Alder Lake P-core, ~62-65 on its E-core and on Zen | only in control-side spin loops (grace waits, benchmark loops); never on the packet path |
+   | atomics on the packet path | acquire/release compile to plain `mov` (x86 TSO); quiescence is one load and one store | nothing to do; no locked instructions except `kShared` meters |
+
+3. **CRC linearity for tuple-space search:** CRC is affine over GF(2), so
+   the hash of `key & mask` can be assembled from per-byte contributions
+   computed once per key. Each extra tuple then costs a few XORs, not a
+   hash. Worth it only if hashing shows up again after D-015.
+4. **Tuple pruning:** order tuples by their highest priority and stop early
+   once a packet's match beats every remaining tuple. It only helps when a
+   whole batch has matched; measure first.
+5. **Clean up the unused `found` warning** in
+   `dataplane/update_scale_bench.cc` (Clang).
+
+### 31.5 Options kept open (decide with evidence)
+
+1. **Our own lock-free single-writer cuckoo** (option 3 from 2026-09-26):
+   the K3 table layout with DPDK's LF write protocol:
+   - entries written before their bucket slot is published;
+   - a change counter across displacements;
+   - slot reuse after a grace period (already in place).
+
+   It would remove `rte_hash`'s per-call bulk setup (§31.3 item 1). D-001
+   rejected it unless the gap mattered; revisit if §31.2.1 or a real
+   pipeline shows the residual matters.
+2. **A versioned-slot table** that drops QSBR for inline values (D-013).
+3. **Backend consolidation** (D-009): after WildcardMatch and L2Forward
+   settle, keep `ConcurrentExactTable`/`ConcurrentMaskedTable` for
+   runtime-updated state, one immutable backend, and Small/Direct only
+   where measured to win.
+4. **Decision-benchmark manifest and runner** (section 26):
+   `tools/ab_bench.py` is the engine to build it on.
+5. **Server-class validation:**
+   - every number so far is from one laptop;
+   - the multi-worker lookup penalty (entry 89) is unexplained;
+   - no NUMA and no real NIC so far.
+6. **gRPC replacement:** only if a single control stream must exceed about
+   20M ops/s (D-005).
+
+### 31.6 Network functions and UPF (Phase N, section 29; D-008)
+
+- Missing L2/L3 basics:
+  - N1 learning bridge;
+  - N2 IPv4 router with ARP/ICMP;
+  - N3 ECMP;
+  - N4 IPv6;
+  - N5 VRFs;
+  - N6 policer and shaper;
+  - N7 mirroring.
+- Reference stateful NFs:
+  - N8 conntrack + firewall;
+  - N9 CGNAT;
+  - N10 L4 load balancer;
+  - N11 IPFIX;
+  - N12 IPsec.
+- Generic gaps, each listing its non-UPF consumers:
+  - a dataplane-to-control event path;
+  - per-worker timers;
+  - flow affinity;
+  - per-object counters at scale;
+  - a kernel exception path;
+  - IPv6 tables.
+- Service pipelines: edge router, L4 LB, and UPF with value-add services.
+- UPF stays a plugin and comes last. A core feature needs at least two
+  non-UPF consumers.
+- Neighbour handling (ARP/ND) lives in the router NF, not the core
+  `Router`, per the external review.
+
+### 31.6a Tracked in other sections (not repeated here)
+
+- **Section 28 (UPF consumer program):**
+  - K7.1 route domains;
+  - K3.8 `rte_acl` range backend;
+  - K9 packet store (idle-UE downlink buffering);
+  - plugin packaging;
+  - the UPF plugin items.
+- **Section 27 (Phase L):**
+  - L1 measurability (per-module counters; it also explains the entry 89
+    multi-worker penalty);
+  - bulk output partitioning;
+  - cross-worker handoff;
+  - the batch-size study.
+- **Section 26:**
+  - K8 fragmentation/reassembly (consumer-driven);
+  - Phases D, F, H, I and C-HW.
+
+### 31.7 Recurring checks
+
+- **On every DPDK upgrade:** `fib_bench` with `BESS_FIB_GATE=1` (D-003).
+  The CI tests in D-007 must pass; they pin every DPDK behaviour we rely
+  on. Re-run `BM_Lookup`, `occupancy_bench` and `grace_period_bench`.
+- **On new hardware:** re-run the D-006 and D-011 tuning checks and the
+  §31.4 ISA A/B.
+- **On any new concurrent structure:** a deterministic invariant test,
+  mutation-checked once (D-007).
+
 ## 25. Known lower-priority research/backlog
 
 These remain useful, but should not distract from the active G1 work.
@@ -9474,6 +9745,11 @@ full local Meson suites pass 91/91 (80 pre-K5 targets plus
 Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K7.
 Partial: F, H, and I. Not started: D, G1, and K8 (consumer-driven).
 C-HW remains a separate deferred hardware-validation track.
+
+**Start here: section 31 (work queue and open ideas, 2026-09-26).** It lists
+every open item from the latest sessions, with next steps and done
+criteria, plus how to build, benchmark (native, release, ABBA, isolated)
+and run live-daemon tests.
 
 **Next software work: G1.2 dataplane resource transactions** (G1.1, the v2
 pipeline API, is done), with Phase L (section 27) as a parallel performance
