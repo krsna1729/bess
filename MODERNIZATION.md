@@ -9612,6 +9612,74 @@ guide is [docs/dataplane-tables.md](docs/dataplane-tables.md). Pick any item
 whose prerequisites are met; update its status here when you start and
 finish.
 
+### 31.0 Priorities (2026-09-27, after the OMEC UPF review)
+
+An OMEC UPF author reviewed the branch against what OMEC maintains
+today. The adapter (`pfcpiface`) launches separate work per
+PDR/FAR/QER, translates each into module commands, and treats a
+timed-out batch as accepted with unknown dataplane state. Its PDR
+compiler expands port ranges into ternary entries, rejects simultaneous
+source and destination ranges, and programs only the first QER.
+
+The review's conclusion, adopted here: **the decisive simplification for
+OMEC is the resource-transaction and plugin contract, not another
+optimized packet primitive.**
+
+It is consistent with D-008 (UPF is a consumer). The generic features
+below each have non-UPF consumers, noted per item. The UPF slice is the
+validation consumer that shows which APIs are awkward; it does not
+drive the design.
+
+**Order of work:**
+
+| # | priority | deliverable | removes from OMEC | non-UPF consumers | status |
+|---|---|---|---|---|---|
+| 1 | P0 | **G1.2b transaction core**: resources, reserve/publish, dependency order, reference safety, per-op results, one grace period per transaction, deferred id reuse (D-020, D-021) | manual ordering, best-effort rollback | Router (routes -> next hops), ExactMatch/WildcardMatch rule sets -> action objects | in progress (engine, SlotTable and the adapters written, tested and mutation-checked; not yet committed) |
+| 2 | P0 | **G1.2c RPC:** `ApplyDataplaneTransaction` with `request_id`, `expected_generation`, typed per-op results and `GetTransaction` status lookup; a streaming packed-op path (E4) | per-rule RPC orchestration, timeout ambiguity, rule-key reconstruction for deletion | any controller: routing daemons, firewall/NAT rule loaders | next |
+| 3 | P0 | **The scope cell (dataplane-atomic scopes), precisely.** An atomic scope must keep both the old and the new interpretation until its publication point. New state is written to *new* keys or write-once slots, and the cell's flip selects which set packets use. A version flag over entries already overwritten in place cannot restore them (review caution). Tables that can only be updated in place refuse atomic scopes rather than fake them (D-020). | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | design, with G1.2b |
+| 4 | P1 | **Vertical UPF slice** (in-tree plugin, static G0 graph): one uplink/downlink session using a typed classifier with a direct `ActionId` result (no `ResultSlot` -> `PackedValueStore` -> `ActionId` chain), a FAR executor, K5 `MeterSet` (no second meter implementation), K6 counters and K7 IPv4 routes, all programmed through G1.2 | validates the contract end to end | -- (validation consumer) | after 1-2 |
+| 5 | P0 | **External plugin package:** installed headers, a Meson dependency (`bess-dev`), a supported plugin API subset and a written compatibility policy | OMEC's vendored BESS fork | any out-of-tree module author | after 4 shows the API surface |
+| 6 | P1 | **K3.8 range backend** (arbitrary source and destination ranges plus precedence), differential against a scalar reference, including overlapping wildcards and simultaneous source/destination ranges | Go ternary expansion, range-width limits, Cartesian products | ACL, firewall rules (N) | queued |
+| 7 | P1 | **K7.1 route domains** (`RouteDomainId`, `ApplyRouteSet`) | Network Instance / N3-N6-N9 workarounds | VRFs (N5), multi-tenant routers | queued |
+| 8 | P1 | **G1.4 resource statistics API over K6** (`GetStats`/`WatchStats` per resource and scope) | polling individual modules, custom aggregation | every NF | queued |
+| 9 | P1 | **K9 bounded packet store + G1.4 event channel** (bounded, backpressure-aware, correlated to scope/action) | custom buffering, unreliable notifications (DDN) | NAT/ARP pending queues, punt paths (N0) | queued |
+| 10 | P2 | **Worker affinity and cross-worker handoff:** first expose the effective RSS configuration and queue-to-worker mapping, then generic handoff (DRR's ingress ring is the first instance, D-019) | UPF-specific queue plumbing, multi-worker limits | NAT, stateful firewall, DRR | queued |
+| 11 | P2 | **Narrow hardware steering:** a lifecycle-managed `rte_flow` interface for the flow shapes actually needed. Capabilities come from exact feature tests with conservative fallback, never driver-name guesses (the PMD's current GTP checksum inference by driver name is to be replaced) | UPF-maintained PMD code | N0 vif demux | queued |
+| later | -- | IPv6 routes, fragmentation/reassembly, more NIC features | remaining protocol limits | -- | -- |
+
+**Course corrections adopted:**
+
+- **D-009 backend consolidation is scheduled right after G1.2b.** Keep
+  measured specialized paths; retire overlapping general-purpose exact
+  tables that exist only because K3 experimented.
+- **No mode-W infrastructure ahead of consumers** (already §31.3 item 2).
+- **Hardware metadata proportional to verified use** (row 11).
+- **Phase N (virtual interfaces, routing, bridging, firewall, NAT, service
+  pipelines) is not a prerequisite for the UPF slice.**
+- **ThreadSanitizer and mutation-checked concurrency tests are gates**
+  (§31.7). Performance results never substitute for memory-model
+  correctness; the L2 AVX2 probe is the standing example.
+- **The WildcardMatch presence filter (§31.3 item 1)** is benchmarked with
+  representative UPF rule distributions, but it does not delay the
+  transaction API.
+
+**The Go SDK carries the atomicity levels explicitly:**
+
+- the default dependency-safe transaction, in which packets may see
+  operations take effect one by one, in dependency order;
+- an opt-in atomic scope for modifications that change overlapping
+  PDRs, FARs and QERs together.
+
+Session establishment defaults to the first. Typed errors and per-operation
+results are preserved, never collapsed into a boolean. An illustrative
+shape, not a commitment:
+
+```go
+tx := bess.NewTransaction().ForSession(key).ExpectGeneration(gen).WithRequestID(id)
+tx.PutMeter(ul); tx.PutAction(act); tx.PutClassifierRule(match, actID); tx.PutRoute(domain, route)
+res, err := tx.Commit(ctx) // Applied | Rejected{per-op errors} | Conflict; GetTransaction(id) after a timeout
+```
+
 ### 31.1 How to work in this repo (read first)
 
 - **Benchmarking:** follow [docs/benchmarking.md](docs/benchmarking.md).
