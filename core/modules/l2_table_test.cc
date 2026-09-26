@@ -189,7 +189,7 @@ TEST(L2TableConcurrencyTest, ReadersNeverMissAStableEntryDuringChurn) {
   }
 
   std::vector<uint64_t> churn;
-  uint64_t moves_possible = 0, ops = 0;
+  uint64_t ops = 0;
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
   while (std::chrono::steady_clock::now() < deadline) {
@@ -200,11 +200,9 @@ TEST(L2TableConcurrencyTest, ReadersNeverMissAStableEntryDuringChurn) {
       churn.pop_back();
     } else {
       const uint64_t mac = rng() & 0xffffffffffffull;
-      const int r = l2_add_entry(&table, mac, 0x7000);
-      if (r == 0) {
+      // A full table (-ENOMEM) is fine: the churn continues with deletes.
+      if (l2_add_entry(&table, mac, 0x7000) == 0) {
         churn.push_back(mac);
-      } else {
-        moves_possible += r == -ENOMEM;
       }
     }
     ops++;

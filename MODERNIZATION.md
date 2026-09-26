@@ -3842,8 +3842,8 @@ rather than one call site).
       (native, ABBA).
     - A deterministic move-hook test catches the reversed move order; the
       stress test does not.
-    - Still on the pause: BPF (next, with `rte_bpf`), URLFilter (legacy;
-      see §31.6).
+    - Still on the pause: BPF (deferred with the `rte_bpf` decision) and
+      URLFilter (legacy); see §31.6.
 
 ## Review process established this session
 
@@ -9599,9 +9599,9 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
    completion counters. No grace period or pause is needed for W-owned
    state (D-013).
 3. **Take the remaining pause-bound commands off the global worker
-   pause:** BPF (add/delete/clear), as G, done together with the
-   `rte_bpf` move (D3; see §31.6). URLFilter stays on the pause as legacy
-   (§31.6). L2Forward, ACL and HashLB are done (D-017).
+   pause:** BPF is deferred with the `rte_bpf` decision (§31.6, D3).
+   URLFilter stays on the pause as legacy (§31.6). L2Forward, ACL and
+   HashLB are done (D-017).
 4. **Fix DRR:** it allows several workers, but `ProcessBatch` writes the
    flow `CuckooMap` with no synchronization. Either restrict it to one
    worker or make the flow state worker-owned (W).
@@ -9754,22 +9754,73 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
       mode G swap, with the old database freed after a grace period.
   - **Consumers:** a secure web gateway or edge policy NF, parental or
     enterprise filtering, and SNI-based steering in an L4/L7 LB.
-- **BPF → `rte_bpf` (D3) is next, together with taking BPF off the
-  pause.**
-  - **Pipeline:** `pcap_compile`, then `rte_bpf_convert` (classic to eBPF;
-    our pinned DPDK is built with libpcap), then `rte_bpf_load`, then
-    `rte_bpf_get_jit` (x86 and ARM JITs).
-  - **Mode G:** each published filter set owns its programs, and
-    `rte_bpf_destroy` runs only after a grace period.
-  - **Acceptance (D3):**
-    - the same verdicts as the old JIT on a corpus of pcap expressions and
-      packets;
-    - an ABBA comparison with the old JIT;
-    - the old JIT is deleted only if D3's criteria hold.
-  - **Bugs found in the current module:**
-    - `delete` leaks the mmap'd JIT code;
-    - a failure partway through `add` keeps the earlier filters;
-    - `priority` is narrowed from int64 to int with no check.
+- **BPF → `rte_bpf` (D3): DEFERRED (2026-09-26, per the user: record
+  now, come back at the end).** The BPF module stays on its own JIT and on
+  the worker pause until this is decided.
+  - **Landed groundwork, not used by the module:**
+    - `core/utils/bpf_program.{h,cc}` (`BpfProgram`): `pcap_compile`, then
+      `rte_bpf_convert`, then a repair pass, then `rte_bpf_load`, then the
+      JIT;
+    - `core/utils/bpf_program_test.cc`: a differential test against
+      libpcap's `bpf_filter()` covering 41 expressions and 4,000 generated
+      packets, each whole and split across two mbufs.
+  - **Two DPDK bugs found by that test** (DPDK 25.11.3, and still on `main`
+    as of 2026-09-26). Both are worked around in `BpfProgram::Repair`, and
+    each workaround was mutation-checked once (without it, the test fails
+    or crashes):
+    1. `lib/bpf/bpf_convert.c` gives classic indirect loads (`[x + k]`)
+       the base register `BPF_SRC(code)`. Bit 0x08 is part of the size
+       field for loads, so halfword loads get X by accident, while byte and
+       word loads get A. `tcp[tcpflags]`, `tcp[13]` and `udp[8:4]` read the
+       wrong offset.
+    2. In `lib/bpf/bpf_jit_x86.c`, `emit_tst_imm` emits TEST r/m64, imm32
+       (`F7 /0`) with an `imm_size()`-sized immediate, which is one byte
+       for k in −128..127. `jset #k` with a small k then corrupts the code
+       stream: a wrong verdict or SIGSEGV. The workaround rewrites such a
+       jset as `mov64 r9, #k; jset rA, r9` and remaps the jump offsets.
+  - **What DPDK tests and claims:**
+    - `app/test/test_bpf.c` `bpf_convert_autotest` converts and loads
+      about 20 pcap filters, including flag tests. It executes only `ip`
+      and `not ip` on one packet, and never compares verdicts;
+    - the programmer's guide lists "cBPF" under unsupported features,
+      although `rte_bpf_convert` exists and `dpdk-dumpcap` uses it for
+      capture filters, which are probably affected by both bugs.
+  - **To do when resumed:**
+    1. **Upstream the fixes, following DPDK's contributing guide:**
+       - `git format-patch`, a `Fixes:` tag and `Cc: stable@dpdk.org`;
+       - `devtools/checkpatches.sh` and `check-git-log.sh`, a
+         `Signed-off-by`;
+       - `git send-email` to dev@dpdk.org, Cc the lib/bpf maintainer from
+         MAINTAINERS.
+
+       Include a test: extend `bpf_convert_autotest` to execute each
+       sample filter and compare against libpcap `bpf_filter()` on crafted
+       packets (a differential test), run with and without the JIT. Confirm
+       with the user before sending (it is an outward-facing action).
+    2. **Hunt for more bugs before trusting it:**
+       - a wider differential corpus: every pcap primitive, random
+         expressions, and fuzzed packets and instruction streams;
+       - the interpreter and the JIT compared against each other;
+       - the arm64 JIT under emulation (it has no mbuf-load support, so it
+         interprets).
+    3. **Decide whether to move** (D3 acceptance criteria):
+       - equivalence (above);
+       - an ABBA comparison against the old BESS JIT;
+       - maintenance and security.
+
+       Options: move to `rte_bpf` with the repair pass, or keep the BESS
+       JIT (which reads only the first segment), or both behind a flag.
+    4. **Longer term, offer eBPF to module users directly** (programs from
+       ELF via `rte_bpf_elf_load`, clang-compiled C, maps and helpers
+       permitting), with pcap-filter kept as the compatibility front end.
+       DPDK's eBPF is the supported path; cBPF only arrives through
+       conversion.
+    5. **Take BPF off the pause with mode G.** Each published filter set
+       owns its programs, freed after a grace period. Also fix the current
+       module's bugs:
+       - `delete` leaks the mmap'd JIT code;
+       - a failure partway through `add` keeps the earlier filters;
+       - `priority` is narrowed from int64 to int.
 
 ### 31.6a Tracked in other sections (not repeated here)
 

@@ -113,6 +113,7 @@ module_sources = files(
 
 utility_sources = files(
   'utils/bpf.cc',
+  'utils/bpf_program.cc',
   'utils/copy.cc',
   'utils/endian.cc',
   'utils/ether.cc',
@@ -254,6 +255,7 @@ unit_test_sources = [
   'drivers/pcap_test.cc',
   'drivers/pmd_test.cc',
   'utils/bits_test.cc',
+  'utils/bpf_program_test.cc',
   'utils/checksum_test.cc',
   'utils/codel_test.cc',
   'utils/cuckoo_map_test.cc',

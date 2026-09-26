@@ -243,7 +243,7 @@ state through G, C or W.
 | ACL | `std::vector` of rules, linear scan | G: `add` copies, appends and publishes (all or nothing) | D-017; `rte_acl` (G-only) is the candidate for large rule sets |
 | HashLB | configuration only (`ExactMatchTable` for field layout) | G: one `RcuPtr<Config>`, read once per batch | D-017 |
 | URLFilter | `Trie` per host | Pause | legacy: cleartext HTTP only; a modern SNI classifier is recorded in MODERNIZATION §31.6 |
-| BPF | compiled filters | Pause | next: G, with the move to `rte_bpf` |
+| BPF | compiled filters | Pause | deferred: G together with the `rte_bpf` decision (MODERNIZATION §31.6) |
 | NAT | `CuckooMap` | worker-owned (the packet path learns flows) | limited to one worker |
 | DRR | `CuckooMap` of flows | written by the packet path | **open issue:** DRR allows several workers, yet its `ProcessBatch` writes the flow map with no synchronization; to review |
 

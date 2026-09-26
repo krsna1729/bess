@@ -38,6 +38,7 @@ file is the reasoning.
 | D-015 | Hash and compare keys inline around `rte_hash` lookups | accepted |
 | D-016 | Benchmark native release builds with ABBA; no ISA multiversioning for now | accepted |
 | D-017 | HashLB and ACL on mode G, L2Forward on mode C; control commands off the worker pause | accepted |
+| D-018 | BPF execution: DPDK `rte_bpf` (with a repair pass) or the BESS JIT | open (deferred) |
 
 ---
 
@@ -959,3 +960,44 @@ follows from the size and change rate of its state (D-004).
 - L2 learning moves into the packet path (the writer would become a
   worker, so mode W or a per-worker learn queue);
 - a second writer is ever needed for `l2_table`.
+
+## D-018 BPF execution: DPDK `rte_bpf` (with a repair pass) or the BESS JIT
+
+**Status:** open, deferred (2026-09-26). The BPF module still uses the
+BESS JIT. The work queue is in MODERNIZATION §31.6.
+**Code:** `core/utils/bpf_program.{h,cc}` (`BpfProgram`, not yet used by
+the module), `core/utils/bpf_program_test.cc`.
+
+**Context.** The BPF module carries its own x86-only classic-BPF JIT. It
+reads only the first segment, and elsewhere it falls back to libpcap's
+interpreter. DPDK's `rte_bpf` offers eBPF with x86 and arm64 JITs and an
+mbuf-aware packet access, and `rte_bpf_convert()` turns pcap's classic
+programs into eBPF.
+
+**What is known.**
+
+- **A differential test** compares `rte_bpf` against libpcap's
+  `bpf_filter()`: 41 expressions × 4,000 generated packets, whole and split
+  across two mbufs.
+- **It found two DPDK bugs,** both still on DPDK `main`:
+  1. the converter gives byte and word indirect loads the accumulator as
+     their base register;
+  2. the x86 JIT truncates the immediate of `jset #k` for k in −128..127,
+     which gives wrong verdicts or a crash.
+
+  `BpfProgram::Repair` works around both, and each workaround was
+  mutation-checked. With it, the test agrees everywhere, and the x86 JIT
+  is in use.
+- **What DPDK tests:** its own test only converts and loads sample filters;
+  it never compares verdicts.
+- **What DPDK claims:** its guide lists cBPF as unsupported, although it
+  ships the converter and `dpdk-dumpcap` uses it.
+
+**Open questions (for the decision):**
+
+- upstream fixes and tests;
+- a wider differential and fuzz corpus to find anything else;
+- an ABBA comparison against the BESS JIT;
+- whether to offer eBPF (ELF) programs to module users directly.
+
+**Revisit when:** the deferred work in MODERNIZATION §31.6 is resumed.
