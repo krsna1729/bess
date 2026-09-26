@@ -38,7 +38,7 @@ or building it.
 ```bash
 tools/bootstrap_dpdk.py --af-xdp auto
 export PKG_CONFIG_PATH="$(tools/bootstrap_dpdk.py --print-pkg-config-path):${PKG_CONFIG_PATH}"
-meson setup build-meson -Dcpu=corei7 -Daf_xdp=auto
+meson setup build-meson -Dcpu=x86-64-v3 -Daf_xdp=auto
 meson compile -C build-meson
 meson test -C build-meson --print-errorlogs
 ```
@@ -46,7 +46,9 @@ meson test -C build-meson --print-errorlogs
 CI uses `--af-xdp required`; this checks the libxdp/libbpf development
 packages, headers, and DPDK `net_af_xdp` shared and static artifacts.  Use
 `-Daf_xdp=required` locally for the same check.  `-Dcpu=native` is the
-default; choose a portable ISA such as `corei7` for distributable builds.
+default; choose a portable ISA such as `x86-64-v3` (the CI floor: AVX2,
+BMI1/2) for distributable builds. For benchmarking, see
+[docs/benchmarking.md](docs/benchmarking.md).
 DPDK is consumed through `pkg-config` and is dynamically linked by default.
 Use `-Ddpdk_link=static` only when a static DPDK link is intentional.
 

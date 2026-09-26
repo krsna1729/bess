@@ -79,7 +79,7 @@ propose it unprompted.
 ```bash
 tools/bootstrap_dpdk.py --af-xdp auto
 export PKG_CONFIG_PATH="$(tools/bootstrap_dpdk.py --print-pkg-config-path):${PKG_CONFIG_PATH}"
-meson setup build-meson -Dcpu=corei7 -Daf_xdp=auto
+meson setup build-meson -Dcpu=x86-64-v3 -Daf_xdp=auto
 meson compile -C build-meson -j4
 meson test -C build-meson --no-rebuild --print-errorlogs -j4
 meson test -C build-meson --no-rebuild --suite python --print-errorlogs -j4
@@ -3773,6 +3773,57 @@ rather than one call site).
       reusable. Without the reuse guard it fails ("a retiring id was
       reused").
     - `ConcurrentChurnNeverLosesANextHop` now also counts reuse refusals.
+97. **WildcardMatch on mode C (D-014).** `classifier::ConcurrentMaskedTable`:
+    - one `ConcurrentExactTable` per mask;
+    - write-once rule records with retire-then-reuse ids (grace period);
+    - an RCU-published tuple list;
+    - the result packed with the id, so single matches skip the record
+      load.
+
+    add/delete/clear change it in place; the default gate and restore go
+    through a generation.
+    - Measured on native release builds (8-pair ABBA):
+      - updates: 1.1 ms / 12 ms / 145 ms per add+delete (1K/10K/100K
+        rules) → ~1 µs, flat across 1-8 masks;
+      - lookups: 1 tuple −11..−51%; any tuple count at 1M rules −33..−50%;
+        multi-tuple small tables **+15..+31%** (a trade-off the user
+        accepted; see D-014 for why).
+    - Tests: ConcurrentMaskedTable 6, including the deterministic
+      id-retirement test (fails 3/3 without the grace period);
+      WildcardMatch 12/12; live `wildcard_match.py` 9/9.
+
+98. **`rte_hash` lookup overheads removed (D-015).** Profiling showed
+    ~20% in hashing through a function pointer into the generic
+    any-length CRC, and ~9% in libc `memcmp` for keys that are not
+    multiples of 16.
+    - Now: an inline fixed-width CRC32C with DPDK's prehashed bulk lookup
+      (bit-identical, tested for widths 1-64 at all alignments), and an
+      equality-only fixed-width compare (`mov; cmp; setne`). The first
+      compare attempt still tail-called `memcmp`; generated-code review
+      caught it.
+    - ExactMatch, native: hits −16..−37% against the old cuckoo; misses
+      +33/+43% at 1K rules and faster from 128K-1M. What remains is
+      `rte_hash`'s per-call bulk setup.
+
+99. **Benchmark methodology, builds and ISA (D-016).**
+    - `tools/ab_bench.py`: ABBA order, paired ratios, a ±3% band with ≥3/4
+      of pairs agreeing, pairing inside one binary, and a busy-machine
+      pre-flight check.
+    - `docs/benchmarking.md`: generic rules.
+    - Release builds fixed: protobuf's generated code keeps
+      `(maybe-)uninitialized` as warnings.
+    - Benchmark numbers now come from native release builds; earlier
+      entries used `corei7` builds.
+    - CI moves from `corei7` to `x86-64-v3`, with a runner check step.
+      GitHub runners are EPYC 7763 (Zen 3): v3 yes, v4 no.
+    - Native against corei7 on the same code: 3-8% on the new paths on the
+      P-core, nothing on the E-core. So no multiversioning for now.
+    - The survey of ISA features beyond v3 (AVX-512/AVX10, APX, WAITPKG,
+      and others) and when to target each: D-016 and §31.4.
+    - Incident: a benchmark hung since the previous day was found spinning
+      at 100% CPU. Isolation kept it off the benchmark CPUs; the ABBA
+      ratios are valid, but absolute numbers may read a few percent low.
+      The pre-flight check now prevents it.
 
 ## Review process established this session
 
@@ -9469,109 +9520,50 @@ finish.
 
 ### 31.1 How to work in this repo (read first)
 
-- **Benchmarks**
-  - Build: `meson setup build-bench -Dcpu=native --buildtype=release`, or
-    at least `-Dcpu=x86-64-v3`. Never quote numbers from `build-meson`:
-    it is `-Dcpu=corei7`, CI's portable baseline, with no AVX2/BMI (it
-    emits `bsf` instead of `tzcnt`, which is 6 uops on Zen 3). All numbers
-    before 2026-09-26 in entries 88-96 were measured on corei7 builds of
-    BESS code (DPDK was native) and are superseded where re-measured.
-  - Run through `omarchy-benchmark --cpu N --isolate` (performance
-    governor, isolated cgroup partition, SMT sibling offline).
-  - Compare with `tools/ab_bench.py A B --filter ... --wrap
-    "omarchy-benchmark --cpu N --isolate --"`. It runs A and B in ABBA
-    order, pairs adjacent runs, and calls a difference only outside a ±3%
-    noise band with at least 3/4 of pairs agreeing. It also pairs two
-    implementations in one binary: `--filter-b` plus `--rename-b`.
-  - Measure on a P-core (CPU 2) and an E-core (CPU 14) of this i9-13900H.
-  - `BESS_DPDK_HUGEPAGE_MB=1024`: one 1 GiB page on this host, so only one
-    DPDK process at a time. A running bessd (module tests) blocks
-    benchmarks.
-  - Long suites: `omarchy-benchmark` needs `sudo` to restore state. Keep
-    it authorized (`sudo -n -v` every few minutes). If `sudo` expires
-    mid-run, CPUs stay offline and the cgroup stays isolated; run
-    `omarchy-benchmark --reset --force`.
-- **Builds:** compile at `-j4` at most. This host has 15 GiB, and `-j16`
-  was killed for memory. Release builds work since the protobuf
-  `-Wno-error=(maybe-)uninitialized` fix.
-- **Live-daemon module tests:**
-  ```
-  G=$PWD/build-meson/protobuf/generated/python
-  sudo env LD_LIBRARY_PATH=... BESS_DPDK_HUGEPAGE_MB=1024 PYTHONPATH=$G \
-      BESS_PROTOBUF_ROOT=$G BESSD_BINARY=$PWD/build-meson/core/bessd \
-      python3 bessctl/run_module_tests.py [--test_name NAME]
-  ```
-  Then `sudo chown -R $USER build-meson`.
-- **Shell hygiene:** never `pkill -f PATTERN` or `pgrep -f PATTERN` in a
-  loop where the pattern appears in your own command line; it matches
-  itself. Kill by PID.
+- **Benchmarking:** follow [docs/benchmarking.md](docs/benchmarking.md).
+  In short:
+  - native or x86-64-v3 release builds;
+  - an isolated CPU;
+  - an otherwise idle machine;
+  - `tools/ab_bench.py` for ABBA paired comparisons;
+  - run under `timeout`.
+
+  Numbers in entries 88-96 were measured on `corei7` builds of BESS code
+  and are superseded where re-measured.
+- **Release builds** work since the protobuf
+  `-Wno-error=(maybe-)uninitialized` fix for generated code.
+- **Live-daemon module tests:** `bessctl/run_module_tests.py` needs a
+  daemon it can start (root). Point it at the build tree:
+  - `BESSD_BINARY` at the built `core/bessd`;
+  - `PYTHONPATH` and `BESS_PROTOBUF_ROOT` at
+    `build-*/protobuf/generated/python`.
 - **Concurrency guarantees are deterministic tests** (D-007). Mutation-check
   each new one once, by removing the protection and watching it fail. Put
   the result in the commit message, not in a patch file.
 - **Decisions** go in `docs/decisions.md` (a new D-nnn, never rewritten,
   only superseded). Code that embodies one cites its id.
 
-### 31.2 In progress (uncommitted at the time of writing; commit when §31.2.1 numbers are in)
+### 31.2 Recently landed (2026-09-26)
 
-1. **WildcardMatch on mode C, D-014 (to write).**
-   - Done:
-     - `classifier::ConcurrentMaskedTable` (`core/classifier/concurrent_masked.*`):
-       one `ConcurrentExactTable` per mask, write-once rule records with
-       retire-then-reuse ids, an RCU-published tuple list, and the result
-       packed with the id so single matches skip the record load;
-     - WildcardMatch switched to it, with add/delete/clear in place and the
-       default gate and restore via generation;
-     - tests: 6 table tests (including the deterministic
-       `RetiredRuleIdWaitsForOnlineReaders`, which fails 3/3 without the
-       grace period), WildcardMatch 12/12, live `wildcard_match.py` 9/9;
-     - `modules/wildcard_match_update_bench.cc`.
-   - Measured on corei7 builds: add+delete ~1.1 µs, flat in rules and
-     masks.
-   - Lookup, after the hashing fixes below: faster than the old generation
-     table from 128K rules (−18..−62%). Residual regressions: +11..15% at
-     4 tuples and 1K-16K rules, and +6% for 1 tuple at 1M rules on the
-     P-core.
-   - The user accepted trading these off, pending the native re-measurement
-     (§31.2.1).
-2. **ConcurrentExactTable lookup overheads, D-015 (to write).** Profiled on
-   the 4-tuple lookup:
-   - `rte_hash` hashed each key through a function pointer into the
-     generic any-length `rte_hash_crc` (~20%). Now a fixed-width inline
-     CRC32C kernel (one `crc32` per 8 bytes) plus DPDK's own
-     `rte_hash_lookup_with_hash_bulk_data`, bit-identical. Test:
-     `InlineHashIsBitIdenticalToRteHash`, every width 1-64 at all 8
-     alignments; changing the seed fails it.
-   - Keys whose width is not a multiple of 16 were compared with libc
-     `memcmp` through a pointer (~9%). Now `rte_hash_set_cmp_func` with an
-     equality-only fixed-width compare: `load; cmp; setne` for 8 bytes.
-     Test: `FixedWidthCompareIsExactEquality`. The first attempt used a
-     constant-size `memcmp`, which GCC still tail-called because memcmp's
-     ordering had to be preserved.
-   - Result: ExactMatch lookups are faster than the old cuckoo at every
-     size on both core types (−2..−55%, corei7 build).
-3. **Release-build fix:** `protobuf/meson.build` keeps
-   `(maybe-)uninitialized` as warnings, not errors, for protoc-generated
-   code only. GCC reports false positives in protobuf's headers at -O3, so
-   `buildtype=release` did not build at all.
-4. **`tools/ab_bench.py`:** the ABBA paired-comparison tool (§31.1).
-
-#### 31.2.1 Measurement running at handoff
-
-The native/release ABBA suite (`/var/tmp/run_abba.sh`, log
-`/var/tmp/abba_native.log`):
-
-1. updates, old module against new;
-2. WildcardMatch old-vs-new lookups and 2b, ExactMatch old-vs-new, on CPUs
-   2 and 14;
-3. the ISA effect: the same code built corei7 against native.
-
-Record its results in D-014/D-015 and the new entries; they decide §31.4
-item 1.
+WildcardMatch on mode C (entry 97, D-014); the `rte_hash` lookup fixes
+(entry 98, D-015); benchmark methodology, CI on x86-64-v3 and the ISA
+survey (entry 99, D-016). The accepted trade-off still open: multi-tuple
+WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
 
 ### 31.3 Next, in order (G1.2a completion)
 
-1. **Regression second pass, continued** (the user asked why, and is open to
-   trade-offs):
+1. **The multi-tuple small-table miss cost** (the D-014 trade-off; not
+   blocking). The root cause is known: `rte_hash` misses on small tables
+   cost more than the old cuckoo's (ExactMatch misses at 1K: +33% on the
+   P-core, +43% on the E-core), and tuple-space search misses N−1 tuples
+   per packet.
+   - **The next thing to try, a per-tuple presence filter:** a bit array
+     indexed by the inline hash. The writer sets a key's bit before
+     inserting it; bits are cleared only by a rebuild (at growth or
+     saturation), RCU-published with the tuple list. Tuples whose bits
+     are all clear skip their `rte_hash` call, and only candidates go to
+     it. A false positive costs a normal lookup, never a wrong answer.
+   - Earlier notes:
    - 4-tuple small tables: what remains is `rte_hash`'s per-call setup in
      `__bulk_lookup_lf` (512 B hit-mask zeroing, positions init, change
      counter), paid once per tuple. It can only be removed by our own
@@ -9639,6 +9631,13 @@ item 1.
    | `pause` | ~160 cycles on the Alder Lake P-core, ~62-65 on its E-core and on Zen | only in control-side spin loops (grace waits, benchmark loops); never on the packet path |
    | atomics on the packet path | acquire/release compile to plain `mov` (x86 TSO); quiescence is one load and one store | nothing to do; no locked instructions except `kShared` meters |
 
+2a. **Instruction sets beyond v3** (the full survey is in D-016). Nothing
+    is critical today. Target, in order, when each pays:
+    1. AVX-512/AVX10 `target_clones` variants for wide-key masking and
+       candidate compaction (`vpcompressd`);
+    2. WAITPKG `umwait`/`tpause` for idle workers (with power-aware idle);
+    3. an APX variant once hardware exists (Intel SDE for correctness
+       before then).
 3. **CRC linearity for tuple-space search:** CRC is affine over GF(2), so
    the hash of `key & mask` can be assembled from per-byte contributions
    computed once per key. Each extra tuple then costs a few XORs, not a

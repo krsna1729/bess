@@ -34,6 +34,9 @@ file is the reasoning.
 | D-011 | Tune per table at build time from host facts discovered once per process | accepted |
 | D-012 | Workers report quiescence every 10 µs of scheduler time, not every 256 rounds | accepted |
 | D-013 | What needs a grace period, and why worker pauses can go but quiescence stays | accepted |
+| D-014 | WildcardMatch on mode C: a concurrent tuple-space table | accepted (trade-off recorded) |
+| D-015 | Hash and compare keys inline around `rte_hash` lookups | accepted |
+| D-016 | Benchmark native release builds with ABBA; no ISA multiversioning for now | accepted |
 
 ---
 
@@ -645,4 +648,224 @@ lets readers see.
 **Revisit when:** a versioned-slot table is built, since it would remove
 QSBR for that table only; or graph publication lands, since it would remove
 the pauses left for structural changes.
+
+## D-014 WildcardMatch on mode C: a concurrent tuple-space table
+
+**Status:** accepted (2026-09-26), with a lookup trade-off the user accepted.
+**Code:** `core/classifier/concurrent_masked.{h,cc}` (`ConcurrentMaskedTable`),
+`core/modules/wildcard_match.{h,cc}`,
+`core/modules/wildcard_match_update_bench.cc`.
+
+**Context.** WildcardMatch rebuilt every tuple table on every `add`: 1.1 ms
+per add+delete at 1K rules, 0.14 s at 100K.
+
+**Decision.**
+
+- One `ConcurrentExactTable` per distinct mask, keyed by the masked value.
+- Rule records `{priority, sequence, result}` are write-once. An update
+  writes a new record under a new id and swaps the table value; old ids are
+  recycled only after a grace period (D-013).
+- The tuple list is RCU-published, and republished only when a mask
+  appears or disappears (at most 8 masks, the wire limit).
+- The table value packs the id with the result, so a packet that exactly
+  one tuple matches never loads its record.
+- Semantics are preserved: the highest priority wins, then the later
+  command; re-adding the same (mask, value) replaces the rule; the mask
+  ceiling counts active masks.
+
+**Evidence** (native release builds, `tools/ab_bench.py`, 8 ABBA pairs
+each, pinned and isolated):
+
+- **Updates, per add+delete** (CPU 2, 4/4 pairs):
+
+  | rules | old | new |
+  |---|---|---|
+  | 1K | 1,090-1,139 µs | ~1 µs |
+  | 10K | 11,590-11,998 µs | ~1 µs |
+  | 100K | 140,062-149,199 µs | ~1 µs |
+
+  Flat across 1, 4 and 8 masks.
+- **Lookups, ns per 32 keys, new / old:**
+
+  | tuples | rules | CPU 2 | CPU 14 |
+  |---|---|---|---|
+  | 1 | 1K | 253 / 393 (−36%) | 461 / 519 (−11%) |
+  | 1 | 1M | 556 / 958 (−43%) | 1115 / 2236 (−51%) |
+  | 4 | 1K | 1288 / 1025 (**+27%**) | 1814 / 1388 (**+31%**) |
+  | 4 | 16K | 1308 / 1054 (**+24%**) | 1905 / 1615 (**+21%**) |
+  | 8 | 1K | 1857 / 1462 (**+26%**) | 2713 / 2100 (**+30%**) |
+  | 8 | 16K | 1850 / 1581 (**+16%**) | 2824 / 2553 (**+15%**) |
+  | 4 | 1M | 1716 / 2562 (−33%) | 3418 / 6384 (−50%) |
+  | 8 | 1M | 2463 / 4175 (−42%) | 6723 / 12750 (−48%) |
+
+- **Why multi-tuple small tables are slower:** each packet misses N−1
+  tuples, and `rte_hash` misses on small tables cost more than the old
+  cuckoo's. ExactMatch misses at 1K rules measure +33% on CPU 2 and +43%
+  on CPU 14 (D-015). Hits and large tables are faster.
+- **Correctness tests:**
+  - `ConcurrentMaskedTableTest.*`, including the deterministic
+    `RetiredRuleIdWaitsForOnlineReaders` (fails 3/3 without the grace
+    period) and a stress test in which stable top-priority rules must
+    always win under churn;
+  - `WildcardMatchTest` 12/12;
+  - the live-daemon `wildcard_match.py` 9/9.
+
+**Rejected.**
+
+- *Keeping the rebuild:* 0.14 s per change at 100K rules.
+- *Per-worker replicas (mode W):* lookups unchanged, but rehash stalls in a
+  worker loop and memory × workers.
+- *Packing priority into the table value:* priorities are full int64, and
+  equal priorities must go to the later command.
+
+**Revisit when:** the per-tuple presence filter (MODERNIZATION §31.3) is
+measured. It targets the multi-tuple miss cost directly. Also revisit if our
+own lock-free cuckoo (§31.5) becomes necessary.
+
+## D-015 Hash and compare keys inline around `rte_hash` lookups
+
+**Status:** accepted (2026-09-26).
+**Code:** `core/classifier/concurrent_exact.{h,cc}`
+(`detail::HashBatchFixed`, `detail::CmpFixed`, `LookupBatch`).
+
+**Context.** Profiling a 4-tuple WildcardMatch lookup found `rte_hash`
+spending:
+
+- ~20% hashing: each key goes through the table's `hash_func` pointer and
+  a PLT stub into the generic any-length `rte_hash_crc` (an alignment loop,
+  then word and tail loops);
+- ~9% in libc `__memcmp_avx2_movbe`: keys whose width is not a multiple of
+  16 are compared with `memcmp` through a function pointer.
+
+The probe itself (`__bulk_lookup_lf`) cost about the same as our cuckoo's.
+
+**Decision.**
+
+- **Hashing:** hash the batch inline with a CRC32C kernel fixed to the key
+  width (one `crc32` per 8 bytes), chosen once per table. Then call DPDK's
+  own `rte_hash_lookup_with_hash_bulk_data`.
+- **Compare:** install an equality-only fixed-width compare with
+  `rte_hash_set_cmp_func` for widths DPDK does not specialize. For 8 bytes
+  it compiles to `mov; cmp; setne`.
+- **Unchanged:** table layout, inserts, occupancy, and the concurrency
+  protocol (the change counter, compare-then-load).
+
+**Evidence.**
+
+- **Bit-identical hash:** `InlineHashIsBitIdenticalToRteHash` covers every
+  width 1-64 at all 8 alignments; changing the seed fails it and lookups
+  with it.
+- **Exact equality:** `FixedWidthCompareIsExactEquality` flips each byte
+  and checks that bytes beyond the key are ignored.
+- **The first compare attempt** used a constant-size `memcmp`, which GCC
+  still tail-called because memcmp's ordering had to be preserved. Caught
+  by reading the generated code.
+- **ExactMatch, native, new against the old cuckoo** (ns per 32 keys, 8
+  ABBA pairs):
+
+  | case | CPU 2 | CPU 14 |
+  |---|---|---|
+  | hits, 1K-128K | −34..−37% | −16..−21% |
+  | hits, 1M | −23% | −33% |
+  | misses, 1K | **+33%** (88 → 119) | **+43%** (134 → 196) |
+  | misses, 16K | +15% | +9% |
+  | misses, 128K | no clear difference | −7% |
+  | misses, 1M | −25% | −43% |
+
+- **What remains** is `rte_hash`'s per-call bulk setup (512 B of hit-mask
+  zeroing, position init, the change counter) on the miss path.
+
+**Rejected.** *Prehashing through the generic `rte_hash_crc`* (tried
+2026-09-25): it kept the generic loop and gained 8%.
+
+**Revisit when:** a DPDK upgrade changes `rte_hash`'s bulk lookup, or when
+the §31.3 presence filter makes the miss path moot.
+
+## D-016 Benchmark native release builds with ABBA; no ISA multiversioning for now
+
+**Status:** accepted (2026-09-26).
+**Code:** `tools/ab_bench.py`; `protobuf/meson.build` (release builds);
+the `cpu` option in `meson_options.txt`.
+
+**Context.**
+
+- The benchmark build directories had been configured `cpu=corei7`, CI's
+  portable baseline. BESS kernels were measured without AVX2 or BMI: the
+  code emitted `bsf`, not `tzcnt`. On Zen 3, `bsf` is 6 uops at one per 3
+  cycles against `tzcnt`'s 2 uops at two per cycle (uops.info).
+- `buildtype=release` did not build at all: GCC reports a false-positive
+  `-Wuninitialized` in protobuf's headers, which `-Werror` made fatal.
+- Comparisons were A-then-B, exposed to drift.
+- The user asked whether per-ISA function multiversioning should be
+  adopted, preferring compiler features over hand-written kernels.
+
+**Decision.**
+
+- **Benchmarks** use `-Dcpu=native` (or at least x86-64-v3) with
+  `buildtype=release`, pinned and isolated. Comparisons use
+  `tools/ab_bench.py`: ABBA order, paired ratios, and a difference is
+  called only outside ±3% with at least 3/4 of pairs agreeing.
+- **CI moves from `corei7` to `x86-64-v3`** (AVX2, BMI1/2, FMA, MOVBE).
+  GitHub's x64 Linux runners are AMD EPYC 7763 (Zen 3), which supports v3
+  but not v4 (no AVX-512). A workflow step checks that the runner supports
+  the floor (`ld.so --help` hwcaps) and fails loudly if not; CI once hit
+  an ISA mismatch between the runner that built the cached DPDK and a later
+  runner. v3 is also the recommended portable ISA for distributable builds
+  (README).
+- **The protobuf-generated library** keeps `(maybe-)uninitialized` as
+  warnings, so release builds work.
+- **No multiversioning for now.** The same code built `corei7` against
+  `native` (8 ABBA pairs):
+  - P-core: the new table paths are 4-8% faster; the old paths show no
+    clear difference;
+  - E-core: no meaningful difference (±4%, some cells slower).
+
+  The hot kernels (CRC32 via `crc32`, compares, masking) already compile
+  to the best instructions at the SSE4.2 baseline.
+- **Order of preference if ISA work is ever needed:** build flags;
+  compiler `target_clones` on batch-level kernels; portable SIMD
+  (`std::experimental::simd`, C++26 `std::simd`); hand-written intrinsics
+  only with a measured need.
+
+**Evidence.** uops.info: `crc32 r64` is 1 uop, 3-cycle latency, 1 per
+cycle (3 per cycle on Zen 5) on Alder Lake P/E and Zen 3/4/5; `pause` costs
+about 160 cycles on the Alder Lake P-core against 62-65 elsewhere (control
+paths only). The rest of the table is in MODERNIZATION §31.4.
+
+**Instruction sets beyond v3** (surveyed 2026-09-26; nothing is critical
+today):
+
+- **x86-64-v4 / AVX-512 and AVX10.1/10.2** (Intel Xeon, AMD Zen 4/5; not
+  Intel client parts or GitHub runners). Useful for:
+  - 64-byte key compare/mask in one instruction;
+  - mask registers;
+  - `vpcompressd` to compact candidate lists;
+  - `vpopcnt`.
+
+  AVX10 has AVX-512's semantics for our purposes, so one v4 variant covers
+  both. DPDK already dispatches `acl`, `fib` and CRC at run time. First
+  candidates, via `target_clones`, only when measured SIMD-bound:
+  wide-key masking and candidate compaction.
+- **APX** (32 GPRs, 3-operand forms, conditional compare/move; upcoming
+  Diamond Rapids / Nova Lake; GCC 14+ `-mapxf`, Clang 19+). A
+  recompile-only win for register-bound batch loops and branchy merges.
+  Add an APX `target_clones` variant once hardware exists; Intel SDE can
+  check correctness before then.
+- **WAITPKG** (`umwait`/`tpause`; AMD `mwaitx`). Power-efficient idle for
+  polling workers, and cheaper control-side spins than `pause` (~160
+  cycles on Alder Lake-P). Belongs with the power-aware-idle item (DPDK
+  `rte_power_monitor`).
+- **VPCLMULQDQ/GFNI:** long-buffer CRC (DPDK `net_crc`) and the CRC
+  linearity trick. **VAES:** IPsec via DPDK crypto drivers.
+  **MOVDIR64B/ENQCMD:** DSA/QAT submission. **CLDEMOTE:** cross-core
+  handoff (Phase L). Each only when its consumer arrives.
+- Not relevant: AVX-VNNI, AMX, AVX-IFMA, LAM.
+
+**Revisit when:**
+
+- a kernel becomes SIMD-width bound (for example wide keys, or
+  checksumming);
+- APX or AVX10.2 hardware is available to measure on;
+- deployments target Zen 3 with portable builds (the `bsf` penalty);
+- a new CPU generation changes these costs.
 

@@ -1,7 +1,7 @@
 option('cpu',
        type: 'string',
        value: 'native',
-       description: 'CPU ISA passed to BESS (for example native or corei7)')
+       description: 'CPU ISA passed to BESS (for example native, or x86-64-v3 for portable builds)')
 option('af_xdp',
        type: 'combo',
        choices: ['auto', 'required'],

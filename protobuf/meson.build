@@ -248,10 +248,17 @@ core_cpp_include = [
   '-I' + join_paths(cpp_proto_root, 'core', 'pb'),
   '-I' + join_paths(cpp_proto_root, 'core'),
 ]
+# protoc-generated code is not ours: newer GCCs report false-positive
+# (maybe-)uninitialized warnings inside protobuf's own headers at -O3, which
+# -Werror would turn into a failed release build. Keep them warnings here.
+proto_codegen_args = cpp.get_supported_arguments(
+  '-Wno-error=uninitialized',
+  '-Wno-error=maybe-uninitialized',
+)
 bess_proto_lib = static_library(
   'bess_proto',
   core_cpp_proto_targets,
-  cpp_args: core_cpp_include,
+  cpp_args: core_cpp_include + proto_codegen_args,
   dependencies: protobuf_runtime_deps,
 )
 bess_proto_dep = declare_dependency(

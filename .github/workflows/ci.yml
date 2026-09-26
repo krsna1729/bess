@@ -7,7 +7,11 @@ on:
     branches: [master, develop]
 
 env:
-  CPU: corei7
+  # x86-64-v3 (AVX2, BMI1/2, FMA, MOVBE): the portable floor. GitHub's x64
+  # Linux runners (AMD EPYC 7763, Zen 3) support it but not v4 (AVX-512);
+  # the check step below fails loudly if a runner ever lacks it.
+  # (Decision D-016.)
+  CPU: x86-64-v3
   AF_XDP: required
   FIFO_TEST_TIMEOUT: 200
 
@@ -31,6 +35,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: Check the runner supports the CPU floor
+        run: |
+          /lib64/ld-linux-x86-64.so.2 --help | grep -A4 'glibc-hwcaps'
+          if ! /lib64/ld-linux-x86-64.so.2 --help \
+              | grep -q "${CPU} (supported"; then
+            echo "::error::runner CPU does not support ${CPU}"
+            exit 1
+          fi
 
       - name: Reserve hugepages
         run: |
