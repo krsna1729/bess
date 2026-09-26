@@ -40,6 +40,7 @@ file is the reasoning.
 | D-017 | HashLB and ACL on mode G, L2Forward on mode C; control commands off the worker pause | accepted |
 | D-018 | BPF execution: DPDK `rte_bpf` (with a repair pass) or the BESS JIT | open (deferred) |
 | D-019 | DRR: a multi-producer ingress ring; the task's worker owns all flow state | accepted (trade-off recorded) |
+| D-020 | Dataplane transactions: what we borrow from DPDK `rte_swx`, P4Runtime and VPP | accepted |
 
 ---
 
@@ -1100,3 +1101,123 @@ operation rings: the commands are two scalars.
   notion of the owner across task moves (for example, the owner published
   at graph-change time);
 - DRR gains per-flow state that commands must write (then mode W op rings).
+
+## D-020 Dataplane transactions: what we borrow from DPDK `rte_swx`, P4Runtime and VPP
+
+**Status:** accepted (2026-09-27). This is the prior-art study that
+G1.2b's design (MODERNIZATION §14.5) was waiting for.
+**Sources read:**
+
+- DPDK 25.11.3 `lib/pipeline/rte_swx_ctl.{h,c}`;
+- the P4Runtime specification source (`p4lang/p4runtime`
+  `docs/v1/P4Runtime-Spec.adoc`, the sections "Batching and Ordering of
+  Updates", "Batch Atomicity" and "Error Reporting");
+- VPP `src/vppinfra/bihash_template.{h,c}` and `src/vlibapi/api_shared.c`
+  (master, 2026-09-27).
+
+**What each does.**
+
+- **DPDK `rte_swx` (the SWX pipeline control API):**
+  - Changes are scheduled per table (add, modify, delete, default entry)
+    and applied by `rte_swx_ctl_pipeline_commit(ctl, abort_on_fail)`.
+  - The commit has two stages. `table_rollfwd0` does all fallible work for
+    every table: it applies pending entries to a shadow table state
+    (`ts_next`), or builds a new table object for tables with no
+    incremental update. If any table fails, all of them roll back.
+    `table_rollfwd1` then does the work that cannot fail.
+  - One pointer store (`rte_swx_pipeline_table_state_set`) then swaps the
+    whole table state, and the same changes are replayed onto the old
+    copy to bring it back in sync.
+  - Every table is kept twice. The library has no reader-reclamation
+    protocol: the old copy is modified right after the pointer swap.
+  - With `abort_on_fail == 0`, a failed commit keeps its pending work for
+    a retry.
+- **P4Runtime `Write`:**
+  - The server "may arbitrarily reorder messages within a batch", but
+    processing "must be strictly serializable" across requests.
+  - Dependent updates (an action-profile member and the table entry
+    pointing at it) must go in separate `Write` calls, or "the behavior
+    may be non-deterministic".
+  - Atomicity: `CONTINUE_ON_ERROR` is required; `ROLLBACK_ON_ERROR`
+    (all-or-none, but packets can see intermediate states) and
+    `DATAPLANE_ATOMIC` are optional and may return `UNIMPLEMENTED`. The
+    spec suggests keeping half of each table spare for `DATAPLANE_ATOMIC`,
+    followed by a pointer swap.
+  - Errors: one `p4.Error` per update, in request order (`OK` for the
+    ones that succeeded).
+  - Concurrency control is primary-controller arbitration by
+    `election_id`. There is no request id, idempotency or retry protocol.
+- **VPP:**
+  - bihash readers are lock-free. They wait while a bucket's lock bit is
+    set (a split is in progress), and after searching they re-read the
+    bucket word and retry if it changed (a seqlock-style check). Replaced
+    pages go to per-size freelists and are reused only as bihash pages, so
+    a stale read is caught by the retry, never by freeing memory. This is
+    type-stable memory with a version re-check.
+  - The binary API runs each handler not marked `is_mp_safe` under
+    `vl_msg_api_barrier_sync()`, which stops every worker. The default is
+    a global pause.
+
+**Decision: borrow.**
+
+1. **Two phases, all fallible work first, across every resource of the
+   transaction** (`rte_swx`'s rollfwd0 and rollfwd1). This is our
+   reserve/publish: publish consists only of infallible stores, so
+   rollback happens in reserve, before anything is visible.
+2. **Per-operation results in request order** (P4Runtime): a rejected
+   transaction reports which operation failed and why, with the rest
+   marked not-applied.
+3. **Strict serializability** (P4Runtime): one sequencer orders
+   transactions. For now that is the control thread, which is already the
+   single writer of every C table. Later, one writer per table (§14.5)
+   must keep the same guarantee for transactions that span tables.
+4. **Named atomicity levels, stated precisely** (P4Runtime's enum):
+   - every transaction is all-or-nothing. It is stronger than
+     `ROLLBACK_ON_ERROR`, because a failure happens before anything is
+     visible, so packets never see a failed transaction's intermediate
+     states;
+   - packets see per-operation states of a successful transaction by
+     default;
+   - dataplane atomicity (`DATAPLANE_ATOMIC`) is available per scope,
+     through the opt-in scope cell, and is refused, not faked, where a
+     table cannot provide it.
+
+**Decision: diverge.**
+
+5. **BESS orders dependent operations inside a transaction; the client
+   does not split batches.** P4Runtime pushes dependency ordering to the
+   client, which is exactly the burden G1.2 exists to remove
+   (§14.5, "clients do not order BESS internals"). Referents publish
+   first; removals run in reverse, with retirement after a grace period.
+6. **Idempotency: `request_id` plus `GetTransaction`.** P4Runtime has no
+   answer for "did my timed-out write apply?"; OMEC's controller shows
+   the cost.
+7. **Optimistic concurrency (`expected_generation`) instead of
+   primary-controller arbitration.** A single-controller deployment needs
+   no election. Arbitration can be layered on later for HA controllers.
+8. **No double-buffered tables** (the `rte_swx` shadow, and P4Runtime's
+   half-capacity suggestion). They cost twice the memory, and `rte_swx`
+   replays onto the old copy with no grace period. Our C tables change in
+   place with QSBR-protected reuse (D-001, D-013), and all-at-once
+   visibility comes from the scope cell (one indirection for the scopes
+   that ask for it), not from copying tables.
+9. **A failed transaction keeps nothing pending** (unlike `rte_swx`'s
+   `abort_on_fail == 0`). A retry is a new request, since state is
+   desired-state, not a pending queue.
+10. **No global barrier as the default** (VPP's non-`mp_safe` handlers).
+    Commands and transactions run while workers keep processing. Pauses
+    are only for graph changes, and those move to RCU publication later
+    (D-013).
+
+**Recorded for later, not adopted now:**
+
+- VPP's type-stable pages with a version re-check are the known
+  alternative to QSBR for our own table, should one ever be written
+  (MODERNIZATION §31.5). They cost a re-read per lookup, and a writer
+  holding a bucket lock blocks readers of that bucket.
+
+**Revisit when:**
+
+- a multi-controller (HA) deployment appears (then arbitration);
+- a target needs dataplane atomicity for a table the scope cell cannot
+  cover.

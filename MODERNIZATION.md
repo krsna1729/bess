@@ -9645,10 +9645,19 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
    an MP/SC ingress ring. Open item: skip the ring when the producer is
    the owning worker (−3% today); this needs a race-free notion of the
    owner across task moves.
-5. **Prior-art study before transactions:** DPDK `rte_swx` table staging
-   with commit/abort, P4Runtime write atomicity (continue-on-error,
-   rollback-on-error, dataplane-atomic), and VPP bihash and binary API.
-   Record what is borrowed as decisions.
+5. **Prior-art study before transactions: done (D-020, 2026-09-27).**
+   Borrowed:
+   - `rte_swx`'s two-phase commit (all fallible work first);
+   - P4Runtime's per-operation results in request order, strict
+     serializability and named atomicity levels.
+
+   Diverged:
+   - BESS orders dependent operations itself, where P4Runtime makes
+     clients split batches;
+   - `request_id` idempotency, which P4Runtime lacks;
+   - optimistic generations instead of election;
+   - no double-buffered tables;
+   - no global barrier, which is VPP's default for non-mp-safe handlers.
 6. **G1.2b transactions** across tables with different update modes.
    This is the remaining architectural milestone, per the external review
    of 2026-09-27: individual live commands do not give the guarantee of
