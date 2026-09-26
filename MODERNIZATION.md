@@ -9280,14 +9280,44 @@ value-add features: a firewall, CGNAT, rate limiting, mirroring.
     exception-path gap).
   - **Egress:** push the VLAN, set the source MAC, check the MTU, then send
     on a per-worker TX queue. There is no shared-queue lock.
-  - **UPF on one NIC:**
-    - N3 is a vif (VLAN or IP), with a flow rule on UDP 2152 steering
-      GTP-U to the UPF workers;
-    - N6 is a vif;
-    - N4 (PFCP) is punted to the kernel.
+  - **UPF interfaces, two correct deployment shapes:**
+    1. **Kubernetes:** N4 (PFCP) arrives on the pod's default network, a
+       kernel-owned interface BESS never touches. N3/N6/N9 are vifs on
+       DPDK-bound SR-IOV VFs or Multus-attached NICs.
+    2. **Single shared NIC:** N3/N6/N9 and N4 are all vifs on one port. N3
+       and N9 carry a flow rule on UDP 2152 steering GTP-U to the UPF
+       workers, and N4's PFCP is punted to the kernel through that vif's
+       exception path.
 
-    Today's OMEC UPF needs separate access and core ports plus veth
-    plumbing.
+    The UPF code is the same in both.
+  - **What the fast path does, and what is left to the kernel.** The rule:
+    anything needed to forward traffic at line rate is fast path; protocols
+    with sessions, timers and human-scale rates are kernel or control-plane
+    daemons.
+
+    | layer | fast path (BESS, per vif) | kernel / control plane (punted, or on a kernel-owned port) |
+    |---|---|---|
+    | Ethernet | destination-MAC filter; broadcast/multicast handling; MTU check | — |
+    | VLAN | 802.1Q push/pop (802.1ad QinQ later) | — |
+    | link aggregation | DPDK bonding PMD runs LACP itself | — |
+    | ARP | reply for vif addresses; next-hop resolution (cache, timers, bounded pending queue); gratuitous ARP on up/address change | proxy-ARP policy, if ever needed |
+    | IPv6 ND | NS/NA for vif addresses and next-hop resolution | DAD, RS/RA, SLAAC |
+    | IPv4/IPv6 forwarding | validation, TTL/hop-limit, checksum, LPM, ECMP, route domains | route computation: BGP, OSPF, IS-IS (e.g. FRR), synced into BESS via the v2 API |
+    | ICMP/ICMPv6 | echo reply for vif addresses; TTL-exceeded, unreachable, packet-too-big (all rate-limited) | everything else addressed to the box |
+    | fragmentation | IPv4 fragmentation/reassembly (K8, consumer-driven) | — |
+    | tunnels | VXLAN, GRE, GTP-U encap/decap; GTP-U echo (UPF plugin) | GTP-C |
+    | liveness | — | BFD first (fast-path BFD only if timers demand it) |
+    | multicast control | — | IGMP/MLD |
+    | discovery | — | LLDP |
+    | addressing | vif addresses are v2-API desired state | DHCP client, if used |
+    | sessions/management | — | PFCP (N4), SSH, DNS, NTP, PTP (hardware timestamps later), metrics |
+
+  - **Control-plane policing:** every punted class passes a `MeterSet`
+    rate limiter, so floods cannot overwhelm the kernel or the punt path.
+  - **Kernel mirror:** each vif that punts has a TAP twin with the same
+    MAC and addresses, so Linux daemons bind normally, and the routes they
+    learn are synced into the BESS router. This is the model of VPP's
+    linux-cp plugin (prior art).
   - **Consumers (D-008):** the edge router, CGNAT (inside and outside
     vifs), the L4 load balancer, a BNG, and UPF.
   - **Phases:**
@@ -9615,7 +9645,10 @@ item 1.
 - **N0 virtual interfaces first** (section 29.3): V1 software vif, demux,
   egress and ARP/ICMP; V2 kernel exception path; V3 `rte_flow` offload
   with software fallback; V4 v2-API objects in transactions. The
-  foundation for N1/N2, and lets UPF run N3/N6/N4 on one NIC.
+  foundation for N1/N2. UPF can run N3/N6/N9 on DPDK/SR-IOV vifs, with
+  N4 either on a kernel-owned port (Kubernetes default network) or punted
+  from a vif on a shared NIC. The fast-path-versus-kernel protocol split
+  is tabled in 29.3.
 - Missing L2/L3 basics:
   - N1 learning bridge;
   - N2 IPv4 router with ARP/ICMP;
