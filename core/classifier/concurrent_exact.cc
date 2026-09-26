@@ -44,6 +44,9 @@ namespace bess::classifier {
 std::expected<std::unique_ptr<ConcurrentExactTable>, std::string>
 ConcurrentExactTable::Create(uint32_t key_len, uint32_t capacity,
                              rcu::RcuDomain &domain, int socket) {
+  if (key_len == 0 || key_len > 64) {
+    return std::unexpected("key length must be 1..64 bytes");
+  }
   if (!IsDpdkInitialized()) {
     InitDpdk();  // rte_hash lives in EAL memory
   }
@@ -61,6 +64,9 @@ ConcurrentExactTable::Create(uint32_t key_len, uint32_t capacity,
   if (table == nullptr) {
     return std::unexpected("rte_hash_create failed (capacity " +
                            std::to_string(capacity) + ")");
+  }
+  if (const detail::CmpFn cmp = detail::SelectCmp(key_len)) {
+    rte_hash_set_cmp_func(table, cmp);
   }
   rte_hash_rcu_config rcu{};
   rcu.v = domain.dpdk_qsbr();

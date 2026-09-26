@@ -38,12 +38,129 @@
 #include <string>
 
 #include <rte_hash.h>
+#include <rte_hash_crc.h>
+
+#include <array>
+#include <cstring>
+#include <utility>
 
 #include "classifier/backend.h"
 #include "rcu/rcu_domain.h"
 #include "utils/common.h"
 
 namespace bess::classifier {
+
+namespace detail {
+
+// CRC32C over exactly W bytes, seed 0, inlined: the same function rte_hash
+// applies (rte_hash_crc, the table's hash_func) and bit-identical to it --
+// CRC is defined over the byte stream, so 8-, 4-, 2- and 1-byte steps give
+// the same value however the bytes are grouped or aligned. The step functions
+// keep rte_hash_crc's fallback to a software CRC on CPUs without one.
+template <size_t W>
+inline uint32_t CrcFixed(const std::byte *p) noexcept {
+  uint32_t h = 0;
+  size_t i = 0;
+  for (; i + 8 <= W; i += 8) {
+    uint64_t v;
+    std::memcpy(&v, p + i, 8);
+    h = rte_hash_crc_8byte(v, h);
+  }
+  if constexpr (W % 8 >= 4) {
+    uint32_t v;
+    std::memcpy(&v, p + i, 4);
+    h = rte_hash_crc_4byte(v, h);
+    i += 4;
+  }
+  if constexpr (W % 4 >= 2) {
+    uint16_t v;
+    std::memcpy(&v, p + i, 2);
+    h = rte_hash_crc_2byte(v, h);
+    i += 2;
+  }
+  if constexpr (W % 2 == 1) {
+    h = rte_hash_crc_1byte(static_cast<uint8_t>(p[i]), h);
+  }
+  return h;
+}
+
+using HashBatchFn = void (*)(const std::byte *keys, size_t stride, size_t n,
+                             hash_sig_t *out) noexcept;
+
+template <size_t W>
+void HashBatchFixed(const std::byte *keys, size_t stride, size_t n,
+                    hash_sig_t *out) noexcept {
+  for (size_t i = 0; i < n; i++) {
+    out[i] = CrcFixed<W>(keys + i * stride);
+  }
+}
+
+// The kernel for a key width, chosen once per table (1..64 bytes).
+inline HashBatchFn SelectHashBatch(size_t width) noexcept {
+  static constexpr auto kTable = []<size_t... I>(std::index_sequence<I...>) {
+    return std::array<HashBatchFn, sizeof...(I)>{&HashBatchFixed<I + 1>...};
+  }(std::make_index_sequence<64>{});
+  return width >= 1 && width <= kTable.size() ? kTable[width - 1] : nullptr;
+}
+
+// Key equality for exactly W bytes (0 iff equal, the rte_hash_cmp_eq_t
+// contract), with the width a compile-time constant so the compiler emits a
+// few loads and compares instead of calling libc's general memcmp. rte_hash
+// has its own SIMD compares only for 16/32/.../128-byte keys and falls back to
+// memcmp through a function pointer otherwise -- ~9% of a WildcardMatch
+// lookup, profiled (Decision D-015).
+//
+// Equality only: rte_hash tests the result against 0 and never uses memcmp's
+// ordering, which is also what stopped the compiler from inlining a
+// constant-size memcmp (it compiled to a tail call into libc). XOR the words
+// and OR the differences: branchless, two loads and a compare per 8 bytes.
+template <size_t W>
+int CmpFixed(const void *a, const void *b, size_t) {
+  const auto *x = static_cast<const std::byte *>(a);
+  const auto *y = static_cast<const std::byte *>(b);
+  uint64_t diff = 0;
+  size_t i = 0;
+  for (; i + 8 <= W; i += 8) {
+    uint64_t u, v;
+    std::memcpy(&u, x + i, 8);
+    std::memcpy(&v, y + i, 8);
+    diff |= u ^ v;
+  }
+  if constexpr (W % 8 >= 4) {
+    uint32_t u, v;
+    std::memcpy(&u, x + i, 4);
+    std::memcpy(&v, y + i, 4);
+    diff |= u ^ v;
+    i += 4;
+  }
+  if constexpr (W % 4 >= 2) {
+    uint16_t u, v;
+    std::memcpy(&u, x + i, 2);
+    std::memcpy(&v, y + i, 2);
+    diff |= static_cast<uint16_t>(u ^ v);
+    i += 2;
+  }
+  if constexpr (W % 2 == 1) {
+    diff |= std::to_integer<uint8_t>(x[i] ^ y[i]);
+  }
+  return diff != 0;
+}
+
+using CmpFn = int (*)(const void *, const void *, size_t);
+
+// A fixed-width compare for widths rte_hash does not specialize; nullptr
+// where it already has one (multiples of 16 up to 128).
+inline CmpFn SelectCmp(size_t width) noexcept {
+  static constexpr auto kTable = []<size_t... I>(std::index_sequence<I...>) {
+    return std::array<CmpFn, sizeof...(I)>{&CmpFixed<I + 1>...};
+  }(std::make_index_sequence<64>{});
+  if (width == 0 || width > kTable.size() || width % 16 == 0) {
+    return nullptr;
+  }
+  return kTable[width - 1];
+}
+
+}  // namespace detail
 
 // A shared exact-match table updated in place while workers read it (G1.2
 // mode C). DPDK's `rte_hash` owns the algorithm and the concurrency: created
@@ -138,22 +255,41 @@ class ConcurrentExactTable {
   }
   uint32_t capacity() const noexcept { return capacity_; }
   uint32_t key_len() const noexcept { return key_len_; }
+  // The table's own hash of `key` (rte_hash_hash), for tests that prove the
+  // inline kernel identical to it.
+  hash_sig_t DpdkHash(ConstBytes key) const noexcept {
+    return rte_hash_hash(table_, key.data());
+  }
+  // The inline kernel's hash of `key`.
+  hash_sig_t InlineHash(ConstBytes key) const noexcept {
+    hash_sig_t sig;
+    hash_batch_(key.data(), key.size(), 1, &sig);
+    return sig;
+  }
 
   // -- reader -------------------------------------------------------------------
 
   // Looks up `n` (<= 64) keys packed at `stride` bytes. Writes values[i] and
   // sets bit i for each hit; misses leave values[i] untouched.
+  //
+  // Hashes the batch here, inline, with the fixed-width kernel chosen at
+  // create, and calls DPDK's prehashed bulk lookup: rte_hash would otherwise
+  // hash each key through its hash-function pointer into the generic,
+  // any-length rte_hash_crc (~20% of a WildcardMatch lookup, profiled). Same
+  // hash, same probe, same concurrency protocol (Decision D-015).
   uint64_t LookupBatch(ConstBytes keys, size_t stride, uint64_t *values,
                        size_t n) const noexcept {
     promise(n <= 64);
     const void *ptrs[64];
+    hash_sig_t sigs[64];
     void *data[64];
     for (size_t i = 0; i < n; i++) {
       ptrs[i] = keys.data() + i * stride;
     }
+    hash_batch_(keys.data(), stride, n, sigs);
     uint64_t hits = 0;
-    rte_hash_lookup_bulk_data(table_, ptrs, static_cast<uint32_t>(n), &hits,
-                              data);
+    rte_hash_lookup_with_hash_bulk_data(table_, ptrs, sigs,
+                                        static_cast<uint32_t>(n), &hits, data);
     for (uint64_t m = hits; m != 0; m &= m - 1) {
       const size_t i = static_cast<size_t>(__builtin_ctzll(m));
       values[i] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data[i]));
@@ -163,11 +299,15 @@ class ConcurrentExactTable {
 
  private:
   ConcurrentExactTable(rte_hash *table, uint32_t key_len, uint32_t capacity)
-      : table_(table), key_len_(key_len), capacity_(capacity) {}
+      : table_(table),
+        key_len_(key_len),
+        capacity_(capacity),
+        hash_batch_(detail::SelectHashBatch(key_len)) {}
 
   rte_hash *table_;
   const uint32_t key_len_;
   const uint32_t capacity_;
+  const detail::HashBatchFn hash_batch_;
   size_t size_ = 0;
 };
 

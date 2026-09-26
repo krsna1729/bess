@@ -106,6 +106,54 @@ TEST(ConcurrentExactTableTest, InsertUpdateEraseAndIterate) {
   EXPECT_EQ(1u, t->size());
 }
 
+// Decision D-015: lookups hash inline with a fixed-width kernel and call
+// DPDK's prehashed bulk lookup. That is only correct if the kernel is
+// bit-identical to the table's own hash (rte_hash_hash, used by every add and
+// delete) for every key width and alignment.
+TEST(ConcurrentExactTableTest, InlineHashIsBitIdenticalToRteHash) {
+  std::mt19937_64 rng(0x15);
+  std::vector<std::byte> buffer(64 + 8);
+  for (uint32_t width = 1; width <= 64; width++) {
+    auto t = ConcurrentExactTable::Create(width, 64, control::runtime().rcu());
+    ASSERT_TRUE(t.has_value()) << t.error();
+    for (int trial = 0; trial < 64; trial++) {
+      for (auto &b : buffer) b = static_cast<std::byte>(rng());
+      const size_t offset = static_cast<size_t>(trial % 8);  // alignments
+      const ConstBytes key(buffer.data() + offset, width);
+      ASSERT_EQ((*t)->DpdkHash(key), (*t)->InlineHash(key))
+          << "width " << width << " offset " << offset;
+    }
+  }
+}
+
+// The fixed-width key compare installed into rte_hash must say "equal"
+// exactly when the bytes are equal, for every width and any differing byte.
+TEST(ConcurrentExactTableTest, FixedWidthCompareIsExactEquality) {
+  std::mt19937_64 rng(0x16);
+  std::vector<std::byte> a(64), b(64);
+  for (size_t width = 1; width <= 64; width++) {
+    const detail::CmpFn cmp = detail::SelectCmp(width);
+    if (cmp == nullptr) {
+      EXPECT_EQ(0u, width % 16) << "only DPDK-specialized widths are skipped";
+      continue;
+    }
+    for (auto &x : a) x = static_cast<std::byte>(rng());
+    b = a;
+    EXPECT_EQ(0, cmp(a.data(), b.data(), width)) << "width " << width;
+    for (size_t byte = 0; byte < width; byte++) {
+      b = a;
+      b[byte] ^= std::byte{1} << (rng() % 8);
+      EXPECT_NE(0, cmp(a.data(), b.data(), width))
+          << "width " << width << " byte " << byte;
+    }
+    b = a;
+    if (width < 64) {
+      b[width] ^= std::byte{0xff};  // beyond the key: must be ignored
+      EXPECT_EQ(0, cmp(a.data(), b.data(), width)) << "width " << width;
+    }
+  }
+}
+
 TEST(ConcurrentExactTableTest, ReportsFullAndReusesErasedSlots) {
   auto t = MakeTable(64);
   uint32_t n = 0;
