@@ -31,6 +31,7 @@
 #ifndef BESS_MODULES_DRR_H_
 #define BESS_MODULES_DRR_H_
 
+#include <atomic>
 #include <cstdlib>
 
 #include <rte_hash_crc.h>
@@ -70,8 +71,13 @@ using bess::utils::CuckooMap;
 //    * Max Flow Queue Size: the maximum size that any Flows queue can get
 //          before the module will start dropping the flows packets
 // COMMANDS
-//    update quantum: cannot not be done live
-//    update Max Flow Queue Size: can be done live
+//    set_quantum_size and set_max_flow_queue_size apply live, without
+//    pausing workers.
+//
+// THREADING: every packet enters through an ingress ring that any number of
+// upstream workers may feed; the module's task, on one worker, drains it and
+// is the only reader and writer of the flow table and flow queues
+// (worker-owned state; decision D-019, docs/decisions.md).
 //
 class DRR final : public Module {
  public:
@@ -87,6 +93,12 @@ class DRR final : public Module {
       1500;  // default value to initialize qauntum_ to
   static const int kPacketOverhead =
       24;  // additional bytes associated with packets
+  // Ingress ring slots: packets handed over by upstream workers and not yet
+  // classified by the task. A full ingress ring drops.
+  static const int kIngressSize = 4096;
+  // At most this many ingress packets are classified per task run, so a
+  // flood cannot starve scheduling.
+  static const int kIngressPerRun = 1024;
 
   // 5 tuple id to identify a flow from a packet header information.
   struct FlowId {
@@ -105,9 +117,10 @@ class DRR final : public Module {
     FlowId id;                     // allows the flow to remove itself from the map
     struct rte_ring *queue;        // queue to store current packets for flow
     bess::PacketHandle next_packet;  // buffer to store next packet from the queue.
-    Flow() : deficit(0), timer(0), id(), next_packet(nullptr){};
+    Flow() : deficit(0), timer(0), id(), queue(nullptr), next_packet(nullptr){};
     Flow(FlowId new_id)
-        : deficit(0), timer(0), id(new_id), next_packet(nullptr){};
+        : deficit(0), timer(0), id(new_id), queue(nullptr),
+          next_packet(nullptr){};
     ~Flow() {
       if (queue) {
         bess::PacketHandle pkt;
@@ -160,6 +173,7 @@ class DRR final : public Module {
 
   CommandResponse Init(const bess::pb::DRRArg &arg);
 
+  // Any worker: hands the batch to the task through the ingress ring.
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
   struct task_result RunTask(Context *ctx, bess::PacketBatch *batch,
@@ -198,6 +212,13 @@ class DRR final : public Module {
   //  and integer pointer to be set on error.
   void Enqueue(Flow *f, bess::PacketHandle pkt, int *err);
 
+  //  Moves up to `limit` packets from the ingress ring into their flows' queues
+  //  (the task's worker only).
+  void DrainIngress(uint32_t limit);
+
+  //  Puts one packet into its flow, creating the flow if needed.
+  void Classify(bess::PacketHandle pkt);
+
   //  Takes a PacketRef to get a flow id for. Returns the 5 element identifier
   //  for the packet's flow.
   FlowId GetId(bess::PacketRef pkt);
@@ -232,20 +253,24 @@ class DRR final : public Module {
   //  size indicated by slots. Takes the Flow to add the queue, the number
   //  of slots for the queue to have and the integer pointer to set on error.
   //  Returns a ring queue.
-  rte_ring *AddQueue(uint32_t slots, int *err);
+  // `flags` defaults to single-producer/single-consumer.
+  rte_ring *AddQueue(uint32_t slots, int *err,
+                     unsigned flags = RING_F_SP_ENQ | RING_F_SC_DEQ);
 
-  // the number of bytes to allocate to each flow in each round.
-  uint32_t quantum_;
+  // the number of bytes to allocate to each flow in each round. Set by
+  // commands, read by the task.
+  std::atomic<uint32_t> quantum_;
 
   // max size of a flow's queue before the module will start dropping
-  // the flow's packets
-  uint32_t max_queue_size_;
+  // the flow's packets. Set by commands, read by the task.
+  std::atomic<uint32_t> max_queue_size_;
 
   // max number of flow's that the module will handle.
   uint32_t max_number_flows_;
 
   // state map used to reunite packets with their flow
   CuckooMap<FlowId, Flow *, Hash, EqualTo> flows_;
+  rte_ring *ingress_;     // multi-producer, single-consumer: packets in.
   rte_ring *flow_ring_;   // ring used for round robin.
   Flow *current_flow_;  // store current flow between batch rounds.
 };

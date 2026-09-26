@@ -204,19 +204,32 @@ inline uint64_t l2_make_slot(uint64_t addr, gate_idx_t gate) {
   return e.entry;
 }
 
-// Returns the gate stored in the bucket for `addr` (occupied), or -1. Each
-// candidate is re-read as one word and re-checked, so a match and its gate
+// Returns the gate stored in the bucket for `addr` (occupied), or -1. Only
+// words read with one atomic load are trusted: a candidate found by the vector
+// compare is re-read as one word and re-checked, so a key match and its gate
 // come from the same word even while the writer changes the bucket.
 inline int l2_probe_bucket(uint64_t addr, const struct l2_entry *bucket,
                            uint64_t slots) {
   const uint64_t want = addr | (1ull << 63);
 #if __AVX2__
   if (slots == 4) {
+    // The four slots are read with one 32-byte vector load, issued as inline
+    // assembly: a C++ vector load of words the writer stores atomically would
+    // be a data race in the language (undefined behaviour), while the asm is
+    // opaque to the compiler and its meaning is the hardware's. On x86 a slot
+    // no one is writing reads back intact; a slot being written may read
+    // torn, which yields at most a false candidate (rejected by the atomic
+    // re-check below) or a miss of an entry mid-move (covered: moves write
+    // the alternate slot first). Four atomic loads assembled in registers
+    // are the conforming alternative and cost +10% (P-core) to +56% (E-core)
+    // per lookup; see D-017's amendment (docs/decisions.md).
+    __m256i table;
+    asm volatile("vmovdqa %1, %0"
+                 : "=x"(table)
+                 : "m"(*reinterpret_cast<const __m256i *>(bucket)));
     // Integer compare. (A former _mm256_cmp_pd compare treated the slots as
     // doubles: an empty slot (+0.0) equalled the key for MAC 0 (-0.0), and
     // with denormals-are-zero every masked slot equalled every key.)
-    const __m256i table =
-        _mm256_load_si256(reinterpret_cast<const __m256i *>(bucket));
     const __m256i masked =
         _mm256_and_si256(table, _mm256_set1_epi64x(kL2KeyMask));
     const int bits = _mm256_movemask_pd(_mm256_castsi256_pd(

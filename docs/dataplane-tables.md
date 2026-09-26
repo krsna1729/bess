@@ -245,7 +245,7 @@ state through G, C or W.
 | URLFilter | `Trie` per host | Pause | legacy: cleartext HTTP only; a modern SNI classifier is recorded in MODERNIZATION §31.6 |
 | BPF | compiled filters | Pause | deferred: G together with the `rte_bpf` decision (MODERNIZATION §31.6) |
 | NAT | `CuckooMap` | worker-owned (the packet path learns flows) | limited to one worker |
-| DRR | `CuckooMap` of flows | written by the packet path | **open issue:** DRR allows several workers, yet its `ProcessBatch` writes the flow map with no synchronization; to review |
+| DRR | `CuckooMap` of flows | worker-owned: upstream workers hand packets over an MP/SC ingress ring; the task's worker owns the flow map and queues; commands are atomics | D-019 |
 
 ## 6. Why it is like this
 

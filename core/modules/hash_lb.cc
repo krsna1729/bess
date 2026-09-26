@@ -121,6 +121,10 @@ CommandResponse HashLB::ApplyMode(const bess::pb::HashLBCommandSetModeArg &arg,
 
 CommandResponse HashLB::ApplyGates(const bess::pb::HashLBCommandSetGatesArg &arg,
                                    Config *config) const {
+  // Every packet goes to gates[hash % n]: n == 0 would index an empty list.
+  if (arg.gates_size() == 0) {
+    return CommandFailure(EINVAL, "HashLB needs at least one ogate");
+  }
   if (static_cast<size_t>(arg.gates_size()) > kMaxGates) {
     return CommandFailure(EINVAL, "HashLB can have at most %zu ogates",
                           kMaxGates);

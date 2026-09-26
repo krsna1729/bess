@@ -30,10 +30,12 @@
 
 #include "drr.h"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "../utils/ether.h"
 #include "../utils/ip.h"
@@ -42,9 +44,11 @@
 
 namespace {
 
-// All DRR rings are single-producer/single-consumer (one task owns the
-// module); the explicit SP/SC entry points below match that mode.
-const unsigned kRingFlags = RING_F_SP_ENQ | RING_F_SC_DEQ;
+// The flow and round-robin rings are single-producer/single-consumer (the
+// AddQueue default): only the module's task touches them. The ingress ring is
+// multi-producer (any upstream worker), single-consumer (the task).
+// Decision D-019 (docs/decisions.md).
+const unsigned kIngressRingFlags = RING_F_SC_DEQ;
 
 }  // namespace
 
@@ -61,14 +65,15 @@ uint32_t RoundToPowerTwo(uint32_t v) {
 
 const Commands DRR::cmds = {
     {"set_quantum_size", "DRRQuantumArg",
-     MODULE_CMD_FUNC(&DRR::CommandQuantumSize), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&DRR::CommandQuantumSize), Command::THREAD_SAFE},
     {"set_max_flow_queue_size", "DRRMaxFlowQueueSizeArg",
-     MODULE_CMD_FUNC(&DRR::CommandMaxFlowQueueSize), Command::THREAD_UNSAFE}};
+     MODULE_CMD_FUNC(&DRR::CommandMaxFlowQueueSize), Command::THREAD_SAFE}};
 
 DRR::DRR()
     : quantum_(kDefaultQuantum),
       max_queue_size_(kFlowQueueMax),
       max_number_flows_(kDefaultNumFlows),
+      ingress_(nullptr),
       flow_ring_(nullptr),
       current_flow_(nullptr) {
   is_task_ = true;
@@ -76,9 +81,21 @@ DRR::DRR()
 }
 
 DRR::~DRR() {
-  for (auto it = flows_.begin(); it != flows_.end();) {
-    RemoveFlow(it->second);
-    it++;
+  if (ingress_ != nullptr) {
+    bess::PacketHandle pkt;
+    while (rte_ring_sc_dequeue(ingress_, reinterpret_cast<void **>(&pkt)) ==
+           0) {
+      bess::PacketFree(pkt);
+    }
+    std::free(ingress_);
+  }
+  // Collect first: removing entries while iterating the map is not safe.
+  std::vector<Flow *> flows;
+  for (auto &entry : flows_) {
+    flows.push_back(entry.second);
+  }
+  for (Flow *f : flows) {
+    RemoveFlow(f);
   }
   std::free(flow_ring_);
 }
@@ -116,6 +133,10 @@ CommandResponse DRR::Init(const bess::pb::DRRArg &arg) {
   if (err_num != 0) {
     return CommandFailure(-err_num);
   }
+  ingress_ = AddQueue(kIngressSize, &err_num, kIngressRingFlags);
+  if (err_num != 0) {
+    return CommandFailure(-err_num);
+  }
 
   return CommandSuccess();
 }
@@ -130,30 +151,47 @@ CommandResponse DRR::CommandMaxFlowQueueSize(
 }
 
 void DRR::ProcessBatch(Context *, bess::PacketBatch *batch) {
-  int err = 0;
+  const int cnt = batch->cnt();
+  const unsigned sent = rte_ring_mp_enqueue_burst(
+      ingress_, reinterpret_cast<void *const *>(batch->handles()), cnt,
+      nullptr);
+  if (static_cast<int>(sent) < cnt) {
+    bess::PacketFreeBulk(batch->handles() + sent, cnt - sent);
+  }
+}
 
-  // insert packets in the batch into their corresponding flows
-  int cnt = batch->cnt();
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
-
-    // TODO(joshua): Add support for fragmented packets.
-    FlowId id = GetId(pkt);
-    auto it = flows_.Find(id);
-
-    // if the Flow doesn't exist create one
-    // and add the packet to the new Flow
-    if (it == nullptr) {
-      if (rte_ring_full(flow_ring_)) {
-        bess::PacketFree(pkt.handle());
-      } else {
-        AddNewFlow(pkt.handle(), id, &err);
-        assert(err == 0);
-      }
-    } else {
-      Enqueue(it->second, pkt.handle(), &err);
-      assert(err == 0);
+void DRR::DrainIngress(uint32_t limit) {
+  bess::PacketHandle pkts[bess::PacketBatch::kMaxBurst];
+  while (limit > 0) {
+    const unsigned n = rte_ring_sc_dequeue_burst(
+        ingress_, reinterpret_cast<void **>(pkts),
+        std::min<uint32_t>(limit, bess::PacketBatch::kMaxBurst), nullptr);
+    for (unsigned i = 0; i < n; i++) {
+      Classify(pkts[i]);
     }
+    if (n < bess::PacketBatch::kMaxBurst) {
+      return;
+    }
+    limit -= n;
+  }
+}
+
+void DRR::Classify(bess::PacketHandle handle) {
+  int err = 0;
+  // TODO(joshua): Add support for fragmented packets.
+  FlowId id = GetId(bess::PacketRef(handle));
+  auto it = flows_.Find(id);
+
+  // if the Flow doesn't exist create one
+  // and add the packet to the new Flow
+  if (it == nullptr) {
+    if (rte_ring_full(flow_ring_)) {
+      bess::PacketFree(handle);
+    } else {
+      AddNewFlow(handle, id, &err);
+    }
+  } else {
+    Enqueue(it->second, handle, &err);
   }
 }
 
@@ -164,6 +202,8 @@ struct task_result DRR::RunTask(Context *ctx, bess::PacketBatch *batch,
         .block = true, .packets = 0, .bits = 0,
     };
   }
+
+  DrainIngress(kIngressPerRun);
 
   int err = 0;
   batch->clear();
@@ -267,7 +307,7 @@ DRR::Flow *DRR::GetNextFlow(int *err) {
       return nullptr;
     }
 
-    f->deficit += quantum_;
+    f->deficit += quantum_.load(std::memory_order_relaxed);
   } else {
     f = current_flow_;
     current_flow_ = nullptr;
@@ -330,6 +370,8 @@ void DRR::AddNewFlow(bess::PacketHandle pkt, FlowId id, int *err) {
   f->queue = AddQueue(static_cast<int>(kFlowQueueSize), err);
 
   if (*err != 0) {
+    delete f;
+    bess::PacketFree(pkt);
     return;
   }
 
@@ -352,7 +394,7 @@ void DRR::RemoveFlow(Flow *f) {
   delete f;
 }
 
-rte_ring *DRR::AddQueue(uint32_t slots, int *err) {
+rte_ring *DRR::AddQueue(uint32_t slots, int *err, unsigned flags) {
   ssize_t bytes = rte_ring_get_memsize(slots);
   if (bytes < 0) {
     *err = -EINVAL;
@@ -368,7 +410,7 @@ rte_ring *DRR::AddQueue(uint32_t slots, int *err) {
   }
 
   std::string name = bess::utils::NewRingName("drr");
-  ret = rte_ring_init(queue, name.c_str(), slots, kRingFlags);
+  ret = rte_ring_init(queue, name.c_str(), slots, flags);
   if (ret) {
     std::free(queue);
     *err = -EINVAL;
@@ -379,7 +421,8 @@ rte_ring *DRR::AddQueue(uint32_t slots, int *err) {
 
 void DRR::Enqueue(Flow *f, bess::PacketHandle newpkt, int *err) {
   // if the queue is full. drop the packet.
-  if (rte_ring_count(f->queue) >= max_queue_size_) {
+  if (rte_ring_count(f->queue) >=
+      max_queue_size_.load(std::memory_order_relaxed)) {
     bess::PacketFree(newpkt);
     return;
   }
@@ -436,7 +479,7 @@ CommandResponse DRR::SetQuantumSize(uint32_t size) {
     return CommandFailure(EINVAL, "quantum size must be at least 1");
   }
 
-  quantum_ = size;
+  quantum_.store(size, std::memory_order_relaxed);
   return CommandSuccess();
 }
 
@@ -444,7 +487,7 @@ CommandResponse DRR::SetMaxFlowQueueSize(uint32_t queue_size) {
   if (queue_size == 0) {
     return CommandFailure(EINVAL, "max queue size must be at least 1");
   }
-  max_queue_size_ = queue_size;
+  max_queue_size_.store(queue_size, std::memory_order_relaxed);
   return CommandSuccess();
 }
 

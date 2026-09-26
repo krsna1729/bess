@@ -39,6 +39,7 @@ file is the reasoning.
 | D-016 | Benchmark native release builds with ABBA; no ISA multiversioning for now | accepted |
 | D-017 | HashLB and ACL on mode G, L2Forward on mode C; control commands off the worker pause | accepted |
 | D-018 | BPF execution: DPDK `rte_bpf` (with a repair pass) or the BESS JIT | open (deferred) |
+| D-019 | DRR: a multi-producer ingress ring; the task's worker owns all flow state | accepted (trade-off recorded) |
 
 ---
 
@@ -944,6 +945,40 @@ follows from the size and change rate of its state (D-004).
   `l2forward.py::test_l2forward_validation` fail against the old code:
   commands were accepted, or the daemon crashed.
 
+**Amendment (2026-09-27): how the AVX2 probe reads shared slots.** An
+external review pointed out a flaw in the probe. It read a bucket's four
+slots with a C++ vector load (`_mm256_load_si256`) while the writer stored
+them with atomics. That is a data race in the C++ memory model, and so
+undefined behaviour, even though matches were re-checked with an atomic
+load. ThreadSanitizer (a standalone harness of the churn test, run once)
+reports 8 races between `l2_store_slot` and `_mm256_load_si256`.
+
+The probe now issues the 32-byte load as inline assembly (`vmovdqa`),
+which the compiler cannot reason about, and keeps the atomic per-candidate
+re-check. With it, ThreadSanitizer is clean and the churn test misses
+nothing. Its correctness rests on x86 behaviour:
+
+- a slot no one is writing reads back intact;
+- a slot being written may read torn, which gives at most a false
+  candidate (the re-check rejects it) or a miss of an entry mid-move
+  (covered, because moves write the alternate slot first).
+
+Alternatives, with native release builds, 8 ABBA pairs, and ns per 32 keys
+against the plain vector load. The numbers are paired medians over 4K..4M
+entries, CPU 2 / CPU 14:
+
+| probe | CPU 2 | CPU 14 |
+|---|---|---|
+| **inline-asm vector load + atomic re-check (chosen)** | +0.6..+2.4% (noise) | +1.8..+2.6% (noise) |
+| four atomic loads assembled in registers (`_mm256_set_epi64x`); fully conforming | +10% at 4K/64K, ~0 at 4M | **+12..+56%** |
+| four atomic loads stored to an aligned array, then a vector load | +55..+209% (store-forwarding stall) | +38..+146% |
+| four scalar atomic probes, early exit | +54..+224% | +44..+186% |
+| four scalar atomic probes, branchless mask | +30..+88% | +21..+94% |
+
+The fully conforming register version is the fallback if an x86
+implementation ever tears aligned 8-byte lanes of a vector load. Its
+E-core cost comes from the insert and shuffle uops.
+
 **Rejected.**
 
 - *L2Forward on mode W* (per-worker replicas): memory × workers for
@@ -1001,3 +1036,67 @@ programs into eBPF.
 - whether to offer eBPF (ELF) programs to module users directly.
 
 **Revisit when:** the deferred work in MODERNIZATION §31.6 is resumed.
+
+## D-019 DRR: a multi-producer ingress ring; the task's worker owns all flow state
+
+**Status:** accepted (2026-09-27), with a single-worker cost recorded.
+**Code:** `core/modules/drr.{h,cc}`, `bessctl/module_tests/drr.py`
+(`test_drr_cross_worker`).
+
+**Context.** DRR allows any number of workers. Upstream workers ran
+`ProcessBatch`, which looked flows up, created them, and could replace a
+flow's queue with a larger ring, freeing the old one. DRR's own task, on its
+worker, dequeued from those same queues and deleted expired flows. Whenever
+an upstream worker and the task's worker differ (a legal placement), this
+races: a queue can be freed under the consumer, or a flow deleted under the
+producer. The flow map itself is not concurrent either.
+
+**Decision.** The module is split at a queue, like `Queue`:
+
+- `ProcessBatch` (any worker) only enqueues the batch onto a
+  multi-producer, single-consumer ingress ring, and drops when the ring is
+  full.
+- The task drains up to 1,024 ingress packets per run, then classifies and
+  schedules as before. It is the only reader and writer of the flow map,
+  the flow queues and the round-robin ring: worker-owned state, needing no
+  grace period and no pause (D-013).
+- The quantum and the maximum flow-queue size are relaxed atomics, so both
+  commands are `THREAD_SAFE`.
+- Also fixed:
+  - `Flow` left `queue` uninitialized, which its destructor read;
+  - the destructor removed map entries while iterating the map;
+  - a flow leaked when its queue allocation failed.
+
+This is the worker-owned case of D-004. It needs no control-to-worker
+operation rings: the commands are two scalars.
+
+**Evidence.**
+
+- **The old code crashed.** `drr.py::test_drr_cross_worker` (two producer
+  workers, and the DRR task on a third worker rate-limited to 2 Mpps so
+  queues grow) took the daemon down in 3 of 3 runs, even with the live
+  commands removed. Each daemon log ends at `*** Resuming ***`. The new
+  code passes 3 of 3, with live commands throughout. This is a stress
+  test, not a proof (D-007); the ownership argument above is the proof.
+- **The single-worker cost:** Source → RandomUpdate (64 flows) → DRR → Sink,
+  DRR's task on the same worker. `bessd` runs under
+  `omarchy-benchmark --cpu 2 --isolate`, with native release builds and 8
+  ABBA pairs of 3 s windows. The old code measured 11.90 Mpps and the new
+  11.47 Mpps. The paired new/old median is 0.972 (0.932..1.052), and the new
+  code was faster in 1 of 8 pairs. That is about −3% for the extra ring hop
+  per packet.
+
+**Rejected.**
+
+- *Limiting DRR to one worker:* it would forbid the ordinary placement of a
+  scheduler task on its own worker.
+- *A concurrent flow map plus grace periods for queues:* every enqueue
+  would pay for sharing state that one worker can own.
+
+**Revisit when:**
+
+- the single-worker cost matters. Classifying directly when the producer
+  is the task's own worker would remove the hop, but it needs a race-free
+  notion of the owner across task moves (for example, the owner published
+  at graph-change time);
+- DRR gains per-flow state that commands must write (then mode W op rings).

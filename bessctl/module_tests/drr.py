@@ -63,6 +63,45 @@ class BessDrrTest(BessModuleTestCase):
             self.assertEqual(len(pkt_outs[0]), 1)
             self.assertSamePackets(pkt_outs[0][0], pkt)
 
+    # Producers on two workers and the DRR task on a third, rate-limited so
+    # flow queues fill and grow, with live commands throughout. Before D-019
+    # the producers created, resized and freed flow queues that the task was
+    # dequeuing from; a stress test cannot prove the race is gone (D-007), but
+    # it did crash the old code (see the commit), and it checks that live
+    # commands no longer need a pause.
+    def test_drr_cross_worker(self):
+        import os
+        cores = sorted(os.sched_getaffinity(0))
+        if len(cores) < 3:
+            self.skipTest('needs three allowed CPUs')
+        for wid in range(3):
+            bess.add_worker(wid=wid, core=cores[wid])
+        bess.add_tc('drr_rl', policy='rate_limit', wid=2, resource='packet',
+                    limit={'packet': 2000000})
+
+        drr = DRR(num_flows=1024, max_flow_queue_size=8192)
+        out = Measure()
+        drr -> out -> Sink()
+        drr.attach_task(parent='drr_rl')
+        for wid in range(2):
+            src = Source()
+            src -> RandomUpdate(fields=[
+                {'offset': 26, 'size': 4, 'min': 1, 'max': 2000},
+                {'offset': 34, 'size': 2, 'min': 1, 'max': 4}]) -> drr
+            src.attach_task(wid=wid)
+
+        bess.resume_all()
+        deadline = time.time() + 3
+        i = 0
+        while time.time() < deadline:
+            drr.set_quantum_size(quantum=1000 + (i % 1000))
+            drr.set_max_flow_queue_size(max_queue_size=4096 + (i % 4096))
+            i += 1
+        bess.pause_all()
+
+        self.assertBessAlive()
+        self.assertGreater(out.get_summary().packets, 0)
+
     # Takes the number of flows n, the quantum to give drr, the list packet rates for each flow
     # and the packet rate for the module. runs this setup for five seconds and tests that
     # throughput for each flow had a jaine fairness of atleast .95.

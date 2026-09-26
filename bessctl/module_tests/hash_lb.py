@@ -56,6 +56,11 @@ class BessHashLBTest(BessModuleTestCase):
             return
         self.fail('command was accepted')
 
+    def test_no_gates_is_refused_at_creation(self):
+        with self.assertRaises(BESS.Error) as ctx:
+            HashLB()
+        self.assertEqual(ctx.exception.code, errno.EINVAL)
+
     def test_gates_and_modes(self):
         pkts = self.flows()
         lb = HashLB(gates=[1, 2])
@@ -72,6 +77,8 @@ class BessHashLBTest(BessModuleTestCase):
         # later in the list must not leave a half-written list behind.
         self.assertRefused(lb.set_gates, gates=[65536])
         self.assertRefused(lb.set_gates, gates=[6, 7, 70000])
+        # No destinations: every packet would index an empty gate list.
+        self.assertRefused(lb.set_gates, gates=[])
         used, total = self.gates_used(lb, pkts, range(8))
         self.assertEqual(total, len(pkts))
         self.assertEqual(used, [3, 4, 5], 'refused commands change nothing')

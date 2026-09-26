@@ -3845,6 +3845,36 @@ rather than one call site).
     - Still on the pause: BPF (deferred with the `rte_bpf` decision) and
       URLFilter (legacy); see §31.6.
 
+101. **External review fixes (2026-09-27).**
+    - **L2Forward's AVX2 probe raced in the C++ memory model:** a vector
+      load of slots the writer stores atomically.
+      - Now an inline-asm vector load plus an atomic re-check. It is the
+        same speed as before; ThreadSanitizer reported 8 races before
+        and none after.
+      - Five alternatives were measured. The fully conforming one costs up
+        to +56% on the E-core, so it is recorded as the fallback (D-017
+        amendment).
+    - **HashLB accepted an empty gate list** (Init or live `set_gates`),
+      after which every packet indexed an empty list. It is now refused,
+      with live regressions.
+    - **Review items folded in:**
+      - transaction acceptance criteria (§31.3 item 6);
+      - `rte_bpf` cutover conditions (§31.6);
+      - the grace-period benchmark as a regression gate, the rule on
+        atomic reads of shared words, and input validation before joining
+        the no-pause catalogue (§31.7).
+
+102. **DRR: the task's worker owns all flow state (D-019).**
+    - Producers on other workers used to create and resize flow queues
+      that the task dequeued from. The new cross-worker test crashed the
+      old daemon in 3 of 3 runs.
+    - Now there is an MP/SC ingress ring and task-side classification;
+      the commands are atomics and `THREAD_SAFE`.
+    - Also fixed: a `Flow` field read uninitialized, map mutation while
+      iterating it, and a leak on allocation failure.
+    - Cost: −3% throughput in the single-worker case (paired ABBA,
+      isolated). Classifying directly on the owning worker is queued.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -9598,18 +9628,34 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
    the scheduler-round boundary into worker-private replicas or shards, with
    completion counters. No grace period or pause is needed for W-owned
    state (D-013).
+   **Not built yet, and why (2026-09-27):** no current module needs
+   control-to-worker operation rings.
+   - NAT's commands mutate nothing.
+   - DRR's commands are two scalars, now atomics (D-019).
+   - DRR's cross-worker packet handoff is an ingress ring, not an op ring.
+
+   Build this when two consumers need commands that write worker-owned
+   state (D-008's rule). Likely consumers: NAT static mappings or flow
+   clear, and the stateful firewall or CG-NAT of Phase N.
 3. **Take the remaining pause-bound commands off the global worker
    pause:** BPF is deferred with the `rte_bpf` decision (§31.6, D3).
    URLFilter stays on the pause as legacy (§31.6). L2Forward, ACL and
    HashLB are done (D-017).
-4. **Fix DRR:** it allows several workers, but `ProcessBatch` writes the
-   flow `CuckooMap` with no synchronization. Either restrict it to one
-   worker or make the flow state worker-owned (W).
+4. **DRR is done (D-019).** The task's worker owns all flow state behind
+   an MP/SC ingress ring. Open item: skip the ring when the producer is
+   the owning worker (−3% today); this needs a race-free notion of the
+   owner across task moves.
 5. **Prior-art study before transactions:** DPDK `rte_swx` table staging
    with commit/abort, P4Runtime write atomicity (continue-on-error,
    rollback-on-error, dataplane-atomic), and VPP bihash and binary API.
    Record what is borrowed as decisions.
-6. **G1.2b transactions** across tables with different update modes. The
+6. **G1.2b transactions** across tables with different update modes.
+   This is the remaining architectural milestone, per the external review
+   of 2026-09-27: individual live commands do not give the guarantee of
+   one dataplane transaction across classifiers, actions, meters, routes
+   and next hops. Acceptance must include failure injection (a failure at
+   every step rolls back or leaves no partial state visible) and checks
+   that generations stay consistent under concurrent traffic. The
    hard question, per an external review: how one transaction combines C
    tables, W state, published generations and meter state without
    pretending they are one mechanism. Planned approach, D-013:
@@ -9811,7 +9857,19 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
        - the interpreter and the JIT compared against each other;
        - the arm64 JIT under emulation (it has no mbuf-load support, so it
          interprets).
-    3. **Decide whether to move** (D3 acceptance criteria):
+    3. **Decide whether to move** (D3 acceptance criteria). The external
+       review of 2026-09-27 adds conditions: keep `rte_bpf` an isolated
+       experiment until the cutover evidence is complete, and never remove
+       the existing JIT merely to reduce code. Cutover needs:
+       - representative performance comparisons;
+       - chained-packet semantics: `rte_bpf` reads across segments, while
+         the BESS JIT sees only the first segment, a visible behaviour
+         change for filters on long packets;
+       - verification on each architecture;
+       - an explicit decision on maintaining the two DPDK workarounds
+         until upstream fixes land.
+
+       The D3 criteria themselves:
        - equivalence (above);
        - an ABBA comparison against the old BESS JIT;
        - maintenance and security.
@@ -9857,6 +9915,20 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
   §31.4 ISA A/B.
 - **On any new concurrent structure:** a deterministic invariant test,
   mutation-checked once (D-007).
+  - Every shared word a writer stores atomically must also be read
+    atomically. No plain or vector loads of shared state, even when a match
+    is re-checked afterwards: that is a data race in the C++ memory model
+    (external review, 2026-09-27; the L2 probe fix, entry 101).
+  - A ThreadSanitizer run of the churn test is the one-time check.
+- **Before raising update rates, or after changing quiescence or
+  reclamation:** `grace_period_bench` is a regression gate (external
+  review, 2026-09-27). Grace-period length bounds the spare-slot headroom a
+  table needs at a given update rate (D-010, D-012).
+- **Before adding a module to the no-pause catalogue:** validate every
+  input that can make the packet path misbehave. That covers range, empty
+  lists (the HashLB gate list, entry 101) and duplicates. Add a live-worker
+  regression showing that a refused command leaves the working
+  configuration in place.
 
 ## 25. Known lower-priority research/backlog
 
