@@ -28,6 +28,9 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <utility>
+#include <vector>
+
 #include "l2_forward.h"
 
 
@@ -219,15 +222,15 @@ static int parse_mac_addr(const char *str, char *addr) {
 
 const Commands L2Forward::cmds = {
     {"add", "L2ForwardCommandAddArg", MODULE_CMD_FUNC(&L2Forward::CommandAdd),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_SAFE},
     {"delete", "L2ForwardCommandDeleteArg",
-     MODULE_CMD_FUNC(&L2Forward::CommandDelete), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&L2Forward::CommandDelete), Command::THREAD_SAFE},
     {"set_default_gate", "L2ForwardCommandSetDefaultGateArg",
      MODULE_CMD_FUNC(&L2Forward::CommandSetDefaultGate), Command::THREAD_SAFE},
     {"lookup", "L2ForwardCommandLookupArg",
      MODULE_CMD_FUNC(&L2Forward::CommandLookup), Command::THREAD_SAFE},
     {"populate", "L2ForwardCommandPopulateArg",
-     MODULE_CMD_FUNC(&L2Forward::CommandPopulate), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&L2Forward::CommandPopulate), Command::THREAD_SAFE},
 };
 
 CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
@@ -278,70 +281,102 @@ void L2Forward::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   }
 }
 
+namespace {
+
+// Gates are int64 on the wire: check before narrowing (65536 is not gate 0,
+// -1 is not gate 65535). DROP_GATE (8192) fits the slot's 15-bit field.
+bool ValidWireGate(int64_t gate) {
+  return gate >= 0 && bess::IsValidGateValue(static_cast<uint64_t>(gate));
+}
+
+}  // namespace
+
+// add/delete/populate change the table in place while workers keep reading
+// (G1.2 mode C; l2_table's single-word slots need no grace period). Each
+// command validates everything first and applies all of it or none.
 CommandResponse L2Forward::CommandAdd(
     const bess::pb::L2ForwardCommandAddArg &arg) {
+  std::vector<std::pair<uint64_t, gate_idx_t>> entries;
+  entries.reserve(static_cast<size_t>(arg.entries_size()));
   for (int i = 0; i < arg.entries_size(); i++) {
     const auto &entry = arg.entries(i);
-
     if (!entry.addr().length()) {
       return CommandFailure(EINVAL,
                             "add list item map must contain addr as a string");
     }
-
     const char *str_addr = entry.addr().c_str();
-    int gate = entry.gate();
     char addr[6];
-
     if (parse_mac_addr(str_addr, addr) != 0) {
       return CommandFailure(EINVAL, "%s is not a proper mac address", str_addr);
     }
-
-    int r = l2_add_entry(&l2_table_, l2_addr_to_u64(addr), gate);
-
-    if (r == -EEXIST) {
-      return CommandFailure(EEXIST, "MAC address '%s' already exist", str_addr);
-    } else if (r == -ENOMEM) {
-      return CommandFailure(ENOMEM, "Not enough space");
-    } else if (r != 0) {
-      return CommandFailure(-r);
+    if (!ValidWireGate(entry.gate())) {
+      return CommandFailure(EINVAL, "Invalid gate: %lld",
+                            static_cast<long long>(entry.gate()));
     }
+    const uint64_t mac = l2_addr_to_u64(addr);
+    gate_idx_t existing;
+    if (l2_find(&l2_table_, mac, &existing) == 0) {
+      return CommandFailure(EEXIST, "MAC address '%s' already exist", str_addr);
+    }
+    for (const auto &[seen, gate] : entries) {
+      if (seen == mac) {
+        return CommandFailure(EEXIST, "MAC address '%s' given twice",
+                              str_addr);
+      }
+    }
+    entries.emplace_back(mac, static_cast<gate_idx_t>(entry.gate()));
   }
 
+  for (size_t i = 0; i < entries.size(); i++) {
+    const int r = l2_add_entry(&l2_table_, entries[i].first, entries[i].second);
+    if (r != 0) {
+      // Out of space part-way: take back what this command added.
+      for (size_t j = 0; j < i; j++) {
+        l2_del_entry(&l2_table_, entries[j].first);
+      }
+      return r == -ENOMEM ? CommandFailure(ENOMEM, "Not enough space")
+                          : CommandFailure(-r);
+    }
+  }
   return CommandSuccess();
 }
 
 CommandResponse L2Forward::CommandDelete(
     const bess::pb::L2ForwardCommandDeleteArg &arg) {
+  std::vector<uint64_t> macs;
+  macs.reserve(static_cast<size_t>(arg.addrs_size()));
   for (int i = 0; i < arg.addrs_size(); i++) {
     const auto &_addr = arg.addrs(i);
-
     if (!_addr.length()) {
       return CommandFailure(EINVAL, "lookup must be list of string");
     }
-
     const char *str_addr = _addr.c_str();
     char addr[6];
-
     if (parse_mac_addr(str_addr, addr) != 0) {
       return CommandFailure(EINVAL, "%s is not a proper mac address", str_addr);
     }
-
-    int r = l2_del_entry(&l2_table_, l2_addr_to_u64(addr));
-
-    if (r == -ENOENT) {
+    const uint64_t mac = l2_addr_to_u64(addr);
+    gate_idx_t gate;
+    if (l2_find(&l2_table_, mac, &gate) != 0) {
       return CommandFailure(ENOENT, "MAC address '%s' does not exist",
                             str_addr);
-    } else if (r != 0) {
-      return CommandFailure(EINVAL, "Unknown Error: %d\n", r);
     }
+    macs.push_back(mac);
   }
-
+  for (const uint64_t mac : macs) {
+    l2_del_entry(&l2_table_, mac);  // duplicates in the request: ENOENT, fine
+  }
   return CommandSuccess();
 }
 
 CommandResponse L2Forward::CommandSetDefaultGate(
     const bess::pb::L2ForwardCommandSetDefaultGateArg &arg) {
-  default_gate_ = arg.gate();
+  if (!ValidWireGate(arg.gate())) {
+    return CommandFailure(EINVAL, "Invalid gate: %lld",
+                          static_cast<long long>(arg.gate()));
+  }
+  __atomic_store_n(&default_gate_, static_cast<gate_idx_t>(arg.gate()),
+                   __ATOMIC_RELAXED);
   return CommandSuccess();
 }
 
@@ -395,16 +430,26 @@ CommandResponse L2Forward::CommandPopulate(
 
   base_u64 = l2_addr_to_u64(base_str);
 
-  int cnt = arg.count();
-  int gate_cnt = arg.gate_count();
+  // gate_count 0 used to divide by zero (i % gate_cnt) and crash bessd.
+  if (arg.count() < 0 || arg.gate_count() <= 0 ||
+      arg.gate_count() > MAX_GATES) {
+    return CommandFailure(EINVAL, "count must be >= 0 and gate_count in 1..%d",
+                          MAX_GATES);
+  }
+  const int64_t cnt = arg.count();
+  const int64_t gate_cnt = arg.gate_count();
 
   base_u64 = bess::utils::be64_t::swap(base_u64) >> 16;
   base_u64 = base_u64 >> 16;
 
-  for (int i = 0; i < cnt; i++) {
-    l2_add_entry(&l2_table_, bess::utils::be64_t::swap(base_u64 << 16),
-                 i % gate_cnt);
-
+  for (int64_t i = 0; i < cnt; i++) {
+    const int r =
+        l2_add_entry(&l2_table_, bess::utils::be64_t::swap(base_u64 << 16),
+                     static_cast<gate_idx_t>(i % gate_cnt));
+    if (r == -ENOMEM) {
+      return CommandFailure(ENOMEM, "Not enough space after %lld entries",
+                            static_cast<long long>(i));
+    }
     base_u64++;
   }
 

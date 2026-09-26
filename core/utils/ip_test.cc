@@ -68,6 +68,25 @@ TEST(IPTest, PrefixInStr) {
   EXPECT_EQ(0x80000000, prefix_3.mask.value());
 }
 
+// Malformed prefixes: Parse() rejects them; the constructor yields 0.0.0.0/0
+// and never throws (std::stoi used to, on a non-numeric length).
+TEST(IPTest, PrefixParseRejectsMalformedInput) {
+  for (const char *bad : {"", "10.0.0.0", "10.0.0.0/", "10.0.0.0/x",
+                          "10.0.0.0/33", "10.0.0.0/-1", "10.0.0.0/8x",
+                          "abc/8", "10.0.0/8", " 10.0.0.0/8", "10.0.0.0x/8",
+                          "10..0.0/8", "10.0.0.256/8"}) {
+    EXPECT_FALSE(Ipv4Prefix::Parse(bad).has_value()) << bad;
+    Ipv4Prefix p(bad);  // must not throw
+    EXPECT_EQ(0u, p.addr.value()) << bad;
+    EXPECT_EQ(0u, p.mask.value()) << bad;
+  }
+  const auto ok = Ipv4Prefix::Parse("192.168.1.0/24");
+  ASSERT_TRUE(ok.has_value());
+  EXPECT_EQ(24u, ok->prefix_length());
+  EXPECT_EQ(32u, Ipv4Prefix::Parse("1.2.3.4/32")->prefix_length());
+  EXPECT_EQ(0u, Ipv4Prefix::Parse("0.0.0.0/0")->prefix_length());
+}
+
 // Check if Ipv4Prefix::Match() behaves correctly
 TEST(IPTest, PrefixMatch) {
   Ipv4Prefix prefix_1("192.168.0.1/24");

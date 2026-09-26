@@ -27,82 +27,64 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import errno
+
 from test_utils import *
 
 
+# ACL rules are published atomically (G1.2 mode G): add/clear run while
+# workers keep processing, first match wins, unmatched traffic is dropped,
+# and a refused command changes nothing. Wire values are validated before
+# narrowing (a uint32 port of 65616 is not port 80), and malformed prefixes
+# are refused instead of crashing the daemon.
 class BessAclTest(BessModuleTestCase):
 
-    def test_run_acl_simple(self):
-        fw = ACL(rules=[{'src_ip': '172.12.0.0/16', 'drop': False}])
-        self.run_for(fw, [0], 3)
+    def passes(self, acl, pkt):
+        outs = self.run_module(acl, 0, [pkt], [0])
+        return len(outs[0]) == 1
+
+    def assertRefused(self, fn, **kwargs):
+        try:
+            fn(**kwargs)
+        except BESS.Error as e:
+            self.assertEqual(e.code, errno.EINVAL, e.errmsg)
+            return
+        self.fail('command was accepted')
+
+    def test_rules(self):
+        a = get_tcp_packet(sip='10.1.2.3', dip='20.0.0.1', sport=1000, dport=80)
+        b = get_tcp_packet(sip='11.1.2.3', dip='20.0.0.1', sport=1000, dport=80)
+
+        acl = ACL(rules=[{'src_ip': '10.0.0.0/8', 'drop': False}])
+        self.assertTrue(self.passes(acl, a))
+        self.assertFalse(self.passes(acl, b), 'unmatched traffic is dropped')
+
+        # 65616 would narrow to 80 and forward `b`; it must be refused.
+        self.assertRefused(acl.add, rules=[{'dst_port': 65616, 'drop': False}])
+        self.assertFalse(self.passes(acl, b), 'refused add changes nothing')
+
+        # A malformed prefix used to throw out of Ipv4Prefix (std::stoi).
+        self.assertRefused(acl.add, rules=[{'src_ip': '11.0.0.0/x',
+                                            'drop': False}])
+        self.assertRefused(acl.add, rules=[{'src_ip': '11.0.0.0/8',
+                                            'drop': False},
+                                           {'dst_ip': 'bogus/8'}])
         self.assertBessAlive()
+        self.assertFalse(self.passes(acl, b), 'all-or-nothing')
 
-    def test_run_acl_3rules(self):
-        fw = ACL(rules=[{'src_ip': '172.12.0.0/16',
-                         'drop': False},
-                        {'dst_ip': '192.168.32.4/32',
-                         'dst_port': 4455,
-                         'src_ip': '134.54.33.2/32',
-                         'drop': False},
-                        {'src_ip': '133.133.133.0/24',
-                         'src_port': 43,
-                         'dst_ip': '96.96.96.155/32',
-                         'dst_port': 9,
-                         'drop': False}])
-        self.run_for(fw, [0], 3)
-        self.assertBessAlive()
+        acl.add(rules=[{'dst_port': 80, 'drop': False}])
+        self.assertTrue(self.passes(acl, b))
 
-    def test_run_acl_edgecase(self):
-        fw = ACL(rules=[{'src_ip': '0.0.0.0/0', 'drop': False}])
-        self.run_for(fw, [0], 3)
-        self.assertBessAlive()
+        acl.clear()
+        self.assertFalse(self.passes(acl, a))
+        self.assertFalse(self.passes(acl, b))
 
-    def test_acl_simple(self):
-        fw = ACL(rules=[{'src_ip': '0.0.0.0/0', 'drop': False}])
-                 # module to test
-        pkt_in = get_tcp_packet(sip='22.22.22.22', dip='22.22.22.22')
+    def test_first_match_wins(self):
+        a = get_tcp_packet(sip='10.1.2.3', dip='20.0.0.1')
+        acl = ACL(rules=[{'src_ip': '10.0.0.0/8', 'drop': True},
+                         {'src_ip': '10.1.0.0/16', 'drop': False}])
+        self.assertFalse(self.passes(acl, a))
 
-        pkt_outs = self.run_module(fw, 0, [pkt_in], [0])
-
-        self.assertEqual(len(pkt_outs[0]), 1)
-        self.assertSamePackets(pkt_outs[0][0], pkt_in)
-
-    def tests_acl_back2back(self):
-        fw = ACL(rules=[{'src_ip': '96.0.0.0/8', 'drop': False}])
-        pkt_in1 = get_tcp_packet(sip='22.22.22.22', dip='22.22.22.22')
-        pkt_in2 = get_tcp_packet(sip='96.22.22.22', dip='22.22.22.22')
-
-        pkt_outs = self.run_module(fw, 0, [pkt_in1], [0])
-        self.assertEqual(len(pkt_outs[0]), 0)
-
-        pkt_outs = self.run_module(fw, 0, [pkt_in2], [0])
-        self.assertEqual(len(pkt_outs[0]), 1)
-        self.assertSamePackets(pkt_outs[0][0], pkt_in2)
-
-    def test_run_acl_custom(self):
-        fw = ACL(rules=[{'src_ip': '172.12.0.0/16',
-                         'drop': False},
-                        {'dst_ip': '192.168.32.4/32',
-                         'dst_port': 4455,
-                         'src_ip': '134.54.33.2/32',
-                         'drop': False},
-                        {'src_ip': '133.133.133.0/24',
-                         'src_port': 43,
-                         'dst_ip': '96.96.96.155/32',
-                         'dst_port': 9,
-                         'drop': False}])
-
-        pkt_udp = get_udp_packet(sip='172.12.0.3', dip='127.12.0.4')
-        pkt_tcp = get_tcp_packet(sip='192.168.32.4', dip='1.2.3.4')
-        rwtemp = [bytes(pkt_udp), bytes(pkt_tcp)]
-
-        Source() -> Rewrite(templates=rwtemp) -> fw -> Sink()
-
-        bess.resume_all()
-        time.sleep(3)
-        bess.pause_all()
-
-        self.assertBessAlive()
 
 suite = unittest.TestLoader().loadTestsFromTestCase(BessAclTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)

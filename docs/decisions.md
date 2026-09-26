@@ -37,6 +37,7 @@ file is the reasoning.
 | D-014 | WildcardMatch on mode C: a concurrent tuple-space table | accepted (trade-off recorded) |
 | D-015 | Hash and compare keys inline around `rte_hash` lookups | accepted |
 | D-016 | Benchmark native release builds with ABBA; no ISA multiversioning for now | accepted |
+| D-017 | HashLB and ACL on mode G, L2Forward on mode C; control commands off the worker pause | accepted |
 
 ---
 
@@ -869,3 +870,92 @@ today):
 - deployments target Zen 3 with portable builds (the `bsf` penalty);
 - a new CPU generation changes these costs.
 
+## D-017 HashLB and ACL on mode G, L2Forward on mode C; control commands off the worker pause
+
+**Status:** accepted (2026-09-26).
+**Code:** `core/modules/hash_lb.{h,cc}`, `core/modules/acl.{h,cc}`,
+`core/modules/l2_table.h`, `core/modules/l2_forward.cc`,
+`core/utils/ip.{h,cc}` (`Ipv4Prefix::Parse`).
+
+**Context.** These modules' commands paused every worker for each change.
+D-013 says a pause is needed only for graph changes. The mode for each
+follows from the size and change rate of its state (D-004).
+
+**Decision.**
+
+- **HashLB, mode G.** The mode, gate list and field layout form one
+  immutable `Config` published through an `RcuPtr`. A batch reads it once.
+  The field-layout table is built per `set_mode` and shared between
+  configurations. The configuration is small and rarely changes, which is
+  what G is for.
+- **ACL, mode G.** The rule list is copied, appended to and republished.
+  `add` is all-or-nothing, and `clear` publishes an empty list. The rule
+  lists this module is meant for are small. Large ones belong to `rte_acl`,
+  which is itself a build-then-swap structure.
+- **L2Forward, mode C.** MAC tables can be large and churn. `l2_table`
+  keeps its layout (4-way buckets of 8-byte inline slots) and becomes
+  single-writer with lock-free readers:
+  - every slot write is one whole-word store (release);
+  - a reader matches on one relaxed load of the slot and re-checks the
+    word it matched, never trusting a SIMD lane on its own;
+  - a compiler fence separates the primary probe from the alternate;
+  - a cuckoo move writes the alternate slot before clearing the primary,
+    so a reader can find an entry in the middle of its move;
+  - no grace period is needed: slots hold values, not pointers.
+- **Wire validation before narrowing,** in every command touched: ports
+  ≤ 0xffff, gates < MAX_GATES, MAC ≤ 48 bits, `populate`'s `gate_count` in
+  1..MAX_GATES (it was a divide by zero). Multi-entry `add`/`delete`
+  validate everything first. L2 `add` also rolls back on ENOMEM, so a
+  refused command leaves the table unchanged.
+- **`Ipv4Prefix::Parse`** is strict ("d.d.d.d/len"). The constructor no
+  longer throws on malformed input (`std::stoi` used to take the daemon
+  down on an ACL rule).
+
+**Evidence.**
+
+- L2Forward lookups, auto body, native release, 8 ABBA pairs (`tools/ab_bench.py`
+  with `BM_L2Forward/2/` in `modules_table_scale_bench`), ns per 32 keys,
+  new / old:
+
+  | entries | CPU 2 (P-core) | CPU 14 (E-core) |
+  |---|---|---|
+  | 4K | 102 / 140 (−27%) | 131 / 231 (−44%) |
+  | 64K | 115 / 151 (−24%) | 145 / 231 (−38%) |
+  | 1M | 235 / 283 (−17%) | 214 / 294 (−23%) |
+  | 4M | 416 / 467 (−11%) | 476 / 550 (−13%) |
+
+  All pairs agree, except 7/8 at 4M on CPU 14. The CPU 2 run passed
+  `--allow-busy`: one browser renderer at 25% on another CPU.
+- **Why faster:** the old probe compared integer slots with
+  `_mm256_cmp_pd`, a floating-point compare. That meant FP-domain latency
+  and bypass delays, and it was also a correctness bug. With
+  denormals-are-zero set, every denormal slot compares equal to every
+  denormal key (a masked MAC slot is a denormal double), so a lookup could
+  return another MAC's gate. The new probe uses `_mm256_cmpeq_epi64`.
+- **Tests** (`core/modules/l2_table_test.cc`; each mutation checked):
+  - `DenormalsAreZeroDoesNotMatchEverything` and
+    `MacZeroMissesOnAnEmptyTable` fail on the old double compare;
+  - `EntryIsFoundInTheMiddleOfItsMove` is deterministic, using a move hook
+    inside the move. It fails with the reversed move order;
+  - `ReadersNeverMissAStableEntryDuringChurn` is a stress test, which did
+    *not* catch the reversed order (D-007: stress is not proof).
+- **Live-daemon tests** `hash_lb.py`, `acl.py` and
+  `l2forward.py::test_l2forward_validation` fail against the old code:
+  commands were accepted, or the daemon crashed.
+
+**Rejected.**
+
+- *L2Forward on mode W* (per-worker replicas): memory × workers for
+  tables that can be large, and every update applied N times.
+- *L2Forward moved onto `ConcurrentExactTable`:* the inline table already
+  resolves a hit in one or two cache lines with no value indirection, and
+  it is now faster than before.
+- *ACL on a concurrent structure:* first-match order over a list has no
+  in-place update that keeps order cheaply. G fits the size.
+
+**Revisit when:**
+
+- ACL rule sets grow beyond a few hundred (then `rte_acl`, still G);
+- L2 learning moves into the packet path (the writer would become a
+  worker, so mode W or a per-worker learn queue);
+- a second writer is ever needed for `l2_table`.

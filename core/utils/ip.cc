@@ -27,6 +27,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <charconv>
 #include "ip.h"
 
 #include <glog/logging.h>
@@ -60,22 +61,55 @@ std::string ToIpv4Address(be32_t addr) {
                              t.bytes[2], t.bytes[3]);
 }
 
-Ipv4Prefix::Ipv4Prefix(const std::string &prefix) {
-  size_t delim_pos = prefix.find('/');
+std::optional<Ipv4Prefix> Ipv4Prefix::Parse(const std::string &prefix) {
+  const size_t slash = prefix.find('/');
+  if (slash == std::string::npos || slash + 1 >= prefix.size()) {
+    return std::nullopt;
+  }
+  // Strictly "d.d.d.d": ParseIpv4Address (sscanf) would also accept
+  // surrounding whitespace and trailing junk.
+  const std::string address = prefix.substr(0, slash);
+  int dots = 0;
+  char prev = '.';
+  for (const char c : address) {
+    if (c == '.') {
+      if (prev == '.') {
+        return std::nullopt;  // an empty part
+      }
+      dots++;
+    } else if (c < '0' || c > '9') {
+      return std::nullopt;
+    }
+    prev = c;
+  }
+  be32_t addr;
+  if (dots != 3 || prev == '.' || !ParseIpv4Address(address, &addr)) {
+    return std::nullopt;
+  }
+  unsigned len = 0;
+  const char *first = prefix.data() + slash + 1;
+  const char *last = prefix.data() + prefix.size();
+  const auto [end, ec] = std::from_chars(first, last, len);
+  if (ec != std::errc() || end != last || len > 32) {
+    return std::nullopt;
+  }
+  Ipv4Prefix out("");
+  out.addr = addr;
+  out.mask = be32_t(SetBitsLow<uint32_t>(len));
+  return out;
+}
 
-  // default values in case of parser failure
-  addr = be32_t(0);
-  mask = be32_t(0);
-
-  if (prefix.length() == 0 || delim_pos == std::string::npos ||
-      delim_pos >= prefix.length()) {
+Ipv4Prefix::Ipv4Prefix(const std::string &prefix)
+    : addr(be32_t(0)), mask(be32_t(0)) {
+  // Default values on parser failure (the historical contract); std::stoi
+  // used to throw out of here on a non-numeric length.
+  if (prefix.empty()) {
     return;
   }
-
-  ParseIpv4Address(prefix.substr(0, delim_pos), &addr);
-
-  const int len = std::stoi(prefix.substr(delim_pos + 1));
-  mask = be32_t(SetBitsLow<uint32_t>(len));
+  if (const auto parsed = Parse(prefix)) {
+    addr = parsed->addr;
+    mask = parsed->mask;
+  }
 }
 
 }  // namespace utils

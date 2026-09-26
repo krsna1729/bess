@@ -32,6 +32,7 @@
 
 #include <type_traits>
 
+#include <optional>
 #include <string>
 
 #include "endian.h"
@@ -97,8 +98,14 @@ struct Ipv4Prefix {
   // Implicit default constructor is not allowed
   Ipv4Prefix() = delete;
 
-  // Construct Ipv4Prefix from a string like "192.168.0.1/24"
+  // Construct Ipv4Prefix from a string like "192.168.0.1/24". Malformed
+  // input yields 0.0.0.0/0 (never throws); callers that must reject bad
+  // input use Parse().
   explicit Ipv4Prefix(const std::string &prefix);
+
+  // Strict parse of "a.b.c.d/len" with 0 <= len <= 32; nullopt for anything
+  // else (a missing or non-numeric length, a bad address, trailing garbage).
+  static std::optional<Ipv4Prefix> Parse(const std::string &prefix);
 
   // Returns true if ip is within the range of Ipv4Prefix
   bool Match(const be32_t &ip) const { return (addr & mask) == (ip & mask); }

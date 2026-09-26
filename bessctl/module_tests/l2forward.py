@@ -48,6 +48,33 @@ class BessL2ForwardTest(BessModuleTestCase):
         with self.assertRaises(bess.Error):
             l2fib.delete(addrs=['00:01:02:03:04:05'])
 
+    # Commands run while workers keep processing (G1.2 mode C) and validate
+    # everything before applying anything: int64 wire gates are checked
+    # before narrowing, a bad entry adds nothing, and populate with
+    # gate_count 0 is refused (it used to divide by zero and crash bessd).
+    def test_l2forward_validation(self):
+        l2fib = L2Forward()
+        for gate in (65536, -1, 8193):
+            with self.assertRaises(bess.Error):
+                l2fib.add(entries=[{'addr': '00:01:02:03:04:05',
+                                    'gate': gate}])
+        with self.assertRaises(bess.Error):
+            l2fib.add(entries=[{'addr': '00:01:02:03:04:06', 'gate': 1},
+                               {'addr': 'not-a-mac', 'gate': 2}])
+        with self.assertRaises(bess.Error):
+            l2fib.lookup(addrs=['00:01:02:03:04:06'])  # nothing was added
+        with self.assertRaises(bess.Error):
+            l2fib.add(entries=[{'addr': '00:01:02:03:04:07', 'gate': 1},
+                               {'addr': '00:01:02:03:04:07', 'gate': 2}])
+        with self.assertRaises(bess.Error):
+            l2fib.populate(base='00:01:02:03:00:00', count=10, gate_count=0)
+        self.assertBessAlive()
+        with self.assertRaises(bess.Error):
+            l2fib.set_default_gate(gate=65536)
+        l2fib.add(entries=[{'addr': '00:01:02:03:04:08', 'gate': 5}])
+        self.assertEqual(list(l2fib.lookup(addrs=['00:01:02:03:04:08']).gates),
+                         [5])
+
 suite = unittest.TestLoader().loadTestsFromTestCase(BessL2ForwardTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)
 

@@ -33,6 +33,7 @@
 // L2Forward's MAC table, moved out of l2_forward.cc unchanged so tests and
 // benchmarks can reach it (K4.6 follow-up).
 
+#include <atomic>
 #include <immintrin.h>
 
 #include <cerrno>
@@ -76,6 +77,12 @@ struct l2_table {
   uint64_t count;
   // Batch-lookup body, fixed at l2_init from the table size (K4.6b).
   bess::dataplane::LookupBody lookup_body;
+  // Test hook, null in production: called by the writer in the middle of a
+  // move, after the entry is written to its alternate slot and before its
+  // primary slot is cleared, with the moving slot word. Lets a test observe
+  // a reader's view at exactly that point (D-007: a deterministic test).
+  void (*move_hook)(void *ctx, uint64_t moving_word) = nullptr;
+  void *move_hook_ctx = nullptr;
 };
 
 #define MAX_TABLE_SIZE (1048576 * 64)
@@ -170,46 +177,68 @@ inline uint32_t l2_alt_index(uint32_t hash, uint32_t size_power,
   return (index ^ tag) & ((0x1lu << (size_power - 1)) - 1);
 }
 
-#if __AVX__
-inline const union {
-  uint64_t val[4];
-  __m256d _mask;
-} _mask = {.val = {0x8000ffffFFFFffffull, 0x8000ffffFFFFffffull,
-                   0x8000ffffFFFFffffull, 0x8000ffffFFFFffffull}};
+// Decision D-017 (docs/decisions.md).
+// Concurrency (G1.2 mode C; see the note above l2_add_entry): a slot is one
+// 64-bit word holding the MAC, the gate and the occupied bit, and every slot
+// write is a single atomic store of the whole word. A reader therefore sees
+// the old or the new word, never a mix, and a key match and its gate always
+// come from the same word -- so a deleted or reused slot needs no grace
+// period.
 
-// Do not call these functions directly. Use find_index() instead. See below.
-inline int find_index_avx(uint64_t addr, uint64_t *table) {
-  DCHECK(reinterpret_cast<uintptr_t>(table) % 32 == 0);
-  __m256d _addr = (__m256d)_mm256_set1_epi64x(addr | (1ull << 63));
-  __m256d _table = _mm256_load_pd((double *)table);
-  _table = _mm256_and_pd(_table, _mask._mask);
-  __m256d cmp = _mm256_cmp_pd(_addr, _table, _CMP_EQ_OQ);
+// Occupied bit + MAC: what a lookup compares (the gate bits are masked off).
+inline constexpr uint64_t kL2KeyMask = 0x8000ffffFFFFffffull;
 
-  return __builtin_ffs(_mm256_movemask_pd(cmp));
+inline uint64_t l2_load_slot(const struct l2_entry *slot) {
+  return __atomic_load_n(&slot->entry, __ATOMIC_RELAXED);
 }
-#else
-inline int find_index_basic(uint64_t addr, uint64_t *table) {
-  for (int i = 0; i < 4; i++) {
-    if ((addr | (1ull << 63)) == (table[i] & 0x8000ffffFFFFffffull)) {
-      return i + 1;
+
+inline void l2_store_slot(struct l2_entry *slot, uint64_t word) {
+  __atomic_store_n(&slot->entry, word, __ATOMIC_RELEASE);
+}
+
+inline uint64_t l2_make_slot(uint64_t addr, gate_idx_t gate) {
+  l2_entry e{};
+  e.addr = addr;
+  e.gate = gate;
+  e.occupied = 1;
+  return e.entry;
+}
+
+// Returns the gate stored in the bucket for `addr` (occupied), or -1. Each
+// candidate is re-read as one word and re-checked, so a match and its gate
+// come from the same word even while the writer changes the bucket.
+inline int l2_probe_bucket(uint64_t addr, const struct l2_entry *bucket,
+                           uint64_t slots) {
+  const uint64_t want = addr | (1ull << 63);
+#if __AVX2__
+  if (slots == 4) {
+    // Integer compare. (A former _mm256_cmp_pd compare treated the slots as
+    // doubles: an empty slot (+0.0) equalled the key for MAC 0 (-0.0), and
+    // with denormals-are-zero every masked slot equalled every key.)
+    const __m256i table =
+        _mm256_load_si256(reinterpret_cast<const __m256i *>(bucket));
+    const __m256i masked =
+        _mm256_and_si256(table, _mm256_set1_epi64x(kL2KeyMask));
+    const int bits = _mm256_movemask_pd(_mm256_castsi256_pd(
+        _mm256_cmpeq_epi64(masked, _mm256_set1_epi64x(want))));
+    for (int m = bits; m != 0; m &= m - 1) {
+      const uint64_t word = l2_load_slot(&bucket[__builtin_ctz(m)]);
+      if ((word & kL2KeyMask) == want) {
+        return static_cast<int>((word >> 48) & 0x7fff);
+      }
+    }
+    return -1;
+  }
+#endif
+  for (uint64_t i = 0; i < slots; i++) {
+    const uint64_t word = l2_load_slot(&bucket[i]);
+    if ((word & kL2KeyMask) == want) {
+      return static_cast<int>((word >> 48) & 0x7fff);
     }
   }
-
-  return 0;
-}
-#endif
-
-// Finds addr from a 4-way bucket *table and returns its index + 1.
-// Returns zero if not found.
-inline int find_index(uint64_t addr, uint64_t *table, const uint64_t) {
-#if __AVX__
-  return find_index_avx(addr, table);
-#else
-  return find_index_basic(addr, table);
-#endif
+  return -1;
 }
 
-// Prefetch hint for a later l2_find() of `addr`: the primary bucket's line.
 inline void l2_prefetch(const struct l2_table *l2tbl, uint64_t addr) {
   const uint32_t idx = l2_hash_to_index(l2_hash(addr), l2tbl->size);
   __builtin_prefetch(&l2tbl->table[idx * l2tbl->bucket], 0, 3);
@@ -220,66 +249,34 @@ inline size_t l2_table_bytes(const struct l2_table *l2tbl) {
   return sizeof(l2_entry) * l2tbl->size * l2tbl->bucket;
 }
 
-inline int l2_find(struct l2_table *l2tbl, uint64_t addr,
-                          gate_idx_t *gate) {
-  size_t i;
-  int ret = -ENOENT;
-  uint32_t hash, idx1, offset;
-  struct l2_entry *tbl = l2tbl->table;
-
-  hash = l2_hash(addr);
-  idx1 = l2_hash_to_index(hash, l2tbl->size);
-
-  offset = l2_ib_to_offset(l2tbl, idx1, 0);
-
-  if (l2tbl->bucket == 4) {
-    int tmp1 = find_index(addr, &tbl[offset].entry, l2tbl->count);
-    if (tmp1) {
-      *gate = tbl[offset + tmp1 - 1].gate;
-      return 0;
-    }
-
-    idx1 = l2_alt_index(hash, l2tbl->size_power, idx1);
-    offset = l2_ib_to_offset(l2tbl, idx1, 0);
-
-    int tmp2 = find_index(addr, &tbl[offset].entry, l2tbl->count);
-
-    if (tmp2) {
-      *gate = tbl[offset + tmp2 - 1].gate;
-      return 0;
-    }
-
-  } else {
-    /* search buckets for first index */
-    for (i = 0; i < l2tbl->bucket; i++) {
-      if (tbl[offset].occupied && addr == tbl[offset].addr) {
-        *gate = tbl[offset].gate;
-        return 0;
-      }
-
-      offset++;
-    }
-
-    idx1 = l2_alt_index(hash, l2tbl->size_power, idx1);
-    offset = l2_ib_to_offset(l2tbl, idx1, 0);
-    /* search buckets for alternate index */
-    for (i = 0; i < l2tbl->bucket; i++) {
-      if (tbl[offset].occupied && addr == tbl[offset].addr) {
-        *gate = tbl[offset].gate;
-        return 0;
-      }
-
-      offset++;
-    }
+inline int l2_find(const struct l2_table *l2tbl, uint64_t addr,
+                   gate_idx_t *gate) {
+  const uint32_t hash = l2_hash(addr);
+  uint32_t idx = l2_hash_to_index(hash, l2tbl->size);
+  int g = l2_probe_bucket(addr, &l2tbl->table[idx * l2tbl->bucket],
+                          l2tbl->bucket);
+  if (g < 0) {
+    // The alternate bucket must be read after the primary: a move writes the
+    // alternate slot before clearing the primary, so primary-then-alternate
+    // cannot miss a moving entry. On x86 loads are not reordered with loads;
+    // this fence keeps the compiler from reordering them either.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    idx = l2_alt_index(hash, l2tbl->size_power, idx);
+    g = l2_probe_bucket(addr, &l2tbl->table[idx * l2tbl->bucket],
+                        l2tbl->bucket);
   }
-
-  return ret;
+  if (g < 0) {
+    return -ENOENT;
+  }
+  *gate = static_cast<gate_idx_t>(g);
+  return 0;
 }
 
 // Looks up `n` addresses (n <= 64). Writes gates[i] and sets bit i of the
 // result for each hit; misses leave gates[i] untouched. Staged or plain as
 // chosen at l2_init.
-inline uint64_t l2_find_batch(struct l2_table *l2tbl, const uint64_t *addrs,
+inline uint64_t l2_find_batch(const struct l2_table *l2tbl,
+                              const uint64_t *addrs,
                               gate_idx_t *gates, size_t n) {
   uint64_t hits = 0;
   bess::dataplane::RunBatch(
@@ -362,10 +359,14 @@ inline int l2_find_slot(struct l2_table *l2tbl, mac_addr_t addr, uint32_t *idx,
     for (j = 0; j < l2tbl->bucket; j++) {
       offset2 = l2_ib_to_offset(l2tbl, idx_v2, j);
       if (!tbl[offset2].occupied) {
-        /* move offset1 to offset2 */
-        tbl[offset2] = tbl[offset1];
-        /* clear offset1 */
-        tbl[offset1].occupied = 0;
+        // Move offset1 to offset2: write the alternate slot first, then
+        // clear the primary (readers probe primary, then alternate).
+        const uint64_t moving = l2_load_slot(&tbl[offset1]);
+        l2_store_slot(&tbl[offset2], moving);
+        if (l2tbl->move_hook != nullptr) {
+          l2tbl->move_hook(l2tbl->move_hook_ctx, moving);
+        }
+        l2_store_slot(&tbl[offset1], 0);
 
         // The slot just vacated is slot i, not slot 0 (which may be
         // occupied: returning 0 overwrote it).
@@ -380,6 +381,11 @@ inline int l2_find_slot(struct l2_table *l2tbl, mac_addr_t addr, uint32_t *idx,
   return -ENOMEM;
 }
 
+// Writers: one at a time (the module serializes its commands), concurrent
+// with any number of lock-free readers (l2_find, l2_find_batch). Every slot
+// write is one atomic store of the whole word, and a move writes the
+// alternate slot before clearing the primary. No grace period is needed:
+// slots hold values, not pointers, and each read is self-contained.
 inline int l2_add_entry(struct l2_table *l2tbl, mac_addr_t addr,
                         gate_idx_t gate) {
   uint32_t offset;
@@ -400,9 +406,8 @@ inline int l2_add_entry(struct l2_table *l2tbl, mac_addr_t addr,
   /* insert entry into empty slot */
   offset = l2_ib_to_offset(l2tbl, index, bucket);
 
-  l2tbl->table[offset].addr = addr;
-  l2tbl->table[offset].gate = gate;
-  l2tbl->table[offset].occupied = 1;
+  // One store of the whole word: readers see an empty slot or the entry.
+  l2_store_slot(&l2tbl->table[offset], l2_make_slot(addr, gate));
   l2tbl->count++;
   return 0;
 }
@@ -414,9 +419,7 @@ inline int l2_del_entry(struct l2_table *l2tbl, uint64_t addr) {
     return -ENOENT;
   }
 
-  l2tbl->table[offset].addr = 0;
-  l2tbl->table[offset].gate = 0;
-  l2tbl->table[offset].occupied = 0;
+  l2_store_slot(&l2tbl->table[offset], 0);
   l2tbl->count--;
   return 0;
 }

@@ -3825,6 +3825,26 @@ rather than one call site).
       ratios are valid, but absolute numbers may read a few percent low.
       The pre-flight check now prevents it.
 
+100. **Modules off the worker pause (D-017).**
+    - HashLB: G, one `RcuPtr<Config>`.
+    - ACL: G, a copy-append-publish rule list; `add` is all-or-nothing.
+    - L2Forward: C. `l2_table` is single-writer with lock-free readers
+      (whole-word slot stores, a single-word re-check, alternate-first
+      moves, no grace period).
+    - Bugs fixed:
+      - the old AVX probe used a floating-point compare, which matches
+        every denormal under DAZ;
+      - `populate` with `gate_count` 0 divided by zero;
+      - an ACL prefix went through `std::stoi` and could throw and take
+        the daemon down;
+      - gates and ports were narrowed without range checks.
+    - L2 lookups are −11..−27% on the P-core and −13..−44% on the E-core
+      (native, ABBA).
+    - A deterministic move-hook test catches the reversed move order; the
+      stress test does not.
+    - Still on the pause: BPF (next, with `rte_bpf`), URLFilter (legacy;
+      see §31.6).
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -9547,7 +9567,8 @@ finish.
 
 WildcardMatch on mode C (entry 97, D-014); the `rte_hash` lookup fixes
 (entry 98, D-015); benchmark methodology, CI on x86-64-v3 and the ISA
-survey (entry 99, D-016). The accepted trade-off still open: multi-tuple
+survey (entry 99, D-016); HashLB and ACL on G, L2Forward on C (entry 100,
+D-017). The accepted trade-off still open: multi-tuple
 WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
 
 ### 31.3 Next, in order (G1.2a completion)
@@ -9577,10 +9598,10 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
    the scheduler-round boundary into worker-private replicas or shards, with
    completion counters. No grace period or pause is needed for W-owned
    state (D-013).
-3. **Take the pause-bound commands off the global worker pause:**
-   L2Forward (add/delete/populate), ACL (add/clear), HashLB
-   (set_mode/set_gates), URLFilter, BPF. Choose C, W or G per table
-   (dataplane-tables.md §3).
+3. **Take the remaining pause-bound commands off the global worker
+   pause:** BPF (add/delete/clear), as G, done together with the
+   `rte_bpf` move (D3; see §31.6). URLFilter stays on the pause as legacy
+   (§31.6). L2Forward, ACL and HashLB are done (D-017).
 4. **Fix DRR:** it allows several workers, but `ProcessBatch` writes the
    flow `CuckooMap` with no synchronization. Either restrict it to one
    worker or make the flow state worker-owned (W).
@@ -9708,6 +9729,47 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
   non-UPF consumers.
 - Neighbour handling (ARP/ND) lives in the router NF, not the core
   `Router`, per the external review.
+- **URLFilter is legacy (2026-09-26).**
+  - **What it does today:** matches only the cleartext HTTP `Host` header
+    and path, then resets the connection. It sees nothing over HTTPS. It
+    is a demo from the original BESS paper and is limited to one worker.
+  - **Decision:** left on the worker pause, with no modernization effort.
+  - **A modern replacement, if an NF needs one:** a name classifier that
+    reads SNI from the TLS ClientHello and from QUIC Initial packets. QUIC
+    Initials are protected with keys derived from a published salt, so
+    anyone can remove the protection.
+  - **Caveats:**
+    - Encrypted Client Hello (ECH) hides the real SNI, leaving only the
+      outer (public) name;
+    - DNS-based signals and IP reputation become the fallback.
+  - **For pattern matching, explore Intel Hyperscan** (multi-pattern regex
+    and literal matching, SIMD, streaming mode across segments; the user
+    asked for this note):
+    - Intel's releases after 5.4 are no longer BSD-licensed;
+    - **Vectorscan** is the open-source (BSD) continuation, and also
+      portable to ARM (NEON/SVE), so it is the likely candidate (Phase D
+      fit);
+    - evaluate against a plain host trie or `rte_hash` for exact names;
+    - pattern databases compile once per rule-set change, so this is a
+      mode G swap, with the old database freed after a grace period.
+  - **Consumers:** a secure web gateway or edge policy NF, parental or
+    enterprise filtering, and SNI-based steering in an L4/L7 LB.
+- **BPF → `rte_bpf` (D3) is next, together with taking BPF off the
+  pause.**
+  - **Pipeline:** `pcap_compile`, then `rte_bpf_convert` (classic to eBPF;
+    our pinned DPDK is built with libpcap), then `rte_bpf_load`, then
+    `rte_bpf_get_jit` (x86 and ARM JITs).
+  - **Mode G:** each published filter set owns its programs, and
+    `rte_bpf_destroy` runs only after a grace period.
+  - **Acceptance (D3):**
+    - the same verdicts as the old JIT on a corpus of pcap expressions and
+      packets;
+    - an ABBA comparison with the old JIT;
+    - the old JIT is deleted only if D3's criteria hold.
+  - **Bugs found in the current module:**
+    - `delete` leaks the mmap'd JIT code;
+    - a failure partway through `add` keeps the earlier filters;
+    - `priority` is narrowed from int64 to int with no check.
 
 ### 31.6a Tracked in other sections (not repeated here)
 

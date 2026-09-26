@@ -31,8 +31,13 @@
 #ifndef BESS_MODULES_HASHLB_H_
 #define BESS_MODULES_HASHLB_H_
 
+#include <memory>
+#include <vector>
+
+#include "../control/runtime_state.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
+#include "../rcu/rcu_ptr.h"
 #include "../utils/exact_match_table.h"
 
 using bess::utils::ExactMatchField;
@@ -40,14 +45,20 @@ using bess::utils::ExactMatchKey;
 using bess::utils::ExactMatchKeyHash;
 using bess::utils::ExactMatchTable;
 
+// Splits packets across output gates by a hash of L2/L3/L4 or chosen fields.
+//
+// The configuration (mode, gate list, field layout) is one immutable object
+// published through an RcuPtr: `set_mode` and `set_gates` build a replacement
+// and publish it while workers keep processing (G1.2 mode G; the
+// configuration is small and changes rarely). A batch reads it once.
+// Decision D-017 (docs/decisions.md)
 class HashLB final : public Module {
  public:
   static const gate_idx_t kNumOGates = MAX_GATES;
 
   static const Commands cmds;
 
-  HashLB()
-      : Module(), gates_(), num_gates_(), mode_(), fields_table_(), hasher_(0) {
+  HashLB() : Module(), config_(bess::control::runtime().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 
@@ -64,19 +75,33 @@ class HashLB final : public Module {
  private:
   enum class Mode { kL2, kL3, kL4, kOther };
   static constexpr Mode kDefaultMode = Mode::kL4;
-
-  template <Mode mode>
-  inline void DoProcessBatch(Context *ctx, bess::PacketBatch *batch);
-
   static constexpr size_t kMaxGates = 16384;
 
-  gate_idx_t gates_[kMaxGates];
-  size_t num_gates_;
-  Mode mode_;
+  struct Config {
+    Mode mode = kDefaultMode;
+    std::vector<gate_idx_t> gates;
+    // Built once per set_mode and never changed, so configurations share it.
+    // No rules are ever added; it is only used for MakeKeys().
+    std::shared_ptr<const ExactMatchTable<int>> fields_table =
+        std::make_shared<const ExactMatchTable<int>>();
+    ExactMatchKeyHash hasher{0};
+  };
 
-  // No rules are ever added to this table, we just use it for MakeKeys().
-  ExactMatchTable<int> fields_table_;
-  ExactMatchKeyHash hasher_;
+  template <Mode mode>
+  inline void DoProcessBatch(Context *ctx, bess::PacketBatch *batch,
+                             const Config &config);
+
+  // A copy of the current configuration (or a default one before Init).
+  Config Current() const;
+  // Validates and applies a mode/field change to `config`.
+  CommandResponse ApplyMode(const bess::pb::HashLBCommandSetModeArg &arg,
+                            Config *config) const;
+  // Validates every wire gate before narrowing it, then replaces the list.
+  CommandResponse ApplyGates(const bess::pb::HashLBCommandSetGatesArg &arg,
+                             Config *config) const;
+  void Install(Config config);
+
+  bess::rcu::RcuPtr<Config> config_;
 };
 
 #endif  // BESS_MODULES_HASHLB_H_

@@ -32,7 +32,9 @@
 
 #include <vector>
 
+#include "../control/runtime_state.h"
 #include "../module.h"
+#include "../rcu/rcu_ptr.h"
 #include "../pb/module_msg.pb.h"
 #include "../utils/ip.h"
 
@@ -58,7 +60,9 @@ class ACL final : public Module {
 
   static const Commands cmds;
 
-  ACL() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
+  ACL() : Module(), rules_(bess::control::runtime().rcu()) {
+    max_allowed_workers_ = Worker::kMaxWorkers;
+  }
 
   CommandResponse Init(const bess::pb::ACLArg &arg);
 
@@ -68,7 +72,20 @@ class ACL final : public Module {
   CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
 
  private:
-  std::vector<ACLRule> rules_;
+  // The rule list is one immutable object published through an RcuPtr:
+  // `add` and `clear` publish a replacement while workers keep processing
+  // (G1.2 mode G; ACLs here are small, scanned first-match). A batch reads it
+  // once. Decision D-017 (docs/decisions.md)
+  struct Rules {
+    std::vector<ACLRule> rules;
+  };
+
+  // Validates and converts every rule of `arg`; nothing is kept on error.
+  CommandResponse ParseRules(const bess::pb::ACLArg &arg,
+                             std::vector<ACLRule> *out) const;
+  void Install(std::vector<ACLRule> rules);
+
+  bess::rcu::RcuPtr<Rules> rules_;
 };
 
 #endif  // BESS_MODULES_ACL_H_
