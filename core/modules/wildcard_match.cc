@@ -161,11 +161,17 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
     }
   }
 
+  auto table = NewTable();
+  if (!table) {
+    return CommandFailure(table.error().first, "%s",
+                          table.error().second.c_str());
+  }
   Error err;
-  GenerationPtr gen = Build(/*rules=*/{}, /*default_gate=*/DROP_GATE, &err);
+  GenerationPtr gen = Build(*table, /*default_gate=*/DROP_GATE, &err);
   if (gen == nullptr) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
+  table_ = std::move(*table);
   published_.Initialize(std::move(gen));
 
   return CommandSuccess();
@@ -247,9 +253,79 @@ bool WildcardMatch::ComputeLayout(bool tolerate_invalid_metadata,
   return true;
 }
 
-WildcardMatch::GenerationPtr WildcardMatch::Build(const std::vector<Rule> &rules,
-                                                  gate_idx_t default_gate,
-                                                  Error *err) {
+Error WildcardMatch::PackRule(const Rule &rule, std::vector<std::byte> *value,
+                              std::vector<std::byte> *mask) const {
+  if (rule.values.size() != field_specs_.size() ||
+      rule.masks.size() != field_specs_.size()) {
+    return std::make_pair(
+        EINVAL, bess::utils::Format("rule should have %zu fields (has %zu)",
+                                    field_specs_.size(), rule.values.size()));
+  }
+  value->clear();
+  mask->clear();
+  for (size_t i = 0; i < rule.values.size(); i++) {
+    const size_t want = static_cast<size_t>(field_specs_[i].size);
+    if (rule.values[i].size() != want || rule.masks[i].size() != want) {
+      return std::make_pair(
+          EINVAL,
+          bess::utils::Format("rule field %zu should have size %zu", i, want));
+    }
+    const auto *v = reinterpret_cast<const std::byte *>(rule.values[i].data());
+    const auto *m = reinterpret_cast<const std::byte *>(rule.masks[i].data());
+    value->insert(value->end(), v, v + want);
+    mask->insert(mask->end(), m, m + want);
+  }
+  return std::make_pair(0, std::string());
+}
+
+std::expected<std::shared_ptr<bess::classifier::ConcurrentMaskedTable>, Error>
+WildcardMatch::NewTable() const {
+  size_t key_size = 0;
+  for (const FieldSpec &spec : field_specs_) {
+    key_size += static_cast<size_t>(spec.size);
+  }
+  auto table = bess::classifier::ConcurrentMaskedTable::Create(
+      static_cast<uint32_t>(key_size), kMaxTuples,
+      bess::control::runtime().rcu());
+  if (!table) {
+    return std::unexpected(std::make_pair(EINVAL, table.error()));
+  }
+  return std::shared_ptr<bess::classifier::ConcurrentMaskedTable>(
+      std::move(*table));
+}
+
+Error WildcardMatch::InsertRule(bess::classifier::ConcurrentMaskedTable &table,
+                                const Rule &rule) const {
+  std::vector<std::byte> value, mask;
+  Error err = PackRule(rule, &value, &mask);
+  if (err.first) {
+    return err;
+  }
+  using R = bess::classifier::ConcurrentMaskedTable::UpsertResult;
+  switch (table.Upsert(
+      bess::classifier::ConstBytes(mask.data(), mask.size()),
+      bess::classifier::ConstBytes(value.data(), value.size()), rule.priority,
+      rule.gate)) {
+    case R::kInserted:
+    case R::kUpdated:
+      return std::make_pair(0, std::string());
+    case R::kTooManyTuples:
+      // The wire-compatible ceiling counts *active* masks: a mask whose last
+      // rule was deleted, or a clear, frees its tuple.
+      return std::make_pair(
+          EINVAL, bess::utils::Format("too many distinct masks (%zu, max %zu)",
+                                      table.tuple_count() + 1, kMaxTuples));
+    case R::kNotCanonical:
+      return std::make_pair(EINVAL, "invalid pair of value and mask");
+    case R::kFull:
+      break;
+  }
+  return std::make_pair(ENOSPC, "rule table is full");
+}
+
+WildcardMatch::GenerationPtr WildcardMatch::Build(
+    std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table,
+    gate_idx_t default_gate, Error *err) {
   KeyLayout layout;
   if (!ComputeLayout(/*tolerate_invalid_metadata=*/false, &layout, err)) {
     return nullptr;
@@ -264,79 +340,16 @@ WildcardMatch::GenerationPtr WildcardMatch::Build(const std::vector<Rule> &rules
     *err = std::make_pair(EINVAL, "extraction plan: " + plan.error().message);
     return nullptr;
   }
-
-  // Pack rule value/mask bytes densely in field order. The legacy table stored
-  // rule bytes verbatim and applied the mask at lookup time; the substrate does
-  // the same, so both value and mask go in unmodified.
-  std::vector<std::byte> value_storage(rules.size() * layout.key_size);
-  std::vector<std::byte> mask_storage(rules.size() * layout.key_size);
-  std::vector<bess::classifier::RuntimeMaskedRule<gate_idx_t, int64_t>>
-      masked_rules;
-  masked_rules.reserve(rules.size());
-  std::set<std::vector<std::byte>> distinct_masks;
-
-  for (size_t r = 0; r < rules.size(); r++) {
-    const Rule &rule = rules[r];
-    if (rule.values.size() != field_specs_.size() ||
-        rule.masks.size() != field_specs_.size()) {
-      *err = std::make_pair(
-          EINVAL, bess::utils::Format("rule should have %zu fields (has %zu)",
-                                      field_specs_.size(),
-                                      rule.values.size()));
-      return nullptr;
-    }
-    std::byte *value_dst = value_storage.data() + r * layout.key_size;
-    std::byte *mask_dst = mask_storage.data() + r * layout.key_size;
-    size_t pos = 0;
-    for (size_t i = 0; i < rule.values.size(); i++) {
-      const size_t want = static_cast<size_t>(field_specs_[i].size);
-      if (rule.values[i].size() != want || rule.masks[i].size() != want) {
-        *err = std::make_pair(
-            EINVAL,
-            bess::utils::Format("rule field %zu should have size %zu", i,
-                                want));
-        return nullptr;
-      }
-      std::memcpy(value_dst + pos, rule.values[i].data(), want);
-      std::memcpy(mask_dst + pos, rule.masks[i].data(), want);
-      pos += want;
-    }
-    distinct_masks.emplace(mask_dst, mask_dst + layout.key_size);
-    masked_rules.push_back(
-        bess::classifier::RuntimeMaskedRule<gate_idx_t, int64_t>{
-            .value = bess::classifier::ConstBytes(value_dst, layout.key_size),
-            .mask = bess::classifier::ConstBytes(mask_dst, layout.key_size),
-            .priority = rule.priority,
-            .result = rule.gate,
-        });
-  }
-
-  // The module's wire-compatible tuple ceiling applies to the *active* distinct
-  // masks of the candidate generation, computed after last-write
-  // canonicalization. A rejected candidate leaves the published generation
-  // untouched, and masks freed by `clear` are genuinely gone.
-  if (distinct_masks.size() > kMaxTuples) {
-    *err = std::make_pair(
-        EINVAL, bess::utils::Format("too many distinct masks (%zu, max %zu)",
-                                    distinct_masks.size(), kMaxTuples));
-    return nullptr;
-  }
-
-  auto backend = bess::classifier::RuntimeMaskedBackend<gate_idx_t, int64_t>::
-      Build(layout.key_size, masked_rules);
-  if (!backend) {
-    *err = std::make_pair(EINVAL,
-                          "classifier backend: " + backend.error().message);
-    return nullptr;
-  }
+  CHECK_EQ(layout.key_size, table->key_len());
 
   return std::make_unique<Generation>(
-      rules, default_gate, std::move(*plan), std::move(*backend),
-      layout.key_size, /*extraction_valid=*/true, std::move(layout.baked_offsets));
+      default_gate, std::move(*plan), std::move(table), layout.key_size,
+      /*extraction_valid=*/true, std::move(layout.baked_offsets));
 }
 
 WildcardMatch::GenerationPtr WildcardMatch::BuildDegraded(
-    const std::vector<Rule> &rules, gate_idx_t default_gate) {
+    std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table,
+    gate_idx_t default_gate) {
   // Same layout machinery, tolerating unreadable metadata: the resulting plan
   // is never executed (extraction_valid == false), so placeholder offsets are
   // safe.
@@ -355,10 +368,8 @@ WildcardMatch::GenerationPtr WildcardMatch::BuildDegraded(
   CHECK(plan.has_value()) << "degraded WildcardMatch plan failed to compile";
 
   return std::make_unique<Generation>(
-      rules, default_gate, std::move(*plan),
-      bess::classifier::RuntimeMaskedBackend<gate_idx_t, int64_t>{},
-      layout.key_size, /*extraction_valid=*/false,
-      std::move(layout.baked_offsets));
+      default_gate, std::move(*plan), std::move(table), layout.key_size,
+      /*extraction_valid=*/false, std::move(layout.baked_offsets));
 }
 
 void WildcardMatch::RefreshForResume() {
@@ -391,7 +402,7 @@ void WildcardMatch::RefreshForResume() {
   }
 
   Error err;
-  GenerationPtr next = Build(current->rules, current->default_gate, &err);
+  GenerationPtr next = Build(current->table, current->default_gate, &err);
   if (next != nullptr) {
     published_.Publish(std::move(next));
     bess::control::runtime().rcu().ReclaimReady();
@@ -404,7 +415,7 @@ void WildcardMatch::RefreshForResume() {
   // packet to the default gate.
   LOG(ERROR) << "WildcardMatch '" << name() << "': metadata refresh failed ("
              << err.second << "); routing all packets to the default gate";
-  published_.Publish(BuildDegraded(current->rules, current->default_gate));
+  published_.Publish(BuildDegraded(current->table, current->default_gate));
   bess::control::runtime().rcu().ReclaimReady();
 }
 
@@ -415,16 +426,6 @@ int WildcardMatch::OnEvent(bess::Event event) {
   RefreshForResume();
   // Return 0 (not -ENOTSUP) to stay registered for future resumes.
   return 0;
-}
-
-void WildcardMatch::UpsertRule(std::vector<Rule> *rules, Rule rule) {
-  for (auto it = rules->begin(); it != rules->end(); ++it) {
-    if (it->masks == rule.masks && it->values == rule.values) {
-      rules->erase(it);
-      break;
-    }
-  }
-  rules->push_back(std::move(rule));
 }
 
 bool WildcardMatch::Publish(
@@ -515,24 +516,19 @@ Error WildcardMatch::RuleFromPb(
   return std::make_pair(0, std::string());
 }
 
+// add/delete/clear change the live table in place (G1.2 mode C): one
+// table operation each, with workers reading throughout. No generation is
+// built.
 CommandResponse WildcardMatch::CommandAdd(
     const bess::pb::WildcardMatchCommandAddArg &arg) {
   Rule rule;
   Error ret = RuleFromPb(arg, &rule);
+  if (!ret.first) {
+    ret = InsertRule(*table_, rule);
+  }
   if (ret.first) {
     return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
-
-  Error err;
-  const bool published = Publish([&](const Generation &current) {
-    std::vector<Rule> rules = current.rules;
-    UpsertRule(&rules, std::move(rule));
-    return Build(rules, current.default_gate, &err);
-  }, &err);
-  if (!published) {
-    return CommandFailure(err.first, "%s", err.second.c_str());
-  }
-
   return CommandSuccess();
 }
 
@@ -546,54 +542,28 @@ CommandResponse WildcardMatch::CommandDelete(
   }
   Error ret =
       RuleFieldsFromPb(arg.values(), field_specs_.size(), &rule.values);
+  if (!ret.first) {
+    ret = RuleFieldsFromPb(arg.masks(), field_specs_.size(), &rule.masks);
+  }
+  std::vector<std::byte> value, mask;
+  if (!ret.first) {
+    ret = PackRule(rule, &value, &mask);
+  }
   if (ret.first) {
     return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
-  ret = RuleFieldsFromPb(arg.masks(), field_specs_.size(), &rule.masks);
-  if (ret.first) {
-    return CommandFailure(ret.first, "%s", ret.second.c_str());
+  if (!table_->Erase(bess::classifier::ConstBytes(mask.data(), mask.size()),
+                     bess::classifier::ConstBytes(value.data(),
+                                                  value.size()))) {
+    return CommandFailure(ENOENT, "failed to delete a rule");
   }
-
-  Error err;
-  bool found = false;
-  const bool published =
-      Publish([&](const Generation &current) -> GenerationPtr {
-        std::vector<Rule> rules;
-        rules.reserve(current.rules.size());
-        for (const Rule &r : current.rules) {
-          if (r.masks == rule.masks && r.values == rule.values) {
-            found = true;
-            continue;
-          }
-          rules.push_back(r);
-        }
-        if (!found) {
-          return nullptr;
-        }
-        return Build(rules, current.default_gate, &err);
-      }, &err);
-  if (!published) {
-    if (!found) {
-      return CommandFailure(ENOENT, "failed to delete a rule");
-    }
-    return CommandFailure(err.first, "%s", err.second.c_str());
-  }
-
   return CommandSuccess();
 }
 
 CommandResponse WildcardMatch::CommandClear(const bess::pb::EmptyArg &) {
-  // Rules go, the default gate stays. Tuple masks are freed with them: the
-  // generation carries no tuple state forward, so a clear genuinely restores
-  // tuple capacity.
-  Error err;
-  const bool published = Publish([&](const Generation &current) {
-    return Build(/*rules=*/{}, current.default_gate, &err);
-  }, &err);
-  if (!published) {
-    return CommandFailure(err.first, "%s", err.second.c_str());
-  }
-
+  // Rules go, the default gate stays. Tuple masks go with them, so a clear
+  // genuinely restores tuple capacity.
+  table_->Clear();
   return CommandSuccess();
 }
 
@@ -606,7 +576,7 @@ CommandResponse WildcardMatch::CommandSetDefaultGate(
   const gate_idx_t gate = static_cast<gate_idx_t>(arg.gate());
   Error err;
   const bool published = Publish([&](const Generation &current) {
-    return Build(current.rules, gate, &err);
+    return Build(current.table, gate, &err);
   }, &err);
   if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());
@@ -639,19 +609,24 @@ CommandResponse WildcardMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
   const Generation *gen = published_.Read();
   resp.set_default_gate(gen->default_gate);
 
-  for (const Rule &rule : gen->rules) {
+  // The table is the source of truth: each rule's mask and (canonical, so
+  // already masked) value, split back into fields.
+  table_->ForEach([&](bess::classifier::ConstBytes mask,
+                      bess::classifier::ConstBytes value,
+                      const bess::classifier::ConcurrentMaskedTable::Rule &r) {
     rule_t *out = resp.add_rules();
-    out->set_priority(rule.priority);
-    out->set_gate(rule.gate);
-    for (size_t i = 0; i < rule.values.size(); i++) {
-      bess::pb::FieldData *value = out->add_values();
-      value->set_value_bin(reinterpret_cast<const char *>(rule.values[i].data()),
-                           rule.values[i].size());
-      bess::pb::FieldData *mask = out->add_masks();
-      mask->set_value_bin(reinterpret_cast<const char *>(rule.masks[i].data()),
-                          rule.masks[i].size());
+    out->set_priority(r.priority);
+    out->set_gate(r.result);
+    size_t pos = 0;
+    for (const FieldSpec &spec : field_specs_) {
+      const size_t n = static_cast<size_t>(spec.size);
+      out->add_values()->set_value_bin(
+          reinterpret_cast<const char *>(value.data() + pos), n);
+      out->add_masks()->set_value_bin(
+          reinterpret_cast<const char *>(mask.data() + pos), n);
+      pos += n;
     }
-  }
+  });
 
   // Sort the results so that they're always predictable: by priority, then
   // gate, then masks, then values -- the legacy order.
@@ -690,27 +665,36 @@ CommandResponse WildcardMatch::SetRuntimeConfig(
         static_cast<unsigned long long>(arg.default_gate()));
   }
   const gate_idx_t default_gate = static_cast<gate_idx_t>(arg.default_gate());
-  std::vector<Rule> rules;
-  rules.reserve(static_cast<size_t>(arg.rules_size()));
+  // A whole-configuration restore: one of the deliberate bulk builds (G1.2
+  // mode G). Fill a fresh table, then publish it in one step; any error
+  // discards it and leaves the running configuration alone.
+  auto table = NewTable();
+  if (!table) {
+    return CommandFailure(table.error().first, "%s",
+                          table.error().second.c_str());
+  }
   for (int i = 0; i < arg.rules_size(); i++) {
     Rule rule;
     Error ret = RuleFromPb(arg.rules(i), &rule);
+    // Duplicates in the argument collapse to the last occurrence, as `add`
+    // does.
+    if (!ret.first) {
+      ret = InsertRule(**table, rule);
+    }
     if (ret.first) {
       return CommandFailure(ret.first, "%s", ret.second.c_str());
     }
-    // Duplicates in the argument collapse to the last occurrence, the same
-    // canonicalization `add` performs.
-    UpsertRule(&rules, std::move(rule));
   }
 
   Error err;
+  auto next_table = *table;
   const bool published = Publish([&](const Generation &) {
-    return Build(rules, default_gate, &err);
+    return Build(next_table, default_gate, &err);
   }, &err);
   if (!published) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
-
+  table_ = std::move(next_table);
   return CommandSuccess();
 }
 
@@ -735,7 +719,7 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   std::array<bess::classifier::SourceView, bess::PacketBatch::kMaxBurst>
       sources;
   std::array<std::byte, bess::PacketBatch::kMaxBurst * kMaxKeyBytes> keys;
-  std::array<gate_idx_t, bess::PacketBatch::kMaxBurst> gates;
+  std::array<uint16_t, bess::PacketBatch::kMaxBurst> gates;
 
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
@@ -768,10 +752,10 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
   }
 
-  uint64_t hits = gen->backend.lookup_batch(
+  uint64_t hits = gen->table->LookupBatch(
       bess::classifier::ConstBytes(keys.data(),
                                    static_cast<size_t>(cnt) * key_size),
-      key_size, std::span<gate_idx_t>(gates).first(static_cast<size_t>(cnt)));
+      key_size, gates.data(), static_cast<size_t>(cnt));
   hits &= valid;
 
   for (int i = 0; i < cnt; i++) {
@@ -782,9 +766,8 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 }
 
 std::string WildcardMatch::GetDesc() const {
-  const Generation *gen = published_.Read();
   return bess::utils::Format("%zu fields, %zu rules", field_specs_.size(),
-                             gen->rules.size());
+                             table_->size());
 }
 
 ADD_MODULE(WildcardMatch, "wm",

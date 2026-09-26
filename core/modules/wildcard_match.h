@@ -33,13 +33,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "../classifier/extract_plan.h"
-#include "../classifier/masked_exact.h"
+#include "../classifier/concurrent_masked.h"
 #include "../classifier/runtime_schema.h"
 #include "../control/runtime_state.h"
 #include "../event.h"
@@ -52,16 +54,19 @@ using Error = std::pair<int, std::string>;
 
 // Multi-field classifier with wildcard (ternary) matching.
 //
-// Matching is the K3.5 tuple-space mechanism: one tuple per distinct rule mask,
-// each owning an exact table over the masked field values, highest priority
-// wins. Extraction is a dense `field0 || field1 || ...` key produced by a
+// Matching is tuple-space search: one tuple per distinct rule mask, each an
+// exact table over the masked field values; the highest priority wins, and
+// among equal priorities the later command. Rules live in a
+// classifier::ConcurrentMaskedTable (G1.2 mode C): add/delete/clear change it
+// in place while workers keep reading, with no rebuild (Decision D-014). Extraction is a dense `field0 || field1 || ...` key produced by a
 // compiled ExtractPlan -- no 8-byte-word padding, which was an artifact of the
 // legacy `wm_hkey_t` storage and never affected matching (the legacy mask
 // zeroed those bytes).
 //
-// Ownership follows the migrated ExactMatch: commands build a complete
-// immutable generation and publish it through an RCU pointer, so a batch sees
-// either the old or the new configuration and never a half-applied one.
+// A generation holds the configuration around the table -- the compiled
+// extraction plan and the default gate -- plus a shared pointer to the table.
+// It is republished only when that configuration changes (default gate,
+// metadata offsets, a restore).
 class WildcardMatch final : public Module {
  public:
   static const gate_idx_t kNumOGates = MAX_GATES;
@@ -111,26 +116,23 @@ class WildcardMatch final : public Module {
     gate_idx_t gate = DROP_GATE;
   };
 
-  // A whole matching generation: the canonical rule list, the default gate,
-  // and the compiled extraction + masked backend built from that list.
-  // Immutable once published.
+  // The configuration a batch runs against. Immutable once published; the
+  // rules themselves are in `table`, which is updated in place.
   struct Generation {
-    Generation(std::vector<Rule> r, gate_idx_t d,
-               bess::classifier::ExtractPlan e,
-               bess::classifier::RuntimeMaskedBackend<gate_idx_t, int64_t> b,
+    Generation(gate_idx_t d, bess::classifier::ExtractPlan e,
+               std::shared_ptr<bess::classifier::ConcurrentMaskedTable> t,
                size_t k, bool valid, std::vector<size_t> offsets)
-        : rules(std::move(r)),
-          default_gate(d),
+        : default_gate(d),
           extract(std::move(e)),
-          backend(std::move(b)),
+          table(std::move(t)),
           key_size(k),
           extraction_valid(valid),
           baked_source_offsets(std::move(offsets)) {}
 
-    std::vector<Rule> rules;
     gate_idx_t default_gate = DROP_GATE;
     bess::classifier::ExtractPlan extract;
-    bess::classifier::RuntimeMaskedBackend<gate_idx_t, int64_t> backend;
+    // Shared, updated in place; owned by every generation that maps it.
+    std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table;
     // Dense packed key width: sum of field sizes. Also the extraction stride.
     size_t key_size = 0;
     // False when metadata offsets were invalid at (re)build time. The packet
@@ -182,22 +184,28 @@ class WildcardMatch final : public Module {
   // Turns a command argument into a `Rule`, validating gate, field count, and
   // value/mask lengths.
   Error RuleFromPb(const bess::pb::WildcardMatchCommandAddArg &arg, Rule *rule);
-  // Inserts `rule` into `rules`, first removing any existing rule with the same
-  // (mask, value) identity: a later command overwrites an earlier one
-  // regardless of priority, which is what inserting the same key into the live
-  // tuple table did. Appending the newest occurrence also makes the substrate's
-  // ordinal ordering match command order. Shared by `add` and
-  // SetRuntimeConfig so both canonicalize identically.
-  static void UpsertRule(std::vector<Rule> *rules, Rule rule);
-  // Builds a generation for `rules`; nullptr with *err set on failure. Runs on
-  // the control plane, off the data path.
-  GenerationPtr Build(const std::vector<Rule> &rules, gate_idx_t default_gate,
-                      Error *err);
+  // Packs a rule's per-field values and masks densely in field order (the
+  // legacy table stored rule bytes verbatim; so does this).
+  Error PackRule(const Rule &rule, std::vector<std::byte> *value,
+                 std::vector<std::byte> *mask) const;
+  // A new, empty rule table.
+  std::expected<std::shared_ptr<bess::classifier::ConcurrentMaskedTable>,
+                Error>
+  NewTable() const;
+  // Inserts or replaces `rule` in `table`; the error on failure.
+  Error InsertRule(bess::classifier::ConcurrentMaskedTable &table,
+                   const Rule &rule) const;
+  // Builds a generation around `table`; nullptr with *err set on failure.
+  // Runs on the control plane, off the data path.
+  GenerationPtr Build(
+      std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table,
+      gate_idx_t default_gate, Error *err);
   // Fail-closed generation for unrecoverable (re)build failures on the resume
   // path: same rules/default for introspection, but extraction disabled so the
   // packet path routes everything to the default gate.
-  GenerationPtr BuildDegraded(const std::vector<Rule> &rules,
-                              gate_idx_t default_gate);
+  GenerationPtr BuildDegraded(
+      std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table,
+      gate_idx_t default_gate);
   // Replaces the published generation with `build(current)`, or leaves the
   // active one alone when the builder returns nullptr (with *err set). Runs
   // only on the control plane, where command and graph mutations are
@@ -212,6 +220,9 @@ class WildcardMatch final : public Module {
 
   // Field configuration, fixed at Init() time.
   std::vector<FieldSpec> field_specs_;
+
+  // The live rule table (also held by the published generation).
+  std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table_;
 
   // Publication and reclamation (bess::rcu::RcuPtr + the runtime's RcuDomain):
   // one acquire load per batch on the data path, serialized rebuilds off it,
