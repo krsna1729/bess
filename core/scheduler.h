@@ -31,6 +31,8 @@
 #ifndef BESS_SCHEDULER_H_
 #define BESS_SCHEDULER_H_
 
+#include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -81,6 +83,32 @@ class SchedWakeupQueue {
 
 // The non-instantiable base class for schedulers.  Implements common routines
 // needed for scheduling.
+// How often a worker reports an RCU quiescent state (Decision D-012).
+// Default: every kDefaultQuiescentIntervalUs of scheduler time. The
+// BESS_QUIESCENT_INTERVAL_US environment variable overrides it for
+// experiments: a number of microseconds (0 = every round), or "rounds" for
+// the pre-D-012 cadence of once per 256 scheduler rounds. Read when a worker's
+// scheduler is created.
+inline constexpr double kDefaultQuiescentIntervalUs = 10.0;
+
+struct QuiescentCadence {
+  bool by_rounds = false;
+  uint64_t interval_cycles = 0;
+};
+
+inline QuiescentCadence ReadQuiescentCadence() {
+  const char *env = std::getenv("BESS_QUIESCENT_INTERVAL_US");
+  if (env != nullptr && std::strcmp(env, "rounds") == 0) {
+    return {.by_rounds = true, .interval_cycles = 0};
+  }
+  double us = kDefaultQuiescentIntervalUs;
+  if (env != nullptr && *env != '\0') {
+    us = std::strtod(env, nullptr);
+  }
+  return {.by_rounds = false,
+          .interval_cycles = static_cast<uint64_t>(us * tsc_hz / 1e6)};
+}
+
 class Scheduler {
  public:
   explicit Scheduler(TrafficClass *root = nullptr)
@@ -89,7 +117,9 @@ class Scheduler {
         wakeup_queue_(),
         stats_(),
         checkpoint_(),
-        ns_per_cycle_(1e9 / tsc_hz) {}
+        ns_per_cycle_(1e9 / tsc_hz),
+        quiescent_(ReadQuiescentCadence()),
+        last_quiescent_() {}
 
   // TODO(barath): Do real cleanup, akin to sched_free() from the old impl.
   virtual ~Scheduler() {
@@ -213,6 +243,11 @@ class Scheduler {
 
   double ns_per_cycle_;
 
+  // How often the worker reports an RCU quiescent state, and when it last
+  // did (TSC).
+  const QuiescentCadence quiescent_;
+  uint64_t last_quiescent_;
+
  private:
   DISALLOW_COPY_AND_ASSIGN(Scheduler);
 };
@@ -241,14 +276,24 @@ class DefaultScheduler : public Scheduler {
     // The main scheduling, running, accounting loop.
     for (uint64_t round = 0;; ++round) {
       // Periodic check, to mitigate expensive operations.
-      if ((round & accounting_mask) == 0) {
-        // RCU quiescent state (K1): the previous task invocation has returned
-        // and the next has not started, so nothing from the previous call
-        // stack can still hold a published pointer. An idle worker reaches
-        // this boundary too, which is what keeps reclamation from stalling
-        // when there is no traffic.
+      // RCU quiescent state (K1): the previous task invocation has returned
+      // and the next has not started, so nothing from the previous call
+      // stack can still hold a published pointer. An idle worker reaches
+      // this boundary too, which is what keeps reclamation from stalling
+      // when there is no traffic. Reported by elapsed time, not by round
+      // count, so a grace period lasts about one interval or one task
+      // invocation, whichever is longer, however slow the modules are
+      // (Decision D-012). checkpoint_ is the TSC ScheduleOnce() already
+      // read; this costs no extra rdtsc.
+      if (this->quiescent_.by_rounds
+              ? (round & accounting_mask) == 0
+              : this->checkpoint_ - this->last_quiescent_ >=
+                    this->quiescent_.interval_cycles) {
         current_worker.ReportQuiescent();
+        this->last_quiescent_ = this->checkpoint_;
+      }
 
+      if ((round & accounting_mask) == 0) {
         if (current_worker.is_pause_requested()) {
           if (current_worker.BlockWorker()) {
             break;
@@ -335,14 +380,24 @@ class ExperimentalScheduler : public Scheduler {
     // The main scheduling, running, accounting loop.
     for (uint64_t round = 0;; ++round) {
       // Periodic check, to mitigate expensive operations.
-      if ((round & accounting_mask) == 0) {
-        // RCU quiescent state (K1): the previous task invocation has returned
-        // and the next has not started, so nothing from the previous call
-        // stack can still hold a published pointer. An idle worker reaches
-        // this boundary too, which is what keeps reclamation from stalling
-        // when there is no traffic.
+      // RCU quiescent state (K1): the previous task invocation has returned
+      // and the next has not started, so nothing from the previous call
+      // stack can still hold a published pointer. An idle worker reaches
+      // this boundary too, which is what keeps reclamation from stalling
+      // when there is no traffic. Reported by elapsed time, not by round
+      // count, so a grace period lasts about one interval or one task
+      // invocation, whichever is longer, however slow the modules are
+      // (Decision D-012). checkpoint_ is the TSC ScheduleOnce() already
+      // read; this costs no extra rdtsc.
+      if (this->quiescent_.by_rounds
+              ? (round & accounting_mask) == 0
+              : this->checkpoint_ - this->last_quiescent_ >=
+                    this->quiescent_.interval_cycles) {
         current_worker.ReportQuiescent();
+        this->last_quiescent_ = this->checkpoint_;
+      }
 
+      if ((round & accounting_mask) == 0) {
         if (current_worker.is_pause_requested()) {
           if (current_worker.BlockWorker()) {
             break;

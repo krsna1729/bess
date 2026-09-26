@@ -314,6 +314,7 @@ if get_option('build_benchmarks')
     'update_scale_bench': ['dataplane/update_scale_bench.cc', benchmark_dep],
     'ingress_bench': ['dataplane/ingress_bench.cc', benchmark_dep],
     'occupancy_bench': ['classifier/occupancy_bench.cc', benchmark_dep],
+    'grace_period_bench': ['rcu/grace_period_bench.cc', benchmark_dep],
     'meter_bench': ['meter/meter_bench.cc', benchmark_main_dep],
     'stats_bench': ['stats/stats_bench.cc', benchmark_main_dep],
     'route_bench': ['route/route_bench.cc', benchmark_main_dep],

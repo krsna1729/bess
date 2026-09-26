@@ -30,8 +30,10 @@ file is the reasoning.
 | D-007 | DPDK behaviours we depend on are deterministic CI tests | accepted |
 | D-008 | UPF is a consumer of the framework, not its driver | accepted |
 | D-009 | Consolidate the exact-match backends | open |
-| D-010 | Size concurrent tables for occupancy and grace-period headroom, not a fixed 75% | accepted in part |
+| D-010 | Size concurrent tables for occupancy and grace-period headroom, not a fixed 75% | accepted |
 | D-011 | Tune per table at build time from host facts discovered once per process | accepted |
+| D-012 | Workers report quiescence every 10 µs of scheduler time, not every 256 rounds | accepted |
+| D-013 | What needs a grace period, and why worker pauses can go but quiescence stays | accepted |
 
 ---
 
@@ -361,17 +363,23 @@ of D-004, so the real users of each backend are known.
 
 ## D-010 Size concurrent tables for occupancy and grace-period headroom, not a fixed 75%
 
-**Status:** accepted in part (2026-09-26):
+**Status:** accepted (2026-09-26). First accepted in part; the headroom
+constant was provisional until grace periods were measured (D-012).
 
-- **Accepted:** the 3/4 sizing, counting pending deletes against headroom,
-  and growth (never failure) whenever headroom is short or an add returns
-  `kFull`.
-- **Provisional:** the headroom constant (`kMinHeadroom` = 256, or 5%). It
-  assumes a 64 µs grace period, which has not been measured.
-- **Next:** measure the grace-period distribution (p50/p95/p99/max) under
-  representative workers, including slow modules and pauses, then set the
-  constant from it.
-- A review pointed out that a QSBR grace period is not a fixed constant. It
+- **Measured, with the 10 µs cadence of D-012:**
+  - grace periods are p99 about 11 µs, p99.9 up to 60 µs, and at most
+    125 µs across 1-4 pipelines;
+  - at one writer's measured peak (~4.3M ops/s), that is about 47 pending
+    slots at p99 and about 540 at the worst;
+  - so 256 slots (or 5%) covers everything up to p99.9, and the rare worst
+    case makes the table grow early rather than fail an add.
+- **Pipelines whose single task invocation is long** (a module taking
+  300 µs per batch) have grace periods as long as that invocation. Their
+  headroom need scales the same way, and growth absorbs it.
+- **Workers oversubscribed on one CPU** get OS-scheduler-length grace
+  periods (milliseconds). That is a deployment error, and the table grows.
+- The review that prompted the measurement pointed out that a QSBR grace
+  period is not a fixed constant. It
   depends on batch duration, scheduling, pauses and slow modules, so
   "update rate × grace period" has an input we have not measured.
 - The implementation is safe either way. A longer grace period only makes
@@ -508,4 +516,133 @@ table is built, or continuously.
 - a platform exposes no sysfs cache information, so the fallback defaults
   start deciding;
 - measurements on a new CPU generation disagree with the rule.
+
+## D-012 Workers report quiescence every 10 µs of scheduler time, not every 256 rounds
+
+**Status:** accepted (2026-09-26).
+**Code:** `core/scheduler.h` (`QuiescentCadence`, both scheduler loops);
+`core/rcu/grace_period_bench.cc`.
+
+**Context.**
+
+- Workers reported an RCU quiescent state once every 256 scheduler rounds,
+  piggybacked on the accounting and pause check. A grace period therefore
+  lasted about 256 × one round, so its length depended on what the modules
+  do.
+- Every structure that frees memory readers may touch waits for grace
+  periods: `RcuPtr` generations, `rte_hash` slots, `rte_lpm` groups and next
+  hops. Table headroom (D-010) is sized from them.
+
+**Decision.**
+
+- Report quiescence when at least 10 µs of scheduler time has passed since
+  the last report. The check runs every round against the TSC the scheduler
+  already reads (`checkpoint_`), so it costs no extra `rdtsc`.
+- A grace period is then about max(10 µs, one task invocation), independent
+  of round counts.
+- The pause check keeps its 256-round cadence.
+- `BESS_QUIESCENT_INTERVAL_US` overrides the interval for experiments (0 =
+  every round, `rounds` = the old cadence).
+
+**Evidence** (`grace_period_bench`, pinned and isolated, control CPU 2,
+workers on CPUs 4-10). Grace period, p50 / p99 in µs:
+
+| scenario | old: every 256 rounds | every round | every 2 µs | every 10 µs |
+|---|---|---|---|---|
+| idle worker | 1.2 / 2.3 | 0.24 / 0.27 | 1.4 / 2.1 | 5.1 / 10.0 |
+| 1 pipeline | 18.9 / 36.9 | 0.29 / 0.39 | 1.3 / 2.3 | 5.3 / 10.3 |
+| 4 pipelines | 34.6 / 53.5 | 0.38 / 0.56 | 2.0 / 2.4 | 8.7 / 11.3 |
+| module burning 10K cycles/batch | 863 / 922 | 2.1 / 4.4 | 2.1 / 3.8 | 5.8 / 11.0 |
+| module burning 1M cycles/batch | **85,501 / 85,545** | 299 / 324 | 299 / 324 | 299 / 324 |
+| 2 workers sharing one CPU | 1,528 / 2,387 | 1,379 / 2,377 | 1,366 / 2,369 | 1,542 / 2,376 |
+
+The cost: each report re-reads the shared QSBR token, which is a cache miss
+whenever a writer has started a new grace period, and every table delete
+starts one. Throughput of 64-byte Source→Bypass→count, with the control
+thread starting 1M grace periods per second:
+
+| cadence | 1 worker | 4 workers |
+|---|---|---|
+| old | 236 Mpps | 656 Mpps |
+| every round | 214 (−9%) | 630 (−4%) |
+| every 2 µs | 229 (−3%) | 650 |
+| every 10 µs | 238 (±0) | 648 |
+
+Without token churn, every cadence is within noise (233-239 Mpps). These
+are tiny rounds, the worst case for per-round cost; real pipelines amortize
+further.
+
+**Rejected.**
+
+- *Every round:* the shortest grace periods, but −9% under heavy delete
+  churn.
+- *2 µs:* −3% under churn, for grace periods that nothing measured needs.
+- *Keeping round counts:* grace periods of 85 ms behind one slow module.
+
+**Revisit when:**
+
+- a consumer needs sub-10 µs reclamation, and then measures the churn cost
+  of 2 µs;
+- the scheduler loop changes;
+- rounds become much longer. The interval is then irrelevant: one task
+  invocation bounds the grace period anyway.
+
+## D-013 What needs a grace period, and why worker pauses can go but quiescence stays
+
+**Status:** accepted (2026-09-26), as design guidance for G1.2 and the NF
+catalogue.
+
+**Context.** Could correctly implemented update modes C and W remove grace
+periods, RCU and framework pauses altogether? Answered by what each mode
+lets readers see.
+
+**Decision (the analysis):**
+
+- **W (worker-owned state, per-worker op rings).** The owning worker is the
+  only reader and the only writer. It applies operations between its own
+  scheduler rounds, when none of its lookups is in flight. Nothing it frees
+  can be in use, so **W-mode state needs no grace period and no pause**.
+  - The control plane talks to it only through SPSC rings and reads it only
+    through snapshots or seqlocks (the K6 pattern).
+  - Costs: every replica applies every operation (N× the work), and a
+    change becomes visible per worker at different instants, not
+    everywhere at once. A cross-worker "all at once" cutover needs a
+    barrier, which is itself a form of quiescence.
+- **C (a shared table, one writer, lock-free readers).** A reader can be in
+  the middle of reading a slot or object the writer just deleted, so reusing
+  that memory must wait until the reader is done. That wait **is** a grace
+  period, whatever it is called. The ways to avoid it all move cost to the
+  packet path:
+  - reference counts (an atomic read-modify-write per lookup);
+  - hazard pointers (publish, fence and re-check per lookup);
+  - type-stable slots with per-slot versions, where readers re-check a
+    version after reading and never free the memory.
+
+  QSBR costs readers nothing and the workers one store per 10 µs (D-012),
+  which is why it is the choice. A future own-table with versioned inline
+  slots could drop QSBR for itself; pointer-valued data still needs a grace
+  period.
+- **G (generation swap).** The old generation is freed after a grace period,
+  as with C.
+- **Framework-level worker pauses are a different mechanism from
+  quiescence.** They are used today for commands marked `THREAD_UNSAFE` and
+  for structural pipeline changes (creating or destroying modules and
+  workers, connecting gates).
+  - Runtime table updates no longer need them once every table is C, W or
+    G (the rest of G1.2a).
+  - Graph changes can move to RCU publication of the graph: connections and
+    tasks as published objects.
+  - Destroying a module must still wait until no worker can be running
+    it, which is again a grace period, not a pause.
+
+**So:**
+
+- Workers need never stop for runtime changes. That is the target, and
+  G1.2a plus graph publication get there.
+- Quiescence reporting stays as the one cheap mechanism behind every free.
+- W-mode state is the exception that needs neither.
+
+**Revisit when:** a versioned-slot table is built, since it would remove
+QSBR for that table only; or graph publication lands, since it would remove
+the pauses left for structural changes.
 

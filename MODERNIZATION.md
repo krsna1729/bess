@@ -3745,6 +3745,34 @@ rather than one call site).
     - `docs/dataplane-tables.md` section 6a and D-011 document what is
       decided once per process (host facts) versus per table at build
       (lookup body, sizing), and what is deliberately not done.
+95. **Grace periods measured; quiescence by time (D-012).**
+    `core/rcu/grace_period_bench.cc` runs real workers with real pipelines.
+    - Workers reported quiescence every 256 scheduler rounds, so a grace
+      period was 256 × one round: 19-35 µs for plain pipelines, 863 µs
+      behind a 10K-cycle module, **85 ms** behind a 1M-cycle one.
+    - Now they report every 10 µs of scheduler time, checked against the
+      TSC the loop already reads. That gives p99 about 11 µs, or one task
+      invocation when that is longer (300 µs for the 1M-cycle module).
+    - Cost with 1M grace periods/s being started: none at 10 µs (238 vs 236
+      Mpps), against −9% for reporting every round and −3% every 2 µs.
+    - D-010 accepted with the measured distribution.
+    - D-013 records what needs a grace period under each update mode, and
+      why pauses can go but quiescence stays.
+
+96. **`Router::RemoveNextHop()` defers instead of blocking.** It records a
+    grace-period token and returns.
+    - The next hop stays published but *retiring*: routes cannot name it,
+      and `SetNextHop()` refuses to reuse the id (new
+      `RouteError::kNextHopRetiring`), so a reader holding it from a removed
+      route never reaches a different next hop.
+    - Every control call, and `ReclaimRetired()`, drops completed
+      retirements with one republish.
+    - New deterministic test `RouterTest.NextHopRemovalIsDeferredNotBlocking`.
+      A reader stays online and silent: removal returns at once (the old
+      code would hang), reuse is refused, and after quiescence the id is
+      reusable. Without the reuse guard it fails ("a retiring id was
+      reused").
+    - `ConcurrentChurnNeverLosesANextHop` now also counts reuse refusals.
 
 ## Review process established this session
 
@@ -8982,17 +9010,9 @@ the Go/C++ SDKs.
   - ExactMatch is on mode C (entry 91, D-001);
   - DPDK behaviours are pinned by deterministic CI tests (entry 92, D-007).
 - Next in G1.2a:
-  0. Measure the QSBR grace-period distribution (p50/p95/p99/max) under
-     representative workers, including slow modules and pauses, and set
-     D-010's headroom constant from it.
   1. WildcardMatch on C (a `ConcurrentExactTable` per tuple);
-     Also make `Router::RemoveNextHop()` defer instead of block. Today it
-     calls `RcuDomain::Synchronize()` holding the Router mutex on the
-     command thread, so each removal waits a full grace period, removals
-     run one after another, and a stalled worker stalls the command path.
-     Retire the id through the domain and keep it reserved until
-     reclaimed, as table slots already are; a transaction must not hold a
-     blocking wait.
+     (Done since: grace periods measured and bounded, entry 95; RemoveNextHop
+     deferred, entry 96.)
   2. L2Forward, ACL and HashLB off the global pause;
   3. the mode W infrastructure.
 - Before G1.2b, study prior art for multi-table atomicity and record what

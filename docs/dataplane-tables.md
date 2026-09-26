@@ -35,8 +35,11 @@ stopping traffic.
 4. **Memory is freed only after a grace period.** Every structure hands
    retired memory (old generations, deleted hash slots, freed LPM groups) to
    the runtime's single `RcuDomain`. The domain frees it once every worker has
-   passed a quiescent point. Nothing on the packet path takes a lock, counts
-   references or frees memory.
+   passed a quiescent point. Workers report one every 10 µs of scheduler
+   time, so a grace period lasts about max(10 µs, the longest single task
+   invocation): p99 about 11 µs for ordinary pipelines (D-012). State owned
+   by one worker (mode W) needs no grace period at all (D-013). Nothing on
+   the packet path takes a lock, counts references or frees memory.
 
 ## 2. Choosing a structure
 
@@ -171,7 +174,10 @@ state through G, C or W.
   Ordering is enforced:
   - a route can only name an existing next hop;
   - readers fence between the route and next-hop loads;
-  - a next hop cannot be removed while any route names it.
+  - a next hop cannot be removed while any route names it;
+  - removing a next hop does not wait. The id stays published and
+    unusable ("retiring") until readers pass a grace period, and later
+    control calls drop it.
 - **Used by:** IPLookup.
 
 ### `ObjectTable<Id, T>` (id → object, mode G)
