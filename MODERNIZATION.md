@@ -9248,6 +9248,59 @@ value-add features: a firewall, CGNAT, rate limiting, mirroring.
 
 ### 29.3 Missing basics (L2/L3)
 
+- **N0. Virtual interfaces (vifs): the foundation under N1-N7, proposed
+  2026-09-26.**
+  - **What a vif is.** A control-plane object: MAC(s), VLAN, IP prefixes,
+    MTU, route domain, and K6 counters, bound to a physical port. Several
+    vifs share one NIC.
+  - **Realized as:**
+    - one `VifDemux` per port and per worker;
+    - per-vif ingress and egress gates;
+    - per-vif L2/L3 service modules;
+    - rows in shared tables (neighbours, routes, counters).
+  - **Demux: hardware first, software fallback per rule.**
+    - On vif creation, each rule (dMAC/VLAN/dIP/UDP port) is offered to the
+      NIC through `rte_flow_validate()`, with actions "steer to queue
+      group (RSS)" and "MARK = vif id".
+    - Accepted rules: the demux just reads the mark (O(1)).
+    - Refused rules (or a NIC without support): the rule goes into a
+      software `ConcurrentExactTable` keyed by (VLAN, dMAC), or by
+      (VLAN, dIP) for IP-mode vifs on a shared MAC.
+    - Correctness never depends on the NIC: unmarked packets always take
+      the software path.
+    - The capability is probed once per port and recorded (D-011 style).
+    - Per-vif RSS queue groups give flow affinity (§29.5).
+  - **L2/L3 services in BESS, not the kernel:**
+    - ARP/ND reply and resolution, feeding `Router`'s next hops;
+    - ICMP echo and TTL-exceeded;
+    - MTU enforcement (fragmentation via K8 later);
+    - broadcast and multicast handling.
+  - **The kernel sees only punted traffic:** a per-vif TAP or virtio-user
+    exception path for PFCP, BGP, BFD, SSH and the like (the §29.5
+    exception-path gap).
+  - **Egress:** push the VLAN, set the source MAC, check the MTU, then send
+    on a per-worker TX queue. There is no shared-queue lock.
+  - **UPF on one NIC:**
+    - N3 is a vif (VLAN or IP), with a flow rule on UDP 2152 steering
+      GTP-U to the UPF workers;
+    - N6 is a vif;
+    - N4 (PFCP) is punted to the kernel.
+
+    Today's OMEC UPF needs separate access and core ports plus veth
+    plumbing.
+  - **Consumers (D-008):** the edge router, CGNAT (inside and outside
+    vifs), the L4 load balancer, a BNG, and UPF.
+  - **Phases:**
+    - V1, software only: the vif object, demux and egress modules, ARP/ICMP,
+      counters; CI-testable on `net_null`/AF_PACKET;
+    - V2: the kernel exception path;
+    - V3: `rte_flow` offload with the capability probe and per-rule
+      fallback, validated per PMD in the C-HW lab;
+    - V4: vifs as v2-API desired-state objects inside G1.2b transactions
+      (create the vif, install demux rows and flow rules, then publish
+      routes).
+  - **Order:** V1 and V2 before N1 and N2, which build on them.
+
 - **N1. Learning bridge.**
   - MAC learning with aging;
   - bridge domains and per-VLAN learning;
@@ -9559,6 +9612,10 @@ item 1.
 
 ### 31.6 Network functions and UPF (Phase N, section 29; D-008)
 
+- **N0 virtual interfaces first** (section 29.3): V1 software vif, demux,
+  egress and ARP/ICMP; V2 kernel exception path; V3 `rte_flow` offload
+  with software fallback; V4 v2-API objects in transactions. The
+  foundation for N1/N2, and lets UPF run N3/N6/N4 on one NIC.
 - Missing L2/L3 basics:
   - N1 learning bridge;
   - N2 IPv4 router with ARP/ICMP;
