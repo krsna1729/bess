@@ -9312,8 +9312,42 @@ value-add features: a firewall, CGNAT, rate limiting, mirroring.
     | addressing | vif addresses are v2-API desired state | DHCP client, if used |
     | sessions/management | — | PFCP (N4), SSH, DNS, NTP, PTP (hardware timestamps later), metrics |
 
-  - **Control-plane policing:** every punted class passes a `MeterSet`
-    rate limiter, so floods cannot overwhelm the kernel or the punt path.
+  - **Punt policy: configurable, per vif (user direction, 2026-09-26).**
+    Traffic addressed to the box, or a protocol the fast path does not
+    forward, is matched against a per-vif punt table. The first match by
+    priority decides the action.
+    - **Match fields:** ethertype, IP protocol, L4 destination port,
+      destination IP, ICMP type/code, VLAN, and "addressed to this vif".
+    - **Actions:**
+      - *fast path*: handled in BESS by the built-in services (ARP/ND for
+        vif addresses, ICMP echo, TTL-exceeded);
+      - *punt → kernel*: the vif's TAP/virtio-user twin (SSH, FRR
+        BGP/OSPF, LLDP, DHCP client);
+      - *punt → bessd control core*: a ring to a non-worker bessd thread
+        running slow-path logic without the kernel (neighbour timers and
+        retries, ICMP errors above fast-path limits, learning
+        notifications, NF slow paths);
+      - *punt → app channel*: a shared-memory ring to an external
+        control-plane app that bypasses the kernel entirely, for example
+        PFCP straight to the UPF control plane. It is a small punt/inject
+        API in the SDK;
+      - *drop*.
+    - **Rate limiting:** per rule (pps and/or bps plus burst), plus a cap
+      per destination so the sum of rules cannot overrun the kernel TAP,
+      the control thread or an app ring. A full destination counts as a
+      drop, never a worker stall. Per-worker exclusive `MeterSet` meters
+      each hold a share of the configured total, so there is no shared
+      lock.
+    - **Counters per rule and destination:** matched, sent, dropped over
+      the limit, destination full.
+    - **Defaults:** ARP/ND/echo in the fast path; to-the-box traffic punted
+      to the kernel only for explicitly listed protocols; everything else
+      addressed to the box dropped and counted. Operators change it through
+      the v2 desired-state API.
+    - **Built from existing parts:** the table is a `ConcurrentMaskedTable`
+      (in-place O(1) policy changes, no pause); actions are ids into an
+      `ObjectTable` (destination, meter, counters); counters are K6
+      per-worker cells.
   - **Kernel mirror:** each vif that punts has a TAP twin with the same
     MAC and addresses, so Linux daemons bind normally, and the routes they
     learn are synced into the BESS router. This is the model of VPP's
