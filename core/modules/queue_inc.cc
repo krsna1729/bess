@@ -42,7 +42,7 @@ const Commands QueueInc::cmds = {{"set_burst", "QueueIncCommandSetBurstArg",
 CommandResponse QueueInc::Init(const bess::pb::QueueIncArg &arg) {
   const char *port_name;
   task_id_t tid;
-  burst_ = bess::PacketBatch::kMaxBurst;
+  burst_.store(bess::PacketBatch::kMaxBurst, std::memory_order_relaxed);
   if (!arg.port().length()) {
     return CommandFailure(EINVAL, "Field 'port' must be specified");
   }
@@ -53,7 +53,7 @@ CommandResponse QueueInc::Init(const bess::pb::QueueIncArg &arg) {
   if (!port_) {
     return CommandFailure(ENODEV, "Port %s not found", port_name);
   }
-  burst_ = bess::PacketBatch::kMaxBurst;
+  burst_.store(bess::PacketBatch::kMaxBurst, std::memory_order_relaxed);
 
   if (arg.prefetch()) {
     prefetch_ = 1;
@@ -96,7 +96,7 @@ struct task_result QueueInc::RunTask(Context *ctx, bess::PacketBatch *batch,
 
   uint64_t received_bytes = 0;
 
-  const int burst = ACCESS_ONCE(burst_);
+  const int burst = burst_.load(std::memory_order_relaxed);
   const int pkt_overhead = 24;
 
   batch->set_cnt(p->RecvPackets(qid, batch->handles(), burst));
@@ -139,7 +139,7 @@ CommandResponse QueueInc::CommandSetBurst(
     return CommandFailure(EINVAL, "burst size must be [0,%zu]",
                           bess::PacketBatch::kMaxBurst);
   } else {
-    burst_ = arg.burst();
+    burst_.store(arg.burst(), std::memory_order_relaxed);
     return CommandSuccess();
   }
 }

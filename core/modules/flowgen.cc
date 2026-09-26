@@ -335,7 +335,7 @@ CommandResponse FlowGen::CommandUpdate(const bess::pb::FlowGenArg &arg) {
 CommandResponse FlowGen::CommandSetBurst(
     const bess::pb::FlowGenCommandSetBurstArg &arg) {
   if (arg.burst() <= bess::PacketBatch::kMaxBurst) {
-    burst_ = arg.burst();
+    burst_.store(arg.burst(), std::memory_order_relaxed);
   } else {
     return CommandFailure(EINVAL, "'burst' must be no greater than %zu",
                           bess::PacketBatch::kMaxBurst);
@@ -357,7 +357,7 @@ CommandResponse FlowGen::Init(const bess::pb::FlowGenArg &arg) {
   arrival_ = Arrival::kUniform;
   duration_ = Duration::kUniform;
   pareto_.alpha = 1.3;
-  burst_ = bess::PacketBatch::kMaxBurst;
+  burst_.store(bess::PacketBatch::kMaxBurst, std::memory_order_relaxed);
   l4_proto_ = 0;
 
   /* register task */
@@ -487,7 +487,7 @@ void FlowGen::GeneratePackets(Context *ctx, bess::PacketBatch *batch) {
   uint64_t now = ctx->current_ns;
 
   batch->clear();
-  const int burst = ACCESS_ONCE(burst_);
+  const int burst = burst_.load(std::memory_order_relaxed);
 
   while (batch->cnt() < burst && !events_.empty()) {
     uint64_t t = events_.top().first;

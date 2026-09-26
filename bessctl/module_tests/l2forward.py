@@ -75,6 +75,29 @@ class BessL2ForwardTest(BessModuleTestCase):
         self.assertEqual(list(l2fib.lookup(addrs=['00:01:02:03:04:08']).gates),
                          [5])
 
+    # set_default_gate is THREAD_SAFE: it runs while a worker forwards
+    # traffic, and the worker reads the gate atomically. Packets from unknown
+    # MACs must follow each new default gate.
+    def test_l2forward_default_gate_live(self):
+        src = Source()
+        l2 = L2Forward()
+        src -> l2
+        l2:0 -> Sink()
+        l2:1 -> Sink()
+        src.attach_task(wid=0)
+        bess.resume_all()
+        deadline = time.time() + 2
+        i = 0
+        while time.time() < deadline:
+            l2.set_default_gate(gate=i % 2)
+            i += 1
+        bess.pause_all()
+        self.assertBessAlive()
+        pkts = {g.ogate: g.pkts for g in bess.get_module_info(l2.name).ogates}
+        self.assertGreater(pkts.get(0, 0), 0)
+        self.assertGreater(pkts.get(1, 0), 0)
+
+
 suite = unittest.TestLoader().loadTestsFromTestCase(BessL2ForwardTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)
 

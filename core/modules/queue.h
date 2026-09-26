@@ -33,6 +33,8 @@
 
 #include <rte_ring.h>
 
+#include <atomic>
+
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 
@@ -92,7 +94,9 @@ class Queue : public Module {
   // Whether backpressure should be applied or not
   bool backpressure_;
 
-  int burst_;
+  // Set by THREAD_SAFE commands while workers read it.
+
+  std::atomic<int> burst_;
 
   // Queue capacity
   uint64_t size_;

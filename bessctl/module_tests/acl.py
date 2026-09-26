@@ -85,6 +85,19 @@ class BessAclTest(BessModuleTestCase):
                          {'src_ip': '10.1.0.0/16', 'drop': False}])
         self.assertFalse(self.passes(acl, a))
 
+    # Rules are added and cleared while a worker forwards traffic (mode G).
+    def test_live_commands(self):
+        acl = ACL(rules=[{'src_ip': '0.0.0.0/0', 'drop': False}])
+
+        def command(i):
+            if i % 10 == 9:
+                acl.clear()
+                acl.add(rules=[{'src_ip': '0.0.0.0/0', 'drop': False}])
+            else:
+                acl.add(rules=[{'dst_port': 1000 + i, 'drop': True}])
+
+        pkts = self.run_with_live_commands(acl, [0], command)
+        self.assertGreater(pkts.get(0, 0), 0)
 
 suite = unittest.TestLoader().loadTestsFromTestCase(BessAclTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)

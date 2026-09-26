@@ -46,7 +46,7 @@ CommandResponse PortInc::Init(const bess::pb::PortIncArg &arg) {
   int ret;
   placement_constraint placement;
 
-  burst_ = bess::PacketBatch::kMaxBurst;
+  burst_.store(bess::PacketBatch::kMaxBurst, std::memory_order_relaxed);
 
   if (!arg.port().length()) {
     return CommandFailure(EINVAL, "'port' must be given as a string");
@@ -57,7 +57,7 @@ CommandResponse PortInc::Init(const bess::pb::PortIncArg &arg) {
   if (!port_) {
     return CommandFailure(ENODEV, "Port %s not found", port_name);
   }
-  burst_ = bess::PacketBatch::kMaxBurst;
+  burst_.store(bess::PacketBatch::kMaxBurst, std::memory_order_relaxed);
 
   num_inc_q = port_->num_queues[PACKET_DIR_INC];
   if (num_inc_q == 0) {
@@ -123,7 +123,7 @@ struct task_result PortInc::RunTask(Context *ctx, bess::PacketBatch *batch,
 
   uint64_t received_bytes = 0;
 
-  const int burst = ACCESS_ONCE(burst_);
+  const int burst = burst_.load(std::memory_order_relaxed);
   const int pkt_overhead = 24;
 
   batch->set_cnt(p->RecvPackets(qid, batch->handles(), burst));
@@ -169,7 +169,7 @@ CommandResponse PortInc::CommandSetBurst(
                           bess::PacketBatch::kMaxBurst);
   }
 
-  burst_ = burst;
+  burst_.store(burst, std::memory_order_relaxed);
   return CommandSuccess();
 }
 

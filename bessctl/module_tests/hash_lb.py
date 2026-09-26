@@ -91,6 +91,18 @@ class BessHashLBTest(BessModuleTestCase):
         used, total = self.gates_used(lb, pkts, range(8))
         self.assertEqual(total, len(pkts))
 
+    # Gates and mode change while a worker forwards traffic (mode G).
+    def test_live_commands(self):
+        lb = HashLB(gates=[0, 1])
+
+        def command(i):
+            if i % 2 == 0:
+                lb.set_gates(gates=[[0, 1], [1, 2, 3]][(i // 2) % 2])
+            else:
+                lb.set_mode(mode=['l3', 'l4'][(i // 2) % 2])
+
+        pkts = self.run_with_live_commands(lb, [0, 1, 2, 3], command)
+        self.assertGreater(sum(pkts.values()), 0)
 
 suite = unittest.TestLoader().loadTestsFromTestCase(BessHashLBTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)

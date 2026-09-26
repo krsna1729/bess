@@ -211,8 +211,11 @@ inline uint64_t l2_make_slot(uint64_t addr, gate_idx_t gate) {
 inline int l2_probe_bucket(uint64_t addr, const struct l2_entry *bucket,
                            uint64_t slots) {
   const uint64_t want = addr | (1ull << 63);
-#if __AVX2__
+#if defined(__x86_64__) && __AVX2__
   if (slots == 4) {
+    // x86-64 only: the argument below is about x86 loads. Elsewhere the
+    // scalar loop below runs; if a vector version is ever wanted there, use
+    // four atomic loads assembled in registers (D-017 amendment).
     // The four slots are read with one 32-byte vector load, issued as inline
     // assembly: a C++ vector load of words the writer stores atomically would
     // be a data race in the language (undefined behaviour), while the asm is

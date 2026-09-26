@@ -1087,6 +1087,31 @@ operation rings: the commands are two scalars.
   code was faster in 1 of 8 pairs. That is about −3% for the extra ring hop
   per packet.
 
+**Amendment (2026-09-27, external review).**
+
+- **Flow creation completes or is undone.** A new flow now ends up both in
+  the flow map and on the round-robin ring, or in neither, and its first
+  packet is always queued or freed. The order is: queue, then map, then
+  ring (rolling back the map on failure), then the first packet (a
+  failure there drops only the packet).
+- **Tests (`core/modules/drr_test.cc`):** deterministic fault injection at
+  each step through a friend test peer, and a leak check against the
+  packet pool. The check was run once against two broken versions: without
+  the map rollback the process crashes, and without the packet free the
+  leak check fails.
+- **The packet contract.** `GetId` read Ethernet, IPv4 and L4 headers
+  through raw pointers, with no length, IHL, protocol or fragment checks.
+  It now reads through `PacketCursor`, so reads are bounds-checked and
+  chained packets work:
+  - an untagged IPv4 packet with a complete header gives the 5-tuple;
+  - ports are read only for TCP and UDP first fragments that carry them,
+    and are 0 otherwise;
+  - anything else maps to one fallback flow, so DRR still schedules every
+    format, as documented.
+
+  Tests cover short, foreign (ARP, IPv6), bad-IHL, non-first-fragment,
+  truncated-L4 and ICMP packets, and a chain split at every byte.
+
 **Rejected.**
 
 - *Limiting DRR to one worker:* it would forbid the ordinary placement of a

@@ -239,7 +239,7 @@ state through G, C or W.
 | ExactMatch | `ConcurrentExactTable` | C: add/delete/clear in place; default gate and restore by G | 0.3 µs per add at any size |
 | IPLookup | `RouteTable` (`rte_lpm`) | C | |
 | WildcardMatch | `ConcurrentMaskedTable` (one `ConcurrentExactTable` per mask) | C: add/delete in place; a new or vanished mask republishes only the tuple list | D-014 |
-| L2Forward | `l2_table` (inline 4-way buckets) | C: single-writer, lock-free readers; whole-word slot stores, no grace period | D-017 |
+| L2Forward | `l2_table` (inline 4-way buckets) | C: single-writer, lock-free readers; whole-word slot stores, no grace period. Multi-entry `add`/`populate` are all-or-nothing per command (validation plus rollback), but not dataplane-atomic: packets see entries one by one | D-017 |
 | ACL | `std::vector` of rules, linear scan | G: `add` copies, appends and publishes (all or nothing) | D-017; `rte_acl` (G-only) is the candidate for large rule sets |
 | HashLB | configuration only (`ExactMatchTable` for field layout) | G: one `RcuPtr<Config>`, read once per batch | D-017 |
 | URLFilter | `Trie` per host | Pause | legacy: cleartext HTTP only; a modern SNI classifier is recorded in MODERNIZATION §31.6 |

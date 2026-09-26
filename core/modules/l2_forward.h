@@ -31,6 +31,8 @@
 #ifndef BESS_MODULES_L2FORWARD_H_
 #define BESS_MODULES_L2FORWARD_H_
 
+#include <atomic>
+
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "l2_table.h"
@@ -65,7 +67,9 @@ class L2Forward final : public Module {
 
  private:
   struct l2_table l2_table_;
-  gate_idx_t default_gate_;
+  // Set by commands while workers read it: an atomic field, relaxed on both
+  // sides (the gate is independent of the table).
+  std::atomic<gate_idx_t> default_gate_;
 };
 
 #endif  // BESS_MODULES_L2FORWARD_H_

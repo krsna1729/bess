@@ -130,15 +130,14 @@ int main(int argc, char *argv[]) {
   rte_eal_mp_wait_lcore();
 
   // Nothing along the normal shutdown path (`daemon stop` -> PauseAll then
-  // KillBess, or a bare KillBess) ever joins or detaches worker threads --
-  // KillBess() just schedules an async server shutdown and returns, so we
-  // get here with worker threads still alive (paused or, if killed
-  // without a preceding pause, still running) and their handles still
-  // joinable. worker_threads[] is a namespace-scope global, so its
-  // std::thread destructors run at static-destruction time on process
-  // exit; a still-joinable one calls std::terminate(). Detach them here
-  // instead of leaving that to chance.
-  detach_all_worker_threads();
+  // KillBess, or a bare KillBess) stops the workers: KillBess() only
+  // schedules an async server shutdown, so we get here with worker threads
+  // alive (paused, or still running if killed without a pause) and still
+  // registered as RCU readers. Stop them in order -- pause, quit, join, which
+  // also unregisters each reader -- before static destruction tears down the
+  // runtime (and its RcuDomain) under them. Detaching them instead left live
+  // readers behind and aborted on the domain's registered-reader check.
+  destroy_all_workers();
 
   LOG(INFO) << "BESS daemon has been gracefully shut down";
 

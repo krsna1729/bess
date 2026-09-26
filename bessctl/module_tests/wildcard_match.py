@@ -289,6 +289,26 @@ class BessWildcardMatchTest(BessModuleTestCase):
         #    '\nmut state:', cur_config, 'expecting:', expect_config)
         assert arg == iconf and cur_config == expect_config
 
+    # Rules come and go while a worker forwards traffic, including masks that
+    # appear and disappear (the tuple list is republished) -- G1.2 mode C.
+    def test_wildcard_match_live_commands(self):
+        wm = WildcardMatch(fields=[{'offset': 26, 'num_bytes': 4}])
+        wm.set_default_gate(gate=0)
+        masks = [[0xff, 0, 0, 0], [0xff, 0xff, 0, 0], [0xff, 0xff, 0xff, 0]]
+
+        def command(i):
+            m = masks[(i // 2) % 3]
+            raw = [10, (i // 2) % 256, (i // 14) % 256, 0]
+            mask = vstring(m)
+            value = vstring([b & mb for b, mb in zip(raw, m)])
+            if i % 2 == 0:
+                wm.add(gate=1, priority=i % 7, masks=mask, values=value)
+            else:
+                wm.delete(masks=mask, values=value)
+
+        pkts = self.run_with_live_commands(wm, [0, 1], command)
+        self.assertGreater(sum(pkts.values()), 0)
+
 suite = unittest.TestLoader().loadTestsFromTestCase(BessWildcardMatchTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)
 

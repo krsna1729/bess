@@ -31,6 +31,8 @@
 #ifndef BESS_MODULES_FLOWGEN_H_
 #define BESS_MODULES_FLOWGEN_H_
 
+#include <atomic>
+
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 
@@ -53,8 +55,10 @@ class Source final : public Module {
       const bess::pb::SourceCommandSetPktSizeArg &arg);
 
  private:
-  int pkt_size_;
-  int burst_;
+  // Set by THREAD_SAFE commands while workers read it.
+  std::atomic<int> pkt_size_;
+  // Set by THREAD_SAFE commands while workers read it.
+  std::atomic<int> burst_;
 };
 
 #endif  // BESS_MODULES_FLOWGEN_H_

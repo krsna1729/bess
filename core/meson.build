@@ -238,6 +238,7 @@ unit_test_sources = [
   'memory_test.cc',
   'metadata_test.cc',
   'module_test.cc',
+  'modules/drr_test.cc',
   'modules/exact_match_migration_test.cc',
   'modules/exact_match_test.cc',
   'modules/l2_table_test.cc',

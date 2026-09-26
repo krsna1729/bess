@@ -57,7 +57,9 @@ using bess::utils::CuckooMap;
 //
 // based on this:
 //  https://en.wikipedia.org/wiki/Deficit_round_robin
-// EXPECTS: Input packets in any format
+// EXPECTS: Input packets in any format. Flows are the IPv4 5-tuple
+// (see GetId); packets that are not untagged, well-formed IPv4 share one
+// fallback flow.
 //
 // MODIFICATIONS: None
 //
@@ -256,6 +258,21 @@ class DRR final : public Module {
   // `flags` defaults to single-producer/single-consumer.
   rte_ring *AddQueue(uint32_t slots, int *err,
                      unsigned flags = RING_F_SP_ENQ | RING_F_SC_DEQ);
+
+  friend class DrrTestPeer;
+
+  // Allocates the round-robin and ingress rings (Init, after the task).
+  CommandResponse AllocateRings();
+
+  // Test-only fault injection for the flow-creation slow path (DrrTestPeer).
+  // Never set in production; checked only when a new flow is created.
+  struct Faults {
+    bool queue_alloc = false;
+    bool map_insert = false;
+    bool ring_enqueue = false;
+    bool first_enqueue = false;
+  };
+  Faults faults_;
 
   // the number of bytes to allocate to each flow in each round. Set by
   // commands, read by the task.

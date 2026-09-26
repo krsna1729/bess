@@ -211,10 +211,11 @@ class BessModuleTestCase(unittest.TestCase):
         self.bess.pause_all()
         self.bess.reset_all()
 
-    def run_for(self, module, igates, duration, pkt_update_fields=[]):
+    def run_for(self, module, igates, duration, pkt_update_fields=None):
         self.bess.pause_all()
 
-        fields = pkt_update_fields
+        # A copy: appending to a shared default list grew it on every call.
+        fields = list(pkt_update_fields or [])
         if len(fields) == 0:
             fields.append({'offset': 26, 'size': 4,
                            'min': 1, 'max': pow(2, 32) - 1})
@@ -233,6 +234,37 @@ class BessModuleTestCase(unittest.TestCase):
         self.bess.resume_all()
         time.sleep(duration)
         self.bess.pause_all()
+
+    def run_with_live_commands(self, module, ogates, command, duration=2):
+        """Forwards random traffic through `module` on a running worker while
+        calling command(i) (i = 0, 1, ...) in a loop for `duration` seconds.
+        For modules whose commands are THREAD_SAFE: they must be accepted
+        while workers run, and the daemon must stay up. Returns
+        {ogate: packets forwarded}."""
+        self.bess.pause_all()
+        fields = [{'offset': 26, 'size': 4, 'min': 1, 'max': pow(2, 32) - 1},
+                  {'offset': 30, 'size': 4, 'min': 1, 'max': pow(2, 32) - 1}]
+        src = self.bess.create_module('Source')
+        rnd = self.bess.create_module('RandomUpdate', 'RandomUpdateArg',
+                                      {'fields': fields})
+        self.bess.connect_modules(src.name, rnd.name)
+        self.bess.connect_modules(rnd.name, module.name, 0, 0)
+        for ogate in ogates:
+            sink = self.bess.create_module('Sink')
+            self.bess.connect_modules(module.name, sink.name, ogate, 0)
+
+        self.bess.resume_all()
+        deadline = time.time() + duration
+        i = 0
+        while time.time() < deadline:
+            command(i)
+            i += 1
+        self.bess.pause_all()
+
+        self.assertBessAlive()
+        self.assertGreater(i, 10, 'too few commands ran')
+        return {g.ogate: g.pkts
+                for g in self.bess.get_module_info(module.name).ogates}
 
     def run_pipeline(self, src_module, dst_module, igate, input_pkts,
                      ogates, time_out=3, proto=scapy.Ether):

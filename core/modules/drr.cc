@@ -31,12 +31,16 @@
 #include "drr.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "../packet_cursor.h"
 #include "../utils/ether.h"
 #include "../utils/ip.h"
 #include "../utils/rte_ring_alloc.h"
@@ -128,6 +132,10 @@ CommandResponse DRR::Init(const bess::pb::DRRArg &arg) {
     return CommandFailure(ENOMEM, "task creation failed");
   }
 
+  return AllocateRings();
+}
+
+CommandResponse DRR::AllocateRings() {
   int err_num = 0;
   flow_ring_ = AddQueue(max_number_flows_, &err_num);
   if (err_num != 0) {
@@ -137,7 +145,6 @@ CommandResponse DRR::Init(const bess::pb::DRRArg &arg) {
   if (err_num != 0) {
     return CommandFailure(-err_num);
   }
-
   return CommandSuccess();
 }
 
@@ -346,44 +353,81 @@ uint32_t DRR::GetNextPackets(bess::PacketBatch *batch, Flow *f, int *err) {
   return total_bytes;
 }
 
+// The 5-tuple of an untagged IPv4 packet, read through a PacketCursor (bounds
+// checked, chained packets included; contiguous headers take its fast path).
+// Ports are read for TCP and UDP first fragments that carry them, and are 0
+// otherwise. Anything else -- not IPv4, shorter than its headers, a header
+// length below 5 -- maps to one fallback flow (all zeros), so DRR still
+// schedules packets of any format, as documented, without reading past them.
 DRR::FlowId DRR::GetId(bess::PacketRef pkt) {
-  using bess::utils::Ethernet;
   using bess::utils::Ipv4;
-  using bess::utils::Udp;
+  using bess::utils::be16_t;
 
-  Ethernet *eth = pkt.head_data<Ethernet *>();
-  Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
-  size_t ip_bytes = ip->header_length << 2;
-  Udp *udp = reinterpret_cast<Udp *>(reinterpret_cast<uint8_t *>(ip) +
-                                     ip_bytes);  // Assumes a l-4 header
-  // TODO(joshua): handle packet fragmentation
-  FlowId id = {ip->src.value(), ip->dst.value(), udp->src_port.value(),
-               udp->dst_port.value(), ip->protocol};
+  FlowId id = {};
+  bess::packet::PacketCursor cursor(pkt);
+  const auto ether_type =
+      cursor.Skip(12) ? cursor.Read<be16_t>() : std::nullopt;
+  if (!ether_type || ether_type->value() != 0x0800) {
+    return FlowId{};
+  }
+  const std::optional<Ipv4> ip = cursor.Read<Ipv4>();
+  if (!ip || ip->version != 4 || ip->header_length < 5) {
+    return FlowId{};
+  }
+  id.src_ip = ip->src.value();
+  id.dst_ip = ip->dst.value();
+  id.protocol = ip->protocol;
+  const bool first_fragment = (ip->fragment_offset.value() & 0x1fff) == 0;
+  if ((ip->protocol == 6 || ip->protocol == 17) && first_fragment &&
+      cursor.Skip((ip->header_length - 5u) * 4u)) {
+    const auto ports = cursor.Read<std::array<be16_t, 2>>();
+    if (ports) {
+      id.src_port = (*ports)[0].value();
+      id.dst_port = (*ports)[1].value();
+    }
+  }
   return id;
 }
 
 void DRR::AddNewFlow(bess::PacketHandle pkt, FlowId id, int *err) {
-  // creates flow
-  Flow *f = new Flow(id);
-
-  // TODO(joshua) do proper error checking
-  f->queue = AddQueue(static_cast<int>(kFlowQueueSize), err);
-
+  // Every step completes or is undone: a new flow ends up both in the map and
+  // on the round-robin ring, or in neither, and the packet is always either
+  // queued or freed.
+  auto f = std::make_unique<Flow>(id);
+  if (faults_.queue_alloc) {
+    *err = -ENOMEM;
+  } else {
+    f->queue = AddQueue(static_cast<int>(kFlowQueueSize), err);
+  }
   if (*err != 0) {
-    delete f;
     bess::PacketFree(pkt);
     return;
   }
 
-  flows_.Insert(id, f);
+  if (faults_.map_insert || flows_.Insert(id, f.get()) == nullptr) {
+    *err = -ENOMEM;
+    bess::PacketFree(pkt);
+    return;  // `f` frees its queue
+  }
 
-  Enqueue(f, pkt, err);
+  // Puts the flow in the round robin.
+  *err = faults_.ring_enqueue ? -ENOBUFS
+                              : rte_ring_sp_enqueue(flow_ring_, f.get());
   if (*err != 0) {
+    flows_.Remove(id);
+    bess::PacketFree(pkt);
     return;
   }
 
-  // puts flow in round robin
-  *err = rte_ring_sp_enqueue(flow_ring_, f);
+  // The flow is complete and schedulable; a failure to queue its first packet
+  // drops that packet only (Enqueue frees it).
+  Flow *flow = f.release();
+  if (faults_.first_enqueue) {
+    *err = -ENOBUFS;
+    bess::PacketFree(pkt);
+    return;
+  }
+  Enqueue(flow, pkt, err);
 }
 
 void DRR::RemoveFlow(Flow *f) {

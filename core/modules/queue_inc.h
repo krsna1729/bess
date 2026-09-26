@@ -31,6 +31,8 @@
 #ifndef BESS_MODULES_QUEUEINC_H_
 #define BESS_MODULES_QUEUEINC_H_
 
+#include <atomic>
+
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../port.h"
@@ -58,7 +60,8 @@ class QueueInc final : public Module {
   Port *port_;
   queue_t qid_;
   int prefetch_;
-  int burst_;
+  // Set by THREAD_SAFE commands while workers read it.
+  std::atomic<int> burst_;
 };
 
 #endif  // BESS_MODULES_QUEUEINC_H_

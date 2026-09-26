@@ -54,18 +54,18 @@ CommandResponse Source::Init(const bess::pb::SourceArg &arg) {
   if (tid == INVALID_TASK_ID)
     return CommandFailure(ENOMEM, "Task creation failed");
 
-  pkt_size_ = 60;
-  burst_ = bess::PacketBatch::kMaxBurst;
+  pkt_size_.store(60, std::memory_order_relaxed);
+  burst_.store(bess::PacketBatch::kMaxBurst, std::memory_order_relaxed);
 
   if (arg.pkt_size() > 0) {
     if (arg.pkt_size() > ConfiguredPacketDataRoom()) {
       return CommandFailure(EINVAL, "Invalid packet size: maximum is %zu",
                             ConfiguredPacketDataRoom());
     }
-    pkt_size_ = arg.pkt_size();
+    pkt_size_.store(arg.pkt_size(), std::memory_order_relaxed);
   }
 
-  burst_ = bess::PacketBatch::kMaxBurst;
+  burst_.store(bess::PacketBatch::kMaxBurst, std::memory_order_relaxed);
 
   return CommandSuccess();
 }
@@ -76,7 +76,7 @@ CommandResponse Source::CommandSetBurst(
     return CommandFailure(EINVAL, "burst size must be [0,%zu]",
                           bess::PacketBatch::kMaxBurst);
   }
-  burst_ = arg.burst();
+  burst_.store(arg.burst(), std::memory_order_relaxed);
 
   return CommandSuccess();
 }
@@ -88,7 +88,7 @@ CommandResponse Source::CommandSetPktSize(
     return CommandFailure(EINVAL, "Invalid packet size: maximum is %zu",
                           ConfiguredPacketDataRoom());
   }
-  pkt_size_ = val;
+  pkt_size_.store(val, std::memory_order_relaxed);
   return CommandSuccess();
 }
 
@@ -99,8 +99,8 @@ struct task_result Source::RunTask(Context *ctx, bess::PacketBatch *batch,
   }
 
   const int pkt_overhead = 24;
-  const int pkt_size = ACCESS_ONCE(pkt_size_);
-  const uint32_t burst = ACCESS_ONCE(burst_);
+  const int pkt_size = pkt_size_.load(std::memory_order_relaxed);
+  const uint32_t burst = burst_.load(std::memory_order_relaxed);
 
   if (current_worker.packet_pool()->AllocBulk(batch->handles(), burst, pkt_size)) {
     batch->set_cnt(burst);

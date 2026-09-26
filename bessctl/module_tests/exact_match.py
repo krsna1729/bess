@@ -243,6 +243,23 @@ class BessExactMatchTest(BessModuleTestCase):
         self.assertEqual(len(pkt_outs[3]), 1)
         self.assertEqual(len(pkt_outs[1]), 0)
 
+    # Rules and the default gate change while a worker forwards traffic
+    # (G1.2 mode C, THREAD_SAFE commands).
+    def test_exact_match_live_commands(self):
+        em = ExactMatch(fields=[{'offset': 26, 'num_bytes': 4}])
+        em.set_default_gate(gate=0)
+
+        def command(i):
+            key = [{'value_bin': socket.inet_aton('10.0.%d.%d' % (i // 2 % 64, 1))}]
+            if i % 2 == 0:
+                em.add(fields=key, gate=1)
+            else:
+                em.delete(fields=key)
+            if i % 50 == 0:
+                em.set_default_gate(gate=(i // 50) % 2)
+
+        pkts = self.run_with_live_commands(em, [0, 1], command)
+        self.assertGreater(sum(pkts.values()), 0)
 
 suite = unittest.TestLoader().loadTestsFromTestCase(BessExactMatchTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)

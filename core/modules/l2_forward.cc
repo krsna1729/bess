@@ -238,7 +238,7 @@ CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
   int size = arg.size();
   int bucket = arg.bucket();
 
-  default_gate_ = DROP_GATE;
+  default_gate_.store(DROP_GATE, std::memory_order_relaxed);
 
   if (size == 0) {
     size = DEFAULT_TABLE_SIZE;
@@ -265,7 +265,8 @@ void L2Forward::DeInit() {
 }
 
 void L2Forward::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  gate_idx_t default_gate = ACCESS_ONCE(default_gate_);
+  const gate_idx_t default_gate =
+      default_gate_.load(std::memory_order_relaxed);
 
   const int cnt = batch->cnt();
   uint64_t dst[bess::PacketBatch::kMaxBurst];
@@ -293,7 +294,13 @@ bool ValidWireGate(int64_t gate) {
 
 // add/delete/populate change the table in place while workers keep reading
 // (G1.2 mode C; l2_table's single-word slots need no grace period). Each
-// command validates everything first and applies all of it or none.
+// command validates everything first, and add undoes its earlier inserts if a
+// later one fails for lack of space, so a refused command leaves the table as
+// it was. That is command-level all-or-nothing, not dataplane atomicity:
+// entries become visible to packets one by one as they are inserted, and a
+// rolled-back add may have been seen briefly. Atomic visibility of a set of
+// changes is what G1.2b transactions add (scope cell); these commands do not
+// promise it.
 CommandResponse L2Forward::CommandAdd(
     const bess::pb::L2ForwardCommandAddArg &arg) {
   std::vector<std::pair<uint64_t, gate_idx_t>> entries;
@@ -375,8 +382,8 @@ CommandResponse L2Forward::CommandSetDefaultGate(
     return CommandFailure(EINVAL, "Invalid gate: %lld",
                           static_cast<long long>(arg.gate()));
   }
-  __atomic_store_n(&default_gate_, static_cast<gate_idx_t>(arg.gate()),
-                   __ATOMIC_RELAXED);
+  default_gate_.store(static_cast<gate_idx_t>(arg.gate()),
+                      std::memory_order_relaxed);
   return CommandSuccess();
 }
 

@@ -3875,6 +3875,50 @@ rather than one call site).
     - Cost: −3% throughput in the single-worker case (paired ABBA,
       isolated). Classifying directly on the owning worker is queued.
 
+103. **Second external review round (2026-09-27), and live-traffic
+     coverage.**
+     - **L2Forward's default gate** was written atomically but read through
+       `ACCESS_ONCE` (a volatile cast, not an atomic read). It is now
+       `std::atomic`, relaxed on both sides. The same pattern was fixed in
+       five legacy modules whose `THREAD_SAFE` commands set `burst_` or
+       `pkt_size_`: PortInc, QueueInc, Queue, Source and FlowGen.
+     - **DRR:**
+       - flow creation completes or is undone, tested with fault injection
+         at every step;
+       - the flow id is read through `PacketCursor`, with malformed or
+         foreign packets on one fallback flow (D-019 amendment).
+     - **L2Forward:** multi-entry commands are documented as all-or-nothing
+       per command, but not dataplane-atomic; that guarantee is G1.2b's.
+       The asm probe is restricted to x86-64 builds.
+     - **Testing gap closed:** every module taken off the worker pause now
+       has a live test that issues its commands while a worker forwards
+       traffic (`run_with_live_commands` in `bessctl/test_utils.py`):
+       ExactMatch, WildcardMatch (masks appearing and disappearing),
+       HashLB, ACL, IPLookup, L2Forward and DRR.
+     - Also fixed: `run_for`'s mutable default argument grew its field
+       list on every call.
+     - **Daemon shutdown, found by the new live tests.**
+       - Every stop of a daemon with workers aborted. KillBess leaves
+         worker threads running, and `main` only detached them, so they
+         stayed registered, sometimes online, RCU readers.
+       - Static destruction then destroyed the runtime's `RcuDomain`
+         before the modules publishing through it (the modules map is
+         declared first, so it is destroyed last). The failures were
+         `RcuPtr destroyed while 1322 reader(s) are online`, reading a
+         dead domain, and the domain's registered-reader check.
+       - This went unseen because harness daemons are stopped with
+         SIGTERM, and nothing checked their exit status.
+       - Now `ApiServer::Run` calls `ControlPlane::Reset()` (modules,
+         ports, traffic classes, workers) as soon as the server stops,
+         and `main` stops any remaining workers in order, never detaching
+         them.
+       - The regression test is `bessctl/test_shutdown.py`. It starts an
+         unprivileged daemon, builds a running pipeline with a worker and
+         WildcardMatch, stops it through the API, and requires exit
+         status 0. With the reset removed it exits with SIGABRT (−6).
+     - WildcardMatch under 21K live add/delete commands, with masks
+       appearing and disappearing, forwarded traffic with no fault.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

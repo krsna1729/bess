@@ -31,6 +31,8 @@
 #ifndef BESS_MODULES_PORTINC_H_
 #define BESS_MODULES_PORTINC_H_
 
+#include <atomic>
+
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../port.h"
@@ -62,7 +64,8 @@ class PortInc final : public Module {
  private:
   Port *port_;
   int prefetch_;
-  int burst_;
+  // Set by THREAD_SAFE commands while workers read it.
+  std::atomic<int> burst_;
 };
 
 #endif  // BESS_MODULES_PORTINC_H_

@@ -1181,4 +1181,13 @@ void ApiServer::Run() {
 
   service.set_shutdown_func([&server]() { server->Shutdown(); });
   server->Wait();
+
+  // Tear the dataplane down in order while the runtime is still alive:
+  // modules (and the state they publish through RCU), then ports, traffic
+  // classes and workers -- ResetAll's order. Left to static destruction, the
+  // runtime destroyed its RcuDomain before the modules that publish through
+  // it, and aborted on RcuPtr's online-reader check.
+  if (auto reset = control_plane.Reset(); !reset) {
+    LOG(ERROR) << "Shutdown reset failed: " << reset.error().message;
+  }
 }

@@ -31,6 +31,8 @@
 #ifndef BESS_MODULES_FLOWGEN_H_
 #define BESS_MODULES_FLOWGEN_H_
 
+#include <atomic>
+
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 
@@ -174,7 +176,9 @@ class FlowGen final : public Module {
     double mean;           /* determined by alpha */
   } pareto_;
 
-  int burst_;
+  // Set by THREAD_SAFE commands while workers read it.
+
+  std::atomic<int> burst_;
 };
 
 #endif  // BESS_MODULES_FLOWGEN_H_

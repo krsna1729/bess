@@ -108,7 +108,7 @@ CommandResponse Queue::Init(const bess::pb::QueueArg &arg) {
     return CommandFailure(ENOMEM, "Task creation failed");
   }
 
-  burst_ = bess::PacketBatch::kMaxBurst;
+  burst_.store(bess::PacketBatch::kMaxBurst, std::memory_order_relaxed);
 
   if (arg.backpressure()) {
     VLOG(1) << "Backpressure enabled for " << name() << "::Queue";
@@ -207,7 +207,7 @@ struct task_result Queue::RunTask(Context *ctx, bess::PacketBatch *batch,
     };
   }
 
-  const int burst = ACCESS_ONCE(burst_);
+  const int burst = burst_.load(std::memory_order_relaxed);
   const int pkt_overhead = 24;
 
   uint64_t total_bytes = 0;
@@ -254,7 +254,7 @@ CommandResponse Queue::CommandSetBurst(
                           bess::PacketBatch::kMaxBurst);
   }
 
-  burst_ = burst;
+  burst_.store(burst, std::memory_order_relaxed);
   return CommandSuccess();
 }
 
