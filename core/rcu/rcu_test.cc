@@ -153,6 +153,22 @@ TEST_F(RcuDomainTest, OnlineReaderBlocksUntilQuiescent) {
   domain_->Unregister(id);
 }
 
+// The pause-during-grace case: a reader that holds a grace period and then goes
+// offline (a worker pausing) releases it without reporting quiescence.
+TEST_F(RcuDomainTest, OfflineDuringGracePeriodReleasesIt) {
+  const ReaderId id = 5;
+  ASSERT_TRUE(domain_->Register(id).has_value());
+  domain_->Online(id);
+
+  const GracePeriod token = domain_->StartGracePeriod();
+  EXPECT_FALSE(domain_->IsComplete(token));
+
+  domain_->Offline(id);
+  EXPECT_TRUE(domain_->IsComplete(token))
+      << "going offline must release a held grace period";
+  domain_->Unregister(id);
+}
+
 TEST_F(RcuDomainTest, UnregisterDuringGracePeriodStopsBeingWaitedOn) {
   const ReaderId id = 4;
   ASSERT_TRUE(domain_->Register(id).has_value());

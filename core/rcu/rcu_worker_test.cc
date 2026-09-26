@@ -116,9 +116,10 @@ TEST_F(RcuWorkerTest, WorkerIdCanBeRecreated) {
   resume_worker(wid);
   EXPECT_TRUE(rcu_->IsOnline(wid));
 
+  // A running worker reports quiescence on its own every few microseconds
+  // (D-012), so whether it still holds this grace period is timing-dependent;
+  // only the outcome after destruction is checked.
   const bess::rcu::GracePeriod held = rcu_->StartGracePeriod();
-  EXPECT_FALSE(rcu_->IsComplete(held))
-      << "an online worker holds the grace period until it reports quiescence";
 
   destroy_worker(wid);
   EXPECT_FALSE(rcu_->IsRegistered(wid));
@@ -146,9 +147,12 @@ TEST_F(RcuWorkerTest, PauseDuringGracePeriodReleasesIt) {
   launch_worker(wid, 0);
   resume_worker(wid);
 
-  // The worker is online and has not reported quiescence since this token.
+  // The worker may or may not have reported quiescence since this token (a
+  // running worker reports every few microseconds, D-012), so only the outcome
+  // is checked here. That an offline reader releases a grace period it was
+  // holding is tested deterministically in rcu_test.cc
+  // (OfflineReaderDoesNotBlockGracePeriod).
   const bess::rcu::GracePeriod token = rcu_->StartGracePeriod();
-  EXPECT_FALSE(rcu_->IsComplete(token));
 
   // Pausing transitions it offline before it blocks.
   pause_worker(wid);
