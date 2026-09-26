@@ -61,6 +61,8 @@ enum class RouteError : uint8_t {
   kInvalidId,            // zero or beyond the configured capacity
   kUnknownNextHop,       // a route names a next hop that does not exist
   kNextHopInUse,         // removing a next hop routes still reference
+  kNextHopRetiring,      // reusing a removed next hop's id before readers are
+                         // done with it (retry after a grace period)
 };
 
 const char *RouteErrorName(RouteError error);

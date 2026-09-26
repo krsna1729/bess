@@ -539,14 +539,21 @@ TEST(RouterTest, ConcurrentChurnNeverLosesANextHop) {
     });
   }
 
-  uint64_t rounds = 0;
+  uint64_t rounds = 0, retiring_refusals = 0;
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
   while (std::chrono::steady_clock::now() < deadline) {
     const uint32_t x = static_cast<uint32_t>(rounds++ % 32);
     const NextHopId id(2 + x);
     const Ipv4Prefix p = P(Ip(10, x, 0, 0), 16);
-    ASSERT_TRUE(router->SetNextHop(id, Hop(static_cast<gate_idx_t>(2 + x), 2)));
+    // An id removed 32 rounds ago may still be retiring (readers not yet
+    // past its grace period); reuse is refused until then.
+    if (auto set = router->SetNextHop(id, Hop(static_cast<gate_idx_t>(2 + x), 2));
+        !set) {
+      ASSERT_EQ(RouteError::kNextHopRetiring, set.error());
+      retiring_refusals++;
+      continue;
+    }
     ASSERT_TRUE(router->SetRoute(p, id));
     ASSERT_TRUE(router->RemoveRoute(p));
     ASSERT_TRUE(router->RemoveNextHop(id));
@@ -559,8 +566,52 @@ TEST(RouterTest, ConcurrentChurnNeverLosesANextHop) {
     domain.Unregister(20 + r);
   }
   EXPECT_EQ(0u, lost.load()) << "of " << batches.load() << " batches, "
-                             << rounds << " rounds";
+                             << rounds << " rounds, " << retiring_refusals
+                             << " reuse refusals";
   EXPECT_GT(rounds, 100u);
+}
+
+// Removing a next hop does not wait for readers. With a reader online that
+// never reports quiescence, RemoveNextHop() returns at once (the former
+// blocking implementation would hang here). Until the reader passes a
+// quiescent state the id is retiring: routes cannot name it and it cannot be
+// reused, so a reader still holding it from a removed route can never reach a
+// different next hop. Afterwards the next control call drops it.
+TEST(RouterTest, NextHopRemovalIsDeferredNotBlocking) {
+  rcu::RcuDomain &domain = control::runtime().rcu();
+  auto router = MakeRouter(/*next_hops=*/8);
+  ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
+  ASSERT_TRUE(router->SetNextHop(NextHopId(2), Hop(2, 2)));
+  ASSERT_TRUE(router->SetRoute(P(Ip(10, 0, 0, 0), 8), NextHopId(1)));
+
+  constexpr uint32_t kReader = 24;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);
+  ASSERT_TRUE(router->RemoveRoute(P(Ip(10, 0, 0, 0), 8)));
+  const auto start = std::chrono::steady_clock::now();
+  ASSERT_TRUE(router->RemoveNextHop(NextHopId(1)));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(1))
+      << "removal must not wait for readers";
+
+  EXPECT_EQ(1u, router->next_hop_count()) << "retiring hops are not live";
+  EXPECT_EQ(1u, router->ReclaimRetired()) << "still waiting for the reader";
+  const auto reuse = router->SetNextHop(NextHopId(1), Hop(3, 3));
+  ASSERT_FALSE(reuse.has_value()) << "a retiring id was reused";
+  EXPECT_EQ(RouteError::kNextHopRetiring, reuse.error());
+  const auto route = router->SetRoute(P(Ip(11, 0, 0, 0), 8), NextHopId(1));
+  ASSERT_FALSE(route.has_value()) << "a route named a retiring id";
+  EXPECT_EQ(RouteError::kUnknownNextHop, route.error());
+  const auto again = router->RemoveNextHop(NextHopId(1));
+  ASSERT_FALSE(again.has_value());
+  EXPECT_EQ(RouteError::kUnknownNextHop, again.error());
+
+  domain.Quiescent(kReader);
+  EXPECT_EQ(0u, router->ReclaimRetired());
+  EXPECT_TRUE(router->SetNextHop(NextHopId(1), Hop(3, 3)))
+      << "reusable once readers have passed";
+  EXPECT_EQ(2u, router->next_hop_count());
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
 }
 
 TEST(RouterTest, RewriteL2) {

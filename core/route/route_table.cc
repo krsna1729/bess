@@ -58,6 +58,8 @@ const char *RouteErrorName(RouteError error) {
       return "no such next hop";
     case RouteError::kNextHopInUse:
       return "next hop is still referenced by routes";
+    case RouteError::kNextHopRetiring:
+      return "next hop retiring";
   }
   return "unknown route error";
 }

@@ -55,7 +55,8 @@ Router::Router(std::unique_ptr<RouteTable<NextHopId>> routes,
       domain_(domain),
       next_hops_(domain),
       desired_(max_next_hops + 1),
-      references_(max_next_hops + 1, 0) {}
+      references_(max_next_hops + 1, 0),
+      is_retiring_(max_next_hops + 1, false) {}
 
 Router::~Router() { next_hops_.ResetQuiesced(); }
 
@@ -76,11 +77,36 @@ void Router::PublishNextHops() {
   domain_.ReclaimReady();
 }
 
+size_t Router::CompleteRetirementsLocked() {
+  const size_t before = retiring_.size();
+  std::erase_if(retiring_, [&](const Retiring &r) {
+    if (!domain_.IsComplete(r.token)) {
+      return false;
+    }
+    desired_[r.id.value()].reset();
+    is_retiring_[r.id.value()] = false;
+    return true;
+  });
+  if (retiring_.size() != before) {
+    PublishNextHops();
+  }
+  return retiring_.size();
+}
+
+size_t Router::ReclaimRetired() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return CompleteRetirementsLocked();
+}
+
 std::expected<void, RouteError> Router::SetNextHop(NextHopId id,
                                                    const NextHop &hop) {
   std::lock_guard<std::mutex> lock(mutex_);
+  CompleteRetirementsLocked();
   if (!ValidId(id)) {
     return std::unexpected(RouteError::kInvalidId);
+  }
+  if (is_retiring_[id.value()]) {
+    return std::unexpected(RouteError::kNextHopRetiring);
   }
   desired_[id.value()] = hop;
   PublishNextHops();
@@ -89,10 +115,11 @@ std::expected<void, RouteError> Router::SetNextHop(NextHopId id,
 
 std::expected<void, RouteError> Router::RemoveNextHop(NextHopId id) {
   std::lock_guard<std::mutex> lock(mutex_);
+  CompleteRetirementsLocked();
   if (!ValidId(id)) {
     return std::unexpected(RouteError::kInvalidId);
   }
-  if (!desired_[id.value()]) {
+  if (!desired_[id.value()] || is_retiring_[id.value()]) {
     return std::unexpected(RouteError::kUnknownNextHop);
   }
   if (references_[id.value()] != 0) {
@@ -100,20 +127,22 @@ std::expected<void, RouteError> Router::RemoveNextHop(NextHopId id) {
   }
   // No route names `id` any more, but a reader may have looked one up just
   // before the last such route went and not yet loaded the next-hop table.
-  // Once every reader has passed a quiescent state, none can hold that id.
-  domain_.Synchronize();
-  desired_[id.value()].reset();
-  PublishNextHops();
+  // Keep it published until every reader has passed a quiescent state; a
+  // later control call drops it. No waiting here (a stalled worker must not
+  // stall the command path, and a transaction must not hold a blocking wait).
+  retiring_.push_back({id, domain_.StartGracePeriod()});
+  is_retiring_[id.value()] = true;
   return {};
 }
 
 std::expected<void, RouteError> Router::SetRoute(Ipv4Prefix prefix,
                                                  NextHopId hop) {
   std::lock_guard<std::mutex> lock(mutex_);
+  CompleteRetirementsLocked();
   if (!ValidId(hop)) {
     return std::unexpected(RouteError::kInvalidId);
   }
-  if (!desired_[hop.value()]) {
+  if (!desired_[hop.value()] || is_retiring_[hop.value()]) {
     return std::unexpected(RouteError::kUnknownNextHop);
   }
   const std::optional<NextHopId> previous = routes_->Find(prefix);
@@ -129,6 +158,7 @@ std::expected<void, RouteError> Router::SetRoute(Ipv4Prefix prefix,
 
 std::expected<void, RouteError> Router::RemoveRoute(Ipv4Prefix prefix) {
   std::lock_guard<std::mutex> lock(mutex_);
+  CompleteRetirementsLocked();
   const std::optional<NextHopId> previous = routes_->Find(prefix);
   if (!previous) {
     return std::unexpected(RouteError::kNotFound);
@@ -142,8 +172,11 @@ std::expected<void, RouteError> Router::RemoveRoute(Ipv4Prefix prefix) {
 
 size_t Router::next_hop_count() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return static_cast<size_t>(std::count_if(
-      desired_.begin(), desired_.end(), [](const auto &h) { return h; }));
+  size_t live = 0;
+  for (size_t i = 1; i < desired_.size(); i++) {
+    live += desired_[i] && !is_retiring_[i];
+  }
+  return live;
 }
 
 size_t Router::RouteReferences(NextHopId id) const {

@@ -115,9 +115,15 @@ inline std::expected<void, packet::MutationError> RewriteL2(
 //  - a next hop cannot be removed while any route names it, and its removal
 //    is published only after a grace period, so no reader can still be
 //    holding an id it looked up before the last route to it went away.
+//    Removal does not wait for that grace period: it records a token and
+//    returns. The entry stays published until the grace period completes;
+//    later control calls (or ReclaimRetired()) then drop it. Until then the
+//    id is *retiring*: routes cannot name it, and SetNextHop() refuses to
+//    reuse it (kNextHopRetiring), because a reader still holding the id from
+//    a removed route would otherwise reach the new next hop.
 //
-// Control methods are serialized internally and may block (the removal grace
-// period); they must not be called from a worker.
+// Control methods are serialized internally and never block on readers; they
+// must not be called from a worker.
 class Router {
  public:
   using Config = LpmRouteTable::Config;
@@ -136,6 +142,10 @@ class Router {
   // Adds next hop `id`, or replaces it (a neighbor update).
   std::expected<void, RouteError> SetNextHop(NextHopId id, const NextHop &hop);
   std::expected<void, RouteError> RemoveNextHop(NextHopId id);
+
+  // Drops retiring next hops whose grace period has completed, and returns
+  // how many are still waiting. Every control method does this first.
+  size_t ReclaimRetired();
 
   // Adds or re-points a route; /0 is the default route.
   std::expected<void, RouteError> SetRoute(Ipv4Prefix prefix, NextHopId hop);
@@ -188,6 +198,8 @@ class Router {
 
   // Builds and publishes the next-hop table from desired_.
   void PublishNextHops();
+  // ReclaimRetired() with mutex_ held.
+  size_t CompleteRetirementsLocked();
 
   std::unique_ptr<RouteTable<NextHopId>> routes_;
   rcu::RcuDomain &domain_;
@@ -196,6 +208,12 @@ class Router {
   mutable std::mutex mutex_;
   std::vector<std::optional<NextHop>> desired_;  // index = id
   std::vector<uint32_t> references_;             // routes per next hop
+  struct Retiring {
+    NextHopId id;
+    rcu::GracePeriod token;
+  };
+  std::vector<Retiring> retiring_;  // removed, still published
+  std::vector<bool> is_retiring_;   // index = id
 };
 
 }  // namespace bess::route
