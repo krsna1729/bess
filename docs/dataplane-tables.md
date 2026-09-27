@@ -258,10 +258,10 @@ reference to something missing.
 - **Cost:** a session of two meters, two actions and two rules, created
   and then removed, takes about 4.4 µs in process (226K sessions/s on a
   P-core, 216K with an idle reader online; 167K and 152K on an E-core).
-  With 1-4 busy readers doing chain lookups, the writer reaches 79-90K
-  sessions/s (P) and costs the readers 4-6% at 10K sessions/s and 9-15% at
-  full rate (`BM_LookupsUnderTransactions`; E-cores in D-021 amendment
-  3).
+  With 1-4 busy readers doing chain lookups, the writer sustains 100K
+  sessions/s at a 6-11% cost to the readers, and reaches 194-241K sessions/s
+  flat out on P-cores (117-168K on E-cores) (`BM_LookupsUnderTransactions`;
+  D-021 amendment 4).
 - Code: `core/dataplane/{resource.h, transaction_engine.{h,cc},
   slot_resource.h}`, `core/classifier/exact_rule_resource.h`; D-020,
   D-021.

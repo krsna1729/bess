@@ -4080,6 +4080,21 @@ rather than one call site).
          overhead.
      - The Router provider and the first module provider follow.
 
+110. **Transaction engine per-operation overhead trimmed (D-021 amendment
+     4).**
+     - **What changed** (profiled first; the tree maps with string keys
+       dominated): one registration record per resource, `Reserve()`
+       reporting existence and previous references, flat per-transaction
+       bookkeeping, and reused scratch.
+     - **ABBA:** sessions −35..−38%, one-op −24%, and per-session time
+       under busy readers −53..−57%, all 8/8.
+     - **The writer now sustains 100K sessions/s** with 1-4 busy readers on
+       P- and E-cores (flat out: 194-241K P, 117-168K E); packet-path cost
+       at 100K sessions/s is 6-11%. The §14.5 gap is closed.
+     - **A rejection-path leak** introduced by the rewrite was caught by an
+       existing test; a lifecycle test now guards every post-reservation
+       rejection reason.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -9997,9 +10012,10 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
 5. **Clean up the unused `found` warning** in
    `dataplane/update_scale_bench.cc` (Clang).
 
-- **Transaction engine per-operation overhead** (D-021 amendments 1 and
-  3; the session-rate gap under load is 79-90K/s against a 100K target):
-  307 ns
+- **Transaction engine per-operation overhead** -- done for now (D-021
+  amendment 4: −24..−57%, and 100K sessions/s under load met). The notes
+  below are kept for further trimming.
+  Originally 307 ns
   for a one-operation transaction against 44 ns for a direct table write.
   To try: interned resource handles instead of name lookups, typed ops
   instead of `std::any`, small-vector staging with no per-op heap

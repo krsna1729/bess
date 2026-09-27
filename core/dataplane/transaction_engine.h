@@ -40,6 +40,8 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "dataplane/resource.h"
@@ -151,6 +153,36 @@ class TransactionEngine {
   Result Reject(size_t n_ops, size_t failed, std::string error) const;
   size_t ReclaimRetiredLocked();
 
+  // Hash maps keyed by strings, looked up by string_view without a copy.
+  struct StringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view s) const noexcept {
+      return std::hash<std::string_view>{}(s);
+    }
+  };
+  template <typename V>
+  using StringMap =
+      std::unordered_map<std::string, V, StringHash, std::equal_to<>>;
+
+  // Everything the engine keeps about one registered resource.
+  struct Registration {
+    Resource *resource = nullptr;
+    // Its declared references, resolved once at registration.
+    std::vector<std::pair<std::string, Registration *>> deps;
+    // References to its keys held by other resources' values: key -> count.
+    StringMap<size_t> incoming;
+    // Retired objects of it handed to RCU and not yet destroyed.
+    std::atomic<size_t> outstanding{0};
+    size_t pending_removals = 0;  // cascade steps not yet run
+    bool touched = false;         // during Apply: needs EndTransaction()
+  };
+  static Registration &RegistrationOf(const Resource *resource) {
+    return *static_cast<Registration *>(resource->registration_);
+  }
+  // The registration a reference from `from` names, if `from` declared it.
+  static Registration *Resolve(const Registration &from,
+                               std::string_view resource);
+
   // One transaction's removals, stage by stage (ranks, highest first); the
   // next stage runs once `token` completes.
   struct Step {
@@ -163,18 +195,43 @@ class TransactionEngine {
     size_t next = 0;
   };
 
+  // Per-transaction working storage, kept across transactions so its
+  // capacity is reused (no allocation per Apply in the steady state).
+  struct KeyRef {
+    Registration *reg;
+    std::string_view key;
+    uint32_t op;
+  };
+  struct Delta {
+    Registration *target;
+    std::string_view key;
+    int64_t change;
+    uint32_t added_by;  // first operation adding a reference; kNone if none
+  };
+  static constexpr uint32_t kNone = ~uint32_t{0};
+  struct Staged {
+    size_t op;
+    std::unique_ptr<StagedOp> work;
+  };
+  struct Scratch {
+    std::vector<Registration *> reg;
+    std::vector<KeyRef> keys;
+    std::vector<Resource::Reservation> reservations;
+    std::vector<Staged> staged;
+    std::vector<uint32_t> removals_by_op;
+    std::vector<Delta> deltas;
+    std::vector<size_t> order;
+    std::vector<Registration *> touched;
+  };
+
   rcu::RcuDomain &domain_;
   mutable std::mutex mutex_;
-  std::map<std::string, Resource *> resources_;
-  std::map<Reference, size_t> references_;  // referent -> count
+  StringMap<std::unique_ptr<Registration>> resources_;
   std::vector<Cascade> cascades_;
-  std::map<const Resource *, size_t> pending_removals_;
-  // Per resource: retired objects handed to RCU and not yet destroyed.
-  std::map<const Resource *, std::unique_ptr<std::atomic<size_t>>>
-      outstanding_;
   // Objects that pending removal cascades will still retire (one per step).
   size_t deferred_objects_ = 0;
   uint64_t generation_ = 0;
+  Scratch scratch_;
 };
 
 }  // namespace dataplane

@@ -227,6 +227,11 @@ class Resource {
     // References the new value holds (upserts).
     std::vector<Reference> references;
     Footprint footprint;
+    // Whether the key existed before the transaction, and the references its
+    // value held then. The resource found the key anyway; reporting it here
+    // saves the engine two more lookups per operation.
+    bool existed = false;
+    std::vector<Reference> previous_references;
   };
 
   // `references`: the resources this one's values may refer to. They must be
@@ -293,6 +298,7 @@ class Resource {
   std::string name_;
   std::vector<std::string> declared_;
   int rank_ = 0;
+  void *registration_ = nullptr;  // the engine's record for it
 };
 
 }  // namespace dataplane

@@ -1594,6 +1594,62 @@ creates one session and removes the oldest per iteration. Native release,
   216K was with an idle reader and a smaller table. The engine's per-op
   overhead (§31.4) is the lever to work on first.
 
+**Amendment 4 (2026-09-27): per-operation overhead trimmed, and the session-rate
+gap closed.**
+
+- **Profiled first** (`perf`, `BM_SingleRule`, the session benchmark).
+  String-keyed `std::map`s dominated: `Reference` holds two strings, so the
+  per-transaction maps and the persistent ledger paid for tree nodes,
+  `memcmp` and `malloc`/`free` on every operation. Each operation also
+  checked its key's existence up to three times, each an `rte_hash`
+  lookup, and every `Apply` allocated fresh scratch vectors.
+- **Changes** (the public API is unchanged):
+  - one `Registration` record per resource: its dependencies resolved to
+    pointers at registration, its incoming-reference ledger as a hash map
+    looked up by `string_view`, its destructor counter and pending-removal
+    count. It replaces four maps.
+  - `Reservation` reports `existed` and `previous_references`, since the
+    resource found the key anyway.
+  - per-transaction duplicate detection and reference deltas are flat
+    vectors, sorted and merged once.
+  - scratch storage is reused across transactions.
+- **A bug found and fixed on the way.** Rejections decided after an
+  operation's own `Reserve()` (an undeclared reference, a reference into
+  an immediate-erase resource) returned before that operation joined the
+  abort list, leaking its pending key.
+  `ReferencesToAnImmediateEraseResourceAreRefused` caught it. The new
+  lifecycle test `RejectionsAfterReservationUndoTheirOwnReservation` guards
+  every post-reservation rejection reason; re-introducing the bug fails
+  it.
+- **ABBA** (8 rounds, against 8db4a3ea, native release, isolated):
+
+  | | P-cores (0,2,4,6,8) | E-cores (12-16) |
+  |---|---|---|
+  | session, create + remove | −35.5% (8/8) | −38.1% (8/8) |
+  | one-operation transaction | −24.4% (8/8) | −24.2% (8/8) |
+  | session with an idle reader | −35.0% (8/8) | −35.7% (8/8) |
+  | per session, 1 busy reader | −55.1% (8/8) | −57.3% (8/8) |
+  | per session, 4 busy readers | −53.2% (8/8) | −54.2% (8/8) |
+
+- **Scaling with the trimmed engine** (one run, M lookups/s per reader):
+
+  | CPUs | readers | none | 10K sess/s | 100K sess/s | flat out | sessions/s flat out |
+  |---|---|---|---|---|---|---|
+  | P | 1 | 56.5 | 52.8 (−7%) | 50.1 (−11%) | 46.5 (−18%) | 241K |
+  | | 4 | 49.3 (197) | 47.2 (−4%) | 45.6 (−8%) | 44.8 (−9%) | 194K |
+  | E | 1 | 33.6 | 32.9 (−2%) | 31.6 (−6%) | 31.0 (−8%) | 168K |
+  | | 4 | 29.2 (117) | 28.3 (−3%) | 27.1 (−7%) | 27.8 (−5%) | 117K |
+
+  The §14.5 target of 100K sessions/s is now met with 1-4 busy readers on
+  both core types. At that rate (about 1.2M table operations/s) readers pay
+  6-11%. Absolute baselines differ from amendment 3's run (machine-level
+  variance; the engine plays no part at rate 0), so compare only within a
+  run, or the ABBA table.
+- **Evidence of correctness:** 18 engine tests and 8 lifecycle tests pass,
+  the TSan harness is clean (its writer now completes ~31K transactions
+  per run against ~22K), and the model-based random lifecycle is
+  unchanged.
+
 **Deferred (next increments):**
 
 - Router and the modules as resource providers;

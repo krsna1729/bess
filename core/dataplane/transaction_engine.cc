@@ -31,7 +31,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <set>
 #include <utility>
 
 #include <glog/logging.h>
@@ -45,8 +44,8 @@ void (*g_publish_window_hook)(bool entering) = nullptr;
 
 namespace {
 
-std::string Describe(const std::string &resource, const ResourceKey &key) {
-  std::string out = resource + "/";
+std::string Describe(std::string_view resource, std::string_view key) {
+  std::string out = std::string(resource) + "/";
   char byte[4];
   for (unsigned char c : key) {
     std::snprintf(byte, sizeof(byte), "%02x", c);
@@ -77,6 +76,16 @@ class AbortGuard {
 
 }  // namespace
 
+TransactionEngine::Registration *TransactionEngine::Resolve(
+    const Registration &from, std::string_view resource) {
+  for (const auto &[name, reg] : from.deps) {
+    if (name == resource) {
+      return reg;
+    }
+  }
+  return nullptr;
+}
+
 std::expected<void, std::string> TransactionEngine::Register(
     Resource *resource) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -84,6 +93,8 @@ std::expected<void, std::string> TransactionEngine::Register(
     return std::unexpected("resource '" + resource->name() +
                            "' is already registered");
   }
+  auto reg = std::make_unique<Registration>();
+  reg->resource = resource;
   int rank = 0;
   for (const std::string &dep : resource->declared_references()) {
     if (dep == resource->name()) {
@@ -95,7 +106,8 @@ std::expected<void, std::string> TransactionEngine::Register(
                              "' references '" + dep +
                              "', which is not registered (register it first)");
     }
-    rank = std::max(rank, it->second->rank() + 1);
+    rank = std::max(rank, it->second->resource->rank() + 1);
+    reg->deps.emplace_back(dep, it->second.get());
   }
   if (!resource->declared_references().empty() && resource->LiveCount() != 0) {
     return std::unexpected("resource '" + resource->name() +
@@ -103,8 +115,8 @@ std::expected<void, std::string> TransactionEngine::Register(
                            "existing references are unknown to the engine");
   }
   resource->rank_ = rank;
-  resources_.emplace(resource->name(), resource);
-  outstanding_.emplace(resource, std::make_unique<std::atomic<size_t>>(0));
+  resource->registration_ = reg.get();
+  resources_.emplace(resource->name(), std::move(reg));
   return {};
 }
 
@@ -115,28 +127,26 @@ std::expected<void, std::string> TransactionEngine::Unregister(
   if (res == resources_.end()) {
     return std::unexpected("resource '" + name + "' is not registered");
   }
+  Registration &reg = *res->second;
   for (const auto &[other_name, other] : resources_) {
-    for (const std::string &dep : other->declared_references()) {
-      if (dep == name) {
-        return std::unexpected("resource '" + other_name +
-                               "' may reference '" + name +
-                               "' (unregister it first)");
-      }
+    if (Resolve(*other, name) != nullptr) {
+      return std::unexpected("resource '" + other_name +
+                             "' may reference '" + name +
+                             "' (unregister it first)");
     }
   }
-  if (res->second->LiveCount() != 0) {
+  if (reg.resource->LiveCount() != 0) {
     return std::unexpected("resource '" + name + "' still has " +
-                           std::to_string(res->second->LiveCount()) +
+                           std::to_string(reg.resource->LiveCount()) +
                            " live key(s)");
   }
-  auto it = references_.lower_bound(Reference{name, {}});
-  if (it != references_.end() && it->first.resource == name) {
+  if (!reg.incoming.empty()) {
     return std::unexpected("keys of '" + name + "' are still referenced");
   }
   // Pending removal steps capture this resource's tables: unregistering
   // (after which the module may destroy them) must wait until they ran.
   ReclaimRetiredLocked();
-  if (pending_removals_.contains(res->second)) {
+  if (reg.pending_removals != 0) {
     return std::unexpected("removals of '" + name +
                            "' are still waiting for readers");
   }
@@ -144,13 +154,12 @@ std::expected<void, std::string> TransactionEngine::Unregister(
   // the resource's module (the deleter it instantiated); it must not go
   // before the last of them has run.
   domain_.ReclaimReady();
-  std::atomic<size_t> &outstanding = *outstanding_.at(res->second);
-  if (const size_t left = outstanding.load(std::memory_order_acquire);
+  if (const size_t left = reg.outstanding.load(std::memory_order_acquire);
       left != 0) {
     return std::unexpected(std::to_string(left) + " retired object(s) of '" +
                            name + "' are still waiting for readers");
   }
-  outstanding_.erase(res->second);
+  reg.resource->registration_ = nullptr;
   resources_.erase(res);
   return {};
 }
@@ -163,8 +172,12 @@ uint64_t TransactionEngine::generation() const {
 size_t TransactionEngine::ReferenceCount(const std::string &resource,
                                          const ResourceKey &key) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  auto it = references_.find(Reference{resource, key});
-  return it == references_.end() ? 0 : it->second;
+  auto res = resources_.find(resource);
+  if (res == resources_.end()) {
+    return 0;
+  }
+  auto it = res->second->incoming.find(std::string_view(key));
+  return it == res->second->incoming.end() ? 0 : it->second;
 }
 
 size_t TransactionEngine::ReclaimRetired() {
@@ -191,13 +204,12 @@ size_t TransactionEngine::ReclaimRetiredLocked() {
       Retirer retirer;
       retirer.retire_.reserve(stage.size());
       for (Step &step : stage) {
+        Registration &owner = RegistrationOf(step.owner);
         retirer.owner_ = step.owner;
-        retirer.outstanding_ = outstanding_.at(step.owner).get();
+        retirer.outstanding_ = &owner.outstanding;
         step.fn(retirer);
         deferred_objects_--;
-        if (--pending_removals_[step.owner] == 0) {
-          pending_removals_.erase(step.owner);
-        }
+        owner.pending_removals--;
       }
       cascade.next++;
       // The next stage waits a grace period from here, and what this stage
@@ -242,74 +254,130 @@ TransactionEngine::Result TransactionEngine::Apply(
     return result;
   }
 
+  // Working storage: cleared, capacity kept from earlier transactions.
+  Scratch &w = scratch_;
+  w.reg.assign(n, nullptr);
+  w.keys.clear();
+  w.reservations.clear();
+  w.reservations.reserve(n);  // stable elements: views point into them
+  w.staged.clear();
+  w.removals_by_op.assign(n, 0);
+  w.deltas.clear();
+  w.touched.clear();
+
   // -- structure: known resources, one operation per key --------------------
-  std::vector<Resource *> resource(n);
-  std::map<Reference, size_t> op_on;  // (resource, key) -> operation index
   for (size_t i = 0; i < n; i++) {
     const Op &op = ops[i];
-    auto it = resources_.find(op.resource);
+    auto it = resources_.find(std::string_view(op.resource));
     if (it == resources_.end()) {
       return Reject(n, i, "unknown resource '" + op.resource + "'");
     }
-    resource[i] = it->second;
+    w.reg[i] = it->second.get();
     if (op.kind == OpKind::kUpsert && !op.value.has_value()) {
       return Reject(n, i, "upsert without a value");
     }
-    if (!op_on.emplace(Reference{op.resource, op.key}, i).second) {
-      return Reject(n, i,
-                    "second operation on " + Describe(op.resource, op.key) +
+    w.keys.push_back(KeyRef{w.reg[i], op.key, static_cast<uint32_t>(i)});
+  }
+  auto key_less = [](const KeyRef &a, const KeyRef &b) {
+    return a.reg != b.reg ? a.reg < b.reg
+                          : a.key != b.key ? a.key < b.key : a.op < b.op;
+  };
+  std::sort(w.keys.begin(), w.keys.end(), key_less);
+  {
+    // The first operation, in request order, that repeats a key.
+    uint32_t duplicate = kNone;
+    for (size_t k = 1; k < w.keys.size(); k++) {
+      if (w.keys[k].reg == w.keys[k - 1].reg &&
+          w.keys[k].key == w.keys[k - 1].key) {
+        duplicate = std::min(duplicate, w.keys[k].op);
+      }
+    }
+    if (duplicate != kNone) {
+      return Reject(n, duplicate,
+                    "second operation on " +
+                        Describe(ops[duplicate].resource, ops[duplicate].key) +
                         " in one transaction");
     }
   }
+  // The operation on (reg, key) in this transaction, if any.
+  auto op_on = [&](Registration *reg, std::string_view key) -> uint32_t {
+    auto it = std::lower_bound(
+        w.keys.begin(), w.keys.end(), KeyRef{reg, key, 0}, key_less);
+    return it != w.keys.end() && it->reg == reg && it->key == key ? it->op
+                                                                  : kNone;
+  };
 
   // -- reserve: all fallible work, nothing visible ---------------------------
-  struct Staged {
-    size_t op;
-    std::unique_ptr<StagedOp> work;
-  };
-  std::vector<Staged> staged;
-  staged.reserve(n);
-  std::set<Resource *> touched;
   AbortGuard abort([&] {
-    for (auto it = staged.rbegin(); it != staged.rend(); ++it) {
+    for (auto it = w.staged.rbegin(); it != w.staged.rend(); ++it) {
       it->work->Abort();
     }
-    for (Resource *r : touched) {
-      r->EndTransaction();
+    for (Registration *r : w.touched) {
+      r->touched = false;
+      r->resource->EndTransaction();
     }
   });
 
-  Resource::Footprint footprint;          // summed over the transaction
-  std::vector<uint32_t> removals_by_op(n, 0);
-  std::map<Reference, int64_t> delta;     // referent -> reference change
-  std::map<Reference, size_t> added_by;   // referent -> first op naming it
+  Resource::Footprint footprint;  // summed over the transaction
   for (size_t i = 0; i < n; i++) {
     const Op &op = ops[i];
-    touched.insert(resource[i]);
-    auto reserved = resource[i]->Reserve(op);
+    Registration *reg = w.reg[i];
+    if (!reg->touched) {
+      reg->touched = true;
+      w.touched.push_back(reg);
+    }
+    auto reserved = reg->resource->Reserve(op);
     if (!reserved) {
       return Reject(n, i, std::move(reserved.error()));
     }
+    w.reservations.push_back(std::move(*reserved));
+    Resource::Reservation &r = w.reservations.back();
+    // Aborted with the rest from here on: any rejection below must undo
+    // this operation's reservation too (a pending key, say).
+    w.staged.push_back(Staged{i, std::move(r.staged)});
     if (op.kind == OpKind::kErase) {
       // Checked below even if no reference to it changes in this transaction.
-      delta.try_emplace(Reference{op.resource, op.key}, 0);
+      w.deltas.push_back(Delta{reg, op.key, 0, kNone});
     }
-    if (resource[i]->Contains(op.key)) {
-      for (const Reference &ref : resource[i]->ReferencesOf(op.key)) {
-        delta[ref]--;
+    if (r.existed) {
+      for (const Reference &ref : r.previous_references) {
+        Registration *target = Resolve(*reg, ref.resource);
+        DCHECK(target != nullptr) << "a stored value names an undeclared "
+                                     "resource";
+        if (target != nullptr) {
+          w.deltas.push_back(Delta{target, ref.key, -1, kNone});
+        }
       }
     }
     if (op.kind == OpKind::kUpsert) {
-      for (const Reference &ref : reserved->references) {
-        delta[ref]++;
-        added_by.emplace(ref, i);
+      for (const Reference &ref : r.references) {
+        // Only declared references: the publication order is derived from
+        // the declarations, so an undeclared one could publish before its
+        // referent.
+        Registration *target = Resolve(*reg, ref.resource);
+        if (target == nullptr) {
+          return Reject(n, i,
+                        "undeclared reference: '" + reg->resource->name() +
+                            "' may not reference '" + ref.resource +
+                            "' (declare it when constructing the resource)");
+        }
+        // Holds by construction (declared references are registered first
+        // and rank below); checked because publication order depends on it.
+        DCHECK_LT(target->resource->rank(), reg->resource->rank());
+        if (!target->resource->DefersErase()) {
+          return Reject(n, i,
+                        "resource '" + ref.resource +
+                            "' cannot be referenced: its erases take effect "
+                            "at once (Resource::DefersErase)");
+        }
+        w.deltas.push_back(
+            Delta{target, ref.key, +1, static_cast<uint32_t>(i)});
       }
     }
-    footprint.retires += reserved->footprint.retires;
-    footprint.removals += reserved->footprint.removals;
-    footprint.callbacks += reserved->footprint.callbacks;
-    removals_by_op[i] = reserved->footprint.removals;
-    staged.push_back(Staged{i, std::move(reserved->staged)});
+    footprint.retires += r.footprint.retires;
+    footprint.removals += r.footprint.removals;
+    footprint.callbacks += r.footprint.callbacks;
+    w.removals_by_op[i] = r.footprint.removals;
   }
 
   // -- bounded backpressure -------------------------------------------------
@@ -338,79 +406,72 @@ TransactionEngine::Result TransactionEngine::Apply(
   }
 
   // -- references the transaction leaves behind -----------------------------
-  for (const auto &[ref, op_index] : added_by) {
-    auto target = resources_.find(ref.resource);
-    if (target == resources_.end()) {
-      return Reject(n, op_index,
-                    "references unknown resource '" + ref.resource + "'");
+  // Merge the deltas per referent: sorted, then one entry per (target, key)
+  // with the summed change and the first operation that added a reference.
+  std::sort(w.deltas.begin(), w.deltas.end(),
+            [](const Delta &a, const Delta &b) {
+              return a.target != b.target ? a.target < b.target
+                                          : a.key < b.key;
+            });
+  {
+    size_t out = 0;
+    for (size_t k = 0; k < w.deltas.size(); k++) {
+      if (out != 0 && w.deltas[out - 1].target == w.deltas[k].target &&
+          w.deltas[out - 1].key == w.deltas[k].key) {
+        w.deltas[out - 1].change += w.deltas[k].change;
+        w.deltas[out - 1].added_by =
+            std::min(w.deltas[out - 1].added_by, w.deltas[k].added_by);
+      } else {
+        w.deltas[out++] = w.deltas[k];
+      }
     }
-    // Only declared references: the publication order is derived from the
-    // declarations, so an undeclared one could publish before its referent.
-    const Resource *referrer = resource[op_index];
-    const auto &declared = referrer->declared_references();
-    if (std::find(declared.begin(), declared.end(), ref.resource) ==
-        declared.end()) {
-      return Reject(n, op_index,
-                    "undeclared reference: '" + referrer->name() +
-                        "' may not reference '" + ref.resource +
-                        "' (declare it when constructing the resource)");
-    }
-    // Holds by construction (declared references are registered first and
-    // rank below); checked because publication order depends on it.
-    DCHECK_LT(target->second->rank(), referrer->rank());
-    if (!target->second->DefersErase()) {
-      return Reject(n, op_index,
-                    "resource '" + ref.resource +
-                        "' cannot be referenced: its erases take effect at "
-                        "once (Resource::DefersErase)");
-    }
+    w.deltas.resize(out);
   }
-  for (const auto &[ref, d] : delta) {
-    auto current = references_.find(ref);
+  for (const Delta &d : w.deltas) {
+    auto current = d.target->incoming.find(d.key);
     const int64_t after =
-        (current == references_.end() ? 0
-                                      : static_cast<int64_t>(current->second)) +
-        d;
+        (current == d.target->incoming.end()
+             ? 0
+             : static_cast<int64_t>(current->second)) +
+        d.change;
     if (after <= 0) {
       continue;
     }
-    auto target = resources_.find(ref.resource);
-    auto op = op_on.find(ref);
-    bool exists_after;
-    if (op != op_on.end()) {
-      exists_after = ops[op->second].kind == OpKind::kUpsert;
-    } else {
-      exists_after =
-          target != resources_.end() && target->second->Contains(ref.key);
-    }
+    const uint32_t op = op_on(d.target, d.key);
+    const bool exists_after = op != kNone
+                                  ? ops[op].kind == OpKind::kUpsert
+                                  : d.target->resource->Contains(
+                                        ResourceKey(d.key));
     if (exists_after) {
       continue;
     }
-    if (op != op_on.end()) {
+    if (op != kNone) {
       // The transaction erases a key that is still referenced afterwards.
-      return Reject(n, op->second,
-                    Describe(ref.resource, ref.key) + " is still referenced " +
-                        std::to_string(after) + " time(s)");
+      return Reject(n, op,
+                    Describe(d.target->resource->name(), d.key) +
+                        " is still referenced " + std::to_string(after) +
+                        " time(s)");
     }
-    return Reject(n, added_by.at(ref),
-                  "references missing " + Describe(ref.resource, ref.key));
+    return Reject(n, d.added_by,
+                  "references missing " +
+                      Describe(d.target->resource->name(), d.key));
   }
 
   // -- commit bookkeeping, allocated before anything is visible -------------
-  std::vector<size_t> order(staged.size());
-  for (size_t i = 0; i < order.size(); i++) {
-    order[i] = i;
+  w.order.resize(w.staged.size());
+  for (size_t i = 0; i < w.order.size(); i++) {
+    w.order[i] = i;
   }
-  std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-    const Op &x = ops[staged[a].op];
-    const Op &y = ops[staged[b].op];
+  std::stable_sort(w.order.begin(), w.order.end(), [&](size_t a, size_t b) {
+    const Op &x = ops[w.staged[a].op];
+    const Op &y = ops[w.staged[b].op];
     const bool xu = x.kind == OpKind::kUpsert;
     const bool yu = y.kind == OpKind::kUpsert;
     if (xu != yu) {
       return xu;  // upserts before erases
     }
-    const int rx = resource[staged[a].op]->rank();
-    const int ry = resource[staged[b].op]->rank();
+    const int rx = w.reg[w.staged[a].op]->resource->rank();
+    const int ry = w.reg[w.staged[b].op]->resource->rank();
     return xu ? rx < ry : rx > ry;
   });
 
@@ -423,22 +484,20 @@ TransactionEngine::Result TransactionEngine::Apply(
   retirer.after_.reserve(footprint.callbacks);
   retirer.removals_.reserve(footprint.removals);
   domain_.ReserveRetirements(footprint.retires);
-  // Ledger nodes for new references, so publishing only updates counts.
-  for (const auto &[ref, d] : delta) {
-    if (d > 0) {
-      references_.try_emplace(ref, 0);
+  // Ledger entries for new references, so publishing only updates counts.
+  for (const Delta &d : w.deltas) {
+    if (d.change > 0) {
+      d.target->incoming.try_emplace(std::string(d.key), 0);
     }
   }
   // The removal cascade's skeleton, from the declared removals: one stage
-  // per rank, highest first, sized exactly; a pending-removal counter per
-  // owning resource.
+  // per rank, highest first, sized exactly.
   std::vector<int> stage_ranks;
   Cascade cascade{0, {}, 0};
   if (footprint.removals != 0) {
     for (size_t i = 0; i < n; i++) {
-      if (removals_by_op[i] != 0) {
-        stage_ranks.push_back(resource[i]->rank());
-        pending_removals_.try_emplace(resource[i], 0);
+      if (w.removals_by_op[i] != 0) {
+        stage_ranks.push_back(w.reg[i]->resource->rank());
       }
     }
     std::sort(stage_ranks.begin(), stage_ranks.end(), std::greater<int>());
@@ -448,8 +507,8 @@ TransactionEngine::Result TransactionEngine::Apply(
     for (size_t s_i = 0; s_i < stage_ranks.size(); s_i++) {
       size_t steps = 0;
       for (size_t i = 0; i < n; i++) {
-        if (resource[i]->rank() == stage_ranks[s_i]) {
-          steps += removals_by_op[i];
+        if (w.reg[i]->resource->rank() == stage_ranks[s_i]) {
+          steps += w.removals_by_op[i];
         }
       }
       cascade.stages[s_i].reserve(steps);
@@ -462,24 +521,24 @@ TransactionEngine::Result TransactionEngine::Apply(
     internal::g_publish_window_hook(true);
   }
   retirer.enforce_ = true;
-  for (size_t i : order) {
-    Resource *owner = resource[staged[i].op];
-    retirer.rank_ = owner->rank();
-    retirer.owner_ = owner;
-    retirer.owner_name_ = owner->name().c_str();
-    retirer.outstanding_ = outstanding_.at(owner).get();
-    staged[i].work->Publish(retirer);
+  for (size_t i : w.order) {
+    Registration *owner = w.reg[w.staged[i].op];
+    retirer.rank_ = owner->resource->rank();
+    retirer.owner_ = owner->resource;
+    retirer.owner_name_ = owner->resource->name().c_str();
+    retirer.outstanding_ = &owner->outstanding;
+    w.staged[i].work->Publish(retirer);
   }
   retirer.enforce_ = false;
   abort.Dismiss();
-  for (const auto &[ref, d] : delta) {
-    auto it = references_.find(ref);
-    if (it == references_.end()) {
-      continue;  // d <= 0 for a key with no references: nothing to record
+  for (const Delta &d : w.deltas) {
+    auto it = d.target->incoming.find(d.key);
+    if (it == d.target->incoming.end()) {
+      continue;  // change <= 0 for a key with no references: nothing to record
     }
-    const int64_t after = static_cast<int64_t>(it->second) + d;
+    const int64_t after = static_cast<int64_t>(it->second) + d.change;
     if (after <= 0) {
-      references_.erase(it);
+      d.target->incoming.erase(it);
     } else {
       it->second = static_cast<size_t>(after);
     }
@@ -492,19 +551,18 @@ TransactionEngine::Result TransactionEngine::Apply(
       s_i++;
     }
     cascade.stages[s_i].push_back(Step{removal.owner, std::move(removal.step)});
-    pending_removals_.find(removal.owner)->second++;
+    RegistrationOf(removal.owner).pending_removals++;
     deferred_objects_++;
   }
   retirer.removals_.clear();
   generation_++;
 
   // -- committed: resources' own cleanup and asynchronous reclamation --------
-  for (Resource *r : touched) {
-    r->EndTransaction();
+  for (Registration *r : w.touched) {
+    r->touched = false;
+    r->resource->EndTransaction();
   }
-  for (auto it = pending_removals_.begin(); it != pending_removals_.end();) {
-    it = it->second == 0 ? pending_removals_.erase(it) : std::next(it);
-  }
+  w.touched.clear();
   std::erase_if(cascade.stages, [](const auto &stage) { return stage.empty(); });
   if (!retirer.empty() || !cascade.stages.empty()) {
     const rcu::GracePeriod token = domain_.StartGracePeriod();

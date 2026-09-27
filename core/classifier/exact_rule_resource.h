@@ -120,11 +120,17 @@ class ExactRuleResource final : public dataplane::Resource {
                              " bytes, the table's are " +
                              std::to_string(table_.key_len()));
     }
+    const std::optional<uint64_t> previous = Find(op.key);
     if (op.kind == dataplane::OpKind::kErase) {
-      if (!Contains(op.key)) {
+      if (!previous) {
         return std::unexpected("not found");
       }
-      return Reservation{std::make_unique<EraseOp>(table_, op.key), {}};
+      Reservation erase{std::make_unique<EraseOp>(table_, op.key), {}};
+      erase.existed = true;
+      if (references_) {
+        erase.previous_references = references_(*previous);
+      }
+      return erase;
     }
     const uint64_t *value = std::any_cast<uint64_t>(&op.value);
     if (value == nullptr) {
@@ -140,10 +146,14 @@ class ExactRuleResource final : public dataplane::Resource {
     // insertion used to leave one behind).
     auto upsert = std::make_unique<UpsertOp>(table_, op.key, *value);
     std::vector<dataplane::Reference> references;
+    std::vector<dataplane::Reference> previous_references;
     if (references_) {
       references = references_(*value);
+      if (previous) {
+        previous_references = references_(*previous);
+      }
     }
-    if (!Contains(op.key)) {
+    if (!previous) {
       // Headroom for deletes still in the defer queue (D-010), then place
       // the key for real, invisible to readers.
       table_.Reclaim();
@@ -160,7 +170,10 @@ class ExactRuleResource final : public dataplane::Resource {
       }
       upsert->MarkInsertedPending();  // Abort() now erases it
     }
-    return Reservation{std::move(upsert), std::move(references), {}};
+    Reservation reservation{std::move(upsert), std::move(references), {}};
+    reservation.existed = previous.has_value();
+    reservation.previous_references = std::move(previous_references);
+    return reservation;
   }
 
  private:

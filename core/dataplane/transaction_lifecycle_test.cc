@@ -360,6 +360,52 @@ TEST_F(LifecycleTest, ThrowingReferenceCallbackLeavesNoPendingKey) {
   EXPECT_EQ(Apply({Rule(10, 1)}).outcome, Outcome::kApplied);
 }
 
+// Rejections decided after an operation's own Reserve() succeeded -- its
+// references are refused, or leave something dangling -- must undo that
+// operation's reservation too (a pending rule key), not only earlier ones.
+TEST_F(LifecycleTest, RejectionsAfterReservationUndoTheirOwnReservation) {
+  auto other_table = ConcurrentExactTable::Create(8, 768, domain_);
+  ASSERT_TRUE(other_table.has_value());
+  // Names "rules" (declared, but rules erase at once: refused) and "meters"
+  // (never declared: refused).
+  ExactRuleResource refs_rules(
+      "refs_rules", **other_table,
+      [](uint64_t v) {
+        std::vector<Reference> refs;
+        if (v == 1) {
+          refs.push_back(Reference{"rules", EncodeKey(v)});
+        } else {
+          refs.push_back(Reference{"meters", EncodeKey(MeterId(1))});
+        }
+        return refs;
+      },
+      std::vector<std::string>{"rules"});
+  ASSERT_TRUE(engine_.Register(&refs_rules));
+  ASSERT_EQ(Apply({Met(1, 1), Act(1, 1, 1), Rule(1, 1)}).outcome,
+            Outcome::kApplied);
+  const Snapshot before = Take();
+  const std::vector<std::vector<Op>> cases = {
+      // a reference into an immediate-erase resource
+      {Op::Upsert("refs_rules", EncodeKey(uint64_t{7}), std::any(uint64_t{1}))},
+      // an undeclared reference
+      {Op::Upsert("refs_rules", EncodeKey(uint64_t{8}), std::any(uint64_t{2}))},
+      // a missing referent, after an earlier pending key
+      {Rule(20, 1), Rule(21, 9)},
+      // erasing a referenced key, with a new pending key in the same batch
+      {Rule(22, 1), EraseAct(1)},
+  };
+  for (size_t c = 0; c < cases.size(); c++) {
+    SCOPED_TRACE(c);
+    const auto r = Apply(cases[c]);
+    ASSERT_EQ(r.outcome, Outcome::kRejected);
+    table_->ReclaimAll();
+    (*other_table)->ReclaimAll();
+    EXPECT_EQ(Take(), before);
+    EXPECT_EQ((*other_table)->size(), 0u) << "a pending key leaked";
+  }
+  ASSERT_TRUE(engine_.Unregister("refs_rules"));
+}
+
 // -- 3. deferred-removal backlog (review P0-2) --------------------------------
 
 // A single resource with room for many objects and no references.
