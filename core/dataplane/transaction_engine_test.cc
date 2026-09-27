@@ -821,8 +821,19 @@ TEST_F(TransactionEngineTest, UnregisterWaitsForPendingRemovals) {
               Outcome::kApplied);
     EXPECT_FALSE(engine_.Unregister("temp_meters"))
         << "unregistered with a removal step still pending (reader online)";
+    // One quiescent state: the removal step runs and hands the object to
+    // RCU, whose destructor -- code of the resource's module -- still waits
+    // for another grace period.
     domain_.Quiescent(kReader);
-    EXPECT_TRUE(engine_.Unregister("temp_meters"));
+    auto un = engine_.Unregister("temp_meters");
+    EXPECT_FALSE(un) << "unregistered while a retired object's destructor "
+                        "was still pending";
+    if (!un) {
+      EXPECT_NE(un.error().find("retired object"), std::string::npos)
+          << un.error();
+    }
+    domain_.Quiescent(kReader);
+    ASSERT_TRUE(engine_.Unregister("temp_meters"));
     // `table` and `res` are destroyed here: nothing may still point at them.
   }
   EXPECT_EQ(engine_.ReclaimRetired(), 0u);

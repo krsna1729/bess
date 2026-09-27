@@ -31,6 +31,7 @@
 #define BESS_DATAPLANE_RESOURCE_H_
 
 #include <any>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -39,6 +40,8 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+
+#include <glog/logging.h>
 
 #include "rcu/rcu_domain.h"
 
@@ -114,14 +117,20 @@ class Resource;
 // anything up before the publish finishes with it first).
 class Retirer {
  public:
+  // Each call during publication must fit the footprint its operation
+  // declared in Reserve() (Resource::Footprint): the engine reserved exactly
+  // that, so publication neither allocates nor meets an unplanned stage.
+  // Exceeding it is a bug in the resource and fatal.
   template <typename T>
   void Retire(std::unique_ptr<T> object) {
     if (object == nullptr) {
       return;
     }
-    retire_.push_back([o = std::move(object)](rcu::RcuDomain &domain,
-                                              rcu::GracePeriod token) mutable {
-      domain.Retire(token, std::move(o));
+    CheckRoom(retire_.size(), retire_.capacity(), "Retire");
+    retire_.push_back([o = std::move(object), c = outstanding_](
+                          rcu::RcuDomain &domain,
+                          rcu::GracePeriod token) mutable {
+      domain.Retire(token, std::move(o), c);
     });
   }
 
@@ -133,12 +142,14 @@ class Retirer {
   // goes). The step receives a Retirer for whatever it replaces.
   // SlotResource's erase uses this to empty its slot.
   void RemoveLater(std::move_only_function<void(Retirer &)> step) {
+    CheckRoom(removals_.size(), removals_.capacity(), "RemoveLater");
     removals_.push_back({rank_, owner_, std::move(step)});
   }
 
   // Runs `fn(token)` once the transaction's grace period has started: for
   // bookkeeping that needs the token.
   void AfterGracePeriodStarts(std::move_only_function<void(rcu::GracePeriod)> fn) {
+    CheckRoom(after_.size(), after_.capacity(), "AfterGracePeriodStarts");
     after_.push_back(std::move(fn));
   }
 
@@ -152,6 +163,14 @@ class Retirer {
     const Resource *owner;  // Unregister() waits for its pending removals
     std::move_only_function<void(Retirer &)> step;
   };
+
+  void CheckRoom(size_t used, size_t capacity, const char *what) const {
+    if (enforce_ && used >= capacity) {
+      LOG(FATAL) << "resource '" << owner_name_
+                 << "' exceeded the footprint it declared in Reserve() ("
+                 << what << "): publication would allocate";
+    }
+  }
 
   void Finish(rcu::RcuDomain &domain, rcu::GracePeriod token) {
     for (auto &r : retire_) {
@@ -168,8 +187,14 @@ class Retirer {
       retire_;
   std::vector<std::move_only_function<void(rcu::GracePeriod)>> after_;
   std::vector<Removal> removals_;
-  int rank_ = 0;                     // of the operation publishing now
-  const Resource *owner_ = nullptr;  // (both set by the engine)
+  // Set by the engine for the operation (or removal step) running now.
+  int rank_ = 0;
+  const Resource *owner_ = nullptr;
+  const char *owner_name_ = "";
+  // The owner's count of retired objects not yet destroyed (see
+  // RcuDomain::Retire): Unregister() waits for it to reach zero.
+  std::atomic<size_t> *outstanding_ = nullptr;
+  bool enforce_ = false;  // during publication: capacity is the footprint
 };
 
 // Work a resource reserved for one operation: everything fallible is done,
@@ -188,10 +213,20 @@ class StagedOp {
 
 class Resource {
  public:
+  // Upper bounds on what an operation's Publish() will ask of the Retirer.
+  // The engine reserves exactly the sum over a transaction before publishing,
+  // and uses it for backpressure: nothing is inferred.
+  struct Footprint {
+    uint32_t retires = 0;    // Retirer::Retire (replaced objects)
+    uint32_t removals = 0;   // Retirer::RemoveLater (deferred removal steps)
+    uint32_t callbacks = 0;  // Retirer::AfterGracePeriodStarts
+  };
+
   struct Reservation {
     std::unique_ptr<StagedOp> staged;
     // References the new value holds (upserts).
     std::vector<Reference> references;
+    Footprint footprint;
   };
 
   // `references`: the resources this one's values may refer to. They must be

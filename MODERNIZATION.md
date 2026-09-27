@@ -4055,6 +4055,31 @@ rather than one call site).
        resource; routes with tbl8 reservation in prepare, per D-021
        amendment 2), then the modules.
 
+109. **G1.2b hardening round 3 and the lifecycle suite (D-021 amendment
+     3).**
+     - **Review findings,** each verified in the source, fixed, and
+       mutation-checked:
+       - deferred destructors now tracked per resource (Unregister waits);
+       - the aggregate deferred-removal backlog counted in admission and
+         bounded in the reclaimer;
+       - exception-safe exact-key preparation;
+       - an explicit per-operation publication footprint, with a
+         reservable RCU queue so even the post-commit handoff does not
+         allocate.
+     - **New adversarial suite:** faults at every reserve position,
+       throwing callbacks, backlog attacks, destructor lifetime, footprint
+       violation, and a 4000-transaction model-checked random lifecycle
+       with a stalling reader. All six mutations are caught.
+     - **Scaling benchmark:**
+       - linear reader scaling;
+       - 4-6% packet-path cost at 10K sessions/s on P-cores, 9-15% with
+         the writer flat out;
+       - E-cores 6-26%;
+       - **gap:** the writer reaches 79-90K sessions/s (P) with busy
+         readers, against a 100K target. Next: trim the engine's per-op
+         overhead.
+     - The Router provider and the first module provider follow.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -9972,7 +9997,9 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
 5. **Clean up the unused `found` warning** in
    `dataplane/update_scale_bench.cc` (Clang).
 
-- **Transaction engine per-operation overhead** (D-021 amendment): 307 ns
+- **Transaction engine per-operation overhead** (D-021 amendments 1 and
+  3; the session-rate gap under load is 79-90K/s against a 100K target):
+  307 ns
   for a one-operation transaction against 44 ns for a direct table write.
   To try: interned resource handles instead of name lookups, typed ops
   instead of `std::any`, small-vector staging with no per-op heap

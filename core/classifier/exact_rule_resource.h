@@ -133,7 +133,16 @@ class ExactRuleResource final : public dataplane::Resource {
     if (*value == kPending) {
       return std::unexpected("value is reserved (kPending)");
     }
-    bool inserted = false;
+    // Everything that can throw comes first -- the staged operation and the
+    // references -- so that placing the key, the one step with a physical
+    // effect, is the last thing that can fail: nothing can leak a pending key
+    // (external review: an allocation or reference-callback failure after the
+    // insertion used to leave one behind).
+    auto upsert = std::make_unique<UpsertOp>(table_, op.key, *value);
+    std::vector<dataplane::Reference> references;
+    if (references_) {
+      references = references_(*value);
+    }
     if (!Contains(op.key)) {
       // Headroom for deletes still in the defer queue (D-010), then place
       // the key for real, invisible to readers.
@@ -149,14 +158,9 @@ class ExactRuleResource final : public dataplane::Resource {
         return std::unexpected(
             "no room for this key (its buckets are full)");
       }
-      inserted = true;
+      upsert->MarkInsertedPending();  // Abort() now erases it
     }
-    Reservation reservation{
-        std::make_unique<UpsertOp>(table_, op.key, *value, inserted), {}};
-    if (references_) {
-      reservation.references = references_(*value);
-    }
-    return reservation;
+    return Reservation{std::move(upsert), std::move(references), {}};
   }
 
  private:
@@ -178,12 +182,9 @@ class ExactRuleResource final : public dataplane::Resource {
 
   class UpsertOp final : public dataplane::StagedOp {
    public:
-    UpsertOp(ConcurrentExactTable &table, std::string key, uint64_t value,
-             bool inserted_pending)
-        : table_(table),
-          key_(std::move(key)),
-          value_(value),
-          inserted_pending_(inserted_pending) {}
+    UpsertOp(ConcurrentExactTable &table, std::string key, uint64_t value)
+        : table_(table), key_(std::move(key)), value_(value) {}
+    void MarkInsertedPending() noexcept { inserted_pending_ = true; }
     void Publish(dataplane::Retirer &) noexcept override {
       // The key is present (placed in Reserve, or already there): this is an
       // in-place value store, which cannot fail.
@@ -200,7 +201,7 @@ class ExactRuleResource final : public dataplane::Resource {
     ConcurrentExactTable &table_;
     std::string key_;
     uint64_t value_;
-    bool inserted_pending_;
+    bool inserted_pending_ = false;
   };
 
   class EraseOp final : public dataplane::StagedOp {

@@ -41,6 +41,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -307,5 +308,191 @@ void BM_SessionWithOnlineReader(benchmark::State &state) {
   domain.Drain();
 }
 BENCHMARK(BM_SessionWithOnlineReader)->UseRealTime();
+
+// Scaling: packet-path lookups on several workers while transactions change
+// the tables. Each reader, on its own CPU, resolves batches of 32 keys the way
+// a pipeline would -- rte_hash rule lookup (pending keys dropped), then the
+// action slot, then the meter slot -- and reports quiescence after each
+// batch. Half of a 65K-session population is live, so batches mix hits and
+// misses. The writer (the benchmark thread) replaces sessions at a paced rate
+// (0 = no transactions, the baseline) or as fast as it can (-1): each
+// iteration establishes one session and releases the oldest.
+//
+// Reported: lookups per second per reader and in total (the cost of
+// transactions to the packet path) and sessions per second achieved.
+void BM_LookupsUnderTransactions(benchmark::State &state) {
+  const int readers = static_cast<int>(state.range(0));
+  const int64_t rate = state.range(1);  // sessions/s; 0 none; -1 max
+  constexpr uint32_t kSessions = 65536;
+  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+
+  auto table = *ConcurrentExactTable::Create(
+      8, ConcurrentExactTable::CapacityFor(kSessions * 2 + 64), domain);
+  SlotTable<MeterId, Meter> meters(kSessions * 2 + 2);
+  SlotTable<ActionId, Action> actions(kSessions * 2 + 2);
+  SlotResource<MeterId, Meter> meters_res("meters", meters);
+  SlotResource<ActionId, Action> actions_res(
+      "actions", actions,
+      [](const Action &a) {
+        return std::vector<Reference>{{"meters", EncodeKey(a.meter)}};
+      },
+      {"meters"});
+  ExactRuleResource rules_res(
+      "rules", *table,
+      [](uint64_t v) {
+        return std::vector<Reference>{
+            {"actions", EncodeKey(ActionId(static_cast<uint32_t>(v)))}};
+      },
+      {"actions"});
+  TransactionEngine engine(domain);
+  if (!engine.Register(&meters_res) || !engine.Register(&actions_res) ||
+      !engine.Register(&rules_res)) {
+    state.SkipWithError("resource registration failed");
+    return;
+  }
+
+  // Session s: rule keys 2s and 2s+1, actions and meters at slot s+1 and
+  // s+1+kSessions (the two directions).
+  auto establish = [&](uint32_t s) {
+    const uint32_t up = s + 1, down = s + 1 + kSessions;
+    return std::vector<Op>{
+        Op::Upsert("meters", EncodeKey(MeterId(up)), std::any(Meter{1, 1})),
+        Op::Upsert("meters", EncodeKey(MeterId(down)), std::any(Meter{2, 1})),
+        Op::Upsert("actions", EncodeKey(ActionId(up)),
+                   std::any(Action{1, MeterId(up)})),
+        Op::Upsert("actions", EncodeKey(ActionId(down)),
+                   std::any(Action{2, MeterId(down)})),
+        Op::Upsert("rules", EncodeKey(uint64_t{2} * s), std::any(uint64_t{up})),
+        Op::Upsert("rules", EncodeKey(uint64_t{2} * s + 1),
+                   std::any(uint64_t{down}))};
+  };
+  auto release = [&](uint32_t s) {
+    const uint32_t up = s + 1, down = s + 1 + kSessions;
+    return std::vector<Op>{
+        Op::Erase("rules", EncodeKey(uint64_t{2} * s)),
+        Op::Erase("rules", EncodeKey(uint64_t{2} * s + 1)),
+        Op::Erase("actions", EncodeKey(ActionId(up))),
+        Op::Erase("actions", EncodeKey(ActionId(down))),
+        Op::Erase("meters", EncodeKey(MeterId(up))),
+        Op::Erase("meters", EncodeKey(MeterId(down)))};
+  };
+  // Live sessions: a window [oldest, next) of kSessions / 2, moving forward.
+  uint32_t oldest = 0, next = 0;
+  for (; next < kSessions / 2; next++) {
+    if (engine.Apply(establish(next)).outcome !=
+        TransactionEngine::Outcome::kApplied) {
+      state.SkipWithError("populate failed");
+      return;
+    }
+  }
+
+  std::atomic<bool> stop{false};
+  std::vector<std::atomic<uint64_t>> lookups(readers);
+  std::vector<std::thread> threads;
+  const int main_cpu = sched_getcpu();
+  int cpu = 0;
+  for (int r = 0; r < readers; r++) {
+    // The next allowed CPU that is not the writer's.
+    while (cpu < CPU_SETSIZE &&
+           (cpu == main_cpu || !CPU_ISSET(cpu, &kInitialCpus))) {
+      cpu++;
+    }
+    const int reader_cpu = cpu < CPU_SETSIZE ? cpu++ : -1;
+    const bess::rcu::ReaderId id = static_cast<bess::rcu::ReaderId>(20 + r);
+    (void)domain.Register(id);
+    lookups[r] = 0;
+    threads.emplace_back([&, r, id, reader_cpu] {
+      if (reader_cpu >= 0) {
+        cpu_set_t one;
+        CPU_ZERO(&one);
+        CPU_SET(reader_cpu, &one);
+        pthread_setaffinity_np(pthread_self(), sizeof(one), &one);
+      }
+      domain.Online(id);
+      std::mt19937_64 rng(1234 + r);
+      uint64_t keys[32], values[32], local = 0, sink = 0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        for (auto &k : keys) {
+          k = rng() % (uint64_t{2} * kSessions);
+        }
+        const uint64_t hits = ExactRuleResource::VisibleHits(
+            table->LookupBatch(
+                bess::classifier::ConstBytes(
+                    reinterpret_cast<const bess::classifier::Byte *>(keys),
+                    sizeof(keys)),
+                8, values, 32),
+            values);
+        for (uint64_t m = hits; m != 0; m &= m - 1) {
+          const int i = __builtin_ctzll(m);
+          if (const Action *a =
+                  actions.Lookup(ActionId(static_cast<uint32_t>(values[i])))) {
+            if (const Meter *meter = meters.Lookup(a->meter)) {
+              sink += meter->cir;
+            }
+          }
+        }
+        local += 32;
+        domain.Quiescent(id);
+      }
+      benchmark::DoNotOptimize(sink);
+      lookups[r] = local;
+      domain.Offline(id);
+    });
+  }
+
+  uint64_t busy = 0, sessions = 0;
+  const auto start = std::chrono::steady_clock::now();
+  auto due = start;
+  for (auto _ : state) {
+    if (rate == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    if (rate > 0) {
+      due += std::chrono::nanoseconds(1000000000 / rate);
+      while (std::chrono::steady_clock::now() < due) {
+      }
+    }
+    // Establish the next session, release the oldest; kBusy or an id still
+    // retiring means readers are behind: try again.
+    while (engine.Apply(establish(next % kSessions)).outcome !=
+           TransactionEngine::Outcome::kApplied) {
+      busy++;
+    }
+    while (engine.Apply(release(oldest % kSessions)).outcome !=
+           TransactionEngine::Outcome::kApplied) {
+      busy++;
+    }
+    next++;
+    oldest++;
+    sessions++;
+  }
+  const double seconds = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+  stop = true;
+  for (auto &t : threads) {
+    t.join();
+  }
+  uint64_t total = 0;
+  for (auto &l : lookups) {
+    total += l;
+  }
+  state.counters["Mlookups_per_reader"] =
+      static_cast<double>(total) / readers / seconds / 1e6;
+  state.counters["Mlookups_total"] = static_cast<double>(total) / seconds / 1e6;
+  state.counters["sessions_per_s"] = static_cast<double>(sessions) / seconds;
+  state.counters["busy_retries"] = static_cast<double>(busy);
+  for (int r = 0; r < readers; r++) {
+    domain.Unregister(static_cast<bess::rcu::ReaderId>(20 + r));
+  }
+  while (engine.ReclaimRetired() != 0) {
+  }
+  domain.Drain();
+}
+BENCHMARK(BM_LookupsUnderTransactions)
+    ->ArgsProduct({{1, 2, 4}, {0, 10000, 100000, -1}})
+    ->UseRealTime()
+    ->MinTime(2.0);
 
 }  // namespace

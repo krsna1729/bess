@@ -228,20 +228,29 @@ void RcuDomain::Synchronize() {
   stats_.grace_periods_completed++;
 }
 
+void RcuDomain::ReserveRetirements(size_t n) {
+  std::lock_guard<std::mutex> lock(retire_mutex_);
+  retired_.reserve(retired_.size() + n);
+}
+
 void RcuDomain::RetireErased(GracePeriod token, void *object,
-                             void (*destroy)(void *)) {
+                             void (*destroy)(void *),
+                             std::atomic<size_t> *outstanding) {
   size_t pending = 0;
+  if (outstanding != nullptr) {
+    outstanding->fetch_add(1, std::memory_order_relaxed);
+  }
   {
     std::lock_guard<std::mutex> lock(retire_mutex_);
-    retired_.push_back(RetiredObject{token, object, destroy});
-    pending_count_.store(retired_.size(), std::memory_order_relaxed);
+    retired_.push_back(RetiredObject{token, object, destroy, outstanding});
+    pending = retired_.size() - head_;
+    pending_count_.store(pending, std::memory_order_relaxed);
     stats_.objects_retired++;
-    stats_.pending_retired_objects = retired_.size();
+    stats_.pending_retired_objects = pending;
     if (stats_.oldest_pending_token == 0 ||
         token < stats_.oldest_pending_token) {
       stats_.oldest_pending_token = token;
     }
-    pending = retired_.size();
   }
 
   if (pending <= retire_high_water_) {
@@ -261,17 +270,28 @@ size_t RcuDomain::ReclaimReady() {
   size_t reclaimed = 0;
   {
     std::lock_guard<std::mutex> lock(retire_mutex_);
-    while (!retired_.empty() && IsGracePeriodComplete(retired_.front().token)) {
-      RetiredObject retired = retired_.front();
-      retired_.pop_front();
+    while (head_ < retired_.size() &&
+           IsGracePeriodComplete(retired_[head_].token)) {
+      const RetiredObject retired = retired_[head_++];
       retired.destroy(retired.object);
+      if (retired.outstanding != nullptr) {
+        retired.outstanding->fetch_sub(1, std::memory_order_release);
+      }
       reclaimed++;
     }
+    if (head_ == retired_.size()) {
+      retired_.clear();  // keeps the capacity
+      head_ = 0;
+    } else if (head_ >= 1024 && head_ * 2 >= retired_.size()) {
+      retired_.erase(retired_.begin(),
+                     retired_.begin() + static_cast<ptrdiff_t>(head_));
+      head_ = 0;
+    }
+    const size_t pending = retired_.size() - head_;
     stats_.objects_reclaimed += reclaimed;
-    stats_.pending_retired_objects = retired_.size();
-    pending_count_.store(retired_.size(), std::memory_order_relaxed);
-    stats_.oldest_pending_token =
-        retired_.empty() ? 0 : retired_.front().token;
+    stats_.pending_retired_objects = pending;
+    pending_count_.store(pending, std::memory_order_relaxed);
+    stats_.oldest_pending_token = pending == 0 ? 0 : retired_[head_].token;
   }
   return reclaimed;
 }

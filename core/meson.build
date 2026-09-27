@@ -224,6 +224,7 @@ unit_test_sources = [
   'dataplane/object_table_rcu_test.cc',
   'dataplane/object_table_publication_test.cc',
   'dataplane/transaction_engine_test.cc',
+  'dataplane/transaction_lifecycle_test.cc',
   'meter/meter_test.cc',
   'meter/meter_set_test.cc',
   'stats/stats_test.cc',

@@ -30,10 +30,12 @@
 #ifndef BESS_DATAPLANE_TRANSACTION_ENGINE_H_
 #define BESS_DATAPLANE_TRANSACTION_ENGINE_H_
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -167,6 +169,11 @@ class TransactionEngine {
   std::map<Reference, size_t> references_;  // referent -> count
   std::vector<Cascade> cascades_;
   std::map<const Resource *, size_t> pending_removals_;
+  // Per resource: retired objects handed to RCU and not yet destroyed.
+  std::map<const Resource *, std::unique_ptr<std::atomic<size_t>>>
+      outstanding_;
+  // Objects that pending removal cascades will still retire (one per step).
+  size_t deferred_objects_ = 0;
   uint64_t generation_ = 0;
 };
 

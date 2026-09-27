@@ -104,6 +104,7 @@ std::expected<void, std::string> TransactionEngine::Register(
   }
   resource->rank_ = rank;
   resources_.emplace(resource->name(), resource);
+  outstanding_.emplace(resource, std::make_unique<std::atomic<size_t>>(0));
   return {};
 }
 
@@ -139,6 +140,17 @@ std::expected<void, std::string> TransactionEngine::Unregister(
     return std::unexpected("removals of '" + name +
                            "' are still waiting for readers");
   }
+  // Objects of this resource already handed to RCU are destroyed by code in
+  // the resource's module (the deleter it instantiated); it must not go
+  // before the last of them has run.
+  domain_.ReclaimReady();
+  std::atomic<size_t> &outstanding = *outstanding_.at(res->second);
+  if (const size_t left = outstanding.load(std::memory_order_acquire);
+      left != 0) {
+    return std::unexpected(std::to_string(left) + " retired object(s) of '" +
+                           name + "' are still waiting for readers");
+  }
+  outstanding_.erase(res->second);
   resources_.erase(res);
   return {};
 }
@@ -161,14 +173,28 @@ size_t TransactionEngine::ReclaimRetired() {
 }
 
 size_t TransactionEngine::ReclaimRetiredLocked() {
+  const size_t retire_budget = domain_.retire_high_water() / 2;
   size_t kept = 0;
   for (size_t c = 0; c < cascades_.size(); c++) {
     Cascade &cascade = cascades_[c];
     while (cascade.next < cascade.stages.size() &&
            domain_.IsComplete(cascade.token)) {
+      std::vector<Step> &stage = cascade.stages[cascade.next];
+      // Each step retires at most one object. Run a stage only if that keeps
+      // the RCU queue within budget, so reclamation never pushes it to the
+      // point where RetireErased() waits for readers under this lock; a
+      // stage that does not fit waits for readers to drain the queue.
+      if (domain_.pending_retired() + stage.size() > retire_budget) {
+        break;
+      }
+      domain_.ReserveRetirements(stage.size());
       Retirer retirer;
-      for (Step &step : cascade.stages[cascade.next]) {
+      retirer.retire_.reserve(stage.size());
+      for (Step &step : stage) {
+        retirer.owner_ = step.owner;
+        retirer.outstanding_ = outstanding_.at(step.owner).get();
         step.fn(retirer);
+        deferred_objects_--;
         if (--pending_removals_[step.owner] == 0) {
           pending_removals_.erase(step.owner);
         }
@@ -236,33 +262,6 @@ TransactionEngine::Result TransactionEngine::Apply(
     }
   }
 
-  // -- bounded backpressure -------------------------------------------------
-  // Retirement runs behind readers. If they are slow to quiesce, never push
-  // the RCU retire queue towards the point where RetireErased() waits for
-  // them (while this lock is held), and never grow the cascade list without
-  // bound: refuse, retriably, before anything is attempted. Operations on
-  // deferred-erase (object) resources are the ones that retire objects --
-  // a replaced or removed object each; rule-table inserts retire nothing.
-  size_t may_retire = 0;
-  for (size_t i = 0; i < n; i++) {
-    may_retire += resource[i]->DefersErase() ? 1 : 0;
-  }
-  const size_t retire_budget = domain_.retire_high_water() / 2;
-  if (may_retire > retire_budget) {
-    return Reject(n, 0,
-                  "transaction retires up to " + std::to_string(may_retire) +
-                      " objects, more than one batch allows (" +
-                      std::to_string(retire_budget) + "); split it");
-  }
-  if (domain_.pending_retired() + may_retire > retire_budget ||
-      cascades_.size() >= kMaxPendingCascades) {
-    Result result;
-    result.outcome = Outcome::kBusy;
-    result.generation = generation_;
-    result.ops.resize(n);
-    return result;
-  }
-
   // -- reserve: all fallible work, nothing visible ---------------------------
   struct Staged {
     size_t op;
@@ -280,6 +279,8 @@ TransactionEngine::Result TransactionEngine::Apply(
     }
   });
 
+  Resource::Footprint footprint;          // summed over the transaction
+  std::vector<uint32_t> removals_by_op(n, 0);
   std::map<Reference, int64_t> delta;     // referent -> reference change
   std::map<Reference, size_t> added_by;   // referent -> first op naming it
   for (size_t i = 0; i < n; i++) {
@@ -304,7 +305,36 @@ TransactionEngine::Result TransactionEngine::Apply(
         added_by.emplace(ref, i);
       }
     }
+    footprint.retires += reserved->footprint.retires;
+    footprint.removals += reserved->footprint.removals;
+    footprint.callbacks += reserved->footprint.callbacks;
+    removals_by_op[i] = reserved->footprint.removals;
     staged.push_back(Staged{i, std::move(reserved->staged)});
+  }
+
+  // -- bounded backpressure -------------------------------------------------
+  // Retirement runs behind readers. Never let the RCU retire queue approach
+  // the point where RetireErased() waits for readers (while this lock is
+  // held): count what is queued, what pending removal cascades will still
+  // retire, and what this transaction declares. Refuse retriably -- the
+  // reservations are aborted, so nothing becomes visible.
+  const size_t may_retire =
+      size_t{footprint.retires} + size_t{footprint.removals};
+  const size_t retire_budget = domain_.retire_high_water() / 2;
+  if (may_retire > retire_budget) {
+    return Reject(n, 0,
+                  "transaction retires up to " + std::to_string(may_retire) +
+                      " objects, more than one batch allows (" +
+                      std::to_string(retire_budget) + "); split it");
+  }
+  if (domain_.pending_retired() + deferred_objects_ + may_retire >
+          retire_budget ||
+      cascades_.size() >= kMaxPendingCascades) {
+    Result result;
+    result.outcome = Outcome::kBusy;
+    result.generation = generation_;
+    result.ops.resize(n);
+    return result;
   }
 
   // -- references the transaction leaves behind -----------------------------
@@ -384,41 +414,46 @@ TransactionEngine::Result TransactionEngine::Apply(
     return xu ? rx < ry : rx > ry;
   });
 
-  // Only object (deferred-erase) resources retire or remove anything: one
-  // retirement or removal per operation at most, so reserve exactly that.
+  // Exactly what the resources declared (their Reserve() footprints): the
+  // retirer's storage, and room in the RCU retire queue for what Finish()
+  // hands over after commit, so neither publication nor the handoff
+  // allocates.
   Retirer retirer;
-  if (may_retire != 0) {
-    retirer.retire_.reserve(may_retire);
-    retirer.after_.reserve(may_retire);
-    retirer.removals_.reserve(may_retire);
-  }
+  retirer.retire_.reserve(footprint.retires);
+  retirer.after_.reserve(footprint.callbacks);
+  retirer.removals_.reserve(footprint.removals);
+  domain_.ReserveRetirements(footprint.retires);
   // Ledger nodes for new references, so publishing only updates counts.
   for (const auto &[ref, d] : delta) {
     if (d > 0) {
       references_.try_emplace(ref, 0);
     }
   }
-  // The removal cascade's skeleton: one stage per rank with deferred erases,
-  // highest first, and a pending-removal counter per owning resource.
+  // The removal cascade's skeleton, from the declared removals: one stage
+  // per rank, highest first, sized exactly; a pending-removal counter per
+  // owning resource.
   std::vector<int> stage_ranks;
   Cascade cascade{0, {}, 0};
-  for (size_t i = 0; may_retire != 0 && i < n; i++) {
-    if (ops[i].kind == OpKind::kErase && resource[i]->DefersErase()) {
-      stage_ranks.push_back(resource[i]->rank());
-      pending_removals_.try_emplace(resource[i], 0);
+  if (footprint.removals != 0) {
+    for (size_t i = 0; i < n; i++) {
+      if (removals_by_op[i] != 0) {
+        stage_ranks.push_back(resource[i]->rank());
+        pending_removals_.try_emplace(resource[i], 0);
+      }
     }
-  }
-  if (!stage_ranks.empty()) {
     std::sort(stage_ranks.begin(), stage_ranks.end(), std::greater<int>());
-    std::vector<int> unique_ranks = stage_ranks;
-    unique_ranks.erase(std::unique(unique_ranks.begin(), unique_ranks.end()),
-                       unique_ranks.end());
-    cascade.stages.resize(unique_ranks.size());
-    for (size_t s_i = 0; s_i < unique_ranks.size(); s_i++) {
-      cascade.stages[s_i].reserve(static_cast<size_t>(std::count(
-          stage_ranks.begin(), stage_ranks.end(), unique_ranks[s_i])));
+    stage_ranks.erase(std::unique(stage_ranks.begin(), stage_ranks.end()),
+                      stage_ranks.end());
+    cascade.stages.resize(stage_ranks.size());
+    for (size_t s_i = 0; s_i < stage_ranks.size(); s_i++) {
+      size_t steps = 0;
+      for (size_t i = 0; i < n; i++) {
+        if (resource[i]->rank() == stage_ranks[s_i]) {
+          steps += removals_by_op[i];
+        }
+      }
+      cascade.stages[s_i].reserve(steps);
     }
-    stage_ranks = std::move(unique_ranks);
     cascades_.reserve(cascades_.size() + 1);
   }
 
@@ -426,11 +461,16 @@ TransactionEngine::Result TransactionEngine::Apply(
   if (internal::g_publish_window_hook != nullptr) {
     internal::g_publish_window_hook(true);
   }
+  retirer.enforce_ = true;
   for (size_t i : order) {
-    retirer.rank_ = resource[staged[i].op]->rank();
-    retirer.owner_ = resource[staged[i].op];
+    Resource *owner = resource[staged[i].op];
+    retirer.rank_ = owner->rank();
+    retirer.owner_ = owner;
+    retirer.owner_name_ = owner->name().c_str();
+    retirer.outstanding_ = outstanding_.at(owner).get();
     staged[i].work->Publish(retirer);
   }
+  retirer.enforce_ = false;
   abort.Dismiss();
   for (const auto &[ref, d] : delta) {
     auto it = references_.find(ref);
@@ -445,24 +485,18 @@ TransactionEngine::Result TransactionEngine::Apply(
     }
   }
   for (Retirer::Removal &removal : retirer.removals_) {
-    // Stages were sized from the erase operations; a resource that removes
-    // later on another path lands in its rank's stage all the same.
+    // Every removal was declared by its operation, whose rank has a stage
+    // sized for it (Retirer enforced the count).
     size_t s_i = 0;
-    while (s_i < stage_ranks.size() && stage_ranks[s_i] != removal.rank) {
+    while (stage_ranks[s_i] != removal.rank) {
       s_i++;
     }
-    if (s_i == stage_ranks.size()) {
-      stage_ranks.push_back(removal.rank);  // unplanned: may allocate
-      cascade.stages.emplace_back();
-    }
     cascade.stages[s_i].push_back(Step{removal.owner, std::move(removal.step)});
-    pending_removals_[removal.owner]++;
+    pending_removals_.find(removal.owner)->second++;
+    deferred_objects_++;
   }
   retirer.removals_.clear();
   generation_++;
-  if (internal::g_publish_window_hook != nullptr) {
-    internal::g_publish_window_hook(false);
-  }
 
   // -- committed: resources' own cleanup and asynchronous reclamation --------
   for (Resource *r : touched) {
@@ -478,9 +512,12 @@ TransactionEngine::Result TransactionEngine::Apply(
       cascade.token = token;
       cascades_.push_back(std::move(cascade));
     }
-    retirer.Finish(domain_, token);
-    domain_.ReclaimReady();
+    retirer.Finish(domain_, token);  // into reserved room: no allocation
   }
+  if (internal::g_publish_window_hook != nullptr) {
+    internal::g_publish_window_hook(false);
+  }
+  domain_.ReclaimReady();
 
   Result result;
   result.outcome = Outcome::kApplied;

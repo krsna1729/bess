@@ -94,7 +94,8 @@ class SlotResource final : public Resource {
       if (!table_.Contains(id)) {
         return std::unexpected("not found");
       }
-      return Reservation{std::make_unique<UnpublishOp>(table_, id), {}};
+      return Reservation{std::make_unique<UnpublishOp>(table_, id), {},
+                         Footprint{.removals = 1}};
     }
     if (!table_.CanPublish(id)) {
       return std::unexpected(
@@ -106,7 +107,9 @@ class SlotResource final : public Resource {
     }
     Reservation reservation{
         std::make_unique<PublishOp>(table_, id, std::make_unique<const T>(*value)),
-        {}};
+        {},
+        // The object it replaces, if any, is retired.
+        Footprint{.retires = table_.Contains(id) ? 1u : 0u}};
     if (references_) {
       reservation.references = references_(*value);
     }

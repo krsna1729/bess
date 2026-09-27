@@ -1500,6 +1500,100 @@ yet):
     PMDs;
   - failure injection at every prepare allocation and DPDK reservation.
 
+**Amendment 3 (2026-09-27): review of f3919d70, findings verified in the
+source first.**
+
+- **Deferred destructors (P0).** A removal step unpublishes an object and
+  hands it to RCU, so its destructor runs a grace period later. That
+  destructor is code the resource's module instantiated (a plugin's
+  `.so`), yet the pending-step count had already reached zero.
+  - `RcuDomain::Retire` now takes an optional per-owner completion
+    counter, decremented after destruction. The engine keeps one per
+    resource, and `Unregister` refuses while it is non-zero.
+  - Tests: `UnregisterWaitsForTheLastDestructor` (a destructor probe), and
+    `UnregisterWaitsForPendingRemovals`, now requiring a second quiescent
+    state. Mutation: without the check, the test segfaults (the destructor
+    ran after the table was destroyed).
+- **Aggregate deferred backlog (P0).** Admission counted objects already
+  queued, but not those that pending cascades would still retire, and the
+  reclaimer ran every eligible stage.
+  - Three transactions each erasing a budget's worth of objects could
+    flood the RCU queue past its high-water mark and block under the lock.
+  - Admission now counts deferred objects, and the reclaimer runs a stage
+    only if it fits the budget, otherwise leaving it pending.
+  - Tests: `ManyDeferredRemovalsCannotBlockTheEngine` (the review's
+    scenario) and `ReclaimerHoldsBackWhenTheRcuQueueIsFull` (another RCU
+    user fills the queue).
+  - Mutations: each check removed fails its test.
+- **Exception safety of exact-key preparation (P1).** The staged
+  operation and the references (a user callback that may throw) are now
+  built before the pending key is placed, which is the last step that can
+  fail. Test: `ThrowingReferenceCallbackLeavesNoPendingKey`. Mutation: the
+  old order leaks a pending key.
+- **An explicit publication footprint (P1).**
+  - `Reserve()` returns `Footprint{retires, removals, callbacks}`, and the
+    engine reserves exactly the sum: the retirer, the cascade stages, and
+    now also room in the RCU retire queue. That queue became a
+    vector-backed ring so it can be reserved, which makes the
+    post-commit handoff allocation-free too;
+    `PublicationDoesNotAllocate` covers it.
+  - Exceeding the declared footprint is fatal, which replaces the
+    allocating fallback. Test: `ExceedingTheDeclaredFootprintIsFatal`, a
+    death test.
+  - Backpressure uses the declared footprints rather than
+    `DefersErase()`.
+- **A lifecycle-wide adversarial suite**
+  (`core/dataplane/transaction_lifecycle_test.cc`, 7 tests):
+  - **Failure at every reserve position**, as an error and as a thrown
+    `bad_alloc`, in four transaction shapes (establish, re-point, delete,
+    an 11-operation mix). The full state is compared afterwards: logical
+    contents, physical rule-table entries including pending keys, the
+    reference ledger and the generation. The same transaction must then
+    still apply.
+  - **The throwing reference callback**, the two backlog tests, the
+    destructor-lifetime test and the footprint death test.
+  - **A model-based random lifecycle:** 4000 transactions with injected
+    faults at random positions, a reader stalling and resuming at random
+    while resolving chains, and random reclamation. The model is checked
+    after every step. Per run: 645 applied, 3075 rejected (589 injected,
+    55 retiring), about 2.5M chains resolved, 0 dangling.
+
+  Mutations across this suite are all caught: the old prepare order,
+  admission without deferred objects, the reclaimer without a budget,
+  unregister without the destructor check, an unenforced footprint, and
+  aborts that forget pending keys.
+
+**Scaling: packet-path lookups under transactions**
+(`BM_LookupsUnderTransactions`).
+
+Each reader, on its own isolated CPU, resolves 32-key batches: a rule
+lookup (pending keys dropped), then the action slot, then the meter slot,
+over 65K sessions with half live. The readers report quiescence every
+batch, far more often than real workers (every 10 µs). The writer
+creates one session and removes the oldest per iteration. Native release,
+`omarchy-benchmark --isolate`, 2 s per point. Lookups are M/s per reader
+(total):
+
+| CPUs | readers | no transactions | 10K sessions/s | writer flat out | sessions/s flat out |
+|---|---|---|---|---|---|
+| P (0,2,4,6,8) | 1 | 42.8 | 40.0 (−6%) | 36.4 (−15%) | 90K |
+| | 2 | 46.2 (92) | 44.2 (−4%) | 41.0 (−11%) | 84K |
+| | 4 | 45.0 (180) | 42.3 (−6%) | 40.8 (−9%) | 79K |
+| E (12-16) | 1 | 28.8 | 27.1 (−6%) | 21.4 (−26%) | 57K |
+| | 2 | 28.4 (57) | 23.2 (−18%) | 21.8 (−23%) | 49K |
+| | 4 | 26.5 (106) | 22.5 (−15%) | 22.4 (−15%) | 44K |
+
+- Readers scale linearly.
+- Transactions at 10K sessions/s (about 120K table operations/s) cost the
+  packet path 4-6% on P-cores and 6-18% on E-cores. With the writer flat
+  out (about 1M table operations/s on P-cores) they cost 9-15% (P) and
+  15-26% (E).
+- No retries: reclamation kept up.
+- **Gap:** with busy readers, the writer reaches 79-90K sessions/s on
+  P-cores and 44-57K on E-cores, below §14.5's 100K target. The earlier
+  216K was with an idle reader and a smaller table. The engine's per-op
+  overhead (§31.4) is the lever to work on first.
+
 **Deferred (next increments):**
 
 - Router and the modules as resource providers;

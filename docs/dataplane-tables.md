@@ -252,10 +252,16 @@ reference to something missing.
   pending; with workers paused, one call advances the cascade.
 - **`kBusy`:** when readers are slow to quiesce and reclamation is behind, a
   transaction is refused retriably instead of waiting.
+- **Declare each operation's footprint** in `Reserve()` (`Footprint{retires,
+  removals, callbacks}`); the adapters do. Exceeding it is fatal: the
+  engine reserved exactly that, so publication never allocates.
 - **Cost:** a session of two meters, two actions and two rules, created
   and then removed, takes about 4.4 µs in process (226K sessions/s on a
-  P-core, 216K with a reader online; 167K and 152K on an E-core;
-  `transaction_bench`).
+  P-core, 216K with an idle reader online; 167K and 152K on an E-core).
+  With 1-4 busy readers doing chain lookups, the writer reaches 79-90K
+  sessions/s (P) and costs the readers 4-6% at 10K sessions/s and 9-15% at
+  full rate (`BM_LookupsUnderTransactions`; E-cores in D-021 amendment
+  3).
 - Code: `core/dataplane/{resource.h, transaction_engine.{h,cc},
   slot_resource.h}`, `core/classifier/exact_rule_resource.h`; D-020,
   D-021.

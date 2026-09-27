@@ -32,7 +32,6 @@
 
 #include <cstddef>
 #include <atomic>
-#include <deque>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -137,16 +136,27 @@ class RcuDomain {
   // queue holds heterogeneous types: destruction goes through the type-erased
   // deleter captured here, and always runs on whichever control thread calls
   // ReclaimReady()/Drain() -- never on a packet worker.
+  //
+  // `outstanding`, if given, is incremented now and decremented right after
+  // the object is destroyed: an owner (a transaction resource, a plugin) can
+  // tell when the last destructor it supplied has run -- the deleter is code
+  // in the owner's module, so the owner must not go away before.
   template <typename T>
-  void Retire(GracePeriod token, std::unique_ptr<T> &&object) {
+  void Retire(GracePeriod token, std::unique_ptr<T> &&object,
+              std::atomic<size_t> *outstanding = nullptr) {
     if (object == nullptr) {
       return;
     }
     // The type-erased queue holds a plain void*; the deleter remembers T, so
     // both `unique_ptr<T>` and `unique_ptr<const T>` work.
     void *raw = const_cast<void *>(static_cast<const void *>(object.release()));
-    RetireErased(token, raw, [](void *p) { delete static_cast<T *>(p); });
+    RetireErased(token, raw, [](void *p) { delete static_cast<T *>(p); },
+                 outstanding);
   }
+
+  // Makes room for `n` more retirements, so that the next `n` Retire() calls
+  // do not allocate (for callers that must not fail after committing).
+  void ReserveRetirements(size_t n);
 
   // Destroys every retired object whose grace period has completed, and returns
   // how many were destroyed. Call from a control thread.
@@ -180,9 +190,11 @@ class RcuDomain {
     GracePeriod token;
     void *object;
     void (*destroy)(void *);
+    std::atomic<size_t> *outstanding;  // decremented after destroy, or null
   };
 
-  void RetireErased(GracePeriod token, void *object, void (*destroy)(void *));
+  void RetireErased(GracePeriod token, void *object, void (*destroy)(void *),
+                    std::atomic<size_t> *outstanding = nullptr);
 
   // Lock-free, stats-free grace-period check: safe to call while holding
   // retire_mutex_ (which ReclaimReady does).
@@ -198,12 +210,15 @@ class RcuDomain {
   size_t registered_readers_ = 0;
 
   mutable std::mutex retire_mutex_;
-  // In retirement order. Tokens come from StartGracePeriod() in increasing
-  // order and DPDK completes them in order, so reclamation takes from the
-  // front and stops at the first incomplete token: O(reclaimed), not
-  // O(pending). An object retired against an older token behind a newer one
-  // is only freed later, never earlier.
-  std::deque<RetiredObject> retired_;
+  // In retirement order, from retired_[head_]. Tokens come from
+  // StartGracePeriod() in increasing order and DPDK completes them in order,
+  // so reclamation advances head_ and stops at the first incomplete token:
+  // O(reclaimed), not O(pending). An object retired against an older token
+  // behind a newer one is only freed later, never earlier. A vector (compacted
+  // in place) rather than a deque, so that ReserveRetirements() can guarantee
+  // later pushes do not allocate.
+  std::vector<RetiredObject> retired_;
+  size_t head_ = 0;
   std::atomic<size_t> pending_count_{0};  // retired_.size(), readable unlocked
   const size_t retire_high_water_;
   mutable RcuStats stats_;  // counters are updated by const readers too
