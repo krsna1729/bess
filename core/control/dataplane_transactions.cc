@@ -78,27 +78,27 @@ uint64_t Digest(const v2::ApplyTransactionRequest &request) {
 v2::TransactionRecord::Outcome ToProto(TransactionEngine::Outcome outcome) {
   switch (outcome) {
     case TransactionEngine::Outcome::kApplied:
-      return v2::TransactionRecord::APPLIED;
+      return v2::TransactionRecord::OUTCOME_APPLIED;
     case TransactionEngine::Outcome::kRejected:
-      return v2::TransactionRecord::REJECTED;
+      return v2::TransactionRecord::OUTCOME_REJECTED;
     case TransactionEngine::Outcome::kConflict:
-      return v2::TransactionRecord::CONFLICT;
+      return v2::TransactionRecord::OUTCOME_CONFLICT;
     case TransactionEngine::Outcome::kBusy:
-      return v2::TransactionRecord::BUSY;
+      return v2::TransactionRecord::OUTCOME_BUSY;
   }
-  return v2::TransactionRecord::REJECTED;
+  return v2::TransactionRecord::OUTCOME_REJECTED;
 }
 
 v2::TransactionOpResult::Status ToProto(TransactionEngine::OpStatus status) {
   switch (status) {
     case TransactionEngine::OpStatus::kApplied:
-      return v2::TransactionOpResult::APPLIED;
+      return v2::TransactionOpResult::STATUS_APPLIED;
     case TransactionEngine::OpStatus::kFailed:
-      return v2::TransactionOpResult::FAILED;
+      return v2::TransactionOpResult::STATUS_FAILED;
     case TransactionEngine::OpStatus::kNotApplied:
-      return v2::TransactionOpResult::NOT_APPLIED;
+      return v2::TransactionOpResult::STATUS_NOT_APPLIED;
   }
-  return v2::TransactionOpResult::NOT_APPLIED;
+  return v2::TransactionOpResult::STATUS_NOT_APPLIED;
 }
 
 // Rejected at decoding: operation `failed` carries the reason, the others
@@ -106,15 +106,15 @@ v2::TransactionOpResult::Status ToProto(TransactionEngine::OpStatus status) {
 v2::TransactionRecord Undecodable(int ops, int failed, std::string error,
                                   uint64_t generation) {
   v2::TransactionRecord record;
-  record.set_outcome(v2::TransactionRecord::REJECTED);
+  record.set_outcome(v2::TransactionRecord::OUTCOME_REJECTED);
   record.set_generation(generation);
   for (int i = 0; i < ops; i++) {
     auto *op = record.add_ops();
     if (i == failed) {
-      op->set_status(v2::TransactionOpResult::FAILED);
+      op->set_status(v2::TransactionOpResult::STATUS_FAILED);
       op->set_error(error);
     } else {
-      op->set_status(v2::TransactionOpResult::NOT_APPLIED);
+      op->set_status(v2::TransactionOpResult::STATUS_NOT_APPLIED);
     }
   }
   return record;
@@ -209,10 +209,10 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     }
   }
   record.set_request_id(id);
-  record.set_visibility(v2::TransactionRecord::DEPENDENCY_ORDERED);
+  record.set_visibility(v2::TransactionRecord::VISIBILITY_DEPENDENCY_ORDERED);
   // BUSY and CONFLICT attempted nothing: the client retries under the id.
-  const bool attempted = record.outcome() == v2::TransactionRecord::APPLIED ||
-                         record.outcome() == v2::TransactionRecord::REJECTED;
+  const bool attempted = record.outcome() == v2::TransactionRecord::OUTCOME_APPLIED ||
+                         record.outcome() == v2::TransactionRecord::OUTCOME_REJECTED;
   if (!id.empty() && attempted) {
     Record(id, digest, record);
   }

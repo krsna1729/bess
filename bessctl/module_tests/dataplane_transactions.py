@@ -36,9 +36,9 @@ from test_utils import *
 from builtin_pb import control_v2_pb2 as control_v2
 from builtin_pb import module_msg_pb2 as module_msg
 
-APPLIED = control_v2.TransactionRecord.APPLIED
-REJECTED = control_v2.TransactionRecord.REJECTED
-BUSY = control_v2.TransactionRecord.BUSY
+APPLIED = control_v2.TransactionRecord.OUTCOME_APPLIED
+REJECTED = control_v2.TransactionRecord.OUTCOME_REJECTED
+BUSY = control_v2.TransactionRecord.OUTCOME_BUSY
 
 
 def exact_rule(bess, module, sip, dip, gate=None):

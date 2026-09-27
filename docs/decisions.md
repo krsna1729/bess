@@ -2063,9 +2063,10 @@ user chose typed keys and values over raw bytes.
   run (or aged out); after a restart the epoch changes and "unknown" means
   unknown, not "never ran".
 - **Visibility is named** (the review's point): every applied transaction
-  reports `DEPENDENCY_ORDERED` -- operations took effect one by one,
+  reports `VISIBILITY_DEPENDENCY_ORDERED` -- operations took effect one by one,
   referents before referrers, never a reference to something missing.
-  `ATOMIC` is reserved for the scope cell.
+  `VISIBILITY_ATOMIC` is reserved for the scope cell. (Enum zero values
+  are `*_UNSPECIFIED`, never sent: D-026.)
 - **pybess:** `transaction_op`, `apply_transaction`, `get_transaction`,
   `list_transaction_resources` over a v2 stub on the same channel.
 

@@ -168,6 +168,18 @@ class DataplaneTransactionsTest : public ::testing::Test {
     } else {
       EXPECT_TRUE(s.ok()) << s.error_message();
     }
+    if (s.ok()) {
+      // Zero (UNSPECIFIED) is never sent: an unset field cannot pass for
+      // success.
+      EXPECT_NE(response.record().outcome(),
+                v2::TransactionRecord::OUTCOME_UNSPECIFIED);
+      EXPECT_NE(response.record().visibility(),
+                v2::TransactionRecord::VISIBILITY_UNSPECIFIED);
+      EXPECT_EQ(response.record().ops_size(), req.ops_size());
+      for (const auto &op : response.record().ops()) {
+        EXPECT_NE(op.status(), v2::TransactionOpResult::STATUS_UNSPECIFIED);
+      }
+    }
     return response;
   }
 
@@ -223,11 +235,11 @@ TEST_F(DataplaneTransactionsTest, TypedOperationsAcrossModules) {
   *req.add_ops() = ExactRule("em0", 0x0a000001, 80, 3);
   *req.add_ops() = WildRule("wm0", 0x0a000000, 0xff000000, 5, 4);
   const auto r = Apply(req);
-  ASSERT_EQ(r.record().outcome(), v2::TransactionRecord::APPLIED);
+  ASSERT_EQ(r.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
   EXPECT_EQ(r.record().visibility(),
-            v2::TransactionRecord::DEPENDENCY_ORDERED);
+            v2::TransactionRecord::VISIBILITY_DEPENDENCY_ORDERED);
   ASSERT_EQ(r.record().ops_size(), 2);
-  EXPECT_EQ(r.record().ops(1).status(), v2::TransactionOpResult::APPLIED);
+  EXPECT_EQ(r.record().ops(1).status(), v2::TransactionOpResult::STATUS_APPLIED);
   EXPECT_FALSE(r.replayed());
   EXPECT_EQ(Rules("em0"), 1u);
   EXPECT_EQ(Rules("wm0"), 1u);
@@ -252,7 +264,7 @@ TEST_F(DataplaneTransactionsTest, TypedOperationsAcrossModules) {
                    .has_error());
   v2::ApplyTransactionRequest erase;
   *erase.add_ops() = EraseExact("em0", 7, 8);
-  EXPECT_EQ(Apply(erase).record().outcome(), v2::TransactionRecord::APPLIED);
+  EXPECT_EQ(Apply(erase).record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
   EXPECT_EQ(Rules("em0"), 0u);
 }
 
@@ -262,10 +274,10 @@ TEST_F(DataplaneTransactionsTest, UndecodableOperationsRejectTheTransaction) {
     *req.add_ops() = ExactRule("em0", 1, 1, 1);
     *req.add_ops() = std::move(bad);
     const auto r = Apply(req);
-    ASSERT_EQ(r.record().outcome(), v2::TransactionRecord::REJECTED) << why;
+    ASSERT_EQ(r.record().outcome(), v2::TransactionRecord::OUTCOME_REJECTED) << why;
     EXPECT_EQ(r.record().ops(0).status(),
-              v2::TransactionOpResult::NOT_APPLIED);
-    EXPECT_EQ(r.record().ops(1).status(), v2::TransactionOpResult::FAILED);
+              v2::TransactionOpResult::STATUS_NOT_APPLIED);
+    EXPECT_EQ(r.record().ops(1).status(), v2::TransactionOpResult::STATUS_FAILED);
     EXPECT_NE(r.record().ops(1).error().find(why), std::string::npos)
         << r.record().ops(1).error();
     EXPECT_EQ(Rules("em0"), 0u);
@@ -295,7 +307,7 @@ TEST_F(DataplaneTransactionsTest, RequestIdsMakeRetriesSafe) {
   req.set_request_id("session-42");
   *req.add_ops() = ExactRule("em0", 42, 1, 2);
   const auto first = Apply(req);
-  ASSERT_EQ(first.record().outcome(), v2::TransactionRecord::APPLIED);
+  ASSERT_EQ(first.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
   EXPECT_EQ(first.record().request_id(), "session-42");
 
   // A retry (the client never saw the first answer): the recorded outcome,
@@ -317,7 +329,7 @@ TEST_F(DataplaneTransactionsTest, RequestIdsMakeRetriesSafe) {
   // GetTransaction after a timeout.
   const auto known = Get("session-42");
   EXPECT_TRUE(known.known());
-  EXPECT_EQ(known.record().outcome(), v2::TransactionRecord::APPLIED);
+  EXPECT_EQ(known.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
   EXPECT_EQ(known.daemon_epoch(), first.daemon_epoch());
   EXPECT_FALSE(Get("never-sent").known());
 
@@ -327,10 +339,10 @@ TEST_F(DataplaneTransactionsTest, RequestIdsMakeRetriesSafe) {
   stale.set_request_id("stale");
   stale.set_expected_generation(first.record().generation() + 100);
   *stale.add_ops() = ExactRule("em0", 44, 1, 2);
-  EXPECT_EQ(Apply(stale).record().outcome(), v2::TransactionRecord::CONFLICT);
+  EXPECT_EQ(Apply(stale).record().outcome(), v2::TransactionRecord::OUTCOME_CONFLICT);
   EXPECT_FALSE(Get("stale").known());
   stale.set_expected_generation(first.record().generation());
-  EXPECT_EQ(Apply(stale).record().outcome(), v2::TransactionRecord::APPLIED);
+  EXPECT_EQ(Apply(stale).record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
   EXPECT_TRUE(Get("stale").known());
 }
 

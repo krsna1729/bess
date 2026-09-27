@@ -238,36 +238,42 @@ message ApplyTransactionRequest {
   // the daemon runs (a bounded, oldest-first window); use GetTransaction
   // after a timeout.
   string request_id = 1;
-  // Refuse (outcome CONFLICT) unless the dataplane transaction generation
+  // Refuse (outcome OUTCOME_CONFLICT) unless the dataplane transaction generation
   // is still this.
   optional uint64 expected_generation = 2;
   repeated TransactionOp ops = 3;
 }
 
 message TransactionOpResult {
+  // Zero is never sent: an unset status must not read as success.
   enum Status {
-    APPLIED = 0;
-    FAILED = 1;       // this operation caused the rejection; see error
-    NOT_APPLIED = 2;  // the transaction was rejected for another operation
+    STATUS_UNSPECIFIED = 0;
+    STATUS_APPLIED = 1;
+    STATUS_FAILED = 2;       // this operation caused the rejection; see error
+    STATUS_NOT_APPLIED = 3;  // the transaction was rejected for another one
   }
   Status status = 1;
   string error = 2;
 }
 
 message TransactionRecord {
+  // Zero is never sent: an unset outcome must not read as applied.
   enum Outcome {
-    APPLIED = 0;
-    REJECTED = 1;  // an operation failed; nothing changed
-    CONFLICT = 2;  // expected_generation did not match; nothing attempted
-    BUSY = 3;      // readers are slow to quiesce; nothing attempted, retry
+    OUTCOME_UNSPECIFIED = 0;
+    OUTCOME_APPLIED = 1;
+    OUTCOME_REJECTED = 2;  // an operation failed; nothing changed
+    OUTCOME_CONFLICT = 3;  // expected_generation did not match; nothing tried
+    OUTCOME_BUSY = 4;      // readers slow to quiesce; nothing tried, retry
   }
-  // What packets could see of an applied transaction. DEPENDENCY_ORDERED:
+  // What packets could see of an applied transaction.
+  // VISIBILITY_DEPENDENCY_ORDERED:
   // its operations took effect one by one, referents before referrers, and
-  // no packet saw a reference to something missing. ATOMIC (all at once)
-  // comes with the scope cell.
+  // no packet saw a reference to something missing. VISIBILITY_ATOMIC (all
+  // at once) comes with the scope cell.
   enum Visibility {
-    DEPENDENCY_ORDERED = 0;
-    ATOMIC = 1;
+    VISIBILITY_UNSPECIFIED = 0;
+    VISIBILITY_DEPENDENCY_ORDERED = 1;
+    VISIBILITY_ATOMIC = 2;
   }
   string request_id = 1;
   Outcome outcome = 2;
