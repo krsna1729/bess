@@ -189,7 +189,7 @@ class TransactionEngine {
   // next stage runs once `token` completes.
   struct Step {
     const Resource *owner;
-    std::move_only_function<void(Retirer &)> fn;
+    Retirer::Step fn;
   };
   struct Cascade {
     rcu::GracePeriod token;

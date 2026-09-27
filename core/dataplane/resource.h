@@ -44,6 +44,7 @@
 #include <glog/logging.h>
 
 #include "rcu/rcu_domain.h"
+#include "utils/inline_function.h"
 
 namespace bess {
 namespace dataplane {
@@ -117,6 +118,17 @@ class Resource;
 // anything up before the publish finishes with it first).
 class Retirer {
  public:
+  // The callables a Retirer keeps live in fixed inline storage, never on
+  // the heap, so handing one over during publication cannot allocate. A
+  // lambda capturing more than kCallableBytes does not compile: prepare its
+  // state in Reserve() (in the staged operation) and capture a pointer or
+  // reference to it. (External review: std::move_only_function would
+  // silently allocate for a large capture, inside noexcept Publish().)
+  static constexpr size_t kCallableBytes = 48;
+  using Step = utils::InlineFunction<void(Retirer &), kCallableBytes>;
+  using AfterStart =
+      utils::InlineFunction<void(rcu::GracePeriod), kCallableBytes>;
+
   // Each call during publication must fit the footprint its operation
   // declared in Reserve() (Resource::Footprint): the engine reserved exactly
   // that, so publication neither allocates nor meets an unplanned stage.
@@ -141,14 +153,14 @@ class Retirer {
   // a referrer just before it went away must be done before its referent
   // goes). The step receives a Retirer for whatever it replaces.
   // SlotResource's erase uses this to empty its slot.
-  void RemoveLater(std::move_only_function<void(Retirer &)> step) {
+  void RemoveLater(Step step) {
     CheckRoom(removals_.size(), removals_.capacity(), "RemoveLater");
     removals_.push_back({rank_, owner_, std::move(step)});
   }
 
   // Runs `fn(token)` once the transaction's grace period has started: for
   // bookkeeping that needs the token.
-  void AfterGracePeriodStarts(std::move_only_function<void(rcu::GracePeriod)> fn) {
+  void AfterGracePeriodStarts(AfterStart fn) {
     CheckRoom(after_.size(), after_.capacity(), "AfterGracePeriodStarts");
     after_.push_back(std::move(fn));
   }
@@ -161,7 +173,7 @@ class Retirer {
   struct Removal {
     int rank;
     const Resource *owner;  // Unregister() waits for its pending removals
-    std::move_only_function<void(Retirer &)> step;
+    Step step;
   };
 
   void CheckRoom(size_t used, size_t capacity, const char *what) const {
@@ -183,9 +195,10 @@ class Retirer {
     after_.clear();
   }
 
-  std::vector<std::move_only_function<void(rcu::RcuDomain &, rcu::GracePeriod)>>
+  std::vector<utils::InlineFunction<void(rcu::RcuDomain &, rcu::GracePeriod),
+                                    kCallableBytes>>
       retire_;
-  std::vector<std::move_only_function<void(rcu::GracePeriod)>> after_;
+  std::vector<AfterStart> after_;
   std::vector<Removal> removals_;
   // Set by the engine for the operation (or removal step) running now.
   int rank_ = 0;
@@ -204,6 +217,15 @@ class StagedOp {
   virtual ~StagedOp() = default;
   // Makes the operation visible to packets. Must not fail: every check and
   // allocation happened in Reserve(). Hands replaced state to `retirer`.
+  //
+  // The no-allocation contract: the engine's own publication path does not
+  // allocate, the Retirer cannot (its callables are inline, within the
+  // declared footprint), and the built-in adapters are checked by
+  // TransactionEngineTest.PublicationDoesNotAllocate. A custom resource's
+  // Publish() is its author's to keep allocation-free: build objects,
+  // copies and removal state in Reserve() and only move or store them
+  // here; check it with the same instrumentation (a counting global
+  // operator new around internal::g_publish_window_hook).
   virtual void Publish(Retirer &retirer) noexcept = 0;
   // Releases the reservation of a transaction that will not publish. Staged
   // objects themselves are freed by the destructor; override for

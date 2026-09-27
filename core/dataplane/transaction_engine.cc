@@ -311,6 +311,11 @@ TransactionEngine::Result TransactionEngine::Apply(
   };
 
   // -- reserve: all fallible work, nothing visible ---------------------------
+  // Room for the abort bookkeeping first: once a Reserve() has placed
+  // something (a pending key), recording it for abort must not be able to
+  // throw (external review: a failed push_back leaked the key).
+  w.staged.reserve(n);
+  w.touched.reserve(n);
   AbortGuard abort([&] {
     for (auto it = w.staged.rbegin(); it != w.staged.rend(); ++it) {
       it->work->Abort();
@@ -326,13 +331,15 @@ TransactionEngine::Result TransactionEngine::Apply(
     const Op &op = ops[i];
     Registration *reg = w.reg[i];
     if (!reg->touched) {
+      w.touched.push_back(reg);  // cannot throw: reserved above
       reg->touched = true;
-      w.touched.push_back(reg);
     }
     auto reserved = reg->resource->Reserve(op);
     if (!reserved) {
       return Reject(n, i, std::move(reserved.error()));
     }
+    // Neither push can throw (both reserved for n): the reservation is
+    // armed for abort before anything else that can fail runs.
     w.reservations.push_back(std::move(*reserved));
     Resource::Reservation &r = w.reservations.back();
     // Aborted with the rest from here on: any rejection below must undo

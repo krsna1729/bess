@@ -1650,6 +1650,74 @@ gap closed.**
   per run against ~22K), and the model-based random lifecycle is
   unchanged.
 
+**Amendment 5 (2026-09-27): external review of 9cb5314 -- allocation
+failures anywhere in `Apply()`, and a publication contract plugins can
+keep.** Each finding was checked against the source before acting.
+
+- **Two exception windows (confirmed, fixed).**
+  - A resource was marked "touched" before it was recorded, so a failing
+    `push_back` left the mark set: that resource was never told
+    `EndTransaction()` again.
+  - An operation's staged work was recorded for abort by a `push_back`
+    that could allocate *after* `Reserve()` had placed a pending key; a
+    failure there leaked the key.
+
+  Now the abort bookkeeping is reserved for all operations before the
+  first `Reserve()`, and the mark follows the record.
+- **A new test fails every allocation `Apply()` makes, one at a time**
+  (`LifecycleAllocationTest`, a thread-local fault countdown in a global
+  `operator new`), in three settings: the engine's first transaction (no
+  scratch capacity yet: 59 allocation sites), a transaction twelve times
+  larger than any before (98), and one that starts by advancing a pending
+  removal cascade (30). After each failure the state (contents, pending
+  keys, reference ledger, generation) must be unchanged, every resource
+  asked to reserve must have been told the transaction ended, and the
+  same transaction must then apply. Mutations: removing the reservation of
+  the abort list fails it (the leaked pending key reproduced at the 12th
+  allocation of a first transaction); restoring the old mark-then-record
+  order fails it ("EndTransaction() skipped").
+- **The publication contract (confirmed gap, closed where the API can
+  close it).** `RemoveLater()` and `AfterGracePeriodStarts()` took a
+  `std::move_only_function` built by the caller inside `Publish()`, whose
+  inline buffer is small and library-specific: a large capture would
+  allocate inside a `noexcept` function, before the footprint check.
+  - The Retirer's callables are now `utils::InlineFunction` (48 bytes,
+    inline, never on the heap). A larger capture is a compile error that
+    says to prepare the state in `Reserve()` and capture a pointer to it
+    (checked once by hand; the built-in adapters use 16 bytes).
+  - What the API cannot see -- a custom `Publish()` allocating in its own
+    code -- is its author's contract, documented on `StagedOp::Publish`:
+    built-in adapters are checked by `PublicationDoesNotAllocate`; custom
+    ones use the same instrumentation. A reusable test-support library for
+    that belongs with the plugin package (MODERNIZATION §31.0 row 5).
+  - Cost, ABBA against a2a665b8 (8 rounds; isolated; P-core CPU 2,
+    E-core CPU 14): sessions (1K and 64K) and a session with an idle
+    reader show no clear difference on either core type. The one-operation
+    transaction on the E-core shows none; on the P-core it is +2.3% (12
+    rounds, about 12 ns of 570, under the 3% noise band but slower in most
+    pairs). Splitting the change shows the exception-safety fix alone
+    carries it (inline storage alone: −0.4%), for +0.4% instructions
+    (about 34 per transaction); the rest of the cycles are code layout. An
+    inline capacity check instead of the `reserve()` calls did not change
+    it. Kept as the price of the fix.
+- **Router integration boundary (agreed, next increment).** When Router
+  becomes a provider, its commands and the engine will share one writer
+  -- the control-plane lock -- as ExactMatch's do (D-022); the standalone
+  interface keeps its own mutex for direct use.
+- **Visibility must be named in the RPC (agreed).** Until the scope cell
+  lands, a successful transaction is all-or-nothing on failure and
+  dependency-ordered on publish, not dataplane-atomic. G1.2c will report
+  which of the two a transaction got, rather than call every transaction
+  atomic.
+- **An end-to-end acceptance test (agreed, recorded as the vertical-slice
+  gate, §31.0 row 4).** ExactMatch -> action -> meter -> Router over
+  virtual PMDs, packets flowing while ordinary updates and transactions
+  run, failures injected at every preparation boundary. It will record
+  packet Mpps, update latency, rejections, dangling-reference checks and
+  the retirement backlog. It needs the action and meter resources as
+  modules, which the slice brings. Until then, D-022's benchmark
+  classifies packets through real modules, not a full graph.
+
 **Deferred (next increments):**
 
 - Router and the modules as resource providers (ExactMatch: D-022);

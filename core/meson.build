@@ -260,6 +260,7 @@ unit_test_sources = [
   'drivers/pcap_test.cc',
   'drivers/pmd_test.cc',
   'utils/bits_test.cc',
+  'utils/inline_function_test.cc',
   'utils/bpf_program_test.cc',
   'utils/checksum_test.cc',
   'utils/codel_test.cc',

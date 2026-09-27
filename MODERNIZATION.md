@@ -4111,6 +4111,25 @@ rather than one call site).
      - **Scaling:** readers show no cost up to 100K sessions/s; the writer
        reaches 465-695K sessions/s flat out (two rules per session).
 
+112. **Review of 9cb5314: allocation failures anywhere in `Apply()`, and
+     an allocation-proof Retirer (D-021 amendment 5).**
+     - **Two exception windows** (a pending key leaked, or `EndTransaction()`
+       skipped, when the engine's own bookkeeping failed to allocate) are
+       fixed.
+     - **New test:** it fails each of the 59/98/30 allocations of a
+       first-use, a larger-than-ever and a cascade-advancing transaction
+       in turn; both windows reproduced by mutation.
+     - **Retirer callables** now live in fixed inline storage
+       (`utils::InlineFunction`), so an oversized capture is a compile
+       error instead of an allocation inside `noexcept` publish; the
+       contract for custom `Publish()` code is documented.
+     - **Cost:** sessions unchanged; one-op transactions +2.3% on a P-core
+       (code layout mostly), none on an E-core.
+     - **Agreed and recorded for later:** Router's shared writer when it
+       becomes a provider; G1.2c naming visibility (dependency-ordered vs
+       atomic scope); an ExactMatch -> action -> meter -> Router
+       acceptance test over virtual PMDs as the vertical slice's gate.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -9829,7 +9848,7 @@ drive the design.
 | 1 | P0 | **G1.2b transaction core**: resources, reserve/publish, dependency order, reference safety, per-op results, one grace period per transaction, deferred id reuse (D-020, D-021) | manual ordering, best-effort rollback | Router (routes -> next hops), ExactMatch/WildcardMatch rule sets -> action objects | core landed (entry 105); ExactMatch provider (entry 111); Router next |
 | 2 | P0 | **G1.2c RPC:** `ApplyDataplaneTransaction` with `request_id`, `expected_generation`, typed per-op results and `GetTransaction` status lookup; a streaming packed-op path (E4) | per-rule RPC orchestration, timeout ambiguity, rule-key reconstruction for deletion | any controller: routing daemons, firewall/NAT rule loaders | next |
 | 3 | P0 | **The scope cell (dataplane-atomic scopes), precisely** (detailed rules in D-021 amendment 2). An atomic scope must keep both the old and the new interpretation until its publication point. New state is written to *new* keys or write-once slots, and the cell's flip selects which set packets use. A version flag over entries already overwritten in place cannot restore them (review caution). Tables that can only be updated in place refuse atomic scopes rather than fake them (D-020). | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | design, with G1.2b |
-| 4 | P1 | **Vertical UPF slice** (in-tree plugin, static G0 graph): one uplink/downlink session using a typed classifier with a direct `ActionId` result (no `ResultSlot` -> `PackedValueStore` -> `ActionId` chain), a FAR executor, K5 `MeterSet` (no second meter implementation), K6 counters and K7 IPv4 routes, all programmed through G1.2 | validates the contract end to end | -- (validation consumer) | after 1-2 |
+| 4 | P1 | **Vertical UPF slice** (in-tree plugin, static G0 graph): one uplink/downlink session using a typed classifier with a direct `ActionId` result (no `ResultSlot` -> `PackedValueStore` -> `ActionId` chain), a FAR executor, K5 `MeterSet` (no second meter implementation), K6 counters and K7 IPv4 routes, all programmed through G1.2. **Gate:** an ExactMatch -> action -> meter -> Router pipeline over virtual PMDs, packets flowing under updates and transactions with failures injected at every prepare boundary; Mpps, update latency, rejections, dangling checks, retirement backlog (D-021 amendment 5) | validates the contract end to end | -- (validation consumer) | after 1-2 |
 | 5 | P0 | **External plugin package:** installed headers, a Meson dependency (`bess-dev`), a supported plugin API subset and a written compatibility policy | OMEC's vendored BESS fork | any out-of-tree module author | after 4 shows the API surface |
 | 6 | P1 | **K3.8 range backend** (arbitrary source and destination ranges plus precedence), differential against a scalar reference, including overlapping wildcards and simultaneous source/destination ranges | Go ternary expansion, range-width limits, Cartesian products | ACL, firewall rules (N) | queued |
 | 7 | P1 | **K7.1 route domains** (`RouteDomainId`, `ApplyRouteSet`) | Network Instance / N3-N6-N9 workarounds | VRFs (N5), multi-tenant routers | queued |

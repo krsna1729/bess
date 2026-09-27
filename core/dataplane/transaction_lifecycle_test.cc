@@ -42,6 +42,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -55,6 +56,34 @@
 #include "control/runtime_state.h"
 #include "dataplane/slot_resource.h"
 #include "dataplane/strong_id.h"
+
+// Allocation-failure injection: with g_fail_countdown = k >= 0, the (k+1)-th
+// allocation on this thread throws std::bad_alloc (and the countdown turns
+// itself off). Section 9 fails every allocation Apply() makes, one by one.
+namespace {
+thread_local long g_fail_countdown = -1;
+}  // namespace
+
+// Replacing the global allocation functions pairs malloc with free by design;
+// GCC's -Wmismatched-new-delete does not know these are the replacements.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+void *operator new(std::size_t n) {
+  if (g_fail_countdown >= 0 && g_fail_countdown-- == 0) {
+    throw std::bad_alloc();
+  }
+  if (void *p = std::malloc(n == 0 ? 1 : n)) {
+    return p;
+  }
+  throw std::bad_alloc();
+}
+void *operator new[](std::size_t n) { return operator new(n); }
+void operator delete(void *p) noexcept { std::free(p); }
+void operator delete[](void *p) noexcept { std::free(p); }
+void operator delete(void *p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
+#pragma GCC diagnostic pop
 
 namespace bess::dataplane {
 namespace {
@@ -115,9 +144,16 @@ class FaultyResource final : public Resource {
   }
   bool DefersErase() const override { return inner_.DefersErase(); }
   size_t LiveCount() const override { return inner_.LiveCount(); }
-  void EndTransaction() noexcept override { inner_.EndTransaction(); }
+  void EndTransaction() noexcept override {
+    in_transaction = false;
+    inner_.EndTransaction();
+  }
+
+  // Reserve() was called and EndTransaction() has not been since.
+  bool in_transaction = false;
 
   std::expected<Reservation, std::string> Reserve(const Op &op) override {
+    in_transaction = true;
     if (injector_.mode != Fault::kNone &&
         ++injector_.calls == injector_.fail_at) {
       if (injector_.mode == Fault::kThrow) {
@@ -778,6 +814,194 @@ TEST_F(LifecycleTest, RandomLifecycleMatchesAModelWithStallingReaders) {
   RecordProperty("applied", static_cast<int>(applied));
   RecordProperty("busy", static_cast<int>(busy));
   RecordProperty("retiring", static_cast<int>(retiring));
+}
+
+// -- 9. an allocation failure anywhere in Apply() ----------------------------
+
+// A fresh engine over fresh tables, so that "first use" (no scratch capacity
+// yet) can be tested per fault position.
+struct World {
+  World() {
+    table = std::move(*ConcurrentExactTable::Create(
+        8, ConcurrentExactTable::CapacityFor(512), control::runtime().rcu()));
+    meters_res = std::make_unique<SlotResource<MeterId, Meter>>("meters",
+                                                                meters);
+    actions_res = std::make_unique<SlotResource<ActionId, Action>>(
+        "actions", actions,
+        [](const Action &a) {
+          std::vector<Reference> refs;
+          if (a.meter.value() != 0) {
+            refs.push_back({"meters", EncodeKey(a.meter)});
+          }
+          return refs;
+        },
+        std::vector<std::string>{"meters"});
+    rules_res = std::make_unique<ExactRuleResource>(
+        "rules", *table,
+        [](uint64_t action) {
+          return std::vector<Reference>{
+              {"actions", EncodeKey(ActionId(static_cast<uint32_t>(action)))}};
+        },
+        std::vector<std::string>{"actions"});
+    // Wrapped (never armed) to check that every resource asked to reserve
+    // is told the transaction ended, whatever happened.
+    for (Resource *r : {static_cast<Resource *>(meters_res.get()),
+                        static_cast<Resource *>(actions_res.get()),
+                        static_cast<Resource *>(rules_res.get())}) {
+      tracked.push_back(std::make_unique<FaultyResource>(*r, injector));
+      EXPECT_TRUE(engine.Register(tracked.back().get()));
+    }
+  }
+
+  bool AnyInTransaction() const {
+    for (const auto &t : tracked) {
+      if (t->in_transaction) {
+        return true;
+      }
+    }
+    return false;
+  }
+  ~World() {
+    while (engine.ReclaimRetired() != 0) {
+    }
+    control::runtime().rcu().Drain();
+  }
+
+  // Logical and physical state, as in LifecycleTest::Snapshot.
+  std::string State() const {
+    std::string out;
+    for (uint32_t id = 1; id <= kIds; id++) {
+      if (meters.Contains(MeterId(id))) {
+        out += "m" + std::to_string(id) + "=" +
+               std::to_string(meters.Current(MeterId(id))->rate) + " ";
+      }
+      if (actions.Contains(ActionId(id))) {
+        const Action *a = actions.Current(ActionId(id));
+        out += "a" + std::to_string(id) + "=" + std::to_string(a->gate) + "/" +
+               std::to_string(a->meter.value()) + " ";
+      }
+      for (const char *res : {"meters", "actions"}) {
+        const auto key = res[0] == 'm' ? EncodeKey(MeterId(id))
+                                       : EncodeKey(ActionId(id));
+        if (size_t n = engine.ReferenceCount(res, key)) {
+          out += std::string("r") + res[0] + std::to_string(id) + "=" +
+                 std::to_string(n) + " ";
+        }
+      }
+    }
+    std::map<uint64_t, uint64_t> rules;  // physical: pending keys count
+    table->ForEach([&](classifier::ConstBytes key, uint64_t value) {
+      uint64_t k = 0;
+      std::memcpy(&k, key.data(), 8);
+      rules[k] = value;
+    });
+    for (const auto &[k, v] : rules) {
+      out += "k" + std::to_string(k) + "=" + std::to_string(v) + " ";
+    }
+    return out + "g" + std::to_string(engine.generation());
+  }
+
+  std::unique_ptr<ConcurrentExactTable> table;
+  SlotTable<MeterId, Meter> meters{kIds};
+  SlotTable<ActionId, Action> actions{kIds};
+  std::unique_ptr<SlotResource<MeterId, Meter>> meters_res;
+  std::unique_ptr<SlotResource<ActionId, Action>> actions_res;
+  std::unique_ptr<ExactRuleResource> rules_res;
+  Injector injector;
+  std::vector<std::unique_ptr<FaultyResource>> tracked;
+  TransactionEngine engine{control::runtime().rcu()};
+};
+
+Op WRule(uint64_t key, uint64_t action) {
+  return Op::Upsert("rules", EncodeKey(key), std::any(action));
+}
+Op WAct(uint32_t id, uint16_t gate, uint32_t meter) {
+  return Op::Upsert("actions", EncodeKey(ActionId(id)),
+                    std::any(Action{gate, MeterId(meter)}));
+}
+Op WMet(uint32_t id, uint32_t rate) {
+  return Op::Upsert("meters", EncodeKey(MeterId(id)), std::any(Meter(rate)));
+}
+
+// Fails the k-th allocation Apply() makes, for every k, in three settings:
+// the engine's first transaction (no scratch capacity yet), a transaction
+// larger than any before it, and one that starts by advancing a pending
+// removal cascade. Each failure must leave the state exactly as it was, and
+// the same transaction must then apply.
+TEST(LifecycleAllocationTest, FailureAtEveryAllocationLeavesNoTrace) {
+  enum Setting { kFirstUse, kLarger, kAfterRemovals };
+  auto chains = [](uint32_t first, uint32_t n) {
+    std::vector<Op> ops;
+    for (uint32_t id = first; id < first + n; id++) {
+      ops.push_back(WRule(1000 + id, id));
+      ops.push_back(WAct(id, static_cast<uint16_t>(id), id));
+      ops.push_back(WMet(id, id * 10));
+    }
+    return ops;
+  };
+  for (Setting setting : {kFirstUse, kLarger, kAfterRemovals}) {
+    std::vector<Op> ops;
+    size_t faults = 0;
+    for (long k = 0;; k++) {
+      SCOPED_TRACE(testing::Message() << "setting " << setting
+                                      << ", failing allocation " << k);
+      World w;
+      if (setting == kLarger) {
+        ASSERT_EQ(w.engine.Apply(chains(1, 1)).outcome,
+                  TransactionEngine::Outcome::kApplied);
+        ops = chains(2, 12);  // 36 operations against a scratch sized for 3
+      } else if (setting == kAfterRemovals) {
+        ASSERT_EQ(w.engine.Apply(chains(1, 4)).outcome,
+                  TransactionEngine::Outcome::kApplied);
+        // Remove two chains (a cascade over two ranks, pending), re-point a
+        // rule and replace a meter.
+        ASSERT_EQ(w.engine
+                      .Apply(std::vector<Op>{
+                          Op::Erase("rules", EncodeKey(uint64_t{1001})),
+                          Op::Erase("actions", EncodeKey(ActionId(1))),
+                          Op::Erase("meters", EncodeKey(MeterId(1))),
+                          Op::Erase("rules", EncodeKey(uint64_t{1002})),
+                          Op::Erase("actions", EncodeKey(ActionId(2))),
+                          Op::Erase("meters", EncodeKey(MeterId(2)))})
+                      .outcome,
+                  TransactionEngine::Outcome::kApplied);
+        ops = chains(5, 3);
+        ops.push_back(WRule(1003, 4));
+        ops.push_back(WMet(3, 31));
+        ops.push_back(Op::Erase("rules", EncodeKey(uint64_t{1004})));
+      } else {
+        ops = chains(1, 6);
+      }
+      const std::string before = w.State();
+      g_fail_countdown = k;
+      bool threw = false;
+      TransactionEngine::Result r;
+      try {
+        r = w.engine.Apply(ops);
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+      const bool fault_fired = g_fail_countdown < 0 && threw;
+      g_fail_countdown = -1;
+      if (!threw) {
+        // Every allocation of this Apply() has had its turn to fail.
+        ASSERT_EQ(r.outcome, TransactionEngine::Outcome::kApplied);
+        break;
+      }
+      ASSERT_TRUE(fault_fired);
+      faults++;
+      ASSERT_FALSE(w.AnyInTransaction()) << "EndTransaction() skipped";
+      w.table->ReclaimAll();
+      ASSERT_EQ(w.State(), before) << "a failed allocation left a trace";
+      // Not wedged: the same transaction applies now, and ends everywhere.
+      ASSERT_EQ(w.engine.Apply(ops).outcome,
+                TransactionEngine::Outcome::kApplied);
+      ASSERT_FALSE(w.AnyInTransaction()) << "EndTransaction() skipped";
+    }
+    std::printf("setting %d: %zu allocation sites failed in turn\n", setting,
+                faults);
+    EXPECT_GT(faults, 10u);
+  }
 }
 
 }  // namespace
