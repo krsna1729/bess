@@ -30,7 +30,8 @@
 #ifndef BESS_CONTROL_API_V2_H_
 #define BESS_CONTROL_API_V2_H_
 
-#include <grpc++/server_context.h>
+#include <grpcpp/server_builder.h>
+#include <grpcpp/server_context.h>
 
 #include "control/control_error.h"
 #include "control/control_plane.h"
@@ -64,6 +65,20 @@ pb::v2::ErrorDetail ToProto(const ControlError &error);
 // ErrorDetail is also attached as the "bess-error-bin" trailer.
 grpc::Status ToStatus(const ControlError &error,
                       grpc::ServerContext *context = nullptr);
+
+// The control server's settings, shared by bessd and the tests (D-026).
+// Messages up to kMaxMessageBytes each way: gRPC's 4 MiB default caps one
+// dataplane transaction at roughly 30K typed rules; 64 MiB allows about
+// half a million, beyond which a bulk load belongs on a streaming path.
+inline constexpr int kMaxMessageBytes = 64 << 20;
+// Once per process, before the first ServerBuilder exists (gRPC collects
+// server plugins in the builder's constructor): the standard health service
+// (grpc.health.v1.Health, SERVING while bessd serves) and, when built with
+// it, server reflection -- so orchestrators and generic tools (grpcurl) work
+// without BESS's protos.
+void PrepareControlServer();
+// Per builder: message size limits.
+void ConfigureControlServer(grpc::ServerBuilder *builder);
 
 class ControlV2Service final : public pb::v2::Control::Service {
  public:

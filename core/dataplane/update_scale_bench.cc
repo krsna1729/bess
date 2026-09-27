@@ -83,6 +83,9 @@
 #include "dpdk.h"
 #include "utils/cuckoo_map.h"
 
+// Lookup results land here so the compiler cannot drop the timed lookups.
+static volatile uint64_t benchmark_sink = 0;
+
 namespace {
 
 constexpr uint32_t kBatch = 32;
@@ -241,7 +244,9 @@ void RunE1(const Options &o) {
         for (size_t b = 0; b + kBatch <= probes; b += kBatch) {
           found += LookupBatch(t->h, &s[b]);
         }
-        return (Now() - t0) * 1e9 / probes;
+        const double ns = (Now() - t0) * 1e9 / probes;
+        benchmark_sink = found;  // keep the lookups from being elided
+        return ns;
       };
       const double h = run(hit), m = run(miss);
       // Churn: replace a random live key with a fresh one (delete + insert).

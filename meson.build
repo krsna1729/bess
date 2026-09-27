@@ -112,6 +112,16 @@ common_deps = [
   dependency('numa', method: 'pkg-config', required: true),
 ]
 
+# gRPC server reflection (grpcurl and similar tools work without the protos,
+# D-026). Shipped with grpc++ but without a pkg-config file; optional.
+grpc_reflection_lib = cpp.find_library('grpc++_reflection', required: false)
+if grpc_reflection_lib.found()
+  common_deps += [declare_dependency(
+    dependencies: grpc_reflection_lib,
+    compile_args: ['-DBESS_GRPC_REFLECTION'],
+  )]
+endif
+
 gtest_dep = dependency('gtest', method: 'pkg-config', required: true)
 benchmark_dep = dependency('benchmark', method: 'pkg-config', required: true)
 benchmark_main_dep = dependency('benchmark_main', method: 'pkg-config',

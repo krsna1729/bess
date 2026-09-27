@@ -35,10 +35,13 @@
 #include "traffic_class.h"
 
 #include <google/protobuf/util/message_differencer.h>
-#include <grpc++/grpc++.h>
+#include <grpcpp/generic/generic_stub.h>
+#include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 
 #include <memory>
 #include <string>
@@ -181,6 +184,86 @@ TEST(ApiV2AdapterTest, ErrorsMapToGrpcCodes) {
   EXPECT_EQ(grpc::StatusCode::UNIMPLEMENTED,
             code(ControlErrorCode::kUnsupportedTransaction));
   EXPECT_EQ(grpc::StatusCode::INTERNAL, code(ControlErrorCode::kInternal));
+}
+
+// The server as bessd builds it (D-026): the standard health service
+// answers SERVING and reflection lists BESS's services, over generic calls
+// (raw protobuf bytes) as a tool without BESS's protos would make them.
+TEST(ControlServerTest, HealthAndReflection) {
+  InitRuntimeOnce();
+  bess::control::PrepareControlServer();
+  ControlPlane control_plane;
+  ControlV2Service service(control_plane);
+  grpc::ServerBuilder builder;
+  bess::control::ConfigureControlServer(&builder);
+  builder.RegisterService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(nullptr, server);
+  auto channel = server->InProcessChannel(grpc::ChannelArguments());
+  grpc::GenericStub generic(channel);
+  auto bytes = [](const grpc::ByteBuffer &buffer) {
+    grpc::Slice slice;
+    EXPECT_TRUE(buffer.DumpToSingleSlice(&slice).ok());
+    return std::string(reinterpret_cast<const char *>(slice.begin()),
+                       slice.size());
+  };
+
+  // grpc.health.v1.Health/Check with an empty HealthCheckRequest: the reply
+  // is HealthCheckResponse{status: SERVING (1)} = field 1, varint 1.
+  {
+    grpc::ClientContext context;
+    grpc::Slice empty;
+    grpc::ByteBuffer request(&empty, 1), reply;  // a valid, empty message
+    grpc::Status status;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    generic.UnaryCall(&context, "/grpc.health.v1.Health/Check",
+                      grpc::StubOptions(), &request, &reply,
+                      [&](grpc::Status s) {
+                        std::lock_guard<std::mutex> lock(mu);
+                        status = s;
+                        done = true;
+                        cv.notify_one();
+                      });
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait(lock, [&] { return done; });
+    ASSERT_TRUE(status.ok()) << status.error_message();
+    EXPECT_EQ(bytes(reply), std::string("\x08\x01", 2));
+  }
+
+#ifdef BESS_GRPC_REFLECTION
+  // grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo with
+  // {list_services: ""} (field 7, empty string); the reply names services.
+  {
+    grpc::ClientContext context;
+    grpc::CompletionQueue cq;
+    auto call = generic.PrepareCall(
+        &context,
+        "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo", &cq);
+    void *tag = nullptr;
+    bool ok = false;
+    call->StartCall(reinterpret_cast<void *>(1));
+    ASSERT_TRUE(cq.Next(&tag, &ok) && ok);
+    const std::string list_services("\x3a\x00", 2);
+    grpc::Slice slice(list_services);
+    grpc::ByteBuffer request(&slice, 1);
+    call->Write(request, reinterpret_cast<void *>(2));
+    ASSERT_TRUE(cq.Next(&tag, &ok) && ok);
+    grpc::ByteBuffer reply;
+    call->Read(&reply, reinterpret_cast<void *>(3));
+    ASSERT_TRUE(cq.Next(&tag, &ok) && ok);
+    const std::string services = bytes(reply);
+    EXPECT_NE(services.find("bess.pb.v2.Control"), std::string::npos);
+    EXPECT_NE(services.find("grpc.health.v1.Health"), std::string::npos);
+    call->WritesDone(reinterpret_cast<void *>(4));
+    ASSERT_TRUE(cq.Next(&tag, &ok));
+    grpc::Status status;
+    call->Finish(&status, reinterpret_cast<void *>(5));
+    ASSERT_TRUE(cq.Next(&tag, &ok));
+  }
+#endif
+  server->Shutdown();
 }
 
 // The service end to end over an in-process channel.

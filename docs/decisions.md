@@ -2091,3 +2091,46 @@ user chose typed keys and values over raw bytes.
 **Deferred:** a live Mpps-under-transactions benchmark on top of this RPC;
 the SDK's temporary references (D-021 amendment 2); a streaming bulk path
 (E4); the scope cell's ATOMIC visibility.
+
+## D-026 gRPC and protobuf practice: what changed, on what evidence
+
+**Status:** accepted (2026-09-28), on the user's invitation to bring the
+gRPC/protobuf usage to current practice "evidence backed, without any
+regressions". gRPC 1.83 (C++), grpcio 1.84 and protobuf 7.36 (upb) in
+Python, protoc 36.1, buf 1.73. Each item was kept only with evidence; two
+were measured and dropped.
+
+**Adopted:**
+
+| item | evidence |
+|---|---|
+| **pybess catches `grpc.RpcError`**, not the private `grpc._channel._Rendezvous` | since grpcio 1.26 a failed unary call raises `_InactiveRpcError`, which is not a `_Rendezvous`: callers got raw gRPC exceptions instead of `BESS.RPCError` (reproduced against a closed port). New `test_failed_rpc_raises_rpc_error` fails before, passes after. `kill()` no longer returns an unbound name when the daemon goes first. |
+| **64 MiB messages each way** (`ConfigureControlServer`, pybess channel options) | gRPC's 4 MiB default refuses a 50,000-rule transaction (6.55 MB, 131 B per typed rule; RESOURCE_EXHAUSTED, tested), and the Python client refused any reply over 4 MiB (a large rule table's config; tested: 4.32 MB refused). 64 MiB fits about 510K typed rules per transaction; beyond that belongs on a streaming path. |
+| **Health service and server reflection** | standard `grpc.health.v1.Health` answers SERVING (tested over a generic call, raw bytes); reflection lists every service (tested; and `grpc_cli ls` against a live bessd lists `bess.pb.v2.Control` with its methods). Reflection links `grpc++_reflection` when present (optional). No effect on any command or packet path. |
+| **`<grpcpp/...>` headers** instead of the deprecated `<grpc++/...>` aliases | mechanical; builds and tests unchanged. |
+| **`gate.h` no longer includes gRPC server headers** (unused) | a translation unit including `gate.h` preprocesses to 52,927 lines instead of 195,483 (−73%); nearly every module includes it. |
+| **Enum zero values are `*_UNSPECIFIED`** in the transaction messages (`STATUS_`, `OUTCOME_`, `VISIBILITY_` prefixes) | `buf lint` STANDARD: an unset enum reads as its zero value, so a reply with no outcome read as APPLIED. Changed hours after the RPC landed, before any client; the tests now assert zero is never sent. |
+| **`buf breaking` in CI** (WIRE_JSON; a pull request against its base, a push against the previous commit) | run locally: the transaction RPC is additive against the commit before it; the enum change is flagged against the commit that introduced them; and against upstream `master` it flags the intentional `CommandInfo` cutover (8b1f0e90) plus a real gap there -- the deleted field's *name* `cmd_args` was not reserved (now `reserved "cmd_args"`). An intentional break is declared with the "buf skip breaking" pull-request label. |
+| **The only compiler warning in a fresh build** (`update_scale_bench.cc`, a lookup count set but unused) | found because incremental builds had not recompiled the file; the verification counts warnings from fresh builds from now on. |
+
+**Measured and dropped:**
+
+- *Skip pybess's per-request `protobuf_to_dict`* (kept for error reports):
+  2.4 µs per request against a gRPC round trip near 100 µs -- about 2%, not
+  worth a code change.
+- *`buf lint` as a gate*: 168 findings, nearly all the legacy API's shape
+  (package layout, shared Empty messages, enum prefixes on shipped v2
+  enums); fixing them breaks clients. Lint stays advisory; new definitions
+  follow it.
+
+**Not adopted, with reasons:**
+
+- *Protobuf editions* (`edition = "2023"`): wire compatible, but explicit
+  field presence becomes the default and changes generated APIs (has-bits
+  on scalars); no benefit today. Revisit with the external plugin SDK.
+- *The callback (async) server API*: every control call serializes on the
+  control-plane lock, so more server concurrency buys nothing.
+- *`google.rpc.Status` rich errors*: needs the googleapis protos; the v2
+  API's typed `ErrorDetail` trailer already carries the structure.
+- *Client deadlines by default in pybess*: some calls (port creation, reset)
+  legitimately take long; a wrong default would be a regression.

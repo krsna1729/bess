@@ -35,9 +35,9 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <grpc++/server.h>
-#include <grpc++/server_builder.h>
-#include <grpc++/server_context.h>
+#include <grpcpp/server.h>
+#include <grpcpp/server_builder.h>
+#include <grpcpp/server_context.h>
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -1168,6 +1168,7 @@ class BESSControlImpl final : public BESSControl::Service {
 
 void ApiServer::Listen(const std::string& addr) {
   if (!builder_) {
+    bess::control::PrepareControlServer();  // before the first builder
     builder_ = new grpc::ServerBuilder();
   }
 
@@ -1190,6 +1191,7 @@ void ApiServer::Run() {
   builder_->RegisterService(&service);
   builder_->RegisterService(&service_v2);
   builder_->SetSyncServerOption(grpc::ServerBuilder::MAX_POLLERS, 1);
+  bess::control::ConfigureControlServer(builder_);
 
   std::unique_ptr<grpc::Server> server = builder_->BuildAndStart();
   if (server == nullptr) {

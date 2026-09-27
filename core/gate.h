@@ -35,8 +35,6 @@
 #include <string>
 #include <vector>
 
-#include <grpc++/server.h>
-#include <grpc/grpc.h>
 
 #include "commands.h"
 #include "message.h"

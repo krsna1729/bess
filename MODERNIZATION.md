@@ -4176,6 +4176,25 @@ rather than one call site).
        daemon tests (packets steered by RPC-added rules, cross-module
        all-or-nothing, replay, churn while traffic flows).
 
+116. **gRPC and protobuf practice, evidence-backed (D-026).**
+     - **Bug fixed:** pybess caught the private `_Rendezvous`; since grpcio
+       1.26 failed calls raise `_InactiveRpcError`, so callers got raw gRPC
+       errors instead of `RPCError` (test fails before, passes after).
+     - **Limits:** 64 MiB messages each way on the server and in pybess
+       (the 4 MiB defaults refused a 50K-rule transaction and any reply
+       over 4 MiB; both tested).
+     - **Operability:** standard health service and server reflection
+       (tested; `grpc_cli ls` works against a live bessd).
+     - **Hygiene:** `<grpcpp/>` headers; `gate.h` drops unused gRPC
+       includes (−73% preprocessed lines for every module); enum zero
+       values `*_UNSPECIFIED`; `reserved "cmd_args"`; the one warning a
+       fresh build showed.
+     - **CI:** `buf breaking` (wire + JSON) on every push and pull request.
+     - **Measured and dropped:** lazy request dicts in pybess (2.4 µs of
+       ~100 µs); `buf lint` as a gate (legacy API shape). Editions, the
+       callback API, rich errors and default deadlines declined with
+       reasons.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

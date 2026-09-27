@@ -54,7 +54,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <grpc++/grpc++.h>
+#include <grpcpp/grpcpp.h>
 #include <rte_cycles.h>
 #include <rte_hash.h>
 #include <rte_hash_crc.h>

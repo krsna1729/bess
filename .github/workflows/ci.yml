@@ -16,6 +16,36 @@ env:
   FIFO_TEST_TIMEOUT: 200
 
 jobs:
+  # Wire (and JSON) compatibility of the protobuf API against the branch's
+  # previous state: a pull request against its base, a push against the
+  # commit before it (D-026). An intentional break (the no-compatibility
+  # cutovers) is declared with the "buf skip breaking" pull-request label.
+  proto-compat:
+    name: Protobuf compatibility
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Against the pull request's base
+        if: github.event_name == 'pull_request'
+        uses: bufbuild/buf-action@v1
+        with:
+          lint: false
+          format: false
+          push: false
+          breaking: true
+          breaking_against: ${{ github.event.repository.clone_url }}#branch=${{ github.base_ref }},subdir=protobuf
+      - name: Against the previous commit
+        if: github.event_name == 'push'
+        uses: bufbuild/buf-action@v1
+        with:
+          lint: false
+          format: false
+          push: false
+          breaking: true
+          breaking_against: .git#ref=HEAD~1,subdir=protobuf
+
   build-and-test:
     name: Meson (${{ matrix.name }})
     runs-on: ubuntu-24.04

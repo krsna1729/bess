@@ -55,3 +55,16 @@ tools/ab_bench.py OLD_BINARY NEW_BINARY --filter 'BM_Lookup' \
   `--rename-b 'PATTERN=>REPLACEMENT'` to pair their names.
 - **Reporting:** state the machine (CPU model and core type), the build
   (`-march`, buildtype, compiler, DPDK version), and the command.
+
+## Live packet rate under transactions
+
+`tools/live_transaction_bench.py` measures a running bessd: packets
+classified by a real ExactMatch module on one worker while a client changes
+its rules through the transaction RPC (D-025) at given rates (each
+transaction adds one session's rule and removes the oldest). It prints Mpps
+through the module, the hit fraction (about 0.5 by construction, which
+checks that rules steer packets), transactions/s achieved and client-side
+latency. Start bessd isolated on the worker core as for any benchmark, run
+the script from another core with `PYTHONPATH` set to the generated Python
+protobufs (`build/protobuf/generated/python` and its `builtin_pb`), and
+compare rates within one run (`--rounds` interleaves them).

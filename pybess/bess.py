@@ -174,6 +174,8 @@ class BESS(object):
     BROKEN_CHANNEL = "AbnormalDisconnection"
     CLOSING_CHANNEL = "ConnectionClosing"
 
+    MAX_MESSAGE_BYTES = 64 << 20  # kMaxMessageBytes in core/control/api_v2.h
+
     def __init__(self):
         self.debug = False
         self.stub = None
@@ -219,7 +221,15 @@ class BESS(object):
             if self.channel is None:
                 self.status = None
                 self.peer = grpc_url
-                self.channel = grpc.insecure_channel(grpc_url)
+                # bessd accepts and sends messages up to 64 MiB (a large
+                # transaction, a big rule table's config); gRPC's client
+                # default would refuse replies over 4 MiB (D-026).
+                self.channel = grpc.insecure_channel(
+                    grpc_url, options=[
+                        ('grpc.max_receive_message_length',
+                         self.MAX_MESSAGE_BYTES),
+                        ('grpc.max_send_message_length',
+                         self.MAX_MESSAGE_BYTES)])
                 self.channel.subscribe(self._update_status,
                                        try_to_connect=True)
                 self.stub = service_pb2_grpc.BESSControlStub(self.channel)
@@ -307,7 +317,9 @@ class BESS(object):
 
         try:
             response = req_fn(req_pb)
-        except grpc._channel._Rendezvous as e:
+        except grpc.RpcError as e:
+            # The public base class: grpcio >= 1.26 raises _InactiveRpcError
+            # for a failed unary call, which is not a _Rendezvous.
             raise self.RPCError(str(e))
 
         if self.debug:
@@ -324,9 +336,10 @@ class BESS(object):
         return response
 
     def kill(self, block=True):
+        response = None  # the daemon may go before it answers
         try:
             response = self._request('KillBess')
-        except grpc._channel._Rendezvous:
+        except self.RPCError:
             pass
 
         if block:

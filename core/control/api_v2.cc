@@ -29,6 +29,11 @@
 
 #include "control/api_v2.h"
 
+#include <grpcpp/health_check_service_interface.h>
+#ifdef BESS_GRPC_REFLECTION
+#include <grpcpp/ext/proto_server_reflection_plugin.h>
+#endif
+
 #include <limits>
 #include <string>
 #include <type_traits>
@@ -453,6 +458,22 @@ grpc::Status ControlV2Service::ApplyPipeline(
   response->set_paused_commit_us(applied->timing.paused_commit_us);
   response->set_retire_us(applied->timing.retire_us);
   return grpc::Status::OK;
+}
+
+void PrepareControlServer() {
+  static const bool prepared = [] {
+    grpc::EnableDefaultHealthCheckService(true);
+#ifdef BESS_GRPC_REFLECTION
+    grpc::reflection::InitProtoReflectionServerBuilderPlugin();
+#endif
+    return true;
+  }();
+  (void)prepared;
+}
+
+void ConfigureControlServer(grpc::ServerBuilder *builder) {
+  builder->SetMaxReceiveMessageSize(kMaxMessageBytes);
+  builder->SetMaxSendMessageSize(kMaxMessageBytes);
 }
 
 ControlV2Service::ControlV2Service(ControlPlane &control_plane)

@@ -381,6 +381,7 @@ message GetMclassInfoResponse {
   string help = 3;               /// 1=line description of the module type
   repeated CommandInfo cmds = 4; /// Commands supported by the module
   reserved 5;                    /// Former cmd_args; now part of CommandInfo
+  reserved "cmd_args";
 }
 
 message ListModulesResponse {
@@ -538,6 +539,7 @@ message GetGateHookClassInfoResponse {
   string help = 3;               /// 1=line description of the gatehook type
   repeated CommandInfo cmds = 4; /// Commands supported by the gatehook
   reserved 5;                    /// Former cmd_args; now part of CommandInfo
+  reserved "cmd_args";
 }
 
 /// Enable/Disable the "Track" hook on a gate (or all gates)

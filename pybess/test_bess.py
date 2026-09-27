@@ -59,6 +59,18 @@ class DummyServiceImpl(service_pb2_grpc.BESSControlServicer):
         response = bess_msg.ListModulesResponse()
         return response
 
+    def ListPorts(self, request, context):
+        # A response beyond gRPC's default 4 MiB receive limit (a large
+        # rule table's config comes back like this).
+        response = bess_msg.ListPortsResponse()
+        for i in range(60000):
+            response.ports.add(name='port%06d' % i, driver='PMDPort' * 8)
+        return response
+
+    def GetVersion(self, request, context):
+        # A failing RPC, as a daemon going away mid-call looks to a client.
+        context.abort(grpc.StatusCode.UNAVAILABLE, 'daemon went away')
+
 
 class TestBESS(unittest.TestCase):
     # Do not use BESS.DEF_PORT (== 10514), as it might be being used by
@@ -68,7 +80,9 @@ class TestBESS(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=2),
+                             options=[('grpc.max_send_message_length',
+                                       64 << 20)])
         service_pb2_grpc.add_BESSControlServicer_to_server(
             DummyServiceImpl(),
             server)
@@ -97,6 +111,23 @@ class TestBESS(unittest.TestCase):
 
         response = client.kill(block=False)
         self.assertEqual(0, response.error.code)
+
+    def test_failed_rpc_raises_rpc_error(self):
+        # grpcio >= 1.26 raises _InactiveRpcError for a failed unary call,
+        # which is not a grpc._channel._Rendezvous: pybess must catch the
+        # public grpc.RpcError to turn it into BESS.RPCError.
+        client = bess.BESS()
+        client.connect(grpc_url=self.GRPC_URL)
+        with self.assertRaises(bess.BESS.RPCError) as ctx:
+            client.get_version()
+        self.assertIn('daemon went away', str(ctx.exception))
+
+    def test_large_responses_are_received(self):
+        client = bess.BESS()
+        client.connect(grpc_url=self.GRPC_URL)
+        response = client.list_ports()
+        self.assertEqual(60000, len(response.ports))
+        self.assertGreater(response.ByteSize(), 4 << 20)
 
     def test_list_modules(self):
         client = bess.BESS()

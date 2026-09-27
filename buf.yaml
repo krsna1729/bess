@@ -1,0 +1,13 @@
+# Protobuf API checks (Decision D-026). CI runs `buf breaking` on every push
+# and pull request against the previous state of the branch; lint is
+# advisory (`buf lint`): the legacy API and the v2 pipeline messages predate
+# it, and renaming their enums would break clients.
+version: v2
+modules:
+  - path: protobuf
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - WIRE_JSON

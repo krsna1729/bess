@@ -34,7 +34,7 @@
 
 #include "control/api_v2.h"
 
-#include <grpc++/grpc++.h>
+#include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -146,6 +146,7 @@ class DataplaneTransactionsTest : public ::testing::Test {
         {"wm0", "WildcardMatch", TwoFields<bess::pb::WildcardMatchArg>()}));
     service_ = std::make_unique<ControlV2Service>(*control_plane_);
     grpc::ServerBuilder builder;
+    bess::control::ConfigureControlServer(&builder);  // as bessd does
     builder.RegisterService(service_.get());
     server_ = builder.BuildAndStart();
     ASSERT_NE(nullptr, server_);
@@ -344,6 +345,39 @@ TEST_F(DataplaneTransactionsTest, RequestIdsMakeRetriesSafe) {
   stale.set_expected_generation(first.record().generation());
   EXPECT_EQ(Apply(stale).record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
   EXPECT_TRUE(Get("stale").known());
+}
+
+// A large transaction: 50,000 typed rules (about 5 MB on the wire). gRPC's
+// default 4 MiB limit refuses it; the control server's settings take it.
+TEST_F(DataplaneTransactionsTest, LargeTransactionsFitTheServerLimits) {
+  v2::ApplyTransactionRequest req;
+  for (uint32_t i = 0; i < 50000; i++) {
+    *req.add_ops() = ExactRule("em0", i, static_cast<uint16_t>(i), 1);
+  }
+  const size_t bytes = req.ByteSizeLong();
+  EXPECT_GT(bytes, size_t{4} << 20);
+  EXPECT_LT(bytes, static_cast<size_t>(bess::control::kMaxMessageBytes));
+
+  // A server with gRPC's defaults.
+  auto plain_service = std::make_unique<ControlV2Service>(*control_plane_);
+  grpc::ServerBuilder builder;
+  builder.RegisterService(plain_service.get());
+  auto plain = builder.BuildAndStart();
+  auto plain_stub = v2::Control::NewStub(
+      plain->InProcessChannel(grpc::ChannelArguments()));
+  grpc::ClientContext context;
+  v2::ApplyTransactionResponse refused;
+  const grpc::Status status =
+      plain_stub->ApplyTransaction(&context, req, &refused);
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::RESOURCE_EXHAUSTED);
+  plain->Shutdown();
+  EXPECT_EQ(Rules("em0"), 0u);
+
+  const auto r = Apply(req);
+  ASSERT_EQ(r.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+  EXPECT_EQ(Rules("em0"), 50000u);
+  std::printf("[rpc] %zu bytes for 50000 typed rules (%.0f B/op)\n", bytes,
+              static_cast<double>(bytes) / 50000);
 }
 
 // The record window is bounded, oldest first.
