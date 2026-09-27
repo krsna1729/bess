@@ -41,6 +41,7 @@ file is the reasoning.
 | D-018 | BPF execution: DPDK `rte_bpf` (with a repair pass) or the BESS JIT | open (deferred) |
 | D-019 | DRR: a multi-producer ingress ring; the task's worker owns all flow state | accepted (trade-off recorded) |
 | D-020 | Dataplane transactions: what we borrow from DPDK `rte_swx`, P4Runtime and VPP | accepted |
+| D-021 | The G1.2b transaction engine: reserve/publish, reference counts, dependency-ordered publish, a removal cascade | accepted |
 
 ---
 
@@ -1246,3 +1247,95 @@ G1.2b's design (MODERNIZATION §14.5) was waiting for.
 - a multi-controller (HA) deployment appears (then arbitration);
 - a target needs dataplane atomicity for a table the scope cell cannot
   cover.
+
+## D-021 The G1.2b transaction engine: reserve/publish, reference counts, dependency-ordered publish, a removal cascade
+
+**Status:** accepted (2026-09-27).
+**Code:**
+
+- `core/dataplane/{resource.h, transaction_engine.{h,cc}, slot_table.h,
+  slot_resource.h}`, `core/classifier/exact_rule_resource.h`;
+- tests: `core/dataplane/transaction_engine_test.cc`;
+- benchmark: `core/dataplane/transaction_bench.cc`.
+
+**Context.** Controllers (OMEC's `pfcpiface` is the worked example) order
+module commands, roll back by hand, and cannot tell whether a timed-out
+batch applied. Section 14.5 designs transactions over registered
+resources; D-020 fixed what to borrow from prior art.
+
+**Decision.**
+
+- **Resources** are named, keyed collections that a module registers. A
+  resource reserves an operation (all fallible work, nothing visible) and
+  returns a `StagedOp` whose `Publish` cannot fail. Ready-made adapters
+  mean a module author writes no reserve/publish code:
+  - `SlotResource` over a `SlotTable` (id → immutable object, mode C);
+  - `ExactRuleResource` over a `ConcurrentExactTable`.
+- **`Apply(ops)` works in stages:**
+  1. an `expected_generation` check;
+  2. structural checks: known resource, one operation per key, a value on
+     every upsert;
+  3. reserve every operation;
+  4. reference checks: every reference left must name a key that exists
+     afterwards, and an erased key must have no references left; the
+     engine keeps the reference counts;
+  5. publish, with upserts in ascending rank then erases in descending
+     rank;
+  6. one grace period retires what the transaction replaced.
+
+  A failure in stages 1-4 aborts every reservation: nothing is visible.
+  Results are per operation, in request order; a scope guard makes the
+  abort path impossible to skip.
+- **Removal cascade.** An erased key that might still be referenced by an
+  in-flight reader stays readable (`SlotTable::Retire`). Stage by stage, by
+  rank from highest down, `Unpublish` runs one grace period after the
+  previous stage (the first stage one grace period after the publish). A
+  reader that saw a referrer just before it went away is done before its
+  referent goes. Ids are reusable only after their stage has run, and
+  `ReclaimRetired()` advances the cascade (every `Apply` calls it first).
+- **A resource whose erases take effect at once** (`DefersErase() ==
+  false`; an rte_hash rule table) cannot be referenced. The engine refuses
+  such references.
+- **Serializability:** one transaction at a time (the engine's mutex); the
+  engine is the single writer of every registered resource.
+
+**Evidence.**
+
+- **Tests (13):**
+  - dependency order: the request order doesn't matter, and publish order
+    is recorded;
+  - rejection with nothing visible, for a missing referent, a referenced
+    erase, a full table, a structural error or a conflict;
+  - retirement waits for readers, and ids are not reused early;
+  - an erased referent stays readable for a reader holding its id;
+  - 3000 random transactions against a model, with reference counts and
+    no-dangling invariants checked after each;
+  - two concurrent-reader stress tests (rte_hash-rooted, and all
+    slot-table chains);
+  - references to an immediate-erase resource are refused.
+- **Mutation checks, run once:**
+  - a missing erase check fails the referenced-erase test;
+  - reversed publish order fails the ordering and concurrent-reader
+    tests;
+  - unpublishing at once fails the retirement test and crashes the stress
+    run;
+  - a single-stage cascade fails the slot-chain test.
+- **ThreadSanitizer** harness (three slot-table levels, about 33K
+  transactions and 4.3M resolutions per run): no reports, and 0 dangling.
+  Before the cascade, the same harness found 73 dangling resolutions,
+  because each table reclaimed its erased slots independently.
+- **Rate:** a session (two meters, two actions, two rules) created and
+  removed takes about 4.1 µs, which is 241K sessions/s on CPU 2 and 177K on
+  CPU 14 (native release, isolated). The §14.5 target is 100K.
+
+**Deferred (next increments):**
+
+- Router and the modules as resource providers;
+- the scope cell (dataplane-atomic scopes; §31.0 row 3);
+- `request_id` idempotency and `GetTransaction` (G1.2c, with the RPC).
+
+**Revisit when:**
+
+- one sequencer is not enough (per-table writers need a cross-table
+  serialization story);
+- a resource needs a removal that cannot wait for the cascade.

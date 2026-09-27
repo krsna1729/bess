@@ -191,6 +191,54 @@ state through G, C or W.
     reusing an id is an ABA hazard that RCU does not solve;
   - who allocates ids decides reuse.
 
+### `SlotTable<Id, T>` (id → object, mode C)
+
+- **Use for:** objects other tables refer to by id (actions, next hops,
+  meter policies) when they change one at a time. It replaces
+  `ObjectTable`'s rebuild.
+- **Reader:** `Lookup(id)`, one acquire load.
+- **Writer:** `Publish(id, object)` is one pointer store, and the replaced
+  object is retired after a grace period. Removal has two steps:
+  - `Retire(id)`: absent on the control side, but still readable;
+  - `Unpublish(id)`: empties the slot, run later by the transaction
+    engine's removal cascade.
+- Code: `core/dataplane/slot_table.h`; D-021.
+
+### Transactions over several tables (G1.2b)
+
+A module exposes its tables as **resources** and registers them with a
+`TransactionEngine`. A controller then changes several resources, across
+modules, in one call, and packets never see a failed change or a
+reference to something missing.
+
+- **Ready-made resources** (no reserve/publish code to write):
+  - `SlotResource<Id, T>` over a `SlotTable` (key = id, value = `T`);
+  - `ExactRuleResource` over a `ConcurrentExactTable` (key = key bytes,
+    value = `uint64_t`).
+
+  Each takes a function naming the keys a value refers to (a rule's
+  action, an action's meter).
+- **Rank:** a resource that refers to another has a higher rank than it.
+  Upserts publish referents first; erases remove referrers first.
+- **Semantics:**
+  - all or nothing, with every check and allocation done before anything
+    is visible;
+  - per-operation results in request order;
+  - `expected_generation` for optimistic concurrency.
+
+  Packets may see a successful transaction's operations take effect one by
+  one, in dependency order. All-at-once visibility per scope (the scope
+  cell) is a later increment.
+- **Only resources that keep erased keys readable** (`DefersErase()`) may
+  be referenced. An `rte_hash` rule table erases at once, so it is a root:
+  nothing may point at it.
+- **Cost:** a session of two meters, two actions and two rules, created
+  and then removed, takes about 4 µs in process (241K sessions/s on a
+  P-core, 177K on an E-core; `transaction_bench`).
+- Code: `core/dataplane/{resource.h, transaction_engine.{h,cc},
+  slot_resource.h}`, `core/classifier/exact_rule_resource.h`; D-020,
+  D-021.
+
 ### `MeterSet` (metering)
 
 - **What:**
