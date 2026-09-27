@@ -169,9 +169,11 @@ state through G, C or W.
   - each route change is atomic to readers;
   - a sequence of changes is not one transaction;
   - `Clear()` builds a fresh table and swaps it.
-- **`Router`:** adds next hops (`NextHopId` → `NextHop`) in an
-  `ObjectTable`, so a neighbour change republishes only the next-hop table.
-  Ordering is enforced:
+- **`Router`:** adds next hops (`NextHopId` → `NextHop`) in a `SlotTable`
+  (mode C), so a neighbour change publishes one next-hop object: 63 ns at
+  any table size, against 1.2 µs at 1K and 101 µs at 64K next hops when the
+  whole next-hop table was rebuilt (P-core, ABBA). Route lookups were
+  unchanged or faster (−8% at 1K routes on a P-core). Ordering is enforced:
   - a route can only name an existing next hop;
   - readers fence between the route and next-hop loads;
   - a next hop cannot be removed while any route names it;

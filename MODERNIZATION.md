@@ -4035,6 +4035,26 @@ rather than one call site).
        policy/state separation, G1.2c idempotency digest and daemon epoch,
        the transaction record, and the acceptance matrix.
 
+108. **Router next hops on `SlotTable` (G1.2b follow-on, §31.0 row 1).**
+     - A neighbor update is one pointer store instead of rebuilding the
+       whole next-hop `ObjectTable`. A removed next hop is retired, stays
+       readable, and has its slot emptied after its grace period.
+       References, id-reuse refusal and route-then-hop fencing are
+       unchanged; all 13 route tests pass, including the concurrent churn
+       test.
+     - **ABBA** (8 rounds, native release, isolated):
+
+       | | P-core | E-core |
+       |---|---|---|
+       | next-hop update, 1K next hops | 1.23 µs → 63 ns | 1.73 µs → 79 ns |
+       | next-hop update, 64K next hops | 101 µs → 63 ns | 136 µs → 79 ns |
+       | route lookup, 1K / 16K routes | −8.1% / −3.8% | no clear difference |
+       | route lookup, 64K routes | no clear difference | no clear difference |
+
+     - **Next:** Router as a resource provider (next hops via the slot
+       resource; routes with tbl8 reservation in prepare, per D-021
+       amendment 2), then the modules.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

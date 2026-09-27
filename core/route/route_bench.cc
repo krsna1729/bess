@@ -40,7 +40,7 @@
 //   update  -- one route change applied in place (K7) versus rebuilding the
 //              whole rte_lpm for it (the pre-K7 IPLookup behaviour), at each
 //              table size.
-//   next hop -- SetNextHop (a neighbor update: republish the next-hop table)
+//   next hop -- SetNextHop (a neighbor update: publish one next-hop object)
 //              at 1K and 64K next hops.
 //
 // Route sets follow entry 34's shape: mostly /24, some /8-/23, and /25-/32
@@ -415,7 +415,7 @@ BENCHMARK(BM_UpdateByRebuild)
     ->Unit(benchmark::kMillisecond)
     ->Iterations(3);
 
-// A neighbor update: republish the next-hop table (routes untouched).
+// A neighbor update: publish one next-hop object (routes untouched).
 void BM_NextHopUpdate(benchmark::State &state) {
   const size_t hops = static_cast<size_t>(state.range(0));
   auto router = Router::Create("route_bench_nh", ConfigFor(1024), hops,

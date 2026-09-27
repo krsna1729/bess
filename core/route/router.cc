@@ -30,6 +30,8 @@
 #include "route/router.h"
 
 #include <algorithm>
+#include <memory>
+#include <vector>
 
 namespace bess::route {
 
@@ -43,52 +45,38 @@ std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
   if (!routes) {
     return std::unexpected(routes.error());
   }
-  std::unique_ptr<Router> router(
+  return std::unique_ptr<Router>(
       new Router(std::move(*routes), max_next_hops, domain));
-  router->PublishNextHops();
-  return router;
 }
 
 Router::Router(std::unique_ptr<RouteTable<NextHopId>> routes,
                size_t max_next_hops, rcu::RcuDomain &domain)
     : routes_(std::move(routes)),
       domain_(domain),
-      next_hops_(domain),
-      desired_(max_next_hops + 1),
-      references_(max_next_hops + 1, 0),
-      is_retiring_(max_next_hops + 1, false) {}
+      next_hops_(max_next_hops),
+      references_(max_next_hops + 1, 0) {}
 
-Router::~Router() { next_hops_.ResetQuiesced(); }
-
-void Router::PublishNextHops() {
-  dataplane::ObjectTableBuilder<NextHopId, NextHop> builder(desired_.size() -
-                                                            1);
-  for (size_t i = 1; i < desired_.size(); i++) {
-    if (desired_[i]) {
-      builder.Set(NextHopId(static_cast<uint32_t>(i)), *desired_[i]);
-    }
-  }
-  auto table = std::move(builder).Build();
-  if (next_hops_.Read() == nullptr) {
-    next_hops_.Initialize(std::move(table));
-    return;
-  }
-  next_hops_.Publish(std::move(table));
-  domain_.ReclaimReady();
-}
+// The SlotTable frees what is still published (including retiring next hops)
+// when it goes: the owner destroys a Router only once no reader can use it.
+Router::~Router() = default;
 
 size_t Router::CompleteRetirementsLocked() {
-  const size_t before = retiring_.size();
+  std::vector<std::unique_ptr<const NextHop>> emptied;
   std::erase_if(retiring_, [&](const Retiring &r) {
     if (!domain_.IsComplete(r.token)) {
       return false;
     }
-    desired_[r.id.value()].reset();
-    is_retiring_[r.id.value()] = false;
+    // No reader can still obtain the id from a route; one may have just
+    // looked the object up, so it is freed after one more grace period.
+    emptied.push_back(next_hops_.Unpublish(r.id));
     return true;
   });
-  if (retiring_.size() != before) {
-    PublishNextHops();
+  if (!emptied.empty()) {
+    const rcu::GracePeriod token = domain_.StartGracePeriod();
+    for (auto &hop : emptied) {
+      domain_.Retire(token, std::move(hop));
+    }
+    domain_.ReclaimReady();
   }
   return retiring_.size();
 }
@@ -105,11 +93,16 @@ std::expected<void, RouteError> Router::SetNextHop(NextHopId id,
   if (!ValidId(id)) {
     return std::unexpected(RouteError::kInvalidId);
   }
-  if (is_retiring_[id.value()]) {
+  if (!next_hops_.CanPublish(id)) {
     return std::unexpected(RouteError::kNextHopRetiring);
   }
-  desired_[id.value()] = hop;
-  PublishNextHops();
+  // One pointer store; a reader holding the previous object keeps it until
+  // its next quiescent state.
+  auto replaced = next_hops_.Publish(id, std::make_unique<const NextHop>(hop));
+  if (replaced) {
+    domain_.Retire(domain_.StartGracePeriod(), std::move(replaced));
+    domain_.ReclaimReady();
+  }
   return {};
 }
 
@@ -119,19 +112,19 @@ std::expected<void, RouteError> Router::RemoveNextHop(NextHopId id) {
   if (!ValidId(id)) {
     return std::unexpected(RouteError::kInvalidId);
   }
-  if (!desired_[id.value()] || is_retiring_[id.value()]) {
+  if (!next_hops_.Contains(id)) {
     return std::unexpected(RouteError::kUnknownNextHop);
   }
   if (references_[id.value()] != 0) {
     return std::unexpected(RouteError::kNextHopInUse);
   }
   // No route names `id` any more, but a reader may have looked one up just
-  // before the last such route went and not yet loaded the next-hop table.
-  // Keep it published until every reader has passed a quiescent state; a
-  // later control call drops it. No waiting here (a stalled worker must not
+  // before the last such route went and not yet loaded the next hop. Keep it
+  // published until every reader has passed a quiescent state; a later
+  // control call empties the slot. No waiting here (a stalled worker must not
   // stall the command path, and a transaction must not hold a blocking wait).
+  next_hops_.Retire(id);
   retiring_.push_back({id, domain_.StartGracePeriod()});
-  is_retiring_[id.value()] = true;
   return {};
 }
 
@@ -142,7 +135,7 @@ std::expected<void, RouteError> Router::SetRoute(Ipv4Prefix prefix,
   if (!ValidId(hop)) {
     return std::unexpected(RouteError::kInvalidId);
   }
-  if (!desired_[hop.value()] || is_retiring_[hop.value()]) {
+  if (!next_hops_.Contains(hop)) {
     return std::unexpected(RouteError::kUnknownNextHop);
   }
   const std::optional<NextHopId> previous = routes_->Find(prefix);
@@ -172,11 +165,7 @@ std::expected<void, RouteError> Router::RemoveRoute(Ipv4Prefix prefix) {
 
 size_t Router::next_hop_count() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  size_t live = 0;
-  for (size_t i = 1; i < desired_.size(); i++) {
-    live += desired_[i] && !is_retiring_[i];
-  }
-  return live;
+  return next_hops_.size();  // live, not counting retiring ones
 }
 
 size_t Router::RouteReferences(NextHopId id) const {

@@ -41,7 +41,7 @@
 #include <string>
 #include <vector>
 
-#include "dataplane/object_table.h"
+#include "dataplane/slot_table.h"
 #include "dataplane/strong_id.h"
 #include "gate.h"
 #include "packet.h"
@@ -100,9 +100,9 @@ inline std::expected<void, packet::MutationError> RewriteL2(
 //   IPv4 dst --LPM--> NextHopId --ObjectTable--> NextHop
 //
 // Many routes share a next hop, so a neighbor change (a new MAC, an
-// unresolved neighbor) republishes only the next-hop table and never touches
-// the route table; a route change is one in-place rte_lpm update and never
-// copies next hops.
+// unresolved neighbor) publishes one next-hop object (a SlotTable pointer
+// store, O(1)) and never touches the route table; a route change is one
+// in-place rte_lpm update and never copies next hops.
 //
 // The two halves are published independently, and the ordering rules that
 // keep a reader from ever resolving a route to a missing next hop are
@@ -110,7 +110,7 @@ inline std::expected<void, packet::MutationError> RewriteL2(
 //
 //  - a route may only name a next hop that exists; the next hop is published
 //    first and a release fence orders it before the route's entries;
-//  - a reader resolves routes first and loads the next-hop generation after an
+//  - a reader resolves routes first and looks the next hop up after an
 //    acquire fence, so a reader that sees a route sees its next hop;
 //  - a next hop cannot be removed while any route names it, and its removal
 //    is published only after a grace period, so no reader can still be
@@ -168,10 +168,9 @@ class Router {
     uint32_t ids[kMaxBatch];
     uint64_t mask = routes_->Read().LookupBatch(dst, std::span(ids, dst.size()));
     std::atomic_thread_fence(std::memory_order_acquire);
-    const NextHopTable *table = next_hops_.Read();
     for (uint64_t m = mask; m != 0; m &= m - 1) {
       const size_t i = static_cast<size_t>(__builtin_ctzll(m));
-      if (const NextHop *hop = table->Lookup(NextHopId(ids[i]))) {
+      if (const NextHop *hop = next_hops_.Lookup(NextHopId(ids[i]))) {
         hops[i] = hop;
       } else {
         mask &= ~(uint64_t{1} << i);  // unreachable by construction
@@ -183,37 +182,31 @@ class Router {
   const NextHop *Resolve(uint32_t dst) const noexcept {
     const auto id = routes_->Read().Lookup(dst);
     std::atomic_thread_fence(std::memory_order_acquire);
-    return id ? next_hops_.Read()->Lookup(*id) : nullptr;
+    return id ? next_hops_.Lookup(*id) : nullptr;
   }
 
  private:
-  using NextHopTable = dataplane::ObjectTable<NextHopId, NextHop>;
-
   Router(std::unique_ptr<RouteTable<NextHopId>> routes, size_t max_next_hops,
          rcu::RcuDomain &domain);
 
-  bool ValidId(NextHopId id) const noexcept {
-    return id.value() != 0 && id.value() < desired_.size();
-  }
+  bool ValidId(NextHopId id) const noexcept { return next_hops_.ValidId(id); }
 
-  // Builds and publishes the next-hop table from desired_.
-  void PublishNextHops();
   // ReclaimRetired() with mutex_ held.
   size_t CompleteRetirementsLocked();
 
   std::unique_ptr<RouteTable<NextHopId>> routes_;
   rcu::RcuDomain &domain_;
-  rcu::RcuPtr<NextHopTable> next_hops_;
+  // One immutable NextHop per id, changed one at a time (mode C): a neighbor
+  // update publishes one object, O(1), instead of rebuilding every next hop.
+  dataplane::SlotTable<NextHopId, NextHop> next_hops_;
 
   mutable std::mutex mutex_;
-  std::vector<std::optional<NextHop>> desired_;  // index = id
-  std::vector<uint32_t> references_;             // routes per next hop
+  std::vector<uint32_t> references_;  // routes per next hop, index = id
   struct Retiring {
     NextHopId id;
     rcu::GracePeriod token;
   };
   std::vector<Retiring> retiring_;  // removed, still published
-  std::vector<bool> is_retiring_;   // index = id
 };
 
 }  // namespace bess::route
