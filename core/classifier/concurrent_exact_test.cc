@@ -182,6 +182,26 @@ TEST(ConcurrentExactTableTest, ReportsFullAndReusesErasedSlots) {
 // to load its value (DPDK's LF lookup compares the key, then loads the
 // value; a reused slot would give it another key's value). Once the reader
 // is quiescent, the slot comes back.
+// DPDK behaviour G1.2b relies on (D-007): rte_hash_add_key_data on a key
+// that is already present updates its value in place and never fails, even
+// when the table has no free slot. ExactRuleResource::Publish depends on it.
+TEST(ConcurrentExactTableTest, UpsertOfAPresentKeySucceedsWhenFull) {
+  auto t = MakeTable(768);
+  std::vector<uint32_t> ids;
+  for (uint32_t id = 1;; id++) {
+    const auto r = t->Upsert(B(K(id)), V(id));
+    if (r == ConcurrentExactTable::UpsertResult::kFull) {
+      break;
+    }
+    ids.push_back(id);
+    ASSERT_LT(ids.size(), 2000u);
+  }
+  for (uint32_t id : ids) {
+    ASSERT_EQ(t->Upsert(B(K(id)), V(id) + 1),
+              ConcurrentExactTable::UpsertResult::kUpdated);
+  }
+}
+
 TEST(ConcurrentExactTableTest, ErasedSlotWaitsForOnlineReaders) {
   rcu::RcuDomain &domain = control::runtime().rcu();
   auto t = MakeTable(1024);

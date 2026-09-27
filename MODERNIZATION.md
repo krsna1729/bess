@@ -3995,6 +3995,26 @@ rather than one call site).
        republish), modules as resource providers, the scope cell, then
        G1.2c RPC.
 
+106. **G1.2b review fixes (D-021 amendment).**
+     - **Findings fixed:**
+       - `Unregister` waits for pending removal steps (use-after-free);
+       - ranks are validated against every new reference;
+       - `ExactRuleResource` places new keys in prepare (`kPending`), so
+         crafted bucket-pair collisions reject cleanly instead of
+         aborting the daemon; the in-place update it relies on is pinned
+         as a DPDK behaviour test;
+       - the RCU retire queue reclaims from the front, O(reclaimed).
+     - **Mutation checks:** each finding's check, removed, reproduces the
+       bug (a CHECK on the destroyed table, a rank test failure, the
+       daemon abort).
+     - **Cost** (answering "do non-transactional users pay?"):
+       - packets never pay;
+       - direct module commands on tables in no reference relationship
+         stay direct (44 ns per operation);
+       - one-operation transactions cost 307 ns;
+       - sessions run at 216K/s with a reader online (P-core).
+     - **Queued:** trimming the engine's per-operation overhead (§31.4).
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -9911,6 +9931,13 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
    whole batch has matched; measure first.
 5. **Clean up the unused `found` warning** in
    `dataplane/update_scale_bench.cc` (Clang).
+
+- **Transaction engine per-operation overhead** (D-021 amendment): 307 ns
+  for a one-operation transaction against 44 ns for a direct table write.
+  To try: interned resource handles instead of name lookups, typed ops
+  instead of `std::any`, small-vector staging with no per-op heap
+  allocation, and batching reference-count updates. Measure with
+  `transaction_bench` `BM_SingleRule` and the session benchmarks.
 
 ### 31.5 Options kept open (decide with evidence)
 

@@ -106,7 +106,11 @@ class TransactionEngine {
   // Registers `resource` (not owned; it must outlive its registration).
   // Fails if the name is taken.
   bool Register(Resource *resource);
-  // Fails while other resources reference keys of it.
+  // Fails while other resources reference keys of it, or while its removal
+  // cascade still holds steps for it (they capture the resource's tables;
+  // a module must not destroy them before). It advances the cascade first,
+  // so with no reader online -- workers paused or stopped, as at module
+  // teardown -- one call is enough.
   bool Unregister(const std::string &name);
 
   Result Apply(std::span<const Op> ops,
@@ -127,9 +131,13 @@ class TransactionEngine {
 
   // One transaction's removals, stage by stage (ranks, highest first); the
   // next stage runs once `token` completes.
+  struct Step {
+    const Resource *owner;
+    std::move_only_function<void(Retirer &)> fn;
+  };
   struct Cascade {
     rcu::GracePeriod token;
-    std::vector<std::vector<std::move_only_function<void(Retirer &)>>> stages;
+    std::vector<std::vector<Step>> stages;
     size_t next = 0;
   };
 
@@ -138,6 +146,7 @@ class TransactionEngine {
   std::map<std::string, Resource *> resources_;
   std::map<Reference, size_t> references_;  // referent -> count
   std::vector<Cascade> cascades_;
+  std::map<const Resource *, size_t> pending_removals_;
   uint64_t generation_ = 0;
 };
 

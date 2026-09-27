@@ -258,32 +258,19 @@ void RcuDomain::RetireErased(GracePeriod token, void *object,
 
 size_t RcuDomain::ReclaimReady() {
   size_t reclaimed = 0;
-  GracePeriod oldest_pending = 0;
-
   {
     std::lock_guard<std::mutex> lock(retire_mutex_);
-
-    auto it = retired_.begin();
-    while (it != retired_.end()) {
-      if (IsGracePeriodComplete(it->token)) {
-        it->destroy(it->object);
-        it = retired_.erase(it);
-        reclaimed++;
-      } else {
-        ++it;
-      }
+    while (!retired_.empty() && IsGracePeriodComplete(retired_.front().token)) {
+      RetiredObject retired = retired_.front();
+      retired_.pop_front();
+      retired.destroy(retired.object);
+      reclaimed++;
     }
-
     stats_.objects_reclaimed += reclaimed;
     stats_.pending_retired_objects = retired_.size();
-    for (const RetiredObject &retired : retired_) {
-      if (oldest_pending == 0 || retired.token < oldest_pending) {
-        oldest_pending = retired.token;
-      }
-    }
-    stats_.oldest_pending_token = oldest_pending;
+    stats_.oldest_pending_token =
+        retired_.empty() ? 0 : retired_.front().token;
   }
-
   return reclaimed;
 }
 

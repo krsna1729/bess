@@ -31,6 +31,7 @@
 #define BESS_RCU_RCU_DOMAIN_H_
 
 #include <cstddef>
+#include <deque>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -185,7 +186,12 @@ class RcuDomain {
   size_t registered_readers_ = 0;
 
   mutable std::mutex retire_mutex_;
-  std::vector<RetiredObject> retired_;
+  // In retirement order. Tokens come from StartGracePeriod() in increasing
+  // order and DPDK completes them in order, so reclamation takes from the
+  // front and stops at the first incomplete token: O(reclaimed), not
+  // O(pending). An object retired against an older token behind a newer one
+  // is only freed later, never earlier.
+  std::deque<RetiredObject> retired_;
   const size_t retire_high_water_;
   mutable RcuStats stats_;  // counters are updated by const readers too
 };

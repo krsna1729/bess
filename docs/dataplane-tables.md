@@ -231,10 +231,23 @@ reference to something missing.
   cell) is a later increment.
 - **Only resources that keep erased keys readable** (`DefersErase()`) may
   be referenced. An `rte_hash` rule table erases at once, so it is a root:
-  nothing may point at it.
+  nothing may point at it. Ranks are checked: a referrer must rank
+  strictly above what it names.
+- **Readers of a rule table registered as a resource drop `kPending`
+  hits** (`ExactRuleResource::VisibleHits`). New keys are placed during
+  prepare with that value, so a key that cannot be placed rejects the
+  transaction instead of failing at publish.
+- **Direct commands stay direct** on tables that take part in no
+  references; a one-operation transaction costs about 307 ns against 44 ns
+  for a direct write (P-core). Tables that do take part in references are
+  written only through the engine.
+- **A module must `Unregister` its resources before destroying their
+  tables.** `Unregister` refuses while removal steps for them are pending;
+  with workers paused, one call advances the cascade and succeeds.
 - **Cost:** a session of two meters, two actions and two rules, created
-  and then removed, takes about 4 µs in process (241K sessions/s on a
-  P-core, 177K on an E-core; `transaction_bench`).
+  and then removed, takes about 4.4 µs in process (226K sessions/s on a
+  P-core, 216K with a reader online; 167K and 152K on an E-core;
+  `transaction_bench`).
 - Code: `core/dataplane/{resource.h, transaction_engine.{h,cc},
   slot_resource.h}`, `core/classifier/exact_rule_resource.h`; D-020,
   D-021.

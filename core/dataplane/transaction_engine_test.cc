@@ -133,7 +133,8 @@ class TransactionEngineTest : public ::testing::Test {
     if (table_->LookupBatch(
             classifier::ConstBytes(
                 reinterpret_cast<const classifier::Byte *>(bytes.data()), 8),
-            8, &v, 1) == 0) {
+            8, &v, 1) == 0 ||
+        v == ExactRuleResource::kPending) {
       return std::nullopt;
     }
     return v;
@@ -295,14 +296,18 @@ TEST_F(TransactionEngineTest, FullTableRejectsTheWholeTransaction) {
   auto r = Apply(ops);
   ASSERT_EQ(r.outcome, Outcome::kRejected);
   EXPECT_EQ(r.ops.back().status, OpStatus::kFailed);
-  EXPECT_NE(r.ops.back().error.find("table full"), std::string::npos);
+  EXPECT_TRUE(r.ops.back().error.find("table full") != std::string::npos ||
+              r.ops.back().error.find("no room") != std::string::npos)
+      << r.ops.back().error;
   EXPECT_EQ(table_->size(), 0u);
   EXPECT_EQ(meters_.Lookup(MeterId(2)), nullptr);
 
-  // The reservation count was reset: exactly `fits` keys now go in.
-  ops.pop_back();
+  // The aborted transaction's pending keys were taken back: slots are free
+  // again once their grace period passes (no reader is online here).
+  table_->ReclaimAll();
+  ops.resize(fits / 2);
   EXPECT_EQ(Apply(ops).outcome, Outcome::kApplied);
-  EXPECT_EQ(table_->size(), fits);
+  EXPECT_EQ(table_->size(), fits / 2 - 1);
 }
 
 TEST_F(TransactionEngineTest, ExpectedGenerationConflictAttemptsNothing) {
@@ -505,10 +510,13 @@ TEST_F(TransactionEngineTest, ReadersNeverResolveADanglingReference) {
       keys[i] = i;
     }
     while (!stop.load(std::memory_order_relaxed)) {
-      uint64_t hits = table_->LookupBatch(
-          classifier::ConstBytes(reinterpret_cast<const classifier::Byte *>(keys),
-                                 sizeof(keys)),
-          8, values, 8);
+      uint64_t hits = ExactRuleResource::VisibleHits(
+          table_->LookupBatch(
+              classifier::ConstBytes(
+                  reinterpret_cast<const classifier::Byte *>(keys),
+                  sizeof(keys)),
+              8, values, 8),
+          values);
       for (uint64_t m = hits; m != 0; m &= m - 1) {
         const size_t i = static_cast<size_t>(__builtin_ctzll(m));
         const Action *a = actions_.Lookup(ActionId(static_cast<uint32_t>(values[i])));
@@ -671,6 +679,130 @@ TEST_F(TransactionEngineTest, SlotChainsNeverDangleWhileRemovalsCascade) {
   EXPECT_EQ(dangling.load(), 0u) << "of " << resolved.load() << " resolutions";
   EXPECT_GT(resolved.load(), 1000u);
   EXPECT_GT(txns, 500u);
+}
+
+// Ranks decide publication order, so they are checked against every new
+// reference: a referrer must rank strictly above its referent.
+TEST_F(TransactionEngineTest, RankViolationsAreRefused) {
+  // Actions at rank 0 would publish before (or with) the meters they name.
+  SlotTable<ActionId, Action> low_actions(kIds);
+  SlotResource<ActionId, Action> low("low_actions", 0, low_actions,
+                                     [](const Action &a) {
+                                       return std::vector<Reference>{
+                                           {"meters", EncodeKey(a.meter)}};
+                                     });
+  // A resource naming itself.
+  SlotResource<ActionId, Action> self("self_actions", 5, low_actions,
+                                      [](const Action &a) {
+                                        return std::vector<Reference>{
+                                            {"self_actions",
+                                             EncodeKey(ActionId(1))}};
+                                      });
+  ASSERT_TRUE(engine_.Register(&low));
+  ASSERT_TRUE(engine_.Register(&self));
+  auto r = Apply({Met(1, 1), Op::Upsert("low_actions",
+                                         EncodeKey(ActionId(1)),
+                                         std::any(Action{1, MeterId(1)}))});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[1].error.find("rank violation"), std::string::npos)
+      << r.ops[1].error;
+  EXPECT_EQ(meters_.Lookup(MeterId(1)), nullptr);
+
+  r = Apply({Op::Upsert("self_actions", EncodeKey(ActionId(1)),
+                        std::any(Action{1, MeterId(0)}))});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[0].error.find("rank violation"), std::string::npos);
+  ASSERT_TRUE(engine_.Unregister("low_actions"));
+  ASSERT_TRUE(engine_.Unregister("self_actions"));
+}
+
+// Pending removal steps capture a resource's tables: Unregister must refuse
+// until they ran, even when nothing references the resource any more.
+TEST_F(TransactionEngineTest, UnregisterWaitsForPendingRemovals) {
+  constexpr rcu::ReaderId kReader = 11;
+  ASSERT_TRUE(domain_.Register(kReader).has_value());
+  domain_.Online(kReader);
+  for (int cycle = 0; cycle < 3; cycle++) {
+    SCOPED_TRACE(cycle);
+    SlotTable<MeterId, Meter> table(8);
+    SlotResource<MeterId, Meter> res("temp_meters", 0, table);
+    ASSERT_TRUE(engine_.Register(&res));
+    ASSERT_EQ(Apply({Op::Upsert("temp_meters", EncodeKey(MeterId(1)),
+                                std::any(Meter(5)))})
+                  .outcome,
+              Outcome::kApplied);
+    ASSERT_EQ(Apply({Op::Erase("temp_meters", EncodeKey(MeterId(1)))}).outcome,
+              Outcome::kApplied);
+    EXPECT_FALSE(engine_.Unregister("temp_meters"))
+        << "unregistered with a removal step still pending (reader online)";
+    domain_.Quiescent(kReader);
+    EXPECT_TRUE(engine_.Unregister("temp_meters"));
+    // `table` and `res` are destroyed here: nothing may still point at them.
+  }
+  EXPECT_EQ(engine_.ReclaimRetired(), 0u);
+  domain_.Offline(kReader);
+  domain_.Unregister(kReader);
+}
+
+// Aggregate capacity cannot promise placement: keys chosen to share one
+// rte_hash bucket pair fill it at 2 x 8 entries whatever the table's size.
+// Such a transaction must be rejected with nothing visible -- it used to
+// reach a CHECK in Publish and abort the daemon.
+TEST_F(TransactionEngineTest, KeysThatCannotBePlacedRejectCleanly) {
+  auto small = ConcurrentExactTable::Create(8, 768, domain_);
+  ASSERT_TRUE(small.has_value());
+  ExactRuleResource res("crowded_rules", 2, **small, [](uint64_t v) {
+    return std::vector<Reference>{
+        {"actions", EncodeKey(ActionId(static_cast<uint32_t>(v)))}};
+  });
+  ASSERT_TRUE(engine_.Register(&res));
+  ASSERT_EQ(Apply({Act(1, 1, 0)}).outcome, Outcome::kApplied);
+
+  // rte_hash: primary bucket = sig & mask, alternate = (primary ^ (sig >>
+  // 16)) & mask. Keys agreeing on both land in the same two buckets.
+  const uint32_t mask = 1024 / 8 - 1;  // 768 entries -> 1024 -> 128 buckets
+  std::vector<uint64_t> crowd;
+  uint32_t want_primary = 0, want_short = 0;
+  for (uint64_t k = 1; crowd.size() < 20; k++) {
+    const auto bytes = EncodeKey(k);
+    const uint32_t sig = (*small)->DpdkHash(classifier::ConstBytes(
+        reinterpret_cast<const classifier::Byte *>(bytes.data()), 8));
+    const uint32_t primary = sig & mask;
+    const uint32_t short_sig = (sig >> 16) & mask;
+    if (crowd.empty()) {
+      want_primary = primary;
+      want_short = short_sig;
+    }
+    if (primary == want_primary && short_sig == want_short) {
+      crowd.push_back(k);
+    }
+  }
+  std::vector<Op> ops;
+  for (uint64_t k : crowd) {
+    ops.push_back(Op::Upsert("crowded_rules", EncodeKey(k), std::any(uint64_t{1})));
+  }
+  const auto r = Apply(ops);
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  bool placement = false;
+  for (const auto &op : r.ops) {
+    placement |= op.error.find("no room for this key") != std::string::npos;
+  }
+  EXPECT_TRUE(placement);
+  EXPECT_EQ((*small)->size(), 0u) << "pending keys of the rejected "
+                                     "transaction were not taken back";
+  EXPECT_EQ(engine_.ReferenceCount("actions", EncodeKey(ActionId(1))), 0u);
+
+  // Sixteen of them fit in the pair's 2 x 8 slots.
+  (*small)->ReclaimAll();
+  ops.resize(16);
+  EXPECT_EQ(Apply(ops).outcome, Outcome::kApplied);
+  EXPECT_EQ((*small)->size(), 16u);
+  std::vector<Op> erase;
+  for (size_t i = 0; i < 16; i++) {
+    erase.push_back(Op::Erase("crowded_rules", EncodeKey(crowd[i])));
+  }
+  ASSERT_EQ(Apply(erase).outcome, Outcome::kApplied);
+  ASSERT_TRUE(engine_.Unregister("crowded_rules"));
 }
 
 }  // namespace

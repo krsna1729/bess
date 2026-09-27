@@ -107,6 +107,8 @@ struct Reference {
   friend auto operator<=>(const Reference &, const Reference &) = default;
 };
 
+class Resource;
+
 // Collects what a transaction's publish phase replaced, and frees it after
 // one grace period for the whole transaction (so a reader that looked
 // anything up before the publish finishes with it first).
@@ -131,7 +133,7 @@ class Retirer {
   // goes). The step receives a Retirer for whatever it replaces.
   // SlotResource's erase uses this to empty its slot.
   void RemoveLater(std::move_only_function<void(Retirer &)> step) {
-    removals_.push_back({rank_, std::move(step)});
+    removals_.push_back({rank_, owner_, std::move(step)});
   }
 
   // Runs `fn(token)` once the transaction's grace period has started: for
@@ -147,6 +149,7 @@ class Retirer {
 
   struct Removal {
     int rank;
+    const Resource *owner;  // Unregister() waits for its pending removals
     std::move_only_function<void(Retirer &)> step;
   };
 
@@ -165,7 +168,8 @@ class Retirer {
       retire_;
   std::vector<std::move_only_function<void(rcu::GracePeriod)>> after_;
   std::vector<Removal> removals_;
-  int rank_ = 0;  // of the operation publishing now (set by the engine)
+  int rank_ = 0;                     // of the operation publishing now
+  const Resource *owner_ = nullptr;  // (both set by the engine)
 };
 
 // Work a resource reserved for one operation: everything fallible is done,

@@ -1328,6 +1328,73 @@ resources; D-020 fixed what to borrow from prior art.
   removed takes about 4.1 µs, which is 241K sessions/s on CPU 2 and 177K on
   CPU 14 (native release, isolated). The §14.5 target is 100K.
 
+**Amendment (2026-09-27, external review of 13a43de1).**
+
+- **Unregister vs pending removals.** `Unregister()` checked only
+  reference counts, but a pending removal-cascade step captures the
+  resource's table. The sequence erase, then unregister, then destroy the
+  table, then `ReclaimRetired()` ran the step against a destroyed table.
+  Every step now records its owning resource, and `Unregister()` advances
+  the cascade and then refuses while any step for that resource is
+  pending. Test: `UnregisterWaitsForPendingRemovals` (a delayed reader,
+  three register/unregister cycles). Mutation: without the check, a step
+  runs on the destroyed table and trips `Unpublish`'s state check.
+- **Ranks are validated, not trusted.** Every new reference must go from a
+  strictly higher rank to a lower one; equal ranks and self-references are
+  refused. Otherwise a referrer could publish before its referent. Test:
+  `RankViolationsAreRefused`.
+- **`ExactRuleResource` prepares for real.**
+  - Aggregate capacity cannot promise placement: keys crafted to share an
+    rte_hash bucket pair fill it at 16, whatever the table's size (the
+    CRC32C seed is fixed). The old `CHECK` in `Publish` then aborted the
+    daemon, a crash a controller could trigger.
+  - Now a new key is inserted in `Reserve` with the value `kPending`,
+    which readers treat as a miss (`VisibleHits()`). A key that doesn't
+    fit rejects the transaction with nothing visible, and `Abort` erases
+    the pending keys.
+  - `Publish` only updates a present key, which rte_hash does in place
+    and cannot fail. That DPDK behaviour is pinned by
+    `ConcurrentExactTableTest.UpsertOfAPresentKeySucceedsWhenFull` (D-007).
+  - Test: `KeysThatCannotBePlacedRejectCleanly` (20 keys sharing a bucket
+    pair are rejected cleanly; 16 fit). Mutation: the old aggregate-only
+    reserve reproduces the abort.
+- **The RCU retire queue** was a vector erased from the middle on every
+  `ReclaimReady()`. It is now a deque reclaimed from the front up to the
+  first incomplete token (tokens complete in order), so the cost is
+  O(reclaimed).
+
+**Cost, and who pays it** (native release, `omarchy-benchmark --isolate`
+on two CPUs of one type; `transaction_bench`):
+
+| | P-core (CPUs 2,4) | E-core (CPUs 14,15) |
+|---|---|---|
+| one rule insert or delete, direct into the table | 44 ns | 59 ns |
+| the same as a one-operation transaction | 307 ns | 378 ns |
+| session of 6 operations, created + removed, no reader | 4.2-4.4 µs (226-236K/s) | 5.9-6.0 µs (167-169K/s) |
+| the same with a reader online, quiescing every ~10 µs | 4.6 µs (216K/s) | 6.6 µs (152K/s) |
+
+- **Packets pay nothing**, with or without transactions. The engine runs
+  on the control side; `SlotTable::Lookup` is one acquire load, and a rule
+  table's lookup is unchanged apart from dropping `kPending` hits, and
+  only in tables registered as resources.
+- **Direct commands stay direct.** A module's own commands keep writing
+  their tables directly when those tables take part in no references
+  (they neither name nor are named by another resource). They are
+  serialized with the engine by the control-plane lock, which the engine's
+  RPC path (G1.2c) holds as `ModuleCommand` does. Their rate is
+  unchanged.
+- **Resources that take part in references are written only through the
+  engine**, because a direct write would bypass the reference counts.
+  Their one-operation commands pay about 260 ns more (roughly 7×) until
+  the engine's per-operation overhead is reduced. That overhead is string
+  keys, `std::any`, map lookups and a heap-allocated staged op per
+  operation; interned handles, typed operations and small-vector staging
+  are queued (MODERNIZATION §31.4).
+- **An earlier run appeared to show readers slowing transactions** (51K
+  sessions/s). The benchmark thread and the reader thread were sharing one
+  CPU, because DPDK's EAL pins the main thread and threads inherit it. The
+  benchmark now places the reader on its own CPU.
+
 **Deferred (next increments):**
 
 - Router and the modules as resource providers;

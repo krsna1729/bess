@@ -78,11 +78,22 @@ bool TransactionEngine::Register(Resource *resource) {
 
 bool TransactionEngine::Unregister(const std::string &name) {
   std::lock_guard<std::mutex> lock(mutex_);
+  auto res = resources_.find(name);
+  if (res == resources_.end()) {
+    return false;
+  }
   auto it = references_.lower_bound(Reference{name, {}});
   if (it != references_.end() && it->first.resource == name) {
     return false;
   }
-  return resources_.erase(name) == 1;
+  // Pending removal steps capture this resource's tables: unregistering
+  // (after which the module may destroy them) must wait until they ran.
+  ReclaimRetiredLocked();
+  if (pending_removals_.contains(res->second)) {
+    return false;
+  }
+  resources_.erase(res);
+  return true;
 }
 
 uint64_t TransactionEngine::generation() const {
@@ -109,8 +120,11 @@ size_t TransactionEngine::ReclaimRetiredLocked() {
     while (cascade.next < cascade.stages.size() &&
            domain_.IsComplete(cascade.token)) {
       Retirer retirer;
-      for (auto &step : cascade.stages[cascade.next]) {
-        step(retirer);
+      for (Step &step : cascade.stages[cascade.next]) {
+        step.fn(retirer);
+        if (--pending_removals_[step.owner] == 0) {
+          pending_removals_.erase(step.owner);
+        }
       }
       cascade.next++;
       // The next stage waits a grace period from here, and what this stage
@@ -226,6 +240,18 @@ TransactionEngine::Result TransactionEngine::Apply(
       return Reject(n, op_index,
                     "references unknown resource '" + ref.resource + "'");
     }
+    // Publication order is by rank, so a referrer must rank strictly above
+    // what it references -- or its upsert could publish first and a packet
+    // resolve a missing key. Ranks are declared, so check them.
+    const Resource *referrer = resource[op_index];
+    if (target->second->rank() >= referrer->rank()) {
+      return Reject(n, op_index,
+                    "rank violation: '" + referrer->name() + "' (rank " +
+                        std::to_string(referrer->rank()) + ") references '" +
+                        ref.resource + "' (rank " +
+                        std::to_string(target->second->rank()) +
+                        "); a referrer must rank strictly higher");
+    }
     if (!target->second->DefersErase()) {
       return Reject(n, op_index,
                     "resource '" + ref.resource +
@@ -285,6 +311,7 @@ TransactionEngine::Result TransactionEngine::Apply(
   Retirer retirer;
   for (size_t i : order) {
     retirer.rank_ = resource[staged[i].op]->rank();
+    retirer.owner_ = resource[staged[i].op];
     staged[i].work->Publish(retirer);
   }
   abort.Dismiss();
@@ -316,7 +343,10 @@ TransactionEngine::Result TransactionEngine::Apply(
             retirer.removals_[i].rank != retirer.removals_[i - 1].rank) {
           cascade.stages.emplace_back();
         }
-        cascade.stages.back().push_back(std::move(retirer.removals_[i].step));
+        cascade.stages.back().push_back(
+            Step{retirer.removals_[i].owner,
+                 std::move(retirer.removals_[i].step)});
+        pending_removals_[retirer.removals_[i].owner]++;
       }
       retirer.removals_.clear();
       cascades_.push_back(std::move(cascade));
