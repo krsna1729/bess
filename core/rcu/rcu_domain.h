@@ -31,6 +31,7 @@
 #define BESS_RCU_RCU_DOMAIN_H_
 
 #include <cstddef>
+#include <atomic>
 #include <deque>
 #include <cstdint>
 #include <memory>
@@ -157,6 +158,17 @@ class RcuDomain {
 
   RcuStats Stats() const;
 
+  // Past this many pending objects, RetireErased() reclaims and then waits
+  // for grace periods (control side). Callers that must never wait, such as
+  // the transaction engine, stay below it.
+  size_t retire_high_water() const { return retire_high_water_; }
+
+  // Objects retired and not yet reclaimed, without taking a lock (an
+  // approximate, recent value; for backpressure decisions).
+  size_t pending_retired() const {
+    return pending_count_.load(std::memory_order_relaxed);
+  }
+
   // The underlying DPDK QSBR variable, for DPDK libraries with native QSBR
   // integration (K7: `rte_lpm_rcu_qsbr_add`), so their internal reclamation
   // waits on the same worker quiescent states as everything else. Hand it to
@@ -192,6 +204,7 @@ class RcuDomain {
   // O(pending). An object retired against an older token behind a newer one
   // is only freed later, never earlier.
   std::deque<RetiredObject> retired_;
+  std::atomic<size_t> pending_count_{0};  // retired_.size(), readable unlocked
   const size_t retire_high_water_;
   mutable RcuStats stats_;  // counters are updated by const readers too
 };

@@ -58,11 +58,16 @@ class SlotResource final : public Resource {
  public:
   using ReferencesFn = std::function<std::vector<Reference>(const T &)>;
 
-  SlotResource(std::string name, int rank, SlotTable<Id, T> &table,
-               ReferencesFn references = {})
-      : Resource(std::move(name), rank),
+  // `may_reference`: the resources `references` can name (declared, see
+  // Resource).
+  SlotResource(std::string name, SlotTable<Id, T> &table,
+               ReferencesFn references = {},
+               std::vector<std::string> may_reference = {})
+      : Resource(std::move(name), std::move(may_reference)),
         table_(table),
         references_(std::move(references)) {}
+
+  size_t LiveCount() const override { return table_.size(); }
 
   bool Contains(const ResourceKey &key) const override {
     Id id;

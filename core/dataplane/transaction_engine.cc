@@ -34,8 +34,14 @@
 #include <set>
 #include <utility>
 
+#include <glog/logging.h>
+
 namespace bess {
 namespace dataplane {
+
+namespace internal {
+void (*g_publish_window_hook)(bool entering) = nullptr;
+}  // namespace internal
 
 namespace {
 
@@ -71,29 +77,70 @@ class AbortGuard {
 
 }  // namespace
 
-bool TransactionEngine::Register(Resource *resource) {
+std::expected<void, std::string> TransactionEngine::Register(
+    Resource *resource) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return resources_.emplace(resource->name(), resource).second;
+  if (resources_.contains(resource->name())) {
+    return std::unexpected("resource '" + resource->name() +
+                           "' is already registered");
+  }
+  int rank = 0;
+  for (const std::string &dep : resource->declared_references()) {
+    if (dep == resource->name()) {
+      return std::unexpected("resource '" + dep + "' cannot reference itself");
+    }
+    auto it = resources_.find(dep);
+    if (it == resources_.end()) {
+      return std::unexpected("resource '" + resource->name() +
+                             "' references '" + dep +
+                             "', which is not registered (register it first)");
+    }
+    rank = std::max(rank, it->second->rank() + 1);
+  }
+  if (!resource->declared_references().empty() && resource->LiveCount() != 0) {
+    return std::unexpected("resource '" + resource->name() +
+                           "' is populated and may reference others: its "
+                           "existing references are unknown to the engine");
+  }
+  resource->rank_ = rank;
+  resources_.emplace(resource->name(), resource);
+  return {};
 }
 
-bool TransactionEngine::Unregister(const std::string &name) {
+std::expected<void, std::string> TransactionEngine::Unregister(
+    const std::string &name) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto res = resources_.find(name);
   if (res == resources_.end()) {
-    return false;
+    return std::unexpected("resource '" + name + "' is not registered");
+  }
+  for (const auto &[other_name, other] : resources_) {
+    for (const std::string &dep : other->declared_references()) {
+      if (dep == name) {
+        return std::unexpected("resource '" + other_name +
+                               "' may reference '" + name +
+                               "' (unregister it first)");
+      }
+    }
+  }
+  if (res->second->LiveCount() != 0) {
+    return std::unexpected("resource '" + name + "' still has " +
+                           std::to_string(res->second->LiveCount()) +
+                           " live key(s)");
   }
   auto it = references_.lower_bound(Reference{name, {}});
   if (it != references_.end() && it->first.resource == name) {
-    return false;
+    return std::unexpected("keys of '" + name + "' are still referenced");
   }
   // Pending removal steps capture this resource's tables: unregistering
   // (after which the module may destroy them) must wait until they ran.
   ReclaimRetiredLocked();
   if (pending_removals_.contains(res->second)) {
-    return false;
+    return std::unexpected("removals of '" + name +
+                           "' are still waiting for readers");
   }
   resources_.erase(res);
-  return true;
+  return {};
 }
 
 uint64_t TransactionEngine::generation() const {
@@ -189,6 +236,33 @@ TransactionEngine::Result TransactionEngine::Apply(
     }
   }
 
+  // -- bounded backpressure -------------------------------------------------
+  // Retirement runs behind readers. If they are slow to quiesce, never push
+  // the RCU retire queue towards the point where RetireErased() waits for
+  // them (while this lock is held), and never grow the cascade list without
+  // bound: refuse, retriably, before anything is attempted. Operations on
+  // deferred-erase (object) resources are the ones that retire objects --
+  // a replaced or removed object each; rule-table inserts retire nothing.
+  size_t may_retire = 0;
+  for (size_t i = 0; i < n; i++) {
+    may_retire += resource[i]->DefersErase() ? 1 : 0;
+  }
+  const size_t retire_budget = domain_.retire_high_water() / 2;
+  if (may_retire > retire_budget) {
+    return Reject(n, 0,
+                  "transaction retires up to " + std::to_string(may_retire) +
+                      " objects, more than one batch allows (" +
+                      std::to_string(retire_budget) + "); split it");
+  }
+  if (domain_.pending_retired() + may_retire > retire_budget ||
+      cascades_.size() >= kMaxPendingCascades) {
+    Result result;
+    result.outcome = Outcome::kBusy;
+    result.generation = generation_;
+    result.ops.resize(n);
+    return result;
+  }
+
   // -- reserve: all fallible work, nothing visible ---------------------------
   struct Staged {
     size_t op;
@@ -240,18 +314,20 @@ TransactionEngine::Result TransactionEngine::Apply(
       return Reject(n, op_index,
                     "references unknown resource '" + ref.resource + "'");
     }
-    // Publication order is by rank, so a referrer must rank strictly above
-    // what it references -- or its upsert could publish first and a packet
-    // resolve a missing key. Ranks are declared, so check them.
+    // Only declared references: the publication order is derived from the
+    // declarations, so an undeclared one could publish before its referent.
     const Resource *referrer = resource[op_index];
-    if (target->second->rank() >= referrer->rank()) {
+    const auto &declared = referrer->declared_references();
+    if (std::find(declared.begin(), declared.end(), ref.resource) ==
+        declared.end()) {
       return Reject(n, op_index,
-                    "rank violation: '" + referrer->name() + "' (rank " +
-                        std::to_string(referrer->rank()) + ") references '" +
-                        ref.resource + "' (rank " +
-                        std::to_string(target->second->rank()) +
-                        "); a referrer must rank strictly higher");
+                    "undeclared reference: '" + referrer->name() +
+                        "' may not reference '" + ref.resource +
+                        "' (declare it when constructing the resource)");
     }
+    // Holds by construction (declared references are registered first and
+    // rank below); checked because publication order depends on it.
+    DCHECK_LT(target->second->rank(), referrer->rank());
     if (!target->second->DefersErase()) {
       return Reject(n, op_index,
                     "resource '" + ref.resource +
@@ -290,7 +366,7 @@ TransactionEngine::Result TransactionEngine::Apply(
                   "references missing " + Describe(ref.resource, ref.key));
   }
 
-  // -- publish (infallible), dependency-ordered ------------------------------
+  // -- commit bookkeeping, allocated before anything is visible -------------
   std::vector<size_t> order(staged.size());
   for (size_t i = 0; i < order.size(); i++) {
     order[i] = i;
@@ -308,47 +384,98 @@ TransactionEngine::Result TransactionEngine::Apply(
     return xu ? rx < ry : rx > ry;
   });
 
+  // Only object (deferred-erase) resources retire or remove anything: one
+  // retirement or removal per operation at most, so reserve exactly that.
   Retirer retirer;
+  if (may_retire != 0) {
+    retirer.retire_.reserve(may_retire);
+    retirer.after_.reserve(may_retire);
+    retirer.removals_.reserve(may_retire);
+  }
+  // Ledger nodes for new references, so publishing only updates counts.
+  for (const auto &[ref, d] : delta) {
+    if (d > 0) {
+      references_.try_emplace(ref, 0);
+    }
+  }
+  // The removal cascade's skeleton: one stage per rank with deferred erases,
+  // highest first, and a pending-removal counter per owning resource.
+  std::vector<int> stage_ranks;
+  Cascade cascade{0, {}, 0};
+  for (size_t i = 0; may_retire != 0 && i < n; i++) {
+    if (ops[i].kind == OpKind::kErase && resource[i]->DefersErase()) {
+      stage_ranks.push_back(resource[i]->rank());
+      pending_removals_.try_emplace(resource[i], 0);
+    }
+  }
+  if (!stage_ranks.empty()) {
+    std::sort(stage_ranks.begin(), stage_ranks.end(), std::greater<int>());
+    std::vector<int> unique_ranks = stage_ranks;
+    unique_ranks.erase(std::unique(unique_ranks.begin(), unique_ranks.end()),
+                       unique_ranks.end());
+    cascade.stages.resize(unique_ranks.size());
+    for (size_t s_i = 0; s_i < unique_ranks.size(); s_i++) {
+      cascade.stages[s_i].reserve(static_cast<size_t>(std::count(
+          stage_ranks.begin(), stage_ranks.end(), unique_ranks[s_i])));
+    }
+    stage_ranks = std::move(unique_ranks);
+    cascades_.reserve(cascades_.size() + 1);
+  }
+
+  // -- publish: from here on nothing may fail, and nothing allocates --------
+  if (internal::g_publish_window_hook != nullptr) {
+    internal::g_publish_window_hook(true);
+  }
   for (size_t i : order) {
     retirer.rank_ = resource[staged[i].op]->rank();
     retirer.owner_ = resource[staged[i].op];
     staged[i].work->Publish(retirer);
   }
   abort.Dismiss();
+  for (const auto &[ref, d] : delta) {
+    auto it = references_.find(ref);
+    if (it == references_.end()) {
+      continue;  // d <= 0 for a key with no references: nothing to record
+    }
+    const int64_t after = static_cast<int64_t>(it->second) + d;
+    if (after <= 0) {
+      references_.erase(it);
+    } else {
+      it->second = static_cast<size_t>(after);
+    }
+  }
+  for (Retirer::Removal &removal : retirer.removals_) {
+    // Stages were sized from the erase operations; a resource that removes
+    // later on another path lands in its rank's stage all the same.
+    size_t s_i = 0;
+    while (s_i < stage_ranks.size() && stage_ranks[s_i] != removal.rank) {
+      s_i++;
+    }
+    if (s_i == stage_ranks.size()) {
+      stage_ranks.push_back(removal.rank);  // unplanned: may allocate
+      cascade.stages.emplace_back();
+    }
+    cascade.stages[s_i].push_back(Step{removal.owner, std::move(removal.step)});
+    pending_removals_[removal.owner]++;
+  }
+  retirer.removals_.clear();
+  generation_++;
+  if (internal::g_publish_window_hook != nullptr) {
+    internal::g_publish_window_hook(false);
+  }
+
+  // -- committed: resources' own cleanup and asynchronous reclamation --------
   for (Resource *r : touched) {
     r->EndTransaction();
   }
-
-  for (const auto &[ref, d] : delta) {
-    const int64_t after = static_cast<int64_t>(references_[ref]) + d;
-    if (after <= 0) {
-      references_.erase(ref);
-    } else {
-      references_[ref] = static_cast<size_t>(after);
-    }
+  for (auto it = pending_removals_.begin(); it != pending_removals_.end();) {
+    it = it->second == 0 ? pending_removals_.erase(it) : std::next(it);
   }
-  generation_++;
-
-  if (!retirer.empty() || !retirer.removals_.empty()) {
+  std::erase_if(cascade.stages, [](const auto &stage) { return stage.empty(); });
+  if (!retirer.empty() || !cascade.stages.empty()) {
     const rcu::GracePeriod token = domain_.StartGracePeriod();
-    if (!retirer.removals_.empty()) {
-      // Stages by rank, highest (referrers) first.
-      std::stable_sort(retirer.removals_.begin(), retirer.removals_.end(),
-                       [](const Retirer::Removal &a, const Retirer::Removal &b) {
-                         return a.rank > b.rank;
-                       });
-      Cascade cascade{token, {}, 0};
-      for (size_t i = 0; i < retirer.removals_.size(); i++) {
-        if (i == 0 ||
-            retirer.removals_[i].rank != retirer.removals_[i - 1].rank) {
-          cascade.stages.emplace_back();
-        }
-        cascade.stages.back().push_back(
-            Step{retirer.removals_[i].owner,
-                 std::move(retirer.removals_[i].step)});
-        pending_removals_[retirer.removals_[i].owner]++;
-      }
-      retirer.removals_.clear();
+    if (!cascade.stages.empty()) {
+      cascade.token = token;
       cascades_.push_back(std::move(cascade));
     }
     retirer.Finish(domain_, token);

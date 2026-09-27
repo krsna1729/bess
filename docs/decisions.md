@@ -1395,6 +1395,111 @@ on two CPUs of one type; `transaction_bench`):
   CPU, because DPDK's EAL pins the main thread and threads inherit it. The
   benchmark now places the reader on its own CPU.
 
+**Amendment 2 (2026-09-27): adopted from two external design documents,
+each point checked first.**
+
+- **A declared dependency graph replaces caller-assigned ranks.**
+  - A resource declares, at construction, which resources its values may
+    reference. They must be registered first, so the graph is acyclic by
+    construction, and the engine derives the rank (0, or 1 + the highest
+    declared dependency's rank).
+  - A value naming an undeclared resource is refused. The rank comparison
+    stays only as an internal invariant (a `DCHECK`), because it cannot be
+    violated any more.
+  - Test: `DependencyDeclarationsAreEnforced`. Mutation: without the check,
+    the invariant `DCHECK` aborts.
+- **The full lifetime contract for `Register`/`Unregister`** (which now
+  return the reason for a refusal). `Unregister` is refused while another
+  registered resource declares this one, while it has live keys, while its
+  keys are referenced, or while removal steps for it are pending.
+  `Register` is refused for a populated resource that declares references,
+  since its existing references would be missing from the ledger.
+- **Publication does not allocate.** Retirer storage (sized to the
+  operations that can retire, which for rule tables is none), ledger nodes
+  for new references, pending-removal counters and the cascade's per-rank
+  stages are all allocated before the first publish. Test:
+  `PublicationDoesNotAllocate` counts allocations with a replaced global
+  `operator new` inside a test-only publication-window hook, across
+  establish, re-point, replace and erase: zero. Mutation: dropping one
+  reservation is caught. What stays after commit is enqueueing retired
+  objects on the RCU deque.
+- **Bounded backpressure instead of waiting under the lock.** With readers
+  slow to quiesce, the RCU retire queue grew until `RetireErased()` fell
+  into `Synchronize()` while holding the engine's lock, a hang for as long
+  as the reader stalled. Now a transaction that would push pending
+  retirements past half the high-water mark, or add a cascade past 4096
+  pending, gets the retriable outcome `kBusy` with nothing attempted. A
+  single transaction that could retire more than that is refused with a
+  request to split it. Test: `SlowReadersGetBackpressureNotAHang` (a
+  reader online that never quiesces). Mutation: without the check, the
+  test hangs (killed by its timeout).
+- **Checked, and not adopted as a change:** "`rte_hash_del_key` can wait
+  for readers synchronously".
+  - True in DPDK 25.11.3 when the defer queue is full
+    (`rte_cuckoo_hash.c`, the `rte_rcu_qsbr_dq_enqueue` failure path).
+  - It cannot happen with our configuration. The default `dq_size` is the
+    table's key-slot count (`rte_cuckoo_hash.c:1648-1650`), the ring holds
+    at least that (`align32pow2(size + 1)`, `rte_rcu_qsbr.c`), and each
+    outstanding entry is one deleted slot. We do not set
+    `free_key_data_func`, so the other synchronize path returns early.
+  - Pinned as a DPDK behaviour test (D-007):
+    `ConcurrentExactTableTest.DeletesNeverWaitForStalledReaders` deletes
+    every key of a full table with a stalled reader and requires prompt
+    completion.
+
+**Cost of this amendment** (paired ABBA, 8 rounds, against fd836db2,
+native release, isolated): P-cores (2,4): no clear difference for
+sessions, with or without a reader online; one-operation transactions
++2.7%. E-cores (14,15): sessions +4.3%, one-operation +4.0%, online-reader
+sessions no clear difference. Direct table writes unchanged. Before this
+comparison, back-to-back runs had suggested +27%; that was machine drift,
+and the paired protocol settled it.
+
+**Recorded from the same documents, for the increments ahead** (not built
+yet):
+
+- **Scope cell (strict atomicity):**
+  - a stable `ScopeCell` points to an immutable `ScopeVersion`, loaded
+    once per packet-processing operation and used for every covered
+    lookup;
+  - only the affected entries are versioned, with old and new
+    interpretations kept until the flip, and no copy of a session or table;
+  - valid only if the scope is identified independently of the rules
+    being changed, and overlapping masked or range rules outside the scope
+    cannot change the winning match;
+  - otherwise reject the requested atomicity, never downgrade silently;
+  - mutable meter tokens and live counters stay separately owned state,
+    referenced by the selected policy version, not copied.
+- **`rte_lpm` is not a pending-key table:** a staged more-specific prefix
+  overrides a less-specific route even with an "invalid" value.
+  Ordinary route updates stay direct. Multi-route transactions need a
+  prepared route-table generation (K7's build-and-swap), or are refused.
+  tbl8 exhaustion is a preparation failure, never a publish failure.
+- **IDs carried across asynchronous queues** (packet metadata through a
+  worker handoff, a buffer, or a hardware MARK): a CPU grace period does not
+  prove the queued packet was consumed. Such IDs need generation-tagged
+  handles, or queue-drain protection before reuse.
+- **Meters:** the immutable policy object is separate from mutable token
+  state, so an unchanged meter is never reset by a transaction (K5 already
+  separates profile from state; the provider must keep that).
+- **G1.2c:**
+  - `request_id` with a digest of the request: replay returns the recorded
+    outcome, and reuse with different contents is refused;
+  - `GetTransaction` for timeouts;
+  - a daemon epoch, so outcomes from before a restart are reported as
+    unknown, not as exactly-once;
+  - one intelligible transaction record: generations, operations in
+    request order, derived dependency order, commit state and outstanding
+    reclamation (committed-with-cleanup-pending is committed, not failed).
+- **SDK:** temporary references resolved by the SDK; the server derives
+  the order. An OMEC layer on top (`ModifySession().PutPDR/FAR/QER`).
+- **Acceptance matrix still to build:**
+  - update p50/p99 and time spent waiting for grace periods;
+  - packet Mpps under 1M modifications/s with workers online;
+  - an in-process ExactMatch → Action → Meter → Router pipeline on virtual
+    PMDs;
+  - failure injection at every prepare allocation and DPDK reservation.
+
 **Deferred (next increments):**
 
 - Router and the modules as resource providers;

@@ -38,6 +38,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstdlib>
+#include <new>
 #include <map>
 #include <random>
 #include <set>
@@ -48,6 +50,34 @@
 #include "control/runtime_state.h"
 #include "dataplane/slot_resource.h"
 #include "dataplane/strong_id.h"
+
+// Allocation counting for the publication window: every allocation made while
+// the engine's test hook reports "publishing" is counted (none are allowed).
+namespace {
+thread_local bool g_in_publish = false;
+std::atomic<size_t> g_publish_allocations{0};
+}  // namespace
+
+// Replacing the global allocation functions pairs malloc with free by design;
+// GCC's -Wmismatched-new-delete does not know these are the replacements.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+void *operator new(std::size_t n) {
+  if (g_in_publish) {
+    g_publish_allocations++;
+  }
+  if (void *p = std::malloc(n == 0 ? 1 : n)) {
+    return p;
+  }
+  throw std::bad_alloc();
+}
+void *operator new[](std::size_t n) { return operator new(n); }
+void operator delete(void *p) noexcept { std::free(p); }
+void operator delete[](void *p) noexcept { std::free(p); }
+void operator delete(void *p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
+#pragma GCC diagnostic pop
 
 namespace bess::dataplane {
 namespace {
@@ -84,20 +114,23 @@ class TransactionEngineTest : public ::testing::Test {
     ASSERT_TRUE(t.has_value()) << t.error();
     table_ = std::move(*t);
     meters_res_ = std::make_unique<SlotResource<MeterId, Meter>>(
-        "meters", 0, meters_);
+        "meters", meters_);
     actions_res_ = std::make_unique<SlotResource<ActionId, Action>>(
-        "actions", 1, actions_, [](const Action &a) {
+        "actions", actions_, [](const Action &a) {
           std::vector<Reference> refs;
           if (a.meter.value() != 0) {
             refs.push_back({"meters", EncodeKey(a.meter)});
           }
           return refs;
-        });
+        },
+        std::vector<std::string>{"meters"});
     rules_res_ = std::make_unique<ExactRuleResource>(
-        "rules", 2, *table_, [](uint64_t action) {
+        "rules", *table_,
+        [](uint64_t action) {
           return std::vector<Reference>{
               {"actions", EncodeKey(ActionId(static_cast<uint32_t>(action)))}};
-        });
+        },
+        std::vector<std::string>{"actions"});
     ASSERT_TRUE(engine_.Register(meters_res_.get()));
     ASSERT_TRUE(engine_.Register(actions_res_.get()));
     ASSERT_TRUE(engine_.Register(rules_res_.get()));
@@ -178,8 +211,10 @@ TEST_F(TransactionEngineTest, AppliesADependentSetGivenInAnyOrder) {
 // A test resource that records the order in which operations publish.
 class Recorder final : public Resource {
  public:
-  Recorder(std::string name, int rank, std::vector<std::string> *log)
-      : Resource(std::move(name), rank), log_(log) {}
+  Recorder(std::string name, std::vector<std::string> deps,
+           std::vector<std::string> *log)
+      : Resource(std::move(name), std::move(deps)), log_(log) {}
+  size_t LiveCount() const override { return keys_.size(); }
   bool Contains(const ResourceKey &key) const override {
     return keys_.contains(key);
   }
@@ -208,7 +243,7 @@ class Recorder final : public Resource {
 
 TEST_F(TransactionEngineTest, PublishesUpsertsReferentsFirstAndErasesReferrersFirst) {
   std::vector<std::string> log;
-  Recorder a("a", 0, &log), b("b", 1, &log), c("c", 2, &log);
+  Recorder a("a", {}, &log), b("b", {"a"}, &log), c("c", {"b"}, &log);
   TransactionEngine engine(domain_);
   ASSERT_TRUE(engine.Register(&a) && engine.Register(&b) &&
               engine.Register(&c));
@@ -583,9 +618,14 @@ TEST_F(TransactionEngineTest, ReadersNeverResolveADanglingReference) {
 // not be a referent: a referrer's old value could hand a reader a key that is
 // already gone.
 TEST_F(TransactionEngineTest, ReferencesToAnImmediateEraseResourceAreRefused) {
-  ExactRuleResource other("other_rules", 3, *table_, [](uint64_t v) {
-    return std::vector<Reference>{{"rules", EncodeKey(v)}};
-  });
+  auto other_table = ConcurrentExactTable::Create(8, 768, domain_);
+  ASSERT_TRUE(other_table.has_value());
+  ExactRuleResource other(
+      "other_rules", **other_table,
+      [](uint64_t v) {
+        return std::vector<Reference>{{"rules", EncodeKey(v)}};
+      },
+      {"rules"});
   ASSERT_TRUE(engine_.Register(&other));
   ASSERT_EQ(Apply({Act(1, 1, 0), Rule(10, 1)}).outcome, Outcome::kApplied);
   auto r = Apply({Op::Upsert("other_rules", EncodeKey(uint64_t{99}),
@@ -609,9 +649,11 @@ TEST_F(TransactionEngineTest, SlotChainsNeverDangleWhileRemovalsCascade) {
   };
   SlotTable<RuleId, RuleObj> rules(16);
   SlotResource<RuleId, RuleObj> rules_res(
-      "slot_rules", 2, rules, [](const RuleObj &r) {
+      "slot_rules", rules,
+      [](const RuleObj &r) {
         return std::vector<Reference>{{"actions", EncodeKey(r.action)}};
-      });
+      },
+      {"actions"});
   ASSERT_TRUE(engine_.Register(&rules_res));
   constexpr rcu::ReaderId kReader = 10;
   ASSERT_TRUE(domain_.Register(kReader).has_value());
@@ -673,6 +715,13 @@ TEST_F(TransactionEngineTest, SlotChainsNeverDangleWhileRemovalsCascade) {
   stop = true;
   reader.join();
   domain_.Unregister(kReader);
+  // Empty the resource before unregistering it (live keys block that).
+  for (uint32_t k = 1; k <= 8; k++) {
+    if (version[k] >= 0) {
+      ASSERT_EQ(Apply({Op::Erase("slot_rules", EncodeKey(RuleId(k)))}).outcome,
+                Outcome::kApplied);
+    }
+  }
   while (engine_.ReclaimRetired() != 0) {
   }
   ASSERT_TRUE(engine_.Unregister("slot_rules"));
@@ -681,39 +730,76 @@ TEST_F(TransactionEngineTest, SlotChainsNeverDangleWhileRemovalsCascade) {
   EXPECT_GT(txns, 500u);
 }
 
-// Ranks decide publication order, so they are checked against every new
-// reference: a referrer must rank strictly above its referent.
-TEST_F(TransactionEngineTest, RankViolationsAreRefused) {
-  // Actions at rank 0 would publish before (or with) the meters they name.
-  SlotTable<ActionId, Action> low_actions(kIds);
-  SlotResource<ActionId, Action> low("low_actions", 0, low_actions,
-                                     [](const Action &a) {
-                                       return std::vector<Reference>{
-                                           {"meters", EncodeKey(a.meter)}};
-                                     });
-  // A resource naming itself.
-  SlotResource<ActionId, Action> self("self_actions", 5, low_actions,
-                                      [](const Action &a) {
-                                        return std::vector<Reference>{
-                                            {"self_actions",
-                                             EncodeKey(ActionId(1))}};
-                                      });
-  ASSERT_TRUE(engine_.Register(&low));
-  ASSERT_TRUE(engine_.Register(&self));
-  auto r = Apply({Met(1, 1), Op::Upsert("low_actions",
+// The publication order is derived from declared dependencies, never from
+// caller-assigned numbers: a value may only name a declared resource, a
+// dependency must be registered first (so the graph is acyclic), and a
+// resource leaves only when nothing depends on it and it holds no keys.
+TEST_F(TransactionEngineTest, DependencyDeclarationsAreEnforced) {
+  EXPECT_EQ(meters_res_->rank(), 0);
+  EXPECT_EQ(actions_res_->rank(), 1);
+  EXPECT_EQ(rules_res_->rank(), 2);
+
+  // Names meters without declaring them.
+  SlotTable<ActionId, Action> other_actions(kIds);
+  SlotResource<ActionId, Action> undeclared(
+      "undeclared_actions", other_actions, [](const Action &a) {
+        return std::vector<Reference>{{"meters", EncodeKey(a.meter)}};
+      });
+  ASSERT_TRUE(engine_.Register(&undeclared));
+  EXPECT_EQ(undeclared.rank(), 0);
+  auto r = Apply({Met(1, 1), Op::Upsert("undeclared_actions",
                                          EncodeKey(ActionId(1)),
                                          std::any(Action{1, MeterId(1)}))});
   ASSERT_EQ(r.outcome, Outcome::kRejected);
-  EXPECT_NE(r.ops[1].error.find("rank violation"), std::string::npos)
+  EXPECT_NE(r.ops[1].error.find("undeclared reference"), std::string::npos)
       << r.ops[1].error;
   EXPECT_EQ(meters_.Lookup(MeterId(1)), nullptr);
+  ASSERT_TRUE(engine_.Unregister("undeclared_actions"));
 
-  r = Apply({Op::Upsert("self_actions", EncodeKey(ActionId(1)),
-                        std::any(Action{1, MeterId(0)}))});
-  ASSERT_EQ(r.outcome, Outcome::kRejected);
-  EXPECT_NE(r.ops[0].error.find("rank violation"), std::string::npos);
-  ASSERT_TRUE(engine_.Unregister("low_actions"));
-  ASSERT_TRUE(engine_.Unregister("self_actions"));
+  // Self-dependency, and a dependency that is not registered.
+  SlotResource<ActionId, Action> self("self", other_actions, {}, {"self"});
+  auto reg = engine_.Register(&self);
+  ASSERT_FALSE(reg);
+  EXPECT_NE(reg.error().find("itself"), std::string::npos);
+  SlotResource<ActionId, Action> orphan("orphan", other_actions, {},
+                                        {"not_registered"});
+  reg = engine_.Register(&orphan);
+  ASSERT_FALSE(reg);
+  EXPECT_NE(reg.error().find("register it first"), std::string::npos);
+
+  // Nothing leaves while a registered resource depends on it, or while it
+  // holds keys.
+  auto un = engine_.Unregister("meters");
+  ASSERT_FALSE(un);
+  EXPECT_NE(un.error().find("may reference 'meters'"), std::string::npos);
+  SlotTable<MeterId, Meter> leaf_table(8);
+  SlotResource<MeterId, Meter> leaf("leaf", leaf_table);
+  ASSERT_TRUE(engine_.Register(&leaf));
+  ASSERT_EQ(Apply({Op::Upsert("leaf", EncodeKey(MeterId(1)),
+                              std::any(Meter(1)))})
+                .outcome,
+            Outcome::kApplied);
+  un = engine_.Unregister("leaf");
+  ASSERT_FALSE(un);
+  EXPECT_NE(un.error().find("live key"), std::string::npos);
+  ASSERT_EQ(Apply({Op::Erase("leaf", EncodeKey(MeterId(1)))}).outcome,
+            Outcome::kApplied);
+  ASSERT_TRUE(engine_.Unregister("leaf"));
+
+  // A populated resource that may reference others cannot join: its
+  // existing references would be missing from the ledger.
+  SlotTable<ActionId, Action> populated_table(8);
+  populated_table.Publish(ActionId(1),
+                          std::make_unique<const Action>(Action{1, MeterId(9)}));
+  SlotResource<ActionId, Action> populated(
+      "populated", populated_table,
+      [](const Action &a) {
+        return std::vector<Reference>{{"meters", EncodeKey(a.meter)}};
+      },
+      {"meters"});
+  reg = engine_.Register(&populated);
+  ASSERT_FALSE(reg);
+  EXPECT_NE(reg.error().find("populated"), std::string::npos);
 }
 
 // Pending removal steps capture a resource's tables: Unregister must refuse
@@ -725,7 +811,7 @@ TEST_F(TransactionEngineTest, UnregisterWaitsForPendingRemovals) {
   for (int cycle = 0; cycle < 3; cycle++) {
     SCOPED_TRACE(cycle);
     SlotTable<MeterId, Meter> table(8);
-    SlotResource<MeterId, Meter> res("temp_meters", 0, table);
+    SlotResource<MeterId, Meter> res("temp_meters", table);
     ASSERT_TRUE(engine_.Register(&res));
     ASSERT_EQ(Apply({Op::Upsert("temp_meters", EncodeKey(MeterId(1)),
                                 std::any(Meter(5)))})
@@ -751,10 +837,13 @@ TEST_F(TransactionEngineTest, UnregisterWaitsForPendingRemovals) {
 TEST_F(TransactionEngineTest, KeysThatCannotBePlacedRejectCleanly) {
   auto small = ConcurrentExactTable::Create(8, 768, domain_);
   ASSERT_TRUE(small.has_value());
-  ExactRuleResource res("crowded_rules", 2, **small, [](uint64_t v) {
-    return std::vector<Reference>{
-        {"actions", EncodeKey(ActionId(static_cast<uint32_t>(v)))}};
-  });
+  ExactRuleResource res(
+      "crowded_rules", **small,
+      [](uint64_t v) {
+        return std::vector<Reference>{
+            {"actions", EncodeKey(ActionId(static_cast<uint32_t>(v)))}};
+      },
+      {"actions"});
   ASSERT_TRUE(engine_.Register(&res));
   ASSERT_EQ(Apply({Act(1, 1, 0)}).outcome, Outcome::kApplied);
 
@@ -803,6 +892,61 @@ TEST_F(TransactionEngineTest, KeysThatCannotBePlacedRejectCleanly) {
   }
   ASSERT_EQ(Apply(erase).outcome, Outcome::kApplied);
   ASSERT_TRUE(engine_.Unregister("crowded_rules"));
+}
+
+// Publication must not do work that can fail: every allocation happens in
+// preparation, and the publish phase only runs the staged operations and
+// updates bookkeeping that already exists. Counted with a global operator new
+// while the engine reports the publication window.
+TEST_F(TransactionEngineTest, PublicationDoesNotAllocate) {
+  internal::g_publish_window_hook = [](bool entering) {
+    g_in_publish = entering;
+  };
+  g_publish_allocations = 0;
+  // Establish, re-point, replace, erase a chain -- every publish path.
+  ASSERT_EQ(Apply({Rule(10, 5), Act(5, 3, 7), Met(7, 1000)}).outcome,
+            Outcome::kApplied);
+  ASSERT_EQ(Apply({Act(6, 2, 7), Rule(10, 6), EraseAct(5)}).outcome,
+            Outcome::kApplied);
+  ASSERT_EQ(Apply({Met(7, 2000)}).outcome, Outcome::kApplied);
+  ASSERT_EQ(Apply({EraseRule(10), EraseAct(6), EraseMet(7)}).outcome,
+            Outcome::kApplied);
+  internal::g_publish_window_hook = nullptr;
+  EXPECT_EQ(g_publish_allocations.load(), 0u)
+      << "the publication phase allocated";
+}
+
+// Reclamation runs behind readers. With a reader that stops quiescing, the
+// engine must refuse new work retriably (kBusy) rather than push the RCU
+// retire queue to the point where it waits for readers under the lock -- a
+// hang for as long as the reader stalls.
+TEST_F(TransactionEngineTest, SlowReadersGetBackpressureNotAHang) {
+  constexpr rcu::ReaderId kReader = 12;
+  ASSERT_TRUE(domain_.Register(kReader).has_value());
+  domain_.Online(kReader);  // and never reports quiescence below
+  ASSERT_EQ(Apply({Met(1, 0)}).outcome, Outcome::kApplied);
+  size_t applied = 0;
+  bool busy = false;
+  for (uint32_t i = 1; i < 10000 && !busy; i++) {
+    // Each replacement retires the previous meter object.
+    const auto r = Apply({Met(1, i)});
+    if (r.outcome == Outcome::kBusy) {
+      busy = true;
+      EXPECT_EQ(r.ops[0].status, OpStatus::kNotApplied);
+    } else {
+      ASSERT_EQ(r.outcome, Outcome::kApplied);
+      applied++;
+    }
+  }
+  EXPECT_TRUE(busy) << "no backpressure after " << applied << " transactions";
+  EXPECT_LE(domain_.Stats().pending_retired_objects,
+            domain_.retire_high_water());
+  domain_.Quiescent(kReader);
+  domain_.ReclaimReady();
+  EXPECT_EQ(Apply({Met(1, 1)}).outcome, Outcome::kApplied)
+      << "work resumes once the reader quiesces";
+  domain_.Offline(kReader);
+  domain_.Unregister(kReader);
 }
 
 }  // namespace

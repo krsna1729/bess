@@ -31,6 +31,7 @@
 #define BESS_DATAPLANE_TRANSACTION_ENGINE_H_
 
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -73,6 +74,13 @@ namespace dataplane {
 // default packets may see the operations of a successful transaction take
 // effect one by one, in the order above; all-at-once visibility per scope
 // (the scope cell of section 14.5) is a later increment.
+namespace internal {
+// Test-only: called with true as the publication phase starts and false as it
+// ends (a test counts allocations in between; none are allowed). Null in
+// production.
+extern void (*g_publish_window_hook)(bool entering);
+}  // namespace internal
+
 class TransactionEngine {
  public:
   enum class OpStatus : uint8_t {
@@ -90,6 +98,8 @@ class TransactionEngine {
     kApplied,
     kRejected,  // an operation failed; results say which and why
     kConflict,  // expected_generation did not match; nothing was attempted
+    kBusy,      // reclamation is behind (readers slow to quiesce); nothing
+                // was attempted -- retry later
   };
 
   struct Result {
@@ -103,15 +113,22 @@ class TransactionEngine {
   TransactionEngine(const TransactionEngine &) = delete;
   TransactionEngine &operator=(const TransactionEngine &) = delete;
 
-  // Registers `resource` (not owned; it must outlive its registration).
-  // Fails if the name is taken.
-  bool Register(Resource *resource);
-  // Fails while other resources reference keys of it, or while its removal
-  // cascade still holds steps for it (they capture the resource's tables;
-  // a module must not destroy them before). It advances the cascade first,
-  // so with no reader online -- workers paused or stopped, as at module
-  // teardown -- one call is enough.
-  bool Unregister(const std::string &name);
+  // Registers `resource` (not owned; it must outlive its registration) and
+  // derives its rank from its declared references, which must already be
+  // registered. Refused: a taken name, an undeclared or unregistered
+  // dependency, a self-dependency, or a populated resource that may
+  // reference others (its existing references would be missing from the
+  // ledger).
+  std::expected<void, std::string> Register(Resource *resource);
+
+  // Refused while: another registered resource declares this one as a
+  // reference; it has live keys (erase them in a transaction first -- their
+  // outgoing references are in the ledger); keys of it are referenced; or its
+  // removal cascade still holds steps for it (they capture its tables, which
+  // the module must not destroy before). It advances the cascade first, so
+  // with no reader online -- workers paused or stopped, as at module
+  // teardown -- that last condition clears in the same call.
+  std::expected<void, std::string> Unregister(const std::string &name);
 
   Result Apply(std::span<const Op> ops,
                std::optional<uint64_t> expected_generation = std::nullopt);
@@ -126,6 +143,9 @@ class TransactionEngine {
                         const ResourceKey &key) const;
 
  private:
+  // More pending removal cascades than this and Apply() answers kBusy.
+  static constexpr size_t kMaxPendingCascades = 4096;
+
   Result Reject(size_t n_ops, size_t failed, std::string error) const;
   size_t ReclaimRetiredLocked();
 

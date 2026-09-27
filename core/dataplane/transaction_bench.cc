@@ -97,19 +97,33 @@ void BM_SessionEstablishRelease(benchmark::State &state) {
       8, ConcurrentExactTable::CapacityFor(sessions * 2 + 64), domain);
   SlotTable<MeterId, Meter> meters(sessions * 2 + 2);
   SlotTable<ActionId, Action> actions(sessions * 2 + 2);
-  SlotResource<MeterId, Meter> meters_res("meters", 0, meters);
+  SlotResource<MeterId, Meter> meters_res("meters", meters);
   SlotResource<ActionId, Action> actions_res(
-      "actions", 1, actions, [](const Action &a) {
+      "actions", actions,
+      [](const Action &a) {
         return std::vector<Reference>{{"meters", EncodeKey(a.meter)}};
-      });
-  ExactRuleResource rules_res("rules", 2, *table, [](uint64_t v) {
-    return std::vector<Reference>{
-        {"actions", EncodeKey(ActionId(static_cast<uint32_t>(v)))}};
-  });
+      },
+      {"meters"});
+  ExactRuleResource rules_res(
+      "rules", *table,
+      [](uint64_t v) {
+        return std::vector<Reference>{
+            {"actions", EncodeKey(ActionId(static_cast<uint32_t>(v)))}};
+      },
+      {"actions"});
   TransactionEngine engine(domain);
-  engine.Register(&meters_res);
-  engine.Register(&actions_res);
-  engine.Register(&rules_res);
+  if (!engine.Register(&meters_res)) {
+    state.SkipWithError("resource registration failed");
+    return;
+  }
+  if (!engine.Register(&actions_res)) {
+    state.SkipWithError("resource registration failed");
+    return;
+  }
+  if (!engine.Register(&rules_res)) {
+    state.SkipWithError("resource registration failed");
+    return;
+  }
 
   // Sessions cycle through the id space; ids freed by a release are reused
   // only after their grace period (no worker is online here, so at once).
@@ -161,9 +175,12 @@ void BM_SingleRule(benchmark::State &state) {
   bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
   auto table = *ConcurrentExactTable::Create(
       8, ConcurrentExactTable::CapacityFor(65536), domain);
-  ExactRuleResource rules_res("rules", 0, *table);
+  ExactRuleResource rules_res("rules", *table);
   TransactionEngine engine(domain);
-  engine.Register(&rules_res);
+  if (!engine.Register(&rules_res)) {
+    state.SkipWithError("resource registration failed");
+    return;
+  }
   uint64_t k = 0;
   std::vector<Op> add(1), del(1);
   for (auto _ : state) {
@@ -216,19 +233,33 @@ void BM_SessionWithOnlineReader(benchmark::State &state) {
       8, ConcurrentExactTable::CapacityFor(kSessions * 2 + 64), domain);
   SlotTable<MeterId, Meter> meters(kSessions * 2 + 2);
   SlotTable<ActionId, Action> actions(kSessions * 2 + 2);
-  SlotResource<MeterId, Meter> meters_res("meters", 0, meters);
+  SlotResource<MeterId, Meter> meters_res("meters", meters);
   SlotResource<ActionId, Action> actions_res(
-      "actions", 1, actions, [](const Action &a) {
+      "actions", actions,
+      [](const Action &a) {
         return std::vector<Reference>{{"meters", EncodeKey(a.meter)}};
-      });
-  ExactRuleResource rules_res("rules", 2, *table, [](uint64_t v) {
-    return std::vector<Reference>{
-        {"actions", EncodeKey(ActionId(static_cast<uint32_t>(v)))}};
-  });
+      },
+      {"meters"});
+  ExactRuleResource rules_res(
+      "rules", *table,
+      [](uint64_t v) {
+        return std::vector<Reference>{
+            {"actions", EncodeKey(ActionId(static_cast<uint32_t>(v)))}};
+      },
+      {"actions"});
   TransactionEngine engine(domain);
-  engine.Register(&meters_res);
-  engine.Register(&actions_res);
-  engine.Register(&rules_res);
+  if (!engine.Register(&meters_res)) {
+    state.SkipWithError("resource registration failed");
+    return;
+  }
+  if (!engine.Register(&actions_res)) {
+    state.SkipWithError("resource registration failed");
+    return;
+  }
+  if (!engine.Register(&rules_res)) {
+    state.SkipWithError("resource registration failed");
+    return;
+  }
 
   uint32_t s = 0;
   uint64_t retries = 0;

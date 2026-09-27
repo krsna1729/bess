@@ -72,11 +72,18 @@ class ExactRuleResource final : public dataplane::Resource {
   using ReferencesFn =
       std::function<std::vector<dataplane::Reference>(uint64_t value)>;
 
-  ExactRuleResource(std::string name, int rank, ConcurrentExactTable &table,
-                    ReferencesFn references = {})
-      : Resource(std::move(name), rank),
+  // `may_reference`: the resources `references` can name (declared, see
+  // Resource).
+  ExactRuleResource(std::string name, ConcurrentExactTable &table,
+                    ReferencesFn references = {},
+                    std::vector<std::string> may_reference = {})
+      : Resource(std::move(name), std::move(may_reference)),
         table_(table),
         references_(std::move(references)) {}
+
+  // Committed keys: no transaction is in flight when the engine asks, so no
+  // kPending placeholder is counted.
+  size_t LiveCount() const override { return table_.size(); }
 
   // The value a key holds while a transaction that adds it is being
   // prepared. Readers treat it as a miss.

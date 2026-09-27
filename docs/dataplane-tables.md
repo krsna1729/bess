@@ -218,8 +218,11 @@ reference to something missing.
 
   Each takes a function naming the keys a value refers to (a rule's
   action, an action's meter).
-- **Rank:** a resource that refers to another has a higher rank than it.
-  Upserts publish referents first; erases remove referrers first.
+- **Declared dependencies, not ranks:** a resource names, when constructed,
+  the resources its values may reference (`SlotResource(name, table,
+  references_fn, {"meters"})`). They must be registered first; the engine
+  derives the publication order and refuses undeclared references. Upserts
+  publish referents first; erases remove referrers first.
 - **Semantics:**
   - all or nothing, with every check and allocation done before anything
     is visible;
@@ -242,8 +245,11 @@ reference to something missing.
   for a direct write (P-core). Tables that do take part in references are
   written only through the engine.
 - **A module must `Unregister` its resources before destroying their
-  tables.** `Unregister` refuses while removal steps for them are pending;
-  with workers paused, one call advances the cascade and succeeds.
+  tables.** `Unregister` refuses (with the reason) while keys remain, keys
+  are referenced, a registered resource depends on it, or removal steps are
+  pending; with workers paused, one call advances the cascade.
+- **`kBusy`:** when readers are slow to quiesce and reclamation is behind, a
+  transaction is refused retriably instead of waiting.
 - **Cost:** a session of two meters, two actions and two rules, created
   and then removed, takes about 4.4 µs in process (226K sessions/s on a
   P-core, 216K with a reader online; 167K and 152K on an E-core;

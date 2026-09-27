@@ -194,16 +194,27 @@ class Resource {
     std::vector<Reference> references;
   };
 
-  // `rank` orders publication: a resource whose values reference another
-  // resource must have a higher rank than it. Upserts publish in ascending
-  // rank (referents first), erases in descending rank (referrers first).
-  Resource(std::string name, int rank) : name_(std::move(name)), rank_(rank) {}
+  // `references`: the resources this one's values may refer to. They must be
+  // registered first (so the graph is acyclic by construction), and the
+  // engine derives the publication order from them: a resource ranks one
+  // above the highest resource it may reference. A value naming a resource
+  // not declared here is refused. (Caller-assigned ranks could be wrong; a
+  // declared graph cannot be.)
+  explicit Resource(std::string name, std::vector<std::string> references = {})
+      : name_(std::move(name)), declared_(std::move(references)) {}
   virtual ~Resource() = default;
 
   Resource(const Resource &) = delete;
   Resource &operator=(const Resource &) = delete;
 
   const std::string &name() const { return name_; }
+  // The resources this one may reference (declared at construction).
+  const std::vector<std::string> &declared_references() const {
+    return declared_;
+  }
+  // Publication rank, derived by the engine at registration: 0 for a
+  // resource that references nothing, else 1 + the highest rank it may
+  // reference. Upserts publish in ascending rank, erases in descending rank.
   int rank() const { return rank_; }
 
   // -- control side, called by the engine with its lock held ------------------
@@ -234,9 +245,19 @@ class Resource {
   // resources that keep per-transaction state in Reserve().
   virtual void EndTransaction() noexcept {}
 
+  // Live (committed) keys. The engine refuses to unregister a resource that
+  // still has any: their outgoing references are in its ledger, and the
+  // module must erase them (in a transaction) first. It also refuses to
+  // register a populated resource that may reference others, since its
+  // existing references would be missing from the ledger.
+  virtual size_t LiveCount() const = 0;
+
  private:
+  friend class TransactionEngine;
+
   std::string name_;
-  int rank_;
+  std::vector<std::string> declared_;
+  int rank_ = 0;
 };
 
 }  // namespace dataplane

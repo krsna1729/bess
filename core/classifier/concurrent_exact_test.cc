@@ -202,6 +202,42 @@ TEST(ConcurrentExactTableTest, UpsertOfAPresentKeySucceedsWhenFull) {
   }
 }
 
+// DPDK behaviour relied on (D-007): with the default defer-queue size
+// (dq_size = the table's key slots) rte_hash_del_key never falls back to
+// rte_rcu_qsbr_synchronize(), which it does when the defer queue is full --
+// every outstanding entry is one deleted slot, so the queue cannot fill.
+// Deleting every key with a stalled reader must therefore return promptly.
+TEST(ConcurrentExactTableTest, DeletesNeverWaitForStalledReaders) {
+  rcu::RcuDomain &domain = control::runtime().rcu();
+  constexpr rcu::ReaderId kReader = 29;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);  // stalled: never quiesces while we delete
+  auto t = MakeTable(768);
+  std::vector<uint32_t> ids;
+  for (uint32_t id = 1; t->Upsert(B(K(id)), V(id)) !=
+                        ConcurrentExactTable::UpsertResult::kFull;
+       id++) {
+    ids.push_back(id);
+  }
+  std::atomic<bool> done{false};
+  std::thread writer([&] {
+    for (uint32_t id : ids) {
+      t->Erase(B(K(id)));
+    }
+    done = true;
+  });
+  for (int i = 0; i < 300 && !done; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  const bool finished = done.load();
+  domain.Quiescent(kReader);  // release a blocked writer, if any
+  writer.join();
+  EXPECT_TRUE(finished) << "rte_hash_del_key waited for a stalled reader";
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
+  t->ReclaimAll();
+}
+
 TEST(ConcurrentExactTableTest, ErasedSlotWaitsForOnlineReaders) {
   rcu::RcuDomain &domain = control::runtime().rcu();
   auto t = MakeTable(1024);

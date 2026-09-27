@@ -4015,6 +4015,26 @@ rather than one call site).
        - sessions run at 216K/s with a reader online (P-core).
      - **Queued:** trimming the engine's per-operation overhead (§31.4).
 
+107. **G1.2b hardening from two external design documents (D-021
+     amendment 2).**
+     - **Adopted, with tests:**
+       - declared dependency graph (derived order, undeclared references
+         refused);
+       - the full Register/Unregister lifetime contract;
+       - a publication phase with zero allocations (counted with a global
+         `operator new`);
+       - `kBusy` backpressure instead of blocking in `Synchronize()` under
+         the lock (proven by a hang without it).
+     - **Checked and not adopted as a change:** `rte_hash_del_key`
+       blocking on a full defer queue cannot occur with the default
+       `dq_size`; pinned by a test.
+     - **Cost:** +0-4% on the control-side transaction path (paired ABBA),
+       and nothing on the direct path.
+     - **Recorded for later:** scope-cell rules, rte_lpm's generation
+       requirement, ID lifetime across asynchronous queues, meter
+       policy/state separation, G1.2c idempotency digest and daemon epoch,
+       the transaction record, and the acceptance matrix.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -9732,7 +9752,7 @@ drive the design.
 |---|---|---|---|---|---|
 | 1 | P0 | **G1.2b transaction core**: resources, reserve/publish, dependency order, reference safety, per-op results, one grace period per transaction, deferred id reuse (D-020, D-021) | manual ordering, best-effort rollback | Router (routes -> next hops), ExactMatch/WildcardMatch rule sets -> action objects | core landed (entry 105); providers next |
 | 2 | P0 | **G1.2c RPC:** `ApplyDataplaneTransaction` with `request_id`, `expected_generation`, typed per-op results and `GetTransaction` status lookup; a streaming packed-op path (E4) | per-rule RPC orchestration, timeout ambiguity, rule-key reconstruction for deletion | any controller: routing daemons, firewall/NAT rule loaders | next |
-| 3 | P0 | **The scope cell (dataplane-atomic scopes), precisely.** An atomic scope must keep both the old and the new interpretation until its publication point. New state is written to *new* keys or write-once slots, and the cell's flip selects which set packets use. A version flag over entries already overwritten in place cannot restore them (review caution). Tables that can only be updated in place refuse atomic scopes rather than fake them (D-020). | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | design, with G1.2b |
+| 3 | P0 | **The scope cell (dataplane-atomic scopes), precisely** (detailed rules in D-021 amendment 2). An atomic scope must keep both the old and the new interpretation until its publication point. New state is written to *new* keys or write-once slots, and the cell's flip selects which set packets use. A version flag over entries already overwritten in place cannot restore them (review caution). Tables that can only be updated in place refuse atomic scopes rather than fake them (D-020). | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | design, with G1.2b |
 | 4 | P1 | **Vertical UPF slice** (in-tree plugin, static G0 graph): one uplink/downlink session using a typed classifier with a direct `ActionId` result (no `ResultSlot` -> `PackedValueStore` -> `ActionId` chain), a FAR executor, K5 `MeterSet` (no second meter implementation), K6 counters and K7 IPv4 routes, all programmed through G1.2 | validates the contract end to end | -- (validation consumer) | after 1-2 |
 | 5 | P0 | **External plugin package:** installed headers, a Meson dependency (`bess-dev`), a supported plugin API subset and a written compatibility policy | OMEC's vendored BESS fork | any out-of-tree module author | after 4 shows the API surface |
 | 6 | P1 | **K3.8 range backend** (arbitrary source and destination ranges plus precedence), differential against a scalar reference, including overlapping wildcards and simultaneous source/destination ranges | Go ternary expansion, range-width limits, Cartesian products | ACL, firewall rules (N) | queued |
