@@ -133,6 +133,9 @@ class Worker {
   volatile worker_status_t status_;
 
   int wid_;   // always [0, kMaxWorkers - 1]
+  // Whether this worker is an online RCU reader; touched only by its own
+  // thread (BlockWorker, the thread's exit), read by ReportQuiescent().
+  bool rcu_online_;
   int core_;  // TODO: should be cpuset_t
   int socket_;
   int fd_event_;

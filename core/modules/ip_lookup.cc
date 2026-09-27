@@ -152,7 +152,12 @@ ParsedPrefix IPLookup::ParseIpv4Prefix(const std::string &prefix,
 
 CommandResponse IPLookup::CommandAdd(
     const bess::pb::IPLookupCommandAddArg &arg) {
-  gate_idx_t gate = arg.gate();
+  // uint64 on the wire: check before narrowing (65536 + g used to route to g).
+  if (!bess::IsValidGateValue(arg.gate())) {
+    return CommandFailure(EINVAL, "Invalid gate: %llu",
+                          static_cast<unsigned long long>(arg.gate()));
+  }
+  gate_idx_t gate = static_cast<gate_idx_t>(arg.gate());
   uint64_t prefix_len = arg.prefix_len();
   ParsedPrefix prefix = ParseIpv4Prefix(arg.prefix(), prefix_len);
   if (std::get<0>(prefix)) {

@@ -57,9 +57,8 @@ class DaemonShutdownTest(unittest.TestCase):
 
     PORT = 10599  # not the default: never touches another daemon
 
-    def test_stop_with_running_pipeline_exits_cleanly(self):
+    def _start(self):
         from pybess.bess import BESS
-
         # Unprivileged: malloc-backed packet pools (-m 0), a private pidfile.
         pidfile = tempfile.NamedTemporaryFile(suffix='.pid', delete=False)
         pidfile.close()
@@ -72,46 +71,74 @@ class DaemonShutdownTest(unittest.TestCase):
             [_bessd(), '-f', '-p', str(self.PORT), '--skip_root_check',
              '-m', '0', '-i', pidfile.name],
             stdout=log, stderr=subprocess.STDOUT)
-        try:
-            bess = BESS()
-            for _ in range(300):  # EAL setup can take several seconds
-                try:
-                    bess.connect(grpc_url='localhost:%d' % self.PORT)
+        self.addCleanup(lambda: proc.poll() is None and
+                        (proc.kill(), proc.wait()))
+        bess = BESS()
+        for _ in range(300):  # EAL setup can take several seconds
+            try:
+                bess.connect(grpc_url='localhost:%d' % self.PORT)
+                return proc, log, bess
+            except (bess.APIError, bess.RPCError):
+                if proc.poll() is not None:
                     break
-                except (bess.APIError, bess.RPCError):
-                    time.sleep(0.2)
-            else:
-                self.fail('bessd did not come up')
+                time.sleep(0.2)
+        self.fail('bessd did not come up')
 
-            bess.pause_all()
-            bess.add_worker(0, 0)
-            bess.create_module('Source', 'src', {})
-            bess.create_module(
-                'WildcardMatch', 'wm',
-                {'fields': [{'offset': 26, 'num_bytes': 4}]})
-            bess.create_module('Sink', 'sink', {})
-            bess.connect_modules('src', 'wm')
-            bess.connect_modules('wm', 'sink')
-            bess.attach_task('src', wid=0)
-            bess.resume_all()
-            bess.run_module_command(
-                'wm', 'add', 'WildcardMatchCommandAddArg',
-                {'gate': 0, 'priority': 1,
-                 'values': [{'value_bin': b'\x0a\x00\x00\x00'}],
-                 'masks': [{'value_bin': b'\xff\x00\x00\x00'}]})
-            time.sleep(0.3)
-            bess.kill()
-            proc.wait(timeout=60)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
+    def _assert_clean_exit(self, proc, log):
+        proc.wait(timeout=60)
         log.seek(0)
         text = log.read().decode(errors='replace')
         failure = [l for l in text.splitlines() if l.startswith('F')]
         self.assertEqual(proc.returncode, 0, '\n'.join(failure[:20]))
         self.assertIn('gracefully shut down', text)
 
+    def _wildcard_rule(self, bess, op, i):
+        arg = {'values': [{'value_bin': bytes([10, i % 256, 0, 0])}],
+               'masks': [{'value_bin': b'\xff\xff\x00\x00'}]}
+        if op == 'add':
+            arg.update(gate=0, priority=1)
+            bess.run_module_command('wm', 'add', 'WildcardMatchCommandAddArg',
+                                    arg)
+        else:
+            bess.run_module_command('wm', 'delete',
+                                    'WildcardMatchCommandDeleteArg', arg)
+
+    def test_stop_with_running_pipeline_exits_cleanly(self):
+        proc, log, bess = self._start()
+        bess.pause_all()
+        bess.add_worker(0, 0)
+        bess.create_module('Source', 'src', {})
+        bess.create_module('WildcardMatch', 'wm',
+                           {'fields': [{'offset': 26, 'num_bytes': 4}]})
+        bess.create_module('Sink', 'sink', {})
+        bess.connect_modules('src', 'wm')
+        bess.connect_modules('wm', 'sink')
+        bess.attach_task('src', wid=0)
+        bess.resume_all()
+        self._wildcard_rule(bess, 'add', 1)
+        time.sleep(0.3)
+        bess.kill()
+        self._assert_clean_exit(proc, log)
+
+    # A worker that was added but never resumed must neither hold grace
+    # periods (retirements pile up otherwise; past the high-water mark the
+    # control plane waited forever, external audit 2026-09-27) nor break
+    # shutdown.
+    def test_stop_with_a_never_resumed_worker_exits_cleanly(self):
+        proc, log, bess = self._start()
+        bess.pause_all()
+        bess.add_worker(0, 0)
+        bess.create_module('WildcardMatch', 'wm',
+                           {'fields': [{'offset': 26, 'num_bytes': 4}]})
+        # Rule ids are retired on delete; with the worker never resumed
+        # these must still be reclaimed and the commands must not stall.
+        start = time.time()
+        for i in range(300):
+            self._wildcard_rule(bess, 'add', i)
+            self._wildcard_rule(bess, 'delete', i)
+        self.assertLess(time.time() - start, 30)
+        bess.kill()
+        self._assert_clean_exit(proc, log)
 
 if __name__ == '__main__':
     unittest.main()

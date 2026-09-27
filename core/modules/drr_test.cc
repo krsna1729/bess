@@ -36,6 +36,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <vector>
@@ -54,6 +55,16 @@ class DrrTestPeer {
   using FlowId = DRR::FlowId;
   static FlowId IdOf(DRR &drr, bess::PacketRef pkt) { return drr.GetId(pkt); }
   static void Drain(DRR &drr) { drr.DrainIngress(DRR::kIngressPerRun); }
+  static void SetQuantum(DRR &drr, uint32_t q) {
+    ASSERT_EQ(drr.SetQuantumSize(q).error().code(), 0);
+  }
+  static uint32_t NextBatch(DRR &drr, bess::PacketBatch *batch) {
+    int err = 0;
+    batch->clear();
+    const uint32_t bytes = drr.GetNextBatch(batch, &err);
+    EXPECT_GE(err, 0);
+    return bytes;
+  }
   static size_t Mapped(const DRR &drr) { return drr.flows_.Count(); }
   static size_t Scheduled(const DRR &drr) {
     return rte_ring_count(drr.flow_ring_) + (drr.current_flow_ ? 1 : 0);
@@ -91,6 +102,16 @@ bess::PacketHandle FlowPacket(bess::PlainPacketPool &pool, uint8_t flow) {
   p[26] = 10; p[29] = flow;          // source 10.0.0.<flow>
   p[30] = 10; p[31] = 1; p[33] = 1;  // destination 10.1.0.1
   p[35] = 53; p[37] = 53;            // ports
+  return pkt;
+}
+
+// A packet of flow `flow`, `len` bytes long.
+bess::PacketHandle SizedFlowPacket(bess::PlainPacketPool &pool, uint8_t flow,
+                                   size_t len) {
+  bess::PacketHandle pkt = FlowPacket(pool, flow);
+  if (pkt != nullptr) {
+    rte_pktmbuf_append(pkt, static_cast<uint16_t>(len - 60));
+  }
   return pkt;
 }
 
@@ -275,6 +296,89 @@ TEST(DrrFlowIdTest, ChainedPacketsGiveTheSameFlowAtEverySplit) {
         << "split at " << at;
     bess::PacketFree(pkt);
   }
+}
+
+// A flow whose queue fills is grown; if that allocation fails, the flow keeps
+// its queue and packets and only the new packet is dropped (the queue used to
+// become null and leak).
+TEST(DrrQueueTest, FailedGrowthKeepsTheFlowsQueue) {
+  constexpr int kPackets = DRR::kFlowQueueSize + 64;
+  bess::PlainPacketPool pool(kPackets + 64);
+  const size_t capacity = pool.Size();
+  {
+    DRR drr;
+    DrrTestPeer::Setup(drr);
+    DrrTestPeer::faults(drr).resize_alloc = true;
+    for (int sent = 0; sent < kPackets; sent += 32) {
+      bess::PacketBatch batch;
+      batch.clear();
+      for (int i = 0; i < 32; i++) {
+        batch.add(bess::PacketRef(FlowPacket(pool, 1)));
+      }
+      drr.ProcessBatch(nullptr, &batch);
+      DrrTestPeer::Drain(drr);
+    }
+    EXPECT_EQ(DrrTestPeer::Mapped(drr), 1u);
+    // The initial ring holds size - 1 packets; the rest were dropped.
+    EXPECT_EQ(pool.Size(), capacity - (DRR::kFlowQueueSize - 1));
+
+    // With growth working again the queue grows past its first size.
+    DrrTestPeer::faults(drr).resize_alloc = false;
+    bess::PacketBatch batch;
+    batch.clear();
+    for (int i = 0; i < 32; i++) {
+      batch.add(bess::PacketRef(FlowPacket(pool, 1)));
+    }
+    drr.ProcessBatch(nullptr, &batch);
+    DrrTestPeer::Drain(drr);
+    EXPECT_EQ(pool.Size(), capacity - (DRR::kFlowQueueSize - 1) - 32);
+  }
+  EXPECT_EQ(pool.Size(), capacity) << "destroying DRR freed every packet";
+}
+
+// Deficit round robin: backlogged flows get equal bytes whatever their packet
+// sizes, to within one quantum plus one packet.
+TEST(DrrSchedulingTest, BackloggedFlowsGetEqualBytes) {
+  bess::PlainPacketPool pool(1024, -1, 2048);
+  const size_t capacity = pool.Size();
+  {
+    DRR drr;
+    DrrTestPeer::Setup(drr);
+    DrrTestPeer::SetQuantum(drr, 1000);
+    // Flow 1: 1000-byte packets; flow 2: 100-byte packets. Both stay
+    // backlogged for the whole measurement.
+    for (int round = 0; round < 10; round++) {
+      bess::PacketBatch batch;
+      batch.clear();
+      for (int i = 0; i < 8; i++) {
+        batch.add(bess::PacketRef(SizedFlowPacket(pool, 1, 1000)));
+      }
+      for (int i = 0; i < 24; i++) {
+        batch.add(bess::PacketRef(SizedFlowPacket(pool, 2, 100)));
+      }
+      drr.ProcessBatch(nullptr, &batch);
+      DrrTestPeer::Drain(drr);
+    }
+    size_t bytes[3] = {0, 0, 0};
+    size_t total = 0;
+    while (total < 20000) {
+      bess::PacketBatch out;
+      const uint32_t got = DrrTestPeer::NextBatch(drr, &out);
+      ASSERT_GT(got, 0u) << "a backlogged DRR produced nothing";
+      for (int i = 0; i < out.cnt(); i++) {
+        bess::PacketRef pkt = out.packet(i);
+        const uint8_t flow = pkt.head_data<uint8_t *>()[29];
+        ASSERT_TRUE(flow == 1 || flow == 2);
+        bytes[flow] += pkt.total_len();
+        total += pkt.total_len();
+      }
+      bess::PacketFreeBatch(&out);
+    }
+    const long diff = static_cast<long>(bytes[1]) - static_cast<long>(bytes[2]);
+    EXPECT_LE(std::abs(diff), 1000 + 1000)
+        << "flow 1: " << bytes[1] << " bytes, flow 2: " << bytes[2];
+  }
+  EXPECT_EQ(pool.Size(), capacity);
 }
 
 TEST(DrrIngressTest, FullIngressDropsAndFreesTheExcess) {

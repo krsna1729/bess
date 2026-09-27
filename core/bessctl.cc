@@ -298,8 +298,12 @@ class BESSControlImpl final : public BESSControl::Service {
   }
 
   Status PauseWorker(ServerContext*, const PauseWorkerRequest* req,
-                     EmptyResponse*) override {
-    (void)control_plane_.PauseWorker(req->wid());
+                     EmptyResponse* response) override {
+    // Report a refused id (out of range) instead of dropping the error.
+    if (auto ret = control_plane_.PauseWorker(static_cast<uint64_t>(req->wid()));
+        !ret) {
+      return return_with_control_error(response, ret.error());
+    }
     return Status::OK;
   }
 
@@ -310,8 +314,12 @@ class BESSControlImpl final : public BESSControl::Service {
   }
 
   Status ResumeWorker(ServerContext*, const ResumeWorkerRequest* req,
-                      EmptyResponse*) override {
-    (void)control_plane_.ResumeWorker(req->wid());
+                      EmptyResponse* response) override {
+    // Report a refused id (out of range) instead of dropping the error.
+    if (auto ret = control_plane_.ResumeWorker(static_cast<uint64_t>(req->wid()));
+        !ret) {
+      return return_with_control_error(response, ret.error());
+    }
     return Status::OK;
   }
 
@@ -961,13 +969,17 @@ class BESSControlImpl final : public BESSControl::Service {
         request->hook().gate_case() == bess::pb::GateHookInfo::kIgate;
     spec.arg = request->hook().arg();
 
-    if (spec.is_igate) {
-      spec.gate_idx = request->hook().igate();
-      spec.use_gate = request->hook().igate() >= 0;
-    } else {
-      spec.gate_idx = request->hook().ogate();
-      spec.use_gate = request->hook().ogate() >= 0;
+    // int64 on the wire; negative means every gate. Range-check before
+    // narrowing to gate_idx_t, or igate 65536 would hook igate 0.
+    const int64_t wire_gate =
+        spec.is_igate ? request->hook().igate() : request->hook().ogate();
+    if (wire_gate >= 0 &&
+        !bess::IsValidGateValue(static_cast<uint64_t>(wire_gate))) {
+      return return_with_error(response, EINVAL, "gate %lld is out of range",
+                               static_cast<long long>(wire_gate));
     }
+    spec.use_gate = wire_gate >= 0;
+    spec.gate_idx = spec.use_gate ? static_cast<gate_idx_t>(wire_gate) : 0;
 
     auto name = control_plane_.ConfigureGateHook(spec, request->enable());
     if (!name) {
@@ -992,7 +1004,13 @@ class BESSControlImpl final : public BESSControl::Service {
                                rh.module_name().c_str());
     }
     bool is_igate = rh.gate_case() == bess::pb::GateHookInfo::kIgate;
-    gate_idx_t gate_idx = is_igate ? rh.igate() : rh.ogate();
+    const int64_t wire_gate = is_igate ? rh.igate() : rh.ogate();
+    if (wire_gate < 0 ||
+        !bess::IsValidGateValue(static_cast<uint64_t>(wire_gate))) {
+      return return_with_error(response, EINVAL, "gate %lld is out of range",
+                               static_cast<long long>(wire_gate));
+    }
+    gate_idx_t gate_idx = static_cast<gate_idx_t>(wire_gate);
     bess::Gate* g = module_gate(m, is_igate, gate_idx);
     if (g == nullptr) {
       return return_with_error(

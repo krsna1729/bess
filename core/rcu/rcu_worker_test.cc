@@ -34,7 +34,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <thread>
 
 #include "control/runtime_state.h"
 #include "opts.h"
@@ -159,6 +162,42 @@ TEST_F(RcuWorkerTest, PauseDuringGracePeriodReleasesIt) {
   EXPECT_TRUE(rcu_->IsComplete(token))
       << "pause must take the reader offline, or reclamation would depend on a "
          "thread that is not running";
+}
+
+// A worker that was launched but never resumed runs one scheduler round before
+// it blocks. A quiescent report in that round used to mark it online in DPDK's
+// QSBR while RcuDomain still thought it offline, so every grace period waited
+// for the worker's first resume (external audit, 2026-09-27).
+TEST_F(RcuWorkerTest, NeverResumedWorkerDoesNotBlockGracePeriods) {
+  const int wid = 0;
+  launch_worker(wid, 0);
+  const bess::rcu::GracePeriod token = rcu_->StartGracePeriod();
+  EXPECT_TRUE(rcu_->IsComplete(token))
+      << "a launched-but-never-resumed worker holds grace periods";
+
+  resume_worker(wid);
+  pause_worker(wid);
+  EXPECT_TRUE(rcu_->IsComplete(rcu_->StartGracePeriod()));
+}
+
+// The same bug's worst consequence: past the retire high-water mark, a writer
+// calls Synchronize() while holding the control-plane lock. With a paused,
+// never-resumed worker that wait must still end.
+TEST_F(RcuWorkerTest, SynchronizeReturnsWithANeverResumedWorker) {
+  launch_worker(0, 0);
+  std::atomic<bool> done{false};
+  std::thread writer([&] {
+    rcu_->Synchronize();
+    done = true;
+  });
+  for (int i = 0; i < 200 && !done; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(done.load()) << "Synchronize() blocked on a paused worker";
+  if (!done) {
+    resume_worker(0);  // release it so the test can finish
+  }
+  writer.join();
 }
 
 }  // namespace

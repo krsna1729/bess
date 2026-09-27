@@ -166,6 +166,7 @@ void Worker::SetNonWorker() {
   // Assign INT_MIN to the variables so that the program can crash
   // when accessed as an index of an array.
   wid_ = INT_MIN;
+  rcu_online_ = false;
   core_ = INT_MIN;
   socket_ = INT_MIN;
   fd_event_ = INT_MIN;
@@ -183,8 +184,12 @@ void Worker::SetNonWorker() {
 }
 
 void Worker::ReportQuiescent() {
-  if (wid_ < 0 || wid_ >= Worker::kMaxWorkers) {
-    return;  // not a worker thread
+  // Only an online reader reports: a worker whose first scheduler round runs
+  // before it is ever resumed must not appear online to DPDK's QSBR (a
+  // report on an offline thread does exactly that). rcu_online_ is this
+  // thread's own flag, so the check costs nothing shared.
+  if (!rcu_online_ || wid_ < 0 || wid_ >= Worker::kMaxWorkers) {
+    return;
   }
   bess::control::runtime().rcu().Quiescent(wid_);
 }
@@ -196,6 +201,7 @@ int Worker::BlockWorker() {
   // Leave the RCU reader domain *before* blocking (K1): a grace period must
   // never depend on a thread that will not report quiescence until it is woken
   // again. This is the offline-before-blocking rule.
+  rcu_online_ = false;
   bess::control::runtime().rcu().Offline(wid_);
 
   status_ = WORKER_PAUSED;
@@ -207,6 +213,7 @@ int Worker::BlockWorker() {
     // Back online before any dataplane work resumes, and report quiescence so
     // that a grace period started while this worker was paused can complete.
     bess::control::runtime().rcu().Online(wid_);
+    rcu_online_ = true;
     bess::control::runtime().rcu().Quiescent(wid_);
     status_ = WORKER_RUNNING;
     return 0;
@@ -269,6 +276,7 @@ void *Worker::Run(void *_arg) {
   const unsigned lcore_id = rte_lcore_id();
 
   wid_ = arg->wid;
+  rcu_online_ = false;
   core_ = arg->core;
   socket_ = rte_socket_id();
 
@@ -319,6 +327,7 @@ void *Worker::Run(void *_arg) {
   // The thread is finished with the dataplane: give the reader slot back
   // before teardown, so a recreated worker with this id can register again and
   // a grace period stops waiting for it.
+  rcu_online_ = false;
   bess::control::runtime().rcu().Offline(wid_);
   bess::control::runtime().rcu().Unregister(wid_);
 

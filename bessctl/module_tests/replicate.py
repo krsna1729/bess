@@ -59,6 +59,20 @@ class BessReplicateTest(BessModuleTestCase):
         self.assertEqual(len(pkt_outs[2]), 1)
         self.assertSamePackets(pkt_outs[2][0], pkt_in)
 
+    # Gates are int64 on the wire and were narrowed unchecked: each must name
+    # one of the module's 32 output gates, and a refused set_gates changes
+    # nothing.
+    def test_replicate_gates_are_validated(self):
+        for bad in [[32], [-1], [65536], [0, 1, 2 ** 32]]:
+            with self.assertRaises(bess.Error, msg=str(bad)):
+                Replicate(gates=bad)
+        rep = Replicate(gates=[0, 1])
+        bess.pause_all()
+        with self.assertRaises(bess.Error):
+            rep.set_gates(gates=[2, 40])
+        self.assertBessAlive()
+
+
 suite = unittest.TestLoader().loadTestsFromTestCase(BessReplicateTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)
 

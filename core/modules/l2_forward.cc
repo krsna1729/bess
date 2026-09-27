@@ -28,11 +28,11 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "l2_forward.h"
-
 
 #include <rte_hash_crc.h>
 
@@ -235,8 +235,17 @@ const Commands L2Forward::cmds = {
 
 CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
   int ret = 0;
-  int size = arg.size();
-  int bucket = arg.bucket();
+  // Wire values are int64: range-check before narrowing, or 2^32 + 1 would
+  // become 1.
+  if (arg.size() < 0 || arg.size() > MAX_TABLE_SIZE || arg.bucket() < 0 ||
+      arg.bucket() > MAX_BUCKET_SIZE) {
+    return CommandFailure(EINVAL,
+                          "size must be in 0..%d and bucket in 0..%d "
+                          "(0: default)",
+                          MAX_TABLE_SIZE, MAX_BUCKET_SIZE);
+  }
+  int size = static_cast<int>(arg.size());
+  int bucket = static_cast<int>(arg.bucket());
 
   default_gate_.store(DROP_GATE, std::memory_order_relaxed);
 
@@ -305,6 +314,8 @@ CommandResponse L2Forward::CommandAdd(
     const bess::pb::L2ForwardCommandAddArg &arg) {
   std::vector<std::pair<uint64_t, gate_idx_t>> entries;
   entries.reserve(static_cast<size_t>(arg.entries_size()));
+  std::unordered_set<uint64_t> seen;  // duplicates within the request
+  seen.reserve(static_cast<size_t>(arg.entries_size()));
   for (int i = 0; i < arg.entries_size(); i++) {
     const auto &entry = arg.entries(i);
     if (!entry.addr().length()) {
@@ -325,11 +336,8 @@ CommandResponse L2Forward::CommandAdd(
     if (l2_find(&l2_table_, mac, &existing) == 0) {
       return CommandFailure(EEXIST, "MAC address '%s' already exist", str_addr);
     }
-    for (const auto &[seen, gate] : entries) {
-      if (seen == mac) {
-        return CommandFailure(EEXIST, "MAC address '%s' given twice",
-                              str_addr);
-      }
+    if (!seen.insert(mac).second) {
+      return CommandFailure(EEXIST, "MAC address '%s' given twice", str_addr);
     }
     entries.emplace_back(mac, static_cast<gate_idx_t>(entry.gate()));
   }
@@ -438,22 +446,37 @@ CommandResponse L2Forward::CommandPopulate(
   base_u64 = l2_addr_to_u64(base_str);
 
   // gate_count 0 used to divide by zero (i % gate_cnt) and crash bessd.
-  if (arg.count() < 0 || arg.gate_count() <= 0 ||
+  const int64_t capacity =
+      static_cast<int64_t>(l2_table_.size) * l2_table_.bucket;
+  if (arg.count() < 0 || arg.count() > capacity || arg.gate_count() <= 0 ||
       arg.gate_count() > MAX_GATES) {
-    return CommandFailure(EINVAL, "count must be >= 0 and gate_count in 1..%d",
-                          MAX_GATES);
+    return CommandFailure(EINVAL,
+                          "count must be in 0..%lld (the table's slots) and "
+                          "gate_count in 1..%d",
+                          static_cast<long long>(capacity), MAX_GATES);
   }
   const int64_t cnt = arg.count();
   const int64_t gate_cnt = arg.gate_count();
 
+  // The MAC as a 48-bit number (aa:bb:cc:dd:ee:ff -> 0xaabbccddeeff). A
+  // second `>> 16` here used to drop its two low bytes, so populate started
+  // at 00:00:aa:bb:cc:dd (external audit, 2026-09-27).
   base_u64 = bess::utils::be64_t::swap(base_u64) >> 16;
-  base_u64 = base_u64 >> 16;
 
+  // Addresses already present are left as they are; the ones this command
+  // adds are taken back if it runs out of space, like add.
+  std::vector<uint64_t> added;
+  added.reserve(static_cast<size_t>(cnt));
   for (int64_t i = 0; i < cnt; i++) {
-    const int r =
-        l2_add_entry(&l2_table_, bess::utils::be64_t::swap(base_u64 << 16),
-                     static_cast<gate_idx_t>(i % gate_cnt));
-    if (r == -ENOMEM) {
+    const uint64_t mac = bess::utils::be64_t::swap(base_u64 << 16);
+    const int r = l2_add_entry(&l2_table_, mac,
+                               static_cast<gate_idx_t>(i % gate_cnt));
+    if (r == 0) {
+      added.push_back(mac);
+    } else if (r == -ENOMEM) {
+      for (const uint64_t m : added) {
+        l2_del_entry(&l2_table_, m);
+      }
       return CommandFailure(ENOMEM, "Not enough space after %lld entries",
                             static_cast<long long>(i));
     }

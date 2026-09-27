@@ -685,12 +685,19 @@ ControlResult<void> ControlPlane::PauseAll() {
 ControlResult<void> ControlPlane::PauseWorker(uint64_t wid) {
   std::lock_guard<std::mutex> lock(mutex_);
 
+  // The wire id is uint64: check before it narrows to int (2^32 was worker 0).
+  if (wid >= static_cast<uint64_t>(Worker::kMaxWorkers)) {
+    return std::unexpected(Err(EINVAL, "worker id %llu is out of range (max %d)",
+                               static_cast<unsigned long long>(wid),
+                               Worker::kMaxWorkers - 1));
+  }
+
   // TODO: It should be made harder to wreak havoc on the rest of the daemon
   // when using PauseWorker(). For now a warning and suggestion that this is
   // for experts only is sufficient.
   LOG(WARNING) << "PauseWorker() is an experimental operation and should be"
                << " used with care. Long-term support not guaranteed.";
-  pause_worker(wid);
+  pause_worker(static_cast<int>(wid));
   LOG(INFO) << "*** Worker " << wid << " has been paused ***";
   return {};
 }
@@ -712,8 +719,15 @@ ControlResult<void> ControlPlane::ResumeAll() {
 ControlResult<void> ControlPlane::ResumeWorker(uint64_t wid) {
   std::lock_guard<std::mutex> lock(mutex_);
 
+  // The wire id is uint64: check before it narrows to int (2^32 was worker 0).
+  if (wid >= static_cast<uint64_t>(Worker::kMaxWorkers)) {
+    return std::unexpected(Err(EINVAL, "worker id %llu is out of range (max %d)",
+                               static_cast<unsigned long long>(wid),
+                               Worker::kMaxWorkers - 1));
+  }
+
   LOG(INFO) << "*** Resuming worker " << wid << " ***";
-  resume_worker(wid);
+  resume_worker(static_cast<int>(wid));
   return {};
 }
 

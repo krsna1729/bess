@@ -169,6 +169,19 @@ TEST_F(RcuDomainTest, OfflineDuringGracePeriodReleasesIt) {
   domain_->Unregister(id);
 }
 
+// A quiescent report from a reader RcuDomain considers offline marks it online
+// in DPDK's counter; Offline() must still take it out, or it holds every grace
+// period from then on.
+TEST_F(RcuDomainTest, OfflineUndoesAStrayQuiescentReport) {
+  const ReaderId id = 6;
+  ASSERT_TRUE(domain_->Register(id).has_value());
+  domain_->Quiescent(id);  // stray: the reader never went online
+  domain_->Offline(id);
+  EXPECT_TRUE(domain_->IsComplete(domain_->StartGracePeriod()))
+      << "a reader that is offline by our books still holds grace periods";
+  domain_->Unregister(id);
+}
+
 TEST_F(RcuDomainTest, UnregisterDuringGracePeriodStopsBeingWaitedOn) {
   const ReaderId id = 4;
   ASSERT_TRUE(domain_->Register(id).has_value());

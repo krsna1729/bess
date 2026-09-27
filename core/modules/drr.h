@@ -85,6 +85,8 @@ class DRR final : public Module {
  public:
   // the default max number of flows allowed + 1
   static const int kDefaultNumFlows = 4096;
+  // Upper bound for the num_flows argument (the round-robin ring's size).
+  static constexpr uint32_t kMaxNumFlows = uint32_t{1} << 24;
   static const int kFlowQueueSize = 2048;  // initial queue size for a flow
   static const int kQueueGrowthFactor =
       2;  // the scale at which a flow's queue grows
@@ -271,6 +273,7 @@ class DRR final : public Module {
     bool map_insert = false;
     bool ring_enqueue = false;
     bool first_enqueue = false;
+    bool resize_alloc = false;  // growing a full flow queue
   };
   Faults faults_;
 

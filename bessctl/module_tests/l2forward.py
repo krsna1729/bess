@@ -97,6 +97,60 @@ class BessL2ForwardTest(BessModuleTestCase):
         self.assertGreater(pkts.get(0, 0), 0)
         self.assertGreater(pkts.get(1, 0), 0)
 
+    # Size 1 used to compute an alternate bucket far outside the table, and
+    # int64 sizes narrowed to int (2^32 + 1 became 1).
+    def test_l2forward_table_size_limits(self):
+        for bad in [{'size': 1}, {'size': 2 ** 32 + 1}, {'size': -4},
+                    {'bucket': 2 ** 32 + 4}, {'size': 6}]:
+            with self.assertRaises(bess.Error, msg=str(bad)):
+                L2Forward(**bad)
+        l2 = L2Forward(size=2, bucket=4)
+        l2.add(entries=[{'addr': '02:00:00:00:00:01', 'gate': 3}])
+        self.assertEqual(
+            list(l2.lookup(addrs=['02:00:00:00:00:01']).gates), [3])
+        self.assertBessAlive()
+
+    # populate starts at `base` (an extra shift used to start two bytes
+    # lower), cycles gates, and refuses more entries than the table has slots.
+    def test_l2forward_populate_addresses(self):
+        l2 = L2Forward(size=64, bucket=4)
+        l2.populate(base='aa:bb:cc:dd:ee:fe', count=4, gate_count=3)
+        gates = l2.lookup(addrs=['aa:bb:cc:dd:ee:fe', 'aa:bb:cc:dd:ee:ff',
+                                 'aa:bb:cc:dd:ef:00', 'aa:bb:cc:dd:ef:01']).gates
+        self.assertEqual(list(gates), [0, 1, 2, 0])
+        with self.assertRaises(bess.Error):
+            l2.lookup(addrs=['00:00:aa:bb:cc:dd'])
+        with self.assertRaises(bess.Error):
+            l2.populate(base='02:00:00:00:00:00', count=64 * 4 + 1,
+                        gate_count=1)
+
+    # A multi-entry add that runs out of space takes back what it added.
+    def test_l2forward_add_rolls_back_when_full(self):
+        l2 = L2Forward(size=2, bucket=1)  # two slots
+        entries = [{'addr': '02:00:00:00:00:%02x' % i, 'gate': i}
+                   for i in range(1, 6)]
+        with self.assertRaises(bess.Error):
+            l2.add(entries=entries)
+        for e in entries:
+            with self.assertRaises(bess.Error, msg=e['addr']):
+                l2.lookup(addrs=[e['addr']])
+
+    # add/delete run while a worker forwards traffic (G1.2 mode C).
+    def test_l2forward_add_delete_live(self):
+        l2 = L2Forward(size=1024, bucket=4)
+        l2.set_default_gate(gate=0)
+
+        def command(i):
+            addr = '02:00:00:00:%02x:%02x' % ((i // 2) // 256 % 256,
+                                              (i // 2) % 256)
+            if i % 2 == 0:
+                l2.add(entries=[{'addr': addr, 'gate': 1}])
+            else:
+                l2.delete(addrs=[addr])
+
+        pkts = self.run_with_live_commands(l2, [0, 1], command)
+        self.assertGreater(sum(pkts.values()), 0)
+
 
 suite = unittest.TestLoader().loadTestsFromTestCase(BessL2ForwardTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)

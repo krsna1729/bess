@@ -38,6 +38,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <random>
 #include <thread>
 #include <vector>
@@ -247,6 +248,92 @@ TEST(L2TableBatchTest, MatchesSingleLookupsUnderBothBodies) {
     }
   }
   l2_deinit(&table);
+}
+
+// Size 1 used to compute an alternate bucket far outside the table (a shift
+// by size_power - 1 = -1); small and narrow tables must keep every entry
+// they accept and find nothing they do not hold.
+TEST(L2TableSizeTest, SizeOneIsRefused) {
+  l2_table table = {};
+  EXPECT_EQ(-EINVAL, l2_init(&table, 1, 4));
+  EXPECT_EQ(-EINVAL, l2_init(&table, 0, 4));
+  EXPECT_EQ(-EINVAL, l2_init(&table, 6, 4));
+}
+
+TEST(L2TableSizeTest, SmallAndNarrowTablesFillAndEmptyExactly) {
+  for (int size : {2, 4, 8}) {
+    for (int bucket : {1, 2, 4}) {
+      SCOPED_TRACE(testing::Message() << "size " << size << " bucket "
+                                      << bucket);
+      l2_table table = {};
+      ASSERT_EQ(0, l2_init(&table, size, bucket));
+      std::mt19937_64 rng(size * 16 + bucket);
+      std::vector<uint64_t> added;
+      int refused = 0;
+      while (refused < 64) {
+        const uint64_t mac = rng() & 0xffffffffffffull;
+        const int r = l2_add_entry(&table, mac,
+                                   static_cast<gate_idx_t>(added.size()));
+        if (r == 0) {
+          added.push_back(mac);
+        } else {
+          ASSERT_TRUE(r == -ENOMEM || r == -EEXIST) << r;
+          refused++;
+        }
+        ASSERT_LE(added.size(), static_cast<size_t>(size * bucket));
+      }
+      for (size_t i = 0; i < added.size(); i++) {
+        gate_idx_t gate = 0;
+        ASSERT_EQ(0, l2_find(&table, added[i], &gate));
+        EXPECT_EQ(gate, static_cast<gate_idx_t>(i));
+      }
+      for (uint64_t mac : added) {
+        ASSERT_EQ(0, l2_del_entry(&table, mac));
+      }
+      for (uint64_t mac : added) {
+        gate_idx_t gate;
+        EXPECT_EQ(-ENOENT, l2_find(&table, mac, &gate));
+      }
+      l2_deinit(&table);
+    }
+  }
+}
+
+// Single-threaded churn against a model for 1- and 2-way buckets (the
+// concurrent churn test covers 4-way).
+TEST(L2TableSizeTest, NarrowBucketChurnMatchesAModel) {
+  for (int bucket : {1, 2}) {
+    SCOPED_TRACE(testing::Message() << "bucket " << bucket);
+    l2_table table = {};
+    ASSERT_EQ(0, l2_init(&table, 64, bucket));
+    std::mt19937_64 rng(77 + bucket);
+    std::map<uint64_t, gate_idx_t> model;
+    std::vector<uint64_t> keys;
+    for (int op = 0; op < 20000; op++) {
+      if (!keys.empty() && rng() % 2) {
+        const size_t at = rng() % keys.size();
+        ASSERT_EQ(0, l2_del_entry(&table, keys[at]));
+        model.erase(keys[at]);
+        keys[at] = keys.back();
+        keys.pop_back();
+      } else {
+        const uint64_t mac = rng() & 0xffffffffffffull;
+        const auto gate = static_cast<gate_idx_t>(op % 4000);
+        if (l2_add_entry(&table, mac, gate) == 0) {
+          model[mac] = gate;
+          keys.push_back(mac);
+        }
+      }
+      if (op % 1000 == 0) {
+        for (const auto &[mac, gate] : model) {
+          gate_idx_t found = 0;
+          ASSERT_EQ(0, l2_find(&table, mac, &found));
+          ASSERT_EQ(found, gate);
+        }
+      }
+    }
+    l2_deinit(&table);
+  }
 }
 
 }  // namespace

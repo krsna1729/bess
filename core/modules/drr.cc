@@ -35,6 +35,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -108,6 +109,17 @@ CommandResponse DRR::Init(const bess::pb::DRRArg &arg) {
   CommandResponse err;
   task_id_t tid;
 
+  // Wire ranges before narrowing: quantum is uint64 on the wire but stored
+  // as uint32 (2^32 + 1 became 1), and num_flows + 1 overflowed
+  // RoundToPowerTwo to 0 at UINT32_MAX.
+  if (arg.quantum() > std::numeric_limits<uint32_t>::max()) {
+    return CommandFailure(EINVAL, "quantum %llu is out of range",
+                          static_cast<unsigned long long>(arg.quantum()));
+  }
+  if (arg.num_flows() > kMaxNumFlows) {
+    return CommandFailure(EINVAL, "num_flows must be at most %u",
+                          kMaxNumFlows);
+  }
   if (arg.num_flows() != 0) {
     max_number_flows_ = RoundToPowerTwo(arg.num_flows() + 1);
   }
@@ -120,7 +132,7 @@ CommandResponse DRR::Init(const bess::pb::DRRArg &arg) {
   }
 
   if (arg.quantum() != 0) {
-    err = SetQuantumSize(arg.quantum());
+    err = SetQuantumSize(static_cast<uint32_t>(arg.quantum()));
     if (err.error().code() != 0) {
       return err;
     }
@@ -476,11 +488,20 @@ void DRR::Enqueue(Flow *f, bess::PacketHandle newpkt, int *err) {
   if (rte_ring_full(f->queue)) {
     uint32_t slots =
         RoundToPowerTwo(rte_ring_count(f->queue) * kQueueGrowthFactor);
-    f->queue = ResizeQueue(f->queue, slots, err);
+    // On failure the flow keeps its current queue (and its packets); only
+    // the new packet is dropped. Assigning the failed result nulled the queue
+    // and leaked it (external audit, 2026-09-27).
+    rte_ring *grown = nullptr;
+    if (faults_.resize_alloc) {
+      *err = -ENOMEM;
+    } else {
+      grown = ResizeQueue(f->queue, slots, err);
+    }
     if (*err != 0) {
       bess::PacketFree(newpkt);
       return;
     }
+    f->queue = grown;
   }
 
   *err = rte_ring_sp_enqueue(f->queue, reinterpret_cast<void *>(newpkt));

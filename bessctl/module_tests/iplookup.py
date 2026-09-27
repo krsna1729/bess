@@ -72,6 +72,16 @@ class BessIPLookupTest(BessModuleTestCase):
         pkts = self.run_with_live_commands(ipl, [0, 1], command)
         self.assertGreater(sum(pkts.values()), 0)
 
+    # The gate is uint64 on the wire; 65536 + g used to route to gate g.
+    def test_iplookup_gate_does_not_wrap(self):
+        ipl = IPLookup()
+        with self.assertRaises(bess.Error):
+            ipl.add(prefix='10.0.0.0', prefix_len=8, gate=65536 + 1)
+        with self.assertRaises(bess.Error):
+            ipl.add(prefix='10.0.0.0', prefix_len=8, gate=2 ** 32)
+        ipl.add(prefix='10.0.0.0', prefix_len=8, gate=1)
+
+
 suite = unittest.TestLoader().loadTestsFromTestCase(BessIPLookupTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)
 

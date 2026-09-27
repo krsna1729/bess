@@ -3919,6 +3919,63 @@ rather than one call site).
      - WildcardMatch under 21K live add/delete commands, with masks
        appearing and disappearing, forwarded traffic with no fault.
 
+104. **Independent audit of checkpoint 9f6afe54 (Opus, high rigor,
+     2026-09-27).** It verified the concurrency core as correct: the l2 table
+     protocol, RcuPtr, the concurrent exact and masked tables, Router
+     retirement and the shutdown order. Its findings, all fixed with tests:
+     - **P1: a never-resumed worker held every grace period.**
+       - A new worker's first scheduler round reported quiescence before
+         checking for a pause. DPDK's `rte_rcu_qsbr_quiescent` then counts
+         the thread as online, and `RcuDomain::Offline()` skipped
+         `rte_rcu_qsbr_thread_offline` because its own flag said offline.
+       - Reclamation stalled until the first resume. Past 4096 pending
+         retirements, `Synchronize()` spun while holding the control-plane
+         lock, and the daemon wedged.
+       - Fix, two layers: `Offline()` always tells DPDK for a registered
+         reader (idempotent), and a worker reports quiescence only while it
+         is an online reader (a thread-private flag).
+       - Tests: the audit's two reproductions (`rcu_worker_test`), a
+         deterministic domain test, and a daemon-level test
+         (`test_shutdown.py`: 600 rule changes with a never-resumed worker,
+         then a clean stop). Mutation-checked for each layer.
+     - **P1: `L2Forward(size=1)` read about 100 GB out of bounds.**
+       `l2_alt_index` shifted by `size_power - 1 = -1`; the int64 size also
+       narrowed, so 2^32 + 1 became 1. Size must now be ≥ 2 and is
+       range-checked before narrowing. New table tests cover sizes 2-8 with
+       buckets 1/2/4, and churn with 1- and 2-way buckets.
+     - **P2: wire values narrowed unchecked** despite the `WireNarrow`
+       contract. Fixed for:
+       - IPLookup's gate (65536 + g routed to g);
+       - gate-hook igate/ogate (65536 hooked gate 0);
+       - `PauseWorker`/`ResumeWorker` worker ids (2^32 was worker 0);
+       - L2Forward size/bucket;
+       - DRR quantum (2^32 + 1 became 1) and num_flows.
+
+       Each is tested at 65536, 2^32 and -1. The worker-id test also
+       showed that the v1 `PauseWorker`/`ResumeWorker` handlers discarded
+       the control plane's error and always returned OK; they now report
+       it.
+     - **P2: DRR queue growth failure** nulled and leaked the flow's queue.
+       The flow now keeps its queue; fault-injection test added.
+     - **P2: L2Forward `populate`:**
+       - an extra shift started it two bytes low (base
+         aa:bb:cc:dd:ee:ff populated 00:00:aa:bb:cc:dd onward);
+       - it now rolls back on ENOMEM like `add`, and refuses more entries
+         than the table has slots;
+       - `add`'s duplicate check is O(n), no longer O(n²) under the
+         control-plane lock.
+     - **Outside scope, also fixed:**
+       - Queue's statistics counters lost updates under several
+         producers; they are now relaxed atomics;
+       - Replicate narrowed its gates unchecked; they are now validated
+         against its 32 output gates, all or nothing.
+     - **New tests the audit asked for:**
+       - the DRR scheduler's byte fairness across packet sizes, which was
+         untested (a packet-round-robin mutation is caught);
+       - L2Forward `add`/`delete` under live traffic;
+       - `add` rollback when the table fills;
+       - `populate`'s MAC values.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

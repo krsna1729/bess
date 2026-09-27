@@ -70,6 +70,20 @@ class BessApiWireRangesTest(BessModuleTestCase):
         ports = [p.name for p in self.bess.list_ports().ports]
         self.assertNotIn('wr_p0', ports)
 
+    def test_gate_hooks_do_not_wrap(self):
+        self.bess.create_module('Bypass', 'wr_h')
+        self.assertRefused(
+            lambda: self.bess.track_gate(True, 'wr_track', 'wr_h',
+                                         direction='in', gate=65536))
+        self.assertRefused(
+            lambda: self.bess.run_gatehook_command(
+                'wr_track', 'wr_h', 'out', 65536, 'reset', 'EmptyArg', {}))
+
+    def test_worker_ids_do_not_wrap(self):
+        # 2^32 narrowed to int is worker 0.
+        self.assertRefused(self.bess.pause_worker, 2 ** 32)
+        self.assertRefused(self.bess.resume_worker, 2 ** 32)
+
 
 suite = unittest.TestLoader().loadTestsFromTestCase(BessApiWireRangesTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)

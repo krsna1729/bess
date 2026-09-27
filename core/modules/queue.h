@@ -107,11 +107,13 @@ class Queue : public Module {
   // Low water occupancy
   uint64_t low_water_;
 
-  // Accumulated statistics counters
+  // Accumulated statistics counters. Several upstream workers enqueue at
+  // once and the THREAD_SAFE get_status reads them while they run: relaxed
+  // atomics, one add per batch (plain counters lost updates).
   struct {
-    uint64_t enqueued;
-    uint64_t dequeued;
-    uint64_t dropped;
+    std::atomic<uint64_t> enqueued;
+    std::atomic<uint64_t> dequeued;
+    std::atomic<uint64_t> dropped;
   } stats_;
 
   bess::pb::QueueArg init_arg_;

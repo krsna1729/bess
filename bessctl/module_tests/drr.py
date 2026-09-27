@@ -63,6 +63,15 @@ class BessDrrTest(BessModuleTestCase):
             self.assertEqual(len(pkt_outs[0]), 1)
             self.assertSamePackets(pkt_outs[0][0], pkt)
 
+    # quantum is uint64 on the wire but stored as uint32 (2^32 + 1 became 1);
+    # num_flows + 1 overflowed at UINT32_MAX.
+    def test_drr_arguments_do_not_wrap(self):
+        with self.assertRaises(bess.Error):
+            DRR(quantum=2 ** 32 + 1)
+        with self.assertRaises(bess.Error):
+            DRR(num_flows=2 ** 32 - 1)
+        DRR(quantum=1500, num_flows=1024)
+
     # Producers on two workers and the DRR task on a third, rate-limited so
     # flow queues fill and grow, with live commands throughout. Before D-019
     # the producers created, resized and freed flow queues that the task was

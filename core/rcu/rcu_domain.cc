@@ -141,10 +141,16 @@ void RcuDomain::Offline(ReaderId id) {
   }
 
   std::lock_guard<std::mutex> lock(state_mutex_);
-  if (!registered_[id] || !online_[id]) {
+  if (!registered_[id]) {
     return;
   }
 
+  // Tell DPDK even if our flag says offline: rte_rcu_qsbr_quiescent() on an
+  // offline thread marks it online in DPDK's counter, and only
+  // rte_rcu_qsbr_thread_offline() (idempotent) takes it back out. Skipping
+  // the call left a stray report holding every grace period (external audit,
+  // 2026-09-27: a never-resumed worker blocked reclamation, and past the
+  // retire high-water mark Synchronize() hung the control plane).
   rte_rcu_qsbr_thread_offline(qsbr_, id);
   online_[id] = 0;
 }

@@ -187,11 +187,11 @@ void Queue::ProcessBatch(Context *, bess::PacketBatch *batch) {
     SignalOverload();
   }
 
-  stats_.enqueued += queued;
+  stats_.enqueued.fetch_add(queued, std::memory_order_relaxed);
 
   if (queued < batch->cnt()) {
     int to_drop = batch->cnt() - queued;
-    stats_.dropped += to_drop;
+    stats_.dropped.fetch_add(to_drop, std::memory_order_relaxed);
     bess::PacketFreeBulk(batch->handles() + queued, to_drop);
   }
 }
@@ -219,7 +219,7 @@ struct task_result Queue::RunTask(Context *ctx, bess::PacketBatch *batch,
     return {.block = true, .packets = 0, .bits = 0};
   }
 
-  stats_.dequeued += cnt;
+  stats_.dequeued.fetch_add(cnt, std::memory_order_relaxed);
   batch->set_cnt(cnt);
 
   if (prefetch_) {
@@ -285,9 +285,9 @@ CommandResponse Queue::CommandGetStatus(
   bess::pb::QueueCommandGetStatusResponse resp;
   resp.set_count(rte_ring_count(queue_));
   resp.set_size(size_);
-  resp.set_enqueued(stats_.enqueued);
-  resp.set_dequeued(stats_.dequeued);
-  resp.set_dropped(stats_.dropped);
+  resp.set_enqueued(stats_.enqueued.load(std::memory_order_relaxed));
+  resp.set_dequeued(stats_.dequeued.load(std::memory_order_relaxed));
+  resp.set_dropped(stats_.dropped.load(std::memory_order_relaxed));
   return CommandSuccess(resp);
 }
 

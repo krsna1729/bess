@@ -101,13 +101,16 @@ inline int is_power_of_2(uint64_t n) {
  *  It creates the slots of MAX_TABLE_SIZE multiplied by MAX_BUCKET_SIZE.
  *
  * @l2tbl: pointer to
- * @size: number of hash value entries. must be power of 2, greater than 0, and
+ * @size: number of hash value entries. must be power of 2, at least 2, and
  *        less than equal to MAX_TABLE_SIZE (2^30)
  * @bucket: number of slots per hash value. must be power of 2, greater than 0,
  *        and less than equal to MAX_BUCKET_SIZE (4)
  */
 inline int l2_init(struct l2_table *l2tbl, int size, int bucket) {
-  if (size <= 0 || size > MAX_TABLE_SIZE || !is_power_of_2(size)) {
+  // At least 2: l2_alt_index() shifts by size_power - 1, so size 1
+  // (size_power 0) computed an alternate bucket far outside the table
+  // (external audit, 2026-09-27).
+  if (size < 2 || size > MAX_TABLE_SIZE || !is_power_of_2(size)) {
     return -EINVAL;
   }
 

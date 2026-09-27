@@ -34,33 +34,34 @@ const Commands Replicate::cmds = {
      MODULE_CMD_FUNC(&Replicate::CommandSetGates), Command::THREAD_UNSAFE},
 };
 
-CommandResponse Replicate::Init(const bess::pb::ReplicateArg &arg) {
-
+// Validates every wire gate (int64) before anything changes: each must name
+// one of this module's output gates. They used to be narrowed unchecked.
+template <typename Arg>
+CommandResponse Replicate::SetGates(const Arg &arg) {
   if (arg.gates_size() > kMaxGates) {
     return CommandFailure(EINVAL, "no more than %d gates", kMaxGates);
   }
-
   for (int i = 0; i < arg.gates_size(); i++) {
-    int elem = arg.gates(i);
-    gates_[i] = elem;
+    if (arg.gates(i) < 0 || arg.gates(i) >= kNumOGates) {
+      return CommandFailure(EINVAL, "gate %lld is out of range (0..%d)",
+                            static_cast<long long>(arg.gates(i)),
+                            kNumOGates - 1);
+    }
+  }
+  for (int i = 0; i < arg.gates_size(); i++) {
+    gates_[i] = static_cast<gate_idx_t>(arg.gates(i));
   }
   ngates_ = arg.gates_size();
-
   return CommandSuccess();
+}
+
+CommandResponse Replicate::Init(const bess::pb::ReplicateArg &arg) {
+  return SetGates(arg);
 }
 
 CommandResponse Replicate::CommandSetGates(
     const bess::pb::ReplicateCommandSetGatesArg &arg) {
-  if (arg.gates_size() > kMaxGates) {
-    return CommandFailure(EINVAL, "no more than %d gates", kMaxGates);
-  }
-
-  for (int i = 0; i < arg.gates_size(); i++) {
-    gates_[i] = arg.gates(i);
-  }
-
-  ngates_ = arg.gates_size();
-  return CommandSuccess();
+  return SetGates(arg);
 }
 
 void Replicate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {

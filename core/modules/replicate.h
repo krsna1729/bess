@@ -56,6 +56,9 @@ class Replicate final : public Module {
 
  private:
   // ID number for each egress gate.
+  template <typename Arg>
+  CommandResponse SetGates(const Arg &arg);
+
   gate_idx_t gates_[kMaxGates];
   // The total number of output gates
   int ngates_;
