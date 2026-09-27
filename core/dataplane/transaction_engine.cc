@@ -135,7 +135,10 @@ std::expected<void, std::string> TransactionEngine::Unregister(
                              "' (unregister it first)");
     }
   }
-  if (reg.resource->LiveCount() != 0) {
+  // Live keys hold references into their dependencies, so a resource that
+  // may reference nothing can go with keys in it: its owner is removing the
+  // table (a module being destroyed with its rules). D-022.
+  if (!reg.deps.empty() && reg.resource->LiveCount() != 0) {
     return std::unexpected("resource '" + name + "' still has " +
                            std::to_string(reg.resource->LiveCount()) +
                            " live key(s)");

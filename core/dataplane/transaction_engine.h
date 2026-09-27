@@ -126,8 +126,10 @@ class TransactionEngine {
   std::expected<void, std::string> Register(Resource *resource);
 
   // Refused while: another registered resource declares this one as a
-  // reference; it has live keys (erase them in a transaction first -- their
-  // outgoing references are in the ledger); keys of it are referenced; or its
+  // reference; it has live keys and may reference others (erase them in a
+  // transaction first -- their outgoing references are in the ledger; a
+  // resource that references nothing may go with its keys, D-022); keys of
+  // it are referenced; or its
   // removal cascade still holds steps for it (they capture its tables, which
   // the module must not destroy before). It advances the cascade first, so
   // with no reader online -- workers paused or stopped, as at module

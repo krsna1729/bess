@@ -1652,7 +1652,7 @@ gap closed.**
 
 **Deferred (next increments):**
 
-- Router and the modules as resource providers;
+- Router and the modules as resource providers (ExactMatch: D-022);
 - the scope cell (dataplane-atomic scopes; §31.0 row 3);
 - `request_id` idempotency and `GetTransaction` (G1.2c, with the RPC).
 
@@ -1661,3 +1661,119 @@ gap closed.**
 - one sequencer is not enough (per-table writers need a cross-table
   serialization story);
 - a resource needs a removal that cannot wait for the cascade.
+
+## D-022 ExactMatch as the first module resource provider
+
+**Status:** accepted (2026-09-27). The first increment of "modules as
+resource providers" deferred by D-021.
+
+**Context.** D-021 built the engine and adapters, and exercised them only
+through tables that tests and benchmarks owned. This decision puts a real
+module behind the engine, so that one transaction changes several modules'
+tables and packets are classified through those modules while it happens.
+
+**Decision:**
+
+- **One engine per runtime:** `RuntimeState::transactions()`, constructed
+  over the runtime's RCU domain and destroyed before it. `Apply()` is called
+  under the control-plane lock, as module commands are: a module's own
+  commands write the same tables, and the engine's prepare-then-publish
+  must not interleave with them.
+- **ExactMatch registers its rules** as the resource `<module>/rules` in
+  `Init()` and unregisters it in `DeInit()`. The key is the packed rule key
+  (the fields' bytes in order, as the command path packs them); the value
+  is the gate. `IsValidGateValue()` is checked in prepare, like the `add`
+  command does. The rules reference nothing and, being erased immediately,
+  cannot be referenced, so unregistering cannot be refused (checked fatally
+  in `DeInit()`).
+- **Module-author ergonomics:** nothing changes for modules that do not
+  take part; a module that does wraps its table in a ready-made adapter,
+  registers it in `Init()`, unregisters it in `DeInit()`, and treats
+  `kPending` as a miss on its packet path. ExactMatch's `add`, `delete` and
+  `clear` commands are unchanged and stay direct (the rules take part in no
+  references; D-021's rule).
+- **Tables that are replaced, not only updated.** ExactMatch grows by
+  copying into a larger table and publishing a new generation.
+  `ExactRuleResource` gains `Hooks`: the table is fetched at every use
+  (`table`), `make_room(force)` lets the owner grow when a new key does not
+  fit during prepare, and `check_value` lets it refuse values. Pending keys
+  are copied with the rest, and staged operations look the table up when
+  they publish or abort, so they act on the table that replaced the one
+  they were placed in. Growth happens in prepare, never in the publish
+  window, and a rejected transaction leaves the larger table (with none of
+  its keys), as a failed `add` after growth does.
+- **Unregistering with live keys** is allowed for a resource that declares
+  no references: its keys hold no references in the ledger, so nothing is
+  left dangling. A module destroyed with its rules no longer needs to erase
+  them through a transaction first. Resources that may reference others
+  still refuse while they hold keys.
+- **The packet path** masks out hits whose value is `kPending` in one
+  branch-free, vectorized pass before choosing gates (see the evidence
+  for why not in the gate loop). `ExactMatch::ClassifyBatch` exposes the
+  exact decision `ProcessBatch` makes (both call one inlined template), so
+  tests and benchmarks drive the real module code from reader threads.
+
+**Evidence:**
+
+- Tests (`core/modules/exact_match_transaction_test.cc`, 6): the resource
+  lives exactly as long as the module and a new module may take the name;
+  one transaction changes two modules or neither; commands and
+  transactions see each other's rules; the table grows several times inside
+  one transaction and a rejection after growth leaves nothing; a key being
+  prepared is a miss on the packet path (observed from inside the publish
+  window); and a registered reader thread classifies packets through two
+  modules while 20,000 sessions are established and released and the
+  tables grow under it, never seeing a placeholder or another key's gate.
+- Mutation checks (one-time), each caught: no `kPending` filter (two
+  tests fail); staged operations keeping the table they were reserved
+  against (crash on the replaced table); no growth in prepare; no
+  unregister in `DeInit()` (crash); unregister never refusing live keys.
+- Packet-path cost, ABBA (`BM_ModuleClassify`, 32-packet batches through
+  `ClassifyBatch`, 32K distinct packets, native release, isolated):
+  the filter is a separate branch-free pass building a mask of pending
+  hits, which the compiler vectorizes (AVX2 compare and movemask), then
+  `hits &= ~pending`. A first version folded the compare into the
+  gate-selection loop and cost **+4.2% on an E-core** for cache-resident
+  hits (12 rounds, 9/12 pairs); it was replaced. The adopted version, 12
+  rounds against the module without the filter:
+
+  | N rules, traffic | P-core (CPU 2) | E-core (CPU 14) |
+  |---|---|---|
+  | 1K, hits | −1.6% (no clear difference) | +1.8% (no clear difference) |
+  | 128K, hits | −1.2% (ncd) | −0.5% (ncd) |
+  | 1M, hits | −1.2% (ncd) | −0.4% (ncd) |
+  | 1K, misses | −1.1% (ncd) | +1.0% (ncd) |
+  | 128K, misses | −1.5% (ncd) | +1.8% (ncd) |
+  | 1M, misses | +0.6% (ncd) | +1.1% (ncd) |
+
+  Absolute: 1K rules, hits, about 450 ns per 32-packet batch on a P-core
+  (71 Mpps), 710 ns on an E-core.
+- Scaling (`BM_ClassifyUnderTransactions`: readers classify through two
+  modules, each session one transaction adding a rule to each and one
+  removing them, 32K live sessions):
+  (one run each; readers on separate CPUs, Mpps per reader):
+
+  | CPUs | readers | none | 10K sess/s | 100K sess/s | flat out | sessions/s flat out |
+  |---|---|---|---|---|---|---|
+  | P (0,2,4,6,8) | 1 | 42.7 | 43.2 | 44.9 | 37.6 (−12%) | 695K |
+  | | 2 | 39.0 | 39.2 | 39.6 | 35.9 (−8%) | 579K |
+  | | 4 | 31.3 | 28.0 | 29.6 | 28.2 (−10%) | 519K |
+  | E (12-16) | 1 | 28.7 | 30.4 | 30.9 | 29.9 | 627K |
+  | | 2 | 25.0 | 24.1 | 26.4 | 26.0 | 558K |
+  | | 4 | 18.6 | 22.2 | 22.5 | 21.5 | 465K |
+
+  Up to 100K sessions/s (200K rule changes/s) readers show no cost beyond
+  this run's variation (±15% between neighbouring cells with 4 E-core
+  readers); a writer running flat out costs P-core readers 8-12%. No
+  transaction was refused busy. These are in-process numbers through the
+  module's classification code, not a live-daemon Mpps gate (deferred with
+  the RPC).
+
+**Deferred:** Router (next hops via `SlotResource`, routes with tbl8
+reservation in prepare) and WildcardMatch as providers; an RPC to reach the
+engine from a controller (G1.2c), after which a live-daemon Mpps gate under
+transactions becomes possible; the scope cell.
+
+**Revisit when:** a module needs its commands and transactions on
+different threads (a second writer), or a provider's table cannot be
+grown during prepare.

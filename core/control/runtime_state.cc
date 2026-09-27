@@ -36,6 +36,7 @@
 #include "module.h"
 #include "port.h"
 #include "control/worker_manager.h"
+#include "dataplane/transaction_engine.h"
 #include "rcu/rcu_domain.h"
 #include "traffic_class.h"
 #include "utils/common.h"
@@ -246,7 +247,8 @@ RuntimeState::RuntimeState()
       // One domain for the whole runtime, sized by the worker id space: a
       // worker registers when its thread starts and unregisters when it is
       // done, so a recreated worker reuses its id.
-      rcu_(std::make_unique<rcu::RcuDomain>(Worker::kMaxWorkers)) {}
+      rcu_(std::make_unique<rcu::RcuDomain>(Worker::kMaxWorkers)),
+      transactions_(std::make_unique<dataplane::TransactionEngine>(*rcu_)) {}
 
 RuntimeState::~RuntimeState() = default;
 
@@ -264,6 +266,10 @@ rcu::RcuDomain &RuntimeState::rcu() {
 
 const rcu::RcuDomain &RuntimeState::rcu() const {
   return *rcu_;
+}
+
+dataplane::TransactionEngine &RuntimeState::transactions() {
+  return *transactions_;
 }
 
 RuntimeState &RuntimeState::Get() {

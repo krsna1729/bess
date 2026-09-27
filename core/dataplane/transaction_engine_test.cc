@@ -768,22 +768,39 @@ TEST_F(TransactionEngineTest, DependencyDeclarationsAreEnforced) {
   EXPECT_NE(reg.error().find("register it first"), std::string::npos);
 
   // Nothing leaves while a registered resource depends on it, or while it
-  // holds keys.
+  // holds keys that reference others (their references are in the ledger).
+  // A resource that references nothing may leave with its keys (D-022).
   auto un = engine_.Unregister("meters");
   ASSERT_FALSE(un);
   EXPECT_NE(un.error().find("may reference 'meters'"), std::string::npos);
   SlotTable<MeterId, Meter> leaf_table(8);
   SlotResource<MeterId, Meter> leaf("leaf", leaf_table);
   ASSERT_TRUE(engine_.Register(&leaf));
+  SlotTable<ActionId, Action> user_table(8);
+  SlotResource<ActionId, Action> user(
+      "user", user_table,
+      [](const Action &a) {
+        return std::vector<Reference>{{"leaf", EncodeKey(a.meter)}};
+      },
+      {"leaf"});
+  ASSERT_TRUE(engine_.Register(&user));
   ASSERT_EQ(Apply({Op::Upsert("leaf", EncodeKey(MeterId(1)),
-                              std::any(Meter(1)))})
+                              std::any(Meter(1))),
+                   Op::Upsert("leaf", EncodeKey(MeterId(2)),
+                              std::any(Meter(2))),
+                   Op::Upsert("user", EncodeKey(ActionId(1)),
+                              std::any(Action{1, MeterId(1)}))})
                 .outcome,
             Outcome::kApplied);
-  un = engine_.Unregister("leaf");
+  un = engine_.Unregister("user");
   ASSERT_FALSE(un);
   EXPECT_NE(un.error().find("live key"), std::string::npos);
-  ASSERT_EQ(Apply({Op::Erase("leaf", EncodeKey(MeterId(1)))}).outcome,
+  ASSERT_EQ(Apply({Op::Erase("user", EncodeKey(ActionId(1)))}).outcome,
             Outcome::kApplied);
+  ASSERT_TRUE(engine_.Unregister("user"));
+  // The leaf still holds two keys (the one just released and one never
+  // referenced); nothing refers to them any more.
+  EXPECT_EQ(leaf.LiveCount(), 2u);
   ASSERT_TRUE(engine_.Unregister("leaf"));
 
   // A populated resource that may reference others cannot join: its

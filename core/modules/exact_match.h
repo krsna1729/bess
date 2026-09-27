@@ -42,6 +42,7 @@
 
 #include "../classifier/backend.h"
 #include "../classifier/concurrent_exact.h"
+#include "../classifier/exact_rule_resource.h"
 #include "../classifier/extract_plan.h"
 #include "../classifier/runtime_schema.h"
 #include "../control/runtime_state.h"
@@ -75,6 +76,11 @@ class ExactMatch final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
+  // What ProcessBatch decides, without emitting: gates[i] is the output gate
+  // of packet i. The same code as the packet path, for tests and benchmarks
+  // that drive the module from a registered reader thread.
+  void ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates) const;
+
   std::string GetDesc() const override;
 
   // Recompiles the extraction plan when metadata offsets are reassigned by a
@@ -83,6 +89,7 @@ class ExactMatch final : public Module {
   int OnEvent(bess::Event event) override;
 
   CommandResponse Init(const bess::pb::ExactMatchArg &arg);
+  void DeInit() override;
   CommandResponse GetInitialArg(const bess::pb::EmptyArg &arg);
   CommandResponse GetRuntimeConfig(const bess::pb::EmptyArg &arg);
   CommandResponse SetRuntimeConfig(const bess::pb::ExactMatchConfig &arg);
@@ -154,6 +161,9 @@ class ExactMatch final : public Module {
   // Sentinel for a metadata field whose attribute currently has no valid
   // physical offset (e.g. orphan reader, out of space).
   static constexpr size_t kInvalidOffset = static_cast<size_t>(-1);
+
+  template <typename Emit>
+  void Classify(bess::PacketBatch *batch, Emit &&emit) const;
 
   CommandResponse AddFieldOne(const bess::pb::Field &field,
                               const bess::pb::FieldData &mask, int idx);
@@ -239,13 +249,17 @@ class ExactMatch final : public Module {
   // one acquire load per batch on the data path, serialized rebuilds off it,
   // and the retired generation is destroyed by a control thread rather than on
   // a packet worker.
-  // Never null between Init() and module destruction: there is no DeInit()
-  // (the generation is released with the module, workers already paused), and
+  // Never null between Init() and module destruction (DeInit() leaves it: the
+  // generation is released with the module, workers already paused), and
   // every command publishes a replacement rather than clearing it.
   bess::rcu::RcuPtr<Generation> published_;
 
   // The table the command path writes (always the current generation's).
   std::shared_ptr<bess::classifier::ConcurrentExactTable> table_;
+
+  // table_ as the transactional resource "<module name>/rules" (D-022),
+  // registered from Init() to DeInit().
+  std::unique_ptr<bess::classifier::ExactRuleResource> resource_;
 };
 
 #endif  // BESS_MODULES_EXACTMATCH_H_

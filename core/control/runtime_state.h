@@ -44,6 +44,9 @@ namespace bess {
 namespace rcu {
 class RcuDomain;
 }  // namespace rcu
+namespace dataplane {
+class TransactionEngine;
+}  // namespace dataplane
 }  // namespace bess
 
 namespace bess {
@@ -198,6 +201,12 @@ class RuntimeState {
   // registered reader.
   rcu::RcuDomain &rcu();
 
+  // The runtime's transaction engine (G1.2b, D-021): modules register the
+  // tables they want changed atomically with other modules' tables as
+  // resources (D-022). Callers of Apply() hold the control-plane lock, as
+  // module commands do: a module's own commands write the same tables.
+  dataplane::TransactionEngine &transactions();
+
   const PortRegistry &ports() const { return ports_; }
   const ModuleRegistry &modules() const { return modules_; }
   const TrafficClassRegistry &traffic_classes() const {
@@ -224,6 +233,8 @@ class RuntimeState {
   TrafficClassRegistry traffic_classes_;
   std::unique_ptr<WorkerManager> workers_;
   std::unique_ptr<rcu::RcuDomain> rcu_;
+  // After rcu_: it retires through it, so it goes first.
+  std::unique_ptr<dataplane::TransactionEngine> transactions_;
   uint64_t generation_ = 0;
 };
 

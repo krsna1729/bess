@@ -246,10 +246,21 @@ reference to something missing.
   references; a one-operation transaction costs about 307 ns against 44 ns
   for a direct write (P-core). Tables that do take part in references are
   written only through the engine.
+- **The runtime has one engine**, `runtime().transactions()`. Call
+  `Apply()` under the control-plane lock, as module commands run: a
+  module's own commands write the same tables.
+- **Modules taking part today:** ExactMatch registers its rules as
+  `<module>/rules` (key: the fields' bytes in order; value: the gate) from
+  `Init()` to `DeInit()`, so one transaction can change the rules of
+  several ExactMatch instances. Its table grows during prepare when a new
+  key does not fit (`ExactRuleResource::Hooks::make_room`); pending keys
+  move to the new table with the rest. D-022.
 - **A module must `Unregister` its resources before destroying their
-  tables.** `Unregister` refuses (with the reason) while keys remain, keys
-  are referenced, a registered resource depends on it, or removal steps are
-  pending; with workers paused, one call advances the cascade.
+  tables.** `Unregister` refuses (with the reason) while keys that may
+  reference others remain (a resource that references nothing may go with
+  its keys), keys are referenced, a registered resource depends on it, or
+  removal steps are pending; with workers paused, one call advances the
+  cascade.
 - **`kBusy`:** when readers are slow to quiesce and reclamation is behind, a
   transaction is refused retriably instead of waiting.
 - **Declare each operation's footprint** in `Reserve()` (`Footprint{retires,
@@ -263,8 +274,8 @@ reference to something missing.
   flat out on P-cores (117-168K on E-cores) (`BM_LookupsUnderTransactions`;
   D-021 amendment 4).
 - Code: `core/dataplane/{resource.h, transaction_engine.{h,cc},
-  slot_resource.h}`, `core/classifier/exact_rule_resource.h`; D-020,
-  D-021.
+  slot_resource.h}`, `core/classifier/exact_rule_resource.h`,
+  `core/modules/exact_match.cc`; D-020, D-021, D-022.
 
 ### `MeterSet` (metering)
 
@@ -311,7 +322,7 @@ reference to something missing.
 
 | module | table | how changes apply | notes |
 |---|---|---|---|
-| ExactMatch | `ConcurrentExactTable` | C: add/delete/clear in place; default gate and restore by G | 0.3 µs per add at any size |
+| ExactMatch | `ConcurrentExactTable` | C: add/delete/clear in place; default gate and restore by G; transactions through resource `<module>/rules` | 0.3 µs per add at any size; D-022 |
 | IPLookup | `RouteTable` (`rte_lpm`) | C | |
 | WildcardMatch | `ConcurrentMaskedTable` (one `ConcurrentExactTable` per mask) | C: add/delete in place; a new or vanished mask republishes only the tuple list | D-014 |
 | L2Forward | `l2_table` (inline 4-way buckets) | C: single-writer, lock-free readers; whole-word slot stores, no grace period. Multi-entry `add`/`populate` are all-or-nothing per command (validation plus rollback), but not dataplane-atomic: packets see entries one by one | D-017 |
@@ -418,6 +429,12 @@ pass a stress run by luck.
   period, and keep one writer.
 - For G: build off the packet path, publish with `RcuPtr::Publish`, and never
   touch the published object again.
+- To let the table join transactions with other modules' tables, wrap it
+  in a ready-made resource (`ExactRuleResource`, `SlotResource`), register
+  it with `runtime().transactions()` in `Init()` and unregister it in
+  `DeInit()`, and make the packet path treat `kPending` as a miss (ExactMatch:
+  a vectorized mask pass, not measurable; a compare inside the gate loop
+  cost 4% on an E-core; D-022).
 - For concurrency, write a deterministic test of the invariant (a reader
   held online, then released) rather than relying on a stress test. Check it
   once by removing the protection and watching it fail.

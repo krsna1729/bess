@@ -31,6 +31,7 @@
 #define BESS_CLASSIFIER_EXACT_RULE_RESOURCE_H_
 
 #include <any>
+#include <expected>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -67,23 +68,56 @@ namespace bess::classifier {
 // `references` maps a value to the keys it names in other resources. (A
 // rule table is a root: its erases take effect at once, so nothing may
 // reference it; see Resource::DefersErase.)
+//
+// A module that replaces its table (ExactMatch grows by copying into a
+// larger one) passes Hooks: the table is then fetched at every use, and
+// make_room may replace it while a transaction is being prepared. Pending
+// keys are copied like any other, and staged operations find them in the
+// new table (they look the table up when they run). Decision D-022.
 class ExactRuleResource final : public dataplane::Resource {
  public:
   using ReferencesFn =
       std::function<std::vector<dataplane::Reference>(uint64_t value)>;
+  using Result = std::expected<void, std::string>;
+
+  struct Hooks {
+    // The owner's current table.
+    std::function<ConcurrentExactTable &()> table;
+    // Refuses values the owner does not accept (e.g. an invalid gate).
+    std::function<Result(uint64_t value)> check_value;
+    // Makes room for one more key -- by growing the table -- when a new key
+    // does not fit. `force`: the key's buckets were full although the table
+    // had its headroom (a cuckoo placement failure). An error rejects the
+    // transaction.
+    std::function<Result(bool force)> make_room;
+    ReferencesFn references;
+    // The resources `references` can name (declared, see Resource).
+    std::vector<std::string> may_reference;
+  };
 
   // `may_reference`: the resources `references` can name (declared, see
   // Resource).
   ExactRuleResource(std::string name, ConcurrentExactTable &table,
                     ReferencesFn references = {},
                     std::vector<std::string> may_reference = {})
-      : Resource(std::move(name), std::move(may_reference)),
-        table_(table),
-        references_(std::move(references)) {}
+      : ExactRuleResource(
+            std::move(name),
+            Hooks{.table = [&table]() -> ConcurrentExactTable & {
+                    return table;
+                  },
+                  .references = std::move(references),
+                  .may_reference = std::move(may_reference)}) {}
+
+  ExactRuleResource(std::string name, Hooks hooks)
+      : Resource(std::move(name), std::move(hooks.may_reference)),
+        table_(std::move(hooks.table)),
+        check_value_(std::move(hooks.check_value)),
+        make_room_(std::move(hooks.make_room)),
+        references_(std::move(hooks.references)) {}
 
   // Committed keys: no transaction is in flight when the engine asks, so no
   // kPending placeholder is counted.
-  size_t LiveCount() const override { return table_.size(); }
+  size_t LiveCount() const override { return table_().size(); }
 
   // The value a key holds while a transaction that adds it is being
   // prepared. Readers treat it as a miss.
@@ -115,10 +149,10 @@ class ExactRuleResource final : public dataplane::Resource {
 
   std::expected<Reservation, std::string> Reserve(
       const dataplane::Op &op) override {
-    if (op.key.size() != table_.key_len()) {
+    if (op.key.size() != table_().key_len()) {
       return std::unexpected("key is " + std::to_string(op.key.size()) +
                              " bytes, the table's are " +
-                             std::to_string(table_.key_len()));
+                             std::to_string(table_().key_len()));
     }
     const std::optional<uint64_t> previous = Find(op.key);
     if (op.kind == dataplane::OpKind::kErase) {
@@ -139,6 +173,11 @@ class ExactRuleResource final : public dataplane::Resource {
     if (*value == kPending) {
       return std::unexpected("value is reserved (kPending)");
     }
+    if (check_value_) {
+      if (Result ok = check_value_(*value); !ok) {
+        return std::unexpected(ok.error());
+      }
+    }
     // Everything that can throw comes first -- the staged operation and the
     // references -- so that placing the key, the one step with a physical
     // effect, is the last thing that can fail: nothing can leak a pending key
@@ -154,19 +193,8 @@ class ExactRuleResource final : public dataplane::Resource {
       }
     }
     if (!previous) {
-      // Headroom for deletes still in the defer queue (D-010), then place
-      // the key for real, invisible to readers.
-      table_.Reclaim();
-      if (table_.slots_in_use() + 1 +
-              ConcurrentExactTable::Headroom(table_.capacity()) >
-          table_.capacity()) {
-        return std::unexpected("table full (" +
-                               std::to_string(table_.capacity()) + " slots)");
-      }
-      if (table_.Upsert(Bytes(op.key), kPending) ==
-          ConcurrentExactTable::UpsertResult::kFull) {
-        return std::unexpected(
-            "no room for this key (its buckets are full)");
+      if (Result placed = PlacePending(op.key); !placed) {
+        return std::unexpected(placed.error());
       }
       upsert->MarkInsertedPending();  // Abort() now erases it
     }
@@ -177,16 +205,48 @@ class ExactRuleResource final : public dataplane::Resource {
   }
 
  private:
+  using TableFn = std::function<ConcurrentExactTable &()>;
+
+  // Inserts `key` with kPending, invisible to readers. When it does not fit
+  // and the owner can make room, makes room once and tries again.
+  Result PlacePending(const std::string &key) {
+    std::string why;
+    for (int attempt = 0; attempt < 2; attempt++) {
+      ConcurrentExactTable &table = table_();
+      // Headroom for deletes still in the defer queue (D-010).
+      table.Reclaim();
+      const bool room = table.slots_in_use() + 1 +
+                            ConcurrentExactTable::Headroom(table.capacity()) <=
+                        table.capacity();
+      if (!room) {
+        why = "table full (" + std::to_string(table.capacity()) + " slots)";
+      } else if (table.Upsert(Bytes(key), kPending) !=
+                 ConcurrentExactTable::UpsertResult::kFull) {
+        return {};
+      } else {
+        why = "no room for this key (its buckets are full)";
+      }
+      if (!make_room_ || attempt == 1) {
+        break;
+      }
+      if (Result grown = make_room_(/*force=*/room); !grown) {
+        return grown;
+      }
+    }
+    return std::unexpected(why);
+  }
+
   static ConstBytes Bytes(const std::string &key) {
     return ConstBytes(reinterpret_cast<const Byte *>(key.data()), key.size());
   }
 
   std::optional<uint64_t> Find(const dataplane::ResourceKey &key) const {
-    if (key.size() != table_.key_len()) {
+    const ConcurrentExactTable &table = table_();
+    if (key.size() != table.key_len()) {
       return std::nullopt;
     }
     uint64_t value = 0;
-    if (table_.LookupBatch(Bytes(key), key.size(), &value, 1) == 0 ||
+    if (table.LookupBatch(Bytes(key), key.size(), &value, 1) == 0 ||
         value == kPending) {
       return std::nullopt;
     }
@@ -195,23 +255,26 @@ class ExactRuleResource final : public dataplane::Resource {
 
   class UpsertOp final : public dataplane::StagedOp {
    public:
-    UpsertOp(ConcurrentExactTable &table, std::string key, uint64_t value)
+    // `table` is the resource's (it outlives its staged operations), looked
+    // up when the operation runs: the owner may have replaced the table
+    // since Reserve().
+    UpsertOp(const TableFn &table, std::string key, uint64_t value)
         : table_(table), key_(std::move(key)), value_(value) {}
     void MarkInsertedPending() noexcept { inserted_pending_ = true; }
     void Publish(dataplane::Retirer &) noexcept override {
       // The key is present (placed in Reserve, or already there): this is an
       // in-place value store, which cannot fail.
-      CHECK(table_.Upsert(Bytes(key_), value_) ==
+      CHECK(table_().Upsert(Bytes(key_), value_) ==
             ConcurrentExactTable::UpsertResult::kUpdated);
     }
     void Abort() noexcept override {
       if (inserted_pending_) {
-        table_.Erase(Bytes(key_));
+        table_().Erase(Bytes(key_));
       }
     }
 
    private:
-    ConcurrentExactTable &table_;
+    const TableFn &table_;
     std::string key_;
     uint64_t value_;
     bool inserted_pending_ = false;
@@ -219,18 +282,20 @@ class ExactRuleResource final : public dataplane::Resource {
 
   class EraseOp final : public dataplane::StagedOp {
    public:
-    EraseOp(ConcurrentExactTable &table, std::string key)
+    EraseOp(const TableFn &table, std::string key)
         : table_(table), key_(std::move(key)) {}
     void Publish(dataplane::Retirer &) noexcept override {
-      table_.Erase(Bytes(key_));
+      table_().Erase(Bytes(key_));
     }
 
    private:
-    ConcurrentExactTable &table_;
+    const TableFn &table_;
     std::string key_;
   };
 
-  ConcurrentExactTable &table_;
+  TableFn table_;
+  std::function<Result(uint64_t)> check_value_;
+  std::function<Result(bool)> make_room_;
   ReferencesFn references_;
 };
 

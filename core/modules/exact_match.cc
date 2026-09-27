@@ -37,6 +37,7 @@
 #include <utility>
 #include <vector>
 
+#include "../dataplane/transaction_engine.h"
 #include "../event.h"
 #include "../metadata.h"
 #include "../snbuf_layout.h"
@@ -522,7 +523,50 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
   table_ = std::move(*table);
   published_.Initialize(std::move(gen));
 
+  // The rules as a transactional resource (D-022), so that one transaction
+  // can change them together with other modules' tables. Keys are the packed
+  // rule keys (the fields' bytes in order), values the gates.
+  resource_ = std::make_unique<classifier::ExactRuleResource>(
+      name() + "/rules",
+      classifier::ExactRuleResource::Hooks{
+          .table = [this]() -> classifier::ConcurrentExactTable & {
+            return *table_;
+          },
+          .check_value =
+              [](uint64_t gate) -> classifier::ExactRuleResource::Result {
+            if (!bess::IsValidGateValue(gate)) {
+              return std::unexpected("invalid gate " + std::to_string(gate));
+            }
+            return {};
+          },
+          .make_room =
+              [this](bool force) -> classifier::ExactRuleResource::Result {
+            Error grow_err;
+            if (!EnsureCapacity(force, &grow_err)) {
+              return std::unexpected(grow_err.second);
+            }
+            return {};
+          }});
+  if (auto registered =
+          bess::control::runtime().transactions().Register(resource_.get());
+      !registered) {
+    resource_.reset();
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
   return CommandSuccess();
+}
+
+void ExactMatch::DeInit() {
+  if (resource_ == nullptr) {
+    return;
+  }
+  // Cannot be refused: the rules reference nothing and nothing may
+  // reference them (their erases are immediate), and Apply() runs under the
+  // control-plane lock this runs under.
+  auto unregistered =
+      bess::control::runtime().transactions().Unregister(resource_->name());
+  CHECK(unregistered) << unregistered.error();
+  resource_.reset();
 }
 
 // Retrieves an ExactMatchArg that would reconstruct this module.
@@ -674,7 +718,11 @@ CommandResponse ExactMatch::SetRuntimeConfig(
   return CommandSuccess();
 }
 
-void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+// The packet path's per-batch decision, shared by ProcessBatch and
+// ClassifyBatch: calls emit(i, gate) once per packet, in order. `emit` is
+// inlined into each caller.
+template <typename Emit>
+inline void ExactMatch::Classify(bess::PacketBatch *batch, Emit &&emit) const {
   // One snapshot for the whole batch: a concurrent command can neither swap
   // the generation mid-batch nor free it under this lookup.
   const Generation *gen = published_.Read();
@@ -685,7 +733,7 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     // Fail-closed generation (metadata offsets unreadable): route everything
     // to the default gate without touching packet or metadata bytes.
     for (int i = 0; i < cnt; i++) {
-      EmitPacket(ctx, batch->packet(i), default_gate);
+      emit(i, default_gate);
     }
     return;
   }
@@ -743,13 +791,33 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
                              static_cast<size_t>(cnt) * key_size),
       key_size, gates.data(), static_cast<size_t>(cnt));
   hits &= valid;
+  // A key a transaction is still preparing holds kPending: a miss (D-022).
+  // A separate branch-free pass, which the compiler vectorizes; folding the
+  // compare into the loop below cost 4% on an E-core (ABBA).
+  uint64_t pending = 0;
+  for (int i = 0; i < cnt; i++) {
+    pending |= uint64_t{gates[i] == classifier::ExactRuleResource::kPending}
+               << i;
+  }
+  hits &= ~pending;
 
   for (int i = 0; i < cnt; i++) {
     const gate_idx_t gate = (hits & (uint64_t{1} << i))
                                 ? static_cast<gate_idx_t>(gates[i])
                                 : default_gate;
-    EmitPacket(ctx, batch->packet(i), gate);
+    emit(i, gate);
   }
+}
+
+void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+  Classify(batch, [&](int i, gate_idx_t gate) {
+    EmitPacket(ctx, batch->packet(i), gate);
+  });
+}
+
+void ExactMatch::ClassifyBatch(bess::PacketBatch *batch,
+                               gate_idx_t *gates) const {
+  Classify(batch, [&](int i, gate_idx_t gate) { gates[i] = gate; });
 }
 
 std::string ExactMatch::GetDesc() const {
