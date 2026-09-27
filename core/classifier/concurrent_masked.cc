@@ -31,7 +31,10 @@
 #include "classifier/concurrent_masked.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstring>
+
+#include <glog/logging.h>
 
 namespace bess::classifier {
 
@@ -154,11 +157,15 @@ ConcurrentMaskedTable::RuleId ConcurrentMaskedTable::Find(
 ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
     ConstBytes mask, ConstBytes value, int64_t priority, uint16_t result) {
   promise(mask.size() == key_len_ && value.size() == key_len_);
+  if (result == kPendingResult) {
+    return UpsertResult::kReservedResult;
+  }
   for (size_t b = 0; b < key_len_; b++) {
     if ((value[b] & ~mask[b]) != std::byte{0}) {
       return UpsertResult::kNotCanonical;
     }
   }
+  DropEmptyTuples();  // a transaction's erase or cancel may have left one
 
   const TupleList *list = tuples_.Read();
   size_t index = list->tuples.size();
@@ -225,6 +232,197 @@ ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
   }
   size_++;
   return UpsertResult::kInserted;
+}
+
+size_t ConcurrentMaskedTable::TupleIndex(const TupleList &list,
+                                         ConstBytes mask) const {
+  for (size_t t = 0; t < list.tuples.size(); t++) {
+    if (std::memcmp(list.tuples[t].mask.data(), mask.data(), key_len_) == 0) {
+      return t;
+    }
+  }
+  return list.tuples.size();
+}
+
+void ConcurrentMaskedTable::DropEmptyTuples() {
+  const TupleList *list = tuples_.Read();
+  if (std::none_of(list->tuples.begin(), list->tuples.end(),
+                   [](const Tuple &t) { return t.table->size() == 0; })) {
+    return;
+  }
+  auto next = std::make_unique<TupleList>();
+  for (const Tuple &tuple : list->tuples) {
+    if (tuple.table->size() != 0) {
+      next->tuples.push_back(tuple);
+    }
+  }
+  PublishTuples(std::move(next));
+}
+
+std::optional<ConcurrentMaskedTable::Rule> ConcurrentMaskedTable::FindRule(
+    ConstBytes mask, ConstBytes value) const {
+  const TupleList *list = tuples_.Read();
+  const size_t t = TupleIndex(*list, mask);
+  if (t == list->tuples.size()) {
+    return std::nullopt;
+  }
+  const RuleId id = Find(*list->tuples[t].table, value);
+  if (id == 0 || id == pending_id_) {
+    return std::nullopt;
+  }
+  return Record(id);
+}
+
+std::expected<ConcurrentMaskedTable::Prepared,
+              ConcurrentMaskedTable::UpsertResult>
+ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
+                                     int64_t priority, uint16_t result) {
+  promise(mask.size() == key_len_ && value.size() == key_len_);
+  if (result == kPendingResult) {
+    return std::unexpected(UpsertResult::kReservedResult);
+  }
+  for (size_t b = 0; b < key_len_; b++) {
+    if ((value[b] & ~mask[b]) != std::byte{0}) {
+      return std::unexpected(UpsertResult::kNotCanonical);
+    }
+  }
+  DropEmptyTuples();
+  // Everything that allocates without a visible effect first.
+  Prepared prepared{std::vector<std::byte>(mask.begin(), mask.end()),
+                    std::vector<std::byte>(value.begin(), value.end())};
+  free_ids_.reserve(free_ids_.size() + prepared_ + 2);
+  if (pending_id_ == 0) {
+    pending_id_ = AllocateId();
+    if (pending_id_ == 0) {
+      return std::unexpected(UpsertResult::kFull);
+    }
+    // Loses to every rule: the lowest priority, and a sequence below every
+    // rule's (ties go to the later command).
+    MutableRecord(pending_id_) = {.priority = INT64_MIN,
+                                  .sequence = 0,
+                                  .result = kPendingResult};
+  }
+
+  const TupleList *list = tuples_.Read();
+  const size_t index = TupleIndex(*list, mask);
+  const bool new_tuple = index == list->tuples.size();
+  if (new_tuple && list->tuples.size() >= max_tuples_) {
+    return std::unexpected(UpsertResult::kTooManyTuples);
+  }
+  std::shared_ptr<ConcurrentExactTable> table =
+      new_tuple ? NewTupleTable(1) : list->tuples[index].table;
+  if (table == nullptr) {
+    return std::unexpected(UpsertResult::kFull);
+  }
+  bool replaced = false;
+  prepared.old = Find(*table, value);
+  if (prepared.old == 0 && !new_tuple && !table->HasRoomForOne()) {
+    table = Grown(*table);
+    if (table == nullptr) {
+      return std::unexpected(UpsertResult::kFull);
+    }
+    replaced = true;
+  }
+  const RuleId id = AllocateId();
+  if (id == 0) {
+    return std::unexpected(UpsertResult::kFull);
+  }
+  // Written now, named by the table only at Commit() (its release store).
+  MutableRecord(id) = {.priority = priority,
+                       .sequence = next_sequence_++,
+                       .result = result};
+  if (prepared.old == 0) {
+    // A new rule: present but pending, so capacity is settled here.
+    const uint64_t pending = Pack(pending_id_, kPendingResult);
+    if (table->Upsert(value, pending) ==
+        ConcurrentExactTable::UpsertResult::kFull) {
+      table = Grown(*table);
+      if (table == nullptr ||
+          table->Upsert(value, pending) ==
+              ConcurrentExactTable::UpsertResult::kFull) {
+        free_ids_.push_back(id);  // never named: reusable at once
+        return std::unexpected(UpsertResult::kFull);
+      }
+      replaced = true;
+    }
+  }
+  if (new_tuple || replaced) {
+    auto next = std::make_unique<TupleList>(*list);
+    if (new_tuple) {
+      next->tuples.push_back({prepared.mask, table});
+    } else {
+      next->tuples[index].table = table;
+    }
+    PublishTuples(std::move(next));
+  }
+  prepared.id = id;
+  prepared.result = result;
+  prepared_++;
+  return prepared;
+}
+
+std::optional<ConcurrentMaskedTable::Prepared>
+ConcurrentMaskedTable::PrepareErase(ConstBytes mask, ConstBytes value) {
+  promise(mask.size() == key_len_ && value.size() == key_len_);
+  const TupleList *list = tuples_.Read();
+  const size_t index = TupleIndex(*list, mask);
+  if (index == list->tuples.size()) {
+    return std::nullopt;
+  }
+  const RuleId old = Find(*list->tuples[index].table, value);
+  if (old == 0 || old == pending_id_) {
+    return std::nullopt;
+  }
+  Prepared prepared{std::vector<std::byte>(mask.begin(), mask.end()),
+                    std::vector<std::byte>(value.begin(), value.end())};
+  prepared.old = old;
+  prepared_++;
+  return prepared;
+}
+
+ConcurrentMaskedTable::RuleId ConcurrentMaskedTable::Commit(
+    const Prepared &prepared) noexcept {
+  const TupleList *list = tuples_.Read();
+  const size_t index = TupleIndex(*list, prepared.mask);
+  // Prepare*() left the tuple and the entry in place; nothing else writes
+  // between prepare and commit (one writer).
+  CHECK_LT(index, list->tuples.size());
+  ConcurrentExactTable &table = *list->tuples[index].table;
+  const ConstBytes value(prepared.value.data(), prepared.value.size());
+  if (prepared.id != 0) {
+    // An in-place value store of a present key: cannot fail.
+    CHECK(table.Upsert(value, Pack(prepared.id, prepared.result)) ==
+          ConcurrentExactTable::UpsertResult::kUpdated);
+    if (prepared.old == 0) {
+      size_++;
+    }
+  } else {
+    CHECK(table.Erase(value));
+    size_--;
+    // An emptied tuple stays until the next prepare or command drops it
+    // (republishing the list would allocate here).
+  }
+  prepared_--;
+  return prepared.old;
+}
+
+void ConcurrentMaskedTable::Cancel(const Prepared &prepared) noexcept {
+  if (prepared.id != 0) {
+    if (prepared.old == 0) {
+      const TupleList *list = tuples_.Read();
+      const size_t index = TupleIndex(*list, prepared.mask);
+      CHECK_LT(index, list->tuples.size());
+      list->tuples[index].table->Erase(
+          ConstBytes(prepared.value.data(), prepared.value.size()));
+    }
+    free_ids_.push_back(prepared.id);  // never named; room reserved
+  }
+  prepared_--;
+}
+
+void ConcurrentMaskedTable::Recycle(RuleId id) {
+  free_ids_.push_back(id);
+  DropEmptyTuples();
 }
 
 bool ConcurrentMaskedTable::Erase(ConstBytes mask, ConstBytes value) {

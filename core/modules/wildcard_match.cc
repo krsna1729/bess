@@ -37,6 +37,7 @@
 #include <string>
 #include <vector>
 
+#include "../dataplane/transaction_engine.h"
 #include "../utils/endian.h"
 #include "../utils/format.h"
 
@@ -174,7 +175,42 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
   table_ = std::move(*table);
   published_.Initialize(std::move(gen));
 
+  // The rules as a transactional resource (D-024), so that one transaction
+  // can change them together with other modules' tables. Keys are the
+  // packed mask then the packed value (fields in order); values are
+  // {priority, gate}. The table filters rules being prepared itself.
+  using bess::classifier::MaskedRuleResource;
+  resource_ = std::make_unique<MaskedRuleResource>(
+      name() + "/rules",
+      MaskedRuleResource::Hooks{
+          .table = [this] { return table_; },
+          .check_value = [](const MaskedRuleResource::Value &v)
+              -> MaskedRuleResource::Result {
+            if (!bess::IsValidGateValue(v.result)) {
+              return std::unexpected("invalid gate " +
+                                     std::to_string(v.result));
+            }
+            return {};
+          }});
+  if (auto registered =
+          bess::control::runtime().transactions().Register(resource_.get());
+      !registered) {
+    resource_.reset();
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
   return CommandSuccess();
+}
+
+void WildcardMatch::DeInit() {
+  if (resource_ == nullptr) {
+    return;
+  }
+  // The rules reference nothing and nothing may reference them; freed rule
+  // ids still in the removal cascade complete here (workers are paused).
+  auto unregistered =
+      bess::control::runtime().transactions().Unregister(resource_->name());
+  CHECK(unregistered) << unregistered.error();
+  resource_.reset();
 }
 
 bool WildcardMatch::ComputeLayout(bool tolerate_invalid_metadata,
@@ -317,6 +353,8 @@ Error WildcardMatch::InsertRule(bess::classifier::ConcurrentMaskedTable &table,
                                       table.tuple_count() + 1, kMaxTuples));
     case R::kNotCanonical:
       return std::make_pair(EINVAL, "invalid pair of value and mask");
+    case R::kReservedResult:  // gates never reach it
+      return std::make_pair(EINVAL, "invalid gate");
     case R::kFull:
       break;
   }
@@ -698,7 +736,12 @@ CommandResponse WildcardMatch::SetRuntimeConfig(
   return CommandSuccess();
 }
 
-void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+// The packet path's per-batch decision, shared by ProcessBatch and
+// ClassifyBatch: calls emit(i, gate) once per packet, in order. `emit` is
+// inlined into each caller.
+template <typename Emit>
+inline void WildcardMatch::Classify(bess::PacketBatch *batch,
+                                    Emit &&emit) const {
   // One snapshot for the whole batch: a concurrent command can neither swap
   // the generation mid-batch nor free it under this lookup.
   const Generation *gen = published_.Read();
@@ -709,7 +752,7 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     // Fail-closed generation (metadata offsets unreadable): route everything
     // to the default gate without touching packet or metadata bytes.
     for (int i = 0; i < cnt; i++) {
-      EmitPacket(ctx, batch->packet(i), default_gate);
+      emit(i, default_gate);
     }
     return;
   }
@@ -761,8 +804,19 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   for (int i = 0; i < cnt; i++) {
     const gate_idx_t gate =
         (hits & (uint64_t{1} << i)) ? gates[i] : default_gate;
-    EmitPacket(ctx, batch->packet(i), gate);
+    emit(i, gate);
   }
+}
+
+void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+  Classify(batch, [&](int i, gate_idx_t gate) {
+    EmitPacket(ctx, batch->packet(i), gate);
+  });
+}
+
+void WildcardMatch::ClassifyBatch(bess::PacketBatch *batch,
+                                  gate_idx_t *gates) const {
+  Classify(batch, [&](int i, gate_idx_t gate) { gates[i] = gate; });
 }
 
 std::string WildcardMatch::GetDesc() const {

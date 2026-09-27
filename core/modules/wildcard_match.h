@@ -42,6 +42,7 @@
 
 #include "../classifier/extract_plan.h"
 #include "../classifier/concurrent_masked.h"
+#include "../classifier/masked_rule_resource.h"
 #include "../classifier/runtime_schema.h"
 #include "../control/runtime_state.h"
 #include "../event.h"
@@ -85,6 +86,12 @@ class WildcardMatch final : public Module {
   }
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
+  void DeInit() override;
+
+  // What ProcessBatch decides, without emitting: gates[i] is the output gate
+  // of packet i. The same code as the packet path, for tests and benchmarks
+  // that drive the module from a registered reader thread.
+  void ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates) const;
 
   std::string GetDesc() const override;
 
@@ -172,6 +179,9 @@ class WildcardMatch final : public Module {
     bool metadata_valid = true;
   };
 
+  template <typename Emit>
+  void Classify(bess::PacketBatch *batch, Emit &&emit) const;
+
   CommandResponse AddFieldOne(const bess::pb::Field &field, int idx);
   // Resolves FieldSpecs into a dense packed layout using current metadata
   // offsets. With `tolerate_invalid_metadata`, unreadable metadata marks the
@@ -223,6 +233,10 @@ class WildcardMatch final : public Module {
 
   // The live rule table (also held by the published generation).
   std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table_;
+
+  // table_ as the transactional resource "<module name>/rules" (D-024),
+  // registered from Init() to DeInit().
+  std::unique_ptr<bess::classifier::MaskedRuleResource> resource_;
 
   // Publication and reclamation (bess::rcu::RcuPtr + the runtime's RcuDomain):
   // one acquire load per batch on the data path, serialized rebuilds off it,

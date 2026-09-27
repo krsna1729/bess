@@ -175,10 +175,12 @@ LookupFixture &FixtureFor(int tuples, size_t rules) {
     rs.push_back({.value = ConstBytes(values[r].data(), 8),
                   .mask = ConstBytes(masks[t].data(), 8),
                   .priority = static_cast<int64_t>(r),
-                  .result = static_cast<uint16_t>(r)});
+                  .result = static_cast<uint16_t>(r % 0xffff)});
+    // (0xffff is reserved: ConcurrentMaskedTable::kPendingResult, D-024.)
     f->concurrent->Upsert(ConstBytes(masks[t].data(), 8),
                           ConstBytes(values[r].data(), 8),
-                          static_cast<int64_t>(r), static_cast<uint16_t>(r));
+                          static_cast<int64_t>(r),
+                          static_cast<uint16_t>(r % 0xffff));
   }
   auto gen = bess::classifier::RuntimeMaskedBackend<uint16_t, int64_t>::Build(
       8, rs);

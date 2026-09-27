@@ -249,6 +249,7 @@ unit_test_sources = [
   'modules/l2_table_test.cc',
   'modules/queue_out_test.cc',
   'modules/wildcard_match_test.cc',
+  'modules/wildcard_match_transaction_test.cc',
   'packet_cursor_test.cc',
   'packet_checksum_test.cc',
   'packet_tx_checksum_test.cc',

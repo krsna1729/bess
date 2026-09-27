@@ -38,6 +38,7 @@
 #include <deque>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -95,7 +96,12 @@ class ConcurrentMaskedTable {
     kTooManyTuples,  // a new mask beyond max_tuples
     kFull,           // out of rule ids, or a tuple table could not grow
     kNotCanonical,
+    kReservedResult,  // kPendingResult is not a rule result
   };
+
+  // The result a rule being prepared by a transaction carries (D-024): it
+  // never wins against another match, and alone reads as a miss.
+  static constexpr uint16_t kPendingResult = 0xFFFF;
 
   static constexpr size_t kMaxBatch = 64;
   static constexpr uint32_t kChunkBits = 10;  // 1024 records per chunk
@@ -118,6 +124,40 @@ class ConcurrentMaskedTable {
   // Removes every rule and every tuple.
   void Clear();
 
+  // -- transactional writer (D-024) ----------------------------------------
+  //
+  // One rule's change split for the transaction engine. Prepare*() does
+  // everything that can fail -- a new tuple, a tuple table's growth, a rule
+  // id and its record -- and leaves every lookup's answer unchanged: a new
+  // rule is inserted as a pending entry (pointing at a record that loses to
+  // every rule, with kPendingResult), a replacement's record is written but
+  // not yet named. Commit() makes the change visible with one in-place table
+  // store or delete and cannot fail; it returns the id no longer named (0 if
+  // none), which the caller hands to Recycle() once a grace period has
+  // passed. Cancel() undoes a Prepare*() that will not be committed. Rules
+  // prepared together must have distinct (mask, value).
+  struct Prepared {
+    std::vector<std::byte> mask;
+    std::vector<std::byte> value;
+    RuleId id = 0;        // the new record (upsert); 0 for an erase
+    RuleId old = 0;       // the rule replaced or erased; 0 for a new rule
+    uint16_t result = 0;
+  };
+  std::expected<Prepared, UpsertResult> PrepareUpsert(ConstBytes mask,
+                                                      ConstBytes value,
+                                                      int64_t priority,
+                                                      uint16_t result);
+  // nullopt if no rule has exactly this (mask, value).
+  std::optional<Prepared> PrepareErase(ConstBytes mask, ConstBytes value);
+  RuleId Commit(const Prepared &prepared) noexcept;
+  void Cancel(const Prepared &prepared) noexcept;
+  // Returns a committed-away id for reuse, and drops tuples a commit or a
+  // cancel left empty (neither can republish the tuple list: it allocates).
+  void Recycle(RuleId id);
+
+  // The committed rule with exactly this (mask, value), if any.
+  std::optional<Rule> FindRule(ConstBytes mask, ConstBytes value) const;
+
   // Visits every rule: fn(ConstBytes mask, ConstBytes value, const Rule &).
   template <typename Fn>
   void ForEach(Fn &&fn) const {
@@ -135,6 +175,11 @@ class ConcurrentMaskedTable {
   uint32_t key_len() const noexcept { return key_len_; }
   // Rule ids retired but not yet past their grace period.
   size_t retiring_ids() const noexcept { return retiring_.size(); }
+  // Rule ids not free: live rules, retiring ids, prepared records and the
+  // pending record.
+  size_t ids_in_use() const noexcept {
+    return (next_id_ - 1) - free_ids_.size();
+  }
 
   // -- reader -------------------------------------------------------------------
 
@@ -171,7 +216,14 @@ class ConcurrentMaskedTable {
     }
     for (uint64_t m = matched; m != 0; m &= m - 1) {
       const size_t i = static_cast<size_t>(__builtin_ctzll(m));
-      results[i] = static_cast<uint16_t>(best[i] >> 32);
+      const auto result = static_cast<uint16_t>(best[i] >> 32);
+      // The best match is a rule a transaction is preparing only when
+      // nothing else matched (its record loses to every rule): a miss.
+      if (result == kPendingResult) {
+        matched &= ~(uint64_t{1} << i);
+      } else {
+        results[i] = result;
+      }
     }
     return matched;
   }
@@ -224,6 +276,11 @@ class ConcurrentMaskedTable {
   void PublishTuples(std::unique_ptr<TupleList> list);
   // The rule id stored for `value` in `table`, or 0.
   static RuleId Find(const ConcurrentExactTable &table, ConstBytes value);
+  // The index of the tuple with this mask in `list`, or list size.
+  size_t TupleIndex(const TupleList &list, ConstBytes mask) const;
+  // Republishes the tuple list without tuples that have no entries (left by
+  // transactional erases, which cannot republish).
+  void DropEmptyTuples();
 
   const uint32_t key_len_;
   const size_t max_tuples_;
@@ -235,6 +292,11 @@ class ConcurrentMaskedTable {
   RuleId next_id_ = 1;
   uint64_t next_sequence_ = 1;
   std::vector<RuleId> free_ids_;
+  // The record every pending entry names (allocated on first use).
+  RuleId pending_id_ = 0;
+  // Prepared, not yet committed or cancelled: free_ids_ keeps room for each,
+  // so Cancel() does not allocate.
+  size_t prepared_ = 0;
   std::deque<Retiring> retiring_;
   size_t size_ = 0;
 };

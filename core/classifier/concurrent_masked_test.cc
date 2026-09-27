@@ -95,6 +95,67 @@ TEST(ConcurrentMaskedTableTest, HigherPriorityThenLaterCommandWins) {
   EXPECT_EQ(3u, t->tuple_count());
 }
 
+// The transactional split (D-024): a prepared new rule is present but loses
+// to every rule and alone reads as a miss; a prepared replacement leaves the
+// old rule answering; commit switches in one store; cancel undoes; the ids a
+// commit frees come back through Recycle(), which also drops emptied masks.
+TEST(ConcurrentMaskedTableTest, PrepareCommitCancelRecycle) {
+  auto t = MakeTable();
+  ASSERT_EQ(R::kInserted, t->Upsert(C(kLow1), C(B(0x07)), 1, 10));
+  const size_t base_ids = t->ids_in_use();
+
+  // A new, higher-priority rule for 0x0707 in a new mask: prepared, it
+  // neither outranks the existing low-priority match nor answers alone.
+  auto wide = t->PrepareUpsert(C(kLow2), C(B(0x0707)), 100, 20);
+  auto alone = t->PrepareUpsert(C(kLow2), C(B(0x0909)), 5, 30);
+  ASSERT_TRUE(wide && alone);
+  EXPECT_EQ(Classify(*t, 0x0707), 10);
+  EXPECT_EQ(Classify(*t, 0x0909), -1);
+  EXPECT_EQ(t->size(), 1u);
+  EXPECT_FALSE(t->FindRule(C(kLow2), C(B(0x0707))).has_value());
+
+  EXPECT_EQ(t->Commit(*wide), 0u);
+  EXPECT_EQ(Classify(*t, 0x0707), 20);
+  t->Cancel(*alone);
+  EXPECT_EQ(Classify(*t, 0x0909), -1);
+  EXPECT_EQ(t->size(), 2u);
+
+  // A replacement: the old rule answers until the commit, which frees its id.
+  auto regate = t->PrepareUpsert(C(kLow2), C(B(0x0707)), 100, 21);
+  ASSERT_TRUE(regate);
+  EXPECT_EQ(Classify(*t, 0x0707), 20);
+  const auto freed = t->Commit(*regate);
+  EXPECT_NE(freed, 0u);
+  EXPECT_EQ(Classify(*t, 0x0707), 21);
+  t->Recycle(freed);
+
+  // Many replace cycles do not grow the ids in use.
+  const size_t steady = t->ids_in_use();
+  for (int i = 0; i < 3000; i++) {
+    auto p = t->PrepareUpsert(C(kLow2), C(B(0x0707)), 100,
+                              static_cast<uint16_t>(i % 50));
+    ASSERT_TRUE(p);
+    t->Recycle(t->Commit(*p));
+  }
+  EXPECT_EQ(t->ids_in_use(), steady);
+
+  // Erasing the mask's last rule leaves an empty tuple until Recycle().
+  auto erase = t->PrepareErase(C(kLow2), C(B(0x0707)));
+  ASSERT_TRUE(erase);
+  EXPECT_FALSE(t->PrepareErase(C(kLow2), C(B(0x0808))).has_value());
+  EXPECT_EQ(t->tuple_count(), 2u);
+  const auto erased = t->Commit(*erase);
+  EXPECT_EQ(Classify(*t, 0x0707), 10);
+  EXPECT_EQ(t->tuple_count(), 2u);
+  t->Recycle(erased);
+  EXPECT_EQ(t->tuple_count(), 1u);
+  EXPECT_EQ(t->size(), 1u);
+  EXPECT_EQ(t->ids_in_use(), base_ids + 1);  // + the pending record
+  EXPECT_EQ(R::kReservedResult,
+            t->Upsert(C(kLow1), C(B(0x08)), 1,
+                      ConcurrentMaskedTable::kPendingResult));
+}
+
 TEST(ConcurrentMaskedTableTest, TupleCeilingCountsActiveMasks) {
   auto t = MakeTable(/*max_tuples=*/2);
   ASSERT_EQ(R::kInserted, t->Upsert(C(kFull), C(B(1)), 0, 1));

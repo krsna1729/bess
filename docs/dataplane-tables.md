@@ -216,7 +216,9 @@ reference to something missing.
 - **Ready-made resources** (no reserve/publish code to write):
   - `SlotResource<Id, T>` over a `SlotTable` (key = id, value = `T`);
   - `ExactRuleResource` over a `ConcurrentExactTable` (key = key bytes,
-    value = `uint64_t`).
+    value = `uint64_t`);
+  - `MaskedRuleResource` over a `ConcurrentMaskedTable` (key = mask and
+    value bytes, value = `{priority, result}`).
 
   Each takes a function naming the keys a value refers to (a rule's
   action, an action's meter).
@@ -255,6 +257,12 @@ reference to something missing.
   several ExactMatch instances. Its table grows during prepare when a new
   key does not fit (`ExactRuleResource::Hooks::make_room`); pending keys
   move to the new table with the rest. D-022.
+- **WildcardMatch** registers its rules as `<module>/rules` (key: packed
+  mask then packed value; value: `{priority, gate}`) through
+  `MaskedRuleResource`. A rule being prepared sits in its tuple naming a
+  record that loses to every rule and alone reads as a miss; the table's
+  lookup filters it, so the packet path is unchanged. The result 0xFFFF is
+  reserved for it. D-024.
 - **Router** (opt-in, `Router::Enroll(engine)`): next hops as
   `<router>/next_hops`, routes as `<router>/routes` (each route references
   its next hop). An enrolled router is written only through the engine
@@ -282,7 +290,8 @@ reference to something missing.
   D-021 amendment 4).
 - Code: `core/dataplane/{resource.h, transaction_engine.{h,cc},
   slot_resource.h}`, `core/classifier/exact_rule_resource.h`,
-  `core/modules/exact_match.cc`, `core/route/router.cc`; D-020 to D-023.
+  `core/classifier/masked_rule_resource.h`, `core/modules/exact_match.cc`,
+  `core/modules/wildcard_match.cc`, `core/route/router.cc`; D-020 to D-024.
 
 ### `MeterSet` (metering)
 
@@ -331,7 +340,7 @@ reference to something missing.
 |---|---|---|---|
 | ExactMatch | `ConcurrentExactTable` | C: add/delete/clear in place; default gate and restore by G; transactions through resource `<module>/rules` | 0.3 µs per add at any size; D-022 |
 | IPLookup | `RouteTable` (`rte_lpm`) | C | |
-| WildcardMatch | `ConcurrentMaskedTable` (one `ConcurrentExactTable` per mask) | C: add/delete in place; a new or vanished mask republishes only the tuple list | D-014 |
+| WildcardMatch | `ConcurrentMaskedTable` (one `ConcurrentExactTable` per mask) | C: add/delete in place; a new or vanished mask republishes only the tuple list; transactions through resource `<module>/rules` | D-014, D-024 |
 | L2Forward | `l2_table` (inline 4-way buckets) | C: single-writer, lock-free readers; whole-word slot stores, no grace period. Multi-entry `add`/`populate` are all-or-nothing per command (validation plus rollback), but not dataplane-atomic: packets see entries one by one | D-017 |
 | ACL | `std::vector` of rules, linear scan | G: `add` copies, appends and publishes (all or nothing) | D-017; `rte_acl` (G-only) is the candidate for large rule sets |
 | HashLB | configuration only (`ExactMatchTable` for field layout) | G: one `RcuPtr<Config>`, read once per batch | D-017 |

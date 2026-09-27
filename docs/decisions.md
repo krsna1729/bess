@@ -1942,3 +1942,84 @@ shared writer boundary (D-021 amendment 5).
 next-hop resource name, which exceeds the short-string buffer for
 realistic router names); `Clear()` for an enrolled router (a bulk erase);
 IPLookup on the same resource.
+
+## D-024 WildcardMatch as a resource provider: pending rules that lose to every rule
+
+**Status:** accepted (2026-09-27). The third module provider (D-022
+ExactMatch, D-023 Router); the rule sets named in MODERNIZATION §31.0 row 1.
+
+**Context.** A masked (tuple-space) table cannot use ExactMatch's pending
+value alone: a packet may match several rules, and the reader keeps the
+best by priority. A rule being prepared must neither outrank an existing
+match nor, alone, answer. And a change can create a mask (a new tuple),
+grow a tuple's table, or need a new rule record -- all of which can fail.
+
+**Decision:**
+
+- **`ConcurrentMaskedTable` gains a prepare/commit split** (`PrepareUpsert`,
+  `PrepareErase`, `Commit`, `Cancel`, `Recycle`):
+  - prepare does everything that can fail: a new tuple, a tuple table's
+    growth, the rule id and its (write-once) record;
+  - a new rule is inserted as a pending entry naming one shared record
+    that loses to every rule (lowest priority, sequence 0) and carries
+    `kPendingResult`. The table's own lookup drops a best match with that
+    result -- the only way it wins is when nothing else matched -- so
+    readers need no change and WildcardMatch's `ProcessBatch` has none;
+  - a replacement's new record is written but not named until commit;
+  - commit is one in-place table store (or delete) and cannot fail; it
+    returns the id no longer named. The adapter hands that id back through
+    the engine's removal cascade (`Retirer::RemoveLater`), a grace period
+    later, so a reader that loaded it just before the swap is done first;
+  - neither commit nor cancel can republish the tuple list (it
+    allocates), so a mask they empty stays as an empty tuple until the
+    cascade's recycle step, the next prepare or the next `add` drops it
+    (the legacy `Upsert` now does too, so a rejected transaction cannot
+    make a later `add` hit the mask ceiling);
+  - the legacy `Upsert` refuses `kPendingResult` (`kReservedResult`): a
+    contract change for the generic table, which now offers 65,535 of the
+    65,536 results. Gates never reach it (at most 8,192), and WildcardMatch
+    is the table's only user. The ABBA below found the one place that
+    relied on it: the lookup benchmark numbered results by rule, so its
+    65,535th rule was refused ("missed a key" at 128K rules); it now wraps
+    below 0xFFFF.
+- **`MaskedRuleResource`**, the ready-made adapter: key = mask then value
+  (2 x key_len bytes), value = `{priority, result}`; hooks for the current
+  table, a value check and references, as `ExactRuleResource`. The freed
+  id's cascade step captures a `weak_ptr` to the table it came from
+  (24 bytes, inside the Retirer's inline storage), so an id never lands in
+  a table that replaced it.
+- **WildcardMatch registers `<module>/rules`** in `Init()` and unregisters
+  in `DeInit()`, like ExactMatch; gates are checked with
+  `IsValidGateValue()`. `ClassifyBatch()` exposes `ProcessBatch`'s
+  decision (one inlined template) for tests and benchmarks.
+
+**Evidence:**
+
+- Tests: `ConcurrentMaskedTableTest.PrepareCommitCancelRecycle` (a pending
+  rule neither outranks a lower-priority match nor answers alone; a
+  prepared replacement leaves the old rule answering; 3,000 replace cycles
+  keep the ids in use flat; an emptied mask stays until `Recycle()`), and
+  7 module tests (`wildcard_match_transaction_test.cc`): lifetime and
+  destruction with rules and a freed id still in the cascade; from inside
+  the publication window, a narrower higher-priority rule, a rule in a new
+  mask, a rule in an existing mask and a re-gate all change no answer;
+  rejection after new masks and a replacement leaves nothing (and the masks
+  go with the next change); one transaction across ExactMatch and
+  WildcardMatch, both or neither; commands and transactions on the same
+  rules, 3,000 rules growing one tuple inside a transaction, 5,000 re-gates;
+  ids returning through the cascade with a standalone table and engine
+  (ids in use flat, the emptied mask dropped); and a registered reader
+  classifying through the module while 8,000 rules come and go across four
+  masks, never seeing another rule's gate.
+- Mutations, each caught: the reader not dropping pending matches (three
+  tests); a pending record that outranks rules (two); a cancel that keeps
+  the pending entry (two); `Recycle()` keeping empty tuples (two); freed
+  ids never recycled (one).
+- Packet path: the reader's one added compare, on the best match of each
+  matched packet, ABBA against 19ed9a17 (`BM_Lookup/1`, 32-key batches,
+  1/4/8 masks x 1K/128K/1M rules, 10 rounds, isolated): no clear
+  difference in any of the 18 cases on P- or E-cores (−1.9..+2.4%; the
+  largest lean, P-core 8 masks 1K rules, +2.1%, under the band).
+
+**Deferred:** the remaining per-rule allocations in prepare (the `Prepared`
+copies of mask and value); a live-daemon gate, with the RPC.
