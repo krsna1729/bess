@@ -2023,3 +2023,70 @@ grow a tuple's table, or need a new rule record -- all of which can fail.
 
 **Deferred:** the remaining per-rule allocations in prepare (the `Prepared`
 copies of mask and value); a live-daemon gate, with the RPC.
+
+## D-025 The dataplane transaction RPC: typed per-resource values, request ids, a daemon epoch
+
+**Status:** accepted (2026-09-28). G1.2c (MODERNIZATION §31.0 row 2); the
+user chose typed keys and values over raw bytes.
+
+**Decision:**
+
+- **Three RPCs on the v2 `Control` service** (`control_v2.proto`):
+  `ApplyTransaction`, `GetTransaction`, `ListTransactionResources`. They
+  run under the control-plane lock, as module commands do (both write the
+  same tables).
+- **Typed keys and values per resource.** A resource that should be
+  reachable over the RPC carries a `ResourceCodec` (set by its owner): the
+  protobuf message types of its keys and values, and their conversion to
+  the engine's key bytes and value. The server packs keys exactly as the
+  module's commands do (the codecs call the commands' own parsing), so no
+  client reproduces BESS's internal packing -- the OMEC pain point.
+  ExactMatch: `ExactMatchRuleKey {fields}` / `ExactMatchRuleValue {gate}`;
+  WildcardMatch: `WildcardMatchRuleKey {values, masks}` /
+  `WildcardMatchRuleValue {priority, gate}`. `ListTransactionResources`
+  names each resource's types. The codec lives in its own header, so the
+  engine core stays free of protobuf; a resource without one is not
+  reachable (Router, a library, until a module exposes it).
+- **Per-operation results in request order**, the engine's: the failing
+  operation says why, the others are NOT_APPLIED. An operation that cannot
+  be decoded (unknown resource, wrong message type, a module's own
+  validation) rejects the same way, before the engine is called.
+- **Idempotency by `request_id`.** An outcome is recorded with a digest of
+  the request's contents (all but the id; deterministic serialization). The
+  same id and contents replay the record (`replayed = true`, nothing
+  applied twice); the same id with other contents is refused (ABORTED,
+  detail CONFLICT). CONFLICT and BUSY outcomes attempted nothing and are not
+  recorded, so a client retries under the same id. Records live in a
+  bounded window (4,096, oldest out first).
+- **`GetTransaction` and a daemon epoch.** The epoch is drawn at start and
+  returned with every answer: an unknown id under the same epoch has not
+  run (or aged out); after a restart the epoch changes and "unknown" means
+  unknown, not "never ran".
+- **Visibility is named** (the review's point): every applied transaction
+  reports `DEPENDENCY_ORDERED` -- operations took effect one by one,
+  referents before referrers, never a reference to something missing.
+  `ATOMIC` is reserved for the scope cell.
+- **pybess:** `transaction_op`, `apply_transaction`, `get_transaction`,
+  `list_transaction_resources` over a v2 stub on the same channel.
+
+**Evidence:**
+
+- `control/dataplane_transactions_test.cc` (5, over an in-process gRPC
+  channel, against real modules): discovery (names and types); typed
+  operations across ExactMatch and WildcardMatch, with the legacy delete
+  finding a rule the RPC added and the RPC erasing one the command added
+  (same packing); every decoding rejection (unknown resource, wrong key
+  type, wrong field count, invalid gate, an erase with a value) and an
+  engine rejection (value outside its mask), each leaving no rule;
+  request-id replay (same generation, no second apply), refusal of a reused
+  id (ABORTED), GetTransaction known/unknown, CONFLICT not recorded and then
+  applied under the same id; the record window ageing out oldest first.
+- Live (`bessctl/module_tests/dataplane_transactions.py`, 3, real daemon):
+  a rule added over the RPC steers a packet to its gate and its erase
+  sends it to the default; one bad gate rejects both modules' changes;
+  replay and GetTransaction; transactions churning rules on a running
+  worker while traffic flows, the daemon alive and packets forwarded.
+
+**Deferred:** a live Mpps-under-transactions benchmark on top of this RPC;
+the SDK's temporary references (D-021 amendment 2); a streaming bulk path
+(E4); the scope cell's ATOMIC visibility.

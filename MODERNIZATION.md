@@ -4164,6 +4164,18 @@ rather than one call site).
        1K-1M rules, P and E). The ABBA also caught the benchmark relying on
        result 0xFFFF.
 
+115. **The dataplane transaction RPC (G1.2c, D-025).**
+     - **What:** `ApplyTransaction`, `GetTransaction` and
+       `ListTransactionResources` on the v2 service; typed keys and values
+       per resource through a `ResourceCodec` (ExactMatch and WildcardMatch
+       rules), packed server-side exactly as the commands pack them;
+       per-operation results; request-id idempotency with a content digest;
+       a daemon epoch; visibility named (`DEPENDENCY_ORDERED`). pybess
+       wrappers.
+     - **Tests:** 5 in-process gRPC tests against real modules and 3 live
+       daemon tests (packets steered by RPC-added rules, cross-module
+       all-or-nothing, replay, churn while traffic flows).
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -9880,7 +9892,7 @@ drive the design.
 | # | priority | deliverable | removes from OMEC | non-UPF consumers | status |
 |---|---|---|---|---|---|
 | 1 | P0 | **G1.2b transaction core**: resources, reserve/publish, dependency order, reference safety, per-op results, one grace period per transaction, deferred id reuse (D-020, D-021) | manual ordering, best-effort rollback | Router (routes -> next hops), ExactMatch/WildcardMatch rule sets -> action objects | core landed (entry 105); providers: ExactMatch (111), Router (113), WildcardMatch (114) |
-| 2 | P0 | **G1.2c RPC:** `ApplyDataplaneTransaction` with `request_id`, `expected_generation`, typed per-op results and `GetTransaction` status lookup; a streaming packed-op path (E4) | per-rule RPC orchestration, timeout ambiguity, rule-key reconstruction for deletion | any controller: routing daemons, firewall/NAT rule loaders | next |
+| 2 | P0 | **G1.2c RPC:** `ApplyDataplaneTransaction` with `request_id`, `expected_generation`, typed per-op results and `GetTransaction` status lookup; a streaming packed-op path (E4) | per-rule RPC orchestration, timeout ambiguity, rule-key reconstruction for deletion | any controller: routing daemons, firewall/NAT rule loaders | landed (entry 115); streaming path and SDK next |
 | 3 | P0 | **The scope cell (dataplane-atomic scopes), precisely** (detailed rules in D-021 amendment 2). An atomic scope must keep both the old and the new interpretation until its publication point. New state is written to *new* keys or write-once slots, and the cell's flip selects which set packets use. A version flag over entries already overwritten in place cannot restore them (review caution). Tables that can only be updated in place refuse atomic scopes rather than fake them (D-020). | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | design, with G1.2b |
 | 4 | P1 | **Vertical UPF slice** (in-tree plugin, static G0 graph): one uplink/downlink session using a typed classifier with a direct `ActionId` result (no `ResultSlot` -> `PackedValueStore` -> `ActionId` chain), a FAR executor, K5 `MeterSet` (no second meter implementation), K6 counters and K7 IPv4 routes, all programmed through G1.2. **Gate:** an ExactMatch -> action -> meter -> Router pipeline over virtual PMDs, packets flowing under updates and transactions with failures injected at every prepare boundary; Mpps, update latency, rejections, dangling checks, retirement backlog (D-021 amendment 5) | validates the contract end to end | -- (validation consumer) | after 1-2 |
 | 5 | P0 | **External plugin package:** installed headers, a Meson dependency (`bess-dev`), a supported plugin API subset and a written compatibility policy | OMEC's vendored BESS fork | any out-of-tree module author | after 4 shows the API surface |

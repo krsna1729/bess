@@ -203,6 +203,23 @@ std::expected<void, std::string> TransactionEngine::Unregister(
   return {};
 }
 
+Resource *TransactionEngine::FindResource(std::string_view name) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = resources_.find(name);
+  return it == resources_.end() ? nullptr : it->second->resource;
+}
+
+std::vector<std::string> TransactionEngine::ResourceNames() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<std::string> names;
+  names.reserve(resources_.size());
+  for (const auto &[name, reg] : resources_) {
+    names.push_back(name);
+  }
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
 uint64_t TransactionEngine::generation() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return generation_;

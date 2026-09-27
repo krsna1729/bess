@@ -372,6 +372,30 @@ message UpdateCommandClearArg {
  * into the WildcardMatch module. For an example of code using WilcardMatch see
  * `bess/bessctl/conf/samples/wildcardmatch.bess`.
  */
+/**
+ * Transactional rule keys and values (G1.2c, D-025): ExactMatch's resource
+ * "<module>/rules" takes ExactMatchRuleKey / ExactMatchRuleValue, and
+ * WildcardMatch's WildcardMatchRuleKey / WildcardMatchRuleValue, in
+ * bess.pb.v2.ApplyTransaction. Fields as in the add/delete commands.
+ */
+message ExactMatchRuleKey {
+  repeated FieldData fields = 1;
+}
+
+message ExactMatchRuleValue {
+  uint64 gate = 1;
+}
+
+message WildcardMatchRuleKey {
+  repeated FieldData values = 1;
+  repeated FieldData masks = 2;
+}
+
+message WildcardMatchRuleValue {
+  int64 priority = 1;
+  uint64 gate = 2;
+}
+
 message WildcardMatchCommandAddArg {
   uint64 gate = 1; /// Traffic matching this new rule will be sent to this gate.
   int64 priority = 2; ///If a packet matches multiple rules, the rule with higher priority will be applied. If priorities are equal behavior is undefined.

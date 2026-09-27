@@ -35,6 +35,7 @@
 #include <variant>
 
 #include "control/pipeline_snapshot.h"
+#include "control/runtime_state.h"
 #include "control/wire_narrow.h"
 #include "worker.h"
 
@@ -451,6 +452,40 @@ grpc::Status ControlV2Service::ApplyPipeline(
   response->set_prepare_us(applied->timing.prepare_us);
   response->set_paused_commit_us(applied->timing.paused_commit_us);
   response->set_retire_us(applied->timing.retire_us);
+  return grpc::Status::OK;
+}
+
+ControlV2Service::ControlV2Service(ControlPlane &control_plane)
+    : ControlV2Service(control_plane, runtime().transactions()) {}
+
+grpc::Status ControlV2Service::ApplyTransaction(
+    grpc::ServerContext *context, const v2::ApplyTransactionRequest *request,
+    v2::ApplyTransactionResponse *response) {
+  // Resources' tables are DPDK structures; commands writing the same tables
+  // run under the same lock.
+  current_worker.SetNonWorker();
+  auto lock = control_plane_.AcquireLock();
+  auto applied = transactions_.Apply(*request);
+  if (!applied) {
+    return ToStatus(applied.error(), context);
+  }
+  *response = std::move(*applied);
+  return grpc::Status::OK;
+}
+
+grpc::Status ControlV2Service::GetTransaction(
+    grpc::ServerContext *, const v2::GetTransactionRequest *request,
+    v2::GetTransactionResponse *response) {
+  auto lock = control_plane_.AcquireLock();
+  *response = transactions_.Get(request->request_id());
+  return grpc::Status::OK;
+}
+
+grpc::Status ControlV2Service::ListTransactionResources(
+    grpc::ServerContext *, const v2::ListTransactionResourcesRequest *,
+    v2::ListTransactionResourcesResponse *response) {
+  auto lock = control_plane_.AcquireLock();
+  *response = transactions_.List();
   return grpc::Status::OK;
 }
 

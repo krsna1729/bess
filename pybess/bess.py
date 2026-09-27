@@ -65,6 +65,8 @@ else:
 del extra, proto_root
 
 from builtin_pb import service_pb2_grpc
+from builtin_pb import control_v2_pb2 as control_v2
+from builtin_pb import control_v2_pb2_grpc
 from builtin_pb import bess_msg_pb2 as bess_msg
 from builtin_pb import module_msg_pb2 as module_msg
 
@@ -175,6 +177,7 @@ class BESS(object):
     def __init__(self):
         self.debug = False
         self.stub = None
+        self.stub_v2 = None
         self.channel = None
         self.peer = self.DEF_GRPC_URL
 
@@ -220,6 +223,7 @@ class BESS(object):
                 self.channel.subscribe(self._update_status,
                                        try_to_connect=True)
                 self.stub = service_pb2_grpc.BESSControlStub(self.channel)
+                self.stub_v2 = control_v2_pb2_grpc.ControlStub(self.channel)
 
             elif self.status == self.CLOSING_CHANNEL:
                 self.disconnect()
@@ -232,6 +236,38 @@ class BESS(object):
                     'Connection to {} failed'.format(grpc_url))
             time.sleep(0.1)
 
+    # -- Dataplane transactions (G1.2c, D-025) --------------------------------
+    # Several modules' tables changed in one call, all or nothing. Keys and
+    # values are the resource's typed messages (list_transaction_resources()
+    # names them), e.g. module_msg.ExactMatchRuleKey / ExactMatchRuleValue
+    # for "<ExactMatch module>/rules".
+
+    @staticmethod
+    def transaction_op(resource, key, value=None, erase=False):
+        op = control_v2.TransactionOp(resource=resource, erase=erase)
+        op.key.Pack(key)
+        if value is not None:
+            op.value.Pack(value)
+        return op
+
+    def apply_transaction(self, ops, request_id='', expected_generation=None):
+        """Returns the ApplyTransactionResponse: record.outcome (APPLIED,
+        REJECTED, CONFLICT, BUSY), per-op results, generation, daemon_epoch,
+        and replayed (a retry of an already recorded request_id)."""
+        req = control_v2.ApplyTransactionRequest(request_id=request_id,
+                                                 ops=ops)
+        if expected_generation is not None:
+            req.expected_generation = expected_generation
+        return self.stub_v2.ApplyTransaction(req)
+
+    def get_transaction(self, request_id):
+        return self.stub_v2.GetTransaction(
+            control_v2.GetTransactionRequest(request_id=request_id))
+
+    def list_transaction_resources(self):
+        return self.stub_v2.ListTransactionResources(
+            control_v2.ListTransactionResourcesRequest())
+
     # returns no error if already disconnected
     def disconnect(self):
         try:
@@ -242,6 +278,7 @@ class BESS(object):
         finally:
             self.status = None
             self.stub = None
+            self.stub_v2 = None
             self.channel = None
 
     def set_debug(self, flag):

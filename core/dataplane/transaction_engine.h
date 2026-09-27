@@ -149,6 +149,11 @@ class TransactionEngine {
   size_t ReclaimRetired();
 
   uint64_t generation() const;
+  // The registered resource with this name, or null. The pointer is valid
+  // while it stays registered (callers hold the control-plane lock).
+  Resource *FindResource(std::string_view name) const;
+  // Registered resource names, sorted.
+  std::vector<std::string> ResourceNames() const;
   // References to `key` of `resource` held by other resources' values.
   size_t ReferenceCount(const std::string &resource,
                         const ResourceKey &key) const;

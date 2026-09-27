@@ -34,6 +34,7 @@
 
 #include "control/control_error.h"
 #include "control/control_plane.h"
+#include "control/dataplane_transactions.h"
 #include "control/pipeline_diff.h"
 #include "control/pipeline_plan.h"
 #include "control/pipeline_spec.h"
@@ -66,8 +67,11 @@ grpc::Status ToStatus(const ControlError &error,
 
 class ControlV2Service final : public pb::v2::Control::Service {
  public:
-  explicit ControlV2Service(ControlPlane &control_plane)
-      : control_plane_(control_plane) {}
+  // Dataplane transactions go to `engine` (the runtime's, by default).
+  explicit ControlV2Service(ControlPlane &control_plane);
+  ControlV2Service(ControlPlane &control_plane,
+                   dataplane::TransactionEngine &engine)
+      : control_plane_(control_plane), transactions_(engine) {}
 
   grpc::Status GetPipeline(grpc::ServerContext *context,
                            const pb::v2::GetPipelineRequest *request,
@@ -86,8 +90,23 @@ class ControlV2Service final : public pb::v2::Control::Service {
                              const pb::v2::ApplyPipelineRequest *request,
                              pb::v2::ApplyPipelineResponse *response) override;
 
+  // Dataplane transactions (G1.2c, D-025), under the control-plane lock.
+  grpc::Status ApplyTransaction(
+      grpc::ServerContext *context,
+      const pb::v2::ApplyTransactionRequest *request,
+      pb::v2::ApplyTransactionResponse *response) override;
+  grpc::Status GetTransaction(
+      grpc::ServerContext *context,
+      const pb::v2::GetTransactionRequest *request,
+      pb::v2::GetTransactionResponse *response) override;
+  grpc::Status ListTransactionResources(
+      grpc::ServerContext *context,
+      const pb::v2::ListTransactionResourcesRequest *request,
+      pb::v2::ListTransactionResourcesResponse *response) override;
+
  private:
   ControlPlane &control_plane_;
+  DataplaneTransactions transactions_;
 };
 
 }  // namespace control

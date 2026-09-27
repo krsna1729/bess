@@ -215,6 +215,99 @@ message ErrorDetail {
   string field = 5;       // offending field, when known
 }
 
+// -- Dataplane transactions (G1.2c, D-025) --------------------------------
+//
+// Several modules' tables changed in one call: all or nothing, per-operation
+// results, dependency order worked out by bessd. A table taking part is a
+// "resource" named "<module>/<table>" ("em0/rules"); its keys and values
+// are typed messages of its own (ListTransactionResources names them), so
+// no client packs BESS's internal keys.
+
+message TransactionOp {
+  string resource = 1;
+  bool erase = 2;                   // false: add, or replace if present
+  google.protobuf.Any key = 3;
+  google.protobuf.Any value = 4;    // not for erase
+}
+
+message ApplyTransactionRequest {
+  // Idempotency (optional but recommended): a repeated request with the
+  // same id and contents returns the recorded outcome (replayed = true)
+  // instead of applying again; the same id with different contents is
+  // refused (ABORTED, error detail CONFLICT). Outcomes are recorded while
+  // the daemon runs (a bounded, oldest-first window); use GetTransaction
+  // after a timeout.
+  string request_id = 1;
+  // Refuse (outcome CONFLICT) unless the dataplane transaction generation
+  // is still this.
+  optional uint64 expected_generation = 2;
+  repeated TransactionOp ops = 3;
+}
+
+message TransactionOpResult {
+  enum Status {
+    APPLIED = 0;
+    FAILED = 1;       // this operation caused the rejection; see error
+    NOT_APPLIED = 2;  // the transaction was rejected for another operation
+  }
+  Status status = 1;
+  string error = 2;
+}
+
+message TransactionRecord {
+  enum Outcome {
+    APPLIED = 0;
+    REJECTED = 1;  // an operation failed; nothing changed
+    CONFLICT = 2;  // expected_generation did not match; nothing attempted
+    BUSY = 3;      // readers are slow to quiesce; nothing attempted, retry
+  }
+  // What packets could see of an applied transaction. DEPENDENCY_ORDERED:
+  // its operations took effect one by one, referents before referrers, and
+  // no packet saw a reference to something missing. ATOMIC (all at once)
+  // comes with the scope cell.
+  enum Visibility {
+    DEPENDENCY_ORDERED = 0;
+    ATOMIC = 1;
+  }
+  string request_id = 1;
+  Outcome outcome = 2;
+  uint64 generation = 3;            // dataplane generation after it
+  repeated TransactionOpResult ops = 4;  // one per operation, in order
+  Visibility visibility = 5;
+}
+
+message ApplyTransactionResponse {
+  TransactionRecord record = 1;
+  // Changes when bessd restarts: outcomes recorded under another epoch are
+  // gone, so an unknown request_id then means "unknown", not "never ran".
+  uint64 daemon_epoch = 2;
+  bool replayed = 3;  // the recorded outcome of an earlier identical request
+}
+
+message GetTransactionRequest {
+  string request_id = 1;
+}
+
+message GetTransactionResponse {
+  bool known = 1;  // false: not seen under this epoch, or aged out
+  TransactionRecord record = 2;
+  uint64 daemon_epoch = 3;
+}
+
+message ListTransactionResourcesRequest {}
+
+message TransactionResource {
+  string name = 1;
+  string key_type = 2;    // protobuf full name of the key message
+  string value_type = 3;  // and of the value message
+}
+
+message ListTransactionResourcesResponse {
+  repeated TransactionResource resources = 1;
+  uint64 generation = 2;
+  uint64 daemon_epoch = 3;
+}
+
 service Control {
   rpc GetPipeline(GetPipelineRequest) returns (GetPipelineResponse) {}
   rpc ValidatePipeline(ValidatePipelineRequest)
@@ -222,4 +315,10 @@ service Control {
   rpc DiffPipeline(DiffPipelineRequest) returns (DiffPipelineResponse) {}
   rpc PlanPipeline(PlanPipelineRequest) returns (PlanPipelineResponse) {}
   rpc ApplyPipeline(ApplyPipelineRequest) returns (ApplyPipelineResponse) {}
+
+  rpc ApplyTransaction(ApplyTransactionRequest)
+      returns (ApplyTransactionResponse) {}
+  rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse) {}
+  rpc ListTransactionResources(ListTransactionResourcesRequest)
+      returns (ListTransactionResourcesResponse) {}
 }

@@ -37,6 +37,7 @@
 #include <utility>
 #include <vector>
 
+#include "../dataplane/resource_codec.h"
 #include "../dataplane/transaction_engine.h"
 #include "../event.h"
 #include "../metadata.h"
@@ -547,6 +548,33 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
             }
             return {};
           }});
+  // Typed keys and values over the RPC (D-025): the rule's fields, packed
+  // here as the add command packs them, and the gate.
+  resource_->SetCodec(std::make_shared<bess::dataplane::TypedCodec<
+                          bess::pb::ExactMatchRuleKey,
+                          bess::pb::ExactMatchRuleValue>>(
+      [this](const bess::pb::ExactMatchRuleKey &key)
+          -> std::expected<bess::dataplane::ResourceKey, std::string> {
+        std::vector<std::vector<uint8_t>> fields;
+        Error err = RuleFieldsFromPb(key.fields(), &fields);
+        std::vector<std::byte> packed;
+        if (!err.first) {
+          err = PackKey(fields, &packed);
+        }
+        if (err.first) {
+          return std::unexpected(err.second);
+        }
+        return bess::dataplane::ResourceKey(
+            reinterpret_cast<const char *>(packed.data()), packed.size());
+      },
+      [](const bess::pb::ExactMatchRuleValue &value)
+          -> std::expected<std::any, std::string> {
+        if (!bess::IsValidGateValue(value.gate())) {
+          return std::unexpected("invalid gate " +
+                                 std::to_string(value.gate()));
+        }
+        return std::any(uint64_t{value.gate()});
+      }));
   if (auto registered =
           bess::control::runtime().transactions().Register(resource_.get());
       !registered) {

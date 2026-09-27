@@ -37,6 +37,7 @@
 #include <string>
 #include <vector>
 
+#include "../dataplane/resource_codec.h"
 #include "../dataplane/transaction_engine.h"
 #include "../utils/endian.h"
 #include "../utils/format.h"
@@ -192,6 +193,38 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
             }
             return {};
           }});
+  // Typed keys and values over the RPC (D-025): values and masks per field,
+  // checked and packed as the add command does, and {priority, gate}.
+  resource_->SetCodec(std::make_shared<bess::dataplane::TypedCodec<
+                          bess::pb::WildcardMatchRuleKey,
+                          bess::pb::WildcardMatchRuleValue>>(
+      [this](const bess::pb::WildcardMatchRuleKey &key)
+          -> std::expected<bess::dataplane::ResourceKey, std::string> {
+        bess::pb::WildcardMatchCommandAddArg arg;
+        *arg.mutable_values() = key.values();
+        *arg.mutable_masks() = key.masks();
+        Rule rule;
+        Error err = RuleFromPb(arg, &rule);
+        std::vector<std::byte> value, mask;
+        if (!err.first) {
+          err = PackRule(rule, &value, &mask);
+        }
+        if (err.first) {
+          return std::unexpected(err.second);
+        }
+        return MaskedRuleResource::Key(
+            bess::classifier::ConstBytes(mask.data(), mask.size()),
+            bess::classifier::ConstBytes(value.data(), value.size()));
+      },
+      [](const bess::pb::WildcardMatchRuleValue &value)
+          -> std::expected<std::any, std::string> {
+        if (!bess::IsValidGateValue(value.gate())) {
+          return std::unexpected("invalid gate " +
+                                 std::to_string(value.gate()));
+        }
+        return std::any(MaskedRuleResource::Value{
+            value.priority(), static_cast<uint16_t>(value.gate())});
+      }));
   if (auto registered =
           bess::control::runtime().transactions().Register(resource_.get());
       !registered) {
