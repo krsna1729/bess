@@ -734,6 +734,58 @@ TEST_F(TransactionEngineTest, SlotChainsNeverDangleWhileRemovalsCascade) {
 // caller-assigned numbers: a value may only name a declared resource, a
 // dependency must be registered first (so the graph is acyclic), and a
 // resource leaves only when nothing depends on it and it holds no keys.
+// Resources that reference only each other leave together with their keys;
+// anything outside the group that may reference a member keeps it (D-023).
+TEST_F(TransactionEngineTest, ResourcesReferencingOnlyEachOtherLeaveTogether) {
+  SlotTable<MeterId, Meter> g_meters(8);
+  SlotTable<ActionId, Action> g_actions(8);
+  SlotResource<MeterId, Meter> meters("g_meters", g_meters);
+  SlotResource<ActionId, Action> actions(
+      "g_actions", g_actions,
+      [](const Action &a) {
+        return std::vector<Reference>{{"g_meters", EncodeKey(a.meter)}};
+      },
+      {"g_meters"});
+  ASSERT_TRUE(engine_.Register(&meters));
+  ASSERT_TRUE(engine_.Register(&actions));
+  ASSERT_EQ(Apply({Op::Upsert("g_meters", EncodeKey(MeterId(1)),
+                              std::any(Meter(1))),
+                   Op::Upsert("g_actions", EncodeKey(ActionId(1)),
+                              std::any(Action{1, MeterId(1)}))})
+                .outcome,
+            Outcome::kApplied);
+
+  auto un = engine_.Unregister("g_actions");  // its references stay behind
+  ASSERT_FALSE(un);
+  EXPECT_NE(un.error().find("live key"), std::string::npos);
+  un = engine_.Unregister("g_meters");  // still declared by g_actions
+  ASSERT_FALSE(un);
+  EXPECT_NE(un.error().find("may reference"), std::string::npos);
+  const std::string unknown[] = {"g_actions", "nope"};
+  EXPECT_FALSE(engine_.Unregister(unknown));
+
+  // A third resource referencing a member keeps the pair registered.
+  SlotTable<ActionId, Action> outside_table(8);
+  SlotResource<ActionId, Action> outside(
+      "g_outside", outside_table,
+      [](const Action &a) {
+        return std::vector<Reference>{{"g_meters", EncodeKey(a.meter)}};
+      },
+      {"g_meters"});
+  ASSERT_TRUE(engine_.Register(&outside));
+  const std::string pair[] = {"g_actions", "g_meters"};
+  un = engine_.Unregister(pair);
+  ASSERT_FALSE(un);
+  EXPECT_NE(un.error().find("g_outside"), std::string::npos);
+  ASSERT_TRUE(engine_.Unregister("g_outside"));
+
+  ASSERT_TRUE(engine_.Unregister(pair));
+  EXPECT_EQ(Apply({Op::Erase("g_meters", EncodeKey(MeterId(1)))}).outcome,
+            Outcome::kRejected);  // gone
+  // Both tables still hold their objects; their owner frees them.
+  EXPECT_EQ(g_actions.size(), 1u);
+}
+
 TEST_F(TransactionEngineTest, DependencyDeclarationsAreEnforced) {
   EXPECT_EQ(meters_res_->rank(), 0);
   EXPECT_EQ(actions_res_->rank(), 1);

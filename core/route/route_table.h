@@ -63,6 +63,8 @@ enum class RouteError : uint8_t {
   kNextHopInUse,         // removing a next hop routes still reference
   kNextHopRetiring,      // reusing a removed next hop's id before readers are
                          // done with it (retry after a grace period)
+  kEnrolled,             // the router is written through its transaction
+                         // engine (Router::Enroll)
 };
 
 const char *RouteErrorName(RouteError error);
@@ -146,6 +148,12 @@ class LpmRouteTable {
   std::optional<uint32_t> Find(Ipv4Prefix prefix) const;
   size_t size() const;
   const Config &config() const noexcept { return config_; }
+
+  // What readers get today for the addresses of `prefix` that no longer
+  // rule covers: the value of the longest rule strictly containing it, else
+  // the default route; nullopt for a miss. Adding `prefix` with this value
+  // changes no lookup (a transaction places new routes so, D-023).
+  std::optional<uint32_t> CoveringValue(Ipv4Prefix prefix) const;
 
   // -- reader -----------------------------------------------------------------
 

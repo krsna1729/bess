@@ -321,6 +321,38 @@ TEST(RouteTableTest, FreedTbl8GroupWaitsForOnlineReaders) {
   domain.Unregister(kReader);
 }
 
+// A DPDK behaviour the transactional route resource depends on (D-023): a
+// delete never fails, even with every tbl8 group freed at once while a
+// reader stalls. rte_lpm's QSBR defer queue defaults to one entry per tbl8
+// group, so it always has room; aborting placed routes and publishing
+// erases rely on it.
+TEST(RouteTableTest, DeletesNeverFailWithAStalledReader) {
+  rcu::RcuDomain &domain = control::runtime().rcu();
+  constexpr uint32_t kGroups = 8;
+  auto table = MakeTable(64, kGroups);
+  for (uint32_t i = 0; i < kGroups; i++) {
+    ASSERT_TRUE(table->Upsert(P(Ip(10, 0, i, 128), 25), Value(i + 1)));
+  }
+  constexpr uint32_t kReader = 23;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);  // and never quiescent until the end
+  for (int round = 0; round < 2; round++) {
+    for (uint32_t i = 0; i < kGroups; i++) {
+      ASSERT_TRUE(table->Erase(P(Ip(10, 0, i, 128), 25)))
+          << "delete " << i << " failed with the defer queue holding "
+          << "every group";
+    }
+    // Nothing can be re-added while the reader holds the groups.
+    EXPECT_FALSE(table->Upsert(P(Ip(10, 0, 0, 128), 25), Value(1)));
+    domain.Quiescent(kReader);
+    for (uint32_t i = 0; i < kGroups; i++) {
+      ASSERT_TRUE(table->Upsert(P(Ip(10, 0, i, 128), 25), Value(i + 1)));
+    }
+  }
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
+}
+
 // Readers (registered RCU readers reporting quiescence between batches, as
 // workers do) look up a fixed key set while the writer churns /26 routes,
 // each of which needs a tbl8 group. The pool is deliberately tiny, so nearly

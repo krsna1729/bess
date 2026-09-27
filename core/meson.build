@@ -229,6 +229,7 @@ unit_test_sources = [
   'meter/meter_set_test.cc',
   'stats/stats_test.cc',
   'route/route_test.cc',
+  'route/router_transaction_test.cc',
   'rcu/rcu_test.cc',
   'rcu/rcu_ptr_test.cc',
   'rcu/rcu_worker_test.cc',

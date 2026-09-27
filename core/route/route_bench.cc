@@ -61,6 +61,7 @@
 #include <vector>
 
 #include "control/runtime_state.h"
+#include "dataplane/transaction_engine.h"
 #include "dpdk.h"
 #include "route/route_table.h"
 #include "route/router.h"
@@ -434,5 +435,90 @@ void BM_NextHopUpdate(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_NextHopUpdate)->Arg(1024)->Arg(65536)->Unit(benchmark::kMicrosecond);
+
+// One router change made directly (mode 0) or as a one-change transaction on
+// an enrolled router (mode 1; D-023): kind 0 = a next-hop update, 1 = a
+// route re-pointed, 2 = a new /24 added and removed (two changes per
+// iteration). 1024 routes, 64 next hops. The price of enrollment per change.
+void BM_RouterChange(benchmark::State &state) {
+  using bess::dataplane::Op;
+  const bool enrolled = state.range(0) == 1;
+  const int kind = static_cast<int>(state.range(1));
+  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  // The engine outlives the router enrolled in it (declared first).
+  bess::dataplane::TransactionEngine engine(domain);
+  auto router =
+      Router::Create("route_bench_tx", ConfigFor(1024), 64, domain).value();
+  if (enrolled && !router->Enroll(engine)) {
+    state.SkipWithError("enroll failed");
+    return;
+  }
+  NextHop hop;
+  hop.neighbor = NeighborState::kResolved;
+  std::vector<Op> setup;
+  for (uint32_t id = 1; id <= 64; id++) {
+    hop.egress = static_cast<bess::gate_idx_t>(id);
+    setup.push_back(router->SetNextHopOp(NextHopId(id), hop));
+    if (!enrolled) {
+      (void)router->SetNextHop(NextHopId(id), hop);
+    }
+  }
+  const std::vector<Route> routes = Routes(1024);
+  for (const Route &r : routes) {
+    const NextHopId id(1 + r.value % 64);
+    setup.push_back(router->SetRouteOp(r.prefix, id));
+    if (!enrolled) {
+      (void)router->SetRoute(r.prefix, id);
+    }
+  }
+  if (enrolled &&
+      engine.Apply(setup).outcome !=
+          bess::dataplane::TransactionEngine::Outcome::kApplied) {
+    state.SkipWithError("setup failed");
+    return;
+  }
+  const Ipv4Prefix fresh = Ipv4Prefix::Make(0xC6336400u, 24).value();  // 198.51.100/24
+  auto apply = [&](Op op) {
+    return engine.Apply(std::span<const Op>(&op, 1)).outcome ==
+           bess::dataplane::TransactionEngine::Outcome::kApplied;
+  };
+  uint32_t n = 0;
+  bool ok = true;
+  for (auto _ : state) {
+    n++;
+    const NextHopId id(1 + n % 64);
+    switch (kind) {
+      case 0:
+        hop.dst_mac.bytes[5] = static_cast<uint8_t>(n);
+        ok = enrolled ? apply(router->SetNextHopOp(NextHopId(1), hop))
+                      : router->SetNextHop(NextHopId(1), hop).has_value();
+        break;
+      case 1:
+        ok = enrolled ? apply(router->SetRouteOp(routes[0].prefix, id))
+                      : router->SetRoute(routes[0].prefix, id).has_value();
+        break;
+      default:
+        ok = enrolled ? apply(router->SetRouteOp(fresh, id)) &&
+                            apply(router->RemoveRouteOp(fresh))
+                      : router->SetRoute(fresh, id).has_value() &&
+                            router->RemoveRoute(fresh).has_value();
+        break;
+    }
+    if (!ok) {
+      state.SkipWithError("change failed");
+      break;
+    }
+    if ((n & 255) == 0) {
+      engine.ReclaimRetired();
+      domain.ReclaimReady();
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * (kind == 2 ? 2 : 1));
+  state.SetLabel(std::string(enrolled ? "transaction" : "direct") +
+                 (kind == 0   ? " next-hop update"
+                  : kind == 1 ? " route re-point"
+                              : " route add+remove"));
+}
+BENCHMARK(BM_RouterChange)->ArgsProduct({{0, 1}, {0, 1, 2}});
 
 }  // namespace

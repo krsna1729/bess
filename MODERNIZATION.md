@@ -4130,6 +4130,24 @@ rather than one call site).
        atomic scope); an ExactMatch -> action -> meter -> Router
        acceptance test over virtual PMDs as the vertical slice's gate.
 
+113. **Router as a resource provider (D-023).**
+     - **What:** `Router::Enroll(engine)` registers next hops and routes;
+       an enrolled router has one writer (direct setters refuse), so no
+       change bypasses the reference ledger (the review's integration
+       boundary). New routes are placed during prepare with the value their
+       addresses already resolve to (covering route, default, or miss), so
+       a full table rejects before anything is visible. Resources that
+       reference only each other now unregister together.
+     - **Tests:** 7 router transaction tests (placeholders invisible from
+       inside the publish window, tbl8 exhaustion, cross-resource
+       references, readers resolving under churn, every allocation
+       failed); a DPDK behaviour test pinning that rte_lpm deletes never
+       fail under a stalled reader; 4 mutations caught, plus a real naming
+       bug found by one.
+     - **Cost:** 0.23/0.59/0.74 µs per next-hop update/route re-point/route
+       add or remove as a transaction vs 0.06/0.22/0.29 µs direct; the
+       unenrolled path is unchanged.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -9845,7 +9863,7 @@ drive the design.
 
 | # | priority | deliverable | removes from OMEC | non-UPF consumers | status |
 |---|---|---|---|---|---|
-| 1 | P0 | **G1.2b transaction core**: resources, reserve/publish, dependency order, reference safety, per-op results, one grace period per transaction, deferred id reuse (D-020, D-021) | manual ordering, best-effort rollback | Router (routes -> next hops), ExactMatch/WildcardMatch rule sets -> action objects | core landed (entry 105); ExactMatch provider (entry 111); Router next |
+| 1 | P0 | **G1.2b transaction core**: resources, reserve/publish, dependency order, reference safety, per-op results, one grace period per transaction, deferred id reuse (D-020, D-021) | manual ordering, best-effort rollback | Router (routes -> next hops), ExactMatch/WildcardMatch rule sets -> action objects | core landed (entry 105); providers: ExactMatch (entry 111), Router (entry 113) |
 | 2 | P0 | **G1.2c RPC:** `ApplyDataplaneTransaction` with `request_id`, `expected_generation`, typed per-op results and `GetTransaction` status lookup; a streaming packed-op path (E4) | per-rule RPC orchestration, timeout ambiguity, rule-key reconstruction for deletion | any controller: routing daemons, firewall/NAT rule loaders | next |
 | 3 | P0 | **The scope cell (dataplane-atomic scopes), precisely** (detailed rules in D-021 amendment 2). An atomic scope must keep both the old and the new interpretation until its publication point. New state is written to *new* keys or write-once slots, and the cell's flip selects which set packets use. A version flag over entries already overwritten in place cannot restore them (review caution). Tables that can only be updated in place refuse atomic scopes rather than fake them (D-020). | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | design, with G1.2b |
 | 4 | P1 | **Vertical UPF slice** (in-tree plugin, static G0 graph): one uplink/downlink session using a typed classifier with a direct `ActionId` result (no `ResultSlot` -> `PackedValueStore` -> `ActionId` chain), a FAR executor, K5 `MeterSet` (no second meter implementation), K6 counters and K7 IPv4 routes, all programmed through G1.2. **Gate:** an ExactMatch -> action -> meter -> Router pipeline over virtual PMDs, packets flowing under updates and transactions with failures injected at every prepare boundary; Mpps, update latency, rejections, dangling checks, retirement backlog (D-021 amendment 5) | validates the contract end to end | -- (validation consumer) | after 1-2 |

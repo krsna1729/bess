@@ -30,6 +30,7 @@
 #ifndef BESS_ROUTE_ROUTER_H_
 #define BESS_ROUTE_ROUTER_H_
 
+#include <any>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -41,6 +42,7 @@
 #include <string>
 #include <vector>
 
+#include "dataplane/resource.h"
 #include "dataplane/slot_table.h"
 #include "dataplane/strong_id.h"
 #include "gate.h"
@@ -48,6 +50,10 @@
 #include "packet_mutation.h"
 #include "route/route_table.h"
 #include "utils/ether.h"
+
+namespace bess::dataplane {
+class TransactionEngine;
+}  // namespace bess::dataplane
 
 namespace bess::route {
 
@@ -124,6 +130,13 @@ inline std::expected<void, packet::MutationError> RewriteL2(
 //
 // Control methods are serialized internally and never block on readers; they
 // must not be called from a worker.
+//
+// Transactions (G1.2b, D-023): Enroll() registers the next hops and the
+// routes as two resources of a TransactionEngine, so that one transaction can
+// change them together with other modules' tables (a rule, the action it
+// names, the route that action forwards to). An enrolled router has one
+// writer, the engine: the direct setters above refuse (kEnrolled), and the
+// engine's reference ledger replaces the router's own counts.
 class Router {
  public:
   using Config = LpmRouteTable::Config;
@@ -156,6 +169,40 @@ class Router {
   // Routes naming `id` (control-side reference count).
   size_t RouteReferences(NextHopId id) const;
 
+  // -- transactions (D-023) ---------------------------------------------------
+
+  // Registers "<name>/next_hops" (key: EncodeKey(NextHopId), value: NextHop)
+  // and "<name>/routes" (key: RouteKey(prefix), value: NextHopId; each route
+  // references its next hop) with `engine`, which must outlive the router or
+  // its enrollment. Refused once any route exists or a removed next hop is
+  // still retiring (the ledger must start from what it can see). Destroying
+  // an enrolled router unregisters both (with workers paused).
+  std::expected<void, std::string> Enroll(dataplane::TransactionEngine &engine);
+  bool enrolled() const noexcept { return engine_ != nullptr; }
+
+  const std::string &next_hops_resource() const { return next_hops_name_; }
+  const std::string &routes_resource() const { return routes_name_; }
+  static dataplane::ResourceKey RouteKey(Ipv4Prefix prefix) {
+    return dataplane::EncodeKey(uint64_t{prefix.addr()} << 8 |
+                                prefix.length());
+  }
+
+  // Operations for this router's resources.
+  dataplane::Op SetNextHopOp(NextHopId id, const NextHop &hop) const {
+    return dataplane::Op::Upsert(next_hops_name_, dataplane::EncodeKey(id),
+                                 std::any(hop));
+  }
+  dataplane::Op RemoveNextHopOp(NextHopId id) const {
+    return dataplane::Op::Erase(next_hops_name_, dataplane::EncodeKey(id));
+  }
+  dataplane::Op SetRouteOp(Ipv4Prefix prefix, NextHopId hop) const {
+    return dataplane::Op::Upsert(routes_name_, RouteKey(prefix),
+                                 std::any(hop));
+  }
+  dataplane::Op RemoveRouteOp(Ipv4Prefix prefix) const {
+    return dataplane::Op::Erase(routes_name_, RouteKey(prefix));
+  }
+
   // -- reader -----------------------------------------------------------------
 
   static constexpr size_t kMaxBatch = LpmRouteTable::kMaxBatch;
@@ -173,7 +220,9 @@ class Router {
       if (const NextHop *hop = next_hops_.Lookup(NextHopId(ids[i]))) {
         hops[i] = hop;
       } else {
-        mask &= ~(uint64_t{1} << i);  // unreachable by construction
+        // Id 0: a route a transaction is placing where there is no covering
+        // route (D-023) -- a miss, as before it was placed.
+        mask &= ~(uint64_t{1} << i);
       }
     }
     return mask;
@@ -186,8 +235,10 @@ class Router {
   }
 
  private:
-  Router(std::unique_ptr<RouteTable<NextHopId>> routes, size_t max_next_hops,
-         rcu::RcuDomain &domain);
+  Router(std::string name, std::unique_ptr<RouteTable<NextHopId>> routes,
+         size_t max_next_hops, rcu::RcuDomain &domain);
+
+  class RouteResource;
 
   bool ValidId(NextHopId id) const noexcept { return next_hops_.ValidId(id); }
 
@@ -207,6 +258,13 @@ class Router {
     rcu::GracePeriod token;
   };
   std::vector<Retiring> retiring_;  // removed, still published
+
+  // Set by Enroll(); the resources exist while enrolled.
+  const std::string next_hops_name_;
+  const std::string routes_name_;
+  dataplane::TransactionEngine *engine_ = nullptr;
+  std::unique_ptr<dataplane::Resource> next_hops_res_;
+  std::unique_ptr<dataplane::Resource> routes_res_;
 };
 
 }  // namespace bess::route

@@ -58,6 +58,8 @@ const char *RouteErrorName(RouteError error) {
       return "no such next hop";
     case RouteError::kNextHopInUse:
       return "next hop is still referenced by routes";
+    case RouteError::kEnrolled:
+      return "the router is enrolled in transactions: write it through them";
     case RouteError::kNextHopRetiring:
       return "next hop retiring";
   }
@@ -213,6 +215,20 @@ std::optional<uint32_t> LpmRouteTable::Find(Ipv4Prefix prefix) const {
   }
   const auto it = rules_.find(prefix);
   return it == rules_.end() ? std::nullopt : std::optional<uint32_t>(it->second);
+}
+
+std::optional<uint32_t> LpmRouteTable::CoveringValue(Ipv4Prefix prefix) const {
+  std::lock_guard<std::mutex> lock(writer_mutex_);
+  for (int length = static_cast<int>(prefix.length()) - 1; length >= 1;
+       length--) {
+    const uint32_t mask = ~uint32_t{0} << (32 - length);
+    const auto shorter =
+        Ipv4Prefix::Make(prefix.addr() & mask, static_cast<uint8_t>(length));
+    if (const auto it = rules_.find(*shorter); it != rules_.end()) {
+      return it->second;
+    }
+  }
+  return prefix.length() == 0 ? std::nullopt : default_;
 }
 
 size_t LpmRouteTable::size() const {

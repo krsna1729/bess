@@ -255,6 +255,13 @@ reference to something missing.
   several ExactMatch instances. Its table grows during prepare when a new
   key does not fit (`ExactRuleResource::Hooks::make_room`); pending keys
   move to the new table with the rest. D-022.
+- **Router** (opt-in, `Router::Enroll(engine)`): next hops as
+  `<router>/next_hops`, routes as `<router>/routes` (each route references
+  its next hop). An enrolled router is written only through the engine
+  (the direct setters refuse, `kEnrolled`). New routes are placed during
+  prepare with the value their addresses already resolve to, so rte_lpm
+  capacity is settled before anything is visible. A change costs
+  ~0.2-0.6 µs as a transaction against 0.06-0.2 µs direct. D-023.
 - **A module must `Unregister` its resources before destroying their
   tables.** `Unregister` refuses (with the reason) while keys that may
   reference others remain (a resource that references nothing may go with
@@ -275,7 +282,7 @@ reference to something missing.
   D-021 amendment 4).
 - Code: `core/dataplane/{resource.h, transaction_engine.{h,cc},
   slot_resource.h}`, `core/classifier/exact_rule_resource.h`,
-  `core/modules/exact_match.cc`; D-020, D-021, D-022.
+  `core/modules/exact_match.cc`, `core/route/router.cc`; D-020 to D-023.
 
 ### `MeterSet` (metering)
 

@@ -1720,7 +1720,8 @@ keep.** Each finding was checked against the source before acting.
 
 **Deferred (next increments):**
 
-- Router and the modules as resource providers (ExactMatch: D-022);
+- Router and the modules as resource providers (ExactMatch: D-022;
+  Router: D-023);
 - the scope cell (dataplane-atomic scopes; §31.0 row 3);
 - `request_id` idempotency and `GetTransaction` (G1.2c, with the RPC).
 
@@ -1845,3 +1846,99 @@ transactions becomes possible; the scope cell.
 **Revisit when:** a module needs its commands and transactions on
 different threads (a second writer), or a provider's table cannot be
 grown during prepare.
+
+## D-023 Router as a resource provider: routes placed invisibly, one writer when enrolled
+
+**Status:** accepted (2026-09-27). The second module-level provider after
+D-022, and the one the external review of 9cb5314 asked for next with a
+shared writer boundary (D-021 amendment 5).
+
+**Decision:**
+
+- **Opt-in enrollment.** `Router::Enroll(engine)` registers two
+  resources: `<router>/next_hops` (the existing `SlotResource` over the
+  router's `SlotTable`; key `EncodeKey(NextHopId)`, value `NextHop`) and
+  `<router>/routes` (new; key `Router::RouteKey(prefix)`, value
+  `NextHopId`, each route referencing its next hop). Op builders
+  (`SetRouteOp`, `SetNextHopOp`, ...) spare callers the encodings.
+- **One writer when enrolled.** The direct setters refuse with
+  `kEnrolled`: the engine's ledger replaces the router's own reference
+  counts, so a direct change cannot bypass it. `RouteReferences()` reads
+  the ledger. Enrollment is refused once any route exists or a removed next
+  hop is still retiring (the ledger must start from what it can see); next
+  hops that already exist are fine (they reference nothing). A router that
+  is not enrolled is unchanged.
+- **Routes are placed during prepare, invisibly.** rte_lpm cannot promise
+  capacity (rules, tbl8 groups) for a set of prefixes, so a new route is
+  inserted during `Reserve()` with a placeholder value: what its addresses
+  resolve to today -- the longest rule strictly containing it, else the
+  default route, else id 0, which the reader already treats as a miss
+  (`LpmRouteTable::CoveringValue`). No lookup changes until `Publish()`
+  stores the real next hop, an in-place update of an existing rule, which
+  cannot fail. A prefix that does not fit rejects the transaction with
+  nothing visible; `Abort()` deletes the placeholder.
+  - This supersedes the note recorded from the design documents (D-021
+    amendment 2, "rte_lpm is not a pending-key table": a staged
+    more-specific prefix overrides its covering route, so multi-route
+    transactions would need a rebuilt table). A staged prefix whose value
+    is the covering answer overrides nothing: every address in it that no
+    longer rule claims already resolved to exactly that value.
+  - Within the publication window, a placeholder can show the old covering
+    value after the covering route itself was re-pointed earlier in the
+    same window. That is the dependency-ordered visibility D-021 already
+    states (not dataplane-atomic until the scope cell). A next hop the
+    placeholder names cannot go away under it: the removal cascade waits a
+    grace period after the whole window.
+- **Deletes cannot fail** (erase publication, placeholder abort): rte_lpm's
+  QSBR defer queue defaults to one entry per tbl8 group. Pinned as a DPDK
+  behaviour test (`RouteTableTest.DeletesNeverFailWithAStalledReader`: every
+  group freed at once under a stalled reader, twice); shrinking the queue
+  to two entries fails it.
+- **Resources that reference only each other leave together.**
+  `TransactionEngine::Unregister(span)` takes a group: members may go with
+  their keys when everything they may reference is in the group, and
+  nothing outside the group may reference a member. A destroyed enrolled
+  router unregisters routes and next hops as one group (the engine must
+  outlive the router). A resource with no references is the one-member
+  case of D-022.
+
+**Evidence:**
+
+- Tests (`core/route/router_transaction_test.cc`, 7): enrollment rules and
+  the direct setters refusing; next hops and routes in one transaction in
+  any order, a route to a missing next hop and removing a used next hop
+  rejected with nothing changed, the removal cascade, the resources leaving
+  with the router; new routes (nested, a /25 taking a tbl8 group, one with
+  no covering route), observed from inside the publication window, change
+  no lookup, with and without a default route; tbl8 exhaustion rejects at
+  prepare with nothing visible and the groups come back; another resource
+  (actions) referencing next hops, which keeps the router's resources
+  registered; a registered reader resolving through the router while 6,000
+  sessions (a next hop and a route each) come and go, never reaching
+  another session's next hop; every allocation of a mixed transaction
+  failed in turn (26 sites), leaving routes, next hops, lookups and ledger
+  unchanged. Engine: `ResourcesReferencingOnlyEachOtherLeaveTogether`.
+- Mutations, each caught: a placeholder that is always a miss (two tests);
+  routes not placed in prepare (a publish-time "table full" crash); an
+  abort that keeps the placeholder (three tests); group unregister ignoring
+  outside dependents. The first run also exposed a real bug: the resource
+  names were built from a moved-from string (`/routes`); the names are now
+  asserted.
+- Cost per change on a P-core (`BM_RouterChange`, 1024 routes, isolated):
+  next-hop update 62 ns direct, 228 ns as a transaction; route re-point
+  221 ns vs 591 ns; route add+remove 293 vs 744 ns per change. The price of
+  one ledger for the router and whatever references its next hops; the
+  unenrolled path is unchanged (ABBA below).
+  ABBA of the unenrolled path against e3238456 (8 rounds, isolated): route
+  lookups (1K/16K/64K) and in-place route updates show no clear difference
+  on P- or E-cores; a direct next-hop update shows none on a P-core
+  (+1.5%). On an E-core it read +8.5% when run after the other route
+  benchmarks in one process, and −8% when run alone (72 vs 78 ns, three
+  alternations); the new build executes 6 fewer instructions per update,
+  so the ±7 ns follows the heap state earlier benchmarks leave, not the
+  code.
+
+**Deferred:** trimming the per-route cost (each `Reference` copies the
+next-hop resource name, which exceeds the short-string buffer for
+realistic router names); `Clear()` for an enrolled router (a bulk erase);
+IPLookup on the same resource.

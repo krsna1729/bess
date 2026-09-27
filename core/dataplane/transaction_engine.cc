@@ -122,48 +122,84 @@ std::expected<void, std::string> TransactionEngine::Register(
 
 std::expected<void, std::string> TransactionEngine::Unregister(
     const std::string &name) {
+  return Unregister(std::span<const std::string>(&name, 1));
+}
+
+std::expected<void, std::string> TransactionEngine::Unregister(
+    std::span<const std::string> names) {
   std::lock_guard<std::mutex> lock(mutex_);
-  auto res = resources_.find(name);
-  if (res == resources_.end()) {
-    return std::unexpected("resource '" + name + "' is not registered");
-  }
-  Registration &reg = *res->second;
-  for (const auto &[other_name, other] : resources_) {
-    if (Resolve(*other, name) != nullptr) {
-      return std::unexpected("resource '" + other_name +
-                             "' may reference '" + name +
-                             "' (unregister it first)");
+  std::vector<Registration *> group;
+  for (const std::string &name : names) {
+    auto res = resources_.find(std::string_view(name));
+    if (res == resources_.end()) {
+      return std::unexpected("resource '" + name + "' is not registered");
+    }
+    if (std::find(group.begin(), group.end(), res->second.get()) ==
+        group.end()) {
+      group.push_back(res->second.get());
     }
   }
-  // Live keys hold references into their dependencies, so a resource that
-  // may reference nothing can go with keys in it: its owner is removing the
-  // table (a module being destroyed with its rules). D-022.
-  if (!reg.deps.empty() && reg.resource->LiveCount() != 0) {
-    return std::unexpected("resource '" + name + "' still has " +
-                           std::to_string(reg.resource->LiveCount()) +
-                           " live key(s)");
+  auto in_group = [&](const Registration *r) {
+    return std::find(group.begin(), group.end(), r) != group.end();
+  };
+  for (Registration *reg : group) {
+    const std::string &name = reg->resource->name();
+    // Nothing outside the group may reference it.
+    bool referenced_in_group = false;
+    for (const auto &[other_name, other] : resources_) {
+      if (Resolve(*other, name) == nullptr) {
+        continue;
+      }
+      if (!in_group(other.get())) {
+        return std::unexpected("resource '" + other_name +
+                               "' may reference '" + name +
+                               "' (unregister it first, or with it)");
+      }
+      referenced_in_group = true;
+    }
+    // Live keys hold references into their dependencies, so a resource may
+    // go with keys in it only if everything it may reference goes with it:
+    // no ledger outside the group counts its keys. A table that references
+    // nothing (ExactMatch's rules, D-022), or a Router's routes leaving
+    // with its next hops (D-023), qualifies.
+    for (const auto &[dep_name, dep] : reg->deps) {
+      if (!in_group(dep) && reg->resource->LiveCount() != 0) {
+        return std::unexpected("resource '" + name + "' still has " +
+                               std::to_string(reg->resource->LiveCount()) +
+                               " live key(s) referencing '" + dep_name + "'");
+      }
+    }
+    // Only a member can have referenced it (see above); anything else in
+    // the ledger would be a bookkeeping error, reported rather than dropped.
+    if (!referenced_in_group && !reg->incoming.empty()) {
+      return std::unexpected("keys of '" + name + "' are still referenced");
+    }
   }
-  if (!reg.incoming.empty()) {
-    return std::unexpected("keys of '" + name + "' are still referenced");
-  }
-  // Pending removal steps capture this resource's tables: unregistering
+  // Pending removal steps capture these resources' tables: unregistering
   // (after which the module may destroy them) must wait until they ran.
   ReclaimRetiredLocked();
-  if (reg.pending_removals != 0) {
-    return std::unexpected("removals of '" + name +
-                           "' are still waiting for readers");
-  }
-  // Objects of this resource already handed to RCU are destroyed by code in
-  // the resource's module (the deleter it instantiated); it must not go
-  // before the last of them has run.
+  // Objects already handed to RCU are destroyed by code in the resource's
+  // module (the deleter it instantiated); it must not go before the last of
+  // them has run.
   domain_.ReclaimReady();
-  if (const size_t left = reg.outstanding.load(std::memory_order_acquire);
-      left != 0) {
-    return std::unexpected(std::to_string(left) + " retired object(s) of '" +
-                           name + "' are still waiting for readers");
+  for (Registration *reg : group) {
+    const std::string &name = reg->resource->name();
+    if (reg->pending_removals != 0) {
+      return std::unexpected("removals of '" + name +
+                             "' are still waiting for readers");
+    }
+    if (const size_t left = reg->outstanding.load(std::memory_order_acquire);
+        left != 0) {
+      return std::unexpected(std::to_string(left) +
+                             " retired object(s) of '" + name +
+                             "' are still waiting for readers");
+    }
   }
-  reg.resource->registration_ = nullptr;
-  resources_.erase(res);
+  for (Registration *reg : group) {
+    reg->resource->registration_ = nullptr;
+    auto res = resources_.find(std::string_view(reg->resource->name()));
+    resources_.erase(res);
+  }
   return {};
 }
 

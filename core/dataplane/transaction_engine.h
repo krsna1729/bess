@@ -135,6 +135,11 @@ class TransactionEngine {
   // with no reader online -- workers paused or stopped, as at module
   // teardown -- that last condition clears in the same call.
   std::expected<void, std::string> Unregister(const std::string &name);
+  // Several resources at once. Resources that reference only each other
+  // (routes and the next hops they name) may leave together with their
+  // keys: their references are all inside the group. D-023.
+  std::expected<void, std::string> Unregister(
+      std::span<const std::string> names);
 
   Result Apply(std::span<const Op> ops,
                std::optional<uint64_t> expected_generation = std::nullopt);
