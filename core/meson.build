@@ -340,6 +340,7 @@ if get_option('build_benchmarks')
     'classifier_typed_bench': ['classifier/typed_exact_bench.cc', benchmark_main_dep],
     'classifier_masked_bench': ['classifier/masked_bench.cc', benchmark_main_dep],
     'classifier_cuckoo_scale_bench': ['classifier/cuckoo_scale_bench.cc', benchmark_main_dep],
+    'classifier_shared_writer_bench': ['classifier/shared_writer_bench.cc', benchmark_main_dep],
     'object_table_bench': ['dataplane/object_table_bench.cc', benchmark_main_dep],
     'transaction_bench': ['dataplane/transaction_bench.cc', benchmark_main_dep],
     'update_scale_bench': ['dataplane/update_scale_bench.cc', benchmark_dep],

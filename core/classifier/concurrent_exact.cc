@@ -43,7 +43,8 @@ namespace bess::classifier {
 
 std::expected<std::unique_ptr<ConcurrentExactTable>, std::string>
 ConcurrentExactTable::Create(uint32_t key_len, uint32_t capacity,
-                             rcu::RcuDomain &domain, int socket) {
+                             rcu::RcuDomain &domain, int socket,
+                             Writers writers) {
   if (key_len == 0 || key_len > 64) {
     return std::unexpected("key length must be 1..64 bytes");
   }
@@ -76,7 +77,7 @@ ConcurrentExactTable::Create(uint32_t key_len, uint32_t capacity,
     return std::unexpected("rte_hash_rcu_qsbr_add failed");
   }
   return std::unique_ptr<ConcurrentExactTable>(
-      new ConcurrentExactTable(table, key_len, params.entries));
+      new ConcurrentExactTable(table, key_len, params.entries, writers));
 }
 
 ConcurrentExactTable::~ConcurrentExactTable() {
@@ -90,6 +91,36 @@ ConcurrentExactTable::~ConcurrentExactTable() {
 
 ConcurrentExactTable::UpsertResult ConcurrentExactTable::Upsert(
     ConstBytes key, uint64_t value) {
+  WriterGuard guard(*this);
+  return UpsertLocked(key, value);
+}
+
+ConcurrentExactTable::InsertResult ConcurrentExactTable::InsertIfAbsent(
+    ConstBytes key, uint64_t value) {
+  promise(key.size() == key_len_);
+  WriterGuard guard(*this);
+  // Lookup and add under one writer lock: no other writer can add the key
+  // in between. Readers are unaffected (lock-free throughout).
+  const hash_sig_t sig = rte_hash_hash(table_, key.data());
+  void *existing = nullptr;
+  if (rte_hash_lookup_with_hash_data(table_, key.data(), sig, &existing) >=
+      0) {
+    return {InsertResult::Status::kExists,
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(existing))};
+  }
+  void *const data = reinterpret_cast<void *>(static_cast<uintptr_t>(value));
+  if (rte_hash_add_key_with_hash_data(table_, key.data(), sig, data) != 0) {
+    ReclaimLocked();
+    if (rte_hash_add_key_with_hash_data(table_, key.data(), sig, data) != 0) {
+      return {InsertResult::Status::kFull, 0};
+    }
+  }
+  size_.fetch_add(1, std::memory_order_relaxed);
+  return {InsertResult::Status::kInserted, value};
+}
+
+ConcurrentExactTable::UpsertResult ConcurrentExactTable::UpsertLocked(
+    ConstBytes key, uint64_t value) {
   promise(key.size() == key_len_);
   void *const data = reinterpret_cast<void *>(static_cast<uintptr_t>(value));
   // One hash for both steps. rte_hash_add_key_data returns 0 for insert
@@ -100,7 +131,7 @@ ConcurrentExactTable::UpsertResult ConcurrentExactTable::Upsert(
   if (ret != 0) {
     // Deleted slots return to the free list only after readers pass a grace
     // period; reclaim what is ready and retry once before reporting full.
-    Reclaim();
+    ReclaimLocked();
     ret = rte_hash_add_key_with_hash_data(table_, key.data(), sig, data);
     if (ret != 0) {
       return UpsertResult::kFull;
@@ -109,7 +140,7 @@ ConcurrentExactTable::UpsertResult ConcurrentExactTable::Upsert(
   if (present) {
     return UpsertResult::kUpdated;
   }
-  size_++;
+  size_.fetch_add(1, std::memory_order_relaxed);
   return UpsertResult::kInserted;
 }
 
@@ -128,6 +159,7 @@ bool ConcurrentExactTable::HasRoomForOne() {
 }
 
 void ConcurrentExactTable::ReclaimAll() {
+  WriterGuard guard(*this);
   unsigned freed = 0, pending = 0, available = 0;
   do {
     rte_hash_rcu_qsbr_dq_reclaim(table_, &freed, &pending, &available);
@@ -135,16 +167,22 @@ void ConcurrentExactTable::ReclaimAll() {
 }
 
 void ConcurrentExactTable::Reclaim() {
+  WriterGuard guard(*this);
+  ReclaimLocked();
+}
+
+void ConcurrentExactTable::ReclaimLocked() {
   unsigned freed, pending, available;
   rte_hash_rcu_qsbr_dq_reclaim(table_, &freed, &pending, &available);
 }
 
 bool ConcurrentExactTable::Erase(ConstBytes key) {
   promise(key.size() == key_len_);
+  WriterGuard guard(*this);
   if (rte_hash_del_key(table_, key.data()) < 0) {
     return false;
   }
-  size_--;
+  size_.fetch_sub(1, std::memory_order_relaxed);
   return true;
 }
 

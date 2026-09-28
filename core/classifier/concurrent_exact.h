@@ -31,6 +31,7 @@
 #define BESS_CLASSIFIER_CONCURRENT_EXACT_H_
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -39,6 +40,7 @@
 
 #include <rte_hash.h>
 #include <rte_hash_crc.h>
+#include <rte_spinlock.h>
 
 #include <array>
 #include <cstring>
@@ -175,8 +177,17 @@ inline CmpFn SelectCmp(size_t width) noexcept {
 // chosen, and the DPDK behaviours this relies on (each pinned by a test) are
 // in docs/dataplane-tables.md; Decisions D-001, D-002 (docs/decisions.md).
 //
-// Values are up to eight bytes, stored in rte_hash's data pointer. Writers
-// must be serialized by the caller (a module's command path is).
+// Values are up to eight bytes, stored in rte_hash's data pointer.
+//
+// Writers (D-028). A kSingle table has one writer at a time, serialized by
+// the caller (a module's command path, or the one worker that owns a
+// partition). A kShared table takes writers from any thread -- several
+// workers learning flows -- serialized by a spinlock inside the table;
+// InsertIfAbsent() makes "first packet of a new flow" race-free. DPDK's own
+// multi-writer mode is not used: it serializes writers on one table lock as
+// well, and its per-lcore free-slot cache has no guard for threads without
+// an lcore id (control threads). A shared table has a fixed capacity: it
+// cannot be copied to grow while workers write it.
 //
 // Sizing (Decision D-010). Capacity is key slots, fixed at creation; the
 // owner grows by building a larger table. Owners create tables with
@@ -192,6 +203,13 @@ inline CmpFn SelectCmp(size_t width) noexcept {
 class ConcurrentExactTable {
  public:
   enum class UpsertResult : uint8_t { kInserted, kUpdated, kFull };
+  enum class Writers : uint8_t { kSingle, kShared };
+
+  struct InsertResult {
+    enum class Status : uint8_t { kInserted, kExists, kFull } status;
+    uint64_t value;  // the stored value: `value` if inserted, else the one
+                     // already there (kExists)
+  };
 
   // Slots of reserve for deletes pending a grace period, at least: one
   // writer's measured peak (~4M ops/s with readers present, update_scale_bench
@@ -210,7 +228,7 @@ class ConcurrentExactTable {
   // sizing.
   static std::expected<std::unique_ptr<ConcurrentExactTable>, std::string>
   Create(uint32_t key_len, uint32_t capacity, rcu::RcuDomain &domain,
-         int socket = SOCKET_ID_ANY);
+         int socket = SOCKET_ID_ANY, Writers writers = Writers::kSingle);
 
   ~ConcurrentExactTable();
 
@@ -220,8 +238,14 @@ class ConcurrentExactTable {
   // -- writer ------------------------------------------------------------------
 
   UpsertResult Upsert(ConstBytes key, uint64_t value);
+  // Adds `key` unless present; never overwrites. With several writers,
+  // exactly one of those racing to add the same key sees kInserted, and the
+  // others get the winner's value (kExists).
+  InsertResult InsertIfAbsent(ConstBytes key, uint64_t value);
   // False if the key is absent.
   bool Erase(ConstBytes key);
+
+  Writers writers() const noexcept { return writers_; }
 
   // Whether one more key fits with Headroom() slots to spare, counting
   // deletes still waiting out a grace period (reclaims what is ready first).
@@ -235,9 +259,11 @@ class ConcurrentExactTable {
   // own; exposed for owners and tests.
   void Reclaim();
 
-  // Visits every entry: fn(ConstBytes key, uint64_t value). Writer thread.
+  // Visits every entry: fn(ConstBytes key, uint64_t value). Writer thread
+  // (a shared table holds its writer lock meanwhile).
   template <typename Fn>
   void ForEach(Fn &&fn) const {
+    WriterGuard guard(*this);
     const void *key;
     void *data;
     uint32_t next = 0;
@@ -247,7 +273,9 @@ class ConcurrentExactTable {
     }
   }
 
-  size_t size() const noexcept { return size_; }
+  size_t size() const noexcept {
+    return size_.load(std::memory_order_relaxed);
+  }
   // Key slots taken: live entries plus deleted ones still waiting out a
   // reader grace period in the QSBR defer queue.
   size_t slots_in_use() const noexcept {
@@ -298,17 +326,48 @@ class ConcurrentExactTable {
   }
 
  private:
-  ConcurrentExactTable(rte_hash *table, uint32_t key_len, uint32_t capacity)
+  ConcurrentExactTable(rte_hash *table, uint32_t key_len, uint32_t capacity,
+                       Writers writers)
       : table_(table),
         key_len_(key_len),
         capacity_(capacity),
-        hash_batch_(detail::SelectHashBatch(key_len)) {}
+        writers_(writers),
+        hash_batch_(detail::SelectHashBatch(key_len)) {
+    rte_spinlock_init(&writer_lock_);
+  }
+
+  // Serializes a kShared table's writers; nothing for a kSingle table.
+  class WriterGuard {
+   public:
+    explicit WriterGuard(const ConcurrentExactTable &t) noexcept
+        : lock_(t.writers_ == Writers::kShared ? &t.writer_lock_ : nullptr) {
+      if (lock_ != nullptr) {
+        rte_spinlock_lock(lock_);
+      }
+    }
+    ~WriterGuard() {
+      if (lock_ != nullptr) {
+        rte_spinlock_unlock(lock_);
+      }
+    }
+    WriterGuard(const WriterGuard &) = delete;
+    WriterGuard &operator=(const WriterGuard &) = delete;
+
+   private:
+    rte_spinlock_t *lock_;
+  };
+
+  // Upsert/Reclaim bodies, with the writer lock held (or not needed).
+  UpsertResult UpsertLocked(ConstBytes key, uint64_t value);
+  void ReclaimLocked();
 
   rte_hash *table_;
   const uint32_t key_len_;
   const uint32_t capacity_;
+  const Writers writers_;
   const detail::HashBatchFn hash_batch_;
-  size_t size_ = 0;
+  mutable rte_spinlock_t writer_lock_;
+  std::atomic<size_t> size_{0};
 };
 
 }  // namespace bess::classifier

@@ -4211,6 +4211,20 @@ rather than one call site).
        Mpps); p99 1.3 ms -> 0.2 ms. Tested unrestricted and as a two-CPU
        "container" (taskset), and live under `taskset -c 4-7`.
 
+118. **Packet-path writers: partitioned or shared tables (D-028).**
+     - **What:** `ConcurrentExactTable::Writers::kShared` (writers from
+       any thread under the table's lock, `InsertIfAbsent`, exact size),
+       beside the single-writer mode; DPDK's multi-writer mode rejected.
+     - **Numbers** (`shared_writer_bench`, P and E): one writer pays
+       nothing for the lock; DPDK multi-writer is 20-25% slower; shared
+       keeps 81-88% of partitioned lookups when new flows are rare, but a
+       single lock collapses with frequent new flows (only partitioning
+       scales: 6.5M inserts/s on 4 P-cores); 16-way striping halves
+       lookups. Guidance: partition when flows can be steered or creation
+       handed off; shared when new flows are rare.
+     - **Tests:** a 4-writer insert race with a live reader, and churn with
+       exact counts; removing the lock fails both.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

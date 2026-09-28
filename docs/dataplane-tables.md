@@ -129,6 +129,13 @@ state through G, C or W.
     reading it.
 - **Used by:** ExactMatch.
 
+- **Writers (D-028):** `kSingle` (the default: one writer at a time, the
+  control plane or the worker that owns a partition) or `kShared` (any
+  thread; writers serialized by the table's lock; `InsertIfAbsent` for
+  race-free flow learning; fixed capacity). Partition when flows can be
+  steered or their creation handed to an owner; share when new flows are
+  rare (numbers in D-028).
+
 ### `RuntimeMaskedBackend` (masked/ternary match, mode G)
 
 - **What:** tuple-space search. There is one exact table per distinct mask,

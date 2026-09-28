@@ -2204,3 +2204,72 @@ to 9.7K/s (p99 1.3 ms -> 0.2 ms). Hosts that isolate worker CPUs with
 
   Idle packet rate unchanged; under transactions the loss is gone, and
   client p99 falls from 1.2-1.5 ms to 0.2-0.3 ms.
+
+## D-028 Packet-path writers: partitioned or shared tables, chosen on numbers
+
+**Status:** accepted (2026-09-28). The user: support both, because a NIC
+cannot always steer flows cleanly to an owner (GTP-U uplink without TEID or
+inner-header RSS; N6 NAT without port-range steering).
+
+**Facts (DPDK 25.11 source):** `rte_hash` writers serialize on one table
+rwlock whenever `writer_takes_lock` (no per-bucket locks; the TSX path does
+not apply on current Intel); lock-free readers use one table-wide change
+counter; `MULTI_WRITER_ADD`'s per-lcore free-slot cache is indexed by
+`rte_lcore_id()` with no `LCORE_ID_ANY` guard, so a write from a thread
+without an lcore id (bessd's control threads) indexes out of bounds; and
+`rte_hash` has no insert-if-absent, which a shared flow table needs (two
+workers seeing a new flow's first packets must not both win).
+
+**Decision:**
+
+- **`ConcurrentExactTable` gains `Writers::kShared`**: writers from any
+  thread, serialized by a spinlock inside the table; `InsertIfAbsent()`
+  (lookup and add under the lock: exactly one racer inserts, the others get
+  the winner's value); exact `size()`; `ForEach()` holds the lock. Readers
+  stay lock-free. A shared table has a fixed capacity (it cannot be copied
+  to grow while workers write it): a full table is a packet-path outcome.
+  `kSingle` is unchanged, and DPDK's multi-writer mode is not used.
+- **Guidance, from the benchmark below:**
+
+  | situation | use |
+  |---|---|
+  | the NIC or a software handoff can steer flows to an owner | partitioned `kSingle` tables, one per worker; any worker may *read* any partition (lock-free), so only creation needs the owner |
+  | no steering, new flows at most ~1% of packets | one `kShared` table |
+  | no steering, frequent new flows | partitioned, with creation handed to the owner (DRR's ingress ring, D-019) |
+
+  A table with per-bucket writer locks (VPP bihash-style) is recorded as
+  the option if a consumer can neither steer nor hand off.
+
+**Evidence:**
+
+- `shared_writer_bench` (`BM_PacketPathWriters`): N threads, each per step
+  inserts one new flow (if absent), erases its oldest, looks up L keys in
+  32-key batches and reports quiescence; 3 repetitions, medians, isolated
+  (P: CPUs 0,2,4,6,8,10; E: 12-19); totals over threads, inserts/s
+  (lookups/s):
+
+  | P-cores | 1 | 2 | 4 threads |
+  |---|---|---|---|
+  | 3% new flows: partitioned | 2.9M (94M) | 4.3M (138M) | 6.5M (209M) |
+  | shared (this) | 2.9M (93M) | 3.2M (102M) | 1.9M (62M) |
+  | DPDK multi-writer | 2.3M (72M) | 3.0M (97M) | 2.0M (65M) |
+  | striped, 16 shared shards | 1.7M (53M) | 2.3M (73M) | 3.3M (105M) |
+  | 0.4% new flows: partitioned | 0.44M (112M) | 0.82M (210M) | 1.54M (395M) |
+  | shared (this) | 0.45M (116M) | 0.75M (191M) | 1.27M (325M) |
+  | DPDK multi-writer | 0.33M (83M) | 0.57M (146M) | 1.03M (262M) |
+  | striped, 16 shared shards | 0.22M (57M) | 0.40M (103M) | 0.71M (182M) |
+
+  E-cores show the same shape (4 threads, 3% new flows: partitioned 4.9M,
+  shared 1.6-1.9M; 0.4%: 0.93M vs 0.81M). Readings: one writer pays
+  nothing for the lock (shared = partitioned within 3%); DPDK's
+  multi-writer is 20-25% below the shared table everywhere; with frequent
+  new flows a single lock collapses under contention (4 writers insert
+  less than 1) and only partitioning scales; with rare new flows shared
+  keeps 81% (P) to 88% (E) of partitioned lookups; naive striping recovers
+  writes but halves lookups (each batch splits across shards) -- rejected.
+- Tests: `SharedWritersInsertEachKeyOnce` (4 writers race over 20,000 keys
+  in different orders with a lock-free reader running: each key inserted
+  exactly once, every racer gets the winner's value, exact size, the
+  reader only ever sees a writer's value) and
+  `SharedWritersChurnKeepsExactCount`. Removing the lock fails both, in 3
+  of 3 runs.

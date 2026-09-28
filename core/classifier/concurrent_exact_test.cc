@@ -431,5 +431,133 @@ TEST(ConcurrentExactTableTest, ConcurrentReadersOnlySeeJustifiedAnswers) {
   }
 }
 
+// A shared table (D-028): writers race to add the same flows, as workers
+// that all see a new flow's first packets would. Each key must be inserted
+// exactly once, every racer must get the winner's value, size() must be
+// exact, and lock-free readers running throughout must only ever see a
+// key's winning value.
+TEST(ConcurrentExactTableTest, SharedWritersInsertEachKeyOnce) {
+  rcu::RcuDomain &domain = control::runtime().rcu();
+  constexpr uint32_t kKeys = 20000;
+  constexpr int kWriters = 4;
+  auto t = ConcurrentExactTable::Create(
+      kKeyLen, ConcurrentExactTable::CapacityFor(kKeys), domain,
+      SOCKET_ID_ANY, ConcurrentExactTable::Writers::kShared);
+  ASSERT_TRUE(t.has_value());
+  ConcurrentExactTable &table = **t;
+
+  std::atomic<bool> go{false}, stop{false};
+  std::atomic<uint64_t> inserted{0}, wrong{0};
+  // winner[k]: the writer id whose value landed (writer w writes w+1).
+  std::vector<std::atomic<uint64_t>> winner(kKeys);
+  std::vector<std::thread> writers;
+  for (int w = 0; w < kWriters; w++) {
+    writers.emplace_back([&, w] {
+      while (!go.load()) {
+      }
+      for (uint32_t k = 0; k < kKeys; k++) {
+        // Every writer walks the keys in a different order.
+        const uint32_t id = (k * 7919u + static_cast<uint32_t>(w) * 104729u) %
+                            kKeys;
+        const Key key = K(id);
+        const auto r = table.InsertIfAbsent(B(key), w + 1);
+        if (r.status == ConcurrentExactTable::InsertResult::Status::kInserted) {
+          inserted++;
+          uint64_t expected = 0;
+          if (!winner[id].compare_exchange_strong(expected, w + 1)) {
+            wrong++;  // a second insert of the same key
+          }
+        } else if (r.status ==
+                   ConcurrentExactTable::InsertResult::Status::kExists) {
+          if (r.value == static_cast<uint64_t>(w + 1)) {
+            wrong++;  // told "exists" with its own value
+          }
+        } else {
+          wrong++;  // full: sized for every key
+        }
+      }
+    });
+  }
+  // A registered reader: a key it finds holds some writer's value, never
+  // anything else.
+  constexpr rcu::ReaderId kReader = 28;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  std::atomic<uint64_t> seen{0}, bad_reads{0};
+  std::thread reader([&] {
+    domain.Online(kReader);
+    std::mt19937 rng(5);
+    while (!stop.load()) {
+      const Key key = K(rng() % kKeys);
+      uint64_t value = 0;
+      if (table.LookupBatch(B(key), kKeyLen, &value, 1)) {
+        seen++;
+        if (value < 1 || value > kWriters) {
+          bad_reads++;
+        }
+      }
+      domain.Quiescent(kReader);
+    }
+    domain.Offline(kReader);
+  });
+  go = true;
+  for (auto &w : writers) {
+    w.join();
+  }
+  stop = true;
+  reader.join();
+  domain.Unregister(kReader);
+
+  EXPECT_EQ(wrong.load(), 0u);
+  EXPECT_EQ(bad_reads.load(), 0u);
+  EXPECT_EQ(inserted.load(), kKeys);
+  EXPECT_EQ(table.size(), kKeys);
+  EXPECT_GT(seen.load(), 0u);
+  // Every key holds its recorded winner's value.
+  for (uint32_t id = 0; id < kKeys; id++) {
+    const Key key = K(id);
+    uint64_t value = 0;
+    ASSERT_EQ(table.LookupBatch(B(key), kKeyLen, &value, 1), 1u);
+    ASSERT_EQ(value, winner[id].load()) << id;
+  }
+}
+
+// Shared writers adding and erasing their own flows concurrently keep an
+// exact count, and the table ends with exactly the live flows.
+TEST(ConcurrentExactTableTest, SharedWritersChurnKeepsExactCount) {
+  rcu::RcuDomain &domain = control::runtime().rcu();
+  constexpr int kWriters = 4;
+  constexpr uint32_t kLive = 2000, kSteps = 20000;
+  auto t = ConcurrentExactTable::Create(
+      kKeyLen, ConcurrentExactTable::CapacityFor(kWriters * kLive * 2), domain,
+      SOCKET_ID_ANY, ConcurrentExactTable::Writers::kShared);
+  ASSERT_TRUE(t.has_value());
+  ConcurrentExactTable &table = **t;
+  std::vector<std::thread> writers;
+  std::atomic<uint64_t> failures{0};
+  for (int w = 0; w < kWriters; w++) {
+    writers.emplace_back([&, w] {
+      const uint32_t base = static_cast<uint32_t>(w) * 1000000u;
+      for (uint32_t i = 0; i < kSteps; i++) {
+        const Key add = K(base + i);
+        if (table.InsertIfAbsent(B(add), i).status !=
+            ConcurrentExactTable::InsertResult::Status::kInserted) {
+          failures++;
+        }
+        if (i >= kLive && !table.Erase(B(K(base + i - kLive)))) {
+          failures++;
+        }
+      }
+    });
+  }
+  for (auto &w : writers) {
+    w.join();
+  }
+  EXPECT_EQ(failures.load(), 0u);
+  EXPECT_EQ(table.size(), static_cast<size_t>(kWriters) * kLive);
+  size_t visited = 0;
+  table.ForEach([&](ConstBytes, uint64_t) { visited++; });
+  EXPECT_EQ(visited, static_cast<size_t>(kWriters) * kLive);
+}
+
 }  // namespace
 }  // namespace bess::classifier
