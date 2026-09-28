@@ -2273,3 +2273,70 @@ workers seeing a new flow's first packets must not both win).
   reader only ever sees a writer's value) and
   `SharedWritersChurnKeepsExactCount`. Removing the lock fails both, in 3
   of 3 runs.
+
+## D-029 DPDK memory for the dataplane: dynamic hugepages, in-memory EAL, IOVA chosen by DPDK
+
+**Status:** accepted (2026-09-28), part 1: the EAL and the allocator. The
+user: hot-path tables should get DPDK's memory, however the EAL was
+initialized, with no parallel allocator; use dynamic hugepages, not
+transparent ones; VFIO-bound NICs are the deployment norm.
+
+**Decision (part 1):**
+
+- **Dynamic memory mode.** `--legacy-mem` is gone (an old TODO): hugepages
+  are mapped as DPDK's heap needs them -- packet pools at startup, tables at
+  creation, both on the control path, so no packet-path page mapping.
+  `-m` becomes a per-socket cap (`--socket-limit`) instead of an up-front
+  reservation. DPDK's limit is exclusive (an allocation fails once the heap
+  would *reach* it: `eal_memalloc_mem_alloc_validate`), so `-m N` passes
+  N+1; passing N made a host with one 1 GiB page refuse that page and
+  bessd could not start (found by the first run).
+- **`--in-memory --single-file-segments`** instead of `--no-shconf
+  --huge-unlink`: no hugetlbfs files and no runtime directory (memfd), one
+  descriptor per segment list -- what a container wants. Without hugepages
+  (`-m 0`, tests and sandboxes) nothing changes: `--no-huge` with a fixed
+  512 MB, where DPDK cannot hotplug.
+- **IOVA mode is DPDK's choice** unless `-iova` is given: VA when an IOMMU is
+  present and every device supports it (vfio-pci -- DMA confined by the
+  IOMMU, no physical addresses needed), PA where hardware requires it. BESS
+  forced PA with hugepages, contradicting its own flag help ("auto if not
+  specified"). On this host (IOMMU active) the EAL picks VA.
+- **`utils/dpdk_memory.h`**: the one allocator for dataplane memory --
+  `DpdkAllocate/DpdkFree`, `MakeDpdk<T>` (owning pointer), `DpdkArray<T>`
+  (cache-line aligned), `DpdkAllocator<T>` (containers) -- on a NUMA socket
+  of the caller's choice, initializing DPDK if nothing has; out of memory
+  is `std::bad_alloc` on the control path. Transparent hugepages are not
+  relied on (a host policy).
+
+**Evidence:**
+
+- Startup, 3 launches each: 266-272 ms both ways; resident memory +1.5 MB
+  (memfd and segment bookkeeping). This host has one 1 GiB page, which the
+  packet pools claim either way, so the on-demand saving shows only on
+  hosts with 2 MiB pages or more memory.
+- Live module suite: 25/25 under IOVA PA and 25/25 under IOVA VA with
+  dynamic memory.
+- Live packet rate, isolated (worker CPU 2), balanced ABBA of the previous
+  bessd against this one (runs A B B A A B; each run's median over 12
+  readings at 0/1K/3K/max transactions/s): ratios 0.974, 0.986, 1.009 --
+  median −1.4%, inside the ±3% band, one of three pairs faster: no clear
+  difference.
+- What the backing is worth to a lookup-heavy table (`memory_backing_bench`:
+  a pointer array plus 32-byte objects in shuffled order, random lookups in
+  32-id batches; 5 repetitions, medians, isolated), M lookups/s:
+
+  | entries | P-core 4 KiB pages | P-core DPDK heap | E-core 4 KiB | E-core DPDK |
+  |---|---|---|---|---|
+  | 1M (40 MB) | 145 | 110 | 73 | 120 |
+  | 4M | 51 | 67 (+32%) | 46 | 78 (+69%) |
+  | 8M | 66 | 75 (+13%) | 38 | 76 (+99%) |
+
+  Large tables gain from 1 GiB pages (TLB reach), most on E-cores; the
+  P-core 1M case goes the other way and is open (one physically contiguous
+  region may alias cache sets for the pointer array and the objects, where
+  scattered 4 KiB pages do not) -- to be understood before converting
+  structures of that size.
+
+**Part 2 (next):** move the hot-path structures onto `dpdk_memory.h`, one
+at a time with before/after numbers -- `SlotTable`, masked-table rule
+records, K6 stats, `CuckooMap`, RCU-published objects.

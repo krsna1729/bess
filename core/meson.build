@@ -116,6 +116,7 @@ module_sources = files(
 
 utility_sources = files(
   'utils/bpf.cc',
+  'utils/dpdk_memory.cc',
   'utils/bpf_program.cc',
   'utils/copy.cc',
   'utils/endian.cc',
@@ -341,6 +342,7 @@ if get_option('build_benchmarks')
     'classifier_masked_bench': ['classifier/masked_bench.cc', benchmark_main_dep],
     'classifier_cuckoo_scale_bench': ['classifier/cuckoo_scale_bench.cc', benchmark_main_dep],
     'classifier_shared_writer_bench': ['classifier/shared_writer_bench.cc', benchmark_main_dep],
+    'utils_memory_backing_bench': ['utils/memory_backing_bench.cc', benchmark_main_dep],
     'object_table_bench': ['dataplane/object_table_bench.cc', benchmark_main_dep],
     'transaction_bench': ['dataplane/transaction_bench.cc', benchmark_main_dep],
     'update_scale_bench': ['dataplane/update_scale_bench.cc', benchmark_dep],

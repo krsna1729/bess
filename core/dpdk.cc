@@ -120,14 +120,12 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
       // --lcore was accepted in older DPDK but no longer exists.
       "--lcores",
       std::to_string(RTE_MAX_LCORE - 1) + "@" + nonworker_corelist,
-      // Do not bother with /var/run/.rte_config and .rte_hugepage_info,
-      // since we don't want to interfere with other DPDK applications.
-      "--no-shconf",
-      // TODO(sangjin) switch to dynamic memory mode
-      "--legacy-mem",
   };
 
   if (dpdk_mb_per_socket <= 0) {
+    // Do not bother with /var/run/.rte_config and .rte_hugepage_info,
+    // since we don't want to interfere with other DPDK applications.
+    rte_args.Append({"--no-shconf"});
     // DPDK renamed --iova to --iova-mode upstream.
     rte_args.Append({"--iova-mode", (FLAGS_iova != "") ? FLAGS_iova : "va"});
     rte_args.Append({"--no-huge"});
@@ -137,18 +135,37 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
     // memory in advance. We allocate 512MB (this is shared among nodes).
     rte_args.Append({"-m", "512"});
   } else {
-    rte_args.Append({"--iova-mode", (FLAGS_iova != "") ? FLAGS_iova : "pa"});
-
-    std::string opt_socket_mem = std::to_string(dpdk_mb_per_socket);
-    for (int i = 1; i < NumNumaNodes(); i++) {
-      opt_socket_mem += "," + std::to_string(dpdk_mb_per_socket);
+    // IOVA mode: the EAL's own choice unless -iova says otherwise -- VA
+    // when an IOMMU is present and every device supports it (vfio-pci: the
+    // deployment norm, DMA confined by the IOMMU, no physical addresses
+    // needed), PA where hardware requires it. BESS used to force PA here.
+    if (!FLAGS_iova.empty()) {
+      rte_args.Append({"--iova-mode", FLAGS_iova});
     }
 
-    rte_args.Append({"--socket-mem", opt_socket_mem});
+    // Dynamic memory (D-029): hugepages are mapped as DPDK's heap needs
+    // them -- packet pools at startup, tables when they are created -- up to
+    // `dpdk_mb_per_socket` per socket (-m, a cap rather than an up-front
+    // reservation), and within whatever the host or a container's hugetlb
+    // limit allows. Nothing is mapped on the packet path: every dataplane
+    // structure is allocated on the control path.
+    //
+    // DPDK's limit is exclusive: an allocation fails once the heap would
+    // reach it (eal_memalloc_mem_alloc_validate: `limit > new_len` passes),
+    // so a cap of exactly one 1 GiB page rejected that page and bessd could
+    // not start. -m N means the heap may reach N MB: pass N + 1.
+    const std::string cap = std::to_string(dpdk_mb_per_socket + 1);
+    std::string limit = cap;
+    for (int i = 1; i < NumNumaNodes(); i++) {
+      limit += "," + cap;
+    }
+    rte_args.Append({"--socket-limit", limit});
 
-    // Unlink mapped hugepage files so that memory can be reclaimed as soon as
-    // bessd terminates.
-    rte_args.Append({"--huge-unlink"});
+    // No hugetlbfs files and no runtime directory (memfd-backed; implies
+    // what --no-shconf and --huge-unlink did): nothing to clean up, nothing
+    // shared with other DPDK processes -- what a container wants. One file
+    // descriptor per memory segment list instead of one per page.
+    rte_args.Append({"--in-memory", "--single-file-segments"});
   }
 
   // reset getopt()

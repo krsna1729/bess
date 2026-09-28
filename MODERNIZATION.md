@@ -4225,6 +4225,19 @@ rather than one call site).
      - **Tests:** a 4-writer insert race with a live reader, and churn with
        exact counts; removing the lock fails both.
 
+119. **DPDK memory, part 1: dynamic hugepages, in-memory EAL, IOVA by
+     DPDK (D-029).**
+     - **What:** `--legacy-mem` dropped (hugepages mapped as needed, `-m`
+       a cap, passed as N+1 because DPDK's limit is exclusive -- found when
+       bessd could not start on a one-page host); `--in-memory
+       --single-file-segments`; IOVA mode left to DPDK (VA with an IOMMU:
+       the VFIO norm); `utils/dpdk_memory.h`, the one allocator for
+       dataplane memory.
+     - **Evidence:** startup unchanged; live suite 25/25 under IOVA PA and
+       VA; live packet rate balanced ABBA −1.4% median (no clear
+       difference); a large table's lookups +13..+99% on DPDK hugepages
+       over 4 KiB pages (the 1M P-core case open).
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
