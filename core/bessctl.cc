@@ -46,6 +46,7 @@
 
 #include "control/wire_narrow.h"
 #include "control/api_v2.h"
+#include "startup.h"
 #include "control/control_plane.h"
 #include "control/worker_manager.h"
 #include "bessd.h"
@@ -1200,7 +1201,11 @@ void ApiServer::Run() {
   }
 
   service.set_shutdown_func([&server]() { server->Shutdown(); });
-  server->Wait();
+  {
+    // SIGTERM/SIGINT: the same shutdown as the KillBess RPC (D-030).
+    bess::startup::TerminationWatcher watcher([&server] { server->Shutdown(); });
+    server->Wait();
+  }
 
   // Tear the dataplane down in order while the runtime is still alive:
   // modules (and the state they publish through RCU), then ports, traffic

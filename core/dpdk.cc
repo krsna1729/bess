@@ -30,6 +30,7 @@
 
 #include "dpdk.h"
 #include "control/thread_placement.h"
+#include "startup.h"
 
 #include <syslog.h>
 #include <unistd.h>
@@ -44,6 +45,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <string>
 
 #include "memory.h"
@@ -122,7 +124,39 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
       std::to_string(RTE_MAX_LCORE - 1) + "@" + nonworker_corelist,
   };
 
-  if (dpdk_mb_per_socket <= 0) {
+  // -m -1: host-free hugepages within the remaining hugetlb capacity of this
+  // process's cgroup and its ancestors; otherwise normal pages (D-030).
+  if (dpdk_mb_per_socket < 0) {
+    const uint64_t usable = startup::UsableHugepageMB(
+        "/sys/kernel/mm/hugepages", "/sys/fs/cgroup", "/proc/self/cgroup");
+    if (usable == 0) {
+      LOG(WARNING) << "No usable hugepages: DPDK memory is normal pages "
+                      "(512 MB). Give bessd hugepages for production.";
+      dpdk_mb_per_socket = 0;
+    } else {
+      LOG(INFO) << usable << " MB of hugepages usable; mapped as needed";
+    }
+  }
+
+  // The NICs DPDK may probe: -pci_allow, else what a device plugin assigned
+  // this container; with neither, every device DPDK can use.
+  std::vector<std::string> allow;
+  if (!FLAGS_pci_allow.empty()) {
+    std::stringstream list(FLAGS_pci_allow);
+    std::string address;
+    while (std::getline(list, address, ',')) {
+      if (!address.empty()) {
+        allow.push_back(address);
+      }
+    }
+  } else {
+    allow = startup::DevicePluginPciAddresses(environ);
+  }
+  for (const std::string &address : allow) {
+    rte_args.Append({"-a", address});
+  }
+
+  if (dpdk_mb_per_socket == 0) {
     // Do not bother with /var/run/.rte_config and .rte_hugepage_info,
     // since we don't want to interfere with other DPDK applications.
     rte_args.Append({"--no-shconf"});
@@ -144,22 +178,24 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
     }
 
     // Dynamic memory (D-029): hugepages are mapped as DPDK's heap needs
-    // them -- packet pools at startup, tables when they are created -- up to
-    // `dpdk_mb_per_socket` per socket (-m, a cap rather than an up-front
-    // reservation), and within whatever the host or a container's hugetlb
-    // limit allows. Nothing is mapped on the packet path: every dataplane
-    // structure is allocated on the control path.
+    // them -- packet pools at startup, tables when they are created -- within
+    // whatever the host or a container's hugetlb limit allows, and at most
+    // `dpdk_mb_per_socket` per socket when -m sets a cap. Nothing is mapped
+    // on the packet path: every dataplane structure is allocated on the
+    // control path.
     //
     // DPDK's limit is exclusive: an allocation fails once the heap would
     // reach it (eal_memalloc_mem_alloc_validate: `limit > new_len` passes),
     // so a cap of exactly one 1 GiB page rejected that page and bessd could
     // not start. -m N means the heap may reach N MB: pass N + 1.
-    const std::string cap = std::to_string(dpdk_mb_per_socket + 1);
-    std::string limit = cap;
-    for (int i = 1; i < NumNumaNodes(); i++) {
-      limit += "," + cap;
+    if (dpdk_mb_per_socket > 0) {
+      const std::string cap = std::to_string(dpdk_mb_per_socket + 1);
+      std::string limit = cap;
+      for (int i = 1; i < NumNumaNodes(); i++) {
+        limit += "," + cap;
+      }
+      rte_args.Append({"--socket-limit", limit});
     }
-    rte_args.Append({"--socket-limit", limit});
 
     // No hugetlbfs files and no runtime directory (memfd-backed; implies
     // what --no-shconf and --huge-unlink did): nothing to clean up, nothing
@@ -256,7 +292,7 @@ void InitDpdk(int dpdk_mb_per_socket) {
     // (so tables beyond the TLB reach are measured the way a hugepage bessd
     // runs them). An unprivileged process cannot resolve physical addresses,
     // so this path uses IOVA-as-VA unless -iova says otherwise.
-    if (dpdk_mb_per_socket <= 0) {
+    if (dpdk_mb_per_socket == 0) {
       if (const char *env = std::getenv("BESS_DPDK_HUGEPAGE_MB")) {
         const int mb = std::atoi(env);
         if (mb > 0) {

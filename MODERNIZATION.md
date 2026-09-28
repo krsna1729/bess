@@ -4238,6 +4238,21 @@ rather than one call site).
        difference); a large table's lookups +13..+99% on DPDK hugepages
        over 4 KiB pages (the 1M P-core case open).
 
+120. **bessd container startup (D-030).**
+     - **What:** any flag from `BESSD_<FLAG>` (command line wins); `-m`
+       automatic (hugepages if usable within the pod's remaining cgroup v2
+       hugetlb capacity, `max - current` along its ancestors, else normal
+       pages with a warning); NICs from `-pci_allow` or the device plugin's
+       `PCIDEVICE_*`; containers run `-f` or set `BESSD_F=true` (legacy
+       daemon mode remains the default); SIGTERM/SIGINT graceful (exit 0);
+       root not required; a short packet pool reports what it lacked and
+       which knobs to turn. `-buffers` stays user-sized (its 256K default
+       was never derived from demand). `docs/running-in-containers.md`.
+     - **Evidence:** 4 unit tests (env flags, hugepage detection over fake
+       sysfs/cgroup trees, device-plugin parsing); live: `bessd -f` in a
+       cpuset with env config, SIGTERM with a worker forwarding traffic
+       -> ordered teardown, exit 0; non-root with normal pages.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <limits>
 #include <rte_errno.h>
+#include <rte_eal.h>
 #include <rte_mempool.h>
 
 #include "dpdk.h"
@@ -34,7 +35,9 @@ void PacketPool::CreateDefaultPools(size_t capacity, size_t data_room_size) {
   rte_dump_physmem_layout(stdout);
 
   for (int sid = 0; sid < NumNumaNodes(); sid++) {
-    if (FLAGS_m == 0) {
+    // What the EAL actually did: -m -1 resolves to normal pages when no
+    // hugepages are usable.
+    if (!rte_eal_has_hugepages()) {
       LOG(WARNING) << "Hugepage is disabled! Creating PlainPacketPool for "
                    << capacity << " packets on node " << sid;
       default_pools_[sid] =
@@ -217,12 +220,25 @@ void PacketPool::PostPopulate() {
   rte_mempool_obj_iter(pool_, rte_pktmbuf_init, nullptr);
 
   LOG(INFO) << name_ << " has been created with " << Capacity() << " packets";
-  if (Capacity() == 0) {
-    LOG(FATAL) << name_ << " has no packets allocated\n"
-               << "Troubleshooting:\n"
-               << "  - Check 'ulimit -l'\n"
-               << "  - Do you have enough memory on the machine?\n"
-               << "  - Maybe memory is too fragmented. Try rebooting.\n";
+  // Say how far short of the request a pool fell, in the units an operator
+  // can change (D-030): the packet count (-buffers, BESSD_BUFFERS) and the
+  // memory behind it (hugepages, -m / BESSD_M).
+  const size_t element = pool_->elt_size + pool_->header_size +
+                         pool_->trailer_size;
+  const size_t wanted = pool_->size;
+  if (Capacity() < wanted) {
+    const auto mb = [&](size_t n) { return std::to_string(n * element >> 20); };
+    const std::string message =
+        name_ + " holds " + std::to_string(Capacity()) + " of the " +
+        std::to_string(wanted) + " packets asked for (" + mb(Capacity()) +
+        " of " + mb(wanted) +
+        " MB): not enough DPDK memory on its socket. Lower -buffers "
+        "(BESSD_BUFFERS), raise the memory cap (-m, BESSD_M) or give bessd "
+        "more hugepages; also check 'ulimit -l'.";
+    if (Capacity() == 0) {
+      LOG(FATAL) << message;
+    }
+    LOG(WARNING) << message;
   }
 }
 

@@ -154,12 +154,14 @@ void ProcessCommandLineArgs() {
 }
 
 void CheckRunningAsRoot() {
-  if (!FLAGS_skip_root_check) {
-    uid_t euid = geteuid();
-    if (euid != 0) {
-      LOG(ERROR) << "You need root privilege to run the BESS daemon";
-      exit(EXIT_FAILURE);
-    }
+  // Root is not required (D-030): with VFIO, IOVA-as-VA and an in-memory
+  // EAL, bessd needs access to its VFIO devices and to hugepages (the
+  // hugetlb group or CAP_IPC_LOCK), which a container runtime grants
+  // without root. DPDK reports precisely what is missing, if anything.
+  if (!FLAGS_skip_root_check && geteuid() != 0) {
+    LOG(WARNING) << "Running without root: bessd needs access to its VFIO "
+                    "devices (/dev/vfio) and to hugepages (hugetlb group or "
+                    "CAP_IPC_LOCK); DPDK will report what is missing";
   }
 
   // Great power comes with great responsibility.

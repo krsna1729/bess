@@ -143,12 +143,19 @@ class TmpFileName final {
     }                                                                         \
   }
 
-// Checks that running as non-root causes termination.
-TEST(CheckRunningAsRoot, NonRoot) {
+// Non-root startup warns about required access but is allowed to continue.
+TEST(CheckRunningAsRoot, NonRootWarnsAndContinues) {
   // Only do the test if we're not root.
-  if (geteuid()) {
-    EXPECT_DEATH(CheckRunningAsRoot(), "");
+  if (geteuid() == 0) {
+    return;
   }
+
+  EXPECT_EXIT(
+      {
+        CheckRunningAsRoot();
+        _exit(0);
+      },
+      ::testing::ExitedWithCode(0), "Running without root: bessd needs access");
 }
 
 // Checks that we can write out and read in a pid value to/from a good file.

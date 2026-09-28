@@ -28,6 +28,8 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import os
+
 from test_utils import *
 
 
@@ -82,8 +84,11 @@ class BessModuleConstraintTest(BessModuleTestCase):
         nat_config = [{'ext_addr': '192.168.1.1'}]
         src0 = Source()
         src1 = Source()
-        bess.add_worker(0, 0)
-        bess.add_worker(1, 1)
+        cores = sorted(os.sched_getaffinity(0))
+        if len(cores) < 2:
+            self.skipTest("requires at least two available CPU cores")
+        bess.add_worker(0, cores[0])
+        bess.add_worker(1, cores[1])
         nat = NAT(ext_addrs=nat_config)
         src0 -> 0: nat: 1 -> Sink()
         src1 -> 1: nat: 0 -> Sink()

@@ -2340,3 +2340,60 @@ transparent ones; VFIO-bound NICs are the deployment norm.
 **Part 2 (next):** move the hot-path structures onto `dpdk_memory.h`, one
 at a time with before/after numbers -- `SlotTable`, masked-table rule
 records, K6 stats, `CuckooMap`, RCU-published objects.
+
+## D-030 container-friendly bessd startup: environment, auto-detection, graceful termination
+
+**Status:** accepted (2026-09-28). The user: modernize bessd's startup for
+container and orchestrated deployments, "where we have to feed less info";
+packet buffers stay user-sized (modules need memory too).
+
+**Decision:**
+
+- **Flags from the environment:** any flag not on the command line is read
+  from `BESSD_<FLAG>` (through gflags, so the flag's validator runs; an
+  invalid value is fatal, as on the command line).
+- **`-m` defaults to automatic (-1):** hugepages if any are usable -- host
+  free pages, bounded by the remaining cgroup v2 hugetlb capacity (`max -
+  current`) along the process's cgroup and its ancestors -- mapped as needed
+  with no cap of BESS's own (D-029); none usable: normal pages (512 MB),
+  with a warning. `-m 0` and `-m N` keep their meaning. The packet pool
+  type follows what the EAL actually did (`rte_eal_has_hugepages()`), not
+  the flag.
+- **NICs:** `-pci_allow`, else the addresses a device plugin assigned
+  (`PCIDEVICE_*`, the Kubernetes SR-IOV network device plugin's convention;
+  `_INFO` JSON and non-addresses ignored), become DPDK's `-a` list; with
+  neither, DPDK probes every device it can use.
+- **Foreground is container mode:** use `-f` or `BESSD_F=true`; daemon mode
+  remains the default. Foreground uses no pidfile or single-instance lock
+  unless `-i` is given.
+- **SIGTERM/SIGINT shut down gracefully:** blocked in every thread from the
+  start of `main()`, taken by a watcher that triggers the same server
+  shutdown as `KillBess`; teardown then runs in order and bessd exits 0.
+- **Root is not required:** a warning names what non-root access needs
+  (VFIO devices, hugepages); DPDK reports what is missing.
+- **A short pool says so:** a packet pool that could not get every buffer
+  asked for now reports how many it holds and how many MB it lacked, and
+  names `-buffers`/`BESSD_BUFFERS`, `-m`/`BESSD_M` and hugepages (it used
+  to warn about a populate return code; an empty pool stays fatal).
+- `-buffers` keeps its default (262,144 per socket). Its history, for the
+  record: a 2015 constant of 128K, a 2016 retry that halved from 512K down
+  to 16K until the mempool fit, a 2018 flag defaulting to 256K -- never
+  derived from demand. Demand (ring descriptors, caches, in-flight
+  batches, buffering modules) depends on the pipeline, so users size it.
+
+**Evidence:**
+
+- `startup_test.cc` (4): environment flags (applied; a command-line flag
+  wins; an invalid value is fatal); usable hugepages from fake sysfs and
+  cgroup trees (per page size, cgroup limits, none, missing directories);
+  device-plugin addresses (merged, sorted, deduplicated; `_INFO` and junk
+  ignored).
+- Live, as a container would run it: bessd with only `-f`, under
+  `taskset -c 4-7`, gRPC address from `BESSD_GRPC_URL` -- flag taken from
+  the environment, "1024 MB of hugepages usable; mapped as needed", the
+  host pidfile untouched, SIGTERM -> graceful shutdown, exit 0. Non-root
+  with `BESSD_M=0`: warns, serves, SIGINT -> exit 0. With a worker
+  forwarding traffic: SIGTERM -> modules, ports and workers destroyed in
+  order, exit 0.
+- `docs/running-in-containers.md` states what bessd reads and what a pod
+  should provide.

@@ -28,8 +28,11 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <unistd.h>
+
 #include <rte_launch.h>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "dataplane/batch_tuning.h"
@@ -38,12 +41,14 @@
 #include "debug.h"
 #include "opts.h"
 #include "packet_pool.h"
+#include "startup.h"
 #include "port.h"
 #include "utils/format.h"
 #include "version.h"
 #include "worker.h"
 
 int main(int argc, char *argv[]) {
+  bess::startup::BlockTerminationSignals();  // before any thread exists
   FLAGS_logbuflevel = -1;
   FLAGS_colorlogtostderr = true;
   google::InitGoogleLogging(argv[0]);
@@ -57,10 +62,23 @@ int main(int argc, char *argv[]) {
   google::SetVersionString(VERSION);
   google::SetUsageMessage("BESS Command Line Options:");
   google::ParseCommandLineFlags(&argc, &argv, true);
+  // BESSD_<FLAG> environment variables for flags not on the command line
+  // (D-030).
+  const std::vector<std::string> from_env =
+      bess::startup::ApplyEnvironmentFlags(environ);
   bess::bessd::ProcessCommandLineArgs();
+  for (const std::string &name : from_env) {
+    LOG(INFO) << "Flag from the environment: " << name;
+  }
   bess::bessd::CheckRunningAsRoot();
 
-  int pidfile_fd = bess::bessd::CheckUniqueInstance(FLAGS_i);
+  // A pidfile and its single-instance lock serve daemon mode and `-k`. In
+  // the foreground -- a container's PID 1 -- there is one instance by
+  // construction and /var/run may be read-only: only with an explicit -i.
+  gflags::CommandLineFlagInfo pidfile_flag;
+  gflags::GetCommandLineFlagInfo("i", &pidfile_flag);
+  const bool use_pidfile = !FLAGS_f || !pidfile_flag.is_default;
+  int pidfile_fd = use_pidfile ? bess::bessd::CheckUniqueInstance(FLAGS_i) : -1;
   ignore_result(bess::bessd::SetResourceLimit());
 
   int signal_fd = -1;
@@ -81,7 +99,9 @@ int main(int argc, char *argv[]) {
   LOG(INFO) << "bessd " << google::VersionString();
 
   // Store our PID (child's, if daemonized) in the PID file.
-  bess::bessd::WritePidfile(pidfile_fd, getpid());
+  if (use_pidfile) {
+    bess::bessd::WritePidfile(pidfile_fd, getpid());
+  }
 
   // Load plugins
   if (!bess::bessd::LoadPlugins(FLAGS_modules)) {

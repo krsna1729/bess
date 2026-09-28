@@ -46,7 +46,7 @@ static const char *kDefaultBindAddr = "127.0.0.1";
 // TODO(barath): Rename these flags to something more intuitive.
 DEFINE_bool(t, false, "Dump the size of internal data structures");
 DEFINE_string(i, "/var/run/bessd.pid", "Specifies where to write the pidfile");
-DEFINE_bool(f, false, "Run BESS in foreground mode (for developers)");
+DEFINE_bool(f, false, "Run BESS in foreground mode.");
 DEFINE_bool(k, false, "Kill existing BESS instance, if any");
 DEFINE_bool(d, false, "Run BESS in debug mode (with debug log messages)");
 DEFINE_bool(skip_root_check, false,
@@ -113,16 +113,22 @@ static const bool _p_dummy[[maybe_unused]] =
     google::RegisterFlagValidator(&FLAGS_p, &ValidateTCPPort);
 
 static bool ValidateMegabytesPerSocket(const char *, int32_t value) {
-  if (value < 0) {
+  if (value < -1) {
     LOG(ERROR) << "Invalid memory size: " << value;
     return false;
   }
 
   return true;
 }
-DEFINE_int32(m, 1024,
-             "Specifies per-socket hugepages to allocate (in MBs). "
-             "If set to 0, no hugepage is used");
+DEFINE_int32(m, -1,
+             "Per-socket DPDK memory cap in MB. -1 (default): hugepages if "
+             "any are usable, mapped as needed with no cap beyond the host or "
+             "container limit, else normal pages; 0: no hugepages; N: "
+             "hugepages, at most N MB per socket");
+DEFINE_string(pci_allow, "",
+              "Comma-separated PCI addresses DPDK may probe (its -a list). "
+              "Empty: the addresses a device plugin assigned "
+              "(PCIDEVICE_* environment), else every device DPDK can use");
 static const bool _m_dummy[[maybe_unused]] =
     google::RegisterFlagValidator(&FLAGS_m, &ValidateMegabytesPerSocket);
 
