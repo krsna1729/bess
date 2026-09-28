@@ -28,6 +28,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "control/pipeline_validator.h"
+#include "control/thread_placement.h"
 
 #include <cerrno>
 #include <set>
@@ -221,6 +222,13 @@ ControlResult<ValidatedPipeline> ValidatePipeline(const RuntimeState &runtime,
           "worker", "core",
           "worker " + std::to_string(worker.wid) + ": CPU " +
               std::to_string(worker.core) + " is not present"));
+    }
+    if (!CpuAllowed(worker.core)) {
+      return std::unexpected(Invalid(
+          "worker", "core",
+          "worker " + std::to_string(worker.wid) + ": CPU " +
+              std::to_string(worker.core) + " is not in bessd's CPU set (" +
+              CpuList(ProcessCpus()) + ")"));
     }
     if (!worker_cores.insert(worker.core).second) {
       return std::unexpected(Invalid(

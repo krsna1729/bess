@@ -29,6 +29,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "dpdk.h"
+#include "control/thread_placement.h"
 
 #include <syslog.h>
 #include <unistd.h>
@@ -183,17 +184,11 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
   rte_openlog_stream(fopencookie(nullptr, "w", dpdk_log_funcs));
 }
 
-// Returns the current affinity set of the process as a string,
-// in the "corelist" format (e.g., "0-12,16-28")
+// The CPU set bessd was started with, in "corelist" format (e.g.
+// "0-12,16-28"): DPDK's main lcore may run anywhere in it (D-027).
 std::string GetNonWorkerCoreList() {
   std::string corelist;
-  cpu_set_t set;
-
-  int ret = pthread_getaffinity_np(pthread_self(), sizeof(set), &set);
-  if (ret < 0) {
-    PLOG(WARNING) << "pthread_getaffinity_np()";
-    return "0";  // Core 0 as a fallback
-  }
+  const cpu_set_t set = bess::control::ProcessCpus();
 
   // Choose the last core available
   for (int i = 0; i < CPU_SETSIZE; i++) {

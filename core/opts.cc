@@ -28,6 +28,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "opts.h"
+#include "control/thread_placement.h"
 
 #include <glog/logging.h>
 
@@ -67,14 +68,25 @@ static bool _iova_dummy[[maybe_unused]] =
     google::RegisterFlagValidator(&FLAGS_iova, &ValidateIovaMode);
 
 static bool ValidateCoreID(const char *, int32_t value) {
+  if (value == -1) {
+    return true;  // automatic: bess::control::DefaultWorkerCore()
+  }
   if (!is_cpu_present(value)) {
     LOG(ERROR) << "Invalid core ID: " << value;
     return false;
   }
-
+  // Inside the CPU set bessd was started with (a container's cpuset, a
+  // taskset): a worker pinned elsewhere would fail to start (D-027).
+  if (!bess::control::CpuAllowed(value)) {
+    LOG(ERROR) << "Core " << value << " is not in bessd's CPU set ("
+               << bess::control::CpuList(bess::control::ProcessCpus()) << ")";
+    return false;
+  }
   return true;
 }
-DEFINE_int32(c, 0, "Core ID for the default worker thread");
+DEFINE_int32(c, -1,
+             "Core ID for the default worker thread (-1: CPU 0 if bessd may "
+             "use it, else the first CPU of its CPU set)");
 static const bool _c_dummy[[maybe_unused]] =
     google::RegisterFlagValidator(&FLAGS_c, &ValidateCoreID);
 

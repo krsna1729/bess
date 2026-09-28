@@ -4195,6 +4195,22 @@ rather than one call site).
        callback API, rich errors and default deadlines declined with
        reasons.
 
+117. **Placement inside the inherited CPU set; control threads off worker
+     CPUs (D-027).**
+     - **Found by the live transaction benchmark:** bessd's own threads
+       were allowed on the worker's CPU; ~8K transactions/s cut the
+       worker's packet rate by 45% (−8% at 1K/s, −20% at 3K/s).
+     - **Fix:** everything is placed inside the CPU set bessd inherited
+       (container cpuset, Kubernetes, taskset): DPDK lcores, the default
+       worker (`-c` now automatic: CPU 0 if allowed, else the first CPU
+       of the set), requested workers (refused with a clear error outside
+       it, instead of a worker CHECK aborting the daemon), and control
+       threads, which leave worker CPUs on every worker launch/destroy.
+     - **ABBA, live, isolated:** idle rate unchanged (median 31.8 vs 31.6
+       Mpps); under 1K/3K/max transactions/s the loss is gone (30.5-32.9
+       Mpps); p99 1.3 ms -> 0.2 ms. Tested unrestricted and as a two-CPU
+       "container" (taskset), and live under `taskset -c 4-7`.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -9922,6 +9938,40 @@ drive the design.
 | 10 | P2 | **Worker affinity and cross-worker handoff:** first expose the effective RSS configuration and queue-to-worker mapping, then generic handoff (DRR's ingress ring is the first instance, D-019) | UPF-specific queue plumbing, multi-worker limits | NAT, stateful firewall, DRR | queued |
 | 11 | P2 | **Narrow hardware steering:** a lifecycle-managed `rte_flow` interface for the flow shapes actually needed. Capabilities come from exact feature tests with conservative fallback, never driver-name guesses (the PMD's current GTP checksum inference by driver name is to be replaced) | UPF-maintained PMD code | N0 vif demux | queued |
 | later | -- | IPv6 routes, fragmentation/reassembly, more NIC features | remaining protocol limits | -- | -- |
+
+**Decided with the user (2026-09-28), next after D-027:**
+
+- **Both partitioned and shared (multi-writer) tables**, chosen per
+  module and deployment. NICs cannot always steer cleanly (GTP-U uplink
+  without TEID/inner-header RSS; N6 NAT without port-range steering), and
+  the right choice depends on the insert-to-lookup ratio. Packet-path
+  writers: NAT/CGNAT, conntrack/stateful firewall, L2 MAC and ARP/ND
+  learning, IP reassembly, load-balancer affinity, flow telemetry, a UPF
+  application-detection flow cache.
+  - Facts (DPDK 25.11 source): `rte_hash` writers serialize on one table
+    rwlock (no per-bucket locks; TSX absent on current Intel); lock-free
+    readers use one table-wide change counter; `MULTI_WRITER_ADD`'s
+    per-lcore free-slot cache has no `LCORE_ID_ANY` guard (a write from a
+    non-lcore thread indexes out of bounds); `rte_hash` has no
+    insert-if-absent, which a shared NAT needs (two workers seeing a new
+    flow's first packets must not both win).
+  - Plan: `ConcurrentExactTable` gains a writers option -- single (today)
+    or shared (insert-if-absent under a writer lock; fixed capacity, since
+    a table written by workers cannot be copied to grow); a partitioned
+    helper (one single-writer table per worker plus a key-to-owner
+    function); an in-process benchmark of new-flow inserts plus lookups at
+    1/2/4/8 workers -- partitioned vs our lock vs DPDK multi-writer, P and
+    E -- whose numbers decide the default and whether lock striping or a
+    per-bucket-lock table is needed. Then NAT on both.
+- **Per-entry statistics are split from lookup** (the user's design): the
+  lookup table stays control-written and carries a counter id; counters
+  are K6-style worker-local arrays indexed by that id (one plain add per
+  packet, no sharing); transactions allocate and free counter ids with
+  their entries (a reused id starts from a baseline); after an erase the
+  removal cascade reads the final values once no worker can increment
+  them -- a UPF's final usage report on PDR/URR deletion. RPC/SDK:
+  `GetStats(resource, keys)` with generation and epoch, and final values
+  delivered with the removing transaction or a watch stream (row 8, G1.4).
 
 **Course corrections adopted:**
 

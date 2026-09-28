@@ -30,6 +30,7 @@
 
 #include "worker.h"
 
+#include <pthread.h>
 #include <sched.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -278,6 +279,11 @@ void *Worker::Run(void *_arg) {
   wid_ = arg->wid;
   rcu_online_ = false;
   core_ = arg->core;
+  tid_ = gettid();  // read by the control plane once this worker is ready
+  // Named for ps/top (15 characters at most); otherwise it inherits the name
+  // of whichever thread launched it (a gRPC handler, say).
+  const std::string name = "bess-worker-" + std::to_string(wid_);
+  pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
   socket_ = rte_socket_id();
 
   // For some reason, rte_socket_id() does not return a correct NUMA ID.

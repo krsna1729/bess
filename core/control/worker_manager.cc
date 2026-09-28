@@ -33,10 +33,12 @@
 #include <cstdint>
 #include <cstring>
 #include <set>
+#include <vector>
 
 #include <glog/logging.h>
 
 #include "control/runtime_state.h"
+#include "control/thread_placement.h"
 #include "module.h"
 #include "opts.h"
 #include "resume_hook.h"
@@ -179,6 +181,7 @@ void WorkerManager::Destroy(int wid) {
     scheduler_names_[wid].clear();
 
     num_workers_--;
+    PlaceThreads();  // its CPU is free for control threads again
   }
 
   if (num_workers_ > 0) {
@@ -240,12 +243,23 @@ void WorkerManager::Launch(int wid, int core, const std::string &scheduler) {
   }
 
   num_workers_++;
+  PlaceThreads();
+}
+
+void WorkerManager::PlaceThreads() {
+  std::vector<WorkerPlacement> placed;
+  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+    if (const Worker *worker = workers_[wid].load()) {
+      placed.push_back({worker->tid(), worker->core()});
+    }
+  }
+  PlaceControlThreads(placed);
 }
 
 Worker *WorkerManager::NextActive() {
   static int prev_wid = 0;
   if (num_workers_ == 0) {
-    Launch(0, FLAGS_c, "");
+    Launch(0, DefaultWorkerCore(), "");
     return Get(0);
   }
 

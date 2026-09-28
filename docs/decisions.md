@@ -2134,3 +2134,73 @@ were measured and dropped.
   API's typed `ErrorDetail` trailer already carries the structure.
 - *Client deadlines by default in pybess*: some calls (port creation, reset)
   legitimately take long; a wrong default would be a regression.
+
+## D-027 Placement inside the inherited CPU set; control threads off worker CPUs
+
+**Status:** accepted (2026-09-28). Found by the first live measurement of
+packets under dataplane transactions (`tools/live_transaction_bench.py`);
+the container requirement is the user's ("honour whatever cpuset affinity
+we got and allocate within that; container/k8s friendly").
+
+**Finding.** On an isolated two-CPU bessd (worker on one, the other free),
+a worker's packet rate fell with the transaction rate -- 32 Mpps idle,
+−8% at 1K transactions/s, −20% at 3K, −45% at ~7.8K/s -- while the
+in-process benchmarks showed no reader cost up to 100K sessions/s. Cause:
+bessd's own threads (main, gRPC, DPDK's service threads) were allowed on
+every CPU of the process, including the busy-polling worker's, and the
+scheduler put them there. Pinning them to the other CPU by hand made the
+packet rate flat (within ~1%) and raised transaction throughput from 7.8K
+to 9.7K/s (p99 1.3 ms -> 0.2 ms). Hosts that isolate worker CPUs with
+`isolcpus` hide this; containers and plain hosts do not.
+
+**Decision:**
+
+- **One CPU set, inherited.** `ProcessCpus()` is the affinity bessd was
+  started with (a cgroup cpuset, Kubernetes' CPU manager, a taskset),
+  captured before `main()` and before DPDK's EAL. Everything bessd places
+  stays inside it: DPDK's `--lcores`, the default worker, requested
+  workers, control threads.
+- **Workers outside it are refused**, with the set in the message
+  (`AddWorker`, the v2 pipeline validator, `-c`), instead of the worker
+  thread's CHECK aborting the daemon.
+- **The default worker** (`-c` now defaults to -1, automatic) is CPU 0 if
+  allowed -- the historical default -- else the first CPU of the set. With
+  the old default a container without CPU 0 could not start bessd at all
+  (gflags validates the default; seen live).
+- **Control threads leave worker CPUs.** On every worker launch and destroy,
+  every thread that is not a worker is restricted to the set minus the
+  workers' CPUs (all of the set if that leaves none, with a warning);
+  threads created later inherit it. A destroyed worker's CPU is given back.
+- Workers are named `bess-worker-<wid>` (they used to inherit a gRPC
+  thread's name).
+- **Lcores are not workers** (answered while doing this): BESS never runs
+  code on EAL lcores; the main thread is lcore 127, and each worker
+  registers a dynamic lcore id only so that DPDK's per-lcore state -- above
+  all the mempool cache -- works. Control threads have none, which is safe
+  for the single-writer tables BESS uses; a multi-writer `rte_hash` indexes
+  per-lcore state with no LCORE_ID_ANY guard, so its writers must be
+  registered lcores (the multi-writer tables to come).
+
+**Evidence:**
+
+- `control/thread_placement_test.cc` (4): the pure CPU arithmetic; the
+  captured set equals the running set; a real worker launch moves the
+  other threads off its CPU, a thread created afterwards inherits that,
+  and a destroy gives it back; a worker outside the set is refused with
+  the message. Registered twice: as is, and under `taskset -c 0-1` (a
+  two-CPU "container"), where the refusal path runs.
+- Live, bessd under `taskset -c 4-7` with no `-c`: the default worker lands
+  on CPU 4, a worker on CPU 2 is refused ("core 2 is not in bessd's CPU set
+  (4-7)"), 22 other threads run on 5-7.
+- Live packet rate, isolated (CPU 2 worker, 4 control), A/B against the
+  previous bessd, 6 rounds each, interleaved A B A B:
+
+  | transactions/s | previous bessd (Mpps) | this change (Mpps) |
+  |---|---|---|
+  | 0 | 31.0-32.4 (median 31.8) | 31.0-33.1 (median 31.6) |
+  | 1,000 | 27.7-30.2 | 31.1-32.9 |
+  | 3,000 | 24.2-26.7 | 31.0-32.4 |
+  | max | 17.3-18.6 at 7.2-8.2K/s | 30.5-31.6 at 9.0-9.9K/s |
+
+  Idle packet rate unchanged; under transactions the loss is gone, and
+  client p99 falls from 1.2-1.5 ms to 0.2-0.3 ms.

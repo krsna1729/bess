@@ -7,6 +7,7 @@ core_sources = files(
   'control/control_error.cc',
   'control/control_plane.cc',
   'control/dataplane_transactions.cc',
+  'control/thread_placement.cc',
   'control/pipeline_diff.cc',
   'control/pipeline_plan.cc',
   'control/pipeline_snapshot.cc',
@@ -237,6 +238,7 @@ unit_test_sources = [
   'rcu/rcu_scheduler_test.cc',
   'control/api_v2_test.cc',
   'control/dataplane_transactions_test.cc',
+  'control/thread_placement_test.cc',
   'control/apply_pipeline_test.cc',
   'control/control_plane_test.cc',
   'bessd_test.cc',
@@ -283,6 +285,7 @@ unit_test_sources = [
   'utils/trie_test.cc',
 ]
 
+taskset_prog = find_program('taskset', required: false)
 foreach source : unit_test_sources
   test_name = source.replace('.cc', '').replace('/', '_')
   # The test main is ours (core/gtest_main.cc) rather than the packaged one:
@@ -308,6 +311,19 @@ foreach source : unit_test_sources
     workdir: test_workdir,
     env: {'LD_LIBRARY_PATH': dpdk_libdir},
   )
+  # Placement as a container sees it: bessd started inside a two-CPU set
+  # (D-027).
+  if source == 'control/thread_placement_test.cc' and taskset_prog.found()
+    test(
+      test_name + '_in_two_cpus',
+      taskset_prog,
+      args: ['-c', '0-1', unit_exe.full_path()],
+      depends: unit_exe,
+      is_parallel: false,
+      workdir: test_workdir,
+      env: {'LD_LIBRARY_PATH': dpdk_libdir},
+    )
+  endif
 endforeach
 
 if get_option('build_benchmarks')

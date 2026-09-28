@@ -35,6 +35,8 @@
 
 #include <cstdint>
 #include <string>
+
+#include <sys/types.h>
 #include <thread>
 #include <type_traits>
 
@@ -110,6 +112,8 @@ class Worker {
 
   int wid() const { return wid_; }
   int core() const { return core_; }
+  // The worker's OS thread id (gettid), set before it reports ready.
+  pid_t tid() const { return tid_; }
   int socket() const { return socket_; }
   int fd_event() { return fd_event_; }
 
@@ -137,6 +141,7 @@ class Worker {
   // thread (BlockWorker, the thread's exit), read by ReportQuiescent().
   bool rcu_online_;
   int core_;  // TODO: should be cpuset_t
+  pid_t tid_;  // set in Run() (Worker stays trivially constructible)
   int socket_;
   int fd_event_;
 

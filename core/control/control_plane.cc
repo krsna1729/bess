@@ -28,6 +28,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "control/control_plane.h"
+#include "control/thread_placement.h"
 
 #include "control/worker_manager.h"
 
@@ -604,6 +605,11 @@ ControlResult<void> ControlPlane::AddWorkerLocked(uint64_t wid, uint64_t core, c
   if (!is_cpu_present(core)) {
     return std::unexpected(Err(EINVAL, "Invalid core %d", static_cast<int>(core)));
   }
+  if (!CpuAllowed(static_cast<int>(core))) {
+    return std::unexpected(Err(EINVAL, "core %d is not in bessd's CPU set (%s)",
+                               static_cast<int>(core),
+                               CpuList(ProcessCpus()).c_str()));
+  }
   if (is_worker_active(wid)) {
     return std::unexpected(Err(EEXIST, "worker:%d is already active", static_cast<int>(wid)));
   }
@@ -1156,7 +1162,7 @@ ControlResult<void> ControlPlane::AttachExistingTcLocked(
     if ((wid != Worker::kAnyWorker && !is_worker_active(wid)) ||
         (wid == Worker::kAnyWorker && active_workers == 0)) {
       if (active_workers == 0 && (wid == 0 || wid == Worker::kAnyWorker)) {
-        launch_worker(0, FLAGS_c);
+        launch_worker(0, DefaultWorkerCore());
       } else {
         return std::unexpected(
             Err(EINVAL, "worker:%d does not exist", static_cast<int>(wid)));
