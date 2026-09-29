@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026, Nefeli Networks, Inc.
-# All rights reserved. (BSD 3-clause; see LICENSE.)
+# SPDX-License-Identifier: BSD-3-Clause
 """Packet rate of a live bessd while dataplane transactions change its rules.
 
 The live gate MODERNIZATION.md section 31.0 asked for (D-021 amendment 5,

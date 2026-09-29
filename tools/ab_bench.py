@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026, Nefeli Networks, Inc.
-# All rights reserved. (BSD 3-clause; see LICENSE.)
+# SPDX-License-Identifier: BSD-3-Clause
 """Paired A/B comparison of two Google Benchmark binaries, drift-cancelling.
 
 Runs A and B in ABBA order (A B B A A B B A ...) so that slow drift (thermal,
