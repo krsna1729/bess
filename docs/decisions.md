@@ -2437,3 +2437,176 @@ paths are existing operator contracts.
 
 **Revisit when:** the RPC address or pidfile naming contract changes, or BESS
 adds an explicit multi-process DPDK sharing mode.
+
+## D-032 The session vertical slice: ExactMatch → ActionTable → Meter → Router as one transactional graph
+
+**Status:** accepted (2026-09-29).
+**Code:**
+
+- `core/modules/action_table.{h,cc}`, `core/modules/meter.{h,cc}`,
+  `core/modules/router.{h,cc}`;
+- `core/modules/exact_match.{h,cc}` (action mode), `core/route/router.{h,cc}`
+  (`LookupNextHop`/`LookupNextHops`, `Release`), `core/route/route_table.h`
+  (`RouteErrno`);
+- `core/dataplane/transaction_engine.{h,cc}` (references bound when their
+  resource registers, `ReleaseForTeardown`);
+- tests: `core/modules/session_pipeline_test.cc`,
+  `core/dataplane/transaction_engine_test.cc` (two registration tests),
+  `bessctl/module_tests/session_pipeline.py`.
+
+**Context.** D-021's acceptance matrix asked for "an in-process ExactMatch →
+Action → Meter → Router pipeline". The substrates were landed (K5's MeterSet,
+K2's SlotTable, K7's Router) but no module exposed them, and ExactMatch could
+only name an output gate: a session -- the rule that selects it, the action it
+names, the meter that polices it, the next hop it forwards to and the route to
+that hop -- could not be one transaction, which is the shape OMEC's
+`pfcpiface` needs.
+
+Two engine gaps surfaced while building it:
+
+- **Registration order.** A resource's declared references had to be
+  registered first. The desired-state planner creates modules in *name order*
+  (`Normalize()` sorts them), so a referrer module could never be guaranteed
+  to come after its referent: the graph must not depend on creation order.
+- **Teardown order.** `Unregister()` refuses while another registered resource
+  declares this one, or while live keys reference others' keys. A module
+  destroyed before its referrer therefore could not release its resources, and
+  a module with live keys that name another module's keys could not either --
+  so destroying a live pipeline depended on the order modules are destroyed
+  in (also name order). Every module's `DeInit()` would have to CHECK-fail.
+
+**Decision.**
+
+- **ExactMatch gains an action mode** (`ExactMatchArg.action_resource`). A rule
+  then carries an `action_id` (not a `gate`); a match writes the action id
+  into the `action_id` metadata attribute and leaves on output gate 0, a miss
+  takes the default gate. The rules resource declares a reference to the
+  action table's resource, so a rule naming a missing action is refused and
+  the actions publish before the rules. The mode is fixed at `Init()`; the
+  command, `set_runtime_config` and the RPC codec all refuse the field the
+  mode does not use.
+  Action-mode `add`, `delete`, `clear` and `set_runtime_config` write through
+  the transaction engine, not directly into the enrolled table: otherwise
+  the reference ledger would permit deleting an action still named by a
+  command-added rule. `get_initial_arg` retains `action_resource`.
+- **`ActionTable`** (`<module>/actions`) resolves an action id from
+  `action_id` metadata to `{meter id, next hop id}`, writes both to metadata
+  and forwards on gate 0. Its values reference the meter resource and the
+  next-hop resource by name (both required configuration), so one transaction
+  creates a session's meter, next hop, route, action and rule -- or none of
+  them -- and the engine refuses an action whose meter or next hop is missing
+  or the removal of one still named.
+- **`Meter`** (`<module>/meters`) polices with K5's `MeterSet`: the meter id
+  comes from `meter_id` metadata, the check is colour-blind on the packet's
+  byte count at one TSC reading per batch, and the packet leaves on the gate
+  that is its colour (0 green, 1 yellow, 2 red), so the policy is the graph --
+  leave red unconnected and red packets are dropped as deadends. Id 0 means
+  "no meter" and is green; an id that names no meter is dropped rather than
+  forwarded unmetered. Meters are shared (any worker may check one), and the
+  module is fail-closed when its attribute is unreadable.
+- **Meters are a resource with a deferred erase.** The desired state is a
+  `MeterSetBuilder`; a transaction edits a private clone of it
+  (`MeterSetBuilder::Clone()`, so unchanged meters keep their token state and
+  a rejected transaction leaves the live builder untouched) and publishes a
+  generation built from that clone. An erase is the two-step removal
+  SlotTable defines: absent to the control side at once, readable until the
+  removal cascade's stage runs, and unpublishable until then.
+  In a transaction that erases one meter and upserts another, the upsert's
+  generation still includes the retiring meter until its removal stage:
+  readers of the old action must not see that meter vanish early.
+- **`Router`** (`<module>/next_hops`, `<module>/routes`) is K7's `Router`,
+  enrolled in the engine (D-023). The packet path resolves the next-hop id
+  from metadata and forwards to the hop's egress; an id that names no next hop
+  and a neighbor that is not resolved are both dropped (what to do toward an
+  unresolved neighbor is the application's, and dropping never forwards on a
+  guess). L2 rewriting stays a separate module's job.
+- **Declared references bind when their resource registers.** `Register()`
+  keeps an unregistered declaration unresolved and binds it when that
+  resource appears; ranks are derived from the bound graph (at registration
+  and before each `Apply`). Until a reference is bound, a value naming it is
+  refused ("undeclared reference"), so no key can hold an outgoing reference
+  the ledger does not know about. A declared cycle has no publication order:
+  `Apply` refuses every transaction while one exists, naming it.
+- **`ReleaseForTeardown(names)`** is the teardown path for a module that may
+  be referenced or hold references: declarations naming a released resource
+  are left declared but unbound (a replacement module with the same name binds
+  them again), live keys may leave, and dangling references are logged.
+  Pending removal stages and retired destructors are still waited for -- they
+  capture the resource's tables. `Unregister()` keeps its strict semantics
+  (D-021/D-023); `bess::route::Router::Release()` and the four modules'
+  `DeInit()` use the teardown release.
+  Reconcile incoming counts from surviving resources' committed values on
+  release and on registration: releasing a referrer drops its outgoing counts,
+  while replacing a released referent restores counts held by surviving
+  referrers. A referrer whose referent is absent can be erased but cannot
+  publish a new value naming that absent resource.
+
+**Evidence:**
+
+- `session_pipeline_test.cc` (8 tests): one transaction creates a session
+  across the four modules with the modules created *referrer-first*, and the
+  ledger counts what each value names (the action names the meter; the route
+  and the action both name the next hop; the rule names the action; routes are
+  a root); each stage's decision is driven in process (the rule's value, the
+  action's meter and next hop, green then red from a 100-byte bucket, the
+  hop's egress); a rule naming a missing action, an action naming a missing
+  meter and an invalid profile are refused with nothing changed; a removal
+  transaction leaves the erased action readable and its meter id unpublishable
+  until the cascade runs (a reader that never quiesces holds it off), and both
+  ids come back after; `DestroyAllModules()` with the modules named so that
+  the *referent* is destroyed first leaves no registered resource.
+- `transaction_engine_test.cc`: `BindsDeclaredReferencesRegisteredLater`
+  (referrer first; an unbound reference is refused; the referent registering
+  binds it and one transaction may then change both; a teardown release
+  followed by a replacement with the same name binds again) and
+  `ReferenceCyclesAreRefused`.
+- The session regressions also cover action-mode commands and config restore
+  against the ledger, a meter upsert in the same transaction as a deferred
+  meter erase, 32-bit action ids above the gate width, an invalid route
+  prefix length and overlarge module capacities rejected before narrowing.
+- `transaction_engine_test.cc`: `RebindRecountsSurvivingReferences`
+  checks an orphaned referrer can be erased and surviving references are
+  recounted at rebind; `TeardownReleaseAcceptsDuplicateNames` checks repeated
+  names cannot release the same resource twice.
+- `bessctl/module_tests/session_pipeline.py` (4 tests) against a live daemon
+  with unix-socket ports: the ActionTable and the ExactMatch are created
+  *before* the modules whose resources they name (the declaration binds when
+  it registers), one `ApplyTransaction` creates the session and two 60-byte
+  packets of it are policed (the first reaches the next hop's egress port,
+  the second does not); a miss and a session with no next hop are dropped;
+  removing a meter an action still names is refused, while removing the whole
+  session in one transaction applies and the session's packets are then
+  dropped; transactions create and remove rules under live traffic.
+- **No regression in what the slice touched:** against a live daemon,
+  `iplookup` (4), `exact_match` (8), `wildcard_match` (10) and
+  `dataplane_transactions` (3) pass, `module_integration` (every module test
+  file) passes, and the full Meson suite passes (116 tests plus the benchmark
+  and plugin suites; two environment-affected runs were re-verified green).
+
+**Recorded from the live slice: duplicate resume recomputes metadata while traffic runs.**
+
+- The demo is loaded with `bessctl run file`. Its runner pauses before
+  executing an empty-pipeline script, then unconditionally calls
+  `resume_all()` in `_do_run_file()`'s `finally` block. The script also called
+  `bess.resume_all()` itself. `ControlPlane::ResumeAll()` runs global hooks
+  even when workers are already running; the `SetupMetadata` hook rewrites
+  metadata offsets without first pausing those workers.
+- **Reproduction:** a script with only the runner's final resume produced
+  zero `Deadends` at ExactMatch and ActionTable after three seconds. Adding an
+  explicit resume plus one second of traffic caused the runner's second
+  resume to produce 544 ExactMatch and 128 ActionTable `Deadends`; an
+  instrumented batch saw `action_id = -2`, `meter_id = -1`,
+  `next_hop_id = 4`.
+- **Fix:** the demo now leaves workers paused through module creation,
+  connection and transaction setup, then lets `run file` perform the single
+  resume after the complete graph exists. Its verification run showed zero
+  ExactMatch/ActionTable deadends. Do not call `resume_all()` inside a
+  `run file` script. The generic `ResumeAll()` behavior remains a correctness
+  hazard for callers that invoke it while workers are already running.
+
+**Deferred:** L2 rewriting in the Router module (a `Rewrite` reading the hop's
+addresses composes today); a per-color drop/queue policy for unresolved
+neighbors; worker-exclusive meters (K5 supports them; the module cannot verify
+the placement they need); `ExactMatch`'s `Clear()` and a bulk erase for an
+enrolled router; trimming `MeterSetBuilder::Clone()`'s O(capacity) copy per
+transaction.

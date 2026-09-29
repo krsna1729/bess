@@ -258,12 +258,13 @@ class Resource {
     std::vector<Reference> previous_references;
   };
 
-  // `references`: the resources this one's values may refer to. They must be
-  // registered first (so the graph is acyclic by construction), and the
-  // engine derives the publication order from them: a resource ranks one
-  // above the highest resource it may reference. A value naming a resource
-  // not declared here is refused. (Caller-assigned ranks could be wrong; a
-  // declared graph cannot be.)
+  // `references`: the resources this one's values may refer to. The engine
+  // derives the publication order from them: a resource ranks one above the
+  // highest resource it may reference. A value naming a resource not declared
+  // here is refused. (Caller-assigned ranks could be wrong; a declared graph
+  // cannot be.) A declared name may register later than this resource -- the
+  // reference is bound when it appears, so module creation order does not
+  // decide the graph -- and until it is bound a value naming it is refused.
   explicit Resource(std::string name, std::vector<std::string> references = {})
       : name_(std::move(name)), declared_(std::move(references)) {}
   virtual ~Resource() = default;
@@ -298,6 +299,16 @@ class Resource {
   virtual std::vector<Reference> ReferencesOf(const ResourceKey &) const {
     return {};
   }
+  // Enumerates references held by all committed values. Called only when
+  // registrations change, to reconcile the ledger after order-independent
+  // teardown and rebinding. Resources that declare dependencies and keep
+  // values must implement this; independent resources need no extra API.
+  virtual void VisitReferences(
+      const std::function<void(const Reference &)> &) const {
+    CHECK(declared_.empty() || LiveCount() == 0)
+        << "a populated resource with dependencies must visit its references";
+  }
+
 
   // Validates `op` and does all its fallible work (decoding, allocation,
   // capacity), leaving nothing visible. Called once per operation, in

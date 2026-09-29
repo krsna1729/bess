@@ -117,12 +117,19 @@ class TransactionEngine {
   TransactionEngine(const TransactionEngine &) = delete;
   TransactionEngine &operator=(const TransactionEngine &) = delete;
 
-  // Registers `resource` (not owned; it must outlive its registration) and
-  // derives its rank from its declared references, which must already be
-  // registered. Refused: a taken name, an undeclared or unregistered
-  // dependency, a self-dependency, or a populated resource that may
-  // reference others (its existing references would be missing from the
+  // Registers `resource` (not owned; it must outlive its registration).
+  // Refused: a taken name, a self-dependency, or a populated resource that
+  // may reference others (its existing references would be missing from the
   // ledger).
+  //
+  // A declared reference to a resource that is not registered yet is kept
+  // unresolved and bound when that resource registers: modules are created in
+  // an order the graph does not control (the desired-state planner creates
+  // them by name), so a referrer may legitimately appear before its referent.
+  // Until the reference is bound, a transaction value that names it is
+  // refused ("undeclared reference"), so no key can hold an outgoing
+  // reference the ledger does not know about. Ranks are derived from the
+  // bound graph before each Apply.
   std::expected<void, std::string> Register(Resource *resource);
 
   // Refused while: another registered resource declares this one as a
@@ -139,6 +146,27 @@ class TransactionEngine {
   // (routes and the next hops they name) may leave together with their
   // keys: their references are all inside the group. D-023.
   std::expected<void, std::string> Unregister(
+      std::span<const std::string> names);
+
+  // Teardown release: a module being destroyed hands its resources back while
+  // the module graph is being disconnected around it, so the order modules
+  // are destroyed in (the planner's, by name) must not decide whether
+  // teardown works. Same as Unregister() except two checks that only make
+  // sense while the resource stays in a live graph:
+  //
+  //  - a declaration naming a released resource is left declared but unbound
+  //    (so a replacement module with the same name binds it again, and until
+  //    then a value naming it is refused as undeclared);
+  //  - a resource may leave with live keys, and with its keys still named by
+  //    other resources' live keys: those references become dangling and are
+  //    logged. Nothing may resolve through the released table any more (the
+  //    graph edges that reached it are gone), and the ledger no longer counts
+  //    its keys.
+  //
+  // What still blocks: pending removal steps and retired objects not yet
+  // destroyed (they capture the resource's tables), as for Unregister().
+  // Missing names are ignored: releasing is idempotent.
+  std::expected<void, std::string> ReleaseForTeardown(
       std::span<const std::string> names);
 
   Result Apply(std::span<const Op> ops,
@@ -165,6 +193,20 @@ class TransactionEngine {
   Result Reject(size_t n_ops, size_t failed, std::string error) const;
   size_t ReclaimRetiredLocked();
 
+  struct Registration;
+
+  // Binds `reg`'s unresolved references to newly registered resources, and
+  // derives every rank from the bound graph (a referrer ranks one above the
+  // highest resource it may reference). Cheap and idempotent; called when a
+  // registration changes the graph and before each Apply.
+  void RebindDependenciesLocked(Registration &reg);
+  void RecomputeRanksLocked();
+  // Registration/teardown are rare; rebuild counts from the live values
+  // rather than keep references to a removed registration or duplicate the
+  // outgoing ledger on every transaction.
+  void RebuildIncomingLocked();
+
+
   // Hash maps keyed by strings, looked up by string_view without a copy.
   struct StringHash {
     using is_transparent = void;
@@ -179,8 +221,10 @@ class TransactionEngine {
   // Everything the engine keeps about one registered resource.
   struct Registration {
     Resource *resource = nullptr;
-    // Its declared references, resolved once at registration.
+    // Its declared references that are bound (the referent is registered).
     std::vector<std::pair<std::string, Registration *>> deps;
+    // Declared references whose resource has not registered yet.
+    std::vector<std::string> unresolved;
     // References to its keys held by other resources' values: key -> count.
     StringMap<size_t> incoming;
     // Retired objects of it handed to RCU and not yet destroyed.
@@ -244,6 +288,12 @@ class TransactionEngine {
   size_t deferred_objects_ = 0;
   uint64_t generation_ = 0;
   Scratch scratch_;
+  // Ranks need deriving from the bound dependency graph (a registration
+  // changed it, or a reference bound late).
+  bool ranks_dirty_ = false;
+  // The bound graph contains a cycle: no publication order exists, so Apply
+  // refuses every transaction until the graph changes (a registration bug).
+  bool reference_cycle_ = false;
 };
 
 }  // namespace dataplane

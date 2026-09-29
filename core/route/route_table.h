@@ -31,6 +31,7 @@
 #define BESS_ROUTE_ROUTE_TABLE_H_
 
 #include <atomic>
+#include <cerrno>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -68,6 +69,24 @@ enum class RouteError : uint8_t {
 };
 
 const char *RouteErrorName(RouteError error);
+
+// The errno a module reports for a route error (the command/RPC error model).
+inline int RouteErrno(RouteError error) {
+  switch (error) {
+    case RouteError::kTableFull:
+      return ENOSPC;
+    case RouteError::kNotFound:
+      return ENOENT;
+    case RouteError::kBackendFailure:
+      return EIO;
+    case RouteError::kNextHopInUse:
+    case RouteError::kNextHopRetiring:
+    case RouteError::kEnrolled:
+      return EBUSY;
+    default:
+      return EINVAL;
+  }
+}
 
 // A validated IPv4 prefix, address in host byte order (`be32_t::value()`).
 class Ipv4Prefix {
@@ -148,6 +167,18 @@ class LpmRouteTable {
   std::optional<uint32_t> Find(Ipv4Prefix prefix) const;
   size_t size() const;
   const Config &config() const noexcept { return config_; }
+  // Control-side enumeration, with the same writer lock as Find().
+  template <typename Fn>
+  void ForEach(Fn &&fn) const {
+    std::lock_guard<std::mutex> lock(writer_mutex_);
+    if (default_) {
+      fn(*Ipv4Prefix::Make(0, 0), *default_);
+    }
+    for (const auto &[prefix, value] : rules_) {
+      fn(prefix, value);
+    }
+  }
+
 
   // What readers get today for the addresses of `prefix` that no longer
   // rule covers: the value of the longest rule strictly containing it, else
@@ -277,6 +308,13 @@ class RouteTable {
     return v ? std::optional<Value>(Wrap(*v)) : std::nullopt;
   }
   size_t size() const { return impl_->size(); }
+  template <typename Fn>
+  void ForEach(Fn &&fn) const {
+    impl_->ForEach([&](Ipv4Prefix prefix, uint32_t value) {
+      fn(prefix, Wrap(value));
+    });
+  }
+
 
   class View {
    public:

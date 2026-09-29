@@ -104,6 +104,20 @@ class MaskedRuleResource final : public dataplane::Resource {
     return rule ? references_(Value{rule->priority, rule->result})
                 : std::vector<dataplane::Reference>{};
   }
+  void VisitReferences(
+      const std::function<void(const dataplane::Reference &)> &visit) const
+      override {
+    if (!references_) {
+      return;
+    }
+    table_()->ForEach([&](ConstBytes, ConstBytes,
+                          const ConcurrentMaskedTable::Rule &rule) {
+      for (const auto &ref : references_(Value{rule.priority, rule.result})) {
+        visit(ref);
+      }
+    });
+  }
+
 
   std::expected<Reservation, std::string> Reserve(
       const dataplane::Op &op) override {

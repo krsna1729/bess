@@ -42,6 +42,7 @@
 #include <string>
 #include <vector>
 
+#include "dataplane/batch_stages.h"
 #include "dataplane/resource.h"
 #include "dataplane/slot_table.h"
 #include "dataplane/strong_id.h"
@@ -180,8 +181,23 @@ class Router {
   std::expected<void, std::string> Enroll(dataplane::TransactionEngine &engine);
   bool enrolled() const noexcept { return engine_ != nullptr; }
 
+  // Releases both resources for teardown, tolerating a referrer that is still
+  // registered and live keys (the graph is being disconnected around the
+  // router): the owning module calls this from DeInit(), because the order
+  // modules are destroyed in must not decide whether a pipeline can be torn
+  // down. The destructor's own path stays strict (D-023) for direct users.
+  std::expected<void, std::string> Release();
+
   const std::string &next_hops_resource() const { return next_hops_name_; }
   const std::string &routes_resource() const { return routes_name_; }
+  // The registered resources while enrolled (null otherwise), so the owning
+  // module can attach the RPC's typed codecs to them (D-025).
+  dataplane::Resource *next_hops_resource_object() const noexcept {
+    return next_hops_res_.get();
+  }
+  dataplane::Resource *routes_resource_object() const noexcept {
+    return routes_res_.get();
+  }
   static dataplane::ResourceKey RouteKey(Ipv4Prefix prefix) {
     return dataplane::EncodeKey(uint64_t{prefix.addr()} << 8 |
                                 prefix.length());
@@ -232,6 +248,37 @@ class Router {
     const auto id = routes_->Read().Lookup(dst);
     std::atomic_thread_fence(std::memory_order_acquire);
     return id ? next_hops_.Lookup(*id) : nullptr;
+  }
+
+  // The next hop an id names, or nullptr for an invalid, out-of-range or
+  // removed one. Valid until the calling worker's next quiescent state. This
+  // is the lookup a session pipeline makes when the action it matched carries
+  // a next-hop id instead of a destination address.
+  const NextHop *LookupNextHop(NextHopId id) const noexcept {
+    return next_hops_.Lookup(id);
+  }
+
+  // Resolves ids to their next hops: bit i of the result is set where
+  // `hops[i]` was written; other positions are untouched. Resolve stage
+  // first, so a batch's next-hop lines are in flight together (K4.6).
+  uint64_t LookupNextHops(std::span<const NextHopId> ids,
+                          std::span<const NextHop *> hops) const noexcept {
+    promise(ids.size() == hops.size());
+    uint64_t mask = 0;
+    dataplane::RunStages(
+        ids.size(),
+        [&](size_t i) {
+          hops[i] = next_hops_.Lookup(ids[i]);
+          if (hops[i] != nullptr) {
+            dataplane::Prefetch(hops[i]);
+          }
+        },
+        [&](size_t i) {
+          if (hops[i] != nullptr) {
+            mask |= uint64_t{1} << i;
+          }
+        });
+    return mask;
   }
 
  private:

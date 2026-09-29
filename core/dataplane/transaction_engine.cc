@@ -95,18 +95,17 @@ std::expected<void, std::string> TransactionEngine::Register(
   }
   auto reg = std::make_unique<Registration>();
   reg->resource = resource;
-  int rank = 0;
   for (const std::string &dep : resource->declared_references()) {
     if (dep == resource->name()) {
       return std::unexpected("resource '" + dep + "' cannot reference itself");
     }
     auto it = resources_.find(dep);
     if (it == resources_.end()) {
-      return std::unexpected("resource '" + resource->name() +
-                             "' references '" + dep +
-                             "', which is not registered (register it first)");
+      // Its resource has not registered yet: bound when it does, so module
+      // creation order (the planner's, by name) cannot decide the graph.
+      reg->unresolved.push_back(dep);
+      continue;
     }
-    rank = std::max(rank, it->second->resource->rank() + 1);
     reg->deps.emplace_back(dep, it->second.get());
   }
   if (!resource->declared_references().empty() && resource->LiveCount() != 0) {
@@ -114,10 +113,86 @@ std::expected<void, std::string> TransactionEngine::Register(
                            "' is populated and may reference others: its "
                            "existing references are unknown to the engine");
   }
-  resource->rank_ = rank;
   resource->registration_ = reg.get();
+  Registration *const registered = reg.get();
   resources_.emplace(resource->name(), std::move(reg));
+  // Everything that declared this name binds to it now.
+  for (auto &[name, other] : resources_) {
+    if (other.get() != registered) {
+      RebindDependenciesLocked(*other);
+    }
+  }
+  RebuildIncomingLocked();
+  ranks_dirty_ = true;
+  // Ranks are derived here too, not only before Apply: a resource's rank is
+  // then meaningful as soon as the graph settles, which is what the engine's
+  // own tests and any introspection read.
+  RecomputeRanksLocked();
   return {};
+}
+
+void TransactionEngine::RebindDependenciesLocked(Registration &reg) {
+  for (size_t i = 0; i < reg.unresolved.size();) {
+    auto it = resources_.find(std::string_view(reg.unresolved[i]));
+    if (it == resources_.end()) {
+      i++;
+      continue;
+    }
+    reg.deps.emplace_back(reg.unresolved[i], it->second.get());
+    reg.unresolved.erase(reg.unresolved.begin() +
+                         static_cast<std::ptrdiff_t>(i));
+  }
+}
+
+void TransactionEngine::RebuildIncomingLocked() {
+  for (auto &[name, reg] : resources_) {
+    reg->incoming.clear();
+  }
+  for (const auto &[name, reg] : resources_) {
+    reg->resource->VisitReferences([&](const Reference &ref) {
+      Registration *target = Resolve(*reg, ref.resource);
+      if (target != nullptr) {
+        ++target->incoming[ref.key];
+      }
+    });
+  }
+}
+
+void TransactionEngine::RecomputeRanksLocked() {
+  if (!ranks_dirty_) {
+    return;
+  }
+  ranks_dirty_ = false;
+  for (auto &[name, reg] : resources_) {
+    reg->resource->rank_ = 0;
+  }
+  // Relaxation over the bound graph: in a DAG every rank settles within
+  // one pass per resource, so a rank still moving after that is a cycle.
+  bool changed = false;
+  for (size_t pass = 0; pass <= resources_.size(); pass++) {
+    changed = false;
+    for (auto &[name, reg] : resources_) {
+      int rank = 0;
+      for (const auto &[dep_name, dep] : reg->deps) {
+        rank = std::max(rank, dep->resource->rank_ + 1);
+      }
+      if (rank != reg->resource->rank_) {
+        reg->resource->rank_ = rank;
+        changed = true;
+      }
+    }
+    if (!changed) {
+      break;
+    }
+  }
+  if (changed) {
+    reference_cycle_ = true;
+    LOG(ERROR) << "registered resources declare a reference cycle: no "
+                  "publication order exists, so transactions are refused "
+                  "until the graph changes";
+  } else {
+    reference_cycle_ = false;
+  }
 }
 
 std::expected<void, std::string> TransactionEngine::Unregister(
@@ -144,10 +219,16 @@ std::expected<void, std::string> TransactionEngine::Unregister(
   };
   for (Registration *reg : group) {
     const std::string &name = reg->resource->name();
-    // Nothing outside the group may reference it.
+    // Nothing outside the group may reference it. A resource that declares
+    // the name but has not bound it (its resource was never registered)
+    // counts: the declaration is what the ledger would use.
     bool referenced_in_group = false;
     for (const auto &[other_name, other] : resources_) {
-      if (Resolve(*other, name) == nullptr) {
+      const bool declares =
+          Resolve(*other, name) != nullptr ||
+          std::find(other->unresolved.begin(), other->unresolved.end(),
+                    name) != other->unresolved.end();
+      if (!declares) {
         continue;
       }
       if (!in_group(other.get())) {
@@ -200,6 +281,77 @@ std::expected<void, std::string> TransactionEngine::Unregister(
     auto res = resources_.find(std::string_view(reg->resource->name()));
     resources_.erase(res);
   }
+  return {};
+}
+
+std::expected<void, std::string> TransactionEngine::ReleaseForTeardown(
+    std::span<const std::string> names) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // Pending removal steps capture these resources' tables, and objects handed
+  // to RCU are destroyed by code in the resource's module: neither may outlive
+  // the release (as for Unregister).
+  ReclaimRetiredLocked();
+  domain_.ReclaimReady();
+
+  std::vector<Registration *> group;
+  for (const std::string &name : names) {
+    auto res = resources_.find(std::string_view(name));
+    if (res == resources_.end()) {
+      continue;  // already released, or never registered
+    }
+    if (std::find(group.begin(), group.end(), res->second.get()) ==
+        group.end()) {
+      group.push_back(res->second.get());
+    }
+  }
+  auto in_group = [&](const Registration *r) {
+    return std::find(group.begin(), group.end(), r) != group.end();
+  };
+  for (Registration *reg : group) {
+    const std::string &name = reg->resource->name();
+    if (reg->pending_removals != 0) {
+      return std::unexpected("removals of '" + name +
+                             "' are still waiting for readers");
+    }
+    if (const size_t left = reg->outstanding.load(std::memory_order_acquire);
+        left != 0) {
+      return std::unexpected(std::to_string(left) +
+                             " retired object(s) of '" + name +
+                             "' are still waiting for readers");
+    }
+  }
+
+  // Declarations naming a released resource stay declared but unbound.
+  // Surviving values may temporarily name missing keys; rebuilding counts
+  // after the release, and again when a replacement registers, keeps their
+  // references in the ledger without retaining the old resource's lifetime.
+  for (Registration *reg : group) {
+    const std::string &name = reg->resource->name();
+    if (!reg->incoming.empty()) {
+      LOG(WARNING) << "resource '" << name << "' is released with "
+                   << reg->incoming.size()
+                   << " key(s) still referenced: those references are now "
+                      "dangling (they resolve to nothing)";
+    }
+    for (auto &[other_name, other] : resources_) {
+      if (in_group(other.get())) {
+        continue;
+      }
+      const size_t removed = std::erase_if(
+          other->deps, [&](const auto &dep) { return dep.first == name; });
+      if (removed != 0 &&
+          std::find(other->unresolved.begin(), other->unresolved.end(),
+                    name) == other->unresolved.end()) {
+        other->unresolved.push_back(name);
+      }
+    }
+  }
+  for (Registration *reg : group) {
+    reg->resource->registration_ = nullptr;
+    resources_.erase(resources_.find(std::string_view(reg->resource->name())));
+  }
+  RebuildIncomingLocked();
+  ranks_dirty_ = true;
   return {};
 }
 
@@ -292,7 +444,9 @@ TransactionEngine::Result TransactionEngine::Reject(size_t n_ops,
   result.outcome = Outcome::kRejected;
   result.generation = generation_;
   result.ops.resize(n_ops);
-  result.ops[failed] = OpResult{OpStatus::kFailed, std::move(error)};
+  if (failed < n_ops) {
+    result.ops[failed] = OpResult{OpStatus::kFailed, std::move(error)};
+  }
   return result;
 }
 
@@ -300,7 +454,16 @@ TransactionEngine::Result TransactionEngine::Apply(
     std::span<const Op> ops, std::optional<uint64_t> expected_generation) {
   std::lock_guard<std::mutex> lock(mutex_);
   ReclaimRetiredLocked();  // frees ids whose removal has completed
+  // Ranks come from the bound dependency graph, which registrations may have
+  // changed since the last Apply (a referent registering after its referrer).
+  RecomputeRanksLocked();
   const size_t n = ops.size();
+
+  if (reference_cycle_) {
+    return Reject(n, 0,
+                  "registered resources declare a reference cycle; the engine "
+                  "cannot order their publication");
+  }
 
   if (expected_generation && *expected_generation != generation_) {
     Result result;
@@ -377,6 +540,14 @@ TransactionEngine::Result TransactionEngine::Apply(
       r->touched = false;
       r->resource->EndTransaction();
     }
+    for (const Delta &d : w.deltas) {
+      if (d.change > 0) {
+        auto it = d.target->incoming.find(d.key);
+        if (it != d.target->incoming.end() && it->second == 0) {
+          d.target->incoming.erase(it);
+        }
+      }
+    }
   });
 
   Resource::Footprint footprint;  // summed over the transaction
@@ -405,8 +576,9 @@ TransactionEngine::Result TransactionEngine::Apply(
     if (r.existed) {
       for (const Reference &ref : r.previous_references) {
         Registration *target = Resolve(*reg, ref.resource);
-        DCHECK(target != nullptr) << "a stored value names an undeclared "
-                                     "resource";
+        // A teardown release can leave a live referrer naming an unbound
+        // resource. Erasing that referrer is allowed; its old reference has
+        // no registered target whose incoming count needs decrementing.
         if (target != nullptr) {
           w.deltas.push_back(Delta{target, ref.key, -1, kNone});
         }
@@ -515,9 +687,11 @@ TransactionEngine::Result TransactionEngine::Apply(
                         " is still referenced " + std::to_string(after) +
                         " time(s)");
     }
-    return Reject(n, d.added_by,
-                  "references missing " +
-                      Describe(d.target->resource->name(), d.key));
+    if (d.added_by != kNone) {
+      return Reject(n, d.added_by,
+                    "references missing " +
+                        Describe(d.target->resource->name(), d.key));
+    }
   }
 
   // -- commit bookkeeping, allocated before anything is visible -------------
@@ -547,12 +721,6 @@ TransactionEngine::Result TransactionEngine::Apply(
   retirer.after_.reserve(footprint.callbacks);
   retirer.removals_.reserve(footprint.removals);
   domain_.ReserveRetirements(footprint.retires);
-  // Ledger entries for new references, so publishing only updates counts.
-  for (const Delta &d : w.deltas) {
-    if (d.change > 0) {
-      d.target->incoming.try_emplace(std::string(d.key), 0);
-    }
-  }
   // The removal cascade's skeleton, from the declared removals: one stage
   // per rank, highest first, sized exactly.
   std::vector<int> stage_ranks;
@@ -577,6 +745,13 @@ TransactionEngine::Result TransactionEngine::Apply(
       cascade.stages[s_i].reserve(steps);
     }
     cascades_.reserve(cascades_.size() + 1);
+  }
+
+  // Ledger entries for new references, so publishing only updates counts.
+  for (const Delta &d : w.deltas) {
+    if (d.change > 0) {
+      d.target->incoming.try_emplace(std::string(d.key), 0);
+    }
   }
 
   // -- publish: from here on nothing may fail, and nothing allocates --------

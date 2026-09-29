@@ -27,12 +27,25 @@ stopping traffic.
    (module commands, the v2 control API). State that the packet path itself
    writes, such as learned flows or counters, is worker-owned instead
    (section 3).
-3. **Published state is never mutated in place, except where a structure is
+3. **Resolve metadata offsets per batch, and fail closed.**
+   `Module::Init()` registers metadata attributes; it does not assign
+   graph-relative offsets. `ComputeMetadataOffsets()` assigns offsets from the
+   connected graph.
+   `PauseAll()` stops workers but does not compute the layout. `ResumeAll()`
+   invokes `SetupMetadata` before `resume_all_workers()` but does not pause
+   workers itself. `bessctl run file` calls `resume_all()` in its `finally`
+   block. Do not call `resume_all()` inside the script: that starts workers;
+   the wrapper then runs `SetupMetadata` again while they can be reading the
+   offsets, which are rewritten in place (D-032). Keep workers quiescent for
+   layout computation. Check `bess::metadata::IsValidOffset()` and drop or
+   take a default path rather than reading byte 0; ActionTable, Meter and
+   Router fail closed and report invalid offsets from `OnEvent(PreResume)`.
+4. **Published state is never mutated in place, except where a structure is
    built for it.** `RcuPtr` generations are immutable once published. The
    exceptions are `ConcurrentExactTable` and `RouteTable`: DPDK designed them
    for one writer changing them in place under lock-free readers, and they
    are wired to the same grace periods (QSBR) as everything else.
-4. **Memory is freed only after a grace period.** Every structure hands
+5. **Memory is freed only after a grace period.** Every structure hands
    retired memory (old generations, deleted hash slots, freed LPM groups) to
    the runtime's single `RcuDomain`. The domain frees it once every worker has
    passed a quiescent point. Workers report one every 10 µs of scheduler
@@ -231,9 +244,15 @@ reference to something missing.
   action, an action's meter).
 - **Declared dependencies, not ranks:** a resource names, when constructed,
   the resources its values may reference (`SlotResource(name, table,
-  references_fn, {"meters"})`). They must be registered first; the engine
-  derives the publication order and refuses undeclared references. Upserts
-  publish referents first; erases remove referrers first.
+  references_fn, {"meters"})`). The engine derives the publication order from
+  the declarations and refuses undeclared references. Upserts publish
+  referents first; erases remove referrers first.
+- **A declared reference binds when its resource registers**, so module
+  creation order (the desired-state planner's, by name) does not decide the
+  graph. Until it binds, a value naming it is refused as an undeclared
+  reference -- no key can hold an outgoing reference the ledger does not know
+  about. A declared cycle has no publication order: `Apply` refuses until the
+  graph changes.
 - **Semantics:**
   - all or nothing, with every check and allocation done before anything
     is visible;
@@ -255,15 +274,19 @@ reference to something missing.
   references; a one-operation transaction costs about 307 ns against 44 ns
   for a direct write (P-core). Tables that do take part in references are
   written only through the engine.
+  `ExactMatch` in action mode uses the engine even for `add`, `delete`,
+  `clear` and `set_runtime_config`: a command bypassing it would not update
+  the rule-to-action reference ledger. Gate mode keeps direct writes.
 - **The runtime has one engine**, `runtime().transactions()`. Call
   `Apply()` under the control-plane lock, as module commands run: a
   module's own commands write the same tables.
 - **Modules taking part today:** ExactMatch registers its rules as
-  `<module>/rules` (key: the fields' bytes in order; value: the gate) from
-  `Init()` to `DeInit()`, so one transaction can change the rules of
+  `<module>/rules` (key: the fields' bytes in order; value: the gate -- or, in
+  action mode, the ActionId of the action the rule names) from `Init()` to
+  `DeInit()`, so one transaction can change the rules of
   several ExactMatch instances. Its table grows during prepare when a new
   key does not fit (`ExactRuleResource::Hooks::make_room`); pending keys
-  move to the new table with the rest. D-022.
+  move to the new table with the rest. D-022, D-032.
 - **WildcardMatch** registers its rules as `<module>/rules` (key: packed
   mask then packed value; value: `{priority, gate}`) through
   `MaskedRuleResource`. A rule being prepared sits in its tuple naming a
@@ -276,13 +299,37 @@ reference to something missing.
   (the direct setters refuse, `kEnrolled`). New routes are placed during
   prepare with the value their addresses already resolve to, so rte_lpm
   capacity is settled before anything is visible. A change costs
-  ~0.2-0.6 µs as a transaction against 0.06-0.2 µs direct. D-023.
-- **A module must `Unregister` its resources before destroying their
-  tables.** `Unregister` refuses (with the reason) while keys that may
-  reference others remain (a resource that references nothing may go with
-  its keys), keys are referenced, a registered resource depends on it, or
-  removal steps are pending; with workers paused, one call advances the
-  cascade.
+  ~0.2-0.6 µs as a transaction against 0.06-0.2 µs direct. D-023. The
+  `Router` module enrolls on `Init()` and releases on `DeInit()`; its packet
+  path resolves a next-hop id from metadata (D-032).
+- **ActionTable** registers `<module>/actions` (key: `EncodeKey(ActionId)`,
+  value: `{meter id, next hop id}`) and declares both the meter and the
+  next-hop resources: an action's value references them, so the engine orders
+  the meter and the next hop before the action, refuses an action naming a
+  missing one, and refuses the removal of one still named. D-032.
+- **Meter** registers `<module>/meters` (key: `EncodeKey(MeterId)`, value: a
+  profile specification) over a `MeterSetBuilder`: a transaction edits a
+  private clone of the desired state, so unchanged meters keep their token
+  state and a rejected transaction leaves the live builder alone. Erases are
+  the two-step removal SlotTable defines -- readable until the removal
+  cascade reaches them, unpublishable until then. D-032.
+  An erased meter stays in generations published by other upserts of the
+  same transaction until its removal stage; an old action may still name it.
+- **A module must release its resources before destroying their tables.**
+  `Unregister` refuses (with the reason) while keys that may reference others
+  remain (a resource that references nothing may go with its keys), keys are
+  referenced, a registered resource depends on it, or removal steps are
+  pending; with workers paused, one call advances the cascade. A module that
+  may be referenced *or* hold references -- the four in the session slice --
+  uses `ReleaseForTeardown` from `DeInit()` instead: declarations naming a
+  released resource are left declared but unbound (a replacement module with
+  the same name binds them again), live keys may leave, and dangling
+  references are logged. Teardown then does not depend on the order modules
+  are destroyed in, which the planner decides by name.
+  Registration and teardown rebuild incoming counts from surviving
+  resources' committed references (`VisitReferences`), so a same-name
+  replacement binds without losing surviving referrers or inheriting
+  references from released ones.
 - **`kBusy`:** when readers are slow to quiesce and reclamation is behind, a
   transaction is refused retriably instead of waiting.
 - **Declare each operation's footprint** in `Reserve()` (`Footprint{retires,
@@ -298,7 +345,9 @@ reference to something missing.
 - Code: `core/dataplane/{resource.h, transaction_engine.{h,cc},
   slot_resource.h}`, `core/classifier/exact_rule_resource.h`,
   `core/classifier/masked_rule_resource.h`, `core/modules/exact_match.cc`,
-  `core/modules/wildcard_match.cc`, `core/route/router.cc`; D-020 to D-024.
+  `core/modules/wildcard_match.cc`, `core/modules/action_table.cc`,
+  `core/modules/meter.cc`, `core/modules/router.cc`, `core/route/router.cc`;
+  D-020 to D-024, D-032.
 
 ### `MeterSet` (metering)
 

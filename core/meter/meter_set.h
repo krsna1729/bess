@@ -226,8 +226,15 @@ class MeterSetBuilder {
   // Snapshots the current desired state as an immutable generation. No state
   // is allocated or copied, only references.
   std::unique_ptr<const MeterSet> Build() const;
+  // A transaction-private edit copy: desired entries are copied, while
+  // unchanged meter states, profiles, and slabs remain shared with published
+  // generations. Only the control plane may call this.
+  std::unique_ptr<MeterSetBuilder> Clone() const;
 
  private:
+  struct CloneTag {};
+  MeterSetBuilder(CloneTag, const MeterSetBuilder &other);
+
   struct Entry {
     std::shared_ptr<const MeterProfile> profile;
     std::shared_ptr<MeterState> state;

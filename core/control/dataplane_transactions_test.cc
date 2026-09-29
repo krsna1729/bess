@@ -296,6 +296,14 @@ TEST_F(DataplaneTransactionsTest, UndecodableOperationsRejectTheTransaction) {
   expect_rejected(op, "should have 2 fields");
   expect_rejected(ExactRule("em0", 2, 2, MAX_GATES + 5), "invalid gate");
   op = ExactRule("em0", 2, 2, 2);
+  {
+    bess::pb::ExactMatchRuleValue val;
+    val.set_gate(2);
+    val.set_action_id(5);
+    Pack(op.mutable_value(), val);
+  }
+  expect_rejected(op, "'action_id' needs an 'action_resource'");
+  op = ExactRule("em0", 2, 2, 2);
   op.set_erase(true);
   expect_rejected(op, "takes no value");
   // The engine's own rejection comes through the same way.

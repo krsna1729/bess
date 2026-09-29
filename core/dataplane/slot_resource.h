@@ -84,6 +84,21 @@ class SlotResource final : public Resource {
     const T *current = table_.Current(id);
     return current ? references_(*current) : std::vector<Reference>{};
   }
+  void VisitReferences(
+      const std::function<void(const Reference &)> &visit) const override {
+    if (!references_) {
+      return;
+    }
+    for (size_t i = 1; i <= table_.capacity(); i++) {
+      const T *value = table_.Current(Id(static_cast<typename Id::rep_type>(i)));
+      if (value != nullptr) {
+        for (const auto &ref : references_(*value)) {
+          visit(ref);
+        }
+      }
+    }
+  }
+
 
   std::expected<Reservation, std::string> Reserve(const Op &op) override {
     Id id;

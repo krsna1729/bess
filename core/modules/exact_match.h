@@ -56,11 +56,29 @@ using google::protobuf::RepeatedPtrField;
 // longer depends on utils/exact_match_table.h, which hash_lb still uses.)
 using Error = std::pair<int, std::string>;
 
+// Two modes, fixed at Init():
+//
+//  - gate mode (the default): a rule's value is the output gate a matching
+//    packet leaves on.
+//  - action mode (`action_resource` set): a rule's value is the ActionId of a
+//    per-session action, which the packet path writes into the `action_id`
+//    metadata attribute and forwards on gate 0, so the graph continues into
+//    an ActionTable. The rules are then a resource that references the
+//    actions, and one transaction can create the session's meter, next hop,
+//    route, action and rule together (G1.2b). A miss still takes the default
+//    gate.
 class ExactMatch final : public Module {
  public:
   static const gate_idx_t kNumOGates = MAX_GATES;
 
+  // Where a match goes in action mode: the module's first output gate, which
+  // the graph connects to the ActionTable.
+  static constexpr gate_idx_t kActionGate = 0;
+
   static const Commands cmds;
+
+  // Whether rules name actions rather than gates (see the class comment).
+  bool action_mode() const noexcept { return action_mode_; }
 
   // Module-level limits, preserved from the legacy ExactMatchTable-based
   // implementation for protobuf API compatibility. The classifier library
@@ -76,10 +94,12 @@ class ExactMatch final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  // What ProcessBatch decides, without emitting: gates[i] is the output gate
-  // of packet i. The same code as the packet path, for tests and benchmarks
-  // that drive the module from a registered reader thread.
+  // Gate-mode decision without emitting, for tests and benchmarks driven
+  // from a registered reader thread. Action ids are not gate_idx_t values.
   void ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates) const;
+  // Action-mode matched ids; zero for a miss (no action to forward).
+  void ClassifyActionsBatch(bess::PacketBatch *batch,
+                            uint32_t *action_ids) const;
 
   std::string GetDesc() const override;
 
@@ -109,7 +129,8 @@ class ExactMatch final : public Module {
     // ExactMatchRuleFields: rule bytes are stored WITHOUT applying the
     // configured mask, while packet/metadata bytes ARE masked on extraction.
     std::vector<std::vector<uint8_t>> fields;
-    gate_idx_t gate;
+    // The gate the rule forwards to, or the action id it names (action mode).
+    uint64_t value;
   };
 
   // The configuration a batch runs against: the compiled extraction plan, the
@@ -162,8 +183,14 @@ class ExactMatch final : public Module {
   // physical offset (e.g. orphan reader, out of space).
   static constexpr size_t kInvalidOffset = static_cast<size_t>(-1);
 
+  // The packet path's per-batch decision, shared by ProcessBatch and
+  // ClassifyBatch: calls emit(i, value, hit) once per packet, in order, where
+  // `value` is the matched rule's value (a gate in gate mode, an action id in
+  // action mode) and `hit` says whether it matched. `emit` is inlined into
+  // each caller.
   template <typename Emit>
-  void Classify(bess::PacketBatch *batch, Emit &&emit) const;
+  void Classify(bess::PacketBatch *batch, const Generation &gen,
+                Emit &&emit) const;
 
   CommandResponse AddFieldOne(const bess::pb::Field &field,
                               const bess::pb::FieldData &mask, int idx);
@@ -171,7 +198,11 @@ class ExactMatch final : public Module {
   // count against the module's configured fields.
   Error RuleFieldsFromPb(const RepeatedPtrField<bess::pb::FieldData> &fields,
                          std::vector<std::vector<uint8_t>> *rule);
-  // Turns a command argument into a `Rule`, validating gate and fields.
+  // The value a rule command carries: the gate (gate mode) or the action id
+  // (action mode), refusing the field the mode does not use.
+  Error RuleValueFromPb(const bess::pb::ExactMatchCommandAddArg &arg,
+                        uint64_t *value) const;
+  // Turns a command argument into a `Rule`, validating value and fields.
   Error RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg, Rule *rule);
   // Replaces the published generation with `build(current)`, or leaves the
   // active one alone when the builder returns nullptr (with *err set). Runs
@@ -244,6 +275,12 @@ class ExactMatch final : public Module {
   };
   std::vector<FieldSpec> field_specs_;
   bool empty_masks_;  // mainly for GetInitialArg
+
+  // Action mode (see the class comment): rules name actions, and the packet
+  // path writes the matched action id into `action_id`.
+  bool action_mode_ = false;
+  std::string action_resource_;
+  int action_id_attr_ = -1;
 
   // Publication and reclamation (bess::rcu::RcuPtr + the runtime's RcuDomain):
   // one acquire load per batch on the data path, serialized rebuilds off it,

@@ -40,6 +40,7 @@
 #include "../utils/ip.h"
 
 using bess::route::Ipv4Prefix;
+using bess::route::RouteErrno;
 using bess::route::RouteError;
 
 static inline int is_valid_gate(gate_idx_t gate) {
@@ -57,19 +58,6 @@ const Commands IPLookup::cmds = {
      MODULE_CMD_FUNC(&IPLookup::CommandDelete), Command::THREAD_SAFE},
     {"clear", "EmptyArg", MODULE_CMD_FUNC(&IPLookup::CommandClear),
      Command::THREAD_SAFE}};
-
-static int RouteErrno(RouteError error) {
-  switch (error) {
-    case RouteError::kTableFull:
-      return ENOSPC;
-    case RouteError::kNotFound:
-      return ENOENT;
-    case RouteError::kBackendFailure:
-      return EIO;
-    default:
-      return EINVAL;
-  }
-}
 
 CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
   bess::route::LpmRouteTable::Config config;

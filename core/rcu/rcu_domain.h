@@ -30,17 +30,17 @@
 #ifndef BESS_RCU_RCU_DOMAIN_H_
 #define BESS_RCU_RCU_DOMAIN_H_
 
-#include <cstddef>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include <rte_rcu_qsbr.h>
-
-#include "control/control_error.h"
 
 namespace bess {
 namespace rcu {
@@ -58,6 +58,13 @@ struct RcuStats {
   uint64_t objects_reclaimed = 0;
   size_t pending_retired_objects = 0;
   GracePeriod oldest_pending_token = 0;
+};
+
+// RCU owns reader lifecycle errors; control code translates them at its
+// boundary rather than pulling control types into a dataplane primitive.
+struct ReaderRegistrationError {
+  int err;
+  std::string message;
 };
 
 // One dataplane reader domain per runtime (not one per module, table or
@@ -101,7 +108,7 @@ class RcuDomain {
   // offline until dataplane execution is about to resume, and unregisters when
   // it is done. Registering an already-registered id is an error; registering a
   // previously unregistered id is how a recreated worker comes back.
-  control::ControlResult<void> Register(ReaderId id);
+  std::expected<void, ReaderRegistrationError> Register(ReaderId id);
   void Unregister(ReaderId id);
 
   // Online readers participate in grace periods; offline readers do not, which

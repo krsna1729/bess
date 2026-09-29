@@ -110,6 +110,16 @@ class Router::RouteResource final : public dataplane::Resource {
     const auto hop = prefix ? Find(*prefix) : std::nullopt;
     return hop ? References(*hop) : std::vector<dataplane::Reference>{};
   }
+  void VisitReferences(
+      const std::function<void(const dataplane::Reference &)> &visit) const
+      override {
+    router_.routes_->ForEach([&](Ipv4Prefix, NextHopId hop) {
+      for (const auto &ref : References(hop)) {
+        visit(ref);
+      }
+    });
+  }
+
 
   std::expected<Reservation, std::string> Reserve(
       const dataplane::Op &op) override {
@@ -247,6 +257,22 @@ std::expected<void, std::string> Router::Enroll(
   engine_ = &engine;
   next_hops_res_ = std::move(hops);
   routes_res_ = std::move(routes);
+  return {};
+}
+
+std::expected<void, std::string> Router::Release() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (engine_ == nullptr) {
+    return {};  // not enrolled, or already released
+  }
+  const std::string names[] = {routes_name_, next_hops_name_};
+  auto released = engine_->ReleaseForTeardown(names);
+  if (!released) {
+    return released;
+  }
+  engine_ = nullptr;
+  next_hops_res_.reset();
+  routes_res_.reset();
   return {};
 }
 

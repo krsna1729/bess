@@ -69,6 +69,7 @@ message BPFCommandClearArg {
 message ExactMatchCommandAddArg {
   uint64 gate = 1; /// The gate to forward out packets that mach this rule.
   repeated FieldData fields = 2; /// The exact match values to check for
+  uint32 action_id = 3; /// The action this rule names (action mode only).
 }
 
 /**
@@ -384,7 +385,77 @@ message ExactMatchRuleKey {
 
 message ExactMatchRuleValue {
   uint64 gate = 1;
+  uint32 action_id = 2;
 }
+
+message ActionIdKey {
+  uint32 id = 1;
+}
+
+message ActionValue {
+  uint32 meter_id = 1;
+  uint32 next_hop_id = 2;
+}
+
+message MeterIdKey {
+  uint32 id = 1;
+}
+
+message SrTcmProfile {
+  uint64 committed_rate = 1;
+  uint64 committed_burst = 2;
+  uint64 excess_burst = 3;
+}
+
+message TrTcmProfile {
+  uint64 committed_rate = 1;
+  uint64 committed_burst = 2;
+  uint64 peak_rate = 3;
+  uint64 peak_burst = 4;
+}
+
+message TrTcmRfc4115Profile {
+  uint64 committed_rate = 1;
+  uint64 committed_burst = 2;
+  uint64 excess_rate = 3;
+  uint64 excess_burst = 4;
+}
+
+message MeterPolicyValue {
+  oneof profile {
+    SrTcmProfile sr_tcm = 1;
+    TrTcmProfile tr_tcm = 2;
+    TrTcmRfc4115Profile tr_tcm_rfc4115 = 3;
+  }
+}
+
+message RouterNextHopIdKey {
+  uint32 id = 1;
+}
+
+enum RouterNeighborState {
+  ROUTER_NEIGHBOR_STATE_UNSPECIFIED = 0;
+  ROUTER_NEIGHBOR_STATE_RESOLVED = 1;
+  ROUTER_NEIGHBOR_STATE_INCOMPLETE = 2;
+  ROUTER_NEIGHBOR_STATE_UNREACHABLE = 3;
+}
+
+message RouterNextHopValue {
+  uint32 egress_gate = 1;
+  RouterNeighborState neighbor = 2;
+  bytes dst_mac = 3;
+  bytes src_mac = 4;
+}
+
+message RouterRouteKey {
+  string ipv4 = 1;
+  uint32 prefix_length = 2;
+}
+
+message RouterRouteValue {
+  uint32 next_hop_id = 1;
+}
+
 
 message WildcardMatchRuleKey {
   repeated FieldData values = 1;
@@ -525,6 +596,7 @@ message EtherEncapArg {
 message ExactMatchArg {
   repeated Field fields = 1; ///A list of ExactMatch Fields
   repeated FieldData masks = 2; /// mask(i) corresponds to the mask for field(i)
+  string action_resource = 3; /// The ActionTable's actions resource: when set, rules name actions (their action_id) and a match goes to output gate 0 with the action id in packet metadata.
 }
 
 /**
@@ -1277,4 +1349,47 @@ message MplsPopArg {
  */
 message WorkerSplitArg {
   map<uint32, uint32> worker_gates = 1; // ogate -> worker mask
+}
+
+/**
+ * The Meter module polices packets against per-session meters (K5), with the
+ * meter set changed transactionally (G1.2b): the meter id comes from packet
+ * metadata, the meter runs colour-blind on the packet's byte count, and the
+ * packet leaves on the gate that is its colour -- 0 green, 1 yellow, 2 red.
+ * An id that names no meter is dropped; id 0 (no meter) is green.
+ *
+ * __Input Gates__: 1
+ * __Output Gates__: 3 (green, yellow, red)
+ */
+message MeterArg {
+  uint64 capacity = 1; /// Most meters this module's table holds (default 1024).
+}
+
+/**
+ * The ActionTable module holds per-session actions: an action id (which an
+ * ExactMatch rule in action mode names) resolves to a meter id and a next-hop
+ * id, both written to packet metadata for the modules downstream. Actions,
+ * their meters and their next hops are one transactional resource graph.
+ *
+ * __Input Gates__: 1
+ * __Output Gates__: 1
+ */
+message ActionTableArg {
+  uint64 capacity = 1; /// Most actions this module's table holds (default 1024).
+  string meters = 2; /// Resource name of the Meter module's meters.
+  string next_hops = 3; /// Resource name of the Router module's next hops.
+}
+
+/**
+ * The Router module forwards a packet to the egress its next-hop id (from
+ * packet metadata) names. Routes and next hops are the resource pair D-023
+ * describes, changed together or not at all.
+ *
+ * __Input Gates__: 1
+ * __Output Gates__: many (the next hop's egress)
+ */
+message RouterArg {
+  uint64 max_routes = 1; /// Most routes (default 4096).
+  uint64 max_tbl8s = 2; /// Most rte_lpm tbl8 groups (default 256).
+  uint64 max_next_hops = 3; /// Most next hops (default 4096).
 }

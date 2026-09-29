@@ -146,6 +146,19 @@ class ExactRuleResource final : public dataplane::Resource {
     const std::optional<uint64_t> value = Find(key);
     return value ? references_(*value) : std::vector<dataplane::Reference>{};
   }
+  void VisitReferences(
+      const std::function<void(const dataplane::Reference &)> &visit) const
+      override {
+    if (!references_) {
+      return;
+    }
+    table_().ForEach([&](ConstBytes, uint64_t value) {
+      for (const auto &ref : references_(value)) {
+        visit(ref);
+      }
+    });
+  }
+
 
   std::expected<Reservation, std::string> Reserve(
       const dataplane::Op &op) override {

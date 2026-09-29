@@ -33,7 +33,10 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <map>
+#include <limits>
 #include <string>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -106,6 +109,25 @@ bool ConvertMask(uint64_t raw, int size, bool is_packet,
   out->resize(static_cast<size_t>(size));
   std::memcpy(out->data(), &converted, static_cast<size_t>(size));
   return true;
+}
+
+// Action-mode commands use the same writer and reference ledger as the
+// transaction RPC. A direct table mutation would leave stale incoming counts.
+CommandResponse ApplyRuleOps(std::span<const bess::dataplane::Op> ops) {
+  auto result = bess::control::runtime().transactions().Apply(ops);
+  using Outcome = bess::dataplane::TransactionEngine::Outcome;
+  if (result.outcome == Outcome::kApplied) {
+    return CommandSuccess();
+  }
+  if (result.outcome == Outcome::kBusy) {
+    return CommandFailure(EBUSY, "transaction reclamation is behind readers");
+  }
+  for (const auto &op : result.ops) {
+    if (!op.error.empty()) {
+      return CommandFailure(EINVAL, "%s", op.error.c_str());
+    }
+  }
+  return CommandFailure(EINVAL, "rule transaction was rejected");
 }
 
 }  // namespace
@@ -413,6 +435,16 @@ void ExactMatch::RefreshForResume() {
     return;  // not initialized (or already deinitialized)
   }
 
+  // Action mode: metadata offsets were just assigned, so an unreadable
+  // 'action_id' means every match will take the default gate. Say it once per
+  // resume; the packet path only fails closed.
+  if (action_mode_ &&
+      !bess::metadata::IsValidOffset(attr_offset(action_id_attr_))) {
+    LOG(ERROR) << "ExactMatch '" << name()
+               << "': the 'action_id' attribute is unreadable (is an "
+                  "ActionTable downstream?); matches take the default gate";
+  }
+
   bool changed = false;
   for (size_t i = 0; i < field_specs_.size(); i++) {
     const FieldSpec &spec = field_specs_[i];
@@ -486,6 +518,8 @@ bool ExactMatch::Publish(
 }
 
 CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
+  action_mode_ = !arg.action_resource().empty();
+  action_resource_ = arg.action_resource();
   empty_masks_ = arg.masks_size() == 0;
   if (arg.fields_size() != arg.masks_size() && !empty_masks_) {
     return CommandFailure(EINVAL,
@@ -534,9 +568,17 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
             return *table_;
           },
           .check_value =
-              [](uint64_t gate) -> classifier::ExactRuleResource::Result {
-            if (!bess::IsValidGateValue(gate)) {
-              return std::unexpected("invalid gate " + std::to_string(gate));
+              [this](uint64_t value) -> classifier::ExactRuleResource::Result {
+            if (action_mode_) {
+              if (value == 0 ||
+                  value > std::numeric_limits<uint32_t>::max()) {
+                return std::unexpected("invalid action id " +
+                                       std::to_string(value));
+              }
+              return {};
+            }
+            if (!bess::IsValidGateValue(value)) {
+              return std::unexpected("invalid gate " + std::to_string(value));
             }
             return {};
           },
@@ -547,9 +589,27 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
               return std::unexpected(grow_err.second);
             }
             return {};
-          }});
+          },
+          // Action mode: every rule names an action, so the engine orders the
+          // actions before the rules and refuses a rule whose action is
+          // missing (G1.2b).
+          .references =
+              action_mode_
+                  ? classifier::ExactRuleResource::ReferencesFn(
+                        [this](uint64_t value) {
+                          return std::vector<bess::dataplane::Reference>{
+                              {action_resource_,
+                               bess::dataplane::EncodeKey(
+                                   bess::dataplane::ActionId(
+                                       static_cast<uint32_t>(value)))}};
+                        })
+                  : classifier::ExactRuleResource::ReferencesFn(),
+          .may_reference = action_mode_
+                               ? std::vector<std::string>{action_resource_}
+                               : std::vector<std::string>{}});
   // Typed keys and values over the RPC (D-025): the rule's fields, packed
-  // here as the add command packs them, and the gate.
+  // here as the add command packs them, and the rule's value -- the gate, or
+  // the action id in action mode.
   resource_->SetCodec(std::make_shared<bess::dataplane::TypedCodec<
                           bess::pb::ExactMatchRuleKey,
                           bess::pb::ExactMatchRuleValue>>(
@@ -567,11 +627,26 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
         return bess::dataplane::ResourceKey(
             reinterpret_cast<const char *>(packed.data()), packed.size());
       },
-      [](const bess::pb::ExactMatchRuleValue &value)
+      [this](const bess::pb::ExactMatchRuleValue &value)
           -> std::expected<std::any, std::string> {
+        if (action_mode_) {
+          if (value.gate() != 0) {
+            return std::unexpected(
+                "this ExactMatch names actions ('action_resource' is set): "
+                "a rule carries 'action_id', not 'gate'");
+          }
+          if (value.action_id() == 0) {
+            return std::unexpected("action id 0 is not a valid action");
+          }
+          return std::any(uint64_t{value.action_id()});
+        }
         if (!bess::IsValidGateValue(value.gate())) {
           return std::unexpected("invalid gate " +
                                  std::to_string(value.gate()));
+        }
+        if (value.action_id() != 0) {
+          return std::unexpected(
+              "'action_id' needs an 'action_resource' on this ExactMatch");
         }
         return std::any(uint64_t{value.gate()});
       }));
@@ -581,6 +656,20 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
     resource_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
+
+  if (action_mode_) {
+    // The packet path delivers a match as an ActionId in metadata; the graph
+    // connects gate 0 to the ActionTable that reads it.
+    action_id_attr_ =
+        AddMetadataAttr("action_id", sizeof(bess::utils::be32_t),
+                        bess::metadata::Attribute::AccessMode::kWrite);
+    if (action_id_attr_ < 0) {
+      const std::string name = resource_->name();
+      CHECK(bess::control::runtime().transactions().Unregister(name));
+      resource_.reset();
+      return CommandFailure(-action_id_attr_, "add_metadata_attr() failed");
+    }
+  }
   return CommandSuccess();
 }
 
@@ -588,12 +677,23 @@ void ExactMatch::DeInit() {
   if (resource_ == nullptr) {
     return;
   }
-  // Cannot be refused: the rules reference nothing and nothing may
-  // reference them (their erases are immediate), and Apply() runs under the
-  // control-plane lock this runs under.
-  auto unregistered =
-      bess::control::runtime().transactions().Unregister(resource_->name());
-  CHECK(unregistered) << unregistered.error();
+  auto &engine = bess::control::runtime().transactions();
+  if (action_mode_) {
+    // In action mode the rules reference an ActionTable, so they may leave
+    // with live keys while the graph is disconnected around them: the order
+    // modules are destroyed in must not decide whether a pipeline can be torn
+    // down.
+    const std::string name = resource_->name();
+    auto released = engine.ReleaseForTeardown(
+        std::span<const std::string>(&name, 1));
+    CHECK(released) << released.error();
+  } else {
+    // Cannot be refused: the rules reference nothing and nothing may
+    // reference them (their erases are immediate), and Apply() runs under the
+    // control-plane lock this runs under.
+    auto unregistered = engine.Unregister(resource_->name());
+    CHECK(unregistered) << unregistered.error();
+  }
   resource_.reset();
 }
 
@@ -620,6 +720,9 @@ CommandResponse ExactMatch::GetInitialArg(const bess::pb::EmptyArg &) {
       ret_mask->set_value_bin(ptr, static_cast<size_t>(spec.size));
     }
   }
+  if (action_mode_) {
+    r.set_action_resource(action_resource_);
+  }
   return CommandSuccess(r);
 }
 
@@ -635,7 +738,11 @@ CommandResponse ExactMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
   // in field order.
   table_->ForEach([&](classifier::ConstBytes key, uint64_t value) {
     rule_t *out = r.add_rules();
-    out->set_gate(static_cast<gate_idx_t>(value));
+    if (action_mode_) {
+      out->set_action_id(static_cast<uint32_t>(value));
+    } else {
+      out->set_gate(value);
+    }
     size_t pos = 0;
     for (const FieldSpec &spec : field_specs_) {
       bess::pb::FieldData *field = out->add_fields();
@@ -647,9 +754,11 @@ CommandResponse ExactMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
   });
   std::sort(r.mutable_rules()->begin(), r.mutable_rules()->end(),
             [](const rule_t &a, const rule_t &b) {
-              // Primary sort key is gate number.
-              if (a.gate() != b.gate()) {
-                return a.gate() < b.gate();
+              // Primary sort key is the rule's value (gate or action id).
+              const uint64_t av = a.gate() != 0 ? a.gate() : a.action_id();
+              const uint64_t bv = b.gate() != 0 ? b.gate() : b.action_id();
+              if (av != bv) {
+                return av < bv;
               }
               // After that, sort by value-to-be-matched, in field order.
               for (int i = 0; i < a.fields_size(); i++) {
@@ -664,8 +773,22 @@ CommandResponse ExactMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
   return CommandSuccess(r);
 }
 
-Error ExactMatch::RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg,
-                             Rule *rule) {
+Error ExactMatch::RuleValueFromPb(
+    const bess::pb::ExactMatchCommandAddArg &arg, uint64_t *value) const {
+  if (action_mode_) {
+    // A rule names an action: the value is its id, and `gate` is not used.
+    if (arg.gate() != 0) {
+      return std::make_pair(
+          EINVAL, "this ExactMatch names actions ('action_resource' is set): "
+                  "a rule carries 'action_id', not 'gate'");
+    }
+    if (arg.action_id() == 0) {
+      return std::make_pair(EINVAL, "'action_id' is required (id 0 is not a "
+                                    "valid action)");
+    }
+    *value = arg.action_id();
+    return std::make_pair(0, std::string());
+  }
   // Validate the 64-bit wire value before narrowing: gate_idx_t is 16-bit, so
   // a post-cast check would accept e.g. 65536 as gate 0.
   if (!bess::IsValidGateValue(arg.gate())) {
@@ -674,25 +797,39 @@ Error ExactMatch::RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg,
         bess::utils::Format("Invalid gate: %llu",
                             static_cast<unsigned long long>(arg.gate())));
   }
-  const gate_idx_t gate = static_cast<gate_idx_t>(arg.gate());
+  if (arg.action_id() != 0) {
+    return std::make_pair(
+        EINVAL, "'action_id' needs an 'action_resource' on this ExactMatch");
+  }
+  *value = arg.gate();
+  return std::make_pair(0, std::string());
+}
+
+Error ExactMatch::RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg,
+                             Rule *rule) {
+  uint64_t value = 0;
+  Error ret = RuleValueFromPb(arg, &value);
+  if (ret.first) {
+    return ret;
+  }
 
   if (arg.fields_size() == 0) {
     return std::make_pair(EINVAL, "'fields' must be a list");
   }
 
-  Error ret = RuleFieldsFromPb(arg.fields(), &rule->fields);
+  ret = RuleFieldsFromPb(arg.fields(), &rule->fields);
   if (ret.first) {
     return ret;
   }
-  rule->gate = gate;
+  rule->value = value;
 
   return std::make_pair(0, std::string());
 }
 
-// Uses an ExactMatchConfig to restore this module's runtime config.
-// The new configuration is built in full and swapped in, so an error leaves
-// the currently installed one serving unchanged -- no partially restored
-// state, which is what the old in-place version had to warn about.
+// Gate mode restores a fresh table in one swap. In action mode rules may name
+// live actions: reconcile them through one transaction so the engine sees
+// every reference change. As with the transaction RPC, its operations become
+// visible in dependency order, not all at once.
 CommandResponse ExactMatch::SetRuntimeConfig(
     const bess::pb::ExactMatchConfig &arg) {
   if (!bess::IsValidGateValue(arg.default_gate())) {
@@ -704,7 +841,7 @@ CommandResponse ExactMatch::SetRuntimeConfig(
 
   // A whole-configuration restore: one of the few deliberate rebuilds (G1.2
   // mode G, bulk load). Build a fresh table, then publish it in one step.
-  std::vector<std::pair<std::vector<std::byte>, gate_idx_t>> rules;
+  std::vector<std::pair<std::vector<std::byte>, uint64_t>> rules;
   rules.reserve(static_cast<size_t>(arg.rules_size()));
   for (auto i = 0; i < arg.rules_size(); i++) {
     Rule rule;
@@ -716,13 +853,57 @@ CommandResponse ExactMatch::SetRuntimeConfig(
     if (ret.first) {
       return CommandFailure(ret.first, "%s", ret.second.c_str());
     }
-    rules.emplace_back(std::move(key), rule.gate);
+    rules.emplace_back(std::move(key), rule.value);
   }
-  // Duplicates collapse to one rule with the last gate, as inserting them
+  if (action_mode_) {
+    using bess::dataplane::Op;
+    std::map<std::string, uint64_t, std::less<>> desired;
+    for (const auto &[key, value] : rules) {
+      desired[std::string(reinterpret_cast<const char *>(key.data()),
+                          key.size())] = value;
+    }
+    std::vector<Op> ops;
+    ops.reserve(table_->size() + desired.size());
+    table_->ForEach([&](classifier::ConstBytes key, uint64_t value) {
+      const std::string_view packed(reinterpret_cast<const char *>(key.data()),
+                                    key.size());
+      auto it = desired.find(packed);
+      if (it == desired.end()) {
+        ops.push_back(Op::Erase(resource_->name(), std::string(packed)));
+      } else {
+        if (it->second != value) {
+          ops.push_back(Op::Upsert(resource_->name(), it->first,
+                                   std::any(it->second)));
+        }
+        desired.erase(it);
+      }
+    });
+    for (const auto &[key, value] : desired) {
+      ops.push_back(Op::Upsert(resource_->name(), key, std::any(value)));
+    }
+    if (!ops.empty()) {
+      KeyLayout layout;
+      Error err;
+      if (!ComputeLayout(/*tolerate_invalid_metadata=*/false, &layout, &err)) {
+        return CommandFailure(err.first, "%s", err.second.c_str());
+      }
+      CommandResponse applied = ApplyRuleOps(ops);
+      if (applied.error().code() != 0) {
+        return applied;
+      }
+    }
+    if (published_.Read()->default_gate != default_gate) {
+      bess::pb::ExactMatchCommandSetDefaultGateArg gate;
+      gate.set_gate(default_gate);
+      return CommandSetDefaultGate(gate);
+    }
+    return CommandSuccess();
+  }
+  // Duplicates collapse to one rule with the last value, as inserting them
   // into the table always did.
   auto table = FillTable(rules.size(), [&](classifier::ConcurrentExactTable &t) {
-    for (const auto &[key, gate] : rules) {
-      if (t.Upsert(classifier::ConstBytes(key.data(), key.size()), gate) ==
+    for (const auto &[key, value] : rules) {
+      if (t.Upsert(classifier::ConstBytes(key.data(), key.size()), value) ==
           classifier::ConcurrentExactTable::UpsertResult::kFull) {
         return false;
       }
@@ -747,21 +928,20 @@ CommandResponse ExactMatch::SetRuntimeConfig(
 }
 
 // The packet path's per-batch decision, shared by ProcessBatch and
-// ClassifyBatch: calls emit(i, gate) once per packet, in order. `emit` is
-// inlined into each caller.
+// ClassifyBatch: calls emit(i, value, hit) once per packet, in order, where
+// `value` is the matched rule's value -- a gate in gate mode, an action id in
+// action mode -- and `hit` says whether the packet matched. `emit` is inlined
+// into each caller; `gen` is the caller's one snapshot for the batch.
 template <typename Emit>
-inline void ExactMatch::Classify(bess::PacketBatch *batch, Emit &&emit) const {
-  // One snapshot for the whole batch: a concurrent command can neither swap
-  // the generation mid-batch nor free it under this lookup.
-  const Generation *gen = published_.Read();
-  const gate_idx_t default_gate = gen->default_gate;
+inline void ExactMatch::Classify(bess::PacketBatch *batch,
+                                const Generation &gen, Emit &&emit) const {
   const int cnt = batch->cnt();
 
-  if (!gen->extraction_valid) {
+  if (!gen.extraction_valid) {
     // Fail-closed generation (metadata offsets unreadable): route everything
     // to the default gate without touching packet or metadata bytes.
     for (int i = 0; i < cnt; i++) {
-      emit(i, default_gate);
+      emit(i, 0, false);
     }
     return;
   }
@@ -772,10 +952,10 @@ inline void ExactMatch::Classify(bess::PacketBatch *batch, Emit &&emit) const {
   // nothing, and invalid rows are zeroed below before the backend (which
   // looks up all rows) sees them. Gapped generic schemas keep the
   // caller-initializes-gap contract and pre-zero instead.
-  const size_t key_size = gen->key_size;
+  const size_t key_size = gen.key_size;
   std::array<classifier::SourceView, bess::PacketBatch::kMaxBurst> sources;
   std::array<std::byte, bess::PacketBatch::kMaxBurst * kMaxKeyBytes> keys;
-  if (!gen->extract.fully_covers_key()) {
+  if (!gen.extract.fully_covers_key()) {
     std::memset(keys.data(), 0, static_cast<size_t>(cnt) * key_size);
   }
   std::array<uint64_t, bess::PacketBatch::kMaxBurst> gates;
@@ -795,7 +975,7 @@ inline void ExactMatch::Classify(bess::PacketBatch *batch, Emit &&emit) const {
   // One extraction batch dispatch, one backend batch dispatch. Metadata
   // attribute IDs were resolved to physical offsets at (re)build time, so
   // nothing here resolves names or parses configuration.
-  const uint64_t valid = gen->extract.ExecuteBatch(
+  const uint64_t valid = gen.extract.ExecuteBatch(
       std::span<const classifier::SourceView>(sources).first(
           static_cast<size_t>(cnt)),
       classifier::MutableBytes(keys).first(static_cast<size_t>(cnt) *
@@ -814,7 +994,7 @@ inline void ExactMatch::Classify(bess::PacketBatch *batch, Emit &&emit) const {
       }
     }
   }
-  uint64_t hits = gen->table->LookupBatch(
+  uint64_t hits = gen.table->LookupBatch(
       classifier::ConstBytes(keys.data(),
                              static_cast<size_t>(cnt) * key_size),
       key_size, gates.data(), static_cast<size_t>(cnt));
@@ -830,22 +1010,64 @@ inline void ExactMatch::Classify(bess::PacketBatch *batch, Emit &&emit) const {
   hits &= ~pending;
 
   for (int i = 0; i < cnt; i++) {
-    const gate_idx_t gate = (hits & (uint64_t{1} << i))
-                                ? static_cast<gate_idx_t>(gates[i])
-                                : default_gate;
-    emit(i, gate);
+    const bool hit = (hits & (uint64_t{1} << i)) != 0;
+    emit(i, hit ? gates[i] : 0, hit);
   }
 }
 
 void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  Classify(batch, [&](int i, gate_idx_t gate) {
-    EmitPacket(ctx, batch->packet(i), gate);
+  // One snapshot for the whole batch: a concurrent command can neither swap
+  // the generation mid-batch nor free it under this lookup.
+  const Generation *gen = published_.Read();
+  if (!action_mode_) {
+    Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
+      EmitPacket(ctx, batch->packet(i),
+                 hit ? static_cast<gate_idx_t>(value) : gen->default_gate);
+    });
+    return;
+  }
+
+  // Action mode: a match's value is an ActionId, which goes to the ActionTable
+  // in packet metadata; a miss takes the default gate.
+  const bess::metadata::mt_offset_t offset = attr_offset(action_id_attr_);
+  if (!bess::metadata::IsValidOffset(offset)) {
+    // Fail closed: a match whose action id cannot be delivered would reach the
+    // ActionTable with a stale id, so it takes the default gate instead.
+    // RefreshForResume() is where this is reported.
+    for (int i = 0; i < batch->cnt(); i++) {
+      EmitPacket(ctx, batch->packet(i), gen->default_gate);
+    }
+    return;
+  }
+  Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
+    bess::PacketRef pkt = batch->packet(i);
+    if (!hit) {
+      EmitPacket(ctx, pkt, gen->default_gate);
+      return;
+    }
+    _set_attr_with_offset<bess::utils::be32_t>(
+        offset, pkt, bess::utils::be32_t(static_cast<uint32_t>(value)));
+    EmitPacket(ctx, pkt, kActionGate);
   });
 }
 
+// The gate-mode helper cannot carry a 32-bit action id.
 void ExactMatch::ClassifyBatch(bess::PacketBatch *batch,
                                gate_idx_t *gates) const {
-  Classify(batch, [&](int i, gate_idx_t gate) { gates[i] = gate; });
+  DCHECK(!action_mode_);
+  const Generation *gen = published_.Read();
+  Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
+    gates[i] = hit ? static_cast<gate_idx_t>(value) : gen->default_gate;
+  });
+}
+
+void ExactMatch::ClassifyActionsBatch(bess::PacketBatch *batch,
+                                     uint32_t *action_ids) const {
+  DCHECK(action_mode_);
+  const Generation *gen = published_.Read();
+  Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
+    action_ids[i] = hit ? static_cast<uint32_t>(value) : 0;
+  });
 }
 
 std::string ExactMatch::GetDesc() const {
@@ -897,19 +1119,26 @@ CommandResponse ExactMatch::CommandAdd(
   if (ret.first) {
     return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
+  if (action_mode_) {
+    const std::string packed(reinterpret_cast<const char *>(key.data()),
+                             key.size());
+    const bess::dataplane::Op op = bess::dataplane::Op::Upsert(
+        resource_->name(), packed, std::any(rule.value));
+    return ApplyRuleOps(std::span(&op, 1));
+  }
   if (!EnsureCapacity(/*force=*/false, &ret)) {
     return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
   const classifier::ConstBytes k(key.data(), key.size());
   using classifier::ConcurrentExactTable;
-  if (table_->Upsert(k, rule.gate) == ConcurrentExactTable::UpsertResult::kFull) {
+  if (table_->Upsert(k, rule.value) == ConcurrentExactTable::UpsertResult::kFull) {
     // Full inside the headroom: a burst of deletes still in their grace
     // period outran it (or displacement ran out of room). Grow rather than
     // refuse.
     if (!EnsureCapacity(/*force=*/true, &ret)) {
       return CommandFailure(ret.first, "%s", ret.second.c_str());
     }
-    if (table_->Upsert(k, rule.gate) ==
+    if (table_->Upsert(k, rule.value) ==
         ConcurrentExactTable::UpsertResult::kFull) {
       return CommandFailure(ENOSPC, "rule table is full");
     }
@@ -932,6 +1161,16 @@ CommandResponse ExactMatch::CommandDelete(
   if (ret.first) {
     return CommandFailure(ret.first, "%s", ret.second.c_str());
   }
+  if (action_mode_) {
+    const std::string packed(reinterpret_cast<const char *>(key.data()),
+                             key.size());
+    if (!resource_->Contains(packed)) {
+      return CommandFailure(ENOENT, "rule doesn't exist");
+    }
+    const bess::dataplane::Op op =
+        bess::dataplane::Op::Erase(resource_->name(), packed);
+    return ApplyRuleOps(std::span(&op, 1));
+  }
   if (!table_->Erase(classifier::ConstBytes(key.data(), key.size()))) {
     return CommandFailure(ENOENT, "rule doesn't exist");
   }
@@ -941,6 +1180,16 @@ CommandResponse ExactMatch::CommandDelete(
 CommandResponse ExactMatch::CommandClear(const bess::pb::EmptyArg &) {
   // Rules go, the default gate stays -- what ClearRules() did to the live
   // table. Deleted in place, rule by rule; workers never stop reading.
+  if (action_mode_) {
+    std::vector<bess::dataplane::Op> ops;
+    ops.reserve(table_->size());
+    table_->ForEach([&](classifier::ConstBytes key, uint64_t) {
+      ops.push_back(bess::dataplane::Op::Erase(
+          resource_->name(),
+          std::string(reinterpret_cast<const char *>(key.data()), key.size())));
+    });
+    return ops.empty() ? CommandSuccess() : ApplyRuleOps(ops);
+  }
   std::vector<std::vector<std::byte>> keys;
   keys.reserve(table_->size());
   table_->ForEach([&](classifier::ConstBytes key, uint64_t) {

@@ -142,6 +142,11 @@ class FaultyResource final : public Resource {
   std::vector<Reference> ReferencesOf(const ResourceKey &key) const override {
     return inner_.ReferencesOf(key);
   }
+  void VisitReferences(
+      const std::function<void(const Reference &)> &visit) const override {
+    inner_.VisitReferences(visit);
+  }
+
   bool DefersErase() const override { return inner_.DefersErase(); }
   size_t LiveCount() const override { return inner_.LiveCount(); }
   void EndTransaction() noexcept override {
@@ -610,6 +615,7 @@ class LyingResource final : public Resource {
   LyingResource() : Resource("liar") {}
   bool Contains(const ResourceKey &) const override { return false; }
   size_t LiveCount() const override { return 0; }
+
   std::expected<Reservation, std::string> Reserve(const Op &) override {
     struct Staged final : StagedOp {
       void Publish(Retirer &retirer) noexcept override {

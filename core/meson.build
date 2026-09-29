@@ -62,6 +62,7 @@ driver_sources = files(
 
 module_sources = files(
   'modules/acl.cc',
+  'modules/action_table.cc',
   'modules/arp_responder.cc',
   'modules/bpf.cc',
   'modules/buffer.cc',
@@ -83,6 +84,7 @@ module_sources = files(
   'modules/macswap.cc',
   'modules/measure.cc',
   'modules/merge.cc',
+  'modules/meter.cc',
   'modules/mpls_pop.cc',
   'modules/mttest.cc',
   'modules/nat.cc',
@@ -97,6 +99,7 @@ module_sources = files(
   'modules/replicate.cc',
   'modules/rewrite.cc',
   'modules/round_robin.cc',
+  'modules/router.cc',
   'modules/set_metadata.cc',
   'modules/sink.cc',
   'modules/source.cc',
@@ -255,6 +258,7 @@ unit_test_sources = [
   'modules/exact_match_transaction_test.cc',
   'modules/l2_table_test.cc',
   'modules/queue_out_test.cc',
+  'modules/session_pipeline_test.cc',
   'modules/wildcard_match_test.cc',
   'modules/wildcard_match_transaction_test.cc',
   'packet_cursor_test.cc',

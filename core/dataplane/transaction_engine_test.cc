@@ -218,6 +218,9 @@ class Recorder final : public Resource {
   bool Contains(const ResourceKey &key) const override {
     return keys_.contains(key);
   }
+  void VisitReferences(
+      const std::function<void(const Reference &)> &) const override {}
+
   std::expected<Reservation, std::string> Reserve(const Op &op) override {
     struct Staged final : StagedOp {
       Recorder *r;
@@ -808,16 +811,30 @@ TEST_F(TransactionEngineTest, DependencyDeclarationsAreEnforced) {
   EXPECT_EQ(meters_.Lookup(MeterId(1)), nullptr);
   ASSERT_TRUE(engine_.Unregister("undeclared_actions"));
 
-  // Self-dependency, and a dependency that is not registered.
+  // A self-dependency is refused. A dependency that is not registered yet is
+  // not: the declaration stays unbound until its resource registers (module
+  // creation order does not decide the graph), and until then a value naming
+  // it is refused.
   SlotResource<ActionId, Action> self("self", other_actions, {}, {"self"});
   auto reg = engine_.Register(&self);
   ASSERT_FALSE(reg);
   EXPECT_NE(reg.error().find("itself"), std::string::npos);
-  SlotResource<ActionId, Action> orphan("orphan", other_actions, {},
-                                        {"not_registered"});
-  reg = engine_.Register(&orphan);
-  ASSERT_FALSE(reg);
-  EXPECT_NE(reg.error().find("register it first"), std::string::npos);
+  SlotTable<ActionId, Action> orphan_actions(8);
+  SlotResource<ActionId, Action> orphan(
+      "orphan", orphan_actions,
+      [](const Action &a) {
+        return std::vector<Reference>{{"not_registered", EncodeKey(a.meter)}};
+      },
+      {"not_registered"});
+  ASSERT_TRUE(engine_.Register(&orphan));
+  EXPECT_EQ(orphan.rank(), 0);
+  auto orphan_r = Apply({Op::Upsert("orphan", EncodeKey(ActionId(1)),
+                                    std::any(Action{1, MeterId(1)}))});
+  ASSERT_EQ(orphan_r.outcome, Outcome::kRejected);
+  EXPECT_NE(orphan_r.ops[0].error.find("undeclared reference"),
+            std::string::npos)
+      << orphan_r.ops[0].error;
+  ASSERT_TRUE(engine_.Unregister("orphan"));
 
   // Nothing leaves while a registered resource depends on it, or while it
   // holds keys that reference others (their references are in the ledger).
@@ -1027,6 +1044,202 @@ TEST_F(TransactionEngineTest, SlowReadersGetBackpressureNotAHang) {
       << "work resumes once the reader quiesces";
   domain_.Offline(kReader);
   domain_.Unregister(kReader);
+}
+
+// A declared reference may bind after its referrer registers: module creation
+// order (the desired-state planner's, by name) must not decide the resource
+// graph. Until the referent registers, a value naming it is refused, so no
+// key can hold an outgoing reference the ledger does not know about; once it
+// registers, one transaction may change both, referent published first.
+TEST(TransactionEngineRegistrationTest, BindsDeclaredReferencesRegisteredLater) {
+  rcu::RcuDomain &domain = control::runtime().rcu();
+  TransactionEngine engine(domain);
+  auto apply = [&engine](std::vector<Op> ops) { return engine.Apply(ops); };
+  SlotTable<MeterId, Meter> meters(8);
+  SlotTable<ActionId, Action> actions(8);
+  SlotResource<ActionId, Action> actions_res(
+      "actions", actions,
+      [](const Action &a) {
+        std::vector<Reference> refs;
+        if (a.meter.value() != 0) {
+          refs.push_back({"meters", EncodeKey(a.meter)});
+        }
+        return refs;
+      },
+      std::vector<std::string>{"meters"});
+  SlotResource<MeterId, Meter> meters_res("meters", meters);
+
+  // The referrer first, naming a resource that is not registered yet.
+  ASSERT_TRUE(engine.Register(&actions_res));
+  auto r = apply({Op::Upsert("actions", EncodeKey(ActionId(1)),
+                             std::any(Action{3, MeterId(2)}))});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[0].error.find("undeclared reference"), std::string::npos)
+      << r.ops[0].error;
+  // A value naming nothing is fine while the referent is missing.
+  ASSERT_EQ(apply({Op::Upsert("actions", EncodeKey(ActionId(1)),
+                              std::any(Action{3, MeterId(0)}))})
+                .outcome,
+            Outcome::kApplied);
+
+  // The referent registers: the declaration binds.
+  ASSERT_TRUE(engine.Register(&meters_res));
+  r = apply({Op::Upsert("actions", EncodeKey(ActionId(1)),
+                        std::any(Action{3, MeterId(2)})),
+             Op::Upsert("meters", EncodeKey(MeterId(2)), std::any(Meter(1000)))});
+  ASSERT_EQ(r.outcome, Outcome::kApplied);
+  EXPECT_EQ(engine.ReferenceCount("meters", EncodeKey(MeterId(2))), 1u);
+  // The bound graph orders erases: the referenced meter may not go first.
+  r = apply({Op::Erase("meters", EncodeKey(MeterId(2)))});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[0].error.find("still referenced"), std::string::npos)
+      << r.ops[0].error;
+
+  // Teardown release: the referrer may leave with live keys while the module
+  // graph around it is being disconnected, and the released name stays
+  // declared so a replacement binds it again.
+  ASSERT_TRUE(engine.ReleaseForTeardown(std::vector<std::string>{"actions"}));
+  EXPECT_EQ(engine.FindResource("actions"), nullptr);
+  r = apply({Op::Upsert("actions", EncodeKey(ActionId(1)),
+                        std::any(Action{3, MeterId(0)}))});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[0].error.find("unknown resource"), std::string::npos);
+  // Releasing the referrer removes its outgoing edge from the surviving
+  // meter's ledger, so the meter can now be erased normally.
+  EXPECT_EQ(engine.ReferenceCount("meters", EncodeKey(MeterId(2))), 0u);
+  ASSERT_TRUE(engine.ReleaseForTeardown(std::vector<std::string>{"meters"}));
+  EXPECT_EQ(engine.FindResource("meters"), nullptr);
+  // A replacement with the same name binds the declaration again (a fresh
+  // module has fresh tables, so the replacement starts empty).
+  SlotTable<MeterId, Meter> meters_again_table(8);
+  SlotTable<ActionId, Action> actions_again_table(8);
+  SlotResource<MeterId, Meter> meters_again("meters", meters_again_table);
+  SlotResource<ActionId, Action> actions_again(
+      "actions", actions_again_table,
+      [](const Action &a) {
+        std::vector<Reference> refs;
+        if (a.meter.value() != 0) {
+          refs.push_back({"meters", EncodeKey(a.meter)});
+        }
+        return refs;
+      },
+      std::vector<std::string>{"meters"});
+  ASSERT_TRUE(engine.Register(&actions_again));
+  ASSERT_TRUE(engine.Register(&meters_again));
+  ASSERT_EQ(apply({Op::Upsert("actions", EncodeKey(ActionId(2)),
+                              std::any(Action{3, MeterId(2)})),
+                   Op::Upsert("meters", EncodeKey(MeterId(2)),
+                              std::any(Meter(7)))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(engine.ReferenceCount("meters", EncodeKey(MeterId(2))), 1u);
+  ASSERT_TRUE(engine.ReleaseForTeardown(
+      std::vector<std::string>{"actions", "meters"}));
+  domain.Drain();
+}
+
+// Releasing a referent first leaves a surviving value with an unbound
+// declaration. A same-name replacement must recover its incoming counts,
+// including when its table starts empty; otherwise a later erase could free
+// an id that the surviving action still hands to readers.
+TEST(TransactionEngineRegistrationTest, RebindRecountsSurvivingReferences) {
+  rcu::RcuDomain &domain = control::runtime().rcu();
+  TransactionEngine engine(domain);
+  SlotTable<MeterId, Meter> meters(8);
+  SlotTable<ActionId, Action> actions(8);
+  SlotResource<MeterId, Meter> original("meters", meters);
+  SlotResource<ActionId, Action> referrer(
+      "actions", actions,
+      [](const Action &action) {
+        return std::vector<Reference>{
+            {"meters", EncodeKey(action.meter)}};
+      },
+      {"meters"});
+  ASSERT_TRUE(engine.Register(&original));
+  ASSERT_TRUE(engine.Register(&referrer));
+  ASSERT_EQ(engine.Apply(std::vector<Op>{
+                Op::Upsert("meters", EncodeKey(MeterId(2)),
+                           std::any(Meter(1000))),
+                Op::Upsert("actions", EncodeKey(ActionId(1)),
+                           std::any(Action{3, MeterId(2)})),
+                Op::Upsert("actions", EncodeKey(ActionId(2)),
+                           std::any(Action{3, MeterId(2)}))})
+                .outcome,
+            Outcome::kApplied);
+
+  ASSERT_TRUE(engine.ReleaseForTeardown(std::vector<std::string>{"meters"}));
+  // The orphaned referrer can still be changed: it must reject a new value
+  // naming the absent resource, but an erase should not dereference it.
+  auto rejected = engine.Apply(std::vector<Op>{Op::Upsert(
+      "actions", EncodeKey(ActionId(1)), std::any(Action{3, MeterId(3)}))});
+  EXPECT_EQ(rejected.outcome, Outcome::kRejected);
+  SlotTable<MeterId, Meter> replacement_table(8);
+  SlotResource<MeterId, Meter> replacement("meters", replacement_table);
+  ASSERT_TRUE(engine.Register(&replacement));
+  EXPECT_EQ(engine.ReferenceCount("meters", EncodeKey(MeterId(2))), 2u);
+  // Erasing one referrer while the key is still absent in the replacement
+  // decrements surviving references; it must not reject or index an absent op.
+  EXPECT_EQ(engine.Apply(std::vector<Op>{
+                Op::Erase("actions", EncodeKey(ActionId(2)))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(engine.ReferenceCount("meters", EncodeKey(MeterId(2))), 1u);
+  ASSERT_EQ(engine.Apply(std::vector<Op>{
+                Op::Upsert("meters", EncodeKey(MeterId(2)),
+                           std::any(Meter(42)))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(engine.Apply(std::vector<Op>{
+                Op::Erase("meters", EncodeKey(MeterId(2)))})
+                .outcome,
+            Outcome::kRejected);
+  ASSERT_EQ(engine.Apply(std::vector<Op>{
+                Op::Erase("actions", EncodeKey(ActionId(1))),
+                Op::Erase("meters", EncodeKey(MeterId(2)))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(engine.ReferenceCount("meters", EncodeKey(MeterId(2))), 0u);
+  while (engine.ReclaimRetired() != 0) {
+  }
+  domain.Drain();
+  ASSERT_TRUE(engine.ReleaseForTeardown(
+      std::vector<std::string>{"actions", "meters"}));
+}
+
+TEST(TransactionEngineRegistrationTest, TeardownReleaseAcceptsDuplicateNames) {
+  rcu::RcuDomain &domain = control::runtime().rcu();
+  TransactionEngine engine(domain);
+  SlotTable<MeterId, Meter> meters(8);
+  SlotResource<MeterId, Meter> resource("meters", meters);
+  ASSERT_TRUE(engine.Register(&resource));
+
+  const std::vector<std::string> names{"meters", "meters"};
+  ASSERT_TRUE(engine.ReleaseForTeardown(names));
+  EXPECT_EQ(engine.FindResource("meters"), nullptr);
+}
+
+// A declaration that names itself, or a set of declarations that forms a
+// cycle, has no publication order; Apply refuses rather than guessing.
+TEST(TransactionEngineRegistrationTest, ReferenceCyclesAreRefused) {
+  rcu::RcuDomain &domain = control::runtime().rcu();
+  TransactionEngine engine(domain);
+  SlotTable<MeterId, Meter> meters(8);
+  SlotResource<MeterId, Meter> first("first", meters, {},
+                                     std::vector<std::string>{"second"});
+  SlotResource<MeterId, Meter> second("second", meters, {},
+                                      std::vector<std::string>{"first"});
+  ASSERT_TRUE(engine.Register(&first));
+  ASSERT_TRUE(engine.Register(&second));
+  auto r = engine.Apply(
+      std::vector<Op>{Op::Upsert("first", EncodeKey(MeterId(1)),
+                                 std::any(Meter(1)))});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  // An empty transaction in a cycle must reject cleanly without indexing ops.
+  EXPECT_EQ(engine.Apply({}).outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[0].error.find("cycle"), std::string::npos) << r.ops[0].error;
+  ASSERT_TRUE(engine.ReleaseForTeardown(
+      std::vector<std::string>{"first", "second"}));
+  domain.Drain();
 }
 
 }  // namespace

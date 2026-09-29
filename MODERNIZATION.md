@@ -4253,6 +4253,36 @@ rather than one call site).
        cpuset with env config, SIGTERM with a worker forwarding traffic
        -> ordered teardown, exit 0; non-root with normal pages.
 
+121. **The session vertical slice: ExactMatch -> ActionTable -> Meter ->
+     Router (D-032).**
+     - **What:** the three missing provider modules, and ExactMatch's action
+       mode, so a session -- the rule that selects it, the action it names,
+       the meter that polices it, the next hop it forwards to and the route to
+       that hop -- is one transaction. `ActionTable` resolves an action id
+       from metadata to `{meter, next hop}`; `Meter` polices with K5's
+       MeterSet (colour -> output gate 0/1/2, so the policy is the graph) and
+       keeps meters as a resource whose erases defer; `Router` enrolls K7's
+       router (D-023) and forwards to the egress the next-hop id names.
+     - **Engine lifecycle:** declared references bind when their resource
+       registers; `ReleaseForTeardown()` releases resources independently of
+       module destruction order. Registration and teardown reconcile incoming
+       counts from surviving values, so releasing a referrer removes its edges
+       and replacing a referent restores edges held by surviving referrers.
+     - **Review fixes:** action-mode commands and bulk restore use the engine's
+       reference ledger; a mixed meter erase/upsert keeps the retiring meter
+       readable until its removal stage; Router rejects out-of-range prefix
+       lengths and capacities before narrowing; mode introspection retains
+       `action_resource`.
+     - **Layering and teardown:** `bess_core` stays separate from
+       `bess_modules`; the generic RCU reader domain returns its own
+       registration error instead of importing control-layer types.
+       Teardown release deduplicates resource names before unbinding them.
+     - **Evidence:** 8 in-process session tests (including mixed meter
+       erasure, command reference counts, wide action ids, router prefix and
+       capacity bounds), 4 engine registration tests, and 4 live daemon tests
+       (packet policing/steering, misses and unresolved hops, referenced
+       removal and transactions under live traffic).
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

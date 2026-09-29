@@ -112,6 +112,17 @@ MeterSetBuilder::MeterSetBuilder(size_t capacity) : entries_(capacity + 1) {}
 
 MeterSetBuilder::~MeterSetBuilder() = default;
 
+MeterSetBuilder::MeterSetBuilder(CloneTag, const MeterSetBuilder &other)
+    : entries_(other.entries_),
+      size_(other.size_),
+      profiles_(other.profiles_),
+      slabs_(other.slabs_) {}
+
+std::unique_ptr<MeterSetBuilder> MeterSetBuilder::Clone() const {
+  return std::unique_ptr<MeterSetBuilder>(
+      new MeterSetBuilder(CloneTag{}, *this));
+}
+
 MeterSetBuilder::ProfileKey MeterSetBuilder::KeyOf(
     const MeterProfileSpec &spec) {
   const auto tag = static_cast<uint64_t>(AlgorithmOf(spec));

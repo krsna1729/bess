@@ -76,22 +76,22 @@ RcuDomain::~RcuDomain() {
   free(qsbr_mem_);
 }
 
-control::ControlResult<void> RcuDomain::Register(ReaderId id) {
+std::expected<void, ReaderRegistrationError> RcuDomain::Register(ReaderId id) {
   if (id >= max_readers_) {
-    return std::unexpected(
-        control::Err(EINVAL, "reader id %u is out of range (max %u)", id,
-                     max_readers_));
+    return std::unexpected(ReaderRegistrationError{
+        EINVAL, "reader id " + std::to_string(id) + " is out of range (max " +
+                    std::to_string(max_readers_) + ")"});
   }
 
   std::lock_guard<std::mutex> lock(state_mutex_);
   if (registered_[id]) {
-    return std::unexpected(
-        control::Err(EEXIST, "reader id %u is already registered", id));
+    return std::unexpected(ReaderRegistrationError{
+        EEXIST, "reader id " + std::to_string(id) + " is already registered"});
   }
 
   if (rte_rcu_qsbr_thread_register(qsbr_, id) != 0) {
-    return std::unexpected(
-        control::Err(EIO, "rte_rcu_qsbr_thread_register(%u) failed", id));
+    return std::unexpected(ReaderRegistrationError{
+        EIO, "rte_rcu_qsbr_thread_register(" + std::to_string(id) + ") failed"});
   }
 
   registered_[id] = 1;

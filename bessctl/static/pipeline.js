@@ -60,7 +60,10 @@ function get_edge_label(stats) {
     var value = stats[num_stats - 1];
     var label = '?'
 
-    if (value.timestamp > 0) {
+    if (opt_mode != 'none' && opt_field == 'bits' &&
+        value.bits === 0 && value.pkts > 0) {
+        label = 'byte tracking off';
+    } else if (value.timestamp > 0) {
         switch (opt_mode) {
             case 'total':
                 label = value[opt_field];
