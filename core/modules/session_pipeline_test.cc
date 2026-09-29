@@ -50,7 +50,7 @@
 
 #include "control/runtime_state.h"
 #include "dataplane/action_id.h"
-#include "dataplane/resource_codec.h"
+#include "control/resource_codec.h"
 #include "dataplane/transaction_engine.h"
 #include "meter/meter.h"
 #include "module.h"

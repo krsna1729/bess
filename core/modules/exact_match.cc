@@ -40,7 +40,7 @@
 #include <utility>
 #include <vector>
 
-#include "../dataplane/resource_codec.h"
+#include "../control/resource_codec.h"
 #include "../dataplane/transaction_engine.h"
 #include "../event.h"
 #include "../metadata.h"

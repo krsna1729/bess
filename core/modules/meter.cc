@@ -39,7 +39,7 @@
 #include <utility>
 
 #include "../control/runtime_state.h"
-#include "../dataplane/resource_codec.h"
+#include "../control/resource_codec.h"
 #include "../dataplane/transaction_engine.h"
 #include "../utils/endian.h"
 #include "../utils/format.h"
