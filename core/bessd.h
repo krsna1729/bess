@@ -70,6 +70,11 @@ std::tuple<bool, pid_t> TryAcquirePidfileLock(int fd);
 // Returns the (locked) file descriptor of pidfile_path.
 int CheckUniqueInstance(const std::string &pidfile_path);
 
+// Returns the default pidfile for the default RPC address and a stable,
+// endpoint-specific sibling path for any other address.
+std::string PidfilePathForRpcAddress(const std::string &default_path,
+                                     const std::string &address);
+
 // Starts BESS as a daemon running in the background.
 int Daemonize();
 

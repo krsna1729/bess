@@ -152,6 +152,7 @@ TEST(CheckRunningAsRoot, NonRootWarnsAndContinues) {
 
   EXPECT_EXIT(
       {
+        google::LogToStderr();
         CheckRunningAsRoot();
         _exit(0);
       },
@@ -291,6 +292,35 @@ TEST(CheckUniqueInstance, BadPidfilePath) {
     const std::string kNoPermissionPath("/dev/nopermission");
     EXPECT_DEATH(CheckUniqueInstance(kNoPermissionPath), "");
   }
+}
+
+TEST(PidfilePathForRpcAddress, PreservesDefaultAndSeparatesAddresses) {
+  EXPECT_EQ("/var/run/bessd.pid",
+            PidfilePathForRpcAddress("/var/run/bessd.pid",
+                                     "127.0.0.1:10514"));
+  EXPECT_EQ("/var/run/bessd.pid.cef627a94d1bc922",
+            PidfilePathForRpcAddress("/var/run/bessd.pid",
+                                     "127.0.0.1:10515"));
+  EXPECT_NE(PidfilePathForRpcAddress("/var/run/bessd.pid", "127.0.0.1:10515"),
+            PidfilePathForRpcAddress("/var/run/bessd.pid", "127.0.0.1:10516"));
+}
+
+TEST(CheckUniqueInstance, DifferentRpcAddressesHaveIndependentLocks) {
+  TmpFileName t;
+  const std::string base = t.filename();
+  const std::string first_path =
+      PidfilePathForRpcAddress(base, "127.0.0.1:10515");
+  const std::string second_path =
+      PidfilePathForRpcAddress(base, "127.0.0.1:10516");
+  ASSERT_NE(first_path, second_path);
+
+  unique_fd first(CheckUniqueInstance(first_path));
+  unique_fd second(CheckUniqueInstance(second_path));
+
+  EXPECT_GE(first.get(), 0);
+  EXPECT_GE(second.get(), 0);
+  unlink(first_path.c_str());
+  unlink(second_path.c_str());
 }
 
 // Checks that the combined routine to check for a unique instance works when

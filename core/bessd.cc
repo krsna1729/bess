@@ -45,8 +45,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <list>
+#include <sstream>
 #include <string>
 #include <tuple>
 
@@ -279,6 +281,25 @@ int CheckUniqueInstance(const std::string &pidfile_path) {
   }
 
   return fd;
+}
+
+// Decision D-031 (docs/decisions.md).
+std::string PidfilePathForRpcAddress(const std::string &default_path,
+                                     const std::string &address) {
+  if (address == "127.0.0.1:10514") {
+    return default_path;
+  }
+
+  // FNV-1a gives a stable, filesystem-safe suffix for arbitrary URLs.
+  std::uint64_t hash = 14695981039346656037ULL;
+  for (unsigned char byte : address) {
+    hash ^= byte;
+    hash *= 1099511628211ULL;
+  }
+  std::ostringstream path;
+  path << default_path << '.' << std::hex << std::setw(16) << std::setfill('0')
+       << hash;
+  return path.str();
 }
 
 static void CloseStdStreams() {

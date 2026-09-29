@@ -2397,3 +2397,43 @@ packet buffers stay user-sized (modules need memory too).
   order, exit 0.
 - `docs/running-in-containers.md` states what bessd reads and what a pod
   should provide.
+
+## D-031 Daemon instance identity follows the RPC listen address
+
+**Status:** accepted (2026-09-29).
+**Code:** `core/bessd.cc`, `core/main.cc`, `bessctl/commands.py`.
+
+**Context.** One default pidfile rejected every second daemon using the default
+path, even at another RPC endpoint; `-k` targeted that shared lock, and
+`bessctl daemon start` only checked it. The default endpoint and explicit `-i`
+paths are existing operator contracts.
+
+**Decision.**
+
+- With default `-i`, retain `/var/run/bessd.pid` for `127.0.0.1:10514` and
+  derive a stable FNV-1a 64-bit suffix for every other effective RPC listen
+  address. `-k` then targets only the daemon holding that endpoint's file.
+- An explicit `-i` is used verbatim, preserving manually assigned lock and
+  restart scope. Operators use distinct explicit paths for independent
+  instances.
+- `bessctl daemon start` resolves command-line and `BESSD_<FLAG>` endpoint
+  settings with the same precedence as bessd, checks the matching pidfile,
+  and uses the existing warning/confirmation path if that endpoint is already
+  locked.
+- This changes BESS daemon locks only; it does not add DPDK shared-state
+  support. Concurrent instances need disjoint DPDK device ownership.
+
+**Evidence.**
+
+- `PidfilePathForRpcAddress.PreservesDefaultAndSeparatesAddresses` verifies
+  legacy-path compatibility and a stable endpoint hash.
+- `CheckUniqueInstance.DifferentRpcAddressesHaveIndependentLocks` acquires
+  two endpoint pidfiles concurrently.
+- `BessdEndpointTest` covers Python/C++ hash agreement, legacy defaults, and
+  explicit path precedence.
+- `DaemonShutdownTest.test_two_instances_stop_independently` starts two live
+  foreground daemons with separate explicit pidfiles and proves stopping one
+  leaves the other's pipeline available.
+
+**Revisit when:** the RPC address or pidfile naming contract changes, or BESS
+adds an explicit multi-process DPDK sharing mode.

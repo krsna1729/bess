@@ -674,9 +674,67 @@ def warn(cli, msg, func, *args):
     return True
 
 
+def _bessd_option_value(opts, name, default):
+    value = os.environ.get('BESSD_' + name.upper(), default)
+    command_value = None
+    opts = list(opts or [])
+    i = 0
+    while i < len(opts):
+        arg = opts[i]
+        if arg in ('-' + name, '--' + name) and i + 1 < len(opts):
+            command_value = opts[i + 1]
+            i += 1
+        else:
+            for prefix in ('-' + name + '=', '--' + name + '='):
+                if arg.startswith(prefix):
+                    command_value = arg[len(prefix):]
+                    break
+        i += 1
+    return command_value if command_value is not None else value
+
+
+def _bessd_grpc_url(opts):
+    grpc_url = _bessd_option_value(opts, 'grpc_url', '')
+    if grpc_url:
+        return grpc_url
+    bind = _bessd_option_value(opts, 'b', '127.0.0.1')
+    port = _bessd_option_value(opts, 'p', '10514')
+    return '{}:{}'.format(bind, port)
+
+
+def _bessd_option_is_explicit(opts, name):
+    if 'BESSD_' + name.upper() in os.environ:
+        return True
+    opts = list(opts or [])
+    return any(arg in ('-' + name, '--' + name) or
+               arg.startswith(('-' + name + '=', '--' + name + '='))
+               for arg in opts)
+
+
+# Decision D-031 (docs/decisions.md): keep this mapping in sync with bessd.
+def _bessd_pidfile_for_rpc_address(default_path, address):
+    if address == '127.0.0.1:10514':
+        return default_path
+
+    value = 14695981039346656037
+    for byte in address.encode('utf-8'):
+        value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff
+    return '{}.{:016x}'.format(default_path, value)
+
+
+def _bessd_pidfile_path(opts):
+    default_path = '/var/run/bessd.pid'
+    pidfile = _bessd_option_value(opts, 'i', default_path)
+    if _bessd_option_is_explicit(opts, 'i'):
+        return pidfile
+    return _bessd_pidfile_for_rpc_address(
+        pidfile, _bessd_grpc_url(opts))
+
+
 def _do_start(cli, opts):
     if opts is None:
         opts = []
+    grpc_url = _bessd_grpc_url(opts)
 
     # need -E to pass GCOV_* env variables through
     bessd = os.environ.get(
@@ -706,7 +764,7 @@ def _do_start(cli, opts):
         start = time.time()
         while time.time() - start < 3:
             try:
-                cli.bess.connect()
+                cli.bess.connect(grpc_url=grpc_url)
                 break
             except cli.bess.RPCError:
                 # bessd is on, but its gRPC server may be not yet. Retry.
@@ -718,12 +776,13 @@ def _do_start(cli, opts):
         cli.fout.write('Done.\n')
 
 
+
 @cmd('daemon start [BESSD_OPTS...]', 'Start BESS daemon in the local machine')
 def daemon_start(cli, opts):
+    pidfile = _bessd_pidfile_path(opts)
     daemon_exists = False
-
     try:
-        with open('/var/run/bessd.pid', 'r') as f:
+        with open(pidfile, 'r') as f:
             try:
                 fcntl.flock(f.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
             except IOError as e:

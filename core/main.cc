@@ -28,6 +28,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <string>
 #include <unistd.h>
 
 #include <rte_launch.h>
@@ -72,12 +73,21 @@ int main(int argc, char *argv[]) {
   }
   bess::bessd::CheckRunningAsRoot();
 
-  // A pidfile and its single-instance lock serve daemon mode and `-k`. In
-  // the foreground -- a container's PID 1 -- there is one instance by
-  // construction and /var/run may be read-only: only with an explicit -i.
+  std::string grpc_url = FLAGS_grpc_url;
+  if (grpc_url.empty()) {
+    grpc_url = bess::utils::Format("%s:%d", FLAGS_b.c_str(), FLAGS_p);
+  }
+
+  // Decision D-031 (docs/decisions.md).
+  // Daemons keep a pidfile so -k can restart the same RPC endpoint. Distinct
+  // endpoints get distinct default pidfiles; foreground PID 1 needs no file
+  // unless -i is explicit (its filesystem may be read-only).
   gflags::CommandLineFlagInfo pidfile_flag;
   gflags::GetCommandLineFlagInfo("i", &pidfile_flag);
   const bool use_pidfile = !FLAGS_f || !pidfile_flag.is_default;
+  if (use_pidfile && pidfile_flag.is_default) {
+    FLAGS_i = bess::bessd::PidfilePathForRpcAddress(FLAGS_i, grpc_url);
+  }
   int pidfile_fd = use_pidfile ? bess::bessd::CheckUniqueInstance(FLAGS_i) : -1;
   ignore_result(bess::bessd::SetResourceLimit());
 
@@ -128,10 +138,6 @@ int main(int argc, char *argv[]) {
 
   {
     ApiServer server;
-    std::string grpc_url = FLAGS_grpc_url;
-    if (grpc_url.empty()) {
-      grpc_url = bess::utils::Format("%s:%d", FLAGS_b.c_str(), FLAGS_p);
-    }
 
     server.Listen(grpc_url);
 

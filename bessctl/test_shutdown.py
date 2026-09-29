@@ -38,6 +38,7 @@ order (ApiServer::Run -> ControlPlane::Reset) before exit.
 """
 
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -57,7 +58,8 @@ class DaemonShutdownTest(unittest.TestCase):
 
     PORT = 10599  # not the default: never touches another daemon
 
-    def _start(self):
+    def _start(self, port=None):
+        port = self.PORT if port is None else port
         from pybess.bess import BESS
         # Unprivileged: malloc-backed packet pools (-m 0), a private pidfile.
         pidfile = tempfile.NamedTemporaryFile(suffix='.pid', delete=False)
@@ -68,7 +70,7 @@ class DaemonShutdownTest(unittest.TestCase):
         log = tempfile.TemporaryFile()
         self.addCleanup(log.close)
         proc = subprocess.Popen(
-            [_bessd(), '-f', '-p', str(self.PORT), '--skip_root_check',
+            [_bessd(), '-f', '-p', str(port), '--skip_root_check',
              '-m', '0', '-i', pidfile.name],
             stdout=log, stderr=subprocess.STDOUT)
         self.addCleanup(lambda: proc.poll() is None and
@@ -76,7 +78,8 @@ class DaemonShutdownTest(unittest.TestCase):
         bess = BESS()
         for _ in range(300):  # EAL setup can take several seconds
             try:
-                bess.connect(grpc_url='localhost:%d' % self.PORT)
+                bess.connect(grpc_url='localhost:%d' % port)
+                self.addCleanup(bess.disconnect)
                 return proc, log, bess
             except (bess.APIError, bess.RPCError):
                 if proc.poll() is not None:
@@ -102,6 +105,26 @@ class DaemonShutdownTest(unittest.TestCase):
         else:
             bess.run_module_command('wm', 'delete',
                                     'WildcardMatchCommandDeleteArg', arg)
+
+    def _unused_port(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(('127.0.0.1', 0))
+            return sock.getsockname()[1]
+
+    def test_two_instances_stop_independently(self):
+        first_port = self._unused_port()
+        first_proc, first_log, first_bess = self._start(first_port)
+        second_port = self._unused_port()
+        second_proc, second_log, second_bess = self._start(second_port)
+        second_bess.create_module('Sink', 'still_here', {})
+
+        first_bess.kill()
+        self._assert_clean_exit(first_proc, first_log)
+        names = [module.name for module in second_bess.list_modules().modules]
+        self.assertIn('still_here', names)
+
+        second_bess.kill()
+        self._assert_clean_exit(second_proc, second_log)
 
     def test_stop_with_running_pipeline_exits_cleanly(self):
         proc, log, bess = self._start()

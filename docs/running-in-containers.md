@@ -19,6 +19,17 @@ Behaviour a container runtime relies on:
 - **Foreground (`-f` or `BESSD_F=true`) is container mode:** logs go to stderr,
   and no pidfile or single-instance lock is used unless `-i` names one (a
   container's PID 1 is the only instance, and `/var/run` may be read-only).
+
+- **Background daemon instance locks:** with default `-i`, the default
+  `127.0.0.1:10514` listener keeps `/var/run/bessd.pid`; each other effective
+  RPC listen address gets a stable hash-suffixed pidfile. `-k` restarts only
+  the process holding the selected pidfile. An explicit `-i` is used verbatim;
+  choose a distinct path for each independently managed instance. `bessctl
+  daemon start` checks the same endpoint-derived path and uses the existing
+  warning/confirmation path if that endpoint is already locked.
+- This only separates BESS instance identity. Concurrent instances need
+  distinct RPC listen addresses and, for DPDK-backed ports, disjoint device
+  ownership. Memory and hugepage capacity remain shared host resources.
 - **SIGTERM and SIGINT shut down gracefully:** the gRPC server stops, the
   dataplane is torn down in order (workers paused, modules, ports, workers
   destroyed), and bessd exits 0 -- so a pod deletion or `docker stop` is

@@ -31,6 +31,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 _here = os.path.dirname(os.path.realpath(__file__))
 # commands.py imports its sibling `sugar` by name, so bessctl/ has to be
@@ -43,6 +44,46 @@ if _here not in sys.path:
 import commands  # noqa: E402
 
 import pybess.module  # noqa: E402
+
+
+class BessdEndpointTest(unittest.TestCase):
+    def test_default_endpoint_keeps_legacy_pidfile(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                '/var/run/bessd.pid',
+                commands._bessd_pidfile_path([]))
+
+    def test_nondefault_endpoint_gets_stable_pidfile(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                '/var/run/bessd.pid.cef627a94d1bc922',
+                commands._bessd_pidfile_path(['-p', '10515']))
+
+    def test_explicit_pidfile_is_not_endpoint_hashed(self):
+        with mock.patch.dict(os.environ, {'BESSD_I': '/tmp/env.pid',
+                                         'BESSD_P': '10514'}, clear=True):
+            self.assertEqual(
+                '/tmp/explicit.pid',
+                commands._bessd_pidfile_path(
+                    ['-i', '/tmp/explicit.pid', '-p', '10515']))
+            self.assertEqual('/tmp/env.pid', commands._bessd_pidfile_path([]))
+
+    def test_grpc_url_environment_and_command_line_precedence(self):
+        with mock.patch.dict(
+                os.environ, {'BESSD_GRPC_URL': '127.0.0.1:10515'}, clear=True):
+            self.assertEqual(
+                '/var/run/bessd.pid.cef627a94d1bc922',
+                commands._bessd_pidfile_path([]))
+            self.assertEqual(
+                '/var/run/bessd.pid',
+                commands._bessd_pidfile_path(
+                    ['--grpc_url=127.0.0.1:10514']))
+
+    def test_command_line_endpoint_overrides_environment(self):
+        with mock.patch.dict(os.environ, {'BESSD_P': '10514'}, clear=True):
+            self.assertEqual(
+                '/var/run/bessd.pid.cef627a94d1bc922',
+                commands._bessd_pidfile_path(['-p', '10515']))
 
 
 def _cmd_infos(*pairs):
