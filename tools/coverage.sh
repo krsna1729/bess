@@ -1,6 +1,6 @@
 #!/bin/sh -e
 
-build_dir=${BESS_BUILD_DIR:-../build-meson}
+build_dir=${BESS_BUILD_DIR:-build/gcc}
 args=${1:-run}
 
 for arg in $args; do

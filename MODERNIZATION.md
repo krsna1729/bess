@@ -79,12 +79,12 @@ propose it unprompted.
 ```bash
 tools/bootstrap_dpdk.py --af-xdp auto
 export PKG_CONFIG_PATH="$(tools/bootstrap_dpdk.py --print-pkg-config-path):${PKG_CONFIG_PATH}"
-meson setup build-meson -Dcpu=x86-64-v3 -Daf_xdp=auto
-meson compile -C build-meson -j4
-meson test -C build-meson --no-rebuild --print-errorlogs -j4
-meson test -C build-meson --no-rebuild --suite python --print-errorlogs -j4
-meson test -C build-meson --no-rebuild --suite integration --print-errorlogs -j4
-meson test -C build-meson --no-rebuild --suite benchmarks --print-errorlogs -j4
+meson setup build/gcc -Dcpu=x86-64-v3 -Daf_xdp=auto
+meson compile -C build/gcc -j4
+meson test -C build/gcc --no-rebuild --print-errorlogs -j4
+meson test -C build/gcc --no-rebuild --suite python --print-errorlogs -j4
+meson test -C build/gcc --no-rebuild --suite integration --print-errorlogs -j4
+meson test -C build/gcc --no-rebuild --suite benchmarks --print-errorlogs -j4
 ```
 
 CI configures `-Daf_xdp=required` and runs the same Meson graph with both GCC

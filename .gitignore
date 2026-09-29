@@ -52,3 +52,11 @@ compile_commands.json
 
 # virtualenv
 venv/
+
+# Build directories and Meson/Ninja intermediates
+/build/
+/_build/
+build-*/
+*.p/
+.ninja_log
+.ninja_deps

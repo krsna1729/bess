@@ -6,7 +6,7 @@ How to produce numbers that can be trusted and compared. Decisions in
 ## Build
 
 - Benchmark a **release** build compiled for the machine you measure on:
-  `meson setup build-bench -Dcpu=native --buildtype=release`.
+  `meson setup build/bench -Dcpu=native --buildtype=release`.
   `-Dcpu=x86-64-v3` also works when the result must represent a portable
   build.
 - Do not quote numbers from a portable-baseline test build. Older baselines

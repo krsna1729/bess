@@ -1,22 +1,10 @@
 core_include = include_directories('.', '..')
 
-core_sources = files(
-  'bessctl.cc',
-  'bessd.cc',
-  'control/api_v2.cc',
-  'control/control_error.cc',
-  'control/control_plane.cc',
-  'control/dataplane_transactions.cc',
-  'control/thread_placement.cc',
-  'startup.cc',
-  'control/pipeline_diff.cc',
-  'control/pipeline_plan.cc',
-  'control/pipeline_snapshot.cc',
-  'control/pipeline_spec.cc',
-  'control/pipeline_validator.cc',
-  'control/runtime_state.cc',
-  'control/transaction.cc',
-  'control/worker_manager.cc',
+rcu_sources = files(
+  'rcu/rcu_domain.cc',
+)
+
+dataplane_sources = files(
   'classifier/concurrent_exact.cc',
   'classifier/concurrent_masked.cc',
   'classifier/extract_plan.cc',
@@ -26,8 +14,31 @@ core_sources = files(
   'dataplane/transaction_engine.cc',
   'meter/meter.cc',
   'meter/meter_set.cc',
+  'route/route_table.cc',
+  'route/router.cc',
   'stats/counter_set.cc',
   'stats/worker_histogram.cc',
+)
+
+control_sources = files(
+  'control/api_v2.cc',
+  'control/control_error.cc',
+  'control/control_plane.cc',
+  'control/dataplane_transactions.cc',
+  'control/pipeline_diff.cc',
+  'control/pipeline_plan.cc',
+  'control/pipeline_snapshot.cc',
+  'control/pipeline_spec.cc',
+  'control/pipeline_validator.cc',
+  'control/runtime_state.cc',
+  'control/thread_placement.cc',
+  'control/transaction.cc',
+  'control/worker_manager.cc',
+)
+
+core_sources = files(
+  'bessctl.cc',
+  'bessd.cc',
   'debug.cc',
   'dpdk.cc',
   'event.cc',
@@ -44,11 +55,9 @@ core_sources = files(
   'packet_tx_checksum.cc',
   'packet_pool.cc',
   'port.cc',
-  'rcu/rcu_domain.cc',
-  'route/route_table.cc',
-  'route/router.cc',
   'resume_hook.cc',
   'shared_obj.cc',
+  'startup.cc',
   'task.cc',
   'traffic_class.cc',
   'worker.cc',
@@ -148,11 +157,32 @@ resume_hook_sources = files(
 
 runtime_compile_deps = common_deps + [bess_proto_dep]
 
+bess_rcu = static_library(
+  'bess_rcu',
+  rcu_sources,
+  include_directories: core_include,
+  dependencies: runtime_compile_deps,
+)
+bess_dataplane = static_library(
+  'bess_dataplane',
+  dataplane_sources,
+  include_directories: core_include,
+  dependencies: runtime_compile_deps,
+  link_with: [bess_rcu],
+)
+bess_control = static_library(
+  'bess_control',
+  control_sources + [proto_ready_marker],
+  include_directories: core_include,
+  dependencies: runtime_compile_deps,
+  link_with: [bess_dataplane, bess_rcu],
+)
 bess_core = static_library(
   'bess_core',
   core_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: runtime_compile_deps,
+  link_with: [bess_control, bess_dataplane, bess_rcu],
 )
 bess_drivers = static_library(
   'bess_drivers',
@@ -188,6 +218,9 @@ bess_resume_hooks = static_library(
 
 runtime_whole = [
   bess_proto_lib,
+  bess_rcu,
+  bess_dataplane,
+  bess_control,
   bess_core,
   bess_utils,
   bess_drivers,

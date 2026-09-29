@@ -106,14 +106,14 @@ jobs:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
         run: |
-          meson setup "build-${{ matrix.name }}" \
+          meson setup "build/${{ matrix.name }}" \
             -Dcpu="$CPU" \
             -Daf_xdp=required \
             -Dbuildtype=debugoptimized \
             -Dbuild_sample_plugin=true
 
       - name: Build BESS
-        run: meson compile -C "build-${{ matrix.name }}" -j4
+        run: meson compile -C "build/${{ matrix.name }}" -j4
 
       - name: Verify AF_XDP artifacts
         run: |
@@ -122,12 +122,12 @@ jobs:
           test -f "$dpdk_libdir/librte_net_af_xdp.a"
 
       - name: Run all Meson tests
-        run: meson test -C "build-${{ matrix.name }}" --print-errorlogs
+        run: meson test -C "build/${{ matrix.name }}" --print-errorlogs
 
       - name: Verify install tree
         run: |
-          meson install -C "build-${{ matrix.name }}" --destdir "$PWD/stage-${{ matrix.name }}"
-          python3 - "$PWD/stage-${{ matrix.name }}" <<'PY'
+          meson install -C "build/${{ matrix.name }}" --destdir "$PWD/build/stage-${{ matrix.name }}"
+          python3 - "$PWD/build/stage-${{ matrix.name }}" <<'PY'
           import os
           from pathlib import Path
           import sys
@@ -143,7 +143,7 @@ jobs:
       - name: Verify installed Python client
         run: |
           python3 tools/check_installed_pybess.py \
-            --root "$PWD/stage-${{ matrix.name }}/usr/local/share/bess"
+            --root "$PWD/build/stage-${{ matrix.name }}/usr/local/share/bess"
 
       - name: Dump daemon logs on failure
         if: failure()

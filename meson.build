@@ -9,6 +9,10 @@ project(
     'buildtype=release',
   ],
 )
+if meson.project_source_root() == meson.project_build_root()
+  error('In-source builds are disallowed. Please use a separate build directory, e.g. "meson setup build-meson".')
+endif
+
 
 cpp = meson.get_compiler('cpp')
 python = import('python').find_installation('python3')
