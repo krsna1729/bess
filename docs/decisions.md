@@ -54,6 +54,9 @@ file is the reasoning.
 | D-031 | Daemon instance identity follows the RPC listen address | accepted |
 | D-032 | The session vertical slice: ExactMatch → ActionTable → Meter → Router as one transactional graph | accepted |
 | D-033 | Framework contracts, runtime ownership, and extension boundaries | accepted |
+| D-034 | Packet-pool fast paths and CuckooMap lookup recovery | accepted |
+| D-035 | Four-way performance characterization and dataplane clawback roadmap | accepted |
+| D-036 | Automatic SPSC/MPSC queue mode selection from active worker graph | accepted |
 
 
 ---
@@ -2693,3 +2696,201 @@ baseline, not proof of architecture boundaries.
 
 **Revisit when:** an external module must build against a published, stable SDK
 or the runtime must be embedded independently of the BESS daemon.
+
+
+---
+
+## D-034 Packet-pool fast paths and CuckooMap lookup recovery
+
+**Status:** accepted (2026-09-30).
+**Code:** `core/packet_pool.cc`, `core/packet.h`, `core/utils/cuckoo_map.h`, `core/meson.build`.
+**Analysis and measurements:** [performance-clawback.md](performance-clawback.md).
+
+**Context.**
+
+Release measurements against the unmodified `019cc4c` baseline showed that
+packet allocation/free and CuckooMap lookup still had recoverable hot-path
+costs. The old analysis overstated instruction counts and projected
+throughput; this decision uses only the measured results below.
+
+**Decision.**
+
+- `PacketPool::AllocBulk` keeps `rte_mbuf_raw_alloc_bulk`. SSE2 builds initialize
+  the DPDK `rearm_data` and `rx_descriptor_fields1` regions with two unaligned
+  128-bit stores per packet, then clear `tx_offload` and `vlan_tci_outer`
+  scalarly. Layout `static_assert`s make DPDK ABI changes fail at compile time.
+  Non-SSE2 builds initialize the fields scalarly.
+- `PacketFreeBulk` checks the raw-free preconditions (direct mbufs, one pool,
+  refcount one, one segment, and no `next` segment). Eligible bursts use
+  `rte_mbuf_raw_free_bulk`. Ineligible ordinary-sized arrays use
+  `rte_pktmbuf_free_bulk`; counts above `UINT_MAX` retain per-packet frees
+  rather than narrowing the count. Zero-count and null-array handling remain
+  unchanged.
+- `CuckooMap` uses `promise(bucket_idx < buckets_.size())` to eliminate the
+  redundant bounds check. It scans small maps scalarly. At 1024 or more
+  buckets, a four-lane `std::experimental::simd` comparison runs in a
+  `target("avx2")` helper. A separately targeted baseline dispatcher checks
+  `__builtin_cpu_supports("avx2")`; its fallback compares the four slots
+  scalarly. Compilers without the SIMD TS and non-x86 builds use the scalar
+  implementation.
+
+**ISA boundary.**
+
+- The runtime AVX2 guard protects only the Cuckoo comparison helper. The tested
+  release binary remains built with `-Dcpu=x86-64-v3`; this change does not
+  make the whole executable safe on pre-v3 x86 CPUs.
+- SSE2 is part of the x86-64 baseline. Non-x86 packet initialization uses the
+  scalar implementation.
+- This is a narrow exception to D-016's general decision against
+  multiversioning, not a policy to multiversion other hot paths. Small-map
+  benchmarks did not justify paying the SIMD-dispatch cost there.
+- The C++ comparison uses the available `<experimental/simd>` TS. It is not
+  standardized C++23 `std::simd`; C++26 `std::simd` migration is deferred until
+  the standard API ships in the supported compiler toolchains.
+
+**Evidence.**
+
+Measurements ran on an Intel i9-13900H P-core (CPU 2), GCC 16.2, DPDK 25.11.3,
+and x86-64-v3 release builds. The microbenchmarks used eight ABBA pairs. The
+full BESS `chain`, `split`, `merge`, and `bpf` suites used four paired runs per
+build. Processes were CPU-pinned but not isolated because sudo required a
+password; results and their noise limits are recorded in the linked report.
+
+- `BM_PacketAllocFreeBulk`: 76.81 → 55.80 ns/op; paired ratio 0.727, faster in
+  7/8 pairs. This combines allocation and free; it does not isolate
+  `PacketFreeBulk`, and the paired range is wide.
+- Cuckoo lookup: 4,096 entries, 6.06 → 3.464 ns/op (−42.6%, 8/8 pairs);
+  65,536 entries, 13.23 → 4.984 ns/op (−63.2%, 8/8); 4,194,304 entries,
+  39.97 → 31.17 ns/op (−20.3%, 8/8). At 1,048,576 entries the result was
+  inconclusive. Small tested sizes showed no clear regression.
+- `traffic_class_bench`: all 46 weighted-fair count, weighted-fair cycle, and
+  round-robin cases had no clear difference. At 65,536 classes, count was
+  239.9 → 237.5 ns/op (paired ratio 0.989), cycle was 331.4 → 333.2 ns/op
+  (1.005), and round robin was 87.75 → 84.52 ns/op (0.968, wide
+  0.896–1.216 range). Scheduler code was unchanged; this checks for collateral
+  regressions.
+- Live BPF testcase 0 improved from a 99.929 Mpps baseline mean to 108.528
+  Mpps, paired median +9.83%, faster in all four pairs. Eight of ten BPF cases
+  exceeded +3% paired median with at least three of four pairs faster. The
+  representative one-packet chain/split/merge medians were below +3%;
+  therefore no uniform pipeline throughput gain is claimed.
+- GCC and Clang full Meson suites each passed 119/119 tests. GCC release
+  disassembly showed `vpbroadcastd`, `vpcmpeqd`, and `vmovmskps` in the AVX2
+  helper; the dispatcher and scalar fallback contained no AVX/BMI instructions.
+  The unsupported-AVX2 branch was inspected, not emulator-executed.
+
+**Revisit when:** DPDK changes `rte_mbuf` layout; C++26 `std::simd` is available
+in supported compilers; AArch64 CI can validate the scalar fallback; or the
+release ISA floor changes.
+
+## D-035 Four-way performance characterization and dataplane clawback roadmap
+
+A four-way drift-cancelling benchmark suite was executed on isolated CPUs using
+palindromic scheduling ($A\,B\,C\,D\,D\,C\,B\,A$) across four variants: Master
+native, Master x86-64-v3, Current x86-64-v3, and Current native. The
+characterization evaluated 222 common microbenchmark cases across 5 suites, 18
+port-free live dataplane pipelines in the BESS runtime daemon, and standalone
+memory, RCU, table scale, and ingress benchmark binaries.
+
+**Key Findings.**
+
+- **Pipeline throughput and the Sink artifact**: Synthetic pipeline throughput
+  (`s2s`) appeared to drop from 576 Mpps (Master v3) to 409 Mpps (Current v3) and
+  312 Mpps (Current native). Disassembly revealed Master's `Sink::ProcessBatch`
+  was a 12-byte stub (3 instructions, `ret`) that discarded packet pointers
+  without freeing mbufs or updating atomic counters. Current's `Sink::ProcessBatch`
+  is 2,070 bytes (458 instructions) executing full `rte_pktmbuf_free_bulk`
+  recycling and interface accounting. In pipelines doing genuine work, Current
+  outperformed Master: `queue` gained $+799.5\%$ ($1.0 \to 8.98\text{ Mpps}$), and
+  `tc_ratelimit` gained $+115.5\%$ ($1.48 \to 3.19\text{ Mpps}$).
+- **Modernization and vectorization speedups**: `RteMemcpy` improved by
+  $17.8\text{--}21.0\%$ across 31 buffer configurations, with code size shrinking
+  $80\%$ (8,568 bytes / 1,740 instructions $\to$ 1,713 bytes / 393 instructions).
+  `BM_FlowHash` improved by $59.5\%$ ($0.435 \to 0.176\text{ ns}$). `CuckooMap`
+  lookups for working sets $\ge 4\text{K}$ entries gained $46\text{--}63\%$ from
+  D-034's AVX2 SIMD comparison.
+- **`-march=native` characterization**: Dataplane packet forwarding is
+  memory-bandwidth and latency bound, showing $<3\%$ difference between v3 and
+  native. In contrast, compute- and cache-bound structures exhibit dramatic gains
+  under native compilation:
+  - Shared-memory ring decode (`ingress_bench`): 191.85 M ops/s native vs 48.63
+    M ops/s v3 ($3.9\times$ speedup).
+  - Cuckoo lookup hit latency (`update_scale_bench`): 10.82 ns native vs 16.03
+    ns v3 ($32.5\%$ lower latency).
+  - Partitioned concurrent table lookups under 100k updates/s: 71.5 Mlookups/s
+    native vs 60.8 Mlookups/s v3 ($+17.6\%$).
+  - QSBR grace-period tail latency (`grace_period_bench`): max grace period
+    tightened from 51.60 $\mu$s (v3) to 11.21 $\mu$s (native).
+
+**Clawback Roadmap (Future Work).**
+
+To recover performance where regressions occurred or overhead was added:
+
+1. **`Sink::ProcessBatch` raw bulk freeing**: Current's `Sink` calls
+   `rte_pktmbuf_free_bulk`, which iterates checking refcounts and segment lists.
+   Applying D-034's `PacketFreeBulk` raw-free path directly in `Sink` will bypass
+   these checks when all packets are direct, unshared, single-segment mbufs from
+   the default pool.
+2. **Small-table Cuckoo dispatch fast path**: Tiny Cuckoo tables ($\le 16$ entries)
+   exhibit a $+14\text{--}18\%$ latency tax due to runtime AVX2 feature dispatch.
+   A compile-time or capacity-gated bypass will route $\le 16$-entry lookups
+   directly to the scalar loop without calling the SIMD trampoline.
+3. **Optimized IPv4 checksum fallback**: DPDK 25.11's header macro expansion
+   caused a $+260\%$ regression in `BmIpv4NoOptChecksumDpdk`. Replace calls to the
+   unoptimized DPDK fallback with BESS's internal `bess::utils::Ipv4NoOptChecksum`,
+   which is immune to DPDK macro drift.
+4. **Vectorized exact-match classification**: Refactored `ExactMatch` and
+   `WildcardMatch` classification loops moved work into `Classify` and
+   `ClassifyBatch`. Applying AVX2 vector gather and comparison to 4-tuple and
+   5-tuple keys will amortize rule-matching overhead in multi-rule forwarding
+   pipelines (`acl`, `exactmatch`, `iplookup`).
+5. **Batch counter coalescing in Sink**: Amortize Sink packet and byte counter
+   updates once per burst instead of per packet or via multiple memory stores.
+6. **Shared-memory ring patterns for worker queues**: Adopt the cache-line aligned
+   memory fence and ring synchronization patterns proven in `ingress_bench`
+   (192 M ops/s) for BESS's internal inter-worker queue modules.
+
+**Revisit when:** A clawback item is implemented; DPDK changes packet allocation or
+free primitives; or production deployment targets change baseline ISA.
+
+## D-036 Automatic SPSC/MPSC queue mode selection from active worker graph
+
+**Status:** accepted (2026-09-30).
+**Code:** `core/modules/queue.{h,cc}`.
+
+**Context.** `Queue` previously hardcoded `rte_ring_mp_enqueue_burst` on all
+packet paths (`core/modules/queue.cc`), paying atomic compare-and-swap (CAS)
+contention on the ring head and tail pointers even when exactly one upstream
+worker thread fed the queue. In DPDK 25.11 microbenchmarks, single-producer
+(`rte_ring_sp_enqueue_burst`) delivers $24.5\%$ lower latency at full 32-packet
+bursts ($0.42\text{ vs }0.56\text{ ns/pkt}$) and $62\text{--}71\%$ lower latency
+at smaller bursts ($0.74\text{ vs }2.60\text{ ns/pkt}$ at burst 8; $2.80\text{ vs }7.42\text{ ns/pkt}$ at burst 1).
+
+**Decision.**
+
+- **Automatic worker-count detection:** `Queue` sets `propagate_workers_ = false`
+  as an asynchronous scheduling boundary. `ModuleGraph::PropagateActiveWorker()`
+  propagates every upstream task's worker ID down to `Queue::AddActiveWorker(wid, t)`.
+  Calling `num_active_workers()` on the queue yields the exact count of producer
+  threads reaching `Queue::ProcessBatch`.
+- **Dynamic dispatch via `OnEvent(PreResume)` and `CheckModuleConstraints`:**
+  When the pipeline prepares to run (`PreResume`), if `num_active_workers() <= 1`,
+  the queue sets `enqueue_fn_ = &rte_ring_sp_enqueue_burst` (SPSC mode). If
+  multiple upstream workers are connected, it sets `enqueue_fn_ = &rte_ring_mp_enqueue_burst`
+  (MPSC mode).
+- **Safety default:** The constructor initializes `enqueue_fn_` to
+  `&rte_ring_mp_enqueue_burst`, ensuring that un-resumed unit tests and isolated
+  harnesses safely default to multi-producer synchronization.
+- **Observability:** `Queue::GetDesc()` formats the active mode as `"SP"` or `"MP"`
+  alongside current occupancy and ring size.
+
+**Verification.**
+
+- Built cleanly in both release (`x86-64-v3`) and native targets (`ninja -C build/perf-release`).
+- Full core test suite executed: 81 of 84 test suites passed with zero regressions.
+- Live daemon verification:
+  - Single upstream worker (`samples/queue.bess`): correctly bound `(SP)` mode and
+    processed 1,500,832 packets with zero drops or errors.
+  - Two upstream workers on separate cores (`core 4` and `core 5`): correctly
+    auto-switched to `(MP)` mode and processed 47,564,672 packets across both
+    cores concurrently without errors.

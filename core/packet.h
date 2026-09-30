@@ -199,8 +199,11 @@ inline bool PacketFreeBulkRawEligible(PacketHandle *pkts, size_t cnt) {
 
 }  // namespace detail
 
+// Decision D-034 (docs/decisions.md): optimistic fast path for the common case
+// (all direct, single-segment, same pool, refcnt 1).  Falls back to DPDK's
+// rte_pktmbuf_free_bulk for clones, external buffers, and multi-segment chains.
 inline void PacketFreeBulk(PacketHandle *pkts, size_t cnt) {
-  if (cnt == 0) {
+  if (unlikely(cnt == 0)) {
     return;
   }
 
@@ -209,19 +212,34 @@ inline void PacketFreeBulk(PacketHandle *pkts, size_t cnt) {
     return;
   }
 
-  const auto eligibility =
-      detail::CheckPacketFreeBulkEligibility(pkts, cnt);
-  if (eligibility == detail::PacketFreeBulkEligibility::kEligible) {
-    rte_mbuf_raw_free_bulk(pkts[0]->pool, pkts,
-                           static_cast<unsigned>(cnt));
-  } else if (eligibility ==
-             detail::PacketFreeBulkEligibility::kCountOverflow) {
+  // DPDK's bulk APIs take an unsigned count. Preserve support for larger
+  // inputs without narrowing the count.
+  if (unlikely(cnt > std::numeric_limits<unsigned>::max())) {
     for (size_t i = 0; i < cnt; i++) {
       rte_pktmbuf_free(pkts[i]);
     }
-  } else {
-    rte_pktmbuf_free_bulk(pkts, static_cast<unsigned>(cnt));
+    return;
   }
+
+  PacketHandle first = pkts[0];
+  if (unlikely(first == nullptr || first->pool == nullptr)) {
+    rte_pktmbuf_free_bulk(pkts, static_cast<unsigned>(cnt));
+    return;
+  }
+  rte_mempool *pool = first->pool;
+
+  // Fast path: check all packets with minimal branches per packet.
+  for (size_t i = 0; i < cnt; i++) {
+    PacketHandle pkt = pkts[i];
+    if (unlikely(pkt == nullptr || !RTE_MBUF_DIRECT(pkt) ||
+                 pkt->pool != pool || rte_mbuf_refcnt_read(pkt) != 1 ||
+                 pkt->nb_segs != 1 || pkt->next != nullptr)) {
+      // Slow path: let DPDK handle nulls, clones, external buffers, and chains.
+      rte_pktmbuf_free_bulk(pkts, static_cast<unsigned>(cnt));
+      return;
+    }
+  }
+  rte_mbuf_raw_free_bulk(pool, pkts, static_cast<unsigned>(cnt));
 }
 
 inline void PacketFreeBatch(PacketBatch *batch) {

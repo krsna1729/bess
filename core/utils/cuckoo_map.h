@@ -13,12 +13,21 @@
 #define BESS_UTILS_CUCKOOMAP_H_
 
 #include <algorithm>
+#include <bit>
 #include <functional>
 #include <limits>
 #include <stack>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#if defined(__x86_64__) && defined(__GNUC__) && \
+    __has_include(<experimental/simd>)
+#include <experimental/simd>
+#define BESS_CUCKOO_HAS_SIMD_TS 1
+#else
+#define BESS_CUCKOO_HAS_SIMD_TS 0
+#endif
 
 #include <glog/logging.h>
 
@@ -31,6 +40,49 @@ namespace utils {
 
 typedef uint32_t HashResult;
 typedef uint32_t EntryIndex;
+
+namespace detail {
+
+constexpr int kCuckooHashSlots = 4;
+
+#if BESS_CUCKOO_HAS_SIMD_TS
+namespace stdx = std::experimental;
+
+__attribute__((target("avx2"), noinline))
+inline unsigned CuckooHashMatchMaskAvx2(const HashResult* hashes,
+                                        HashResult primary) {
+  using v4u32 = stdx::fixed_size_simd<HashResult, kCuckooHashSlots>;
+  const v4u32 values(hashes, stdx::element_aligned);
+  const auto match = (values == v4u32(primary));
+
+  unsigned mask = 0;
+  for (unsigned i = 0; i < kCuckooHashSlots; ++i) {
+    if (match[i]) {
+      mask |= 1u << i;
+    }
+  }
+  return mask;
+}
+
+__attribute__(
+    (target("arch=x86-64,no-avx,no-avx2,no-bmi,no-bmi2"), noinline))
+inline unsigned CuckooHashMatchMask(const HashResult* hashes,
+                                    HashResult primary) {
+  if (__builtin_cpu_supports("avx2")) {
+    return CuckooHashMatchMaskAvx2(hashes, primary);
+  }
+
+  unsigned mask = 0;
+  for (unsigned i = 0; i < kCuckooHashSlots; ++i) {
+    if (hashes[i] == primary) {
+      mask |= 1u << i;
+    }
+  }
+  return mask;
+}
+#endif
+
+}  // namespace detail
 
 // A Hash table implementation using cuckoo hashing
 //
@@ -246,6 +298,7 @@ class CuckooMap {
     if (idx == kInvalidEntryIdx) {
       return nullptr;
     }
+    promise(idx < entries_.size());
     return &entries_[idx];
   }
 
@@ -349,7 +402,7 @@ class CuckooMap {
   // Tunable macros
   static const int kInitNumBucket = 4;
   static const int kInitNumEntries = 16;
-  static const int kEntriesPerBucket = 4;  // 4-way set associative
+  static const int kEntriesPerBucket = detail::kCuckooHashSlots;
 
   // 4^kMaxCuckooPath buckets will be considered to make a empty slot,
   // before giving up and expand the table.
@@ -432,6 +485,10 @@ class CuckooMap {
   EntryIndex GetFromBucket(HashResult primary, HashResult bucket_idx,
                            const Probe& probe,
                            const StoredProbeEqual& eq) const {
+    // Decision D-034: bucket_idx is always (hash & bucket_mask_) where
+    // bucket_mask_ == buckets_.size() - 1, so it is always in range.
+    // This promise eliminates the compiler-generated bounds check.
+    promise(bucket_idx < buckets_.size());
     const Bucket& bucket = buckets_[bucket_idx];
 
     int slot_idx = FindSlot(bucket, primary, probe, eq);
@@ -491,12 +548,31 @@ class CuckooMap {
   template <typename Probe, typename StoredProbeEqual>
   int FindSlot(const Bucket& bucket, HashResult primary, const Probe& probe,
                const StoredProbeEqual& eq) const {
+    // Decision D-034: keep small bucket arrays scalar; ABBA showed the SIMD
+    // scan pays off only for larger tables. The helper dispatches to AVX2
+    // at runtime and keeps a scalar fallback.
+#if BESS_CUCKOO_HAS_SIMD_TS
+    if (buckets_.size() >= 1024) {
+      unsigned matches =
+          detail::CuckooHashMatchMask(bucket.hash_values, primary);
+      while (matches != 0) {
+        const unsigned i = std::countr_zero(matches);
+        matches &= matches - 1;
+        EntryIndex idx = bucket.entry_indices[i];
+        promise(idx < entries_.size());
+        if (likely(Eq(entries_[idx].first, probe, eq))) {
+          return i;
+        }
+      }
+      return -1;
+    }
+#endif
+
     for (int i = 0; i < kEntriesPerBucket; i++) {
       if (bucket.hash_values[i] == primary) {
         EntryIndex idx = bucket.entry_indices[i];
-        const Entry& entry = entries_[idx];
-
-        if (likely(Eq(entry.first, probe, eq))) {
+        promise(idx < entries_.size());
+        if (likely(Eq(entries_[idx].first, probe, eq))) {
           return i;
         }
       }
@@ -651,5 +727,7 @@ class CuckooMap {
 
 }  // namespace utils
 }  // namespace bess
+
+#undef BESS_CUCKOO_HAS_SIMD_TS
 
 #endif  // BESS_UTILS_CUCKOOMAP_H_

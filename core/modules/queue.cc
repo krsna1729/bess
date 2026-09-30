@@ -144,17 +144,31 @@ void Queue::DeInit() {
     std::free(queue_);
   }
 }
+int Queue::OnEvent(bess::Event event) {
+  if (event != bess::Event::PreResume) {
+    return -ENOTSUP;
+  }
+  const size_t workers = num_active_workers();
+  if (workers <= 1) {
+    enqueue_fn_ = &rte_ring_sp_enqueue_burst;
+  } else {
+    enqueue_fn_ = &rte_ring_mp_enqueue_burst;
+  }
+  return 0;
+}
+
 
 std::string Queue::GetDesc() const {
   const struct rte_ring *ring = queue_;
 
-  return bess::utils::Format("%u/%u", rte_ring_count(ring),
-                             rte_ring_get_size(ring));
+  return bess::utils::Format(
+      "%u/%u (%s)", rte_ring_count(ring), rte_ring_get_size(ring),
+      (enqueue_fn_ == &rte_ring_sp_enqueue_burst) ? "SP" : "MP");
 }
 
 /* from upstream */
 void Queue::ProcessBatch(Context *, bess::PacketBatch *batch) {
-  int queued = static_cast<int>(rte_ring_mp_enqueue_burst(
+  int queued = static_cast<int>(enqueue_fn_(
       queue_, reinterpret_cast<void **>(batch->handles()), batch->cnt(),
       nullptr));
   if (backpressure_ && rte_ring_count(queue_) > high_water_) {
@@ -272,7 +286,14 @@ void Queue::AdjustWaterLevels() {
 
 CheckConstraintResult Queue::CheckModuleConstraints() const {
   CheckConstraintResult status = CHECK_OK;
-  if (num_active_tasks() - tasks().size() < 1) {  // Assume multi-producer.
+  const size_t workers = num_active_workers();
+  if (workers <= 1) {
+    const_cast<Queue *>(this)->enqueue_fn_ = &rte_ring_sp_enqueue_burst;
+  } else {
+    const_cast<Queue *>(this)->enqueue_fn_ = &rte_ring_mp_enqueue_burst;
+  }
+
+  if (num_active_tasks() - tasks().size() < 1) {
     LOG(ERROR) << "Queue has no producers";
     status = CHECK_NONFATAL_ERROR;
   }

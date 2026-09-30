@@ -1,12 +1,18 @@
 #include "packet_pool.h"
 
+#include <algorithm>
+#include <bit>
+#include <cstddef>
+#include <limits>
 #include <sys/mman.h>
 
-#include <algorithm>
-#include <limits>
 #include <rte_errno.h>
 #include <rte_eal.h>
 #include <rte_mempool.h>
+
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 #include "dpdk.h"
 #include "runtime/opts.h"
@@ -26,6 +32,25 @@ void DoMunmap(rte_mempool_memhdr *memhdr, void *) {
 }
 
 }  // namespace
+static_assert(offsetof(rte_mbuf, data_off) == offsetof(rte_mbuf, rearm_data));
+static_assert(offsetof(rte_mbuf, refcnt) == offsetof(rte_mbuf, rearm_data) + 2);
+static_assert(offsetof(rte_mbuf, nb_segs) == offsetof(rte_mbuf, rearm_data) + 4);
+static_assert(offsetof(rte_mbuf, port) == offsetof(rte_mbuf, rearm_data) + 6);
+static_assert(offsetof(rte_mbuf, ol_flags) == offsetof(rte_mbuf, rearm_data) + 8);
+static_assert(offsetof(rte_mbuf, rx_descriptor_fields1) ==
+              offsetof(rte_mbuf, rearm_data) + 16);
+static_assert(offsetof(rte_mbuf, packet_type) ==
+              offsetof(rte_mbuf, rx_descriptor_fields1));
+static_assert(offsetof(rte_mbuf, pkt_len) ==
+              offsetof(rte_mbuf, rx_descriptor_fields1) + 4);
+static_assert(offsetof(rte_mbuf, data_len) ==
+              offsetof(rte_mbuf, rx_descriptor_fields1) + 8);
+static_assert(offsetof(rte_mbuf, vlan_tci) ==
+              offsetof(rte_mbuf, rx_descriptor_fields1) + 10);
+static_assert(offsetof(rte_mbuf, tx_offload) >=
+              offsetof(rte_mbuf, rx_descriptor_fields1) + 16);
+static_assert(offsetof(rte_mbuf, vlan_tci_outer) >=
+              offsetof(rte_mbuf, rx_descriptor_fields1) + 16);
 
 PacketPool *PacketPool::default_pools_[RTE_MAX_NUMA_NODES];
 
@@ -124,18 +149,64 @@ bool PacketPool::AllocBulk(PacketHandle *pkts, size_t count, size_t len) {
     return false;
   }
 
+  // Decision D-034 (docs/decisions.md): two 128-bit metadata stores per packet,
+  // plus scalar clears for tx_offload and vlan_tci_outer. The layout
+  // assertions above protect these stores against DPDK mbuf ABI changes.
+#if defined(__SSE2__)
+  // 1st store (16 B at &rearm_data): [data_off|refcnt|nb_segs|port] [ol_flags]
+  const uint64_t low_rearm =
+      static_cast<uint64_t>(initial_data_off) |
+      (UINT64_C(1) << 16) |  // refcnt = 1
+      (UINT64_C(1) << 32) |  // nb_segs = 1
+      (static_cast<uint64_t>(RTE_MBUF_PORT_INVALID) << 48);
+  const __m128i rearm = _mm_set_epi64x(
+      static_cast<long long>(initial_ol_flags),
+      static_cast<long long>(std::bit_cast<int64_t>(low_rearm)));
+
+  // 2nd store (16 B at rx_descriptor_fields1): [packet_type|pkt_len] [data_len|vlan_tci|rss]
+  const __m128i rxdesc = _mm_setr_epi32(
+      0,                                        // packet_type
+      static_cast<int32_t>(packet_len),         // pkt_len
+      static_cast<int32_t>(data_len),           // data_len | vlan_tci=0
+      0);                                       // rss (don't care)
+
+  size_t i = 0;
+  for (; i + 1 < count; i += 2) {
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(&pkts[i]->rearm_data), rearm);
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(pkts[i]->rx_descriptor_fields1),
+                     rxdesc);
+    pkts[i]->tx_offload = 0;
+    pkts[i]->vlan_tci_outer = 0;
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(&pkts[i + 1]->rearm_data),
+                     rearm);
+    _mm_storeu_si128(
+        reinterpret_cast<__m128i *>(pkts[i + 1]->rx_descriptor_fields1), rxdesc);
+    pkts[i + 1]->tx_offload = 0;
+    pkts[i + 1]->vlan_tci_outer = 0;
+  }
+  if (i < count) {
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(&pkts[i]->rearm_data), rearm);
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(pkts[i]->rx_descriptor_fields1),
+                     rxdesc);
+    pkts[i]->tx_offload = 0;
+    pkts[i]->vlan_tci_outer = 0;
+  }
+#else  // scalar fallback for non-x86 architectures
   for (size_t i = 0; i < count; i++) {
     PacketHandle pkt = pkts[i];
-    pkt->pkt_len = packet_len;
-    pkt->tx_offload = 0;
-    pkt->vlan_tci = 0;
+    pkt->data_off       = initial_data_off;
+    rte_mbuf_refcnt_set(pkt, 1);
+    pkt->nb_segs        = 1;
+    pkt->port           = RTE_MBUF_PORT_INVALID;
+    pkt->ol_flags       = initial_ol_flags;
+    pkt->packet_type    = 0;
+    pkt->pkt_len        = packet_len;
+    pkt->data_len       = data_len;
+    pkt->tx_offload     = 0;
+    pkt->vlan_tci       = 0;
     pkt->vlan_tci_outer = 0;
-    pkt->port = RTE_MBUF_PORT_INVALID;
-    pkt->ol_flags = initial_ol_flags;
-    pkt->packet_type = 0;
-    pkt->data_off = initial_data_off;
-    pkt->data_len = data_len;
   }
+#endif
   return true;
 }
 

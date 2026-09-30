@@ -369,6 +369,7 @@ unit_test_sources = [
   'modules/wildcard_match_test.cc',
   'modules/wildcard_match_transaction_test.cc',
   'packet_cursor_test.cc',
+  'packet_test.cc',
   'packet_checksum_test.cc',
   'packet_tx_checksum_test.cc',
   'packet_mutation_test.cc',

@@ -22,6 +22,7 @@ class Queue : public Module {
         prefetch_(),
         backpressure_(),
         burst_(),
+        enqueue_fn_(&rte_ring_mp_enqueue_burst),
         size_(),
         high_water_(),
         low_water_(),
@@ -37,6 +38,8 @@ class Queue : public Module {
   CommandResponse SetRuntimeConfig(const bess::pb::QueueArg &arg);
 
   void DeInit() override;
+
+  int OnEvent(bess::Event event) override;
 
   struct task_result RunTask(Context *ctx, bess::PacketBatch *batch,
                              void *arg) override;
@@ -71,6 +74,10 @@ class Queue : public Module {
   // Set by THREAD_SAFE commands while workers read it.
 
   std::atomic<int> burst_;
+  using EnqueueFn = unsigned int (*)(struct rte_ring *, void * const *,
+                                     unsigned int, unsigned int *);
+  EnqueueFn enqueue_fn_;
+
 
   // Queue capacity
   uint64_t size_;
