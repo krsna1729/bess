@@ -28,7 +28,7 @@
 
 #if __has_include("classifier/concurrent_masked.h")
 #include "classifier/concurrent_masked.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #define HAVE_CONCURRENT_MASKED 1
 #endif
 #include "classifier/masked_exact.h"
@@ -136,7 +136,7 @@ LookupFixture &FixtureFor(int tuples, size_t rules) {
   }
   std::vector<bess::classifier::RuntimeMaskedRule<uint16_t, int64_t>> rs;
   auto table = bess::classifier::ConcurrentMaskedTable::Create(
-      8, 8, bess::control::runtime().rcu());
+      8, 8, bess::runtime::runtime().rcu());
   if (!table) std::abort();
   f->concurrent = std::move(*table);
   for (size_t r = 0; r < rules; r++) {

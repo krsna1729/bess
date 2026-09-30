@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_CONTROL_RUNTIME_STATE_H_
-#define BESS_CONTROL_RUNTIME_STATE_H_
+#ifndef BESS_RUNTIME_RUNTIME_STATE_H_
+#define BESS_RUNTIME_RUNTIME_STATE_H_
 
 #include <cstdint>
 #include <map>
@@ -25,7 +25,7 @@ class TransactionEngine;
 namespace bess {
 class TrafficClass;
 
-namespace control {
+namespace runtime {
 
 class WorkerManager;
 
@@ -218,7 +218,7 @@ inline RuntimeState &runtime() {
   return RuntimeState::Get();
 }
 
-}  // namespace control
+}  // namespace runtime
 }  // namespace bess
 
-#endif  // BESS_CONTROL_RUNTIME_STATE_H_
+#endif  // BESS_RUNTIME_RUNTIME_STATE_H_

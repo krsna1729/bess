@@ -19,15 +19,15 @@
 #include "../classifier/exact_rule_resource.h"
 #include "../classifier/extract_plan.h"
 #include "../classifier/runtime_schema.h"
-#include "../control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "../event.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../rcu/rcu_ptr.h"
 
 using google::protobuf::RepeatedPtrField;
-// (bess::utils::Error is the same alias; defined locally so this module no
-// longer depends on utils/exact_match_table.h, which hash_lb still uses.)
+// (bess::framework::Error is the same alias; defined locally so this module
+// no longer depends on framework/exact_match_table.h, which HashLB still uses.)
 using Error = std::pair<int, std::string>;
 
 // Two modes, fixed at Init():
@@ -62,7 +62,7 @@ class ExactMatch final : public Module {
   static constexpr size_t kMaxKeyBytes = kMaxFields * kMaxFieldSize;
 
   ExactMatch()
-      : Module(), published_(bess::control::runtime().rcu()) {
+      : Module(), published_(bess::runtime::runtime().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 

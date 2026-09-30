@@ -23,13 +23,13 @@
 #include <thread>
 #include <vector>
 
-#include "control/runtime_state.h"
-#include "control/worker_manager.h"
+#include "runtime/runtime_state.h"
+#include "runtime/worker_manager.h"
 #include "dataplane/action_id.h"
 #include "dataplane/object_table.h"
 #include "module.h"
 #include "module_graph.h"
-#include "opts.h"
+#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
 #include "rcu/rcu_domain.h"
@@ -175,7 +175,7 @@ class ObjectTableRcuTest : public ::testing::Test {
  protected:
   void SetUp() override {
     InitRuntimeOnce();
-    domain_ = &bess::control::runtime().rcu();
+    domain_ = &bess::runtime::runtime().rcu();
     TestAction::alive = 0;
     TestAction::destroyed = 0;
     TestAction::destroyed_on_thread = 0;
@@ -191,7 +191,7 @@ class ObjectTableRcuTest : public ::testing::Test {
     WaitFor([] { return g_done.load() || !g_holding.load(); },
             std::chrono::milliseconds(2000));
 
-    if (bess::control::runtime().workers().num_workers() > 0) {
+    if (bess::runtime::runtime().workers().num_workers() > 0) {
       // The daemon's order: modules (which own tasks) under a pause, then
       // workers.
       {

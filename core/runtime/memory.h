@@ -1,12 +1,15 @@
-#ifndef BESS_MEMORY_H_
-#define BESS_MEMORY_H_
+#ifndef BESS_RUNTIME_MEMORY_H_
+#define BESS_RUNTIME_MEMORY_H_
 
 #include <glog/logging.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace bess {
 
@@ -117,4 +120,4 @@ class DmaMemoryPool {
 
 }  // namespace bess
 
-#endif  // BESS_MEMORY_H_
+#endif  // BESS_RUNTIME_MEMORY_H_

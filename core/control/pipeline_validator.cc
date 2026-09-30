@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "control/pipeline_validator.h"
-#include "control/thread_placement.h"
-
+#include "runtime/thread_placement.h"
 #include <cerrno>
 #include <set>
 #include <string>
@@ -64,8 +63,8 @@ const char *ParentOf(const PipelineSpec &spec, const std::string &name) {
 
 }  // namespace
 
-ControlResult<ValidatedPipeline> ValidatePipeline(const RuntimeState &runtime,
-                                                  const PipelineSpec &desired) {
+ControlResult<ValidatedPipeline> ValidatePipeline(
+    const runtime::RuntimeState &runtime, const PipelineSpec &desired) {
   // Only type registries and the CPU topology are consulted; the runtime's
   // instance registries are deliberately not touched, so validation cannot
   // have side effects on the active pipeline.
@@ -196,12 +195,12 @@ ControlResult<ValidatedPipeline> ValidatePipeline(const RuntimeState &runtime,
           "worker " + std::to_string(worker.wid) + ": CPU " +
               std::to_string(worker.core) + " is not present"));
     }
-    if (!CpuAllowed(worker.core)) {
+    if (!runtime::CpuAllowed(worker.core)) {
       return std::unexpected(Invalid(
           "worker", "core",
           "worker " + std::to_string(worker.wid) + ": CPU " +
               std::to_string(worker.core) + " is not in bessd's CPU set (" +
-              CpuList(ProcessCpus()) + ")"));
+              runtime::CpuList(runtime::ProcessCpus()) + ")"));
     }
     if (!worker_cores.insert(worker.core).second) {
       return std::unexpected(Invalid(

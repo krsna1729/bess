@@ -67,10 +67,6 @@ bool LoadPlugins(const std::string &directory);
 // List all imported .so files.
 std::vector<std::string> ListPlugins();
 
-// Return the current executable's own directory. For example, if the location
-// of the executable is /opt/bess/core/bessd, returns /opt/bess/core/ (with the
-// slash at the end).
-std::string GetCurrentDirectory();
 
 }  // namespace bessd
 }  // namespace bess

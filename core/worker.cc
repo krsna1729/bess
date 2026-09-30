@@ -23,12 +23,12 @@
 
 #include "metadata.h"
 #include "module.h"
-#include "opts.h"
+#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "resume_hook.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "rcu/rcu_domain.h"
-#include "control/worker_manager.h"
+#include "runtime/worker_manager.h"
 #include "resume_hooks/metadata.h"
 #include "scheduler.h"
 #include "utils/random.h"
@@ -65,75 +65,75 @@ int is_cpu_present(unsigned int core_id) {
 }
 
 int is_worker_active(int wid) {
-  return bess::control::runtime().workers().IsActive(wid);
+  return bess::runtime::runtime().workers().IsActive(wid);
 }
 
 int is_worker_core(int cpu) {
-  return bess::control::runtime().workers().IsCoreUsed(cpu);
+  return bess::runtime::runtime().workers().IsCoreUsed(cpu);
 }
 
 void pause_worker(int wid) {
-  bess::control::runtime().workers().Pause(wid);
+  bess::runtime::runtime().workers().Pause(wid);
 }
 
 void pause_all_workers() {
-  bess::control::runtime().workers().PauseAll();
+  bess::runtime::runtime().workers().PauseAll();
 }
 
 void resume_worker(int wid) {
-  bess::control::runtime().workers().Resume(wid);
+  bess::runtime::runtime().workers().Resume(wid);
 }
 
 void resume_all_workers() {
-  bess::control::runtime().workers().ResumeAll();
+  bess::runtime::runtime().workers().ResumeAll();
 }
 
 void attach_orphans() {
-  bess::control::runtime().workers().AttachOrphans();
+  bess::runtime::runtime().workers().AttachOrphans();
 }
 
 void destroy_worker(int wid) {
-  bess::control::runtime().workers().Destroy(wid);
+  bess::runtime::runtime().workers().Destroy(wid);
 }
 
 void destroy_all_workers() {
-  bess::control::runtime().workers().DestroyAll();
+  bess::runtime::runtime().workers().DestroyAll();
 }
 
 void detach_all_worker_threads() {
-  bess::control::runtime().workers().DetachAllThreads();
+  bess::runtime::runtime().workers().DetachAllThreads();
 }
 
 bool is_any_worker_running() {
-  return bess::control::runtime().workers().AnyRunning();
+  return bess::runtime::runtime().workers().AnyRunning();
 }
 
 bool is_worker_running(int wid) {
-  return bess::control::runtime().workers().IsRunning(wid);
+  return bess::runtime::runtime().workers().IsRunning(wid);
 }
 
 void launch_worker(int wid, int core, const std::string &scheduler) {
-  bess::control::runtime().workers().Launch(wid, core, scheduler);
+  bess::runtime::runtime().workers().Launch(wid, core, scheduler);
 }
 
 Worker *get_next_active_worker() {
-  return bess::control::runtime().workers().NextActive();
+  return bess::runtime::runtime().workers().NextActive();
 }
 
 void add_tc_to_orphan(bess::TrafficClass *c, int wid) {
-  bess::control::runtime().workers().AddOrphan(c, wid);
+  bess::runtime::runtime().workers().AddOrphan(c, wid);
 }
 
 bool remove_tc_from_orphan(bess::TrafficClass *c) {
-  return bess::control::runtime().workers().RemoveOrphan(c);
+  return bess::runtime::runtime().workers().RemoveOrphan(c);
 }
 
 const std::list<std::pair<int, bess::TrafficClass *>> &list_orphan_tcs() {
-  return bess::control::runtime().workers().orphan_tcs();
+  return bess::runtime::runtime().workers().orphan_tcs();
 }
 
 bool detach_tc(bess::TrafficClass *c) {
-  return bess::control::runtime().workers().DetachTc(c);
+  return bess::runtime::runtime().workers().DetachTc(c);
 }
 
 void Worker::SetNonWorker() {
@@ -166,35 +166,35 @@ void Worker::ReportQuiescent() {
   if (!rcu_online_ || wid_ < 0 || wid_ >= Worker::kMaxWorkers) {
     return;
   }
-  bess::control::runtime().rcu().Quiescent(wid_);
+  bess::runtime::runtime().rcu().Quiescent(wid_);
 }
 
 int Worker::BlockWorker() {
-  bess::control::worker_signal t;
+  bess::runtime::worker_signal t;
   int ret;
 
   // Leave the RCU reader domain *before* blocking (K1): a grace period must
   // never depend on a thread that will not report quiescence until it is woken
   // again. This is the offline-before-blocking rule.
   rcu_online_ = false;
-  bess::control::runtime().rcu().Offline(wid_);
+  bess::runtime::runtime().rcu().Offline(wid_);
 
   status_ = WORKER_PAUSED;
 
   ret = read(fd_event_, &t, sizeof(t));
   CHECK_EQ(ret, sizeof(t));
 
-  if (t == bess::control::worker_signal::unblock) {
+  if (t == bess::runtime::worker_signal::unblock) {
     // Back online before any dataplane work resumes, and report quiescence so
     // that a grace period started while this worker was paused can complete.
-    bess::control::runtime().rcu().Online(wid_);
+    bess::runtime::runtime().rcu().Online(wid_);
     rcu_online_ = true;
-    bess::control::runtime().rcu().Quiescent(wid_);
+    bess::runtime::runtime().rcu().Quiescent(wid_);
     status_ = WORKER_RUNNING;
     return 0;
   }
 
-  if (t == bess::control::worker_signal::quit) {
+  if (t == bess::runtime::worker_signal::quit) {
     status_ = WORKER_FINISHED;
     return 1;
   }
@@ -205,7 +205,7 @@ int Worker::BlockWorker() {
 
 /* The entry point of worker threads */
 void *Worker::Run(void *_arg) {
-  bess::control::WorkerThreadArg *arg = (bess::control::WorkerThreadArg *)_arg;
+  bess::runtime::WorkerThreadArg *arg = (bess::runtime::WorkerThreadArg *)_arg;
   rand_ = new Random();
 
   cpu_set_t set;
@@ -281,13 +281,13 @@ void *Worker::Run(void *_arg) {
 
   STORE_BARRIER();
 
-  bess::control::runtime().workers().Publish(wid_, this);
+  bess::runtime::runtime().workers().Publish(wid_, this);
 
   // Register as a reader, but stay offline: a worker that merely exists as a
   // thread is not an active RCU participant. It goes online when dataplane
   // execution is about to resume (BlockWorker's unblock path).
   {
-    auto registered = bess::control::runtime().rcu().Register(wid_);
+    auto registered = bess::runtime::runtime().rcu().Register(wid_);
     CHECK(registered.has_value())
         << "RCU reader registration failed for worker " << wid_ << ": "
         << registered.error().message;
@@ -308,8 +308,8 @@ void *Worker::Run(void *_arg) {
   // before teardown, so a recreated worker with this id can register again and
   // a grace period stops waiting for it.
   rcu_online_ = false;
-  bess::control::runtime().rcu().Offline(wid_);
-  bess::control::runtime().rcu().Unregister(wid_);
+  bess::runtime::runtime().rcu().Offline(wid_);
+  bess::runtime::runtime().rcu().Unregister(wid_);
 
   delete scheduler_;
   delete rand_;

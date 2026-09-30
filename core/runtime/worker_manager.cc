@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "control/worker_manager.h"
+#include "runtime/worker_manager.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -10,10 +10,10 @@
 
 #include <glog/logging.h>
 
-#include "control/runtime_state.h"
-#include "control/thread_placement.h"
+#include "runtime/runtime_state.h"
+#include "runtime/thread_placement.h"
 #include "module.h"
-#include "opts.h"
+#include "runtime/opts.h"
 #include "resume_hook.h"
 #include "resume_hooks/metadata.h"
 #include "scheduler.h"
@@ -25,7 +25,7 @@ using bess::ExperimentalScheduler;
 using bess::Scheduler;
 
 namespace bess {
-namespace control {
+namespace runtime {
 
 namespace {
 
@@ -317,5 +317,5 @@ bool WorkerManager::DetachTc(TrafficClass *c) {
   return RemoveOrphan(c);
 }
 
-}  // namespace control
+}  // namespace runtime
 }  // namespace bess

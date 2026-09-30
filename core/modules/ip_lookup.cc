@@ -7,7 +7,7 @@
 #include <cerrno>
 #include <string>
 
-#include "../control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "../utils/bits.h"
 #include "../utils/ether.h"
 #include "../utils/format.h"
@@ -40,7 +40,7 @@ CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
   config.socket = 0;
 
   auto table = bess::route::RouteTable<GateRoute>::Create(
-      name(), config, bess::control::runtime().rcu());
+      name(), config, bess::runtime::runtime().rcu());
   if (!table) {
     return CommandFailure(RouteErrno(table.error()), "route table: %s",
                           bess::route::RouteErrorName(table.error()));

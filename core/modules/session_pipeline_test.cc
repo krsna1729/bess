@@ -21,9 +21,9 @@
 #include <string>
 #include <vector>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "dataplane/action_id.h"
-#include "control/resource_codec.h"
+#include "framework/resource_codec.h"
 #include "dataplane/transaction_engine.h"
 #include "meter/meter.h"
 #include "module.h"
@@ -45,7 +45,7 @@ using bess::route::Ipv4Prefix;
 using bess::route::NextHopId;
 using Outcome = TransactionEngine::Outcome;
 
-TransactionEngine &Engine() { return bess::control::runtime().transactions(); }
+TransactionEngine &Engine() { return bess::runtime::runtime().transactions(); }
 
 template <typename Arg>
 google::protobuf::Any Pack(const Arg &arg) {
@@ -139,7 +139,7 @@ class SessionPipelineTest : public ::testing::Test {
   void Settle() {
     while (Engine().ReclaimRetired() != 0) {
     }
-    bess::control::runtime().rcu().Drain();
+    bess::runtime::runtime().rcu().Drain();
   }
 
   TransactionEngine::Result Apply(std::vector<Op> ops) {
@@ -375,7 +375,7 @@ TEST_F(SessionPipelineTest, RemovalCascadeAndIdReuse) {
 
   // A reader that never reports quiescence: the removal cascade cannot run, so
   // what an erase leaves behind is observable.
-  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr bess::rcu::ReaderId kReader = 25;
   ASSERT_TRUE(domain.Register(kReader).has_value());
   domain.Online(kReader);
@@ -566,9 +566,43 @@ TEST_F(SessionPipelineTest, RouterCodecRejectsOutOfRangePrefix) {
   bess::pb::RouterRouteKey key;
   key.set_ipv4("0.0.0.0");
   key.set_prefix_length(256);  // narrowing to uint8_t would silently make /0
-  EXPECT_FALSE(codec->Key(Pack(key)).has_value());
+  google::protobuf::Any packed = Pack(key);
+  EXPECT_FALSE(codec->Key(packed.type_url(), packed.value()).has_value());
   key.set_prefix_length(0);
-  EXPECT_TRUE(codec->Key(Pack(key)).has_value());
+  packed = Pack(key);
+  EXPECT_TRUE(codec->Key(packed.type_url(), packed.value()).has_value());
+}
+
+TEST_F(SessionPipelineTest, ResourceCodecUnpacksTypedWireMessages) {
+  Router *rt = CreateRouterModule("rt");
+  ASSERT_NE(nullptr, rt);
+  const auto *codec = rt->router()->routes_resource_object()->codec();
+  bess::pb::RouterRouteKey key;
+  key.set_ipv4("10.0.0.0");
+  key.set_prefix_length(24);
+  const google::protobuf::Any packed = Pack(key);
+  EXPECT_TRUE(codec->Key(packed.type_url(), packed.value()).has_value());
+
+  const google::protobuf::Any wrong_type =
+      Pack(bess::pb::RouterNextHopIdKey{});
+  EXPECT_FALSE(
+      codec->Key(wrong_type.type_url(), wrong_type.value()).has_value());
+
+  const std::string malformed(1, static_cast<char>(0xff));
+  EXPECT_FALSE(codec->Key(packed.type_url(), malformed).has_value());
+  bess::pb::RouterRouteValue value;
+  value.set_next_hop_id(7);
+  const google::protobuf::Any packed_value = Pack(value);
+  EXPECT_TRUE(
+      codec->Value(packed_value.type_url(), packed_value.value()).has_value());
+
+  const google::protobuf::Any wrong_value_type =
+      Pack(bess::pb::RouterNextHopValue{});
+  EXPECT_FALSE(codec->Value(wrong_value_type.type_url(),
+                            wrong_value_type.value())
+                   .has_value());
+  EXPECT_FALSE(
+      codec->Value(packed_value.type_url(), malformed).has_value());
 }
 
 TEST_F(SessionPipelineTest, ActionIdsAreNotNarrowedToGateWidth) {
@@ -630,14 +664,20 @@ TEST_F(SessionPipelineTest, CodecsRejectMismatchedFieldsAndUnknownEnums) {
   bess::pb::ExactMatchRuleValue em_val;
   em_val.set_gate(1);
   em_val.set_action_id(1);
-  EXPECT_FALSE(em_codec->Value(Pack(em_val)).has_value());
+  const google::protobuf::Any packed_em_val = Pack(em_val);
+  EXPECT_FALSE(em_codec
+                   ->Value(packed_em_val.type_url(), packed_em_val.value())
+                   .has_value());
 
   const auto *nh_codec = rt->router()->next_hops_resource_object()->codec();
   ASSERT_NE(nullptr, nh_codec);
   bess::pb::RouterNextHopValue nh_val;
   nh_val.set_egress_gate(0);
   nh_val.set_neighbor(static_cast<bess::pb::RouterNeighborState>(99));
-  EXPECT_FALSE(nh_codec->Value(Pack(nh_val)).has_value());
+  const google::protobuf::Any packed_nh_val = Pack(nh_val);
+  EXPECT_FALSE(nh_codec
+                   ->Value(packed_nh_val.type_url(), packed_nh_val.value())
+                   .has_value());
 }
 
 

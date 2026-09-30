@@ -23,7 +23,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "packet_pool.h"
 #include "route/route_table.h"
 #include "route/router.h"
@@ -46,7 +46,7 @@ std::unique_ptr<RouteTable<Value>> MakeTable(uint32_t routes = 1024,
   config.max_routes = routes;
   config.tbl8_groups = tbl8;
   auto table = RouteTable<Value>::Create("route_test", config,
-                                         control::runtime().rcu());
+                                         bess::runtime::runtime().rcu());
   EXPECT_TRUE(table.has_value()) << RouteErrorName(table.error());
   return std::move(table).value();
 }
@@ -270,7 +270,7 @@ TEST(RouteTableTest, LargeArbitraryOrderMatchesReferenceThroughChurn) {
 // Once the reader is quiescent, the next add reclaims the group. The pool
 // holds one group, so the second /24's add can only succeed by reuse.
 TEST(RouteTableTest, FreedTbl8GroupWaitsForOnlineReaders) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto table = MakeTable(64, /*tbl8=*/1);
   const Ipv4Prefix a = P(Ip(10, 1, 1, 64), 26);
   const Ipv4Prefix b = P(Ip(10, 2, 2, 64), 26);
@@ -300,7 +300,7 @@ TEST(RouteTableTest, FreedTbl8GroupWaitsForOnlineReaders) {
 // group, so it always has room; aborting placed routes and publishing
 // erases rely on it.
 TEST(RouteTableTest, DeletesNeverFailWithAStalledReader) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr uint32_t kGroups = 8;
   auto table = MakeTable(64, kGroups);
   for (uint32_t i = 0; i < kGroups; i++) {
@@ -336,7 +336,7 @@ TEST(RouteTableTest, DeletesNeverFailWithAStalledReader) {
 // the /26's value for keys inside it. A group reused under a reader would
 // surface as another /24's value.
 TEST(RouteTableTest, ConcurrentReadersOnlySeeJustifiedAnswers) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto table = MakeTable(4096, /*tbl8=*/4);
 
   constexpr uint32_t kSubnets = 64;
@@ -432,7 +432,7 @@ std::unique_ptr<Router> MakeRouter(size_t next_hops = 64) {
   config.max_routes = 4096;
   config.tbl8_groups = 256;
   auto router = Router::Create("router_test", config, next_hops,
-                               control::runtime().rcu());
+                               bess::runtime::runtime().rcu());
   EXPECT_TRUE(router.has_value()) << RouteErrorName(router.error());
   return std::move(router).value();
 }
@@ -512,7 +512,7 @@ TEST(RouterTest, ResolveBatch) {
 // would come back with the bit cleared; RemoveNextHop's grace period is what
 // prevents that.
 TEST(RouterTest, ConcurrentChurnNeverLosesANextHop) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto router = MakeRouter(/*next_hops=*/64);
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
   ASSERT_TRUE(router->SetRoute(P(Ip(10, 0, 0, 0), 8), NextHopId(1)));
@@ -583,7 +583,7 @@ TEST(RouterTest, ConcurrentChurnNeverLosesANextHop) {
 // reused, so a reader still holding it from a removed route can never reach a
 // different next hop. Afterwards the next control call drops it.
 TEST(RouterTest, NextHopRemovalIsDeferredNotBlocking) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto router = MakeRouter(/*next_hops=*/8);
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
   ASSERT_TRUE(router->SetNextHop(NextHopId(2), Hop(2, 2)));

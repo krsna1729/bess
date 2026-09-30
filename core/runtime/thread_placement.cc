@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "control/thread_placement.h"
+#include "runtime/thread_placement.h"
 
 #include <dirent.h>
 #include <unistd.h>
@@ -11,9 +11,9 @@
 
 #include <glog/logging.h>
 
-#include "opts.h"
+#include "runtime/opts.h"
 
-namespace bess::control {
+namespace bess::runtime {
 
 cpu_set_t ControlCpus(const cpu_set_t &base, std::span<const int> cores) {
   cpu_set_t out = base;
@@ -122,4 +122,4 @@ int PlaceControlThreads(std::span<const WorkerPlacement> workers) {
   return moved;
 }
 
-}  // namespace bess::control
+}  // namespace bess::runtime

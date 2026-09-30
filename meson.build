@@ -104,26 +104,37 @@ if get_option('af_xdp') == 'required'
   endforeach
 endif
 
+glog_dep = dependency('libglog', method: 'pkg-config', required: true)
+gflags_dep = dependency('gflags', method: 'pkg-config', required: true)
+protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true)
+grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true)
+libunwind_dep = dependency('libunwind', method: 'pkg-config', required: true)
+zlib_dep = dependency('zlib', method: 'pkg-config', required: true)
+pcap_dep = dependency('libpcap', method: 'pkg-config', required: true)
+numa_dep = dependency('numa', method: 'pkg-config', required: true)
+
 common_deps = [
   dpdk_dep,
-  dependency('libglog', method: 'pkg-config', required: true),
-  dependency('gflags', method: 'pkg-config', required: true),
-  dependency('protobuf', method: 'pkg-config', required: true),
-  dependency('grpc++', method: 'pkg-config', required: true),
-  dependency('libunwind', method: 'pkg-config', required: true),
-  dependency('zlib', method: 'pkg-config', required: true),
-  dependency('libpcap', method: 'pkg-config', required: true),
-  dependency('numa', method: 'pkg-config', required: true),
+  glog_dep,
+  gflags_dep,
+  protobuf_dep,
+  grpcpp_dep,
+  libunwind_dep,
+  zlib_dep,
+  pcap_dep,
+  numa_dep,
 ]
 
 # gRPC server reflection (grpcurl and similar tools work without the protos,
 # D-026). Shipped with grpc++ but without a pkg-config file; optional.
 grpc_reflection_lib = cpp.find_library('grpc++_reflection', required: false)
+grpc_reflection_deps = []
 if grpc_reflection_lib.found()
-  common_deps += [declare_dependency(
+  grpc_reflection_deps = [declare_dependency(
     dependencies: grpc_reflection_lib,
     compile_args: ['-DBESS_GRPC_REFLECTION'],
   )]
+  common_deps += grpc_reflection_deps
 endif
 
 gtest_dep = dependency('gtest', method: 'pkg-config', required: true)

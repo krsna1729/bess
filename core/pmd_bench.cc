@@ -44,7 +44,7 @@
 #include <glog/logging.h>
 
 #include "drivers/pmd.h"
-#include "opts.h"
+#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "pktbatch.h"
 #include "port.h"

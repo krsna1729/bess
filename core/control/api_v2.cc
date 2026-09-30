@@ -13,7 +13,7 @@
 #include <variant>
 
 #include "control/pipeline_snapshot.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "control/wire_narrow.h"
 #include "worker.h"
 
@@ -450,7 +450,7 @@ void ConfigureControlServer(grpc::ServerBuilder *builder) {
 }
 
 ControlV2Service::ControlV2Service(ControlPlane &control_plane)
-    : ControlV2Service(control_plane, runtime().transactions()) {}
+    : ControlV2Service(control_plane, runtime::runtime().transactions()) {}
 
 grpc::Status ControlV2Service::ApplyTransaction(
     grpc::ServerContext *context, const v2::ApplyTransactionRequest *request,

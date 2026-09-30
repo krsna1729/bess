@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "classifier/exact_rule_resource.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "dataplane/slot_resource.h"
 #include "dataplane/strong_id.h"
 #include "dataplane/transaction_engine.h"
@@ -66,7 +66,7 @@ struct Action {
 
 void BM_SessionEstablishRelease(benchmark::State &state) {
   const uint32_t sessions = static_cast<uint32_t>(state.range(0));
-  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto table = *ConcurrentExactTable::Create(
       8, ConcurrentExactTable::CapacityFor(sessions * 2 + 64), domain);
   SlotTable<MeterId, Meter> meters(sessions * 2 + 2);
@@ -146,7 +146,7 @@ BENCHMARK(BM_SessionEstablishRelease)->Arg(1024)->Arg(65536);
 // command if its commands go through the engine.
 void BM_SingleRule(benchmark::State &state) {
   const bool via_engine = state.range(0) != 0;
-  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto table = *ConcurrentExactTable::Create(
       8, ConcurrentExactTable::CapacityFor(65536), domain);
   ExactRuleResource rules_res("rules", *table);
@@ -184,7 +184,7 @@ BENCHMARK(BM_SingleRule)->Arg(0)->Arg(1);
 // freed by a release come back only after their cascade.
 void BM_SessionWithOnlineReader(benchmark::State &state) {
   constexpr uint32_t kSessions = 65536;
-  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr bess::rcu::ReaderId kReader = 20;
   (void)domain.Register(kReader);
   std::atomic<bool> stop{false};
@@ -297,7 +297,7 @@ void BM_LookupsUnderTransactions(benchmark::State &state) {
   const int readers = static_cast<int>(state.range(0));
   const int64_t rate = state.range(1);  // sessions/s; 0 none; -1 max
   constexpr uint32_t kSessions = 65536;
-  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
 
   auto table = *ConcurrentExactTable::Create(
       8, ConcurrentExactTable::CapacityFor(kSessions * 2 + 64), domain);

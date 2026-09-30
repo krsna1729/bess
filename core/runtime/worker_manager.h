@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_CONTROL_WORKER_MANAGER_H_
-#define BESS_CONTROL_WORKER_MANAGER_H_
+#ifndef BESS_RUNTIME_WORKER_MANAGER_H_
+#define BESS_RUNTIME_WORKER_MANAGER_H_
 
 #include <array>
 #include <atomic>
@@ -17,7 +17,7 @@
 namespace bess {
 class Scheduler;
 
-namespace control {
+namespace runtime {
 
 // Arguments handed to a worker OS thread: the BESS worker id, the CPU it is
 // pinned to, and the scheduler it owns (the thread takes ownership).
@@ -125,7 +125,7 @@ class WorkerManager {
   std::list<std::pair<int, TrafficClass *>> orphan_tcs_;
 };
 
-}  // namespace control
+}  // namespace runtime
 }  // namespace bess
 
-#endif  // BESS_CONTROL_WORKER_MANAGER_H_
+#endif  // BESS_RUNTIME_WORKER_MANAGER_H_

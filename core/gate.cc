@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "gate.h"
-#include "gate_hooks/track.h"
+#include "module.h"
 #include "utils/format.h"
 
 #include <algorithm>
@@ -208,7 +208,8 @@ void OGate::AddTrackHook() {
   // If we haven't located the track hook builder yet, do that first.
   if (track_builder == nullptr) {
     const auto it =
-        bess::GateHookBuilder::all_gate_hook_builders().find(Track::kName);
+        bess::GateHookBuilder::all_gate_hook_builders().find(
+            kTrackGateHookName);
     // Would like to use CHECK_NE here, but cannot because
     // operator<< is not defined on the arguments.
     if (it == bess::GateHookBuilder::all_gate_hook_builders().end()) {

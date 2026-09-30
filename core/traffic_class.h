@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "task.h"
 #include "utils/common.h"
 #include "utils/extended_priority_queue.h"
@@ -636,7 +636,7 @@ class TrafficClassBuilder {
     std::unique_ptr<TrafficClass> c =
         std::make_unique<T>(name, args...);
     T *raw = static_cast<T *>(c.get());
-    if (!bess::control::runtime().traffic_classes().Register(std::move(c))) {
+    if (!bess::runtime::runtime().traffic_classes().Register(std::move(c))) {
       return nullptr;
     }
     return raw;
@@ -737,13 +737,13 @@ class TrafficClassBuilder {
   static bool Clear(TrafficClass *c);
 
   // Non-owning view of the runtime's traffic-class registry.
-  static const bess::control::TrafficClassRegistry::Map &all_tcs() {
-    return bess::control::runtime().traffic_classes().All();
+  static const bess::runtime::TrafficClassRegistry::Map &all_tcs() {
+    return bess::runtime::runtime().traffic_classes().All();
   }
 
   // Returns the TrafficClass * with the given name or nullptr if not found.
   static TrafficClass *Find(const std::string &name) {
-    return bess::control::runtime().traffic_classes().Find(name);
+    return bess::runtime::runtime().traffic_classes().Find(name);
   }
 };
 

@@ -35,7 +35,7 @@
 #include <thread>
 #include <vector>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "dataplane/transaction_engine.h"
 #include "module.h"
 #include "module_graph.h"
@@ -191,7 +191,7 @@ void BM_ClassifyUnderTransactions(benchmark::State &state) {
   // 1 + s % 63. Half the sessions are live at any time.
   ExactMatch *ul = CreateModule("ul", 0);
   ExactMatch *dl = CreateModule("dl", 0);
-  TransactionEngine &engine = bess::control::runtime().transactions();
+  TransactionEngine &engine = bess::runtime::runtime().transactions();
   auto establish = [](uint32_t s) {
     const uint64_t gate = 1 + s % 63;
     return std::vector<Op>{
@@ -223,7 +223,7 @@ void BM_ClassifyUnderTransactions(benchmark::State &state) {
     }
   }
 
-  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   std::atomic<bool> stop{false};
   std::vector<std::atomic<uint64_t>> classified(readers);
   std::vector<std::thread> threads;

@@ -6,10 +6,7 @@ sample_plugin = shared_module(
   ],
   include_directories: core_include,
   cpp_args: core_cpp_include + sample_proto_include,
-  dependencies: common_deps + [
-    dependency('protobuf', method: 'pkg-config', required: true),
-    dependency('grpc++', method: 'pkg-config', required: true),
-  ],
+  dependencies: [dpdk_dep, glog_dep, protobuf_dep, grpcpp_dep],
   build_rpath: dpdk_libdir,
   install: true,
   install_dir: join_paths(get_option('libdir'), 'bess', 'modules'),

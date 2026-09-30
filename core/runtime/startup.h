@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_STARTUP_H_
-#define BESS_STARTUP_H_
+#ifndef BESS_RUNTIME_STARTUP_H_
+#define BESS_RUNTIME_STARTUP_H_
 
 #include <atomic>
 #include <cstdint>
@@ -57,4 +57,4 @@ class TerminationWatcher {
 
 }  // namespace bess::startup
 
-#endif  // BESS_STARTUP_H_
+#endif  // BESS_RUNTIME_STARTUP_H_

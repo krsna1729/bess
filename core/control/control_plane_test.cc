@@ -11,7 +11,7 @@
 #include "control/transaction.h"
 #include "control/pipeline_spec.h"
 #include "control/pipeline_validator.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "module.h"
 #include "port.h"
 #include "worker.h"
@@ -30,9 +30,9 @@ using bess::control::ValidatePipeline;
 
 class ControlPlaneTest : public ::testing::Test {
  protected:
-  void SetUp() override { runtime_ = &bess::control::runtime(); }
+  void SetUp() override { runtime_ = &bess::runtime::runtime(); }
 
-  bess::control::RuntimeState *runtime_;
+  bess::runtime::RuntimeState *runtime_;
 };
 
 // A minimal valid desired pipeline: one worker, one module, no ports (the
@@ -497,7 +497,7 @@ TEST_F(ControlPlaneTest, DiffIgnoresInternalTrafficClasses) {
   ASSERT_TRUE(diff.has_value()) << diff.error().message;
   EXPECT_TRUE(diff->traffic_classes.empty());
 
-  bess::control::runtime().traffic_classes().Release(internal);
+  bess::runtime::runtime().traffic_classes().Release(internal);
   delete internal;
 }
 

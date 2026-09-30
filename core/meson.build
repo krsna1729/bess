@@ -1,4 +1,4 @@
-core_include = include_directories('.', '..')
+core_include = include_directories('.')
 
 rcu_sources = files(
   'rcu/rcu_domain.cc',
@@ -15,9 +15,25 @@ dataplane_sources = files(
   'meter/meter.cc',
   'meter/meter_set.cc',
   'route/route_table.cc',
-  'route/router.cc',
   'stats/counter_set.cc',
-  'stats/worker_histogram.cc',
+)
+
+packet_sources = files(
+  'packet.cc',
+  'packet_reshape.cc',
+  'packet_checksum.cc',
+  'packet_tx_checksum.cc',
+)
+
+runtime_sources = files(
+  'runtime/runtime_state.cc',
+  'runtime/thread_placement.cc',
+  'runtime/worker_manager.cc',
+  'runtime/dpdk.cc',
+  'runtime/opts.cc',
+  'runtime/memory.cc',
+  'runtime/path.cc',
+  'runtime/startup.cc',
 )
 
 control_sources = files(
@@ -30,37 +46,31 @@ control_sources = files(
   'control/pipeline_snapshot.cc',
   'control/pipeline_spec.cc',
   'control/pipeline_validator.cc',
-  'control/runtime_state.cc',
-  'control/thread_placement.cc',
   'control/transaction.cc',
-  'control/worker_manager.cc',
 )
 
-core_sources = files(
-  'bessctl.cc',
-  'bessd.cc',
-  'debug.cc',
-  'dpdk.cc',
+framework_sources = files(
   'event.cc',
   'gate.cc',
-  'memory.cc',
   'message.cc',
   'metadata.cc',
   'module.cc',
   'module_graph.cc',
-  'opts.cc',
-  'packet.cc',
-  'packet_reshape.cc',
-  'packet_checksum.cc',
-  'packet_tx_checksum.cc',
   'packet_pool.cc',
   'port.cc',
   'resume_hook.cc',
+  'route/router.cc',
   'shared_obj.cc',
-  'startup.cc',
+  'stats/worker_histogram.cc',
   'task.cc',
   'traffic_class.cc',
   'worker.cc',
+)
+
+host_sources = files(
+  'bessctl.cc',
+  'bessd.cc',
+  'debug.cc',
 )
 
 driver_sources = files(
@@ -140,6 +150,7 @@ utility_sources = files(
   'utils/ip.cc',
   'utils/pcap_handle.cc',
   'utils/simd.cc',
+  'utils/stacktrace.cc',
   'utils/syscallthread.cc',
   'utils/time.cc',
 )
@@ -155,79 +166,142 @@ resume_hook_sources = files(
   'resume_hooks/task_graph.cc',
 )
 
-runtime_compile_deps = common_deps + [bess_proto_dep]
+low_level_compile_deps = [dpdk_dep, glog_dep]
+runtime_compile_deps = low_level_compile_deps + [
+  gflags_dep, protobuf_dep, bess_proto_headers_dep,
+]
+framework_compile_deps = runtime_compile_deps + [pcap_dep]
+control_compile_deps = low_level_compile_deps + [
+  gflags_dep, protobuf_dep, grpcpp_dep, bess_proto_headers_dep,
+] + grpc_reflection_deps
+host_compile_deps = common_deps + [bess_proto_headers_dep]
+driver_compile_deps = low_level_compile_deps + [
+  protobuf_dep, pcap_dep, bess_proto_headers_dep,
+]
+module_compile_deps = low_level_compile_deps + [
+  protobuf_dep, pcap_dep, bess_proto_headers_dep,
+]
+hook_compile_deps = module_compile_deps
+resume_hook_compile_deps = low_level_compile_deps + [
+  protobuf_dep, bess_proto_headers_dep,
+]
+utility_compile_deps = low_level_compile_deps + [pcap_dep]
 
 bess_rcu = static_library(
   'bess_rcu',
   rcu_sources,
   include_directories: core_include,
-  dependencies: runtime_compile_deps,
+  dependencies: low_level_compile_deps,
 )
 bess_dataplane = static_library(
   'bess_dataplane',
   dataplane_sources,
   include_directories: core_include,
-  dependencies: runtime_compile_deps,
+  dependencies: low_level_compile_deps,
   link_with: [bess_rcu],
+)
+bess_utils = static_library(
+  'bess_utils',
+  utility_sources,
+  include_directories: core_include,
+  dependencies: utility_compile_deps,
+)
+bess_runtime = static_library(
+  'bess_runtime',
+  runtime_sources + [proto_ready_marker],
+  include_directories: core_include,
+  dependencies: runtime_compile_deps,
+  link_with: [bess_dataplane, bess_rcu, bess_utils],
+)
+
+bess_packet = static_library(
+  'bess_packet',
+  packet_sources,
+  include_directories: core_include,
+  dependencies: low_level_compile_deps,
+  link_with: [bess_utils],
+)
+bess_framework = static_library(
+  'bess_framework',
+  framework_sources + [proto_ready_marker],
+  include_directories: core_include,
+  dependencies: framework_compile_deps,
+  link_with: [bess_runtime, bess_packet, bess_dataplane, bess_rcu, bess_utils],
 )
 bess_control = static_library(
   'bess_control',
   control_sources + [proto_ready_marker],
   include_directories: core_include,
-  dependencies: runtime_compile_deps,
-  link_with: [bess_dataplane, bess_rcu],
+  dependencies: control_compile_deps,
+  link_with: [bess_runtime, bess_framework, bess_dataplane, bess_rcu],
 )
-bess_core = static_library(
-  'bess_core',
-  core_sources + [proto_ready_marker],
+bess_host = static_library(
+  'bess_host',
+  host_sources + [proto_ready_marker],
   include_directories: core_include,
-  dependencies: runtime_compile_deps,
-  link_with: [bess_control, bess_dataplane, bess_rcu],
+  dependencies: host_compile_deps,
+  link_with: [bess_control, bess_framework, bess_runtime, bess_dataplane, bess_rcu],
 )
 bess_drivers = static_library(
   'bess_drivers',
   driver_sources + [proto_ready_marker],
   include_directories: core_include,
-  dependencies: runtime_compile_deps,
-)
-bess_utils = static_library(
-  'bess_utils',
-  utility_sources + [proto_ready_marker],
-  include_directories: core_include,
-  dependencies: runtime_compile_deps,
+  dependencies: driver_compile_deps,
+  link_with: [bess_framework, bess_runtime],
 )
 bess_modules = static_library(
   'bess_modules',
   module_sources + [proto_ready_marker],
   include_directories: core_include,
-  dependencies: runtime_compile_deps,
+  dependencies: module_compile_deps,
+  link_with: [bess_framework, bess_runtime, bess_dataplane, bess_rcu, bess_utils],
   pic: true,
 )
 bess_gate_hooks = static_library(
   'bess_gate_hooks',
   gate_hook_sources + [proto_ready_marker],
   include_directories: core_include,
-  dependencies: runtime_compile_deps,
+  dependencies: hook_compile_deps,
+  link_with: [bess_framework, bess_runtime],
 )
 bess_resume_hooks = static_library(
   'bess_resume_hooks',
   resume_hook_sources + [proto_ready_marker],
   include_directories: core_include,
-  dependencies: runtime_compile_deps,
+  dependencies: resume_hook_compile_deps,
+  link_with: [bess_framework, bess_runtime],
 )
 
 runtime_whole = [
   bess_proto_lib,
   bess_rcu,
+  bess_packet,
   bess_dataplane,
+  bess_runtime,
+  bess_framework,
   bess_control,
-  bess_core,
+  bess_host,
   bess_utils,
   bess_drivers,
   bess_modules,
   bess_gate_hooks,
   bess_resume_hooks,
 ]
+component_runtime_whole = [
+  bess_proto_lib,
+  bess_rcu,
+  bess_dataplane,
+  bess_runtime,
+  bess_framework,
+  bess_utils,
+  bess_packet,
+]
+
+module_graph_runtime_whole = component_runtime_whole + [bess_gate_hooks]
+module_runtime_whole = module_graph_runtime_whole + [bess_modules]
+driver_runtime_whole = component_runtime_whole + [bess_drivers]
+gate_runtime_whole = component_runtime_whole + [bess_gate_hooks]
+
 runtime_deps = common_deps + [bess_proto_dep]
 runtime_rpath = dpdk_libdir
 
@@ -277,12 +351,12 @@ unit_test_sources = [
   'control/api_v2_test.cc',
   'control/dataplane_transactions_test.cc',
   'control/thread_placement_test.cc',
-  'startup_test.cc',
+  'runtime/startup_test.cc',
   'control/apply_pipeline_test.cc',
   'control/control_plane_test.cc',
   'bessd_test.cc',
   'gate_test.cc',
-  'memory_test.cc',
+  'runtime/memory_test.cc',
   'metadata_test.cc',
   'module_test.cc',
   'modules/drr_test.cc',
@@ -313,7 +387,7 @@ unit_test_sources = [
   'utils/cuckoo_map_test.cc',
   'utils/endian_test.cc',
   'utils/ether_test.cc',
-  'utils/exact_match_table_test.cc',
+  'framework/exact_match_table_test.cc',
   'utils/extended_priority_queue_test.cc',
   'utils/fifo_test.cc',
   'utils/histogram_test.cc',
@@ -328,6 +402,28 @@ unit_test_sources = [
 taskset_prog = find_program('taskset', required: false)
 foreach source : unit_test_sources
   test_name = source.replace('.cc', '').replace('/', '_')
+  integration_test = (
+    source.startswith('control/') or
+    source == 'bessd_test.cc' or
+    source == 'registry_test.cc'
+  )
+  test_link_whole = component_runtime_whole
+  if source.startswith('modules/')
+    test_link_whole = module_runtime_whole
+  elif source in [
+    'dataplane/object_table_rcu_test.cc',
+    'metadata_test.cc',
+    'module_test.cc',
+    'rcu/rcu_scheduler_test.cc',
+  ]
+    test_link_whole = module_graph_runtime_whole
+  elif source.startswith('drivers/')
+    test_link_whole = driver_runtime_whole
+  elif source == 'gate_test.cc'
+    test_link_whole = gate_runtime_whole
+  elif integration_test
+    test_link_whole = runtime_whole
+  endif
   # The test main is ours (core/gtest_main.cc) rather than the packaged one:
   # it configures the death-test style and keeps expected-death children from
   # writing core dumps.
@@ -336,7 +432,7 @@ foreach source : unit_test_sources
     source,
     'gtest_main.cc',
     include_directories: core_include,
-    link_whole: runtime_whole,
+    link_whole: test_link_whole,
     dependencies: runtime_deps + [gtest_dep],
     build_rpath: runtime_rpath,
   )

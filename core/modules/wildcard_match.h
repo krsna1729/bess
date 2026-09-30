@@ -18,7 +18,7 @@
 #include "../classifier/concurrent_masked.h"
 #include "../classifier/masked_rule_resource.h"
 #include "../classifier/runtime_schema.h"
-#include "../control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "../event.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
@@ -55,7 +55,7 @@ class WildcardMatch final : public Module {
   static constexpr size_t kMaxKeyBytes = kMaxFields * kMaxFieldSize;
   static constexpr size_t kMaxTuples = 8;
 
-  WildcardMatch() : Module(), published_(bess::control::runtime().rcu()) {
+  WildcardMatch() : Module(), published_(bess::runtime::runtime().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 

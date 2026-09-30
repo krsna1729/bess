@@ -206,7 +206,7 @@ class StagedOp {
   virtual void Abort() noexcept {}
 };
 
-class ResourceCodec;  // resource_codec.h (protobuf; the RPC's concern)
+class ResourceCodec;  // framework/resource_codec.h; the engine needs no protobuf.
 
 class Resource {
  public:
@@ -247,8 +247,8 @@ class Resource {
 
   const std::string &name() const { return name_; }
 
-  // How the RPC decodes typed keys and values for this resource (D-025);
-  // null: not reachable over the RPC. Set by the owner before registering.
+  // Module-facing typed codec; control owns the wire-envelope adapter. Null
+  // means this resource is not reachable over the RPC.
   const ResourceCodec *codec() const { return codec_.get(); }
   void SetCodec(std::shared_ptr<const ResourceCodec> codec) {
     codec_ = std::move(codec);

@@ -42,6 +42,19 @@ file is the reasoning.
 | D-019 | DRR: a multi-producer ingress ring; the task's worker owns all flow state | accepted (trade-off recorded) |
 | D-020 | Dataplane transactions: what we borrow from DPDK `rte_swx`, P4Runtime and VPP | accepted |
 | D-021 | The G1.2b transaction engine: reserve/publish, reference counts, dependency-ordered publish, a removal cascade | accepted |
+| D-022 | ExactMatch as the first module resource provider | accepted |
+| D-023 | Router as a resource provider: routes placed invisibly, one writer when enrolled | accepted |
+| D-024 | WildcardMatch as a resource provider: pending rules that lose to every rule | accepted |
+| D-025 | The dataplane transaction RPC: typed per-resource values, request ids, a daemon epoch | accepted |
+| D-026 | gRPC and protobuf practice: what changed, on what evidence | accepted |
+| D-027 | Placement inside the inherited CPU set; control threads off worker CPUs | accepted |
+| D-028 | Packet-path writers: partitioned or shared tables, chosen on numbers | accepted |
+| D-029 | DPDK memory for the dataplane: dynamic hugepages, in-memory EAL, IOVA chosen by DPDK | accepted |
+| D-030 | Container-friendly bessd startup: environment, auto-detection, graceful termination | accepted |
+| D-031 | Daemon instance identity follows the RPC listen address | accepted |
+| D-032 | The session vertical slice: ExactMatch → ActionTable → Meter → Router as one transactional graph | accepted |
+| D-033 | Framework contracts, runtime ownership, and extension boundaries | accepted |
+
 
 ---
 
@@ -2383,7 +2396,7 @@ packet buffers stay user-sized (modules need memory too).
 
 **Evidence:**
 
-- `startup_test.cc` (4): environment flags (applied; a command-line flag
+- `runtime/startup_test.cc` (4): environment flags (applied; a command-line flag
   wins; an invalid value is fatal); usable hugepages from fake sysfs and
   cgroup trees (per page size, cgroup limits, none, missing directories);
   device-plugin addresses (merged, sorted, deduplicated; `_INFO` and junk
@@ -2610,3 +2623,73 @@ neighbors; worker-exclusive meters (K5 supports them; the module cannot verify
 the placement they need); `ExactMatch`'s `Clear()` and a bulk erase for an
 enrolled router; trimming `MeterSetBuilder::Clone()`'s O(capacity) copy per
 transaction.
+
+## D-033 Framework contracts, runtime ownership, and extension boundaries
+
+**Status:** accepted (2026-09-29).
+**Code:** [architecture.md](architecture.md); runtime APIs in `core/runtime/`;
+the typed codec in `core/framework/resource_codec.h`; wire adaptation in
+`core/control/dataplane_transactions.cc`; component targets/test closures in
+`core/meson.build` and generated-message includes in `protobuf/meson.build`.
+
+**Context.** Master grouped framework/runtime implementation in flat `core/`
+and kept modules, drivers, and hooks in separate source groups. The newer
+library split names useful components, but shared compile dependencies,
+global include roots, and whole-runtime test links do not enforce those
+boundaries. `RuntimeState` and `WorkerManager` live under `control/` while
+modules use them; module resource codecs are also declared under `control/`.
+
+**Decision.**
+
+- The **framework** owns the module-facing contracts and execution mechanics:
+  module lifecycle, graph/gate, metadata, packet-batch, scheduling, port, and
+  extension interfaces.
+- The **runtime** owns one live instance: its registries and services,
+  initialization and worker lifecycle, control-service composition, and
+  extension assembly. The daemon is the composition root.
+- Packet and dataplane mechanisms remain libraries consumed by framework and
+  modules. `modules/`, `drivers/`, `gate_hooks/`, and `resume_hooks/` remain
+  separate implementation groups; no extra `extensions/` parent is required.
+- The control plane may use runtime services and generic dataplane/resource
+  APIs, but not concrete module implementations. Modules use framework and
+  selected library APIs, not control-plane implementation headers.
+- Build targets and component tests must expose and link only the dependencies
+  each component actually needs. Full-runtime links remain explicit integration
+  tests. The default module-authoring path remains unchanged.
+- `utils/` is limited to low-level helpers; framework- or packet-specific code
+  belongs with its owner.
+
+**Rejected:** treating every implementation group as a peer “library”;
+keeping runtime ownership under `control/`; moving files before establishing
+and enforcing component dependencies.
+
+**Evidence at decision time:** Source inspection found production modules
+including `control/runtime_state.h` and `control/resource_codec.h`, while
+`utils/exact_match_table.h` includes module, metadata, message, and packet
+headers. `core/meson.build` supplied one shared dependency set and include roots
+to every library; unit tests and benchmarks linked `runtime_whole`. GCC and
+Clang suites passed 118/118 each before this boundary migration; that is a
+baseline, not proof of architecture boundaries.
+
+**Implementation evidence (2026-09-29):**
+
+- `RuntimeState`, `WorkerManager`, thread placement, platform initialization,
+  options, memory management, startup, and executable-path APIs now live under
+  `core/runtime/`; callers and tests use the runtime ownership/API.
+- The resource codec lives under `core/framework/` and accepts a type URL plus
+  serialized value bytes. The control adapter extracts those fields from
+  protobuf `Any` before typed decoding; regression coverage checks successful
+  decoding, type mismatch, and malformed bytes.
+- `ExactMatchTable` is framework-owned. Framework gate/graph code no longer
+  depends on the concrete Track hook, and CuckooMap stack traces no longer pull
+  the host debug implementation into utility tests.
+- Meson compile dependencies and component-test closures are narrowed.
+  Module-graph tests explicitly link the gate-hook implementation they need;
+  full-runtime tests retain an explicit full closure.
+- GCC and Clang each built incrementally with `meson compile -j4` and passed
+  all 118 Meson tests, including Python, live module integration, benchmarks,
+  and `sample_plugin_load`. Local compiler builds ran sequentially; test
+  invocations used `--no-rebuild` without a job override.
+
+**Revisit when:** an external module must build against a published, stable SDK
+or the runtime must be embedded independently of the BESS daemon.

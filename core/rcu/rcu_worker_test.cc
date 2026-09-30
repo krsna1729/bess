@@ -12,8 +12,8 @@
 #include <chrono>
 #include <thread>
 
-#include "control/runtime_state.h"
-#include "opts.h"
+#include "runtime/runtime_state.h"
+#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
 #include "rcu/rcu_domain.h"
@@ -39,7 +39,7 @@ class RcuWorkerTest : public ::testing::Test {
  protected:
   void SetUp() override {
     InitRuntimeOnce();
-    rcu_ = &bess::control::runtime().rcu();
+    rcu_ = &bess::runtime::runtime().rcu();
   }
 
   void TearDown() override {

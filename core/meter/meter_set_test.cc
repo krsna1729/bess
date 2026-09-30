@@ -10,7 +10,7 @@
 #include <array>
 #include <memory>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "rcu/rcu_domain.h"
 #include "rcu/rcu_ptr.h"
 
@@ -262,7 +262,7 @@ TEST(MeterSetTest, CheckBatchColorAware) {
 // the reader passes a quiescent state, while the surviving meter's state
 // carries on in the new generation.
 TEST(MeterSetPublicationTest, PublishRetiresOldGeneration) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   const uint32_t reader = 1;
   ASSERT_TRUE(domain.Register(reader).has_value());
   domain.Online(reader);

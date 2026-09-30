@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "control/control_plane.h"
-#include "control/thread_placement.h"
-
-#include "control/worker_manager.h"
-
+#include "runtime/thread_placement.h"
+#include "runtime/worker_manager.h"
 #include <limits>
 #include <optional>
 #include <memory>
@@ -23,7 +21,7 @@
 #include "message.h"
 #include "module.h"
 #include "module_graph.h"
-#include "opts.h"
+#include "runtime/opts.h"
 #include "resume_hook.h"
 #include "scheduler.h"
 #include "utils/format.h"
@@ -129,7 +127,7 @@ ControlResult<PortInfo> ControlPlane::CreatePort(const PortSpec& spec) {
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -171,7 +169,7 @@ ControlResult<PortInfo> ControlPlane::CreatePortLocked(const PortSpec& spec) {
     return std::unexpected(Err(EINVAL, "Invalid queue size"));
   }
 
-  PortRegistry &ports = runtime().ports();
+  runtime::PortRegistry &ports = runtime::runtime().ports();
   std::string port_name;
 
   if (spec.name.length() > 0) {
@@ -242,7 +240,7 @@ ControlResult<void> ControlPlane::DestroyPort(const std::string& name) {
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -254,7 +252,7 @@ ControlResult<void> ControlPlane::DestroyPortLocked(const std::string& name) {
         Err(EINVAL, "Argument must be a name in str"));
   }
 
-  int ret = runtime().ports().Destroy(name);
+  int ret = runtime::runtime().ports().Destroy(name);
   if (ret == -ENOENT) {
     return std::unexpected(Err(ENOENT, "No port `%s' found", name.c_str()));
   }
@@ -274,7 +272,7 @@ ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConf(
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -285,7 +283,7 @@ ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConfLocked(const s
     return std::unexpected(Err(EINVAL, "Port name is not given"));
   }
 
-  Port *port = runtime().ports().Find(name);
+  Port *port = runtime::runtime().ports().Find(name);
   if (!port) {
     return std::unexpected(Err(ENOENT, "No port `%s' found", name.c_str()));
   }
@@ -311,7 +309,7 @@ ControlResult<void> ControlPlane::ResetPorts() {
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -319,7 +317,7 @@ ControlResult<void> ControlPlane::ResetPorts() {
 ControlResult<void> ControlPlane::ResetPortsLocked() {
   WorkerPauser wp;
 
-  PortRegistry &ports = runtime().ports();
+  runtime::PortRegistry &ports = runtime::runtime().ports();
 
   std::vector<std::string> names;
   names.reserve(ports.Size());
@@ -350,7 +348,7 @@ ControlResult<std::string> ControlPlane::CreateModule(const ModuleSpec& spec) {
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -371,7 +369,7 @@ ControlResult<std::string> ControlPlane::CreateModuleLocked(const ModuleSpec& sp
 
   std::string mod_name;
   if (spec.name.length()) {
-    if (runtime().modules().Contains(spec.name)) {
+    if (runtime::runtime().modules().Contains(spec.name)) {
       return std::unexpected(
           Err(EEXIST, "Module %s exists", spec.name.c_str()));
     }
@@ -404,7 +402,7 @@ ControlResult<void> ControlPlane::DestroyModule(const std::string& name) {
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -417,7 +415,7 @@ ControlResult<void> ControlPlane::DestroyModuleLocked(const std::string& name) {
     return std::unexpected(Err(EINVAL, "Argument must be a name in str"));
   }
 
-  Module* m = runtime().modules().Find(name);
+  Module* m = runtime::runtime().modules().Find(name);
   if (!m) {
     return std::unexpected(Err(ENOENT, "No module '%s' found", name.c_str()));
   }
@@ -440,7 +438,7 @@ ControlResult<void> ControlPlane::ResetModules() {
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -462,7 +460,7 @@ ControlResult<void> ControlPlane::ConnectModules(const ConnectionSpec& spec) {
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -476,13 +474,13 @@ ControlResult<void> ControlPlane::ConnectModulesLocked(const ConnectionSpec& spe
     return std::unexpected(Err(EINVAL, "Missing 'm1' or 'm2' field"));
   }
 
-  Module* m1 = runtime().modules().Find(spec.upstream);
+  Module* m1 = runtime::runtime().modules().Find(spec.upstream);
   if (!m1) {
     return std::unexpected(
         Err(ENOENT, "No module '%s' found", spec.upstream.c_str()));
   }
 
-  Module* m2 = runtime().modules().Find(spec.downstream);
+  Module* m2 = runtime::runtime().modules().Find(spec.downstream);
   if (!m2) {
     return std::unexpected(
         Err(ENOENT, "No module '%s' found", spec.downstream.c_str()));
@@ -524,7 +522,7 @@ ControlResult<void> ControlPlane::DisconnectModules(
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -537,7 +535,7 @@ ControlResult<void> ControlPlane::DisconnectModulesLocked(const DisconnectionSpe
     return std::unexpected(Err(EINVAL, "Missing 'name' field"));
   }
 
-  Module* m = runtime().modules().Find(spec.name);
+  Module* m = runtime::runtime().modules().Find(spec.name);
   if (!m) {
     return std::unexpected(
         Err(ENOENT, "No module '%s' found", spec.name.c_str()));
@@ -565,7 +563,7 @@ ControlResult<void> ControlPlane::AddWorker(uint64_t wid, uint64_t core,
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -578,10 +576,10 @@ ControlResult<void> ControlPlane::AddWorkerLocked(uint64_t wid, uint64_t core, c
   if (!is_cpu_present(core)) {
     return std::unexpected(Err(EINVAL, "Invalid core %d", static_cast<int>(core)));
   }
-  if (!CpuAllowed(static_cast<int>(core))) {
+  if (!runtime::CpuAllowed(static_cast<int>(core))) {
     return std::unexpected(Err(EINVAL, "core %d is not in bessd's CPU set (%s)",
                                static_cast<int>(core),
-                               CpuList(ProcessCpus()).c_str()));
+                               runtime::CpuList(runtime::ProcessCpus()).c_str()));
   }
   if (is_worker_active(wid)) {
     return std::unexpected(Err(EEXIST, "worker:%d is already active", static_cast<int>(wid)));
@@ -603,7 +601,7 @@ ControlResult<void> ControlPlane::DestroyWorker(uint64_t wid) {
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -613,7 +611,7 @@ ControlResult<void> ControlPlane::DestroyWorkerLocked(uint64_t wid) {
   if (wid >= Worker::kMaxWorkers) {
     return std::unexpected(Err(EINVAL, "Invalid worker id"));
   }
-  Worker* worker = runtime().workers().Get(wid);
+  Worker* worker = runtime::runtime().workers().Get(wid);
   if (!worker) {
     return std::unexpected(Err(ENOENT, "Worker %d is not active", static_cast<int>(wid)));
   }
@@ -641,7 +639,7 @@ ControlResult<void> ControlPlane::ResetWorkers() {
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -722,7 +720,7 @@ ControlResult<void> ControlPlane::AddTc(const TrafficClassSpec& spec) {
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -801,7 +799,7 @@ ControlResult<void> ControlPlane::UpdateTcParams(const TrafficClassSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto result = UpdateTcParamsLocked(spec);
   if (result) {
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -857,7 +855,7 @@ ControlResult<void> ControlPlane::UpdateTcParent(const TrafficClassSpec& spec) {
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -920,7 +918,7 @@ ControlResult<void> ControlPlane::UpdateTcParentLocked(const TrafficClassSpec& s
 // holds raw pointers, and a stale one would be followed on the next wakeup.
 void ControlPlane::RemoveSubtreeFromWakeupQueues(bess::TrafficClass* c) {
   for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    Worker* worker = runtime().workers().Get(wid);
+    Worker* worker = runtime::runtime().workers().Get(wid);
     if (worker != nullptr) {
       worker->scheduler()->wakeup_queue().Remove(c);
     }
@@ -952,7 +950,7 @@ ControlResult<void> ControlPlane::RemoveTcLocked(const std::string& name) {
             name.c_str()));
   }
 
-  runtime().traffic_classes().Release(c);
+  runtime::runtime().traffic_classes().Release(c);
   delete c;
   return {};
 }
@@ -1000,7 +998,7 @@ ControlResult<void> ControlPlane::ResetTcs() {
     // the legacy RPC path and the transactional path share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
   }
   return result;
 }
@@ -1033,7 +1031,7 @@ ControlPlane::CheckSchedulingConstraints() {
   // Check constraints around chains run by each worker. This checks that
   // global constraints are met.
   for (int i = 0; i < Worker::kMaxWorkers; i++) {
-    Worker* worker = runtime().workers().Get(i);
+    Worker* worker = runtime::runtime().workers().Get(i);
     if (worker == nullptr) {
       continue;
     }
@@ -1086,7 +1084,7 @@ ControlResult<bess::TrafficClass*> ControlPlane::FindTc(
     }
   } else if (spec.leaf_module_name.length() != 0) {
     const std::string& module_name = spec.leaf_module_name;
-    Module* m = runtime().modules().Find(module_name);
+    Module* m = runtime::runtime().modules().Find(module_name);
     if (!m) {
       return std::unexpected(
           Err(ENOENT, "No module '%s' found", module_name.c_str()));
@@ -1131,11 +1129,11 @@ ControlResult<void> ControlPlane::AttachExistingTcLocked(
                                  Worker::kAnyWorker, Worker::kMaxWorkers - 1));
     }
 
-    int active_workers = runtime().workers().num_workers();
+    int active_workers = runtime::runtime().workers().num_workers();
     if ((wid != Worker::kAnyWorker && !is_worker_active(wid)) ||
         (wid == Worker::kAnyWorker && active_workers == 0)) {
       if (active_workers == 0 && (wid == 0 || wid == Worker::kAnyWorker)) {
-        launch_worker(0, DefaultWorkerCore());
+        launch_worker(0, runtime::DefaultWorkerCore());
       } else {
         return std::unexpected(
             Err(EINVAL, "worker:%d does not exist", static_cast<int>(wid)));
@@ -1217,7 +1215,7 @@ ControlResult<void> ControlPlane::AttachTc(bess::TrafficClass* c_,
 
   auto attached = AttachExistingTcLocked(c.get(), spec);
   if (!attached) {
-    runtime().traffic_classes().Release(c.get());
+    runtime::runtime().traffic_classes().Release(c.get());
     return std::unexpected(attached.error());
   }
 
@@ -1394,7 +1392,7 @@ ControlResult<std::string> ControlPlane::ConfigureGateHook(
   }
 
   // Install this hook on the specified module
-  Module *m = runtime().modules().Find(spec.module_name);
+  Module *m = runtime::runtime().modules().Find(spec.module_name);
   if (!m) {
     return std::unexpected(
         Err(ENOENT, "No module '%s' found", spec.module_name.c_str()));
@@ -1496,19 +1494,19 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
   const auto validation_start = std::chrono::steady_clock::now();
 
   // 1. Validate. Pure, so a rejected spec cannot have touched anything.
-  auto validated = bess::control::ValidatePipeline(runtime(), desired);
+  auto validated = bess::control::ValidatePipeline(runtime::runtime(), desired);
   if (!validated) {
     return std::unexpected(validated.error());
   }
 
   // 2. Optimistic concurrency: a stale writer is rejected before any effect.
   if (options.expected_generation.has_value() &&
-      *options.expected_generation != runtime().generation()) {
+      *options.expected_generation != runtime::runtime().generation()) {
     ControlError error = Err(ESTALE, "expected generation %llu, active generation %llu",
                              static_cast<unsigned long long>(
                                  *options.expected_generation),
                              static_cast<unsigned long long>(
-                                 runtime().generation()));
+                                 runtime::runtime().generation()));
     error.code = ControlErrorCode::kConflict;
     error.object = "pipeline";
     error.field = "expected_generation";
@@ -1521,12 +1519,12 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
           std::chrono::steady_clock::now() - validation_start)
           .count());
 
-  PipelineSnapshot before = SnapshotRuntime(runtime());
+  PipelineSnapshot before = SnapshotRuntime(runtime::runtime());
   PipelineDiff diff = Diff(before, validated->spec);
   if (diff.empty()) {
     ApplyTiming timing;
     timing.validation_us = validation_us;
-    return ApplyResult{runtime().generation(), 0, false, timing};
+    return ApplyResult{runtime::runtime().generation(), 0, false, timing};
   }
   PipelinePlan plan = Plan(diff);
 
@@ -1551,7 +1549,7 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
   // active -- the generation has to say so -- but the caller is told, because
   // returning success would claim a pipeline that does not exist.
   if (auto retired = transaction.Retire(); !retired) {
-    runtime().BumpGeneration();
+    runtime::runtime().BumpGeneration();
 
     ControlError error = Err(retired.error().err,
                              "pipeline committed, but retirement failed: %s",
@@ -1562,54 +1560,54 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
     return std::unexpected(error);
   }
 
-  runtime().BumpGeneration();
+  runtime::runtime().BumpGeneration();
 
   ApplyTiming timing = transaction.timing();
   timing.validation_us = validation_us;
 
-  return ApplyResult{runtime().generation(), transaction.ops_executed(),
+  return ApplyResult{runtime::runtime().generation(), transaction.ops_executed(),
                      transaction.quiescence() == Quiescence::kWorkers, timing};
 }
 
 ControlResult<ValidatedPipeline> ControlPlane::ValidatePipeline(
     const PipelineSpec &desired) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return bess::control::ValidatePipeline(runtime(), desired);
+  return bess::control::ValidatePipeline(runtime::runtime(), desired);
 }
 
 PipelineSnapshot ControlPlane::GetPipeline() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return SnapshotRuntime(runtime());
+  return SnapshotRuntime(runtime::runtime());
 }
 
 ControlResult<PipelineDiff> ControlPlane::DiffPipeline(
     const PipelineSpec &desired) const {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  auto validated = bess::control::ValidatePipeline(runtime(), desired);
+  auto validated = bess::control::ValidatePipeline(runtime::runtime(), desired);
   if (!validated) {
     return std::unexpected(validated.error());
   }
 
-  return Diff(SnapshotRuntime(runtime()), validated->spec);
+  return Diff(SnapshotRuntime(runtime::runtime()), validated->spec);
 }
 
 ControlPlane::Versioned<PipelineSnapshot> ControlPlane::GetPipelineVersioned()
     const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return {SnapshotRuntime(runtime()), runtime().generation()};
+  return {SnapshotRuntime(runtime::runtime()), runtime::runtime().generation()};
 }
 
 ControlResult<ControlPlane::Versioned<PipelineDiff>>
 ControlPlane::DiffPipelineVersioned(const PipelineSpec &desired) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  auto validated = bess::control::ValidatePipeline(runtime(), desired);
+  auto validated = bess::control::ValidatePipeline(runtime::runtime(), desired);
   if (!validated) {
     return std::unexpected(validated.error());
   }
   return Versioned<PipelineDiff>{
-      Diff(SnapshotRuntime(runtime()), validated->spec),
-      runtime().generation()};
+      Diff(SnapshotRuntime(runtime::runtime()), validated->spec),
+      runtime::runtime().generation()};
 }
 
 ControlResult<ControlPlane::Versioned<PipelinePlan>>
@@ -1653,7 +1651,7 @@ ControlResult<void> ControlPlane::Reset() {
     return std::unexpected(w.error());
   }
 
-  runtime().BumpGeneration();
+  runtime::runtime().BumpGeneration();
   return {};
 }
 

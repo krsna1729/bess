@@ -24,7 +24,7 @@
 //
 // NOTE on variant 3 (metadata): ExactMatchTable::MakeKeys(const void **) only
 // serves packet-offset fields, so the legacy metadata extraction below is a
-// faithful inline of DoMakeKeys (utils/exact_match_table.h) with per-field
+// faithful inline of DoMakeKeys (framework/exact_match_table.h) with per-field
 // base pointers: same padding zero, same unaligned 8-byte load, same mask,
 // same positional store. The new path uses the real ExtractPlan API.
 
@@ -42,7 +42,7 @@
 #include "classifier/cuckoo_exact.h"
 #include "classifier/extract_plan.h"
 #include "classifier/runtime_schema.h"
-#include "utils/exact_match_table.h"
+#include "framework/exact_match_table.h"
 
 namespace {
 
@@ -57,9 +57,9 @@ using bess::classifier::RuntimeExactRule;
 using bess::classifier::RuntimeKeyField;
 using bess::classifier::SourceKind;
 using bess::classifier::SourceView;
-using bess::utils::ExactMatchKey;
-using bess::utils::ExactMatchRuleFields;
-using bess::utils::ExactMatchTable;
+using bess::framework::ExactMatchKey;
+using bess::framework::ExactMatchRuleFields;
+using bess::framework::ExactMatchTable;
 using bess::classifier::detail::RuntimeCuckooEqual;
 
 using bess::classifier::detail::RuntimeCuckooFixedProbeEqual;

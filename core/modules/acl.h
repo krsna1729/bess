@@ -6,7 +6,7 @@
 
 #include <vector>
 
-#include "../control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "../module.h"
 #include "../rcu/rcu_ptr.h"
 #include "../pb/module_msg.pb.h"
@@ -34,7 +34,7 @@ class ACL final : public Module {
 
   static const Commands cmds;
 
-  ACL() : Module(), rules_(bess::control::runtime().rcu()) {
+  ACL() : Module(), rules_(bess::runtime::runtime().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 

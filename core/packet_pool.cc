@@ -9,7 +9,7 @@
 #include <rte_mempool.h>
 
 #include "dpdk.h"
-#include "opts.h"
+#include "runtime/opts.h"
 #include "utils/copy.h"
 
 namespace bess {

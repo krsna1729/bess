@@ -98,7 +98,7 @@ class Scheduler {
   // TODO(barath): Do real cleanup, akin to sched_free() from the old impl.
   virtual ~Scheduler() {
     if (root_) {
-      bess::control::runtime().traffic_classes().ReleaseTree(root_);
+      bess::runtime::runtime().traffic_classes().ReleaseTree(root_);
     }
     delete root_;
   }
@@ -154,13 +154,13 @@ class Scheduler {
 
     const auto &children = default_rr_class_->Children();
     if (children.size() == 0) {
-      bess::control::runtime().traffic_classes().Release(root_);
+      bess::runtime::runtime().traffic_classes().Release(root_);
       delete root_;
       root_ = nullptr;
       default_rr_class_ = nullptr;
     } else if (children.size() == 1) {
       root_->RemoveChild(children[0]);
-      bess::control::runtime().traffic_classes().Release(root_);
+      bess::runtime::runtime().traffic_classes().Release(root_);
       delete root_;
       root_ = children[0];
       default_rr_class_ = nullptr;

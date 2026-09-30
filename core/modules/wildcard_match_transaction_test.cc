@@ -17,7 +17,7 @@
 #include <thread>
 #include <vector>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "dataplane/transaction_engine.h"
 #include "module.h"
 #include "module_graph.h"
@@ -34,7 +34,7 @@ using bess::dataplane::Op;
 using bess::dataplane::TransactionEngine;
 using Outcome = TransactionEngine::Outcome;
 
-TransactionEngine &Engine() { return bess::control::runtime().transactions(); }
+TransactionEngine &Engine() { return bess::runtime::runtime().transactions(); }
 
 // Both modules classify on 4 bytes at offset 26 and 2 bytes at offset 34.
 template <typename M, typename Arg>
@@ -311,10 +311,10 @@ TEST_F(WildcardMatchTransactionTest, CommandsGrowthAndIdReuse) {
 TEST_F(WildcardMatchTransactionTest, FreedIdsReturnThroughTheCascade) {
   std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table =
       *bess::classifier::ConcurrentMaskedTable::Create(
-          6, 8, bess::control::runtime().rcu());
+          6, 8, bess::runtime::runtime().rcu());
   MaskedRuleResource res("masked",
                          MaskedRuleResource::Hooks{.table = [&] { return table; }});
-  TransactionEngine engine(bess::control::runtime().rcu());
+  TransactionEngine engine(bess::runtime::runtime().rcu());
   ASSERT_TRUE(engine.Register(&res));
   auto regate = [&](uint16_t gate) {
     return engine.Apply(std::vector<Op>{Op::Upsert(
@@ -361,7 +361,7 @@ TEST_F(WildcardMatchTransactionTest, LookupsWhileTransactionsRun) {
     return std::vector<Op>{
         Remove("wm", kAll, mask_b(s), s + 1, static_cast<uint16_t>(s % 7))};
   };
-  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr bess::rcu::ReaderId kReader = 26;
   ASSERT_TRUE(domain.Register(kReader).has_value());
   std::atomic<bool> stop{false};

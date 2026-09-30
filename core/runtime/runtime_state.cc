@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 
 #include <cctype>
 #include <cerrno>
@@ -8,14 +8,14 @@
 
 #include "module.h"
 #include "port.h"
-#include "control/worker_manager.h"
+#include "runtime/worker_manager.h"
 #include "dataplane/transaction_engine.h"
 #include "rcu/rcu_domain.h"
 #include "traffic_class.h"
 #include "utils/common.h"
 
 namespace bess {
-namespace control {
+namespace runtime {
 
 namespace {
 
@@ -250,5 +250,5 @@ RuntimeState &RuntimeState::Get() {
   return state;
 }
 
-}  // namespace control
+}  // namespace runtime
 }  // namespace bess

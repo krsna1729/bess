@@ -1,25 +1,24 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_DATAPLANE_RESOURCE_CODEC_H_
-#define BESS_DATAPLANE_RESOURCE_CODEC_H_
+#ifndef BESS_FRAMEWORK_RESOURCE_CODEC_H_
+#define BESS_FRAMEWORK_RESOURCE_CODEC_H_
 
 #include <any>
 #include <expected>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <utility>
 
-#include <google/protobuf/any.pb.h>
+#include <google/protobuf/message.h>
 
 #include "dataplane/resource.h"
 
 namespace bess::dataplane {
 
-// How a resource's keys and values arrive over the RPC (G1.2c, D-025): typed
-// protobuf messages per resource, turned into the engine's ResourceKey and
-// value here, so clients never reproduce BESS's internal key packing. A
-// resource without a codec is not reachable over the RPC. Kept out of
-// resource.h so the engine core does not depend on protobuf.
+// Maps a serialized resource key/value message to the engine's internal
+// representation. Control-plane transports adapt their wire envelope to this
+// interface; module authors provide only typed conversion functions.
 class ResourceCodec {
  public:
   virtual ~ResourceCodec() = default;
@@ -29,9 +28,9 @@ class ResourceCodec {
   virtual std::string value_type() const = 0;
 
   virtual std::expected<ResourceKey, std::string> Key(
-      const google::protobuf::Any &key) const = 0;
+      std::string_view type_url, const std::string &serialized) const = 0;
   virtual std::expected<std::any, std::string> Value(
-      const google::protobuf::Any &value) const = 0;
+      std::string_view type_url, const std::string &serialized) const = 0;
 };
 
 // A codec from two conversion functions over concrete message types.
@@ -54,27 +53,38 @@ class TypedCodec final : public ResourceCodec {
   }
 
   std::expected<ResourceKey, std::string> Key(
-      const google::protobuf::Any &key) const override {
+      std::string_view type_url, const std::string &serialized) const override {
     KeyMsg msg;
-    if (!key.UnpackTo(&msg)) {
+    if (!Unpack(type_url, serialized, key_type(), &msg)) {
       return std::unexpected("key is not a " + key_type());
     }
     return key_(msg);
   }
   std::expected<std::any, std::string> Value(
-      const google::protobuf::Any &value) const override {
+      std::string_view type_url, const std::string &serialized) const override {
     ValueMsg msg;
-    if (!value.UnpackTo(&msg)) {
+    if (!Unpack(type_url, serialized, value_type(), &msg)) {
       return std::unexpected("value is not a " + value_type());
     }
     return value_(msg);
   }
 
  private:
+  template <typename Message>
+  static bool Unpack(std::string_view type_url, const std::string &serialized,
+                     const std::string &full_name, Message *message) {
+    const size_t slash = type_url.rfind('/');
+    if (slash == std::string_view::npos ||
+        type_url.substr(slash + 1) != full_name) {
+      return false;
+    }
+    return message->ParseFromString(serialized);
+  }
+
   KeyFn key_;
   ValueFn value_;
 };
 
 }  // namespace bess::dataplane
 
-#endif  // BESS_DATAPLANE_RESOURCE_CODEC_H_
+#endif  // BESS_FRAMEWORK_RESOURCE_CODEC_H_

@@ -240,8 +240,8 @@ python_proto_targets = core_python_proto_targets + [sample_python_target] + pyth
 python_proto_include = ['-I' + python_proto_root]
 
 protobuf_runtime_deps = [
-  dependency('protobuf', method: 'pkg-config', required: true),
-  dependency('grpc++', method: 'pkg-config', required: true),
+  protobuf_dep,
+  grpcpp_dep,
 ]
 
 core_cpp_include = [
@@ -260,6 +260,10 @@ bess_proto_lib = static_library(
   core_cpp_proto_targets,
   cpp_args: core_cpp_include + proto_codegen_args,
   dependencies: protobuf_runtime_deps,
+)
+bess_proto_headers_dep = declare_dependency(
+  compile_args: core_cpp_include,
+  dependencies: [protobuf_dep],
 )
 bess_proto_dep = declare_dependency(
   link_with: bess_proto_lib,

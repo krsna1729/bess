@@ -14,9 +14,10 @@ namespace {
 // Tests that assert on a fatal path -- EXPECT_DEATH/ASSERT_DEATH -- make gtest
 // fork a child which really does abort, because that is what the assertion is
 // about. The kernel then writes a core for every one of those children, and
-// systemd-coredump reports each as a crash: bessd_test and memory_test between
-// them produce a handful per run, which buries the crashes that matter (the
-// real daemon cores from G0 development were found in exactly this log).
+// systemd-coredump reports each as a crash: bessd_test and
+// runtime_memory_test between them produce a handful per run, which buries
+// the crashes that matter (the real daemon cores from G0 development were
+// found in exactly this log).
 //
 // Make the test process non-dumpable (and belt-and-braces zero its core limit);
 // its death-test children inherit both, so expected deaths stop reaching

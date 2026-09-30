@@ -4,7 +4,7 @@
 // usable hugepages from sysfs and the cgroup, and the NICs a device plugin
 // assigned.
 
-#include "startup.h"
+#include "runtime/startup.h"
 
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-#include "opts.h"
+#include "runtime/opts.h"
 
 namespace {
 

@@ -12,8 +12,7 @@
 #include <thread>
 #include <vector>
 
-#include "control/runtime_state.h"
-
+#include "runtime/runtime_state.h"
 namespace bess::classifier {
 namespace {
 
@@ -36,7 +35,7 @@ const Bytes kLow1 = B(0x00000000000000ffull);
 
 std::unique_ptr<ConcurrentMaskedTable> MakeTable(size_t max_tuples = 8) {
   auto t = ConcurrentMaskedTable::Create(kKeyLen, max_tuples,
-                                         control::runtime().rcu());
+                                         bess::runtime::runtime().rcu());
   EXPECT_TRUE(t.has_value()) << t.error();
   return std::move(*t);
 }
@@ -175,7 +174,7 @@ TEST(ConcurrentMaskedTableTest, GrowsWithoutLosingRules) {
 // not reused -- that reader may have loaded it and be about to read its
 // record. After the reader is quiescent the id comes back.
 TEST(ConcurrentMaskedTableTest, RetiredRuleIdWaitsForOnlineReaders) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto t = MakeTable();
   ASSERT_EQ(R::kInserted, t->Upsert(C(kFull), C(B(1)), 0, 1));
   ASSERT_EQ(R::kInserted, t->Upsert(C(kFull), C(B(2)), 0, 2));
@@ -204,7 +203,7 @@ TEST(ConcurrentMaskedTableTest, RetiredRuleIdWaitsForOnlineReaders) {
 // ids are recycled. A reader must never miss a stable key or see another
 // rule's result for it.
 TEST(ConcurrentMaskedTableTest, ConcurrentReadersAlwaysSeeTheStableWinner) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto t = MakeTable();
   std::vector<uint64_t> keys;
   for (uint64_t i = 0; i < 64; i++) {

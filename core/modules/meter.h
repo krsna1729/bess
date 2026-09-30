@@ -7,6 +7,7 @@
 #include <set>
 #include <string>
 
+#include "runtime/runtime_state.h"
 #include "../dataplane/resource.h"
 #include "../meter/meter_set.h"
 #include "../module.h"
@@ -46,7 +47,7 @@ class Meter final : public Module {
 
   static const Commands cmds;
 
-  Meter() : Module(), published_(bess::control::runtime().rcu()) {
+  Meter() : Module(), published_(bess::runtime::runtime().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 

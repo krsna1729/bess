@@ -33,7 +33,7 @@
 #include <utility>
 #include <vector>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "dataplane/transaction_engine.h"
 #include "dpdk.h"
 #include "route/route_table.h"
@@ -128,7 +128,7 @@ Fixture &TableFor(size_t n) {
     f.routes = Routes(n);
     f.keys = Keys(f.routes);
     f.table = LpmRouteTable::Create("route_bench", ConfigFor(n),
-                                    bess::control::runtime().rcu())
+                                    bess::runtime::runtime().rcu())
                   .value();
     for (const Route &r : f.routes) {
       (void)f.table->Upsert(r.prefix, r.value);
@@ -216,7 +216,7 @@ BENCHMARK(BM_LookupRouteTable)->ArgsProduct({{1024, 16384, 65536}, {0, 1}});
 
 std::unique_ptr<Router> RouterFor(size_t n, std::vector<uint32_t> *keys) {
   auto router = Router::Create("route_bench_rt", ConfigFor(n), 1024,
-                               bess::control::runtime().rcu())
+                               bess::runtime::runtime().rcu())
                     .value();
   for (uint32_t id = 1; id <= 1023; id++) {
     NextHop hop;
@@ -355,7 +355,7 @@ void BM_UpdateInPlace(benchmark::State &state) {
     (void)f.table->Upsert(p, 7);
     (void)f.table->Erase(p);
   }
-  bess::control::runtime().rcu().ReclaimReady();
+  bess::runtime::runtime().rcu().ReclaimReady();
   state.SetItemsProcessed(state.iterations() * 2);
 }
 BENCHMARK(BM_UpdateInPlace)->Arg(1024)->Arg(16384)->Arg(65536);
@@ -393,7 +393,7 @@ BENCHMARK(BM_UpdateByRebuild)
 void BM_NextHopUpdate(benchmark::State &state) {
   const size_t hops = static_cast<size_t>(state.range(0));
   auto router = Router::Create("route_bench_nh", ConfigFor(1024), hops,
-                               bess::control::runtime().rcu())
+                               bess::runtime::runtime().rcu())
                     .value();
   NextHop hop;
   hop.neighbor = NeighborState::kResolved;
@@ -417,7 +417,7 @@ void BM_RouterChange(benchmark::State &state) {
   using bess::dataplane::Op;
   const bool enrolled = state.range(0) == 1;
   const int kind = static_cast<int>(state.range(1));
-  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   // The engine outlives the router enrolled in it (declared first).
   bess::dataplane::TransactionEngine engine(domain);
   auto router =

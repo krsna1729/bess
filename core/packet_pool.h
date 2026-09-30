@@ -1,7 +1,7 @@
 #ifndef BESS_PACKET_POOL_H_
 #define BESS_PACKET_POOL_H_
 
-#include "memory.h"
+#include "runtime/memory.h"
 #include "packet.h"
 
 // "Contiguous" here means that all packets reside in a single memory region

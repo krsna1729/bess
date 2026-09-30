@@ -7,8 +7,8 @@
 #include <cinttypes>
 #include <string>
 
-#include "control/worker_manager.h"
-#include "opts.h"
+#include "runtime/worker_manager.h"
+#include "runtime/opts.h"
 #include "scheduler.h"
 #include "utils/common.h"
 #include "utils/time.h"
@@ -29,7 +29,7 @@ int TrafficClass::WorkerId() const {
     if (!is_worker_active(wid))
       continue;
 
-    if (bess::control::runtime().workers().Get(wid)->scheduler()->root() ==
+    if (bess::runtime::runtime().workers().Get(wid)->scheduler()->root() ==
         Root()) {
       return wid;
     }
@@ -498,12 +498,12 @@ LeafTrafficClass::~LeafTrafficClass() {
 }
 
 bool TrafficClassBuilder::ClearAll() {
-  bess::control::runtime().traffic_classes().ReleaseAll();
+  bess::runtime::runtime().traffic_classes().ReleaseAll();
   return true;
 }
 
 bool TrafficClassBuilder::Clear(TrafficClass *c) {
-  return bess::control::runtime().traffic_classes().Release(c);
+  return bess::runtime::runtime().traffic_classes().Release(c);
 }
 
 }  // namespace bess

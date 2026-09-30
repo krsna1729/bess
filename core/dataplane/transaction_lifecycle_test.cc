@@ -26,7 +26,7 @@
 #include <vector>
 
 #include "classifier/exact_rule_resource.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "dataplane/slot_resource.h"
 #include "dataplane/strong_id.h"
 
@@ -271,7 +271,7 @@ class LifecycleTest : public ::testing::Test {
     return engine_.Apply(ops);
   }
 
-  rcu::RcuDomain &domain_ = control::runtime().rcu();
+  rcu::RcuDomain &domain_ = bess::runtime::runtime().rcu();
   std::unique_ptr<ConcurrentExactTable> table_;
   SlotTable<MeterId, Meter> meters_{kIds};
   SlotTable<ActionId, Action> actions_{kIds};
@@ -802,7 +802,7 @@ TEST_F(LifecycleTest, RandomLifecycleMatchesAModelWithStallingReaders) {
 struct World {
   World() {
     table = std::move(*ConcurrentExactTable::Create(
-        8, ConcurrentExactTable::CapacityFor(512), control::runtime().rcu()));
+        8, ConcurrentExactTable::CapacityFor(512), bess::runtime::runtime().rcu()));
     meters_res = std::make_unique<SlotResource<MeterId, Meter>>("meters",
                                                                 meters);
     actions_res = std::make_unique<SlotResource<ActionId, Action>>(
@@ -843,7 +843,7 @@ struct World {
   ~World() {
     while (engine.ReclaimRetired() != 0) {
     }
-    control::runtime().rcu().Drain();
+    bess::runtime::runtime().rcu().Drain();
   }
 
   // Logical and physical state, as in LifecycleTest::Snapshot.
@@ -888,7 +888,7 @@ struct World {
   std::unique_ptr<ExactRuleResource> rules_res;
   Injector injector;
   std::vector<std::unique_ptr<FaultyResource>> tracked;
-  TransactionEngine engine{control::runtime().rcu()};
+  TransactionEngine engine{bess::runtime::runtime().rcu()};
 };
 
 Op WRule(uint64_t key, uint64_t action) {

@@ -8,16 +8,16 @@
 #include <memory>
 #include <vector>
 
-#include "../control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../rcu/rcu_ptr.h"
-#include "../utils/exact_match_table.h"
+#include "../framework/exact_match_table.h"
 
-using bess::utils::ExactMatchField;
-using bess::utils::ExactMatchKey;
-using bess::utils::ExactMatchKeyHash;
-using bess::utils::ExactMatchTable;
+using bess::framework::ExactMatchField;
+using bess::framework::ExactMatchKey;
+using bess::framework::ExactMatchKeyHash;
+using bess::framework::ExactMatchTable;
 
 // Splits packets across output gates by a hash of L2/L3/L4 or chosen fields.
 //
@@ -32,7 +32,7 @@ class HashLB final : public Module {
 
   static const Commands cmds;
 
-  HashLB() : Module(), config_(bess::control::runtime().rcu()) {
+  HashLB() : Module(), config_(bess::runtime::runtime().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 

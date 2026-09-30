@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "dpdk.h"
-#include "control/thread_placement.h"
-#include "startup.h"
+#include "runtime/thread_placement.h"
+#include "runtime/startup.h"
 
 #include <syslog.h>
 #include <unistd.h>
@@ -22,8 +22,8 @@
 #include <sstream>
 #include <string>
 
-#include "memory.h"
-#include "opts.h"
+#include "runtime/memory.h"
+#include "runtime/opts.h"
 #include "worker.h"
 
 namespace bess {
@@ -215,7 +215,7 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
 // "0-12,16-28"): DPDK's main lcore may run anywhere in it (D-027).
 std::string GetNonWorkerCoreList() {
   std::string corelist;
-  const cpu_set_t set = bess::control::ProcessCpus();
+  const cpu_set_t set = bess::runtime::ProcessCpus();
 
   // Choose the last core available
   for (int i = 0; i < CPU_SETSIZE; i++) {

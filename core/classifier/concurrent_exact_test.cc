@@ -13,8 +13,7 @@
 #include <thread>
 #include <vector>
 
-#include "control/runtime_state.h"
-
+#include "runtime/runtime_state.h"
 namespace bess::classifier {
 namespace {
 
@@ -36,7 +35,7 @@ uint64_t V(uint32_t id) { return (uint64_t{id} << 20) | 0xabcde; }
 
 std::unique_ptr<ConcurrentExactTable> MakeTable(uint32_t capacity) {
   auto table = ConcurrentExactTable::Create(kKeyLen, capacity,
-                                            control::runtime().rcu());
+                                            bess::runtime::runtime().rcu());
   EXPECT_TRUE(table.has_value()) << table.error();
   return std::move(*table);
 }
@@ -86,7 +85,7 @@ TEST(ConcurrentExactTableTest, InlineHashIsBitIdenticalToRteHash) {
   std::mt19937_64 rng(0x15);
   std::vector<std::byte> buffer(64 + 8);
   for (uint32_t width = 1; width <= 64; width++) {
-    auto t = ConcurrentExactTable::Create(width, 64, control::runtime().rcu());
+    auto t = ConcurrentExactTable::Create(width, 64, bess::runtime::runtime().rcu());
     ASSERT_TRUE(t.has_value()) << t.error();
     for (int trial = 0; trial < 64; trial++) {
       for (auto &b : buffer) b = static_cast<std::byte>(rng());
@@ -180,7 +179,7 @@ TEST(ConcurrentExactTableTest, UpsertOfAPresentKeySucceedsWhenFull) {
 // every outstanding entry is one deleted slot, so the queue cannot fill.
 // Deleting every key with a stalled reader must therefore return promptly.
 TEST(ConcurrentExactTableTest, DeletesNeverWaitForStalledReaders) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr rcu::ReaderId kReader = 29;
   ASSERT_TRUE(domain.Register(kReader).has_value());
   domain.Online(kReader);  // stalled: never quiesces while we delete
@@ -211,7 +210,7 @@ TEST(ConcurrentExactTableTest, DeletesNeverWaitForStalledReaders) {
 }
 
 TEST(ConcurrentExactTableTest, ErasedSlotWaitsForOnlineReaders) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto t = MakeTable(1024);
   for (uint32_t id = 0; id < 100; id++) {
     ASSERT_EQ(ConcurrentExactTable::UpsertResult::kInserted,
@@ -257,7 +256,7 @@ TEST(ConcurrentExactTableTest, SizingCountsPendingDeletesAgainstHeadroom) {
   EXPECT_EQ(256u, T::Headroom(768));
   EXPECT_EQ(78643u, T::Headroom(3u << 19));
 
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto t = MakeTable(T::CapacityFor(0));
   ASSERT_EQ(768u, t->capacity());
   for (uint32_t id = 0; id < 500; id++) {
@@ -292,7 +291,7 @@ TEST(ConcurrentExactTableTest, SizingCountsPendingDeletesAgainstHeadroom) {
 // up as a churned key answering with another key's value, and a displacement
 // a reader cannot follow as a stable key missing.
 TEST(ConcurrentExactTableTest, ConcurrentReadersOnlySeeJustifiedAnswers) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr uint32_t kCapacity = 256;
   auto t = MakeTable(kCapacity);
 
@@ -409,7 +408,7 @@ TEST(ConcurrentExactTableTest, ConcurrentReadersOnlySeeJustifiedAnswers) {
 // exact, and lock-free readers running throughout must only ever see a
 // key's winning value.
 TEST(ConcurrentExactTableTest, SharedWritersInsertEachKeyOnce) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr uint32_t kKeys = 20000;
   constexpr int kWriters = 4;
   auto t = ConcurrentExactTable::Create(
@@ -496,7 +495,7 @@ TEST(ConcurrentExactTableTest, SharedWritersInsertEachKeyOnce) {
 // Shared writers adding and erasing their own flows concurrently keep an
 // exact count, and the table ends with exactly the live flows.
 TEST(ConcurrentExactTableTest, SharedWritersChurnKeepsExactCount) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr int kWriters = 4;
   constexpr uint32_t kLive = 2000, kSteps = 20000;
   auto t = ConcurrentExactTable::Create(

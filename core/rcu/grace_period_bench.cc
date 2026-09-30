@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "dpdk.h"
 #include "module.h"
 #include "module_graph.h"
@@ -115,7 +115,7 @@ void Measure(const Scenario &s, const std::vector<int> &cpus,
   }
   resume_all_workers();
 
-  bess::rcu::RcuDomain &rcu = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &rcu = bess::runtime::runtime().rcu();
   if (s.throughput) {
     const uint64_t hz = rte_get_tsc_hz();
     const uint64_t warm = rte_rdtsc() + hz / 5;

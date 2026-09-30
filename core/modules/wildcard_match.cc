@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-#include "../control/resource_codec.h"
+#include "../framework/resource_codec.h"
 #include "../dataplane/transaction_engine.h"
 #include "../utils/endian.h"
 #include "../utils/format.h"
@@ -200,7 +200,7 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
             value.priority(), static_cast<uint16_t>(value.gate())});
       }));
   if (auto registered =
-          bess::control::runtime().transactions().Register(resource_.get());
+          bess::runtime::runtime().transactions().Register(resource_.get());
       !registered) {
     resource_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
@@ -215,7 +215,7 @@ void WildcardMatch::DeInit() {
   // The rules reference nothing and nothing may reference them; freed rule
   // ids still in the removal cascade complete here (workers are paused).
   auto unregistered =
-      bess::control::runtime().transactions().Unregister(resource_->name());
+      bess::runtime::runtime().transactions().Unregister(resource_->name());
   CHECK(unregistered) << unregistered.error();
   resource_.reset();
 }
@@ -329,7 +329,7 @@ WildcardMatch::NewTable() const {
   }
   auto table = bess::classifier::ConcurrentMaskedTable::Create(
       static_cast<uint32_t>(key_size), kMaxTuples,
-      bess::control::runtime().rcu());
+      bess::runtime::runtime().rcu());
   if (!table) {
     return std::unexpected(std::make_pair(EINVAL, table.error()));
   }
@@ -450,7 +450,7 @@ void WildcardMatch::RefreshForResume() {
   GenerationPtr next = Build(current->table, current->default_gate, &err);
   if (next != nullptr) {
     published_.Publish(std::move(next));
-    bess::control::runtime().rcu().ReclaimReady();
+    bess::runtime::runtime().rcu().ReclaimReady();
     return;
   }
 
@@ -461,7 +461,7 @@ void WildcardMatch::RefreshForResume() {
   LOG(ERROR) << "WildcardMatch '" << name() << "': metadata refresh failed ("
              << err.second << "); routing all packets to the default gate";
   published_.Publish(BuildDegraded(current->table, current->default_gate));
-  bess::control::runtime().rcu().ReclaimReady();
+  bess::runtime::runtime().rcu().ReclaimReady();
 }
 
 int WildcardMatch::OnEvent(bess::Event event) {
@@ -491,7 +491,7 @@ bool WildcardMatch::Publish(
   // reclaim whatever readers are already done with. This runs on the control
   // thread, so a retired table is destroyed here -- never on a worker.
   published_.Publish(std::move(next));
-  bess::control::runtime().rcu().ReclaimReady();
+  bess::runtime::runtime().rcu().ReclaimReady();
   return true;
 }
 

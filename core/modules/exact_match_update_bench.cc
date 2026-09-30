@@ -31,7 +31,7 @@
 #if __has_include("classifier/concurrent_exact.h")
 #include "classifier/concurrent_exact.h"
 #include "classifier/cuckoo_exact.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #define HAVE_CONCURRENT_EXACT 1
 #endif
 
@@ -141,14 +141,14 @@ LookupFixture &FixtureFor(size_t n, bool miss) {
   // The module's sizing (D-010).
   auto table = ConcurrentExactTable::Create(8,
                                             ConcurrentExactTable::CapacityFor(n),
-                                            bess::control::runtime().rcu());
+                                            bess::runtime::runtime().rcu());
   if (!table) std::abort();
   f->concurrent = std::move(*table);
   // The pre-D-010 sizing, for an in-process A/B: a power of two at 3/4 load.
   uint32_t pow2 = 1024;
   while (pow2 * 3 / 4 < n) pow2 *= 2;
   auto old = ConcurrentExactTable::Create(8, pow2,
-                                          bess::control::runtime().rcu());
+                                          bess::runtime::runtime().rcu());
   if (!old) std::abort();
   f->concurrent_pow2 = std::move(*old);
   for (size_t i = 0; i < n; i++) {

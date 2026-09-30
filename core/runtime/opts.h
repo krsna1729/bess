@@ -1,8 +1,8 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_OPTS_H_
-#define BESS_OPTS_H_
+#ifndef BESS_RUNTIME_OPTS_H_
+#define BESS_RUNTIME_OPTS_H_
 
 #include <gflags/gflags.h>
 
@@ -28,4 +28,4 @@ DECLARE_uint32(packet_data_room);
 DECLARE_bool(dpdk);
 DECLARE_string(iova);
 
-#endif  // BESS_OPTS_H_
+#endif  // BESS_RUNTIME_OPTS_H_

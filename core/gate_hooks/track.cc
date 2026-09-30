@@ -10,7 +10,7 @@
 // Ethernet overhead in bytes
 static const size_t kEthernetOverhead = 24;
 
-const std::string Track::kName = "Track";
+const std::string Track::kName = bess::kTrackGateHookName;
 
 const GateHookCommands Track::cmds = {{"reset", "EmptyArg",
                                        GATE_HOOK_CMD_FUNC(&Track::CommandReset),

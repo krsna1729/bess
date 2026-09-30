@@ -5,7 +5,7 @@
 
 #include "control/control_error.h"
 #include "control/pipeline_spec.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 
 namespace bess {
 namespace control {
@@ -24,8 +24,8 @@ struct ValidatedPipeline {
 //
 // `runtime` is read for what already exists (registries and type registries);
 // `desired` is what the caller wants to exist.
-ControlResult<ValidatedPipeline> ValidatePipeline(const RuntimeState &runtime,
-                                                  const PipelineSpec &desired);
+ControlResult<ValidatedPipeline> ValidatePipeline(
+    const runtime::RuntimeState &runtime, const PipelineSpec &desired);
 
 }  // namespace control
 }  // namespace bess

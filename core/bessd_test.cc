@@ -15,7 +15,8 @@
 #include <iostream>
 #include <string>
 
-#include "opts.h"
+#include "runtime/opts.h"
+#include "runtime/path.h"
 #include "utils/common.h"
 
 namespace bess {
@@ -407,8 +408,8 @@ TEST(SetResourceLimit, BasicRun) {
 }
 
 // Checks that we can get the executable's own directory.
-TEST(GetCurrentDirectory, BasicRun) {
-  EXPECT_NE(GetCurrentDirectory(), "");
+TEST(ExecutableDirectory, BasicRun) {
+  EXPECT_NE(bess::runtime::ExecutableDirectory(), "");
 }
 
 }  // namespace bessd

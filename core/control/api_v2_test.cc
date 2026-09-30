@@ -20,8 +20,8 @@
 #include <string>
 
 #include "control/control_plane.h"
-#include "control/runtime_state.h"
-#include "opts.h"
+#include "runtime/runtime_state.h"
+#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
 
@@ -364,7 +364,7 @@ TEST_F(ApiV2ServiceTest, StaleGenerationIsAbortedWithTypedDetail) {
   grpc::ClientContext ctx;
   v2::ApplyPipelineRequest req;
   *req.mutable_pipeline() = SamplePipeline();
-  req.set_expected_generation(bess::control::runtime().generation() + 100);
+  req.set_expected_generation(bess::runtime::runtime().generation() + 100);
   v2::ApplyPipelineResponse resp;
   const grpc::Status status = stub_->ApplyPipeline(&ctx, req, &resp);
   EXPECT_EQ(grpc::StatusCode::ABORTED, status.error_code());
@@ -402,7 +402,7 @@ TEST_F(ApiV2ServiceTest, InvalidPipelineIsRejectedBeforeAnySideEffect) {
 TEST_F(ApiV2ServiceTest, OutOfRangeWireValuesAreRefusedEverywhere) {
   v2::Pipeline bad = SamplePipeline();
   bad.mutable_connections(0)->set_ogate(65536);  // would be gate 0
-  const uint64_t generation = bess::control::runtime().generation();
+  const uint64_t generation = bess::runtime::runtime().generation();
 
   const auto check = [&](grpc::ClientContext &ctx, const grpc::Status &st) {
     EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, st.error_code());
@@ -436,7 +436,7 @@ TEST_F(ApiV2ServiceTest, OutOfRangeWireValuesAreRefusedEverywhere) {
     v2::ApplyPipelineResponse resp;
     check(ctx, stub_->ApplyPipeline(&ctx, req, &resp));
   }
-  EXPECT_EQ(generation, bess::control::runtime().generation());
+  EXPECT_EQ(generation, bess::runtime::runtime().generation());
   grpc::ClientContext ctx;
   v2::GetPipelineResponse resp;
   ASSERT_TRUE(stub_->GetPipeline(&ctx, {}, &resp).ok());

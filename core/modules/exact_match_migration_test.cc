@@ -30,7 +30,7 @@
 #include "classifier/runtime_schema.h"
 #include "modules/exact_match.h"
 #include "pb/module_msg.pb.h"
-#include "utils/exact_match_table.h"
+#include "framework/exact_match_table.h"
 
 namespace {
 
@@ -45,10 +45,10 @@ using bess::classifier::RuntimeExactRule;
 using bess::classifier::RuntimeKeyField;
 using bess::classifier::SourceKind;
 using bess::classifier::SourceView;
-using bess::utils::ExactMatchField;
-using bess::utils::ExactMatchKey;
-using bess::utils::ExactMatchRuleFields;
-using bess::utils::ExactMatchTable;
+using bess::framework::ExactMatchField;
+using bess::framework::ExactMatchKey;
+using bess::framework::ExactMatchRuleFields;
+using bess::framework::ExactMatchTable;
 
 constexpr gate_idx_t kDefaultGate = 999;
 constexpr size_t kMetadataSize = 128;

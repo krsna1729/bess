@@ -27,7 +27,7 @@
 #include <tuple>
 
 #include "debug.h"
-#include "opts.h"
+#include "runtime/opts.h"
 #include "port.h"
 
 // How log messages are processed in BESS?
@@ -457,19 +457,6 @@ bool LoadPlugins(const std::string &directory) {
   return (remaining.size() == 0);
 }
 
-std::string GetCurrentDirectory() {
-  char dest[PATH_MAX + 1];
-  ssize_t res = readlink("/proc/self/exe", dest, PATH_MAX);
-  if (res == -1) {
-    PLOG(FATAL) << "readlink()";
-  }
-  dest[res] = '\0';
-  const char *slash = strrchr(dest, '/');
-  if (slash == nullptr) {
-    PLOG(FATAL) << "strrchr()";
-  }
-  return std::string(dest, slash - dest + 1);
-}
 
 }  // namespace bessd
 }  // namespace bess

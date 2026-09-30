@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "control/pipeline_spec.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "gate.h"
 #include "message.h"
 #include "port.h"
@@ -103,7 +103,7 @@ struct PipelineSnapshot {
 
 // Reads the active runtime into a snapshot. Pure: it never mutates the state it
 // is given.
-PipelineSnapshot SnapshotRuntime(const RuntimeState &runtime);
+PipelineSnapshot SnapshotRuntime(const runtime::RuntimeState &runtime);
 
 // Reconstructs the desired-state description of an active runtime. Internal
 // traffic classes (module leaf classes and scheduler defaults, whose names

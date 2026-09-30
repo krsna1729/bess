@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "gate.h"
 #include "message.h"
 #include "metadata.h"
@@ -43,7 +43,7 @@ class ModuleGraph {
   static int DisconnectModule(Module *module, gate_idx_t ogate_idx);
 
   // Non-owning view of the runtime's module registry.
-  static const bess::control::ModuleRegistry::Map &GetAllModules();
+  static const bess::runtime::ModuleRegistry::Map &GetAllModules();
 
   static std::string GenerateDefaultName(const std::string &class_name,
                                          const std::string &default_template);

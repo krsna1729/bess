@@ -22,7 +22,7 @@
 
 #include <glog/logging.h>
 
-#include "../debug.h"
+#include "stacktrace.h"
 #include "../dataplane/batch_tuning.h"
 #include "common.h"
 
@@ -174,7 +174,7 @@ class CuckooMap {
       if (++trials >= 3) {
         LOG_FIRST_N(WARNING, 1)
             << "CuckooMap: Excessive hash colision detected:\n"
-            << bess::debug::DumpStack();
+            << StackTrace(nullptr);
         return nullptr;
       }
 

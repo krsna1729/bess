@@ -2,11 +2,15 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_UTILS_EXACT_MATCH_TABLE_H_
-#define BESS_UTILS_EXACT_MATCH_TABLE_H_
+#ifndef BESS_FRAMEWORK_EXACT_MATCH_TABLE_H_
+#define BESS_FRAMEWORK_EXACT_MATCH_TABLE_H_
 
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <rte_config.h>
@@ -16,10 +20,10 @@
 #include "../metadata.h"
 #include "../module.h"
 #include "../packet.h"
-#include "bits.h"
-#include "cuckoo_map.h"
-#include "endian.h"
-#include "format.h"
+#include "utils/bits.h"
+#include "utils/cuckoo_map.h"
+#include "utils/endian.h"
+#include "utils/format.h"
 
 #define MAX_FIELDS 8
 #define MAX_FIELD_SIZE 8
@@ -34,7 +38,7 @@ static_assert(MAX_FIELD_SIZE <= sizeof(uint64_t),
 #endif
 
 namespace bess {
-namespace utils {
+namespace framework {
 
 using Error = std::pair<int, std::string>;
 
@@ -72,8 +76,8 @@ class ExactMatchKeyHash {
  public:
   explicit ExactMatchKeyHash(size_t len) : len_(len) {}
 
-  HashResult operator()(const ExactMatchKey &key) const {
-    HashResult init_val = 0;
+  utils::HashResult operator()(const ExactMatchKey &key) const {
+    utils::HashResult init_val = 0;
 
     promise(len_ >= sizeof(uint64_t));
     promise(len_ <= sizeof(ExactMatchKey));
@@ -131,7 +135,7 @@ template <typename T>
 class ExactMatchTable {
  public:
   using EmTable =
-      CuckooMap<ExactMatchKey, T, ExactMatchKeyHash, ExactMatchKeyEq>;
+      utils::CuckooMap<ExactMatchKey, T, ExactMatchKeyHash, ExactMatchKeyEq>;
 
   ExactMatchTable()
       : raw_key_size_(),
@@ -326,8 +330,9 @@ class ExactMatchTable {
   // Returns 0 on success, non-zero errno on failure.
   Error gather_key(const ExactMatchRuleFields &fields, ExactMatchKey *key) {
     if (fields.size() != num_fields_) {
-      return MakeError(EINVAL, Format("rule should have %zu fields (has %zu)",
-                                      num_fields_, fields.size()));
+      return MakeError(
+          EINVAL, utils::Format("rule should have %zu fields (has %zu)",
+                                num_fields_, fields.size()));
     }
 
     *key = {};
@@ -340,8 +345,9 @@ class ExactMatchTable {
 
       if (static_cast<size_t>(field_size) != f_obj.size()) {
         return MakeError(
-            EINVAL, Format("rule field %zu should have size %d (has %zu)", i,
-                           field_size, f_obj.size()));
+            EINVAL,
+            utils::Format("rule field %zu should have size %d (has %zu)", i,
+                          field_size, f_obj.size()));
       }
 
       memcpy(reinterpret_cast<uint8_t *>(key) + field_pos, f_obj.data(),
@@ -389,14 +395,15 @@ class ExactMatchTable {
                    const std::string &mt_attr_name, int idx,
                    Module *m = nullptr, bool attr_resolved = false) {
     if (idx >= MAX_FIELDS) {
-      return MakeError(EINVAL,
-                       Format("idx %d is not in [0,%d)", idx, MAX_FIELDS));
+      return MakeError(
+          EINVAL, utils::Format("idx %d is not in [0,%d)", idx, MAX_FIELDS));
     }
     ExactMatchField *f = &fields_[idx];
     f->size = field.size;
     if (f->size < 1 || f->size > MAX_FIELD_SIZE) {
-      return MakeError(EINVAL, Format("idx %d: 'size' must be in [1,%d]", idx,
-                                      MAX_FIELD_SIZE));
+      return MakeError(
+          EINVAL, utils::Format("idx %d: 'size' must be in [1,%d]", idx,
+                                MAX_FIELD_SIZE));
     }
 
     // Check `m` itself (rather than mt_attr_name.length()) so the
@@ -412,21 +419,23 @@ class ExactMatchTable {
       // not do.
       f->attr_id = field.attr_id;
       if (f->attr_id < 0) {
-        return MakeError(EINVAL,
-                         Format("idx %d: attr id must be already resolved", idx));
+        return MakeError(
+            EINVAL,
+            utils::Format("idx %d: attr id must be already resolved", idx));
       }
     } else if (m != nullptr) {
       f->attr_id = m->AddMetadataAttr(mt_attr_name, f->size,
                                       metadata::Attribute::AccessMode::kRead);
       if (f->attr_id < 0) {
-        return MakeError(-f->attr_id,
-                         Format("idx %d: add_metadata_attr() failed", idx));
+        return MakeError(
+            -f->attr_id,
+            utils::Format("idx %d: add_metadata_attr() failed", idx));
       }
     } else {
       f->attr_id = -1;
       f->offset = field.offset;
       if (f->offset < 0 || f->offset > 1024) {
-        return MakeError(EINVAL, Format("idx %d: invalid 'offset'", idx));
+        return MakeError(EINVAL, utils::Format("idx %d: invalid 'offset'", idx));
       }
     }
 
@@ -434,17 +443,18 @@ class ExactMatchTable {
 
     if (field.mask == 0) {
       /* by default all bits are considered */
-      f->mask = SetBitsHigh<uint64_t>(f->size * 8);
+      f->mask = utils::SetBitsHigh<uint64_t>(f->size * 8);
     } else {
       if (!utils::uint64_to_bin(&f->mask, field.mask, f->size,
                                 utils::is_be_system() | force_be)) {
         return MakeError(
-            EINVAL, Format("idx %d: not a valid %d-byte mask", idx, f->size));
+            EINVAL,
+            utils::Format("idx %d: not a valid %d-byte mask", idx, f->size));
       }
     }
 
     if (f->mask == 0) {
-      return MakeError(EINVAL, Format("idx %d: empty mask", idx));
+      return MakeError(EINVAL, utils::Format("idx %d: empty mask", idx));
     }
 
     num_fields_++;
@@ -467,7 +477,7 @@ class ExactMatchTable {
   EmTable table_;
 };
 
+}  // namespace framework
 }  // namespace bess
-}  // namespace utils
 
-#endif  // BESS_UTILS_EXACT_MATCH_TABLE_H_
+#endif  // BESS_FRAMEWORK_EXACT_MATCH_TABLE_H_

@@ -6,8 +6,7 @@
 // (`taskset -c 2-3 control_thread_placement_test`) to see it as a container
 // would.
 
-#include "control/thread_placement.h"
-
+#include "runtime/thread_placement.h"
 #include <gtest/gtest.h>
 #include <pthread.h>
 #include <sched.h>
@@ -17,18 +16,18 @@
 #include <vector>
 
 #include "control/control_plane.h"
-#include "control/runtime_state.h"
-#include "opts.h"
+#include "runtime/runtime_state.h"
+#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
 #include "worker.h"
 
 namespace {
 
-using bess::control::ControlCpus;
-using bess::control::CpuAllowed;
-using bess::control::CpuList;
-using bess::control::ProcessCpus;
+using bess::runtime::ControlCpus;
+using bess::runtime::CpuAllowed;
+using bess::runtime::CpuList;
+using bess::runtime::ProcessCpus;
 
 cpu_set_t Set(std::initializer_list<int> cpus) {
   cpu_set_t set;
@@ -74,7 +73,7 @@ TEST(ThreadPlacementTest, EverythingStaysInsideTheInheritedSet) {
   const cpu_set_t now = ThisThread();
   // Nothing narrowed this thread yet: the captured set is what we run with.
   EXPECT_TRUE(CPU_EQUAL(&now, &ProcessCpus())) << CpuList(ProcessCpus());
-  EXPECT_TRUE(CpuAllowed(bess::control::DefaultWorkerCore()));
+  EXPECT_TRUE(CpuAllowed(bess::runtime::DefaultWorkerCore()));
 }
 
 // A worker on the last allowed CPU: the other threads leave it, threads

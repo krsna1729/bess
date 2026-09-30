@@ -16,12 +16,12 @@
 
 #include "control/control_plane.h"
 #include "control/pipeline_spec.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "control/transaction.h"
-#include "control/worker_manager.h"
+#include "runtime/worker_manager.h"
 #include "pb/module_msg.pb.h"
 #include "pb/port_msg.pb.h"
-#include "opts.h"
+#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
 #include "worker.h"
@@ -110,7 +110,7 @@ class ApplyPipelineTest : public ::testing::Test {
 };
 
 TEST_F(ApplyPipelineTest, AppliesACompletePipeline) {
-  const uint64_t generation_before = bess::control::runtime().generation();
+  const uint64_t generation_before = bess::runtime::runtime().generation();
 
   auto applied = control_plane_->ApplyPipeline(FullPipeline(), {});
   ASSERT_TRUE(applied.has_value()) << applied.error().message;
@@ -162,9 +162,9 @@ TEST_F(ApplyPipelineTest, FailedCommitKeepsTheActivePipeline) {
   ASSERT_TRUE(control_plane_->ApplyPipeline(FullPipeline(), {}).has_value());
 
   const PipelineSnapshot active = control_plane_->GetPipeline();
-  const uint64_t generation = bess::control::runtime().generation();
-  const size_t modules = bess::control::runtime().modules().Size();
-  const size_t tcs = bess::control::runtime().traffic_classes().Size();
+  const uint64_t generation = bess::runtime::runtime().generation();
+  const size_t modules = bess::runtime::runtime().modules().Size();
+  const size_t tcs = bess::runtime::runtime().traffic_classes().Size();
 
   // Add a traffic-class hierarchy whose second half cannot attach: a child of a
   // priority class without a priority. The parent is created first, so the
@@ -185,9 +185,9 @@ TEST_F(ApplyPipelineTest, FailedCommitKeepsTheActivePipeline) {
   auto applied = control_plane_->ApplyPipeline(broken, {});
   ASSERT_FALSE(applied.has_value());
 
-  EXPECT_EQ(generation, bess::control::runtime().generation());
-  EXPECT_EQ(modules, bess::control::runtime().modules().Size());
-  EXPECT_EQ(tcs, bess::control::runtime().traffic_classes().Size());
+  EXPECT_EQ(generation, bess::runtime::runtime().generation());
+  EXPECT_EQ(modules, bess::runtime::runtime().modules().Size());
+  EXPECT_EQ(tcs, bess::runtime::runtime().traffic_classes().Size());
   EXPECT_TRUE(control_plane_->GetPipeline() == active)
       << "the previous pipeline must still be the active one";
 
@@ -200,7 +200,7 @@ TEST_F(ApplyPipelineTest, FailedCommitKeepsTheActivePipeline) {
 // Removal goes through the retire phase, and the runtime ends up consistent.
 TEST_F(ApplyPipelineTest, RemovesModulesAndConnectionsAgain) {
   ASSERT_TRUE(control_plane_->ApplyPipeline(FullPipeline(), {}).has_value());
-  const uint64_t after_apply = bess::control::runtime().generation();
+  const uint64_t after_apply = bess::runtime::runtime().generation();
 
   PipelineSpec reduced = FullPipeline();
   reduced.connections.clear();
@@ -247,7 +247,7 @@ struct Fingerprint {
 
 Fingerprint Capture() {
   Fingerprint fingerprint;
-  const bess::control::RuntimeState &state = bess::control::runtime();
+  const bess::runtime::RuntimeState &state = bess::runtime::runtime();
 
   fingerprint.generation = state.generation();
   fingerprint.ports = state.ports().Size();
@@ -361,7 +361,7 @@ TEST_F(ApplyPipelineTest, InjectedFailuresLeaveNoTrace) {
 // apply must never claim a pipeline that does not exist.
 TEST_F(ApplyPipelineTest, InjectedRetireFailureIsReportedAsFailure) {
   ASSERT_TRUE(control_plane_->ApplyPipeline(FullPipeline(), {}).has_value());
-  const uint64_t generation = bess::control::runtime().generation();
+  const uint64_t generation = bess::runtime::runtime().generation();
 
   PipelineSpec reduced = FullPipeline();
   reduced.connections.clear();  // the edge into "sink" goes away with it
@@ -388,8 +388,8 @@ TEST_F(ApplyPipelineTest, InjectedRetireFailureIsReportedAsFailure) {
   // The new state *is* active -- the commit happened -- so the generation says
   // so, and the module that could not be retired is still there. The caller
   // knows, which is the difference from silently succeeding.
-  EXPECT_EQ(generation + 1, bess::control::runtime().generation());
-  EXPECT_TRUE(bess::control::runtime().modules().Contains("sink"));
+  EXPECT_EQ(generation + 1, bess::runtime::runtime().generation());
+  EXPECT_TRUE(bess::runtime::runtime().modules().Contains("sink"));
 }
 
 // The invariant: a successful apply leaves exactly the desired state.
@@ -543,7 +543,7 @@ TEST_F(ApplyPipelineTest, PolicyChangeIsRefusedTransactionally) {
   child.share = 3;
   spec.traffic_classes.push_back(child);
   ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
-  const uint64_t generation = bess::control::runtime().generation();
+  const uint64_t generation = bess::runtime::runtime().generation();
 
   PipelineSpec changed = spec;
   for (auto &tc : changed.traffic_classes) {
@@ -564,7 +564,7 @@ TEST_F(ApplyPipelineTest, PolicyChangeIsRefusedTransactionally) {
   ASSERT_FALSE(applied.has_value());
   EXPECT_EQ(bess::control::ControlErrorCode::kUnsupportedTransaction,
             applied.error().code);
-  EXPECT_EQ(generation, bess::control::runtime().generation());
+  EXPECT_EQ(generation, bess::runtime::runtime().generation());
 }
 
 // A plan whose retirement cannot be guaranteed is refused up front: the port is
@@ -601,7 +601,7 @@ TEST_F(ApplyPipelineTest, RetirementPreconditionsAreProvenUpFront) {
   PipelineSpec without_port = spec;
   without_port.ports.clear();
 
-  const uint64_t generation = bess::control::runtime().generation();
+  const uint64_t generation = bess::runtime::runtime().generation();
   const PipelineSnapshot active = control_plane_->GetPipeline();
 
   auto applied = control_plane_->ApplyPipeline(without_port, {});
@@ -610,7 +610,7 @@ TEST_F(ApplyPipelineTest, RetirementPreconditionsAreProvenUpFront) {
             applied.error().code);
   EXPECT_EQ("port", applied.error().object);
   EXPECT_NE(std::string::npos, applied.error().message.find("still in use"));
-  EXPECT_EQ(generation, bess::control::runtime().generation());
+  EXPECT_EQ(generation, bess::runtime::runtime().generation());
   EXPECT_TRUE(control_plane_->GetPipeline() == active);
 }
 
@@ -645,8 +645,8 @@ TEST_F(ApplyPipelineTest, RefusedReparentKeepsEveryClassAndPlacement) {
   ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
 
   const PipelineSnapshot active = control_plane_->GetPipeline();
-  const uint64_t generation = bess::control::runtime().generation();
-  const size_t tcs = bess::control::runtime().traffic_classes().Size();
+  const uint64_t generation = bess::runtime::runtime().generation();
+  const size_t tcs = bess::runtime::runtime().traffic_classes().Size();
 
   // child_a would collide with child_b's priority: refused.
   PipelineSpec collision = spec;
@@ -655,11 +655,11 @@ TEST_F(ApplyPipelineTest, RefusedReparentKeepsEveryClassAndPlacement) {
   auto applied = control_plane_->ApplyPipeline(collision, {});
   ASSERT_FALSE(applied.has_value());
 
-  EXPECT_EQ(generation, bess::control::runtime().generation());
-  EXPECT_EQ(tcs, bess::control::runtime().traffic_classes().Size());
+  EXPECT_EQ(generation, bess::runtime::runtime().generation());
+  EXPECT_EQ(tcs, bess::runtime::runtime().traffic_classes().Size());
   EXPECT_TRUE(control_plane_->GetPipeline() == active);
-  EXPECT_TRUE(bess::control::runtime().traffic_classes().Contains("child_a"));
-  EXPECT_TRUE(bess::control::runtime().traffic_classes().Contains("child_b"));
+  EXPECT_TRUE(bess::runtime::runtime().traffic_classes().Contains("child_a"));
+  EXPECT_TRUE(bess::runtime::runtime().traffic_classes().Contains("child_b"));
 
   // Both children still hold their original priorities.
   for (const auto &tc : control_plane_->GetPipeline().traffic_classes) {
@@ -704,8 +704,8 @@ TEST_F(ApplyPipelineTest, AttachFailureDuringCommitRollsBackCleanly) {
   ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
 
   const PipelineSnapshot active = control_plane_->GetPipeline();
-  const uint64_t generation = bess::control::runtime().generation();
-  const size_t tcs = bess::control::runtime().traffic_classes().Size();
+  const uint64_t generation = bess::runtime::runtime().generation();
+  const size_t tcs = bess::runtime::runtime().traffic_classes().Size();
 
   // Rename the child: the new class is created during the commit, while the old
   // one is only retired afterwards, so the rate limiter still holds its child
@@ -716,10 +716,10 @@ TEST_F(ApplyPipelineTest, AttachFailureDuringCommitRollsBackCleanly) {
   auto applied = control_plane_->ApplyPipeline(renamed, {});
   ASSERT_FALSE(applied.has_value());
 
-  EXPECT_EQ(generation, bess::control::runtime().generation());
-  EXPECT_EQ(tcs, bess::control::runtime().traffic_classes().Size());
-  EXPECT_TRUE(bess::control::runtime().traffic_classes().Contains("old_child"));
-  EXPECT_FALSE(bess::control::runtime().traffic_classes().Contains("new_child"));
+  EXPECT_EQ(generation, bess::runtime::runtime().generation());
+  EXPECT_EQ(tcs, bess::runtime::runtime().traffic_classes().Size());
+  EXPECT_TRUE(bess::runtime::runtime().traffic_classes().Contains("old_child"));
+  EXPECT_FALSE(bess::runtime::runtime().traffic_classes().Contains("new_child"));
   EXPECT_TRUE(control_plane_->GetPipeline() == active);
 }
 
@@ -743,13 +743,13 @@ TEST_F(ApplyPipelineTest, ZeroShareIsRejectedBeforeAnyChange) {
   child.share = 0;
   spec.traffic_classes.push_back(child);
 
-  const uint64_t generation = bess::control::runtime().generation();
+  const uint64_t generation = bess::runtime::runtime().generation();
   auto applied = control_plane_->ApplyPipeline(spec, {});
   ASSERT_FALSE(applied.has_value());
   EXPECT_EQ(EINVAL, applied.error().err);
   EXPECT_EQ("share", applied.error().field);
-  EXPECT_EQ(generation, bess::control::runtime().generation());
-  EXPECT_TRUE(bess::control::runtime().traffic_classes().Empty());
+  EXPECT_EQ(generation, bess::runtime::runtime().generation());
+  EXPECT_TRUE(bess::runtime::runtime().traffic_classes().Empty());
 }
 
 // Pause duration is observable from the start.
@@ -836,7 +836,7 @@ TEST_F(ApplyPipelineTest, LegacyReparentRestoresTheOriginalAttachment) {
   move.parent = "home";
   ASSERT_TRUE(control_plane_->UpdateTcParent(move).has_value());
 
-  const uint64_t generation = bess::control::runtime().generation();
+  const uint64_t generation = bess::runtime::runtime().generation();
   {
     const bess::control::PipelineSnapshot moved = control_plane_->GetPipeline();
     bool homed = false;
@@ -857,8 +857,8 @@ TEST_F(ApplyPipelineTest, LegacyReparentRestoresTheOriginalAttachment) {
   auto refused = control_plane_->UpdateTcParent(collision);
   ASSERT_FALSE(refused.has_value());
 
-  EXPECT_EQ(generation, bess::control::runtime().generation());
-  EXPECT_TRUE(bess::control::runtime().traffic_classes().Contains(leaf_name));
+  EXPECT_EQ(generation, bess::runtime::runtime().generation());
+  EXPECT_TRUE(bess::runtime::runtime().traffic_classes().Contains(leaf_name));
 
   // The class went back where it was, not to the orphan list.
   bool restored = false;
@@ -897,7 +897,7 @@ TEST_F(ApplyPipelineTest, LegacyReparentRefusesToMoveAnAttachedRoot) {
   ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
 
   const PipelineSnapshot active = control_plane_->GetPipeline();
-  const uint64_t generation = bess::control::runtime().generation();
+  const uint64_t generation = bess::runtime::runtime().generation();
 
   bess::control::TrafficClassSpec move;
   move.name = "solo";
@@ -909,9 +909,9 @@ TEST_F(ApplyPipelineTest, LegacyReparentRefusesToMoveAnAttachedRoot) {
   ASSERT_FALSE(refused.has_value());
   EXPECT_EQ(EINVAL, refused.error().err);
 
-  EXPECT_EQ(generation, bess::control::runtime().generation());
+  EXPECT_EQ(generation, bess::runtime::runtime().generation());
   EXPECT_TRUE(control_plane_->GetPipeline() == active);
-  EXPECT_TRUE(bess::control::runtime().traffic_classes().Contains("solo"));
+  EXPECT_TRUE(bess::runtime::runtime().traffic_classes().Contains("solo"));
 }
 
 }  // namespace

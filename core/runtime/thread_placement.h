@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_CONTROL_THREAD_PLACEMENT_H_
-#define BESS_CONTROL_THREAD_PLACEMENT_H_
+#ifndef BESS_RUNTIME_THREAD_PLACEMENT_H_
+#define BESS_RUNTIME_THREAD_PLACEMENT_H_
 
 #include <sched.h>
 #include <sys/types.h>
@@ -9,7 +9,7 @@
 #include <span>
 #include <string>
 
-namespace bess::control {
+namespace bess::runtime {
 
 // Keeps the daemon's own threads -- main, gRPC, DPDK's service threads --
 // off the CPUs packet workers are pinned to (Decision D-027). Unpinned, the
@@ -45,6 +45,6 @@ cpu_set_t ControlCpus(const cpu_set_t &base, std::span<const int> cores);
 // creator's set. Returns how many threads it moved.
 int PlaceControlThreads(std::span<const WorkerPlacement> workers);
 
-}  // namespace bess::control
+}  // namespace bess::runtime
 
-#endif  // BESS_CONTROL_THREAD_PLACEMENT_H_
+#endif  // BESS_RUNTIME_THREAD_PLACEMENT_H_

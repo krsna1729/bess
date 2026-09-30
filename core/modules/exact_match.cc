@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include "../control/resource_codec.h"
+#include "../framework/resource_codec.h"
 #include "../dataplane/transaction_engine.h"
 #include "../event.h"
 #include "../metadata.h"
@@ -46,7 +46,7 @@ const Commands ExactMatch::cmds = {
 namespace {
 
 // Converts a raw configured mask into the byte mask applied on extraction,
-// mirroring ExactMatchTable::DoAddField (utils/exact_match_table.h):
+// mirroring ExactMatchTable::DoAddField (framework/exact_match_table.h):
 //   - raw == 0 selects the default all-ones mask;
 //   - otherwise the value must fit in `size` bytes, stored big-endian for
 //     packet (offset) fields and little-endian for metadata fields;
@@ -88,7 +88,7 @@ bool ConvertMask(uint64_t raw, int size, bool is_packet,
 // Action-mode commands use the same writer and reference ledger as the
 // transaction RPC. A direct table mutation would leave stale incoming counts.
 CommandResponse ApplyRuleOps(std::span<const bess::dataplane::Op> ops) {
-  auto result = bess::control::runtime().transactions().Apply(ops);
+  auto result = bess::runtime::runtime().transactions().Apply(ops);
   using Outcome = bess::dataplane::TransactionEngine::Outcome;
   if (result.outcome == Outcome::kApplied) {
     return CommandSuccess();
@@ -287,7 +287,7 @@ ExactMatch::NewTable(size_t rules) const {
   auto table = classifier::ConcurrentExactTable::Create(
       static_cast<uint32_t>(key_size),
       classifier::ConcurrentExactTable::CapacityFor(rules),
-      bess::control::runtime().rcu());
+      bess::runtime::runtime().rcu());
   if (!table) {
     return std::unexpected(std::make_pair(ENOMEM, table.error()));
   }
@@ -446,7 +446,7 @@ void ExactMatch::RefreshForResume() {
   GenerationPtr next = Build(current->table, current->default_gate, &err);
   if (next != nullptr) {
     published_.Publish(std::move(next));
-    bess::control::runtime().rcu().ReclaimReady();
+    bess::runtime::runtime().rcu().ReclaimReady();
     return;
   }
 
@@ -458,7 +458,7 @@ void ExactMatch::RefreshForResume() {
              << "': metadata refresh failed (" << err.second
              << "); routing all packets to the default gate";
   published_.Publish(BuildDegraded(current->table, current->default_gate));
-  bess::control::runtime().rcu().ReclaimReady();
+  bess::runtime::runtime().rcu().ReclaimReady();
 }
 
 int ExactMatch::OnEvent(bess::Event event) {
@@ -487,7 +487,7 @@ bool ExactMatch::Publish(
   // reclaim whatever readers are already done with. This runs on the control
   // thread, so a retired table is destroyed here -- never on a worker.
   published_.Publish(std::move(next));
-  bess::control::runtime().rcu().ReclaimReady();
+  bess::runtime::runtime().rcu().ReclaimReady();
   return true;
 }
 
@@ -625,7 +625,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
         return std::any(uint64_t{value.gate()});
       }));
   if (auto registered =
-          bess::control::runtime().transactions().Register(resource_.get());
+          bess::runtime::runtime().transactions().Register(resource_.get());
       !registered) {
     resource_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
@@ -639,7 +639,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
                         bess::metadata::Attribute::AccessMode::kWrite);
     if (action_id_attr_ < 0) {
       const std::string name = resource_->name();
-      CHECK(bess::control::runtime().transactions().Unregister(name));
+      CHECK(bess::runtime::runtime().transactions().Unregister(name));
       resource_.reset();
       return CommandFailure(-action_id_attr_, "add_metadata_attr() failed");
     }
@@ -651,7 +651,7 @@ void ExactMatch::DeInit() {
   if (resource_ == nullptr) {
     return;
   }
-  auto &engine = bess::control::runtime().transactions();
+  auto &engine = bess::runtime::runtime().transactions();
   if (action_mode_) {
     // In action mode the rules reference an ActionTable, so they may leave
     // with live keys while the graph is disconnected around them: the order

@@ -15,10 +15,10 @@
 #include <mutex>
 #include <thread>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "module.h"
 #include "module_graph.h"
-#include "opts.h"
+#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
 #include "rcu/rcu_domain.h"
@@ -117,7 +117,7 @@ class RcuSchedulerTest : public ::testing::Test {
  protected:
   void SetUp() override {
     InitRuntimeOnce();
-    rcu_ = &bess::control::runtime().rcu();
+    rcu_ = &bess::runtime::runtime().rcu();
     g_published.store(nullptr);
     g_holding.store(false);
     g_release.store(false);

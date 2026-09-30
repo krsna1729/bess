@@ -16,11 +16,11 @@
 
 #include "control/control_plane.h"
 #include "control/dataplane_transactions.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "module.h"
 #include "modules/exact_match.h"
 #include "modules/wildcard_match.h"
-#include "opts.h"
+#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "pb/module_msg.pb.h"
 #include "port.h"
@@ -167,7 +167,7 @@ class DataplaneTransactionsTest : public ::testing::Test {
   }
 
   static size_t Rules(const char *name) {
-    Module *m = bess::control::runtime().modules().Find(name);
+    Module *m = bess::runtime::runtime().modules().Find(name);
     if (auto *em = dynamic_cast<ExactMatch *>(m)) {
       bess::pb::ExactMatchConfig config;
       EXPECT_TRUE(em->GetRuntimeConfig(bess::pb::EmptyArg())
@@ -224,7 +224,7 @@ TEST_F(DataplaneTransactionsTest, TypedOperationsAcrossModules) {
   *del.add_fields() = Int(0x0a000001);
   *del.add_fields() = Int(80);
   auto *em = static_cast<ExactMatch *>(
-      bess::control::runtime().modules().Find("em0"));
+      bess::runtime::runtime().modules().Find("em0"));
   EXPECT_FALSE(em->CommandDelete(del).has_error());
   EXPECT_EQ(Rules("em0"), 0u);
   // And the RPC erases what the command path added.
@@ -364,7 +364,7 @@ TEST_F(DataplaneTransactionsTest, LargeTransactionsFitTheServerLimits) {
 // The record window is bounded, oldest first.
 TEST(DataplaneTransactionsWindowTest, OldestRecordsAgeOut) {
   InitRuntimeOnce();
-  bess::dataplane::TransactionEngine engine(bess::control::runtime().rcu());
+  bess::dataplane::TransactionEngine engine(bess::runtime::runtime().rcu());
   DataplaneTransactions transactions(engine, /*epoch=*/7);
   v2::ApplyTransactionRequest req;
   for (size_t i = 0; i <= DataplaneTransactions::kMaxRecords; i++) {

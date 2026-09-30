@@ -21,6 +21,9 @@ namespace bess {
 
 typedef uint16_t gate_idx_t;
 
+// The framework installs this registered hook on every output gate.
+inline constexpr char kTrackGateHookName[] = "Track";
+
 #define TRACK_GATES 1
 #define TCPDUMP_GATES 1
 

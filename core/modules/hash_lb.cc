@@ -63,7 +63,7 @@ void HashLB::Install(Config config) {
   // Workers keep processing: they see the old or the new configuration for a
   // whole batch, and the old one is freed after a grace period.
   config_.Publish(std::move(next));
-  bess::control::runtime().rcu().ReclaimReady();
+  bess::runtime::runtime().rcu().ReclaimReady();
 }
 
 CommandResponse HashLB::ApplyMode(const bess::pb::HashLBCommandSetModeArg &arg,

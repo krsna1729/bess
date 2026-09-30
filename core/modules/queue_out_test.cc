@@ -10,7 +10,7 @@
 
 #include <gtest/gtest.h>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "modules/queue_out.h"
 #include "modules/port_out.h"
 #include "packet_checksum.h"
@@ -118,10 +118,10 @@ class QueueOutChecksumTest : public ::testing::Test {
     std::unique_ptr<Port> port(builder->second.CreatePort("queue-out-test"));
     port->num_queues[PACKET_DIR_OUT] = 1;
     port_ = static_cast<QueueOutChecksumTestPort *>(port.get());
-    ASSERT_TRUE(bess::control::runtime().ports().Add(std::move(port)));
+    ASSERT_TRUE(bess::runtime::runtime().ports().Add(std::move(port)));
   }
 
-  void TearDown() override { bess::control::runtime().ports().Clear(); }
+  void TearDown() override { bess::runtime::runtime().ports().Clear(); }
 
   QueueOutChecksumTestPort *port_ = nullptr;
 };

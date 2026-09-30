@@ -17,7 +17,7 @@
 #include <thread>
 #include <vector>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "dataplane/slot_resource.h"
 #include "dataplane/transaction_engine.h"
 #include "route/router.h"
@@ -85,7 +85,7 @@ class RouterTransactionTest : public ::testing::Test {
     config.max_routes = 4096;
     config.tbl8_groups = tbl8_groups;
     auto router =
-        Router::Create("rt", config, next_hops, control::runtime().rcu());
+        Router::Create("rt", config, next_hops, bess::runtime::runtime().rcu());
     EXPECT_TRUE(router.has_value());
     return std::move(router).value();
   }
@@ -97,10 +97,10 @@ class RouterTransactionTest : public ::testing::Test {
   void Settle() {
     while (engine_.ReclaimRetired() != 0) {
     }
-    control::runtime().rcu().Drain();
+    bess::runtime::runtime().rcu().Drain();
   }
 
-  TransactionEngine engine_{control::runtime().rcu()};
+  TransactionEngine engine_{bess::runtime::runtime().rcu()};
 };
 
 TEST_F(RouterTransactionTest, EnrolledRoutersAreWrittenOnlyThroughTheEngine) {
@@ -324,7 +324,7 @@ TEST_F(RouterTransactionTest, ResolvesWhileTransactionsRun) {
                            router->RemoveNextHopOp(NextHopId(s + 1))};
   };
 
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr rcu::ReaderId kReader = 25;
   ASSERT_TRUE(domain.Register(kReader).has_value());
   std::atomic<bool> stop{false};
@@ -384,7 +384,7 @@ TEST_F(RouterTransactionTest, FailureAtEveryAllocationLeavesNoTrace) {
   size_t faults = 0;
   for (long k = 0;; k++) {
     SCOPED_TRACE(testing::Message() << "failing allocation " << k);
-    TransactionEngine engine{control::runtime().rcu()};
+    TransactionEngine engine{bess::runtime::runtime().rcu()};
     auto router = MakeRouter();
     ASSERT_TRUE(router->Enroll(engine));
     ASSERT_EQ(engine

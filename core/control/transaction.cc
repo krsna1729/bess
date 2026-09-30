@@ -12,8 +12,8 @@
 #include <glog/logging.h>
 
 #include "control/control_plane.h"
-#include "control/runtime_state.h"
-#include "control/worker_manager.h"
+#include "runtime/runtime_state.h"
+#include "runtime/worker_manager.h"
 #include "module.h"
 #include "scheduler.h"
 #include "worker.h"
@@ -97,7 +97,7 @@ Quiescence RequiredQuiescence(const PipelinePlan &plan) {
 }
 
 ControlResult<void> CheckReversibility(const PipelinePlan &plan) {
-  const RuntimeState &state = runtime();
+  const runtime::RuntimeState &state = runtime::runtime();
 
   for (const PlanOperation &op : plan.prepare_ops) {
     if (const auto *create = std::get_if<CreatePortOp>(&op)) {
@@ -314,7 +314,7 @@ void Transaction::Abort() noexcept {
   // roots keeps a default round-robin wrapper for them. Collapse those, so a
   // failed transaction leaves no trace at all -- including in the structural
   // snapshot.
-  runtime().workers().AdjustSchedulerDefaults();
+  runtime::runtime().workers().AdjustSchedulerDefaults();
 }
 
 ControlResult<void> Transaction::ExecutePrepareOp(const PlanOperation &op) {

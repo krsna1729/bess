@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <vector>
 
-#include "control/worker_manager.h"
+#include "runtime/worker_manager.h"
 #include "module.h"
 #include "port.h"
 #include "task.h"
@@ -113,7 +113,7 @@ PipelineSpec SpecFromSnapshot(const PipelineSnapshot &snapshot) {
   return spec;
 }
 
-PipelineSnapshot SnapshotRuntime(const RuntimeState &runtime) {
+PipelineSnapshot SnapshotRuntime(const runtime::RuntimeState &runtime) {
   PipelineSnapshot snapshot;
 
   for (const auto &pair : runtime.ports().All()) {

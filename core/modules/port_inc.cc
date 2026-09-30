@@ -4,7 +4,7 @@
 
 #include "port_inc.h"
 
-#include "../control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "../utils/format.h"
 
 const Commands PortInc::cmds = {
@@ -27,7 +27,7 @@ CommandResponse PortInc::Init(const bess::pb::PortIncArg &arg) {
   }
   port_name = arg.port().c_str();
 
-  port_ = bess::control::runtime().ports().Find(port_name);
+  port_ = bess::runtime::runtime().ports().Find(port_name);
   if (!port_) {
     return CommandFailure(ENODEV, "Port %s not found", port_name);
   }

@@ -12,7 +12,7 @@
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 
-#include "control/resource_codec.h"
+#include "framework/resource_codec.h"
 
 namespace bess::control {
 
@@ -136,7 +136,7 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
       return std::unexpected("resource '" + op.resource() +
                              "' is not reachable over the RPC");
     }
-    auto key = codec->Key(op.key());
+    auto key = codec->Key(op.key().type_url(), op.key().value());
     if (!key) {
       return std::unexpected(key.error());
     }
@@ -146,7 +146,7 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
       }
       return Op::Erase(op.resource(), std::move(*key));
     }
-    auto value = codec->Value(op.value());
+    auto value = codec->Value(op.value().type_url(), op.value().value());
     if (!value) {
       return std::unexpected(value.error());
     }

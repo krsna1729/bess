@@ -41,7 +41,7 @@
 #include <vector>
 
 #include "classifier/concurrent_exact.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "rcu/rcu_domain.h"
 
 namespace {
@@ -105,7 +105,7 @@ void BM_PacketPathWriters(benchmark::State &state) {
   const int variant = static_cast<int>(state.range(0));
   const int threads = static_cast<int>(state.range(1));
   const int lookups = static_cast<int>(state.range(2));
-  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
 
   // Room for every live flow plus deletes waiting out a grace period.
   const uint32_t per_thread = ConcurrentExactTable::CapacityFor(kWindow * 2);

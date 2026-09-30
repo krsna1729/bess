@@ -41,7 +41,7 @@
 #include <string>
 #include <vector>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "dpdk.h"
 #include "rcu/rcu_domain.h"
 #include "utils/cuckoo_map.h"
@@ -124,7 +124,7 @@ rte_hash *Create(Kind kind, uint32_t pow2) {
     std::abort();
   }
   rte_hash_rcu_config rcu{};
-  rcu.v = bess::control::runtime().rcu().dpdk_qsbr();
+  rcu.v = bess::runtime::runtime().rcu().dpdk_qsbr();
   rcu.mode = RTE_HASH_QSBR_MODE_DQ;
   if (rte_hash_rcu_qsbr_add(h, &rcu) != 0) {
     std::abort();
@@ -333,7 +333,7 @@ ChurnResult Churn(Kind kind, uint32_t pow2, double load,
   rte_hash *h = Create(kind, pow2);
   const uint64_t slots = kind == Kind::kThreeQuarter ? pow2 / 4 * 3 : pow2;
   const uint64_t target = static_cast<uint64_t>(load * slots);
-  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr uint32_t kReader = 30;
   if (quiesce_every) {
     if (!domain.Register(kReader).has_value()) std::abort();

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "startup.h"
+#include "runtime/startup.h"
 
 #include <dirent.h>
 #include <pthread.h>

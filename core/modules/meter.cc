@@ -11,8 +11,8 @@
 #include <string>
 #include <utility>
 
-#include "../control/runtime_state.h"
-#include "../control/resource_codec.h"
+#include "runtime/runtime_state.h"
+#include "framework/resource_codec.h"
 #include "../dataplane/transaction_engine.h"
 #include "../utils/endian.h"
 #include "../utils/format.h"
@@ -206,7 +206,7 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
             return std::any(*policy);
           }));
   if (auto registered =
-          bess::control::runtime().transactions().Register(resource_.get());
+          bess::runtime::runtime().transactions().Register(resource_.get());
       !registered) {
     resource_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
@@ -216,7 +216,7 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
                                    bess::metadata::Attribute::AccessMode::kRead);
   if (meter_id_attr_ < 0) {
     const std::string name = resource_->name();
-    CHECK(bess::control::runtime().transactions().ReleaseForTeardown(
+    CHECK(bess::runtime::runtime().transactions().ReleaseForTeardown(
         std::span<const std::string>(&name, 1)));
     resource_.reset();
     return CommandFailure(-meter_id_attr_, "add_metadata_attr() failed");
@@ -232,7 +232,7 @@ void Meter::DeInit() {
   // with its keys still named (D-021's teardown release): the order modules
   // are destroyed in must not decide whether a pipeline can be torn down.
   const std::string name = resource_->name();
-  auto released = bess::control::runtime().transactions().ReleaseForTeardown(
+  auto released = bess::runtime::runtime().transactions().ReleaseForTeardown(
       std::span<const std::string>(&name, 1));
   CHECK(released) << released.error();
   resource_.reset();

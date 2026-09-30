@@ -4,7 +4,7 @@
 
 #include "port_out.h"
 
-#include "../control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "../utils/format.h"
 #include "tx_checksum_profile.h"
 
@@ -27,7 +27,7 @@ CommandResponse PortOut::Init(const bess::pb::PortOutArg &arg) {
 
   port_name = arg.port().c_str();
 
-  port_ = bess::control::runtime().ports().Find(port_name);
+  port_ = bess::runtime::runtime().ports().Find(port_name);
   if (!port_) {
     return CommandFailure(ENODEV, "Port %s not found", port_name);
   }

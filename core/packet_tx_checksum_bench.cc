@@ -12,7 +12,7 @@
 #include <span>
 #include <vector>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "modules/queue_out.h"
 #include "packet.h"
 #include "packet_checksum.h"
@@ -93,7 +93,7 @@ TxChecksumBenchPort *GetTxChecksumBenchPort() {
         builder->second.CreatePort("tx-checksum-bench"));
     instance->num_queues[PACKET_DIR_OUT] = 1;
     auto *bench_port = static_cast<TxChecksumBenchPort *>(instance.get());
-    CHECK(bess::control::runtime().ports().Add(std::move(instance)));
+    CHECK(bess::runtime::runtime().ports().Add(std::move(instance)));
     return bench_port;
   }();
   return port;

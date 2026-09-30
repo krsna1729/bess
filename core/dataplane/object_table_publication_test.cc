@@ -17,7 +17,7 @@
 #include <thread>
 #include <vector>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "dataplane/action_id.h"
 #include "dataplane/object_table.h"
 #include "dataplane/strong_id.h"
@@ -66,7 +66,7 @@ std::unique_ptr<const ActionTable> BuildTable(int value, size_t capacity = 16) {
 class ObjectTablePublicationTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    domain_ = &bess::control::runtime().rcu();
+    domain_ = &bess::runtime::runtime().rcu();
     TestAction::alive = 0;
     TestAction::destroyed = 0;
   }

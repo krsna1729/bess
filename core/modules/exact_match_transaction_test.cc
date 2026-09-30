@@ -16,7 +16,7 @@
 #include <thread>
 #include <vector>
 
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "dataplane/transaction_engine.h"
 #include "module.h"
 #include "module_graph.h"
@@ -31,7 +31,7 @@ using bess::dataplane::Op;
 using bess::dataplane::TransactionEngine;
 using Outcome = TransactionEngine::Outcome;
 
-TransactionEngine &Engine() { return bess::control::runtime().transactions(); }
+TransactionEngine &Engine() { return bess::runtime::runtime().transactions(); }
 
 // Fields: 4 bytes at offset 26, 2 bytes at offset 34. The packed rule key is
 // the fields' bytes in order: 6 bytes.
@@ -305,7 +305,7 @@ TEST_F(ExactMatchTransactionTest, LookupsWhileTransactionsRun) {
   constexpr uint32_t kLive = 1500;
   constexpr uint32_t kSteps = 20000;
 
-  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr bess::rcu::ReaderId kReader = 21;
   ASSERT_TRUE(domain.Register(kReader).has_value());
   std::atomic<bool> stop{false};
@@ -358,7 +358,7 @@ TEST_F(ExactMatchTransactionTest, LookupsWhileTransactionsRun) {
         busy++;
       }
     }
-    bess::control::runtime().rcu().ReclaimReady();
+    bess::runtime::runtime().rcu().ReclaimReady();
   }
   stop = true;
   reader.join();

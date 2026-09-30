@@ -1,14 +1,13 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "opts.h"
-#include "control/thread_placement.h"
-
+#include "runtime/opts.h"
+#include "runtime/thread_placement.h"
 #include <glog/logging.h>
 
 #include <cstdint>
 
-#include "bessd.h"
+#include "runtime/path.h"
 #include "worker.h"
 #include "packet.h"
 
@@ -25,7 +24,7 @@ DEFINE_bool(k, false, "Kill existing BESS instance, if any");
 DEFINE_bool(d, false, "Run BESS in debug mode (with debug log messages)");
 DEFINE_bool(skip_root_check, false,
             "Skip checking that the process is running as root.");
-DEFINE_string(modules, bess::bessd::GetCurrentDirectory() + "modules",
+DEFINE_string(modules, bess::runtime::ExecutableDirectory() + "modules",
               "Load modules from the specified directory");
 DEFINE_bool(core_dump, false, "Generate a core dump on fatal faults");
 DEFINE_bool(no_crashlog, false, "Disable the generation of a crash log file");
@@ -43,7 +42,7 @@ static bool _iova_dummy[[maybe_unused]] =
 
 static bool ValidateCoreID(const char *, int32_t value) {
   if (value == -1) {
-    return true;  // automatic: bess::control::DefaultWorkerCore()
+    return true;  // automatic: bess::runtime::DefaultWorkerCore()
   }
   if (!is_cpu_present(value)) {
     LOG(ERROR) << "Invalid core ID: " << value;
@@ -51,9 +50,9 @@ static bool ValidateCoreID(const char *, int32_t value) {
   }
   // Inside the CPU set bessd was started with (a container's cpuset, a
   // taskset): a worker pinned elsewhere would fail to start (D-027).
-  if (!bess::control::CpuAllowed(value)) {
+  if (!bess::runtime::CpuAllowed(value)) {
     LOG(ERROR) << "Core " << value << " is not in bessd's CPU set ("
-               << bess::control::CpuList(bess::control::ProcessCpus()) << ")";
+               << bess::runtime::CpuList(bess::runtime::ProcessCpus()) << ")";
     return false;
   }
   return true;

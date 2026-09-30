@@ -20,9 +20,9 @@
 
 #include "control/wire_narrow.h"
 #include "control/api_v2.h"
-#include "startup.h"
+#include "runtime/startup.h"
 #include "control/control_plane.h"
-#include "control/worker_manager.h"
+#include "runtime/worker_manager.h"
 #include "bessd.h"
 #include "gate.h"
 #include "gate_hooks/tcpdump.h"
@@ -31,7 +31,7 @@
 #include "metadata.h"
 #include "module.h"
 #include "module_graph.h"
-#include "opts.h"
+#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
 #include "resume_hook.h"
@@ -314,7 +314,7 @@ class BESSControlImpl final : public BESSControl::Service {
       ListWorkersResponse_WorkerStatus* status = response->add_workers_status();
       status->set_wid(wid);
       status->set_running(is_worker_running(wid));
-      Worker* worker = bess::control::runtime().workers().Get(wid);
+      Worker* worker = bess::runtime::runtime().workers().Get(wid);
       status->set_core(worker->core());
       status->set_num_tcs(worker->scheduler()->NumTcs());
       status->set_silent_drops(worker->silent_drops());
@@ -529,7 +529,7 @@ class BESSControlImpl final : public BESSControl::Service {
                    ListPortsResponse* response) override {
     auto lock = control_plane_.AcquireLock();
 
-    for (const auto& pair : bess::control::runtime().ports().All()) {
+    for (const auto& pair : bess::runtime::runtime().ports().All()) {
       const ::Port* p = pair.second.get();
       bess::pb::ListPortsResponse::Port* port = response->add_ports();
 
@@ -606,7 +606,7 @@ class BESSControlImpl final : public BESSControl::Service {
     }
 
     const char* port_name = request->name().c_str();
-    const ::Port* port = bess::control::runtime().ports().Find(port_name);
+    const ::Port* port = bess::runtime::runtime().ports().Find(port_name);
     if (!port) {
       return return_with_error(response, ENOENT, "No port `%s' found",
                                port_name);
@@ -634,7 +634,7 @@ class BESSControlImpl final : public BESSControl::Service {
                       GetPortStatsResponse* response) override {
     auto lock = control_plane_.AcquireLock();
 
-    ::Port* port = bess::control::runtime().ports().Find(request->name());
+    ::Port* port = bess::runtime::runtime().ports().Find(request->name());
     if (!port) {
       return return_with_error(response, ENOENT, "No port '%s' found",
                                request->name().c_str());
@@ -675,7 +675,7 @@ class BESSControlImpl final : public BESSControl::Service {
                        GetLinkStatusResponse* response) override {
     auto lock = control_plane_.AcquireLock();
 
-    ::Port* port = bess::control::runtime().ports().Find(request->name());
+    ::Port* port = bess::runtime::runtime().ports().Find(request->name());
     if (!port) {
       return return_with_error(response, ENOENT, "No port '%s' found",
                                request->name().c_str());
@@ -753,7 +753,7 @@ class BESSControlImpl final : public BESSControl::Service {
                                "Argument must be a name in str");
     m_name = request->name().c_str();
 
-    m = bess::control::runtime().modules().Find(request->name());
+    m = bess::runtime::runtime().modules().Find(request->name());
     if (!m) {
       return return_with_error(response, ENOENT, "No module '%s' found",
                                m_name);
@@ -973,7 +973,7 @@ class BESSControlImpl final : public BESSControl::Service {
     // No need to look up the hook builder: the gate either
     // has a hook instance with the right name, or doesn't.
     const bess::pb::GateHookInfo& rh = request->hook();
-    Module* m = bess::control::runtime().modules().Find(rh.module_name());
+    Module* m = bess::runtime::runtime().modules().Find(rh.module_name());
     if (!m) {
       return return_with_error(response, ENOENT, "No module '%s' found",
                                rh.module_name().c_str());
@@ -1125,7 +1125,7 @@ class BESSControlImpl final : public BESSControl::Service {
     // DPDK functions may be called, so be prepared
     current_worker.SetNonWorker();
 
-    Module* m = bess::control::runtime().modules().Find(request->name());
+    Module* m = bess::runtime::runtime().modules().Find(request->name());
     *response = m->RunCommand(request->cmd(), request->arg());
     return Status::OK;
   }

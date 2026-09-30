@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "classifier/exact_rule_resource.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "dataplane/slot_resource.h"
 #include "dataplane/strong_id.h"
 
@@ -151,7 +151,7 @@ class TransactionEngineTest : public ::testing::Test {
     return engine_.Apply(ops, gen);
   }
 
-  rcu::RcuDomain &domain_ = control::runtime().rcu();
+  rcu::RcuDomain &domain_ = bess::runtime::runtime().rcu();
   std::unique_ptr<ConcurrentExactTable> table_;
   SlotTable<MeterId, Meter> meters_{kIds};
   SlotTable<ActionId, Action> actions_{kIds};
@@ -1025,7 +1025,7 @@ TEST_F(TransactionEngineTest, SlowReadersGetBackpressureNotAHang) {
 // key can hold an outgoing reference the ledger does not know about; once it
 // registers, one transaction may change both, referent published first.
 TEST(TransactionEngineRegistrationTest, BindsDeclaredReferencesRegisteredLater) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   TransactionEngine engine(domain);
   auto apply = [&engine](std::vector<Op> ops) { return engine.Apply(ops); };
   SlotTable<MeterId, Meter> meters(8);
@@ -1116,7 +1116,7 @@ TEST(TransactionEngineRegistrationTest, BindsDeclaredReferencesRegisteredLater) 
 // including when its table starts empty; otherwise a later erase could free
 // an id that the surviving action still hands to readers.
 TEST(TransactionEngineRegistrationTest, RebindRecountsSurvivingReferences) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   TransactionEngine engine(domain);
   SlotTable<MeterId, Meter> meters(8);
   SlotTable<ActionId, Action> actions(8);
@@ -1180,7 +1180,7 @@ TEST(TransactionEngineRegistrationTest, RebindRecountsSurvivingReferences) {
 }
 
 TEST(TransactionEngineRegistrationTest, TeardownReleaseAcceptsDuplicateNames) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   TransactionEngine engine(domain);
   SlotTable<MeterId, Meter> meters(8);
   SlotResource<MeterId, Meter> resource("meters", meters);
@@ -1194,7 +1194,7 @@ TEST(TransactionEngineRegistrationTest, TeardownReleaseAcceptsDuplicateNames) {
 // A declaration that names itself, or a set of declarations that forms a
 // cycle, has no publication order; Apply refuses rather than guessing.
 TEST(TransactionEngineRegistrationTest, ReferenceCyclesAreRefused) {
-  rcu::RcuDomain &domain = control::runtime().rcu();
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   TransactionEngine engine(domain);
   SlotTable<MeterId, Meter> meters(8);
   SlotResource<MeterId, Meter> first("first", meters, {},

@@ -14,7 +14,7 @@
 
 #include "module.h"
 #include "module_graph.h"
-#include "control/runtime_state.h"
+#include "runtime/runtime_state.h"
 #include "modules/exact_match.h"
 #include "pb/module_msg.pb.h"
 
@@ -154,7 +154,7 @@ TEST_F(ExactMatchTest, GrowsWithoutLosingRules) {
 TEST_F(ExactMatchTest, ChurnDuringLongGracePeriodGrowsInsteadOfFailing) {
   ExactMatch *m = Create();
   ASSERT_NE(nullptr, m);
-  bess::rcu::RcuDomain &domain = bess::control::runtime().rcu();
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr uint32_t kReader = 21;
   ASSERT_TRUE(domain.Register(kReader).has_value());
   domain.Online(kReader);  // and never quiescent during the churn

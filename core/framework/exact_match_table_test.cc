@@ -7,13 +7,13 @@
 #include <gtest/gtest.h>
 
 #include "../packet_pool.h"
-#include "endian.h"
+#include "utils/endian.h"
 
-using bess::utils::Error;
-using bess::utils::ExactMatchField;
-using bess::utils::ExactMatchKey;
-using bess::utils::ExactMatchRuleFields;
-using bess::utils::ExactMatchTable;
+using bess::framework::Error;
+using bess::framework::ExactMatchField;
+using bess::framework::ExactMatchKey;
+using bess::framework::ExactMatchRuleFields;
+using bess::framework::ExactMatchTable;
 
 TEST(EmTableTest, AddField) {
   ExactMatchTable<uint8_t> em;
