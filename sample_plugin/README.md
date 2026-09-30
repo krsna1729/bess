@@ -8,7 +8,7 @@ from the top level:
     tools/bootstrap_dpdk.py --af-xdp auto
     export PKG_CONFIG_PATH="$(tools/bootstrap_dpdk.py --print-pkg-config-path):${PKG_CONFIG_PATH}"
     meson setup build -Dbuild_sample_plugin=true
-    meson compile -C build
+    meson compile -C build -j4
 
 The shared module is written to `build/sample_plugin/libsequential_update.so`
 and installed under `lib/bess/modules`.  The plugin's protobuf sources are

@@ -13,13 +13,13 @@ propose it unprompted.
 
 ## Before you touch anything: sandbox constraints
 
-- **Cap every build tool and nested build subprocess at four jobs.** Use
-  `meson compile -C <build-dir> -j4`, then
-  `meson test -C <build-dir> --no-rebuild --print-errorlogs -j4`. The test
-  runner's `-j4` is not a substitute for an explicit build-tool job limit.
-  Pass `-j4` directly to Ninja or any other child build tool. This is a hard
-  user constraint: a prior `-j20` build exhausted memory and crashed the WSL
-  VM (~7.6GB RAM).
+- **Use four workers per build; keep local compiler builds sequential.** Use
+  Meson's native `meson compile -C <build-dir> -j4`. It caps workers for one
+  invocation but does not coordinate different build directories. On this
+  workstation, finish GCC before starting Clang; GitHub Actions schedules its
+  matrix according to hosted-worker capacity. Routine compilation is
+  incremental; do not clean or reconfigure day-to-day. Use a fresh build
+  directory for release verification.
 - **No real hugepages or NIC in this sandbox.** `/proc/meminfo` shows only
   ~256MB of hugepage capacity, often already exhausted. Run `bessd` with
   `-m 0` (no-hugepage mode — already a supported fallback path in
@@ -42,8 +42,8 @@ propose it unprompted.
   are gtest death-test children -- 7 `EXPECT_DEATH` statements in
   `core/bessd_test.cc` (the `CheckRunningAsRoot.*`, `WritePidFile.*`,
   `ReadPidFile.*`, `TryAcquirePidfileLock.*`, `CheckUniqueInstance.*` cases)
-  and 3 in `core/memory_test.cc`. There is no `BessdTest` suite; that wrong
-  guess cost this session a phantom hunt. `coredumpctl info <pid>` settles
+  and 3 in `core/runtime/memory_test.cc`. There is no `BessdTest` suite; that
+  wrong guess cost this session a phantom hunt. `coredumpctl info <pid>` settles
   it in one line: a death-test child's *command line* carries
   `--gtest_internal_run_death_test=<file>|<line>|...`. How many fire varies
   with which cases skip by environment (~6-7 observed of the 10). A green
@@ -60,7 +60,7 @@ propose it unprompted.
   `-DGLOG_USE_GLOG_EXPORT` (glog >= 0.7's headers refuse to compile without
   it and Arch's `libglog.pc` does not supply the define);
   `-include cinttypes` (libstdc++ 16 no longer provides `PRIxPTR`
-  transitively, which `core/memory.cc` relies on); `BESS_LINK_DYNAMIC=1`
+  transitively, which `core/runtime/memory.cc` relies on); `BESS_LINK_DYNAMIC=1`
   (Arch's `grpc++.pc` lists `-labsl_strerror`, absent from Arch's abseil
   package). g++ 16 additionally promotes three pre-existing warning classes
   to errors under the tree's `-Werror` (`Any::PackFrom`/`UnpackTo` are
@@ -81,10 +81,10 @@ tools/bootstrap_dpdk.py --af-xdp auto
 export PKG_CONFIG_PATH="$(tools/bootstrap_dpdk.py --print-pkg-config-path):${PKG_CONFIG_PATH}"
 meson setup build/gcc -Dcpu=x86-64-v3 -Daf_xdp=auto
 meson compile -C build/gcc -j4
-meson test -C build/gcc --no-rebuild --print-errorlogs -j4
-meson test -C build/gcc --no-rebuild --suite python --print-errorlogs -j4
-meson test -C build/gcc --no-rebuild --suite integration --print-errorlogs -j4
-meson test -C build/gcc --no-rebuild --suite benchmarks --print-errorlogs -j4
+meson test -C build/gcc --no-rebuild --print-errorlogs
+meson test -C build/gcc --no-rebuild --suite python --print-errorlogs
+meson test -C build/gcc --no-rebuild --suite integration --print-errorlogs
+meson test -C build/gcc --no-rebuild --suite benchmarks --print-errorlogs
 ```
 
 CI configures `-Daf_xdp=required` and runs the same Meson graph with both GCC

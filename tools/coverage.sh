@@ -6,7 +6,7 @@ args=${1:-run}
 for arg in $args; do
     case $arg in
         run)
-            meson test -C "$build_dir" --print-errorlogs
+            meson test -C "$build_dir" --no-rebuild --print-errorlogs
             ;;
         serve)
             coverage_dir="$build_dir/meson-logs"

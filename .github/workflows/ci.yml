@@ -122,7 +122,7 @@ jobs:
           test -f "$dpdk_libdir/librte_net_af_xdp.a"
 
       - name: Run all Meson tests
-        run: meson test -C "build/${{ matrix.name }}" --print-errorlogs
+        run: meson test -C "build/${{ matrix.name }}" --no-rebuild --print-errorlogs
 
       - name: Verify install tree
         run: |

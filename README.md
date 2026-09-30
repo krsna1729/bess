@@ -39,9 +39,14 @@ or building it.
 tools/bootstrap_dpdk.py --af-xdp auto
 export PKG_CONFIG_PATH="$(tools/bootstrap_dpdk.py --print-pkg-config-path):${PKG_CONFIG_PATH}"
 meson setup build-meson -Dcpu=x86-64-v3 -Daf_xdp=auto
-meson compile -C build-meson
-meson test -C build-meson --print-errorlogs
+meson compile -C build-meson -j4
+meson test -C build-meson --no-rebuild --print-errorlogs
 ```
+Routine compilation is incremental. Meson's `-j4` caps each invocation at four
+workers. Locally, run GCC and Clang builds sequentially because Meson does not
+coordinate separate build directories. GitHub Actions schedules its compiler
+matrix according to hosted-worker capacity. Use a fresh build directory for
+release verification instead of cleaning the day-to-day build.
 
 CI uses `--af-xdp required`; this checks the libxdp/libbpf development
 packages, headers, and DPDK `net_af_xdp` shared and static artifacts.  Use
@@ -55,11 +60,11 @@ Use `-Ddpdk_link=static` only when a static DPDK link is intentional.
 Useful Meson-native checks:
 
 ```bash
-meson test -C build-meson --suite python
-meson test -C build-meson --suite integration
-meson test -C build-meson --suite benchmarks
+meson test -C build-meson --no-rebuild --suite python
+meson test -C build-meson --no-rebuild --suite integration
+meson test -C build-meson --no-rebuild --suite benchmarks
 meson setup build-asan -Db_sanitize=address,undefined -Db_coverage=true
-meson compile -C build-asan
+meson compile -C build-asan -j4
 meson install -C build-meson --destdir "$PWD/stage"
 ```
 
