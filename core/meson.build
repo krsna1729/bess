@@ -304,6 +304,12 @@ gate_runtime_whole = component_runtime_whole + [bess_gate_hooks]
 
 runtime_deps = common_deps + [bess_proto_dep]
 runtime_rpath = dpdk_libdir
+bessd_link_args = []
+if static_binary_opt == 'fully_static'
+  bessd_link_args += ['-static']
+elif static_binary_opt == 'standalone'
+  bessd_link_args += ['-static-libgcc', '-static-libstdc++']
+endif
 
 bessd = executable(
   'bessd',
@@ -313,8 +319,60 @@ bessd = executable(
   dependencies: runtime_deps,
   export_dynamic: true,
   build_rpath: runtime_rpath,
+  link_args: bessd_link_args,
   install: true,
 )
+core_public_headers = files(
+  'bessctl.h',
+  'bessd.h',
+  'commands.h',
+  'debug.h',
+  'dpdk.h',
+  'event.h',
+  'gate.h',
+  'message.h',
+  'metadata.h',
+  'module.h',
+  'module_graph.h',
+  'packet.h',
+  'packet_checksum.h',
+  'packet_cursor.h',
+  'packet_handle.h',
+  'packet_mutation.h',
+  'packet_pool.h',
+  'packet_reshape.h',
+  'packet_tx_checksum.h',
+  'pktbatch.h',
+  'port.h',
+  'resume_hook.h',
+  'scheduler.h',
+  'shared_obj.h',
+  'snbuf_layout.h',
+  'task.h',
+  'traffic_class.h',
+  'worker.h',
+)
+install_headers(core_public_headers, subdir: 'bess/core')
+
+core_subdirs = [
+  'utils',
+  'framework',
+  'runtime',
+  'classifier',
+  'control',
+  'meter',
+  'route',
+  'rcu',
+  'stats',
+  'gate_hooks',
+  'resume_hooks',
+  'drivers',
+]
+
+foreach sdir : core_subdirs
+  install_subdir(sdir, install_dir: 'include/bess/core')
+endforeach
+
 
 unit_test_sources = [
   'classifier/classifier_test.cc',
@@ -325,6 +383,7 @@ unit_test_sources = [
   'classifier/result_plan_test.cc',
   'classifier/typed_exact_test.cc',
   'classifier/masked_exact_test.cc',
+  'classifier/range_backend_test.cc',
   'classifier/generation_test.cc',
   'classifier/packed_value_store_test.cc',
   'classifier/cuckoo_exact_test.cc',
@@ -344,6 +403,7 @@ unit_test_sources = [
   'stats/stats_test.cc',
   'route/route_test.cc',
   'route/router_transaction_test.cc',
+  'route/route_domain_test.cc',
   'rcu/rcu_test.cc',
   'rcu/rcu_ptr_test.cc',
   'rcu/rcu_worker_test.cc',

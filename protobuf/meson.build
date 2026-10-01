@@ -120,6 +120,11 @@ proto_ready_marker = custom_target(
   command: [find_program('touch'), '@OUTPUT@'],
   build_by_default: true,
 )
+install_subdir(
+  join_paths(cpp_proto_root, 'core', 'pb'),
+  install_dir: 'include/bess/core',
+)
+
 
 sample_proto_name = 'supdate_msg.proto'
 sample_proto_file = files('../sample_plugin/protobuf/supdate_msg.proto')

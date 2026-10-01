@@ -144,12 +144,13 @@ void ActionTable::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     return;
   }
 
+  int out_cnt = 0;
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
     const ActionId id(
         get_attr_with_offset<bess::utils::be32_t>(action_offset, pkt).value());
     const Action *action = actions_->Lookup(id);
-    if (action == nullptr) {
+    if (unlikely(action == nullptr)) {
       EmitPacket(ctx, pkt, DROP_GATE);
       continue;
     }
@@ -157,7 +158,14 @@ void ActionTable::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
         meter_offset, pkt, bess::utils::be32_t(action->meter.value()));
     _set_attr_with_offset<bess::utils::be32_t>(
         hop_offset, pkt, bess::utils::be32_t(action->next_hop.value()));
-    EmitPacket(ctx, pkt, 0);
+    if (out_cnt != i) {
+      batch->handles()[out_cnt] = batch->handles()[i];
+    }
+    out_cnt++;
+  }
+  if (likely(out_cnt > 0)) {
+    batch->set_cnt(out_cnt);
+    RunNextModule(ctx, batch);
   }
 }
 

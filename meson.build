@@ -45,13 +45,16 @@ add_project_arguments(
   '-Wno-missing-field-initializers',
   language: 'cpp',
 )
+static_binary_opt = get_option('static_binary')
+is_static_deps = (static_binary_opt != 'none')
+dpdk_is_static = (get_option('dpdk_link') == 'static') or is_static_deps
 
 # libdpdk.pc carries the DPDK build machine's -march and -mrtm flags. They
 # must not override BESS's explicit cpu option, especially in portable CI.
 dpdk_raw = dependency(
   'libdpdk',
   method: 'pkg-config',
-  static: get_option('dpdk_link') == 'static',
+  static: dpdk_is_static,
   required: true,
 )
 pkg_config = find_program('pkg-config', required: true)
@@ -72,14 +75,19 @@ foreach arg : run_command(
   endif
 endforeach
 dpdk_pkg_link_args = ['--libs', 'libdpdk']
-if get_option('dpdk_link') == 'static'
-  dpdk_pkg_link_args = ['--static', 'libdpdk']
+if dpdk_is_static
+  dpdk_pkg_link_args = ['--libs', '--static', 'libdpdk']
 endif
-dpdk_link_args = run_command(
+dpdk_link_args = []
+foreach arg : run_command(
   pkg_config, dpdk_pkg_link_args,
   env: pkg_config_env,
   check: true,
 ).stdout().strip().split(' ')
+  if arg != ''
+    dpdk_link_args += arg
+  endif
+endforeach
 dpdk_dep = declare_dependency(
   compile_args: dpdk_compile_args,
   link_args: dpdk_link_args,
@@ -104,14 +112,15 @@ if get_option('af_xdp') == 'required'
   endforeach
 endif
 
-glog_dep = dependency('libglog', method: 'pkg-config', required: true)
-gflags_dep = dependency('gflags', method: 'pkg-config', required: true)
-protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true)
-grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true)
-libunwind_dep = dependency('libunwind', method: 'pkg-config', required: true)
-zlib_dep = dependency('zlib', method: 'pkg-config', required: true)
-pcap_dep = dependency('libpcap', method: 'pkg-config', required: true)
-numa_dep = dependency('numa', method: 'pkg-config', required: true)
+glog_dep = dependency('libglog', method: 'pkg-config', static: is_static_deps, required: true)
+# gflags must match glog's shared/static state to avoid double registration in gflags
+gflags_dep = dependency('gflags', method: 'pkg-config', static: false, required: true)
+protobuf_dep = dependency('protobuf', method: 'pkg-config', static: is_static_deps, required: true)
+grpcpp_dep = dependency('grpc++', method: 'pkg-config', static: is_static_deps, required: true)
+libunwind_dep = dependency('libunwind', method: 'pkg-config', static: is_static_deps, required: true)
+zlib_dep = dependency('zlib', method: 'pkg-config', static: is_static_deps, required: true)
+pcap_dep = dependency('libpcap', method: 'pkg-config', static: is_static_deps, required: true)
+numa_dep = dependency('numa', method: 'pkg-config', static: is_static_deps, required: true)
 
 common_deps = [
   dpdk_dep,
@@ -159,6 +168,17 @@ version_h = custom_target(
   output: 'version.h',
   command: [python, files('tools/write_version.py'), '@OUTPUT@'],
   build_always_stale: true,
+)
+
+pkg = import('pkgconfig')
+pkg.generate(
+  name: 'bess-dev',
+  filebase: 'bess-dev',
+  description: 'BESS dataplane plugin and module development headers',
+  version: meson.project_version(),
+  subdirs: ['bess', 'bess/core'],
+  extra_cflags: ['-D_GNU_SOURCE', '-DGLOG_USE_GLOG_EXPORT', '-include', 'cinttypes'],
+  requires: ['libdpdk', 'libglog', 'protobuf', 'grpc++'],
 )
 
 subdir('protobuf')

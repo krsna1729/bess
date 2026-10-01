@@ -20,3 +20,8 @@ option('build_sample_plugin',
        type: 'boolean',
        value: true,
        description: 'Build the sample plugin')
+option('static_binary',
+       type: 'combo',
+       choices: ['none', 'standalone', 'fully_static'],
+       value: 'none',
+       description: 'Build standalone (all static dependencies + libstdc++) or fully static binary for release CI')

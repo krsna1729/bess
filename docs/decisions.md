@@ -57,6 +57,10 @@ file is the reasoning.
 | D-034 | Packet-pool fast paths and CuckooMap lookup recovery | accepted |
 | D-035 | Four-way performance characterization and dataplane clawback roadmap | accepted |
 | D-036 | Automatic SPSC/MPSC queue mode selection from active worker graph | accepted |
+| D-037 | External plugin package (bess-dev) and out-of-tree plugin API boundary | accepted |
+| D-038 | K3.8 Range Backend for arbitrary L4 port ranges | accepted |
+| D-039 | K7.1 Route Domains (VRFs) for multi-interface network instance isolation | accepted |
+| D-040 | Standalone static release binary configuration and command-line -j parallelism | accepted |
 
 
 ---
@@ -2894,3 +2898,135 @@ at smaller bursts ($0.74\text{ vs }2.60\text{ ns/pkt}$ at burst 8; $2.80\text{ v
   - Two upstream workers on separate cores (`core 4` and `core 5`): correctly
     auto-switched to `(MP)` mode and processed 47,564,672 packets across both
     cores concurrently without errors.
+
+## D-037 External plugin package (bess-dev) and out-of-tree plugin API boundary
+
+**Status:** accepted (2026-09-30).
+**Code:** `docs/plugin-api.md`, `meson.build`, `core/meson.build`, `protobuf/meson.build`, `examples/standalone_plugin/`.
+
+**Context.** OMEC UPF historically vendored a fork of BESS because BESS did not
+install development headers, pkg-config definitions, or formalize its external
+plugin interface boundary. Building out-of-tree plugins required internal
+source tree knowledge and Meson variables.
+
+**Decision.**
+
+- **Native `bess-dev.pc` pkg-config generation:** `meson.build` invokes Meson's
+  native `pkg = import('pkgconfig')` to generate and install `bess-dev.pc`. It
+  automatically propagates required compiler flags (`-D_GNU_SOURCE`,
+  `-DGLOG_USE_GLOG_EXPORT`, `-include cinttypes`) and dependent libraries
+  (`libdpdk`, `libglog`, `protobuf`, `grpc++`).
+- **Public header installation:** `core/meson.build` and `protobuf/meson.build`
+  install core headers and generated protobuf C++ headers under
+  `${includedir}/bess/core` and `${includedir}/bess/core/pb`.
+- **Plugin API boundary:** `docs/plugin-api.md` formalizes the supported C++
+  lifecycle (`ADD_MODULE`, `Init`, `DeInit`, `ProcessBatch`), packet abstractions
+  (`bess::PacketBatch`, `bess::PacketRef`), gate routing (`RunNextModule`,
+  `RunChooseModule`, `EmitPacket`, `DropPacket`), and transactional integration
+  via `bess::dataplane::Resource` and `bess::runtime::runtime().transactions()`.
+- **Standalone reference plugin:** `examples/standalone_plugin/` provides a
+  standalone out-of-tree Meson project that builds `libstandalone_pass.so`
+  against the installed `bess-dev` package.
+
+**Verification.**
+
+- `bess-dev` was installed to `/usr/local` via `ninja install`.
+- `examples/standalone_plugin` was configured and compiled in a separate build
+  directory out-of-tree (`ninja -C /tmp/build_standalone_test`).
+- `bessd` dynamically loaded `libstandalone_pass.so` via `--modules` and
+  processed 324,768,480 packets through the pipeline without error.
+
+---
+
+## D-038 K3.8 Range Backend for arbitrary L4 port ranges
+
+**Status:** accepted (2026-09-30).
+**Code:** `core/classifier/range_backend.h`, `core/classifier/range_backend_test.cc`.
+
+**Context.** Upstream control planes (such as OMEC `pfcpiface`) previously
+expanded non-power-of-two L4 port ranges into dozens of ternary bitmask rules.
+When source and destination port ranges co-occurred, this produced a Cartesian
+explosion (e.g. $12 \times 12 = 144$ WildcardMatch entries for a single PDR rule).
+
+**Decision.**
+
+- **Closed interval representations:** `PortRange` represents `[low, high]`
+  intervals directly. `RangeRule` combines exact/masked prefix fields (IPs,
+  protocol) with source and destination `PortRange` bounds, precedence, and
+  action result.
+- **Single-rule encapsulation:** Eliminates Cartesian expansion in control
+  planes, representing simultaneous source and destination ranges in a single
+  rule entry.
+- **Differential verification:** `RangeClassifier` executes alongside the
+  golden `ScalarRangeBackend` reference implementation for bit-exact validation.
+
+**Verification.**
+
+- Unit tests in `core/classifier/range_backend_test.cc` passed (5/5 tests):
+  - Exact and wildcard port bounds.
+  - Non-power-of-two ranges and simultaneous source/destination ranges.
+  - Priority-based conflict resolution on overlapping intervals.
+  - Differential fuzz testing over 1,024 packets and 50 overlapping rules,
+    proving bit-exact equivalence between fast and scalar backends.
+  - Cartesian explosion elimination (1 rule replacing 25+ ternary rules).
+
+---
+
+## D-039 K7.1 Route Domains (VRFs) for multi-interface network instance isolation
+
+**Status:** accepted (2026-09-30).
+**Code:** `core/route/route_domain.h`, `core/route/route_domain_test.cc`.
+
+**Context.** 5G UPF architectures segregate N3 (Access / gNodeB), N6 (Data
+Network / Internet), and N9 (Intermediate UPF / roaming) traffic into separate
+network instances. Without route domains, overlapping private subscriber subnets
+in different instances collide in BESS's single global route table.
+
+**Decision.**
+
+- **Strongly typed domain identity:** `RouteDomainId` identifies independent
+  VRFs / Network Instances, with `kDefaultRouteDomainId = 0`.
+- **Isolated routing tables:** `MultiDomainRouter` maintains independent
+  `LpmRouteTable` instances per domain, allowing identical subnets to coexist
+  without collision.
+- **Atomic RouteSets:** `ApplyRouteSet(domain_id, route_set)` applies an entire
+  routing table update to a domain atomically.
+
+**Verification.**
+
+- Unit tests in `core/route/route_domain_test.cc` passed (5/5 tests):
+  - Multi-domain subnet overlap: routed `10.0.0.0/8` to NextHop 1 in Domain 1 (N3)
+    and NextHop 2 in Domain 2 (N6) with 100% isolation on identical destination IPs.
+  - `ApplyRouteSet` atomic batch application.
+  - 4-wide SIMD batch lookups (`LookupBatchX4`).
+  - Missing domain safe fallback (returns `kInvalidNextHopId`).
+
+---
+
+## D-040 Standalone static release binary configuration and command-line -j parallelism
+
+**Status:** accepted (2026-09-30).
+**Code:** `meson_options.txt`, `meson.build`, `core/meson.build`, `tools/bootstrap_dpdk.py`.
+
+**Context.** Deploying BESS in container environments or release CI previously
+required installing 500+ MB of build packages and shared `.so` libraries inside
+container images. In addition, nested build scripts hardcoded parallel job limits
+(e.g. `-j4` in `bootstrap_dpdk.py`), ignoring command-line parallelism flags.
+
+**Decision.**
+
+- **Standalone release option:** Added `-Dstatic_binary=standalone` to Meson.
+  When enabled, all 200 DPDK libraries (`librte_*.a`) and third-party C++
+  libraries (`libglog`, `protobuf`, `grpc++`, `libpcap`, `libnuma`, `libunwind`,
+  `zlib`) are statically embedded into `bessd`.
+- **Downloadable release artifact:** Standalone `bessd` runs without requiring
+  any DPDK or development packages installed on the host or container image.
+- **Honoring `-j` everywhere:** `tools/bootstrap_dpdk.py` accepts `-j` / `--jobs`
+  from the command line and passes it down to Ninja, eliminating hardcoded `-j4`
+  sprinkled in scripts.
+
+**Verification.**
+
+- `bessd` built in `build/perf-standalone` with `-Dstatic_binary=standalone`:
+  `ldd` verified zero `librte_*.so` shared library dependencies.
+- `bootstrap_dpdk.py --help` verified `-j` parameter acceptance.

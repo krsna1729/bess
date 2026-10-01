@@ -128,7 +128,7 @@ def check_af_xdp_artifacts(prefix: Path, mode: str) -> None:
 
 
 def configure_and_build(source_dir: Path, build_dir: Path, prefix: Path,
-                         cpu: str | None, env: dict[str, str]) -> None:
+                         cpu: str | None, jobs: int | None, env: dict[str, str]) -> None:
     build_dir.parent.mkdir(parents=True, exist_ok=True)
     command = ['meson', 'setup']
     if (build_dir / 'meson-private' / 'coredata.dat').exists():
@@ -143,8 +143,15 @@ def configure_and_build(source_dir: Path, build_dir: Path, prefix: Path,
     if cpu:
         command.append('-Dmachine=' + cpu)
     run(command, env=env)
-    run(['ninja', '-C', str(build_dir), '-j4'], env=env)
-    run(['ninja', '-C', str(build_dir), '-j4', 'install'], env=env)
+    ninja_cmd = ['ninja', '-C', str(build_dir)]
+    if jobs:
+        ninja_cmd.append(f'-j{jobs}')
+    run(ninja_cmd, env=env)
+    install_cmd = ['ninja', '-C', str(build_dir)]
+    if jobs:
+        install_cmd.append(f'-j{jobs}')
+    install_cmd.append('install')
+    run(install_cmd, env=env)
 
 
 def main() -> int:
@@ -153,6 +160,8 @@ def main() -> int:
     parser.add_argument('--af-xdp', choices=('auto', 'required'),
                         default=os.environ.get('AF_XDP', 'auto').lower())
     parser.add_argument('--cpu', default=os.environ.get('CPU'))
+    parser.add_argument('-j', '--jobs', type=int, default=None,
+                        help='Number of parallel compile jobs passed to ninja')
     parser.add_argument('--print-pkg-config-path', action='store_true')
     args = parser.parse_args()
 
@@ -170,7 +179,7 @@ def main() -> int:
     build_env = os.environ.copy()
     build_env['PKG_CONFIG_PATH'] = os.pathsep.join(
         filter(None, [build_env.get('PKG_CONFIG_PATH'), str(pkgconfig)]))
-    configure_and_build(dpdk_dir, build_dir, prefix, args.cpu, build_env)
+    configure_and_build(dpdk_dir, build_dir, prefix, args.cpu, args.jobs, build_env)
     check_af_xdp_artifacts(prefix, args.af_xdp)
     print(f'DPDK pkg-config path: {pkgconfig}')
     return 0
