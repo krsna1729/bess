@@ -1,54 +1,96 @@
-# Core component architecture
+# BESS Core Architecture Contract
 
-This document describes ownership and dependency direction in `core/`. The module-author path stays the same: a module uses the ordinary `ProcessBatch`/`EmitPacket` model and may opt into shared dataplane mechanisms where needed.
+## 0. Non-Negotiable Principle
 
-## Terms
+Appliance authors are free to build radically different programming models—VFP-style layered policy, OVS-style translated flow caches, Hoverboard-style hierarchical fast/slow paths, OMEC-style session compilation, or custom load-balancer state machines—without fighting the BESS architecture or first translating their model into a BESS-defined policy model.
 
-- **Framework**: the module-facing contracts and the execution mechanics that honor them: module lifecycle, graph/gate model, metadata, packet-batch interface, scheduling, and extension interfaces. The framework is hosted by BESS; it is not the daemon.
-- **Runtime**: one live BESS instance. It owns instance registries and runtime services, initializes the process, starts/stops workers, and assembles the framework with control services and extensions.
-- **Libraries**: reusable mechanisms consumed by the framework and modules. “Library” describes a reusable component and a build artifact; it is not a separate layer above or below the framework.
-- **Modules**: concrete packet-processing behavior built on framework contracts and selected libraries. A module must not depend on another concrete module.
-- **Adapters/extensions**: port drivers and concrete gate/resume hooks. Their contracts belong to the framework; their implementations are assembled by the runtime.
-- **Control plane**: RPC, desired-state planning, validation, and orchestration of runtime services. It is a runtime subsystem, but remains a distinct component; it does not own module implementations.
-- **Utilities**: low-level, cross-cutting helpers. A utility must not depend on module, framework, runtime, or control-plane code. Domain-specific code belongs with its owning component instead.
+### BESS decides:
+- How packets execute efficiently (`bess::PacketRef`, `bess::PacketBatch`, vector extraction).
+- How packet memory is represented, bounded, and safely mutated.
+- How worker-local and shared state is published and reclaimed via QSBR RCU (`bess::rcu::RcuDomain`, `RcuPtr`).
+- How stable identifiers map to immutable objects (`StrongId`, `ObjectTable`, `SlotTable`).
+- How multi-resource modifications preserve referential correctness (`TransactionEngine`, `VISIBILITY_DEPENDENCY_ORDERED`).
+- How single-instruction session switches occur without torn reads (`ScopeCell`, `VISIBILITY_ATOMIC`).
+- How generic classifiers, meters, routing structures, and counters are implemented with near-assembly speed.
+- How physical/virtual devices and workers are placed and scheduled.
 
-## Dependency rules
+### The application decides:
+- What a session, connection, flow, policy, rule, group, tenant, or intent means.
+- How its policy is compiled and which decisions are cached or offloaded.
+- What gets punted or resumed to the control plane.
+- Which BESS libraries it composes directly and which it bypasses.
 
-An arrow means “may depend on.”
+---
+
+## 1. Component Layering and Dependency DAG
+
+BESS is organized as a strict directed acyclic graph (DAG) enforced at build time. Reusable networking algorithms are **pure C++ libraries** with zero dependencies on BESS module graphs, runtime singletons, or protobufs:
 
 ```text
-modules, drivers, hook implementations ──depend on──> framework API + selected libraries/runtime API
-framework engine ────────────────uses──> runtime services + packet/dataplane libraries
-runtime instance implementation ──uses──> framework Module/Port/worker contracts
-runtime host ────────────────────composes──> framework + control + extensions
-bessd ───────────────────────────is the composition root for the runtime host
+                  bess_utils (Leaf utilities)
+                      ^
+                      |
+                  bess_packet (Packet mbuf view & mutation)
+                      ^
+                      |
+                  bess_rcu (Quiescent-state RCU substrate)
+                      ^
+                      |
+             bess_dataplane_core (StrongId, SlotTable, ObjectTable, Transactions, ScopeCell)
+                      ^
+      +---------------+---------------+---------------+
+      |               |               |               |
+bess_classifier   bess_meter     bess_stats      bess_route
+      ^               ^               ^               ^
+      +---------------+---------------+---------------+
+                      |
+               bess_framework (Module, Gate, Graph, Task, Scheduler, Hooks)
+                      ^
+                      |
+               bess_runtime (Workers, Memory, DPDK, Ports)
+                      ^
+                      |
+               bess_control (Desired-state pipeline, Transaction RPC)
+                      ^
+                      |
+            bess_modules & drivers (Thin adapters over pure libraries)
 ```
 
-More specifically:
+---
 
-1. Dataplane libraries may use low-level support, RCU, and packet/data APIs. They may not include control-plane, daemon, module, or protobuf-RPC implementation headers.
-2. Framework code may use packet/dataplane libraries and runtime service APIs, but not concrete modules, drivers, hooks, or control-plane orchestration.
-3. Modules, drivers, and hook implementations use framework APIs, required libraries, and only the runtime services exposed through the runtime API. They do not include `control/` implementation headers or one another's implementation headers.
-4. Control-plane code uses runtime services and generic dataplane/resource APIs. It does not depend on concrete module implementations.
-5. Runtime owns instance state and composes control, framework, built-in modules, drivers, hooks, and the daemon entry point. Runtime services use framework-owned Module/Port/worker contracts, while framework code calls runtime services; the runtime host closes this pair. The daemon is not a dependency of libraries.
-6. Meson targets expose only the compile dependencies and include roots each component needs. Component tests link the component under test and its dependencies; full-runtime tests remain explicit integration tests.
+## 2. Forbidden Dependency Edges (Build-Enforced)
 
-## Ownership map
+The build system and include verification checker (`tools/check_includes.py`) enforce the following invariants:
 
-| Component | Owns | Current implementation |
-|---|---|---|
-| Framework | Module/graph/gate/metadata contracts; packet-batch and port interfaces; scheduler/worker execution; hook and resource-codec contracts | `bess_framework`: framework source group in `core/meson.build`, `framework/resource_codec.h`, `framework/exact_match_table.*`, `route/router.cc`, `stats/worker_histogram.*` |
-| Packet library | Packet representation, cursors, checksums, mutation and reshape | `bess_packet`: `packet.cc`, `packet_reshape.cc`, `packet_checksum.cc`, `packet_tx_checksum.cc`; runtime-backed `packet_pool.cc` remains in `bess_framework` |
-| Dataplane libraries | RCU, classifier backends, generic resource/object tables and transactions, meters, route-table algorithms, statistics primitives | `bess_rcu`, `bess_dataplane`: `rcu/`, `classifier/`, `dataplane/`, `meter/`, `route/route_table.*`, `stats/counter_set.*` |
-| Runtime | Live instance state/registries, worker management, platform initialization, startup, extension registration/loading, daemon composition | `bess_runtime`: runtime-owned sources in `runtime/`; `bess_host`: `bessctl.cc`, `bessd.cc`, `debug.cc`; `main.cc` is the composition root |
-| Control plane | RPC services, control semantics, desired-state validation/diff/planning/transactions | `bess_control`: `control/` |
-| Extensions | Concrete built-in modules, port drivers, gate hooks, resume hooks | `bess_modules`, `bess_drivers`, `bess_gate_hooks`, `bess_resume_hooks`; no extra `extensions/` parent is required |
-| Utilities | Only leaf helpers with no framework/runtime/module dependency | `bess_utils` / `utils/`; framework-specific ExactMatchTable is owned by `framework/` |
+1. `packet/**` may only depend on `utils/**` and low-level DPDK mbuf primitives. It must **never** include `framework/**`, `runtime/**`, `control/**`, `pb/**`, or `module.h`.
+2. `dataplane/**` (core substrate) may depend on `rcu/**` and minimal `utils/**`. It must **never** include `framework/**`, `runtime/**`, `control/**`, or `pb/**`.
+3. Reusable libraries (`classifier/**`, `meter/**`, `stats/**`, `route/route_table.*`) are standalone C++ libraries. They must **never** include `module.h`, `runtime/**`, or `control/**`.
+4. `framework/**` defines execution contracts (Module, Gate, Task). It does not depend on concrete modules, drivers, or control-plane RPC orchestration.
+5. Modules (`modules/**`) and drivers (`drivers/**`) are thin graph adapters. A module must **never** include another concrete module's internal header.
 
-These are Meson source/link owners. Core targets use only the `core/` include root; generated Protobuf include roots are added through `bess_proto_headers_dep` only for components that consume generated messages. In particular, `route/route_table.*` is a reusable table library, while `route/router.*` integrates routing with BESS packet and gate APIs; `stats/current_worker.h` and `stats/worker_histogram.*` are framework/runtime adapters, not statistics primitives.
+---
 
-## Boundary status
+## 3. Transaction and Concurrency Semantics
 
-Runtime state and worker management live under `runtime/`; platform initialization, option definitions, and memory management are built into `bess_runtime`. Modules consume those APIs without depending on `control/`. The typed resource-codec contract and framework exact-match helper live under `framework/`; the control adapter extracts `Any` type/value bytes and delegates typed decoding.
+BESS provides two formal visibility guarantees for state mutation (Decision D-021):
 
-Meson separates `bess_runtime`, `bess_framework`, `bess_packet`, `bess_dataplane`, `bess_control`, `bess_host`, utilities, modules, drivers, and hooks. Component tests link their owning implementation closure; control/daemon tests explicitly link the full runtime. The module-authoring API and packet-processing path remain unchanged.
+1. **`VISIBILITY_DEPENDENCY_ORDERED`**:
+   - Operations take effect in dependency order (referents before referrers).
+   - A rule referencing an action or next-hop cannot see a missing target.
+   - Deletions cascade in reverse dependency order, with physical destruction deferred until all readers clear a QSBR grace period.
+   - Zero worker pause during active transactions.
+2. **`VISIBILITY_ATOMIC`**:
+   - Single-instruction atomic cutover enabled by `ScopeCell`.
+   - Packages `{meter_id, next_hop_id}` into a 64-bit atomic word.
+   - Packets observe either the entire old policy or the entire new policy, with zero torn reads across concurrent readers.
+
+---
+
+## 4. Architectural Anti-Goals
+
+The following patterns are explicitly rejected and forbidden:
+- **No universal `BessAction` object**: Actions are defined by the application/module, not centralized into a monolithic variant.
+- **No BESS policy language**: BESS provides fast mechanisms, not high-level network policy ASTs.
+- **No mandatory module graphs**: High-performance appliances can call BESS libraries directly without instantiating `Module` graphs.
+- **No global runtime reach-through**: Reusable libraries receive their dependencies (`RcuDomain`, memory allocators) explicitly via constructors, never via global `runtime()` singletons.
+- **No full-table rebuilds for live updates**: Tables support concurrent in-place updates with QSBR hazard management.

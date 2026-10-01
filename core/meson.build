@@ -4,20 +4,31 @@ rcu_sources = files(
   'rcu/rcu_domain.cc',
 )
 
-dataplane_sources = files(
+dataplane_core_sources = files(
+  'dataplane/batch_tuning.cc',
+  'dataplane/transaction_engine.cc',
+)
+
+classifier_sources = files(
   'classifier/concurrent_exact.cc',
   'classifier/concurrent_masked.cc',
   'classifier/extract_plan.cc',
   'classifier/result_plan.cc',
   'classifier/runtime_schema.cc',
-  'dataplane/batch_tuning.cc',
-  'dataplane/transaction_engine.cc',
+)
+
+meter_sources = files(
   'meter/meter.cc',
   'meter/meter_set.cc',
-  'route/route_table.cc',
+)
+
+stats_sources = files(
   'stats/counter_set.cc',
 )
 
+route_sources = files(
+  'route/route_table.cc',
+)
 packet_sources = files(
   'packet.cc',
   'packet_reshape.cc',
@@ -196,13 +207,48 @@ bess_rcu = static_library(
   include_directories: core_include,
   dependencies: low_level_compile_deps,
 )
-bess_dataplane = static_library(
-  'bess_dataplane',
-  dataplane_sources,
+bess_dataplane_core = static_library(
+  'bess_dataplane_core',
+  dataplane_core_sources,
   include_directories: core_include,
   dependencies: low_level_compile_deps,
   link_with: [bess_rcu],
 )
+bess_classifier = static_library(
+  'bess_classifier',
+  classifier_sources,
+  include_directories: core_include,
+  dependencies: low_level_compile_deps,
+  link_with: [bess_dataplane_core, bess_rcu],
+)
+bess_meter = static_library(
+  'bess_meter',
+  meter_sources,
+  include_directories: core_include,
+  dependencies: low_level_compile_deps,
+  link_with: [bess_dataplane_core],
+)
+bess_stats = static_library(
+  'bess_stats',
+  stats_sources,
+  include_directories: core_include,
+  dependencies: low_level_compile_deps,
+  link_with: [bess_dataplane_core],
+)
+bess_route = static_library(
+  'bess_route',
+  route_sources,
+  include_directories: core_include,
+  dependencies: low_level_compile_deps,
+  link_with: [bess_dataplane_core, bess_rcu],
+)
+bess_dataplane_libs = [
+  bess_dataplane_core,
+  bess_classifier,
+  bess_meter,
+  bess_stats,
+  bess_route,
+]
 bess_utils = static_library(
   'bess_utils',
   utility_sources,
@@ -214,7 +260,7 @@ bess_runtime = static_library(
   runtime_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: runtime_compile_deps,
-  link_with: [bess_dataplane, bess_rcu, bess_utils],
+  link_with: bess_dataplane_libs + [bess_rcu, bess_utils],
 )
 
 bess_packet = static_library(
@@ -229,21 +275,21 @@ bess_framework = static_library(
   framework_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: framework_compile_deps,
-  link_with: [bess_runtime, bess_packet, bess_dataplane, bess_rcu, bess_utils],
+  link_with: bess_dataplane_libs + [bess_runtime, bess_packet, bess_rcu, bess_utils],
 )
 bess_control = static_library(
   'bess_control',
   control_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: control_compile_deps,
-  link_with: [bess_runtime, bess_framework, bess_dataplane, bess_rcu],
+  link_with: [bess_runtime, bess_framework, bess_dataplane_core, bess_rcu],
 )
 bess_host = static_library(
   'bess_host',
   host_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: host_compile_deps,
-  link_with: [bess_control, bess_framework, bess_runtime, bess_dataplane, bess_rcu],
+  link_with: [bess_control, bess_framework, bess_runtime, bess_dataplane_core, bess_rcu],
 )
 bess_drivers = static_library(
   'bess_drivers',
@@ -257,7 +303,7 @@ bess_modules = static_library(
   module_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: module_compile_deps,
-  link_with: [bess_framework, bess_runtime, bess_dataplane, bess_rcu, bess_utils],
+  link_with: bess_dataplane_libs + [bess_framework, bess_runtime, bess_rcu, bess_utils],
   pic: true,
 )
 bess_gate_hooks = static_library(
@@ -279,7 +325,11 @@ runtime_whole = [
   bess_proto_lib,
   bess_rcu,
   bess_packet,
-  bess_dataplane,
+  bess_dataplane_core,
+  bess_classifier,
+  bess_meter,
+  bess_stats,
+  bess_route,
   bess_runtime,
   bess_framework,
   bess_control,
@@ -293,7 +343,11 @@ runtime_whole = [
 component_runtime_whole = [
   bess_proto_lib,
   bess_rcu,
-  bess_dataplane,
+  bess_dataplane_core,
+  bess_classifier,
+  bess_meter,
+  bess_stats,
+  bess_route,
   bess_runtime,
   bess_framework,
   bess_utils,
@@ -529,6 +583,13 @@ foreach source : unit_test_sources
     )
   endif
 endforeach
+test(
+  'check_layer_includes',
+  python,
+  args: [files('../tools/check_includes.py'), '--root', meson.project_source_root()],
+  is_parallel: false,
+  suite: 'architecture',
+)
 
 if get_option('build_benchmarks')
   benchmark_sources = {
