@@ -68,6 +68,7 @@ file is the reasoning.
 | D-045 | Explicit application instances with leased lookup (M5) | accepted |
 | D-046 | Route domains consolidated into the one Router (M6) | accepted |
 | D-047 | Phase A closure: link-graph checker, plugin descriptor range, conformance plugins | accepted |
+| D-048 | Fast build profile: normal test linking, mold, ccache, quiet EAL | accepted |
 
 
 ---
@@ -3481,3 +3482,48 @@ trimmed allowlist reported both injected violations and the resulting cycle.
 
 **Revisit when:** a plugin needs a capability or API break that the range
 cannot express, or the `framework` and `runtime` edges are untangled.
+
+---
+
+## D-048 Fast build profile: normal test linking, mold, ccache, quiet EAL
+
+**Status:** accepted (2026-10-02).
+**Code:** `tools/profiles/fast.ini`, `core/meson.build`, `core/packet_pool.cc`,
+`MODERNIZATION.md` ("Build profiles").
+
+**Context.** The debugoptimized tree was 12 GB: 128 executables averaging 85
+MB, 96% of it DWARF, each linking 11 BESS libraries whole-archive, relinked
+by GNU ld at 3.1-3.5 s per 55 MB test. A full suite run also wrote 397 MB of
+logs, and filled a 7.7 GB `/tmp` until a test that reads a daemon log from a
+temporary file failed spuriously.
+
+**Decision.**
+
+- `tools/profiles/fast.ini`: `-O1 -g0`, mold, ccache, benchmarks off. Perf and
+  release stay ordinary Meson option sets; no native file for them.
+- Unit tests link the BESS libraries with `link_with` (the linker pulls only
+  referenced objects). Tests that need static registration (ADD_MODULE,
+  drivers, hooks, the daemon) keep `link_whole`, as before.
+- `rte_dump_physmem_layout()` in `PacketPool::CreateDefaultPools` runs only at
+  `--v=1`. In no-hugepage mode it printed one line per 4 KB page, about 131,000
+  lines per daemon start, 125 MB over the Python suite.
+
+**Measured** (this workstation, GCC 16, `-j8`): link of one 55 MB test: GNU ld
+3.1-3.5 s, gold 0.78 s, mold 0.27 s. Fast tree: cold build without benchmarks
+174 s; edit of a core `.cc` rebuilding every test binary and `bessd` 4 s; leaf
+edit plus its test 5 s; `module.h` edit 14 s for one test. Tree 240 MB (205 MB
+executables, 25 MB generated protobuf) against 12 GB. 98/98 tests pass, with
+the benchmark targets not built in this profile.
+
+**Not done.**
+
+- The 100 MB target. Executables are 92 files totalling 205 MB; reaching 100 MB
+  needs the tests merged into a dozen or so binaries. That trades per-test
+  isolation and parallel scheduling for size, and was not attempted.
+- Widely included headers: `module.h` is included by 147 translation units,
+  `packet.h` by 162 and `utils/endian.h` by 113, so an edit to them rebuilds
+  minutes of work whatever the linker.
+- No DPDK trim yet (apps and unused drivers off, curated NIC set).
+
+**Revisit when:** the test count or binary sizes grow enough to break the
+one-minute loop, or a precompiled-header experiment shows a measured gain.

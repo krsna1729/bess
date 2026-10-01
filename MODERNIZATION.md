@@ -13,13 +13,13 @@ propose it unprompted.
 
 ## Before you touch anything: sandbox constraints
 
-- **Use four workers per build; keep local compiler builds sequential.** Use
-  Meson's native `meson compile -C <build-dir> -j4`. It caps workers for one
-  invocation but does not coordinate different build directories. On this
-  workstation, finish GCC before starting Clang; GitHub Actions schedules its
-  matrix according to hosted-worker capacity. Routine compilation is
-  incremental; do not clean or reconfigure day-to-day. Use a fresh build
-  directory for release verification.
+- **Use at most eight workers per build; one compiler locally.** Use Meson's
+  native `meson compile -C <build-dir> -j8`. It caps workers for one
+  invocation but does not coordinate different build directories, so do not
+  run two builds at once. Develop and test with one compiler (GCC); CI builds
+  and tests with GCC and Clang. Routine compilation is incremental; do not
+  clean or reconfigure day-to-day. Use a fresh build directory for release
+  verification.
 - **No real hugepages or NIC in this sandbox.** `/proc/meminfo` shows only
   ~256MB of hugepage capacity, often already exhausted. Run `bessd` with
   `-m 0` (no-hugepage mode — already a supported fallback path in
@@ -80,7 +80,7 @@ propose it unprompted.
 tools/bootstrap_dpdk.py --af-xdp auto
 export PKG_CONFIG_PATH="$(tools/bootstrap_dpdk.py --print-pkg-config-path):${PKG_CONFIG_PATH}"
 meson setup build/gcc -Dcpu=x86-64-v3 -Daf_xdp=auto
-meson compile -C build/gcc -j4
+meson compile -C build/gcc -j8
 meson test -C build/gcc --no-rebuild --print-errorlogs
 meson test -C build/gcc --no-rebuild --suite python --print-errorlogs
 meson test -C build/gcc --no-rebuild --suite integration --print-errorlogs
@@ -91,6 +91,33 @@ CI configures `-Daf_xdp=required` and runs the same Meson graph with both GCC
 and Clang.  `-Db_sanitize=address,undefined` and `-Db_coverage=true` are
 Meson's native sanitizer and coverage controls.  The default DPDK linkage is
 shared; `-Ddpdk_link=static` is an explicit opt-in.
+
+### Build profiles
+
+Three profiles, by purpose. Only the first needs a native file; the others are
+ordinary Meson options.
+
+| Profile | Purpose | Setup |
+|---|---|---|
+| **fast** | edit, build, test | `meson setup build/fast --native-file tools/profiles/fast.ini` |
+| **perf** | benchmark numbers | `meson setup build/perf -Dbuildtype=release -Dcpu=native` |
+| **release** | what ships | CI's `-Dbuildtype=release -Dstatic_binary=standalone -Dcpu=x86-64-v3` |
+
+`fast` uses `-O1 -g0`, the mold linker, ccache and no benchmarks. It needs
+`mold` and `ccache` installed (`pacman -S mold ccache`). Measured on this
+workstation (20 cores, `-j8`, GCC 16): a cold build of everything but the
+benchmarks takes 174 s; editing `route_table.cc` and rebuilding its test takes
+5 s; editing `module.cc` and relinking a module test takes 2 s; editing
+`packet_pool.cc` (a core file) and relinking all 92 test binaries and `bessd`
+takes 4 s; editing `module.h`, which 147 translation units include, takes 14 s
+for one test and a few minutes for everything. The tree is 240 MB (205 MB
+executables, 25 MB generated protobuf) against 12 GB for the debugoptimized
+tree. Debug a failure in a separate `-Dbuildtype=debugoptimized` tree. The
+`perf` and `release` rows are the existing configurations and were not
+changed.
+
+`/tmp` must have free space: tests write daemon logs there, and a full `/tmp`
+makes `test_shutdown` fail with a missing "gracefully shut down" line.
 
 The old `core/Makefile`, `core/extra.mk`, and top-level `build.py` are not part
 of the supported build.  Generated protobuf code is never written into the
@@ -110,7 +137,7 @@ exercising all 22 module test files.
 - DPDK source/version/checksum has one tracked source of truth: `deps/dpdk.json`.
 - Generated C++ and Python protobuf artifacts live in the build tree.
 - The source tree should remain clean after a normal build/test.
-- Cap local build parallelism at `-j4` on memory-constrained development systems.
+- Cap local build parallelism at `-j8`.
 - C++23 is the production baseline.
 - C++26 remains experimental and must not become a project-wide production requirement yet.
 
@@ -4397,6 +4424,19 @@ rather than one call site).
        split.
      - **Evidence:** GCC 98/98 non-benchmark tests; installed-tree verifier
        54/54 headers; three conformance plugins build from the staged package.
+
+128. **Fast build profile (D-048).**
+     - **What:** `tools/profiles/fast.ini` (`-O1 -g0`, mold, ccache, no
+       benchmarks), unit tests linked with `link_with` unless they need static
+       registration, and the physical-memory-layout dump moved behind `--v=1`.
+     - **Found:** the 125 MB log came from one `rte_dump_physmem_layout` call
+       that prints a line per 4 KB page in no-hugepage mode, and a full `/tmp`
+       (my scratch plus earlier sessions') made `test_shutdown` fail.
+     - **Numbers:** 12 GB to 240 MB; core-file edit to all binaries 4 s; link of
+       a 55 MB test 3.1 s (GNU ld) to 0.27 s (mold); cold build 174 s.
+     - **Not done:** the 100 MB target (needs merged test binaries), a DPDK
+       trim, slimmer widely-included headers.
+     - **Evidence:** fast tree 98/98 tests after the change.
 
 ## Review process established this session
 

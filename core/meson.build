@@ -579,9 +579,15 @@ foreach source : unit_test_sources
     source == 'bessd_test.cc' or
     source == 'registry_test.cc'
   )
-  test_link_whole = component_runtime_whole
+  # Tests that only use library code link the libraries normally, so the
+  # linker pulls just the objects they reference. A test that needs static
+  # registration (ADD_MODULE and the driver, hook and port builders) links the
+  # relevant libraries whole, or those constructors would be dropped.
+  test_link_with = component_runtime_whole
+  test_link_whole = []
   if source.startswith('modules/')
     test_link_whole = module_runtime_whole
+    test_link_with = []
   elif source in [
     'dataplane/object_table_rcu_test.cc',
     'metadata_test.cc',
@@ -589,12 +595,16 @@ foreach source : unit_test_sources
     'rcu/rcu_scheduler_test.cc',
   ]
     test_link_whole = module_graph_runtime_whole
+    test_link_with = []
   elif source.startswith('drivers/')
     test_link_whole = driver_runtime_whole
+    test_link_with = []
   elif source == 'gate_test.cc'
     test_link_whole = gate_runtime_whole
+    test_link_with = []
   elif integration_test
     test_link_whole = runtime_whole
+    test_link_with = []
   endif
   # The test main is ours (core/gtest_main.cc) rather than the packaged one:
   # it configures the death-test style and keeps expected-death children from
@@ -604,6 +614,7 @@ foreach source : unit_test_sources
     source,
     'gtest_main.cc',
     include_directories: core_include,
+    link_with: test_link_with,
     link_whole: test_link_whole,
     dependencies: runtime_deps + [gtest_dep],
     build_rpath: runtime_rpath,

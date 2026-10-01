@@ -71,7 +71,11 @@ PacketPool *PacketPool::default_pools_[RTE_MAX_NUMA_NODES];
 void PacketPool::CreateDefaultPools(size_t capacity, size_t data_room_size) {
   InitDpdk(FLAGS_dpdk ? FLAGS_m : 0);
 
-  rte_dump_physmem_layout(stdout);
+  // A debug aid: with normal pages (no hugepages) it is one line per 4 KB
+  // segment, tens of MB of log per daemon start.
+  if (VLOG_IS_ON(1)) {
+    rte_dump_physmem_layout(stdout);
+  }
 
   for (int sid = 0; sid < NumNumaNodes(); sid++) {
     // What the EAL actually did: -m -1 resolves to normal pages when no
