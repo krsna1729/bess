@@ -67,6 +67,7 @@ framework_sources = files(
   'metadata.cc',
   'module.cc',
   'module_graph.cc',
+  'framework/module_init_context.cc',
   'packet_pool.cc',
   'port.cc',
   'resume_hook.cc',
@@ -362,7 +363,6 @@ gate_runtime_whole = component_runtime_whole + [bess_gate_hooks]
 runtime_deps = common_deps + [bess_proto_dep]
 runtime_rpath = dpdk_libdir
 bessd_link_args = []
-if static_binary_opt == 'fully_static'
 if static_binary_opt != 'none'
   # -static-libgcc and a static libunwind both define the libgcc unwinder entry
   # points (_Unwind_Resume, ...). Naming libgcc_eh in the target's own link
@@ -370,6 +370,7 @@ if static_binary_opt != 'none'
   # runtime win so libunwind's duplicate definitions are never pulled (D-043).
   bessd_link_args += ['-l:libgcc_eh.a']
 endif
+if static_binary_opt == 'fully_static'
   bessd_link_args += ['-static']
 elif static_binary_opt == 'standalone'
   # Distribution libunwind.a is not position independent; link a non-PIE
@@ -425,6 +426,7 @@ core_public_subdir_headers = {
     'utils/time.h',
   ),
   'framework': files(
+    'framework/module_init_context.h',
     'framework/plugin.h',
   ),
   'dataplane': files(

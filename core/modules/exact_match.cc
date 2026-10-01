@@ -87,8 +87,9 @@ bool ConvertMask(uint64_t raw, int size, bool is_packet,
 
 // Action-mode commands use the same writer and reference ledger as the
 // transaction RPC. A direct table mutation would leave stale incoming counts.
-CommandResponse ApplyRuleOps(std::span<const bess::dataplane::Op> ops) {
-  auto result = bess::runtime::runtime().transactions().Apply(ops);
+CommandResponse ApplyRuleOps(bess::dataplane::TransactionEngine &engine,
+                             std::span<const bess::dataplane::Op> ops) {
+  auto result = engine.Apply(ops);
   using Outcome = bess::dataplane::TransactionEngine::Outcome;
   if (result.outcome == Outcome::kApplied) {
     return CommandSuccess();
@@ -287,7 +288,7 @@ ExactMatch::NewTable(size_t rules) const {
   auto table = classifier::ConcurrentExactTable::Create(
       static_cast<uint32_t>(key_size),
       classifier::ConcurrentExactTable::CapacityFor(rules),
-      bess::runtime::runtime().rcu());
+      init_context().rcu());
   if (!table) {
     return std::unexpected(std::make_pair(ENOMEM, table.error()));
   }
@@ -446,7 +447,7 @@ void ExactMatch::RefreshForResume() {
   GenerationPtr next = Build(current->table, current->default_gate, &err);
   if (next != nullptr) {
     published_.Publish(std::move(next));
-    bess::runtime::runtime().rcu().ReclaimReady();
+    init_context().rcu().ReclaimReady();
     return;
   }
 
@@ -458,7 +459,7 @@ void ExactMatch::RefreshForResume() {
              << "': metadata refresh failed (" << err.second
              << "); routing all packets to the default gate";
   published_.Publish(BuildDegraded(current->table, current->default_gate));
-  bess::runtime::runtime().rcu().ReclaimReady();
+  init_context().rcu().ReclaimReady();
 }
 
 int ExactMatch::OnEvent(bess::Event event) {
@@ -487,7 +488,7 @@ bool ExactMatch::Publish(
   // reclaim whatever readers are already done with. This runs on the control
   // thread, so a retired table is destroyed here -- never on a worker.
   published_.Publish(std::move(next));
-  bess::runtime::runtime().rcu().ReclaimReady();
+  init_context().rcu().ReclaimReady();
   return true;
 }
 
@@ -625,7 +626,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
         return std::any(uint64_t{value.gate()});
       }));
   if (auto registered =
-          bess::runtime::runtime().transactions().Register(resource_.get());
+          init_context().resources().Register(resource_.get());
       !registered) {
     resource_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
@@ -639,7 +640,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
                         bess::metadata::Attribute::AccessMode::kWrite);
     if (action_id_attr_ < 0) {
       const std::string name = resource_->name();
-      CHECK(bess::runtime::runtime().transactions().Unregister(name));
+      CHECK(init_context().resources().Unregister(name));
       resource_.reset();
       return CommandFailure(-action_id_attr_, "add_metadata_attr() failed");
     }
@@ -651,7 +652,7 @@ void ExactMatch::DeInit() {
   if (resource_ == nullptr) {
     return;
   }
-  auto &engine = bess::runtime::runtime().transactions();
+  auto &engine = init_context().resources();
   if (action_mode_) {
     // In action mode the rules reference an ActionTable, so they may leave
     // with live keys while the graph is disconnected around them: the order
@@ -861,7 +862,7 @@ CommandResponse ExactMatch::SetRuntimeConfig(
       if (!ComputeLayout(/*tolerate_invalid_metadata=*/false, &layout, &err)) {
         return CommandFailure(err.first, "%s", err.second.c_str());
       }
-      CommandResponse applied = ApplyRuleOps(ops);
+      CommandResponse applied = ApplyRuleOps(init_context().resources(), ops);
       if (applied.error().code() != 0) {
         return applied;
       }
@@ -1098,7 +1099,7 @@ CommandResponse ExactMatch::CommandAdd(
                              key.size());
     const bess::dataplane::Op op = bess::dataplane::Op::Upsert(
         resource_->name(), packed, std::any(rule.value));
-    return ApplyRuleOps(std::span(&op, 1));
+    return ApplyRuleOps(init_context().resources(), std::span(&op, 1));
   }
   if (!EnsureCapacity(/*force=*/false, &ret)) {
     return CommandFailure(ret.first, "%s", ret.second.c_str());
@@ -1143,7 +1144,7 @@ CommandResponse ExactMatch::CommandDelete(
     }
     const bess::dataplane::Op op =
         bess::dataplane::Op::Erase(resource_->name(), packed);
-    return ApplyRuleOps(std::span(&op, 1));
+    return ApplyRuleOps(init_context().resources(), std::span(&op, 1));
   }
   if (!table_->Erase(classifier::ConstBytes(key.data(), key.size()))) {
     return CommandFailure(ENOENT, "rule doesn't exist");
@@ -1162,7 +1163,8 @@ CommandResponse ExactMatch::CommandClear(const bess::pb::EmptyArg &) {
           resource_->name(),
           std::string(reinterpret_cast<const char *>(key.data()), key.size())));
     });
-    return ops.empty() ? CommandSuccess() : ApplyRuleOps(ops);
+    return ops.empty() ? CommandSuccess()
+                       : ApplyRuleOps(init_context().resources(), ops);
   }
   std::vector<std::vector<std::byte>> keys;
   keys.reserve(table_->size());

@@ -62,6 +62,8 @@ file is the reasoning.
 | D-039 | K7.1 Route Domains (VRFs) for multi-interface network instance isolation | accepted |
 | D-040 | Standalone static release binary configuration and command-line -j parallelism | accepted |
 | D-041 | Curated `bess-dev` headers and source-only plugin contract | accepted |
+| D-042 | Module initialization capabilities replace direct runtime access (M3) | accepted |
+| D-043 | Standalone release link: libgcc_eh ahead of libunwind, non-PIE | accepted |
 
 
 ---
@@ -3079,3 +3081,71 @@ does not change the package name or `ADD_MODULE` loading semantics.
 
 **Revisit when:** an experimental header is promoted to supported source API,
 or the plugin loader begins consuming additional descriptor fields.
+
+---
+
+## D-042 Module initialization capabilities (M3)
+
+**Status:** accepted (2026-10-01).
+**Code:** `core/framework/module_init_context.{h,cc}`, `core/module.h`,
+`core/modules/*.{h,cc}`, `tools/check_includes.py`, `docs/plugin-api.md`.
+
+**Context.** Seventeen module sources called `bess::runtime::runtime()`
+directly for the RCU domain, transaction engine, and port lookup, making the
+global runtime the de facto dependency-injection model for module authors
+(roadmap G.2, M3).
+
+**Decision.**
+
+- `ModuleInitContext` exposes three named capabilities: `resources()`,
+  `rcu()`, and `ports()` (a read-only `PortDirectory`). There is deliberately
+  no `Get<Service>()`.
+- `Module` binds a context in its constructor and offers `init_context()` to
+  derived classes. Existing `Init(const Proto&)` signatures and module
+  constructors are unchanged; the context is available in member initializers.
+- Until explicit application instances (M5), the bound context is the process
+  runtime's. `ModuleInitContext::ProcessDefault()` is the only place the
+  framework resolves it.
+- Every non-test file under `core/modules/` migrated; `check_includes.py` now
+  rejects any `runtime/` include there. Tests and benchmarks keep direct
+  runtime access as fixtures.
+- A worker-topology capability is deferred until a module needs it.
+
+Per-packet cost is zero: the context is read only in construction, `Init`,
+command handlers, and reclamation after a table publish. `Module` gains one
+pointer; the packet path does not read it.
+
+**Revisit when:** M5 introduces application instances (bind per-instance
+contexts), or a module needs worker topology.
+
+---
+
+## D-043 Standalone release link: libgcc_eh ahead of libunwind, non-PIE
+
+**Status:** accepted (2026-10-01).
+**Code:** `core/meson.build`.
+
+**Context.** The "Package and Publish Release Binaries" job (the first to run
+once the Meson jobs passed) failed at `Linking target core/bessd` on
+`ubuntu-24.04` with GCC 13 and `-Dstatic_binary=standalone`:
+`multiple definition of _Unwind_Resume` and `relocation R_X86_64_32S against
+.rodata can not be used when making a PIE object`. Reproduced in an
+`ubuntu:24.04` container.
+
+**Cause.** Ubuntu's `libunwind.a` provides libgcc-compatible unwinder entry
+points (`Resume.o` defines `_Unwind_Resume`), which `-static-libgcc`'s
+`libgcc_eh.a` also defines. libunwind is needed (static `libglog.a` calls its
+`unw_*` functions), so it cannot be dropped. The archive is also not
+position independent, while the compiler defaults to PIE.
+
+**Decision.** For `static_binary` other than `none`, name `-l:libgcc_eh.a` in
+`bessd`'s own link arguments, which precede the dependency libraries, so the
+compiler runtime supplies the unwinder and libunwind's duplicates are not
+pulled. For `standalone`, also link `-no-pie`. Placing it as a dependency was
+tried and rejected: Meson orders it after `libunwind.a`.
+
+**Verification** (`ubuntu:24.04`, GCC 13.3, x86-64-v3): the previously failing
+link succeeds; `ldd` shows no `librte` libraries; `bessd --help` starts.
+
+**Revisit when:** the release job moves off distribution `libunwind.a`, or
+BESS stops needing libunwind through glog.

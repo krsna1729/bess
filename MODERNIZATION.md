@@ -4286,6 +4286,28 @@ rather than one call site).
        (packet policing/steering, misses and unresolved hops, referenced
        removal and transactions under live traffic).
 
+122. **Standalone release link fix (D-043).**
+     - **What:** the release job's `bessd` link failed (`_Unwind_Resume`
+       defined by both `libunwind.a` and `libgcc_eh.a`; non-PIC `libunwind.a`
+       under PIE). `static_binary` builds now name `-l:libgcc_eh.a` in the
+       target link arguments; `standalone` links `-no-pie`.
+     - **Evidence:** failure reproduced in an `ubuntu:24.04` container with
+       GCC 13; after the change the link succeeds, `ldd` shows no `librte`
+       libraries, and `bessd --help` starts.
+
+123. **M3: module initialization capabilities (D-042).**
+     - **What:** `framework/module_init_context.h` gives modules `resources()`,
+       `rcu()` and `ports()` through `Module::init_context()`. All 17 non-test
+       files in `core/modules` that called `runtime()` or included
+       `runtime/runtime_state.h` migrated, including ActionTable, Meter,
+       Router, ExactMatch and WildcardMatch. `check_includes.py` rejects
+       `runtime/` includes under `core/modules` (tests and benchmarks exempt);
+       the header is part of the installed API (52 headers).
+     - **Not done:** the context is still bound to the process runtime; per-
+       instance binding is M5. No worker-topology capability yet.
+     - **Evidence:** GCC Meson suite 128/128; staged-header verifier 52/52;
+       include checker and its 5-case self-test pass.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

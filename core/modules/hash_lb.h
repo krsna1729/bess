@@ -8,7 +8,6 @@
 #include <memory>
 #include <vector>
 
-#include "runtime/runtime_state.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../rcu/rcu_ptr.h"
@@ -32,7 +31,7 @@ class HashLB final : public Module {
 
   static const Commands cmds;
 
-  HashLB() : Module(), config_(bess::runtime::runtime().rcu()) {
+  HashLB() : Module(), config_(init_context().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 

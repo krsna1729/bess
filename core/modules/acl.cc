@@ -55,7 +55,7 @@ void ACL::Install(std::vector<ACLRule> rules) {
     return;
   }
   rules_.Publish(std::move(next));
-  bess::runtime::runtime().rcu().ReclaimReady();
+  init_context().rcu().ReclaimReady();
 }
 
 CommandResponse ACL::Init(const bess::pb::ACLArg &arg) {

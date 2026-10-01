@@ -19,7 +19,6 @@
 #include "../classifier/exact_rule_resource.h"
 #include "../classifier/extract_plan.h"
 #include "../classifier/runtime_schema.h"
-#include "runtime/runtime_state.h"
 #include "../event.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
@@ -62,7 +61,7 @@ class ExactMatch final : public Module {
   static constexpr size_t kMaxKeyBytes = kMaxFields * kMaxFieldSize;
 
   ExactMatch()
-      : Module(), published_(bess::runtime::runtime().rcu()) {
+      : Module(), published_(init_context().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 

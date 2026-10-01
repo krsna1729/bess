@@ -76,6 +76,14 @@ FORBIDDEN_RULES = [
             ("control/", "route table must not depend on control"),
         ],
     ),
+    # Modules obtain runtime facilities through Module::init_context() (D-042),
+    # never by including the runtime state. Tests and benchmarks are exempt.
+    (
+        re.compile(r"^core/modules/"),
+        [
+            ("runtime/", "modules must use Module::init_context(), not runtime"),
+        ],
+    ),
 ]
 
 
@@ -130,6 +138,7 @@ def run_self_test():
         ("core/dataplane/bar.cc", '#include "runtime/runtime_state.h"'),
         ("core/classifier/exact.h", '#include "module.h"'),
         ("core/meter/meter.cc", '#include "control/api_v2.h"'),
+        ("core/modules/foo.cc", '#include "runtime/runtime_state.h"'),
     ]
 
     include_pattern = re.compile(r'^\s*#\s*include\s+["<]([^">]+)[">]')
@@ -143,10 +152,10 @@ def run_self_test():
                     if forbidden_sub in inc:
                         dummy_violations.append((fake_path, inc, reason))
                         break
-    assert len(dummy_violations) == 4, (
-        f"Expected 4 synthetic violations, got {len(dummy_violations)}"
+    assert len(dummy_violations) == 5, (
+        f"Expected 5 synthetic violations, got {len(dummy_violations)}"
     )
-    print("Self-test PASSED: all 4 synthetic violations correctly detected.")
+    print("Self-test PASSED: all 5 synthetic violations correctly detected.")
 
 
 def main():

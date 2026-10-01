@@ -11,7 +11,6 @@
 #include <string>
 #include <utility>
 
-#include "runtime/runtime_state.h"
 #include "framework/resource_codec.h"
 #include "../dataplane/transaction_engine.h"
 #include "../utils/endian.h"
@@ -76,13 +75,13 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       arg.max_next_hops() ? static_cast<size_t>(arg.max_next_hops()) : 4096;
 
   auto router = route::Router::Create(name(), config, max_next_hops,
-                                      bess::runtime::runtime().rcu());
+                                      init_context().rcu());
   if (!router) {
     return CommandFailure(route::RouteErrno(router.error()), "router: %s",
                           route::RouteErrorName(router.error()));
   }
   router_ = std::move(*router);
-  if (auto enrolled = router_->Enroll(bess::runtime::runtime().transactions());
+  if (auto enrolled = router_->Enroll(init_context().resources());
       !enrolled) {
     router_.reset();
     return CommandFailure(EINVAL, "%s", enrolled.error().c_str());

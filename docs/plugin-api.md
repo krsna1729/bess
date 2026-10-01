@@ -97,6 +97,24 @@ identity through `bess_plugin_descriptor_v1()`. It is metadata only; module
 classes still register through `ADD_MODULE`. This descriptor does not promise
 that C++ module objects are ABI-compatible across BESS releases.
 
+### Runtime capabilities (`init_context()`)
+
+A module reaches runtime facilities through the protected
+`Module::init_context()` (`framework/module_init_context.h`), during
+construction or `Init()`:
+
+| Method | Capability |
+|---|---|
+| `resources()` | register/apply transactional resources (`dataplane::TransactionEngine`) |
+| `rcu()` | the reader domain published tables retire through |
+| `ports().Find(name)` | look up an existing port by name |
+
+The context is bound when the `Module` base is constructed, so it is usable in
+a derived constructor's member initializers (for example
+`published_(init_context().rcu())`). Never call it from `ProcessBatch` or
+`RunTask`. Modules in `core/modules` must not include `runtime/`; `tools/check_includes.py`
+enforces that.
+
 ---
 
 ## 3. Data Structures and Hot Paths

@@ -19,6 +19,7 @@
 #include "event.h"
 #include "gate.h"
 #include "message.h"
+#include "framework/module_init_context.h"
 #include "metadata.h"
 #include "task.h"
 #include "packet_pool.h"
@@ -167,7 +168,8 @@ class alignas(64) Module {
   // overide this section to create a new module -----------------------------
  public:
   Module()
-      : name_(),
+      : init_context_(&bess::framework::ModuleInitContext::ProcessDefault()),
+        name_(),
         module_builder_(),
         initial_arg_(),
         pipeline_(),
@@ -426,6 +428,9 @@ class alignas(64) Module {
     pipeline_ = pipeline;
   }
 
+  // Bound at construction; see D-042.
+  const bess::framework::ModuleInitContext *init_context_;
+
   std::string name_;
 
   const ModuleBuilder *module_builder_;
@@ -477,6 +482,13 @@ class alignas(64) Module {
   // Note, one should override the `AddActiveWorker` method in more complex
   // cases.
   bool propagate_workers_;
+
+  // The explicit capabilities a module may use while it is constructed and
+  // initialized (D-042). Never consult it from packet processing.
+  const bess::framework::ModuleInitContext &init_context() const {
+    return *init_context_;
+  }
+
   DISALLOW_COPY_AND_ASSIGN(Module);
 };
 

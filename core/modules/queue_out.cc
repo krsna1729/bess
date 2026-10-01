@@ -4,7 +4,6 @@
 
 #include "queue_out.h"
 
-#include "runtime/runtime_state.h"
 #include "../port.h"
 #include "../utils/format.h"
 #include "tx_checksum_profile.h"
@@ -20,7 +19,7 @@ CommandResponse QueueOut::Init(const bess::pb::QueueOutArg &arg) {
   port_name = arg.port().c_str();
   qid_ = arg.qid();
 
-  port_ = bess::runtime::runtime().ports().Find(port_name);
+  port_ = init_context().ports().Find(port_name);
   if (!port_) {
     return CommandFailure(ENODEV, "Port %s not found", port_name);
   }

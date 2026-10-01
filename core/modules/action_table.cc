@@ -11,7 +11,6 @@
 #include <utility>
 #include <vector>
 
-#include "runtime/runtime_state.h"
 #include "framework/resource_codec.h"
 #include "../dataplane/transaction_engine.h"
 #include "../utils/endian.h"
@@ -71,7 +70,7 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
                        bess::route::NextHopId(value.next_hop_id())});
           }));
   if (auto registered =
-          bess::runtime::runtime().transactions().Register(resource_.get());
+          init_context().resources().Register(resource_.get());
       !registered) {
     resource_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
@@ -87,7 +86,7 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
                                       AccessMode::kWrite);
   if (action_id_attr_ < 0 || meter_id_attr_ < 0 || next_hop_id_attr_ < 0) {
     const std::string name = resource_->name();
-    CHECK(bess::runtime::runtime().transactions().ReleaseForTeardown(
+    CHECK(init_context().resources().ReleaseForTeardown(
         std::span<const std::string>(&name, 1)));
     resource_.reset();
     return CommandFailure(EINVAL, "add_metadata_attr() failed");
@@ -103,7 +102,7 @@ void ActionTable::DeInit() {
   // than unregister: the order modules are destroyed in must not decide
   // whether a pipeline can be torn down.
   const std::string name = resource_->name();
-  auto released = bess::runtime::runtime().transactions().ReleaseForTeardown(
+  auto released = init_context().resources().ReleaseForTeardown(
       std::span<const std::string>(&name, 1));
   CHECK(released) << released.error();
   resource_.reset();
