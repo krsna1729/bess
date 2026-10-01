@@ -10,13 +10,22 @@
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 
+#include <any>
 #include <cstdint>
+#include <expected>
+#include <initializer_list>
 #include <memory>
 #include <string>
 
+#include <google/protobuf/wrappers.pb.h>
+
 #include "control/control_plane.h"
 #include "control/dataplane_transactions.h"
+#include "dataplane/scope.h"
+#include "dataplane/slot_resource.h"
 #include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
+#include "rcu/rcu_domain.h"
 #include "runtime/runtime_state.h"
 #include "module.h"
 #include "modules/exact_match.h"
@@ -377,6 +386,236 @@ TEST(DataplaneTransactionsWindowTest, OldestRecordsAgeOut) {
   EXPECT_FALSE(transactions.Get("r0").known());
   EXPECT_TRUE(transactions.Get("r1").known());
   EXPECT_EQ(transactions.Get("r1").daemon_epoch(), 7u);
+}
+
+// -- M8 (D-050): the consistency level over the wire ----------------------------------
+
+struct SessionVersion {
+  uint32_t epoch = 0;
+};
+struct MeterObject {
+  uint32_t rate = 0;
+};
+
+struct MeterTag;
+using MeterKey = bess::dataplane::StrongId<MeterTag, uint32_t>;
+
+// A scope table ("sessions": one immutable SessionVersion per scope) and an
+// ordinary resource ("meters") behind the real RPC server and codecs; keys and
+// values travel as UInt32Value messages. The scope table is the in-tree
+// acceptance application of the scope-snapshot level; the meters cannot
+// provide it.
+class ConsistencyRpcTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    InitRuntimeOnce();
+    using bess::framework::TypedCodec;
+    using google::protobuf::UInt32Value;
+    ASSERT_TRUE(engine_.Register(&sessions_res_).has_value());
+    ASSERT_TRUE(engine_.Register(&meters_res_).has_value());
+    session_binding_ = bindings_.Bind(
+        sessions_res_,
+        std::make_shared<TypedCodec<UInt32Value, UInt32Value>>(
+            [](const UInt32Value &key)
+                -> std::expected<bess::dataplane::ResourceKey, std::string> {
+              return bess::dataplane::EncodeKey(
+                  bess::dataplane::ScopeId(key.value()));
+            },
+            [](const UInt32Value &value) -> std::expected<std::any, std::string> {
+              return std::any(SessionVersion{value.value()});
+            }));
+    meter_binding_ = bindings_.Bind(
+        meters_res_,
+        std::make_shared<TypedCodec<UInt32Value, UInt32Value>>(
+            [](const UInt32Value &key)
+                -> std::expected<bess::dataplane::ResourceKey, std::string> {
+              return bess::dataplane::EncodeKey(MeterKey(key.value()));
+            },
+            [](const UInt32Value &value) -> std::expected<std::any, std::string> {
+              return std::any(MeterObject{value.value()});
+            }));
+    service_ = std::make_unique<ControlV2Service>(control_plane_, engine_,
+                                                  bindings_);
+    grpc::ServerBuilder builder;
+    bess::control::ConfigureControlServer(&builder);
+    builder.RegisterService(service_.get());
+    server_ = builder.BuildAndStart();
+    ASSERT_NE(nullptr, server_);
+    stub_ = v2::Control::NewStub(
+        server_->InProcessChannel(grpc::ChannelArguments()));
+  }
+
+  void TearDown() override {
+    server_->Shutdown();
+    while (engine_.ReclaimRetired() != 0) {
+    }
+    domain_.Drain();
+  }
+
+  static v2::TransactionOp Op(const char *resource, uint32_t key,
+                              uint32_t value) {
+    v2::TransactionOp op;
+    op.set_resource(resource);
+    google::protobuf::UInt32Value k, v;
+    k.set_value(key);
+    v.set_value(value);
+    Pack(op.mutable_key(), k);
+    Pack(op.mutable_value(), v);
+    return op;
+  }
+  static v2::ApplyTransactionRequest Request(
+      const std::string &id, v2::ApplyTransactionRequest::Consistency level,
+      std::initializer_list<v2::TransactionOp> ops) {
+    v2::ApplyTransactionRequest req;
+    req.set_request_id(id);
+    req.set_consistency(level);
+    for (const auto &op : ops) {
+      *req.add_ops() = op;
+    }
+    return req;
+  }
+
+  grpc::Status Apply(const v2::ApplyTransactionRequest &req,
+                     v2::ApplyTransactionResponse *response,
+                     v2::ErrorDetail *detail = nullptr) {
+    grpc::ClientContext context;
+    const grpc::Status status =
+        stub_->ApplyTransaction(&context, req, response);
+    if (detail != nullptr) {
+      const auto &trailers = context.GetServerTrailingMetadata();
+      const auto it = trailers.find("bess-error-bin");
+      if (it != trailers.end()) {
+        EXPECT_TRUE(detail->ParseFromString(
+            std::string(it->second.data(), it->second.size())));
+      }
+    }
+    return status;
+  }
+
+  const SessionVersion *Session(uint32_t scope) const {
+    return sessions_.Lookup(bess::dataplane::ScopeId(scope));
+  }
+
+  bess::rcu::RcuDomain domain_{8};
+  bess::dataplane::ScopeTable<SessionVersion> sessions_{16};
+  bess::dataplane::SlotTable<MeterKey, MeterObject> meters_{16};
+  bess::dataplane::ScopeResource<SessionVersion> sessions_res_{"sessions",
+                                                              sessions_};
+  bess::dataplane::SlotResource<MeterKey, MeterObject> meters_res_{"meters",
+                                                                   meters_};
+  bess::dataplane::TransactionEngine engine_{domain_};
+  bess::framework::ResourceBindings bindings_;
+  bess::framework::ResourceBinding session_binding_, meter_binding_;
+  ControlPlane control_plane_;
+  std::unique_ptr<ControlV2Service> service_;
+  std::unique_ptr<grpc::Server> server_;
+  std::unique_ptr<v2::Control::Stub> stub_;
+};
+
+using Level = v2::ApplyTransactionRequest;
+
+TEST_F(ConsistencyRpcTest, ScopeSnapshotIsRequestedAppliedAndReported) {
+  v2::ApplyTransactionResponse response;
+  const auto req = Request("s1", Level::CONSISTENCY_SCOPE_SNAPSHOT,
+                           {Op("sessions", 1, 5), Op("sessions", 2, 5)});
+  ASSERT_TRUE(Apply(req, &response).ok());
+  EXPECT_EQ(response.record().outcome(),
+            v2::TransactionRecord::OUTCOME_APPLIED);
+  EXPECT_EQ(response.record().visibility(),
+            v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT);
+  ASSERT_NE(Session(1), nullptr);
+  EXPECT_EQ(Session(1)->epoch, 5u);
+  EXPECT_EQ(Session(2)->epoch, 5u);
+
+  // A retry replays the record, level included; the same id asking for the
+  // other level is a different request.
+  v2::ApplyTransactionResponse again;
+  ASSERT_TRUE(Apply(req, &again).ok());
+  EXPECT_TRUE(again.replayed());
+  EXPECT_EQ(again.record().visibility(),
+            v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT);
+  v2::ApplyTransactionResponse other;
+  EXPECT_EQ(Apply(Request("s1", Level::CONSISTENCY_REFERENTIAL,
+                          {Op("sessions", 1, 5), Op("sessions", 2, 5)}),
+                  &other)
+                .error_code(),
+            grpc::StatusCode::ABORTED);
+}
+
+TEST_F(ConsistencyRpcTest, UnsetAndReferentialAreTheDependencyOrderedLevel) {
+  for (const auto level :
+       {Level::CONSISTENCY_UNSPECIFIED, Level::CONSISTENCY_REFERENTIAL}) {
+    v2::ApplyTransactionResponse response;
+    ASSERT_TRUE(Apply(Request("", level,
+                              {Op("meters", 1, 100), Op("sessions", 1, 6)}),
+                      &response)
+                    .ok());
+    EXPECT_EQ(response.record().outcome(),
+              v2::TransactionRecord::OUTCOME_APPLIED);
+    EXPECT_EQ(response.record().visibility(),
+              v2::TransactionRecord::VISIBILITY_DEPENDENCY_ORDERED);
+  }
+}
+
+// The point of M8: a request for the scope-snapshot level that includes a
+// resource which cannot provide it is refused, typed, with the reason -- and
+// nothing, of the scope resource either, is applied. It is not recorded (it
+// attempted nothing), so the corrected request goes through under the same id.
+TEST_F(ConsistencyRpcTest, UnsupportedLevelIsATypedErrorNeverADowngrade) {
+  v2::ApplyTransactionResponse applied;
+  ASSERT_TRUE(Apply(Request("", Level::CONSISTENCY_SCOPE_SNAPSHOT,
+                            {Op("sessions", 1, 1)}),
+                    &applied)
+                  .ok());
+  const uint64_t generation = engine_.generation();
+
+  const auto mixed = Request("m1", Level::CONSISTENCY_SCOPE_SNAPSHOT,
+                             {Op("sessions", 1, 2), Op("meters", 7, 700)});
+  v2::ApplyTransactionResponse response;
+  v2::ErrorDetail detail;
+  const grpc::Status status = Apply(mixed, &response, &detail);
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::UNIMPLEMENTED);
+  EXPECT_EQ(detail.code(), v2::ErrorDetail::UNSUPPORTED_TRANSACTION);
+  EXPECT_EQ(detail.field(), "consistency");
+  EXPECT_EQ(detail.object(), "meters");
+  EXPECT_NE(detail.message().find("scope-snapshot"), std::string::npos)
+      << detail.message();
+  EXPECT_EQ(Session(1)->epoch, 1u);  // the scope operation did not apply
+  EXPECT_EQ(meters_.Lookup(MeterKey(7)), nullptr);
+  EXPECT_EQ(engine_.generation(), generation);
+
+  // Not recorded...
+  grpc::ClientContext context;
+  v2::GetTransactionRequest get;
+  get.set_request_id("m1");
+  v2::GetTransactionResponse known;
+  ASSERT_TRUE(stub_->GetTransaction(&context, get, &known).ok());
+  EXPECT_FALSE(known.known());
+  // ...and the same operations are fine as the referential transaction they
+  // can be, under the same id.
+  v2::ApplyTransactionResponse referential;
+  ASSERT_TRUE(Apply(Request("m1", Level::CONSISTENCY_REFERENTIAL,
+                            {Op("sessions", 1, 2), Op("meters", 7, 700)}),
+                    &referential)
+                  .ok());
+  EXPECT_EQ(referential.record().outcome(),
+            v2::TransactionRecord::OUTCOME_APPLIED);
+  EXPECT_EQ(referential.record().visibility(),
+            v2::TransactionRecord::VISIBILITY_DEPENDENCY_ORDERED);
+  EXPECT_EQ(Session(1)->epoch, 2u);
+}
+
+// A level this build does not know is not read as the default.
+TEST_F(ConsistencyRpcTest, UnknownLevelIsRefused) {
+  v2::ApplyTransactionRequest req;
+  *req.add_ops() = Op("sessions", 1, 9);
+  req.set_consistency(static_cast<Level::Consistency>(99));
+  v2::ApplyTransactionResponse response;
+  v2::ErrorDetail detail;
+  EXPECT_EQ(Apply(req, &response, &detail).error_code(),
+            grpc::StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(detail.field(), "consistency");
+  EXPECT_EQ(Session(1), nullptr);
 }
 
 }  // namespace

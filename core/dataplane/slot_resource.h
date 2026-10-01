@@ -27,7 +27,7 @@ namespace dataplane {
 // `references` names the keys a value refers to (for example, an action
 // object naming a meter), so the engine can order and check them.
 template <typename Id, typename T>
-class SlotResource final : public Resource {
+class SlotResource : public Resource {
  public:
   using ReferencesFn = std::function<std::vector<Reference>(const T &)>;
 

@@ -2,10 +2,12 @@
 
 #include "control/dataplane_transactions.h"
 
+#include <cerrno>
 #include <expected>
 #include <functional>
 #include <optional>
 #include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -58,6 +60,8 @@ v2::TransactionRecord::Outcome ToProto(TransactionEngine::Outcome outcome) {
       return v2::TransactionRecord::OUTCOME_CONFLICT;
     case TransactionEngine::Outcome::kBusy:
       return v2::TransactionRecord::OUTCOME_BUSY;
+    case TransactionEngine::Outcome::kUnsupported:
+      break;  // answered as a typed error before a record is built
   }
   return v2::TransactionRecord::OUTCOME_REJECTED;
 }
@@ -103,6 +107,25 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     const v2::ApplyTransactionRequest &request) {
   v2::ApplyTransactionResponse response;
   response.set_daemon_epoch(epoch_);
+  // A level this build does not know is refused: reading it as referential
+  // would serve a stronger request with a weaker transaction.
+  dataplane::Consistency consistency = dataplane::Consistency::kReferential;
+  switch (request.consistency()) {
+    case v2::ApplyTransactionRequest::CONSISTENCY_UNSPECIFIED:
+    case v2::ApplyTransactionRequest::CONSISTENCY_REFERENTIAL:
+      break;
+    case v2::ApplyTransactionRequest::CONSISTENCY_SCOPE_SNAPSHOT:
+      consistency = dataplane::Consistency::kScopeSnapshot;
+      break;
+    default:
+      return std::unexpected(ControlError{
+          .code = ControlErrorCode::kInvalidArgument,
+          .err = EINVAL,
+          .message = "unknown consistency level " +
+                     std::to_string(static_cast<int>(request.consistency())),
+          .object = "",
+          .field = "consistency"});
+  }
   const std::string &id = request.request_id();
   const uint64_t digest = id.empty() ? 0 : Digest(request);
   if (!id.empty()) {
@@ -173,7 +196,26 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     if (request.has_expected_generation()) {
       expected = request.expected_generation();
     }
-    const TransactionEngine::Result result = engine_.Apply(ops, expected);
+    const TransactionEngine::Result result =
+        engine_.Apply(ops, expected, consistency);
+    if (result.outcome == TransactionEngine::Outcome::kUnsupported) {
+      // A typed error, not a record: the request names a promise a resource
+      // cannot keep, which retrying will not change. Nothing was attempted,
+      // so nothing is recorded under the id.
+      ControlError error{.code = ControlErrorCode::kUnsupportedTransaction,
+                         .err = ENOTSUP,
+                         .message = "unsupported consistency",
+                         .object = "",
+                         .field = "consistency"};
+      for (size_t i = 0; i < result.ops.size(); i++) {
+        if (result.ops[i].status == TransactionEngine::OpStatus::kFailed) {
+          error.message = result.ops[i].error;
+          error.object = ops[i].resource;
+          break;
+        }
+      }
+      return std::unexpected(std::move(error));
+    }
     record.set_outcome(ToProto(result.outcome));
     record.set_generation(result.generation);
     for (const auto &op : result.ops) {
@@ -183,7 +225,9 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     }
   }
   record.set_request_id(id);
-  record.set_visibility(v2::TransactionRecord::VISIBILITY_DEPENDENCY_ORDERED);
+  record.set_visibility(consistency == dataplane::Consistency::kScopeSnapshot
+                            ? v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT
+                            : v2::TransactionRecord::VISIBILITY_DEPENDENCY_ORDERED);
   // BUSY and CONFLICT attempted nothing: the client retries under the id.
   const bool attempted = record.outcome() == v2::TransactionRecord::OUTCOME_APPLIED ||
                          record.outcome() == v2::TransactionRecord::OUTCOME_REJECTED;

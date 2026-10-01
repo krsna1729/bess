@@ -234,14 +234,24 @@ class BESS(object):
             op.value.Pack(value)
         return op
 
-    def apply_transaction(self, ops, request_id='', expected_generation=None):
+    def apply_transaction(self, ops, request_id='', expected_generation=None,
+                          consistency=None):
         """Returns the ApplyTransactionResponse: record.outcome (APPLIED,
         REJECTED, CONFLICT, BUSY), per-op results, generation, daemon_epoch,
-        and replayed (a retry of an already recorded request_id)."""
+        and replayed (a retry of an already recorded request_id).
+
+        consistency: None or ApplyTransactionRequest.CONSISTENCY_REFERENTIAL
+        (operations take effect one by one, referents first), or
+        CONSISTENCY_SCOPE_SNAPSHOT (each scope switches from its whole old
+        version to its whole new one). A resource that cannot provide the
+        requested level fails the call with UNIMPLEMENTED (error detail
+        UNSUPPORTED_TRANSACTION); it is never served at a weaker level."""
         req = control_v2.ApplyTransactionRequest(request_id=request_id,
                                                  ops=ops)
         if expected_generation is not None:
             req.expected_generation = expected_generation
+        if consistency is not None:
+            req.consistency = consistency
         return self.stub_v2.ApplyTransaction(req)
 
     def get_transaction(self, request_id):

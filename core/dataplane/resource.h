@@ -206,6 +206,29 @@ class StagedOp {
   virtual void Abort() noexcept {}
 };
 
+// The two levels at which a transaction can become visible to packets (M8,
+// D-050). They are different promises, not a strength dial a request is
+// silently rounded between:
+//
+//   kReferential    -- the default for every resource. Operations take effect
+//                      one by one, referents before referrers; a packet may see
+//                      some of a multi-resource transaction applied and the
+//                      rest not yet, but never a reference to something
+//                      missing, and never part of a failed transaction.
+//   kScopeSnapshot  -- every scope the transaction touches switches from its
+//                      complete old version to its complete new version in one
+//                      pointer store: a packet that binds a scope once sees
+//                      all of the old version or all of the new one. Only
+//                      resources whose operations are such stores can take
+//                      part (ProvidedConsistency()); there is no ordering
+//                      between two scopes of one transaction.
+enum class Consistency : uint8_t { kReferential, kScopeSnapshot };
+
+inline const char *ToString(Consistency consistency) {
+  return consistency == Consistency::kScopeSnapshot ? "scope-snapshot"
+                                                    : "referential";
+}
+
 class Resource {
  public:
   // Upper bounds on what an operation's Publish() will ask of the Retirer.
@@ -287,6 +310,17 @@ class Resource {
   // once (an rte_hash rule table) must not be a referent; the engine refuses
   // references to it.
   virtual bool DefersErase() const { return false; }
+
+  // The strongest consistency level a transaction operation on this resource
+  // can take part in. kScopeSnapshot is a promise about the resource's
+  // Publish(): each operation changes what one scope's readers see by a single
+  // store of a whole immutable version (ScopeResource), nothing else is
+  // visible earlier or later, and readers bind that version once. A resource
+  // that cannot promise it keeps the default; a transaction that requests
+  // kScopeSnapshot and names such a resource is refused, not downgraded.
+  virtual Consistency ProvidedConsistency() const {
+    return Consistency::kReferential;
+  }
 
   // Called after a transaction finished (published or aborted), for
   // resources that keep per-transaction state in Reserve().

@@ -204,6 +204,24 @@ message TransactionOp {
 }
 
 message ApplyTransactionRequest {
+  // How the transaction must become visible to packets (M8, D-050). Two
+  // different promises, never one rounded into the other:
+  //   CONSISTENCY_REFERENTIAL: operations take effect one by one, referents
+  //     before referrers; a packet may see part of the transaction applied,
+  //     never a reference to something missing. Any resource can take part.
+  //   CONSISTENCY_SCOPE_SNAPSHOT: every scope the transaction touches
+  //     switches from its whole old version to its whole new one in one
+  //     store. Only resources that are scope tables can take part; if any
+  //     operation names another, the call fails with UNIMPLEMENTED and error
+  //     detail UNSUPPORTED_TRANSACTION (field "consistency", object the
+  //     resource) and nothing is applied. It is never served as referential.
+  // Unset (UNSPECIFIED) means CONSISTENCY_REFERENTIAL, which is all this
+  // request could ask before the field existed.
+  enum Consistency {
+    CONSISTENCY_UNSPECIFIED = 0;
+    CONSISTENCY_REFERENTIAL = 1;
+    CONSISTENCY_SCOPE_SNAPSHOT = 2;
+  }
   // Idempotency (optional but recommended): a repeated request with the
   // same id and contents returns the recorded outcome (replayed = true)
   // instead of applying again; the same id with different contents is
@@ -215,6 +233,7 @@ message ApplyTransactionRequest {
   // is still this.
   optional uint64 expected_generation = 2;
   repeated TransactionOp ops = 3;
+  Consistency consistency = 4;
 }
 
 message TransactionOpResult {
@@ -238,15 +257,24 @@ message TransactionRecord {
     OUTCOME_CONFLICT = 3;  // expected_generation did not match; nothing tried
     OUTCOME_BUSY = 4;      // readers slow to quiesce; nothing tried, retry
   }
-  // What packets could see of an applied transaction.
-  // VISIBILITY_DEPENDENCY_ORDERED:
-  // its operations took effect one by one, referents before referrers, and
-  // no packet saw a reference to something missing. VISIBILITY_ATOMIC (all
-  // at once) comes with the scope cell.
+  // The consistency level the transaction ran under (it describes what
+  // packets could see once the transaction is APPLIED; a transaction that was
+  // not applied changed nothing):
+  //   VISIBILITY_DEPENDENCY_ORDERED: its operations took effect one by one,
+  //     referents before referrers, and no packet saw a reference to
+  //     something missing (CONSISTENCY_REFERENTIAL).
+  //   VISIBILITY_SCOPE_SNAPSHOT: each scope it touched switched from its whole
+  //     old version to its whole new one in one store
+  //     (CONSISTENCY_SCOPE_SNAPSHOT). There is no order between two scopes.
+  // VISIBILITY_ATOMIC is never sent. It named a promise ("all at once") that
+  // nothing provides: the strongest guarantee is per scope, and
+  // VISIBILITY_SCOPE_SNAPSHOT says so. The value stays only because removing
+  // an enum value breaks `buf breaking`.
   enum Visibility {
     VISIBILITY_UNSPECIFIED = 0;
     VISIBILITY_DEPENDENCY_ORDERED = 1;
-    VISIBILITY_ATOMIC = 2;
+    VISIBILITY_ATOMIC = 2 [deprecated = true];
+    VISIBILITY_SCOPE_SNAPSHOT = 3;
   }
   string request_id = 1;
   Outcome outcome = 2;

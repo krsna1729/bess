@@ -11,7 +11,7 @@ This contract defines the performance, memory, and concurrency invariants for al
    - All batch workspaces and scratch buffers must be pre-allocated or stack-allocated within bounded limits (`kMaxBurst = 32`).
 
 2. **Near-Specialized Assembly for Typed Paths**:
-   - For typed hot paths (e.g. `TypedExactTable`, `RangeClassifier`, `ScopeCell`), code generation must approach optimal hand-written assembly.
+   - For typed hot paths (e.g. `TypedExactTable`, `RangeClassifier`, `ScopeTable::Lookup`), code generation must approach optimal hand-written assembly.
    - Branching and comparisons must use direct scalar or SIMD instructions (e.g., unsigned integer comparisons for port ranges, SSE2/AVX2 vector shifts for VLAN stripping and key extraction).
 
 3. **Bound Genericity Outside the Packet Loop**:
@@ -30,7 +30,7 @@ This contract defines the performance, memory, and concurrency invariants for al
    - **Classifier**: At most **1 cache line** read per packet in steady-state hash table lookups (1 bucket load).
    - **Routing**: Exactly **1 memory access** for IPv4 routes `/24` or shorter via DIR-24-8 `rte_lpm` `tbl24`.
    - **Metering & Accounting**: Per-worker arrays (`WorkerSlots`) guarantee that worker increments touch only cache lines exclusive to that worker's NUMA node, eliminating cross-core cache invalidation storms.
-   - **Session Action**: `ScopeCell` packs `{meter_id, next_hop_id}` into a single 64-bit word ($8\,\text{bytes}$), reading both continuation fields in a single memory access.
+   - **Scope binding**: a packet operation reads a scope's whole policy with one acquire load (`ScopeTable::Lookup`, D-050) and routes every covered lookup through that immutable version; it adds a pointer load per scope, not a version check per table operation. Referential resources keep their lookup cost unchanged (nothing on their read path was touched). The load itself has not been benchmarked.
 
 2. **Scale Bounds**:
    - Strong identifiers (`StrongId`) are scalar wrappers: trivially copyable, register-passable, the size of their representation, and compiled to the same code as the raw integer (checked for `InterfaceId`, D-049). An identifier that can appear in packet metadata or a hardware mark is 32 bits (`ActionId`, `NextHopId`, `InterfaceId`, `RouteDomainId`). `WorkerId` is 16 bits because it never leaves the process. `GenerationHandle<Id>` is an id plus a 32-bit generation: 8 bytes, one 64-bit compare.

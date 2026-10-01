@@ -4458,6 +4458,40 @@ rather than one call site).
        46 edges, 6 grandfathered; include checker 7-case self-test. Clang and
        GCC 14 run in CI.
 
+130. **M8: explicit transaction consistency (D-050).**
+     - **What:** a transaction now asks for a level -- *referential* (default;
+       reported `VISIBILITY_DEPENDENCY_ORDERED`) or *scope-snapshot*
+       (`ApplyTransactionRequest.consistency`, reported
+       `VISIBILITY_SCOPE_SNAPSHOT`). A resource declares what it can provide
+       (`Resource::ProvidedConsistency`); a scope-snapshot request that names
+       any other resource is refused (`Outcome::kUnsupported`; over gRPC
+       `UNIMPLEMENTED` / `UNSUPPORTED_TRANSACTION`, field `consistency`, the
+       resource and reason), never served as referential. The meter-and-next-hop
+       `ScopeCell` that nothing used is gone; the generic primitive is
+       `ScopeTable<Version>` (a `SlotTable` keyed by `ScopeId`) and
+       `ScopeResource<Version>`. `VISIBILITY_ATOMIC` is deprecated and never
+       sent. `check_includes.py` now forbids `core/dataplane/` from including
+       `meter/`, `route/`, `classifier/`, `stats/` (11-case self-test); the
+       architecture, dataplane-tables and performance-contract docs no longer
+       claim an atomic visibility nothing provided.
+     - **Checked:** the old packed `ScopeCell` was used by nothing but its own
+       test (no engine, RPC or module), so the docs' claim had no code behind
+       it; `SlotTable` already gives one acquire load, a pointer-store publish,
+       id quarantine and reference tracking, so no second cell class was added.
+     - **Not done:** no shipped module reads a scope (the two acceptance
+       applications, a per-session policy and a VFP-like policy group, are
+       test applications); no cross-scope atomicity or mixed
+       referential+snapshot transaction; no packet-path code changed, so no
+       benchmark; `buf` is not installed here (descriptors were compared with
+       `protoc` instead) and no live-daemon Python test was added.
+     - **Evidence:** fast tree (GCC 16, `-O1`) 99/99 tests, including
+       `dataplane_scope_snapshot_test` (18: every reader/publication
+       interleaving enumerated, threaded readers, failure injection at every
+       reservation position, refusal) and 4 new `ConsistencyRpcTest` cases
+       over a real in-process gRPC channel; link-graph checker 46 edges, 6
+       grandfathered (unchanged); staged install: 57 curated headers present
+       and compiling. Clang and GCC 14 run in CI.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -8051,10 +8085,12 @@ consumer-driven (D-008, §31.3 item 2).
   process. Four live-daemon tests check forwarding, metering, teardown and
   updates under traffic; the traffic-under-update case churns action-mode
   ExactMatch rules/actions, not the full meter/route chain.
-- **G1.2d — transaction-integrated atomic scopes: PENDING.** `ScopeCell` and
-  `ScopeTable` implement and test a lock-free 64-bit plan cell, but they are
-  not used by `TransactionEngine`; `ApplyTransaction` reports only
-  `VISIBILITY_DEPENDENCY_ORDERED`, never `VISIBILITY_ATOMIC`.
+- **G1.2d — transaction-integrated scope snapshots: DONE as the generic
+  primitive (M8, D-050).** `ScopeCell`/`ScopeTable` (a packed meter+next-hop
+  word that nothing used) were replaced by `dataplane::ScopeTable<Version>` /
+  `ScopeResource<Version>`; a request can ask for `CONSISTENCY_SCOPE_SNAPSHOT`
+  and gets `VISIBILITY_SCOPE_SNAPSHOT`, or a typed refusal. No shipped module
+  uses it yet; `VISIBILITY_ATOMIC` is deprecated and never sent.
 - **Other G1.2 follow-ons:** the live Mpps benchmark (D-027) covers unary
   ExactMatch rule churn, not the full ActionTable→Meter→Router chain.
   Full-chain failure injection under traffic, `ReplaceScope`, production
@@ -10191,7 +10227,7 @@ drive the design.
 |---|---|---|---|---|---|
 | 1 | P0 | **G1.2b transaction engine and providers**: reserve/publish, dependency ordering, reference safety, retirement (D-021); ExactMatch, WildcardMatch, Router, ActionTable and Meter (D-022–D-024, D-032) | manual ordering, best-effort rollback | routers, firewalls, NAT | complete |
 | 2 | P0 | **G1.2c unary transaction RPC:** `ApplyTransaction`, `GetTransaction`, `ListTransactionResources`, `request_id`, generations and daemon epoch (D-025) | per-rule RPC orchestration and timeout ambiguity | any controller | unary path complete; production streaming/bulk RPC and SDKs pending |
-| 3 | P0 | **Atomic scope publication:** one cell selects a complete old or new immutable policy version | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | `ScopeCell`/`ScopeTable` primitive exists; transaction/RPC integration for `VISIBILITY_ATOMIC` pending |
+| 3 | P0 | **Scope-snapshot publication:** one pointer store selects a complete old or new immutable policy version | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | `ScopeTable`/`ScopeResource` and `CONSISTENCY_SCOPE_SNAPSHOT` complete with two test applications (D-050); no shipped module consumes it yet |
 | 4 | P1 | **Generic session vertical slice** (D-032): action-mode ExactMatch → ActionTable → K5 Meter → Router, programmed in one transaction | controller-side ordering/rollback | session policy, firewall/QoS/forwarding chains | basic in-process and live-daemon slice complete; full-chain prepare-failure and Mpps-under-update gate pending |
 | 5 | P0 | **External plugin package** (`bess-dev`) with an explicit header contract | vendored BESS fork | out-of-tree module authors | curated 51-header source API and installed-plugin checks complete (D-037, D-041); no C++ ABI promise |
 | 6 | P1 | **K3.8 range backend** (arbitrary source/destination ranges and precedence), differential against scalar reference | Go ternary expansion and Cartesian products | ACL, firewall rules | complete (D-038) |
@@ -10359,7 +10395,7 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
    - optimistic generations instead of election;
    - no double-buffered tables;
    - no global barrier, which is VPP's default for non-mp-safe handlers.
-6. **G1.2b/c core and unary RPC: DONE; atomic-scope integration remains open.**
+6. **G1.2b/c core and unary RPC: DONE; scope snapshots done as a primitive (D-050).**
    D-021/D-025/D-032 and their tests establish dependency-safe transactions,
    typed unary RPC, reference-safe ExactMatch/WildcardMatch/Router/ActionTable/
    Meter providers, and the basic session vertical slice.
@@ -10368,10 +10404,11 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
      churns action-mode ExactMatch rules/actions, not the full meter/route chain.
    - D-027's `live_transaction_bench.py` measures Mpps under unary ExactMatch
      rule churn; it is not a measurement of the full session chain.
-   - `ScopeCell`/`ScopeTable` exist and their 64-bit word is tested for
-     untorn reads, but no transaction path publishes scope versions; RPC
-     outcomes remain `VISIBILITY_DEPENDENCY_ORDERED`.
-   **Pending:** `VISIBILITY_ATOMIC` transaction integration; full-chain
+   - Scope snapshots (M8, D-050): `ScopeTable<Version>`/`ScopeResource` with
+     `CONSISTENCY_SCOPE_SNAPSHOT` over the RPC, refused (not downgraded) for
+     resources that cannot provide it. The earlier packed `ScopeCell` word was
+     deleted.
+   **Pending:** a shipped module that consumes a scope; full-chain
    prepare-failure traffic/Mpps gate; production streaming/bulk RPC;
    `ReplaceScope`; Go/C++ SDKs; G1.3 capabilities and G1.4 stats/events.
    Generic Mode W remains intentionally deferred until two consumers need it

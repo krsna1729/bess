@@ -281,9 +281,9 @@ bool ValidWireGate(int64_t gate) {
 // later one fails for lack of space, so a refused command leaves the table as
 // it was. That is command-level all-or-nothing, not dataplane atomicity:
 // entries become visible to packets one by one as they are inserted, and a
-// rolled-back add may have been seen briefly. Atomic visibility of a set of
-// changes is what G1.2b transactions add (scope cell); these commands do not
-// promise it.
+// rolled-back add may have been seen briefly. All-or-nothing changes across
+// tables are what G1.2b transactions add (referential, or scope-snapshot for a
+// scope table: D-050); these commands promise neither.
 CommandResponse L2Forward::CommandAdd(
     const bess::pb::L2ForwardCommandAddArg &arg) {
   std::vector<std::pair<uint64_t, gate_idx_t>> entries;

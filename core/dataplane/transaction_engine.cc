@@ -424,7 +424,8 @@ TransactionEngine::Result TransactionEngine::Reject(size_t n_ops,
 }
 
 TransactionEngine::Result TransactionEngine::Apply(
-    std::span<const Op> ops, std::optional<uint64_t> expected_generation) {
+    std::span<const Op> ops, std::optional<uint64_t> expected_generation,
+    Consistency consistency) {
   std::lock_guard<std::mutex> lock(mutex_);
   ReclaimRetiredLocked();  // frees ids whose removal has completed
   // Ranks come from the bound dependency graph, which registrations may have
@@ -465,6 +466,19 @@ TransactionEngine::Result TransactionEngine::Apply(
       return Reject(n, i, "unknown resource '" + op.resource + "'");
     }
     w.reg[i] = it->second.get();
+    if (consistency == Consistency::kScopeSnapshot &&
+        w.reg[i]->resource->ProvidedConsistency() !=
+            Consistency::kScopeSnapshot) {
+      // Not a rejection of the operation's content: this request can never
+      // succeed against this resource. Said so, not served as referential.
+      Result result = Reject(
+          n, i,
+          "resource '" + op.resource +
+              "' cannot take part in a scope-snapshot transaction: its "
+              "operations become visible one by one (referential)");
+      result.outcome = Outcome::kUnsupported;
+      return result;
+    }
     if (op.kind == OpKind::kUpsert && !op.value.has_value()) {
       return Reject(n, i, "upsert without a value");
     }

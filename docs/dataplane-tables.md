@@ -236,6 +236,30 @@ state through G, C or W.
     engine's removal cascade.
 - Code: `core/dataplane/slot_table.h`; D-021.
 
+### `ScopeTable<Version>` (scope id → one immutable policy, mode C)
+
+- **Use for:** a policy that must be seen whole: a session's meter, next
+  hop and class, or a VFP-like group's layers. The application decides
+  what a scope is; BESS stores one immutable `Version` per `ScopeId` and
+  knows nothing else about it. It is a `SlotTable<ScopeId, Version>`, so
+  the reader and writer sides below are `SlotTable`'s.
+- **Reader:** bind the scope **once** per packet operation --
+  `const Version *v = table.Lookup(scope_id)` (one acquire load) -- and use
+  `*v` for every covered lookup. Looking the scope up again for each field
+  can see two versions (the model test shows it does).
+- **Writer:** a transaction on a `ScopeResource<Version>` (key =
+  `EncodeKey(ScopeId)`, value = the `Version`) replaces the whole version by
+  one pointer store. It is the only built-in resource that can be part of a
+  scope-snapshot transaction (`Consistency::kScopeSnapshot`); see
+  [architecture.md section 3](architecture.md) for what that does and does
+  not promise.
+- **A `Version` is immutable and self-contained.** Mutable state (meter
+  tokens, counters) lives elsewhere and the version names it by id --
+  declare those references like any resource's, and the engine keeps what a
+  live version names alive. Build objects a new version names in an earlier
+  referential transaction.
+- Code: `core/dataplane/scope.h`; D-050.
+
 ### Transactions over several tables (G1.2b)
 
 A module exposes its tables as **resources** and registers them with a
@@ -245,6 +269,8 @@ reference to something missing.
 
 - **Ready-made resources** (no reserve/publish code to write):
   - `SlotResource<Id, T>` over a `SlotTable` (key = id, value = `T`);
+  - `ScopeResource<Version>` over a `ScopeTable` (key = `ScopeId`, value =
+    the `Version`); the only one that provides the scope-snapshot level;
   - `ExactRuleResource` over a `ConcurrentExactTable` (key = key bytes,
     value = `uint64_t`);
   - `MaskedRuleResource` over a `ConcurrentMaskedTable` (key = mask and
@@ -267,11 +293,18 @@ reference to something missing.
   - all or nothing, with every check and allocation done before anything
     is visible;
   - per-operation results in request order;
-  - `expected_generation` for optimistic concurrency.
+  - `expected_generation` for optimistic concurrency;
+  - a requested **consistency**: *referential* (the default) or
+    *scope-snapshot* (below).
 
-  Packets may see a successful transaction's operations take effect one by
-  one, in dependency order. All-at-once visibility per scope (the scope
-  cell) is a later increment.
+  Referential: packets may see a successful transaction's operations take
+  effect one by one, in dependency order, so a packet can see part of it.
+  Scope-snapshot: only for resources that provide it (`ScopeResource`);
+  each scope switches from its whole old version to its whole new one. A
+  scope-snapshot request that names any other resource gets
+  `Outcome::kUnsupported` (over RPC, `UNIMPLEMENTED` /
+  `UNSUPPORTED_TRANSACTION`) and nothing is applied: it is refused, not
+  served as referential (D-050).
 - **Only resources that keep erased keys readable** (`DefersErase()`) may
   be referenced. An `rte_hash` rule table erases at once, so it is a root:
   nothing may point at it. Ranks are checked: a referrer must rank

@@ -70,6 +70,7 @@ file is the reasoning.
 | D-047 | Phase A closure: link-graph checker, plugin descriptor range, conformance plugins | accepted |
 | D-048 | Fast build profile: normal test linking, mold, ccache, quiet EAL | accepted |
 | D-049 | Logical network identities: InterfaceId replaces the gate in the route library (M7) | accepted |
+| D-050 | Explicit transaction consistency: referential vs scope-snapshot (M8) | accepted |
 
 
 ---
@@ -3589,3 +3590,170 @@ library, which no longer touches the egress.
 
 **Revisit when:** a second adapter (a fused appliance, hardware) needs a mapping
 that is not a constant offset, which would call for a table the owner supplies.
+
+## D-050 Explicit transaction consistency: referential vs scope-snapshot (M8)
+
+**Status:** accepted (2026-10-02).
+**Code:** `core/dataplane/scope.h` (new; replaces `scope_cell.h`),
+`core/dataplane/{resource.h,slot_resource.h,transaction_engine.{h,cc}}`,
+`core/dataplane/scope_snapshot_test.cc` (replaces `scope_cell_test.cc`),
+`core/control/dataplane_transactions.{h,cc}`, `core/control/dataplane_transactions_test.cc`,
+`protobuf/control_v2.proto`, `pybess/bess.py`, `core/meson.build`,
+`tools/check_includes.py`, `tools/check_installed_headers.py`,
+`docs/{architecture,dataplane-tables,performance-contract}.md`.
+
+**Context.** "Atomic" was an overloaded promise. `docs/architecture.md` and
+`docs/performance-contract.md` said `VISIBILITY_ATOMIC` was enabled by a
+`ScopeCell` that packed `{MeterId, NextHopId}` into one 64-bit word. The code
+disagreed: nothing but its own test used `ScopeCell`; the control path only ever
+recorded `VISIBILITY_DEPENDENCY_ORDERED`; `ApplyTransactionRequest` could not
+ask for a level, so "reject instead of downgrade" had no surface; and
+`dataplane/` included `meter/meter.h` and `route/next_hop_id.h` for it, an
+upward edge the include checker did not look for. The roadmap (M8) asks for two
+named levels, snapshot scopes only for a real consumer, a refusal with a reason
+instead of a silent downgrade, and adversarial reader tests. Where roadmap and
+code differed, the code was trusted: there was no `ScopeCell` with
+`Read() -> const ScopeVersion*`, only a packed word.
+
+**Decision.**
+
+1. **Two levels, named apart.** C++: `dataplane::Consistency { kReferential,
+   kScopeSnapshot }`. Wire: `ApplyTransactionRequest.consistency` (new field 4;
+   `CONSISTENCY_UNSPECIFIED` means referential, which is all a request could ask
+   before) and `TransactionRecord.Visibility` gains `VISIBILITY_SCOPE_SNAPSHOT
+   = 3`. `VISIBILITY_ATOMIC = 2` stays only because removing a value breaks
+   `buf breaking`; it is `deprecated` and never sent (it promised "all at
+   once", which nothing provides: the promise is per scope). The record's
+   visibility reports the level the transaction ran under.
+2. **A level is a capability of a resource, checked, not negotiated.**
+   `Resource::ProvidedConsistency()` defaults to referential. `Apply(ops,
+   expected_generation, consistency)` answers `Outcome::kUnsupported` for a
+   scope-snapshot request that names any resource without the capability, in
+   the structure phase before anything is reserved (the failing operation
+   carries the reason; the rest are `kNotApplied`). Over gRPC that is
+   `UNIMPLEMENTED` with error detail `UNSUPPORTED_TRANSACTION`, `field =
+   "consistency"`, `object =` the resource, the reason as the message -- a
+   typed error, not a record: retrying cannot change it, nothing was attempted,
+   and nothing is stored under the `request_id`. A consistency value the build
+   does not know is `INVALID_ARGUMENT` (reading it as referential would be the
+   downgrade). `consistency` is part of the request digest, so reusing a
+   `request_id` with the other level is the existing `CONFLICT`.
+3. **The smallest scope primitive: a `SlotTable` keyed by `ScopeId`.**
+   `ScopeTable<Version> = SlotTable<ScopeId, Version>` and `ScopeResource<Version>
+   : SlotResource<ScopeId, Version>` reporting `kScopeSnapshot`. A `SlotTable`
+   already is "stable id -> atomic pointer to an immutable object": one acquire
+   load to read (the roadmap's `ScopeCell::Read()` is `ScopeTable::Lookup`),
+   one exchange to publish, the old version retired through the transaction's
+   grace period, id reuse quarantined until the removal cascade (the ScopeId
+   reuse risk), and references from a version to separately owned state (a
+   meter id) tracked by the engine's ledger. A second cell class would
+   duplicate all of it and need its own resource adapter. `ScopeResource`
+   inherits that; `SlotResource` lost `final` for it. The meter/route-specific
+   `ScopePlan`/`ScopeCell`/`ScopeTable` were deleted (clean cutover, no
+   alias); `Version` is whatever the application defines.
+4. **Operational definition of "identifiable independently".** A scope is the
+   key of a `ScopeResource`: the id a packet carries, chosen by the
+   application and unrelated to the rules replaced. The engine already allows
+   one operation per key per transaction, so each scope in a transaction
+   switches by exactly one pointer store. What the engine cannot check -- that
+   the lookups a version covers do not depend on rules outside it -- stays the
+   application's obligation, written in `scope.h`.
+5. **Mixing is refused, not approximated.** A scope-snapshot request that also
+   names an ordinary resource (a new action, a next hop) is `kUnsupported`:
+   serving it "snapshot where possible" is the downgrade. The pattern is
+   two calls: create the referents (invisible until named) in a referential
+   transaction, then switch the scope in a scope-snapshot one. Two scopes in
+   one scope-snapshot transaction each switch whole; there is no order between
+   them and no reader binds both.
+6. **Layering.** `scope.h` includes only `dataplane/` headers. `check_includes.py`
+   now forbids non-test `core/dataplane/` from including `meter/`, `route/`,
+   `classifier/` and `stats/`, with four negative self-test cases (11 cases in
+   all; it was 7). `scope.h` and `slot_resource.h` (which it includes) are
+   installed (`core_public_subdir_headers`, `PUBLIC_REQUIRED`); `scope_cell.h`
+   is gone from both.
+7. **The "real consumer" is two test applications, decided here.** The
+   application owns what a scope means, so the acceptance shapes are in-tree
+   applications of the library, not changes to a shipped module: a per-session
+   policy (meter, next hop, QoS class that must move together) and a VFP-like
+   policy group (a classification layer and an action layer that must come
+   from one group version). Both run through the production engine; the
+   session shape also runs through the production RPC server and codec
+   machinery. No shipped module reads a scope on its packet path: that would
+   add a read to a hot path with no user to size the `Version` for.
+
+**Evidence.** `dataplane_scope_snapshot_test` (18 tests) and the new
+`ConsistencyRpcTest` cases of `control_dataplane_transactions_test` (4):
+
+- *Schedule enumeration.* The writer's publication steps and a reader's loads
+  are interleaved in every possible way (before the transaction, after each
+  publication step, after the transaction returned with the reader still
+  holding what it read), and the set of observations is compared with the
+  contract exactly.
+  - `SessionBoundOnceIsAlwaysOneWholeVersion` (21 schedules): a reader that
+    binds the scope and reads four fields sees exactly `{old, new}`, never a mix.
+  - `ReaderThatRebindsPerFieldSeesATear`: the same harness shows a tear for a
+    reader that looks the scope up per field, so the harness is able to fail.
+  - `TwoScopesEachSwitchWholeWithNoOrderBetweenThem`: each scope whole; some
+    interleaving shows one switched and the other not.
+  - `GroupBoundOnceResolvesThroughOneVersion` vs
+    `GroupUpdatedReferentiallyCanBeObservedHalfApplied`: the group resolves to
+    `{v1, v2}` as a scope and to `{v1, v2, miss}` when its two layers are
+    replaced referentially.
+  - `ReferentialModelTest.*`: a reader that follows a reference sees the new
+    referent or a newer one, exactly `{(1,1),(1,2),(2,2)}`; the reverse reader
+    sees all four combinations; a new referrer is never visible without its
+    referent; an erased referent stays readable for a reader holding its
+    referrer and goes after the reader's quiescent state.
+- *Threads* (`ScopeSnapshotStressTest.*`, `ReferentialStressTest.*`): two real
+  RCU readers against a writer running at least 2,500 transactions and 300 ms;
+  0 torn policies, 0 scope going backwards, 0 misses, 0 dangling references.
+  The last run read about 1.1 M session policies over 286 K epochs (scope 3
+  erased and recreated every 100), 2.1 M group resolutions over 429 K
+  versions, and 1.9 M referential reads over 277 K epochs.
+- *Failure injection* (`ScopeSnapshotFailureTest.*`): an error or an exception
+  at each of four reservation positions leaves the very same old version
+  objects visible, with no publication step run and the generation unchanged,
+  and the identical transaction then applies; a version naming a missing hop is
+  refused with the old scope intact; a hop a live version names cannot be
+  erased, and an erased hop stays readable to a reader holding the old version.
+- *Refusal* (`ScopeSnapshotRefusalTest.*`, `ConsistencyRpcTest.*`): a scope
+  request naming a plain resource, first, last or alone, is `kUnsupported`
+  with the reason, and neither resource changes; the same operations apply
+  as referential; over gRPC the refusal is `UNIMPLEMENTED` /
+  `UNSUPPORTED_TRANSACTION` / `consistency` / the resource, unrecorded, and
+  the corrected request succeeds under the same `request_id`; an unknown level
+  is `INVALID_ARGUMENT`.
+- *Wire compatibility.* `buf` is not installed here, so the old and new
+  `control_v2.proto` were compiled with `protoc` to descriptors and compared
+  field by field: nothing removed, renumbered or retyped; added: field 4, the
+  nested `Consistency` enum and `VISIBILITY_SCOPE_SNAPSHOT = 3`.
+- *Layering and packaging.* `check_includes.py` self-test 11/11 and clean run;
+  `check_link_graph.py` 46 edges, 6 grandfathered (unchanged);
+  `check_installed_headers.py` on a staged `meson install --tags devel`: 57
+  curated headers present, all compile, private include rejected.
+
+**Not done.**
+
+- No shipped module consumes a scope (decision 7). `ScopeResource` is
+  experimental API with two test applications.
+- No cross-scope atomicity and no mixed referential + snapshot transaction;
+  both are refused or documented, not approximated (decisions 4 and 5).
+- No packet-path code changed: `SlotTable::Lookup` is untouched and `Resource`
+  gained one control-side virtual, so no benchmark was run and the cost of the
+  scope load is not measured; the contract line says so.
+- The schedule enumeration has one reader against one writer. Several readers
+  are covered only by the threaded tests, which are probabilistic. No
+  ThreadSanitizer run (the build has no sanitizer option; M22).
+- `buf lint`/`buf breaking` themselves were not run (the descriptor comparison
+  above stands in). `pybess.apply_transaction` gained a `consistency`
+  argument; no live-daemon Python test was added or run (bessd starts through
+  `sudo` in `run_module_tests.py`).
+- A `ScopeId` carried across a task boundary (a handoff, a completion) is not
+  generation-checked: `SlotTable` has no generations and no such consumer
+  exists. `GenerationHandle<ScopeId>` (D-049) is the tool when one does.
+
+**Revisit when:** a shipped module or plugin (the OMEC UPF plugin, a policy-group
+firewall) reads a scope on its packet path -- then size its `Version`, add its
+codec and a live test, and benchmark the load; a client needs the referents and
+the switch in one call (a prepare-then-switch request); a use needs two scopes
+to switch together; or a worker must hold a scope across task invocations.

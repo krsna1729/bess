@@ -4,7 +4,7 @@
 
 Verifies the installed 'bess-dev' C++ headers tree:
 1. Ensures internal headers (runtime internals, control-plane RPC, drivers) are NOT installed.
-2. Ensures curated public headers (module.h, framework/plugin.h, dataplane/scope_cell.h, etc.) ARE installed.
+2. Ensures curated public headers (module.h, framework/plugin.h, dataplane/scope.h, etc.) ARE installed.
 3. Performs a standalone C++ compilation of a plugin against the installed include tree.
 4. Performs a negative compilation test proving that attempts to include internal headers fail.
 
@@ -82,7 +82,8 @@ PUBLIC_REQUIRED = [
     "dataplane/interface_id.h",
     "dataplane/object_table.h",
     "dataplane/resource.h",
-    "dataplane/scope_cell.h",
+    "dataplane/scope.h",
+    "dataplane/slot_resource.h",
     "dataplane/slot_table.h",
     "dataplane/strong_id.h",
     "dataplane/worker_id.h",

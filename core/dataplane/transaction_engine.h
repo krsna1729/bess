@@ -47,10 +47,19 @@ namespace dataplane {
 //      ReclaimRetired() (also run at the start of every Apply) advances it.
 //
 // Transactions are strictly serializable: one at a time, in arrival order
-// (the engine is the single writer of every registered resource). By
-// default packets may see the operations of a successful transaction take
-// effect one by one, in the order above; all-at-once visibility per scope
-// (the scope cell of section 14.5) is a later increment.
+// (the engine is the single writer of every registered resource).
+//
+// Visibility to packets is requested per transaction (Consistency, M8, D-050)
+// and is never silently downgraded:
+//
+//   kReferential (default): packets may see the operations of a successful
+//     transaction take effect one by one, in the order above, and nothing of
+//     a failed one. A packet that can name a key finds it.
+//   kScopeSnapshot: only for transactions whose every operation is on a
+//     resource that provides it (Resource::ProvidedConsistency, ScopeResource).
+//     Each scope switches from its whole old version to its whole new one in
+//     a single store. Any other operation makes the engine answer
+//     Outcome::kUnsupported before reserving anything.
 namespace internal {
 // Test-only: called with true as the publication phase starts and false as it
 // ends (a test counts allocations in between; none are allowed). Null in
@@ -77,6 +86,9 @@ class TransactionEngine {
     kConflict,  // expected_generation did not match; nothing was attempted
     kBusy,      // reclamation is behind (readers slow to quiesce); nothing
                 // was attempted -- retry later
+    kUnsupported,  // the requested consistency cannot be provided by an
+                   // operation's resource (ops say which); nothing was
+                   // attempted and the request will not succeed as it stands
   };
 
   struct Result {
@@ -142,8 +154,12 @@ class TransactionEngine {
   std::expected<void, std::string> ReleaseForTeardown(
       std::span<const std::string> names);
 
+  // `consistency` is a request, not a hint: if any operation's resource
+  // cannot provide it the answer is Outcome::kUnsupported (the failed
+  // operation carries the reason), never a weaker transaction.
   Result Apply(std::span<const Op> ops,
-               std::optional<uint64_t> expected_generation = std::nullopt);
+               std::optional<uint64_t> expected_generation = std::nullopt,
+               Consistency consistency = Consistency::kReferential);
 
   // Advances every removal cascade whose grace period has completed, and
   // returns how many cascades are still pending. Control thread only.

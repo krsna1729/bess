@@ -29,7 +29,10 @@ FORBIDDEN_RULES = [
             ("module.h", "packet substrate must not depend on Module"),
         ],
     ),
-    # Dataplane core substrate must not depend on framework, runtime, or control
+    # Dataplane core substrate must not depend on framework, runtime, or control,
+    # nor on the batteries built on top of it (meter, route, classifier, stats):
+    # the edge is batteries -> substrate, never back (M8, D-050). Tests and
+    # benchmarks are exempt.
     (
         re.compile(r"^core/dataplane/"),
         [
@@ -40,6 +43,10 @@ FORBIDDEN_RULES = [
             ("google/protobuf/", "dataplane core must not depend on protobuf"),
             ("grpc", "dataplane core must not depend on gRPC"),
             ("module.h", "dataplane core must not depend on Module"),
+            ("meter/", "dataplane core must not depend on the meter battery"),
+            ("route/", "dataplane core must not depend on the route library"),
+            ("classifier/", "dataplane core must not depend on the classifier battery"),
+            ("stats/", "dataplane core must not depend on the stats battery"),
         ],
     ),
     # Reusable classifier battery must not depend on runtime, control, or Module
@@ -146,6 +153,10 @@ def run_self_test():
         ("core/modules/foo.cc", '#include "runtime/runtime_state.h"'),
         ("core/dataplane/baz.h", '#include <google/protobuf/any.h>'),
         ("core/route/router.h", '#include "gate.h"'),
+        ("core/dataplane/scope.h", '#include "meter/meter.h"'),
+        ("core/dataplane/scope.h", '#include "route/next_hop_id.h"'),
+        ("core/dataplane/slot_table.h", '#include "classifier/classifier.h"'),
+        ("core/dataplane/batch_stages.h", '#include "stats/worker_slots.h"'),
     ]
 
     include_pattern = re.compile(r'^\s*#\s*include\s+["<]([^">]+)[">]')
@@ -159,10 +170,12 @@ def run_self_test():
                     if forbidden_sub in inc:
                         dummy_violations.append((fake_path, inc, reason))
                         break
-    assert len(dummy_violations) == 7, (
-        f"Expected 7 synthetic violations, got {len(dummy_violations)}"
+    expected = 11
+    assert len(synthetic_cases) == expected and len(dummy_violations) == expected, (
+        f"Expected {expected} synthetic violations, got {len(dummy_violations)} "
+        f"of {len(synthetic_cases)} cases"
     )
-    print("Self-test PASSED: all 7 synthetic violations correctly detected.")
+    print(f"Self-test PASSED: all {expected} synthetic violations correctly detected.")
 
 
 def main():

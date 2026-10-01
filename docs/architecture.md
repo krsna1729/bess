@@ -10,7 +10,7 @@ Appliance authors are free to build radically different programming models—VFP
 - How worker-local and shared state is published and reclaimed via QSBR RCU (`bess::rcu::RcuDomain`, `RcuPtr`).
 - How stable identifiers map to immutable objects (`StrongId`, `ObjectTable`, `SlotTable`).
 - How multi-resource modifications preserve referential correctness (`TransactionEngine`, `VISIBILITY_DEPENDENCY_ORDERED`).
-- How single-instruction session switches occur without torn reads (`ScopeCell`, `VISIBILITY_ATOMIC`).
+- How a scope's whole policy switches without a torn read (`ScopeResource`, consistency `CONSISTENCY_SCOPE_SNAPSHOT`), and how that differs from referential visibility.
 - How generic classifiers, meters, routing structures, and counters are implemented with near-assembly speed.
 - How physical/virtual devices and workers are placed and scheduled.
 
@@ -36,7 +36,7 @@ BESS is organized as a strict directed acyclic graph (DAG) enforced at build tim
                   bess_rcu (Quiescent-state RCU substrate)
                       ^
                       |
-             bess_dataplane_core (StrongId, SlotTable, ObjectTable, Transactions, ScopeCell)
+             bess_dataplane_core (StrongId, SlotTable, ObjectTable, Transactions, ScopeTable/ScopeResource)
                       ^
       +---------------+---------------+---------------+
       |               |               |               |
@@ -60,10 +60,10 @@ bess_classifier   bess_meter     bess_stats      bess_route
 
 ## 2. Forbidden Dependency Edges (Build-Enforced)
 
-Two checkers enforce this in CI. `tools/check_includes.py` rejects forbidden `#include` edges (rules 1-3, plus: `core/modules/**` must not include `runtime/**`, and `core/dataplane/**` must not include protobuf or gRPC). `tools/check_link_graph.py` reads the built static archives, resolves undefined symbols between BESS libraries, and compares the result with the allowlisted DAG in `tools/layer_dag.json`; it catches dependencies that enter through link configuration. Rules 4 and 5 are review rules today. A grandfathered violation must be listed in `layer_dag.json` with an owner and a removal phase, and the checker warns when one is no longer needed. The measured graph is committed at `docs/baselines/dependency-graph.json`.
+Two checkers enforce this in CI. `tools/check_includes.py` rejects forbidden `#include` edges (rules 1-3, plus: `core/modules/**` must not include `runtime/**`, and `core/dataplane/**` must not include protobuf, gRPC, or the batteries built on it: `meter/`, `route/`, `classifier/`, `stats/`; tests and benchmarks are exempt). `tools/check_link_graph.py` reads the built static archives, resolves undefined symbols between BESS libraries, and compares the result with the allowlisted DAG in `tools/layer_dag.json`; it catches dependencies that enter through link configuration. Rules 4 and 5 are review rules today. A grandfathered violation must be listed in `layer_dag.json` with an owner and a removal phase, and the checker warns when one is no longer needed. The measured graph is committed at `docs/baselines/dependency-graph.json`.
 
 1. `packet/**` may only depend on `utils/**` and low-level DPDK mbuf primitives. It must **never** include `framework/**`, `runtime/**`, `control/**`, `pb/**`, or `module.h`.
-2. `dataplane/**` (core substrate) may depend on `rcu/**` and minimal `utils/**`. It must **never** include `framework/**`, `runtime/**`, `control/**`, or `pb/**`.
+2. `dataplane/**` (core substrate) may depend on `rcu/**` and minimal `utils/**`. It must **never** include `framework/**`, `runtime/**`, `control/**`, `pb/**`, or the batteries above it (`meter/**`, `route/**`, `classifier/**`, `stats/**`).
 3. Reusable libraries (`classifier/**`, `meter/**`, `stats/**`, `route/route_table.*`) are standalone C++ libraries. They must **never** include `module.h`, `runtime/**`, or `control/**`.
 4. `framework/**` defines execution contracts (Module, Gate, Task). It does not depend on concrete modules, drivers, or control-plane RPC orchestration.
 5. Modules (`modules/**`) and drivers (`drivers/**`) are thin graph adapters. A module must **never** include another concrete module's internal header.
@@ -72,15 +72,23 @@ Two checkers enforce this in CI. `tools/check_includes.py` rejects forbidden `#i
 
 ## 3. Transaction and Concurrency Semantics
 
-Visibility is requested per transaction (Decision D-021). Today the control path provides one level:
+A transaction asks for one of two consistency levels (`ApplyTransactionRequest.consistency`; `dataplane::Consistency` in C++; Decisions D-021, D-050). They are different promises, named apart, and a request for a level that its resources cannot provide is refused, never served as the other one.
 
-1. **`VISIBILITY_DEPENDENCY_ORDERED`** (provided; the only level the transaction RPC reports):
-   - Operations take effect in dependency order (referents before referrers).
-   - A rule referencing an action or next-hop cannot see a missing target.
-   - Deletions cascade in reverse dependency order, with physical destruction deferred until all readers clear a QSBR grace period.
+1. **Referential** (`CONSISTENCY_REFERENTIAL`, the default; reported as `VISIBILITY_DEPENDENCY_ORDERED`). Any resource can take part.
+   - Operations take effect one by one, in dependency order (referents before referrers): upserts by ascending rank, erases by descending rank.
+   - A packet that can name a key finds it: a rule referencing an action or next hop never sees a missing target. A reader that reaches a new referrer and follows its reference finds the new referent or a newer one.
+   - Deletions leave readable until a removal cascade has waited a grace period per rank, so a reader holding the old referrer still finds its referent.
+   - A failure before publication is invisible. Nothing of a transaction is visible before its first publication step.
+   - **Mixed generations are allowed**: while a multi-resource transaction publishes, a packet may see some of it applied and the rest not yet (a new referent under an old referrer, or the old classification beside the new actions). Use this level when every intermediate state is acceptable.
    - Zero worker pause during active transactions.
-2. **`VISIBILITY_ATOMIC`** (not provided yet):
-   - `dataplane::ScopeCell` is the primitive: one 64-bit atomic word that switches a scope's whole policy at once. It is not wired into the transaction engine or the RPC, and `ApplyTransactionRequest` cannot request a visibility level. Wiring it, and refusing rather than downgrading an unsupported request, is milestone M8.
+2. **Scope snapshot** (`CONSISTENCY_SCOPE_SNAPSHOT`; reported as `VISIBILITY_SCOPE_SNAPSHOT`). Only resources that are scope tables (`dataplane::ScopeResource`) can take part.
+   - A *scope* is whatever a packet can name independently of the rules being replaced (a session, a policy group, a tenant); the application defines it. Its policy is one immutable `Version` value.
+   - A transaction replaces each scope it touches from its complete old version to its complete new one by one pointer store. A packet operation binds the scope once (`ScopeTable::Lookup`, one acquire load per scope, not per table operation) and then sees one version in full, however many lookups it makes through it.
+   - **No order between scopes**: two scopes in one transaction switch one after the other. The promise is per scope. Mutable state (meter tokens, counters) is not copied into a version; the version names it (a meter id) and the engine keeps it alive while any version names it.
+   - Create new objects a version will name in a *referential* transaction first (nothing can name them yet), then switch the scope in a scope-snapshot transaction. A scope-snapshot request that includes any other resource (so it would become visible operation by operation) is refused with `Outcome::kUnsupported` in C++ and, over gRPC, `UNIMPLEMENTED` with error detail `UNSUPPORTED_TRANSACTION` (field `consistency`, object the resource, the reason in the message). Nothing is applied, nothing is recorded under the `request_id`, and a level the daemon does not know is `INVALID_ARGUMENT`.
+   - A scope-snapshot transaction that cannot be fully prepared (a failed reservation, an exception, a missing referent) leaves every old scope visible.
+   - Erasing a scope leaves its last version readable until the removal cascade, then `Lookup` returns null; a packet operation must handle a missing scope.
+   - `VISIBILITY_ATOMIC` in the wire enum is deprecated and never sent. It promised "all at once", which nothing provides.
 
 ---
 
