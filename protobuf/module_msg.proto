@@ -1406,3 +1406,29 @@ message VifCommandDeleteArg {
 
 message VifCommandClearArg {
 }
+
+/**
+ * The Bridge module is an L2 learning bridge. It dynamically learns MAC
+ * addresses from incoming packets, maps them to arrival gates with an aging
+ * timer, and forwards packets toward known destinations while flooding
+ * unknown unicast and broadcast packets to all other active gates.
+ *
+ * __Input Gates__: many
+ * __Output Gates__: many
+ */
+message BridgeArg {
+  uint32 size = 1;        /// Maximum dynamic MAC entries (default: 1024)
+  uint32 aging_time = 2;  /// Aging timeout in seconds (default: 300)
+}
+
+message BridgeCommandAddArg {
+  string mac_addr = 1;    /// Static MAC address
+  uint32 gate = 2;        /// Output gate
+}
+
+message BridgeCommandDeleteArg {
+  string mac_addr = 1;    /// MAC address to delete
+}
+
+message BridgeCommandClearArg {
+}

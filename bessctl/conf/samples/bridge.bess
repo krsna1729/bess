@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# L2 Learning Bridge example (N1).
+# Demonstrates an Ethernet learning bridge connecting multiple network segments:
+# - Segment 0 connected to Port/Gate 0
+# - Segment 1 connected to Port/Gate 1
+# - Bridge learns MAC addresses dynamically on ingress and switches frames between segments.
+
+import scapy.all as scapy
+
+def gen_pkt(smac, dmac, sip, dip):
+    eth = scapy.Ether(src=smac, dst=dmac)
+    ip = scapy.IP(src=sip, dst=dip)
+    udp = scapy.UDP(sport=10001, dport=10002)
+    payload = 'BRIDGE_DATA_PAYLOAD'
+    return bytes(eth/ip/udp/payload)
+
+pkts_segment0 = [
+    # Host 1 on Segment 0 sending to Host 2 on Segment 1
+    gen_pkt('02:00:00:00:00:01', '02:00:00:00:00:02', '10.0.0.1', '10.0.0.2'),
+]
+
+pkts_segment1 = [
+    # Host 2 on Segment 1 sending to Host 1 on Segment 0
+    gen_pkt('02:00:00:00:00:02', '02:00:00:00:00:01', '10.0.0.2', '10.0.0.1'),
+]
+
+br::Bridge(size=1024, aging_time=300)
+
+# Ingress pipelines from Segment 0 and Segment 1
+Source() -> Rewrite(templates=pkts_segment0) -> 0:br
+Source() -> Rewrite(templates=pkts_segment1) -> 1:br
+
+# Egress sinks for Segment 0 and Segment 1
+br:0 -> Sink()  # Gate 0: Egress to Segment 0
+br:1 -> Sink()  # Gate 1: Egress to Segment 1
