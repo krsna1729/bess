@@ -33,7 +33,7 @@ This contract defines the performance, memory, and concurrency invariants for al
    - **Session Action**: `ScopeCell` packs `{meter_id, next_hop_id}` into a single 64-bit word ($8\,\text{bytes}$), reading both continuation fields in a single memory access.
 
 2. **Scale Bounds**:
-   - Strong identifiers (`StrongId`) must be strictly 32-bit scalar wrappers (`sizeof(Id) == 4`), trivially copyable and register-passable.
+   - Strong identifiers (`StrongId`) are scalar wrappers: trivially copyable, register-passable, the size of their representation, and compiled to the same code as the raw integer (checked for `InterfaceId`, D-049). An identifier that can appear in packet metadata or a hardware mark is 32 bits (`ActionId`, `NextHopId`, `InterfaceId`, `RouteDomainId`). `WorkerId` is 16 bits because it never leaves the process. `GenerationHandle<Id>` is an id plus a 32-bit generation: 8 bytes, one 64-bit compare.
    - Bounded packet buffers (`PacketStore`) must enforce strict global and per-flow capacity caps to prevent unconstrained memory ballooning under network congestion or paging delays.
 
 ---

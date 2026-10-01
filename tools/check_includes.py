@@ -69,13 +69,16 @@ FORBIDDEN_RULES = [
             ("control/", "stats battery must not depend on control"),
         ],
     ),
-    # Standalone route table must not depend on Module, runtime, or control
+    # The route library (table and Router) is graph-independent: no Module, gate,
+    # runtime, control or protobuf (M7, D-049). Tests and benchmarks are exempt.
     (
-        re.compile(r"^core/route/route_table\."),
+        re.compile(r"^core/route/"),
         [
-            ("module.h", "route table must not depend on Module"),
-            ("runtime/", "route table must not depend on runtime"),
-            ("control/", "route table must not depend on control"),
+            ("module.h", "route library must not depend on Module"),
+            ("gate.h", "route library must not depend on gates; use InterfaceId"),
+            ("runtime/", "route library must not depend on runtime"),
+            ("control/", "route library must not depend on control"),
+            ("pb/", "route library must not depend on protobuf"),
         ],
     ),
     # Modules obtain runtime facilities through Module::init_context() (D-042),
@@ -142,6 +145,7 @@ def run_self_test():
         ("core/meter/meter.cc", '#include "control/api_v2.h"'),
         ("core/modules/foo.cc", '#include "runtime/runtime_state.h"'),
         ("core/dataplane/baz.h", '#include <google/protobuf/any.h>'),
+        ("core/route/router.h", '#include "gate.h"'),
     ]
 
     include_pattern = re.compile(r'^\s*#\s*include\s+["<]([^">]+)[">]')
@@ -155,10 +159,10 @@ def run_self_test():
                     if forbidden_sub in inc:
                         dummy_violations.append((fake_path, inc, reason))
                         break
-    assert len(dummy_violations) == 6, (
-        f"Expected 6 synthetic violations, got {len(dummy_violations)}"
+    assert len(dummy_violations) == 7, (
+        f"Expected 7 synthetic violations, got {len(dummy_violations)}"
     )
-    print("Self-test PASSED: all 6 synthetic violations correctly detected.")
+    print("Self-test PASSED: all 7 synthetic violations correctly detected.")
 
 
 def main():

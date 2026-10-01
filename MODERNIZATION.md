@@ -4438,6 +4438,26 @@ rather than one call site).
        trim, slimmer widely-included headers.
      - **Evidence:** fast tree 98/98 tests after the change.
 
+129. **M7: logical network identities (D-049).**
+     - **What:** `dataplane::InterfaceId` replaces `gate_idx_t` in
+       `route::NextHop`; the Router module maps interface `n` to gate `n - 1`
+       and anything else to a drop; the wire still carries `egress_gate`.
+       `route/router.cc` moved into `bess_route`, which removed the
+       `framework` -> `route` link edge and its exception. `GenerationHandle`
+       added for ids that outlive an RCU read. The include checker now covers
+       all of `core/route/` and forbids `gate.h` there.
+     - **Checked:** `InterfaceId` compiles to the same instructions as a raw
+       `uint32_t`; `GenerationHandle` equality is one `cmpq` (the first version
+       branched, which is why it compares as a word).
+     - **Not done:** no Router-module benchmark, so the per-packet mapping cost
+       is not timed; the other ids wait for their milestones.
+     - **Evidence:** fast tree (GCC 16, `-O1`) 99/99 tests including the new
+       `identity_test`, the route, route-domain, transaction and session
+       pipeline tests on the new type, and the live Python suite; both route
+       benchmarks build and run in the debugoptimized tree; link-graph checker
+       46 edges, 6 grandfathered; include checker 7-case self-test. Clang and
+       GCC 14 run in CI.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

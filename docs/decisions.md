@@ -69,6 +69,7 @@ file is the reasoning.
 | D-046 | Route domains consolidated into the one Router (M6) | accepted |
 | D-047 | Phase A closure: link-graph checker, plugin descriptor range, conformance plugins | accepted |
 | D-048 | Fast build profile: normal test linking, mold, ccache, quiet EAL | accepted |
+| D-049 | Logical network identities: InterfaceId replaces the gate in the route library (M7) | accepted |
 
 
 ---
@@ -3527,3 +3528,64 @@ the benchmark targets not built in this profile.
 
 **Revisit when:** the test count or binary sizes grow enough to break the
 one-minute loop, or a precompiled-header experiment shows a measured gain.
+
+---
+
+## D-049 Logical network identities: InterfaceId replaces the gate in the route library (M7)
+
+**Status:** accepted (2026-10-02).
+**Code:** `core/dataplane/interface_id.h`, `core/dataplane/generation_handle.h`,
+`core/dataplane/identity_test.cc`, `core/route/router.{h,cc}`,
+`core/modules/router.cc`, `core/meson.build`, `tools/check_includes.py`,
+`tools/layer_dag.json`, `docs/performance-contract.md`.
+
+**Context.** `route::NextHop::egress` was a `gate_idx_t`, so the reusable
+routing library included `gate.h`, and `route/router.cc` was compiled into
+`bess_framework` (the one remaining `framework` -> `route` link edge). D-046
+deliberately left that to M7.
+
+**Decision.**
+
+- `dataplane::InterfaceId` (`StrongId<_, uint32_t>`, zero = no interface)
+  names a logical forwarding endpoint. `NextHop::egress` is an `InterfaceId`
+  defaulting to none. `route/` no longer includes `gate.h`; `router.cc` moved
+  from `bess_framework` to `bess_route`, and the grandfathered link exception
+  was deleted (the link checker reports 46 edges, 6 grandfathered).
+- The graph adapter, `modules/router.cc`, owns the mapping: interface `n`
+  leaves on gate `n - 1`; interface 0, or one beyond the gate space, drops.
+  The wire is unchanged: `egress_gate` keeps meaning a gate, and the codec
+  converts (`DROP_GATE` is no interface). One subtraction and one compare
+  per packet; no table.
+- `dataplane::GenerationHandle<Id>` (`{Id id; uint32_t generation;}`, 8 bytes,
+  one 64-bit compare) is added for ids that outlive an RCU read: queued
+  continuations, punts, hardware completions. No consumer exists yet; it is a
+  roadmap M7 deliverable and its contract is in `docs/architecture.md`
+  section 7. It compares as one word because the defaulted member-wise `==`
+  compiled to a branch plus two compares.
+- `tools/check_includes.py` now applies to all of `core/route/` (not only the
+  table): no `module.h`, `gate.h`, runtime, control or protobuf includes.
+- Only ids with a consumer were introduced. `FlowId`, `ContinuationId`,
+  `BridgeDomainId`, `NeighborId` and `NextHopGroupId` arrive with M9, M11, M14
+  and M15.
+- `docs/performance-contract.md` required every `StrongId` to be 32 bits, but
+  `WorkerId` is 16; it now states the rule for ids that reach packets or
+  hardware and names the exceptions.
+
+**Evidence.**
+
+- Assembly (GCC 16, `-O2`, `.scratch/asm`): the interface-to-gate mapping on
+  `InterfaceId` and on a raw `uint32_t` compile to the same five instructions
+  (`lea`, `mov`, `cmp`, `cmova`, `ret`); `InterfaceId` equality differs from the
+  raw compare only in operand order; the validity test is identical;
+  `GenerationHandle` equality is a single `cmpq`, as a raw 64-bit compare.
+- Tests: `identity_test` (distinct id types do not compare or convert, zero is
+  invalid, a handle with the same id and a later generation is unequal, hashes
+  separate generations) and the existing route, route-domain, transaction and
+  session-pipeline tests on the new type.
+
+**Not measured.** There is no Router-module microbenchmark, so the added
+per-packet subtraction and compare were not timed; `route_bench` exercises the
+library, which no longer touches the egress.
+
+**Revisit when:** a second adapter (a fused appliance, hardware) needs a mapping
+that is not a constant offset, which would call for a table the owner supplies.

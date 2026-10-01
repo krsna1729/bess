@@ -19,14 +19,14 @@
 #include <glog/logging.h>
 
 #include "dataplane/batch_stages.h"
+#include "dataplane/interface_id.h"
 #include "dataplane/resource.h"
 #include "dataplane/slot_table.h"
-#include "gate.h"
 #include "packet.h"
 #include "packet_mutation.h"
+#include "route/next_hop_id.h"
 #include "route/route_domain.h"
 #include "route/route_table.h"
-#include "route/next_hop_id.h"
 #include "utils/ether.h"
 
 namespace bess::dataplane {
@@ -42,16 +42,15 @@ enum class NeighborState : uint8_t {
   kUnreachable,  // resolution failed
 };
 
-// Where a route leads (K7): the egress (a BESS output gate -- in a module
-// graph, the path to the egress port), the neighbor state, and the L2
-// addresses to write when the neighbor is resolved. What to do with packets
+// Where a route leads (K7): the egress interface, the neighbor state, and the
+// L2 addresses to write when the neighbor is resolved. What to do with packets
 // toward an unresolved neighbor (queue, punt, drop) is the application's.
 //
-// `egress` is still a `gate_idx_t`: replacing it with a graph-independent
-// interface identity is M7's identity work (D-046 records why it was not done
-// here).
+// `egress` is a logical interface (`dataplane::InterfaceId`, zero = none), not
+// a graph gate: the owner maps it to a gate, a port and queue, or a hardware
+// action (M7, D-049). This library knows nothing of any of them.
 struct NextHop {
-  gate_idx_t egress = DROP_GATE;
+  dataplane::InterfaceId egress = dataplane::kInvalidInterfaceId;
   NeighborState neighbor = NeighborState::kIncomplete;
   utils::Ethernet::Address dst_mac{};
   utils::Ethernet::Address src_mac{};

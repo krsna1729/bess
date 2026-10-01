@@ -35,9 +35,6 @@
     {"from": "bess_framework", "to": "bess_runtime",
      "reason": "module.cc, module_graph.cc, worker.cc and the init context read the runtime registries; target direction is runtime -> framework",
      "owner": "M1 follow-up: split bess_execution out of bess_framework", "remove_by": "Phase B"},
-    {"from": "bess_framework", "to": "bess_route",
-     "reason": "route/router.cc is compiled into bess_framework because Router carries gate_idx_t",
-     "owner": "M7 (logical network identities)", "remove_by": "M7"},
     {"from": "bess_control", "to": "bess_host",
      "reason": "ControlPlane loads and unloads plugins through bessd.cc",
      "owner": "M3 follow-up: plugin loading behind a runtime interface", "remove_by": "Phase B"}

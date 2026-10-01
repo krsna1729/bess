@@ -78,6 +78,8 @@ PUBLIC_REQUIRED = [
     "dataplane/action_id.h",
     "dataplane/batch_stages.h",
     "dataplane/batch_tuning.h",
+    "dataplane/generation_handle.h",
+    "dataplane/interface_id.h",
     "dataplane/object_table.h",
     "dataplane/resource.h",
     "dataplane/scope_cell.h",

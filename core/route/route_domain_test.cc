@@ -30,9 +30,9 @@ constexpr uint32_t Ip(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
   return a << 24 | b << 16 | c << 8 | d;
 }
 
-NextHop Hop(gate_idx_t egress) {
+NextHop Hop(uint32_t egress) {
   NextHop hop;
-  hop.egress = egress;
+  hop.egress = bess::dataplane::InterfaceId(egress);
   hop.neighbor = NeighborState::kResolved;
   return hop;
 }
@@ -61,7 +61,7 @@ std::unique_ptr<Router> MakeRouter(size_t domains, size_t next_hops = 64,
 
 int EgressOf(const Router &router, RouteDomainId domain, uint32_t dst) {
   const NextHop *hop = router.Resolve(domain, dst);
-  return hop == nullptr ? -1 : static_cast<int>(hop->egress);
+  return hop == nullptr ? -1 : static_cast<int>(hop->egress.value());
 }
 
 TEST(RouteDomainTest, DefaultDomainExistsAndNothingElseDoes) {
@@ -144,7 +144,7 @@ TEST(RouteDomainTest, OverlappingPrefixesResolveIndependently) {
   EXPECT_EQ(-1, EgressOf(*router, d1, Ip(11, 0, 0, 1)));
 
   // The single-domain overloads are the default domain's.
-  EXPECT_EQ(11, router->Resolve(Ip(10, 1, 2, 3))->egress);
+  EXPECT_EQ(bess::dataplane::InterfaceId(11), router->Resolve(Ip(10, 1, 2, 3))->egress);
   EXPECT_EQ(router->Resolve(d0, Ip(10, 1, 2, 3)), router->Resolve(Ip(10, 1, 2, 3)));
 
   // A batch is within one domain; other domains' answers do not leak in.
@@ -152,13 +152,13 @@ TEST(RouteDomainTest, OverlappingPrefixesResolveIndependently) {
                                        Ip(10, 2, 0, 1), Ip(10, 1, 9, 9)};
   std::array<const NextHop *, 4> hops{};
   EXPECT_EQ(0b1101u, router->ResolveBatch(d2, dst, hops));
-  EXPECT_EQ(11, hops[0]->egress);
-  EXPECT_EQ(33, hops[2]->egress);
-  EXPECT_EQ(11, hops[3]->egress);
+  EXPECT_EQ(bess::dataplane::InterfaceId(11), hops[0]->egress);
+  EXPECT_EQ(bess::dataplane::InterfaceId(33), hops[2]->egress);
+  EXPECT_EQ(bess::dataplane::InterfaceId(11), hops[3]->egress);
   hops = {};
   EXPECT_EQ(0b1101u, router->ResolveBatch(d1, dst, hops));
-  EXPECT_EQ(22, hops[0]->egress);
-  EXPECT_EQ(22, hops[2]->egress);
+  EXPECT_EQ(bess::dataplane::InterfaceId(22), hops[0]->egress);
+  EXPECT_EQ(bess::dataplane::InterfaceId(22), hops[2]->egress);
 
   // Removing a route in one domain leaves the same prefix in the others.
   ASSERT_TRUE(router->RemoveRoute(d1, P(Ip(10, 0, 0, 0), 8)));
@@ -181,7 +181,7 @@ TEST(RouteDomainTest, DefaultRoutePerDomain) {
   auto router = MakeRouter(3);
   const RouteDomainId d0 = kDefaultRouteDomainId, d1(1), d2(2);
   for (uint32_t i = 1; i <= 3; i++) {
-    ASSERT_TRUE(router->SetNextHop(NextHopId(i), Hop(static_cast<gate_idx_t>(i))));
+    ASSERT_TRUE(router->SetNextHop(NextHopId(i), Hop(static_cast<uint32_t>(i))));
   }
   ASSERT_TRUE(router->SetRoute(d0, P(0, 0), NextHopId(1)));
   ASSERT_TRUE(router->SetRoute(d1, P(0, 0), NextHopId(2)));
@@ -483,7 +483,7 @@ TEST(RouteDomainTest, ConcurrentReadersWhileDomainsAreCreatedAndUpdated) {
   ASSERT_TRUE(router.has_value());
   for (uint32_t d = 0; d < kDomains; d++) {
     ASSERT_TRUE((*router)->SetNextHop(NextHopId(d + 1),
-                                      Hop(static_cast<gate_idx_t>(d + 1))));
+                                      Hop(static_cast<uint32_t>(d + 1))));
   }
 
   constexpr int kReaders = 2;
@@ -504,7 +504,7 @@ TEST(RouteDomainTest, ConcurrentReadersWhileDomainsAreCreatedAndUpdated) {
             if (d >= kDomains) {
               continue;
             }
-          } else if (d < kDomains && hop->egress == d + 1) {
+          } else if (d < kDomains && hop->egress.value() == d + 1) {
             hits++;
           } else {
             wrong++;
@@ -515,7 +515,7 @@ TEST(RouteDomainTest, ConcurrentReadersWhileDomainsAreCreatedAndUpdated) {
           const uint64_t mask = (*router)->ResolveBatch(domain, dst, hops);
           for (uint64_t m = mask; m != 0; m &= m - 1) {
             const int i = __builtin_ctzll(m);
-            if (d >= kDomains || hops[i]->egress != d + 1) {
+            if (d >= kDomains || hops[i]->egress.value() != d + 1) {
               wrong++;
             }
           }

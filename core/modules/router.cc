@@ -59,6 +59,23 @@ std::expected<bess::utils::Ethernet::Address, std::string> MacFromPb(
       reinterpret_cast<const uint8_t *>(bytes.data()));
 }
 
+// The adapter's whole interface <-> gate mapping (D-049): interface n leaves on
+// gate n - 1, and the invalid interface (0), or one beyond the gate space,
+// drops. The unsigned subtraction folds both bounds into one compare. The
+// route library holds interfaces only; nothing outside this module knows gates.
+inline gate_idx_t GateOf(dataplane::InterfaceId egress) {
+  const uint32_t gate = egress.value() - 1;
+  return gate < MAX_GATES ? static_cast<gate_idx_t>(gate) : DROP_GATE;
+}
+
+// The wire still names a gate (`egress_gate`); DROP_GATE means no interface.
+// `gate` has passed IsValidGateValue().
+inline dataplane::InterfaceId InterfaceOf(uint64_t gate) {
+  return gate == DROP_GATE
+             ? dataplane::kInvalidInterfaceId
+             : dataplane::InterfaceId(static_cast<uint32_t>(gate) + 1);
+}
+
 }  // namespace
 
 CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
@@ -135,7 +152,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
               return std::unexpected(src.error());
             }
             route::NextHop hop;
-            hop.egress = static_cast<gate_idx_t>(value.egress_gate());
+            hop.egress = InterfaceOf(value.egress_gate());
             auto neighbor = NeighborFromPb(value.neighbor());
             if (!neighbor) {
               return std::unexpected(neighbor.error());
@@ -251,7 +268,7 @@ void Router::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
         (resolved & (uint64_t{1} << i)) != 0 ? hops[i] : nullptr;
     const gate_idx_t gate =
         hop != nullptr && hop->neighbor == route::NeighborState::kResolved
-            ? hop->egress
+            ? GateOf(hop->egress)
             : DROP_GATE;
     EmitPacket(ctx, batch->packet(i), gate);
   }

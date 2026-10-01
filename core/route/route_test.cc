@@ -417,10 +417,10 @@ TEST(RouteTableTest, ConcurrentReadersOnlySeeJustifiedAnswers) {
 
 // -- Router -----------------------------------------------------------------------
 
-NextHop Hop(gate_idx_t egress, uint8_t mac_tail,
+NextHop Hop(uint32_t egress, uint8_t mac_tail,
             NeighborState state = NeighborState::kResolved) {
   NextHop hop;
-  hop.egress = egress;
+  hop.egress = bess::dataplane::InterfaceId(egress);
   hop.neighbor = state;
   hop.dst_mac.bytes[5] = mac_tail;
   hop.src_mac.bytes[5] = 0xee;
@@ -460,7 +460,7 @@ TEST(RouterTest, RoutesNeedNextHopsAndPinThem) {
 
   const NextHop *hop = router->Resolve(Ip(10, 1, 5, 5));
   ASSERT_NE(nullptr, hop);
-  EXPECT_EQ(4, hop->egress);
+  EXPECT_EQ(bess::dataplane::InterfaceId(4), hop->egress);
   EXPECT_EQ(nullptr, router->Resolve(Ip(11, 0, 0, 0)));
 
   ASSERT_TRUE(router->RemoveRoute(P(Ip(10, 0, 0, 0), 8)));
@@ -498,10 +498,10 @@ TEST(RouterTest, ResolveBatch) {
                                        Ip(20, 9, 9, 9)};
   std::array<const NextHop *, 5> hops{};
   EXPECT_EQ(0b11101u, router->ResolveBatch(dst, hops));
-  EXPECT_EQ(1, hops[0]->egress);
+  EXPECT_EQ(bess::dataplane::InterfaceId(1), hops[0]->egress);
   EXPECT_EQ(nullptr, hops[1]);
-  EXPECT_EQ(2, hops[2]->egress);
-  EXPECT_EQ(2, hops[4]->egress);
+  EXPECT_EQ(bess::dataplane::InterfaceId(2), hops[2]->egress);
+  EXPECT_EQ(bess::dataplane::InterfaceId(2), hops[4]->egress);
 }
 
 // Readers resolving continuously while the writer adds next hops, points
@@ -553,7 +553,7 @@ TEST(RouterTest, ConcurrentChurnNeverLosesANextHop) {
     const Ipv4Prefix p = P(Ip(10, x, 0, 0), 16);
     // An id removed 32 rounds ago may still be retiring (readers not yet
     // past its grace period); reuse is refused until then.
-    if (auto set = router->SetNextHop(id, Hop(static_cast<gate_idx_t>(2 + x), 2));
+    if (auto set = router->SetNextHop(id, Hop(static_cast<uint32_t>(2 + x), 2));
         !set) {
       ASSERT_EQ(RouteError::kNextHopRetiring, set.error());
       retiring_refusals++;

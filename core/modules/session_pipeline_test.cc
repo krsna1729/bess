@@ -124,9 +124,9 @@ constexpr uint32_t Ip(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
   return a << 24 | b << 16 | c << 8 | d;
 }
 
-bess::route::NextHop HopWithEgress(gate_idx_t egress) {
+bess::route::NextHop HopWithEgress(uint32_t egress) {
   bess::route::NextHop hop;
-  hop.egress = egress;
+  hop.egress = bess::dataplane::InterfaceId(egress);
   hop.neighbor = bess::route::NeighborState::kResolved;
   return hop;
 }
@@ -277,7 +277,7 @@ TEST_F(SessionPipelineTest, OneTransactionCreatesASession) {
     const uint64_t resolved = rt->router()->LookupNextHops(ids, hops);
     EXPECT_EQ(resolved, 0b01u);
     ASSERT_NE(nullptr, hops[0]);
-    EXPECT_EQ(hops[0]->egress, 7);
+    EXPECT_EQ(hops[0]->egress, bess::dataplane::InterfaceId(7));
     EXPECT_EQ(hops[0]->neighbor, bess::route::NeighborState::kResolved);
   }
 }
@@ -451,7 +451,7 @@ TEST_F(SessionPipelineTest, RemovalCascadeAndIdReuse) {
                 .outcome,
             Outcome::kApplied);
   ASSERT_NE(nullptr, rt->router()->Resolve(Ip(10, 9, 9, 9)));
-  EXPECT_EQ(rt->router()->Resolve(Ip(10, 9, 9, 9))->egress, 9);
+  EXPECT_EQ(rt->router()->Resolve(Ip(10, 9, 9, 9))->egress, bess::dataplane::InterfaceId(9));
 }
 
 // Modules are destroyed in name order (the desired-state planner's), which is

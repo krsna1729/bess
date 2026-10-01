@@ -64,9 +64,9 @@ constexpr uint32_t Ip(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
   return a << 24 | b << 16 | c << 8 | d;
 }
 
-NextHop Hop(gate_idx_t egress) {
+NextHop Hop(uint32_t egress) {
   NextHop hop;
-  hop.egress = egress;
+  hop.egress = bess::dataplane::InterfaceId(egress);
   hop.neighbor = NeighborState::kResolved;
   return hop;
 }
@@ -74,7 +74,7 @@ NextHop Hop(gate_idx_t egress) {
 // The egress `dst` resolves to, or -1 for a miss.
 int EgressOf(const Router &router, uint32_t dst) {
   const NextHop *hop = router.Resolve(dst);
-  return hop == nullptr ? -1 : hop->egress;
+  return hop == nullptr ? -1 : static_cast<int>(hop->egress.value());
 }
 
 class RouterTransactionTest : public ::testing::Test {
@@ -296,7 +296,7 @@ TEST_F(RouterTransactionTest, RoutesInTwoDomainsInOneTransaction) {
             Outcome::kApplied);
   auto egress = [&](RouteDomainId d, uint32_t dst) {
     const NextHop *hop = router->Resolve(d, dst);
-    return hop == nullptr ? -1 : static_cast<int>(hop->egress);
+    return hop == nullptr ? -1 : static_cast<int>(hop->egress.value());
   };
   EXPECT_EQ(egress(d1, Ip(10, 1, 1, 1)), 11);
   EXPECT_EQ(egress(d2, Ip(10, 1, 1, 1)), 12);
@@ -431,7 +431,7 @@ TEST_F(RouterTransactionTest, ResolvesWhileTransactionsRun) {
   auto establish = [&](uint32_t s) {
     return std::vector<Op>{
         router->SetNextHopOp(NextHopId(s + 1),
-                             Hop(static_cast<gate_idx_t>(s % 4000))),
+                             Hop(static_cast<uint32_t>(s % 4000))),
         router->SetRouteOp(prefix(s), NextHopId(s + 1))};
   };
   auto release = [&](uint32_t s) {
@@ -458,7 +458,7 @@ TEST_F(RouterTransactionTest, ResolvesWhileTransactionsRun) {
       const uint64_t mask = router->ResolveBatch(dst, resolved);
       for (uint64_t m = mask; m != 0; m &= m - 1) {
         const int i = __builtin_ctzll(m);
-        if (resolved[i]->egress == session[i] % 4000) {
+        if (resolved[i]->egress.value() == session[i] % 4000) {
           hits++;
         } else {
           wrong++;

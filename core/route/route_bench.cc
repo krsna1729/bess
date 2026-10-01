@@ -220,7 +220,7 @@ std::unique_ptr<Router> RouterFor(size_t n, std::vector<uint32_t> *keys) {
                     .value();
   for (uint32_t id = 1; id <= 1023; id++) {
     NextHop hop;
-    hop.egress = static_cast<bess::gate_idx_t>(id % 8);
+    hop.egress = bess::dataplane::InterfaceId(static_cast<uint32_t>(id % 8));
     hop.neighbor = NeighborState::kResolved;
     (void)router->SetNextHop(NextHopId(id), hop);
   }
@@ -242,7 +242,7 @@ void BM_LookupRouter(benchmark::State &state) {
     const uint64_t mask =
         router->ResolveBatch(std::span(&keys[offset], kBatch), hops);
     for (uint64_t m = mask; m; m &= m - 1) {
-      egress += hops[__builtin_ctzll(m)]->egress;
+      egress += hops[__builtin_ctzll(m)]->egress.value();
     }
     offset = (offset + kBatch) % keys.size();
   }
@@ -430,7 +430,7 @@ void BM_RouterChange(benchmark::State &state) {
   hop.neighbor = NeighborState::kResolved;
   std::vector<Op> setup;
   for (uint32_t id = 1; id <= 64; id++) {
-    hop.egress = static_cast<bess::gate_idx_t>(id);
+    hop.egress = bess::dataplane::InterfaceId(static_cast<uint32_t>(id));
     setup.push_back(router->SetNextHopOp(NextHopId(id), hop));
     if (!enrolled) {
       (void)router->SetNextHop(NextHopId(id), hop);

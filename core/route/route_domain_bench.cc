@@ -73,7 +73,7 @@ Router::Config ConfigFor(size_t routes) {
 void AddNextHops(Router &router, uint32_t n) {
   for (uint32_t id = 1; id <= n; id++) {
     NextHop hop;
-    hop.egress = static_cast<bess::gate_idx_t>(id % 8);
+    hop.egress = bess::dataplane::InterfaceId(static_cast<uint32_t>(id % 8));
     hop.neighbor = NeighborState::kResolved;
     (void)router.SetNextHop(NextHopId(id), hop);
   }
@@ -134,7 +134,7 @@ void BM_DomainSweep(benchmark::State &state) {
     if (id_only) {
       sink += router.LookupRoute(domain, ip).value();
     } else {
-      sink += router.Resolve(domain, ip)->egress;
+      sink += router.Resolve(domain, ip)->egress.value();
     }
     if (++d > domains) {
       d = 1;
@@ -154,7 +154,7 @@ void BM_HotDomain(benchmark::State &state) {
   for (auto _ : state) {
     const NextHop *hop = by_overload ? router.Resolve(ip)
                                      : router.Resolve(RouteDomainId(1), ip);
-    sink += hop->egress;
+    sink += hop->egress.value();
     benchmark::ClobberMemory();
   }
   benchmark::DoNotOptimize(sink);

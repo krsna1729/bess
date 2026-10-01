@@ -28,6 +28,7 @@ stats_sources = files(
 
 route_sources = files(
   'route/route_table.cc',
+  'route/router.cc',
 )
 packet_sources = files(
   'packet.cc',
@@ -76,7 +77,6 @@ framework_sources = files(
   'packet_pool.cc',
   'port.cc',
   'resume_hook.cc',
-  'route/router.cc',
   'shared_obj.cc',
   'stats/worker_histogram.cc',
   'task.cc',
@@ -439,6 +439,8 @@ core_public_subdir_headers = {
     'dataplane/action_id.h',
     'dataplane/batch_stages.h',
     'dataplane/batch_tuning.h',
+    'dataplane/generation_handle.h',
+    'dataplane/interface_id.h',
     'dataplane/object_table.h',
     'dataplane/resource.h',
     'dataplane/scope_cell.h',
@@ -496,6 +498,7 @@ unit_test_sources = [
   'classifier/small_exact_test.cc',
   'classifier/direct_exact_test.cc',
   'dataplane/batch_stages_test.cc',
+  'dataplane/identity_test.cc',
   'dataplane/object_table_test.cc',
   'dataplane/object_table_rcu_test.cc',
   'dataplane/object_table_publication_test.cc',
