@@ -4385,6 +4385,19 @@ rather than one call site).
        `build/perf-release`; I re-ran only that they build and pass, not the
        numbers.
 
+127. **Phase A closure (D-047).**
+     - **What:** a link-graph checker against an allowlisted DAG (17 libraries,
+       47 edges, 7 grandfathered with owners), a committed dependency graph,
+       descriptor API range and capabilities validated by `bessd`, packet and
+       classifier conformance plugins, and the missing contract sections in
+       `docs/architecture.md`.
+     - **Audit finding:** M0-M2 were not complete when logged. Still open: the
+       M0 measured baselines (benchmarks, memory, assembly, sanitizer subset,
+       one-command rerun), M1's code-size comparison, and the `execution`
+       split.
+     - **Evidence:** GCC 98/98 non-benchmark tests; installed-tree verifier
+       54/54 headers; three conformance plugins build from the staged package.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

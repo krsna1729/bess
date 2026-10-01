@@ -11,6 +11,16 @@ sample_plugin = shared_module(
   install: true,
   install_dir: join_paths(get_option('libdir'), 'bess', 'modules'),
 )
+# Test-only: declares an unsupported API range; the daemon must refuse it.
+incompatible_probe = shared_module(
+  'incompatible_probe',
+  ['modules/incompatible_probe.cc', sample_cpp_target],
+  include_directories: core_include,
+  cpp_args: core_cpp_include + sample_proto_include,
+  dependencies: [dpdk_dep, glog_dep, protobuf_dep, grpcpp_dep],
+  build_rpath: dpdk_libdir,
+  install: false,
+)
 sample_plugin_test_env = {
   'BESS_PROTOBUF_ROOT': join_paths(meson.project_build_root(), 'protobuf', 'generated', 'python'),
   'PYTHONPATH': ':'.join([
@@ -29,7 +39,7 @@ test(
     '--bessd', join_paths(meson.project_build_root(), 'core', 'bessd'),
     '--plugin-dir', meson.current_build_dir(),
   ],
-  depends: [sample_plugin] + python_proto_targets,
+  depends: [sample_plugin, incompatible_probe] + python_proto_targets,
   env: sample_plugin_test_env,
   suite: 'plugin',
   is_parallel: false,

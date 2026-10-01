@@ -67,6 +67,7 @@ file is the reasoning.
 | D-044 | Resource wire codecs bound outside the dataplane Resource (M4) | accepted |
 | D-045 | Explicit application instances with leased lookup (M5) | accepted |
 | D-046 | Route domains consolidated into the one Router (M6) | accepted |
+| D-047 | Phase A closure: link-graph checker, plugin descriptor range, conformance plugins | accepted |
 
 
 ---
@@ -3407,3 +3408,76 @@ pinned to one P-core, `--benchmark_min_time=0.5s`.
 per-domain FIB would be the lever, not the domain index), domains must be
 created under transactions, sparse domain ids appear, or M7 introduces the
 interface identity that replaces the gate in `NextHop`.
+
+---
+
+## D-047 Phase A closure: link-graph checker, plugin descriptor range, conformance plugins
+
+**Status:** accepted (2026-10-01).
+**Code:** `tools/check_link_graph.py`, `tools/layer_dag.json`,
+`docs/baselines/dependency-graph.json`, `core/framework/plugin.h`,
+`core/framework/plugin_check.{h,cc}`, `core/bessd.cc`,
+`sample_plugin/modules/incompatible_probe.cc`,
+`examples/standalone_plugin/`, `docs/architecture.md`,
+`.github/workflows/ci.yml`.
+
+**Context.** Auditing M0-M5 against the roadmap found Phase A incomplete in
+three places. M1 had an include checker but no check of what actually links.
+M2's descriptor carried only a name and a version, nothing consumed it, and
+conformance covered a trivial plugin and a negative case but not packet or
+classifier use. M0's architecture contract lacked the API classification, RCU
+and handle lifetime rules, and battery admission criteria, and described
+`VISIBILITY_ATOMIC` as enabled when only `ScopeCell`, unused by the engine,
+exists.
+
+**Decision.**
+
+- `tools/check_link_graph.py` reads the built static archives, resolves each
+  undefined symbol against the strong definitions of the other BESS libraries,
+  and compares the resulting graph with the allowlist in `tools/layer_dag.json`.
+  A grandfathered edge needs a reason, an owner milestone and a removal phase;
+  the tool fails on any other edge or on a cycle outside the exceptions, and
+  warns about stale exceptions. Weak symbols are ignored. It runs as
+  `check_link_graph` (and a self-test) in the `architecture` suite and
+  emits `docs/baselines/dependency-graph.json`. Measured: 17 libraries, 47
+  edges, 7 grandfathered. The grandfathered edges are `utils`, `classifier`,
+  `meter`, `route` to `runtime` (lazy EAL bring-up, M22), `framework` to
+  `runtime` (an `execution` split), `framework` to `route` (until M7 removes
+  the gate from `Router`) and `control` to `host` (plugin loading).
+- The descriptor gains `api_min`, `api_max` and `required_capabilities`
+  (`BESS_CAP_*`), and `BESS_PLUGIN_REQUIRES`. `BESS_PLUGIN_API_VERSION` is 1.
+  `bessd` validates a plugin that exports a descriptor before keeping it:
+  layout version, API range and capabilities. A refused plugin is `dlclose`d,
+  which deregisters the modules its static constructors registered, and a
+  refusal is permanent (no inheritance-retry pass). A plugin with no
+  descriptor loads as before. `plugin_check.h` is internal and not installed.
+- Conformance: `standalone_macswap` (packet mutation) and `standalone_range_gate`
+  (public classifier headers) join `standalone_pass`, all built from the staged
+  install only; CI asserts each exports its descriptor. The sample plugin
+  declares `BESS_CAP_INIT_CONTEXT`, and `incompatible_probe` declares an
+  unsupported API range so the daemon test proves a refused plugin leaves no
+  module registered and logs the refusal.
+- `docs/architecture.md` now states the API classification, RCU lifetime
+  rules, handle lifetime rules and battery admission criteria, and says plainly
+  that `VISIBILITY_ATOMIC` is not provided until M8.
+
+**Not done (still open in Phase A).**
+
+- M0's measured baselines: the structured `f4fdab03` benchmark set, memory
+  footprints, assembly shape notes, a one-command rerun, and the sanitizer
+  subset. They need Release builds and benchmark time and are not started.
+- M1's binary code-size comparison and the `route/**` to `module.h` include
+  rule for `router.h` (blocked on M7).
+- `bess_execution` split out of `bess_framework`.
+
+**Verification.** GCC: 98/98 non-benchmark tests plus both route benchmarks,
+including the two new architecture tests (`check_link_graph` and its
+self-test), `plugin_check_test` (6 cases) and the sample-plugin daemon test
+with the refusal assertion. Installed-tree check: 54 headers present, private
+headers absent, positive and negative compiles pass, and the three
+conformance plugins build against the staged package and export
+`bess_plugin_descriptor_v1`. A negative run of the link checker with a
+trimmed allowlist reported both injected violations and the resulting cycle.
+
+**Revisit when:** a plugin needs a capability or API break that the range
+cannot express, or the `framework` and `runtime` edges are untangled.

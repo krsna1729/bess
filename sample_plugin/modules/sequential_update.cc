@@ -4,6 +4,8 @@
 
 #include "sequential_update.h"
 
+#include "framework/plugin.h"
+
 using bess::utils::be32_t;
 
 const Commands SequentialUpdate::cmds = {
@@ -122,3 +124,5 @@ void SequentialUpdate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
 ADD_MODULE(SequentialUpdate, "supdate",
            "updates packet data sequentially in a range")
+
+BESS_PLUGIN_REQUIRES("sample_sequential_update", "1.0.0", BESS_CAP_INIT_CONTEXT)

@@ -72,6 +72,7 @@ framework_sources = files(
   'module_graph.cc',
   'framework/module_init_context.cc',
   'framework/resource_bindings.cc',
+  'framework/plugin_check.cc',
   'packet_pool.cc',
   'port.cc',
   'resume_hook.cc',
@@ -457,8 +458,8 @@ core_public_subdir_headers = {
   'route': files(
     'route/route_table.h',
     'route/next_hop_id.h',
-    'route/router.h',
     'route/route_domain.h',
+    'route/router.h',
   ),
   'rcu': files(
     'rcu/rcu_domain.h',
@@ -558,6 +559,7 @@ unit_test_sources = [
   'utils/ether_test.cc',
   'framework/exact_match_table_test.cc',
   'framework/resource_bindings_test.cc',
+  'framework/plugin_check_test.cc',
   'utils/extended_priority_queue_test.cc',
   'utils/fifo_test.cc',
   'utils/histogram_test.cc',
@@ -635,6 +637,27 @@ test(
   'check_layer_includes',
   python,
   args: [files('../tools/check_includes.py'), '--root', meson.project_source_root()],
+  is_parallel: false,
+  suite: 'architecture',
+)
+test(
+  'check_link_graph_self_test',
+  python,
+  args: [files('../tools/check_link_graph.py'), '--self-test'],
+  is_parallel: false,
+  suite: 'architecture',
+)
+# The real check reads the built archives; the dependency list makes
+# `meson test` build them first.
+test(
+  'check_link_graph',
+  python,
+  args: [files('../tools/check_link_graph.py'), '--build-dir',
+         meson.project_build_root()],
+  depends: [bess_rcu, bess_dataplane_core, bess_classifier, bess_meter,
+            bess_stats, bess_route, bess_utils, bess_packet, bess_runtime,
+            bess_framework, bess_control, bess_host, bess_drivers,
+            bess_modules, bess_gate_hooks, bess_resume_hooks, bess_proto_lib],
   is_parallel: false,
   suite: 'architecture',
 )

@@ -27,6 +27,7 @@
 #include <tuple>
 
 #include "debug.h"
+#include "framework/plugin_check.h"
 #include "runtime/opts.h"
 #include "port.h"
 
@@ -392,13 +393,42 @@ std::vector<std::string> ListPlugins() {
   return list;
 }
 
-bool LoadPlugin(const std::string &path) {
+namespace {
+
+enum class PluginLoad { kLoaded, kRetry, kRefused };
+
+// dlopen()s `path`. A plugin that exports a descriptor must match this daemon
+// (D-047); a refused plugin is closed again, which deregisters the modules its
+// static constructors registered. A plugin without a descriptor is a legacy
+// plugin and loads as before.
+PluginLoad TryLoadPlugin(const std::string &path) {
   void *handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
-  if (handle != nullptr) {
-    plugin_handles.emplace(path, handle);
-    return true;
+  if (handle == nullptr) {
+    return PluginLoad::kRetry;
   }
-  return false;
+  if (void *symbol = dlsym(handle, "bess_plugin_descriptor_v1")) {
+    const auto *descriptor =
+        reinterpret_cast<const BessPluginDescriptor *(*)()>(symbol)();
+    std::string reason = descriptor == nullptr
+                             ? "descriptor function returned null"
+                             : framework::CheckPluginDescriptor(*descriptor);
+    if (!reason.empty()) {
+      LOG(ERROR) << "Plugin " << path << " refused: " << reason;
+      dlclose(handle);
+      return PluginLoad::kRefused;
+    }
+    LOG(INFO) << "Plugin " << path << " declares "
+              << (descriptor->name ? descriptor->name : "?") << " "
+              << (descriptor->version ? descriptor->version : "?");
+  }
+  plugin_handles.emplace(path, handle);
+  return PluginLoad::kLoaded;
+}
+
+}  // namespace
+
+bool LoadPlugin(const std::string &path) {
+  return TryLoadPlugin(path) == PluginLoad::kLoaded;
 }
 
 bool UnloadPlugin(const std::string &path) {
@@ -423,6 +453,7 @@ bool LoadPlugins(const std::string &directory) {
   }
 
   std::list<std::string> remaining;
+  size_t refused = 0;
   dirent *entry;
   while ((entry = readdir(dir)) != nullptr) {
     if ((entry->d_type == DT_REG || entry->d_type == DT_LNK) &&
@@ -437,11 +468,16 @@ bool LoadPlugins(const std::string &directory) {
     for (auto it = remaining.begin(); it != remaining.end();) {
       const std::string full_path = *it;
       LOG(INFO) << "Loading plugin (attempt " << pass << "): " << full_path;
-      if (!LoadPlugin(full_path)) {
+      const PluginLoad result = TryLoadPlugin(full_path);
+      if (result == PluginLoad::kRetry) {
         VLOG(1) << "Error loading plugin " << full_path
                 << "dlerror=" << dlerror();
         ++it;
       } else {
+        // Loaded, or refused for good: another pass cannot change either.
+        if (result == PluginLoad::kRefused) {
+          refused++;
+        }
         it = remaining.erase(it);
       }
     }
@@ -454,7 +490,7 @@ bool LoadPlugins(const std::string &directory) {
   }
 
   closedir(dir);
-  return (remaining.size() == 0);
+  return (remaining.size() == 0 && refused == 0);
 }
 
 

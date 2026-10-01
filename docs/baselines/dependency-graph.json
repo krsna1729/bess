@@ -1,0 +1,313 @@
+{
+  "nodes": [
+    "bess_classifier",
+    "bess_control",
+    "bess_dataplane_core",
+    "bess_drivers",
+    "bess_framework",
+    "bess_gate_hooks",
+    "bess_host",
+    "bess_meter",
+    "bess_modules",
+    "bess_packet",
+    "bess_proto",
+    "bess_rcu",
+    "bess_resume_hooks",
+    "bess_route",
+    "bess_runtime",
+    "bess_stats",
+    "bess_utils"
+  ],
+  "edges": [
+    {
+      "from": "bess_classifier",
+      "to": "bess_rcu",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_classifier",
+      "to": "bess_runtime",
+      "status": "exception"
+    },
+    {
+      "from": "bess_control",
+      "to": "bess_dataplane_core",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_control",
+      "to": "bess_framework",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_control",
+      "to": "bess_host",
+      "status": "exception"
+    },
+    {
+      "from": "bess_control",
+      "to": "bess_proto",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_control",
+      "to": "bess_runtime",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_control",
+      "to": "bess_utils",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_dataplane_core",
+      "to": "bess_rcu",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_drivers",
+      "to": "bess_framework",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_drivers",
+      "to": "bess_proto",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_drivers",
+      "to": "bess_utils",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_framework",
+      "to": "bess_dataplane_core",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_framework",
+      "to": "bess_proto",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_framework",
+      "to": "bess_rcu",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_framework",
+      "to": "bess_route",
+      "status": "exception"
+    },
+    {
+      "from": "bess_framework",
+      "to": "bess_runtime",
+      "status": "exception"
+    },
+    {
+      "from": "bess_framework",
+      "to": "bess_stats",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_framework",
+      "to": "bess_utils",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_gate_hooks",
+      "to": "bess_framework",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_gate_hooks",
+      "to": "bess_proto",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_gate_hooks",
+      "to": "bess_stats",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_gate_hooks",
+      "to": "bess_utils",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_host",
+      "to": "bess_control",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_host",
+      "to": "bess_framework",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_host",
+      "to": "bess_gate_hooks",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_host",
+      "to": "bess_proto",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_host",
+      "to": "bess_runtime",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_host",
+      "to": "bess_utils",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_meter",
+      "to": "bess_runtime",
+      "status": "exception"
+    },
+    {
+      "from": "bess_modules",
+      "to": "bess_classifier",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_modules",
+      "to": "bess_dataplane_core",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_modules",
+      "to": "bess_framework",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_modules",
+      "to": "bess_meter",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_modules",
+      "to": "bess_packet",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_modules",
+      "to": "bess_proto",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_modules",
+      "to": "bess_rcu",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_modules",
+      "to": "bess_route",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_modules",
+      "to": "bess_utils",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_resume_hooks",
+      "to": "bess_framework",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_resume_hooks",
+      "to": "bess_proto",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_route",
+      "to": "bess_rcu",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_route",
+      "to": "bess_runtime",
+      "status": "exception"
+    },
+    {
+      "from": "bess_runtime",
+      "to": "bess_framework",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_runtime",
+      "to": "bess_rcu",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_runtime",
+      "to": "bess_utils",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_utils",
+      "to": "bess_runtime",
+      "status": "exception"
+    }
+  ],
+  "exceptions": [
+    {
+      "from": "bess_utils",
+      "to": "bess_runtime",
+      "symbols": "IsDpdkInitialized/InitDpdk",
+      "reason": "utils/dpdk_memory.cc and utils/bpf_program.cc bring up the EAL lazily so tests and tools run without a daemon",
+      "owner": "M22 (test infrastructure)",
+      "remove_by": "Phase F: tests initialize the EAL explicitly"
+    },
+    {
+      "from": "bess_classifier",
+      "to": "bess_runtime",
+      "symbols": "IsDpdkInitialized/InitDpdk",
+      "reason": "classifier/concurrent_exact.cc lazy EAL bring-up for rte_hash",
+      "owner": "M22 (test infrastructure)",
+      "remove_by": "Phase F: tests initialize the EAL explicitly"
+    },
+    {
+      "from": "bess_meter",
+      "to": "bess_runtime",
+      "symbols": "IsDpdkInitialized/InitDpdk",
+      "reason": "meter/meter.cc lazy EAL bring-up for rte_meter",
+      "owner": "M22 (test infrastructure)",
+      "remove_by": "Phase F: tests initialize the EAL explicitly"
+    },
+    {
+      "from": "bess_route",
+      "to": "bess_runtime",
+      "symbols": "IsDpdkInitialized/InitDpdk",
+      "reason": "route/route_table.cc lazy EAL bring-up for rte_lpm",
+      "owner": "M22 (test infrastructure)",
+      "remove_by": "Phase F: tests initialize the EAL explicitly"
+    },
+    {
+      "from": "bess_framework",
+      "to": "bess_runtime",
+      "reason": "module.cc, module_graph.cc, worker.cc and the init context read the runtime registries; target direction is runtime -> framework",
+      "owner": "M1 follow-up: split bess_execution out of bess_framework",
+      "remove_by": "Phase B"
+    },
+    {
+      "from": "bess_framework",
+      "to": "bess_route",
+      "reason": "route/router.cc is compiled into bess_framework because Router carries gate_idx_t",
+      "owner": "M7 (logical network identities)",
+      "remove_by": "M7"
+    },
+    {
+      "from": "bess_control",
+      "to": "bess_host",
+      "reason": "ControlPlane loads and unloads plugins through bessd.cc",
+      "owner": "M3 follow-up: plugin loading behind a runtime interface",
+      "remove_by": "Phase B"
+    }
+  ]
+}

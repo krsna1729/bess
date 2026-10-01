@@ -144,6 +144,11 @@ jobs:
             --include-dir "$stage/usr/local/include/bess/core"
           meson setup "build/standalone-${{ matrix.name }}" examples/standalone_plugin
           meson compile -C "build/standalone-${{ matrix.name }}"
+          for plugin in standalone_pass standalone_macswap standalone_range_gate; do
+            so="build/standalone-${{ matrix.name }}/lib${plugin}.so"
+            test -f "$so"
+            nm -D --defined-only "$so" | grep -q bess_plugin_descriptor_v1
+          done
           python3 - "$stage" <<'PY'
           import os
           from pathlib import Path

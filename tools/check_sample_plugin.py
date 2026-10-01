@@ -31,10 +31,12 @@ def main() -> int:
             '-modules', args.plugin_dir,
             '-grpc_url', args.grpc_url,
         ]
+        log_path = Path(temporary) / 'bessd.log'
+        log = open(log_path, 'wb')
         process = subprocess.Popen(
             command,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=log,
         )
         client = BESS()
         try:
@@ -51,6 +53,14 @@ def main() -> int:
                         raise RuntimeError(
                             'sample plugin loaded but SequentialUpdate is absent: '
                             + repr(list(classes.names)))
+                    if 'IncompatibleProbe' in classes.names:
+                        raise RuntimeError(
+                            'a plugin declaring an unsupported BESS API range '
+                            'was loaded and left IncompatibleProbe registered')
+                    refusal = log_path.read_text(errors='replace')
+                    if 'incompatible_probe' not in refusal or 'refused' not in refusal:
+                        raise RuntimeError(
+                            'the daemon did not log refusing incompatible_probe')
                     return 0
                 except Exception as error:  # gRPC reports several transient errors
                     last_error = error
