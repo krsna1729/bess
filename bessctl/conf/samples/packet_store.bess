@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Bounded Packet Store example (K9).
+# Demonstrates buffering packets awaiting downstream events (e.g. mobile paging or ARP resolution)
+# and releasing on demand:
+# - Gate 0: Released packets
+# - Gate 1: Evicted / expired packets
+
+import scapy.all as scapy
+
+def gen_pkt(sip, dip):
+    eth = scapy.Ether(src='02:00:00:00:00:01', dst='02:00:00:00:00:02')
+    ip = scapy.IP(src=sip, dst=dip)
+    udp = scapy.UDP(sport=10001, dport=10002)
+    payload = 'PACKET_STORE_BUFFERED_DATA'
+    return bytes(eth/ip/udp/payload)
+
+pkts = [
+    gen_pkt('10.0.0.1', '10.0.0.2'),
+]
+
+ps::PacketStore(max_packets=4096, max_packets_per_flow=64, timeout_ms=5000)
+
+Source() -> Rewrite(templates=pkts) -> ps
+
+ps:0 -> Sink()  # Gate 0: Released packets
+ps:1 -> Sink()  # Gate 1: Evicted / expired packets

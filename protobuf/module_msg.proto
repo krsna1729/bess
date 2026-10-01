@@ -1432,3 +1432,30 @@ message BridgeCommandDeleteArg {
 
 message BridgeCommandClearArg {
 }
+
+/**
+ * The PacketStore module implements a bounded, ownership-safe packet buffer (K9).
+ * Buffers incoming packets correlated by an ID (from metadata or packet key),
+ * enqueuing up to `max_packets` total and `max_packets_per_flow` per flow.
+ * Packets are released on demand via `release(id)` or evicted on timeout/overflow.
+ *
+ * __Input Gates__: 1
+ * __Output Gates__: 2 (0: released, 1: expired/evicted)
+ */
+message PacketStoreArg {
+  uint32 max_packets = 1;           /// Maximum total packets in store (default: 4096)
+  uint32 max_packets_per_flow = 2;  /// Maximum packets per flow/session ID (default: 64)
+  uint32 timeout_ms = 3;            /// Maximum buffering time in ms (default: 5000)
+}
+
+message PacketStoreCommandReleaseArg {
+  uint32 id = 1;                    /// Flow/session ID to release
+  uint32 gate = 2;                  /// Target output gate (default: 0)
+}
+
+message PacketStoreCommandDropArg {
+  uint32 id = 1;                    /// Flow/session ID to drop
+}
+
+message PacketStoreCommandClearArg {
+}

@@ -113,8 +113,9 @@ if get_option('af_xdp') == 'required'
 endif
 
 glog_dep = dependency('libglog', method: 'pkg-config', static: is_static_deps, required: true)
-# gflags must match glog's shared/static state to avoid double registration in gflags
-gflags_dep = dependency('gflags', method: 'pkg-config', static: false, required: true)
+# gflags must match glog's shared/static state to avoid double registration in gflags,
+# but must be static in a fully_static build
+gflags_dep = dependency('gflags', method: 'pkg-config', static: (static_binary_opt == 'fully_static'), required: true)
 protobuf_dep = dependency('protobuf', method: 'pkg-config', static: is_static_deps, required: true)
 grpcpp_dep = dependency('grpc++', method: 'pkg-config', static: is_static_deps, required: true)
 libunwind_dep = dependency('libunwind', method: 'pkg-config', static: is_static_deps, required: true)
