@@ -74,13 +74,32 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   const size_t max_next_hops =
       arg.max_next_hops() ? static_cast<size_t>(arg.max_next_hops()) : 4096;
 
+  const size_t max_domains =
+      arg.max_domains() ? static_cast<size_t>(arg.max_domains()) : 1;
+  if (max_domains > route::kMaxRouteDomains) {
+    return CommandFailure(EINVAL, "max_domains exceeds %zu",
+                          route::kMaxRouteDomains);
+  }
+
   auto router = route::Router::Create(name(), config, max_next_hops,
-                                      init_context().rcu());
+                                      init_context().rcu(), max_domains);
   if (!router) {
     return CommandFailure(route::RouteErrno(router.error()), "router: %s",
                           route::RouteErrorName(router.error()));
   }
   router_ = std::move(*router);
+  // Domains are structural: all exist before the router is enrolled.
+  for (size_t d = 1; d < max_domains; d++) {
+    if (auto created =
+            router_->CreateDomain(route::RouteDomainId(static_cast<uint32_t>(d)),
+                                  config);
+        !created) {
+      const route::RouteError error = created.error();
+      router_.reset();
+      return CommandFailure(route::RouteErrno(error), "router: domain %zu: %s",
+                            d, route::RouteErrorName(error));
+    }
+  }
   if (auto enrolled = router_->Enroll(init_context().resources());
       !enrolled) {
     next_hops_binding_.Reset();
@@ -145,7 +164,14 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
             if (!prefix) {
               return std::unexpected(route::RouteErrorName(prefix.error()));
             }
-            return route::Router::RouteKey(*prefix);
+            // Absent means the default domain, as before domains existed; a
+            // domain the router does not have is refused when the key is used.
+            if (key.domain() >= route::kMaxRouteDomains) {
+              return std::unexpected("invalid route domain " +
+                                     std::to_string(key.domain()));
+            }
+            return route::Router::RouteKey(route::RouteDomainId(key.domain()),
+                                           *prefix);
           },
           [](const bess::pb::RouterRouteValue &value)
               -> std::expected<std::any, std::string> {

@@ -3,6 +3,7 @@
 #include "route/router.h"
 
 #include <algorithm>
+#include <map>
 #include <memory>
 #include <set>
 #include <vector>
@@ -16,29 +17,41 @@ namespace bess::route {
 
 std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
     std::string name, const Config &config, size_t max_next_hops,
-    rcu::RcuDomain &domain) {
+    rcu::RcuDomain &domain, size_t max_domains) {
   if (max_next_hops == 0 || max_next_hops > LpmRouteTable::kMaxValue) {
     return std::unexpected(RouteError::kValueOutOfRange);
   }
-  auto routes = RouteTable<NextHopId>::Create(name, config, domain);
+  if (max_domains == 0 || max_domains > kMaxRouteDomains) {
+    return std::unexpected(RouteError::kValueOutOfRange);
+  }
+  auto routes = LpmRouteTable::Create(name, config, domain);
   if (!routes) {
     return std::unexpected(routes.error());
   }
-  return std::unique_ptr<Router>(
-      new Router(name, std::move(*routes), max_next_hops, domain));
+  return std::unique_ptr<Router>(new Router(
+      std::move(name), std::move(*routes), max_next_hops, max_domains, domain));
 }
 
-Router::Router(std::string name, std::unique_ptr<RouteTable<NextHopId>> routes,
-               size_t max_next_hops, rcu::RcuDomain &domain)
-    : routes_(std::move(routes)),
-      domain_(domain),
+Router::Router(std::string name, std::unique_ptr<LpmRouteTable> default_routes,
+               size_t max_next_hops, size_t max_domains, rcu::RcuDomain &rcu)
+    : name_(name),
+      rcu_(rcu),
+      max_domains_(max_domains),
+      domains_(max_domains),
+      default_routes_(default_routes.get()),
+      domain_ids_{kDefaultRouteDomainId},
       next_hops_(max_next_hops),
       references_(max_next_hops + 1, 0),
       next_hops_name_(name + "/next_hops"),
-      routes_name_(name + "/routes") {}
+      routes_name_(name + "/routes") {
+  // Before any reader can exist: nothing to retire.
+  domains_.Publish(SlotOf(kDefaultRouteDomainId),
+                   std::make_unique<const Domain>(std::move(default_routes)));
+}
 
-// The SlotTable frees what is still published (including retiring next hops)
-// when it goes: the owner destroys a Router only once no reader can use it.
+// The SlotTables free what is still published (including retiring next hops
+// and every domain's FIB) when they go: the owner destroys a Router only once
+// no reader can use it.
 Router::~Router() {
   if (engine_ != nullptr) {
     // Routes reference only next hops, so the two leave together with their
@@ -49,10 +62,14 @@ Router::~Router() {
   }
 }
 
-// "<router>/routes" (D-023): key RouteKey(prefix), value NextHopId; each
-// route references its next hop in "<router>/next_hops". A root: erasing a
-// route takes effect at once (rte_lpm deletes in place), so nothing may
-// reference a route.
+// "<router>/routes" (D-023): key Router::RouteKey(domain, prefix), value
+// NextHopId; each route references its next hop in "<router>/next_hops". A
+// root: erasing a route takes effect at once (rte_lpm deletes in place), so
+// nothing may reference a route. One resource covers every domain: the domain
+// is part of the key, so the same prefix in two domains is two routes, and a
+// single transaction can change several domains' routes. The set of domains
+// is frozen while enrolled, so the FIB pointers this resource holds stay
+// valid.
 //
 // rte_lpm cannot promise capacity (rules and tbl8 groups) for a set of
 // prefixes in advance, so a new route is placed during Reserve() with a
@@ -70,42 +87,47 @@ class Router::RouteResource final : public dataplane::Resource {
       : Resource(router.routes_name_, {router.next_hops_name_}),
         router_(router) {}
 
-  size_t LiveCount() const override { return router_.routes_->size(); }
+  size_t LiveCount() const override { return router_.CountRoutes(); }
 
   bool Contains(const dataplane::ResourceKey &key) const override {
-    const auto prefix = Decode(key);
-    return prefix && Find(*prefix).has_value();
+    const auto id = Decode(key);
+    return id && Find(*id).has_value();
   }
 
   std::vector<dataplane::Reference> ReferencesOf(
       const dataplane::ResourceKey &key) const override {
-    const auto prefix = Decode(key);
-    const auto hop = prefix ? Find(*prefix) : std::nullopt;
+    const auto id = Decode(key);
+    const auto hop = id ? Find(*id) : std::nullopt;
     return hop ? References(*hop) : std::vector<dataplane::Reference>{};
   }
   void VisitReferences(
       const std::function<void(const dataplane::Reference &)> &visit) const
       override {
-    router_.routes_->ForEach([&](Ipv4Prefix, NextHopId hop) {
-      for (const auto &ref : References(hop)) {
-        visit(ref);
-      }
+    router_.ForEachDomain([&](RouteDomainId, LpmRouteTable &routes) {
+      routes.ForEach([&](Ipv4Prefix, uint32_t hop) {
+        for (const auto &ref : References(NextHopId(hop))) {
+          visit(ref);
+        }
+      });
     });
   }
 
 
   std::expected<Reservation, std::string> Reserve(
       const dataplane::Op &op) override {
-    const auto prefix = Decode(op.key);
-    if (!prefix) {
-      return std::unexpected("not a route key (RouteKey) of a valid prefix");
+    const auto id = Decode(op.key);
+    if (!id) {
+      return std::unexpected(
+          "not a route key (Router::RouteKey) of a valid prefix");
     }
-    const std::optional<NextHopId> previous = Find(*prefix);
+    LpmRouteTable *table = router_.TableOf(id->domain);
+    const Ipv4Prefix prefix = id->prefix;
+    const std::optional<NextHopId> previous = Find(*id);
     if (op.kind == dataplane::OpKind::kErase) {
       if (!previous) {
         return std::unexpected("not found");
       }
-      Reservation erase{std::make_unique<EraseOp>(router_, *prefix), {}};
+      Reservation erase{std::make_unique<EraseOp>(*table, prefix), {}};
       erase.existed = true;
       erase.previous_references = References(*previous);
       return erase;
@@ -114,22 +136,23 @@ class Router::RouteResource final : public dataplane::Resource {
     if (hop == nullptr) {
       return std::unexpected("wrong value type (want NextHopId)");
     }
+    if (table == nullptr) {
+      return std::unexpected(RouteErrorName(RouteError::kUnknownDomain));
+    }
     if (!router_.ValidId(*hop)) {
       return std::unexpected(RouteErrorName(RouteError::kInvalidId));
     }
     // Everything that can throw first; placing the prefix is the last step.
-    auto upsert = std::make_unique<UpsertOp>(router_, *prefix, *hop);
+    auto upsert = std::make_unique<UpsertOp>(*table, prefix, *hop);
     Reservation reservation{nullptr, References(*hop)};
     reservation.existed = previous.has_value();
     if (previous) {
       reservation.previous_references = References(*previous);
-    } else if (prefix->length() != 0) {
-      pending_.insert(*prefix);  // may throw: before anything is placed
-      const uint32_t placeholder =
-          router_.routes_->untyped().CoveringValue(*prefix).value_or(0);
-      if (auto placed = router_.routes_->untyped().Upsert(*prefix, placeholder);
-          !placed) {
-        pending_.erase(*prefix);
+    } else if (prefix.length() != 0) {
+      pending_.insert(*id);  // may throw: before anything is placed
+      const uint32_t placeholder = table->CoveringValue(prefix).value_or(0);
+      if (auto placed = table->Upsert(prefix, placeholder); !placed) {
+        pending_.erase(*id);
         return std::unexpected(RouteErrorName(placed.error()));
       }
       upsert->MarkPlaced();  // Abort() now deletes it
@@ -141,21 +164,31 @@ class Router::RouteResource final : public dataplane::Resource {
   void EndTransaction() noexcept override { pending_.clear(); }
 
  private:
-  static std::optional<Ipv4Prefix> Decode(const dataplane::ResourceKey &key) {
+  static std::optional<::bess::route::RouteKey> Decode(
+      const dataplane::ResourceKey &key) {
     uint64_t raw = 0;
-    if (!dataplane::DecodeKey(key, &raw) || raw >> 40 != 0) {
+    if (!dataplane::DecodeKey(key, &raw)) {
       return std::nullopt;
     }
     const auto prefix = Ipv4Prefix::Make(static_cast<uint32_t>(raw >> 8),
                                          static_cast<uint8_t>(raw & 0xff));
-    return prefix ? std::optional<Ipv4Prefix>(*prefix) : std::nullopt;
-  }
-
-  std::optional<NextHopId> Find(Ipv4Prefix prefix) const {
-    if (pending_.contains(prefix)) {
+    if (!prefix) {
       return std::nullopt;
     }
-    return router_.routes_->Find(prefix);
+    return ::bess::route::RouteKey{
+        RouteDomainId(static_cast<uint32_t>(raw >> 40)), *prefix};
+  }
+
+  std::optional<NextHopId> Find(const ::bess::route::RouteKey &id) const {
+    if (pending_.contains(id)) {
+      return std::nullopt;
+    }
+    const LpmRouteTable *table = router_.TableOf(id.domain);
+    if (table == nullptr) {
+      return std::nullopt;
+    }
+    const auto hop = table->Find(id.prefix);
+    return hop ? std::optional<NextHopId>(NextHopId(*hop)) : std::nullopt;
   }
 
   std::vector<dataplane::Reference> References(NextHopId hop) const {
@@ -164,24 +197,24 @@ class Router::RouteResource final : public dataplane::Resource {
 
   class UpsertOp final : public dataplane::StagedOp {
    public:
-    UpsertOp(Router &router, Ipv4Prefix prefix, NextHopId hop)
-        : router_(router), prefix_(prefix), hop_(hop) {}
+    UpsertOp(LpmRouteTable &table, Ipv4Prefix prefix, NextHopId hop)
+        : table_(table), prefix_(prefix), hop_(hop) {}
     void MarkPlaced() noexcept { placed_ = true; }
     void Publish(dataplane::Retirer &) noexcept override {
       // The prefix is present (placed in Reserve(), or already a route): an
       // in-place value store, which cannot fail.
-      auto set = router_.routes_->Upsert(prefix_, hop_);
+      auto set = table_.Upsert(prefix_, static_cast<uint32_t>(hop_.value()));
       CHECK(set) << RouteErrorName(set.error());
     }
     void Abort() noexcept override {
       if (placed_) {
-        auto erased = router_.routes_->Erase(prefix_);
+        auto erased = table_.Erase(prefix_);
         CHECK(erased) << RouteErrorName(erased.error());
       }
     }
 
    private:
-    Router &router_;
+    LpmRouteTable &table_;
     Ipv4Prefix prefix_;
     NextHopId hop_;
     bool placed_ = false;
@@ -189,20 +222,20 @@ class Router::RouteResource final : public dataplane::Resource {
 
   class EraseOp final : public dataplane::StagedOp {
    public:
-    EraseOp(Router &router, Ipv4Prefix prefix)
-        : router_(router), prefix_(prefix) {}
+    EraseOp(LpmRouteTable &table, Ipv4Prefix prefix)
+        : table_(table), prefix_(prefix) {}
     void Publish(dataplane::Retirer &) noexcept override {
-      auto erased = router_.routes_->Erase(prefix_);
+      auto erased = table_.Erase(prefix_);
       CHECK(erased) << RouteErrorName(erased.error());
     }
 
    private:
-    Router &router_;
+    LpmRouteTable &table_;
     Ipv4Prefix prefix_;
   };
 
   Router &router_;
-  std::set<Ipv4Prefix> pending_;  // placed in this transaction
+  std::set<::bess::route::RouteKey> pending_;  // placed in this transaction
 };
 
 std::expected<void, std::string> Router::Enroll(
@@ -214,7 +247,7 @@ std::expected<void, std::string> Router::Enroll(
   if (CompleteRetirementsLocked() != 0) {
     return std::unexpected("removed next hops are still retiring");
   }
-  if (routes_->size() != 0) {
+  if (CountRoutes() != 0) {
     return std::unexpected("enroll before adding routes");
   }
   auto hops = std::make_unique<dataplane::SlotResource<NextHopId, NextHop>>(
@@ -252,7 +285,7 @@ std::expected<void, std::string> Router::Release() {
 size_t Router::CompleteRetirementsLocked() {
   std::vector<std::unique_ptr<const NextHop>> emptied;
   std::erase_if(retiring_, [&](const Retiring &r) {
-    if (!domain_.IsComplete(r.token)) {
+    if (!rcu_.IsComplete(r.token)) {
       return false;
     }
     // No reader can still obtain the id from a route; one may have just
@@ -261,11 +294,11 @@ size_t Router::CompleteRetirementsLocked() {
     return true;
   });
   if (!emptied.empty()) {
-    const rcu::GracePeriod token = domain_.StartGracePeriod();
+    const rcu::GracePeriod token = rcu_.StartGracePeriod();
     for (auto &hop : emptied) {
-      domain_.Retire(token, std::move(hop));
+      rcu_.Retire(token, std::move(hop));
     }
-    domain_.ReclaimReady();
+    rcu_.ReclaimReady();
   }
   return retiring_.size();
 }
@@ -292,8 +325,8 @@ std::expected<void, RouteError> Router::SetNextHop(NextHopId id,
   // its next quiescent state.
   auto replaced = next_hops_.Publish(id, std::make_unique<const NextHop>(hop));
   if (replaced) {
-    domain_.Retire(domain_.StartGracePeriod(), std::move(replaced));
-    domain_.ReclaimReady();
+    rcu_.Retire(rcu_.StartGracePeriod(), std::move(replaced));
+    rcu_.ReclaimReady();
   }
   return {};
 }
@@ -319,49 +352,189 @@ std::expected<void, RouteError> Router::RemoveNextHop(NextHopId id) {
   // control call empties the slot. No waiting here (a stalled worker must not
   // stall the command path, and a transaction must not hold a blocking wait).
   next_hops_.Retire(id);
-  retiring_.push_back({id, domain_.StartGracePeriod()});
+  retiring_.push_back({id, rcu_.StartGracePeriod()});
   return {};
 }
 
-std::expected<void, RouteError> Router::SetRoute(Ipv4Prefix prefix,
+std::expected<void, RouteError> Router::CreateDomain(RouteDomainId domain,
+                                                     const Config &config) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (engine_ != nullptr) {
+    return std::unexpected(RouteError::kEnrolled);
+  }
+  const DomainSlot slot = SlotOf(domain);
+  if (!domains_.ValidId(slot)) {
+    return std::unexpected(RouteError::kInvalidId);
+  }
+  if (domains_.Contains(slot)) {
+    return std::unexpected(RouteError::kDomainExists);
+  }
+  auto table = LpmRouteTable::Create(
+      name_ + "_d" + std::to_string(domain.value()), config, rcu_);
+  if (!table) {
+    return std::unexpected(table.error());
+  }
+  // Fully built before the one store that makes it visible; nothing was
+  // published at this slot, so there is nothing to retire.
+  domains_.Publish(slot, std::make_unique<const Domain>(std::move(*table)));
+  domain_ids_.insert(
+      std::lower_bound(domain_ids_.begin(), domain_ids_.end(), domain), domain);
+  return {};
+}
+
+std::expected<void, RouteError> Router::RemoveDomain(RouteDomainId domain) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (engine_ != nullptr) {
+    return std::unexpected(RouteError::kEnrolled);
+  }
+  if (domain == kDefaultRouteDomainId) {
+    return std::unexpected(RouteError::kDomainInUse);
+  }
+  const DomainSlot slot = SlotOf(domain);
+  if (!domains_.Contains(slot)) {
+    return std::unexpected(RouteError::kUnknownDomain);
+  }
+  if (TableOf(domain)->size() != 0) {
+    return std::unexpected(RouteError::kDomainInUse);
+  }
+  // A reader that already loaded the Domain keeps it (and its empty FIB)
+  // until its next quiescent state; a later lookup misses. No domain id is
+  // handed out by a referrer, so the slot can be emptied at once.
+  domains_.Retire(slot);
+  // Unpublished first, then the grace period that covers it (as RcuPtr does).
+  auto removed = domains_.Unpublish(slot);
+  rcu_.Retire(rcu_.StartGracePeriod(), std::move(removed));
+  domain_ids_.erase(
+      std::lower_bound(domain_ids_.begin(), domain_ids_.end(), domain));
+  rcu_.ReclaimReady();
+  return {};
+}
+
+size_t Router::domain_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return domain_ids_.size();
+}
+
+std::expected<void, RouteError> Router::SetRoute(RouteDomainId domain,
+                                                 Ipv4Prefix prefix,
                                                  NextHopId hop) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (engine_ != nullptr) {
     return std::unexpected(RouteError::kEnrolled);
   }
   CompleteRetirementsLocked();
+  LpmRouteTable *routes = TableOf(domain);
+  if (routes == nullptr) {
+    return std::unexpected(RouteError::kUnknownDomain);
+  }
   if (!ValidId(hop)) {
     return std::unexpected(RouteError::kInvalidId);
   }
   if (!next_hops_.Contains(hop)) {
     return std::unexpected(RouteError::kUnknownNextHop);
   }
-  const std::optional<NextHopId> previous = routes_->Find(prefix);
-  if (auto set = routes_->Upsert(prefix, hop); !set) {
+  const std::optional<uint32_t> previous = routes->Find(prefix);
+  if (auto set = routes->Upsert(prefix, static_cast<uint32_t>(hop.value()));
+      !set) {
     return set;
   }
   references_[hop.value()]++;
   if (previous) {
-    references_[previous->value()]--;
+    references_[*previous]--;
   }
   return {};
 }
 
-std::expected<void, RouteError> Router::RemoveRoute(Ipv4Prefix prefix) {
+std::expected<void, RouteError> Router::RemoveRoute(RouteDomainId domain,
+                                                    Ipv4Prefix prefix) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (engine_ != nullptr) {
     return std::unexpected(RouteError::kEnrolled);
   }
   CompleteRetirementsLocked();
-  const std::optional<NextHopId> previous = routes_->Find(prefix);
+  LpmRouteTable *routes = TableOf(domain);
+  if (routes == nullptr) {
+    return std::unexpected(RouteError::kUnknownDomain);
+  }
+  const std::optional<uint32_t> previous = routes->Find(prefix);
   if (!previous) {
     return std::unexpected(RouteError::kNotFound);
   }
-  if (auto erased = routes_->Erase(prefix); !erased) {
+  if (auto erased = routes->Erase(prefix); !erased) {
     return erased;
   }
-  references_[previous->value()]--;
+  references_[*previous]--;
   return {};
+}
+
+std::expected<void, RouteError> Router::ReplaceRouteSetAtomic(
+    RouteDomainId domain, const RouteSet &routes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (engine_ != nullptr) {
+    return std::unexpected(RouteError::kEnrolled);
+  }
+  CompleteRetirementsLocked();
+  LpmRouteTable *table = TableOf(domain);
+  if (table == nullptr) {
+    return std::unexpected(RouteError::kUnknownDomain);
+  }
+
+  // 1. Everything checkable without building: each route's next hop exists.
+  std::map<Ipv4Prefix, NextHopId> wanted;  // a repeated prefix: last entry wins
+  for (const RouteEntry &entry : routes) {
+    if (!ValidId(entry.hop)) {
+      return std::unexpected(RouteError::kInvalidId);
+    }
+    if (!next_hops_.Contains(entry.hop)) {
+      return std::unexpected(RouteError::kUnknownNextHop);
+    }
+    wanted[entry.prefix] = entry.hop;
+  }
+  std::vector<LpmRouteTable::Rule> rules;
+  rules.reserve(wanted.size());
+  for (const auto &[prefix, hop] : wanted) {
+    rules.push_back({prefix, static_cast<uint32_t>(hop.value())});
+  }
+  // What the old set referenced, taken before it is replaced.
+  std::vector<uint32_t> released;
+  table->ForEach([&](Ipv4Prefix, uint32_t hop) { released.push_back(hop); });
+
+  // 2. Build the replacement FIB off to the side and publish it once. Rule and
+  // tbl8 capacity can only be settled by building (rte_lpm cannot predict it),
+  // so this is where a shortage surfaces -- with the old set still published.
+  if (auto replaced = table->ReplaceAll(rules); !replaced) {
+    return replaced;
+  }
+
+  // 3. Published; nothing below can fail. The counts now match the new set.
+  for (const uint32_t hop : released) {
+    references_[hop]--;
+  }
+  for (const auto &entry : wanted) {
+    references_[entry.second.value()]++;
+  }
+  return {};
+}
+
+// Callers hold mutex_, or the router is enrolled (domains frozen), or have
+// exclusive access (Enroll's check).
+size_t Router::CountRoutes() const {
+  size_t count = 0;
+  ForEachDomain([&](RouteDomainId, LpmRouteTable &routes) {
+    count += routes.size();
+  });
+  return count;
+}
+
+size_t Router::route_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return CountRoutes();
+}
+
+size_t Router::route_count(RouteDomainId domain) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const LpmRouteTable *routes = TableOf(domain);
+  return routes != nullptr ? routes->size() : 0;
 }
 
 size_t Router::next_hop_count() const {

@@ -35,6 +35,12 @@ const char *RouteErrorName(RouteError error) {
       return "the router is enrolled in transactions: write it through them";
     case RouteError::kNextHopRetiring:
       return "next hop retiring";
+    case RouteError::kUnknownDomain:
+      return "no such route domain";
+    case RouteError::kDomainExists:
+      return "route domain already exists";
+    case RouteError::kDomainInUse:
+      return "route domain is the default or still has routes";
   }
   return "unknown route error";
 }
@@ -178,6 +184,43 @@ std::expected<void, RouteError> LpmRouteTable::Clear() {
   live_.Publish(std::move(*fresh));
   domain_.ReclaimReady();
   rules_.clear();
+  return {};
+}
+
+std::expected<void, RouteError> LpmRouteTable::ReplaceAll(
+    std::span<const Rule> rules) {
+  std::map<Ipv4Prefix, uint32_t> next_rules;
+  std::optional<uint32_t> next_default;
+  for (const Rule &rule : rules) {
+    if (rule.value > kMaxValue) {
+      return std::unexpected(RouteError::kValueOutOfRange);
+    }
+    if (rule.prefix.length() == 0) {
+      next_default = rule.value;
+    } else {
+      next_rules[rule.prefix] = rule.value;
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(writer_mutex_);
+  auto fresh = NewInstance(next_default.value_or(kNoDefault));
+  if (!fresh) {
+    return std::unexpected(fresh.error());
+  }
+  for (const auto &[prefix, value] : next_rules) {
+    const int ret =
+        rte_lpm_add((*fresh)->lpm, prefix.addr(), prefix.length(), value);
+    if (ret != 0) {
+      // `fresh` is dropped (rte_lpm_free): the live table was never touched.
+      return std::unexpected(ret == -ENOSPC ? RouteError::kTableFull
+                                            : RouteError::kBackendFailure);
+    }
+  }
+  // The one publication: a release store of the finished table.
+  live_.Publish(std::move(*fresh));
+  domain_.ReclaimReady();
+  rules_ = std::move(next_rules);
+  default_ = next_default;
   return {};
 }
 

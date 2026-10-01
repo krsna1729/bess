@@ -39,6 +39,10 @@ enum class RouteError : uint8_t {
                          // done with it (retry after a grace period)
   kEnrolled,             // the router is written through its transaction
                          // engine (Router::Enroll)
+  kUnknownDomain,        // the route domain does not exist (never created,
+                         // removed, or beyond the router's max_domains)
+  kDomainExists,         // creating a route domain that already exists
+  kDomainInUse,          // removing the default domain, or one with routes
 };
 
 const char *RouteErrorName(RouteError error);
@@ -49,12 +53,16 @@ inline int RouteErrno(RouteError error) {
     case RouteError::kTableFull:
       return ENOSPC;
     case RouteError::kNotFound:
+    case RouteError::kUnknownDomain:
       return ENOENT;
+    case RouteError::kDomainExists:
+      return EEXIST;
     case RouteError::kBackendFailure:
       return EIO;
     case RouteError::kNextHopInUse:
     case RouteError::kNextHopRetiring:
     case RouteError::kEnrolled:
+    case RouteError::kDomainInUse:
       return EBUSY;
     default:
       return EINVAL;
@@ -98,9 +106,10 @@ class Ipv4Prefix {
 // scale, while one in-place add is a single rule insertion. The consequence,
 // stated plainly: each route change is atomic to readers (a lookup sees the
 // old or the new answer, never a mix or garbage), but a *sequence* of changes
-// is not one atomic transaction. Wholesale replacement -- Clear() -- still
-// builds a fresh table and publishes it through RcuPtr, since that is both
-// faster than deleting rule by rule and atomic.
+// is not one atomic transaction. Wholesale replacement -- Clear(), or
+// ReplaceAll() with a new rule set -- still builds a fresh table and publishes
+// it through RcuPtr, since that is both faster than deleting rule by rule and
+// atomic.
 //
 // The /0 route is kept beside rte_lpm (whose depth starts at 1) as an atomic
 // default value.
@@ -134,6 +143,21 @@ class LpmRouteTable {
   // Removes every non-default route by publishing a fresh empty table; the
   // default route is kept (what rte_lpm_delete_all meant for IPLookup).
   std::expected<void, RouteError> Clear();
+
+  struct Rule {
+    Ipv4Prefix prefix;
+    uint32_t value;
+  };
+
+  // Replaces every route -- the default included -- with `rules` as one
+  // publication. The replacement is built in a fresh rte_lpm beside the live
+  // one, so every rule and tbl8 group it needs is placed (and a shortage
+  // found) before anything is visible: on any error the live table is
+  // untouched. Readers then see the old rule set or the new one, never a mix,
+  // and the old table is retired through the RCU domain. A prefix named more
+  // than once takes its last value. Cost is a table build (see above), not an
+  // in-place update.
+  std::expected<void, RouteError> ReplaceAll(std::span<const Rule> rules);
 
   // Control-side reads of the authoritative rule set (rte_lpm cannot be read
   // back, so the table keeps its own).
@@ -201,15 +225,21 @@ class LpmRouteTable::View {
  public:
   bool valid() const noexcept { return instance_ != nullptr; }
 
-  // The value for `addr` (host order), falling back to the default route.
-  std::optional<uint32_t> Lookup(uint32_t addr) const noexcept {
+  // The value for `addr` (host order), falling back to the default route, or
+  // kNoDefault (above every value) for a miss: Lookup() without the optional,
+  // for per-packet callers.
+  uint32_t LookupOrMiss(uint32_t addr) const noexcept {
     uint32_t value;
     if (rte_lpm_lookup(instance_->lpm, addr, &value) == 0) {
       return value;
     }
-    const uint32_t def =
-        instance_->default_value.load(std::memory_order_relaxed);
-    return def == kNoDefault ? std::nullopt : std::optional<uint32_t>(def);
+    return instance_->default_value.load(std::memory_order_relaxed);
+  }
+
+  // The value for `addr` (host order), falling back to the default route.
+  std::optional<uint32_t> Lookup(uint32_t addr) const noexcept {
+    const uint32_t value = LookupOrMiss(addr);
+    return value == kNoDefault ? std::nullopt : std::optional<uint32_t>(value);
   }
 
   // Looks up every address (host order), writing `values[i]`. Returns a mask

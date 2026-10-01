@@ -200,7 +200,17 @@ state through G, C or W.
   - removing a next hop does not wait. The id stays published and
     unusable ("retiring") until readers pass a grace period, and later
     control calls drop it.
-- **Used by:** IPLookup.
+- **Route domains (M6, D-046):** one `Router` owns every domain's FIB and the
+  shared next hops. `Router::Create(..., max_domains)` fixes a dense domain
+  index (default 1); domains live in a `SlotTable` indexed by `RouteDomainId`,
+  so `Resolve(domain, ip)` / `ResolveBatch(domain, ips, hops)` are lock-free,
+  need no `Module`, metadata or gates, and miss on an unknown domain.
+  `CreateDomain`/`RemoveDomain` are safe while readers run.
+  `SetRoute`/`RemoveRoute` are the live in-place update;
+  `ReplaceRouteSetAtomic(domain, routes)` builds a replacement FIB beside the
+  live one, validates next hops and rte_lpm capacity before publishing, and
+  publishes it with one pointer store (a table build, not an in-place update).
+- **Used by:** IPLookup, the `Router` module.
 
 ### `ObjectTable<Id, T>` (id → object, mode G)
 
@@ -300,6 +310,9 @@ reference to something missing.
   prepare with the value their addresses already resolve to, so rte_lpm
   capacity is settled before anything is visible. A change costs
   ~0.2-0.6 µs as a transaction against 0.06-0.2 µs direct. D-023. The
+  routes resource covers every route domain: the key carries the domain in
+  bits 40-63 (the default domain's keys are unchanged), and domains are
+  created before `Enroll()` and frozen after it. D-046. The
   `Router` module enrolls on `Init()` and releases on `DeInit()`; its packet
   path resolves a next-hop id from metadata (D-032).
 - **ActionTable** registers `<module>/actions` (key: `EncodeKey(ActionId)`,

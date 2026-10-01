@@ -4335,6 +4335,56 @@ rather than one call site).
        registry unit tests and 4 reference-example tests; installed-header
        verifier 53/53; include checker passes.
 
+126. **M6: route domains consolidated into the one Router (D-046).**
+     - **What:** `MultiDomainRouter` is deleted. `Router` owns every domain's
+       FIB and the shared next hops; domains are a dense `SlotTable`
+       (`Router::Create(..., max_domains)`, default 1) read with one acquire
+       load, an unknown/removed/out-of-range domain is a miss, and
+       `CreateDomain`/`RemoveDomain` are safe while readers run (the old
+       `std::map` was read unsynchronized during `CreateDomain`: a data race).
+       Route identity is `RouteKey{domain, prefix}`; one routes resource
+       carries the domain in key bits 40-63 (domain 0 is byte-identical to the
+       old key), next-hop reference counts span domains, D-023 placement is per
+       domain. `SetRoute`/`RemoveRoute` are the live in-place update;
+       `ReplaceRouteSetAtomic` builds a replacement FIB beside the live one,
+       validates next hops and rte_lpm rules/tbl8 before publishing, publishes
+       once and retires the old FIB, leaving the old generation and the counts
+       untouched on any failure (it refuses on an enrolled router).
+       `Resolve`/`ResolveBatch`/`LookupRoute(domain, ...)` need no
+       Module, metadata or gates. Module RPC: `RouterRouteKey.domain` and
+       `RouterArg.max_domains` (optional fields, wire compatible).
+       `BESS_DPDK_NOHUGE_MB` (default unchanged, 512) sizes the no-hugepage EAL
+       heap for tests and benchmarks.
+     - **Found:** the K7.1 benchmark's "1.69-2.41 ns" for 64 domains was
+       measured with `CreateDomain` errors discarded; each domain is a 64 MB
+       tbl24 and the EAL heap was 512 MB, so most domains never existed and
+       the 16/64-domain rows measured misses. Only its 1- and 4-domain rows were
+       real (1.66 / 2.46 ns id-only).
+     - **Numbers (release, one P-core):** real FIBs, `LookupRoute` 1.03 / 1.04 /
+       1.06 ns at 1 / 4 / 16 domains; `Resolve` 1.49 / 1.50 / 1.92 ns; hot
+       domain 1.35 ns (0.91 ns through the default-domain overload); 32-wide
+       batch in one domain 45.7-54.6 ns; 64K-route FIBs 62.6 ns; reader CPU
+       time 48-49 ns/batch under concurrent updates vs 45.7 idle.
+       Single-domain `BM_LookupRouter` (32-wide `ResolveBatch`) is 2-11% slower
+       than HEAD (213 / 239 / 267 vs 236-239 / 256-264 / 270-278 ns at
+       1K / 16K / 64K routes) with identical instruction streams and cache/TLB
+       misses; the gap is branch mispredicts and moved between 216 and 237 ns
+       when only the benchmark's earlier heap allocations changed, so it is
+       a layout effect I could not remove, recorded rather than hidden.
+     - **Not done:** `NextHop::egress` is still a `gate_idx_t` (an
+       `InterfaceId` touches the modules and tests outside the route files;
+       M7); 64 real domains (4.2 GB of tbl24) were not measured on this host;
+       the flat-vector and sparse alternatives to the dense `SlotTable` were
+       not benchmarked; domains are frozen once enrolled and are not
+       created over the RPC after `Init()`; `ReplaceRouteSetAtomic` is not on
+       the RPC.
+     - **Evidence:** GCC (`build/gcc`, debugoptimized): 98/98 non-benchmark
+       tests and the two route benchmarks pass, including the rewritten
+       `route_domain_test` and `router_transaction_test`. Clang runs in CI.
+       The timing figures above were measured by the implementing agent in
+       `build/perf-release`; I re-ran only that they build and pass, not the
+       numbers.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -10072,7 +10122,7 @@ drive the design.
 | 4 | P1 | **Generic session vertical slice** (D-032): action-mode ExactMatch → ActionTable → K5 Meter → Router, programmed in one transaction | controller-side ordering/rollback | session policy, firewall/QoS/forwarding chains | basic in-process and live-daemon slice complete; full-chain prepare-failure and Mpps-under-update gate pending |
 | 5 | P0 | **External plugin package** (`bess-dev`) with an explicit header contract | vendored BESS fork | out-of-tree module authors | curated 51-header source API and installed-plugin checks complete (D-037, D-041); no C++ ABI promise |
 | 6 | P1 | **K3.8 range backend** (arbitrary source/destination ranges and precedence), differential against scalar reference | Go ternary expansion and Cartesian products | ACL, firewall rules | complete (D-038) |
-| 7 | P1 | **K7.1 route domains** (`RouteDomainId`, `ApplyRouteSet`) | Network Instance workarounds | VRFs, multi-tenant routers | complete (D-039) |
+| 7 | P1 | **K7.1 route domains** (`RouteDomainId`, `ApplyRouteSet`) | Network Instance workarounds | VRFs, multi-tenant routers | complete (D-039; unified into `Router` by D-046) |
 | 8 | P1 | **G1.4 resource statistics API over K6** (`GetStats`/`WatchStats`) | per-object polling and custom aggregation | every NF | pending |
 | 9 | P1 | **K9 bounded packet store + G1.4 event channel** | custom buffering and unreliable notifications | NAT/ARP pending queues, punt paths | K9 packet store complete; event channel pending |
 | 10 | P2 | **Worker affinity and cross-worker handoff:** first expose the effective RSS configuration and queue-to-worker mapping, then generic handoff (DRR's ingress ring is the first instance, D-019) | UPF-specific queue plumbing, multi-worker limits | NAT, stateful firewall, DRR | queued |

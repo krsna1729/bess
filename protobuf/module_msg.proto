@@ -424,6 +424,7 @@ message RouterNextHopValue {
 message RouterRouteKey {
   string ipv4 = 1;
   uint32 prefix_length = 2;
+  uint32 domain = 3; /// Route domain (default 0); must be below the router's max_domains.
 }
 
 message RouterRouteValue {
@@ -1366,6 +1367,7 @@ message RouterArg {
   uint64 max_routes = 1; /// Most routes (default 4096).
   uint64 max_tbl8s = 2; /// Most rte_lpm tbl8 groups (default 256).
   uint64 max_next_hops = 3; /// Most next hops (default 4096).
+  uint64 max_domains = 4; /// Route domains (VRFs) 0..n-1, each with its own FIB sized as above (default 1: the default domain only).
 }
 
 /**

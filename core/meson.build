@@ -458,6 +458,7 @@ core_public_subdir_headers = {
     'route/route_table.h',
     'route/next_hop_id.h',
     'route/router.h',
+    'route/route_domain.h',
   ),
   'rcu': files(
     'rcu/rcu_domain.h',

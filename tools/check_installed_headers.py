@@ -90,6 +90,7 @@ PUBLIC_REQUIRED = [
     "meter/meter.h",
     "meter/meter_set.h",
     "route/next_hop_id.h",
+    "route/route_domain.h",
     "route/route_table.h",
     "route/router.h",
     "rcu/rcu_domain.h",

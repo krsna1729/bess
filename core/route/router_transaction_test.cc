@@ -80,13 +80,18 @@ int EgressOf(const Router &router, uint32_t dst) {
 class RouterTransactionTest : public ::testing::Test {
  protected:
   std::unique_ptr<Router> MakeRouter(uint32_t tbl8_groups = 64,
-                                     size_t next_hops = 64) {
+                                     size_t next_hops = 64,
+                                     size_t domains = 1) {
     LpmRouteTable::Config config;
     config.max_routes = 4096;
     config.tbl8_groups = tbl8_groups;
-    auto router =
-        Router::Create("rt", config, next_hops, bess::runtime::runtime().rcu());
+    auto router = Router::Create("rt", config, next_hops,
+                                 bess::runtime::runtime().rcu(), domains);
     EXPECT_TRUE(router.has_value());
+    // Domains are structural: they exist before the router is enrolled.
+    for (uint32_t d = 1; d < domains; d++) {
+      EXPECT_TRUE((*router)->CreateDomain(RouteDomainId(d), config));
+    }
     return std::move(router).value();
   }
 
@@ -259,6 +264,116 @@ TEST_F(RouterTransactionTest, RoutesThatDoNotFitRejectWithNothingVisible) {
   ops.pop_back();
   ASSERT_EQ(Apply(ops).outcome, Outcome::kApplied);
   EXPECT_EQ(EgressOf(*router, Ip(20, 0, 1, 1)), 1);
+}
+
+// One routes resource covers every domain; the domain is part of the key. The
+// default domain's key is the byte string the pre-domain router used.
+TEST_F(RouterTransactionTest, RoutesInTwoDomainsInOneTransaction) {
+  auto router = MakeRouter(/*tbl8_groups=*/64, /*next_hops=*/64, /*domains=*/3);
+  const RouteDomainId d1(1), d2(2);
+  ASSERT_TRUE(router->Enroll(engine_));
+
+  const Ipv4Prefix net = P(Ip(10, 0, 0, 0), 8);
+  EXPECT_EQ(Router::RouteKey(net),
+            dataplane::EncodeKey(uint64_t{Ip(10, 0, 0, 0)} << 8 | 8))
+      << "the default domain's key changed";
+  EXPECT_EQ(Router::RouteKey(kDefaultRouteDomainId, net), Router::RouteKey(net));
+  EXPECT_EQ(Router::RouteKey(d2, net),
+            dataplane::EncodeKey(uint64_t{2} << 40 |
+                                 uint64_t{Ip(10, 0, 0, 0)} << 8 | 8));
+  EXPECT_EQ(router->SetRouteOp(d1, net, NextHopId(1)).key,
+            Router::RouteKey(RouteKey{d1, net}));
+  EXPECT_NE(Router::RouteKey(d1, net), Router::RouteKey(d2, net));
+
+  ASSERT_EQ(Apply({router->SetRouteOp(d1, net, NextHopId(1)),
+                   router->SetRouteOp(d2, net, NextHopId(2)),
+                   router->SetRouteOp(net, NextHopId(1)),
+                   router->SetRouteOp(d2, P(0, 0), NextHopId(3)),
+                   router->SetNextHopOp(NextHopId(1), Hop(11)),
+                   router->SetNextHopOp(NextHopId(2), Hop(12)),
+                   router->SetNextHopOp(NextHopId(3), Hop(13))})
+                .outcome,
+            Outcome::kApplied);
+  auto egress = [&](RouteDomainId d, uint32_t dst) {
+    const NextHop *hop = router->Resolve(d, dst);
+    return hop == nullptr ? -1 : static_cast<int>(hop->egress);
+  };
+  EXPECT_EQ(egress(d1, Ip(10, 1, 1, 1)), 11);
+  EXPECT_EQ(egress(d2, Ip(10, 1, 1, 1)), 12);
+  EXPECT_EQ(egress(kDefaultRouteDomainId, Ip(10, 1, 1, 1)), 11);
+  EXPECT_EQ(egress(d2, Ip(99, 1, 1, 1)), 13) << "d2's default route";
+  EXPECT_EQ(egress(d1, Ip(99, 1, 1, 1)), -1);
+  EXPECT_EQ(router->route_count(), 4u);
+  EXPECT_EQ(router->route_count(d2), 2u);
+  // The reference ledger spans domains: next hop 1 is named in two.
+  EXPECT_EQ(router->RouteReferences(NextHopId(1)), 2u);
+  EXPECT_EQ(router->RouteReferences(NextHopId(2)), 1u);
+
+  // The same prefix in another domain is another route: erasing a route that
+  // exists only elsewhere is "not found", and a domain the router does not
+  // have is refused.
+  auto missing = Apply({router->RemoveRouteOp(d1, P(0, 0))});
+  ASSERT_EQ(missing.outcome, Outcome::kRejected);
+  EXPECT_NE(missing.ops[0].error.find("not found"), std::string::npos);
+  auto unknown = Apply({router->SetRouteOp(RouteDomainId(7), net, NextHopId(1))});
+  ASSERT_EQ(unknown.outcome, Outcome::kRejected);
+  EXPECT_EQ(router->route_count(), 4u);
+
+  // Erasing a referenced next hop is refused until every domain's route to it
+  // goes; the cascade in one transaction then succeeds.
+  ASSERT_EQ(Apply({router->RemoveNextHopOp(NextHopId(1))}).outcome,
+            Outcome::kRejected);
+  ASSERT_EQ(Apply({router->RemoveRouteOp(d1, net),
+                   router->RemoveNextHopOp(NextHopId(1))})
+                .outcome,
+            Outcome::kRejected)
+      << "the default domain's route still names it";
+  EXPECT_EQ(router->RouteReferences(NextHopId(1)), 2u);
+  ASSERT_EQ(Apply({router->RemoveRouteOp(d1, net),
+                   router->RemoveRouteOp(net),
+                   router->RemoveNextHopOp(NextHopId(1))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(router->RouteReferences(NextHopId(1)), 0u);
+  EXPECT_EQ(egress(d1, Ip(10, 1, 1, 1)), -1);
+  EXPECT_EQ(egress(d2, Ip(10, 1, 1, 1)), 12) << "d2 is untouched";
+  EXPECT_EQ(router->route_count(), 2u);
+
+  // The set of domains and wholesale replacement are not transactional.
+  EXPECT_EQ(router->CreateDomain(RouteDomainId(1), {}).error(),
+            RouteError::kEnrolled);
+  EXPECT_EQ(router->RemoveDomain(d1).error(), RouteError::kEnrolled);
+  EXPECT_EQ(router->ReplaceRouteSetAtomic(d1, {}).error(),
+            RouteError::kEnrolled);
+  Settle();
+}
+
+// A new route is placed per domain during prepare, and a domain's tbl8 pool
+// is its own: filling d1's rejects the transaction without touching d2.
+TEST_F(RouterTransactionTest, PlacementCapacityIsPerDomain) {
+  auto router = MakeRouter(/*tbl8_groups=*/2, /*next_hops=*/8, /*domains=*/3);
+  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1))}).outcome,
+            Outcome::kApplied);
+  std::vector<Op> ops;
+  for (uint32_t i = 0; i < 2; i++) {
+    ops.push_back(router->SetRouteOp(RouteDomainId(1), P(Ip(20, 0, i, 0), 25),
+                                     NextHopId(1)));
+    ops.push_back(router->SetRouteOp(RouteDomainId(2), P(Ip(20, 0, i, 0), 25),
+                                     NextHopId(1)));
+  }
+  ASSERT_EQ(Apply(ops).outcome, Outcome::kApplied) << "two groups each fit";
+  ops = {router->SetRouteOp(RouteDomainId(1), P(Ip(21, 0, 0, 0), 25),
+                            NextHopId(1)),
+         router->SetRouteOp(RouteDomainId(2), P(Ip(22, 0, 0, 0), 24),
+                            NextHopId(1))};
+  const auto r = Apply(ops);
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_EQ(r.ops[0].status, TransactionEngine::OpStatus::kFailed);
+  EXPECT_EQ(router->route_count(RouteDomainId(1)), 2u);
+  EXPECT_EQ(router->route_count(RouteDomainId(2)), 2u);
+  EXPECT_EQ(router->Resolve(RouteDomainId(2), Ip(22, 0, 0, 1)), nullptr)
+      << "the rejected transaction's placeholder was removed";
 }
 
 // Another resource referencing the router's next hops: an action naming the

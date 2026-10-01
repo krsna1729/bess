@@ -141,7 +141,12 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
     // even if we opt out of using hugepages, many DPDK libraries still rely on
     // rte_malloc (e.g., rte_lpm), so we need to reserve some (normal page)
     // memory in advance. We allocate 512MB (this is shared among nodes).
-    rte_args.Append({"-m", "512"});
+    // BESS_DPDK_NOHUGE_MB=<MB> (tests and benchmarks only) sizes this heap;
+    // unset, it is 512.
+    const char *heap_mb = std::getenv("BESS_DPDK_NOHUGE_MB");
+    rte_args.Append({"-m", (heap_mb != nullptr && std::atoi(heap_mb) > 0)
+                               ? std::string(heap_mb)
+                               : std::string("512")});
   } else {
     // IOVA mode: the EAL's own choice unless -iova says otherwise -- VA
     // when an IOMMU is present and every device supports it (vfio-pci: the

@@ -66,6 +66,7 @@ file is the reasoning.
 | D-043 | Standalone release link: libgcc_eh ahead of libunwind, non-PIE | accepted |
 | D-044 | Resource wire codecs bound outside the dataplane Resource (M4) | accepted |
 | D-045 | Explicit application instances with leased lookup (M5) | accepted |
+| D-046 | Route domains consolidated into the one Router (M6) | accepted |
 
 
 ---
@@ -2980,7 +2981,8 @@ explosion (e.g. $12 \times 12 = 144$ WildcardMatch entries for a single PDR rule
 
 ## D-039 K7.1 Route Domains (VRFs) for multi-interface network instance isolation
 
-**Status:** accepted (2026-09-30).
+**Status:** accepted (2026-09-30); `MultiDomainRouter` replaced by the unified
+`Router` in [D-046](#d-046-route-domains-consolidated-into-the-one-router-m6).
 **Code:** `core/route/route_domain.h`, `core/route/route_domain_test.cc`.
 
 **Context.** 5G UPF architectures segregate N3 (Access / gNodeB), N6 (Data
@@ -3251,3 +3253,157 @@ allowed; init fails on a missing instance and on a type mismatch).
 
 **Revisit when:** a control-side create/destroy binding is requested, or
 instances must be created while workers run (an RCU-based lease).
+
+
+---
+
+## D-046 Route domains consolidated into the one Router (M6)
+
+**Status:** accepted (2026-10-01).
+**Code:** `core/route/route_domain.h`, `core/route/router.{h,cc}`,
+`core/route/route_table.{h,cc}` (`LpmRouteTable::ReplaceAll`, `LookupOrMiss`),
+`core/route/route_domain_test.cc`, `core/route/router_transaction_test.cc`,
+`core/route/route_domain_bench.cc`, `core/modules/router.cc`,
+`protobuf/module_msg.proto` (`RouterArg.max_domains`, `RouterRouteKey.domain`),
+`core/runtime/dpdk.cc` (`BESS_DPDK_NOHUGE_MB`), `docs/dataplane-tables.md`.
+
+**Context.** K7.1 (D-039) put route domains in a second object,
+`MultiDomainRouter`: a `std::map<RouteDomainId, unique_ptr<LpmRouteTable>>`
+beside the real `Router`. It had no next hops, no reference counts and no
+transaction resource, so a route could name a next hop that did not exist; its
+reader looked the map up with no synchronization while `CreateDomain()`
+inserted into it (a data race); and `ApplyRouteSet()` was documented as
+atomic but was a sequence of visible upserts. Left alone, L3 work would have
+grown two routing architectures.
+
+**Decision.**
+
+- **One owner.** `Router` owns every domain's FIB and the shared next hops.
+  `MultiDomainRouter` is deleted; `route_domain.h` keeps only identity types:
+  `RouteDomainId` (default 0, no gate/module/metadata dependency),
+  `RouteKey{domain, prefix}`, `RouteEntry`/`RouteSet`. Next-hop reference
+  counts span all domains (a next hop cannot be removed while any domain
+  routes to it).
+- **Domain reader structure: a dense `SlotTable<DomainSlot, Domain>` of
+  `max_domains` slots** (`Router::Create(..., max_domains)`, default 1 = the
+  default domain only, the cost and behaviour of the pre-M6 router). The slot
+  is `domain id + 1`. A reader does one bounds-checked acquire load; an
+  unknown, removed or out-of-range id (including `UINT32_MAX`, which wraps to
+  the invalid slot) is a miss, never undefined behaviour. `CreateDomain()`
+  publishes a fully built FIB with one store; `RemoveDomain()` (empty,
+  non-default domains only) unpublishes it and frees it after a grace period,
+  so a reader that already loaded it keeps a consistent empty FIB. Domain 0 is
+  permanent and the default-domain overloads read it through a cached pointer
+  with no slot lookup. Domain ids are an index, so they are dense by contract
+  (bound `kMaxRouteDomains = 2^24`, set by the resource key).
+- **Domains are structural.** Once the router is enrolled in a
+  `TransactionEngine`, `CreateDomain`/`RemoveDomain` return `kEnrolled`
+  (enforced, not a comment): the engine's route resource holds raw FIB pointers
+  and iterates the domain list without a lock.
+- **Route identity and transactions.** One `"<router>/routes"` resource and one
+  `"<router>/next_hops"` resource per router. The route key is
+  `EncodeKey(domain << 40 | addr << 8 | len)`; domain 0 is byte-identical to the
+  previous key. Placement/pending (D-023) is per `(domain, prefix)`, a domain's
+  tbl8 pool is its own, an unknown domain is rejected at prepare, and one
+  transaction can change several domains' routes with their next hops.
+  The module RPC adds `RouterRouteKey.domain = 3` and `RouterArg.max_domains = 4`
+  (new optional fields, wire compatible; unset means domain 0 / 1 domain).
+  `max_domains` creates domains `0..n-1` at `Init()`, before enrollment.
+- **Update modes, named for what they are.** `SetRoute`/`RemoveRoute`: ordinary
+  live one-writer updates, applied in place, each atomic to readers, a sequence
+  not atomic. `ReplaceRouteSetAtomic(domain, RouteSet)`: validates every
+  route's next hop, builds the replacement FIB off to the side
+  (`LpmRouteTable::ReplaceAll`: a fresh `rte_lpm`, every rule added, so rule and
+  tbl8 exhaustion surface before anything is visible), publishes it with one
+  `RcuPtr` store, retires the old FIB through the RCU domain, and only then
+  moves the reference counts. Any failure (`kUnknownNextHop`, `kInvalidId`,
+  `kTableFull`) leaves the old generation published and the counts unchanged.
+  A prefix named twice takes its last entry. It refuses with `kEnrolled` on a
+  router enrolled in a transaction engine, like the direct setters. It costs a
+  table build, not an in-place update (D-003: 5.8-40 us/route at 64K-512K).
+- **Direct specialized use.** `Resolve(domain, ipv4)`,
+  `ResolveBatch(domain, dst, hops)` and `LookupRoute(domain, ipv4)` (id only)
+  need no `Module`, metadata or gate; the single-domain overloads are the
+  default domain's.
+- **Error model.** New `RouteError`s: `kUnknownDomain` (ENOENT), `kDomainExists`
+  (EEXIST), `kDomainInUse` (EBUSY).
+
+**Evidence.** GCC (`build/gcc`): 98/98 non-benchmark tests and the two route
+benchmarks pass; Clang runs in CI. The timings below were measured by the
+implementing agent in Release (`build/perf-release`, x86-64-v3, GCC),
+pinned to one P-core, `--benchmark_min_time=0.5s`.
+
+- *Old `route_domain_bench` is not a valid multi-domain baseline.* Its
+  fixture created 64 domains with `(void)CreateDomain(...)`, but each domain's
+  `rte_lpm` is a fixed 64 MB tbl24 and tests/benchmarks run with a 512 MB EAL
+  heap, so only the first few domains existed (4,408 "LPM memory allocation
+  failed" lines per run). Its 16- and 64-domain rows (4.06 and 2.40 ns) largely
+  measured misses on never-created domains; the "1.69-2.41 ns" figure is
+  therefore not evidence for 16/64 domains. Only its 1- and 4-domain rows
+  (1.66 and 2.46 ns, id-only `MultiDomainRouter::Lookup`) hit real FIBs.
+- *New, real FIBs (`BM_DomainSweep`, rotating over N domains, hot key):*
+  `LookupRoute` (same work as the old `Lookup`) 1.03 / 1.04 / 1.06 ns at
+  1 / 4 / 16 domains, against 1.66 / 2.46 ns at 1 / 4 before (the `std::map`
+  walk is gone). `Resolve` (route + acquire fence + next-hop object) 1.49 /
+  1.50 / 1.92 ns. Hot single domain: 1.35 ns by id, 0.91 ns through the
+  default-domain overload.
+- *Batches inside one domain:* 4-wide `ResolveBatch` 4.67 / 6.09 / 5.65 ns at
+  1 / 4 / 16 domains (this also resolves next hops; the old X4 was id-only
+  3.19 / 3.92 / 3.97 ns, so it is not the same work); 32-wide 45.7 / 54.6 /
+  53.4 ns (0.70 / 0.59 / 0.60 G keys/s). Small and large FIB, 32-wide batches
+  rotating over 4 domains: 1K routes 46.5-52 ns, 64K routes 62.6 ns.
+- *Lookup during updates (32-wide, reader CPU time):* 48-49 ns with a
+  second thread doing in-place `SetRoute`/`RemoveRoute` in the same domain
+  (~1.4M updates/s) and 48 ns with `ReplaceRouteSetAtomic` swapping another
+  domain (~340 swaps/s), against 45.7 ns idle. (Wall time per batch is ~2x
+  because `taskset` may place the writer on the reader's core; CPU time is the
+  reader's.) Domain lifecycle: `CreateDomain`+`RemoveDomain` 1.56 ms (a 64 MB
+  table).
+- *Single-domain `Router` against `route_bench`:* `BM_LookupRouter`
+  (32-wide `ResolveBatch`, ns/batch, median of 7, ABBA) HEAD 213 / 239 / 267
+  at 1K / 16K / 64K routes, M6 as built 236-239 / 256-264 / 270-278 in
+  the same session, i.e. +11% / +10% / +2%. `BM_LookupRouteTable` (the raw FIB,
+  unchanged code) is flat (168 vs 174 ns at 1K). I treated this as a
+  regression to be explained. The M6 and HEAD loops compile to the same
+  instructions (matching instruction count, L1 and dTLB misses); the
+  difference is branch mispredicts, concentrated on the data-dependent tbl8
+  branch. The effect tracks heap layout, not the lookup code [INFERENCE from
+  perturbation]: changing only what the benchmark mallocs before it builds the
+  router (so the `NextHop` objects it dereferences land elsewhere) moved the
+  M6 binary between 216 and 237 ns/batch and HEAD's own binary between 213 and
+  223 ns/batch. Reordering `Router`'s members and forcing the batch helper
+  inline changed nothing. I found no code change that removes the gap, so it
+  is recorded as measured: a single-domain `Router` is 2-11% slower on this
+  one benchmark, with identical instruction streams.
+- A control build of HEAD (`git archive` into a separate tree, same options)
+  reproduced the 213 / 239 / 267 figures, so the baseline binary was not stale.
+
+**Not done.**
+
+- **`NextHop::egress` is still a `gate_idx_t`.** A strongly typed
+  `InterfaceId` would change `NextHop`, `session_pipeline_test.cc`
+  (`HopWithEgress`, `->egress`), the Router module adapter and the RPC value;
+  that is the identity work M7 owns, and I did not widen M6 into modules
+  outside the route files.
+- **64 real domains were not measured.** 64 x 64 MB tbl24 needs 4.2 GB; this
+  host had ~3 GB free, so rows with 64 domains are skipped by the benchmark
+  (`BESS_DOMAIN_BENCH_MAX=64` with `BESS_DPDK_NOHUGE_MB` above 4.6 GB runs
+  them). The 16-domain row is the largest real sweep.
+- **Alternatives to the dense `SlotTable` were not benchmarked** (an immutable
+  flat-vector generation republished per domain change, and an RCU-published
+  sparse representation). The first has the same one-load read and an O(domains)
+  republish per change; the second only pays when ids are sparse, which the
+  dense-id contract excludes. Neither was built.
+- **Domains cannot be created or removed once the router is enrolled**, and
+  the RPC creates `0..max_domains-1` once at `Init()`. A live
+  create/remove command and a transactional domain lifecycle are not provided;
+  `ReplaceRouteSetAtomic` is not exposed over the RPC (an enrolled router
+  changes routes through transactions).
+- Each domain costs a 64 MB `rte_lpm` tbl24 regardless of its size.
+- `LpmRouteTable::Clear()` still keeps the default route; only
+  `ReplaceAll` replaces it.
+
+**Revisit when:** more than ~16 domains per router are needed (a smaller
+per-domain FIB would be the lever, not the domain index), domains must be
+created under transactions, sparse domain ids appear, or M7 introduces the
+interface identity that replaces the gate in `NextHop`.
