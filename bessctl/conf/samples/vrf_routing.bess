@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Multi-Tenant Virtual Routing and Forwarding (VRF) example.
+# Demonstrates isolated routing tables for separate network tenants
+# (Tenant Red vs Tenant Blue) coexisting with overlapping private subnets (10.0.0.0/8).
+
+import scapy.all as scapy
+
+def gen_pkt(src_ip, dst_ip):
+    eth = scapy.Ether(src='02:1e:67:9f:4d:ae', dst='06:16:3e:1b:72:32')
+    ip = scapy.IP(src=src_ip, dst=dst_ip)
+    udp = scapy.UDP(sport=10001, dport=10002)
+    payload = 'VRF_ROUTING_PACKET'
+    return bytes(eth/ip/udp/payload)
+
+# Packets with identical destination IP '10.1.2.3' from two different tenants:
+red_packets = [gen_pkt('192.168.1.1', '10.1.2.3')]   # Tenant Red packet
+blue_packets = [gen_pkt('172.16.0.1', '10.1.2.3')]   # Tenant Blue packet
+
+# Independent routing tables representing isolated VRFs:
+red_vrf::IPLookup()
+blue_vrf::IPLookup()
+
+# Emulate separate tenant ingress ports:
+Source() -> Rewrite(templates=red_packets) -> red_vrf
+Source() -> Rewrite(templates=blue_packets) -> blue_vrf
+
+# Tenant-specific egress gateways:
+red_vrf:1 -> Sink()   # Gate 1: Tenant Red Gateway
+red_vrf:0 -> Sink()   # Gate 0: Tenant Red Default Drop
+
+blue_vrf:2 -> Sink()  # Gate 2: Tenant Blue Gateway
+blue_vrf:0 -> Sink()  # Gate 0: Tenant Blue Default Drop
+
+# Default drop routes for unroutable traffic:
+red_vrf.add(prefix='0.0.0.0', prefix_len=0, gate=0)
+blue_vrf.add(prefix='0.0.0.0', prefix_len=0, gate=0)
+
+# Overlapping Subnet 10.0.0.0/8 configured in BOTH tenant VRFs:
+# Tenant Red routes 10.0.0.0/8 to Gate 1 (Red Gateway)
+red_vrf.add(prefix='10.0.0.0', prefix_len=8, gate=1)
+
+# Tenant Blue routes 10.0.0.0/8 to Gate 2 (Blue Gateway)
+blue_vrf.add(prefix='10.0.0.0', prefix_len=8, gate=2)

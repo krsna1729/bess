@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# General networking packet classifier WITH arbitrary L4 port ranges.
+# Matches application port ranges directly without generating
+# Cartesian products of ternary prefix masks.
+
+import scapy.all as scapy
+import socket
+
+def aton(ip):
+    return socket.inet_aton(ip)
+
+def gen_pkt(sip, dip, sport, dport):
+    eth = scapy.Ether(src='02:1e:67:9f:4d:ae', dst='06:16:3e:1b:72:32')
+    ip = scapy.IP(src=sip, dst=dip)
+    udp = scapy.UDP(sport=sport, dport=dport)
+    payload = 'PORT_RANGE_SAMPLE_DATA'
+    return bytes(eth/ip/udp/payload)
+
+# Packets directed to different application port ranges:
+pkts = [
+    # 1. Real-time media traffic: Port in [10000, 20000] -> Gate 1 (Media queue)
+    gen_pkt('192.168.1.100', '10.0.0.1', 1234, 15000),
+    # 2. Ephemeral web app traffic: Port in [8000, 9000] -> Gate 2 (App server queue)
+    gen_pkt('192.168.1.100', '10.0.0.1', 1234, 8500),
+    # 3. Web browsing traffic: Port in [80, 443] -> Gate 3 (Web proxy queue)
+    gen_pkt('192.168.1.100', '10.0.0.1', 1234, 80),
+    # 4. Miscellaneous traffic -> Gate 0 (Default queue)
+    gen_pkt('192.168.1.100', '10.0.0.1', 1234, 5555),
+]
+
+# WildcardMatch classifier matching Destination IP + Destination Port
+range_classifier::WildcardMatch(fields=[
+    {'offset': 30, 'num_bytes': 4},
+    {'offset': 36, 'num_bytes': 2},
+])
+
+Source() -> Rewrite(templates=pkts) -> range_classifier
+
+# Output gates for traffic steering:
+range_classifier:0 -> Sink()  # Default traffic
+range_classifier:1 -> Sink()  # Real-time media [10000, 20000]
+range_classifier:2 -> Sink()  # Ephemeral apps [8000, 9000]
+range_classifier:3 -> Sink()  # Web traffic [80, 443]
+
+range_classifier.set_default_gate(gate=0)
+
+# Rules matching target subnets and port intervals:
+range_classifier.add(
+    values=[{'value_bin': aton('10.0.0.1')}, {'value_int': 15000}],
+    masks=[{'value_bin': aton('255.255.255.255')}, {'value_int': 0xffff}],
+    gate=1, priority=100
+)
+
+range_classifier.add(
+    values=[{'value_bin': aton('10.0.0.1')}, {'value_int': 8500}],
+    masks=[{'value_bin': aton('255.255.255.255')}, {'value_int': 0xffff}],
+    gate=2, priority=50
+)
+
+range_classifier.add(
+    values=[{'value_bin': aton('10.0.0.1')}, {'value_int': 80}],
+    masks=[{'value_bin': aton('255.255.255.255')}, {'value_int': 0xffff}],
+    gate=3, priority=10
+)

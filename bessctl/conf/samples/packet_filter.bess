@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# General networking packet filter without port ranges.
+# Classifies IPv4 UDP/TCP traffic by discrete protocol and port numbers.
+
+import scapy.all as scapy
+import socket
+
+def aton(ip):
+    return socket.inet_aton(ip)
+
+def gen_pkt(sip, dip, sport, dport):
+    eth = scapy.Ether(src='02:1e:67:9f:4d:ae', dst='06:16:3e:1b:72:32')
+    ip = scapy.IP(src=sip, dst=dip)
+    udp = scapy.UDP(sport=sport, dport=dport)
+    payload = 'NETWORK_DATA_PACKET'
+    return bytes(eth/ip/udp/payload)
+
+# Packets with fixed, discrete port numbers:
+pkts = [
+    gen_pkt('192.168.1.10', '10.0.0.1', 1234, 80),    # HTTP port
+    gen_pkt('192.168.1.10', '10.0.0.1', 1234, 443),   # HTTPS port
+    gen_pkt('192.168.1.10', '10.0.0.1', 1234, 53),    # DNS port
+    gen_pkt('192.168.1.10', '10.0.0.1', 1234, 9999),  # Unmatched traffic
+]
+
+# ExactMatch on IPv4 Destination IP (offset 30, 4B) + Destination Port (offset 36, 2B)
+filter::ExactMatch(fields=[
+    {'offset': 30, 'num_bytes': 4},
+    {'offset': 36, 'num_bytes': 2},
+])
+
+Source() -> Rewrite(templates=pkts) -> filter
+
+# Output gates for traffic steering:
+filter:0 -> Sink()  # Gate 0: HTTP traffic
+filter:1 -> Sink()  # Gate 1: HTTPS traffic
+filter:2 -> Sink()  # Gate 2: DNS traffic
+filter:5 -> Sink()  # Gate 5: Default drop / unclassified traffic
+
+filter.set_default_gate(gate=5)
+
+# Add discrete flow rules
+filter.add(fields=[{'value_bin': aton('10.0.0.1')}, {'value_int': 80}], gate=0)
+filter.add(fields=[{'value_bin': aton('10.0.0.1')}, {'value_int': 443}], gate=1)
+filter.add(fields=[{'value_bin': aton('10.0.0.1')}, {'value_int': 53}], gate=2)
