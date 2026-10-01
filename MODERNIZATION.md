@@ -145,6 +145,9 @@ separately.
 
 ### Roadmap phase audit (2026-09-24)
 
+This dated table is a snapshot, not the current handoff; see §14 and §31.3
+for the updated G1 status.
+
 | Workstream | Status | Boundary / next step |
 |---|---|---|
 | A — DPDK/build | Complete | Version/API migration and dependency pinning are closed. |
@@ -7861,17 +7864,35 @@ the new public API. K1–K7 now provide the resource contracts G1 exposes.
   generation conflict) plus a typed `ErrorDetail` in the `bess-error-bin`
   trailer. Verified in process over a real gRPC channel
   (`control_api_v2_test`) and against a running `bessd` from Python.
-- **G1.2 — dataplane resource transactions: NEXT.** Design, worked PFCP
-  examples, semantics and build order in section 14.5. Driven by the OMEC UPF
-  consumer (section 28).
-- **G1.3 — `GetSystem` / `GetCapabilities`:** version, workers/CPUs, cache
-  geometry (K4.6b), module/driver classes and their resources, PMD
-  capabilities.
-- **G1.4 — stats:** `GetStats` / `WatchStats` over K6 snapshots (generation,
-  epoch, deltas); `WatchEvents` for generation changes.
-- **G1.5 / G1.6 — thin Go and C++ SDKs:** typed builders, one-RPC
-  transactions, typed errors from `ErrorDetail`, generation/conflict retry
-  helpers. G1.7 — C++ `bessctl` on the v2 API.
+
+**G1.2a — live single-table update paths: DONE.** ExactMatch, WildcardMatch
+and Router have landed live update paths; generic Mode W operation rings stay
+consumer-driven (D-008, §31.3 item 2).
+- **G1.2b — dependency-safe transaction engine and resource providers: DONE**
+  (D-021–D-025, D-032). ExactMatch, WildcardMatch, Router, ActionTable and
+  Meter participate in dependency-ordered transactions. `ApplyTransaction`,
+  `GetTransaction` and `ListTransactionResources` provide the unary typed RPC,
+  idempotency and resource discovery.
+- **D-032 session vertical slice: DONE at basic scope.** One transaction
+  creates the ExactMatch action rule, action, K5 meter, next hop and route.
+  `session_pipeline_test.cc` drives each stage and rejection/removal path in
+  process. Four live-daemon tests check forwarding, metering, teardown and
+  updates under traffic; the traffic-under-update case churns action-mode
+  ExactMatch rules/actions, not the full meter/route chain.
+- **G1.2d — transaction-integrated atomic scopes: PENDING.** `ScopeCell` and
+  `ScopeTable` implement and test a lock-free 64-bit plan cell, but they are
+  not used by `TransactionEngine`; `ApplyTransaction` reports only
+  `VISIBILITY_DEPENDENCY_ORDERED`, never `VISIBILITY_ATOMIC`.
+- **Other G1.2 follow-ons:** the live Mpps benchmark (D-027) covers unary
+  ExactMatch rule churn, not the full ActionTable→Meter→Router chain.
+  Full-chain failure injection under traffic, `ReplaceScope`, production
+  streaming/bulk RPC and Go/C++ SDKs remain pending. The streaming proto in
+  `protobuf/tests/ingress_bench.proto` is benchmark-only.
+- **G1.3 — `GetSystem` / `GetCapabilities`: PENDING.**
+- **G1.4 — resource stats and events: PENDING.** Existing port/traffic-class
+  stats are not per-resource transaction lifecycle stats.
+- **G1.5 / G1.6 — thin Go and C++ SDKs: PENDING.** G1.7 C++ `bessctl` on v2
+  also remains pending.
 
 The old imperative API should not constrain the ideal end state.
 
@@ -9497,35 +9518,23 @@ deltas, typed `WorkerId`; `Track` migrated. See the K6 section.
 `Router` with ordered route/next-hop publication, `RewriteL2`; `IPLookup`
 migrated. See the K7 section.
 
-### Next — G1.2 dataplane resource transactions
+### G1 current status and next work (updated 2026-10-01)
 
-G1.1 (the v2 pipeline API) is done. G1.2 (section 14.5) moves session ordering
-and rollback from controllers into `bessd` with performance as a hard
-requirement: live single-writer tables with O(1) in-place inserts and
-unchanged reader hot paths, reserve-then-publish transactions, an opt-in scope
-cell for session atomicity, and idempotent `request_id`. It starts with
-G1.2a: today's single insert is O(table) (ExactMatch 7.9 ms at 100K rules);
-make it O(1) first, with three update modes covering all modules: C (DPDK
-lock-free `rte_hash`/`rte_lpm` + runtime QSBR, direct insert), W
-(per-worker op rings applied at the scheduler-round boundary, for replicas and
-shards), and G (generation swap for bulk and tiny tables). Then G1.3 capabilities, G1.4 stats, and
-the Go/C++ SDKs.
+G1.1 pipeline desired state, the G1.2b dependency-safe transaction core and
+providers, and the G1.2c unary typed transaction RPC are implemented. D-032
+adds the generic ExactMatch → ActionTable → K5 Meter → Router session slice.
+Do not rebuild those pieces from the older G1.2 design below.
 
-- The OMEC UPF program (section 28) is the strongest consumer, but not the
-  driver ([docs/decisions.md](docs/decisions.md) D-008). A core feature
-  needs at least two non-UPF consumers, and the network-function catalogue
-  (section 29) supplies them.
-- G1.2a progress:
-  - ExactMatch is on mode C (entry 91, D-001);
-  - DPDK behaviours are pinned by deterministic CI tests (entry 92, D-007).
-- Next in G1.2a: see section 31 (the work queue). WildcardMatch on mode C
-  is implemented and awaiting its native benchmark (§31.2), and grace
-  periods and `RemoveNextHop` are done (entries 95 and 96). Then mode W,
-  and taking the remaining modules off the global pause (§31.3).
-- Before G1.2b, study prior art for multi-table atomicity and record what
-  we borrow as decisions: DPDK `rte_swx` table staging with commit/abort,
-  P4Runtime write atomicity (continue-on-error, rollback-on-error,
-  dataplane-atomic), and VPP's bihash and binary API.
+Next, integrate `ScopeCell` into transaction publication so a supported
+`VISIBILITY_ATOMIC` scope switches one complete old/new policy version.
+Then extend the full-chain live gate with prepare-failure injection and Mpps
+measurements under sustained updates. D-027's live benchmark is useful
+evidence, but it measures ExactMatch rule churn, not that complete chain.
+
+Still open after that gate: production streaming/bulk RPC, `ReplaceScope`,
+Go/C++ SDKs (G1.5/G1.6), `GetSystem`/capabilities (G1.3), and transaction
+statistics/events (G1.4). Generic Mode W operation rings remain deliberately
+deferred until two real consumers need them (D-008; §31.3 item 2).
 
 ### Following stages
 
@@ -9714,6 +9723,16 @@ stay in OMEC. Where it now stands against this roadmap:
 | K4.4b mixed GTP/PSC TX profiles tested (plain v4, outer v4/GTP+inner v4, with and without PSC) | Profiles exist, UPF layouts untested | Test with the UPF plugin (v4 acceptance test 4) |
 | Stable external plugin build/ABI, so OMEC can stop vendoring BESS | Missing | **Phase F:** plugin devel package (v4 M6) |
 | Structural graph via G0 only; never `ApplyPipeline` per PFCP rule | Honored (G1.1 is topology only) | -- |
+
+**BESS platform update (2026-10-01; D-032, D-038, D-039, D-041).** Since this
+v4 snapshot, the K3.8 range backend, K7.1 route domains, K9 bounded packet
+store, generic session vertical slice and curated `bess-dev` package have
+landed. D-032's ExactMatch action mode writes `ActionId` to packet metadata.
+This table and the v4 sequencing below remain an OMEC integration plan, not
+the current BESS work queue: UPF-specific classifier/session compilation and
+SDK work remain application integration, while transaction-atomic scope
+publication and the full-chain live failure/Mpps gate remain open. See §14
+and §29.9 for current BESS status.
 
 Sequencing, per v4 section 64: M1, an in-tree UPF plugin on the existing
 substrate (static G0 graph, typed `ActionId` classifier, aggregate
@@ -9998,15 +10017,15 @@ drive the design.
 
 | # | priority | deliverable | removes from OMEC | non-UPF consumers | status |
 |---|---|---|---|---|---|
-| 1 | P0 | **G1.2b transaction core**: resources, reserve/publish, dependency order, reference safety, per-op results, one grace period per transaction, deferred id reuse (D-020, D-021) | manual ordering, best-effort rollback | Router (routes -> next hops), ExactMatch/WildcardMatch rule sets -> action objects | core landed (entry 105); providers: ExactMatch (111), Router (113), WildcardMatch (114) |
-| 2 | P0 | **G1.2c RPC:** `ApplyDataplaneTransaction` with `request_id`, `expected_generation`, typed per-op results and `GetTransaction` status lookup; a streaming packed-op path (E4) | per-rule RPC orchestration, timeout ambiguity, rule-key reconstruction for deletion | any controller: routing daemons, firewall/NAT rule loaders | landed (entry 115); streaming path and SDK next |
-| 3 | P0 | **The scope cell (dataplane-atomic scopes), precisely** (detailed rules in D-021 amendment 2). An atomic scope must keep both the old and the new interpretation until its publication point. New state is written to *new* keys or write-once slots, and the cell's flip selects which set packets use. A version flag over entries already overwritten in place cannot restore them (review caution). Tables that can only be updated in place refuse atomic scopes rather than fake them (D-020). | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | design, with G1.2b |
-| 4 | P1 | **Vertical UPF slice** (in-tree plugin, static G0 graph): one uplink/downlink session using a typed classifier with a direct `ActionId` result (no `ResultSlot` -> `PackedValueStore` -> `ActionId` chain), a FAR executor, K5 `MeterSet` (no second meter implementation), K6 counters and K7 IPv4 routes, all programmed through G1.2. **Gate:** an ExactMatch -> action -> meter -> Router pipeline over virtual PMDs, packets flowing under updates and transactions with failures injected at every prepare boundary; Mpps, update latency, rejections, dangling checks, retirement backlog (D-021 amendment 5) | validates the contract end to end | -- (validation consumer) | after 1-2 |
-| 5 | P0 | **External plugin package:** installed headers, a Meson dependency (`bess-dev`), a supported plugin API subset and a written compatibility policy | OMEC's vendored BESS fork | any out-of-tree module author | after 4 shows the API surface |
-| 6 | P1 | **K3.8 range backend** (arbitrary source and destination ranges plus precedence), differential against a scalar reference, including overlapping wildcards and simultaneous source/destination ranges | Go ternary expansion, range-width limits, Cartesian products | ACL, firewall rules (N) | queued |
-| 7 | P1 | **K7.1 route domains** (`RouteDomainId`, `ApplyRouteSet`) | Network Instance / N3-N6-N9 workarounds | VRFs (N5), multi-tenant routers | queued |
-| 8 | P1 | **G1.4 resource statistics API over K6** (`GetStats`/`WatchStats` per resource and scope) | polling individual modules, custom aggregation | every NF | queued |
-| 9 | P1 | **K9 bounded packet store + G1.4 event channel** (bounded, backpressure-aware, correlated to scope/action) | custom buffering, unreliable notifications (DDN) | NAT/ARP pending queues, punt paths (N0) | queued |
+| 1 | P0 | **G1.2b transaction engine and providers**: reserve/publish, dependency ordering, reference safety, retirement (D-021); ExactMatch, WildcardMatch, Router, ActionTable and Meter (D-022–D-024, D-032) | manual ordering, best-effort rollback | routers, firewalls, NAT | complete |
+| 2 | P0 | **G1.2c unary transaction RPC:** `ApplyTransaction`, `GetTransaction`, `ListTransactionResources`, `request_id`, generations and daemon epoch (D-025) | per-rule RPC orchestration and timeout ambiguity | any controller | unary path complete; production streaming/bulk RPC and SDKs pending |
+| 3 | P0 | **Atomic scope publication:** one cell selects a complete old or new immutable policy version | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | `ScopeCell`/`ScopeTable` primitive exists; transaction/RPC integration for `VISIBILITY_ATOMIC` pending |
+| 4 | P1 | **Generic session vertical slice** (D-032): action-mode ExactMatch → ActionTable → K5 Meter → Router, programmed in one transaction | controller-side ordering/rollback | session policy, firewall/QoS/forwarding chains | basic in-process and live-daemon slice complete; full-chain prepare-failure and Mpps-under-update gate pending |
+| 5 | P0 | **External plugin package** (`bess-dev`) with an explicit header contract | vendored BESS fork | out-of-tree module authors | curated 51-header source API and installed-plugin checks complete (D-037, D-041); no C++ ABI promise |
+| 6 | P1 | **K3.8 range backend** (arbitrary source/destination ranges and precedence), differential against scalar reference | Go ternary expansion and Cartesian products | ACL, firewall rules | complete (D-038) |
+| 7 | P1 | **K7.1 route domains** (`RouteDomainId`, `ApplyRouteSet`) | Network Instance workarounds | VRFs, multi-tenant routers | complete (D-039) |
+| 8 | P1 | **G1.4 resource statistics API over K6** (`GetStats`/`WatchStats`) | per-object polling and custom aggregation | every NF | pending |
+| 9 | P1 | **K9 bounded packet store + G1.4 event channel** | custom buffering and unreliable notifications | NAT/ARP pending queues, punt paths | K9 packet store complete; event channel pending |
 | 10 | P2 | **Worker affinity and cross-worker handoff:** first expose the effective RSS configuration and queue-to-worker mapping, then generic handoff (DRR's ingress ring is the first instance, D-019) | UPF-specific queue plumbing, multi-worker limits | NAT, stateful firewall, DRR | queued |
 | 11 | P2 | **Narrow hardware steering:** a lifecycle-managed `rte_flow` interface for the flow shapes actually needed. Capabilities come from exact feature tests with conservative fallback, never driver-name guesses (the PMD's current GTP checksum inference by driver name is to be replaced) | UPF-maintained PMD code | N0 vif demux | queued |
 | later | -- | IPv6 routes, fragmentation/reassembly, more NIC features | remaining protocol limits | -- | -- |
@@ -10111,7 +10130,7 @@ survey (entry 99, D-016); HashLB and ACL on G, L2Forward on C (entry 100,
 D-017). The accepted trade-off still open: multi-tuple
 WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
 
-### 31.3 Next, in order (G1.2a completion)
+### 31.3 Remaining work (updated 2026-10-01)
 
 1. **The multi-tuple small-table miss cost** (the D-014 trade-off; not
    blocking). The root cause is known: `rte_hash` misses on small tables
@@ -10168,21 +10187,23 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
    - optimistic generations instead of election;
    - no double-buffered tables;
    - no global barrier, which is VPP's default for non-mp-safe handlers.
-6. **G1.2b transactions** across tables with different update modes.
-   This is the remaining architectural milestone, per the external review
-   of 2026-09-27: individual live commands do not give the guarantee of
-   one dataplane transaction across classifiers, actions, meters, routes
-   and next hops. Acceptance must include failure injection (a failure at
-   every step rolls back or leaves no partial state visible) and checks
-   that generations stay consistent under concurrent traffic. The
-   hard question, per an external review: how one transaction combines C
-   tables, W state, published generations and meter state without
-   pretending they are one mechanism. Planned approach, D-013:
-   - insert in dependency order (referenced objects first, unreachable
-     until referenced);
-   - delete in reverse, with retirement after a grace period;
-   - an opt-in scope cell (one atomic word) for all-at-once cutover;
-   - no worker pause for data transactions.
+6. **G1.2b/c core and unary RPC: DONE; atomic-scope integration remains open.**
+   D-021/D-025/D-032 and their tests establish dependency-safe transactions,
+   typed unary RPC, reference-safe ExactMatch/WildcardMatch/Router/ActionTable/
+   Meter providers, and the basic session vertical slice.
+   - The live daemon creates/removes the rule, action, meter, route and next
+     hop transactionally, then checks packets. Its traffic-under-update test
+     churns action-mode ExactMatch rules/actions, not the full meter/route chain.
+   - D-027's `live_transaction_bench.py` measures Mpps under unary ExactMatch
+     rule churn; it is not a measurement of the full session chain.
+   - `ScopeCell`/`ScopeTable` exist and their 64-bit word is tested for
+     untorn reads, but no transaction path publishes scope versions; RPC
+     outcomes remain `VISIBILITY_DEPENDENCY_ORDERED`.
+   **Pending:** `VISIBILITY_ATOMIC` transaction integration; full-chain
+   prepare-failure traffic/Mpps gate; production streaming/bulk RPC;
+   `ReplaceScope`; Go/C++ SDKs; G1.3 capabilities and G1.4 stats/events.
+   Generic Mode W remains intentionally deferred until two consumers need it
+   (D-008, item 2 above).
 7. **Graph changes without pauses:** publish connections and tasks via RCU.
    Destroying a module then waits for a grace period, never a pause
    (D-013).
@@ -10571,35 +10592,36 @@ Every hardware acceleration must retain a software fallback with identical BESS 
 9. **No packet-path shared ownership/refcounting abstractions.**
 10. **Optimize only after correctness and representative measurement.**
 11. **Hardware absence must not stall software architecture.**
-12. **Do not preserve compatibility layers merely because they existed historically when a clean cutover is feasible.**
-
+Closed: A, B-software, C-software, E, J (subsumed by K1), G0, K1–K7, K9,
+G1.1, G1.2a single-table updates, G1.2b transaction core, G1.2c unary RPC,
+and M2 curated plugin package.
+Partial: F, G1 (atomic scopes, streaming/SDK, capabilities, stats/events), H,
+and I. Not started: D and K8 (consumer-driven).
 ---
 
 
 ### 30. Current handoff
 
-K5 (`990f6726`, entry 78), K6 (`ce6241bf`, entry 79), K7 (`9535d5e3`, entry
-80), K4.6 (`173e93e8`, entry 81) and K4.6b (entry 82) landed on `develop` on
-2026-09-25 on top of the maintenance-only baseline `6959bd27`. GCC and Clang
-full local Meson suites pass 91/91 (80 pre-K5 targets plus
-`meter_meter_test`, `meter_meter_set_test`, `meter_bench`, `stats_stats_test`,
-`stats_bench`, `route_route_test`, `route_bench`,
-`dataplane_batch_stages_test`, `classifier_cuckoo_scale_bench`,
-`modules_l2_table_test`, `modules_table_scale_bench`).
+**Historical baseline (2026-09-25):** K5, K6, K7, K4.6 and K4.6b had
+landed; GCC and Clang full local Meson suites passed 91/91 at that snapshot.
+The current status below supersedes this baseline; detailed evidence remains
+in the dated entries above.
 
-Closed: A, B-software, C-software, E, J (subsumed by K1), G0, and K1–K7.
-Partial: F, H, and I. Not started: D, G1, and K8 (consumer-driven).
+Closed: A, B-software, C-software, E, J (subsumed by K1), G0, K1–K7, K9,
+G1.1, G1.2b transaction core, G1.2c unary RPC, and M2 curated plugin package.
+Partial: F, G1 (atomic scopes, streaming/SDK, capabilities, stats/events), H,
+and I. Not started: D and K8 (consumer-driven).
 C-HW remains a separate deferred hardware-validation track.
 
-**Start here: section 31 (work queue and open ideas, 2026-09-26).** It lists
-every open item from the latest sessions, with next steps and done
-criteria, plus how to build, benchmark (native, release, ABBA, isolated)
-and run live-daemon tests.
+**Start here:** §14 G1 status and §31.3 remaining work, updated 2026-10-01.
+Historical entries below/above record what was planned at the time; do not
+reopen completed transaction core/providers or duplicate the D-032 session
+slice.
 
-**Next software work: G1.2 dataplane resource transactions** (G1.1, the v2
-pipeline API, is done), with Phase L (section 27) as a parallel performance
-track starting at L1 measurability. Do not reopen closed K
-architecture; do not block the software sequence on real-NIC work.
+**Next software work:** integrate transaction-atomic `ScopeCell` publication
+and complete the full-chain failure-injection/Mpps gate; continue Phase L
+(section 27) as a parallel performance track. Production streaming, `ReplaceScope`,
+SDKs, G1.3 and G1.4 follow. Do not block software work on real-NIC validation.
 Benchmarks are run through `omarchy-benchmark` (pinned, isolated,
 performance governor); multithreaded gbench rows must self-pin each thread,
 because the EAL pins the main thread and isolated partitions do not load
