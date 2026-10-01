@@ -20,6 +20,7 @@
 #include "gate.h"
 #include "message.h"
 #include "metadata.h"
+#include "task.h"
 #include "packet_pool.h"
 #include "worker.h"
 

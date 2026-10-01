@@ -130,10 +130,21 @@ jobs:
       - name: Run all Meson tests
         run: meson test -C "build/${{ matrix.name }}" --no-rebuild --print-errorlogs
 
-      - name: Verify install tree
+      - name: Verify install tree and external plugin API
+        env:
+          CXX: ${{ matrix.cxx }}
         run: |
-          meson install -C "build/${{ matrix.name }}" --destdir "$PWD/build/stage-${{ matrix.name }}"
-          python3 - "$PWD/build/stage-${{ matrix.name }}" <<'PY'
+          stage="$PWD/build/stage-${{ matrix.name }}"
+          meson install -C "build/${{ matrix.name }}" --destdir "$stage"
+          pc_file=$(find "$stage" -type f -name bess-dev.pc -print -quit)
+          test -n "$pc_file"
+          export PKG_CONFIG_PATH="$(dirname "$pc_file")${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          export CXXFLAGS="-I$stage/usr/local/include/bess -I$stage/usr/local/include/bess/core ${CXXFLAGS:-}"
+          python3 tools/check_installed_headers.py \
+            --include-dir "$stage/usr/local/include/bess/core"
+          meson setup "build/standalone-${{ matrix.name }}" examples/standalone_plugin
+          meson compile -C "build/standalone-${{ matrix.name }}"
+          python3 - "$stage" <<'PY'
           import os
           from pathlib import Path
           import sys

@@ -18,11 +18,11 @@
 #include "dataplane/batch_stages.h"
 #include "dataplane/resource.h"
 #include "dataplane/slot_table.h"
-#include "dataplane/strong_id.h"
 #include "gate.h"
 #include "packet.h"
 #include "packet_mutation.h"
 #include "route/route_table.h"
+#include "route/next_hop_id.h"
 #include "utils/ether.h"
 
 namespace bess::dataplane {
@@ -31,11 +31,6 @@ class TransactionEngine;
 
 namespace bess::route {
 
-// A next hop's stable id: one-based, zero invalid (like ActionId), and at
-// most 24 bits because it is what the route table stores.
-struct NextHopIdTag;
-using NextHopId = dataplane::StrongId<NextHopIdTag, uint32_t>;
-inline constexpr NextHopId kInvalidNextHopId{};
 
 enum class NeighborState : uint8_t {
   kResolved,     // L2 addresses known; forward with RewriteL2()

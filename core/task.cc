@@ -8,6 +8,7 @@
 
 #include "gate.h"
 #include "module.h"
+#include "traffic_class.h"
 
 // Called when the leaf that owns this task is destroyed.
 void Task::Detach() {

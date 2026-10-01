@@ -7,7 +7,6 @@
 
 #include <glog/logging.h>
 #include <google/protobuf/any.pb.h>
-#include <gtest/gtest_prod.h>
 
 #include <cstdint>
 #include <functional>

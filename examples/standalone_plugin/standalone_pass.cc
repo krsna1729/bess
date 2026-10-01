@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "module.h"
+#include "framework/plugin.h"
 
 #include <atomic>
 #include <cstdint>
@@ -41,6 +42,8 @@ CommandResponse StandalonePass::CommandGetStats(const bess::pb::EmptyArg &) {
   bess::pb::EmptyArg resp;
   return CommandSuccess(resp);
 }
+
+BESS_PLUGIN("standalone_pass", "1.0.0");
 
 ADD_MODULE(StandalonePass, "standalone_pass",
            "Standalone out-of-tree plugin passing packets through gate 0")

@@ -8,14 +8,15 @@
 #include <glog/logging.h>
 
 #include <cstdint>
+#include <list>
 #include <string>
+#include <utility>
 
 #include <sys/types.h>
 #include <thread>
 #include <type_traits>
 
 #include "gate.h"
-#include "traffic_class.h"
 #include "utils/common.h"
 #include "utils/random.h"
 
@@ -46,7 +47,9 @@ typedef enum {
 namespace bess {
 class Scheduler;
 class PacketPool;
+class TrafficClass;
 }  // namespace bess
+
 
 class Task;
 

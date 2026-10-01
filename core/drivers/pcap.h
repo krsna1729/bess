@@ -6,6 +6,8 @@
 #define BESS_DRIVERS_PCAP_H_
 
 #include "../port.h"
+#include <gtest/gtest_prod.h>
+
 
 #include <glog/logging.h>
 

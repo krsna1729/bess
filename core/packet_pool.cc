@@ -15,6 +15,7 @@
 #endif
 
 #include "dpdk.h"
+#include "runtime/memory.h"
 #include "runtime/opts.h"
 #include "utils/copy.h"
 
@@ -32,6 +33,19 @@ void DoMunmap(rte_mempool_memhdr *memhdr, void *) {
 }
 
 }  // namespace
+class BessPacketPool final : public PacketPool {
+ public:
+  BessPacketPool(size_t capacity = kDefaultCapacity, int socket_id = -1,
+                 size_t data_room_size = kDefaultPacketDataSize);
+
+  bool IsVirtuallyContiguous() override { return true; }
+  bool IsPhysicallyContiguous() override { return true; }
+  bool IsPinned() override { return true; }
+
+ private:
+  DmaMemoryPool mem_;
+};
+
 static_assert(offsetof(rte_mbuf, data_off) == offsetof(rte_mbuf, rearm_data));
 static_assert(offsetof(rte_mbuf, refcnt) == offsetof(rte_mbuf, rearm_data) + 2);
 static_assert(offsetof(rte_mbuf, nb_segs) == offsetof(rte_mbuf, rearm_data) + 4);

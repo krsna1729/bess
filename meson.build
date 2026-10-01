@@ -171,6 +171,7 @@ version_h = custom_target(
   build_always_stale: true,
 )
 
+# Decision D-041: plugin compile dependencies exclude daemon-only gRPC.
 pkg = import('pkgconfig')
 pkg.generate(
   name: 'bess-dev',
@@ -179,7 +180,7 @@ pkg.generate(
   version: meson.project_version(),
   subdirs: ['bess', 'bess/core'],
   extra_cflags: ['-D_GNU_SOURCE', '-DGLOG_USE_GLOG_EXPORT', '-include', 'cinttypes'],
-  requires: ['libdpdk', 'libglog', 'protobuf', 'grpc++'],
+  requires: ['libdpdk', 'libglog', 'protobuf'],
 )
 
 subdir('protobuf')

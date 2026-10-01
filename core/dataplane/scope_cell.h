@@ -10,7 +10,7 @@
 
 #include "dataplane/strong_id.h"
 #include "meter/meter.h"
-#include "route/router.h"
+#include "route/next_hop_id.h"
 
 namespace bess::dataplane {
 

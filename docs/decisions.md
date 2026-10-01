@@ -61,6 +61,7 @@ file is the reasoning.
 | D-038 | K3.8 Range Backend for arbitrary L4 port ranges | accepted |
 | D-039 | K7.1 Route Domains (VRFs) for multi-interface network instance isolation | accepted |
 | D-040 | Standalone static release binary configuration and command-line -j parallelism | accepted |
+| D-041 | Curated `bess-dev` headers and source-only plugin contract | accepted |
 
 
 ---
@@ -3030,3 +3031,51 @@ container images. In addition, nested build scripts hardcoded parallel job limit
 - `bessd` built in `build/perf-standalone` with `-Dstatic_binary=standalone`:
   `ldd` verified zero `librte_*.so` shared library dependencies.
 - `bootstrap_dpdk.py --help` verified `-j` parameter acceptance.
+
+---
+
+## D-041 Curated `bess-dev` headers and source-only plugin contract
+
+**Status:** accepted (2026-10-01).
+**Code:** `core/meson.build`, `core/{module.h,packet_pool.h,worker.h}`,
+`core/route/next_hop_id.h`, `core/dataplane/scope_cell.h`,
+`core/framework/plugin.h`, `meson.build`, `tools/check_installed_headers.py`,
+`.github/workflows/ci.yml`, `docs/plugin-api.md`,
+`examples/standalone_plugin/`.
+
+**Context.** D-037 added the `bess-dev` package, but recursively installed
+implementation headers and made `grpc++` a required compile dependency even
+though a basic module plugin uses protobuf messages and not gRPC. Compiling
+against a staged package also exposed private transitive includes from
+`packet_pool.h` and `worker.h`.
+
+**Decision.**
+
+- `core/meson.build` installs a named 51-header surface. It does not recurse
+  through implementation subdirectories; runtime, control, driver, hook,
+  benchmark, and test internals remain absent.
+- `bess-dev.pc` requires only `libdpdk`, `libglog`, and `protobuf`. A plugin
+  that uses gRPC declares `grpc++` itself.
+- Module, packet, and port headers are a supported source API, not a C++ ABI.
+  Plugins are rebuilt against their target BESS release. Selected classifier,
+  dataplane, meter, RCU, route, and statistics headers are experimental.
+- `bess_plugin_descriptor_v1` is versioned C metadata for plugin identity;
+  `ADD_MODULE` remains the registration mechanism.
+- CI compiles an external plugin using installed artifacts, rejects a private
+  runtime include, and builds `examples/standalone_plugin` out of tree.
+
+This supersedes D-037's dependency list and broad header-install behavior; it
+does not change the package name or `ADD_MODULE` loading semantics.
+
+**Verification** (GCC and Clang, x86-64-v3 build):
+
+- Full Meson suite: **128/128** on GCC and **128/128** on Clang.
+- Staged-header verifier: **51/51** headers present; positive plugin compile
+  passed; `runtime/runtime_state.h` negative include rejected.
+- Out-of-tree `examples/standalone_plugin` compiled against staged `bess-dev`
+  with both GCC and Clang; `bess_plugin_descriptor_v1` is exported.
+- `pkg-config --print-requires bess-dev`: `libdpdk`, `libglog`, `protobuf`;
+  no `grpc++`.
+
+**Revisit when:** an experimental header is promoted to supported source API,
+or the plugin loader begins consuming additional descriptor fields.

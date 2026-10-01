@@ -380,17 +380,12 @@ bessd = executable(
   install: true,
 )
 core_public_headers = files(
-  'bessctl.h',
-  'bessd.h',
   'commands.h',
-  'debug.h',
-  'dpdk.h',
   'event.h',
   'gate.h',
   'message.h',
   'metadata.h',
   'module.h',
-  'module_graph.h',
   'packet.h',
   'packet_checksum.h',
   'packet_cursor.h',
@@ -401,33 +396,66 @@ core_public_headers = files(
   'packet_tx_checksum.h',
   'pktbatch.h',
   'port.h',
-  'resume_hook.h',
-  'scheduler.h',
-  'shared_obj.h',
   'snbuf_layout.h',
   'task.h',
-  'traffic_class.h',
   'worker.h',
 )
 install_headers(core_public_headers, subdir: 'bess/core')
 
-core_subdirs = [
-  'utils',
-  'framework',
-  'runtime',
-  'classifier',
-  'control',
-  'meter',
-  'route',
-  'rcu',
-  'stats',
-  'gate_hooks',
-  'resume_hooks',
-  'drivers',
-]
-
-foreach sdir : core_subdirs
-  install_subdir(sdir, install_dir: 'include/bess/core')
+# Decision D-041 (docs/decisions.md): install a named API set; never recurse
+# into core implementation subdirectories.
+core_public_subdir_headers = {
+  'utils': files(
+    'utils/common.h',
+    'utils/copy.h',
+    'utils/endian.h',
+    'utils/ether.h',
+    'utils/extended_priority_queue.h',
+    'utils/inline_function.h',
+    'utils/random.h',
+    'utils/time.h',
+  ),
+  'framework': files(
+    'framework/plugin.h',
+  ),
+  'dataplane': files(
+    'dataplane/action_id.h',
+    'dataplane/batch_stages.h',
+    'dataplane/batch_tuning.h',
+    'dataplane/object_table.h',
+    'dataplane/resource.h',
+    'dataplane/scope_cell.h',
+    'dataplane/slot_table.h',
+    'dataplane/strong_id.h',
+    'dataplane/worker_id.h',
+  ),
+  'classifier': files(
+    'classifier/byte_key.h',
+    'classifier/classifier.h',
+    'classifier/range_backend.h',
+  ),
+  'meter': files(
+    'meter/meter.h',
+    'meter/meter_set.h',
+  ),
+  'route': files(
+    'route/route_table.h',
+    'route/next_hop_id.h',
+    'route/router.h',
+  ),
+  'rcu': files(
+    'rcu/rcu_domain.h',
+    'rcu/rcu_ptr.h',
+  ),
+  'stats': files(
+    'stats/counter_set.h',
+    'stats/worker_histogram.h',
+    'stats/worker_local.h',
+    'stats/worker_slots.h',
+  ),
+}
+foreach subdir, headers : core_public_subdir_headers
+  install_headers(headers, subdir: 'bess/core/' + subdir)
 endforeach
 
 

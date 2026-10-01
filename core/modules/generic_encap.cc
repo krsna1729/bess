@@ -5,6 +5,7 @@
 #include "generic_encap.h"
 
 #include "../utils/endian.h"
+#include "../utils/simd.h"
 
 static_assert(MAX_FIELD_SIZE <= sizeof(uint64_t),
               "field cannot be larger than 8 bytes");

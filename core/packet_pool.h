@@ -1,7 +1,10 @@
 #ifndef BESS_PACKET_POOL_H_
 #define BESS_PACKET_POOL_H_
 
-#include "runtime/memory.h"
+#include <cstddef>
+#include <cstdint>
+#include <string>
+
 #include "packet.h"
 
 // "Contiguous" here means that all packets reside in a single memory region
@@ -123,18 +126,6 @@ class PlainPacketPool : public PacketPool {
   bool pinned_;
 };
 
-class BessPacketPool : public PacketPool {
- public:
-  BessPacketPool(size_t capacity = kDefaultCapacity, int socket_id = -1,
-                 size_t data_room_size = kDefaultPacketDataSize);
-
-  bool IsVirtuallyContiguous() override { return true; }
-  bool IsPhysicallyContiguous() override { return true; }
-  bool IsPinned() override { return true; }
-
- private:
-  DmaMemoryPool mem_;
-};
 
 class DpdkPacketPool : public PacketPool {
  public:
