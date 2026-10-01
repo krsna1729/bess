@@ -9,6 +9,10 @@ import socket
 def aton(ip):
     return socket.inet_aton(ip)
 
+def hton16(val):
+    import struct
+    return struct.pack('!H', val)
+
 def gen_pkt(sip, dip, sport, dport):
     eth = scapy.Ether(src='02:1e:67:9f:4d:ae', dst='06:16:3e:1b:72:32')
     ip = scapy.IP(src=sip, dst=dip)
@@ -39,8 +43,6 @@ filter:2 -> Sink()  # Gate 2: DNS traffic
 filter:5 -> Sink()  # Gate 5: Default drop / unclassified traffic
 
 filter.set_default_gate(gate=5)
-
-# Add discrete flow rules
-filter.add(fields=[{'value_bin': aton('10.0.0.1')}, {'value_int': 80}], gate=0)
-filter.add(fields=[{'value_bin': aton('10.0.0.1')}, {'value_int': 443}], gate=1)
-filter.add(fields=[{'value_bin': aton('10.0.0.1')}, {'value_int': 53}], gate=2)
+filter.add(fields=[{'value_bin': aton('10.0.0.1')}, {'value_bin': hton16(80)}], gate=0)
+filter.add(fields=[{'value_bin': aton('10.0.0.1')}, {'value_bin': hton16(443)}], gate=1)
+filter.add(fields=[{'value_bin': aton('10.0.0.1')}, {'value_bin': hton16(53)}], gate=2)

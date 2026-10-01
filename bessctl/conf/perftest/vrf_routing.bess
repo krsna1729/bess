@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# High-rate stress performance benchmark for Multi-Tenant VRF Routing (K7.1).
+# Measures packet forwarding throughput across multiple isolated VRF domains.
+
+import scapy.all as scapy
+import sys
+import time
+
+psize = int($BESS_PKT_SIZE!'60')
+
+def gen_pkt(src_ip, dst_ip):
+    eth = scapy.Ether(src='02:1e:67:9f:4d:ae', dst='06:16:3e:1b:72:32')
+    ip = scapy.IP(src=src_ip, dst=dst_ip)
+    udp = scapy.UDP(sport=10001, dport=10002)
+    payload = ('VRFPERF' * 20)[:max(0, psize - len(eth/ip/udp))]
+    return bytes(eth/ip/udp/payload)
+
+def create_vrf_pipeline(num_vrfs):
+    bess.reset_all()
+    bess.pause_all()
+    
+    snk = Sink()
+    
+    for v in range(num_vrfs):
+        v_name = f'vrf_{v}'
+        vrf = IPLookup(name=v_name)
+        pkt = gen_pkt(f'192.168.{v}.1', '10.1.2.3')
+        
+        Source(pkt_size=psize) -> Rewrite(templates=[pkt]) -> vrf
+        
+        # Subnet 10.0.0.0/8 routed to gateway (gate 1)
+        vrf:1 -> snk
+        vrf:0 -> snk
+        
+        vrf.add(prefix='0.0.0.0', prefix_len=0, gate=0)
+        vrf.add(prefix='10.0.0.0', prefix_len=8, gate=1)
+    
+    bess.resume_all()
+
+# Sweep across active VRF domains
+for vrf_count in [1, 2, 4, 8]:
+    create_vrf_pipeline(vrf_count)
+    sys.stdout.write("VRFs/%2d active " % vrf_count)
+    sys.stdout.flush()
+    time.sleep(1.0)
+    bess.pause_all()
+    bess.reset_all()

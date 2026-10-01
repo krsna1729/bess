@@ -9,6 +9,10 @@ import socket
 
 def aton(ip):
     return socket.inet_aton(ip)
+def hton16(val):
+    import struct
+    return struct.pack('!H', val)
+
 
 def gen_pkt(sip, dip, sport, dport):
     eth = scapy.Ether(src='02:1e:67:9f:4d:ae', dst='06:16:3e:1b:72:32')
@@ -47,19 +51,19 @@ range_classifier.set_default_gate(gate=0)
 
 # Rules matching target subnets and port intervals:
 range_classifier.add(
-    values=[{'value_bin': aton('10.0.0.1')}, {'value_int': 15000}],
-    masks=[{'value_bin': aton('255.255.255.255')}, {'value_int': 0xffff}],
+    values=[{'value_bin': aton('10.0.0.1')}, {'value_bin': hton16(15000)}],
+    masks=[{'value_bin': aton('255.255.255.255')}, {'value_bin': b'\xff\xff'}],
     gate=1, priority=100
 )
 
 range_classifier.add(
-    values=[{'value_bin': aton('10.0.0.1')}, {'value_int': 8500}],
-    masks=[{'value_bin': aton('255.255.255.255')}, {'value_int': 0xffff}],
+    values=[{'value_bin': aton('10.0.0.1')}, {'value_bin': hton16(8500)}],
+    masks=[{'value_bin': aton('255.255.255.255')}, {'value_bin': b'\xff\xff'}],
     gate=2, priority=50
 )
 
 range_classifier.add(
-    values=[{'value_bin': aton('10.0.0.1')}, {'value_int': 80}],
-    masks=[{'value_bin': aton('255.255.255.255')}, {'value_int': 0xffff}],
+    values=[{'value_bin': aton('10.0.0.1')}, {'value_bin': hton16(80)}],
+    masks=[{'value_bin': aton('255.255.255.255')}, {'value_bin': b'\xff\xff'}],
     gate=3, priority=10
 )

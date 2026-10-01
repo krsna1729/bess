@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# High-rate stress performance benchmark for L4 port range classification (K3.8).
+# Measures packet rate (Mpps) and scaling across increasing range rule counts.
+
+import scapy.all as scapy
+import socket
+import struct
+import sys
+import time
+
+psize = int($BESS_PKT_SIZE!'60')
+
+def aton(ip):
+    return socket.inet_aton(ip)
+
+def hton16(val):
+    return struct.pack('!H', val)
+
+def gen_pkt(sport, dport):
+    eth = scapy.Ether(src='02:1e:67:9f:4d:ae', dst='06:16:3e:1b:72:32')
+    ip = scapy.IP(src='192.168.1.100', dst='10.0.0.1')
+    udp = scapy.UDP(sport=sport, dport=dport)
+    payload = ('PERFTEST' * 20)[:max(0, psize - len(eth/ip/udp))]
+    return bytes(eth/ip/udp/payload)
+
+pkts = [
+    gen_pkt(1234, 15000),  # Matches media range [10000, 20000]
+    gen_pkt(1234, 8500),   # Matches app range [8000, 9000]
+    gen_pkt(1234, 80),     # Matches web range [80, 443]
+    gen_pkt(1234, 5555),   # Default fallback
+]
+
+def create_pipeline(num_rules):
+    bess.reset_all()
+    bess.pause_all()
+    
+    classifier = WildcardMatch(fields=[
+        {'offset': 30, 'num_bytes': 4},
+        {'offset': 36, 'num_bytes': 2},
+    ])
+    
+    Source(pkt_size=psize) -> Rewrite(templates=pkts) -> classifier
+    
+    # Egress gates
+    classifier:0 -> Sink()
+    classifier:1 -> Sink()
+    classifier:2 -> Sink()
+    classifier:3 -> Sink()
+    
+    classifier.set_default_gate(gate=0)
+    
+    # Base rules
+    classifier.add(
+        values=[{'value_bin': aton('10.0.0.1')}, {'value_bin': hton16(15000)}],
+        masks=[{'value_bin': aton('255.255.255.255')}, {'value_bin': b'\xff\xff'}],
+        gate=1, priority=1000
+    )
+    classifier.add(
+        values=[{'value_bin': aton('10.0.0.1')}, {'value_bin': hton16(8500)}],
+        masks=[{'value_bin': aton('255.255.255.255')}, {'value_bin': b'\xff\xff'}],
+        gate=2, priority=500
+    )
+    classifier.add(
+        values=[{'value_bin': aton('10.0.0.1')}, {'value_bin': hton16(80)}],
+        masks=[{'value_bin': aton('255.255.255.255')}, {'value_bin': b'\xff\xff'}],
+        gate=3, priority=100
+    )
+    
+    # Additional background rules for scaling stress
+    for i in range(num_rules - 3):
+        port = 20000 + i * 10
+        classifier.add(
+            values=[{'value_bin': aton('10.0.0.1')}, {'value_bin': hton16(port)}],
+            masks=[{'value_bin': aton('255.255.255.255')}, {'value_bin': b'\xff\xff'}],
+            gate=0, priority=10
+        )
+    
+    bess.resume_all()
+
+# Sweep across rule counts
+for rules in [4, 16, 64, 256]:
+    create_pipeline(rules)
+    sys.stdout.write("PortRanges/%3d rules " % rules)
+    sys.stdout.flush()
+    time.sleep(1.0)
+    bess.pause_all()
+    bess.reset_all()
