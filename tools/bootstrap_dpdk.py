@@ -18,6 +18,27 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[1]
 METADATA = ROOT / 'deps' / 'dpdk.json'
 
+# What of DPDK to build. Every library is always built (a plugin may use any of
+# them); DPDK's own apps never are. The profiles differ in which drivers:
+#   bess  the PCI and vdev buses, the ring/stack mempools and the software and
+#         AF_XDP ports BESS and its tests use (null, ring, af_xdp, af_packet,
+#         tap). Enough for development and CI.
+#   full  every NIC family, for a binary that ships to real hardware. Crypto,
+#         event, baseband, regex, ml, compress, vdpa, raw, gpu and dma devices
+#         stay off: nothing in BESS uses them.
+PROFILES = {
+    'bess': [
+        '-Ddisable_apps=*',
+        '-Denable_drivers=bus/pci,bus/vdev,mempool/ring,mempool/stack,'
+        'net/null,net/ring,net/af_xdp,net/af_packet,net/tap',
+    ],
+    'full': [
+        '-Ddisable_apps=*',
+        '-Ddisable_drivers=crypto/*,event/*,baseband/*,regex/*,ml/*,'
+        'compress/*,vdpa/*,raw/*,gpu/*,dma/*',
+    ],
+}
+
 
 def run(command: list[str], *, cwd: Path | None = None,
         env: dict[str, str] | None = None) -> None:
@@ -128,7 +149,8 @@ def check_af_xdp_artifacts(prefix: Path, mode: str) -> None:
 
 
 def configure_and_build(source_dir: Path, build_dir: Path, prefix: Path,
-                         cpu: str | None, jobs: int | None, env: dict[str, str]) -> None:
+                         cpu: str | None, profile: str, jobs: int | None,
+                         env: dict[str, str]) -> None:
     build_dir.parent.mkdir(parents=True, exist_ok=True)
     command = ['meson', 'setup']
     if (build_dir / 'meson-private' / 'coredata.dat').exists():
@@ -139,6 +161,7 @@ def configure_and_build(source_dir: Path, build_dir: Path, prefix: Path,
         '--prefix=' + str(prefix),
         '--libdir=lib',
         '-Dexamples=',
+        *PROFILES[profile],
     ])
     if cpu:
         command.append('-Dmachine=' + cpu)
@@ -160,6 +183,11 @@ def main() -> int:
     parser.add_argument('--af-xdp', choices=('auto', 'required'),
                         default=os.environ.get('AF_XDP', 'auto').lower())
     parser.add_argument('--cpu', default=os.environ.get('CPU'))
+    parser.add_argument('--profile', choices=sorted(PROFILES),
+                        default=os.environ.get('DPDK_PROFILE', 'full'),
+                        help='which DPDK drivers to build: bess (software '
+                        'ports only, for development and CI) or full (every '
+                        'NIC family, for hardware; default)')
     parser.add_argument('-j', '--jobs', type=int, default=None,
                         help='Number of parallel compile jobs passed to ninja')
     parser.add_argument('--print-pkg-config-path', action='store_true')
@@ -179,7 +207,8 @@ def main() -> int:
     build_env = os.environ.copy()
     build_env['PKG_CONFIG_PATH'] = os.pathsep.join(
         filter(None, [build_env.get('PKG_CONFIG_PATH'), str(pkgconfig)]))
-    configure_and_build(dpdk_dir, build_dir, prefix, args.cpu, args.jobs, build_env)
+    configure_and_build(dpdk_dir, build_dir, prefix, args.cpu, args.profile,
+                        args.jobs, build_env)
     check_af_xdp_artifacts(prefix, args.af_xdp)
     print(f'DPDK pkg-config path: {pkgconfig}')
     return 0

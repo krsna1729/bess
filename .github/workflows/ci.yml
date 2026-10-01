@@ -92,14 +92,14 @@ jobs:
         uses: actions/cache@v6
         with:
           path: deps
-          key: dpdk-${{ matrix.name }}-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'tools/bootstrap_dpdk.py') }}
+          key: dpdk-bess-${{ matrix.name }}-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'tools/bootstrap_dpdk.py') }}
 
       - name: Bootstrap pinned DPDK
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
         run: |
-          tools/bootstrap_dpdk.py --af-xdp required --cpu "$CPU"
+          tools/bootstrap_dpdk.py --af-xdp required --cpu "$CPU" --profile bess
           echo "PKG_CONFIG_PATH=$(tools/bootstrap_dpdk.py --print-pkg-config-path)" >> "$GITHUB_ENV"
 
       - name: Configure BESS
@@ -190,11 +190,11 @@ jobs:
         uses: actions/cache@v6
         with:
           path: deps
-          key: dpdk-gcc-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'tools/bootstrap_dpdk.py') }}
+          key: dpdk-full-gcc-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'tools/bootstrap_dpdk.py') }}
 
       - name: Bootstrap pinned DPDK
         run: |
-          tools/bootstrap_dpdk.py --af-xdp required --cpu "$CPU"
+          tools/bootstrap_dpdk.py --af-xdp required --cpu "$CPU" --profile full
           echo "PKG_CONFIG_PATH=$(tools/bootstrap_dpdk.py --print-pkg-config-path)" >> "$GITHUB_ENV"
 
       - name: Configure Standalone Release Build

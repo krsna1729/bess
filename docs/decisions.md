@@ -71,6 +71,7 @@ file is the reasoning.
 | D-048 | Fast build profile: normal test linking, mold, ccache, quiet EAL | accepted |
 | D-049 | Logical network identities: InterfaceId replaces the gate in the route library (M7) | accepted |
 | D-050 | Explicit transaction consistency: referential vs scope-snapshot (M8) | accepted |
+| D-051 | DPDK build profiles: bess (software ports) and full (every NIC family) | accepted |
 
 
 ---
@@ -3757,3 +3758,61 @@ firewall) reads a scope on its packet path -- then size its `Version`, add its
 codec and a live test, and benchmark the load; a client needs the referents and
 the switch in one call (a prepare-then-switch request); a use needs two scopes
 to switch together; or a worker must hold a scope across task invocations.
+
+---
+
+## D-051 DPDK build profiles: bess (software ports) and full (every NIC family)
+
+**Status:** accepted (2026-10-02).
+**Code:** `tools/bootstrap_dpdk.py`, `.github/workflows/ci.yml`,
+`MODERNIZATION.md` ("Build profiles").
+
+**Context.** The pinned DPDK built 2,246 compile units: 976 NIC drivers, 308 of
+DPDK's own apps, and crypto, event, baseband, regex, ml, compress, vdpa, raw,
+gpu and dma drivers BESS never touches. It cost a 545 MB CI cache entry and
+the longest cold start in the pipeline, and a development machine carried
+about 1.3 GB of install and build tree.
+
+**Decision.**
+
+- `bootstrap_dpdk.py --profile {bess,full}`. Apps are never built and every
+  library stays enabled in both (64 libraries, identical sets), so a plugin
+  that uses any DPDK library still compiles and links; only devices differ.
+- `bess`: the PCI and vdev buses, the ring and stack mempools, and the
+  `null`, `ring`, `af_xdp`, `af_packet` and `tap` ports. This is what the code
+  and tests name (`net_null`, `net_ring`, `net_af_xdp`); the Intel driver
+  names in `drivers/pmd_test.cc` are strings in fake `rte_eth_dev_info`
+  structs, not devices.
+- `full`: every NIC family; the unused device classes above stay off. It is the
+  default, so a README build for real hardware behaves as before.
+- CI builds and tests with `bess`; the release job builds `full`. The two have
+  separate cache keys (they previously shared one).
+
+**Measured** (cold builds from scratch, `-j8`, this workstation): `bess` 38 s,
+21 MB installed, 67 static libraries, 372 compile units; `full` 141 s, 68 MB
+installed, 148 static libraries, 1,624 compile units. The previous
+configuration was 2,246 units and a 703 MB build directory. BESS built against
+the `bess` install passes 99/99 tests (fast profile).
+
+**Out-of-tree plugins.** A plugin compiles against `bess-dev`, whose
+pkg-config file requires `libdpdk`; that now lists the libraries of the
+installed profile. Libraries are the same in both profiles, so no plugin
+loses an API. A plugin that needs a particular device (a crypto PMD, a NIC
+driver) must run on a DPDK that has it: it gets the devices of the `bessd` it
+loads into, which is the release (`full`) binary or whatever the deployer
+built. Plugins do not link drivers themselves.
+
+**Not done.**
+
+- A curated NIC set for `full` (for example only Intel and Mellanox families).
+  Which families are deployed is a product decision not made here.
+- Removing the old install and build trees on this machine: `build/gcc`,
+  `build/clang` and `build/perf-*` still load libraries from the previous
+  install, so deleting it would break them.
+- Re-running the full CI release build with `full` is left to CI; locally only
+  `bess` was built and tested end to end, `full` was built cold and
+  size-checked but BESS was not linked against it.
+
+**Revisit when:** a NIC family is deployed that `full` omits, a DPDK library
+is needed that has to be disabled to save time (none is expensive: libraries
+are 335 of 2,246 units), or the release set is curated.

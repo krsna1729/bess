@@ -92,6 +92,11 @@ and Clang.  `-Db_sanitize=address,undefined` and `-Db_coverage=true` are
 Meson's native sanitizer and coverage controls.  The default DPDK linkage is
 shared; `-Ddpdk_link=static` is an explicit opt-in.
 
+For development and CI, build DPDK with only the software ports:
+`tools/bootstrap_dpdk.py --af-xdp auto --profile bess` (38 s cold, 21 MB). The
+default `--profile full` builds every NIC family, for a binary that talks to
+hardware; it takes about 2 minutes.
+
 ### Build profiles
 
 Three profiles, by purpose. Only the first needs a native file; the others are
@@ -4491,6 +4496,21 @@ rather than one call site).
        over a real in-process gRPC channel; link-graph checker 46 edges, 6
        grandfathered (unchanged); staged install: 57 curated headers present
        and compiling. Clang and GCC 14 run in CI.
+
+131. **DPDK build profiles (D-051).**
+     - **What:** `tools/bootstrap_dpdk.py --profile {bess,full}`; apps never
+       built, all 64 libraries always enabled. `bess` = PCI/vdev buses, ring
+       and stack mempools, null/ring/af_xdp/af_packet/tap ports; `full` (the
+       default) = every NIC family. CI builds `bess`, the release job `full`,
+       with separate cache keys.
+     - **Numbers** (cold, `-j8`): `bess` 38 s / 21 MB installed / 372 compile
+       units; `full` 141 s / 68 MB / 1,624; previously 2,246 units and a 703 MB
+       build directory.
+     - **Plugins:** unaffected at the API level (identical library sets); a
+       plugin needing a specific device runs on whatever `bessd` it loads into.
+     - **Not done:** a curated NIC set; cleaning the old install (old trees
+       still use it); linking BESS against the `full` install locally.
+     - **Evidence:** BESS built against the `bess` install, fast tree 99/99.
 
 ## Review process established this session
 
