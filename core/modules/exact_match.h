@@ -20,6 +20,7 @@
 #include "../classifier/extract_plan.h"
 #include "../classifier/runtime_schema.h"
 #include "../event.h"
+#include "../framework/resource_bindings.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../rcu/rcu_ptr.h"
@@ -270,6 +271,7 @@ class ExactMatch final : public Module {
   // table_ as the transactional resource "<module name>/rules" (D-022),
   // registered from Init() to DeInit().
   std::unique_ptr<bess::classifier::ExactRuleResource> resource_;
+  bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
 };
 
 #endif  // BESS_MODULES_EXACTMATCH_H_

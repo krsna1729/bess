@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "framework/resource_codec.h"
+#include "framework/resource_bindings.h"
 #include "../dataplane/transaction_engine.h"
 #include "../utils/endian.h"
 #include "../utils/format.h"
@@ -53,8 +53,9 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
       },
       std::vector<std::string>{meters_resource_, next_hops_resource_});
   // Typed keys and values over the RPC (D-025).
-  resource_->SetCodec(
-      std::make_shared<dataplane::TypedCodec<bess::pb::ActionIdKey,
+  binding_ = init_context().resource_bindings().Bind(
+      *resource_,
+      std::make_shared<bess::framework::TypedCodec<bess::pb::ActionIdKey,
                                              bess::pb::ActionValue>>(
           [](const bess::pb::ActionIdKey &key)
               -> std::expected<dataplane::ResourceKey, std::string> {
@@ -72,6 +73,7 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
   if (auto registered =
           init_context().resources().Register(resource_.get());
       !registered) {
+    binding_.Reset();
     resource_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
@@ -88,6 +90,7 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
     const std::string name = resource_->name();
     CHECK(init_context().resources().ReleaseForTeardown(
         std::span<const std::string>(&name, 1)));
+    binding_.Reset();
     resource_.reset();
     return CommandFailure(EINVAL, "add_metadata_attr() failed");
   }
@@ -105,6 +108,7 @@ void ActionTable::DeInit() {
   auto released = init_context().resources().ReleaseForTeardown(
       std::span<const std::string>(&name, 1));
   CHECK(released) << released.error();
+  binding_.Reset();
   resource_.reset();
 }
 

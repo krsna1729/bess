@@ -206,8 +206,6 @@ class StagedOp {
   virtual void Abort() noexcept {}
 };
 
-class ResourceCodec;  // framework/resource_codec.h; the engine needs no protobuf.
-
 class Resource {
  public:
   // Upper bounds on what an operation's Publish() will ask of the Retirer.
@@ -246,13 +244,6 @@ class Resource {
   Resource &operator=(const Resource &) = delete;
 
   const std::string &name() const { return name_; }
-
-  // Module-facing typed codec; control owns the wire-envelope adapter. Null
-  // means this resource is not reachable over the RPC.
-  const ResourceCodec *codec() const { return codec_.get(); }
-  void SetCodec(std::shared_ptr<const ResourceCodec> codec) {
-    codec_ = std::move(codec);
-  }
 
   // The resources this one may reference (declared at construction).
   const std::vector<std::string> &declared_references() const {
@@ -315,7 +306,6 @@ class Resource {
   std::vector<std::string> declared_;
   int rank_ = 0;
   void *registration_ = nullptr;  // the engine's record for it
-  std::shared_ptr<const ResourceCodec> codec_;
 };
 
 }  // namespace dataplane

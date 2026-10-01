@@ -14,7 +14,7 @@
 
 #include "dataplane/resource.h"
 
-namespace bess::dataplane {
+namespace bess::framework {
 
 // Maps a serialized resource key/value message to the engine's internal
 // representation. Control-plane transports adapt their wire envelope to this
@@ -27,7 +27,7 @@ class ResourceCodec {
   virtual std::string key_type() const = 0;
   virtual std::string value_type() const = 0;
 
-  virtual std::expected<ResourceKey, std::string> Key(
+  virtual std::expected<dataplane::ResourceKey, std::string> Key(
       std::string_view type_url, const std::string &serialized) const = 0;
   virtual std::expected<std::any, std::string> Value(
       std::string_view type_url, const std::string &serialized) const = 0;
@@ -38,7 +38,8 @@ template <typename KeyMsg, typename ValueMsg>
 class TypedCodec final : public ResourceCodec {
  public:
   using KeyFn =
-      std::function<std::expected<ResourceKey, std::string>(const KeyMsg &)>;
+      std::function<std::expected<dataplane::ResourceKey, std::string>(
+          const KeyMsg &)>;
   using ValueFn =
       std::function<std::expected<std::any, std::string>(const ValueMsg &)>;
 
@@ -52,7 +53,7 @@ class TypedCodec final : public ResourceCodec {
     return std::string(ValueMsg::descriptor()->full_name());
   }
 
-  std::expected<ResourceKey, std::string> Key(
+  std::expected<dataplane::ResourceKey, std::string> Key(
       std::string_view type_url, const std::string &serialized) const override {
     KeyMsg msg;
     if (!Unpack(type_url, serialized, key_type(), &msg)) {
@@ -85,6 +86,6 @@ class TypedCodec final : public ResourceCodec {
   ValueFn value_;
 };
 
-}  // namespace bess::dataplane
+}  // namespace bess::framework
 
 #endif  // BESS_FRAMEWORK_RESOURCE_CODEC_H_

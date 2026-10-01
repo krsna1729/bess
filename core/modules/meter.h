@@ -9,6 +9,7 @@
 
 #include "../dataplane/resource.h"
 #include "../meter/meter_set.h"
+#include "../framework/resource_bindings.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../rcu/rcu_ptr.h"
@@ -101,6 +102,7 @@ class Meter final : public Module {
   bess::rcu::RcuPtr<bess::meter::MeterSet> published_;
 
   std::unique_ptr<bess::dataplane::Resource> resource_;
+  bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
 
   int meter_id_attr_ = -1;
 };

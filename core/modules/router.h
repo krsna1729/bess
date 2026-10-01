@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 
+#include "../framework/resource_bindings.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../route/router.h"
@@ -55,6 +56,9 @@ class Router final : public Module {
 
  private:
   std::unique_ptr<bess::route::Router> router_;
+  // After router_, which owns the resources they bind (D-044).
+  bess::framework::ResourceBinding next_hops_binding_;
+  bess::framework::ResourceBinding routes_binding_;
   int next_hop_id_attr_ = -1;
 };
 

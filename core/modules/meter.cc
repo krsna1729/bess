@@ -11,7 +11,7 @@
 #include <string>
 #include <utility>
 
-#include "framework/resource_codec.h"
+#include "framework/resource_bindings.h"
 #include "../dataplane/transaction_engine.h"
 #include "../utils/endian.h"
 #include "../utils/format.h"
@@ -186,8 +186,9 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
   published_.Initialize(live_->Build());
 
   resource_ = std::make_unique<MetersResource>(*this);
-  resource_->SetCodec(
-      std::make_shared<dataplane::TypedCodec<bess::pb::MeterIdKey,
+  binding_ = init_context().resource_bindings().Bind(
+      *resource_,
+      std::make_shared<bess::framework::TypedCodec<bess::pb::MeterIdKey,
                                              bess::pb::MeterPolicyValue>>(
           [](const bess::pb::MeterIdKey &key)
               -> std::expected<dataplane::ResourceKey, std::string> {
@@ -207,6 +208,7 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
   if (auto registered =
           init_context().resources().Register(resource_.get());
       !registered) {
+    binding_.Reset();
     resource_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
@@ -217,6 +219,7 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
     const std::string name = resource_->name();
     CHECK(init_context().resources().ReleaseForTeardown(
         std::span<const std::string>(&name, 1)));
+    binding_.Reset();
     resource_.reset();
     return CommandFailure(-meter_id_attr_, "add_metadata_attr() failed");
   }
@@ -234,6 +237,7 @@ void Meter::DeInit() {
   auto released = init_context().resources().ReleaseForTeardown(
       std::span<const std::string>(&name, 1));
   CHECK(released) << released.error();
+  binding_.Reset();
   resource_.reset();
 }
 

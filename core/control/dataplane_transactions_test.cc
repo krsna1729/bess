@@ -16,6 +16,7 @@
 
 #include "control/control_plane.h"
 #include "control/dataplane_transactions.h"
+#include "framework/resource_bindings.h"
 #include "runtime/runtime_state.h"
 #include "module.h"
 #include "modules/exact_match.h"
@@ -365,7 +366,8 @@ TEST_F(DataplaneTransactionsTest, LargeTransactionsFitTheServerLimits) {
 TEST(DataplaneTransactionsWindowTest, OldestRecordsAgeOut) {
   InitRuntimeOnce();
   bess::dataplane::TransactionEngine engine(bess::runtime::runtime().rcu());
-  DataplaneTransactions transactions(engine, /*epoch=*/7);
+  bess::framework::ResourceBindings bindings;
+  DataplaneTransactions transactions(engine, bindings, /*epoch=*/7);
   v2::ApplyTransactionRequest req;
   for (size_t i = 0; i <= DataplaneTransactions::kMaxRecords; i++) {
     req.set_request_id("r" + std::to_string(i));

@@ -12,7 +12,7 @@
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 
-#include "framework/resource_codec.h"
+#include "framework/resource_bindings.h"
 
 namespace bess::control {
 
@@ -95,8 +95,9 @@ v2::TransactionRecord Undecodable(int ops, int failed, std::string error,
 
 }  // namespace
 
-DataplaneTransactions::DataplaneTransactions(TransactionEngine &engine)
-    : DataplaneTransactions(engine, DrawEpoch()) {}
+DataplaneTransactions::DataplaneTransactions(
+    TransactionEngine &engine, const framework::ResourceBindings &bindings)
+    : DataplaneTransactions(engine, bindings, DrawEpoch()) {}
 
 ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     const v2::ApplyTransactionRequest &request) {
@@ -131,7 +132,7 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     if (resource == nullptr) {
       return std::unexpected("unknown resource '" + op.resource() + "'");
     }
-    const dataplane::ResourceCodec *codec = resource->codec();
+    const framework::ResourceCodec *codec = bindings_.Find(*resource);
     if (codec == nullptr) {
       return std::unexpected("resource '" + op.resource() +
                              "' is not reachable over the RPC");
@@ -221,8 +222,8 @@ v2::ListTransactionResourcesResponse DataplaneTransactions::List() const {
   response.set_generation(engine_.generation());
   for (const std::string &name : engine_.ResourceNames()) {
     const dataplane::Resource *resource = engine_.FindResource(name);
-    const dataplane::ResourceCodec *codec =
-        resource == nullptr ? nullptr : resource->codec();
+    const framework::ResourceCodec *codec =
+        resource == nullptr ? nullptr : bindings_.Find(*resource);
     if (codec == nullptr) {
       continue;  // not reachable over the RPC
     }

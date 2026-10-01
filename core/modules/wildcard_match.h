@@ -19,6 +19,7 @@
 #include "../classifier/masked_rule_resource.h"
 #include "../classifier/runtime_schema.h"
 #include "../event.h"
+#include "../framework/resource_bindings.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../rcu/rcu_ptr.h"
@@ -210,6 +211,7 @@ class WildcardMatch final : public Module {
   // table_ as the transactional resource "<module name>/rules" (D-024),
   // registered from Init() to DeInit().
   std::unique_ptr<bess::classifier::MaskedRuleResource> resource_;
+  bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
 
   // Publication and reclamation (bess::rcu::RcuPtr + the runtime's RcuDomain):
   // one acquire load per batch on the data path, serialized rebuilds off it,

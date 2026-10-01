@@ -58,8 +58,9 @@ class ControlV2Service final : public pb::v2::Control::Service {
   // Dataplane transactions go to `engine` (the runtime's, by default).
   explicit ControlV2Service(ControlPlane &control_plane);
   ControlV2Service(ControlPlane &control_plane,
-                   dataplane::TransactionEngine &engine)
-      : control_plane_(control_plane), transactions_(engine) {}
+                   dataplane::TransactionEngine &engine,
+                   const framework::ResourceBindings &bindings)
+      : control_plane_(control_plane), transactions_(engine, bindings) {}
 
   grpc::Status GetPipeline(grpc::ServerContext *context,
                            const pb::v2::GetPipelineRequest *request,

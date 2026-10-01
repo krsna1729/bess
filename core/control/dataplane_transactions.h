@@ -11,12 +11,13 @@
 
 #include "control/control_error.h"
 #include "dataplane/transaction_engine.h"
+#include "framework/resource_bindings.h"
 #include "pb/control_v2.pb.h"
 
 namespace bess::control {
 
 // The dataplane transaction RPC's server side (G1.2c, Decision D-025), apart
-// from gRPC: typed operations decoded through each resource's codec, applied
+// from gRPC: typed operations decoded through each resource's bound codec, applied
 // through the TransactionEngine, and outcomes recorded by request_id.
 //
 //   - Idempotency: an outcome is recorded with a digest of the request's
@@ -35,9 +36,12 @@ class DataplaneTransactions {
  public:
   static constexpr size_t kMaxRecords = 4096;
 
-  explicit DataplaneTransactions(dataplane::TransactionEngine &engine);
-  DataplaneTransactions(dataplane::TransactionEngine &engine, uint64_t epoch)
-      : engine_(engine), epoch_(epoch) {}
+  DataplaneTransactions(dataplane::TransactionEngine &engine,
+                        const framework::ResourceBindings &bindings);
+  DataplaneTransactions(dataplane::TransactionEngine &engine,
+                        const framework::ResourceBindings &bindings,
+                        uint64_t epoch)
+      : engine_(engine), bindings_(bindings), epoch_(epoch) {}
 
   ControlResult<pb::v2::ApplyTransactionResponse> Apply(
       const pb::v2::ApplyTransactionRequest &request);
@@ -57,6 +61,7 @@ class DataplaneTransactions {
               const pb::v2::TransactionRecord &record);
 
   dataplane::TransactionEngine &engine_;
+  const framework::ResourceBindings &bindings_;
   const uint64_t epoch_;
   std::unordered_map<std::string, Recorded> records_;
   std::deque<std::string> order_;  // oldest first

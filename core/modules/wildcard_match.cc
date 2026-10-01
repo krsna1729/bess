@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-#include "../framework/resource_codec.h"
+#include "../framework/resource_bindings.h"
 #include "../dataplane/transaction_engine.h"
 #include "../utils/endian.h"
 #include "../utils/format.h"
@@ -169,7 +169,8 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
           }});
   // Typed keys and values over the RPC (D-025): values and masks per field,
   // checked and packed as the add command does, and {priority, gate}.
-  resource_->SetCodec(std::make_shared<bess::dataplane::TypedCodec<
+  binding_ = init_context().resource_bindings().Bind(
+      *resource_,std::make_shared<bess::framework::TypedCodec<
                           bess::pb::WildcardMatchRuleKey,
                           bess::pb::WildcardMatchRuleValue>>(
       [this](const bess::pb::WildcardMatchRuleKey &key)
@@ -202,6 +203,7 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
   if (auto registered =
           init_context().resources().Register(resource_.get());
       !registered) {
+    binding_.Reset();
     resource_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
@@ -217,6 +219,7 @@ void WildcardMatch::DeInit() {
   auto unregistered =
       init_context().resources().Unregister(resource_->name());
   CHECK(unregistered) << unregistered.error();
+  binding_.Reset();
   resource_.reset();
 }
 

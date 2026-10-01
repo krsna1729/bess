@@ -19,6 +19,9 @@ class RcuDomain;
 namespace dataplane {
 class TransactionEngine;
 }  // namespace dataplane
+namespace framework {
+class ResourceBindings;
+}  // namespace framework
 namespace runtime {
 class PortRegistry;
 }  // namespace runtime
@@ -47,9 +50,12 @@ class PortDirectory {
 class ModuleInitContext {
  public:
   ModuleInitContext(dataplane::TransactionEngine &resources,
-                    rcu::RcuDomain &rcu,
+                    ResourceBindings &resource_bindings, rcu::RcuDomain &rcu,
                     const runtime::PortRegistry &ports) noexcept
-      : resources_(resources), rcu_(rcu), ports_(ports) {}
+      : resources_(resources),
+        resource_bindings_(resource_bindings),
+        rcu_(rcu),
+        ports_(ports) {}
 
   ModuleInitContext(const ModuleInitContext &) = delete;
   ModuleInitContext &operator=(const ModuleInitContext &) = delete;
@@ -58,6 +64,12 @@ class ModuleInitContext {
   // hold the control-plane lock, as module commands do.
   dataplane::TransactionEngine &resources() const noexcept {
     return resources_;
+  }
+
+  // Control-side metadata (the wire codec) for resources this module
+  // registers, kept apart from the dataplane resource itself (D-044).
+  ResourceBindings &resource_bindings() const noexcept {
+    return resource_bindings_;
   }
 
   // The reader domain every published table retires through. Needed by
@@ -72,6 +84,7 @@ class ModuleInitContext {
 
  private:
   dataplane::TransactionEngine &resources_;
+  ResourceBindings &resource_bindings_;
   rcu::RcuDomain &rcu_;
   PortDirectory ports_;
 };

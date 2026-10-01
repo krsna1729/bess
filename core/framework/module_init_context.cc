@@ -2,6 +2,7 @@
 
 #include "framework/module_init_context.h"
 
+#include "framework/resource_bindings.h"
 #include "runtime/runtime_state.h"
 
 namespace bess {
@@ -12,11 +13,12 @@ Port *PortDirectory::Find(const std::string &name) const {
 }
 
 const ModuleInitContext &ModuleInitContext::ProcessDefault() {
-  // Constructed after RuntimeState (first use), so destroyed before it.
-  static const ModuleInitContext context(
-      runtime::runtime().transactions(), runtime::runtime().rcu(),
-      runtime::runtime().ports());
-  return context;
+  // Never destroyed: modules the runtime owns call back into it while the
+  // runtime itself is being destroyed at exit.
+  static const ModuleInitContext *const context = new ModuleInitContext(
+      runtime::runtime().transactions(), ResourceBindings::ProcessDefault(),
+      runtime::runtime().rcu(), runtime::runtime().ports());
+  return *context;
 }
 
 }  // namespace framework

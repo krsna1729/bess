@@ -450,7 +450,8 @@ void ConfigureControlServer(grpc::ServerBuilder *builder) {
 }
 
 ControlV2Service::ControlV2Service(ControlPlane &control_plane)
-    : ControlV2Service(control_plane, runtime::runtime().transactions()) {}
+    : ControlV2Service(control_plane, runtime::runtime().transactions(),
+                       framework::ResourceBindings::ProcessDefault()) {}
 
 grpc::Status ControlV2Service::ApplyTransaction(
     grpc::ServerContext *context, const v2::ApplyTransactionRequest *request,

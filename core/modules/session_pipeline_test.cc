@@ -23,7 +23,7 @@
 
 #include "runtime/runtime_state.h"
 #include "dataplane/action_id.h"
-#include "framework/resource_codec.h"
+#include "framework/resource_bindings.h"
 #include "dataplane/transaction_engine.h"
 #include "meter/meter.h"
 #include "module.h"
@@ -46,6 +46,10 @@ using bess::route::NextHopId;
 using Outcome = TransactionEngine::Outcome;
 
 TransactionEngine &Engine() { return bess::runtime::runtime().transactions(); }
+
+bess::framework::ResourceBindings &Bindings() {
+  return bess::framework::ResourceBindings::ProcessDefault();
+}
 
 template <typename Arg>
 google::protobuf::Any Pack(const Arg &arg) {
@@ -562,7 +566,7 @@ TEST_F(SessionPipelineTest, ActionModeCommandsKeepReferenceCounts) {
 TEST_F(SessionPipelineTest, RouterCodecRejectsOutOfRangePrefix) {
   Router *rt = CreateRouterModule("rt");
   ASSERT_NE(nullptr, rt);
-  const auto *codec = rt->router()->routes_resource_object()->codec();
+  const auto *codec = Bindings().Find(*rt->router()->routes_resource_object());
   bess::pb::RouterRouteKey key;
   key.set_ipv4("0.0.0.0");
   key.set_prefix_length(256);  // narrowing to uint8_t would silently make /0
@@ -576,7 +580,7 @@ TEST_F(SessionPipelineTest, RouterCodecRejectsOutOfRangePrefix) {
 TEST_F(SessionPipelineTest, ResourceCodecUnpacksTypedWireMessages) {
   Router *rt = CreateRouterModule("rt");
   ASSERT_NE(nullptr, rt);
-  const auto *codec = rt->router()->routes_resource_object()->codec();
+  const auto *codec = Bindings().Find(*rt->router()->routes_resource_object());
   bess::pb::RouterRouteKey key;
   key.set_ipv4("10.0.0.0");
   key.set_prefix_length(24);
@@ -660,7 +664,7 @@ TEST_F(SessionPipelineTest, CodecsRejectMismatchedFieldsAndUnknownEnums) {
 
   const auto *em_res = Engine().FindResource("em/rules");
   ASSERT_NE(nullptr, em_res);
-  const auto *em_codec = em_res->codec();
+  const auto *em_codec = Bindings().Find(*em_res);
   bess::pb::ExactMatchRuleValue em_val;
   em_val.set_gate(1);
   em_val.set_action_id(1);
@@ -669,7 +673,7 @@ TEST_F(SessionPipelineTest, CodecsRejectMismatchedFieldsAndUnknownEnums) {
                    ->Value(packed_em_val.type_url(), packed_em_val.value())
                    .has_value());
 
-  const auto *nh_codec = rt->router()->next_hops_resource_object()->codec();
+  const auto *nh_codec = Bindings().Find(*rt->router()->next_hops_resource_object());
   ASSERT_NE(nullptr, nh_codec);
   bess::pb::RouterNextHopValue nh_val;
   nh_val.set_egress_gate(0);

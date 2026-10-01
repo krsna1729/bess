@@ -37,6 +37,8 @@ FORBIDDEN_RULES = [
             ("runtime/", "dataplane core must not depend on runtime"),
             ("control/", "dataplane core must not depend on control"),
             ("pb/", "dataplane core must not depend on protobuf"),
+            ("google/protobuf/", "dataplane core must not depend on protobuf"),
+            ("grpc", "dataplane core must not depend on gRPC"),
             ("module.h", "dataplane core must not depend on Module"),
         ],
     ),
@@ -139,6 +141,7 @@ def run_self_test():
         ("core/classifier/exact.h", '#include "module.h"'),
         ("core/meter/meter.cc", '#include "control/api_v2.h"'),
         ("core/modules/foo.cc", '#include "runtime/runtime_state.h"'),
+        ("core/dataplane/baz.h", '#include <google/protobuf/any.h>'),
     ]
 
     include_pattern = re.compile(r'^\s*#\s*include\s+["<]([^">]+)[">]')
@@ -152,10 +155,10 @@ def run_self_test():
                     if forbidden_sub in inc:
                         dummy_violations.append((fake_path, inc, reason))
                         break
-    assert len(dummy_violations) == 5, (
-        f"Expected 5 synthetic violations, got {len(dummy_violations)}"
+    assert len(dummy_violations) == 6, (
+        f"Expected 6 synthetic violations, got {len(dummy_violations)}"
     )
-    print("Self-test PASSED: all 5 synthetic violations correctly detected.")
+    print("Self-test PASSED: all 6 synthetic violations correctly detected.")
 
 
 def main():

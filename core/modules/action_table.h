@@ -11,6 +11,7 @@
 #include "../dataplane/slot_resource.h"
 #include "../dataplane/slot_table.h"
 #include "../meter/meter.h"
+#include "../framework/resource_bindings.h"
 #include "../module.h"
 #include "../pb/module_msg.pb.h"
 #include "../route/router.h"
@@ -75,6 +76,7 @@ class ActionTable final : public Module {
  private:
   std::unique_ptr<bess::dataplane::SlotTable<ActionId, Action>> actions_;
   std::unique_ptr<bess::dataplane::SlotResource<ActionId, Action>> resource_;
+  bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
   std::string meters_resource_;
   std::string next_hops_resource_;
 

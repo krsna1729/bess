@@ -11,7 +11,7 @@
 #include <string>
 #include <utility>
 
-#include "framework/resource_codec.h"
+#include "framework/resource_bindings.h"
 #include "../dataplane/transaction_engine.h"
 #include "../utils/endian.h"
 #include "../utils/ether.h"
@@ -83,13 +83,16 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   router_ = std::move(*router);
   if (auto enrolled = router_->Enroll(init_context().resources());
       !enrolled) {
+    next_hops_binding_.Reset();
+    routes_binding_.Reset();
     router_.reset();
     return CommandFailure(EINVAL, "%s", enrolled.error().c_str());
   }
 
   // Typed keys and values over the RPC (D-025).
-  router_->next_hops_resource_object()->SetCodec(
-      std::make_shared<dataplane::TypedCodec<bess::pb::RouterNextHopIdKey,
+  next_hops_binding_ = init_context().resource_bindings().Bind(
+      *router_->next_hops_resource_object(),
+      std::make_shared<bess::framework::TypedCodec<bess::pb::RouterNextHopIdKey,
                                              bess::pb::RouterNextHopValue>>(
           [](const bess::pb::RouterNextHopIdKey &key)
               -> std::expected<dataplane::ResourceKey, std::string> {
@@ -123,8 +126,9 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
             hop.src_mac = *src;
             return std::any(hop);
           }));
-  router_->routes_resource_object()->SetCodec(
-      std::make_shared<dataplane::TypedCodec<bess::pb::RouterRouteKey,
+  routes_binding_ = init_context().resource_bindings().Bind(
+      *router_->routes_resource_object(),
+      std::make_shared<bess::framework::TypedCodec<bess::pb::RouterRouteKey,
                                              bess::pb::RouterRouteValue>>(
           [](const bess::pb::RouterRouteKey &key)
               -> std::expected<dataplane::ResourceKey, std::string> {
@@ -157,6 +161,8 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   if (next_hop_id_attr_ < 0) {
     auto released = router_->Release();
     CHECK(released) << released.error();
+    next_hops_binding_.Reset();
+    routes_binding_.Reset();
     router_.reset();
     return CommandFailure(-next_hop_id_attr_, "add_metadata_attr() failed");
   }
@@ -172,6 +178,8 @@ void Router::DeInit() {
   // be torn down.
   auto released = router_->Release();
   CHECK(released) << released.error();
+  next_hops_binding_.Reset();
+  routes_binding_.Reset();
   router_.reset();
 }
 

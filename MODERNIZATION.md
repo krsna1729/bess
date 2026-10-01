@@ -4308,6 +4308,17 @@ rather than one call site).
      - **Evidence:** GCC Meson suite 128/128; staged-header verifier 52/52;
        include checker and its 5-case self-test pass.
 
+124. **M4: wire codecs leave the dataplane Resource (D-044).**
+     - **What:** `Resource::codec()/SetCodec()` removed; codecs are bound
+       through `framework::ResourceBindings` (RAII `ResourceBinding` handles)
+       by ActionTable, Meter, Router (two resources), ExactMatch and
+       WildcardMatch; `DataplaneTransactions` reads them from the bindings.
+       The include checker rejects protobuf/gRPC includes in `core/dataplane`.
+     - **Not done:** a protobuf-free `ResourceSchema` interface with a
+       protobuf helper above it; the codec still takes protobuf type URLs.
+     - **Evidence:** GCC and Clang Meson suites 129/129 each, including 5 new
+       binding tests and the live session-pipeline tests; include checker 6-case self-test.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

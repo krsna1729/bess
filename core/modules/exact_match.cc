@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include "../framework/resource_codec.h"
+#include "../framework/resource_bindings.h"
 #include "../dataplane/transaction_engine.h"
 #include "../event.h"
 #include "../metadata.h"
@@ -585,7 +585,8 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
   // Typed keys and values over the RPC (D-025): the rule's fields, packed
   // here as the add command packs them, and the rule's value -- the gate, or
   // the action id in action mode.
-  resource_->SetCodec(std::make_shared<bess::dataplane::TypedCodec<
+  binding_ = init_context().resource_bindings().Bind(
+      *resource_,std::make_shared<bess::framework::TypedCodec<
                           bess::pb::ExactMatchRuleKey,
                           bess::pb::ExactMatchRuleValue>>(
       [this](const bess::pb::ExactMatchRuleKey &key)
@@ -628,6 +629,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
   if (auto registered =
           init_context().resources().Register(resource_.get());
       !registered) {
+    binding_.Reset();
     resource_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
@@ -641,6 +643,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
     if (action_id_attr_ < 0) {
       const std::string name = resource_->name();
       CHECK(init_context().resources().Unregister(name));
+      binding_.Reset();
       resource_.reset();
       return CommandFailure(-action_id_attr_, "add_metadata_attr() failed");
     }
@@ -669,6 +672,7 @@ void ExactMatch::DeInit() {
     auto unregistered = engine.Unregister(resource_->name());
     CHECK(unregistered) << unregistered.error();
   }
+  binding_.Reset();
   resource_.reset();
 }
 

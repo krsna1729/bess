@@ -64,6 +64,7 @@ file is the reasoning.
 | D-041 | Curated `bess-dev` headers and source-only plugin contract | accepted |
 | D-042 | Module initialization capabilities replace direct runtime access (M3) | accepted |
 | D-043 | Standalone release link: libgcc_eh ahead of libunwind, non-PIE | accepted |
+| D-044 | Resource wire codecs bound outside the dataplane Resource (M4) | accepted |
 
 
 ---
@@ -2059,7 +2060,8 @@ user chose typed keys and values over raw bytes.
   run under the control-plane lock, as module commands do (both write the
   same tables).
 - **Typed keys and values per resource.** A resource that should be
-  reachable over the RPC carries a `ResourceCodec` (set by its owner): the
+  reachable over the RPC has a `ResourceCodec` bound to it by its owner
+  (since D-044; originally a `Resource` member): the
   protobuf message types of its keys and values, and their conversion to
   the engine's key bytes and value. The server packs keys exactly as the
   module's commands do (the codecs call the commands' own parsing), so no
@@ -3149,3 +3151,51 @@ link succeeds; `ldd` shows no `librte` libraries; `bessd --help` starts.
 
 **Revisit when:** the release job moves off distribution `libunwind.a`, or
 BESS stops needing libunwind through glog.
+
+---
+
+## D-044 Resource wire codecs are bound outside the dataplane Resource (M4)
+
+**Status:** accepted (2026-10-01).
+**Code:** `core/framework/resource_bindings.{h,cc}`,
+`core/framework/resource_codec.h`, `core/dataplane/resource.h`,
+`core/control/dataplane_transactions.{h,cc}`, `core/control/api_v2.{h,cc}`,
+`core/modules/{action_table,meter,router,exact_match,wildcard_match}.{h,cc}`,
+`tools/check_includes.py`.
+
+**Context.** `dataplane::Resource` carried a `shared_ptr<const ResourceCodec>`
+with `codec()`/`SetCodec()`, so the dataplane resource type was shaped by a
+control-side wire concern (roadmap M4).
+
+**Decision.**
+
+- `Resource` has no codec. `ResourceCodec`/`TypedCodec` moved to namespace
+  `bess::framework`.
+- `framework::ResourceBindings` maps `const Resource*` to a codec. `Bind()`
+  returns a move-only `ResourceBinding` handle that removes the binding when
+  reset or destroyed, so a resource freed and reallocated at the same address
+  cannot inherit a stale codec. A resource without a binding is not reachable
+  over the RPC, as before.
+- Modules bind through `init_context().resource_bindings()` (a fourth,
+  named capability) and keep the handle declared after the resource it binds,
+  resetting it before the resource.
+- `DataplaneTransactions` reads codecs from a `const ResourceBindings&` it is
+  constructed with. The RPC schema, type URLs and error strings are unchanged.
+- `tools/check_includes.py` now also rejects `google/protobuf/` and `grpc`
+  includes under `core/dataplane` (non-test), so the dataplane core stays
+  protobuf-free by build-time check.
+- Not done: a protobuf-schema helper layered over a protobuf-free
+  `ResourceSchema` interface (the roadmap's `ResourceSchema`/
+  `control/protobuf_resource_schema.h`). The codec interface still speaks
+  protobuf type URLs; it now lives wholly outside the dataplane. `std::any`
+  stays, per the roadmap.
+
+Both the context and the process-default bindings are intentionally never
+destroyed: module destructors unbind while the runtime is torn down at exit.
+
+**Verification:** GCC and Clang Meson suites 129/129 each (including 5 new `ResourceBindings`
+tests and the live session-pipeline tests, which exercise the RPC decode and
+listing paths).
+
+**Revisit when:** M5 gives each application instance its own bindings, or a
+non-protobuf control binding needs the codec interface generalized.
