@@ -79,11 +79,12 @@ TEST_F(PacketStoreTest, BufferAndReleaseFlow) {
   PacketStore *ps = CreateStore(arg);
   ASSERT_NE(nullptr, ps);
 
-  // Connect gate 0 to Sink
+  // ProcessBatch is invoked synchronously here, not by a worker; the default
+  // Track hook requires a worker identity and is irrelevant to this test.
   const auto &builders = ModuleBuilder::all_module_builders();
   Module *sink0 = ModuleGraph::CreateModule(builders.find("Sink")->second,
                                             "sink0", {}, nullptr);
-  ASSERT_EQ(0, ModuleGraph::ConnectModules(ps, 0, sink0, 0));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(ps, 0, sink0, 0, true));
 
   PlainPacketPool pool(16);
   Task task(ps, nullptr);
@@ -127,10 +128,12 @@ TEST_F(PacketStoreTest, PerFlowCapacityEviction) {
   PacketStore *ps = CreateStore(arg);
   ASSERT_NE(nullptr, ps);
 
+  // ProcessBatch is invoked synchronously here, not by a worker; omit the
+  // worker-only default Track hook.
   const auto &builders = ModuleBuilder::all_module_builders();
   Module *sink1 = ModuleGraph::CreateModule(builders.find("Sink")->second,
                                             "sink1", {}, nullptr);
-  ASSERT_EQ(0, ModuleGraph::ConnectModules(ps, 1, sink1, 0));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(ps, 1, sink1, 0, true));
 
   PlainPacketPool pool(16);
   Task task(ps, nullptr);
