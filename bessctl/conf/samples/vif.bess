@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Virtual Interface (VIF) example.
+# Demonstrates multiple logical virtual interfaces sharing a physical pipeline:
+# - VIF 1: VLAN 100, MAC 02:00:00:00:01:01, IP 192.168.1.1, RouteDomain 10 (Gate 1)
+# - VIF 2: VLAN 200, MAC 02:00:00:00:02:02, IP 192.168.2.1, RouteDomain 20 (Gate 2)
+# - Unclassified traffic steered to default Gate 0
+
+import scapy.all as scapy
+
+def gen_tagged_pkt(vlan, dmac, smac, sip, dip):
+    eth = scapy.Ether(src=smac, dst=dmac)
+    dot1q = scapy.Dot1Q(vlan=vlan)
+    ip = scapy.IP(src=sip, dst=dip)
+    udp = scapy.UDP(sport=10001, dport=10002)
+    payload = 'VIF_SAMPLE_PAYLOAD'
+    return bytes(eth/dot1q/ip/udp/payload)
+
+def gen_untagged_pkt(dmac, smac, sip, dip):
+    eth = scapy.Ether(src=smac, dst=dmac)
+    ip = scapy.IP(src=sip, dst=dip)
+    udp = scapy.UDP(sport=10001, dport=10002)
+    payload = 'UNCLASSIFIED_PAYLOAD'
+    return bytes(eth/ip/udp/payload)
+
+pkts = [
+    # Packet 1: Targeted for VIF 1 (VLAN 100)
+    gen_tagged_pkt(100, '02:00:00:00:01:01', '02:aa:bb:cc:dd:ee', '192.168.1.100', '192.168.1.1'),
+    # Packet 2: Targeted for VIF 2 (VLAN 200)
+    gen_tagged_pkt(200, '02:00:00:00:02:02', '02:aa:bb:cc:dd:ee', '192.168.2.100', '192.168.2.1'),
+    # Packet 3: Untagged fallback
+    gen_untagged_pkt('02:ff:ff:ff:ff:ff', '02:aa:bb:cc:dd:ee', '10.0.0.100', '10.0.0.1'),
+]
+
+vif::Vif(default_gate=0, interfaces=[
+    {
+        'id': 1,
+        'vlan': 100,
+        'mac_addr': '02:00:00:00:01:01',
+        'ip_addr': '192.168.1.1',
+        'route_domain': 10,
+        'gate': 1,
+    },
+    {
+        'id': 2,
+        'vlan': 200,
+        'mac_addr': '02:00:00:00:02:02',
+        'ip_addr': '192.168.2.1',
+        'route_domain': 20,
+        'gate': 2,
+    },
+])
+
+# Pipeline
+Source() -> Rewrite(templates=pkts) -> vif
+
+# Egress sinks
+vif:0 -> Sink()  # Gate 0: Unclassified / fallback
+vif:1 -> Sink()  # Gate 1: VIF 1 (VLAN 100)
+vif:2 -> Sink()  # Gate 2: VIF 2 (VLAN 200)

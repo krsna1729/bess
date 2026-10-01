@@ -1367,3 +1367,42 @@ message RouterArg {
   uint64 max_tbl8s = 2; /// Most rte_lpm tbl8 groups (default 256).
   uint64 max_next_hops = 3; /// Most next hops (default 4096).
 }
+
+/**
+ * The Vif module manages Virtual Interfaces (VIFs) sharing a physical port or
+ * pipeline. It classifies packets by VLAN (802.1Q) and destination MAC,
+ * strips the VLAN tag on ingress, assigns logical vif_id and route_domain
+ * metadata, responds to local ARP requests for the VIF's IP address, and
+ * steers traffic to designated output gates.
+ *
+ * __Input Gates__: 1
+ * __Output Gates__: many
+ */
+message VifArg {
+  message Interface {
+    uint32 id = 1;             /// Logical VIF ID
+    uint32 vlan = 2;           /// 802.1Q VLAN tag (0: untagged)
+    string mac_addr = 3;       /// Interface MAC address
+    string ip_addr = 4;        /// Local IPv4 address for ARP responder (optional)
+    uint32 route_domain = 5;   /// Associated L3 VRF Route Domain ID
+    uint32 gate = 6;           /// Egress/demux output gate
+  }
+  repeated Interface interfaces = 1;
+  uint32 default_gate = 2;     /// Gate for unclassified traffic (default: DROP_GATE)
+}
+
+message VifCommandAddArg {
+  uint32 id = 1;
+  uint32 vlan = 2;
+  string mac_addr = 3;
+  string ip_addr = 4;
+  uint32 route_domain = 5;
+  uint32 gate = 6;
+}
+
+message VifCommandDeleteArg {
+  uint32 id = 1;
+}
+
+message VifCommandClearArg {
+}
