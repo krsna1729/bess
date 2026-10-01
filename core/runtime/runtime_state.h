@@ -10,6 +10,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include "framework/instance_registry.h"
+
 class Module;
 class Port;
 
@@ -166,6 +168,8 @@ class RuntimeState {
   PortRegistry &ports() { return ports_; }
   ModuleRegistry &modules() { return modules_; }
   TrafficClassRegistry &traffic_classes() { return traffic_classes_; }
+  // Application-owned object graphs shared by modules (D-045).
+  framework::InstanceRegistry &instances() { return instances_; }
   WorkerManager &workers();
 
   // The single dataplane reader domain (K1): workers register once and report
@@ -201,6 +205,8 @@ class RuntimeState {
   RuntimeState();
   ~RuntimeState();
 
+  // First: modules (below) release their leases on it as they are destroyed.
+  framework::InstanceRegistry instances_;
   PortRegistry ports_;
   ModuleRegistry modules_;
   TrafficClassRegistry traffic_classes_;

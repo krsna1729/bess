@@ -106,14 +106,40 @@ construction or `Init()`:
 | Method | Capability |
 |---|---|
 | `resources()` | register/apply transactional resources (`dataplane::TransactionEngine`) |
+| `resource_bindings()` | bind a resource's wire codec (control-side metadata) |
 | `rcu()` | the reader domain published tables retire through |
 | `ports().Find(name)` | look up an existing port by name |
+| `instances()` | borrow application-owned shared state (below) |
 
 The context is bound when the `Module` base is constructed, so it is usable in
 a derived constructor's member initializers (for example
 `published_(init_context().rcu())`). Never call it from `ProcessBatch` or
 `RunTask`. Modules in `core/modules` must not include `runtime/`; `tools/check_includes.py`
 enforces that.
+
+### Application instances (`init_context().instances()`)
+
+State shared by several module instances lives in an explicit, named
+instance rather than a global service (`framework/instance_registry.h`):
+
+```cpp
+// Application code (control plane), once:
+auto created = runtime.instances().Create<UpfState>("upf0", options);
+
+// In each module's Init(), once:
+auto lease = init_context().instances().Lookup<UpfState>("upf0");
+if (!lease) {
+  return CommandFailure(ENOENT, "%s", InstanceErrorName(lease.error()));
+}
+lease_ = std::move(*lease);   // keeps the instance alive
+state_ = lease_.get();        // cached; used from ProcessBatch
+```
+
+`Lookup` never creates, a wrong type is an error, and `Destroy` is refused
+while any module holds a lease. The packet path uses the cached pointer only:
+no name lookup, no reference count. Create and destroy are structural
+operations done under the control-plane lock; the state's own contents must
+provide their own synchronization for live updates.
 
 ---
 

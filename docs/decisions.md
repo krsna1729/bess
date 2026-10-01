@@ -65,6 +65,7 @@ file is the reasoning.
 | D-042 | Module initialization capabilities replace direct runtime access (M3) | accepted |
 | D-043 | Standalone release link: libgcc_eh ahead of libunwind, non-PIE | accepted |
 | D-044 | Resource wire codecs bound outside the dataplane Resource (M4) | accepted |
+| D-045 | Explicit application instances with leased lookup (M5) | accepted |
 
 
 ---
@@ -3199,3 +3200,54 @@ listing paths).
 
 **Revisit when:** M5 gives each application instance its own bindings, or a
 non-protobuf control binding needs the codec interface generalized.
+
+---
+
+## D-045 Explicit application instances (M5)
+
+**Status:** accepted (2026-10-01).
+**Code:** `core/framework/instance_registry.{h,cc}`,
+`core/framework/module_init_context.{h,cc}`, `core/runtime/runtime_state.h`,
+`core/modules/shared_instance_test.cc`, `docs/plugin-api.md`.
+
+**Context.** `SharedObjectSpace` is global, creates objects implicitly on first
+`Get<T>()`, and shares them by `shared_ptr`; an application that needs one
+object graph shared by several modules (a vSwitch, a UPF) would otherwise use
+a global, implicit service (roadmap M5).
+
+**Decision.**
+
+- `framework::InstanceRegistry`, owned by `RuntimeState` and reached through
+  `init_context().instances()`, holds named, typed, application-owned
+  objects. `Create<T>(name, args...)` makes one and fails with `kExists` on a
+  duplicate name; `Lookup<T>(name)` never creates and fails with `kNotFound`
+  or `kTypeMismatch`; `Destroy(name)` is explicit and fails with `kInUse`
+  while any lease is outstanding; `Describe()` lists name, demangled type and
+  lease count.
+- Borrowing is an `InstanceLease<T>` (move-only, counted). A module resolves
+  its instance once in `Init()`, keeps the lease as a member, and caches
+  `lease.get()`. The packet path performs no name lookup and no reference
+  count change; the pointer stays valid because the lease blocks `Destroy`.
+- Lifetime is structural: create and destroy run under the control-plane lock,
+  with the consumers' pipeline stopped or reconfigured. The registry is not
+  thread-safe. Contents update live under the instance's own synchronization.
+- Destroying a lease-holding module releases its lease; the registry is the
+  first `RuntimeState` member so it is destroyed after the module registry.
+- `SharedObjectSpace` is unchanged and remains for compatibility. The
+  reference example (`shared_instance_test.cc`) uses explicit instances.
+- The registry header is installed API; its implementation compiles into the
+  runtime library so `RuntimeState` owns it without a link cycle.
+- Not done: exposing instances over the management RPC. The roadmap allows
+  generic create/destroy only with a plugin-supplied schema and constructor
+  binding, and no consumer exists; `Describe()` is available in-process.
+  The roadmap's separate `Require<T>()` is `Lookup<T>()` here.
+
+**Verification:** GCC and Clang Meson suites 131/131 each; installed-header
+verifier 53/53. New: 10 registry unit tests (duplicate create constructs
+nothing, lookup never creates, type mismatch leaks no lease, destroy refused
+while leased, move semantics, ordered description) and 4 reference-example
+tests (two modules share one counter; destroy refused while both hold it, then
+allowed; init fails on a missing instance and on a type mismatch).
+
+**Revisit when:** a control-side create/destroy binding is requested, or
+instances must be created while workers run (an RCU-based lease).

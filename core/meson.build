@@ -38,6 +38,9 @@ packet_sources = files(
 
 runtime_sources = files(
   'runtime/runtime_state.cc',
+  # Compiled with the runtime so RuntimeState can own it without a link cycle;
+  # the header is public API under framework/ (D-045).
+  'framework/instance_registry.cc',
   'runtime/thread_placement.cc',
   'runtime/worker_manager.cc',
   'runtime/dpdk.cc',
@@ -427,6 +430,7 @@ core_public_subdir_headers = {
     'utils/time.h',
   ),
   'framework': files(
+    'framework/instance_registry.h',
     'framework/module_init_context.h',
     'framework/plugin.h',
   ),
@@ -510,6 +514,8 @@ unit_test_sources = [
   'control/dataplane_transactions_test.cc',
   'control/thread_placement_test.cc',
   'runtime/startup_test.cc',
+  'framework/instance_registry_test.cc',
+  'modules/shared_instance_test.cc',
   'control/apply_pipeline_test.cc',
   'control/control_plane_test.cc',
   'bessd_test.cc',

@@ -20,6 +20,7 @@ namespace dataplane {
 class TransactionEngine;
 }  // namespace dataplane
 namespace framework {
+class InstanceRegistry;
 class ResourceBindings;
 }  // namespace framework
 namespace runtime {
@@ -50,10 +51,12 @@ class PortDirectory {
 class ModuleInitContext {
  public:
   ModuleInitContext(dataplane::TransactionEngine &resources,
-                    ResourceBindings &resource_bindings, rcu::RcuDomain &rcu,
+                    ResourceBindings &resource_bindings,
+                    framework::InstanceRegistry &instances, rcu::RcuDomain &rcu,
                     const runtime::PortRegistry &ports) noexcept
       : resources_(resources),
         resource_bindings_(resource_bindings),
+        instances_(instances),
         rcu_(rcu),
         ports_(ports) {}
 
@@ -78,13 +81,18 @@ class ModuleInitContext {
 
   const PortDirectory &ports() const noexcept { return ports_; }
 
-  // The context for the process's one active runtime instance. Explicit
-  // application instances (M5) will bind a module to its own context here.
+  // Application-owned objects modules share by name (D-045). Resolve once, in
+  // Init(), keep the lease, and cache the pointer; never from the packet path.
+  framework::InstanceRegistry &instances() const noexcept { return instances_; }
+
+  // The context for the process's one active runtime. A separate context per
+  // runtime is future work; modules always receive this one today.
   static const ModuleInitContext &ProcessDefault();
 
  private:
   dataplane::TransactionEngine &resources_;
   ResourceBindings &resource_bindings_;
+  framework::InstanceRegistry &instances_;
   rcu::RcuDomain &rcu_;
   PortDirectory ports_;
 };

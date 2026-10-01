@@ -4319,6 +4319,22 @@ rather than one call site).
      - **Evidence:** GCC and Clang Meson suites 129/129 each, including 5 new
        binding tests and the live session-pipeline tests; include checker 6-case self-test.
 
+125. **M5: explicit application instances (D-045).**
+     - **What:** `framework::InstanceRegistry` with `Create`/`Lookup`/`Destroy`
+       /`Describe` and counted `InstanceLease<T>`, owned by `RuntimeState`
+       and exposed as `init_context().instances()`. Lookup never creates;
+       duplicate create, type mismatch and destroy-while-leased are explicit
+       errors. `SharedObjectSpace` is unchanged.
+     - **Reference example:** `modules/shared_instance_test.cc` shares one
+       counter between two module instances, caching the raw pointer for the
+       packet-side method.
+     - **Not done:** instances over the management RPC (no schema/constructor
+       binding exists); packet-path "zero lookup" is by construction and
+       review, not measured.
+     - **Evidence:** GCC and Clang Meson suites 131/131 each, including 10
+       registry unit tests and 4 reference-example tests; installed-header
+       verifier 53/53; include checker passes.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

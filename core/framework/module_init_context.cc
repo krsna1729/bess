@@ -17,7 +17,8 @@ const ModuleInitContext &ModuleInitContext::ProcessDefault() {
   // runtime itself is being destroyed at exit.
   static const ModuleInitContext *const context = new ModuleInitContext(
       runtime::runtime().transactions(), ResourceBindings::ProcessDefault(),
-      runtime::runtime().rcu(), runtime::runtime().ports());
+      runtime::runtime().instances(), runtime::runtime().rcu(),
+      runtime::runtime().ports());
   return *context;
 }
 

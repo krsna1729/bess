@@ -64,6 +64,7 @@ PUBLIC_REQUIRED = [
     "snbuf_layout.h",
     "task.h",
     "worker.h",
+    "framework/instance_registry.h",
     "framework/module_init_context.h",
     "framework/plugin.h",
     "utils/common.h",
