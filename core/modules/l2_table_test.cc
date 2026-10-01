@@ -164,9 +164,10 @@ TEST(L2TableConcurrencyTest, ReadersNeverMissAStableEntryDuringChurn) {
 
   std::vector<uint64_t> churn;
   uint64_t ops = 0;
+  // At least 500 ms and 100000 operations; see concurrent_exact_test.cc.
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (std::chrono::steady_clock::now() < deadline || ops <= 100000u) {
     if (!churn.empty() && (churn.size() > 120 || rng() % 2)) {
       const size_t at = rng() % churn.size();
       ASSERT_EQ(0, l2_del_entry(&table, churn[at]));

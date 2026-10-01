@@ -10,8 +10,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "rcu/rcu_domain.h"
@@ -36,6 +38,56 @@ NextHop Hop(uint32_t egress) {
   hop.neighbor = NeighborState::kResolved;
   return hop;
 }
+
+// RCU reader threads of a concurrency test. They are registered here and, on
+// every exit -- including a failed ASSERT that returns early -- stopped,
+// joined and unregistered, so a failure is reported instead of terminating
+// the process with joinable threads.
+class ReaderGroup {
+ public:
+  ReaderGroup(rcu::RcuDomain &rcu, uint32_t first_id)
+      : rcu_(rcu), next_id_(first_id) {}
+  ReaderGroup(const ReaderGroup &) = delete;
+  ReaderGroup &operator=(const ReaderGroup &) = delete;
+  ~ReaderGroup() { Finish(); }
+
+  std::atomic<bool> &stop() { return stop_; }
+
+  // Registers the next reader id and runs `body(id)` on a thread. False if
+  // the id could not be registered.
+  bool Start(std::function<void(uint32_t)> body) {
+    const uint32_t id = next_id_++;
+    if (!rcu_.Register(id).has_value()) {
+      return false;
+    }
+    ids_.push_back(id);
+    threads_.emplace_back([body = std::move(body), id] { body(id); });
+    return true;
+  }
+
+  // Stops and joins every reader, then unregisters them. Idempotent.
+  void Finish() {
+    if (finished_) {
+      return;
+    }
+    finished_ = true;
+    stop_ = true;
+    for (auto &thread : threads_) {
+      thread.join();
+    }
+    for (uint32_t id : ids_) {
+      rcu_.Unregister(id);
+    }
+  }
+
+ private:
+  rcu::RcuDomain &rcu_;
+  uint32_t next_id_;
+  std::atomic<bool> stop_{false};
+  bool finished_ = false;
+  std::vector<std::thread> threads_;
+  std::vector<uint32_t> ids_;
+};
 
 LpmRouteTable::Config Cfg(uint32_t routes = 256, uint32_t tbl8 = 16) {
   LpmRouteTable::Config config;
@@ -385,13 +437,11 @@ TEST(RouteDomainTest, ReplacementIsOneVisibleStep) {
   }
 
   constexpr int kReaders = 2;
-  std::atomic<bool> stop{false};
+  ReaderGroup group(rcu, 41);
+  std::atomic<bool> &stop = group.stop();
   std::atomic<uint64_t> mixed{0}, missed{0}, batches{0};
-  std::vector<std::thread> readers;
   for (int r = 0; r < kReaders; r++) {
-    const uint32_t id = 41 + r;
-    ASSERT_TRUE(rcu.Register(id).has_value());
-    readers.emplace_back([&, id] {
+    ASSERT_TRUE(group.Start([&](uint32_t id) {
       rcu.Online(id);
       uint64_t local = 0;
       while (!stop.load(std::memory_order_relaxed)) {
@@ -411,21 +461,22 @@ TEST(RouteDomainTest, ReplacementIsOneVisibleStep) {
       }
       batches += local;
       rcu.Offline(id);
-    });
+    }));
   }
+  // Each replacement builds a 64 MB table and retires the old one, freed only
+  // after every reader has passed a quiescent state. A writer that outruns
+  // descheduled readers would exhaust the 512 MB test heap (it did, on CI's
+  // four CPUs), so it drains after each swap.
   uint64_t swaps = 0;
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
   while (std::chrono::steady_clock::now() < deadline || swaps < 3) {
-    ASSERT_TRUE(router->ReplaceRouteSetAtomic(d1, sets[++swaps % 2]));
+    const auto swapped = router->ReplaceRouteSetAtomic(d1, sets[++swaps % 2]);
+    ASSERT_TRUE(swapped.has_value())
+        << (swapped ? "" : RouteErrorName(swapped.error()));
+    rcu.Drain();
   }
-  stop = true;
-  for (auto &t : readers) {
-    t.join();
-  }
-  for (int r = 0; r < kReaders; r++) {
-    rcu.Unregister(41 + r);
-  }
+  group.Finish();
   EXPECT_EQ(0u, mixed.load()) << "of " << batches.load() << " batches";
   EXPECT_EQ(0u, missed.load());
   EXPECT_GE(swaps, 3u);
@@ -487,13 +538,11 @@ TEST(RouteDomainTest, ConcurrentReadersWhileDomainsAreCreatedAndUpdated) {
   }
 
   constexpr int kReaders = 2;
-  std::atomic<bool> stop{false};
+  ReaderGroup group(rcu, 44);
+  std::atomic<bool> &stop = group.stop();
   std::atomic<uint64_t> wrong{0}, hits{0}, lookups{0};
-  std::vector<std::thread> readers;
   for (int r = 0; r < kReaders; r++) {
-    const uint32_t id = 44 + r;
-    ASSERT_TRUE(rcu.Register(id).has_value());
-    readers.emplace_back([&, id] {
+    ASSERT_TRUE(group.Start([&](uint32_t id) {
       rcu.Online(id);
       uint64_t local = 0;
       while (!stop.load(std::memory_order_relaxed)) {
@@ -525,17 +574,28 @@ TEST(RouteDomainTest, ConcurrentReadersWhileDomainsAreCreatedAndUpdated) {
       }
       lookups += local;
       rcu.Offline(id);
-    });
+    }));
   }
 
   Router &router_ref = **router;
+  // A removed or replaced FIB is a 64 MB table that is freed only after every
+  // reader has passed a quiescent state. The writer loop below outruns readers
+  // that are descheduled (a busy or small machine), so it drains after each
+  // removal: that bounds the tables in flight to the live ones plus one being
+  // built, which fits the 512 MB heap. Without it this test ran out of memory
+  // on CI's four CPUs.
+  auto ok = [](const std::expected<void, RouteError> &result) {
+    return result.has_value();
+  };
   uint64_t rounds = 0;
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(800);
   while (std::chrono::steady_clock::now() < deadline || rounds < 3) {
     for (uint32_t d = 1; d < kDomains; d++) {
       const RouteDomainId domain(d);
-      ASSERT_TRUE(router_ref.CreateDomain(domain, Cfg(256, 4)));
+      const auto created = router_ref.CreateDomain(domain, Cfg(256, 4));
+      ASSERT_TRUE(ok(created))
+          << (created ? "" : RouteErrorName(created.error()));
       ASSERT_TRUE(router_ref.SetRoute(domain, P(Ip(10, 0, 0, 0), 8),
                                       NextHopId(d + 1)));
       ASSERT_TRUE(router_ref.SetRoute(domain, P(Ip(10, 5, 0, 0), 16),
@@ -545,23 +605,24 @@ TEST(RouteDomainTest, ConcurrentReadersWhileDomainsAreCreatedAndUpdated) {
     for (uint32_t d = 1; d < kDomains; d++) {
       const RouteDomainId domain(d);
       if (d % 2 == 0) {
-        ASSERT_TRUE(router_ref.ReplaceRouteSetAtomic(
+        const auto replaced = router_ref.ReplaceRouteSetAtomic(
             domain, {{P(Ip(10, 0, 0, 0), 8), NextHopId(d + 1)},
-                     {P(Ip(10, 6, 0, 0), 16), NextHopId(d + 1)}}));
+                     {P(Ip(10, 6, 0, 0), 16), NextHopId(d + 1)}});
+        ASSERT_TRUE(ok(replaced))
+            << (replaced ? "" : RouteErrorName(replaced.error()));
+        rcu.Drain();
       }
-      ASSERT_TRUE(router_ref.ReplaceRouteSetAtomic(domain, {}));
+      const auto emptied = router_ref.ReplaceRouteSetAtomic(domain, {});
+      ASSERT_TRUE(ok(emptied))
+          << (emptied ? "" : RouteErrorName(emptied.error()));
+      rcu.Drain();
       ASSERT_TRUE(router_ref.RemoveDomain(domain));
+      rcu.Drain();
     }
     ASSERT_TRUE(router_ref.RemoveRoute(P(Ip(10, 0, 0, 0), 8)));
     rounds++;
   }
-  stop = true;
-  for (auto &t : readers) {
-    t.join();
-  }
-  for (int r = 0; r < kReaders; r++) {
-    rcu.Unregister(44 + r);
-  }
+  group.Finish();
   EXPECT_EQ(0u, wrong.load()) << "of " << lookups.load() << " lookups";
   EXPECT_GT(hits.load(), 0u);
   EXPECT_GE(rounds, 3u);

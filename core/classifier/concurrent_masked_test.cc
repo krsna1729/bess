@@ -250,9 +250,10 @@ TEST(ConcurrentMaskedTableTest, ConcurrentReadersAlwaysSeeTheStableWinner) {
   std::mt19937_64 rng(0x7e57);
   std::vector<std::pair<int, uint64_t>> live;
   uint64_t ops = 0;
+  // At least 500 ms and 10000 operations; see concurrent_exact_test.cc.
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (std::chrono::steady_clock::now() < deadline || ops <= 10000u) {
     if (!live.empty() && (live.size() > 3000 || rng() % 2)) {
       const size_t at = rng() % live.size();
       const auto [m, v] = live[at];

@@ -355,9 +355,12 @@ TEST(ConcurrentExactTableTest, ConcurrentReadersOnlySeeJustifiedAnswers) {
   std::vector<uint32_t> present;
   std::vector<bool> in(kChurn, false);
   uint64_t ops = 0, full = 0;
+  // The run lasts at least 500 ms and at least 100000 operations: the volume
+  // is what makes the reader checks meaningful, so it is the loop condition
+  // and not an assertion about machine speed.
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (std::chrono::steady_clock::now() < deadline || ops <= 100000u) {
     if (!present.empty() && (present.size() >= kCapacity - kStable ||
                              rng() % 2 == 0)) {
       const size_t at = rng() % present.size();
