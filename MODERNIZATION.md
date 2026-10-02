@@ -4612,6 +4612,61 @@ rather than one call site).
        tests; include checker 16-case self-test; link graph 18 libraries, 46
        edges, 6 grandfathered; staged install 66 curated headers.
 
+135. **M11: handoff, punt and resume (D-054).**
+     - **What:** `dataplane/handoff.h` (+ `handoff.cc`), `HandoffChannel<Context,
+       Topology>`: one `rte_ring_elem` of `{packet, context}` slots, topology a
+       template argument, one allocation (DPDK heap on a requested node, placement
+       reported), `Close`/`Drain`/destructor teardown, exact counters.
+       `dataplane/continuation.h`: `ContinuationId`, `ContinuationHandle =
+       GenerationHandle<ContinuationId>` and `ContinuationTable<Target>` (FIFO slot
+       reuse, lock-free concurrent `Resolve`, generation quarantine). Experimental
+       API, installed. No new library; `check_includes.py` keeps both headers off
+       the packet view (22-case self-test).
+     - **Deviation from the roadmap sketch:** the primary call is a burst,
+       `TryPuntBurst(span<PuntItem>) -> PuntResult`; the accepted items' `packet`
+       is set to nullptr (moved-from) and the refused tail stays the caller's. The
+       sketch's per-packet `TryPunt` is kept as a thin form. A per-packet-only
+       API measured 3.6x slower at burst 32, and `PacketHandle` is a raw
+       `rte_mbuf *`, so a by-value sketch leaves a live-looking pointer after
+       success.
+     - **Decided by measurement:** `build/perf-release`, CPUs 2 and 4, `powersave`,
+       loaded desktop, paired ABBA. Round trip against the Queue's pointer ring:
+       parity or better (-6%, -10%, none at bursts 1, 8, 32). Context in the ring
+       slot beats context in the packet by 21-31% at bursts 8 and 32 (the packet
+       wins by 12-20% at burst 1). A cached-index ring is 21-40% slower in the
+       round trip, 12-31% faster streaming; not adopted (roadmap: no new queue).
+     - **Not resolved:** one-way streaming with the SP/SC channel is 35-52%
+       slower than the bare pointer ring at bursts 8 and 32; software cost is 2-5 ns
+       per burst, so the rest is coherence behaviour I could not pin down (D-054).
+     - **Not done:** cross-NUMA measurement (one node); a graph adapter; an SP/SC
+       misuse detector; ASan and mutation runs; GCC 14 / Clang 19 (Clang 22 syntax
+       check only); the TSan run used the C11 ring variant, not the one that ships.
+     - **Evidence:** 35 + 10 + 13 cases pass, each binary 3/3 pinned to one CPU
+       and to two and standalone under `timeout 60 prlimit --as=3000000000`;
+       ThreadSanitizer clean (35 + 10 + 12; the allocator-refusal test skipped, a
+       hook artifact); include checker 22-case self-test; link graph 18 libraries,
+       47 edges, 6 grandfathered; staged install 68 curated headers.
+
+136. **Release build repaired; one CI authority; unsafe modules contained (D-055).**
+     - **What:** the release job went red when it was pinned to GCC 14: Ubuntu's static
+       `libunwind` archives are GCC 13 fat-LTO objects and GCC 14's linker plugin rejects
+       their bytecode. Reproduced in an `ubuntu:24.04` container; fixed with `-fno-lto` on
+       static links (BESS does not use LTO). The release steps now live in
+       `tools/ci_profile.py` beside the gating lanes, and `tools/ci_container.sh release`
+       runs them in the CI image. An outside review of `451ccd47` also found, and the tree
+       confirmed: `Bridge` and `PacketStore` declared `kMaxWorkers` while mutating
+       unsynchronised `std::unordered_map` / `std::map` state on the packet path (both now
+       `max_allowed_workers_ = 1`, which the module graph enforces as a fatal constraint);
+       and `docs/performance-contract.md` stated cache-line counts as global invariants
+       (rewritten as kernel-specific targets).
+     - **Own mistake:** the GCC 14 pin was mine and caused the red release job; the earlier
+       green run had used GCC 13.
+     - **Not done in this entry:** the full `bessd` standalone link under GCC 14 (a minimal
+       link was reproduced and fixed; the next `publish-release` run is the full one);
+       `SharedFlowTable` placement failure and alias visibility, the `framework` to
+       `runtime` cycle, `ProcessDefault()` exposure and the paired M0 baseline, which the
+       same review raised and are tracked as separate work.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

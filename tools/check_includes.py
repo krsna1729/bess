@@ -52,6 +52,18 @@ FORBIDDEN_RULES = [
             ("worker.h", "dataplane core must not include worker.h; pass ticks and tokens in"),
         ],
     ),
+    # The handoff channel and the continuation table (M11, D-054) move an
+    # opaque PacketHandle (an rte_mbuf pointer) and never look inside a packet,
+    # so they sit below the packet view: packet_handle.h only. The generic
+    # dataplane rule above covers them too. Tests and benchmarks are exempt.
+    (
+        re.compile(r"^core/dataplane/(handoff|continuation)"),
+        [
+            ("packet.h", "handoff/continuation must not include the packet view; packet_handle.h is enough"),
+            ("pktbatch.h", "handoff/continuation must not depend on PacketBatch"),
+            ("packet_pool.h", "handoff/continuation must not depend on the packet pool"),
+        ],
+    ),
     # Reusable classifier battery must not depend on runtime, control, or Module
     (
         re.compile(r"^core/classifier/"),
@@ -183,6 +195,12 @@ def run_self_test():
         ("core/dataplane/expiry_wheel.h", '#include "flow/flow_types.h"'),
         ("core/dataplane/expiry_wheel.h", '#include "worker.h"'),
         ("core/dataplane/tick_rate.h", '#include "gate.h"'),
+        ("core/dataplane/handoff.h", '#include "packet_pool.h"'),
+        ("core/dataplane/handoff.h", '#include "pktbatch.h"'),
+        ("core/dataplane/continuation.h", '#include "packet.h"'),
+        ("core/dataplane/handoff.cc", '#include "worker.h"'),
+        ("core/dataplane/continuation.h", '#include "flow/flow_types.h"'),
+        ("core/dataplane/handoff.h", '#include "framework/module_init_context.h"'),
     ]
 
     include_pattern = re.compile(r'^\s*#\s*include\s+["<]([^">]+)[">]')
@@ -196,7 +214,7 @@ def run_self_test():
                     if forbidden_sub in inc:
                         dummy_violations.append((fake_path, inc, reason))
                         break
-    expected = 16
+    expected = 22
     assert len(synthetic_cases) == expected and len(dummy_violations) == expected, (
         f"Expected {expected} synthetic violations, got {len(dummy_violations)} "
         f"of {len(synthetic_cases)} cases"

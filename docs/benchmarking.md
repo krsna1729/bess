@@ -122,3 +122,35 @@ and every benchmark reports `bytes_per_timer`. `rte_timer` reads the real TSC an
 has no budget, so its expiring distributions are compressed to a few microseconds
 (the comment in the source says how). The hashed wheel is a baseline only (see
 its comment) and is not run at 1M timers over an hour: that is 440M visits.
+
+## Handoff
+
+`handoff_bench` (`core/dataplane/handoff_bench.cc`, D-054) runs the same
+handoff through the candidates the roadmap says to compare: the Queue module's
+exact ring calls (a ring of bare pointers, single-producer enqueue, single-consumer
+dequeue), `rte_ring_elem` rings with 8 to 64 byte elements, the flag-dispatching
+generic calls, multi-producer variants, a cached-index single-producer ring
+(a yardstick only; no such queue ships), and the real `HandoffChannel`. It needs
+two CPUs and pins its own two threads to the first two CPUs the process may use,
+so run it under `taskset` with two **physical** cores (on this machine CPUs 2 and
+4: siblings share a core), one candidate family at a time:
+
+```
+ninja -C build/perf-release core/handoff_bench
+export LD_LIBRARY_PATH=$PWD/deps/dpdk-25.11.3/install/lib/x86_64-linux-gnu:$PWD/deps/dpdk-25.11.3/install/lib
+taskset -c 2,4 build/perf-release/core/handoff_bench --benchmark_repetitions=3 \
+    --benchmark_report_aggregates_only=true --benchmark_min_time=0.3s \
+    --benchmark_filter='BM_RoundTrip_(ptr_ring|elem|cached)'
+```
+
+Families: `BM_RoundTrip_*` (one burst in flight: a handoff and its resume, per burst
+and per packet), `BM_OneWay_*` (producer and consumer; the second argument is the
+consumer's per-burst delay in `pause` loops: 0 is balanced, 400 is a producer
+that outruns its consumer and reports the refused fraction and the cost of a
+producer-loop iteration when the queue is full), `BM_RefuseFull_*` (the cost of a
+refused call, one thread) and `BM_PacketRoundTrip_*` (both sides touch the
+packet, as a real slow path does, so that where the context lives is priced
+honestly). Every run first moves a verified stream; a spin that makes no progress
+for 20 s aborts. Counters: `ns_per_burst`, `ns_per_item`, `bytes_per_item` (ring
+element), `ring_bytes`. For a paired A/B between two rows of one binary use
+`tools/ab_bench.py` with `--filter-b` and `--rename-b`.

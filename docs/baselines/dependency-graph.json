@@ -66,6 +66,11 @@
       "status": "allowed"
     },
     {
+      "from": "bess_dataplane_core",
+      "to": "bess_utils",
+      "status": "allowed"
+    },
+    {
       "from": "bess_drivers",
       "to": "bess_framework",
       "status": "allowed"

@@ -11,6 +11,7 @@ This contract defines the performance, memory, and concurrency invariants for al
    - All batch workspaces and scratch buffers must be pre-allocated or stack-allocated within bounded limits (`kMaxBurst = 32`).
    - Flow tables (`flow::WorkerFlowTable`, `flow::SharedFlowTable`, M9) allocate only in `Create()`: capacity is fixed, there is no resize or rehash, and a full table refuses the create (`EmplaceStatus::kFull`) instead of growing. Lookup, create and erase of a worker-owned table allocate nothing.
    - The expiry engine (`dataplane::ExpiryWheel`, M10, D-053) allocates only in `Create()`; `Schedule`, `Refresh`, `Cancel` and `Poll` allocate nothing, a full engine refuses the arming (`kNoExpiry`), and `Poll` takes an explicit work budget: an expiry storm cannot monopolise a worker. Per-packet cost of keeping a flow alive is one store (owner-side `last_seen`) or one load-compare-store on a 32-byte node (`Refresh`); measured in D-053.
+   - Handoff channels (`dataplane::HandoffChannel`, M11, D-054) and `dataplane::ContinuationTable` allocate only in `Create()`: one block per object (the channel's from DPDK's heap on the requested NUMA node), nothing afterwards. `TryPuntBurst`, `Dequeue`, `Close`, `Drain` and `Resolve` allocate nothing (`NothingAllocatesAfterCreate` in both test files), a full channel refuses and says so instead of growing (`PuntResult::refused`, the refused items stay with the producer), and a producer's loop never blocks on one.
 
 2. **Near-Specialized Assembly for Typed Paths**:
    - For typed hot paths (e.g. `TypedExactTable`, `RangeClassifier`, `ScopeTable::Lookup`), code generation must approach optimal hand-written assembly.
@@ -23,7 +24,8 @@ This contract defines the performance, memory, and concurrency invariants for al
 4. **Zero Shared-Lock Contention**:
    - Worker threads must never acquire shared mutexes, spinlocks, or atomic read-modify-write loops during packet forwarding.
    - All reader synchronization relies on QSBR RCU (`bess::rcu::RcuDomain`) and acquire-load memory fences.
-   - The one sanctioned exception is a *writer* of a table that was built to be written from workers: `ConcurrentExactTable` with `Writers::kShared` and `flow::SharedFlowTable` serialize creates and erases on one spinlock (D-028, D-052). Their readers take no lock and execute no read-modify-write. Choose such a table only where new flows are rare; otherwise partition into `WorkerFlowTable`s.
+   - One sanctioned exception is a *writer* of a table that was built to be written from workers: `ConcurrentExactTable` with `Writers::kShared` and `flow::SharedFlowTable` serialize creates and erases on one spinlock (D-028, D-052). Their readers take no lock and execute no read-modify-write. Choose such a table only where new flows are rare; otherwise partition into `WorkerFlowTable`s.
+   - A multi-producer or multi-consumer handoff channel (`HandoffTopology::kMpSc`, `kMpMc`, D-054) is a second explicit exception: its enqueue and dequeue are the ring's compare-and-swap on the shared head, bound at creation and never inspected per call, and its refusal path adds a shared counter increment. `kSpSc`, the topology of one punting worker and one service thread, executes no read-modify-write and no lock on its hot path.
 
 ---
 

@@ -74,6 +74,8 @@ file is the reasoning.
 | D-051 | DPDK build profiles: bess (software ports) and full (every NIC family) | accepted |
 | D-052 | Generic flow-state substrate: typed flow tables with generation-checked ids (M9) | accepted |
 | D-053 | Expiry substrate: a worker-owned hierarchical timing wheel with budgeted polls (M10) | accepted |
+| D-054 | Handoff substrate: burst channels over `rte_ring_elem` with moved-from ownership, and generation-checked continuations (M11) | accepted, with the exceptions under "Not done" |
+| D-055 | One CI authority for gating and release lanes; static release links with -fno-lto | accepted |
 
 
 ---
@@ -4325,3 +4327,321 @@ owner; a workload with over 10M timers or sub-microsecond granularity appears;
 the lazy refresh's extra array touch shows up in a profile of a real module
 (then use the owner-side style); M11 hand-off changes who may refresh a flow; or
 a consumer with one coarse timeout prefers the cheaper budgeted scan.
+
+## D-054 Handoff substrate: burst channels over `rte_ring_elem` with moved-from ownership, and generation-checked continuations (M11)
+
+**Status:** accepted (2026-10-02), with the exceptions under "Not done".
+**Code:** `core/dataplane/{handoff.h,handoff.cc,continuation.h}`, tests
+`core/dataplane/{handoff_test.cc,handoff_threads_test.cc,continuation_test.cc}`,
+benchmark `core/dataplane/handoff_bench.cc`, `core/meson.build` (source, install
+manifest, tests, benchmark), `tools/{check_includes.py,check_installed_headers.py}`,
+`docs/{handoff,architecture,performance-contract,benchmarking}.md`,
+`docs/baselines/dependency-graph.json`.
+
+**Context.** Nothing moved packets between threads with ownership: the Queue
+module moves bare pointers between graph tasks and counts drops, and the flow and
+expiry substrates (M9, M10) hand out generation handles that nothing could carry
+across a queue. OVS/VFP misses, DPI, crypto, reassembly, neighbour resolution and
+UPF buffering all need the same thing: hand a packet and a little context to
+another thread, get it back (or not) with a token that is safe to resume from,
+and shut the whole thing down with packets in flight.
+
+**Decision.**
+
+- **Mechanism: `rte_ring_elem`, no new queue.** `HandoffChannel<Context, Topology>`
+  is one DPDK ring of `PuntItem<Context>` (the packet pointer and the context in
+  one slot), with the explicit sync-mode calls. Topology (`kSpSc`, `kMpSc`,
+  `kMpMc`) is a template argument, so nothing inspects it per call. One
+  allocation from the config's allocator (DPDK's heap on the requested node by
+  default) holds the object and the ring; `placement()` reports the node asked
+  for and the node got.
+- **Burst API; deviation from the roadmap sketch.** The sketch has
+  `TryPunt(PacketHandle, Context)` returning `expected<void, HandoffError>` and
+  `Dequeue(span<PuntItem>)`. A per-packet-only enqueue is the wrong shape: the
+  gates, every baseline and the exit gate are burst-based, and measurement says a
+  per-packet interface costs 3.6x at burst 32 (table). The sketch also leaves the
+  caller holding a live-looking pointer after success (`PacketHandle` is a raw
+  `rte_mbuf *`; no owning packet type exists, and `std::move` of a pointer
+  copies it), which is the double-free hazard the roadmap text asks the API to
+  avoid. The primary call is `TryPuntBurst(span<PuntItem>) -> PuntResult`: the
+  first `accepted` items belong to the channel and **their `packet` is set to
+  nullptr**; the rest are untouched, still the caller's, and the result says
+  why (`kFull` or `kClosed`). `TryPunt(PacketHandle &, const Context &)` stays as
+  the one-packet form with the same rule (null on success, untouched on failure).
+  The roadmap's `expected<void, HandoffError>` is kept for it.
+- **Context in the ring slot.** Trivially copyable, item at most 64 bytes, checked
+  at compile time; `NoContext` makes the slot the pointer alone (8 bytes). Larger
+  context travels as a generation-safe id.
+- **Lifecycle.** `Close()` (producers get `kClosed` at once, queued items stay),
+  stop the threads (a quiescent point; the channel cannot wait for threads inside
+  a call), `Drain(fn)` (optional), destroy (what is left is freed and counted in
+  `discarded`). `enqueued == dequeued + discarded + occupancy` when no call is in
+  progress. Back-pressure is exactly two policies, drop or retry, and nothing
+  blocks.
+- **Continuations (`ContinuationId` is declared here, M7's rule).**
+  `ContinuationHandle = GenerationHandle<ContinuationId>` and
+  `ContinuationTable<Target>`: a fixed slot array (one allocation), generation odd
+  while live, FIFO slot reuse (a handle parked in a queue sees the longest time
+  before its slot holds anything else), a slot whose generation would wrap is
+  quarantined. One thread at a time issues and retires; any number resolve
+  concurrently, lock-free, without a read-modify-write (generation, copy,
+  generation again, target words atomic). A stale, retired or forged handle
+  resolves to nothing and retires nothing. The name `Continuation` avoids the
+  worker "resume hook" (`resume_hook.h`, bessctl ResumeAll), which is unrelated.
+- **Layering.** Header-only except `handoff.cc`; no new library, no new exception
+  (`bess_dataplane_core` already may use `bess_utils`; the link graph went from
+  46 to 47 edges, all allowed). `check_includes.py` gets a rule that keeps both
+  headers off the packet view (`packet.h`, `pktbatch.h`, `packet_pool.h`) and six
+  new negative cases (22 in all).
+- **A DPDK 25.11 wart.** `rte_ring_elem.h` has no `extern "C"` of its own, so
+  `rte_ring_get_memsize_elem` has C++ linkage and does not link; `handoff.cc`
+  reaches the C symbol through an asm label. Everything else in the element API is
+  inline.
+
+**Evidence.**
+
+*Tests* (fast tree, GCC 16, `-O1`, `-march=native`): 35 single-thread, 10
+cross-thread and 13 continuation cases. Single thread: ownership (accepted items
+moved-from, refused untouched, the retried tail), exact capacity for 16 sizes,
+close/drain/accounting, an **exhaustive walk** of every enqueue/dequeue burst
+sequence (bursts 1..capacity+1, capacity 1..5, depth 8..4, over a million nodes
+per topology) from every ring alignment, three ring-size runs up to and over the
+2^32 index wrap and the 2^31 boundary, checked step by step against a queue; a
+random differential test over five context sizes (8 to 64 byte items) and all three
+topologies with random Close/Drain/start index; allocator refusal; placement
+(including a requested node served from another one, reported); an allocation-
+counting `operator new` (nothing allocates after `Create`); real mbufs with the
+pool's count as the ownership oracle (destroy with queued packets, drain exactly
+once, refused tail freed, closed channel, punt and resume through two channels,
+300 create/destroy rounds). Threads: SP/SC, MP/SC and MP/MC streams with exact
+once-only accounting and per-producer order, a drop-policy stream, a consumer that
+never drains (accepts exactly `capacity`, counts every refusal, memory unchanged,
+teardown frees all), shutdown in order with live producers and consumer, a
+consumer that stops mid-stream, 60 lifecycles under traffic, a single-producer
+role handed between threads at a join, and punt-service-resume in which the worker
+retires continuations while their packets are away and every one of them comes back
+and fails closed (the architecture.md section 7 test). Continuation: stale handle
+after slot reuse, forged handles, generation wrap, targets of 1 to 64 bytes
+byte-for-byte, a model that predicts every handle in a grid after every operation,
+no allocation after `Create`, allocator refusal at both allocations, and a
+concurrent test (a resolved target is whole, is the one issued for that handle,
+and a handle whose retirement completed never resolves). No test asserts how much
+work fits in a time window; volume is the loop condition and a 25 s deadline only
+turns a hang into a failure. Each binary passes 3/3 pinned to one CPU
+(`taskset -c 0`) and to two (`0,1`), and standalone under `timeout 60 prlimit
+--as=3000000000`. Clang 22 syntax check of both headers and all three tests with
+the fast profile's flags (`-Wall -Wextra -Werror`) is clean; GCC 14 and Clang 19
+are left to CI.
+
+*Benchmarks* (`handoff_bench`, `build/perf-release`, buildtype=release,
+`-march=x86-64-v3`, GCC 16.2.1, i9-13900H, two P-cores on different physical cores
+(`taskset -c 2,4`), governor `powersave` so frequency was not fixed, Chrome and
+other desktop load present (`ab_bench --allow-busy`), median of 3 repetitions,
+`--benchmark_min_time=0.3s`). Round trip: A enqueues a burst, B (pinned to the other
+core) dequeues it and enqueues it back, A dequeues it; one burst in flight; ns per
+burst (per packet is that divided by the burst):
+
+| ring | B/item | b=1 | b=8 | b=16 | b=32 |
+|---|---|---|---|---|---|
+| ptr-ring SP/SC (Queue's exact calls) | 8 | 233 | 243 | 250 | 284 |
+| elem8 | 8 | 234 | 239 | 249 | 315 |
+| elem16 | 16 | 219 | 226 | 270 | 411 |
+| elem24 | 24 | 307 | 309 | 418 | 662 |
+| elem32 | 32 | 260 | 328 | 453 | 674 |
+| elem64 | 64 | 242 | 551 | 728 | 1007 |
+| elem16, flag-dispatching calls | 16 | 252 | 258 | 284 | 401 |
+| elem16 MP/SC | 16 | 277 | 313 | 321 | 454 |
+| elem16 MP/MC | 16 | 225 | 276 | 283 | 449 |
+| cached-index SP/SC (not shipped) | 16 | 279 | 359 | 376 | 405 |
+| **channel SP/SC, no context** | 8 | 234 | 230 | 245 | 316 |
+| **channel SP/SC, 8-byte context** | 16 | 226 | 220 | 267 | 402 |
+| channel SP/SC, 24-byte context | 32 | 198 | 306 | 459 | 611 |
+| channel MP/SC, 8-byte context | 16 | 210 | 203 | 247 | 430 |
+| channel MP/MC, 8-byte context | 16 | 212 | 214 | 256 | 423 |
+| channel, one packet per call both sides | 16 | 200 | 208 | 709 | 1391 |
+
+Run-to-run noise on this machine is 10-20% at burst 1 (single rows are not
+ordered reliably); the decisions rest on paired ABBA runs (`tools/ab_bench.py`, 8
+rounds, called only outside +-3% with 3/4 of pairs agreeing; B/A):
+
+- **Exit criterion, round trip (SP/SC channel without context against the
+  Queue's pointer ring, same 8-byte item):** -5.7% at burst 1, -9.7% at 8, no
+  clear difference at 32. No regression.
+- **Bookkeeping, round trip (channel against the bare `elem16` ring):** no clear
+  difference at 1, 8 or 32. In a single thread (enqueue then dequeue one burst, no
+  cross-core traffic) the channel costs +0.6, +2.0 and +5.4 ns per burst over the
+  bare element ring (4.8/8.1/19.3 against 4.2/6.1/13.9 ns), the closed check, the
+  counters and the nulling of the handed-over pointers.
+- **A per-packet-only API:** x3.6 at burst 32 (1491 against 413 ns), no clear
+  difference at 1 and 8 (noisy), hence the burst primary.
+- **Where the context lives** (both sides touch the packet; a 128-byte header and a
+  private line): in the ring slot is 31% and 21% faster than in the packet's
+  private area at bursts 8 and 32 for an 8-byte context, 28% and 28% for 24
+  bytes; at burst 1 the packet is 12% (8 bytes) and 20% (24 bytes) *faster*. The
+  design point is the burst, and a context in the packet couples the channel to
+  the packet layout, so: in the slot. At burst 1 alone the other choice wins.
+- **Flag-dispatching calls against the explicit ones:** no clear difference in
+  the round trip (the cross-core transfer dominates); in one thread it costs 0.3,
+  1.4 and 0.9 ns per burst. Topology as a type costs nothing and removes the
+  question.
+- **A cached-index SP/SC ring** (a yardstick, not a candidate: the roadmap says
+  no new queue algorithm): in the round trip, the handoff use, it is 21% and 40%
+  *slower* than `rte_ring_elem` at bursts 1 and 8 and equal at 32. One way (a
+  producer streaming into a consumer) it is 15%, 12% and 31% faster at bursts 1,
+  8 and 32. That gain is real and is what the rule costs a streaming consumer.
+
+Bytes per item scale the cost: at burst 32 the round trip is 284, 315, 411, 662
+and 1007 ns for 8, 8 (element API), 16, 24-32 and 64 bytes; elements of 8 and 16
+bytes have DPDK's dedicated copy paths. Keep contexts to a word where a
+generation-safe id will do.
+
+Software cost without coherence (one thread, enqueue and dequeue of one burst; ns
+at burst 1/8/32): pointer ring 4.0/6.9/14.8, `elem16` 4.2/6.1/13.9, channel
+SP/SC with no context 6.2/9.0/18.5 and with an 8-byte context 4.8/8.1/19.3,
+channel MP/SC 13.4/19.5/25.3, MP/MC 22.9/28.5/34.4, channel with one call per
+packet 8.6/60.1/239.2. A refused call on a full ring costs 1.4 ns (pointer
+ring), 0.8 (`elem16`), 2.4 (channel SP/SC) and 6.6 ns (channel MP/SC, which
+increments a shared counter); a producer that outruns its consumer pays 4.3, 8.6
+and 17.6 ns per burst of 1, 8 and 32 offered to a full channel (`elem16`: 3.2,
+7.0, 15.6). The assembly of SP/SC `TryPuntBurst` has no lock-prefixed
+instruction and no call (154 static instructions, the copy loops included);
+`Dequeue` 106; MP/SC has the compare-and-swap and three counter `lock xadd`s.
+Bytes: 384 for the object (three 128-byte groups) plus the ring: for 1024 items of
+16 bytes 17,152 bytes in all (about 16.75 per item at full occupancy).
+
+*Mutants* (a defect put into the header, the three test binaries rebuilt and run,
+the header restored; each was caught except the last): accepted packets not nulled
+(fails `AcceptedItemsAreMovedAndRefusedItemsStayWithTheCaller`, the exhaustive walk
+and the differential test, and the freeing tests via a double free); closed check
+removed (4 tests: the packet test, shutdown in order, consumer stops mid-stream,
+repeated lifecycle); `refused_full` not counted (3); destructor not draining (3,
+the pool count); LIFO instead of FIFO slot reuse in the continuation table (3);
+post-copy generation check removed in `Resolve` (**not caught**, see "Not done").
+
+**What the measurements say, and what they do not.**
+
+- **One way, the SP/SC channel is slower than the bare pointer ring, and I did
+  not find out why.** Balanced producer and consumer, no context (8-byte item,
+  the same as the Queue's ring): +35% at burst 8 and +52% at 32 (paired, 0/8
+  pairs favourable; burst 1 not clear). Against the bare 16-byte element ring,
+  +14% and +45% (+8.7% and +67% in a rerun after the groups were moved apart).
+  The software cost measured in one thread is 2 to 5 ns per burst, an eighth of the
+  difference at burst 32, so the rest is coherence behaviour, and the L2 misses per
+  burst (`perf stat`, user mode) were higher for the channel (6-7 against 2-4).
+  Removing, one at a time and cumulatively, the counters, the nulling and the
+  closed check left a +10% residual against a bare ring on the same DPDK heap
+  (the ring on the DPDK heap was not slower than the `aligned_alloc` one). Moving
+  the counter groups to separate 128-byte pairs did not remove it either; that
+  layout is kept as ordinary practice, not as a measured win. The round trip, the
+  handoff use, is at parity (above). A streaming consumer should measure its own
+  case; see "Revisit when".
+- The benchmark is noisy (powersave, a loaded desktop): a single run of a row
+  can be 30% off, which is why the claims above are paired. The matrix was run
+  with the counter groups 64 bytes apart; the A/B runs that follow the change to
+  128 bytes agree with it.
+- `perf stat` cache counters were used for the one-way investigation only; no
+  systematic cache-line-traffic table exists.
+
+**Not done.**
+
+- **ThreadSanitizer: run once, not repeated pinned, and not on the production ring
+  variant.** A scratch tree (`.scratch/tsan`, deleted afterwards) built the three
+  test binaries with the fast profile's compiler and flags plus `-fsanitize=thread
+  -g1 -DRTE_USE_C11_MEM_MODEL -Wno-tsan`, `-j8`, run with `taskset -c 2,4,6,8` and no
+  `prlimit --as` (TSan's shadow memory needs the address space). Result: the 35
+  single-thread, 10 cross-thread and 12 of 13 continuation cases pass with **zero
+  reports**. The thirteenth, the allocator-refusal test, is skipped: TSan's
+  interceptor for the nothrow aligned `operator new` calls the test's replacement
+  without catching the injected `bad_alloc`, which is an artifact of the hook (the
+  test passes in the normal build). Two things were needed to get a clean run, and
+  both are about what TSan cannot see, not about the channel. (1) This DPDK build
+  uses the *generic* ring variant on x86 (plain volatile stores ordered by compiler
+  barriers, correct on TSO), which TSan cannot model, so the scratch build defines
+  `RTE_USE_C11_MEM_MODEL` to compile the ring's inline code with acquire/release
+  atomics: the algorithm was checked, the exact barrier variant that ships was not.
+  (2) mbufs are recycled through DPDK's uninstrumented mempool code, so the first
+  run reported 20 races, all between `rte_pktmbuf_prefree_seg` in the freeing thread
+  and `rte_mbuf_raw_reset_bulk` in the allocating one; the test's `Env` now splits
+  alloc and free (TSan builds only) so that a release follows the prefree and an
+  acquire precedes the reset, and the races are gone. A fix of the channel was not
+  involved.
+- **Cross-NUMA handoff** was not measured: this machine has one node. `placement()`
+  and the test of its reporting are the mechanism; the benchmark cannot show a
+  remote cost.
+- **No graph adapter** (a `Queue`-style module in `modules/`) and no production
+  consumer; the reference consumers are tests. No wiring of the counters to
+  `stats/` and no event for "punt queue full".
+- **No ownership-violation detector** for an `kSpSc` role used by two threads
+  (`flow/`'s `OwnerGuard` exists for flow tables; a dataplane-level one is not
+  written). The cross-thread tests would not catch such misuse.
+- **No ASan run.** Mutation testing was done for six defects only, and one was not
+  caught: removing the *second* generation check in `ContinuationTable::Resolve` (the
+  one after the target copy) fails no test, because the concurrent test cannot
+  force a retire-and-reuse into that window; the first check and the
+  generation-per-slot design are covered, the post-copy check is covered by
+  reasoning only.
+- **The unexplained one-way regression** above, and the burst-1 result that favours
+  a context in the packet.
+- **GCC 14 and Clang 19** were not run (Clang 22 syntax check only).
+- **The production ring variant is not what TSan checked** (see the TSan note).
+- The `kRingInitFailed` error path is unreachable with valid parameters and is
+  untested.
+
+**Revisit when:** a streaming consumer (reassembly into crypto, DPI) is
+throughput-bound on the handoff and a profile shows the ring (then the one-way
+gap above, and the cached-index ring's 12-31%, are the numbers to beat, and the
+no-new-queue rule is the thing to reconsider); a consumer needs a graph adapter
+(`Queue`-style, picking SP or MP at `PreResume` as D-036 does); cross-NUMA
+placement matters (measure on a two-node machine); M20 hardware marks need a
+continuation that survives a device reset; or a move-only owning packet type
+arrives in `bess_packet` (then `PuntItem` should hold it and the nulling
+convention becomes a type).
+
+## D-055 One CI authority for gating and release lanes; static release links with -fno-lto
+
+**Status:** accepted (2026-10-02), with the exceptions under "Not done".
+**Code:** `tools/ci_profile.py`, `tools/ci_container.sh`, `env/ci.Dockerfile`, `tools/bootstrap_dpdk.py` (`--variant`), `.github/workflows/ci.yml`, `core/meson.build` (`bessd_link_args`), `docs/ci-parity.md`.
+
+**Context.** Two CI-only failures in one day had the same shape: the configuration that failed was not
+one a developer could run. A benchmark compiled with GCC 16 in the fast tree but failed under Clang 19,
+because the fast tree builds no benchmarks. Then pinning the release job to GCC 14 (to build the shipped
+binaries with a compiler that something else tests; before, it used the image's default g++ 13.3 and no
+other job did) exposed a second problem: Ubuntu's static archives (`libunwind.a`, `libunwind-x86_64.a`)
+are fat LTO objects built by GCC 13, and GCC 14's linker plugin reads their bytecode and stops with
+`bytecode stream ... generated with LTO version 13.1 instead of the expected 14.0`. The release job went
+red on that, and a review of the branch said so. The release job also had its own copy of the configure
+and build commands, so it was outside the single authority that the gating lanes already shared.
+
+**Decision.**
+
+- `tools/ci_profile.py` defines every lane. The gating lanes (`gcc`, `clang`) and the release build
+  (`release-bootstrap`, `release-configure`, `release-build`, `release-verify`) are steps of the same script
+  with the same compiler and CPU authority; `ci.yml` calls it and `check-pins` fails when its compiler
+  pins and the workflow matrix disagree. The release-specific options are listed in the script, not in the
+  workflow.
+- The static link passes `-fno-lto`. BESS is not built with LTO (`meson.build` asserts `b_lto` is off for
+  static builds), so the only LTO input is a distribution archive, and its fat objects also carry machine
+  code, which the link uses. The release compiler stays GCC 14; falling back to GCC 13 to match the archive
+  was rejected, since nothing else tests that compiler.
+- `tools/ci_container.sh` runs the same script in the CI image (Ubuntu 24.04, gcc-14, clang-19) for the
+  exact compiler versions, including `release`; `CTR_CPUSET`, `CTR_MEMORY` and `CTR_JOBS` keep it from
+  disturbing a benchmark.
+
+**Evidence.** The failure was reproduced in an `ubuntu:24.04` container with g++-14 and the distribution's
+`libunwind-dev`: the link of a small program against `libunwind-x86_64.a` and `libunwind.a` fails with the
+LTO-version error as built by the old flags, and succeeds and runs with `-fno-use-linker-plugin` or with
+`-fno-lto`. `ci_profile.py release --dry-run` prints the commands the old job ran, and `check-pins` passes.
+
+**Not done.**
+
+- The full `bessd` standalone link has not been run locally with GCC 14; the minimal link above is the
+  evidence, and the next CI run of `publish-release` is the full one.
+- Archives other than libunwind may also carry GCC 13 bytecode; `-fno-lto` covers them by construction, but
+  none was individually inspected.
+- The Ubuntu 26.04 lanes are not part of the pins (they are experiments).
+- A system `libunwind` built by the release compiler (or a distribution without an LTO archive) would make
+  the flag unnecessary; not pursued.
+
+**Revisit when:** the release job moves to another compiler or distribution, BESS adopts LTO (the assertion
+fails first), or a distribution ships static archives that are slim LTO only (then the link needs an
+unwinder built without LTO).

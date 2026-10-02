@@ -6,6 +6,7 @@ rcu_sources = files(
 
 dataplane_core_sources = files(
   'dataplane/batch_tuning.cc',
+  'dataplane/handoff.cc',
   'dataplane/transaction_engine.cc',
 )
 
@@ -387,7 +388,6 @@ if static_binary_opt != 'none'
   # arguments, which precede the dependency libraries, makes the compiler
   # runtime win so libunwind's duplicate definitions are never pulled (D-043).
   bessd_link_args += ['-l:libgcc_eh.a']
-endif
   # Ubuntu builds its static archives (libunwind.a, libunwind-x86_64.a, ...)
   # as fat LTO objects with the distribution's GCC. The linker plugin would
   # read their LTO bytecode and fail whenever the compiler's major version
@@ -396,6 +396,7 @@ endif
   # the machine code the fat objects also carry (D-055).
   assert(not get_option('b_lto'), 'static builds are linked with -fno-lto; b_lto must be off')
   bessd_link_args += ['-fno-lto']
+endif
 if static_binary_opt == 'fully_static'
   bessd_link_args += ['-static']
 elif static_binary_opt == 'standalone'
@@ -460,8 +461,10 @@ core_public_subdir_headers = {
     'dataplane/action_id.h',
     'dataplane/batch_stages.h',
     'dataplane/batch_tuning.h',
+    'dataplane/continuation.h',
     'dataplane/expiry_wheel.h',
     'dataplane/generation_handle.h',
+    'dataplane/handoff.h',
     'dataplane/interface_id.h',
     'dataplane/object_table.h',
     'dataplane/resource.h',
@@ -535,7 +538,10 @@ unit_test_sources = [
   'classifier/small_exact_test.cc',
   'classifier/direct_exact_test.cc',
   'dataplane/batch_stages_test.cc',
+  'dataplane/continuation_test.cc',
   'dataplane/expiry_wheel_test.cc',
+  'dataplane/handoff_test.cc',
+  'dataplane/handoff_threads_test.cc',
   'dataplane/tick_rate_test.cc',
   'dataplane/identity_test.cc',
   'dataplane/object_table_test.cc',
@@ -732,6 +738,7 @@ if get_option('build_benchmarks')
     'classifier_shared_writer_bench': ['classifier/shared_writer_bench.cc', benchmark_main_dep],
     'flow_bench': ['flow/flow_bench.cc', benchmark_main_dep],
     'expiry_bench': ['dataplane/expiry_bench.cc', benchmark_main_dep],
+    'handoff_bench': ['dataplane/handoff_bench.cc', benchmark_main_dep],
     'flow_expiry_bench': ['flow/flow_expiry_bench.cc', benchmark_main_dep],
     'classifier_range_backend_bench': ['classifier/range_backend_bench.cc', benchmark_main_dep],
     'utils_memory_backing_bench': ['utils/memory_backing_bench.cc', benchmark_main_dep],

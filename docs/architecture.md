@@ -36,7 +36,7 @@ BESS is organized as a strict directed acyclic graph (DAG) enforced at build tim
                   bess_rcu (Quiescent-state RCU substrate)
                       ^
                       |
-             bess_dataplane_core (StrongId, SlotTable, ObjectTable, Transactions, ScopeTable/ScopeResource, ExpiryWheel/TickRate)
+             bess_dataplane_core (StrongId, SlotTable, ObjectTable, Transactions, ScopeTable/ScopeResource, ExpiryWheel/TickRate, HandoffChannel/ContinuationTable)
                       ^
       +-----------+-----------+-----------+-----------+-----------+
       |           |           |           |           |           |
@@ -65,6 +65,8 @@ Two checkers enforce this in CI. `tools/check_includes.py` rejects forbidden `#i
 `core/flow/**` (M9, D-052) is covered by `check_includes.py` too: no `module.h`, `gate.h`, `framework/`, `runtime/`, `control/`, protobuf or gRPC, and no `worker.h` (which also catches `stats/current_worker.h`): a flow table learns who owns it from an injected owner token, not by asking the worker. Link-wise `bess_flow` may use `bess_classifier`, `bess_dataplane_core`, `bess_rcu` and `bess_utils` (`SharedFlowTable` is built on `ConcurrentExactTable`).
 
 `core/dataplane/**` also may not include `flow/`, `gate.h`, `module.h` or `worker.h` (M10, D-053): the expiry engine (`dataplane/expiry_wheel.h`) is a generic substrate that `flow/` consumes through its `Observer` seam, so the edge runs `flow/ -> dataplane/`, never back, and a tick source (the scheduler's cached TSC, a test clock) is passed in as ticks, not read from a global or from the worker.
+
+`dataplane/handoff.h` and `dataplane/continuation.h` (M11, D-054) are held to one more rule: they may not include the packet view (`packet.h`, `pktbatch.h`, `packet_pool.h`). A handoff channel moves an opaque `PacketHandle` (`packet_handle.h`, an `rte_mbuf *`), frees it only at teardown through `rte_pktmbuf_free`, and never looks inside a packet; the packet substrate stays below it. Both are header-only except `handoff.cc` (the DPDK-heap allocator and the C-linkage ring size call), so no new library and no new link edge: `bess_dataplane_core` already may use `bess_utils`.
 
 1. `packet/**` may only depend on `utils/**` and low-level DPDK mbuf primitives. It must **never** include `framework/**`, `runtime/**`, `control/**`, `pb/**`, or `module.h`.
 2. `dataplane/**` (core substrate) may depend on `rcu/**` and minimal `utils/**`. It must **never** include `framework/**`, `runtime/**`, `control/**`, `pb/**`, `flow/**`, `gate.h`, `module.h`, `worker.h`, or the batteries above it (`meter/**`, `route/**`, `classifier/**`, `stats/**`).
@@ -131,14 +133,14 @@ From `core/rcu/rcu_domain.h` and `rcu_ptr.h`:
 
 ## 7. Handle Lifetime Rules
 
-Identifiers (`StrongId`) name objects through `SlotTable`/`ObjectTable`; an erased id is retired, not reused, until readers can no longer hold it (for example `Router` refuses to reuse a retiring `NextHopId`). A borrowed instance is an `InstanceLease`, which blocks `Destroy`. These rules bind batteries that hand out handles (flow ids, M9, implemented in `flow/`; handoff and hardware-offload handles, milestones M11, M20):
+Identifiers (`StrongId`) name objects through `SlotTable`/`ObjectTable`; an erased id is retired, not reused, until readers can no longer hold it (for example `Router` refuses to reuse a retiring `NextHopId`). A borrowed instance is an `InstanceLease`, which blocks `Destroy`. These rules bind batteries that hand out handles (flow ids, M9, implemented in `flow/`; handoff continuations, M11, implemented in `dataplane/`; hardware-offload handles, M20):
 
 1. A handle that can outlive its object carries a generation; resolving a stale handle fails closed and never reaches a new object that reused the slot.
 2. An asynchronous completion names the handle it was issued for and is checked against the current generation before it takes effect.
 3. A handle is not dereferenced across a structural change (destroy, replace-scope) without re-resolving.
 4. Resolution on the packet path is by cached pointer or index, never by name.
 
-`FlowId`/`FlowHandle` (M9) is the first implementation; its tests show a stale handle failing to resolve after its slot is reused (`StaleHandleCannotReachAFlowThatReusedItsSlot`, worker and shared tables) and an expiry record unable to erase the flow that reused its slot (`IdleExpiryStale.ARecordThatOutlivedItsFlowCannotEraseTheFlowInItsSlot`, with the real expiry engine of M10; the engine's own `ExpiryHandle` carries a generation of its own, `ExpiryWheel.AStaleHandleCannotTouchTheTimerThatReusedItsNode`). The other handle-issuing milestones (M11, M20) must show the same test.
+`FlowId`/`FlowHandle` (M9) is the first implementation; its tests show a stale handle failing to resolve after its slot is reused (`StaleHandleCannotReachAFlowThatReusedItsSlot`, worker and shared tables) and an expiry record unable to erase the flow that reused its slot (`IdleExpiryStale.ARecordThatOutlivedItsFlowCannotEraseTheFlowInItsSlot`, with the real expiry engine of M10; the engine's own `ExpiryHandle` carries a generation of its own, `ExpiryWheel.AStaleHandleCannotTouchTheTimerThatReusedItsNode`). `ContinuationHandle` (M11, `dataplane/continuation.h`) is the third: `ContinuationTableTest.StaleHandleCannotReachAContinuationThatReusedItsSlot` shows it for the table, and `HandoffThreadsTest.PuntServiceResumeFailsClosedForARetiredContinuation` shows it across threads: a worker retires continuations while their packets are with a service thread, and each of those packets comes back and fails closed. The remaining handle-issuing milestone (M20) must show the same test.
 
 ## 8. Battery Admission Criteria
 
