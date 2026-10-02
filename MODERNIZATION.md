@@ -4639,9 +4639,9 @@ rather than one call site).
        slower than the bare pointer ring at bursts 8 and 32; software cost is 2-5 ns
        per burst, so the rest is coherence behaviour I could not pin down (D-054).
      - **Not done:** cross-NUMA measurement (one node); a graph adapter; an SP/SC
-       misuse detector; ASan and mutation runs; GCC 14 / Clang 19 (Clang 22 syntax
+       misuse detector; ASan on the EAL-free cases only; GCC 14 / Clang 19 (Clang 22 syntax
        check only); the TSan run used the C11 ring variant, not the one that ships.
-     - **Evidence:** 35 + 10 + 13 cases pass, each binary 3/3 pinned to one CPU
+     - **Evidence:** 35 + 10 + 18 cases pass, each binary 3/3 pinned to one CPU
        and to two and standalone under `timeout 60 prlimit --as=3000000000`;
        ThreadSanitizer clean (35 + 10 + 12; the allocator-refusal test skipped, a
        hook artifact); include checker 22-case self-test; link graph 18 libraries,

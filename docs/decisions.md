@@ -4340,6 +4340,9 @@ benchmark `core/dataplane/handoff_bench.cc`, `core/meson.build` (source, install
 manifest, tests, benchmark), `tools/{check_includes.py,check_installed_headers.py}`,
 `docs/{handoff,architecture,performance-contract,benchmarking}.md`,
 `docs/baselines/dependency-graph.json`.
+`core/dataplane/continuation.h` gains a compile-time test seam (`ResolveHook`); tests
+`core/dataplane/continuation_test.cc` (+5 cases, 18 in all) and `core/dataplane/handoff_test.cc` (allocation hook
+replaces the nothrow `operator new` forms), `docs/handoff.md` ("Testing a race at an exact point").
 
 **Context.** Nothing moved packets between threads with ownership: the Queue
 module moves bare pointers between graph tasks and counts drops, and the flow and
@@ -4391,6 +4394,11 @@ and shut the whole thing down with packets in flight.
   generation again, target words atomic). A stale, retired or forged handle
   resolves to nothing and retires nothing. The name `Continuation` avoids the
   worker "resume hook" (`resume_hook.h`, bessctl ResumeAll), which is unrelated.
+- **A test seam in `Resolve`, free in production.** `ContinuationTable<Target, ResolveHook = NoResolveHook>`:
+  `Resolve` calls `ResolveHook::AfterTargetWord(i)` after loading word `i` of the target and before reading the
+  generation again; after the last word that is exactly "copied, not yet validated". `NoResolveHook` is an empty
+  inline function. A test supplies a hook that retires and reuses the slot at that point, so the fail-closed check
+  is exercised deterministically instead of by a race. It is a test facility, not an extension point.
 - **Layering.** Header-only except `handoff.cc`; no new library, no new exception
   (`bess_dataplane_core` already may use `bess_utils`; the link graph went from
   46 to 47 edges, all allowed). `check_includes.py` gets a rule that keeps both
@@ -4435,6 +4443,48 @@ turns a hang into a failure. Each binary passes 3/3 pinned to one CPU
 --as=3000000000`. Clang 22 syntax check of both headers and all three tests with
 the fast profile's flags (`-Wall -Wextra -Werror`) is clean; GCC 14 and Clang 19
 are left to CI.
+
+*The `Resolve` seam* (`ContinuationResolveSeamTest`, 5 cases, single thread, no timing): the hook runs once per
+target word and an idle hook changes nothing; a retire between the copy and the check; a retire and reuse of the
+only slot between them (the old handle must resolve to neither the old nor the new target, the new handle
+must resolve); a retire and reuse after word 0 of two (the mix `{old, ~new}` must never be returned); a retire
+before the `Resolve` never reaches the copy. Each asserts the hook was reached. **Zero cost in production, by
+assembly:** `Resolve` for targets of 8, 24 and 13 bytes, GCC 16.2.1 `-O3 -march=x86-64-v3`, compiled from the
+header before and after the change: the listing with directives, symbol names and labels normalised is identical
+(499 lines each, a whole-file diff of 0 lines); a control instantiation with a hook that calls an external
+function emits the call (1 `call`), so the seam is wired. (The first asm comparison of this step compared the
+unchanged worktree with itself because the edit had landed in the wrong tree; it was redone after the edit was in
+the right one.)
+
+*Sanitizers on this branch.* **ASan + UBSan + LSan** (scratch tree, `-fsanitize=address,undefined -O1 -g1`,
+no `prlimit`): `continuation_test` 18/18 and `handoff_test` 28/28 (every case that does not initialise the EAL)
+with no report. 7 cases in `handoff_test` and all 10 in `handoff_threads_test` initialise the DPDK EAL, which fails
+under ASan (`eal_legacy_hugepage_init(): couldn't allocate memory due to IOVA exceeding limits of current DMA mask`:
+ASan's mappings sit above the mask, `--iova-mode va --no-huge`); they were not run under ASan. Running it
+first exposed a defect of the allocation-counting hooks of both unit tests: they replaced `operator new` but not the
+nothrow forms, so the library's own nothrow `new` bypassed the counting and the injected refusal and, under ASan,
+produced memory the replaced `operator delete` freed (alloc-dealloc-mismatch). The hooks now replace the nothrow
+forms too; that is also what made the "allocator-refusal test is skipped under TSan" artifact of the first text go
+away (see below).
+
+*ThreadSanitizer and the real (generic) ring variant.* The D-054 TSan run used `-DRTE_USE_C11_MEM_MODEL`. To
+see what TSan says about the variant that ships, a second scratch tree was built without it and run
+(`taskset -c 2,4,6,8`, 120 s cap per binary): `handoff_test` 35/35, 0 reports; `continuation_test` 17/18 and 0 reports (the 18th is the allocator-refusal test, the hook artifact; after the nothrow fix the same tree runs it: 18/18, 0 reports);
+`handoff_threads_test` **630 reports** in the 120 s it was given (the run was cut by the cap, so the count is a
+lower bound), of which 559 (89%) are inside the ring's own inline code (542 in `__rte_ring_enqueue_elems_32` /
+`__rte_ring_dequeue_elems_32`, 17 in `__rte_ring_update_tail` / `__rte_ring_headtail_move_head`) and the other 71
+are mbuf fields and payload reads in the producer and consumer, which race only because the ordering between them
+travels through the ring. The generic variant orders with plain `volatile` accesses and `rte_smp_wmb()/rmb()`, which
+are compiler barriers on x86 (TSO): TSan models atomics, locks and its own annotations, not volatile accesses or
+barriers, so it reports every ring access as a race and cannot say whether the ordering is right. There is no flag
+that makes it see them. The only ways to a clean run are (a) the C11 variant, which is what the first run
+used, and (b) `__tsan_release`/`__tsan_acquire` annotations on the ring entry points, which *assert* the ordering
+instead of checking it and would verify nothing about the ring. So the C11 build is the best mechanical evidence
+available, and what it shows is that the ring's algorithm with DPDK's own acquire/release placement is race-free
+under the channel's use; for the shipped x86 variant the argument is TSO plus compiler barriers, plus the normal
+build's real-thread runs (every binary 3/3 on one and on two CPUs), not a tool. Defining `RTE_USE_C11_MEM_MODEL` for
+`core/dataplane` would make the shipped ring the checked one (its cost is unmeasured: a one-hour experiment, H5 in
+`.scratch/streaming-plan.md`).
 
 *Benchmarks* (`handoff_bench`, `build/perf-release`, buildtype=release,
 `-march=x86-64-v3`, GCC 16.2.1, i9-13900H, two P-cores on different physical cores
@@ -4512,14 +4562,19 @@ instruction and no call (154 static instructions, the copy loops included);
 Bytes: 384 for the object (three 128-byte groups) plus the ring: for 1024 items of
 16 bytes 17,152 bytes in all (about 16.75 per item at full occupancy).
 
-*Mutants* (a defect put into the header, the three test binaries rebuilt and run,
-the header restored; each was caught except the last): accepted packets not nulled
-(fails `AcceptedItemsAreMovedAndRefusedItemsStayWithTheCaller`, the exhaustive walk
-and the differential test, and the freeing tests via a double free); closed check
-removed (4 tests: the packet test, shutdown in order, consumer stops mid-stream,
-repeated lifecycle); `refused_full` not counted (3); destructor not draining (3,
-the pool count); LIFO instead of FIFO slot reuse in the continuation table (3);
-post-copy generation check removed in `Resolve` (**not caught**, see "Not done").
+*Mutants* (a defect put into the header, the three test binaries rebuilt and run, the header restored; nine, all
+caught): accepted packets not nulled (10 tests: the ownership test, the exhaustive walk and the differential test
+for each topology, and the freeing tests); closed check removed (13); `refused_full` not counted (11); destructor
+not draining (3, the pool count); LIFO instead of FIFO slot reuse in the continuation table (3); **generation check
+after the target copy removed in `Resolve` (3: `ContinuationResolveSeamTest.RetiredBetweenTheCopyAndTheCheckFailsClosed`,
+`...RetiredAndReusedBetweenTheCopyAndTheCheckFailsClosed`, `...ReusedInTheMiddleOfTheCopyIsNeverReturnedTorn`)**;
+the check before the copy removed (1: `...RetiredBeforeTheResolveNeverReachesTheCopy`, which asserts the early-out is
+taken; the post-copy check alone is functionally sufficient, so this one is an optimisation, not a safety property);
+the odd-generation check removed (2); the id bound removed (1: the forged-handle test crashes reading out of
+bounds, rc 139). **Correction:** the first D-054 text said the post-copy check's removal was "not caught". That was
+wrong in the other direction: the first mutation script's pattern matched the *pre-copy* check (the first
+`if` before `LoadTarget`), whose removal changes no behaviour; the post-copy mutant had never been run. It was run
+for the first time here and is caught.
 
 **What the measurements say, and what they do not.**
 
@@ -4547,48 +4602,23 @@ post-copy generation check removed in `Resolve` (**not caught**, see "Not done")
 
 **Not done.**
 
-- **ThreadSanitizer: run once, not repeated pinned, and not on the production ring
-  variant.** A scratch tree (`.scratch/tsan`, deleted afterwards) built the three
-  test binaries with the fast profile's compiler and flags plus `-fsanitize=thread
-  -g1 -DRTE_USE_C11_MEM_MODEL -Wno-tsan`, `-j8`, run with `taskset -c 2,4,6,8` and no
-  `prlimit --as` (TSan's shadow memory needs the address space). Result: the 35
-  single-thread, 10 cross-thread and 12 of 13 continuation cases pass with **zero
-  reports**. The thirteenth, the allocator-refusal test, is skipped: TSan's
-  interceptor for the nothrow aligned `operator new` calls the test's replacement
-  without catching the injected `bad_alloc`, which is an artifact of the hook (the
-  test passes in the normal build). Two things were needed to get a clean run, and
-  both are about what TSan cannot see, not about the channel. (1) This DPDK build
-  uses the *generic* ring variant on x86 (plain volatile stores ordered by compiler
-  barriers, correct on TSO), which TSan cannot model, so the scratch build defines
-  `RTE_USE_C11_MEM_MODEL` to compile the ring's inline code with acquire/release
-  atomics: the algorithm was checked, the exact barrier variant that ships was not.
-  (2) mbufs are recycled through DPDK's uninstrumented mempool code, so the first
-  run reported 20 races, all between `rte_pktmbuf_prefree_seg` in the freeing thread
-  and `rte_mbuf_raw_reset_bulk` in the allocating one; the test's `Env` now splits
-  alloc and free (TSan builds only) so that a release follows the prefree and an
-  acquire precedes the reset, and the races are gone. A fix of the channel was not
-  involved.
-- **Cross-NUMA handoff** was not measured: this machine has one node. `placement()`
-  and the test of its reporting are the mechanism; the benchmark cannot show a
-  remote cost.
-- **No graph adapter** (a `Queue`-style module in `modules/`) and no production
-  consumer; the reference consumers are tests. No wiring of the counters to
-  `stats/` and no event for "punt queue full".
-- **No ownership-violation detector** for an `kSpSc` role used by two threads
-  (`flow/`'s `OwnerGuard` exists for flow tables; a dataplane-level one is not
-  written). The cross-thread tests would not catch such misuse.
-- **No ASan run.** Mutation testing was done for six defects only, and one was not
-  caught: removing the *second* generation check in `ContinuationTable::Resolve` (the
-  one after the target copy) fails no test, because the concurrent test cannot
-  force a retire-and-reuse into that window; the first check and the
-  generation-per-slot design are covered, the post-copy check is covered by
-  reasoning only.
-- **The unexplained one-way regression** above, and the burst-1 result that favours
-  a context in the packet.
-- **GCC 14 and Clang 19** were not run (Clang 22 syntax check only).
-- **The production ring variant is not what TSan checked** (see the TSan note).
-- The `kRingInitFailed` error path is unreachable with valid parameters and is
-  untested.
+- **ThreadSanitizer: the real ring variant is not checkable by TSan** (reason above); the C11 variant is clean:
+  35 + 10 + 12 cases, 0 reports. The thirteenth continuation case (allocator refusal) was skipped there; with the
+  nothrow `operator new` forms replaced it runs under the sanitizers: 18/18 under TSan (generic-ring tree) and
+  ASan, 0 reports.
+- **ASan + UBSan + LSan: partial.** Clean on 18 + 28 cases; the 7 + 10 EAL-dependent cases cannot start under ASan
+  (above). A fix would be an EAL option for a low `--base-virtaddr` in the test main, a change to
+  `core/runtime/dpdk.cc` that was not made here.
+- **Mutation testing: nine mutants, all caught**; none of them attacks the MP/SC and MP/MC enqueue paths specifically
+  (all three topologies share the bookkeeping that was mutated; the ring calls themselves are DPDK's).
+- **Still open, unchanged:** cross-NUMA handoff (one node); a graph adapter and a production consumer; an SP/SC
+  role-misuse detector (a debug-only owner check is feature work, not a test, and was not started); GCC 14 and Clang 19
+  (Clang 22 syntax check only); the one-way streaming slowdown (plan, hypotheses, experiments and time boxes in
+  `.scratch/streaming-plan.md`; needs a quiet machine and the `performance` governor); the main matrix was
+  measured with 64-byte counter groups, before the change to 128 (later A/B runs agree; re-running the matrix
+  needs a quiet machine too); no systematic cache-line-traffic table.
+- **Not run here:** the full `meson test` suite (only `continuation.h`'s default instantiation, two test files and
+  `docs/handoff.md` changed: the three affected test binaries pass, standalone and 3/3 pinned to one and two CPUs).
 
 **Revisit when:** a streaming consumer (reassembly into crypto, DPI) is
 throughput-bound on the handoff and a profile shows the ring (then the one-way
