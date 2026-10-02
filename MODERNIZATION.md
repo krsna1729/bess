@@ -4667,6 +4667,24 @@ rather than one call site).
        `runtime` cycle, `ProcessDefault()` exposure and the paired M0 baseline, which the
        same review raised and are tracked as separate work.
 
+137. **M1/M2 closure: enforceable include rules, classified installs (D-058).**
+     - **What:** an outside review found M1/M2 exit criteria that were prose. `check_includes.py`
+       now resolves each include as the compiler does and judges the resolved path (`"../runtime/x.h"`
+       is `runtime/x.h`), bans `..` includes outright (the 359 existing ones are grandfathered as
+       exact pairs in `tools/include_dotdot_baseline.txt`; a new or stale entry fails, so it only
+       shrinks), shares one judge between scanner and self-test, and its self-test is a Meson test.
+       `bess-dev` installs exactly the five generated `pb/*.pb.h` the public headers need (was 36 files
+       including `.grpc.pb.h` and `.pb.cc`); `tools/public_proto_closure.py` computes that from the
+       real include graph. `tools/api_classes.json` classifies every installed header public or
+       experimental and `check_installed_headers.py` requires the installed set to equal it, a public
+       header to include only public ones, and the generated set to be the closure. `ci_profile.py`
+       gained `clean-tree`. Docs: plugin descriptor (`api_min/api_max`, `BESS_CAP_*`, what a refused
+       plugin is), API classes, and a control-vs-dataplane section in `docs/architecture.md`.
+     - **Not done in this entry:** `<bess/...>` includes (needs an install-layout change; recorded as a
+       non-goal with a revisit condition), the rewrite of the grandfathered `..` includes,
+       `sample_plugin` is not an installed-artifacts consumer, and the architecture document's
+       "fast-path invariants" item (M0 list) has no section in architecture.md (docs/performance-contract.md holds the performance side).
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
