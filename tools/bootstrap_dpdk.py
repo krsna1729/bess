@@ -190,18 +190,25 @@ def main() -> int:
                         'NIC family, for hardware; default)')
     parser.add_argument('-j', '--jobs', type=int, default=None,
                         help='Number of parallel compile jobs passed to ninja')
+    parser.add_argument('--variant', default=os.environ.get('DPDK_VARIANT', ''),
+                        help='install into install-<variant> (built in '
+                        'build-<variant>) instead of install, so trees that '
+                        'need a different compiler, CPU or profile do not '
+                        'overwrite each other (tools/ci_profile.py uses one '
+                        'per compiler)')
     parser.add_argument('--print-pkg-config-path', action='store_true')
     args = parser.parse_args()
 
     dpdk_dir = ROOT / 'deps' / metadata['directory']
-    prefix = dpdk_dir / 'install'
+    suffix = f'-{args.variant}' if args.variant else ''
+    prefix = dpdk_dir / f'install{suffix}'
     pkgconfig = prefix / 'lib' / 'pkgconfig'
     if args.print_pkg_config_path:
         print(pkgconfig)
         return 0
 
     archive = ROOT / 'deps' / f'{metadata["directory"]}.tar.xz'
-    build_dir = dpdk_dir / 'build'
+    build_dir = dpdk_dir / f'build{suffix}'
     check_af_xdp_dependencies(args.af_xdp)
     download_and_extract(metadata, dpdk_dir, archive)
     build_env = os.environ.copy()
