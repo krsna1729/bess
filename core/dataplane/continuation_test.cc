@@ -85,6 +85,41 @@ void *operator new(std::size_t n, std::align_val_t a) {
 void *operator new[](std::size_t n, std::align_val_t a) {
   return Allocate(n, static_cast<std::size_t>(a));
 }
+// The nothrow forms are replaced as well. The table allocates with them
+// (`::operator new(n, align, std::nothrow)`, `new (std::nothrow)`), and left to the
+// library they would bypass the counting and the injected refusal and, under
+// AddressSanitizer, hand out memory its own runtime then sees freed by the
+// replaced `operator delete` (alloc-dealloc-mismatch).
+void *operator new(std::size_t n, const std::nothrow_t &) noexcept {
+  try {
+    return Allocate(n, 0);
+  } catch (const std::bad_alloc &) {
+    return nullptr;
+  }
+}
+void *operator new[](std::size_t n, const std::nothrow_t &) noexcept {
+  try {
+    return Allocate(n, 0);
+  } catch (const std::bad_alloc &) {
+    return nullptr;
+  }
+}
+void *operator new(std::size_t n, std::align_val_t a,
+                   const std::nothrow_t &) noexcept {
+  try {
+    return Allocate(n, static_cast<std::size_t>(a));
+  } catch (const std::bad_alloc &) {
+    return nullptr;
+  }
+}
+void *operator new[](std::size_t n, std::align_val_t a,
+                     const std::nothrow_t &) noexcept {
+  try {
+    return Allocate(n, static_cast<std::size_t>(a));
+  } catch (const std::bad_alloc &) {
+    return nullptr;
+  }
+}
 void operator delete(void *p) noexcept { Release(p); }
 void operator delete[](void *p) noexcept { Release(p); }
 void operator delete(void *p, std::size_t) noexcept { Release(p); }
@@ -501,6 +536,132 @@ TEST(ContinuationTableTest, AllocatorRefusalAtCreateIsAnErrorAndLeaksNothing) {
     }
     EXPECT_EQ(window.allocations(), window.frees());
   }
+}
+
+// -- Resolve against a retirement at an exact point (the test seam) --------------------
+//
+// The concurrent test below can only hope a retire lands inside a Resolve. These
+// run code at the exact point instead: `RaceHook::AfterTargetWord(i)` is called
+// by Resolve after word `i` of the target was loaded and before the generation is
+// read again (continuation.h, `ResolveHook`). Single thread, no timing.
+
+struct Pair {
+  uint64_t value;
+  uint64_t inverted;  // always ~value, so a mix of two lives is visible
+  friend bool operator==(const Pair &, const Pair &) = default;
+};
+Pair PairOf(uint64_t value) { return {value, ~value}; }
+
+struct RaceHook {
+  static inline std::function<void(size_t)> action;
+  static inline int calls = 0;
+  static void AfterTargetWord(size_t index) noexcept {
+    calls++;
+    if (action) {
+      action(index);
+    }
+  }
+};
+using RaceTable = ContinuationTable<Pair, RaceHook>;
+
+// Clears the hook however the test ends.
+class HookGuard {
+ public:
+  HookGuard() {
+    RaceHook::action = nullptr;
+    RaceHook::calls = 0;
+  }
+  ~HookGuard() { RaceHook::action = nullptr; }
+};
+
+std::unique_ptr<RaceTable> MakeRace(size_t capacity) {
+  auto table = RaceTable::Create(capacity);
+  EXPECT_TRUE(table.has_value());
+  return std::move(table).value();
+}
+
+TEST(ContinuationResolveSeamTest, TheHookRunsOncePerTargetWordAndAnIdleHookChangesNothing) {
+  const HookGuard guard;
+  auto table = MakeRace(2);
+  const ContinuationHandle h = table->Issue(PairOf(7));
+  std::vector<size_t> seen;
+  RaceHook::action = [&](size_t index) { seen.push_back(index); };
+  EXPECT_EQ(PairOf(7), table->Resolve(h));
+  EXPECT_EQ((std::vector<size_t>{0, 1}), seen) << "after word 0, then after word 1";
+  // A forged handle never reaches the copy.
+  seen.clear();
+  EXPECT_EQ(std::nullopt, table->Resolve({ContinuationId(9), 1}));
+  EXPECT_TRUE(seen.empty());
+}
+
+// The target was copied, then the continuation was retired: the copy is complete
+// and was live when it started, but the handle no longer names a live
+// continuation, so Resolve must not return it.
+TEST(ContinuationResolveSeamTest, RetiredBetweenTheCopyAndTheCheckFailsClosed) {
+  const HookGuard guard;
+  auto table = MakeRace(2);
+  const ContinuationHandle h = table->Issue(PairOf(7));
+  RaceHook::action = [&](size_t index) {
+    if (index == 1) {  // the last word: the copy is done
+      EXPECT_TRUE(table->Retire(h));
+    }
+  };
+  EXPECT_EQ(std::nullopt, table->Resolve(h));
+  EXPECT_EQ(2, RaceHook::calls) << "the seam was reached";
+  EXPECT_EQ(0u, table->size());
+}
+
+// The same, and the slot is reused by another continuation before the check: the
+// handle must not resolve to the new occupant's target or to its own old one.
+TEST(ContinuationResolveSeamTest, RetiredAndReusedBetweenTheCopyAndTheCheckFailsClosed) {
+  const HookGuard guard;
+  auto table = MakeRace(1);  // one slot: the next Issue must reuse it
+  const ContinuationHandle old_handle = table->Issue(PairOf(7));
+  ContinuationHandle new_handle = kNoContinuation;
+  RaceHook::action = [&](size_t index) {
+    if (index == 1) {
+      ASSERT_TRUE(table->Retire(old_handle));
+      new_handle = table->Issue(PairOf(8));
+    }
+  };
+  EXPECT_EQ(std::nullopt, table->Resolve(old_handle));
+  EXPECT_EQ(2, RaceHook::calls);
+  ASSERT_NE(kNoContinuation, new_handle);
+  ASSERT_EQ(old_handle.id, new_handle.id) << "the slot was reused";
+  RaceHook::action = nullptr;
+  EXPECT_EQ(PairOf(8), table->Resolve(new_handle)) << "the new continuation is fine";
+  EXPECT_EQ(std::nullopt, table->Resolve(old_handle));
+}
+
+// A reuse in the middle of the copy: word 0 is the old target's, word 1 the new
+// one's. The mix must never be returned.
+TEST(ContinuationResolveSeamTest, ReusedInTheMiddleOfTheCopyIsNeverReturnedTorn) {
+  const HookGuard guard;
+  auto table = MakeRace(1);
+  const ContinuationHandle old_handle = table->Issue(PairOf(7));
+  RaceHook::action = [&](size_t index) {
+    if (index == 0) {
+      ASSERT_TRUE(table->Retire(old_handle));
+      ASSERT_NE(kNoContinuation, table->Issue(PairOf(8)));
+    }
+  };
+  const std::optional<Pair> got = table->Resolve(old_handle);
+  EXPECT_EQ(std::nullopt, got) << "a target of value " << (got ? got->value : 0)
+                               << " and inverse of "
+                               << (got ? ~got->inverted : 0)
+                               << " was returned";
+  EXPECT_EQ(2, RaceHook::calls);
+}
+
+// A retirement that happens before the first generation check is the ordinary
+// stale-handle case and never reaches the copy.
+TEST(ContinuationResolveSeamTest, RetiredBeforeTheResolveNeverReachesTheCopy) {
+  const HookGuard guard;
+  auto table = MakeRace(2);
+  const ContinuationHandle h = table->Issue(PairOf(7));
+  ASSERT_TRUE(table->Retire(h));
+  EXPECT_EQ(std::nullopt, table->Resolve(h));
+  EXPECT_EQ(0, RaceHook::calls);
 }
 
 // -- threads --------------------------------------------------------------------------
