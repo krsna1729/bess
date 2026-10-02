@@ -4685,6 +4685,25 @@ rather than one call site).
        `sample_plugin` is not an installed-artifacts consumer, and the architecture document's
        "fast-path invariants" item (M0 list) has no section in architecture.md (docs/performance-contract.md holds the performance side).
 
+138. **Execution layering: no grandfathered link edges left (D-057).**
+     - **What:** `bess_runtime` is retired. A new bottom library `bess_eal` holds DPDK bring-up,
+       memory, options and thread placement; `bess_execution` (workers, tasks, scheduler,
+       traffic classes, packet pool, the registries) sits below `bess_framework`. The plugin
+       loader moved from `bessd.cc` to `framework/plugin_loader`, which removed `control -> host`.
+       `tools/layer_dag.json` has no exceptions. `ModuleInitContext::ProcessDefault()` is private
+       (friend `Module`); an installed-header check proves a plugin that calls it fails to compile.
+     - **Correction:** D-047 assumed `bess_execution` could be split out of `bess_framework` by
+       moving files. It could not (module.cc builds tasks, task.cc dispatches modules); the cut was
+       four definition relocations plus extracting the EAL. The residual-symbol check is empty, so
+       no new virtual call was added.
+     - **Evidence:** the hot functions (`Task::operator()`, `Worker::ReportQuiescent`, the scheduler,
+       `Module::ProcessBatch`) compile to identical `-O3` assembly before and after; the agent's tree
+       109/109; after merging with the M1/M2 tooling, see the merge commit. No benchmark was run here:
+       archive and object order changed for 17 files, and the layout effect is measured in the
+       paired M0 baseline.
+     - **Behaviour change:** `InitDpdk` no longer marks the calling thread as a non-worker; the default
+       packet pools do it instead, so callers that only start the EAL lazily keep their thread state.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

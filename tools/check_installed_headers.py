@@ -270,6 +270,29 @@ ADD_MODULE(TestModule, "test_module", "installed-header conformance module")
                 )
             print(f"  OK: intentionally private include {bad_header} is rejected.")
 
+        # An author cannot fetch a context for themselves: only Module's
+        # constructor may call ProcessDefault() (D-057).
+        ctx_cpp = Path(tempdir) / "ctx_plugin.cc"
+        ctx_cpp.write_text(
+            '#include "module.h"\n'
+            "const bess::framework::ModuleInitContext &Grab() {\n"
+            "  return bess::framework::ModuleInitContext::ProcessDefault();\n"
+            "}\n"
+        )
+        ctx_cmd = list(cmd)
+        ctx_cmd[ctx_cmd.index(str(test_cpp))] = str(ctx_cpp)
+        ctx_result = subprocess.run(ctx_cmd, capture_output=True, text=True)
+        if (
+            ctx_result.returncode == 0
+            or "ProcessDefault" not in ctx_result.stderr
+            or "private" not in ctx_result.stderr
+        ):
+            raise RuntimeError(
+                "ModuleInitContext::ProcessDefault() is reachable from "
+                f"plugin code:\n{ctx_result.stderr}"
+            )
+        print("  OK: ModuleInitContext::ProcessDefault() is not callable by authors.")
+
 
 def run_self_test():
     """The table check and the include rule catch what they claim to catch."""
@@ -320,29 +343,6 @@ def run_self_test():
     got = include_problems(reach, headers)
     assert got == ["public utils/common.h includes experimental flow/flow_key.h: promote it or stop including it"], got
     print("Self-test PASSED: table, internal-file and include rules detect every injected defect.")
-
-        # An author cannot fetch a context for themselves: only Module's
-        # constructor may call ProcessDefault() (D-057).
-        ctx_cpp = Path(tempdir) / "ctx_plugin.cc"
-        ctx_cpp.write_text(
-            '#include "module.h"\n'
-            "const bess::framework::ModuleInitContext &Grab() {\n"
-            "  return bess::framework::ModuleInitContext::ProcessDefault();\n"
-            "}\n"
-        )
-        ctx_cmd = list(cmd)
-        ctx_cmd[ctx_cmd.index(str(test_cpp))] = str(ctx_cpp)
-        ctx_result = subprocess.run(ctx_cmd, capture_output=True, text=True)
-        if (
-            ctx_result.returncode == 0
-            or "ProcessDefault" not in ctx_result.stderr
-            or "private" not in ctx_result.stderr
-        ):
-            raise RuntimeError(
-                "ModuleInitContext::ProcessDefault() is reachable from "
-                f"plugin code:\n{ctx_result.stderr}"
-            )
-        print("  OK: ModuleInitContext::ProcessDefault() is not callable by authors.")
 
 
 def main():

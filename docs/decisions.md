@@ -76,6 +76,7 @@ file is the reasoning.
 | D-053 | Expiry substrate: a worker-owned hierarchical timing wheel with budgeted polls (M10) | accepted |
 | D-054 | Handoff substrate: burst channels over `rte_ring_elem` with moved-from ownership, and generation-checked continuations (M11) | accepted, with the exceptions under "Not done" |
 | D-055 | One CI authority for gating and release lanes; static release links with -fno-lto | accepted |
+| D-057 | Execution layering: EAL extracted, framework no longer reaches runtime (M1) | accepted |
 | D-058 | M1/M2 closure: enforceable include rules, classified installs | accepted |
 
 
@@ -3477,7 +3478,8 @@ exists.
   subset. They need Release builds and benchmark time and are not started.
 - M1's binary code-size comparison and the `route/**` to `module.h` include
   rule for `router.h` (blocked on M7).
-- `bess_execution` split out of `bess_framework`.
+- `bess_execution` split out of `bess_framework`. **Closed by D-057** (the split needed definition
+  relocations and an EAL library, not only file moves).
 
 **Verification.** GCC: 98/98 non-benchmark tests plus both route benchmarks,
 including the two new architecture tests (`check_link_graph` and its
@@ -4647,6 +4649,73 @@ LTO-version error as built by the old flags, and succeeds and runs with `-fno-us
 **Revisit when:** the release job moves to another compiler or distribution, BESS adopts LTO (the assertion
 fails first), or a distribution ships static archives that are slim LTO only (then the link needs an
 unwinder built without LTO).
+
+
+## D-057 Execution layering: EAL extracted, framework no longer reaches runtime (M1)
+
+**Status:** accepted (2026-10-02), with the exceptions under "Not done".
+**Code:** `core/meson.build` (`eal_sources`, `execution_sources`, `framework_sources`, `bess_eal`, `bess_execution`; `bess_runtime` removed), `core/framework/plugin_loader.{h,cc}`, `core/runtime/thread_placement.{h,cc}`, `core/runtime/dpdk.cc`, `core/packet_pool.cc`, `core/module.cc`, `core/module_graph.cc`, `core/task.cc`, `core/worker.cc`, `core/framework/module_init_context.h`, `tools/layer_dag.json`, `tools/check_includes.py`, `tools/check_installed_headers.py`, `docs/baselines/dependency-graph.json`.
+
+**Context.** D-047 left six grandfathered edges in `tools/layer_dag.json`: `bess_framework -> bess_runtime`,
+`bess_utils/classifier/meter/route -> bess_runtime` (lazy EAL bring-up) and `bess_control -> bess_host`
+(plugin loading). Its "Not done" item read as a file move: split a `bess_execution` out of `bess_framework`.
+That premise was incomplete. A stand-alone execution archive cannot be made by moving files: `module.cc`
+builds `Task` and `LeafTrafficClass` (`Module::RegisterTask`), `task.cc` calls `Module::ProcessBatch` and the
+inline `ProcessOGates`, and `runtime_state.cc` calls the private `Module::Destroy`. The cycle had two halves:
+the registries/state/`WorkerManager` (runtime) against Module/Worker/TrafficClass (framework), and the EAL
+helpers (`dpdk.cc`, `opts.cc`) against `worker.cc`/`packet_pool.cc`. The second half is also why four
+low-level libraries pointed at "runtime".
+
+**Decision.** Cut at definitions, not at files, and add no virtual call on the packet path:
+
+- `bess_eal` is a new bottom library (above `bess_utils` only): `runtime/{dpdk,memory,opts,path,startup,thread_placement}.cc`
+  plus `utils/dpdk_memory.cc` and `utils/bpf_program.cc`, the two utils files that start the EAL lazily.
+  `classifier`, `meter`, `route` and `dataplane` link it. `check_includes.py` forbids those files from
+  including `worker.h`, `module.h`, `packet_pool.h`, `scheduler.h`, `traffic_class.h` and `runtime_state.h`
+  (four negative self-test cases; 26 total).
+- `bess_execution` sits below `bess_framework`: `worker.cc`, `task.cc`, `traffic_class.cc`, `event.cc`,
+  `resume_hook.cc`, `packet_pool.cc`, `runtime/runtime_state.cc`, `runtime/worker_manager.cc`,
+  `framework/instance_registry.cc`. `bess_framework` keeps Module, gates, ports, the module graph, the init
+  context, the resource bindings and the plugin check/loader.
+- `bess_runtime` is retired (no alias). Header paths and the `bess::runtime` namespace are unchanged, so
+  installed headers and external plugins see no difference.
+- Definition relocations that make the cut empty: `is_cpu_present` moved from `worker.cc` to
+  `runtime/thread_placement.cc` (still declared in `worker.h`); `InitDpdk` no longer calls
+  `current_worker.SetNonWorker()` (the call moved to `PacketPool::CreateDefaultPools` and the lazy path of the
+  `PacketPool` constructor); `ModuleRegistry::Clear` moved into `module_graph.cc` (it calls the private
+  `Module::Destroy`); `Task::GetSocketConstraints` moved into `module.cc`.
+- The plugin loader moved out of `bessd.cc` into `framework/plugin_loader.{h,cc}` (namespace
+  `bess::framework`), which removes `control -> host`.
+- `tools/layer_dag.json` now has `"exceptions": []`.
+- `ModuleInitContext::ProcessDefault()` is private with `friend class ::Module`. An author cannot get
+  capabilities except through `Module::init_context()`. `ResourceBindings::ProcessDefault()` stays public:
+  `framework/resource_bindings.h` is not installed (only `instance_registry.h`, `module_init_context.h`,
+  `plugin.h` are). `check_installed_headers.py` compiles a plugin that calls `ProcessDefault()` and requires
+  the failure to name it as private.
+
+**Evidence.**
+- Residual-symbol check (strong T/D/B/R/S/G symbols `bess_execution` needs from `bess_framework`, from `nm`
+  on the built archives): empty. `bess_eal` needs nothing from `bess_execution` or `bess_framework`. So no
+  new virtual call was needed and the fallback (stop at a merged framework+state library) was not taken.
+- `check_link_graph.py`: 19 libraries, 51 edges, 0 grandfathered, no violations; the baseline JSON is
+  regenerated.
+- Hot-path assembly (the five touched translation units compiled with the perf-release flags, before vs
+  after): see the report; no packet-path function body changed.
+- fast tree, GCC: 109/109 tests. clang++ 22 `-fsyntax-only` on every changed file. Staged install:
+  installed-header check passes including the new negative case, and the three standalone plugins build
+  against it; `sample_plugin_load` passes.
+
+**Not done.**
+- No benchmark was run. Archive membership and object order changed for ~17 files, and D-046 measured 2-11%
+  from layout alone; an A/B across all benchmarks is the open item.
+- `SetNonWorker` behaviour: callers that only bring the EAL up lazily (classifier, meter, route, utils,
+  benchmarks calling `InitDpdk` directly) no longer reset the main thread's worker TLS. Production paths and
+  every test that goes through `PacketPool::CreateDefaultPools` are unchanged; the control plane still calls
+  `SetNonWorker` per RPC.
+- `ResourceBindings::ProcessDefault()` is still public (internal header); tests and `api_v2.cc` use it.
+
+**Revisit when:** a second runtime instance (M5) needs a context that is not the process default, or a
+benchmark shows the layout change cost more than noise.
 
 ## D-058 M1/M2 closure: enforceable include rules, classified installs
 
