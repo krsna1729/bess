@@ -280,6 +280,16 @@ void ModuleGraph::DestroyModule(Module *m) {
   owned->Destroy();
 }
 
+// Defined here, not in runtime/runtime_state.cc: Destroy() is private to
+// Module and the registry state lives below the module layer.
+void bess::runtime::ModuleRegistry::Clear() {
+  for (auto &pair : modules_) {
+    pair.second->Destroy();
+  }
+  modules_.clear();
+  task_names_.clear();
+}
+
 void ModuleGraph::DestroyAllModules() {
   changes_made_ = true;
 

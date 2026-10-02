@@ -8,7 +8,6 @@
 #include <string>
 
 #include "runtime/worker_manager.h"
-#include "runtime/opts.h"
 #include "scheduler.h"
 #include "utils/common.h"
 #include "utils/time.h"

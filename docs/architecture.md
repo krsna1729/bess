@@ -30,6 +30,9 @@ BESS is organized as a strict directed acyclic graph (DAG) enforced at build tim
                   bess_utils (Leaf utilities)
                       ^
                       |
+                  bess_eal (DPDK bring-up, memory, process options, thread placement)
+                      ^
+                      |
                   bess_packet (Packet mbuf view & mutation)
                       ^
                       |
@@ -44,10 +47,10 @@ bess_classifier  bess_meter  bess_stats  bess_route  bess_flow
       ^           ^           ^           ^           ^
       +-----------+-----------+-----------+-----------+-----------+
                       |
-               bess_framework (Module, Gate, Graph, Task, Scheduler, Hooks)
+               bess_execution (Worker, Task, Scheduler, TrafficClass, PacketPool, registries)
                       ^
                       |
-               bess_runtime (Workers, Memory, DPDK, Ports)
+               bess_framework (Module, Gate, Graph, Ports, Init context, Plugin loader)
                       ^
                       |
                bess_control (Desired-state pipeline, Transaction RPC)
@@ -60,7 +63,7 @@ bess_classifier  bess_meter  bess_stats  bess_route  bess_flow
 
 ## 2. Forbidden Dependency Edges (Build-Enforced)
 
-Two checkers enforce this in CI. `tools/check_includes.py` rejects forbidden `#include` edges (rules 1-3, plus: `core/modules/**` must not include `runtime/**`, and `core/dataplane/**` must not include protobuf, gRPC, or the batteries built on it: `meter/`, `route/`, `classifier/`, `stats/`; tests and benchmarks are exempt). `tools/check_link_graph.py` reads the built static archives, resolves undefined symbols between BESS libraries, and compares the result with the allowlisted DAG in `tools/layer_dag.json`; it catches dependencies that enter through link configuration. Rules 4 and 5 are review rules today. A grandfathered violation must be listed in `layer_dag.json` with an owner and a removal phase, and the checker warns when one is no longer needed. The measured graph is committed at `docs/baselines/dependency-graph.json`.
+Two checkers enforce this in CI. `tools/check_includes.py` rejects forbidden `#include` edges (rules 1-3, plus: `core/modules/**` must not include `runtime/**`, and `core/dataplane/**` must not include protobuf, gRPC, or the batteries built on it: `meter/`, `route/`, `classifier/`, `stats/`; tests and benchmarks are exempt). `tools/check_link_graph.py` reads the built static archives, resolves undefined symbols between BESS libraries, and compares the result with the allowlisted DAG in `tools/layer_dag.json`; it catches dependencies that enter through link configuration. Rules 4 and 5 are review rules today. A grandfathered violation would have to be listed in `layer_dag.json` with an owner and a removal phase, and the checker warns when one is no longer needed; the list is empty today (D-057). The measured graph is committed at `docs/baselines/dependency-graph.json`.
 
 `core/flow/**` (M9, D-052) is covered by `check_includes.py` too: no `module.h`, `gate.h`, `framework/`, `runtime/`, `control/`, protobuf or gRPC, and no `worker.h` (which also catches `stats/current_worker.h`): a flow table learns who owns it from an injected owner token, not by asking the worker. Link-wise `bess_flow` may use `bess_classifier`, `bess_dataplane_core`, `bess_rcu` and `bess_utils` (`SharedFlowTable` is built on `ConcurrentExactTable`).
 
@@ -71,7 +74,7 @@ Two checkers enforce this in CI. `tools/check_includes.py` rejects forbidden `#i
 1. `packet/**` may only depend on `utils/**` and low-level DPDK mbuf primitives. It must **never** include `framework/**`, `runtime/**`, `control/**`, `pb/**`, or `module.h`.
 2. `dataplane/**` (core substrate) may depend on `rcu/**` and minimal `utils/**`. It must **never** include `framework/**`, `runtime/**`, `control/**`, `pb/**`, `flow/**`, `gate.h`, `module.h`, `worker.h`, or the batteries above it (`meter/**`, `route/**`, `classifier/**`, `stats/**`).
 3. Reusable libraries (`classifier/**`, `flow/**`, `meter/**`, `stats/**`, `route/route_table.*`) are standalone C++ libraries. They must **never** include `module.h`, `runtime/**`, or `control/**`.
-4. `framework/**` defines execution contracts (Module, Gate, Task). It does not depend on concrete modules, drivers, or control-plane RPC orchestration.
+4. `bess_eal` (`runtime/{dpdk,memory,opts,path,startup,thread_placement}.*`, `utils/{dpdk_memory,bpf_program}.*`) is the bottom of the DPDK-facing stack: it must **never** include `worker.h`, `module.h`, `packet_pool.h`, `scheduler.h`, `traffic_class.h` or `runtime/runtime_state.h` (`check_includes.py`), and the libraries that bring the EAL up lazily (`classifier`, `meter`, `route`, `dataplane`) link it. `bess_execution` (workers, tasks, scheduler, traffic classes, the packet pool and the registries they publish through) needs no strong symbol from `bess_framework`; Module is reached only through its virtual interface (D-057). `framework/**` defines the graph contracts (Module, Gate, Port) on top of it and does not depend on concrete modules, drivers, or control-plane RPC orchestration.
 5. Modules (`modules/**`) and drivers (`drivers/**`) are thin graph adapters. A module must **never** include another concrete module's internal header.
 
 ---

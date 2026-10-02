@@ -24,7 +24,6 @@
 
 #include "runtime/memory.h"
 #include "runtime/opts.h"
-#include "worker.h"
 
 namespace bess {
 namespace {
@@ -262,8 +261,6 @@ bool IsDpdkInitialized() {
 }
 
 void InitDpdk(int dpdk_mb_per_socket) {
-  current_worker.SetNonWorker();
-
   if (!is_initialized) {
     is_initialized = true;
     // Test and benchmark binaries bring the EAL up lazily with no hugepages.

@@ -129,6 +129,24 @@ FORBIDDEN_RULES = [
             ("runtime/", "modules must use Module::init_context(), not runtime"),
         ],
     ),
+    # The EAL layer (bess_eal, D-057): DPDK bring-up, memory, process options,
+    # thread placement, and the two utils files that start the EAL lazily. It is
+    # below the worker, the packet pool and the registries, so none of them may
+    # be included. Tests and benchmarks are exempt.
+    (
+        re.compile(
+            r"^core/runtime/(dpdk|memory|opts|path|startup|thread_placement)\.(cc|h)$"
+            r"|^core/utils/(dpdk_memory|bpf_program)\.(cc|h)$"
+        ),
+        [
+            ("worker.h", "the EAL layer must not depend on the worker"),
+            ("module.h", "the EAL layer must not depend on Module"),
+            ("packet_pool.h", "the EAL layer must not depend on the packet pool"),
+            ("scheduler.h", "the EAL layer must not depend on the scheduler"),
+            ("traffic_class.h", "the EAL layer must not depend on traffic classes"),
+            ("runtime_state.h", "the EAL layer must not depend on the runtime registries"),
+        ],
+    ),
 ]
 
 
@@ -201,6 +219,10 @@ def run_self_test():
         ("core/dataplane/handoff.cc", '#include "worker.h"'),
         ("core/dataplane/continuation.h", '#include "flow/flow_types.h"'),
         ("core/dataplane/handoff.h", '#include "framework/module_init_context.h"'),
+        ("core/runtime/opts.cc", '#include "worker.h"'),
+        ("core/runtime/dpdk.cc", '#include "packet_pool.h"'),
+        ("core/utils/dpdk_memory.cc", '#include "runtime/runtime_state.h"'),
+        ("core/runtime/thread_placement.cc", '#include "scheduler.h"'),
     ]
 
     include_pattern = re.compile(r'^\s*#\s*include\s+["<]([^">]+)[">]')
@@ -214,7 +236,7 @@ def run_self_test():
                     if forbidden_sub in inc:
                         dummy_violations.append((fake_path, inc, reason))
                         break
-    expected = 22
+    expected = 26
     assert len(synthetic_cases) == expected and len(dummy_violations) == expected, (
         f"Expected {expected} synthetic violations, got {len(dummy_violations)} "
         f"of {len(synthetic_cases)} cases"

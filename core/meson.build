@@ -42,18 +42,20 @@ packet_sources = files(
   'packet_tx_checksum.cc',
 )
 
-runtime_sources = files(
-  'runtime/runtime_state.cc',
-  # Compiled with the runtime so RuntimeState can own it without a link cycle;
-  # the header is public API under framework/ (D-045).
-  'framework/instance_registry.cc',
+# The EAL layer: DPDK bring-up, memory, process options, thread placement.
+# It sits below everything that touches rte_* memory (the classifier, meter,
+# route and dataplane libraries bring the EAL up lazily through it) and must
+# not reach up into Module, Worker or the registries (tools/check_includes.py
+# enforces the includes, tools/check_link_graph.py the archive edges).
+eal_sources = files(
   'runtime/thread_placement.cc',
-  'runtime/worker_manager.cc',
   'runtime/dpdk.cc',
   'runtime/opts.cc',
   'runtime/memory.cc',
   'runtime/path.cc',
   'runtime/startup.cc',
+  'utils/dpdk_memory.cc',
+  'utils/bpf_program.cc',
 )
 
 control_sources = files(
@@ -70,7 +72,6 @@ control_sources = files(
 )
 
 framework_sources = files(
-  'event.cc',
   'gate.cc',
   'message.cc',
   'metadata.cc',
@@ -79,11 +80,24 @@ framework_sources = files(
   'framework/module_init_context.cc',
   'framework/resource_bindings.cc',
   'framework/plugin_check.cc',
-  'packet_pool.cc',
+  'framework/plugin_loader.cc',
   'port.cc',
-  'resume_hook.cc',
   'shared_obj.cc',
   'stats/worker_histogram.cc',
+)
+
+# Workers, tasks, the scheduler and traffic classes, plus the registries they
+# publish through. Below bess_framework: nothing here may need a Module symbol
+# (a strong one; calls go through Module's virtual interface), which
+# tools/check_link_graph.py enforces as the absence of an
+# execution -> framework edge.
+execution_sources = files(
+  'event.cc',
+  'framework/instance_registry.cc',
+  'packet_pool.cc',
+  'resume_hook.cc',
+  'runtime/runtime_state.cc',
+  'runtime/worker_manager.cc',
   'task.cc',
   'traffic_class.cc',
   'worker.cc',
@@ -164,8 +178,6 @@ module_sources = files(
 
 utility_sources = files(
   'utils/bpf.cc',
-  'utils/dpdk_memory.cc',
-  'utils/bpf_program.cc',
   'utils/copy.cc',
   'utils/endian.cc',
   'utils/ether.cc',
@@ -212,6 +224,19 @@ resume_hook_compile_deps = low_level_compile_deps + [
 ]
 utility_compile_deps = low_level_compile_deps + [pcap_dep]
 
+bess_utils = static_library(
+  'bess_utils',
+  utility_sources,
+  include_directories: core_include,
+  dependencies: utility_compile_deps,
+)
+bess_eal = static_library(
+  'bess_eal',
+  eal_sources + [proto_ready_marker],
+  include_directories: core_include,
+  dependencies: runtime_compile_deps + [pcap_dep],
+  link_with: [bess_utils],
+)
 bess_rcu = static_library(
   'bess_rcu',
   rcu_sources,
@@ -223,14 +248,14 @@ bess_dataplane_core = static_library(
   dataplane_core_sources,
   include_directories: core_include,
   dependencies: low_level_compile_deps,
-  link_with: [bess_rcu],
+  link_with: [bess_eal, bess_rcu],
 )
 bess_classifier = static_library(
   'bess_classifier',
   classifier_sources,
   include_directories: core_include,
   dependencies: low_level_compile_deps,
-  link_with: [bess_dataplane_core, bess_rcu],
+  link_with: [bess_dataplane_core, bess_eal, bess_rcu],
 )
 bess_flow = static_library(
   'bess_flow',
@@ -244,7 +269,7 @@ bess_meter = static_library(
   meter_sources,
   include_directories: core_include,
   dependencies: low_level_compile_deps,
-  link_with: [bess_dataplane_core],
+  link_with: [bess_dataplane_core, bess_eal],
 )
 bess_stats = static_library(
   'bess_stats',
@@ -258,7 +283,7 @@ bess_route = static_library(
   route_sources,
   include_directories: core_include,
   dependencies: low_level_compile_deps,
-  link_with: [bess_dataplane_core, bess_rcu],
+  link_with: [bess_dataplane_core, bess_eal, bess_rcu],
 )
 bess_dataplane_libs = [
   bess_dataplane_core,
@@ -267,19 +292,6 @@ bess_dataplane_libs = [
   bess_stats,
   bess_route,
 ]
-bess_utils = static_library(
-  'bess_utils',
-  utility_sources,
-  include_directories: core_include,
-  dependencies: utility_compile_deps,
-)
-bess_runtime = static_library(
-  'bess_runtime',
-  runtime_sources + [proto_ready_marker],
-  include_directories: core_include,
-  dependencies: runtime_compile_deps,
-  link_with: bess_dataplane_libs + [bess_rcu, bess_utils],
-)
 
 bess_packet = static_library(
   'bess_packet',
@@ -288,40 +300,47 @@ bess_packet = static_library(
   dependencies: low_level_compile_deps,
   link_with: [bess_utils],
 )
+bess_execution = static_library(
+  'bess_execution',
+  execution_sources + [proto_ready_marker],
+  include_directories: core_include,
+  dependencies: runtime_compile_deps,
+  link_with: bess_dataplane_libs + [bess_eal, bess_packet, bess_rcu, bess_utils],
+)
 bess_framework = static_library(
   'bess_framework',
   framework_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: framework_compile_deps,
-  link_with: bess_dataplane_libs + [bess_runtime, bess_packet, bess_rcu, bess_utils],
+  link_with: bess_dataplane_libs + [bess_execution, bess_eal, bess_packet, bess_rcu, bess_utils],
 )
 bess_control = static_library(
   'bess_control',
   control_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: control_compile_deps,
-  link_with: [bess_runtime, bess_framework, bess_dataplane_core, bess_rcu],
+  link_with: [bess_framework, bess_execution, bess_eal, bess_dataplane_core, bess_rcu],
 )
 bess_host = static_library(
   'bess_host',
   host_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: host_compile_deps,
-  link_with: [bess_control, bess_framework, bess_runtime, bess_dataplane_core, bess_rcu],
+  link_with: [bess_control, bess_framework, bess_execution, bess_eal, bess_dataplane_core, bess_rcu],
 )
 bess_drivers = static_library(
   'bess_drivers',
   driver_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: driver_compile_deps,
-  link_with: [bess_framework, bess_runtime],
+  link_with: [bess_framework, bess_execution, bess_eal],
 )
 bess_modules = static_library(
   'bess_modules',
   module_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: module_compile_deps,
-  link_with: bess_dataplane_libs + [bess_framework, bess_runtime, bess_rcu, bess_utils],
+  link_with: bess_dataplane_libs + [bess_framework, bess_execution, bess_eal, bess_rcu, bess_utils],
   pic: true,
 )
 bess_gate_hooks = static_library(
@@ -329,14 +348,14 @@ bess_gate_hooks = static_library(
   gate_hook_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: hook_compile_deps,
-  link_with: [bess_framework, bess_runtime],
+  link_with: [bess_framework, bess_execution, bess_eal],
 )
 bess_resume_hooks = static_library(
   'bess_resume_hooks',
   resume_hook_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: resume_hook_compile_deps,
-  link_with: [bess_framework, bess_runtime],
+  link_with: [bess_framework, bess_execution, bess_eal],
 )
 
 runtime_whole = [
@@ -349,7 +368,8 @@ runtime_whole = [
   bess_meter,
   bess_stats,
   bess_route,
-  bess_runtime,
+  bess_eal,
+  bess_execution,
   bess_framework,
   bess_control,
   bess_host,
@@ -368,7 +388,8 @@ component_runtime_whole = [
   bess_meter,
   bess_stats,
   bess_route,
-  bess_runtime,
+  bess_eal,
+  bess_execution,
   bess_framework,
   bess_utils,
   bess_packet,
@@ -714,7 +735,7 @@ test(
   args: [files('../tools/check_link_graph.py'), '--build-dir',
          meson.project_build_root()],
   depends: [bess_rcu, bess_dataplane_core, bess_classifier, bess_flow, bess_meter,
-            bess_stats, bess_route, bess_utils, bess_packet, bess_runtime,
+            bess_stats, bess_route, bess_utils, bess_packet, bess_eal, bess_execution,
             bess_framework, bess_control, bess_host, bess_drivers,
             bess_modules, bess_gate_hooks, bess_resume_hooks, bess_proto_lib],
   is_parallel: false,

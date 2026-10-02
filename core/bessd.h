@@ -9,16 +9,10 @@
 
 #include <string>
 #include <tuple>
-#include <vector>
 
 namespace bess {
 namespace bessd {
 
-// When Modules extend other Modules, they may reference a shared object
-// that has not yet been loaded by the BESS daemon. kInheritanceLimit is
-// the number of passes that will be made while loading Module shared objects,
-// and thus the maximum inheritance depth of any Module.
-const int kInheritanceLimit = 10;
 // Process command line arguments from gflags.
 void ProcessCommandLineArgs();
 
@@ -54,18 +48,6 @@ int Daemonize();
 
 // Sets BESS's resource limit.  Returns true upon success.
 bool SetResourceLimit();
-
-// Load an indiviual plugin specified by path. Return true upon success.
-bool LoadPlugin(const std::string &path);
-
-// Unload a loaded plugin specified by path. Return true upon success.
-bool UnloadPlugin(const std::string &path);
-
-// Load all the .so files in the specified directory. Return true upon success.
-bool LoadPlugins(const std::string &directory);
-
-// List all imported .so files.
-std::vector<std::string> ListPlugins();
 
 
 }  // namespace bessd

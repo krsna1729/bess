@@ -13,6 +13,7 @@
 #include "dataplane/batch_tuning.h"
 #include "bessctl.h"
 #include "bessd.h"
+#include "framework/plugin_loader.h"
 #include "debug.h"
 #include "runtime/opts.h"
 #include "packet_pool.h"
@@ -88,7 +89,7 @@ int main(int argc, char *argv[]) {
   }
 
   // Load plugins
-  if (!bess::bessd::LoadPlugins(FLAGS_modules)) {
+  if (!bess::framework::LoadPlugins(FLAGS_modules)) {
     PLOG(WARNING) << "LoadPlugins() failed to load from directory: "
                   << FLAGS_modules;
   }

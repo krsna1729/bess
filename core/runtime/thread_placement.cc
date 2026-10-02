@@ -6,12 +6,31 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <vector>
 
 #include <glog/logging.h>
 
 #include "runtime/opts.h"
+
+#define SYS_CPU_DIR "/sys/devices/system/cpu/cpu%u"
+#define CORE_ID_FILE "topology/core_id"
+
+/* Check if a cpu is present by the presence of the cpu information for it */
+int is_cpu_present(unsigned int core_id) {
+  char path[PATH_MAX];
+  int len = snprintf(path, sizeof(path), SYS_CPU_DIR "/" CORE_ID_FILE, core_id);
+  if (len <= 0 || (unsigned)len >= sizeof(path)) {
+    return 0;
+  }
+  if (access(path, F_OK) != 0) {
+    return 0;
+  }
+
+  return 1;
+}
 
 namespace bess::runtime {
 
