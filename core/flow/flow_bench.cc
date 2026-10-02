@@ -15,6 +15,9 @@
 //  * BM_WorkerChurn    lookups with 1% / 10% of operations replaced by a
 //                      create + erase pair, and create/erase flat out.
 //  * BM_WorkerCreateEraseLatency  per-operation latency tail of the above.
+//  * BM_SharedLookup   one thread, one SharedFlowTable: the shared read path's
+//                      time per lookup (hit or miss, scalar or batched), the
+//                      row to pair A/B when that path changes.
 //  * BM_SharedReaders  N threads reading one SharedFlowTable, against N
 //                      per-thread WorkerFlowTables partitioning the same keys.
 //  * BM_SharedReaderWriter  readers plus a writer churning flows: reader
@@ -946,6 +949,76 @@ void Pin(int cpu) {
 using SharedKey = Key16;
 using SharedState = StateN<32>;
 
+// One thread, one SharedFlowTable: time per lookup with no cross-thread effects,
+// so the read path's own cost (the directory probe, the generation check on a
+// hit, the state access) can be paired A/B on `real_time` by tools/ab_bench.py.
+// BM_SharedReaders below measures what N readers sustain; this is what one costs.
+struct SharedFixture {
+  using Table = SharedFlowTable<SharedKey, SharedState>;
+  // Declared first: destroyed last, after the table that uses it.
+  std::unique_ptr<bess::rcu::RcuDomain> domain;
+  std::unique_ptr<Table> table;
+  size_t n = 0;
+};
+
+SharedFixture& GetSharedFixture(size_t n) {
+  static std::unique_ptr<SharedFixture> cached;
+  if (cached == nullptr || cached->n != n) {
+    Adopt([] { cached.reset(); });
+    EnsureDpdk();
+    auto fixture = std::make_unique<SharedFixture>();
+    fixture->n = n;
+    fixture->domain = std::make_unique<bess::rcu::RcuDomain>(16);
+    auto table = SharedFixture::Table::Create(n, *fixture->domain, 0);
+    if (!table.has_value()) {
+      std::abort();
+    }
+    fixture->table = std::move(*table);
+    for (uint64_t id = 0; id < n; id++) {
+      fixture->table->Emplace(MakeKey<SharedKey>(id), id);
+    }
+    cached = std::move(fixture);
+  }
+  return *cached;
+}
+
+void BM_SharedLookup(benchmark::State& state) {
+  const size_t n = static_cast<size_t>(state.range(0));
+  const auto dist = static_cast<Dist>(state.range(1));
+  state.SetLabel(DistName(dist));
+  const size_t batch = static_cast<size_t>(state.range(2));
+  auto& table = *GetSharedFixture(n).table;
+  const std::vector<SharedKey> stream = BuildStream<SharedKey>(dist, n);
+  const SharedState* out[64];
+  uint64_t pos = 0, sum = 0, hits = 0;
+  const uint64_t t0 = Tsc();
+  if (batch == 1) {
+    for (auto _ : state) {
+      const SharedState* s = table.Peek(stream[pos]);
+      pos = (pos + 1) & (kStream - 1);
+      if (s != nullptr) {
+        hits++;
+        sum += s->counter;
+      }
+    }
+  } else {
+    for (auto _ : state) {
+      const uint64_t mask = table.PeekBatch(
+          std::span<const SharedKey>(&stream[pos], batch),
+          std::span<const SharedState*>(out, batch));
+      pos = (pos + batch) & (kStream - 1);
+      for (uint64_t m = mask; m != 0; m &= m - 1) {
+        hits++;
+        sum += out[__builtin_ctzll(m)]->counter;
+      }
+    }
+  }
+  const uint64_t ticks = Tsc() - t0;
+  benchmark::DoNotOptimize(sum);
+  Report(state, state.iterations() * batch, ticks, hits,
+         static_cast<double>(table.slab_bytes()) / static_cast<double>(n));
+}
+
 // Readers only. variant 0: one SharedFlowTable all readers share; variant 1:
 // one WorkerFlowTable per reader (a partitioned table, the steerable case),
 // each reader looking up its own partition's keys.
@@ -1276,6 +1349,19 @@ void RegisterBaselines(const std::string& tag, std::vector<int64_t> sizes,
           ->Args({size, variant})
           ->Unit(kUnit)
           ->MinTime(0.25);
+    }
+  }
+
+  // Shared lookup on one thread: the read path's own cost, hit-heavy (hot1 is
+  // cache-resident, uniform is memory-bound) and all-miss, scalar and batched.
+  for (int64_t size : {int64_t{1} << 16, int64_t{1} << 20}) {
+    for (int64_t dist : {kHot, kUniform, kMiss}) {
+      for (int64_t batch : {1, 32}) {
+        benchmark::RegisterBenchmark("BM_SharedLookup", BM_SharedLookup)
+            ->Args({size, dist, batch})
+            ->Unit(kUnit)
+            ->MinTime(0.25);
+      }
     }
   }
 

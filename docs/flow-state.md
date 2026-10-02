@@ -57,7 +57,9 @@ FlowHandle h = made.handle;                     // 8 bytes; keep it, not the poi
 - **A full table says so.** `Emplace` returns `EmplaceStatus::kFull`, a null
   `state` and changes nothing; the observer hears `OnFull()`. The table never
   evicts. What to do (drop, evict an expired flow, count) is the application's;
-  `Erase` frees exactly one slot.
+  `Erase` frees exactly one slot. `SharedFlowTable` has a second refusal,
+  `kPlacementFailed`, for a key its directory cannot place although slots are
+  free (see below).
 - **Duplicates.** `Emplace` of a present key returns `kExists` with the existing
   flow and does not construct a State.
 - **State** is constructed in place and never moved or copied: it needs no move
@@ -96,7 +98,10 @@ fail closed on a stale handle: it never reaches the flow that reused the slot.
 A slot whose generation counter is exhausted (2^31 reuses of that one slot) is
 retired, not reused (`quarantined_slots()`), so a handle can never be matched by
 a later lifetime; under LIFO reuse a hot slot reaches that after minutes of
-flat-out churn, under FIFO after `capacity` times as long.
+flat-out churn, under FIFO after `capacity` times as long. (A `SharedFlowTable`
+create that is refused for placement, or whose State constructor throws, also
+moves its slot one lifetime on, for the reason given below; it is the same wear,
+and under FIFO a stream of refusals spreads it over the free slots.)
 
 ### Aliases
 
@@ -108,8 +113,11 @@ the key was an alias (`via_alias`), which is how an application tells forward
 from reverse without the table knowing about directions.
 
 - `EmplaceAliased(key, alias, args...)` creates both keys or neither.
+  `WorkerFlowTable` is single-threaded, so that is all it can mean.
+  `SharedFlowTable` makes it true for concurrent readers too: both keys become
+  visible at one instant (see below).
 - `AddAlias(handle, alias)`: `kAdded`, `kStale`, `kExists` (the key is taken, by
-  any flow), `kNoRoom`.
+  any flow), `kNoRoom`; `SharedFlowTable` also has `kPlacementFailed`.
 - `RemoveAlias(key)` removes one alias; the primary key cannot be removed this
   way.
 - `Erase(key or handle)` removes the flow and all its keys together. No alias
@@ -160,15 +168,48 @@ address. Readers (`Peek`, `Find`, `FindBatch`, `Lookup`, from any thread) take n
 lock and do no atomic read-modify-write. Writers (`Emplace`, `Erase`, aliases)
 may come from any thread and are serialized by one spinlock.
 
-- An erased flow leaves the directory at once and its handle stops resolving at
-  once, but its State is destroyed and its slot reused only after a grace period
-  of the `RcuDomain` the table was created with, so a worker that found the State
-  before the erase may use it until its next quiescent state.
+- **A flow appears, and disappears, at one instant for all its keys.** The
+  directory's value for each key of a flow is the flow's live handle, and every
+  reader path (`Peek`, `Find`, `FindOwned`, `FindHandle`, `PeekBatch`,
+  `FindBatch`) accepts a directory value only if the slot's generation (one
+  acquire load) still equals the handle's and is live. `Emplace` and
+  `EmplaceAliased` put every key into the directory first, build the State, and
+  then release-store the live generation; until that store nothing resolves, and
+  after it everything does, with the State and keys visible. A reader that
+  found one key of an aliased flow and then looks for the other finds it too,
+  with the same handle, unless the flow has been erased in between. `Erase`
+  mirrors it: the generation moves on first (no key resolves from then on), and
+  the keys leave the directory after. A directory value that went stale, from an
+  erased flow or an abandoned create, never resolves (D-056 has the reasoning).
+- **A key the directory cannot place is a refusal, not an abort.** Free capacity
+  does not promise that a given key fits: the directory is an `rte_hash` of
+  eight-entry buckets, and keys that share a bucket pair fill it at sixteen
+  however empty the table is. Flow keys come from packets, so this can be
+  provoked. `Emplace` and `EmplaceAliased` return `EmplaceStatus::kPlacementFailed`
+  and `AddAlias` returns `AliasStatus::kPlacementFailed`, and the table holds the
+  same flows, keys and size as before; no State is built (its constructor does
+  not run and its arguments are not consumed), no `OnCreate` fires, and a
+  refused create tells the observer `OnFull()` (the table had no room for the
+  flow; the status says which room). An alias that had already reached the
+  directory is taken back out. The caller treats it like `kFull` (drop, count,
+  expire something and try again); retrying the same key succeeds only after
+  something in its bucket pair has been erased.
+  `FindHandle`, `Find` and the rest are unaffected.
+- An erased flow stops resolving at once, but its State is destroyed and its
+  slot reused only after a grace period of the `RcuDomain` the table was created
+  with, so a worker that found the State before the erase may use it until its
+  next quiescent state.
 - Destruction runs under the writer lock on a thread that calls `Reclaim()` or
   that calls `Emplace` when no slot is free. A control thread calling
   `Reclaim()` periodically keeps destructors off workers.
   `pending_reclaim()` is the backlog; a stalled reader makes it grow until the
   table is full.
+- A refused create keeps a directory entry for a moment (it is inserted, then
+  taken back), and a deleted directory key waits out a grace period in the
+  directory like an erased flow's does. A stream of refusals that each insert and
+  take back an alias therefore spends the directory's headroom (5% of its slots,
+  at least 256) until readers pass a quiescent state, as a stream of erases does;
+  the consequence is more refusals, never a fault.
 - `StateSharing::kSharedMutable`: `Find`/`Lookup` return `State *`; State must
   synchronise itself. `kOwnedByCreator`: other threads get `const State *` from
   `Peek`; `FindOwned`/`LookupOwned` return `State *` and, under a checked
