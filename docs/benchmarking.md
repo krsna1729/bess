@@ -95,3 +95,30 @@ FLOW_BENCH_MAIN_CPU=0 taskset -c 0,2,4,6,8,10 flow_bench \
 `FLOW_BENCH_LARGE=1` also registers the 10M-flow case (the smallest key and
 State, about 0.5 GB). Lookup benchmarks report `ns_per_lookup`, `tsc_per_lookup`
 (TSC ticks, not core cycles) and `bytes_per_flow`.
+
+## Expiry
+
+`expiry_bench` (`core/dataplane/expiry_bench.cc`, D-053) runs the same
+schedule / refresh / cancel / poll operations through the mechanisms the roadmap
+says to evaluate (the wheel, an eager-refresh wheel, a hashed single-level wheel, a
+heap with lazy deletion, a periodic scan, DPDK `rte_timer`); `flow_expiry_bench`
+(`core/flow/flow_expiry_bench.cc`) measures what each way of refreshing a flow
+costs a packet loop over a `WorkerFlowTable`, and the cost of a scan of the table.
+Run them from the release tree on one P-core, one candidate at a time (the EAL
+comes up in the first benchmark, so `LD_LIBRARY_PATH` must name DPDK's libraries):
+
+```
+ninja -C build/perf-release core/expiry_bench core/flow_expiry_bench
+taskset -c 2 build/perf-release/core/expiry_bench --benchmark_repetitions=3 \
+    --benchmark_report_aggregates_only=true --benchmark_filter='^BM_[A-Za-z]+/wheel/'
+taskset -c 2 build/perf-release/core/flow_expiry_bench --benchmark_repetitions=3 \
+    --benchmark_report_aggregates_only=true
+```
+
+`EXPIRY_BENCH_LARGE=1` also registers 10M timers for the wheel and the scan.
+Timing is in ticks of one nanosecond; the drain benchmarks report
+`ns_per_expiry`, `worst_poll_ns` and `p999_poll_ns` (single poll, TSC-timed),
+and every benchmark reports `bytes_per_timer`. `rte_timer` reads the real TSC and
+has no budget, so its expiring distributions are compressed to a few microseconds
+(the comment in the source says how). The hashed wheel is a baseline only (see
+its comment) and is not run at 1M timers over an hour: that is 440M visits.

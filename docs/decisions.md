@@ -73,6 +73,7 @@ file is the reasoning.
 | D-050 | Explicit transaction consistency: referential vs scope-snapshot (M8) | accepted |
 | D-051 | DPDK build profiles: bess (software ports) and full (every NIC family) | accepted |
 | D-052 | Generic flow-state substrate: typed flow tables with generation-checked ids (M9) | accepted |
+| D-053 | Expiry substrate: a worker-owned hierarchical timing wheel with budgeted polls (M10) | accepted |
 
 
 ---
@@ -4175,3 +4176,152 @@ slot prefetch default worth flipping; M10 finds the observer seam too narrow
 writer lock, measured above, is the bottleneck for a consumer that cannot
 partition; or `ConcurrentExactTable` is promoted to public, which would let
 `shared_flow_table.h` be installed.
+
+## D-053 Expiry substrate: a worker-owned hierarchical timing wheel with budgeted polls (M10)
+
+**Status:** accepted (2026-10-02), with the exceptions under "Not done".
+**Code:** `core/dataplane/{expiry_wheel.h,tick_rate.h}`, tests
+`core/dataplane/{expiry_wheel_test.cc,tick_rate_test.cc}` and
+`core/flow/expiry_consumer_test.cc`, benchmarks `core/dataplane/expiry_bench.cc`
+and `core/flow/flow_expiry_bench.cc`, `core/meson.build` (install manifest, test
+and benchmark registration), `tools/{check_includes.py,check_installed_headers.py}`,
+`core/flow/flow_observer.h` (comment only), `docs/{expiry,flow-state,architecture,performance-contract,benchmarking}.md`.
+
+**Context.** No timer code existed. M9 left a seam: a flow table calls an
+inline observer on create and erase, and hands out generation-checked
+`FlowHandle`s. Idle expiry, FDB aging, NAT bindings and neighbour entries all need
+the same thing: a deadline per entry, cheap refresh on the packet path, and
+expiry work that cannot stall a poll. DPDK's `rte_timer` was the baseline to
+beat. It is a per-lcore skip list with no per-poll budget.
+
+**Decision.**
+
+- `ExpiryWheel<Payload, Tick, LevelBits, Levels>`: a hierarchical timing wheel
+  (6 levels of 64 slots by default) over a fixed array of 32-byte nodes (24 with
+  32-bit ticks) linked by 32-bit indices. Everything is allocated in `Create`.
+  After that nothing allocates, and a full wheel says so (`kNoExpiry`) and changes
+  nothing.
+- It lives in `dataplane/` and knows nothing about flows, modules, gates, workers
+  or protobuf. It takes ticks as an unsigned integer type that may wrap, and
+  compares them by serial-number arithmetic. It reads no clock; `TickRate`
+  converts seconds to ticks at the control boundary only. `check_includes.py`
+  forbids `flow/`, `gate.h` and `worker.h` under `dataplane/` (3 new self-test
+  cases, 16 in all).
+- `Schedule` returns an `ExpiryHandle` (node index plus generation, odd while
+  armed). A fired or cancelled handle stays dead after the node is reused, so
+  `Refresh` and `Cancel` on it return false and touch nothing. The payload
+  (a `FlowHandle`) carries the owner's own generation check. A record that
+  outlives its flow is therefore harmless in two independent ways.
+- `Poll(now, budget, fn)` charges one unit per timer delivered and one per timer
+  moved down a level. It stops at the budget, says `exhausted`, and the next call
+  resumes with nothing lost or repeated. `Poll(now, 0, fn)` only reports whether
+  work waits. Empty time is skipped with one occupancy word per level. Timers
+  fire in non-decreasing deadline order, never early, and late by less than the
+  granularity.
+- Two ways to refresh a hot flow, both supported. (1) `Refresh(handle, later)`
+  is a load, compare and store on the node; the wheel moves it once per timeout
+  when it reaches the old position. (2) Owner-side: the flow's State keeps
+  `last_seen`, the engine is not called per packet, and the callback returns the
+  real deadline to re-arm the same timer. **Use (2) when the packet path must not
+  touch a second array.**
+- Single thread only: nothing is atomic and there is no owner-check policy.
+
+**Evidence.**
+
+*Tests* (fast tree, GCC 16, `-O1`): 36 wheel cases, 7 `TickRate` cases and 15
+consumer cases. They include a random differential test against a trivially
+correct model, exhaustive wraparound of an 8-bit clock (every start, timeout and
+step), the same with refresh and cancel, 64-bit ticks near the wrap at every
+granularity, budget and resume tests, forged and reused handles, generation
+exhaustion, an allocation-counting `operator new` hook (nothing allocates after
+`Create`), and a flow table wired to the wheel through the observer with both
+refresh styles. Four deliberate defects each failed named tests: handles accepted
+without the generation check; a budget off by one; a granularity that fired early;
+a backwards `now` not clamped. All 58 cases pass 3/3 pinned to one CPU and to two
+CPUs (`taskset -c 0`, `0,1`). The tests do not assert how much work fit in a time
+window.
+
+*Benchmarks* (`expiry_bench`, `flow_expiry_bench`; `build/perf-release`,
+buildtype=release, GCC 16.2.1, i9-13900H, pinned to CPU 2, governor `powersave`
+so frequency was not fixed, median of 3, one tick = 1 ns, wheel granularity
+2^20 ticks ≈ 1 ms, 64 budget). Per-operation cost in ns and bytes per timer, the
+timer's own storage only:
+
+| N = 64K | B/timer | schedule | cancel | refresh (uniform) | refresh (hot 1%) | poll, nothing due | drain, per expiry |
+|---|---|---|---|---|---|---|---|
+| wheel (lazy refresh) | 32 | 5.8 | 3.2 | 3.3 | 1.1 | 5.0 | 23.7 |
+| wheel, eager refresh | 32 | 5.9 | 3.2 | 12.2 | 4.9 | 5.0 | 23.9 |
+| heap, lazy deletion | 93 | 21.4 | 0.1 | 1.0 | 0.5 | 0.5 | 66.6 |
+| periodic scan, flat array | 8 | 0.7 | 0.0 | 1.1 | 0.4 | 40.0 | 0.8 |
+| periodic scan, 64 B records | 64 | 3.8 | 1.7 | 2.3 | 0.5 | 71.2 | 1.9 |
+| `rte_timer` | 120 | 243.6 | 237.0 | 428.8 | 212.5 | 7.0 | not measured |
+
+At 1M timers the wheel costs 6.0 schedule, 3.7 cancel, 16.4 uniform refresh and
+90 ns per expiry (about 26 us for the worst 64-unit poll). Each is slower than at
+64K; the likely cause is cache misses over 32 MB of nodes, which I did not
+confirm with a counter. Scan with 64 B records costs 5.9
+ns per expiry. At 64K timers the wheel is **40 to 70 times cheaper than
+`rte_timer` on schedule and cancel and uses a quarter of its memory**. Against
+the heap it is cheaper on schedule, drain and the worst budgeted poll, and uses a
+third of the memory; the heap is cheaper on cancel, refresh and an empty poll,
+because lazy deletion leaves dead records in the heap until they are popped.
+
+*Per packet, over a `WorkerFlowTable`* (`flow_expiry_bench`, hit loop over 1024
+and 1M flows):
+
+| Refresh style | 1K flows | 1M flows |
+|---|---|---|
+| none (lookup only) | 4.63 ns | 24.5 ns |
+| owner-side store | 4.61 ns | 25.1 ns |
+| engine, lazy | 6.06 ns | 41.8 ns |
+| engine, eager | 10.13 ns | 76.8 ns |
+
+The owner-side store is free within noise. The engine's lazy refresh costs
+about 1.4 ns at 1K flows and 17 ns at 1M, because it touches a second array.
+Scanning a 1M-flow table takes about 3.0 ms (3 ns per flow) in one pass.
+
+*Layering and packaging:* include checker 16-case self-test and clean run; link
+graph 18 libraries, 46 edges, 6 grandfathered, no violations (no new library, so
+`docs/baselines/dependency-graph.json` is unchanged); staged install: 66 curated
+headers present and compiling with `-Wall -Wextra -Werror`.
+
+**What the measurements say, and what they do not.**
+
+- A flat periodic scan is cheaper than the wheel on every raw cost at these
+  sizes: no node, no bookkeeping, 8 bytes per timer. It loses on three other
+  properties. Detection delay grows with the table (a budget of 64 entries over 1M
+  needs about 16,000 polls to cover it). The cost of a poll with nothing due is
+  40 ns and up, not 5. The work per poll is bounded only if the scan itself is
+  budgeted. The wheel's detection delay and per-poll work do not depend on the
+  table size. **If a consumer has one coarse timeout, high churn and a latency
+  tolerance of one full pass, a budgeted scan of its own table is the cheaper
+  choice; `docs/expiry.md` says so.**
+- `rte_timer` has no budget, so its drain distribution is not comparable and is
+  not reported.
+- The hashed single-level wheel in the benchmark is a baseline only: it is not a
+  complete implementation, and its 2 us poll at 1M timers is a revolution scan.
+  It is not a recommendation.
+
+**Not done.**
+
+- **`rte_timer` at 1M timers was not measured.** The output file is
+  truncated (invalid JSON) and I did not repeat the run. The 1K and 64K figures stand.
+- **The 10M-timer benchmark was not re-run after the last header edit.** An
+  earlier run (before the final change) showed 32 bytes per timer and 207 ns per
+  expiry at 10M, but those numbers are not quoted above.
+- **No ThreadSanitizer run.** The wheel is single-threaded by design and no
+  concurrency test exists. GCC 14 and Clang 19 are left to CI.
+- **No assembly inspection of the refresh path.** Its cost is measured above, not
+  explained at instruction level.
+- **The owner-side refresh is documented and tested but no module uses it.** No
+  production consumer exists yet; the reference consumer is a test.
+- **Frequency was not pinned** (governor `powersave`), so absolute nanoseconds
+  carry that uncertainty. Ratios are more reliable than absolute values.
+- **No timer-wheel statistics are exported.** Counters for late polls, moves
+  per poll and retired nodes are not wired to `stats/`.
+
+**Revisit when:** a consumer needs timers fired from a thread other than the
+owner; a workload with over 10M timers or sub-microsecond granularity appears;
+the lazy refresh's extra array touch shows up in a profile of a real module
+(then use the owner-side style); M11 hand-off changes who may refresh a flow; or
+a consumer with one coarse timeout prefers the cheaper budgeted scan.

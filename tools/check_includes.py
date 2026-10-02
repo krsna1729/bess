@@ -47,6 +47,9 @@ FORBIDDEN_RULES = [
             ("route/", "dataplane core must not depend on the route library"),
             ("classifier/", "dataplane core must not depend on the classifier battery"),
             ("stats/", "dataplane core must not depend on the stats battery"),
+            ("flow/", "dataplane core must not depend on flow: the edge is flow -> dataplane"),
+            ("gate.h", "dataplane core must not depend on gates"),
+            ("worker.h", "dataplane core must not include worker.h; pass ticks and tokens in"),
         ],
     ),
     # Reusable classifier battery must not depend on runtime, control, or Module
@@ -177,6 +180,9 @@ def run_self_test():
         ("core/dataplane/batch_stages.h", '#include "stats/worker_slots.h"'),
         ("core/flow/worker_flow_table.h", '#include "module.h"'),
         ("core/flow/owner.h", '#include "stats/current_worker.h"'),
+        ("core/dataplane/expiry_wheel.h", '#include "flow/flow_types.h"'),
+        ("core/dataplane/expiry_wheel.h", '#include "worker.h"'),
+        ("core/dataplane/tick_rate.h", '#include "gate.h"'),
     ]
 
     include_pattern = re.compile(r'^\s*#\s*include\s+["<]([^">]+)[">]')
@@ -190,7 +196,7 @@ def run_self_test():
                     if forbidden_sub in inc:
                         dummy_violations.append((fake_path, inc, reason))
                         break
-    expected = 13
+    expected = 16
     assert len(synthetic_cases) == expected and len(dummy_violations) == expected, (
         f"Expected {expected} synthetic violations, got {len(dummy_violations)} "
         f"of {len(synthetic_cases)} cases"

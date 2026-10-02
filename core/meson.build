@@ -452,6 +452,7 @@ core_public_subdir_headers = {
     'dataplane/action_id.h',
     'dataplane/batch_stages.h',
     'dataplane/batch_tuning.h',
+    'dataplane/expiry_wheel.h',
     'dataplane/generation_handle.h',
     'dataplane/interface_id.h',
     'dataplane/object_table.h',
@@ -460,6 +461,7 @@ core_public_subdir_headers = {
     'dataplane/slot_resource.h',
     'dataplane/slot_table.h',
     'dataplane/strong_id.h',
+    'dataplane/tick_rate.h',
     'dataplane/worker_id.h',
   ),
   'classifier': files(
@@ -502,6 +504,7 @@ foreach subdir, headers : core_public_subdir_headers
 endforeach
 
 unit_test_sources = [
+  'flow/expiry_consumer_test.cc',
   'flow/flow_index_test.cc',
   'flow/reference_apps_test.cc',
   'flow/worker_flow_table_test.cc',
@@ -524,6 +527,8 @@ unit_test_sources = [
   'classifier/small_exact_test.cc',
   'classifier/direct_exact_test.cc',
   'dataplane/batch_stages_test.cc',
+  'dataplane/expiry_wheel_test.cc',
+  'dataplane/tick_rate_test.cc',
   'dataplane/identity_test.cc',
   'dataplane/object_table_test.cc',
   'dataplane/object_table_rcu_test.cc',
@@ -718,6 +723,8 @@ if get_option('build_benchmarks')
     'classifier_cuckoo_scale_bench': ['classifier/cuckoo_scale_bench.cc', benchmark_main_dep],
     'classifier_shared_writer_bench': ['classifier/shared_writer_bench.cc', benchmark_main_dep],
     'flow_bench': ['flow/flow_bench.cc', benchmark_main_dep],
+    'expiry_bench': ['dataplane/expiry_bench.cc', benchmark_main_dep],
+    'flow_expiry_bench': ['flow/flow_expiry_bench.cc', benchmark_main_dep],
     'classifier_range_backend_bench': ['classifier/range_backend_bench.cc', benchmark_main_dep],
     'utils_memory_backing_bench': ['utils/memory_backing_bench.cc', benchmark_main_dep],
     'object_table_bench': ['dataplane/object_table_bench.cc', benchmark_main_dep],

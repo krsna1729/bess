@@ -4578,6 +4578,40 @@ rather than one call site).
        fit in that time; guarantee the volume instead.
      - **Evidence:** each fixed test passes 4/4 to 6/6 on one CPU and on two.
 
+134. **M10: expiry substrate (D-053).**
+     - **What:** `dataplane/expiry_wheel.h`, a worker-owned hierarchical timing
+       wheel (6 levels of 64 slots, 32-byte nodes, 32-bit indices, one
+       allocation in `Create`), and `dataplane/tick_rate.h` for the
+       seconds-to-ticks conversion at the control boundary. `Poll(now, budget,
+       fn)` delivers or moves at most `budget` timers and resumes exactly where
+       it stopped. `ExpiryHandle` is a generation handle, so a cancelled or
+       fired handle stays dead after its node is reused. Experimental API,
+       installed. `flow/` is a consumer through M9's observer seam; the edge
+       never runs the other way (three new `check_includes.py` rules).
+     - **Decided by measurement:** `build/perf-release`, CPU 2, `powersave`.
+       At 64K timers the wheel costs 5.8 ns to schedule and 3.2 ns to cancel,
+       against 244 and 237 ns for `rte_timer`, in 32 bytes against 120. A flat
+       periodic scan is cheaper than the wheel on every raw cost (it is
+       recorded in D-053 and `docs/expiry.md`), but its detection delay grows
+       with the table and its poll is not bounded unless budgeted. Per packet
+       over a flow table: owner-side `last_seen` store costs nothing measurable,
+       the engine's lazy refresh 1.4 ns at 1K flows and 17 ns at 1M.
+     - **Process note:** two agents working on M10 died before reporting
+       (the user reported terminal crashes). The parent took over from the
+       agent's last state: the tests were green but the benchmark numbers, the
+       decision record and this entry did not exist. The parent re-ran the
+       packet-loop benchmark on the final header, tabulated the per-size
+       benchmark files from the agent's runs, and ran four mutations of its own.
+     - **Not done:** `rte_timer` at 1M timers (its output file is truncated);
+       10M timers re-run after the last edit; ThreadSanitizer; assembly
+       inspection of the refresh; any production module using the wheel; wiring
+       counters to `stats/`.
+     - **Evidence:** 36 wheel, 7 tick-rate and 15 consumer cases pass; each
+       passes 3/3 on one CPU and on two; four mutants (no generation check,
+       budget off by one, early firing, unclamped backwards time) each fail named
+       tests; include checker 16-case self-test; link graph 18 libraries, 46
+       edges, 6 grandfathered; staged install 66 curated headers.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

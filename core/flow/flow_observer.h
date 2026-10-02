@@ -11,8 +11,8 @@
 namespace bess::flow {
 
 // The seam between a flow table and whatever watches its flows' lifetime:
-// the expiry engine of milestone M10, hit and miss counters, an offload
-// agent. Decision D-052.
+// the expiry engine of milestone M10 (dataplane/expiry_wheel.h), hit and miss
+// counters, an offload agent. Decisions D-052, D-053.
 //
 // The table calls the observer inline (it is a template parameter, so there
 // is no virtual call and no std::function), from the thread that mutates the
@@ -29,9 +29,9 @@ namespace bess::flow {
 // keeps FlowHandles in its records; when a deadline passes it calls
 // `table.Erase(handle)`. The handle carries the slot's generation, so a
 // record that outlived its flow cannot erase the newer flow that reused the
-// slot: Erase(handle) returns false. Refreshing a flow's deadline is a plain
-// store in the application's State (M10 decides where), so the table has no
-// Touch().
+// slot: Erase(handle) returns false. Refreshing a flow's deadline is either a
+// call to the engine or a plain store in the application's State (D-053 says
+// which and when), so the table has no Touch().
 //
 // An observer must not call a mutating operation of the table that notified
 // it (re-entrancy is not supported). It runs on the table's hot create/erase

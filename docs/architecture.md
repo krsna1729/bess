@@ -36,7 +36,7 @@ BESS is organized as a strict directed acyclic graph (DAG) enforced at build tim
                   bess_rcu (Quiescent-state RCU substrate)
                       ^
                       |
-             bess_dataplane_core (StrongId, SlotTable, ObjectTable, Transactions, ScopeTable/ScopeResource)
+             bess_dataplane_core (StrongId, SlotTable, ObjectTable, Transactions, ScopeTable/ScopeResource, ExpiryWheel/TickRate)
                       ^
       +-----------+-----------+-----------+-----------+-----------+
       |           |           |           |           |           |
@@ -64,8 +64,10 @@ Two checkers enforce this in CI. `tools/check_includes.py` rejects forbidden `#i
 
 `core/flow/**` (M9, D-052) is covered by `check_includes.py` too: no `module.h`, `gate.h`, `framework/`, `runtime/`, `control/`, protobuf or gRPC, and no `worker.h` (which also catches `stats/current_worker.h`): a flow table learns who owns it from an injected owner token, not by asking the worker. Link-wise `bess_flow` may use `bess_classifier`, `bess_dataplane_core`, `bess_rcu` and `bess_utils` (`SharedFlowTable` is built on `ConcurrentExactTable`).
 
+`core/dataplane/**` also may not include `flow/`, `gate.h`, `module.h` or `worker.h` (M10, D-053): the expiry engine (`dataplane/expiry_wheel.h`) is a generic substrate that `flow/` consumes through its `Observer` seam, so the edge runs `flow/ -> dataplane/`, never back, and a tick source (the scheduler's cached TSC, a test clock) is passed in as ticks, not read from a global or from the worker.
+
 1. `packet/**` may only depend on `utils/**` and low-level DPDK mbuf primitives. It must **never** include `framework/**`, `runtime/**`, `control/**`, `pb/**`, or `module.h`.
-2. `dataplane/**` (core substrate) may depend on `rcu/**` and minimal `utils/**`. It must **never** include `framework/**`, `runtime/**`, `control/**`, `pb/**`, or the batteries above it (`meter/**`, `route/**`, `classifier/**`, `stats/**`).
+2. `dataplane/**` (core substrate) may depend on `rcu/**` and minimal `utils/**`. It must **never** include `framework/**`, `runtime/**`, `control/**`, `pb/**`, `flow/**`, `gate.h`, `module.h`, `worker.h`, or the batteries above it (`meter/**`, `route/**`, `classifier/**`, `stats/**`).
 3. Reusable libraries (`classifier/**`, `flow/**`, `meter/**`, `stats/**`, `route/route_table.*`) are standalone C++ libraries. They must **never** include `module.h`, `runtime/**`, or `control/**`.
 4. `framework/**` defines execution contracts (Module, Gate, Task). It does not depend on concrete modules, drivers, or control-plane RPC orchestration.
 5. Modules (`modules/**`) and drivers (`drivers/**`) are thin graph adapters. A module must **never** include another concrete module's internal header.
@@ -136,7 +138,7 @@ Identifiers (`StrongId`) name objects through `SlotTable`/`ObjectTable`; an eras
 3. A handle is not dereferenced across a structural change (destroy, replace-scope) without re-resolving.
 4. Resolution on the packet path is by cached pointer or index, never by name.
 
-`FlowId`/`FlowHandle` (M9) is the first implementation; its tests show a stale handle failing to resolve after its slot is reused (`StaleHandleCannotReachAFlowThatReusedItsSlot`, worker and shared tables) and an expiry record unable to erase the flow that reused its slot. The other handle-issuing milestones (M11, M20) must show the same test.
+`FlowId`/`FlowHandle` (M9) is the first implementation; its tests show a stale handle failing to resolve after its slot is reused (`StaleHandleCannotReachAFlowThatReusedItsSlot`, worker and shared tables) and an expiry record unable to erase the flow that reused its slot (`IdleExpiryStale.ARecordThatOutlivedItsFlowCannotEraseTheFlowInItsSlot`, with the real expiry engine of M10; the engine's own `ExpiryHandle` carries a generation of its own, `ExpiryWheel.AStaleHandleCannotTouchTheTimerThatReusedItsNode`). The other handle-issuing milestones (M11, M20) must show the same test.
 
 ## 8. Battery Admission Criteria
 

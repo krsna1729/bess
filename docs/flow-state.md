@@ -135,16 +135,20 @@ struct WorkerOwner {
 `ReleaseOwner()` hands a table to another worker (call it from the owner, after
 the worker has stopped using it).
 
-### The expiry seam (for M10)
+### Expiry: the observer seam and `ExpiryWheel`
 
 `Traits::Observer` is a type with `OnCreate(handle, state)`,
 `OnErase(handle, state)` and `OnFull()`, called inline (no virtual call, no
-`std::function`; `NoFlowObserver` is empty). The timer substrate of milestone
-M10 will implement it: schedule in `OnCreate`, cancel in `OnErase`, keep
-`FlowHandle`s in its records, and expire by calling `table.Erase(handle)`. Because
-the handle carries the generation, a record that outlived its flow cannot erase
-the flow that reused the slot. The table has no timer and no `Touch()`: a
-refresh is a plain store into the application's State. `FlowCounters` is an
+`std::function`; `NoFlowObserver` is empty). The expiry engine of milestone M10
+(`dataplane/expiry_wheel.h`, guide in [expiry.md](expiry.md)) plugs in through
+it: schedule in `OnCreate`, cancel in `OnErase`, keep the `FlowHandle` as the
+timer's payload, and expire by calling `table.Erase(handle)` from the poll
+callback. Because the handle carries the generation, a record that outlived its
+flow cannot erase the flow that reused the slot. The table has no timer and no
+`Touch()`: a refresh is either `ExpiryWheel::Refresh` or a plain store into the
+application's State (both are shown, tested against a model, in
+`core/flow/expiry_consumer_test.cc`). The flow library does not include the
+engine and the engine does not include the flow library. `FlowCounters` is an
 optional ready-made observer that counts creates, erases and refusals.
 
 ## SharedFlowTable
@@ -188,7 +192,7 @@ a higher load makes a missing lookup walk several buckets under churn.
 
 ## Not provided
 
-No timers or aging (M10), no eviction policy, no TCP or NAT semantics, no
+No timers or aging inside the table (see above: they are `dataplane/expiry_wheel.h`, wired through the observer), no eviction policy, no TCP or NAT semantics, no
 resizing, no per-flow counters unless the observer adds them, no NUMA or hugepage
 allocator beyond the `Traits::Allocator` seam. Behaviour at 10 million flows was
 not measured (D-052).
