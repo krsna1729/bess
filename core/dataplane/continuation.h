@@ -107,7 +107,20 @@ inline const char *ToString(ContinuationError error) noexcept {
   return "unknown continuation table error";
 }
 
-template <typename Target>
+// The seam tests use to run code at a precise point inside `Resolve` (see
+// docs/handoff.md, "Testing"). `ResolveHook::AfterTargetWord(i)` is called after
+// word `i` of the target has been loaded, on the resolving thread, before the
+// generation is read again; after the last word it is exactly the point between
+// "the target was copied" and "the copy is validated". A test supplies its own
+// hook type that retires and reuses the slot there, so that the fail-closed check
+// is exercised deterministically instead of by a race. The default hook is an
+// empty inline function: a production table compiles to the same code as one
+// without the seam (the instantiation's assembly was compared, D-054).
+struct NoResolveHook {
+  static void AfterTargetWord(size_t /*index*/) noexcept {}
+};
+
+template <typename Target, typename ResolveHook = NoResolveHook>
   requires std::is_trivially_copyable_v<Target> && (sizeof(Target) <= 64)
 class ContinuationTable {
  public:
@@ -294,6 +307,7 @@ class ContinuationTable {
     std::array<std::byte, kWords * 8> bytes;
     for (size_t i = 0; i < kWords; i++) {
       const uint64_t word = slot.words[i].load(std::memory_order_acquire);
+      ResolveHook::AfterTargetWord(i);
       std::memcpy(bytes.data() + i * 8, &word, 8);
     }
     std::memcpy(exact.data(), bytes.data(), sizeof(Target));

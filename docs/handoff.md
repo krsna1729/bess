@@ -217,5 +217,15 @@ repeated lifecycle, punt-service-resume with retired continuations) and
 pinned to one or two CPUs; the cross-thread ones have a ThreadSanitizer run
 described in D-054.
 
+**Testing a race at an exact point.** `ContinuationTable<Target, ResolveHook>` takes
+a second template argument, `ResolveHook`, whose static
+`AfterTargetWord(size_t i)` is called by `Resolve` after word `i` of the target was
+loaded and before the generation is read again. The default, `NoResolveHook`, is an
+empty inline function and compiles to exactly the code of a table without the
+seam (the assembly of `Resolve` for three target sizes was compared, D-054). A test
+supplies its own hook that retires and reuses the slot there, which exercises the
+fail-closed check deterministically (`ContinuationResolveSeamTest.*`); it is a
+test facility, not an extension point for production code.
+
 Benchmarks: `handoff_bench` (build and run from the release tree, pinned to two
 physical cores; see benchmarking.md).

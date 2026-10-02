@@ -68,6 +68,39 @@ void *operator new(std::size_t n, std::align_val_t a) {
 void *operator new[](std::size_t n, std::align_val_t a) {
   return Allocate(n, static_cast<std::size_t>(a));
 }
+// The nothrow forms too, so that no allocation is made by the library's own
+// operator new and freed by the replaced operator delete below (AddressSanitizer
+// reports that as alloc-dealloc-mismatch).
+void *operator new(std::size_t n, const std::nothrow_t &) noexcept {
+  try {
+    return Allocate(n, 0);
+  } catch (const std::bad_alloc &) {
+    return nullptr;
+  }
+}
+void *operator new[](std::size_t n, const std::nothrow_t &) noexcept {
+  try {
+    return Allocate(n, 0);
+  } catch (const std::bad_alloc &) {
+    return nullptr;
+  }
+}
+void *operator new(std::size_t n, std::align_val_t a,
+                   const std::nothrow_t &) noexcept {
+  try {
+    return Allocate(n, static_cast<std::size_t>(a));
+  } catch (const std::bad_alloc &) {
+    return nullptr;
+  }
+}
+void *operator new[](std::size_t n, std::align_val_t a,
+                     const std::nothrow_t &) noexcept {
+  try {
+    return Allocate(n, static_cast<std::size_t>(a));
+  } catch (const std::bad_alloc &) {
+    return nullptr;
+  }
+}
 void operator delete(void *p) noexcept { std::free(p); }
 void operator delete[](void *p) noexcept { std::free(p); }
 void operator delete(void *p, std::size_t) noexcept { std::free(p); }
