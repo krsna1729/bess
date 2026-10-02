@@ -88,6 +88,24 @@ FORBIDDEN_RULES = [
             ("pb/", "route library must not depend on protobuf"),
         ],
     ),
+    # The flow-state library is graph-independent and sits below the worker: no
+    # Module, gate, framework, runtime, control or protobuf, and no worker.h or
+    # stats/current_worker.h (worker identity is an injected owner token; M9,
+    # D-052). Tests and benchmarks are exempt.
+    (
+        re.compile(r"^core/flow/"),
+        [
+            ("module.h", "flow library must not depend on Module"),
+            ("gate.h", "flow library must not depend on gates"),
+            ("framework/", "flow library must not depend on framework"),
+            ("runtime/", "flow library must not depend on runtime"),
+            ("control/", "flow library must not depend on control"),
+            ("pb/", "flow library must not depend on protobuf"),
+            ("google/protobuf/", "flow library must not depend on protobuf"),
+            ("grpc", "flow library must not depend on gRPC"),
+            ("worker.h", "flow library must not include worker.h; inject an owner token"),
+        ],
+    ),
     # Modules obtain runtime facilities through Module::init_context() (D-042),
     # never by including the runtime state. Tests and benchmarks are exempt.
     (
@@ -157,6 +175,8 @@ def run_self_test():
         ("core/dataplane/scope.h", '#include "route/next_hop_id.h"'),
         ("core/dataplane/slot_table.h", '#include "classifier/classifier.h"'),
         ("core/dataplane/batch_stages.h", '#include "stats/worker_slots.h"'),
+        ("core/flow/worker_flow_table.h", '#include "module.h"'),
+        ("core/flow/owner.h", '#include "stats/current_worker.h"'),
     ]
 
     include_pattern = re.compile(r'^\s*#\s*include\s+["<]([^">]+)[">]')
@@ -170,7 +190,7 @@ def run_self_test():
                     if forbidden_sub in inc:
                         dummy_violations.append((fake_path, inc, reason))
                         break
-    expected = 11
+    expected = 13
     assert len(synthetic_cases) == expected and len(dummy_violations) == expected, (
         f"Expected {expected} synthetic violations, got {len(dummy_violations)} "
         f"of {len(synthetic_cases)} cases"

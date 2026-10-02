@@ -68,3 +68,30 @@ latency. Start bessd isolated on the worker core as for any benchmark, run
 the script from another core with `PYTHONPATH` set to the generated Python
 protobufs (`build/protobuf/generated/python` and its `builtin_pb`), and
 compare rates within one run (`--rounds` interleaves them).
+
+## Flow-state tables
+
+`flow_bench` (`core/flow/flow_bench.cc`, D-052) covers `WorkerFlowTable` and
+`SharedFlowTable` against the backends they were chosen over. Build and run it
+from the release tree, pinned to one P-core for the single-thread benchmarks:
+
+```
+ninja -C build/perf-release core/flow_bench
+taskset -c 2 build/perf-release/core/flow_bench --benchmark_repetitions=3 \
+    --benchmark_report_aggregates_only=true \
+    --benchmark_filter='BM_Worker|BM_Baseline'
+```
+
+The multi-thread benchmarks (`BM_SharedReaders`, `BM_SharedReaderWriter`) pin
+their own threads to the CPUs the process may use, except the CPU the
+benchmark thread sleeps on. Give the process one CPU more than the threads it
+should start, and set `FLOW_BENCH_MAIN_CPU` to that spare CPU:
+
+```
+FLOW_BENCH_MAIN_CPU=0 taskset -c 0,2,4,6,8,10 flow_bench \
+    --benchmark_filter='BM_SharedReaders/[0-9]+/(1|2|4)/[01]/'
+```
+
+`FLOW_BENCH_LARGE=1` also registers the 10M-flow case (the smallest key and
+State, about 0.5 GB). Lookup benchmarks report `ns_per_lookup`, `tsc_per_lookup`
+(TSC ticks, not core cycles) and `bytes_per_flow`.

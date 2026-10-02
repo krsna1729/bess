@@ -66,7 +66,8 @@ stopping traffic.
 | rate limiting / policing | `MeterSet` (+ `MeterState`) | `meter/meter_set.h` | set: G; bucket state: per meter, see header |
 | counters and histograms read by the controller | `CounterSet`, `WorkerHistogram` | `stats/counter_set.h`, `stats/worker_histogram.h` | worker-owned |
 | any other per-worker scratch | `WorkerLocal<T>` | `stats/worker_local.h` | worker-owned |
-| flows the packet path creates (NAT-style learning) | `utils::CuckooMap` owned by one worker | `utils/cuckoo_map.h` | worker-owned |
+| flows the packet path creates (NAT-style learning), with stable ids, aliases and a fixed capacity | `flow::WorkerFlowTable` (worker-owned) or `flow::SharedFlowTable` (shared lookup); see [flow-state.md](flow-state.md) | `flow/worker_flow_table.h`, `flow/shared_flow_table.h` | worker-owned / in place, one writer lock |
+| flows that need none of that, owned by one worker | `utils::CuckooMap` owned by one worker | `utils/cuckoo_map.h` | worker-owned |
 | any immutable configuration object | `RcuPtr<T>` | `rcu/rcu_ptr.h` | G |
 | turning packet bytes into a lookup key | `ExtractPlan` | `classifier/extract_plan.h` | compiled with the generation |
 
@@ -425,9 +426,11 @@ reference to something missing.
 
 - **What:** BESS's original single-writer cuckoo hash, with prefetch hooks
   for batch lookups.
-- **Use:** only as state owned and written by one worker (NAT's flow table).
-  It is not safe for a command thread, or a second worker, to write while a
-  worker reads.
+- **Use:** only as state owned and written by one worker. It is not safe for
+  a command thread, or a second worker, to write while a worker reads. It
+  grows itself when an insert fails, so it is not a fixed-capacity table;
+  flow state that needs a bounded size, a stable id or aliases belongs in
+  `flow::WorkerFlowTable` (flow-state.md).
 
 ### `ExtractPlan` (packet → key)
 

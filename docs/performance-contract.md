@@ -9,6 +9,7 @@ This contract defines the performance, memory, and concurrency invariants for al
 1. **Zero Allocation**:
    - The packet processing path (`ProcessBatch`, `RunTask`, `Lookup`, `EmitPacket`) must perform **zero heap allocations** (`malloc`, `new`, `std::vector` resize).
    - All batch workspaces and scratch buffers must be pre-allocated or stack-allocated within bounded limits (`kMaxBurst = 32`).
+   - Flow tables (`flow::WorkerFlowTable`, `flow::SharedFlowTable`, M9) allocate only in `Create()`: capacity is fixed, there is no resize or rehash, and a full table refuses the create (`EmplaceStatus::kFull`) instead of growing. Lookup, create and erase of a worker-owned table allocate nothing.
 
 2. **Near-Specialized Assembly for Typed Paths**:
    - For typed hot paths (e.g. `TypedExactTable`, `RangeClassifier`, `ScopeTable::Lookup`), code generation must approach optimal hand-written assembly.
@@ -21,6 +22,7 @@ This contract defines the performance, memory, and concurrency invariants for al
 4. **Zero Shared-Lock Contention**:
    - Worker threads must never acquire shared mutexes, spinlocks, or atomic read-modify-write loops during packet forwarding.
    - All reader synchronization relies on QSBR RCU (`bess::rcu::RcuDomain`) and acquire-load memory fences.
+   - The one sanctioned exception is a *writer* of a table that was built to be written from workers: `ConcurrentExactTable` with `Writers::kShared` and `flow::SharedFlowTable` serialize creates and erases on one spinlock (D-028, D-052). Their readers take no lock and execute no read-modify-write. Choose such a table only where new flows are rare; otherwise partition into `WorkerFlowTable`s.
 
 ---
 
@@ -31,6 +33,7 @@ This contract defines the performance, memory, and concurrency invariants for al
    - **Routing**: Exactly **1 memory access** for IPv4 routes `/24` or shorter via DIR-24-8 `rte_lpm` `tbl24`.
    - **Metering & Accounting**: Per-worker arrays (`WorkerSlots`) guarantee that worker increments touch only cache lines exclusive to that worker's NUMA node, eliminating cross-core cache invalidation storms.
    - **Scope binding**: a packet operation reads a scope's whole policy with one acquire load (`ScopeTable::Lookup`, D-050) and routes every covered lookup through that immutable version; it adds a pointer load per scope, not a version check per table operation. Referential resources keep their lookup cost unchanged (nothing on their read path was touched). The load itself has not been benchmarked.
+   - **Flow state** (M9, D-052): a `WorkerFlowTable` lookup reads one 64-byte index bucket (eight 16-bit tags and eight ids) and, only on a tag match, the slot record that holds the key, the generation and the start of the State (56 bytes for a 16-byte key with 32 bytes of State: one or two lines). A miss reads the index bucket alone unless that bucket has overflowed. `SharedFlowTable` adds the rte_hash directory's lines to the slot record's. Measured times, bytes per flow and the sizes that were not run are in D-052.
 
 2. **Scale Bounds**:
    - Strong identifiers (`StrongId`) are scalar wrappers: trivially copyable, register-passable, the size of their representation, and compiled to the same code as the raw integer (checked for `InterfaceId`, D-049). An identifier that can appear in packet metadata or a hardware mark is 32 bits (`ActionId`, `NextHopId`, `InterfaceId`, `RouteDomainId`). `WorkerId` is 16 bits because it never leaves the process. `GenerationHandle<Id>` is an id plus a 32-bit generation: 8 bytes, one 64-bit compare.

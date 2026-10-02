@@ -72,6 +72,7 @@ file is the reasoning.
 | D-049 | Logical network identities: InterfaceId replaces the gate in the route library (M7) | accepted |
 | D-050 | Explicit transaction consistency: referential vs scope-snapshot (M8) | accepted |
 | D-051 | DPDK build profiles: bess (software ports) and full (every NIC family) | accepted |
+| D-052 | Generic flow-state substrate: typed flow tables with generation-checked ids (M9) | accepted |
 
 
 ---
@@ -3816,3 +3817,361 @@ built. Plugins do not link drivers themselves.
 **Revisit when:** a NIC family is deployed that `full` omits, a DPDK library
 is needed that has to be disabled to save time (none is expensive: libraries
 are 335 of 2,246 units), or the release set is curated.
+
+## D-052 Generic flow-state substrate: typed flow tables with generation-checked ids (M9)
+
+**Status:** accepted (2026-10-02), with the exceptions under "Not done".
+**Code:** `core/flow/{flow_types.h,flow_key.h,flow_index.h,flow_storage.h,flow_observer.h,owner.h,owner.cc,worker_flow_table.h,shared_flow_table.h}`,
+tests `core/flow/{flow_index_test.cc,worker_flow_table_test.cc,shared_flow_table_test.cc,reference_apps_test.cc}`,
+benchmark `core/flow/flow_bench.cc`, `core/meson.build` (`bess_flow`, install manifest,
+test and benchmark registration), `tools/{check_includes.py,check_installed_headers.py,layer_dag.json}`,
+`docs/{flow-state,architecture,dataplane-tables,performance-contract,benchmarking}.md`,
+`docs/baselines/dependency-graph.json`.
+
+**Context.** Firewalls, NATs, load balancers, session compilers and caches all
+need the same primitive: typed state under an application-defined key that
+outlives a lookup, with a handle that is safe to keep. What existed:
+`ConcurrentExactTable` (rte_hash, shared writers by D-028) holds an 8-byte value
+and is internal; `utils::CuckooMap` is single-writer but grows itself when an
+insert fails (`DoEmplace`, "expand the table as the last resort"), which is a
+resize on the path that creates flows, and its free-entry list is a
+`std::stack` over a deque, which allocates as it grows; `GenerationHandle`
+(D-049) had no consumer; `SlotTable` publishes immutable objects one at a time
+from a control thread. The roadmap's text and the code agreed except where
+noted below (it names `std::equal_to` and `DefaultHash`; the hash and
+equality here must be `noexcept` and the defaults read the key's bytes, see
+"Key").
+
+**Decision.**
+
+- **A new library, `bess_flow` (`core/flow/`)**, on `bess_dataplane_core`,
+  `bess_rcu`, `bess_utils` and (for the shared table only) `bess_classifier`.
+  `check_includes.py` forbids `module.h`, `gate.h`, `framework/`, `runtime/`,
+  `control/`, protobuf, gRPC and `worker.h` there (13-case self-test; the
+  `worker.h` rule also catches `stats/current_worker.h`). The link-graph
+  checker lists `bess_flow` with no exception; it reports 18 libraries and 46
+  edges (6 grandfathered, unchanged). The committed
+  `docs/baselines/dependency-graph.json` was regenerated; it also drops two
+  edges D-049 had already removed. Expiry stays in `dataplane/` for M10, so the
+  flow library defines only the seam (below). All headers except
+  `shared_flow_table.h` are installed as experimental API (it includes
+  `classifier/concurrent_exact.h`, which is internal); the installed-header
+  check compiles them standalone.
+- **Ids.** `FlowId` (`StrongId<_, uint32_t>`, one-based, zero = none) and
+  `FlowHandle = GenerationHandle<FlowId>`. A slot's generation is odd while it
+  holds a flow and even while free and advances at creation and at erasure, so
+  a handle matches only the lifetime it was issued for (a forged even
+  generation matches nothing). A slot whose generation would wrap (2^31 reuses)
+  is retired instead of reused: no ABA, ever, at the price of that slot.
+  `SlotReuse::kLifo` (warm cache) or `kFifo` (slot freed longest ago; use when
+  handles live long) is a template choice.
+- **`WorkerFlowTable<Key, State, Hash, Equal, Traits>`** (worker-owned). One
+  contiguous slot record per flow holds its keys, generation and the in-place
+  State (State is never moved or copied, its address is stable, its
+  constructor may throw without changing the table); a directory maps hashes
+  to key ids. Everything is allocated in `Create()` (which reports
+  `kInvalidCapacity`, `kTooLarge` or `kOutOfMemory` and leaves nothing
+  allocated); after that no operation allocates, resizes or rehashes. A full
+  table returns `EmplaceStatus::kFull`, builds no State, changes nothing and
+  tells the observer; it never evicts. Nothing is atomic. `Traits` carries the
+  alias count, reuse policy, observer, owner policy and allocator.
+- **The directory is a new, small, fixed-size table (`FlowIndex`)**, a
+  deliberate exception to "do not create a hash implementation by default":
+  64-byte buckets of eight 16-bit tags and 32-bit key ids, overflow to the next
+  bucket counted in the buckets passed (an erase takes the counts back, so
+  there are no tombstones), user hash mixed by two multiplies, bucket chosen by
+  multiply-shift so any bucket count works, tags compared with one SSE2 compare
+  (a scalar definition is tested equal). Why not the existing backends,
+  measured below: `CuckooMap` resizes and allocates (cannot satisfy the
+  requirement), and rte_hash/`ConcurrentExactTable` need the EAL, compare keys
+  through a function pointer, and store 8-byte values, so a
+  typed State costs a second array and a second cache miss. Sized for 4 keys per
+  bucket (50% load) because deletion never moves an entry back: simulated with
+  random keys at steady churn, the average chain a *missing* lookup walks was 1.24
+  buckets at 4 per bucket, 2.1 at 5, 3.4 at 5.5 and 7.2 at 6.
+- **Key.** `FixedFlowKey` = trivially copyable. The default hash and equality
+  read the key's bytes and exist only for canonical keys: no padding
+  (`has_unique_object_representations`) or a `FlowKeyTraits<K>` specialisation
+  in which the author promises zeroed padding; anything else is a compile error
+  saying so. Keys with masks or don't-care fields pass their own `noexcept`
+  `Hash` and `Equal`. The hidden-padding hazard is thereby a compile-time
+  decision, not a runtime surprise.
+- **Aliases** (`Traits::kAliases = N`): up to N extra keys per flow, each one more
+  directory entry pointing at the same slot record; `FindRef` says whether the
+  key was an alias (no direction semantics in the table); `EmplaceAliased` is
+  all-or-nothing; erasing a flow removes every key. Chosen over a second table
+  the application keeps in step by measurement (`BM_AliasLookup`,
+  `BM_AliasChurn`, below): equal lookup speed, 16% fewer bytes per flow, equal
+  create/erase rate, and consistency by construction. A secondary index inside
+  the table was not built (it has the second table's second probe).
+- **Expiry seam (for M10).** `Traits::Observer` (`OnCreate`, `OnErase`, `OnFull`;
+  inline, `NoFlowObserver` is empty, `FlowCounters` is optional). The expiry
+  engine keeps `FlowHandle`s, expires by `Erase(handle)`, and a record that
+  outlived its flow fails closed. The table has no timer and no `Touch()`
+  (refresh is a store in the application's State). Tested with a fake expiry
+  engine, including the stale-record case M10's exit criteria name.
+- **Ownership diagnostics.** `Traits::Owner` (`kChecked`, `Current()`): with a
+  checked policy every call compares the caller with the owner, bound on the
+  first call, and aborts on a mismatch; unchecked policies store and compile
+  nothing. The library cannot include `worker.h`, so worker identity is
+  injected (`TokenOf(WorkerId)`; the default checks the calling thread in
+  builds without `NDEBUG`). `ReleaseOwner()` hands a table over.
+- **`SharedFlowTable<Key, State, Traits>`** (shared lookup; not installed).
+  The directory is a `ConcurrentExactTable` holding the 8-byte `FlowHandle`; the
+  State lives in the same slot records as above. Readers take no lock and do no
+  read-modify-write; writers from any thread serialize on one spinlock (D-028's
+  model, whose numbers decide when to use it). An erased flow leaves the
+  directory and its handle stops resolving at once; its State is destroyed and
+  slot reused only after a grace period of the caller's `RcuDomain`, one grace
+  period per `Reclaim()` batch, in a fixed 4-byte-per-flow ring (no allocation
+  on erase; a bounded number of outstanding batches, overflow folds into the
+  newest). Destruction runs on whoever calls `Reclaim()` or `Emplace` on a full
+  table. `StateSharing::kSharedMutable` (State synchronises itself; `Find`
+  returns `State *`) or `kOwnedByCreator` (others get `const State *` from
+  `Peek`; `FindOwned` checks the creator under an owner policy) keeps the
+  roadmap's two questions apart.
+
+**Evidence.** Everything below was run; GCC 16.2.1 unless stated.
+
+*Tests* (fast tree, `-O1`; 103/103 pass: the 99 before plus four new test
+binaries holding 49 cases):
+
+- `flow_index_test` (10): the SSE2 tag match equals its scalar definition for
+  every pattern; the designed key count always fits, with bounded chains, for
+  sequential, high-half and strided keys; hash flood (every key to one bucket,
+  counters saturated) still finds, erases and reuses everything; after 400,000
+  random churn operations each bucket's overflow count equals exactly what the
+  live entries imply (no residue) and a missing lookup walks under 1.5 buckets;
+  the default hash spreads a counter placed at *every* byte offset of a key.
+  The last two caught two real defects while writing them: a first default
+  hash (multiply then rotate) confined a counter in the high half of a word to
+  8 buckets, and a multiplicative hash alone made lookups of a counter in the
+  top bytes of a 32-byte key walk 1.3 buckets against 1.05 for a random hash;
+  the index therefore always mixes, and the default hash folds high bits down.
+- `flow_worker_flow_table_test` (21): create/find/erase/duplicate; capacity
+  exhaustion (refusal builds no State, an existing key is `exists` not `full`,
+  one erase frees exactly one slot); in-place State with stable address and
+  destruction; a throwing constructor changes nothing; **a stale handle cannot
+  reach the flow that reused its slot** (including forged handles and erase by
+  stale handle); LIFO vs FIFO reuse; generation exhaustion retires the slot;
+  alias lifetime (every key leaves with the flow, freed keys are reusable,
+  `EmplaceAliased` all-or-nothing); any key type and a constant hash; batch
+  equals scalar; `ForEach`; reported bytes per flow; failure injection in the
+  allocator at each of the three allocations (nothing leaks) and impossible
+  capacities; ownership (first caller owns, other callers and wrong
+  `ReleaseOwner` abort with the operation named, hand-off, thread tokens); the
+  fake expiry engine (hooks, cancel on erase, budgeted expiry by handle, stale
+  record); and **a random differential test against `std::map` /
+  `unordered_map` models** (six seeds x three table shapes plus a weak-hash
+  table and a one-flow table, 40,000 operations each, comparing state, handles,
+  `via_alias`, size, fullness, stale handles and batches after every step).
+- `flow_shared_flow_table_test` (14): the same API checks on the shared table
+  with State larger than rte_hash's value; **a stalled RCU reader keeps the
+  erased State alive and intact and its slot taken until it passes a quiescent
+  state**, then everything is released; more outstanding batches than the table
+  tracks fold safely; stale-handle and generation-retirement tests; alias
+  lifetime; `kOwnedByCreator` access and death on a stranger; creation-failure
+  injection and a directory rte_hash refuses (no slot array allocated first);
+  four racing creators make each of 3,000 flows exactly once;
+  **concurrent lookup against create/erase** (3 registered readers using each
+  State they find, 2 writers, a reclaiming control thread, 1.5 s; a State seen
+  after its destructor or with another key's value fails); and a differential
+  model test.
+- `flow_reference_apps_test` (4): a NAT (reverse key as alias, idle expiry,
+  full-table drop), an L2 forwarding table (learn, move, VLAN in the key, aging
+  by scan) and a load balancer's connection table shared by four workers (each
+  connection pinned to one backend as seen by all; backend removal erases its
+  connections) are written against the public API only: three appliance states,
+  no table of their own.
+- Mutation checks (each fails the named tests, then reverted): reclaiming
+  without the grace-period check; not bumping the generation on erase; not
+  erasing alias keys (worker and shared); accepting an even generation; not
+  decrementing overflow counts; not retiring an exhausted generation.
+- Not run under ThreadSanitizer (no instrumented tree); the concurrent tests
+  ran in the ordinary build. Compiled clean with Clang 22.1.8 `-Werror`
+  (syntax only, tests and benchmark); GCC 14 and Clang 19 run in CI.
+
+*Benchmarks.* `core/flow/flow_bench.cc`; Intel Core i9-13900H (hybrid:
+6 P-cores with SMT, 8 E-cores; 1.25 MiB L2 per P-core, 24 MiB shared L3), GCC
+16.2.1 `-O3` (meson `release`) `-march=x86-64-v3`, DPDK 25.11.3, Linux 7.2,
+governor `powersave` (HWP, EPP `balance_performance`; not changed), no core
+isolation; single-thread benchmarks pinned to P-core CPU 2 with `taskset`,
+3 repetitions, medians (coefficient of variation of the single-thread lookup
+benchmarks: median 0.2%, 90th percentile 1.3%, worst 5.4%). 16-byte five-tuple key
+(13 bytes of fields, 3 explicit zero bytes), 32-byte State, unless a column
+says otherwise; every hit reads `State::counter`. The TSC ran at 3.00 GHz
+(1 ns = 3.0 ticks; the core ran faster, so ticks are not core cycles). Query
+streams are 262,144 precomputed keys replayed. ns per lookup:
+
+| table | access | batch 1 | batch 8 | batch 16 | batch 32 |
+|---|---|---|---|---|---|
+| 1K | one hot flow | 4.3 | 4.5 | 4.4 | 4.6 |
+| 1K | Zipf(1) | 4.5 | 4.7 | 4.6 | 4.8 |
+| 1K | uniform hit | 4.8 | 4.9 | 4.7 | 5.0 |
+| 1K | miss | 3.2 | 3.4 | 3.4 | 3.8 |
+| 1K | 50/50 hit/miss | 11.5 | 9.6 | 10.0 | 9.7 |
+| 64K | one hot flow | 4.3 | 4.5 | 4.4 | 4.6 |
+| 64K | Zipf(1) | 7.1 | 6.8 | 5.6 | 5.6 |
+| 64K | uniform hit | 8.7 | 8.0 | 6.7 | 6.3 |
+| 64K | miss | 4.5 | 4.0 | 3.7 | 4.0 |
+| 64K | 50/50 hit/miss | 14.3 | 10.7 | 10.3 | 9.9 |
+| 1M | one hot flow | 4.3 | 4.5 | 4.4 | 4.6 |
+| 1M | Zipf(1) | 17.2 | 15.8 | 13.1 | 11.3 |
+| 1M | uniform hit | 35.5 | 32.1 | 22.5 | 19.4 |
+| 1M | miss | 6.1 | 6.3 | 5.4 | 4.6 |
+| 1M | 50/50 hit/miss | 28.1 | 26.6 | 19.3 | 15.3 |
+
+(Zipf(1) is the log-uniform approximation: rank *r* with probability ~1/*r*. The
+50/50 case is slow even in a 1K table because a random hit/miss pattern
+mispredicts the tag-match branch about half the time; a 1K batch of
+misses or hits alone is 3-5 ns. At batch 1 and 1M, a uniform hit is one
+dependent miss to the index and one to the slot record; a batch of 32 overlaps
+them, 35.5 to 19.4 ns.)
+
+Key width and State size, batch 32, with bytes per flow at full occupancy
+(slot record + free list + directory):
+
+| key | State | 64K hit | 64K miss | 1M hit | 1M miss | bytes/flow |
+|---|---|---|---|---|---|---|
+| 8 B | 32 B | 5.5 | 3.6 | 18.2 | 4.0 | 68 |
+| 16 B | 32 B | 6.3 | 4.1 | 19.6 | 4.5 | 76 |
+| 5-tuple (16 B) | 32 B | 6.3 | 4.0 | 19.4 | 4.6 | 76 |
+| 32 B | 32 B | 8.4 | 5.0 | 23.5 | 6.0 | 92 |
+| 48 B (tunnel + inner tuple) | 32 B | 10.8 | 6.0 | 27.8 | 7.4 | 108 |
+| 5-tuple | 16 B | 6.0 | - | 19.0 | - | 60 |
+| 5-tuple | 64 B | 6.7 | - | 21.2 | - | 108 |
+| 5-tuple | 128 B | 6.9 | - | 20.6 | - | 172 |
+| 5-tuple | 16 B + 256 B record in a separate array | 12.0 | - | 37.5 | - | 316 |
+
+The backends the roadmap says to evaluate, on the same streams (ns per lookup;
+`CuckooMap` with its own prefetch staging for batch 32, rte_hash in position
+mode with `rte_hash_lookup_bulk` and the State in a slab, `ConcurrentExactTable`
+with `LookupBatch` and a slab; "FlowIndex raw" is this directory with keys and
+States in two flat arrays, a scalar loop, no generation: it isolates what the
+slot record and batch stages add):
+
+| backend | 64K hit b1 | 64K hit b32 | 64K miss b1 | 64K miss b32 | 1M hit b1 | 1M hit b32 | 1M miss b1 | 1M miss b32 | bytes/flow |
+|---|---|---|---|---|---|---|---|---|---|
+| `WorkerFlowTable` | 8.7 | 6.3 | 4.5 | 4.0 | 35.5 | 19.4 | 6.1 | 4.6 | 76 |
+| FlowIndex raw | 8.4 | 7.2 | 4.7 | 3.9 | 39.8 | 34.8 | 7.3 | 6.2 | 64 |
+| `CuckooMap<K, State>` | 8.1 | 16.4 | 5.0 | 6.1 | 34.2 | 27.6 | 8.7 | 10.2 | 64 |
+| rte_hash + slab | 24.3 | 10.1 | 14.6 | 7.0 | 57.9 | 26.8 | 16.5 | 7.7 | 109 |
+| `ConcurrentExactTable` + slab | 28.8 | 8.7 | 14.0 | 4.0 | 120.3 | 27.1 | 21.6 | 5.8 | 152 |
+| `std::unordered_map` | 18.6 | - | 24.9 | - | 58.4 | - | 67.1 | - | not measured |
+
+With an 8-byte key and 1M flows, uniform hit, batch 1 / 32: `WorkerFlowTable`
+(batch 32 only) 18.2; `CuckooMap` 29.4 / 27.9; rte_hash 61.2 / 34.7;
+`ConcurrentExactTable` 114.1 / 25.8; FlowIndex raw 34.4 / 29.1;
+`std::unordered_map` 47.8. Scalar lookups: `CuckooMap`, the one backend that
+resizes, is 4-7% faster on hits than `WorkerFlowTable` and slower on misses
+(5.0 vs 4.5 ns at 64K, 8.7 vs 6.1 at 1M); the others are 1.6-3.4x slower on hits.
+Batches of 32: `WorkerFlowTable` is 27-28% faster than the best other backend
+on hits (6.3 vs 8.7 ns at 64K, 19.4 vs 26.8 at 1M), equal on 64K misses and 21%
+faster on 1M misses. Bytes per flow of rte_hash and `ConcurrentExactTable` are
+the EAL heap each used plus the slab.
+
+Slot-record prefetch in `FindBatch` (`Traits::kPrefetchSlots`; batch
+8 / 16 / 32, ns): 64K hit 8.0 / 6.7 / 6.3 without, 8.4 / 6.9 / 7.1 with; 64K
+miss 4.0 / 3.7 / 4.0 vs 4.6 / 4.5 / 4.8; 1M hit 32.1 / 22.5 / 19.4 vs
+30.7 / 20.7 / 18.5; 1M miss 6.3 / 5.4 / 4.6 vs 6.9 / 6.0 / 5.5. It helps only
+an all-hit batch far beyond the caches (4-8%) and costs everywhere else (10-22%
+on misses, up to 13% on cache-resident hits), so it is off by default.
+
+Aliases (`BM_AliasLookup`, `BM_AliasChurn`; five-tuple key, 32-byte State,
+batch 32, uniform hit, ns; one table with an alias key against two tables, the
+second mapping the reverse key to a pointer): 64K via the forward key 6.8 vs
+6.4, via the reverse key 6.9 vs 6.9; 1M 23.1 vs 19.9 and 22.6 vs 25.6. Bytes
+per flow 108 vs 128. Creating and erasing a two-key flow flat out: 49.7 vs 55.2
+ns at 64K, 154 vs 151 ns at 1M.
+
+Churn, batch of 32 lookups with a fraction of operations replaced by a
+create + erase pair of a flow in a sliding window (`BM_WorkerChurn`): 64K 1% 8.7
+ns/op, 10% 9.5 ns/op, flat out 36.5 M create+erase pairs/s (13.7 ns/op);
+1M 1% 29.3, 10% 31.3, flat out 21.4 M pairs/s. Latency of one create or erase
+run alone (serialised timestamps, ticks / ns): 64K create p50 44 / 15, p99
+96 / 32, p99.9 136 / 45; erase 58 / 19, 106 / 35, 134 / 45; 1M create p50
+78 / 26, p99 524 / 174, p99.9 932 / 310; erase 100 / 33, 520 / 173, 936 / 312.
+The maxima (60,000-123,000 ticks, 20-41 us) are interruptions, not the table:
+nothing in create or erase loops or allocates.
+
+Shared lookup (`BM_SharedReaders`; M lookups/s in total, batch 32, uniform
+hit, each reader pinned to its own physical core; the partitioned row gives
+each reader its own `WorkerFlowTable` of 1/N of the keys and only its own keys):
+
+| cpus | table | readers: 1 | 2 | 4 | 8 |
+|---|---|---|---|---|---|
+| P-cores | 64K shared directory | 105 | 216 | 416 | - |
+| P-cores | 64K partitioned | 160 | 343 | 741 | - |
+| P-cores | 1M shared directory | 35 | 70 | 129 | - |
+| P-cores | 1M partitioned | 51 | 98 | 161 | - |
+| E-cores | 64K shared directory | 48 | 84 | 127 | 270 |
+| E-cores | 64K partitioned | 67 | 128 | 216 | 541 |
+| E-cores | 1M shared directory | 19 | 36 | 60 | 119 |
+| E-cores | 1M partitioned | 23 | 48 | 82 | 145 |
+
+Shared readers scale to the cores they were given (the shared directory runs
+at 69-83% of a partitioned table's per-reader rate at 1M and 50-72% at 64K) and
+nothing the readers share is written. One shared writer cycling 4,096 flows
+(`BM_SharedReaderWriter`, as fast as it can) cost the readers 22-24% at 64K
+on P-cores and 2-16% on E-cores, and 4-6% at 1M on P-cores and 3-6% on E-cores
+(the 64K loss is probably the writer's stores invalidating directory lines the
+readers share; not isolated); the writer managed 1.8-4.7 M
+operations/s, its p50/p99 per operation was 424-1,662 / 794-3,184 ticks
+(0.14-1.1 us), and the reclamation backlog peaked at 2,560-6,400 erased
+flows. Bytes per flow of the shared table: 64 (slot, free list, ring) plus
+about 120 for the rte_hash directory (measured as EAL heap growth) = 184.
+
+10M flows (`FLOW_BENCH_LARGE=1`, 8-byte key and 16-byte State only, worker
+table): 52 bytes per flow (about 0.5 GB), uniform hit 34.3 ns scalar and 19.5 ns
+per lookup in batches of 32, miss 11.0 and 8.5 ns.
+
+*Assembly.* GCC 16.2.1 `-O2 -march=x86-64-v3`, a 16-byte key and 32-byte State
+(`.scratch/asm/find.cc`, not kept). `WorkerFlowTable::Find` compiles to the
+same code as the raw directory loop: the inline key hash (two multiplies per
+word, then the two-multiply mix and the multiply-shift bucket choice), a
+broadcast of the tag and `vpcmpeqw` + `vpacksswb` + `vpmovmskb` against the
+bucket's eight tags, `tzcnt` over the match mask, the id load, the slot
+address (`imul $56`; the raw loop shifts), a 16-byte `vpxor` + `vptest` key
+compare, the state address, and the overflow-byte test that continues or
+ends. 81 instructions against the raw loop's 85, no call, no `lock`-prefixed
+instruction, no allocation, no indirect jump; the expected shape for the
+roadmap's list (hash, bucket loads, equality, direct state address). The one
+instruction not strictly needed is a compare of the found id against the miss
+marker.
+
+**Not done.**
+
+- **Timers and aging** are M10; only the seam exists, tested with a fake.
+- **10M flows** were run only for the worker table with the smallest key and
+  State; the shared table (about 1.8 GB of EAL heap at 10M) and larger keys or
+  States above 1M were not run, nor were larger shared sizes: this machine has
+  about 4 GB free.
+- **Cache-miss counters** were not collected (`perf` was not used); "cycles" are
+  TSC ticks. Frequency scaling and core isolation were not controlled (the
+  governor is `powersave`; the repeat medians are tight, but absolute numbers
+  would be a little higher or lower under `performance`). The single-thread
+  matrix was run on one P-core only, not on an E-core; the shared benchmarks
+  were run on both.
+- **Shared readers on P-cores stop at 4** (five distinct physical cores with
+  the benchmark thread aside); 8 readers ran on E-cores only. One writer only;
+  multi-writer contention is D-028's measurement.
+- **ThreadSanitizer** and GCC 14 / Clang 19 were not run locally.
+- **A secondary-index alias representation** was not built; the choice rests on
+  the comparison with a second table.
+- **No module uses a flow table yet**, so there is no live-daemon test and no
+  packet-loop throughput number; the three reference applications are tests.
+- **`SharedFlowTable` needs the EAL** (the directory is rte_hash; the classifier
+  already has the lazy bring-up exception) and **`Reclaim()` is driven by the
+  caller**: nothing reclaims in the background, and destroying a table waits
+  for the grace period.
+- **No hugepage or NUMA-aware allocation**; `Traits::Allocator` is the seam.
+- **`ForEach` is O(capacity)**, fine for scans and tests, not a packet-path
+  operation.
+
+**Revisit when:** a consumer needs more than 14 aliases or a different key set
+per flow; a workload with mostly hit batches over very large tables makes the
+slot prefetch default worth flipping; M10 finds the observer seam too narrow
+(for example it needs the refresh to be a table operation); the shared table's
+writer lock, measured above, is the bottleneck for a consumer that cannot
+partition; or `ConcurrentExactTable` is promoted to public, which would let
+`shared_flow_table.h` be installed.

@@ -4512,6 +4512,72 @@ rather than one call site).
        still use it); linking BESS against the `full` install locally.
      - **Evidence:** BESS built against the `bess` install, fast tree 99/99.
 
+132. **M9: generic flow-state substrate (D-052).**
+     - **What:** new library `bess_flow` (`core/flow/`, experimental API, headers
+       installed except `shared_flow_table.h`): `WorkerFlowTable` (worker-owned,
+       fixed capacity chosen at `Create`, no allocation or resize afterwards,
+       State built in place with a stable address, a full table refuses and
+       changes nothing), `FlowId`/`FlowHandle` with a generation per slot (a
+       stale handle never reaches the flow that reused its slot; an exhausted
+       generation retires its slot), alias keys (a reverse key finds the same
+       State and leaves with the flow), an observer seam for the M10 expiry
+       engine, an injected owner token with debug-checked ownership, and
+       `SharedFlowTable` (rte_hash directory holding handles, State in the
+       library's own slots, readers lock-free, writers on one spinlock, State
+       destroyed and slot reused only after an `RcuDomain` grace period;
+       `kSharedMutable` vs `kOwnedByCreator` state). The worker table's
+       directory (`FlowIndex`) is new and small because `CuckooMap` resizes and
+       allocates and rte_hash cannot hold a typed State without a second miss.
+       `check_includes.py` has a `core/flow/` rule (13-case self-test);
+       `layer_dag.json` lists `bess_flow`; `docs/flow-state.md` is the guide.
+     - **Found:** a default hash built from one multiply per word confined
+       structured keys to a few buckets (caught by the new hash tests; the index
+       now always mixes and the default hash folds high bits down); a 5.5-per-
+       bucket load made a missing lookup walk 3.4 buckets under churn, so the
+       index is sized for 50% load; prefetching the slot record in batches only
+       helps all-hit batches over huge tables, so it is off by default; the
+       committed dependency-graph baseline was stale since D-049 and was
+       regenerated.
+     - **Numbers** (i9-13900H P-core, GCC 16, `-O3 -march=x86-64-v3`, pinned,
+       governor `powersave`): 16-byte key, 32-byte State, 76 bytes per flow,
+       uniform hit in a batch of 32 6.3 ns at 64K flows and 19.4 ns at 1M (the
+       best other backend 8.7 and 26.8); scalar level with `CuckooMap`; 10M
+       flows (8-byte key, 16-byte State) 52 bytes per flow, 19.5 ns; shared
+       directory 105/216/416 M lookups/s for 1/2/4 readers at 64K. Full tables,
+       latency tails and the assembly note are in D-052.
+     - **Not done:** timers and aging (M10); 10M flows beyond the smallest key
+       and State; cache-miss counters; ThreadSanitizer; GCC 14 and Clang 19 runs
+       (Clang 22 syntax check only); a module that uses a flow table; hugepage or
+       NUMA allocation.
+     - **Evidence:** fast tree (GCC 16, `-O1`) 103/103 tests: the 99 before plus
+       `flow_flow_index_test` (10 cases), `flow_worker_flow_table_test` (21,
+       including a random differential test against std containers and failure
+       injection), `flow_shared_flow_table_test` (14, including a stalled RCU
+       reader and concurrent lookup against create/erase) and
+       `flow_reference_apps_test` (4: a NAT, an L2 table and a shared
+       load-balancer table on the public API only); seven mutations of the
+       table logic each failed a named test; staged install: 64 curated headers
+       present and compiling with `-Wall -Wextra -Werror`; link-graph checker
+       18 libraries, 46 edges, 6 grandfathered; include checker 13-case
+       self-test.
+
+133. **Concurrent tests no longer depend on machine speed (commit 58aa8765).**
+     - **What:** CI's GCC 14 job failed once in `route_route_domain_test`. The
+       writer swapped 64 MB route tables in a loop while descheduled readers
+       delayed their reclamation, which exhausted the 512 MB test heap; the
+       failed `ASSERT` then terminated the process with joinable threads. The
+       tests now drain retired tables after each swap and join readers through
+       a `ReaderGroup` on every exit. Three more tests
+       (`concurrent_exact`, `concurrent_masked`, `l2_table`) asserted a
+       throughput floor after a fixed 500 ms and failed on two CPUs; the
+       operation count is now part of the loop condition.
+     - **Found by:** pinning the suite to one and two CPUs with `taskset`,
+       which reproduced the first failure immediately. The full non-Python
+       suite on two CPUs then passed except for in-progress work.
+     - **Rule:** a test may bound its run by time, but not assert how much work
+       fit in that time; guarantee the volume instead.
+     - **Evidence:** each fixed test passes 4/4 to 6/6 on one CPU and on two.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

@@ -38,11 +38,11 @@ BESS is organized as a strict directed acyclic graph (DAG) enforced at build tim
                       |
              bess_dataplane_core (StrongId, SlotTable, ObjectTable, Transactions, ScopeTable/ScopeResource)
                       ^
-      +---------------+---------------+---------------+
-      |               |               |               |
-bess_classifier   bess_meter     bess_stats      bess_route
-      ^               ^               ^               ^
-      +---------------+---------------+---------------+
+      +-----------+-----------+-----------+-----------+-----------+
+      |           |           |           |           |           |
+bess_classifier  bess_meter  bess_stats  bess_route  bess_flow
+      ^           ^           ^           ^           ^
+      +-----------+-----------+-----------+-----------+-----------+
                       |
                bess_framework (Module, Gate, Graph, Task, Scheduler, Hooks)
                       ^
@@ -62,9 +62,11 @@ bess_classifier   bess_meter     bess_stats      bess_route
 
 Two checkers enforce this in CI. `tools/check_includes.py` rejects forbidden `#include` edges (rules 1-3, plus: `core/modules/**` must not include `runtime/**`, and `core/dataplane/**` must not include protobuf, gRPC, or the batteries built on it: `meter/`, `route/`, `classifier/`, `stats/`; tests and benchmarks are exempt). `tools/check_link_graph.py` reads the built static archives, resolves undefined symbols between BESS libraries, and compares the result with the allowlisted DAG in `tools/layer_dag.json`; it catches dependencies that enter through link configuration. Rules 4 and 5 are review rules today. A grandfathered violation must be listed in `layer_dag.json` with an owner and a removal phase, and the checker warns when one is no longer needed. The measured graph is committed at `docs/baselines/dependency-graph.json`.
 
+`core/flow/**` (M9, D-052) is covered by `check_includes.py` too: no `module.h`, `gate.h`, `framework/`, `runtime/`, `control/`, protobuf or gRPC, and no `worker.h` (which also catches `stats/current_worker.h`): a flow table learns who owns it from an injected owner token, not by asking the worker. Link-wise `bess_flow` may use `bess_classifier`, `bess_dataplane_core`, `bess_rcu` and `bess_utils` (`SharedFlowTable` is built on `ConcurrentExactTable`).
+
 1. `packet/**` may only depend on `utils/**` and low-level DPDK mbuf primitives. It must **never** include `framework/**`, `runtime/**`, `control/**`, `pb/**`, or `module.h`.
 2. `dataplane/**` (core substrate) may depend on `rcu/**` and minimal `utils/**`. It must **never** include `framework/**`, `runtime/**`, `control/**`, `pb/**`, or the batteries above it (`meter/**`, `route/**`, `classifier/**`, `stats/**`).
-3. Reusable libraries (`classifier/**`, `meter/**`, `stats/**`, `route/route_table.*`) are standalone C++ libraries. They must **never** include `module.h`, `runtime/**`, or `control/**`.
+3. Reusable libraries (`classifier/**`, `flow/**`, `meter/**`, `stats/**`, `route/route_table.*`) are standalone C++ libraries. They must **never** include `module.h`, `runtime/**`, or `control/**`.
 4. `framework/**` defines execution contracts (Module, Gate, Task). It does not depend on concrete modules, drivers, or control-plane RPC orchestration.
 5. Modules (`modules/**`) and drivers (`drivers/**`) are thin graph adapters. A module must **never** include another concrete module's internal header.
 
@@ -108,7 +110,7 @@ The following patterns are explicitly rejected and forbidden:
 Every installed header is **public**, **experimental** or **internal**. Packaging enforces it: the install manifest in `core/meson.build` names each installed header (no recursive install), and `tools/check_installed_headers.py` fails if a private header is installed or a public one is missing.
 
 - **Public** (supported source API for compatible BESS releases; plugins are rebuilt against the target release, the C++ ABI is not promised): the module, packet and port headers at `bess/core/`, `framework/module_init_context.h`, `framework/instance_registry.h`, `framework/plugin.h`, and the `utils/` helpers in the install manifest.
-- **Experimental** (installed, may change without preserving source compatibility): the selected headers under `classifier/`, `dataplane/`, `meter/`, `rcu/`, `route/` and `stats/`. Promotion to public is a decision recorded in `docs/decisions.md`.
+- **Experimental** (installed, may change without preserving source compatibility): the selected headers under `classifier/`, `dataplane/`, `flow/`, `meter/`, `rcu/`, `route/` and `stats/`. `flow/shared_flow_table.h` is not installed: it includes `classifier/concurrent_exact.h`, which is internal. Promotion to public is a decision recorded in `docs/decisions.md`.
 - **Internal** (never installed): `runtime/`, `control/`, `drivers/`, `gate_hooks/`, `resume_hooks/`, `framework/resource_bindings.h`, the transaction engine, scheduler and daemon startup headers, tests and benchmarks.
 
 `docs/plugin-api.md` is the plugin author's view of the same table.
@@ -127,14 +129,14 @@ From `core/rcu/rcu_domain.h` and `rcu_ptr.h`:
 
 ## 7. Handle Lifetime Rules
 
-Identifiers (`StrongId`) name objects through `SlotTable`/`ObjectTable`; an erased id is retired, not reused, until readers can no longer hold it (for example `Router` refuses to reuse a retiring `NextHopId`). A borrowed instance is an `InstanceLease`, which blocks `Destroy`. These rules bind batteries that hand out handles later (flow ids, handoff and hardware-offload handles; milestones M9, M11, M20):
+Identifiers (`StrongId`) name objects through `SlotTable`/`ObjectTable`; an erased id is retired, not reused, until readers can no longer hold it (for example `Router` refuses to reuse a retiring `NextHopId`). A borrowed instance is an `InstanceLease`, which blocks `Destroy`. These rules bind batteries that hand out handles (flow ids, M9, implemented in `flow/`; handoff and hardware-offload handles, milestones M11, M20):
 
 1. A handle that can outlive its object carries a generation; resolving a stale handle fails closed and never reaches a new object that reused the slot.
 2. An asynchronous completion names the handle it was issued for and is checked against the current generation before it takes effect.
 3. A handle is not dereferenced across a structural change (destroy, replace-scope) without re-resolving.
 4. Resolution on the packet path is by cached pointer or index, never by name.
 
-These are contracts for code not yet written; each such milestone must show a test where a stale handle does not resolve to a new object.
+`FlowId`/`FlowHandle` (M9) is the first implementation; its tests show a stale handle failing to resolve after its slot is reused (`StaleHandleCannotReachAFlowThatReusedItsSlot`, worker and shared tables) and an expiry record unable to erase the flow that reused its slot. The other handle-issuing milestones (M11, M20) must show the same test.
 
 ## 8. Battery Admission Criteria
 

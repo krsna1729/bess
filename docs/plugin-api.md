@@ -9,9 +9,11 @@ This document formalizes the supported C++ and build contract for out-of-tree BE
 - The module and packet headers at `bess/core/` are the supported source API.
   External plugins must be rebuilt against their target BESS release; BESS
   does not promise a stable C++ ABI.
-- The selected headers under `bess/core/{classifier,dataplane,meter,rcu,route,stats}`
+- The selected headers under `bess/core/{classifier,dataplane,flow,meter,rcu,route,stats}`
   are experimental C++ APIs. Their interfaces may change without preserving
-  source compatibility.
+  source compatibility. (`flow/` is the flow-state library, see
+  `docs/flow-state.md`; a plugin that uses it links the `bess_flow` symbols
+  `bessd` already exports.)
 - `framework/plugin.h` defines the versioned `bess_plugin_descriptor_v1` C
   metadata ABI. It identifies a plugin; `ADD_MODULE` remains the module
   registration mechanism.

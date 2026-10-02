@@ -17,6 +17,10 @@ classifier_sources = files(
   'classifier/runtime_schema.cc',
 )
 
+flow_sources = files(
+  'flow/owner.cc',
+)
+
 meter_sources = files(
   'meter/meter.cc',
   'meter/meter_set.cc',
@@ -227,6 +231,13 @@ bess_classifier = static_library(
   dependencies: low_level_compile_deps,
   link_with: [bess_dataplane_core, bess_rcu],
 )
+bess_flow = static_library(
+  'bess_flow',
+  flow_sources,
+  include_directories: core_include,
+  dependencies: low_level_compile_deps,
+  link_with: [bess_classifier, bess_dataplane_core, bess_rcu],
+)
 bess_meter = static_library(
   'bess_meter',
   meter_sources,
@@ -330,6 +341,7 @@ bess_resume_hooks = static_library(
 runtime_whole = [
   bess_proto_lib,
   bess_rcu,
+  bess_flow,
   bess_packet,
   bess_dataplane_core,
   bess_classifier,
@@ -349,6 +361,7 @@ runtime_whole = [
 component_runtime_whole = [
   bess_proto_lib,
   bess_rcu,
+  bess_flow,
   bess_dataplane_core,
   bess_classifier,
   bess_meter,
@@ -454,6 +467,15 @@ core_public_subdir_headers = {
     'classifier/classifier.h',
     'classifier/range_backend.h',
   ),
+  'flow': files(
+    'flow/flow_index.h',
+    'flow/flow_key.h',
+    'flow/flow_observer.h',
+    'flow/flow_storage.h',
+    'flow/flow_types.h',
+    'flow/owner.h',
+    'flow/worker_flow_table.h',
+  ),
   'meter': files(
     'meter/meter.h',
     'meter/meter_set.h',
@@ -479,8 +501,11 @@ foreach subdir, headers : core_public_subdir_headers
   install_headers(headers, subdir: 'bess/core/' + subdir)
 endforeach
 
-
 unit_test_sources = [
+  'flow/flow_index_test.cc',
+  'flow/reference_apps_test.cc',
+  'flow/worker_flow_table_test.cc',
+  'flow/shared_flow_table_test.cc',
   'classifier/classifier_test.cc',
   'classifier/classifier_api_test.cc',
   'classifier/backend_test.cc',
@@ -669,7 +694,7 @@ test(
   python,
   args: [files('../tools/check_link_graph.py'), '--build-dir',
          meson.project_build_root()],
-  depends: [bess_rcu, bess_dataplane_core, bess_classifier, bess_meter,
+  depends: [bess_rcu, bess_dataplane_core, bess_classifier, bess_flow, bess_meter,
             bess_stats, bess_route, bess_utils, bess_packet, bess_runtime,
             bess_framework, bess_control, bess_host, bess_drivers,
             bess_modules, bess_gate_hooks, bess_resume_hooks, bess_proto_lib],
@@ -692,6 +717,7 @@ if get_option('build_benchmarks')
     'classifier_masked_bench': ['classifier/masked_bench.cc', benchmark_main_dep],
     'classifier_cuckoo_scale_bench': ['classifier/cuckoo_scale_bench.cc', benchmark_main_dep],
     'classifier_shared_writer_bench': ['classifier/shared_writer_bench.cc', benchmark_main_dep],
+    'flow_bench': ['flow/flow_bench.cc', benchmark_main_dep],
     'classifier_range_backend_bench': ['classifier/range_backend_bench.cc', benchmark_main_dep],
     'utils_memory_backing_bench': ['utils/memory_backing_bench.cc', benchmark_main_dep],
     'object_table_bench': ['dataplane/object_table_bench.cc', benchmark_main_dep],

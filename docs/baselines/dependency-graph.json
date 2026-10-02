@@ -4,6 +4,7 @@
     "bess_control",
     "bess_dataplane_core",
     "bess_drivers",
+    "bess_flow",
     "bess_framework",
     "bess_gate_hooks",
     "bess_host",
@@ -81,11 +82,6 @@
     },
     {
       "from": "bess_framework",
-      "to": "bess_dataplane_core",
-      "status": "allowed"
-    },
-    {
-      "from": "bess_framework",
       "to": "bess_proto",
       "status": "allowed"
     },
@@ -93,11 +89,6 @@
       "from": "bess_framework",
       "to": "bess_rcu",
       "status": "allowed"
-    },
-    {
-      "from": "bess_framework",
-      "to": "bess_route",
-      "status": "exception"
     },
     {
       "from": "bess_framework",
@@ -226,6 +217,11 @@
     },
     {
       "from": "bess_route",
+      "to": "bess_dataplane_core",
+      "status": "allowed"
+    },
+    {
+      "from": "bess_route",
       "to": "bess_rcu",
       "status": "allowed"
     },
@@ -294,13 +290,6 @@
       "reason": "module.cc, module_graph.cc, worker.cc and the init context read the runtime registries; target direction is runtime -> framework",
       "owner": "M1 follow-up: split bess_execution out of bess_framework",
       "remove_by": "Phase B"
-    },
-    {
-      "from": "bess_framework",
-      "to": "bess_route",
-      "reason": "route/router.cc is compiled into bess_framework because Router carries gate_idx_t",
-      "owner": "M7 (logical network identities)",
-      "remove_by": "M7"
     },
     {
       "from": "bess_control",

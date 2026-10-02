@@ -6,6 +6,7 @@
     "bess_packet": ["bess_utils"],
     "bess_dataplane_core": ["bess_rcu", "bess_utils"],
     "bess_classifier": ["bess_dataplane_core", "bess_rcu", "bess_utils"],
+    "bess_flow": ["bess_classifier", "bess_dataplane_core", "bess_rcu", "bess_utils"],
     "bess_meter": ["bess_dataplane_core", "bess_utils"],
     "bess_stats": ["bess_dataplane_core", "bess_utils"],
     "bess_route": ["bess_dataplane_core", "bess_rcu", "bess_packet", "bess_utils"],

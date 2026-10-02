@@ -41,6 +41,7 @@ INTERNAL_FORBIDDEN = [
     "dataplane/transaction_engine_test.cc",
     "classifier/concurrent_exact.h",
     "classifier/concurrent_masked.h",
+    "flow/shared_flow_table.h",
     "route/router_transaction_test.cc",
 ]
 
@@ -90,6 +91,13 @@ PUBLIC_REQUIRED = [
     "classifier/byte_key.h",
     "classifier/classifier.h",
     "classifier/range_backend.h",
+    "flow/flow_index.h",
+    "flow/flow_key.h",
+    "flow/flow_observer.h",
+    "flow/flow_storage.h",
+    "flow/flow_types.h",
+    "flow/owner.h",
+    "flow/worker_flow_table.h",
     "meter/meter.h",
     "meter/meter_set.h",
     "route/next_hop_id.h",
