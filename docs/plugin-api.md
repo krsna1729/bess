@@ -184,8 +184,10 @@ construction or `Init()`:
 
 The context is bound when the `Module` base is constructed, so it is usable in
 a derived constructor's member initializers (for example
-`published_(init_context().rcu())`). Never call it from `ProcessBatch` or
-`RunTask`. Modules in `core/modules` must not include `runtime/`; `tools/check_includes.py`
+`published_(init_context().rcu())`). There is no other way to obtain a
+context: `ModuleInitContext::ProcessDefault()` is private to `Module`'s
+constructor, so a module cannot build or look one up for itself. Never call
+`init_context()` from `ProcessBatch` or `RunTask`. Modules in `core/modules` must not include `runtime/`; `tools/check_includes.py`
 enforces that.
 
 ### Application instances (`init_context().instances()`)
@@ -265,4 +267,4 @@ Cross-module state in a pipeline (e.g. classification result $\to$ meter $\to$ r
    Loads all `.so` modules found in the directory before starting listening for RPCs.
 2. **Runtime CLI command**:
    `bessctl module load /path/to/my_module.so`
-3. **Symbol resolution**: `bessd` is linked with `-rdynamic` (`export_dynamic: true` in Meson). Symbols defined in `libbess_framework`, `libbess_runtime`, and `libdpdk` are exported, allowing loaded modules to resolve runtime methods without duplicating engine code.
+3. **Symbol resolution**: `bessd` is linked with `-rdynamic` (`export_dynamic: true` in Meson). Symbols defined in `libbess_framework`, `libbess_execution`, `libbess_eal`, and `libdpdk` are exported, allowing loaded modules to resolve runtime methods without duplicating engine code.

@@ -161,14 +161,6 @@ std::string ModuleRegistry::GenerateDefaultName(
   promise_unreachable();
 }
 
-void ModuleRegistry::Clear() {
-  for (auto &pair : modules_) {
-    pair.second->Destroy();
-  }
-  modules_.clear();
-  task_names_.clear();
-}
-
 // ---------------------------------------------------------------------------
 // TrafficClassRegistry
 // ---------------------------------------------------------------------------

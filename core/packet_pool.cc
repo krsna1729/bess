@@ -18,6 +18,7 @@
 #include "runtime/memory.h"
 #include "runtime/opts.h"
 #include "utils/copy.h"
+#include "worker.h"
 
 namespace bess {
 namespace {
@@ -69,6 +70,7 @@ static_assert(offsetof(rte_mbuf, vlan_tci_outer) >=
 PacketPool *PacketPool::default_pools_[RTE_MAX_NUMA_NODES];
 
 void PacketPool::CreateDefaultPools(size_t capacity, size_t data_room_size) {
+  current_worker.SetNonWorker();
   InitDpdk(FLAGS_dpdk ? FLAGS_m : 0);
 
   // A debug aid: with normal pages (no hugepages) it is one line per 4 KB
@@ -104,6 +106,7 @@ void PacketPool::CreateDefaultPools(size_t capacity, size_t data_room_size) {
 PacketPool::PacketPool(size_t capacity, int socket_id, size_t data_room_size)
     : data_room_size_(data_room_size) {
   if (!IsDpdkInitialized()) {
+    current_worker.SetNonWorker();
     InitDpdk(0);
   }
 

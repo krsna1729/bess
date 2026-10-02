@@ -4,7 +4,6 @@
 
 #include "task.h"
 
-#include <unordered_set>
 
 #include "gate.h"
 #include "module.h"
@@ -63,16 +62,6 @@ struct task_result Task::operator()(Context *ctx) const {
   deadend(ctx, &dead_batch_);
 
   return result;
-}
-
-// Compute constraints for the pipeline starting at this task.
-placement_constraint Task::GetSocketConstraints() const {
-  if (module_) {
-    std::unordered_set<const Module *> visited;
-    return module_->ComputePlacementConstraints(&visited);
-  } else {
-    return UNCONSTRAINED_SOCKET;
-  }
 }
 
 // Add a worker to the set of workers that call this task.

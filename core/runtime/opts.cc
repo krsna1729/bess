@@ -8,7 +8,6 @@
 #include <cstdint>
 
 #include "runtime/path.h"
-#include "worker.h"
 #include "packet.h"
 
 // Port this BESS instance listens on.

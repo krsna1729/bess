@@ -10,6 +10,7 @@
 // Init(). Packet processing never performs capability lookup, and a module
 // never includes runtime/runtime_state.h.
 
+class Module;
 class Port;
 
 namespace bess {
@@ -85,11 +86,15 @@ class ModuleInitContext {
   // Init(), keep the lease, and cache the pointer; never from the packet path.
   framework::InstanceRegistry &instances() const noexcept { return instances_; }
 
+  // The framework gives every module its context; a module reads it through
+  // Module::init_context() and cannot construct or look one up itself.
+ private:
   // The context for the process's one active runtime. A separate context per
-  // runtime is future work; modules always receive this one today.
+  // runtime is future work; Module's constructor is the only caller, so
+  // ProcessDefault() is not part of the author-facing surface.
+  friend class ::Module;
   static const ModuleInitContext &ProcessDefault();
 
- private:
   dataplane::TransactionEngine &resources_;
   ResourceBindings &resource_bindings_;
   framework::InstanceRegistry &instances_;

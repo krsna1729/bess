@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <sstream>
+#include <unordered_set>
 
 #include "runtime/worker_manager.h"
 #include "gate.h"
@@ -162,6 +163,18 @@ placement_constraint Module::ComputePlacementConstraints(
     }
   }
   return constraint;
+}
+
+// Compute constraints for the pipeline starting at this task. Defined here,
+// not in task.cc, so the scheduler objects need no symbol from Module beyond
+// its virtual interface.
+placement_constraint Task::GetSocketConstraints() const {
+  if (module_) {
+    std::unordered_set<const Module *> visited;
+    return module_->ComputePlacementConstraints(&visited);
+  } else {
+    return UNCONSTRAINED_SOCKET;
+  }
 }
 
 void Module::AddActiveWorker(int wid, const Task *t) {

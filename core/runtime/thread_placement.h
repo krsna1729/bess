@@ -9,6 +9,11 @@
 #include <span>
 #include <string>
 
+// Whether the kernel exposes CPU `core_id` (topology present). Declared for
+// the whole program in worker.h as well; defined here, in the EAL layer, so
+// runtime/opts.cc does not depend on the worker.
+int is_cpu_present(unsigned int core_id);
+
 namespace bess::runtime {
 
 // Keeps the daemon's own threads -- main, gRPC, DPDK's service threads --

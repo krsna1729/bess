@@ -24,6 +24,7 @@
 #include "control/control_plane.h"
 #include "runtime/worker_manager.h"
 #include "bessd.h"
+#include "framework/plugin_loader.h"
 #include "gate.h"
 #include "gate_hooks/tcpdump.h"
 #include "gate_hooks/track.h"
@@ -1060,7 +1061,7 @@ class BESSControlImpl final : public BESSControl::Service {
                      ListPluginsResponse* response) override {
     auto lock = control_plane_.AcquireLock();
 
-    auto list = bess::bessd::ListPlugins();
+    auto list = bess::framework::ListPlugins();
     for (auto& path : list) {
       response->add_paths(path);
     }

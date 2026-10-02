@@ -16,7 +16,7 @@
 
 #include <glog/logging.h>
 
-#include "bessd.h"
+#include "framework/plugin_loader.h"
 #include "gate.h"
 #include "message.h"
 #include "module.h"
@@ -1463,7 +1463,7 @@ ControlResult<void> ControlPlane::ImportPlugin(const std::string& path) {
 
   WorkerPauser wp;
   VLOG(1) << "Loading plugin: " << path;
-  if (!bess::bessd::LoadPlugin(path)) {
+  if (!framework::LoadPlugin(path)) {
     return std::unexpected(
         Err(-1, "Failed loading plugin %s", path.c_str()));
   }
@@ -1476,7 +1476,7 @@ ControlResult<void> ControlPlane::UnloadPlugin(const std::string& path) {
   WorkerPauser wp;
 
   VLOG(1) << "Unloading plugin: " << path;
-  if (!bess::bessd::UnloadPlugin(path)) {
+  if (!framework::UnloadPlugin(path)) {
     return std::unexpected(
         Err(-1, "Failed unloading plugin %s", path.c_str()));
   }

@@ -146,6 +146,24 @@ FORBIDDEN_RULES = [
             ("runtime/", "modules must use Module::init_context(), not runtime"),
         ],
     ),
+    # The EAL layer (bess_eal, D-057): DPDK bring-up, memory, process options,
+    # thread placement, and the two utils files that start the EAL lazily. It is
+    # below the worker, the packet pool and the registries, so none of them may
+    # be included. Tests and benchmarks are exempt.
+    (
+        re.compile(
+            r"^core/runtime/(dpdk|memory|opts|path|startup|thread_placement)\.(cc|h)$"
+            r"|^core/utils/(dpdk_memory|bpf_program)\.(cc|h)$"
+        ),
+        [
+            ("worker.h", "the EAL layer must not depend on the worker"),
+            ("module.h", "the EAL layer must not depend on Module"),
+            ("packet_pool.h", "the EAL layer must not depend on the packet pool"),
+            ("scheduler.h", "the EAL layer must not depend on the scheduler"),
+            ("traffic_class.h", "the EAL layer must not depend on traffic classes"),
+            ("runtime_state.h", "the EAL layer must not depend on the runtime registries"),
+        ],
+    ),
 ]
 
 
@@ -322,6 +340,11 @@ SELF_TEST_CASES = [
     ("core/utils/a.h", '#include <../utils/b.h>', 1),
     # ... and only the resolved path is judged: this names utils/x.h.
     ("core/modules/a.cc", '#include "runtime/../utils/x.h"', 1),
+    # The EAL layer (bess_eal, D-057) sits below the worker and the registries.
+    ("core/runtime/opts.cc", '#include "worker.h"', 1),
+    ("core/runtime/dpdk.cc", '#include "packet_pool.h"', 1),
+    ("core/utils/dpdk_memory.cc", '#include "runtime/runtime_state.h"', 1),
+    ("core/runtime/thread_placement.cc", '#include "scheduler.h"', 1),
 ]
 
 # Includes that must pass: controls proving the rules are not over-broad.
