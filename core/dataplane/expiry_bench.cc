@@ -355,9 +355,8 @@ class RteTimer {
  public:
   static constexpr bool kBudgeted = false;
   static constexpr bool kRealClock = true;
-  explicit RteTimer(size_t n, uint64_t start)
+  explicit RteTimer(size_t n, uint64_t /*start*/)
       : timers_(n),
-        base_(start),
         per_ns_(static_cast<double>(rte_get_tsc_hz()) / 1e9),
         spread_(std::clamp<uint64_t>(n * 9000, 3'000'000, 12'000'000'000ull)) {
     rte_timer_subsystem_init();  // EEXIST on repeat is fine
@@ -403,7 +402,6 @@ class RteTimer {
  private:
   static void Fire(rte_timer*, void*) { count_++; }
   std::vector<rte_timer> timers_;
-  uint64_t base_;
   double per_ns_;
   uint64_t spread_;
   uint64_t last_insert_ = 0;
