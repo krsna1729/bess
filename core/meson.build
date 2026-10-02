@@ -700,6 +700,13 @@ test(
   suite: 'architecture',
 )
 test(
+  'check_layer_includes_self_test',
+  python,
+  args: [files('../tools/check_includes.py'), '--self-test'],
+  is_parallel: false,
+  suite: 'architecture',
+)
+test(
   'check_link_graph_self_test',
   python,
   args: [files('../tools/check_link_graph.py'), '--self-test'],

@@ -120,9 +120,43 @@ proto_ready_marker = custom_target(
   command: [find_program('touch'), '@OUTPUT@'],
   build_by_default: true,
 )
-install_subdir(
-  join_paths(cpp_proto_root, 'core', 'pb'),
-  install_dir: 'include/bess/core',
+# bess-dev installs the generated headers the public C++ headers include,
+# transitively, and nothing else: no *.grpc.pb.h, no .pb.cc, no control or test
+# protocol. tools/public_proto_closure.py computes the set from the include
+# graph and tools/api_classes.json names it; the test below and the installed
+# tree check (tools/check_installed_headers.py) fail if this list drifts.
+public_pb_headers = ['bess_msg', 'error', 'module_msg', 'port_msg', 'util_msg']
+pb_install_copy = find_program('cp')
+foreach stem : public_pb_headers
+  custom_target(
+    'install_pb_' + stem,
+    input: core_cpp_proto_targets,
+    output: stem + '.pb.h',
+    command: [pb_install_copy,
+              join_paths(cpp_proto_root, 'core', 'pb', stem + '.pb.h'),
+              '@OUTPUT@'],
+    build_by_default: true,
+    install: true,
+    install_dir: join_paths(get_option('includedir'), 'bess', 'core', 'pb'),
+  )
+endforeach
+test(
+  'check_public_proto_closure',
+  python,
+  args: [files('../tools/public_proto_closure.py'),
+         '--core-dir', join_paths(meson.project_source_root(), 'core'),
+         '--pb-dir', join_paths(cpp_proto_root, 'core', 'pb'),
+         '--check'],
+  depends: core_cpp_proto_targets,
+  is_parallel: false,
+  suite: 'architecture',
+)
+test(
+  'check_installed_headers_self_test',
+  python,
+  args: [files('../tools/check_installed_headers.py'), '--self-test'],
+  is_parallel: false,
+  suite: 'architecture',
 )
 
 

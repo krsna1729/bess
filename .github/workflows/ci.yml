@@ -139,6 +139,9 @@ jobs:
       - name: Verify install tree, external plugin API and Python client
         run: python3 tools/ci_profile.py verify-install $LANE
 
+      - name: Check the build left the source tree unchanged
+        run: python3 tools/ci_profile.py clean-tree $LANE
+
       - name: Dump daemon logs on failure
         if: failure()
         run: cat /tmp/bessd.*.INFO.* 2>/dev/null || true

@@ -13,7 +13,11 @@ defined here and nowhere else.
     tools/ci_profile.py build --compiler gcc     # one step (they are re-runnable)
 
 Steps, in CI order: bootstrap (DPDK), configure, build, verify-dpdk, layers,
-test, verify-install. `all` runs them in that order.
+test, verify-install, clean-tree. `all` runs them in that order. clean-tree
+fails if the build or the tests left the source tree changed (a modified or
+untracked, non-ignored file): a build writes only to its build directory. Run
+alone it requires a clean tree; under `all` it compares with the tree as `all`
+found it, so uncommitted work of your own is not blamed on the build.
 
 What this cannot reproduce on a developer machine, and `info` says so:
   * the exact compiler versions, when gcc-14 / clang-19 are not installed (the
@@ -27,6 +31,7 @@ Local runs never exceed 8 build jobs (docs: MODERNIZATION.md "Build profiles").
 """
 
 import argparse
+import hashlib
 import os
 import shutil
 import subprocess
@@ -66,6 +71,7 @@ class Setup:
         self.dry_run = args.dry_run
         self.in_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
         self.notes = []
+        self.tree_before = {}  # the tree as `all` found it; empty means "must be clean"
         family = args.compiler
         if args.cc or args.cxx:
             if not (args.cc and args.cxx and args.name):
@@ -214,6 +220,44 @@ def step_verify_install(s):
            '--root', s.stage / 'usr/local/share/bess'], env=env)
 
 
+def tree_state():
+    """{path: content hash} of every modified or untracked non-ignored file."""
+    out = subprocess.run(
+        ['git', 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
+        cwd=ROOT, capture_output=True, check=True).stdout.decode()
+    state = {}
+    fields = out.split('\0')
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if not entry:
+            continue
+        path = entry[3:]
+        if entry[0] in 'RC':
+            i += 1  # the origin path of a rename or copy follows
+        file = ROOT / path
+        state[path] = (hashlib.sha256(file.read_bytes()).hexdigest()
+                       if file.is_file() else 'absent')
+    return state
+
+
+def step_clean_tree(s):
+    if s.dry_run:
+        print('+ git status --porcelain (fails if the build changed the source tree)')
+        return
+    now = tree_state()
+    changed = {path for path in now.keys() | s.tree_before.keys()
+               if now.get(path) != s.tree_before.get(path)}
+    if changed:
+        listing = '\n'.join(f'  {path}' for path in sorted(changed))
+        raise SystemExit(
+            'the source tree differs from how the run found it (alone: from HEAD); '
+            'a build and its tests must write only to the build directory. Fix '
+            'the rule that wrote these, or ignore the generated file:\n' + listing)
+    print('source tree unchanged')
+
+
 STEPS = [
     ('bootstrap', step_bootstrap),
     ('configure', step_configure),
@@ -222,6 +266,7 @@ STEPS = [
     ('layers', step_layers),
     ('test', step_test),
     ('verify-install', step_verify_install),
+    ('clean-tree', step_clean_tree),
 ]
 
 # The release job (publish-release in ci.yml): a static standalone bessd built
@@ -343,6 +388,8 @@ def main():
     if args.step == 'info':
         info(s)
         return 0
+    if args.step == 'all' and not args.dry_run:
+        s.tree_before = tree_state()
     groups = {'all': STEPS, 'release': RELEASE_STEPS}
     for name, function in STEPS + RELEASE_STEPS:
         if args.step == name or name in [n for n, _ in groups.get(args.step, [])]:

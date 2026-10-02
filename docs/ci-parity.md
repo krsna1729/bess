@@ -18,7 +18,12 @@ tools/ci_profile.py build --compiler clang   # one step; steps can be re-run
 ```
 
 Steps, in CI order: `bootstrap` (DPDK), `configure`, `build`, `verify-dpdk`,
-`layers`, `test`, `verify-install`. Build trees go to `build/ci-<lane>`, DPDK to
+`layers`, `test`, `verify-install`, `clean-tree`. `clean-tree` fails if the
+build, the tests or the install left the source tree changed (a modified or
+untracked, non-ignored file): a build writes only to its build directory.
+Under `all` it compares with the tree as `all` found it, so uncommitted work
+of your own is not blamed on the build; run alone it needs a clean tree.
+Build trees go to `build/ci-<lane>`, DPDK to
 `deps/dpdk-*/install-<lane>` (`tools/bootstrap_dpdk.py --variant`), so nothing
 here touches the fast tree or its DPDK.
 

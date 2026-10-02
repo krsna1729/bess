@@ -1,25 +1,46 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
-"""BESS Curated Public Headers Verifier (Milestone M2).
+"""BESS Curated Public Headers Verifier (Milestone M2, D-058).
 
-Verifies the installed 'bess-dev' C++ headers tree:
-1. Ensures internal headers (runtime internals, control-plane RPC, drivers) are NOT installed.
-2. Ensures curated public headers (module.h, framework/plugin.h, dataplane/scope.h, etc.) ARE installed.
-3. Performs a standalone C++ compilation of a plugin against the installed include tree.
-4. Performs a negative compilation test proving that attempts to include internal headers fail.
+Verifies the installed 'bess-dev' C++ headers tree against the classification
+table in tools/api_classes.json (every installed header is `public` or
+`experimental`; internal headers are never installed):
+1. The installed set equals the table: a header installed but not classified,
+   and a classified header that is not installed, both fail. Named internal
+   files (runtime, control, drivers, transaction engine, `*.grpc.pb.h`, the
+   control and test protocols, `.pb.cc`) fail with their own message.
+2. A public header includes only public headers (and the generated ones);
+   every quoted include of an installed header resolves inside the installed
+   tree.
+3. The generated headers installed are exactly the closure the public headers
+   need (tools/public_proto_closure.py).
+4. A plugin that includes every installed header compiles against the installed
+   tree alone, and a plugin that includes an internal header fails to.
 
 Usage:
   tools/check_installed_headers.py --include-dir /path/to/include/bess/core
+  tools/check_installed_headers.py --self-test
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
+import posixpath
 import shlex
 import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import public_proto_closure  # noqa: E402
+
+MANIFEST = Path(__file__).resolve().with_name("api_classes.json")
+CLASSES = ("public", "experimental")
+
+# Files and directories that must never be installed. The exact-set check below
+# already refuses anything unlisted; these give the common mistakes their own
+# message and keep a table edit from listing one of them.
 INTERNAL_FORBIDDEN = [
     "bessctl.h",
     "bessd.h",
@@ -38,83 +59,80 @@ INTERNAL_FORBIDDEN = [
     "utils/bpf_program.h",
     "utils/cuckoo_map.h",
     "dataplane/transaction_engine.h",
-    "dataplane/transaction_engine_test.cc",
     "classifier/concurrent_exact.h",
     "classifier/concurrent_masked.h",
     "flow/shared_flow_table.h",
-    "route/router_transaction_test.cc",
+    # Generated protocol the public headers do not include.
+    "pb/service.pb.h",
+    "pb/control_v2.pb.h",
+    "pb/test_msg.pb.h",
+    "pb/ingress_bench.pb.h",
 ]
 
-PUBLIC_REQUIRED = [
-    "commands.h",
-    "event.h",
-    "gate.h",
-    "message.h",
-    "metadata.h",
-    "module.h",
-    "packet.h",
-    "packet_checksum.h",
-    "packet_cursor.h",
-    "packet_handle.h",
-    "packet_mutation.h",
-    "packet_pool.h",
-    "packet_reshape.h",
-    "packet_tx_checksum.h",
-    "pktbatch.h",
-    "port.h",
-    "snbuf_layout.h",
-    "task.h",
-    "worker.h",
-    "framework/instance_registry.h",
-    "framework/module_init_context.h",
-    "framework/plugin.h",
-    "utils/common.h",
-    "utils/copy.h",
-    "utils/endian.h",
-    "utils/ether.h",
-    "utils/extended_priority_queue.h",
-    "utils/inline_function.h",
-    "utils/random.h",
-    "utils/time.h",
-    "dataplane/action_id.h",
-    "dataplane/batch_stages.h",
-    "dataplane/batch_tuning.h",
-    "dataplane/continuation.h",
-    "dataplane/expiry_wheel.h",
-    "dataplane/generation_handle.h",
-    "dataplane/handoff.h",
-    "dataplane/interface_id.h",
-    "dataplane/object_table.h",
-    "dataplane/resource.h",
-    "dataplane/scope.h",
-    "dataplane/slot_resource.h",
-    "dataplane/slot_table.h",
-    "dataplane/strong_id.h",
-    "dataplane/tick_rate.h",
-    "dataplane/worker_id.h",
-    "classifier/byte_key.h",
-    "classifier/classifier.h",
-    "classifier/range_backend.h",
-    "flow/flow_index.h",
-    "flow/flow_key.h",
-    "flow/flow_observer.h",
-    "flow/flow_storage.h",
-    "flow/flow_types.h",
-    "flow/owner.h",
-    "flow/worker_flow_table.h",
-    "meter/meter.h",
-    "meter/meter_set.h",
-    "route/next_hop_id.h",
-    "route/route_domain.h",
-    "route/route_table.h",
-    "route/router.h",
-    "rcu/rcu_domain.h",
-    "rcu/rcu_ptr.h",
-    "stats/counter_set.h",
-    "stats/worker_histogram.h",
-    "stats/worker_local.h",
-    "stats/worker_slots.h",
-]
+# Never installed whatever the table says: gRPC stubs, generated and test sources.
+FORBIDDEN_SUFFIXES = (".grpc.pb.h", ".grpc.pb.cc", ".pb.cc", "_test.cc", "_bench.cc")
+
+
+def is_internal(name):
+    return name.endswith(FORBIDDEN_SUFFIXES) or any(
+        name == item or name.startswith(item + "/") for item in INTERNAL_FORBIDDEN
+    )
+
+
+def load_manifest(path=MANIFEST):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return data["headers"], list(data["generated"]["headers"])
+
+
+def table_problems(installed, headers, generated):
+    """Differences between the installed file set and the classification table."""
+    problems = []
+    for name, cls in sorted(headers.items()):
+        if cls not in CLASSES:
+            problems.append(f"{name} has class {cls!r}; the classes are {CLASSES}")
+    for name in sorted(set(headers) | set(generated)):
+        if is_internal(name):
+            problems.append(f"api_classes.json lists an internal file: {name}")
+    for name in sorted(installed):
+        if is_internal(name):
+            problems.append(f"internal file was installed: {name}")
+    listed = set(headers) | set(generated)
+    for name in sorted(installed - listed):
+        if not is_internal(name):
+            problems.append(f"installed but not classified in api_classes.json: {name}")
+    for name in sorted(listed - installed):
+        problems.append(f"classified in api_classes.json but not installed: {name}")
+    return problems
+
+
+def resolve(tree, header, inc):
+    """The installed file `inc` names from `header`, as the compiler finds it."""
+    for candidate in (
+        posixpath.normpath(posixpath.join(posixpath.dirname(header), inc)),
+        posixpath.normpath(inc),
+    ):
+        if candidate in tree:
+            return candidate
+    return None
+
+
+def include_problems(tree, headers):
+    """A public header may include only public headers; every include resolves.
+
+    `tree` maps each installed file to the quoted includes it contains.
+    """
+    problems = []
+    for name in sorted(headers):
+        for inc in tree.get(name, []):
+            target = resolve(tree, name, inc)
+            if target is None:
+                problems.append(f'{name} includes "{inc}", which is not installed')
+            elif headers[name] == "public" and headers.get(target) == "experimental":
+                problems.append(
+                    f"public {name} includes experimental {target}: "
+                    "promote it or stop including it"
+                )
+    return problems
 
 
 def verify_headers(include_dir: Path):
@@ -122,18 +140,42 @@ def verify_headers(include_dir: Path):
     if not include_dir.is_dir():
         raise RuntimeError(f"Installed header directory does not exist: {include_dir}")
 
-    for internal in INTERNAL_FORBIDDEN:
-        path = include_dir / internal
-        if path.exists():
-            raise RuntimeError(
-                f"Internal header or subtree '{internal}' was installed: {path}"
-            )
-    print("  OK: private headers and subtrees are absent.")
+    headers, generated = load_manifest()
+    installed = {
+        p.relative_to(include_dir).as_posix()
+        for p in include_dir.rglob("*")
+        if p.is_file()
+    }
+    problems = table_problems(installed, headers, generated)
+    if problems:
+        raise RuntimeError(
+            "installed headers differ from tools/api_classes.json:\n  "
+            + "\n  ".join(problems)
+        )
+    counts = {c: sum(1 for v in headers.values() if v == c) for c in CLASSES}
+    print(
+        f"  OK: the installed set is exactly the table ({counts['public']} public, "
+        f"{counts['experimental']} experimental, {len(generated)} generated); "
+        "no internal file is installed."
+    )
 
-    for public in PUBLIC_REQUIRED:
-        if not (include_dir / public).is_file():
-            raise RuntimeError(f"Required public header is missing: {public}")
-    print(f"  OK: all {len(PUBLIC_REQUIRED)} curated headers are installed.")
+    tree = {
+        name: public_proto_closure.quoted_includes(include_dir / name)
+        for name in installed
+        if name.endswith(".h")
+    }
+    problems = include_problems(tree, headers)
+    if problems:
+        raise RuntimeError("include graph of installed headers:\n  " + "\n  ".join(problems))
+    print("  OK: public headers include only public headers; every include resolves.")
+
+    needed = public_proto_closure.closure(include_dir, headers, include_dir / "pb")
+    if needed != set(generated):
+        raise RuntimeError(
+            f"generated headers listed {sorted(generated)} but the public headers "
+            f"need {sorted(needed)}"
+        )
+    print(f"  OK: the {len(needed)} generated headers are exactly the closure the public headers need.")
 
     pkg_config = os.environ.get("PKG_CONFIG", "pkg-config")
     requirements = subprocess.run(
@@ -174,7 +216,7 @@ def verify_headers(include_dir: Path):
 
     with tempfile.TemporaryDirectory(prefix="bess-header-test-") as tempdir:
         test_cpp = Path(tempdir) / "test_plugin.cc"
-        includes = "\n".join(f'#include "{header}"' for header in PUBLIC_REQUIRED)
+        includes = "\n".join(f'#include "{header}"' for header in sorted(headers))
         test_cpp.write_text(
             includes
             + """
@@ -214,33 +256,87 @@ ADD_MODULE(TestModule, "test_module", "installed-header conformance module")
             )
         print("  OK: plugin and curated API headers compile from installed artifacts.")
 
-        bad_cpp = Path(tempdir) / "bad_plugin.cc"
-        bad_cpp.write_text(
-            '#include "module.h"\n#include "runtime/runtime_state.h"\n'
-        )
-        bad_cmd = list(cmd)
-        bad_cmd[bad_cmd.index(str(test_cpp))] = str(bad_cpp)
-        bad_result = subprocess.run(bad_cmd, capture_output=True, text=True)
-        if (
-            bad_result.returncode == 0
-            or "runtime/runtime_state.h" not in bad_result.stderr
-        ):
-            raise RuntimeError(
-                "Negative test did not fail specifically on the forbidden "
-                f"runtime header:\n{bad_result.stderr}"
-            )
-        print("  OK: intentionally private runtime include is rejected.")
+        # Neither header is installed; the plugin must fail on exactly that one.
+        for bad_header in ("runtime/runtime_state.h", "pb/service.grpc.pb.h"):
+            bad_cpp = Path(tempdir) / "bad_plugin.cc"
+            bad_cpp.write_text(f'#include "module.h"\n#include "{bad_header}"\n')
+            bad_cmd = list(cmd)
+            bad_cmd[bad_cmd.index(str(test_cpp))] = str(bad_cpp)
+            bad_result = subprocess.run(bad_cmd, capture_output=True, text=True)
+            if bad_result.returncode == 0 or bad_header not in bad_result.stderr:
+                raise RuntimeError(
+                    "Negative test did not fail specifically on the forbidden "
+                    f"header {bad_header}:\n{bad_result.stderr}"
+                )
+            print(f"  OK: intentionally private include {bad_header} is rejected.")
+
+
+def run_self_test():
+    """The table check and the include rule catch what they claim to catch."""
+    print("Running check_installed_headers self-test...")
+    headers = {
+        "module.h": "public",
+        "utils/common.h": "public",
+        "flow/flow_key.h": "experimental",
+    }
+    generated = ["pb/error.pb.h"]
+    everything = set(headers) | set(generated)
+
+    def problems(installed, hdrs=headers, gen=generated):
+        return "\n".join(table_problems(installed, hdrs, gen))
+
+    assert problems(everything) == "", problems(everything)
+    for extra, want in [
+        ("flow/flow_table.h", "installed but not classified in api_classes.json: flow/flow_table.h"),
+        ("pb/service.grpc.pb.h", "internal file was installed: pb/service.grpc.pb.h"),
+        ("pb/error.grpc.pb.h", "internal file was installed: pb/error.grpc.pb.h"),
+        ("pb/control_v2.pb.h", "internal file was installed: pb/control_v2.pb.h"),
+        ("pb/error.pb.cc", "internal file was installed: pb/error.pb.cc"),
+        ("runtime/runtime_state.h", "internal file was installed: runtime/runtime_state.h"),
+        ("flow/worker_flow_table_test.cc", "internal file was installed"),
+    ]:
+        assert want in problems(everything | {extra}), (extra, problems(everything | {extra}))
+    for gone in sorted(everything):
+        assert f"classified in api_classes.json but not installed: {gone}" in problems(everything - {gone}), gone
+    assert "has class 'internal'" in problems(everything, {**headers, "module.h": "internal"})
+    assert "lists an internal file: runtime/x.h" in problems(
+        everything | {"runtime/x.h"}, {**headers, "runtime/x.h": "public"}
+    )
+
+    # The include rule: `tree` is installed file -> its quoted includes.
+    base = {"module.h": [], "utils/common.h": [], "flow/flow_key.h": ["utils/common.h"]}
+    assert include_problems(base, headers) == []
+    got = include_problems({**base, "module.h": ["flow/flow_key.h"]}, headers)
+    assert got == ["public module.h includes experimental flow/flow_key.h: promote it or stop including it"], got
+    got = include_problems({**base, "module.h": ["utils/missing.h"]}, headers)
+    assert got == ['module.h includes "utils/missing.h", which is not installed'], got
+    # An experimental header may include public and experimental ones.
+    assert include_problems({**base, "flow/flow_key.h": ["module.h", "flow/flow_key.h"]}, headers) == []
+    # A sibling include resolves relative to the includer; `..` resolves too.
+    sibling = {**base, "flow/owner.h": [], "flow/flow_key.h": ["owner.h", "../module.h"]}
+    assert include_problems(sibling, {**headers, "flow/owner.h": "experimental"}) == []
+    # A public header reaching an experimental one by a sibling spelling is caught.
+    reach = {**base, "utils/common.h": ["../flow/flow_key.h"]}
+    got = include_problems(reach, headers)
+    assert got == ["public utils/common.h includes experimental flow/flow_key.h: promote it or stop including it"], got
+    print("Self-test PASSED: table, internal-file and include rules detect every injected defect.")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--include-dir",
-        required=True,
         type=Path,
         help="Path to installed include/bess/core directory",
     )
+    parser.add_argument("--self-test", action="store_true",
+                        help="check the checker's own rules, no install needed")
     args = parser.parse_args()
+    if args.self_test:
+        run_self_test()
+        return 0
+    if args.include_dir is None:
+        parser.error("--include-dir is required")
 
     try:
         verify_headers(args.include_dir)
