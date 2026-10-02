@@ -388,6 +388,14 @@ if static_binary_opt != 'none'
   # runtime win so libunwind's duplicate definitions are never pulled (D-043).
   bessd_link_args += ['-l:libgcc_eh.a']
 endif
+  # Ubuntu builds its static archives (libunwind.a, libunwind-x86_64.a, ...)
+  # as fat LTO objects with the distribution's GCC. The linker plugin would
+  # read their LTO bytecode and fail whenever the compiler's major version
+  # differs from the archive's ("generated with LTO version 13.1 instead of the
+  # expected 14.0"). BESS is not built with LTO; ignore the sections and link
+  # the machine code the fat objects also carry (D-055).
+  assert(not get_option('b_lto'), 'static builds are linked with -fno-lto; b_lto must be off')
+  bessd_link_args += ['-fno-lto']
 if static_binary_opt == 'fully_static'
   bessd_link_args += ['-static']
 elif static_binary_opt == 'standalone'

@@ -6,6 +6,7 @@
 #   tools/ci_container.sh gcc            # configure, build and verify as CI does
 #   tools/ci_container.sh clang build    # one step
 #   tools/ci_container.sh gcc info
+#   tools/ci_container.sh release        # the publish-release build (gcc-14, full DPDK)
 #
 # Use it when the compilers installed on the host are not the CI versions
 # (tools/ci_profile.py info says which). Build trees go to build/ctr-<lane> and
@@ -13,8 +14,14 @@
 # The container is limited to 8 CPUs and 10 GB of memory.
 set -euo pipefail
 
-lane="${1:?usage: $0 gcc|clang [step]}"
+lane="${1:?usage: $0 gcc|clang|release [step]}"
+compiler="$lane"
 step="${2:-all}"
+if [[ "$lane" == release ]]; then
+  # The publish-release job: a static standalone bessd with gcc-14.
+  compiler=gcc
+  step="${2:-release}"
+fi
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 image=bess-ci:ubuntu-24.04
 
@@ -28,10 +35,18 @@ fi
 "${docker[@]}" build -q -t "$image" -f "$root/env/ci.Dockerfile" "$root" >/dev/null
 
 mkdir -p "$root/.scratch/ctr-home"
-exec "${docker[@]}" run --rm --cpus 8 --memory 10g \
+# CTR_CPUSET (for example 12-19), CTR_MEMORY and CTR_JOBS restrict the container
+# so it does not disturb a benchmark running on the host.
+limits=(--memory "${CTR_MEMORY:-10g}")
+if [[ -n "${CTR_CPUSET:-}" ]]; then
+  limits+=(--cpuset-cpus "$CTR_CPUSET")
+else
+  limits+=(--cpus 8)
+fi
+exec "${docker[@]}" run --rm "${limits[@]}" \
   --user "$(id -u):$(id -g)" \
   -e HOME=/src/.scratch/ctr-home \
   -v "$root:/src" -w /src \
   "$image" \
-  python3 tools/ci_profile.py "$step" --compiler "$lane" --name "ctr-$lane" \
-    --jobs 8 --no-ccache
+  python3 tools/ci_profile.py "$step" --compiler "$compiler" --name "ctr-$lane" \
+    --jobs "${CTR_JOBS:-8}" --no-ccache

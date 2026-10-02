@@ -29,9 +29,10 @@ This contract defines the performance, memory, and concurrency invariants for al
 
 ## 2. Memory and Cache-Line Budgets
 
-1. **Cache-Line Touch Budget**:
-   - **Classifier**: At most **1 cache line** read per packet in steady-state hash table lookups (1 bucket load).
-   - **Routing**: Exactly **1 memory access** for IPv4 routes `/24` or shorter via DIR-24-8 `rte_lpm` `tbl24`.
+1. **Cache-Line Footprint**:
+   - The invariant is *no avoidable memory indirection on the packet path*. The cache-line footprint of each lookup kernel is characterised in that kernel's decision record, and it is a measured or analysed target of that backend, not a global cap: a representation change may legitimately move it, and a number here is not a promise to callers.
+   - **Classifier** (`rte_hash`-backed exact match): a hit reads the signature bucket line and then the key/value slot line (two lines at least, by the layout of `rte_hash`); a miss reads the bucket line alone. Not counted with hardware counters.
+   - **Routing**: the `rte_lpm` `tbl24` probe for an IPv4 route of `/24` or shorter is one table load. Resolving the next hop adds the `NextHop` table load, so a full route resolution reads at least two lines; longer prefixes add a `tbl8` load.
    - **Metering & Accounting**: Per-worker arrays (`WorkerSlots`) guarantee that worker increments touch only cache lines exclusive to that worker's NUMA node, eliminating cross-core cache invalidation storms.
    - **Scope binding**: a packet operation reads a scope's whole policy with one acquire load (`ScopeTable::Lookup`, D-050) and routes every covered lookup through that immutable version; it adds a pointer load per scope, not a version check per table operation. Referential resources keep their lookup cost unchanged (nothing on their read path was touched). The load itself has not been benchmarked.
    - **Flow state** (M9, D-052): a `WorkerFlowTable` lookup reads one 64-byte index bucket (eight 16-bit tags and eight ids) and, only on a tag match, the slot record that holds the key, the generation and the start of the State (56 bytes for a 16-byte key with 32 bytes of State: one or two lines). A miss reads the index bucket alone unless that bucket has overflowed. `SharedFlowTable` adds the rte_hash directory's lines to the slot record's. Measured times, bytes per flow and the sizes that were not run are in D-052.

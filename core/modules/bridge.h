@@ -26,7 +26,10 @@ class Bridge final : public Module {
     bool is_static = false;
   };
 
-  Bridge() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
+  // One worker: the FDB is a std::unordered_map mutated on the packet path, so
+  // two workers would race (and the learn path may allocate). Keep it a
+  // behavioural prototype until M14 supplies a bounded, worker-owned FDB.
+  Bridge() : Module() { max_allowed_workers_ = 1; }
 
   CommandResponse Init(const bess::pb::BridgeArg &arg);
   CommandResponse CommandAdd(const bess::pb::BridgeCommandAddArg &arg);

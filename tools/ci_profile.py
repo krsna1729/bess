@@ -224,6 +224,61 @@ STEPS = [
     ('verify-install', step_verify_install),
 ]
 
+# The release job (publish-release in ci.yml): a static standalone bessd built
+# with the same compiler as the gating gcc lane, the `full` DPDK profile, and
+# no benchmarks or sample plugin. It shares this script's compiler and CPU
+# authority; only the options below are release-specific. Not part of `all`.
+RELEASE_MESON_OPTIONS = [
+    f'-Dcpu={CPU}',
+    '-Dbuildtype=release',
+    '-Dstatic_binary=standalone',
+    '-Daf_xdp=required',
+    '-Dbuild_benchmarks=false',
+    '-Dbuild_sample_plugin=false',
+]
+
+
+def step_release_bootstrap(s):
+    s.run([sys.executable, ROOT / 'tools' / 'bootstrap_dpdk.py',
+           '--af-xdp', 'required', '--cpu', CPU, '--profile', 'full',
+           '--variant', s.variant, '-j', s.jobs])
+
+
+def step_release_configure(s):
+    command = ['meson', 'setup']
+    if (s.build_dir / 'meson-private' / 'coredata.dat').exists():
+        command.append('--reconfigure')
+    command += [s.build_dir, *RELEASE_MESON_OPTIONS]
+    s.run(command, env=s.env_with_dpdk())
+
+
+def step_release_build(s):
+    s.run(['meson', 'compile', '-C', s.build_dir, '-j', s.jobs, 'core/bessd'],
+          env=s.env_with_dpdk())
+
+
+def step_release_verify(s):
+    bessd = s.build_dir / 'core' / 'bessd'
+    if s.dry_run:
+        print(f'+ ldd {bessd} must name no librte_*')
+        return
+    if not bessd.is_file():
+        raise SystemExit(f'{bessd} was not built')
+    linked = subprocess.run(['ldd', bessd], capture_output=True, text=True).stdout
+    dynamic_dpdk = [l for l in linked.splitlines() if 'librte' in l.lower()]
+    if dynamic_dpdk:
+        raise SystemExit('bessd has unexpected dynamic DPDK dependencies:\n'
+                         + '\n'.join(dynamic_dpdk))
+    print('bessd links no dynamic DPDK library')
+
+
+RELEASE_STEPS = [
+    ('release-bootstrap', step_release_bootstrap),
+    ('release-configure', step_release_configure),
+    ('release-build', step_release_build),
+    ('release-verify', step_release_verify),
+]
+
 
 def info(s):
     print(f'lane            {s.name} ({s.family})')
@@ -267,7 +322,8 @@ def check_pins():
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('step', choices=[n for n, _ in STEPS] + ['all', 'info', 'check-pins'])
+    parser.add_argument('step', choices=[n for n, _ in STEPS + RELEASE_STEPS]
+                        + ['all', 'release', 'info', 'check-pins'])
     parser.add_argument('--compiler', choices=sorted(PINS))
     parser.add_argument('--cc')
     parser.add_argument('--cxx')
@@ -287,8 +343,9 @@ def main():
     if args.step == 'info':
         info(s)
         return 0
-    for name, function in STEPS:
-        if args.step in ('all', name):
+    groups = {'all': STEPS, 'release': RELEASE_STEPS}
+    for name, function in STEPS + RELEASE_STEPS:
+        if args.step == name or name in [n for n, _ in groups.get(args.step, [])]:
             print(f'== {name}', flush=True)
             function(s)
     return 0

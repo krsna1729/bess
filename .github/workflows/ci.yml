@@ -148,12 +148,12 @@ jobs:
     needs: [proto-compat, build-and-test]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-24.04
-    # The shipped binaries are built by the compiler the gating gcc lane tests.
-    # Without this the job used the image's default g++ (13.3), which no other
-    # job builds with.
+    # The shipped binaries are built by the compiler the gating gcc lane tests
+    # (without a pin the job used the image's default g++ 13.3, which no other
+    # job builds with), through the same script and compiler authority as the
+    # gating lanes. The release-specific options are in tools/ci_profile.py.
     env:
-      CC: gcc-14
-      CXX: g++-14
+      LANE: --cc gcc-14 --cxx g++-14 --name standalone
     permissions:
       contents: write
     steps:
@@ -171,29 +171,16 @@ jobs:
           key: dpdk-full-gcc14-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'tools/bootstrap_dpdk.py') }}
 
       - name: Bootstrap pinned DPDK
-        run: |
-          tools/bootstrap_dpdk.py --af-xdp required --cpu "$CPU" --profile full
-          echo "PKG_CONFIG_PATH=$(tools/bootstrap_dpdk.py --print-pkg-config-path)" >> "$GITHUB_ENV"
+        run: python3 tools/ci_profile.py release-bootstrap $LANE
 
       - name: Configure Standalone Release Build
-        run: |
-          meson setup build/standalone \
-            -Dcpu="$CPU" \
-            -Dbuildtype=release \
-            -Dstatic_binary=standalone \
-            -Daf_xdp=required \
-            -Dbuild_benchmarks=false \
-            -Dbuild_sample_plugin=false
+        run: python3 tools/ci_profile.py release-configure $LANE
 
       - name: Build Standalone Binaries
-        run: meson compile -C build/standalone -j4 core/bessd
+        run: python3 tools/ci_profile.py release-build $LANE
 
       - name: Verify zero dynamic DPDK dependencies
-        run: |
-          if ldd build/standalone/core/bessd | grep -i librte; then
-            echo "::error::bessd has unexpected dynamic DPDK dependencies"
-            exit 1
-          fi
+        run: python3 tools/ci_profile.py release-verify $LANE
 
       - name: Package Release Tarball
         run: |

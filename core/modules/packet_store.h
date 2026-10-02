@@ -30,7 +30,11 @@ class PacketStore final : public Module {
     bess::PacketRef pkt;
     gate_idx_t gate = 0;
   };
-  PacketStore() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
+  // One worker: the store, the release queue and the packet counters are
+  // unsynchronised std::map / std::deque state mutated on the packet path
+  // (which also allocates). Contain it until it is rebuilt over a bounded
+  // store with explicit packet ownership (M10/M11 substrate).
+  PacketStore() : Module() { max_allowed_workers_ = 1; }
   ~PacketStore() override { DeInit(); }
 
   CommandResponse Init(const bess::pb::PacketStoreArg &arg);
