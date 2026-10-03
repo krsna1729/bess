@@ -22,6 +22,7 @@
     "packet_checksum.h": "public",
     "packet_cursor.h": "public",
     "packet_handle.h": "public",
+    "packet_edit_plan.h": "experimental",
     "packet_mutation.h": "public",
     "packet_pool.h": "public",
     "packet_reshape.h": "public",

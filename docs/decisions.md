@@ -83,6 +83,7 @@ file is the reasoning.
 | D-060 | InterfaceId is 16 bits: a next hop stays 16 bytes | accepted |
 | D-061 | Release builds define NDEBUG; damage-guarding checks are CHECK | accepted |
 | D-062 | Decision cache: a typed flow cache with O(1) generation invalidation (M12) | accepted |
+| D-063 | Bounded packet edit plan: experimental and opt-in, not adopted for typed rewrites (M13) | accepted |
 
 
 ---
@@ -5462,3 +5463,61 @@ shared part is one atomic with acquire/release, covered by the two-worker test).
 
 **Revisit when:** a consumer needs one cache shared by workers (then a `SharedFlowTable` variant), or invalidation
 narrower than a whole policy scope (one generation per group already works; per-rule dependencies would be new).
+
+## D-063 Bounded packet edit plan: experimental and opt-in, not adopted for typed rewrites (M13)
+
+**Status:** accepted (2026-10-03): the M13 decision gate's "keep experimental and opt-in" outcome.
+**Code:** `core/packet_edit_plan.h` (new, header-only, installed experimental), `core/packet_edit_plan_cases.h`
+(test and benchmark support, not installed), `core/packet_edit_plan_test.cc`, `core/packet_edit_plan_bench.cc`,
+`core/meson.build`, `tools/api_classes.json`.
+
+**Context.** Roadmap M13 asks whether a packet-only compiled edit representation helps dynamic policy engines,
+without becoming an action bytecode, judged against hand-written C++ and a typed action on five cases.
+
+**What was built.** `EditPlan`: at most 12 fixed-size steps (8 bytes each) and 160 bytes of literal data. Allowed:
+a prefix replacement (remove n bytes, prepend m, one `data_off` adjustment, in place when it shrinks), fixed writes,
+copies, a 16-bit checksum adjusted by a delta computed at build time, a length field set from the packet length, and
+an outer IPv4 header checksum from a partial sum computed at build time. Nothing else (no meter, route, drop, branch
+or loop). `EditPlanBuilder` merges adjacent and overlapping writes, folds several adjustments of one checksum into
+one step, fuses remove-then-prepend, derives the contiguous range the plan touches, and refuses what it cannot
+represent. `Apply` checks the packet once (range in the first segment, writeable storage, headroom) and changes
+nothing on refusal; `ApplyTrusted` skips those checks for callers whose parse contract proves them (debug builds
+check). No heap allocation and no virtual dispatch per packet.
+
+**Evidence.**
+- Tests (`packet_edit_plan_test`, 7, at one and two CPUs, real mbufs): each case's plan writes the same bytes as the
+  hand-written code and leaves valid IPv4 and TCP checksums (NAT, VXLAN encap and decap, a VFP-like rewrite of both
+  MACs, the destination address and port, a UPF-like outer replacement); `ApplyTrusted` writes the same bytes; write
+  merging; refusals (shared storage, too short, no headroom) change nothing; the builder refuses too many steps, too
+  much data, and an IPv4 checksum over words the plan does not fix, including words a `Copy` writes. Three mutants
+  each fail named tests: an unfolded checksum delta, a flipped prefix sign, write merging without adjacency.
+- Benchmark (`packet_edit_plan_bench`, release `NDEBUG`, isolated on CPU 2, no device interrupts, medians of 5,
+  every implementation's constants built once outside the loop), ns per packet net of the per-iteration restore:
+
+  | case | hand-written | typed action | EditPlan | std::variant | fn-pointer list | ApplyTrusted |
+  |---|---|---|---|---|---|---|
+  | NAT address+port | 2.1 | 1.3 | 9.3 | 8.4 | 8.7 | 7.9 |
+  | VXLAN encap | 5.6 | - | 7.5 | 7.4 | 7.4 | 6.5 |
+  | VXLAN decap | 0.1 | - | 1.2 | 1.8 | 1.6 | 0.3 |
+  | VFP-like rewrite | 5.3 | - | 11.5 | 10.3 | 10.7 | 10.1 |
+  | UPF-like outer | 0.9 | - | 3.0 | 3.0 | 3.2 | 1.6 |
+  | one write | 0.2 | - | 3.7 | 3.6 | 4.0 | 2.4 |
+
+- The plan is 1-7 ns per packet slower than hand-written code in every case; `ApplyTrusted` removes 1-2 ns of it.
+  The three step representations (opcode switch, `std::variant`, pre-bound function pointers, sharing
+  `ApplyPrefix`) are within about 1 ns of each other: dispatch is not the cost. The fourth, generated specialised
+  code, is what the hand-written and typed rows are. Fixed-size fast paths for 1/2/4/8-byte writes changed nothing
+  beyond noise and were dropped. The gap is the interpreter's loop and per-step loads [INFERENCE from the variants;
+  no counters read]. (An earlier run had the hand-written VXLAN encap build its header per packet, which made the
+  plan look faster there; with the header built once it is not.)
+- Expressiveness limits, by design (no branches): a precomputed checksum delta needs the old bytes fixed by the flow
+  match, so a DSCP or TTL rewrite over a per-packet value is not expressible; UDP checksums are not expressible (0
+  must stay 0, a computed 0 must become 0xFFFF).
+
+**Decision.** Keep `EditPlan` experimental and opt-in, for policy compiled at run time (a VFP layer stack, an OVS
+action list) where the edit is not known when the application is built. Existing typed rewrites do not go through
+it, and applications with fixed rewrites should keep writing typed C++ (the NAT binding as a typed action is 7x
+cheaper here).
+
+**Revisit when:** a dynamic consumer needs it and its per-packet budget allows a few nanoseconds; UDP or per-packet
+field edits are needed (a branch-free op for each); or code generation (a JIT, or templates instantiated per plan shape) becomes acceptable.

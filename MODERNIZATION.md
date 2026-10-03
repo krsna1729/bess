@@ -4948,6 +4948,16 @@ rather than one call site).
      within 0.3 ns of the raw flow table at 64K and 1M; scalar +0.3-1.2 ns at 64K. Hit-path instructions documented
      in D-062. Exit criteria: agnostic cache, O(1) invalidation, codegen documented, miss path without modules.
 
+151. **M13 bounded packet edit plan: experimental, opt-in (D-063).** `packet_edit_plan.h`: a plan of at most 12
+     fixed-size steps (prefix replacement, writes, copies, precomputed checksum deltas, length fields, an outer IPv4
+     checksum from a precomputed partial sum), built and merged once, applied without allocation or virtual
+     dispatch. Seven tests on real mbufs (byte-identical to hand-written code on all five roadmap cases, valid
+     checksums, refusals change nothing, a `Copy` under a precomputed header checksum refused); three mutants
+     caught. Isolated benchmark: the opcode, `std::variant` and function-pointer representations are within about
+     1 ns of each other; the plan is 1-7 ns slower than hand-written code in every case. Decision gate: keep it
+     experimental and opt-in; typed rewrites do not go through it. UDP checksums and per-packet old values are not
+     expressible (no branches).
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
