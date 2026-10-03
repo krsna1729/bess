@@ -464,7 +464,7 @@ void _trace_before_call(Module *mod, Module *next, bess::PacketBatch *batch) {
   s->curr_indent += len;
 
   s->depth++;
-  DCHECK_LT(s->depth, MAX_TRACE_DEPTH);
+  CHECK_LT(s->depth, MAX_TRACE_DEPTH);  // indent[] bound (D-061)
 
   s->newlined = 0;
 }

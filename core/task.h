@@ -113,7 +113,7 @@ class Task {
 
   // Do not track used/unsued for efficiency
   bess::PacketBatch *AllocPacketBatch() const {
-    DCHECK_LT(pbatch_idx_, MAX_PBATCH_CNT);
+    CHECK_LT(pbatch_idx_, MAX_PBATCH_CNT);  // past the array is corruption (D-061)
     bess::PacketBatch *batch = &pbatch_[pbatch_idx_++];
     batch->clear();
     return batch;

@@ -7,6 +7,11 @@ project(
     'cpp_std=c++23',
     'warning_level=0',
     'buildtype=release',
+    # Release builds define NDEBUG: no assert()/DCHECK and, since Meson 1.4, no
+    # -D_GLIBCXX_ASSERTIONS (libstdc++ bounds checks), which cost CuckooMap
+    # lookups 8-26%. debug/debugoptimized builds (the gating CI lanes, tests)
+    # keep both; glog CHECK() stays on everywhere (D-061).
+    'b_ndebug=if-release',
   ],
 )
 if meson.project_source_root() == meson.project_build_root()

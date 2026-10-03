@@ -351,7 +351,7 @@ TEST_F(RcuDomainTest, RetirementQueueIsBounded) {
 }
 
 // Teardown invariant: a domain must not disappear while readers are registered.
-TEST_F(RcuDomainTest, DestroyWithRegisteredReaderIsADebugFailure) {
+TEST_F(RcuDomainTest, DestroyWithRegisteredReaderAborts) {
   EXPECT_DEATH(
       {
         auto *domain = new RcuDomain(8);

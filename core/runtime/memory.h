@@ -40,15 +40,15 @@ uintptr_t Virt2PhyGeneric(void *ptr);
 // allocated by AllocHugepage() or DmaMemoryPool::Alloc()
 static inline uintptr_t Virt2Phy(void *ptr) {
   uintptr_t vaddr = reinterpret_cast<uintptr_t>(ptr);
-  DCHECK(kVirtualAddressStart <= vaddr);
-  DCHECK(vaddr < kVirtualAddressEnd);
+  CHECK(kVirtualAddressStart <= vaddr);  // a wrong address reaches DMA (D-061)
+  CHECK(vaddr < kVirtualAddressEnd);
   return vaddr ^ kVirtualAddressStart;
 }
 
 // Only valid for memory blocks allocated by AllocHugepage() or
 // DmaMemoryPool::Alloc()
 static inline void *Phy2Virt(uintptr_t paddr) {
-  DCHECK(paddr < (kVirtualAddressEnd - kVirtualAddressStart));
+  CHECK(paddr < (kVirtualAddressEnd - kVirtualAddressStart));
   return reinterpret_cast<void *>(paddr + kVirtualAddressStart);
 }
 

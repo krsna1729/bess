@@ -41,7 +41,7 @@ RcuDomain::RcuDomain(uint32_t max_readers, size_t retire_high_water)
 
 RcuDomain::~RcuDomain() {
   // A domain must never disappear while registered readers can still run.
-  DCHECK_EQ(0u, registered_readers())
+  CHECK_EQ(0u, registered_readers())  // readers would use a freed domain (D-061)
       << "RcuDomain destroyed with " << registered_readers()
       << " reader(s) still registered";
 
