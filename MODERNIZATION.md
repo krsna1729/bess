@@ -4731,6 +4731,7 @@ rather than one call site).
      - **Found, not fixed (pre-existing):** 25 TUs (`main.cc`, `worker.cc`, `port.cc`, `packet_pool.cc`,
        `drivers/pmd.cc`, ...) log through absl, not glog, because protobuf's absl logging is included
        after glog there; `bessd` never initialises absl logging, so those lines miss glog's files and `--v`.
+       *(Fixed in entry 142, D-059.)*
      - **Open:** the e035e892 CI run's Clang lanes stalled 4 h in the build and were cancelled (GCC lanes
        passed; a local Clang 22 build of the same lane takes 403 s). Re-run CI and diagnose if it recurs.
        *(Recurred on a13f4da1; root-caused and fixed in entry 141.)*
@@ -4792,6 +4793,21 @@ rather than one call site).
      - **Evidence (plugin change):** the tree that failed 3/3 passed 3/3; with both changes, a fresh `build/fast`
        (configured from nothing, ccache warm) builds, passes 112/112 and `sample_plugin_load` 3/3; both plugin compile
        edges list `core_proto_ready.h` as an order-only input. Reviewed: Opus 5.5 high.
+
+142. **One logging backend: glog through `utils/logging.h` (D-059).**
+     - **What:** in 25 translation units (`main.cc`, `worker.cc`, `port.cc`, `packet_pool.cc`, `drivers/pmd.cc`, ...)
+       protobuf's absl logging was included after glog, so `LOG`/`CHECK`/`VLOG` went to absl, which `bessd` never
+       initialises: those lines missed glog's log files and `--v`. `core/utils/logging.h` includes absl's `log.h`
+       first (guarded by `__has_include`: Ubuntu 24.04's Abseil has no `absl/log`, and no collision) and glog
+       second; all 71 direct glog includes now use it, and `check_includes.py` refuses a direct
+       `<glog/logging.h>` anywhere else under `core/`, tests included.
+     - **Evidence:** absl logging expanded in BESS code (use-site check over every TU): 20 TUs before, 0 after;
+       the `LOG` in effect at the end of each TU: absl in 26 before, 1 after (`message.cc`, which does not log);
+       an Ubuntu 24.04 container compiles the header and gets glog's `LOG`. Fast suite 112/112; include self-test 40 cases;
+       staged install passes.
+     - **Cost:** about 0.4-0.6 s more compile time for each TU that did not already reach absl through protobuf (about
+       200 TUs); the cold-build effect was not measured.
+     - **Found by:** the independent reviewer (Opus 5.5) during the D-058 addendum review.
 
 ## Review process established this session
 

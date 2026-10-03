@@ -79,6 +79,7 @@ file is the reasoning.
 | D-056 | SharedFlowTable: fallible creation and generation-gated publication (M9 follow-up) | accepted |
 | D-057 | Execution layering: EAL extracted, framework no longer reaches runtime (M1) | accepted |
 | D-058 | M1/M2 closure: enforceable include rules, classified installs | accepted |
+| D-059 | One logging backend: glog included only through utils/logging.h, after absl | accepted |
 
 
 ---
@@ -5131,6 +5132,8 @@ refuses any `..` component in quoted and angle includes, everywhere under `core/
   in the base tree too, among them `main.cc`, `worker.cc`, `port.cc`, `packet_pool.cc` and `drivers/pmd.cc`.
   `bessd` initialises only glog (`google::InitGoogleLogging`), so those messages bypass glog's log files and
   `--v`. Not fixed here; tracked as an open item (MODERNIZATION.md entry 139).
+  *(Annotation: fixed by D-059; the `l2_forward.h` include-order workaround above was then removed, since the
+  order no longer matters.)*
 - The `<../utils/b.h>` self-test case (a leading `..` in angle form), dropped in the rewrite, is restored;
   turning the ban off fails the self-test.
 
@@ -5141,3 +5144,62 @@ versions) not run locally. `..` includes outside `core/` are not scanned (the ch
 **Revisit when.** The include root or installed header layout changes (e.g. the `<bess/...>` spelling,
 still a non-goal): re-run the deps comparison, since quoted root-relative includes rely on no sibling
 file shadowing the target.
+
+## D-059 One logging backend: glog included only through utils/logging.h, after absl
+
+**Status:** accepted (2026-10-03).
+**Code:** `core/utils/logging.h` (new, installed, public), 71 files under `core/` (every former `<glog/logging.h>`),
+`tools/check_includes.py` (rule and self-test cases), `docs/plugin-api.md`, `core/modules/l2_forward.h` (the D-058 include-order workaround removed), `core/meson.build` and `tools/api_classes.json` (install
+manifest and classification).
+
+**Context.** Found by the reviewer during the D-058 addendum review. glog and protobuf's absl logging
+(`absl/log/log.h`, included by protobuf's own headers) both define `LOG`, `LOG_IF`, `VLOG` and their variants, each
+unconditionally; glog's `CHECK` expands through `LOG_IF`. Whichever of the two headers is included second wins, and
+later includes are no-ops behind include guards. In 25 translation units of the base tree absl came second, so their
+`LOG`/`CHECK`/`VLOG` went to absl, among them `main.cc`, `worker.cc`, `port.cc`, `packet_pool.cc`, `drivers/pmd.cc`,
+`drivers/pcap.cc`, `bessd.cc`, `bessctl.cc` and several modules (a 26th, `message.cc`, includes only absl and does not
+log). `bessd` initialises only glog (`google::InitGoogleLogging`), so those messages bypassed glog's log files and
+`--v`: for example `main.cc`'s startup `LOG(INFO)`/`LOG(WARNING)` lines and `worker.cc`'s `VLOG`s.
+
+**Decision.** `core/utils/logging.h` includes `<absl/log/log.h>` (when it exists) and then `<glog/logging.h>`; every BESS file includes
+glog only through it, and `check_includes.py` refuses `glog/logging.h` anywhere else under `core/` (tests included).
+glog is then always the second of the two in every translation unit, whatever order other headers come in: if protobuf
+came earlier, absl is already defined and glog still follows it; if protobuf comes later, its absl include is a no-op.
+The absl include is guarded with `__has_include`: `absl/log` first shipped in Abseil LTS 20230125 (protobuf 22+).
+Ubuntu 24.04, where the gating CI lanes and the release job build, has Abseil 20220623 and protobuf 3.21: no
+`absl/log/log.h`, protobuf cannot include it, and there is no collision there. Routing absl's sink into glog instead was not chosen: it would keep two macro families with different flags (`--v`
+versus absl's own verbosity) in one binary.
+
+**Evidence.**
+- Use-site check (the reviewer's, Opus 5.5): every non-generated TU preprocessed, line markers followed, absl
+  `log_internal` expansions that land in BESS files counted. Base: 20 TUs expand absl logging in BESS code, including
+  through the headers `packet.h` (17 TUs), `rcu_ptr.h` (6), `simd.h` (3) and `exact_rule_resource.h` (2). Branch: 0.
+  This is the sound check; the end-of-TU check below misses expansions that happen before glog is first included.
+- Ubuntu 24.04 (`ubuntu:24.04` container, `g++-14`, distro `libgoogle-glog-dev`, `libabsl-dev` 20220623.1,
+  `libprotobuf-dev` 3.21.12): no `absl/log` directory; a TU including `utils/logging.h` and protobuf compiles and its
+  `LOG` is glog's (`COMPACT_GOOGLE_LOG_`). Without the guard it would not compile (the reviewer's P0 finding).
+- Which `LOG` is in effect at the end of every translation unit (`g++ -E -dM` over `compile_commands.json`, protobuf
+  generated sources excluded): base tree `LOG` is absl in 26 TUs, glog in 267, undefined in 54; branch: absl in 1,
+  glog in 292, undefined in 54. The one is `core/message.cc`, which never includes glog and uses neither `LOG` nor
+  `CHECK`.
+- Objects that still reference `absl::log_internal::LogMessage` (46 in the base fast tree, 33 on the branch,
+  generated protobuf objects excluded) do so from protobuf's own inline code (for example
+  `RepeatedField<long>::Get`, `KeyMapBase::Resize`, `PackFrom` inlined into `CommandSuccess`), which uses
+  `ABSL_DCHECK`/`ABSL_CHECK` and is active in this non-NDEBUG build; that is protobuf's logging, not ours.
+- `check_includes.py --self-test`: 40 bad includes (44 violations), 10 clean controls; with the rule disabled the
+  self-test fails. Scan: 0 violations.
+- Fast suite 112/112 (merged tree, with D-058's `l2_forward.h` workaround removed); link graph 19 libraries, 51 edges, 0 grandfathered; staged install: all header checks pass
+  (`utils/logging.h` installed and classified public; 13 installed headers include it).
+- Compile-time cost (no ccache, 5 runs each): a TU that did not reach absl before pays for parsing it once:
+  `rcu/rcu_domain.cc` 3.8 s -> 4.4 s, `dataplane/transaction_engine.cc` 7.8 s -> 8.2 s. About 200 TUs did not reach
+  absl before; the effect on a cold `-j8` build was not measured.
+
+**Not done.** The cold-build time effect is estimated, not measured. The 13 edited benchmark TUs are not built by the
+fast profile; they were syntax-checked with GCC 16 and Clang 22 using the release tree's command lines: 26 checks, no
+diagnostics in BESS files.
+The full BESS build was not run on Ubuntu 24.04 locally; CI is that run. Out-of-tree plugins are not checked by `check_includes.py`;
+a plugin that includes `<glog/logging.h>` itself before any BESS header would still put glog first.
+`docs/plugin-api.md` now tells plugin authors to include `utils/logging.h`. GCC 14 / Clang 19 run in CI.
+
+**Revisit when:** BESS stops depending on glog or protobuf stops using absl logging (then the wrapper can go); a
+release build (NDEBUG) needs the absl references from protobuf inline code counted again.
