@@ -4736,6 +4736,35 @@ rather than one call site).
      - **Not done:** the M0 paired baseline, the M6 Router check, M10 10M and `rte_timer` 1M points,
        the SharedFlowTable 10M row, the M11 streaming slowdown.
 
+140. **SharedFlowTable: fallible creation and generation-gated publication (D-056).**
+     - **What:** an outside review of M9 found two defects in `SharedFlowTable`, both confirmed against the code:
+       (1) directory inserts were `CHECK`ed on the claim "the directory is sized for every key"; sizing proves the
+       aggregate, not that a given key fits an `rte_hash` bucket pair, so keys crowding one pair aborted the daemon
+       with the table nearly empty; (2) `EmplaceAliased` published the live generation, then the alias, then the
+       primary, and no key-taking reader path checked the slot generation, so a lock-free reader could find the alias
+       without the primary. Now a key the directory cannot place is `kPlacementFailed` (additive enum values), a
+       refusal that builds no State, fires `OnFull`, and takes back what it inserted; a create inserts every key,
+       builds the State, then release-stores the live generation; every reader path validates the directory handle
+       against the slot generation; erase moves the generation first. The readers' fields and the writer's counters
+       and lock now sit on separate cache lines. A zero-cost test hook in `Erase` makes the erase window testable.
+     - **Found while fixing:** the review's sketch had an ABA (a reader's directory value for an abandoned attempt
+       could match the next flow in the slot), so an abandoned create advances the generation like an erase.
+     - **Measured, isolated but contaminated (`omarchy-benchmark`, performance governor, vs `627fa286`):** writer ops/s +16%,
+       create/erase p50 -16% to -22%; readers under writer churn -3% to -16% (paired and per-side medians, 1 and
+       4 readers); one-thread hot hit +5% (about 1 ns), uniform batches up to +6-16%. Provisional: the wrapper
+       reported device-interrupt contamination on the benchmark CPUs. Without the cache-line change the readers
+       lost 15-19% (busy machine); with it, this is the price of the two guarantees.
+     - **Process:** reviewed by an independent reviewer (three findings: layout regression, missing deterministic
+       erase-window test, undocumented cost; all fixed); the original author agent was stopped and the parent finished
+       the work.
+     - **Not done:** churn rows at 1M flows and other key/State sizes; `ConcurrentExactTable`'s own false sharing; TSan
+       on the final header (it ran before the layout change and hook, neither of which changes ordering); the 10M-flow
+       shared row; GCC 14 / Clang 19 locally (CI).
+     - **Evidence:** 25 shared-table tests (was 14), including crafted-collision refusals, rollback, the create and
+       erase windows, a crowded-directory differential test and a bounded concurrent visibility test; erase-order and
+       validation mutants fail deterministically on one CPU; tests 3/3 pinned to one and two CPUs; full suite 109/109
+       in the worktree; the hook compiles to identical production code.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

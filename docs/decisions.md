@@ -76,6 +76,7 @@ file is the reasoning.
 | D-053 | Expiry substrate: a worker-owned hierarchical timing wheel with budgeted polls (M10) | accepted |
 | D-054 | Handoff substrate: burst channels over `rte_ring_elem` with moved-from ownership, and generation-checked continuations (M11) | accepted, with the exceptions under "Not done" |
 | D-055 | One CI authority for gating and release lanes; static release links with -fno-lto | accepted |
+| D-056 | SharedFlowTable: fallible creation and generation-gated publication (M9 follow-up) | accepted |
 | D-057 | Execution layering: EAL extracted, framework no longer reaches runtime (M1) | accepted |
 | D-058 | M1/M2 closure: enforceable include rules, classified installs | accepted |
 
@@ -4721,6 +4722,263 @@ LTO-version error as built by the old flags, and succeeds and runs with `-fno-us
 fails first), or a distribution ships static archives that are slim LTO only (then the link needs an
 unwinder built without LTO).
 
+
+
+## D-056 SharedFlowTable: fallible creation and generation-gated publication (M9 follow-up)
+
+**Status:** accepted (2026-10-02), with the exceptions under "Not done".
+**Code:** `core/flow/{shared_flow_table.h,flow_types.h,flow_observer.h}` (comment only for the observer),
+tests `core/flow/shared_flow_table_test.cc` (24 -> 25 with the erase-window test), benchmark `core/flow/flow_bench.cc` (`BM_SharedLookup`),
+`docs/{flow-state,performance-contract,benchmarking}.md`.
+
+**Correction to D-052.** D-052 said of the shared table that "`EmplaceAliased` is all-or-nothing" and the code said
+"the shared directory is sized for every key" in two `CHECK`s. Both were wrong, and an outside review found it.
+(1) Sizing the directory (`ConcurrentExactTable::CapacityFor`) proves that the *aggregate* number of keys fits,
+not that a *given* key can be placed: `rte_hash` is a cuckoo table of eight-entry buckets, a key may live in two
+buckets only, and keys that share that pair fill it at 16 entries however empty the table is (the same fact that
+moved `ExactRuleResource` placement into `Reserve`, D-021; D-010's sizing guarantees slots and headroom, not
+placement). Flow keys come from packets, so a crafted or merely unlucky key reached a `CHECK` and aborted the daemon.
+(2) `EmplaceAliased` published the slot's live generation, then the alias key, then the primary key, and no reader
+path compared the directory's handle with the slot's generation, so a lock-free reader could find the alias and miss
+the primary. "Both keys or neither" held for writers, and not for readers. D-052's `WorkerFlowTable` is not affected
+by (1) (its `FlowIndex` probes every bucket circularly and holds at least as many positions as keys, so its two
+`CHECK`s state a true invariant) and is single-threaded, which is all (2) can mean there. D-052's test count for the
+shared table (14) is now 25 (the placement and publication tests below are what its claim lacked).
+
+**Context.** `SharedFlowTable::CreateLocked` constructed the State, popped the slot, wrote the keys, stored the live
+generation, inserted the alias and then the primary into the directory, and `CHECK`ed both inserts; `AddAlias`
+did the same for one key. `Peek`/`Find`/`FindHandle`/`FindBatch` took the directory's `FlowHandle` and indexed the slot
+without looking at its generation; only the handle-taking calls (`Lookup(handle)`, `Peek(handle)`, `Alive`, ...)
+validated.
+
+**Decision.**
+
+- **A key the directory cannot place is an ordinary refusal.** `EmplaceStatus::kPlacementFailed` (value 4, appended)
+  and `AliasStatus::kPlacementFailed` (value 4, appended); the existing values are unchanged. It is separate from
+  `kFull` so that a caller can tell "the table is full, evict or expire" from "this key's bucket pair is full; slots are
+  free" (an operator counting refusals wants both numbers), and it is additive, so a caller that treats every non-created
+  status as a drop is unchanged. A refused `Emplace`/`EmplaceAliased` builds no State (the constructor does not run and
+  its arguments are not consumed), fires no `OnCreate`, and tells the observer `OnFull()`: the observer contract is "no
+  room for the flow", a second hook would break every existing `FlowObserver`, and an expiry engine that reacts to
+  `OnFull` by evicting is exactly right here too (the status says which room ran out). `AddAlias` has no observer
+  event for any refusal, and still has none. The only `CHECK` left on the insert path is the table's own invariant: the
+  directory returned "exists" for a key that the caller had just found absent under the writer lock.
+- **Directory first, State second, one publication.** A create inserts every key of the flow into the directory
+  while the slot still holds its free (even) generation, then builds the State, then writes the keys, owner stamp and
+  size, then release-stores the live generation. If a directory insert fails, the keys already inserted are erased
+  and the create is refused before anything is built; if the State constructor throws, the keys are erased, the slot
+  is abandoned as below, and the exception propagates (the table is as it was). The brief's sketch constructs the State
+  first and destroys it on failure; this order costs a refused create nothing, never runs user code whose arguments
+  would then be consumed (`Emplace(key, std::move(x))` followed by a refusal would have destroyed `x`'s contents), and
+  makes "State destroyed on rollback" unnecessary, so the leak mutant below is the construct-and-forget one.
+- **Every reader path validates the directory's handle against the slot generation** (`Resolve(key)` for `Peek`, `Find`,
+  `FindOwned`, `FindHandle` and the writer paths, `FindBatchImpl` for the batches), with one acquire load and an
+  equality-and-odd test, before it forms a State pointer; a hit that fails is a miss and the batch's hit mask drops it.
+  A flow is therefore visible at one instant for all its keys; a reader that found one key and later looks for the
+  other finds it with the same handle, or the flow has been erased in between; and a directory value that went stale
+  never resolves. The acquire load is also what makes the State and the keys visible to the reader (before this, that
+  edge was inside `rte_hash`, which ThreadSanitizer cannot see).
+- **Erase now mirrors it:** the generation moves on first, then the keys leave the directory (before, the other way
+  round). With validation in the readers the old order would have left a window in which an alias is found and the
+  primary is not, the same defect on the way out. Reclamation is unchanged (the grace period starts after both).
+- **An abandoned create moves its slot's generation on, and the slot to the back of the free list.** The review's
+  sketch (leave the slot's generation alone until publication) has an ABA: a reader that read the directory's value
+  for the attempt's handle (`slot s, generation g+1`) and is delayed past a refusal and a later successful create in
+  the same slot, which also gets `g+1`, would validate against the wrong flow and answer a lookup of key K with
+  another flow's State. So a refused or throwing create does what an erase does: generation `g` becomes `g+2`, so
+  `g+1` is never issued twice. Under `kFifo` the slot goes to the back of the free list, so a stream of refusals wears
+  every slot's generation evenly (a stack has only one end, and `kLifo` documents that a hot slot sees the most
+  generations); at the wrap the slot is quarantined like an erased one. Cost to the attacker of wearing out a slot
+  this way is the same as the cost of the churn that already does it (two generations per event).
+- **`AddAlias` inserts into the directory before it touches the slot**, so a refusal leaves the key mask and the
+  keys as they were; the flow is live, so the alias resolves the moment it is in.
+- **The writer's fields leave the readers' cache line.** `directory_`, `slots_` and `capacity_`, read by every
+  lookup, are followed by `alignas(64) size_` and then the lock, counters, observer and hook, written by every
+  create and erase. Measured below; it removes the reader regression the validation would otherwise have shown.
+- **A test seam in `Erase`, free in production.** `Traits::Hook::AfterEraseGenerationStore()` runs between the
+  generation store and the first key leaving the directory; the default `NoSharedFlowTableHook` is empty, and the
+  production instantiation compiles to the same instructions as one without the call (below). A test uses it to
+  check, deterministically on any number of CPUs, that every key of an erased flow already resolves to nothing.
+
+**Evidence.** Everything below was run; GCC 16.2.1 unless stated.
+
+*Tests* (fast tree, `-O1`; `flow_shared_flow_table_test` 25/25, was 14; reference apps 4, worker table 21, expiry
+consumer 15 pass; `flow_index_test` 10 passed only in the TSan tree):
+
+- `AKeyTheDirectoryCannotPlaceIsRefusedAndChangesNothing`: keys crafted to share one `rte_hash` bucket pair (the
+  technique of `KeysThatCannotBePlacedRejectCleanly`: `ConcurrentExactTable::DpdkHash`, primary = hash & mask,
+  alternate = (primary ^ hash>>16) & mask) fill a 64-flow table's pair at `fit` (<= 16) while 48+ slots are free;
+  the next create returns `kPlacementFailed` (twice: same answer), size and `directory().size()` unchanged,
+  `OnCreate` count unchanged, `OnFull` counted, a counting State `built` equals the flows that exist (a refusal builds
+  nothing) and `built == destroyed` at teardown; erasing one crowd flow lets the refused key in and refuses the next;
+  the table then fills to exactly its capacity with other keys (no slot lost to the refusals), `kFull` after, every
+  slot id present once, the refused slot's flow has generation 3 and an untouched slot 1.
+- `ARefusedCreateMovesTheStackSlotToANewGeneration` (kLifo: the next flow in that slot has generation 3, id as
+  attempted); `AnAliasedCreateThatCannotBePlacedTakesBackWhatItInserted` (primary refused after the alias was
+  inserted: `directory().size()` is still 2 per flow, the orphan alias key is free for a flow of its own; alias
+  refused first: nothing inserted; both succeed once the pair has room); `AnAliasThatCannotBePlacedLeavesTheFlowAsItWas`
+  (`kPlacementFailed`, no `OnFull`, key mask intact: the flow still takes its alias, then `kNoRoom`; erasing the flow
+  takes exactly its keys); `NoKeyOfAFlowResolvesBeforeAllOfThemDo` (from inside the State constructor, where both keys
+  are in the directory and the flow is not published, `Peek`, `Find`, `FindHandle`, `PeekBatch`, `FindBatch` all miss;
+  after the create all hit with one handle); `AThrowingConstructorTakesTheKeysBack` and
+  `AHandleOfAnAbandonedCreateNeverNamesALaterFlow` (the directory value read in the window cannot resolve to the
+  next flow in the same slot, kLifo); `ARefusedCreateRetiresASlotWhoseGenerationWouldWrap`;
+  `AliasedFlowAppearsAndVanishesAsOneToConcurrentReaders` (3 readers, 30,000 writer operations over four key pairs
+  that are reused by flows of different generations, loops bounded by counts, threads joined on every path by an RAII
+  joiner: a reader that finds one key of a flow and misses the other while the flow is still alive is a failure); and
+  `CrowdedDirectoryMatchesAModelOfItsBucketCapacity`, a differential test (3 seeds x 20,000 operations) in which every
+  key shares one bucket pair, so the model predicts every status (`kFull`, `kPlacementFailed`, `kAliasExists`, aliased
+  creates that insert one key and lose the other, `AddAlias` refusals) from the pair's measured capacity, and compares
+  state, handle, `via_alias`, `OnCreate`/`OnFull` counts and `directory().size()` after every step; the existing model
+  test now also checks `directory().size()`.
+- `EveryKeyOfAnErasedFlowResolvesToNothingBeforeAnyLeavesTheDirectory` (the erase window, through the test hook):
+  both keys still in the directory, and `Peek`, `Find`, `FindHandle`, `Peek(handle)`, `Lookup`, `Alive`,
+  `PeekBatch`, `FindBatch` all miss; erase through the alias and through the handle. The probe is cleared on every
+  exit (a failed `ASSERT` cannot leave a dangling callback for later tests).
+- Pinned, final header: the concurrency, window and create-window tests 3/3 at `taskset -c 0` and 3/3 at `-c 0,1`
+  (the new concurrent test needed a `yield` per reader round: before it, 13 s on one CPU).
+- Full fast suite in this worktree (based on `627fa286`): 109/109.
+
+*Mutants* (header altered, test binary rebuilt, each of the 24 tests run alone; the header restored): 15 mutants,
+each fails at least one named test. Publication live before the inserts (`M1b`): 5 tests; live between the alias and
+primary inserts (`M1`): 4; reader validation off in `Resolve` (`M2a`): the window test and the concurrent test; off in
+the batch (`M2b`): the window test and `ConcurrentLookupWithCreateAndErase`; alias rollback omitted: 2; key mask set
+before the insert in `AddAlias`: 2; constructor-throw rollback omitted: 2; abandon without a generation bump: 5; abandoned
+slot lost: 5; no `OnFull`: 3; State built and leaked on refusal (the brief's "State not destroyed on rollback", in this
+order only a construct-and-forget mutant exists): 6; no wrap quarantine: 1; erase with the directory first (`M7`): the
+concurrent test only (before the erase-window test; see below); the old `CHECK` (`M9`): 6. The ordering mutants and `M2a` against the concurrent test alone, 5 runs
+per CPU set: caught 0/5 at `-c 0` (one CPU: the window is nanoseconds, the deterministic window test is what catches
+them there), 5/5 at `-c 0,1` and 5/5 at `-c 0-3`. **Rerun on the final header, pinned to one CPU** (the parent,
+`taskset -c 0`): erase with the directory first (`M7`) fails the erase-window test; `Resolve` without validation
+(`M2a`) and the batch without validation (`M2b`) each fail the erase-window and create-window tests; the unmutated
+header passes. So the erase-side ordering is now caught deterministically, not only by a two-CPU race.
+
+*The hook is free* (parent): `flow_bench.cc` compiled with the release flags against the final header and against a
+copy with the hook call deleted (include precedence checked with `-H`): identical code; the only differences are two
+`__FILE__` path strings. A control hook that calls an external function changes 73 lines and emits the call.
+
+*Builds and checks*: Clang 22 and GCC 16 `-fsyntax-only -Wall -Wextra -Werror` clean on the four test translation
+units and `flow_bench.cc`; GCC 16 `-O3 -march=x86-64-v3 -Wall -Wextra -Werror` builds `flow_bench` (release tree);
+`check_includes.py` 22-case self-test and tree scan pass; `check_link_graph.py` on the fully built tree: 18 libraries, 47 edges, 6 grandfathered, no violation.
+
+*ThreadSanitizer* (scratch tree, deleted afterwards): the fast profile's flags plus `-fsanitize=thread -g1
+-DRTE_USE_C11_MEM_MODEL -DRTE_FORCE_INTRINSICS -Wno-tsan`, `-j8`, `taskset -c 2,4,6,8`, no `prlimit --as`. Two things
+TSan cannot see had to be handled, as in D-054: x86 `rte_spinlock` is inline assembly (the first run, without
+`RTE_FORCE_INTRINSICS`, reported races on the free list that the lock orders), and `rte_hash`'s own acquire/release
+and its key store live in an uninstrumented library (suppressed: `race:...CmpFixed`, the inline key compare that reads
+what the library's `memcpy` wrote). Result: worker table 21, reference apps 4 (four workers on one shared table),
+expiry consumer 15 and flow index 10 pass with zero reports. The shared-table binary (then 24 tests) passed with **2 reports**,
+both in the existing `ConcurrentLookupWithCreateAndErase` (reader's plain read of `Big::value`/`echo` against the
+constructor of the next flow in the slot), intermittent (a variant without the control thread: 0, 0 and 3 reports in
+three runs). The same test at HEAD reports 3 (the other direction: constructor write against reader read, `rte_hash`'s
+publication edge being invisible to TSan; the generation acquire now supplies that edge, so that direction is gone).
+My reading, not proven: `rte_rcu_qsbr_check` returns early on a relaxed load of `acked_token`, which `rte_hash`'s own
+uninstrumented reclaim advances, so the acquire loads that order the reader before the reuse happen where TSan does
+not look; every reuse is in fact ordered by the table's lock chain and QSBR. A probe of `RcuDomain` alone (a reader's
+plain read, `Quiescent`; the writer waits `IsComplete`, then writes; 3,000 swaps) reports nothing, so TSan does see
+QSBR when `rte_hash` is not involved. What TSan did verify: publication through the generation (no forward report),
+the free list, ring and counters under the lock, and the whole of the reference apps' shared table. What it did not:
+`rte_hash` internals and every ordering that passes through them.
+
+*Cost of the validation* (release tree, GCC 16 `-O3 -march=x86-64-v3`, governor `powersave`, a loaded desktop
+(`ab_bench.py` refused to start: Chrome, a terminal and a multiplexer at 25-55% CPU, so `--allow-busy`), single-thread
+rows pinned to P-core CPU 2, multi-thread rows `taskset -c 0,2,4,6,8,10` with `FLOW_BENCH_MAIN_CPU=0`, ABBA,
+8 runs per side for `ab_bench.py`, 6 per side for the counter rows (`.scratch/ab_counters.py`, a throwaway: `ab_bench.py`
+compares `real_time`, which for the multi-thread rows is a 5 ms sleep). A is HEAD's header, B this change's, the same
+`flow_bench.cc` compiled against each. The new row `BM_SharedLookup` is one thread, `Peek`/`PeekBatch`, 16-byte key,
+32-byte State. Paired B/A median (ns per lookup or per batch of 32): hot hit scalar +5.7% (16.3 -> 17.3 ns) at 64K and
+1M; hot hit batch +4.6% and +3.6% (253 -> 261 ns per 32); uniform hit batch +7.2% at 64K (noisy, 0.76..1.12) and +9.1% at
+1M (0.97..1.45); uniform scalar +3.3% and no clear difference; all-miss rows no difference (they never reach the
+validation). So the validation costs one dependent load and compare per hit: about 1 ns scalar, 0.2-0.3 ns per key in
+a batch on a cache-resident table, up to the 3-9% above when memory-bound (the code is a plain `mov` of the
+generation, a compare and a branch per hit; checked in the disassembly of the release benchmark). Readers only,
+`BM_SharedReaders` shared directory, Mlookups/s B/A: 64K 1 reader 0.94, 64K 4 readers 0.97, 1M 1 reader 0.91, 1M 4 readers
+0.92 (the partitioned-table control rows, which the change cannot touch: 0.98-1.00, paired medians 0.98-1.03). With a
+writer churning (`BM_SharedReaderWriter`): readers' Mlookups/s B/A 0.81-0.85 at 1 reader and 4 readers, writer ops/s
+0.81-0.92, create p50 +11% to +47%, erase p50 +12% to +19% (TSC ticks), p99 +7% to +19%. **That writer-row cost is not
+the validation**: a variant with the old erase order and one with the State constructed first (`eraseold`, `ctorfirst`),
+each measured against B on these rows, did not change it (paired medians 0.92-1.07, inside those rows' spread, 0.79 to
+1.24), and a slot prefetch pass in the batch (`prefetch`, measured on the uniform batch rows of `BM_SharedLookup`) made no
+clear difference either.
+It comes from the table's own layout: `directory_`, `slots_` and `capacity_`, which every lookup
+reads, share one 64-byte line with `size_`, `pending_published_` and `lock_`, which every create and erase writes, so each
+writer operation invalidates the readers' line and the readers' extra loads (the validation reads `capacity_` and
+`slots_` per hit) make the writer wait for it. A variant that moves the writer's counters, lock and observer to a line of
+their own (`alignas(64)` on `size_`; nothing else changed) against B, ABBA 6 per side, 65,536 flows: writer ops/s x1.32
+(1 reader) and x1.59 (4 readers), readers' Mlookups/s x1.22 and x1.32, create p50 -35% and -54%, erase p50 -31% and
+-38%, B faster in 6/6 pairs; against A (HEAD's header, unmodified layout): writer ops/s x1.17 and x1.29, readers' Mlookups/s
+x1.10 and x1.11, create p50 -23% and -40%, erase p50 -21% and -24%, 5/6 to 6/6 pairs. So the layout, not the guarantee,
+is what the writer rows measured, and fixing it would more than pay for the validation.
+
+*The same layout A/B rerun in an isolated window* (`omarchy-benchmark --isolate --cpu 0,2,4,6,8,10 --diagnose` around the
+unchanged `run_ab6.sh`: cgroup v2 partition on CPUs 0,2,4,6,8,10, SMT siblings 1,3,5,7,9,11 offline, performance governor,
+turbo preserved, housekeeping on the E-cores 12-19, state restored by the wrapper; ABBA 6 per side, the same
+binaries and rows, 65,536 flows; the wrapper reported contamination (vmd0 interrupts on CPUs 2 and 4, iwlwifi on all five benchmark CPUs, 11-12K
+thermal-event interrupts per CPU) during the
+run; the children ran under `taskset` only, without `timeout`/`prlimit`, because the wrapper had started before that
+requirement reached me, bounded by the runner's own 1,500 s subprocess timeout). Layout variant against B (this change):
+writer ops/s x1.23 (1 reader) and x1.53 (4 readers), readers' Mlookups/s x1.22 and x1.22, create p50 -23% and -48%, erase
+p50 -27% and -30%, 6/6 pairs each. Against A (HEAD's header): writer ops/s x1.20 and x1.53, readers' Mlookups/s x1.04
+(4/6 pairs) and x1.00 (1/6; no difference), create p50 -26% and -52%, erase p50 -25% and -34%, 6/6 pairs for the writer
+and latency rows. So in the isolated window the layout variant is as fast as HEAD for readers and 20-53% faster for the
+writer, while this change without it is, by those two ratios, about 18-20% below HEAD for readers with a writer churning
+(inferred from the two A/B pairs, not measured directly in the isolated window; the noisy-window measurement of B against A
+gave 15-19%). The noisy-window numbers above (powersave, loaded desktop) and these agree in sign and size for the layout;
+the absolute rates are higher isolated (readers 84 vs 57 Mlookups/s at one reader, `after` binary).
+
+Decision on the cost: the guarantee stays. One load and a compare per hit buys a flow that is visible at one instant, a
+stale directory value that cannot resolve, and State and keys made visible by an edge TSan and a weakly ordered CPU can
+both see; the alternative, documenting a weaker contract, would leave a reader able to find an alias without its flow's
+primary key. **The layout change is applied** (reviewer finding: without it the fix cost readers 15-19% under churn, measured on the busy machine).
+
+*Final, isolated* (parent; `omarchy-benchmark --isolate --cpu 0,2,4,6,8,10 --diagnose`, performance governor, SMT
+siblings offline, housekeeping on the E-cores, state verified restored; A = `627fa286`'s header, B = the final header,
+the same `flow_bench.cc` built against each in one release tree; counter rows ABBA 8 runs per side, `BM_SharedLookup`
+16 runs per side through `tools/ab_bench.py`; children under `timeout` and `prlimit --data=8G`; the diagnostics showed
+the wrapper reported contamination: device interrupts on the benchmark CPUs (i2c_designware 98,096 on CPU6, i915
+35,589 on CPU8, ASUE1213 9,989 on CPU4, iwlwifi 9,064 on CPU6; IRQ work 22,213, function calls 14,215, rescheduling
+8,899), 131,518 context switches; **so these numbers are provisional**, as D-053's were): with a writer churning on
+65,536 flows, writer ops/s x1.16 (1 reader, 8/8 pairs) and x1.16 (4 readers, 8/8); create p50 -22% and -16% (0/8
+slower); erase p50 -17% and -16%; readers' Mlookups/s at 1 reader: paired median 0.93 (wide, 0.66..1.14, B lower in
+6/8), per-side median ratio 0.84; at 4 readers: paired median 0.97 (B lower in 7/8), per-side 0.94. One thread
+(`BM_SharedLookup`, rows hot / uniform / miss): hot hit +5% (16.7 -> 17.6 ns scalar, 246 -> 259 ns per 32, at 64K
+and 1M, 16/16 runs); uniform: 64K scalar -6.3% (B faster in 12/16), 64K batch 32 +15.7% (0.74..1.83), 1M batch 32
++6.3% (2/16 B faster), 1M scalar no clear difference; miss rows no clear difference. **Net cost of the guarantee
+as shipped: about 1 ns per hot scalar hit (5%), up to 6-16% on uniform batches, and 3-16% of reader throughput
+under writer churn depending on the statistic; writers gain 16% and create/erase latency falls 16-22%.**
+
+**Not done.**
+
+- **The churn rows ran at 65,536 flows only**, one writer, 1 and 4 readers; 1M flows under churn, other key and
+  State sizes, and the E-cores were not run. The directory's own object (`ConcurrentExactTable`: `table_` and
+  `hash_batch_` read by lookups, `size_` and `writer_lock_` written by every insert and erase, in one line) was not
+  changed or measured and may carry the same false sharing.
+- **ThreadSanitizer ran before the layout change and the hook**; neither changes any ordering (member placement and an
+  empty inline call), but the TSan run was not repeated on the final header.
+- **10M flows** were not run for the shared table (about 1.8 GB of EAL heap at 10M per D-052); tracked as an open item.
+- **TSan's two reports** in `ConcurrentLookupWithCreateAndErase` are unexplained by TSan itself (see above); the
+  explanation is an inference from DPDK's source and a probe. GCC 14 and Clang 19 are left to CI (GCC 16 and Clang 22
+  locally).
+- **Placement refusals are not free for an attacker to spam**: a refused aliased create inserts and takes back an
+  entry, which waits out a grace period in the directory (headroom: 5%, at least 256 slots); a stalled reader
+  turns a stream of refusals into more refusals, never a fault. Not measured. Also not measured: the time an attacker
+  needs to wear out slot generations through refusals (two generations per refusal, FIFO spreads them; the same wear as
+  churn).
+- **The directory's hash seed is fixed** (CRC32C seed 0), so a crafted crowd is reproducible by anyone who knows the key
+  layout; D-056 makes it harmless (a refusal), not impossible. A per-table seed is a `ConcurrentExactTable` change.
+- `WorkerFlowTable`'s two `CHECK`s on index insertion were examined and are true invariants (the index probes every
+  bucket and holds at least as many positions as keys); no change.
+- Review section 12 (`FlowIndex`'s deterministic mixer against hash flooding) was not touched; the flood tests stay
+  green and the seeded mixer is listed under "Revisit when".
+
+**Revisit when:** the next change touching `ConcurrentExactTable` (separate its readers' `table_`/`hash_batch_` from
+`size_`/`writer_lock_` the same way and measure); the 3-16% reader cost under churn matters to a consumer; a deployment lets an attacker choose flow keys and the refusal counters show it (then `FlowIndex`'s
+deterministic mixer, which the same review raised as not a correctness bug, gets a per-table random seed: a seeded
+multiply keeps the assembly shape, and `kPlacementFailed` crowding could be defeated for the shared directory the same
+way, by seeding the directory's hash, which `ConcurrentExactTable` does not currently allow; M22 hardening is the
+natural home); the directory's refusal rate matters (then a second hash function or `RTE_HASH_EXTRA_FLAGS_EXT_TABLE`
+buys placement at the price of a chained bucket on the lookup path); a consumer needs the State constructed before
+the directory insert (the order in the review's sketch); or `ConcurrentExactTable` is promoted to public.
 
 ## D-057 Execution layering: EAL extracted, framework no longer reaches runtime (M1)
 
