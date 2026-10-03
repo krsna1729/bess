@@ -53,6 +53,8 @@
     "dataplane/tick_rate.h": "experimental",
     "dataplane/worker_id.h": "experimental",
     "flow/decision_cache.h": "experimental",
+    "conntrack/conntrack.h": "experimental",
+    "conntrack/packet_parse.h": "experimental",
     "flow/flow_index.h": "experimental",
     "l2/fdb.h": "experimental",
     "l2/mac_table.h": "experimental",

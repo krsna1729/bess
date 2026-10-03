@@ -4988,6 +4988,15 @@ rather than one call site).
      Maglev 0.42-0.45 (128 KiB a group; 0.40-0.43 with a ~101 entries-per-member table), rendezvous 1.8-113 ns
      for 2-128 members; churn on removing one member: range 11-25%, Maglev 0.1-2.6%, rendezvous 0%. Weighted
      selection is not consistent (6-27%). 8 of 9 mutants caught (+1 after strengthening a test).
+155. **M17 connection tracking (D-067).** `conntrack/packet_parse.h`: a checked parser (VLAN tags, IPv4 options,
+     IPv6 extension headers, fragments, first fragments parsed through) into a 50-byte descriptor.
+     `conntrack/conntrack.h`: a canonical bidirectional key with zones, Linux's TCP state table (no window
+     tracking; pickup off by default; a SYN after TIME_WAIT/CLOSE reopens), UDP and ICMP echo state, ICMP errors
+     as related, timeouts as policy, `UserData` for consumers; over `WorkerFlowTable` and `ExpiryWheel`. Isolated
+     (wrapper verdict "contamination": thermal and timer interrupts, no device IRQs): parse 1.7-4.2 ns; track
+     13-15 ns at 1K connections, 21-30 at 64K, 95-149 at 1M; a handshake-and-close 18-21 ns a packet; expiry 31 ns
+     a connection. Building the key with word stores took a packet from 36 to 20 ns (an unisolated pair). 26
+     mutants caught (5 after strengthening tests). Reviewed: four findings fixed.
 
 ## Review process established this session
 
