@@ -50,6 +50,7 @@
     "dataplane/strong_id.h": "experimental",
     "dataplane/tick_rate.h": "experimental",
     "dataplane/worker_id.h": "experimental",
+    "flow/decision_cache.h": "experimental",
     "flow/flow_index.h": "experimental",
     "flow/flow_key.h": "experimental",
     "flow/flow_observer.h": "experimental",
