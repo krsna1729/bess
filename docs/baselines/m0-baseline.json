@@ -1,0 +1,3044 @@
+{
+ "schema": "bess-m0-baseline/1",
+ "source_proof": {
+  "A": {
+   "tree": "/home/krsna1729/Projects/bess/.scratch/wt/base",
+   "commit": "f4fdab03c10f9f0b39147a59230d2a678e6050a8"
+  },
+  "B": {
+   "tree": "/home/krsna1729/Projects/bess/.scratch/wt/m0head",
+   "commit": "e035e8924b7abae24e99884b6889ab2ec557d94d"
+  },
+  "identical_sources": {
+   "packet_bench": {
+    "path": "core/packet_bench.cc",
+    "blob": "a5b2384ac3ccccc0d5468e622dbc4ce0157f883f"
+   },
+   "packet_checksum_bench": {
+    "path": "core/packet_checksum_bench.cc",
+    "blob": "575f046c426c69fcd6fbff0ed696de9a67ffadaf"
+   },
+   "packet_tx_checksum_bench": {
+    "path": "core/packet_tx_checksum_bench.cc",
+    "blob": "89f8429ce86b097b3f0bf592e00074bb701cf323"
+   },
+   "utils_checksum_bench": {
+    "path": "core/utils/checksum_bench.cc",
+    "blob": "557a0042e3810e8a94503d4b8efe1089ad9260b5"
+   },
+   "classifier_bench": {
+    "path": "core/classifier/classifier_bench.cc",
+    "blob": "36da26b6939dce57cec82919f5f99143be5d6630"
+   },
+   "classifier_typed_bench": {
+    "path": "core/classifier/typed_exact_bench.cc",
+    "blob": "e62a8dda0169ced481fb682e5a7a4b560b240171"
+   },
+   "classifier_masked_bench": {
+    "path": "core/classifier/masked_bench.cc",
+    "blob": "70cc485ec7efa367e7030dbe39032f1c5618519a"
+   },
+   "classifier_range_backend_bench": {
+    "path": "core/classifier/range_backend_bench.cc",
+    "blob": "0ebd9e9d8a6ccfd7c0ce2e7d70090b8572c12cd3"
+   },
+   "modules_exact_match_bench": {
+    "path": "core/modules/exact_match_bench.cc",
+    "blob": "c4f52b3a0464edddab739a40f75d5120ab1fcbe0"
+   },
+   "modules_wildcard_match_bench": {
+    "path": "core/modules/wildcard_match_bench.cc",
+    "blob": "846223d55455ef44fb184634f849932383af6418"
+   },
+   "meter_bench": {
+    "path": "core/meter/meter_bench.cc",
+    "blob": "bdf651bbbb5217dcfbc57184202c74404e466d7f"
+   },
+   "stats_bench": {
+    "path": "core/stats/stats_bench.cc",
+    "blob": "c4a89cf3d95bb9cef59e91a0939c87c895b627d2"
+   },
+   "fib_bench": {
+    "path": "core/fib_bench.cc",
+    "blob": "88e7177bd25b513d910a0ee6d17431ad709c438b"
+   },
+   "rcu_bench": {
+    "path": "core/rcu/rcu_bench.cc",
+    "blob": "7eae474c4322756a1adb5b02a4a18889decd9375"
+   },
+   "object_table_bench": {
+    "path": "core/dataplane/object_table_bench.cc",
+    "blob": "14c2ee38b9c981d5968137a770678a7b79c7dba7"
+   },
+   "transaction_bench": {
+    "path": "core/dataplane/transaction_bench.cc",
+    "blob": "8757bff5c3830911a4874b73c10cf9424d2bc2e4"
+   },
+   "ring_bench": {
+    "path": "core/ring_bench.cc",
+    "blob": "a6ebddf601ff498d3f0c0908b2e85473060fc64c"
+   },
+   "modules_exact_match_transaction_bench": {
+    "path": "core/modules/exact_match_transaction_bench.cc",
+    "blob": "b8c74e4fa5426ca7794ad609821ac1ea7e9ce4cf"
+   }
+  },
+  "adapted_sources": {
+   "route_bench": {
+    "path": "core/route/route_bench.cc",
+    "blob_A": "5883ae95da5f2d256a7305f611c3782815987d33",
+    "blob_B": "3052fe6dd815d263c8f524d5e013a3f9a1e6936a"
+   }
+  },
+  "not_compared": {
+   "core/route/route_domain_bench.cc": "rewritten after f4fdab03 (M6); workload differs",
+   "core/rcu/grace_period_bench.cc": "custom non-Google-Benchmark harness needing 5 isolated CPUs and ~75 s per run; rcu_bench BM_GracePeriodLatency covers grace-period latency"
+  },
+  "supplemental": {
+   "source": "tools/m0_slot_table_bench.cc",
+   "sha256": "d2d698897bcbe3e0a841a238131770a0d5e8822e2e77d33bc9079a92556b2529",
+   "header_blobs": {
+    "core/dataplane/slot_table.h": "68a728a1de282f90740b40a4fd42106fe8eba2e6",
+    "core/dataplane/strong_id.h": "2f2949796527401df75a032147932183b1a9cc4d"
+   }
+  },
+  "compile_flags": [
+   "-fdiagnostics-color=always",
+   "-D_GLIBCXX_ASSERTIONS=1",
+   "-D_FILE_OFFSET_BITS=64",
+   "-std=c++23",
+   "-O3",
+   "-march=x86-64-v3",
+   "-D_GNU_SOURCE",
+   "-DGLOG_USE_GLOG_EXPORT",
+   "-include",
+   "cinttypes",
+   "-Wall",
+   "-Wextra",
+   "-Werror",
+   "-Wcast-align",
+   "-Wno-error=cast-align",
+   "-Wno-pedantic",
+   "-Wno-error=deprecated-declarations",
+   "-Wno-error=array-bounds",
+   "-Wno-error=address-of-packed-member",
+   "-Wno-error=unused-result",
+   "-Wno-error=unused-variable",
+   "-Wno-error=unused-but-set-variable",
+   "-Wno-unused-parameter",
+   "-Wno-missing-field-initializers",
+   "-DBESS_GRPC_REFLECTION",
+   "-pthread",
+   "-DPROTOBUF_USE_DLLS",
+   "-DNOMINMAX",
+   "-include",
+   "rte_config.h"
+  ]
+ },
+ "groups": {
+  "packet": {
+   "metadata": {
+    "captured_utc": "2026-10-03T06:04:12Z",
+    "host_kernel": "7.2.5-3-omarchy",
+    "compiler": "g++ (GCC) 16.2.1 20260810",
+    "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900H",
+    "online_cpus": "0-2,4-19",
+    "benchmark_cpus": "2",
+    "cpu_state": {
+     "2": {
+      "governor": "performance",
+      "epp": "performance",
+      "max_khz": "5200000"
+     }
+    },
+    "no_turbo": "0",
+    "isolation": {
+     "cgroup": "/sys/fs/cgroup/omarchy-benchmark-3249613",
+     "partition": "isolated",
+     "cpus": "2"
+    },
+    "dpdk_pkg_config": "/home/krsna1729/Projects/bess/deps/dpdk-25.11.3/install/lib/pkgconfig",
+    "dpdk_version": "25.11.3",
+    "meson_options": "buildtype=release (-O3), cpu=x86-64-v3",
+    "rounds": 6,
+    "min_time": "0.05s",
+    "group": "packet",
+    "cpu_isolated": true,
+    "allow_busy": false,
+    "provisional": false,
+    "seconds": 45.0
+   },
+   "cases": [
+    {
+     "target": "packet_bench",
+     "filter": "^BM_PacketAllocFree$|^BM_PacketCursorPositionedRead/width:4/offset:(14|34)/batch:1$|^BM_PacketCursorSequentialRead/batch:8$|^BM_PacketCheckedPrepend/bytes:14/shape:0/batch:1$|^BM_PacketCheckedAppend/bytes:8/shape:0/batch:1$|^BM_PacketCheckedRemovePrefix/bytes:14/shape:0/batch:1$|^BM_PayloadWriteability/storage:0$|^BM_EnsureWritableUniqueMultisegment/bytes:256$|^BM_EnsureWritableSharedCow/bytes:256$|^BM_EnsureLinearNativeTwoSegment$|^BM_EnsureContiguousCrossesTwoSegments$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 7105632,
+       "text": 5327587,
+       "data": 157408,
+       "bss": 33632
+      },
+      "B": {
+       "file_bytes": 7094064,
+       "text": 5260525,
+       "data": 163424,
+       "bss": 11976
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_PacketAllocFree",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 6.560611588209735,
+       "B_median": 6.826590737847528,
+       "paired_ratio_median": 1.0160004113696224,
+       "paired_ratio_min": 0.9536891052950838,
+       "paired_ratio_max": 1.0724761606247264,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 152690856.34425598,
+         "B": 146803705.91982275
+        }
+       }
+      },
+      {
+       "name": "BM_PacketCursorPositionedRead/width:4/offset:14/batch:1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 6.76017807429994,
+       "B_median": 6.764464837176275,
+       "paired_ratio_median": 1.0006326156915404,
+       "paired_ratio_min": 0.9510515192671132,
+       "paired_ratio_max": 1.0230196963694147,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes_copied/read": {
+         "A": 4.0,
+         "B": 4.0
+        },
+        "bytes_per_second": {
+         "A": 592599325.7213374,
+         "B": 592302154.6621242
+        },
+        "cursor_copies/read": {
+         "A": 1.0,
+         "B": 1.0
+        },
+        "items_per_second": {
+         "A": 148149831.43033436,
+         "B": 148075538.66553104
+        },
+        "segment_transitions/read": {
+         "A": 0.0,
+         "B": 0.0
+        }
+       }
+      },
+      {
+       "name": "BM_PacketCursorPositionedRead/width:4/offset:34/batch:1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 6.78339451493904,
+       "B_median": 6.767862704475825,
+       "paired_ratio_median": 0.9978215886149491,
+       "paired_ratio_min": 0.9547486467225198,
+       "paired_ratio_max": 1.0188308556837817,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes_copied/read": {
+         "A": 4.0,
+         "B": 4.0
+        },
+        "bytes_per_second": {
+         "A": 590903777.1100891,
+         "B": 591757946.6298561
+        },
+        "cursor_copies/read": {
+         "A": 1.0,
+         "B": 1.0
+        },
+        "items_per_second": {
+         "A": 147725944.27752227,
+         "B": 147939486.65746403
+        },
+        "segment_transitions/read": {
+         "A": 0.0,
+         "B": 0.0
+        }
+       }
+      },
+      {
+       "name": "BM_PacketCursorSequentialRead/batch:8",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 121.12738754839803,
+       "B_median": 120.81403046444626,
+       "paired_ratio_median": 0.9962481125038481,
+       "paired_ratio_min": 0.9740544787285357,
+       "paired_ratio_max": 1.0035006408297629,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes_copied/read": {
+         "A": 15.0,
+         "B": 15.0
+        },
+        "bytes_per_second": {
+         "A": 992060299.4998577,
+         "B": 994871440.939048
+        },
+        "fields/read": {
+         "A": 4.0,
+         "B": 4.0
+        },
+        "items_per_second": {
+         "A": 264549413.19996202,
+         "B": 265299050.91707948
+        },
+        "segment_transitions/read": {
+         "A": 0.0,
+         "B": 0.0
+        }
+       }
+      },
+      {
+       "name": "BM_PacketCheckedPrepend/bytes:14/shape:0/batch:1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 136.71408170297653,
+       "B_median": 137.2784678133992,
+       "paired_ratio_median": 1.0017237314894758,
+       "paired_ratio_min": 0.9874452848196144,
+       "paired_ratio_max": 1.0187907568234174,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes/mutation": {
+         "A": 14.0,
+         "B": 14.0
+        },
+        "items_per_second": {
+         "A": 7264725.181702744,
+         "B": 7233150.560656443
+        },
+        "segments/mutation": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      },
+      {
+       "name": "BM_PacketCheckedAppend/bytes:8/shape:0/batch:1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 138.2906325729339,
+       "B_median": 137.75612492563005,
+       "paired_ratio_median": 0.9961347035336335,
+       "paired_ratio_min": 0.9928622678379315,
+       "paired_ratio_max": 1.0186301739598969,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes/mutation": {
+         "A": 8.0,
+         "B": 8.0
+        },
+        "items_per_second": {
+         "A": 7189934.434533242,
+         "B": 7230180.559123395
+        },
+        "segments/mutation": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      },
+      {
+       "name": "BM_PacketCheckedRemovePrefix/bytes:14/shape:0/batch:1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 136.68892581121438,
+       "B_median": 136.1135812133664,
+       "paired_ratio_median": 1.005575583404831,
+       "paired_ratio_min": 0.9923287439446611,
+       "paired_ratio_max": 1.0634526998045593,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes/mutation": {
+         "A": 14.0,
+         "B": 14.0
+        },
+        "items_per_second": {
+         "A": 7287214.830990745,
+         "B": 7320316.877590327
+        },
+        "segments/mutation": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      },
+      {
+       "name": "BM_PayloadWriteability/storage:0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 0.552701269521531,
+       "B_median": 0.5559241517777127,
+       "paired_ratio_median": 1.0065967566565108,
+       "paired_ratio_min": 0.9931930649120306,
+       "paired_ratio_max": 1.0385557278554747,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 1811657807.6533518,
+         "B": 1801558340.8762271
+        },
+        "writable": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      },
+      {
+       "name": "BM_EnsureWritableUniqueMultisegment/bytes:256",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 6.613474919995026,
+       "B_median": 6.6547167544486365,
+       "paired_ratio_median": 1.0084078409958956,
+       "paired_ratio_min": 0.9959992004335992,
+       "paired_ratio_max": 1.1109154170998454,
+       "pairs_B_better": 1,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "allocation/op": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "bytes_copied/op": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "head_replaced/op": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "items_per_second": {
+         "A": 151414949.01881033,
+         "B": 150511314.53033644
+        },
+        "segments/op": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      },
+      {
+       "name": "BM_EnsureWritableSharedCow/bytes:256",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 162.5077254121754,
+       "B_median": 164.467795471646,
+       "paired_ratio_median": 1.00801754236927,
+       "paired_ratio_min": 1.003213338646548,
+       "paired_ratio_max": 1.0238029299640232,
+       "pairs_B_better": 0,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "allocation/op": {
+         "A": 1.0,
+         "B": 1.0
+        },
+        "bytes_copied/op": {
+         "A": 256.0,
+         "B": 256.0
+        },
+        "head_replaced/op": {
+         "A": 1.0,
+         "B": 1.0
+        },
+        "items_per_second": {
+         "A": 6131033.451200625,
+         "B": 6091698.117345488
+        },
+        "segments/op": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      },
+      {
+       "name": "BM_EnsureLinearNativeTwoSegment",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 151.34954279822176,
+       "B_median": 148.7078984946993,
+       "paired_ratio_median": 1.0020408700086554,
+       "paired_ratio_min": 0.924581821605753,
+       "paired_ratio_max": 1.0106458510691336,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "allocations": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "bytes_copied": {
+         "A": 64.0,
+         "B": 64.0
+        },
+        "head_replacements": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "items_per_second": {
+         "A": 6570636.975554336,
+         "B": 6681179.317139473
+        },
+        "segments_freed": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      },
+      {
+       "name": "BM_EnsureContiguousCrossesTwoSegments",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 155.6104995066128,
+       "B_median": 156.97275206416697,
+       "paired_ratio_median": 1.002768764126776,
+       "paired_ratio_min": 0.9841866837273218,
+       "paired_ratio_max": 1.010764120839468,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "allocations": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "bytes_copied": {
+         "A": 64.0,
+         "B": 64.0
+        },
+        "head_replacements": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "items_per_second": {
+         "A": 6402963.99898072,
+         "B": 6362817.9529544
+        },
+        "segments_freed": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      }
+     ],
+     "seconds": 20.4
+    },
+    {
+     "target": "packet_checksum_bench",
+     "filter": "^BM_(RawBess|ValidatedBess)Contiguous/packet_bytes:(64|1500)/protocol:6/checksum_intent:0$|^BM_ComputeChecksums/packet_bytes:1500/shape:0/protocol:6/checksum_intent:0/cold_rotation:0$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6974056,
+       "text": 5216691,
+       "data": 157272,
+       "bss": 33632
+      },
+      "B": {
+       "file_bytes": 6954272,
+       "text": 5148429,
+       "data": 163288,
+       "bss": 11976
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_RawBessContiguous/packet_bytes:64/protocol:6/checksum_intent:0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 2.9867625706256367,
+       "B_median": 2.980307007732376,
+       "paired_ratio_median": 0.9880341851036953,
+       "paired_ratio_min": 0.9593860810968713,
+       "paired_ratio_max": 1.0505768312473427,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "checksum_intent": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "dpdk_checksum_mismatch": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "items_per_second": {
+         "A": 335185024.43045247,
+         "B": 335989654.20380783
+        },
+        "packet_bytes": {
+         "A": 64.0,
+         "B": 64.0
+        },
+        "protocol": {
+         "A": 6.0,
+         "B": 6.0
+        },
+        "segments": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      },
+      {
+       "name": "BM_RawBessContiguous/packet_bytes:1500/protocol:6/checksum_intent:0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 2.9764563965942035,
+       "B_median": 2.9830905325573505,
+       "paired_ratio_median": 1.0022600241638568,
+       "paired_ratio_min": 0.9541571139586866,
+       "paired_ratio_max": 1.0411757373250725,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "checksum_intent": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "dpdk_checksum_mismatch": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "items_per_second": {
+         "A": 336467764.8872193,
+         "B": 335540780.76613533
+        },
+        "packet_bytes": {
+         "A": 1500.0,
+         "B": 1500.0
+        },
+        "protocol": {
+         "A": 6.0,
+         "B": 6.0
+        },
+        "segments": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      },
+      {
+       "name": "BM_ValidatedBessContiguous/packet_bytes:64/protocol:6/checksum_intent:0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 11.4335911772002,
+       "B_median": 11.391993996879343,
+       "paired_ratio_median": 1.0034745424519405,
+       "paired_ratio_min": 0.967719148014822,
+       "paired_ratio_max": 1.0129643752667243,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "checksum_intent": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "dpdk_checksum_mismatch": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "items_per_second": {
+         "A": 87604585.4890686,
+         "B": 87921630.33440767
+        },
+        "packet_bytes": {
+         "A": 64.0,
+         "B": 64.0
+        },
+        "protocol": {
+         "A": 6.0,
+         "B": 6.0
+        },
+        "segments": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      },
+      {
+       "name": "BM_ValidatedBessContiguous/packet_bytes:1500/protocol:6/checksum_intent:0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 11.483191984652116,
+       "B_median": 11.480356181543723,
+       "paired_ratio_median": 0.9898186659801795,
+       "paired_ratio_min": 0.9768558403576102,
+       "paired_ratio_max": 1.0424055191506247,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "checksum_intent": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "dpdk_checksum_mismatch": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "items_per_second": {
+         "A": 87216014.65505853,
+         "B": 87263920.27907367
+        },
+        "packet_bytes": {
+         "A": 1500.0,
+         "B": 1500.0
+        },
+        "protocol": {
+         "A": 6.0,
+         "B": 6.0
+        },
+        "segments": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      },
+      {
+       "name": "BM_ComputeChecksums/packet_bytes:1500/shape:0/protocol:6/checksum_intent:0/cold_rotation:0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 22.63258333426037,
+       "B_median": 22.603263642631674,
+       "paired_ratio_median": 0.99209710828987,
+       "paired_ratio_min": 0.9864386455049049,
+       "paired_ratio_max": 1.0405180386664716,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "checksum_intent": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "cold_rotation": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "items_per_second": {
+         "A": 44250397.1583347,
+         "B": 44315653.04788767
+        },
+        "packet_bytes": {
+         "A": 1500.0,
+         "B": 1500.0
+        },
+        "protocol": {
+         "A": 6.0,
+         "B": 6.0
+        },
+        "segments": {
+         "A": 1.0,
+         "B": 1.0
+        },
+        "working_set": {
+         "A": 1.0,
+         "B": 1.0
+        }
+       }
+      }
+     ],
+     "seconds": 9.3
+    },
+    {
+     "target": "packet_tx_checksum_bench",
+     "filter": "^BenchmarkTxFinalization/variant:(0|1)/protocol:0/packet_bytes:1500/batch:32/shape:0$|^BenchmarkQueueOutEgress/packet_bytes:1500/protocol:0/batch:32/profile:(0|1)$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6944104,
+       "text": 5189401,
+       "data": 157448,
+       "bss": 33952
+      },
+      "B": {
+       "file_bytes": 6924224,
+       "text": 5118103,
+       "data": 163432,
+       "bss": 11976
+      }
+     },
+     "rows": [
+      {
+       "name": "BenchmarkQueueOutEgress/packet_bytes:1500/protocol:0/batch:32/profile:0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 11.977160978229755,
+       "B_median": 11.68504356706889,
+       "paired_ratio_median": 0.9781376201860741,
+       "paired_ratio_min": 0.9153055683962056,
+       "paired_ratio_max": 1.0379661390811006,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes_per_second": {
+         "A": 4011408316130.674,
+         "B": 4114733557586.592
+        },
+        "items_per_second": {
+         "A": 2674272210.7537823,
+         "B": 2743155705.057728
+        }
+       }
+      },
+      {
+       "name": "BenchmarkQueueOutEgress/packet_bytes:1500/protocol:0/batch:32/profile:1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 3171.8636860183897,
+       "B_median": 3258.095913487811,
+       "paired_ratio_median": 1.0159193755279077,
+       "paired_ratio_min": 0.9958613576024546,
+       "paired_ratio_max": 1.0532414811689212,
+       "pairs_B_better": 1,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes_per_second": {
+         "A": 15152590672.124744,
+         "B": 14749864199.03999
+        },
+        "items_per_second": {
+         "A": 10101727.11474983,
+         "B": 9833242.799359992
+        }
+       }
+      },
+      {
+       "name": "BenchmarkTxFinalization/variant:0/protocol:0/packet_bytes:1500/batch:32/shape:0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 0.20141400348062682,
+       "B_median": 0.2030331612013122,
+       "paired_ratio_median": 1.00869593353951,
+       "paired_ratio_min": 0.9998929755459655,
+       "paired_ratio_max": 1.0858112299498943,
+       "pairs_B_better": 1,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes_per_second": {
+         "A": 238772289515327.0,
+         "B": 236774513665933.22
+        },
+        "items_per_second": {
+         "A": 159181526343.55133,
+         "B": 157849675777.28882
+        }
+       }
+      },
+      {
+       "name": "BenchmarkTxFinalization/variant:1/protocol:0/packet_bytes:1500/batch:32/shape:0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 1.985194736966301,
+       "B_median": 1.97952716265862,
+       "paired_ratio_median": 0.9988231388240113,
+       "paired_ratio_min": 0.9567089985210301,
+       "paired_ratio_max": 1.049382594990275,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes_per_second": {
+         "A": 24216302448484.61,
+         "B": 24286182863143.742
+        },
+        "items_per_second": {
+         "A": 16144201632.323072,
+         "B": 16190788575.429163
+        }
+       }
+      }
+     ],
+     "seconds": 8.0
+    },
+    {
+     "target": "utils_checksum_bench",
+     "filter": "^ChecksumFixture/BmGenericChecksum(Dpdk|Bess)/1024$|^ChecksumFixture/BmIncrementalUpdate16$|^ChecksumFixture/BmSrcIpPortUpdateBess$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6961720,
+       "text": 5199960,
+       "data": 158648,
+       "bss": 31392
+      },
+      "B": {
+       "file_bytes": 6946032,
+       "text": 5131510,
+       "data": 164696,
+       "bss": 9736
+      }
+     },
+     "rows": [
+      {
+       "name": "ChecksumFixture/BmGenericChecksumDpdk/1024",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 21.60654672366568,
+       "B_median": 21.903242722318986,
+       "paired_ratio_median": 1.0170481990085256,
+       "paired_ratio_min": 0.979953003030118,
+       "paired_ratio_max": 1.044424549901148,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes_per_second": {
+         "A": 47431508138.32826,
+         "B": 46799944358.86878
+        },
+        "items_per_second": {
+         "A": 46319832.16633619,
+         "B": 45703070.662957795
+        }
+       }
+      },
+      {
+       "name": "ChecksumFixture/BmGenericChecksumBess/1024",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 13.738832815231302,
+       "B_median": 13.837804308452178,
+       "paired_ratio_median": 1.00388636433189,
+       "paired_ratio_min": 0.9999629284108426,
+       "paired_ratio_max": 1.0239582029672307,
+       "pairs_B_better": 1,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes_per_second": {
+         "A": 74625407451.88705,
+         "B": 74081407694.90979
+        },
+        "items_per_second": {
+         "A": 72876374.46473345,
+         "B": 72345124.70206034
+        }
+       }
+      },
+      {
+       "name": "ChecksumFixture/BmIncrementalUpdate16",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 1.879778112449704,
+       "B_median": 1.8680935521973363,
+       "paired_ratio_median": 0.9948877087090449,
+       "paired_ratio_min": 0.9784481820862265,
+       "paired_ratio_max": 1.0048478862626513,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 532858968.884865,
+         "B": 535889244.9097365
+        }
+       }
+      },
+      {
+       "name": "ChecksumFixture/BmSrcIpPortUpdateBess",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 3.073620070013561,
+       "B_median": 3.0466585981009358,
+       "paired_ratio_median": 0.992795547783865,
+       "paired_ratio_min": 0.9805415539656945,
+       "paired_ratio_max": 1.0186701942229923,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 325785300.86723566,
+         "B": 328678584.0872884
+        }
+       }
+      }
+     ],
+     "seconds": 7.3
+    }
+   ]
+  },
+  "classify": {
+   "metadata": {
+    "captured_utc": "2026-10-03T06:04:58Z",
+    "host_kernel": "7.2.5-3-omarchy",
+    "compiler": "g++ (GCC) 16.2.1 20260810",
+    "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900H",
+    "online_cpus": "0-2,4-19",
+    "benchmark_cpus": "2",
+    "cpu_state": {
+     "2": {
+      "governor": "performance",
+      "epp": "performance",
+      "max_khz": "5200000"
+     }
+    },
+    "no_turbo": "0",
+    "isolation": {
+     "cgroup": "/sys/fs/cgroup/omarchy-benchmark-3250646",
+     "partition": "isolated",
+     "cpus": "2"
+    },
+    "dpdk_pkg_config": "/home/krsna1729/Projects/bess/deps/dpdk-25.11.3/install/lib/pkgconfig",
+    "dpdk_version": "25.11.3",
+    "meson_options": "buildtype=release (-O3), cpu=x86-64-v3",
+    "rounds": 6,
+    "min_time": "0.05s",
+    "group": "classify",
+    "cpu_isolated": true,
+    "allow_busy": false,
+    "provisional": false,
+    "seconds": 60.2
+   },
+   "cases": [
+    {
+     "target": "classifier_bench",
+     "filter": "^BM_(DirectTypedLookup|TypedTableLookup|Cuckoo_TypedBatch_Hit|Small_TypedBatch_Hit|RteHashData_Bulk_Hit)/(1|32)$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 7095560,
+       "text": 5328860,
+       "data": 157840,
+       "bss": 31424
+      },
+      "B": {
+       "file_bytes": 7079840,
+       "text": 5260530,
+       "data": 163888,
+       "bss": 9768
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_DirectTypedLookup/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 0.7429916095791222,
+       "B_median": 0.6060814563394752,
+       "paired_ratio_median": 0.8185715881551792,
+       "paired_ratio_min": 0.7933645821658435,
+       "paired_ratio_max": 0.8579623065693582,
+       "pairs_B_better": 6,
+       "pairs": 6,
+       "verdict": "B better (-18.1% real_time)",
+       "counters": {
+        "items_per_second": {
+         "A": 1347389425.7036436,
+         "B": 1651759626.1698864
+        }
+       }
+      },
+      {
+       "name": "BM_DirectTypedLookup/32",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 15.893349356113237,
+       "B_median": 15.436150561554454,
+       "paired_ratio_median": 0.9747892338431128,
+       "paired_ratio_min": 0.9354755637570978,
+       "paired_ratio_max": 1.035477461334219,
+       "pairs_B_better": 5,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 2016170244.3329482,
+         "B": 2075044330.1483536
+        }
+       }
+      },
+      {
+       "name": "BM_TypedTableLookup/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 0.5894923742232004,
+       "B_median": 0.7279042136914036,
+       "paired_ratio_median": 1.2290598804224806,
+       "paired_ratio_min": 1.1126005603637041,
+       "paired_ratio_max": 1.3946960230521066,
+       "pairs_B_better": 0,
+       "pairs": 6,
+       "verdict": "B worse (+22.9% real_time)",
+       "counters": {
+        "items_per_second": {
+         "A": 1698473124.1323686,
+         "B": 1384146356.6607602
+        }
+       }
+      },
+      {
+       "name": "BM_TypedTableLookup/32",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 15.418333234254215,
+       "B_median": 15.887802271566066,
+       "paired_ratio_median": 1.0330953439728559,
+       "paired_ratio_min": 1.010362272416239,
+       "paired_ratio_max": 1.0502415084706116,
+       "pairs_B_better": 0,
+       "pairs": 6,
+       "verdict": "B worse (+3.3% real_time)",
+       "counters": {
+        "items_per_second": {
+         "A": 2077759851.071806,
+         "B": 2017091362.1753469
+        }
+       }
+      },
+      {
+       "name": "BM_Cuckoo_TypedBatch_Hit/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 3.210404970171962,
+       "B_median": 3.194382624430946,
+       "paired_ratio_median": 0.994655850142225,
+       "paired_ratio_min": 0.98249705651672,
+       "paired_ratio_max": 1.0115623866566987,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 311865203.0073776,
+         "B": 313479198.0655496
+        }
+       }
+      },
+      {
+       "name": "BM_Cuckoo_TypedBatch_Hit/32",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 108.3173579287461,
+       "B_median": 110.73954069551573,
+       "paired_ratio_median": 1.023151296816371,
+       "paired_ratio_min": 0.9936689823401096,
+       "paired_ratio_max": 1.0664985073130646,
+       "pairs_B_better": 1,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 295883335.73835564,
+         "B": 289354321.9852792
+        }
+       }
+      },
+      {
+       "name": "BM_Small_TypedBatch_Hit/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 0.8593613333249117,
+       "B_median": 0.8726825216123401,
+       "paired_ratio_median": 1.008954951102403,
+       "paired_ratio_min": 0.9875551724874092,
+       "paired_ratio_max": 1.04508953360202,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 1165324342.3482409,
+         "B": 1147440202.9751596
+        }
+       }
+      },
+      {
+       "name": "BM_Small_TypedBatch_Hit/32",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 147.28513367996496,
+       "B_median": 147.14354871151647,
+       "paired_ratio_median": 0.9992277868005226,
+       "paired_ratio_min": 0.9664257289092001,
+       "paired_ratio_max": 1.0042852904362487,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 217701371.19035816,
+         "B": 217793013.8779589
+        }
+       }
+      },
+      {
+       "name": "BM_RteHashData_Bulk_Hit/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 17.40893496518393,
+       "B_median": 17.227195585140564,
+       "paired_ratio_median": 0.9936675522992973,
+       "paired_ratio_min": 0.9385780008759691,
+       "paired_ratio_max": 1.0835795220841296,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 57521857.131996445,
+         "B": 58122993.25629446
+        }
+       }
+      },
+      {
+       "name": "BM_RteHashData_Bulk_Hit/32",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 307.57245597616964,
+       "B_median": 305.25884949694876,
+       "paired_ratio_median": 0.9962555773348055,
+       "paired_ratio_min": 0.9232674477725619,
+       "paired_ratio_max": 1.0084218075025608,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 104202065.13029107,
+         "B": 104957077.16550542
+        }
+       }
+      }
+     ],
+     "seconds": 14.1
+    },
+    {
+     "target": "classifier_typed_bench",
+     "filter": "^BM_K34_Cuckoo_(Direct|Table|Runtime)_K8_R4/16/8/(0|1|2|3)$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 7492432,
+       "text": 5637039,
+       "data": 157176,
+       "bss": 31488
+      },
+      "B": {
+       "file_bytes": 7480840,
+       "text": 5568709,
+       "data": 163224,
+       "bss": 9832
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_K34_Cuckoo_Direct_K8_R4/16/8/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 19.933877251603548,
+       "B_median": 20.343144443706585,
+       "paired_ratio_median": 1.022581448157612,
+       "paired_ratio_min": 0.9943472808407309,
+       "paired_ratio_max": 1.042499903538303,
+       "pairs_B_better": 1,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 401877378.8837259,
+         "B": 393799433.8145085
+        }
+       }
+      },
+      {
+       "name": "BM_K34_Cuckoo_Table_K8_R4/16/8/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 18.016684520230285,
+       "B_median": 17.262360404080002,
+       "paired_ratio_median": 0.9719909470068883,
+       "paired_ratio_min": 0.924433425674944,
+       "paired_ratio_max": 0.986390700778798,
+       "pairs_B_better": 6,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 444526111.65536416,
+         "B": 464045938.5147387
+        }
+       }
+      },
+      {
+       "name": "BM_K34_Cuckoo_Runtime_K8_R4/16/8/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 17.17204869556893,
+       "B_median": 16.910835607987885,
+       "paired_ratio_median": 0.988870663804694,
+       "paired_ratio_min": 0.9646503379513413,
+       "paired_ratio_max": 0.9962518331434455,
+       "pairs_B_better": 6,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 466531777.54768974,
+         "B": 473818653.09634185
+        }
+       }
+      },
+      {
+       "name": "BM_K34_Cuckoo_Direct_K8_R4/16/8/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 17.496103707084437,
+       "B_median": 17.223618828394088,
+       "paired_ratio_median": 0.9927063286726547,
+       "paired_ratio_min": 0.94643745992161,
+       "paired_ratio_max": 1.0670643466539385,
+       "pairs_B_better": 5,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 457875171.6560707,
+         "B": 465250974.4074131
+        }
+       }
+      },
+      {
+       "name": "BM_K34_Cuckoo_Table_K8_R4/16/8/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 16.613883486150847,
+       "B_median": 16.2950862719524,
+       "paired_ratio_median": 0.9987543043585122,
+       "paired_ratio_min": 0.9338554402523099,
+       "paired_ratio_max": 1.006028879162667,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 482270826.36851037,
+         "B": 491696208.7379029
+        }
+       }
+      },
+      {
+       "name": "BM_K34_Cuckoo_Runtime_K8_R4/16/8/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 17.509545247253048,
+       "B_median": 16.860050841612907,
+       "paired_ratio_median": 0.96417102651857,
+       "paired_ratio_min": 0.9296967445712482,
+       "paired_ratio_max": 0.9778978531244634,
+       "pairs_B_better": 6,
+       "pairs": 6,
+       "verdict": "B better (-3.6% real_time)",
+       "counters": {
+        "items_per_second": {
+         "A": 457464567.8384021,
+         "B": 475079535.95129776
+        }
+       }
+      },
+      {
+       "name": "BM_K34_Cuckoo_Direct_K8_R4/16/8/2",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 18.555329974004135,
+       "B_median": 19.16064780973897,
+       "paired_ratio_median": 1.0242534584014629,
+       "paired_ratio_min": 1.0013757282030262,
+       "paired_ratio_max": 1.0508645982634346,
+       "pairs_B_better": 0,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 431724383.20324016,
+         "B": 418070004.43769807
+        }
+       }
+      },
+      {
+       "name": "BM_K34_Cuckoo_Table_K8_R4/16/8/2",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 16.398987617304794,
+       "B_median": 16.546694094317502,
+       "paired_ratio_median": 1.0151391545120731,
+       "paired_ratio_min": 0.948833872426489,
+       "paired_ratio_max": 1.0431272662508084,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 488593066.58190197,
+         "B": 484153624.9642906
+        }
+       }
+      },
+      {
+       "name": "BM_K34_Cuckoo_Runtime_K8_R4/16/8/2",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 17.85762053953328,
+       "B_median": 17.673588972413185,
+       "paired_ratio_median": 0.9944517766701293,
+       "paired_ratio_min": 0.9615034072285216,
+       "paired_ratio_max": 1.0158956099090335,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 448796105.8180522,
+         "B": 453346567.9138848
+        }
+       }
+      },
+      {
+       "name": "BM_K34_Cuckoo_Direct_K8_R4/16/8/3",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 16.984313418731986,
+       "B_median": 17.183618723936128,
+       "paired_ratio_median": 1.0064965447996497,
+       "paired_ratio_min": 0.9851000796749919,
+       "paired_ratio_max": 1.0362859621596416,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 471699839.7101516,
+         "B": 466224559.9257656
+        }
+       }
+      },
+      {
+       "name": "BM_K34_Cuckoo_Table_K8_R4/16/8/3",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 16.609917845637078,
+       "B_median": 15.631665028507408,
+       "paired_ratio_median": 0.9465374711404027,
+       "paired_ratio_min": 0.8883279101903453,
+       "paired_ratio_max": 0.9731696637276707,
+       "pairs_B_better": 6,
+       "pairs": 6,
+       "verdict": "B better (-5.3% real_time)",
+       "counters": {
+        "items_per_second": {
+         "A": 482339782.54236174,
+         "B": 512718772.91967607
+        }
+       }
+      },
+      {
+       "name": "BM_K34_Cuckoo_Runtime_K8_R4/16/8/3",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 15.785982819649629,
+       "B_median": 15.815896020611774,
+       "paired_ratio_median": 1.0050907146262384,
+       "paired_ratio_min": 0.9658577221514681,
+       "paired_ratio_max": 1.0648044716076446,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 507542116.0238307,
+         "B": 506814124.10956764
+        }
+       }
+      }
+     ],
+     "seconds": 15.6
+    },
+    {
+     "target": "classifier_masked_bench",
+     "filter": "^BM_Masked_(Legacy|Substrate)/8/4/16/75/1/8/0$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 7470544,
+       "text": 5627027,
+       "data": 157176,
+       "bss": 31488
+      },
+      "B": {
+       "file_bytes": 7458952,
+       "text": 5558641,
+       "data": 163224,
+       "bss": 9832
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_Masked_Legacy/8/4/16/75/1/8/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 273.17533719930657,
+       "B_median": 257.7729117283011,
+       "paired_ratio_median": 0.9413594764565036,
+       "paired_ratio_min": 0.9217743106390726,
+       "paired_ratio_max": 0.9700828143040501,
+       "pairs_B_better": 6,
+       "pairs": 6,
+       "verdict": "B better (-5.9% real_time)",
+       "counters": {
+        "avg_tuple_matches": {
+         "A": 1.0,
+         "B": 1.0
+        },
+        "items_per_second": {
+         "A": 29323385.935022015,
+         "B": 31073917.010035746
+        }
+       }
+      },
+      {
+       "name": "BM_Masked_Substrate/8/4/16/75/1/8/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 120.65074384187048,
+       "B_median": 118.77031855919682,
+       "paired_ratio_median": 0.979843340099543,
+       "paired_ratio_min": 0.9671676501289473,
+       "paired_ratio_max": 1.0025944761393584,
+       "pairs_B_better": 5,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "avg_tuple_matches": {
+         "A": 1.0,
+         "B": 1.0
+        },
+        "items_per_second": {
+         "A": 66400667.16768712,
+         "B": 67444104.09799045
+        },
+        "tuples": {
+         "A": 4.0,
+         "B": 4.0
+        }
+       }
+      }
+     ],
+     "seconds": 15.8
+    },
+    {
+     "target": "classifier_range_backend_bench",
+     "filter": "^BM_(K38RangeLookupBatch|CartesianTernaryLookupBatch)/8$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6985776,
+       "text": 5229783,
+       "data": 157000,
+       "bss": 31392
+      },
+      "B": {
+       "file_bytes": 6965992,
+       "text": 5161389,
+       "data": 163080,
+       "bss": 9736
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_K38RangeLookupBatch/8",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 57.10383999394253,
+       "B_median": 56.30807555280626,
+       "paired_ratio_median": 0.9782195895070791,
+       "paired_ratio_min": 0.9327453110938654,
+       "paired_ratio_max": 1.0130503932351067,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 140265016.59842658,
+         "B": 142239908.74156776
+        }
+       }
+      },
+      {
+       "name": "BM_CartesianTernaryLookupBatch/8",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 1103.2418711149953,
+       "B_median": 1109.1265609926045,
+       "paired_ratio_median": 1.0031506777882484,
+       "paired_ratio_min": 0.9987267601661963,
+       "paired_ratio_max": 1.0112119374138453,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 7259438.231366452,
+         "B": 7222899.211454613
+        }
+       }
+      }
+     ],
+     "seconds": 4.5
+    },
+    {
+     "target": "modules_exact_match_bench",
+     "filter": "^BM_(Legacy|New)EndToEnd/0/8/2$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 7101752,
+       "text": 5333779,
+       "data": 157184,
+       "bss": 31712
+      },
+      "B": {
+       "file_bytes": 7080960,
+       "text": 5260969,
+       "data": 163232,
+       "bss": 9736
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_LegacyEndToEnd/0/8/2",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 37.251860935374744,
+       "B_median": 37.07192424949899,
+       "paired_ratio_median": 0.9923078793138438,
+       "paired_ratio_min": 0.9708540366105319,
+       "paired_ratio_max": 1.0860366758670494,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 215043033.3213784,
+         "B": 216087388.37364694
+        }
+       }
+      },
+      {
+       "name": "BM_NewEndToEnd/0/8/2",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 30.40319058014697,
+       "B_median": 28.161890561100638,
+       "paired_ratio_median": 0.9376353001333363,
+       "paired_ratio_min": 0.8654659913648596,
+       "paired_ratio_max": 0.9522043419274343,
+       "pairs_B_better": 6,
+       "pairs": 6,
+       "verdict": "B better (-6.2% real_time)",
+       "counters": {
+        "items_per_second": {
+         "A": 263627282.66982675,
+         "B": 284509456.0381151
+        }
+       }
+      }
+     ],
+     "seconds": 5.3
+    },
+    {
+     "target": "modules_wildcard_match_bench",
+     "filter": "^BM_Wm_(Legacy|Module)/4/8/0/0$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 7206168,
+       "text": 5415487,
+       "data": 157176,
+       "bss": 31776
+      },
+      "B": {
+       "file_bytes": 7186352,
+       "text": 5343465,
+       "data": 163224,
+       "bss": 9800
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_Wm_Legacy/4/8/0/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 204.833059239157,
+       "B_median": 208.15785807373572,
+       "paired_ratio_median": 1.019952283228121,
+       "paired_ratio_min": 0.9897012059189869,
+       "paired_ratio_max": 1.0355764034464658,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "avg_tuple_matches": {
+         "A": 1.0,
+         "B": 1.0
+        },
+        "items_per_second": {
+         "A": 39099040.46655497,
+         "B": 38468951.411289304
+        }
+       }
+      },
+      {
+       "name": "BM_Wm_Module/4/8/0/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 114.20912883994757,
+       "B_median": 116.8055252172152,
+       "paired_ratio_median": 1.0341479093649248,
+       "paired_ratio_min": 0.9714331958367941,
+       "paired_ratio_max": 1.0795038184936652,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "avg_tuple_matches": {
+         "A": 1.0,
+         "B": 1.0
+        },
+        "items_per_second": {
+         "A": 70102312.35162866,
+         "B": 68577453.04721996
+        },
+        "tuples": {
+         "A": 4.0,
+         "B": 4.0
+        }
+       }
+      }
+     ],
+     "seconds": 4.9
+    }
+   ]
+  },
+  "state": {
+   "metadata": {
+    "captured_utc": "2026-10-03T06:05:59Z",
+    "host_kernel": "7.2.5-3-omarchy",
+    "compiler": "g++ (GCC) 16.2.1 20260810",
+    "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900H",
+    "online_cpus": "0-2,4-19",
+    "benchmark_cpus": "2",
+    "cpu_state": {
+     "2": {
+      "governor": "performance",
+      "epp": "performance",
+      "max_khz": "5200000"
+     }
+    },
+    "no_turbo": "0",
+    "isolation": {
+     "cgroup": "/sys/fs/cgroup/omarchy-benchmark-3251834",
+     "partition": "isolated",
+     "cpus": "2"
+    },
+    "dpdk_pkg_config": "/home/krsna1729/Projects/bess/deps/dpdk-25.11.3/install/lib/pkgconfig",
+    "dpdk_version": "25.11.3",
+    "meson_options": "buildtype=release (-O3), cpu=x86-64-v3",
+    "rounds": 6,
+    "min_time": "0.05s",
+    "group": "state",
+    "cpu_isolated": true,
+    "allow_busy": false,
+    "provisional": false,
+    "seconds": 93.5
+   },
+   "cases": [
+    {
+     "target": "meter_bench",
+     "filter": "^BM_SingleState/(0|1)$|^BM_BatchMeterSet/1024/(0|1)$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6942400,
+       "text": 5188902,
+       "data": 157056,
+       "bss": 31712
+      },
+      "B": {
+       "file_bytes": 6922616,
+       "text": 5120388,
+       "data": 163104,
+       "bss": 10056
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_SingleState/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 5.946404438670342,
+       "B_median": 6.019657015590981,
+       "paired_ratio_median": 1.0002468346279532,
+       "paired_ratio_min": 0.9685035215445476,
+       "paired_ratio_max": 1.0462558720768615,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 168372232.21164083,
+         "B": 166318096.4828528
+        }
+       }
+      },
+      {
+       "name": "BM_SingleState/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 9.156967818462554,
+       "B_median": 9.036839887108014,
+       "paired_ratio_median": 0.9828228107050154,
+       "paired_ratio_min": 0.9507991736326574,
+       "paired_ratio_max": 1.001911070453309,
+       "pairs_B_better": 5,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 109307161.24572161,
+         "B": 110793602.71083546
+        }
+       }
+      },
+      {
+       "name": "BM_BatchMeterSet/1024/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 175.18816771712787,
+       "B_median": 176.75087197880447,
+       "paired_ratio_median": 1.011311233514355,
+       "paired_ratio_min": 0.9572668451229607,
+       "paired_ratio_max": 1.027551651634607,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 182890339.39881644,
+         "B": 181289041.15822875
+        },
+        "state_bytes": {
+         "A": 65536.0,
+         "B": 65536.0
+        }
+       }
+      },
+      {
+       "name": "BM_BatchMeterSet/1024/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 316.818652181968,
+       "B_median": 316.79527841022286,
+       "paired_ratio_median": 0.9917186728725604,
+       "paired_ratio_min": 0.9724300295647939,
+       "paired_ratio_max": 1.0128598458203573,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 101146959.59060627,
+         "B": 101139121.02629259
+        },
+        "state_bytes": {
+         "A": 65536.0,
+         "B": 65536.0
+        }
+       }
+      }
+     ],
+     "seconds": 7.7
+    },
+    {
+     "target": "stats_bench",
+     "filter": "^BM_(AccountCell|AccountUpdate|SnapshotCounters/3)$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6934000,
+       "text": 5181518,
+       "data": 157016,
+       "bss": 31904
+      },
+      "B": {
+       "file_bytes": 6914216,
+       "text": 5113188,
+       "data": 163096,
+       "bss": 10248
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_AccountCell",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 0.5621506448369473,
+       "B_median": 0.5802743695676327,
+       "paired_ratio_median": 1.0217033062552339,
+       "paired_ratio_min": 0.9477606222197238,
+       "paired_ratio_max": 1.119654852687173,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 1780609506.3212621,
+         "B": 1725561957.5844684
+        }
+       }
+      },
+      {
+       "name": "BM_AccountUpdate",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 1.1538129142977498,
+       "B_median": 1.157277725047869,
+       "paired_ratio_median": 0.9984681497103971,
+       "paired_ratio_min": 0.9472351300788905,
+       "paired_ratio_max": 1.0497703729225913,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 867861623.7273014,
+         "B": 865426935.4878542
+        }
+       }
+      },
+      {
+       "name": "BM_SnapshotCounters/3",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 387.6375457540095,
+       "B_median": 390.7218135375807,
+       "paired_ratio_median": 1.0196622878447545,
+       "paired_ratio_min": 0.9863715392039795,
+       "paired_ratio_max": 1.0594578876393637,
+       "pairs_B_better": 1,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "storage_bytes": {
+         "A": 4096.0,
+         "B": 4096.0
+        }
+       }
+      }
+     ],
+     "seconds": 5.9
+    },
+    {
+     "target": "fib_bench",
+     "filter": "^BM_Lookup(LpmVec|Fib)/routes:1024$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6951984,
+       "text": 5200996,
+       "data": 157272,
+       "bss": 31392
+      },
+      "B": {
+       "file_bytes": 6940392,
+       "text": 5132610,
+       "data": 163320,
+       "bss": 9736
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_LookupLpmVec/routes:1024",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 283613.01123920217,
+       "B_median": 281784.29361735494,
+       "paired_ratio_median": 1.012028383021946,
+       "paired_ratio_min": 0.954855729609215,
+       "paired_ratio_max": 1.061288032060458,
+       "pairs_B_better": 1,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "build_ns_route": {
+         "A": 714.75732421875,
+         "B": 720.35009765625
+        },
+        "bytes_route": {
+         "A": 98321.0,
+         "B": 98321.0
+        },
+        "cpu_ns_pkt": {
+         "A": 4.320822756530429,
+         "B": 4.2937254054405924
+        },
+        "items_per_second": {
+         "A": 231462676.54848567,
+         "B": 232907545.87432873
+        }
+       }
+      },
+      {
+       "name": "BM_LookupFib/routes:1024",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 266091.33588928444,
+       "B_median": 274865.9519500017,
+       "paired_ratio_median": 1.0266873437671726,
+       "paired_ratio_min": 0.9537903330999512,
+       "paired_ratio_max": 1.0688264662701017,
+       "pairs_B_better": 1,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "build_ns_route": {
+         "A": 384.4541015625,
+         "B": 412.00341796875
+        },
+        "bytes_route": {
+         "A": 99156.25,
+         "B": 99156.25
+        },
+        "cpu_ns_pkt": {
+         "A": 4.053188889508942,
+         "B": 4.187137278791328
+        },
+        "items_per_second": {
+         "A": 246728978.24505815,
+         "B": 238836833.61830872
+        }
+       }
+      }
+     ],
+     "seconds": 6.5
+    },
+    {
+     "target": "route_bench",
+     "filter": "^BM_LookupRouter/(1024|65536)$|^BM_LookupRouteTable/1024/0$|^BM_UpdateInPlace/1024$|^BM_NextHopUpdate/1024$",
+     "source": "adapted",
+     "sizes": {
+      "A": {
+       "file_bytes": 6977144,
+       "text": 5224158,
+       "data": 157336,
+       "bss": 31488
+      },
+      "B": {
+       "file_bytes": 6961600,
+       "text": 5155188,
+       "data": 163352,
+       "bss": 9832
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_LookupRouteTable/1024/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 175.99451751240215,
+       "B_median": 175.14775670997923,
+       "paired_ratio_median": 1.0157637429784594,
+       "paired_ratio_min": 0.9629773625293795,
+       "paired_ratio_max": 1.0505228362544001,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 181994152.53827968,
+         "B": 182959462.3574062
+        }
+       }
+      },
+      {
+       "name": "BM_LookupRouter/1024",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 191.5144214496401,
+       "B_median": 219.28882987660185,
+       "paired_ratio_median": 1.1552449440377373,
+       "paired_ratio_min": 1.0832881967897963,
+       "paired_ratio_max": 1.1774594685667448,
+       "pairs_B_better": 0,
+       "pairs": 6,
+       "verdict": "B worse (+15.5% real_time)",
+       "counters": {
+        "items_per_second": {
+         "A": 167435241.75927424,
+         "B": 146097147.42190617
+        }
+       }
+      },
+      {
+       "name": "BM_LookupRouter/65536",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 238.8302566775309,
+       "B_median": 240.74202680548888,
+       "paired_ratio_median": 1.005894688647604,
+       "paired_ratio_min": 0.9691612923453428,
+       "paired_ratio_max": 1.0513915694957203,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 134236515.23494324,
+         "B": 133143024.63238868
+        }
+       }
+      },
+      {
+       "name": "BM_UpdateInPlace/1024",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 627.5258729375348,
+       "B_median": 621.8446884972585,
+       "paired_ratio_median": 0.9895622437907842,
+       "paired_ratio_min": 0.9623228475602993,
+       "paired_ratio_max": 1.0239746102319545,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 3191109.5852597496,
+         "B": 3219802.7923033806
+        }
+       }
+      },
+      {
+       "name": "BM_NextHopUpdate/1024",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "us",
+       "A_median": 0.06792581134625689,
+       "B_median": 0.07479311460077129,
+       "paired_ratio_median": 1.0997128899245956,
+       "paired_ratio_min": 1.0351182751190777,
+       "paired_ratio_max": 1.1367226704077336,
+       "pairs_B_better": 0,
+       "pairs": 6,
+       "verdict": "B worse (+10.0% real_time)",
+       "counters": {
+        "items_per_second": {
+         "A": 14742610.143289007,
+         "B": 13387290.096716143
+        }
+       }
+      }
+     ],
+     "seconds": 44.3
+    },
+    {
+     "target": "rcu_bench",
+     "filter": "^BM_(RcuPtrRead|GracePeriodLatency|PublishWithIdleReader)$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6915416,
+       "text": 5164784,
+       "data": 157168,
+       "bss": 31424
+      },
+      "B": {
+       "file_bytes": 6899696,
+       "text": 5096406,
+       "data": 163216,
+       "bss": 9768
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_RcuPtrRead",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 58.2617318814153,
+       "B_median": 58.04648888827819,
+       "paired_ratio_median": 0.9929359303996841,
+       "paired_ratio_min": 0.9646396075609637,
+       "paired_ratio_max": 1.0138819888230182,
+       "pairs_B_better": 5,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {}
+      },
+      {
+       "name": "BM_PublishWithIdleReader",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 42.43449566749844,
+       "B_median": 50.772871531080455,
+       "paired_ratio_median": 1.190826569467231,
+       "paired_ratio_min": 0.9709230944853666,
+       "paired_ratio_max": 1.2861705794938398,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {}
+      },
+      {
+       "name": "BM_GracePeriodLatency",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 16.817148486522278,
+       "B_median": 16.826297355042364,
+       "paired_ratio_median": 1.0062492190839891,
+       "paired_ratio_min": 0.9787952798487934,
+       "paired_ratio_max": 1.0478490180469564,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {}
+      }
+     ],
+     "seconds": 5.8
+    },
+    {
+     "target": "object_table_bench",
+     "filter": "^BM_ObjectTableLookup<(16|64)>/10240/0$|^BM_ObjectTableBatchLookup<16>/32$|^BM_ObjectTableBuild<64>/10240$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 7170728,
+       "text": 5387211,
+       "data": 156984,
+       "bss": 31392
+      },
+      "B": {
+       "file_bytes": 7155040,
+       "text": 5318881,
+       "data": 163064,
+       "bss": 9736
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_ObjectTableLookup<64>/10240/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 6.97083264781322,
+       "B_median": 7.087513897911042,
+       "paired_ratio_median": 0.989231078629677,
+       "paired_ratio_min": 0.8452054404407439,
+       "paired_ratio_max": 1.3202943463265742,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes_per_object": {
+         "A": 64.0,
+         "B": 64.0
+        },
+        "items_per_second": {
+         "A": 1149047090.2067795,
+         "B": 1131218868.0865798
+        },
+        "storage_bytes": {
+         "A": 696388.0,
+         "B": 696388.0
+        },
+        "touched_bytes": {
+         "A": 544.0,
+         "B": 544.0
+        }
+       }
+      },
+      {
+       "name": "BM_ObjectTableBatchLookup<16>/32",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 4911.100069744398,
+       "B_median": 4834.642206287115,
+       "paired_ratio_median": 0.9837477023600127,
+       "paired_ratio_min": 0.954779149755812,
+       "paired_ratio_max": 1.0600710841951282,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "batch": {
+         "A": 32.0,
+         "B": 32.0
+        },
+        "items_per_second": {
+         "A": 835282852.8777871,
+         "B": 848581158.6081119
+        }
+       }
+      },
+      {
+       "name": "BM_ObjectTableBuild<64>/10240",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 29222.07407279517,
+       "B_median": 28721.809493428802,
+       "paired_ratio_median": 0.9780498000815676,
+       "paired_ratio_min": 0.9599416844300297,
+       "paired_ratio_max": 0.995787469537805,
+       "pairs_B_better": 6,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "bytes_per_object": {
+         "A": 64.0,
+         "B": 64.0
+        },
+        "items_per_second": {
+         "A": 351046734.6960525,
+         "B": 357382466.80718863
+        },
+        "objects": {
+         "A": 10240.0,
+         "B": 10240.0
+        },
+        "storage_bytes": {
+         "A": 696388.0,
+         "B": 696388.0
+        }
+       }
+      }
+     ],
+     "seconds": 6.5
+    },
+    {
+     "target": "transaction_bench",
+     "filter": "^BM_SingleRule/(0|1)$|^BM_SessionEstablishRelease/1024$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 7034768,
+       "text": 5257078,
+       "data": 158248,
+       "bss": 31552
+      },
+      "B": {
+       "file_bytes": 7014984,
+       "text": 5189572,
+       "data": 164280,
+       "bss": 9896
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_SessionEstablishRelease/1024",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 3155.87373126301,
+       "B_median": 3299.885042693907,
+       "paired_ratio_median": 1.0267151660203313,
+       "paired_ratio_min": 0.9946783318277008,
+       "paired_ratio_max": 1.0922654363585351,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 317362.1768182387,
+         "B": 303421.9578306308
+        }
+       }
+      },
+      {
+       "name": "BM_SingleRule/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 99.24134229244498,
+       "B_median": 99.25632473343944,
+       "paired_ratio_median": 0.9957354365457003,
+       "paired_ratio_min": 0.9278266184565853,
+       "paired_ratio_max": 1.0189275910234012,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 20194719.139287125,
+         "B": 20184786.111670982
+        }
+       }
+      },
+      {
+       "name": "BM_SingleRule/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 650.9229238929638,
+       "B_median": 644.6193200807925,
+       "paired_ratio_median": 1.004720969269306,
+       "paired_ratio_min": 0.9451415855883931,
+       "paired_ratio_max": 1.0293712149277532,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 3077571.453050522,
+         "B": 3107234.3129011863
+        }
+       }
+      }
+     ],
+     "seconds": 6.8
+    },
+    {
+     "target": "modules_exact_match_transaction_bench",
+     "filter": "^BM_ModuleClassify/1000/0$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6946128,
+       "text": 5196400,
+       "data": 157304,
+       "bss": 33952
+      },
+      "B": {
+       "file_bytes": 6930344,
+       "text": 5124730,
+       "data": 163320,
+       "bss": 12008
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_ModuleClassify/1000/0",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 572.3890947410837,
+       "B_median": 580.4409593110904,
+       "paired_ratio_median": 1.0034674216000248,
+       "paired_ratio_min": 0.9495972698208891,
+       "paired_ratio_max": 1.168037026311792,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 56067043.93109523,
+         "B": 55279149.1696163
+        }
+       }
+      }
+     ],
+     "seconds": 6.9
+    },
+    {
+     "target": "m0_slot_table_bench",
+     "filter": "^BM_(SlotTable(Lookup|Publish)|StrongIdCompare)$",
+     "source": "supplemental",
+     "sizes": {
+      "A": {
+       "file_bytes": 40168,
+       "text": 20881,
+       "data": 1536,
+       "bss": 8
+      },
+      "B": {
+       "file_bytes": 40168,
+       "text": 20881,
+       "data": 1536,
+       "bss": 8
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_SlotTableLookup",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 24.012289886497598,
+       "B_median": 24.36852692789605,
+       "paired_ratio_median": 0.9987304973848297,
+       "paired_ratio_min": 0.9891783180636876,
+       "paired_ratio_max": 1.051967838129586,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 1334746349.589981,
+         "B": 1315544803.0279908
+        }
+       }
+      },
+      {
+       "name": "BM_SlotTablePublish",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 5.50539624756189,
+       "B_median": 5.441594746954529,
+       "paired_ratio_median": 0.9861624841178144,
+       "paired_ratio_min": 0.9165366236583137,
+       "paired_ratio_max": 1.003176555853909,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 181972599.3237018,
+         "B": 184030821.74653366
+        }
+       }
+      },
+      {
+       "name": "BM_StrongIdCompare",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 3.647672023238489,
+       "B_median": 3.669433632948441,
+       "paired_ratio_median": 0.9951915186658553,
+       "paired_ratio_min": 0.6924784492309082,
+       "paired_ratio_max": 1.0392889541032229,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 8785469978.276867,
+         "B": 8736857492.777449
+        }
+       }
+      }
+     ],
+     "seconds": 3.2
+    }
+   ]
+  },
+  "threads": {
+   "metadata": {
+    "captured_utc": "2026-10-03T06:07:33Z",
+    "host_kernel": "7.2.5-3-omarchy",
+    "compiler": "g++ (GCC) 16.2.1 20260810",
+    "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900H",
+    "online_cpus": "0-2,4,6-19",
+    "benchmark_cpus": "2,4",
+    "cpu_state": {
+     "2": {
+      "governor": "performance",
+      "epp": "performance",
+      "max_khz": "5200000"
+     },
+     "4": {
+      "governor": "performance",
+      "epp": "performance",
+      "max_khz": "5400000"
+     }
+    },
+    "no_turbo": "0",
+    "isolation": {
+     "cgroup": "/sys/fs/cgroup/omarchy-benchmark-3253711",
+     "partition": "isolated",
+     "cpus": "2,4"
+    },
+    "dpdk_pkg_config": "/home/krsna1729/Projects/bess/deps/dpdk-25.11.3/install/lib/pkgconfig",
+    "dpdk_version": "25.11.3",
+    "meson_options": "buildtype=release (-O3), cpu=x86-64-v3",
+    "rounds": 6,
+    "min_time": "0.05s",
+    "group": "threads",
+    "cpu_isolated": true,
+    "allow_busy": false,
+    "provisional": false,
+    "seconds": 138.8
+   },
+   "cases": [
+    {
+     "target": "transaction_bench",
+     "filter": "^BM_SessionWithOnlineReader/real_time$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 7034768,
+       "text": 5257078,
+       "data": 158248,
+       "bss": 31552
+      },
+      "B": {
+       "file_bytes": 7014984,
+       "text": 5189572,
+       "data": 164280,
+       "bss": 9896
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_SessionWithOnlineReader/real_time",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 3544.1271871839554,
+       "B_median": 3635.379730312182,
+       "paired_ratio_median": 1.0237704024277174,
+       "paired_ratio_min": 0.9810639078428167,
+       "paired_ratio_max": 1.0744440054960833,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "grace_periods": {
+         "A": 86186.5,
+         "B": 85154.0
+        },
+        "items_per_second": {
+         "A": 282172.3167902974,
+         "B": 275076.0867102926
+        },
+        "pending_at_end": {
+         "A": 12.0,
+         "B": 11.0
+        },
+        "retries": {
+         "A": 0.0,
+         "B": 0.0
+        }
+       }
+      }
+     ],
+     "seconds": 5.0
+    },
+    {
+     "target": "transaction_bench",
+     "filter": "^BM_LookupsUnderTransactions/1/10000/min_time:2.000/real_time$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 7034768,
+       "text": 5257078,
+       "data": 158248,
+       "bss": 31552
+      },
+      "B": {
+       "file_bytes": 7014984,
+       "text": 5189572,
+       "data": 164280,
+       "bss": 9896
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_LookupsUnderTransactions/1/10000/min_time:2.000/real_time",
+       "metric": "Mlookups_per_reader",
+       "higher_is_better": true,
+       "unit": "Mlookups_per_reader",
+       "A_median": 42.674935984878076,
+       "B_median": 43.05717266755141,
+       "paired_ratio_median": 1.0078111904613647,
+       "paired_ratio_min": 0.9815341076083114,
+       "paired_ratio_max": 1.0341884809107738,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "Mlookups_per_reader": {
+         "A": 42.674935984878076,
+         "B": 43.05717266755141
+        },
+        "Mlookups_total": {
+         "A": 42.674935984878076,
+         "B": 43.05717266755141
+        },
+        "busy_retries": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "sessions_per_s": {
+         "A": 9999.970346516528,
+         "B": 9999.97361614104
+        }
+       }
+      }
+     ],
+     "seconds": 55.8
+    },
+    {
+     "target": "modules_exact_match_transaction_bench",
+     "filter": "^BM_ClassifyUnderTransactions/1/10000/min_time:2.000/real_time$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6946128,
+       "text": 5196400,
+       "data": 157304,
+       "bss": 33952
+      },
+      "B": {
+       "file_bytes": 6930344,
+       "text": 5124730,
+       "data": 163320,
+       "bss": 12008
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_ClassifyUnderTransactions/1/10000/min_time:2.000/real_time",
+       "metric": "Mpps_per_reader",
+       "higher_is_better": true,
+       "unit": "Mpps_per_reader",
+       "A_median": 38.01500901430819,
+       "B_median": 37.92070660049347,
+       "paired_ratio_median": 0.996382927049473,
+       "paired_ratio_min": 0.9701670709417184,
+       "paired_ratio_max": 1.0060057874338166,
+       "pairs_B_better": 2,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "Mpps_per_reader": {
+         "A": 38.01500901430819,
+         "B": 37.92070660049347
+        },
+        "busy_retries": {
+         "A": 0.0,
+         "B": 0.0
+        },
+        "sessions_per_s": {
+         "A": 9999.984851808727,
+         "B": 9999.977307194356
+        }
+       }
+      }
+     ],
+     "seconds": 55.1
+    },
+    {
+     "target": "ring_bench",
+     "filter": "^BM_RingRte(Mpsc|RtsSc|HtsSc)/1$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6964440,
+       "text": 5203706,
+       "data": 157416,
+       "bss": 31552
+      },
+      "B": {
+       "file_bytes": 6944656,
+       "text": 5135320,
+       "data": 163432,
+       "bss": 9864
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_RingRteMpsc/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 181937823.47952947,
+       "B_median": 181932498.00242484,
+       "paired_ratio_median": 0.9992471037571866,
+       "paired_ratio_min": 0.8359522048339715,
+       "paired_ratio_max": 1.0543068459138982,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 2869613.0896235844,
+         "B": 2877856.203511304
+        }
+       }
+      },
+      {
+       "name": "BM_RingRteRtsSc/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 180678053.93366143,
+       "B_median": 176374671.51507735,
+       "paired_ratio_median": 0.9636823050869472,
+       "paired_ratio_min": 0.9424108260101025,
+       "paired_ratio_max": 1.073056897266689,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 2895089.623141191,
+         "B": 2970483.0086662164
+        }
+       }
+      },
+      {
+       "name": "BM_RingRteHtsSc/1",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 175196471.97332233,
+       "B_median": 179551821.49307802,
+       "paired_ratio_median": 1.0272122925597926,
+       "paired_ratio_min": 0.8768626548046177,
+       "paired_ratio_max": 1.100954849881071,
+       "pairs_B_better": 1,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 2986127.440919213,
+         "B": 2913131.42337244
+        }
+       }
+      }
+     ],
+     "seconds": 14.2
+    },
+    {
+     "target": "stats_bench",
+     "filter": "^BM_Threads(WorkerLocalUpdate|SharedRmw)/real_time/threads:2$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6934000,
+       "text": 5181518,
+       "data": 157016,
+       "bss": 31904
+      },
+      "B": {
+       "file_bytes": 6914216,
+       "text": 5113188,
+       "data": 163096,
+       "bss": 10248
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_ThreadsWorkerLocalUpdate/real_time/threads:2",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 1.754382046392688,
+       "B_median": 1.8813850314486267,
+       "paired_ratio_median": 1.0749886635894714,
+       "paired_ratio_min": 0.9888153189402686,
+       "paired_ratio_max": 1.1586172964344092,
+       "pairs_B_better": 1,
+       "pairs": 6,
+       "verdict": "B worse (+7.5% real_time)",
+       "counters": {
+        "items_per_second": {
+         "A": 1140015679.5895443,
+         "B": 1063297619.3450704
+        }
+       }
+      },
+      {
+       "name": "BM_ThreadsSharedRmw/real_time/threads:2",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 52.91196618290627,
+       "B_median": 51.13604315076967,
+       "paired_ratio_median": 0.9838597203658522,
+       "paired_ratio_min": 0.8222491162903326,
+       "paired_ratio_max": 1.179264039599551,
+       "pairs_B_better": 3,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 37916313.686938524,
+         "B": 39202575.0599658
+        }
+       }
+      }
+     ],
+     "seconds": 4.0
+    },
+    {
+     "target": "meter_bench",
+     "filter": "^BM_Threads(OneSharedMeter|ExclusiveMeterEach)/real_time/threads:2$",
+     "source": "identical",
+     "sizes": {
+      "A": {
+       "file_bytes": 6942400,
+       "text": 5188902,
+       "data": 157056,
+       "bss": 31712
+      },
+      "B": {
+       "file_bytes": 6922616,
+       "text": 5120388,
+       "data": 163104,
+       "bss": 10056
+      }
+     },
+     "rows": [
+      {
+       "name": "BM_ThreadsOneSharedMeter/real_time/threads:2",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 100.52234081211567,
+       "B_median": 95.2339369354006,
+       "paired_ratio_median": 0.973678006793639,
+       "paired_ratio_min": 0.6556714413006756,
+       "paired_ratio_max": 1.3862112559147084,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 19897323.11512859,
+         "B": 21006883.205166474
+        }
+       }
+      },
+      {
+       "name": "BM_ThreadsExclusiveMeterEach/real_time/threads:2",
+       "metric": "real_time",
+       "higher_is_better": false,
+       "unit": "ns",
+       "A_median": 13.97192858397641,
+       "B_median": 13.545046741595431,
+       "paired_ratio_median": 0.9766918809211148,
+       "paired_ratio_min": 0.8419802101871876,
+       "paired_ratio_max": 1.080376102517268,
+       "pairs_B_better": 4,
+       "pairs": 6,
+       "verdict": "no clear difference",
+       "counters": {
+        "items_per_second": {
+         "A": 143146841.6667174,
+         "B": 147659755.34445202
+        }
+       }
+      }
+     ],
+     "seconds": 4.7
+    }
+   ]
+  }
+ }
+}

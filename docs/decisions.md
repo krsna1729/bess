@@ -80,6 +80,7 @@ file is the reasoning.
 | D-057 | Execution layering: EAL extracted, framework no longer reaches runtime (M1) | accepted |
 | D-058 | M1/M2 closure: enforceable include rules, classified installs | accepted |
 | D-059 | One logging backend: glog included only through utils/logging.h, after absl | accepted |
+| D-060 | InterfaceId is 16 bits: a next hop stays 16 bytes | accepted |
 
 
 ---
@@ -3388,6 +3389,9 @@ pinned to one P-core, `--benchmark_min_time=0.5s`.
   inline changed nothing. I found no code change that removes the gap, so it
   is recorded as measured: a single-domain `Router` is 2-11% slower on this
   one benchmark, with identical instruction streams.
+  *(Annotation, 2026-10-03: not reproduced in isolation. c0320737 against 00f9461a, 16 ABBA pairs,
+  `omarchy-benchmark --isolate --cpu 2`: 1K and 16K routes no difference, 64K +3.6% (15/16). The larger Router
+  regression found later came from M7's wider `NextHop`; see D-060.)*
 - A control build of HEAD (`git archive` into a separate tree, same options)
   reproduced the 213 / 239 / 267 figures, so the baseline binary was not stale.
 
@@ -3562,7 +3566,7 @@ deliberately left that to M7.
 
 **Decision.**
 
-- `dataplane::InterfaceId` (`StrongId<_, uint32_t>`, zero = no interface)
+- `dataplane::InterfaceId` (`StrongId<_, uint32_t>`, zero = no interface; *now 16 bits, D-060*)
   names a logical forwarding endpoint. `NextHop::egress` is an `InterfaceId`
   defaulting to none. `route/` no longer includes `gate.h`; `router.cc` moved
   from `bess_framework` to `bess_route`, and the grandfathered link exception
@@ -5203,3 +5207,46 @@ a plugin that includes `<glog/logging.h>` itself before any BESS header would st
 
 **Revisit when:** BESS stops depending on glog or protobuf stops using absl logging (then the wrapper can go); a
 release build (NDEBUG) needs the absl references from protobuf inline code counted again.
+
+## D-060 InterfaceId is 16 bits: a next hop stays 16 bytes
+
+**Status:** accepted (2026-10-03). Supersedes D-049's width (32 bits); the rest of D-049 stands.
+**Code:** `core/dataplane/interface_id.h`, `core/route/router.h` (`static_assert(sizeof(NextHop) == 16)`),
+`core/modules/router.cc` (gate mapping), `core/dataplane/identity_test.cc`, `core/route/route_bench.cc`,
+`core/route/route_domain_bench.cc`, `docs/performance-contract.md`.
+
+**Context.** The M0 paired baseline (f4fdab03 against e035e892, isolated, 6 ABBA pairs) found
+`route_bench:BM_LookupRouter/1024` 15.5% slower (6/6 pairs). Bisected with paired runs (16 pairs each,
+`omarchy-benchmark --isolate --cpu 2`, no device interrupts on the benchmark CPU):
+- f4fdab03 against c0320737 (the 12 commits before M6): no difference on any row;
+- 3c3eb61f against 5e571feb (the Meson library split): no difference;
+- c0320737 against 00f9461a (M6): 1K and 16K routes no difference, 64K +3.6% (15/16 pairs);
+- **00f9461a against d7e961e7 (M7): 1K +14.1% (16/16), 16K +3.9% (16/16)**, 64K no difference.
+
+M7 made `NextHop::egress` a 32-bit `InterfaceId` (was a 16-bit `gate_idx_t`). `sizeof(NextHop)` went from 16
+(align 2) to 20 (align 4): a 64-byte line holds 3.2 next hops instead of 4, and some straddle two lines. The cost
+shows where the next-hop table is hot (1K routes) and fades when the FIB's own lines dominate (64K).
+
+**Decision.** `InterfaceId` is `StrongId<_, uint16_t>` (65,535 endpoints; a module's gate space is 8,192), so
+`NextHop` is 16 bytes again, and `router.h` asserts it. The id rule in `docs/performance-contract.md` now says an
+id stored in a hot per-packet structure is as narrow as its range allows; 32 bits stays the rule for a handle's
+slot and for ids carried in packet metadata or hardware marks. A runtime that needs more endpoints, or puts one
+in a hardware mark, widens at that boundary. `GenerationHandle` still requires a 32-bit id; no production handle
+used `InterfaceId`, and the identity tests now use `ActionId` for handles. The interface-to-gate mapping does its
+subtraction in 32 bits, as before, so interface 0 still maps to `DROP_GATE` in one compare.
+
+**Evidence.**
+- Develop (00101723) against develop with this change, 16 pairs, isolated: `BM_LookupRouter/1024` -10.3%
+  (0.897, 16/16), 16K -4.0% (15/16), 64K no difference; `BM_NextHopUpdate` no difference. Against the pre-M7
+  numbers, by multiplying the two paired ratios from separate sessions [INFERENCE]: 1K about +2%, 16K about even.
+- A first experiment (only the id width changed) gave -9.8% (16/16), the same result.
+- Fast suite 112/112; Clang 22 `-fsyntax-only` on the changed library and test files; both route benchmarks built
+  in a release tree (GCC 16).
+
+**Not done.** The remaining ~2% at 1K (if real) is not explained: M7 also moved `router.cc` from `bess_framework`
+to `bess_route` (link layout), which was not isolated. M0's `BM_NextHopUpdate/1024` +10% was not reproduced in
+any bisect pair (all no difference); it is unexplained and may be a layout effect of the M0 build. D-046's
+"single-domain Router 2-11% slower" was not reproduced in isolation (see the annotation there).
+
+**Revisit when:** an interface must cross a hardware mark or packet metadata (widen there, not in `NextHop`);
+`NextHop` gains a field (the `static_assert` fails first); a deployment needs more than 65,535 endpoints.

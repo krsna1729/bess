@@ -4809,6 +4809,39 @@ rather than one call site).
        200 TUs); the cold-build effect was not measured.
      - **Found by:** the independent reviewer (Opus 5.5) during the D-058 addendum review.
 
+143. **M0 paired baseline; the Router regression bisected to M7 and fixed (D-060).**
+     - **M0 baseline** (`tools/run_m0_baseline.py`, result `docs/baselines/m0-baseline.json`): f4fdab03 (A,
+       pre-modernization) against e035e892 (B), release `-O3 -Dcpu=x86-64-v3`, same DPDK, 6 ABBA pairs per case,
+       `omarchy-benchmark --isolate` (CPU 2; 2,4 for the threaded group). The wrapper's diagnostics show timer,
+       function-call, TLB-shootdown, rescheduling and thermal interrupts and timer/scheduler/RCU softirqs on the
+       benchmark CPUs; no device interrupts on CPU 2, but the threaded group had vmd0 (214) and iwlwifi (52)
+       interrupts on CPU 4. 92 rows (82 no clear difference); called only when the median paired ratio is outside +/-3% and 3/4 of the pairs agree:
+       - B better: `BM_DirectTypedLookup/1` -18.1%, `BM_K34_Cuckoo_Runtime/1` -3.6%, `BM_K34_Cuckoo_Table/3`
+         -5.3%, `BM_Masked_Legacy` -5.9%, `BM_NewEndToEnd` (ExactMatch) -6.2%;
+       - B worse: `BM_LookupRouter/1024` +15.5% (below), `BM_NextHopUpdate/1024` +10.0%, `BM_TypedTableLookup/1`
+         +22.9% and `/32` +3.3%, `BM_ThreadsWorkerLocalUpdate` (2 threads) +7.5%;
+       - every other row (packet, checksum, meter, stats, FIB, RCU, object table, transactions, rings, slot
+         table) no clear difference.
+       `BM_DirectTypedLookup/1` and `BM_TypedTableLookup/1` (sub-nanosecond loops) swapped values between A and B,
+       which looks like code placement rather than a code change [INFERENCE]; not investigated further.
+     - **Router bisect** (16 ABBA pairs per step, CPU 2 isolated, no device interrupts): nothing in f4fdab03 ->
+       c0320737 (including the Meson library split); M6 (00f9461a) no difference at 1K/16K routes and +3.6% at
+       64K; **M7 (d7e961e7) +14.1% at 1K, +3.9% at 16K**. M7 made `NextHop::egress` a 32-bit `InterfaceId`, and
+       `NextHop` grew from 16 to 20 bytes. D-046's "2-11%" for M6 was not reproduced (annotated).
+     - **Fix (D-060, the user's choice among narrowing, accepting, or repacking):** `InterfaceId` is 16 bits and
+       `NextHop` is asserted to be 16 bytes. Develop against develop+fix: `BM_LookupRouter/1024` -10.3% (16/16),
+       16K -4.0% (15/16), 64K and `BM_NextHopUpdate` no difference. The performance contract's id-width rule is
+       restated (narrow when stored in a hot structure; 32 bits for handle slots and ids in metadata or marks).
+     - **Open:** M0's `BM_NextHopUpdate/1024` +10% did not reproduce in any bisect pair; `BM_ThreadsWorkerLocalUpdate`
+       +7.5% (run on CPUs 2,4 in the window with CPU 4's device interrupts) and `BM_TypedTableLookup/32` +3.3% are
+       not bisected; a possible ~2% residual at 1K routes after the fix
+       [INFERENCE from multiplying ratios of separate sessions].
+     - **Tooling:** `tools/ab_bench.py` reads results from `--benchmark_out` (EAL output on stdout had corrupted
+       earlier runs); the M0 runner derives its lock and DPDK paths from the main checkout, and accepts a source
+       that differs from f4fdab03 only by D-059's logging include (recorded per file), so it reruns against
+       develop as well as against e035e892, the B of the committed result. The committed result is schema `/1` (written
+       before those two checks); the runner now writes `/2`.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
