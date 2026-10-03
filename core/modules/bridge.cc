@@ -5,17 +5,33 @@
 #include <cstring>
 #include <vector>
 
+#include "utils/ether.h"
 #include "utils/format.h"
 #include "utils/time.h"
 
 namespace {
 
 using bess::utils::Ethernet;
+namespace l2 = bess::l2;
+namespace dataplane = bess::dataplane;
 
-uint64_t MacToUint64(const Ethernet::Address &addr) {
-  uint64_t v = 0;
-  std::memcpy(&v, addr.bytes, Ethernet::Address::kSize);
-  return v;
+const l2::BridgeDomainId kDomain(0);
+// Aging in nanoseconds of the worker's TSC clock; wheel granularity 2^20 ns.
+constexpr unsigned kGranularityShift = 20;
+// Wheel work per batch; aging lags at most a few batches behind.
+constexpr size_t kAgeBudget = 256;
+
+l2::MacAddress ToMac(const Ethernet::Address &a) {
+  l2::MacAddress m;
+  std::memcpy(m.bytes.data(), a.bytes, 6);
+  return m;
+}
+// Gate g <-> interface g + 1, DROP_GATE included.
+dataplane::InterfaceId InterfaceOfGate(gate_idx_t g) {
+  return dataplane::InterfaceId(static_cast<uint16_t>(g + 1));
+}
+gate_idx_t GateOfInterface(dataplane::InterfaceId i) {
+  return static_cast<gate_idx_t>(i.value() - 1);
 }
 
 }  // namespace
@@ -31,7 +47,20 @@ const Commands Bridge::cmds = {
 
 CommandResponse Bridge::Init(const bess::pb::BridgeArg &arg) {
   max_entries_ = arg.size() ? arg.size() : 1024;
-  aging_time_sec_ = arg.aging_time() ? arg.aging_time() : 300;
+  const uint64_t aging_sec = arg.aging_time() ? arg.aging_time() : 300;
+  l2::Fdb::Config config;
+  config.capacity = max_entries_ + kStaticReserve;
+  config.learn_limit = max_entries_;
+  config.aging = aging_sec * 1'000'000'000ull;
+  config.granularity_shift = kGranularityShift;
+  config.max_domains = 1;
+  config.start = tsc_to_ns(rdtsc());
+  auto fdb = l2::Fdb::Create(config);
+  if (!fdb) {
+    return CommandFailure(ENOMEM, "cannot create the FDB for %u entries",
+                          max_entries_);
+  }
+  fdb_ = std::move(*fdb);
   return CommandSuccess();
 }
 
@@ -44,14 +73,17 @@ CommandResponse Bridge::CommandAdd(const bess::pb::BridgeCommandAddArg &arg) {
   if (!bess::IsValidGateValue(arg.gate())) {
     return CommandFailure(EINVAL, "invalid output gate: %u", arg.gate());
   }
-
-  uint64_t key = MacToUint64(mac);
-  fdb_[key] = Entry{
-      .gate = static_cast<gate_idx_t>(arg.gate()),
-      .last_seen_sec = 0,
-      .is_static = true,
-  };
-  return CommandSuccess();
+  switch (fdb_->AddStatic(kDomain, ToMac(mac),
+                          InterfaceOfGate(static_cast<gate_idx_t>(arg.gate())))) {
+    case l2::ProgramResult::kAdded:
+    case l2::ProgramResult::kReplaced:
+      return CommandSuccess();
+    case l2::ProgramResult::kInvalid:
+      return CommandFailure(EINVAL, "a multicast MAC cannot be a static entry");
+    case l2::ProgramResult::kFull:
+      break;
+  }
+  return CommandFailure(ENOSPC, "FDB full (%zu entries)", fdb_->capacity());
 }
 
 CommandResponse Bridge::CommandDelete(
@@ -61,42 +93,38 @@ CommandResponse Bridge::CommandDelete(
     return CommandFailure(EINVAL, "invalid MAC address: '%s'",
                           arg.mac_addr().c_str());
   }
-
-  uint64_t key = MacToUint64(mac);
-  if (fdb_.erase(key) == 0) {
+  if (!fdb_->Remove(kDomain, ToMac(mac))) {
     return CommandFailure(ENOENT, "MAC address not found in FDB");
   }
   return CommandSuccess();
 }
 
 CommandResponse Bridge::CommandClear(const bess::pb::BridgeCommandClearArg &) {
-  fdb_.clear();
+  fdb_->Flush(/*static_too=*/true);
   return CommandSuccess();
 }
 
-void Bridge::ExpireEntries(uint64_t now_sec) {
-  for (auto it = fdb_.begin(); it != fdb_.end();) {
-    if (!it->second.is_static &&
-        (now_sec - it->second.last_seen_sec > aging_time_sec_)) {
-      it = fdb_.erase(it);
-    } else {
-      ++it;
+void Bridge::Flood(Context *ctx, bess::PacketRef pkt, gate_idx_t,
+                   const std::vector<gate_idx_t> &flood_gates) {
+  if (flood_gates.empty()) {
+    DropPacket(ctx, pkt);
+    return;
+  }
+  for (size_t g = 1; g < flood_gates.size(); g++) {
+    bess::PacketRef copy(bess::PacketCopy(pkt.handle()));
+    if (copy.handle() != nullptr) {
+      EmitPacket(ctx, copy, flood_gates[g]);
     }
   }
+  EmitPacket(ctx, pkt, flood_gates[0]);
 }
 
 void Bridge::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const int cnt = batch->cnt();
   const gate_idx_t igate = ctx->current_igate;
-  const uint64_t now_sec =
-      tsc_to_ns(current_worker.current_tsc()) / 1'000'000'000ULL;
+  const uint64_t now = tsc_to_ns(current_worker.current_tsc());
+  fdb_->Age(now, kAgeBudget);
 
-  // Periodically clean expired entries if table grows
-  if (fdb_.size() >= max_entries_) {
-    ExpireEntries(now_sec);
-  }
-
-  // Pre-collect active flooding gates (all output gates except ingress gate)
   std::vector<gate_idx_t> flood_gates;
   const auto &out_gates = ogates();
   for (size_t g = 0; g < out_gates.size(); g++) {
@@ -104,85 +132,34 @@ void Bridge::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       flood_gates.push_back(static_cast<gate_idx_t>(g));
     }
   }
+  const dataplane::InterfaceId ingress = InterfaceOfGate(igate);
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
     if (unlikely(pkt.head_len() < sizeof(Ethernet))) {
       DropPacket(ctx, pkt);
       continue;
     }
-
     const Ethernet *eth = pkt.head_data<const Ethernet *>();
-    const bool src_multicast = (eth->src_addr.bytes[0] & 1) != 0;
-    const bool dst_multicast = (eth->dst_addr.bytes[0] & 1) != 0;
+    // Learning ignores multicast sources and keeps static entries.
+    (void)fdb_->Learn(kDomain, ToMac(eth->src_addr), ingress, now);
 
-    // 1. MAC Learning: learn arrival gate for unicast source MAC
-    if (likely(!src_multicast)) {
-      const uint64_t src_key = MacToUint64(eth->src_addr);
-      auto it = fdb_.find(src_key);
-      if (it != fdb_.end()) {
-        if (!it->second.is_static) {
-          it->second.gate = igate;
-          it->second.last_seen_sec = now_sec;
-        }
-      } else if (fdb_.size() < max_entries_) {
-        fdb_[src_key] = Entry{
-            .gate = igate,
-            .last_seen_sec = now_sec,
-            .is_static = false,
-        };
-      }
-    }
-
-    // 2. MAC Forwarding
-    if (unlikely(dst_multicast)) {
-      // Broadcast/Multicast -> Flood
-      if (flood_gates.empty()) {
-        DropPacket(ctx, pkt);
-      } else {
-        for (size_t g = 1; g < flood_gates.size(); g++) {
-          bess::PacketRef copy(bess::PacketCopy(pkt.handle()));
-          if (copy.handle() != nullptr) {
-            EmitPacket(ctx, copy, flood_gates[g]);
-          }
-        }
-        EmitPacket(ctx, pkt, flood_gates[0]);
-      }
+    if (unlikely((eth->dst_addr.bytes[0] & 1) != 0)) {
+      Flood(ctx, pkt, igate, flood_gates);
       continue;
     }
-
-    // Unicast lookup
-    const uint64_t dst_key = MacToUint64(eth->dst_addr);
-    auto it = fdb_.find(dst_key);
-    if (it != fdb_.end() &&
-        (it->second.is_static ||
-         (now_sec - it->second.last_seen_sec <= aging_time_sec_))) {
-      const gate_idx_t out_gate = it->second.gate;
-      if (out_gate == igate) {
-        // Hairpin filter: packet destined to same segment -> drop
-        DropPacket(ctx, pkt);
-      } else {
-        // Forward to learned gate
-        EmitPacket(ctx, pkt, out_gate);
-      }
+    const dataplane::InterfaceId out = fdb_->Lookup(kDomain, ToMac(eth->dst_addr));
+    if (out == dataplane::kInvalidInterfaceId) {
+      Flood(ctx, pkt, igate, flood_gates);
+    } else if (out == ingress) {
+      DropPacket(ctx, pkt);  // hairpin
     } else {
-      // Unknown unicast -> Flood
-      if (flood_gates.empty()) {
-        DropPacket(ctx, pkt);
-      } else {
-        for (size_t g = 1; g < flood_gates.size(); g++) {
-          bess::PacketRef copy(bess::PacketCopy(pkt.handle()));
-          if (copy.handle() != nullptr) {
-            EmitPacket(ctx, copy, flood_gates[g]);
-          }
-        }
-        EmitPacket(ctx, pkt, flood_gates[0]);
-      }
+      EmitPacket(ctx, pkt, GateOfInterface(out));
     }
   }
 }
 
 std::string Bridge::GetDesc() const {
-  return bess::utils::Format("%zu FDB entries, max %u", fdb_.size(),
+  return bess::utils::Format("%zu FDB entries, max %u", fdb_->size(),
                              max_entries_);
 }
 

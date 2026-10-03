@@ -4957,6 +4957,18 @@ rather than one call site).
      1 ns of each other; the plan is 1-7 ns slower than hand-written code in every case. Decision gate: keep it
      experimental and opt-in; typed rewrites do not go through it. UDP checksums and per-packet old values are not
      expressible (no branches).
+152. **M14 L2 forwarding database (D-064).** `l2/fdb.h`: exact (bridge domain, MAC) -> `InterfaceId` lookup,
+     learning (refresh, move, refuse multicast and the invalid interface, a learn limit), static entries, aging on
+     the M10 `ExpiryWheel`, flood groups and a VLAN -> domain map; no `Module` or gate dependency (include rule for
+     `core/l2/`). `l2/mac_table.h`: the backend, a two-choice cuckoo table of 64-byte buckets with four contiguous
+     keys. Bridge is now a thin adapter over it (protobuf unchanged; static entries bounded at `size` + 1,024);
+     L2Forward stays on the mode-C `l2_table` (user review requested). Isolated, 1K / 64K / 1M uniform hits:
+     FDB 4.1 / 5.3 / 8.9 ns scalar, `l2_table` 3.2 / 4.0 / 5.9, the pre-M14 `unordered_map` 8.7 / 16.0 / 23.1,
+     the flow substrate 3.3 / 5.5 / 20.8. Learning 1.7-2.7x faster than the `unordered_map`. Four lookup costs were
+     found and fixed while building it (store-forwarding key build, mispredicting probe, scalar probe, linear CRC
+     pair); the 1M rows remain 1.5-3.2x behind `l2_table` (TLB reach, twice the footprint; not closed). Eleven of
+     thirteen mutants caught; the displacement-cycle guard is unreachable at 50% load, and a wheel Schedule
+     refusal needs 2^31 armings of one node. Reviewed: two rounds.
 
 ## Review process established this session
 
