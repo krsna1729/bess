@@ -95,6 +95,16 @@ namespace bess::flow {
 
 enum class StateSharing : uint8_t { kOwnedByCreator, kSharedMutable };
 
+// A test seam: the table calls it inline at the one point of Erase where the
+// flow's generation has moved on and its keys are still in the directory (the
+// window in which every key must already resolve to nothing). Under the writer
+// lock; must not call a mutating operation of the table. The default is empty
+// and occupies no space, so a production table compiles to the same code with
+// or without the call (checked in the disassembly, D-056).
+struct NoSharedFlowTableHook {
+  void AfterEraseGenerationStore() noexcept {}
+};
+
 struct DefaultSharedFlowTableTraits {
   static constexpr size_t kAliases = 0;
   // Slots return in the order they were erased, spreading reuse over every
@@ -104,6 +114,7 @@ struct DefaultSharedFlowTableTraits {
   using Observer = NoFlowObserver;  // called under the writer lock
   using Owner = DefaultOwner;       // checks kOwnedByCreator access
   using Allocator = DefaultFlowAllocator;
+  using Hook = NoSharedFlowTableHook;  // tests only
 };
 
 template <typename Key, typename State,
@@ -118,6 +129,7 @@ class SharedFlowTable {
   using key_type = Key;
   using state_type = State;
   using Observer = typename Traits::Observer;
+  using Hook = typename Traits::Hook;
 
   static constexpr size_t kAliases = Traits::kAliases;
   static constexpr StateSharing kSharing = Traits::kSharing;
@@ -125,6 +137,9 @@ class SharedFlowTable {
   static constexpr bool kSharedMutable = kSharing == StateSharing::kSharedMutable;
 
   static_assert(kAliases <= 14, "alias key bits must fit the slot's key mask");
+  static_assert(
+      requires(Hook &hook) { { hook.AfterEraseGenerationStore() } noexcept; },
+      "Traits::Hook needs a noexcept AfterEraseGenerationStore()");
 
   // `capacity` flows. The directory and the slot array are allocated here and
   // never grow. `domain` must outlive the table. Needs the EAL (the directory
@@ -699,6 +714,7 @@ class SharedFlowTable {
     // nothing). The State and the slot wait for readers that may be using them.
     const uint32_t next = slot.LoadGeneration() + 1;  // odd -> even
     slot.StoreGeneration(next);
+    hook_.AfterEraseGenerationStore();
     for (size_t j = 0; j < kKeysPerSlot; j++) {
       if (slot.key_mask >> j & 1) {
         EraseKey(*slot.key_ptr(j));
@@ -755,15 +771,22 @@ class SharedFlowTable {
     return freed;
   }
 
+  // Read by every lookup and never written after Create: one cache line of
+  // their own. Everything a create or erase writes (the counters, the lock, the
+  // observer) starts on the next line, so a writer's stores do not invalidate
+  // the line every reader loads (D-056: with them together, a churning writer
+  // cost the readers 15-19% (busy machine; 18-20% inferred when isolated) and
+  // the writer 1.2-1.5x (isolated)).
   rcu::RcuDomain &domain_;
   std::unique_ptr<classifier::ConcurrentExactTable> directory_;
-  [[no_unique_address]] Observer observer_;
   Slot *slots_ = nullptr;
   uint32_t capacity_ = 0;
-  std::atomic<uint32_t> size_{0};
+  alignas(64) std::atomic<uint32_t> size_{0};
   std::atomic<uint32_t> quarantined_{0};
   std::atomic<uint32_t> pending_published_{0};
   mutable rte_spinlock_t lock_;
+  [[no_unique_address]] Observer observer_;
+  [[no_unique_address]] Hook hook_;
   // Guarded by lock_:
   detail::FreeList free_;
   uint32_t *pending_ = nullptr;

@@ -215,6 +215,14 @@ may come from any thread and are serialized by one spinlock.
   `Peek`; `FindOwned`/`LookupOwned` return `State *` and, under a checked
   `Traits::Owner`, abort if the caller is not the thread that created the flow.
 - The table must be destroyed after the workers stopped using it.
+- The table's reader-side fields (directory pointer, slot array, capacity) are
+  on a cache line of their own, and the counters, lock and observer that every
+  create and erase writes are on the next, so a writer does not invalidate the
+  line every lookup loads (D-056 has the measurement).
+- `Traits::Hook` (default `NoSharedFlowTableHook`, empty, no code) is a test
+  seam called inside `Erase` between the generation store and the first
+  directory erase; the tests use it to prove that every key already resolves to
+  nothing there. Applications leave it alone.
 
 ## Memory
 

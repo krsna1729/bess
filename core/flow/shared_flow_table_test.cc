@@ -420,6 +420,19 @@ struct CountedLifoTraits : CountedTraits {
 using CountedTable = SharedFlowTable<uint64_t, Counted, CountedTraits>;
 using CountedLifoTable = SharedFlowTable<uint64_t, Counted, CountedLifoTraits>;
 
+// Calls `probe` inside Erase, between the generation store and the first key
+// leaving the directory. Empty by default in production tables.
+struct EraseWindow {
+  static inline std::function<void()> probe;
+  void AfterEraseGenerationStore() noexcept {
+    if (probe) probe();
+  }
+};
+struct WindowTraits : CountedTraits {
+  using Hook = EraseWindow;
+};
+using WindowTable = SharedFlowTable<uint64_t, Counted, WindowTraits>;
+
 classifier::ConstBytes KeyBytes(const uint64_t &key) {
   return classifier::ConstBytes(reinterpret_cast<const std::byte *>(&key),
                                 sizeof(key));
@@ -741,6 +754,55 @@ TEST_F(SharedFlowTablePlacementTest, NoKeyOfAFlowResolvesBeforeAllOfThemDo) {
   EXPECT_EQ(3u, t->FindBatch(both, found));
   EXPECT_EQ(made.state, found[0]);
   EXPECT_EQ(made.state, found[1]);
+}
+
+// The same window on the way out, deterministic on any number of CPUs: the
+// hook runs in Erase after the generation has moved on and before any key has
+// left the directory. Every key of the flow must already resolve to nothing, so
+// a reader cannot find an alias and miss the primary (or the reverse), and the
+// directory must still hold the keys (the probe is in the window it claims).
+TEST_F(SharedFlowTablePlacementTest, EveryKeyOfAnErasedFlowResolvesToNothingBeforeAnyLeavesTheDirectory) {
+  auto t = Make<WindowTable>(16);
+  constexpr uint64_t kKey = 100, kAlias = 200;
+  const auto made = t->EmplaceAliased(kKey, kAlias, 5);
+  ASSERT_TRUE(made.created());
+  ASSERT_EQ(made.state, t->Find(kAlias));
+  int probes = 0;
+  // Cleared on every exit, including a failed ASSERT: the probe captures locals.
+  struct ClearProbe {
+    ~ClearProbe() { EraseWindow::probe = nullptr; }
+  } clear_probe;
+  EraseWindow::probe = [&] {
+    probes++;
+    EXPECT_TRUE(InDirectory(t->directory(), kKey)) << "the probe is not in the window";
+    EXPECT_TRUE(InDirectory(t->directory(), kAlias)) << "the probe is not in the window";
+    for (uint64_t k : {kKey, kAlias}) {
+      EXPECT_EQ(nullptr, t->Peek(k)) << "key " << k;
+      EXPECT_EQ(nullptr, t->Find(k)) << "key " << k;
+      EXPECT_EQ(kNoFlow, t->FindHandle(k).handle) << "key " << k;
+    }
+    EXPECT_EQ(nullptr, t->Peek(made.handle));
+    EXPECT_EQ(nullptr, t->Lookup(made.handle));
+    EXPECT_FALSE(t->Alive(made.handle));
+    const uint64_t both[2] = {kKey, kAlias};
+    const Counted *peeked[2] = {nullptr, nullptr};
+    EXPECT_EQ(0u, t->PeekBatch(both, peeked));
+    Counted *found[2] = {nullptr, nullptr};
+    EXPECT_EQ(0u, t->FindBatch(both, found));
+    EXPECT_EQ(nullptr, found[0]);
+    EXPECT_EQ(nullptr, found[1]);
+  };
+  // Erase through the alias, then through the handle: both paths.
+  EXPECT_TRUE(t->Erase(kAlias));
+  EXPECT_EQ(1, probes);
+  EXPECT_EQ(0u, t->directory().size());
+  const auto again = t->EmplaceAliased(kKey, kAlias, 6);
+  ASSERT_TRUE(again.created());
+  EXPECT_TRUE(t->Erase(again.handle));
+  EXPECT_EQ(2, probes);
+  EraseWindow::probe = nullptr;
+  EXPECT_EQ(nullptr, t->Find(kKey));
+  EXPECT_EQ(nullptr, t->Find(kAlias));
 }
 
 template <typename Table>
