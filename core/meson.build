@@ -458,6 +458,7 @@ core_public_headers = files(
   'packet_checksum.h',
   'packet_cursor.h',
   'packet_handle.h',
+  'packet_edit_plan.h',
   'packet_mutation.h',
   'packet_pool.h',
   'packet_reshape.h',
@@ -624,6 +625,7 @@ unit_test_sources = [
   'packet_checksum_test.cc',
   'packet_tx_checksum_test.cc',
   'packet_mutation_test.cc',
+  'packet_edit_plan_test.cc',
   'packet_reshape_test.cc',
   'port_test.cc',
   'shared_obj_test.cc',
@@ -766,6 +768,7 @@ if get_option('build_benchmarks')
   benchmark_sources = {
     'fib_bench': ['fib_bench.cc', benchmark_dep],
     'mempool_bench': ['mempool_bench.cc', benchmark_dep],
+    'packet_edit_plan_bench': ['packet_edit_plan_bench.cc', benchmark_main_dep],
     'packet_bench': ['packet_bench.cc', benchmark_dep],
     'packet_checksum_bench': ['packet_checksum_bench.cc', benchmark_main_dep],
     'packet_tx_checksum_bench': ['packet_tx_checksum_bench.cc', benchmark_main_dep],
