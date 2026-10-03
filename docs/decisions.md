@@ -90,6 +90,7 @@ file is the reasoning.
 | D-067 | Connection tracking: a library over the flow table and the expiry wheel (M17) | accepted |
 | D-068 | NAT as a library: bindings on the flow table, a bitmap port pool, generic expiry (M18) | accepted |
 | D-069 | Tunnel packet mechanics: VXLAN, Geneve, GRE and a GTP-U header codec (M19) | accepted |
+| D-070 | Hardware flow rules: a lifecycle owner, not a flow IR (M20) | accepted |
 
 
 ---
@@ -6154,3 +6155,96 @@ VXLAN-GPE; a module adapter for Geneve, GRE or GTP-U (none existed); `IPEncap`/`
 
 **Revisit when:** a consumer needs Geneve option TLVs, IPv6 underlays (then the UDP checksum is mandatory), or a
 GTP-U control path.
+
+## D-070 Hardware flow rules: a lifecycle owner, not a flow IR (M20)
+
+**Status:** accepted (2026-10-04), experimental API. Software only: the real-hardware certification matrix (Intel,
+NVIDIA/Mellanox, virtio/representors) is not run — no NIC is available here — and stays a separate, non-blocking
+gate.
+**Code:** `core/offload/flow_rule_owner.h`, `core/offload/fake_flow_backend.h`, `core/offload/rte_flow_backend.h`
+(new, header-only, installed experimental), `core/offload/flow_rule_owner_test.cc`, `core/meson.build`,
+`tools/check_includes.py`, `tools/api_classes.json`.
+
+**Context.** Roadmap M20: let applications compile their own decisions to NIC flow rules while BESS supplies resource
+ownership, asynchronous lifecycle and reconciliation; no BESS flow IR that mirrors `rte_flow`; testable without
+hardware.
+
+**Decision.**
+- `FlowRuleOwner<Backend>` owns rules, not their meaning. The application passes its backend's native rule (for
+  `RteFlowBackend`, an `rte_flow_attr` and its pattern and action arrays as built for `rte_flow_create`) and a cookie
+  (its continuation or software decision). The owner tracks the port, an explicit state — preparing, submitted,
+  installed, failed, removing, removed, unknown after a device reset — and a generation-tagged `FlowRuleHandle`, so a
+  handle kept past its rule never names the next rule in that slot.
+- Asynchronous completion is explicit: `Install` returns a submitted rule; only a completion delivered by `Poll`
+  makes it installed (or failed). A rule removed while submitted is removed once installed. A failed rule keeps its
+  handle until the application removes it (after choosing its fallback). A removal the device refuses or fails
+  leaves the rule installed, with its MARK and hardware handle (DPDK keeps a rule whose destroy failed): `Remove`
+  returns false, a failed completion and a refused deferred removal are reported by `Poll` as installed with the
+  error. The completion callback may act on its rule; the owner looks the rule up again afterwards.
+- Bounded outstanding requests (`max_outstanding`): `Install` returns `kBackpressure`; removals beyond the bound wait
+  in a queue (`RetryPendingRemovals`). `RemoveAll(port)` for teardown; `Stats` through the backend.
+- MARK identity: the owner hands out MARK values and maps them back to cookies (`MarkCookie`) only while the rule is
+  installed. A value is reused only after its rule's removal completed and the application has since drained the
+  port's receive queues (`NoteDrained`), so a packet marked by an old rule can never map to a new one. A rule that
+  never reached the device returns its value at once; after a reset, values drain as for a removal.
+- Reset: `OnDeviceReset(port)` makes every rule there unknown (and forgets its in-flight requests);
+  `Reconcile(port, fn)` lets the application decide per rule, retiring the old handles; late completions for rules a
+  reset made unknown are ignored.
+- Capability reporting comes from the backend per port (`FlowCapabilities`): the device's answers, not assumed
+  booleans. Only `supported` gates `Install`: for `RteFlowBackend` it means the port has rte_flow operations
+  (`rte_flow_validate`, a stable API, answers something other than ENOSYS). The other fields are hints for the
+  application's compiler: the PMD's `rte_flow_validate` answer for one sample ingress rule each (match an IPv4
+  destination and a UDP port, fully masked; then with MARK, with COUNT, over VXLAN, and with the transfer
+  attribute), each with a QUEUE 0 or else DROP fate. A PMD can refuse a sample and accept the application's rule
+  (i40e, for example, refuses wildcard-only patterns), so hints never refuse an install; the device's answer for
+  the rule does (`kRefused`, or a failed completion). `mark_bits` is a lower bound: the widest of 32, 24, 16 and 8
+  bits whose top bit the PMD accepts as a MARK value (mlx5 reserves values from 0xfffff0, so all-ones values would
+  under-report). A positive answer is kept per port (`Reprobe` after reconfiguration or a reset); a negative one is
+  asked again. `Validate(port, rule)` asks about the application's own rule (the native escape hatch). `max_rules`
+  stays unknown and template or queue support unreported: `rte_flow_info_get` is still experimental DPDK API, which
+  BESS does not enable. An owner whose MARK values (`mark_base + marks - 1`) would pass 32 bits refuses every
+  install (`kUnsupported`).
+- `RteFlowBackend` uses the synchronous `rte_flow_create`/`rte_flow_destroy`, queuing their results for `Poll`, so
+  the owner's state machine is the same as for an asynchronous backend; a MARK action the application leaves with a
+  null `conf` is filled with the owner's value. `InstallBatch` submits rules in order and stops at the first one not
+  submitted.
+- `FakeFlowBackend` (installed, for applications' tests too): capability fixtures, requests that complete when the
+  test says (or at the next poll), injected refusals and failures, device reset, per-rule counters.
+
+**Evidence.** `offload_flow_rule_owner_test` 11/11 (fast build, gcc; `taskset -c 0` and `-c 0,1`): asynchronous install
+and removal with counters, failures and refusals releasing their resources, the outstanding bound and queued
+removals, MARK reuse only after removal and a drain of the same port, reset and reconciliation (including slot reuse
+under new generations), late completions after a reset, refused and failed removals keeping the rule and its MARK,
+a removal from inside the completion callback, only `supported` gating an install (hints off, the device's refusal
+reported), MARK values at and past 32 bits, batch install, and the `rte_flow` backend's no-device path (no ethdev is
+probed in unit tests). A throwaway program (EAL `--no-huge --vdev=net_null0`, output in the PR) ran the probe on a
+real ethdev: the null PMD has no flow operations, so `supported` is false (ENOSYS), `Validate` returns ENOSYS (38)
+and `Install` returns `kUnsupported`. The probe's sample rules have not met a PMD with flow operations. No benchmark: everything here is control path; the one packet-path read, `MarkCookie`, is an
+array index.
+
+**Mutation checks** (25 mutants of the final code: 23 caught, 2 equivalent; 32 runs, including two reruns after
+tests were strengthened and 4 mutants of a MARK-width gate that review removed, all caught): the MARK mapped at submit, a late completion
+counted, a MARK freed without a drain, any port's drain freeing it, no backpressure, reconciliation keeping handles,
+the generation not bumped (survived until the test reused both retired slots), a removal requested while submitted
+ignored, `RemoveAll` touching other ports, the MARK mapping not cleared when removal starts, a reset keeping MARK
+mappings, a refused submit leaking its slot; after review: a refused removal making the rule unknown, a failed
+removal retiring it, a refused deferred removal not reported, the MARK unmapped before a removal the device then
+refuses, and both guards against a second removal after the callback dropped (each alone is equivalent: either
+prevents it); a batch that does not stop; MARK values past 32 bits accepted, the 32-bit check off by one, an owner
+without MARKs held to the check (survived until the test used `mark_base` 0), the MARK hint gating an install, and
+`supported` not gating it.
+
+**Review** (reviewer agent): round 1 incorrect: a refused or failed removal let the MARK be reused while the rule
+still existed (and lost its hardware handle); a removal from the completion callback removed the rule twice; counts,
+index order and the capability comment. All fixed. Round 2: correct, go; the mutant count corrected. Round 3
+(capability probing, added to meet the roadmap's "actual capability" requirement): incorrect — an Ethernet-only
+wildcard probe gated installs and i40e refuses such rules (read in the DPDK source), all-ones MARK probes
+under-report mlx5's width, MARK ranges past 32 bits wrapped. Fixed as above.
+
+**Not done.** The real-hardware matrix (the probe has run only against the null PMD); the `rte_flow`
+template/asynchronous API (queues, templates, async create and destroy) and its limits (`rte_flow_info_get`);
+transfer rules beyond the capability probe; rule aging; publishing `MarkCookie` to workers (the owner is control-side; an
+application copies the map into an RCU object as it needs).
+
+**Revisit when:** a NIC lab is available (run the certification matrix), or a consumer needs the asynchronous
+template API.

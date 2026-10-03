@@ -162,6 +162,19 @@ FORBIDDEN_RULES = [
             ("pb/", "tunnel library must not depend on protobuf"),
         ],
     ),
+    # The offload seam (M20, D-070): no Module, gate, framework, runtime,
+    # control or protobuf.
+    (
+        re.compile(r"^core/offload/"),
+        [
+            ("module.h", "offload seam must not depend on Module"),
+            ("gate.h", "offload seam must not depend on gates"),
+            ("framework/", "offload seam must not depend on framework"),
+            ("runtime/", "offload seam must not depend on runtime"),
+            ("control/", "offload seam must not depend on control"),
+            ("pb/", "offload seam must not depend on protobuf"),
+        ],
+    ),
     # The flow-state library is graph-independent and sits below the worker: no
     # Module, gate, framework, runtime, control or protobuf, and no worker.h or
     # stats/current_worker.h (worker identity is an injected owner token; M9,
@@ -320,6 +333,7 @@ SELF_TEST_CASES = [
     ("core/dataplane/slot_table.h", '#include "classifier/classifier.h"', 1),
     ("core/dataplane/batch_stages.h", '#include "stats/worker_slots.h"', 1),
     ("core/flow/worker_flow_table.h", '#include "module.h"', 1),
+    ("core/offload/flow_rule_owner.h", '#include "module.h"', 1),
     ("core/l2/fdb.h", '#include "gate.h"', 1),
     ("core/conntrack/conntrack.h", '#include "gate.h"', 1),
     ("core/nat/nat.h", '#include "module.h"', 1),
