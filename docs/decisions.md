@@ -4272,6 +4272,9 @@ timer's own storage only:
 | periodic scan, 64 B records | 64 | 3.8 | 1.7 | 2.3 | 0.5 | 71.2 | 1.9 |
 | `rte_timer` | 120 | 243.6 | 237.0 | 428.8 | 212.5 | 7.0 | not measured |
 
+*(Annotation, 2026-10-03: the drain column is the 1 s spread (`uniform_1s`); schedule and cancel are the
+5-minute spread. See the addendum below.)*
+
 At 1M timers the wheel costs 6.0 schedule, 3.7 cancel, 16.4 uniform refresh and
 90 ns per expiry (about 26 us for the worst 64-unit poll). Each is slower than at
 64K; the likely cause is cache misses over 32 MB of nodes, which I did not
@@ -4368,6 +4371,41 @@ owner; a workload with over 10M timers or sub-microsecond granularity appears;
 the lazy refresh's extra array touch shows up in a profile of a real module
 (then use the owner-side style); M11 hand-off changes who may refresh a flow; or
 a consumer with one coarse timeout prefers the cheaper budgeted scan.
+
+
+**Addendum (2026-10-03): the "Not done" measurements, isolated.** `expiry_bench` at 71f6ac8b, release `-O3
+-Dcpu=x86-64-v3`, GCC 16.2.1, `omarchy-benchmark --isolate --cpu 2` with the performance governor (the table above
+was `powersave`). The wrapper showed timer, function-call, TLB, rescheduling and thermal interrupts and timer/scheduler/RCU
+softirqs on CPU 2, and no device interrupts. Raw output: `docs/baselines/m10-expiry.json`. Nanoseconds per operation; drain is the 5-minute
+spread with a 64-unit budget where the candidate takes one; worst poll is the single largest poll in three drains.
+
+| candidate | N | B/timer | schedule | cancel | refresh uniform | refresh hot 1% | poll, nothing due | drain per expiry | worst poll |
+|---|---|---|---|---|---|---|---|---|---|
+| wheel | 64K | 32 | 7.5 | 5.4 | 3.7 | 1.6 | 3.6 | 45.0 | 5.8 us |
+| wheel | 1M | 32 | 10.6 | 7.9 | 14.9 | 2.3 | 6.2 | 164.8 | 342 us |
+| wheel | **10M** | 32 | 9.8 | 5.6 | 22.9 | 4.7 | 33.2 | 243.2 | 52 us |
+| wheel, eager refresh | 1M | 32 | 9.4 | 7.0 | 66.9 | 9.9 | 6.9 | 189.1 | 35 us |
+| heap, lazy deletion | 1M | 93 | 27.8 | 0.5 | 1.8 | 0.6 | 5.8 | 396.1 | 230 us |
+| scan, flat array | 1M | 8 | 0.6 | 0.3 | 1.8 | 1.3 | 44.8 | 0.9 | 4.8 us |
+| scan, flat array | **10M** | 8 | 2.0 | 0.7 | 7.8 | 1.5 | 75.3 | 1.4 | 18 us |
+| scan, 64 B records | 1M | 64 | 9.6 | 4.6 | 3.0 | 1.1 | 206.6 | 6.6 | 13 us |
+| `rte_timer` | 64K | 120 | 278.8 | 254.2 | 547.9 | 195.5 | 7.3 | 79.6 | 5.6 ms |
+| `rte_timer` | **1M** | 120 | 1,134.6 | 1,066.1 | 1,343.9 | 349.0 | 7.6 | 211.1 | 228 ms |
+
+- **`rte_timer` at 1M** (the missing point): schedule and cancel cost about 1.1 us, 107 and 135 times the
+  wheel's; it has no budget, so one `rte_timer_manage` call ran a whole drain (228 ms worst poll).
+- **10M timers** (the run that predated the last header edit): the wheel holds 32 B per timer (320 MB) and costs
+  243 ns per expiry, consistent with the earlier unquoted 32 B and 207 ns. Scan stays 8 B and 1.4 ns per expiry,
+  but its detection delay grows with N, as stated above.
+- The wheel's 1M worst poll (342 us) is one maximum sample; its 10M run gave 52 us and the eager variant at 1M
+  35 us. The budgeted bound is on work per poll, not time; one sample this far out is not explained.
+- Against the `powersave` table on the same distributions, 64K wheel: schedule 5.8 -> 7.5 ns (+29%), cancel
+  3.2 -> 5.4 ns (+69%), drain per expiry 43.8 -> 45.0 ns (5-minute spread; the original table's drain column is
+  the 1 s spread, 23.7 then and 24.1 now); `rte_timer` schedule 244 -> 279 ns. These are single runs on different
+  days and governors, not paired comparisons, so the schedule and cancel increases are not attributed.
+- The `rte_timer` 1M row is from the full-table run. The separate `rte_timer`-only run in the same file gave
+  schedule 1,034, cancel 984, refresh 1,555 (uniform) and 283 (hot), 229 ns per expiry and a 250 ms worst poll:
+  within 19% of the row, and the same conclusion.
 
 ## D-054 Handoff substrate: burst channels over `rte_ring_elem` with moved-from ownership, and generation-checked continuations (M11)
 

@@ -4842,6 +4842,16 @@ rather than one call site).
        develop as well as against e035e892, the B of the committed result. The committed result is schema `/1` (written
        before those two checks); the runner now writes `/2`.
 
+144. **M10 closure measurements, isolated (D-053 addendum).**
+     - `rte_timer` at 1M timers (the run whose JSON had been corrupted): schedule 1,135 ns, cancel 1,066 ns
+       (107x and 135x the wheel), 211 ns per expiry, and one unbudgeted poll ran a whole 1M drain (228 ms); a
+       second, `rte_timer`-only run agreed within 19%.
+     - 10M timers on the final header: wheel 32 B per timer, 243 ns per expiry, 52 us worst budgeted poll; scan
+       8 B and 1.4 ns per expiry.
+     - The full 1K/64K/1M table rerun with the performance governor; raw output in `docs/baselines/m10-expiry.json`.
+       One wheel 1M worst-poll sample (342 us) stands out and is not explained.
+     - `omarchy-benchmark --isolate --cpu 2`; no device interrupts on CPU 2.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
