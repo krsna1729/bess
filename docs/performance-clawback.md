@@ -4,17 +4,17 @@ Decision D-034 records the code changes, portability boundary, and benchmark evi
 
 ## Changes
 
-- `PacketPool::AllocBulk` still allocates with `rte_mbuf_raw_alloc_bulk`. On SSE2 builds, it initializes the packed `rearm_data` and `rx_descriptor_fields1` regions with two unaligned 128-bit stores per packet, then clears `tx_offload` and `vlan_tci_outer` separately. `static_assert`s protect the DPDK layout assumptions. The non-SSE2 path initializes the fields scalarly.
+- `PacketPool::AllocBulk` still allocates with `rte_mbuf_raw_alloc_bulk`. It initializes the packed `rearm_data` and `rx_descriptor_fields1` regions with two 16-byte `memcpy` stores per packet (one unaligned vector store each on x86 and arm64; formerly SSE2 intrinsics with a scalar fallback, M21), then clears `tx_offload` and `vlan_tci_outer` separately. `static_assert`s protect the DPDK layout assumptions.
 - `PacketFreeBulk` uses `rte_mbuf_raw_free_bulk` only when every packet is direct, from the same pool, singly referenced, single-segment, and has no `next` segment. Ineligible ordinary-sized arrays retain the `rte_pktmbuf_free_bulk` path; counts above `UINT_MAX` remain per-packet frees without narrowing.
-- `CuckooMap` promises the proven bucket bound before vector access, removing the compiler-generated bounds check. For maps with at least 1024 buckets, a four-lane `std::experimental::simd` match helper is isolated behind an AVX2 target and runtime feature check. Small maps use the scalar scan; the scalar implementation also covers builds without the SIMD TS and non-x86 targets.
+- `CuckooMap` promises the proven bucket bound before vector access, removing the compiler-generated bounds check. For maps with at least 1024 buckets, a four-lane `std::experimental::simd` match helper (`bess::arch::MatchHashes32x4`, `core/arch/tag_match.h` since M21) is isolated behind an AVX2 target and runtime feature check. Small maps use the scalar scan; the scalar implementation also covers builds without the SIMD TS and non-x86 targets.
 
-No handwritten assembly. The SIMD TS is used where its typed comparison model fits; SSE2 intrinsics remain for packed DPDK struct stores, which are type-punned fields rather than a typed SIMD array. The current GCC and Clang toolchains provide `<experimental/simd>`; this is not the standardized C++26 `std::simd` API.
+No handwritten assembly. The SIMD TS is used where its typed comparison model fits; the packed DPDK struct stores are type-punned fields rather than a typed SIMD array, so they are plain 16-byte copies. The current GCC and Clang toolchains provide `<experimental/simd>`; this is not the standardized C++26 `std::simd` API.
 
 ## ISA boundary
 
 The Cuckoo AVX2 helper is separately compiled for AVX2. Its dispatcher is compiled for baseline x86-64 and calls it only after `__builtin_cpu_supports("avx2")`; otherwise it compares the four slots scalarly. The tested GCC object emits `vpbroadcastd`, `vpcmpeqd`, and `vmovmskps` in the AVX2 helper, while the dispatcher and scalar fallback contain no AVX/BMI instructions. The non-AVX2 branch was inspected, not exercised under emulation.
 
-This guard is deliberately local: the configured release build uses `-Dcpu=x86-64-v3`, so the full BESS binary still requires that ISA floor. The helper does not make a v3-targeted executable safe on older x86 CPUs. SSE2 is part of the x86-64 baseline; non-x86 builds take the scalar packet and Cuckoo paths.
+This guard is deliberately local: the configured release build uses `-Dcpu=x86-64-v3`, so the full BESS binary still requires that ISA floor. The helper does not make a v3-targeted executable safe on older x86 CPUs. Non-x86 builds take the scalar Cuckoo path.
 
 ## Microbenchmark evidence
 

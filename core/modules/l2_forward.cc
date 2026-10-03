@@ -11,7 +11,6 @@
 #include <rte_hash_crc.h>
 
 #include "utils/endian.h"
-#include "utils/simd.h"
 
 /******************************************************************************/
 // TODO(barath): Move this test code elsewhere.

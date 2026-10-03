@@ -7,7 +7,7 @@
 
 #include <gtest/gtest.h>
 
-#include <xmmintrin.h>
+#include "arch/fp_env.h"
 
 #include <atomic>
 #include <chrono>
@@ -56,9 +56,9 @@ TEST_P(L2TableTest, EveryAddedEntryIsFound) {
 
 INSTANTIATE_TEST_SUITE_P(Buckets, L2TableTest, ::testing::Values(1, 2, 4));
 
-// The former AVX probe compared slots as doubles (_mm256_cmp_pd): an empty
-// slot (all zeros, +0.0) compared equal to the key for MAC 0 (occupied bit
-// set: -0.0), so MAC 0 "hit" an empty table.
+// The former AVX probe compared slots as doubles (a packed-double compare):
+// an empty slot (all zeros, +0.0) compared equal to the key for MAC 0
+// (occupied bit set: -0.0), so MAC 0 "hit" an empty table.
 TEST(L2TableCompareTest, MacZeroMissesOnAnEmptyTable) {
   l2_table table = {};
   ASSERT_EQ(0, l2_init(&table, 1024, 4));
@@ -70,22 +70,24 @@ TEST(L2TableCompareTest, MacZeroMissesOnAnEmptyTable) {
   l2_deinit(&table);
 }
 
-// ...and with denormals-are-zero set in MXCSR (some libraries and
-// -ffast-math code set it), every masked slot compared equal to every key.
+// ...and with denormals-are-zero set (some libraries and -ffast-math code
+// set it), every masked slot compared equal to every key: a masked slot has
+// a zero exponent, so as a double it is a denormal, read as zero. Lookups
+// compare integers, so the floating-point environment must not matter.
 TEST(L2TableCompareTest, DenormalsAreZeroDoesNotMatchEverything) {
   l2_table table = {};
   ASSERT_EQ(0, l2_init(&table, 1024, 4));
   for (uint64_t mac = 1; mac <= 500; mac++) {
     ASSERT_EQ(0, l2_add_entry(&table, mac * 0x10001, 1));
   }
-  const unsigned saved = _mm_getcsr();
-  _mm_setcsr(saved | 0x8040);  // DAZ | FTZ
   size_t false_hits = 0;
-  for (uint64_t mac = 1; mac <= 500; mac++) {
-    gate_idx_t gate;
-    false_hits += l2_find(&table, mac * 0x10001 + 3, &gate) == 0;
+  {
+    bess::arch::ScopedFlushDenormals flush;
+    for (uint64_t mac = 1; mac <= 500; mac++) {
+      gate_idx_t gate;
+      false_hits += l2_find(&table, mac * 0x10001 + 3, &gate) == 0;
+    }
   }
-  _mm_setcsr(saved);
   EXPECT_EQ(0u, false_hits);
   l2_deinit(&table);
 }

@@ -2,10 +2,9 @@
 
 #include "vif.h"
 
-#include <x86intrin.h>
-
 #include <cstring>
 
+#include "arch/vlan.h"
 #include "utils/format.h"
 
 namespace {
@@ -14,6 +13,7 @@ using bess::utils::Arp;
 using bess::utils::be16_t;
 using bess::utils::be32_t;
 using bess::utils::Ethernet;
+using bess::utils::Vlan;
 
 uint64_t MacToUint64(const Ethernet::Address &addr) {
   uint64_t v = 0;
@@ -155,21 +155,20 @@ void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
 
     uint16_t vlan = 0;
-    // Check for 802.1Q VLAN tag using SIMD
-    __m128i eth_data = _mm_loadu_si128(reinterpret_cast<__m128i *>(head));
-    be16_t tpid(be16_t::swap(_mm_extract_epi16(eth_data, 6)));
+    // Check for an 802.1Q / 802.1ad VLAN tag.
+    const be16_t tpid = reinterpret_cast<const Ethernet *>(head)->ether_type;
 
     bool tagged = (tpid == be16_t(Ethernet::Type::kVlan)) ||
                   (tpid == be16_t(Ethernet::Type::kQinQ));
 
     if (tagged && pkt.head_len() >= sizeof(Ethernet) + 4) {
-      uint16_t tci = be16_t::swap(_mm_extract_epi16(eth_data, 7));
-      vlan = tci & 0x0FFF;
+      const be16_t tci =
+          reinterpret_cast<const Vlan *>(head + sizeof(Ethernet))->tci;
+      vlan = tci.value() & 0x0FFF;
 
-      // Strip VLAN tag in place
+      // Strip the VLAN tag in place.
       if (pkt.adj(4)) {
-        eth_data = _mm_slli_si128(eth_data, 4);
-        _mm_storeu_si128(reinterpret_cast<__m128i *>(head), eth_data);
+        bess::arch::RemoveVlanTag(head);
       }
     }
 

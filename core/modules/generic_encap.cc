@@ -4,17 +4,20 @@
 
 #include "generic_encap.h"
 
+#include <bit>
+#include <cstring>
+
 #include "utils/endian.h"
-#include "utils/simd.h"
 
 static_assert(MAX_FIELD_SIZE <= sizeof(uint64_t),
               "field cannot be larger than 8 bytes");
 
 #define MAX_HEADER_SIZE (MAX_FIELDS * MAX_FIELD_SIZE)
 
-#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
-#error this code assumes little endian architecture (x86)
-#endif
+// A field's bytes are the low bytes of its uint64_t value, written with one
+// 8-byte store (the next field overwrites the excess).
+static_assert(std::endian::native == std::endian::little,
+              "GenericEncap writes fields as little-endian words");
 
 CommandResponse GenericEncap::AddFieldOne(
     const bess::pb::GenericEncapArg_EncapField &field, struct Field *f,
@@ -105,7 +108,7 @@ void GenericEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
   int encap_size = encap_size_;
 
-  char headers[bess::PacketBatch::kMaxBurst][MAX_HEADER_SIZE] __ymm_aligned;
+  alignas(32) char headers[bess::PacketBatch::kMaxBurst][MAX_HEADER_SIZE];
 
   for (int i = 0; i < num_fields_; i++) {
     uint64_t value = fields_[i].value;
@@ -117,8 +120,9 @@ void GenericEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
     for (int j = 0; j < cnt; j++, header += MAX_HEADER_SIZE) {
       bess::PacketRef pkt = batch->packet(j);
-      *(reinterpret_cast<uint64_t *>(header)) =
+      const uint64_t word =
           (attr_id < 0) ? value : get_attr_with_offset<uint64_t>(offset, pkt);
+      std::memcpy(header, &word, sizeof(word));
     }
   }
 

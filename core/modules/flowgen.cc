@@ -11,7 +11,6 @@
 #include "utils/ether.h"
 #include "utils/format.h"
 #include "utils/ip.h"
-#include "utils/simd.h"
 #include "utils/tcp.h"
 #include "utils/udp.h"
 #include "utils/time.h"

@@ -19,7 +19,6 @@
 #include "task.h"
 #include "utils/common.h"
 #include "utils/extended_priority_queue.h"
-#include "utils/simd.h"
 #include "utils/time.h"
 
 using bess::utils::extended_priority_queue;

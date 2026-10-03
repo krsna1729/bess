@@ -3,16 +3,13 @@
 #include <algorithm>
 #include <bit>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <sys/mman.h>
 
 #include <rte_errno.h>
 #include <rte_eal.h>
 #include <rte_mempool.h>
-
-#if defined(__SSE2__)
-#include <emmintrin.h>
-#endif
 
 #include "dpdk.h"
 #include "runtime/memory.h"
@@ -170,64 +167,34 @@ bool PacketPool::AllocBulk(PacketHandle *pkts, size_t count, size_t len) {
     return false;
   }
 
-  // Decision D-034 (docs/decisions.md): two 128-bit metadata stores per packet,
-  // plus scalar clears for tx_offload and vlan_tci_outer. The layout
-  // assertions above protect these stores against DPDK mbuf ABI changes.
-#if defined(__SSE2__)
-  // 1st store (16 B at &rearm_data): [data_off|refcnt|nb_segs|port] [ol_flags]
-  const uint64_t low_rearm =
+  // Decision D-034 (docs/decisions.md): two 16-byte metadata stores per
+  // packet, plus clears of tx_offload and vlan_tci_outer. The layout
+  // assertions above protect these stores against DPDK mbuf ABI changes; the
+  // patterns are little-endian words. Each 16-byte memcpy compiles to one
+  // vector store where the target has them (x86 SSE2, arm64).
+  static_assert(std::endian::native == std::endian::little);
+  // 1st store (16 B at rearm_data): [data_off|refcnt|nb_segs|port] [ol_flags]
+  const uint64_t rearm[2] = {
       static_cast<uint64_t>(initial_data_off) |
-      (UINT64_C(1) << 16) |  // refcnt = 1
-      (UINT64_C(1) << 32) |  // nb_segs = 1
-      (static_cast<uint64_t>(RTE_MBUF_PORT_INVALID) << 48);
-  const __m128i rearm = _mm_set_epi64x(
-      static_cast<long long>(initial_ol_flags),
-      static_cast<long long>(std::bit_cast<int64_t>(low_rearm)));
+          (UINT64_C(1) << 16) |  // refcnt = 1
+          (UINT64_C(1) << 32) |  // nb_segs = 1
+          (static_cast<uint64_t>(RTE_MBUF_PORT_INVALID) << 48),
+      initial_ol_flags};
+  // 2nd store (16 B at rx_descriptor_fields1):
+  // [packet_type|pkt_len] [data_len|vlan_tci=0|rss=0]
+  const uint32_t rxdesc[4] = {0, packet_len, data_len, 0};
+  static_assert(sizeof(rearm) == 16 && sizeof(rxdesc) == 16);
 
-  // 2nd store (16 B at rx_descriptor_fields1): [packet_type|pkt_len] [data_len|vlan_tci|rss]
-  const __m128i rxdesc = _mm_setr_epi32(
-      0,                                        // packet_type
-      static_cast<int32_t>(packet_len),         // pkt_len
-      static_cast<int32_t>(data_len),           // data_len | vlan_tci=0
-      0);                                       // rss (don't care)
-
-  size_t i = 0;
-  for (; i + 1 < count; i += 2) {
-    _mm_storeu_si128(reinterpret_cast<__m128i *>(&pkts[i]->rearm_data), rearm);
-    _mm_storeu_si128(reinterpret_cast<__m128i *>(pkts[i]->rx_descriptor_fields1),
-                     rxdesc);
-    pkts[i]->tx_offload = 0;
-    pkts[i]->vlan_tci_outer = 0;
-    _mm_storeu_si128(reinterpret_cast<__m128i *>(&pkts[i + 1]->rearm_data),
-                     rearm);
-    _mm_storeu_si128(
-        reinterpret_cast<__m128i *>(pkts[i + 1]->rx_descriptor_fields1), rxdesc);
-    pkts[i + 1]->tx_offload = 0;
-    pkts[i + 1]->vlan_tci_outer = 0;
-  }
-  if (i < count) {
-    _mm_storeu_si128(reinterpret_cast<__m128i *>(&pkts[i]->rearm_data), rearm);
-    _mm_storeu_si128(reinterpret_cast<__m128i *>(pkts[i]->rx_descriptor_fields1),
-                     rxdesc);
-    pkts[i]->tx_offload = 0;
-    pkts[i]->vlan_tci_outer = 0;
-  }
-#else  // scalar fallback for non-x86 architectures
   for (size_t i = 0; i < count; i++) {
-    PacketHandle pkt = pkts[i];
-    pkt->data_off       = initial_data_off;
-    rte_mbuf_refcnt_set(pkt, 1);
-    pkt->nb_segs        = 1;
-    pkt->port           = RTE_MBUF_PORT_INVALID;
-    pkt->ol_flags       = initial_ol_flags;
-    pkt->packet_type    = 0;
-    pkt->pkt_len        = packet_len;
-    pkt->data_len       = data_len;
-    pkt->tx_offload     = 0;
-    pkt->vlan_tci       = 0;
-    pkt->vlan_tci_outer = 0;
+    // Addressed from the mbuf, not through the members: each store spans
+    // several fields.
+    char *mbuf = reinterpret_cast<char *>(pkts[i]);
+    std::memcpy(mbuf + offsetof(rte_mbuf, rearm_data), rearm, sizeof(rearm));
+    std::memcpy(mbuf + offsetof(rte_mbuf, rx_descriptor_fields1), rxdesc,
+                sizeof(rxdesc));
+    pkts[i]->tx_offload = 0;
+    pkts[i]->vlan_tci_outer = 0;
   }
-#endif
   return true;
 }
 

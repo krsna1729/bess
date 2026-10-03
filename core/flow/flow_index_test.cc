@@ -88,24 +88,6 @@ TEST(FlowIndexTest, BucketIsOneCacheLine) {
   EXPECT_EQ(64u, alignof(Bucket));
 }
 
-// The SSE2 tag compare is the hot-path version; the scalar one is the
-// definition. They must agree for every tag position and every pattern.
-TEST(FlowIndexTest, SimdTagMatchEqualsScalarDefinition) {
-  std::mt19937 rng(7);
-  alignas(64) uint16_t tags[8];
-  for (int trial = 0; trial < 20000; trial++) {
-    // A small alphabet makes matches (including several per bucket) likely.
-    for (auto &t : tags) t = static_cast<uint16_t>(rng() % 5);
-    const auto probe = static_cast<uint16_t>(rng() % 5);
-    ASSERT_EQ(detail::MatchTagsScalar(tags, probe),
-              detail::MatchTags(tags, probe));
-  }
-  for (uint32_t pattern = 0; pattern < 256; pattern++) {
-    for (int i = 0; i < 8; i++) tags[i] = (pattern >> i & 1) ? 0xffff : 0x8000;
-    ASSERT_EQ(pattern, detail::MatchTags(tags, 0xffff));
-  }
-}
-
 TEST(FlowIndexTest, SplitStaysInRangeAndTagIsNeverEmpty) {
   for (uint32_t buckets : {1u, 2u, 3u, 7u, 1000u, 65536u, 1000003u}) {
     Bucket *none = nullptr;

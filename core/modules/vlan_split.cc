@@ -4,29 +4,28 @@
 
 #include "vlan_split.h"
 
+#include "arch/vlan.h"
 #include "utils/ether.h"
 
 void VLANSplit::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::be16_t;
   using bess::utils::Ethernet;
+  using bess::utils::Vlan;
 
   int cnt = batch->cnt();
 
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
     char *old_head = pkt.head_data<char *>();
-    __m128i eth;
-
-    eth = _mm_loadu_si128(reinterpret_cast<__m128i *>(old_head));
-    be16_t tpid(be16_t::swap(_mm_extract_epi16(eth, 6)));
+    const auto *eth = reinterpret_cast<const Ethernet *>(old_head);
+    const be16_t tpid = eth->ether_type;
 
     bool tagged = (tpid == be16_t(Ethernet::Type::kVlan)) ||
                   (tpid == be16_t(Ethernet::Type::kQinQ));
 
     if (tagged && pkt.adj(4)) {
-      be16_t tci(be16_t::swap(_mm_extract_epi16(eth, 7)));
-      eth = _mm_slli_si128(eth, 4);
-      _mm_storeu_si128(reinterpret_cast<__m128i *>(old_head), eth);
+      const be16_t tci = reinterpret_cast<const Vlan *>(eth + 1)->tci;
+      bess::arch::RemoveVlanTag(old_head);
       EmitPacket(ctx, pkt, tci.value() & 0x0fff);
     } else {
       EmitPacket(ctx, pkt, 0); /* untagged packets go to gate 0 */

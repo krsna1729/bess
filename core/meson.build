@@ -477,7 +477,11 @@ core_public_subdir_headers = {
   'arch': files(
     'arch/cpu.h',
     'arch/crc32c.h',
+    'arch/fp_env.h',
     'arch/signal_context.h',
+    'arch/tag_match.h',
+    'arch/vlan.h',
+    'arch/word_probe.h',
   ),
   'utils': files(
     'utils/arp.h',
@@ -584,6 +588,7 @@ endforeach
 
 unit_test_sources = [
   'arch/arch_test.cc',
+  'arch/kernels_test.cc',
   'arch/signal_context_test.cc',
   'flow/decision_cache_test.cc',
   'flow/expiry_consumer_test.cc',

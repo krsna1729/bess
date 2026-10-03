@@ -7,9 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#if defined(__SSE2__)
-#include <emmintrin.h>
-#endif
+#include "arch/tag_match.h"
 
 namespace bess::flow::detail {
 
@@ -43,25 +41,9 @@ struct alignas(64) Bucket {
 static_assert(sizeof(Bucket) == 64);
 
 // Which slots of `tags` equal `tag`: bit i set for tags[i] == tag.
-inline uint32_t MatchTagsScalar(const uint16_t *tags, uint16_t tag) noexcept {
-  uint32_t mask = 0;
-  for (size_t i = 0; i < Bucket::kSlots; i++) {
-    mask |= static_cast<uint32_t>(tags[i] == tag) << i;
-  }
-  return mask;
-}
-
 inline uint32_t MatchTags(const uint16_t *tags, uint16_t tag) noexcept {
-#if defined(__SSE2__)
-  const __m128i have = _mm_load_si128(reinterpret_cast<const __m128i *>(tags));
-  const __m128i eq = _mm_cmpeq_epi16(have, _mm_set1_epi16(static_cast<short>(tag)));
-  // Narrow the sixteen byte lanes (two per tag) to one bit per tag.
-  return static_cast<uint32_t>(
-             _mm_movemask_epi8(_mm_packs_epi16(eq, eq))) &
-         0xffu;
-#else
-  return MatchTagsScalar(tags, tag);
-#endif
+  static_assert(Bucket::kSlots == 8);
+  return arch::MatchTags16x8(tags, tag);
 }
 
 // Weak or structured user hashes (std::hash<uint64_t> is the identity) must

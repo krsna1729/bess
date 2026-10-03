@@ -23,8 +23,7 @@
 
 #include <benchmark/benchmark.h>
 
-#include <immintrin.h>
-
+#include <cstring>
 #include <map>
 #include <memory>
 #include <string>
@@ -153,6 +152,15 @@ std::vector<uint32_t> StreamFor(const Fixture &f, bool uniform) {
 
 // -- lookup ------------------------------------------------------------------------
 
+// Four consecutive keys as rte_lpm_lookupx4's xmm_t (DPDK's rte_vect.h type,
+// via rte_lpm.h): lane i is keys[i].
+xmm_t Load4(const uint32_t *keys) {
+  xmm_t v;
+  static_assert(sizeof(v) == 4 * sizeof(uint32_t));
+  std::memcpy(&v, keys, sizeof(v));
+  return v;
+}
+
 // The pre-K7 IPLookup inner loop, on the same table: addresses as they sit in
 // packets (network order), swapped four at a time, rte_lpm_lookupx4.
 void BM_LookupRawLpmX4(benchmark::State &state) {
@@ -172,16 +180,15 @@ void BM_LookupRawLpmX4(benchmark::State &state) {
   for (const Route &r : f.routes) {
     rte_lpm_add(lpm, r.prefix.addr(), r.prefix.length(), r.value);
   }
-  const __m128i bswap =
-      _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
   size_t offset = 0;
   uint32_t hops[kBatch];
   for (auto _ : state) {
     for (size_t i = 0; i < kBatch; i += 4) {
-      __m128i ips = _mm_loadu_si128(
-          reinterpret_cast<const __m128i *>(&wire[offset + i]));
-      ips = _mm_shuffle_epi8(ips, bswap);
-      rte_lpm_lookupx4(lpm, ips, &hops[i], 0);
+      const uint32_t *w = &wire[offset + i];
+      const uint32_t values[4] = {
+          __builtin_bswap32(w[0]), __builtin_bswap32(w[1]),
+          __builtin_bswap32(w[2]), __builtin_bswap32(w[3])};
+      rte_lpm_lookupx4(lpm, Load4(values), &hops[i], 0);
     }
     benchmark::DoNotOptimize(hops);
     offset = (offset + kBatch) % wire.size();
@@ -312,9 +319,7 @@ void BM_LookupBody(benchmark::State &state) {
       case kX4:
       case kPrefetchX4:
         for (size_t i = 0; i < kBatch; i += 4) {
-          const __m128i v =
-              _mm_loadu_si128(reinterpret_cast<const __m128i *>(&ips[i]));
-          rte_lpm_lookupx4(lpm, v, &hops[i], UINT32_MAX);
+          rte_lpm_lookupx4(lpm, Load4(&ips[i]), &hops[i], UINT32_MAX);
         }
         break;
       case kScalar:

@@ -6,9 +6,10 @@
 // block, so this binary measures the exact code shapes the module would use,
 // not just "a lookup":
 //
-//   BM_LookupLpmVec     the current module path: 4-wide SSE byte swap
-//                       (_mm_shuffle_epi8, see modules/ip_lookup.cc)
-//                       followed by rte_lpm_lookupx4(), 32 packets at a time
+//   BM_LookupLpmVec     the former module path: four keys byte-swapped to
+//                       value form at a time (once an SSSE3 byte shuffle in
+//                       modules/ip_lookup.cc) and handed to
+//                       rte_lpm_lookupx4(), 32 packets at a time
 //   BM_LookupLpmScalar  the module's tail path: read each address as a value
 //                       (be32_t::value(): a load plus byte swap on this host)
 //                       and call rte_lpm_lookup()
@@ -88,9 +89,6 @@
 #include <vector>
 
 #include <time.h>
-
-#include <emmintrin.h>
-#include <tmmintrin.h>
 
 #include "dpdk.h"
 #include "utils/endian.h"
@@ -290,15 +288,16 @@ class LpmTable {
   }
   int Delete(const Route &r) { return rte_lpm_delete(lpm_, r.prefix, r.len); }
 
-  // The module's vector path: raw packet-order keys, SSE byte swap, then
+  // The module's vector path: raw packet-order keys, byte-swapped four at a
+  // time into DPDK's xmm_t (rte_vect.h, via rte_lpm.h), then
   // rte_lpm_lookupx4() (which wants value form).
   void LookupBatch(const uint32_t *keys, uint32_t *next_hops) {
-    const __m128i bswap_mask =
-        _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
     for (size_t i = 0; i + 3 < kBatch; i += 4) {
-      __m128i ip_addr =
-          _mm_set_epi32(keys[i + 3], keys[i + 2], keys[i + 1], keys[i]);
-      ip_addr = _mm_shuffle_epi8(ip_addr, bswap_mask);
+      const uint32_t values[4] = {ToValue(keys[i]), ToValue(keys[i + 1]),
+                                  ToValue(keys[i + 2]), ToValue(keys[i + 3])};
+      xmm_t ip_addr;
+      static_assert(sizeof(ip_addr) == sizeof(values));
+      std::memcpy(&ip_addr, values, sizeof(values));
       rte_lpm_lookupx4(lpm_, ip_addr, next_hops + i, kDefaultNextHop);
     }
   }
