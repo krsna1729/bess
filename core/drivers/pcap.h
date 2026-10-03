@@ -8,8 +8,7 @@
 #include "port.h"
 #include <gtest/gtest_prod.h>
 
-
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "utils/pcap_handle.h"
 

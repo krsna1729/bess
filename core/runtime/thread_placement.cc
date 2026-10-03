@@ -11,7 +11,7 @@
 #include <cstdlib>
 #include <vector>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "runtime/opts.h"
 

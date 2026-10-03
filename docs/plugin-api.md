@@ -46,6 +46,12 @@ BESS installs development headers and a standard pkg-config file:
 `bess-dev` does not require `grpc++`. Plugins that use gRPC must declare it
 as their own dependency.
 
+**Logging.** Include `"utils/logging.h"`, never `<glog/logging.h>` directly. glog
+and protobuf's absl logging both define `LOG`/`CHECK`/`VLOG`; the header included
+second wins, and `bessd` initialises only glog. `utils/logging.h` includes absl
+first so glog wins in every translation unit (D-059); a plugin that includes glog
+itself before any BESS header can end up logging through uninitialised absl.
+
 ### Out-of-tree Meson Integration
 An external project builds plugins using Meson without vendoring BESS source code:
 

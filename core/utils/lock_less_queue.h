@@ -5,7 +5,7 @@
 #ifndef BESS_UTILS_LOCK_LESS_QUEUE_H_
 #define BESS_UTILS_LOCK_LESS_QUEUE_H_
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include <rte_ring.h>
 

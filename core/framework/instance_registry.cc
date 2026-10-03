@@ -6,7 +6,7 @@
 
 #include <cstdlib>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 namespace bess::framework {
 

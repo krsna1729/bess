@@ -8,7 +8,7 @@
 #include <cstring>
 #include <string>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 namespace bess::runtime {
 

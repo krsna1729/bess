@@ -7,8 +7,8 @@
 
 #include <thread>
 
+#include "utils/logging.h"
 #include <gflags/gflags.h>
-#include <glog/logging.h>
 #include <grpcpp/server.h>
 #include <grpcpp/server_builder.h>
 #include <grpcpp/server_context.h>

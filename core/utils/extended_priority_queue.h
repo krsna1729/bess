@@ -8,7 +8,7 @@
 #include <queue>
 #include <vector>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 namespace bess {
 namespace utils {

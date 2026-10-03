@@ -10,7 +10,7 @@
 
 #include <limits>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "message.h"
 #include "utils/common.h"

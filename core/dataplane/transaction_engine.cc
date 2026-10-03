@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <utility>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 namespace bess {
 namespace dataplane {

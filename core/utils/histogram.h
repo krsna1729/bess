@@ -14,7 +14,7 @@
 #include <numeric>
 #include <vector>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 // Class for general purpose histogram. T generally should be an
 // integral type, though floating point types will also work.

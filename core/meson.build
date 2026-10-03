@@ -480,6 +480,7 @@ core_public_subdir_headers = {
     'utils/ether.h',
     'utils/extended_priority_queue.h',
     'utils/inline_function.h',
+    'utils/logging.h',
     'utils/random.h',
     'utils/time.h',
   ),

@@ -8,7 +8,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "message.h"
 #include "utils/common.h"

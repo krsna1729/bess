@@ -15,8 +15,8 @@
 #include <functional>
 #include <unordered_map>
 
+#include "utils/logging.h"
 #include <benchmark/benchmark.h>
-#include <glog/logging.h>
 
 #include "common.h"
 #include "random.h"

@@ -8,7 +8,7 @@
 #include <set>
 #include <vector>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "dataplane/slot_resource.h"
 #include "dataplane/transaction_engine.h"

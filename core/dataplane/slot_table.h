@@ -8,7 +8,7 @@
 #include <memory>
 #include <vector>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "utils/common.h"
 

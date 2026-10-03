@@ -5,7 +5,7 @@
 #ifndef BESS_PORT_H_
 #define BESS_PORT_H_
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 #include <google/protobuf/any.pb.h>
 
 #include <cstdint>

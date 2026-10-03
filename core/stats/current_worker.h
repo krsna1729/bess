@@ -3,7 +3,7 @@
 #ifndef BESS_STATS_CURRENT_WORKER_H_
 #define BESS_STATS_CURRENT_WORKER_H_
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "dataplane/worker_id.h"
 #include "worker.h"

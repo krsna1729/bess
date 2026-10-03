@@ -16,8 +16,8 @@
 #include <sstream>
 #include <system_error>
 
+#include "utils/logging.h"
 #include <gflags/gflags.h>
-#include <glog/logging.h>
 
 namespace bess::startup {
 

@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "framework/plugin_loader.h"
 #include "gate.h"

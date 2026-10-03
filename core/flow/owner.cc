@@ -2,7 +2,7 @@
 
 #include "flow/owner.h"
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 namespace bess::flow {
 

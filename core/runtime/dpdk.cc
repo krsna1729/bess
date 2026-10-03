@@ -9,7 +9,7 @@
 #include <syslog.h>
 #include <unistd.h>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 #include <rte_config.h>
 #include <rte_cycles.h>
 #include <rte_eal.h>

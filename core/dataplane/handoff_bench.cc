@@ -42,8 +42,8 @@
 // element), ring_bytes. Every run first moves a verified stream (each item's
 // pointer and context checked on return) before the timed loop.
 
+#include "utils/logging.h"
 #include <benchmark/benchmark.h>
-#include <glog/logging.h>
 
 #include <rte_ring.h>
 #include <rte_ring_elem.h>

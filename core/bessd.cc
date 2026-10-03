@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include <algorithm>
 #include <cerrno>

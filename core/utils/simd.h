@@ -9,7 +9,7 @@
 
 #include <x86intrin.h>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #define __xmm_aligned __attribute__((aligned(16)))
 #define __ymm_aligned __attribute__((aligned(32)))

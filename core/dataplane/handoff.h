@@ -20,7 +20,7 @@
 #include <type_traits>
 #include <utility>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "packet_handle.h"
 

@@ -1,7 +1,7 @@
 #ifndef BESS_RUNTIME_MEMORY_H_
 #define BESS_RUNTIME_MEMORY_H_
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include <cstddef>
 #include <cstdint>

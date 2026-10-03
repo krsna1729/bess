@@ -4,7 +4,7 @@
 
 #include "metadata.h"
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include <algorithm>
 #include <functional>

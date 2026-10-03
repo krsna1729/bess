@@ -9,7 +9,7 @@
 #include <deque>
 #include <functional>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "time.h"
 #include "queue.h"

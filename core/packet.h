@@ -11,7 +11,7 @@
 #include <string>
 #include <type_traits>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 #include <rte_mbuf.h>
 
 #include "metadata.h"

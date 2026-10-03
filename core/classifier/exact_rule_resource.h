@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "classifier/concurrent_exact.h"
 #include "dataplane/resource.h"

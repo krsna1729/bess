@@ -4,7 +4,7 @@
 
 #include "module_graph.h"
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "runtime/worker_manager.h"
 #include "gate.h"

@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "dataplane/batch_stages.h"
 #include "dataplane/interface_id.h"
