@@ -4750,7 +4750,12 @@ for the first time here and is caught.
 - **One-way streaming slowdown:** not yet investigated further; the ranked hypotheses and experiments are in a
   local plan (not committed). It is tracked and will be measured under `omarchy-benchmark`. No cause is claimed.
   *(Annotation: isolated runs show the round trip affected too; ring placement mod 128 (H1) is refuted. Entry
-  146.)*
+  146.)* *(Annotation, entry 149: neither the closed loop's phase (H2) nor
+  the object/ring layout (H3) explains the one-way gap. Compiling out the closed check, the ownership nulling and the
+  per-call counters together (a throwaway variant) made one-way burst 32 between 5% and 14% faster in two runs, and
+  with the ring also padded it was at parity with the bare ring [INFERENCE: that part of the gap is the channel's
+  per-call work; the split between the contract (closed check, nulling) and the counters was not measured]. The
+  round trip stays 18-24% slower than the bare ring even in that variant: cause not found.)*
 - **Counter layout matrix:** the main matrix used 64-byte counter groups; a limited A/B after moving the groups
   to 128 bytes agrees, but a full matrix and cache-line-traffic table have not been captured.
 - **Full-suite verification:** the M11 worktree agent did not run the whole suite; the parent ran it on the
