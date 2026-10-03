@@ -7,9 +7,9 @@
 
 #include <atomic>
 
+#include "l2_table.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
-#include "l2_table.h"
 
 #if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error this code assumes little endian architecture (x86)

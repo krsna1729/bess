@@ -6,10 +6,10 @@
 
 #include <vector>
 
-#include "packet.h"
 #include "copy.h"
 #include "ether.h"
 #include "ip.h"
+#include "packet.h"
 #include "tcp.h"
 
 namespace bess {

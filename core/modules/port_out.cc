@@ -4,8 +4,8 @@
 
 #include "port_out.h"
 
-#include "utils/format.h"
 #include "tx_checksum_profile.h"
+#include "utils/format.h"
 
 const Commands PortOut::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&PortOut::GetInitialArg),

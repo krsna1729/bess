@@ -326,8 +326,6 @@ def run_self_test():
         if got:
             raise AssertionError(f"{path}: {line}: expected clean, got {got}")
 
-
-
     # Resolution is the compiler's: next to the includer first, then the root.
     # The rule below ("a module never includes another module's header") is
     # not shipped; it stands in for any rule whose fragment names a directory.
@@ -350,8 +348,6 @@ def run_self_test():
         got = scan_lines(path, [text], lambda p, t=tree: p in t, rules=siblings)
         if len(got) != want:
             raise AssertionError(f"resolution: {path} {text}: want {want}, got {got}")
-
-
 
     total = len(SELF_TEST_CASES)
     print(
@@ -378,7 +374,6 @@ def main():
         "--verbose", "-v", action="store_true", help="Verbose output"
     )
     args = parser.parse_args()
-
 
     if args.self_test:
         run_self_test()
