@@ -39,12 +39,22 @@ BESS installs development headers and a standard pkg-config file:
   ```sh
   pkg-config --cflags bess-dev
   # Output includes:
-  # -I${includedir}/bess -I${includedir}/bess/core -D_GNU_SOURCE -DGLOG_USE_GLOG_EXPORT -include cinttypes
-  # plus Cflags from required dependencies (libdpdk, libglog, protobuf).
+  # -I${includedir}/bess -I${includedir}/bess/core
+  # -march=<bessd's cpu option> [-DBESS_ARCH_GENERIC]
+  # the DPDK include paths, -include rte_config.h and defines bessd compiled with
+  # -D_GNU_SOURCE -DGLOG_USE_GLOG_EXPORT -include cinttypes
+  # plus Cflags from required dependencies (libglog, protobuf).
   ```
 
 `bess-dev` does not require `grpc++`. Plugins that use gRPC must declare it
 as their own dependency.
+
+**ISA.** A plugin compiles for bessd's ISA (M21). `bess-dev` does not
+`Requires: libdpdk`, because pkg-config would append the `-march`/`-mrtm`
+DPDK was built with after bessd's and the last `-march` wins; it carries the
+DPDK compile flags bessd used (machine flags removed) and DPDK's shared-library
+link flags instead, so the DPDK prefix is the one bessd was built against.
+With `-Dcpu=native` "bessd's ISA" means the build machine's.
 
 **Logging.** Include `"utils/logging.h"`, never `<glog/logging.h>` directly. glog
 and protobuf's absl logging both define `LOG`/`CHECK`/`VLOG`; the header included

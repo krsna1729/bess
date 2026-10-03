@@ -1,0 +1,195 @@
+{
+  "_comment": [
+    "Architecture code outside core/arch/ that predates the M21 boundary (D-071).",
+    "tools/check_arch.py fails on any count above or below an entry, so this list only shrinks.",
+    "Edited by hand and reviewed; `tools/check_arch.py --report` prints the current counts in this format."
+  ],
+  "files": {
+    "core/classifier/masked_bench.cc": {
+      "condition": 1,
+      "intrinsic": 1,
+      "reason": "benchmark: crc32c_sse42_u64 under __x86_64 (rte_hash_crc elsewhere)"
+    },
+    "core/dataplane/expiry_bench.cc": {
+      "include": 1,
+      "intrinsic": 2,
+      "reason": "benchmark: __rdtsc cycle timing"
+    },
+    "core/dataplane/handoff_bench.cc": {
+      "asm": 1,
+      "reason": "benchmark: x86 pause in a spin loop"
+    },
+    "core/dataplane/ingress_bench.cc": {
+      "intrinsic": 1,
+      "reason": "benchmark: __builtin_ia32_pause in a spin loop"
+    },
+    "core/debug.cc": {
+      "condition": 2,
+      "reason": "crash handler reads the trap IP from ucontext (REG_EIP/REG_RIP)"
+    },
+    "core/fib_bench.cc": {
+      "include": 2,
+      "intrinsic": 5,
+      "reason": "benchmark: SSSE3 byte shuffle feeding rte_lpm_lookupx4"
+    },
+    "core/flow/flow_bench.cc": {
+      "include": 1,
+      "intrinsic": 6,
+      "reason": "benchmark: __rdtsc/__rdtscp/_mm_lfence cycle timing"
+    },
+    "core/flow/flow_index.h": {
+      "include": 1,
+      "condition": 2,
+      "intrinsic": 3,
+      "reason": "SSE2 bucket tag match with scalar fallback"
+    },
+    "core/framework/exact_match_table.h": {
+      "condition": 1,
+      "intrinsic": 1,
+      "reason": "crc32c_sse42_u64 hash under __x86_64, rte_hash_crc otherwise"
+    },
+    "core/modules/bpf.cc": {
+      "condition": 3,
+      "reason": "BESS x86-64 BPF JIT, libpcap interpreter otherwise"
+    },
+    "core/modules/bypass.cc": {
+      "intrinsic": 1,
+      "reason": "_mm_pause busy wait"
+    },
+    "core/modules/exact_match_bench.cc": {
+      "intrinsic": 2,
+      "reason": "benchmark: crc32c_sse42_u64 reference values"
+    },
+    "core/modules/hash_lb.cc": {
+      "condition": 2,
+      "intrinsic": 2,
+      "reason": "crc32c_sse42_u16/u32 under __x86_64, portable CRC otherwise"
+    },
+    "core/modules/l2_table.h": {
+      "include": 1,
+      "condition": 1,
+      "asm": 1,
+      "intrinsic": 6,
+      "reason": "AVX2 bucket probe (vmovdqa asm, D-017) with scalar fallback"
+    },
+    "core/modules/l2_table_test.cc": {
+      "include": 1,
+      "intrinsic": 3,
+      "reason": "test: _mm_getcsr/_mm_setcsr DAZ/FTZ control"
+    },
+    "core/modules/set_metadata.cc": {
+      "include": 1,
+      "reason": "unused <x86intrin.h> include"
+    },
+    "core/modules/url_filter.h": {
+      "condition": 1,
+      "intrinsic": 2,
+      "reason": "crc32c_sse42_u64 hash under __x86_64, rte_hash_crc otherwise"
+    },
+    "core/modules/vif.cc": {
+      "include": 1,
+      "intrinsic": 5,
+      "reason": "SSE VLAN tag insert/strip"
+    },
+    "core/modules/vlan_pop.cc": {
+      "intrinsic": 4,
+      "reason": "SSE VLAN tag strip"
+    },
+    "core/modules/vlan_push.cc": {
+      "intrinsic": 5,
+      "reason": "SSE4.1 VLAN tag insert"
+    },
+    "core/modules/vlan_split.cc": {
+      "intrinsic": 6,
+      "reason": "SSE VLAN tag strip"
+    },
+    "core/modules/wildcard_match_bench.cc": {
+      "condition": 1,
+      "intrinsic": 1,
+      "reason": "benchmark: crc32c_sse42_u64 under __x86_64"
+    },
+    "core/nat/nat_bench.cc": {
+      "intrinsic": 1,
+      "reason": "benchmark: crc32c_sse42_u64 hash"
+    },
+    "core/packet_pool.cc": {
+      "include": 1,
+      "condition": 2,
+      "intrinsic": 9,
+      "reason": "SSE2 mbuf rearm with scalar fallback"
+    },
+    "core/route/route_bench.cc": {
+      "include": 1,
+      "intrinsic": 7,
+      "reason": "benchmark: SSSE3 byte shuffle feeding rte_lpm_lookupx4"
+    },
+    "core/utils/bits.h": {
+      "include": 1,
+      "intrinsic": 7,
+      "reason": "SSE 16-byte mask in MaskBytes"
+    },
+    "core/utils/bpf.cc": {
+      "condition": 1,
+      "reason": "BESS x86-64 BPF JIT, libpcap interpreter otherwise"
+    },
+    "core/utils/bpf.h": {
+      "condition": 2,
+      "reason": "BESS x86-64 BPF JIT declarations"
+    },
+    "core/utils/bpf_program_test.cc": {
+      "condition": 1,
+      "reason": "test: x86-only native JIT assertion"
+    },
+    "core/utils/checksum.h": {
+      "include": 1,
+      "condition": 2,
+      "asm": 10,
+      "intrinsic": 22,
+      "reason": "AVX2 and x86 adc-asm ones-complement checksum kernels"
+    },
+    "core/utils/common.h": {
+      "asm": 1,
+      "reason": "FULL_BARRIER is x86 mfence"
+    },
+    "core/utils/copy.h": {
+      "include": 1,
+      "condition": 2,
+      "intrinsic": 9,
+      "reason": "SSE2/AVX2 16- and 32-byte copy"
+    },
+    "core/utils/cuckoo_map.h": {
+      "condition": 1,
+      "intrinsic": 3,
+      "reason": "runtime-dispatched AVX2 match mask (D-034)"
+    },
+    "core/utils/http_parser.cc": {
+      "include": 2,
+      "intrinsic": 3,
+      "reason": "SSE4.2 pcmpestri token scan"
+    },
+    "core/utils/mcslock.h": {
+      "asm": 2,
+      "intrinsic": 2,
+      "reason": "x86 sfence/lfence and pause in the MCS lock"
+    },
+    "core/utils/simd.cc": {
+      "condition": 1,
+      "intrinsic": 4,
+      "reason": "__m128i/__m256i debug printers"
+    },
+    "core/utils/simd.h": {
+      "include": 1,
+      "condition": 4,
+      "intrinsic": 17,
+      "reason": "x86 SIMD helpers; #error without SSE4.2"
+    },
+    "core/utils/syscallthread.h": {
+      "include": 1,
+      "reason": "unused <nmmintrin.h> include"
+    },
+    "core/utils/time.h": {
+      "asm": 1,
+      "reason": "rdtsc asm"
+    }
+  }
+}

@@ -8,11 +8,9 @@ on:
     branches: [master, develop]
 
 env:
-  # x86-64-v3 (AVX2, BMI1/2, FMA, MOVBE): the portable floor. GitHub's x64
-  # Linux runners (AMD EPYC 7763, Zen 3) support it but not v4 (AVX-512);
-  # the check step below fails loudly if a runner ever lacks it.
-  # (Decision D-016.)
-  CPU: x86-64-v3
+  # The CPU floor is per architecture and comes from tools/ci_profile.py
+  # (x86_64: x86-64-v3, decision D-016; aarch64: armv8.2-a, M21). The first
+  # step of each job writes it to CPU and fails loudly if the runner lacks it.
   AF_XDP: required
   FIFO_TEST_TIMEOUT: 200
 
@@ -53,13 +51,14 @@ jobs:
   build-and-test:
     name: Meson (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    # The ubuntu-24.04 pair gates. The ubuntu-26.04 lanes are experimental:
-    # they exist to see the toolchain and library drift (GCC 15, Clang 22;
-    # ubuntu-latest moves to 26.04 between 2026-10-19 and 2026-11-19) before
-    # it reaches the gating lanes, and they must not block a merge.
+    # The ubuntu-24.04 x86 pair gates. The other lanes are experimental and
+    # must not block a merge: the ubuntu-26.04 lanes show toolchain and library
+    # drift (GCC 15, Clang 22; ubuntu-latest moves to 26.04 between 2026-10-19
+    # and 2026-11-19) before it reaches the gating lanes; the arm64 and generic
+    # lanes are new (M21) and gate once they have been green.
     continue-on-error: ${{ matrix.experimental == true }}
     env:
-      LANE: --cc ${{ matrix.cc }} --cxx ${{ matrix.cxx }} --name ${{ matrix.name }}
+      LANE: --cc ${{ matrix.cc }} --cxx ${{ matrix.cxx }} --name ${{ matrix.name }} ${{ matrix.lane_args }}
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +72,30 @@ jobs:
           # Clang 19 updates __cpp_concepts for libstdc++'s C++23 <expected>.
           - name: clang
             os: ubuntu-24.04
+            cc: clang-19
+            cxx: clang++-19
+          # x86 with -Darch_generic=true: core/arch/ takes the portable paths
+          # every other architecture runs, so they are built (benchmarks
+          # included) and tested on each push. A lane of its own, in parallel:
+          # the gating lanes keep testing the x86 paths that ship.
+          - name: gcc-generic
+            os: ubuntu-24.04
+            experimental: true
+            cc: gcc-14
+            cxx: g++-14
+            lane_args: --arch-generic
+          # arm64: GitHub's ubuntu-24.04-arm runners (Azure Cobalt 100,
+          # Neoverse N2), the same compilers, DPDK bootstrap and steps as the
+          # gating pair, built for the armv8.2-a floor. AF_XDP stays required:
+          # Ubuntu 24.04 ships libxdp-dev/libbpf-dev for arm64.
+          - name: gcc-arm64
+            os: ubuntu-24.04-arm
+            experimental: true
+            cc: gcc-14
+            cxx: g++-14
+          - name: clang-arm64
+            os: ubuntu-24.04-arm
+            experimental: true
             cc: clang-19
             cxx: clang++-19
           - name: gcc-u26
@@ -89,20 +112,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # x86_64: glibc's ld.so lists the ISA levels the CPU supports; aarch64:
+      # the kernel's /proc/cpuinfo features (tools/ci_profile.py check-cpu).
       - name: Check the runner supports the CPU floor
         run: |
-          /lib64/ld-linux-x86-64.so.2 --help | grep -A4 'glibc-hwcaps'
-          if ! /lib64/ld-linux-x86-64.so.2 --help \
-              | grep -q "${CPU} (supported"; then
-            echo "::error::runner CPU does not support ${CPU}"
-            exit 1
-          fi
+          echo "CPU=$(python3 tools/ci_profile.py cpu)" >> "$GITHUB_ENV"
+          python3 tools/ci_profile.py check-cpu
 
       - name: Reserve hugepages
         run: |
           sudo sysctl -w vm.nr_hugepages=512
           sudo mkdir -p /mnt/huge
           sudo mount -t hugetlbfs nodev /mnt/huge
+          grep -E 'HugePages_Total|Hugepagesize' /proc/meminfo
 
       - name: Install build dependencies
         run: |
@@ -114,7 +136,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: deps
-          key: dpdk-bess-${{ matrix.name }}-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'tools/bootstrap_dpdk.py') }}
+          key: dpdk-bess-${{ matrix.name }}-${{ runner.arch }}-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'tools/bootstrap_dpdk.py') }}
 
       # The configuration and the verification steps live in tools/ci_profile.py,
       # which a developer runs unchanged (docs/ci-parity.md).
@@ -158,12 +180,17 @@ jobs:
     # (without a pin the job used the image's default g++ 13.3, which no other
     # job builds with), through the same script and compiler authority as the
     # gating lanes. The release-specific options are in tools/ci_profile.py.
+    # x86_64 only until the arm64 lanes gate; the tarball and the DPDK cache
+    # are named per architecture, so an arm64 release is one more runner.
     env:
       LANE: --cc gcc-14 --cxx g++-14 --name standalone
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v7
+
+      - name: Resolve the CPU floor
+        run: echo "CPU=$(python3 tools/ci_profile.py cpu)" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
@@ -174,7 +201,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: deps
-          key: dpdk-full-gcc14-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'tools/bootstrap_dpdk.py') }}
+          key: dpdk-full-gcc14-${{ runner.arch }}-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'tools/bootstrap_dpdk.py') }}
 
       - name: Bootstrap pinned DPDK
         run: python3 tools/ci_profile.py release-bootstrap $LANE
@@ -192,7 +219,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           [ -z "$VERSION" ] && VERSION=$(git rev-parse --short HEAD)
-          TARNAME="bess-${VERSION}-linux-x86_64"
+          TARNAME="bess-${VERSION}-linux-$(uname -m)"
           mkdir -p "$TARNAME/bin"
           cp build/standalone/core/bessd "$TARNAME/bin/"
           cp bin/bessctl "$TARNAME/bin/"

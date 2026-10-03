@@ -135,7 +135,21 @@ def include_problems(tree, headers):
     return problems
 
 
-def verify_headers(include_dir: Path):
+def machine_flag_problems(cflags, march=None):
+    """Plugins compile for bessd's ISA: at most one -march (BESS's cpu option)
+    and no other machine flag, such as DPDK's own -march or -mrtm (M21).
+    `march`, when given, is bessd's cpu option: then exactly that -march."""
+    machine = [flag for flag in cflags if flag.startswith("-m")]
+    if len(machine) > 1 or any(not flag.startswith("-march=") for flag in machine):
+        return [f"bess-dev cflags carry machine flags {machine}; only bessd's "
+                "-march may reach a plugin build"]
+    if march is not None and machine != ([f"-march={march}"] if march else []):
+        return [f"bess-dev cflags carry {machine or 'no -march'}; bessd was built "
+                f"with cpu={march!r}"]
+    return []
+
+
+def verify_headers(include_dir: Path, march=None):
     print(f"Verifying installed headers in: {include_dir}")
     if not include_dir.is_dir():
         raise RuntimeError(f"Installed header directory does not exist: {include_dir}")
@@ -210,6 +224,11 @@ def verify_headers(include_dir: Path):
     pkg_flags = [
         flag for flag in shlex.split(pkg_cflags) if flag not in bess_include_flags
     ]
+    leaks = machine_flag_problems(pkg_flags, march)
+    if leaks:
+        raise RuntimeError("\n".join(leaks))
+    isa = [flag for flag in pkg_flags if flag.startswith("-march=")]
+    print(f"  OK: bess-dev's ISA flags are bessd's alone: {' '.join(isa) or 'compiler default'}")
     compiler = shlex.split(os.environ.get("CXX", "c++"))
     if not compiler:
         raise RuntimeError("CXX must name a C++ compiler")
@@ -342,6 +361,18 @@ def run_self_test():
     reach = {**base, "utils/common.h": ["../flow/flow_key.h"]}
     got = include_problems(reach, headers)
     assert got == ["public utils/common.h includes experimental flow/flow_key.h: promote it or stop including it"], got
+    # bess-dev carries bessd's ISA and nothing from a dependency's build machine.
+    assert machine_flag_problems(["-I/x", "-march=x86-64-v3", "-DBESS_ARCH_GENERIC"]) == []
+    assert machine_flag_problems(["-I/x"]) == []
+    for leak in (["-march=x86-64-v3", "-march=native"], ["-march=x86-64-v3", "-mrtm"],
+                 ["-mcpu=neoverse-n1"], ["-march=armv8.2-a", "-moutline-atomics"]):
+        assert machine_flag_problems(["-I/x", *leak]), leak
+    # With bessd's cpu known, the plugin gets exactly that -march.
+    assert machine_flag_problems(["-march=armv8.2-a"], "armv8.2-a") == []
+    assert machine_flag_problems([], "") == []
+    assert machine_flag_problems([], "x86-64-v3")
+    assert machine_flag_problems(["-march=native"], "x86-64-v3")
+    assert machine_flag_problems(["-march=native"], "")
     print("Self-test PASSED: table, internal-file and include rules detect every injected defect.")
 
 
@@ -354,6 +385,8 @@ def main():
     )
     parser.add_argument("--self-test", action="store_true",
                         help="check the checker's own rules, no install needed")
+    parser.add_argument("--march", default=None,
+                        help="bessd's cpu option: bess-dev must carry exactly -march=<it>")
     args = parser.parse_args()
     if args.self_test:
         run_self_test()
@@ -362,7 +395,7 @@ def main():
         parser.error("--include-dir is required")
 
     try:
-        verify_headers(args.include_dir)
+        verify_headers(args.include_dir, args.march)
         print("ALL HEADER VERIFICATION CHECKS PASSED.")
         return 0
     except Exception as e:

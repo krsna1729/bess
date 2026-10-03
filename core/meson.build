@@ -791,6 +791,22 @@ test(
   is_parallel: false,
   suite: 'architecture',
 )
+# Architecture code stays in core/arch/; the allowlist grandfathers the rest
+# and only shrinks (M21, D-071).
+test(
+  'check_arch',
+  python,
+  args: [files('../tools/check_arch.py'), '--root', meson.project_source_root()],
+  is_parallel: false,
+  suite: 'architecture',
+)
+test(
+  'check_arch_self_test',
+  python,
+  args: [files('../tools/check_arch.py'), '--self-test'],
+  is_parallel: false,
+  suite: 'architecture',
+)
 test(
   'check_link_graph_self_test',
   python,
