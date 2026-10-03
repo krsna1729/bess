@@ -119,16 +119,21 @@ TEST(CounterSetTest, DeltaRules) {
 // owning a worker slot, add (1 packet, 1500 bytes) as one Update; a reader
 // snapshotting concurrently -- and resetting now and then -- must never see
 // bytes != 1500 x packets for any worker or in total. Removing the sequence
-// bumps breaks this within a few thousand snapshots.
+// bumps breaks this within a few thousand snapshots. The writers keep going
+// until the reader has taken kMinSnapshots: on a busy runner the reader thread
+// can be descheduled while the writers finish their fixed count (CI saw 7).
 TEST(CounterSetTest, SnapshotsNeverSplitAnUpdate) {
   CounterSet set({"packets", "bytes"});
   constexpr int kWriters = 4;
   constexpr uint64_t kPerWriter = 2'000'000;
+  constexpr uint64_t kMinSnapshots = 64;
   std::atomic<int> running{kWriters};
+  std::atomic<uint64_t> taken{0};
   std::vector<std::thread> writers;
   for (int t = 0; t < kWriters; t++) {
     writers.emplace_back([&, t] {
-      for (uint64_t i = 0; i < kPerWriter; i++) {
+      for (uint64_t i = 0;
+           i < kPerWriter || taken.load(std::memory_order_relaxed) < kMinSnapshots; i++) {
         auto u = set.Updating(W(static_cast<uint16_t>(t * 7)));
         u.Add(kPackets, 1);
         u.Add(kBytes, 1500);
@@ -142,6 +147,7 @@ TEST(CounterSetTest, SnapshotsNeverSplitAnUpdate) {
   while (running.load() > 0) {
     const CounterSnapshot snap = set.Snapshot(true);
     snapshots++;
+    taken.store(snapshots, std::memory_order_relaxed);
     if (snap.totals[kBytes] != 1500 * snap.totals[kPackets]) {
       split++;
     }
@@ -159,7 +165,7 @@ TEST(CounterSetTest, SnapshotsNeverSplitAnUpdate) {
     w.join();
   }
   EXPECT_EQ(0u, split) << "over " << snapshots << " snapshots";
-  EXPECT_GT(snapshots, 10u);
+  EXPECT_GE(snapshots, kMinSnapshots);
 }
 
 // Single-writer adds lose nothing, whatever the reader does meanwhile.
