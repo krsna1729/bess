@@ -82,6 +82,7 @@ file is the reasoning.
 | D-059 | One logging backend: glog included only through utils/logging.h, after absl | accepted |
 | D-060 | InterfaceId is 16 bits: a next hop stays 16 bytes | accepted |
 | D-061 | Release builds define NDEBUG; damage-guarding checks are CHECK | accepted |
+| D-062 | Decision cache: a typed flow cache with O(1) generation invalidation (M12) | accepted |
 
 
 ---
@@ -5397,3 +5398,67 @@ flow-table and bessd changes pass in it and in the fast tree. CI runs the full s
 
 **Revisit when:** a deployment wants the libstdc++ checks in its release binary (add a hardening profile then); a
 `DCHECK` is found guarding memory safety (promote it); `b_ndebug` changes meaning in Meson.
+
+## D-062 Decision cache: a typed flow cache with O(1) generation invalidation (M12)
+
+**Status:** accepted (2026-10-03), experimental API.
+**Code:** `core/flow/decision_cache.h` (new, header-only, installed experimental), `core/flow/decision_cache_test.cc`,
+`core/flow/decision_cache_bench.cc`, `core/meson.build`, `tools/api_classes.json`, `docs/flow-state.md`.
+
+**Context.** Roadmap M12: let an application compile rich policy (an OVS megaflow, a VFP layer stack) once per flow
+into an immutable decision and find it again per packet with one flow lookup, without BESS defining the policy or
+the decision, and with invalidation that does not walk the cache.
+
+**Decision.**
+- `DecisionCache<Key, DecisionId>` is a `WorkerFlowTable<Key, {DecisionId, uint64_t generation}>` (M9), owned by
+  one worker. `DecisionId` is any trivially copyable application id; BESS requires no `ActionId`. The application
+  resolves it in its own table (typically an RCU-published `SlotTable`).
+- `DecisionGeneration` is one 64-bit epoch per policy scope, on its own cache line, shared by every worker's cache.
+  `Invalidate()` is one atomic increment (acq_rel); `Current()` an acquire load, so a worker that sees generation g
+  sees the decision objects published before it. 64 bits never wrap.
+- Lookup is a hit only when the entry's generation equals the current one; otherwise `kStale` (counted as a miss
+  by the caller). `LookupBatch` reads the generation once per batch and reports stale positions separately.
+- `Install(key, id, compiled_at)` takes the generation the decision was compiled against and refuses
+  (`kStaleGeneration`) if the policy has moved on, so a decision compiled under old policy is never installed as
+  current. An existing entry (stale or current) is overwritten in place; a full cache refuses (`kFull`).
+- The control side must publish the new policy (and its decision objects) before `Invalidate()`. Otherwise a
+  worker can read the new generation, compile against the old policy and install that as current; the API cannot
+  check this caller order, so the header and `docs/flow-state.md` state it.
+- Stale entries keep their slot until reinstalled or erased (`Erase`, typically from M10 expiry); no sweep.
+- The miss path is the application's: read the generation, compile (or punt through M11), install. No graph module
+  is involved.
+- Not now: a shared multi-worker cache, dependency-aware (wildcard) invalidation, per-entry eviction policy.
+
+**Evidence.**
+- Tests (`flow_decision_cache_test`, 7, pass pinned to one CPU and to two): two reference consumers with unrelated
+  decision and id types (a VFP-style decision resolved through a `SlotTable`, an OVS-style action index); one
+  `Invalidate()` makes all 65,536 entries stale without touching them and reinstall reuses the slot; the
+  compile-then-install race is refused, including against an existing entry; full and erase; batch equals scalar
+  on random hit/miss/stale mixes (untouched miss positions); one invalidate reaches two workers' caches; the miss
+  path compiles and installs with no module. Three mutants each fail named tests: install ignoring `compiled_at`;
+  scalar lookup without the generation compare; batch lookup without it.
+- Hit path (GCC 16, release, x86-64-v3): against `WorkerFlowTable::Find`, `Lookup` adds one load of the entry's
+  generation (the entry's line), two loads for the shared generation (the reference, then the value on a
+  read-mostly line), one compare and branch, and the id load.
+- Benchmark (`flow_decision_cache_bench`, release with `NDEBUG`, `omarchy-benchmark --isolate --cpu 2`, no device
+  interrupts on CPU 2, medians of 3, single runs not paired), ns per lookup, decision cache (raw flow table):
+
+  | stream | 64K batch 1 | 64K batch 32 | 1M batch 1 | 1M batch 32 |
+  |---|---|---|---|---|
+  | one hot key | 4.18 (3.83) | 4.50 (4.24) | 4.32 (3.92) | 4.61 (4.32) |
+  | uniform hit | 7.97 (6.76) | 5.87 (5.58) | 35.85 (29.39) | 19.55 (19.83) |
+  | miss | 4.22 (3.86) | 3.68 (3.75) | 5.76 (5.97) | 4.20 (4.50) |
+  | half hit, half miss | 13.30 (12.33) | 9.08 (8.97) | 31.93 (26.33) | 15.05 (15.00) |
+  | half the entries stale | 16.51 | 9.32 | 41.83 | 21.32 |
+
+  At batch 32 the cache is within 0.3 ns of the raw table; scalar it adds 0.3-1.2 ns at 64K and up to 6.5 ns at
+  1M uniform (single run). Resolving the decision through a `SlotTable` and reading one field: 13.8 / 15.3 / 19.4
+  ns at 64K for 16 / 64 / 256-byte decisions, 75-79 ns at 1M (memory-bound). Install after a policy change: 33 ns
+  (64K), 63 ns (1M). 60 bytes per entry (16-byte key).
+
+**Not done.** No shipped module uses it (the roadmap asks for reference consumers, which the tests are). The hit
+path was not compared in paired runs; the numbers above are single runs. No 10M row. No ThreadSanitizer run (the
+shared part is one atomic with acquire/release, covered by the two-worker test).
+
+**Revisit when:** a consumer needs one cache shared by workers (then a `SharedFlowTable` variant), or invalidation
+narrower than a whole policy scope (one generation per group already works; per-rule dependencies would be new).

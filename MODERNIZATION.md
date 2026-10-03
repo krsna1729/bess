@@ -4940,6 +4940,13 @@ rather than one call site).
        re-measured in entry 144. The channel is slower in the R5 single
        runs too (one-way +17% / +68%, round trip +21% / +9% at bursts 8 / 32); single runs, not comparable in size
        with the paired results.
+150. **M12 Decision cache (D-062).** `flow/decision_cache.h`: `DecisionCache<Key, DecisionId>` over a worker-owned
+     `WorkerFlowTable`, with a shared 64-bit `DecisionGeneration` per policy scope. Invalidation is one increment;
+     installs carry the generation they were compiled against and are refused if policy moved on. Seven tests
+     (two unrelated decision types, O(1) invalidation of 65,536 entries, the compile/install race, full and erase,
+     batch against scalar, two workers, the module-free miss path); three mutants caught. Benchmark: at batch 32
+     within 0.3 ns of the raw flow table at 64K and 1M; scalar +0.3-1.2 ns at 64K. Hit-path instructions documented
+     in D-062. Exit criteria: agnostic cache, O(1) invalidation, codegen documented, miss path without modules.
 
 ## Review process established this session
 

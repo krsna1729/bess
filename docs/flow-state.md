@@ -224,6 +224,54 @@ may come from any thread and are serialized by one spinlock.
   directory erase; the tests use it to prove that every key already resolves to
   nothing there. Applications leave it alone.
 
+## DecisionCache
+
+```cpp
+#include "flow/decision_cache.h"
+
+DecisionGeneration policy;                       // one per policy scope, shared
+auto cache = DecisionCache<Tuple, MyDecisionId>::Create(1 << 16, policy).value();
+
+MyDecisionId id;
+switch (cache->Lookup(key, &id)) {
+  case DecisionLookup::kHit:   /* resolve id in the application's table */ break;
+  case DecisionLookup::kMiss:
+  case DecisionLookup::kStale: {
+    const uint64_t g = policy.Current();       // read before compiling
+    id = Compile(key);                          // or punt the key (M11)
+    cache->Install(key, id, g);                 // refused if policy moved on
+  }
+}
+// Control side: publish the new policy first, then invalidate (O(1)).
+PublishNewPolicy();
+policy.Invalidate();
+```
+
+A `WorkerFlowTable` whose State is `{DecisionId, generation}` (M12, D-062). The
+cache knows nothing about what a decision is: `DecisionId` is the application's
+id type, resolved in the application's own table (typically an RCU-published
+`SlotTable`). A hit is one flow lookup and one compare with the policy scope's
+current generation; `LookupBatch` reads the generation once per batch.
+
+- **Invalidation is O(1).** `DecisionGeneration::Invalidate()` is one increment;
+  every entry compiled against an older generation reads as `kStale`. The
+  generation is 64 bits and never wraps.
+- **Install is checked against the generation the decision was compiled for.**
+  A policy change between reading the generation and installing makes the
+  install `kStaleGeneration`, so a decision compiled against old policy is never
+  installed as current -- if the control side publishes the new policy before
+  calling `Invalidate()`. Invalidating first lets a worker read the new
+  generation, compile against the old policy and install it as current.
+- **Stale entries keep their slot** until their key is installed again (reused
+  in place) or erased; keys that do not come back leave through `Erase`,
+  typically driven by `ExpiryWheel`. There is no sweep. A cache full of stale
+  entries refuses new keys (`kFull`).
+- **Ownership:** one worker owns a cache (it is a `WorkerFlowTable`); any thread
+  may invalidate. Decision objects are published and retired through RCU, since
+  a worker may hold an id across a policy change until its next quiescent state.
+- There is no shared (multi-worker) variant yet: a steerable workload gives each
+  worker its own cache under one shared generation.
+
 ## Memory
 
 Per flow, at full occupancy:
