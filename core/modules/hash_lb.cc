@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include "dataplane/member_select.h"
+
 static inline uint32_t hash_16(uint16_t val, uint32_t init_val) {
 #if __x86_64
   return crc32c_sse42_u16(val, init_val);
@@ -23,23 +25,11 @@ static inline uint32_t hash_32(uint32_t val, uint32_t init_val) {
 #endif
 }
 
-/* Returns a value in [0, range) as a function of an opaque number.
- * Also see utils/random.h */
+// Returns a value in [0, range) as a function of an opaque number: the shared
+// range mapping (M16, D-066), which computes exactly what the floating-point
+// form here did (floor(hash * range / 2^32)), so no flow changes gate.
 static inline uint16_t hash_range(uint32_t hashval, uint16_t range) {
-#if 1
-  union {
-    uint64_t i;
-    double d;
-  } tmp;
-
-  /* the resulting number is 1.(b0)(b1)..(b31)00000..00 */
-  tmp.i = 0x3ff0000000000000ull | (static_cast<uint64_t>(hashval) << 20);
-
-  return (tmp.d - 1.0) * range;
-#else
-  /* This IDIV instruction is significantly slower */
-  return hashval % range;
-#endif
+  return static_cast<uint16_t>(bess::dataplane::RangeSelect(hashval, range));
 }
 
 

@@ -43,6 +43,7 @@
     "dataplane/generation_handle.h": "experimental",
     "dataplane/handoff.h": "experimental",
     "dataplane/interface_id.h": "experimental",
+    "dataplane/member_select.h": "experimental",
     "dataplane/object_table.h": "experimental",
     "dataplane/resource.h": "experimental",
     "dataplane/scope.h": "experimental",

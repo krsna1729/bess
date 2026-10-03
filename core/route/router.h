@@ -21,6 +21,7 @@
 
 #include "dataplane/batch_stages.h"
 #include "dataplane/interface_id.h"
+#include "dataplane/member_select.h"
 #include "dataplane/resource.h"
 #include "dataplane/slot_table.h"
 #include "packet.h"
@@ -86,16 +87,15 @@ inline std::expected<void, packet::MutationError> RewriteL2(
 // An ECMP group (M15, D-065): 1..kMaxMembers next hops, immutable once
 // published. A flow picks a member by its hash, so one flow keeps one path
 // while the membership is unchanged; how the hash is made (which fields, which
-// algorithm) is the application's (M16 adds selection algorithms).
+// algorithm) is the application's (dataplane/member_select.h, D-066).
 struct NextHopGroup {
   static constexpr size_t kMaxMembers = 64;
   uint32_t size = 0;
   std::array<NextHopId, kMaxMembers> members{};
 
-  // Lemire's multiply-shift: uniform over the members for a uniform 32-bit
-  // hash, no division.
+  // Uniform over the members for a uniform 32-bit hash, no division.
   NextHopId Select(uint32_t flow_hash) const noexcept {
-    return members[(uint64_t{flow_hash} * size) >> 32];
+    return members[dataplane::RangeSelect(flow_hash, size)];
   }
 };
 
