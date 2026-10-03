@@ -4733,6 +4733,7 @@ rather than one call site).
        after glog there; `bessd` never initialises absl logging, so those lines miss glog's files and `--v`.
      - **Open:** the e035e892 CI run's Clang lanes stalled 4 h in the build and were cancelled (GCC lanes
        passed; a local Clang 22 build of the same lane takes 403 s). Re-run CI and diagnose if it recurs.
+       *(Recurred on a13f4da1; root-caused and fixed in entry 141.)*
      - **Not done:** the M0 paired baseline, the M6 Router check, M10 10M and `rte_timer` 1M points,
        the SharedFlowTable 10M row, the M11 streaming slowdown.
 
@@ -4764,6 +4765,33 @@ rather than one call site).
        erase windows, a crowded-directory differential test and a bounded concurrent visibility test; erase-order and
        validation mutants fail deterministically on one CPU; tests 3/3 pinned to one and two CPUs; full suite 109/109
        in the worktree; the hook compiles to identical production code.
+
+141. **CI Clang lanes: duplicated DPDK link flags hung GNU ld; a plugin test depended on readdir order.**
+     - **Hang:** both Clang lanes stalled for hours at build step 623/624 on e035e892 and a13f4da1. The
+       unfinished edge was `Linking target core/runtime_startup_test` (CI log edges against an identical local
+       configure). Reproduced in the CI image (`tools/ci_container.sh clang all`): `/usr/bin/ld` (binutils 2.42)
+       at 100% CPU in libbfd `strcmp`. The link had 769 `-l` flags in one `--start-group`: DPDK's 58 libraries
+       13 times, plus BESS's own. `dpdk_dep` is a `declare_dependency` with raw `link_args` (from `pkg-config --libs`), which Meson
+       does not deduplicate, and each of the 13 static libraries that listed it passed them on to every link.
+     - **Fix:** static libraries take `dpdk_dep.partial_dependency(compile_args: true, includes: true)`;
+       executables and plugins still link the full `dpdk_dep` once (runtime_deps, or listed directly). Links now
+       carry 61 `-l` flags (one `rte_eal`). The captured link with the duplicates removed finishes in 1.0 s; the
+       same unmodified command through `g++-14` was still running at 150 s, so the cause is GNU ld's handling of
+       this argument list, not the Clang driver (why only Clang-built objects trigger it was not investigated).
+     - **Plugin test:** `sample_plugin_load` failed 3/3 in one build tree and passed in another. Both
+       `incompatible_probe` and `sequential_update` compiled `sample_supdate_msg.pb.cc`; the loader opens plugins in
+       `readdir()` order, `dlopen()` runs the probe's descriptor registration before the daemon refuses it, and
+       `dlclose()` does not undo it, so when the probe came first `sequential_update`'s registration aborted bessd
+       ("File already exists in database: supdate_msg.proto"). The probe does not use that proto; it no longer
+       compiles it. Both plugins now also wait for core's protoc outputs (`proto_ready_marker`), which `module.h`
+       reaches; before, nothing ordered their compiles after them in a clean build.
+     - **Evidence (link fix, before the plugin change):** CI image, clang-19 lane: build completes; tests pass except
+       three that cannot start DPDK's EAL in the container (`Failed to get current mempolicy: Operation not
+       permitted`, ENOMEM); static release lane (gcc-14, static DPDK) passes, including its no-dynamic-DPDK check;
+       fast tree 112/112. DPDK NEEDED entries of all 103 fast-tree executables unchanged (reviewer).
+     - **Evidence (plugin change):** the tree that failed 3/3 passed 3/3; with both changes, a fresh `build/fast`
+       (configured from nothing, ccache warm) builds, passes 112/112 and `sample_plugin_load` 3/3; both plugin compile
+       edges list `core_proto_ready.h` as an order-only input. Reviewed: Opus 5.5 high.
 
 ## Review process established this session
 

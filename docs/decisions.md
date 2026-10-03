@@ -4653,7 +4653,8 @@ for the first time here and is caught.
 - **Compiler coverage:** the M11 code at `627fa286` passed the GCC 14 and Clang 19 CI lanes (run 37001729024).
   The follow-up `ContinuationTable::Resolve` seam was syntax-checked with Clang 22. The e035e892 CI run's GCC
   lanes passed; both Clang lanes stalled for 4 hours in the build and the run was cancelled (a local Clang 22
-  build of the same lane completes in 403 s). Open item in MODERNIZATION.md entry 139.
+  build of the same lane completes in 403 s). Open item in MODERNIZATION.md entry 139. *(Annotation: it recurred
+  on a13f4da1; cause and fix in MODERNIZATION.md entry 141: duplicated DPDK link flags hung GNU ld.)*
 - **One-way streaming slowdown:** not yet investigated further; the ranked hypotheses and experiments are in a
   local plan (not committed). It is tracked and will be measured under `omarchy-benchmark`. No cause is claimed.
 - **Counter layout matrix:** the main matrix used 64-byte counter groups; a limited A/B after moving the groups

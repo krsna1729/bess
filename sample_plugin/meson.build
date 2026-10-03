@@ -3,6 +3,7 @@ sample_plugin = shared_module(
   [
     'modules/sequential_update.cc',
     sample_cpp_target,
+    proto_ready_marker,  # core pb/*.pb.h, reached through module.h
   ],
   include_directories: core_include,
   cpp_args: core_cpp_include + sample_proto_include,
@@ -12,9 +13,13 @@ sample_plugin = shared_module(
   install_dir: join_paths(get_option('libdir'), 'bess', 'modules'),
 )
 # Test-only: declares an unsupported API range; the daemon must refuse it.
+# It must not carry sample_cpp_target: dlopen() runs the generated file's
+# static registration before the daemon can refuse the plugin, and dlclose()
+# does not undo it, so a probe loaded before sequential_update (readdir order)
+# made that plugin's identical registration abort the daemon.
 incompatible_probe = shared_module(
   'incompatible_probe',
-  ['modules/incompatible_probe.cc', sample_cpp_target],
+  ['modules/incompatible_probe.cc', proto_ready_marker],
   include_directories: core_include,
   cpp_args: core_cpp_include + sample_proto_include,
   dependencies: [dpdk_dep, glog_dep, protobuf_dep, grpcpp_dep],
