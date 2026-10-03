@@ -87,6 +87,7 @@ file is the reasoning.
 | D-064 | L2 forwarding database: a graph-independent FDB on a MAC-specialised table (M14) | accepted |
 | D-065 | L3 batteries: next-hop groups in the Router, neighbor table, L3 packet helpers (M15) | accepted |
 | D-066 | Member selection: shared algorithms, no shared group object (M16) | accepted |
+| D-067 | Connection tracking: a library over the flow table and the expiry wheel (M17) | accepted |
 
 
 ---
@@ -5817,3 +5818,105 @@ the member); per-flow stickiness across rebuilds (a flow table's job, M17).
 
 **Revisit when:** a consumer needs weighted consistent hashing, or groups large enough that Maglev's table size
 should scale with membership by default.
+
+## D-067 Connection tracking: a library over the flow table and the expiry wheel (M17)
+
+**Status:** accepted (2026-10-04), experimental API.
+**Code:** `core/conntrack/packet_parse.h`, `core/conntrack/conntrack.h` (new, header-only, installed
+experimental), `core/conntrack/conntrack_test.cc`, `core/conntrack/conntrack_bench.cc`, `core/meson.build`,
+`tools/check_includes.py`, `tools/api_classes.json`.
+
+**Context.** Roadmap M17: protocol-aware bidirectional connection state on M9/M10, without firewall, NAT or
+action-syntax policy; checked parsing (no fixed Ethernet header, no untagged-IPv4 assumption, no unvalidated
+contiguity); a narrow parsed-packet descriptor.
+
+**Decision.**
+- **Parser** (`ParseFrame`, `ParseIpPacket` → `ParsedFlowPacket`): up to two 802.1Q/802.1ad tags; IPv4 with
+  options (IHL ≥ 5, total length within the frame); IPv6 with up to 8 extension headers (hop-by-hop, routing,
+  destination options, fragment), each length checked; TCP (data offset ≥ 5 and within the packet), UDP
+  (length ≥ 8 and within the packet), ICMP/ICMPv6 (8 bytes). Non-initial fragments are `kFragment` (no L4). A
+  first fragment (IPv4 MF with offset 0, or an IPv6 fragment header at offset 0) is parsed through and flagged,
+  and only the fixed L4 header is required (the UDP length and TCP options may continue in later fragments). An
+  EtherType that disagrees with the IP version is malformed. The descriptor holds offsets, L3/L4 kinds,
+  addresses, ports (or the ICMP echo identifier), TCP flags and the first-fragment flag: 50 bytes, no payload
+  view.
+- **Key**: both endpoints in canonical order (the lesser (address, port) is A) plus protocol, family and a
+  caller-supplied zone (a VRF or tenant): one 40-byte padding-free key for both directions. Built with word stores
+  and big-endian word compares (the field-by-field build cost 36 against 20 ns a packet, below).
+- **Tracker** (`Conntrack<UserData>`): one worker's `WorkerFlowTable<CtKey, Entry>` plus an `ExpiryWheel` whose
+  payload is the flow handle. `Track(frame, parsed, now, zone, may_create)` returns kNew, kExisting, kRelated,
+  kInvalid, kUntracked or kFull with the direction and the entry. TCP follows Linux nf_conntrack's state table
+  (states and transitions, `tcp_conntracks`), without sequence or window tracking; mid-stream pickup is a policy
+  switch, off by default (Linux's `nf_conntrack_tcp_loose` defaults on). A SYN that takes TIME_WAIT or CLOSE back
+  to SYN_SENT reopens the tuple as a new connection (kNew; the SYN's sender is the initiator; `replied` and
+  `UserData` start afresh), as Linux kills the old entry and re-evaluates the packet; unlike Linux, the reopened
+  connection keeps the old flow handle (state keyed outside the entry by handle sees one object). UDP has
+  unreplied/replied
+  timeouts; ICMP echo requests start a connection, replies match it, and errors are kRelated to the connection
+  their quote names (the quote is parsed leniently, as it is truncated; a quoted non-initial fragment, or a quoted
+  ICMP other than an echo, names nothing); other ICMP types are untracked; other protocols are tracked by
+  addresses. Timeouts are a `TimeoutPolicy` (Linux's defaults, in the caller's tick unit via `Scaled`); a
+  connection's deadline is refreshed on every accepted packet and can be set by the caller (`SetDeadline`).
+  `may_create = false` is the hook for a policy that refuses new connections; `UserData` is the consumer's own
+  per-connection state (a firewall verdict, a NAT binding), opaque here.
+
+**Evidence.** `conntrack_bench`, release `NDEBUG`, gcc x86-64-v3, `omarchy-benchmark --isolate --cpu 2`,
+3 repetitions, medians, on the code after review. Track rows: established connections; the stream holds one packet
+for each of `conns` connections drawn at random with replacement (about 63% of the connections, some several
+times), read sequentially, so the table and the wheel are accessed at random; the handshake row runs SYN, SYN-ACK,
+ACK, FIN, ACK, FIN, ACK per connection; the expire row times only `Expire` (setup and teardown are paused). CPU 2:
+no device IRQs, 3,246 thermal-event interrupts, timer and SCHED softirqs; wrapper verdict "contamination".
+
+| benchmark | ns |
+|---|---|
+| parse TCP/IPv4 | 3.51 |
+| parse UDP/IPv4, 2 VLAN tags | 3.43 |
+| parse UDP/IPv6, 2 ext headers | 4.15 |
+| parse truncated (rejected) | 1.73 |
+| track: TCP ACK, original (no transition), 1024 conns | 14.69 (accepted 100%) |
+| track: TCP ACK, reply, 1024 conns | 15.19 (accepted 100%) |
+| track: UDP refresh, 1024 conns | 13.44 (accepted 100%) |
+| track: TCP ACK, original (no transition), 65536 conns | 27.28 (accepted 100%) |
+| track: TCP ACK, reply, 65536 conns | 30.09 (accepted 100%) |
+| track: UDP refresh, 65536 conns | 20.87 (accepted 100%) |
+| track: TCP ACK, original (no transition), 1048576 conns | 147.78 (accepted 100%) |
+| track: TCP ACK, reply, 1048576 conns | 149.32 (accepted 100%) |
+| track: UDP refresh, 1048576 conns | 94.88 (accepted 100%) |
+| track: TCP handshake+close, per packet, 1024 conns | 17.66 (accepted 100%) |
+| track: TCP handshake+close, per packet, 65536 conns | 20.68 (accepted 100%) |
+| expire, 65536 at once | 31.17 per conn |
+
+- The key build: field-by-field stores, read back by the hash in 8-byte words, defeated store forwarding, and the
+  address order called `memcmp`; `BM_Track/0/1024` and `/2/1024` measured 35.9 / 34.8 ns with that build and
+  20.4 / 18.3 ns with the word build (unisolated, CPU 6, two runs each).
+- At 1M connections a packet costs 95-149 ns: the index bucket, the slot and the wheel node are each a likely
+  cache miss, and `Track` is scalar (no prefetch). TCP rows are slower than UDP, and the gap grows with the
+  table: about 1-2 ns at 1K, 6-9 ns at 64K, 53-54 ns at 1M [not investigated].
+- The review fixes cost parsing about 0.4 ns (TCP/IPv4 3.13 → 3.51 ns between the isolated runs before and after);
+  the track rows moved by less than 2.5 ns.
+
+**Mutation checks** (`conntrack_conntrack_test`, fast build; 26, all caught after strengthening; outputs in the
+PR): parser — IHL below 5 accepted, total length unchecked, TCP data offset unchecked, IPv4 fragments parsed, IPv6
+extension length unchecked, one VLAN tag only, EtherType/version mismatch accepted; key — not canonical, zone
+dropped, low address word ignored, protocol dropped; tracker — reply SYN-ACK in SYN_SENT invalid, invalid
+transitions accepted (the test aborts), `replied` never set, pickup always on, echo replies starting connections,
+`may_create` ignored, related direction not flipped, the replied UDP timeout unused, no refresh on packets. Five
+survived the first tests (the IHL bound, the extension-header length and the version check because the malformed
+inputs also failed other checks; the low address word and the protocol because the tests used IPv4 only and one
+protocol); each test was strengthened so that only the guarded check can catch it, and all five were caught. After
+review: a reopen keeping the old entry, the UDP length and TCP options checked on a first fragment, an IPv6 first
+fragment not flagged, a quoted fragment keyed, a quoted ICMP type unchecked — all caught.
+
+**Review** (reviewer agent): round 1 found the TCP table (cell for cell against Linux), timeouts, parser bounds,
+key, directions and timers correct, with four findings, all fixed: a reopen kept the old initiator (a
+reverse-direction reopen could not complete); first fragments of large UDP datagrams (and of TCP with options) were
+malformed; quotes of non-initial fragments and of non-echo ICMP were keyed; this record's TCP/UDP comparison,
+sampling description and expire timing were wrong. Round 2: correct, go, no findings.
+
+**Not done.** TCP sequence and window tracking; a batch `Track` with prefetch; IPv6 extension headers inside ICMP
+error quotes; per-zone or per-protocol limits; expectation helpers for related protocols (FTP data); persistence
+and synchronisation between workers (a connection belongs to one worker; RSS or a handoff steers both directions
+to it).
+
+**Revisit when:** a consumer needs window checks (then sequence tracking per direction), or the 1M-connection
+cost matters (a batch path that prefetches the index, slot and wheel node).

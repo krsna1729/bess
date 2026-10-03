@@ -122,6 +122,19 @@ FORBIDDEN_RULES = [
             ("pb/", "L2 library must not depend on protobuf"),
         ],
     ),
+    # The conntrack library (M17, D-067) is a networking library over flow and
+    # expiry: no Module, gate, framework, runtime, control or protobuf.
+    (
+        re.compile(r"^core/conntrack/"),
+        [
+            ("module.h", "conntrack must not depend on Module"),
+            ("gate.h", "conntrack must not depend on gates"),
+            ("framework/", "conntrack must not depend on framework"),
+            ("runtime/", "conntrack must not depend on runtime"),
+            ("control/", "conntrack must not depend on control"),
+            ("pb/", "conntrack must not depend on protobuf"),
+        ],
+    ),
     # The flow-state library is graph-independent and sits below the worker: no
     # Module, gate, framework, runtime, control or protobuf, and no worker.h or
     # stats/current_worker.h (worker identity is an injected owner token; M9,
@@ -281,6 +294,7 @@ SELF_TEST_CASES = [
     ("core/dataplane/batch_stages.h", '#include "stats/worker_slots.h"', 1),
     ("core/flow/worker_flow_table.h", '#include "module.h"', 1),
     ("core/l2/fdb.h", '#include "gate.h"', 1),
+    ("core/conntrack/conntrack.h", '#include "gate.h"', 1),
     ("core/flow/owner.h", '#include "stats/current_worker.h"', 1),
     ("core/dataplane/expiry_wheel.h", '#include "flow/flow_types.h"', 1),
     ("core/dataplane/expiry_wheel.h", '#include "worker.h"', 1),
