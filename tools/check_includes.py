@@ -135,6 +135,19 @@ FORBIDDEN_RULES = [
             ("pb/", "conntrack must not depend on protobuf"),
         ],
     ),
+    # The NAT library (M18, D-068): no Module, gate, framework, runtime, control
+    # or protobuf.
+    (
+        re.compile(r"^core/nat/"),
+        [
+            ("module.h", "NAT library must not depend on Module"),
+            ("gate.h", "NAT library must not depend on gates"),
+            ("framework/", "NAT library must not depend on framework"),
+            ("runtime/", "NAT library must not depend on runtime"),
+            ("control/", "NAT library must not depend on control"),
+            ("pb/", "NAT library must not depend on protobuf"),
+        ],
+    ),
     # The flow-state library is graph-independent and sits below the worker: no
     # Module, gate, framework, runtime, control or protobuf, and no worker.h or
     # stats/current_worker.h (worker identity is an injected owner token; M9,
@@ -295,6 +308,7 @@ SELF_TEST_CASES = [
     ("core/flow/worker_flow_table.h", '#include "module.h"', 1),
     ("core/l2/fdb.h", '#include "gate.h"', 1),
     ("core/conntrack/conntrack.h", '#include "gate.h"', 1),
+    ("core/nat/nat.h", '#include "module.h"', 1),
     ("core/flow/owner.h", '#include "stats/current_worker.h"', 1),
     ("core/dataplane/expiry_wheel.h", '#include "flow/flow_types.h"', 1),
     ("core/dataplane/expiry_wheel.h", '#include "worker.h"', 1),

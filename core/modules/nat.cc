@@ -3,31 +3,27 @@
 
 #include "nat.h"
 
-#include <span>
-
 #include <algorithm>
-#include <numeric>
+#include <array>
+#include <span>
 #include <string>
+#include <utility>
+#include <vector>
 
-#include "utils/checksum.h"
-#include "utils/common.h"
-#include "utils/ether.h"
+#include "conntrack/packet_parse.h"
 #include "utils/format.h"
-#include "utils/icmp.h"
 #include "utils/ip.h"
-#include "utils/tcp.h"
-#include "utils/udp.h"
+#include "utils/time.h"
 
-using bess::utils::Ethernet;
-using bess::utils::Ipv4;
-using IpProto = bess::utils::Ipv4::Proto;
-using bess::utils::Udp;
-using bess::utils::Tcp;
-using bess::utils::Icmp;
-using bess::utils::ChecksumIncrement16;
-using bess::utils::ChecksumIncrement32;
-using bess::utils::UpdateChecksumWithIncrement;
-using bess::utils::UpdateChecksum16;
+namespace {
+
+namespace nat = bess::nat;
+using bess::utils::be32_t;
+
+// Wheel work per batch.
+constexpr size_t kExpireBudget = 256;
+
+}  // namespace
 
 const Commands NAT::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&NAT::GetInitialArg),
@@ -37,7 +33,6 @@ const Commands NAT::cmds = {
     {"set_runtime_config", "EmptyArg", MODULE_CMD_FUNC(&NAT::SetRuntimeConfig),
      Command::THREAD_SAFE}};
 
-// TODO(torek): move this to set/get runtime config
 CommandResponse NAT::Init(const bess::pb::NATArg &arg) {
   // Check before committing any changes.
   for (const auto &address_range : arg.ext_addrs()) {
@@ -50,54 +45,55 @@ CommandResponse NAT::Init(const bess::pb::NATArg &arg) {
     }
   }
 
+  nat::Nat::Config config;
   for (const auto &address_range : arg.ext_addrs()) {
-    auto ext_addr = address_range.ext_addr();
-    be32_t addr;
-
-    bool ret = bess::utils::ParseIpv4Address(ext_addr, &addr);
-    if (!ret) {
-      return CommandFailure(EINVAL, "invalid IP address %s", ext_addr.c_str());
+    nat::ExternalAddress ext;
+    if (!bess::utils::ParseIpv4Address(address_range.ext_addr(), &ext.addr)) {
+      return CommandFailure(EINVAL, "invalid IP address %s",
+                            address_range.ext_addr().c_str());
     }
-
-    ext_addrs_.push_back(addr);
-    // Add a port range list
-    std::vector<PortRange> port_list;
     if (address_range.port_ranges().size() == 0) {
-      port_list.emplace_back(PortRange{
-          .begin = 0u, .end = 65535u, .suspended = false,
-      });
+      ext.ranges.push_back({0, 65535, false});
     }
     for (const auto &range : address_range.port_ranges()) {
-      port_list.emplace_back(PortRange{
-          .begin = (uint16_t)range.begin(),
-          .end = (uint16_t)range.end(),
-          // Control plane gets to decide if the port range can be used.
-          .suspended = range.suspended()});
+      // Control plane gets to decide if the port range can be used.
+      ext.ranges.push_back({static_cast<uint16_t>(range.begin()), range.end(),
+                            range.suspended()});
     }
-    port_ranges_.push_back(port_list);
+    config.addresses.push_back(std::move(ext));
   }
-
-  if (ext_addrs_.empty()) {
+  if (config.addresses.empty()) {
     return CommandFailure(EINVAL,
                           "at least one external IP address must be specified");
   }
-
-  // Sort so that GetInitialArg is predictable and consistent.
-  std::sort(ext_addrs_.begin(), ext_addrs_.end());
-
+  // Sorted (with their ranges) so GetInitialArg is predictable and an internal
+  // address maps to the same external one as before (the hash indexes this
+  // order).
+  std::stable_sort(config.addresses.begin(), config.addresses.end(),
+                   [](const auto &a, const auto &b) { return a.addr < b.addr; });
+  // As many bindings as the addresses' ports can serve, at most 1M: the
+  // table is allocated here (about 130 bytes a binding, D-068).
+  config.capacity = nat::Nat::CapacityFor(config.addresses);
+  config.start = tsc_to_ns(rdtsc());
+  config.seed = rdtsc();
+  auto made = nat::Nat::Create(config);
+  if (!made) {
+    return CommandFailure(ENOMEM, "cannot create the NAT binding table");
+  }
+  nat_ = std::move(*made);
   return CommandSuccess();
 }
 
 CommandResponse NAT::GetInitialArg(const bess::pb::EmptyArg &) {
   bess::pb::NATArg resp;
-  for (size_t i = 0; i < ext_addrs_.size(); i++) {
+  for (const auto &a : nat_->addresses()) {
     auto ext = resp.add_ext_addrs();
-    ext->set_ext_addr(ToIpv4Address(ext_addrs_[i]));
-    for (auto irange : port_ranges_[i]) {
+    ext->set_ext_addr(ToIpv4Address(a.addr));
+    for (const auto &r : a.ranges) {
       auto erange = ext->add_port_ranges();
-      erange->set_begin((uint32_t)irange.begin);
-      erange->set_end((uint32_t)irange.end);
-      erange->set_suspended(irange.suspended);
+      erange->set_begin(r.begin);
+      erange->set_end(r.end);
+      erange->set_suspended(r.suspended);
     }
   }
   return CommandSuccess(resp);
@@ -111,255 +107,39 @@ CommandResponse NAT::SetRuntimeConfig(const bess::pb::EmptyArg &) {
   return CommandSuccess();
 }
 
-static inline std::pair<bool, Endpoint> ExtractEndpoint(const Ipv4 *ip,
-                                                        const void *l4,
-                                                        NAT::Direction dir) {
-  IpProto proto = static_cast<IpProto>(ip->protocol);
-
-  if (likely(proto == IpProto::kTcp || proto == IpProto::kUdp)) {
-    // UDP and TCP share the same layout for port numbers
-    const Udp *udp = static_cast<const Udp *>(l4);
-    Endpoint ret;
-
-    if (dir == NAT::kForward) {
-      ret = {.addr = ip->src, .port = udp->src_port, .protocol = proto};
-    } else {
-      ret = {.addr = ip->dst, .port = udp->dst_port, .protocol = proto};
-    }
-
-    return std::make_pair(true, ret);
-  }
-
-  // slow path
-  if (proto == IpProto::kIcmp) {
-    const Icmp *icmp = static_cast<const Icmp *>(l4);
-    Endpoint ret;
-
-    if (icmp->type == 0 || icmp->type == 8 || icmp->type == 13 ||
-        icmp->type == 15 || icmp->type == 16) {
-      if (dir == NAT::kForward) {
-        ret = {
-            .addr = ip->src, .port = icmp->ident, .protocol = IpProto::kIcmp};
-      } else {
-        ret = {
-            .addr = ip->dst, .port = icmp->ident, .protocol = IpProto::kIcmp};
-      }
-
-      return std::make_pair(true, ret);
-    }
-  }
-
-  return std::make_pair(
-      false, Endpoint{.addr = ip->src, .port = be16_t(0), .protocol = 0});
-}
-
-// Not necessary to inline this function, since it is less frequently called
-NAT::HashTable::Entry *NAT::CreateNewEntry(const Endpoint &src_internal,
-                                           uint64_t now) {
-  Endpoint src_external;
-
-  // An internal IP address is always mapped to the same external IP address,
-  // in an deterministic manner (rfc4787 REQ-2)
-  size_t hashed = rte_hash_crc(&src_internal.addr, sizeof(be32_t), 0);
-  size_t ext_addr_index = hashed % ext_addrs_.size();
-  src_external.addr = ext_addrs_[ext_addr_index];
-  src_external.protocol = src_internal.protocol;
-
-  for (const auto &port_range : port_ranges_[ext_addr_index]) {
-    uint16_t min;
-    uint16_t range;  // consider [min, min + range) port range
-    // Avoid allocation from an unusable range. We do this even when a range is
-    // already in use since we might want to reclaim it once flows die out.
-    if (port_range.suspended) {
-      continue;
-    }
-
-    if (src_internal.protocol == IpProto::kIcmp) {
-      min = port_range.begin;
-      range = port_range.end - port_range.begin;
-    } else {
-      if (src_internal.port == be16_t(0)) {
-        // ignore port number 0
-        return nullptr;
-      } else if (src_internal.port & ~be16_t(1023)) {
-        if (port_range.end <= 1024u) {
-          continue;
-        }
-        min = std::max((uint16_t)1024, port_range.begin);
-        range = port_range.end - min + 1;
-      } else {
-        // Privileged ports are mapped to privileged ports (rfc4787 REQ-5-a)
-        if (port_range.begin >= 1023u) {
-          continue;
-        }
-        min = port_range.begin;
-        range = std::min((uint16_t)1023, port_range.end) - min;
-      }
-    }
-
-    // Start from a random port, then do linear probing
-    uint16_t start_port = min + rng_.GetRange(range);
-    uint16_t port = start_port;
-    int trials = 0;
-
-    do {
-      src_external.port = be16_t(port);
-      auto *hash_reverse = map_.Find(src_external);
-      if (hash_reverse == nullptr) {
-      found:
-        // Found an available src_internal <-> src_external mapping
-        NatEntry forward_entry;
-        NatEntry reverse_entry;
-
-        reverse_entry.endpoint = src_internal;
-        map_.Insert(src_external, reverse_entry);
-
-        forward_entry.endpoint = src_external;
-        return map_.Insert(src_internal, forward_entry);
-      } else {
-        // A':a' is not free, but it might have been expired.
-        // Check with the forward hash entry since timestamp refreshes only for
-        // forward direction.
-        auto *hash_forward = map_.Find(hash_reverse->second.endpoint);
-
-        // Forward and reverse entries must share the same lifespan.
-        DCHECK(hash_forward != nullptr);
-
-        if (now - hash_forward->second.last_refresh > kTimeOutNs) {
-          // Found an expired mapping. Remove A':a' <-> A'':a''...
-          map_.Remove(hash_forward->first);
-          map_.Remove(hash_reverse->first);
-          goto found;  // and go install A:a <-> A':a'
-        }
-      }
-
-      port++;
-      trials++;
-
-      // Out of range? Also check if zero due to uint16_t overflow
-      if (port == 0 || port >= min + range) {
-        port = min;
-      }
-      // FIXME: Should not try for kMaxTrials.
-    } while (port != start_port && trials < kMaxTrials);
-  }
-  return nullptr;
-}
-
-template <NAT::Direction dir>
-inline void Stamp(Ipv4 *ip, void *l4, const Endpoint &before,
-                  const Endpoint &after) {
-  IpProto proto = static_cast<IpProto>(ip->protocol);
-  DCHECK_EQ(before.protocol, after.protocol);
-  DCHECK_EQ(before.protocol, proto);
-
-  if (dir == NAT::kForward) {
-    ip->src = after.addr;
-  } else {
-    ip->dst = after.addr;
-  }
-
-  uint32_t l3_increment =
-      ChecksumIncrement32(before.addr.raw_value(), after.addr.raw_value());
-  ip->checksum = UpdateChecksumWithIncrement(ip->checksum, l3_increment);
-
-  uint32_t l4_increment =
-      l3_increment +
-      ChecksumIncrement16(before.port.raw_value(), after.port.raw_value());
-
-  if (likely(proto == IpProto::kTcp || proto == IpProto::kUdp)) {
-    Udp *udp = static_cast<Udp *>(l4);
-    if (dir == NAT::kForward) {
-      udp->src_port = after.port;
-    } else {
-      udp->dst_port = after.port;
-    }
-
-    if (proto == IpProto::kTcp) {
-      Tcp *tcp = static_cast<Tcp *>(l4);
-      tcp->checksum = UpdateChecksumWithIncrement(tcp->checksum, l4_increment);
-    } else {
-      // NOTE: UDP checksum is tricky in two ways:
-      // 1. if the old checksum field was 0 (not set), no need to update
-      // 2. if the updated value is 0, use 0xffff (rfc768)
-      if (udp->checksum != 0) {
-        udp->checksum =
-            UpdateChecksumWithIncrement(udp->checksum, l4_increment) ?: 0xffff;
-      }
-    }
-  } else {
-    DCHECK_EQ(proto, IpProto::kIcmp);
-    Icmp *icmp = static_cast<Icmp *>(l4);
-    icmp->ident = after.port;
-
-    // ICMP does not have a pseudo header
-    icmp->checksum = UpdateChecksum16(icmp->checksum, before.port.raw_value(),
-                                      after.port.raw_value());
-  }
-}
-
-template <NAT::Direction dir>
-inline void NAT::DoProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  gate_idx_t ogate_idx = dir == kForward ? 1 : 0;
+void NAT::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+  const auto dir = ctx->current_igate == 0 ? nat::Direction::kForward
+                                           : nat::Direction::kReverse;
+  const gate_idx_t ogate = dir == nat::Direction::kForward ? 1 : 0;
+  const uint64_t now = ctx->current_ns;
+  nat_->Expire(now, kExpireBudget);
   const int cnt = batch->cnt();
-  uint64_t now = ctx->current_ns;
-
-  // Parse first so the flow table can warm every packet's bucket before the
-  // lookups (a no-op for a table that fits in L1d; K4.6b).
-  Endpoint keys[bess::PacketBatch::kMaxBurst];
-  bool valid[bess::PacketBatch::kMaxBurst];
-  Ipv4 *ips[bess::PacketBatch::kMaxBurst];
-  void *l4s[bess::PacketBatch::kMaxBurst];
-  for (int i = 0; i < cnt; i++) {
-    Ethernet *eth = batch->packet(i).head_data<Ethernet *>();
-    ips[i] = reinterpret_cast<Ipv4 *>(eth + 1);
-    size_t ip_bytes = (ips[i]->header_length) << 2;
-    l4s[i] = reinterpret_cast<uint8_t *>(ips[i]) + ip_bytes;
-    std::tie(valid[i], keys[i]) = ExtractEndpoint(ips[i], l4s[i], dir);
-  }
-  map_.PrefetchBatch(std::span<const Endpoint>(keys, cnt));
-
+  std::span<uint8_t> frames[bess::PacketBatch::kMaxBurst];
+  bess::conntrack::ParsedFlowPacket parsed[bess::PacketBatch::kMaxBurst];
+  bool ok[bess::PacketBatch::kMaxBurst];
+  nat::Verdict verdicts[bess::PacketBatch::kMaxBurst];
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
-    const Endpoint &before = keys[i];
-
-    if (!valid[i]) {
-      DropPacket(ctx, pkt);
-      continue;
-    }
-
-    auto *hash_item = map_.Find(before);
-
-    if (hash_item == nullptr) {
-      if (dir != kForward || !(hash_item = CreateNewEntry(before, now))) {
-        DropPacket(ctx, pkt);
-        continue;
-      }
-    }
-
-    // only refresh for outbound packets, rfc4787 REQ-6
-    if (dir == kForward) {
-      hash_item->second.last_refresh = now;
-    }
-
-    Stamp<dir>(ips[i], l4s[i], before, hash_item->second.endpoint);
-    EmitPacket(ctx, pkt, ogate_idx);
+    frames[i] = std::span<uint8_t>(pkt.head_data<uint8_t *>(), pkt.head_len());
+    // The headers must be in the first segment; the lengths are checked
+    // against the whole packet (a chained packet is translated in place).
+    ok[i] = bess::conntrack::ParseFrame(frames[i], parsed[i], pkt.total_len()) ==
+            bess::conntrack::ParseStatus::kOk;
   }
-}
-
-void NAT::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  gate_idx_t incoming_gate = ctx->current_igate;
-
-  if (incoming_gate == 0) {
-    DoProcessBatch<kForward>(ctx, batch);
-  } else {
-    DoProcessBatch<kReverse>(ctx, batch);
+  nat_->TranslateBatch(std::span(frames, cnt), std::span(parsed, cnt),
+                       std::span(ok, cnt), dir, now, std::span(verdicts, cnt));
+  for (int i = 0; i < cnt; i++) {
+    bess::PacketRef pkt = batch->packet(i);
+    if (verdicts[i] == nat::Verdict::kTranslated) {
+      EmitPacket(ctx, pkt, ogate);
+    } else {
+      DropPacket(ctx, pkt);
+    }
   }
 }
 
 std::string NAT::GetDesc() const {
-  // Divide by 2 since the table has both forward and reverse entries
-  return bess::utils::Format("%zu entries", map_.Count() / 2);
+  return bess::utils::Format("%zu entries", nat_ ? nat_->size() : 0);
 }
 
 ADD_MODULE(NAT, "nat", "Dynamic Network address/port translator")
