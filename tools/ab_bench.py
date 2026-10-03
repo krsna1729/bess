@@ -45,6 +45,7 @@ import shlex
 import statistics
 import subprocess
 import sys
+import tempfile
 
 
 def busy_processes(threshold=0.2, window=1.0):
@@ -93,13 +94,17 @@ def busy_processes(threshold=0.2, window=1.0):
 
 
 def run(binary, args, wrap):
-    cmd = shlex.split(wrap) + [binary] + args + ['--benchmark_format=json']
-    out = subprocess.run(cmd, capture_output=True, text=True)
-    if out.returncode != 0:
-        sys.exit('benchmark failed: %s\n%s' % (' '.join(cmd), out.stderr[-2000:]))
-    # Wrappers may print their own lines; the JSON document starts at '{'.
-    text = out.stdout[out.stdout.index('{'):]
-    data = json.loads(text)
+    # The results go to their own file: a benchmark that starts DPDK's EAL (or
+    # logs) writes to stdout too, which can corrupt a JSON document read there.
+    with tempfile.TemporaryDirectory(prefix='ab_bench-') as tmp:
+        result = os.path.join(tmp, 'out.json')
+        cmd = shlex.split(wrap) + [binary] + args + [
+            '--benchmark_out=' + result, '--benchmark_out_format=json']
+        out = subprocess.run(cmd, capture_output=True, text=True)
+        if out.returncode != 0:
+            sys.exit('benchmark failed: %s\n%s' % (' '.join(cmd), out.stderr[-2000:]))
+        with open(result) as f:
+            data = json.load(f)
     return {b['name']: b['real_time'] for b in data['benchmarks']
             if b.get('run_type', 'iteration') == 'iteration' and 'real_time' in b}
 
