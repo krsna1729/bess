@@ -528,6 +528,9 @@ core_public_subdir_headers = {
   'nat': files(
     'nat/nat.h',
   ),
+  'tunnel': files(
+    'tunnel/tunnel.h',
+  ),
   'conntrack': files(
     'conntrack/conntrack.h',
     'conntrack/packet_parse.h',
@@ -575,6 +578,7 @@ unit_test_sources = [
   'l2/fdb_test.cc',
   'conntrack/conntrack_test.cc',
   'nat/nat_test.cc',
+  'tunnel/tunnel_test.cc',
   'flow/flow_index_test.cc',
   'flow/reference_apps_test.cc',
   'flow/worker_flow_table_test.cc',
@@ -813,6 +817,7 @@ if get_option('build_benchmarks')
     'flow_expiry_bench': ['flow/flow_expiry_bench.cc', benchmark_main_dep],
     'conntrack_bench': ['conntrack/conntrack_bench.cc', benchmark_main_dep],
     'nat_bench': ['nat/nat_bench.cc', benchmark_main_dep],
+    'tunnel_bench': ['tunnel/tunnel_bench.cc', benchmark_main_dep],
     'flow_decision_cache_bench': ['flow/decision_cache_bench.cc', benchmark_main_dep],
     'l2_fdb_bench': ['l2/fdb_bench.cc', benchmark_main_dep],
     'classifier_range_backend_bench': ['classifier/range_backend_bench.cc', benchmark_main_dep],

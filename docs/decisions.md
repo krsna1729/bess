@@ -89,6 +89,7 @@ file is the reasoning.
 | D-066 | Member selection: shared algorithms, no shared group object (M16) | accepted |
 | D-067 | Connection tracking: a library over the flow table and the expiry wheel (M17) | accepted |
 | D-068 | NAT as a library: bindings on the flow table, a bitmap port pool, generic expiry (M18) | accepted |
+| D-069 | Tunnel packet mechanics: VXLAN, Geneve, GRE and a GTP-U header codec (M19) | accepted |
 
 
 ---
@@ -6059,3 +6060,97 @@ headers); the conntrack and FDB per-packet wheel refreshes could use the same ow
 
 **Revisit when:** a consumer needs filtering or hairpinning, or the small-table per-packet cost matters (a
 specialised 8-byte-key table with the binding inline, as D-064 did for the FDB).
+
+## D-069 Tunnel packet mechanics: VXLAN, Geneve, GRE and a GTP-U header codec (M19)
+
+**Status:** accepted (2026-10-04), experimental API.
+**Code:** `core/tunnel/tunnel.h` (new, header-only, installed experimental), `core/tunnel/tunnel_test.cc`,
+`core/tunnel/tunnel_bench.cc`, `core/modules/vxlan_{encap,decap}.cc`, `bessctl/module_tests/vxlan.py` (new),
+`core/meson.build`, `tools/check_includes.py`, `tools/api_classes.json`.
+
+**Context.** Roadmap M19: reusable encapsulation and decapsulation mechanics without application control semantics
+(no VTEP learning, no PDU session, QFI, PFCP or FAR); the standard graph modules become adapters; an appliance can
+call encap and decap directly.
+
+**Decision.**
+- **Encapsulation** writes headers into bytes the caller has made room for: `WriteIpv4` (no options, DF, checksum),
+  `WriteUdp` (checksum 0: allowed for these tunnels over IPv4; over IPv6 the caller computes it), `WriteVxlanUdp`
+  (the legacy VXLANEncap's UDP + VXLAN headers), `WriteGeneve` (options are the caller's bytes; OAM and critical
+  bits), `WriteGre` (key, sequence, optional checksum over header and payload), `WriteGtpu` (a minimal G-PDU header).
+  `FlowEntropyPort` gives the UDP source port from the inner flow, in 0xc000-0xffff (RFC 7348/6335). Sizes and MTU:
+  `VxlanOverhead`, `GeneveOverhead`, `GreBytes`, `InnerMtu`.
+- **Decapsulation** checks the outer headers with the M17/M18 parser (any VLAN tags, IPv4 or IPv6, lengths; chained
+  packets: headers in the first segment, lengths against `total_len`), then the tunnel header, and reports the inner
+  offset, the identifier (VNI, GRE key, TEID) and the protocol; a fragmented outer packet (a first fragment
+  included) is refused (reassemble first): `DecapVxlan` (I flag; an inner Ethernet header; a
+  UDP port or any), `DecapGeneve` (version 0, option length within the packet; OAM and critical bits reported, the
+  options themselves are the caller's), `DecapGre`/`ParseGre` (version 0; the routing, strict-route and recursion
+  bits refused, RFC 2784 2.3; a present checksum verified),
+  `DecapGtpu` (version 1, PT 1, G-PDU only; the sequence number and extension-header chain are walked and skipped,
+  the first extension type reported — what it means, such as the PDU session container, is the application's).
+- **API shape.** The decap functions return a status (`DecapError`, `kOk` = 0) and write through out-parameters:
+  the caller's `ParsedFlowPacket` and a 12-byte `Decapsulated`. Returned by value in a `std::expected`, the results
+  made the caller copy fields just written with narrow stores, which stalled store forwarding (VXLAN 10.3, GRE 20.1,
+  GTP-U 14.0 ns a decap; 5.3, 5.4 and 7.2 ns with out-parameters; unisolated, CPU 6).
+- **VXLAN modules as adapters.** `VXLANEncap` keeps its metadata contract (reads `tun_ip_src`, `tun_ip_dst`,
+  `tun_id`; writes `ip_src`, `ip_dst`, `ip_proto` for `IPEncap`) and its headers. `VXLANDecap` keeps its metadata
+  (outer IPv4 addresses and the VNI) and accepts any UDP port, as before (classification upstream decides).
+
+**Behaviour changes** (intentional):
+- The encap source port hashes the inner ports. The legacy code added the IPv4 header length in 4-byte words as if
+  it were bytes, so it hashed IP header bytes 5-8 (identification, fragment, TTL): the port changed per packet and
+  the underlay's ECMP could reorder a flow. Ports therefore differ from before for inner TCP/UDP. An inner
+  fragment hashes without ports, so a datagram's fragments share one path.
+- A packet without the headroom for the headers is dropped by `VXLANEncap` (before, it went on unencapsulated).
+- `VXLANDecap` drops what does not check — malformed outer headers, the I flag clear, an inner frame shorter than an
+  Ethernet header, and IPv6 outer headers (its metadata holds IPv4 addresses) — where it used to strip fixed
+  offsets regardless; VLAN-tagged outer frames are decapsulated (before, misread).
+
+**Evidence.** `tunnel_bench`, release `NDEBUG`, gcc x86-64-v3, `omarchy-benchmark --isolate --cpu 2`, 3 repetitions,
+medians; byte buffers with headroom (no packet allocation); the legacy rows are the legacy modules' per-packet code
+copied into the benchmark; the run is of the code after review. CPU 2: no device IRQs; 1,000 thermal-event
+interrupts, SCHED (362), RCU (89) and timer (13) softirqs; wrapper verdict "contamination".
+
+| operation | ns per packet |
+|---|---|
+| VXLAN encap: legacy VXLANEncap body | 3.76 |
+| VXLAN encap: FlowEntropyPort + WriteVxlanUdp | 4.27 |
+| VXLAN decap: legacy VXLANDecap body (no checks) | 0.81 |
+| DecapVxlan (checked) | 4.12 |
+| DecapGeneve (8 option bytes) | 4.10 |
+| DecapGre (key) | 4.47 |
+| DecapGtpu (sequence + 1 extension) | 5.52 |
+
+- Encap costs 0.5 ns more (the bounds and fragment checks); a checked decap 3.3-4.7 ns more than the legacy decap,
+  which checked nothing.
+- Tests (after review): `tunnel_tunnel_test` 8/8 (fast build, gcc; `taskset -c 0` and `-c 0,1`): VXLAN round trip with and without
+  an outer VLAN tag, every truncation refused, refusals (port, I flag, short inner), chained packets, entropy port
+  per flow and in range (independent of the IP identification), Geneve options and critical bit, GRE key, sequence
+  and checksum, GTP-U with sequence and an extension chain, overhead and MTU. Under ASan and UBSan (debug build)
+  the tunnel, conntrack and NAT tests pass with no ASan report; UBSan reports misaligned 4-byte loads in the existing
+  `utils/checksum.h` (lines 277, 431, 532), not in this code (recorded for M22).
+- `bessctl/module_tests/vxlan.py` (new) exercises `VXLANDecap` (valid frames on two ports, with and without an outer
+  VLAN; four that must drop) and a `VXLANEncap` liveness run; it runs in CI, not run locally (needs a running
+  daemon).
+- One test bug found while writing: vectors built from two temporaries' iterators (`Inner(...).begin()` with
+  another `Inner(...).end()`) made a GTP-U case pass or fail at random; the tests now name the frame first.
+
+**Mutation checks** (`tunnel_tunnel_test` and `conntrack_conntrack_test`, fast build; 22: 21 caught, 1 equivalent): entropy with the legacy word
+offset, ignoring ports, outside the dynamic range; VXLAN I flag, port, inner length, header readability (after the
+test asserted the exact error), the VNI's 24 bits; Geneve version, option bound (after a test with Ethernet padding
+past the datagram); GRE routing accepted, checksum unverified; GTP-U PT, length, non-G-PDU accepted; the MTU
+overhead; after review: an outer first fragment accepted, fragment bytes hashed as ports, the GRE strict-route and
+recursion bits accepted, an IPv6 atomic fragment flagged as a first fragment. Equivalent: a zero-length GTP-U extension header (the 16-header bound still ends the walk).
+
+**Review** (reviewer agent): round 1 correct, go; four optional findings, all taken: outer first fragments refused
+(the inner packet would be cut), inner fragments hashed without ports, GRE strict-route and recursion bits refused,
+and this record's struct size, by-value numbers and interrupt list corrected. Round 2: correct, go; one optional
+finding taken: the parser no longer flags an IPv6 atomic fragment (offset 0, M clear) as a first fragment, so decap
+does not refuse that whole packet (RFC 6946).
+
+**Not done.** Geneve option parsing (the options are the caller's bytes); GRE over IPv6 checksums, keepalives;
+GTP-U messages other than G-PDU (echo, error indication) and any 3GPP semantics; an outer IPv6 header writer;
+VXLAN-GPE; a module adapter for Geneve, GRE or GTP-U (none existed); `IPEncap`/`EtherEncap` unchanged.
+
+**Revisit when:** a consumer needs Geneve option TLVs, IPv6 underlays (then the UDP checksum is mandatory), or a
+GTP-U control path.

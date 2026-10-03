@@ -5010,6 +5010,16 @@ rather than one call site).
      7-291 ns with 29.5% failures at 99% taken. 18 mutants caught, 1 equivalent. Needs review (user): the
      small-table per-packet cost and the Init allocation.
 
+157. **M19 tunnel mechanics (D-069).** `tunnel/tunnel.h`: header writers (IPv4, UDP, VXLAN, Geneve, GRE with
+     key/sequence/checksum, a minimal GTP-U G-PDU), the flow-entropy UDP source port, overhead and MTU helpers, and
+     checked decapsulation for VXLAN, Geneve, GRE and GTP-U (outer headers through the M17/M18 parser, chained
+     packets, outer fragments refused, out-parameters). The VXLAN modules are adapters (same metadata); their
+     entropy port now hashes the inner ports (the legacy code hashed IP identification, fragment and TTL:
+     per-packet ports, reordering), and packets that do not check are dropped. Isolated (wrapper verdict
+     "contamination"): encap 3.8 → 4.3 ns, a checked decap 4.1-5.5 ns against 0.8 for the unchecked legacy decap.
+     ASan clean on the tunnel, conntrack and NAT tests. 21 mutants caught, 1 equivalent. Reviewed: go, five
+     optional findings taken.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
