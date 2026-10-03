@@ -7,9 +7,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../utils/ether.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "utils/ether.h"
 
 // Bridge: Ethernet L2 Learning Bridge with MAC aging and flooding.
 // Learns source MAC to ingress gate mappings dynamically, forwards known

@@ -8,13 +8,10 @@ by verifying that lower-level libraries do not include higher-level components
 
 Usage:
   tools/check_includes.py [--root DIR] [--self-test] [--verbose]
-  tools/check_includes.py --emit-dotdot-baseline   # regenerate the grandfather list
 
 Each quoted include is resolved the way the compiler does (relative to the
 including file, then the `core/` include root) and the rules are applied to the
-resolved path as well as to the spelling, so `#include "../runtime/x.h"` is the
-edge `runtime/x.h`. `..` components are banned outright, except for the
-grandfathered (file, include) pairs in include_dotdot_baseline.txt.
+resolved path. Every `..` component is banned in quoted and angle includes.
 """
 
 import argparse
@@ -24,14 +21,6 @@ import re
 import sys
 
 INCLUDE_PATTERN = re.compile(r'^\s*#\s*include\s+(["<])([^">]+)[">]')
-
-# Every `..` include that predates the ban, as (file, include) pairs. M1: a new
-# `..` include is refused; an entry whose include is gone must be deleted, so the
-# list only shrinks. Owner: M1 follow-up (include hygiene). Removal: rewrite the
-# include as root-relative (`"../utils/x.h"` -> `"utils/x.h"`, the same file since
-# core/ is the include root), a no-codegen mechanical pass best done when no
-# other branch is editing core/modules, core/drivers and the hook libraries.
-DOTDOT_BASELINE = Path(__file__).resolve().with_name("include_dotdot_baseline.txt")
 
 # Forbidden dependency rules: (source_path_pattern, list_of_forbidden_include_patterns)
 FORBIDDEN_RULES = [
@@ -193,11 +182,10 @@ def has_dotdot(inc):
     return ".." in inc.split("/")
 
 
-def judge_include(rel_path, quote, inc, exists, dotdot_allowed=frozenset(),
-                  layering=True, rules=None):
+def judge_include(rel_path, quote, inc, exists, layering=True, rules=None):
     """Return (reason, ...) for every rule the include breaks."""
     reasons = []
-    if has_dotdot(inc) and (rel_path, inc) not in dotdot_allowed:
+    if has_dotdot(inc):
         reasons.append(
             "'..' in an include path is banned: spell it relative to the "
             "include root (core/)"
@@ -218,7 +206,7 @@ def is_fixture(rel_path):
     return "_test.cc" in rel_path or "_bench.cc" in rel_path or "gtest_main.cc" in rel_path
 
 
-def scan_lines(rel_path, lines, exists, dotdot_allowed=frozenset(), rules=None):
+def scan_lines(rel_path, lines, exists, rules=None):
     """Violations (path, line, include, reason) of one file's lines."""
     violations = []
     layering = not is_fixture(rel_path)
@@ -227,20 +215,9 @@ def scan_lines(rel_path, lines, exists, dotdot_allowed=frozenset(), rules=None):
         if not m:
             continue
         inc = m.group(2).replace("\\", "/")
-        for reason in judge_include(
-            rel_path, m.group(1), inc, exists, dotdot_allowed, layering, rules
-        ):
+        for reason in judge_include(rel_path, m.group(1), inc, exists, layering, rules):
             violations.append((rel_path, line_no, inc, reason))
     return violations
-
-
-def load_dotdot_baseline(path=DOTDOT_BASELINE):
-    pairs = set()
-    for raw in Path(path).read_text(encoding="utf-8").splitlines():
-        if raw.strip() and not raw.startswith("#"):
-            file, inc = raw.split("\t")
-            pairs.add((file, inc))
-    return pairs
 
 
 def core_sources(root):
@@ -248,19 +225,9 @@ def core_sources(root):
         yield p, str(p.relative_to(root)).replace("\\", "/")
 
 
-def stale_baseline(baseline, seen):
-    return [
-        (file, 0, inc, "stale entry in include_dotdot_baseline.txt: the include "
-         "is gone, delete the line")
-        for file, inc in sorted(baseline - seen)
-    ]
-
-
-def check_includes(root_dir, verbose=False, baseline_path=DOTDOT_BASELINE):
+def check_includes(root_dir, verbose=False):
     root = Path(root_dir)
-    baseline = load_dotdot_baseline(baseline_path)
     violations = []
-    seen_dotdot = set()
     scanned_files = 0
 
     def exists(path):
@@ -269,38 +236,12 @@ def check_includes(root_dir, verbose=False, baseline_path=DOTDOT_BASELINE):
     for p, rel_str in core_sources(root):
         scanned_files += 1
         lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-        violations += scan_lines(rel_str, lines, exists, baseline)
-        for line in lines:
-            m = INCLUDE_PATTERN.match(line)
-            if m and has_dotdot(m.group(2)):
-                seen_dotdot.add((rel_str, m.group(2)))
-
-    violations += stale_baseline(baseline, seen_dotdot)
+        violations += scan_lines(rel_str, lines, exists)
 
     if verbose:
         print(f"Scanned {scanned_files} core source files.")
 
     return violations
-
-
-def emit_dotdot_baseline(root_dir):
-    root = Path(root_dir)
-    pairs = set()
-    for p, rel_str in core_sources(root):
-        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-            m = INCLUDE_PATTERN.match(line)
-            if m and has_dotdot(m.group(2)):
-                pairs.add((rel_str, m.group(2)))
-    header = [
-        "# Grandfathered '..' includes (tools/check_includes.py). One 'file<TAB>include' per line.",
-        "# New '..' includes are refused; delete a line when its include is rewritten",
-        "# root-relative (a stale line fails the check). Owner: M1 include hygiene.",
-    ]
-    DOTDOT_BASELINE.write_text(
-        "\n".join(header + [f"{f}\t{i}" for f, i in sorted(pairs)]) + "\n",
-        encoding="utf-8",
-    )
-    print(f"Wrote {len(pairs)} entries to {DOTDOT_BASELINE}")
 
 
 # (including file, include line, number of violations it must produce).
@@ -333,13 +274,14 @@ SELF_TEST_CASES = [
     ("core/dataplane/a.h", '#include "../../core/runtime/x.h"', 2),
     ("core/classifier/a.cc", '#include "../module.h"', 2),
     ("core/route/a.h", '#include "../control/service.h"', 2),
-    # '..' is banned even where the target is allowed, and even in a test.
+    # `..` is banned even where the target is allowed, in tests, and after
+    # normalisation; quoted and angle forms are both covered.
     ("core/dataplane/a.h", '#include "../utils/common.h"', 1),
     ("core/modules/new_module.cc", '#include "../utils/ip.h"', 1),
     ("core/flow/a_test.cc", '#include "../packet_pool.h"', 1),
-    ("core/utils/a.h", '#include <../utils/b.h>', 1),
-    # ... and only the resolved path is judged: this names utils/x.h.
+    ("core/utils/a.h", '#include <a/../utils/b.h>', 1),
     ("core/modules/a.cc", '#include "runtime/../utils/x.h"', 1),
+    ("core/modules/a.cc", '#include <a/../utils/x.h>', 1),
     # The EAL layer (bess_eal, D-057) sits below the worker and the registries.
     ("core/runtime/opts.cc", '#include "worker.h"', 1),
     ("core/runtime/dpdk.cc", '#include "packet_pool.h"', 1),
@@ -349,19 +291,16 @@ SELF_TEST_CASES = [
 
 # Includes that must pass: controls proving the rules are not over-broad.
 SELF_TEST_CLEAN = [
-    ("core/dataplane/a.h", '#include "utils/common.h"', frozenset()),
-    ("core/dataplane/a.h", '#include "strong_id.h"', frozenset()),
-    ("core/modules/a.cc", '#include "utils/ip.h"', frozenset()),
-    ("core/modules/a.cc", '#include <glog/logging.h>', frozenset()),
-    ("core/modules/a.cc", '#include "a..b/c.h"', frozenset()),
-    ("core/modules/a.cc", '#include "./utils/ip.h"', frozenset()),
+    ("core/dataplane/a.h", '#include "utils/common.h"'),
+    ("core/dataplane/a.h", '#include "strong_id.h"'),
+    ("core/modules/a.cc", '#include "utils/ip.h"'),
+    ("core/modules/a.cc", '#include <glog/logging.h>'),
+    ("core/modules/a.cc", '#include "a..b/c.h"'),
+    ("core/modules/a.cc", '#include "./utils/ip.h"'),
     # a layer's own directory name is not a forbidden edge
-    ("core/flow/a.h", '#include "flow_key.h"', frozenset()),
+    ("core/flow/a.h", '#include "flow_key.h"'),
     # tests are exempt from layering, not from the '..' ban
-    ("core/dataplane/a_test.cc", '#include "runtime/runtime_state.h"', frozenset()),
-    # a grandfathered pair passes the ban (and nothing else)
-    ("core/modules/old.cc", '#include "../utils/ip.h"',
-     frozenset({("core/modules/old.cc", "../utils/ip.h")})),
+    ("core/dataplane/a_test.cc", '#include "runtime/runtime_state.h"'),
 ]
 
 
@@ -382,24 +321,12 @@ def run_self_test():
             )
         bad += expected
 
-    for path, line, allowed in SELF_TEST_CLEAN:
-        got = scan_lines(path, [line], nothing_exists, dotdot_allowed=allowed)
+    for path, line in SELF_TEST_CLEAN:
+        got = scan_lines(path, [line], nothing_exists)
         if got:
             raise AssertionError(f"{path}: {line}: expected clean, got {got}")
 
-    # The '..' baseline is exact: a listed pair passes, an unlisted pair (in the
-    # same file, or the same include in another file) is still refused.
-    pair = frozenset({("core/modules/old.cc", "../utils/ip.h")})
-    line = '#include "../utils/ip.h"'
-    for path, text, allowed, want in [
-        ("core/modules/old.cc", line, frozenset(), 1),
-        ("core/modules/old.cc", line, pair, 0),
-        ("core/modules/old.cc", '#include "../utils/ether.h"', pair, 1),
-        ("core/modules/new.cc", line, pair, 1),
-    ]:
-        got = scan_lines(path, [text], nothing_exists, dotdot_allowed=allowed)
-        if len(got) != want:
-            raise AssertionError(f"'..' baseline: {path} {text}: want {want}, got {got}")
+
 
     # Resolution is the compiler's: next to the includer first, then the root.
     # The rule below ("a module never includes another module's header") is
@@ -424,12 +351,7 @@ def run_self_test():
         if len(got) != want:
             raise AssertionError(f"resolution: {path} {text}: want {want}, got {got}")
 
-    # A baseline entry whose include is gone is an error: the list only shrinks.
-    gone = ("core/modules/old.cc", "../utils/ip.h")
-    if len(stale_baseline({gone, ("a.cc", "../b.h")}, {("a.cc", "../b.h")})) != 1 or (
-        stale_baseline({gone}, {gone})
-    ):
-        raise AssertionError("stale baseline entries are not reported exactly")
+
 
     total = len(SELF_TEST_CASES)
     print(
@@ -453,18 +375,10 @@ def main():
         help="Run negative self-test verifying detection of forbidden edges",
     )
     parser.add_argument(
-        "--emit-dotdot-baseline",
-        action="store_true",
-        help="Rewrite include_dotdot_baseline.txt from the tree (shrink it, never grow it)",
-    )
-    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Verbose output"
     )
     args = parser.parse_args()
 
-    if args.emit_dotdot_baseline:
-        emit_dotdot_baseline(args.root)
-        return 0
 
     if args.self_test:
         run_self_test()

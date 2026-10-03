@@ -11,10 +11,10 @@
 #include <string>
 #include <vector>
 
-#include "../framework/resource_bindings.h"
-#include "../dataplane/transaction_engine.h"
-#include "../utils/endian.h"
-#include "../utils/format.h"
+#include "framework/resource_bindings.h"
+#include "dataplane/transaction_engine.h"
+#include "utils/endian.h"
+#include "utils/format.h"
 
 using bess::metadata::Attribute;
 

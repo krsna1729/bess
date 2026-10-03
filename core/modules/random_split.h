@@ -5,9 +5,9 @@
 #ifndef BESS_MODULES_RANDOM_SPLIT_H_
 #define BESS_MODULES_RANDOM_SPLIT_H_
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../utils/random.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "utils/random.h"
 
 // Maximum number of output gates to allow.
 #define MAX_SPLIT_GATES 16384

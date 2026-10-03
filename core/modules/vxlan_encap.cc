@@ -6,10 +6,10 @@
 
 #include <rte_hash_crc.h>
 
-#include "../utils/ether.h"
-#include "../utils/ip.h"
-#include "../utils/udp.h"
-#include "../utils/vxlan.h"
+#include "utils/ether.h"
+#include "utils/ip.h"
+#include "utils/udp.h"
+#include "utils/vxlan.h"
 
 using bess::utils::be16_t;
 using bess::utils::be32_t;

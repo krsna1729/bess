@@ -7,8 +7,8 @@
 #include <cstdlib>
 #include <string>
 
-#include "../utils/format.h"
-#include "../utils/rte_ring_alloc.h"
+#include "utils/format.h"
+#include "utils/rte_ring_alloc.h"
 
 #define DEFAULT_QUEUE_SIZE 1024
 

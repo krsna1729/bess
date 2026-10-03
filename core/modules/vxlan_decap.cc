@@ -4,10 +4,10 @@
 
 #include "vxlan_decap.h"
 
-#include "../utils/ether.h"
-#include "../utils/ip.h"
-#include "../utils/udp.h"
-#include "../utils/vxlan.h"
+#include "utils/ether.h"
+#include "utils/ip.h"
+#include "utils/udp.h"
+#include "utils/vxlan.h"
 
 /* TODO: Currently it decapulates the entire Ethernet/IP/UDP/VXLAN headers.
  *       Modularize. */

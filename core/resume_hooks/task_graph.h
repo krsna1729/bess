@@ -4,9 +4,9 @@
 #ifndef BESS_RESUME_HOOKS_TASK_GRAPH_
 #define BESS_RESUME_HOOKS_TASK_GRAPH_
 
-#include "../message.h"
-#include "../resume_hook.h"
-#include "../worker.h"
+#include "message.h"
+#include "resume_hook.h"
+#include "worker.h"
 
 // SetupTaskGraph computes read/write offsets for packet metadata attributes.
 class SetupTaskGraph final : public bess::ResumeHook {

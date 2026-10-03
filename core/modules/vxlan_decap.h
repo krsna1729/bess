@@ -5,8 +5,8 @@
 #ifndef BESS_MODULES_VXLANDECAP_H_
 #define BESS_MODULES_VXLANDECAP_H_
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
 
 class VXLANDecap final : public Module {
  public:

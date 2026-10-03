@@ -5,7 +5,7 @@
 #ifndef BESS_MODULES_SINK_H_
 #define BESS_MODULES_SINK_H_
 
-#include "../module.h"
+#include "module.h"
 
 class Sink final : public Module {
  public:

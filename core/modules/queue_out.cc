@@ -4,8 +4,8 @@
 
 #include "queue_out.h"
 
-#include "../port.h"
-#include "../utils/format.h"
+#include "port.h"
+#include "utils/format.h"
 #include "tx_checksum_profile.h"
 
 CommandResponse QueueOut::Init(const bess::pb::QueueOutArg &arg) {

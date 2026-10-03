@@ -4,13 +4,13 @@
 #ifndef BESS_MODULES_STATIC_NAT_H_
 #define BESS_MODULES_STATIC_NAT_H_
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
 
 #include <string>
 #include <vector>
 
-#include "../utils/endian.h"
+#include "utils/endian.h"
 
 using bess::utils::be16_t;
 using bess::utils::be32_t;

@@ -5,10 +5,10 @@
 #ifndef BESS_GATE_HOOKS_PCAPNG_
 #define BESS_GATE_HOOKS_PCAPNG_
 
-#include "../message.h"
-#include "../module.h"
+#include "message.h"
+#include "module.h"
 
-#include "../utils/fifo_opener.h"
+#include "utils/fifo_opener.h"
 
 class PcapngOpener final : public bess::utils::FifoOpener {
  public:

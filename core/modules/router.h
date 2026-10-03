@@ -6,10 +6,10 @@
 #include <memory>
 #include <string>
 
-#include "../framework/resource_bindings.h"
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../route/router.h"
+#include "framework/resource_bindings.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "route/router.h"
 
 // K7's route table and next hops as a module, enrolled in the transaction
 // engine (D-023).

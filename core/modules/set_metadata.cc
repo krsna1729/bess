@@ -8,8 +8,8 @@
 
 #include "set_metadata.h"
 
-#include "../utils/bits.h"
-#include "../utils/endian.h"
+#include "utils/bits.h"
+#include "utils/endian.h"
 
 using bess::metadata::mt_offset_t;
 

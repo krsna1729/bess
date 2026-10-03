@@ -5,13 +5,13 @@
 #ifndef BESS_DRIVERS_PCAP_H_
 #define BESS_DRIVERS_PCAP_H_
 
-#include "../port.h"
+#include "port.h"
 #include <gtest/gtest_prod.h>
 
 
 #include <glog/logging.h>
 
-#include "../utils/pcap_handle.h"
+#include "utils/pcap_handle.h"
 
 // Port to connect to a device via PCAP.
 // (Not recommended because PCAP is slow :-)

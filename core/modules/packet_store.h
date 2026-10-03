@@ -8,9 +8,9 @@
 #include <string>
 #include <vector>
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../utils/endian.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "utils/endian.h"
 
 // PacketStore: Bounded, ownership-safe packet buffer (K9).
 // Buffers packets indexed by flow ID (from metadata 'store_id' or 'vif_id').

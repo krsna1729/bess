@@ -14,10 +14,10 @@
 #include <atomic>
 #include <thread>
 
-#include "../message.h"
-#include "../port.h"
+#include "message.h"
+#include "port.h"
 
-#include "../utils/syscallthread.h"
+#include "utils/syscallthread.h"
 
 class UnixSocketPort;
 

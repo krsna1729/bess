@@ -12,11 +12,11 @@
 #include <utility>
 
 #include "framework/resource_bindings.h"
-#include "../dataplane/transaction_engine.h"
-#include "../utils/endian.h"
-#include "../utils/ether.h"
-#include "../utils/format.h"
-#include "../utils/ip.h"
+#include "dataplane/transaction_engine.h"
+#include "utils/endian.h"
+#include "utils/ether.h"
+#include "utils/format.h"
+#include "utils/ip.h"
 
 namespace dataplane = bess::dataplane;
 namespace route = bess::route;

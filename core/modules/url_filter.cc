@@ -6,11 +6,11 @@
 #include <algorithm>
 #include <tuple>
 
-#include "../utils/checksum.h"
-#include "../utils/ether.h"
-#include "../utils/format.h"
-#include "../utils/http_parser.h"
-#include "../utils/ip.h"
+#include "utils/checksum.h"
+#include "utils/ether.h"
+#include "utils/format.h"
+#include "utils/http_parser.h"
+#include "utils/ip.h"
 
 using bess::utils::Ethernet;
 using bess::utils::Ipv4;

@@ -7,11 +7,11 @@
 
 #include <map>
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../utils/endian.h"
-#include "../utils/ether.h"
-#include "../utils/ip.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "utils/endian.h"
+#include "utils/ether.h"
+#include "utils/ip.h"
 
 using bess::utils::Ethernet;
 using bess::utils::be32_t;

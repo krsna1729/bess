@@ -3,11 +3,11 @@
 
 #include "static_nat.h"
 
-#include "../utils/checksum.h"
-#include "../utils/ether.h"
-#include "../utils/ip.h"
-#include "../utils/tcp.h"
-#include "../utils/udp.h"
+#include "utils/checksum.h"
+#include "utils/ether.h"
+#include "utils/ip.h"
+#include "utils/tcp.h"
+#include "utils/udp.h"
 
 const Commands StaticNAT::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&StaticNAT::GetInitialArg),

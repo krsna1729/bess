@@ -4,7 +4,7 @@
 
 #include "vlan_pop.h"
 
-#include "../utils/ether.h"
+#include "utils/ether.h"
 
 void VLANPop::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::be16_t;

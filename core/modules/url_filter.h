@@ -13,11 +13,11 @@
 #include <utility>
 #include <vector>
 
-#include "../module.h"
-#include "../packet.h"
-#include "../pb/module_msg.pb.h"
-#include "../utils/tcp_flow_reconstruct.h"
-#include "../utils/trie.h"
+#include "module.h"
+#include "packet.h"
+#include "pb/module_msg.pb.h"
+#include "utils/tcp_flow_reconstruct.h"
+#include "utils/trie.h"
 
 using bess::utils::TcpFlowReconstruct;
 using bess::utils::Trie;

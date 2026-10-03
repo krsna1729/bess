@@ -6,9 +6,9 @@
 #include <optional>
 #include <string>
 
-#include "../utils/ether.h"
-#include "../utils/ip.h"
-#include "../utils/udp.h"
+#include "utils/ether.h"
+#include "utils/ip.h"
+#include "utils/udp.h"
 
 const Commands ACL::cmds = {
     {"add", "ACLArg", MODULE_CMD_FUNC(&ACL::CommandAdd),

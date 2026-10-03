@@ -7,14 +7,14 @@
 #include <cmath>
 #include <functional>
 
-#include "../utils/checksum.h"
-#include "../utils/ether.h"
-#include "../utils/format.h"
-#include "../utils/ip.h"
-#include "../utils/simd.h"
-#include "../utils/tcp.h"
-#include "../utils/udp.h"
-#include "../utils/time.h"
+#include "utils/checksum.h"
+#include "utils/ether.h"
+#include "utils/format.h"
+#include "utils/ip.h"
+#include "utils/simd.h"
+#include "utils/tcp.h"
+#include "utils/udp.h"
+#include "utils/time.h"
 
 using bess::utils::Ethernet;
 using bess::utils::Ipv4;

@@ -14,15 +14,15 @@
 #include <utility>
 #include <vector>
 
-#include "../classifier/extract_plan.h"
-#include "../classifier/concurrent_masked.h"
-#include "../classifier/masked_rule_resource.h"
-#include "../classifier/runtime_schema.h"
-#include "../event.h"
-#include "../framework/resource_bindings.h"
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../rcu/rcu_ptr.h"
+#include "classifier/extract_plan.h"
+#include "classifier/concurrent_masked.h"
+#include "classifier/masked_rule_resource.h"
+#include "classifier/runtime_schema.h"
+#include "event.h"
+#include "framework/resource_bindings.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "rcu/rcu_ptr.h"
 
 using google::protobuf::RepeatedPtrField;
 using Error = std::pair<int, std::string>;

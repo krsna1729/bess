@@ -11,9 +11,9 @@
 #include <rte_bus_pci.h>
 #include <rte_ethdev.h>
 
-#include "../packet_pool.h"
-#include "../utils/ether.h"
-#include "../utils/format.h"
+#include "packet_pool.h"
+#include "utils/ether.h"
+#include "utils/format.h"
 
 PmdCapabilities PmdCapabilities::FromDeviceInfo(
     const rte_eth_dev_info &dev_info) {

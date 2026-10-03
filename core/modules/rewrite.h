@@ -5,8 +5,8 @@
 #ifndef BESS_MODULES_REWRITE_H_
 #define BESS_MODULES_REWRITE_H_
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
 
 class Rewrite final : public Module {
  public:

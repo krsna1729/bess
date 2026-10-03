@@ -4,8 +4,8 @@
 
 #include "track.h"
 
-#include "../message.h"
-#include "../stats/current_worker.h"
+#include "message.h"
+#include "stats/current_worker.h"
 
 // Ethernet overhead in bytes
 static const size_t kEthernetOverhead = 24;

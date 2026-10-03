@@ -5,11 +5,11 @@
 #ifndef BESS_MODULES_RANDOMUPDATE_H_
 #define BESS_MODULES_RANDOMUPDATE_H_
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
 
-#include "../utils/endian.h"
-#include "../utils/random.h"
+#include "utils/endian.h"
+#include "utils/random.h"
 
 static const size_t kMaxVariable = 16;
 

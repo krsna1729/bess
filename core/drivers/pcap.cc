@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-#include "../utils/pcap.h"
+#include "utils/pcap.h"
 
 CommandResponse PCAPPort::Init(const bess::pb::PCAPPortArg& arg) {
   if (pcap_handle_.is_initialized()) {

@@ -7,8 +7,8 @@
 
 #include <atomic>
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
 
 class Source final : public Module {
  public:

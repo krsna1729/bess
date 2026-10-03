@@ -6,15 +6,15 @@
 #include <memory>
 #include <string>
 
-#include "../dataplane/action_id.h"
-#include "../dataplane/resource.h"
-#include "../dataplane/slot_resource.h"
-#include "../dataplane/slot_table.h"
-#include "../meter/meter.h"
-#include "../framework/resource_bindings.h"
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../route/router.h"
+#include "dataplane/action_id.h"
+#include "dataplane/resource.h"
+#include "dataplane/slot_resource.h"
+#include "dataplane/slot_table.h"
+#include "meter/meter.h"
+#include "framework/resource_bindings.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "route/router.h"
 
 // Per-session actions (K2's action table as a module, G1.2b as a resource
 // provider).

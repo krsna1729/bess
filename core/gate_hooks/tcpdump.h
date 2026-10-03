@@ -5,10 +5,10 @@
 #ifndef BESS_GATE_HOOKS_TCPDUMP_
 #define BESS_GATE_HOOKS_TCPDUMP_
 
-#include "../message.h"
-#include "../module.h"
+#include "message.h"
+#include "module.h"
 
-#include "../utils/fifo_opener.h"
+#include "utils/fifo_opener.h"
 
 class TcpdumpOpener final : public bess::utils::FifoOpener {
  public:

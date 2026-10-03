@@ -6,10 +6,10 @@
 
 #include <vector>
 
-#include "../module.h"
-#include "../rcu/rcu_ptr.h"
-#include "../pb/module_msg.pb.h"
-#include "../utils/ip.h"
+#include "module.h"
+#include "rcu/rcu_ptr.h"
+#include "pb/module_msg.pb.h"
+#include "utils/ip.h"
 
 using bess::utils::be16_t;
 using bess::utils::be32_t;

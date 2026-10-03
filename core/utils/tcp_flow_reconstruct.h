@@ -6,7 +6,7 @@
 
 #include <vector>
 
-#include "../packet.h"
+#include "packet.h"
 #include "copy.h"
 #include "ether.h"
 #include "ip.h"

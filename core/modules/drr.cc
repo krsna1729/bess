@@ -15,11 +15,11 @@
 #include <string>
 #include <vector>
 
-#include "../packet_cursor.h"
-#include "../utils/ether.h"
-#include "../utils/ip.h"
-#include "../utils/rte_ring_alloc.h"
-#include "../utils/udp.h"
+#include "packet_cursor.h"
+#include "utils/ether.h"
+#include "utils/ip.h"
+#include "utils/rte_ring_alloc.h"
+#include "utils/udp.h"
 
 namespace {
 

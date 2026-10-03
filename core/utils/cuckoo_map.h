@@ -32,7 +32,7 @@
 #include <glog/logging.h>
 
 #include "stacktrace.h"
-#include "../dataplane/batch_tuning.h"
+#include "dataplane/batch_tuning.h"
 #include "common.h"
 
 namespace bess {

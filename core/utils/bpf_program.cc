@@ -8,7 +8,7 @@
 
 #include <vector>
 
-#include "../dpdk.h"
+#include "dpdk.h"
 
 namespace bess {
 namespace utils {

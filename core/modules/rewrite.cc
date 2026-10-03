@@ -6,7 +6,7 @@
 
 #include <cstdio>
 
-#include "../utils/copy.h"
+#include "utils/copy.h"
 
 const Commands Rewrite::cmds = {
     {"add", "RewriteArg", MODULE_CMD_FUNC(&Rewrite::CommandAdd),

@@ -5,7 +5,7 @@
 #ifndef BESS_MODULES_MERGE_H_
 #define BESS_MODULES_MERGE_H_
 
-#include "../module.h"
+#include "module.h"
 
 class Merge final : public Module {
  public:

@@ -8,12 +8,12 @@
 #include <utility>
 #include <vector>
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../utils/arp.h"
-#include "../utils/endian.h"
-#include "../utils/ether.h"
-#include "../utils/ip.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "utils/arp.h"
+#include "utils/endian.h"
+#include "utils/ether.h"
+#include "utils/ip.h"
 
 // Vif: Virtual Interface multiplexer/demultiplexer.
 // Manages multiple logical L2/L3 interfaces sharing a physical port or pipeline.

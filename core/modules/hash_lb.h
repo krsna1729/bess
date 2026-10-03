@@ -8,10 +8,10 @@
 #include <memory>
 #include <vector>
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../rcu/rcu_ptr.h"
-#include "../framework/exact_match_table.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "rcu/rcu_ptr.h"
+#include "framework/exact_match_table.h"
 
 using bess::framework::ExactMatchField;
 using bess::framework::ExactMatchKey;

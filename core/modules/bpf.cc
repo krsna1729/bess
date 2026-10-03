@@ -37,7 +37,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "../utils/bpf.h"
+#include "utils/bpf.h"
 #include "bpf.h"
 
 /* -------------------------------------------------------------------------

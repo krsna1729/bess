@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "task_graph.h"
-#include "../module_graph.h"
+#include "module_graph.h"
 
 const std::string SetupTaskGraph::kName = "setup_taskgraph";
 

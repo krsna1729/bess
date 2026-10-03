@@ -14,15 +14,15 @@
 #include <utility>
 #include <vector>
 
-#include "../framework/resource_bindings.h"
-#include "../dataplane/transaction_engine.h"
-#include "../event.h"
-#include "../metadata.h"
-#include "../snbuf_layout.h"
-#include "../utils/bits.h"
-#include "../utils/endian.h"
-#include "../rcu/rcu_ptr.h"
-#include "../utils/format.h"
+#include "framework/resource_bindings.h"
+#include "dataplane/transaction_engine.h"
+#include "event.h"
+#include "metadata.h"
+#include "snbuf_layout.h"
+#include "utils/bits.h"
+#include "utils/endian.h"
+#include "rcu/rcu_ptr.h"
+#include "utils/format.h"
 
 namespace classifier = bess::classifier;
 

@@ -10,10 +10,10 @@
 
 #include <glog/logging.h>
 
-#include "../message.h"
-#include "../utils/common.h"
-#include "../utils/pcap.h"
-#include "../utils/time.h"
+#include "message.h"
+#include "utils/common.h"
+#include "utils/pcap.h"
+#include "utils/time.h"
 
 const std::string Tcpdump::kName = "TcpDump";
 
