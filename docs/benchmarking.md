@@ -82,6 +82,13 @@ taskset -c 2 build/perf-release/core/flow_bench --benchmark_repetitions=3 \
     --benchmark_filter='BM_Worker|BM_Baseline'
 ```
 
+`BM_SharedLookup` is the one-thread row of `SharedFlowTable` (scalar and batched
+`Peek`, hit and miss, 64K and 1M flows): its `real_time` is one lookup (or one
+batch), so `tools/ab_bench.py` can pair it A/B when the shared read path changes.
+The multi-thread rows below report `Mlookups_s` as a counter and a nominal
+`real_time` (a 5 ms sleep per iteration), so `ab_bench.py` cannot compare them;
+pair those by hand (alternate the two binaries ABBA, compare the counter).
+
 The multi-thread benchmarks (`BM_SharedReaders`, `BM_SharedReaderWriter`) pin
 their own threads to the CPUs the process may use, except the CPU the
 benchmark thread sleeps on. Give the process one CPU more than the threads it

@@ -23,7 +23,10 @@ namespace bess::flow {
 //   OnErase(handle, state)   a flow is about to go: its state is still alive,
 //                            its keys are about to leave the index. Cancel
 //                            the expiry record here.
-//   OnFull()                 an Emplace was refused because no slot is free.
+//   OnFull()                 an Emplace was refused for lack of room: no free
+//                            slot, or (SharedFlowTable) the shared directory
+//                            could not place a key of the new flow. The
+//                            EmplaceStatus says which.
 //
 // The reverse direction needs nothing from this interface. An expiry engine
 // keeps FlowHandles in its records; when a deadline passes it calls

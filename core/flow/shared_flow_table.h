@@ -62,10 +62,48 @@
 // calls Reclaim() periodically keeps destructors off workers. Anything that
 // outlives a quiescent state carries a FlowHandle and resolves it with
 // Lookup(handle) each time.
+//
+// Publication. A flow becomes visible at one instant, for every key it has.
+// The slot's generation is odd while it holds a live flow, and the handle the
+// directory stores for each of the flow's keys names that live generation. A
+// create inserts every key into the directory first, builds the State, and
+// only then release-stores the live generation into the slot: until that
+// store the slot's generation is the free (even) one, so a directory value
+// does not match it and every reader path (Peek, Find, FindOwned, FindHandle
+// and the batch lookups) treats the key as absent. Every reader validates the
+// directory's handle against the slot's generation (acquire) before it forms
+// a State pointer, so a reader that finds one key of an aliased flow and
+// later looks for another finds it too, or the flow is gone. Erase mirrors
+// it: the generation moves on first, so every key stops resolving at once,
+// and then the keys leave the directory. A stale directory value, from a
+// flow that was erased or a create that was abandoned, never resolves.
+//
+// Placement. The directory is an rte_hash. Free capacity does not promise
+// that a given key fits: keys that share a cuckoo bucket pair fill it at 16
+// entries however empty the table is, and flow keys come from packets. A key
+// the directory cannot place is a refusal like a full table, not a fault:
+// Emplace returns EmplaceStatus::kPlacementFailed (AddAlias,
+// AliasStatus::kPlacementFailed) and the table holds the same flows, keys,
+// size and free slots as before. A refused create builds no State (a State
+// argument is not moved from), fires no OnCreate, does fire OnFull (the table
+// had no room for the flow), and takes back any directory entry it had
+// inserted; the one visible trace is that the slot it tried has moved on one
+// generation (and, under kFifo, to the back of the free list), so a handle read
+// from the directory in the meantime can never name a later flow.
 
 namespace bess::flow {
 
 enum class StateSharing : uint8_t { kOwnedByCreator, kSharedMutable };
+
+// A test seam: the table calls it inline at the one point of Erase where the
+// flow's generation has moved on and its keys are still in the directory (the
+// window in which every key must already resolve to nothing). Under the writer
+// lock; must not call a mutating operation of the table. The default is empty
+// and occupies no space, so a production table compiles to the same code with
+// or without the call (checked in the disassembly, D-056).
+struct NoSharedFlowTableHook {
+  void AfterEraseGenerationStore() noexcept {}
+};
 
 struct DefaultSharedFlowTableTraits {
   static constexpr size_t kAliases = 0;
@@ -76,6 +114,7 @@ struct DefaultSharedFlowTableTraits {
   using Observer = NoFlowObserver;  // called under the writer lock
   using Owner = DefaultOwner;       // checks kOwnedByCreator access
   using Allocator = DefaultFlowAllocator;
+  using Hook = NoSharedFlowTableHook;  // tests only
 };
 
 template <typename Key, typename State,
@@ -90,6 +129,7 @@ class SharedFlowTable {
   using key_type = Key;
   using state_type = State;
   using Observer = typename Traits::Observer;
+  using Hook = typename Traits::Hook;
 
   static constexpr size_t kAliases = Traits::kAliases;
   static constexpr StateSharing kSharing = Traits::kSharing;
@@ -97,6 +137,9 @@ class SharedFlowTable {
   static constexpr bool kSharedMutable = kSharing == StateSharing::kSharedMutable;
 
   static_assert(kAliases <= 14, "alias key bits must fit the slot's key mask");
+  static_assert(
+      requires(Hook &hook) { { hook.AfterEraseGenerationStore() } noexcept; },
+      "Traits::Hook needs a noexcept AfterEraseGenerationStore()");
 
   // `capacity` flows. The directory and the slot array are allocated here and
   // never grow. `domain` must outlive the table. Needs the EAL (the directory
@@ -259,10 +302,13 @@ class SharedFlowTable {
 
   // -- writers: any thread; serialized by the table ---------------------------
 
-  // Creates the flow `key` with State(args...) unless present. Construction
-  // happens before the flow becomes visible, so a reader finds it complete.
-  // kFull when no slot is free even after reclaiming what the readers have
-  // released; nothing changes then.
+  // Creates the flow `key` with State(args...) unless present. The flow is
+  // published after construction, for all its keys at once, so a reader finds
+  // it complete or not at all. Refused, with nothing changed and no State
+  // built, when no slot is free even after reclaiming what the readers have
+  // released (kFull), or when the directory cannot place the key although
+  // slots are free (kPlacementFailed: see "Placement" above). A refusal tells
+  // the observer OnFull().
   template <typename... Args>
   EmplaceResult<State> Emplace(const Key &key, Args &&...args) {
     Lock guard(lock_);
@@ -296,10 +342,14 @@ class SharedFlowTable {
     if (j > kAliases) {
       return AliasStatus::kNoRoom;
     }
+    // The directory first, so a refusal leaves the slot as it was. The flow is
+    // live, so the alias resolves the moment it is in the directory; the slot's
+    // own record of the key is only read by Erase and RemoveAlias, under the
+    // lock.
+    if (!TryInsert(alias, handle)) {
+      return AliasStatus::kPlacementFailed;
+    }
     slot.StoreKey(j, alias);
-    const auto added = directory_->InsertIfAbsent(Bytes(alias), ValueOf(handle));
-    CHECK(added.status == classifier::ConcurrentExactTable::InsertResult::Status::kInserted)
-        << "the shared directory is sized for every key";
     slot.key_mask = static_cast<uint16_t>(slot.key_mask | (1u << j));
     return AliasStatus::kAdded;
   }
@@ -327,9 +377,10 @@ class SharedFlowTable {
     return false;
   }
 
-  // Erases the flow `key` names (primary or alias). Its keys leave the
-  // directory at once; its State stays valid for readers until a grace period
-  // passes, and is destroyed by a later Reclaim() or Emplace().
+  // Erases the flow `key` names (primary or alias). Every key stops resolving
+  // at once, and the keys then leave the directory; the State stays valid for
+  // readers until a grace period passes, and is destroyed by a later
+  // Reclaim() or Emplace().
   bool Erase(const Key &key) {
     Lock guard(lock_);
     const FlowHandle handle = Resolve(key);
@@ -460,13 +511,18 @@ class SharedFlowTable {
     return {FlowId(slot + 1), slots_[slot].LoadGeneration()};
   }
 
-  // The handle the directory holds for `key`, or the empty handle.
+  // The handle of the live flow `key` names, or the empty handle. The
+  // directory's value is believed only if the slot still holds that flow: a
+  // key whose flow is not yet published, was erased, or whose create was
+  // abandoned resolves to nothing, and so does a directory value that went
+  // stale between the probe and here.
   FlowHandle Resolve(const Key &key) const noexcept {
     uint64_t value = 0;
     if (directory_->LookupBatch(Bytes(key), sizeof(Key), &value, 1) == 0) {
       return {};
     }
-    return std::bit_cast<FlowHandle>(value);
+    const auto handle = std::bit_cast<FlowHandle>(value);
+    return SlotOf(handle) == kNone ? FlowHandle{} : handle;
   }
 
   uint32_t SlotOf(FlowHandle handle) const noexcept {
@@ -502,12 +558,78 @@ class SharedFlowTable {
     for (size_t i = 0; i < n; i++) {
       out[i] = nullptr;
     }
+    // Each directory hit is validated against its slot's generation before it
+    // becomes a State pointer; a hit that fails (erased, or not yet published)
+    // is a miss.
+    uint64_t live = hits;
     for (uint64_t m = hits; m != 0; m &= m - 1) {
       const size_t i = static_cast<size_t>(std::countr_zero(m));
-      const auto handle = std::bit_cast<FlowHandle>(values[i]);
-      out[i] = slots_[handle.id.value() - 1].state_ptr();
+      const uint32_t slot = SlotOf(std::bit_cast<FlowHandle>(values[i]));
+      if (slot == kNone) [[unlikely]] {
+        live &= ~(uint64_t{1} << i);
+      } else {
+        out[i] = slots_[slot].state_ptr();
+      }
     }
-    return hits;
+    return live;
+  }
+
+  using InsertStatus = classifier::ConcurrentExactTable::InsertResult::Status;
+
+  // One key into the directory. False if the directory cannot place it, with
+  // nothing inserted.
+  bool TryInsert(const Key &key, FlowHandle handle) {
+    const auto inserted =
+        directory_->InsertIfAbsent(Bytes(key), ValueOf(handle));
+    if (inserted.status == InsertStatus::kInserted) {
+      return true;
+    }
+    // kExists would mean the directory holds a key no live flow owns: every
+    // caller has just found `key` absent under this lock, and entries leave
+    // the directory with their flow. That is the table's own invariant,
+    // whatever keys arrive. kFull is not: it depends on where the key lands.
+    CHECK(inserted.status == InsertStatus::kFull)
+        << "the shared directory holds a key that no live flow owns";
+    return false;
+  }
+
+  void EraseKey(const Key &key) {
+    const bool erased = directory_->Erase(Bytes(key));
+    DCHECK(erased);
+  }
+
+  // `key` and the optional alias, or neither.
+  bool InsertKeys(const Key &key, const Key *alias, FlowHandle handle) {
+    if (alias != nullptr && !TryInsert(*alias, handle)) {
+      return false;
+    }
+    if (TryInsert(key, handle)) {
+      return true;
+    }
+    if (alias != nullptr) {
+      EraseKey(*alias);
+    }
+    return false;
+  }
+
+  // A create that did not happen: the free slot at the head of the list was
+  // offered a handle (its next odd generation) that readers may have read from
+  // the directory before the keys were taken back. The slot's generation moves
+  // past that handle, exactly as if a flow had lived and died there, so the
+  // handle can never match a later flow in this slot. The slot goes to the back
+  // of the free list (a stack has only one end), so a stream of refused
+  // creates does not wear out one slot's generations; and if the generation
+  // would wrap, the slot is retired like an erased one.
+  void AbandonSlot(uint32_t slot_number) noexcept {
+    Slot &slot = slots_[slot_number];
+    const uint32_t next = slot.LoadGeneration() + 2;  // even -> next even
+    slot.StoreGeneration(next);
+    free_.Pop();
+    if (next == 0) {
+      quarantined_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      free_.Push(slot_number);
+    }
   }
 
   template <typename... Args>
@@ -537,37 +659,47 @@ class SharedFlowTable {
     }
     const uint32_t slot_number = free_.Peek();
     Slot &slot = slots_[slot_number];
-    // Build the State while nobody can see it; a throwing constructor leaves
-    // the table as it was.
-    State *state = ::new (static_cast<void *>(slot.state))
-        State(std::forward<Args>(args)...);
+    const uint32_t live = slot.LoadGeneration() + 1;  // even -> odd, not stored yet
+    const FlowHandle handle{FlowId(slot_number + 1), live};
+
+    // Every key goes into the directory while the slot still holds its free
+    // (even) generation, so none of them resolves yet. A key the directory
+    // cannot place refuses the create before anything is built: the State's
+    // constructor does not run and its arguments are not consumed.
+    if (!InsertKeys(key, alias, handle)) {
+      AbandonSlot(slot_number);
+      observer_.OnFull();
+      return {nullptr, {}, EmplaceStatus::kPlacementFailed};
+    }
+    // Build the State while nobody can resolve the flow. A throwing
+    // constructor takes the keys back out and leaves the table as it was.
+    State *state = nullptr;
+    try {
+      state = ::new (static_cast<void *>(slot.state))
+          State(std::forward<Args>(args)...);
+    } catch (...) {
+      EraseKey(key);
+      if (alias != nullptr) {
+        EraseKey(*alias);
+      }
+      AbandonSlot(slot_number);
+      throw;
+    }
     free_.Pop();
     slot.StoreKey(0, key);
     slot.key_mask = 1;
-    if constexpr (kStampOwner) {
-      slot.extra = Traits::Owner::Current();
-    }
-    const uint32_t generation = slot.LoadGeneration() + 1;  // even -> odd
-    const FlowHandle handle{FlowId(slot_number + 1), generation};
     if (alias != nullptr) {
       slot.StoreKey(1, *alias);
       slot.key_mask = 3;
     }
-    // Everything the flow consists of is written; the directory insert below
-    // (a release store inside rte_hash) is what publishes it to readers.
-    slot.StoreGeneration(generation);
-    if (alias != nullptr) {
-      const auto second =
-          directory_->InsertIfAbsent(Bytes(*alias), ValueOf(handle));
-      CHECK(second.status ==
-            classifier::ConcurrentExactTable::InsertResult::Status::kInserted)
-          << "the shared directory is sized for every key";
+    if constexpr (kStampOwner) {
+      slot.extra = Traits::Owner::Current();
     }
-    const auto first = directory_->InsertIfAbsent(Bytes(key), ValueOf(handle));
-    CHECK(first.status ==
-          classifier::ConcurrentExactTable::InsertResult::Status::kInserted)
-        << "the shared directory is sized for every key";
     size_.fetch_add(1, std::memory_order_relaxed);
+    // The one publication point: this release store makes the flow resolve,
+    // for every key at once, with the State and keys above visible to any
+    // reader that sees it.
+    slot.StoreGeneration(live);
     observer_.OnCreate(handle, *state);
     return {state, handle, EmplaceStatus::kCreated};
   }
@@ -576,18 +708,19 @@ class SharedFlowTable {
     Slot &slot = slots_[slot_number];
     State *state = slot.state_ptr();
     observer_.OnErase(HandleOf(slot_number), *state);
-    // Out of the directory first, so no new reader can find the flow; then the
-    // generation, so a handle already held stops resolving. The State and the
-    // slot wait for readers that may be using them.
+    // The generation first: from this store no key of the flow resolves, for
+    // every key at once, and a handle already held stops resolving. The keys
+    // then leave the directory (entries that remain until then resolve to
+    // nothing). The State and the slot wait for readers that may be using them.
+    const uint32_t next = slot.LoadGeneration() + 1;  // odd -> even
+    slot.StoreGeneration(next);
+    hook_.AfterEraseGenerationStore();
     for (size_t j = 0; j < kKeysPerSlot; j++) {
       if (slot.key_mask >> j & 1) {
-        const bool erased = directory_->Erase(Bytes(*slot.key_ptr(j)));
-        DCHECK(erased);
+        EraseKey(*slot.key_ptr(j));
       }
     }
     slot.key_mask = 0;
-    const uint32_t next = slot.LoadGeneration() + 1;  // odd -> even
-    slot.StoreGeneration(next);
     size_.fetch_sub(1, std::memory_order_relaxed);
 
     const uint32_t tail = (pending_head_ + pending_count_) % capacity_;
@@ -638,15 +771,22 @@ class SharedFlowTable {
     return freed;
   }
 
+  // Read by every lookup and never written after Create: one cache line of
+  // their own. Everything a create or erase writes (the counters, the lock, the
+  // observer) starts on the next line, so a writer's stores do not invalidate
+  // the line every reader loads (D-056: with them together, a churning writer
+  // cost the readers 15-19% (busy machine; 18-20% inferred when isolated) and
+  // the writer 1.2-1.5x (isolated)).
   rcu::RcuDomain &domain_;
   std::unique_ptr<classifier::ConcurrentExactTable> directory_;
-  [[no_unique_address]] Observer observer_;
   Slot *slots_ = nullptr;
   uint32_t capacity_ = 0;
-  std::atomic<uint32_t> size_{0};
+  alignas(64) std::atomic<uint32_t> size_{0};
   std::atomic<uint32_t> quarantined_{0};
   std::atomic<uint32_t> pending_published_{0};
   mutable rte_spinlock_t lock_;
+  [[no_unique_address]] Observer observer_;
+  [[no_unique_address]] Hook hook_;
   // Guarded by lock_:
   detail::FreeList free_;
   uint32_t *pending_ = nullptr;

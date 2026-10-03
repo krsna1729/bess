@@ -49,6 +49,11 @@ enum class EmplaceStatus : uint8_t {
   kFull,         // no free slot; nothing changed (see docs/flow-state.md)
   kAliasExists,  // EmplaceAliased: the alias key was already present; nothing
                  // changed
+  kPlacementFailed,  // SharedFlowTable only: slots are free but the shared
+                     // directory could not place the key (or its alias), as
+                     // happens to keys that crowd one hash bucket pair; nothing
+                     // changed and no State was built. Refused like kFull, not
+                     // an error of the table.
 };
 
 enum class AliasStatus : uint8_t {
@@ -56,6 +61,8 @@ enum class AliasStatus : uint8_t {
   kStale,   // the handle does not name a live flow
   kExists,  // the alias key is already in the table (for any flow)
   kNoRoom,  // the flow already has Traits::kAliases aliases
+  kPlacementFailed,  // SharedFlowTable only: the directory could not place the
+                     // alias key; nothing changed
 };
 
 template <typename State>
