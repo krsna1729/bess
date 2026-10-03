@@ -109,6 +109,19 @@ FORBIDDEN_RULES = [
             ("pb/", "route library must not depend on protobuf"),
         ],
     ),
+    # The L2 library (M14, D-064) is graph-independent: no Module, gate,
+    # framework, runtime, control or protobuf; interfaces are InterfaceId.
+    (
+        re.compile(r"^core/l2/"),
+        [
+            ("module.h", "L2 library must not depend on Module"),
+            ("gate.h", "L2 library must not depend on gates; use InterfaceId"),
+            ("framework/", "L2 library must not depend on framework"),
+            ("runtime/", "L2 library must not depend on runtime"),
+            ("control/", "L2 library must not depend on control"),
+            ("pb/", "L2 library must not depend on protobuf"),
+        ],
+    ),
     # The flow-state library is graph-independent and sits below the worker: no
     # Module, gate, framework, runtime, control or protobuf, and no worker.h or
     # stats/current_worker.h (worker identity is an injected owner token; M9,
@@ -267,6 +280,7 @@ SELF_TEST_CASES = [
     ("core/dataplane/slot_table.h", '#include "classifier/classifier.h"', 1),
     ("core/dataplane/batch_stages.h", '#include "stats/worker_slots.h"', 1),
     ("core/flow/worker_flow_table.h", '#include "module.h"', 1),
+    ("core/l2/fdb.h", '#include "gate.h"', 1),
     ("core/flow/owner.h", '#include "stats/current_worker.h"', 1),
     ("core/dataplane/expiry_wheel.h", '#include "flow/flow_types.h"', 1),
     ("core/dataplane/expiry_wheel.h", '#include "worker.h"', 1),

@@ -432,6 +432,26 @@ reference to something missing.
   flow state that needs a bounded size, a stable id or aliases belongs in
   `flow::WorkerFlowTable` (flow-state.md).
 
+### `l2::Fdb` and `l2::MacTable` (L2 forwarding database, worker-owned)
+
+- **What:** `core/l2/fdb.h` (experimental, M14, D-064): exact
+  (bridge domain, MAC) → `InterfaceId` lookup, static entries, a learning
+  helper (refresh, move, refuse multicast and the invalid interface), aging
+  on the generic `ExpiryWheel`, flood groups per domain and a VLAN → domain
+  map. No `Module`, gate or runtime dependency; the owner maps interfaces to
+  gates (Bridge: gate g is interface g + 1).
+- **Table:** `MacTable`, a two-choice cuckoo table whose 64-byte bucket holds
+  four contiguous keys (one vector compare), their values and flags; the aging
+  timer sits in a cold array beside it. Fixed capacity, sized for 50% load;
+  tables of 2 MiB or more ask for transparent huge pages.
+- **Use:** one worker owns it (learning writes it on the packet path). It is
+  not mode C: a table that a command thread writes while several workers
+  read is `l2_table` (L2Forward) or `ConcurrentExactTable`.
+- **Cost** (D-064): 3.4 ns a hot lookup, 4.1–5.3 ns uniform up to 64K
+  entries; 0.6–2.5 ns behind `l2_table` and 1.1–3× ahead of the
+  `unordered_map` Bridge used before M14; at 1M entries 1.5–3.2× behind
+  `l2_table`.
+
 ### `ExtractPlan` (packet → key)
 
 - **What:** compiles a key layout (packet offsets, metadata attributes, masks)
@@ -453,6 +473,7 @@ reference to something missing.
 | BPF | compiled filters | Pause | deferred: G together with the `rte_bpf` decision (MODERNIZATION §31.6) |
 | NAT | `CuckooMap` | worker-owned (the packet path learns flows) | limited to one worker |
 | DRR | `CuckooMap` of flows | worker-owned: upstream workers hand packets over an MP/SC ingress ring; the task's worker owns the flow map and queues; commands are atomics | D-019 |
+| Bridge | `l2::Fdb` (`MacTable` + `ExpiryWheel`) | worker-owned (the packet path learns); commands are THREAD_UNSAFE | one worker; D-064 |
 
 ## 6. Why it is like this
 

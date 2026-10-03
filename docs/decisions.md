@@ -84,6 +84,7 @@ file is the reasoning.
 | D-061 | Release builds define NDEBUG; damage-guarding checks are CHECK | accepted |
 | D-062 | Decision cache: a typed flow cache with O(1) generation invalidation (M12) | accepted |
 | D-063 | Bounded packet edit plan: experimental and opt-in, not adopted for typed rewrites (M13) | accepted |
+| D-064 | L2 forwarding database: a graph-independent FDB on a MAC-specialised table (M14) | accepted |
 
 
 ---
@@ -5521,3 +5522,117 @@ cheaper here).
 
 **Revisit when:** a dynamic consumer needs it and its per-packet budget allows a few nanoseconds; UDP or per-packet
 field edits are needed (a branch-free op for each); or code generation (a JIT, or templates instantiated per plan shape) becomes acceptable.
+
+## D-064 L2 forwarding database: a graph-independent FDB on a MAC-specialised table (M14)
+
+**Status:** accepted (2026-10-04), experimental API. **Needs review (user):** L2Forward is not moved onto the
+library (below).
+**Code:** `core/l2/fdb.h`, `core/l2/mac_table.h` (new, header-only, installed experimental), `core/l2/fdb_test.cc`,
+`core/l2/fdb_bench.cc`, `core/modules/bridge.{h,cc}`, `core/modules/bridge_test.cc`, `core/meson.build`,
+`tools/check_includes.py`, `tools/api_classes.json`, `docs/dataplane-tables.md`.
+
+**Context.** Roadmap M14: an L2 bridge/FDB library with no `Module` or gate dependency (mechanism, not policy:
+no STP, EVPN or learning-security policy), the three candidate backends compared (the legacy `l2_table`, the
+flow substrate, a MAC-specialised table), and the modules rebuilt as thin adapters.
+
+**Decision.**
+- `l2::Fdb`: exact (`BridgeDomainId`, MAC) → `InterfaceId`. `Learn` creates, refreshes or moves dynamic entries;
+  it ignores multicast sources, the invalid interface and unknown domains, never touches a static entry, and
+  stops creating at a learn limit that keeps room for static programming. `AddStatic` and `Remove` program it
+  (a static entry replaces a dynamic one and cancels its timer). Aging runs on the M10 `ExpiryWheel` with a work
+  budget per call: a learned entry is usable while `now - learned <= aging`, the legacy Bridge's rule. Flood
+  groups per domain and a VLAN → domain map are plain configuration. Everything fails closed: a miss, an unknown
+  domain and an unmapped VLAN read as no interface or no domain.
+- Ownership: one worker owns an `Fdb` (learning writes it on the packet path); no locks, no RCU.
+- Backend: `l2::MacTable`, a two-choice cuckoo table. A 64-byte bucket holds four contiguous 64-bit keys (domain
+  in the low 16 bits, MAC above), their 16-bit values and flags; one vector compare probes a bucket. The empty
+  marker is the all-ones word (domain 0xFFFF with the broadcast MAC, never a valid key). The timer handle lives in
+  a cold array beside the table, moved with its slot. Sized for 50% load; inserts into two full buckets move
+  entries along a breadth-first path. Tables of 2 MiB or more are 2 MiB-aligned with `MADV_HUGEPAGE`.
+- Bridge is rebuilt on it: gate g is interface g + 1 (`DROP_GATE` included), the protobuf arguments and commands
+  are unchanged, learning and forwarding are the same (hairpin drop, flood to every connected output gate but the
+  ingress one). Two differences: static entries are bounded (`size` + 1,024, ENOSPC beyond; before, unbounded),
+  and expiry is not checked at lookup. Aging runs in `ProcessBatch` with 256 units of wheel work per batch at a
+  granularity of 2^20 ns (about 1 ms), so packets must flow for entries to leave, and after a burst of N expiries
+  (an idle period) draining takes about N/256 batches; meanwhile the expired entries still forward to their old
+  gates, where the legacy module, checking age at lookup against a whole-second clock, flooded at once.
+  `DifferentialAgainstLegacyBridgeSemantics` ages with an unlimited budget at granularity 0 before every packet,
+  so its equivalence holds for those settings, not Bridge's.
+- **L2Forward stays on `l2_table`** (the conservative choice; user review requested). It is mode C: a command
+  thread writes while several workers read lock-free (D-017), which a worker-owned FDB does not provide; and
+  `l2_table` is faster for plain MAC → gate lookups (table below), with no domain, flags or timer to carry.
+
+**Evidence.** `l2_fdb_bench`, release (`NDEBUG`, x86-64-v3, gcc), `omarchy-benchmark --isolate --cpu 2`,
+3 repetitions, medians, ns per lookup. CPU 2 logged no device interrupts; it took about 8,500 thermal-event
+interrupts in each run (the machine's thermal management, present in every row). Backends: the FDB
+(`MacTable`), `l2_table` sized as L2Forward sizes it, `std::unordered_map` (the pre-M14 Bridge, scalar only) and
+`WorkerFlowTable<FdbKey, InterfaceId>` (the flow substrate). Every lookup row reports its hit rate (100% for hit
+streams, 0% for misses; `l2_table` 99.98% at 1M). The run is of the final code; two earlier runs of the code
+before the review fixes agree within 0.3 ns below 1M.
+
+| entries | stream | batch | Fdb (MacTable) | l2_table | unordered_map | WorkerFlowTable |
+|---|---|---|---|---|---|---|
+| 1024 | hot | 1 | 3.36 | 2.78 | 5.83 | 3.04 |
+| 1024 | hot | 32 | 2.96 | 2.00 | — | 3.78 |
+| 1024 | miss | 1 | 4.53 | 3.69 | 11.44 | 2.56 |
+| 1024 | miss | 32 | 4.26 | 2.36 | — | 3.38 |
+| 1024 | uniform | 1 | 4.11 | 3.20 | 8.69 | 3.28 |
+| 1024 | uniform | 32 | 3.51 | 2.30 | — | 3.83 |
+| 65536 | hot | 1 | 3.41 | 2.81 | 3.89 | 3.09 |
+| 65536 | hot | 32 | 2.97 | 2.28 | — | 3.79 |
+| 65536 | miss | 1 | 6.18 | 4.25 | 18.06 | 3.40 |
+| 65536 | miss | 32 | 5.69 | 3.18 | — | 3.55 |
+| 65536 | uniform | 1 | 5.25 | 4.01 | 15.98 | 5.50 |
+| 65536 | uniform | 32 | 4.18 | 2.86 | — | 4.43 |
+| 1048576 | hot | 1 | 3.45 | 2.91 | 3.95 | 3.19 |
+| 1048576 | hot | 32 | 2.97 | 2.29 | — | 3.83 |
+| 1048576 | miss | 1 | 19.89 | 6.99 | 23.84 | 4.63 |
+| 1048576 | miss | 32 | 16.51 | 5.23 | — | 4.16 |
+| 1048576 | uniform | 1 | 8.91 | 5.86 | 23.11 | 20.82 |
+| 1048576 | uniform | 32 | 6.10 | 3.76 | — | 11.99 |
+
+Learning (ns per learn; half the stream present, half new at the learn limit): FDB 13.2 / 16.8 / 64.8 at
+1K / 64K / 1M, `unordered_map` 22.6 / 41.9 / 173.4. Aging: 27 ns per entry for 64K expiring at once, 107 at 1M.
+
+What the comparison showed:
+- The flow substrate first (the FDB built on `WorkerFlowTable`): 1M uniform hits 47 ns scalar against `l2_table`'s
+  5.8 (an index line, then the key array, then the state array); rejected. The table above keeps it as a
+  reference row.
+- Three causes found and fixed on the way to the table above, each measured: a key built by two narrow stores and
+  read by one 8-byte load defeated store forwarding (27 → 8 ns a hot lookup); an early-exit probe loop
+  mispredicted on the random matching way; interleaved key/value slots kept the probe scalar (16-byte slots,
+  about 24 instructions; now one vector compare). Two CRCs for the two buckets are linear in the key
+  (`crc(s, k) = crc(0, k) ^ c`), so every key in a bucket shared one alternate and inserts failed at 48% load;
+  the hash is splitmix64's finaliser.
+- `MacTable` against `l2_table`: 0.6-2.5 ns slower up to 64K entries; at 1M, 1.5-1.6× slower for uniform hits
+  and 2.8-3.2× for misses. Per-instruction profiles of the 1M rows show the bucket loads taking dTLB walks (about 1.2 per
+  lookup) although most of the table is on transparent huge pages; how many depends on the machine's free huge
+  pages from run to run (18-32 MB of 32 MB observed), and `l2_table`'s table is half the size (8-byte slots, no
+  domain). Not closed: the 1M miss rows are 2.8-3.2× `l2_table` [INFERENCE: TLB reach and twice the footprint; not
+  isolated further].
+- Against the `unordered_map` it replaces in Bridge: faster in every row (1.1-3.0×; the least for hot keys at
+  64K and 1M and for 1M misses).
+- A domain bound check in `Lookup` (the first fix for the reserved key, below) cost 0.5 ns a scalar lookup in an
+  isolated run (hot 3.31 → 3.77); the fix kept is the invariant that a free slot's value is 0, at no cost.
+
+**Mutation checks** (`l2_fdb_test`, `modules_bridge_test`, fast build): aging deadline without the +1 (caught by
+the aging test and the legacy differential); learning overriding a static entry; `AddStatic` keeping the dynamic
+timer; the learn domain bound dropped; the learn limit dropped; the probe ignoring the matching way; a move that
+leaves the cold word behind; a non-involutive alternate bucket — all caught. After review: `Erase` not clearing
+the value, `LookupBatch` not testing it, `Remove` without its domain check — caught (the reserved-key test learns
+and removes 32 MACs in a one-entry FDB, so every free slot last held an interface). Survived: removing the guard
+against a displacement path that revisits a bucket (at 50% load no test reaches such a path; the guard stays as a
+cheap defence), and ignoring a `Schedule` refusal (it needs 2^31 armings of one wheel node).
+
+**Review** (reviewer agent, two rounds). Round 1: the reserved key word (domain 0xFFFF with the broadcast MAC,
+the table's empty marker) matched a free slot in `Lookup`/`LookupBatch`/`Remove` — a stale interface, or a
+`size()` underflow that stops learning; `Learn` ignored a `Schedule` refusal (a quarantined wheel node) and kept
+an entry that never ages; the aging-lag statement was understated. All fixed as described above.
+
+**Not done.** VLAN-aware forwarding in Bridge (the library maps VLANs; the module has one domain). Concurrent
+readers: none by design (the roadmap's "concurrent readers" item is answered by keeping L2Forward on the mode-C
+`l2_table`). A batch lookup in Bridge (it looks up one packet at a time, as before).
+
+**Revisit when:** L2Forward needs domains, aging or learning (then a mode-C FDB variant: a single writer with
+whole-slot stores, as `l2_table` does); or the 1M miss gap matters to a consumer (try a 1 GiB-page or explicit
+hugetlbfs allocation, or a smaller slot).

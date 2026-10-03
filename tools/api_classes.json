@@ -53,6 +53,8 @@
     "dataplane/worker_id.h": "experimental",
     "flow/decision_cache.h": "experimental",
     "flow/flow_index.h": "experimental",
+    "l2/fdb.h": "experimental",
+    "l2/mac_table.h": "experimental",
     "flow/flow_key.h": "experimental",
     "flow/flow_observer.h": "experimental",
     "flow/flow_storage.h": "experimental",

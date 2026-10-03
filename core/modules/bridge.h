@@ -3,32 +3,30 @@
 #ifndef BESS_MODULES_BRIDGE_H_
 #define BESS_MODULES_BRIDGE_H_
 
+#include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
+#include "l2/fdb.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
-#include "utils/ether.h"
 
-// Bridge: Ethernet L2 Learning Bridge with MAC aging and flooding.
-// Learns source MAC to ingress gate mappings dynamically, forwards known
-// unicast traffic, and floods unknown unicast and broadcast traffic.
+// Bridge: Ethernet L2 learning bridge with MAC aging and flooding, a thin
+// adapter over the l2::Fdb library (M14, D-064). Learns source MAC -> ingress
+// gate, forwards known unicast, floods unknown unicast and broadcast to every
+// connected output gate except the ingress one, and drops hairpin traffic.
+// Gate g is FDB interface g + 1 (DROP_GATE included, so a static entry can
+// blackhole a MAC); the FDB never sees gates.
 class Bridge final : public Module {
  public:
   static const gate_idx_t kNumIGates = MAX_GATES;
   static const gate_idx_t kNumOGates = MAX_GATES;
   static const Commands cmds;
 
-  struct Entry {
-    gate_idx_t gate = 0;
-    uint64_t last_seen_sec = 0;
-    bool is_static = false;
-  };
+  // Static entries beyond the learning limit (`size`).
+  static constexpr size_t kStaticReserve = 1024;
 
-  // One worker: the FDB is a std::unordered_map mutated on the packet path, so
-  // two workers would race (and the learn path may allocate). Keep it a
-  // behavioural prototype until M14 supplies a bounded, worker-owned FDB.
+  // One worker: the FDB is worker-owned (learning writes it on the packet path).
   Bridge() : Module() { max_allowed_workers_ = 1; }
 
   CommandResponse Init(const bess::pb::BridgeArg &arg);
@@ -40,13 +38,11 @@ class Bridge final : public Module {
   std::string GetDesc() const override;
 
  private:
-  void ExpireEntries(uint64_t now_sec);
+  void Flood(Context *ctx, bess::PacketRef pkt, gate_idx_t igate,
+             const std::vector<gate_idx_t> &flood_gates);
 
   uint32_t max_entries_ = 1024;
-  uint32_t aging_time_sec_ = 300;
-
-  // MAC as uint64 -> Entry
-  std::unordered_map<uint64_t, Entry> fdb_;
+  std::unique_ptr<bess::l2::Fdb> fdb_;
 };
 
 #endif  // BESS_MODULES_BRIDGE_H_

@@ -513,6 +513,10 @@ core_public_subdir_headers = {
     'classifier/classifier.h',
     'classifier/range_backend.h',
   ),
+  'l2': files(
+    'l2/fdb.h',
+    'l2/mac_table.h',
+  ),
   'flow': files(
     'flow/decision_cache.h',
     'flow/flow_index.h',
@@ -551,6 +555,7 @@ endforeach
 unit_test_sources = [
   'flow/decision_cache_test.cc',
   'flow/expiry_consumer_test.cc',
+  'l2/fdb_test.cc',
   'flow/flow_index_test.cc',
   'flow/reference_apps_test.cc',
   'flow/worker_flow_table_test.cc',
@@ -785,6 +790,7 @@ if get_option('build_benchmarks')
     'handoff_bench': ['dataplane/handoff_bench.cc', benchmark_main_dep],
     'flow_expiry_bench': ['flow/flow_expiry_bench.cc', benchmark_main_dep],
     'flow_decision_cache_bench': ['flow/decision_cache_bench.cc', benchmark_main_dep],
+    'l2_fdb_bench': ['l2/fdb_bench.cc', benchmark_main_dep],
     'classifier_range_backend_bench': ['classifier/range_backend_bench.cc', benchmark_main_dep],
     'utils_memory_backing_bench': ['utils/memory_backing_bench.cc', benchmark_main_dep],
     'object_table_bench': ['dataplane/object_table_bench.cc', benchmark_main_dep],

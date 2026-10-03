@@ -12,6 +12,7 @@
 #include "packet.h"
 #include "packet_pool.h"
 #include "pb/module_msg.pb.h"
+#include "utils/format.h"
 #include "task.h"
 #include "utils/endian.h"
 #include "utils/ether.h"
@@ -243,6 +244,33 @@ TEST_F(BridgeTest, HairpinFiltering) {
   ctx.current_igate = 0;
   br->ProcessBatch(&ctx, &batch);
   // Packet was dropped by hairpin filtering
+}
+
+// Static programming through the module: DROP_GATE is accepted (a blackholed
+// MAC), a multicast MAC is refused, and statics beyond `size` plus
+// kStaticReserve are refused with ENOSPC (the FDB is bounded, D-064).
+TEST_F(BridgeTest, StaticProgrammingLimits) {
+  BridgeArg arg;
+  arg.set_size(1);
+  Bridge *br = CreateBridge(arg);
+  ASSERT_NE(nullptr, br);
+  BridgeCommandAddArg add;
+  add.set_mac_addr("02:00:00:00:00:01");
+  add.set_gate(DROP_GATE);
+  EXPECT_EQ(0, br->CommandAdd(add).error().code());
+  add.set_mac_addr("01:00:5e:00:00:01");
+  add.set_gate(1);
+  EXPECT_EQ(EINVAL, br->CommandAdd(add).error().code());
+  int last = 0;
+  for (int i = 0; i < 1 + static_cast<int>(Bridge::kStaticReserve); i++) {
+    add.set_mac_addr(bess::utils::Format("02:00:00:01:%02x:%02x", i >> 8, i & 0xff));
+    last = br->CommandAdd(add).error().code();
+    if (last != 0) {
+      EXPECT_EQ(static_cast<int>(Bridge::kStaticReserve), i);  // the 1,026th entry
+      break;
+    }
+  }
+  EXPECT_EQ(ENOSPC, last);
 }
 
 }  // namespace
