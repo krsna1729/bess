@@ -17,8 +17,9 @@ namespace bess::route {
 
 std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
     std::string name, const Config &config, size_t max_next_hops,
-    rcu::RcuDomain &domain, size_t max_domains) {
-  if (max_next_hops == 0 || max_next_hops > LpmRouteTable::kMaxValue) {
+    rcu::RcuDomain &domain, size_t max_domains, size_t max_groups) {
+  if (max_next_hops == 0 || max_next_hops > LpmRouteTable::kMaxValue ||
+      max_groups > LpmRouteTable::kMaxValue - max_next_hops) {
     return std::unexpected(RouteError::kValueOutOfRange);
   }
   if (max_domains == 0 || max_domains > kMaxRouteDomains) {
@@ -29,19 +30,27 @@ std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
     return std::unexpected(routes.error());
   }
   return std::unique_ptr<Router>(new Router(
-      std::move(name), std::move(*routes), max_next_hops, max_domains, domain));
+      std::move(name), std::move(*routes), max_next_hops, max_domains,
+      max_groups, domain));
 }
 
 Router::Router(std::string name, std::unique_ptr<LpmRouteTable> default_routes,
-               size_t max_next_hops, size_t max_domains, rcu::RcuDomain &rcu)
+               size_t max_next_hops, size_t max_domains, size_t max_groups,
+               rcu::RcuDomain &rcu)
     : name_(name),
       rcu_(rcu),
       max_domains_(max_domains),
+      max_next_hops_(static_cast<uint32_t>(max_next_hops)),
       domains_(max_domains),
       default_routes_(default_routes.get()),
       domain_ids_{kDefaultRouteDomainId},
       next_hops_(max_next_hops),
       references_(max_next_hops + 1, 0),
+      // SlotTable needs a capacity of at least one; a router without groups
+      // never publishes into it.
+      groups_(std::max<size_t>(max_groups, 1)),
+      group_references_(max_groups + 1, 0),
+      member_references_(max_next_hops + 1, 0),
       next_hops_name_(name + "/next_hops"),
       routes_name_(name + "/routes") {
   // Before any reader can exist: nothing to retire.
@@ -250,6 +259,9 @@ std::expected<void, std::string> Router::Enroll(
   if (CountRoutes() != 0) {
     return std::unexpected("enroll before adding routes");
   }
+  if (groups_.size() != 0 || !retiring_groups_.empty()) {
+    return std::unexpected("next-hop groups are not transactional (D-065)");
+  }
   auto hops = std::make_unique<dataplane::SlotResource<NextHopId, NextHop>>(
       next_hops_name_, next_hops_);
   auto routes = std::make_unique<RouteResource>(*this);
@@ -283,6 +295,27 @@ std::expected<void, std::string> Router::Release() {
 }
 
 size_t Router::CompleteRetirementsLocked() {
+  // Groups first: a retired group's members stay referenced (so the next
+  // hops stay published) until no reader can still select from it.
+  std::vector<std::unique_ptr<const NextHopGroup>> emptied_groups;
+  std::erase_if(retiring_groups_, [&](const RetiringGroup &r) {
+    if (!rcu_.IsComplete(r.token)) {
+      return false;
+    }
+    auto group = groups_.Unpublish(r.id);
+    for (uint32_t i = 0; i < group->size; i++) {
+      member_references_[group->members[i].value()]--;
+    }
+    emptied_groups.push_back(std::move(group));
+    return true;
+  });
+  if (!emptied_groups.empty()) {
+    const rcu::GracePeriod token = rcu_.StartGracePeriod();
+    for (auto &group : emptied_groups) {
+      rcu_.Retire(token, std::move(group));
+    }
+  }
+
   std::vector<std::unique_ptr<const NextHop>> emptied;
   std::erase_if(retiring_, [&](const Retiring &r) {
     if (!rcu_.IsComplete(r.token)) {
@@ -300,7 +333,7 @@ size_t Router::CompleteRetirementsLocked() {
     }
     rcu_.ReclaimReady();
   }
-  return retiring_.size();
+  return retiring_.size() + retiring_groups_.size();
 }
 
 size_t Router::ReclaimRetired() {
@@ -343,7 +376,7 @@ std::expected<void, RouteError> Router::RemoveNextHop(NextHopId id) {
   if (!next_hops_.Contains(id)) {
     return std::unexpected(RouteError::kUnknownNextHop);
   }
-  if (references_[id.value()] != 0) {
+  if (references_[id.value()] != 0 || member_references_[id.value()] != 0) {
     return std::unexpected(RouteError::kNextHopInUse);
   }
   // No route names `id` any more, but a reader may have looked one up just
@@ -438,11 +471,141 @@ std::expected<void, RouteError> Router::SetRoute(RouteDomainId domain,
       !set) {
     return set;
   }
-  references_[hop.value()]++;
+  Reference(hop.value());
   if (previous) {
-    references_[*previous]--;
+    Unreference(*previous);
   }
   return {};
+}
+
+std::expected<void, RouteError> Router::SetRoute(RouteDomainId domain,
+                                                 Ipv4Prefix prefix,
+                                                 NextHopGroupId group) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (engine_ != nullptr) {
+    return std::unexpected(RouteError::kEnrolled);
+  }
+  CompleteRetirementsLocked();
+  LpmRouteTable *routes = TableOf(domain);
+  if (routes == nullptr) {
+    return std::unexpected(RouteError::kUnknownDomain);
+  }
+  if (!groups_.ValidId(group) || group.value() >= group_references_.size()) {
+    return std::unexpected(RouteError::kInvalidId);
+  }
+  if (!groups_.Contains(group)) {
+    return std::unexpected(RouteError::kUnknownNextHop);
+  }
+  // The group was published (release store) before this route can be.
+  const uint32_t value = max_next_hops_ + group.value();
+  const std::optional<uint32_t> previous = routes->Find(prefix);
+  if (auto set = routes->Upsert(prefix, value); !set) {
+    return set;
+  }
+  Reference(value);
+  if (previous) {
+    Unreference(*previous);
+  }
+  return {};
+}
+
+void Router::Reference(uint32_t value) noexcept {
+  if (value > max_next_hops_) {
+    group_references_[value - max_next_hops_]++;
+  } else {
+    references_[value]++;
+  }
+}
+
+void Router::Unreference(uint32_t value) noexcept {
+  if (value > max_next_hops_) {
+    group_references_[value - max_next_hops_]--;
+  } else {
+    references_[value]--;
+  }
+}
+
+std::expected<void, RouteError> Router::SetNextHopGroup(
+    NextHopGroupId id, std::span<const NextHopId> members) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (engine_ != nullptr) {
+    return std::unexpected(RouteError::kEnrolled);
+  }
+  CompleteRetirementsLocked();
+  if (!groups_.ValidId(id) || id.value() >= group_references_.size() ||
+      members.empty() || members.size() > NextHopGroup::kMaxMembers) {
+    return std::unexpected(RouteError::kInvalidId);
+  }
+  if (!groups_.CanPublish(id)) {
+    return std::unexpected(RouteError::kNextHopRetiring);
+  }
+  auto group = std::make_unique<NextHopGroup>();
+  group->size = static_cast<uint32_t>(members.size());
+  for (size_t i = 0; i < members.size(); i++) {
+    if (!ValidId(members[i])) {
+      return std::unexpected(RouteError::kInvalidId);
+    }
+    if (!next_hops_.Contains(members[i])) {
+      return std::unexpected(RouteError::kUnknownNextHop);
+    }
+    group->members[i] = members[i];
+  }
+  for (const NextHopId m : members) {
+    member_references_[m.value()]++;
+  }
+  // One pointer store; the members were published before.
+  auto replaced = groups_.Publish(id, std::unique_ptr<const NextHopGroup>(std::move(group)));
+  if (replaced) {
+    // The old members are released now. A reader may still select from the
+    // old object until its quiescent state, but a member removed after this
+    // retires with a grace period that starts later, so it stays published
+    // until such readers are gone (the argument that lets RemoveRoute release
+    // its next hop at once).
+    for (uint32_t i = 0; i < replaced->size; i++) {
+      member_references_[replaced->members[i].value()]--;
+    }
+    rcu_.Retire(rcu_.StartGracePeriod(), std::move(replaced));
+    rcu_.ReclaimReady();
+  }
+  return {};
+}
+
+std::expected<void, RouteError> Router::RemoveNextHopGroup(NextHopGroupId id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (engine_ != nullptr) {
+    return std::unexpected(RouteError::kEnrolled);
+  }
+  CompleteRetirementsLocked();
+  if (!groups_.ValidId(id) || id.value() >= group_references_.size()) {
+    return std::unexpected(RouteError::kInvalidId);
+  }
+  if (!groups_.Contains(id)) {
+    return std::unexpected(RouteError::kUnknownNextHop);
+  }
+  if (group_references_[id.value()] != 0) {
+    return std::unexpected(RouteError::kNextHopInUse);
+  }
+  // As RemoveNextHop: readable until a grace period passes.
+  groups_.Retire(id);
+  retiring_groups_.push_back({id, rcu_.StartGracePeriod()});
+  return {};
+}
+
+size_t Router::next_hop_group_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return groups_.size();
+}
+
+size_t Router::GroupReferences(NextHopGroupId id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return groups_.ValidId(id) && id.value() < group_references_.size()
+             ? group_references_[id.value()]
+             : 0;
+}
+
+size_t Router::GroupMemberships(NextHopId id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ValidId(id) ? member_references_[id.value()] : 0;
 }
 
 std::expected<void, RouteError> Router::RemoveRoute(RouteDomainId domain,
@@ -463,7 +626,7 @@ std::expected<void, RouteError> Router::RemoveRoute(RouteDomainId domain,
   if (auto erased = routes->Erase(prefix); !erased) {
     return erased;
   }
-  references_[*previous]--;
+  Unreference(*previous);
   return {};
 }
 
@@ -507,8 +670,8 @@ std::expected<void, RouteError> Router::ReplaceRouteSetAtomic(
   }
 
   // 3. Published; nothing below can fail. The counts now match the new set.
-  for (const uint32_t hop : released) {
-    references_[hop]--;
+  for (const uint32_t value : released) {
+    Unreference(value);  // the old set may have named groups
   }
   for (const auto &entry : wanted) {
     references_[entry.second.value()]++;

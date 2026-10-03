@@ -14,6 +14,11 @@ struct NextHopIdTag;
 using NextHopId = bess::dataplane::StrongId<NextHopIdTag, uint32_t>;
 inline constexpr NextHopId kInvalidNextHopId{};
 
+// An ECMP group of next hops (M15, D-065): one-based, zero invalid. A route
+// names a next hop or a group; a group names next hops.
+struct NextHopGroupIdTag;
+using NextHopGroupId = bess::dataplane::StrongId<NextHopGroupIdTag, uint32_t>;
+
 }  // namespace bess::route
 
 #endif  // BESS_ROUTE_NEXT_HOP_ID_H_

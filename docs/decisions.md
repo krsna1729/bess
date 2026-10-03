@@ -85,6 +85,7 @@ file is the reasoning.
 | D-062 | Decision cache: a typed flow cache with O(1) generation invalidation (M12) | accepted |
 | D-063 | Bounded packet edit plan: experimental and opt-in, not adopted for typed rewrites (M13) | accepted |
 | D-064 | L2 forwarding database: a graph-independent FDB on a MAC-specialised table (M14) | accepted |
+| D-065 | L3 batteries: next-hop groups in the Router, neighbor table, L3 packet helpers (M15) | accepted |
 
 
 ---
@@ -5636,3 +5637,98 @@ readers: none by design (the roadmap's "concurrent readers" item is answered by 
 **Revisit when:** L2Forward needs domains, aging or learning (then a mode-C FDB variant: a single writer with
 whole-slot stores, as `l2_table` does); or the 1M miss gap matters to a consumer (try a 1 GiB-page or explicit
 hugetlbfs allocation, or a smaller slot).
+
+## D-065 L3 batteries: next-hop groups in the Router, neighbor table, L3 packet helpers (M15)
+
+**Status:** accepted (2026-10-04), experimental API. **Needs review (user):** groups live inside `Router` (one code
+path for every router) rather than in a separate wrapper; measured effect below.
+**Code:** `core/route/next_hop_id.h`, `core/route/router.{h,cc}`, `core/route/l3_packet.h` and
+`core/route/neighbor_table.h` (new, header-only, installed experimental), `core/route/route_test.cc`,
+`core/route/router_transaction_test.cc`, `core/route/l3_test.cc` (new), `core/meson.build`, `tools/api_classes.json`.
+
+**Context.** Roadmap M15: extend the Router into reusable L3 mechanism without becoming a routing daemon. What
+existed (K7, M6, M7): route domains, the IPv4 FIB (`rte_lpm`), the next hop as a shared forwarding object
+(egress `InterfaceId`, neighbor state, L2 rewrite) published per id, so a neighbor change is one object update.
+Missing against the exit criteria: an ECMP-ready forwarding model; neighbor state apart from how it is learned;
+TTL, MTU and ICMP mechanics; ARP helpers.
+
+**Decision.**
+- **Next-hop groups.** `NextHopGroupId`; a group is 1..64 next hops, immutable once published in a `SlotTable`
+  (mode C, as the next hops). `SetRoute(domain, prefix, NextHopGroupId)` points a route at a group. The reader
+  picks a member with the flow hash it passes (`Resolve(domain, dst, hash)`, `ResolveBatch(domain, dst, hashes,
+  hops)`, `LookupRoute(domain, dst, hash)`): Lemire's multiply-shift over the member count, so a flow stays on
+  one member while the membership is unchanged. Without a hash, member 0. How the hash is made, and smarter
+  selection (consistent hashing, weights beyond repetition, health), is the application's; M16 adds algorithms.
+  Changing a group's members publishes a new group object (no route changes); a member's neighbor change is
+  that next hop's update and reaches every group at once. Reference counts pin members (a member cannot be
+  removed) and groups (a group a route names cannot be removed); removal retires the id for a grace period, as
+  next hops do, and members stay pinned until the retired group is unpublished.
+- **Encoding.** In the FIB a group is the value `max_next_hops + group id` (the 24-bit route value bounds
+  `max_next_hops + max_groups`). Such a value, and `kNoDefault`, are beyond the next-hop table, where `Lookup`
+  returns null; the group check runs only on that path and out of line (`[[gnu::noinline, gnu::cold]]`), and
+  the plain batch path is a template instance without the hash parameter.
+- **Not transactional.** An enrolled router refuses group operations (`kEnrolled`) and `Enroll()` refuses a
+  router with groups. Transactional groups need a third resource with references from routes and to next hops;
+  recorded, not built.
+- **Neighbor table** (`neighbor_table.h`, control side): (interface, IPv4) → state and MAC, with the next hops
+  bound to each neighbor. `Update` (an ARP reply, an ND advertisement later, a controller) returns the bound next
+  hops' new objects; `Publish` writes them with `SetNextHop`. A controller-programmed and an ARP-resolved
+  neighbor end in the same `NextHop`. No resolver runs here.
+- **L3 packet helpers** (`l3_packet.h`, raw header bytes, no Module or packet type): `DecrementTtl` (RFC 1624
+  incremental checksum; TTL 0/1 reported, header untouched), `DecrementHopLimit` (IPv6), `CheckMtu` (fits /
+  fragmentation needed (DF) / fragmentable: the application drops, punts, fragments later or emits ICMP),
+  `BuildIcmpv4Error` (Time Exceeded, Destination Unreachable incl. fragmentation-needed with the next-hop MTU;
+  quotes the header plus 8 bytes; refuses what the IP header shows RFC 1122 3.2.2 forbids: ICMP errors,
+  non-unicast destinations, sources in 0/8 or 127/8 or not unicast, non-initial fragments; a link-layer
+  broadcast/multicast arrival and a directed-broadcast destination are the caller's to check, documented),
+  `ParseArp`, `BuildArpRequest`, `BuildArpReply`.
+- **IPv6.** Not built: no IPv6 FIB backend is ready. The ids, groups, neighbor key and helpers are
+  address-family neutral except the IPv4 key and FIB; an IPv6 FIB enters as another per-domain table naming the
+  same next hops and groups.
+
+**Evidence.**
+- Reader cost, paired ABBA (`tools/ab_bench.py`, 16 pairs: `--rounds 16`), `omarchy-benchmark --isolate --cpu 2`,
+  release `NDEBUG`. A is this tree with `router.{h,cc}` and `next_hop_id.h` from develop (same build tree, so only
+  the router code differs); B is this change (the kept variant). `BM_LookupRouter` 1K / 16K / 64K: no clear
+  difference (-0.4%, -0.5%, -1.3%). `BM_HotDomain` by id: no clear difference; the default-domain overload
+  +6.9% (0.80 → 0.86 ns, 0/16 pairs favour B). `BM_Batch32` 1 / 4 / 16 domains: +3.2%, -6.1%, -12.2%; the two
+  "gains" are the baseline's placement, not this change: A's `Batch32/16` is 55.9 ns here, while the M14-tree
+  build of the same develop router code measured 49.8 and 51.2 ns, and B's 49.3 ns is at that level. Neither
+  direction on these rows is attributable to the code. Interrupts on CPU 2: no device IRQs; thermal-event
+  interrupts 29,162 (the route and `Batch32` run) and 4,170 (the `HotDomain` run); timer, SCHED and RCU softirqs
+  and 2 NET_RX; the wrapper's verdict on both runs is "contamination: observable IRQ or softirq activity".
+- Against the M14 tree (develop router code, but a different build tree, so other libraries differ), only an
+  earlier variant was measured isolated: with the group check before the lookup, inline, `HotDomain` +9.4 / +12.2%
+  and `Batch32` +5.5-15.2%; with the check after the lookup, inline and not templated, `HotDomain/1` +7.0%,
+  `Batch32/1` +20.2%, `/4` +3.5%, `/16` +7.3%. Those variants were replaced; the kept one was not compared with
+  the M14 tree.
+- Layout sensitivity (quick unisolated runs on CPU 6, `.scratch/m15/evidence_layout_variants.txt` in the
+  author's tree; the numbers are also in the PR): variants identical for a router without groups moved
+  `BM_Batch32/16` between 53 and 61 ns and `BM_HotDomain/1` between 0.91 and 1.02 ns; the kept variant was the
+  best of three. The remaining +6.9% on one 0.8 ns row is attributed to code placement [INFERENCE: not isolated
+  further].
+- Tests (fast build; `taskset -c 0,1`): `route_route_test` 19/19 (5 new: spreading and stickiness, membership and
+  neighbor changes without route changes, batch with hashes equals scalar, invalid groups, deferred group
+  removal pinning members), `route_router_transaction_test` 10/10 (1 new: groups and enrollment exclude each
+  other), `route_l3_test` 6/6 (new), `route_route_domain_test` 11/11. At one CPU,
+  `RouteTableTest.ConcurrentReadersOnlySeeJustifiedAnswers` fails its throughput floor here (461 adds; it
+  wants more than 1,000) and on the M14 tree's develop route code (783, 743); it tests `LpmRouteTable`, which this
+  change does not touch (`.scratch/m15/evidence_testfloor.txt`).
+
+**Mutation checks** (14, all caught; `.scratch/m15/evidence_mutants.txt`): `Select` ignoring the hash; the group path returning a miss; `Unreference`
+ignoring groups; `RemoveNextHop` ignoring membership (the test aborts reading `.error()` of a success); a retired
+group keeping its members pinned; `Enroll` accepting groups; a replacement keeping the old members pinned; TTL
+decrement without the checksum update; ICMP errors answered; the quote without the 8 bytes; non-initial
+fragments answered; `NeighborTable::Update` republishing nothing; an unresolved neighbor keeping its MAC; a
+loopback source answered (added after review).
+
+**Review** (reviewer agent): round 1 found the router code correct; two findings, fixed: this evidence section
+(pair count, the `Batch32` framing, the interrupt note, unsourced numbers) and `BuildIcmpv4Error` answering a
+loopback or 0/8 source, with the caller's duties undocumented. Round 2: correct, go, no findings.
+
+**Not done.** Transactional groups; IPv6 FIB; a resolver module (ARP/ND state machine and timers); ND packet
+helpers; fragmentation; an L3 interface table (MTU and address per `InterfaceId`): the MTU check takes the MTU
+as an argument, and a `NextHop` has no room for one at 16 bytes (D-060).
+
+**Revisit when:** a consumer needs groups under transactions; M16 lands selection algorithms (then `Select`
+becomes one of them); an IPv6 backend is chosen.

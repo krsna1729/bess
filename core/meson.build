@@ -536,6 +536,8 @@ core_public_subdir_headers = {
     'route/next_hop_id.h',
     'route/route_domain.h',
     'route/router.h',
+    'route/l3_packet.h',
+    'route/neighbor_table.h',
   ),
   'rcu': files(
     'rcu/rcu_domain.h',
@@ -596,6 +598,7 @@ unit_test_sources = [
   'route/route_test.cc',
   'route/router_transaction_test.cc',
   'route/route_domain_test.cc',
+  'route/l3_test.cc',
   'rcu/rcu_test.cc',
   'rcu/rcu_ptr_test.cc',
   'rcu/rcu_worker_test.cc',

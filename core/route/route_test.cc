@@ -619,6 +619,204 @@ TEST(RouterTest, NextHopRemovalIsDeferredNotBlocking) {
   domain.Unregister(kReader);
 }
 
+std::unique_ptr<Router> MakeGroupRouter(size_t next_hops = 16, size_t groups = 4) {
+  LpmRouteTable::Config config;
+  config.max_routes = 1024;
+  config.tbl8_groups = 64;
+  auto router = Router::Create("router_groups", config, next_hops,
+                               bess::runtime::runtime().rcu(), 1, groups);
+  EXPECT_TRUE(router.has_value()) << RouteErrorName(router.error());
+  return std::move(router).value();
+}
+
+// A group route spreads flows over its members by hash, keeps a flow on one
+// member, and pins the members (D-065).
+TEST(RouterGroupTest, FlowsSpreadOverMembersAndStay) {
+  auto router = MakeGroupRouter();
+  for (uint32_t i = 1; i <= 4; i++) {
+    ASSERT_TRUE(router->SetNextHop(NextHopId(i), Hop(i, static_cast<uint8_t>(i))));
+  }
+  const NextHopId members[] = {NextHopId(1), NextHopId(2), NextHopId(3)};
+  ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(1), members));
+  ASSERT_TRUE(router->SetRoute(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                               NextHopGroupId(1)));
+  ASSERT_TRUE(router->SetRoute(P(Ip(20, 0, 0, 0), 8), NextHopId(4)));
+  EXPECT_EQ(1u, router->GroupReferences(NextHopGroupId(1)));
+  EXPECT_EQ(1u, router->GroupMemberships(NextHopId(2)));
+  EXPECT_EQ(0u, router->RouteReferences(NextHopId(2)));
+
+  std::array<int, 5> count{};
+  std::mt19937 rng(15);
+  for (int i = 0; i < 30000; i++) {
+    const uint32_t hash = rng();
+    const NextHop *hop = router->Resolve(kDefaultRouteDomainId, Ip(10, 1, 2, 3), hash);
+    ASSERT_NE(nullptr, hop);
+    count[hop->egress.value()]++;
+    // The same flow, the same member; LookupRoute agrees.
+    ASSERT_EQ(hop, router->Resolve(kDefaultRouteDomainId, Ip(10, 9, 9, 9), hash));
+    ASSERT_EQ(hop->egress.value(),
+              router->LookupRoute(kDefaultRouteDomainId, Ip(10, 1, 2, 3), hash).value());
+  }
+  for (int m = 1; m <= 3; m++) {
+    EXPECT_NEAR(10000, count[m], 600) << "member " << m;
+  }
+  EXPECT_EQ(0, count[4]);
+  // Without a hash: the first member. A plain next-hop route ignores the hash.
+  EXPECT_EQ(bess::dataplane::InterfaceId(1), router->Resolve(Ip(10, 1, 2, 3))->egress);
+  EXPECT_EQ(bess::dataplane::InterfaceId(4),
+            router->Resolve(kDefaultRouteDomainId, Ip(20, 1, 1, 1), 0xdeadbeef)->egress);
+
+  // Pinned: a member and a group in use cannot go.
+  EXPECT_EQ(RouteError::kNextHopInUse, router->RemoveNextHop(NextHopId(2)).error());
+  EXPECT_EQ(RouteError::kNextHopInUse,
+            router->RemoveNextHopGroup(NextHopGroupId(1)).error());
+}
+
+// Membership and neighbor changes are object updates: no route changes.
+TEST(RouterGroupTest, MembershipAndNeighborChangesNeedNoRouteChange) {
+  auto router = MakeGroupRouter();
+  for (uint32_t i = 1; i <= 3; i++) {
+    ASSERT_TRUE(router->SetNextHop(NextHopId(i), Hop(i, static_cast<uint8_t>(i))));
+  }
+  const NextHopId three[] = {NextHopId(1), NextHopId(2), NextHopId(3)};
+  ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(2), three));
+  ASSERT_TRUE(router->SetRoute(kDefaultRouteDomainId, P(0, 0), NextHopGroupId(2)));
+  ASSERT_TRUE(router->SetRoute(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                               NextHopGroupId(2)));
+
+  const NextHopId two[] = {NextHopId(1), NextHopId(2)};
+  ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(2), two));
+  EXPECT_EQ(2u, router->route_count());
+  EXPECT_EQ(0u, router->GroupMemberships(NextHopId(3)));
+  for (uint32_t h = 0; h < 4096; h++) {
+    const uint32_t hash = h * 0x9e3779b9u;
+    ASSERT_NE(bess::dataplane::InterfaceId(3),
+              router->Resolve(kDefaultRouteDomainId, Ip(10, 0, 0, 1), hash)->egress);
+  }
+  ASSERT_TRUE(router->RemoveNextHop(NextHopId(3))) << "no longer a member";
+
+  // A neighbor update of a member reaches every group route at once.
+  ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 0x77)));
+  EXPECT_EQ(0x77, router->Resolve(Ip(10, 0, 0, 1))->dst_mac.bytes[5]);
+  EXPECT_EQ(0x77, router->Resolve(Ip(99, 0, 0, 1))->dst_mac.bytes[5]);
+
+  // Replacing a domain's routes releases the group references they held.
+  EXPECT_EQ(2u, router->GroupReferences(NextHopGroupId(2)));
+  ASSERT_TRUE(router->ReplaceRouteSetAtomic(kDefaultRouteDomainId,
+                                            {{P(Ip(30, 0, 0, 0), 8), NextHopId(2)}}));
+  EXPECT_EQ(0u, router->GroupReferences(NextHopGroupId(2)));
+  EXPECT_EQ(nullptr, router->Resolve(Ip(10, 0, 0, 1)));
+  // Re-pointing a route from a group to a next hop releases the group too.
+  ASSERT_TRUE(router->SetRoute(kDefaultRouteDomainId, P(Ip(40, 0, 0, 0), 8),
+                               NextHopGroupId(2)));
+  ASSERT_TRUE(router->SetRoute(P(Ip(40, 0, 0, 0), 8), NextHopId(1)));
+  EXPECT_EQ(0u, router->GroupReferences(NextHopGroupId(2)));
+  ASSERT_TRUE(router->RemoveNextHopGroup(NextHopGroupId(2)));
+}
+
+TEST(RouterGroupTest, BatchWithHashesMatchesScalar) {
+  auto router = MakeGroupRouter();
+  for (uint32_t i = 1; i <= 8; i++) {
+    ASSERT_TRUE(router->SetNextHop(NextHopId(i), Hop(i, static_cast<uint8_t>(i))));
+  }
+  const NextHopId a[] = {NextHopId(1), NextHopId(2), NextHopId(3), NextHopId(4)};
+  const NextHopId b[] = {NextHopId(5), NextHopId(6)};
+  ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(1), a));
+  ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(4), b));
+  ASSERT_TRUE(router->SetRoute(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8), NextHopGroupId(1)));
+  ASSERT_TRUE(router->SetRoute(kDefaultRouteDomainId, P(Ip(20, 0, 0, 0), 8), NextHopGroupId(4)));
+  ASSERT_TRUE(router->SetRoute(P(Ip(30, 0, 0, 0), 8), NextHopId(8)));
+  std::mt19937 rng(16);
+  for (int round = 0; round < 50; round++) {
+    std::array<uint32_t, 32> dst{}, hashes{};
+    for (size_t i = 0; i < dst.size(); i++) {
+      dst[i] = Ip(10 + 10 * (rng() % 4), rng() % 256, 1, 1);  // 40/8 misses
+      hashes[i] = rng();
+    }
+    std::array<const NextHop *, 32> hops{};
+    const uint64_t mask = router->ResolveBatch(kDefaultRouteDomainId, dst, hashes, hops);
+    for (size_t i = 0; i < dst.size(); i++) {
+      const NextHop *want = router->Resolve(kDefaultRouteDomainId, dst[i], hashes[i]);
+      ASSERT_EQ(want != nullptr, (mask >> i & 1) != 0);
+      if (want != nullptr) {
+        ASSERT_EQ(want, hops[i]);
+      }
+    }
+  }
+}
+
+TEST(RouterGroupTest, InvalidGroupsAreRefused) {
+  auto router = MakeGroupRouter(/*next_hops=*/8, /*groups=*/2);
+  ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
+  const NextHopId one[] = {NextHopId(1)};
+  const NextHopId missing[] = {NextHopId(1), NextHopId(2)};
+  const NextHopId out_of_range[] = {NextHopId(9)};
+  std::vector<NextHopId> too_many(NextHopGroup::kMaxMembers + 1, NextHopId(1));
+  EXPECT_EQ(RouteError::kInvalidId, router->SetNextHopGroup(NextHopGroupId(0), one).error());
+  EXPECT_EQ(RouteError::kInvalidId, router->SetNextHopGroup(NextHopGroupId(3), one).error());
+  EXPECT_EQ(RouteError::kInvalidId, router->SetNextHopGroup(NextHopGroupId(1), {}).error());
+  EXPECT_EQ(RouteError::kInvalidId,
+            router->SetNextHopGroup(NextHopGroupId(1), too_many).error());
+  EXPECT_EQ(RouteError::kUnknownNextHop,
+            router->SetNextHopGroup(NextHopGroupId(1), missing).error());
+  EXPECT_EQ(RouteError::kInvalidId,
+            router->SetNextHopGroup(NextHopGroupId(1), out_of_range).error());
+  EXPECT_EQ(0u, router->GroupMemberships(NextHopId(1))) << "a refused group pins nothing";
+  EXPECT_EQ(RouteError::kUnknownNextHop,
+            router->SetRoute(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8), NextHopGroupId(1))
+                .error());
+  EXPECT_EQ(RouteError::kInvalidId,
+            router->SetRoute(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8), NextHopGroupId(3))
+                .error());
+  // A router without groups refuses them; route values must fit 24 bits.
+  auto plain = MakeRouter(8);
+  EXPECT_EQ(RouteError::kInvalidId, plain->SetNextHopGroup(NextHopGroupId(1), one).error());
+  LpmRouteTable::Config config;
+  EXPECT_EQ(RouteError::kValueOutOfRange,
+            Router::Create("too_wide", config, LpmRouteTable::kMaxValue - 1,
+                           bess::runtime::runtime().rcu(), 1, 2)
+                .error());
+  // Kept: an exactly fitting router.
+  EXPECT_TRUE(Router::Create("fits", config, LpmRouteTable::kMaxValue - 2,
+                             bess::runtime::runtime().rcu(), 1, 2)
+                  .has_value());
+}
+
+// Removing a group does not wait for readers; the id retires (cannot be
+// reused or named by a route) and its members stay pinned until readers pass.
+TEST(RouterGroupTest, GroupRemovalIsDeferredAndPinsMembers) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  auto router = MakeGroupRouter();
+  ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
+  const NextHopId one[] = {NextHopId(1)};
+  ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(1), one));
+  ASSERT_TRUE(router->SetRoute(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8), NextHopGroupId(1)));
+
+  constexpr uint32_t kReader = 25;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);
+  ASSERT_TRUE(router->RemoveRoute(P(Ip(10, 0, 0, 0), 8)));
+  ASSERT_TRUE(router->RemoveNextHopGroup(NextHopGroupId(1)));
+  EXPECT_EQ(0u, router->next_hop_group_count());
+  EXPECT_EQ(1u, router->ReclaimRetired());
+  EXPECT_NE(nullptr, router->LookupNextHopGroup(NextHopGroupId(1))) << "still readable";
+  EXPECT_EQ(RouteError::kNextHopRetiring,
+            router->SetNextHopGroup(NextHopGroupId(1), one).error());
+  EXPECT_EQ(RouteError::kUnknownNextHop,
+            router->SetRoute(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8), NextHopGroupId(1))
+                .error());
+  EXPECT_EQ(RouteError::kNextHopInUse, router->RemoveNextHop(NextHopId(1)).error())
+      << "a retiring group's members stay pinned";
+
+  domain.Quiescent(kReader);
+  EXPECT_EQ(0u, router->ReclaimRetired());
+  EXPECT_EQ(nullptr, router->LookupNextHopGroup(NextHopGroupId(1)));
+  EXPECT_EQ(0u, router->GroupMemberships(NextHopId(1)));
+  EXPECT_TRUE(router->RemoveNextHop(NextHopId(1)));
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
+}
+
 TEST(RouterTest, RewriteL2) {
   PlainPacketPool pool(8, -1, 128);
   PacketHandle pkt = pool.Alloc(64);

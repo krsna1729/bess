@@ -139,6 +139,35 @@ TEST_F(RouterTransactionTest, EnrolledRoutersAreWrittenOnlyThroughTheEngine) {
   EXPECT_EQ(router->RouteReferences(NextHopId(1)), 1u);
 }
 
+// Next-hop groups are not transactional (D-065): a router with groups cannot
+// enroll, and an enrolled router refuses them.
+TEST_F(RouterTransactionTest, GroupsAndEnrollmentExcludeEachOther) {
+  LpmRouteTable::Config config;
+  auto made = Router::Create("rtg", config, 8, bess::runtime::runtime().rcu(),
+                             /*max_domains=*/1, /*max_groups=*/4);
+  ASSERT_TRUE(made.has_value());
+  auto router = std::move(made).value();
+  ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1)));
+  const NextHopId members[] = {NextHopId(1)};
+  ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(1), members));
+  auto enrolled = router->Enroll(engine_);
+  ASSERT_FALSE(enrolled);
+  EXPECT_NE(enrolled.error().find("not transactional"), std::string::npos);
+
+  ASSERT_TRUE(router->RemoveNextHopGroup(NextHopGroupId(1)));
+  Settle();
+  EXPECT_EQ(0u, router->ReclaimRetired());
+  ASSERT_TRUE(router->Enroll(engine_));
+  EXPECT_EQ(RouteError::kEnrolled,
+            router->SetNextHopGroup(NextHopGroupId(1), members).error());
+  EXPECT_EQ(RouteError::kEnrolled,
+            router->SetRoute(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                             NextHopGroupId(1))
+                .error());
+  EXPECT_EQ(RouteError::kEnrolled,
+            router->RemoveNextHopGroup(NextHopGroupId(1)).error());
+}
+
 TEST_F(RouterTransactionTest, NextHopsAndRoutesChangeTogether) {
   auto router = MakeRouter();
   ASSERT_TRUE(router->Enroll(engine_));
