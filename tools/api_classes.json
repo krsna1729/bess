@@ -32,6 +32,8 @@
     "snbuf_layout.h": "public",
     "task.h": "public",
     "worker.h": "public",
+    "arch/cpu.h": "public",
+    "arch/crc32c.h": "experimental",
     "classifier/byte_key.h": "experimental",
     "classifier/classifier.h": "experimental",
     "classifier/range_backend.h": "experimental",

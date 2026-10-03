@@ -474,6 +474,10 @@ install_headers(core_public_headers, subdir: 'bess/core')
 # Decision D-041 (docs/decisions.md): install a named API set; never recurse
 # into core implementation subdirectories.
 core_public_subdir_headers = {
+  'arch': files(
+    'arch/cpu.h',
+    'arch/crc32c.h',
+  ),
   'utils': files(
     'utils/arp.h',
     'utils/checksum.h',
@@ -578,6 +582,7 @@ foreach subdir, headers : core_public_subdir_headers
 endforeach
 
 unit_test_sources = [
+  'arch/arch_test.cc',
   'flow/decision_cache_test.cc',
   'flow/expiry_consumer_test.cc',
   'offload/flow_rule_owner_test.cc',

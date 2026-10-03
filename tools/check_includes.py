@@ -175,6 +175,21 @@ FORBIDDEN_RULES = [
             ("pb/", "offload seam must not depend on protobuf"),
         ],
     ),
+    # The architecture primitives (M21, D-071) are the bottom layer: nothing
+    # from BESS, only system and DPDK headers.
+    (
+        re.compile(r"^core/arch/"),
+        [
+            ("utils/", "arch must not depend on utils"),
+            ("module.h", "arch must not depend on Module"),
+            ("packet.h", "arch must not depend on packets"),
+            ("worker.h", "arch must not depend on workers"),
+            ("framework/", "arch must not depend on framework"),
+            ("runtime/", "arch must not depend on runtime"),
+            ("control/", "arch must not depend on control"),
+            ("pb/", "arch must not depend on protobuf"),
+        ],
+    ),
     # The flow-state library is graph-independent and sits below the worker: no
     # Module, gate, framework, runtime, control or protobuf, and no worker.h or
     # stats/current_worker.h (worker identity is an injected owner token; M9,
@@ -336,6 +351,7 @@ SELF_TEST_CASES = [
     ("core/offload/flow_rule_owner.h", '#include "module.h"', 1),
     ("core/l2/fdb.h", '#include "gate.h"', 1),
     ("core/conntrack/conntrack.h", '#include "gate.h"', 1),
+    ("core/arch/cpu.h", '#include "utils/common.h"', 1),
     ("core/nat/nat.h", '#include "module.h"', 1),
     ("core/tunnel/tunnel.h", '#include "metadata.h"', 1),
     ("core/flow/owner.h", '#include "stats/current_worker.h"', 1),
