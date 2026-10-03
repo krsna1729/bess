@@ -458,6 +458,15 @@ reference to something missing.
   `unordered_map` Bridge used before M14; at 1M entries 1.5–3.2× behind
   `l2_table`.
 
+### Member selection (`dataplane/member_select.h`, M16)
+
+- **What:** hash → member index: `RangeSelect` (no table), `WeightedSelector`
+  (alias table), `MaglevSelector` (consistent), `RendezvousSelector` (exact
+  minimal disruption, O(n): small groups), `RoundRobinCursor` (mutable, one
+  owner), `AnySelector` (run-time choice, one dispatch per batch). Built on
+  the control side, immutable, published like any object (D-066).
+- **Used by:** HashLB and the Router's next-hop groups (`RangeSelect`).
+
 ### `ExtractPlan` (packet → key)
 
 - **What:** compiles a key layout (packet offsets, metadata attributes, masks)

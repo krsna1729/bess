@@ -86,6 +86,7 @@ file is the reasoning.
 | D-063 | Bounded packet edit plan: experimental and opt-in, not adopted for typed rewrites (M13) | accepted |
 | D-064 | L2 forwarding database: a graph-independent FDB on a MAC-specialised table (M14) | accepted |
 | D-065 | L3 batteries: next-hop groups in the Router, neighbor table, L3 packet helpers (M15) | accepted |
+| D-066 | Member selection: shared algorithms, no shared group object (M16) | accepted |
 
 
 ---
@@ -5732,3 +5733,87 @@ as an argument, and a `NextHop` has no room for one at 16 bytes (D-060).
 
 **Revisit when:** a consumer needs groups under transactions; M16 lands selection algorithms (then `Select`
 becomes one of them); an IPv6 backend is chosen.
+
+## D-066 Member selection: shared algorithms, no shared group object (M16)
+
+**Status:** accepted (2026-10-04), experimental API.
+**Code:** `core/dataplane/member_select.h` (new, header-only, installed experimental),
+`core/dataplane/member_select_test.cc`, `core/dataplane/member_select_bench.cc`, `core/modules/hash_lb.cc`,
+`core/route/router.h`, `core/meson.build`, `tools/api_classes.json`.
+
+**Context.** Roadmap M16: let ECMP, load balancing and other group choices share low-level selection without
+pretending they have the same semantics; policy objects, inline when known, one dispatch per batch when chosen at
+run time; mutable round-robin kept explicit.
+
+**Decision.**
+- Selectors map a 32-bit hash to a member index. Pure and immutable once built (control side builds, workers
+  read): `RangeSelect`/`RangeSelector` (multiply-shift), `WeightedSelector` (Walker/Vose alias table with exact
+  integer thresholds; the bucket and the coin come from one 64-bit product, so one hash suffices; branch-free),
+  `MaglevSelector` (consistent hash; table size a prime, default 65,537; member keys are stable identities),
+  `RendezvousSelector` (highest random weight, O(n)). `RoundRobinCursor` is the one mutable selector: one owner,
+  not thread-safe, two workers keep two cursors. `AnySelector` holds one pure selector chosen at run time and
+  dispatches once per `SelectBatch`.
+- No common group object: ECMP keeps the Router's next-hop groups (D-065), HashLB keeps its gate list; both call
+  the same function. HashLB's former floating-point mapping computed exactly `floor(hash × n / 2^32)` (a 48-bit
+  product, exact in a double); it now calls `RangeSelect`, and a test compares the two over every n in 1..300 and
+  a stride to 65,535 with edge and random hashes: no flow changes gate. The Router's `NextHopGroup::Select` (D-065)
+  had the same multiply-shift inline; it now calls `RangeSelect` (same result; the route tests pass unchanged).
+- Rendezvous is kept for small groups where exact minimal disruption matters (it moved 0% of other members' flows
+  for 4-128 members, Maglev 0.1-2.6%); its O(n) cost (113 ns at 128 members) rules it out for large groups.
+- Weighted selection is not consistent: rebuilding the alias table for a weight change moves 6-27% of the other
+  members' flows. A weighted consistent hash (weighted Maglev) is not built.
+
+**Evidence.** `member_select_bench`, release `NDEBUG`, gcc x86-64-v3, `omarchy-benchmark --isolate --cpu 2`,
+3 repetitions, medians. ns per selection in a loop of independent selections over random hashes (throughput, not
+latency); bytes per group; max/min share over 2^24 sequential golden-ratio hashes (2^20 for rendezvous; weighted
+normalised by weight); churn = of flows on members that stay, the percentage that move when the middle member is
+removed (weighted: its weight set to 0). CPU 2: no device IRQs, 4,750 thermal-event interrupts, timer/SCHED
+softirqs; wrapper verdict "contamination".
+
+| selector | metric | 2 | 4 | 8 | 32 | 128 |
+|---|---|---|---|---|---|---|
+| range | ns/select | 0.37 | 0.38 | 0.38 | 0.39 | 0.39 |
+| range | bytes/group | 4 | 4 | 4 | 4 | 4 |
+| range | max/min share | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| range | churn % | 0.0 | 11.1 | 18.4 | 23.4 | 24.6 |
+| weighted | ns/select | 0.51 | 0.52 | 0.53 | 0.54 | 0.54 |
+| weighted | bytes/group | 64 | 80 | 112 | 304 | 1072 |
+| weighted | max/min share | 1.000 | 1.000 | 1.000 | 1.000 | 1.001 |
+| weighted | churn % | 0.0 | 5.6 | 23.3 | 9.5 | 26.8 |
+| Maglev 65537 | ns/select | 0.42 | 0.43 | 0.44 | 0.44 | 0.45 |
+| Maglev 65537 | bytes/group | 131106 | 131106 | 131106 | 131106 | 131106 |
+| Maglev 65537 | max/min share | 1.000 | 1.000 | 1.000 | 1.002 | 1.005 |
+| Maglev 65537 | churn % | 0.0 | 0.1 | 0.2 | 0.4 | 0.6 |
+| Maglev ~101n | ns/select | 0.40 | 0.41 | 0.41 | 0.42 | 0.43 |
+| Maglev ~101n | bytes/group | 454 | 850 | 1650 | 6534 | 25914 |
+| Maglev ~101n | max/min share | 1.010 | 1.010 | 1.010 | 1.010 | 1.011 |
+| Maglev ~101n | churn % | 0.0 | 2.6 | 2.1 | 2.2 | 1.8 |
+| rendezvous | ns/select | 1.76 | 3.35 | 6.79 | 27.78 | 113.37 |
+| rendezvous | bytes/group | 40 | 56 | 88 | 280 | 1048 |
+| rendezvous | max/min share | 1.001 | 1.002 | 1.006 | 1.019 | 1.052 |
+| rendezvous | churn % | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| Any(Maglev) batch | ns/select | 0.34 | 0.35 | 0.35 | 0.36 | 0.36 |
+| Any(Maglev) batch | bytes/group | 131106 | 131106 | 131106 | 131106 | 131106 |
+| Any(Maglev) batch | max/min share | 1.000 | 1.000 | 1.000 | 1.002 | 1.005 |
+| Any(Maglev) batch | churn % | 0.0 | 0.1 | 0.2 | 0.4 | 0.6 |
+
+HashLB's mapping: former floating-point form 0.69 ns, `RangeSelect` 0.46 ns per call (7 gates).
+
+Found while building: the weighted selector's `coin < threshold ? bucket : alias` compiled to a branch that
+mispredicts on a fair coin (7.0 ns against 1.4 for the branch-free form, unisolated); with 2^20 samples the
+quality metric reported Maglev 1.05 at 128 members although its table is balanced to one entry in 512 (2^24
+samples: 1.005).
+
+**Mutation checks** (`dataplane_member_select_test`, fast build): range by modulo; alias donation wrong; threshold
+unscaled; weighted keep inverted; Maglev accepting duplicate keys; rendezvous taking the minimum; rendezvous
+ignoring the hash; round robin by modulo instead of restart (caught after the test was strengthened: it first
+shrank where both give 0) — caught. Survived: Maglev offset and skip from the same hash bits (a weaker
+permutation that still balances and still moves few flows in these tests).
+
+**Review** (reviewer agent): correct, go; one finding, fixed: the weighted precision bound holds per bucket (about 2^-32), not per member (up to about 2n·2^-32).
+
+**Not done.** Weighted consistent hashing; health or drain states (the application rebuilds a selector without
+the member); per-flow stickiness across rebuilds (a flow table's job, M17).
+
+**Revisit when:** a consumer needs weighted consistent hashing, or groups large enough that Maglev's table size
+should scale with membership by default.

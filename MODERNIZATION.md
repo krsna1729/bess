@@ -4980,6 +4980,14 @@ rather than one call site).
      resolve +6.9% (0.057 ns) [INFERENCE: code placement, after three layout variants]; domain batches +3% /
      -6% / -12%, where the two gains are the baseline's placement, not the change. 14/14 mutants caught. IPv6
      FIB, resolver module and transactional groups not built.
+154. **M16 member selection (D-066).** `dataplane/member_select.h`: range (multiply-shift), weighted (alias table,
+     exact integer thresholds, one hash, branch-free), Maglev, rendezvous, an explicit round-robin cursor, and
+     `AnySelector` (one dispatch per batch). HashLB and the Router's next-hop groups now call `RangeSelect`
+     (the Router's inline multiply-shift was the same); for HashLB it computes exactly what its
+     floating-point mapping did (tested; 0.69 → 0.46 ns). Isolated: range 0.37-0.39 ns, weighted 0.51-0.54,
+     Maglev 0.42-0.45 (128 KiB a group; 0.40-0.43 with a ~101 entries-per-member table), rendezvous 1.8-113 ns
+     for 2-128 members; churn on removing one member: range 11-25%, Maglev 0.1-2.6%, rendezvous 0%. Weighted
+     selection is not consistent (6-27%). 8 of 9 mutants caught (+1 after strengthening a test).
 
 ## Review process established this session
 
