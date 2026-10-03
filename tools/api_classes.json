@@ -78,15 +78,22 @@
     "stats/worker_histogram.h": "experimental",
     "stats/worker_local.h": "experimental",
     "stats/worker_slots.h": "experimental",
+    "utils/arp.h": "experimental",
+    "utils/checksum.h": "experimental",
     "utils/common.h": "public",
     "utils/copy.h": "public",
     "utils/endian.h": "public",
     "utils/ether.h": "public",
     "utils/extended_priority_queue.h": "public",
+    "utils/icmp.h": "experimental",
     "utils/inline_function.h": "public",
+    "utils/ip.h": "experimental",
     "utils/logging.h": "public",
     "utils/random.h": "public",
-    "utils/time.h": "public"
+    "utils/simd.h": "experimental",
+    "utils/tcp.h": "experimental",
+    "utils/time.h": "public",
+    "utils/udp.h": "experimental"
   },
   "generated": {
     "comment": "protoc output the public headers include, transitively (tools/public_proto_closure.py computes it). Class: public.",

@@ -475,15 +475,22 @@ install_headers(core_public_headers, subdir: 'bess/core')
 # into core implementation subdirectories.
 core_public_subdir_headers = {
   'utils': files(
+    'utils/arp.h',
+    'utils/checksum.h',
     'utils/common.h',
     'utils/copy.h',
     'utils/endian.h',
     'utils/ether.h',
     'utils/extended_priority_queue.h',
+    'utils/icmp.h',
     'utils/inline_function.h',
+    'utils/ip.h',
     'utils/logging.h',
     'utils/random.h',
+    'utils/simd.h',
+    'utils/tcp.h',
     'utils/time.h',
+    'utils/udp.h',
   ),
   'framework': files(
     'framework/instance_registry.h',
