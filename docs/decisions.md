@@ -4162,7 +4162,8 @@ marker.
 - **10M flows** were run only for the worker table with the smallest key and
   State; the shared table (about 1.8 GB of EAL heap at 10M) and larger keys or
   States above 1M were not run, nor were larger shared sizes: this machine has
-  about 4 GB free.
+  about 4 GB free. *(Annotation: the shared table at 10M was run later; see the
+  addendum below.)*
 - **Cache-miss counters** were not collected (`perf` was not used); "cycles" are
   TSC ticks. Frequency scaling and core isolation were not controlled (the
   governor is `powersave`; the repeat medians are tight, but absolute numbers
@@ -4192,6 +4193,32 @@ slot prefetch default worth flipping; M10 finds the observer seam too narrow
 writer lock, measured above, is the bottleneck for a consumer that cannot
 partition; or `ConcurrentExactTable` is promoted to public, which would let
 `shared_flow_table.h` be installed.
+
+
+**Addendum (2026-10-03): the shared table at 10M flows.** `flow_bench` gained 10M-flow `BM_SharedLookup` rows
+under `FLOW_BENCH_LARGE=1`, which now also brings the EAL up on the no-hugepage heap (3,000 MB unless
+`BESS_DPDK_NOHUGE_MB` says otherwise; this host has one 1 GB hugepage). Run at 418c98ab's code plus that change,
+release `-O3 -Dcpu=x86-64-v3`, GCC 16.2.1, `omarchy-benchmark --isolate --cpu 2` (performance governor; timer,
+function-call, TLB, rescheduling and thermal interrupts and softirqs on CPU 2, no device interrupts), memory capped
+with `prlimit --data=4000 MB`. One run, ns per lookup, `Peek`/`PeekBatch` on one thread:
+
+| distribution, batch | 64K | 1M | 10M |
+|---|---|---|---|
+| hot, 1 | 16.6 | 16.9 | 15.9 |
+| hot, 32 | 7.8 | 7.7 | 7.6 |
+| uniform, 1 | 27.7 | 115.2 | 132.5 |
+| uniform, 32 | 9.6 | 29.5 | 36.8 |
+| miss, 1 | 14.4 | 25.6 | 45.4 |
+| miss, 32 | 3.8 | 6.8 | 14.8 |
+
+The slab is 64 bytes per flow at every size (the `rte_hash` directory is not counted in that figure). Every row of
+this run, the 64K and 1M ones included, used the 4 KB-page heap, so the three columns compare with each other; the
+hugepage figures above and in D-056 are a different backing. The nearest hugepage run (D-056's final A/B, same code,
+1M flows; a different session, and contaminated) gave uniform 133.5 / 29.7 ns and miss 37.8 / 8.8 ns (scalar / batch
+32) against this run's 115.2 / 29.5 and 25.6 / 6.8: no hugepage advantage shows, and these two runs cannot settle
+whether 4 KB pages cost anything here. From 1M to 10M a uniform hit costs about 15% more scalar and 25% more batched; a miss costs 1.8x
+scalar and 2.2x batched, which follows the directory outgrowing the caches [INFERENCE: no cache or TLB counters were read].
+Raw output: `docs/baselines/flow-shared-10m.json`.
 
 ## D-053 Expiry substrate: a worker-owned hierarchical timing wheel with budgeted polls (M10)
 

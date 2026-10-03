@@ -263,7 +263,18 @@ double EalHeapAllocated() {
 }
 
 void EnsureDpdk() {
-  if (!bess::IsDpdkInitialized()) bess::InitDpdk(2048);
+  if (bess::IsDpdkInitialized()) return;
+  if (std::getenv("FLOW_BENCH_LARGE") != nullptr) {
+    // A 10M-flow SharedFlowTable needs about 1.8 GB of EAL heap, more than a
+    // host with one 1 GB hugepage has: use the no-hugepage heap, 3000 MB unless
+    // the caller chose a size (BESS_DPDK_NOHUGE_MB). Untouched pages cost no RAM.
+    // This backs every EAL-backed row of a LARGE run with 4 KB pages, so a
+    // LARGE run compares only with another LARGE run (docs/benchmarking.md).
+    setenv("BESS_DPDK_NOHUGE_MB", "3000", 0);
+    bess::InitDpdk(0);
+    return;
+  }
+  bess::InitDpdk(2048);
 }
 
 // Only one fixture lives at a time: a 1M-flow table of any one shape is
@@ -1309,11 +1320,20 @@ void RegisterBaselines(const std::string& tag, std::vector<int64_t> sizes,
   RegisterWorker<FiveTuple, StateN<128>>("tuple16_state128", kBig, {kUniform}, {32});
   RegisterWorker<FiveTuple, IndirectState>("tuple16_indirect256", kBig, {kUniform}, {32});
 
-  // 10M flows, only on request (FLOW_BENCH_LARGE=1) and only with the smallest
-  // key and State: about 0.5 GB of table plus the fixture's transient peak.
+  // 10M flows, only on request (FLOW_BENCH_LARGE=1): the worker table with the
+  // smallest key and State (about 0.5 GB plus the fixture's transient peak), and
+  // the shared table, which D-052 left unmeasured for memory.
   if (std::getenv("FLOW_BENCH_LARGE") != nullptr) {
     RegisterWorker<Key8, StateN<16>>("key8_state16_10M", {10'000'000},
                                      {kUniform, kMiss}, {1, 32});
+    for (int64_t dist : {kHot, kUniform, kMiss}) {
+      for (int64_t batch : {1, 32}) {
+        benchmark::RegisterBenchmark("BM_SharedLookup", BM_SharedLookup)
+            ->Args({10'000'000, dist, batch})
+            ->Unit(kUnit)
+            ->MinTime(0.25);
+      }
+    }
   }
 
   // The backends the roadmap says to evaluate first, on the same streams.

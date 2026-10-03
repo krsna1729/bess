@@ -4852,6 +4852,12 @@ rather than one call site).
        One wheel 1M worst-poll sample (342 us) stands out and is not explained.
      - `omarchy-benchmark --isolate --cpu 2`; no device interrupts on CPU 2.
 
+145. **SharedFlowTable at 10M flows (D-052 addendum).**
+     - `flow_bench`: 10M `BM_SharedLookup` rows under `FLOW_BENCH_LARGE=1`, which also switches the EAL to a sized
+       no-hugepage heap (the 1.8 GB table does not fit this host's one 1 GB hugepage).
+     - Isolated, one run, 4 KB pages for every size: 10M hot 15.9 / 7.6 ns (scalar / batch 32), uniform 132.5 /
+       36.8 ns, miss 45.4 / 14.8 ns; 64 B of slab per flow. Raw output `docs/baselines/flow-shared-10m.json`.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

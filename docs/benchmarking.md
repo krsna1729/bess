@@ -99,9 +99,13 @@ FLOW_BENCH_MAIN_CPU=0 taskset -c 0,2,4,6,8,10 flow_bench \
     --benchmark_filter='BM_SharedReaders/[0-9]+/(1|2|4)/[01]/'
 ```
 
-`FLOW_BENCH_LARGE=1` also registers the 10M-flow case (the smallest key and
-State, about 0.5 GB). Lookup benchmarks report `ns_per_lookup`, `tsc_per_lookup`
-(TSC ticks, not core cycles) and `bytes_per_flow`.
+`FLOW_BENCH_LARGE=1` also registers the 10M-flow cases: the worker table with the
+smallest key and State (about 0.5 GB) and `BM_SharedLookup` at 10M (about 1.8 GB
+of EAL heap). It also brings the EAL up on the 4 KB-page no-hugepage heap (3,000
+MB, or `BESS_DPDK_NOHUGE_MB`) instead of hugepages, for every EAL-backed row in
+that process (`BM_Shared*`, `BM_BaselineRteHash`, `BM_BaselineConcurrentExact`), so
+compare a LARGE run only with another LARGE run. Lookup benchmarks report
+`ns_per_lookup`, `tsc_per_lookup` (TSC ticks, not core cycles) and `bytes_per_flow`.
 
 ## Expiry
 
