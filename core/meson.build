@@ -203,7 +203,14 @@ resume_hook_sources = files(
   'resume_hooks/task_graph.cc',
 )
 
-low_level_compile_deps = [dpdk_dep, glog_dep]
+# Static libraries take DPDK's compile flags only. dpdk_dep carries raw
+# link_args, which Meson does not deduplicate: each static library that
+# listed it passed all of DPDK's -l flags on to the final link again (13
+# copies in one --start-group), and GNU ld 2.42 then ran for hours on some
+# links (core/runtime_startup_test in the Clang CI lanes). Every executable
+# and plugin links the full dpdk_dep once, through runtime_deps or directly.
+dpdk_compile_dep = dpdk_dep.partial_dependency(compile_args: true, includes: true)
+low_level_compile_deps = [dpdk_compile_dep, glog_dep]
 runtime_compile_deps = low_level_compile_deps + [
   gflags_dep, protobuf_dep, bess_proto_headers_dep,
 ]
@@ -211,7 +218,10 @@ framework_compile_deps = runtime_compile_deps + [pcap_dep]
 control_compile_deps = low_level_compile_deps + [
   gflags_dep, protobuf_dep, grpcpp_dep, bess_proto_headers_dep,
 ] + grpc_reflection_deps
-host_compile_deps = common_deps + [bess_proto_headers_dep]
+host_compile_deps = low_level_compile_deps + [
+  gflags_dep, protobuf_dep, grpcpp_dep, libunwind_dep, zlib_dep, pcap_dep,
+  numa_dep, bess_proto_headers_dep,
+]
 driver_compile_deps = low_level_compile_deps + [
   protobuf_dep, pcap_dep, bess_proto_headers_dep,
 ]
