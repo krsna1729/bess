@@ -64,16 +64,18 @@ std::expected<bess::utils::Ethernet::Address, std::string> MacFromPb(
 // drops. The unsigned subtraction folds both bounds into one compare. The
 // route library holds interfaces only; nothing outside this module knows gates.
 inline gate_idx_t GateOf(dataplane::InterfaceId egress) {
-  const uint32_t gate = egress.value() - 1;
+  const uint32_t gate = static_cast<uint32_t>(egress.value()) - 1u;
   return gate < MAX_GATES ? static_cast<gate_idx_t>(gate) : DROP_GATE;
 }
 
 // The wire still names a gate (`egress_gate`); DROP_GATE means no interface.
 // `gate` has passed IsValidGateValue().
+static_assert(MAX_GATES < std::numeric_limits<uint16_t>::max(),
+              "every gate has an interface (gate + 1)");
 inline dataplane::InterfaceId InterfaceOf(uint64_t gate) {
   return gate == DROP_GATE
              ? dataplane::kInvalidInterfaceId
-             : dataplane::InterfaceId(static_cast<uint32_t>(gate) + 1);
+             : dataplane::InterfaceId(static_cast<uint16_t>(gate + 1));
 }
 
 }  // namespace

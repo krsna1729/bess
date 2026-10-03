@@ -56,6 +56,11 @@ struct NextHop {
   utils::Ethernet::Address src_mac{};
 };
 
+// Every resolved packet loads one; at 16 bytes four fill a cache line and none
+// straddles two. A 32-bit egress made it 20 bytes and cost a hot 1K-route
+// lookup 14% (D-060).
+static_assert(sizeof(NextHop) == 16, "a next hop is 16 bytes");
+
 // Writes `hop`'s destination and source MAC into the packet's Ethernet
 // header. Requires the header in the first segment and exclusive payload
 // storage (use K4 EnsureWritable first for a shared packet).

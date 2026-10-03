@@ -24,7 +24,8 @@ static_assert(!std::equality_comparable_with<InterfaceId, ActionId>);
 static_assert(!std::convertible_to<InterfaceId, ActionId>);
 static_assert(!std::constructible_from<InterfaceId, ActionId>);
 
-using Handle = GenerationHandle<InterfaceId>;
+// A handle needs a 32-bit id (one 64-bit word); InterfaceId is 16 bits (D-060).
+using Handle = GenerationHandle<ActionId>;
 static_assert(sizeof(Handle) == 2 * sizeof(uint32_t));
 static_assert(std::is_trivially_copyable_v<Handle>);
 
@@ -46,20 +47,20 @@ TEST(InterfaceIdTest, OrdersAndHashesByValue) {
 TEST(GenerationHandleTest, DiffersWhenOnlyTheGenerationDiffers) {
   // The reason the type exists: the same slot id reused by a later object must
   // not compare equal to a handle issued for the earlier one.
-  const Handle issued{InterfaceId(5), 1};
-  const Handle reused{InterfaceId(5), 2};
+  const Handle issued{ActionId(5), 1};
+  const Handle reused{ActionId(5), 2};
   EXPECT_NE(issued, reused);
-  EXPECT_EQ(issued, (Handle{InterfaceId(5), 1}));
-  EXPECT_NE(issued, (Handle{InterfaceId(6), 1}));
+  EXPECT_EQ(issued, (Handle{ActionId(5), 1}));
+  EXPECT_NE(issued, (Handle{ActionId(6), 1}));
 }
 
 TEST(GenerationHandleTest, HashSeparatesGenerationsOfOneId) {
-  const GenerationHandleHash<InterfaceId> hash;
-  EXPECT_NE(hash(Handle{InterfaceId(5), 1}), hash(Handle{InterfaceId(5), 2}));
-  EXPECT_NE(hash(Handle{InterfaceId(5), 1}), hash(Handle{InterfaceId(6), 1}));
-  std::unordered_set<Handle, GenerationHandleHash<InterfaceId>> set;
-  set.insert(Handle{InterfaceId(5), 1});
-  set.insert(Handle{InterfaceId(5), 2});
+  const GenerationHandleHash<ActionId> hash;
+  EXPECT_NE(hash(Handle{ActionId(5), 1}), hash(Handle{ActionId(5), 2}));
+  EXPECT_NE(hash(Handle{ActionId(5), 1}), hash(Handle{ActionId(6), 1}));
+  std::unordered_set<Handle, GenerationHandleHash<ActionId>> set;
+  set.insert(Handle{ActionId(5), 1});
+  set.insert(Handle{ActionId(5), 2});
   EXPECT_EQ(2u, set.size());
 }
 

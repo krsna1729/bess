@@ -73,7 +73,7 @@ Router::Config ConfigFor(size_t routes) {
 void AddNextHops(Router &router, uint32_t n) {
   for (uint32_t id = 1; id <= n; id++) {
     NextHop hop;
-    hop.egress = bess::dataplane::InterfaceId(static_cast<uint32_t>(id % 8));
+    hop.egress = bess::dataplane::InterfaceId(static_cast<uint16_t>(id % 8));
     hop.neighbor = NeighborState::kResolved;
     (void)router.SetNextHop(NextHopId(id), hop);
   }
