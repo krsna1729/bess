@@ -81,6 +81,7 @@ file is the reasoning.
 | D-058 | M1/M2 closure: enforceable include rules, classified installs | accepted |
 | D-059 | One logging backend: glog included only through utils/logging.h, after absl | accepted |
 | D-060 | InterfaceId is 16 bits: a next hop stays 16 bytes | accepted |
+| D-061 | Release builds define NDEBUG; damage-guarding checks are CHECK | accepted |
 
 
 ---
@@ -5338,3 +5339,56 @@ any bisect pair (all no difference); it is unexplained and may be a layout effec
 
 **Revisit when:** an interface must cross a hardware mark or packet metadata (widen there, not in `NextHop`);
 `NextHop` gains a field (the `static_assert` fails first); a deployment needs more than 65,535 endpoints.
+
+## D-061 Release builds define NDEBUG; damage-guarding checks are CHECK
+
+**Status:** accepted (2026-10-03).
+**Code:** `meson.build` (`b_ndebug=if-release`), `tools/profiles/fast.ini` (`b_ndebug=false`), `core/task.h`,
+`core/stats/current_worker.h`, `core/module.cc`, `core/dataplane/slot_table.h`, `core/rcu/{rcu_ptr.h,rcu_domain.cc,rcu_test.cc}`,
+`core/dataplane/expiry_wheel.h`, `core/runtime/memory.h`.
+
+**Context.** The R1 master-vs-HEAD rerun found CuckooMap lookups 12-65% slower on small maps. A bisect of every
+`cuckoo_map.h` change since master, each built in the same tree, showed every change neutral or faster (D-034's
+AVX2 change up to 63% faster): the gap was the build. The scratch-worktree release trees (the M0 runner's, the bisect and measurement trees)
+used Meson's default `b_ndebug=false`; the main `build/perf-release` had been configured with `-Db_ndebug=true`.
+The default
+since Meson 1.4 also adds `-D_GLIBCXX_ASSERTIONS=1` (libstdc++ bounds checks) and keeps `assert()`/`DCHECK`;
+master's Makefile built with `-O3 -DNDEBUG`. Measured on the same HEAD code (isolated, 8 ABBA pairs): without
+the assertions every CuckooMap lookup row is 8-26% faster. Checksum rows did not move [INFERENCE: from two
+master-relative runs, with and without the assertions, that agree; HEAD against HEAD-NDEBUG was not run for checksum].
+
+**Decision** (the user's, after comparing distro practice with DPDK, VPP and the kernel).
+- Release builds define `NDEBUG` (`b_ndebug=if-release`): no `assert()`, `DCHECK` or `_GLIBCXX_ASSERTIONS`, as in
+  DPDK (`RTE_ASSERT` compiled out unless `RTE_ENABLE_ASSERT`) and VPP (`CLIB_DEBUG=0` release images).
+  `debugoptimized` builds (the gating CI lanes, which run the tests) and the `fast` profile keep them; Meson counts
+  `plain` as release, so `fast.ini` sets `b_ndebug=false`.
+- The kernel's rule for what stays on: a few cheap, deliberate checks against real damage, not a library-wide
+  mode. In BESS that is glog `CHECK()`, compiled into every build (DPDK's `RTE_VERIFY`, the kernel's `BUG_ON`). The
+  92 `assert`/`DCHECK` sites were audited; those whose failure in release is memory corruption or a use-after-free,
+  and which run per batch or on the control path, became `CHECK`: `Task::AllocPacketBatch` (write past
+  `pbatch_[]`), `CurrentWorkerId()` (out-of-range `WorkerSlots` slot), the trace depth bound (`indent[]`),
+  `SlotTable::Publish/Retire/Unpublish` (freeing or overwriting an object a reader may hold), `~RcuPtr` with
+  readers online, a second `RcuPtr::Initialize` (frees what readers hold), `~RcuDomain` with registered readers
+  (readers use a freed domain), `ExpiryWheel::Poll` re-entry (wheel list corruption; one branch per poll), and the
+  `Virt2Phy`/`Phy2Virt` range (a wrong address handed to DMA). The death test on the domain check is renamed
+  `DestroyWithRegisteredReaderAborts`.
+- `NDEBUG` also selects the flow tables' `DefaultOwner` (`flow/owner.h`): `UncheckedOwner` in release, `ThreadOwner`
+  otherwise. That per-lookup ownership check is debug-only by design ("release builds check nothing"), and release
+  builds now match it. Two consequences: D-056's measurements were taken in a worktree release tree that
+  still had `ThreadOwner` (D-052's tree is not recorded) (and, for `kOwnedByCreator` shared tables, an owner stamp per slot), so their
+  default-trait rows included the check; and a plugin built without `NDEBUG` (`bess-dev.pc` does not set it)
+  instantiates default-trait flow tables with a different layout from a release `bessd`. No table crosses that
+  boundary today; a plugin that shares one must name its owner traits explicitly.
+- The rest stay debug-only: per-packet contracts on compile-time or structurally bounded values (`CopySmall`,
+  `attr_offset`, the unix-socket burst), consistency checks whose failure is not memory damage (flow-table
+  `erased`, `RouteKey`), `l2_forward`'s self-test, unreachable switch arms.
+
+**Evidence.** R1 microbenchmarks and the bisect are in MODERNIZATION.md entry 148. Release configure: `-DNDEBUG`
+present, `_GLIBCXX_ASSERTIONS` absent; `fast` configure: both unchanged from before. Targeted tests on the fast
+tree: the 14 test binaries that cover the changed files (SlotTable, RcuPtr, memory, transactions, object tables,
+scope snapshots, generations, meters, router, session pipeline, bessd) pass. A full release tree with `NDEBUG`
+(bessd, every test and benchmark) compiles, and the 9 tests covering the RCU, expiry, scope, object-table, memory,
+flow-table and bessd changes pass in it and in the fast tree. CI runs the full suites on the PR.
+
+**Revisit when:** a deployment wants the libstdc++ checks in its release binary (add a hardening profile then); a
+`DCHECK` is found guarding memory safety (promote it); `b_ndebug` changes meaning in Meson.

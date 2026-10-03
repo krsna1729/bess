@@ -58,7 +58,7 @@ class RcuPtr {
     // Destroying a published pointer while a reader could still hold it would
     // be a use-after-free. Teardown goes through ResetQuiesced() (workers
     // paused) or Publish() (readers running), never through the destructor.
-    DCHECK(owner_ == nullptr || domain_.online_readers() == 0)
+    CHECK(owner_ == nullptr || domain_.online_readers() == 0)
         << "RcuPtr destroyed while " << domain_.online_readers()
         << " reader(s) are online; clear it with ResetQuiesced() first";
   }
@@ -67,7 +67,7 @@ class RcuPtr {
   // when no reader can be holding a previous pointer.
   void Initialize(std::unique_ptr<const T> initial) {
     std::lock_guard<std::mutex> lock(writer_mutex_);
-    DCHECK(owner_ == nullptr) << "RcuPtr already initialized";
+    CHECK(owner_ == nullptr) << "RcuPtr already initialized";  // D-061
     owner_ = std::move(initial);
     current_.store(owner_.get(), std::memory_order_release);
   }

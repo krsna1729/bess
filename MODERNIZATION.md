@@ -4890,6 +4890,33 @@ rather than one call site).
        `WorkerSlots` slot in its own 128-byte line pair (against adjacent-line prefetch pairing) changed nothing
        (1.207 vs 1.212 ns), so it was not adopted. Unexplained after the one-hour box; 0.06 ns per update (1.10 -> 1.16 ns).
 
+148. **Performance revisit R1 and R4: master against HEAD; release builds get NDEBUG (D-061).**
+     - **R1 microbenchmarks** (D-035's five suites, 222 cases, all common to both): master 1d8f708f's prebuilt
+       x86-64-v3 binaries against HEAD a9eac4b6, release, `omarchy-benchmark --isolate --cpu 2`, 8 ABBA pairs. HEAD
+       better / worse / no clear difference: copy 24 / 0 / 100; traffic classes 18 / 2 / 26 (round robin and
+       weighted-fair counts 3-20% faster); URL filter 1 / 0 / 0; checksum 5 / 4 / 20 (the worse rows are DPDK's
+       `rte_ipv4_cksum` no-options path +245%, incremental updates +6-9% and `BmTcpChecksumBess/787` +3.1%, inside the checksum-clobber fix and
+       the DPDK port that were filtered out as unavoidable); CuckooMap 3 / 11 / 8 (below).
+     - **CuckooMap:** small maps (4-4K entries) 12-65% slower and 4M 36% slower, 16K-256K about 50% faster. The
+       benchmark is unchanged. Of the ten commits that touched `cuckoo_map.h` since master, the five that changed its
+       code, each built in one tree and compared with the pre-`0e1d00fd` header (master's) built there, so each
+       result is cumulative from that base (8 pairs): `0e1d00fd`, `173e93e8`, `aef8f5b6`,
+       `0e4999fc` within about 2% (one 4K row +3-12%); D-034's `44930b9e` 4-63% faster. Master's prebuilt binary
+       against its own header rebuilt today: the rebuild 12-145% slower, so the gap is the build. The cause:
+       the worktree release trees kept Meson's default `b_ndebug=false` (the main `build/perf-release` had
+       `b_ndebug=true`), which adds `_GLIBCXX_ASSERTIONS`; master built with
+       `-DNDEBUG`. HEAD with `NDEBUG`, same code: every lookup row 8-26% faster than HEAD as built; against master,
+       64-1K entries within 4%, 16K-1M 28-64% faster, 4M +6%, 4 and 16 entries +16%, 4K +40% (not investigated).
+       Release builds now define `NDEBUG` (D-061).
+     - **R1 pipelines: not obtained.** The four-way pipeline harness, cut to master-v3 against HEAD-v3, measured
+       0 Mpps for both builds on every config under `omarchy-benchmark` (4 rounds, 45 configs); outside the
+       wrapper `bessd` did not become ready. Not diagnosed within the box; the end-to-end comparison is open.
+     - **R4, K3.7.1 candidate-id cleanup** (`5b6decba` against `e1628681`, 16 pairs, isolated; both built with
+       `-Wno-error=(maybe-)uninitialized` for today's protobuf): `BM_Masked_Substrate` 3-12% slower on most rows
+       (0/16 pairs favourable), one row +18%, one row 4% faster, the 64-mask rows 14-18% faster. The original record called its smoke
+       pair (402 -> 467 ns) not a verdict; this paired run confirms the direction. The cost is still in HEAD (M0
+       measured no change since f4fdab03, which follows it). Recorded; not pursued.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

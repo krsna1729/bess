@@ -116,7 +116,7 @@ class SlotTable {
   std::unique_ptr<const T> Publish(Id id,
                                    std::unique_ptr<const T> object) noexcept {
     const size_t index = static_cast<size_t>(id.value());
-    DCHECK(CanPublish(id));
+    CHECK(CanPublish(id));  // a retiring object may still be read (D-061)
     const T *old = slots_[index].exchange(object.release(),
                                           std::memory_order_acq_rel);
     if (states_[index] == SlotState::kFree) {
@@ -130,7 +130,7 @@ class SlotTable {
   // It stays readable, and the id unpublishable, until Unpublish().
   void Retire(Id id) noexcept {
     const size_t index = static_cast<size_t>(id.value());
-    DCHECK(Contains(id));
+    CHECK(Contains(id));
     states_[index] = SlotState::kRetiring;
     size_--;
   }
@@ -139,7 +139,7 @@ class SlotTable {
   // a grace period (a reader may have just looked it up). The id is free.
   std::unique_ptr<const T> Unpublish(Id id) noexcept {
     const size_t index = static_cast<size_t>(id.value());
-    DCHECK(state(id) == SlotState::kRetiring);
+    CHECK(state(id) == SlotState::kRetiring);  // else a live object is freed (D-061)
     states_[index] = SlotState::kFree;
     return std::unique_ptr<const T>(
         slots_[index].exchange(nullptr, std::memory_order_acq_rel));

@@ -256,7 +256,7 @@ class ExpiryWheel {
   PollResult Poll(Tick now, size_t budget, Fn &&fn) noexcept {
     static_assert(std::is_nothrow_invocable_v<Fn &, const Payload &>,
                   "an expiry callback must be noexcept");
-    DCHECK(!polling_) << "Poll is not re-entrant";
+    CHECK(!polling_) << "Poll is not re-entrant";  // list corruption otherwise (D-061)
     polling_ = true;
     const PollResult result = PollImpl(now, budget, fn);
     polling_ = false;

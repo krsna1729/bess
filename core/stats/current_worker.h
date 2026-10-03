@@ -15,10 +15,10 @@ static_assert(dataplane::kMaxWorkers == Worker::kMaxWorkers,
 
 // The calling worker's id, for code that runs on a worker thread and does
 // not have `Context::wid` at hand (gate hooks, for instance). Calling it from
-// a thread that is not a worker is a bug; debug builds check.
+// a thread that is not a worker is a bug; every build checks.
 inline dataplane::WorkerId CurrentWorkerId() noexcept {
   const int wid = current_worker.wid();
-  DCHECK(wid >= 0 && wid < Worker::kMaxWorkers)
+  CHECK(wid >= 0 && wid < Worker::kMaxWorkers)  // else an out-of-range slot (D-061)
       << "CurrentWorkerId() called off a worker thread (wid " << wid << ")";
   return dataplane::WorkerId(static_cast<uint16_t>(wid));
 }
