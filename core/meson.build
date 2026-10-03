@@ -475,15 +475,22 @@ install_headers(core_public_headers, subdir: 'bess/core')
 # into core implementation subdirectories.
 core_public_subdir_headers = {
   'utils': files(
+    'utils/arp.h',
+    'utils/checksum.h',
     'utils/common.h',
     'utils/copy.h',
     'utils/endian.h',
     'utils/ether.h',
     'utils/extended_priority_queue.h',
+    'utils/icmp.h',
     'utils/inline_function.h',
+    'utils/ip.h',
     'utils/logging.h',
     'utils/random.h',
+    'utils/simd.h',
+    'utils/tcp.h',
     'utils/time.h',
+    'utils/udp.h',
   ),
   'framework': files(
     'framework/instance_registry.h',
@@ -536,6 +543,8 @@ core_public_subdir_headers = {
     'route/next_hop_id.h',
     'route/route_domain.h',
     'route/router.h',
+    'route/l3_packet.h',
+    'route/neighbor_table.h',
   ),
   'rcu': files(
     'rcu/rcu_domain.h',
@@ -596,6 +605,7 @@ unit_test_sources = [
   'route/route_test.cc',
   'route/router_transaction_test.cc',
   'route/route_domain_test.cc',
+  'route/l3_test.cc',
   'rcu/rcu_test.cc',
   'rcu/rcu_ptr_test.cc',
   'rcu/rcu_worker_test.cc',

@@ -213,6 +213,12 @@ state through G, C or W.
   publishes it with one pointer store (a table build, not an in-place update).
 - **Used by:** IPLookup, the `Router` module.
 
+- **Next-hop groups** (M15, D-065): `SetNextHopGroup(id, members)` and
+  `SetRoute(domain, prefix, NextHopGroupId)`; `Resolve`/`ResolveBatch`/
+  `LookupRoute` take a flow hash that picks the member. Not transactional.
+  Neighbor state lives in `NeighborTable` (control side), whose updates are
+  next-hop updates; TTL, MTU, ICMP and ARP mechanics are in `l3_packet.h`.
+
 ### `ObjectTable<Id, T>` (id → object, mode G)
 
 - **What:** an immutable dense array indexed by a strongly typed, one-based

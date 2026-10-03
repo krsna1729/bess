@@ -4969,6 +4969,17 @@ rather than one call site).
      pair); the 1M rows remain 1.5-3.2x behind `l2_table` (TLB reach, twice the footprint; not closed). Eleven of
      thirteen mutants caught; the displacement-cycle guard is unreachable at 50% load, and a wheel Schedule
      refusal needs 2^31 armings of one node. Reviewed: two rounds.
+153. **M15 L3 batteries (D-065).** Next-hop groups in the Router: a route names a next hop or a group of up to 64,
+     the reader picks a member by the flow hash it passes (multiply-shift), membership changes publish one group
+     object and neighbor changes stay next-hop updates; groups are pinned by routes and pin their members; not
+     transactional (enrolled routers refuse them). `neighbor_table.h`: neighbor state by (interface, IPv4) with
+     its bound next hops; `Update` + `Publish` turn a resolution into next-hop updates, never route changes.
+     `l3_packet.h`: TTL/hop-limit decrement (RFC 1624), MTU check reporting DF, ICMPv4 errors under RFC 1122's
+     refusals (including loopback and 0/8 sources), ARP parse/request/reply. Reader cost, isolated ABBA (16
+     pairs) against this tree with develop's router: route lookups no clear difference; the default-domain hot
+     resolve +6.9% (0.057 ns) [INFERENCE: code placement, after three layout variants]; domain batches +3% /
+     -6% / -12%, where the two gains are the baseline's placement, not the change. 14/14 mutants caught. IPv6
+     FIB, resolver module and transactional groups not built.
 
 ## Review process established this session
 

@@ -4,6 +4,7 @@
 #define BESS_ROUTE_ROUTER_H_
 
 #include <any>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -82,6 +83,22 @@ inline std::expected<void, packet::MutationError> RewriteL2(
   return {};
 }
 
+// An ECMP group (M15, D-065): 1..kMaxMembers next hops, immutable once
+// published. A flow picks a member by its hash, so one flow keeps one path
+// while the membership is unchanged; how the hash is made (which fields, which
+// algorithm) is the application's (M16 adds selection algorithms).
+struct NextHopGroup {
+  static constexpr size_t kMaxMembers = 64;
+  uint32_t size = 0;
+  std::array<NextHopId, kMaxMembers> members{};
+
+  // Lemire's multiply-shift: uniform over the members for a uniform 32-bit
+  // hash, no division.
+  NextHopId Select(uint32_t flow_hash) const noexcept {
+    return members[(uint64_t{flow_hash} * size) >> 32];
+  }
+};
+
 // Route domains plus next hops (K7, K7.1, M6):
 //
 //   (domain, IPv4 dst) --LPM--> NextHopId --SlotTable--> NextHop
@@ -141,6 +158,17 @@ inline std::expected<void, packet::MutationError> RewriteL2(
 // are) and need no Module, metadata or gate: Resolve()/ResolveBatch() are the
 // whole direct, specialized path.
 //
+// Next-hop groups (M15, D-065): a route names a next hop or a group of
+// them, and the reader picks a group member by the flow hash it passes
+// (Resolve without a hash uses 0: the group's first member for any group).
+// A group is one immutable SlotTable object: changing its members publishes a
+// new object (O(1), no FIB change), changing a member's neighbor is the
+// member's next-hop update, and a group in use (routes name it) cannot be
+// removed. In the FIB a group is the value max_next_hops + group id, so a
+// router without groups pays one never-taken branch. Groups are not
+// transactional: an enrolled router refuses them (kEnrolled), and Enroll()
+// refuses a router that has groups.
+//
 // Transactions (G1.2b, D-023): Enroll() registers the next hops and the
 // routes as two resources of a TransactionEngine, so that one transaction can
 // change them together with other modules' tables (a rule, the action it
@@ -155,9 +183,11 @@ class Router {
 
   // `config` sizes the default domain's FIB; CreateDomain() takes the others'.
   // `max_domains` (1..kMaxRouteDomains) bounds the domain ids: 0..max_domains-1.
+  // `max_groups` bounds the next-hop group ids: 1..max_groups (0: none);
+  // max_next_hops + max_groups must fit a route value (24 bits).
   static std::expected<std::unique_ptr<Router>, RouteError> Create(
       std::string name, const Config &config, size_t max_next_hops,
-      rcu::RcuDomain &domain, size_t max_domains = 1);
+      rcu::RcuDomain &domain, size_t max_domains = 1, size_t max_groups = 0);
 
   ~Router();
 
@@ -170,9 +200,30 @@ class Router {
   std::expected<void, RouteError> SetNextHop(NextHopId id, const NextHop &hop);
   std::expected<void, RouteError> RemoveNextHop(NextHopId id);
 
-  // Drops retiring next hops whose grace period has completed, and returns
-  // how many are still waiting. Every control method does this first.
+  // Drops retiring next hops and groups whose grace period has completed, and
+  // returns how many are still waiting. Every control method does this first.
   size_t ReclaimRetired();
+
+  // -- next-hop groups (M15, D-065) ------------------------------------------------
+
+  // Adds group `id` or replaces its members (1..NextHopGroup::kMaxMembers
+  // existing next hops; a next hop may appear more than once, as a weight).
+  // kInvalidId (id, or member count), kUnknownNextHop, kNextHopRetiring (the id
+  // was removed and readers may still hold it), kEnrolled.
+  std::expected<void, RouteError> SetNextHopGroup(NextHopGroupId id,
+                                                  std::span<const NextHopId> members);
+  // Removes a group no route names (kNextHopInUse otherwise). Like a next
+  // hop, it stays readable until a grace period passes; its members stay
+  // referenced until then.
+  std::expected<void, RouteError> RemoveNextHopGroup(NextHopGroupId id);
+  // Points a route at a group (the next-hop overload's semantics otherwise).
+  std::expected<void, RouteError> SetRoute(RouteDomainId domain, Ipv4Prefix prefix,
+                                           NextHopGroupId group);
+  size_t next_hop_group_count() const;
+  // Routes naming group `id`, across all domains.
+  size_t GroupReferences(NextHopGroupId id) const;
+  // Groups naming next hop `id` (counted once per member position).
+  size_t GroupMemberships(NextHopId id) const;
 
   // -- domains ----------------------------------------------------------------
 
@@ -307,38 +358,66 @@ class Router {
     if (unlikely(routes == nullptr)) {
       return 0;
     }
-    return ResolveBatchIn(*routes, dst, hops);
+    return ResolveBatchIn<false>(*routes, dst, {}, hops);
   }
   // The default domain.
   uint64_t ResolveBatch(std::span<const uint32_t> dst,
                         std::span<const NextHop *> hops) const noexcept {
-    return ResolveBatchIn(*default_routes_, dst, hops);
+    return ResolveBatchIn<false>(*default_routes_, dst, {}, hops);
+  }
+  // With each packet's flow hash, which picks the member of a group route.
+  uint64_t ResolveBatch(RouteDomainId domain, std::span<const uint32_t> dst,
+                        std::span<const uint32_t> flow_hashes,
+                        std::span<const NextHop *> hops) const noexcept {
+    promise(flow_hashes.size() == dst.size());
+    const LpmRouteTable *routes = TableOf(domain);
+    if (unlikely(routes == nullptr)) {
+      return 0;
+    }
+    return ResolveBatchIn<true>(*routes, dst, flow_hashes, hops);
   }
 
   // The next hop `dst` resolves to in `domain`, or nullptr for a miss or an
   // unknown domain. Valid until the calling worker's next quiescent state.
-  const NextHop *Resolve(RouteDomainId domain, uint32_t dst) const noexcept {
+  // `flow_hash` picks the member of a group route.
+  const NextHop *Resolve(RouteDomainId domain, uint32_t dst,
+                         uint32_t flow_hash = 0) const noexcept {
     const LpmRouteTable *routes = TableOf(domain);
     if (unlikely(routes == nullptr)) {
       return nullptr;
     }
-    return ResolveIn(*routes, dst);
+    return ResolveIn(*routes, dst, flow_hash);
   }
   const NextHop *Resolve(uint32_t dst) const noexcept {
-    return ResolveIn(*default_routes_, dst);
+    return ResolveIn(*default_routes_, dst, 0);
   }
 
   // Only the route lookup: the next-hop id `dst` matches in `domain`, or
   // kInvalidNextHopId (a miss, an unknown domain, or a route a transaction is
   // still placing, D-023). For pipelines that carry ids and resolve them later
   // with LookupNextHop(s).
-  NextHopId LookupRoute(RouteDomainId domain, uint32_t dst) const noexcept {
+  // A group route yields the member `flow_hash` picks.
+  NextHopId LookupRoute(RouteDomainId domain, uint32_t dst,
+                        uint32_t flow_hash = 0) const noexcept {
     const LpmRouteTable *routes = TableOf(domain);
     if (unlikely(routes == nullptr)) {
       return kInvalidNextHopId;
     }
-    const uint32_t id = routes->Read().LookupOrMiss(dst);
-    return id != LpmRouteTable::kNoDefault ? NextHopId(id) : kInvalidNextHopId;
+    uint32_t id = routes->Read().LookupOrMiss(dst);
+    if (unlikely(id > max_next_hops_)) {
+      if (id == LpmRouteTable::kNoDefault) {
+        return kInvalidNextHopId;
+      }
+      std::atomic_thread_fence(std::memory_order_acquire);
+      id = MemberOf(id, flow_hash);
+    }
+    return NextHopId(id);
+  }
+
+  // The group `id` names, or nullptr. Valid until the calling worker's next
+  // quiescent state.
+  const NextHopGroup *LookupNextHopGroup(NextHopGroupId id) const noexcept {
+    return groups_.Lookup(id);
   }
 
   // The next hop an id names, or nullptr for an invalid, out-of-range or
@@ -395,7 +474,8 @@ class Router {
   }
 
   Router(std::string name, std::unique_ptr<LpmRouteTable> default_routes,
-         size_t max_next_hops, size_t max_domains, rcu::RcuDomain &rcu);
+         size_t max_next_hops, size_t max_domains, size_t max_groups,
+         rcu::RcuDomain &rcu);
 
   class RouteResource;
 
@@ -417,16 +497,45 @@ class Router {
 
   bool ValidId(NextHopId id) const noexcept { return next_hops_.ValidId(id); }
 
-  const NextHop *ResolveIn(const LpmRouteTable &routes,
-                           uint32_t dst) const noexcept {
-    const uint32_t id = routes.Read().LookupOrMiss(dst);
-    std::atomic_thread_fence(std::memory_order_acquire);
-    return id != LpmRouteTable::kNoDefault ? next_hops_.Lookup(NextHopId(id))
-                                           : nullptr;
+  // The member of the group a route value above max_next_hops_ names, as a
+  // next-hop id value; 0 (a miss) for a group not published.
+  uint32_t MemberOf(uint32_t value, uint32_t flow_hash) const noexcept {
+    const NextHopGroup *group = groups_.Lookup(
+        NextHopGroupId(static_cast<uint32_t>(value - max_next_hops_)));
+    return group != nullptr ? group->Select(flow_hash).value() : 0;
   }
 
+  // A group's value (and kNoDefault) is beyond the next-hop table, where
+  // Lookup returns nullptr: the group check runs only on that path, so a
+  // router without groups resolves exactly as before (D-065 measured a
+  // check ahead of the lookup at +5-15% on the domain benchmarks).
+  // Out of line and cold: inlined, it grew the resolve loops enough to cost
+  // the no-group path (D-065).
+  [[gnu::noinline, gnu::cold]] const NextHop *GroupMemberHop(
+      uint32_t value, uint32_t flow_hash) const noexcept {
+    if (value <= max_next_hops_ || value == LpmRouteTable::kNoDefault) {
+      return nullptr;
+    }
+    return next_hops_.Lookup(NextHopId(MemberOf(value, flow_hash)));
+  }
+
+  const NextHop *ResolveIn(const LpmRouteTable &routes, uint32_t dst,
+                           uint32_t flow_hash) const noexcept {
+    const uint32_t id = routes.Read().LookupOrMiss(dst);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const NextHop *hop = next_hops_.Lookup(NextHopId(id));
+    if (unlikely(hop == nullptr)) {
+      hop = GroupMemberHop(id, flow_hash);
+    }
+    return hop;
+  }
+
+  // Without kHashed, `flow_hashes` is unused and every packet uses hash 0; a
+  // template, so the plain path compiles as it did before groups (D-065).
+  template <bool kHashed>
   uint64_t ResolveBatchIn(const LpmRouteTable &routes,
                           std::span<const uint32_t> dst,
+                          std::span<const uint32_t> flow_hashes,
                           std::span<const NextHop *> hops) const noexcept {
     promise(dst.size() == hops.size() && dst.size() <= kMaxBatch);
     uint32_t ids[kMaxBatch];
@@ -434,7 +543,11 @@ class Router {
     std::atomic_thread_fence(std::memory_order_acquire);
     for (uint64_t m = mask; m != 0; m &= m - 1) {
       const size_t i = static_cast<size_t>(__builtin_ctzll(m));
-      if (const NextHop *hop = next_hops_.Lookup(NextHopId(ids[i]))) {
+      const NextHop *hop = next_hops_.Lookup(NextHopId(ids[i]));
+      if (unlikely(hop == nullptr)) {
+        hop = GroupMemberHop(ids[i], kHashed ? flow_hashes[i] : 0);
+      }
+      if (hop != nullptr) {
         hops[i] = hop;
       } else {
         // Id 0: a route a transaction is placing where there is no covering
@@ -451,6 +564,7 @@ class Router {
   const std::string name_;
   rcu::RcuDomain &rcu_;
   const size_t max_domains_;
+  const uint32_t max_next_hops_;  // route values above it name groups
   // Slot = domain id + 1. Read lock-free by workers and the engine; written
   // under mutex_ (and never once enrolled).
   dataplane::SlotTable<DomainSlot, Domain> domains_;
@@ -469,6 +583,20 @@ class Router {
     rcu::GracePeriod token;
   };
   std::vector<Retiring> retiring_;  // removed, still published
+
+  // Groups (D-065), mode C like the next hops.
+  dataplane::SlotTable<NextHopGroupId, NextHopGroup> groups_;
+  std::vector<uint32_t> group_references_;   // routes per group, index = id
+  std::vector<uint32_t> member_references_;  // group members per next hop
+  struct RetiringGroup {
+    NextHopGroupId id;
+    rcu::GracePeriod token;
+  };
+  std::vector<RetiringGroup> retiring_groups_;
+
+  // A route value's reference (a next hop's or a group's), control side.
+  void Reference(uint32_t value) noexcept;
+  void Unreference(uint32_t value) noexcept;
 
   // Set by Enroll(); the resources exist while enrolled.
   const std::string next_hops_name_;
