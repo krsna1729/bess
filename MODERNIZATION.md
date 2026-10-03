@@ -4832,6 +4832,7 @@ rather than one call site).
        `NextHop` is asserted to be 16 bytes. Develop against develop+fix: `BM_LookupRouter/1024` -10.3% (16/16),
        16K -4.0% (15/16), 64K and `BM_NextHopUpdate` no difference. The performance contract's id-width rule is
        restated (narrow when stored in a hot structure; 32 bits for handle slots and ids in metadata or marks).
+     - *(Annotation: the three open rows were rechecked and bisected in entry 147.)*
      - **Open:** M0's `BM_NextHopUpdate/1024` +10% did not reproduce in any bisect pair; `BM_ThreadsWorkerLocalUpdate`
        +7.5% (run on CPUs 2,4 in the window with CPU 4's device interrupts) and `BM_TypedTableLookup/32` +3.3% are
        not bisected; a possible ~2% residual at 1K routes after the fix
@@ -4870,6 +4871,24 @@ rather than one call site).
        is refuted: moving the bare ring or the channel's ring by 64 bytes changed nothing (16 pairs each). CPU 4
        had device interrupts in both windows (step 0: vmd0 168, iwlwifi 54; H1: ASUE1213 4,114, vmd0 834,
        thunderbolt 141, iwlwifi 103); every compared row shared its window.
+
+147. **M0's remaining rows: rechecked at 16 pairs and bisected (R6).** f4fdab03 against develop (71f6ac8b's code),
+     `omarchy-benchmark --isolate` (CPU 2; 2,4 for the threaded row; CPU 4 had ASUE1213 3,332, vmd0 118 and iwlwifi
+     44 interrupts in that window):
+     - `BM_TypedTableLookup/1` and `/32`: no difference (M0 had +22.9% / +3.3%). Closed as not reproduced.
+       `BM_DirectTypedLookup/1` is reproducibly about 20% faster on develop (-18.1% in M0, -21.9% here, 16/16); its
+       code is unchanged since f4fdab03, so placement is the likely reason [INFERENCE: not investigated].
+     - `BM_NextHopUpdate`: +4.1% at 1K and +8.4% at 64K next hops (0/16 pairs). The stepwise
+       data disagrees: f4fdab03 -> M7 was flat at every step, and an automated bisect comparing each midpoint
+       directly against M7 (8 pairs, 3% bar) put develop's code (cef7813d, the same `core/` as 71f6ac8b) at +0.5% /
+       +1.3% of M7, with no midpoint above +2.7%. So the direct f4fdab03-vs-develop gap is not reproduced stepwise:
+       a difference between build trees or sessions, unexplained. (The bisect tool's "first bad 71f6ac8b" was never
+       measured and is not a result.) It is a control-side write, about 66 ns per update; not pursued further.
+     - `BM_ThreadsWorkerLocalUpdate` (2 threads): +6.7% (0/16). Bisect: first bad 22acce04 (M8, +11.9%), which changes
+       no stats code. The benchmark function's instructions are identical, its address is the same mod 64, and the
+       benchmark's statics are the same mod 4,096 in the good and bad binaries. An experiment that put each worker's
+       `WorkerSlots` slot in its own 128-byte line pair (against adjacent-line prefetch pairing) changed nothing
+       (1.207 vs 1.212 ns), so it was not adopted. Unexplained after the one-hour box; 0.06 ns per update (1.10 -> 1.16 ns).
 
 ## Review process established this session
 
