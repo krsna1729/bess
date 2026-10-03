@@ -4916,6 +4916,30 @@ rather than one call site).
        (0/16 pairs favourable), one row +18%, one row 4% faster, the 64-mask rows 14-18% faster. The original record called its smoke
        pair (402 -> 467 ns) not a verdict; this paired run confirms the direction. The cost is still in HEAD (M0
        measured no change since f4fdab03, which follows it). Recorded; not pursued.
+149. **M11 streaming hypotheses H2-H4 and the R5 re-measure.** Isolated on CPUs 2,4 (`omarchy-benchmark`; CPU 4 had
+     vmd0, iwlwifi and thunderbolt interrupts in each window, shared by every compared row), 16 ABBA pairs.
+     - **H2, the closed loop's phase:** `handoff_bench`'s `OneWay` now reports the consumer's items per non-empty
+       dequeue, its empty polls per item and the producer's enqueue calls per burst. At burst 32 both rings run full
+       32-item batches with almost no producer retries (1.00-1.02 calls per burst); the channel's consumer polls empty
+       one-tenth as often (0.008 against 0.08 per item), so the channel's consumer is the slower side. That is the
+       per-call cost showing up, not a phase that the same work would avoid: with both consuming full batches, the
+       difference is in the cost of each dequeue (paired, this build: one-way +7% / +12% at bursts 8 / 32, round trip
+       +21% / +23%). Refuted as an explanation.
+     - **H3, layout:** 256 bytes between the channel object and its ring changed nothing (all four rows). Refuted.
+     - **H4 and the per-call work:** a throwaway variant without the closed check, the ownership nulling and the
+       per-call counters: one-way burst 32 -13.8% (15/16 pairs), round trip burst 8 -5.2%; the same variant with the
+       pad, -4.9% one-way and at parity with the bare ring one-way (-3.5%, +1.0%). So part of the one-way gap,
+       somewhere between 5% and 14% in these noisy runs, is the channel's per-call work [INFERENCE]; how it splits
+       between the contract (closed check, ownership nulling) and the counters (observability) was not measured.
+       The round trip remains 18-24% slower than the bare ring even in that variant: unexplained, and the
+       investigation stops here (D-054 annotated).
+     - **R5:** release `NDEBUG` build, one isolated pass. `WorkerFlowTable` lookups against D-052's table: 1K one hot
+       flow 4.2 ns against 4.3 (a match); uniform hits 10-18% faster (64K 7.4 against 8.7; 1M 29.2 against 35.5
+       scalar, 17.5 against 19.4 at batch 32), plausibly D-061's `NDEBUG` (`UncheckedOwner`, no libstdc++
+       assertions) [INFERENCE]. Expiry was
+       re-measured in entry 144. The channel is slower in the R5 single
+       runs too (one-way +17% / +68%, round trip +21% / +9% at bursts 8 / 32); single runs, not comparable in size
+       with the paired results.
 
 ## Review process established this session
 
