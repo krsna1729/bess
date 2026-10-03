@@ -7,8 +7,16 @@
 
 #include <atomic>
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+
+// Not before module.h, and in its own block so clang-format keeps it here. glog
+// and protobuf's absl logging both define LOG/LOG_IF/VLOG (glog's CHECK expands
+// through LOG_IF); the second of the two to be included first redefines them,
+// and later includes of either are no-ops behind their include guards.
+// module.h includes absl logging and then glog, so this module logs through
+// glog. If l2_table.h (which includes glog) came first, absl would be included
+// second and win.
 #include "l2_table.h"
 
 #if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__

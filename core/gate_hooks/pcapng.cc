@@ -12,10 +12,10 @@
 
 #include <glog/logging.h>
 
-#include "../message.h"
-#include "../utils/common.h"
-#include "../utils/pcapng.h"
-#include "../utils/time.h"
+#include "message.h"
+#include "utils/common.h"
+#include "utils/pcapng.h"
+#include "utils/time.h"
 
 using namespace bess::utils::pcapng;
 

@@ -5,8 +5,8 @@
 #include <cstring>
 #include <vector>
 
-#include "../utils/format.h"
-#include "../utils/time.h"
+#include "utils/format.h"
+#include "utils/time.h"
 
 namespace {
 

@@ -5,9 +5,9 @@
 #ifndef BESS_GATE_HOOKS_TRACK_
 #define BESS_GATE_HOOKS_TRACK_
 
-#include "../message.h"
-#include "../module.h"
-#include "../stats/counter_set.h"
+#include "message.h"
+#include "module.h"
+#include "stats/counter_set.h"
 
 // TrackGate counts the number of packets, batches and bytes seen by a gate.
 //

@@ -4,7 +4,7 @@
 
 #include "update.h"
 
-#include "../utils/endian.h"
+#include "utils/endian.h"
 
 const Commands Update::cmds = {
     {"add", "UpdateArg", MODULE_CMD_FUNC(&Update::CommandAdd),

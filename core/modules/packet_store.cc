@@ -2,8 +2,8 @@
 
 #include "packet_store.h"
 
-#include "../utils/format.h"
-#include "../utils/time.h"
+#include "utils/format.h"
+#include "utils/time.h"
 
 namespace {
 

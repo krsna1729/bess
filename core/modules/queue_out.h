@@ -5,10 +5,10 @@
 #ifndef BESS_MODULES_QUEUEOUT_H_
 #define BESS_MODULES_QUEUEOUT_H_
 
-#include "../module.h"
-#include "../packet_tx_checksum.h"
-#include "../pb/module_msg.pb.h"
-#include "../port.h"
+#include "module.h"
+#include "packet_tx_checksum.h"
+#include "pb/module_msg.pb.h"
+#include "port.h"
 
 class QueueOut final : public Module {
  public:

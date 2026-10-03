@@ -31,9 +31,9 @@
 
 #include <glog/logging.h>
 
-#include "stacktrace.h"
-#include "../dataplane/batch_tuning.h"
 #include "common.h"
+#include "dataplane/batch_tuning.h"
+#include "stacktrace.h"
 
 namespace bess {
 namespace utils {

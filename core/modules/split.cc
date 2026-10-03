@@ -4,8 +4,8 @@
 
 #include "split.h"
 
-#include "../utils/bits.h"
-#include "../utils/endian.h"
+#include "utils/bits.h"
+#include "utils/endian.h"
 
 CommandResponse Split::Init(const bess::pb::SplitArg &arg) {
   size_ = arg.size();

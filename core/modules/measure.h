@@ -5,11 +5,11 @@
 #ifndef BESS_MODULES_MEASURE_H_
 #define BESS_MODULES_MEASURE_H_
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../utils/histogram.h"
-#include "../utils/mcslock.h"
-#include "../utils/random.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "utils/histogram.h"
+#include "utils/mcslock.h"
+#include "utils/random.h"
 
 class Measure final : public Module {
  public:

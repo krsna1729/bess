@@ -14,16 +14,16 @@
 #include <utility>
 #include <vector>
 
-#include "../classifier/backend.h"
-#include "../classifier/concurrent_exact.h"
-#include "../classifier/exact_rule_resource.h"
-#include "../classifier/extract_plan.h"
-#include "../classifier/runtime_schema.h"
-#include "../event.h"
-#include "../framework/resource_bindings.h"
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../rcu/rcu_ptr.h"
+#include "classifier/backend.h"
+#include "classifier/concurrent_exact.h"
+#include "classifier/exact_rule_resource.h"
+#include "classifier/extract_plan.h"
+#include "classifier/runtime_schema.h"
+#include "event.h"
+#include "framework/resource_bindings.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "rcu/rcu_ptr.h"
 
 using google::protobuf::RepeatedPtrField;
 // (bess::framework::Error is the same alias; defined locally so this module

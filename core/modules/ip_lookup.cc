@@ -7,10 +7,10 @@
 #include <cerrno>
 #include <string>
 
-#include "../utils/bits.h"
-#include "../utils/ether.h"
-#include "../utils/format.h"
-#include "../utils/ip.h"
+#include "utils/bits.h"
+#include "utils/ether.h"
+#include "utils/format.h"
+#include "utils/ip.h"
 
 using bess::route::Ipv4Prefix;
 using bess::route::RouteErrno;

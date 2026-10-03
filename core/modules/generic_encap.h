@@ -5,8 +5,8 @@
 #ifndef BESS_MODULES_GENERICENCAP_H_
 #define BESS_MODULES_GENERICENCAP_H_
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
 
 #define MAX_FIELDS 8
 #define MAX_FIELD_SIZE 8

@@ -5,7 +5,7 @@
 #ifndef BESS_MODULES_BUFFER_H_
 #define BESS_MODULES_BUFFER_H_
 
-#include "../module.h"
+#include "module.h"
 
 /* TODO: timer-triggered flush */
 class Buffer final : public Module {

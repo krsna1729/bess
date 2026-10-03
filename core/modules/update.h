@@ -5,10 +5,10 @@
 #ifndef BESS_MODULES_UPDATE_H_
 #define BESS_MODULES_UPDATE_H_
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
 
-#include "../utils/endian.h"
+#include "utils/endian.h"
 
 using bess::utils::be64_t;
 

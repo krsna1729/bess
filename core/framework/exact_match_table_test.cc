@@ -6,7 +6,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../packet_pool.h"
+#include "packet_pool.h"
 #include "utils/endian.h"
 
 using bess::framework::Error;

@@ -35,7 +35,7 @@
 #include <gtest/gtest.h>
 #include <pcap/pcap.h>
 
-#include "../packet_pool.h"
+#include "packet_pool.h"
 
 TEST(PCAPPortTest, OversizedChainedPacketIsNotReportedSent) {
   pcap_t *dead_handle = pcap_open_dead(DLT_EN10MB, 65535);

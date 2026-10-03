@@ -5,7 +5,7 @@
 #ifndef BESS_MODULES_MACSWAP_H_
 #define BESS_MODULES_MACSWAP_H_
 
-#include "../module.h"
+#include "module.h"
 
 class MACSwap final : public Module {
  public:

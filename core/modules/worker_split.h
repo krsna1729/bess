@@ -5,7 +5,7 @@
 #ifndef BESS_MODULES_WORKERSPLIT_H_
 #define BESS_MODULES_WORKERSPLIT_H_
 
-#include "../module.h"
+#include "module.h"
 
 class WorkerSplit final : public Module {
  public:

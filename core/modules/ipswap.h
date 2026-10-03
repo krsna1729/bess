@@ -5,7 +5,7 @@
 #ifndef BESS_MODULES_IPSWAP_H_
 #define BESS_MODULES_IPSWAP_H_
 
-#include "../module.h"
+#include "module.h"
 
 // Swap source and destination IP addresses and UDP/TCP ports
 class IPSwap final : public Module {

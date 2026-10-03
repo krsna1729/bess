@@ -6,7 +6,7 @@
 #ifndef BESS_MODULES_IP_CHECKSUM_H_
 #define BESS_MODULES_IP_CHECKSUM_H_
 
-#include "../module.h"
+#include "module.h"
 
 // Compute IP checksum on packet
 class IPChecksum final : public Module {

@@ -8,8 +8,8 @@
 #include <expected>
 #include <limits>
 
-#include "../packet_tx_checksum.h"
-#include "../pb/module_msg.pb.h"
+#include "packet_tx_checksum.h"
+#include "pb/module_msg.pb.h"
 
 namespace bess::modules {
 namespace detail {

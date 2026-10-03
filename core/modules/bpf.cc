@@ -37,8 +37,8 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "../utils/bpf.h"
 #include "bpf.h"
+#include "utils/bpf.h"
 
 /* -------------------------------------------------------------------------
  * Module code begins from here

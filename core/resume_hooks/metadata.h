@@ -5,9 +5,9 @@
 #ifndef BESS_RESUME_HOOKS_METADATA_
 #define BESS_RESUME_HOOKS_METADATA_
 
-#include "../message.h"
-#include "../resume_hook.h"
-#include "../worker.h"
+#include "message.h"
+#include "resume_hook.h"
+#include "worker.h"
 
 // SetupMetadata computes read/write offsets for packet metadata attributes.
 class SetupMetadata final : public bess::ResumeHook {

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "source.h"
-#include "../packet_pool.h"
+#include "packet_pool.h"
 
 namespace {
 

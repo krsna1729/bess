@@ -4,11 +4,11 @@
 
 #include "l4_checksum.h"
 
-#include "../utils/checksum.h"
-#include "../utils/ether.h"
-#include "../utils/ip.h"
-#include "../utils/tcp.h"
-#include "../utils/udp.h"
+#include "utils/checksum.h"
+#include "utils/ether.h"
+#include "utils/ip.h"
+#include "utils/tcp.h"
+#include "utils/udp.h"
 
 enum { FORWARD_GATE = 0, FAIL_GATE };
 

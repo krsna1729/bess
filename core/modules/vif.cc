@@ -6,7 +6,7 @@
 
 #include <cstring>
 
-#include "../utils/format.h"
+#include "utils/format.h"
 
 namespace {
 

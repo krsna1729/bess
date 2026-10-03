@@ -9,11 +9,11 @@
 #include <string>
 #include <tuple>
 
-#include "../dataplane/strong_id.h"
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../route/route_table.h"
-#include "../utils/endian.h"
+#include "dataplane/strong_id.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "route/route_table.h"
+#include "utils/endian.h"
 
 using bess::utils::be32_t;
 using ParsedPrefix = std::tuple<int, std::string, be32_t>;

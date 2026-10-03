@@ -4,7 +4,7 @@
 
 #include "arp_responder.h"
 
-#include "../utils/arp.h"
+#include "utils/arp.h"
 
 using bess::utils::Arp;
 using bess::utils::be16_t;

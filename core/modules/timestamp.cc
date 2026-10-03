@@ -4,10 +4,10 @@
 
 #include "timestamp.h"
 
-#include "../utils/ether.h"
-#include "../utils/ip.h"
-#include "../utils/time.h"
-#include "../utils/udp.h"
+#include "utils/ether.h"
+#include "utils/ip.h"
+#include "utils/time.h"
+#include "utils/udp.h"
 
 using bess::utils::Ethernet;
 using bess::utils::Ipv4;

@@ -4,7 +4,7 @@
 
 #include "macswap.h"
 
-#include "../utils/ether.h"
+#include "utils/ether.h"
 
 void MACSwap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::Ethernet;

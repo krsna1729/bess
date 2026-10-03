@@ -16,9 +16,9 @@
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 
-#include "../packet_checksum.h"
-#include "../module.h"
-#include "../port.h"
+#include "packet_checksum.h"
+#include "module.h"
+#include "port.h"
 
 typedef uint16_t dpdk_port_t;
 

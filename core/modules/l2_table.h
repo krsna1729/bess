@@ -18,8 +18,8 @@
 #include <glog/logging.h>
 #include <rte_hash_crc.h>
 
-#include "../dataplane/batch_stages.h"
-#include "../gate.h"
+#include "dataplane/batch_stages.h"
+#include "gate.h"
 
 using bess::gate_idx_t;
 

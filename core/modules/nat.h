@@ -4,8 +4,8 @@
 #ifndef BESS_MODULES_NAT_H_
 #define BESS_MODULES_NAT_H_
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
 
 #include <rte_config.h>
 #include <rte_hash_crc.h>
@@ -16,9 +16,9 @@
 #include <utility>
 #include <vector>
 
-#include "../utils/cuckoo_map.h"
-#include "../utils/endian.h"
-#include "../utils/random.h"
+#include "utils/cuckoo_map.h"
+#include "utils/endian.h"
+#include "utils/random.h"
 
 // Theory of operation:
 //

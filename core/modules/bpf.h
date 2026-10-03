@@ -9,9 +9,9 @@
 
 #include <vector>
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../utils/bpf.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "utils/bpf.h"
 
 class BPF final : public Module {
  public:

@@ -4,9 +4,9 @@
 
 #include "ip_checksum.h"
 
-#include "../utils/checksum.h"
-#include "../utils/ether.h"
-#include "../utils/ip.h"
+#include "utils/checksum.h"
+#include "utils/ether.h"
+#include "utils/ip.h"
 
 enum { FORWARD_GATE = 0, FAIL_GATE };
 

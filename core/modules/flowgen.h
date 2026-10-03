@@ -7,14 +7,14 @@
 
 #include <atomic>
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
 
 #include <queue>
 #include <stack>
 
-#include "../utils/endian.h"
-#include "../utils/random.h"
+#include "utils/endian.h"
+#include "utils/random.h"
 
 #define MAX_TEMPLATE_SIZE 1536
 

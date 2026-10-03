@@ -4,7 +4,7 @@
 
 #include "vlan_split.h"
 
-#include "../utils/ether.h"
+#include "utils/ether.h"
 
 void VLANSplit::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::be16_t;

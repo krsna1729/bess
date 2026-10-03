@@ -5,12 +5,12 @@
 #ifndef BESS_MODULES_PORTOUT_H_
 #define BESS_MODULES_PORTOUT_H_
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../port.h"
-#include "../packet_tx_checksum.h"
-#include "../utils/mcslock.h"
-#include "../worker.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "port.h"
+#include "packet_tx_checksum.h"
+#include "utils/mcslock.h"
+#include "worker.h"
 
 class PortOut final : public Module {
  public:

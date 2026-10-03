@@ -7,9 +7,9 @@
 
 #include <atomic>
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../port.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "port.h"
 
 class PortInc final : public Module {
  public:

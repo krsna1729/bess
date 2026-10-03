@@ -77,3 +77,12 @@ same script (`env/install-deps.sh`). The container is limited to 8 CPUs and
    touches headers, benchmarks or the build.
 2. Changing the CI configuration in `ci.yml` and not locally. The configuration
    is in the script, so there is nothing to forget.
+
+## Include paths
+
+`tools/check_includes.py` rejects every `..` path component in quoted and angle
+includes, with no allowlist. D-058's 359 legacy `..` includes in 124 files were
+respelled root-relative (`"../utils/x.h"` -> `"utils/x.h"`), each to the same
+header; `core/resume_hooks/metadata.cc` uses `<metadata.h>` because the quoted
+form would find its sibling `resume_hooks/metadata.h`. No installed header path
+changed.

@@ -16,10 +16,10 @@
 #include <rte_config.h>
 #include <rte_hash_crc.h>
 
-#include "../message.h"
-#include "../metadata.h"
-#include "../module.h"
-#include "../packet.h"
+#include "message.h"
+#include "metadata.h"
+#include "module.h"
+#include "packet.h"
 #include "utils/bits.h"
 #include "utils/cuckoo_map.h"
 #include "utils/endian.h"

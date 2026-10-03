@@ -4,8 +4,8 @@
 #ifndef BESS_MODULES_REPLICATE_H_
 #define BESS_MODULES_REPLICATE_H_
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
 
 class Replicate final : public Module {
  public:

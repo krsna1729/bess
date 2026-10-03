@@ -4,8 +4,8 @@
 
 #include "mpls_pop.h"
 
-#include "../utils/ether.h"
-#include "../utils/mpls.h"
+#include "utils/ether.h"
+#include "utils/mpls.h"
 
 using bess::utils::Ethernet;
 using bess::utils::Mpls;

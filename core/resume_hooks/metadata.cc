@@ -2,8 +2,9 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "../metadata.h"
 #include "metadata.h"
+// Core metadata.h: "metadata.h" would find resume_hooks/metadata.h.
+#include <metadata.h>
 
 const std::string SetupMetadata::kName = "setup_metadata";
 

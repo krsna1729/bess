@@ -11,11 +11,11 @@
 #include <rte_hash_crc.h>
 #include <rte_ring.h>
 
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../pktbatch.h"
-#include "../utils/cuckoo_map.h"
-#include "../utils/ip.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "pktbatch.h"
+#include "utils/cuckoo_map.h"
+#include "utils/ip.h"
 
 using bess::utils::Ipv4Prefix;
 using bess::utils::CuckooMap;

@@ -4,7 +4,7 @@
 
 #include "ether_encap.h"
 
-#include "../utils/ether.h"
+#include "utils/ether.h"
 
 using bess::utils::Ethernet;
 

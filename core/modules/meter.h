@@ -7,12 +7,12 @@
 #include <set>
 #include <string>
 
-#include "../dataplane/resource.h"
-#include "../meter/meter_set.h"
-#include "../framework/resource_bindings.h"
-#include "../module.h"
-#include "../pb/module_msg.pb.h"
-#include "../rcu/rcu_ptr.h"
+#include "dataplane/resource.h"
+#include "meter/meter_set.h"
+#include "framework/resource_bindings.h"
+#include "module.h"
+#include "pb/module_msg.pb.h"
+#include "rcu/rcu_ptr.h"
 
 // Per-session metering: K5's MeterSet as a module, and its meters as a
 // transactional resource (G1.2b).

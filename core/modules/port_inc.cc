@@ -4,7 +4,7 @@
 
 #include "port_inc.h"
 
-#include "../utils/format.h"
+#include "utils/format.h"
 
 const Commands PortInc::cmds = {
     {"set_burst", "PortIncCommandSetBurstArg",

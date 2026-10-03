@@ -6,9 +6,9 @@
 
 #include <cstring>
 
-#include "../utils/ether.h"
-#include "../utils/format.h"
-#include "../utils/simd.h"
+#include "utils/ether.h"
+#include "utils/format.h"
+#include "utils/simd.h"
 
 using bess::utils::be16_t;
 using bess::utils::be32_t;
