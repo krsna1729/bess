@@ -279,6 +279,7 @@ SELF_TEST_CASES = [
     ("core/dataplane/a.h", '#include "../utils/common.h"', 1),
     ("core/modules/new_module.cc", '#include "../utils/ip.h"', 1),
     ("core/flow/a_test.cc", '#include "../packet_pool.h"', 1),
+    ("core/utils/a.h", '#include <../utils/b.h>', 1),
     ("core/utils/a.h", '#include <a/../utils/b.h>', 1),
     ("core/modules/a.cc", '#include "runtime/../utils/x.h"', 1),
     ("core/modules/a.cc", '#include <a/../utils/x.h>', 1),
