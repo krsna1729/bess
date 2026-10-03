@@ -15,7 +15,7 @@
 #include <type_traits>
 #include <utility>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 #include <rte_spinlock.h>
 
 #include "classifier/concurrent_exact.h"

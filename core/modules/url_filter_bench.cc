@@ -3,8 +3,8 @@
 
 // Benchmark for UrlFilter module.
 
+#include "utils/logging.h"
 #include <benchmark/benchmark.h>
-#include <glog/logging.h>
 
 #include "url_filter.h"
 

@@ -4,7 +4,7 @@
 
 #include "port.h"
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include <cassert>
 #include <cctype>

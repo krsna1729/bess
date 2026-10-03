@@ -112,8 +112,8 @@
 // (MEMPOOL_F_NO_IOVA_CONTIG, PlainPacketPool's shape) and EAL runs --no-huge,
 // so this builds and runs in CI and in the sandbox alike.
 
+#include "utils/logging.h"
 #include <benchmark/benchmark.h>
-#include <glog/logging.h>
 
 #include <rte_errno.h>
 #include <rte_lcore.h>

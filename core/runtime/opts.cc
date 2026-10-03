@@ -3,7 +3,7 @@
 
 #include "runtime/opts.h"
 #include "runtime/thread_placement.h"
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include <cstdint>
 

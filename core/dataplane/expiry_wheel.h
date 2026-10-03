@@ -15,7 +15,7 @@
 #include <type_traits>
 #include <utility>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "dataplane/generation_handle.h"
 #include "dataplane/strong_id.h"

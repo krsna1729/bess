@@ -8,7 +8,7 @@
 #include <set>
 #include <vector>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "runtime/runtime_state.h"
 #include "runtime/thread_placement.h"

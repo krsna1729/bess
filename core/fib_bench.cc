@@ -70,8 +70,8 @@
 
 #include <benchmark/benchmark.h>
 
+#include "utils/logging.h"
 #include <cstdlib>
-#include <glog/logging.h>
 
 #include <rte_errno.h>
 #include <rte_fib.h>

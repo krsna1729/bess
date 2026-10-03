@@ -50,8 +50,8 @@
 // Needs no EAL, no hugepages, no daemon: rings live in plain caller-owned
 // memory via the shared `utils/rte_ring_alloc.h` helpers.
 
+#include "utils/logging.h"
 #include <benchmark/benchmark.h>
-#include <glog/logging.h>
 
 #include <rte_ring.h>
 #include <rte_ring_hts.h>

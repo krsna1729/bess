@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
+#include "utils/logging.h"
 #include <benchmark/benchmark.h>
-#include <glog/logging.h>
 #include <rte_ip.h>
 
 #include <algorithm>

@@ -3,8 +3,8 @@
 
 // Benchmarks for TC / scheduler.
 
+#include "utils/logging.h"
 #include <benchmark/benchmark.h>
-#include <glog/logging.h>
 
 #include <vector>
 

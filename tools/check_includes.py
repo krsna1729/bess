@@ -182,6 +182,10 @@ def has_dotdot(inc):
     return ".." in inc.split("/")
 
 
+# The one file allowed to include glog directly (see its comment).
+LOGGING_HEADER = "core/utils/logging.h"
+
+
 def judge_include(rel_path, quote, inc, exists, layering=True, rules=None):
     """Return (reason, ...) for every rule the include breaks."""
     reasons = []
@@ -189,6 +193,11 @@ def judge_include(rel_path, quote, inc, exists, layering=True, rules=None):
         reasons.append(
             "'..' in an include path is banned: spell it relative to the "
             "include root (core/)"
+        )
+    if inc == "glog/logging.h" and rel_path != LOGGING_HEADER:
+        reasons.append(
+            "include glog through \"utils/logging.h\", which puts it after "
+            "absl logging so LOG/CHECK use glog in every translation unit"
         )
     if layering:
         target = resolve_include(rel_path, quote, inc, exists)
@@ -288,6 +297,11 @@ SELF_TEST_CASES = [
     ("core/runtime/dpdk.cc", '#include "packet_pool.h"', 1),
     ("core/utils/dpdk_memory.cc", '#include "runtime/runtime_state.h"', 1),
     ("core/runtime/thread_placement.cc", '#include "scheduler.h"', 1),
+    # glog only through utils/logging.h, which orders it after absl logging;
+    # tests included (they log too).
+    ("core/modules/a.cc", '#include <glog/logging.h>', 1),
+    ("core/dataplane/a_test.cc", '#include <glog/logging.h>', 1),
+    ("core/utils/other.h", '#include "glog/logging.h"', 1),
 ]
 
 # Includes that must pass: controls proving the rules are not over-broad.
@@ -295,7 +309,9 @@ SELF_TEST_CLEAN = [
     ("core/dataplane/a.h", '#include "utils/common.h"'),
     ("core/dataplane/a.h", '#include "strong_id.h"'),
     ("core/modules/a.cc", '#include "utils/ip.h"'),
-    ("core/modules/a.cc", '#include <glog/logging.h>'),
+    ("core/modules/a.cc", '#include <rte_mbuf.h>'),
+    ("core/modules/a.cc", '#include "utils/logging.h"'),
+    ("core/utils/logging.h", '#include <glog/logging.h>'),
     ("core/modules/a.cc", '#include "a..b/c.h"'),
     ("core/modules/a.cc", '#include "./utils/ip.h"'),
     # a layer's own directory name is not a forbidden edge

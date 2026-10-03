@@ -2,7 +2,7 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 #include <poll.h>
 #include <signal.h>
 

@@ -6,7 +6,7 @@
 
 #include <cstdlib>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 #include <gtest/gtest.h>
 
 namespace {

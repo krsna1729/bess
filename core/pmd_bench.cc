@@ -39,9 +39,9 @@
 // harness -- this exercises the exact rte_eth_rx/tx_burst boundary Phase B
 // Stage 2 must redesign, without it.
 
+#include "utils/logging.h"
 #include <benchmark/benchmark.h>
 #include <vector>
-#include <glog/logging.h>
 
 #include "drivers/pmd.h"
 #include "runtime/opts.h"

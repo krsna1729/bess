@@ -1,6 +1,6 @@
 #include "runtime/memory.h"
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 #include <gtest/gtest.h>
 
 #include <algorithm>

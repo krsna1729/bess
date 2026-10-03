@@ -9,7 +9,7 @@
 #include <string>
 #include <utility>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "control/control_plane.h"
 #include "runtime/runtime_state.h"

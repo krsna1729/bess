@@ -78,6 +78,7 @@
     "utils/ether.h": "public",
     "utils/extended_priority_queue.h": "public",
     "utils/inline_function.h": "public",
+    "utils/logging.h": "public",
     "utils/random.h": "public",
     "utils/time.h": "public"
   },

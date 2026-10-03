@@ -29,7 +29,7 @@
 #define BESS_CUCKOO_HAS_SIMD_TS 0
 #endif
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "common.h"
 #include "dataplane/batch_tuning.h"

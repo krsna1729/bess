@@ -4,7 +4,7 @@
 
 #include "module.h"
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include <algorithm>
 #include <sstream>

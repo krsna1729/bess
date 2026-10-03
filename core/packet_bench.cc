@@ -12,8 +12,8 @@
 // arithmetic, batch pointer-array copies) don't depend on which pool
 // backend supplied the underlying memory.
 
+#include "utils/logging.h"
 #include <benchmark/benchmark.h>
-#include <glog/logging.h>
 
 #include <algorithm>
 #include <array>

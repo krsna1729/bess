@@ -6,7 +6,7 @@
 #include <climits>
 #include <cstring>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 namespace bess::classifier {
 

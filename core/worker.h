@@ -5,7 +5,7 @@
 #ifndef BESS_WORKER_H_
 #define BESS_WORKER_H_
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include <cstdint>
 #include <list>

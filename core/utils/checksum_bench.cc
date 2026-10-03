@@ -6,8 +6,8 @@
 #include <rte_config.h>
 #include <rte_ip.h>
 
+#include "utils/logging.h"
 #include <benchmark/benchmark.h>
-#include <glog/logging.h>
 
 #include "ether.h"
 #include "random.h"

@@ -5,8 +5,8 @@
 
 #include <cstdlib>
 
+#include "utils/logging.h"
 #include <benchmark/benchmark.h>
-#include <glog/logging.h>
 #include <rte_memcpy.h>
 
 #include "random.h"

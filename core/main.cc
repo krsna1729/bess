@@ -7,8 +7,8 @@
 
 #include <rte_launch.h>
 
+#include "utils/logging.h"
 #include <gflags/gflags.h>
-#include <glog/logging.h>
 
 #include "dataplane/batch_tuning.h"
 #include "bessctl.h"

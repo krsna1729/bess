@@ -4,7 +4,7 @@
 
 #include "mttest.h"
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 CommandResponse MetadataTest::AddAttributes(
     const google::protobuf::Map<std::string, int64_t> &attributes,

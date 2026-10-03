@@ -7,7 +7,7 @@
 #include <sys/select.h>
 #include <unistd.h>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 #include <gtest/gtest.h>
 
 #include <csignal>

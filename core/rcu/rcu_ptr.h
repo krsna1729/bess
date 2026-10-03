@@ -8,7 +8,7 @@
 #include <mutex>
 #include <utility>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "rcu/rcu_domain.h"
 

@@ -14,7 +14,7 @@
 #include <type_traits>
 #include <utility>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "flow/flow_index.h"
 #include "flow/flow_key.h"

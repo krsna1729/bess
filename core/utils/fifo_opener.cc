@@ -7,7 +7,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "fifo_opener.h"
 

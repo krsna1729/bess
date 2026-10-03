@@ -4,7 +4,7 @@
 #ifndef BESS_UTILS_BITS_H_
 #define BESS_UTILS_BITS_H_
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 #include <x86intrin.h>
 
 #include <algorithm>

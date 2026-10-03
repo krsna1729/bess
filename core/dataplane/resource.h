@@ -14,7 +14,7 @@
 #include <type_traits>
 #include <vector>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "rcu/rcu_domain.h"
 #include "utils/inline_function.h"

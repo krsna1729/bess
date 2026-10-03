@@ -4,7 +4,7 @@
 #include <charconv>
 #include "ip.h"
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 
 #include "bits.h"
 #include "format.h"

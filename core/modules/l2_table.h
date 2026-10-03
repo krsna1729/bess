@@ -15,7 +15,7 @@
 #include <cstring>
 #include <new>
 
-#include <glog/logging.h>
+#include "utils/logging.h"
 #include <rte_hash_crc.h>
 
 #include "dataplane/batch_stages.h"
