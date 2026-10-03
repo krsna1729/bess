@@ -799,6 +799,7 @@ if get_option('build_benchmarks')
     'modules_wildcard_match_bench': ['modules/wildcard_match_bench.cc', benchmark_main_dep],
     'modules_wildcard_match_update_bench': ['modules/wildcard_match_update_bench.cc', benchmark_main_dep],
     'modules_table_scale_bench': ['modules/table_scale_bench.cc', benchmark_main_dep],
+    'modules_router_bench': ['modules/router_bench.cc', benchmark_main_dep],
     'utils_checksum_bench': ['utils/checksum_bench.cc', benchmark_main_dep],
     'utils_copy_bench': ['utils/copy_bench.cc', benchmark_main_dep],
     'utils_cuckoo_map_bench': ['utils/cuckoo_map_bench.cc', benchmark_main_dep],

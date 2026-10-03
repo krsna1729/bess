@@ -3610,6 +3610,16 @@ library, which no longer touches the egress.
 **Revisit when:** a second adapter (a fused appliance, hardware) needs a mapping
 that is not a constant offset, which would call for a table the owner supplies.
 
+
+**Addendum (2026-10-03): the mapping's per-packet cost, measured.** `GateOf` and `InterfaceOf` moved from
+`modules/router.cc` into `modules/router_gate_map.h` (unchanged code) so that `modules/router_bench.cc` times the
+module's per-packet decision on its own: a 32-id burst resolved with `LookupNextHops`, then one gate per packet,
+either the egress as stored (the pre-M7 shape) or `GateOf(egress)`. Release `-O3`, GCC 16.2.1, isolated on CPU 2
+(no device interrupts), 16 ABBA pairs in one binary: the mapping costs 5.2 ns per burst over 1,024 next hops
+(43.0 -> 48.3 ns, 16/16 pairs) and 5.4 ns over 65,536 (67.2 -> 72.6 ns, 16/16): about 0.17 ns per packet,
++12% / +8% of resolve plus mapping, a smaller share of the module's whole `ProcessBatch`. The bound check is kept:
+it is what makes a stray interface id drop instead of reaching a wrong gate.
+
 ## D-050 Explicit transaction consistency: referential vs scope-snapshot (M8)
 
 **Status:** accepted (2026-10-02).
@@ -3778,6 +3788,14 @@ the switch in one call (a prepare-then-switch request); a use needs two scopes
 to switch together; or a worker must hold a scope across task invocations.
 
 ---
+
+
+**Addendum (2026-10-03): the scope load, measured.** A scope load is `ScopeTable::Lookup`, and `ScopeTable` is
+`SlotTable<ScopeId, Version>`. The M0 paired baseline (entry 143, `docs/baselines/m0-baseline.json`) measured
+`SlotTable::Lookup` with `tools/m0_slot_table_bench.cc`: 32 lookups of live ids in 24.4 ns, about 0.76 ns per
+load with the table cache-resident, no clear difference from f4fdab03 (paired ratio 0.999, 6 pairs, isolated;
+`slot_table.h` byte-identical at the measured B, e035e892). A cold-cache or large-table load was not measured;
+the "Revisit when" condition (a shipped consumer) still decides when it is.
 
 ## D-051 DPDK build profiles: bess (software ports) and full (every NIC family)
 
@@ -4695,7 +4713,10 @@ for the first time here and is caught.
   the counter groups to separate 128-byte pairs did not remove it either; that
   layout is kept as ordinary practice, not as a measured win. The round trip, the
   handoff use, is at parity (above). A streaming consumer should measure its own
-  case; see "Revisit when".
+  case; see "Revisit when". *(Annotation, 2026-10-03: not at parity in isolation. On CPUs 2,4 under
+  `omarchy-benchmark`, the no-context channel against the bare pointer ring was +23% / +26% round trip at bursts
+  8 / 32 (0/32 ABBA pairs favourable) and +19% one-way at burst 32, with device interrupts on CPU 4 (vmd0 168, iwlwifi 54) shared by both rows. See
+  MODERNIZATION.md entry 146.)*
 - The benchmark is noisy (powersave, a loaded desktop): a single run of a row
   can be 30% off, which is why the claims above are paired. The matrix was run
   with the counter groups 64 bytes apart; the A/B runs that follow the change to
@@ -4727,6 +4748,8 @@ for the first time here and is caught.
   on a13f4da1; cause and fix in MODERNIZATION.md entry 141: duplicated DPDK link flags hung GNU ld.)*
 - **One-way streaming slowdown:** not yet investigated further; the ranked hypotheses and experiments are in a
   local plan (not committed). It is tracked and will be measured under `omarchy-benchmark`. No cause is claimed.
+  *(Annotation: isolated runs show the round trip affected too; ring placement mod 128 (H1) is refuted. Entry
+  146.)*
 - **Counter layout matrix:** the main matrix used 64-byte counter groups; a limited A/B after moving the groups
   to 128 bytes agrees, but a full matrix and cache-line-traffic table have not been captured.
 - **Full-suite verification:** the M11 worktree agent did not run the whole suite; the parent ran it on the

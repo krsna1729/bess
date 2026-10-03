@@ -4858,6 +4858,19 @@ rather than one call site).
      - Isolated, one run, 4 KB pages for every size: 10M hot 15.9 / 7.6 ns (scalar / batch 32), uniform 132.5 /
        36.8 ns, miss 45.4 / 14.8 ns; 64 B of slab per flow. Raw output `docs/baselines/flow-shared-10m.json`.
 
+146. **M7 and M8 open costs measured (D-049 and D-050 addenda); M11 streaming H1 refuted.**
+     - **M7:** `modules/router_gate_map.h` holds the Router module's interface <-> gate mapping (moved, unchanged);
+       `modules_router_bench` times it: 5.2 / 5.4 ns per 32-packet burst at 1K / 64K next hops (about 0.17 ns per
+       packet), 16/16 ABBA pairs, isolated.
+     - **M8:** the scope load is `SlotTable::Lookup`, already in the M0 baseline: about 0.76 ns per load
+       (cache-resident), no difference from f4fdab03.
+     - **M11 one-way streaming (D-054 open item), first steps, isolated on CPUs 2,4:** the channel against the bare
+       pointer ring is +19% one-way at burst 32 and +23% / +26% round trip at bursts 8 / 32 (0/32 pairs
+       favourable), so the round trip is not at parity as D-054 recorded; hypothesis H1 (ring placement mod 128)
+       is refuted: moving the bare ring or the channel's ring by 64 bytes changed nothing (16 pairs each). CPU 4
+       had device interrupts in both windows (step 0: vmd0 168, iwlwifi 54; H1: ASUE1213 4,114, vmd0 834,
+       thunderbolt 141, iwlwifi 103); every compared row shared its window.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
