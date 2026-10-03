@@ -182,3 +182,15 @@ Two kinds of thread run BESS code, and each owns different things. This is what 
 
 What this forbids: control code on a worker, a worker calling into `control/`, a reusable library naming the control plane (section 2, rules 1-3), and a module freeing a published object directly instead of retiring it.
 
+## 10. Fast-Path Invariants
+
+Packet-path code runs in bounded batches. It must not allocate or wait for the
+control plane; state and workspaces are prepared before the packet loop. Shared
+mutable state requires an explicit synchronization design; worker-owned state is
+preferred when the workload permits it. Keep typed operations close to their
+machine representation and avoid unnecessary memory indirection.
+
+These are architectural constraints, not fixed cache-line or instruction-count
+promises. The backend-specific measurements and targets are in
+`docs/performance-contract.md`.
+

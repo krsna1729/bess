@@ -4439,8 +4439,11 @@ rather than one call site).
        (my scratch plus earlier sessions') made `test_shutdown` fail.
      - **Numbers:** 12 GB to 240 MB; core-file edit to all binaries 4 s; link of
        a 55 MB test 3.1 s (GNU ld) to 0.27 s (mold); cold build 174 s.
-     - **Not done:** the 100 MB target (needs merged test binaries), a DPDK
-       trim, slimmer widely-included headers.
+     - **Accepted non-goal:** the tree is 240 MB (205 MB of test binaries), not the
+       aspirational 100 MB. The user chose to keep per-test isolation and parallel
+       scheduling rather than merge binaries (2026-10-02). Revisit only if growth
+       makes tree size a practical limit. Also not done: slimmer widely-included
+       headers.
      - **Evidence:** fast tree 98/98 tests after the change.
 
 129. **M7: logical network identities (D-049).**
@@ -4684,6 +4687,8 @@ rather than one call site).
        non-goal with a revisit condition), the rewrite of the grandfathered `..` includes,
        `sample_plugin` is not an installed-artifacts consumer, and the architecture document's
        "fast-path invariants" item (M0 list) has no section in architecture.md (docs/performance-contract.md holds the performance side).
+       **Later closed:** the `..` rewrite (entry 139) and the fast-path invariants section
+       (`docs/architecture.md` section 10).
 
 138. **Execution layering: no grandfathered link edges left (D-057).**
      - **What:** `bess_runtime` is retired. A new bottom library `bess_eal` holds DPDK bring-up,
@@ -4703,6 +4708,33 @@ rather than one call site).
        paired M0 baseline.
      - **Behaviour change:** `InitDpdk` no longer marks the calling thread as a non-worker; the default
        packet pools do it instead, so callers that only start the EAL lazily keep their thread state.
+
+139. **Closure tranche: legacy `..` includes, M1 code size, M10 evidence (D-058 addendum, D-047, D-053).**
+     - **`..` includes:** all 359 grandfathered pairs in 124 files are respelled root-relative
+       in the existing quoted style; one `<metadata.h>` where a sibling header would shadow the quoted
+       form. The baseline file and its checker machinery are deleted; `..` is refused everywhere in
+       `core/`. Proof that every include resolves to the same header: `ninja -t deps` lists the same headers for all 369
+       fast-tree objects as the base tree. Fast suite 112/112. Review found that re-sorting the includes
+       switched `l2_forward.cc` from glog to absl `LOG`/`CHECK` (include order decided the macros); fixed,
+       and all 369 objects now compile to the base tree's instruction sequences.
+     - **M1 code size (closes D-047's open item):** `3c3eb61f` vs `5e571feb`, GCC 16 `-O3`, same DPDK,
+       cold builds. `bessd` 6,601,676 B both sides, `.text` 4,075,483 B both; `packet_bench` `.text`
+       4,213,787 B both (-64 B `.rodata`, -32 B `.data.rel.ro`). Defined global symbol sets identical;
+       the `.text` of all 135 paired objects byte-identical; the linked `.text` bytes differ (placement).
+       Build time was not compared.
+     - **M10:** the `Refresh` assembly was inspected (no list operations for a later deadline; the
+       owner-side store does not call the wheel). TSan does not apply: the wheel is single-threaded by
+       contract with no cross-thread API. Isolated (`omarchy-benchmark`) refresh timings are recorded as
+       provisional because IRQ and softirq activity remained on the isolated CPU.
+     - **Accepted by the user:** the 240 MB fast tree (D-048) and a reference consumer in place of a
+       production one (D-053, D-054).
+     - **Found, not fixed (pre-existing):** 25 TUs (`main.cc`, `worker.cc`, `port.cc`, `packet_pool.cc`,
+       `drivers/pmd.cc`, ...) log through absl, not glog, because protobuf's absl logging is included
+       after glog there; `bessd` never initialises absl logging, so those lines miss glog's files and `--v`.
+     - **Open:** the e035e892 CI run's Clang lanes stalled 4 h in the build and were cancelled (GCC lanes
+       passed; a local Clang 22 build of the same lane takes 403 s). Re-run CI and diagnose if it recurs.
+     - **Not done:** the M0 paired baseline, the M6 Router check, M10 10M and `rte_timer` 1M points,
+       the SharedFlowTable 10M row, the M11 streaming slowdown.
 
 ## Review process established this session
 

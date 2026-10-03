@@ -3478,6 +3478,11 @@ exists.
   subset. They need Release builds and benchmark time and are not started.
 - M1's binary code-size comparison and the `route/**` to `module.h` include
   rule for `router.h` (blocked on M7).
+  **Code size closed (2026-10-03):** `3c3eb61f` vs `5e571feb` (GCC 16 `-O3 -march=x86-64-v3`, same DPDK, cold):
+  `bessd` total and `.text` (4,075,483 B) equal; `packet_bench` `.text` (4,213,787 B) equal, `.rodata` -64 B and
+  `.data.rel.ro` -32 B; defined global symbol sets equal; all 135 paired objects' `.text` byte-identical; linked
+  `.text` bytes differ (same size; placement and relocation, not object code). Build time was not compared.
+  MODERNIZATION.md entry 139.
 - `bess_execution` split out of `bess_framework`. **Closed by D-057** (the split needed definition
   relocations and an EAL library, not only file moves).
 
@@ -3527,9 +3532,9 @@ the benchmark targets not built in this profile.
 
 **Not done.**
 
-- The 100 MB target. Executables are 92 files totalling 205 MB; reaching 100 MB
-  needs the tests merged into a dozen or so binaries. That trades per-test
-  isolation and parallel scheduling for size, and was not attempted.
+- The aspirational 100 MB target was not met: 92 test executables total 205 MB. The user accepted
+  the 240 MB fast tree on 2026-10-02 and chose to retain per-test isolation and parallel scheduling
+  rather than merge binaries. Closed as a non-goal unless tree growth makes it a practical limit.
 - Widely included headers: `module.h` is included by 147 translation units,
   `packet.h` by 162 and `utils/endian.h` by 113, so an edit to them rebuilds
   minutes of work whatever the linker.
@@ -4285,6 +4290,37 @@ The owner-side store is free within noise. The engine's lazy refresh costs
 about 1.4 ns at 1K flows and 17 ns at 1M, because it touches a second array.
 Scanning a 1M-flow table takes about 3.0 ms (3 ns per flow) in one pass.
 
+*Refresh-path assembly and isolated follow-up.* The probe is
+
+```cpp
+#include "dataplane/expiry_wheel.h"
+using Wheel = bess::dataplane::ExpiryWheel<uint64_t>;
+extern "C" __attribute__((noinline)) bool RefreshProbe(Wheel *wheel,
+    bess::dataplane::ExpiryHandle handle, uint64_t deadline) noexcept {
+  return wheel->Refresh(handle, deadline);
+}
+```
+
+compiled with `g++ -std=c++23 -O3 -march=x86-64-v3 -DGLOG_USE_GLOG_EXPORT -Icore -S` (GCC 16.2.1).
+The SHA-256 of that `-S` output was `a45464787eeed02b498118b53dfb24b31da6759302e3485671806007ea6b983b`; the
+file embeds its source path and the compiler's ident string, so the hash only reproduces with the same
+path and compiler build. The shape below is what matters. The generated code bounds-checks
+the index, computes the 32-byte node address, checks generation/armed/delivery state, compares the new
+deadline with the stored one and stores it. A later or equal deadline returns without unlink/relink;
+an earlier deadline takes that path. The owner-side packet branch stores `last_seen` directly and does
+not call the wheel.
+
+A bounded follow-up ran only `BM_Refresh` for 1K and 64K timers, three repetitions, under
+`omarchy-benchmark --isolate --cpu 2 --diagnose` (performance governor). Lazy-wheel medians were
+1.386/1.332 ns (uniform/hot-1%) at 1K and 3.638/1.377 ns at 64K; eager-wheel medians were
+5.866/5.900 and 15.724/5.738 ns. The wrapper still reported CPU2 activity (7,426 local timer IRQs,
+8,131 scheduler softirqs, 3,675 RCU softirqs); these are provisional, not a clean paired comparison.
+Raw output and assembly were kept in local scratch only (not committed).
+
+**ThreadSanitizer applicability.** No TSan build was run. `ExpiryWheel` is worker-owned, single-threaded,
+and has no cross-thread API or atomics. A single-thread TSan run would provide no race evidence; adding
+a concurrency test would assert a contract the API does not have. Revisit if the API gains cross-thread access.
+
 *Layering and packaging:* include checker 16-case self-test and clean run; link
 graph 18 libraries, 46 edges, 6 grandfathered, no violations (no new library, so
 `docs/baselines/dependency-graph.json` is unchanged); staged install: 66 curated
@@ -4314,12 +4350,8 @@ headers present and compiling with `-Wall -Wextra -Werror`.
 - **The 10M-timer benchmark was not re-run after the last header edit.** An
   earlier run (before the final change) showed 32 bytes per timer and 207 ns per
   expiry at 10M, but those numbers are not quoted above.
-- **No ThreadSanitizer run.** The wheel is single-threaded by design and no
-  concurrency test exists. GCC 14 and Clang 19 are left to CI.
-- **No assembly inspection of the refresh path.** Its cost is measured above, not
-  explained at instruction level.
-- **The owner-side refresh is documented and tested but no module uses it.** No
-  production consumer exists yet; the reference consumer is a test.
+- **ThreadSanitizer:** not applicable to the documented single-thread/worker-owned contract (evidence above); there is no cross-thread API. GCC 14 and Clang 19 are left to CI.
+- **The owner-side refresh is documented and tested but no production module uses it.** The public reference-consumer test is sufficient for M10; production adoption is not a milestone exit condition.
 - **Frequency was not pinned** (governor `powersave`), so absolute nanoseconds
   carry that uncertainty. Ratios are more reliable than absolute values.
 - **No timer-wheel statistics are exported.** Counters for late polls, moves
@@ -4611,14 +4643,23 @@ for the first time here and is caught.
   `core/runtime/dpdk.cc` that was not made here.
 - **Mutation testing: nine mutants, all caught**; none of them attacks the MP/SC and MP/MC enqueue paths specifically
   (all three topologies share the bookkeeping that was mutated; the ring calls themselves are DPDK's).
-- **Still open, unchanged:** cross-NUMA handoff (one node); a graph adapter and a production consumer; an SP/SC
-  role-misuse detector (a debug-only owner check is feature work, not a test, and was not started); GCC 14 and Clang 19
-  (Clang 22 syntax check only); the one-way streaming slowdown (plan, hypotheses, experiments and time boxes in
-  `.scratch/streaming-plan.md`; needs a quiet machine and the `performance` governor); the main matrix was
-  measured with 64-byte counter groups, before the change to 128 (later A/B runs agree; re-running the matrix
-  needs a quiet machine too); no systematic cache-line-traffic table.
-- **Not run here:** the full `meson test` suite (only `continuation.h`'s default instantiation, two test files and
-  `docs/handoff.md` changed: the three affected test binaries pass, standalone and 3/3 pinned to one and two CPUs).
+- **Cross-NUMA:** not measured; this host has one NUMA node. Revisit on a two-node host if a consumer needs
+  remote handoff placement evidence.
+- **Graph adapter / production consumer:** not required for M11 closure; the user accepts the reference consumer
+  test, and no production slow-path consumer exists yet. Add a graph adapter when one such consumer needs it.
+- **SP/SC role-misuse detector:** not implemented. Topology is a compile-time choice; a debug owner checker is
+  additional feature work, not required to establish the channel contract.
+- **Compiler coverage:** the M11 code at `627fa286` passed the GCC 14 and Clang 19 CI lanes (run 37001729024).
+  The follow-up `ContinuationTable::Resolve` seam was syntax-checked with Clang 22. The e035e892 CI run's GCC
+  lanes passed; both Clang lanes stalled for 4 hours in the build and the run was cancelled (a local Clang 22
+  build of the same lane completes in 403 s). Open item in MODERNIZATION.md entry 139.
+- **One-way streaming slowdown:** not yet investigated further; the ranked hypotheses and experiments are in a
+  local plan (not committed). It is tracked and will be measured under `omarchy-benchmark`. No cause is claimed.
+- **Counter layout matrix:** the main matrix used 64-byte counter groups; a limited A/B after moving the groups
+  to 128 bytes agrees, but a full matrix and cache-line-traffic table have not been captured.
+- **Full-suite verification:** the M11 worktree agent did not run the whole suite; the parent ran it on the
+  merged e035e892 tree, 112/112 passed. The three affected binaries also passed standalone and 3/3 pinned to
+  one and two CPUs.
 
 **Revisit when:** a streaming consumer (reassembly into crypto, DPI) is
 throughput-bound on the handoff and a profile shows the ring (then the one-way
@@ -4750,7 +4791,7 @@ benchmark shows the layout change cost more than noise.
 ## D-058 M1/M2 closure: enforceable include rules, classified installs
 
 **Status:** accepted (2026-10-02), with the exceptions under "Not done".
-**Code:** `tools/check_includes.py`, `tools/include_dotdot_baseline.txt`, `tools/api_classes.json`, `tools/check_installed_headers.py`, `tools/public_proto_closure.py`, `protobuf/meson.build` (`public_pb_headers`), `core/meson.build` (`check_layer_includes_self_test`), `tools/ci_profile.py` (`clean-tree`), `.github/workflows/ci.yml`, `docs/architecture.md` (sections 2, 5, 9), `docs/plugin-api.md`, `docs/ci-parity.md`.
+**Code:** `tools/check_includes.py`, `tools/include_dotdot_baseline.txt` (deleted by the addendum below), `tools/api_classes.json`, `tools/check_installed_headers.py`, `tools/public_proto_closure.py`, `protobuf/meson.build` (`public_pb_headers`), `core/meson.build` (`check_layer_includes_self_test`), `tools/ci_profile.py` (`clean-tree`), `.github/workflows/ci.yml`, `docs/architecture.md` (sections 2, 5, 9), `docs/plugin-api.md`, `docs/ci-parity.md`.
 
 **Context.** An outside review of `627fa286` found that several M1/M2 exit criteria were prose, not checks. (1) `check_includes.py` matched substrings of the *spelled* include, resolved nothing, and banned `..` nowhere; 359 `..` includes existed (all in `modules/`, `drivers/`, `gate_hooks/`, `resume_hooks/`, `framework/`, `utils/`, none in a layered library) and its self-test was only run by the CI `layers` step, and re-implemented the matching loop instead of calling it. (2) `protobuf/meson.build` installed the whole generated `pb/` directory: 9 protocols as `.pb.h`, `.pb.cc`, `.grpc.pb.h` and `.grpc.pb.cc`, though the public headers need five `.pb.h` (M2 exit: recursive installation removed). (3) The public/experimental split lived in `docs/architecture.md` and `docs/plugin-api.md` and in one flat `PUBLIC_REQUIRED` list that never checked the installed set was *only* that list. (4) `docs/plugin-api.md` still called the descriptor "metadata only" and never mentioned the API range or capabilities. (5) The scout found no `#include <bess/...>` and listed it as an M1 deliverable. (6) Nothing checked that a build leaves the source tree clean. (7) `docs/architecture.md` had no control-vs-dataplane section (the M0 text lists one).
 
@@ -4768,11 +4809,76 @@ benchmark shows the layout change cost more than noise.
 
 **Not done.**
 
-- The 359 grandfathered `..` includes are not rewritten. The rewrite is mechanical (`"../utils/x.h"` to `"utils/x.h"`, the same file) and no-codegen, but it touches 124 files in `core/modules`, `drivers`, `gate_hooks`, `resume_hooks`, `framework`, `utils` that other branches are editing; the baseline is the owner (M1 include hygiene) and shrinks with each file touched. Removal phase: a pass with no branches in flight, before the M2 API freeze.
+- The 359 grandfathered `..` includes are not rewritten. The rewrite is mechanical (`"../utils/x.h"` to `"utils/x.h"`, the same file) and no-codegen, but it touches 124 files in `core/modules`, `drivers`, `gate_hooks`, `resume_hooks`, `framework`, `utils` that other branches are editing; the baseline is the owner (M1 include hygiene) and shrinks with each file touched. Removal phase: a pass with no branches in flight, before the M2 API freeze. **Closed by the D-058 addendum below:** all 359 were rewritten, `tools/include_dotdot_baseline.txt` and `--emit-dotdot-baseline` are gone, and `..` is refused with no exception.
 - `<bess/...>` (above).
 - `sample_plugin` is an in-tree build (it uses `core_include`), not an installed-artifacts consumer; only `examples/standalone_plugin` proves the installed contract. Converting `sample_plugin` was not asked and would lose its coverage of in-tree plugin loading.
 - The install lists remain in two places (`core/meson.build` and `tools/api_classes.json`); the checker makes drift a failure on the staged install (`verify-install`), not at configure time.
 - The classification table does not yet separate "public for plugin authors" from "public for application authors" (`instance_registry.h`, `module_init_context.h`).
 - Only the GCC 16 compile of the conformance plugin was run here; the CI lanes (GCC 14, Clang 19) run it for real.
 
-**Revisit when:** a header is promoted or demoted (edit the table in the same change); the plugin API version is bumped for a source break (the one moment an install-layout change to `include/bess/<layer>` is cheap, and `<bess/...>` could land with it, together with the baseline rewrite); or the install lists move into one generated manifest.
+**Revisit when:** a header is promoted or demoted (edit the table in the same change); the plugin API version is bumped for a source break (the one moment an install-layout change to `include/bess/<layer>` is cheap, and `<bess/...>` could land with it); or the install lists move into one generated manifest.
+
+### D-058 addendum: the legacy `..` includes are gone; `..` is banned with no allowlist
+
+**Status:** accepted (2026-10-03), addendum to D-058.
+
+**Code:** `tools/check_includes.py` (baseline loading, allowlist, stale-entry check and
+`--emit-dotdot-baseline` removed), `tools/include_dotdot_baseline.txt` (deleted), 124 files under
+`core/modules`, `core/drivers`, `core/gate_hooks`, `core/resume_hooks`, `core/framework`, `core/utils`,
+`docs/architecture.md`, `docs/ci-parity.md`.
+
+**Context.** D-058 banned `..` in include paths but grandfathered 359 existing `(file, include)` pairs in
+124 files, so the rule held only for new code and the checker carried a baseline file and its machinery.
+
+**Decision.** Every pair is respelled root-relative in the tree's existing quoted convention
+(`"../utils/x.h"` -> `"utils/x.h"`; 284 such includes already existed, no angle-form project includes did).
+Each replacement was generated from the checker's own resolver: the old include's resolved target is the
+new spelling, and the quoted form is used only where it resolves to that same target. One exception:
+`core/resume_hooks/metadata.cc` includes core `metadata.h` as `<metadata.h>` (with a comment), because
+`"metadata.h"` would find its sibling `resume_hooks/metadata.h`, which it also includes. The checker now
+refuses any `..` component in quoted and angle includes, everywhere under `core/`, with no exceptions.
+
+**Evidence.**
+- Rewrite verifier (throwaway scripts, not committed): 359 pairs, 124 files,
+  358 quoted, 1 angle; target equality checked per pair.
+- Actual compiler resolution: `ninja -t deps` of all 369 objects in this fast tree vs the main tree's
+  fast tree at base e035e892 (same options): 0 objects differ in the set of headers read
+  (the parent re-ran the comparison independently). This covers the `-I` search order, not just the
+  checker's model.
+- `check_includes.py --self-test`: 37 bad includes (41 violations, after the restored case below), 8 clean
+  controls; scan: 503 files, 0.
+- `check_link_graph.py --build-dir build/fast`: 19 libraries, 51 edges, 0 grandfathered, no violations.
+- Full suite, `meson test -C build/fast --no-rebuild --num-processes 4` under the build lock: 112/112.
+- Clang 22 `-fsyntax-only` with the Meson flags on all 53 rewritten `.cc` TUs (43 modules, 3 drivers,
+  3 gate_hooks, 2 resume_hooks, 1 framework, 1 utils): pass. 16 of the 71 rewritten headers are not
+  included by those TUs; one including TU each was checked as well (16 TUs, no diagnostics).
+- Staged install (`meson install --destdir`), `check_installed_headers.py`: all checks passed; the three
+  standalone example plugins build against the staged headers.
+- Earlier: GCC 16 `acl.cc` instruction bytes identical before/after (4,372 instructions).
+- Review (default reviewer model): no sibling-shadowing collision besides `metadata.cc`; it asked for the
+  include order to be re-sorted in 8 files (`"../x.h"` had sorted before a sibling) and for leftover blank
+  lines in `check_includes.py` to go.
+- **The re-sort changed behaviour in one file, found in the parent's own review.** In `modules/l2_forward.h`
+  sorting put `l2_table.h` (which includes glog) before `module.h` (which brings in protobuf's absl
+  logging). Both define `LOG`/`LOG_IF`/`VLOG` and glog's `CHECK` expands through `LOG_IF`; the second of the two
+  to be included first wins, and later includes are no-ops behind include guards. `module.h` includes absl
+  logging and then glog, so glog wins; with `l2_table.h` first, absl came second, and `l2_forward.cc` switched to absl logging
+  (absl `log_internal` symbols 6 -> 15, glog 17 -> 14, `.text` +693 B). `l2_table.h` is now in its own include
+  block after `module.h`, with a comment, so clang-format keeps it there. Proof that nothing else changed:
+  all 369 fast-tree objects have the base tree's symbol sets and instruction sequences (only data offsets
+  differ, from shorter `__FILE__` strings).
+- **The glog/absl collision is pre-existing and active, not only latent** (found by the reviewer, Opus 5.5):
+  in 25 of the 127 TUs that include both, absl is included second, so their `LOG`/`CHECK`/`VLOG` go to absl
+  in the base tree too, among them `main.cc`, `worker.cc`, `port.cc`, `packet_pool.cc` and `drivers/pmd.cc`.
+  `bessd` initialises only glog (`google::InitGoogleLogging`), so those messages bypass glog's log files and
+  `--v`. Not fixed here; tracked as an open item (MODERNIZATION.md entry 139).
+- The `<../utils/b.h>` self-test case (a leading `..` in angle form), dropped in the rewrite, is restored;
+  turning the ban off fails the self-test.
+
+**Not done.** No benchmark-only TU was built (the fast profile builds none); no performance measurement
+(the change is spelling only, and the deps comparison shows identical inputs). GCC 14 / Clang 19 (CI
+versions) not run locally. `..` includes outside `core/` are not scanned (the checker's scope is `core/`).
+
+**Revisit when.** The include root or installed header layout changes (e.g. the `<bess/...>` spelling,
+still a non-goal): re-run the deps comparison, since quoted root-relative includes rely on no sibling
+file shadowing the target.
