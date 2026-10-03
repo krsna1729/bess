@@ -35,6 +35,9 @@ jobs:
           lint: false
           format: false
           push: false
+          # The result is the check's status; commenting would need
+          # pull-requests: write, which this workflow does not grant.
+          pr_comment: false
           breaking: true
           breaking_against: ${{ github.event.repository.clone_url }}#branch=${{ github.base_ref }},subdir=protobuf
       - name: Against the previous commit
