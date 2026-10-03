@@ -442,24 +442,29 @@ void OneWay(benchmark::State &state) {
   }
   typename Ops::Ring *ring = Ops::Create();
   std::atomic<bool> stop{false}, ready{false};
-  std::atomic<uint64_t> consumed{0};
+  std::atomic<uint64_t> consumed{0}, nonempty_polls{0}, empty_polls{0};
   std::thread consumer([&] {
     PinToNth(1);
     alignas(64) std::byte buffer[kMaxBurst * kMaxItemBytes];
     SpinGuard guard;
-    uint64_t count = 0;
+    uint64_t count = 0, nonempty = 0, empty = 0;
     ready.store(true, std::memory_order_release);
     while (!stop.load(std::memory_order_relaxed)) {
       const unsigned m = Ops::Deq(ring, buffer, kMaxBurst);
       count += m;
       if (m != 0) {
+        nonempty++;
         for (int64_t i = 0; i < pace; i++) {
           asm volatile("pause");
         }
+      } else {
+        empty++;
       }
       guard.Check();
     }
     consumed.store(count, std::memory_order_relaxed);
+    nonempty_polls.store(nonempty, std::memory_order_relaxed);
+    empty_polls.store(empty, std::memory_order_relaxed);
   });
   PinToNth(0);
   while (!ready.load(std::memory_order_acquire)) {
@@ -467,7 +472,7 @@ void OneWay(benchmark::State &state) {
 
   alignas(64) std::byte buffer[kMaxBurst * kMaxItemBytes];
   SpinGuard guard;
-  uint64_t accepted = 0, refused = 0, seq = 0;
+  uint64_t accepted = 0, refused = 0, seq = 0, enq_calls = 0;
   const auto start = std::chrono::steady_clock::now();
   for (auto _ : state) {
     Fill<E>(buffer, burst, seq);
@@ -475,6 +480,7 @@ void OneWay(benchmark::State &state) {
     if (pace == 0) {
       for (unsigned sent = 0; sent < burst;) {
         const unsigned k = Ops::Enq(ring, buffer + sent * E, burst - sent);
+        enq_calls++;
         sent += k;
         accepted += k;
         guard.Check();
@@ -504,6 +510,15 @@ void OneWay(benchmark::State &state) {
   state.counters["refused_fraction"] =
       static_cast<double>(refused) / (iterations * burst);
   state.counters["bytes_per_item"] = E;
+  // The closed loop's phase (D-054 streaming item, H2): how the consumer's
+  // batches and empty polls, and the producer's retries, settle for this ring.
+  const double items = static_cast<double>(consumed.load());
+  state.counters["consumer_items_per_nonempty_deq"] =
+      nonempty_polls.load() ? items / static_cast<double>(nonempty_polls.load()) : 0;
+  state.counters["consumer_empty_polls_per_item"] =
+      items > 0 ? static_cast<double>(empty_polls.load()) / items : 0;
+  state.counters["producer_enq_calls_per_burst"] =
+      pace == 0 ? static_cast<double>(enq_calls) / iterations : 1;
   state.SetItemsProcessed(state.iterations() * burst);
   Ops::Destroy(ring);
 }
