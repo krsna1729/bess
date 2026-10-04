@@ -65,54 +65,26 @@ TEST(MatchTest, Hashes32x4EqualDefinition) {
 
 constexpr uint64_t kMask = 0x8000ffffFFFFffffull;  // L2Forward's key bits
 
-struct Bucket {
-  alignas(32) uint64_t words[4] = {};
-  bool Find(uint64_t want, uint64_t *found) const {
-    return FindMaskedWord64x4(
-        words, kMask, want,
-        [this](unsigned i) { return __atomic_load_n(&words[i], __ATOMIC_RELAXED); },
-        found);
-  }
-};
-
-TEST(MatchTest, MaskedWord64x4FindsTheFirstMatchUnderTheMask) {
+// Every word that matches under the mask is a candidate, whatever the bits
+// outside the mask hold. (A candidate need not match: the caller re-checks.)
+TEST(MatchTest, MaskedWordCandidatesIncludeEveryMatch) {
   std::mt19937_64 rng(17);
+  alignas(32) uint64_t words[4];
   for (int trial = 0; trial < 20000; trial++) {
-    Bucket b;
     // Keys from a small alphabet, occupied bit random, payload (the bits
-    // outside the mask) random: the payload must not affect matching.
-    for (auto &w : b.words) {
+    // outside the mask) random.
+    for (auto &w : words) {
       w = (rng() % 3) | (rng() & ~kMask) | ((rng() & 1) << 63);
     }
     const uint64_t want = (rng() % 3) | (1ull << 63);
-    int first = -1;
-    for (int i = 3; i >= 0; i--) {
-      if ((b.words[i] & kMask) == want) first = i;
+    unsigned matches = 0;
+    for (int i = 0; i < 4; i++) {
+      matches |= unsigned{(words[i] & kMask) == want} << i;
     }
-    uint64_t found = 0;
-    ASSERT_EQ(first >= 0, b.Find(want, &found));
-    if (first >= 0) {
-      ASSERT_EQ(b.words[first], found);
-    }
+    const unsigned candidates = MaskedWordCandidates64x4(words, kMask, want);
+    ASSERT_EQ(matches, candidates & matches) << std::hex << candidates;
+    ASSERT_EQ(0u, candidates & ~0xfu);
   }
-}
-
-// The word handed back is the one `load` returned, and a candidate that
-// `load` no longer confirms is rejected: the writer replaced it between the
-// bucket read and the re-read.
-TEST(MatchTest, MaskedWord64x4TrustsOnlyLoadedWords) {
-  alignas(32) uint64_t words[4] = {0, 0, 5 | 1ull << 63, 0};
-  const uint64_t want = 5 | 1ull << 63;
-  uint64_t found = 0;
-  const uint64_t replaced = 6 | 1ull << 63;
-  EXPECT_FALSE(FindMaskedWord64x4(
-      words, kMask, want,
-      [&](unsigned i) { return i == 2 ? replaced : words[i]; }, &found));
-  const uint64_t new_payload = want | (uint64_t{0x1234} << 48);
-  ASSERT_TRUE(FindMaskedWord64x4(
-      words, kMask, want,
-      [&](unsigned i) { return i == 2 ? new_payload : words[i]; }, &found));
-  EXPECT_EQ(new_payload, found);
 }
 
 // Bytes 0..23 of a buffer hold 1..24. The kernels touch 16 bytes; the bytes

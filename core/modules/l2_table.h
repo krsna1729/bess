@@ -182,25 +182,27 @@ inline uint64_t l2_make_slot(uint64_t addr, gate_idx_t gate) {
 }
 
 // Returns the gate stored in the bucket for `addr` (occupied), or -1. Only
-// words read with one atomic load are trusted: a key match and its gate come
-// from the same word even while the writer changes the bucket. Four-slot
-// buckets use the architecture's probe (one vector load on x86 with AVX2,
-// D-017 amendment), others this loop.
+// words read with one atomic load are trusted: a candidate found by the
+// architecture's 4-slot filter (one vector load on x86 with AVX2, D-017
+// amendment; every slot elsewhere) is re-read as one word and re-checked, so
+// a key match and its gate come from the same word even while the writer
+// changes the bucket.
 inline int l2_probe_bucket(uint64_t addr, const struct l2_entry *bucket,
                            uint64_t slots) {
   const uint64_t want = addr | (1ull << 63);
-  uint64_t word;
   if (slots == 4) {
-    if (bess::arch::FindMaskedWord64x4(
-            bucket, kL2KeyMask, want,
-            [bucket](unsigned i) { return l2_load_slot(&bucket[i]); },
-            &word)) {
-      return static_cast<int>((word >> 48) & 0x7fff);
+    for (int m = static_cast<int>(bess::arch::MaskedWordCandidates64x4(
+             bucket, kL2KeyMask, want));
+         m != 0; m &= m - 1) {
+      const uint64_t word = l2_load_slot(&bucket[__builtin_ctz(m)]);
+      if ((word & kL2KeyMask) == want) {
+        return static_cast<int>((word >> 48) & 0x7fff);
+      }
     }
     return -1;
   }
   for (uint64_t i = 0; i < slots; i++) {
-    word = l2_load_slot(&bucket[i]);
+    const uint64_t word = l2_load_slot(&bucket[i]);
     if ((word & kL2KeyMask) == want) {
       return static_cast<int>((word >> 48) & 0x7fff);
     }
