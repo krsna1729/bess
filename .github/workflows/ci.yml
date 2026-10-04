@@ -8,9 +8,9 @@ on:
     branches: [master, develop]
 
 # A new push to a pull request cancels its older run; pushes to develop,
-# master and tags each run to completion.
+# master and tags are never grouped (each run completes).
 concurrency:
-  group: ci-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:

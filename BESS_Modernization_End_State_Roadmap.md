@@ -5628,8 +5628,8 @@ not a reason.
 
 ### L.1.2 Small-scope protocol models in C++ (A1+)
 
-The protocols that have caused or nearly caused review findings get a compact abstract state machine in C++. A
-test enumerates every interleaving of its actions up to a small bound (for example 2 readers, 2 generations,
+The protocols that have caused or nearly caused review findings will get a compact abstract state machine in C++
+(none exists yet; these three are the next assurance work items). A test enumerates every interleaving of its actions up to a small bound (for example 2 readers, 2 generations,
 3 resources, 2 requests) and asserts the invariants in every reachable state. The model holds only the semantic
 state (resources, references, generations, readers, owners, epochs), never the production containers, allocators
 or DPDK calls. It is a test, not a proof: it excludes violations only within the explored bound.
@@ -5682,7 +5682,7 @@ none adds hot-path cost:
 | Item | Gate to start | Kill criterion |
 |---|---|---|
 | TLA+/TLC pilot: M8 transaction publication (`spec/tla/Transactions.tla`) | the A1+ C++ model exists and its invariants are stable for one release | after the pilot: ADOPT if it found a real defect or states the contract materially better than the C++ model; LIMIT to that protocol if useful only there; STOP if it costs more than the risk it removes |
-| TLA+ for M20 async offload lifecycle (MARK IDs, install/remove/reset, delayed completions) | before any async hardware rule code (M20 is blocked on hardware) | same three-way decision |
+| TLA+ for M20 async offload lifecycle (MARK IDs, install/remove/reset, delayed completions) | before the rte_flow async/template path is built (D-070's hardware matrix is blocked on hardware) | same three-way decision |
 | TLA+ for M11 handoff and M27 retry/epoch | the M8 pilot decides ADOPT | same |
 | Lean pilot: classifier semantics (exact, masked, range, precedence, default) and one canonicalization theorem | L.1.4's reference semantics is stable | STOP if it becomes a parallel implementation to maintain |
 | Lean for EditPlan semantic equivalence | M13 adopted | M13's optimizer must stay small enough to have a precise semantics; otherwise M13 itself is reconsidered |
