@@ -535,6 +535,11 @@ core_public_subdir_headers = {
     'conntrack/conntrack.h',
     'conntrack/packet_parse.h',
   ),
+  'offload': files(
+    'offload/fake_flow_backend.h',
+    'offload/flow_rule_owner.h',
+    'offload/rte_flow_backend.h',
+  ),
   'flow': files(
     'flow/decision_cache.h',
     'flow/flow_index.h',
@@ -575,6 +580,7 @@ endforeach
 unit_test_sources = [
   'flow/decision_cache_test.cc',
   'flow/expiry_consumer_test.cc',
+  'offload/flow_rule_owner_test.cc',
   'l2/fdb_test.cc',
   'conntrack/conntrack_test.cc',
   'nat/nat_test.cc',

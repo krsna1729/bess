@@ -5020,6 +5020,16 @@ rather than one call site).
      ASan clean on the tunnel, conntrack and NAT tests. 21 mutants caught, 1 equivalent. Reviewed: go, five
      optional findings taken.
 
+158. **M20 hardware flow-rule lifecycle (D-070).** `offload/flow_rule_owner.h`: an owner of NIC rules the
+     application compiles itself (no BESS flow IR): explicit asynchronous states, generation-tagged handles,
+     bounded outstanding requests with backpressure, batch teardown, statistics, reset and reconciliation, and MARK
+     values reused only after removal and a queue drain. `offload/fake_flow_backend.h` for software tests;
+     `offload/rte_flow_backend.h` passes native `rte_flow` rules through. A refused or failed removal keeps the
+     rule and its MARK. Only "the port has rte_flow operations" gates an install; MARK, COUNT, tunnel and
+     transfer capabilities are hints, the PMD's `rte_flow_validate` answers for sample rules (run against the null
+     PMD by a throwaway program). 11 tests, 23 mutants caught, 2 equivalent. The
+     real-hardware matrix is not run (no NIC here) and stays a separate gate.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
