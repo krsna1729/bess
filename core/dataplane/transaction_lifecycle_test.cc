@@ -937,8 +937,8 @@ TEST(LifecycleAllocationTest, FailureAtEveryAllocationLeavesNoTrace) {
       reference.table->ReclaimAll();
       applied = reference.State();
     }
-    size_t faults = 0;
-    fault_injection::ForEachFailurePoint([&](size_t k) {
+    size_t threw_count = 0;
+    const size_t points = fault_injection::ForEachFailurePoint([&](size_t k) {
       SCOPED_TRACE(testing::Message() << "setting " << setting
                                       << ", failing allocation " << k);
       World w;
@@ -963,7 +963,7 @@ TEST(LifecycleAllocationTest, FailureAtEveryAllocationLeavesNoTrace) {
         ASSERT_EQ(w.State(), applied) << "an absorbed refusal changed the outcome";
         return;
       }
-      faults++;
+      threw_count++;
       ASSERT_FALSE(w.AnyInTransaction()) << "EndTransaction() skipped";
       w.table->ReclaimAll();
       ASSERT_EQ(w.State(), before) << "a failed allocation left a trace";
@@ -972,9 +972,9 @@ TEST(LifecycleAllocationTest, FailureAtEveryAllocationLeavesNoTrace) {
                 TransactionEngine::Outcome::kApplied);
       ASSERT_FALSE(w.AnyInTransaction()) << "EndTransaction() skipped";
     });
-    std::printf("setting %d: %zu allocation sites failed in turn\n", setting,
-                faults);
-    EXPECT_GT(faults, 10u);
+    std::printf("setting %d: %zu failure points, %zu of them thrown\n", setting, points,
+                threw_count);
+    EXPECT_GT(points, 10u);
   }
 }
 

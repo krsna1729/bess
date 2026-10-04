@@ -188,10 +188,11 @@ class FlowRuleOwner {
     try {
       submitted = backend_.Submit(port, rule, mark + config_.mark_base, Tag(h), error);
     } catch (...) {
-      // The request never left (std::bad_alloc in the backend, say): the
-      // handle and the MARK are free again before the caller sees the
-      // exception.
-      Retire(index, /*mark_seen_by_device=*/false);
+      // The handle is free again before the caller sees the exception. The
+      // backend may have thrown after the device took the rule (bookkeeping
+      // after rte_flow_create, say), so the MARK drains on `port` like a
+      // removed rule's: it is not handed out again before NoteDrained(port).
+      Retire(index, /*mark_seen_by_device=*/true);
       throw;
     }
     if (!submitted) {

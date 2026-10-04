@@ -3,9 +3,7 @@
 #ifndef BESS_TESTING_ALLOCATION_FAULTS_H_
 #define BESS_TESTING_ALLOCATION_FAULTS_H_
 
-#include <atomic>
 #include <cstddef>
-#include <cstdint>
 #include <limits>
 
 #include <gtest/gtest.h>
@@ -23,9 +21,9 @@
 // While an AllocationFaults window is open, the allocations it sees are
 // counted from 0, and the one numbered `fail_at` is refused: the throwing
 // forms throw std::bad_alloc, the nothrow forms return nullptr. Every later
-// allocation succeeds. By default a window sees only the thread that opened
-// it (other threads -- a reader, a reclaimer -- allocate freely); kAllThreads
-// sees every thread. Windows on one thread nest: the innermost one counts.
+// allocation succeeds. A window sees only the thread that opened it (other
+// threads -- a reader, a reclaimer -- allocate freely). Windows on one thread
+// nest: the innermost one counts.
 //
 // The "failure at every point leaves no trace" loop:
 //
@@ -49,20 +47,16 @@ inline constexpr size_t kNoFailure = std::numeric_limits<size_t>::max();
 
 namespace internal {
 
+// Touched only by the thread that opened it.
 struct Window {
-  std::atomic<size_t> allocations{0};
-  std::atomic<size_t> frees{0};
+  size_t allocations = 0;
+  size_t frees = 0;
   size_t fail_at = kNoFailure;
-  std::atomic<bool> injected{false};
+  bool injected = false;
 };
 
-// The opening thread's innermost window, or null.
+// Makes `window` the thread's innermost window; returns the previous one, or null.
 Window *ExchangeThreadWindow(Window *window) noexcept;
-// The one all-threads window: static storage, so a thread that read the
-// "open" flag never touches a destroyed object.
-Window &SharedWindow() noexcept;
-void OpenSharedWindow(size_t fail_at) noexcept;
-void CloseSharedWindow() noexcept;
 
 }  // namespace internal
 
@@ -71,44 +65,23 @@ size_t InjectedFailures() noexcept;
 
 class AllocationFaults {
  public:
-  enum class Threads : uint8_t { kThisThread, kAllThreads };
-
-  // Counts allocations; refuses the `fail_at`-th (0-based), or none.
-  explicit AllocationFaults(size_t fail_at = kNoFailure,
-                            Threads threads = Threads::kThisThread)
-      : threads_(threads) {
-    if (threads_ == Threads::kAllThreads) {
-      internal::OpenSharedWindow(fail_at);
-    } else {
-      own_.fail_at = fail_at;
-      previous_ = internal::ExchangeThreadWindow(&own_);
-    }
+  // Counts this thread's allocations; refuses the `fail_at`-th (0-based), or none.
+  explicit AllocationFaults(size_t fail_at = kNoFailure) {
+    own_.fail_at = fail_at;
+    previous_ = internal::ExchangeThreadWindow(&own_);
   }
-  ~AllocationFaults() {
-    if (threads_ == Threads::kAllThreads) {
-      internal::CloseSharedWindow();
-    } else {
-      (void)internal::ExchangeThreadWindow(previous_);
-    }
-  }
+  ~AllocationFaults() { (void)internal::ExchangeThreadWindow(previous_); }
   AllocationFaults(const AllocationFaults &) = delete;
   AllocationFaults &operator=(const AllocationFaults &) = delete;
 
   // Allocation attempts seen, the refused one included.
-  size_t allocations() const noexcept {
-    return window().allocations.load(std::memory_order_relaxed);
-  }
+  size_t allocations() const noexcept { return own_.allocations; }
   // Non-null pointers freed while the window was open (allocated in it or not).
-  size_t frees() const noexcept { return window().frees.load(std::memory_order_relaxed); }
+  size_t frees() const noexcept { return own_.frees; }
   // The `fail_at`-th allocation happened and was refused.
-  bool injected() const noexcept { return window().injected.load(std::memory_order_relaxed); }
+  bool injected() const noexcept { return own_.injected; }
 
  private:
-  const internal::Window &window() const noexcept {
-    return threads_ == Threads::kAllThreads ? internal::SharedWindow() : own_;
-  }
-
-  Threads threads_;
   internal::Window own_;
   internal::Window *previous_ = nullptr;
 };

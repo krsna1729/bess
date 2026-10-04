@@ -6,7 +6,8 @@
 
 #include "testing/allocation_faults.h"
 
-#include <cstdio>
+#include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <new>
 
@@ -15,35 +16,13 @@ namespace internal {
 namespace {
 
 constinit thread_local Window *t_window = nullptr;
-std::atomic<bool> g_shared_open{false};
 std::atomic<size_t> g_injected{0};
 
-Window &Shared() noexcept {
-  static Window window;
-  return window;
-}
-
-// Counts one allocation in `w`; true if it is the one to refuse.
-bool Refuse(Window *w) noexcept {
-  const size_t index = w->allocations.fetch_add(1, std::memory_order_relaxed);
-  if (index != w->fail_at) {
-    return false;
-  }
-  w->injected.store(true, std::memory_order_relaxed);
-  g_injected.fetch_add(1, std::memory_order_relaxed);
-  return true;
-}
-
-// Null when a window refuses the allocation (or malloc fails).
+// Null when the thread's window refuses the allocation (or malloc fails).
 void *Allocate(std::size_t n, std::size_t align) noexcept {
-  bool refuse = false;
-  if (Window *w = t_window; w != nullptr) {
-    refuse = Refuse(w);
-  }
-  if (g_shared_open.load(std::memory_order_acquire)) {
-    refuse |= Refuse(&Shared());
-  }
-  if (refuse) {
+  if (Window *w = t_window; w != nullptr && w->allocations++ == w->fail_at) {
+    w->injected = true;
+    g_injected.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
   }
   if (n == 0) {
@@ -51,6 +30,10 @@ void *Allocate(std::size_t n, std::size_t align) noexcept {
   }
   if (align <= alignof(std::max_align_t)) {
     return std::malloc(n);
+  }
+  // aligned_alloc wants a multiple of the alignment; rounding up must not wrap.
+  if (n > SIZE_MAX - align) {
+    return nullptr;
   }
   return std::aligned_alloc(align, (n + align - 1) / align * align);
 }
@@ -67,10 +50,7 @@ void Release(void *p) noexcept {
     return;
   }
   if (Window *w = t_window; w != nullptr) {
-    w->frees.fetch_add(1, std::memory_order_relaxed);
-  }
-  if (g_shared_open.load(std::memory_order_acquire)) {
-    Shared().frees.fetch_add(1, std::memory_order_relaxed);
+    w->frees++;
   }
   std::free(p);
 }
@@ -82,23 +62,6 @@ Window *ExchangeThreadWindow(Window *window) noexcept {
   t_window = window;
   return previous;
 }
-
-Window &SharedWindow() noexcept { return Shared(); }
-
-void OpenSharedWindow(size_t fail_at) noexcept {
-  if (g_shared_open.load(std::memory_order_relaxed)) {
-    std::fputs("AllocationFaults: one all-threads window at a time\n", stderr);
-    std::abort();
-  }
-  Window &w = Shared();
-  w.allocations.store(0, std::memory_order_relaxed);
-  w.frees.store(0, std::memory_order_relaxed);
-  w.injected.store(false, std::memory_order_relaxed);
-  w.fail_at = fail_at;
-  g_shared_open.store(true, std::memory_order_release);
-}
-
-void CloseSharedWindow() noexcept { g_shared_open.store(false, std::memory_order_release); }
 
 }  // namespace internal
 

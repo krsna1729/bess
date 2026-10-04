@@ -11,8 +11,10 @@
 #include <cstdint>
 #include <limits>
 #include <new>
+#include <set>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "offload/fake_flow_backend.h"
@@ -478,8 +480,10 @@ struct FaultFixture {
 // allocation (the backend's bookkeeping, the owner's) refused in turn. A
 // batch stops at the first rule not submitted -- refused (reported in out),
 // or std::bad_alloc -- and the owner and the device then look exactly as if
-// the batch had been just the rules before it: the failed rule's handle and
-// MARK are free again. Submitting the rest then completes the batch.
+// the batch had been just the rules before it: the failed rule's handle is
+// free again, and its MARK too -- at once when refused, after the next drain
+// when the backend threw (the device may have the rule). Submitting the rest
+// then completes the batch.
 TEST(FlowRuleOwnerFaultTest, InstallBatchFailureAtEveryPointLeavesNoTrace) {
   constexpr size_t kBatch = 30;
   std::vector<uint64_t> rules, cookies;
@@ -527,6 +531,12 @@ TEST(FlowRuleOwnerFaultTest, InstallBatchFailureAtEveryPointLeavesNoTrace) {
       ASSERT_EQ(submitted, ref.InstallBatch(std::span(rules).first(submitted),
                                             std::span(cookies).first(submitted),
                                             std::span(ref_out).first(submitted)));
+      if (threw) {
+        ASSERT_EQ(ref.owner.draining_marks() + 1, f.owner.draining_marks())
+            << "the MARK of an install that threw is reused without a drain";
+        f.owner.NoteDrained(0);
+        ref.owner.NoteDrained(0);
+      }
       ASSERT_EQ(ref.Summary(), f.Summary()) << "the failed install left a trace";
       // The rest of the batch goes through, on both.
       const auto rest = [&](FaultFixture &x, std::vector<InstallResult> &o) {
@@ -541,6 +551,54 @@ TEST(FlowRuleOwnerFaultTest, InstallBatchFailureAtEveryPointLeavesNoTrace) {
   }
   // The fake's request queue grows a block at a time as a batch goes in.
   EXPECT_GE(points, 20u);
+}
+
+// A backend that throws after the device took the rule (RteFlowBackend:
+// rte_flow_create succeeded, then its bookkeeping ran out of memory).
+struct AcceptThenThrowBackend : RefusingBackend {
+  bool throw_next = false;
+  bool Submit(uint16_t port, const Rule &rule, uint32_t mark, uint64_t tag, int &error) {
+    const bool submitted = RefusingBackend::Submit(port, rule, mark, tag, error);
+    if (std::exchange(throw_next, false)) {
+      throw std::bad_alloc();
+    }
+    return submitted;
+  }
+};
+
+// The owner cannot tell whether an install that threw reached the device, so
+// its MARK drains like a removed rule's: packets the orphan rule marks are
+// never mapped to a later rule's cookie.
+TEST(FlowRuleOwnerFaultTest, InstallThatThrowsDrainsItsMark) {
+  AcceptThenThrowBackend backend;
+  backend.SetCapabilities(0, Nic());
+  FlowRuleOwner<AcceptThenThrowBackend> owner(
+      backend, {.max_rules = 8, .max_outstanding = 8, .mark_base = 1, .marks = 4});
+  backend.throw_next = true;
+  EXPECT_THROW(owner.Install(0, 1, 10), std::bad_alloc);
+  EXPECT_EQ(0u, owner.live_rules());
+  EXPECT_EQ(0u, owner.outstanding());
+  EXPECT_EQ(1u, owner.draining_marks());
+  EXPECT_EQ(3u, owner.free_marks());
+  // The device installs the orphan; the owner ignores its completion.
+  backend.Complete(1);
+  owner.Poll([](const Completion &) { ADD_FAILURE() << "the orphan was reported"; });
+  const std::set<uint32_t> orphan = backend.marks(0);
+  ASSERT_EQ(1u, orphan.size());
+  const uint32_t orphan_mark = *orphan.begin();
+  EXPECT_FALSE(owner.MarkCookie(orphan_mark).has_value());
+  // Until the drain, the other three MARKs are all there is.
+  for (uint64_t i = 0; i < 3; i++) {
+    const InstallResult r = owner.Install(0, 2 + i, 20 + i);
+    ASSERT_EQ(InstallError::kOk, r.status);
+    EXPECT_NE(orphan_mark, r.mark);
+  }
+  EXPECT_EQ(InstallError::kNoMark, owner.Install(0, 5, 50).status);
+  owner.NoteDrained(0);
+  EXPECT_EQ(0u, owner.draining_marks());
+  const InstallResult r = owner.Install(0, 6, 60);
+  ASSERT_EQ(InstallError::kOk, r.status);
+  EXPECT_EQ(orphan_mark, r.mark);
 }
 
 // A removal cycle -- RemoveAll with more rules than the outstanding window,

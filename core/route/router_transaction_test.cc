@@ -551,8 +551,8 @@ TEST_F(RouterTransactionTest, FailureAtEveryAllocationLeavesNoTrace) {
     ASSERT_EQ(reference.engine.Apply(reference.ops).outcome, Outcome::kApplied);
     applied = reference.State();
   }
-  size_t faults = 0;
-  fault_injection::ForEachFailurePoint([&](size_t k) {
+  size_t threw_count = 0;
+  const size_t points = fault_injection::ForEachFailurePoint([&](size_t k) {
     SCOPED_TRACE(testing::Message() << "failing allocation " << k);
     Run run;
     prepare(run);
@@ -574,13 +574,13 @@ TEST_F(RouterTransactionTest, FailureAtEveryAllocationLeavesNoTrace) {
       ASSERT_EQ(applied, run.State()) << "an absorbed refusal changed the outcome";
       return;
     }
-    faults++;
+    threw_count++;
     ASSERT_EQ(run.State(), before) << "a failed allocation left a trace";
     ASSERT_EQ(run.engine.Apply(run.ops).outcome, Outcome::kApplied);
     ASSERT_EQ(applied, run.State());
   });
-  std::printf("[router] %zu allocation sites failed in turn\n", faults);
-  EXPECT_GT(faults, 10u);
+  std::printf("[router] %zu failure points, %zu of them thrown\n", points, threw_count);
+  EXPECT_GT(points, 10u);
 }
 
 // -- live (non-transactional) updates: domains, next hops, groups -----------------
