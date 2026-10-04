@@ -102,8 +102,8 @@ file is the reasoning.
 | D-079 | Shared NAT: one binding table for every worker, lock-free lookups, creates under a lock, growth on the control thread (TP6) | accepted |
 | D-080 | Symmetric RSS port option; a conntrack module with owned and per-worker tables, per-worker only on verified symmetric inputs (TP8) | accepted |
 | D-081 | Shared conntrack: one table for every worker, a per-connection lock, deadlines kept by the entry (TP8) | accepted |
-| D-083 | NAT usage counters: per-mapping packets and bytes, final and interim records through a bounded log (TP7) | accepted |
 | D-082 | Capability discovery: GetCapabilities, and SDK capabilities/supports/metrics (M27.2) | accepted |
+| D-083 | NAT usage counters: per-mapping packets and bytes, final and interim records through a bounded log (TP7) | accepted |
 
 
 ---
@@ -7002,6 +7002,39 @@ connections at once create each exactly once; replies on other workers than thei
 while expiry runs. The owned tracker after the `ct_internal` extraction (release, isolated CPU 2, 12 ABBA rounds,
 contamination flagged): `BM_Track` 3-15% faster on 10 of 11 rows (placement), `BM_TrackBatch` no clear difference on
 8 of 9 rows (one -4%); not slower anywhere.
+## D-082 Capability discovery: GetCapabilities, and SDK capabilities/supports/metrics (M27.2)
+
+**Status:** accepted (2026-10-05), additive wire change.
+**Code:** `protobuf/control_v2.proto` (`GetCapabilities`, `PluginInfo`, `PortInfo`), `core/control/api_v2.{h,cc}`,
+`core/framework/plugin_loader.{h,cc}` (`LoadedPlugins`), `pybess/sdk.py` (`capabilities`, `supports`, `metrics`),
+`sdk/go/bess/client.go` (`Capabilities`, `Supports`, `Metrics`), `pybess/test_sdk.py`, `sdk/go/bess/client_test.go`,
+`bessctl/module_tests/control_sdk.py`, `sdk/go/bess/live_test.go`.
+
+**Context.** Roadmap M27 asks the SDK to expose the daemon API version, resource types, optional batteries/plugins
+and port/device capabilities, and to leave the decision to the application. A controller built against a newer
+schema also needs to know which RPCs an older daemon lacks (WatchEvents will be one).
+
+**Decision.**
+- `control_v2.GetCapabilities` (additive): the daemon's version (`git describe`, as `GetVersion`), the RPCs its
+  schema declares (full names from the generated service descriptor), the plugin API version and the capabilities a
+  plugin may require, the module classes, the loaded plugins (from their descriptors), the ports (driver, queues,
+  accepted transmit offloads) and the transaction resources, with the daemon epoch.
+- SDK (Python and Go): `capabilities()` returns the raw message (the application decides; the SDK adds no policy),
+  `supports(rpc)` answers the common question and treats a daemon too old to serve GetCapabilities (UNIMPLEMENTED)
+  as supporting nothing newer; `metrics()` reads ListMetrics. Every discovery call observes the daemon epoch, so a
+  restart seen there retires old resource handles as a transaction would.
+- Not included: offload capabilities beyond the transmit offloads a port accepted; a port's flow-rule support is only
+  known by validating rules (M20), so it stays with the offload owner.
+
+**Evidence.** Fast build: 133/133 with the Go SDK's live test (Docker toolchain): `Capabilities` names a version and
+module classes, `Supports("ApplyTransaction")` holds, `Metrics` returns samples. Python live
+(`control_sdk.py test_capabilities`): the version, `bess.pb.v2.Control/GetCapabilities` among the RPCs,
+`supports('ApplyTransaction')` true and `supports('NoSuchRpc')` false, `ExactMatch` among the module classes, the
+module's resource listed, the epoch equal to the client's, the harness's Unix socket port listed with its driver and
+one receive queue, and `bess_transaction_generation` among the metrics. Unit (Python 25, Go): an old daemon
+(UNIMPLEMENTED) supports nothing newer, another refusal (PERMISSION_DENIED) is raised, not reported as
+unsupported; a discovery call that sees a new epoch retires an old resource handle before anything is sent.
+
 ## D-083 NAT usage counters: per-mapping packets and bytes, final and interim records through a bounded log (TP7)
 
 **Status:** accepted (2026-10-05), experimental API. Implements table_policy.md section 6 for NAT.
@@ -7042,37 +7075,4 @@ report gives 3 packets and 300 bytes for a mapping, owned and shared; `request_u
 while the NAT's worker runs. A NAT without usage compiles none of it (`if constexpr` on the store; Expire's report
 call is empty).
 
-
-## D-082 Capability discovery: GetCapabilities, and SDK capabilities/supports/metrics (M27.2)
-
-**Status:** accepted (2026-10-05), additive wire change.
-**Code:** `protobuf/control_v2.proto` (`GetCapabilities`, `PluginInfo`, `PortInfo`), `core/control/api_v2.{h,cc}`,
-`core/framework/plugin_loader.{h,cc}` (`LoadedPlugins`), `pybess/sdk.py` (`capabilities`, `supports`, `metrics`),
-`sdk/go/bess/client.go` (`Capabilities`, `Supports`, `Metrics`), `pybess/test_sdk.py`, `sdk/go/bess/client_test.go`,
-`bessctl/module_tests/control_sdk.py`, `sdk/go/bess/live_test.go`.
-
-**Context.** Roadmap M27 asks the SDK to expose the daemon API version, resource types, optional batteries/plugins
-and port/device capabilities, and to leave the decision to the application. A controller built against a newer
-schema also needs to know which RPCs an older daemon lacks (WatchEvents will be one).
-
-**Decision.**
-- `control_v2.GetCapabilities` (additive): the daemon's version (`git describe`, as `GetVersion`), the RPCs its
-  schema declares (full names from the generated service descriptor), the plugin API version and the capabilities a
-  plugin may require, the module classes, the loaded plugins (from their descriptors), the ports (driver, queues,
-  accepted transmit offloads) and the transaction resources, with the daemon epoch.
-- SDK (Python and Go): `capabilities()` returns the raw message (the application decides; the SDK adds no policy),
-  `supports(rpc)` answers the common question and treats a daemon too old to serve GetCapabilities (UNIMPLEMENTED)
-  as supporting nothing newer; `metrics()` reads ListMetrics. Every discovery call observes the daemon epoch, so a
-  restart seen there retires old resource handles as a transaction would.
-- Not included: offload capabilities beyond the transmit offloads a port accepted; a port's flow-rule support is only
-  known by validating rules (M20), so it stays with the offload owner.
-
-**Evidence.** Fast build: 133/133 with the Go SDK's live test (Docker toolchain): `Capabilities` names a version and
-module classes, `Supports("ApplyTransaction")` holds, `Metrics` returns samples. Python live
-(`control_sdk.py test_capabilities`): the version, `bess.pb.v2.Control/GetCapabilities` among the RPCs,
-`supports('ApplyTransaction')` true and `supports('NoSuchRpc')` false, `ExactMatch` among the module classes, the
-module's resource listed, the epoch equal to the client's, the harness's Unix socket port listed with its driver and
-one receive queue, and `bess_transaction_generation` among the metrics. Unit (Python 25, Go): an old daemon
-(UNIMPLEMENTED) supports nothing newer, another refusal (PERMISSION_DENIED) is raised, not reported as
-unsupported; a discovery call that sees a new epoch retires an old resource handle before anything is sent.
 
