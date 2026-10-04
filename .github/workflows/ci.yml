@@ -12,11 +12,18 @@ on:
   schedule:
     - cron: '17 3 * * *'
 
-# A new push to a pull request cancels its older run; pushes to develop,
-# master and tags are never grouped (each run completes).
+# A newer commit cancels the older run it supersedes: per pull request, per
+# branch for pushes (develop, master), and the nightly run its predecessor
+# (its own group: a schedule runs on master's ref but checks out develop).
+# Tags are never grouped: a release run always completes. The tip's run (and
+# the nightly) covers every commit a cancelled run would have.
 concurrency:
-  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: >-
+    ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number)
+    || github.event_name == 'schedule' && 'nightly'
+    || startsWith(github.ref, 'refs/tags/') && github.run_id
+    || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   # The CPU floor is per architecture and comes from tools/ci_profile.py
