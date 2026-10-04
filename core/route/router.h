@@ -33,7 +33,7 @@
 #include "utils/ether.h"
 
 namespace bess::dataplane {
-class TransactionEngine;
+class ResourceRegistry;
 }  // namespace bess::dataplane
 
 namespace bess::route {
@@ -289,7 +289,7 @@ class Router {
   // exists or a removed next hop or group is still retiring (the ledger must
   // start from what it can see). Freezes the set of domains. Destroying an
   // enrolled router unregisters them (with workers paused).
-  std::expected<void, std::string> Enroll(dataplane::TransactionEngine &engine);
+  std::expected<void, std::string> Enroll(dataplane::ResourceRegistry &engine);
   bool enrolled() const noexcept { return engine_ != nullptr; }
 
   // Releases both resources for teardown, tolerating a referrer that is still
@@ -637,7 +637,7 @@ class Router {
   const std::string next_hops_name_;
   const std::string routes_name_;
   const std::string groups_name_;
-  dataplane::TransactionEngine *engine_ = nullptr;
+  dataplane::ResourceRegistry *engine_ = nullptr;
   std::unique_ptr<dataplane::Resource> next_hops_res_;
   std::unique_ptr<dataplane::Resource> groups_res_;  // null without max_groups
   std::unique_ptr<dataplane::Resource> routes_res_;

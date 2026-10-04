@@ -77,8 +77,9 @@ class ResourceBindings {
 
   size_t size() const { return codecs_.size(); }
 
-  // The bindings of the process's one active runtime instance (explicit
-  // application instances, M5, will own their own).
+  // The process's bindings. Process-scoped on purpose, like the transaction
+  // engine and the control endpoint they describe: application instances
+  // (M5) share them (consolidation review, 2026-10-04).
   static ResourceBindings &ProcessDefault();
 
  private:
@@ -89,6 +90,11 @@ class ResourceBindings {
                      std::shared_ptr<const ResourceCodec>>
       codecs_;
 };
+
+class ModuleInitContext;
+// The bindings an in-tree module attaches its resources' codecs to (D-044).
+// Internal: codecs are protobuf-bound and not part of the plugin SDK.
+ResourceBindings &BindingsOf(const ModuleInitContext &context) noexcept;
 
 }  // namespace bess::framework
 

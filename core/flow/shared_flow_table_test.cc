@@ -2,6 +2,8 @@
 
 #include "flow/shared_flow_table.h"
 
+#include "classifier/concurrent_exact.h"
+
 #include <gtest/gtest.h>
 #include <rte_malloc.h>
 
@@ -597,11 +599,11 @@ KeyGroups MakeKeyGroups(const classifier::ConcurrentExactTable &directory,
 }
 
 // Whether the directory itself, bypassing the table's validation, holds `key`.
-bool InDirectory(const classifier::ConcurrentExactTable &directory,
+bool InDirectory(const SharedExactIndex &directory,
                  uint64_t key, FlowHandle *handle = nullptr) {
   uint64_t value = 0;
   const bool hit =
-      directory.LookupBatch(KeyBytes(key), sizeof(key), &value, 1) != 0;
+      directory.LookupBatch(KeyBytes(key).data(), sizeof(key), &value, 1) != 0;
   if (hit && handle != nullptr) *handle = std::bit_cast<FlowHandle>(value);
   return hit;
 }
@@ -632,7 +634,7 @@ class SharedFlowTablePlacementTest : public ::testing::Test {
 TEST_F(SharedFlowTablePlacementTest, AKeyTheDirectoryCannotPlaceIsRefusedAndChangesNothing) {
   constexpr size_t kCapacity = 64;
   auto t = Make<CountedTable>(kCapacity);
-  const KeyGroups keys = MakeKeyGroups(t->directory(), 40, 80);
+  const KeyGroups keys = MakeKeyGroups(t->directory().backend_for_testing(), 40, 80);
 
   // Fill the crowd's bucket pair while 48 or more slots stay free.
   EmplaceResult<Counted> refused;
@@ -704,7 +706,7 @@ TEST_F(SharedFlowTablePlacementTest, AKeyTheDirectoryCannotPlaceIsRefusedAndChan
 
 TEST_F(SharedFlowTablePlacementTest, ARefusedCreateMovesTheStackSlotToANewGeneration) {
   auto t = Make<CountedLifoTable>(64);
-  const KeyGroups keys = MakeKeyGroups(t->directory(), 40, 4);
+  const KeyGroups keys = MakeKeyGroups(t->directory().backend_for_testing(), 40, 4);
   size_t fit = 0;
   while (fit < keys.crowd.size() && t->Emplace(keys.crowd[fit], fit).created()) {
     fit++;
@@ -721,7 +723,7 @@ TEST_F(SharedFlowTablePlacementTest, ARefusedCreateMovesTheStackSlotToANewGenera
 
 TEST_F(SharedFlowTablePlacementTest, AnAliasedCreateThatCannotBePlacedTakesBackWhatItInserted) {
   auto t = Make<CountedTable>(64);
-  const KeyGroups keys = MakeKeyGroups(t->directory(), 40, 80);
+  const KeyGroups keys = MakeKeyGroups(t->directory().backend_for_testing(), 40, 80);
   size_t used = 0;
   auto elsewhere = [&] { return keys.elsewhere[used++]; };
 
@@ -784,7 +786,7 @@ TEST_F(SharedFlowTablePlacementTest, AnAliasedCreateThatCannotBePlacedTakesBackW
 
 TEST_F(SharedFlowTablePlacementTest, AnAliasThatCannotBePlacedLeavesTheFlowAsItWas) {
   auto t = Make<CountedTable>(64);
-  const KeyGroups keys = MakeKeyGroups(t->directory(), 40, 8);
+  const KeyGroups keys = MakeKeyGroups(t->directory().backend_for_testing(), 40, 8);
   const auto flow = t->Emplace(keys.elsewhere[0], 7);
   ASSERT_TRUE(flow.created());
   size_t fit = 0;
@@ -973,7 +975,7 @@ TEST_F(SharedFlowTablePlacementTest, AHandleOfAnAbandonedCreateNeverNamesALaterF
 TEST_F(SharedFlowTablePlacementTest, ARefusedCreateRetiresASlotWhoseGenerationWouldWrap) {
   constexpr size_t kCapacity = 32;
   auto t = Make<CountedTable>(kCapacity);
-  const KeyGroups keys = MakeKeyGroups(t->directory(), 40, 40);
+  const KeyGroups keys = MakeKeyGroups(t->directory().backend_for_testing(), 40, 40);
   size_t fit = 0;
   while (fit < keys.crowd.size() && t->Emplace(keys.crowd[fit], fit).created()) {
     fit++;
@@ -1361,8 +1363,8 @@ TEST_F(SharedFlowTablePlacementTest, CrowdedDirectoryMatchesAModelOfItsBucketCap
     uint32_t directory_capacity = 0;
     {
       auto probe = Make<CountedTable>(64);
-      directory_capacity = probe->directory().capacity();
-      groups = MakeKeyGroups(probe->directory(), kUniverse, 0);
+      directory_capacity = probe->directory().backend_for_testing().capacity();
+      groups = MakeKeyGroups(probe->directory().backend_for_testing(), kUniverse, 0);
       while (fit < groups.crowd.size() &&
              probe->Emplace(groups.crowd[fit], 0).created()) {
         fit++;
@@ -1371,7 +1373,8 @@ TEST_F(SharedFlowTablePlacementTest, CrowdedDirectoryMatchesAModelOfItsBucketCap
       ASSERT_LT(fit, groups.crowd.size());
     }
     auto t = Make<CountedTable>(kCapacity);
-    ASSERT_EQ(directory_capacity, t->directory().capacity()) << "geometry differs";
+    ASSERT_EQ(directory_capacity, t->directory().backend_for_testing().capacity())
+        << "geometry differs";
     const std::vector<uint64_t> &universe = groups.crowd;
 
     struct ModelFlow {

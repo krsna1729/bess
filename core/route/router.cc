@@ -11,7 +11,7 @@
 #include "utils/logging.h"
 
 #include "dataplane/slot_resource.h"
-#include "dataplane/transaction_engine.h"
+#include "dataplane/resource_registry.h"
 
 namespace bess::route {
 
@@ -331,7 +331,7 @@ class Router::GroupResource final
 };
 
 std::expected<void, std::string> Router::Enroll(
-    dataplane::TransactionEngine &engine) {
+    dataplane::ResourceRegistry &engine) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (engine_ != nullptr) {
     return std::unexpected("already enrolled");
