@@ -43,7 +43,7 @@ including `dynamicpb` messages built from a descriptor set.
 | Before the first send | Learns the daemon epoch (resource discovery) if this client has not. |
 | No answer (deadline, unavailable; `INTERNAL`/`UNKNOWN` without BESS's error detail) | Asks `GetTransaction(request_id)`, again if the question goes unanswered too. Known: that outcome (`replayed`). Answered "not known" under the epoch the commit started with: sends the identical request again (the daemon replays or applies it once). Never sends again on a guess. |
 | No answer through every attempt | `TransportError`: the outcome is unknown, not failed; ask `get_transaction(request_id)` later. |
-| Any answer from another daemon epoch | `DaemonRestarted`: the transaction met a daemon that lost the state it was built against; never reported as applied or as not applied. |
+| Any answer from another daemon epoch | `DaemonRestarted`: the transaction met a daemon that lost the state it was built against; never reported as applied or as not applied (the new daemon may have applied it: re-read its state). |
 | `OUTCOME_BUSY` | Retries with doubling backoff, then `Busy`. |
 | `OUTCOME_CONFLICT` | `Conflict` (nothing tried); the application decides what a moved generation means. `after_unknown_attempt`: an earlier send of the same commit went unanswered and may have applied. |
 | `OUTCOME_REJECTED` | `Rejected`, with each failing operation's index and error; nothing changed. |
@@ -68,9 +68,12 @@ Consistency: `client.transaction(snapshot=True)` asks for
 Resource handles and restarts: the client knows of a restart only once the
 daemon answers from the new epoch (any call: discovery, a commit, a status
 question); that answer drops the resource cache and makes every older handle
-stale. A restart the client has not seen yet is caught on the commit's answer
-(`DaemonRestarted`), and the daemon decodes keys and values by type, so a
-resource whose schema changed under the same name refuses the request.
+stale. A restart the client has not seen yet passes these checks: the request
+is sent, and the restarted daemon may apply it (it decodes keys and values by
+type, so a resource whose schema changed under the same name refuses it). The
+answer's new epoch then raises `DaemonRestarted`, which means "the outcome on
+the new daemon is not reported": re-read its state before deciding, as a retry
+under a new request id could apply the transaction twice.
 
 ## Tests
 

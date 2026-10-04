@@ -115,8 +115,10 @@ class StaleResource(Error):
 
 
 class DaemonRestarted(Error):
-    """The daemon restarted: its state, and the transaction's outcome, are
-    gone. Re-read the state and decide again."""
+    """The daemon restarted: the state the transaction was built against is
+    gone. The restarted daemon may have applied the request (a restart the
+    client had not seen yet): re-read its state before deciding again; a
+    retry under a new request id could apply it twice."""
 
 
 # -- results ---------------------------------------------------------------------

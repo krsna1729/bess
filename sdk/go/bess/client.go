@@ -116,7 +116,9 @@ func (e *TransportError) Error() string {
 }
 
 // DaemonRestartedError: the transaction met a daemon that lost the state it
-// was built against. Re-read the state and decide again.
+// was built against. The restarted daemon may have applied the request (a
+// restart the client had not seen yet): re-read its state before deciding
+// again; a retry under a new request id could apply it twice.
 type DaemonRestartedError struct{ From, To uint64 }
 
 func (e *DaemonRestartedError) Error() string {
