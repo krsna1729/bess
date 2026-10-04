@@ -213,6 +213,29 @@ class WorkerFlowTable {
     return FindBatchImpl(keys, out);
   }
 
+  // FindBatch that also gives each flow's handle and whether its key was an
+  // alias (FindRef for a batch): out[i] is empty for a miss.
+  uint64_t FindRefBatch(std::span<const Key> keys, std::span<FlowRef<State>> out) noexcept {
+    owner_.Check("FindRefBatch");
+    const size_t n = keys.size();
+    promise(n <= kMaxBatch);
+    promise(out.size() >= n);
+    detail::FlowIndex::Hashed hashed[kMaxBatch];
+    PrefetchBatch(keys, hashed);
+    uint64_t hits = 0;
+    for (size_t i = 0; i < n; i++) {
+      const uint32_t kid = FindKid(hashed[i], keys[i]);
+      if (kid != kNone) {
+        Slot &slot = slots_[kid / kKeysPerSlot];
+        out[i] = {slot.state_ptr(), HandleOf(kid / kKeysPerSlot), kid % kKeysPerSlot != 0};
+        hits |= uint64_t{1} << i;
+      } else {
+        out[i] = {};
+      }
+    }
+    return hits;
+  }
+
   // Resolves a handle: the flow's State, or nullptr if the handle is stale,
   // forged or empty. Never reaches a flow that reused the slot.
   State *Lookup(FlowHandle handle) noexcept {
@@ -527,6 +550,27 @@ class WorkerFlowTable {
       }
     }
     return hits;
+  }
+
+  // FindBatchImpl's prefetch phase, for FindRefBatch. FindBatchImpl keeps its
+  // own copy: sharing it (or a callback loop) measured FindBatch 6-9% slower
+  // on in-cache tables.
+  void PrefetchBatch(std::span<const Key> keys, detail::FlowIndex::Hashed *hashed) const noexcept {
+    const size_t n = keys.size();
+    for (size_t i = 0; i < n; i++) {
+      hashed[i] = Locate(keys[i]);
+      index_.Prefetch(hashed[i]);
+    }
+    if constexpr (Traits::kPrefetchSlots) {
+      for (size_t i = 0; i < n; i++) {
+        const uint32_t kid = index_.FirstCandidate(hashed[i]);
+        if (kid != kNone) {
+          const Slot *slot = &slots_[kid / kKeysPerSlot];
+          __builtin_prefetch(slot, 0, 3);
+          __builtin_prefetch(slot->state, 0, 3);
+        }
+      }
+    }
   }
 
   [[no_unique_address]] Hash hash_;

@@ -16,6 +16,7 @@
 #include <type_traits>
 
 #include "conntrack/packet_parse.h"
+#include "dataplane/batch_tuning.h"
 #include "dataplane/expiry_wheel.h"
 #include "flow/worker_flow_table.h"
 
@@ -293,6 +294,15 @@ class Conntrack {
     if (ct == nullptr) {
       return std::unexpected(CreateError::kOutOfMemory);
     }
+    // Staged only once the table outgrows L2 (BESS_LOOKUP_BODY overrides).
+    // D-006's L1d threshold is too low here: measured, staging costs
+    // conntrack 14-22% with 1K connections (L2-resident) and saves 16-39%
+    // at 64K and 58-64% at 1M.
+    const dataplane::LookupBody forced = dataplane::LookupBodyOverride();
+    ct->body_ = forced != dataplane::LookupBody::kAuto ? forced
+                : ct->table_->memory_bytes() > dataplane::CacheGeometry::Smallest().l2_bytes
+                    ? dataplane::LookupBody::kStaged
+                    : dataplane::LookupBody::kPlain;
     return ct;
   }
 
@@ -302,20 +312,87 @@ class Conntrack {
   // connection is kInvalid instead (the caller's policy refused it).
   Result Track(std::span<const uint8_t> frame, const ParsedFlowPacket &p, Tick now,
                uint16_t zone = 0, bool may_create = true) noexcept {
-    if (p.l3 == L3Kind::kNone || p.l4 == L4Kind::kNone) {
-      return {TrackStatus::kUntracked};  // not parsed as kOk
-    }
-    if (p.l4 == L4Kind::kIcmp || p.l4 == L4Kind::kIcmpv6) {
-      if (ct_internal::IsIcmpError(p.l4, p.icmp_type)) {
-        return Related(frame, p, zone);
-      }
-      if (!ct_internal::IsEchoRequest(p.l4, p.icmp_type) &&
-          !ct_internal::IsEchoReply(p.l4, p.icmp_type)) {
-        return {TrackStatus::kUntracked};
-      }
+    if (!Keyed(p)) {
+      return Unkeyed(frame, p, zone);
     }
     const CanonicalKey c = MakeKey(p, zone);
-    if (const auto ref = table_->FindRef(c.key); ref.state != nullptr) {
+    return Resolve(p, c, table_->FindRef(c.key), now, may_create);
+  }
+
+  static constexpr size_t kMaxBatch = Table::kMaxBatch;
+
+  // Track for a batch, in order: the connection lookups go together (the
+  // table prefetches the whole batch), then each packet is resolved as Track
+  // would. A miss is looked up again, as an earlier packet of the batch may
+  // have created its connection. Same results as Track packet by packet.
+  // Staged or plain as chosen at Create from the table's footprint (staged
+  // once it outgrows L2; BESS_LOOKUP_BODY overrides).
+  void TrackBatch(std::span<const std::span<const uint8_t>> frames,
+                  std::span<const ParsedFlowPacket> parsed, Tick now, std::span<Result> out,
+                  uint16_t zone = 0, bool may_create = true) noexcept {
+    promise(frames.size() <= kMaxBatch && parsed.size() == frames.size() &&
+            out.size() >= frames.size());
+    if (body_ == dataplane::LookupBody::kPlain) {
+      for (size_t i = 0; i < frames.size(); i++) {
+        out[i] = Track(frames[i], parsed[i], now, zone, may_create);
+      }
+      return;
+    }
+    CanonicalKey keys[kMaxBatch];
+    CtKey lookup[kMaxBatch];
+    uint8_t where[kMaxBatch];
+    size_t n = 0;
+    for (size_t i = 0; i < frames.size(); i++) {
+      if (Keyed(parsed[i])) [[likely]] {
+        keys[n] = MakeKey(parsed[i], zone);
+        lookup[n] = keys[n].key;
+        where[n++] = static_cast<uint8_t>(i);
+      }
+    }
+    flow::FlowRef<Entry> refs[kMaxBatch];
+    (void)table_->FindRefBatch(std::span<const CtKey>(lookup, n),
+                               std::span<flow::FlowRef<Entry>>(refs, n));
+    size_t k = 0;
+    for (size_t i = 0; i < frames.size(); i++) {
+      if (k < n && where[k] == i) {
+        const flow::FlowRef<Entry> ref = refs[k].state != nullptr ? refs[k] : table_->FindRef(lookup[k]);
+        out[i] = Resolve(parsed[i], keys[k], ref, now, may_create);
+        k++;
+      } else {
+        out[i] = Unkeyed(frames[i], parsed[i], zone);
+      }
+    }
+  }
+
+ private:
+  // A packet that has a connection key: parsed, and not an ICMP error or an
+  // ICMP type conntrack does not follow.
+  static bool Keyed(const ParsedFlowPacket &p) noexcept {
+    if (p.l3 == L3Kind::kNone || p.l4 == L4Kind::kNone) {
+      return false;
+    }
+    if (p.l4 == L4Kind::kIcmp || p.l4 == L4Kind::kIcmpv6) {
+      return ct_internal::IsEchoRequest(p.l4, p.icmp_type) ||
+             ct_internal::IsEchoReply(p.l4, p.icmp_type);
+    }
+    return true;
+  }
+
+  // What Track answers for a packet without a key.
+  Result Unkeyed(std::span<const uint8_t> frame, const ParsedFlowPacket &p,
+                 uint16_t zone) noexcept {
+    if (p.l3 != L3Kind::kNone && p.l4 != L4Kind::kNone &&
+        (p.l4 == L4Kind::kIcmp || p.l4 == L4Kind::kIcmpv6) &&
+        ct_internal::IsIcmpError(p.l4, p.icmp_type)) {
+      return Related(frame, p, zone);
+    }
+    return {TrackStatus::kUntracked};
+  }
+
+  // The rest of Track once the key has been looked up.
+  Result Resolve(const ParsedFlowPacket &p, const CanonicalKey &c, const flow::FlowRef<Entry> &ref,
+                 Tick now, bool may_create) noexcept {
+    if (ref.state != nullptr) {
       Entry &e = *ref.state;
       const Direction dir = c.src_is_a == e.initiator_is_a ? Direction::kOriginal : Direction::kReply;
       if (p.l4 == L4Kind::kTcp) {
@@ -392,6 +469,7 @@ class Conntrack {
     return {TrackStatus::kNew, Direction::kOriginal, made.handle, made.state};
   }
 
+ public:
   // Removes connections whose timeout has passed by `now`, doing at most
   // `budget` units of wheel work. Returns how many left.
   size_t Expire(Tick now, size_t budget) noexcept {
@@ -424,6 +502,9 @@ class Conntrack {
   }
 
   size_t size() const noexcept { return table_->size(); }
+  // How TrackBatch runs: staged or plain (chosen at Create).
+  dataplane::LookupBody batch_body() const noexcept { return body_; }
+  void SetBatchBodyForTesting(dataplane::LookupBody body) noexcept { body_ = body; }
   size_t capacity() const noexcept { return table_->capacity(); }
   const TimeoutPolicy &policy() const noexcept { return policy_; }
 
@@ -476,6 +557,7 @@ class Conntrack {
 
   std::unique_ptr<Table> table_;
   std::unique_ptr<Wheel> wheel_;
+  dataplane::LookupBody body_ = dataplane::LookupBody::kStaged;
   TimeoutPolicy policy_;
 };
 
