@@ -345,6 +345,11 @@ def step_verify_install(s):
                 'dependencies'):
         if key not in info:
             raise SystemExit(f'build-info.json lacks {key}')
+    if not isinstance(info['plugin_api_version'], int) or not info['dpdk'].get('sha256'):
+        raise SystemExit(f"build-info.json is incomplete: plugin_api_version="
+                         f"{info['plugin_api_version']!r} dpdk={info['dpdk']!r}")
+    if os.environ.get('GITHUB_ACTIONS') and info['commit'] == 'unknown':
+        raise SystemExit('build-info.json has no commit in a git checkout (git failed?)')
     sbom = json.loads(sbom_files[0].read_text())
     if sbom.get('spdxVersion') != 'SPDX-2.3' or not any(
             p['name'] == 'dpdk' and p.get('checksums') for p in sbom.get('packages', [])):

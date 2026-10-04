@@ -6472,10 +6472,12 @@ spread over architecture.md, plugin-api.md and several decisions.
   meson's introspection (compilers, options, dependencies found and their versions), `deps/dpdk.json` (DPDK's pin
   with URL and sha256), `BESS_PLUGIN_API_VERSION`, and git (or "unknown" in a source release). Nothing is kept by
   hand. A meson target regenerates both on every build and installs them (`share/bess/`, `share/doc/bess/`).
-- The SBOM is deterministic for the same inputs: its namespace is a digest of the facts and its timestamp the
-  commit's, so two builds of one commit produce the same document.
-- CI's verify-install requires both files in the staged install, the metadata keys, and the DPDK pin with its
-  checksum in the SBOM.
+- The SBOM is deterministic for the same inputs (commit, toolchain, options, dependency versions): its namespace
+  is a digest of the facts and its timestamp `SOURCE_DATE_EPOCH`, else the commit's. A dirty build records the
+  digest of its tracked changes, so it never takes the clean commit's identity. Test and benchmark libraries
+  (gtest, benchmark) are `TEST_DEPENDENCY_OF`, not runtime dependencies.
+- CI's verify-install requires both files in the staged install, the metadata keys, an integer plugin API
+  version, a commit (in CI), and the DPDK pin with its checksum in the SBOM.
 - `docs/compatibility.md` states the promises in one place: wire compatibility (`buf breaking`, WIRE_JSON, required
   on `develop`), the public/experimental/internal C++ classes, the plugin descriptor rules, and a new rule: a
   deprecated API keeps working for at least one release after the one that announces its replacement, and its

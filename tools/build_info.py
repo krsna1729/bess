@@ -16,6 +16,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -23,6 +24,9 @@ from pathlib import Path
 
 OPTIONS = ('buildtype', 'cpp_std', 'cpu', 'arch_generic', 'b_sanitize', 'b_lto',
            'build_benchmarks', 'build_fuzzers')
+# Found by meson but linked only into tests and benchmarks, never into bessd.
+TEST_ONLY = frozenset({'gtest', 'gtest_main', 'gmock', 'gmock_main', 'benchmark',
+                       'benchmark_main'})
 
 
 def intro(build_dir, name):
@@ -48,22 +52,28 @@ def build_info(build_dir, source_dir):
     compilers = intro(build_dir, 'compilers').get('host', {})
     options = {o['name']: o['value'] for o in intro(build_dir, 'buildoptions')
                if o['name'] in OPTIONS}
-    dependencies = sorted({(d['name'], d.get('version') or 'unknown')
-                           for d in intro(build_dir, 'dependencies')})
+    versions = {}
+    for d in intro(build_dir, 'dependencies'):
+        versions.setdefault(d['name'], set()).add(d.get('version') or 'unknown')
     dpdk = json.loads((Path(source_dir) / 'deps' / 'dpdk.json').read_text())
     commit = git(source_dir, 'rev-parse', 'HEAD')
     dirty = git(source_dir, 'status', '--porcelain', '--untracked-files=no')
+    # A dirty build is not the commit's code: its tracked changes' digest
+    # tells two dirty builds of one commit apart.
+    diff = hashlib.sha256(git(source_dir, 'diff', 'HEAD').encode()).hexdigest() if dirty else None
     return {
         'name': project['descriptive_name'],
         'version': project['version'],
         'commit': commit or 'unknown',
         'dirty': bool(dirty) if commit else None,
+        'dirty_diff_sha256': diff,
         'plugin_api_version': plugin_api_version(source_dir),
         'compilers': {lang: {'id': c['id'], 'version': c['version']}
                       for lang, c in sorted(compilers.items())},
         'options': options,
         'dpdk': {'version': dpdk['version'], 'url': dpdk['url'], 'sha256': dpdk['sha256']},
-        'dependencies': [{'name': n, 'version': v} for n, v in dependencies],
+        'dependencies': [{'name': n, 'version': ' '.join(sorted(v))}
+                         for n, v in sorted(versions.items())],
     }
 
 
@@ -101,10 +111,14 @@ def sbom(info):
             'filesAnalyzed': False,
             'licenseDeclared': 'NOASSERTION',
         })
-    relationships = [{'spdxElementId': 'SPDXRef-DOCUMENT', 'relationshipType': 'DESCRIBES',
-                      'relatedSpdxElement': 'SPDXRef-Package-bess'}]
-    relationships += [{'spdxElementId': 'SPDXRef-Package-bess', 'relationshipType': 'DEPENDS_ON',
-                       'relatedSpdxElement': p['SPDXID']} for p in packages[1:]]
+    relationships = [{'spdxElementId': 'SPDXRef-Package-bess', 'relationshipType': 'DEPENDS_ON',
+                      'relatedSpdxElement': p['SPDXID']}
+                     if p['name'] not in TEST_ONLY else
+                     {'spdxElementId': p['SPDXID'], 'relationshipType': 'TEST_DEPENDENCY_OF',
+                      'relatedSpdxElement': 'SPDXRef-Package-bess'}
+                     for p in packages[1:]]
+    relationships.insert(0, {'spdxElementId': 'SPDXRef-DOCUMENT', 'relationshipType': 'DESCRIBES',
+                             'relatedSpdxElement': 'SPDXRef-Package-bess'})
     digest = hashlib.sha256(json.dumps(info, sort_keys=True).encode()).hexdigest()
     return {
         'spdxVersion': 'SPDX-2.3',
@@ -112,7 +126,7 @@ def sbom(info):
         'SPDXID': 'SPDXRef-DOCUMENT',
         'name': f"bess-{info['version']}",
         # Deterministic for the same inputs (reproducible builds): no random
-        # UUID, and the timestamp is the commit's when there is one.
+        # UUID; the timestamp is SOURCE_DATE_EPOCH, else the commit's.
         'documentNamespace': f'https://github.com/krsna1729/bess/spdx/{digest}',
         'creationInfo': {'created': info.get('_created') or '1970-01-01T00:00:00Z',
                          'creators': ['Tool: bess-tools-build_info.py']},
@@ -129,11 +143,16 @@ def main():
     parser.add_argument('--sbom', required=True)
     args = parser.parse_args()
     info = build_info(args.build_dir, args.source_dir)
-    created = git(args.source_dir, 'log', '-1', '--format=%cI', 'HEAD')
+    epoch = os.environ.get('SOURCE_DATE_EPOCH')
+    created = (datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc) if epoch
+               else None)
+    if created is None and (commit_time := git(args.source_dir, 'log', '-1', '--format=%cI',
+                                               'HEAD')):
+        created = datetime.datetime.fromisoformat(commit_time)
     doc_info = dict(info)
     if created:
-        doc_info['_created'] = datetime.datetime.fromisoformat(created).astimezone(
-            datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        doc_info['_created'] = created.astimezone(datetime.timezone.utc).strftime(
+            '%Y-%m-%dT%H:%M:%SZ')
     Path(args.info).write_text(json.dumps(info, indent=2, sort_keys=True) + '\n')
     Path(args.sbom).write_text(json.dumps(sbom(doc_info), indent=2, sort_keys=True) + '\n')
     return 0
