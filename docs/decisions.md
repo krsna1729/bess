@@ -6437,12 +6437,16 @@ decision cache's generations, and no static analysis beyond the layering checks.
   clang-analyzer); CI's clang-tidy 19 counts replaced it (below).
 - `check_includes.py`: 0 forbidden edges; `check_arch.py`: 7 allowlisted findings, no growth.
 
-**Review:** REVIEW
+**Review:** independent reviewer, two rounds. Round 1: incorrect (P2: the tidy regex dropped clang-analyzer
+findings; P3: baseline version; P3: an RteFlowBackend rule orphaned by a throwing record push), all fixed. Round 2:
+correct (confidence 0.8), three P3: TSan detection through `__has_feature` and `--strict` fixed; the handoff test's
+deadline under sanitizer slowdown recorded below.
 
 **Not done.** bessd under ASan (the daemon suites); TSan over a running
 daemon (the concurrency logic is covered in isolated components, which the roadmap allows); clang-tidy findings in
 the baseline (288 in 88 files with clang-tidy 22) are reviewed debt, removed as files are touched; a property test over the control
-transaction decoder beyond its fuzzer; `dataplane_handoff_threads_test` under CPU oversubscription (above).
+transaction decoder beyond its fuzzer; `dataplane_handoff_threads_test` under CPU oversubscription (above) and its
+fixed 25 s deadline under sanitizer slowdown (scale it before the sanitizer lanes gate).
 
 **Revisit when:** the sanitizer lanes are green for a week (make them gating); a new stateful battery lands (it needs
 a model, fault injection and, if shared, a TSan entry before it is called stable).
