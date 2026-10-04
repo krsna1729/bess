@@ -3,7 +3,7 @@
 // M14 (D-064): L2 lookup and learning across the three candidate backends.
 //
 //   BM_L2Lookup/<backend>/<n>/<stream>/<batch>   ns per lookup
-//     backend 0 l2::Fdb (generic WorkerFlowTable), 1 legacy l2_table
+//     backend 0 l2::Fdb over MacTable, 1 legacy l2_table
 //     (MAC-specialised 4-way cuckoo, L2Forward's), 2 std::unordered_map (the
 //     pre-M14 Bridge), 3 the generic flow substrate (WorkerFlowTable<FdbKey,
 //     InterfaceId>, the backend D-064 measured and rejected); 4/5/6 l2::BasicFdb

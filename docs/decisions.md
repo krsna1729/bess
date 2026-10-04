@@ -6556,7 +6556,7 @@ are not called):
 
   All 16/16 pairs except learn at 1M (15/16). This answers the review's L2 finding (MacTable 1M misses 19.9 ns
   against l2_table's 7.0): half the slot bytes (8 vs 16) and one 32-byte bucket probe per candidate.
-FDB over MacTable (backend 0, the templating with unchanged table code) against develop, B/A: with every
+- *FDB over MacTable (backend 0)*: the templating with unchanged table code, against develop, B/A: with every
   backend instantiated in one bench binary, +4 to +20%; with the new backends compiled out of B, scalar
   +5 to +8% (about 0.25 ns at 4.2-5.2 ns; 0-1/16 pairs favour B), batch-32 -4% to +5% (mixed sign), 1M rows
   no clear difference. Most of the first gap is code placement in the bench binary, not the templating; the
