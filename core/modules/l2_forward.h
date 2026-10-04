@@ -46,8 +46,9 @@ class L2Forward final : public Module {
   // One-word slots: commands write one at a time (the control thread runs
   // them in turn) while every worker reads without a lock (table policy,
   // user decision 1; D-017's guarantees). Value: gate + 1, so 0 is a miss.
-  // No cold word is used.
-  using Table = bess::l2::PackedMacTable<uint8_t, bess::dataplane::SingleWriter>;
+  // No cold word (an empty type allocates none).
+  struct NoCold {};
+  using Table = bess::l2::PackedMacTable<NoCold, bess::dataplane::SingleWriter>;
   std::unique_ptr<Table> table_;
   // Set by commands while workers read it: an atomic field, relaxed on both
   // sides (the gate is independent of the table).

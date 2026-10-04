@@ -393,6 +393,22 @@ TEST(FdbModelTest, PackedOwnerTableMatchesTheModel) { RunPacked<dataplane::Owner
 TEST(FdbModelTest, PackedSingleWriterTableMatchesTheModel) { RunPacked<dataplane::SingleWriter>(); }
 TEST(FdbModelTest, PackedMultiWriterTableMatchesTheModel) { RunPacked<dataplane::MultiWriter>(); }
 
+// Learning runs on the packet path: on a shared table it skips rather than
+// waits for another writer.
+TEST(FdbModelTest, LearningOnASharedTableSkipsWhenAnotherWriterHoldsIt) {
+  using SharedFdb = BasicFdb<PackedMacTable<dataplane::ExpiryHandle, dataplane::MultiWriter>>;
+  SharedFdb::Config c;
+  c.max_domains = 1;
+  auto fdb = std::move(*SharedFdb::Create(c));
+  const MacAddress mac{{0x02, 0, 0, 0, 0, 9}};
+  {
+    auto held = fdb->table().Lock();
+    EXPECT_EQ(LearnResult::kBusy, fdb->Learn(BridgeDomainId(0), mac, InterfaceId(3), 0));
+  }
+  EXPECT_EQ(dataplane::kInvalidInterfaceId, fdb->Lookup(BridgeDomainId(0), mac));
+  EXPECT_EQ(LearnResult::kLearned, fdb->Learn(BridgeDomainId(0), mac, InterfaceId(3), 0));
+}
+
 TEST(FdbModelTest, PackedTableHoldsOneDomain) {
   using PackedFdb = BasicFdb<PackedMacTable<dataplane::ExpiryHandle>>;
   PackedFdb::Config c;

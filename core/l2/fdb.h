@@ -10,6 +10,7 @@
 #include <cstring>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <new>
 #include <span>
 #include <vector>
@@ -85,6 +86,7 @@ enum class LearnResult : uint8_t {
   kStatic,     // a static entry exists; nothing changed
   kIgnored,    // multicast source, invalid interface or unknown domain
   kFull,       // no room; nothing changed
+  kBusy,       // another writer holds a shared table: skipped (the next packet learns)
 };
 
 enum class ProgramResult : uint8_t {
@@ -116,6 +118,7 @@ concept FdbStorage = requires(T t, const T ct, uint64_t key, uint32_t slot,
   { ct.capacity() } -> std::same_as<size_t>;
   { ct.memory_bytes() } -> std::same_as<size_t>;
   t.Lock();
+  { t.TryLock() } -> std::same_as<std::optional<typename T::Guard>>;
   T::kNotFound;
   T::kMaxBatch;
   T::kMaxDomains;
@@ -219,7 +222,12 @@ class BasicFdb {
         interface.value() > Table::kMaxValue || domain.value() >= max_domains_) {
       return LearnResult::kIgnored;
     }
-    [[maybe_unused]] auto guard = table_->Lock();
+    // Learning runs on the packet path: on a shared table it never waits for
+    // another writer (table policy decision 2); an owned table always gets it.
+    const std::optional<typename Table::Guard> guard = table_->TryLock();
+    if (!guard) {
+      return LearnResult::kBusy;
+    }
     const uint64_t key = Word(MakeKey(domain, mac));
     // Usable while now - last learned <= aging (the legacy Bridge's rule), so
     // the timer fires one tick after that.
@@ -364,6 +372,8 @@ class BasicFdb {
 
   size_t size() const noexcept { return table_->size(); }
   size_t capacity() const noexcept { return table_->capacity(); }
+  // The storage, for an owner that shares it (its readers) or holds its lock.
+  Table &table() noexcept { return *table_; }
   size_t dynamic_entries() const noexcept { return wheel_->size(); }
   size_t memory_bytes() const noexcept {
     return table_->memory_bytes() + wheel_->memory_bytes() + sizeof(*this);

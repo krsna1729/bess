@@ -6510,10 +6510,15 @@ the module as C++ types. No table offered both lock-free readers on many workers
   bridge domain per table. Readers on any thread see a slot whole; a move writes its destination before clearing its
   source; a move path is bracketed by an odd sequence number that a reader re-checks only on a miss, so a hit costs
   no more than l2_table's and a key present throughout is never missed (l2_table's one-step move could not move an
-  entry back into its primary and so needed no sequence; this table's search can). `MultiWriter` adds the table's
-  spinlock with `Lock` and `TryLock` (packet-path learning skips on contention: plan decision 2).
+  entry back into its primary and so needed no sequence; this table's search can). A reader retries at most
+  `kMaxRetries` (64) times, so a writer preempted inside a move path cannot stall workers: past that a miss stands,
+  which for L2Forward sends one packet to the default gate. `MultiWriter` adds the table's spinlock with `Lock` and
+  `TryLock`; `BasicFdb::Learn` uses `TryLock` and returns `kBusy` instead of waiting (plan decision 2).
 - **L2Forward** keeps its five commands and arguments (`size * bucket` entries) on `PackedMacTable<SingleWriter>`;
-  value = gate + 1. **l2_table is deleted** from bessd; a frozen copy remains only as the benchmarks' baseline.
+  value = gate + 1. The same arguments now take twice the slot memory (the table runs at 50% load; l2_table filled
+  every slot it could reach, and its one-step move left some unreachable): 64 KiB instead of 32 KiB by default, 4 GiB
+  instead of 2 GiB at the largest accepted size, so a configuration at the memory limit can now fail Init with
+  ENOMEM. No cold array (an empty `Cold` allocates none). **l2_table is deleted** from bessd; a frozen copy remains only as the benchmarks' baseline.
 - **Bridge** stays on `Fdb` (MacTable): it needs many bridge domains, which one-word slots cannot hold.
 
 **Evidence.** EVIDENCE

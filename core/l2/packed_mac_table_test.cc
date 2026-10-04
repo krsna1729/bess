@@ -129,12 +129,27 @@ TYPED_TEST(PackedMacTableTest, KeysWithADomainNeverMatch) {
   EXPECT_EQ(t->Lookup(Key(0x0200'0000'0001) | 1), 0u);
   EXPECT_EQ(t->Find(Key(0x0200'0000'0001) | 0xFFFF), Table::kNotFound);
   EXPECT_EQ(t->Insert(Key(0x0200'0000'0002) | 3, 5, 0), Table::kNotFound);
+  // Value 0 would read as a miss, and values wider than the slot do not fit.
+  EXPECT_EQ(t->Insert(Key(0x0200'0000'0004), 0, 0), Table::kNotFound);
+  EXPECT_EQ(t->Insert(Key(0x0200'0000'0004), Table::kMaxValue + 1, 0), Table::kNotFound);
   // The all-ones MAC is an ordinary key.
   ASSERT_NE(t->Insert(Key(~uint64_t{0}), 9, 1), Table::kNotFound);
   EXPECT_EQ(t->Lookup(Key(~uint64_t{0})), 9u);
 }
 
 // Deterministic (D-007): a reader at the exact point inside a move.
+
+// One key through the scalar or the batch reader.
+template <typename Table>
+uint32_t Read(const Table &t, uint64_t key, bool batch) {
+  if (!batch) {
+    return t.Lookup(key);
+  }
+  uint16_t value = 0xFFFF;
+  const uint64_t hits = t.LookupBatch(std::span<const uint64_t>(&key, 1), &value);
+  EXPECT_EQ(hits != 0, value != 0);
+  return value;
+}
 
 template <typename Sync>
 class PackedMacTableSharedTest : public ::testing::Test {};
@@ -172,75 +187,102 @@ TYPED_TEST(PackedMacTableSharedTest, AReaderMidMoveFindsTheEntry) {
 // into the primary before the reader probes the alternate: both probes miss,
 // and only the move sequence tells the reader to look again.
 TYPED_TEST(PackedMacTableSharedTest, AReaderBetweenProbesRetriesAfterAMove) {
-  using Table = PackedMacTable<uint32_t, TypeParam>;
-  auto t = Table::Create(256);
-  const uint64_t k = Key(0x0200'0000'0001);
-  const size_t primary = t->PrimaryBucketForTesting(k);
-  // Fill k's primary bucket with keys whose primary it also is.
-  std::vector<uint64_t> fillers;
-  for (uint64_t m = 0x0400'0000'0000; fillers.size() < Table::kWays; m++) {
-    const uint64_t f = Key(m);
-    if (t->PrimaryBucketForTesting(f) == primary) {
-      ASSERT_NE(t->Insert(f, 1, 0), Table::kNotFound);
-      ASSERT_EQ(t->Find(f) / Table::kWays, primary);
-      fillers.push_back(f);
+  for (const bool batch : {false, true}) {
+    SCOPED_TRACE(batch ? "LookupBatch" : "Lookup");
+    using Table = PackedMacTable<uint32_t, TypeParam>;
+    auto t = Table::Create(256);
+    const uint64_t k = Key(0x0200'0000'0001);
+    const size_t primary = t->PrimaryBucketForTesting(k);
+    // Fill k's primary bucket with keys whose primary it also is.
+    std::vector<uint64_t> fillers;
+    for (uint64_t m = 0x0400'0000'0000; fillers.size() < Table::kWays; m++) {
+      const uint64_t f = Key(m);
+      if (t->PrimaryBucketForTesting(f) == primary) {
+        ASSERT_NE(t->Insert(f, 1, 0), Table::kNotFound);
+        ASSERT_EQ(t->Find(f) / Table::kWays, primary);
+        fillers.push_back(f);
+      }
     }
+    ASSERT_NE(t->Insert(k, 9, 0), Table::kNotFound);
+    const uint32_t from = t->Find(k);
+    ASSERT_EQ(from / Table::kWays, t->AltBucketForTesting(k)) << "k went to its alternate";
+    t->Erase(t->Find(fillers[0]));
+    const uint32_t to = t->FreeSlotForTesting(primary);
+    ASSERT_NE(to, Table::kNotFound);
+    int moved = 0;
+    t->between_probes_hook = [&](uint64_t key) {
+      if (key == k && moved++ == 0) {
+        t->MoveForTesting(to, from);
+      }
+    };
+    EXPECT_EQ(Read(*t, k, batch), 9u) << "the reader missed an entry that moved under it";
+    EXPECT_EQ(moved, 1) << "the retry found k in its primary";
+    t->between_probes_hook = nullptr;
+    EXPECT_EQ(t->Find(k), to);
   }
-  ASSERT_NE(t->Insert(k, 9, 0), Table::kNotFound);
-  const uint32_t from = t->Find(k);
-  ASSERT_EQ(from / Table::kWays, t->AltBucketForTesting(k)) << "k went to its alternate";
-  t->Erase(t->Find(fillers[0]));
-  const uint32_t to = t->FreeSlotForTesting(primary);
-  ASSERT_NE(to, Table::kNotFound);
-  int moved = 0;
-  t->between_probes_hook = [&](uint64_t key) {
-    if (key == k && moved++ == 0) {
-      t->MoveForTesting(to, from);
-    }
-  };
-  EXPECT_EQ(t->Lookup(k), 9u) << "the reader missed an entry that moved under it";
-  EXPECT_EQ(moved, 1) << "the retry found k in its primary";
-  t->between_probes_hook = nullptr;
-  EXPECT_EQ(t->Find(k), to);
 }
 
 // A reader that starts while a move path is being written (the sequence is
 // odd), misses the primary, and then sees the entry leave the alternate for
 // the primary: it must not trust its misses until the path ends.
 TYPED_TEST(PackedMacTableSharedTest, AReaderStartingInsideAMovePathDoesNotTrustAMiss) {
-  using Table = PackedMacTable<uint32_t, TypeParam>;
-  auto t = Table::Create(256);
-  const uint64_t k = Key(0x0200'0000'0003);
-  const size_t primary = t->PrimaryBucketForTesting(k);
-  std::vector<uint64_t> fillers;
-  for (uint64_t m = 0x0600'0000'0000; fillers.size() < Table::kWays; m++) {
-    const uint64_t f = Key(m);
-    if (t->PrimaryBucketForTesting(f) == primary) {
-      ASSERT_NE(t->Insert(f, 1, 0), Table::kNotFound);
-      fillers.push_back(f);
+  for (const bool batch : {false, true}) {
+    SCOPED_TRACE(batch ? "LookupBatch" : "Lookup");
+    using Table = PackedMacTable<uint32_t, TypeParam>;
+    auto t = Table::Create(256);
+    const uint64_t k = Key(0x0200'0000'0003);
+    const size_t primary = t->PrimaryBucketForTesting(k);
+    std::vector<uint64_t> fillers;
+    for (uint64_t m = 0x0600'0000'0000; fillers.size() < Table::kWays; m++) {
+      const uint64_t f = Key(m);
+      if (t->PrimaryBucketForTesting(f) == primary) {
+        ASSERT_NE(t->Insert(f, 1, 0), Table::kNotFound);
+        fillers.push_back(f);
+      }
+    }
+    ASSERT_NE(t->Insert(k, 4, 0), Table::kNotFound);
+    const uint32_t from = t->Find(k);
+    ASSERT_EQ(from / Table::kWays, t->AltBucketForTesting(k));
+    t->Erase(t->Find(fillers[0]));
+    const uint32_t to = t->FreeSlotForTesting(primary);
+    t->BeginMovesForTesting();  // the writer is inside a path
+    int calls = 0;
+    t->between_probes_hook = [&](uint64_t key) {
+      if (key != k) {
+        return;
+      }
+      if (calls++ == 0) {
+        t->MoveStepForTesting(to, from);  // k leaves the alternate; the path goes on
+      } else {
+        t->EndMovesForTesting();  // the retry waited for the path to end
+      }
+    };
+    EXPECT_EQ(Read(*t, k, batch), 4u) << "a miss inside a move path was trusted";
+    t->between_probes_hook = nullptr;
+    if (calls < 2) {
+      t->EndMovesForTesting();
     }
   }
-  ASSERT_NE(t->Insert(k, 4, 0), Table::kNotFound);
-  const uint32_t from = t->Find(k);
-  ASSERT_EQ(from / Table::kWays, t->AltBucketForTesting(k));
-  t->Erase(t->Find(fillers[0]));
-  const uint32_t to = t->FreeSlotForTesting(primary);
-  t->BeginMovesForTesting();  // the writer is inside a path
-  int calls = 0;
-  t->between_probes_hook = [&](uint64_t key) {
-    if (key != k) {
-      return;
-    }
-    if (calls++ == 0) {
-      t->MoveStepForTesting(to, from);  // k leaves the alternate; the path goes on
-    } else {
-      t->EndMovesForTesting();  // the retry waited for the path to end
-    }
-  };
-  EXPECT_EQ(t->Lookup(k), 4u) << "a miss inside a move path was trusted";
-  t->between_probes_hook = nullptr;
-  if (calls < 2) {
+}
+
+// A writer that stops inside a move path (preempted) must not stall readers:
+// after kMaxRetries a miss stands.
+TYPED_TEST(PackedMacTableSharedTest, AReaderGivesUpOnAWriterStuckInAMovePath) {
+  for (const bool batch : {false, true}) {
+    SCOPED_TRACE(batch ? "LookupBatch" : "Lookup");
+    using Table = PackedMacTable<uint32_t, TypeParam>;
+    auto t = Table::Create(64);
+    const uint64_t absent = Key(0x0200'0000'0077);
+    unsigned probes = 0;
+    t->between_probes_hook = [&](uint64_t) { probes++; };
+    t->BeginMovesForTesting();  // and never ends it during the lookup
+    EXPECT_EQ(Read(*t, absent, batch), 0u);
+    // The batch probes once itself, then retries through Lookup.
+    EXPECT_EQ(probes, Table::kMaxRetries + (batch ? 2u : 1u));
     t->EndMovesForTesting();
+    probes = 0;
+    EXPECT_EQ(Read(*t, absent, batch), 0u);
+    EXPECT_EQ(probes, 1u) << "a stable miss is final at once";
   }
 }
 

@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 
 #include "arch/cpu.h"
+#include "arch/crc32c.h"
 #include "arch/word_probe.h"
 #include "dataplane/table_policy.h"
 #include "utils/common.h"
@@ -79,6 +80,12 @@ class PackedMacTable {
   static constexpr size_t kMaxDomains = 1;
   static constexpr uint32_t kMaxValue = (1u << 14) - 1;
   static constexpr size_t kHugePage = size_t{2} << 20;
+  // A reader's retries after a miss while moves run. The writer's move path is
+  // short, but a writer that is preempted inside one must not stall readers:
+  // past this many the miss stands (for L2Forward: the default gate, once).
+  static constexpr unsigned kMaxRetries = 64;
+  // An empty Cold costs nothing: no cold array.
+  static constexpr bool kHasCold = !std::is_empty_v<Cold>;
 
   using writers = Sync;
   using readers =
@@ -146,23 +153,27 @@ class PackedMacTable {
     const size_t bytes = buckets * kWays * sizeof(uint64_t);
     const size_t align = bytes >= kHugePage ? kHugePage : 64;
     t->slots_ = static_cast<uint64_t *>(std::aligned_alloc(align, (bytes + align - 1) & ~(align - 1)));
-    t->cold_ = static_cast<Cold *>(std::malloc(buckets * kWays * sizeof(Cold)));
-    if (t->slots_ == nullptr || t->cold_ == nullptr) {
+    if constexpr (kHasCold) {
+      t->cold_ = static_cast<Cold *>(std::malloc(buckets * kWays * sizeof(Cold)));
+    }
+    if (t->slots_ == nullptr || (kHasCold && t->cold_ == nullptr)) {
       return nullptr;
     }
     if (align == kHugePage) {
       (void)madvise(t->slots_, bytes, MADV_HUGEPAGE);  // advisory
     }
     std::memset(static_cast<void *>(t->slots_), 0, bytes);
-    for (size_t i = 0; i < buckets * kWays; i++) {
-      new (&t->cold_[i]) Cold{};
+    if constexpr (kHasCold) {
+      for (size_t i = 0; i < buckets * kWays; i++) {
+        new (&t->cold_[i]) Cold{};
+      }
     }
     return t;
   }
 
   ~PackedMacTable() {
     std::free(slots_);
-    std::free(cold_);
+    std::free(cold_);  // null without a cold array
   }
   PackedMacTable(const PackedMacTable &) = delete;
   PackedMacTable &operator=(const PackedMacTable &) = delete;
@@ -174,7 +185,7 @@ class PackedMacTable {
   uint32_t Lookup(uint64_t key) const noexcept {
     const uint64_t want = Want(key);
     const uint64_t h = Hash(key);
-    for (;;) {
+    for (unsigned attempt = 0;; attempt++) {
       const uint32_t seq = kShared ? moves_.load(std::memory_order_acquire) : 0;
       const size_t b1 = h & mask_;
       uint64_t word = ProbeWord(b1, want);
@@ -190,15 +201,19 @@ class PackedMacTable {
       if (word != 0) {
         return ValueOf(word);
       }
-      if (!kShared || Stable(seq)) {
+      if (!kShared || Stable(seq) || attempt == kMaxRetries) {
         return 0;
       }
+      arch::CpuRelax();
     }
   }
 
   // values[i] = the value for keys[i], 0 for a miss; bit i set for a hit.
+  // The move sequence is read once for the batch and checked once after it,
+  // only if something missed; an unstable batch looks its misses up again.
   uint64_t LookupBatch(std::span<const uint64_t> keys, uint16_t *values) const noexcept {
     promise(keys.size() <= kMaxBatch);
+    const uint32_t seq = kShared ? moves_.load(std::memory_order_acquire) : 0;
     uint64_t hashes[kMaxBatch];
     for (size_t i = 0; i < keys.size(); i++) {
       const uint64_t h = Hash(keys[i]);
@@ -212,19 +227,26 @@ class PackedMacTable {
       const size_t b1 = hashes[i] & mask_;
       uint64_t word = ProbeWord(b1, want);
       if (word == 0) {
+        BESS_PMT_HOOK(between_probes_hook, keys[i]);
         if constexpr (kShared) {
           std::atomic_thread_fence(std::memory_order_acquire);
         }
         word = ProbeWord(Alt(b1, hashes[i]), want);
-        if constexpr (kShared) {
-          if (word == 0) {
-            const uint32_t v = Lookup(keys[i]);  // rare: re-check under the sequence
-            word = v != 0 ? (uint64_t{v} << 48) : 0;
-          }
-        }
       }
       values[i] = static_cast<uint16_t>(ValueOf(word));
       hits |= uint64_t{word != 0} << i;
+    }
+    if constexpr (kShared) {
+      const uint64_t all = keys.size() == 64 ? ~uint64_t{0} : (uint64_t{1} << keys.size()) - 1;
+      uint64_t misses = ~hits & all;
+      if (misses != 0 && !Stable(seq)) {  // rare: a move ran during the batch
+        for (; misses != 0; misses &= misses - 1) {
+          const unsigned i = static_cast<unsigned>(__builtin_ctzll(misses));
+          const uint32_t v = Lookup(keys[i]);
+          values[i] = static_cast<uint16_t>(v);
+          hits |= uint64_t{v != 0} << i;
+        }
+      }
     }
     return hits;
   }
@@ -249,7 +271,8 @@ class PackedMacTable {
   // `flags` (0 or 1), or kNotFound if full or no free slot is reachable. May
   // move other entries.
   uint32_t Insert(uint64_t key, uint16_t value, uint8_t flags) noexcept {
-    if (size_ >= capacity_ || (key & 0xFFFF) != 0) {
+    // Value 0 reads as a miss; a nonzero domain does not fit.
+    if (size_ >= capacity_ || (key & 0xFFFF) != 0 || value == 0 || value > kMaxValue) {
       return kNotFound;
     }
     const uint64_t h = Hash(key);
@@ -265,7 +288,7 @@ class PackedMacTable {
     if (s == kNotFound) {
       return kNotFound;
     }
-    cold_[s] = Cold{};
+    ResetCold(s);
     Store(s, Make(Mac(key), value, flags));
     size_++;
     return s;
@@ -273,12 +296,13 @@ class PackedMacTable {
 
   void Erase(uint32_t s) noexcept {
     Store(s, 0);
-    cold_[s] = Cold{};
+    ResetCold(s);
     size_--;
   }
 
   uint64_t key(uint32_t s) const noexcept { return (Load(s) & kMacMask) << 16; }
   uint32_t value(uint32_t s) const noexcept { return ValueOf(Load(s)); }
+  // 1..kMaxValue (0 would read as a miss).
   void set_value(uint32_t s, uint16_t v) noexcept {
     const uint64_t w = Load(s);
     Store(s, (w & ~kValueMask) | (uint64_t{v} << 48 & kValueMask));
@@ -288,7 +312,11 @@ class PackedMacTable {
     const uint64_t w = Load(s);
     Store(s, (w & ~kFlagBit) | (f ? kFlagBit : 0));
   }
-  Cold &cold(uint32_t s) noexcept { return cold_[s]; }
+  Cold &cold(uint32_t s) noexcept
+    requires kHasCold
+  {
+    return cold_[s];
+  }
 
   // fn(slot) for every occupied slot. fn may Erase that slot (never Insert).
   template <typename Fn>
@@ -303,7 +331,7 @@ class PackedMacTable {
   size_t size() const noexcept { return size_; }
   size_t capacity() const noexcept { return capacity_; }
   size_t memory_bytes() const noexcept {
-    return nbuckets_ * kWays * (sizeof(uint64_t) + sizeof(Cold)) + sizeof(*this);
+    return nbuckets_ * kWays * (sizeof(uint64_t) + (kHasCold ? sizeof(Cold) : 0)) + sizeof(*this);
   }
 
  private:
@@ -329,14 +357,16 @@ class PackedMacTable {
     return static_cast<uint32_t>((word & kValueMask) >> 48);
   }
 
-  // MacTable's hash and involutive alternate (see mac_table.h).
+  // One CRC32C instruction, spread over 64 bits by one multiply: the low
+  // bits (the bucket) are a bijection of the CRC's, the high half (the
+  // alternate's tag) mixes all of them. A CRC alone is linear, which gives a
+  // bucket's keys one alternate (MacTable's note); the product does not.
+  // Cheaper than MacTable's splitmix64 (measured: scalar lookups, D-073).
   static uint64_t Hash(uint64_t key) noexcept {
-    key ^= key >> 30;
-    key *= 0xbf58476d1ce4e5b9ull;
-    key ^= key >> 27;
-    key *= 0x94d049bb133111ebull;
-    return key ^ (key >> 31);
+    return uint64_t{arch::Crc32c(key, 0)} * 0x9E3779B97F4A7C15ull;
   }
+  // The alternate bucket; an involution (Alt(Alt(b)) == b), so a resident
+  // entry's other bucket follows from its key and its present bucket.
   size_t Alt(size_t b, uint64_t h) const noexcept { return (b ^ ((h >> 32) | 1)) & mask_; }
 
   uint64_t Load(uint32_t s) const noexcept {
@@ -389,8 +419,15 @@ class PackedMacTable {
   }
 
   // Moves the entry in `from` to the free slot `to`: destination first.
+  void ResetCold(uint32_t s) noexcept {
+    if constexpr (kHasCold) {
+      cold_[s] = Cold{};
+    }
+  }
   void Move(uint32_t to, uint32_t from) noexcept {
-    cold_[to] = cold_[from];
+    if constexpr (kHasCold) {
+      cold_[to] = cold_[from];
+    }
     const uint64_t word = Load(from);
     Store(to, word);
     BESS_PMT_HOOK(mid_move_hook, word);

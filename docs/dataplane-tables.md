@@ -479,7 +479,8 @@ reference to something missing.
   a move writes its destination before clearing its source, and a move
   path is bracketed by an odd sequence number that a reader re-checks only
   on a miss, so a key present throughout is never missed and a hit costs no
-  extra. Proven by deterministic tests at each point inside a move
+  extra. The re-check is bounded (`kMaxRetries`, 64): a writer preempted
+  inside a move path cannot stall readers, at the price of a rare miss. Proven by deterministic tests at each point inside a move
   (`packed_mac_table_test.cc`), each of which fails if that ordering is
   removed.
 - **Used by:** L2Forward (`SingleWriter`); `BasicFdb<PackedMacTable<...>>`

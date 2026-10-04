@@ -111,19 +111,28 @@ void BM_L2Lookup(benchmark::State &state) {
   }
   uint64_t sink = 0, hits = 0;
   size_t pos = 0;
+  // The loop's counters are the lambda's locals (written back after), as in
+  // the other backends' inline loops: captured by reference they would be
+  // loaded and stored through memory every iteration.
   const auto run_fdb = [&](auto f) {
     InterfaceId out[Fdb::kMaxBatch];
+    uint64_t s = 0, h = 0;
+    size_t p = 0;
+    const MacAddress *m = macs.data();
+    const FdbKey *k = keys.data();
     for (auto _ : state) {
       if (batch == 1) {
-        const InterfaceId got = f->Lookup(kD, macs[pos]);
-        sink += got.value();
-        hits += got != bess::dataplane::kInvalidInterfaceId;
+        const InterfaceId got = f->Lookup(kD, m[p]);
+        s += got.value();
+        h += got != bess::dataplane::kInvalidInterfaceId;
       } else {
-        sink += f->LookupBatch(std::span<const FdbKey>(&keys[pos], batch),
-                               std::span<InterfaceId>(out, batch));
+        s += f->LookupBatch(std::span<const FdbKey>(&k[p], batch),
+                            std::span<InterfaceId>(out, batch));
       }
-      pos = (pos + batch) & (kStream - 1);
+      p = (p + batch) & (kStream - 1);
     }
+    sink += s;
+    hits += h;
   };
   if (backend == 0) {
     run_fdb(FdbWith(n));
@@ -225,10 +234,13 @@ void BM_L2Learn(benchmark::State &state) {
     c.max_domains = 1;
     auto f = F::Create(c).value();
     for (uint32_t i = 0; i < n; i++) (void)f->Learn(kD, Mac(i), InterfaceId(1), now);
+    size_t p = 0;
+    uint64_t t = now;
+    const MacAddress *m = macs.data();
     for (auto _ : state) {
       benchmark::DoNotOptimize(
-          f->Learn(kD, macs[pos], InterfaceId(static_cast<uint16_t>(1 + (pos & 3))), ++now));
-      pos = (pos + 1) & (kStream - 1);
+          f->Learn(kD, m[p], InterfaceId(static_cast<uint16_t>(1 + (p & 3))), ++t));
+      p = (p + 1) & (kStream - 1);
     }
   };
   if (backend == 0) {

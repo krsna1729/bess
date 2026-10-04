@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <optional>
 #include <span>
 #include <type_traits>
 
@@ -58,6 +59,7 @@ class MacTable {
   using growth = dataplane::Fixed;
   using Guard = dataplane::NoLock;
   Guard Lock() noexcept { return {}; }
+  std::optional<Guard> TryLock() noexcept { return Guard{}; }
 
   static std::unique_ptr<MacTable> Create(size_t capacity) {
     if (capacity == 0 || capacity > (size_t{1} << 28)) {
