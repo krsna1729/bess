@@ -66,7 +66,8 @@ class RouterAppliance final : public Module {
     for (int i = 0; i < batch->cnt(); i++) {
       bess::PacketRef pkt = batch->packet(i);
       const RouterApp::Decision d =
-          app_->Process(ingress, std::span<uint8_t>(pkt.head_data<uint8_t *>(), pkt.head_len()));
+          app_->Process(ingress, std::span<uint8_t>(pkt.head_data<uint8_t *>(), pkt.head_len()),
+                        pkt.total_len());
       if (d.verdict == RouterApp::Verdict::kForward) {
         EmitPacket(ctx, pkt, static_cast<gate_idx_t>(d.egress.value() - 1));
       } else {
@@ -75,8 +76,14 @@ class RouterAppliance final : public Module {
     }
   }
 
+  // On a private RouterApp: the self test moves a neighbor, which must not
+  // change what the module forwards.
   CommandResponse CommandSelfTest(const bess::pb::EmptyArg &) {
-    if (std::string failed = SelfTest(); !failed.empty()) {
+    auto made = RouterApp::Create(init_context().rcu());
+    if (!made) {
+      return CommandFailure(EINVAL, "%s", made.error().c_str());
+    }
+    if (std::string failed = SelfTest(**made); !failed.empty()) {
       return CommandFailure(EINVAL, "R1 direct path: %s", failed.c_str());
     }
     return CommandSuccess();
@@ -84,15 +91,15 @@ class RouterAppliance final : public Module {
 
  private:
   // The direct path, no graph. Returns "" or what failed.
-  std::string SelfTest() {
+  static std::string SelfTest(RouterApp &app) {
     using V = RouterApp::Verdict;
     const uint32_t host = 0x0a010203;  // 10.1.2.3: routed in both VRFs
     // Overlapping VRFs: the same destination leaves VRF 1 by the ECMP pair
     // (if1/if2) and VRF 2 by if3.
     auto f1 = UdpFrame(0xc0a80001, host, 1000);
     auto f2 = f1;
-    const RouterApp::Decision in1 = app_->Process(If(1), f1);
-    const RouterApp::Decision in2 = app_->Process(If(3), f2);
+    const RouterApp::Decision in1 = app.Process(If(1), f1);
+    const RouterApp::Decision in2 = app.Process(If(3), f2);
     if (in1.verdict != V::kForward || (in1.egress.value() != 1 && in1.egress.value() != 2)) {
       return "VRF 1 did not use its ECMP pair";
     }
@@ -107,8 +114,8 @@ class RouterAppliance final : public Module {
     for (uint16_t port = 1; port <= 256; port++) {
       auto a = UdpFrame(0xc0a80001, host, port);
       auto b = a;
-      const auto da = app_->Process(If(1), a);
-      const auto db = app_->Process(If(1), b);
+      const auto da = app.Process(If(1), a);
+      const auto db = app.Process(If(1), b);
       if (da.egress != db.egress) {
         return "a flow changed path";
       }
@@ -119,37 +126,37 @@ class RouterAppliance final : public Module {
     }
     // A neighbor update: if3's gateway moves to another MAC. Forwarding follows
     // at once and no route is written.
-    const size_t routes = app_->router().route_count();
-    const size_t writes = app_->route_writes();
+    const size_t routes = app.router().route_count();
+    const size_t writes = app.route_writes();
     bess::utils::Ethernet::Address moved;
     const uint8_t mac[6] = {0x02, 0, 0, 0, 0, 0xb3};
     std::memcpy(&moved, mac, 6);
-    if (!app_->LearnNeighbor(If(3), RouterApp::kGatewayC, moved)) {
+    if (!app.LearnNeighbor(If(3), RouterApp::kGatewayC, moved)) {
       return "neighbor update";
     }
     auto f3 = UdpFrame(0xc0a80001, host, 1000);
-    if (app_->Process(If(3), f3).verdict != V::kForward || std::memcmp(f3.data(), mac, 6) != 0) {
+    if (app.Process(If(3), f3).verdict != V::kForward || std::memcmp(f3.data(), mac, 6) != 0) {
       return "the new MAC is not used";
     }
-    if (app_->router().route_count() != routes || app_->route_writes() != writes) {
+    if (app.router().route_count() != routes || app.route_writes() != writes) {
       return "a route was written for a neighbor change";
     }
     // Unresolved neighbor: the application drops.
-    if (!app_->LearnNeighbor(If(3), RouterApp::kGatewayC, moved,
+    if (!app.LearnNeighbor(If(3), RouterApp::kGatewayC, moved,
                              bess::route::NeighborState::kIncomplete)) {
       return "neighbor state";
     }
     auto f4 = UdpFrame(0xc0a80001, host, 1000);
-    const bool unresolved = app_->Process(If(3), f4).verdict == V::kUnresolved;
-    (void)app_->LearnNeighbor(If(3), RouterApp::kGatewayC, moved);  // restore
+    const bool unresolved = app.Process(If(3), f4).verdict == V::kUnresolved;
+    (void)app.LearnNeighbor(If(3), RouterApp::kGatewayC, moved);  // resolved again for the TTL case
     if (!unresolved) {
       return "an unresolved neighbor was forwarded to";
     }
     // No route, TTL expiry.
     auto f5 = UdpFrame(0xc0a80001, 0x08080808, 1000);
     auto f6 = UdpFrame(0xc0a80001, host, 1000, 1);
-    if (app_->Process(If(1), f5).verdict != V::kNoRoute ||
-        app_->Process(If(3), f6).verdict != V::kTtlExpired) {
+    if (app.Process(If(1), f5).verdict != V::kNoRoute ||
+        app.Process(If(3), f6).verdict != V::kTtlExpired) {
       return "a miss or an expired TTL was forwarded";
     }
     return "";
@@ -160,7 +167,7 @@ class RouterAppliance final : public Module {
 
 const Commands RouterAppliance::cmds = {
     {"self_test", "EmptyArg", MODULE_CMD_FUNC(&RouterAppliance::CommandSelfTest),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_UNSAFE},  // the private RouterApp is destroyed with workers paused
 };
 
 BESS_PLUGIN_REQUIRES("router_appliance", "1.0.0", BESS_CAP_INIT_CONTEXT);

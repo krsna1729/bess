@@ -7210,12 +7210,16 @@ against (persona D, D-074 era): code that uses non-header-only batteries (the ro
 - R5 (a mode of R3, `EnableHierarchy`): a cold flow is evaluated per packet and counted in a worker-owned flow table,
   nothing cached; the application's rule (hot at the third packet) installs its decision in the cache and calls the
   application's promotion hook, which installs a hardware rule through the flow-rule owner (a fake device in the self
-  test). BESS defines neither the hotness rule nor the promotion.
+  test). A group switch calls the revocation hook for the tenant, so hardware copies follow the generation as the
+  cache does; cold counts age out (idle for `idle_after` default-path packets, an incremental two-slot sweep), so
+  one-off flows cannot fill the table. BESS defines neither the hotness rule nor the promotion.
 - R4 session datapath, in-tree: the application's Session, PdrLikeRule, SessionAction and QosPolicy (none a BESS
   action type), its three resources (QoS, actions referencing the QoS and the router's next hops, rules referencing
   the actions) registered with BESS's router in one engine. One transaction installs a session across both owners --
   the router's next hop and route, the application's QoS policy, action and rule -- and the fused path classifies the
-  UE's downlink, meters it, resolves the router's next hop and writes the session's GTP-U header. A transaction whose
+  UE's downlink, meters it, routes it to its eNodeB through the FIB the transaction wrote (without the route it has no
+  way out) and writes the session's GTP-U header in front of the inner packet. Not shown: R4 as a graph vertical slice
+  (modules over the same resources), which the roadmap also asks for. A transaction whose
   action names a next hop nobody installs is refused whole; the router's next hop cannot be removed while the
   application's action names it, and goes in one transaction with the session (referrers first). In-tree because an
   application resource reaches the wire through a codec, and codecs are internal (D-074): a public codec facade is
@@ -7227,7 +7231,10 @@ on the graph path R1 moves 172.16.1.1 to gate 0, R2 an inside host's UDP and R3 
 the inbound firewall allowed to start connections fails R2 ("an outside-started connection was admitted"); a group
 switch without the generation increment fails R3 ("tenant 0 still allows web after its switch"). R5: two cold packets
 cache nothing; the third caches the decision and installs one rule on the fake device; the fourth hits. R4
-(`dataplane_session_reference_test`, 4 tests): pass. Found on
+(`dataplane_session_reference_test`, 4 tests): pass. Review fixes: the appliances parse with the packet's total
+length (multi-segment packets); R1's self test runs on a private RouterApp (it moves a neighbor); R3/R5's self test
+drains the runtime domain before returning (retired policies are freed by plugin code); R5 mutants -- no sweep, no
+revocation -- fail its self test ("one-off flows filled the cold counts", "a revoked decision stayed in hardware"). Found on
 the way: a NAT whose expiry wheel starts at clock 0 while packets carry the TSC clock refuses every mapping (the
 deadline is beyond the wheel's horizon): the module starts the wheels at the packet clock's now, as the in-tree NAT
 module does.

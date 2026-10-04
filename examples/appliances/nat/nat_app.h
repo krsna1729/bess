@@ -56,10 +56,11 @@ class NatApp {
   // Outbound (inside -> outside): the firewall admits it (and may start a
   // connection), then the NAT maps the source. Inbound: the NAT maps the
   // destination back through the reverse alias, then the firewall admits it
-  // only as part of a connection started inside.
-  Verdict Process(std::span<uint8_t> frame, bool outbound, Tick now) noexcept {
+  // only as part of a connection started inside. `frame` is the packet's
+  // first segment, `total_len` the packet's length (0: the span's).
+  Verdict Process(std::span<uint8_t> frame, bool outbound, Tick now, size_t total_len = 0) noexcept {
     bess::conntrack::ParsedFlowPacket p;
-    if (bess::conntrack::ParseFrame(frame, p) != bess::conntrack::ParseStatus::kOk) {
+    if (bess::conntrack::ParseFrame(frame, p, total_len) != bess::conntrack::ParseStatus::kOk) {
       return Verdict::kNotTranslated;
     }
     if (outbound) {
@@ -76,7 +77,7 @@ class NatApp {
       return Verdict::kNotTranslated;  // no mapping: dropped
     }
     // Re-parse: the rewrite changed the destination the firewall keys on.
-    if (bess::conntrack::ParseFrame(frame, p) != bess::conntrack::ParseStatus::kOk ||
+    if (bess::conntrack::ParseFrame(frame, p, total_len) != bess::conntrack::ParseStatus::kOk ||
         !Admitted(frame, p, now, /*may_create=*/false)) {
       return Verdict::kRefused;
     }

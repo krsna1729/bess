@@ -21,7 +21,11 @@
 // the default path -- evaluated per packet, nothing cached -- while the
 // application counts it; when the application's own hotness rule says so, the
 // decision is installed in the cache (the fast path) and handed to the
-// application's promotion hook (a hardware flow, for example). BESS defines
+// application's promotion hook (a hardware flow, for example). A group switch
+// calls the revocation hook for the tenant: copies of its decisions outside the
+// cache (the hardware rules) follow its generation, as the cache does. Cold
+// counts age: a flow idle for `idle_after` default-path packets is forgotten
+// (an incremental sweep), so one-off flows cannot fill the table. BESS defines
 // neither the rule nor the promotion.
 
 #include <array>
@@ -106,27 +110,34 @@ class VswitchApp {
     }
   }
 
-  using Promote = std::function<void(const VswitchKey &, CompiledDecision)>;
+  struct Hierarchy {
+    uint32_t hot_after = 3;      // packets on the default path before a flow is hot
+    uint32_t idle_after = 4096;  // default-path packets after which a cold count is forgotten
+    // A hot flow's decision, just cached.
+    std::function<void(const VswitchKey &, CompiledDecision)> promote;
+    // A tenant's generation moved: its promoted decisions are stale.
+    std::function<void(size_t tenant)> revoke;
+  };
 
-  // R5: flows start cold; a flow's decision is cached once it has sent
-  // `hot_after` packets (the application's rule), and `promote` sees it then.
-  bool EnableHierarchy(uint32_t hot_after, Promote promote) {
+  // R5: flows start cold; a flow's decision is cached once it is hot by the
+  // application's rule, and the hooks see promotions and revocations.
+  bool EnableHierarchy(Hierarchy h) {
     auto cold = ColdTable::Create(4096);
     if (!cold) {
       return false;
     }
     cold_ = std::move(*cold);
-    hot_after_ = hot_after;
-    promote_ = std::move(promote);
+    hierarchy_ = std::move(h);
     return true;
   }
 
   // The direct path: parse, look up, compile on a miss, execute. Returns the
   // decision (allow false: drop). A DSCP mark rewrites the IPv4 TOS in place.
-  CompiledDecision Process(size_t tenant, std::span<uint8_t> frame) noexcept {
+  // `frame` is the packet's first segment, `total_len` its length (0: the span's).
+  CompiledDecision Process(size_t tenant, std::span<uint8_t> frame, size_t total_len = 0) noexcept {
     bess::conntrack::ParsedFlowPacket p;
     if (tenant >= kTenants ||
-        bess::conntrack::ParseFrame(frame, p) != bess::conntrack::ParseStatus::kOk ||
+        bess::conntrack::ParseFrame(frame, p, total_len) != bess::conntrack::ParseStatus::kOk ||
         p.l3 != bess::conntrack::L3Kind::kIpv4) {
       return {};
     }
@@ -150,8 +161,8 @@ class VswitchApp {
       compiles_[tenant]++;
       if (cold_ == nullptr || Hot(key)) {
         if (caches_[tenant]->Install(key, d, g) != bess::flow::DecisionInstall::kStaleGeneration &&
-            promote_) {
-          promote_(key, d);
+            hierarchy_.promote) {
+          hierarchy_.promote(key, d);
         }
       }
     }
@@ -183,6 +194,9 @@ class VswitchApp {
     next->layers[layer].groups[group] = std::move(replacement);
     (void)policies_[tenant]->Publish(std::move(next));
     generations_[tenant].Invalidate();
+    if (hierarchy_.revoke) {
+      hierarchy_.revoke(tenant);
+    }
     return true;
   }
 
@@ -194,20 +208,47 @@ class VswitchApp {
 
  private:
   using Cache = bess::flow::DecisionCache<VswitchKey, CompiledDecision>;
-  using ColdTable = bess::flow::WorkerFlowTable<VswitchKey, uint32_t>;
+  struct ColdCount {
+    uint32_t packets = 0;
+    uint32_t last_tick = 0;  // the default-path packet that last saw the flow
+  };
+  using ColdTable = bess::flow::WorkerFlowTable<VswitchKey, ColdCount>;
 
   // The application's hotness rule: a flow is hot at its `hot_after`th
-  // packet; until then its packets are counted (a full table: stays cold).
+  // packet; until then its packets are counted (a full table: stays cold
+  // until the sweep frees a slot).
   bool Hot(const VswitchKey &key) noexcept {
-    auto made = cold_->Emplace(key, 0u);
+    const uint32_t now = ++tick_;
+    Sweep(now);
+    auto made = cold_->Emplace(key);
     if (made.state == nullptr) {
       return false;
     }
-    if (++*made.state < hot_after_) {
+    made.state->last_tick = now;
+    if (++made.state->packets < hierarchy_.hot_after) {
       return false;
     }
     (void)cold_->Erase(key);
     return true;
+  }
+
+  // Two slots per default-path packet: the whole table every capacity/2
+  // packets, so a cold count lives at most idle_after + capacity/2 of them.
+  void Sweep(uint32_t now) noexcept {
+    std::array<bess::flow::FlowHandle, 2> idle;
+    size_t n = 0;
+    sweep_ = cold_->VisitRange(sweep_, idle.size(),
+                               [&](bess::flow::FlowHandle h, const VswitchKey &, ColdCount &c) {
+                                 if (now - c.last_tick > hierarchy_.idle_after) {
+                                   idle[n++] = h;
+                                 }
+                               });
+    if (sweep_ >= cold_->capacity()) {
+      sweep_ = 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+      (void)cold_->Erase(idle[i]);
+    }
   }
 
   explicit VswitchApp(bess::rcu::RcuDomain &rcu) {
@@ -277,8 +318,9 @@ class VswitchApp {
   std::array<std::unique_ptr<Cache>, kTenants> caches_;
   std::array<uint64_t, kTenants> hits_{}, compiles_{};
   std::unique_ptr<ColdTable> cold_;
-  uint32_t hot_after_ = 0;
-  Promote promote_;
+  Hierarchy hierarchy_;
+  uint32_t tick_ = 0;
+  size_t sweep_ = 0;
 };
 
 }  // namespace appliance

@@ -76,7 +76,7 @@ class NatAppliance final : public Module {
     for (int i = 0; i < batch->cnt(); i++) {
       bess::PacketRef pkt = batch->packet(i);
       const auto v = app_->Process(std::span<uint8_t>(pkt.head_data<uint8_t *>(), pkt.head_len()),
-                                   outbound, ctx->current_ns);
+                                   outbound, ctx->current_ns, pkt.total_len());
       if (v == NatApp::Verdict::kForward) {
         EmitPacket(ctx, pkt, outbound ? 0 : 1);
       } else {

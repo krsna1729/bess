@@ -62,10 +62,12 @@ struct QosPolicy {
 };
 
 // What a session does with a matched packet: meter, then send it over GTP-U
-// (its TEID) through a next hop the router owns.
+// (its TEID) to its eNodeB, routed by BESS's router. The next hop is named so
+// the engine keeps it while the session needs it.
 struct SessionAction {
   QosId qos;
   NextHopId next_hop;
+  uint32_t enb;  // host order
   uint32_t teid;
 };
 
@@ -123,13 +125,15 @@ class SessionApp {
     return {};
   }
 
-  // The fused direct path on one downlink frame (Ethernet + IPv4 + payload)
-  // with `headroom` bytes free in front of it: GTP-U encapsulation in place.
+  // The fused direct path on one downlink frame (Ethernet + IPv4 + payload):
+  // classify, the session's action, its meter, the route to its eNodeB, and
+  // the GTP-U header written in front of the inner IPv4 packet in `out` (the
+  // outer IPv4/UDP headers are the egress's business, not shown).
   enum class Verdict { kForwarded, kNoSession, kMetered, kNoNextHop };
   struct Out {
     Verdict verdict;
     bess::dataplane::InterfaceId egress{};
-    uint32_t teid = 0;
+    std::vector<uint8_t> gtpu;  // GTP-U header + inner packet
   };
   Out Process(std::span<const uint8_t> frame, uint64_t now) const {
     uint32_t dst;
@@ -154,15 +158,16 @@ class SessionApp {
         bess::meter::MeterColor::kRed) {
       return {Verdict::kMetered};
     }
-    const NextHop *hop = router_->LookupNextHop(action->next_hop);
-    if (hop == nullptr) {
+    const NextHop *hop = router_->Resolve(action->enb);
+    if (hop == nullptr || hop->neighbor != bess::route::NeighborState::kResolved) {
       return {Verdict::kNoNextHop};
     }
-    std::array<uint8_t, bess::tunnel::kGtpuBaseBytes> gtpu{};
-    bess::tunnel::WriteGtpu(gtpu.data(), action->teid, static_cast<uint16_t>(frame.size() - 14));
-    uint32_t teid;
-    std::memcpy(&teid, gtpu.data() + 4, 4);
-    return {Verdict::kForwarded, hop->egress, __builtin_bswap32(teid)};
+    const auto inner = frame.subspan(14);
+    Out out{Verdict::kForwarded, hop->egress,
+            std::vector<uint8_t>(bess::tunnel::kGtpuBaseBytes + inner.size())};
+    bess::tunnel::WriteGtpu(out.gtpu.data(), action->teid, static_cast<uint16_t>(inner.size()));
+    std::memcpy(out.gtpu.data() + bess::tunnel::kGtpuBaseBytes, inner.data(), inner.size());
+    return out;
   }
 
   // Ops installing a session: the router's next hop and route toward the
@@ -180,7 +185,7 @@ class SessionApp {
             router_->SetRouteOp(*bess::route::Ipv4Prefix::Make(enb, 32), NextHopId(n)),
             Op::Upsert("sess/qos", EncodeKey(QosId(n)), std::any(qos)),
             Op::Upsert("sess/actions", EncodeKey(ActionId(n)),
-                       std::any(SessionAction{QosId(n), NextHopId(n), 0x1000 + n})),
+                       std::any(SessionAction{QosId(n), NextHopId(n), enb, 0x1000 + n})),
             Op::Upsert("sess/rules", EncodeKey(RuleId(n)), std::any(PdrLikeRule{ue_ip, ActionId(n)}))};
   }
 
@@ -232,9 +237,21 @@ TEST_F(SessionReferenceTest, OneTransactionInstallsASessionAcrossOwners) {
   const auto out = app_->Process(Downlink(kUe), bess::meter::MeterNow());
   EXPECT_EQ(SessionApp::Verdict::kForwarded, out.verdict);
   EXPECT_EQ(1u, out.egress.value());
-  EXPECT_EQ(0x1001u, out.teid);
+  ASSERT_EQ(bess::tunnel::kGtpuBaseBytes + 86, out.gtpu.size());
+  EXPECT_EQ(0x30, out.gtpu[0]);  // GTPv1, PT=1
+  EXPECT_EQ(0xff, out.gtpu[1]);  // G-PDU
+  EXPECT_EQ(86, out.gtpu[2] << 8 | out.gtpu[3]);
+  EXPECT_EQ(0x1001u, uint32_t{out.gtpu[4]} << 24 | out.gtpu[5] << 16 | out.gtpu[6] << 8 | out.gtpu[7]);
+  EXPECT_EQ(0x45, out.gtpu[8]);  // the inner IPv4 header
   EXPECT_EQ(SessionApp::Verdict::kNoSession,
             app_->Process(Downlink(kUe + 1), bess::meter::MeterNow()).verdict);
+  // The route is what carries it: without the route the session has no way out.
+  ASSERT_EQ(Outcome::kApplied,
+            engine_.Apply(std::vector<Op>{app_->router().RemoveRouteOp(
+                              *bess::route::Ipv4Prefix::Make(kEnb, 32))})
+                .outcome);
+  EXPECT_EQ(SessionApp::Verdict::kNoNextHop,
+            app_->Process(Downlink(kUe), bess::meter::MeterNow()).verdict);
 }
 
 // A session whose action names a next hop nobody installs is refused whole:

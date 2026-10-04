@@ -82,11 +82,12 @@ class RouterApp {
   // Routes one frame in place (the direct path): the checked parse, the VRF's
   // FIB with the flow hash for a group route, the neighbor state, TTL, then the
   // L2 rewrite. Nothing of the frame changes unless the verdict is kForward.
-  Decision Process(InterfaceId ingress, std::span<uint8_t> frame) const noexcept {
+  // `frame` is the packet's first segment, `total_len` its length (0: the span's).
+  Decision Process(InterfaceId ingress, std::span<uint8_t> frame, size_t total_len = 0) const noexcept {
     const Interface *in = InterfaceOf(ingress);
     bess::conntrack::ParsedFlowPacket p;
     if (in == nullptr ||
-        bess::conntrack::ParseFrame(frame, p) != bess::conntrack::ParseStatus::kOk ||
+        bess::conntrack::ParseFrame(frame, p, total_len) != bess::conntrack::ParseStatus::kOk ||
         p.l3 != bess::conntrack::L3Kind::kIpv4) {
       return {Verdict::kNotIpv4};
     }
