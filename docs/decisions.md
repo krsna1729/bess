@@ -6180,6 +6180,16 @@ headers); the conntrack and FDB per-packet wheel refreshes could use the same ow
 **Revisit when:** a consumer needs filtering or hairpinning, or the small-table per-packet cost matters (a
 specialised 8-byte-key table with the binding inline, as D-064 did for the FDB).
 
+**Change attempted (consolidation review, NAT clawback, 2026-10-04): rejected on its gate.** Dropping the two
+endpoints from `Binding` (they are already the flow's primary key and alias in the table's slot; read back through
+`KeyOf`/a new `AliasOf`) saves 16 bytes a mapping (40 -> 24 B of binding). Measured (release, isolated CPU 2, 12
+ABBA rounds, `nat_bench` against develop): lookups no clear difference (1M: -6%), but `Translate` +12 to +21% at 4K,
+64K and 1M (one 64K row no clear difference) and `Bind` +9%: the rewrite now reads the endpoints from the key
+storage instead of the binding the lookup already brought in. The gate was "memory down, translate not slower", so
+the change is not merged (kept on branch `wip/nat`). **Needs review (user)** only if memory per mapping matters more
+than about 1 ns per translated packet at the target sizes. The small-table cost and the capacity default (user
+decision 3-B, 65,536) are unchanged.
+
 ## D-069 Tunnel packet mechanics: VXLAN, Geneve, GRE and a GTP-U header codec (M19)
 
 **Status:** accepted (2026-10-04), experimental API.
