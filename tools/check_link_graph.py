@@ -197,8 +197,13 @@ def main():
     for name in unknown:
         print(f"ERROR: library {name} is not in the allowlisted DAG ({DAG_FILE.name})")
     for a, b, n in violations:
+        owned = libs[b][0]
+        symbols = sorted(s for s in libs[a][1] if s in owned)
+        shown = subprocess.run(["c++filt"], input="\n".join(symbols[:5]), capture_output=True,
+                               text=True).stdout.split("\n") if symbols else []
         print(f"ERROR: forbidden link edge {a} -> {b} ({n} symbols) "
-              f"is in neither 'allowed' nor 'exceptions'")
+              f"is in neither 'allowed' nor 'exceptions'; first: "
+              + "; ".join(s for s in shown if s))
     for cycle in cycles:
         print("ERROR: dependency cycle outside the exceptions: " + " -> ".join(cycle))
     for a, b in stale:
