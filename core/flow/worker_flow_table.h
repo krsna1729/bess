@@ -261,6 +261,17 @@ class WorkerFlowTable {
     return slot == kNone ? nullptr : slots_[slot].key_ptr(0);
   }
 
+  // The flow's alias key `i` (0 .. kAliases-1) as stored at creation or by
+  // AddAlias, or nullptr for a stale handle. A removed alias's bytes are not
+  // cleared: callers that remove aliases track which are live.
+  const Key *AliasOf(FlowHandle handle, size_t i) const noexcept
+    requires(kAliases > 0)
+  {
+    owner_.Check("AliasOf");
+    const uint32_t slot = SlotOf(handle);
+    return slot == kNone || i >= kAliases ? nullptr : slots_[slot].key_ptr(1 + i);
+  }
+
   // -- create and erase -------------------------------------------------------
 
   // Creates the flow `key` with State(args...), unless the key is present
@@ -356,6 +367,24 @@ class WorkerFlowTable {
     }
     EraseSlot(slot);
     return true;
+  }
+
+  // Visits the live flows in slots [first, first + count) (clamped to the
+  // capacity): fn(FlowHandle, const Key &primary, State &). Returns the slot
+  // after the window, so a caller can walk the table a few slots at a time
+  // (incremental migration); capacity() means done. The callback must not
+  // create or erase flows in this table.
+  template <typename Fn>
+  size_t VisitRange(size_t first, size_t count, Fn &&fn) {
+    owner_.Check("VisitRange");
+    const size_t end = std::min<size_t>(capacity_, first + count);
+    for (size_t slot = first; slot < end; slot++) {
+      if (slots_[slot].generation & 1) {
+        fn(HandleOf(static_cast<uint32_t>(slot)), *slots_[slot].key_ptr(0),
+           *slots_[slot].state_ptr());
+      }
+    }
+    return end;
   }
 
   // Visits every live flow: fn(FlowHandle, const Key &primary, State &). The

@@ -3,6 +3,8 @@
 
 from test_utils import *
 
+import time
+
 
 class BessNatTest(BessModuleTestCase):
     # Test the packet mangling features with a single rule
@@ -79,6 +81,40 @@ class BessNatTest(BessModuleTestCase):
         nat_config = [{'ext_addr': '192.168.1.1'}]
         nat = NAT(ext_addrs=nat_config)
         self._test_l4(nat, scapy.ICMP(), '192.168.1.1')
+
+    def test_nat_shared(self):
+        # One NAT for every worker (TP6): the same translations.
+        nat_config = [{'ext_addr': '192.168.1.1'}]
+        for l4 in (scapy.UDP(sport=56797, dport=53),
+                   scapy.TCP(sport=52428, dport=80), scapy.ICMP()):
+            nat = NAT(ext_addrs=nat_config, shared=True, capacity=1024)
+            self._test_l4(nat, l4, '192.168.1.1')
+
+    def test_nat_grows_without_stopping(self):
+        # Owned (TP5) and shared (TP6): starts at 4 mappings, may grow to 64;
+        # at 3 of 4 it asks the daemon's maintenance loop for a larger table
+        # and keeps translating. 40 flows all get a mapping only if the table
+        # grew, four times.
+        for shared in (False, True):
+            self._grow(NAT(ext_addrs=[{'ext_addr': '192.168.1.1'}], capacity=4,
+                           max_capacity=64, shared=shared))
+
+    def _grow(self, nat):
+        eth = scapy.Ether(src='02:1e:67:9f:4d:ae', dst='06:16:3e:1b:72:32')
+        translated = 0
+        for flow in range(40):
+            pkt = eth / scapy.IP(src='172.16.0.2', dst='8.8.8.8') / \
+                scapy.UDP(sport=20000 + flow, dport=53) / 'x'
+            # A packet that finds the table full is dropped: retry while the
+            # control side allocates (every 1 ms) and the worker migrates.
+            for _ in range(200):
+                out = self.run_module(nat, 0, [pkt], [0, 1])
+                if len(out[1]) == 1:
+                    translated += 1
+                    break
+                time.sleep(0.01)
+        self.assertEqual(40, translated)
+        self.assertIn('40 entries', self.bess.get_module_info(nat.name).desc)
 
     def test_nat_selfconfig(self):
         # Send initial conf unsorted, see that it comes back sorted

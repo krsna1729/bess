@@ -98,6 +98,8 @@ file is the reasoning.
 | D-075 | Release metadata, SBOM and the compatibility policy (M26) | accepted |
 | D-076 | Operational metrics: a pull registry, ListMetrics, built-in RCU and transaction sources (M25 phase 1) | accepted |
 | D-077 | Worker-to-control module requests: a one-slot endpoint per condition and the maintenance loop (TP4) | accepted |
+| D-078 | NAT grows without stopping: the owner asks, the control side allocates, the owner moves bindings (TP5) | accepted |
+| D-079 | Shared NAT: one binding table for every worker, lock-free lookups, creates under a lock, growth on the control thread (TP6) | accepted |
 
 
 ---
@@ -6824,4 +6826,77 @@ benchmark applies.
 
 **Revisit when:** a handler needs to run sooner than one interval (an eventfd wake-up), or a module needs ordered
 multiple requests of one kind (then a bounded ring with loss accounting).
+
+
+## D-078 NAT grows without stopping: the owner asks, the control side allocates, the owner moves bindings (TP5)
+
+**Status:** accepted (2026-10-04), experimental API. Implements user decisions 3-B and 9.5 (table_policy.md 4.1).
+**Code:** `core/nat/nat.h` (`Config::max_capacity`, `NeedsGrowth`, `GrowthTarget`, `NewTable`, `Adopt`,
+`MigrateSome`; the expiry wheel keyed by internal endpoint), `core/flow/worker_flow_table.h` (`VisitRange`,
+`AliasOf`), `core/modules/nat.{h,cc}` (two request endpoints, handover and retire slots),
+`protobuf/module_msg.proto` (`NATArg.capacity`, `max_capacity`), `core/nat/nat_test.cc`, `core/nat/nat_model_test.cc`.
+
+**Context.** D-068 allocated what the addresses could serve (up to 1M bindings, about 130 MB) at Init; the user
+chose a 65,536 default with explicit larger capacity (3-B), and required that a realistic NAT grow without downtime,
+the worker never allocating (9.5).
+
+**Decision.**
+- The NAT module holds `capacity` bindings (default 65,536, or what the addresses serve if less). With
+  `max_capacity` larger (at most what the addresses serve), it grows, doubling, up to it; the default is fixed
+  (user decision 9.3: owned fixed, shared growable).
+- At 3/4 full the worker posts a grow request (TP4, D-077). The control side, in the maintenance loop, allocates the
+  larger table (`Nat::NewTable`) and leaves it in a handover slot. The worker adopts it at its next batch: new
+  bindings go to it, lookups try it, then the old table on a miss. Each batch the worker moves the bindings of 64
+  slots (copy into the new table, erase from the old), so a binding is in exactly one table at every lookup and
+  `size()` is exact. When the walk ends, the empty old table goes back through a retire slot and a free request;
+  the control side frees it. Neither allocation nor free runs on a worker.
+- While migrating, the NAT refuses a new binding when both tables together hold the new table's capacity, so every
+  unmoved binding always fits.
+- The expiry wheel is keyed by the internal endpoint (not a slot handle) and sized for `max_capacity`, so a binding
+  moves without its timer changing.
+- Outside a migration the packet path gains one predicted branch on a lookup miss; expiry looks a binding up by key.
+
+**Evidence.** EVIDENCE
+
+**Revisit when:** a shared multi-worker NAT is needed (TP6: the same request path, a writer lock and copy-without-erase
+under RCU), or the 2x memory peak during a migration matters at the target sizes (bihash-style per-bucket growth).
+
+
+## D-079 Shared NAT: one binding table for every worker, lock-free lookups, creates under a lock, growth on the control thread (TP6)
+
+**Status:** accepted (2026-10-04), experimental API. Implements user decisions 9.1, 9.3 and 9.6 (table_policy.md 4.2, 5.1).
+**Code:** `core/nat/nat.h` (`BasicNat<Store>`, `OwnedBindings`, `SharedBindings`, `SharedBinding`, `Nat`, `SharedNat`,
+`NatConfig`, `Grow`), `core/flow/shared_flow_table.h` (`VisitRange`, `memory_bytes`), `core/modules/nat.{h,cc}`
+(`shared`), `protobuf/module_msg.proto` (`NATArg.shared`), `core/nat/shared_nat_test.cc`, `core/nat/nat_bench.cc`
+(`BM_TranslateShared`), `bessctl/module_tests/nat.py`.
+
+**Context.** A NAT on more than one worker cannot be partitioned: the rewrite changes the tuple, so the two directions
+of a mapping hash apart, and NAT must not spend NIC steering rules (decision 9.6). So any worker may see either
+direction of any mapping, and the bindings must be shared.
+
+**Decision.**
+- One engine, two stores: `BasicNat<OwnedBindings>` (= `Nat`, a WorkerFlowTable, no lock) and
+  `BasicNat<SharedBindings>` (= `SharedNat`, a SharedFlowTable). The packet logic (endpoint parse, rewrite, port
+  pool, address choice, expiry) is the same code.
+- Shared lookups are the SharedFlowTable's, lock-free. A worker that refreshes a mapping does one relaxed store
+  (`SharedBinding::last_refresh` is atomic; the latest outbound packet wins). Creating a mapping (port pick, both
+  keys, the timer) holds the NAT's spinlock, and a worker waits for it (9.1). A create that loses a race to another
+  worker's create of the same endpoint uses that binding.
+- Expiry runs on whichever worker takes the lock without waiting (try-lock per batch). An expired binding's state
+  lives until a grace period of the runtime's RCU domain; each expiry call also reclaims slots whose grace period
+  has passed, so a full table frees slots a call later rather than refusing a create first.
+- Growth (default for shared, up to what the addresses serve: 9.3), table_policy.md 4.2 (the rhashtable shape): a
+  worker posts a grow request at 3/4 (TP4); on the control thread `Grow` allocates the larger table, publishes it
+  (creates go to it, lookups try it, then the old one), copies the old table in chunks of 64 slots under the lock
+  (released between chunks), stops lookups in the old table, waits for a grace period, folds any refresh that reached
+  an old copy into the new one, and frees the old table. Workers never stop. While growing, a create also checks the
+  old table (a binding another worker created there after this worker's lookup, or an external endpoint that is an
+  old internal key) and capacity counts both tables, so a copy always fits.
+- The module chooses at Init (`NATArg.shared`); the default stays one worker. Init cannot see how many workers will
+  attach; an owned NAT attached to a second worker is refused as before.
+- Known edge: an outbound packet that a worker translates with a binding that another worker expires at that
+  instant may leave with the old port after the port was released; one packet at an expiry boundary, as in other
+  NATs with lock-free lookups.
+
+**Evidence.** EVIDENCE
 

@@ -776,6 +776,15 @@ message NATArg {
     repeated PortRange port_ranges = 2;
   }
   repeated ExternalAddress ext_addrs = 1; /// list of external IP addresses
+  /// Initial binding capacity (0: 65,536, or what the addresses can serve if less).
+  uint64 capacity = 2;
+  /// Larger than capacity: the table grows, without stopping, up to this many
+  /// bindings (at most what the addresses can serve). 0: fixed (one worker) or
+  /// what the addresses serve (shared).
+  uint64 max_capacity = 3;
+  /// One NAT for every worker (any traffic distribution): lookups lock-free,
+  /// creating a mapping takes a lock. Default: one worker.
+  bool shared = 4;
 }
 
 /**

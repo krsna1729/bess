@@ -570,7 +570,7 @@ while packets flow, and nothing needs privileges.
 |---|---|---|
 | cuckoo backends (WildcardMatch tuples, typed `ExactTable`) | plain or staged body, at generation build | `ResolveLookupBody()` from the built table's footprint and lookup shape |
 | L2Forward's `PackedMacTable` | none: every batch hashes, prefetches both buckets, then probes (as MacTable) | - |
-| NAT's binding table (`WorkerFlowTable`, D-068) | capacity, at module Init | `Nat::CapacityFor(addresses)`: the mappings the addresses' ports can serve, at most 1M; `FindBatch` always prefetches |
+| NAT's binding table (`WorkerFlowTable` owned, `SharedFlowTable` shared; D-068, D-078, D-079) | `capacity` and `max_capacity`, at module Init | 65,536 or what the addresses' ports serve if less; grows by doubling to `max_capacity` (owned: opt-in; shared: by default, up to what the addresses serve, at most 1M); `FindBatch` always prefetches |
 | `ConcurrentExactTable` (ExactMatch) | capacity, at create and on growth | `CapacityFor(rules)` and `Headroom()` (D-010); DPDK's own bulk lookup, no body choice |
 | `ConcurrentExactTable`, inside `rte_hash` | signature and key compare functions, at create | DPDK picks SSE2 signature compare, and a SIMD key compare for 16/32/…/128-byte keys (`memcmp` otherwise) |
 | `RouteTable` (`rte_lpm`) | nothing | always plain: one independent load per packet |

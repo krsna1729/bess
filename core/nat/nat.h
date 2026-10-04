@@ -5,8 +5,11 @@
 
 #include <rte_config.h>
 #include <rte_hash_crc.h>
+#include <rte_pause.h>
+#include <rte_spinlock.h>
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -21,7 +24,9 @@
 
 #include "conntrack/packet_parse.h"
 #include "dataplane/expiry_wheel.h"
+#include "flow/shared_flow_table.h"
 #include "flow/worker_flow_table.h"
+#include "rcu/rcu_domain.h"
 #include "utils/checksum.h"
 #include "utils/endian.h"
 #include "utils/random.h"
@@ -244,15 +249,111 @@ struct BindingTraits : flow::DefaultFlowTableTraits {
   static constexpr size_t kAliases = 1;  // the external endpoint
 };
 
-class Nat {
- public:
-  using Tick = uint64_t;  // nanoseconds, the caller's clock
+// A binding shared by every worker (SharedNat): the endpoints are immutable
+// once published; `last_refresh` is the one field workers write, a relaxed
+// store (the latest outbound packet wins; expiry only needs "recently").
+struct SharedBinding {
+  Endpoint internal;
+  Endpoint external;
+  uint32_t address_index;
+  std::atomic<uint64_t> last_refresh;
+  dataplane::ExpiryHandle timer{};
+  SharedBinding(Endpoint in, Endpoint ext, uint32_t a, uint64_t now)
+      : internal(in), external(ext), address_index(a), last_refresh(now) {}
+};
+
+struct SharedBindingTraits : flow::DefaultSharedFlowTableTraits {
+  static constexpr size_t kAliases = 1;  // the external endpoint
+};
+
+// How a NAT stores its bindings: the table policy (table_policy.md, user
+// decisions 1 and 3; the module chooses).
+//
+// OwnedBindings: one worker owns the NAT; a WorkerFlowTable, no lock; the
+// table may grow (TP5, D-078).
+struct OwnedBindings {
+  static constexpr bool kShared = false;
+  using BindingType = Binding;
   using Table = flow::WorkerFlowTable<Endpoint, Binding, flow::DefaultFlowHash<Endpoint>,
                                       flow::DefaultFlowEqual<Endpoint>, BindingTraits>;
-  using Wheel = dataplane::ExpiryWheel<flow::FlowHandle, Tick>;
+  static auto CreateTable(size_t capacity, rcu::RcuDomain *) { return Table::Create(capacity); }
+  static uint64_t RefreshOf(const Binding &b) noexcept { return b.last_refresh; }
+  static void Refresh(Binding &b, uint64_t now) noexcept { b.last_refresh = now; }
+  struct Lock {  // nothing to exclude
+    void Acquire() noexcept {}
+    bool TryAcquire() noexcept { return true; }
+    void Release() noexcept {}
+  };
+};
 
-  // 5 minutes (RFC 4787 REQ-5-c), refreshed by outbound packets only (REQ-6).
-  static constexpr Tick kDefaultTimeout = 300ull * 1000 * 1000 * 1000;
+// SharedBindings: every worker translates through one NAT (any traffic
+// distribution: the two directions of a mapping hash apart after the rewrite,
+// so no steering keeps them on one worker; user decision 6). Lookups are the
+// SharedFlowTable's, lock-free; creating a binding (port pick, both keys, the
+// timer) holds the NAT's lock, which a worker waits for (decision 9.1); expiry
+// runs on whichever worker takes the lock without waiting. Erased bindings are
+// destroyed after an RCU grace period. Fixed capacity (TP6).
+struct SharedBindings {
+  static constexpr bool kShared = true;
+  using BindingType = SharedBinding;
+  using Table = flow::SharedFlowTable<Endpoint, SharedBinding, SharedBindingTraits>;
+  static auto CreateTable(size_t capacity, rcu::RcuDomain *domain) {
+    return Table::Create(capacity, *domain);
+  }
+  static uint64_t RefreshOf(const SharedBinding &b) noexcept {
+    return b.last_refresh.load(std::memory_order_relaxed);
+  }
+  static void Refresh(SharedBinding &b, uint64_t now) noexcept {
+    b.last_refresh.store(now, std::memory_order_relaxed);
+  }
+  struct Lock {
+    Lock() noexcept { rte_spinlock_init(&lock_); }
+    void Acquire() noexcept { rte_spinlock_lock(&lock_); }
+    bool TryAcquire() noexcept { return rte_spinlock_trylock(&lock_) != 0; }
+    void Release() noexcept { rte_spinlock_unlock(&lock_); }
+    rte_spinlock_t lock_;
+  };
+};
+
+// 5 minutes (RFC 4787 REQ-5-c), refreshed by outbound packets only (REQ-6).
+inline constexpr uint64_t kDefaultNatTimeout = 300ull * 1000 * 1000 * 1000;
+
+struct NatConfig {
+  std::vector<ExternalAddress> addresses;
+  size_t capacity = 65536;  // bindings (user decision 3-B)
+  // Larger than `capacity`: the table may grow to it, doubling, without
+  // stopping (TP5: the owner asks, the control side allocates, the owner
+  // migrates a few bindings a batch). 0 or <= capacity: fixed.
+  size_t max_capacity = 0;
+  uint64_t timeout = kDefaultNatTimeout;
+  unsigned granularity_shift = 24;  // wheel granularity 2^24 ns, about 17 ms
+  uint64_t start = 0;
+  uint64_t seed = 0;  // port start randomness
+  // SharedNat only: the domain whose grace periods free erased bindings
+  // (every worker that translates is one of its readers).
+  rcu::RcuDomain *rcu = nullptr;
+};
+
+enum class NatCreateError : uint8_t {
+  kNoAddresses,
+  kBadRange,
+  kOutOfMemory,
+  kInvalidCapacity,
+  kNoRcuDomain,  // SharedNat without Config::rcu
+};
+
+template <typename Store>
+class BasicNat {
+ public:
+  using Tick = uint64_t;  // nanoseconds, the caller's clock
+  using Table = typename Store::Table;
+  using BindingT = typename Store::BindingType;
+  static constexpr bool kShared = Store::kShared;
+  // Keyed by the internal endpoint, not a slot handle: a growing NAT moves
+  // bindings to a new table without touching their timers (TP5).
+  using Wheel = dataplane::ExpiryWheel<Endpoint, Tick>;
+
+  static constexpr Tick kDefaultTimeout = kDefaultNatTimeout;
 
   // The most mappings the addresses can serve: one per port and protocol
   // class (TCP, UDP, ICMP) of each distinct address, capped.
@@ -267,18 +368,11 @@ class Nat {
     return std::min(cap, distinct * 3 * 65536);
   }
 
-  struct Config {
-    std::vector<ExternalAddress> addresses;
-    size_t capacity = 65536;  // bindings
-    Tick timeout = kDefaultTimeout;
-    unsigned granularity_shift = 24;  // wheel granularity 2^24 ns, about 17 ms
-    Tick start = 0;
-    uint64_t seed = 0;  // port start randomness
-  };
+  using Config = NatConfig;
 
-  enum class CreateError : uint8_t { kNoAddresses, kBadRange, kOutOfMemory, kInvalidCapacity };
+  using CreateError = NatCreateError;
 
-  static std::expected<std::unique_ptr<Nat>, CreateError> Create(const Config &config) {
+  static std::expected<std::unique_ptr<BasicNat>, CreateError> Create(const Config &config) {
     if (config.addresses.empty()) {
       return std::unexpected(CreateError::kNoAddresses);
     }
@@ -289,21 +383,26 @@ class Nat {
         }
       }
     }
-    auto table = Table::Create(config.capacity);
+    if (kShared && config.rcu == nullptr) {
+      return std::unexpected(CreateError::kNoRcuDomain);
+    }
+    auto table = Store::CreateTable(config.capacity, config.rcu);
     if (!table) {
       return std::unexpected(table.error() == flow::FlowTableError::kOutOfMemory
                                  ? CreateError::kOutOfMemory
                                  : CreateError::kInvalidCapacity);
     }
-    auto wheel = Wheel::Create(config.capacity, config.start, config.granularity_shift);
+    // Timers for the largest table the NAT may grow to: the wheel never moves.
+    auto wheel = Wheel::Create(std::max(config.capacity, config.max_capacity), config.start,
+                               config.granularity_shift);
     if (!wheel) {
       return std::unexpected(CreateError::kOutOfMemory);
     }
     // The engine copies the addresses and allocates its port bitmaps as it
     // is built: a refusal there is kOutOfMemory like the others.
-    std::unique_ptr<Nat> nat;
+    std::unique_ptr<BasicNat> nat;
     try {
-      nat.reset(new Nat(config, std::move(*table), std::move(*wheel)));
+      nat.reset(new BasicNat(config, std::move(*table), std::move(*wheel)));
     } catch (const std::bad_alloc &) {
       return std::unexpected(CreateError::kOutOfMemory);
     }
@@ -350,7 +449,7 @@ class Nat {
     if (!before) {
       return why;
     }
-    return Finish(frame, p, dir, now, *before, table_->Find(*before));
+    return Finish(frame, p, dir, now, *before, FindAny(*before));
   }
 
   static constexpr size_t kMaxBatch = Table::kMaxBatch;
@@ -379,13 +478,13 @@ class Nat {
         where[n++] = static_cast<uint32_t>(i);
       }
     }
-    Binding *found[kMaxBatch];
-    (void)table_->FindBatch(std::span<const Endpoint>(keys, n), std::span<Binding *>(found, n));
+    BindingT *found[kMaxBatch];
+    (void)cur()->FindBatch(std::span<const Endpoint>(keys, n), std::span<BindingT *>(found, n));
     for (size_t k = 0; k < n; k++) {
       const size_t i = where[k];
       // A miss is looked up again: an earlier packet of this batch may have
       // just created the mapping.
-      Binding *b = found[k] != nullptr ? found[k] : table_->Find(keys[k]);
+      BindingT *b = found[k] != nullptr ? found[k] : FindAny(keys[k]);
       out[i] = Finish(frames[i], parsed[i], dir, now, keys[k], b);
     }
   }
@@ -394,7 +493,7 @@ class Nat {
   // The rest of Translate once the endpoint has been looked up (`b` the
   // binding its key found, or null).
   Verdict Finish(std::span<uint8_t> frame, const conntrack::ParsedFlowPacket &p, Direction dir,
-                 Tick now, const Endpoint &before, Binding *b) noexcept {
+                 Tick now, const Endpoint &before, BindingT *b) noexcept {
     // The internal endpoint is the primary key, the external one the alias:
     // a key that is the other side of a mapping belongs to another mapping.
     if (b != nullptr && !(dir == Direction::kForward ? b->internal == before
@@ -413,7 +512,7 @@ class Nat {
         return made;
       }
     } else if (dir == Direction::kForward) {
-      b->last_refresh = now;
+      Store::Refresh(*b, now);
     }
     Rewrite(frame.data() + p.l3_offset, frame.data() + p.l4_offset, dir, before,
             dir == Direction::kForward ? b->external : b->internal);
@@ -425,44 +524,223 @@ class Nat {
   // Removes mappings idle (no outbound packet) for the timeout, releasing
   // their ports. At most `budget` units of wheel work.
   size_t Expire(Tick now, size_t budget) noexcept {
+    // Shared: one worker at a time, and never waiting (another worker that
+    // holds the lock is creating or expiring; the next batch tries again).
+    if (!lock_.TryAcquire()) {
+      return 0;
+    }
+    if constexpr (kShared) {
+      // Frees the slots of bindings erased by earlier calls whose grace period
+      // has passed, and starts one for those erased since: an expired binding
+      // returns to the free list a call or two later, not only when a create
+      // finds the table full (which would refuse that create).
+      (void)table_->Reclaim();
+      if (old_ != nullptr) {
+        (void)old_->Reclaim();
+      }
+    }
     size_t removed = 0;
     (void)wheel_->Poll(now, budget,
-                       [this, now, &removed](const flow::FlowHandle &h) noexcept
+                       [this, now, &removed](const Endpoint &internal) noexcept
                            -> std::optional<Tick> {
-                         const Binding *b = table_->Lookup(h);
+                         // Under the lock: the current table, and while growing
+                         // the old one (owned: a binding not moved yet; shared:
+                         // a binding not copied yet, or the copy's original).
+                         BindingT *b = table_->Find(internal);
+                         BindingT *o = old_ != nullptr ? old_->Find(internal) : nullptr;
+                         if (b == nullptr) {
+                           b = o;
+                           o = nullptr;
+                         }
                          if (b == nullptr) {
                            return std::nullopt;
                          }
-                         // Refreshed since this deadline was set: wait for the new one.
-                         const Tick due = Wheel::After(b->last_refresh, timeout_);
+                         // Refreshed since this deadline was set (in either copy):
+                         // wait for the new one.
+                         Tick last = Store::RefreshOf(*b);
+                         if (o != nullptr && static_cast<int64_t>(Store::RefreshOf(*o) - last) > 0) {
+                           last = Store::RefreshOf(*o);
+                         }
+                         const Tick due = Wheel::After(last, timeout_);
                          if (static_cast<int64_t>(due - now) > 0) {
                            return due;
                          }
                          ports_.Release(PoolOf(b->address_index), b->external.protocol,
                                         b->external.port.value());
-                         removed += table_->Erase(h) ? 1 : 0;
+                         bool erased = table_->Erase(internal);
+                         if (old_ != nullptr) {
+                           erased |= old_->Erase(internal);  // not moved, or the original
+                         }
+                         removed += erased ? 1 : 0;
                          return std::nullopt;
                        });
+    lock_.Release();
     return removed;
   }
 
-  const Binding *Find(const Endpoint &e) const noexcept { return table_->Find(e); }
-  size_t size() const noexcept { return table_->size(); }
+  // -- growth (TP5) ----------------------------------------------------------------
+
+  // Whether to ask for a larger table: at least 3/4 full, below the maximum,
+  // and not already growing. One branch on a worker's path.
+  bool NeedsGrowth() const noexcept {
+    const Table *t = cur();
+    return prev() == nullptr && t->capacity() < max_capacity_ &&
+           t->size() * 4 >= t->capacity() * 3;
+  }
+  // The capacity to ask for: double, at most the maximum.
+  size_t GrowthTarget() const noexcept {
+    return std::min(cur()->capacity() * 2, max_capacity_);
+  }
+
+  // Shared growth (TP6, table_policy.md 4.2, the rhashtable shape): on the
+  // control thread, which is not a reader of the NAT's RCU domain. Allocates
+  // the larger table; publishes it (creates go to it, lookups try it, then the
+  // old one); copies the old table into it in chunks under the lock, released
+  // between chunks so workers keep creating; stops lookups in the old table
+  // and waits for a grace period; folds refreshes that reached old copies
+  // meanwhile; frees the old table. Workers never stop. False (and nothing
+  // changes) when the table cannot be allocated.
+  bool Grow(size_t capacity)
+    requires(kShared)
+  {
+    if (capacity <= cur()->capacity() || capacity > max_capacity_) {
+      return true;
+    }
+    auto made = Store::CreateTable(capacity, rcu_);
+    if (!made) {
+      return false;
+    }
+    lock_.Acquire();
+    old_ = std::move(table_);
+    table_ = std::move(*made);
+    prev_.store(old_.get(), std::memory_order_release);
+    cur_.store(table_.get(), std::memory_order_release);
+    lock_.Release();
+    for (size_t cursor = 0; cursor < old_->capacity();) {
+      lock_.Acquire();
+      cursor = old_->VisitRange(cursor, kGrowChunk,
+                                [this](flow::FlowHandle, const Endpoint &internal,
+                                       const BindingT &b) {
+                                  // Absent from the new table: creates check the
+                                  // old one under this lock first.
+                                  auto copy = table_->EmplaceAliased(
+                                      internal, b.external, b.internal, b.external,
+                                      b.address_index, Store::RefreshOf(b));
+                                  if (copy.created()) {
+                                    copy.state->timer = b.timer;
+                                  }
+                                });
+      lock_.Release();
+    }
+    lock_.Acquire();
+    prev_.store(nullptr, std::memory_order_release);
+    lock_.Release();
+    rcu_->Synchronize();  // no worker still holds an old binding
+    lock_.Acquire();
+    old_->ForEach([this](flow::FlowHandle, const Endpoint &internal, const BindingT &b) {
+      if (BindingT *n = table_->Find(internal)) {
+        const Tick old_refresh = Store::RefreshOf(b);
+        if (static_cast<int64_t>(old_refresh - Store::RefreshOf(*n)) > 0) {
+          Store::Refresh(*n, old_refresh);
+        }
+      }
+    });
+    std::unique_ptr<Table> retired = std::move(old_);
+    migrated_tables_++;
+    lock_.Release();
+    retired.reset();  // its destructor waits for a grace period again
+    return true;
+  }
+  // Slots copied per lock hold while a shared NAT grows (about 64 x 50 ns).
+  static constexpr size_t kGrowChunk = 64;
+  // A new, empty table: the control side calls this (allocation never happens
+  // on the packet path) and hands the result to the owner.
+  static std::unique_ptr<Table> NewTable(size_t capacity)
+    requires(!kShared)
+  {
+    auto made = Table::Create(capacity);
+    return made ? std::move(*made) : nullptr;
+  }
+  // The owner takes over a larger table: new bindings go to it, lookups try it
+  // first, then the old one, until MigrateSome has moved every binding.
+  void Adopt(std::unique_ptr<Table> bigger) noexcept
+    requires(!kShared)
+  {
+    if (bigger == nullptr || old_ != nullptr || bigger->capacity() <= table_->capacity()) {
+      return;  // stale or useless: dropped (freed by the caller's unique_ptr)
+    }
+    old_ = std::move(table_);
+    table_ = std::move(bigger);
+    cursor_ = 0;
+  }
+  bool migrating() const noexcept { return prev() != nullptr; }
+  // Moves the bindings of the next `slots` slots of the old table to the new
+  // one (an owned table has one thread: a binding is in exactly one table at
+  // every lookup, and size() stays exact). When the walk ends, returns the old,
+  // now empty, table for the caller to free off the packet path; nullptr until
+  // then.
+  std::unique_ptr<Table> MigrateSome(size_t slots) noexcept
+    requires(!kShared)
+  {
+    if (old_ == nullptr) {
+      return nullptr;
+    }
+    flow::FlowHandle moved[kMaxMigrateSlots];
+    size_t n = 0;
+    cursor_ = old_->VisitRange(cursor_, std::min(slots, kMaxMigrateSlots),
+                               [&](flow::FlowHandle h, const Endpoint &internal, BindingT &b) {
+                                 // The larger table has room, and creates check
+                                 // both tables first, so this always creates.
+                                 if (table_->EmplaceAliased(internal, *old_->AliasOf(h, 0), b)
+                                         .created()) {
+                                   moved[n++] = h;
+                                 }
+                               });
+    for (size_t i = 0; i < n; i++) {
+      (void)old_->Erase(moved[i]);
+    }
+    if (cursor_ < old_->capacity()) {
+      return nullptr;
+    }
+    migrated_tables_++;
+    return std::move(old_);
+  }
+  static constexpr size_t kMaxMigrateSlots = 256;
+  size_t migrated_tables() const noexcept { return migrated_tables_; }
+  size_t capacity() const noexcept { return cur()->capacity(); }
+
+  const BindingT *Find(const Endpoint &e) const noexcept {
+    return const_cast<BasicNat *>(this)->FindAny(e);
+  }
+  // Bindings. Exact for an owned NAT; while a shared NAT grows, a binding and
+  // its copy count twice.
+  size_t size() const noexcept {
+    const Table *o = prev();
+    return cur()->size() + (o != nullptr ? o->size() : 0);
+  }
   const std::vector<ExternalAddress> &addresses() const noexcept { return addresses_; }
-  // Bytes for `capacity` bindings: the table (both keys and the binding), the
-  // wheel and the port bitmaps.
+  // Bytes for `capacity` bindings: the table (both keys and the binding; for a
+  // SharedNat its slots, excluding the rte_hash directory), the wheel and the
+  // port bitmaps.
   size_t memory_bytes() const noexcept {
-    return table_->memory_bytes() + wheel_->memory_bytes() + ports_.memory_bytes();
+    const Table *o = prev();
+    return cur()->memory_bytes() + (o != nullptr ? o->memory_bytes() : 0) +
+           wheel_->memory_bytes() + ports_.memory_bytes();
   }
 
  private:
-  Nat(const Config &config, std::unique_ptr<Table> table, std::unique_ptr<Wheel> wheel)
+  BasicNat(const Config &config, std::unique_ptr<Table> table, std::unique_ptr<Wheel> wheel)
       : addresses_(config.addresses),
         timeout_(config.timeout),
         table_(std::move(table)),
         wheel_(std::move(wheel)),
         ports_(config.addresses.size()) {
     rng_.SetSeed(config.seed);
+    max_capacity_ = std::max(config.capacity, config.max_capacity);
+    rcu_ = config.rcu;
+    if constexpr (kShared) {
+      cur_.store(table_.get(), std::memory_order_relaxed);
+    }
     // One bitmap per distinct external IP: two entries for one address (with
     // overlapping ranges) share it, so a port is never handed out twice.
     pool_of_.resize(addresses_.size());
@@ -479,12 +757,73 @@ class Nat {
 
   size_t PoolOf(size_t address_index) const noexcept { return pool_of_[address_index]; }
 
-  Verdict Bind(const Endpoint &internal, Tick now, Binding **out) noexcept {
+  // The tables lookups use: the current one and, while growing, the old one.
+  // Owned: the owner's pointers. Shared: published for lock-free readers.
+  Table *cur() const noexcept {
+    if constexpr (kShared) {
+      return cur_.load(std::memory_order_acquire);
+    } else {
+      return table_.get();
+    }
+  }
+  Table *prev() const noexcept {
+    if constexpr (kShared) {
+      return prev_.load(std::memory_order_acquire);
+    } else {
+      return old_.get();
+    }
+  }
+
+  // The binding `e` names in the current table, else (while growing) in the
+  // old one. Outside growth this is one lookup and one predicted branch.
+  BindingT *FindAny(const Endpoint &e) noexcept {
+    BindingT *b = cur()->Find(e);
+    if (b == nullptr) [[unlikely]] {
+      if (Table *o = prev(); o != nullptr) [[unlikely]] {
+        b = FindIn(*o, e);
+      }
+    }
+    return b;
+  }
+  // Out of line and cold: the growth-only lookup stays out of the hot loop.
+  [[gnu::noinline, gnu::cold]] static BindingT *FindIn(Table &t, const Endpoint &e) noexcept {
+    return t.Find(e);
+  }
+
+  Verdict Bind(const Endpoint &internal, Tick now, BindingT **out) noexcept {
     if ((internal.protocol == 6 || internal.protocol == 17) && internal.port == be16_t(0)) {
       return Verdict::kPortZero;
     }
-    if (wheel_->full() || table_->full()) {
+    lock_.Acquire();
+    const Verdict v = BindLocked(internal, now, out);
+    lock_.Release();
+    return v;
+  }
+
+  // Under lock_ (shared; nothing to hold when owned).
+  Verdict BindLocked(const Endpoint &internal, Tick now, BindingT **out) noexcept {
+    // Bindings in both tables count while migrating: the new table must keep
+    // room for every binding not moved yet.
+    // (Shared: conservative while growing, a copied binding counts twice.)
+    if (wheel_->full() ||
+        table_->size() + (old_ != nullptr ? old_->size() : 0) >= table_->capacity()) {
       return Verdict::kFull;
+    }
+    if constexpr (!kShared) {
+      if (table_->full()) {
+        return Verdict::kFull;
+      }
+    }
+    if (old_ != nullptr) [[unlikely]] {
+      // Growing: the old table is part of the key space. Shared: another
+      // worker may have bound this endpoint there after our lookup.
+      if (BindingT *x = FindIn(*old_, internal)) {
+        if (x->internal == internal) {
+          *out = x;
+          return Verdict::kTranslated;
+        }
+        return Verdict::kConflict;
+      }
     }
     const size_t a = PickAddress(internal.addr, addresses_.size());
     for (const PortRange &range : addresses_[a].ranges) {
@@ -497,15 +836,29 @@ class Nat {
         continue;
       }
       const Endpoint external{addresses_[a].addr, be16_t(*port), internal.protocol};
-      auto made = table_->EmplaceAliased(
-          internal, external, Binding{internal, external, static_cast<uint32_t>(a), now});
-      if (!made.created()) {
-        // The table is full, or the external endpoint is an internal one's
-        // key: free the port and refuse.
+      if (old_ != nullptr && FindIn(*old_, external) != nullptr) [[unlikely]] {
+        // The external endpoint is an internal one's key in the old table.
         ports_.Release(PoolOf(a), internal.protocol, *port);
+        return Verdict::kConflict;
+      }
+      auto made = table_->EmplaceAliased(
+          internal, external, internal, external, static_cast<uint32_t>(a), now);
+      if (!made.created()) {
+        ports_.Release(PoolOf(a), internal.protocol, *port);
+        if constexpr (kShared) {
+          // Another worker bound this endpoint between our lookup and the lock:
+          // use its binding (the endpoint is that flow's primary key).
+          if (made.status == flow::EmplaceStatus::kExists && made.state != nullptr &&
+              made.state->internal == internal) {
+            *out = made.state;
+            return Verdict::kTranslated;
+          }
+        }
+        // The table is full, or the external endpoint is an internal one's
+        // key: refuse.
         return made.status == flow::EmplaceStatus::kFull ? Verdict::kFull : Verdict::kConflict;
       }
-      made.state->timer = wheel_->Schedule(Wheel::After(now, timeout_), made.handle);
+      made.state->timer = wheel_->Schedule(Wheel::After(now, timeout_), internal);
       if (made.state->timer == dataplane::kNoExpiry) {
         ports_.Release(PoolOf(a), internal.protocol, *port);
         (void)table_->Erase(made.handle);
@@ -524,7 +877,21 @@ class Nat {
   PortPool ports_;
   std::vector<uint32_t> pool_of_;  // address index -> its IP's bitmap
   Random rng_;
+  // Growth state (TP5), last: the members above keep their offsets.
+  size_t max_capacity_;
+  std::unique_ptr<Table> old_;  // while migrating: the table being moved from
+  size_t cursor_ = 0;           // its next slot to move
+  size_t migrated_tables_ = 0;
+  typename Store::Lock lock_;
+  rcu::RcuDomain *rcu_ = nullptr;
+  // Shared: the tables published to lock-free readers (owned: unused).
+  std::atomic<Table *> cur_{nullptr};
+  std::atomic<Table *> prev_{nullptr};
 };
+
+// The owned NAT (one worker) and the shared one (every worker).
+using Nat = BasicNat<OwnedBindings>;
+using SharedNat = BasicNat<SharedBindings>;
 
 }  // namespace bess::nat
 

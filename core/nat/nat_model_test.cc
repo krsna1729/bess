@@ -190,6 +190,7 @@ struct NatModelConfig {
   uint64_t timeout;
   std::vector<ExternalAddress> addresses;
   size_t steps;
+  size_t max_capacity = 0;  // > capacity: the NAT grows (TP5) at random points
 };
 
 class NatModel {
@@ -202,6 +203,7 @@ class NatModel {
     c.granularity_shift = cfg.shift;
     c.start = 0;
     c.seed = cfg.seed;
+    c.max_capacity = cfg.max_capacity;
     auto made = Nat::Create(c);
     EXPECT_TRUE(made.has_value());
     nat_ = std::move(*made);
@@ -240,6 +242,16 @@ class NatModel {
         now_ += rng_() % 10 == 0 ? cfg_.timeout / 2 + rng_() % cfg_.timeout : rng_() % 8;
       }
       if (::testing::Test::HasFatalFailure()) return;
+      // Growth, as the module drives it, at random points: the owner adopts a
+      // larger table when asked and moves a few slots between operations.
+      // Every check above and below must hold throughout.
+      if (nat_->NeedsGrowth() && rng_() % 4 == 0) {
+        nat_->Adopt(Nat::NewTable(nat_->GrowthTarget()));
+        grown++;
+      }
+      if (nat_->migrating()) {
+        (void)nat_->MigrateSome(1 + rng_() % 8);
+      }
       ASSERT_EQ(bindings_.size(), nat_->size());
       if (step % 50 == 0) {
         CheckAll();
@@ -250,7 +262,7 @@ class NatModel {
   }
 
   std::map<Verdict, size_t> verdicts;
-  size_t expired = 0, budget_stops = 0;
+  size_t expired = 0, budget_stops = 0, grown = 0;
 
  private:
   uint64_t Mask() const { return (uint64_t{1} << cfg_.shift) - 1; }
@@ -404,7 +416,7 @@ class NatModel {
       ASSERT_EQ(Verdict::kPortZero, v);
       return unchanged();
     }
-    if (bindings_.size() == cfg_.capacity) {
+    if (bindings_.size() == nat_->capacity()) {
       ASSERT_EQ(Verdict::kFull, v);
       return unchanged();
     }
@@ -570,6 +582,11 @@ TEST(NatModelTest, RandomTrafficBothDirectionsWithExpiryMatchesABindingModel) {
       Pub(kA1, {{1020, 1036, false}}),
   };
   for (uint32_t seed = 1; seed <= 4; seed++) configs.push_back({seed, 64, 0, 300, small, 30000});
+  // Growing tables (TP5): 4 -> 8 -> ... -> 64 while traffic, expiry and kFull
+  // at every intermediate size go on.
+  for (uint32_t seed = 21; seed <= 24; seed++) {
+    configs.push_back({seed, 4, 0, 300, small, 30000, 64});
+  }
   // A small table: kFull dominates.
   configs.push_back({11, 6, 0, 300, small, 20000});
   // A coarse wheel: removal within one granule of the deadline.
@@ -577,7 +594,7 @@ TEST(NatModelTest, RandomTrafficBothDirectionsWithExpiryMatchesABindingModel) {
   // One wide range: capacity before ports.
   configs.push_back({13, 24, 0, 200, {Pub(kA1, {{1, 65536, false}})}, 20000});
   std::map<Verdict, size_t> total;
-  size_t expired = 0, budget_stops = 0;
+  size_t expired = 0, budget_stops = 0, grown = 0;
   for (const auto &cfg : configs) {
     SCOPED_TRACE(::testing::Message() << "seed " << cfg.seed);
     NatModel model(cfg);
@@ -586,6 +603,7 @@ TEST(NatModelTest, RandomTrafficBothDirectionsWithExpiryMatchesABindingModel) {
     for (const auto &[v, n] : model.verdicts) total[v] += n;
     expired += model.expired;
     budget_stops += model.budget_stops;
+    grown += model.grown;
   }
   // Every verdict and path the model distinguishes was reached.
   for (const Verdict v : {Verdict::kTranslated, Verdict::kNotIpv4, Verdict::kUnsupported,
@@ -595,6 +613,7 @@ TEST(NatModelTest, RandomTrafficBothDirectionsWithExpiryMatchesABindingModel) {
   }
   EXPECT_GT(expired, 0u);
   EXPECT_GT(budget_stops, 0u);
+  EXPECT_GE(grown, 8u) << "the growing configurations grew";
 }
 
 }  // namespace

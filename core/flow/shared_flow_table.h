@@ -3,6 +3,7 @@
 #ifndef BESS_FLOW_SHARED_FLOW_TABLE_H_
 #define BESS_FLOW_SHARED_FLOW_TABLE_H_
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstddef>
@@ -191,6 +192,7 @@ class SharedFlowTable {
     table->slots_block_ = std::move(slots);
     table->free_block_ = std::move(free_items);
     table->pending_block_ = std::move(pending);
+    table->block_bytes_ = slot_bytes + free_bytes + pending_bytes;
     return table;
   }
 
@@ -408,6 +410,24 @@ class SharedFlowTable {
     return ReclaimLocked();
   }
 
+  // Visits the live flows in slots [first, first + count) (clamped to the
+  // capacity): fn(FlowHandle, const Key &primary, const State &). Returns the
+  // slot after the window (capacity() when done), so a caller can walk the
+  // table in chunks, as a growing owner copies it into a larger table. Holds
+  // the writer lock: the callback must not call back into this table.
+  template <typename Fn>
+  size_t VisitRange(size_t first, size_t count, Fn &&fn) const {
+    Lock guard(lock_);
+    const size_t end = std::min<size_t>(capacity_, first + count);
+    for (size_t slot = first; slot < end; slot++) {
+      if (slots_[slot].LoadGeneration() & 1) {
+        fn(HandleOf(static_cast<uint32_t>(slot)), *slots_[slot].key_ptr(0),
+           *slots_[slot].state_ptr());
+      }
+    }
+    return end;
+  }
+
   // Visits every live flow: fn(FlowHandle, const Key &primary, const State &).
   // Holds the writer lock: the callback must not call back into the table.
   template <typename Fn>
@@ -424,6 +444,9 @@ class SharedFlowTable {
 
   size_t size() const noexcept { return size_.load(std::memory_order_relaxed); }
   size_t capacity() const noexcept { return capacity_; }
+  // Bytes of the slots and free lists (the rte_hash directory not counted:
+  // DPDK does not report it).
+  size_t memory_bytes() const noexcept { return block_bytes_; }
   // Erased flows whose State has not been destroyed yet: the reclamation
   // backlog. A stalled reader makes it grow until the table is full.
   size_t pending_reclaim() const noexcept {
@@ -793,6 +816,7 @@ class SharedFlowTable {
   uint32_t batch_head_ = 0;
   uint32_t batch_count_ = 0;
   Block slots_block_, free_block_, pending_block_;
+  size_t block_bytes_ = 0;
 };
 
 }  // namespace bess::flow

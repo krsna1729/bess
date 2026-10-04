@@ -612,6 +612,7 @@ unit_test_sources = [
   'conntrack/conntrack_model_test.cc',
   'nat/nat_test.cc',
   'nat/nat_model_test.cc',
+  'nat/shared_nat_test.cc',
   'tunnel/tunnel_test.cc',
   'flow/flow_index_test.cc',
   'flow/reference_apps_test.cc',

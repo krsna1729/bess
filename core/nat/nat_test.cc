@@ -432,6 +432,45 @@ TEST(NatTest, FullTablesDuplicateAddressesAndConflicts) {
 
 // A batch gives what packet-by-packet translation gives, including two
 // packets of one new flow in the same batch (one mapping, not a refusal).
+// Growth (TP5): while a larger table is adopted but nothing has moved yet,
+// new bindings may only fill it up to its capacity counting the ones still in
+// the old table, so every binding fits when migration runs; nothing is lost.
+TEST(NatTest, GrowthNeverLosesABindingWhenCreatesOutrunMigration) {
+  Nat::Config c;
+  c.addresses = {Pub()};
+  c.capacity = 4;
+  c.max_capacity = 16;  // the wheel holds 16: only the size check stops at 8
+  c.granularity_shift = 0;
+  c.seed = 7;
+  auto nat = Nat::Create(c).value();
+  auto send = [&](uint16_t port) {
+    auto f = Frame(17, kInside, port, kRemote, 53);
+    ParsedFlowPacket p;
+    EXPECT_EQ(ParseStatus::kOk, ParseFrame(f, p));
+    return nat->Translate(f, p, Direction::kForward, 0);
+  };
+  for (uint16_t port = 1000; port < 1003; port++) ASSERT_EQ(Verdict::kTranslated, send(port));
+  ASSERT_TRUE(nat->NeedsGrowth()) << "3 of 4";
+  ASSERT_EQ(8u, nat->GrowthTarget());
+  nat->Adopt(Nat::NewTable(nat->GrowthTarget()));
+  ASSERT_TRUE(nat->migrating());
+  // No migration step: creates go to the new table until both together fill it.
+  uint16_t port = 1003;
+  while (send(port) == Verdict::kTranslated) port++;
+  EXPECT_EQ(8u, nat->size()) << "3 old + 5 new: the new table's capacity, no more";
+  EXPECT_EQ(Verdict::kFull, send(port));
+  std::unique_ptr<Nat::Table> old;
+  while ((old = nat->MigrateSome(1)) == nullptr) {
+  }
+  EXPECT_EQ(0u, old->size()) << "every binding moved";
+  EXPECT_FALSE(nat->migrating());
+  EXPECT_EQ(8u, nat->size());
+  for (uint16_t q = 1000; q < port; q++) {
+    EXPECT_TRUE(nat->Find(Endpoint{be32_t(kInside), be16_t(q), 17}) != nullptr) << q;
+  }
+  EXPECT_TRUE(nat->NeedsGrowth()) << "8 of 8: the next growth (to 16) is due";
+}
+
 TEST(NatTest, BatchMatchesPacketByPacket) {
   Harness one({Pub()}), many({Pub()});  // same seed: same port choices
   std::mt19937 rng(21);

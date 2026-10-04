@@ -4,9 +4,11 @@
 #ifndef BESS_MODULES_NAT_H_
 #define BESS_MODULES_NAT_H_
 
+#include <atomic>
 #include <memory>
 #include <string>
 
+#include "framework/module_requests.h"
 #include "module.h"
 #include "nat/nat.h"
 #include "pb/module_msg.pb.h"
@@ -24,8 +26,10 @@ class NAT final : public Module {
 
   static const Commands cmds;
 
-  // One worker: the binding table is worker-owned.
+  // One worker unless Init chooses the shared NAT (TP6): the default table is
+  // worker-owned.
   NAT() : Module() { max_allowed_workers_ = 1; }
+  ~NAT() override;
 
   CommandResponse Init(const bess::pb::NATArg &arg);
   CommandResponse GetInitialArg(const bess::pb::EmptyArg &arg);
@@ -38,7 +42,23 @@ class NAT final : public Module {
   std::string GetDesc() const override;
 
  private:
+  // Growth (TP5, D-078): the worker asks for a larger table, the control side
+  // allocates it and hands it over here; the worker migrates and hands the old
+  // table back to be freed. Neither allocation nor free happens on a worker.
+  struct GrowRequest {
+    uint64_t capacity;  // 0: free the retired table
+  };
+  void OnGrowRequest(const GrowRequest &request);
+  template <typename N>
+  void Translate(N &nat, Context *ctx, bess::PacketBatch *batch);
+
+  // Exactly one is set: the owned NAT (one worker, grows) or the shared one.
   std::unique_ptr<bess::nat::Nat> nat_;
+  std::unique_ptr<bess::nat::SharedNat> shared_;
+  std::atomic<bess::nat::Nat::Table *> handover_{nullptr};  // control -> worker
+  std::atomic<bess::nat::Nat::Table *> retired_{nullptr};   // worker -> control
+  bess::framework::RequestEndpoint<GrowRequest> grow_;
+  bess::framework::RequestEndpoint<GrowRequest> free_;
 };
 
 #endif  // BESS_MODULES_NAT_H_

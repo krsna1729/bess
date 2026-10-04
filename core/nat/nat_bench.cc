@@ -36,6 +36,7 @@
 
 #include "arch/crc32c.h"
 #include "nat/nat.h"
+#include "rcu/rcu_domain.h"
 #include "utils/cuckoo_map.h"
 
 namespace {
@@ -207,20 +208,29 @@ uint64_t LegacyPacket(LegacyMap &map, std::vector<uint8_t> &f, bool reverse) {
   return 1;
 }
 
-void BM_Translate(benchmark::State &st) {
+// N = Nat (the owned NAT) or SharedNat (TP6: one NAT for every worker; one
+// RCU reader here, online throughout, as a worker is).
+template <typename N>
+void TranslateImpl(benchmark::State &st) {
   const bool legacy_path = st.range(0) == 0 || st.range(0) == 2;
   const bool reverse = st.range(1) == 1;
   const auto n = static_cast<uint32_t>(st.range(2));
   LegacyMap legacy;
-  Nat::Config c;
+  typename N::Config c;
   // 20 addresses: room for 1M UDP mappings (64,512 ports each).
   for (uint32_t a = 1; a <= 20; a++) {
     c.addresses.push_back({be32_t(0xc6336400 + a), {{0, 65535, false}}});
   }
   // Paths 1 and 3 size the table as the module does (CapacityFor: here 1M,
   // the cap), so a small set of mappings sits in a sparse table.
-  c.capacity = Nat::CapacityFor(c.addresses);
-  auto nat = Nat::Create(c).value();
+  c.capacity = N::CapacityFor(c.addresses);
+  bess::rcu::RcuDomain domain(2);
+  if constexpr (N::kShared) {
+    if (!domain.Register(1).has_value()) std::abort();
+    domain.Online(1);
+    c.rcu = &domain;
+  }
+  auto nat = N::Create(c).value();
   std::vector<std::vector<uint8_t>> frames;
   std::vector<ParsedFlowPacket> parsed;
   for (uint32_t i = 0; i < n; i++) {
@@ -321,7 +331,15 @@ void BM_Translate(benchmark::State &st) {
       static_cast<double>(st.iterations()) * per,
       benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
   st.counters["bytes_per_mapping"] = static_cast<double>(nat->memory_bytes()) / c.capacity;
+  if constexpr (N::kShared) {
+    domain.Offline(1);  // first: the table's destructor waits for a grace period
+    nat.reset();
+    domain.Unregister(1);
+  }
 }
+
+void BM_Translate(benchmark::State &st) { TranslateImpl<Nat>(st); }
+void BM_TranslateShared(benchmark::State &st) { TranslateImpl<SharedNat>(st); }
 
 void BM_Bind(benchmark::State &st) {
   constexpr uint32_t kCap = 65536;
@@ -355,6 +373,7 @@ void BM_Bind(benchmark::State &st) {
 BENCHMARK(BM_Lookup)->ArgsProduct({{0, 1}, {4096, 65536, 1048576}})->MinTime(0.2);
 BENCHMARK(BM_Allocate)->ArgsProduct({{0, 1}, {10, 50, 90, 99}})->MinTime(0.2);
 BENCHMARK(BM_Translate)->ArgsProduct({{0, 1, 2, 3}, {0, 1}, {4096, 65536, 1048576}})->MinTime(0.2);
+BENCHMARK(BM_TranslateShared)->ArgsProduct({{3}, {0, 1}, {4096, 65536, 1048576}})->MinTime(0.2);
 BENCHMARK(BM_Bind)->MinTime(0.2);
 
 }  // namespace
