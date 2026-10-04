@@ -800,17 +800,25 @@ TEST_F(RouterTransactionTest, GroupsNextHopsAndRoutesChangeInOneTransaction) {
                 .outcome,
             Outcome::kApplied);
 
-  // The route moves to a plain next hop and the group goes, in one transaction.
+  // The route moves to a plain next hop and the group goes, in one
+  // transaction, while a reader is online and has not passed a quiescent
+  // state: it may still hold a FIB value naming the group.
+  rcu::RcuDomain &rcu = bess::runtime::runtime().rcu();
+  const rcu::ReaderId reader = 62;
+  ASSERT_TRUE(rcu.Register(reader).has_value());
+  rcu.Online(reader);
   ASSERT_EQ(Apply({router->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(3)),
                    router->RemoveNextHopGroupOp(NextHopGroupId(1))})
                 .outcome,
             Outcome::kApplied);
   EXPECT_EQ(EgressOf(*router, Ip(10, 1, 1, 1)), 3);
-  // The removed id stays retiring until reclaimed: a reader may still hold
-  // a FIB value naming it.
+  // So the removed id stays retiring: re-adding it is refused.
   const auto again = Apply({router->SetNextHopGroupOp(NextHopGroupId(1), cd)});
+  rcu.Offline(reader);
+  rcu.Unregister(reader);
   ASSERT_NE(again.outcome, Outcome::kApplied);
   EXPECT_NE(again.ops[0].error.find("retiring"), std::string::npos) << again.ops[0].error;
+  // Once the reader is gone the grace period ends and the id is free again.
   Settle();
   EXPECT_EQ(router->next_hop_group_count(), 0u);
   ASSERT_EQ(Apply({router->SetNextHopGroupOp(NextHopGroupId(1), cd)}).outcome, Outcome::kApplied);
