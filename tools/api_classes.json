@@ -33,6 +33,7 @@
     "task.h": "public",
     "worker.h": "public",
     "arch/cpu.h": "public",
+    "arch/byte_match.h": "experimental",
     "arch/crc32c.h": "experimental",
     "arch/fp_env.h": "experimental",
     "arch/signal_context.h": "experimental",
@@ -105,7 +106,6 @@
     "utils/ip.h": "experimental",
     "utils/logging.h": "public",
     "utils/random.h": "public",
-    "utils/simd.h": "experimental",
     "utils/tcp.h": "experimental",
     "utils/time.h": "public",
     "utils/udp.h": "experimental"

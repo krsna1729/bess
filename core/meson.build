@@ -186,7 +186,6 @@ utility_sources = files(
   'utils/http_parser.cc',
   'utils/ip.cc',
   'utils/pcap_handle.cc',
-  'utils/simd.cc',
   'utils/stacktrace.cc',
   'utils/syscallthread.cc',
   'utils/time.cc',
@@ -476,6 +475,7 @@ install_headers(core_public_headers, subdir: 'bess/core')
 core_public_subdir_headers = {
   'arch': files(
     'arch/cpu.h',
+    'arch/byte_match.h',
     'arch/crc32c.h',
     'arch/fp_env.h',
     'arch/signal_context.h',
@@ -496,7 +496,6 @@ core_public_subdir_headers = {
     'utils/ip.h',
     'utils/logging.h',
     'utils/random.h',
-    'utils/simd.h',
     'utils/tcp.h',
     'utils/time.h',
     'utils/udp.h',
@@ -685,6 +684,7 @@ unit_test_sources = [
   'utils/inline_function_test.cc',
   'utils/bpf_program_test.cc',
   'utils/checksum_test.cc',
+  'utils/copy_test.cc',
   'utils/codel_test.cc',
   'utils/cuckoo_map_test.cc',
   'utils/endian_test.cc',

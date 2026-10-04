@@ -279,4 +279,35 @@ TEST(Mask, ExtraLongUnAligned) {
   }
 }
 
+// Every length across the 1-, 8- and 16-byte chunk boundaries, at every
+// relative misalignment of buf and mask: each byte is ANDed with its mask
+// byte and nothing outside [buf, buf + len) changes.
+TEST(Mask, EveryLengthAndAlignment) {
+  const size_t kMaxLength = 80;
+  const size_t kPad = 16;
+  for (size_t len = 0; len <= kMaxLength; len++) {
+    for (size_t buf_off = 0; buf_off < 8; buf_off++) {
+      for (size_t mask_off = 0; mask_off < 8; mask_off += 3) {
+        std::vector<uint8_t> buf(kPad + kMaxLength + kPad);
+        std::vector<uint8_t> mask(kMaxLength + 8);
+        for (size_t i = 0; i < buf.size(); i++) {
+          buf[i] = static_cast<uint8_t>(0x5A ^ (i * 37));
+        }
+        for (size_t i = 0; i < mask.size(); i++) {
+          mask[i] = static_cast<uint8_t>(i * 101 + len);
+        }
+        std::vector<uint8_t> exp = buf;
+        uint8_t *b = buf.data() + kPad + buf_off;
+        const uint8_t *m = mask.data() + mask_off;
+        for (size_t i = 0; i < len; i++) {
+          exp[kPad + buf_off + i] &= m[i];
+        }
+        bess::utils::MaskBytes(b, m, len);
+        ASSERT_EQ(exp, buf) << "len=" << len << " buf_off=" << buf_off
+                            << " mask_off=" << mask_off;
+      }
+    }
+  }
+}
+
 }  // namespace (unnamed)

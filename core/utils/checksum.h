@@ -8,11 +8,13 @@
 #ifndef BESS_UTILS_CHECKSUM_H_
 #define BESS_UTILS_CHECKSUM_H_
 
-#include <x86intrin.h>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 
 #include "common.h"
 #include "ip.h"
-#include "simd.h"
 #include "tcp.h"
 #include "udp.h"
 
@@ -22,156 +24,70 @@ namespace utils {
 // All input bytestreams for checksum should be network-order
 // Todo: strongly-typed endian for input/output paramters
 
-// Pointer types used below to type-pun into packed protocol headers
-// (Ipv4/Udp/Tcp) that a caller may have just written through their real
-// struct type. Plain `uint32_t`/`uint64_t`/`uint16_t` pointers are NOT
-// safe for this: strict aliasing lets GCC assume such a read can't
-// observe a write made through the header's own struct type, and CSE or
-// hoist the read across it -- including reads that appear as a plain C
-// expression operand to inline asm (e.g. `"g"(buf32[i] & 0xFFFF)`), which
-// is not protected by a later asm's `"memory"` clobber. `may_alias`
-// disables that assumption for these specific pointer types. Confirmed
-// necessary and sufficient by direct reproduction; see MODERNIZATION.md.
-typedef uint16_t __attribute__((may_alias)) aliasing_uint16_t;
-typedef uint32_t __attribute__((may_alias)) aliasing_uint32_t;
-typedef uint64_t __attribute__((may_alias)) aliasing_uint64_t;
+// The header functions below read 32-bit words of the header and mask out the
+// checksum field by its position in a little-endian word.
+static_assert(std::endian::native == std::endian::little,
+              "checksum.h reads header words as little-endian");
 
-// Returns 32-bit one's complement sum of 'len' bytes from 'buf' and 'sum16'.
+namespace checksum_internal {
+
+// Every read of packet bytes goes through these: memcpy is a byte access, so
+// it may alias the header struct a caller has just written (GCC once hoisted a
+// typed read of ip.length above `ip->length = ...` in url_filter.cc's
+// Generate403Packet, see MODERNIZATION.md) and needs no alignment (IPv4 and
+// L4 headers sit 2 bytes off a 4-byte boundary behind Ethernet).
+static inline uint64_t Load32(const unsigned char *p) {
+  uint32_t v;
+  memcpy(&v, p, sizeof(v));
+  return v;
+}
+
+static inline uint64_t Load16(const unsigned char *p) {
+  uint16_t v;
+  memcpy(&v, p, sizeof(v));
+  return v;
+}
+
+// Folds an exact sum of 32-bit words into 32 bits with end-around carry: the
+// result is congruent to `sum` modulo 2^32 - 1 and is 0 only if `sum` is.
+static inline uint32_t Fold64(uint64_t sum) {
+  sum = (sum >> 32) + (sum & 0xFFFFFFFF);
+  sum += sum >> 32;
+  return static_cast<uint32_t>(sum);
+}
+
+}  // namespace checksum_internal
+
+// Returns 32-bit one's complement sum of 'len' bytes from 'buf'.
+//
+// Whole 16-byte blocks are summed as 32-bit words, the remainder as 16-bit
+// words, then the odd byte; every part is exact in 64 bits (len < 16 GiB) and
+// folded once. Only the sum modulo 0xFFFF and whether it is zero carry
+// meaning; this split also reproduces the exact 32-bit value of the former
+// x86-64 adc/AVX2 kernels. Plain loops: compilers vectorize the word loop
+// (e.g. zero-extend and 64-bit adds with AVX2; widening adds on arm64).
 static inline uint32_t CalculateSum(const void *buf, size_t len) {
-  const aliasing_uint64_t *buf64 =
-      reinterpret_cast<const aliasing_uint64_t *>(buf);
+  using checksum_internal::Load16;
+  using checksum_internal::Load32;
+  const auto *p = static_cast<const unsigned char *>(buf);
+  const size_t words32_end = len & ~size_t{15};
   uint64_t sum64 = 0;
-  bool odd = len & 1;
 
-#if __AVX2__
-  // Faster for >128B data
-  if (len >= sizeof(__m256i) * 4) {
-    const __m256i *buf256 = reinterpret_cast<const __m256i *>(buf64);
-    __m256i zero256 = _mm256_setzero_si256();
-
-    // We parallelize two ymm streams to minimize register dependency:
-    //     a: buf256,             buf256 + 2,             ...
-    //     b:         buf256 + 1,             buf256 + 3, ...
-    __m256i a = _mm256_loadu_si256(buf256);
-    __m256i b = _mm256_loadu_si256(buf256 + 1);
-
-    // For each stream, accumulate unpackhi and unpacklo in parallel
-    // (as 4x64bit vectors, so that each upper 0000 can hold carries)
-    // -------------------------------------------------------------------
-    // 32B data: aaaaAAAA bbbbBBBB ccccCCCC ddddDDDD  (1 letter = 1 byte)
-    // unpackhi: bbbb0000 BBBB0000 dddd0000 DDDD0000
-    // unpacklo: aaaa0000 AAAA0000 cccc0000 CCCC0000
-    __m256i sum_a_hi = _mm256_unpackhi_epi32(a, zero256);
-    __m256i sum_a_lo = _mm256_unpacklo_epi32(a, zero256);
-    __m256i sum_b_hi = _mm256_unpackhi_epi32(b, zero256);
-    __m256i sum_b_lo = _mm256_unpacklo_epi32(b, zero256);
-
-    len -= sizeof(__m256i) * 2;
-    buf256 += 2;
-
-    while (len >= sizeof(__m256i) * 2) {
-      a = _mm256_loadu_si256(buf256);
-      b = _mm256_loadu_si256(buf256 + 1);
-
-      sum_a_hi = _mm256_add_epi64(sum_a_hi, _mm256_unpackhi_epi32(a, zero256));
-      sum_a_lo = _mm256_add_epi64(sum_a_lo, _mm256_unpacklo_epi32(a, zero256));
-      sum_b_hi = _mm256_add_epi64(sum_b_hi, _mm256_unpackhi_epi32(b, zero256));
-      sum_b_lo = _mm256_add_epi64(sum_b_lo, _mm256_unpacklo_epi32(b, zero256));
-
-      len -= sizeof(__m256i) * 2;
-      buf256 += 2;
-    }
-
-    // fold four 256bit sums into one 128bit sum
-    __m256i sum256 = _mm256_add_epi64(_mm256_add_epi64(sum_a_hi, sum_a_lo),
-                                      _mm256_add_epi64(sum_b_hi, sum_b_lo));
-    __m128i sum128 = _mm_add_epi64(_mm256_extracti128_si256(sum256, 0),
-                                   _mm256_extracti128_si256(sum256, 1));
-
-    // fold 128bit sum into 64bit
-    sum64 += m128i_extract_u64(sum128, 0) + m128i_extract_u64(sum128, 1);
-    buf64 = reinterpret_cast<const aliasing_uint64_t *>(buf256);
-  }
-#endif
-
-#if __x86_64
-  // Repeat 64-bit one's complement sum (at sum64) including carrys
-  // 8 additions in a loop
-  while (len >= sizeof(uint64_t) * 8) {
-    asm volatile(
-        "addq %[u0], %[sum] \n\t"
-        "adcq %[u1], %[sum] \n\t"
-        "adcq %[u2], %[sum] \n\t"
-        "adcq %[u3], %[sum] \n\t"
-        "adcq %[u4], %[sum] \n\t"
-        "adcq %[u5], %[sum] \n\t"
-        "adcq %[u6], %[sum] \n\t"
-        "adcq %[u7], %[sum] \n\t"
-        "adcq $0, %[sum]"
-        : [sum] "+&r"(sum64)
-        : [u0] "m"(buf64[0]), [u1] "m"(buf64[1]), [u2] "m"(buf64[2]),
-          [u3] "m"(buf64[3]), [u4] "m"(buf64[4]), [u5] "m"(buf64[5]),
-          [u6] "m"(buf64[6]), [u7] "m"(buf64[7])
-        : "memory");
-    len -= sizeof(uint64_t) * 8;
-    buf64 += 8;
+  for (size_t i = 0; i < words32_end; i += 4) {
+    sum64 += Load32(p + i);
   }
 
-  while (len >= sizeof(uint64_t) * 2) {
-    // Repeat 64-bit one's complement sum (at sum64) including carrys
-    // 2 additions in a loop
-    asm volatile(
-        "addq %[u0], %[sum] \n\t"
-        "adcq %[u1], %[sum] \n\t"
-        "adcq $0, %[sum]"
-        : [sum] "+&r"(sum64)
-        : [u0] "m"(buf64[0]), [u1] "m"(buf64[1])
-        : "memory");
-    len -= sizeof(uint64_t) * 2;
-    buf64 += 2;
-  }
-
-  // Reduce 64-bit unsigned integer to 32-bit unsigned integer
-  // Carry may happens, but no need to complete reduce here
-  sum64 = (sum64 >> 32) + (sum64 & 0xFFFFFFFF);
-#else
-  // Use stantard C language for 32 bit or other non-Intel
-  typedef union[[gnu::may_alias]] {
-    uint32_t u64;
-    uint16_t u16[4];
-  }
-  u16_64;
-  const u16_64 *ubuf64;
-  ubuf64 = reinterpret_cast<const u16_64 *>(buf64);
-  while (len >= sizeof(uint64_t)) {
-    sum64 += ubuf64->u16[0];
-    sum64 += ubuf64->u16[1];
-    sum64 += ubuf64->u16[2];
-    sum64 += ubuf64->u16[3];
-    len -= sizeof(uint64_t);
-    ubuf64++;
-  }
-  buf64 = reinterpret_cast<const aliasing_uint64_t *>(ubuf64);
-#endif
-
-  // Repeat 16-bit one's complement sum (at sum64)
-  const aliasing_uint16_t *buf16 =
-      reinterpret_cast<const aliasing_uint16_t *>(buf64);
-  while (len >= sizeof(uint16_t)) {
-    sum64 += *buf16++;
-    len -= sizeof(uint16_t);
+  size_t i = words32_end;
+  for (; i + 1 < len; i += 2) {
+    sum64 += Load16(p + i);
   }
 
   // Add remaining 8-bit to the one's complement sum
-  if (odd) {
-    sum64 += *reinterpret_cast<const uint8_t *>(buf16);
+  if (len & 1) {
+    sum64 += p[i];
   }
 
-  // Reduce 64-bit unsigned int to 32-bit unsigned int
-  sum64 = (sum64 >> 32) + (sum64 & 0xFFFFFFFF);
-  sum64 += (sum64 >> 32);
-
-  return static_cast<uint32_t>(sum64);
+  return checksum_internal::Fold64(sum64);
 }
 
 // Fold a 32-bit non-inverted checksum into a inverted 16-bit one,
@@ -201,91 +117,48 @@ static inline bool VerifyGenericChecksum(const void *buf, size_t len) {
   return VerifyGenericChecksum(buf, len, 0);
 }
 
+namespace checksum_internal {
+
+// One's complement sum (unfolded) of the 20-byte option-less IPv4 header at
+// `p`, optionally without its checksum field (bytes 10-11, the high half of
+// the third little-endian word).
+static inline uint64_t SumIpv4Header(const unsigned char *p,
+                                     bool skip_checksum) {
+  return Load32(p) + Load32(p + 4) +
+         (skip_checksum ? Load32(p + 8) & 0xFFFF : Load32(p + 8)) +
+         Load32(p + 12) + Load32(p + 16);
+}
+
+// The IPv4 pseudo-header fields (RFC 768/793) as little-endian words: the
+// addresses and length are in network order, the zero byte and protocol form
+// the 16-bit word 0x00pp, read little-endian as 0xpp00.
+static inline uint64_t SumPseudoHeader(be32_t src, be32_t dst, uint16_t l4_len,
+                                       uint8_t proto) {
+  return uint64_t{src.raw_value()} + dst.raw_value() + be16_t::swap(l4_len) +
+         (uint32_t{proto} << 8);
+}
+
+}  // namespace checksum_internal
+
 // Returns true if the IP checksum is correct
 static inline bool VerifyIpv4NoOptChecksum(const Ipv4 &iph) {
-  const aliasing_uint32_t *buf32 =
-      reinterpret_cast<const aliasing_uint32_t *>(&iph);
-  uint32_t sum;
-
-  // Calculate internet checksum, the optimized way is
-  // 1. get 32-bit one's complement sum including carrys
-  //
-  // buf32[0] must be read here, inside the asm's memory operands, rather
-  // than via a preceding plain C `sum = buf32[0]` statement: a plain load
-  // is not ordered by the asm's "memory" clobber (that clobber only
-  // fences things *after* the asm executes), so it can still be hoisted
-  // ahead of a caller's write to the same bytes through a different
-  // pointer type when this function is inlined. See
-  // CalculateIpv4NoOptChecksum() below and MODERNIZATION.md for the
-  // confirmed repro of exactly this reordering.
-  asm volatile(
-      "movl %[u0], %[sum]   \n\t"
-      "addl %[u1], %[sum]   \n\t"
-      "adcl %[u2], %[sum]   \n\t"
-      "adcl %[u3], %[sum]   \n\t"
-      "adcl %[u4], %[sum]   \n\t"
-      "adcl $0, %[sum]        \n\t"
-      : [sum] "=&r"(sum)
-      : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [u2] "m"(buf32[2]),
-        [u3] "m"(buf32[3]), [u4] "m"(buf32[4])
-      : "memory");
-
-  // 2. reduce to 16-bit unsigned integer and negate
-  return FoldChecksum(sum) == 0;
+  const auto *p = reinterpret_cast<const unsigned char *>(&iph);
+  uint64_t sum = checksum_internal::SumIpv4Header(p, false);
+  return FoldChecksum(checksum_internal::Fold64(sum)) == 0;
 }
 
 // Returns IP checksum of the ip header 'iph' without ip options
 // It skips the checksum field into the calculation
 // It does not set the checksum field in ip header
 static inline uint16_t CalculateIpv4NoOptChecksum(const Ipv4 &iph) {
-  const aliasing_uint32_t *buf32 =
-      reinterpret_cast<const aliasing_uint32_t *>(&iph);
-  uint32_t sum;
-
-  // Calculate internet checksum, the optimized way is
-  // 1. get 32-bit one's complement sum including carrys
-  //
-  // This asm block (and every other one in this file) must be `volatile`
-  // with a "memory" clobber: without both, nothing tells the compiler
-  // that these memory reads need to observe prior writes to the same
-  // buffer through *other* pointer types (e.g. the Ipv4*/Tcp* field
-  // assignments callers do just before calling into these functions).
-  // Confirmed by direct reproduction: without this, GCC 13 at -O3 was
-  // observed hoisting a read of buf32[0] (ip.length, among other
-  // fields) *before* a preceding `ip->length = ...` write when this
-  // function got inlined into url_filter.cc's Generate403Packet(),
-  // silently computing the checksum over the wrong (stale template
-  // default) length field. See MODERNIZATION.md for the full
-  // investigation.
-  //
-  // Note buf32[0] is read here as an asm memory operand rather than via
-  // a preceding plain C `sum = buf32[0]` statement: a plain load sits
-  // *before* this asm in program order, so the asm's "memory" clobber
-  // (which only fences things after it executes) would not stop the
-  // compiler from still hoisting that plain load ahead of the caller's
-  // write. Folding the read into the asm's operand list is what actually
-  // closes the reordering window.
-  asm volatile(
-      "movl %[u0], %[sum]    \n\t"
-      "addl %[u1], %[sum]    \n\t"
-      "adcl %[u2], %[sum]    \n\t"
-      "adcl %[u3], %[sum]    \n\t"
-      "adcl %[u4], %[sum]    \n\t"
-      "adcl $0, %[sum]       \n\t"
-      : [sum] "=&r"(sum)
-      : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]),
-        [u2] "g"(buf32[2] & 0xFFFF),  // skip checksum fields
-        [u3] "m"(buf32[3]), [u4] "m"(buf32[4])
-      : "memory");
-
-  // 2. reduce to 16-bit unsigned integer and negate
-  return FoldChecksum(sum);
+  const auto *p = reinterpret_cast<const unsigned char *>(&iph);
+  uint64_t sum = checksum_internal::SumIpv4Header(p, true);
+  return FoldChecksum(checksum_internal::Fold64(sum));
 }
 
 // Returns true if the IP checksum is correct
 static inline bool VerifyIpv4Checksum(const Ipv4 &iph) {
-  const aliasing_uint32_t *buf32 =
-      reinterpret_cast<const aliasing_uint32_t *>(&iph);
+  const auto *p = reinterpret_cast<const unsigned char *>(&iph);
   size_t ip_header_len = iph.header_length << 2;
 
   if (likely(ip_header_len == sizeof(iph))) {
@@ -296,33 +169,16 @@ static inline bool VerifyIpv4Checksum(const Ipv4 &iph) {
     return false;  // Invalid IP header
   }
 
-  uint32_t sum = CalculateSum(buf32 + sizeof(iph) / sizeof(*buf32),
-                              ip_header_len - sizeof(iph));
-
-  // Calculate internet checksum, the optimized way is
-  // 1. get 32-bit one's complement sum including carrys
-  asm volatile(
-      "addl %[u0], %[sum]   \n\t"
-      "adcl %[u1], %[sum]   \n\t"
-      "adcl %[u2], %[sum]   \n\t"
-      "adcl %[u3], %[sum]   \n\t"
-      "adcl %[u4], %[sum]   \n\t"
-      "adcl $0, %[sum]        \n\t"
-      : [sum] "+&r"(sum)
-      : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [u2] "m"(buf32[2]),
-        [u3] "m"(buf32[3]), [u4] "m"(buf32[4])
-      : "memory");
-
-  // 2. reduce to 16-bit unsigned integer and negate
-  return FoldChecksum(sum) == 0;
+  uint64_t sum = CalculateSum(p + sizeof(iph), ip_header_len - sizeof(iph));
+  sum += checksum_internal::SumIpv4Header(p, false);
+  return FoldChecksum(checksum_internal::Fold64(sum)) == 0;
 }
 
 // Returns IP checksum of the ip header 'iph'
 // It skips the checksum field into the calculation
 // It does not set the checksum field in ip header
 static inline uint16_t CalculateIpv4Checksum(const Ipv4 &iph) {
-  const aliasing_uint32_t *buf32 =
-      reinterpret_cast<const aliasing_uint32_t *>(&iph);
+  const auto *p = reinterpret_cast<const unsigned char *>(&iph);
   size_t ip_header_len = iph.header_length << 2;
 
   if (likely(ip_header_len == sizeof(iph))) {
@@ -333,26 +189,9 @@ static inline uint16_t CalculateIpv4Checksum(const Ipv4 &iph) {
     return 0;  // Invalid IP header. Give up.
   }
 
-  uint32_t sum = CalculateSum(buf32 + sizeof(iph) / sizeof(*buf32),
-                              ip_header_len - sizeof(iph));
-
-  // Calculate internet checksum, the optimized way is
-  // 1. get 32-bit one's complement sum including carrys
-  asm volatile(
-      "addl %[u0], %[sum]    \n\t"
-      "adcl %[u1], %[sum]    \n\t"
-      "adcl %[u2], %[sum]    \n\t"
-      "adcl %[u3], %[sum]    \n\t"
-      "adcl %[u4], %[sum]    \n\t"
-      "adcl $0, %[sum]       \n\t"
-      : [sum] "+&r"(sum)
-      : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]),
-        [u2] "g"(buf32[2] & 0xFFFF),  // skip checksum fields
-        [u3] "m"(buf32[3]), [u4] "m"(buf32[4])
-      : "memory");
-
-  // 2. reduce to 16-bit unsigned integer and negate
-  return FoldChecksum(sum);
+  uint64_t sum = CalculateSum(p + sizeof(iph), ip_header_len - sizeof(iph));
+  sum += checksum_internal::SumIpv4Header(p, true);
+  return FoldChecksum(checksum_internal::Fold64(sum));
 }
 
 // Returns true if the UDP checksum is correct with the UDP header and
@@ -361,34 +200,21 @@ static inline uint16_t CalculateIpv4Checksum(const Ipv4 &iph) {
 // NOTE: Undefined behavior if udp_len < 8
 static inline bool VerifyIpv4UdpChecksum(const Udp &udph, be32_t src_ip,
                                          be32_t dst_ip, uint16_t udp_len) {
-  const aliasing_uint32_t *buf32 =
-      reinterpret_cast<const aliasing_uint32_t *>(&udph);
+  using checksum_internal::Load32;
+  const auto *p = reinterpret_cast<const unsigned char *>(&udph);
 
   // UDP checksum is optional, and all zeroes mean "not computed"
   if (udph.checksum == 0) {
     return true;
   }
 
-  // UDP payload
-  uint32_t sum = CalculateSum(buf32 + sizeof(udph) / sizeof(*buf32),
-                              udp_len - sizeof(udph));
-  uint32_t len = static_cast<uint32_t>(be16_t::swap(udp_len));
+  // UDP payload, header and pseudo header
+  uint64_t sum = CalculateSum(p + sizeof(udph), udp_len - sizeof(udph));
+  sum += Load32(p) + Load32(p + 4);
+  sum += checksum_internal::SumPseudoHeader(src_ip, dst_ip, udp_len,
+                                            Ipv4::Proto::kUdp);
 
-  // Calculate the checksum of UDP header and pseudo header
-  asm volatile(
-      "addl %[u0], %[sum]      \n\t"
-      "adcl %[u1], %[sum]      \n\t"
-      "adcl %[src], %[sum]     \n\t"
-      "adcl %[dst], %[sum]     \n\t"
-      "adcl %[len], %[sum]     \n\t"
-      "adcl $0x1100, %[sum]    \n\t"  // 17 == IPPROTO_UDP
-      "adcl $0, %[sum]         \n\t"
-      : [sum] "+&r"(sum)
-      : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [src] "r"(src_ip.raw_value()),
-        [dst] "r"(dst_ip.raw_value()), [len] "r"(len)
-      : "memory");
-
-  return FoldChecksum(sum) == 0;
+  return FoldChecksum(checksum_internal::Fold64(sum)) == 0;
 }
 
 // Returns true if the UDP checksum is correct
@@ -411,29 +237,18 @@ static inline bool VerifyIpv4UdpChecksum(const Ipv4 &iph, const Udp &udph) {
 // NOTE: Undefined behavior if udp_len < 8
 static inline uint16_t CalculateIpv4UdpChecksum(const Udp &udph, be32_t src,
                                                 be32_t dst, uint16_t udp_len) {
-  const aliasing_uint32_t *buf32 =
-      reinterpret_cast<const aliasing_uint32_t *>(&udph);
-  // UDP payload
-  uint32_t sum = CalculateSum(buf32 + sizeof(udph) / sizeof(*buf32),
-                              udp_len - sizeof(udph));
-  uint32_t len = static_cast<uint32_t>(be16_t::swap(udp_len));
+  using checksum_internal::Load32;
+  const auto *p = reinterpret_cast<const unsigned char *>(&udph);
 
-  // Calculate the checksum of UDP header and pseudo header
-  asm volatile(
-      "addl %[u0], %[sum]      \n\t"
-      "adcl %[u1], %[sum]      \n\t"
-      "adcl %[src], %[sum]     \n\t"
-      "adcl %[dst], %[sum]     \n\t"
-      "adcl %[len], %[sum]     \n\t"
-      "adcl $0x1100, %[sum]    \n\t"  // 17 == IPPROTO_UDP
-      "adcl $0, %[sum]         \n\t"
-      : [sum] "+&r"(sum)
-      : [u0] "m"(buf32[0]), [u1] "g"(buf32[1] & 0xFFFF),  // skip checksum field
-        [src] "r"(src.raw_value()), [dst] "r"(dst.raw_value()), [len] "r"(len)
-      : "memory");
+  // UDP payload, header without the checksum field (bytes 6-7) and pseudo
+  // header
+  uint64_t sum = CalculateSum(p + sizeof(udph), udp_len - sizeof(udph));
+  sum += Load32(p) + (Load32(p + 4) & 0xFFFF);
+  sum += checksum_internal::SumPseudoHeader(src, dst, udp_len,
+                                            Ipv4::Proto::kUdp);
 
   // If the result of UDP checksum calculation is 0, return all ones (rfc 768)
-  return FoldChecksum(sum) ?: 0xFFFF;
+  return FoldChecksum(checksum_internal::Fold64(sum)) ?: 0xFFFF;
 }
 
 // Returns UDP (on IPv4) checksum of the UDP header 'udph' with ip header 'iph'
@@ -456,33 +271,17 @@ static inline uint16_t CalculateIpv4UdpChecksum(const Ipv4 &iph,
 // NOTE: Undefined behavior if tcp_len < 20
 static inline bool VerifyIpv4TcpChecksum(const Tcp &tcph, be32_t src_ip,
                                          be32_t dst_ip, uint16_t tcp_len) {
-  const aliasing_uint32_t *buf32 =
-      reinterpret_cast<const aliasing_uint32_t *>(&tcph);
+  using checksum_internal::Load32;
+  const auto *p = reinterpret_cast<const unsigned char *>(&tcph);
 
-  // TCP options and payload
-  uint32_t sum = CalculateSum(buf32 + sizeof(tcph) / sizeof(*buf32),
-                              tcp_len - sizeof(tcph));
-  uint32_t len = static_cast<uint32_t>(be16_t::swap(tcp_len));
+  // TCP options and payload, header and pseudo header
+  uint64_t sum = CalculateSum(p + sizeof(tcph), tcp_len - sizeof(tcph));
+  sum += Load32(p) + Load32(p + 4) + Load32(p + 8) + Load32(p + 12) +
+         Load32(p + 16);
+  sum += checksum_internal::SumPseudoHeader(src_ip, dst_ip, tcp_len,
+                                            Ipv4::Proto::kTcp);
 
-  // Calculate the checksum of TCP header and pseudo header
-  asm volatile(
-      "addl %[u0], %[sum]      \n\t"
-      "adcl %[u1], %[sum]      \n\t"
-      "adcl %[u2], %[sum]      \n\t"
-      "adcl %[u3], %[sum]      \n\t"
-      "adcl %[u4], %[sum]      \n\t"
-      "adcl %[src], %[sum]     \n\t"
-      "adcl %[dst], %[sum]     \n\t"
-      "adcl %[len], %[sum]     \n\t"
-      "adcl $0x0600, %[sum]    \n\t"  // 6 == IPPROTO_TCP
-      "adcl $0, %[sum]         \n\t"
-      : [sum] "+&r"(sum)
-      : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [u2] "m"(buf32[2]),
-        [u3] "m"(buf32[3]), [u4] "m"(buf32[4]), [src] "r"(src_ip.raw_value()),
-        [dst] "r"(dst_ip.raw_value()), [len] "r"(len)
-      : "memory");
-
-  return FoldChecksum(sum) == 0;
+  return FoldChecksum(checksum_internal::Fold64(sum)) == 0;
 }
 
 // Returns true if the TCP checksum is correct
@@ -507,33 +306,18 @@ static inline bool VerifyIpv4TcpChecksum(const Ipv4 &iph, const Tcp &tcph) {
 // NOTE: Undefined behavior if tcp_len < 20
 static inline uint16_t CalculateIpv4TcpChecksum(const Tcp &tcph, be32_t src,
                                                 be32_t dst, uint16_t tcp_len) {
-  const aliasing_uint32_t *buf32 =
-      reinterpret_cast<const aliasing_uint32_t *>(&tcph);
-  // tcp options and payload
-  uint32_t sum = CalculateSum(buf32 + sizeof(tcph) / sizeof(*buf32),
-                              tcp_len - sizeof(tcph));
-  uint32_t len = static_cast<uint32_t>(be16_t::swap(tcp_len));
+  using checksum_internal::Load32;
+  const auto *p = reinterpret_cast<const unsigned char *>(&tcph);
 
-  // Calculate the checksum of TCP header and pseudo header
-  asm volatile(
-      "addl %[u0], %[sum]      \n\t"
-      "adcl %[u1], %[sum]      \n\t"
-      "adcl %[u2], %[sum]      \n\t"
-      "adcl %[u3], %[sum]      \n\t"
-      "adcl %[u4], %[sum]      \n\t"
-      "adcl %[src], %[sum]     \n\t"
-      "adcl %[dst], %[sum]     \n\t"
-      "adcl %[len], %[sum]     \n\t"
-      "adcl $0x0600, %[sum]    \n\t"  // 6 == IPPROTO_TCP
-      "adcl $0, %[sum]         \n\t"
-      : [sum] "+&r"(sum)
-      : [u0] "m"(buf32[0]), [u1] "m"(buf32[1]), [u2] "m"(buf32[2]),
-        [u3] "m"(buf32[3]),
-        [u4] "g"(buf32[4] >> 16),  // skip checksum field
-        [src] "r"(src.raw_value()), [dst] "r"(dst.raw_value()), [len] "r"(len)
-      : "memory");
+  // TCP options and payload, header without the checksum field (bytes 16-17,
+  // the low half of the fifth little-endian word) and pseudo header
+  uint64_t sum = CalculateSum(p + sizeof(tcph), tcp_len - sizeof(tcph));
+  sum += Load32(p) + Load32(p + 4) + Load32(p + 8) + Load32(p + 12) +
+         (Load32(p + 16) >> 16);
+  sum += checksum_internal::SumPseudoHeader(src, dst, tcp_len,
+                                            Ipv4::Proto::kTcp);
 
-  return FoldChecksum(sum);
+  return FoldChecksum(checksum_internal::Fold64(sum));
 }
 
 // Returns TCP (on IPv4) checksum of the tcp header 'tcph' with ip header 'iph'
