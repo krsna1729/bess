@@ -5,6 +5,8 @@
 
 #include "syscallthread.h"
 
+#include "utils/logging.h"
+
 namespace bess {
 namespace utils {
 
@@ -56,11 +58,11 @@ bool CatchExitSignal() {
   return true;
 }
 
-// pthread_sigmask shouldn't return EINTR, but we can check.
+// pthread_sigmask returns an error number (never -1 with errno); with a
+// valid mask it cannot fail.
 static inline void PthreadSetSigmask(const sigset_t *mask) {
-  while (pthread_sigmask(SIG_SETMASK, mask, nullptr) < 0 && errno == EINTR) {
-    continue;
-  }
+  const int rc = pthread_sigmask(SIG_SETMASK, mask, nullptr);
+  CHECK_EQ(rc, 0) << "pthread_sigmask: " << strerror(rc);
 }
 
 /*

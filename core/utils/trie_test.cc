@@ -25,6 +25,23 @@ TEST(TrieTest, Match) {
   EXPECT_TRUE(trie.Match("123456"));
 }
 
+// Assignment replaces the whole trie: a key only the old trie had is gone
+// (Node::operator= used to keep children the source lacked; M22 clang-tidy).
+TEST(TrieTest, AssignmentReplacesTheOldKeys) {
+  Trie<int32_t> trie;
+  trie.Insert("abc", 1);
+  Trie<int32_t> other;
+  other.Insert("xyz", 2);
+  trie = other;
+  EXPECT_FALSE(trie.Match("abc"));
+  EXPECT_FALSE(trie.MatchPrefix("a"));
+  EXPECT_TRUE(trie.Match("xyz"));
+  EXPECT_EQ(2, trie.Lookup("xyz").second);
+  const Trie<int32_t> &same = trie;
+  trie = same;  // self-assignment keeps the trie
+  EXPECT_TRUE(trie.Match("xyz"));
+}
+
 TEST(TrieTest, MatchPrefix) {
   Trie<int32_t> trie;
 

@@ -150,7 +150,7 @@ static inline void MaskBytes(uint8_t *buf, uint8_t const *mask,
 }
 
 // Dangerous Helper! Use SetBitsHigh<T>() and SetBitsLow<T>() instead.
-template <typename T, typename = std::enable_if<std::is_integral<T>::value>>
+template <typename T, typename = std::enable_if_t<std::is_integral<T>::value>>
 static inline T _SetBitsHigh(size_t n) {
   return (T{1} << n) - 1;
 }
@@ -160,7 +160,7 @@ static inline T _SetBitsHigh(size_t n) {
 // from the most significant bit toward the least significant. Returns a `T`
 // with all bits set if `n` is greater than the number of bits in `T`.
 // For example: SetBitsHigh<uint32_t>(9) will return 0xFF800000
-template <typename T, typename = std::enable_if<std::is_integral<T>::value>>
+template <typename T, typename = std::enable_if_t<std::is_integral<T>::value>>
 static inline T SetBitsHigh(size_t n) {
   if (unlikely(n == 0)) {
     return T{0};
@@ -173,7 +173,7 @@ static inline T SetBitsHigh(size_t n) {
 // from the least significant bit toward the most signifant. Returns a `T` with
 // all bits set if `n` is greater than the number of bits in `T`.
 // For example: SetBitsLow<uint32_t>(9) will return 0x000001FF
-template <typename T, typename = std::enable_if<std::is_integral<T>::value>>
+template <typename T, typename = std::enable_if_t<std::is_integral<T>::value>>
 static inline T SetBitsLow(size_t n) {
   if (unlikely(n == 0)) {
     return T{0};
