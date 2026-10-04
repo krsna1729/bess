@@ -196,7 +196,12 @@ bool RcuDomain::IsComplete(GracePeriod token) const {
 }
 
 void RcuDomain::Synchronize() {
-  rte_rcu_qsbr_synchronize(qsbr_, RTE_QSBR_THRID_INVALID);
+  // rte_rcu_qsbr_synchronize() with no calling reader is exactly this: start a
+  // grace period and wait for it. Spelled with the inline start and check, the
+  // acquire loads of the readers' counters are in BESS's code, where
+  // ThreadSanitizer sees them (the library function is not instrumented, so
+  // every reclaim after it looked like a race with the readers; M22).
+  rte_rcu_qsbr_check(qsbr_, rte_rcu_qsbr_start(qsbr_), true);
 
   std::lock_guard<std::mutex> lock(retire_mutex_);
   stats_.grace_periods_completed++;
@@ -247,17 +252,27 @@ void RcuDomain::RetireErased(GracePeriod token, void *object,
 
 size_t RcuDomain::ReclaimReady() {
   size_t reclaimed = 0;
+  // One object at a time: taken under the lock, destroyed outside it. A
+  // retired object's destructor may lock what a publisher holds while it
+  // retires (RcuPtr's writer mutex, then this domain's), so destroying under
+  // retire_mutex_ ordered the two mutexes both ways (ThreadSanitizer, M22).
+  for (;;) {
+    RetiredObject retired;
+    {
+      std::lock_guard<std::mutex> lock(retire_mutex_);
+      if (head_ == retired_.size() || !IsGracePeriodComplete(retired_[head_].token)) {
+        break;
+      }
+      retired = retired_[head_++];
+    }
+    retired.destroy(retired.object);
+    if (retired.outstanding != nullptr) {
+      retired.outstanding->fetch_sub(1, std::memory_order_release);
+    }
+    reclaimed++;
+  }
   {
     std::lock_guard<std::mutex> lock(retire_mutex_);
-    while (head_ < retired_.size() &&
-           IsGracePeriodComplete(retired_[head_].token)) {
-      const RetiredObject retired = retired_[head_++];
-      retired.destroy(retired.object);
-      if (retired.outstanding != nullptr) {
-        retired.outstanding->fetch_sub(1, std::memory_order_release);
-      }
-      reclaimed++;
-    }
     if (head_ == retired_.size()) {
       retired_.clear();  // keeps the capacity
       head_ = 0;
