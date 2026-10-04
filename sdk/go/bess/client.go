@@ -24,6 +24,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"maps"
 	"strings"
@@ -182,6 +183,8 @@ type transport interface {
 	apply(ctx context.Context, in *pb.ApplyTransactionRequest) (*pb.ApplyTransactionResponse, metadata.MD, error)
 	get(ctx context.Context, in *pb.GetTransactionRequest) (*pb.GetTransactionResponse, metadata.MD, error)
 	list(ctx context.Context) (*pb.ListTransactionResourcesResponse, metadata.MD, error)
+	capabilities(ctx context.Context) (*pb.GetCapabilitiesResponse, metadata.MD, error)
+	metrics(ctx context.Context) (*pb.ListMetricsResponse, metadata.MD, error)
 }
 
 type grpcTransport struct{ c pb.ControlClient }
@@ -201,6 +204,18 @@ func (t grpcTransport) get(ctx context.Context, in *pb.GetTransactionRequest) (*
 func (t grpcTransport) list(ctx context.Context) (*pb.ListTransactionResourcesResponse, metadata.MD, error) {
 	var md metadata.MD
 	r, err := t.c.ListTransactionResources(ctx, &pb.ListTransactionResourcesRequest{}, grpc.Trailer(&md))
+	return r, md, err
+}
+
+func (t grpcTransport) capabilities(ctx context.Context) (*pb.GetCapabilitiesResponse, metadata.MD, error) {
+	var md metadata.MD
+	r, err := t.c.GetCapabilities(ctx, &pb.GetCapabilitiesRequest{}, grpc.Trailer(&md))
+	return r, md, err
+}
+
+func (t grpcTransport) metrics(ctx context.Context) (*pb.ListMetricsResponse, metadata.MD, error) {
+	var md metadata.MD
+	r, err := t.c.ListMetrics(ctx, &pb.ListMetricsRequest{}, grpc.Trailer(&md))
 	return r, md, err
 }
 
@@ -291,6 +306,59 @@ func (c *Client) Resources(ctx context.Context, refresh bool) (map[string]Resour
 	c.resources = found
 	c.mu.Unlock()
 	return maps.Clone(found), nil
+}
+
+// Capabilities is what the daemon offers (control_v2.GetCapabilities):
+// version, RPCs, plugin API and granted capabilities, module classes,
+// plugins, ports and resources. A daemon too old to serve it answers
+// InvalidRequestError (UNIMPLEMENTED).
+func (c *Client) Capabilities(ctx context.Context) (*pb.GetCapabilitiesResponse, error) {
+	actx, cancel := context.WithTimeout(ctx, c.retry.AttemptTimeout)
+	defer cancel()
+	r, md, err := c.t.capabilities(actx)
+	if err != nil {
+		if noAnswer(err, md) {
+			return nil, &TransportError{Code: status.Code(err)}
+		}
+		return nil, translate(err, md)
+	}
+	c.observeEpoch(r.GetDaemonEpoch())
+	return r, nil
+}
+
+// Supports reports whether the daemon serves rpc ("ApplyTransaction" or a
+// full name). A daemon that cannot answer GetCapabilities serves none of
+// the newer RPCs; a transport failure is returned as such.
+func (c *Client) Supports(ctx context.Context, rpc string) (bool, error) {
+	r, err := c.Capabilities(ctx)
+	if err != nil {
+		var invalid *InvalidRequestError
+		if errors.As(err, &invalid) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, name := range r.GetRpcs() {
+		if name == rpc || strings.HasSuffix(name, "/"+rpc) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Metrics is every metric sample (control_v2.ListMetrics).
+func (c *Client) Metrics(ctx context.Context) ([]*pb.MetricSample, error) {
+	actx, cancel := context.WithTimeout(ctx, c.retry.AttemptTimeout)
+	defer cancel()
+	r, md, err := c.t.metrics(actx)
+	if err != nil {
+		if noAnswer(err, md) {
+			return nil, &TransportError{Code: status.Code(err)}
+		}
+		return nil, translate(err, md)
+	}
+	c.observeEpoch(r.GetDaemonEpoch())
+	return r.GetSamples(), nil
 }
 
 // Resource is the resource name; InvalidRequestError if no module

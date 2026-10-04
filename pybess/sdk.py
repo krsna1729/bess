@@ -213,6 +213,32 @@ class Client:
             raise InvalidRequest('no transactional resource %r' % name)
         return found
 
+    # discovery
+
+    def capabilities(self):
+        """What the daemon offers (control_v2.GetCapabilities): version, RPCs,
+        plugin API and granted capabilities, module classes, plugins, ports and
+        resources. Raw message; supports() answers the common question."""
+        response = self._read(self._stub.GetCapabilities, v2.GetCapabilitiesRequest())
+        self._observe_epoch(response.daemon_epoch)
+        return response
+
+    def supports(self, rpc):
+        """Whether the daemon serves `rpc` ('ApplyTransaction', or a full name).
+        A daemon too old to answer GetCapabilities serves none of the newer RPCs."""
+        try:
+            rpcs = self.capabilities().rpcs
+        except InvalidRequest:
+            return False
+        return any(r == rpc or r.endswith('/' + rpc) for r in rpcs)
+
+    def metrics(self):
+        """Every metric sample (control_v2.ListMetrics), as
+        {(name, ((label, value), ...)): value}."""
+        response = self._read(self._stub.ListMetrics, v2.ListMetricsRequest())
+        self._observe_epoch(response.daemon_epoch)
+        return {(m.name, tuple(sorted(m.labels.items()))): m.value for m in response.samples}
+
     # transactions
 
     def transaction(self, expected_generation=None, snapshot=False, request_id=None):
@@ -230,6 +256,16 @@ class Client:
 
     def _call(self, method, request):
         return method(request, timeout=self._retry.attempt_timeout)
+
+    def _read(self, method, request):
+        """A read-only RPC: transport failures and server refusals typed.
+        UNIMPLEMENTED (an older daemon) is InvalidRequest."""
+        try:
+            return self._call(method, request)
+        except grpc.RpcError as e:
+            if _no_answer(e):
+                raise TransportError(None, e.code())
+            raise _translate(e)
 
     def _observe_epoch(self, epoch):
         changed = self.daemon_epoch is not None and epoch != self.daemon_epoch

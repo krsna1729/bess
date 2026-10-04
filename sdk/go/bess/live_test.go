@@ -80,6 +80,16 @@ func TestLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	caps, err := client.Capabilities(ctx)
+	if err != nil || caps.GetDaemonVersion() == "" || len(caps.GetModuleClasses()) == 0 {
+		t.Fatalf("capabilities %v %v", caps, err)
+	}
+	if ok, err := client.Supports(ctx, "ApplyTransaction"); err != nil || !ok {
+		t.Fatalf("supports ApplyTransaction: %v %v", ok, err)
+	}
+	if samples, err := client.Metrics(ctx); err != nil || len(samples) == 0 {
+		t.Fatalf("metrics %d %v", len(samples), err)
+	}
 	key := message(t, files, r.KeyType, cfg.Key)
 	value := message(t, files, r.ValueType, cfg.Value)
 

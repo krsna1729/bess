@@ -103,6 +103,7 @@ file is the reasoning.
 | D-080 | Symmetric RSS port option; a conntrack module with owned and per-worker tables, per-worker only on verified symmetric inputs (TP8) | accepted |
 | D-081 | Shared conntrack: one table for every worker, a per-connection lock, deadlines kept by the entry (TP8) | accepted |
 | D-083 | NAT usage counters: per-mapping packets and bytes, final and interim records through a bounded log (TP7) | accepted |
+| D-082 | Capability discovery: GetCapabilities, and SDK capabilities/supports/metrics (M27.2) | accepted |
 
 
 ---
@@ -7040,4 +7041,31 @@ interrupted by growth still gives every mapping; four workers counting while the
 report gives 3 packets and 300 bytes for a mapping, owned and shared; `request_usage_report` and `drain_usage` run
 while the NAT's worker runs. A NAT without usage compiles none of it (`if constexpr` on the store; Expire's report
 call is empty).
+
+
+## D-082 Capability discovery: GetCapabilities, and SDK capabilities/supports/metrics (M27.2)
+
+**Status:** accepted (2026-10-05), additive wire change.
+**Code:** `protobuf/control_v2.proto` (`GetCapabilities`, `PluginInfo`, `PortInfo`), `core/control/api_v2.{h,cc}`,
+`core/framework/plugin_loader.{h,cc}` (`LoadedPlugins`), `pybess/sdk.py` (`capabilities`, `supports`, `metrics`),
+`sdk/go/bess/client.go` (`Capabilities`, `Supports`, `Metrics`), `pybess/test_sdk.py`, `sdk/go/bess/client_test.go`,
+`bessctl/module_tests/control_sdk.py`, `sdk/go/bess/live_test.go`.
+
+**Context.** Roadmap M27 asks the SDK to expose the daemon API version, resource types, optional batteries/plugins
+and port/device capabilities, and to leave the decision to the application. A controller built against a newer
+schema also needs to know which RPCs an older daemon lacks (WatchEvents will be one).
+
+**Decision.**
+- `control_v2.GetCapabilities` (additive): the daemon's version (`git describe`, as `GetVersion`), the RPCs its
+  schema declares (full names from the generated service descriptor), the plugin API version and the capabilities a
+  plugin may require, the module classes, the loaded plugins (from their descriptors), the ports (driver, queues,
+  accepted transmit offloads) and the transaction resources, with the daemon epoch.
+- SDK (Python and Go): `capabilities()` returns the raw message (the application decides; the SDK adds no policy),
+  `supports(rpc)` answers the common question and treats a daemon too old to serve GetCapabilities (UNIMPLEMENTED)
+  as supporting nothing newer; `metrics()` reads ListMetrics. Every discovery call observes the daemon epoch, so a
+  restart seen there retires old resource handles as a transaction would.
+- Not included: offload capabilities beyond the transmit offloads a port accepted; a port's flow-rule support is only
+  known by validating rules (M20), so it stays with the offload owner.
+
+**Evidence.** EVIDENCE
 

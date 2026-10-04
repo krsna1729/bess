@@ -95,6 +95,9 @@ class ControlV2Service final : public pb::v2::Control::Service {
   grpc::Status ListMetrics(grpc::ServerContext *context,
                            const pb::v2::ListMetricsRequest *request,
                            pb::v2::ListMetricsResponse *response) override;
+  grpc::Status GetCapabilities(grpc::ServerContext *context,
+                               const pb::v2::GetCapabilitiesRequest *request,
+                               pb::v2::GetCapabilitiesResponse *response) override;
 
  private:
   ControlPlane &control_plane_;

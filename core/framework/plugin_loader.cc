@@ -35,6 +35,25 @@ std::vector<std::string> ListPlugins() {
   return list;
 }
 
+std::vector<LoadedPlugin> LoadedPlugins() {
+  std::vector<LoadedPlugin> list;
+  for (const auto &[path, handle] : plugin_handles) {
+    LoadedPlugin p{path, "", "", 0};
+    using Get = const BessPluginDescriptor *(*)();
+    if (void *symbol = dlsym(handle, "bess_plugin_descriptor_v1")) {
+      if (const BessPluginDescriptor *d = reinterpret_cast<Get>(symbol)()) {
+        p.name = d->name != nullptr ? d->name : "";
+        p.version = d->version != nullptr ? d->version : "";
+        p.required_capabilities = d->required_capabilities;
+      }
+    }
+    list.push_back(std::move(p));
+  }
+  std::sort(list.begin(), list.end(),
+            [](const LoadedPlugin &a, const LoadedPlugin &b) { return a.path < b.path; });
+  return list;
+}
+
 namespace {
 
 enum class PluginLoad { kLoaded, kRetry, kRefused };

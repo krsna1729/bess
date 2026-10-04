@@ -2,6 +2,7 @@
 
 #include "control/api_v2.h"
 
+#include <google/protobuf/descriptor.h>
 #include <grpcpp/health_check_service_interface.h>
 #ifdef BESS_GRPC_REFLECTION
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
@@ -13,6 +14,11 @@
 #include <variant>
 
 #include "control/pipeline_snapshot.h"
+#include "utils/logging.h"
+#include "framework/plugin_check.h"
+#include "framework/plugin_loader.h"
+#include "module.h"
+#include "port.h"
 #include "runtime/runtime_state.h"
 #include "control/wire_narrow.h"
 #include "worker.h"
@@ -499,6 +505,54 @@ grpc::Status ControlV2Service::ListMetrics(grpc::ServerContext *,
       (*out->mutable_labels())[key] = value;
     }
     out->set_value(s.value);
+  }
+  response->set_daemon_epoch(transactions_.epoch());
+  return grpc::Status::OK;
+}
+
+grpc::Status ControlV2Service::GetCapabilities(grpc::ServerContext *,
+                                               const v2::GetCapabilitiesRequest *,
+                                               v2::GetCapabilitiesResponse *response) {
+  auto lock = control_plane_.AcquireLock();
+  response->set_daemon_version(google::VersionString());
+  // The RPCs as this binary's schema declares them: a client built against a
+  // newer schema sees which ones this daemon lacks.
+  if (const google::protobuf::ServiceDescriptor *service =
+          google::protobuf::DescriptorPool::generated_pool()->FindServiceByName(
+              v2::Control::service_full_name())) {
+    for (int i = 0; i < service->method_count(); i++) {
+      response->add_rpcs(std::string(service->full_name()) + "/" +
+                         std::string(service->method(i)->name()));
+    }
+  }
+  response->set_plugin_api_version(BESS_PLUGIN_API_VERSION);
+  response->set_plugin_capabilities(framework::kSupportedPluginCapabilities);
+  for (const auto &[name, builder] : ModuleBuilder::all_module_builders()) {
+    response->add_module_classes(name);
+  }
+  for (const framework::LoadedPlugin &p : framework::LoadedPlugins()) {
+    v2::PluginInfo *out = response->add_plugins();
+    out->set_name(p.name);
+    out->set_version(p.version);
+    out->set_path(p.path);
+    out->set_required_capabilities(p.required_capabilities);
+  }
+  for (const auto &[name, port] : runtime::runtime().ports().All()) {
+    v2::PortInfo *out = response->add_ports();
+    out->set_name(name);
+    out->set_driver(port->port_builder() != nullptr ? port->port_builder()->class_name() : "");
+    out->set_rx_queues(static_cast<uint32_t>(port->num_rx_queues()));
+    out->set_tx_queues(static_cast<uint32_t>(port->num_tx_queues()));
+    const packet::TxOffloadCapabilities tx = port->GetTxOffloadCapabilities();
+    out->set_tx_ipv4_checksum(tx.checksums.ipv4_header);
+    out->set_tx_udp_checksum(tx.checksums.udp);
+    out->set_tx_tcp_checksum(tx.checksums.tcp);
+    out->set_tx_outer_ipv4_checksum(tx.checksums.outer_ipv4_header);
+    out->set_tx_outer_udp_checksum(tx.checksums.outer_udp);
+    out->set_tx_multi_segment(tx.multi_segment_tx);
+  }
+  for (const v2::TransactionResource &r : transactions_.List().resources()) {
+    *response->add_resources() = r;
   }
   response->set_daemon_epoch(transactions_.epoch());
   return grpc::Status::OK;

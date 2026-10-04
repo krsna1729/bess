@@ -50,6 +50,7 @@ type fake struct {
 	asked     []string
 	listed    int
 	rejectOps bool
+	oldDaemon bool // answers GetCapabilities with UNIMPLEMENTED
 }
 
 func (f *fake) apply(_ context.Context, in *pb.ApplyTransactionRequest) (*pb.ApplyTransactionResponse, metadata.MD, error) {
@@ -85,6 +86,25 @@ func (f *fake) list(context.Context) (*pb.ListTransactionResourcesResponse, meta
 	}
 	return &pb.ListTransactionResourcesResponse{DaemonEpoch: epoch, Resources: []*pb.TransactionResource{
 		{Name: resource, KeyType: keyType, ValueType: valueType}}}, nil, nil
+}
+
+func (f *fake) capabilities(context.Context) (*pb.GetCapabilitiesResponse, metadata.MD, error) {
+	if f.oldDaemon {
+		return nil, nil, status.Error(codes.Unimplemented, "unknown method GetCapabilities")
+	}
+	return &pb.GetCapabilitiesResponse{Rpcs: []string{"bess.pb.v2.Control/ApplyTransaction"},
+		DaemonEpoch: f.epochOr1()}, nil, nil
+}
+
+func (f *fake) metrics(context.Context) (*pb.ListMetricsResponse, metadata.MD, error) {
+	return &pb.ListMetricsResponse{DaemonEpoch: f.epochOr1()}, nil, nil
+}
+
+func (f *fake) epochOr1() uint64 {
+	if f.epoch == 0 {
+		return 1
+	}
+	return f.epoch
 }
 
 type harness struct {
@@ -373,4 +393,18 @@ func TestACommittedTransactionIsNotSentAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = noOutcome
+}
+
+func TestSupportsReadsTheDaemonsRPCsAndAnOldDaemonSupportsNothingNew(t *testing.T) {
+	ctx := context.Background()
+	c := newHarness(&fake{}, 1).c
+	if ok, err := c.Supports(ctx, "ApplyTransaction"); err != nil || !ok {
+		t.Fatalf("ApplyTransaction: %v %v", ok, err)
+	}
+	if ok, err := c.Supports(ctx, "WatchEvents"); err != nil || ok {
+		t.Fatalf("WatchEvents: %v %v", ok, err)
+	}
+	if ok, err := newHarness(&fake{oldDaemon: true}, 1).c.Supports(ctx, "ApplyTransaction"); err != nil || ok {
+		t.Fatalf("old daemon: %v %v", ok, err)
+	}
 }

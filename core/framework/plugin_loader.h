@@ -27,6 +27,15 @@ bool LoadPlugins(const std::string &directory);
 // List all imported .so files.
 std::vector<std::string> ListPlugins();
 
+// A loaded plugin as its descriptor names it.
+struct LoadedPlugin {
+  std::string path;
+  std::string name;
+  std::string version;
+  uint64_t required_capabilities = 0;
+};
+std::vector<LoadedPlugin> LoadedPlugins();
+
 }  // namespace bess::framework
 
 #endif  // BESS_FRAMEWORK_PLUGIN_LOADER_H_

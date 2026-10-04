@@ -545,7 +545,7 @@ func (x MetricSample_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MetricSample_Kind.Descriptor instead.
 func (MetricSample_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{31, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{35, 0}
 }
 
 type Port struct {
@@ -2395,6 +2395,335 @@ func (x *ListTransactionResourcesResponse) GetDaemonEpoch() uint64 {
 	return 0
 }
 
+type GetCapabilitiesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetCapabilitiesRequest) Reset() {
+	*x = GetCapabilitiesRequest{}
+	mi := &file_control_v2_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetCapabilitiesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetCapabilitiesRequest) ProtoMessage() {}
+
+func (x *GetCapabilitiesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v2_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetCapabilitiesRequest.ProtoReflect.Descriptor instead.
+func (*GetCapabilitiesRequest) Descriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{30}
+}
+
+type PluginInfo struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	Name                 string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Version              string                 `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
+	Path                 string                 `protobuf:"bytes,3,opt,name=path,proto3" json:"path,omitempty"`
+	RequiredCapabilities uint64                 `protobuf:"varint,4,opt,name=required_capabilities,json=requiredCapabilities,proto3" json:"required_capabilities,omitempty"` // BESS_CAP_* bits (framework/plugin.h)
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *PluginInfo) Reset() {
+	*x = PluginInfo{}
+	mi := &file_control_v2_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PluginInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PluginInfo) ProtoMessage() {}
+
+func (x *PluginInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v2_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PluginInfo.ProtoReflect.Descriptor instead.
+func (*PluginInfo) Descriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *PluginInfo) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *PluginInfo) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+func (x *PluginInfo) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
+}
+
+func (x *PluginInfo) GetRequiredCapabilities() uint64 {
+	if x != nil {
+		return x.RequiredCapabilities
+	}
+	return 0
+}
+
+type PortInfo struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Name     string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Driver   string                 `protobuf:"bytes,2,opt,name=driver,proto3" json:"driver,omitempty"`
+	RxQueues uint32                 `protobuf:"varint,3,opt,name=rx_queues,json=rxQueues,proto3" json:"rx_queues,omitempty"`
+	TxQueues uint32                 `protobuf:"varint,4,opt,name=tx_queues,json=txQueues,proto3" json:"tx_queues,omitempty"`
+	// Transmit offloads the port accepted (packet_checksum.h).
+	TxIpv4Checksum      bool `protobuf:"varint,5,opt,name=tx_ipv4_checksum,json=txIpv4Checksum,proto3" json:"tx_ipv4_checksum,omitempty"`
+	TxUdpChecksum       bool `protobuf:"varint,6,opt,name=tx_udp_checksum,json=txUdpChecksum,proto3" json:"tx_udp_checksum,omitempty"`
+	TxTcpChecksum       bool `protobuf:"varint,7,opt,name=tx_tcp_checksum,json=txTcpChecksum,proto3" json:"tx_tcp_checksum,omitempty"`
+	TxOuterIpv4Checksum bool `protobuf:"varint,8,opt,name=tx_outer_ipv4_checksum,json=txOuterIpv4Checksum,proto3" json:"tx_outer_ipv4_checksum,omitempty"`
+	TxOuterUdpChecksum  bool `protobuf:"varint,9,opt,name=tx_outer_udp_checksum,json=txOuterUdpChecksum,proto3" json:"tx_outer_udp_checksum,omitempty"`
+	TxMultiSegment      bool `protobuf:"varint,10,opt,name=tx_multi_segment,json=txMultiSegment,proto3" json:"tx_multi_segment,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *PortInfo) Reset() {
+	*x = PortInfo{}
+	mi := &file_control_v2_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PortInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PortInfo) ProtoMessage() {}
+
+func (x *PortInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v2_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PortInfo.ProtoReflect.Descriptor instead.
+func (*PortInfo) Descriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *PortInfo) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *PortInfo) GetDriver() string {
+	if x != nil {
+		return x.Driver
+	}
+	return ""
+}
+
+func (x *PortInfo) GetRxQueues() uint32 {
+	if x != nil {
+		return x.RxQueues
+	}
+	return 0
+}
+
+func (x *PortInfo) GetTxQueues() uint32 {
+	if x != nil {
+		return x.TxQueues
+	}
+	return 0
+}
+
+func (x *PortInfo) GetTxIpv4Checksum() bool {
+	if x != nil {
+		return x.TxIpv4Checksum
+	}
+	return false
+}
+
+func (x *PortInfo) GetTxUdpChecksum() bool {
+	if x != nil {
+		return x.TxUdpChecksum
+	}
+	return false
+}
+
+func (x *PortInfo) GetTxTcpChecksum() bool {
+	if x != nil {
+		return x.TxTcpChecksum
+	}
+	return false
+}
+
+func (x *PortInfo) GetTxOuterIpv4Checksum() bool {
+	if x != nil {
+		return x.TxOuterIpv4Checksum
+	}
+	return false
+}
+
+func (x *PortInfo) GetTxOuterUdpChecksum() bool {
+	if x != nil {
+		return x.TxOuterUdpChecksum
+	}
+	return false
+}
+
+func (x *PortInfo) GetTxMultiSegment() bool {
+	if x != nil {
+		return x.TxMultiSegment
+	}
+	return false
+}
+
+type GetCapabilitiesResponse struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	DaemonVersion      string                 `protobuf:"bytes,1,opt,name=daemon_version,json=daemonVersion,proto3" json:"daemon_version,omitempty"`
+	Rpcs               []string               `protobuf:"bytes,2,rep,name=rpcs,proto3" json:"rpcs,omitempty"` // full names, e.g. bess.pb.v2.Control/ApplyTransaction
+	PluginApiVersion   uint32                 `protobuf:"varint,3,opt,name=plugin_api_version,json=pluginApiVersion,proto3" json:"plugin_api_version,omitempty"`
+	PluginCapabilities uint64                 `protobuf:"varint,4,opt,name=plugin_capabilities,json=pluginCapabilities,proto3" json:"plugin_capabilities,omitempty"` // BESS_CAP_* a plugin may require
+	ModuleClasses      []string               `protobuf:"bytes,5,rep,name=module_classes,json=moduleClasses,proto3" json:"module_classes,omitempty"`
+	Plugins            []*PluginInfo          `protobuf:"bytes,6,rep,name=plugins,proto3" json:"plugins,omitempty"`
+	Ports              []*PortInfo            `protobuf:"bytes,7,rep,name=ports,proto3" json:"ports,omitempty"`
+	Resources          []*TransactionResource `protobuf:"bytes,8,rep,name=resources,proto3" json:"resources,omitempty"`
+	DaemonEpoch        uint64                 `protobuf:"varint,9,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *GetCapabilitiesResponse) Reset() {
+	*x = GetCapabilitiesResponse{}
+	mi := &file_control_v2_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetCapabilitiesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetCapabilitiesResponse) ProtoMessage() {}
+
+func (x *GetCapabilitiesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v2_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetCapabilitiesResponse.ProtoReflect.Descriptor instead.
+func (*GetCapabilitiesResponse) Descriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *GetCapabilitiesResponse) GetDaemonVersion() string {
+	if x != nil {
+		return x.DaemonVersion
+	}
+	return ""
+}
+
+func (x *GetCapabilitiesResponse) GetRpcs() []string {
+	if x != nil {
+		return x.Rpcs
+	}
+	return nil
+}
+
+func (x *GetCapabilitiesResponse) GetPluginApiVersion() uint32 {
+	if x != nil {
+		return x.PluginApiVersion
+	}
+	return 0
+}
+
+func (x *GetCapabilitiesResponse) GetPluginCapabilities() uint64 {
+	if x != nil {
+		return x.PluginCapabilities
+	}
+	return 0
+}
+
+func (x *GetCapabilitiesResponse) GetModuleClasses() []string {
+	if x != nil {
+		return x.ModuleClasses
+	}
+	return nil
+}
+
+func (x *GetCapabilitiesResponse) GetPlugins() []*PluginInfo {
+	if x != nil {
+		return x.Plugins
+	}
+	return nil
+}
+
+func (x *GetCapabilitiesResponse) GetPorts() []*PortInfo {
+	if x != nil {
+		return x.Ports
+	}
+	return nil
+}
+
+func (x *GetCapabilitiesResponse) GetResources() []*TransactionResource {
+	if x != nil {
+		return x.Resources
+	}
+	return nil
+}
+
+func (x *GetCapabilitiesResponse) GetDaemonEpoch() uint64 {
+	if x != nil {
+		return x.DaemonEpoch
+	}
+	return 0
+}
+
 type ListMetricsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -2403,7 +2732,7 @@ type ListMetricsRequest struct {
 
 func (x *ListMetricsRequest) Reset() {
 	*x = ListMetricsRequest{}
-	mi := &file_control_v2_proto_msgTypes[30]
+	mi := &file_control_v2_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2415,7 +2744,7 @@ func (x *ListMetricsRequest) String() string {
 func (*ListMetricsRequest) ProtoMessage() {}
 
 func (x *ListMetricsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[30]
+	mi := &file_control_v2_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2428,7 +2757,7 @@ func (x *ListMetricsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListMetricsRequest.ProtoReflect.Descriptor instead.
 func (*ListMetricsRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{30}
+	return file_control_v2_proto_rawDescGZIP(), []int{34}
 }
 
 type MetricSample struct {
@@ -2444,7 +2773,7 @@ type MetricSample struct {
 
 func (x *MetricSample) Reset() {
 	*x = MetricSample{}
-	mi := &file_control_v2_proto_msgTypes[31]
+	mi := &file_control_v2_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2456,7 +2785,7 @@ func (x *MetricSample) String() string {
 func (*MetricSample) ProtoMessage() {}
 
 func (x *MetricSample) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[31]
+	mi := &file_control_v2_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2469,7 +2798,7 @@ func (x *MetricSample) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetricSample.ProtoReflect.Descriptor instead.
 func (*MetricSample) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{31}
+	return file_control_v2_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *MetricSample) GetName() string {
@@ -2517,7 +2846,7 @@ type ListMetricsResponse struct {
 
 func (x *ListMetricsResponse) Reset() {
 	*x = ListMetricsResponse{}
-	mi := &file_control_v2_proto_msgTypes[32]
+	mi := &file_control_v2_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2529,7 +2858,7 @@ func (x *ListMetricsResponse) String() string {
 func (*ListMetricsResponse) ProtoMessage() {}
 
 func (x *ListMetricsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[32]
+	mi := &file_control_v2_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2542,7 +2871,7 @@ func (x *ListMetricsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListMetricsResponse.ProtoReflect.Descriptor instead.
 func (*ListMetricsResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{32}
+	return file_control_v2_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *ListMetricsResponse) GetSamples() []*MetricSample {
@@ -2757,7 +3086,36 @@ const file_control_v2_proto_rawDesc = "" +
 	"\n" +
 	"generation\x18\x02 \x01(\x04R\n" +
 	"generation\x12!\n" +
-	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpoch\"\x14\n" +
+	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpoch\"\x18\n" +
+	"\x16GetCapabilitiesRequest\"\x83\x01\n" +
+	"\n" +
+	"PluginInfo\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\tR\aversion\x12\x12\n" +
+	"\x04path\x18\x03 \x01(\tR\x04path\x123\n" +
+	"\x15required_capabilities\x18\x04 \x01(\x04R\x14requiredCapabilities\"\xfc\x02\n" +
+	"\bPortInfo\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
+	"\x06driver\x18\x02 \x01(\tR\x06driver\x12\x1b\n" +
+	"\trx_queues\x18\x03 \x01(\rR\brxQueues\x12\x1b\n" +
+	"\ttx_queues\x18\x04 \x01(\rR\btxQueues\x12(\n" +
+	"\x10tx_ipv4_checksum\x18\x05 \x01(\bR\x0etxIpv4Checksum\x12&\n" +
+	"\x0ftx_udp_checksum\x18\x06 \x01(\bR\rtxUdpChecksum\x12&\n" +
+	"\x0ftx_tcp_checksum\x18\a \x01(\bR\rtxTcpChecksum\x123\n" +
+	"\x16tx_outer_ipv4_checksum\x18\b \x01(\bR\x13txOuterIpv4Checksum\x121\n" +
+	"\x15tx_outer_udp_checksum\x18\t \x01(\bR\x12txOuterUdpChecksum\x12(\n" +
+	"\x10tx_multi_segment\x18\n" +
+	" \x01(\bR\x0etxMultiSegment\"\x9a\x03\n" +
+	"\x17GetCapabilitiesResponse\x12%\n" +
+	"\x0edaemon_version\x18\x01 \x01(\tR\rdaemonVersion\x12\x12\n" +
+	"\x04rpcs\x18\x02 \x03(\tR\x04rpcs\x12,\n" +
+	"\x12plugin_api_version\x18\x03 \x01(\rR\x10pluginApiVersion\x12/\n" +
+	"\x13plugin_capabilities\x18\x04 \x01(\x04R\x12pluginCapabilities\x12%\n" +
+	"\x0emodule_classes\x18\x05 \x03(\tR\rmoduleClasses\x120\n" +
+	"\aplugins\x18\x06 \x03(\v2\x16.bess.pb.v2.PluginInfoR\aplugins\x12*\n" +
+	"\x05ports\x18\a \x03(\v2\x14.bess.pb.v2.PortInfoR\x05ports\x12=\n" +
+	"\tresources\x18\b \x03(\v2\x1f.bess.pb.v2.TransactionResourceR\tresources\x12!\n" +
+	"\fdaemon_epoch\x18\t \x01(\x04R\vdaemonEpoch\"\x14\n" +
 	"\x12ListMetricsRequest\"\xb8\x02\n" +
 	"\fMetricSample\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x121\n" +
@@ -2804,7 +3162,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\n" +
 	"\n" +
-	"\x06RETIRE\x10\x032\xc5\x06\n" +
+	"\x06RETIRE\x10\x032\xa3\a\n" +
 	"\aControl\x12P\n" +
 	"\vGetPipeline\x12\x1e.bess.pb.v2.GetPipelineRequest\x1a\x1f.bess.pb.v2.GetPipelineResponse\"\x00\x12_\n" +
 	"\x10ValidatePipeline\x12#.bess.pb.v2.ValidatePipelineRequest\x1a$.bess.pb.v2.ValidatePipelineResponse\"\x00\x12S\n" +
@@ -2813,7 +3171,8 @@ const file_control_v2_proto_rawDesc = "" +
 	"\rApplyPipeline\x12 .bess.pb.v2.ApplyPipelineRequest\x1a!.bess.pb.v2.ApplyPipelineResponse\"\x00\x12_\n" +
 	"\x10ApplyTransaction\x12#.bess.pb.v2.ApplyTransactionRequest\x1a$.bess.pb.v2.ApplyTransactionResponse\"\x00\x12Y\n" +
 	"\x0eGetTransaction\x12!.bess.pb.v2.GetTransactionRequest\x1a\".bess.pb.v2.GetTransactionResponse\"\x00\x12P\n" +
-	"\vListMetrics\x12\x1e.bess.pb.v2.ListMetricsRequest\x1a\x1f.bess.pb.v2.ListMetricsResponse\"\x00\x12w\n" +
+	"\vListMetrics\x12\x1e.bess.pb.v2.ListMetricsRequest\x1a\x1f.bess.pb.v2.ListMetricsResponse\"\x00\x12\\\n" +
+	"\x0fGetCapabilities\x12\".bess.pb.v2.GetCapabilitiesRequest\x1a#.bess.pb.v2.GetCapabilitiesResponse\"\x00\x12w\n" +
 	"\x18ListTransactionResources\x12+.bess.pb.v2.ListTransactionResourcesRequest\x1a,.bess.pb.v2.ListTransactionResourcesResponse\"\x00b\x06proto3"
 
 var (
@@ -2829,7 +3188,7 @@ func file_control_v2_proto_rawDescGZIP() []byte {
 }
 
 var file_control_v2_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
-var file_control_v2_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
+var file_control_v2_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
 var file_control_v2_proto_goTypes = []any{
 	(ObjectType)(0),                          // 0: bess.pb.v2.ObjectType
 	(ChangeKind)(0),                          // 1: bess.pb.v2.ChangeKind
@@ -2870,19 +3229,23 @@ var file_control_v2_proto_goTypes = []any{
 	(*ListTransactionResourcesRequest)(nil),  // 36: bess.pb.v2.ListTransactionResourcesRequest
 	(*TransactionResource)(nil),              // 37: bess.pb.v2.TransactionResource
 	(*ListTransactionResourcesResponse)(nil), // 38: bess.pb.v2.ListTransactionResourcesResponse
-	(*ListMetricsRequest)(nil),               // 39: bess.pb.v2.ListMetricsRequest
-	(*MetricSample)(nil),                     // 40: bess.pb.v2.MetricSample
-	(*ListMetricsResponse)(nil),              // 41: bess.pb.v2.ListMetricsResponse
-	nil,                                      // 42: bess.pb.v2.TrafficClass.LimitEntry
-	nil,                                      // 43: bess.pb.v2.TrafficClass.MaxBurstEntry
-	nil,                                      // 44: bess.pb.v2.MetricSample.LabelsEntry
-	(*anypb.Any)(nil),                        // 45: google.protobuf.Any
+	(*GetCapabilitiesRequest)(nil),           // 39: bess.pb.v2.GetCapabilitiesRequest
+	(*PluginInfo)(nil),                       // 40: bess.pb.v2.PluginInfo
+	(*PortInfo)(nil),                         // 41: bess.pb.v2.PortInfo
+	(*GetCapabilitiesResponse)(nil),          // 42: bess.pb.v2.GetCapabilitiesResponse
+	(*ListMetricsRequest)(nil),               // 43: bess.pb.v2.ListMetricsRequest
+	(*MetricSample)(nil),                     // 44: bess.pb.v2.MetricSample
+	(*ListMetricsResponse)(nil),              // 45: bess.pb.v2.ListMetricsResponse
+	nil,                                      // 46: bess.pb.v2.TrafficClass.LimitEntry
+	nil,                                      // 47: bess.pb.v2.TrafficClass.MaxBurstEntry
+	nil,                                      // 48: bess.pb.v2.MetricSample.LabelsEntry
+	(*anypb.Any)(nil),                        // 49: google.protobuf.Any
 }
 var file_control_v2_proto_depIdxs = []int32{
-	45, // 0: bess.pb.v2.Port.arg:type_name -> google.protobuf.Any
-	45, // 1: bess.pb.v2.Module.arg:type_name -> google.protobuf.Any
-	42, // 2: bess.pb.v2.TrafficClass.limit:type_name -> bess.pb.v2.TrafficClass.LimitEntry
-	43, // 3: bess.pb.v2.TrafficClass.max_burst:type_name -> bess.pb.v2.TrafficClass.MaxBurstEntry
+	49, // 0: bess.pb.v2.Port.arg:type_name -> google.protobuf.Any
+	49, // 1: bess.pb.v2.Module.arg:type_name -> google.protobuf.Any
+	46, // 2: bess.pb.v2.TrafficClass.limit:type_name -> bess.pb.v2.TrafficClass.LimitEntry
+	47, // 3: bess.pb.v2.TrafficClass.max_burst:type_name -> bess.pb.v2.TrafficClass.MaxBurstEntry
 	9,  // 4: bess.pb.v2.Pipeline.ports:type_name -> bess.pb.v2.Port
 	10, // 5: bess.pb.v2.Pipeline.modules:type_name -> bess.pb.v2.Module
 	11, // 6: bess.pb.v2.Pipeline.connections:type_name -> bess.pb.v2.Connection
@@ -2902,8 +3265,8 @@ var file_control_v2_proto_depIdxs = []int32{
 	17, // 20: bess.pb.v2.PlanPipelineResponse.steps:type_name -> bess.pb.v2.PlanStep
 	14, // 21: bess.pb.v2.ApplyPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
 	3,  // 22: bess.pb.v2.ErrorDetail.code:type_name -> bess.pb.v2.ErrorDetail.Code
-	45, // 23: bess.pb.v2.TransactionOp.key:type_name -> google.protobuf.Any
-	45, // 24: bess.pb.v2.TransactionOp.value:type_name -> google.protobuf.Any
+	49, // 23: bess.pb.v2.TransactionOp.key:type_name -> google.protobuf.Any
+	49, // 24: bess.pb.v2.TransactionOp.value:type_name -> google.protobuf.Any
 	29, // 25: bess.pb.v2.ApplyTransactionRequest.ops:type_name -> bess.pb.v2.TransactionOp
 	4,  // 26: bess.pb.v2.ApplyTransactionRequest.consistency:type_name -> bess.pb.v2.ApplyTransactionRequest.Consistency
 	5,  // 27: bess.pb.v2.TransactionOpResult.status:type_name -> bess.pb.v2.TransactionOpResult.Status
@@ -2913,32 +3276,37 @@ var file_control_v2_proto_depIdxs = []int32{
 	32, // 31: bess.pb.v2.ApplyTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
 	32, // 32: bess.pb.v2.GetTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
 	37, // 33: bess.pb.v2.ListTransactionResourcesResponse.resources:type_name -> bess.pb.v2.TransactionResource
-	8,  // 34: bess.pb.v2.MetricSample.kind:type_name -> bess.pb.v2.MetricSample.Kind
-	44, // 35: bess.pb.v2.MetricSample.labels:type_name -> bess.pb.v2.MetricSample.LabelsEntry
-	40, // 36: bess.pb.v2.ListMetricsResponse.samples:type_name -> bess.pb.v2.MetricSample
-	18, // 37: bess.pb.v2.Control.GetPipeline:input_type -> bess.pb.v2.GetPipelineRequest
-	20, // 38: bess.pb.v2.Control.ValidatePipeline:input_type -> bess.pb.v2.ValidatePipelineRequest
-	22, // 39: bess.pb.v2.Control.DiffPipeline:input_type -> bess.pb.v2.DiffPipelineRequest
-	24, // 40: bess.pb.v2.Control.PlanPipeline:input_type -> bess.pb.v2.PlanPipelineRequest
-	26, // 41: bess.pb.v2.Control.ApplyPipeline:input_type -> bess.pb.v2.ApplyPipelineRequest
-	30, // 42: bess.pb.v2.Control.ApplyTransaction:input_type -> bess.pb.v2.ApplyTransactionRequest
-	34, // 43: bess.pb.v2.Control.GetTransaction:input_type -> bess.pb.v2.GetTransactionRequest
-	39, // 44: bess.pb.v2.Control.ListMetrics:input_type -> bess.pb.v2.ListMetricsRequest
-	36, // 45: bess.pb.v2.Control.ListTransactionResources:input_type -> bess.pb.v2.ListTransactionResourcesRequest
-	19, // 46: bess.pb.v2.Control.GetPipeline:output_type -> bess.pb.v2.GetPipelineResponse
-	21, // 47: bess.pb.v2.Control.ValidatePipeline:output_type -> bess.pb.v2.ValidatePipelineResponse
-	23, // 48: bess.pb.v2.Control.DiffPipeline:output_type -> bess.pb.v2.DiffPipelineResponse
-	25, // 49: bess.pb.v2.Control.PlanPipeline:output_type -> bess.pb.v2.PlanPipelineResponse
-	27, // 50: bess.pb.v2.Control.ApplyPipeline:output_type -> bess.pb.v2.ApplyPipelineResponse
-	33, // 51: bess.pb.v2.Control.ApplyTransaction:output_type -> bess.pb.v2.ApplyTransactionResponse
-	35, // 52: bess.pb.v2.Control.GetTransaction:output_type -> bess.pb.v2.GetTransactionResponse
-	41, // 53: bess.pb.v2.Control.ListMetrics:output_type -> bess.pb.v2.ListMetricsResponse
-	38, // 54: bess.pb.v2.Control.ListTransactionResources:output_type -> bess.pb.v2.ListTransactionResourcesResponse
-	46, // [46:55] is the sub-list for method output_type
-	37, // [37:46] is the sub-list for method input_type
-	37, // [37:37] is the sub-list for extension type_name
-	37, // [37:37] is the sub-list for extension extendee
-	0,  // [0:37] is the sub-list for field type_name
+	40, // 34: bess.pb.v2.GetCapabilitiesResponse.plugins:type_name -> bess.pb.v2.PluginInfo
+	41, // 35: bess.pb.v2.GetCapabilitiesResponse.ports:type_name -> bess.pb.v2.PortInfo
+	37, // 36: bess.pb.v2.GetCapabilitiesResponse.resources:type_name -> bess.pb.v2.TransactionResource
+	8,  // 37: bess.pb.v2.MetricSample.kind:type_name -> bess.pb.v2.MetricSample.Kind
+	48, // 38: bess.pb.v2.MetricSample.labels:type_name -> bess.pb.v2.MetricSample.LabelsEntry
+	44, // 39: bess.pb.v2.ListMetricsResponse.samples:type_name -> bess.pb.v2.MetricSample
+	18, // 40: bess.pb.v2.Control.GetPipeline:input_type -> bess.pb.v2.GetPipelineRequest
+	20, // 41: bess.pb.v2.Control.ValidatePipeline:input_type -> bess.pb.v2.ValidatePipelineRequest
+	22, // 42: bess.pb.v2.Control.DiffPipeline:input_type -> bess.pb.v2.DiffPipelineRequest
+	24, // 43: bess.pb.v2.Control.PlanPipeline:input_type -> bess.pb.v2.PlanPipelineRequest
+	26, // 44: bess.pb.v2.Control.ApplyPipeline:input_type -> bess.pb.v2.ApplyPipelineRequest
+	30, // 45: bess.pb.v2.Control.ApplyTransaction:input_type -> bess.pb.v2.ApplyTransactionRequest
+	34, // 46: bess.pb.v2.Control.GetTransaction:input_type -> bess.pb.v2.GetTransactionRequest
+	43, // 47: bess.pb.v2.Control.ListMetrics:input_type -> bess.pb.v2.ListMetricsRequest
+	39, // 48: bess.pb.v2.Control.GetCapabilities:input_type -> bess.pb.v2.GetCapabilitiesRequest
+	36, // 49: bess.pb.v2.Control.ListTransactionResources:input_type -> bess.pb.v2.ListTransactionResourcesRequest
+	19, // 50: bess.pb.v2.Control.GetPipeline:output_type -> bess.pb.v2.GetPipelineResponse
+	21, // 51: bess.pb.v2.Control.ValidatePipeline:output_type -> bess.pb.v2.ValidatePipelineResponse
+	23, // 52: bess.pb.v2.Control.DiffPipeline:output_type -> bess.pb.v2.DiffPipelineResponse
+	25, // 53: bess.pb.v2.Control.PlanPipeline:output_type -> bess.pb.v2.PlanPipelineResponse
+	27, // 54: bess.pb.v2.Control.ApplyPipeline:output_type -> bess.pb.v2.ApplyPipelineResponse
+	33, // 55: bess.pb.v2.Control.ApplyTransaction:output_type -> bess.pb.v2.ApplyTransactionResponse
+	35, // 56: bess.pb.v2.Control.GetTransaction:output_type -> bess.pb.v2.GetTransactionResponse
+	45, // 57: bess.pb.v2.Control.ListMetrics:output_type -> bess.pb.v2.ListMetricsResponse
+	42, // 58: bess.pb.v2.Control.GetCapabilities:output_type -> bess.pb.v2.GetCapabilitiesResponse
+	38, // 59: bess.pb.v2.Control.ListTransactionResources:output_type -> bess.pb.v2.ListTransactionResourcesResponse
+	50, // [50:60] is the sub-list for method output_type
+	40, // [40:50] is the sub-list for method input_type
+	40, // [40:40] is the sub-list for extension type_name
+	40, // [40:40] is the sub-list for extension extendee
+	0,  // [0:40] is the sub-list for field type_name
 }
 
 func init() { file_control_v2_proto_init() }
@@ -2955,7 +3323,7 @@ func file_control_v2_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_control_v2_proto_rawDesc), len(file_control_v2_proto_rawDesc)),
 			NumEnums:      9,
-			NumMessages:   36,
+			NumMessages:   40,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

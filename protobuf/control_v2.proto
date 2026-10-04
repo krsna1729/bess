@@ -315,6 +315,48 @@ message ListTransactionResourcesResponse {
   uint64 daemon_epoch = 3;
 }
 
+// -- Capabilities (M27, D-082) ---------------------------------------------
+//
+// What this daemon offers, for a controller to decide what to use: its version,
+// the RPCs it serves (a newer client sees which are absent), the plugin API and
+// the capabilities it grants, the module classes and loaded plugins, the
+// ports with their queues and transmit offloads, and the transaction resources.
+
+message GetCapabilitiesRequest {}
+
+message PluginInfo {
+  string name = 1;
+  string version = 2;
+  string path = 3;
+  uint64 required_capabilities = 4;  // BESS_CAP_* bits (framework/plugin.h)
+}
+
+message PortInfo {
+  string name = 1;
+  string driver = 2;
+  uint32 rx_queues = 3;
+  uint32 tx_queues = 4;
+  // Transmit offloads the port accepted (packet_checksum.h).
+  bool tx_ipv4_checksum = 5;
+  bool tx_udp_checksum = 6;
+  bool tx_tcp_checksum = 7;
+  bool tx_outer_ipv4_checksum = 8;
+  bool tx_outer_udp_checksum = 9;
+  bool tx_multi_segment = 10;
+}
+
+message GetCapabilitiesResponse {
+  string daemon_version = 1;
+  repeated string rpcs = 2;  // full names, e.g. bess.pb.v2.Control/ApplyTransaction
+  uint32 plugin_api_version = 3;
+  uint64 plugin_capabilities = 4;  // BESS_CAP_* a plugin may require
+  repeated string module_classes = 5;
+  repeated PluginInfo plugins = 6;
+  repeated PortInfo ports = 7;
+  repeated TransactionResource resources = 8;
+  uint64 daemon_epoch = 9;
+}
+
 // -- Operational metrics (M25, D-076) ------------------------------------
 //
 // Pulled: each call reads every registered source (the runtime's RCU and
@@ -354,6 +396,7 @@ service Control {
       returns (ApplyTransactionResponse) {}
   rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse) {}
   rpc ListMetrics(ListMetricsRequest) returns (ListMetricsResponse) {}
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse) {}
   rpc ListTransactionResources(ListTransactionResourcesRequest)
       returns (ListTransactionResourcesResponse) {}
 }

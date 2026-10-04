@@ -87,6 +87,36 @@ TIMEOUT = FakeRpcError(grpc.StatusCode.DEADLINE_EXCEEDED)
 
 class SdkTest(unittest.TestCase):
 
+    def test_supports_reads_the_daemons_rpcs_and_an_old_daemon_supports_nothing_new(self):
+        class Capable(Stub):
+            def GetCapabilities(self, request, timeout=None):
+                return v2.GetCapabilitiesResponse(
+                    rpcs=['bess.pb.v2.Control/ApplyTransaction'], daemon_epoch=self.epoch)
+
+        class Old(Stub):
+            def GetCapabilities(self, request, timeout=None):
+                raise FakeRpcError(grpc.StatusCode.UNIMPLEMENTED, 'unknown method')
+
+        capable = self.client(Capable())
+        self.assertTrue(capable.supports('ApplyTransaction'))
+        self.assertFalse(capable.supports('WatchEvents'))
+        self.assertFalse(self.client(Old()).supports('ApplyTransaction'))
+
+    def test_a_discovery_call_that_sees_a_restart_retires_old_handles(self):
+        class Restarting(Stub):
+            def GetCapabilities(self, request, timeout=None):
+                return v2.GetCapabilitiesResponse(daemon_epoch=2)
+
+        stub = Restarting()
+        client = self.client(stub)
+        old = client.resource(RESOURCE)  # epoch 1
+        client.capabilities()            # the daemon now answers epoch 2
+        stub.epoch = 2
+        tx = client.transaction()
+        with self.assertRaises(sdk.StaleResource):
+            tx.upsert(old, KEY(request_id='k'), VALUE())
+        self.assertEqual(stub.applied, [])
+
     def client(self, stub, attempts=4):
         self.sleeps = []
         return sdk.Client(stub=stub, retry=sdk.RetryPolicy(attempts=attempts, busy_backoff=0.01),
