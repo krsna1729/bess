@@ -230,16 +230,25 @@ TEST_F(RcuPtrTest, PublicationStormReclaimsEverything) {
       EXPECT_NE(nullptr, state);
     }
   });
-
+  // The storm must overlap the reader even on one CPU: wait until the reader
+  // runs, and yield now and then so a single CPU interleaves the two.
+  while (reader_rounds.load() == 0) {
+    std::this_thread::yield();
+  }
+  const int rounds_before = reader_rounds.load();
   for (int i = 1; i <= kGenerations; i++) {
     published_->Publish(std::make_unique<const State>(i));
     // The control side reclaims as it goes; nothing waits for readers here.
     domain_->ReclaimReady();
+    if (i % 64 == 0) {
+      std::this_thread::yield();
+    }
   }
+  const int rounds_during = reader_rounds.load() - rounds_before;
 
   stop.store(true);
   reader.join();
-  EXPECT_GT(reader_rounds.load(), 0);
+  EXPECT_GT(rounds_during, 0) << "the reader ran during the storm";
 
   // The reader must leave the domain before a blocking Synchronize: an online
   // reader that has stopped reporting would hold the grace period forever,

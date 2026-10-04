@@ -386,11 +386,18 @@ TEST(RouteTableTest, ConcurrentReadersOnlySeeJustifiedAnswers) {
     });
   }
 
+  // At least 500 ms of churn under the readers, and at least kAdds adds
+  // however many CPUs they share (on one CPU the readers take most of the
+  // time, and adds wait for grace periods the readers must report). The hard
+  // deadline only stops a hang.
+  constexpr uint64_t kAdds = 1000;
   std::mt19937_64 rng(0x6b3a);
   uint64_t adds = 0, full = 0;
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-  while (std::chrono::steady_clock::now() < deadline) {
+  const auto start = std::chrono::steady_clock::now();
+  const auto window = start + std::chrono::milliseconds(500);
+  const auto hard_deadline = start + std::chrono::seconds(20);
+  while ((std::chrono::steady_clock::now() < window || adds < kAdds) &&
+         std::chrono::steady_clock::now() < hard_deadline) {
     const auto &[p, v] = churn[rng() % churn.size()];
     if (table->Find(p)) {
       ASSERT_TRUE(table->Erase(p));
@@ -399,7 +406,15 @@ TEST(RouteTableTest, ConcurrentReadersOnlySeeJustifiedAnswers) {
       // Adds can transiently find no free group while freed ones wait out a
       // reader grace period; that is the defer queue working.
       ASSERT_TRUE(added || added.error() == RouteError::kTableFull);
-      added ? adds++ : full++;
+      if (added) {
+        adds++;
+      } else {
+        full++;
+        // A short sleep lets every reader run and report quiescence, so
+        // retired groups free (a yield gives the CPU to one thread only, and
+        // retrying at once without one starves the readers on few CPUs).
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+      }
     }
   }
   stop = true;
@@ -412,7 +427,7 @@ TEST(RouteTableTest, ConcurrentReadersOnlySeeJustifiedAnswers) {
 
   EXPECT_EQ(0u, bad.load()) << "of " << lookups.load() << " lookups, "
                             << adds << " adds, " << full << " full";
-  EXPECT_GT(adds, 1000u);
+  EXPECT_GE(adds, kAdds);
 }
 
 // -- Router -----------------------------------------------------------------------

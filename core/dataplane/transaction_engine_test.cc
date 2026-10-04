@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <new>
 #include <map>
@@ -547,10 +548,14 @@ TEST_F(TransactionEngineTest, ReadersNeverResolveADanglingReference) {
   // Chain for rule k: action 10+k (or 40+k), meter 10+k (or 40+k): the writer
   // alternates between the two id sets so erased ids have time to retire.
   std::vector<int> version(8, -1);
+  // At least 400 ms and 1001 applied transactions, whichever is later (on one
+  // CPU the reader shares the time); the hard deadline only stops a hang.
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+  const auto hard_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
   size_t txns = 0;
-  while (std::chrono::steady_clock::now() < deadline) {
+  while ((std::chrono::steady_clock::now() < deadline || txns <= 1000u) &&
+         std::chrono::steady_clock::now() < hard_deadline) {
     const uint64_t k = rng() % 8;
     std::vector<Op> ops;
     const int v = version[k];
@@ -571,13 +576,20 @@ TEST_F(TransactionEngineTest, ReadersNeverResolveADanglingReference) {
     }
     const auto r = Apply(ops);
     if (r.outcome != Outcome::kApplied) {
-      // Only an id still retiring can refuse: retry later.
-      bool retiring = false;
+      // Only an id still retiring, or a full retirement backlog (busy: the
+      // reader has not reported quiescence, as on one CPU), can refuse: give
+      // the reader a turn and retry later.
+      bool retiring = r.outcome == Outcome::kBusy;
       for (const auto &op : r.ops) {
         retiring |= op.error.find("retiring") != std::string::npos;
       }
-      ASSERT_TRUE(retiring) << "unexpected rejection";
+      if (!retiring) {
+        ADD_FAILURE() << "unexpected rejection";
+        break;  // stop the reader below before returning
+      }
       version[k] = v;
+      engine_.ReclaimRetired();
+      std::this_thread::yield();
       continue;
     }
     txns++;

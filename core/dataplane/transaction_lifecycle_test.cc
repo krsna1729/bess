@@ -661,6 +661,11 @@ TEST_F(LifecycleTest, RandomLifecycleMatchesAModelWithStallingReaders) {
     if (rng() % 4 == 0) {
       engine_.ReclaimRetired();
     }
+    if (!stall.load(std::memory_order_relaxed)) {
+      // On few CPUs the reader must get to run to report quiescence, or every
+      // erased id stays retiring and most transactions are refused.
+      std::this_thread::yield();
+    }
     std::vector<Op> ops;
     std::set<std::pair<int, uint64_t>> used;
     auto m = meters;
