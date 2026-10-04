@@ -199,6 +199,33 @@ inline ParseStatus ParseIp(const uint8_t *ip, size_t present, size_t limit, size
   }
   return ParseStatus::kMalformed;
 }
+
+// The general path: any of up to two VLAN tags, IPv4 with options, IPv6 with
+// extension headers. `out` is cleared and `total_len` settled by the caller.
+inline ParseStatus ParseFrameGeneral(std::span<const uint8_t> frame, ParsedFlowPacket &out,
+                                     size_t total_len) noexcept {
+  size_t off = 12;
+  if (frame.size() < 14) {
+    return ParseStatus::kMalformed;
+  }
+  uint16_t type = Be16(frame.data() + off);
+  for (int tags = 0; (type == 0x8100 || type == 0x88a8) && tags < 2; tags++) {
+    off += 4;
+    if (frame.size() < off + 2) {
+      return ParseStatus::kMalformed;
+    }
+    type = Be16(frame.data() + off);
+  }
+  off += 2;
+  if (type != 0x0800 && type != 0x86dd) {
+    return ParseStatus::kNotIp;
+  }
+  const ParseStatus s = ParseIp(frame.data() + off, frame.size() - off, total_len - off, off, out);
+  if (s == ParseStatus::kOk && ((type == 0x0800) != (out.l3 == L3Kind::kIpv4))) {
+    return ParseStatus::kMalformed;  // EtherType and IP version disagree
+  }
+  return s;
+}
 }  // namespace parse_internal
 
 // Parses an Ethernet frame (optionally with up to two 802.1Q/802.1ad tags).
@@ -211,29 +238,30 @@ inline ParseStatus ParseFrame(std::span<const uint8_t> frame, ParsedFlowPacket &
     total_len = frame.size();
   }
   out = ParsedFlowPacket{};
-  size_t off = 12;
-  if (frame.size() < 14) {
-    return ParseStatus::kMalformed;
-  }
-  uint16_t type = parse_internal::Be16(frame.data() + off);
-  for (int tags = 0; (type == 0x8100 || type == 0x88a8) && tags < 2; tags++) {
-    off += 4;
-    if (frame.size() < off + 2) {
+  // The common frame first, validated in one place: untagged Ethernet, IPv4
+  // without options. The same checks as the general path below, in the order
+  // that decides fastest (the tunnel review's "validate once, execute fast";
+  // conntrack_test checks both paths agree on every frame it builds).
+  if (frame.size() >= 34 && frame[12] == 0x08 && frame[13] == 0x00 && frame[14] == 0x45)
+      [[likely]] {
+    const uint8_t *ip = frame.data() + 14;
+    out.l3_offset = 14;
+    const size_t total = parse_internal::Be16(ip + 2);
+    if (total < 20 || total > total_len - 14) {
       return ParseStatus::kMalformed;
     }
-    type = parse_internal::Be16(frame.data() + off);
+    out.l3 = L3Kind::kIpv4;
+    out.protocol = ip[9];
+    std::memcpy(out.src.data(), ip + 12, 4);
+    std::memcpy(out.dst.data(), ip + 16, 4);
+    const uint16_t frag = parse_internal::Be16(ip + 6);
+    if ((frag & 0x1fff) != 0) {
+      return ParseStatus::kFragment;
+    }
+    out.first_fragment = (frag & 0x2000) != 0;
+    return parse_internal::ParseL4(ip, std::min(frame.size() - 14, total), total, 20, 14, out);
   }
-  off += 2;
-  if (type != 0x0800 && type != 0x86dd) {
-    return ParseStatus::kNotIp;
-  }
-  const ParseStatus s = parse_internal::ParseIp(frame.data() + off, frame.size() - off,
-                                                total_len - off, off, out);
-  if (s == ParseStatus::kOk &&
-      ((type == 0x0800) != (out.l3 == L3Kind::kIpv4))) {
-    return ParseStatus::kMalformed;  // EtherType and IP version disagree
-  }
-  return s;
+  return parse_internal::ParseFrameGeneral(frame, out, total_len);
 }
 
 // Parses a packet that starts at its IP header.

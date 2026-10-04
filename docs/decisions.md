@@ -104,6 +104,7 @@ file is the reasoning.
 | D-081 | Shared conntrack: one table for every worker, a per-connection lock, deadlines kept by the entry (TP8) | accepted |
 | D-082 | Capability discovery: GetCapabilities, and SDK capabilities/supports/metrics (M27.2) | accepted |
 | D-083 | NAT usage counters: per-mapping packets and bytes, final and interim records through a bounded log (TP7) | accepted |
+| D-085 | Packet parse: the common frame validated on one path ("validate once, execute fast"; tunnel clawback) | accepted |
 
 
 ---
@@ -7075,4 +7076,32 @@ report gives 3 packets and 300 bytes for a mapping, owned and shared; `request_u
 while the NAT's worker runs. A NAT without usage compiles none of it (`if constexpr` on the store; Expire's report
 call is empty).
 
+
+## D-085 Packet parse: the common frame validated on one path ("validate once, execute fast"; tunnel clawback)
+
+**Status:** accepted (2026-10-05). Consolidation review (paste-3) section 15 and the tunnel clawback; D-067's parser.
+**Code:** `core/conntrack/packet_parse.h` (`ParseFrame`'s fast path; `parse_internal::ParseFrameGeneral`),
+`core/conntrack/conntrack_test.cc` (`FastPathAgreesWithTheGeneralPath`).
+
+**Context.** The checked VXLAN decapsulation cost 4-5x the legacy module's unchecked fixed offsets (D-069). The review
+asked for "validate once, execute fast" rather than unchecked code. Every checked consumer -- the tunnel decaps,
+conntrack, NAT, the ConnTrack and NAT modules -- starts with `ParseFrame`, whose general path handles VLAN tags,
+IPv4 options, IPv6 extension headers and fragments before reaching the common frame.
+
+**Decision.**
+- `ParseFrame` first recognises the common frame -- untagged Ethernet, IPv4 without options (bytes 12-14 are 08 00
+  45, at least 34 bytes) -- and validates it on one straight path: the same checks, in the order that decides fastest,
+  into the same `ParsedFlowPacket`. Anything else takes the general path, unchanged (`ParseFrameGeneral`).
+- The two paths must agree on every frame, valid or not: a differential test compares status and every parsed field
+  for valid TCP, UDP, ICMP, GRE and fragment frames, each with every byte changed (three random values), every
+  truncation, and total lengths below and above the bytes.
+- No unchecked path: the tunnel decaps keep their checks; they are cheaper because the parse under them is.
+
+**Evidence.** Unit 136/136 (the differential test in `conntrack_test`). Release, isolated CPU 2, 12 ABBA rounds
+against develop rebuilt in the same session, contamination flagged (IRQ activity): `tunnel_bench BM_Decap` VXLAN
+5.15 -> 3.64 ns (-30%), Geneve -33%, GRE -25%, GTP-U -27% (the legacy unchecked VXLAN body measured 1.1 ns: the
+checked decap went from 4.5x to 3.3x of it); `conntrack_bench BM_Parse` untagged IPv4 TCP -31%, a truncated frame
+-52%, and the general path not slower (QinQ UDP -10%, IPv6 with extension headers -3%); `BM_TrackBatch` -3 to -4% at
+1K and 64K connections, no clear difference at 1M; `nat_bench BM_Translate/3/` -5 to -7% at 4K and 64K mappings, no
+clear difference at 1M (where lookups dominate).
 

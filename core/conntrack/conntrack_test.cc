@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <random>
@@ -180,6 +181,53 @@ TEST(PacketParseTest, Ipv6ExtensionHeadersAndFragments) {
 
 // Every truncation of a valid frame is rejected or parsed within bounds: never
 // a read past the frame (the sanitizer lanes run this too).
+// The fast path (untagged IPv4 without options) and the general path give the
+// same status and the same parse for every frame: valid frames of each
+// protocol, then each with one byte changed and each truncated, and with a
+// total length smaller and larger than the bytes.
+TEST(PacketParseTest, FastPathAgreesWithTheGeneralPath) {
+  auto same = [](const ParsedFlowPacket &a, const ParsedFlowPacket &b) {
+    return a.l3 == b.l3 && a.l4 == b.l4 && a.protocol == b.protocol && a.tcp_flags == b.tcp_flags &&
+           a.l3_offset == b.l3_offset && a.l4_offset == b.l4_offset && a.l4_length == b.l4_length &&
+           a.src == b.src && a.dst == b.dst && a.src_port == b.src_port && a.dst_port == b.dst_port &&
+           a.icmp_type == b.icmp_type && a.icmp_code == b.icmp_code &&
+           a.first_fragment == b.first_fragment;
+  };
+  std::vector<std::vector<uint8_t>> frames = {
+      Tcp(kClient, kServer, kTcpSyn), Udp(kClient, kServer), Udp(kClient, kServer, 0),
+      Icmp(kClient, kServer, 8, 7), Ipv4Frame(kClient, kServer, 47, std::vector<uint8_t>(4, 0)),
+      Ipv4Frame(kClient, kServer, 17, std::vector<uint8_t>(12, 0), 0, 0, 0x2000),  // first fragment
+      Ipv4Frame(kClient, kServer, 17, std::vector<uint8_t>(12, 0), 0, 0, 0x0010),  // later fragment
+  };
+  std::mt19937 rng(11);
+  size_t fast = 0, compared = 0;
+  for (const auto &base : frames) {
+    std::vector<std::vector<uint8_t>> variants = {base};
+    for (size_t i = 0; i < base.size(); i++) {
+      for (int k = 0; k < 3; k++) {
+        auto v = base;
+        v[i] = static_cast<uint8_t>(rng());
+        variants.push_back(v);
+      }
+      variants.emplace_back(base.begin(), base.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+    for (const auto &v : variants) {
+      for (size_t total : {size_t{0}, v.size() + 9, v.size() > 3 ? v.size() - 3 : 0}) {
+        ParsedFlowPacket a, b;
+        const ParseStatus sa = ParseFrame(v, a, total);
+        b = ParsedFlowPacket{};
+        const ParseStatus sb =
+            parse_internal::ParseFrameGeneral(v, b, std::max(total, v.size()));
+        ASSERT_EQ(sa, sb) << compared;
+        ASSERT_TRUE(same(a, b)) << compared;
+        fast += v.size() >= 34 && v[12] == 0x08 && v[13] == 0 && v[14] == 0x45;
+        compared++;
+      }
+    }
+  }
+  EXPECT_GT(fast, compared / 2) << "most variants take the fast path";
+}
+
 TEST(PacketParseTest, TruncationsAndLiesAreMalformed) {
   const auto full = Tcp(kClient, kServer, kSA);
   for (size_t n = 0; n < full.size(); n++) {
