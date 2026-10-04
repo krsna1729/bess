@@ -25,6 +25,7 @@ PLUGIN_CLASSES = {
     'StandalonePass': {},
     'StandaloneMacSwap': {},
     'StandaloneRangeGate': {},
+    'StandaloneFlowCount': {},  # gate 0 carries packets of flows it already knows
 }
 
 

@@ -122,7 +122,7 @@ CPU_FLOOR = {
 ARM64_FLOOR_FEATURES = ('fp', 'asimd', 'crc32', 'atomics', 'asimdrdm')
 DPDK_PROFILE = 'bess'
 STANDALONE_PLUGINS = ('standalone_pass', 'standalone_macswap',
-                      'standalone_range_gate')
+                      'standalone_range_gate', 'standalone_flow_count')
 LOCAL_JOB_CAP = 8
 
 
@@ -426,6 +426,12 @@ def step_verify_install(s):
     s.run([sys.executable, ROOT / 'tools' / 'check_standalone_plugins.py',
            '--bessd', bessd[0], '--plugin-dir', s.standalone],
           env={**env, 'PYTHONPATH': client_root, 'BESS_PROTOBUF_ROOT': client_root})
+    # A third-party library on the installed primitives, built and tested
+    # without bessd (M23, persona E).
+    battery = ROOT / 'build' / f'battery-{s.name}'
+    shutil.rmtree(battery, ignore_errors=True)
+    s.run(['meson', 'setup', battery, 'examples/sdk_battery'], env=env)
+    s.run(['meson', 'test', '-C', battery, '--print-errorlogs'], env=env)
 
 
 def tree_state():

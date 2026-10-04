@@ -44,7 +44,12 @@ CI then builds `examples/standalone_plugin` from the staged `bess-dev` alone (a
 copy of `bess-dev.pc` whose prefix is the stage, so a BESS already installed on
 the machine cannot supply a header), loads every plugin into the staged
 `bessd`, and runs packets through each through the installed Python client
-(`tools/check_standalone_plugins.py`).
+(`tools/check_standalone_plugins.py`). One of them, `standalone_flow_count`,
+keeps per-flow state in the public `flow::WorkerFlowTable` (a module on a
+public library). `examples/sdk_battery` is a third-party library on the public
+primitives alone (`StrongId`, `GenerationHandle`, `ExpiryWheel`): leases that
+expire unless renewed, with handles that go stale when a slot is reused. CI
+builds it from the staged install and runs its test without `bessd`.
 
 - `framework/plugin.h` defines the versioned `bess_plugin_descriptor_v1` C
   ABI (below). `ADD_MODULE` remains the module registration mechanism.
