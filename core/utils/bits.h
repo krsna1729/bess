@@ -38,8 +38,12 @@ static inline void ShiftBytesLeft(uint8_t *buf, const size_t len,
   size_t tmp_len = len;
   size_t inc = sizeof(uint64_t) - shift;
   while (tmp_len >= sizeof(uint64_t)) {
-    uint64_t *block = reinterpret_cast<uint64_t *>(tmp_buf);
-    *block >>= shift * 8;
+    // Little-endian: shifting the word right moves its bytes toward lower
+    // addresses. memcpy: `buf` has no alignment.
+    uint64_t block;
+    memcpy(&block, tmp_buf, sizeof(block));
+    block >>= shift * 8;
+    memcpy(tmp_buf, &block, sizeof(block));
     tmp_buf += inc;
     tmp_len = buf + len - tmp_buf;
   }
@@ -76,8 +80,10 @@ static inline void ShiftBytesRight(uint8_t *buf, const size_t len,
   size_t dec = sizeof(uint64_t) - shift;
   size_t leftover = len;
   while (tmp_buf >= buf) {
-    uint64_t *block = reinterpret_cast<uint64_t *>(tmp_buf);
-    *block <<= shift * 8;
+    uint64_t block;
+    memcpy(&block, tmp_buf, sizeof(block));
+    block <<= shift * 8;
+    memcpy(tmp_buf, &block, sizeof(block));
     tmp_buf -= dec;
     leftover -= dec;
   }

@@ -409,6 +409,104 @@ TEST(ChecksumTest, UdpChecksumZeroAddressNoPayload) {
   EXPECT_TRUE(VerifyIpv4UdpChecksum(*ip, *udp));
 }
 
+// Headers where they really sit: behind a 14-byte Ethernet header, i.e. at
+// 2 mod 4 (mbuf data starts 4-byte aligned), and at other 2-byte-aligned
+// offsets (the header structs' be16_t fields need that much). Every header
+// function must read them without assuming 4-byte alignment (run under
+// UBSan, a misaligned 4-byte load fails here) and must agree with DPDK and
+// with the same bytes at offset 0.
+TEST(ChecksumTest, HeadersAtEthernetOffsets) {
+  constexpr size_t kOffsets[] = {0, 2, 6, 14, 18};
+  constexpr size_t kMaxPacket = 15 * 4 + 1500;
+  alignas(64) uint8_t ref[kMaxPacket];
+  alignas(64) uint8_t buf[kMaxPacket + 32];
+
+  for (int trial = 0; trial < 20000; trial++) {
+    const size_t ihl = trial % 3 == 0 ? 5 + rd.GetRange(11) : 5;
+    const bool tcp = trial & 1;
+    const size_t l4_header = tcp ? sizeof(Tcp) : sizeof(Udp);
+    const size_t l4_len = l4_header + rd.GetRange(64);
+    for (uint8_t &b : ref) {
+      b = static_cast<uint8_t>(rd.Get());
+    }
+    auto *ip = reinterpret_cast<Ipv4 *>(ref);
+    ip->version = 4;
+    ip->header_length = ihl;
+    ip->length = be16_t(ihl * 4 + l4_len);
+    ip->protocol = tcp ? Ipv4::Proto::kTcp : Ipv4::Proto::kUdp;
+    // DPDK sums the checksum fields too, so they start at zero (BESS skips
+    // them; the verify pass below stores real values).
+    ip->checksum = 0;
+    if (tcp) {
+      reinterpret_cast<Tcp *>(ref + ihl * 4)->checksum = 0;
+    } else {
+      reinterpret_cast<Udp *>(ref + ihl * 4)->length = be16_t(l4_len);
+      reinterpret_cast<Udp *>(ref + ihl * 4)->checksum = 0;
+    }
+
+    struct Results {
+      uint16_t ip, ip_noopt, l4;
+      bool ip_ok, ip_noopt_ok, l4_ok;
+    } expect{};
+    for (size_t off : kOffsets) {
+      memcpy(buf + off, ref, sizeof(ref));
+      const auto &h = *reinterpret_cast<const Ipv4 *>(buf + off);
+      const uint8_t *l4 = buf + off + ihl * 4;
+      Results got;
+      got.ip = CalculateIpv4Checksum(h);
+      got.ip_noopt = CalculateIpv4NoOptChecksum(h);
+      got.ip_ok = VerifyIpv4Checksum(h);
+      got.ip_noopt_ok = VerifyIpv4NoOptChecksum(h);
+      if (tcp) {
+        got.l4 = CalculateIpv4TcpChecksum(h, *reinterpret_cast<const Tcp *>(l4));
+        got.l4_ok = VerifyIpv4TcpChecksum(h, *reinterpret_cast<const Tcp *>(l4));
+      } else {
+        got.l4 = CalculateIpv4UdpChecksum(h, *reinterpret_cast<const Udp *>(l4));
+        got.l4_ok = VerifyIpv4UdpChecksum(h, *reinterpret_cast<const Udp *>(l4));
+      }
+
+      if (off == 0) {
+        expect = got;
+      } else {
+        ASSERT_EQ(expect.ip, got.ip) << "off=" << off;
+        ASSERT_EQ(expect.ip_noopt, got.ip_noopt) << "off=" << off;
+        ASSERT_EQ(expect.l4, got.l4) << "off=" << off;
+        ASSERT_EQ(expect.ip_ok, got.ip_ok) << "off=" << off;
+        ASSERT_EQ(expect.ip_noopt_ok, got.ip_noopt_ok) << "off=" << off;
+        ASSERT_EQ(expect.l4_ok, got.l4_ok) << "off=" << off;
+      }
+
+      const auto *dh = reinterpret_cast<const rte_ipv4_hdr *>(buf + off);
+      // DPDK can return -0 (0xffff) where BESS returns 0, see above.
+      const uint16_t dpdk_ip = rte_ipv4_cksum(dh);
+      ASSERT_EQ(dpdk_ip == 0xffff ? 0 : dpdk_ip, got.ip) << "off=" << off;
+      const uint16_t dpdk_l4 = rte_ipv4_udptcp_cksum(dh, l4);
+      if (tcp && dpdk_l4 == 0xffff) {
+        ASSERT_EQ(0, got.l4) << "off=" << off;
+      } else {
+        ASSERT_EQ(dpdk_l4, got.l4) << "off=" << off;
+      }
+    }
+
+    // Store the computed checksums and verify, at every offset.
+    ip->checksum = expect.ip;
+    if (tcp) {
+      reinterpret_cast<Tcp *>(ref + ihl * 4)->checksum = expect.l4;
+    } else {
+      reinterpret_cast<Udp *>(ref + ihl * 4)->checksum = expect.l4;
+    }
+    for (size_t off : kOffsets) {
+      memcpy(buf + off, ref, sizeof(ref));
+      const auto &h = *reinterpret_cast<const Ipv4 *>(buf + off);
+      const uint8_t *l4 = buf + off + ihl * 4;
+      ASSERT_TRUE(VerifyIpv4Checksum(h)) << "off=" << off;
+      ASSERT_TRUE(tcp ? VerifyIpv4TcpChecksum(h, *reinterpret_cast<const Tcp *>(l4))
+                      : VerifyIpv4UdpChecksum(h, *reinterpret_cast<const Udp *>(l4)))
+          << "off=" << off;
+    }
+  }
+}
+
 // Tests incremental checksum update for unsigned 16-bit integer
 TEST(ChecksumTest, IncrementalUpdateChecksum16) {
   uint16_t old16 = 0x4500;
