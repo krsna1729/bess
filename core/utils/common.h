@@ -62,8 +62,9 @@ static inline uint64_t align_ceil_pow2(uint64_t v) {
   return v + 1;
 }
 
-// Put before a type's name or a member: struct __cacheline_aligned Foo {...}.
-#define __cacheline_aligned alignas(bess::arch::kCacheLineSize)
+// A GNU attribute, as before M21, so both forms keep working:
+// struct __cacheline_aligned Foo {...}; and struct Foo {...} __cacheline_aligned;
+#define __cacheline_aligned __attribute__((aligned(bess::arch::kCacheLineSize)))
 
 // CPU-memory ordering between threads (not device/DMA memory). INST_BARRIER
 // only stops the compiler from moving memory accesses across it. The others
