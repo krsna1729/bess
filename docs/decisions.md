@@ -5737,8 +5737,7 @@ loopback or 0/8 source, with the caller's duties undocumented. Round 2: correct,
 helpers; fragmentation; an L3 interface table (MTU and address per `InterfaceId`): the MTU check takes the MTU
 as an argument, and a `NextHop` has no room for one at 16 bytes (D-060).
 
-**Revisit when:** a consumer needs groups under transactions; M16 lands selection algorithms (then `Select`
-becomes one of them); an IPv6 backend is chosen.
+**Revisit when:** M16 lands selection algorithms (then `Select` becomes one of them); an IPv6 backend is chosen.
 
 **Change (user decision 2026-10-04): transactional groups, still inside the Router.** With `max_groups`, `Enroll`
 registers a third resource, `<router>/groups` (key `EncodeKey(NextHopGroupId)`, value `NextHopGroup`), between next
@@ -5746,12 +5745,19 @@ hops and routes. A group references its distinct members in `<router>/next_hops`
 one reference); a route's value is a `NextHopId` or a `NextHopGroupId` and references the next hop or the group it
 names. One transaction can now add next hops, a group over them and a route to it, or move a route off a group and
 remove the group: the engine orders the resources (next hops, groups, routes), checks every reference before
-anything is visible, and keeps a member or a group in use. Reserve checks the member count (1..`kMaxMembers`) and
-member ids before the slot table reads them. Enrolled, `GroupReferences` and `GroupMemberships` come from the
+anything is visible, and keeps a member or a group in use. Reserve checks the group id and the member count
+(1..`kMaxMembers`) before the slot table reads the members; an unknown or retiring member fails the engine's
+reference check. Enrolled, `GroupReferences` and `GroupMemberships` come from the
 engine's ledger (memberships count groups, not member positions), and `RouteReferences` counts routes only. The
 direct group setters refuse on an enrolled router (`kEnrolled`), and a router that already has groups cannot
 enroll. No shared group object: the user's choice until a second consumer exists (D-066). The lookup path is
-unchanged. EVIDENCE
+unchanged. Evidence: route_router_transaction_test 17/17 and route_route_test 19/19 (fast tree);
+13 mutants of the new code, all caught after two tests were added (a group id that would wrap the FIB value onto a
+next hop; a weighted member counted twice); reviewer correct (0.85), one P3 fixed (this text, plus a test that a
+removed id stays retiring). Lookup A/B (release x86-64-v3, isolated CPU 2, 16 ABBA rounds, `route_bench`
+LookupRouter, LookupBody, RouterChange; 29 rows): 28 no clear difference; `LookupBody/2/1024/1` +5.0% with 3/16
+pairs and a 0.79-1.35 range on code that did not change (noise); the wrapper flagged NET_RX and thermal
+interrupts on CPU 2.
 
 ## D-066 Member selection: shared algorithms, no shared group object (M16)
 

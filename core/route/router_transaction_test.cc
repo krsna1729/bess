@@ -806,8 +806,14 @@ TEST_F(RouterTransactionTest, GroupsNextHopsAndRoutesChangeInOneTransaction) {
                 .outcome,
             Outcome::kApplied);
   EXPECT_EQ(EgressOf(*router, Ip(10, 1, 1, 1)), 3);
+  // The removed id stays retiring until reclaimed: a reader may still hold
+  // a FIB value naming it.
+  const auto again = Apply({router->SetNextHopGroupOp(NextHopGroupId(1), cd)});
+  ASSERT_NE(again.outcome, Outcome::kApplied);
+  EXPECT_NE(again.ops[0].error.find("retiring"), std::string::npos) << again.ops[0].error;
   Settle();
   EXPECT_EQ(router->next_hop_group_count(), 0u);
+  ASSERT_EQ(Apply({router->SetNextHopGroupOp(NextHopGroupId(1), cd)}).outcome, Outcome::kApplied);
 }
 
 TEST_F(RouterTransactionTest, GroupReferencesAreChecked) {
