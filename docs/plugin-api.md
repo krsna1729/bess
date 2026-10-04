@@ -37,6 +37,12 @@ key must be trivially copyable (`FixedFlowKey`), and a padded one needs its
 own hash and equality (`FlowKeyOps`); an expiry payload must be trivially
 copyable. A new id type or concept gets a twin in `NEGATIVE_CASES`.
 
+CI then builds `examples/standalone_plugin` from the staged `bess-dev` alone (a
+copy of `bess-dev.pc` whose prefix is the stage, so a BESS already installed on
+the machine cannot supply a header), loads every plugin into the staged
+`bessd`, and runs packets through each through the installed Python client
+(`tools/check_standalone_plugins.py`).
+
 - `framework/plugin.h` defines the versioned `bess_plugin_descriptor_v1` C
   ABI (below). `ADD_MODULE` remains the module registration mechanism.
 

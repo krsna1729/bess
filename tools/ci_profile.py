@@ -155,6 +155,7 @@ class Setup:
         self.build_dir = ROOT / 'build' / self.name
         self.stage = ROOT / 'build' / f'stage-{self.name}'
         self.standalone = ROOT / 'build' / f'standalone-{self.name}'
+        self.stage_pkgconfig = ROOT / 'build' / f'stage-pkgconfig-{self.name}'
         self.variant = self.name
         jobs = args.jobs or (4 if self.in_ci else min(LOCAL_JOB_CAP, os.cpu_count() or 1))
         if not self.in_ci and jobs > LOCAL_JOB_CAP:
@@ -313,10 +314,24 @@ def step_verify_install(s):
     pc = next(s.stage.rglob('bess-dev.pc'), None)
     if pc is None:
         raise SystemExit('bess-dev.pc was not installed')
-    env['PKG_CONFIG_PATH'] = os.pathsep.join([str(pc.parent), env['PKG_CONFIG_PATH']])
+    # The installed bess-dev.pc names the real prefix (/usr/local). Consumers
+    # here must see the stage and nothing else: a copy whose prefix is the
+    # stage's, first on the path, so a BESS install already on the machine
+    # cannot supply a header (its older Module layout once made every
+    # installed-tree plugin corrupt bessd's heap on a developer machine).
+    staged_pc = s.stage_pkgconfig
+    staged_pc.mkdir(parents=True, exist_ok=True)
+    text = pc.read_text()
+    prefix = next((line.split('=', 1)[1] for line in text.splitlines()
+                   if line.startswith('prefix=')), None)
+    if prefix is None:
+        raise SystemExit(f'{pc} has no prefix= line')
+    stage_prefix = s.stage / prefix.lstrip('/')
+    (staged_pc / 'bess-dev.pc').write_text(
+        text.replace(f'prefix={prefix}', f'prefix={stage_prefix}', 1))
+    env['PKG_CONFIG_PATH'] = os.pathsep.join([str(staged_pc), env['PKG_CONFIG_PATH']])
     env['CXX'] = s.env['CXX']
-    include = s.stage / 'usr/local/include/bess'
-    env['CXXFLAGS'] = f'-I{include} -I{include}/core ' + env.get('CXXFLAGS', '')
+    include = stage_prefix / 'include/bess'
     s.run([sys.executable, ROOT / 'tools' / 'check_installed_headers.py',
            '--include-dir', include / 'core', '--march', s.cpu], env=env)
     s.run(['meson', 'setup', s.standalone, 'examples/standalone_plugin'], env=env)
@@ -354,6 +369,12 @@ def step_verify_install(s):
     if sbom.get('spdxVersion') != 'SPDX-2.3' or not any(
             p['name'] == 'dpdk' and p.get('checksums') for p in sbom.get('packages', [])):
         raise SystemExit('bess.spdx.json is not an SPDX 2.3 document with the DPDK pin')
+    # The installed-tree plugins load into the staged bessd and move packets,
+    # driven by the installed Python client (M23).
+    client_root = str(s.stage / 'usr/local/share/bess')
+    s.run([sys.executable, ROOT / 'tools' / 'check_standalone_plugins.py',
+           '--bessd', bessd[0], '--plugin-dir', s.standalone],
+          env={**env, 'PYTHONPATH': client_root, 'BESS_PROTOBUF_ROOT': client_root})
 
 
 def tree_state():
