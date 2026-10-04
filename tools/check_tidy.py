@@ -154,6 +154,8 @@ def main():
     ap.add_argument("--build-dir")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--strict", action="store_true",
+                    help="fail when the baseline is another clang-tidy version's (CI: the pin must match)")
     ap.add_argument("--files", help="only sources matching this regex (for local use; the gate runs all)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -173,11 +175,14 @@ def main():
     base_major, baseline = load_baseline()
     if base_major != major:
         # Another clang-tidy finds other things: comparing would fail on counts
-        # nobody introduced. Report instead; the gate is CI's, with its pin.
-        print(f"NOTICE: clang-tidy {major} here, the baseline is clang-tidy {base_major}'s: the gate is not "
-              "applied. Current counts in the baseline's format:")
+        # nobody introduced. Report instead; the gate is CI's, with its pin, and
+        # there (--strict) a mismatch fails, so the baseline cannot silently
+        # stop being enforced.
+        what = "FAILED" if args.strict else "NOTICE"
+        print(f"{what}: clang-tidy {major} here, the baseline is clang-tidy {base_major}'s: the gate is not "
+              "applied. Current counts in the baseline's format (commit them as the baseline):")
         print(json.dumps(to_json(counts, major), indent=2))
-        return 0
+        return 1 if args.strict else 0
     if args.files:
         baseline = {k: v for k, v in baseline.items() if re.search(args.files, k[0])}
     problems = compare(counts, baseline)

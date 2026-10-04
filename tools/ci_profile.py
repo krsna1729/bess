@@ -370,7 +370,7 @@ def step_tidy(s):
         return
     s.run([sys.executable, ROOT / 'tools' / 'check_tidy.py', '--self-test'])
     s.run([sys.executable, ROOT / 'tools' / 'check_tidy.py', '--build-dir', s.build_dir,
-           '--jobs', s.jobs], env=s.env_with_dpdk())
+           '--jobs', s.jobs, '--strict'], env=s.env_with_dpdk())
 
 
 STEPS = [

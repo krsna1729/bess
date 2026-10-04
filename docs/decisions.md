@@ -6393,8 +6393,8 @@ decision cache's generations, and no static analysis beyond the layering checks.
   and modernize are off. `tools/check_tidy.py` counts findings per (file, check), clang-analyzer included, against
   `tools/tidy_baseline.json` and fails on any change, so the baseline only shrinks. The baseline records the
   clang-tidy major version it was made with; the gate runs in the `clang-asan` lane with CI's pin (clang-tidy-19)
-  and, with any other version, only reports. The committed baseline is clang-tidy 22's (this machine): the first CI
-  run reports clang-tidy 19's counts and the baseline is replaced with them, which turns the CI gate on.
+  and `--strict`, where a baseline of another version fails and prints the counts to commit; elsewhere another
+  version only reports.
 
 **Found and fixed** (each with a regression test where one fits):
 - Fuzzing: `ParseIpv4Address` wrapped out-of-range parts; `endian.h` bound references to misaligned packed fields;
@@ -6434,7 +6434,7 @@ decision cache's generations, and no static analysis beyond the layering checks.
 - Fuzz: build clean, the `fuzz` corpus suite 10/10, `checksum_plan` and `tunnel_decap` 120 s each with no crash
   (836k and 3.1M executions).
 - clang-tidy 22: `check_tidy.py --report` produced the committed baseline, 288 findings in 88 files (2
-  clang-analyzer); the first CI run gives clang-tidy 19's counts.
+  clang-analyzer); CI's clang-tidy 19 counts replaced it (below).
 - `check_includes.py`: 0 forbidden edges; `check_arch.py`: 7 allowlisted findings, no growth.
 
 **Review:** REVIEW
