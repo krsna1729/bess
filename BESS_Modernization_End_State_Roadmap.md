@@ -34,7 +34,7 @@
 - [18. Phase E — acceleration and portability](#18-phase-e--acceleration-and-portability)
 - [19. Phase F — hardening and product quality](#19-phase-f--hardening-and-product-quality)
 - [20–33. Build/API/verification/critical-path plans](#20-proposed-end-state-repositorybuild-layout)
-- [Appendices A–L](#appendix-a--current-file-ownership-map)
+- [Appendices A–M](#appendix-a--current-file-ownership-map)
 - [Final architectural statement](#final-architectural-statement)
 
 ## 0. Non-negotiable outcome
@@ -5703,6 +5703,36 @@ Rules for any adopted formal work:
 Not planned at any level: proofs of DPDK, `rte_hash`, `rte_lpm`, PMDs, firmware, the scheduler, the C++ memory-model
 correspondence, compiler correctness, or the whole module graph. Bend and Vx do not enter the dependency graph;
 Bend's automatic parallelism does not fit packet execution, and a heterogeneous IR is a watch item only.
+
+---
+
+# Appendix M — UPF control-boundary gaps
+
+Source: an external UPF (OMEC) gap analysis against `develop` at `451ccd47`, re-checked 2026-10-04. Its measure
+of success: how much generic dataplane infrastructure an OMEC-style UPF can delete, so that it carries only PFCP and
+GTP semantics. Several of its gaps have closed since: the Go control SDK (M27.1), Bridge's unsynchronised FDB (now
+`PackedMacTable` with one writer, D-073), the thin `rte_flow` owner instead of a second flow language (D-070), and
+PacketStore's data race (pinned to one worker). The rest are adopted below. None defines PFCP, URR, QER or DDN
+semantics; each is a generic mechanism a UPF composes. Order: after M23 (no new major abstraction before it), in
+the order listed.
+
+| # | Gap | Lands in | Exit criterion |
+|---|---|---|---|
+| 1 | **ReplaceScope**: one operation that creates a scope version's new referents and switches the scope pointer, hiding today's two transactions (D-050) from the client | M8 follow-up + M27 SDK | a whole session modification is seen by readers as the old or the new version; the client submits one logical operation and never handles the intermediate state; failure injection at every prepare point; Mpps unchanged |
+| 2 | **Dataplane-to-control events**: worker-local bounded rings, a control-side drain, `WatchEvents` stream, SDK support (M25 phase 2) | M25 | no worker ever blocks; explicit overflow counter; monotonic sequence per source; generation/scope correlation; applications register their own event types |
+| 3 | **Streaming transactions**: many outstanding transactions on one stream, ordered result correlation, bounded queues and backpressure, the same apply engine and request-id semantics as unary | M27.2 | the SDK's `Commit` is the same call over unary or stream; sustained update rate measured against unary |
+| 4 | **Indexed object counters**: packet/byte counters for millions of objects, worker-local increments, range/batch snapshot, generation-safe ids, reset epochs, optional threshold arm (feeds 2) | TP7 (usage counters) / M25 | no mutex, no per-update allocation, no shared atomics on the packet path; snapshot cost per object measured |
+| 5 | **Owner-worker handoff with a resolved continuation**: a packet arriving on a non-owner worker is handed to its owner with its `ActionId`/`FlowHandle`, never reclassified (D-054 channels, continuation generations) | M11 follow-up | local-owner and remote-owner paths benchmarked at bursts 1/8/16/32; worker-exclusive meters and flow state need no synchronisation |
+| 6 | **PacketStore rewrite** on 5: per-owner store, preallocated descriptors, bounded queues, `ExpiryWheel`, flow/session handle index, an event on the first buffered packet (2) | after 2 and 5 | no allocation and no shared mutable container on the packet path; bounded memory set at init |
+| 7 | **UPF reference slice** as the M24 session-compiler appliance: N6 downlink and N3 uplink, multiple PDRs with arbitrary source and destination port ranges, QERs, one session modification through ReplaceScope, usage counters, idle buffering, timeout reconciliation | M24 | the plugin needs no generic BESS glue beyond the SDK and installed headers; if it does, the API is wrong, not the plugin |
+
+The visible-concept test for API review: a UPF author should need about ten BESS concepts (packet reference and
+cursor, typed classifier, `ActionId`, scope id and version, meter id, route domain and next hop, `FlowHandle`,
+worker id, the transaction SDK). RCU domains, engine internals, slot resources, resource bindings, QSBR, module
+pause and worker quiescence are BESS's own and must not be needed to write the slice in 7.
+
+IPv6 route domains and PDR keys, fragment reassembly, RSS/RETA validation and hardware meters follow only once the
+software slice proves the need.
 
 ---
 
