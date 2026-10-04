@@ -4794,6 +4794,26 @@ continuation that survives a device reset; or a move-only owning packet type
 arrives in `bess_packet` (then `PuntItem` should hold it and the nulling
 convention becomes a type).
 
+**Protocol model and code mapping (roadmap Appendix L, 2026-10-04).** The ownership protocol is checked at level
+A1+: `IndexWraparoundIsExhaustivelyConsistent` enumerates every sequence of enqueue and dequeue bursts of
+1..capacity+1 items to depth 4-8 from every ring alignment, across the 2^32 wrap and the 2^31 boundary (over 10^6
+nodes), against a queue model; `RandomOperationsMatchAModelForEveryContextSize` drives punt bursts, single punts,
+dequeues, `Close` and `Drain` against the same model, with the accounting identity, for every topology and context
+size; `PacketHandoffTest` checks teardown frees what is left. Close and drain are explored by the random model, not
+exhaustively (a closed channel cannot be reopened to restore a sibling branch); that is the known gap.
+
+| Model action | Code | Invariant checked |
+|---|---|---|
+| Punt (burst) | `HandoffChannel::TryPuntBurst` | the first N items move (`packet == nullptr`), the rest stay the producer's, untouched; refusal says full or closed |
+| Punt (one) | `TryPunt` | as above for one item; the caller's handle is nulled only on success |
+| Dequeue | `Dequeue` / `DequeueRaw` | FIFO per producer; each item delivered once; the consumer owns it on return |
+| Close | `Close` | every later punt refuses with `kClosed`; queued items stay deliverable |
+| Drain | `Drain(fn)` | every queued item reaches `fn` exactly once; counted in `discarded` |
+| Teardown | `~HandoffChannel` (`Deleter`) | what is left is freed (`FreePacket`) and counted; nothing leaks |
+| Accounting | `stats()` | `enqueued == dequeued + discarded + occupancy` when no call is in progress |
+
+A change to any row's code changes the model or the test in the same commit.
+
 ## D-055 One CI authority for gating and release lanes; static release links with -fno-lto
 
 **Status:** accepted (2026-10-02), with the exceptions under "Not done".
