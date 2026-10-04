@@ -44,12 +44,14 @@ class Stub:
 
     def __init__(self, epoch=1, apply=(), get=()):
         self.epoch = epoch
+        self.listed = 0
         self.apply_script = list(apply)
         self.get_script = list(get)
         self.applied = []
         self.got = []
 
     def ListTransactionResources(self, request, timeout=None):
+        self.listed += 1
         return v2.ListTransactionResourcesResponse(
             resources=[v2.TransactionResource(name=RESOURCE, key_type=KEY.DESCRIPTOR.full_name,
                                               value_type=VALUE.DESCRIPTOR.full_name)],
@@ -132,14 +134,53 @@ class SdkTest(unittest.TestCase):
         self.assertEqual(len(stub.applied), 2)
         self.assertEqual(stub.applied[0], stub.applied[1], 'same id and contents')
 
-    def test_an_unreachable_daemon_keeps_the_request_id(self):
+    def test_an_unanswered_question_is_asked_again_not_answered_by_resending(self):
         unavailable = FakeRpcError(grpc.StatusCode.UNAVAILABLE)
-        stub = Stub(apply=[unavailable, unavailable, (APPLIED, 1)], get=[unavailable, (False, 0, 1)])
+        stub = Stub(apply=[unavailable, (APPLIED, 1)], get=[unavailable, (False, 0, 1)])
         self.tx(self.client(stub)).commit()
+        self.assertEqual(len(stub.got), 2, 'asked until it had an answer')
+        self.assertEqual(len(stub.applied), 2)
         self.assertEqual(len({r.request_id for r in stub.applied}), 1)
 
+    def test_a_restart_behind_a_failed_question_is_not_applied_blind(self):
+        unavailable = FakeRpcError(grpc.StatusCode.UNAVAILABLE)
+        stub = Stub(apply=[TIMEOUT], get=[unavailable, (False, 0, 2)])
+        with self.assertRaises(sdk.DaemonRestarted):
+            self.tx(self.client(stub)).commit()
+        self.assertEqual(len(stub.applied), 1, 'never resent to the restarted daemon')
+
+    def test_the_epoch_is_learned_before_the_first_send(self):
+        stub = Stub(apply=[(APPLIED, 2)])
+        client = self.client(stub)
+        handle = sdk.Resource(RESOURCE, KEY.DESCRIPTOR.full_name, VALUE.DESCRIPTOR.full_name)
+        tx = client.transaction()
+        tx.upsert(handle, KEY(), VALUE())  # no discovery through this client
+        with self.assertRaises(sdk.DaemonRestarted):
+            tx.commit()  # the daemon answered from epoch 2; it was 1 when the commit began
+        self.assertEqual(stub.listed, 1)
+
+    def test_internal_without_bess_detail_is_no_answer(self):
+        reset = FakeRpcError(grpc.StatusCode.INTERNAL, 'stream reset')
+        stub = Stub(apply=[reset], get=[(True, APPLIED, 1)])
+        result = self.tx(self.client(stub)).commit()
+        self.assertTrue(result.replayed)
+        detail = v2.ErrorDetail(code=v2.ErrorDetail.INTERNAL, message='engine failure')
+        stub = Stub(apply=[FakeRpcError(grpc.StatusCode.INTERNAL, 'x', detail)])
+        with self.assertRaises(sdk.InvalidRequest):
+            self.tx(self.client(stub)).commit()
+
+    def test_a_conflict_after_an_unanswered_send_says_it_may_have_applied(self):
+        stub = Stub(apply=[TIMEOUT, (CONFLICT, 1)], get=[(False, 0, 1)])
+        with self.assertRaises(sdk.Conflict) as raised:
+            self.tx(self.client(stub), expected_generation=3).commit()
+        self.assertTrue(raised.exception.after_unknown_attempt)
+        stub = Stub(apply=[(CONFLICT, 1)])
+        with self.assertRaises(sdk.Conflict) as raised:
+            self.tx(self.client(stub), expected_generation=3).commit()
+        self.assertFalse(raised.exception.after_unknown_attempt)
+
     def test_no_answer_at_all_is_an_unknown_outcome_not_a_failure(self):
-        stub = Stub(apply=[TIMEOUT, TIMEOUT], get=[TIMEOUT, TIMEOUT])
+        stub = Stub(apply=[TIMEOUT], get=[TIMEOUT])
         with self.assertRaises(sdk.TransportError) as raised:
             self.tx(self.client(stub, attempts=2)).commit()
         self.assertEqual(raised.exception.request_id, stub.applied[0].request_id)

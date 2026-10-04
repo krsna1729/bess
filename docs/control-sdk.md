@@ -22,11 +22,12 @@ print(tx.result.generation)                   # committed on a clean exit
 | Situation | What the SDK does |
 |---|---|
 | One logical transaction | One `request_id` for its whole life, kept across every retry. |
-| No answer (deadline, unavailable) | Asks `GetTransaction(request_id)`. Known: that outcome (`replayed`). Not known under the same daemon epoch: sends the identical request again (the daemon replays or applies it once). |
+| Before the first send | Learns the daemon epoch (resource discovery) if this client has not. |
+| No answer (deadline, unavailable; `INTERNAL`/`UNKNOWN` without BESS's error detail) | Asks `GetTransaction(request_id)`, again if the question goes unanswered too. Known: that outcome (`replayed`). Answered "not known" under the epoch the commit started with: sends the identical request again (the daemon replays or applies it once). Never sends again on a guess. |
 | No answer through every attempt | `TransportError`: the outcome is unknown, not failed; ask `get_transaction(request_id)` later. |
-| The daemon restarted meanwhile | `DaemonRestarted`: the outcome is lost with the daemon's state; never reported as applied or as not applied. |
+| Any answer from another daemon epoch | `DaemonRestarted`: the transaction met a daemon that lost the state it was built against; never reported as applied or as not applied. |
 | `OUTCOME_BUSY` | Retries with doubling backoff, then `Busy`. |
-| `OUTCOME_CONFLICT` | `Conflict` (nothing tried); the application decides what a moved generation means. |
+| `OUTCOME_CONFLICT` | `Conflict` (nothing tried); the application decides what a moved generation means. `after_unknown_attempt`: an earlier send of the same commit went unanswered and may have applied. |
 | `OUTCOME_REJECTED` | `Rejected`, with each failing operation's index and error; nothing changed. |
 | A refused call | `InvalidRequest`, with the server's `ErrorDetail` (code, field, object). |
 | A key or value of the wrong type | `InvalidRequest` before anything is sent. |

@@ -63,11 +63,18 @@ class InvalidRequest(Error):
 
 
 class Conflict(Error):
-    """expected_generation no longer matched: nothing was tried."""
+    """expected_generation no longer matched: this attempt tried nothing.
 
-    def __init__(self, record):
-        super().__init__('generation moved on (now %d)' % record.generation)
+    after_unknown_attempt: an earlier send of the same commit went unanswered,
+    so that attempt may have applied (and moved the generation itself) with
+    its record since aged out of the daemon's window: re-read the state."""
+
+    def __init__(self, record, after_unknown_attempt=False):
+        super().__init__('generation moved on (now %d)%s' % (
+            record.generation, '; an earlier unanswered attempt may have applied'
+            if after_unknown_attempt else ''))
         self.record = record
+        self.after_unknown_attempt = after_unknown_attempt
 
 
 class Rejected(Error):
@@ -166,8 +173,13 @@ class Client:
     def resources(self, refresh=False):
         """Every transactional resource, by name (cached)."""
         if self._resources is None or refresh:
-            response = self._call(self._stub.ListTransactionResources,
-                                  v2.ListTransactionResourcesRequest())
+            try:
+                response = self._call(self._stub.ListTransactionResources,
+                                      v2.ListTransactionResourcesRequest())
+            except grpc.RpcError as e:
+                if _no_answer(e):
+                    raise TransportError(None, e.code())
+                raise _translate(e)
             self._observe_epoch(response.daemon_epoch)
             self._resources = {r.name: Resource(r.name, r.key_type, r.value_type)
                                for r in response.resources}
@@ -208,59 +220,83 @@ class Client:
         return changed
 
     def _commit(self, request):
-        """Applies `request` exactly once, whatever the transport does."""
-        epoch_at_start = self.daemon_epoch
+        """Applies `request` exactly once, whatever the transport does.
+
+        Every RPC counts against the attempt budget. After a send without an
+        answer the outcome is asked for, never assumed; the request is sent
+        again only once GetTransaction has answered "not known" under the
+        epoch this commit started with. An answer from any other epoch is
+        DaemonRestarted: the transaction met a daemon that lost the state
+        the caller built it against.
+        """
+        if self.daemon_epoch is None:
+            self.resources(refresh=True)  # learn the epoch before sending
+        epoch = self.daemon_epoch
         backoff = self._retry.busy_backoff
-        transport_failure = None
-        for attempt in range(self._retry.attempts):
+        transport_failure = None  # the last RPC that went unanswered
+        unknown_attempt = False   # a send of this commit went unanswered
+        send = True
+        for _ in range(self._retry.attempts):
+            if send:
+                try:
+                    response = self._call(self._stub.ApplyTransaction, request)
+                except grpc.RpcError as e:
+                    if not _no_answer(e):
+                        raise _translate(e)
+                    transport_failure = e.code()
+                    unknown_attempt = True
+                    send = False  # ask before sending again
+                    continue
+                self._check_epoch(response.daemon_epoch, epoch)
+                record = response.record
+                if record.outcome == _OUTCOME.OUTCOME_BUSY:
+                    transport_failure = None
+                    self._sleep(backoff)
+                    backoff *= 2
+                    continue
+                return _finish(record, response.replayed, response.daemon_epoch,
+                               unknown_attempt)
             try:
-                response = self._call(self._stub.ApplyTransaction, request)
+                known, record, answered_epoch = self.get_transaction(request.request_id)
             except grpc.RpcError as e:
-                if e.code() not in _TRANSIENT:
+                if not _no_answer(e):
                     raise _translate(e)
                 transport_failure = e.code()
-                # No answer: did it apply? Ask, under the same request id.
-                outcome = self._reconcile(request.request_id, epoch_at_start)
-                if outcome is not None:
-                    return outcome
-                continue  # not seen: sending the same request again is safe
-            # A changed epoch here means this attempt reached a restarted
-            # daemon and its answer is about that daemon: report it as it is
-            # (the caller sees daemon_epoch change). A restart seen before a
-            # resend raises DaemonRestarted in _reconcile instead.
-            self._observe_epoch(response.daemon_epoch)
-            record = response.record
-            if record.outcome == _OUTCOME.OUTCOME_BUSY:
-                transport_failure = None
-                self._sleep(backoff)
-                backoff *= 2
-                continue
-            return _finish(record, response.replayed, response.daemon_epoch)
+                continue  # still no answer: ask again, never resend blind
+            self._check_epoch(answered_epoch, epoch)
+            if known:
+                return _finish(record, True, answered_epoch, unknown_attempt)
+            transport_failure = None
+            send = True  # confirmed unseen under this epoch: sending again is safe
         if transport_failure is not None:
             raise TransportError(request.request_id, transport_failure)
         raise Busy('still busy after %d attempts' % self._retry.attempts)
 
-    def _reconcile(self, request_id, epoch_at_start):
-        try:
-            known, record, epoch = self.get_transaction(request_id)
-        except grpc.RpcError as e:
-            if e.code() in _TRANSIENT:
-                return None  # still unreachable: try again
-            raise _translate(e)
-        restarted = self._observe_epoch(epoch) or (
-            epoch_at_start is not None and epoch != epoch_at_start)
-        if known:
-            return _finish(record, True, epoch)
-        if restarted:
-            raise DaemonRestarted('the daemon restarted; the outcome is lost with its state')
-        return None
+    def _check_epoch(self, answered, expected):
+        self._observe_epoch(answered)
+        if answered != expected:
+            raise DaemonRestarted('the daemon restarted (epoch %d -> %d): the transaction met a '
+                                  'daemon that lost the state it was built against'
+                                  % (expected, answered))
 
 
-def _finish(record, replayed, epoch):
+def _no_answer(error):
+    """Whether a failed call says nothing about the outcome: the transport's
+    timeouts and losses, and INTERNAL/UNKNOWN without BESS's error detail (a
+    reset stream, a handler that died after recording)."""
+    code = error.code()
+    if code in _TRANSIENT:
+        return True
+    if code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.UNKNOWN):
+        return not any(key == 'bess-error-bin' for key, _ in (error.trailing_metadata() or ()))
+    return False
+
+
+def _finish(record, replayed, epoch, unknown_attempt=False):
     if record.outcome == _OUTCOME.OUTCOME_APPLIED:
         return Applied(record, replayed, epoch)
     if record.outcome == _OUTCOME.OUTCOME_CONFLICT:
-        raise Conflict(record)
+        raise Conflict(record, unknown_attempt)
     if record.outcome == _OUTCOME.OUTCOME_REJECTED:
         raise Rejected(record)
     if record.outcome == _OUTCOME.OUTCOME_BUSY:
