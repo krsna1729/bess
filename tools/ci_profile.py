@@ -249,6 +249,16 @@ def step_layers(s):
     s.run([sys.executable, ROOT / 'tools' / 'check_arch.py'])
 
 
+def symbolizer():
+    # Sanitizer reports name frames only through llvm-symbolizer, and the TSan
+    # suppressions match on function names: without it they match nothing.
+    for path in (shutil.which('llvm-symbolizer'), '/usr/lib/llvm-19/bin/llvm-symbolizer',
+                 shutil.which('llvm-symbolizer-19')):
+        if path and os.access(path, os.X_OK):
+            return path
+    raise SystemExit('llvm-symbolizer not found (env/install-deps.sh installs llvm-19)')
+
+
 def step_test(s):
     if s.sanitize == 'address':
         # Every unit, architecture, plugin and fuzz-corpus test under ASan and
@@ -256,8 +266,9 @@ def step_test(s):
         # (not built) and the daemon suites `python` and `integration` (bessd
         # under ASan is not yet a supported mode; D-072).
         env = s.env_with_dpdk()
-        env['ASAN_OPTIONS'] = 'detect_leaks=1:halt_on_error=1:abort_on_error=1'
-        env['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
+        env['ASAN_OPTIONS'] = ('detect_leaks=1:halt_on_error=1:abort_on_error=1'
+                               ':external_symbolizer_path=' + symbolizer())
+        env['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1:external_symbolizer_path=' + symbolizer()
         s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs',
                '--no-suite', 'python', '--no-suite', 'integration',
                '--timeout-multiplier', '6'], env=env)
@@ -272,7 +283,8 @@ def step_test(s):
 def step_test_tsan(s):
     env = s.env_with_dpdk()
     env['TSAN_OPTIONS'] = ('suppressions=' + str(ROOT / 'tools/sanitizers/tsan.supp')
-                           + ' halt_on_error=1 second_deadlock_stack=1')
+                           + ' halt_on_error=1 second_deadlock_stack=1'
+                           + ' external_symbolizer_path=' + symbolizer())
     env['LD_LIBRARY_PATH'] = os.pathsep.join(
         filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))
     tests = []
