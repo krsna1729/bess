@@ -66,7 +66,10 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   (`gcc`, `clang`) and the sanitizer lanes; pushes to `develop`/`master` and
   tags run every lane, adding arm64, generic and ubuntu-26.04 (`push_only`).
   A break those lanes catch shows up on the push and is fixed forward. A new
-  push to a pull request cancels its older run.
+  push cancels the older run it supersedes: per pull request, per branch
+  for pushes to `develop` and `master` (the tip's run covers every merged
+  commit), and the nightly run its predecessor. Tag (release) runs always
+  complete.
 - **What a pull request skips.** Benchmarks are built in every lane but run
   only on pushes and the nightly run (at 0.001 s per case they measure
   nothing; their setup was 80% of a gating lane's test time). clang-tidy
