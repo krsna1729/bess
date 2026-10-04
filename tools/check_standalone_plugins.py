@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -50,8 +51,16 @@ def edge_packets(client, module, gate=0):
     info = client.get_module_info(module)
     for ogate in info.ogates:
         if ogate.ogate == gate:
-            return ogate.cnt
+            return ogate.pkts
     return 0
+
+
+def free_port():
+    """A port nothing listens on now, so the client cannot reach another
+    daemon instead of the one this check starts."""
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        return probe.getsockname()[1]
 
 
 def run(client, plugin_classes):
@@ -81,8 +90,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bessd', required=True)
     parser.add_argument('--plugin-dir', required=True)
-    parser.add_argument('--grpc-url', default='127.0.0.1:10516')
+    parser.add_argument('--grpc-url', help='default: 127.0.0.1 on a free port')
     args = parser.parse_args()
+    args.grpc_url = args.grpc_url or f'127.0.0.1:{free_port()}'
 
     from pybess.bess import BESS
 

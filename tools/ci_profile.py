@@ -334,6 +334,8 @@ def step_verify_install(s):
     include = stage_prefix / 'include/bess'
     s.run([sys.executable, ROOT / 'tools' / 'check_installed_headers.py',
            '--include-dir', include / 'core', '--march', s.cpu], env=env)
+    # A fresh builddir: a configured one keeps the bess-dev it resolved before.
+    shutil.rmtree(s.standalone, ignore_errors=True)
     s.run(['meson', 'setup', s.standalone, 'examples/standalone_plugin'], env=env)
     s.run(['meson', 'compile', '-C', s.standalone], env=env)
     for plugin in STANDALONE_PLUGINS:
