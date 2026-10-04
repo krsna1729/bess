@@ -92,6 +92,7 @@ file is the reasoning.
 | D-069 | Tunnel packet mechanics: VXLAN, Geneve, GRE and a GTP-U header codec (M19) | accepted |
 | D-070 | Hardware flow rules: a lifecycle owner, not a flow IR (M20) | accepted |
 | D-071 | Portability: one architecture boundary (core/arch), generic fallback for every kernel (M21) | accepted |
+| D-072 | Hardening program: sanitizers with the EAL, fuzzing, fault injection, models, curated clang-tidy (M22) | accepted |
 
 
 ---
@@ -5925,6 +5926,15 @@ to it).
 **Revisit when:** a consumer needs window checks (then sequence tracking per direction), or the 1M-connection
 cost matters (a batch path that prefetches the index, slot and wheel node).
 
+**Change (M22, user decision 2026-10-04): Linux's flag-combination filter.** Before the TCP state table, a segment
+whose flags (PSH, ECE and CWR ignored) are not one of Linux `tcp_error()`'s valid combinations — SYN, SYN|URG,
+SYN|ACK, RST, RST|ACK, FIN|ACK, FIN|ACK|URG, ACK, ACK|URG — is `kInvalid`: no state change, no deadline refresh, no
+connection created. Before, such segments went through the table (a bare FIN acted as a FIN, so a crafted packet could
+move a connection to a closing state and its short timeout). The check is one shift of a 64-bit constant on the flag
+byte. Found by the M22 conntrack model test (written independently from Linux's table); evidence: model walk over all
+256 flag bytes in every reachable state, 9 filter mutants caught only by the new test, ASan+UBSan clean, isolated A/B: no clear difference
+(64K Track rows rerun at 24 rounds: B/A 0.998-1.012).
+
 ## D-068 NAT as a library: bindings on the flow table, a bitmap port pool, generic expiry (M18)
 
 **Status:** accepted (2026-10-04), experimental API. **Needs review (user):** the module's per-packet cost against
@@ -6250,6 +6260,12 @@ application copies the map into an RCU object as it needs).
 **Revisit when:** a NIC lab is available (run the certification matrix), or a consumer needs the asynchronous
 template API.
 
+**Change (M22, D-072).** Exception safety: a backend that throws in Submit no longer leaks the handle and MARK, and
+Retire cannot throw (MARK free list a fixed ring, quarantine and free slots reserved at construction). A backend that
+throws during Submit sends the rule's MARK to the port's drain quarantine, never straight back to the free list.
+`RteFlowBackend` records each completion before calling the device, so nothing can throw once the device holds (or
+has removed) a rule: a rule the device took is always tracked.
+
 ## D-071 Portability: one architecture boundary (core/arch), generic fallback for every kernel (M21)
 
 **Status:** accepted (2026-10-04). ARM64 is compiled and tested only by CI's new experimental lanes; nothing was built
@@ -6333,4 +6349,101 @@ trials; ARM64 runs only in CI; on arm64 `rdtsc()` reads CNTVCT_EL0 (25 MHz to 1 
 accounting is coarser there; NEON versions of the tag and word kernels (arm64 uses the portable loops; untestable here).
 
 **Revisit when:** the ARM64 lanes are green (make them gating); a profile shows an arm64 kernel worth specialising.
+
+## D-072 Hardening program: sanitizers with the EAL, fuzzing, fault injection, models, curated clang-tidy (M22)
+
+**Status:** accepted (2026-10-04). The sanitizer and tidy CI lanes start experimental and become gating once green.
+**Code:** `core/fuzz/` (ten harnesses, seeds, `make_seeds.py`, replay main), `core/testing/allocation_faults.{h,cc}`,
+model tests `core/{flow/decision_cache,conntrack/conntrack,nat/nat,l2/fdb}_model_test.cc`, `.clang-tidy`,
+`tools/check_tidy.py`, `tools/tidy_baseline.json`, `tools/sanitizers/{tsan.supp,tsan_tests.txt}`,
+`core/runtime/dpdk.cc`, `core/rcu/rcu_domain.cc`, `meson.build`, `meson_options.txt` (`build_fuzzers`),
+`core/meson.build`, `tools/ci_profile.py`, `.github/workflows/ci.yml`, `env/install-deps.sh`, `docs/fuzzing.md`; the
+production fixes listed below.
+
+**Context.** Roadmap M22: carry the transaction engine's adversarial testing to the rest of the dataplane. Before
+M22: no sanitizer in CI, the DPDK EAL did not start under ASan (so most of the suite could not run there), no fuzz
+target, three private copies of a fail-Nth `operator new` hook, no model tests for conntrack, NAT bindings or the
+decision cache's generations, and no static analysis beyond the layering checks.
+
+**Decision.**
+- **ASan + UBSan, broadly.** The EAL starts under ASan with `--base-virtaddr 0x10000000` in ASan builds (the default
+  heap address falls in ASan's shadow, so DPDK mapped the heap above the IOMMU's DMA mask). Every ASan build compiles
+  with `PROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT` (protobuf's headers otherwise pick a layout the system library
+  does not have). The `clang-asan` lane runs the unit, architecture, plugin and fuzz-corpus suites; exclusions are
+  explicit: benchmarks (timing code) and the daemon suites `python` and `integration`. One scoped attribute:
+  `BpfProgram::Matches` is exempt from UBSan's `-fsanitize=function`, whose check reads the 8 bytes before the
+  called function for a type signature; DPDK's JIT code starts a fresh mapping, so that read faulted on the
+  unmapped page before it (seen 1 run in 5).
+- **TSan, targeted.** `clang-tsan` builds with `RTE_USE_C11_MEM_MODEL RTE_FORCE_INTRINSICS` and runs the concurrency
+  tests in `tools/sanitizers/tsan_tests.txt` (RCU, object tables, scopes, the transaction engine, handoff,
+  continuations, shared flow table, decision cache, stats, L2 table, routes, concurrent exact table, MCS lock), with
+  one suppression (rte_hash's uninstrumented key compare). FDB, neighbor table, expiry wheel, offload owner and the
+  instance registry are single-owner by contract; their publication is covered through RCU, Router and transactions.
+- **Fuzzing.** Ten libFuzzer harnesses (packet cursor, mutation, checksum plan, classifier schema, resource codec,
+  route prefix, conntrack, NAT, tunnel decap, control transactions), each with an oracle beyond "no crash", none
+  needing the EAL; `-Dbuild_fuzzers=true`; gcc builds replay the corpus; the `fuzz` suite replays the committed seeds
+  in every lane that builds fuzzers, so a past crash stays fixed.
+- **Fault injection.** One utility, `bess::fault_injection::AllocationFaults` and `ForEachFailurePoint`, replacing
+  all twenty global allocation forms, linked into opt-in tests only; under TSan (whose runtime owns `operator new`)
+  it injects nothing and the TSan list excludes those cases.
+- **Models.** Every stateful battery has a reference model written from its contract (not its code): decision
+  cache generations, conntrack connection table and Linux's TCP table, NAT bindings with expiry, FDB in full.
+- **Static analysis.** `.clang-tidy` enables bugprone, selected performance, CERT integer and string, narrowing,
+  virtual destructors, slicing and core analyzer checks, with each disabled check's reason in the file. Readability
+  and modernize are off. `tools/check_tidy.py` counts findings per (file, check), clang-analyzer included, against
+  `tools/tidy_baseline.json` and fails on any change, so the baseline only shrinks. The baseline records the
+  clang-tidy major version it was made with; the gate runs in the `clang-asan` lane with CI's pin (clang-tidy-19)
+  and, with any other version, only reports. The committed baseline is clang-tidy 22's (this machine): the first CI
+  run reports clang-tidy 19's counts and the baseline is replaced with them, which turns the CI gate on.
+
+**Found and fixed** (each with a regression test where one fits):
+- Fuzzing: `ParseIpv4Address` wrapped out-of-range parts; `endian.h` bound references to misaligned packed fields;
+  `PacketCursor` broke on a leading empty segment; `EditPlanBuilder` accepted an IPv4 checksum over per-packet words
+  and wrapped RemovePrefix at 16 bits; NAT's ICMP rewrite could write checksum 0x0000; `checksum.h` misaligned
+  loads (fixed in M21).
+- Fault injection: `Fdb::Create` and `Nat::Create` threw instead of returning out-of-memory; the neighbor table lost
+  a binding or left an empty entry on a refused allocation; `ConcurrentExactTable` leaked its rte_hash;
+  `LpmRouteTable` leaked on a failed create and could keep a route without its shadow entry; Router removals could
+  leave an id retiring forever; the transaction engine allocated its result after publishing (an applied transaction
+  could throw); `FlowRuleOwner` leaked handles and MARKs on a throwing backend. The old private hooks stopped early:
+  59 / 98 / 30 failure points against 75 / 124 / 39 now.
+- Models: conntrack accepted TCP flag combinations Linux rejects (user decision: now Linux's `tcp_error()` filter).
+- ASan: `l2_table` called `aligned_alloc` with a size not a multiple of the alignment; `ExactMatchTable` key
+  extraction loaded and stored misaligned `uint64_t`s (now memcpy); test buffers too small for 8-byte field reads.
+- TSan: `RcuDomain::ReclaimReady` ran destructors under the retire mutex, against `RcuPtr::Publish`'s order (a
+  lock-order inversion; a destructor that retires would deadlock), now outside it; `Synchronize` went through
+  DPDK's uninstrumented `rte_rcu_qsbr_synchronize`, hiding its ordering from TSan, now the inline start and check.
+  `rte_rcu_qsbr_check` can answer from `acked_token`, a relaxed copy another checker wrote: no happens-before edge
+  from the readers' reports reaches that caller (benign on hardware, where the reclaimer's writes depend on the
+  check). Under TSan only, `RcuDomain` releases on each report and acquires on each completed check, which is the
+  edge a grace period means; it is compiled out of every other build.
+- clang-tidy: the trie's copy assignment kept children the source lacked; a `pthread_sigmask` error check that
+  could never fire; `enable_if` constraints in `bits.h` that constrained nothing.
+
+**Evidence** (the branch as merged, this machine, 20 CPUs):
+- fast tree (gcc): build clean with `-Werror`; `meson test` (unit suites) on CPU 0 alone 130/130; on CPUs 0-1
+  129/130. The miss is `dataplane_handoff_threads_test` hitting its 25 s deadline: unchanged by M22, it slows by
+  100x or more when busy processes share its CPU (reproduced with three spinning processes on CPU 0: tests that
+  take 40 ms take 5-10 s, one run in six past the deadline); a sleep-every-64th-yield backoff did not change the
+  times and was not kept. Follow-up, not a product defect.
+- clang ASan+UBSan: 130 tests, 129 passed in the full run; the one failure was `utils_bpf_program_test` (the
+  `-fsanitize=function` read above), then 30/30 runs with the attribute and without the earlier use-after-return
+  flag.
+- clang TSan: 18 binaries, 0 reports (the shared flow table's 3 reports before the RCU annotation; 10 more runs
+  of it and of `rcu_rcu_test`, 0 reports).
+- Fuzz: build clean, the `fuzz` corpus suite 10/10, `checksum_plan` and `tunnel_decap` 120 s each with no crash
+  (836k and 3.1M executions).
+- clang-tidy 22: `check_tidy.py --report` produced the committed baseline, 288 findings in 88 files (2
+  clang-analyzer); the first CI run gives clang-tidy 19's counts.
+- `check_includes.py`: 0 forbidden edges; `check_arch.py`: 7 allowlisted findings, no growth.
+
+**Review:** REVIEW
+
+**Not done.** bessd under ASan (the daemon suites); TSan over a running
+daemon (the concurrency logic is covered in isolated components, which the roadmap allows); clang-tidy findings in
+the baseline (288 in 88 files with clang-tidy 22) are reviewed debt, removed as files are touched; a property test over the control
+transaction decoder beyond its fuzzer; `dataplane_handoff_threads_test` under CPU oversubscription (above).
+
+**Revisit when:** the sanitizer lanes are green for a week (make them gating); a new stateful battery lands (it needs
+a model, fault injection and, if shared, a TSan entry before it is called stable).
 

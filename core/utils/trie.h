@@ -56,6 +56,7 @@ class Trie {
 
   Trie() : root_() {}
   Trie(const Trie& t) : root_(t.root_) {}
+  Trie& operator=(const Trie& t) = default;
 
   // Inserts a string into the trie, associating the key
   // with the value.

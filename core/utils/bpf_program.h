@@ -34,6 +34,12 @@ class BpfProgram {
   BpfProgram(const BpfProgram &) = delete;
   BpfProgram &operator=(const BpfProgram &) = delete;
 
+  // UBSan's -fsanitize=function reads the 8 bytes before a called function
+  // for its type signature; JIT code starts a fresh mapping, so the read can
+  // fault on the page before it (M22, D-072). Exempt the one indirect call.
+#if defined(__clang__)
+  __attribute__((no_sanitize("function")))
+#endif
   bool Matches(struct rte_mbuf *pkt) const {
     const uint64_t ret = jit_ != nullptr ? jit_(pkt) : rte_bpf_exec(bpf_, pkt);
     return ret != 0;

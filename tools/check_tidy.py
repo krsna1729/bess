@@ -27,7 +27,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "tools" / "tidy_baseline.json"
-WARNING = re.compile(r"^(?P<file>[^:\s][^:]*):(?P<line>\d+):\d+: (?:warning|error): .* \[(?P<checks>[a-z0-9.,\-]+)\]$")
+WARNING = re.compile(r"^(?P<file>[^:\s][^:]*):(?P<line>\d+):(?P<col>\d+): (?:warning|error): .* \[(?P<checks>[A-Za-z0-9.,\-]+)\]$")
 EXCLUDED = re.compile(r"(_test|_bench|_fuzz)\.cc$|/gtest_main\.cc$|/fuzz/|/protobuf/|\.pb\.cc$")
 
 
@@ -57,7 +57,8 @@ def parse(output, build_dir=ROOT):
         m = WARNING.match(line.strip())
         if not m:
             continue
-        key_line = (os.path.normpath(os.path.join(build_dir, m.group("file"))), m.group("line"), m.group("checks"))
+        key_line = (os.path.normpath(os.path.join(build_dir, m.group("file"))), m.group("line"),
+                    m.group("col"), m.group("checks"))
         if key_line in seen:  # a header's finding repeats for every source that includes it
             continue
         seen.add(key_line)
@@ -85,14 +86,23 @@ def run_tidy(build_dir, source):
     return r.stdout
 
 
-def to_json(counts):
+def tidy_major():
+    out = subprocess.run([clang_tidy(), "--version"], capture_output=True, text=True).stdout
+    m = re.search(r"version (\d+)\.", out)
+    return int(m.group(1)) if m else 0
+
+
+def to_json(counts, major):
     files = {}
     for (f, check), n in sorted(counts.items()):
         files.setdefault(f, {})[check] = n
     return {"_comment": [
         "clang-tidy findings (.clang-tidy profile) that predate the M22 gate (D-072).",
         "tools/check_tidy.py fails on any count above or below an entry, so this list only shrinks.",
-        "Edited by hand and reviewed; `tools/check_tidy.py --report` prints the current counts."],
+        "Edited by hand and reviewed; `tools/check_tidy.py --report` prints the current counts.",
+        "Counts are those of one clang-tidy major version (clang_tidy_major): CI's pin; another version's",
+        "findings differ, so the gate compares only with that version and otherwise reports."],
+        "clang_tidy_major": major,
         "files": files}
 
 
@@ -111,9 +121,10 @@ def compare(current, baseline):
 
 def load_baseline():
     if not BASELINE.exists():
-        return {}
+        return 0, {}
     data = json.loads(BASELINE.read_text())
-    return {(f, c): n for f, checks in data.get("files", {}).items() for c, n in checks.items()}
+    return data.get("clang_tidy_major", 0), {
+        (f, c): n for f, checks in data.get("files", {}).items() for c, n in checks.items()}
 
 
 def self_test():
@@ -122,13 +133,15 @@ def self_test():
         "../../core/a.h:3:5: warning: x [bugprone-use-after-move]",  # same line, relative path, second TU
         f"{ROOT}/core/b.cc:1:1: warning: y [performance-move-const-arg,bugprone-foo]",
         "/usr/include/x.h:1:1: warning: z [bugprone-bar]",
+        f"{ROOT}/core/b.cc:9:2: warning: null [clang-analyzer-core.NullDereference]",  # capitals
+        f"{ROOT}/core/b.cc:9:7: warning: null [clang-analyzer-core.NullDereference]",  # same line, other column
         "not a warning",
     ])
     counts = parse(out, ROOT / "build" / "x")
     assert counts == {("core/a.h", "bugprone-use-after-move"): 1, ("core/b.cc", "performance-move-const-arg"): 1,
-                      ("core/b.cc", "bugprone-foo"): 1}, counts
+                      ("core/b.cc", "bugprone-foo"): 1, ("core/b.cc", "clang-analyzer-core.NullDereference"): 2}, counts
     assert compare(counts, counts) == []
-    assert len(compare(counts, {})) == 3  # growth
+    assert len(compare(counts, {})) == 4  # growth
     grown = dict(counts)
     grown[("core/a.h", "bugprone-use-after-move")] = 2
     assert "new finding" in compare(grown, counts)[0]
@@ -153,21 +166,26 @@ def main():
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         output = "\n".join(pool.map(lambda s: run_tidy(args.build_dir, s), sources))
     counts = parse(output, Path(args.build_dir).resolve())
+    major = tidy_major()
     if args.report:
-        print(json.dumps(to_json(counts), indent=2))
+        print(json.dumps(to_json(counts, major), indent=2))
+        return 0
+    base_major, baseline = load_baseline()
+    if base_major != major:
+        # Another clang-tidy finds other things: comparing would fail on counts
+        # nobody introduced. Report instead; the gate is CI's, with its pin.
+        print(f"NOTICE: clang-tidy {major} here, the baseline is clang-tidy {base_major}'s: the gate is not "
+              "applied. Current counts in the baseline's format:")
+        print(json.dumps(to_json(counts, major), indent=2))
         return 0
     if args.files:
-        baseline = {k: v for k, v in load_baseline().items() if re.search(args.files, k[0])}
-    else:
-        baseline = load_baseline()
+        baseline = {k: v for k, v in baseline.items() if re.search(args.files, k[0])}
     problems = compare(counts, baseline)
     if problems:
         print(f"FAILED: clang-tidy findings differ from {BASELINE.name} ({len(problems)} problem(s)):")
         print("\n".join(problems))
-        version = subprocess.run([clang_tidy(), "--version"], capture_output=True, text=True).stdout
-        print(f"Current counts ({version.strip().splitlines()[-1] if version.strip() else 'clang-tidy'}), "
-              "in the baseline's format, for review:")
-        print(json.dumps(to_json(counts), indent=2))
+        print(f"Current counts (clang-tidy {major}), in the baseline's format, for review:")
+        print(json.dumps(to_json(counts, major), indent=2))
         return 1
     total = sum(counts.values())
     print(f"OK: {len(sources)} sources; {total} baselined finding(s) in {len({f for f, _ in counts})} file(s); "

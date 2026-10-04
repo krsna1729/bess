@@ -5037,6 +5037,13 @@ rather than one call site).
      allowlist (204 findings in 39 files -> 7 in 4, the BPF JIT). Experimental ARM64 and generic CI lanes. Header
      checksums faster than before; raw 64-byte UDP/TCP sums 0.27-0.6 ns slower (follow-up).
 
+160. **M22 hardening (D-072).** ASan+UBSan now runs with the DPDK EAL (130 tests instead of the EAL-free
+     subset), TSan over 18 concurrency binaries (0 reports after the RCU fixes and annotation), ten fuzz harnesses with oracles,
+     one fault-injection utility with failure-at-every-point tests for every stateful battery, reference models for
+     the decision cache, conntrack (Linux's TCP table), NAT and FDB, and a curated clang-tidy gate with a shrink-only
+     baseline. About thirty real bugs fixed along the way (D-072 lists them). New experimental CI lanes: clang-asan
+     (with tidy) and clang-tsan.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

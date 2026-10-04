@@ -9,6 +9,22 @@
 
 #include "utils/logging.h"
 
+#if defined(__SANITIZE_THREAD__)
+// rte_rcu_qsbr_check() answers from acked_token, a relaxed copy another checker
+// wrote, so a thread whose check takes that path has no happens-before edge
+// from the readers' quiescent reports (benign on hardware: the reclaimer's
+// writes are control-dependent on the check). ThreadSanitizer would report
+// every reuse of reclaimed memory; these give it the edge the grace period
+// means. Compiled out of every other build.
+extern "C" void __tsan_acquire(void *addr);
+extern "C" void __tsan_release(void *addr);
+#define BESS_RCU_REPORT(qsbr) __tsan_release(qsbr)
+#define BESS_RCU_OBSERVE(qsbr) __tsan_acquire(qsbr)
+#else
+#define BESS_RCU_REPORT(qsbr) ((void)0)
+#define BESS_RCU_OBSERVE(qsbr) ((void)0)
+#endif
+
 namespace bess {
 namespace rcu {
 
@@ -125,6 +141,7 @@ void RcuDomain::Offline(ReaderId id) {
   // the call left a stray report holding every grace period (external audit,
   // 2026-09-27: a never-resumed worker blocked reclamation, and past the
   // retire high-water mark Synchronize() hung the control plane).
+  BESS_RCU_REPORT(qsbr_);
   rte_rcu_qsbr_thread_offline(qsbr_, id);
   online_[id] = 0;
 }
@@ -163,6 +180,7 @@ void RcuDomain::Quiescent(ReaderId id) {
   if (id >= max_readers_) {
     return;
   }
+  BESS_RCU_REPORT(qsbr_);
   rte_rcu_qsbr_quiescent(qsbr_, id);
 }
 
@@ -182,7 +200,11 @@ bool RcuDomain::IsGracePeriodComplete(GracePeriod token) const {
   // Non-blocking check: has every online reader passed a quiescent state since
   // the token was issued? With no online readers this is immediately true,
   // which is what lets a paused (or not yet started) runtime reclaim.
-  return rte_rcu_qsbr_check(qsbr_, token, 0) != 0;
+  if (rte_rcu_qsbr_check(qsbr_, token, 0) == 0) {
+    return false;
+  }
+  BESS_RCU_OBSERVE(qsbr_);
+  return true;
 }
 
 bool RcuDomain::IsComplete(GracePeriod token) const {
@@ -202,6 +224,7 @@ void RcuDomain::Synchronize() {
   // ThreadSanitizer sees them (the library function is not instrumented, so
   // every reclaim after it looked like a race with the readers; M22).
   rte_rcu_qsbr_check(qsbr_, rte_rcu_qsbr_start(qsbr_), true);
+  BESS_RCU_OBSERVE(qsbr_);
 
   std::lock_guard<std::mutex> lock(retire_mutex_);
   stats_.grace_periods_completed++;

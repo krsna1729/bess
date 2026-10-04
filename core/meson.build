@@ -773,18 +773,6 @@ foreach source : unit_test_sources
   if source in allocation_fault_tests
     test_link_whole = [test_link_whole, allocation_faults_lib]
   endif
-  # Sanitizer exclusions, each scoped to one test and with its reason (M22,
-  # D-072); everything else in the test stays instrumented.
-  test_cpp_args = []
-  if get_option('b_sanitize').contains('address') and source == 'utils/bpf_program_test.cc'
-    # DPDK's BPF JIT (uninstrumented) faults when the test's mbuf chain lives
-    # on ASan's fake stack (use-after-return detection); the same test passes
-    # with a real stack frame. Open question whether the JIT reads past the
-    # chain: tracked as a follow-up in D-072.
-    # (get_supported_arguments cannot test this flag: it needs -fsanitize=address.)
-    test_cpp_args += cpp.get_id() == 'clang' ? ['-fsanitize-address-use-after-return=never']
-                                             : ['--param=asan-use-after-return=0']
-  endif
   # The test main is ours (core/gtest_main.cc) rather than the packaged one:
   # it configures the death-test style and keeps expected-death children from
   # writing core dumps.
@@ -793,7 +781,6 @@ foreach source : unit_test_sources
     source,
     'gtest_main.cc',
     include_directories: core_include,
-    cpp_args: test_cpp_args,
     link_with: test_link_with,
     link_whole: test_link_whole,
     dependencies: runtime_deps + [gtest_dep],
