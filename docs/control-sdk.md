@@ -1,4 +1,4 @@
-# Control SDK (`pybess.sdk`, M27)
+# Control SDKs (`pybess.sdk`, Go `sdk/go`, M27)
 
 A thin client over the generic control API (`protobuf/control_v2.proto`). It
 adds no semantics of its own: resources are whatever modules registered
@@ -17,7 +17,25 @@ with client.transaction(expected_generation=g) as tx:
 print(tx.result.generation)                   # committed on a clean exit
 ```
 
-## What it guarantees
+Go (`github.com/krsna1729/bess/sdk/go/bess`), the same guarantees with Go
+errors (`*ConflictError`, `*RejectedError`, `*BusyError`, `*TransportError`,
+`*DaemonRestartedError`, `*InvalidRequestError`):
+
+```go
+client, err := bess.Dial("localhost:10514")
+rules, err := client.Resource(ctx, "em0/rules")
+tx := client.Transaction(bess.WithExpectedGeneration(g))
+err = tx.Upsert(rules, key, value)     // any proto.Message, types checked
+applied, err := tx.Commit(ctx)
+```
+
+The Go module carries its generated `control_v2` code (`sdk/go/controlv2`),
+made by `tools/gen_go_sdk.sh` in a pinned container; CI regenerates it and
+fails on any difference, so it never drifts from the `.proto`. Keys and values
+of module resources need no generated Go types: any `proto.Message` works,
+including `dynamicpb` messages built from a descriptor set.
+
+## What they guarantee
 
 | Situation | What the SDK does |
 |---|---|
@@ -48,12 +66,14 @@ Consistency: `client.transaction(snapshot=True)` asks for
 
 ## Tests
 
-`pybess/test_sdk.py` scripts every recovery path against a fake stub (the
-`python` suite); `bessctl/module_tests/control_sdk.py` runs a transaction,
-a replay, a conflict and a client-side type refusal against a live daemon
-(the `integration` suite).
+`pybess/test_sdk.py` and `sdk/go/bess/client_test.go` script every recovery
+path against a fake transport (the `python` suite; the CI job "Go SDK", with
+the race detector). Against a live daemon (the `integration` suite):
+`bessctl/module_tests/control_sdk.py` (Python) and `control_sdk_go.py`, which
+runs the Go client (`go test -tags live`) to commit a rule, replay it, meet a
+conflict and refuse a mistyped key, then checks the rule steers packets.
 
 ## Not yet
 
-A Go client with the same guarantees; streaming transactions (the protocol
-has no stream yet). Both follow this contract when they come.
+Streaming transactions (the protocol has no stream yet); it will follow this
+contract when it comes.
