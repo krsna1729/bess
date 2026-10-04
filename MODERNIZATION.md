@@ -5035,7 +5035,7 @@ rather than one call site).
      bulk sum, L2 probe, tag match, cuckoo AVX2, HTTP scan). Memory ordering moved from x86 TSO assumptions to C++
      atomics. DPDK machine flags filtered; `bess-dev.pc` carries bessd's ISA. `check_arch.py` with a shrink-only
      allowlist (204 findings in 39 files -> 7 in 4, the BPF JIT). Experimental ARM64 and generic CI lanes. Header
-     checksums 4-17% slower on small packets: next change.
+     checksums faster than before; raw 64-byte UDP/TCP sums 0.27-0.6 ns slower (follow-up).
 
 ## Review process established this session
 

@@ -6273,7 +6273,9 @@ findings in 39 files outside any boundary; every translation unit that included 
   (meson `-Darch_generic=true`) forces every kernel onto its portable path, so an x86 build compiles and tests the
   code other architectures run.
 - Portable by default; a kernel stays architecture-specific only where an isolated A/B showed the portable version
-  materially slower: the checksum bulk sum (portable was 26-62% slower on 64 B-2 KB buffers), the L2 4-slot probe
+  materially slower: the checksum bulk sum (portable was 26-62% slower on 64 B-2 KB buffers), the header and
+  pseudo-header sums (`AddWords32`: an add/adc chain over memcpy-loaded values; portable C was 7% slower on the IPv4
+  header and 4-17% on 64-byte UDP/TCP packets), the L2 4-slot probe
   (AVX2 candidate filter + the base's atomic re-check), the flow tag match (SSE2), the cuckoo AVX2 helper (D-034's
   runtime dispatch, moved unchanged), the HTTP SSE4.2 token scan. Copy, mask, VLAN tag insert/remove (GCC/Clang vector
   extensions: one source, same x86 instructions), packet-pool rearm (memcpy; one 32-byte store) and CRC32C (instruction
@@ -6305,20 +6307,30 @@ findings in 39 files outside any boundary; every translation unit that included 
   "contamination" by the wrapper, a shared machine): L2 forced-body and default rows 0.991-1.020, no clear
   difference (the first portable probe was +5.0-5.7%, rejected); flow 12/12 no clear difference; packet pool bulk
   9.5% faster; VLAN push/pop 0.985-0.989; copy and mask kernels instruction-identical (two copy rows and some mask
-  rows moved +/-8-13%: code placement); `BatchForward` 6.7% faster; checksum bulk sums no clear difference;
-  `ComputeChecksums` 4-13% faster. **Slower:** IPv4 header checksum 7.1-7.3%, `RawBess` 64 B with L4 checksums 9-17%,
-  `Validated` 64 B with L4 3.6-4.3% (the header and pseudo-header sums are portable C; GCC does not produce the old
-  adc chain). See Not done.
+  rows moved +/-8-13%: code placement); `BatchForward` 6.7% faster; `ComputeChecksums` 4-13% faster.
+  Checksums against develop (final code, `utils_checksum_bench` all rows, `packet_checksum_bench` RawBess/ValidatedBess
+  contiguous rows): IPv4 header -4.2%, TCP/60 -4.9%, TCP/787 -3.6%, source IP/port update -8.8%, network-only
+  `RawBess` -16.6 to -17.1%; bulk sums and every `ValidatedBess` row no clear difference. **Slower:** `RawBess` 64-byte
+  rows with L4 checksums, +5.5 to +11.7% (0.27-0.6 ns; 1500 and 4096 B no clear difference). The x86 code is
+  instruction-for-instruction the old chain plus a stack frame the compiler now sets up for the inlined AVX2 block;
+  two attempts to move that block out of line made other rows 3-44% slower and were dropped. Machine shared; wrapper
+  verdict "contamination" on every run (CPU 2: 47-60k thermal, 4.5-7k function-call interrupts).
 - Mutants: slice a 7/7; b1 every non-equivalent caught (28 run, 2 equivalent); b2 18 of 21 caught, 3 survive as
   predicted (the non-AVX2 dispatcher branch is not executed on an AVX2 host; trusting a candidate without the atomic
   re-check and a missing acquire fence cannot show in single-threaded x86 tests); slice c 26/27 (the uncaught one
   deletes the configure check itself).
-- Tests: integrated tree, fast and generic builds, unit suites at `taskset -c 0` and `-c 0,1`: VERIFY.
+- Tests: integrated tree, fast and generic builds rc 0; full unit suites (without the daemon suites) at
+  `taskset -c 0,1` pass in both trees; at `-c 0`, 4-5 concurrency stress tests fail on develop too (0/5 on develop
+  and here; fixed separately, those tests only). The new MCS-lock test was sized to the CPUs it may use (it hit the
+  30 s timeout with 4 threads on 2 CPUs).
 
-**Review:** REVIEW
+**Review** (reviewer agent): correct, go (memory ordering on arm64, the probe under the C++ model, checksum kernels
+and asm constraints, build and CI); two optional findings taken: `__cacheline_aligned` kept a GNU attribute so it may
+follow a definition, and this record's checksum numbers updated to the final code.
 
-**Not done.** The header and pseudo-header checksum regression (an x86 kernel for those sums is the next change);
-ARM64 runs only in CI; NEON versions of the tag and word kernels (arm64 uses the portable loops; untestable here).
+**Not done.** The 64-byte raw L4 checksum residual (0.27-0.6 ns), to be found with a profile rather than layout
+trials; ARM64 runs only in CI; on arm64 `rdtsc()` reads CNTVCT_EL0 (25 MHz to 1 GHz by part), so cycle-based
+accounting is coarser there; NEON versions of the tag and word kernels (arm64 uses the portable loops; untestable here).
 
 **Revisit when:** the ARM64 lanes are green (make them gating); a profile shows an arm64 kernel worth specialising.
 
