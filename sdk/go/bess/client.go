@@ -357,18 +357,22 @@ func (c *Client) Supports(ctx context.Context, rpc string) (bool, error) {
 }
 
 // WatchEvents streams operational events (control_v2.WatchEvents), oldest
-// first, from `from` (0: the next event); with types, only those (gaps
+// first, from `from` (0: the next event); to resume from a saved sequence,
+// pass the epoch it belongs to (0: unknown). With types, only those (gaps
 // always). A "bess.gap" event names events the daemon no longer held. After a
-// transport failure the stream resumes after the last event delivered. The
-// event channel closes when ctx ends or on an error, which is sent on the
-// error channel first: DaemonRestartedError when the daemon restarted (what
-// was built from earlier events is gone: re-read the state, watch from 0).
-func (c *Client) WatchEvents(ctx context.Context, from uint64, types ...string) (<-chan *pb.Event, <-chan error) {
+// transport failure the stream resumes where it stopped, even before its
+// first event. The event channel closes when ctx ends or on an error; then
+// the error channel yields the error, if any, and closes: DaemonRestartedError
+// when the daemon restarted (what was built from earlier events is gone:
+// re-read the state, watch from 0). "bess.start" and "bess.progress" are not
+// delivered.
+func (c *Client) WatchEvents(ctx context.Context, from, epoch uint64, types ...string) (<-chan *pb.Event, <-chan error) {
 	events := make(chan *pb.Event)
 	errc := make(chan error, 1)
 	go func() {
+		defer close(errc)
 		defer close(events)
-		next, epoch := from, uint64(0)
+		next := from
 		backoff := c.retry.BusyBackoff
 		for ctx.Err() == nil {
 			stream, err := c.t.watch(ctx, &pb.WatchEventsRequest{FromSequence: next, Types: types, DaemonEpoch: epoch})
@@ -383,9 +387,16 @@ func (c *Client) WatchEvents(ctx context.Context, from uint64, types ...string) 
 					return
 				}
 				epoch = e.GetDaemonEpoch()
-				if e.GetType() == "bess.gap" {
+				switch e.GetType() {
+				case "bess.start":
+					next = e.GetSequence()
+					continue
+				case "bess.progress":
+					next = e.GetSequence() + 1
+					continue
+				case "bess.gap":
 					next = e.GetGapTo()
-				} else {
+				default:
 					next = e.GetSequence() + 1
 				}
 				select {

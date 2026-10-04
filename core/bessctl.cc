@@ -1180,7 +1180,9 @@ void ApiServer::Run() {
   // returns, so Shutdown() is not left waiting for it.
   auto shutdown = [&server]() {
     bess::runtime::runtime().events().Close();
-    server->Shutdown();
+    // A deadline: a stream blocked writing to a client that stopped reading
+    // is cancelled then, not waited for.
+    server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(3));
   };
   service.set_shutdown_func(shutdown);
   {

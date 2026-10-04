@@ -63,6 +63,16 @@ class BessEventsTest(BessModuleTestCase):
         self.assertTrue(first.sequence == 1 or first.type == 'bess.gap', first)
 
 
+    def test_a_sequence_this_daemon_never_reached_is_a_restart(self):
+        # A controller resuming from a sequence it saved before a restart:
+        # told so, not left waiting for sequences that will mean other events.
+        client = sdk.Client(self.bess.peer)
+        client.resources(refresh=True)
+        with self.assertRaises(sdk.DaemonRestarted):
+            next(client.watch_events(from_sequence=10 ** 12, daemon_epoch=client.daemon_epoch,
+                                     reconnect=False))
+
+
 suite = unittest.TestLoader().loadTestsFromTestCase(BessEventsTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)
 

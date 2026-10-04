@@ -360,9 +360,13 @@ message GetCapabilitiesResponse {
 // -- Operational events (M25 phase 2, D-084) -----------------------------
 //
 // Pushed: control-plane observations, never per-packet logs. A stream starts
-// at `from_sequence` (0: the next event) and, when what it asked for is older
-// than the daemon still holds, first gets one event of type "bess.gap" naming
-// the lost range. Sequences restart with the daemon (daemon_epoch).
+// at `from_sequence` (0: the next event). Stream-control events, all with
+// source "bessd": "bess.start" first (its sequence is where the stream starts,
+// with the daemon_epoch); "bess.restart" before it when the caller's sequence
+// or epoch is from before a restart (the stream then starts live);
+// "bess.gap" when what was asked for is older than the daemon still holds;
+// "bess.progress" (with a types filter) carrying the last sequence passed
+// over, so a reconnect resumes there. Sequences restart with the daemon.
 
 message WatchEventsRequest {
   uint64 from_sequence = 1;

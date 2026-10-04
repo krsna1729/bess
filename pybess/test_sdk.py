@@ -92,12 +92,16 @@ class SdkTest(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.requests = []
+                start = lambda seq: v2.Event(type='bess.start', sequence=seq, daemon_epoch=1)
                 self.script = [
-                    [v2.Event(sequence=5, type='a', daemon_epoch=1),
+                    # Fails before its first event: resumes from where it started.
+                    [start(5), FakeRpcError(grpc.StatusCode.UNAVAILABLE)],
+                    [start(5), v2.Event(sequence=5, type='a', daemon_epoch=1),
                      v2.Event(sequence=6, type='b', daemon_epoch=1),
                      FakeRpcError(grpc.StatusCode.UNAVAILABLE)],
-                    [v2.Event(type='bess.gap', gap_from=7, gap_to=9, daemon_epoch=1),
+                    [start(7), v2.Event(type='bess.gap', gap_from=7, gap_to=9, daemon_epoch=1),
                      v2.Event(sequence=9, type='c', daemon_epoch=1),
+                     v2.Event(type='bess.progress', sequence=14, daemon_epoch=1),
                      FakeRpcError(grpc.StatusCode.UNAVAILABLE)],
                     [v2.Event(type='bess.restart', daemon_epoch=2)],
                 ]
@@ -116,8 +120,8 @@ class SdkTest(unittest.TestCase):
             for event in client.watch_events(from_sequence=5):
                 seen.append(event.type)
         self.assertEqual(seen, ['a', 'b', 'bess.gap', 'c'])
-        self.assertEqual(stub.requests, [(5, 0), (7, 1), (10, 1)],
-                         'resumed after the last event, under the epoch seen')
+        self.assertEqual(stub.requests, [(5, 0), (5, 1), (7, 1), (15, 1)],
+                         'resumed where it stopped, under the epoch seen, past filtered events')
         self.assertEqual(client.daemon_epoch, 2)
 
     def test_supports_reads_the_daemons_rpcs_and_an_old_daemon_supports_nothing_new(self):

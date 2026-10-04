@@ -61,7 +61,11 @@ class EventHub {
  public:
   static constexpr int kMaxWorkers = 64;
 
-  explicit EventHub(size_t log_capacity = 65536, size_t ring_capacity = 256);
+  // The log's events are heap objects (strings and a field map): about
+  // 0.5 KiB each, so the default 16384 holds about 8 MiB when full. Worker
+  // events reach the log only through DrainWorkers (the maintenance loop):
+  // with the loop off, a worker's 257th event is refused and counted.
+  explicit EventHub(size_t log_capacity = 16384, size_t ring_capacity = 256);
   ~EventHub();
   EventHub(const EventHub &) = delete;
   EventHub &operator=(const EventHub &) = delete;

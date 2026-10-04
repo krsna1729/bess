@@ -236,16 +236,19 @@ class Client:
             raise
         return any(r == rpc or r.endswith('/' + rpc) for r in rpcs)
 
-    def watch_events(self, from_sequence=0, types=(), reconnect=True):
+    def watch_events(self, from_sequence=0, types=(), reconnect=True, daemon_epoch=0):
         """Operational events (control_v2.WatchEvents), oldest first, until
         the caller stops iterating.
 
-        Starts at `from_sequence` (0: the next event). A "bess.gap" event names
-        events the daemon no longer held. After a transport failure the stream
-        resumes after the last event seen (`reconnect`); if the daemon
-        restarted meanwhile, DaemonRestarted is raised: what the caller built
-        from earlier events is gone; re-read the state and watch from 0."""
-        next_sequence, epoch = from_sequence, None
+        Starts at `from_sequence` (0: the next event); to resume from a saved
+        sequence, pass the epoch it belongs to. A "bess.gap" event names events
+        the daemon no longer held. After a transport failure the stream resumes
+        where it stopped (`reconnect`), even before its first event. When the
+        daemon restarted, DaemonRestarted is raised: what the caller built from
+        earlier events is gone; re-read the state and watch from 0. The
+        stream-control events "bess.start" and "bess.progress" are not yielded.
+        """
+        next_sequence, epoch = from_sequence, daemon_epoch or None
         backoff = self._retry.busy_backoff
         while True:
             request = v2.WatchEventsRequest(from_sequence=next_sequence, types=list(types),
@@ -258,6 +261,12 @@ class Client:
                         raise DaemonRestarted('events of daemon epoch %s ended: the daemon is '
                                               'now at epoch %d' % (epoch, event.daemon_epoch))
                     epoch = event.daemon_epoch
+                    if event.type == 'bess.start':
+                        next_sequence = event.sequence
+                        continue
+                    if event.type == 'bess.progress':
+                        next_sequence = event.sequence + 1
+                        continue
                     next_sequence = event.gap_to if event.type == 'bess.gap' else event.sequence + 1
                     yield event
                 return

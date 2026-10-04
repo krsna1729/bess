@@ -7128,12 +7128,19 @@ worker ever waiting. Design: `.scratch/design/m25_observability.md` section 2.
 - The log: the last 65,536 events, each with a sequence (gapless per daemon epoch), monotonic time, generation, type,
   source and string fields. Control-plane events are appended directly: a `bess.transaction` per transaction the
   daemon decided (outcome, request id, operations, generation; a replay decided nothing new).
-- `control_v2.WatchEvents(from_sequence, types, daemon_epoch)`: server streaming from a sequence (0: the next event);
-  a reader behind the log first gets one `bess.gap` naming the lost range; a reader of another epoch first gets
-  `bess.restart`. The stream waits on the log, not the control lock; shutdown closes the log first, so no stream holds
-  the server.
-- SDK (Python generator, Go channel): resume after the last delivered event on a transport failure; a restart raises
-  `DaemonRestarted` (the caller's state from earlier events is gone; re-read and watch from 0).
+- `control_v2.WatchEvents(from_sequence, types, daemon_epoch)`: server streaming from a sequence (0: the next event).
+  Stream-control events: `bess.start` first (where the stream starts, under which epoch, so a client that loses the
+  stream before any event still resumes there); `bess.restart` before it when the caller's epoch differs or its
+  sequence was never reached (it is from before a restart); `bess.gap` when what was asked for is no longer held;
+  `bess.progress` with a types filter, the last sequence passed over, so a reconnect does not ask again for filtered
+  events. The stream waits on the log, not the control lock. Shutdown closes the log, then shuts the server down with a
+  3 s deadline, so a stream blocked writing to a client that stopped reading is cancelled.
+- SDK (Python generator, Go channel): resume where the stream stopped on a transport failure; a restart raises
+  `DaemonRestarted` (the caller's state from earlier events is gone; re-read and watch from 0); a saved sequence is
+  resumed with its epoch. Go closes its error channel when the stream ends.
+- Memory: 1 MiB of rings; the log holds 16,384 events of about 0.5 KiB (heap strings and fields), about 8 MiB full.
+  Worker events need the maintenance loop: with it off, a worker's ring fills after 256 events and the rest are
+  refused and counted.
 - Modules: `init_context().events()` behind `BESS_CAP_EVENTS`, the context's last member.
 
 **Evidence.** EVIDENCE

@@ -96,7 +96,7 @@ func TestLive(t *testing.T) {
 
 	wctx, stopWatching := context.WithCancel(ctx)
 	defer stopWatching()
-	events, _ := client.WatchEvents(wctx, 0, "bess.transaction")
+	events, _ := client.WatchEvents(wctx, 0, 0, "bess.transaction")
 	time.Sleep(300 * time.Millisecond) // the stream is open before the transaction
 
 	tx := client.Transaction()

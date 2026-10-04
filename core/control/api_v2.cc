@@ -516,8 +516,11 @@ grpc::Status ControlV2Service::WatchEvents(grpc::ServerContext *context,
   stats::EventHub &hub = runtime::runtime().events();
   const std::set<std::string> types(request->types().begin(), request->types().end());
   const uint64_t epoch = transactions_.epoch();
-  uint64_t next = request->from_sequence() != 0 ? request->from_sequence() : hub.next_sequence();
-  if (request->daemon_epoch() != 0 && request->daemon_epoch() != epoch) {
+  const uint64_t now_next = hub.next_sequence();
+  uint64_t next = request->from_sequence() != 0 ? request->from_sequence() : now_next;
+  // A sequence of another epoch, or one this daemon never reached, means the
+  // daemon restarted since the caller's sequence: say so, then go live.
+  if ((request->daemon_epoch() != 0 && request->daemon_epoch() != epoch) || next > now_next) {
     v2::Event restart;
     restart.set_type("bess.restart");
     restart.set_source("bessd");
@@ -525,7 +528,17 @@ grpc::Status ControlV2Service::WatchEvents(grpc::ServerContext *context,
     if (!writer->Write(restart)) {
       return grpc::Status::OK;
     }
-    next = hub.next_sequence();
+    next = now_next;
+  }
+  // Where this stream starts, before any event: a client that reconnects
+  // before the first event still resumes from here, under this epoch.
+  v2::Event start;
+  start.set_type("bess.start");
+  start.set_source("bessd");
+  start.set_daemon_epoch(epoch);
+  start.set_sequence(next);
+  if (!writer->Write(start)) {
+    return grpc::Status::OK;
   }
   while (!context->IsCancelled()) {
     // Short waits: cancellation is noticed within one.
@@ -541,10 +554,13 @@ grpc::Status ControlV2Service::WatchEvents(grpc::ServerContext *context,
         return grpc::Status::OK;
       }
     }
+    bool skipped = false, wrote = false;
     for (const stats::Event &e : got.events) {
       if (!types.empty() && types.count(e.type) == 0) {
+        skipped = true;
         continue;
       }
+      wrote = true;
       v2::Event out;
       out.set_sequence(e.sequence);
       out.set_daemon_epoch(epoch);
@@ -557,6 +573,18 @@ grpc::Status ControlV2Service::WatchEvents(grpc::ServerContext *context,
       }
       if (!writer->Write(out)) {
         return grpc::Status::OK;  // the client went away
+      }
+    }
+    if (skipped && !wrote) {
+      // Only filtered-out events: tell the client how far the stream got, so
+      // a reconnect does not ask for (and report a gap in) what it filtered.
+      v2::Event progress;
+      progress.set_type("bess.progress");
+      progress.set_source("bessd");
+      progress.set_daemon_epoch(epoch);
+      progress.set_sequence(got.next - 1);
+      if (!writer->Write(progress)) {
+        return grpc::Status::OK;
       }
     }
     next = got.next;

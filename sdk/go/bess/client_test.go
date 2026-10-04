@@ -446,13 +446,16 @@ func TestSupportsReadsTheDaemonsRPCsAndAnOldDaemonSupportsNothingNew(t *testing.
 
 func TestWatchEventsResumesAfterTheLastEventAndReportsARestart(t *testing.T) {
 	down := status.Error(codes.Unavailable, "down")
+	start := func(seq uint64) *pb.Event { return &pb.Event{Type: "bess.start", Sequence: seq, DaemonEpoch: 1} }
 	f := &fake{streams: []*scriptedStream{
-		{steps: []any{&pb.Event{Sequence: 5, Type: "a", DaemonEpoch: 1}, &pb.Event{Sequence: 6, Type: "b", DaemonEpoch: 1}, down}},
-		{steps: []any{&pb.Event{Type: "bess.gap", GapFrom: 7, GapTo: 9, DaemonEpoch: 1}, &pb.Event{Sequence: 9, Type: "c", DaemonEpoch: 1}, down}},
+		{steps: []any{start(5), down}}, // fails before its first event
+		{steps: []any{start(5), &pb.Event{Sequence: 5, Type: "a", DaemonEpoch: 1}, &pb.Event{Sequence: 6, Type: "b", DaemonEpoch: 1}, down}},
+		{steps: []any{start(7), &pb.Event{Type: "bess.gap", GapFrom: 7, GapTo: 9, DaemonEpoch: 1}, &pb.Event{Sequence: 9, Type: "c", DaemonEpoch: 1},
+			&pb.Event{Type: "bess.progress", Sequence: 14, DaemonEpoch: 1}, down}},
 		{steps: []any{&pb.Event{Type: "bess.restart", DaemonEpoch: 2}}},
 	}}
 	h := newHarness(f, 1)
-	events, errc := h.c.WatchEvents(context.Background(), 5)
+	events, errc := h.c.WatchEvents(context.Background(), 5, 0)
 	var seen []string
 	for e := range events {
 		seen = append(seen, e.GetType())
@@ -464,8 +467,24 @@ func TestWatchEventsResumesAfterTheLastEventAndReportsARestart(t *testing.T) {
 	if strings.Join(seen, ",") != "a,b,bess.gap,c" {
 		t.Fatalf("events %v", seen)
 	}
-	want := [][2]uint64{{5, 0}, {7, 1}, {10, 1}}
+	want := [][2]uint64{{5, 0}, {5, 1}, {7, 1}, {15, 1}}
 	if fmt.Sprint(f.watched) != fmt.Sprint(want) {
-		t.Fatalf("requests %v, want %v (resumed after the last event, under the epoch seen)", f.watched, want)
+		t.Fatalf("requests %v, want %v (resumed where it stopped, under the epoch seen)", f.watched, want)
+	}
+}
+
+func TestWatchEventsClosesItsErrorChannelWhenTheContextEnds(t *testing.T) {
+	f := &fake{streams: []*scriptedStream{{steps: []any{&pb.Event{Type: "bess.start", Sequence: 1, DaemonEpoch: 1},
+		&pb.Event{Sequence: 1, Type: "a", DaemonEpoch: 1}}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	events, errc := newHarness(f, 1).c.WatchEvents(ctx, 0, 0)
+	<-events
+	cancel()
+	for range events {
+	}
+	select {
+	case <-errc: // closed (or an error): the caller's '<-errc' returns
+	case <-time.After(5 * time.Second):
+		t.Fatal("the error channel stayed open after cancellation")
 	}
 }
