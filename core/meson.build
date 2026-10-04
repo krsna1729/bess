@@ -20,6 +20,7 @@ classifier_sources = files(
 
 flow_sources = files(
   'flow/owner.cc',
+  'flow/shared_exact_index.cc',
 )
 
 meter_sources = files(
@@ -518,6 +519,7 @@ core_public_subdir_headers = {
     'dataplane/member_select.h',
     'dataplane/object_table.h',
     'dataplane/resource.h',
+    'dataplane/resource_registry.h',
     'dataplane/scope.h',
     'dataplane/slot_resource.h',
     'dataplane/slot_table.h',
@@ -558,6 +560,8 @@ core_public_subdir_headers = {
     'flow/flow_types.h',
     'flow/owner.h',
     'flow/worker_flow_table.h',
+    'flow/shared_exact_index.h',
+    'flow/shared_flow_table.h',
   ),
   'meter': files(
     'meter/meter.h',

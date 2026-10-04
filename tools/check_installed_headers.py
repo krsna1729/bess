@@ -61,7 +61,6 @@ INTERNAL_FORBIDDEN = [
     "dataplane/transaction_engine.h",
     "classifier/concurrent_exact.h",
     "classifier/concurrent_masked.h",
-    "flow/shared_flow_table.h",
     # Generated protocol the public headers do not include.
     "pb/service.pb.h",
     "pb/control_v2.pb.h",

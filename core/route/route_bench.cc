@@ -427,7 +427,7 @@ void BM_RouterChange(benchmark::State &state) {
   bess::dataplane::TransactionEngine engine(domain);
   auto router =
       Router::Create("route_bench_tx", ConfigFor(1024), 64, domain).value();
-  if (enrolled && !router->Enroll(engine)) {
+  if (enrolled && !router->Enroll(engine.registry())) {
     state.SkipWithError("enroll failed");
     return;
   }

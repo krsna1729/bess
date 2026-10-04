@@ -19,21 +19,21 @@
 #include <rte_spinlock.h>
 
 #include "arch/cpu.h"
-#include "classifier/concurrent_exact.h"
 #include "flow/flow_key.h"
 #include "flow/flow_observer.h"
 #include "flow/flow_storage.h"
 #include "flow/flow_types.h"
+#include "flow/shared_exact_index.h"
 #include "flow/owner.h"
 #include "rcu/rcu_domain.h"
 #include "utils/common.h"
 
 // A flow table whose lookup is shared by every worker (roadmap M9, Decision
-// D-052; guide in docs/flow-state.md). NOT installed: it is built on
-// ConcurrentExactTable, which is internal until it is promoted.
+// D-052; guide in docs/flow-state.md). Installed (experimental): its
+// directory is a SharedExactIndex, which keeps the backend internal.
 //
-// The shape follows Decision D-028. The directory is a ConcurrentExactTable
-// (DPDK rte_hash, lock-free readers, QSBR-deferred delete) mapping the key to
+// The shape follows Decision D-028. The directory (a SharedExactIndex over
+// DPDK rte_hash: lock-free readers, QSBR-deferred delete) maps the key to
 // an eight-byte FlowHandle; the State lives in a fixed slot array of this
 // library's own, so it is not limited to rte_hash's eight-byte value and its
 // address is stable. Readers take no lock and execute no atomic
@@ -162,11 +162,9 @@ class SharedFlowTable {
     // The directory first: its failure must not follow a large allocation.
     // It holds one key per alias too, and deleted keys wait out a grace
     // period in it like slots do; CapacityFor adds the headroom.
-    auto directory = classifier::ConcurrentExactTable::Create(
-        static_cast<uint32_t>(sizeof(Key)),
-        classifier::ConcurrentExactTable::CapacityFor(keys), domain, socket,
-        classifier::ConcurrentExactTable::Writers::kSingle);
-    if (!directory.has_value()) {
+    auto directory =
+        SharedExactIndex::Create(static_cast<uint32_t>(sizeof(Key)), keys, domain, socket);
+    if (directory == nullptr) {
       return std::unexpected(FlowTableError::kBackendFailed);
     }
     Block slots, free_items, pending;
@@ -177,7 +175,7 @@ class SharedFlowTable {
       return std::unexpected(FlowTableError::kOutOfMemory);
     }
     std::unique_ptr<SharedFlowTable> table(new (std::nothrow) SharedFlowTable(
-        domain, std::move(*directory), std::move(observer)));
+        domain, std::move(directory), std::move(observer)));
     if (table == nullptr) {
       return std::unexpected(FlowTableError::kOutOfMemory);
     }
@@ -435,7 +433,7 @@ class SharedFlowTable {
     return quarantined_.load(std::memory_order_relaxed);
   }
   Observer &observer() noexcept { return observer_; }
-  const classifier::ConcurrentExactTable &directory() const noexcept {
+  const SharedExactIndex &directory() const noexcept {
     return *directory_;
   }
 
@@ -493,7 +491,7 @@ class SharedFlowTable {
   };
 
   SharedFlowTable(rcu::RcuDomain &domain,
-                  std::unique_ptr<classifier::ConcurrentExactTable> directory,
+                  std::unique_ptr<SharedExactIndex> directory,
                   Observer observer)
       : domain_(domain),
         directory_(std::move(directory)),
@@ -501,9 +499,8 @@ class SharedFlowTable {
     rte_spinlock_init(&lock_);
   }
 
-  static classifier::ConstBytes Bytes(const Key &key) noexcept {
-    return classifier::ConstBytes(reinterpret_cast<const std::byte *>(&key),
-                                  sizeof(Key));
+  static const std::byte *Bytes(const Key &key) noexcept {
+    return reinterpret_cast<const std::byte *>(&key);
   }
   static uint64_t ValueOf(FlowHandle handle) noexcept {
     return std::bit_cast<uint64_t>(handle);
@@ -520,7 +517,7 @@ class SharedFlowTable {
   // stale between the probe and here.
   FlowHandle Resolve(const Key &key) const noexcept {
     uint64_t value = 0;
-    if (directory_->LookupBatch(Bytes(key), sizeof(Key), &value, 1) == 0) {
+    if (!directory_->Lookup(Bytes(key), &value)) {
       return {};
     }
     const auto handle = std::bit_cast<FlowHandle>(value);
@@ -554,9 +551,7 @@ class SharedFlowTable {
     promise(out.size() >= n);
     uint64_t values[kMaxBatch];
     const uint64_t hits = directory_->LookupBatch(
-        classifier::ConstBytes(reinterpret_cast<const std::byte *>(keys.data()),
-                               n * sizeof(Key)),
-        sizeof(Key), values, n);
+        reinterpret_cast<const std::byte *>(keys.data()), sizeof(Key), values, n);
     for (size_t i = 0; i < n; i++) {
       out[i] = nullptr;
     }
@@ -576,21 +571,20 @@ class SharedFlowTable {
     return live;
   }
 
-  using InsertStatus = classifier::ConcurrentExactTable::InsertResult::Status;
+  using InsertStatus = SharedExactIndex::InsertStatus;
 
   // One key into the directory. False if the directory cannot place it, with
   // nothing inserted.
   bool TryInsert(const Key &key, FlowHandle handle) {
-    const auto inserted =
-        directory_->InsertIfAbsent(Bytes(key), ValueOf(handle));
-    if (inserted.status == InsertStatus::kInserted) {
+    const InsertStatus inserted = directory_->InsertIfAbsent(Bytes(key), ValueOf(handle));
+    if (inserted == InsertStatus::kInserted) {
       return true;
     }
     // kExists would mean the directory holds a key no live flow owns: every
     // caller has just found `key` absent under this lock, and entries leave
     // the directory with their flow. That is the table's own invariant,
     // whatever keys arrive. kFull is not: it depends on where the key lands.
-    CHECK(inserted.status == InsertStatus::kFull)
+    CHECK(inserted == InsertStatus::kFull)
         << "the shared directory holds a key that no live flow owns";
     return false;
   }
@@ -780,7 +774,7 @@ class SharedFlowTable {
   // cost the readers 15-19% (busy machine; 18-20% inferred when isolated) and
   // the writer 1.2-1.5x (isolated)).
   rcu::RcuDomain &domain_;
-  std::unique_ptr<classifier::ConcurrentExactTable> directory_;
+  std::unique_ptr<SharedExactIndex> directory_;
   Slot *slots_ = nullptr;
   uint32_t capacity_ = 0;
   alignas(arch::kCacheLineSize) std::atomic<uint32_t> size_{0};

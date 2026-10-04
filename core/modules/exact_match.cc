@@ -585,7 +585,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
   // Typed keys and values over the RPC (D-025): the rule's fields, packed
   // here as the add command packs them, and the rule's value -- the gate, or
   // the action id in action mode.
-  binding_ = init_context().resource_bindings().Bind(
+  binding_ = bess::framework::BindingsOf(init_context()).Bind(
       *resource_,std::make_shared<bess::framework::TypedCodec<
                           bess::pb::ExactMatchRuleKey,
                           bess::pb::ExactMatchRuleValue>>(
@@ -866,7 +866,7 @@ CommandResponse ExactMatch::SetRuntimeConfig(
       if (!ComputeLayout(/*tolerate_invalid_metadata=*/false, &layout, &err)) {
         return CommandFailure(err.first, "%s", err.second.c_str());
       }
-      CommandResponse applied = ApplyRuleOps(init_context().resources(), ops);
+      CommandResponse applied = ApplyRuleOps(bess::dataplane::EngineOf(init_context().resources()), ops);
       if (applied.error().code() != 0) {
         return applied;
       }
@@ -1103,7 +1103,7 @@ CommandResponse ExactMatch::CommandAdd(
                              key.size());
     const bess::dataplane::Op op = bess::dataplane::Op::Upsert(
         resource_->name(), packed, std::any(rule.value));
-    return ApplyRuleOps(init_context().resources(), std::span(&op, 1));
+    return ApplyRuleOps(bess::dataplane::EngineOf(init_context().resources()), std::span(&op, 1));
   }
   if (!EnsureCapacity(/*force=*/false, &ret)) {
     return CommandFailure(ret.first, "%s", ret.second.c_str());
@@ -1148,7 +1148,7 @@ CommandResponse ExactMatch::CommandDelete(
     }
     const bess::dataplane::Op op =
         bess::dataplane::Op::Erase(resource_->name(), packed);
-    return ApplyRuleOps(init_context().resources(), std::span(&op, 1));
+    return ApplyRuleOps(bess::dataplane::EngineOf(init_context().resources()), std::span(&op, 1));
   }
   if (!table_->Erase(classifier::ConstBytes(key.data(), key.size()))) {
     return CommandFailure(ENOENT, "rule doesn't exist");
@@ -1168,7 +1168,7 @@ CommandResponse ExactMatch::CommandClear(const bess::pb::EmptyArg &) {
           std::string(reinterpret_cast<const char *>(key.data()), key.size())));
     });
     return ops.empty() ? CommandSuccess()
-                       : ApplyRuleOps(init_context().resources(), ops);
+                       : ApplyRuleOps(bess::dataplane::EngineOf(init_context().resources()), ops);
   }
   std::vector<std::vector<std::byte>> keys;
   keys.reserve(table_->size());

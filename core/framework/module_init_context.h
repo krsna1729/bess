@@ -18,7 +18,7 @@ namespace rcu {
 class RcuDomain;
 }  // namespace rcu
 namespace dataplane {
-class TransactionEngine;
+class ResourceRegistry;
 }  // namespace dataplane
 namespace framework {
 class InstanceRegistry;
@@ -51,7 +51,7 @@ class PortDirectory {
 // without touching callers.
 class ModuleInitContext {
  public:
-  ModuleInitContext(dataplane::TransactionEngine &resources,
+  ModuleInitContext(dataplane::ResourceRegistry &resources,
                     ResourceBindings &resource_bindings,
                     framework::InstanceRegistry &instances, rcu::RcuDomain &rcu,
                     const runtime::PortRegistry &ports) noexcept
@@ -64,17 +64,10 @@ class ModuleInitContext {
   ModuleInitContext(const ModuleInitContext &) = delete;
   ModuleInitContext &operator=(const ModuleInitContext &) = delete;
 
-  // Registers and applies this instance's resources (D-021, D-022). Callers
-  // hold the control-plane lock, as module commands do.
-  dataplane::TransactionEngine &resources() const noexcept {
-    return resources_;
-  }
-
-  // Control-side metadata (the wire codec) for resources this module
-  // registers, kept apart from the dataplane resource itself (D-044).
-  ResourceBindings &resource_bindings() const noexcept {
-    return resource_bindings_;
-  }
+  // Registers and releases this instance's resources (D-021, D-022): the
+  // engine's public face. Callers hold the control-plane lock, as module
+  // commands do.
+  dataplane::ResourceRegistry &resources() const noexcept { return resources_; }
 
   // The reader domain every published table retires through. Needed by
   // modules that own an RcuPtr or a classifier/route table.
@@ -88,14 +81,19 @@ class ModuleInitContext {
 
   // The framework gives every module its context; a module reads it through
   // Module::init_context() and cannot construct or look one up itself.
+  //
+  // The wire codecs of a module's resources (D-044) are control-plane
+  // metadata, not part of this public surface: in-tree modules reach them
+  // through framework::BindingsOf() (framework/resource_bindings.h).
  private:
   // The context for the process's one active runtime. A separate context per
   // runtime is future work; Module's constructor is the only caller, so
   // ProcessDefault() is not part of the author-facing surface.
   friend class ::Module;
+  friend ResourceBindings &BindingsOf(const ModuleInitContext &context) noexcept;
   static const ModuleInitContext &ProcessDefault();
 
-  dataplane::TransactionEngine &resources_;
+  dataplane::ResourceRegistry &resources_;
   ResourceBindings &resource_bindings_;
   framework::InstanceRegistry &instances_;
   rcu::RcuDomain &rcu_;

@@ -95,16 +95,16 @@ TEST_F(RouterTransactionTest, EnrolledRoutersAreWrittenOnlyThroughTheEngine) {
   auto router = MakeRouter();
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1)));  // before: fine
   ASSERT_TRUE(router->SetRoute(P(Ip(10, 0, 0, 0), 8), NextHopId(1)));
-  auto enrolled = router->Enroll(engine_);
+  auto enrolled = router->Enroll(engine_.registry());
   ASSERT_FALSE(enrolled) << "enrolled with routes the ledger cannot see";
   EXPECT_NE(enrolled.error().find("before adding routes"), std::string::npos);
   ASSERT_TRUE(router->RemoveRoute(P(Ip(10, 0, 0, 0), 8)));
 
-  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
   EXPECT_TRUE(router->enrolled());
   EXPECT_EQ(router->next_hops_resource(), "rt/next_hops");
   EXPECT_EQ(router->routes_resource(), "rt/routes");
-  EXPECT_FALSE(router->Enroll(engine_));
+  EXPECT_FALSE(router->Enroll(engine_.registry()));
   EXPECT_EQ(router->SetNextHop(NextHopId(2), Hop(2)).error(),
             RouteError::kEnrolled);
   EXPECT_EQ(router->RemoveNextHop(NextHopId(1)).error(),
@@ -134,14 +134,14 @@ TEST_F(RouterTransactionTest, DirectGroupsAndEnrollmentExcludeEachOther) {
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1)));
   const NextHopId members[] = {NextHopId(1)};
   ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(1), members));
-  auto enrolled = router->Enroll(engine_);
+  auto enrolled = router->Enroll(engine_.registry());
   ASSERT_FALSE(enrolled);
   EXPECT_NE(enrolled.error().find("before adding next-hop groups"), std::string::npos);
 
   ASSERT_TRUE(router->RemoveNextHopGroup(NextHopGroupId(1)));
   Settle();
   EXPECT_EQ(0u, router->ReclaimRetired());
-  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
   EXPECT_EQ(RouteError::kEnrolled,
             router->SetNextHopGroup(NextHopGroupId(1), members).error());
   EXPECT_EQ(RouteError::kEnrolled,
@@ -154,7 +154,7 @@ TEST_F(RouterTransactionTest, DirectGroupsAndEnrollmentExcludeEachOther) {
 
 TEST_F(RouterTransactionTest, NextHopsAndRoutesChangeTogether) {
   auto router = MakeRouter();
-  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
   // Given in any order: the engine publishes next hops before routes.
   ASSERT_EQ(Apply({router->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(1)),
                    router->SetRouteOp(P(Ip(10, 1, 0, 0), 16), NextHopId(2)),
@@ -219,7 +219,7 @@ TEST_F(RouterTransactionTest, RoutesBeingPlacedChangeNoLookup) {
   for (bool with_default : {false, true}) {
     SCOPED_TRACE(with_default ? "with a default route" : "no default route");
     auto router = MakeRouter();
-    ASSERT_TRUE(router->Enroll(engine_));
+    ASSERT_TRUE(router->Enroll(engine_.registry()));
     std::vector<Op> base = {router->SetNextHopOp(NextHopId(1), Hop(1)),
                             router->SetNextHopOp(NextHopId(2), Hop(2)),
                             router->SetNextHopOp(NextHopId(9), Hop(9)),
@@ -258,7 +258,7 @@ TEST_F(RouterTransactionTest, RoutesBeingPlacedChangeNoLookup) {
 
 TEST_F(RouterTransactionTest, RoutesThatDoNotFitRejectWithNothingVisible) {
   auto router = MakeRouter(/*tbl8_groups=*/2);
-  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
   ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1))}).outcome,
             Outcome::kApplied);
   // Three /25s in three /24s need three tbl8 groups; there are two.
@@ -284,7 +284,7 @@ TEST_F(RouterTransactionTest, RoutesThatDoNotFitRejectWithNothingVisible) {
 TEST_F(RouterTransactionTest, RoutesInTwoDomainsInOneTransaction) {
   auto router = MakeRouter(/*tbl8_groups=*/64, /*next_hops=*/64, /*domains=*/3);
   const RouteDomainId d1(1), d2(2);
-  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
 
   const Ipv4Prefix net = P(Ip(10, 0, 0, 0), 8);
   EXPECT_EQ(Router::RouteKey(net),
@@ -365,7 +365,7 @@ TEST_F(RouterTransactionTest, RoutesInTwoDomainsInOneTransaction) {
 // is its own: filling d1's rejects the transaction without touching d2.
 TEST_F(RouterTransactionTest, PlacementCapacityIsPerDomain) {
   auto router = MakeRouter(/*tbl8_groups=*/2, /*next_hops=*/8, /*domains=*/3);
-  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
   ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1))}).outcome,
             Outcome::kApplied);
   std::vector<Op> ops;
@@ -399,7 +399,7 @@ struct Action {
 
 TEST_F(RouterTransactionTest, OtherResourcesReferenceNextHops) {
   auto router = MakeRouter();
-  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
   dataplane::SlotTable<ActionId, Action> actions(16);
   const std::string hops = router->next_hops_resource();
   dataplane::SlotResource<ActionId, Action> actions_res(
@@ -436,7 +436,7 @@ TEST_F(RouterTransactionTest, ResolvesWhileTransactionsRun) {
   constexpr uint32_t kLive = 300;
   constexpr uint32_t kSteps = 6000;
   auto router = MakeRouter(/*tbl8_groups=*/64, /*next_hops=*/kSessions);
-  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
   // Session s: 40.x.y.0/24 with x.y = s, via next hop s + 1, egress s % 4000.
   auto prefix = [](uint32_t s) {
     return P(Ip(40, (s >> 8) & 0xff, s & 0xff, 0), 24);
@@ -532,7 +532,7 @@ TEST_F(RouterTransactionTest, FailureAtEveryAllocationLeavesNoTrace) {
   const auto prepare = [&](Run &run) {
     run.router = MakeRouter();
     Router &router = *run.router;
-    ASSERT_TRUE(router.Enroll(run.engine));
+    ASSERT_TRUE(router.Enroll(run.engine.registry()));
     ASSERT_EQ(run.engine
                   .Apply(std::vector<Op>{
                       router.SetNextHopOp(NextHopId(1), Hop(1)),
@@ -770,7 +770,7 @@ std::set<int> EgressesOf(const Router &router, uint32_t dst) {
 
 TEST_F(RouterTransactionTest, GroupsNextHopsAndRoutesChangeInOneTransaction) {
   auto router = MakeRouter(64, 64, 1, /*groups=*/8);
-  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
   EXPECT_EQ(router->groups_resource(), "rt/groups");
   ASSERT_NE(router->groups_resource_object(), nullptr);
   const NextHopId abc[] = {NextHopId(1), NextHopId(2), NextHopId(3)};
@@ -826,7 +826,7 @@ TEST_F(RouterTransactionTest, GroupsNextHopsAndRoutesChangeInOneTransaction) {
 
 TEST_F(RouterTransactionTest, GroupReferencesAreChecked) {
   auto router = MakeRouter(64, 64, 1, /*groups=*/4);
-  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
   const NextHopId ab[] = {NextHopId(1), NextHopId(2), NextHopId(1)};  // 1 weighted twice
   ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1)),
                    router->SetNextHopOp(NextHopId(2), Hop(2)),
@@ -875,7 +875,7 @@ TEST_F(RouterTransactionTest, GroupReferencesAreChecked) {
 
 TEST_F(RouterTransactionTest, RoutersWithoutGroupsRefuseGroupOps) {
   auto router = MakeRouter();  // max_groups 0
-  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
   EXPECT_EQ(router->groups_resource_object(), nullptr);
   ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1))}).outcome, Outcome::kApplied);
   const NextHopId one[] = {NextHopId(1)};
@@ -892,7 +892,7 @@ TEST_F(RouterTransactionTest, RoutersWithoutGroupsRefuseGroupOps) {
 // of the next hops some committed state allowed for that destination.
 TEST_F(RouterTransactionTest, ReadersResolveThroughGroupsWhileTransactionsRun) {
   auto router = MakeRouter(64, 64, 1, /*groups=*/4);
-  ASSERT_TRUE(router->Enroll(engine_));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
   std::vector<Op> setup;
   for (uint32_t i = 1; i <= 6; i++) {
     setup.push_back(router->SetNextHopOp(NextHopId(i), Hop(i)));
@@ -1014,7 +1014,7 @@ TEST_F(RouterTransactionTest, GroupTransactionFailureAtEveryAllocationLeavesNoTr
   const auto prepare = [&](Run &run, MakeRouterFn make) {
     run.router = make();
     Router &router = *run.router;
-    ASSERT_TRUE(router.Enroll(run.engine));
+    ASSERT_TRUE(router.Enroll(run.engine.registry()));
     ASSERT_EQ(run.engine
                   .Apply(std::vector<Op>{router.SetNextHopOp(NextHopId(1), Hop(1)),
                                          router.SetNextHopOp(NextHopId(2), Hop(2)),

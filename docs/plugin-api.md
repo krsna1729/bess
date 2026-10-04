@@ -192,11 +192,15 @@ construction or `Init()`:
 
 | Method | Capability |
 |---|---|
-| `resources()` | register/apply transactional resources (`dataplane::TransactionEngine`) |
-| `resource_bindings()` | bind a resource's wire codec (control-side metadata) |
+| `resources()` | register and release transactional resources, read reference counts (`dataplane::ResourceRegistry`, `dataplane/resource_registry.h`, experimental); applying transactions is the control plane's |
 | `rcu()` | the reader domain published tables retire through |
 | `ports().Find(name)` | look up an existing port by name |
 | `instances()` | borrow application-owned shared state (below) |
+
+Every type this surface names is installed. Binding a resource's wire codec
+(control-side protobuf metadata, D-044) is in-tree only, through
+`framework::BindingsOf(init_context())` in the internal
+`framework/resource_bindings.h`: codecs are not part of the plugin SDK yet.
 
 The context is bound when the `Module` base is constructed, so it is usable in
 a derived constructor's member initializers (for example

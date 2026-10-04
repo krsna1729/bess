@@ -9,8 +9,9 @@ runtime, control or protobuf; reaching it from a module is the module's job.
 
 **Experimental API.** The headers other than `shared_flow_table.h` are installed
 and may change without preserving source compatibility (architecture.md
-section 5). `shared_flow_table.h` is not installed because it is built on
-`ConcurrentExactTable`, which is internal.
+section 5). `shared_flow_table.h` is installed too: its directory is a
+`SharedExactIndex` (`flow/shared_exact_index.h`), which keeps the backend,
+the internal `ConcurrentExactTable`, out of the installed headers (D-074).
 
 ## Which table
 

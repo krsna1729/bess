@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "dataplane/resource.h"
+#include "dataplane/resource_registry.h"
 #include "rcu/rcu_domain.h"
 
 namespace bess {
@@ -98,6 +99,9 @@ class TransactionEngine {
   };
 
   explicit TransactionEngine(rcu::RcuDomain &domain) : domain_(domain) {}
+
+  // The public face given to modules and libraries (resource_registry.h).
+  ResourceRegistry &registry() noexcept { return registry_; }
 
   TransactionEngine(const TransactionEngine &) = delete;
   TransactionEngine &operator=(const TransactionEngine &) = delete;
@@ -283,7 +287,14 @@ class TransactionEngine {
   // The bound graph contains a cycle: no publication order exists, so Apply
   // refuses every transaction until the graph changes (a registration bug).
   bool reference_cycle_ = false;
+  ResourceRegistry registry_{*this};
 };
+
+// The engine behind a registry: for the control plane and in-tree code that
+// applies transactions (a module's legacy commands), never for plugins.
+inline TransactionEngine &EngineOf(ResourceRegistry &registry) noexcept {
+  return registry.engine_;
+}
 
 }  // namespace dataplane
 }  // namespace bess

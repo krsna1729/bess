@@ -93,6 +93,7 @@ file is the reasoning.
 | D-070 | Hardware flow rules: a lifecycle owner, not a flow IR (M20) | accepted |
 | D-071 | Portability: one architecture boundary (core/arch), generic fallback for every kernel (M21) | accepted |
 | D-072 | Hardening program: sanitizers with the EAL, fuzzing, fault injection, models, curated clang-tidy (M22) | accepted |
+| D-074 | Public context accessors return only installed types: ResourceRegistry facade, bindings in-tree, SharedFlowTable installed (consolidation) | accepted |
 | D-075 | Release metadata, SBOM and the compatibility policy (M26) | accepted |
 
 
@@ -3150,6 +3151,10 @@ pointer; the packet path does not read it.
 **Revisit when:** M5 introduces application instances (bind per-instance
 contexts), or a module needs worker topology.
 
+
+**Change (D-074, consolidation).** `resources()` now returns the `dataplane::ResourceRegistry` facade and
+`resource_bindings()` left the public context (in-tree modules use `framework::BindingsOf`).
+
 ---
 
 ## D-043 Standalone release link: libgcc_eh ahead of libunwind, non-PIE
@@ -3229,6 +3234,10 @@ listing paths).
 
 **Revisit when:** M5 gives each application instance its own bindings, or a
 non-protobuf control binding needs the codec interface generalized.
+
+
+**Change (D-074, consolidation).** Modules bind through `framework::BindingsOf(init_context())` (internal
+header); `init_context().resource_bindings()` no longer exists.
 
 ---
 
@@ -6474,6 +6483,55 @@ fixed 25 s deadline under sanitizer slowdown (scale it before the sanitizer lane
 **Revisit when:** the sanitizer lanes are green for a week (make them gating); a new stateful battery lands (it needs
 a model, fault injection and, if shared, a TSan entry before it is called stable).
 
+## D-074 Public context accessors return only installed types: ResourceRegistry facade, bindings in-tree, SharedFlowTable installed (consolidation)
+
+**Status:** accepted (2026-10-04). Changes D-042's capability list.
+**Code:** `core/dataplane/resource_registry.h` (new, experimental), `core/dataplane/transaction_engine.{h,cc}`
+(`registry()`, `EngineOf`), `core/framework/module_init_context.{h,cc}`, `core/framework/resource_bindings.h`
+(`BindingsOf`), `core/route/router.{h,cc}` (`Enroll(ResourceRegistry &)`), the five modules that bind codecs,
+`core/flow/shared_exact_index.{h,cc}`, `core/flow/shared_flow_table.h`, `tools/api_classes.json`,
+`tools/check_installed_headers.py`, `docs/plugin-api.md`, `docs/architecture.md`, `docs/flow-state.md`.
+
+**Context.** An external review (2026-10-04) found that the public `ModuleInitContext` returned
+`dataplane::TransactionEngine &` and `framework::ResourceBindings &`, both internal and never installed: the stable
+surface named types an external author cannot see, and invited coupling to `Apply`, reclamation and registration
+internals once they are installed.
+
+**Decision.**
+- `resources()` returns `dataplane::ResourceRegistry &`: register, unregister, release for teardown, reference counts
+  and the generation. It is defined out of line, so the installed header includes no engine internals. Applying
+  transactions stays with the control plane; in-tree code that applies them (ExactMatch's legacy commands) uses
+  `dataplane::EngineOf(registry)` from the internal engine header.
+- `resource_bindings()` leaves the public context. Wire codecs are protobuf-bound control metadata, not part of the
+  plugin SDK; in-tree modules use `framework::BindingsOf(init_context())` from the internal bindings header. When a
+  codec API is promoted (M23/M27), a public binding facade comes with it.
+- The bindings registry stays process-scoped on purpose (the engine and the control endpoint are): the old comment
+  that application instances would own their own is withdrawn, as the review advised.
+- Libraries take the facade: `Router::Enroll(dataplane::ResourceRegistry &)`; tests pass `engine.registry()`.
+- **`SharedFlowTable` is installed** (experimental): its directory is `flow::SharedExactIndex`, an out-of-line
+  boundary over the internal `ConcurrentExactTable` (key bytes to a 64-bit value; lock-free readers; one writer at a
+  time). The read path is inline and is the backend's own (its batch hash, then DPDK's prehashed bulk lookup on
+  the same rte_hash); only the writer is out of line, so a lookup costs what it did before the boundary. Appliances that need a
+  shared flow directory (policy vSwitch, load balancers) can now be built against the installed SDK (review item 7).
+
+**Evidence.** Fast build: unit 130/130, the installed-header check (SharedFlowTable and SharedExactIndex in the
+installed set, no internal include), integration 1/1. `BM_SharedLookup` B/A against develop, release tree,
+isolated CPU, 16 rounds: all 12 rows (64K and 1M flows; scalar and batch 32; three key shapes) no clear difference.
+A first version with an out-of-line read path measured scalar lookups 5-14% slower, hence the inline reader.
+
+**Limits.** The invariant is on what the public accessors return. Internal types are still *named* where nothing
+can be done with them without the internal headers: `ModuleInitContext`'s constructor (the runtime builds contexts;
+modules cannot), the `BindingsOf` friend declaration, and `SharedExactIndex::backend_for_testing()`. Nothing checks
+this mechanically yet. The inline read path compiles the backend's hash and probe protocol into plugin binaries:
+changing either requires rebuilding plugins, which the experimental class and per-release plugin builds already
+require.
+
+**Changes.** D-042's capability list: `resources()` returns `dataplane::ResourceRegistry &`, and
+`resource_bindings()` is no longer a public capability. D-044's access route is now
+`framework::BindingsOf(init_context())`.
+
+**Revisit when:** a codec API is promoted to the SDK (public binding facade), or a second control domain per process
+appears (then registries per domain).
 ## D-075 Release metadata, SBOM and the compatibility policy (M26)
 
 **Status:** accepted (2026-10-04).

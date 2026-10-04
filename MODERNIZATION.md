@@ -5044,6 +5044,16 @@ rather than one call site).
      baseline. About thirty real bugs fixed along the way (D-072 lists them). New experimental CI lanes: clang-asan
      (with tidy) and clang-tsan.
 
+161. **Course correction: consolidation before breadth (external review, 2026-10-04).** The review placed the branch
+     at M21 in architecture and M17-M18 in maturity. Adopted: `develop` protected (required: Meson gcc, Meson clang,
+     Protobuf compatibility; sanitizer and ARM lanes optional); the public `ModuleInitContext` names only installed
+     types (`dataplane::ResourceRegistry`; codec bindings in-tree only) and `SharedFlowTable` is installed through a
+     `SharedExactIndex` boundary (D-074); transactional next-hop groups (D-065 change); l2_table retired only at
+     parity or with the reason recorded (D-073); a performance-clawback order (handoff, L2, conntrack batch, NAT
+     small tables, tunnel validated path, checksum); then reference appliances against installed headers (M24) and
+     the thin control SDK (M27). Kept against the review: NAT growth (user decision 3), gated so a growable table
+     costs what a fixed one does outside migration.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

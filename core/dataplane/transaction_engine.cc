@@ -345,6 +345,26 @@ std::vector<std::string> TransactionEngine::ResourceNames() const {
   return names;
 }
 
+std::expected<void, std::string> ResourceRegistry::Register(Resource *resource) {
+  return engine_.Register(resource);
+}
+std::expected<void, std::string> ResourceRegistry::Unregister(const std::string &name) {
+  return engine_.Unregister(name);
+}
+std::expected<void, std::string> ResourceRegistry::Unregister(
+    std::span<const std::string> names) {
+  return engine_.Unregister(names);
+}
+std::expected<void, std::string> ResourceRegistry::ReleaseForTeardown(
+    std::span<const std::string> names) {
+  return engine_.ReleaseForTeardown(names);
+}
+size_t ResourceRegistry::ReferenceCount(const std::string &resource,
+                                        const ResourceKey &key) const {
+  return engine_.ReferenceCount(resource, key);
+}
+uint64_t ResourceRegistry::generation() const { return engine_.generation(); }
+
 uint64_t TransactionEngine::generation() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return generation_;
