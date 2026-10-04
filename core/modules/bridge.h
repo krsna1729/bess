@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "l2/fdb.h"
+#include "l2/packed_mac_table.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 
@@ -27,6 +28,10 @@ class Bridge final : public Module {
   static constexpr size_t kStaticReserve = 1024;
 
   // One worker: the FDB is worker-owned (learning writes it on the packet path).
+  // One bridge domain, so the one-word table (D-073: faster than MacTable in
+  // every lookup and learn measured).
+  using Fdb = bess::l2::BasicFdb<bess::l2::PackedMacTable<bess::dataplane::ExpiryHandle>>;
+
   Bridge() : Module() { max_allowed_workers_ = 1; }
 
   CommandResponse Init(const bess::pb::BridgeArg &arg);
@@ -42,7 +47,7 @@ class Bridge final : public Module {
              const std::vector<gate_idx_t> &flood_gates);
 
   uint32_t max_entries_ = 1024;
-  std::unique_ptr<bess::l2::Fdb> fdb_;
+  std::unique_ptr<Fdb> fdb_;
 };
 
 #endif  // BESS_MODULES_BRIDGE_H_

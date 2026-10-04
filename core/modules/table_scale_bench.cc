@@ -28,7 +28,7 @@
 #include <vector>
 
 #include "classifier/masked_exact.h"
-#include "modules/l2_table.h"
+#include "modules/legacy_l2_table_bench.h"
 #include "nat/nat.h"
 
 namespace {

@@ -7,8 +7,10 @@
 
 #include <atomic>
 #include <bit>
+#include <memory>
 
-#include "l2_table.h"
+#include "dataplane/table_policy.h"
+#include "l2/packed_mac_table.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 
@@ -22,7 +24,7 @@ class L2Forward final : public Module {
 
   static const Commands cmds;
 
-  L2Forward() : Module(), l2_table_(), default_gate_() {
+  L2Forward() : Module(), default_gate_() {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 
@@ -41,7 +43,13 @@ class L2Forward final : public Module {
       const bess::pb::L2ForwardCommandPopulateArg &arg);
 
  private:
-  struct l2_table l2_table_;
+  // One-word slots: commands write one at a time (the control thread runs
+  // them in turn) while every worker reads without a lock (table policy,
+  // user decision 1; D-017's guarantees). Value: gate + 1, so 0 is a miss.
+  // No cold word (an empty type allocates none).
+  struct NoCold {};
+  using Table = bess::l2::PackedMacTable<NoCold, bess::dataplane::SingleWriter>;
+  std::unique_ptr<Table> table_;
   // Set by commands while workers read it: an atomic field, relaxed on both
   // sides (the gate is independent of the table).
   std::atomic<gate_idx_t> default_gate_;

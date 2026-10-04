@@ -4,11 +4,13 @@
 #define BESS_L2_FDB_H_
 
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <new>
 #include <span>
 #include <vector>
@@ -16,6 +18,7 @@
 #include "dataplane/expiry_wheel.h"
 #include "dataplane/interface_id.h"
 #include "dataplane/strong_id.h"
+#include "dataplane/table_policy.h"
 #include "l2/mac_table.h"
 #include "utils/common.h"
 
@@ -31,10 +34,12 @@ namespace bess::l2 {
 // runtime dependency; interfaces are `dataplane::InterfaceId` (M7) and the
 // owner maps them to gates, ports or hardware.
 //
-// Ownership: an Fdb is one worker's (a MacTable plus an ExpiryWheel);
-// learning, lookup, aging and programming happen on that worker.
-// A deployment that needs lock-free reads from many workers of a table one
-// thread writes uses a concurrent table instead (see D-064).
+// Storage: the table is a type parameter (user decision 1, 2026-10-04: one
+// FDB, the module picks the table). `Fdb` is the worker-owned MacTable: one
+// worker learns, looks up, ages and programs. A storage says who may write and
+// read it (dataplane/table_policy.h) and how many domains and how wide an
+// interface it holds; every mutation holds its writer guard (nothing, for an
+// owned table).
 //
 // Fail closed: a miss, an unknown domain and the invalid interface all read as
 // kInvalidInterfaceId; the invalid interface cannot be programmed or learned.
@@ -81,6 +86,7 @@ enum class LearnResult : uint8_t {
   kStatic,     // a static entry exists; nothing changed
   kIgnored,    // multicast source, invalid interface or unknown domain
   kFull,       // no room; nothing changed
+  kBusy,       // another writer holds a shared table: skipped (the next packet learns)
 };
 
 enum class ProgramResult : uint8_t {
@@ -90,12 +96,45 @@ enum class ProgramResult : uint8_t {
   kFull,
 };
 
-class Fdb {
+// What BasicFdb needs from its table: 64-bit key words (domain | MAC, see
+// MakeKey), a value per slot (the interface) and a flags byte, a cold word per
+// slot for the aging timer, batch lookup, and the writer guard.
+template <typename T>
+concept FdbStorage = requires(T t, const T ct, uint64_t key, uint32_t slot,
+                              std::span<const uint64_t> keys) {
+  { T::Create(size_t{}) } -> std::same_as<std::unique_ptr<T>>;
+  { ct.Lookup(key) } -> std::same_as<uint32_t>;
+  { ct.LookupBatch(keys, static_cast<dataplane::InterfaceId *>(nullptr)) } -> std::same_as<uint64_t>;
+  { ct.Find(key) } -> std::same_as<uint32_t>;
+  { t.Insert(key, uint16_t{}, uint8_t{}) } -> std::same_as<uint32_t>;
+  t.Erase(slot);
+  { ct.value(slot) } -> std::convertible_to<uint32_t>;
+  t.set_value(slot, uint16_t{});
+  { ct.flags(slot) } -> std::same_as<uint8_t>;
+  t.set_flags(slot, uint8_t{});
+  t.ForEach([](uint32_t) {});
+  { t.cold(slot) } -> std::same_as<dataplane::ExpiryHandle &>;
+  { ct.size() } -> std::same_as<size_t>;
+  { ct.capacity() } -> std::same_as<size_t>;
+  { ct.memory_bytes() } -> std::same_as<size_t>;
+  t.Lock();
+  { t.TryLock() } -> std::same_as<std::optional<typename T::Guard>>;
+  T::kNotFound;
+  T::kMaxBatch;
+  T::kMaxDomains;
+  T::kMaxValue;
+  typename T::writers;
+  typename T::readers;
+  typename T::growth;
+};
+
+template <typename Storage = MacTable<dataplane::ExpiryHandle>>
+  requires FdbStorage<Storage>
+class BasicFdb {
  public:
   using Tick = uint64_t;
-  // The MAC-specialised table (D-064 compares it with the flow substrate and
-  // the legacy l2_table); each slot's cold word is its aging timer.
-  using Table = MacTable<dataplane::ExpiryHandle>;
+  // The table; each slot's cold word is its aging timer.
+  using Table = Storage;
   // The payload is the key word: every path that ends an entry's dynamic life
   // (removal, static reprogramming, flush) cancels its timer, so a timer that
   // fires belongs to the present dynamic entry for that key.
@@ -116,11 +155,12 @@ class Fdb {
   enum class CreateError : uint8_t { kInvalidConfig, kOutOfMemory };
 
   // Allocations happen only here (and in SetFloodGroup).
-  static std::expected<std::unique_ptr<Fdb>, CreateError> Create(const Config &config) {
+  static std::expected<std::unique_ptr<BasicFdb>, CreateError> Create(const Config &config) {
     if (config.capacity == 0 || config.capacity > (size_t{1} << 28) ||
         // Domain 0xFFFF is reserved: with the broadcast MAC its key word is the
-    // table's empty marker, and it is kNoDomain.
-    config.max_domains == 0 || config.max_domains > 65535) {
+        // table's empty marker, and it is kNoDomain.
+        config.max_domains == 0 || config.max_domains > 65535 ||
+        config.max_domains > Table::kMaxDomains) {
       return std::unexpected(CreateError::kInvalidConfig);
     }
     auto wheel = Wheel::Create(config.capacity, config.start, config.granularity_shift);
@@ -135,9 +175,9 @@ class Fdb {
     }
     // The FDB allocates its flood groups as it is built: a refusal there is
     // kOutOfMemory like the others, not an exception.
-    std::unique_ptr<Fdb> fdb;
+    std::unique_ptr<BasicFdb> fdb;
     try {
-      fdb.reset(new Fdb(std::move(table), std::move(*wheel), config));
+      fdb.reset(new BasicFdb(std::move(table), std::move(*wheel), config));
     } catch (const std::bad_alloc &) {
       return std::unexpected(CreateError::kOutOfMemory);
     }
@@ -151,9 +191,8 @@ class Fdb {
     // Domain 0xFFFF with the broadcast MAC is the table's empty marker and
     // finds a free slot, whose value is 0: kInvalidInterfaceId, a miss. (A
     // domain bound check here measured +0.5 ns a lookup.)
-    const uint32_t s = table_->Find(Word(MakeKey(domain, mac)));
-    return s == Table::kNotFound ? dataplane::kInvalidInterfaceId
-                                 : dataplane::InterfaceId(table_->value(s));
+    return dataplane::InterfaceId(
+        static_cast<uint16_t>(table_->Lookup(Word(MakeKey(domain, mac)))));
   }
 
   // out[i] = interface or kInvalidInterfaceId; bit i set for a hit.
@@ -161,19 +200,11 @@ class Fdb {
                        std::span<dataplane::InterfaceId> out) const noexcept {
     promise(keys.size() <= kMaxBatch && out.size() >= keys.size());
     uint64_t words[kMaxBatch];
-    uint32_t slots[kMaxBatch];
     for (size_t i = 0; i < keys.size(); i++) {
       words[i] = Word(keys[i]);
     }
-    table_->FindBatch(std::span<const uint64_t>(words, keys.size()), slots);
-    uint64_t hits = 0;
-    for (size_t i = 0; i < keys.size(); i++) {
-      // A free slot (the empty-marker key) reads value 0: not a hit.
-      const bool hit = slots[i] != Table::kNotFound && table_->value(slots[i]) != 0;
-      hits |= uint64_t{hit} << i;
-      out[i] = hit ? dataplane::InterfaceId(table_->value(slots[i])) : dataplane::kInvalidInterfaceId;
-    }
-    return hits;
+    // A miss reads value 0, kInvalidInterfaceId.
+    return table_->LookupBatch(std::span<const uint64_t>(words, keys.size()), out.data());
   }
 
   // -- learning -----------------------------------------------------------------
@@ -182,8 +213,14 @@ class Fdb {
   LearnResult Learn(BridgeDomainId domain, const MacAddress &mac,
                     dataplane::InterfaceId interface, Tick now) noexcept {
     if (mac.multicast() || interface == dataplane::kInvalidInterfaceId ||
-        domain.value() >= max_domains_) {
+        interface.value() > Table::kMaxValue || domain.value() >= max_domains_) {
       return LearnResult::kIgnored;
+    }
+    // Learning runs on the packet path: on a shared table it never waits for
+    // another writer (table policy decision 2); an owned table always gets it.
+    const std::optional<typename Table::Guard> guard = table_->TryLock();
+    if (!guard) {
+      return LearnResult::kBusy;
     }
     const uint64_t key = Word(MakeKey(domain, mac));
     // Usable while now - last learned <= aging (the legacy Bridge's rule), so
@@ -203,12 +240,11 @@ class Fdb {
     if (table_->size() >= learn_limit_) {
       return LearnResult::kFull;
     }
-    const uint32_t s = table_->Insert(key);
+    const uint32_t s = table_->Insert(key, interface.value(),
+                                      static_cast<uint8_t>(FdbFlags::kDynamic));
     if (s == Table::kNotFound) {
       return LearnResult::kFull;
     }
-    table_->set_value(s, interface.value());
-    table_->set_flags(s, static_cast<uint8_t>(FdbFlags::kDynamic));
     // The wheel holds `capacity` timers, one per dynamic entry, but it
     // quarantines a node whose generation is exhausted (2^31 armings), so
     // Schedule can still refuse: an entry without a timer would never age.
@@ -224,6 +260,7 @@ class Fdb {
   // Ages out dynamic entries whose deadline is <= now, doing at most `budget`
   // units of wheel work (see ExpiryWheel). Returns how many entries left.
   size_t Age(Tick now, size_t budget) noexcept {
+    [[maybe_unused]] auto guard = table_->Lock();
     size_t removed = 0;
     (void)wheel_->Poll(now, budget, [this, &removed](const uint64_t &key) noexcept {
       const uint32_t s = table_->Find(key);
@@ -241,24 +278,22 @@ class Fdb {
   ProgramResult AddStatic(BridgeDomainId domain, const MacAddress &mac,
                           dataplane::InterfaceId interface) noexcept {
     if (interface == dataplane::kInvalidInterfaceId || mac.multicast() ||
-        domain.value() >= max_domains_) {
+        interface.value() > Table::kMaxValue || domain.value() >= max_domains_) {
       return ProgramResult::kInvalid;
     }
+    [[maybe_unused]] auto guard = table_->Lock();
     const uint64_t key = Word(MakeKey(domain, mac));
-    ProgramResult result = ProgramResult::kReplaced;
-    uint32_t s = table_->Find(key);
-    if (s != Table::kNotFound) {
-      CancelTimer(s);
-    } else {
-      s = table_->Insert(key);
-      if (s == Table::kNotFound) {
-        return ProgramResult::kFull;
-      }
-      result = ProgramResult::kAdded;
+    const uint32_t found = table_->Find(key);
+    if (found == Table::kNotFound) {
+      return table_->Insert(key, interface.value(), static_cast<uint8_t>(FdbFlags::kStatic)) ==
+                     Table::kNotFound
+                 ? ProgramResult::kFull
+                 : ProgramResult::kAdded;
     }
-    table_->set_value(s, interface.value());
-    table_->set_flags(s, static_cast<uint8_t>(FdbFlags::kStatic));
-    return result;
+    CancelTimer(found);
+    table_->set_value(found, interface.value());
+    table_->set_flags(found, static_cast<uint8_t>(FdbFlags::kStatic));
+    return ProgramResult::kReplaced;
   }
 
   // Removes (domain, mac), static or dynamic. False if absent.
@@ -266,6 +301,7 @@ class Fdb {
     if (domain.value() >= max_domains_) {
       return false;
     }
+    [[maybe_unused]] auto guard = table_->Lock();
     const uint32_t s = table_->Find(Word(MakeKey(domain, mac)));
     if (s == Table::kNotFound) {
       return false;
@@ -277,6 +313,7 @@ class Fdb {
 
   // Removes every dynamic entry (static_too: every entry). O(capacity).
   void Flush(bool static_too = false) noexcept {
+    [[maybe_unused]] auto guard = table_->Lock();
     table_->ForEach([&](uint32_t s) {
       if (static_too || table_->flags(s) == static_cast<uint8_t>(FdbFlags::kDynamic)) {
         CancelTimer(s);
@@ -329,13 +366,15 @@ class Fdb {
 
   size_t size() const noexcept { return table_->size(); }
   size_t capacity() const noexcept { return table_->capacity(); }
+  // The storage, for an owner that shares it (its readers) or holds its lock.
+  Table &table() noexcept { return *table_; }
   size_t dynamic_entries() const noexcept { return wheel_->size(); }
   size_t memory_bytes() const noexcept {
     return table_->memory_bytes() + wheel_->memory_bytes() + sizeof(*this);
   }
 
  private:
-  Fdb(std::unique_ptr<Table> table, std::unique_ptr<Wheel> wheel, const Config &config)
+  BasicFdb(std::unique_ptr<Table> table, std::unique_ptr<Wheel> wheel, const Config &config)
       : table_(std::move(table)),
         wheel_(std::move(wheel)),
         aging_(config.aging),
@@ -365,6 +404,9 @@ class Fdb {
   std::vector<std::vector<dataplane::InterfaceId>> flood_;
   std::array<BridgeDomainId, 4096> vlan_domain_;
 };
+
+// The worker-owned FDB (D-064): one worker learns, looks up, ages, programs.
+using Fdb = BasicFdb<>;
 
 }  // namespace bess::l2
 

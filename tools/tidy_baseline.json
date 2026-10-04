@@ -134,10 +134,6 @@
       "bugprone-implicit-widening-of-multiplication-result": 1,
       "cppcoreguidelines-narrowing-conversions": 1
     },
-    "core/modules/l2_table.h": {
-      "clang-analyzer-core.uninitialized.Assign": 1,
-      "cppcoreguidelines-narrowing-conversions": 11
-    },
     "core/modules/measure.cc": {
       "cppcoreguidelines-narrowing-conversions": 1
     },

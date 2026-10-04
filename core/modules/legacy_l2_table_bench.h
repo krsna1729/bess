@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_MODULES_L2_TABLE_H_
-#define BESS_MODULES_L2_TABLE_H_
+#ifndef BESS_MODULES_LEGACY_L2_TABLE_BENCH_H_
+#define BESS_MODULES_LEGACY_L2_TABLE_BENCH_H_
 
-// L2Forward's MAC table, moved out of l2_forward.cc unchanged so tests and
-// benchmarks can reach it (K4.6 follow-up).
+// Benchmarks only: L2Forward's former MAC table (D-017), frozen as the
+// baseline PackedMacTable is measured against (table policy TP2, user
+// decision 1: one MAC table implementation). Not built into bessd.
 
 #include <atomic>
 
@@ -420,4 +421,4 @@ inline uint64_t l2_addr_to_u64(char *addr) {
 }
 
 
-#endif  // BESS_MODULES_L2_TABLE_H_
+#endif  // BESS_MODULES_LEGACY_L2_TABLE_BENCH_H_
