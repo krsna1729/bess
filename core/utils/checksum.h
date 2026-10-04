@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "arch/checksum_kernels.h"
 #include "common.h"
 #include "ip.h"
 #include "tcp.h"
@@ -56,35 +57,38 @@ static inline uint32_t Fold64(uint64_t sum) {
   return static_cast<uint32_t>(sum);
 }
 
+// Folds a sum below 2^47 into 32 bits for FoldChecksum(): congruent modulo
+// 0xFFFF (2^16 is 1 there) and 0 only if `sum` is, which is all the 16-bit
+// checksum depends on. Cheaper than Fold64() for the header sums.
+static inline uint32_t FoldForChecksum(uint64_t sum) {
+  return static_cast<uint32_t>((sum & 0xFFFF) + (sum >> 16));
+}
+
 }  // namespace checksum_internal
 
 // Returns 32-bit one's complement sum of 'len' bytes from 'buf'.
 //
-// Whole 16-byte blocks are summed as 32-bit words, the remainder as 16-bit
-// words, then the odd byte; every part is exact in 64 bits (len < 16 GiB) and
-// folded once. Only the sum modulo 0xFFFF and whether it is zero carry
-// meaning; this split also reproduces the exact 32-bit value of the former
-// x86-64 adc/AVX2 kernels. Plain loops: compilers vectorize the word loop
-// (e.g. zero-extend and 64-bit adds with AVX2; widening adds on arm64).
+// Whole 16-byte blocks are summed as 32-bit words (bess::arch::SumWords32:
+// AVX2/add-with-carry on x86-64, a vectorizable loop elsewhere), the
+// remainder as 16-bit words, then the odd byte, and the total is folded once.
+// Only the sum modulo 0xFFFF and whether it is zero carry meaning; this split
+// also gives the exact 32-bit value BESS has always returned.
 static inline uint32_t CalculateSum(const void *buf, size_t len) {
   using checksum_internal::Load16;
-  using checksum_internal::Load32;
   const auto *p = static_cast<const unsigned char *>(buf);
   const size_t words32_end = len & ~size_t{15};
-  uint64_t sum64 = 0;
+  uint64_t sum64 = bess::arch::SumWords32(p, words32_end);
 
-  for (size_t i = 0; i < words32_end; i += 4) {
-    sum64 += Load32(p + i);
+  // Fewer than 16 bytes left (the bound lets compilers unroll this fully):
+  // 16-bit words, then the odd byte.
+  const unsigned char *tail = p + words32_end;
+  const size_t rem = len & 15;
+  size_t i = 0;
+  for (; i + 1 < rem; i += 2) {
+    sum64 += Load16(tail + i);
   }
-
-  size_t i = words32_end;
-  for (; i + 1 < len; i += 2) {
-    sum64 += Load16(p + i);
-  }
-
-  // Add remaining 8-bit to the one's complement sum
-  if (len & 1) {
-    sum64 += p[i];
+  if (rem & 1) {
+    sum64 += tail[i];
   }
 
   return checksum_internal::Fold64(sum64);
@@ -144,7 +148,7 @@ static inline uint64_t SumPseudoHeader(be32_t src, be32_t dst, uint16_t l4_len,
 static inline bool VerifyIpv4NoOptChecksum(const Ipv4 &iph) {
   const auto *p = reinterpret_cast<const unsigned char *>(&iph);
   uint64_t sum = checksum_internal::SumIpv4Header(p, false);
-  return FoldChecksum(checksum_internal::Fold64(sum)) == 0;
+  return FoldChecksum(checksum_internal::FoldForChecksum(sum)) == 0;
 }
 
 // Returns IP checksum of the ip header 'iph' without ip options
@@ -153,7 +157,7 @@ static inline bool VerifyIpv4NoOptChecksum(const Ipv4 &iph) {
 static inline uint16_t CalculateIpv4NoOptChecksum(const Ipv4 &iph) {
   const auto *p = reinterpret_cast<const unsigned char *>(&iph);
   uint64_t sum = checksum_internal::SumIpv4Header(p, true);
-  return FoldChecksum(checksum_internal::Fold64(sum));
+  return FoldChecksum(checksum_internal::FoldForChecksum(sum));
 }
 
 // Returns true if the IP checksum is correct
@@ -171,7 +175,7 @@ static inline bool VerifyIpv4Checksum(const Ipv4 &iph) {
 
   uint64_t sum = CalculateSum(p + sizeof(iph), ip_header_len - sizeof(iph));
   sum += checksum_internal::SumIpv4Header(p, false);
-  return FoldChecksum(checksum_internal::Fold64(sum)) == 0;
+  return FoldChecksum(checksum_internal::FoldForChecksum(sum)) == 0;
 }
 
 // Returns IP checksum of the ip header 'iph'
@@ -191,7 +195,7 @@ static inline uint16_t CalculateIpv4Checksum(const Ipv4 &iph) {
 
   uint64_t sum = CalculateSum(p + sizeof(iph), ip_header_len - sizeof(iph));
   sum += checksum_internal::SumIpv4Header(p, true);
-  return FoldChecksum(checksum_internal::Fold64(sum));
+  return FoldChecksum(checksum_internal::FoldForChecksum(sum));
 }
 
 // Returns true if the UDP checksum is correct with the UDP header and
@@ -214,7 +218,7 @@ static inline bool VerifyIpv4UdpChecksum(const Udp &udph, be32_t src_ip,
   sum += checksum_internal::SumPseudoHeader(src_ip, dst_ip, udp_len,
                                             Ipv4::Proto::kUdp);
 
-  return FoldChecksum(checksum_internal::Fold64(sum)) == 0;
+  return FoldChecksum(checksum_internal::FoldForChecksum(sum)) == 0;
 }
 
 // Returns true if the UDP checksum is correct
@@ -248,7 +252,7 @@ static inline uint16_t CalculateIpv4UdpChecksum(const Udp &udph, be32_t src,
                                             Ipv4::Proto::kUdp);
 
   // If the result of UDP checksum calculation is 0, return all ones (rfc 768)
-  return FoldChecksum(checksum_internal::Fold64(sum)) ?: 0xFFFF;
+  return FoldChecksum(checksum_internal::FoldForChecksum(sum)) ?: 0xFFFF;
 }
 
 // Returns UDP (on IPv4) checksum of the UDP header 'udph' with ip header 'iph'
@@ -281,7 +285,7 @@ static inline bool VerifyIpv4TcpChecksum(const Tcp &tcph, be32_t src_ip,
   sum += checksum_internal::SumPseudoHeader(src_ip, dst_ip, tcp_len,
                                             Ipv4::Proto::kTcp);
 
-  return FoldChecksum(checksum_internal::Fold64(sum)) == 0;
+  return FoldChecksum(checksum_internal::FoldForChecksum(sum)) == 0;
 }
 
 // Returns true if the TCP checksum is correct
@@ -317,7 +321,7 @@ static inline uint16_t CalculateIpv4TcpChecksum(const Tcp &tcph, be32_t src,
   sum += checksum_internal::SumPseudoHeader(src, dst, tcp_len,
                                             Ipv4::Proto::kTcp);
 
-  return FoldChecksum(checksum_internal::Fold64(sum));
+  return FoldChecksum(checksum_internal::FoldForChecksum(sum));
 }
 
 // Returns TCP (on IPv4) checksum of the tcp header 'tcph' with ip header 'iph'

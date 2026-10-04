@@ -302,9 +302,15 @@ TEST(Mask, EveryLengthAndAlignment) {
         for (size_t i = 0; i < len; i++) {
           exp[kPad + buf_off + i] &= m[i];
         }
+        std::vector<uint8_t> orig = buf;
         bess::utils::MaskBytes(b, m, len);
         ASSERT_EQ(exp, buf) << "len=" << len << " buf_off=" << buf_off
                             << " mask_off=" << mask_off;
+        buf = orig;
+        b = buf.data() + kPad + buf_off;
+        bess::utils::MaskBytes64(b, m, len);
+        ASSERT_EQ(exp, buf) << "MaskBytes64 len=" << len
+                            << " buf_off=" << buf_off << " mask_off=" << mask_off;
       }
     }
   }

@@ -75,6 +75,25 @@ TEST(ChecksumTest, GenericChecksumCarryBoundaries) {
       }
     }
   }
+
+  // All-ones 16-byte blocks, then a tail of 0x01 and zeros: under 128 bytes
+  // the x86-64 add-with-carry kernel reduces the blocks to 2^33 - 2, and the
+  // tail's 1 carries the total across 2^32 a second time, so the last
+  // end-around carry of the final fold decides the result.
+  for (size_t off = 0; off < 4; off++) {
+    for (size_t len = 17; len <= 256; len++) {
+      const size_t blocks = len & ~size_t{15};
+      if (blocks == len) {
+        continue;
+      }
+      memset(buf + off, 0xFF, blocks);
+      memset(buf + off + blocks, 0, len - blocks);
+      buf[off + blocks] = 0x01;
+      uint16_t cksum_bess = CalculateGenericChecksum(buf + off, len);
+      uint16_t cksum_dpdk = ~rte_raw_cksum(buf + off, len);
+      ASSERT_EQ(cksum_dpdk, cksum_bess) << "off=" << off << " len=" << len;
+    }
+  }
 }
 
 // Tests IP checksum

@@ -106,16 +106,15 @@ static inline void MaskBytes64(uint8_t *buf, uint8_t const *mask,
   size_t leftover = len - n * sizeof(uint64_t);
   for (size_t i = 0; i < n; i++) {
     uint64_t b, m;
-    memcpy(&b, buf, sizeof(b));
-    memcpy(&m, mask, sizeof(m));
+    memcpy(&b, buf + i * sizeof(b), sizeof(b));
+    memcpy(&m, mask + i * sizeof(m), sizeof(m));
     b &= m;
-    memcpy(buf, &b, sizeof(b));
-    buf += sizeof(b);
-    mask += sizeof(m);
+    memcpy(buf + i * sizeof(b), &b, sizeof(b));
   }
 
   if (leftover) {
-    MaskBytesSmall(buf, mask, leftover);
+    MaskBytesSmall(buf + n * sizeof(uint64_t), mask + n * sizeof(uint64_t),
+                   leftover);
   }
 }
 

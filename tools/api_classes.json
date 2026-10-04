@@ -34,6 +34,7 @@
     "worker.h": "public",
     "arch/cpu.h": "public",
     "arch/byte_match.h": "experimental",
+    "arch/checksum_kernels.h": "experimental",
     "arch/crc32c.h": "experimental",
     "arch/fp_env.h": "experimental",
     "arch/signal_context.h": "experimental",

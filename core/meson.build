@@ -476,6 +476,7 @@ core_public_subdir_headers = {
   'arch': files(
     'arch/cpu.h',
     'arch/byte_match.h',
+    'arch/checksum_kernels.h',
     'arch/crc32c.h',
     'arch/fp_env.h',
     'arch/signal_context.h',
