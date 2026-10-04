@@ -93,7 +93,7 @@ def busy_processes(threshold=0.2, window=1.0):
     return busy
 
 
-def run(binary, args, wrap):
+def run(binary, args, wrap, metric=None):
     # The results go to their own file: a benchmark that starts DPDK's EAL (or
     # logs) writes to stdout too, which can corrupt a JSON document read there.
     with tempfile.TemporaryDirectory(prefix='ab_bench-') as tmp:
@@ -105,8 +105,14 @@ def run(binary, args, wrap):
             sys.exit('benchmark failed: %s\n%s' % (' '.join(cmd), out.stderr[-2000:]))
         with open(result) as f:
             data = json.load(f)
-    return {b['name']: b['real_time'] for b in data['benchmarks']
-            if b.get('run_type', 'iteration') == 'iteration' and 'real_time' in b}
+    # A counter (`--metric`) instead of the time per iteration: two benchmarks
+    # whose iterations hold different amounts of work (one packet, a batch of
+    # 32) compare by their per-item counter. Inverted rate counters are in
+    # seconds; shown in ns.
+    key = metric or 'real_time'
+    scale = 1e9 if metric else 1.0
+    return {b['name']: b[key] * scale for b in data['benchmarks']
+            if b.get('run_type', 'iteration') == 'iteration' and key in b}
 
 
 def main():
@@ -124,6 +130,10 @@ def main():
     p.add_argument('--noise', type=float, default=0.03)
     p.add_argument('--allow-busy', action='store_true',
                    help='skip the idle-machine pre-flight check')
+    p.add_argument('--metric', help='compare this counter instead of real_time, for benchmarks '
+                                    'whose iterations differ in work. It must be an inverted '
+                                    'rate counter (kIsRate | kInvert, seconds per item, e.g. '
+                                    'ns_per_packet): values are shown in ns')
     p.add_argument('extra', nargs='*')
     o = p.parse_args()
 
@@ -148,7 +158,7 @@ def main():
         order += ['a', 'b', 'b', 'a']
     results = {'a': [], 'b': []}
     for step, side in enumerate(order):
-        r = run(o.a if side == 'a' else o.b, args[side], o.wrap)
+        r = run(o.a if side == 'a' else o.b, args[side], o.wrap, o.metric)
         if side == 'b' and rename:
             r = {rename[0].sub(rename[1], k): v for k, v in r.items()}
         results[side].append(r)

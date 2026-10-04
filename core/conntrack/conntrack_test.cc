@@ -514,5 +514,77 @@ TEST(ConntrackTest, PolicyRefusalCapacityAndControl) {
   EXPECT_EQ(TrackStatus::kUntracked, ct->Track({}, ParsedFlowPacket{}, 0).status);
 }
 
+
+// TrackBatch answers exactly as Track packet by packet: a random stream over
+// a small set of endpoints, so batches create, use and close connections
+// within themselves, with echo, ICMP errors, untracked and unparsed packets
+// mixed in, and a table small enough to fill.
+TEST(ConntrackTest, TrackBatchMatchesTrackPacketByPacket) {
+  for (const uint32_t seed : {1u, 2u, 3u, 4u, 5u, 6u}) {
+    SCOPED_TRACE(seed);
+    auto scalar = Conntrack<>::Create(48).value();
+    auto batched = Conntrack<>::Create(48).value();
+    // Both bodies, whatever the footprint would choose.
+    batched->SetBatchBodyForTesting(seed % 2 ? dataplane::LookupBody::kStaged
+                                             : dataplane::LookupBody::kPlain);
+    std::mt19937 rng(seed);
+    const uint8_t kFlags[] = {kTcpSyn, kTcpSyn | kTcpAck, kTcpAck, kTcpFin | kTcpAck,
+                              kTcpRst, kTcpAck | ct_internal::kTcpUrg, kTcpSyn | kTcpFin};
+    uint64_t now = 1;
+    for (int round = 0; round < 400; round++) {
+      const size_t n = 1 + rng() % Conntrack<>::kMaxBatch;
+      std::vector<std::vector<uint8_t>> frames;
+      std::vector<ParsedFlowPacket> parsed(n);
+      for (size_t i = 0; i < n; i++) {
+        const Ep a{static_cast<uint32_t>(0x0a000000u + rng() % 6), static_cast<uint16_t>(1000 + rng() % 4)};
+        const Ep b{static_cast<uint32_t>(0xc0a80000u + rng() % 3), static_cast<uint16_t>(80 + rng() % 2)};
+        const bool fwd = rng() % 2;
+        const Ep s = fwd ? a : b, d = fwd ? b : a;
+        switch (rng() % 8) {
+          case 0: case 1: case 2: frames.push_back(Tcp(s, d, kFlags[rng() % 7])); break;
+          case 3: case 4: frames.push_back(Udp(s, d)); break;
+          case 5: frames.push_back(Icmp(s, d, rng() % 2 ? 8 : 0, static_cast<uint16_t>(rng() % 3))); break;
+          case 6: {
+            std::vector<uint8_t> q = Udp(d, s);
+            q.erase(q.begin(), q.begin() + 14);
+            q.resize(28);
+            frames.push_back(Icmp(s, d, 3, 0, q));
+            break;
+          }
+          default: frames.push_back(Icmp(s, d, 13, 1)); break;  // untracked
+        }
+        if (ParseFrame(frames.back(), parsed[i]) != ParseStatus::kOk) {
+          parsed[i] = ParsedFlowPacket{};
+        }
+      }
+      if (rng() % 5 == 0) {
+        parsed[rng() % n] = ParsedFlowPacket{};  // an unparsed packet
+      }
+      std::vector<std::span<const uint8_t>> spans(frames.begin(), frames.end());
+      std::vector<Conntrack<>::Result> got(n);
+      batched->TrackBatch(spans, parsed, now, got);
+      // Entries are read once both sides have run the whole batch: a later
+      // packet of the batch may move the same connection on.
+      std::vector<Conntrack<>::Result> want(n);
+      for (size_t i = 0; i < n; i++) {
+        want[i] = scalar->Track(frames[i], parsed[i], now);
+      }
+      for (size_t i = 0; i < n; i++) {
+        ASSERT_EQ(want[i].status, got[i].status) << "round " << round << " packet " << i;
+        ASSERT_EQ(want[i].direction, got[i].direction) << "round " << round << " packet " << i;
+        ASSERT_EQ(want[i].handle, got[i].handle) << "round " << round << " packet " << i;
+        ASSERT_EQ(want[i].entry != nullptr, got[i].entry != nullptr);
+        if (want[i].entry != nullptr) {
+          ASSERT_EQ(want[i].entry->tcp, got[i].entry->tcp) << "round " << round << " packet " << i;
+          ASSERT_EQ(want[i].entry->replied, got[i].entry->replied);
+        }
+      }
+      now += rng() % 3 == 0 ? 50'000'000'000ull : 1000;
+      ASSERT_EQ(scalar->Expire(now, ~size_t{0}), batched->Expire(now, ~size_t{0}));
+      ASSERT_EQ(scalar->size(), batched->size());
+    }
+  }
+}
+
 }  // namespace
 }  // namespace bess::conntrack

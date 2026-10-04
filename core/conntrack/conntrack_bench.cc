@@ -103,14 +103,13 @@ struct Stream {
   std::vector<ParsedFlowPacket> parsed;
 };
 
-void BM_Track(benchmark::State &state) {
-  const int kase = static_cast<int>(state.range(0));
-  const auto conns = static_cast<uint32_t>(state.range(1));
-  TimeoutPolicy policy;
-  auto ct = Conntrack<>::Create(conns * 2 + 64, policy).value();
+// Cases 0-2: `conns` established connections, and a stream of one packet
+// kind per connection in random connection order (read sequentially: only the
+// table and the wheel are accessed at random, as on a packet path where the
+// parsed descriptor is the packet's own).
+Stream Established(Conntrack<> &ct, int kase, uint32_t conns, uint64_t now) {
   auto client = [](uint32_t i) { return 0x0a000000u + i; };
   constexpr uint32_t kServer = 0xc0a80001;
-  uint64_t now = 1;
   std::mt19937 rng(0x17);
   Stream s;
   auto add = [&](std::vector<uint8_t> f) {
@@ -119,37 +118,51 @@ void BM_Track(benchmark::State &state) {
     s.frames.push_back(std::move(f));
     s.parsed.push_back(p);
   };
-  if (kase <= 2) {
-    // Establish every connection, then stream one packet kind in random order.
-    for (uint32_t i = 0; i < conns; i++) {
-      const uint16_t port = static_cast<uint16_t>(1024 + i % 60000);
-      if (kase == 2) {
-        add(V4(client(i), port, kServer, 53, 17, 0));
-      } else {
-        for (auto [s1, s2, from_client] :
-             {std::tuple{kTcpSyn, 0, true}, {kTcpSyn | kTcpAck, 0, false}, {kTcpAck, 0, true}}) {
-          (void)s2;
-          auto f = from_client ? V4(client(i), port, kServer, 80, 6, s1)
-                               : V4(kServer, 80, client(i), port, 6, s1);
-          ParsedFlowPacket p;
-          (void)ParseFrame(f, p);
-          (void)ct->Track(f, p, now);
-        }
-        add(kase == 0 ? V4(client(i), port, kServer, 80, 6, kTcpAck)
-                      : V4(kServer, 80, client(i), port, 6, kTcpAck));
+  for (uint32_t i = 0; i < conns; i++) {
+    const uint16_t port = static_cast<uint16_t>(1024 + i % 60000);
+    if (kase == 2) {
+      add(V4(client(i), port, kServer, 53, 17, 0));
+    } else {
+      for (auto [s1, s2, from_client] :
+           {std::tuple{kTcpSyn, 0, true}, {kTcpSyn | kTcpAck, 0, false}, {kTcpAck, 0, true}}) {
+        (void)s2;
+        auto f = from_client ? V4(client(i), port, kServer, 80, 6, s1)
+                             : V4(kServer, 80, client(i), port, 6, s1);
+        ParsedFlowPacket p;
+        (void)ParseFrame(f, p);
+        (void)ct.Track(f, p, now);
       }
+      add(kase == 0 ? V4(client(i), port, kServer, 80, 6, kTcpAck)
+                    : V4(kServer, 80, client(i), port, 6, kTcpAck));
     }
-    // The stream holds the packets in a random connection order and is read
-    // sequentially: only the table and the wheel are accessed at random, as
-    // on a packet path where the parsed descriptor is the packet's own.
-    std::vector<uint32_t> order(conns);
-    for (auto &o : order) o = rng() % conns;
-    Stream shuffled;
-    for (const uint32_t i : order) {
-      shuffled.frames.push_back(s.frames[i]);
-      shuffled.parsed.push_back(s.parsed[i]);
-    }
-    s = std::move(shuffled);
+  }
+  std::vector<uint32_t> order(conns);
+  for (auto &o : order) o = rng() % conns;
+  Stream shuffled;
+  for (const uint32_t i : order) {
+    shuffled.frames.push_back(s.frames[i]);
+    shuffled.parsed.push_back(s.parsed[i]);
+  }
+  return shuffled;
+}
+
+void BM_Track(benchmark::State &state) {
+  const int kase = static_cast<int>(state.range(0));
+  const auto conns = static_cast<uint32_t>(state.range(1));
+  TimeoutPolicy policy;
+  auto ct = Conntrack<>::Create(conns * 2 + 64, policy).value();
+  auto client = [](uint32_t i) { return 0x0a000000u + i; };
+  constexpr uint32_t kServer = 0xc0a80001;
+  uint64_t now = 1;
+  Stream s;
+  auto add = [&](std::vector<uint8_t> f) {
+    ParsedFlowPacket p;
+    (void)ParseFrame(f, p);
+    s.frames.push_back(std::move(f));
+    s.parsed.push_back(p);
+  };
+  if (kase <= 2) {
+    s = Established(*ct, kase, conns, now);
     size_t pos = 0;
     uint64_t existing = 0;
     for (auto _ : state) {
@@ -212,9 +225,44 @@ void BM_Expire(benchmark::State &state) {
       benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
 }
 
+// BM_TrackBatch/<case>/<conns>: cases 0-2 through TrackBatch, 32 packets a
+// call; ns per packet, comparable with BM_Track's.
+void BM_TrackBatch(benchmark::State &state) {
+  const int kase = static_cast<int>(state.range(0));
+  const auto conns = static_cast<uint32_t>(state.range(1));
+  constexpr size_t kBatch = 32;
+  auto ct = Conntrack<>::Create(conns * 2 + 64, TimeoutPolicy{}).value();
+  const uint64_t now = 1;
+  Stream s = Established(*ct, kase, conns, now);
+  // Wrap-around copies, so every batch is contiguous.
+  for (size_t i = 0; i < kBatch; i++) {
+    s.frames.push_back(s.frames[i]);
+    s.parsed.push_back(s.parsed[i]);
+  }
+  std::vector<std::span<const uint8_t>> spans(s.frames.begin(), s.frames.end());
+  Conntrack<>::Result out[kBatch];
+  size_t pos = 0;
+  uint64_t existing = 0;
+  for (auto _ : state) {
+    ct->TrackBatch(std::span(spans).subspan(pos, kBatch), std::span(s.parsed).subspan(pos, kBatch),
+                   now, out);
+    for (const auto &r : out) {
+      existing += r.status == TrackStatus::kExisting || r.status == TrackStatus::kNew;
+    }
+    pos += kBatch;
+    if (pos >= conns) pos -= conns;
+  }
+  state.counters["accepted_pct"] = 100.0 * existing / (state.iterations() * kBatch);
+  state.counters["staged"] = ct->batch_body() == bess::dataplane::LookupBody::kStaged;
+  state.counters["ns_per_packet"] = benchmark::Counter(
+      static_cast<double>(state.iterations()) * kBatch,
+      benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
+}
+
 BENCHMARK(BM_Parse)->DenseRange(0, 3)->MinTime(0.2);
 BENCHMARK(BM_Track)->ArgsProduct({{0, 1, 2}, {1024, 65536, 1048576}})->MinTime(0.3);
 BENCHMARK(BM_Track)->Args({3, 1024})->Args({3, 65536})->MinTime(0.3);
+BENCHMARK(BM_TrackBatch)->ArgsProduct({{0, 1, 2}, {1024, 65536, 1048576}})->MinTime(0.3);
 BENCHMARK(BM_Expire)->Arg(65536)->Iterations(5);
 
 }  // namespace

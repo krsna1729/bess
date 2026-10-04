@@ -5954,7 +5954,7 @@ and synchronisation between workers (a connection belongs to one worker; RSS or 
 to it).
 
 **Revisit when:** a consumer needs window checks (then sequence tracking per direction), or the 1M-connection
-cost matters (a batch path that prefetches the index, slot and wheel node).
+cost matters beyond `TrackBatch` (below: prefetching the slot and wheel node too).
 
 **Change (M22, user decision 2026-10-04): Linux's flag-combination filter.** Before the TCP state table, a segment
 whose flags (PSH, ECE and CWR ignored) are not one of Linux `tcp_error()`'s valid combinations — SYN, SYN|URG,
@@ -5964,6 +5964,29 @@ move a connection to a closing state and its short timeout). The check is one sh
 byte. Found by the M22 conntrack model test (written independently from Linux's table); evidence: model walk over all
 256 flag bytes in every reachable state, 9 filter mutants caught only by the new test, ASan+UBSan clean, isolated A/B: no clear difference
 (64K Track rows rerun at 24 rounds: B/A 0.998-1.012).
+
+**Change (consolidation review, performance clawback): `TrackBatch`.** `Conntrack::TrackBatch(frames, parsed, now,
+out)` tracks up to 64 packets (`kMaxBatch`) in order, with the same results as `Track` packet by packet (a differential test over
+random streams that create, use and close connections within a batch, under both bodies; dropping the re-lookup of a
+miss is caught). Staged: keys for the whole batch, then `WorkerFlowTable::FindRefBatch` (hash and prefetch every
+index line, then probe), then each packet resolved as `Track` would; a miss is looked up again, as an earlier packet
+of the batch may have created its connection. Plain: `Track` per packet. `Create` picks staged once the table
+outgrows L2 (`BESS_LOOKUP_BODY` overrides). D-006's L1d threshold is too low here: staging costs 14-22% with an
+L2-resident table. `Track` itself is unchanged: `Track` is split into `Keyed`/`Unkeyed`/`Resolve` for sharing,
+release A/B against develop: 11/11 rows no clear difference. `FindBatch` keeps its own prefetch loop: sharing it
+through a callback measured 6-9% slower at in-cache sizes; with the loop restored, 30/30 `BM_WorkerLookup` rows no
+clear difference. No module calls `TrackBatch` yet.
+
+Evidence (release, isolated CPU 2, 16 rounds, ns per packet, `TrackBatch` against `Track`; the wrapper flagged IRQ
+activity on every run):
+
+| Connections | Body | Established (cases 0, 1, 2) |
+|---|---|---|
+| 1M | staged | -63.7%, -63.8%, -58.6% (205 -> 75 ns, case 0) |
+| 64K | staged | -35.7%, -41.8%, -17.7% |
+| 1K | plain | +8.4%, +10.9%, +16.1% (about 2 ns a packet: the batch call and result array) |
+
+Callers with small tables call `Track`.
 
 ## D-068 NAT as a library: bindings on the flow table, a bitmap port pool, generic expiry (M18)
 
