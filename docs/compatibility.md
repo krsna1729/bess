@@ -75,11 +75,11 @@ validates the software against the unix-socket and pcap ports, DPDK's
 | Area | Status | Where |
 |---|---|---|
 | Physical NIC over VFIO, MTU/jumbo, scatter RX | not validated (no NIC) | MODERNIZATION.md section 5 (C-HW) |
-| Multi-queue RSS; symmetric RSS key and RETA pinning | software path tested; real-NIC symmetry not validated | D-080 |
+| Multi-queue RSS; symmetric RSS key and RETA pinning | configuration code not exercised (CI's ports have one receive queue; only the symmetric-inputs check ran) | D-080 |
 | Real-NIC throughput baseline | not measured | C-HW |
 | AF_XDP zero-copy | not validated (copy mode only) | C-HW |
 | `MBUF_FAST_FREE`, MT-lockfree Tx, PortOut lock elision | not enabled; needs a PMD that advertises it and a workload | C-HW |
-| Checksum offload on transmit | negotiated per port and reported (`GetCapabilities` `PortInfo`); real-NIC correctness not validated | MODERNIZATION.md K4.4a, D-082 |
+| Checksum offload on transmit | negotiated per port and reported (`GetCapabilities` `PortInfo`); real-NIC correctness not validated | MODERNIZATION.md K4.4b, D-082 |
 | `rte_flow` offload (`offload/rte_flow_backend.h`) | probed against the null PMD only; lifecycle tested over the fake device | D-070 |
 | Hardware meter backend | not implemented | C-HW |
 | Certification matrix (Intel, NVIDIA/Mellanox, virtio, representors) | not run | D-070 |

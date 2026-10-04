@@ -158,6 +158,8 @@ bool UnloadPlugin(const std::string &path) {
   }
   // Drivers and gate hooks register without a destructor to undo it: the
   // builders would keep calling into unmapped code.
+  // (Removed before dlclose: destroying a builder runs the plugin's code.)
+  std::vector<std::string> module_classes;
   if (auto c = plugin_contents.find(path); c != plugin_contents.end()) {
     for (const std::string &d : c->second.port_drivers) {
       PortBuilder::DeregisterPortClass(d);
@@ -165,11 +167,24 @@ bool UnloadPlugin(const std::string &path) {
     for (const std::string &h : c->second.gate_hooks) {
       bess::GateHookBuilder::all_gate_hook_builders_holder().erase(h);
     }
+    module_classes = std::move(c->second.module_classes);
     plugin_contents.erase(c);
   }
   bool success = (dlclose(it->second) == 0);
   if (success) {
     plugin_handles.erase(it);
+    // dlclose succeeds without unmapping a library another loaded object
+    // still needs, or one marked NODELETE: its static destructors did not
+    // run, so its module classes stay registered. Keep it as loaded (with
+    // what is still registered) and say so, rather than report it gone.
+    if (void *still = dlopen(path.c_str(), RTLD_NOLOAD | RTLD_NOW)) {
+      LOG(ERROR) << "Plugin " << path << " stays mapped after dlclose (another loaded "
+                 << "object needs it, or it is NODELETE); its port drivers and gate "
+                 << "hooks were removed, its module classes remain";
+      plugin_handles.emplace(path, still);
+      plugin_contents[path] = PluginContents{std::move(module_classes), {}, {}};
+      return false;
+    }
   } else {
     LOG(WARNING) << "Error unloading module " << path << ": " << dlerror();
   }

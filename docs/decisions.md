@@ -7396,6 +7396,10 @@ after it was unmapped.
   still mapped -- and the loader removes the plugin's drivers and gate hooks before `dlclose` (module classes
   deregister themselves in the plugin's static destructors). A refused load removes them too.
 - Not tracked: a pointer into the plugin's code that some other plugin or module keeps on its own.
+- `dlclose` can succeed without unmapping (another loaded object needs the library, or it is NODELETE, as g++
+  makes a library with `STB_GNU_UNIQUE` symbols): a `dlopen(RTLD_NOLOAD)` probe afterwards finds it, and the unload
+  is reported failed with the plugin kept as loaded (its module classes still registered; its drivers and gate hooks,
+  removed before `dlclose` because destroying their builders runs its code, gone) and an error logged.
 
 **Evidence.** `sample_plugin_load` (suite `plugin`, live bessd): with a `SequentialUpdate` module `su0` alive,
 `unload_plugin` answers EBUSY naming "module su0" and the class stays registered; after `destroy_module` the unload
