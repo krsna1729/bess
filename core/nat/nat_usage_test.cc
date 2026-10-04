@@ -196,11 +196,19 @@ TEST(NatUsageTest, SharedCountsAddUpAcrossWorkersAndGrowth) {
       online++;
       for (int round = 0; round < kRounds; round++) {
         for (int flow = 0; flow < kFlows; flow++) {
-          auto out = Udp(0x0a000004, static_cast<uint16_t>(7000 + flow), kRemote, 53);
-          ParsedFlowPacket p;
-          if (ParseFrame(out, p) != ParseStatus::kOk) std::abort();
-          if (nat->Translate(out, p, Direction::kForward, 1) == Verdict::kTranslated) sent++;
-          domain.Quiescent(reader);
+          // A packet the full table refuses is sent again once it has grown
+          // (as a flow's next packet would be): every flow ends up mapped
+          // whatever the scheduling, with growth under way meanwhile.
+          Verdict v;
+          do {
+            auto out = Udp(0x0a000004, static_cast<uint16_t>(7000 + flow), kRemote, 53);
+            ParsedFlowPacket p;
+            if (ParseFrame(out, p) != ParseStatus::kOk) std::abort();
+            v = nat->Translate(out, p, Direction::kForward, 1);
+            domain.Quiescent(reader);
+            if (v == Verdict::kFull) std::this_thread::yield();
+          } while (v == Verdict::kFull);
+          if (v == Verdict::kTranslated) sent++;
         }
       }
       domain.Offline(reader);
@@ -208,10 +216,10 @@ TEST(NatUsageTest, SharedCountsAddUpAcrossWorkersAndGrowth) {
     });
   }
   while (online.load() < kWorkers) {
+    std::this_thread::yield();
   }
   // Grow whenever asked (as the module's handler does) until the workers are
-  // done and nothing more is asked; packets refused while the table was full
-  // are not counted as sent.
+  // done and nothing more is asked.
   size_t grown = 0;
   while (finished.load() < kWorkers || nat->NeedsGrowth()) {
     if (nat->NeedsGrowth()) {
@@ -224,12 +232,15 @@ TEST(NatUsageTest, SharedCountsAddUpAcrossWorkersAndGrowth) {
     std::this_thread::yield();
   }
   for (auto &t : workers) t.join();
-  EXPECT_GE(grown, 4u);
+  EXPECT_GE(grown, 5u) << "16 -> 512 for 300 flows";
   EXPECT_EQ(static_cast<size_t>(kFlows), nat->size());
+  EXPECT_EQ(static_cast<uint64_t>(kWorkers) * kRounds * kFlows, sent.load());
   // End everything: one final record per mapping.
   ASSERT_TRUE(domain.Register(6).has_value());
   domain.Online(6);
-  ASSERT_EQ(static_cast<size_t>(kFlows), nat->Expire(2000000, ~size_t{0}));
+  // EXPECT, not ASSERT: returning with reader 6 online would hang the NAT's
+  // destructor (it waits for a grace period).
+  EXPECT_EQ(static_cast<size_t>(kFlows), nat->Expire(2000000, ~size_t{0}));
   domain.Offline(6);
   domain.Unregister(6);
   uint64_t total = 0;
