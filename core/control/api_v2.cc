@@ -2,6 +2,7 @@
 
 #include "control/api_v2.h"
 
+#include <gflags/gflags.h>
 #include <google/protobuf/descriptor.h>
 #include <grpcpp/health_check_service_interface.h>
 #ifdef BESS_GRPC_REFLECTION
@@ -14,7 +15,6 @@
 #include <variant>
 
 #include "control/pipeline_snapshot.h"
-#include "utils/logging.h"
 #include "framework/plugin_check.h"
 #include "framework/plugin_loader.h"
 #include "module.h"
