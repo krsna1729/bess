@@ -224,7 +224,7 @@ class BessControlSdkTest(BessModuleTestCase):
         # The harness's unix socket ports appear once created.
         self.run_module(em, 0, [get_tcp_packet(sip='1.2.3.4', dip='5.6.7.8')], [0])
         ports = {p.name: p for p in client.capabilities().ports}
-        self.assertTrue(any(p.driver == 'UnixSocketPort' and p.rx_queues == 1
+        self.assertTrue(any(p.driver == 'UnixSocketPort' and p.rx_queues == 1 and p.symmetric_rss
                             for p in ports.values()), ports)
         samples = client.metrics()
         self.assertIn('bess_transaction_generation', {name for name, _ in samples})

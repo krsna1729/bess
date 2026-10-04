@@ -2512,8 +2512,13 @@ type PortInfo struct {
 	TxOuterIpv4Checksum bool `protobuf:"varint,8,opt,name=tx_outer_ipv4_checksum,json=txOuterIpv4Checksum,proto3" json:"tx_outer_ipv4_checksum,omitempty"`
 	TxOuterUdpChecksum  bool `protobuf:"varint,9,opt,name=tx_outer_udp_checksum,json=txOuterUdpChecksum,proto3" json:"tx_outer_udp_checksum,omitempty"`
 	TxMultiSegment      bool `protobuf:"varint,10,opt,name=tx_multi_segment,json=txMultiSegment,proto3" json:"tx_multi_segment,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Receive steering (TP8): both directions of a connection reach the same
+	// queue (trivially with one queue), and what decides the queue (equal on
+	// two ports: the same tuple lands on the same queue index; 0: unknown).
+	SymmetricRss  bool   `protobuf:"varint,11,opt,name=symmetric_rss,json=symmetricRss,proto3" json:"symmetric_rss,omitempty"`
+	RssSignature  uint64 `protobuf:"varint,12,opt,name=rss_signature,json=rssSignature,proto3" json:"rss_signature,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PortInfo) Reset() {
@@ -2614,6 +2619,20 @@ func (x *PortInfo) GetTxMultiSegment() bool {
 		return x.TxMultiSegment
 	}
 	return false
+}
+
+func (x *PortInfo) GetSymmetricRss() bool {
+	if x != nil {
+		return x.SymmetricRss
+	}
+	return false
+}
+
+func (x *PortInfo) GetRssSignature() uint64 {
+	if x != nil {
+		return x.RssSignature
+	}
+	return 0
 }
 
 type GetCapabilitiesResponse struct {
@@ -3265,7 +3284,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12\x12\n" +
 	"\x04path\x18\x03 \x01(\tR\x04path\x123\n" +
-	"\x15required_capabilities\x18\x04 \x01(\x04R\x14requiredCapabilities\"\xfc\x02\n" +
+	"\x15required_capabilities\x18\x04 \x01(\x04R\x14requiredCapabilities\"\xc6\x03\n" +
 	"\bPortInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06driver\x18\x02 \x01(\tR\x06driver\x12\x1b\n" +
@@ -3277,7 +3296,9 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x16tx_outer_ipv4_checksum\x18\b \x01(\bR\x13txOuterIpv4Checksum\x121\n" +
 	"\x15tx_outer_udp_checksum\x18\t \x01(\bR\x12txOuterUdpChecksum\x12(\n" +
 	"\x10tx_multi_segment\x18\n" +
-	" \x01(\bR\x0etxMultiSegment\"\x9a\x03\n" +
+	" \x01(\bR\x0etxMultiSegment\x12#\n" +
+	"\rsymmetric_rss\x18\v \x01(\bR\fsymmetricRss\x12#\n" +
+	"\rrss_signature\x18\f \x01(\x04R\frssSignature\"\x9a\x03\n" +
 	"\x17GetCapabilitiesResponse\x12%\n" +
 	"\x0edaemon_version\x18\x01 \x01(\tR\rdaemonVersion\x12\x12\n" +
 	"\x04rpcs\x18\x02 \x03(\tR\x04rpcs\x12,\n" +

@@ -655,6 +655,8 @@ grpc::Status ControlV2Service::GetCapabilities(grpc::ServerContext *,
     out->set_tx_outer_ipv4_checksum(tx.checksums.outer_ipv4_header);
     out->set_tx_outer_udp_checksum(tx.checksums.outer_udp);
     out->set_tx_multi_segment(tx.multi_segment_tx);
+    out->set_symmetric_rss(port->symmetric_rss());
+    out->set_rss_signature(port->rss_signature());
   }
   const v2::ListTransactionResourcesResponse listed = transactions_.List();
   for (const v2::TransactionResource &r : listed.resources()) {

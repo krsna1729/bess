@@ -7037,7 +7037,9 @@ schema also needs to know which RPCs an older daemon lacks (WatchEvents will be 
   as supporting nothing newer; `metrics()` reads ListMetrics. Every discovery call observes the daemon epoch, so a
   restart seen there retires old resource handles as a transaction would.
 - Not included: offload capabilities beyond the transmit offloads a port accepted; a port's flow-rule support is only
-  known by validating rules (M20), so it stays with the offload owner.
+  known by validating rules (M20), so it stays with the offload owner. Added since (D-088): each port's receive
+  steering, `symmetric_rss` and `rss_signature` (TP8, D-080), which decide whether per-worker connection state is
+  possible.
 
 **Evidence.** Fast build: 133/133 with the Go SDK's live test (Docker toolchain): `Capabilities` names a version and
 module classes, `Supports("ApplyTransaction")` holds, `Metrics` returns samples. Python live
@@ -7219,8 +7221,9 @@ against (persona D, D-074 era): code that uses non-header-only batteries (the ro
   the actions) registered with BESS's router in one engine. One transaction installs a session across both owners --
   the router's next hop and route, the application's QoS policy, action and rule -- and the fused path classifies the
   UE's downlink, meters it, routes it to its eNodeB through the FIB the transaction wrote (without the route it has no
-  way out) and writes the session's GTP-U header in front of the inner packet. Not shown: R4 as a graph vertical slice
-  (modules over the same resources), which the roadmap also asks for. A transaction whose
+  way out) and writes the session's GTP-U header in front of the inner packet. The graph vertical slice the roadmap
+  also asks for is G1.2b's `bessctl/module_tests/session_pipeline.py` (ExactMatch in action mode -> ActionTable ->
+  Meter -> Router, one ApplyTransaction, packets through the live graph). A transaction whose
   action names a next hop nobody installs is refused whole; the router's next hop cannot be removed while the
   application's action names it, and goes in one transaction with the session (referrers first). In-tree because an
   application resource reaches the wire through a codec, and codecs are internal (D-074): a public codec facade is
@@ -7306,5 +7309,6 @@ Live `control_sdk` (5 tests) passes; mutants -- a blind resend after a timeout, 
 lost-answer and the restart tests. The migrated bench on a fast build (2000 sessions, 1 s per rate): hit 0.50 at
 rates 0, 1000 and max (4073 tx/s), so the SDK-applied pipeline and rules steer packets. Go: `go vet`, `go test -race`
 (3 new tests, the same cases) and the live `control_sdk_go` (a pipeline planned, applied, refused at a stale
-generation, and removed) pass.
+generation, and removed) pass. Capability discovery gains each port's `symmetric_rss` and `rss_signature`
+(`PortInfo` 11, 12; the harness's single-queue unix-socket port reports symmetric).
 

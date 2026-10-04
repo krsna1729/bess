@@ -343,6 +343,11 @@ message PortInfo {
   bool tx_outer_ipv4_checksum = 8;
   bool tx_outer_udp_checksum = 9;
   bool tx_multi_segment = 10;
+  // Receive steering (TP8): both directions of a connection reach the same
+  // queue (trivially with one queue), and what decides the queue (equal on
+  // two ports: the same tuple lands on the same queue index; 0: unknown).
+  bool symmetric_rss = 11;
+  uint64 rss_signature = 12;
 }
 
 message GetCapabilitiesResponse {
