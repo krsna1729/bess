@@ -55,9 +55,13 @@ class BessEventsTest(BessModuleTestCase):
         self.assertEqual(seen[0].daemon_epoch, client.daemon_epoch)
 
     def test_a_reader_from_the_start_gets_what_is_held(self):
+        em = ExactMatch(fields=[{'offset': 26, 'num_bytes': 4},
+                                {'offset': 30, 'num_bytes': 4}])
         client = sdk.Client(self.bess.peer)
-        events = client.watch_events(from_sequence=1, reconnect=False)
-        first = next(events)
+        with client.transaction() as tx:  # at least one event exists
+            tx.upsert(client.resource(em.name + '/rules'), rule_key('9.9.9.9', '8.8.8.8'),
+                      module_msg.ExactMatchRuleValue(gate=1))
+        first = next(client.watch_events(from_sequence=1, reconnect=False))
         # Sequence 1 is held (this daemon has emitted few events), or a gap
         # names what is not.
         self.assertTrue(first.sequence == 1 or first.type == 'bess.gap', first)
