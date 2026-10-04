@@ -106,14 +106,35 @@ def find_cycles(edges, exceptions):
     return cycles
 
 
+def ubsan_build(build_dir):
+    """Whether the build directory was configured with UBSan (b_sanitize)."""
+    info = Path(build_dir) / "meson-info" / "intro-buildoptions.json"
+    if not info.exists():
+        return False
+    for option in json.loads(info.read_text()):
+        if option.get("name") == "b_sanitize":
+            value = option.get("value")
+            values = value if isinstance(value, list) else str(value).split(",")
+            return "undefined" in values
+    return False
+
+
 def load_libs(build_dir):
     libs = {}
     patterns = ["core/libbess_*.a", "protobuf/libbess_proto.a"]
+    # UBSan's vptr check makes code reference the typeinfo (_ZTI*) of every
+    # polymorphic type it handles, defined where the type's key function is:
+    # instrumentation, not a dependency (a dynamic_cast or typeid of a
+    # higher-layer type needs its header, which check_includes.py forbids).
+    skip_typeinfo = ubsan_build(build_dir)
     for pattern in patterns:
         for archive in sorted(glob.glob(str(Path(build_dir) / pattern))):
             name = lib_name(archive)
             if name:
-                libs[name] = archive_symbols(archive)
+                defined, undefined = archive_symbols(archive)
+                if skip_typeinfo:
+                    undefined = {s for s in undefined if not s.startswith("_ZTI")}
+                libs[name] = (defined, undefined)
     return libs
 
 
