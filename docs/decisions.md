@@ -6955,7 +6955,13 @@ looks like a new or untracked connection: a silent policy error, so the mode nee
   count and, with several queues, the same `rss_signature()`; and queue q of each port on one worker. Otherwise the module fails closed (everything to ogate 1), logs why, and its description
   says `closed: <why>`.
 
-**Evidence.** EVIDENCE
+**Evidence.** Fast build: unit 132/132 (layer include check included: the input check reads only the module graph,
+no runtime). Live (`bessctl/module_tests/conntrack.py`, 6 tests): an inside SYN starts a connection, its SYN-ACK
+from outside is tracked, an outside SYN starts none, in OWNED, SHARED and PER_WORKER (the harness feeds the module
+straight from single-queue ports on one worker: accepted); fed by a Source, PER_WORKER fails closed (`closed: its
+input ... is not a port queue`) or, with `fallback_shared`, tracks shared. Not exercised: a multi-queue NIC with
+symmetric RSS (no such hardware here; the hash configuration and the redirection-table pinning run only with
+several receive queues).
 
 
 ## D-081 Shared conntrack: one table for every worker, a per-connection lock, deadlines kept by the entry (TP8)
@@ -6986,5 +6992,12 @@ and taking a lock per packet would serialise every worker.
 - Known edge: a connection the expiry erases at the instant a worker refreshes it is gone (the packet that raced it is
   tracked; the next creates a new connection or, on the outside, is refused).
 
-**Evidence.** EVIDENCE
+**Evidence.** `shared_conntrack_test` (3 tests, in the TSan list, 6 runs each on 2 CPUs): one thread over 20,000
+random TCP/UDP/ICMP packets across hosts, both directions, policy refusals and expiry gives the owned tracker's
+status, direction and table size for every packet and the same removals at every expiry (it failed before the
+earlier-deadline timer move: a TCP close left the old 5-day timer armed); four workers sending the SYNs of 4,000 new
+connections at once create each exactly once; replies on other workers than their originals are tracked as replies
+while expiry runs. The owned tracker after the `ct_internal` extraction (release, isolated CPU 2, 12 ABBA rounds,
+contamination flagged): `BM_Track` 3-15% faster on 10 of 11 rows (placement), `BM_TrackBatch` no clear difference on
+8 of 9 rows (one -4%); not slower anywhere.
 
