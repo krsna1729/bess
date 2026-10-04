@@ -34,7 +34,7 @@
 - [18. Phase E — acceleration and portability](#18-phase-e--acceleration-and-portability)
 - [19. Phase F — hardening and product quality](#19-phase-f--hardening-and-product-quality)
 - [20–33. Build/API/verification/critical-path plans](#20-proposed-end-state-repositorybuild-layout)
-- [Appendices A–K](#appendix-a--current-file-ownership-map)
+- [Appendices A–M](#appendix-a--current-file-ownership-map)
 - [Final architectural statement](#final-architectural-statement)
 
 ## 0. Non-negotiable outcome
@@ -699,6 +699,8 @@ Packet paths fail closed on invalid/unresolved state.
 Unsupported strict semantics are rejected rather than silently weakened.
 
 No CPU RCU grace period may be used as proof that an object ID crossing an asynchronous queue or hardware MARK has been consumed.
+
+Assurance is chosen per failure class, at the cheapest level that closes it; claims never exceed the evidence behind them (Appendix L).
 
 ---
 
@@ -4734,6 +4736,8 @@ Every review should answer:
 - ID reuse safe?
 - async escape handled?
 - concurrency test?
+- does every claim match its evidence? (a test is not a proof; a bounded exploration is not an unbounded proof)
+- if the change touches a protocol with a C++ state model (Appendix L), did the model and its action-to-code mapping change with it?
 
 ### Ergonomics
 
@@ -4783,7 +4787,8 @@ It is complete when all of the following are demonstrably true.
 - stateful resources have failure/concurrency/model tests;
 - transaction semantics are precise;
 - async handles cannot ABA;
-- no plugin teardown occurs while its objects/code remain reachable.
+- no plugin teardown occurs while its objects/code remain reachable;
+- the strongest claim each document makes about a critical contract is backed by a mechanism able to establish it (Appendix L.1.5).
 
 ## Ergonomics
 
@@ -5595,6 +5600,139 @@ core/modules/hash_lb.*
 ```
 
 The document intentionally builds on the current direction rather than replacing it.
+
+---
+
+# Appendix L — Assurance doctrine and machine-checked specifications
+
+Source: an external discussion of formal verification for BESS (TLA+, Lean, Bend, Vx), reviewed 2026-10-04 against
+the roadmap at `d677f186`. Its central advice fits this roadmap's Pareto discipline: do not add a "formal
+verification phase"; choose, per failure class, the cheapest technique that actually closes it. L.1 is what BESS
+adopts now, in C++ and in its existing test and review machinery. L.2 is future work, each item with an entry gate.
+
+## L.1 Adopted now (C++ and process)
+
+### L.1.1 Assurance ladder
+
+| Level | Technique | BESS use |
+|---|---|---|
+| A0 | C++ types, concepts, `static_assert`, layout checks | strong IDs, ownership and policy axes as types (`table_policy.h`), slot layouts |
+| A1 | deterministic unit, differential, property and reference-model tests; fuzzing; sanitizers; fault injection; mutation checks | default for every table, parser, packet algorithm and resource operation (M22) |
+| A1+ | small-scope exhaustive exploration of an abstract state machine, written in C++ (gtest) | concurrent and lifecycle protocols, below |
+| A2 | TLA+/TLC bounded model checking | future (L.2) |
+| A3 | Lean theorems about functional semantics | future (L.2) |
+| A4 | implementation refinement proofs | not planned |
+
+A subsystem moves up a level only when the level below leaves a material failure class open. Importance alone is
+not a reason.
+
+### L.1.2 Small-scope protocol models in C++ (A1+)
+
+The protocols that have caused or nearly caused review findings will get a compact abstract state machine in C++
+(none exists yet; these three are the next assurance work items). A test enumerates every interleaving of its actions up to a small bound (for example 2 readers, 2 generations,
+3 resources, 2 requests) and asserts the invariants in every reachable state. The model holds only the semantic
+state (resources, references, generations, readers, owners, epochs), never the production containers, allocators
+or DPDK calls. It is a test, not a proof: it excludes violations only within the explored bound.
+
+| Protocol | Actions | Invariants |
+|---|---|---|
+| M8 transaction visibility | Prepare, RejectPrepare, Publish (per resource), Abort, ReaderObserve, Retire, Reclaim, Retry, Restart | a visible reference names a visible target; prepare/abort failures are invisible; no reclaim while reachable; no stale-generation commit; one execution per request id; scoped reads come from one generation |
+| M11 handoff ownership | Enqueue, Dequeue, Drop, Drain, Teardown, Resume, Reject | at most one owner per packet; a freed packet never becomes live; resume only at the current generation; teardown leaves no packet unaccounted |
+| M27 control retry/epoch | Send, Deliver, Commit, LoseReply, Query, Retry, RestartDaemon, Rediscover | same id and digest: at most one application; same id, other digest: refused; a timeout is never reported as failure; no status from an old epoch reported as certain; a stale handle is never sent |
+
+Each model's counterexamples become permanent concrete C++ regression tests against the production code. The
+existing reference models (`fdb_model_test`, `nat_model_test`, `conntrack_model_test`,
+`decision_cache_model_test`) stay A1; the M27 SDK's scripted recovery tests are the A1 base the M27 model extends.
+
+### L.1.3 Model-to-code mapping
+
+Each A1+ model's decision record carries a table that maps every model action to the production function or
+window that realizes it (for M8: Prepare to the engine's reserve/prepare phase, Publish to the infallible
+publication window, Reclaim to RCU reclamation after quiescence, Restart to the daemon-epoch change). A change
+that breaks a row must change the model or the code in the same commit. The model and the code cannot drift
+apart silently.
+
+### L.1.4 Single reference semantics for transforming code
+
+Code that transforms a specification into a faster representation (classifier canonicalization and backend
+choice, range splitting, the M13 EditPlan optimizer if adopted, incremental checksum updates) is tested against one
+straightforward reference implementation of the meaning: `reference(spec, input) == optimized(compile(spec),
+input)` over generated specifications and inputs. The reference is the documentation of the semantics. It is
+the object a later Lean definition (L.2) would formalize.
+
+### L.1.5 Claim precision
+
+Documents, decision records and PR descriptions must not describe tests as proofs, a bounded exploration as an
+unbounded proof, or a statement about a model as a statement about the C++, compiler or DPDK implementation unless
+a correspondence argument exists. This is in the review checklist (§32) and the definition of done (§33).
+
+### L.1.6 Placement and capacity validation (from the Vx discussion)
+
+These are already roadmap direction; the discussion sharpens them. Each lands in the milestone it belongs to, and
+none adds hot-path cost:
+
+- requested placement (NUMA node, queue-to-worker, device) is validated at init or control time into a bound plan;
+  the packet path consumes only the bound result;
+- memory admission per NUMA node and resource: a publication that would exceed a declared budget is refused
+  before it is visible, not discovered at allocation failure on a worker;
+- move-only ownership in public APIs wherever ownership transfers (packets, handoff, async completions).
+
+## L.2 Future work (entry gates)
+
+| Item | Gate to start | Kill criterion |
+|---|---|---|
+| TLA+/TLC pilot: M8 transaction publication (`spec/tla/Transactions.tla`) | the A1+ C++ model exists and its invariants are stable for one release | after the pilot: ADOPT if it found a real defect or states the contract materially better than the C++ model; LIMIT to that protocol if useful only there; STOP if it costs more than the risk it removes |
+| TLA+ for M20 async offload lifecycle (MARK IDs, install/remove/reset, delayed completions) | before the rte_flow async/template path is built (D-070's hardware matrix is blocked on hardware) | same three-way decision |
+| TLA+ for M11 handoff and M27 retry/epoch | the M8 pilot decides ADOPT | same |
+| Lean pilot: classifier semantics (exact, masked, range, precedence, default) and one canonicalization theorem | L.1.4's reference semantics is stable | STOP if it becomes a parallel implementation to maintain |
+| Lean for EditPlan semantic equivalence | M13 adopted | M13's optimizer must stay small enough to have a precise semantics; otherwise M13 itself is reconsidered |
+| Lean for checksum algebra (incremental equals full recomputation) | after the classifier pilot decides ADOPT | proves the mathematics only, never the inline asm; differential tests, the compiler matrix and mutation checks keep covering that |
+| TLAPS (unbounded TLA+ proofs) | a model has repeatedly found real defects and is an enduring artifact | not before |
+
+Rules for any adopted formal work:
+
+- Artifacts live in `spec/` (`spec/tla/`, `spec/lean/`), outside the production dependency graph. No production
+  target depends on them.
+- Toolchains are pinned (the TLC release; `lean-toolchain`) and run in a pinned container, as the DPDK and Go
+  generator pins are.
+- CI is asymmetric: tiny models and the proof library on PRs (seconds); larger scopes and liveness checks
+  nightly; the largest configurations before release.
+- A model much larger than the protocol it states is modelling implementation accidents. Shrink the model.
+- Two tools at most (TLA+ and Lean).
+
+Not planned at any level: proofs of DPDK, `rte_hash`, `rte_lpm`, PMDs, firmware, the scheduler, the C++ memory-model
+correspondence, compiler correctness, or the whole module graph. Bend and Vx do not enter the dependency graph;
+Bend's automatic parallelism does not fit packet execution, and a heterogeneous IR is a watch item only.
+
+---
+
+# Appendix M — UPF control-boundary gaps
+
+Source: an external UPF (OMEC) gap analysis against `develop` at `451ccd47`, re-checked 2026-10-04. Its measure
+of success: how much generic dataplane infrastructure an OMEC-style UPF can delete, so that it carries only PFCP and
+GTP semantics. Several of its gaps have closed since: the Go control SDK (M27.1), Bridge's unsynchronised FDB (now
+`PackedMacTable` with one writer, D-073), the thin `rte_flow` owner instead of a second flow language (D-070), and
+PacketStore's data race (pinned to one worker). The rest are adopted below. None defines PFCP, URR, QER or DDN
+semantics; each is a generic mechanism a UPF composes. Order: after M23 (no new major abstraction before it), in
+the order listed.
+
+| # | Gap | Lands in | Exit criterion |
+|---|---|---|---|
+| 1 | **ReplaceScope**: one operation that creates a scope version's new referents and switches the scope pointer, hiding today's two transactions (D-050) from the client | M8 follow-up + M27 SDK | a whole session modification is seen by readers as the old or the new version; the client submits one logical operation and never handles the intermediate state; failure injection at every prepare point; Mpps unchanged |
+| 2 | **Dataplane-to-control events**: worker-local bounded rings, a control-side drain, `WatchEvents` stream, SDK support (M25 phase 2) | M25 | no worker ever blocks; explicit overflow counter; monotonic sequence per source; generation/scope correlation; applications register their own event types |
+| 3 | **Streaming transactions**: many outstanding transactions on one stream, ordered result correlation, bounded queues and backpressure, the same apply engine and request-id semantics as unary | M27.2 | the SDK's `Commit` is the same call over unary or stream; sustained update rate measured against unary |
+| 4 | **Indexed object counters**: packet/byte counters for millions of objects, worker-local increments, range/batch snapshot, generation-safe ids, reset epochs, optional threshold arm (feeds 2) | TP7 (usage counters) / M25 | no mutex, no per-update allocation, no shared atomics on the packet path; snapshot cost per object measured |
+| 5 | **Owner-worker handoff with a resolved continuation**: a packet arriving on a non-owner worker is handed to its owner with its `ActionId`/`FlowHandle`, never reclassified (D-054 channels, continuation generations) | M11 follow-up | local-owner and remote-owner paths benchmarked at bursts 1/8/16/32; worker-exclusive meters and flow state need no synchronisation |
+| 6 | **PacketStore rewrite** on 5: per-owner store, preallocated descriptors, bounded queues, `ExpiryWheel`, flow/session handle index, an event on the first buffered packet (2) | after 2 and 5 | no allocation and no shared mutable container on the packet path; bounded memory set at init |
+| 7 | **UPF reference slice** as the M24 session-compiler appliance: N6 downlink and N3 uplink, multiple PDRs with arbitrary source and destination port ranges, QERs, one session modification through ReplaceScope, usage counters, idle buffering, timeout reconciliation | M24 | the plugin needs no generic BESS glue beyond the SDK and installed headers; if it does, the API is wrong, not the plugin |
+
+The visible-concept test for API review: a UPF author should need about ten BESS concepts (packet reference and
+cursor, typed classifier, `ActionId`, scope id and version, meter id, route domain and next hop, `FlowHandle`,
+worker id, the transaction SDK). RCU domains, engine internals, slot resources, resource bindings, QSBR, module
+pause and worker quiescence are BESS's own and must not be needed to write the slice in 7.
+
+IPv6 route domains and PDR keys, fragment reassembly, RSS/RETA validation and hardware meters follow only once the
+software slice proves the need.
 
 ---
 

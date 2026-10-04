@@ -40,7 +40,7 @@ here touches the fast tree or its DPDK.
 | benchmarks | on (the default) | CI compiles them; the fast tree does not |
 | sample plugin | on | the plugin path is part of the contract |
 | DPDK | `bess` profile, built by the lane's compiler; x86_64 `cpu_instruction_set=x86-64-v3`, aarch64 `platform=generic` (`-march=armv8-a+crc`, 128-byte cache lines) | a header-visible difference between a GCC- and a Clang-built DPDK is a real CI difference |
-| compilers | gcc-14 / g++-14, clang-19 / clang++-19 | `check-pins` fails CI when the script and `ci.yml` disagree |
+| compilers | gcc-14 / g++-14, clang-19 / clang++-19 | `check-pins` fails CI when a lane in `LANES` disagrees with its family's pin |
 
 ## Architectures
 
@@ -60,6 +60,26 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   third architecture runs, and everything (benchmarks too) builds and tests
   against them. All three are experimental (cannot block a merge) until they
   have been green; `check-pins` already holds them to the gating pins.
+- **Which lanes run when.** The lane table is `LANES` in `tools/ci_profile.py`;
+  the workflow's `Lanes` job turns it into the matrix
+  (`ci_profile.py lanes --event <event>`). Pull requests run the gating pair
+  (`gcc`, `clang`) and the sanitizer lanes; pushes to `develop`/`master` and
+  tags run every lane, adding arm64, generic and ubuntu-26.04 (`push_only`).
+  A break those lanes catch shows up on the push and is fixed forward. A new
+  push to a pull request cancels its older run.
+- **What a pull request skips.** Benchmarks are built in every lane but run
+  only on pushes and the nightly run (at 0.001 s per case they measure
+  nothing; their setup was 80% of a gating lane's test time). clang-tidy
+  checks only the changed C++ sources, or every source when a header, a
+  `meson.build` or the tidy configuration changes; pushes and the nightly run
+  check all. Tidy runs in the clang-asan lane, which is experimental, so it is
+  advisory until that lane gates. A nightly scheduled run (03:17 UTC) runs
+  every lane and the benchmarks on `develop` (named explicitly: a schedule
+  runs on the default branch, `master`).
+- **Compiler cache.** CI restores a ccache per lane (the newest; pull requests
+  can read `develop`'s) and uses it when `CCACHE_DIR` is set. Only pushes and
+  the nightly run save one, so pull requests do not churn the repository's
+  cache quota. Local runs use ccache when installed.
 - **DPDK's flags do not choose BESS's ISA.** `meson.build` drops every `-m`
   flag from libdpdk's cflags (prints them at configure) and stops on any flag
   it does not recognise. `bess-dev.pc` carries bessd's `-march` and the
@@ -113,7 +133,7 @@ same script (`env/install-deps.sh`). The container is limited to 8 CPUs and
    fast tree does not build. Run `tools/ci_profile.py all` before a push that
    touches headers, benchmarks or the build.
 2. Changing the CI configuration in `ci.yml` and not locally. The configuration
-   is in the script, so there is nothing to forget.
+   and the lane table are in the script, so there is nothing to forget.
 
 ## Include paths
 
