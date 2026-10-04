@@ -186,7 +186,6 @@ utility_sources = files(
   'utils/http_parser.cc',
   'utils/ip.cc',
   'utils/pcap_handle.cc',
-  'utils/simd.cc',
   'utils/stacktrace.cc',
   'utils/syscallthread.cc',
   'utils/time.cc',
@@ -474,6 +473,17 @@ install_headers(core_public_headers, subdir: 'bess/core')
 # Decision D-041 (docs/decisions.md): install a named API set; never recurse
 # into core implementation subdirectories.
 core_public_subdir_headers = {
+  'arch': files(
+    'arch/cpu.h',
+    'arch/byte_match.h',
+    'arch/checksum_kernels.h',
+    'arch/crc32c.h',
+    'arch/fp_env.h',
+    'arch/signal_context.h',
+    'arch/tag_match.h',
+    'arch/vlan.h',
+    'arch/word_probe.h',
+  ),
   'utils': files(
     'utils/arp.h',
     'utils/checksum.h',
@@ -487,7 +497,6 @@ core_public_subdir_headers = {
     'utils/ip.h',
     'utils/logging.h',
     'utils/random.h',
-    'utils/simd.h',
     'utils/tcp.h',
     'utils/time.h',
     'utils/udp.h',
@@ -578,6 +587,9 @@ foreach subdir, headers : core_public_subdir_headers
 endforeach
 
 unit_test_sources = [
+  'arch/arch_test.cc',
+  'arch/kernels_test.cc',
+  'arch/signal_context_test.cc',
   'flow/decision_cache_test.cc',
   'flow/expiry_consumer_test.cc',
   'offload/flow_rule_owner_test.cc',
@@ -673,6 +685,7 @@ unit_test_sources = [
   'utils/inline_function_test.cc',
   'utils/bpf_program_test.cc',
   'utils/checksum_test.cc',
+  'utils/copy_test.cc',
   'utils/codel_test.cc',
   'utils/cuckoo_map_test.cc',
   'utils/endian_test.cc',
@@ -685,6 +698,7 @@ unit_test_sources = [
   'utils/histogram_test.cc',
   'utils/ip_test.cc',
   'utils/llqueue_test.cc',
+  'utils/mcslock_test.cc',
   'utils/pcap_handle_test.cc',
   'utils/tcp_flow_reconstruct_test.cc',
   'utils/time_test.cc',
@@ -775,6 +789,22 @@ test(
   'check_layer_includes_self_test',
   python,
   args: [files('../tools/check_includes.py'), '--self-test'],
+  is_parallel: false,
+  suite: 'architecture',
+)
+# Architecture code stays in core/arch/; the allowlist grandfathers the rest
+# and only shrinks (M21, D-071).
+test(
+  'check_arch',
+  python,
+  args: [files('../tools/check_arch.py'), '--root', meson.project_source_root()],
+  is_parallel: false,
+  suite: 'architecture',
+)
+test(
+  'check_arch_self_test',
+  python,
+  args: [files('../tools/check_arch.py'), '--self-test'],
   is_parallel: false,
   suite: 'architecture',
 )

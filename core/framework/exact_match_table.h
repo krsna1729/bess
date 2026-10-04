@@ -5,6 +5,7 @@
 #ifndef BESS_FRAMEWORK_EXACT_MATCH_TABLE_H_
 #define BESS_FRAMEWORK_EXACT_MATCH_TABLE_H_
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -13,9 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include <rte_config.h>
-#include <rte_hash_crc.h>
-
+#include "arch/crc32c.h"
 #include "message.h"
 #include "metadata.h"
 #include "module.h"
@@ -33,9 +32,9 @@ static_assert(MAX_FIELD_SIZE <= sizeof(uint64_t),
 
 #define HASH_KEY_SIZE (MAX_FIELDS * MAX_FIELD_SIZE)
 
-#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
-#error this code assumes little endian architecture (x86)
-#endif
+static_assert(std::endian::native == std::endian::little,
+              "ExactMatchKey packs field bytes into uint64_t words assuming a "
+              "little-endian target");
 
 namespace bess {
 namespace framework {
@@ -82,14 +81,10 @@ class ExactMatchKeyHash {
     promise(len_ >= sizeof(uint64_t));
     promise(len_ <= sizeof(ExactMatchKey));
 
-#if __x86_64
     for (size_t i = 0; i < len_ / 8; i++) {
-      init_val = crc32c_sse42_u64(key.u64_arr[i], init_val);
+      init_val = bess::arch::Crc32c(key.u64_arr[i], init_val);
     }
     return init_val;
-#else
-    return rte_hash_crc(&key, len_, init_val);
-#endif
   }
 
  private:

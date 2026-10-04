@@ -7,7 +7,6 @@
 // benchmarks can reach it (K4.6 follow-up).
 
 #include <atomic>
-#include <immintrin.h>
 
 #include <cerrno>
 #include <cstdint>
@@ -17,6 +16,8 @@
 
 #include "utils/logging.h"
 #include <rte_hash_crc.h>
+
+#include "arch/word_probe.h"
 
 #include "dataplane/batch_stages.h"
 #include "gate.h"
@@ -28,7 +29,7 @@ using bess::gate_idx_t;
 // exactly 8 bytes. (2017's `alignas(32)` here made each slot 32 bytes, which
 // left slots 1-3 of every 4-way bucket unreachable by that lookup: 75% of
 // entries in a full table could not be found and could be added again.) The
-// AVX load's 32-byte alignment comes from the table allocation instead.
+// 4-slot probe's 32-byte alignment comes from the table allocation instead.
 struct l2_entry {
   union {
     struct {
@@ -96,7 +97,7 @@ inline int l2_init(struct l2_table *l2tbl, int size, int bucket) {
   }
 
   // 64-byte aligned, so every 4-slot (32-byte) bucket is 32-byte aligned for
-  // the AVX load and never straddles a cache line.
+  // the vector probe and never straddles a cache line.
   const size_t bytes = sizeof(l2_entry) * static_cast<size_t>(size) * bucket;
   l2tbl->table = static_cast<l2_entry *>(std::aligned_alloc(64, bytes));
   if (l2tbl->table == nullptr) {
@@ -181,39 +182,18 @@ inline uint64_t l2_make_slot(uint64_t addr, gate_idx_t gate) {
 }
 
 // Returns the gate stored in the bucket for `addr` (occupied), or -1. Only
-// words read with one atomic load are trusted: a candidate found by the vector
-// compare is re-read as one word and re-checked, so a key match and its gate
-// come from the same word even while the writer changes the bucket.
+// words read with one atomic load are trusted: a candidate found by the
+// architecture's 4-slot filter (one vector load on x86 with AVX2, D-017
+// amendment; every slot elsewhere) is re-read as one word and re-checked, so
+// a key match and its gate come from the same word even while the writer
+// changes the bucket.
 inline int l2_probe_bucket(uint64_t addr, const struct l2_entry *bucket,
                            uint64_t slots) {
   const uint64_t want = addr | (1ull << 63);
-#if defined(__x86_64__) && __AVX2__
   if (slots == 4) {
-    // x86-64 only: the argument below is about x86 loads. Elsewhere the
-    // scalar loop below runs; if a vector version is ever wanted there, use
-    // four atomic loads assembled in registers (D-017 amendment).
-    // The four slots are read with one 32-byte vector load, issued as inline
-    // assembly: a C++ vector load of words the writer stores atomically would
-    // be a data race in the language (undefined behaviour), while the asm is
-    // opaque to the compiler and its meaning is the hardware's. On x86 a slot
-    // no one is writing reads back intact; a slot being written may read
-    // torn, which yields at most a false candidate (rejected by the atomic
-    // re-check below) or a miss of an entry mid-move (covered: moves write
-    // the alternate slot first). Four atomic loads assembled in registers
-    // are the conforming alternative and cost +10% (P-core) to +56% (E-core)
-    // per lookup; see D-017's amendment (docs/decisions.md).
-    __m256i table;
-    asm volatile("vmovdqa %1, %0"
-                 : "=x"(table)
-                 : "m"(*reinterpret_cast<const __m256i *>(bucket)));
-    // Integer compare. (A former _mm256_cmp_pd compare treated the slots as
-    // doubles: an empty slot (+0.0) equalled the key for MAC 0 (-0.0), and
-    // with denormals-are-zero every masked slot equalled every key.)
-    const __m256i masked =
-        _mm256_and_si256(table, _mm256_set1_epi64x(kL2KeyMask));
-    const int bits = _mm256_movemask_pd(_mm256_castsi256_pd(
-        _mm256_cmpeq_epi64(masked, _mm256_set1_epi64x(want))));
-    for (int m = bits; m != 0; m &= m - 1) {
+    for (int m = static_cast<int>(bess::arch::MaskedWordCandidates64x4(
+             bucket, kL2KeyMask, want));
+         m != 0; m &= m - 1) {
       const uint64_t word = l2_load_slot(&bucket[__builtin_ctz(m)]);
       if ((word & kL2KeyMask) == want) {
         return static_cast<int>((word >> 48) & 0x7fff);
@@ -221,7 +201,6 @@ inline int l2_probe_bucket(uint64_t addr, const struct l2_entry *bucket,
     }
     return -1;
   }
-#endif
   for (uint64_t i = 0; i < slots; i++) {
     const uint64_t word = l2_load_slot(&bucket[i]);
     if ((word & kL2KeyMask) == want) {
@@ -250,8 +229,11 @@ inline int l2_find(const struct l2_table *l2tbl, uint64_t addr,
   if (g < 0) {
     // The alternate bucket must be read after the primary: a move writes the
     // alternate slot before clearing the primary, so primary-then-alternate
-    // cannot miss a moving entry. On x86 loads are not reordered with loads;
-    // this fence keeps the compiler from reordering them either.
+    // cannot miss a moving entry. The slot loads are relaxed; a primary load
+    // that read the writer's release store of the cleared (or a later) word
+    // synchronizes with this acquire fence, so the alternate probe sees the
+    // moved entry. (On x86 it emits no instruction: loads are not reordered
+    // with older loads there, and it keeps the compiler from reordering.)
     std::atomic_thread_fence(std::memory_order_acquire);
     idx = l2_alt_index(hash, l2tbl->size_power, idx);
     g = l2_probe_bucket(addr, &l2tbl->table[idx * l2tbl->bucket],

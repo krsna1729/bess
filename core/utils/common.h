@@ -9,9 +9,12 @@
 
 #include <unistd.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
+
+#include "arch/cpu.h"
 
 #if __cplusplus < 201703L  // pre-C++17?
 #error Must be built with C++17
@@ -59,13 +62,20 @@ static inline uint64_t align_ceil_pow2(uint64_t v) {
   return v + 1;
 }
 
-#define __cacheline_aligned __attribute__((aligned(64)))
+// A GNU attribute, as before M21, so both forms keep working:
+// struct __cacheline_aligned Foo {...}; and struct Foo {...} __cacheline_aligned;
+#define __cacheline_aligned __attribute__((aligned(bess::arch::kCacheLineSize)))
 
-/* For x86_64. DMA operations are not safe with these macros */
-#define INST_BARRIER() asm volatile("" ::: "memory")
-#define LOAD_BARRIER() INST_BARRIER()
-#define STORE_BARRIER() INST_BARRIER()
-#define FULL_BARRIER() asm volatile("mfence" ::: "memory")
+// CPU-memory ordering between threads (not device/DMA memory). INST_BARRIER
+// only stops the compiler from moving memory accesses across it. The others
+// are C++ fences: LOAD (acquire) and STORE (release) cost no instruction on
+// x86 but are real barriers on weakly ordered CPUs such as arm64; FULL
+// (seq_cst) also orders earlier stores before later loads (an x86 MFENCE or
+// locked instruction, arm64 DMB ISH). Prefer std::atomic with explicit orders.
+#define INST_BARRIER() bess::arch::CompilerBarrier()
+#define LOAD_BARRIER() std::atomic_thread_fence(std::memory_order_acquire)
+#define STORE_BARRIER() std::atomic_thread_fence(std::memory_order_release)
+#define FULL_BARRIER() std::atomic_thread_fence(std::memory_order_seq_cst)
 
 // Put this in the declarations for a class to be uncopyable.
 #define DISALLOW_COPY(TypeName) TypeName(const TypeName &) = delete

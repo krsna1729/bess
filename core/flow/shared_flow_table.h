@@ -18,6 +18,7 @@
 #include "utils/logging.h"
 #include <rte_spinlock.h>
 
+#include "arch/cpu.h"
 #include "classifier/concurrent_exact.h"
 #include "flow/flow_key.h"
 #include "flow/flow_observer.h"
@@ -169,7 +170,8 @@ class SharedFlowTable {
       return std::unexpected(FlowTableError::kBackendFailed);
     }
     Block slots, free_items, pending;
-    if (!slots.Allocate(slot_bytes, std::max<size_t>(alignof(Slot), 64)) ||
+    if (!slots.Allocate(slot_bytes, std::max<size_t>(alignof(Slot),
+                                                     arch::kCacheLineSize)) ||
         !free_items.Allocate(free_bytes, alignof(uint32_t)) ||
         !pending.Allocate(pending_bytes, alignof(uint32_t))) {
       return std::unexpected(FlowTableError::kOutOfMemory);
@@ -781,7 +783,7 @@ class SharedFlowTable {
   std::unique_ptr<classifier::ConcurrentExactTable> directory_;
   Slot *slots_ = nullptr;
   uint32_t capacity_ = 0;
-  alignas(64) std::atomic<uint32_t> size_{0};
+  alignas(arch::kCacheLineSize) std::atomic<uint32_t> size_{0};
   std::atomic<uint32_t> quarantined_{0};
   std::atomic<uint32_t> pending_published_{0};
   mutable rte_spinlock_t lock_;

@@ -161,7 +161,7 @@ int Worker::BlockWorker() {
   rcu_online_ = false;
   bess::runtime::runtime().rcu().Offline(wid_);
 
-  status_ = WORKER_PAUSED;
+  set_status(WORKER_PAUSED);
 
   ret = read(fd_event_, &t, sizeof(t));
   CHECK_EQ(ret, sizeof(t));
@@ -172,12 +172,12 @@ int Worker::BlockWorker() {
     bess::runtime::runtime().rcu().Online(wid_);
     rcu_online_ = true;
     bess::runtime::runtime().rcu().Quiescent(wid_);
-    status_ = WORKER_RUNNING;
+    set_status(WORKER_RUNNING);
     return 0;
   }
 
   if (t == bess::runtime::worker_signal::quit) {
-    status_ = WORKER_FINISHED;
+    set_status(WORKER_FINISHED);
     return 1;
   }
 
@@ -259,10 +259,10 @@ void *Worker::Run(void *_arg) {
   packet_pool_ = bess::PacketPool::GetDefaultPool(socket_);
   CHECK_NOTNULL(packet_pool_);
 
-  status_ = WORKER_PAUSING;
+  set_status(WORKER_PAUSING);
 
-  STORE_BARRIER();
-
+  // Publish() is a seq_cst store, so it also releases everything above
+  // (status_, packet_pool_, ...) to the master's load of workers_[wid_].
   bess::runtime::runtime().workers().Publish(wid_, this);
 
   // Register as a reader, but stay offline: a worker that merely exists as a

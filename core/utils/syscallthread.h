@@ -5,11 +5,11 @@
 #ifndef BESS_UTILS_SYSCALLTHREAD_H
 #define BESS_UTILS_SYSCALLTHREAD_H
 
+#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <thread>
 
-#include <nmmintrin.h>
 #include <signal.h>
 
 namespace bess {
@@ -127,8 +127,10 @@ class SyscallThread {
   // intermediate classes to have destuctors, but that doesn't work.)
   virtual ~SyscallThread() = default;
 
-  bool IsExitRequested() const { return exit_requested_; }
-  bool Done() const { return state_ == ThreadState::kDone; }
+  bool IsExitRequested() const {
+    return exit_requested_.load(std::memory_order_acquire);
+  }
+  bool Done() const { return state() == ThreadState::kDone; }
 
   /*!
    * Starts the thread running.  Will call the user provided Run()
@@ -144,7 +146,7 @@ class SyscallThread {
     }
 
     // If the thread isn't in pristine state, this is an error.
-    if (state_ != ThreadState::kNotStarted) {
+    if (state() != ThreadState::kNotStarted) {
       errno = EINVAL;
       return false;
     }
@@ -152,7 +154,7 @@ class SyscallThread {
     assert(!thread_.joinable());
     AssertNoKnockThread();
 
-    state_ = ThreadState::kStarting;
+    SetState(ThreadState::kStarting);
     thread_ = std::thread(RunInThread, this, reliable_);
 
     return true;
@@ -172,7 +174,7 @@ class SyscallThread {
    * t.Terminate(SyscallThread::WaitType::kRequestOnly).
    */
   void Terminate(enum WaitType waittype = WaitType::kWait) {
-    if (state_ == ThreadState::kNotStarted) {
+    if (state() == ThreadState::kNotStarted) {
       // If never started, there is nothing to terminate.
       return;
     }
@@ -184,8 +186,8 @@ class SyscallThread {
     // - it's not already on its way out, or done.
     // (if someone else already asked, that someone-else also
     // kicked off any signalling required).
-    bool send_signal = !exit_requested_ && state_ < ThreadState::kExiting;
-    exit_requested_ = true;
+    bool send_signal = !IsExitRequested() && state() < ThreadState::kExiting;
+    exit_requested_.store(true, std::memory_order_release);
     if (send_signal) {
       SendSignal();
     }
@@ -236,12 +238,12 @@ class SyscallThread {
   // (If we ever allow detaching threads, Reset+InternalReset will
   // be responsible for allocating new state objects if needed.)
   bool InternalReset() {
-    if (state_ == ThreadState::kNotStarted) {
+    if (state() == ThreadState::kNotStarted) {
       // Nothing to do.
       return true;
     }
 
-    if (state_ != ThreadState::kDone) {
+    if (state() != ThreadState::kDone) {
       // Inappropriate call.
       return false;
     }
@@ -250,16 +252,16 @@ class SyscallThread {
     WaitFor();
 
     // Rewind state.
-    exit_requested_ = false;
-    state_ = ThreadState::kNotStarted;
+    exit_requested_.store(false, std::memory_order_relaxed);
+    SetState(ThreadState::kNotStarted);
     return true;
   }
 
   // Marks thread as exiting.
-  void InternalBeginExiting() { state_ = ThreadState::kExiting; }
+  void InternalBeginExiting() { SetState(ThreadState::kExiting); }
 
   // Detect whether thread is marked "exiting" or "exited".
-  bool ExitingOrExited() const { return state_ >= ThreadState::kExiting; }
+  bool ExitingOrExited() const { return state() >= ThreadState::kExiting; }
 
   // Kick (deliver signal to) thread to get an in-progress system
   // call to return EINTR.  Note that this just sends one signal!
@@ -271,8 +273,14 @@ class SyscallThread {
   // to the instance.
   static void RunInThread(SyscallThread *thread, bool reliable);
 
-  volatile enum ThreadState state_;
-  volatile bool exit_requested_;
+  // Written by the controlling thread and the syscall thread, read by both
+  // (and by knock threads): acquire/release so a reader that sees kDone also
+  // sees what Run() did. Plain loads/stores on x86.
+  ThreadState state() const { return state_.load(std::memory_order_acquire); }
+  void SetState(ThreadState s) { state_.store(s, std::memory_order_release); }
+
+  std::atomic<ThreadState> state_;
+  std::atomic<bool> exit_requested_;
   bool reliable_;
   std::thread thread_;
 };

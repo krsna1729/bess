@@ -29,11 +29,8 @@
 #include <assert.h>
 #include <stddef.h>
 #include <string.h>
-#ifdef _MSC_VER
-#include <nmmintrin.h>
-#else
-#include <x86intrin.h>
-#endif
+
+#include "arch/byte_match.h"
 
 /* $Id$ */
 
@@ -102,30 +99,16 @@ static const char *token_char_map =
     "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
     "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
-// Note: SSE version of findchar_fast always reads 16 bytes
-// out of ranges, and ranges_size must be even and between 2 and 16.
+// Skips 16-byte blocks with no byte in `ranges` (a vector kernel on x86 with
+// SSE4.2, nothing elsewhere); the callers' scalar loops do the rest. Reads 16
+// bytes of `ranges`; ranges_size must be even and between 2 and 16.
 static const char *findchar_fast(const char *buf, const char *buf_end,
                                  const char *ranges, size_t ranges_size,
                                  int *found) {
-  *found = 0;
-  if (likely(buf_end - buf >= 16)) {
-    __m128i ranges16 = _mm_loadu_si128((const __m128i *)((const void *)ranges));
-
-    size_t left = (buf_end - buf) & ~15;
-    do {
-      __m128i b16 = _mm_loadu_si128((const __m128i *)((const void *)buf));
-      int r = _mm_cmpestri(
-          ranges16, ranges_size, b16, 16,
-          _SIDD_LEAST_SIGNIFICANT | _SIDD_CMP_RANGES | _SIDD_UBYTE_OPS);
-      if (unlikely(r != 16)) {
-        buf += r;
-        *found = 1;
-        break;
-      }
-      buf += 16;
-      left -= 16;
-    } while (likely(left != 0));
-  }
+  bool hit;
+  buf = bess::arch::SkipBytesOutsideRanges(buf, buf_end, ranges, ranges_size,
+                                           &hit);
+  *found = hit;
   return buf;
 }
 

@@ -23,10 +23,30 @@ cpp = meson.get_compiler('cpp')
 python = import('python').find_installation('python3')
 fs = import('fs')
 
+# The ISA BESS (and every plugin built from bess-dev) is compiled for comes
+# from these two options alone (M21). `cpu` is passed as -march=<cpu> on both
+# supported architectures: native, or a named baseline (x86_64: x86-64-v3, the
+# CI floor; aarch64: armv8.2-a, the CI floor); '' passes no flag (the
+# compiler's default ISA). `arch_generic` makes core/arch/ take its portable
+# paths so an x86 build compiles and tests what other architectures run.
+cpu_family = host_machine.cpu_family()
+if cpu_family not in ['x86_64', 'aarch64']
+  warning('BESS is built and tested on x86_64 and aarch64; @0@ is unsupported'.format(cpu_family))
+endif
+bess_isa_args = []
 cpu = get_option('cpu')
 if cpu != ''
-  add_project_arguments('-march=' + cpu, language: 'cpp')
+  if not cpp.has_argument('-march=' + cpu)
+    error(('cpu=@0@: @1@ rejects -march=@0@ on @2@. Use native, a baseline of ' +
+           'this architecture (x86_64: x86-64-v3; aarch64: armv8.2-a), or ' +
+           'cpu= (empty) for the compiler default.').format(cpu, cpp.get_id(), cpu_family))
+  endif
+  bess_isa_args += '-march=' + cpu
 endif
+if get_option('arch_generic')
+  bess_isa_args += '-DBESS_ARCH_GENERIC'
+endif
+add_project_arguments(bess_isa_args, language: 'cpp')
 
 add_project_arguments(
   '-D_GNU_SOURCE',
@@ -54,8 +74,14 @@ static_binary_opt = get_option('static_binary')
 is_static_deps = (static_binary_opt != 'none')
 dpdk_is_static = (get_option('dpdk_link') == 'static') or is_static_deps
 
-# libdpdk.pc carries the DPDK build machine's -march and -mrtm flags. They
-# must not override BESS's explicit cpu option, especially in portable CI.
+# libdpdk's cflags carry the machine flags DPDK itself was built with (x86:
+# -march=<cpu_instruction_set> -mrtm, sometimes -msse4; arm64: -march=armv8-a+crc
+# or -mcpu=<core>, -moutline-atomics). BESS's ISA is the cpu option alone, so
+# every -m flag is dropped. Kept: include paths, the forced rte_config.h
+# include and defines. Any other kind of flag stops the configure, so a new
+# DPDK flag is reviewed rather than silently inherited. (DPDK's libraries
+# still run only on CPUs that have the ISA DPDK was built for; the bootstrap
+# builds it for the same floor, tools/bootstrap_dpdk.py.)
 dpdk_raw = dependency(
   'libdpdk',
   method: 'pkg-config',
@@ -70,15 +96,47 @@ if pkg_config_paths.length() > 0
 endif
 
 dpdk_compile_args = []
+# The same flags for bess-dev.pc, with an option and its operand joined
+# (-includerte_config.h): pkg.generate drops a repeated '-include' token.
+dpdk_pc_cflags = []
+dpdk_dropped_args = []
+dpdk_flag_with_operand = ''
 foreach arg : run_command(
   pkg_config, '--cflags', 'libdpdk',
   env: pkg_config_env,
   check: true,
-).stdout().strip().split(' ')
-  if arg != '' and not arg.startswith('-march=') and arg != '-mrtm'
+).stdout().strip().split()
+  if dpdk_flag_with_operand != ''
+    dpdk_compile_args += [dpdk_flag_with_operand, arg]
+    dpdk_pc_cflags += dpdk_flag_with_operand + arg
+    dpdk_flag_with_operand = ''
+  elif arg in ['-include', '-isystem', '-idirafter', '-iquote']
+    dpdk_flag_with_operand = arg
+  elif arg.startswith('-I') or arg.startswith('-D') or arg.startswith('-U') or arg.startswith('-isystem') or arg == '-pthread'
     dpdk_compile_args += arg
+    dpdk_pc_cflags += arg
+  elif arg.startswith('-m')
+    dpdk_dropped_args += arg
+  else
+    error(('libdpdk cflag "@0@" is neither an include path, a define nor a ' +
+           'machine flag. Decide whether BESS may inherit it (meson.build, ' +
+           'DPDK cflag filter).').format(arg))
   endif
 endforeach
+if dpdk_flag_with_operand != ''
+  error('libdpdk cflags end with "@0@" and no operand'.format(dpdk_flag_with_operand))
+endif
+# The guarantee itself, independent of how the filter above is written: no
+# DPDK machine flag reaches BESS's compile or a plugin's.
+foreach arg : dpdk_compile_args + dpdk_pc_cflags
+  if arg.startswith('-m')
+    error('DPDK machine flag @0@ would leak into BESS or bess-dev.pc'.format(arg))
+  endif
+endforeach
+message('libdpdk machine flags dropped: @0@; BESS compiles with: @1@'.format(
+  dpdk_dropped_args.length() > 0 ? ' '.join(dpdk_dropped_args) : '(none)',
+  bess_isa_args.length() > 0 ? ' '.join(bess_isa_args) : '(the compiler default ISA)'))
+
 dpdk_pkg_link_args = ['--libs', 'libdpdk']
 if dpdk_is_static
   dpdk_pkg_link_args = ['--libs', '--static', 'libdpdk']
@@ -177,6 +235,17 @@ version_h = custom_target(
 )
 
 # Decision D-041: plugin compile dependencies exclude daemon-only gRPC.
+# Plugins compile for bessd's ISA (M21): libdpdk is not a `requires`, because
+# pkg-config would emit DPDK's own -march/-mrtm after BESS's flags and the
+# last -march wins. Instead the package carries BESS's ISA flags, the DPDK
+# cflags BESS itself compiles with (filtered above) and DPDK's shared-library
+# link flags. The DPDK prefix is therefore fixed at BESS's build time, as it
+# already was inside libdpdk.pc.
+dpdk_plugin_libs = run_command(
+  pkg_config, '--libs', 'libdpdk',
+  env: pkg_config_env,
+  check: true,
+).stdout().strip().split()
 pkg = import('pkgconfig')
 pkg.generate(
   name: 'bess-dev',
@@ -184,8 +253,10 @@ pkg.generate(
   description: 'BESS dataplane plugin and module development headers',
   version: meson.project_version(),
   subdirs: ['bess', 'bess/core'],
-  extra_cflags: ['-D_GNU_SOURCE', '-DGLOG_USE_GLOG_EXPORT', '-include', 'cinttypes'],
-  requires: ['libdpdk', 'libglog', 'protobuf'],
+  extra_cflags: bess_isa_args + dpdk_pc_cflags +
+                ['-D_GNU_SOURCE', '-DGLOG_USE_GLOG_EXPORT', '-include', 'cinttypes'],
+  libraries: dpdk_plugin_libs,
+  requires: ['libglog', 'protobuf'],
 )
 
 subdir('protobuf')

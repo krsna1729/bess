@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "arch/cpu.h"
 #include "commands.h"
 #include "event.h"
 #include "gate.h"
@@ -164,7 +165,7 @@ enum CheckConstraintResult {
   CHECK_FATAL_ERROR = 2
 };
 
-class alignas(64) Module {
+class alignas(bess::arch::kCacheLineSize) Module {
   // overide this section to create a new module -----------------------------
  public:
   Module()

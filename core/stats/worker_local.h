@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <memory>
 
+#include "arch/cpu.h"
 #include "dataplane/worker_id.h"
 #include "utils/common.h"
 
@@ -14,7 +15,7 @@ namespace bess::stats {
 
 using dataplane::WorkerId;
 
-inline constexpr size_t kCacheLine = 64;
+inline constexpr size_t kCacheLine = arch::kCacheLineSize;
 
 // One `T` per worker, each on its own cache lines (K6).
 //

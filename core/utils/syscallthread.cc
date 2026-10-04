@@ -79,18 +79,18 @@ void SyscallThread::RunInThread(SyscallThread *syscaller, bool reliable) {
   // Note that we're now ready to act upon SIG_THREAD_EXIT, i.e.,
   // we have the right signal mask established.  This is really
   // just for debug - we have to be able to act on it early.
-  syscaller->state_ = SyscallThread::ThreadState::kReady;
+  syscaller->SetState(SyscallThread::ThreadState::kReady);
 
   // Run the user's code.  Note that it's possible that we were told
   // to exit already, e.g., before we finished setting the signal mask;
   // in this case, do NOT run the user's code (it might block forever,
   // if pfuncs is true).
-  if (!syscaller->exit_requested_) {
+  if (!syscaller->IsExitRequested()) {
     syscaller->Run();
   }
 
   // We're done; remark on this and terminate (by returning).
-  syscaller->state_ = SyscallThread::ThreadState::kDone;
+  syscaller->SetState(SyscallThread::ThreadState::kDone);
 }
 
 /*

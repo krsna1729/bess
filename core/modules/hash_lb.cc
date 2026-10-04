@@ -7,22 +7,15 @@
 #include <utility>
 #include <vector>
 
+#include "arch/crc32c.h"
 #include "dataplane/member_select.h"
 
 static inline uint32_t hash_16(uint16_t val, uint32_t init_val) {
-#if __x86_64
-  return crc32c_sse42_u16(val, init_val);
-#else
-  return crc32c_2bytes(val, init_val);
-#endif
+  return bess::arch::Crc32c(val, init_val);
 }
 
 static inline uint32_t hash_32(uint32_t val, uint32_t init_val) {
-#if __x86_64
-  return crc32c_sse42_u32(val, init_val);
-#else
-  return crc32c_1word(val, init_val);
-#endif
+  return bess::arch::Crc32c(val, init_val);
 }
 
 // Returns a value in [0, range) as a function of an opaque number: the shared

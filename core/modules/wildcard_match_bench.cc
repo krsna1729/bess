@@ -23,8 +23,6 @@
 
 #include <benchmark/benchmark.h>
 
-#include <rte_hash_crc.h>
-
 #include <array>
 #include <climits>
 #include <cstddef>
@@ -34,6 +32,7 @@
 #include <span>
 #include <vector>
 
+#include "arch/crc32c.h"
 #include "classifier/extract_plan.h"
 #include "classifier/masked_exact.h"
 #include "classifier/runtime_schema.h"
@@ -314,15 +313,10 @@ struct WmLegacyHash {
   size_t words = 1;
   HashResult operator()(const WmWordKey &key) const noexcept {
     HashResult hash = 0;
-#if __x86_64
     for (size_t i = 0; i < words; i++) {
-      hash = static_cast<HashResult>(crc32c_sse42_u64(key.words[i], hash));
+      hash = static_cast<HashResult>(bess::arch::Crc32c(key.words[i], hash));
     }
     return hash;
-#else
-    return static_cast<HashResult>(
-        rte_hash_crc(&key, words * sizeof(uint64_t), hash));
-#endif
   }
 };
 

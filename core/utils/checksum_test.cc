@@ -55,6 +55,47 @@ TEST(ChecksumTest, GenericChecksum) {
   }
 }
 
+// Sums near the one's complement wrap: mostly-0xFF bytes make every 32-bit
+// word close to 0xFFFFFFFF, so the end-around carries (including a carry out
+// of the final fold) and the +0/-0 boundary are hit constantly. Every length
+// up to 256 at every 4-byte misalignment, against DPDK's rte_raw_cksum().
+TEST(ChecksumTest, GenericChecksumCarryBoundaries) {
+  const uint8_t kBytes[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0x00, 0x01, 0x02};
+  alignas(8) uint8_t buf[256 + 8];
+  for (int trial = 0; trial < 200; trial++) {
+    for (uint8_t &b : buf) {
+      b = trial == 0 ? 0xFF : kBytes[rd.GetRange(sizeof(kBytes))];
+    }
+    for (size_t off = 0; off < 4; off++) {
+      for (size_t len = 0; len <= 256; len++) {
+        uint16_t cksum_bess = CalculateGenericChecksum(buf + off, len);
+        uint16_t cksum_dpdk = ~rte_raw_cksum(buf + off, len);
+        ASSERT_EQ(cksum_dpdk, cksum_bess)
+            << "trial=" << trial << " off=" << off << " len=" << len;
+      }
+    }
+  }
+
+  // All-ones 16-byte blocks, then a tail of 0x01 and zeros: under 128 bytes
+  // the x86-64 add-with-carry kernel reduces the blocks to 2^33 - 2, and the
+  // tail's 1 carries the total across 2^32 a second time, so the last
+  // end-around carry of the final fold decides the result.
+  for (size_t off = 0; off < 4; off++) {
+    for (size_t len = 17; len <= 256; len++) {
+      const size_t blocks = len & ~size_t{15};
+      if (blocks == len) {
+        continue;
+      }
+      memset(buf + off, 0xFF, blocks);
+      memset(buf + off + blocks, 0, len - blocks);
+      buf[off + blocks] = 0x01;
+      uint16_t cksum_bess = CalculateGenericChecksum(buf + off, len);
+      uint16_t cksum_dpdk = ~rte_raw_cksum(buf + off, len);
+      ASSERT_EQ(cksum_dpdk, cksum_bess) << "off=" << off << " len=" << len;
+    }
+  }
+}
+
 // Tests IP checksum
 TEST(ChecksumTest, Ipv4NoOptChecksum) {
   char buf[1514] = {0};  // ipv4 header w/o options
@@ -321,20 +362,16 @@ TEST(ChecksumTest, TcpChecksum) {
   }
 }
 
-// Regression test for a real miscompile found (and fixed) in this session:
-// the checksum asm blocks declared their running sum as a read-write "+r"
-// operand without an earlyclobber ("&"), while also reading src/dst/len
-// into separate "r" input operands later in the same asm block. When GCC
-// can prove the sum's initial value equals one of those inputs -- which
-// happens here because a zero-length payload makes CalculateSum() return
-// 0, and src/dst are also all-zero -- it's permitted to coalesce them into
-// one register, corrupting the checksum (confirmed via direct disassembly:
-// GCC 13 at -O3 emitted "adcl %eax, %eax" instead of adding the real
-// src/dst values). This exact packet shape (zero addresses, no payload) is
-// exactly what a stress/fuzz test could plausibly generate, so pin it here
-// against DPDK's independent rte_ipv4_udptcp_cksum() oracle rather than
-// only relying on the randomized loop above (which uses rd.Get() and would
-// only hit this by chance).
+// Regression test for a real miscompile in the former inline-asm checksum
+// code: its running sum was a read-write "+r" operand without an earlyclobber
+// ("&") next to separate "r" inputs for src/dst/len, and when GCC could prove
+// the sum's initial value equal to one of them -- a zero-length payload makes
+// CalculateSum() return 0, and src/dst are all-zero here -- it coalesced them
+// into one register (GCC 13 -O3 emitted "adcl %eax, %eax"). The asm is gone;
+// this packet shape (zero addresses, no payload), which a stress/fuzz test
+// could plausibly generate, stays pinned against DPDK's independent
+// rte_ipv4_udptcp_cksum() oracle rather than left to the randomized loop
+// above (which uses rd.Get() and would only hit this by chance).
 TEST(ChecksumTest, TcpChecksumZeroAddressNoPayload) {
   char buf[1514] = {0};
 
@@ -389,6 +426,104 @@ TEST(ChecksumTest, UdpChecksumZeroAddressNoPayload) {
 
   udp->checksum = cksum_bess;
   EXPECT_TRUE(VerifyIpv4UdpChecksum(*ip, *udp));
+}
+
+// Headers where they really sit: behind a 14-byte Ethernet header, i.e. at
+// 2 mod 4 (mbuf data starts 4-byte aligned), and at other 2-byte-aligned
+// offsets (the header structs' be16_t fields need that much). Every header
+// function must read them without assuming 4-byte alignment (run under
+// UBSan, a misaligned 4-byte load fails here) and must agree with DPDK and
+// with the same bytes at offset 0.
+TEST(ChecksumTest, HeadersAtEthernetOffsets) {
+  constexpr size_t kOffsets[] = {0, 2, 6, 14, 18};
+  constexpr size_t kMaxPacket = 15 * 4 + 1500;
+  alignas(64) uint8_t ref[kMaxPacket];
+  alignas(64) uint8_t buf[kMaxPacket + 32];
+
+  for (int trial = 0; trial < 20000; trial++) {
+    const size_t ihl = trial % 3 == 0 ? 5 + rd.GetRange(11) : 5;
+    const bool tcp = trial & 1;
+    const size_t l4_header = tcp ? sizeof(Tcp) : sizeof(Udp);
+    const size_t l4_len = l4_header + rd.GetRange(64);
+    for (uint8_t &b : ref) {
+      b = static_cast<uint8_t>(rd.Get());
+    }
+    auto *ip = reinterpret_cast<Ipv4 *>(ref);
+    ip->version = 4;
+    ip->header_length = ihl;
+    ip->length = be16_t(ihl * 4 + l4_len);
+    ip->protocol = tcp ? Ipv4::Proto::kTcp : Ipv4::Proto::kUdp;
+    // DPDK sums the checksum fields too, so they start at zero (BESS skips
+    // them; the verify pass below stores real values).
+    ip->checksum = 0;
+    if (tcp) {
+      reinterpret_cast<Tcp *>(ref + ihl * 4)->checksum = 0;
+    } else {
+      reinterpret_cast<Udp *>(ref + ihl * 4)->length = be16_t(l4_len);
+      reinterpret_cast<Udp *>(ref + ihl * 4)->checksum = 0;
+    }
+
+    struct Results {
+      uint16_t ip, ip_noopt, l4;
+      bool ip_ok, ip_noopt_ok, l4_ok;
+    } expect{};
+    for (size_t off : kOffsets) {
+      memcpy(buf + off, ref, sizeof(ref));
+      const auto &h = *reinterpret_cast<const Ipv4 *>(buf + off);
+      const uint8_t *l4 = buf + off + ihl * 4;
+      Results got;
+      got.ip = CalculateIpv4Checksum(h);
+      got.ip_noopt = CalculateIpv4NoOptChecksum(h);
+      got.ip_ok = VerifyIpv4Checksum(h);
+      got.ip_noopt_ok = VerifyIpv4NoOptChecksum(h);
+      if (tcp) {
+        got.l4 = CalculateIpv4TcpChecksum(h, *reinterpret_cast<const Tcp *>(l4));
+        got.l4_ok = VerifyIpv4TcpChecksum(h, *reinterpret_cast<const Tcp *>(l4));
+      } else {
+        got.l4 = CalculateIpv4UdpChecksum(h, *reinterpret_cast<const Udp *>(l4));
+        got.l4_ok = VerifyIpv4UdpChecksum(h, *reinterpret_cast<const Udp *>(l4));
+      }
+
+      if (off == 0) {
+        expect = got;
+      } else {
+        ASSERT_EQ(expect.ip, got.ip) << "off=" << off;
+        ASSERT_EQ(expect.ip_noopt, got.ip_noopt) << "off=" << off;
+        ASSERT_EQ(expect.l4, got.l4) << "off=" << off;
+        ASSERT_EQ(expect.ip_ok, got.ip_ok) << "off=" << off;
+        ASSERT_EQ(expect.ip_noopt_ok, got.ip_noopt_ok) << "off=" << off;
+        ASSERT_EQ(expect.l4_ok, got.l4_ok) << "off=" << off;
+      }
+
+      const auto *dh = reinterpret_cast<const rte_ipv4_hdr *>(buf + off);
+      // DPDK can return -0 (0xffff) where BESS returns 0, see above.
+      const uint16_t dpdk_ip = rte_ipv4_cksum(dh);
+      ASSERT_EQ(dpdk_ip == 0xffff ? 0 : dpdk_ip, got.ip) << "off=" << off;
+      const uint16_t dpdk_l4 = rte_ipv4_udptcp_cksum(dh, l4);
+      if (tcp && dpdk_l4 == 0xffff) {
+        ASSERT_EQ(0, got.l4) << "off=" << off;
+      } else {
+        ASSERT_EQ(dpdk_l4, got.l4) << "off=" << off;
+      }
+    }
+
+    // Store the computed checksums and verify, at every offset.
+    ip->checksum = expect.ip;
+    if (tcp) {
+      reinterpret_cast<Tcp *>(ref + ihl * 4)->checksum = expect.l4;
+    } else {
+      reinterpret_cast<Udp *>(ref + ihl * 4)->checksum = expect.l4;
+    }
+    for (size_t off : kOffsets) {
+      memcpy(buf + off, ref, sizeof(ref));
+      const auto &h = *reinterpret_cast<const Ipv4 *>(buf + off);
+      const uint8_t *l4 = buf + off + ihl * 4;
+      ASSERT_TRUE(VerifyIpv4Checksum(h)) << "off=" << off;
+      ASSERT_TRUE(tcp ? VerifyIpv4TcpChecksum(h, *reinterpret_cast<const Tcp *>(l4))
+                      : VerifyIpv4UdpChecksum(h, *reinterpret_cast<const Udp *>(l4)))
+          << "off=" << off;
+    }
+  }
 }
 
 // Tests incremental checksum update for unsigned 16-bit integer

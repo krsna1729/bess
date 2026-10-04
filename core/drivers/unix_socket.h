@@ -119,10 +119,10 @@ class UnixSocketPort final : public Port {
    */
   struct sockaddr_un addr_;
 
-  // NOTE: three threads (accept / recv / send) may race on this, so use
-  // volatile.
-  /* FD for client connection.*/
-  volatile int client_fd_;
+  // FD for the client connection. Three threads (accept / recv / send) race
+  // on it; only the int itself is shared (the socket's state lives in the
+  // kernel), so relaxed atomic loads and stores suffice.
+  std::atomic<int> client_fd_;
 };
 
 #endif  // BESS_DRIVERS_UNIXSOCKET_H_

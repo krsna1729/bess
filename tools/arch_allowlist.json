@@ -1,0 +1,25 @@
+{
+  "_comment": [
+    "Architecture code outside core/arch/ that predates the M21 boundary (D-071).",
+    "tools/check_arch.py fails on any count above or below an entry, so this list only shrinks.",
+    "Edited by hand and reviewed; `tools/check_arch.py --report` prints the current counts in this format."
+  ],
+  "files": {
+    "core/modules/bpf.cc": {
+      "condition": 3,
+      "reason": "BESS x86-64 BPF JIT, libpcap interpreter otherwise"
+    },
+    "core/utils/bpf.cc": {
+      "condition": 1,
+      "reason": "BESS x86-64 BPF JIT, libpcap interpreter otherwise"
+    },
+    "core/utils/bpf.h": {
+      "condition": 2,
+      "reason": "BESS x86-64 BPF JIT declarations"
+    },
+    "core/utils/bpf_program_test.cc": {
+      "condition": 1,
+      "reason": "test: x86-only native JIT assertion"
+    }
+  }
+}

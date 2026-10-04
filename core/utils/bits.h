@@ -5,9 +5,9 @@
 #define BESS_UTILS_BITS_H_
 
 #include "utils/logging.h"
-#include <x86intrin.h>
 
 #include <algorithm>
+#include <cstring>
 
 #include "common.h"
 
@@ -38,8 +38,12 @@ static inline void ShiftBytesLeft(uint8_t *buf, const size_t len,
   size_t tmp_len = len;
   size_t inc = sizeof(uint64_t) - shift;
   while (tmp_len >= sizeof(uint64_t)) {
-    uint64_t *block = reinterpret_cast<uint64_t *>(tmp_buf);
-    *block >>= shift * 8;
+    // Little-endian: shifting the word right moves its bytes toward lower
+    // addresses. memcpy: `buf` has no alignment.
+    uint64_t block;
+    memcpy(&block, tmp_buf, sizeof(block));
+    block >>= shift * 8;
+    memcpy(tmp_buf, &block, sizeof(block));
     tmp_buf += inc;
     tmp_len = buf + len - tmp_buf;
   }
@@ -76,8 +80,10 @@ static inline void ShiftBytesRight(uint8_t *buf, const size_t len,
   size_t dec = sizeof(uint64_t) - shift;
   size_t leftover = len;
   while (tmp_buf >= buf) {
-    uint64_t *block = reinterpret_cast<uint64_t *>(tmp_buf);
-    *block <<= shift * 8;
+    uint64_t block;
+    memcpy(&block, tmp_buf, sizeof(block));
+    block <<= shift * 8;
+    memcpy(tmp_buf, &block, sizeof(block));
     tmp_buf -= dec;
     leftover -= dec;
   }
@@ -93,45 +99,49 @@ static inline void MaskBytesSmall(uint8_t *buf, const uint8_t *mask,
 }
 
 // Applies the `len`-byte bitmask `mask` to `buf`, in 8-byte chunks if able,
-// otherwise, falls back to 1-byte chunks.
+// otherwise, falls back to 1-byte chunks. Neither pointer needs alignment.
 static inline void MaskBytes64(uint8_t *buf, uint8_t const *mask,
                                const size_t len) {
   size_t n = len / sizeof(uint64_t);
   size_t leftover = len - n * sizeof(uint64_t);
-  uint64_t *buf64 = reinterpret_cast<uint64_t *>(buf);
-  const uint64_t *mask64 = reinterpret_cast<const uint64_t *>(mask);
   for (size_t i = 0; i < n; i++) {
-    buf64[i] &= mask64[i];
+    uint64_t b, m;
+    memcpy(&b, buf + i * sizeof(b), sizeof(b));
+    memcpy(&m, mask + i * sizeof(m), sizeof(m));
+    b &= m;
+    memcpy(buf + i * sizeof(b), &b, sizeof(b));
   }
 
   if (leftover) {
-    buf = reinterpret_cast<uint8_t *>(buf64 + n);
-    mask = reinterpret_cast<uint8_t const *>(mask64 + n);
-    MaskBytesSmall(buf, mask, leftover);
+    MaskBytesSmall(buf + n * sizeof(uint64_t), mask + n * sizeof(uint64_t),
+                   leftover);
   }
 }
 
 // Applies the `len`-byte bitmask `mask` to `buf`, in 16-byte chunks if able,
-// otherwise, falls back to 8-byte chunks and possibly 1-byte chunks.
+// otherwise, falls back to 8-byte chunks and possibly 1-byte chunks. A 16-byte
+// chunk is two 64-bit ANDs, which compilers merge into one vector AND (SSE2
+// pand, NEON and).
 static inline void MaskBytes(uint8_t *buf, uint8_t const *mask,
                              const size_t len) {
   if (len <= sizeof(uint64_t)) {
     return MaskBytes64(buf, mask, len);
   }
 
-  // AVX2?
-  size_t n = len / sizeof(__m128i);
-  size_t leftover = len - n * sizeof(__m128i);
-  __m128i *buf128 = reinterpret_cast<__m128i *>(buf);
-  const __m128i *mask128 = reinterpret_cast<const __m128i *>(mask);
+  constexpr size_t kChunk = 2 * sizeof(uint64_t);
+  size_t n = len / kChunk;
+  size_t leftover = len - n * kChunk;
   for (size_t i = 0; i < n; i++) {
-    __m128i a = _mm_loadu_si128(buf128 + i);
-    __m128i b = _mm_loadu_si128(mask128 + i);
-    _mm_storeu_si128(buf128 + i, _mm_and_si128(a, b));
+    uint64_t b[2], m[2];
+    memcpy(b, buf, kChunk);
+    memcpy(m, mask, kChunk);
+    b[0] &= m[0];
+    b[1] &= m[1];
+    memcpy(buf, b, kChunk);
+    buf += kChunk;
+    mask += kChunk;
   }
 
-  buf = reinterpret_cast<uint8_t *>(buf128 + n);
-  mask = reinterpret_cast<uint8_t const *>(mask128 + n);
   if (leftover >= sizeof(uint64_t)) {
     MaskBytes64(buf, mask, leftover);
   } else {

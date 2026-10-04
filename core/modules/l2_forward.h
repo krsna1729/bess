@@ -6,14 +6,15 @@
 #define BESS_MODULES_L2FORWARD_H_
 
 #include <atomic>
+#include <bit>
 
 #include "l2_table.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 
-#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
-#error this code assumes little endian architecture (x86)
-#endif
+static_assert(std::endian::native == std::endian::little,
+              "L2Forward packs MAC addresses into integers assuming a "
+              "little-endian target");
 
 class L2Forward final : public Module {
  public:

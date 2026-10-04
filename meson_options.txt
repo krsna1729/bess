@@ -1,7 +1,11 @@
 option('cpu',
        type: 'string',
        value: 'native',
-       description: 'CPU ISA passed to BESS (for example native, or x86-64-v3 for portable builds)')
+       description: 'ISA passed as -march=<cpu>: native, or a portable baseline (x86_64: x86-64-v3; aarch64: armv8.2-a); empty passes no -march')
+option('arch_generic',
+       type: 'boolean',
+       value: false,
+       description: 'Define BESS_ARCH_GENERIC: core/arch/ uses its portable code paths instead of x86/arm64 intrinsics and asm')
 option('af_xdp',
        type: 'combo',
        choices: ['auto', 'required'],

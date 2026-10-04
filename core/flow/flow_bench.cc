@@ -40,7 +40,6 @@
 
 #include <pthread.h>
 #include <sched.h>
-#include <x86intrin.h>
 
 #include <rte_hash.h>
 #include <rte_malloc.h>
@@ -60,6 +59,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "arch/cpu.h"
 #include "classifier/concurrent_exact.h"
 #include "dpdk.h"
 #include "flow/flow_index.h"
@@ -208,23 +208,13 @@ std::vector<K> BuildStream(Dist dist, size_t n, uint64_t seed = 1) {
   return stream;
 }
 
-inline uint64_t Tsc() { return __rdtsc(); }
+inline uint64_t Tsc() { return bess::arch::ReadCycleCounter(); }
 
-// Serialised timestamps for timing a single operation: rdtsc alone can be
-// executed early or late relative to the work it brackets. Their own cost is
-// measured once and subtracted.
-inline uint64_t TscBegin() {
-  _mm_lfence();
-  const uint64_t t = __rdtsc();
-  _mm_lfence();
-  return t;
-}
-inline uint64_t TscEnd() {
-  unsigned aux;
-  const uint64_t t = __rdtscp(&aux);
-  _mm_lfence();
-  return t;
-}
+// Serialised timestamps for timing a single operation: a plain counter read
+// can be executed early or late relative to the work it brackets. Their own
+// cost is measured once and subtracted.
+inline uint64_t TscBegin() { return bess::arch::ReadCycleCounterSerialized(); }
+inline uint64_t TscEnd() { return bess::arch::ReadCycleCounterSerialized(); }
 uint32_t TscOverhead() {
   static const uint32_t overhead = [] {
     std::vector<uint32_t> samples(10001);

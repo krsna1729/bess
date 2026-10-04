@@ -290,6 +290,9 @@ class alignas(RTE_CACHE_LINE_SIZE) MeterState {
   const MeterSharing sharing_;
 };
 
+// alignas pads the state to a whole number of lines, so this holds for 64-
+// (x86) and 128-byte (generic arm64) lines alike as long as the fields fit in
+// one line; they take 64 bytes or less.
 static_assert(sizeof(MeterState) == RTE_CACHE_LINE_SIZE,
               "a meter's state is expected to fill exactly one cache line");
 

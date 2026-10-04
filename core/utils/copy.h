@@ -5,8 +5,9 @@
 #define BESS_UTILS_COPY_H_
 
 #include "utils/logging.h"
-#include <x86intrin.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 
 #include "common.h"
@@ -14,23 +15,18 @@
 namespace bess {
 namespace utils {
 
+// Fixed-size copies. A constant-size __builtin_memcpy compiles to unaligned
+// vector loads and stores of the widest kind the target has (one 32-byte
+// vmovdqu with AVX2, two 16-byte movdqu with SSE, ldp/stp q on arm64), so no
+// intrinsics are needed for any architecture.
 static inline void Copy16(void *__restrict__ dst,
                           const void *__restrict__ src) {
-  _mm_storeu_si128(reinterpret_cast<__m128i *>(dst),
-                   _mm_loadu_si128(reinterpret_cast<const __m128i *>(src)));
+  __builtin_memcpy(dst, src, 16);
 }
 
 static inline void Copy32(void *__restrict__ dst,
                           const void *__restrict__ src) {
-#if __AVX2__
-  _mm256_storeu_si256(
-      reinterpret_cast<__m256i *>(dst),
-      _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src)));
-#else
-  Copy16(dst, src);
-  Copy16(reinterpret_cast<__m128i *>(dst) + 1,
-         reinterpret_cast<const __m128i *>(src) + 1);
-#endif
+  __builtin_memcpy(dst, src, 32);
 }
 
 // Copy exactly "bytes" (<= 64). Works best if size is a compile-time constant.
@@ -116,56 +112,43 @@ static inline void CopySmall(void *__restrict__ dst,
 static inline void CopyInlined(void *__restrict__ dst,
                                const void *__restrict__ src, size_t bytes,
                                bool sloppy = false) {
-#if __AVX2__
-  using block_t = __m256i;
-  auto copy_block = [](void *__restrict__ d, const void *__restrict__ s) {
-    Copy32(d, s);
-  };
-#else
-  using block_t = __m128i;
-  auto copy_block = [](void *__restrict__ d, const void *__restrict__ s) {
-    Copy16(d, s);
-  };
-#endif
-
-  const size_t block_size = sizeof(block_t);
-  uintptr_t dst_u = reinterpret_cast<uintptr_t>(dst);
-  uintptr_t src_u = reinterpret_cast<uintptr_t>(src);
+  // The bulk loop moves 32-byte blocks on every target, so a sloppy copy
+  // overruns by at most 31 bytes everywhere (see Copy()).
+  constexpr size_t block_size = 32;
+  auto *d = static_cast<char *__restrict__>(dst);
+  auto *s = static_cast<const char *__restrict__>(src);
 
   if (bytes <= 64 && !sloppy) {
-    CopySmall(dst, src, bytes);
+    CopySmall(d, s, bytes);
     return;
   }
 
-  // Align dst on a cache line if buffer is big yet misaligned.
-  if (bytes >= 256 && (dst_u % block_size) != 0) {
-    // Copy "block_t" bytes, but proceed with only "offset" bytes.
-    copy_block(reinterpret_cast<block_t *__restrict__>(dst),
-               reinterpret_cast<const block_t *__restrict__>(src));
+  // Align dst on a block boundary if buffer is big yet misaligned.
+  uintptr_t misalign = reinterpret_cast<uintptr_t>(d) % block_size;
+  if (bytes >= 256 && misalign != 0) {
+    // Copy a whole block, but proceed with only "offset" bytes.
+    Copy32(d, s);
 
-    uintptr_t offset = block_size - (dst_u % block_size);
-    dst = reinterpret_cast<decltype(dst)>(dst_u + offset);
-    src = reinterpret_cast<decltype(src)>(src_u + offset);
+    size_t offset = block_size - misalign;
+    d += offset;
+    s += offset;
     bytes -= offset;
   }
-
-  auto *d = reinterpret_cast<block_t *__restrict__>(dst);
-  auto *s = reinterpret_cast<const block_t *__restrict__>(src);
 
   size_t num_blocks = (sloppy ? bytes + block_size - 1 : bytes) / block_size;
   size_t num_loops = num_blocks / 8;
 
   while (num_loops--) {
-    copy_block(d + 0, s + 0);
-    copy_block(d + 1, s + 1);
-    copy_block(d + 2, s + 2);
-    copy_block(d + 3, s + 3);
-    copy_block(d + 4, s + 4);
-    copy_block(d + 5, s + 5);
-    copy_block(d + 6, s + 6);
-    copy_block(d + 7, s + 7);
-    d += 8;
-    s += 8;
+    Copy32(d + 0 * block_size, s + 0 * block_size);
+    Copy32(d + 1 * block_size, s + 1 * block_size);
+    Copy32(d + 2 * block_size, s + 2 * block_size);
+    Copy32(d + 3 * block_size, s + 3 * block_size);
+    Copy32(d + 4 * block_size, s + 4 * block_size);
+    Copy32(d + 5 * block_size, s + 5 * block_size);
+    Copy32(d + 6 * block_size, s + 6 * block_size);
+    Copy32(d + 7 * block_size, s + 7 * block_size);
+    d += 8 * block_size;
+    s += 8 * block_size;
   }
 
   // Copy the leftover. No block to copy if remainder is 0
@@ -173,34 +156,33 @@ static inline void CopyInlined(void *__restrict__ dst,
 
   switch (leftover_blocks) {
     case 7:
-      copy_block(d + 6, s + 6);
+      Copy32(d + 6 * block_size, s + 6 * block_size);
       [[fallthrough]];
     case 6:
-      copy_block(d + 5, s + 5);
+      Copy32(d + 5 * block_size, s + 5 * block_size);
       [[fallthrough]];
     case 5:
-      copy_block(d + 4, s + 4);
+      Copy32(d + 4 * block_size, s + 4 * block_size);
       [[fallthrough]];
     case 4:
-      copy_block(d + 3, s + 3);
+      Copy32(d + 3 * block_size, s + 3 * block_size);
       [[fallthrough]];
     case 3:
-      copy_block(d + 2, s + 2);
+      Copy32(d + 2 * block_size, s + 2 * block_size);
       [[fallthrough]];
     case 2:
-      copy_block(d + 1, s + 1);
+      Copy32(d + 1 * block_size, s + 1 * block_size);
       [[fallthrough]];
     case 1:
-      copy_block(d + 0, s + 0);
+      Copy32(d + 0 * block_size, s + 0 * block_size);
   }
 
+  // The last partial block: copy the block that ends exactly at "bytes",
+  // overlapping what was already copied.
   if (!sloppy && (bytes % block_size) != 0) {
     size_t fringe = bytes % block_size;
-    dst_u = reinterpret_cast<uintptr_t>(d + leftover_blocks);
-    src_u = reinterpret_cast<uintptr_t>(s + leftover_blocks);
-
-    copy_block(reinterpret_cast<decltype(d)>(dst_u + fringe - block_size),
-               reinterpret_cast<decltype(s)>(src_u + fringe - block_size));
+    size_t end = leftover_blocks * block_size + fringe;
+    Copy32(d + end - block_size, s + end - block_size);
   }
 }
 

@@ -91,6 +91,7 @@ file is the reasoning.
 | D-068 | NAT as a library: bindings on the flow table, a bitmap port pool, generic expiry (M18) | accepted |
 | D-069 | Tunnel packet mechanics: VXLAN, Geneve, GRE and a GTP-U header codec (M19) | accepted |
 | D-070 | Hardware flow rules: a lifecycle owner, not a flow IR (M20) | accepted |
+| D-071 | Portability: one architecture boundary (core/arch), generic fallback for every kernel (M21) | accepted |
 
 
 ---
@@ -6248,3 +6249,88 @@ application copies the map into an RCU object as it needs).
 
 **Revisit when:** a NIC lab is available (run the certification matrix), or a consumer needs the asynchronous
 template API.
+
+## D-071 Portability: one architecture boundary (core/arch), generic fallback for every kernel (M21)
+
+**Status:** accepted (2026-10-04). ARM64 is compiled and tested only by CI's new experimental lanes; nothing was built
+for aarch64 on this machine.
+**Code:** `core/arch/` (new: `cpu.h`, `crc32c.h`, `signal_context.h`, `checksum_kernels.h`, `byte_match.h`, `vlan.h`,
+`tag_match.h`, `word_probe.h`, `fp_env.h`, tests); `core/utils/{copy,bits,checksum,time,common,mcslock,syscallthread,
+cuckoo_map}.h`, `http_parser.cc`; `core/utils/simd.{h,cc}` deleted; modules (vif, vlan_*, l2_table, l2_forward,
+generic_encap, flowgen, bypass, hash_lb, url_filter, set_metadata), `packet_pool.cc`, `flow/flow_index.h`,
+`worker.{h,cc}`, `runtime/worker_manager.cc`, `drivers/unix_socket.*`, `debug.cc`, stats, meter, module.h, benches;
+`meson.build`, `meson_options.txt`, `tools/{check_arch.py,arch_allowlist.json,bootstrap_dpdk.py,ci_profile.py,
+check_installed_headers.py}`, `.github/workflows/ci.yml`, docs.
+
+**Context.** Roadmap M21: x86 and ARM64 first-class without giving up measured ISA wins; no architecture branches
+scattered through libraries; no silent ISA dependence from DPDK's pkg-config flags. Before M21, 204 architecture
+findings in 39 files outside any boundary; every translation unit that included `module.h` pulled `<x86intrin.h>`
+(through `utils/copy.h`); `utils/time.h` used `rdtsc` asm; `debug.cc` had `#error` on non-x86.
+
+**Decision.**
+- `core/arch/` is the only place for ISA conditions, intrinsic headers and instruction asm. `cpu.h` defines
+  `BESS_ARCH_X86` or `BESS_ARCH_ARM64`; every kernel keys off those, never raw compiler macros. `BESS_ARCH_GENERIC`
+  (meson `-Darch_generic=true`) forces every kernel onto its portable path, so an x86 build compiles and tests the
+  code other architectures run.
+- Portable by default; a kernel stays architecture-specific only where an isolated A/B showed the portable version
+  materially slower: the checksum bulk sum (portable was 26-62% slower on 64 B-2 KB buffers), the header and
+  pseudo-header sums (`AddWords32`: an add/adc chain over memcpy-loaded values; portable C was 7% slower on the IPv4
+  header and 4-17% on 64-byte UDP/TCP packets), the L2 4-slot probe
+  (AVX2 candidate filter + the base's atomic re-check), the flow tag match (SSE2), the cuckoo AVX2 helper (D-034's
+  runtime dispatch, moved unchanged), the HTTP SSE4.2 token scan. Copy, mask, VLAN tag insert/remove (GCC/Clang vector
+  extensions: one source, same x86 instructions), packet-pool rearm (memcpy; one 32-byte store) and CRC32C (instruction
+  if the target has it, else DPDK's `rte_hash_crc_*`, identical values) are portable.
+- Memory ordering no longer leans on x86 TSO: worker status (`std::atomic_ref`, acquire/release), MCS lock (atomics,
+  `CpuRelax`), syscall-thread and unix-socket flags (atomics), `LOAD/STORE/FULL_BARRIER` as `atomic_thread_fence`.
+  Acquire/release compile to plain moves on x86, so x86 code keeps its shape.
+- Cache line from `RTE_CACHE_LINE_SIZE` (`arch::kCacheLineSize`; 128 on DPDK's generic arm64).
+- Build: every `-m*` machine flag in DPDK's pkg-config cflags is dropped (and printed); any other unknown flag stops
+  configure; a check fails if a machine flag reaches BESS or plugin flags. `bess-dev.pc` no longer `requires` libdpdk
+  (its `-march=native -mrtm` came last and won); it carries bessd's `-march`, the filtered DPDK cflags and DPDK link
+  flags. DPDK bootstrap uses `cpu_instruction_set` (x86) or `platform=generic` (arm64). ARM64 floor `armv8.2-a`
+  (Neoverse N1 and newer: Graviton2, Ampere Altra, GitHub's arm runners).
+- Enforcement: `tools/check_arch.py` (architecture suite and CI layers step) counts ISA includes, conditions, asm and
+  intrinsics outside `core/arch/` against `tools/arch_allowlist.json`; any change in a count fails, so the list only
+  shrinks. After M21 it holds 7 findings in 4 files: the x86-64 BPF JIT, already replaced by libpcap's interpreter on
+  other architectures.
+- CI: experimental lanes `gcc-arm64`, `clang-arm64` (ubuntu-24.04-arm) and `gcc-generic` (x86, `arch_generic`). They
+  become gating once green.
+
+**Evidence.**
+- Identity: CRC32C instruction vs DPDK software over 100k values per width and the 0xe3069283 check value; checksums
+  bit-identical to the base (about 132M random cases per seed x 4 seeds plus an exhaustive 2^32 header sweep, on
+  x86-64-v3, v2, baseline x86-64 and the generic path); VLAN kernels byte-identical over 3M random frames (including
+  headroom bytes); HTTP token scan identical over 3M messages; codegen of the CRC users instruction-identical.
+- UBSan: the misaligned loads in `checksum.h` (old lines 277, 431, 532) are gone; `HeadersAtEthernetOffsets` runs
+  clean under ASan+UBSan.
+- Isolated A/B (release, x86-64-v3, CPU 2, `omarchy-benchmark`, `ab_bench` 16 ABBA rounds; every run flagged
+  "contamination" by the wrapper, a shared machine): L2 forced-body and default rows 0.991-1.020, no clear
+  difference (the first portable probe was +5.0-5.7%, rejected); flow 12/12 no clear difference; packet pool bulk
+  9.5% faster; VLAN push/pop 0.985-0.989; copy and mask kernels instruction-identical (two copy rows and some mask
+  rows moved +/-8-13%: code placement); `BatchForward` 6.7% faster; `ComputeChecksums` 4-13% faster.
+  Checksums against develop (final code, `utils_checksum_bench` all rows, `packet_checksum_bench` RawBess/ValidatedBess
+  contiguous rows): IPv4 header -4.2%, TCP/60 -4.9%, TCP/787 -3.6%, source IP/port update -8.8%, network-only
+  `RawBess` -16.6 to -17.1%; bulk sums and every `ValidatedBess` row no clear difference. **Slower:** `RawBess` 64-byte
+  rows with L4 checksums, +5.5 to +11.7% (0.27-0.6 ns; 1500 and 4096 B no clear difference). The x86 code is
+  instruction-for-instruction the old chain plus a stack frame the compiler now sets up for the inlined AVX2 block;
+  two attempts to move that block out of line made other rows 3-44% slower and were dropped. Machine shared; wrapper
+  verdict "contamination" on every run (CPU 2: 47-60k thermal, 4.5-7k function-call interrupts).
+- Mutants: slice a 7/7; b1 every non-equivalent caught (28 run, 2 equivalent); b2 18 of 21 caught, 3 survive as
+  predicted (the non-AVX2 dispatcher branch is not executed on an AVX2 host; trusting a candidate without the atomic
+  re-check and a missing acquire fence cannot show in single-threaded x86 tests); slice c 26/27 (the uncaught one
+  deletes the configure check itself).
+- Tests: integrated tree, fast and generic builds rc 0; full unit suites (without the daemon suites) at
+  `taskset -c 0,1` pass in both trees; at `-c 0`, 4-5 concurrency stress tests fail on develop too (0/5 on develop
+  and here; fixed separately, those tests only). The new MCS-lock test was sized to the CPUs it may use (it hit the
+  30 s timeout with 4 threads on 2 CPUs).
+
+**Review** (reviewer agent): correct, go (memory ordering on arm64, the probe under the C++ model, checksum kernels
+and asm constraints, build and CI); two optional findings taken: `__cacheline_aligned` kept a GNU attribute so it may
+follow a definition, and this record's checksum numbers updated to the final code.
+
+**Not done.** The 64-byte raw L4 checksum residual (0.27-0.6 ns), to be found with a profile rather than layout
+trials; ARM64 runs only in CI; on arm64 `rdtsc()` reads CNTVCT_EL0 (25 MHz to 1 GHz by part), so cycle-based
+accounting is coarser there; NEON versions of the tag and word kernels (arm64 uses the portable loops; untestable here).
+
+**Revisit when:** the ARM64 lanes are green (make them gating); a profile shows an arm64 kernel worth specialising.
+

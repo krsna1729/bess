@@ -36,9 +36,9 @@ The supported developer build uses Meson and Ninja.  DPDK is pinned in
 or building it.
 
 ```bash
-tools/bootstrap_dpdk.py --af-xdp auto
+tools/bootstrap_dpdk.py --af-xdp auto --cpu x86-64-v3   # aarch64: --cpu armv8.2-a
 export PKG_CONFIG_PATH="$(tools/bootstrap_dpdk.py --print-pkg-config-path):${PKG_CONFIG_PATH}"
-meson setup build-meson -Dcpu=x86-64-v3 -Daf_xdp=auto
+meson setup build-meson -Dcpu=x86-64-v3 -Daf_xdp=auto   # aarch64: -Dcpu=armv8.2-a
 meson compile -C build-meson -j4
 meson test -C build-meson --no-rebuild --print-errorlogs
 ```
@@ -50,9 +50,18 @@ release verification instead of cleaning the day-to-day build.
 
 CI uses `--af-xdp required`; this checks the libxdp/libbpf development
 packages, headers, and DPDK `net_af_xdp` shared and static artifacts.  Use
-`-Daf_xdp=required` locally for the same check.  `-Dcpu=native` is the
-default; choose a portable ISA such as `x86-64-v3` (the CI floor: AVX2,
-BMI1/2) for distributable builds. For benchmarking, see
+`-Daf_xdp=required` locally for the same check.  `-Dcpu` is passed as
+`-march=<cpu>` on x86_64 and aarch64. `native` is the default; for
+distributable builds use the CI floor of the architecture: `x86-64-v3` (AVX2,
+BMI1/2) or `armv8.2-a` (LSE atomics, CRC32; Neoverse N1 and newer).
+`-Dcpu=` (empty) passes no `-march`. BESS's ISA comes from this option alone:
+the `-march`/`-mcpu`/`-m*` flags in DPDK's pkg-config cflags are dropped, and
+`bess-dev.pc` gives plugins bessd's `-march`. `tools/bootstrap_dpdk.py --cpu`
+builds DPDK for the same floor (on aarch64 DPDK's generic arm64 target).
+`-Darch_generic=true` makes `core/arch/` use its portable code paths instead
+of x86/arm64 intrinsics and asm, to build and test on x86 what other
+architectures run; architecture-specific code belongs only in `core/arch/`
+(`tools/check_arch.py`). For benchmarking, see
 [docs/benchmarking.md](docs/benchmarking.md).
 DPDK is consumed through `pkg-config` and is dynamically linked by default.
 Use `-Ddpdk_link=static` only when a static DPDK link is intentional.

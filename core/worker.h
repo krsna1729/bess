@@ -7,6 +7,7 @@
 
 #include "utils/logging.h"
 
+#include <atomic>
 #include <cstdint>
 #include <list>
 #include <string>
@@ -69,7 +70,7 @@ class Worker {
   /* ----------------------------------------------------------------------
    * functions below are invoked by worker threads
    * ---------------------------------------------------------------------- */
-  inline int is_pause_requested() { return status_ == WORKER_PAUSING; }
+  inline int is_pause_requested() { return status() == WORKER_PAUSING; }
 
   /* Block myself. Return nonzero if the worker needs to die */
   int BlockWorker();
@@ -84,8 +85,16 @@ class Worker {
   /* The entry point of worker threads */
   void *Run(void *_arg);
 
-  worker_status_t status() { return status_; }
-  void set_status(worker_status_t status) { status_ = status; }
+  // The master and the worker hand status_ back and forth: each side's
+  // release store publishes what it wrote before it, and the other's
+  // acquire load (a plain mov on x86) sees it. std::atomic_ref keeps Worker
+  // trivially constructible, as __thread requires.
+  worker_status_t status() {
+    return std::atomic_ref(status_).load(std::memory_order_acquire);
+  }
+  void set_status(worker_status_t status) {
+    std::atomic_ref(status_).store(status, std::memory_order_release);
+  }
 
   int wid() const { return wid_; }
   int core() const { return core_; }
@@ -111,7 +120,8 @@ class Worker {
   Random *rand() const { return rand_; }
 
  private:
-  volatile worker_status_t status_;
+  alignas(std::atomic_ref<worker_status_t>::required_alignment)
+      worker_status_t status_;
 
   int wid_;   // always [0, kMaxWorkers - 1]
   // Whether this worker is an online RCU reader; touched only by its own

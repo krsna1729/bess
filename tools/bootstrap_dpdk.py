@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import sys
@@ -148,13 +149,31 @@ def check_af_xdp_artifacts(prefix: Path, mode: str) -> None:
         print('AF_XDP PMD artifacts: available')
 
 
-def configure_and_build(source_dir: Path, build_dir: Path, prefix: Path,
-                         cpu: str | None, profile: str, jobs: int | None,
-                         env: dict[str, str]) -> None:
-    build_dir.parent.mkdir(parents=True, exist_ok=True)
+def machine_options(cpu: str | None, arch: str) -> list[str]:
+    """DPDK's machine selection for BESS's `cpu` on `arch` (uname -m).
+
+    x86_64: cpu_instruction_set=<cpu> (DPDK compiles with -march=<cpu>; the
+    `machine` spelling is deprecated). aarch64: DPDK ignores
+    cpu_instruction_set and picks flags from its SoC table, so `native`
+    detects this machine's core and anything else is the generic SoC:
+    -march=armv8-a+crc, RTE_CACHE_LINE_SIZE 128, which every armv8.1+ server
+    (and so BESS's armv8.2-a floor) runs. BESS's own -march stays its `cpu`.
+    """
+    if arch == 'aarch64':
+        return ['-Dplatform=native' if cpu == 'native' else '-Dplatform=generic']
+    if arch == 'x86_64':
+        return ['-Dcpu_instruction_set=' + cpu] if cpu else []
+    raise SystemExit(f'unsupported architecture {arch}: BESS builds on x86_64 and aarch64')
+
+
+def setup_command(source_dir: Path, build_dir: Path, prefix: Path,
+                  cpu: str | None, profile: str, arch: str) -> list[str]:
     command = ['meson', 'setup']
     if (build_dir / 'meson-private' / 'coredata.dat').exists():
-        command.append('--reconfigure')
+        # A tree configured before the switch from -Dmachine keeps that value,
+        # which DPDK refuses next to cpu_instruction_set (and on aarch64 it
+        # would override the platform): reset it to its default.
+        command.extend(['--reconfigure', '-Dmachine=auto'])
     command.extend([
         str(build_dir),
         str(source_dir),
@@ -162,10 +181,17 @@ def configure_and_build(source_dir: Path, build_dir: Path, prefix: Path,
         '--libdir=lib',
         '-Dexamples=',
         *PROFILES[profile],
+        *machine_options(cpu, arch),
     ])
-    if cpu:
-        command.append('-Dmachine=' + cpu)
-    run(command, env=env)
+    return command
+
+
+def configure_and_build(source_dir: Path, build_dir: Path, prefix: Path,
+                         cpu: str | None, profile: str, jobs: int | None,
+                         env: dict[str, str]) -> None:
+    build_dir.parent.mkdir(parents=True, exist_ok=True)
+    run(setup_command(source_dir, build_dir, prefix, cpu, profile,
+                      platform.machine()), env=env)
     ninja_cmd = ['ninja', '-C', str(build_dir)]
     if jobs:
         ninja_cmd.append(f'-j{jobs}')

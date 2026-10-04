@@ -49,7 +49,6 @@
 #include <rte_cycles.h>
 #include <rte_lcore.h>
 #include <rte_timer.h>
-#include <x86intrin.h>
 
 #include <algorithm>
 #include <chrono>
@@ -531,9 +530,10 @@ void BM_Drain(benchmark::State& state) {
     size_t fired = 0;
     const auto t0 = Clock::now();
     while (fired < n) {
-      const uint64_t p0 = __rdtsc();
+      // rte_rdtsc: the counter rte_get_tsc_hz() (tsc_per_ns above) measures.
+      const uint64_t p0 = rte_rdtsc();
       fired += a.Poll(end, budget);
-      poll_ticks.push_back(__rdtsc() - p0);
+      poll_ticks.push_back(rte_rdtsc() - p0);
       worst_work = std::max<double>(worst_work, static_cast<double>(a.work()));
       if (poll_ticks.size() > 50'000'000) break;  // a candidate that cannot finish
     }
