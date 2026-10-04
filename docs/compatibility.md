@@ -63,3 +63,26 @@ API version, compilers, C++ standard, ISA and build options, the DPDK pin
 with its source checksum, and every dependency's version) and an SPDX 2.3
 SBOM, `share/doc/bess/bess.spdx.json`, generated from the same facts by
 `tools/build_info.py`. CI's install check requires both.
+
+## Hardware validation
+
+Software completeness and hardware validation are tracked separately: no
+release claims hardware behaviour that was not run on that hardware. CI
+validates the software against the unix-socket and pcap ports, DPDK's
+`net_null` device, and fakes for the hardware seams
+(`offload/fake_flow_backend.h`); no physical NIC is in the loop.
+
+| Area | Status | Where |
+|---|---|---|
+| Physical NIC over VFIO, MTU/jumbo, scatter RX | not validated (no NIC) | MODERNIZATION.md section 5 (C-HW) |
+| Multi-queue RSS; symmetric RSS key and RETA pinning | software path tested; real-NIC symmetry not validated | D-080 |
+| Real-NIC throughput baseline | not measured | C-HW |
+| AF_XDP zero-copy | not validated (copy mode only) | C-HW |
+| `MBUF_FAST_FREE`, MT-lockfree Tx, PortOut lock elision | not enabled; needs a PMD that advertises it and a workload | C-HW |
+| Checksum offload on transmit | negotiated per port and reported (`GetCapabilities` `PortInfo`); real-NIC correctness not validated | MODERNIZATION.md K4.4a, D-082 |
+| `rte_flow` offload (`offload/rte_flow_backend.h`) | probed against the null PMD only; lifecycle tested over the fake device | D-070 |
+| Hardware meter backend | not implemented | C-HW |
+| Certification matrix (Intel, NVIDIA/Mellanox, virtio, representors) | not run | D-070 |
+
+A row changes only with a decision record that names the device, firmware,
+DPDK version and the result.

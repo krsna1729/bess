@@ -148,6 +148,11 @@ def meson_options(s):
     ]
     if s.arch_generic:
         options.append('-Darch_generic=true')
+    # The fuzz harnesses (M22, D-072): the gating gcc lane replays every
+    # committed corpus through replay_main; the ASan lane links libFuzzer and
+    # replays them under ASan and UBSan (suite `fuzz`, run by `meson test`).
+    if s.name == 'gcc' or s.sanitize == 'address':
+        options.append('-Dbuild_fuzzers=true')
     if s.sanitize == 'address':
         # Benchmarks are timing code: built and run in the other lanes.
         options += ['-Db_sanitize=address,undefined', '-Db_lundef=false',
