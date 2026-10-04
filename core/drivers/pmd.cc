@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
+#include <string>
+#include <vector>
 
 #include <rte_bus.h>
 #include <rte_bus_pci.h>
@@ -145,32 +148,79 @@ static const rte_eth_conf default_eth_conf(const rte_eth_dev_info &dev_info,
       // prior behavior (drivers picked their own hash algorithm).
       .algorithm = RTE_ETH_HASH_FUNCTION_DEFAULT,
   };
-  if (symmetric == PMDPort::SymmetricRss::kFunction) {
-    ret.rx_adv_conf.rss_conf.algorithm = RTE_ETH_HASH_FUNCTION_SYMMETRIC_TOEPLITZ;
-  } else if (symmetric == PMDPort::SymmetricRss::kKey) {
+  if (symmetric != PMDPort::SymmetricRss::kNone) {
+    // The key is pinned in both modes, so two ports of one driver hash alike
+    // (a driver's default key may differ per port).
     for (size_t i = 0; i < sizeof(kSymmetricRssKey); i += 2) {
       kSymmetricRssKey[i] = 0x6d;
       kSymmetricRssKey[i + 1] = 0x5a;
     }
     ret.rx_adv_conf.rss_conf.rss_key = kSymmetricRssKey;
     ret.rx_adv_conf.rss_conf.rss_key_len = dev_info.hash_key_size;
-    ret.rx_adv_conf.rss_conf.algorithm = RTE_ETH_HASH_FUNCTION_TOEPLITZ;
+    ret.rx_adv_conf.rss_conf.algorithm = symmetric == PMDPort::SymmetricRss::kFunction
+                                             ? RTE_ETH_HASH_FUNCTION_SYMMETRIC_TOEPLITZ
+                                             : RTE_ETH_HASH_FUNCTION_TOEPLITZ;
   }
 
   return ret;
 }
 
-// What the device can do for a symmetric hash.
+// What the device can do for a symmetric hash: a settable key is required in
+// both modes (the key is pinned so ports hash alike).
 static PMDPort::SymmetricRss SymmetricRssOf(const rte_eth_dev_info &dev_info) {
+  if (dev_info.hash_key_size == 0 || dev_info.hash_key_size > sizeof(kSymmetricRssKey)) {
+    return PMDPort::SymmetricRss::kNone;
+  }
   if (dev_info.rss_algo_capa & RTE_ETH_HASH_ALGO_CAPA_MASK(SYMMETRIC_TOEPLITZ)) {
     return PMDPort::SymmetricRss::kFunction;
   }
-  if ((dev_info.rss_algo_capa & RTE_ETH_HASH_ALGO_CAPA_MASK(TOEPLITZ)) &&
-      dev_info.hash_key_size > 0 && dev_info.hash_key_size <= sizeof(kSymmetricRssKey)) {
+  if (dev_info.rss_algo_capa & RTE_ETH_HASH_ALGO_CAPA_MASK(TOEPLITZ)) {
     return PMDPort::SymmetricRss::kKey;
   }
   return PMDPort::SymmetricRss::kNone;
 }
+
+// Pins the redirection table to queue = entry % queues (drivers fill their
+// default differently). False when the device refuses.
+static bool PinReta(dpdk_port_t port_id, const rte_eth_dev_info &dev_info, int num_rxq) {
+  const uint16_t size = dev_info.reta_size;
+  if (size == 0 || size % RTE_ETH_RETA_GROUP_SIZE != 0) {
+    return false;
+  }
+  std::vector<rte_eth_rss_reta_entry64> reta(size / RTE_ETH_RETA_GROUP_SIZE);
+  for (uint16_t i = 0; i < size; i++) {
+    reta[i / RTE_ETH_RETA_GROUP_SIZE].mask = ~uint64_t{0};
+    reta[i / RTE_ETH_RETA_GROUP_SIZE].reta[i % RTE_ETH_RETA_GROUP_SIZE] =
+        static_cast<uint16_t>(i % num_rxq);
+  }
+  return rte_eth_dev_rss_reta_update(port_id, reta.data(), size) == 0;
+}
+void PMDPort::SettleRss() {
+  rss_signature_ = 0;
+  const int num_rxq = num_queues[PACKET_DIR_INC];
+  rte_eth_dev_info dev_info;
+  if (!symmetric_rss_ || num_rxq <= 1 || rte_eth_dev_info_get(dpdk_port_id_, &dev_info) != 0) {
+    return;
+  }
+  const PMDPort::SymmetricRss mode = SymmetricRssOf(dev_info);
+  const bool pinned = PinReta(dpdk_port_id_, dev_info, num_rxq);
+  // Two ports agree when everything that picks the queue agrees; an unpinned
+  // redirection table is the driver's own, so it only agrees with itself.
+  const uint64_t hf = (RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_SCTP) &
+                      dev_info.flow_type_rss_offloads;
+  std::string facts = std::string(dev_info.driver_name ? dev_info.driver_name : "?") + "/" +
+                      std::to_string(static_cast<int>(mode)) + "/" +
+                      std::to_string(dev_info.hash_key_size) + "/" + std::to_string(hf) + "/" +
+                      std::to_string(num_rxq) + "/" +
+                      (pinned ? "reta" + std::to_string(dev_info.reta_size)
+                              : "own" + std::to_string(dpdk_port_id_));
+  rss_signature_ = std::hash<std::string>{}(facts) | 1;  // never 0
+  if (!pinned) {
+    LOG(WARNING) << "PMDPort " << name() << ": symmetric_rss without a pinned redirection table;"
+                 << " per-worker state across ports will be refused";
+  }
+}
+
 CommandResponse PMDPort::ConfigureDevice(dpdk_port_t port_id,
                                           const rte_eth_dev_info &dev_info,
                                           bool enable_rx_scatter) {
@@ -534,6 +584,7 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
     return CommandFailure(-ret, "rte_eth_dev_start() failed");
   }
   dpdk_port_id_ = ret_port_id;
+  SettleRss();
 
   int numa_node = rte_eth_dev_socket_id(static_cast<int>(ret_port_id));
   node_placement_ =
@@ -623,6 +674,7 @@ CommandResponse PMDPort::UpdateConfWithOps(const Conf &conf,
       resp = CommandFailure(-ret, "rte_eth_dev_start() failed");
       goto restart;
     }
+    SettleRss();
   }
 
   conf_ = old_conf;

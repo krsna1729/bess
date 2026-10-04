@@ -120,6 +120,7 @@ class PMDPort final : public Port {
   bool symmetric_rss() const override {
     return num_queues[PACKET_DIR_INC] <= 1 || symmetric_rss_;
   }
+  uint64_t rss_signature() const override { return rss_signature_; }
 
   /*!
    * Receives packets from the device.
@@ -192,6 +193,10 @@ class PMDPort final : public Port {
                                     bool enable_rx_scatter,
                                     const UpdateConfOps &ops);
 
+  // After a start: with symmetric_rss and several queues, pins the
+  // redirection table and records rss_signature_.
+  void SettleRss();
+
   CommandResponse ConfigureDevice(dpdk_port_t port_id,
                                   const rte_eth_dev_info &dev_info,
                                   bool enable_rx_scatter);
@@ -218,6 +223,7 @@ class PMDPort final : public Port {
   bool conf_state_degraded_;
   bool loopback_;
   bool symmetric_rss_ = false;  // configured a symmetric RSS hash
+  uint64_t rss_signature_ = 0;  // see Port::rss_signature()
   int vlan_offload_mask_;
 
   std::string driver_;  // ixgbe, i40e, ...

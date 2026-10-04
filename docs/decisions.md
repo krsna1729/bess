@@ -6941,14 +6941,18 @@ looks like a new or untracked connection: a silent policy error, so the mode nee
 
 **Decision.**
 - `PMDPortArg.symmetric_rss`: the device's symmetric Toeplitz function where it reports one (`rss_algo_capa`), else
-  its Toeplitz function with the symmetric key 0x6d5a repeated (Woo and Park 2012); refused (ENOTSUP) when it offers
-  neither. A port reports `symmetric_rss()`: true with one receive queue or when configured. No NIC flow rules.
+  its Toeplitz function with the symmetric key 0x6d5a repeated (Woo and Park 2012); the key is pinned in both modes
+  and the redirection table pinned to entry % queues after every start, so two ports of one driver send a tuple to the
+  same queue index. Refused (ENOTSUP) without a settable key. A port reports `symmetric_rss()` (one receive queue, or
+  configured) and `rss_signature()` (driver, mode, key size, hashed fields, queues, and the pinned table or, when the
+  device refused to pin it, the port itself). No NIC flow rules.
 - `ConnTrack` module: igate 0 may start connections, igate 1 may not; tracked packets (new, existing, related) to
   ogate 0, the rest to ogate 1. `OWNED` (one worker) or `PER_WORKER` (one table per worker, allocated before resume
   for each worker that runs the module, never on the packet path).
 - `PER_WORKER` is accepted only when, before every resume, `AsymmetricInputs` finds every task reaching the module to
-  be a `PortInc`/`QueueInc` on a port with a symmetric hash, all such ports with the same queue count, and queue q of
-  each port on one worker. Otherwise the module fails closed (everything to ogate 1), logs why, and its description
+  be a `PortInc`/`QueueInc` connected straight to it (a module in between could rewrite or decapsulate: a NAT in front,
+  or a tunnel whose outer header the NIC hashed), on a port with a symmetric hash; all such ports with the same queue
+  count and, with several queues, the same `rss_signature()`; and queue q of each port on one worker. Otherwise the module fails closed (everything to ogate 1), logs why, and its description
   says `closed: <why>`.
 
 **Evidence.** EVIDENCE
@@ -6969,8 +6973,11 @@ and taking a lock per packet would serialise every worker.
 - `SharedConntrack` gives the owned tracker's verdicts (one state machine: `ct_internal::StepExisting`, extracted from
   `Conntrack::Resolve` without changing it) on a `SharedFlowTable`. Lookups are lock-free.
 - A packet of a connection takes that connection's one-byte lock for the state machine and stores the new deadline in
-  the entry; the wheel is not touched on the packet path. A timer that fires re-arms to the entry's deadline if a packet
-  moved it, else erases (the owner-kept deadline, as NAT does). Two workers serialise only on one connection.
+  the entry. The wheel is touched only when the deadline moves earlier than the armed timer (a TCP close shortens the
+  timeout), under the tracker's lock; otherwise a timer that fires re-arms to the entry's deadline if a packet moved it,
+  else erases (the owner-kept deadline, as NAT does). A packet that moves the deadline earlier and a timer firing at
+  that moment pair full fences on the deadline and `armed` (Dekker), so the earlier deadline is never lost. Two workers
+  serialise only on one connection.
 - Creating holds the tracker's lock (the table insert and the timer); a create that loses a race to another worker's
   create of the same connection handles the packet as that connection's. Expiry runs on whichever worker takes the
   lock without waiting; erased entries are freed after an RCU grace period.

@@ -224,6 +224,10 @@ class Port {
   // received on the same queue: trivially with one receive queue; a driver
   // with RSS says so when it configured a symmetric hash (TP8).
   virtual bool symmetric_rss() const { return num_queues[PACKET_DIR_INC] <= 1; }
+  // What decides a packet's receive queue when there are several: equal on two
+  // ports means the same tuple lands on the same queue index on both (driver,
+  // hash function, key, hashed fields, redirection table). 0: unknown.
+  virtual uint64_t rss_signature() const { return 0; }
 
   /*!
    * Get any placement constraints that need to be met when receiving from this

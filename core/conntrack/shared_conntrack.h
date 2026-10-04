@@ -137,10 +137,24 @@ class SharedConntrack {
                          if (e == nullptr) {
                            return std::nullopt;
                          }
-                         const Tick due = e->deadline.load(std::memory_order_relaxed);
+                         Tick due = e->deadline.load(std::memory_order_relaxed);
                          if (static_cast<int64_t>(due - now) > 0) {
+                           // Re-arm to the deadline a packet moved it to. A packet
+                           // that moves it earlier at the same time stores the
+                           // deadline, then reads `armed`; here `armed` is stored,
+                           // then the deadline read again: with a full fence on
+                           // both sides, one of the two sees the other's store
+                           // (Dekker), so the earlier deadline is never lost.
                            e->armed.store(due, std::memory_order_relaxed);
-                           return due;  // a packet moved it: wait for the new one
+                           std::atomic_thread_fence(std::memory_order_seq_cst);
+                           const Tick again = e->deadline.load(std::memory_order_relaxed);
+                           if (static_cast<int64_t>(due - again) > 0) {
+                             due = again;
+                             e->armed.store(due, std::memory_order_relaxed);
+                           }
+                           if (static_cast<int64_t>(due - now) > 0) {
+                             return due;
+                           }
                          }
                          removed += table_->Erase(h) ? 1 : 0;
                          return std::nullopt;
@@ -193,6 +207,7 @@ class SharedConntrack {
     const Tick due = Wheel::After(now, ct_internal::TimeoutFor(policy_, p.l4, e));
     e.deadline.store(due, std::memory_order_relaxed);
     UnlockEntry(e);
+    std::atomic_thread_fence(std::memory_order_seq_cst);  // pairs with Expire's (Dekker)
     if (static_cast<int64_t>(e.armed.load(std::memory_order_relaxed) - due) > 0) [[unlikely]] {
       // Earlier than the armed timer (a TCP close shortens the timeout): move
       // the timer, as the owned tracker does on every packet.
