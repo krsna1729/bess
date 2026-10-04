@@ -3,16 +3,17 @@
 #include "stats/event_hub.h"
 
 #include <bit>
-#include <time.h>
+#include <chrono>
+#include <cstddef>
 
 namespace bess::stats {
 
 namespace {
 
 uint64_t MonotonicNs() {
-  timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
 }
 
 }  // namespace
@@ -47,8 +48,9 @@ uint32_t EventHub::RegisterType(const std::string &name,
       return static_cast<uint32_t>(i);
     }
   }
-  std::vector<std::string> names(value_names.begin(),
-                                 value_names.begin() + std::min<size_t>(value_names.size(), 6));
+  std::vector<std::string> names(
+      value_names.begin(),
+      value_names.begin() + static_cast<std::ptrdiff_t>(std::min<size_t>(value_names.size(), 6)));
   types_.push_back({name, std::move(names), source_prefix});
   return static_cast<uint32_t>(types_.size() - 1);
 }
@@ -62,6 +64,14 @@ uint32_t EventHub::NamedSource(const std::string &name) {
   }
   source_names_.push_back(name);
   return kNamedSource | static_cast<uint32_t>(source_names_.size() - 1);
+}
+
+bool EventHub::Full(int wid) const noexcept {
+  if (wid < 0 || wid >= kMaxWorkers) {
+    return true;
+  }
+  const Ring &r = *rings_[static_cast<size_t>(wid)];
+  return r.tail.load(std::memory_order_relaxed) - r.head.load(std::memory_order_acquire) > r.mask;
 }
 
 bool EventHub::Post(int wid, const WorkerEvent &event) noexcept {

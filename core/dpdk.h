@@ -14,7 +14,9 @@ bool IsDpdkInitialized();
 void InitDpdk(int dpdk_mb_per_socket = 0);
 
 // Writes DPDK's trace (--dpdk_trace) to its directory; nothing when tracing
-// is off. At shutdown: bessd does not call rte_eal_cleanup(), which would.
+// is off. At shutdown, with workers paused and still registered with EAL (a
+// thread's trace buffer is freed when it unregisters); bessd does not call
+// rte_eal_cleanup(), which would save it.
 void SaveDpdkTrace();
 
 }  // namespace bess

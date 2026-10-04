@@ -33,6 +33,7 @@
 #include "metadata.h"
 #include "module.h"
 #include "module_graph.h"
+#include "dpdk.h"
 #include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
@@ -1203,6 +1204,13 @@ void ApiServer::Run() {
   // classes and workers -- ResetAll's order. Left to static destruction, the
   // runtime destroyed its RcuDomain before the modules that publish through
   // it, and aborted on RcuPtr's online-reader check.
+  // DPDK's trace (--dpdk_trace) before the reset: a worker's trace buffer is
+  // freed when its thread unregisters from EAL, and the reset ends the
+  // workers. Paused, they write no trace points while it is saved.
+  if (!FLAGS_dpdk_trace.empty()) {
+    pause_all_workers();
+    bess::SaveDpdkTrace();
+  }
   if (auto reset = control_plane.Reset(); !reset) {
     LOG(ERROR) << "Shutdown reset failed: " << reset.error().message;
   }

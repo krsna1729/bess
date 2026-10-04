@@ -77,12 +77,17 @@ class EventHub {
 
   // Control side: a source id that the log shows as `name` (a module
   // instance's name, say) instead of the type's prefix and a number.
-  // Idempotent per name.
+  // Idempotent per name. Ids carry kNamedSource; plugins need
+  // BESS_CAP_EVENT_SOURCES (an older bessd lacks it).
   static constexpr uint32_t kNamedSource = UINT32_C(1) << 31;
   uint32_t NamedSource(const std::string &name);
 
-  // Worker `wid`: false when its ring is full (counted).
+  // Worker `wid`: false when its ring is full (counted). A poster's own
+  // source ids stay below kNamedSource.
   bool Post(int wid, const WorkerEvent &event) noexcept;
+  // Worker `wid`: whether its ring is full now (nothing counted), for a
+  // poster that keeps what it would post for later (EventThrottle).
+  bool Full(int wid) const noexcept;
 
   // Control side.
   uint64_t Emit(std::string type, std::string source, std::map<std::string, std::string> fields,

@@ -7337,22 +7337,29 @@ DPDK's tracing before building tracing machinery.
   with the episode's total; a counter that went down is a new baseline), `bess.port_link` (up/down with the speed; a
   port's first sample is its baseline, a removed port starts over).
 - Packet-path conditions are posted by the module that meets them, on the failure path only, through
-  `stats::EventThrottle`: at most one event per second per worker, carrying the count since the last one (a post the
-  ring refuses keeps its count), under the module's name (`EventHub::NamedSource`). In tree: `bess.table_full` (NAT
+  `stats::EventThrottle`: at most one event per second per worker, carrying the count since the last one, under the
+  module's name (`EventHub::NamedSource`). While the worker's ring is full it does not post (`EventHub::Full`), so
+  `bess.events_lost` counts only real loss and the count waits for the next event. Plugins using it require
+  `BESS_CAP_EVENT_SOURCES` (1<<6): an older bessd lacks the two symbols. Raw posters keep their source ids below
+  `kNamedSource` (2^31). In tree: `bess.table_full` (NAT
   bindings refused by a full table or wheel, ConnTrack connections refused by a full table), `bess.nat_ports_exhausted`,
   `bess.queue_full` (Queue's ring). A batch that meets no failure runs no event code (NAT and ConnTrack count failures
   in their existing per-packet verdict loop and test the count once per batch; Queue inside its existing drop branch).
 - Tracing is DPDK's: `--dpdk_trace REGEX` passes EAL `--trace` (and `--dpdk_trace_dir` `--trace-dir`), and bessd saves
-  the trace at shutdown (`rte_trace_save`; it does not call `rte_eal_cleanup`). CTF, read with babeltrace or Trace
+  the trace at shutdown (`rte_trace_save`; it does not call `rte_eal_cleanup`) with the workers paused, before the
+  reset ends them: a thread's trace buffer is freed when it unregisters from EAL. CTF, read with babeltrace or Trace
   Compass. BESS adds no tracer of its own.
 - Not done: histograms (no consumer, D-076); per-port metrics in `ListMetrics` (the registry is read without the
   control-plane lock, and the port list needs it); neighbor and offload events (their state lives in applications'
   code -- the router's neighbors change through transactions, which are already events; flow-rule owners are the
   application's to report).
 
+**Review.** The reviewer's P2 (the trace was saved after the workers had unregistered, losing their buffers) and two
+P3s (retried posts inflating `bess.events_lost`; the new symbols and the source-id bit) are fixed as above.
+
 **Evidence.** `stats_event_hub_test` (5): the throttle's first occurrence posts at once, the rest of the interval is
-carried by the next event per worker (3, then 2+4+1), under the poster's name; a refused post keeps its count (the
-refused 10 + 1). `control_pressure_monitor_test` (3): RCU high at 500 of 1000 and cleared at 124 (not at 125-499);
+carried by the next event per worker (3, then 2+4+1), under the poster's name; with the ring full the count waits
+(10 + 1) and `lost()` does not move. `control_pressure_monitor_test` (3): RCU high at 500 of 1000 and cleared at 124 (not at 125-499);
 drop episodes per direction from a baseline (tx 3 then cleared with 23; rx in the same sample), a counter reset not an
 episode; link up and down, a down baseline not an event, a removed port's return a new baseline. Live (`events.py`):
 a ConnTrack of capacity 4 fed 64 new UDP flows yields a `bess.table_full` from the module's own name with a count and

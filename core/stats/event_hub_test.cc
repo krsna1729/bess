@@ -74,9 +74,12 @@ TEST(EventThrottleTest, OneEventPerIntervalPerWorkerCarryingTheCount) {
   for (const Event &e : got.events) seen.insert({e.fields.at("worker"), e.fields.at("count")});
   EXPECT_EQ((std::multiset<std::pair<std::string, std::string>>{{"0", "3"}, {"0", "7"}, {"1", "1"}}),
             seen);
-  // Worker 2's ring (2 slots) full: the refused post keeps its count.
+  // Worker 2's ring (2 slots) full: the third keeps its count, and is not
+  // counted as lost (nothing was).
   EventThrottle other(hub, "bess.queue_full", "q0", 0);
+  const uint64_t lost = hub.lost();
   for (uint64_t now = 1; now <= 3; now++) other.Note(2, now, 10);
+  EXPECT_EQ(lost, hub.lost());
   ASSERT_EQ(2u, hub.DrainWorkers());
   other.Note(2, 4, 1);
   ASSERT_EQ(1u, hub.DrainWorkers());

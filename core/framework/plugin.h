@@ -28,6 +28,7 @@
 #define BESS_CAP_METRICS (UINT64_C(1) << 3)       // init_context().metrics()
 #define BESS_CAP_REQUESTS (UINT64_C(1) << 4)      // init_context().requests()
 #define BESS_CAP_EVENTS (UINT64_C(1) << 5)        // init_context().events()
+#define BESS_CAP_EVENT_SOURCES (UINT64_C(1) << 6)  // EventHub::NamedSource/Full, stats::EventThrottle
 
 struct BessPluginDescriptor {
   uint32_t abi_version;  // Must be BESS_PLUGIN_ABI_VERSION

@@ -18,8 +18,9 @@ namespace bess::stats {
 // never meets the condition runs none of it. The first occurrence posts at
 // once; later ones inside the interval are counted and carried by the next
 // event ("count"), so the log shows how much happened without one event per
-// packet. Each worker uses its own slot (no sharing, no atomics); a post the
-// worker's ring refuses keeps the count for the next one.
+// packet. Each worker uses its own slot (no sharing, no atomics); while the
+// worker's ring is full nothing is posted (nor counted as lost: the count is
+// kept for the next event). A plugin using it requires BESS_CAP_EVENT_SOURCES.
 //
 //   Init:    full_ = EventThrottle(init_context().events(), "bess.table_full", name());
 //   Worker:  if (refused != 0) [[unlikely]] full_.Note(ctx->wid, ctx->current_ns, refused);
@@ -45,6 +46,9 @@ class EventThrottle {
     s.pending += count;
     if (s.posted && now_ns - s.last_ns < interval_ns_) {
       return;
+    }
+    if (hub_->Full(wid)) {
+      return;  // kept for the next event, not lost
     }
     WorkerEvent e;
     e.type = type_;

@@ -201,6 +201,7 @@ struct BessPluginDescriptor {
   | `BESS_CAP_METRICS` | operational metrics (`init_context().metrics()`) |
   | `BESS_CAP_REQUESTS` | worker-to-control requests (`init_context().requests()`) |
   | `BESS_CAP_EVENTS` | operational events (`init_context().events()`) |
+  | `BESS_CAP_EVENT_SOURCES` | named event sources and the throttled packet-path events (`EventHub::NamedSource`, `EventHub::Full`, `stats::EventThrottle`) |
 
   The `standalone_*` conformance plugins in `examples/standalone_plugin` use
   `BESS_PLUGIN`; `sample_plugin`'s `SequentialUpdate` uses
