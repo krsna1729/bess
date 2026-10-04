@@ -130,8 +130,10 @@ def main():
     p.add_argument('--noise', type=float, default=0.03)
     p.add_argument('--allow-busy', action='store_true',
                    help='skip the idle-machine pre-flight check')
-    p.add_argument('--metric', help='compare this counter (e.g. ns_per_packet) instead of '
-                                    'real_time: for benchmarks whose iterations differ in work')
+    p.add_argument('--metric', help='compare this counter instead of real_time, for benchmarks '
+                                    'whose iterations differ in work. It must be an inverted '
+                                    'rate counter (kIsRate | kInvert, seconds per item, e.g. '
+                                    'ns_per_packet): values are shown in ns')
     p.add_argument('extra', nargs='*')
     o = p.parse_args()
 

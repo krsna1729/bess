@@ -5956,7 +5956,7 @@ byte. Found by the M22 conntrack model test (written independently from Linux's 
 (64K Track rows rerun at 24 rounds: B/A 0.998-1.012).
 
 **Change (consolidation review, performance clawback): `TrackBatch`.** `Conntrack::TrackBatch(frames, parsed, now,
-out)` tracks up to 32 packets in order, with the same results as `Track` packet by packet (a differential test over
+out)` tracks up to 64 packets (`kMaxBatch`) in order, with the same results as `Track` packet by packet (a differential test over
 random streams that create, use and close connections within a batch, under both bodies; dropping the re-lookup of a
 miss is caught). Staged: keys for the whole batch, then `WorkerFlowTable::FindRefBatch` (hash and prefetch every
 index line, then probe), then each packet resolved as `Track` would; a miss is looked up again, as an earlier packet
