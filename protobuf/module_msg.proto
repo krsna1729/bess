@@ -765,6 +765,28 @@ message MetadataTestArg {
  * __Input Gates__: 2 (0 for internal->external, and 1 for external->internal direction)
  * __Output Gates__: 2 (same as the input gate)
  */
+/**
+ * Connection tracking (TP8, D-080): the conntrack library as a module.
+ * igate 0 may start connections (the inside), igate 1 may not (the outside);
+ * ogate 0 gets packets of tracked connections (new, existing, related),
+ * ogate 1 everything else (invalid, untracked, refused for a full table).
+ */
+message ConnTrackArg {
+  enum Mode {
+    OWNED = 0;       /// one worker, one table
+    PER_WORKER = 1;  /// one table per worker; needs symmetric RSS inputs
+    SHARED = 2;      /// one table for every worker, any traffic distribution
+  }
+  Mode mode = 1;
+  /// Connections per table (0: 65,536).
+  uint64 capacity = 2;
+  /// Accept an established TCP connection seen mid-stream (no SYN).
+  bool tcp_pickup = 3;
+  /// PER_WORKER on inputs that are not verified symmetric: track with one
+  /// shared table instead of failing closed.
+  bool fallback_shared = 4;
+}
+
 message NATArg {
   message PortRange {
     uint32 begin = 1;

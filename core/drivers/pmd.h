@@ -69,6 +69,10 @@ struct PmdCapabilities {
  */
 class PMDPort final : public Port {
  public:
+  // How a symmetric hash is configured: the device's symmetric Toeplitz
+  // function, a symmetric key for its Toeplitz function, or not at all.
+  enum class SymmetricRss : uint8_t { kNone, kFunction, kKey };
+
   PMDPort()
       : Port(),
         dpdk_port_id_(DPDK_PORT_UNKNOWN),
@@ -111,6 +115,11 @@ class PMDPort final : public Port {
    * collect stats).
    */
   void CollectStats(bool reset) override;
+
+  // One receive queue, or a symmetric hash configured (PMDPortArg.symmetric_rss).
+  bool symmetric_rss() const override {
+    return num_queues[PACKET_DIR_INC] <= 1 || symmetric_rss_;
+  }
 
   /*!
    * Receives packets from the device.
@@ -208,6 +217,7 @@ class PMDPort final : public Port {
   bool rx_scatter_enabled_;
   bool conf_state_degraded_;
   bool loopback_;
+  bool symmetric_rss_ = false;  // configured a symmetric RSS hash
   int vlan_offload_mask_;
 
   std::string driver_;  // ixgbe, i40e, ...

@@ -128,6 +128,9 @@ class Task {
   void ClearPacketBatch() const { pbatch_idx_ = 0; }
 
   Module *module() const { return module_; }
+  void *arg() const { return arg_; }
+  // The leaf traffic class this task runs under (its root is a worker's).
+  bess::LeafTrafficClass *tc() const { return c_; }
 
   bess::PacketBatch *dead_batch() const { return &dead_batch_; }
 

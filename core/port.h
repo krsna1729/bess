@@ -220,6 +220,11 @@ class Port {
 
   virtual uint64_t GetFlags() const { return 0; }
 
+  // Whether both directions of a connection (the same 5-tuple, swapped) are
+  // received on the same queue: trivially with one receive queue; a driver
+  // with RSS says so when it configured a symmetric hash (TP8).
+  virtual bool symmetric_rss() const { return num_queues[PACKET_DIR_INC] <= 1; }
+
   /*!
    * Get any placement constraints that need to be met when receiving from this
    * port.

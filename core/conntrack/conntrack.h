@@ -247,6 +247,88 @@ inline bool ParseQuoted(std::span<const uint8_t> q, bool v6, ParsedFlowPacket &o
   }
   return true;
 }
+
+// What a keyed packet does to its existing connection: the TCP state machine
+// and the reply flag, on any entry with `tcp`, `initiator_is_a` and `replied`
+// (the owned and the shared store). kReopen: a SYN takes TIME_WAIT or CLOSE
+// back to SYN_SENT, a new connection on the old tuple (Linux kills the old
+// entry and re-evaluates the packet); the caller resets the entry, with the
+// sender as the initiator. Nothing changes on kInvalid.
+enum class Step : uint8_t { kInvalid, kExisting, kReopen };
+template <typename E>
+inline Step StepExisting(E &e, const ParsedFlowPacket &p, Direction dir,
+                         bool may_create) noexcept {
+  if (p.l4 == L4Kind::kTcp) {
+    if (!ValidFlags(p.tcp_flags)) {
+      return Step::kInvalid;  // tcp_error(): nothing changes
+    }
+    const uint8_t next = kTcpTable[static_cast<int>(dir)][ClassOf(p.tcp_flags)][static_cast<int>(e.tcp)];
+    if (next == kIv) {
+      return Step::kInvalid;
+    }
+    if (next == static_cast<uint8_t>(TcpState::kSynSent) &&
+        (e.tcp == TcpState::kTimeWait || e.tcp == TcpState::kClose)) {
+      return may_create ? Step::kReopen : Step::kInvalid;
+    }
+    if (next != kIg) {
+      e.tcp = static_cast<TcpState>(next);
+    }
+  }
+  if (dir == Direction::kReply) {
+    e.replied = true;
+  }
+  return Step::kExisting;
+}
+
+// A connection's timeout in its state (`e` as for StepExisting).
+template <typename E>
+inline uint64_t TimeoutFor(const TimeoutPolicy &policy, L4Kind l4, const E &e) noexcept {
+  switch (l4) {
+    case L4Kind::kTcp:
+      return policy.tcp[static_cast<size_t>(e.tcp)];
+    case L4Kind::kUdp:
+      return e.replied ? policy.udp_replied : policy.udp_unreplied;
+    case L4Kind::kIcmp:
+    case L4Kind::kIcmpv6:
+      return policy.icmp;
+    default:
+      return policy.other;
+  }
+}
+
+// A packet that has a connection key: parsed, and not an ICMP error or an
+// ICMP type conntrack does not follow.
+inline bool Keyed(const ParsedFlowPacket &p) noexcept {
+  if (p.l3 == L3Kind::kNone || p.l4 == L4Kind::kNone) {
+    return false;
+  }
+  if (p.l4 == L4Kind::kIcmp || p.l4 == L4Kind::kIcmpv6) {
+    return IsEchoRequest(p.l4, p.icmp_type) || IsEchoReply(p.l4, p.icmp_type);
+  }
+  return true;
+}
+
+// An ICMP error's quoted packet as a connection key (the quote went from us
+// toward the error's sender, so its tuple, as written, is the connection's).
+// False when the quote is short or unparsable.
+inline bool QuotedKey(std::span<const uint8_t> frame, const ParsedFlowPacket &p, uint16_t zone,
+                      CanonicalKey *out) noexcept {
+  const size_t quote = size_t{p.l4_offset} + 8;
+  if (frame.size() < quote) {
+    return false;
+  }
+  const size_t ip_end = std::min(frame.size(), size_t{p.l4_offset} + p.l4_length);
+  if (ip_end < quote) {
+    return false;
+  }
+  ParsedFlowPacket inner;
+  if (!ParseQuoted(frame.subspan(quote, ip_end - quote), p.l3 == L3Kind::kIpv6, inner) ||
+      inner.l3 != p.l3) {
+    return false;
+  }
+  *out = MakeKey(inner, zone);
+  return true;
+}
 }  // namespace ct_internal
 
 template <typename UserData = NoUserData>
@@ -365,18 +447,7 @@ class Conntrack {
   }
 
  private:
-  // A packet that has a connection key: parsed, and not an ICMP error or an
-  // ICMP type conntrack does not follow.
-  static bool Keyed(const ParsedFlowPacket &p) noexcept {
-    if (p.l3 == L3Kind::kNone || p.l4 == L4Kind::kNone) {
-      return false;
-    }
-    if (p.l4 == L4Kind::kIcmp || p.l4 == L4Kind::kIcmpv6) {
-      return ct_internal::IsEchoRequest(p.l4, p.icmp_type) ||
-             ct_internal::IsEchoReply(p.l4, p.icmp_type);
-    }
-    return true;
-  }
+  static bool Keyed(const ParsedFlowPacket &p) noexcept { return ct_internal::Keyed(p); }
 
   // What Track answers for a packet without a key.
   Result Unkeyed(std::span<const uint8_t> frame, const ParsedFlowPacket &p,
@@ -395,25 +466,11 @@ class Conntrack {
     if (ref.state != nullptr) {
       Entry &e = *ref.state;
       const Direction dir = c.src_is_a == e.initiator_is_a ? Direction::kOriginal : Direction::kReply;
-      if (p.l4 == L4Kind::kTcp) {
-        if (!ct_internal::ValidFlags(p.tcp_flags)) {
-          return {TrackStatus::kInvalid, dir};  // tcp_error(): nothing changes
-        }
-        const uint8_t next =
-            ct_internal::kTcpTable[static_cast<int>(dir)][ct_internal::ClassOf(p.tcp_flags)]
-                                  [static_cast<int>(e.tcp)];
-        if (next == ct_internal::kIv) {
+      switch (ct_internal::StepExisting(e, p, dir, may_create)) {
+        case ct_internal::Step::kInvalid:
           return {TrackStatus::kInvalid, dir};
-        }
-        // A SYN that takes TIME_WAIT or CLOSE back to SYN_SENT opens a new
-        // connection on the old tuple: as Linux does (it kills the old entry
-        // and re-evaluates the packet), the sender becomes the initiator and
-        // nothing of the old connection is kept.
-        if (next == static_cast<uint8_t>(TcpState::kSynSent) &&
-            (e.tcp == TcpState::kTimeWait || e.tcp == TcpState::kClose)) {
-          if (!may_create) {
-            return {TrackStatus::kInvalid, dir};
-          }
+        case ct_internal::Step::kReopen: {
+          // Nothing of the old connection is kept; the sender is the initiator.
           const dataplane::ExpiryHandle timer = e.timer;
           e = Entry{};
           e.tcp = TcpState::kSynSent;
@@ -422,12 +479,8 @@ class Conntrack {
           (void)wheel_->Refresh(e.timer, Wheel::After(now, TimeoutOf(p.l4, e)));
           return {TrackStatus::kNew, Direction::kOriginal, ref.handle, &e};
         }
-        if (next != ct_internal::kIg) {
-          e.tcp = static_cast<TcpState>(next);
-        }
-      }
-      if (dir == Direction::kReply) {
-        e.replied = true;
+        case ct_internal::Step::kExisting:
+          break;
       }
       (void)wheel_->Refresh(e.timer, Wheel::After(now, TimeoutOf(p.l4, e)));
       return {TrackStatus::kExisting, dir, ref.handle, &e};
@@ -513,37 +566,16 @@ class Conntrack {
       : table_(std::move(table)), wheel_(std::move(wheel)), policy_(policy) {}
 
   Tick TimeoutOf(L4Kind l4, const Entry &e) const noexcept {
-    switch (l4) {
-      case L4Kind::kTcp:
-        return policy_.tcp[static_cast<size_t>(e.tcp)];
-      case L4Kind::kUdp:
-        return e.replied ? policy_.udp_replied : policy_.udp_unreplied;
-      case L4Kind::kIcmp:
-      case L4Kind::kIcmpv6:
-        return policy_.icmp;
-      default:
-        return policy_.other;
-    }
+    return ct_internal::TimeoutFor(policy_, l4, e);
   }
 
   // An ICMP error: the quoted packet went from us toward the error's sender,
   // so its tuple, as written, is the connection's.
   Result Related(std::span<const uint8_t> frame, const ParsedFlowPacket &p, uint16_t zone) noexcept {
-    const size_t quote = size_t{p.l4_offset} + 8;
-    if (frame.size() < quote) {
+    CanonicalKey c;
+    if (!ct_internal::QuotedKey(frame, p, zone, &c)) {
       return {TrackStatus::kInvalid};
     }
-    const size_t ip_end = std::min(frame.size(), size_t{p.l4_offset} + p.l4_length);
-    if (ip_end < quote) {
-      return {TrackStatus::kInvalid};
-    }
-    ParsedFlowPacket inner;
-    if (!ct_internal::ParseQuoted(frame.subspan(quote, ip_end - quote),
-                                  p.l3 == L3Kind::kIpv6, inner) ||
-        inner.l3 != p.l3) {
-      return {TrackStatus::kInvalid};
-    }
-    const CanonicalKey c = MakeKey(inner, zone);
     const auto ref = table_->FindRef(c.key);
     if (ref.state == nullptr) {
       return {TrackStatus::kInvalid};

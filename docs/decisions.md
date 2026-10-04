@@ -100,6 +100,8 @@ file is the reasoning.
 | D-077 | Worker-to-control module requests: a one-slot endpoint per condition and the maintenance loop (TP4) | accepted |
 | D-078 | NAT grows without stopping: the owner asks, the control side allocates, the owner moves bindings (TP5) | accepted |
 | D-079 | Shared NAT: one binding table for every worker, lock-free lookups, creates under a lock, growth on the control thread (TP6) | accepted |
+| D-080 | Symmetric RSS port option; a conntrack module with owned and per-worker tables, per-worker only on verified symmetric inputs (TP8) | accepted |
+| D-081 | Shared conntrack: one table for every worker, a per-connection lock, deadlines kept by the entry (TP8) | accepted |
 
 
 ---
@@ -6920,4 +6922,62 @@ module's shared mode translates UDP, TCP and ICMP and grows 4 -> 64. Cost, one w
 rounds): `BM_TranslateShared/3/` against the owned NAT +32% at 4K, +47% at 64K, +34% at 1M per packet: the
 SharedFlowTable's validated lookups and the atomic refresh, reported (table_policy.md 7: shared is reported, not
 gated); the reason to choose it is running on more than one worker.
+
+
+## D-080 Symmetric RSS port option; a conntrack module with owned and per-worker tables, per-worker only on verified symmetric inputs (TP8)
+
+**Status:** accepted (2026-10-05), experimental. Implements table_policy.md 5.3 (user, 2026-10-04); the shared store
+is D-081.
+**Code:** `core/drivers/pmd.{h,cc}` (`PMDPortArg.symmetric_rss`, `SymmetricRss`), `core/port.h`
+(`Port::symmetric_rss()`), `core/modules/symmetric_inputs.{h,cc}` (`AsymmetricInputs`), `core/modules/conntrack.{h,cc}`
+(`ConnTrack`, `ConnTrackArg`), `core/task.h` (`arg()`, `tc()`), `core/module.h` (`visited_tasks()`),
+`core/modules/{port_inc,queue_inc}.h` (`port()`, `qid()`), `protobuf/{module_msg,ports/port_msg}.proto`,
+`bessctl/module_tests/conntrack.py`.
+
+**Context.** Conntrack does not rewrite the tuple and its key is canonical, so with a symmetric receive hash both
+directions of a connection reach one queue, and a worker can own its table: no shared writes, no lock. BESS's PMD
+port passed no RSS key and the default hash, so traffic was not symmetric. A mis-steered reply in per-worker mode
+looks like a new or untracked connection: a silent policy error, so the mode needs a check, not a promise.
+
+**Decision.**
+- `PMDPortArg.symmetric_rss`: the device's symmetric Toeplitz function where it reports one (`rss_algo_capa`), else
+  its Toeplitz function with the symmetric key 0x6d5a repeated (Woo and Park 2012); refused (ENOTSUP) when it offers
+  neither. A port reports `symmetric_rss()`: true with one receive queue or when configured. No NIC flow rules.
+- `ConnTrack` module: igate 0 may start connections, igate 1 may not; tracked packets (new, existing, related) to
+  ogate 0, the rest to ogate 1. `OWNED` (one worker) or `PER_WORKER` (one table per worker, allocated before resume
+  for each worker that runs the module, never on the packet path).
+- `PER_WORKER` is accepted only when, before every resume, `AsymmetricInputs` finds every task reaching the module to
+  be a `PortInc`/`QueueInc` on a port with a symmetric hash, all such ports with the same queue count, and queue q of
+  each port on one worker. Otherwise the module fails closed (everything to ogate 1), logs why, and its description
+  says `closed: <why>`.
+
+**Evidence.** EVIDENCE
+
+
+## D-081 Shared conntrack: one table for every worker, a per-connection lock, deadlines kept by the entry (TP8)
+
+**Status:** accepted (2026-10-05), experimental API.
+**Code:** `core/conntrack/shared_conntrack.h` (`SharedConntrack`), `core/conntrack/conntrack.h` (`ct_internal::StepExisting`,
+`TimeoutFor`, `Keyed`, `QuotedKey`: the state machine and key rules both trackers share), `core/modules/conntrack.{h,cc}`
+(`SHARED`, `fallback_shared`), `core/conntrack/shared_conntrack_test.cc`.
+
+**Context.** Without a verified symmetric hash (D-080) the two directions of a connection may reach different
+workers, so the tracker must be shared. The owned tracker re-arms its wheel on every packet; a wheel is single-writer,
+and taking a lock per packet would serialise every worker.
+
+**Decision.**
+- `SharedConntrack` gives the owned tracker's verdicts (one state machine: `ct_internal::StepExisting`, extracted from
+  `Conntrack::Resolve` without changing it) on a `SharedFlowTable`. Lookups are lock-free.
+- A packet of a connection takes that connection's one-byte lock for the state machine and stores the new deadline in
+  the entry; the wheel is not touched on the packet path. A timer that fires re-arms to the entry's deadline if a packet
+  moved it, else erases (the owner-kept deadline, as NAT does). Two workers serialise only on one connection.
+- Creating holds the tracker's lock (the table insert and the timer); a create that loses a race to another worker's
+  create of the same connection handles the packet as that connection's. Expiry runs on whichever worker takes the
+  lock without waiting; erased entries are freed after an RCU grace period.
+- Module: `ConnTrackArg.mode = SHARED`, or `PER_WORKER` with `fallback_shared` (unverified inputs track shared instead
+  of failing closed).
+- Known edge: a connection the expiry erases at the instant a worker refreshes it is gone (the packet that raced it is
+  tracked; the next creates a new connection or, on the outside, is refused).
+
+**Evidence.** EVIDENCE
 

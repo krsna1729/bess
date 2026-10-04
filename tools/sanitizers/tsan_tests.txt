@@ -28,3 +28,4 @@ l2_packed_mac_table_test
 stats_metric_registry_test
 framework_module_requests_test
 nat_shared_nat_test
+conntrack_shared_conntrack_test

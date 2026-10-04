@@ -23,6 +23,9 @@ class PortInc final : public Module {
   }
 
   CommandResponse Init(const bess::pb::PortIncArg &arg);
+
+  // The port it receives from; a task's argument is its queue id.
+  const Port *port() const { return port_; }
   CommandResponse GetInitialArg(const bess::pb::EmptyArg &);
 
   void DeInit() override;

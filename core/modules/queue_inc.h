@@ -20,6 +20,9 @@ class QueueInc final : public Module {
   QueueInc() : Module(), port_(), qid_(), prefetch_(), burst_() {}
 
   CommandResponse Init(const bess::pb::QueueIncArg &arg);
+
+  const Port *port() const { return port_; }
+  queue_t qid() const { return qid_; }
   void DeInit() override;
 
   struct task_result RunTask(Context *ctx, bess::PacketBatch *batch,

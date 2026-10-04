@@ -116,9 +116,16 @@ static size_t single_mbuf_rx_capacity(const bess::PacketPool &pool) {
              : 0;
 }
 
+// The Toeplitz key that makes the hash symmetric (Woo and Park, "Scalable TCP
+// session monitoring with symmetric receive-side scaling", 2012): 0x6d5a
+// repeated, so swapping source and destination address and port gives the same
+// hash. As long as the device's key.
+static uint8_t kSymmetricRssKey[64];
+
 static const rte_eth_conf default_eth_conf(const rte_eth_dev_info &dev_info,
                                            int nb_rxq,
-                                           bool enable_rx_scatter) {
+                                           bool enable_rx_scatter,
+                                           PMDPort::SymmetricRss symmetric) {
   rte_eth_conf ret = {};
 
   ret.rxmode.mq_mode = (nb_rxq > 1) ? RTE_ETH_MQ_RX_RSS : RTE_ETH_MQ_RX_NONE;
@@ -138,8 +145,31 @@ static const rte_eth_conf default_eth_conf(const rte_eth_dev_info &dev_info,
       // prior behavior (drivers picked their own hash algorithm).
       .algorithm = RTE_ETH_HASH_FUNCTION_DEFAULT,
   };
+  if (symmetric == PMDPort::SymmetricRss::kFunction) {
+    ret.rx_adv_conf.rss_conf.algorithm = RTE_ETH_HASH_FUNCTION_SYMMETRIC_TOEPLITZ;
+  } else if (symmetric == PMDPort::SymmetricRss::kKey) {
+    for (size_t i = 0; i < sizeof(kSymmetricRssKey); i += 2) {
+      kSymmetricRssKey[i] = 0x6d;
+      kSymmetricRssKey[i + 1] = 0x5a;
+    }
+    ret.rx_adv_conf.rss_conf.rss_key = kSymmetricRssKey;
+    ret.rx_adv_conf.rss_conf.rss_key_len = dev_info.hash_key_size;
+    ret.rx_adv_conf.rss_conf.algorithm = RTE_ETH_HASH_FUNCTION_TOEPLITZ;
+  }
 
   return ret;
+}
+
+// What the device can do for a symmetric hash.
+static PMDPort::SymmetricRss SymmetricRssOf(const rte_eth_dev_info &dev_info) {
+  if (dev_info.rss_algo_capa & RTE_ETH_HASH_ALGO_CAPA_MASK(SYMMETRIC_TOEPLITZ)) {
+    return PMDPort::SymmetricRss::kFunction;
+  }
+  if ((dev_info.rss_algo_capa & RTE_ETH_HASH_ALGO_CAPA_MASK(TOEPLITZ)) &&
+      dev_info.hash_key_size > 0 && dev_info.hash_key_size <= sizeof(kSymmetricRssKey)) {
+    return PMDPort::SymmetricRss::kKey;
+  }
+  return PMDPort::SymmetricRss::kNone;
 }
 CommandResponse PMDPort::ConfigureDevice(dpdk_port_t port_id,
                                           const rte_eth_dev_info &dev_info,
@@ -158,8 +188,10 @@ CommandResponse PMDPort::ConfigureDevice(dpdk_port_t port_id,
     return CommandFailure(ENODEV, "No default packet pool for socket %d", sid);
   }
 
+  const SymmetricRss symmetric =
+      symmetric_rss_ && num_rxq > 1 ? SymmetricRssOf(dev_info) : SymmetricRss::kNone;
   rte_eth_conf eth_conf =
-      default_eth_conf(dev_info, num_rxq, enable_rx_scatter);
+      default_eth_conf(dev_info, num_rxq, enable_rx_scatter, symmetric);
   eth_conf.lpbk_mode = loopback_ ? 1 : 0;
 
   int ret = rte_eth_dev_configure(port_id, num_rxq, num_txq, &eth_conf);
@@ -415,6 +447,13 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
 
   capabilities_ = PmdCapabilities::FromDeviceInfo(dev_info);
   loopback_ = arg.loopback();
+  symmetric_rss_ = arg.symmetric_rss();
+  if (symmetric_rss_ && num_queues[PACKET_DIR_INC] > 1 &&
+      SymmetricRssOf(dev_info) == SymmetricRss::kNone) {
+    return CommandFailure(ENOTSUP,
+                          "symmetric_rss: the device offers neither a symmetric Toeplitz "
+                          "hash nor a Toeplitz hash with a settable key");
+  }
   vlan_offload_mask_ =
       (arg.vlan_offload_rx_strip() ? RTE_ETH_VLAN_STRIP_OFFLOAD : 0) |
       (arg.vlan_offload_rx_filter() ? RTE_ETH_VLAN_FILTER_OFFLOAD : 0) |

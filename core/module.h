@@ -365,6 +365,8 @@ class alignas(bess::arch::kCacheLineSize) Module {
 
   // Number of tasks that access this module
   inline size_t num_active_tasks() const { return visited_tasks_.size(); }
+  // The tasks whose packets reach this module (as of the last propagation).
+  const std::vector<const Task *> &visited_tasks() const { return visited_tasks_; }
 
   const std::vector<Module *> &parent_tasks() const { return parent_tasks_; };
 

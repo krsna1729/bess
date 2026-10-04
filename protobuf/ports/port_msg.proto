@@ -21,6 +21,11 @@ message PMDPortArg {
   bool vlan_offload_rx_strip = 5;
   bool vlan_offload_rx_filter = 6;
   bool vlan_offload_rx_qinq = 7;
+
+  /// Both directions of a connection reach the same receive queue (TP8): a
+  /// symmetric Toeplitz hash where the device offers it, else the Toeplitz
+  /// hash with a symmetric key. Refused when the device can do neither.
+  bool symmetric_rss = 8;
 }
 
 message UnixSocketPortArg {
