@@ -108,6 +108,7 @@ file is the reasoning.
 | D-085 | Packet parse: the common frame validated on one path ("validate once, execute fast"; tunnel clawback) | accepted |
 | D-086 | Reference appliances as installed-tree plugins with a direct-path self test; R1-R5 (M24) | accepted |
 | D-087 | Release artifacts: a tarball, bess and bess-dev .deb packages with derived dependencies, and a runtime image (M26) | accepted |
+| D-088 | SDK desired state (PipelineBuilder, plan/apply), black-box recovery tests, a controller on the SDK (M27) | accepted |
 
 
 ---
@@ -7268,4 +7269,38 @@ into an installed bessd.
 ubuntu:24.04 container the `deb` builder makes both packages from a staged install (Package, Version, Installed-Size,
 Depends as given), they install with dpkg (`bess-dev` requiring the same `bess`), and bessd and bess-dev.pc land in
 /usr/local. The `dpkg -S` dependency derivation and the image build run in CI's release job (develop pushes).
+
+
+## D-088 SDK desired state (PipelineBuilder, plan/apply), black-box recovery tests, a controller on the SDK (M27)
+
+**Status:** accepted (2026-10-05).
+**Code:** `pybess/sdk.py` (`PipelineBuilder`, `PipelineSnapshot`, `PipelineConflict`, `Client.pipeline`,
+`validate_pipeline`, `diff_pipeline`, `plan_pipeline`, `apply_pipeline`, `_detail`), `pybess/test_sdk.py`
+(`PipelineTest`), `bessctl/module_tests/control_sdk.py` (lost answer, lost request, restart, pipeline),
+`tools/live_transaction_bench.py` (migrated), `docs/control-sdk.md`.
+
+**Context.** Roadmap M27's exit criteria: a real controller migration uses the SDK; raw stubs stay usable; no
+appliance type in the SDK; timeout, restart and idempotency behaviour has black-box integration tests. The SDK had
+transactions, capabilities, metrics and events, and its recovery paths were tested against scripted stubs only. The
+desired-state pipeline API (G1.1) had no SDK surface.
+
+**Decision.**
+- Desired state: `PipelineBuilder` only assembles a `control_v2.Pipeline` (ports, modules with their packed
+  arguments, connections, `chain`, workers, traffic classes, `remove` with its connections), empty or from
+  `client.pipeline()`'s snapshot; the daemon validates, diffs, plans and applies -- no planner logic in the SDK.
+  `apply_pipeline` retries RESOURCE_BUSY within the retry policy, never CONFLICT (`PipelineConflict`, a `Conflict`)
+  or a refusal; without a request id, no answer is `TransportError` and nothing is resent. An answer is told from a
+  loss by the server's `ErrorDetail` (UNAVAILABLE with a detail is a resource failure, answered).
+- Black-box recovery against a live daemon: the real stub with ApplyTransaction's fate scripted per call (deliver;
+  sent, then the answer lost; never sent). A restart is a real one (`bessd -k`) between the send and the question.
+- The controller: `tools/live_transaction_bench.py` (D-027's live gate) applies its pipeline through the SDK and
+  drives its rules as SDK transactions (a Busy through every retry is rebuilt under a new id: nothing applied); BUSY
+  answers come from the daemon's `bess_transactions_total{outcome="busy"}`. The module's default gate and gate
+  counters stay on the legacy API (module-specific).
+
+**Evidence.** `python_unittest_discover`: 184 tests pass (4 new pipeline tests: builder and snapshot editing, busy
+retried and conflict not, busy through every attempt, no answer not resent and a detailed UNAVAILABLE answered).
+Live `control_sdk` (5 tests) passes; mutants -- a blind resend after a timeout, an ignored epoch -- fail the
+lost-answer and the restart tests. The migrated bench on a fast build (2000 sessions, 1 s per rate): hit 0.50 at
+rates 0, 1000 and max (4073 tx/s), so the SDK-applied pipeline and rules steer packets.
 

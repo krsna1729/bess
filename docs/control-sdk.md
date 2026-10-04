@@ -35,6 +35,31 @@ fails on any difference, so it never drifts from the `.proto`. Keys and values
 of module resources need no generated Go types: any `proto.Message` works,
 including `dynamicpb` messages built from a descriptor set.
 
+## Desired state
+
+The pipeline (ports, modules, connections, workers, traffic classes) is
+desired state: `PipelineBuilder` assembles a `control_v2.Pipeline`, empty or
+from `client.pipeline()`'s snapshot, and the daemon validates, diffs, plans and
+applies it. The SDK repeats none of the planner's logic.
+
+```python
+snap = client.pipeline()                       # PipelineSnapshot: pipeline, generation
+p = (sdk.PipelineBuilder(snap.pipeline)
+     .module('em', 'ExactMatch', module_msg.ExactMatchArg(...))
+     .chain('rnd', 'em')
+     .build())
+steps, generation = client.plan_pipeline(p)    # what the daemon would do
+client.apply_pipeline(p, expected_generation=snap.generation)
+```
+
+`apply_pipeline` retries a busy answer within the retry policy and never a
+conflict (`PipelineConflict`, a `Conflict`) or a refusal. It carries no request
+id, so after no answer the outcome is unknown (`TransportError`): read
+`client.pipeline()` before applying again, or apply with `expected_generation`
+so a second application is a conflict. An answer is told from a loss by the
+server's `ErrorDetail` (a resource failure is UNAVAILABLE with a detail: an
+answer).
+
 ## What they guarantee
 
 | Situation | What the SDK does |
@@ -107,10 +132,21 @@ the race detector). Against a live daemon (the `integration` suite):
 runs the Go client (`go test -tags live`) to commit a rule, replay it, meet a
 conflict and refuse a mistyped key, then checks the rule steers packets.
 
-## Not yet
+Black-box recovery against the live daemon (`control_sdk.py`, the real stub
+with ApplyTransaction's fate scripted): an answer lost after the daemon applied
+is recovered through GetTransaction (`replayed`, the daemon's applied counter
+moves by one, the rule steers); a request lost before it arrived is sent again
+once "not known"; a daemon restarted between the send and the question is
+`DaemonRestarted`, the old resource handle is then `StaleResource` and never
+sent. A blind resend after a timeout, or an ignored epoch, fails them. A
+pipeline built, planned and applied through the SDK, re-applied as a no-op,
+and refused at a stale generation.
 
-This is M27's first slice (transactional control, Python and Go). Still to
-come, as the roadmap's M27 describes:
+A real controller on the SDK: `tools/live_transaction_bench.py` (D-027's live
+gate) applies its pipeline as desired state and drives its rules as SDK
+transactions; it reads BUSY answers from the daemon's metrics.
+
+## Not yet
 
 - Resource capability and binding information in discovery.
 - A machine-readable error taxonomy beyond `ErrorDetail`'s codes: schema
@@ -118,7 +154,5 @@ come, as the roadmap's M27 describes:
 - A request field naming the epoch the transaction was built for, so the
   daemon itself refuses one sent across a restart the client has not seen
   (today the client reports it as `DaemonRestarted` after the fact).
-- Desired-state, capability, telemetry and event surfaces (M25's metrics and
-  events feed the last two).
 - Streaming transactions (the protocol has no stream yet); they will follow
   this contract.

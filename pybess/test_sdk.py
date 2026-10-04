@@ -85,6 +85,89 @@ BUSY = v2.TransactionRecord.OUTCOME_BUSY
 TIMEOUT = FakeRpcError(grpc.StatusCode.DEADLINE_EXCEEDED)
 
 
+class PipelineStub:
+    """ApplyPipeline answers from a script; GetPipeline the last applied."""
+
+    def __init__(self, apply=()):
+        self.script = list(apply)
+        self.sent = []
+        self.active = v2.Pipeline()
+        self.generation = 3
+
+    def GetPipeline(self, request, timeout=None):
+        return v2.GetPipelineResponse(pipeline=self.active, generation=self.generation)
+
+    def ApplyPipeline(self, request, timeout=None):
+        self.sent.append(request)
+        step = self.script.pop(0) if self.script else None
+        if isinstance(step, Exception):
+            raise step
+        self.active.CopyFrom(request.pipeline)
+        self.generation += 1
+        return v2.ApplyPipelineResponse(generation=self.generation, applied_ops=1)
+
+
+def refused(code, detail_code, message='refused'):
+    return FakeRpcError(code, message, v2.ErrorDetail(code=detail_code, message=message))
+
+
+class PipelineTest(unittest.TestCase):
+
+    def test_the_builder_assembles_and_edits_a_snapshot(self):
+        p = (sdk.PipelineBuilder().worker(0, 2).module('a', 'Source').module('b', 'Bypass')
+             .module('c', 'Sink').chain('a', 'b', 'c').connect('b', 'c', ogate=1)
+             .traffic_class('root', 'round_robin', wid=0, share=2, limit={'packet': 10}).build())
+        self.assertEqual([(c.upstream, c.ogate, c.downstream) for c in p.connections],
+                         [('a', 0, 'b'), ('b', 0, 'c'), ('b', 1, 'c')])
+        self.assertEqual(p.traffic_classes[0].share, 2)
+        self.assertFalse(p.traffic_classes[0].HasField('priority'))
+        edited = sdk.PipelineBuilder(p).remove('b').build()
+        self.assertEqual([m.name for m in edited.modules], ['a', 'c'])
+        self.assertEqual(len(edited.connections), 0)
+        self.assertEqual(len(p.modules), 3)  # the base is not changed
+        arg = v2.GetTransactionRequest(request_id='x')
+        packed = sdk.PipelineBuilder().module('m', 'X', arg).build().modules[0].arg
+        self.assertTrue(packed.Is(v2.GetTransactionRequest.DESCRIPTOR))
+
+    def test_apply_retries_busy_and_never_a_conflict(self):
+        busy = refused(grpc.StatusCode.FAILED_PRECONDITION, v2.ErrorDetail.RESOURCE_BUSY)
+        stub = PipelineStub(apply=[busy, busy])
+        slept = []
+        client = sdk.Client(stub=stub, sleep=slept.append)
+        snap = client.pipeline()
+        done = client.apply_pipeline(sdk.PipelineBuilder(snap.pipeline).module('m', 'Sink').build(),
+                                     expected_generation=snap.generation)
+        self.assertEqual(done.generation, 4)
+        self.assertEqual(len(stub.sent), 3)
+        self.assertEqual(slept, [0.01, 0.02])
+        self.assertEqual(stub.sent[0].expected_generation, 3)
+        conflict = refused(grpc.StatusCode.ABORTED, v2.ErrorDetail.CONFLICT, 'generation is 9')
+        stub = PipelineStub(apply=[conflict])
+        with self.assertRaises(sdk.PipelineConflict) as raised:
+            sdk.Client(stub=stub).apply_pipeline(v2.Pipeline(), expected_generation=1)
+        self.assertIsInstance(raised.exception, sdk.Conflict)
+        self.assertEqual(len(stub.sent), 1)
+
+    def test_busy_through_every_attempt_is_busy(self):
+        busy = refused(grpc.StatusCode.FAILED_PRECONDITION, v2.ErrorDetail.RESOURCE_BUSY)
+        stub = PipelineStub(apply=[busy] * 4)
+        with self.assertRaises(sdk.Busy):
+            sdk.Client(stub=stub, sleep=lambda s: None).apply_pipeline(v2.Pipeline())
+        self.assertEqual(len(stub.sent), 4)
+
+    def test_no_answer_is_unknown_and_never_resent(self):
+        stub = PipelineStub(apply=[TIMEOUT])
+        with self.assertRaises(sdk.TransportError):
+            sdk.Client(stub=stub).apply_pipeline(v2.Pipeline())
+        self.assertEqual(len(stub.sent), 1)
+        # A resource failure is an answer (it carries the detail), not a loss.
+        failed = refused(grpc.StatusCode.UNAVAILABLE, v2.ErrorDetail.RESOURCE_FAILURE)
+        stub = PipelineStub(apply=[failed])
+        with self.assertRaises(sdk.InvalidRequest) as raised:
+            sdk.Client(stub=stub).apply_pipeline(v2.Pipeline())
+        self.assertEqual(raised.exception.detail.code, v2.ErrorDetail.RESOURCE_FAILURE)
+
+
 class SdkTest(unittest.TestCase):
 
     def test_watch_events_resumes_after_the_last_event_and_reports_a_restart(self):

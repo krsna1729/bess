@@ -29,6 +29,19 @@ client sees another epoch, an old handle is refused, never sent: look the
 resource up again (client.resource(name)), as the restarted daemon may serve
 another set. A transaction is bound to its first resource's epoch.
 
+Desired state (the pipeline): PipelineBuilder assembles a control_v2.Pipeline
+(or edits a snapshot from client.pipeline()); the daemon validates, diffs,
+plans and applies it -- the SDK repeats none of that:
+
+    snap = client.pipeline()
+    p = sdk.PipelineBuilder(snap.pipeline).module('em', 'ExactMatch', arg).connect('rnd', 'em')
+    client.apply_pipeline(p.build(), expected_generation=snap.generation)
+
+apply_pipeline retries a busy answer (bounded, like a transaction) and never a
+conflict or a refusal. It has no request id: after no answer, the outcome is
+unknown (TransportError) -- read client.pipeline() and compare before applying
+again, or apply with expected_generation so a second application conflicts.
+
 One limit: the daemon remembers outcomes in a bounded window (4096). A request
 that applied, then aged out of it before the retry asked, looks unseen and is
 sent again. Set expected_generation where applying twice would matter: the
@@ -113,6 +126,16 @@ class StaleResource(Error):
     """A resource handle (or a transaction built with it) from an earlier
     daemon epoch than the one the client has seen. Nothing was sent: look the
     resource up again and rebuild the transaction."""
+
+
+class PipelineConflict(Conflict):
+    """apply_pipeline's expected_generation no longer matched: nothing changed."""
+
+    def __init__(self, message, detail=None):
+        Error.__init__(self, message)
+        self.record = None
+        self.after_unknown_attempt = False
+        self.detail = detail
 
 
 class DaemonRestarted(Error):
@@ -285,6 +308,38 @@ class Client:
         self._observe_epoch(response.daemon_epoch)
         return {(m.name, tuple(sorted(m.labels.items()))): m.value for m in response.samples}
 
+    # desired state
+
+    def pipeline(self):
+        """The active pipeline as desired state, and its generation."""
+        response = self._read(self._stub.GetPipeline, v2.GetPipelineRequest())
+        return PipelineSnapshot(response.pipeline, response.generation)
+
+    def validate_pipeline(self, pipeline):
+        """The daemon's canonical form of `pipeline` (InvalidRequest if invalid)."""
+        return self._pipeline_call(self._stub.ValidatePipeline,
+                                   v2.ValidatePipelineRequest(pipeline=pipeline)).normalized
+
+    def diff_pipeline(self, pipeline):
+        """(PipelineDiff, generation): what applying `pipeline` would change."""
+        response = self._pipeline_call(self._stub.DiffPipeline,
+                                       v2.DiffPipelineRequest(pipeline=pipeline))
+        return response.diff, response.generation
+
+    def plan_pipeline(self, pipeline):
+        """([PlanStep], generation): the daemon's plan for `pipeline`."""
+        response = self._pipeline_call(self._stub.PlanPipeline,
+                                       v2.PlanPipelineRequest(pipeline=pipeline))
+        return list(response.steps), response.generation
+
+    def apply_pipeline(self, pipeline, expected_generation=None):
+        """Makes `pipeline` the active one, all or nothing; returns the
+        daemon's ApplyPipelineResponse (generation, applied_ops, timings)."""
+        request = v2.ApplyPipelineRequest(pipeline=pipeline)
+        if expected_generation is not None:
+            request.expected_generation = expected_generation
+        return self._pipeline_call(self._stub.ApplyPipeline, request, retry_busy=True)
+
     # transactions
 
     def transaction(self, expected_generation=None, snapshot=False, request_id=None):
@@ -312,6 +367,30 @@ class Client:
             if _no_answer(e):
                 raise TransportError(None, e.code())
             raise _translate(e)
+
+    def _pipeline_call(self, method, request, retry_busy=False):
+        """A desired-state RPC. Answered refusals carry an ErrorDetail: a
+        generation conflict is PipelineConflict, a busy resource is retried
+        (retry_busy) up to the attempt budget; no answer is TransportError."""
+        backoff = self._retry.busy_backoff
+        for attempt in range(self._retry.attempts):
+            try:
+                return self._call(method, request)
+            except grpc.RpcError as e:
+                detail = _detail(e)
+                if detail is None and _no_answer(e):
+                    raise TransportError(None, e.code())
+                if detail is not None and detail.code == v2.ErrorDetail.CONFLICT:
+                    raise PipelineConflict(detail.message or e.details(), detail)
+                if (detail is not None and detail.code == v2.ErrorDetail.RESOURCE_BUSY and
+                        retry_busy and attempt + 1 < self._retry.attempts):
+                    self._sleep(backoff)
+                    backoff *= 2
+                    continue
+                if detail is not None and detail.code == v2.ErrorDetail.RESOURCE_BUSY:
+                    raise Busy(detail.message or e.details())
+                raise _translate(e)
+        raise Busy('still busy after %d attempts' % self._retry.attempts)
 
     def _observe_epoch(self, epoch):
         changed = self.daemon_epoch is not None and epoch != self.daemon_epoch
@@ -416,13 +495,19 @@ def _finish(record, replayed, epoch, unknown_attempt=False):
     raise Error('unexpected outcome %d' % record.outcome)
 
 
-def _translate(error):
-    """A failed call's gRPC error as an SDK error (ErrorDetail decoded)."""
-    detail = None
+def _detail(error):
+    """The server's ErrorDetail of a failed call, or None."""
     for key, value in (error.trailing_metadata() or ()):
         if key == 'bess-error-bin':
             detail = v2.ErrorDetail()
             detail.ParseFromString(value)
+            return detail
+    return None
+
+
+def _translate(error):
+    """A failed call's gRPC error as an SDK error (ErrorDetail decoded)."""
+    detail = _detail(error)
     message = detail.message if detail is not None and detail.message else error.details()
     if detail is not None and detail.code == v2.ErrorDetail.CONFLICT:
         return InvalidRequest('request id reused with different contents: ' + message, detail,
@@ -505,3 +590,89 @@ def _pack(message):
     packed = any_pb2.Any()
     packed.Pack(message)
     return packed
+
+
+# -- desired state ------------------------------------------------------------------
+
+class PipelineSnapshot:
+    """The active pipeline (control_v2.Pipeline) and its generation."""
+
+    def __init__(self, pipeline, generation):
+        self.pipeline = pipeline
+        self.generation = generation
+
+    def __repr__(self):
+        return 'PipelineSnapshot(generation=%d, modules=%d)' % (
+            self.generation, len(self.pipeline.modules))
+
+
+class PipelineBuilder:
+    """Assembles a control_v2.Pipeline, empty or from a snapshot. It only
+    builds the message: the daemon validates, diffs and plans it. Arguments
+    (`arg`) are the module's or driver's own protobuf messages."""
+
+    def __init__(self, base=None):
+        self._p = v2.Pipeline()
+        if base is not None:
+            self._p.CopyFrom(base)
+
+    def port(self, name, driver, arg=None, rx_queues=0, tx_queues=0, rx_queue_size=0,
+             tx_queue_size=0):
+        port = self._p.ports.add(name=name, driver=driver, num_rx_queues=rx_queues,
+                                 num_tx_queues=tx_queues, rx_queue_size=rx_queue_size,
+                                 tx_queue_size=tx_queue_size)
+        if arg is not None:
+            port.arg.Pack(arg)
+        return self
+
+    def module(self, name, mclass, arg=None):
+        module = self._p.modules.add(name=name, mclass=mclass)
+        if arg is not None:
+            module.arg.Pack(arg)
+        return self
+
+    def connect(self, upstream, downstream, ogate=0, igate=0, skip_default_hooks=False):
+        self._p.connections.add(upstream=upstream, ogate=ogate, downstream=downstream,
+                                igate=igate, skip_default_hooks=skip_default_hooks)
+        return self
+
+    def chain(self, *names):
+        """Gate 0 to gate 0 along `names`."""
+        for upstream, downstream in zip(names, names[1:]):
+            self.connect(upstream, downstream)
+        return self
+
+    def worker(self, wid, core, scheduler=''):
+        self._p.workers.add(wid=wid, core=core, scheduler=scheduler)
+        return self
+
+    def traffic_class(self, name, policy, parent='', resource='', wid=-1, priority=None,
+                      share=None, limit=None, max_burst=None, leaf_module_name='',
+                      leaf_module_taskid=0):
+        tc = self._p.traffic_classes.add(name=name, policy=policy, parent=parent,
+                                         resource=resource, wid=wid,
+                                         leaf_module_name=leaf_module_name,
+                                         leaf_module_taskid=leaf_module_taskid)
+        if priority is not None:
+            tc.priority = priority
+        if share is not None:
+            tc.share = share
+        tc.limit.update(limit or {})
+        tc.max_burst.update(max_burst or {})
+        return self
+
+    def remove(self, name):
+        """Drops the port, module or traffic class `name`, and the
+        connections that touch it."""
+        for field in (self._p.ports, self._p.modules, self._p.traffic_classes):
+            for item in [x for x in field if x.name == name]:
+                field.remove(item)
+        for c in [c for c in self._p.connections if name in (c.upstream, c.downstream)]:
+            self._p.connections.remove(c)
+        return self
+
+    def build(self):
+        """A copy of the pipeline as built so far."""
+        out = v2.Pipeline()
+        out.CopyFrom(self._p)
+        return out
