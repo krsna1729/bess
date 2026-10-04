@@ -59,6 +59,7 @@
     "l2/fdb.h": "experimental",
     "l2/mac_table.h": "experimental",
     "nat/nat.h": "experimental",
+    "tunnel/tunnel.h": "experimental",
     "flow/flow_key.h": "experimental",
     "flow/flow_observer.h": "experimental",
     "flow/flow_storage.h": "experimental",

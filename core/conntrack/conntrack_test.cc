@@ -247,6 +247,11 @@ TEST(PacketParseTest, FirstFragmentsAreParsed) {
   Put16(v6, 14 + 48 + 4, 2000);
   ASSERT_EQ(ParseStatus::kOk, ParseFrame(v6, p));
   EXPECT_TRUE(p.first_fragment);
+  v6[14 + 40 + 3] = 0;  // M clear: an atomic fragment, a whole packet (RFC 6946)
+  EXPECT_EQ(ParseStatus::kMalformed, ParseFrame(v6, p)) << "the UDP length now must fit";
+  Put16(v6, 14 + 48 + 4, 8);
+  ASSERT_EQ(ParseStatus::kOk, ParseFrame(v6, p));
+  EXPECT_FALSE(p.first_fragment);
 }
 
 // -- TCP --------------------------------------------------------------------------

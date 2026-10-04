@@ -4,13 +4,11 @@
 
 #include "vxlan_decap.h"
 
-#include "utils/ether.h"
-#include "utils/ip.h"
-#include "utils/udp.h"
-#include "utils/vxlan.h"
+#include <cstring>
+#include <span>
 
-/* TODO: Currently it decapulates the entire Ethernet/IP/UDP/VXLAN headers.
- *       Modularize. */
+#include "tunnel/tunnel.h"
+#include "utils/endian.h"
 
 enum {
   ATTR_W_TUN_IP_SRC,
@@ -19,7 +17,7 @@ enum {
 };
 
 CommandResponse VXLANDecap::Init(
-    const bess::pb::VXLANDecapArg &arg[[maybe_unused]]) {
+    const bess::pb::VXLANDecapArg &arg [[maybe_unused]]) {
   using AccessMode = bess::metadata::Attribute::AccessMode;
 
   AddMetadataAttr("tun_ip_src", 4, AccessMode::kWrite);
@@ -29,33 +27,37 @@ CommandResponse VXLANDecap::Init(
   return CommandSuccess();
 }
 
+// Strips the outer Ethernet/IPv4/UDP/VXLAN headers after checking them
+// through the tunnel library (M19, D-069): any VLAN tags, IPv4 options and
+// lengths, the VXLAN I flag, an inner Ethernet header. Any UDP port (the
+// classification upstream decided this is VXLAN). A packet that does not
+// check, or has an IPv6 outer header (the metadata holds IPv4 addresses), is
+// dropped; before, it was decapsulated at fixed offsets regardless.
 void VXLANDecap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::be32_t;
-  using bess::utils::Ethernet;
-  using bess::utils::Ipv4;
-  using bess::utils::Udp;
-  using bess::utils::Vxlan;
-
-  int cnt = batch->cnt();
-
+  const int cnt = batch->cnt();
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
-    Ethernet *eth = pkt.head_data<Ethernet *>();
-    Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
-    size_t ip_bytes = ip->header_length << 2;
-    Udp *udp =
-        reinterpret_cast<Udp *>(reinterpret_cast<uint8_t *>(ip) + ip_bytes);
-    Vxlan *vh = reinterpret_cast<Vxlan *>(udp + 1);
-
-    set_attr<be32_t>(this, ATTR_W_TUN_IP_SRC, pkt, ip->src);
-    set_attr<be32_t>(this, ATTR_W_TUN_IP_DST, pkt, ip->dst);
-    set_attr<be32_t>(this, ATTR_W_TUN_ID, pkt, vh->vx_vni >> 8);
-
-    pkt.adj(sizeof(*eth) + ip_bytes + sizeof(*udp) + sizeof(*vh));
+    bess::conntrack::ParsedFlowPacket outer;
+    bess::tunnel::Decapsulated d;
+    const auto status = bess::tunnel::DecapVxlan(
+        std::span<const uint8_t>(pkt.head_data<const uint8_t *>(), pkt.head_len()), outer, d,
+        std::nullopt, pkt.total_len());
+    if (unlikely(status != bess::tunnel::DecapError::kOk ||
+                 outer.l3 != bess::conntrack::L3Kind::kIpv4)) {
+      DropPacket(ctx, pkt);
+      continue;
+    }
+    be32_t src, dst;
+    std::memcpy(&src, outer.src.data(), 4);
+    std::memcpy(&dst, outer.dst.data(), 4);
+    set_attr<be32_t>(this, ATTR_W_TUN_IP_SRC, pkt, src);
+    set_attr<be32_t>(this, ATTR_W_TUN_IP_DST, pkt, dst);
+    set_attr<be32_t>(this, ATTR_W_TUN_ID, pkt, be32_t(d.id));
+    pkt.adj(static_cast<uint16_t>(d.inner_offset));
+    EmitPacket(ctx, pkt, 0);
   }
-
-  RunNextModule(ctx, batch);
 }
 
 ADD_MODULE(VXLANDecap, "vxlan_decap",
-           "decapsulates the outer Ethetnet/IP/UDP/VXLAN headers")
+           "decapsulates the outer Ethernet/IP/UDP/VXLAN headers")

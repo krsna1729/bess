@@ -148,6 +148,20 @@ FORBIDDEN_RULES = [
             ("pb/", "NAT library must not depend on protobuf"),
         ],
     ),
+    # The tunnel library (M19, D-069): no Module, gate, framework, runtime,
+    # control, protobuf or metadata.
+    (
+        re.compile(r"^core/tunnel/"),
+        [
+            ("module.h", "tunnel library must not depend on Module"),
+            ("gate.h", "tunnel library must not depend on gates"),
+            ("metadata.h", "tunnel library must not depend on metadata"),
+            ("framework/", "tunnel library must not depend on framework"),
+            ("runtime/", "tunnel library must not depend on runtime"),
+            ("control/", "tunnel library must not depend on control"),
+            ("pb/", "tunnel library must not depend on protobuf"),
+        ],
+    ),
     # The flow-state library is graph-independent and sits below the worker: no
     # Module, gate, framework, runtime, control or protobuf, and no worker.h or
     # stats/current_worker.h (worker identity is an injected owner token; M9,
@@ -309,6 +323,7 @@ SELF_TEST_CASES = [
     ("core/l2/fdb.h", '#include "gate.h"', 1),
     ("core/conntrack/conntrack.h", '#include "gate.h"', 1),
     ("core/nat/nat.h", '#include "module.h"', 1),
+    ("core/tunnel/tunnel.h", '#include "metadata.h"', 1),
     ("core/flow/owner.h", '#include "stats/current_worker.h"', 1),
     ("core/dataplane/expiry_wheel.h", '#include "flow/flow_types.h"', 1),
     ("core/dataplane/expiry_wheel.h", '#include "worker.h"', 1),

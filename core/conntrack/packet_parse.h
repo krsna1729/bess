@@ -180,14 +180,16 @@ inline ParseStatus ParseIp(const uint8_t *ip, size_t present, size_t limit, size
         if (off + 8 > have) {
           return ParseStatus::kMalformed;
         }
-        const bool initial = (Be16(ip + off + 2) & 0xfff8) == 0;
+        const uint16_t frag = Be16(ip + off + 2);
+        const bool initial = (frag & 0xfff8) == 0;
         next = ip[off];
         off += 8;
         if (!initial) {
           out.protocol = next;
           return ParseStatus::kFragment;
         }
-        out.first_fragment = true;
+        // An atomic fragment (offset 0, M clear) is a whole packet (RFC 6946).
+        out.first_fragment = (frag & 0x0001) != 0;
         continue;
       }
       break;
