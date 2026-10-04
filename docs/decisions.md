@@ -7112,7 +7112,7 @@ worker ever waiting. Design: `.scratch/design/m25_observability.md` section 2.
   posts a registered type, a source id and up to six values, never blocking; a full ring refuses and counts, and the
   next accepted event carries the count, which the log shows as `bess.events_lost`. The maintenance loop moves worker
   events into the log every tick (the hub has its own lock, not the control-plane lock).
-- The log: the last 65,536 events, each with a sequence (gapless per daemon epoch), monotonic time, generation, type,
+- The log: the last 16,384 events, each with a sequence (gapless per daemon epoch), monotonic time, generation, type,
   source and string fields. Control-plane events are appended directly: a `bess.transaction` per transaction the
   daemon decided (outcome, request id, operations, generation; a replay decided nothing new).
 - `control_v2.WatchEvents(from_sequence, types, daemon_epoch)`: server streaming from a sequence (0: the next event).
