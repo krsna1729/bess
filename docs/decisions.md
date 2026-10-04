@@ -3820,6 +3820,27 @@ load with the table cache-resident, no clear difference from f4fdab03 (paired ra
 `slot_table.h` byte-identical at the measured B, e035e892). A cold-cache or large-table load was not measured;
 the "Revisit when" condition (a shipped consumer) still decides when it is.
 
+**Protocol model and code mapping (roadmap Appendix L, 2026-10-04).** Checked at level A1+ in
+`core/dataplane/scope_snapshot_test.cc`: resources wrapped as `Observed` report every publication step to a
+`Probe`; `ForEachSchedule` and `Interleave` run a reader's observations at every placement between those steps (and
+before and after the transaction), and each test asserts the exact set of observations: a reader following a
+reference sees (old, old), (old, new) or (new, new), never (new referrer, old referent); a reader outside the
+reference order may see all four; a new referrer is never visible without its referent; a scope-snapshot reader
+that binds once sees one whole version, and one that rebinds per field sees the documented tear. Failure tests
+(`ScopeSnapshotFailureTest`) and stress tests with concurrent readers complete it; `transaction_engine_test.cc` adds
+the random model (`RandomTransactionsMatchAModel`) and the dangling-reference reader.
+
+| Model action | Code | Invariant checked |
+|---|---|---|
+| Prepare | `TransactionEngine::Apply` structure and prepare phases (`Resource::Prepare`) | a failure leaves nothing visible |
+| Publish (per resource) | the infallible publication window, referents before referrers, referrers erased first | a visible reference names a visible target |
+| Scope switch | `ScopeResource` (one `SlotTable` pointer store per scope) | a reader bound once sees one version |
+| Retire / Reclaim | the engine's retirement queue, `ReclaimRetired`, RCU quiescence | no reclaim while a reader may hold it; ids reused only after |
+| Abort / Reject | outcome `kRejected` / `kConflict` / `kUnsupported` | nothing applied, nothing visible |
+| Retry / Restart | request id and digest, `GetTransaction`, daemon epoch (control plane, M27 model) | one execution per request id |
+
+A change to any row's code changes the tests in the same commit.
+
 ## D-051 DPDK build profiles: bess (software ports) and full (every NIC family)
 
 **Status:** accepted (2026-10-02).

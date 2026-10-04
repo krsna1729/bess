@@ -5628,8 +5628,10 @@ not a reason.
 
 ### L.1.2 Small-scope protocol models in C++ (A1+)
 
-The protocols that have caused or nearly caused review findings will get a compact abstract state machine in C++
-(none exists yet; these three are the next assurance work items). A test enumerates every interleaving of its actions up to a small bound (for example 2 readers, 2 generations,
+The protocols that have caused or nearly caused review findings have a compact model checked exhaustively at a
+small bound (status 2026-10-04: M8 and M11 already had them when this appendix was written -- the M8 schedule
+enumerator in `scope_snapshot_test.cc`, the M11 walk in `handoff_test.cc` -- and M27's was added in Python,
+`pybess/test_sdk_model.py`, since the SDK is the client; each decision record carries its mapping). A test enumerates every interleaving of its actions up to a small bound (for example 2 readers, 2 generations,
 3 resources, 2 requests) and asserts the invariants in every reachable state. The model holds only the semantic
 state (resources, references, generations, readers, owners, epochs), never the production containers, allocators
 or DPDK calls. It is a test, not a proof: it excludes violations only within the explored bound.
