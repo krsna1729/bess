@@ -25,6 +25,7 @@
 #define BESS_CAP_INIT_CONTEXT (UINT64_C(1) << 0)  // Module::init_context()
 #define BESS_CAP_INSTANCES (UINT64_C(1) << 1)     // init_context().instances()
 #define BESS_CAP_RESOURCES (UINT64_C(1) << 2)     // transactional resources
+#define BESS_CAP_METRICS (UINT64_C(1) << 3)       // init_context().metrics()
 
 struct BessPluginDescriptor {
   uint32_t abi_version;  // Must be BESS_PLUGIN_ABI_VERSION

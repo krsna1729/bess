@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "framework/instance_registry.h"
+#include "stats/metric_registry.h"
 
 class Module;
 class Port;
@@ -184,6 +185,11 @@ class RuntimeState {
   // module commands do: a module's own commands write the same tables.
   dataplane::TransactionEngine &transactions();
 
+  // Operational metrics (M25): the runtime's own sources (RCU, transaction
+  // engine) are registered here; modules register theirs through
+  // ModuleInitContext::metrics(). Read by the ListMetrics RPC.
+  stats::MetricRegistry &metrics() { return metrics_; }
+
   const PortRegistry &ports() const { return ports_; }
   const ModuleRegistry &modules() const { return modules_; }
   const TrafficClassRegistry &traffic_classes() const {
@@ -205,6 +211,8 @@ class RuntimeState {
   RuntimeState();
   ~RuntimeState();
 
+  // Before everything that registers a source in it.
+  stats::MetricRegistry metrics_;
   // First: modules (below) release their leases on it as they are destroyed.
   framework::InstanceRegistry instances_;
   PortRegistry ports_;
@@ -215,6 +223,8 @@ class RuntimeState {
   // After rcu_: it retires through it, so it goes first.
   std::unique_ptr<dataplane::TransactionEngine> transactions_;
   uint64_t generation_ = 0;
+  // Last: removed before what it reads.
+  stats::MetricSource builtin_metrics_;
 };
 
 // Accessor for code that needs the runtime it is operating in. Module

@@ -17,6 +17,9 @@ namespace bess {
 namespace rcu {
 class RcuDomain;
 }  // namespace rcu
+namespace stats {
+class MetricRegistry;
+}  // namespace stats
 namespace dataplane {
 class ResourceRegistry;
 }  // namespace dataplane
@@ -54,12 +57,13 @@ class ModuleInitContext {
   ModuleInitContext(dataplane::ResourceRegistry &resources,
                     ResourceBindings &resource_bindings,
                     framework::InstanceRegistry &instances, rcu::RcuDomain &rcu,
-                    const runtime::PortRegistry &ports) noexcept
+                    const runtime::PortRegistry &ports, stats::MetricRegistry &metrics) noexcept
       : resources_(resources),
         resource_bindings_(resource_bindings),
         instances_(instances),
         rcu_(rcu),
-        ports_(ports) {}
+        ports_(ports),
+        metrics_(metrics) {}
 
   ModuleInitContext(const ModuleInitContext &) = delete;
   ModuleInitContext &operator=(const ModuleInitContext &) = delete;
@@ -78,6 +82,12 @@ class ModuleInitContext {
   // Application-owned objects modules share by name (D-045). Resolve once, in
   // Init(), keep the lease, and cache the pointer; never from the packet path.
   framework::InstanceRegistry &instances() const noexcept { return instances_; }
+
+  // Operational metrics (M25, stats/metric_registry.h): register a source that
+  // reads this module's counters when the control plane asks; keep the
+  // returned MetricSource as a member, declared after what it reads. A plugin
+  // that calls this requires BESS_CAP_METRICS.
+  stats::MetricRegistry &metrics() const noexcept { return metrics_; }
 
   // The framework gives every module its context; a module reads it through
   // Module::init_context() and cannot construct or look one up itself.
@@ -98,6 +108,8 @@ class ModuleInitContext {
   framework::InstanceRegistry &instances_;
   rcu::RcuDomain &rcu_;
   PortDirectory ports_;
+  // Last: plugins built before it read the members above at unchanged offsets.
+  stats::MetricRegistry &metrics_;
 };
 
 }  // namespace framework

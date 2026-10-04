@@ -5066,6 +5066,11 @@ rather than one call site).
      had a Reviewer pass and local tests; `develop`'s own CI run on the tip (`25e02a3a`) and a local build and test of
      the tip are the validation (local: 131/132; the one failure was this machine's unconfigured Go shim, and the
      Go live test passes with a working Go). Normal flow (pull request, required checks) resumes.
+163. **M25 phase 1: operational metrics (D-076).** A pull registry (`stats::MetricRegistry`) of sources that read
+     their owner's plain stats when asked; built-in RCU and transaction sources (grace periods, retired and
+     reclaimed objects, the reclamation backlog, online readers, transactions by outcome, generation, pending
+     cascades); `control_v2.ListMetrics`; `tools/bess_prometheus.py`; `init_context().metrics()` behind
+     `BESS_CAP_METRICS`. No packet-path change. Events (`WatchEvents`) are phase 2.
 
 ## Review process established this session
 

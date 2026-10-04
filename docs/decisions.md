@@ -96,6 +96,7 @@ file is the reasoning.
 | D-073 | Table policy: the table is a type the module picks; one MAC table, PackedMacTable (user decisions 1, 3) | accepted |
 | D-074 | Public context accessors return only installed types: ResourceRegistry facade, bindings in-tree, SharedFlowTable installed (consolidation) | accepted |
 | D-075 | Release metadata, SBOM and the compatibility policy (M26) | accepted |
+| D-076 | Operational metrics: a pull registry, ListMetrics, built-in RCU and transaction sources (M25 phase 1) | accepted |
 
 
 ---
@@ -6730,4 +6731,44 @@ signing and provenance (M26 item in the roadmap's release work, blocked on secre
 builds twice and compares (the metadata is deterministic, the binaries are not checked).
 
 **Revisit when:** a consumer needs a container or distro package; release signing keys exist.
+
+
+## D-076 Operational metrics: a pull registry, ListMetrics, built-in RCU and transaction sources (M25 phase 1)
+
+**Status:** accepted (2026-10-04), experimental API.
+**Code:** `core/stats/metric_registry.{h,cc}` (new, installed experimental), `core/stats/metric_registry_test.cc`,
+`core/runtime/runtime_state.{h,cc}` (the registry and the built-in sources), `core/dataplane/transaction_engine.{h,cc}`
+(`outcome_counts()`, `pending_cascades()`), `core/framework/{module_init_context,plugin,plugin_check}.h`
+(`metrics()`, `BESS_CAP_METRICS`), `core/control/api_v2.{h,cc}`, `protobuf/control_v2.proto` (`ListMetrics`),
+`tools/bess_prometheus.py`, `bessctl/module_tests/metrics.py`, `docs/plugin-api.md`.
+
+**Context.** Roadmap M25: the runtime's back-pressure and reclamation state must be observable without a
+packet-path cost and without an exporter inside any dataplane library. Before: per-port and per-module stats over
+their own RPCs; RCU and transaction state visible only in logs.
+
+**Decision.**
+- Pull, not push. `stats::MetricRegistry` holds sources: callbacks that read whatever plain stats struct or
+  worker-local counter their owner keeps and write samples (`MetricWriter::Counter`/`Gauge`, Prometheus-style
+  names, labels). A `MetricSource` handle removes its callback when destroyed, so a source never outlives what it
+  reads. Nothing runs on a packet path; a library knows no exporter.
+- Built-in sources (the runtime): RCU grace periods started and completed, objects retired and reclaimed, the
+  reclamation backlog, online readers; transactions by outcome (applied, rejected, conflict, busy, unsupported:
+  new control-side counters in the engine), the transaction generation and pending removal cascades (BUSY past
+  4096).
+- Wire: `control_v2.ListMetrics` (additive): every sample, sorted, with the daemon epoch (counters restart with
+  the daemon). Exporters live outside: `tools/bess_prometheus.py` renders the text exposition format.
+- Modules: `init_context().metrics()` behind `BESS_CAP_METRICS`; the context's new member is its last, so plugins
+  built before it read the members above at unchanged offsets.
+- Phase 2 (events, `WatchEvents`) and the worker-to-control request path (TP4, D-077) are separate decisions.
+
+**Evidence.** Fast build: unit 131/131 (`stats_metric_registry_test`, 4 tests, also in the TSan list; the layer
+graph gains `bess_execution -> bess_stats` and `bess_control -> bess_stats`, downward edges). Live
+(`bessctl/module_tests/metrics.py`, a real bessd): one applied and one rejected transaction move
+`bess_transactions_total{outcome="applied"}` and `{outcome="rejected"}` by exactly one each and raise the
+generation, under an unchanged daemon epoch; `tools/bess_prometheus.py`'s output parses as the text exposition
+format with every sample after its TYPE line (counter and gauge types as declared). Nothing on a packet path
+changed, so no benchmark applies.
+
+**Revisit when:** a consumer needs histograms (the registry has counters and gauges only), push export, or
+per-worker breakdowns of a built-in source.
 

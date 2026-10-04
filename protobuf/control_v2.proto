@@ -315,6 +315,33 @@ message ListTransactionResourcesResponse {
   uint64 daemon_epoch = 3;
 }
 
+// -- Operational metrics (M25, D-076) ------------------------------------
+//
+// Pulled: each call reads every registered source (the runtime's RCU and
+// transaction engine, and whatever modules registered). Names follow
+// Prometheus conventions (`bess_` prefix, counters end in `_total`), so an
+// exporter can pass them through (tools/bess_prometheus.py).
+
+message ListMetricsRequest {}
+
+message MetricSample {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_COUNTER = 1;  // monotonic while the daemon runs
+    KIND_GAUGE = 2;
+  }
+  string name = 1;
+  Kind kind = 2;
+  string help = 3;
+  map<string, string> labels = 4;
+  double value = 5;
+}
+
+message ListMetricsResponse {
+  repeated MetricSample samples = 1;  // sorted by name, then labels
+  uint64 daemon_epoch = 2;            // counters restart with the daemon
+}
+
 service Control {
   rpc GetPipeline(GetPipelineRequest) returns (GetPipelineResponse) {}
   rpc ValidatePipeline(ValidatePipelineRequest)
@@ -326,6 +353,7 @@ service Control {
   rpc ApplyTransaction(ApplyTransactionRequest)
       returns (ApplyTransactionResponse) {}
   rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse) {}
+  rpc ListMetrics(ListMetricsRequest) returns (ListMetricsResponse) {}
   rpc ListTransactionResources(ListTransactionResourcesRequest)
       returns (ListTransactionResourcesResponse) {}
 }

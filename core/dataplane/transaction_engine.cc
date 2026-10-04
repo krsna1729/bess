@@ -381,6 +381,11 @@ size_t TransactionEngine::ReferenceCount(const std::string &resource,
   return it == res->second->incoming.end() ? 0 : it->second;
 }
 
+size_t TransactionEngine::pending_cascades() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return cascades_.size();
+}
+
 size_t TransactionEngine::ReclaimRetired() {
   std::lock_guard<std::mutex> lock(mutex_);
   return ReclaimRetiredLocked();
@@ -443,7 +448,26 @@ TransactionEngine::Result TransactionEngine::Reject(size_t n_ops,
   return result;
 }
 
-TransactionEngine::Result TransactionEngine::Apply(
+TransactionEngine::Result TransactionEngine::Apply(std::span<const Op> ops,
+                                                  std::optional<uint64_t> expected_generation,
+                                                  Consistency consistency) {
+  Result result = ApplyImpl(ops, expected_generation, consistency);
+  const size_t index = static_cast<size_t>(result.outcome);
+  if (index < outcome_counts_.size()) {
+    outcome_counts_[index].fetch_add(1, std::memory_order_relaxed);
+  }
+  return result;
+}
+
+TransactionEngine::OutcomeCounts TransactionEngine::outcome_counts() const {
+  OutcomeCounts counts{};
+  for (size_t i = 0; i < counts.size(); i++) {
+    counts[i] = outcome_counts_[i].load(std::memory_order_relaxed);
+  }
+  return counts;
+}
+
+TransactionEngine::Result TransactionEngine::ApplyImpl(
     std::span<const Op> ops, std::optional<uint64_t> expected_generation,
     Consistency consistency) {
   std::lock_guard<std::mutex> lock(mutex_);

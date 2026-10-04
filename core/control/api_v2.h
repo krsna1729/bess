@@ -92,6 +92,9 @@ class ControlV2Service final : public pb::v2::Control::Service {
       grpc::ServerContext *context,
       const pb::v2::ListTransactionResourcesRequest *request,
       pb::v2::ListTransactionResourcesResponse *response) override;
+  grpc::Status ListMetrics(grpc::ServerContext *context,
+                           const pb::v2::ListMetricsRequest *request,
+                           pb::v2::ListMetricsResponse *response) override;
 
  private:
   ControlPlane &control_plane_;

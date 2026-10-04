@@ -3,6 +3,7 @@
 #ifndef BESS_DATAPLANE_TRANSACTION_ENGINE_H_
 #define BESS_DATAPLANE_TRANSACTION_ENGINE_H_
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <expected>
@@ -165,6 +166,14 @@ class TransactionEngine {
                std::optional<uint64_t> expected_generation = std::nullopt,
                Consistency consistency = Consistency::kReferential);
 
+  // How many Apply() calls ended in each Outcome, indexed by the enum's value
+  // (operational metrics, M25).
+  static constexpr size_t kOutcomes = 8;
+  using OutcomeCounts = std::array<uint64_t, kOutcomes>;
+  OutcomeCounts outcome_counts() const;
+  // Removal cascades still waiting for a grace period.
+  size_t pending_cascades() const;
+
   // Advances every removal cascade whose grace period has completed, and
   // returns how many cascades are still pending. Control thread only.
   size_t ReclaimRetired();
@@ -184,6 +193,8 @@ class TransactionEngine {
   static constexpr size_t kMaxPendingCascades = 4096;
 
   Result Reject(size_t n_ops, size_t failed, std::string error) const;
+  Result ApplyImpl(std::span<const Op> ops, std::optional<uint64_t> expected_generation,
+                   Consistency consistency);
   size_t ReclaimRetiredLocked();
 
   struct Registration;
@@ -288,6 +299,7 @@ class TransactionEngine {
   // refuses every transaction until the graph changes (a registration bug).
   bool reference_cycle_ = false;
   ResourceRegistry registry_{*this};
+  std::array<std::atomic<uint64_t>, kOutcomes> outcome_counts_{};
 };
 
 // The engine behind a registry: for the control plane and in-tree code that

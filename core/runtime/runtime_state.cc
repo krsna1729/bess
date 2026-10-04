@@ -213,7 +213,35 @@ RuntimeState::RuntimeState()
       // worker registers when its thread starts and unregisters when it is
       // done, so a recreated worker reuses its id.
       rcu_(std::make_unique<rcu::RcuDomain>(Worker::kMaxWorkers)),
-      transactions_(std::make_unique<dataplane::TransactionEngine>(*rcu_)) {}
+      transactions_(std::make_unique<dataplane::TransactionEngine>(*rcu_)) {
+  builtin_metrics_ = metrics_.Register([this](stats::MetricWriter &w) {
+    const rcu::RcuStats r = rcu_->Stats();
+    w.Counter("bess_rcu_grace_periods_started_total", "Grace periods started", r.grace_periods_started);
+    w.Counter("bess_rcu_grace_periods_completed_total", "Grace periods completed",
+              r.grace_periods_completed);
+    w.Counter("bess_rcu_objects_retired_total", "Objects retired to RCU", r.objects_retired);
+    w.Counter("bess_rcu_objects_reclaimed_total", "Retired objects destroyed", r.objects_reclaimed);
+    w.Gauge("bess_rcu_pending_retired_objects",
+            "Retired objects waiting for a grace period (reclamation backlog)",
+            static_cast<double>(r.pending_retired_objects));
+    w.Gauge("bess_rcu_online_readers", "Readers (workers) online", rcu_->online_readers());
+    // In Outcome's order (checked below).
+    static constexpr const char *kOutcomes[] = {"applied", "rejected", "conflict", "busy",
+                                                "unsupported"};
+    static_assert(static_cast<size_t>(dataplane::TransactionEngine::Outcome::kUnsupported) == 4 &&
+                  static_cast<size_t>(dataplane::TransactionEngine::Outcome::kApplied) == 0);
+    const auto counts = transactions_->outcome_counts();
+    for (size_t i = 0; i < std::size(kOutcomes); i++) {
+      w.Counter("bess_transactions_total", "Dataplane transactions by outcome",
+                static_cast<double>(counts[i]), {{"outcome", kOutcomes[i]}});
+    }
+    w.Gauge("bess_transaction_generation", "Dataplane transaction generation",
+            static_cast<double>(transactions_->generation()));
+    w.Gauge("bess_transaction_pending_cascades",
+            "Removal cascades waiting for a grace period (Apply answers BUSY past 4096)",
+            static_cast<double>(transactions_->pending_cascades()));
+  });
+}
 
 RuntimeState::~RuntimeState() = default;
 

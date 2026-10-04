@@ -30,6 +30,7 @@ meter_sources = files(
 
 stats_sources = files(
   'stats/counter_set.cc',
+  'stats/metric_registry.cc',
 )
 
 route_sources = files(
@@ -583,6 +584,7 @@ core_public_subdir_headers = {
   ),
   'stats': files(
     'stats/counter_set.h',
+    'stats/metric_registry.h',
     'stats/worker_histogram.h',
     'stats/worker_local.h',
     'stats/worker_slots.h',
@@ -646,6 +648,7 @@ unit_test_sources = [
   'meter/meter_test.cc',
   'meter/meter_set_test.cc',
   'stats/stats_test.cc',
+  'stats/metric_registry_test.cc',
   'route/route_test.cc',
   'route/router_transaction_test.cc',
   'route/route_domain_test.cc',

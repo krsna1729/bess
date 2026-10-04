@@ -97,6 +97,7 @@
     "route/route_table.h": "experimental",
     "route/router.h": "experimental",
     "stats/counter_set.h": "experimental",
+    "stats/metric_registry.h": "experimental",
     "stats/worker_histogram.h": "experimental",
     "stats/worker_local.h": "experimental",
     "stats/worker_slots.h": "experimental",

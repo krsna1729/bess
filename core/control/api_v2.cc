@@ -484,5 +484,25 @@ grpc::Status ControlV2Service::ListTransactionResources(
   return grpc::Status::OK;
 }
 
+grpc::Status ControlV2Service::ListMetrics(grpc::ServerContext *,
+                                           const v2::ListMetricsRequest *,
+                                           v2::ListMetricsResponse *response) {
+  // The registry has its own lock: sources read their objects' counters,
+  // which workers write, without the control-plane lock.
+  for (const stats::MetricSample &s : runtime::runtime().metrics().Collect()) {
+    v2::MetricSample *out = response->add_samples();
+    out->set_name(s.name);
+    out->set_kind(s.kind == stats::MetricKind::kCounter ? v2::MetricSample::KIND_COUNTER
+                                                         : v2::MetricSample::KIND_GAUGE);
+    out->set_help(s.help);
+    for (const auto &[key, value] : s.labels) {
+      (*out->mutable_labels())[key] = value;
+    }
+    out->set_value(s.value);
+  }
+  response->set_daemon_epoch(transactions_.epoch());
+  return grpc::Status::OK;
+}
+
 }  // namespace control
 }  // namespace bess
