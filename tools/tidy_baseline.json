@@ -6,14 +6,13 @@
     "Counts are those of one clang-tidy major version (clang_tidy_major): CI's pin; another version's",
     "findings differ, so the gate compares only with that version and otherwise reports."
   ],
-  "clang_tidy_major": 22,
+  "clang_tidy_major": 19,
   "files": {
     "core/bessctl.cc": {
       "bugprone-unused-return-value": 3,
       "cppcoreguidelines-narrowing-conversions": 6
     },
     "core/bessd.cc": {
-      "bugprone-unchecked-string-to-number-conversion": 1,
       "cert-err33-c": 2,
       "cppcoreguidelines-narrowing-conversions": 1
     },
@@ -48,9 +47,6 @@
     "core/drivers/pcap.cc": {
       "performance-unnecessary-copy-initialization": 1
     },
-    "core/drivers/pmd.cc": {
-      "bugprone-invalid-enum-default-initialization": 1
-    },
     "core/drivers/unix_socket.cc": {
       "cert-err33-c": 2,
       "performance-unnecessary-copy-initialization": 1
@@ -83,9 +79,6 @@
     },
     "core/metadata.h": {
       "performance-unnecessary-value-param": 1
-    },
-    "core/meter/meter.h": {
-      "bugprone-tagged-union-member-count": 3
     },
     "core/meter/meter_set.cc": {
       "bugprone-unchecked-optional-access": 1
@@ -123,7 +116,6 @@
       "performance-unnecessary-copy-initialization": 1
     },
     "core/modules/flowgen.cc": {
-      "bugprone-float-loop-counter": 1,
       "bugprone-implicit-widening-of-multiplication-result": 1,
       "bugprone-integer-division": 1,
       "cppcoreguidelines-narrowing-conversions": 8
@@ -138,12 +130,8 @@
     "core/modules/hash_lb.cc": {
       "cppcoreguidelines-narrowing-conversions": 2
     },
-    "core/modules/ipswap.cc": {
-      "bugprone-unintended-char-ostream-output": 1
-    },
     "core/modules/l2_forward.cc": {
       "bugprone-implicit-widening-of-multiplication-result": 1,
-      "bugprone-unchecked-string-to-number-conversion": 1,
       "cppcoreguidelines-narrowing-conversions": 1
     },
     "core/modules/l2_table.h": {
@@ -155,9 +143,6 @@
     },
     "core/modules/mttest.cc": {
       "cppcoreguidelines-narrowing-conversions": 1
-    },
-    "core/modules/noop.h": {
-      "bugprone-derived-method-shadowing-base-method": 1
     },
     "core/modules/port_inc.cc": {
       "bugprone-implicit-widening-of-multiplication-result": 1,
@@ -197,8 +182,11 @@
       "cert-str34-c": 1,
       "cppcoreguidelines-narrowing-conversions": 2
     },
+    "core/modules/worker_split.cc": {
+      "performance-for-range-copy": 1
+    },
     "core/packet_checksum.cc": {
-      "clang-analyzer-core.NullDereference": 1
+      "bugprone-unchecked-optional-access": 2
     },
     "core/pktbatch.h": {
       "bugprone-multi-level-implicit-pointer-conversion": 4,
@@ -218,7 +206,6 @@
       "performance-unnecessary-value-param": 1
     },
     "core/runtime/dpdk.cc": {
-      "bugprone-unchecked-string-to-number-conversion": 2,
       "cert-err33-c": 1,
       "cppcoreguidelines-narrowing-conversions": 4,
       "performance-unnecessary-value-param": 1
@@ -237,9 +224,6 @@
       "bugprone-implicit-widening-of-multiplication-result": 2,
       "performance-inefficient-string-concatenation": 1,
       "performance-no-automatic-move": 3
-    },
-    "core/runtime/thread_placement.cc": {
-      "bugprone-unchecked-string-to-number-conversion": 1
     },
     "core/runtime/worker_manager.cc": {
       "bugprone-suspicious-memory-comparison": 1,
@@ -271,7 +255,6 @@
       "performance-move-const-arg": 1
     },
     "core/utils/endian.h": {
-      "bugprone-std-namespace-modification": 1,
       "misc-redundant-expression": 3
     },
     "core/utils/ether.h": {
@@ -302,7 +285,6 @@
       "cert-err33-c": 1
     },
     "core/utils/stacktrace.cc": {
-      "bugprone-command-processor": 1,
       "bugprone-multi-level-implicit-pointer-conversion": 1,
       "cppcoreguidelines-narrowing-conversions": 1,
       "performance-no-int-to-ptr": 2,

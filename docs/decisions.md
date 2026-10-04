@@ -6433,8 +6433,8 @@ decision cache's generations, and no static analysis beyond the layering checks.
   of it and of `rcu_rcu_test`, 0 reports).
 - Fuzz: build clean, the `fuzz` corpus suite 10/10, `checksum_plan` and `tunnel_decap` 120 s each with no crash
   (836k and 3.1M executions).
-- clang-tidy 22: `check_tidy.py --report` produced the committed baseline, 288 findings in 88 files (2
-  clang-analyzer); CI's clang-tidy 19 counts replaced it (below).
+- clang-tidy: the committed baseline is CI's clang-tidy 19 (the first `--strict` run printed it): 276 findings in
+  84 files. Locally, clang-tidy 22 finds 288 in 88 (2 clang-analyzer) and only reports.
 - `check_includes.py`: 0 forbidden edges; `check_arch.py`: 7 allowlisted findings, no growth.
 
 **Review:** independent reviewer, two rounds. Round 1: incorrect (P2: the tidy regex dropped clang-analyzer
@@ -6444,7 +6444,7 @@ deadline under sanitizer slowdown recorded below.
 
 **Not done.** bessd under ASan (the daemon suites); TSan over a running
 daemon (the concurrency logic is covered in isolated components, which the roadmap allows); clang-tidy findings in
-the baseline (288 in 88 files with clang-tidy 22) are reviewed debt, removed as files are touched; a property test over the control
+the baseline (276 in 84 files) are reviewed debt, removed as files are touched; a property test over the control
 transaction decoder beyond its fuzzer; `dataplane_handoff_threads_test` under CPU oversubscription (above) and its
 fixed 25 s deadline under sanitizer slowdown (scale it before the sanitizer lanes gate).
 
