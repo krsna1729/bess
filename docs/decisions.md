@@ -107,6 +107,7 @@ file is the reasoning.
 | D-084 | Operational events: worker rings, a bounded log, WatchEvents with gaps and restarts, SDK streams (M25 phase 2) | accepted |
 | D-085 | Packet parse: the common frame validated on one path ("validate once, execute fast"; tunnel clawback) | accepted |
 | D-086 | Reference appliances as installed-tree plugins with a direct-path self test; R1-R5 (M24) | accepted |
+| D-087 | Release artifacts: a tarball, bess and bess-dev .deb packages with derived dependencies, and a runtime image (M26) | accepted |
 
 
 ---
@@ -6753,7 +6754,8 @@ compilers, dependencies, dirty, dpdk, name, options, plugin_api_version, version
 sha256) and `share/doc/bess/bess.spdx.json` (SPDX-2.3, 13 packages, DPDK's with a checksum). Two runs of
 `tools/build_info.py` over the same build give byte-identical files. CI's verify-install checks both on every lane.
 
-**Not done.** Container image and distro packages (no consumer yet: env/Dockerfile builds the CI image only);
+**Not done.** Container image and distro packages (no consumer yet: env/Dockerfile builds the CI image only; done
+since, D-087);
 signing and provenance (M26 item in the roadmap's release work, blocked on secrets); a reproducibility check that
 builds twice and compares (the metadata is deterministic, the binaries are not checked).
 
@@ -7229,4 +7231,34 @@ cache nothing; the third caches the decision and installs one rule on the fake d
 the way: a NAT whose expiry wheel starts at clock 0 while packets carry the TSC clock refuses every mapping (the
 deadline is beyond the wheel's horizon): the module starts the wheels at the packet clock's now, as the in-tree NAT
 module does.
+
+
+## D-087 Release artifacts: a tarball, bess and bess-dev .deb packages with derived dependencies, and a runtime image (M26)
+
+**Status:** accepted (2026-10-05). Signing stays blocked on keys (D-075).
+**Code:** `tools/package_release.py` (new: `tarball`, `deb`), `env/runtime.Dockerfile` (new), `.github/workflows/ci.yml`
+(the release job packages all three and smoke-runs the image).
+
+**Context.** Roadmap M26 lists a source release, an OCI image, distro packages, a standalone daemon package and a
+development package. The release job shipped a tarball assembled inline in the workflow; D-075 left the image and
+packages for "when a consumer needs them". The M24 appliances are such consumers: they build from `bess-dev` and load
+into an installed bessd.
+
+**Decision.**
+- `package_release.py tarball`: what the job shipped (bessd, bessctl, dpdk-devbind.py, the Python client, docs), now a
+  script, with its sha256.
+- `package_release.py deb` (on Debian/Ubuntu, from `meson install` of the release build): `bess` (bessd, the Python
+  client and schema, `build-info.json` and the SPDX SBOM) and `bess-dev` (headers and `bess-dev.pc`, depending on the
+  same `bess` version). `bess`'s Depends are derived, not listed: the package owning every shared library `ldd` shows
+  for bessd (`dpkg -S`), and a library no package owns stops the build. Versions: a tag's (v1.2.3 -> 1.2.3) or
+  `0.0~git<commit>`.
+- `env/runtime.Dockerfile`: ubuntu:24.04 plus the `bess` package (apt resolves its Depends) and the Python client's
+  PyPI requirements; entrypoint `bessd -f`. The release job builds it from the .deb it just made, runs
+  `bessd --version` in it, and ships the image as a `docker save` archive; tags publish all artifacts to the GitHub
+  release. Pushing to a registry waits for a consumer and its credentials.
+
+**Evidence.** Local: `tarball` from a fast build lists bin/, bessctl/, pybess/, README, COPYING with its sha256; in an
+ubuntu:24.04 container the `deb` builder makes both packages from a staged install (Package, Version, Installed-Size,
+Depends as given), they install with dpkg (`bess-dev` requiring the same `bess`), and bessd and bess-dev.pc land in
+/usr/local. The `dpkg -S` dependency derivation and the image build run in CI's release job (develop pushes).
 

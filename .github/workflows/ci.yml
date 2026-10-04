@@ -263,35 +263,30 @@ jobs:
       - name: Verify zero dynamic DPDK dependencies
         run: python3 tools/ci_profile.py release-verify $LANE
 
-      - name: Package Release Tarball
+      - name: Package release artifacts (tarball, .deb, runtime image)
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          [ -z "$VERSION" ] && VERSION=$(git rev-parse --short HEAD)
-          TARNAME="bess-${VERSION}-linux-$(uname -m)"
-          mkdir -p "$TARNAME/bin"
-          cp build/standalone/core/bessd "$TARNAME/bin/"
-          cp bin/bessctl "$TARNAME/bin/"
-          cp bin/dpdk-devbind.py "$TARNAME/bin/"
-          cp -r bessctl "$TARNAME/"
-          cp -r pybess "$TARNAME/"
-          cp README.md LICENSE COPYING "$TARNAME/" 2>/dev/null || true
-          tar -czvf "${TARNAME}.tar.gz" "$TARNAME"
-          sha256sum "${TARNAME}.tar.gz" > "${TARNAME}.tar.gz.sha256"
-          echo "RELEASE_TARNAME=${TARNAME}" >> "$GITHUB_ENV"
+          [ "$GITHUB_REF_TYPE" = tag ] || VERSION=$(git rev-parse --short HEAD)
+          mkdir -p dist
+          python3 tools/package_release.py tarball --build build/standalone --version "$VERSION" --out dist
+          python3 tools/package_release.py deb --build build/standalone --version "$VERSION" --out dist
+          DEB=$(cd dist && ls bess_*.deb)
+          docker build -f env/runtime.Dockerfile --build-arg DEB="$DEB" -t bess:"$VERSION" dist
+          # The image's bessd starts and reports its version.
+          docker run --rm --entrypoint /usr/local/bin/bessd bess:"$VERSION" --version
+          docker save bess:"$VERSION" | gzip > dist/bess-image-"$VERSION"-$(uname -m).tar.gz
+          (cd dist && sha256sum *.deb bess-image-*.tar.gz >> SHA256SUMS)
+          echo "RELEASE_VERSION=${VERSION}" >> "$GITHUB_ENV"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.RELEASE_TARNAME }}
-          path: |
-            ${{ env.RELEASE_TARNAME }}.tar.gz
-            ${{ env.RELEASE_TARNAME }}.tar.gz.sha256
+          name: bess-${{ env.RELEASE_VERSION }}-linux-${{ runner.arch }}
+          path: dist/
 
       - name: Publish to GitHub Releases
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ env.RELEASE_TARNAME }}.tar.gz
-            ${{ env.RELEASE_TARNAME }}.tar.gz.sha256
+          files: dist/*
           generate_release_notes: true
