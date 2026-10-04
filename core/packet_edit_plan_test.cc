@@ -167,6 +167,14 @@ TEST(EditPlanBuilderTest, RejectsWhatItCannotRepresent) {
   std::vector<uint8_t> lots(EditPlan::kMaxData + 1, 1);
   EXPECT_EQ(EditBuildError::kTooMuchData, EditPlanBuilder().Write(0, lots).Build().error());
 
+  // Removals add up; a total beyond 16 bits is refused rather than wrapped
+  // (found by packet_mutation_fuzz: 0xFFFF + 1 removed nothing).
+  EXPECT_EQ(EditBuildError::kOutOfRange,
+            EditPlanBuilder().RemovePrefix(0xFFFF).RemovePrefix(1).Build().error());
+  const auto most = EditPlanBuilder().RemovePrefix(0x8000).RemovePrefix(0x7FFF).Build();
+  ASSERT_TRUE(most.has_value());
+  EXPECT_EQ(0xFFFF, most->remove_bytes());
+
   // An IPv4 checksum over a header the plan does not fix is refused: its sum
   // could not be precomputed.
   EXPECT_EQ(EditBuildError::kOutOfRange,
@@ -182,6 +190,32 @@ TEST(EditPlanBuilderTest, RejectsWhatItCannotRepresent) {
                                              .Ipv4HeaderChecksum(14)
                                              .Build()
                                              .error());
+
+  // Nor over a header word a length or checksum step changes per packet
+  // (found by packet_mutation_fuzz: the sum used the written literal and the
+  // checksum came out wrong). The header's own length and checksum fields
+  // stay allowed.
+  EXPECT_EQ(EditBuildError::kOutOfRange, EditPlanBuilder()
+                                             .Prepend(h)
+                                             .SetLength(18, 14)
+                                             .Ipv4HeaderChecksum(14)
+                                             .Build()
+                                             .error());
+  const uint8_t old_addr[4] = {10, 0, 0, 1};
+  const uint8_t new_addr[4] = {10, 0, 0, 2};
+  EXPECT_EQ(EditBuildError::kOutOfRange, EditPlanBuilder()
+                                             .Prepend(h)
+                                             .AdjustChecksum(26, old_addr, new_addr)
+                                             .Ipv4HeaderChecksum(14)
+                                             .Build()
+                                             .error());
+  EXPECT_TRUE(EditPlanBuilder()
+                  .Prepend(h)
+                  .SetLength(16, 14)
+                  .AdjustChecksum(24, old_addr, new_addr)
+                  .Ipv4HeaderChecksum(14)
+                  .Build()
+                  .has_value());
 }
 
 }  // namespace

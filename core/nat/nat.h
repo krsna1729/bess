@@ -106,8 +106,11 @@ inline void Store32(uint8_t *p, uint32_t v) noexcept { std::memcpy(p, &v, 4); }
 // packet from `before` to `after`, updating the IPv4 header checksum and the
 // L4 one incrementally (RFC 1624): TCP always, UDP unless its checksum is 0
 // (absent; a result of 0 is written as 0xffff, RFC 768), ICMP (no pseudo
-// header: only the identifier). `ip` and `l4` are the packet's writable bytes
-// at the offsets the parser checked; `before` is what the packet carries.
+// header: only the identifier; a result of 0 is written as 0xffff too, as an
+// all-zero message -- echo reply, identifier 0, sequence 0, no payload --
+// verifies only with 0xffff, and 0xffff verifies wherever 0 does). `ip` and
+// `l4` are the packet's writable bytes at the offsets the parser checked;
+// `before` is what the packet carries.
 inline void Rewrite(uint8_t *ip, uint8_t *l4, Direction dir, const Endpoint &before,
                     const Endpoint &after) noexcept {
   using namespace rewrite_internal;
@@ -129,8 +132,9 @@ inline void Rewrite(uint8_t *ip, uint8_t *l4, Direction dir, const Endpoint &bef
     }
   } else {
     Store16(l4 + 4, after.port.raw_value());
-    Store16(l4 + 2, utils::UpdateChecksum16(Load16(l4 + 2), before.port.raw_value(),
-                                            after.port.raw_value()));
+    const uint16_t updated = utils::UpdateChecksum16(Load16(l4 + 2), before.port.raw_value(),
+                                                     after.port.raw_value());
+    Store16(l4 + 2, updated != 0 ? updated : 0xffff);
   }
 }
 

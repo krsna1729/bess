@@ -1,6 +1,7 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
+#include <cctype>
 #include <charconv>
 #include "ip.h"
 
@@ -13,15 +14,32 @@ namespace bess {
 namespace utils {
 
 bool ParseIpv4Address(const std::string &str, be32_t *addr) {
-  unsigned int a, b, c, d;
-  int cnt;
-
-  cnt = bess::utils::Parse(str, "%u.%u.%u.%u", &a, &b, &c, &d);
-  if (cnt != 4 || a >= 256 || b >= 256 || c >= 256 || d >= 256) {
-    return false;
+  // Four decimal parts, each optionally preceded by whitespace; anything after
+  // the fourth part is ignored (the leniency of the sscanf("%u.%u.%u.%u") this
+  // replaces). sscanf's %u wrapped out-of-range parts ("4294967297" read as 1),
+  // so "4294967296.0.0.1" used to parse as 0.0.0.1.
+  const char *p = str.data();
+  const char *const end = p + str.size();
+  uint32_t value = 0;
+  for (int i = 0; i < 4; i++) {
+    if (i > 0) {
+      if (p == end || *p != '.') {
+        return false;
+      }
+      p++;
+    }
+    while (p != end && std::isspace(static_cast<unsigned char>(*p))) {
+      p++;
+    }
+    unsigned part = 0;
+    const auto [next, ec] = std::from_chars(p, end, part);
+    if (ec != std::errc() || part > 255) {
+      return false;
+    }
+    value = (value << 8) | part;
+    p = next;
   }
-
-  *addr = be32_t((a << 24) | (b << 16) | (c << 8) | d);
+  *addr = be32_t(value);
   return true;
 }
 
@@ -40,8 +58,8 @@ std::optional<Ipv4Prefix> Ipv4Prefix::Parse(const std::string &prefix) {
   if (slash == std::string::npos || slash + 1 >= prefix.size()) {
     return std::nullopt;
   }
-  // Strictly "d.d.d.d": ParseIpv4Address (sscanf) would also accept
-  // surrounding whitespace and trailing junk.
+  // Strictly "d.d.d.d": ParseIpv4Address would also accept whitespace before
+  // each part and trailing junk.
   const std::string address = prefix.substr(0, slash);
   int dots = 0;
   char prev = '.';

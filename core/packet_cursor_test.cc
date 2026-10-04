@@ -178,6 +178,29 @@ TEST(PacketCursorTest, ReadsAcrossThreeSegmentsAndSkipsBoundaries) {
   PacketFree(packet);
 }
 
+TEST(PacketCursorTest, PeeksPastLeadingEmptySegments) {
+  // A head emptied by RemovePrefixInPlace leaves a zero-length first segment.
+  // A fresh cursor is at the same offset as one that skipped zero bytes, so
+  // both must borrow the first non-empty segment.
+  const std::vector<std::byte> bytes = Pattern(8);
+  const std::array<size_t, 3> lengths = {0, 0, 8};
+  PlainPacketPool pool(8, -1, 64);
+  PacketHandle packet = BuildChain(pool, lengths, bytes);
+  ASSERT_NE(packet, nullptr);
+
+  const PacketCursor cursor{PacketRef(packet)};
+  const auto peek = cursor.PeekContiguous(bytes.size());
+  ASSERT_EQ(peek.size(), bytes.size());
+  EXPECT_EQ(peek.data(),
+            PacketRef(packet->next->next).head_data<const std::byte *>());
+
+  PacketCursor skipped = cursor;
+  ASSERT_TRUE(skipped.Skip(0));
+  EXPECT_EQ(skipped.PeekContiguous(bytes.size()).data(), peek.data());
+
+  PacketFree(packet);
+}
+
 TEST(PacketCursorTest, FailedReadsAndSkipsAreTransactional) {
   const std::vector<std::byte> bytes = Pattern(6);
   const std::array<size_t, 2> lengths = {3, 3};

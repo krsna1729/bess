@@ -27,6 +27,27 @@ TEST(IPTest, AddressInStr) {
   EXPECT_FALSE(ParseIpv4Address("1.1.256.1", &b));
 }
 
+// Parts too large for an unsigned int used to wrap inside sscanf's %u and
+// pass the 0-255 check (found by core/fuzz/route_prefix_fuzz).
+TEST(IPTest, OutOfRangePartsAreRejectedNotWrapped) {
+  const be32_t sentinel(0xdeadbeef);
+  for (const char *bad :
+       {"4294967296.0.0.1", "1.2.3.4294967297", "1.18446744073709551616.0.0",
+        "1.2.3.0000000000000000000000002017612633061982232"}) {
+    be32_t out = sentinel;
+    EXPECT_FALSE(ParseIpv4Address(bad, &out)) << bad;
+    EXPECT_EQ(sentinel, out) << bad;
+    EXPECT_FALSE(Ipv4Prefix::Parse(std::string(bad) + "/8").has_value()) << bad;
+  }
+  // The accepted forms are unchanged: leading zeros, whitespace before a part
+  // and anything after the fourth part.
+  be32_t out;
+  ASSERT_TRUE(ParseIpv4Address("010.0.0.001", &out));
+  EXPECT_EQ(be32_t(0x0a000001), out);
+  ASSERT_TRUE(ParseIpv4Address(" 1. 2.3.4 junk", &out));
+  EXPECT_EQ(be32_t(0x01020304), out);
+}
+
 // Check if Ipv4Prefix can be correctly constructed from strings
 TEST(IPTest, PrefixInStr) {
   Ipv4Prefix prefix_1("192.168.0.1/24");

@@ -144,6 +144,40 @@ TEST(NatTest, ForwardAndReverseRewriteKeepChecksumsValid) {
   EXPECT_EQ(0, bare[40] | bare[41]);
 }
 
+// An echo reply that is all zeros once translated (identifier 0, sequence 0,
+// no payload) sums to +0, which only the checksum 0xffff verifies: the
+// incremental update's 0x0000 is written as 0xffff (found by core/fuzz/nat_fuzz).
+TEST(NatTest, IcmpRewriteToAnAllZeroMessageKeepsTheChecksumValid) {
+  auto zero_reply = [](uint32_t src, uint32_t dst, uint16_t id) {
+    auto f = Frame(1, src, id, dst, /*type=*/0);
+    f.resize(34 + 8);  // no payload
+    Put16(f, 16, 28);
+    auto *ip = reinterpret_cast<utils::Ipv4 *>(f.data() + 14);
+    ip->checksum = 0;
+    ip->checksum = utils::CalculateIpv4NoOptChecksum(*ip);
+    f[36] = f[37] = 0;
+    const uint16_t sum = utils::CalculateGenericChecksum(f.data() + 34, 8);
+    std::memcpy(f.data() + 36, &sum, 2);
+    return f;
+  };
+  // Outbound: the only identifier is 0.
+  Harness out({Pub(kPublic, {{0, 1, false}})});
+  auto f = zero_reply(kInside, kRemote, 12);
+  ASSERT_TRUE(ChecksumsValid(f));
+  ASSERT_EQ(Verdict::kTranslated, out.Send(f, Direction::kForward, 0));
+  EXPECT_EQ(0, f[38] | f[39]);
+  EXPECT_TRUE(ChecksumsValid(f));
+  EXPECT_EQ(0xffff, f[36] << 8 | f[37]);
+  // Inbound: back to the internal identifier 0.
+  Harness in({Pub(kPublic, {{5, 6, false}})});
+  auto request = Frame(1, kInside, 0, kRemote, 8);
+  ASSERT_EQ(Verdict::kTranslated, in.Send(request, Direction::kForward, 0));
+  auto g = zero_reply(kRemote, kPublic, 5);
+  ASSERT_EQ(Verdict::kTranslated, in.Send(g, Direction::kReverse, 1));
+  EXPECT_EQ(0, g[38] | g[39]);
+  EXPECT_TRUE(ChecksumsValid(g));
+}
+
 TEST(NatTest, EndpointIndependentMappingAndDirectionGuard) {
   Harness h({Pub()});
   auto a = Frame(17, kInside, 5000, kRemote, 53);

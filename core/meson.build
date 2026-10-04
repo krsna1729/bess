@@ -908,3 +908,77 @@ if get_option('build_benchmarks')
     depends: benchmark_targets,
   )
 endif
+
+# Fuzz harnesses (core/fuzz, docs/fuzzing.md). With Clang each links the
+# libFuzzer engine; with GCC, which has no libFuzzer, it links a main that
+# replays files. Either way the committed seed corpus is replayed as a test in
+# the 'fuzz' suite. Sanitizers come from b_sanitize. Harnesses use only
+# EAL-free code and link the libraries normally (link_with), so only the
+# objects they reference are pulled in.
+if get_option('build_fuzzers')
+  fuzz_with_libfuzzer = cpp.get_id() == 'clang'
+  if fuzz_with_libfuzzer and not get_option('cpp_args').contains('-fsanitize=fuzzer-no-link')
+    warning('build_fuzzers: library code has no coverage instrumentation; ' +
+            'configure with -Dcpp_args=-fsanitize=fuzzer-no-link (docs/fuzzing.md)')
+  endif
+  # protobuf's headers switch generated messages to a different global layout
+  # under ASan; the system libprotobuf is not built that way, so descriptors
+  # come back null (resource_codec, control_transaction crash on any input).
+  if get_option('b_sanitize').contains('address') and not get_option('cpp_args').contains('-DPROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT')
+    warning('build_fuzzers: ASan without -DPROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT ' +
+            'in cpp_args breaks protobuf descriptors (docs/fuzzing.md)')
+  endif
+  # name: extra libraries beyond component_runtime_whole.
+  fuzz_targets = {
+    'packet_cursor': [],
+    'packet_mutation': [],
+    'checksum_plan': [],
+    'classifier_schema': [],
+    'resource_codec': [],
+    'route_prefix': [],
+    'conntrack': [],
+    'nat': [],
+    'tunnel_decap': [],
+    'control_transaction': [bess_control],
+  }
+  fuzz_executables = []
+  foreach fuzz_name, fuzz_libs : fuzz_targets
+    fuzz_sources = ['fuzz/' + fuzz_name + '_fuzz.cc']
+    fuzz_cpp_args = []
+    fuzz_link_args = []
+    fuzz_test_args = []
+    if fuzz_with_libfuzzer
+      fuzz_cpp_args = ['-fsanitize=fuzzer']
+      fuzz_link_args = ['-fsanitize=fuzzer']
+      # libFuzzer's default error exit code, 77, means "skipped" to Meson.
+      fuzz_test_args = ['-runs=0', '-error_exitcode=1']
+      fuzz_sources += ['fuzz/libfuzzer_options.cc']
+    else
+      fuzz_sources += ['fuzz/replay_main.cc']
+    endif
+    fuzz_exe = executable(
+      fuzz_name + '_fuzz',
+      fuzz_sources,
+      include_directories: core_include,
+      cpp_args: fuzz_cpp_args,
+      link_args: fuzz_link_args,
+      link_with: fuzz_libs + component_runtime_whole,
+      dependencies: runtime_deps,
+      build_rpath: runtime_rpath,
+    )
+    fuzz_executables += fuzz_exe
+    test(
+      fuzz_name + '_fuzz_corpus',
+      fuzz_exe,
+      args: fuzz_test_args + [meson.current_source_dir() / 'fuzz' / 'corpus' / fuzz_name],
+      suite: 'fuzz',
+      timeout: 300,
+      env: {'LD_LIBRARY_PATH': dpdk_libdir},
+    )
+  endforeach
+  run_target(
+    'fuzzers',
+    command: [find_program('true')],
+    depends: fuzz_executables,
+  )
+endif

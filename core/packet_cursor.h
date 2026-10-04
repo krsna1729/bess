@@ -18,7 +18,8 @@
 namespace bess::packet {
 
 // Read-only cursor over the logical bytes of a native packet. The cursor never
-// makes a packet linear: contiguous reads borrow the current segment, while
+// makes a packet linear: contiguous reads borrow the current segment (the one
+// holding the byte at offset(); empty segments are never current), while
 // ReadBytes()/Read<T>() copy across segment boundaries.
 //
 // A failed Skip() or ReadBytes() leaves the cursor unchanged. PacketRef is a
@@ -30,7 +31,9 @@ class PacketCursor {
       : segment_(packet),
         segment_offset_(0),
         packet_offset_(0),
-        remaining_(packet.handle() == nullptr ? 0 : packet.total_len()) {}
+        remaining_(packet.handle() == nullptr ? 0 : packet.total_len()) {
+    Normalize();
+  }
 
   [[nodiscard]] size_t offset() const noexcept { return packet_offset_; }
   [[nodiscard]] size_t remaining() const noexcept { return remaining_; }

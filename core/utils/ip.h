@@ -14,7 +14,9 @@
 namespace bess {
 namespace utils {
 
-// return false if string -> be32_t conversion failed (*addr is unmodified)
+// "a.b.c.d" with decimal parts 0-255, each optionally preceded by whitespace;
+// input after the fourth part is ignored. Returns false if the conversion
+// failed (*addr is unmodified).
 bool ParseIpv4Address(const std::string &str, be32_t *addr);
 
 // be32 -> string

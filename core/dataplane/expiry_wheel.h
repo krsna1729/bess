@@ -508,7 +508,13 @@ class ExpiryWheel {
   }
 
   static constexpr uint64_t SlotsMask() noexcept {
-    return kSlots == 64 ? ~uint64_t{0} : (uint64_t{1} << kSlots) - 1;
+    // if constexpr, not ?:, so a 64-slot wheel never instantiates the shift
+    // by 64 (Clang 22 rejects it under -Werror even in the dead branch).
+    if constexpr (kSlots == 64) {
+      return ~uint64_t{0};
+    } else {
+      return (uint64_t{1} << kSlots) - 1;
+    }
   }
 
   // Moves the wheel to `t` (a boundary at which something is due) and queues
