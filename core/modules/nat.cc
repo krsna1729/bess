@@ -96,11 +96,20 @@ CommandResponse NAT::Init(const bess::pb::NATArg &arg) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   } else {
     config.max_capacity = std::min<size_t>(arg.max_capacity(), servable);
-    auto made = nat::Nat::Create(config);
-    if (!made) {
-      return CommandFailure(ENOMEM, "cannot create the NAT binding table");
+    if (config.max_capacity > config.capacity) {
+      auto made = nat::GrowableNat::Create(config);
+      if (!made) {
+        return CommandFailure(ENOMEM, "cannot create the NAT binding table");
+      }
+      growable_ = std::move(*made);
+    } else {
+      config.max_capacity = 0;
+      auto made = nat::Nat::Create(config);
+      if (!made) {
+        return CommandFailure(ENOMEM, "cannot create the NAT binding table");
+      }
+      nat_ = std::move(*made);
     }
-    nat_ = std::move(*made);
   }
   grow_ = bess::framework::RequestEndpoint<GrowRequest>(
       init_context().requests(), [this](const GrowRequest &r) { OnGrowRequest(r); });
@@ -129,7 +138,7 @@ void NAT::OnGrowRequest(const GrowRequest &request) {
   }
   // A table retired by an earlier growth whose free request is still queued.
   delete retired_.exchange(nullptr, std::memory_order_acquire);
-  auto bigger = nat::Nat::NewTable(request.capacity);
+  auto bigger = nat::GrowableNat::NewTable(request.capacity);
   if (bigger == nullptr) {
     // No memory: the table stays as it is (creates refuse with kFull, counted
     // as drops); the next request asks again.
@@ -143,7 +152,9 @@ void NAT::OnGrowRequest(const GrowRequest &request) {
 
 CommandResponse NAT::GetInitialArg(const bess::pb::EmptyArg &) {
   bess::pb::NATArg resp;
-  for (const auto &a : nat_ ? nat_->addresses() : shared_->addresses()) {
+  for (const auto &a : nat_       ? nat_->addresses()
+                       : growable_ ? growable_->addresses()
+                                   : shared_->addresses()) {
     auto ext = resp.add_ext_addrs();
     ext->set_ext_addr(ToIpv4Address(a.addr));
     for (const auto &r : a.ranges) {
@@ -165,6 +176,11 @@ CommandResponse NAT::SetRuntimeConfig(const bess::pb::EmptyArg &) {
 }
 
 void NAT::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+  if (nat_ != nullptr) [[likely]] {  // the default: owned, fixed
+    nat_->Expire(ctx->current_ns, kExpireBudget);
+    Translate(*nat_, ctx, batch);
+    return;
+  }
   if (shared_ != nullptr) {
     if (shared_->NeedsGrowth()) [[unlikely]] {
       (void)grow_.Post({shared_->GrowthTarget()});
@@ -173,22 +189,26 @@ void NAT::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     Translate(*shared_, ctx, batch);
     return;
   }
-  // Growth: take a handed-over table, migrate a few bindings a batch, hand the
-  // old table back to be freed, ask for a larger one when 3/4 full.
-  if (nat::Nat::Table *bigger = handover_.exchange(nullptr, std::memory_order_acquire)) [[unlikely]] {
-    nat_->Adopt(std::unique_ptr<nat::Nat::Table>(bigger));
+  // Growable: take a handed-over table, migrate a few bindings a batch, hand
+  // the old table back to be freed, ask for a larger one when 3/4 full.
+  nat::GrowableNat &g = *growable_;
+  // A relaxed load first: the exchange (a locked instruction) only when a
+  // table has been handed over, once per growth.
+  if (handover_.load(std::memory_order_relaxed) != nullptr) [[unlikely]] {
+    g.Adopt(std::unique_ptr<nat::GrowableNat::Table>(
+        handover_.exchange(nullptr, std::memory_order_acquire)));
   }
-  if (nat_->migrating()) [[unlikely]] {
-    if (auto old = nat_->MigrateSome(kMigrateSlots)) {
+  if (g.migrating()) [[unlikely]] {
+    if (auto old = g.MigrateSome(kMigrateSlots)) {
       retired_.store(old.release(), std::memory_order_release);
       (void)free_.Post({0});
       grow_.Done();
     }
-  } else if (nat_->NeedsGrowth()) [[unlikely]] {
-    (void)grow_.Post({nat_->GrowthTarget()});
+  } else if (g.NeedsGrowth()) [[unlikely]] {
+    (void)grow_.Post({g.GrowthTarget()});
   }
-  nat_->Expire(ctx->current_ns, kExpireBudget);
-  Translate(*nat_, ctx, batch);
+  g.Expire(ctx->current_ns, kExpireBudget);
+  Translate(g, ctx, batch);
 }
 
 template <typename N>
@@ -223,7 +243,8 @@ void NAT::Translate(N &nat, Context *ctx, bess::PacketBatch *batch) {
 }
 
 std::string NAT::GetDesc() const {
-  return bess::utils::Format("%zu entries", nat_ ? nat_->size() : shared_ ? shared_->size() : 0);
+  const size_t n = nat_ ? nat_->size() : growable_ ? growable_->size() : shared_ ? shared_->size() : 0;
+  return bess::utils::Format("%zu entries", n);
 }
 
 ADD_MODULE(NAT, "nat", "Dynamic Network address/port translator")

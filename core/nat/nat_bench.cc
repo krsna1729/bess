@@ -339,6 +339,7 @@ void TranslateImpl(benchmark::State &st) {
 }
 
 void BM_Translate(benchmark::State &st) { TranslateImpl<Nat>(st); }
+void BM_TranslateGrowable(benchmark::State &st) { TranslateImpl<GrowableNat>(st); }
 void BM_TranslateShared(benchmark::State &st) { TranslateImpl<SharedNat>(st); }
 
 void BM_Bind(benchmark::State &st) {
@@ -373,6 +374,7 @@ void BM_Bind(benchmark::State &st) {
 BENCHMARK(BM_Lookup)->ArgsProduct({{0, 1}, {4096, 65536, 1048576}})->MinTime(0.2);
 BENCHMARK(BM_Allocate)->ArgsProduct({{0, 1}, {10, 50, 90, 99}})->MinTime(0.2);
 BENCHMARK(BM_Translate)->ArgsProduct({{0, 1, 2, 3}, {0, 1}, {4096, 65536, 1048576}})->MinTime(0.2);
+BENCHMARK(BM_TranslateGrowable)->ArgsProduct({{3}, {0, 1}, {4096, 65536, 1048576}})->MinTime(0.2);
 BENCHMARK(BM_TranslateShared)->ArgsProduct({{3}, {0, 1}, {4096, 65536, 1048576}})->MinTime(0.2);
 BENCHMARK(BM_Bind)->MinTime(0.2);
 

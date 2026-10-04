@@ -52,11 +52,13 @@ class NAT final : public Module {
   template <typename N>
   void Translate(N &nat, Context *ctx, bess::PacketBatch *batch);
 
-  // Exactly one is set: the owned NAT (one worker, grows) or the shared one.
+  // Exactly one is set: the owned NAT (one worker; fixed, or growable with
+  // max_capacity) or the shared one.
   std::unique_ptr<bess::nat::Nat> nat_;
+  std::unique_ptr<bess::nat::GrowableNat> growable_;
   std::unique_ptr<bess::nat::SharedNat> shared_;
-  std::atomic<bess::nat::Nat::Table *> handover_{nullptr};  // control -> worker
-  std::atomic<bess::nat::Nat::Table *> retired_{nullptr};   // worker -> control
+  std::atomic<bess::nat::GrowableNat::Table *> handover_{nullptr};  // control -> worker
+  std::atomic<bess::nat::GrowableNat::Table *> retired_{nullptr};   // worker -> control
   bess::framework::RequestEndpoint<GrowRequest> grow_;
   bess::framework::RequestEndpoint<GrowRequest> free_;
 };

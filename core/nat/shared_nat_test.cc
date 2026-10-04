@@ -99,19 +99,23 @@ TEST(SharedNatTest, OneThreadMatchesTheOwnedNat) {
 }
 
 // Four workers walk the same sequence of new endpoints at once, so most
-// creates race another worker's create of the same endpoint, and expire as
-// they go. Each internal endpoint ends with one external port, no port serves
-// two endpoints, both keys reach the same binding, and a reply never reaches
-// another host.
-TEST(SharedNatTest, ConcurrentWorkersBindEachEndpointOnce) {
+// creates race another worker's create of the same endpoint. Run twice: with
+// mappings that never expire, every reply must reach its own host; with
+// expiry racing the creates (each worker's clock is its own round, so a
+// mapping one worker refreshes another may expire: replies are not checked),
+// the table must still be consistent at rest. Either way each internal
+// endpoint ends with one external port, no port serves two endpoints, and
+// both keys reach the same binding.
+void RunConcurrentCreates(bool expire) {
   rcu::RcuDomain domain(8);
   auto config = Config<SharedNat>(&domain, 65536);
   // 2048 ports for about 1000 live mappings: concurrent picks land in the same
   // bitmap words, so a create outside the lock would hand a port out twice.
   config.addresses = {{utils::be32_t(kPublic), {{1024, 3072, false}}}};
-  config.timeout = 1000;
+  config.timeout = expire ? 1000 : ~uint64_t{0} / 4;
   auto nat = SharedNat::Create(config).value();
-  constexpr int kWorkers = 4, kRounds = 20000;
+  constexpr int kWorkers = 4;
+  const int rounds = expire ? 20000 : 1900;  // without expiry: fewer endpoints than ports
   auto endpoint_of = [](int r) {
     return std::pair<uint32_t, uint16_t>(0x0a000000u + r % 251, static_cast<uint16_t>(5000 + r / 251));
   };
@@ -126,7 +130,7 @@ TEST(SharedNatTest, ConcurrentWorkersBindEachEndpointOnce) {
       started++;
       while (started.load() < kWorkers) {
       }
-      for (int r = 0; r < kRounds; r++) {
+      for (int r = 0; r < rounds; r++) {
         const auto [host, port] = endpoint_of(r);
         auto f = Udp(host, port, kRemote, 53);
         ParsedFlowPacket p;
@@ -136,15 +140,15 @@ TEST(SharedNatTest, ConcurrentWorkersBindEachEndpointOnce) {
           auto reply = Udp(kRemote, 53, kPublic, SrcPort(f));
           ParsedFlowPacket q;
           if (ParseFrame(reply, q) != ParseStatus::kOk) std::abort();
-          if (nat->Translate(reply, q, Direction::kReverse, r) == Verdict::kTranslated) {
-            const uint32_t to = static_cast<uint32_t>(reply[30]) << 24 | reply[31] << 16 |
-                                reply[32] << 8 | reply[33];
-            const uint16_t to_port = static_cast<uint16_t>(reply[36] << 8 | reply[37]);
-            // A reply may race an expiry and find nothing; never another host.
-            if (to != host || to_port != port) inconsistent++;
+          const Verdict back = nat->Translate(reply, q, Direction::kReverse, r);
+          const uint32_t to = static_cast<uint32_t>(reply[30]) << 24 | reply[31] << 16 |
+                              reply[32] << 8 | reply[33];
+          const uint16_t to_port = static_cast<uint16_t>(reply[36] << 8 | reply[37]);
+          if (!expire && (back != Verdict::kTranslated || to != host || to_port != port)) {
+            inconsistent++;
           }
         }
-        if (r % 16 == w) (void)nat->Expire(r, 64);
+        if (expire && r % 16 == w) (void)nat->Expire(r, 64);
         domain.Quiescent(reader);
       }
       domain.Offline(reader);
@@ -152,10 +156,12 @@ TEST(SharedNatTest, ConcurrentWorkersBindEachEndpointOnce) {
   }
   for (auto &t : workers) t.join();
   EXPECT_EQ(0u, inconsistent.load());
-  EXPECT_GT(translated.load(), static_cast<uint64_t>(kWorkers) * kRounds / 2);
+  // With expiry racing on skewed clocks, ports may run out for a while: only
+  // the table's consistency is the point there.
+  EXPECT_GT(translated.load(), expire ? 0u : static_cast<uint64_t>(kWorkers) * rounds / 2);
   std::map<uint16_t, Endpoint> owner_of_port;
   size_t live = 0;
-  for (int r = 0; r < kRounds; r++) {
+  for (int r = 0; r < rounds; r++) {
     const auto [host, port] = endpoint_of(r);
     const Endpoint in{utils::be32_t(host), utils::be16_t(port), 17};
     const auto *b = nat->Find(in);
@@ -167,24 +173,34 @@ TEST(SharedNatTest, ConcurrentWorkersBindEachEndpointOnce) {
     EXPECT_EQ(b, nat->Find(b->external)) << "one binding, two keys";
   }
   EXPECT_EQ(live, nat->size());
-  EXPECT_GT(live, 0u);
+  if (!expire) {
+    EXPECT_EQ(static_cast<size_t>(rounds), live);
+  }
   nat.reset();
   for (int w = 0; w < kWorkers; w++) domain.Unregister(static_cast<rcu::ReaderId>(w + 1));
 }
+
+TEST(SharedNatTest, ConcurrentCreatesBindEachEndpointOnce) { RunConcurrentCreates(false); }
+TEST(SharedNatTest, ConcurrentCreatesAndExpiryLeaveAConsistentTable) { RunConcurrentCreates(true); }
 
 // Growth under traffic (TP6, table_policy.md 4.2): workers create and look up
 // while a control thread grows the table 64 -> 4096 in steps. A mapping, once
 // made, keeps its external port through every growth (nothing expires here),
 // a reply always reaches its host, and at the end every mapping is reachable
 // by both keys, with no port shared.
-TEST(SharedNatTest, GrowsUnderTrafficWithoutLosingAMapping) {
+// With `expire`, workers also expire mappings (timeout 2000 ticks of one
+// clock all workers advance) while the table grows: the two-copy expiry and
+// the refresh fold run against the copy; only the table's consistency at rest
+// is checked.
+void RunGrowth(bool expire) {
   rcu::RcuDomain domain(8);
   auto config = Config<SharedNat>(&domain, 64);
   config.max_capacity = 4096;
-  config.timeout = ~uint64_t{0} / 4;
+  config.timeout = expire ? 2000 : ~uint64_t{0} / 4;
   auto nat = SharedNat::Create(config).value();
   constexpr int kWorkers = 3, kFlows = 3000;
   std::atomic<bool> stop{false};
+  std::atomic<uint64_t> clock{1};
   std::atomic<int> online{0};
   std::atomic<uint64_t> moved_port{0}, wrong_host{0};
   std::vector<std::atomic<uint32_t>> port_of(kFlows);  // 0: no mapping seen yet
@@ -201,7 +217,11 @@ TEST(SharedNatTest, GrowsUnderTrafficWithoutLosingAMapping) {
         auto f = Udp(0x0a000000u + flow / 50, static_cast<uint16_t>(3000 + flow % 50), kRemote, 53);
         ParsedFlowPacket p;
         if (ParseFrame(f, p) != ParseStatus::kOk) std::abort();
-        if (nat->Translate(f, p, Direction::kForward, 1) == Verdict::kTranslated) {
+        const uint64_t now = expire ? clock.fetch_add(1, std::memory_order_relaxed) : 1;
+        if (expire) {
+          (void)nat->Translate(f, p, Direction::kForward, now);
+          if (r % 8 == 0) (void)nat->Expire(now, 64);
+        } else if (nat->Translate(f, p, Direction::kForward, now) == Verdict::kTranslated) {
           uint32_t expected = 0;
           const uint32_t got = SrcPort(f);
           if (!port_of[flow].compare_exchange_strong(expected, got) && expected != got) {
@@ -225,18 +245,46 @@ TEST(SharedNatTest, GrowsUnderTrafficWithoutLosingAMapping) {
   }
   // The control thread (not a reader): grow whenever asked, as the module's
   // request handler does, until the maximum.
+  // With expiry the live set may stay below a later 3/4 mark: two growths
+  // under expiry are enough (a deadline bounds a stuck run).
   size_t grown = 0;
-  while (nat->capacity() < 4096) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while ((expire ? grown < 2 : nat->capacity() < 4096) &&
+         std::chrono::steady_clock::now() < deadline) {
     if (nat->NeedsGrowth()) {
-      ASSERT_TRUE(nat->Grow(nat->GrowthTarget()));
+      if (!nat->Grow(nat->GrowthTarget())) {
+        ADD_FAILURE() << "growth failed";
+        break;
+      }
       grown++;
     }
     std::this_thread::yield();
+  }
+  if (expire) {
+    EXPECT_EQ(2u, grown);
   }
   // Let the workers run on the final table for a moment.
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
   stop = true;
   for (auto &t : workers) t.join();
+  EXPECT_EQ(0u, nat->dropped_in_growth());
+  if (expire) {
+    // At rest: one port per mapping, both keys, the count.
+    std::set<uint16_t> live_ports;
+    size_t live = 0;
+    for (int flow = 0; flow < kFlows; flow++) {
+      const Endpoint in{utils::be32_t(0x0a000000u + flow / 50), utils::be16_t(3000 + flow % 50), 17};
+      const auto *b = nat->Find(in);
+      if (b == nullptr) continue;
+      live++;
+      EXPECT_TRUE(live_ports.insert(b->external.port.value()).second);
+      EXPECT_EQ(b, nat->Find(b->external));
+    }
+    EXPECT_EQ(live, nat->size());
+    nat.reset();
+    for (int w = 0; w < kWorkers; w++) domain.Unregister(static_cast<rcu::ReaderId>(w + 1));
+    return;
+  }
   EXPECT_EQ(6u, grown) << "64 -> 4096 by doubling";
   EXPECT_EQ(6u, nat->migrated_tables());
   EXPECT_EQ(0u, moved_port.load()) << "a mapping changed its port";
@@ -260,6 +308,9 @@ TEST(SharedNatTest, GrowsUnderTrafficWithoutLosingAMapping) {
   nat.reset();
   for (int w = 0; w < kWorkers; w++) domain.Unregister(static_cast<rcu::ReaderId>(w + 1));
 }
+
+TEST(SharedNatTest, GrowsUnderTrafficWithoutLosingAMapping) { RunGrowth(false); }
+TEST(SharedNatTest, GrowsWhileExpiringAndStaysConsistent) { RunGrowth(true); }
 
 }  // namespace
 }  // namespace bess::nat

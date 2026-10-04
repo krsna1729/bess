@@ -6844,6 +6844,9 @@ the worker never allocating (9.5).
 - The NAT module holds `capacity` bindings (default 65,536, or what the addresses serve if less). With
   `max_capacity` larger (at most what the addresses serve), it grows, doubling, up to it; the default is fixed
   (user decision 9.3: owned fixed, shared growable).
+- Fixed and growable are two types, `Nat` (`OwnedStore<false>`) and `GrowableNat` (`OwnedStore<true>`): the growth
+  code (the second table, the endpoint-keyed wheel, the both-table checks) is compiled only into the growable one, so
+  the default NAT runs D-068's code by construction, not by measurement.
 - At 3/4 full the worker posts a grow request (TP4, D-077). The control side, in the maintenance loop, allocates the
   larger table (`Nat::NewTable`) and leaves it in a handover slot. The worker adopts it at its next batch: new
   bindings go to it, lookups try it, then the old table on a miss. Each batch the worker moves the bindings of 64
@@ -6856,7 +6859,17 @@ the worker never allocating (9.5).
   moves without its timer changing.
 - Outside a migration the packet path gains one predicted branch on a lookup miss; expiry looks a binding up by key.
 
-**Evidence.** EVIDENCE
+**Evidence.** Unit 134/134 (fast build). `nat_test`: a growable NAT at 3 of 4 adopts a table of 8; with no
+migration step, creates stop at 8 counting both tables (the check that keeps room for unmoved bindings: removing it
+fails the test); migration then moves all 8 and every mapping is found; a fixed NAT refuses a maximum above its
+capacity. `nat_model_test`: four growing configurations (4 -> 64 at random points, migration in steps of 1-8 slots
+between operations) match the binding model through traffic, expiry and kFull at every size; dropping the old-table
+lookup or the old-table erase fails it. Live (`bessctl/module_tests/nat.py`): a NAT of capacity 4, maximum 64, gives
+40 flows a mapping each through the maintenance loop, owned and shared. Release, isolated CPU 2, 16 ABBA rounds,
+contamination flagged (IRQ activity): against develop rebuilt in the same session, `BM_Translate/3/` (batch path)
+no clear difference at 4K/64K/1M except one row +3.1%, `BM_Bind` +5.4%; the same library built with develop's
+benchmark source measured 4-7% faster than develop on every Translate row and 26% on Bind, so the differences are
+placement, not the code; growable against fixed (12 rounds): no clear difference on 5 of 6 rows (one -3.9%).
 
 **Revisit when:** a shared multi-worker NAT is needed (TP6: the same request path, a writer lock and copy-without-erase
 under RCU), or the 2x memory peak during a migration matters at the target sizes (bihash-style per-bucket growth).
@@ -6898,5 +6911,13 @@ direction of any mapping, and the bindings must be shared.
   instant may leave with the old port after the port was released; one packet at an expiry boundary, as in other
   NATs with lock-free lookups.
 
-**Evidence.** EVIDENCE
+**Evidence.** `shared_nat_test` (6 tests, in the TSan list): on one thread a SharedNat gives a Nat's verdicts,
+rewrites and expiries; four workers racing creates of the same endpoints bind each once with no port shared and both
+keys on one binding (with the lock removed the test fails every run), and every reply reaches its host; with expiry
+racing, the table is consistent at rest; workers translating while the control thread grows 64 -> 4096 keep every
+mapping and its port (6 growths, `dropped_in_growth` 0), and growth with expiry running stays consistent. Live: the
+module's shared mode translates UDP, TCP and ICMP and grows 4 -> 64. Cost, one worker (release, isolated CPU 2, 12
+rounds): `BM_TranslateShared/3/` against the owned NAT +32% at 4K, +47% at 64K, +34% at 1M per packet: the
+SharedFlowTable's validated lookups and the atomic refresh, reported (table_policy.md 7: shared is reported, not
+gated); the reason to choose it is running on more than one worker.
 

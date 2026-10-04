@@ -269,10 +269,14 @@ struct SharedBindingTraits : flow::DefaultSharedFlowTableTraits {
 // How a NAT stores its bindings: the table policy (table_policy.md, user
 // decisions 1 and 3; the module chooses).
 //
-// OwnedBindings: one worker owns the NAT; a WorkerFlowTable, no lock; the
-// table may grow (TP5, D-078).
-struct OwnedBindings {
+// OwnedBindings: one worker owns the NAT; a WorkerFlowTable, no lock; fixed
+// capacity (user decision 9.3), the code the NAT had before growth (D-068).
+// GrowableOwnedBindings: the same, and the table may grow (TP5, D-078); the
+// growth code is compiled only here, so a fixed NAT pays nothing for it.
+template <bool Growable>
+struct OwnedStore {
   static constexpr bool kShared = false;
+  static constexpr bool kGrowable = Growable;
   using BindingType = Binding;
   using Table = flow::WorkerFlowTable<Endpoint, Binding, flow::DefaultFlowHash<Endpoint>,
                                       flow::DefaultFlowEqual<Endpoint>, BindingTraits>;
@@ -285,6 +289,8 @@ struct OwnedBindings {
     void Release() noexcept {}
   };
 };
+using OwnedBindings = OwnedStore<false>;
+using GrowableOwnedBindings = OwnedStore<true>;
 
 // SharedBindings: every worker translates through one NAT (any traffic
 // distribution: the two directions of a mapping hash apart after the rewrite,
@@ -295,6 +301,7 @@ struct OwnedBindings {
 // destroyed after an RCU grace period. Fixed capacity (TP6).
 struct SharedBindings {
   static constexpr bool kShared = true;
+  static constexpr bool kGrowable = true;
   using BindingType = SharedBinding;
   using Table = flow::SharedFlowTable<Endpoint, SharedBinding, SharedBindingTraits>;
   static auto CreateTable(size_t capacity, rcu::RcuDomain *domain) {
@@ -349,9 +356,11 @@ class BasicNat {
   using Table = typename Store::Table;
   using BindingT = typename Store::BindingType;
   static constexpr bool kShared = Store::kShared;
-  // Keyed by the internal endpoint, not a slot handle: a growing NAT moves
-  // bindings to a new table without touching their timers (TP5).
-  using Wheel = dataplane::ExpiryWheel<Endpoint, Tick>;
+  static constexpr bool kGrowable = Store::kGrowable;
+  // A growable NAT's timers are keyed by the internal endpoint, not a slot
+  // handle: a binding moves to a new table without touching its timer (TP5).
+  using WheelKey = std::conditional_t<kGrowable, Endpoint, flow::FlowHandle>;
+  using Wheel = dataplane::ExpiryWheel<WheelKey, Tick>;
 
   static constexpr Tick kDefaultTimeout = kDefaultNatTimeout;
 
@@ -393,6 +402,9 @@ class BasicNat {
                                  : CreateError::kInvalidCapacity);
     }
     // Timers for the largest table the NAT may grow to: the wheel never moves.
+    if (!kGrowable && config.max_capacity > config.capacity) {
+      return std::unexpected(CreateError::kInvalidCapacity);  // use GrowableNat
+    }
     auto wheel = Wheel::Create(std::max(config.capacity, config.max_capacity), config.start,
                                config.granularity_shift);
     if (!wheel) {
@@ -540,40 +552,60 @@ class BasicNat {
       }
     }
     size_t removed = 0;
-    (void)wheel_->Poll(now, budget,
-                       [this, now, &removed](const Endpoint &internal) noexcept
-                           -> std::optional<Tick> {
-                         // Under the lock: the current table, and while growing
-                         // the old one (owned: a binding not moved yet; shared:
-                         // a binding not copied yet, or the copy's original).
-                         BindingT *b = table_->Find(internal);
-                         BindingT *o = old_ != nullptr ? old_->Find(internal) : nullptr;
-                         if (b == nullptr) {
-                           b = o;
-                           o = nullptr;
-                         }
-                         if (b == nullptr) {
+    if constexpr (!kGrowable) {
+      (void)wheel_->Poll(now, budget,
+                         [this, now, &removed](const flow::FlowHandle &h) noexcept
+                             -> std::optional<Tick> {
+                           const BindingT *b = table_->Lookup(h);
+                           if (b == nullptr) {
+                             return std::nullopt;
+                           }
+                           // Refreshed since this deadline was set: wait for the new one.
+                           const Tick due = Wheel::After(Store::RefreshOf(*b), timeout_);
+                           if (static_cast<int64_t>(due - now) > 0) {
+                             return due;
+                           }
+                           ports_.Release(PoolOf(b->address_index), b->external.protocol,
+                                          b->external.port.value());
+                           removed += table_->Erase(h) ? 1 : 0;
                            return std::nullopt;
-                         }
-                         // Refreshed since this deadline was set (in either copy):
-                         // wait for the new one.
-                         Tick last = Store::RefreshOf(*b);
-                         if (o != nullptr && static_cast<int64_t>(Store::RefreshOf(*o) - last) > 0) {
-                           last = Store::RefreshOf(*o);
-                         }
-                         const Tick due = Wheel::After(last, timeout_);
-                         if (static_cast<int64_t>(due - now) > 0) {
-                           return due;
-                         }
-                         ports_.Release(PoolOf(b->address_index), b->external.protocol,
-                                        b->external.port.value());
-                         bool erased = table_->Erase(internal);
-                         if (old_ != nullptr) {
-                           erased |= old_->Erase(internal);  // not moved, or the original
-                         }
-                         removed += erased ? 1 : 0;
-                         return std::nullopt;
-                       });
+                         });
+    } else {
+      (void)wheel_->Poll(now, budget,
+                         [this, now, &removed](const Endpoint &internal) noexcept
+                             -> std::optional<Tick> {
+                           // Under the lock: the current table, and while growing
+                           // the old one (owned: a binding not moved yet; shared:
+                           // a binding not copied yet, or the copy's original).
+                           BindingT *b = table_->Find(internal);
+                           BindingT *o = old_ != nullptr ? old_->Find(internal) : nullptr;
+                           if (b == nullptr) {
+                             b = o;
+                             o = nullptr;
+                           }
+                           if (b == nullptr) {
+                             return std::nullopt;
+                           }
+                           // Refreshed since this deadline was set (in either copy):
+                           // wait for the new one.
+                           Tick last = Store::RefreshOf(*b);
+                           if (o != nullptr && static_cast<int64_t>(Store::RefreshOf(*o) - last) > 0) {
+                             last = Store::RefreshOf(*o);
+                           }
+                           const Tick due = Wheel::After(last, timeout_);
+                           if (static_cast<int64_t>(due - now) > 0) {
+                             return due;
+                           }
+                           ports_.Release(PoolOf(b->address_index), b->external.protocol,
+                                          b->external.port.value());
+                           bool erased = table_->Erase(internal);
+                           if (old_ != nullptr) {
+                             erased |= old_->Erase(internal);  // not moved, or the original
+                           }
+                           removed += erased ? 1 : 0;
+                           return std::nullopt;
+                         });
+    }
     lock_.Release();
     return removed;
   }
@@ -583,6 +615,9 @@ class BasicNat {
   // Whether to ask for a larger table: at least 3/4 full, below the maximum,
   // and not already growing. One branch on a worker's path.
   bool NeedsGrowth() const noexcept {
+    if constexpr (!kGrowable) {
+      return false;
+    }
     const Table *t = cur();
     return prev() == nullptr && t->capacity() < max_capacity_ &&
            t->size() * 4 >= t->capacity() * 3;
@@ -616,20 +651,37 @@ class BasicNat {
     prev_.store(old_.get(), std::memory_order_release);
     cur_.store(table_.get(), std::memory_order_release);
     lock_.Release();
+    std::vector<Endpoint> unplaced;  // the control thread may allocate
     for (size_t cursor = 0; cursor < old_->capacity();) {
       lock_.Acquire();
       cursor = old_->VisitRange(cursor, kGrowChunk,
-                                [this](flow::FlowHandle, const Endpoint &internal,
-                                       const BindingT &b) {
+                                [this, &unplaced](flow::FlowHandle, const Endpoint &internal,
+                                                  const BindingT &b) {
                                   // Absent from the new table: creates check the
-                                  // old one under this lock first.
+                                  // old one under this lock first. The new table
+                                  // has room (capacity counts both), but its
+                                  // directory may refuse a key (kPlacementFailed).
                                   auto copy = table_->EmplaceAliased(
                                       internal, b.external, b.internal, b.external,
                                       b.address_index, Store::RefreshOf(b));
                                   if (copy.created()) {
                                     copy.state->timer = b.timer;
+                                  } else if (copy.status != flow::EmplaceStatus::kExists) {
+                                    unplaced.push_back(internal);
                                   }
                                 });
+      // A binding the new table refused ends here, cleanly: its port goes back
+      // to the pool and it leaves the old table (its timer will find nothing).
+      // The flow gets a new mapping with its next outbound packet. Counted.
+      for (const Endpoint &internal : unplaced) {
+        if (const BindingT *b = old_->Find(internal)) {
+          ports_.Release(PoolOf(b->address_index), b->external.protocol,
+                         b->external.port.value());
+          (void)old_->Erase(internal);
+          dropped_in_growth_++;
+        }
+      }
+      unplaced.clear();
       lock_.Release();
     }
     lock_.Acquire();
@@ -656,7 +708,7 @@ class BasicNat {
   // A new, empty table: the control side calls this (allocation never happens
   // on the packet path) and hands the result to the owner.
   static std::unique_ptr<Table> NewTable(size_t capacity)
-    requires(!kShared)
+    requires(!kShared && kGrowable)
   {
     auto made = Table::Create(capacity);
     return made ? std::move(*made) : nullptr;
@@ -664,7 +716,7 @@ class BasicNat {
   // The owner takes over a larger table: new bindings go to it, lookups try it
   // first, then the old one, until MigrateSome has moved every binding.
   void Adopt(std::unique_ptr<Table> bigger) noexcept
-    requires(!kShared)
+    requires(!kShared && kGrowable)
   {
     if (bigger == nullptr || old_ != nullptr || bigger->capacity() <= table_->capacity()) {
       return;  // stale or useless: dropped (freed by the caller's unique_ptr)
@@ -680,7 +732,7 @@ class BasicNat {
   // now empty, table for the caller to free off the packet path; nullptr until
   // then.
   std::unique_ptr<Table> MigrateSome(size_t slots) noexcept
-    requires(!kShared)
+    requires(!kShared && kGrowable)
   {
     if (old_ == nullptr) {
       return nullptr;
@@ -707,6 +759,9 @@ class BasicNat {
   }
   static constexpr size_t kMaxMigrateSlots = 256;
   size_t migrated_tables() const noexcept { return migrated_tables_; }
+  // Shared growth: bindings the larger table's directory could not place, ended
+  // (port released) instead of copied. Expected 0; nonzero is visible.
+  size_t dropped_in_growth() const noexcept { return dropped_in_growth_; }
   size_t capacity() const noexcept { return cur()->capacity(); }
 
   const BindingT *Find(const Endpoint &e) const noexcept {
@@ -767,7 +822,9 @@ class BasicNat {
     }
   }
   Table *prev() const noexcept {
-    if constexpr (kShared) {
+    if constexpr (!kGrowable) {
+      return nullptr;
+    } else if constexpr (kShared) {
       return prev_.load(std::memory_order_acquire);
     } else {
       return old_.get();
@@ -804,9 +861,7 @@ class BasicNat {
   Verdict BindLocked(const Endpoint &internal, Tick now, BindingT **out) noexcept {
     // Bindings in both tables count while migrating: the new table must keep
     // room for every binding not moved yet.
-    // (Shared: conservative while growing, a copied binding counts twice.)
-    if (wheel_->full() ||
-        table_->size() + (old_ != nullptr ? old_->size() : 0) >= table_->capacity()) {
+    if (wheel_->full()) {
       return Verdict::kFull;
     }
     if constexpr (!kShared) {
@@ -814,7 +869,13 @@ class BasicNat {
         return Verdict::kFull;
       }
     }
-    if (old_ != nullptr) [[unlikely]] {
+    if constexpr (kGrowable) {
+      // (Shared: conservative while growing, a copied binding counts twice.)
+      if (table_->size() + (old_ != nullptr ? old_->size() : 0) >= table_->capacity()) {
+        return Verdict::kFull;
+      }
+    }
+    if (kGrowable && old_ != nullptr) [[unlikely]] {
       // Growing: the old table is part of the key space. Shared: another
       // worker may have bound this endpoint there after our lookup.
       if (BindingT *x = FindIn(*old_, internal)) {
@@ -836,7 +897,7 @@ class BasicNat {
         continue;
       }
       const Endpoint external{addresses_[a].addr, be16_t(*port), internal.protocol};
-      if (old_ != nullptr && FindIn(*old_, external) != nullptr) [[unlikely]] {
+      if (kGrowable && old_ != nullptr && FindIn(*old_, external) != nullptr) [[unlikely]] {
         // The external endpoint is an internal one's key in the old table.
         ports_.Release(PoolOf(a), internal.protocol, *port);
         return Verdict::kConflict;
@@ -858,7 +919,13 @@ class BasicNat {
         // key: refuse.
         return made.status == flow::EmplaceStatus::kFull ? Verdict::kFull : Verdict::kConflict;
       }
-      made.state->timer = wheel_->Schedule(Wheel::After(now, timeout_), internal);
+      WheelKey key;
+      if constexpr (kGrowable) {
+        key = internal;
+      } else {
+        key = made.handle;
+      }
+      made.state->timer = wheel_->Schedule(Wheel::After(now, timeout_), key);
       if (made.state->timer == dataplane::kNoExpiry) {
         ports_.Release(PoolOf(a), internal.protocol, *port);
         (void)table_->Erase(made.handle);
@@ -882,6 +949,7 @@ class BasicNat {
   std::unique_ptr<Table> old_;  // while migrating: the table being moved from
   size_t cursor_ = 0;           // its next slot to move
   size_t migrated_tables_ = 0;
+  size_t dropped_in_growth_ = 0;
   typename Store::Lock lock_;
   rcu::RcuDomain *rcu_ = nullptr;
   // Shared: the tables published to lock-free readers (owned: unused).
@@ -889,8 +957,10 @@ class BasicNat {
   std::atomic<Table *> prev_{nullptr};
 };
 
-// The owned NAT (one worker) and the shared one (every worker).
+// The owned NAT (one worker; fixed, or growable) and the shared one (every
+// worker, growable).
 using Nat = BasicNat<OwnedBindings>;
+using GrowableNat = BasicNat<GrowableOwnedBindings>;
 using SharedNat = BasicNat<SharedBindings>;
 
 }  // namespace bess::nat

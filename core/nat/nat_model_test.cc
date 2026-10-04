@@ -193,10 +193,11 @@ struct NatModelConfig {
   size_t max_capacity = 0;  // > capacity: the NAT grows (TP5) at random points
 };
 
+template <typename N>
 class NatModel {
  public:
   explicit NatModel(const NatModelConfig &cfg) : cfg_(cfg), rng_(cfg.seed) {
-    Nat::Config c;
+    typename N::Config c;
     c.addresses = cfg.addresses;
     c.capacity = cfg.capacity;
     c.timeout = cfg.timeout;
@@ -204,7 +205,7 @@ class NatModel {
     c.start = 0;
     c.seed = cfg.seed;
     c.max_capacity = cfg.max_capacity;
-    auto made = Nat::Create(c);
+    auto made = N::Create(c);
     EXPECT_TRUE(made.has_value());
     nat_ = std::move(*made);
     for (const auto &a : cfg.addresses) {
@@ -245,12 +246,14 @@ class NatModel {
       // Growth, as the module drives it, at random points: the owner adopts a
       // larger table when asked and moves a few slots between operations.
       // Every check above and below must hold throughout.
-      if (nat_->NeedsGrowth() && rng_() % 4 == 0) {
-        nat_->Adopt(Nat::NewTable(nat_->GrowthTarget()));
-        grown++;
-      }
-      if (nat_->migrating()) {
-        (void)nat_->MigrateSome(1 + rng_() % 8);
+      if constexpr (N::kGrowable) {
+        if (nat_->NeedsGrowth() && rng_() % 4 == 0) {
+          nat_->Adopt(N::NewTable(nat_->GrowthTarget()));
+          grown++;
+        }
+        if (nat_->migrating()) {
+          (void)nat_->MigrateSome(1 + rng_() % 8);
+        }
       }
       ASSERT_EQ(bindings_.size(), nat_->size());
       if (step % 50 == 0) {
@@ -559,7 +562,7 @@ class NatModel {
   NatModelConfig cfg_;
   std::mt19937 rng_;
   uint64_t now_ = 0;
-  std::unique_ptr<Nat> nat_;
+  std::unique_ptr<N> nat_;
   std::vector<uint32_t> ext_ips_;
   std::vector<uint32_t> hosts_;
   std::vector<uint16_t> interesting_ports_;
@@ -597,13 +600,21 @@ TEST(NatModelTest, RandomTrafficBothDirectionsWithExpiryMatchesABindingModel) {
   size_t expired = 0, budget_stops = 0, grown = 0;
   for (const auto &cfg : configs) {
     SCOPED_TRACE(::testing::Message() << "seed " << cfg.seed);
-    NatModel model(cfg);
-    model.Run();
+    auto run = [&](auto &model) {
+      model.Run();
+      for (const auto &[v, n] : model.verdicts) total[v] += n;
+      expired += model.expired;
+      budget_stops += model.budget_stops;
+      grown += model.grown;
+    };
+    if (cfg.max_capacity > cfg.capacity) {
+      NatModel<GrowableNat> model(cfg);
+      run(model);
+    } else {
+      NatModel<Nat> model(cfg);
+      run(model);
+    }
     if (::testing::Test::HasFatalFailure()) return;
-    for (const auto &[v, n] : model.verdicts) total[v] += n;
-    expired += model.expired;
-    budget_stops += model.budget_stops;
-    grown += model.grown;
   }
   // Every verdict and path the model distinguishes was reached.
   for (const Verdict v : {Verdict::kTranslated, Verdict::kNotIpv4, Verdict::kUnsupported,
