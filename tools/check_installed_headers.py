@@ -163,6 +163,7 @@ NEGATIVE_PRELUDE = """\
 #include "dataplane/scope.h"
 #include "dataplane/worker_id.h"
 #include "flow/flow_types.h"
+#include "flow/shared_flow_table.h"
 #include "flow/worker_flow_table.h"
 #include "l2/fdb.h"
 #include "meter/meter.h"
@@ -172,10 +173,19 @@ using namespace bess::dataplane;
 namespace flow = bess::flow;
 namespace route = bess::route;
 struct PaddedKey { uint8_t a; uint32_t b; };
+struct OwnedTraits : flow::DefaultSharedFlowTableTraits {
+  static constexpr flow::StateSharing kSharing = flow::StateSharing::kOwnedByCreator;
+};
+struct AliasTraits : flow::DefaultSharedFlowTableTraits {
+  static constexpr size_t kAliases = 1;
+};
+using SharedTable = flow::SharedFlowTable<uint64_t, int>;
+using OwnedTable = flow::SharedFlowTable<uint64_t, int, OwnedTraits>;
 """
 
 _CONVERSION = r"conversion|convert"
 _COMPARE = r"operator==|invalid operands"
+_UNAVAILABLE = r"constraints|satisf|no matching|requires"
 
 NEGATIVE_CASES = [
     # (name, good, bad, diagnostic)
@@ -210,6 +220,20 @@ NEGATIVE_CASES = [
     ("a padded key needs a hash and an equality (FlowKeyOps)",
      "using T = flow::WorkerFlowTable<uint64_t, int>; T *t = nullptr;",
      "using T = flow::WorkerFlowTable<PaddedKey, int>; T *t = nullptr;", r"FlowKeyOps|ByteHashableFlowKey"),
+    # Ownership modes (SharedFlowTable): a shared-mutable table hands out
+    # mutable state to any finder; an owned-by-creator table only to its owner.
+    ("a shared-mutable table has no owner-only lookup",
+     "OwnedTable *t = nullptr; (void)t->FindOwned(uint64_t{1});",
+     "SharedTable *t = nullptr; (void)t->FindOwned(uint64_t{1});", _UNAVAILABLE),
+    ("an owned-by-creator table has no lookup for any thread",
+     "SharedTable *t = nullptr; (void)t->Find(uint64_t{1});",
+     "OwnedTable *t = nullptr; (void)t->Find(uint64_t{1});", _UNAVAILABLE),
+    ("an owned-by-creator table has no batch lookup for any thread",
+     "SharedTable *t = nullptr; uint64_t k[1]{}; int *o[1]{}; (void)t->FindBatch(k, o);",
+     "OwnedTable *t = nullptr; uint64_t k[1]{}; int *o[1]{}; (void)t->FindBatch(k, o);", _UNAVAILABLE),
+    ("a table without alias slots cannot add an alias",
+     "flow::SharedFlowTable<uint64_t, int, AliasTraits> *t = nullptr; (void)t->AddAlias(flow::FlowHandle{}, uint64_t{2});",
+     "SharedTable *t = nullptr; (void)t->AddAlias(flow::FlowHandle{}, uint64_t{2});", _UNAVAILABLE),
     ("an expiry payload must be trivially copyable",
      "using W = ExpiryWheel<uint64_t>; W *w = nullptr;",
      "using W = ExpiryWheel<std::string>; W *w = nullptr;", r"trivially_copyable|constraints"),

@@ -35,7 +35,10 @@ matched (M23): strong ids (`ActionId`, `NextHopId`, `NextHopGroupId`,
 across kinds; generation handles of different kinds do not convert; a flow
 key must be trivially copyable (`FixedFlowKey`), and a padded one needs its
 own hash and equality (`FlowKeyOps`); an expiry payload must be trivially
-copyable. A new id type or concept gets a twin in `NEGATIVE_CASES`.
+copyable; a `SharedFlowTable`'s mode decides its lookups (a shared-mutable
+table has no `FindOwned`, an owned-by-creator table no `Find` or `FindBatch`,
+and a table without alias slots no `AddAlias`). A new id type, concept or
+mode-restricted member gets a twin in `NEGATIVE_CASES`.
 
 CI then builds `examples/standalone_plugin` from the staged `bess-dev` alone (a
 copy of `bess-dev.pc` whose prefix is the stage, so a BESS already installed on
