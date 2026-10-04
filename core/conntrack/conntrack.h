@@ -29,8 +29,9 @@ namespace bess::conntrack {
 // its own per-connection data in the entry (UserData).
 //
 // One worker owns a Conntrack (the flow table is worker-owned). TCP follows
-// Linux nf_conntrack's state table; sequence numbers and windows are not
-// tracked (an out-of-window segment is not detected).
+// Linux nf_conntrack: tcp_error()'s flag-combination check, then the state
+// table; sequence numbers and windows are not tracked (an out-of-window
+// segment is not detected).
 
 enum class Direction : uint8_t { kOriginal, kReply };
 
@@ -133,8 +134,9 @@ enum class TrackStatus : uint8_t {
   kNew,        // this packet created the connection
   kExisting,   // a packet of a tracked connection, accepted by its state machine
   kRelated,    // an ICMP error about a tracked connection (handle names it)
-  kInvalid,    // no connection and not one that may start one, or rejected by
-               // the TCP state machine; nothing changed
+  kInvalid,    // no connection and not one that may start one, an invalid TCP
+               // flag combination, or rejected by the TCP state machine;
+               // nothing changed
   kUntracked,  // not trackable: a non-initial fragment, ICMP neither echo nor error
   kFull,       // would start a connection, but the table is full
 };
@@ -174,6 +176,24 @@ inline FlagClass ClassOf(uint8_t flags) noexcept {
   if (flags & kTcpFin) return kFin;
   if (flags & kTcpAck) return kAck;
   return kNoFlags;
+}
+
+// Linux nf_conntrack_proto_tcp.c tcp_error(): before the state table, a
+// segment whose flags, with PSH, ECE and CWR ignored, are not one of
+// tcp_valid_flags' combinations is invalid ("invalid tcp flag combination").
+// Valid: SYN, SYN|URG, SYN|ACK, RST, RST|ACK, FIN|ACK, FIN|ACK|URG, ACK,
+// ACK|URG. Everything else -- no flags, FIN alone, SYN|FIN, SYN|RST, FIN|RST,
+// SYN|ACK|URG, URG alone, ... -- is refused. The checked bits (FIN, SYN, RST,
+// ACK, URG = 0x37) index a 64-bit set: one shift, no memory load.
+inline constexpr uint8_t kTcpUrg = 0x20;
+inline constexpr uint8_t kCheckedFlags = kTcpFin | kTcpSyn | kTcpRst | kTcpAck | kTcpUrg;
+inline constexpr uint64_t FlagSet(uint8_t flags) { return uint64_t{1} << flags; }
+inline constexpr uint64_t kValidFlagSets =
+    FlagSet(kTcpSyn) | FlagSet(kTcpSyn | kTcpUrg) | FlagSet(kTcpSyn | kTcpAck) | FlagSet(kTcpRst) |
+    FlagSet(kTcpRst | kTcpAck) | FlagSet(kTcpFin | kTcpAck) | FlagSet(kTcpFin | kTcpAck | kTcpUrg) |
+    FlagSet(kTcpAck) | FlagSet(kTcpAck | kTcpUrg);
+inline bool ValidFlags(uint8_t flags) noexcept {
+  return (kValidFlagSets >> (flags & kCheckedFlags)) & 1;
 }
 
 inline bool IsIcmpError(L4Kind k, uint8_t type) noexcept {
@@ -299,6 +319,9 @@ class Conntrack {
       Entry &e = *ref.state;
       const Direction dir = c.src_is_a == e.initiator_is_a ? Direction::kOriginal : Direction::kReply;
       if (p.l4 == L4Kind::kTcp) {
+        if (!ct_internal::ValidFlags(p.tcp_flags)) {
+          return {TrackStatus::kInvalid, dir};  // tcp_error(): nothing changes
+        }
         const uint8_t next =
             ct_internal::kTcpTable[static_cast<int>(dir)][ct_internal::ClassOf(p.tcp_flags)]
                                   [static_cast<int>(e.tcp)];
@@ -337,6 +360,9 @@ class Conntrack {
     fresh.initiator_is_a = c.src_is_a;
     if (p.l4 == L4Kind::kTcp) {
       const auto cls = ct_internal::ClassOf(p.tcp_flags);
+      if (!ct_internal::ValidFlags(p.tcp_flags)) {
+        return {TrackStatus::kInvalid};  // tcp_error(): creates nothing
+      }
       if (cls == ct_internal::kSyn) {
         fresh.tcp = TcpState::kSynSent;
       } else if (cls == ct_internal::kAck && policy_.tcp_pickup) {

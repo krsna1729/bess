@@ -2,12 +2,18 @@
 
 // Conntrack (M17, D-067) against two reference models (M22).
 //
-// 1. The TCP state model: Linux nf_conntrack's tcp_conntracks[dir][index]
-//    [state] table and get_conntrack_index() (nf_conntrack_proto_tcp.c),
-//    encoded below from the Linux source as a table of Linux's own mnemonics
-//    (sNO..sS2, sIV invalid, sIG ignore). Flag classes in Linux's precedence:
-//    RST, then SYN (SYN|ACK when ACK is set), then FIN, then ACK, else none.
-//    How the tracker uses the table (D-067):
+// 1. The TCP state model: Linux nf_conntrack's tcp_error() flag filter, then
+//    its tcp_conntracks[dir][index][state] table and get_conntrack_index()
+//    (nf_conntrack_proto_tcp.c), encoded below from the Linux source: the
+//    filter as the set of tcp_valid_flags combinations, the table in Linux's
+//    own mnemonics (sNO..sS2, sIV invalid, sIG ignore). Flag classes in
+//    Linux's precedence: RST, then SYN (SYN|ACK when ACK is set), then FIN,
+//    then ACK, else none.
+//    How the tracker uses them (D-067):
+//      - the filter first: flags & ~(PSH|ECE|CWR) must be one of SYN,
+//        SYN|URG, SYN|ACK, RST, RST|ACK, FIN|ACK, FIN|ACK|URG, ACK, ACK|URG;
+//        otherwise kInvalid and nothing changes or is created (an existing
+//        connection's direction is still reported).
 //      - an existing connection: the packet's direction is original when its
 //        sender is the connection's initiator, else reply. sIV: kInvalid,
 //        nothing changes (no state, no timeout, no `replied`). sIG: the state
@@ -18,8 +24,8 @@
 //      - no connection: a SYN creates sSS; an ACK creates sES only with
 //        tcp_pickup; any other TCP packet is kInvalid.
 //    Not modelled (not done by the tracker, D-067): sequence/window tracking,
-//    Linux's tcp_error() flag-combination filter, the sIG "last index"
-//    bookkeeping.
+//    tcp_error()'s length and checksum checks (the parser's and the
+//    caller's), the sIG "last index" bookkeeping.
 //
 // 2. The connection-table model: canonical key (zone, protocol, family, the
 //    lesser (address, port) endpoint, the greater one) -> {TCP state,
@@ -102,6 +108,18 @@ uint8_t LinuxIndex(uint8_t flags) {
   if (flags & kFin) return iFIN;
   if (flags & kAck) return iACK;
   return iNONE;
+}
+
+// tcp_valid_flags and its use in tcp_error(), same file: PUSH, ECE and CWR are
+// always valid; the rest must be one of these combinations.
+bool LinuxValidFlags(uint8_t flags) {
+  constexpr uint8_t kFin = 0x01, kSyn = 0x02, kRst = 0x04, kPsh = 0x08, kAck = 0x10, kUrg = 0x20,
+                    kEce = 0x40, kCwr = 0x80;
+  static const std::set<uint8_t> kValid = {
+      kSyn, kSyn | kUrg, kSyn | kAck, kRst, kRst | kAck, kFin | kAck, kFin | kAck | kUrg, kAck,
+      kAck | kUrg,
+  };
+  return kValid.count(static_cast<uint8_t>(flags & ~(kEce | kCwr | kPsh))) != 0;
 }
 
 TcpState AsState(uint8_t s) { return static_cast<TcpState>(s); }
@@ -247,7 +265,7 @@ class TableModel {
   }
 
   enum Count { kNewC, kFullC, kInvalidC, kReopenC, kRefusedC, kExpiredC, kBudgetStopC,
-               kUntrackedC, kCounts };
+               kUntrackedC, kBadFlagsC, kCounts };
   size_t count(Count c) const { return counts_[c]; }
 
  private:
@@ -297,8 +315,11 @@ class TableModel {
   }
 
   uint8_t RandomFlags() {
-    static constexpr uint8_t kCommon[] = {0x02, 0x12, 0x11, 0x10, 0x18, 0x04, 0x14, 0x01, 0x00};
-    return rng_() % 4 == 0 ? static_cast<uint8_t>(rng_() % 64) : kCommon[rng_() % 9];
+    // Common segments, the invalid combinations tcp_error() names (FIN, SYN|FIN,
+    // SYN|RST, none), and any byte (PSH, URG, ECE and CWR included).
+    static constexpr uint8_t kCommon[] = {0x02, 0x12, 0x11, 0x10, 0x18, 0x04, 0x14,
+                                          0x01, 0x00, 0x03, 0x06, 0xd0, 0x52};
+    return rng_() % 4 == 0 ? static_cast<uint8_t>(rng_()) : kCommon[rng_() % 13];
   }
 
   void Track() {
@@ -332,7 +353,10 @@ class TableModel {
       want_dir = dir == kOrig ? Direction::kOriginal : Direction::kReply;
       uint8_t next = c.tcp;
       bool accepted = true;
-      if (f.l4 == L4Kind::kTcp) {
+      if (f.l4 == L4Kind::kTcp && !LinuxValidFlags(flags)) {
+        accepted = false;
+        counts_[kBadFlagsC]++;
+      } else if (f.l4 == L4Kind::kTcp) {
         next = kLinux[dir][LinuxIndex(flags)][c.tcp];
         if (next == sIV) {
           accepted = false;
@@ -367,7 +391,10 @@ class TableModel {
       c.l4 = f.l4;
       c.initiator = sender;
       bool may_start = true;
-      if (f.l4 == L4Kind::kTcp) {
+      if (f.l4 == L4Kind::kTcp && !LinuxValidFlags(flags)) {
+        may_start = false;
+        counts_[kBadFlagsC]++;
+      } else if (f.l4 == L4Kind::kTcp) {
         const uint8_t cls = LinuxIndex(flags);
         if (cls == iSYN) {
           c.tcp = sSS;
@@ -546,10 +573,10 @@ TEST(ConntrackModelTest, RandomTrafficExpiryAndRemovalMatchAConnectionTableModel
 
 // From a fresh tracker, a breadth-first walk over the model's states: each
 // state reached by a shortest packet path (with the side that sent each
-// packet), then every one of the 64 flag combinations from either side is
-// replayed onto that path and the verdict, direction and resulting state
-// compared with the Linux table. Covers every (state, direction, flag class)
-// cell the tracker can reach, reopens from both sides included.
+// packet), then every one of the 256 flag bytes from either side is replayed
+// onto that path and the verdict, direction and resulting state compared
+// with the Linux filter and table. Covers every (state, direction, flag
+// class) cell the tracker can reach, reopens from both sides included.
 TEST(ConntrackModelTest, TcpTransitionsMatchTheLinuxTableInEveryReachableState) {
   struct Step {
     bool from_client;
@@ -568,14 +595,17 @@ TEST(ConntrackModelTest, TcpTransitionsMatchTheLinuxTableInEveryReachableState) 
     policy.tcp_pickup = pickup;
     std::set<std::pair<uint8_t, bool>> seen;
     std::deque<Node> queue;
-    bool covered[2][6][10] = {};
-    // Creation: every flag combination from the client on a fresh tracker.
-    for (int flags = 0; flags < 64; flags++) {
+    bool covered[2][6][10] = {};        // any flag byte of the class
+    bool covered_valid[2][6][10] = {};  // a byte tcp_error() lets through
+    // Creation: every flag byte from the client on a fresh tracker.
+    for (int flags = 0; flags < 256; flags++) {
       auto ct = Ct::Create(4, policy).value();
       const auto r = ct->Track({}, Packet(flow, true, static_cast<uint8_t>(flags), 0), 1);
       const uint8_t cls = LinuxIndex(static_cast<uint8_t>(flags));
-      const bool creates = cls == iSYN || (pickup && cls == iACK);
+      const bool creates =
+          LinuxValidFlags(static_cast<uint8_t>(flags)) && (cls == iSYN || (pickup && cls == iACK));
       ASSERT_EQ(creates ? TrackStatus::kNew : TrackStatus::kInvalid, r.status) << flags;
+      ASSERT_EQ(creates ? 1u : 0u, ct->size()) << flags;
       if (creates) {
         const uint8_t s = kLinux[kOrig][cls][sNO];
         ASSERT_EQ(AsState(s), r.entry->tcp);
@@ -589,7 +619,7 @@ TEST(ConntrackModelTest, TcpTransitionsMatchTheLinuxTableInEveryReachableState) 
       const Node node = queue.front();
       queue.pop_front();
       for (const bool from_client : {true, false}) {
-        for (int flags = 0; flags < 64; flags++) {
+        for (int flags = 0; flags < 256; flags++) {
           auto ct = Ct::Create(4, policy).value();
           uint64_t now = 1;
           for (const Step &s : node.path) {
@@ -600,8 +630,10 @@ TEST(ConntrackModelTest, TcpTransitionsMatchTheLinuxTableInEveryReachableState) 
           ASSERT_EQ(AsState(node.state), before.tcp);
           const uint8_t dir = from_client == node.client_initiates ? kOrig : kRepl;
           const uint8_t cls = LinuxIndex(static_cast<uint8_t>(flags));
+          const bool valid = LinuxValidFlags(static_cast<uint8_t>(flags));
           covered[dir][cls][node.state] = true;
-          uint8_t next = kLinux[dir][cls][node.state];
+          covered_valid[dir][cls][node.state] |= valid;
+          uint8_t next = valid ? kLinux[dir][cls][node.state] : uint8_t{sIV};
           const auto r = ct->Track({}, Packet(flow, from_client, static_cast<uint8_t>(flags), 0), now);
           replays++;
           SCOPED_TRACE(::testing::Message() << "state " << int{node.state} << " dir " << int{dir}
@@ -648,18 +680,92 @@ TEST(ConntrackModelTest, TcpTransitionsMatchTheLinuxTableInEveryReachableState) 
       }
     }
     // Every cell of every state an existing connection can be in (all but
-    // sNO), from both directions and in all six flag classes, was tested.
+    // sNO), from both directions and in all six flag classes, was tested;
+    // and every cell of the five classes a valid flag byte can have (the
+    // no-flag class has none) was tested with a byte the filter passes.
     for (int dir = 0; dir < 2; dir++) {
       for (int cls = 0; cls < 6; cls++) {
         for (int s = sSS; s <= sS2; s++) {
           EXPECT_TRUE(covered[dir][cls][s]) << dir << " " << cls << " " << s;
+          EXPECT_EQ(cls != iNONE, covered_valid[dir][cls][s]) << dir << " " << cls << " " << s;
         }
       }
     }
     // Both initiator sides of all nine states were reached (reverse reopens).
     EXPECT_EQ(18u, seen.size());
-    EXPECT_GT(replays, 2000u);
+    EXPECT_GT(replays, 9000u);
   }
+}
+
+// tcp_error()'s filter on its own, with deadlines (which the walk above
+// cannot see): every flag byte Linux refuses, from either side, is kInvalid
+// and creates nothing on a fresh tracker (pickup on), and on a connection --
+// established, or SYN_SENT with nothing replied yet -- leaves the state,
+// `replied` and the deadline as they were. A valid byte with PSH, ECE and CWR
+// set is still accepted.
+TEST(ConntrackModelTest, InvalidTcpFlagCombinationsChangeNothingAndCreateNothing) {
+  constexpr uint8_t F = 0x01, S = 0x02, R = 0x04, P = 0x08, A = 0x10, U = 0x20, E = 0x40, C = 0x80;
+  // The combinations scanners and broken stacks send, all refused by Linux.
+  for (const uint8_t named : {uint8_t{0}, F, uint8_t(S | F), uint8_t(S | R), uint8_t(F | R), U, P,
+                              uint8_t(F | P | U), uint8_t(S | A | U), uint8_t(R | A | U),
+                              uint8_t(S | R | A), uint8_t(E | C), uint8_t(0x3f)}) {
+    EXPECT_FALSE(LinuxValidFlags(named)) << int{named};
+  }
+  std::vector<uint8_t> invalid;
+  for (int flags = 0; flags < 256; flags++) {
+    if (!LinuxValidFlags(static_cast<uint8_t>(flags))) invalid.push_back(static_cast<uint8_t>(flags));
+  }
+  // 9 valid combinations, each with any of PSH, ECE and CWR.
+  ASSERT_EQ(256u - 9 * 8, invalid.size());
+
+  TimeoutPolicy policy;
+  policy.tcp[static_cast<size_t>(TcpState::kSynSent)] = 60;
+  policy.tcp[static_cast<size_t>(TcpState::kEstablished)] = 100;
+  policy.tcp_pickup = true;  // an ACK may create: the filter must still refuse ACK|FIN|RST
+  const Flow flow{L4Kind::kTcp, 6, false, V4(0x0a000001, 40000), V4(0x0a000002, 80), 0};
+  const CtKey key = AsCtKey(KeyOf(flow));
+  for (const uint8_t flags : invalid) {
+    for (const bool from_client : {true, false}) {
+      SCOPED_TRACE(::testing::Message() << "flags " << int{flags} << " from client " << from_client);
+      // No connection: nothing is created.
+      auto ct = Ct::Create(4, policy).value();
+      auto r = ct->Track({}, Packet(flow, from_client, flags, 0), 0);
+      ASSERT_EQ(TrackStatus::kInvalid, r.status);
+      ASSERT_EQ(nullptr, r.entry);
+      ASSERT_EQ(0u, ct->size());
+
+      // SYN_SENT, nothing replied; deadline 1 + 60.
+      ASSERT_EQ(TrackStatus::kNew, ct->Track({}, Packet(flow, true, S, 0), 1).status);
+      r = ct->Track({}, Packet(flow, from_client, flags, 0), 30);
+      ASSERT_EQ(TrackStatus::kInvalid, r.status);
+      ASSERT_EQ(from_client ? Direction::kOriginal : Direction::kReply, r.direction);
+      ASSERT_EQ(nullptr, r.entry);
+      ASSERT_EQ(TcpState::kSynSent, ct->Find(key)->tcp);
+      ASSERT_FALSE(ct->Find(key)->replied);
+      ASSERT_EQ(0u, ct->Expire(60, 1u << 20)) << "expired early";
+      ASSERT_EQ(1u, ct->Expire(61, 1u << 20)) << "the invalid segment refreshed the deadline";
+
+      // ESTABLISHED; deadline 4 + 100.
+      ASSERT_EQ(TrackStatus::kNew, ct->Track({}, Packet(flow, true, S, 0), 2).status);
+      ASSERT_EQ(TrackStatus::kExisting, ct->Track({}, Packet(flow, false, S | A, 0), 3).status);
+      ASSERT_EQ(TrackStatus::kExisting, ct->Track({}, Packet(flow, true, A, 0), 4).status);
+      ASSERT_EQ(TcpState::kEstablished, ct->Find(key)->tcp);
+      r = ct->Track({}, Packet(flow, from_client, flags, 0), 50);
+      ASSERT_EQ(TrackStatus::kInvalid, r.status);
+      ASSERT_EQ(from_client ? Direction::kOriginal : Direction::kReply, r.direction);
+      ASSERT_EQ(TcpState::kEstablished, ct->Find(key)->tcp);
+      ASSERT_EQ(0u, ct->Expire(103, 1u << 20)) << "expired early";
+      ASSERT_EQ(1u, ct->Expire(104, 1u << 20)) << "the invalid segment refreshed the deadline";
+    }
+  }
+  // Valid combinations carrying PSH, ECE and CWR pass the filter.
+  auto ct = Ct::Create(4, policy).value();
+  ASSERT_EQ(TrackStatus::kNew, ct->Track({}, Packet(flow, true, S | E | C, 0), 1).status);
+  ASSERT_EQ(TrackStatus::kExisting, ct->Track({}, Packet(flow, false, S | A | E, 0), 2).status);
+  ASSERT_EQ(TrackStatus::kExisting, ct->Track({}, Packet(flow, true, A | P | U | C, 0), 3).status);
+  ASSERT_EQ(TcpState::kEstablished, ct->Find(key)->tcp);
+  ASSERT_EQ(TrackStatus::kExisting, ct->Track({}, Packet(flow, true, F | A | P | U, 0), 4).status);
+  ASSERT_EQ(TcpState::kFinWait, ct->Find(key)->tcp);
 }
 
 }  // namespace
