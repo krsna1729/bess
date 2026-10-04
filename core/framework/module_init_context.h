@@ -118,7 +118,8 @@ class ModuleInitContext {
   framework::InstanceRegistry &instances_;
   rcu::RcuDomain &rcu_;
   PortDirectory ports_;
-  // Last: plugins built before it read the members above at unchanged offsets.
+  // Appended in order (M25, then TP4): plugins built before each read the
+  // members above it at unchanged offsets.
   stats::MetricRegistry &metrics_;
   framework::RequestHub &requests_;
 };
