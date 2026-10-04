@@ -14,7 +14,7 @@
     "bess_execution": ["bess_eal", "bess_packet", "bess_dataplane_core", "bess_rcu", "bess_stats", "bess_utils", "bess_proto"],
     "bess_framework": ["bess_execution", "bess_eal", "bess_packet", "bess_dataplane_core", "bess_rcu", "bess_stats", "bess_utils", "bess_proto"],
     "bess_control": ["bess_framework", "bess_execution", "bess_eal", "bess_dataplane_core", "bess_rcu", "bess_stats", "bess_utils", "bess_proto"],
-    "bess_host": ["bess_control", "bess_framework", "bess_execution", "bess_eal", "bess_gate_hooks", "bess_dataplane_core", "bess_rcu", "bess_utils", "bess_proto"],
+    "bess_host": ["bess_control", "bess_framework", "bess_execution", "bess_eal", "bess_gate_hooks", "bess_dataplane_core", "bess_rcu", "bess_stats", "bess_utils", "bess_proto"],
     "bess_modules": ["bess_framework", "bess_execution", "bess_eal", "bess_classifier", "bess_flow", "bess_meter", "bess_route", "bess_stats", "bess_dataplane_core", "bess_packet", "bess_rcu", "bess_utils", "bess_proto"],
     "bess_drivers": ["bess_framework", "bess_execution", "bess_eal", "bess_utils", "bess_proto"],
     "bess_gate_hooks": ["bess_framework", "bess_execution", "bess_stats", "bess_utils", "bess_proto"],
