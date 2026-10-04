@@ -27,6 +27,7 @@ const (
 	Control_ApplyPipeline_FullMethodName            = "/bess.pb.v2.Control/ApplyPipeline"
 	Control_ApplyTransaction_FullMethodName         = "/bess.pb.v2.Control/ApplyTransaction"
 	Control_GetTransaction_FullMethodName           = "/bess.pb.v2.Control/GetTransaction"
+	Control_ListMetrics_FullMethodName              = "/bess.pb.v2.Control/ListMetrics"
 	Control_ListTransactionResources_FullMethodName = "/bess.pb.v2.Control/ListTransactionResources"
 )
 
@@ -41,6 +42,7 @@ type ControlClient interface {
 	ApplyPipeline(ctx context.Context, in *ApplyPipelineRequest, opts ...grpc.CallOption) (*ApplyPipelineResponse, error)
 	ApplyTransaction(ctx context.Context, in *ApplyTransactionRequest, opts ...grpc.CallOption) (*ApplyTransactionResponse, error)
 	GetTransaction(ctx context.Context, in *GetTransactionRequest, opts ...grpc.CallOption) (*GetTransactionResponse, error)
+	ListMetrics(ctx context.Context, in *ListMetricsRequest, opts ...grpc.CallOption) (*ListMetricsResponse, error)
 	ListTransactionResources(ctx context.Context, in *ListTransactionResourcesRequest, opts ...grpc.CallOption) (*ListTransactionResourcesResponse, error)
 }
 
@@ -122,6 +124,16 @@ func (c *controlClient) GetTransaction(ctx context.Context, in *GetTransactionRe
 	return out, nil
 }
 
+func (c *controlClient) ListMetrics(ctx context.Context, in *ListMetricsRequest, opts ...grpc.CallOption) (*ListMetricsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListMetricsResponse)
+	err := c.cc.Invoke(ctx, Control_ListMetrics_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *controlClient) ListTransactionResources(ctx context.Context, in *ListTransactionResourcesRequest, opts ...grpc.CallOption) (*ListTransactionResourcesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListTransactionResourcesResponse)
@@ -143,6 +155,7 @@ type ControlServer interface {
 	ApplyPipeline(context.Context, *ApplyPipelineRequest) (*ApplyPipelineResponse, error)
 	ApplyTransaction(context.Context, *ApplyTransactionRequest) (*ApplyTransactionResponse, error)
 	GetTransaction(context.Context, *GetTransactionRequest) (*GetTransactionResponse, error)
+	ListMetrics(context.Context, *ListMetricsRequest) (*ListMetricsResponse, error)
 	ListTransactionResources(context.Context, *ListTransactionResourcesRequest) (*ListTransactionResourcesResponse, error)
 	mustEmbedUnimplementedControlServer()
 }
@@ -174,6 +187,9 @@ func (UnimplementedControlServer) ApplyTransaction(context.Context, *ApplyTransa
 }
 func (UnimplementedControlServer) GetTransaction(context.Context, *GetTransactionRequest) (*GetTransactionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetTransaction not implemented")
+}
+func (UnimplementedControlServer) ListMetrics(context.Context, *ListMetricsRequest) (*ListMetricsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListMetrics not implemented")
 }
 func (UnimplementedControlServer) ListTransactionResources(context.Context, *ListTransactionResourcesRequest) (*ListTransactionResourcesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListTransactionResources not implemented")
@@ -325,6 +341,24 @@ func _Control_GetTransaction_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_ListMetrics_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListMetricsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).ListMetrics(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_ListMetrics_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).ListMetrics(ctx, req.(*ListMetricsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Control_ListTransactionResources_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListTransactionResourcesRequest)
 	if err := dec(in); err != nil {
@@ -377,6 +411,10 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetTransaction",
 			Handler:    _Control_GetTransaction_Handler,
+		},
+		{
+			MethodName: "ListMetrics",
+			Handler:    _Control_ListMetrics_Handler,
 		},
 		{
 			MethodName: "ListTransactionResources",
