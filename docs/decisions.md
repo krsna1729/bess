@@ -5733,12 +5733,25 @@ loopback source answered (added after review).
 (pair count, the `Batch32` framing, the interrupt note, unsourced numbers) and `BuildIcmpv4Error` answering a
 loopback or 0/8 source, with the caller's duties undocumented. Round 2: correct, go, no findings.
 
-**Not done.** Transactional groups; IPv6 FIB; a resolver module (ARP/ND state machine and timers); ND packet
+**Not done.** IPv6 FIB; a resolver module (ARP/ND state machine and timers); ND packet
 helpers; fragmentation; an L3 interface table (MTU and address per `InterfaceId`): the MTU check takes the MTU
 as an argument, and a `NextHop` has no room for one at 16 bytes (D-060).
 
 **Revisit when:** a consumer needs groups under transactions; M16 lands selection algorithms (then `Select`
 becomes one of them); an IPv6 backend is chosen.
+
+**Change (user decision 2026-10-04): transactional groups, still inside the Router.** With `max_groups`, `Enroll`
+registers a third resource, `<router>/groups` (key `EncodeKey(NextHopGroupId)`, value `NextHopGroup`), between next
+hops and routes. A group references its distinct members in `<router>/next_hops` (a repeated member, a weight, is
+one reference); a route's value is a `NextHopId` or a `NextHopGroupId` and references the next hop or the group it
+names. One transaction can now add next hops, a group over them and a route to it, or move a route off a group and
+remove the group: the engine orders the resources (next hops, groups, routes), checks every reference before
+anything is visible, and keeps a member or a group in use. Reserve checks the member count (1..`kMaxMembers`) and
+member ids before the slot table reads them. Enrolled, `GroupReferences` and `GroupMemberships` come from the
+engine's ledger (memberships count groups, not member positions), and `RouteReferences` counts routes only. The
+direct group setters refuse on an enrolled router (`kEnrolled`), and a router that already has groups cannot
+enroll. No shared group object: the user's choice until a second consumer exists (D-066). The lookup path is
+unchanged. EVIDENCE
 
 ## D-066 Member selection: shared algorithms, no shared group object (M16)
 

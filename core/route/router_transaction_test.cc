@@ -10,12 +10,14 @@
 
 #include <any>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <expected>
 #include <functional>
 #include <map>
 #include <new>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -56,16 +58,18 @@ int EgressOf(const Router &router, uint32_t dst) {
   return hop == nullptr ? -1 : static_cast<int>(hop->egress.value());
 }
 
+using MakeRouterFn = std::function<std::unique_ptr<Router>()>;
+
 class RouterTransactionTest : public ::testing::Test {
  protected:
   std::unique_ptr<Router> MakeRouter(uint32_t tbl8_groups = 64,
                                      size_t next_hops = 64,
-                                     size_t domains = 1) {
+                                     size_t domains = 1, size_t groups = 0) {
     LpmRouteTable::Config config;
     config.max_routes = 4096;
     config.tbl8_groups = tbl8_groups;
     auto router = Router::Create("rt", config, next_hops,
-                                 bess::runtime::runtime().rcu(), domains);
+                                 bess::runtime::runtime().rcu(), domains, groups);
     EXPECT_TRUE(router.has_value());
     // Domains are structural: they exist before the router is enrolled.
     for (uint32_t d = 1; d < domains; d++) {
@@ -118,9 +122,10 @@ TEST_F(RouterTransactionTest, EnrolledRoutersAreWrittenOnlyThroughTheEngine) {
   EXPECT_EQ(router->RouteReferences(NextHopId(1)), 1u);
 }
 
-// Next-hop groups are not transactional (D-065): a router with groups cannot
-// enroll, and an enrolled router refuses them.
-TEST_F(RouterTransactionTest, GroupsAndEnrollmentExcludeEachOther) {
+// Groups made through the direct API stay out of the engine's ledger: a router
+// that has them cannot enroll, and an enrolled router takes groups only
+// through transactions.
+TEST_F(RouterTransactionTest, DirectGroupsAndEnrollmentExcludeEachOther) {
   LpmRouteTable::Config config;
   auto made = Router::Create("rtg", config, 8, bess::runtime::runtime().rcu(),
                              /*max_domains=*/1, /*max_groups=*/4);
@@ -131,7 +136,7 @@ TEST_F(RouterTransactionTest, GroupsAndEnrollmentExcludeEachOther) {
   ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(1), members));
   auto enrolled = router->Enroll(engine_);
   ASSERT_FALSE(enrolled);
-  EXPECT_NE(enrolled.error().find("not transactional"), std::string::npos);
+  EXPECT_NE(enrolled.error().find("before adding next-hop groups"), std::string::npos);
 
   ASSERT_TRUE(router->RemoveNextHopGroup(NextHopGroupId(1)));
   Settle();
@@ -743,6 +748,308 @@ TEST(RouterLiveUpdateFaultTest, FailureAtEveryAllocationLeavesNoTrace) {
     // (removing a domain or a route, repointing one): zero points is a pass.
     std::printf("[router live] %s: %zu allocation sites failed in turn\n", name, points);
   }
+}
+
+
+// -- next-hop groups through transactions (user decision on D-065) ----------------
+
+// The egress a destination resolves to with `hash`, -1 for a miss.
+int EgressOfHashed(const Router &router, uint32_t dst, uint32_t hash) {
+  const NextHop *hop = router.Resolve(kDefaultRouteDomainId, dst, hash);
+  return hop == nullptr ? -1 : static_cast<int>(hop->egress.value());
+}
+
+// The set of egresses a group route spreads over, by sampling hashes.
+std::set<int> EgressesOf(const Router &router, uint32_t dst) {
+  std::set<int> seen;
+  for (uint32_t h = 0; h < 4096; h++) {
+    seen.insert(EgressOfHashed(router, dst, h * 0x9E3779B9u));
+  }
+  return seen;
+}
+
+TEST_F(RouterTransactionTest, GroupsNextHopsAndRoutesChangeInOneTransaction) {
+  auto router = MakeRouter(64, 64, 1, /*groups=*/8);
+  ASSERT_TRUE(router->Enroll(engine_));
+  EXPECT_EQ(router->groups_resource(), "rt/groups");
+  ASSERT_NE(router->groups_resource_object(), nullptr);
+  const NextHopId abc[] = {NextHopId(1), NextHopId(2), NextHopId(3)};
+  // Next hops, a group over them and a route to the group: one transaction.
+  auto r = Apply({router->SetNextHopOp(NextHopId(1), Hop(1)),
+                  router->SetNextHopOp(NextHopId(2), Hop(2)),
+                  router->SetNextHopOp(NextHopId(3), Hop(3)),
+                  router->SetNextHopGroupOp(NextHopGroupId(1), abc),
+                  router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                     NextHopGroupId(1))});
+  ASSERT_EQ(r.outcome, Outcome::kApplied);
+  EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{1, 2, 3}));
+  EXPECT_EQ(router->GroupReferences(NextHopGroupId(1)), 1u);
+  EXPECT_EQ(router->GroupMemberships(NextHopId(2)), 1u);
+  EXPECT_EQ(router->RouteReferences(NextHopId(2)), 0u) << "a member is not a route";
+
+  // Re-pointing the group's members and adding a next hop, atomically.
+  const NextHopId cd[] = {NextHopId(3), NextHopId(4)};
+  ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(4), Hop(4)),
+                   router->SetNextHopGroupOp(NextHopGroupId(1), cd)})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{3, 4}));
+  Settle();
+  // Next hops no group or route names any more can go.
+  ASSERT_EQ(Apply({router->RemoveNextHopOp(NextHopId(1)), router->RemoveNextHopOp(NextHopId(2))})
+                .outcome,
+            Outcome::kApplied);
+
+  // The route moves to a plain next hop and the group goes, in one transaction.
+  ASSERT_EQ(Apply({router->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(3)),
+                   router->RemoveNextHopGroupOp(NextHopGroupId(1))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(EgressOf(*router, Ip(10, 1, 1, 1)), 3);
+  Settle();
+  EXPECT_EQ(router->next_hop_group_count(), 0u);
+}
+
+TEST_F(RouterTransactionTest, GroupReferencesAreChecked) {
+  auto router = MakeRouter(64, 64, 1, /*groups=*/4);
+  ASSERT_TRUE(router->Enroll(engine_));
+  const NextHopId ab[] = {NextHopId(1), NextHopId(2), NextHopId(1)};  // 1 weighted twice
+  ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1)),
+                   router->SetNextHopOp(NextHopId(2), Hop(2)),
+                   router->SetNextHopGroupOp(NextHopGroupId(2), ab),
+                   router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                      NextHopGroupId(2))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(router->GroupMemberships(NextHopId(1)), 1u) << "a weight is not a second membership";
+  const auto gen = engine_.generation();
+  const auto rejected = [&](std::vector<Op> ops, const char *why) {
+    const auto res = Apply(std::move(ops));
+    EXPECT_NE(res.outcome, Outcome::kApplied) << why;
+    EXPECT_EQ(engine_.generation(), gen) << why << ": nothing applied";
+    EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{1, 2})) << why;
+  };
+  rejected({router->RemoveNextHopGroupOp(NextHopGroupId(2))}, "a group a route names");
+  rejected({router->RemoveNextHopOp(NextHopId(2))}, "a group's member");
+  const NextHopId missing[] = {NextHopId(1), NextHopId(9)};
+  rejected({router->SetNextHopGroupOp(NextHopGroupId(3), missing)}, "an unknown member");
+  rejected({router->SetRouteOp(kDefaultRouteDomainId, P(Ip(20, 0, 0, 0), 8), NextHopGroupId(3))},
+           "a route to an unknown group");
+  rejected({router->SetNextHopGroupOp(NextHopGroupId(5), ab)}, "a group id past max_groups");
+  // max_next_hops (64) + this id wraps to next hop 1's FIB value.
+  rejected({router->SetRouteOp(kDefaultRouteDomainId, P(Ip(20, 0, 0, 0), 8),
+                               NextHopGroupId(0xFFFFFFFFu - 62))},
+           "a group id that wraps the FIB value");
+  EXPECT_EQ(EgressOf(*router, Ip(20, 0, 0, 1)), -1);
+  rejected({router->SetNextHopGroupOp(NextHopGroupId(3), std::span<const NextHopId>())},
+           "an empty group");
+  std::vector<NextHopId> many(NextHopGroup::kMaxMembers + 1, NextHopId(1));
+  rejected({router->SetNextHopGroupOp(NextHopGroupId(3), many)}, "too many members");
+  // A good op with a bad one: the whole transaction is refused.
+  rejected({router->SetNextHopOp(NextHopId(3), Hop(3)),
+            router->SetNextHopGroupOp(NextHopGroupId(3), missing)},
+           "mixed transaction");
+  EXPECT_EQ(EgressOf(*router, Ip(30, 0, 0, 1)), -1);
+
+  // The direct setters belong to an unenrolled router.
+  EXPECT_EQ(router->SetNextHopGroup(NextHopGroupId(3), ab).error(), RouteError::kEnrolled);
+  EXPECT_EQ(router->RemoveNextHopGroup(NextHopGroupId(2)).error(), RouteError::kEnrolled);
+  EXPECT_EQ(router->SetRoute(kDefaultRouteDomainId, P(Ip(20, 0, 0, 0), 8), NextHopGroupId(2))
+                .error(),
+            RouteError::kEnrolled);
+}
+
+TEST_F(RouterTransactionTest, RoutersWithoutGroupsRefuseGroupOps) {
+  auto router = MakeRouter();  // max_groups 0
+  ASSERT_TRUE(router->Enroll(engine_));
+  EXPECT_EQ(router->groups_resource_object(), nullptr);
+  ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1))}).outcome, Outcome::kApplied);
+  const NextHopId one[] = {NextHopId(1)};
+  EXPECT_NE(Apply({router->SetNextHopGroupOp(NextHopGroupId(1), one)}).outcome,
+            Outcome::kApplied);
+  EXPECT_NE(Apply({router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                      NextHopGroupId(1))})
+                .outcome,
+            Outcome::kApplied);
+}
+
+// A reader resolving through groups while transactions replace members, move
+// routes between groups and next hops, and retire groups: every answer is one
+// of the next hops some committed state allowed for that destination.
+TEST_F(RouterTransactionTest, ReadersResolveThroughGroupsWhileTransactionsRun) {
+  auto router = MakeRouter(64, 64, 1, /*groups=*/4);
+  ASSERT_TRUE(router->Enroll(engine_));
+  std::vector<Op> setup;
+  for (uint32_t i = 1; i <= 6; i++) {
+    setup.push_back(router->SetNextHopOp(NextHopId(i), Hop(i)));
+  }
+  const NextHopId g1[] = {NextHopId(1), NextHopId(2)};
+  setup.push_back(router->SetNextHopGroupOp(NextHopGroupId(1), g1));
+  setup.push_back(router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                     NextHopGroupId(1)));
+  ASSERT_EQ(Apply(setup).outcome, Outcome::kApplied);
+
+  rcu::RcuDomain &rcu = bess::runtime::runtime().rcu();
+  const rcu::ReaderId reader_id = 61;
+  ASSERT_TRUE(rcu.Register(reader_id).has_value());
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> bad{0}, reads{0};
+  std::thread reader([&] {
+    rcu.Online(reader_id);
+    uint32_t h = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      const int e = EgressOfHashed(*router, Ip(10, 2, 3, 4), h++ * 0x9E3779B9u);
+      // Every next hop 1..6 is a legal answer at some point; a miss is not
+      // (the route always names a group or a next hop that exists).
+      if (e < 1 || e > 6) {
+        bad++;
+      }
+      reads++;
+      rcu.Quiescent(reader_id);
+    }
+    rcu.Offline(reader_id);
+  });
+  std::mt19937 rng(65);
+  size_t applied = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+  const auto hard = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  uint32_t current = 1;  // the group the route names; 0: a next hop
+  while ((std::chrono::steady_clock::now() < deadline || applied < 200) &&
+         std::chrono::steady_clock::now() < hard) {
+    std::vector<Op> ops;
+    const uint32_t other = current == 1 ? 2 : 1;
+    std::vector<NextHopId> members;
+    for (uint32_t m = 0, n = 1 + rng() % 4; m < n; m++) {
+      members.push_back(NextHopId(1 + rng() % 6));
+    }
+    switch (rng() % 3) {
+      case 0:  // new members for the current group
+        if (current != 0) {
+          ops.push_back(router->SetNextHopGroupOp(NextHopGroupId(current), members));
+        }
+        break;
+      case 1:  // the route moves to the other group, the old group goes
+        ops.push_back(router->SetNextHopGroupOp(NextHopGroupId(other), members));
+        ops.push_back(router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                         NextHopGroupId(other)));
+        if (current != 0) {
+          ops.push_back(router->RemoveNextHopGroupOp(NextHopGroupId(current)));
+        }
+        current = other;
+        break;
+      default:  // the route moves to a plain next hop, the group goes
+        ops.push_back(router->SetRouteOp(P(Ip(10, 0, 0, 0), 8), members[0]));
+        if (current != 0) {
+          ops.push_back(router->RemoveNextHopGroupOp(NextHopGroupId(current)));
+        }
+        current = 0;
+        break;
+    }
+    if (ops.empty()) {
+      continue;
+    }
+    const auto r = Apply(ops);
+    if (r.outcome == Outcome::kApplied) {
+      applied++;
+    } else {
+      // Only a group id still retiring may refuse: undo the bookkeeping.
+      bool retiring = r.outcome == Outcome::kBusy;
+      for (const auto &op : r.ops) {
+        retiring |= op.error.find("retiring") != std::string::npos;
+      }
+      if (!retiring) {
+        ADD_FAILURE() << "unexpected rejection";
+        break;
+      }
+      current = router->GroupReferences(NextHopGroupId(1)) != 0   ? 1
+                : router->GroupReferences(NextHopGroupId(2)) != 0 ? 2
+                                                                  : 0;
+      engine_.ReclaimRetired();
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+  }
+  stop = true;
+  reader.join();
+  rcu.Unregister(reader_id);
+  EXPECT_EQ(bad.load(), 0u) << "of " << reads.load();
+  EXPECT_GE(applied, 200u);
+  EXPECT_GT(reads.load(), 0u);
+}
+
+TEST_F(RouterTransactionTest, GroupTransactionFailureAtEveryAllocationLeavesNoTrace) {
+  struct Run {
+    TransactionEngine engine{bess::runtime::runtime().rcu()};
+    std::unique_ptr<Router> router;
+    std::vector<Op> ops;
+    std::string State() const {
+      std::string s = std::to_string(router->route_count()) + "/" +
+                      std::to_string(router->next_hop_count()) + "/" +
+                      std::to_string(router->next_hop_group_count()) + "/g" +
+                      std::to_string(engine.generation());
+      for (uint32_t h = 0; h < 16; h++) {
+        s += " " + std::to_string(EgressOfHashed(*router, Ip(10, 0, 0, 1), h * 0x9E3779B9u));
+      }
+      for (uint32_t g = 1; g <= 2; g++) {
+        s += " g" + std::to_string(router->GroupReferences(NextHopGroupId(g)));
+      }
+      return s;
+    }
+  };
+  std::vector<NextHopId> ab = {NextHopId(1), NextHopId(2)};
+  std::vector<NextHopId> bc = {NextHopId(2), NextHopId(3)};
+  const auto prepare = [&](Run &run, MakeRouterFn make) {
+    run.router = make();
+    Router &router = *run.router;
+    ASSERT_TRUE(router.Enroll(run.engine));
+    ASSERT_EQ(run.engine
+                  .Apply(std::vector<Op>{router.SetNextHopOp(NextHopId(1), Hop(1)),
+                                         router.SetNextHopOp(NextHopId(2), Hop(2)),
+                                         router.SetNextHopGroupOp(NextHopGroupId(1), ab),
+                                         router.SetRouteOp(kDefaultRouteDomainId,
+                                                           P(Ip(10, 0, 0, 0), 8),
+                                                           NextHopGroupId(1))})
+                  .outcome,
+              Outcome::kApplied);
+    run.ops = {router.SetNextHopOp(NextHopId(3), Hop(3)),
+               router.SetNextHopGroupOp(NextHopGroupId(2), bc),
+               router.SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8), NextHopGroupId(2)),
+               router.RemoveNextHopGroupOp(NextHopGroupId(1))};
+  };
+  const MakeRouterFn make = [&] { return MakeRouter(64, 64, 1, 4); };
+  std::string applied;
+  {
+    Run reference;
+    prepare(reference, make);
+    ASSERT_EQ(reference.engine.Apply(reference.ops).outcome, Outcome::kApplied);
+    applied = reference.State();
+  }
+  const size_t points = fault_injection::ForEachFailurePoint([&](size_t k) {
+    SCOPED_TRACE(testing::Message() << "failing allocation " << k);
+    Run run;
+    prepare(run, make);
+    ASSERT_FALSE(testing::Test::HasFailure());
+    const std::string before = run.State();
+    bool threw = false;
+    TransactionEngine::Result result;
+    {
+      const fault_injection::AllocationFaults window(k);
+      try {
+        result = run.engine.Apply(run.ops);
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+    }
+    if (!threw) {
+      ASSERT_EQ(result.outcome, Outcome::kApplied);
+      ASSERT_EQ(applied, run.State());
+      return;
+    }
+    ASSERT_EQ(run.State(), before) << "a failed allocation left a trace";
+    ASSERT_EQ(run.engine.Apply(run.ops).outcome, Outcome::kApplied);
+    ASSERT_EQ(applied, run.State());
+  });
+  std::printf("[router groups] %zu failure points\n", points);
+  EXPECT_GT(points, 10u);
 }
 
 }  // namespace
