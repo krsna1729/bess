@@ -270,6 +270,11 @@ class ConcurrentExactTable {
 
   // -- reader -------------------------------------------------------------------
 
+  // The read path's two parts, for a wrapper that inlines it without this
+  // header (flow::SharedExactIndex): the DPDK table and the batch hash.
+  rte_hash *dpdk_table() const noexcept { return table_; }
+  detail::HashBatchFn hash_batch() const noexcept { return hash_batch_; }
+
   // Looks up `n` (<= 64) keys packed at `stride` bytes. Writes values[i] and
   // sets bit i for each hit; misses leave values[i] untouched.
   //
@@ -278,11 +283,6 @@ class ConcurrentExactTable {
   // hash each key through its hash-function pointer into the generic,
   // any-length rte_hash_crc (~20% of a WildcardMatch lookup, profiled). Same
   // hash, same probe, same concurrency protocol (Decision D-015).
-  // The read path's two parts, for a wrapper that inlines it without this
-  // header (flow::SharedExactIndex): the DPDK table and the batch hash.
-  rte_hash *dpdk_table() const noexcept { return table_; }
-  detail::HashBatchFn hash_batch() const noexcept { return hash_batch_; }
-
   uint64_t LookupBatch(ConstBytes keys, size_t stride, uint64_t *values,
                        size_t n) const noexcept {
     promise(n <= 64);
