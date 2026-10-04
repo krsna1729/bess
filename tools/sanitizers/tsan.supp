@@ -12,3 +12,8 @@ race:CmpFixed
 # counters, ownership and packets stay instrumented.
 race:__rte_ring_dequeue_elems
 race:__rte_ring_enqueue_elems
+# rte_lpm: a tbl8 group is reused only after a grace period, ordered by the
+# QSBR defer queue inside librte_lpm (uninstrumented); TSan sees the group's
+# re-initialising memset and an inline lookup's read, not the grace period
+# between them. The route tests check every concurrent answer (D-046, D-047).
+race:rte_lpm_lookup

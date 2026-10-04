@@ -6378,8 +6378,8 @@ decision cache's generations, and no static analysis beyond the layering checks.
 - **TSan, targeted.** `clang-tsan` builds with `RTE_USE_C11_MEM_MODEL RTE_FORCE_INTRINSICS` and runs the concurrency
   tests in `tools/sanitizers/tsan_tests.txt` (RCU, object tables, scopes, the transaction engine, handoff,
   continuations, shared flow table, decision cache, stats, L2 table, routes, concurrent exact table, MCS lock), with
-  two suppressions (rte_hash's uninstrumented key compare; rte_ring's element copies, ordered by standalone
-  fences TSan does not model). FDB, neighbor table, expiry wheel, offload owner and the
+  three suppressions (rte_hash's uninstrumented key compare; rte_ring's element copies, ordered by standalone
+  fences TSan does not model; rte_lpm's tbl8 reuse, ordered by a QSBR defer queue inside uninstrumented librte_lpm). FDB, neighbor table, expiry wheel, offload owner and the
   instance registry are single-owner by contract; their publication is covered through RCU, Router and transactions.
 - **Fuzzing.** Ten libFuzzer harnesses (packet cursor, mutation, checksum plan, classifier schema, resource codec,
   route prefix, conntrack, NAT, tunnel decap, control transactions), each with an oracle beyond "no crash", none
