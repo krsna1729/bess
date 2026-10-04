@@ -19,7 +19,7 @@ constinit thread_local Window *t_window = nullptr;
 std::atomic<size_t> g_injected{0};
 
 // Null when the thread's window refuses the allocation (or malloc fails).
-void *Allocate(std::size_t n, std::size_t align) noexcept {
+[[maybe_unused]] void *Allocate(std::size_t n, std::size_t align) noexcept {
   if (Window *w = t_window; w != nullptr && w->allocations++ == w->fail_at) {
     w->injected = true;
     g_injected.fetch_add(1, std::memory_order_relaxed);
@@ -38,14 +38,14 @@ void *Allocate(std::size_t n, std::size_t align) noexcept {
   return std::aligned_alloc(align, (n + align - 1) / align * align);
 }
 
-void *AllocateOrThrow(std::size_t n, std::size_t align) {
+[[maybe_unused]] void *AllocateOrThrow(std::size_t n, std::size_t align) {
   if (void *p = Allocate(n, align)) {
     return p;
   }
   throw std::bad_alloc();
 }
 
-void Release(void *p) noexcept {
+[[maybe_unused]] void Release(void *p) noexcept {
   if (p == nullptr) {
     return;
   }
@@ -70,6 +70,12 @@ size_t InjectedFailures() noexcept {
 }
 
 }  // namespace bess::fault_injection
+
+// ThreadSanitizer's runtime defines the global allocation functions itself
+// (strongly), so a TSan build cannot replace them: there the windows see no
+// allocation and inject nothing, and the TSan lane runs these binaries' concurrency tests
+// only (tools/ci_profile.py tsan, M22).
+#ifndef BESS_ALLOCATION_FAULTS_DISABLED
 
 using bess::fault_injection::internal::Allocate;
 using bess::fault_injection::internal::AllocateOrThrow;
@@ -114,3 +120,5 @@ void operator delete[](void *p, std::align_val_t, const std::nothrow_t &) noexce
 }
 
 #pragma GCC diagnostic pop
+
+#endif  // BESS_ALLOCATION_FAULTS_DISABLED

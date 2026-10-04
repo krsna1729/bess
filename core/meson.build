@@ -717,6 +717,8 @@ allocation_faults_lib = static_library(
   'testing/allocation_faults.cc',
   include_directories: core_include,
   dependencies: [gtest_dep],
+  # TSan's runtime owns operator new/delete: no replacement there (D-072).
+  cpp_args: get_option('b_sanitize').contains('thread') ? ['-DBESS_ALLOCATION_FAULTS_DISABLED'] : [],
 )
 allocation_fault_tests = [
   'dataplane/continuation_test.cc',
@@ -771,6 +773,18 @@ foreach source : unit_test_sources
   if source in allocation_fault_tests
     test_link_whole = [test_link_whole, allocation_faults_lib]
   endif
+  # Sanitizer exclusions, each scoped to one test and with its reason (M22,
+  # D-072); everything else in the test stays instrumented.
+  test_cpp_args = []
+  if get_option('b_sanitize').contains('address') and source == 'utils/bpf_program_test.cc'
+    # DPDK's BPF JIT (uninstrumented) faults when the test's mbuf chain lives
+    # on ASan's fake stack (use-after-return detection); the same test passes
+    # with a real stack frame. Open question whether the JIT reads past the
+    # chain: tracked as a follow-up in D-072.
+    # (get_supported_arguments cannot test this flag: it needs -fsanitize=address.)
+    test_cpp_args += cpp.get_id() == 'clang' ? ['-fsanitize-address-use-after-return=never']
+                                             : ['--param=asan-use-after-return=0']
+  endif
   # The test main is ours (core/gtest_main.cc) rather than the packaged one:
   # it configures the death-test style and keeps expected-death children from
   # writing core dumps.
@@ -779,6 +793,7 @@ foreach source : unit_test_sources
     source,
     'gtest_main.cc',
     include_directories: core_include,
+    cpp_args: test_cpp_args,
     link_with: test_link_with,
     link_whole: test_link_whole,
     dependencies: runtime_deps + [gtest_dep],
@@ -951,13 +966,6 @@ if get_option('build_fuzzers')
   if fuzz_with_libfuzzer and not get_option('cpp_args').contains('-fsanitize=fuzzer-no-link')
     warning('build_fuzzers: library code has no coverage instrumentation; ' +
             'configure with -Dcpp_args=-fsanitize=fuzzer-no-link (docs/fuzzing.md)')
-  endif
-  # protobuf's headers switch generated messages to a different global layout
-  # under ASan; the system libprotobuf is not built that way, so descriptors
-  # come back null (resource_codec, control_transaction crash on any input).
-  if get_option('b_sanitize').contains('address') and not get_option('cpp_args').contains('-DPROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT')
-    warning('build_fuzzers: ASan without -DPROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT ' +
-            'in cpp_args breaks protobuf descriptors (docs/fuzzing.md)')
   endif
   # name: extra libraries beyond component_runtime_whole.
   fuzz_targets = {

@@ -98,8 +98,11 @@ inline int l2_init(struct l2_table *l2tbl, int size, int bucket) {
 
   // 64-byte aligned, so every 4-slot (32-byte) bucket is 32-byte aligned for
   // the vector probe and never straddles a cache line.
+  // aligned_alloc needs a size that is a multiple of the alignment (C11;
+  // ASan enforces it): a table of one bucket is 32 bytes.
   const size_t bytes = sizeof(l2_entry) * static_cast<size_t>(size) * bucket;
-  l2tbl->table = static_cast<l2_entry *>(std::aligned_alloc(64, bytes));
+  const size_t alloc_bytes = (bytes + 63) & ~size_t{63};
+  l2tbl->table = static_cast<l2_entry *>(std::aligned_alloc(64, alloc_bytes));
   if (l2tbl->table == nullptr) {
     return -ENOMEM;
   }

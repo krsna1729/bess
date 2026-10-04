@@ -19,15 +19,13 @@ The Meson option `build_fuzzers` (default false) adds the harnesses.
       CC=clang CXX=clang++ meson setup build/fuzz --buildtype=debug \
         -Db_sanitize=address,undefined -Db_lundef=false \
         -Dbuild_fuzzers=true -Dbuild_benchmarks=false \
-        "-Dcpp_args=-fsanitize=fuzzer-no-link -fno-sanitize-recover=undefined -DPROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT"
+        "-Dcpp_args=-fsanitize=fuzzer-no-link -fno-sanitize-recover=undefined"
       ninja -C build/fuzz fuzzers
 
   `-fno-sanitize-recover=undefined` makes UBSan findings abort, so the fuzzer
-  reports them. `PROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT` keeps generated
-  protobuf code on the message layout the (uninstrumented) system libprotobuf
-  uses; without it protobuf's headers pick an ASan-only layout and every
-  descriptor is null. The DPDK EAL does not start under ASan, which is why
-  the harnesses never need it. libFuzzer builds also link
+  reports them. Every ASan build adds `PROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT`
+  (root meson.build): it keeps generated protobuf code on the message layout the
+  (uninstrumented) system libprotobuf uses. The harnesses need no DPDK EAL. libFuzzer builds also link
   `core/fuzz/libfuzzer_options.cc`, which turns off ASan's
   alloc-dealloc-mismatch check: the packaged libFuzzer runtime brings its own
   aligned `operator delete` that is linked ahead of ASan's.

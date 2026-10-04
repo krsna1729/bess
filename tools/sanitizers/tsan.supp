@@ -1,0 +1,7 @@
+# ThreadSanitizer suppressions (M22, D-072). Each entry names code TSan cannot
+# see the synchronisation of, with the reason. Keep this list short.
+#
+# rte_hash's lock-free lookup pairs its key compare with a version counter
+# read in DPDK code built without TSan instrumentation; TSan sees only the
+# BESS-side compare of the key bytes (decisions.md, M9 TSan run).
+race:CmpFixed

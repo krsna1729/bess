@@ -98,6 +98,22 @@ jobs:
             experimental: true
             cc: clang-19
             cxx: clang++-19
+          # Sanitizers (M22, D-072): ASan+UBSan over the unit, architecture,
+          # plugin and fuzz-corpus suites; TSan over the concurrency tests in
+          # tools/sanitizers/tsan_tests.txt. Experimental until green, then
+          # gating.
+          - name: clang-asan
+            os: ubuntu-24.04
+            experimental: true
+            cc: clang-19
+            cxx: clang++-19
+            lane_args: --sanitize address
+          - name: clang-tsan
+            os: ubuntu-24.04
+            experimental: true
+            cc: clang-19
+            cxx: clang++-19
+            lane_args: --sanitize thread
           - name: gcc-u26
             os: ubuntu-26.04
             experimental: true
@@ -157,6 +173,9 @@ jobs:
 
       - name: Check layer include dependencies
         run: python3 tools/ci_profile.py layers $LANE
+
+      - name: Curated clang-tidy (clang-asan lane only)
+        run: python3 tools/ci_profile.py tidy $LANE
 
       - name: Run all Meson tests
         run: python3 tools/ci_profile.py test $LANE

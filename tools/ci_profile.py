@@ -54,7 +54,12 @@ PINS = {
     'gcc': ('gcc-14', 'g++-14'),
     'clang': ('clang-19', 'clang++-19'),
 }
-LANE_SUFFIXES = ('-arm64', '-generic')
+LANE_SUFFIXES = ('-arm64', '-generic', '-asan', '-tsan')
+# Sanitizer lanes (M22, D-072): --sanitize picks the build and the test step.
+SANITIZERS = {'address': '-asan', 'thread': '-tsan'}
+# TSan needs DPDK's C11 atomics and no x86 inline asm in the headers BESS
+# inlines, or it reports the ring and spinlock code as races.
+TSAN_DPDK_ARGS = '-DRTE_USE_C11_MEM_MODEL -DRTE_FORCE_INTRINSICS'
 FALLBACK = {
     'gcc': ('gcc', 'g++'),
     'clang': ('clang', 'clang++'),
@@ -100,6 +105,14 @@ def meson_options(s):
     ]
     if s.arch_generic:
         options.append('-Darch_generic=true')
+    if s.sanitize == 'address':
+        # Benchmarks are timing code: built and run in the other lanes.
+        options += ['-Db_sanitize=address,undefined', '-Db_lundef=false',
+                    '-Dbuild_benchmarks=false']
+    elif s.sanitize == 'thread':
+        options += ['-Db_sanitize=thread', '-Db_lundef=false',
+                    '-Dbuild_benchmarks=false',
+                    f'-Dcpp_args={TSAN_DPDK_ARGS}', f'-Dc_args={TSAN_DPDK_ARGS}']
     return options
 
 
@@ -115,6 +128,7 @@ class Setup:
                              '--dry-run and info can show another architecture')
         self.cpu = cpu_floor(self.arch)
         self.arch_generic = args.arch_generic
+        self.sanitize = args.sanitize
         family = args.compiler
         if args.cc or args.cxx:
             if not (args.cc and args.cxx and args.name):
@@ -135,7 +149,8 @@ class Setup:
                     f'so {self.cxx} ({self.version(self.cxx)}) is used instead. '
                     'A diagnostic that exists in only one compiler version can '
                     'still differ from CI.')
-            self.name = args.name or (f'ci-{family}' + ('-generic' if self.arch_generic else ''))
+            self.name = args.name or (f'ci-{family}' + ('-generic' if self.arch_generic else '')
+                                      + SANITIZERS.get(self.sanitize, ''))
         self.build_dir = ROOT / 'build' / self.name
         self.stage = ROOT / 'build' / f'stage-{self.name}'
         self.standalone = ROOT / 'build' / f'standalone-{self.name}'
@@ -177,6 +192,13 @@ class Setup:
              '--variant', self.variant, '--print-pkg-config-path'],
             capture_output=True, text=True, check=True, env=self.env)
         return out.stdout.strip()
+
+    def dpdk_libdir(self):
+        if self.dry_run:
+            return ''
+        return subprocess.run(['pkg-config', '--variable=libdir', 'libdpdk'],
+                              capture_output=True, text=True, check=True,
+                              env=self.env_with_dpdk()).stdout.strip()
 
     def env_with_dpdk(self, *extra):
         env = self.env.copy()
@@ -228,11 +250,48 @@ def step_layers(s):
 
 
 def step_test(s):
+    if s.sanitize == 'address':
+        # Every unit, architecture, plugin and fuzz-corpus test under ASan and
+        # UBSan, halting on the first report. Explicit exclusions: benchmarks
+        # (not built) and the daemon suites `python` and `integration` (bessd
+        # under ASan is not yet a supported mode; D-072).
+        env = s.env_with_dpdk()
+        env['ASAN_OPTIONS'] = 'detect_leaks=1:halt_on_error=1:abort_on_error=1'
+        env['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
+        s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs',
+               '--no-suite', 'python', '--no-suite', 'integration',
+               '--timeout-multiplier', '6'], env=env)
+        return
+    if s.sanitize == 'thread':
+        step_test_tsan(s)
+        return
     s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs'],
           env=s.env_with_dpdk())
 
 
+def step_test_tsan(s):
+    env = s.env_with_dpdk()
+    env['TSAN_OPTIONS'] = ('suppressions=' + str(ROOT / 'tools/sanitizers/tsan.supp')
+                           + ' halt_on_error=1 second_deadlock_stack=1')
+    env['LD_LIBRARY_PATH'] = os.pathsep.join(
+        filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))
+    tests = []
+    for line in (ROOT / 'tools/sanitizers/tsan_tests.txt').read_text().splitlines():
+        line = line.split('#', 1)[0].strip()
+        if line:
+            name, *rest = line.split()
+            tests.append((name, rest[0] if rest else '*'))
+    s.run(['meson', 'compile', '-C', s.build_dir, '-j', s.jobs,
+           *[f'core/{name}' for name, _ in tests]], env=env)
+    for name, test_filter in tests:
+        s.run([s.build_dir / 'core' / name, f'--gtest_filter={test_filter}'], env=env,
+              cwd=s.build_dir / 'core')
+
+
 def step_verify_install(s):
+    if s.sanitize:
+        print('skipped: a sanitizer lane installs nothing (the gating lanes verify the install)')
+        return
     env = s.env_with_dpdk()
     s.run(['meson', 'install', '-C', s.build_dir, '--destdir', s.stage], env=env)
     if s.dry_run:
@@ -303,12 +362,24 @@ def step_clean_tree(s):
     print('source tree unchanged')
 
 
+def step_tidy(s):
+    # The curated clang-tidy gate (D-072) needs a clang compile database: it
+    # runs in the clang ASan lane, the one clang build with every library.
+    if s.sanitize != 'address':
+        print('skipped: clang-tidy runs in the clang-asan lane')
+        return
+    s.run([sys.executable, ROOT / 'tools' / 'check_tidy.py', '--self-test'])
+    s.run([sys.executable, ROOT / 'tools' / 'check_tidy.py', '--build-dir', s.build_dir,
+           '--jobs', s.jobs], env=s.env_with_dpdk())
+
+
 STEPS = [
     ('bootstrap', step_bootstrap),
     ('configure', step_configure),
     ('build', step_build),
     ('verify-dpdk', step_verify_dpdk),
     ('layers', step_layers),
+    ('tidy', step_tidy),
     ('test', step_test),
     ('verify-install', step_verify_install),
     ('clean-tree', step_clean_tree),
@@ -376,10 +447,12 @@ def info(s):
     print(f'compiler        {s.cxx}: {s.version(s.cxx)}')
     print(f'                {s.cc}: {s.version(s.cc)}')
     print(f'architecture    {s.arch}, cpu floor {s.cpu}'
-          + (', BESS_ARCH_GENERIC' if s.arch_generic else ''))
+          + (', BESS_ARCH_GENERIC' if s.arch_generic else '')
+          + (f', sanitizer {s.sanitize}' if s.sanitize else ''))
     print(f'build dir       {s.build_dir}')
     print(f'DPDK            profile {DPDK_PROFILE}, cpu {s.cpu}, variant {s.variant}')
-    print(f'meson options   {" ".join(meson_options(s))} (benchmarks on, default)')
+    print(f'meson options   {" ".join(meson_options(s))}'
+          + ('' if s.sanitize else ' (benchmarks on, default)'))
     print(f'jobs            {s.jobs}')
     divergences = list(s.notes)
     try:
@@ -459,6 +532,8 @@ def main():
                         help='show another architecture (only with --dry-run or info)')
     parser.add_argument('--arch-generic', action='store_true',
                         help='configure -Darch_generic=true (the gcc-generic lane)')
+    parser.add_argument('--sanitize', choices=sorted(SANITIZERS),
+                        help='a sanitizer lane: address (ASan+UBSan) or thread (TSan)')
     parser.add_argument('--jobs', type=int)
     parser.add_argument('--no-ccache', action='store_true',
                         help='local runs use ccache when installed; it does not '
