@@ -6,6 +6,10 @@ on:
     tags: ['v*']
   pull_request:
     branches: [master, develop]
+  # Nightly: every lane and the benchmark suite, on develop, even without a
+  # push (docs/ci-parity.md).
+  schedule:
+    - cron: '17 3 * * *'
 
 # A new push to a pull request cancels its older run; pushes to develop,
 # master and tags are never grouped (each run completes).
@@ -99,12 +103,21 @@ jobs:
     continue-on-error: ${{ matrix.experimental }}
     env:
       LANE: --cc ${{ matrix.cc }} --cxx ${{ matrix.cxx }} --name ${{ matrix.name }} ${{ matrix.lane_args }}
+      # Outside the checkout: the clean-tree step checks it is unchanged.
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_MAXSIZE: 500M
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPRESS: 'true'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.lanes.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The merge commit and its base parent: tidy checks a pull
+          # request's changed sources.
+          fetch-depth: 2
 
       # x86_64: glibc's ld.so lists the ISA levels the CPU supports; aarch64:
       # the kernel's /proc/cpuinfo features (tools/ci_profile.py check-cpu).
@@ -141,6 +154,16 @@ jobs:
 
       # The configuration and the verification steps live in tools/ci_profile.py,
       # which a developer runs unchanged (docs/ci-parity.md).
+      # Compiler cache per lane, saved by every run and restored from the
+      # newest (pull requests can read develop's). Keyed by commit so each run
+      # saves its own; the prefix restores the most recent.
+      - name: Cache compiler output
+        uses: actions/cache@v6
+        with:
+          path: /home/runner/.ccache
+          key: ccache-${{ matrix.name }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.name }}-${{ runner.arch }}-
+
       - name: Check the lanes' compiler pins
         run: python3 tools/ci_profile.py check-pins
 

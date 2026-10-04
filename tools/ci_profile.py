@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -202,7 +203,10 @@ class Setup:
                              f'{LOCAL_JOB_CAP}')
         self.jobs = jobs
         launcher = ''
-        if not self.in_ci and not args.no_ccache and shutil.which('ccache'):
+        # Local runs use ccache when installed; CI when the workflow restores
+        # a cache directory (CCACHE_DIR). It does not change the generated code.
+        if (not args.no_ccache and shutil.which('ccache')
+                and (not self.in_ci or os.environ.get('CCACHE_DIR'))):
             launcher = 'ccache '
         self.env = os.environ.copy()
         self.env['CC'] = launcher + self.cc
@@ -317,7 +321,12 @@ def step_test(s):
     if s.sanitize == 'thread':
         step_test_tsan(s)
         return
-    s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs'],
+    # Benchmarks are built in every lane; pull requests do not run them (at
+    # 0.001 s per case they measure nothing, and their setup was 80% of the
+    # test step). Pushes and the nightly run execute them.
+    skip = (['--no-suite', 'benchmarks']
+            if os.environ.get('GITHUB_EVENT_NAME') == 'pull_request' else [])
+    s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs', *skip],
           env=s.env_with_dpdk())
 
 
@@ -441,8 +450,35 @@ def step_tidy(s):
         print('skipped: clang-tidy runs in the clang-asan lane')
         return
     s.run([sys.executable, ROOT / 'tools' / 'check_tidy.py', '--self-test'])
+    files = []
+    changed = pull_request_changes()
+    if changed is not None:
+        if any(path.endswith(('.h', '.hh', '.hpp')) for path in changed) or any(
+                Path(path).name in ('meson.build', '.clang-tidy', 'tidy_baseline.json',
+                                    'check_tidy.py') for path in changed):
+            print('tidy: a header or the tidy configuration changed: every source')
+        else:
+            sources = [path for path in changed if path.endswith(('.cc', '.cpp'))]
+            if not sources:
+                print('skipped: the pull request changes no C++ source')
+                return
+            print(f'tidy: the {len(sources)} changed source(s) only (pushes check all)')
+            files = ['--files', '|'.join(re.escape(path) + '$' for path in sources)]
     s.run([sys.executable, ROOT / 'tools' / 'check_tidy.py', '--build-dir', s.build_dir,
-           '--jobs', s.jobs, '--strict'], env=s.env_with_dpdk())
+           '--jobs', s.jobs, '--strict', *files], env=s.env_with_dpdk())
+
+
+def pull_request_changes():
+    """The files a pull request changes, or None outside one. CI checks out
+    the merge commit, whose first parent is the base branch tip."""
+    if os.environ.get('GITHUB_EVENT_NAME') != 'pull_request':
+        return None
+    out = subprocess.run(['git', 'diff', '--name-only', 'HEAD^1', 'HEAD'], cwd=ROOT,
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        print('could not list the pull request\'s changes; checking everything')
+        return None
+    return [line for line in out.stdout.splitlines() if line]
 
 
 STEPS = [
@@ -616,7 +652,7 @@ def main():
                         help='a sanitizer lane: address (ASan+UBSan) or thread (TSan)')
     parser.add_argument('--jobs', type=int)
     parser.add_argument('--no-ccache', action='store_true',
-                        help='local runs use ccache when installed; it does not '
+                        help='ccache is used when installed (CI: when CCACHE_DIR is set); it does not '
                         'change the generated code')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--event', help='lanes: the GitHub event (pull_request, push)')

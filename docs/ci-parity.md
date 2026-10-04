@@ -67,6 +67,16 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   tags run every lane, adding arm64, generic and ubuntu-26.04 (`push_only`).
   A break those lanes catch shows up on the push and is fixed forward. A new
   push to a pull request cancels its older run.
+- **What a pull request skips.** Benchmarks are built in every lane but run
+  only on pushes and the nightly run (at 0.001 s per case they measure
+  nothing; their setup was 80% of a gating lane's test time). clang-tidy
+  checks only the changed C++ sources, or every source when a header, a
+  `meson.build` or the tidy configuration changes; pushes and the nightly run
+  check all. A nightly scheduled run (03:17 UTC) runs every lane and the
+  benchmarks on `develop`.
+- **Compiler cache.** CI restores a ccache per lane (keyed by commit, restored
+  from the newest; pull requests can read `develop`'s) and uses it when
+  `CCACHE_DIR` is set. Local runs use ccache when installed.
 - **DPDK's flags do not choose BESS's ISA.** `meson.build` drops every `-m`
   flag from libdpdk's cflags (prints them at configure) and stops on any flag
   it does not recognise. `bess-dev.pc` carries bessd's `-march` and the

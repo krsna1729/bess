@@ -156,7 +156,7 @@ def main():
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--strict", action="store_true",
                     help="fail when the baseline is another clang-tidy version's (CI: the pin must match)")
-    ap.add_argument("--files", help="only sources matching this regex (for local use; the gate runs all)")
+    ap.add_argument("--files", help="only sources (and findings) in files matching this regex; CI pull requests pass the changed files")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -184,7 +184,11 @@ def main():
         print(json.dumps(to_json(counts, major), indent=2))
         return 1 if args.strict else 0
     if args.files:
+        # Only the selected files are compared: findings a selected source
+        # reports in an unselected header are that header's, checked when it
+        # is selected (a changed header selects everything) or in a full run.
         baseline = {k: v for k, v in baseline.items() if re.search(args.files, k[0])}
+        counts = {k: v for k, v in counts.items() if re.search(args.files, k[0])}
     problems = compare(counts, baseline)
     if problems:
         print(f"FAILED: clang-tidy findings differ from {BASELINE.name} ({len(problems)} problem(s)):")
