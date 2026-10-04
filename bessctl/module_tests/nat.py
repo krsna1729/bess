@@ -143,6 +143,19 @@ class BessNatTest(BessModuleTestCase):
                              ('172.16.0.2', 33000))
             self.assertEqual((record.packets, record.bytes), (3, 300))
 
+    def test_nat_usage_commands_while_running(self):
+        # The usage commands run while the NAT's worker does (the log must be
+        # drainable under traffic, or a full log would stall expiry).
+        nat = NAT(ext_addrs=[{'ext_addr': '192.168.1.1'}], capacity=64, usage=True)
+        src = Source()
+        src -> nat -> Sink()
+        bess.resume_all()
+        try:
+            nat.request_usage_report()
+            nat.drain_usage()
+        finally:
+            bess.pause_all()
+
     def test_nat_selfconfig(self):
         # Send initial conf unsorted, see that it comes back sorted
         # (note that this is a bit different from other modules

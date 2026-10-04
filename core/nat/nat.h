@@ -751,11 +751,19 @@ class BasicNat {
           log_->Free() < slots) {
         return;
       }
+      if (report_table_ != table_.get()) {
+        // A walk resumes in the table it started on; after a growth the slots
+        // mean other bindings: start over (a mapping may be reported twice in
+        // that report, never missed).
+        report_table_ = table_.get();
+        cursor_report_ = 0;
+      }
       cursor_report_ = table_->VisitRange(cursor_report_, slots,
                                           [this](flow::FlowHandle, const Endpoint &,
                                                  const BindingT &b) { (void)Log(b, nullptr, false); });
       if (cursor_report_ >= table_->capacity()) {
         cursor_report_ = 0;
+        report_table_ = nullptr;
         report_requested_.store(false, std::memory_order_relaxed);
         reports_done_.fetch_add(1, std::memory_order_release);
       }
@@ -773,6 +781,9 @@ class BasicNat {
     }
     return n;
   }
+  // Final records that could not be logged: only a binding the larger table
+  // refused during shared growth, with the log full at that moment.
+  size_t usage_lost() const noexcept { return usage_lost_; }
   uint64_t reports_done() const noexcept {
     return reports_done_.load(std::memory_order_acquire);
   }
@@ -846,6 +857,9 @@ class BasicNat {
       // The flow gets a new mapping with its next outbound packet. Counted.
       for (const Endpoint &internal : unplaced) {
         if (const BindingT *b = old_->Find(internal)) {
+          if (!LogFinal(*b, nullptr)) {
+            usage_lost_++;  // the log is full and the binding cannot stay
+          }
           ports_.Release(PoolOf(b->address_index), b->external.protocol,
                          b->external.port.value());
           (void)old_->Erase(internal);
@@ -1149,6 +1163,8 @@ class BasicNat {
   std::atomic<bool> report_requested_{false};
   std::atomic<uint64_t> reports_done_{0};
   size_t cursor_report_ = 0;
+  const Table *report_table_ = nullptr;  // the table the current walk is on
+  size_t usage_lost_ = 0;
   typename Store::Lock lock_;
   rcu::RcuDomain *rcu_ = nullptr;
   // Shared: the tables published to lock-free readers (owned: unused).

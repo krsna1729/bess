@@ -153,6 +153,29 @@ TEST(NatUsageTest, CountsMoveWithAGrowingTable) {
   for (const auto &r : records) EXPECT_EQ(2u, r.packets) << r.internal.port.value();
 }
 
+// A report interrupted by growth starts over in the new table: every live
+// mapping is in it at least once (the slots it had walked mean other bindings
+// after the move).
+TEST(NatUsageTest, AReportInterruptedByGrowthMissesNoMapping) {
+  auto c = Config<CountedGrowableNat>(128, 4096);
+  c.max_capacity = 256;
+  auto nat = CountedGrowableNat::Create(c).value();
+  for (uint16_t port = 8000; port < 8096; port++) {  // 96: 3/4 of 128
+    auto out = Udp(0x0a000005, port, kRemote, 53);
+    ASSERT_EQ(Verdict::kTranslated, Send(*nat, out, Direction::kForward, 1));
+  }
+  nat->RequestReport();
+  (void)nat->Expire(1, 16);  // walks the first 64 slots
+  ASSERT_EQ(0u, nat->reports_done());
+  nat->Adopt(CountedGrowableNat::NewTable(nat->GrowthTarget()));
+  while (nat->MigrateSome(256) == nullptr) {
+  }
+  while (nat->reports_done() == 0) (void)nat->Expire(1, 16);
+  std::map<uint16_t, int> seen;
+  for (const auto &r : Drain(*nat)) seen[r.internal.port.value()]++;
+  EXPECT_EQ(96u, seen.size()) << "every mapping reported";
+}
+
 // Shared: four workers count one mapping set while the control thread grows
 // the table; after expiry the final records add up to every packet sent.
 TEST(NatUsageTest, SharedCountsAddUpAcrossWorkersAndGrowth) {
@@ -199,11 +222,11 @@ TEST(NatUsageTest, SharedCountsAddUpAcrossWorkersAndGrowth) {
   EXPECT_GE(grown, 4u);
   EXPECT_EQ(static_cast<size_t>(kFlows), nat->size());
   // End everything: one final record per mapping.
-  ASSERT_TRUE(domain.Register(9).has_value());
-  domain.Online(9);
+  ASSERT_TRUE(domain.Register(6).has_value());
+  domain.Online(6);
   ASSERT_EQ(static_cast<size_t>(kFlows), nat->Expire(~uint64_t{0} / 2, ~size_t{0}));
-  domain.Offline(9);
-  domain.Unregister(9);
+  domain.Offline(6);
+  domain.Unregister(6);
   uint64_t total = 0;
   for (const auto &r : Drain(*nat)) total += r.packets;
   EXPECT_EQ(sent.load(), total);

@@ -32,11 +32,13 @@ constexpr size_t kMigrateSlots = 64;
 const Commands NAT::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&NAT::GetInitialArg),
      Command::THREAD_SAFE},
-    // The usage log is single-consumer: these run under the control lock.
+    // While workers run: the usage log's one consumer is the control side
+    // (every module command holds the control-plane lock); a report request
+    // is one atomic flag.
     {"request_usage_report", "EmptyArg", MODULE_CMD_FUNC(&NAT::CommandRequestUsageReport),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_SAFE},
     {"drain_usage", "EmptyArg", MODULE_CMD_FUNC(&NAT::CommandDrainUsage),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_SAFE},
     {"get_runtime_config", "EmptyArg", MODULE_CMD_FUNC(&NAT::GetRuntimeConfig),
      Command::THREAD_SAFE},
     {"set_runtime_config", "EmptyArg", MODULE_CMD_FUNC(&NAT::SetRuntimeConfig),
