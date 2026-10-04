@@ -6470,8 +6470,15 @@ findings in 39 files outside any boundary; every translation unit that included 
 and asm constraints, build and CI); two optional findings taken: `__cacheline_aligned` kept a GNU attribute so it may
 follow a definition, and this record's checksum numbers updated to the final code.
 
-**Not done.** The 64-byte raw L4 checksum residual (0.27-0.6 ns), to be found with a profile rather than layout
-trials; ARM64 runs only in CI; on arm64 `rdtsc()` reads CNTVCT_EL0 (25 MHz to 1 GHz by part), so cycle-based
+**Change (2026-10-05, consolidation clawback): the 64-byte residual stays.** A third source-level variant moved the
+AVX2 block of `arch::SumWords32` out of line behind a `len >= 128` branch, so the small packets that never run it
+would not pay for its ymm state. Measured against develop (release, isolated CPU 2, 16 ABBA rounds, contamination
+flagged): every `RawBessContiguous` row 3-15% slower, including the rows that compute no checksum at all (+10%), and
+`ValidatedBess` 1.5 KB and 4 KB rows 6-11% slower: placement, not the checksum. Rejected, as the two out-of-line
+attempts before it. Without binary inspection (user, 2026-10-04) no further source-level lever is in sight; the
+residual is 0.3-0.6 ns on one benchmark row class and is closed here.
+
+**Not done.** The 64-byte raw L4 checksum residual (0.27-0.6 ns): closed as above; ARM64 runs only in CI; on arm64 `rdtsc()` reads CNTVCT_EL0 (25 MHz to 1 GHz by part), so cycle-based
 accounting is coarser there; NEON versions of the tag and word kernels (arm64 uses the portable loops; untestable here).
 
 **Revisit when:** the ARM64 lanes are green (make them gating); a profile shows an arm64 kernel worth specialising.

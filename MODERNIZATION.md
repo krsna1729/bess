@@ -5071,6 +5071,18 @@ rather than one call site).
      reclaimed objects, the reclamation backlog, online readers, transactions by outcome, generation, pending
      cascades); `control_v2.ListMetrics`; `tools/bess_prometheus.py`; `init_context().metrics()` behind
      `BESS_CAP_METRICS`. No packet-path change. Events (`WatchEvents`) are phase 2.
+164. **Direct pushes to develop, batches of ten (2026-10-04/05, user decision).** Work was pushed straight to `develop`
+     (rebased, no PRs), the reviewer agent reviewing every slice with its findings fixed in follow-up commits, and a
+     cleanup round after every ten pushes: the develop CI of the round's pushes, a full local regression of the tip
+     (unit, live daemon tests, the Go SDK's live test), worktree pruning. Cleanup 1 (push 11-13) found what CI had
+     not been able to show while each push cancelled the last run: the Go bindings not regenerated for ListMetrics,
+     the install-tree check starting a staged bessd without DPDK's library path, and a clang-analyzer finding in
+     PackedMacTable. Pushes 14-20: TP4 worker-to-control requests and the maintenance loop (D-077); NAT growth,
+     owned and shared, and SharedNat (D-078, D-079); TP8 symmetric RSS, the ConnTrack module and SharedConntrack
+     (D-080, D-081); M27.2 capability discovery (D-082); TP7 NAT usage counters (D-083); M25 phase 2 events (D-084);
+     the packet-parse fast path that closed most of the tunnel clawback (D-085); and a GCC dangling-reference fix in
+     GetCapabilities that CI's compiler flagged and the local one did not (push 18). Cleanup 2: 139/139 local with
+     every live test; the NAT binding shrink (D-068) and the checksum residual (D-071) measured and rejected.
 
 ## Review process established this session
 
