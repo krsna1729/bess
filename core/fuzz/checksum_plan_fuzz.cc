@@ -22,8 +22,8 @@
 //           (ctl as above without bits6-7, u16, u16) for an own outer and one
 //           for the inner domain when present
 //   packet  rest of the input (at most 2048 bytes)
-//   While kEvenChunksOnly is set (checksum.h alignment workaround, below),
-//   segment lengths, headroom and network offsets are rounded down to even.
+//   Segment lengths, headroom and network offsets take any value, odd
+//   included (checksum.h loads unaligned-safely since M21).
 //
 // Oracle:
 //   - An independent reference parser over the flat bytes decides whether
@@ -445,14 +445,11 @@ bool Same(const std::expected<ChecksumLayout, ChecksumError> &a,
 
 // ---- Decoding --------------------------------------------------------------
 
-// utils::CalculateSum (core/utils/checksum.h) does 16-bit loads through a
-// uint16_t pointer, which UBSan reports at odd addresses. ChecksumAccumulator
-// hands it odd addresses whenever a chunk starts at an odd packet offset or
-// follows an odd-length segment. Until checksum.h loads unaligned-safely,
-// segment lengths, headroom and network offsets are rounded down to even,
-// which leaves the cross-segment pending-byte path unexercised.
-// TODO(M21 checksum.h): remove 2-byte alignment workaround
-constexpr bool kEvenChunksOnly = true;
+// Before M21, utils::CalculateSum's 16-bit loads went through a uint16_t
+// pointer (UBSan at odd addresses) and this harness rounded every length and
+// offset to even. checksum.h now loads with memcpy, so odd offsets and
+// odd-length segments (the cross-segment pending-byte path) are fuzzed.
+constexpr bool kEvenChunksOnly = false;
 
 size_t EvenIfRequired(size_t v) { return kEvenChunksOnly ? v & ~size_t{1} : v; }
 

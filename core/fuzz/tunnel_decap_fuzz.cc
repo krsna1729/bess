@@ -321,9 +321,8 @@ void CheckRaw(std::span<const uint8_t> frame, size_t total_len, const RawPorts &
   CheckParseGre(frame, gre_offset);
 }
 
-// TODO(M21 checksum.h): remove 4-byte alignment workaround
-// utils/checksum.h loads header words through misaligned pointers, which
-// UBSan reports (known M22 finding; reproducers in .scratch/m22/b/tunnel_decap/):
+// Before M21, utils/checksum.h loaded header words through misaligned
+// pointers, which UBSan reported (reproducers kept in the M22 evidence):
 // CalculateIpv4NoOptChecksum, reached from WriteIpv4, on an IPv4 header at
 // Ethernet offset 14/18 (ubsan_misaligned_ipv4_checksum.bin), and
 // CalculateSum's 16-bit loop, reached from the GRE checksum, on a GRE header
@@ -331,8 +330,9 @@ void CheckRaw(std::span<const uint8_t> frame, size_t total_len, const RawPorts &
 // a raw frame is copied so its base is 2 mod 4 (its IPv4 header 4-byte
 // aligned, its GRE header even), ParseGre's fuzzed offset is even, and the
 // round trip writes the outer IPv4 header 4-byte aligned and copies it in.
-// False: frames in place, Ethernet-framed, any offset.
-constexpr bool kAlignForChecksum = true;
+// Now false (checksum.h loads with memcpy since M21): frames in place,
+// Ethernet-framed, any offset. The reproducers are seeds that must stay clean.
+constexpr bool kAlignForChecksum = false;
 
 void RunRaw(FuzzInput &in) {
   const uint8_t mode = in.U8();

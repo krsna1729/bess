@@ -149,7 +149,19 @@ def stage_b():
     }
 
 
+# Inputs that once failed, kept so every corpus replay checks them.
+REGRESSIONS = {
+    # ubsan_misaligned_ipv4_checksum: found by this fuzzer before M21 (UBSan, utils/checksum.h);
+    # kept as a seed so the corpus replay checks it stays clean.
+    "r_ubsan_misaligned_ipv4_checksum": bytes.fromhex("01020000ffff0000000004000800000000"),
+    # ubsan_misaligned_calculate_sum_odd_base: found by this fuzzer before M21 (UBSan, utils/checksum.h);
+    # kept as a seed so the corpus replay checks it stays clean.
+    "r_ubsan_misaligned_calculate_sum_odd_base": bytes.fromhex("00004496013333333333333333333333333333333333333333333333333333333333333333333333333333333333333318181818a0a0a0a0a0a0a0a0a0a00004a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a011b5a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a03da0a0a0a018181818181808000086dd58"),
+}
+
+
 def seeds():
     out = stage_a()
     out.update(stage_b())
+    out.update(REGRESSIONS)
     return out
