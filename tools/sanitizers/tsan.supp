@@ -5,3 +5,8 @@
 # read in DPDK code built without TSan instrumentation; TSan sees only the
 # BESS-side compare of the key bytes (decisions.md, M9 TSan run).
 race:CmpFixed
+# rte_ring (DPDK 25.11): the consumer orders its element copy after the
+# producer's with a relaxed tail load and a standalone acquire fence, which
+# ThreadSanitizer does not model; it reports the copy itself. The handoff
+# channel's own counters, ownership and packets stay instrumented.
+race:__rte_ring_dequeue_elems
