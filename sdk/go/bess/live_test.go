@@ -6,7 +6,8 @@ package bess
 
 // Against a live bessd (bessctl/module_tests/control_sdk_go.py starts it and
 // writes testdata/live.json): discovery, a typed commit, a replay under the
-// same request id, a conflict, and a client-side type refusal. The module's
+// same request id, a conflict, a client-side type refusal, and a pipeline
+// planned, applied and refused at a stale generation. The module's
 // messages are built at run time from a descriptor set (dynamicpb), as a
 // client in a language without generated types would.
 
@@ -138,5 +139,33 @@ func TestLive(t *testing.T) {
 		t.Fatal("a stale generation applied")
 	} else if _, ok := err.(*ConflictError); !ok {
 		t.Fatalf("got %v, want a conflict", err)
+	}
+
+	// Desired state: two modules added to the active pipeline, planned and
+	// applied at its generation; then refused at that (stale) generation.
+	snap, err := client.Pipeline(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	added, err := NewPipeline(snap.Pipeline).Module("go_sdk_a", "Bypass", nil).
+		Module("go_sdk_b", "Sink", nil).Chain("go_sdk_a", "go_sdk_b").Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if steps, g, err := client.PlanPipeline(ctx, added); err != nil || g != snap.Generation || len(steps) == 0 {
+		t.Fatalf("plan %v %d %v", steps, g, err)
+	}
+	done, err := client.ApplyPipeline(ctx, added, WithPipelineGeneration(snap.Generation))
+	if err != nil || done.GetGeneration() <= snap.Generation {
+		t.Fatalf("apply %v %v", done, err)
+	}
+	removed, _ := NewPipeline(added).Remove("go_sdk_a").Remove("go_sdk_b").Build()
+	if _, err := client.ApplyPipeline(ctx, removed, WithPipelineGeneration(snap.Generation)); err == nil {
+		t.Fatal("a stale pipeline generation applied")
+	} else if _, ok := err.(*PipelineConflictError); !ok {
+		t.Fatalf("got %v, want a pipeline conflict", err)
+	}
+	if _, err := client.ApplyPipeline(ctx, removed, WithPipelineGeneration(done.GetGeneration())); err != nil {
+		t.Fatal(err)
 	}
 }

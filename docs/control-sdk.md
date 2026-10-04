@@ -52,6 +52,11 @@ steps, generation = client.plan_pipeline(p)    # what the daemon would do
 client.apply_pipeline(p, expected_generation=snap.generation)
 ```
 
+Go: `bess.NewPipeline(snap.Pipeline).Module(...).Chain(...).Build()`,
+`client.Pipeline`, `ValidatePipeline`, `DiffPipeline`, `PlanPipeline`,
+`ApplyPipeline(ctx, p, bess.WithPipelineGeneration(g))`, with
+`*PipelineConflictError`.
+
 `apply_pipeline` retries a busy answer within the retry policy and never a
 conflict (`PipelineConflict`, a `Conflict`) or a refusal. It carries no request
 id, so after no answer the outcome is unknown (`TransportError`): read

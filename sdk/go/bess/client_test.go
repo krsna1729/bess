@@ -56,6 +56,31 @@ type fake struct {
 	refuse    bool // answers GetCapabilities with PERMISSION_DENIED
 	streams   []*scriptedStream
 	watched   [][2]uint64 // (from_sequence, daemon_epoch) per WatchEvents call
+	pipelines []step      // ApplyPipeline's script (err/md; nil err: applied)
+	applied   []*pb.ApplyPipelineRequest
+}
+
+func (f *fake) pipeline(_ context.Context, in proto.Message) (proto.Message, metadata.MD, error) {
+	switch req := in.(type) {
+	case *pb.GetPipelineRequest:
+		return &pb.GetPipelineResponse{Pipeline: &pb.Pipeline{}, Generation: 3}, nil, nil
+	case *pb.ApplyPipelineRequest:
+		f.applied = append(f.applied, req)
+		if len(f.pipelines) > 0 {
+			s := f.pipelines[0]
+			f.pipelines = f.pipelines[1:]
+			if s.err != nil {
+				return nil, s.md, s.err
+			}
+		}
+		return &pb.ApplyPipelineResponse{Generation: 4}, nil, nil
+	}
+	return nil, nil, status.Error(codes.Unimplemented, "fake")
+}
+
+func refusal(code codes.Code, detail pb.ErrorDetail_Code) step {
+	d, _ := proto.Marshal(&pb.ErrorDetail{Code: detail, Message: "refused"})
+	return step{err: status.Error(code, "x"), md: metadata.Pairs(errorDetailKey, string(d))}
 }
 
 func (f *fake) apply(_ context.Context, in *pb.ApplyTransactionRequest) (*pb.ApplyTransactionResponse, metadata.MD, error) {
@@ -486,5 +511,69 @@ func TestWatchEventsClosesItsErrorChannelWhenTheContextEnds(t *testing.T) {
 	case <-errc: // closed (or an error): the caller's '<-errc' returns
 	case <-time.After(5 * time.Second):
 		t.Fatal("the error channel stayed open after cancellation")
+	}
+}
+
+func TestThePipelineBuilderAssemblesAndEditsASnapshot(t *testing.T) {
+	p, err := NewPipeline(nil).Worker(0, 2, "").Module("a", "Source", nil).
+		Module("b", "Bypass", &pb.GetTransactionRequest{RequestId: "x"}).Module("c", "Sink", nil).
+		Chain("a", "b", "c").Connect("b", 1, "c", 0).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range p.GetConnections() {
+		got = append(got, fmt.Sprintf("%s:%d->%s", c.GetUpstream(), c.GetOgate(), c.GetDownstream()))
+	}
+	if strings.Join(got, " ") != "a:0->b b:0->c b:1->c" {
+		t.Fatal(got)
+	}
+	if !p.GetModules()[1].GetArg().MessageIs(&pb.GetTransactionRequest{}) {
+		t.Fatal(p.GetModules()[1])
+	}
+	edited, _ := NewPipeline(p).Remove("b").Build()
+	if len(edited.GetModules()) != 2 || len(edited.GetConnections()) != 0 || len(p.GetModules()) != 3 {
+		t.Fatal(edited, p)
+	}
+}
+
+func TestApplyPipelineRetriesBusyAndNeverAConflict(t *testing.T) {
+	busyStep := refusal(codes.FailedPrecondition, pb.ErrorDetail_RESOURCE_BUSY)
+	h := newHarness(&fake{pipelines: []step{busyStep, busyStep}}, 4)
+	ctx := context.Background()
+	snap, err := h.c.Pipeline(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := h.c.ApplyPipeline(ctx, snap.Pipeline, WithPipelineGeneration(snap.Generation))
+	if err != nil || r.GetGeneration() != 4 || len(h.f.applied) != 3 || h.f.applied[0].GetExpectedGeneration() != 3 {
+		t.Fatal(r, err, h.f.applied)
+	}
+	if len(h.sleeps) != 2 || h.sleeps[1] != 20*time.Millisecond {
+		t.Fatal(h.sleeps)
+	}
+	h = newHarness(&fake{pipelines: []step{refusal(codes.Aborted, pb.ErrorDetail_CONFLICT)}}, 4)
+	_, err = h.c.ApplyPipeline(ctx, &pb.Pipeline{}, WithPipelineGeneration(1))
+	as[*PipelineConflictError](t, err)
+	if len(h.f.applied) != 1 {
+		t.Fatal(h.f.applied)
+	}
+	h = newHarness(&fake{pipelines: []step{busyStep, busyStep}}, 2)
+	_, err = h.c.ApplyPipeline(ctx, &pb.Pipeline{})
+	as[*BusyError](t, err)
+}
+
+func TestApplyPipelineWithoutAnAnswerIsUnknownAndNotResent(t *testing.T) {
+	h := newHarness(&fake{pipelines: []step{timeout()}}, 4)
+	_, err := h.c.ApplyPipeline(context.Background(), &pb.Pipeline{})
+	as[*TransportError](t, err)
+	if len(h.f.applied) != 1 {
+		t.Fatal(h.f.applied)
+	}
+	// UNAVAILABLE with BESS's detail is an answer (a resource failure).
+	h = newHarness(&fake{pipelines: []step{refusal(codes.Unavailable, pb.ErrorDetail_RESOURCE_FAILURE)}}, 4)
+	_, err = h.c.ApplyPipeline(context.Background(), &pb.Pipeline{})
+	if e := as[*InvalidRequestError](t, err); e.Detail.GetCode() != pb.ErrorDetail_RESOURCE_FAILURE {
+		t.Fatal(e)
 	}
 }

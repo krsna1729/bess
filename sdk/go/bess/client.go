@@ -18,6 +18,13 @@
 //	tx := client.Transaction()
 //	err = tx.Upsert(rules, key, value)
 //	applied, err := tx.Commit(ctx)
+//
+// Desired state: NewPipeline assembles a control_v2 Pipeline (or edits the
+// snapshot Client.Pipeline returns); the daemon validates, diffs, plans and
+// applies it. ApplyPipeline retries a busy answer and never a conflict
+// (PipelineConflictError) or a refusal; with no request id, no answer is a
+// TransportError and nothing is resent: read Pipeline again, or apply with
+// WithPipelineGeneration so a second application conflicts.
 package bess
 
 import (
@@ -27,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -116,6 +124,15 @@ func (e *TransportError) Error() string {
 	return fmt.Sprintf("bess: no answer for %q: %s", e.RequestID, e.Code)
 }
 
+// PipelineConflictError: ApplyPipeline's expected generation no longer
+// matched; nothing changed.
+type PipelineConflictError struct {
+	Message string
+	Detail  *pb.ErrorDetail
+}
+
+func (e *PipelineConflictError) Error() string { return "bess: pipeline conflict: " + e.Message }
+
 // DaemonRestartedError: the transaction met a daemon that lost the state it
 // was built against. The restarted daemon may have applied the request (a
 // restart the client had not seen yet): re-read its state before deciding
@@ -186,6 +203,9 @@ type transport interface {
 	capabilities(ctx context.Context) (*pb.GetCapabilitiesResponse, metadata.MD, error)
 	metrics(ctx context.Context) (*pb.ListMetricsResponse, metadata.MD, error)
 	watch(ctx context.Context, in *pb.WatchEventsRequest) (eventStream, error)
+	// pipeline is one desired-state RPC: in is a Get/Validate/Diff/Plan/
+	// ApplyPipelineRequest, the response the matching response.
+	pipeline(ctx context.Context, in proto.Message) (proto.Message, metadata.MD, error)
 }
 
 // eventStream is what WatchEvents reads (the gRPC client stream, or a test's).
@@ -227,6 +247,27 @@ func (t grpcTransport) metrics(ctx context.Context) (*pb.ListMetricsResponse, me
 
 func (t grpcTransport) watch(ctx context.Context, in *pb.WatchEventsRequest) (eventStream, error) {
 	return t.c.WatchEvents(ctx, in)
+}
+
+func (t grpcTransport) pipeline(ctx context.Context, in proto.Message) (proto.Message, metadata.MD, error) {
+	var md metadata.MD
+	var r proto.Message
+	var err error
+	switch req := in.(type) {
+	case *pb.GetPipelineRequest:
+		r, err = t.c.GetPipeline(ctx, req, grpc.Trailer(&md))
+	case *pb.ValidatePipelineRequest:
+		r, err = t.c.ValidatePipeline(ctx, req, grpc.Trailer(&md))
+	case *pb.DiffPipelineRequest:
+		r, err = t.c.DiffPipeline(ctx, req, grpc.Trailer(&md))
+	case *pb.PlanPipelineRequest:
+		r, err = t.c.PlanPipeline(ctx, req, grpc.Trailer(&md))
+	case *pb.ApplyPipelineRequest:
+		r, err = t.c.ApplyPipeline(ctx, req, grpc.Trailer(&md))
+	default:
+		return nil, nil, fmt.Errorf("bess: not a pipeline request: %T", in)
+	}
+	return r, md, err
 }
 
 // -- the client ----------------------------------------------------------------
@@ -447,6 +488,201 @@ func (c *Client) Resource(ctx context.Context, name string) (Resource, error) {
 		}
 	}
 	return Resource{}, &InvalidRequestError{Message: fmt.Sprintf("no transactional resource %q", name)}
+}
+
+// -- desired state ----------------------------------------------------------------
+
+// PipelineSnapshot is the active pipeline and its generation.
+type PipelineSnapshot struct {
+	Pipeline   *pb.Pipeline
+	Generation uint64
+}
+
+// Pipeline is the active pipeline as desired state.
+func (c *Client) Pipeline(ctx context.Context) (PipelineSnapshot, error) {
+	r, err := c.pipelineCall(ctx, &pb.GetPipelineRequest{}, false)
+	if err != nil {
+		return PipelineSnapshot{}, err
+	}
+	g := r.(*pb.GetPipelineResponse)
+	return PipelineSnapshot{g.GetPipeline(), g.GetGeneration()}, nil
+}
+
+// ValidatePipeline is the daemon's canonical form of p (InvalidRequestError
+// if p is invalid).
+func (c *Client) ValidatePipeline(ctx context.Context, p *pb.Pipeline) (*pb.Pipeline, error) {
+	r, err := c.pipelineCall(ctx, &pb.ValidatePipelineRequest{Pipeline: p}, false)
+	if err != nil {
+		return nil, err
+	}
+	return r.(*pb.ValidatePipelineResponse).GetNormalized(), nil
+}
+
+// DiffPipeline is what applying p would change, and the generation it was
+// taken against.
+func (c *Client) DiffPipeline(ctx context.Context, p *pb.Pipeline) (*pb.PipelineDiff, uint64, error) {
+	r, err := c.pipelineCall(ctx, &pb.DiffPipelineRequest{Pipeline: p}, false)
+	if err != nil {
+		return nil, 0, err
+	}
+	d := r.(*pb.DiffPipelineResponse)
+	return d.GetDiff(), d.GetGeneration(), nil
+}
+
+// PlanPipeline is the daemon's plan for p, and the generation it was made
+// against.
+func (c *Client) PlanPipeline(ctx context.Context, p *pb.Pipeline) ([]*pb.PlanStep, uint64, error) {
+	r, err := c.pipelineCall(ctx, &pb.PlanPipelineRequest{Pipeline: p}, false)
+	if err != nil {
+		return nil, 0, err
+	}
+	pl := r.(*pb.PlanPipelineResponse)
+	return pl.GetSteps(), pl.GetGeneration(), nil
+}
+
+// PipelineOption sets an ApplyPipeline option.
+type PipelineOption func(*pb.ApplyPipelineRequest)
+
+// WithPipelineGeneration applies only if the active generation is g
+// (PipelineConflictError otherwise).
+func WithPipelineGeneration(g uint64) PipelineOption {
+	return func(r *pb.ApplyPipelineRequest) { r.ExpectedGeneration = &g }
+}
+
+// ApplyPipeline makes p the active pipeline, all or nothing.
+func (c *Client) ApplyPipeline(ctx context.Context, p *pb.Pipeline, opts ...PipelineOption) (*pb.ApplyPipelineResponse, error) {
+	req := &pb.ApplyPipelineRequest{Pipeline: p}
+	for _, o := range opts {
+		o(req)
+	}
+	r, err := c.pipelineCall(ctx, req, true)
+	if err != nil {
+		return nil, err
+	}
+	return r.(*pb.ApplyPipelineResponse), nil
+}
+
+// pipelineCall runs a desired-state RPC. An answered refusal carries an
+// ErrorDetail: CONFLICT is PipelineConflictError, RESOURCE_BUSY is retried
+// (retryBusy) within the policy; no answer is TransportError.
+func (c *Client) pipelineCall(ctx context.Context, in proto.Message, retryBusy bool) (proto.Message, error) {
+	backoff := c.retry.BusyBackoff
+	for attempt := 1; ; attempt++ {
+		actx, cancel := context.WithTimeout(ctx, c.retry.AttemptTimeout)
+		r, md, err := c.t.pipeline(actx, in)
+		cancel()
+		if err == nil {
+			return r, nil
+		}
+		detail := errorDetail(md)
+		if detail == nil && noAnswer(err, md) {
+			return nil, &TransportError{Code: status.Code(err)}
+		}
+		switch detail.GetCode() {
+		case pb.ErrorDetail_CONFLICT:
+			return nil, &PipelineConflictError{Message: detail.GetMessage(), Detail: detail}
+		case pb.ErrorDetail_RESOURCE_BUSY:
+			if retryBusy && attempt < c.retry.Attempts && ctx.Err() == nil {
+				c.sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return nil, &BusyError{Attempts: attempt}
+		}
+		return nil, translate(err, md)
+	}
+}
+
+// PipelineBuilder assembles a control_v2 Pipeline. It only builds the
+// message: the daemon validates, diffs and plans it.
+type PipelineBuilder struct {
+	p   *pb.Pipeline
+	err error
+}
+
+// NewPipeline starts from base (a snapshot's pipeline, copied) or empty (nil).
+func NewPipeline(base *pb.Pipeline) *PipelineBuilder {
+	if base == nil {
+		return &PipelineBuilder{p: &pb.Pipeline{}}
+	}
+	return &PipelineBuilder{p: proto.Clone(base).(*pb.Pipeline)}
+}
+
+func (b *PipelineBuilder) pack(arg proto.Message) *anypb.Any {
+	if arg == nil || b.err != nil {
+		return nil
+	}
+	a, err := anypb.New(arg)
+	if err != nil {
+		b.err = err
+	}
+	return a
+}
+
+// Port adds a port (queue counts and sizes as in pb.Port: PortSpec for those).
+func (b *PipelineBuilder) Port(name, driver string, arg proto.Message) *PipelineBuilder {
+	return b.PortSpec(&pb.Port{Name: name, Driver: driver, Arg: b.pack(arg)})
+}
+
+// PortSpec adds a port as given.
+func (b *PipelineBuilder) PortSpec(p *pb.Port) *PipelineBuilder {
+	b.p.Ports = append(b.p.Ports, p)
+	return b
+}
+
+// Module adds a module with its Init argument (nil: none).
+func (b *PipelineBuilder) Module(name, mclass string, arg proto.Message) *PipelineBuilder {
+	b.p.Modules = append(b.p.Modules, &pb.Module{Name: name, Mclass: mclass, Arg: b.pack(arg)})
+	return b
+}
+
+// Connect adds upstream:ogate -> igate:downstream.
+func (b *PipelineBuilder) Connect(upstream string, ogate uint32, downstream string, igate uint32) *PipelineBuilder {
+	b.p.Connections = append(b.p.Connections,
+		&pb.Connection{Upstream: upstream, Ogate: ogate, Downstream: downstream, Igate: igate})
+	return b
+}
+
+// Chain connects gate 0 to gate 0 along names.
+func (b *PipelineBuilder) Chain(names ...string) *PipelineBuilder {
+	for i := 1; i < len(names); i++ {
+		b.Connect(names[i-1], 0, names[i], 0)
+	}
+	return b
+}
+
+// Worker adds a worker.
+func (b *PipelineBuilder) Worker(wid, core int32, scheduler string) *PipelineBuilder {
+	b.p.Workers = append(b.p.Workers, &pb.Worker{Wid: wid, Core: core, Scheduler: scheduler})
+	return b
+}
+
+// TrafficClass adds a traffic class as given.
+func (b *PipelineBuilder) TrafficClass(tc *pb.TrafficClass) *PipelineBuilder {
+	b.p.TrafficClasses = append(b.p.TrafficClasses, tc)
+	return b
+}
+
+// Remove drops the port, module or traffic class name and the connections
+// that touch it.
+func (b *PipelineBuilder) Remove(name string) *PipelineBuilder {
+	b.p.Ports = slices.DeleteFunc(b.p.Ports, func(p *pb.Port) bool { return p.GetName() == name })
+	b.p.Modules = slices.DeleteFunc(b.p.Modules, func(m *pb.Module) bool { return m.GetName() == name })
+	b.p.TrafficClasses = slices.DeleteFunc(b.p.TrafficClasses,
+		func(tc *pb.TrafficClass) bool { return tc.GetName() == name })
+	b.p.Connections = slices.DeleteFunc(b.p.Connections, func(c *pb.Connection) bool {
+		return c.GetUpstream() == name || c.GetDownstream() == name
+	})
+	return b
+}
+
+// Build is a copy of the pipeline built so far, or the first argument that
+// could not be packed.
+func (b *PipelineBuilder) Build() (*pb.Pipeline, error) {
+	if b.err != nil {
+		return nil, b.err
+	}
+	return proto.Clone(b.p).(*pb.Pipeline), nil
 }
 
 // GetTransaction asks for requestID's outcome under the current epoch.
@@ -738,19 +974,25 @@ func noAnswer(err error, md metadata.MD) bool {
 	return false
 }
 
+// errorDetail decodes the server's ErrorDetail from a failed call's
+// trailers (nil: none).
+func errorDetail(md metadata.MD) *pb.ErrorDetail {
+	if vals := md.Get(errorDetailKey); len(vals) > 0 {
+		d := &pb.ErrorDetail{}
+		if proto.Unmarshal([]byte(vals[0]), d) == nil {
+			return d
+		}
+	}
+	return nil
+}
+
 // translate turns a refused call into InvalidRequestError, decoding the
 // server's ErrorDetail.
 func translate(err error, md metadata.MD) error {
 	msg := status.Convert(err).Message()
-	var detail *pb.ErrorDetail
-	if vals := md.Get(errorDetailKey); len(vals) > 0 {
-		d := &pb.ErrorDetail{}
-		if proto.Unmarshal([]byte(vals[0]), d) == nil {
-			detail = d
-			if d.GetMessage() != "" {
-				msg = d.GetMessage()
-			}
-		}
+	detail := errorDetail(md)
+	if detail.GetMessage() != "" {
+		msg = detail.GetMessage()
 	}
 	if detail != nil && detail.GetCode() == pb.ErrorDetail_CONFLICT {
 		msg = "request id reused with different contents: " + msg

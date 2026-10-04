@@ -7277,7 +7277,9 @@ Depends as given), they install with dpkg (`bess-dev` requiring the same `bess`)
 **Code:** `pybess/sdk.py` (`PipelineBuilder`, `PipelineSnapshot`, `PipelineConflict`, `Client.pipeline`,
 `validate_pipeline`, `diff_pipeline`, `plan_pipeline`, `apply_pipeline`, `_detail`), `pybess/test_sdk.py`
 (`PipelineTest`), `bessctl/module_tests/control_sdk.py` (lost answer, lost request, restart, pipeline),
-`tools/live_transaction_bench.py` (migrated), `docs/control-sdk.md`.
+`tools/live_transaction_bench.py` (migrated), `docs/control-sdk.md`; Go: `sdk/go/bess/client.go` (`NewPipeline`,
+`PipelineBuilder`, `PipelineSnapshot`, `PipelineConflictError`, `Pipeline`, `ValidatePipeline`, `DiffPipeline`,
+`PlanPipeline`, `ApplyPipeline`, `WithPipelineGeneration`, `errorDetail`), `client_test.go`, `live_test.go`.
 
 **Context.** Roadmap M27's exit criteria: a real controller migration uses the SDK; raw stubs stay usable; no
 appliance type in the SDK; timeout, restart and idempotency behaviour has black-box integration tests. The SDK had
@@ -7302,5 +7304,7 @@ desired-state pipeline API (G1.1) had no SDK surface.
 retried and conflict not, busy through every attempt, no answer not resent and a detailed UNAVAILABLE answered).
 Live `control_sdk` (5 tests) passes; mutants -- a blind resend after a timeout, an ignored epoch -- fail the
 lost-answer and the restart tests. The migrated bench on a fast build (2000 sessions, 1 s per rate): hit 0.50 at
-rates 0, 1000 and max (4073 tx/s), so the SDK-applied pipeline and rules steer packets.
+rates 0, 1000 and max (4073 tx/s), so the SDK-applied pipeline and rules steer packets. Go: `go vet`, `go test -race`
+(3 new tests, the same cases) and the live `control_sdk_go` (a pipeline planned, applied, refused at a stale
+generation, and removed) pass.
 
