@@ -7143,5 +7143,16 @@ worker ever waiting. Design: `.scratch/design/m25_observability.md` section 2.
   refused and counted.
 - Modules: `init_context().events()` behind `BESS_CAP_EVENTS`, the context's last member.
 
-**Evidence.** EVIDENCE
+**Evidence.** Fast build: 139/139 (layer and link graphs: `bess_host -> bess_stats` added for the shutdown close),
+with `event_hub_test` (4 tests, in the TSan list): worker events become typed events in order, a ring of 4 refuses
+the 5th and 6th and the next accepted event brings a `bess.events_lost` with count 2; a reader behind a log of 8 gets
+a gap [3, 13) and then 13-20; a waiting reader wakes for an event and for close; four workers posting 20,000 events
+each against a draining loop: accepted + lost equals posted, every accepted event in the log once, per-worker order
+kept. SDK units: Python and Go resume where the stream stopped (also before its first event, from `bess.start`), past
+a gap and past filtered events (`bess.progress`), and raise DaemonRestarted on `bess.restart`; Go closes its error
+channel when the context ends. Live (`events.py`, a real bessd): an applied and a conflicting transaction arrive as
+two `bess.transaction` events (outcomes, generation, request id, increasing sequences, the client's epoch); reading
+from sequence 1 gives it (or a gap); a saved sequence the daemon never reached raises DaemonRestarted. Go live test:
+the transaction's event arrives with its outcome, generation and request id. Nothing on a packet path changed (a
+module that posts nothing runs no event code).
 
