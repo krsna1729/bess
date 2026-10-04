@@ -103,6 +103,10 @@ class PortBuilder {
 
   static const std::map<std::string, PortBuilder> &all_port_builders();
 
+  // Removes a driver class (a plugin's, when it is unloaded). No port of the
+  // class may exist.
+  static bool DeregisterPortClass(const std::string &class_name);
+
   const std::string &class_name() const { return class_name_; }
   const std::string &name_template() const { return name_template_; }
   const std::string &help_text() const { return help_text_; }

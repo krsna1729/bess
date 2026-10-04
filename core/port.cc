@@ -56,6 +56,10 @@ bool PortBuilder::RegisterPortClass(
   return true;
 }
 
+bool PortBuilder::DeregisterPortClass(const std::string &class_name) {
+  return all_port_builders_holder().erase(class_name) != 0;
+}
+
 const std::map<std::string, PortBuilder> &PortBuilder::all_port_builders() {
   return all_port_builders_holder();
 }

@@ -18,7 +18,22 @@ inline constexpr int kInheritanceLimit = 10;
 bool LoadPlugin(const std::string &path);
 
 // Unload a loaded plugin specified by path. Returns true upon success.
+// dlclose()s a plugin after removing the port drivers and gate hooks it
+// registered (its module classes deregister themselves). The caller checks
+// first that nothing of the plugin is in use (ControlPlane::UnloadPlugin).
 bool UnloadPlugin(const std::string &path);
+
+// What a loaded plugin registered: the classes that appeared while it was
+// opened. Nothing for a path that is not loaded.
+struct PluginContents {
+  std::vector<std::string> module_classes;
+  std::vector<std::string> port_drivers;
+  std::vector<std::string> gate_hooks;
+};
+bool PluginContentsOf(const std::string &path, PluginContents *out);
+
+// Whether `address` (a function, say) is in the code `path` mapped.
+bool CodeInPlugin(const std::string &path, const void *address);
 
 // Load all the .so files in the specified directory. Returns true upon
 // success.

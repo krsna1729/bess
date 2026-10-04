@@ -4,11 +4,40 @@
 from __future__ import annotations
 
 import argparse
+import errno
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
+
+
+def check_unload_lifetime(client) -> None:
+    """Roadmap 28.4 (D-090): a plugin with a live module is not unloaded --
+    the refusal names the module -- and is once the module is gone, taking
+    its class with it."""
+    from pybess.bess import BESS
+    from builtin_pb import bess_msg_pb2 as bess_msg
+    import supdate_msg_pb2
+    plugin = next(p for p in client.list_plugins().paths if 'sequential_update' in p)
+    request = bess_msg.CreateModuleRequest(name='su0', mclass='SequentialUpdate')
+    request.arg.Pack(supdate_msg_pb2.SequentialUpdateArg())
+    client._request('CreateModule', request)
+    try:
+        client.unload_plugin(plugin)
+    except BESS.Error as error:
+        if error.code != errno.EBUSY or 'module su0' not in error.errmsg:
+            raise RuntimeError(f'unexpected refusal: {error}')
+    else:
+        raise RuntimeError('a plugin with a live module was unloaded')
+    if 'SequentialUpdate' not in client.list_mclasses().names:
+        raise RuntimeError('a refused unload removed the class')
+    client.destroy_module('su0')
+    client.unload_plugin(plugin)
+    if 'SequentialUpdate' in client.list_mclasses().names:
+        raise RuntimeError('the unloaded plugin left its class registered')
+    if plugin in client.list_plugins().paths:
+        raise RuntimeError('the unloaded plugin is still listed')
 
 
 def main() -> int:
@@ -61,12 +90,15 @@ def main() -> int:
                     if 'incompatible_probe' not in refusal or 'refused' not in refusal:
                         raise RuntimeError(
                             'the daemon did not log refusing incompatible_probe')
-                    return 0
+                    break
                 except Exception as error:  # gRPC reports several transient errors
                     last_error = error
                     client.disconnect()
                     time.sleep(0.1)
-            raise RuntimeError(f'timed out waiting for plugin registry: {last_error}')
+            else:
+                raise RuntimeError(f'timed out waiting for plugin registry: {last_error}')
+            check_unload_lifetime(client)
+            return 0
         finally:
             client.disconnect()
             if process.poll() is None:

@@ -283,9 +283,13 @@ provide their own synchronization for live updates.
 An instance a plugin creates holds the plugin's code (its deleter and type
 information) for as long as the instance exists, and nothing destroys
 instances on `reset_all`. A plugin that creates registry instances
-(`standalone_appliance` is one) must therefore not be unloaded while they
-exist: destroy them first (`Destroy`, once no lease is held), or keep the
-plugin loaded for the daemon's life.
+(`standalone_appliance` is one) cannot be unloaded while they exist: destroy
+them first (`Destroy`, once no lease is held), or keep the plugin loaded for
+the daemon's life. `unload plugin` refuses (EBUSY, naming them) while any
+module of the plugin's classes, port of its drivers, gate hook of its classes
+or instance its code destroys exists; it then destroys what the plugin's code
+retired to RCU before `dlclose` (D-090). Pointers to the plugin's code that
+another plugin or module keeps on its own are not tracked.
 
 ---
 

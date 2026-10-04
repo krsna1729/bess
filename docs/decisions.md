@@ -110,6 +110,7 @@ file is the reasoning.
 | D-087 | Release artifacts: a tarball, bess and bess-dev .deb packages with derived dependencies, and a runtime image (M26) | accepted |
 | D-088 | SDK desired state (PipelineBuilder, plan/apply), black-box recovery tests, a controller on the SDK (M27) | accepted |
 | D-089 | Bounded-backpressure observability: pressure transitions, throttled packet-path events, DPDK tracing (M25 phase 3) | accepted |
+| D-090 | Plugin unload refuses while the plugin's code is reachable (roadmap 28.4) | accepted |
 
 
 ---
@@ -7366,4 +7367,38 @@ a ConnTrack of capacity 4 fed 64 new UDP flows yields a `bess.table_full` from t
 worker. Tracing smoke: `bessd -m 0 --dpdk_trace 'lib.*' --dpdk_trace_dir /tmp/bess-trace`, stopped by KillBess,
 leaves a CTF trace (`metadata`, `channel0_*`) and logs "DPDK trace saved". No performance claim: the library hot loops
 are unchanged and no module-level benchmark covers these modules.
+
+
+## D-090 Plugin unload refuses while the plugin's code is reachable (roadmap 28.4)
+
+**Status:** accepted (2026-10-05).
+**Code:** `core/framework/plugin_loader.{h,cc}` (`PluginContents`, `PluginContentsOf`, `CodeInPlugin`; drivers and
+gate hooks deregistered at unload and at a refused load), `core/port.{h,cc}` (`DeregisterPortClass`),
+`core/framework/instance_registry.{h,cc}` (`DestroyedBy`), `core/control/control_plane.cc` (`UnloadPlugin`),
+`tools/check_sample_plugin.py` (`check_unload_lifetime`), `bessctl/commands.py`, `docs/plugin-api.md`.
+
+**Context.** Roadmap 28.4 and Appendix J ("plugin unload lifetime test passes"): unloading must be refused while
+module instances exist, resources are registered, RCU-retired objects with plugin destructors remain, or handoff items
+or offload callbacks reference plugin code -- tracked explicitly. `UnloadPlugin` was a bare `dlclose` (bessctl's
+command said it "can crash the BESS daemon"); port drivers and gate hooks registered by a plugin stayed registered
+after it was unmapped.
+
+**Decision.**
+- The loader records what each plugin registered: the module classes, port drivers and gate hooks that appeared
+  while it was opened (a diff of the three registries around `dlopen`).
+- `ControlPlane::UnloadPlugin` refuses with EBUSY, naming each, while any module of the plugin's classes, gate hook
+  of its classes, port of its drivers, or application instance whose destructor is in the plugin's code
+  (`dladdr` of the instance's deleter) exists. Registered resources, metric sources, request endpoints, event
+  posters, handoff channels and flow-rule owners are a module's and leave with it, so "no module of its classes"
+  covers them.
+- Then, with workers paused (offline, so a grace period needs none), the runtime's RCU domain is drained and the
+  transaction engine's retired objects reclaimed -- what the plugin's code retired is destroyed while that code is
+  still mapped -- and the loader removes the plugin's drivers and gate hooks before `dlclose` (module classes
+  deregister themselves in the plugin's static destructors). A refused load removes them too.
+- Not tracked: a pointer into the plugin's code that some other plugin or module keeps on its own.
+
+**Evidence.** `sample_plugin_load` (suite `plugin`, live bessd): with a `SequentialUpdate` module `su0` alive,
+`unload_plugin` answers EBUSY naming "module su0" and the class stays registered; after `destroy_module` the unload
+succeeds, and the class and the plugin are gone from `list_mclasses` and `list_plugins`. Mutant: without the module
+check the test fails ("a plugin with a live module was unloaded").
 

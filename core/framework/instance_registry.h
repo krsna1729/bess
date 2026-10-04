@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <expected>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -155,6 +156,10 @@ class InstanceRegistry {
 
   // Name, type and lease count of every instance, in name order.
   std::vector<InstanceInfo> Describe() const;
+
+  // Names of the instances whose destructor `code_in` claims (its address):
+  // what a plugin about to be unloaded would leave without code.
+  std::vector<std::string> DestroyedBy(const std::function<bool(const void *)> &code_in) const;
 
   size_t size() const { return instances_.size(); }
 

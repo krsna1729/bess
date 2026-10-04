@@ -1764,8 +1764,8 @@ def import_plugin(cli, plugin):
 
 @cmd('unload plugin PLUGIN_FILE', 'Unload the specified plugin (*.so)')
 def unload_plugin(cli, plugin):
-    # FIXME check whether the plugin is being used
-    # currently this command can crash the BESS daemon
+    # Refused (EBUSY, naming them) while modules, ports, gate hooks or
+    # instances of the plugin exist (D-090).
     cli.bess.pause_all()
     try:
         cli.bess.unload_plugin(plugin)

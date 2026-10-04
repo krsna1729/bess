@@ -54,6 +54,17 @@ std::vector<InstanceInfo> InstanceRegistry::Describe() const {
   return out;
 }
 
+std::vector<std::string> InstanceRegistry::DestroyedBy(
+    const std::function<bool(const void *)> &code_in) const {
+  std::vector<std::string> out;
+  for (const auto &[name, entry] : instances_) {
+    if (code_in(reinterpret_cast<const void *>(entry->object.get_deleter()))) {
+      out.push_back(name);
+    }
+  }
+  return out;
+}
+
 std::string InstanceRegistry::DemangledName(const std::type_info &type) {
   int status = 0;
   char *demangled = abi::__cxa_demangle(type.name(), nullptr, nullptr, &status);

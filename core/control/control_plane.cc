@@ -3,6 +3,7 @@
 #include "control/control_plane.h"
 #include "runtime/thread_placement.h"
 #include "runtime/worker_manager.h"
+#include <algorithm>
 #include <limits>
 #include <optional>
 #include <memory>
@@ -16,11 +17,15 @@
 
 #include "utils/logging.h"
 
+#include "dataplane/transaction_engine.h"
+#include "framework/instance_registry.h"
 #include "framework/plugin_loader.h"
 #include "gate.h"
 #include "message.h"
 #include "module.h"
 #include "module_graph.h"
+#include "port.h"
+#include "rcu/rcu_domain.h"
 #include "runtime/opts.h"
 #include "resume_hook.h"
 #include "scheduler.h"
@@ -1470,10 +1475,65 @@ ControlResult<void> ControlPlane::ImportPlugin(const std::string& path) {
   return {};
 }
 
+// Roadmap 28.4: a plugin leaves only when nothing reachable runs its code --
+// no module of its classes (their resources, metrics, requests, handoff and
+// offload state are the module's), no port of its drivers, no gate hook of
+// its classes, no application instance its code destroys -- and objects its
+// code retired to RCU have been destroyed (workers paused: a grace period
+// needs none).
 ControlResult<void> ControlPlane::UnloadPlugin(const std::string& path) {
   std::lock_guard<std::mutex> lock(mutex_);
 
+  framework::PluginContents contents;
+  if (!framework::PluginContentsOf(path, &contents)) {
+    return std::unexpected(Err(ENOENT, "Plugin %s is not loaded", path.c_str()));
+  }
+  auto in = [](const std::vector<std::string> &names, const std::string &name) {
+    return std::find(names.begin(), names.end(), name) != names.end();
+  };
+  std::vector<std::string> users;
+  for (const auto &[name, m] : runtime::runtime().modules().All()) {
+    if (in(contents.module_classes, m->module_builder()->class_name())) {
+      users.push_back("module " + name);
+    }
+    auto hooks_of = [&](const auto &gates) {
+      for (const auto *gate : gates) {
+        if (gate == nullptr) {
+          continue;
+        }
+        for (const bess::GateHook *hook : gate->hooks()) {
+          if (in(contents.gate_hooks, hook->class_name())) {
+            users.push_back("gate hook " + hook->name() + " on " + name);
+          }
+        }
+      }
+    };
+    hooks_of(m->igates());
+    hooks_of(m->ogates());
+  }
+  for (const auto &[name, port] : runtime::runtime().ports().All()) {
+    if (port->port_builder() != nullptr &&
+        in(contents.port_drivers, port->port_builder()->class_name())) {
+      users.push_back("port " + name);
+    }
+  }
+  for (const std::string &name : runtime::runtime().instances().DestroyedBy(
+           [&](const void *code) { return framework::CodeInPlugin(path, code); })) {
+    users.push_back("instance " + name);
+  }
+  if (!users.empty()) {
+    std::string list;
+    for (const std::string &u : users) {
+      list += (list.empty() ? "" : ", ") + u;
+    }
+    return std::unexpected(
+        Err(EBUSY, "Plugin %s is in use: %s", path.c_str(), list.c_str()));
+  }
+
   WorkerPauser wp;
+  runtime::runtime().rcu().Drain();
+  while (runtime::runtime().transactions().ReclaimRetired() != 0) {
+  }
 
   VLOG(1) << "Unloading plugin: " << path;
   if (!framework::UnloadPlugin(path)) {
