@@ -37,7 +37,7 @@ namespace checksum_internal {
 // typed read of ip.length above `ip->length = ...` in url_filter.cc's
 // Generate403Packet, see MODERNIZATION.md) and needs no alignment (IPv4 and
 // L4 headers sit 2 bytes off a 4-byte boundary behind Ethernet).
-static inline uint64_t Load32(const unsigned char *p) {
+static inline uint32_t Load32(const unsigned char *p) {
   uint32_t v;
   memcpy(&v, p, sizeof(v));
   return v;
@@ -55,13 +55,6 @@ static inline uint32_t Fold64(uint64_t sum) {
   sum = (sum >> 32) + (sum & 0xFFFFFFFF);
   sum += sum >> 32;
   return static_cast<uint32_t>(sum);
-}
-
-// Folds a sum below 2^47 into 32 bits for FoldChecksum(): congruent modulo
-// 0xFFFF (2^16 is 1 there) and 0 only if `sum` is, which is all the 16-bit
-// checksum depends on. Cheaper than Fold64() for the header sums.
-static inline uint32_t FoldForChecksum(uint64_t sum) {
-  return static_cast<uint32_t>((sum & 0xFFFF) + (sum >> 16));
 }
 
 }  // namespace checksum_internal
@@ -123,23 +116,27 @@ static inline bool VerifyGenericChecksum(const void *buf, size_t len) {
 
 namespace checksum_internal {
 
-// One's complement sum (unfolded) of the 20-byte option-less IPv4 header at
-// `p`, optionally without its checksum field (bytes 10-11, the high half of
-// the third little-endian word).
-static inline uint64_t SumIpv4Header(const unsigned char *p,
-                                     bool skip_checksum) {
-  return Load32(p) + Load32(p + 4) +
-         (skip_checksum ? Load32(p + 8) & 0xFFFF : Load32(p + 8)) +
-         Load32(p + 12) + Load32(p + 16);
+// The five 32-bit words of the 20-byte option-less IPv4 header at `p` added
+// to `init` (bess::arch::AddWords32), optionally without the checksum field
+// (bytes 10-11, the high half of the third little-endian word).
+static inline uint32_t SumIpv4Header(const unsigned char *p, bool skip_checksum,
+                                     uint32_t init) {
+  const uint32_t w[5] = {
+      Load32(p), Load32(p + 4),
+      skip_checksum ? Load32(p + 8) & 0xFFFF : Load32(p + 8), Load32(p + 12),
+      Load32(p + 16)};
+  return bess::arch::AddWords32(init, w);
 }
 
-// The IPv4 pseudo-header fields (RFC 768/793) as little-endian words: the
-// addresses and length are in network order, the zero byte and protocol form
-// the 16-bit word 0x00pp, read little-endian as 0xpp00.
-static inline uint64_t SumPseudoHeader(be32_t src, be32_t dst, uint16_t l4_len,
-                                       uint8_t proto) {
-  return uint64_t{src.raw_value()} + dst.raw_value() + be16_t::swap(l4_len) +
-         (uint32_t{proto} << 8);
+// The IPv4 pseudo-header (RFC 768/793) as little-endian words: the addresses
+// and length in network order, and the zero byte and protocol as the 16-bit
+// word 0x00pp, read little-endian as 0xpp00.
+static inline uint32_t PseudoLength(uint16_t l4_len) {
+  return be16_t::swap(l4_len);
+}
+
+static inline uint32_t PseudoProto(uint8_t proto) {
+  return uint32_t{proto} << 8;
 }
 
 }  // namespace checksum_internal
@@ -147,8 +144,7 @@ static inline uint64_t SumPseudoHeader(be32_t src, be32_t dst, uint16_t l4_len,
 // Returns true if the IP checksum is correct
 static inline bool VerifyIpv4NoOptChecksum(const Ipv4 &iph) {
   const auto *p = reinterpret_cast<const unsigned char *>(&iph);
-  uint64_t sum = checksum_internal::SumIpv4Header(p, false);
-  return FoldChecksum(checksum_internal::FoldForChecksum(sum)) == 0;
+  return FoldChecksum(checksum_internal::SumIpv4Header(p, false, 0)) == 0;
 }
 
 // Returns IP checksum of the ip header 'iph' without ip options
@@ -156,8 +152,7 @@ static inline bool VerifyIpv4NoOptChecksum(const Ipv4 &iph) {
 // It does not set the checksum field in ip header
 static inline uint16_t CalculateIpv4NoOptChecksum(const Ipv4 &iph) {
   const auto *p = reinterpret_cast<const unsigned char *>(&iph);
-  uint64_t sum = checksum_internal::SumIpv4Header(p, true);
-  return FoldChecksum(checksum_internal::FoldForChecksum(sum));
+  return FoldChecksum(checksum_internal::SumIpv4Header(p, true, 0));
 }
 
 // Returns true if the IP checksum is correct
@@ -173,9 +168,8 @@ static inline bool VerifyIpv4Checksum(const Ipv4 &iph) {
     return false;  // Invalid IP header
   }
 
-  uint64_t sum = CalculateSum(p + sizeof(iph), ip_header_len - sizeof(iph));
-  sum += checksum_internal::SumIpv4Header(p, false);
-  return FoldChecksum(checksum_internal::FoldForChecksum(sum)) == 0;
+  uint32_t sum = CalculateSum(p + sizeof(iph), ip_header_len - sizeof(iph));
+  return FoldChecksum(checksum_internal::SumIpv4Header(p, false, sum)) == 0;
 }
 
 // Returns IP checksum of the ip header 'iph'
@@ -193,9 +187,8 @@ static inline uint16_t CalculateIpv4Checksum(const Ipv4 &iph) {
     return 0;  // Invalid IP header. Give up.
   }
 
-  uint64_t sum = CalculateSum(p + sizeof(iph), ip_header_len - sizeof(iph));
-  sum += checksum_internal::SumIpv4Header(p, true);
-  return FoldChecksum(checksum_internal::FoldForChecksum(sum));
+  uint32_t sum = CalculateSum(p + sizeof(iph), ip_header_len - sizeof(iph));
+  return FoldChecksum(checksum_internal::SumIpv4Header(p, true, sum));
 }
 
 // Returns true if the UDP checksum is correct with the UDP header and
@@ -204,7 +197,7 @@ static inline uint16_t CalculateIpv4Checksum(const Ipv4 &iph) {
 // NOTE: Undefined behavior if udp_len < 8
 static inline bool VerifyIpv4UdpChecksum(const Udp &udph, be32_t src_ip,
                                          be32_t dst_ip, uint16_t udp_len) {
-  using checksum_internal::Load32;
+  using namespace checksum_internal;
   const auto *p = reinterpret_cast<const unsigned char *>(&udph);
 
   // UDP checksum is optional, and all zeroes mean "not computed"
@@ -213,12 +206,11 @@ static inline bool VerifyIpv4UdpChecksum(const Udp &udph, be32_t src_ip,
   }
 
   // UDP payload, header and pseudo header
-  uint64_t sum = CalculateSum(p + sizeof(udph), udp_len - sizeof(udph));
-  sum += Load32(p) + Load32(p + 4);
-  sum += checksum_internal::SumPseudoHeader(src_ip, dst_ip, udp_len,
-                                            Ipv4::Proto::kUdp);
-
-  return FoldChecksum(checksum_internal::FoldForChecksum(sum)) == 0;
+  uint32_t sum = CalculateSum(p + sizeof(udph), udp_len - sizeof(udph));
+  const uint32_t w[6] = {Load32(p),          Load32(p + 4),
+                         src_ip.raw_value(), dst_ip.raw_value(),
+                         PseudoLength(udp_len), PseudoProto(Ipv4::Proto::kUdp)};
+  return FoldChecksum(bess::arch::AddWords32(sum, w)) == 0;
 }
 
 // Returns true if the UDP checksum is correct
@@ -241,18 +233,18 @@ static inline bool VerifyIpv4UdpChecksum(const Ipv4 &iph, const Udp &udph) {
 // NOTE: Undefined behavior if udp_len < 8
 static inline uint16_t CalculateIpv4UdpChecksum(const Udp &udph, be32_t src,
                                                 be32_t dst, uint16_t udp_len) {
-  using checksum_internal::Load32;
+  using namespace checksum_internal;
   const auto *p = reinterpret_cast<const unsigned char *>(&udph);
 
   // UDP payload, header without the checksum field (bytes 6-7) and pseudo
   // header
-  uint64_t sum = CalculateSum(p + sizeof(udph), udp_len - sizeof(udph));
-  sum += Load32(p) + (Load32(p + 4) & 0xFFFF);
-  sum += checksum_internal::SumPseudoHeader(src, dst, udp_len,
-                                            Ipv4::Proto::kUdp);
+  uint32_t sum = CalculateSum(p + sizeof(udph), udp_len - sizeof(udph));
+  const uint32_t w[6] = {Load32(p),        Load32(p + 4) & 0xFFFF,
+                         src.raw_value(),  dst.raw_value(),
+                         PseudoLength(udp_len), PseudoProto(Ipv4::Proto::kUdp)};
 
   // If the result of UDP checksum calculation is 0, return all ones (rfc 768)
-  return FoldChecksum(checksum_internal::FoldForChecksum(sum)) ?: 0xFFFF;
+  return FoldChecksum(bess::arch::AddWords32(sum, w)) ?: 0xFFFF;
 }
 
 // Returns UDP (on IPv4) checksum of the UDP header 'udph' with ip header 'iph'
@@ -275,17 +267,17 @@ static inline uint16_t CalculateIpv4UdpChecksum(const Ipv4 &iph,
 // NOTE: Undefined behavior if tcp_len < 20
 static inline bool VerifyIpv4TcpChecksum(const Tcp &tcph, be32_t src_ip,
                                          be32_t dst_ip, uint16_t tcp_len) {
-  using checksum_internal::Load32;
+  using namespace checksum_internal;
   const auto *p = reinterpret_cast<const unsigned char *>(&tcph);
 
   // TCP options and payload, header and pseudo header
-  uint64_t sum = CalculateSum(p + sizeof(tcph), tcp_len - sizeof(tcph));
-  sum += Load32(p) + Load32(p + 4) + Load32(p + 8) + Load32(p + 12) +
-         Load32(p + 16);
-  sum += checksum_internal::SumPseudoHeader(src_ip, dst_ip, tcp_len,
-                                            Ipv4::Proto::kTcp);
-
-  return FoldChecksum(checksum_internal::FoldForChecksum(sum)) == 0;
+  uint32_t sum = CalculateSum(p + sizeof(tcph), tcp_len - sizeof(tcph));
+  const uint32_t w[9] = {Load32(p),          Load32(p + 4),
+                         Load32(p + 8),      Load32(p + 12),
+                         Load32(p + 16),     src_ip.raw_value(),
+                         dst_ip.raw_value(), PseudoLength(tcp_len),
+                         PseudoProto(Ipv4::Proto::kTcp)};
+  return FoldChecksum(bess::arch::AddWords32(sum, w)) == 0;
 }
 
 // Returns true if the TCP checksum is correct
@@ -310,18 +302,18 @@ static inline bool VerifyIpv4TcpChecksum(const Ipv4 &iph, const Tcp &tcph) {
 // NOTE: Undefined behavior if tcp_len < 20
 static inline uint16_t CalculateIpv4TcpChecksum(const Tcp &tcph, be32_t src,
                                                 be32_t dst, uint16_t tcp_len) {
-  using checksum_internal::Load32;
+  using namespace checksum_internal;
   const auto *p = reinterpret_cast<const unsigned char *>(&tcph);
 
   // TCP options and payload, header without the checksum field (bytes 16-17,
   // the low half of the fifth little-endian word) and pseudo header
-  uint64_t sum = CalculateSum(p + sizeof(tcph), tcp_len - sizeof(tcph));
-  sum += Load32(p) + Load32(p + 4) + Load32(p + 8) + Load32(p + 12) +
-         (Load32(p + 16) >> 16);
-  sum += checksum_internal::SumPseudoHeader(src, dst, tcp_len,
-                                            Ipv4::Proto::kTcp);
-
-  return FoldChecksum(checksum_internal::FoldForChecksum(sum));
+  uint32_t sum = CalculateSum(p + sizeof(tcph), tcp_len - sizeof(tcph));
+  const uint32_t w[9] = {Load32(p),       Load32(p + 4),
+                         Load32(p + 8),   Load32(p + 12),
+                         Load32(p + 16) >> 16, src.raw_value(),
+                         dst.raw_value(), PseudoLength(tcp_len),
+                         PseudoProto(Ipv4::Proto::kTcp)};
+  return FoldChecksum(bess::arch::AddWords32(sum, w));
 }
 
 // Returns TCP (on IPv4) checksum of the tcp header 'tcph' with ip header 'iph'

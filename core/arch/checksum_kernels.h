@@ -3,7 +3,8 @@
 #ifndef BESS_ARCH_CHECKSUM_KERNELS_H_
 #define BESS_ARCH_CHECKSUM_KERNELS_H_
 
-// The bulk loop of the Internet checksum (utils/checksum.h) (M21, D-071).
+// The add-with-carry kernels of the Internet checksum (utils/checksum.h)
+// (M21, D-071).
 // x86-64 keeps the AVX2 and add-with-carry kernels BESS has always used: the
 // portable loop below, as GCC vectorizes it for x86-64-v3, is 11-25% slower
 // from 1 KiB up and ~40% slower at 40-64 bytes (.scratch/m21/b1). Every path
@@ -125,6 +126,72 @@ inline uint64_t SumWords32(const unsigned char *p, size_t len) noexcept {
   }
   uint64_t sum = lo + hi;
   return (sum >> 32) + (sum & 0xFFFFFFFF);
+#endif
+}
+
+// Adds the 32-bit words `w` to `sum` with end-around carry (the header and
+// pseudo-header part of the IPv4/UDP/TCP checksums, N = 5, 6 or 9). Returns
+// a value congruent to the total modulo 2^32 - 1 that is zero only if `sum`
+// and every word are zero. On x86-64 one add/adc chain, as BESS always did:
+// the portable 64-bit sum and fold was 7% slower on the IPv4 header checksum
+// and 4-17% on 64-byte UDP/TCP packets (.scratch/m21/b1). The words are
+// values (loaded by the caller with memcpy), so no memory operand can be
+// misaligned.
+template <size_t N>
+inline uint32_t AddWords32(uint32_t sum, const uint32_t (&w)[N]) noexcept {
+#if defined(BESS_ARCH_X86) && defined(__x86_64__)
+  static_assert(N == 5 || N == 6 || N == 9, "add an asm chain for this N");
+  // "+&r": the sum must not share a register with any input (GCC may merge
+  // inputs it proves equal to the initial sum).
+  if constexpr (N == 5) {
+    asm("addl %[w0], %[s] \n\t"
+        "adcl %[w1], %[s] \n\t"
+        "adcl %[w2], %[s] \n\t"
+        "adcl %[w3], %[s] \n\t"
+        "adcl %[w4], %[s] \n\t"
+        "adcl $0, %[s]"
+        : [s] "+&r"(sum)
+        : [w0] "g"(w[0]), [w1] "g"(w[1]), [w2] "g"(w[2]), [w3] "g"(w[3]),
+          [w4] "g"(w[4])
+        : "cc");
+  } else if constexpr (N == 6) {
+    asm("addl %[w0], %[s] \n\t"
+        "adcl %[w1], %[s] \n\t"
+        "adcl %[w2], %[s] \n\t"
+        "adcl %[w3], %[s] \n\t"
+        "adcl %[w4], %[s] \n\t"
+        "adcl %[w5], %[s] \n\t"
+        "adcl $0, %[s]"
+        : [s] "+&r"(sum)
+        : [w0] "g"(w[0]), [w1] "g"(w[1]), [w2] "g"(w[2]), [w3] "g"(w[3]),
+          [w4] "g"(w[4]), [w5] "g"(w[5])
+        : "cc");
+  } else {
+    asm("addl %[w0], %[s] \n\t"
+        "adcl %[w1], %[s] \n\t"
+        "adcl %[w2], %[s] \n\t"
+        "adcl %[w3], %[s] \n\t"
+        "adcl %[w4], %[s] \n\t"
+        "adcl %[w5], %[s] \n\t"
+        "adcl %[w6], %[s] \n\t"
+        "adcl %[w7], %[s] \n\t"
+        "adcl %[w8], %[s] \n\t"
+        "adcl $0, %[s]"
+        : [s] "+&r"(sum)
+        : [w0] "g"(w[0]), [w1] "g"(w[1]), [w2] "g"(w[2]), [w3] "g"(w[3]),
+          [w4] "g"(w[4]), [w5] "g"(w[5]), [w6] "g"(w[6]), [w7] "g"(w[7]),
+          [w8] "g"(w[8])
+        : "cc");
+  }
+  return sum;
+#else
+  uint64_t s = sum;
+  for (uint32_t v : w) {
+    s += v;
+  }
+  s = (s >> 32) + (s & 0xFFFFFFFF);
+  s += s >> 32;
+  return static_cast<uint32_t>(s);
 #endif
 }
 
