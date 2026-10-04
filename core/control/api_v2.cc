@@ -551,7 +551,8 @@ grpc::Status ControlV2Service::GetCapabilities(grpc::ServerContext *,
     out->set_tx_outer_udp_checksum(tx.checksums.outer_udp);
     out->set_tx_multi_segment(tx.multi_segment_tx);
   }
-  for (const v2::TransactionResource &r : transactions_.List().resources()) {
+  const v2::ListTransactionResourcesResponse listed = transactions_.List();
+  for (const v2::TransactionResource &r : listed.resources()) {
     *response->add_resources() = r;
   }
   response->set_daemon_epoch(transactions_.epoch());
