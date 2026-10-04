@@ -7,6 +7,12 @@ on:
   pull_request:
     branches: [master, develop]
 
+# A new push to a pull request cancels its older run; pushes to develop,
+# master and tags each run to completion.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   # The CPU floor is per architecture and comes from tools/ci_profile.py
   # (x86_64: x86-64-v3, decision D-016; aarch64: armv8.2-a, M21). The first
@@ -69,82 +75,33 @@ jobs:
           go vet ./...
           go test -race -count=1 ./...
 
+  # The lane table lives in tools/ci_profile.py (LANES, with the compiler
+  # pins); pull requests run the gating pair and the sanitizer lanes, pushes
+  # every lane (docs/ci-parity.md).
+  lanes:
+    name: Lanes
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: tools/ci_profile.py
+          sparse-checkout-cone-mode: false
+      - id: pick
+        run: python3 tools/ci_profile.py lanes --event ${{ github.event_name }} >> "$GITHUB_OUTPUT"
+
   build-and-test:
     name: Meson (${{ matrix.name }})
+    needs: lanes
     runs-on: ${{ matrix.os }}
-    # The ubuntu-24.04 x86 pair gates. The other lanes are experimental and
-    # must not block a merge: the ubuntu-26.04 lanes show toolchain and library
-    # drift (GCC 15, Clang 22; ubuntu-latest moves to 26.04 between 2026-10-19
-    # and 2026-11-19) before it reaches the gating lanes; the arm64 and generic
-    # lanes are new (M21) and gate once they have been green.
-    continue-on-error: ${{ matrix.experimental == true }}
+    # Only the gating lanes (ubuntu-24.04 x86 gcc and clang) may block a merge.
+    continue-on-error: ${{ matrix.experimental }}
     env:
       LANE: --cc ${{ matrix.cc }} --cxx ${{ matrix.cxx }} --name ${{ matrix.name }} ${{ matrix.lane_args }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # GCC 14 (Ubuntu 24.04 noble-updates): the distro default is 13,
-          # which lacks C++23 features the codebase may use (deducing this).
-          - name: gcc
-            os: ubuntu-24.04
-            cc: gcc-14
-            cxx: g++-14
-          # Clang 19 updates __cpp_concepts for libstdc++'s C++23 <expected>.
-          - name: clang
-            os: ubuntu-24.04
-            cc: clang-19
-            cxx: clang++-19
-          # x86 with -Darch_generic=true: core/arch/ takes the portable paths
-          # every other architecture runs, so they are built (benchmarks
-          # included) and tested on each push. A lane of its own, in parallel:
-          # the gating lanes keep testing the x86 paths that ship.
-          - name: gcc-generic
-            os: ubuntu-24.04
-            experimental: true
-            cc: gcc-14
-            cxx: g++-14
-            lane_args: --arch-generic
-          # arm64: GitHub's ubuntu-24.04-arm runners (Azure Cobalt 100,
-          # Neoverse N2), the same compilers, DPDK bootstrap and steps as the
-          # gating pair, built for the armv8.2-a floor. AF_XDP stays required:
-          # Ubuntu 24.04 ships libxdp-dev/libbpf-dev for arm64.
-          - name: gcc-arm64
-            os: ubuntu-24.04-arm
-            experimental: true
-            cc: gcc-14
-            cxx: g++-14
-          - name: clang-arm64
-            os: ubuntu-24.04-arm
-            experimental: true
-            cc: clang-19
-            cxx: clang++-19
-          # Sanitizers (M22, D-072): ASan+UBSan over the unit, architecture,
-          # plugin and fuzz-corpus suites; TSan over the concurrency tests in
-          # tools/sanitizers/tsan_tests.txt. Experimental until green, then
-          # gating.
-          - name: clang-asan
-            os: ubuntu-24.04
-            experimental: true
-            cc: clang-19
-            cxx: clang++-19
-            lane_args: --sanitize address
-          - name: clang-tsan
-            os: ubuntu-24.04
-            experimental: true
-            cc: clang-19
-            cxx: clang++-19
-            lane_args: --sanitize thread
-          - name: gcc-u26
-            os: ubuntu-26.04
-            experimental: true
-            cc: gcc-15
-            cxx: g++-15
-          - name: clang-u26
-            os: ubuntu-26.04
-            experimental: true
-            cc: clang-22
-            cxx: clang++-22
+      matrix: ${{ fromJSON(needs.lanes.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v7
@@ -184,7 +141,7 @@ jobs:
 
       # The configuration and the verification steps live in tools/ci_profile.py,
       # which a developer runs unchanged (docs/ci-parity.md).
-      - name: Check the script's compiler pins match this matrix
+      - name: Check the lanes' compiler pins
         run: python3 tools/ci_profile.py check-pins
 
       - name: Bootstrap pinned DPDK

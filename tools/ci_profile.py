@@ -48,9 +48,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# The CI lanes. These must equal the matrix in .github/workflows/ci.yml;
-# `check-pins` fails when they do not, and CI runs it. The arm64 and generic
-# lanes (<family>-arm64, <family>-generic) use their family's pin.
+# The compiler pin of each lane family. The arm64, generic and sanitizer lanes
+# (<family>-arm64, ...) use their family's pin; `check-pins` checks LANES
+# against it, and CI runs it.
 PINS = {
     'gcc': ('gcc-14', 'g++-14'),
     'clang': ('clang-19', 'clang++-19'),
@@ -61,6 +61,46 @@ SANITIZERS = {'address': '-asan', 'thread': '-tsan'}
 # TSan needs DPDK's C11 atomics and no x86 inline asm in the headers BESS
 # inlines, or it reports the ring and spinlock code as races.
 TSAN_DPDK_ARGS = '-DRTE_USE_C11_MEM_MODEL -DRTE_FORCE_INTRINSICS'
+# The CI lanes: the build-and-test matrix of .github/workflows/ci.yml, which
+# reads it from `ci_profile.py lanes`. The ubuntu-24.04 x86 pair gates. The
+# others are experimental and must not block a merge: the ubuntu-26.04 lanes
+# show toolchain and library drift (GCC 15, Clang 22) before it reaches the
+# gating lanes; the arm64 and generic lanes are new (M21) and gate once they
+# have been green. `push_only` lanes run on pushes to develop/master and tags,
+# not on pull requests: they catch drift and portability breaks a release
+# later, and leaving them out halves a pull request's runner time. The
+# sanitizer lanes run on pull requests.
+LANES = [
+    # GCC 14 (Ubuntu 24.04 noble-updates): the distro default is 13, which
+    # lacks C++23 features the codebase may use (deducing this).
+    {'name': 'gcc', 'os': 'ubuntu-24.04', 'cc': 'gcc-14', 'cxx': 'g++-14'},
+    # Clang 19 updates __cpp_concepts for libstdc++'s C++23 <expected>.
+    {'name': 'clang', 'os': 'ubuntu-24.04', 'cc': 'clang-19', 'cxx': 'clang++-19'},
+    # x86 with -Darch_generic=true: core/arch/ takes the portable paths every
+    # other architecture runs, so they are built (benchmarks included) and
+    # tested; the gating lanes keep testing the x86 paths that ship.
+    {'name': 'gcc-generic', 'os': 'ubuntu-24.04', 'cc': 'gcc-14', 'cxx': 'g++-14',
+     'lane_args': '--arch-generic', 'experimental': True, 'push_only': True},
+    # arm64: GitHub's ubuntu-24.04-arm runners (Azure Cobalt 100, Neoverse
+    # N2), the same compilers, DPDK bootstrap and steps as the gating pair,
+    # built for the armv8.2-a floor. AF_XDP stays required: Ubuntu 24.04 ships
+    # libxdp-dev/libbpf-dev for arm64.
+    {'name': 'gcc-arm64', 'os': 'ubuntu-24.04-arm', 'cc': 'gcc-14', 'cxx': 'g++-14',
+     'experimental': True, 'push_only': True},
+    {'name': 'clang-arm64', 'os': 'ubuntu-24.04-arm', 'cc': 'clang-19', 'cxx': 'clang++-19',
+     'experimental': True, 'push_only': True},
+    # Sanitizers (M22, D-072): ASan+UBSan over the unit, architecture, plugin
+    # and fuzz-corpus suites; TSan over the concurrency tests in
+    # tools/sanitizers/tsan_tests.txt. Experimental until green, then gating.
+    {'name': 'clang-asan', 'os': 'ubuntu-24.04', 'cc': 'clang-19', 'cxx': 'clang++-19',
+     'lane_args': '--sanitize address', 'experimental': True},
+    {'name': 'clang-tsan', 'os': 'ubuntu-24.04', 'cc': 'clang-19', 'cxx': 'clang++-19',
+     'lane_args': '--sanitize thread', 'experimental': True},
+    {'name': 'gcc-u26', 'os': 'ubuntu-26.04', 'cc': 'gcc-15', 'cxx': 'g++-15',
+     'experimental': True, 'push_only': True},
+    {'name': 'clang-u26', 'os': 'ubuntu-26.04', 'cc': 'clang-22', 'cxx': 'clang++-22',
+     'experimental': True, 'push_only': True},
+]
 FALLBACK = {
     'gcc': ('gcc', 'g++'),
     'clang': ('clang', 'clang++'),
@@ -499,29 +539,37 @@ def info(s):
         print(f'  - {d}')
 
 
+def ci_lanes(event):
+    """The build-and-test matrix for a GitHub event, as the workflow's
+    `matrix=` output."""
+    include = [{k: v for k, v in lane.items() if k != 'push_only'}
+               for lane in LANES if not (event == 'pull_request' and lane.get('push_only'))]
+    for lane in include:
+        lane.setdefault('lane_args', '')
+        lane.setdefault('experimental', False)
+    return 'matrix=' + json.dumps({'include': include}, separators=(',', ':'))
+
+
 def check_pins():
-    import yaml
-    workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
-    matrix = workflow['jobs']['build-and-test']['strategy']['matrix']['include']
-    lanes = {m['name']: (m['cc'], m['cxx']) for m in matrix}
-    gating = {m['name'] for m in matrix if not m.get('experimental')}
+    lanes = {m['name']: (m['cc'], m['cxx']) for m in LANES}
+    gating = {m['name'] for m in LANES if not m.get('experimental')}
     bad = []
     for family, pair in PINS.items():
         if family not in gating or lanes[family] != pair:
-            bad.append(f'{family}: script pins {pair}, ci.yml gating lane has '
+            bad.append(f'{family}: PINS has {pair}, the gating lane has '
                        f'{lanes.get(family) if family in gating else None}')
         for suffix in LANE_SUFFIXES:
             name = family + suffix
             if name in lanes and lanes[name] != pair:
-                bad.append(f'{name}: script pins {pair}, ci.yml has {lanes[name]}')
+                bad.append(f'{name}: PINS has {pair}, the lane has {lanes[name]}')
     known = {family + suffix for family in PINS for suffix in ('',) + LANE_SUFFIXES}
     extra = gating - known
     if extra:
-        bad.append(f'ci.yml gating lanes without a pin here: {sorted(extra)}')
+        bad.append(f'gating lanes without a pin: {sorted(extra)}')
     if bad:
-        raise SystemExit('ci_profile.py and ci.yml disagree:\n  ' + '\n  '.join(bad))
+        raise SystemExit('LANES and PINS disagree:\n  ' + '\n  '.join(bad))
     pinned = sorted(lanes.keys() & known)
-    print('pins match ci.yml lanes:', ', '.join(pinned),
+    print('pins match the CI lanes:', ', '.join(pinned),
           f'(gating: {", ".join(sorted(gating))})')
 
 
@@ -555,7 +603,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('step', choices=[n for n, _ in STEPS + RELEASE_STEPS]
-                        + ['all', 'release', 'info', 'check-pins', 'check-cpu', 'cpu'])
+                        + ['all', 'release', 'info', 'check-pins', 'check-cpu', 'cpu', 'lanes'])
     parser.add_argument('--compiler', choices=sorted(PINS))
     parser.add_argument('--cc')
     parser.add_argument('--cxx')
@@ -571,7 +619,11 @@ def main():
                         help='local runs use ccache when installed; it does not '
                         'change the generated code')
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--event', help='lanes: the GitHub event (pull_request, push)')
     args = parser.parse_args()
+    if args.step == 'lanes':
+        print(ci_lanes(args.event))
+        return 0
     if args.step == 'check-pins':
         check_pins()
         return 0
