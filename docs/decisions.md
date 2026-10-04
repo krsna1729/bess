@@ -111,6 +111,7 @@ file is the reasoning.
 | D-088 | SDK desired state (PipelineBuilder, plan/apply), black-box recovery tests, a controller on the SDK (M27) | accepted |
 | D-089 | Bounded-backpressure observability: pressure transitions, throttled packet-path events, DPDK tracing (M25 phase 3) | accepted |
 | D-090 | Plugin unload refuses while the plugin's code is reachable (roadmap 28.4) | accepted |
+| D-091 | Accepted: BM_ThreadsWorkerLocalUpdate +6.7% (2 threads), not attributable to a code change (roadmap 23.2) | accepted |
 
 
 ---
@@ -7405,4 +7406,25 @@ after it was unmapped.
 `unload_plugin` answers EBUSY naming "module su0" and the class stays registered; after `destroy_module` the unload
 succeeds, and the class and the plugin are gone from `list_mclasses` and `list_plugins`. Mutant: without the module
 check the test fails ("a plugin with a live module was unloaded").
+
+
+## D-091 Accepted: BM_ThreadsWorkerLocalUpdate +6.7% (2 threads), not attributable to a code change (roadmap 23.2)
+
+**Status:** accepted (2026-10-05).
+**Code:** none.
+
+**Context.** Roadmap 23.2: a regression above 3% is explained or accepted with a rationale. The M0 paired baseline
+(MODERNIZATION.md entry 143) and its bisect (entry 147) left one stats row open: `BM_ThreadsWorkerLocalUpdate` with two
+threads, +6.7% (0 of 16 pairs better; 1.10 to 1.16 ns per update), first bad at 22acce04 (M8, D-050). The acceptance
+audit of Appendix J (meter/stats baseline retained) found it neither explained nor accepted.
+
+**Decision.** Accepted, not pursued. The evidence says no code change caused it: 22acce04 changes no stats code; the
+benchmark function's instructions are identical in the good and bad builds, at the same address modulo 64, with its
+statics at the same addresses modulo 4,096; giving each worker's slot its own 128-byte line pair (against
+adjacent-line prefetch pairing) changed nothing (1.207 vs 1.212 ns). What remains is the binaries' layout or the
+measurement session, which no source change controls. The cost is 0.06 ns per worker-local update, in a benchmark of
+two threads updating adjacent slots; the single-thread update rows and every packet-path stats row show no difference.
+
+**Revisit when:** a change to `stats/worker_local.h` or `stats/worker_slots.h`, or a packet-path benchmark that shows
+counter updates, regresses; then the row is measured again alongside it.
 
