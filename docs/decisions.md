@@ -7067,5 +7067,12 @@ schema also needs to know which RPCs an older daemon lacks (WatchEvents will be 
 - Not included: offload capabilities beyond the transmit offloads a port accepted; a port's flow-rule support is only
   known by validating rules (M20), so it stays with the offload owner.
 
-**Evidence.** EVIDENCE
+**Evidence.** Fast build: 133/133 with the Go SDK's live test (Docker toolchain): `Capabilities` names a version and
+module classes, `Supports("ApplyTransaction")` holds, `Metrics` returns samples. Python live
+(`control_sdk.py test_capabilities`): the version, `bess.pb.v2.Control/GetCapabilities` among the RPCs,
+`supports('ApplyTransaction')` true and `supports('NoSuchRpc')` false, `ExactMatch` among the module classes, the
+module's resource listed, the epoch equal to the client's, the harness's Unix socket port listed with its driver and
+one receive queue, and `bess_transaction_generation` among the metrics. Unit (Python 25, Go): an old daemon
+(UNIMPLEMENTED) supports nothing newer, another refusal (PERMISSION_DENIED) is raised, not reported as
+unsupported; a discovery call that sees a new epoch retires an old resource handle before anything is sent.
 
