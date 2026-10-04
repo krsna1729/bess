@@ -426,12 +426,23 @@ struct FaultFixture {
     }
     ASSERT_EQ(4u, owner.outstanding());
   }
+  // Installs a batch and records the handles of the rules it submitted --
+  // also when it stops with an exception.
   size_t InstallBatch(std::span<const uint64_t> rules, std::span<const uint64_t> cookies,
                       std::span<InstallResult> out) {
-    const size_t n = owner.InstallBatch(0, rules, cookies, out);
-    for (size_t i = 0; i < out.size() && out[i].status == InstallError::kOk; i++) {
-      handles.push_back(out[i].handle);
+    const auto record = [&] {
+      for (size_t i = 0; i < out.size() && out[i].status == InstallError::kOk; i++) {
+        handles.push_back(out[i].handle);
+      }
+    };
+    size_t n = 0;
+    try {
+      n = owner.InstallBatch(0, rules, cookies, out);
+    } catch (...) {
+      record();
+      throw;
     }
+    record();
     return n;
   }
   // What the application can observe, MARK values aside: a refused install's
@@ -511,7 +522,8 @@ TEST(FlowRuleOwnerFaultTest, InstallBatchFailureAtEveryPointLeavesNoTrace) {
       // The reference: the same owner given only the rules before the stop.
       FaultFixture ref;
       ref.Prepare();
-      std::vector<InstallResult> ref_out(kBatch);
+      std::vector<InstallResult> ref_out(kBatch,
+                                         InstallResult{InstallError::kUnsupported, {}, 0, 0});
       ASSERT_EQ(submitted, ref.InstallBatch(std::span(rules).first(submitted),
                                             std::span(cookies).first(submitted),
                                             std::span(ref_out).first(submitted)));
