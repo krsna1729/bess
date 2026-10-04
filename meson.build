@@ -56,6 +56,15 @@ if get_option('arch_generic')
 endif
 add_project_arguments(bess_isa_args, language: 'cpp')
 
+# Whether flow tables check their owner thread (flow/owner.h). It changes a
+# table's layout, so bessd and every plugin built from bess-dev must agree:
+# one value, from bessd's build type, for both (a plugin's own NDEBUG does not
+# decide it). Meson's if-release defines NDEBUG for release and plain builds.
+bess_ndebug = get_option('b_ndebug') == 'true' or (
+  get_option('b_ndebug') == 'if-release' and get_option('buildtype') in ['release', 'plain'])
+bess_abi_args = ['-DBESS_FLOW_OWNER_CHECKS=@0@'.format(bess_ndebug ? 0 : 1)]
+add_project_arguments(bess_abi_args, language: 'cpp')
+
 add_project_arguments(
   '-D_GNU_SOURCE',
   '-DGLOG_USE_GLOG_EXPORT',
@@ -261,7 +270,7 @@ pkg.generate(
   description: 'BESS dataplane plugin and module development headers',
   version: meson.project_version(),
   subdirs: ['bess', 'bess/core'],
-  extra_cflags: bess_isa_args + dpdk_pc_cflags +
+  extra_cflags: bess_isa_args + bess_abi_args + dpdk_pc_cflags +
                 ['-D_GNU_SOURCE', '-DGLOG_USE_GLOG_EXPORT', '-include', 'cinttypes'],
   libraries: dpdk_plugin_libs,
   requires: ['libglog', 'protobuf'],

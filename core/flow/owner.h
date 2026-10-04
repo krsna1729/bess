@@ -60,8 +60,18 @@ struct UncheckedOwner {
   static OwnerToken Current() noexcept { return kNoOwner; }
 };
 
-// Debug builds check the calling thread; release builds check nothing.
-#ifdef NDEBUG
+// Debug builds check the calling thread; release builds check nothing. The
+// choice changes a table's layout, so bessd and every plugin must agree: the
+// build passes BESS_FLOW_OWNER_CHECKS (0 or 1) to bessd and in bess-dev's
+// cflags, from bessd's build type, whatever a plugin's own NDEBUG. Without it
+// (a consumer of the bare headers), NDEBUG decides, as before.
+#if defined(BESS_FLOW_OWNER_CHECKS)
+#if BESS_FLOW_OWNER_CHECKS
+using DefaultOwner = ThreadOwner;
+#else
+using DefaultOwner = UncheckedOwner;
+#endif
+#elif defined(NDEBUG)
 using DefaultOwner = UncheckedOwner;
 #else
 using DefaultOwner = ThreadOwner;

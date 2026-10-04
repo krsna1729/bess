@@ -27,6 +27,13 @@ equal that table (`tools/check_installed_headers.py`, run on the staged
 install in CI), so a header cannot be installed without being classified or
 classified without being installed. Promoting a header is a recorded decision.
 
+One layout choice is bessd's, not the plugin's: whether flow tables check their
+owner thread (`flow/owner.h`) changes `WorkerFlowTable`'s layout, so `bess-dev`
+carries `-DBESS_FLOW_OWNER_CHECKS=<0|1>` from bessd's build type. A plugin built
+with another build type (a release plugin for a debug bessd) still agrees with
+the daemon it loads into; a table shared through the `InstanceRegistry` has one
+layout on both sides.
+
 The same check compiles a set of twins against the staged install, each a line
 that must compile and one that must not, with the compiler's diagnostic
 matched (M23): strong ids (`ActionId`, `NextHopId`, `NextHopGroupId`,
