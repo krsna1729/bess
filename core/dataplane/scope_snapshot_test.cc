@@ -972,8 +972,16 @@ TEST(ReferentialStressTest, ConcurrentReadersFollowReferencesToAtLeastTheSameEpo
   }
   bool writer_ok = true;
   const auto deadline = std::chrono::steady_clock::now() + kStressTime;
+  // Keep writing until the readers have done their reads too: on one CPU they
+  // get few turns in kStressTime. The hard deadline only stops a hang.
+  const auto hard_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
   uint32_t epoch = 2;
-  for (; StressRunning(epoch, deadline) && writer_ok; epoch++) {
+  for (; (StressRunning(epoch, deadline) || reads.load() <= 1000u) &&
+         std::chrono::steady_clock::now() < hard_deadline && writer_ok;
+       epoch++) {
+    if (epoch % 64 == 0) {
+      std::this_thread::yield();
+    }
     for (;;) {
       const auto r =
           w.engine.Apply(std::vector<Op>{w.Hop(1, epoch, 1), w.Met(1, epoch)});
