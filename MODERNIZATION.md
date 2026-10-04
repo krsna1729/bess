@@ -5030,6 +5030,13 @@ rather than one call site).
      PMD by a throwaway program). 11 tests, 23 mutants caught, 2 equivalent. The
      real-hardware matrix is not run (no NIC here) and stays a separate gate.
 
+159. **M21 portability (D-071).** `core/arch/` is the one place for ISA code; `BESS_ARCH_GENERIC` builds the portable
+     paths on x86. Portable copy, mask, VLAN, packet-pool rearm and CRC; x86 kernels kept where measured (checksum
+     bulk sum, L2 probe, tag match, cuckoo AVX2, HTTP scan). Memory ordering moved from x86 TSO assumptions to C++
+     atomics. DPDK machine flags filtered; `bess-dev.pc` carries bessd's ISA. `check_arch.py` with a shrink-only
+     allowlist (204 findings in 39 files -> 7 in 4, the BPF JIT). Experimental ARM64 and generic CI lanes. Header
+     checksums 4-17% slower on small packets: next change.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
