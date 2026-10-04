@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "arch/crc32c.h"
 #include "dataplane/table_policy.h"
 
 namespace bess::l2 {
@@ -135,6 +136,47 @@ TYPED_TEST(PackedMacTableTest, KeysWithADomainNeverMatch) {
   // The all-ones MAC is an ordinary key.
   ASSERT_NE(t->Insert(Key(~uint64_t{0}), 9, 1), Table::kNotFound);
   EXPECT_EQ(t->Lookup(Key(~uint64_t{0})), 9u);
+}
+
+// CRC32C is linear: a MAC difference d with CRC(d) = 0 exists (48 bits onto
+// 32) and gives pairs k, k ^ d with the same CRC under any initial value, so
+// a seed there would not stop an attacker building colliding MACs. With the
+// secret multiplier first, such a pair shares a bucket pair only by chance.
+TEST(PackedMacTableHashTest, LinearCrcCollisionsDoNotSurviveTheSeed) {
+  // Gaussian elimination over GF(2) on the CRCs of the 48 MAC bits.
+  struct Row {
+    uint32_t crc;
+    uint64_t combo;  // which MAC bits XOR to this CRC
+  };
+  std::vector<Row> basis;
+  uint64_t d = 0;
+  for (int bit = 0; bit < 48 && d == 0; bit++) {
+    Row r{arch::Crc32c(Key(uint64_t{1} << bit), 0), uint64_t{1} << bit};
+    for (const Row &b : basis) {
+      if ((r.crc ^ b.crc) < r.crc) {  // b's leading bit is set in r
+        r.crc ^= b.crc;
+        r.combo ^= b.combo;
+      }
+    }
+    if (r.crc == 0) {
+      d = r.combo;  // a nonzero difference with CRC 0
+    } else {
+      basis.push_back(r);
+      std::sort(basis.begin(), basis.end(), [](const Row &x, const Row &y) { return x.crc > y.crc; });
+    }
+  }
+  ASSERT_NE(d, 0u);
+  const uint64_t k1 = Key(0x0200'0000'0001), k2 = Key(0x0200'0000'0001 ^ d);
+  ASSERT_EQ(arch::Crc32c(k1, 0), arch::Crc32c(k2, 0));
+  ASSERT_EQ(arch::Crc32c(k1, 0x1234567), arch::Crc32c(k2, 0x1234567)) << "linear in the seed too";
+  using Table = PackedMacTable<uint32_t>;
+  int shared = 0;
+  for (int i = 0; i < 16; i++) {
+    auto t = Table::Create(1 << 16);
+    shared += t->PrimaryBucketForTesting(k1) == t->PrimaryBucketForTesting(k2) &&
+              t->AltBucketForTesting(k1) == t->AltBucketForTesting(k2);
+  }
+  EXPECT_LE(shared, 1) << "a CRC-colliding pair kept colliding across seeds";
 }
 
 // Deterministic (D-007): a reader at the exact point inside a move.

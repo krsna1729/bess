@@ -48,14 +48,14 @@ const Commands Bridge::cmds = {
 CommandResponse Bridge::Init(const bess::pb::BridgeArg &arg) {
   max_entries_ = arg.size() ? arg.size() : 1024;
   const uint64_t aging_sec = arg.aging_time() ? arg.aging_time() : 300;
-  l2::Fdb::Config config;
+  Fdb::Config config;
   config.capacity = max_entries_ + kStaticReserve;
   config.learn_limit = max_entries_;
   config.aging = aging_sec * 1'000'000'000ull;
   config.granularity_shift = kGranularityShift;
   config.max_domains = 1;
   config.start = tsc_to_ns(rdtsc());
-  auto fdb = l2::Fdb::Create(config);
+  auto fdb = Fdb::Create(config);
   if (!fdb) {
     return CommandFailure(ENOMEM, "cannot create the FDB for %u entries",
                           max_entries_);

@@ -104,7 +104,7 @@ concept FdbStorage = requires(T t, const T ct, uint64_t key, uint32_t slot,
                               std::span<const uint64_t> keys) {
   { T::Create(size_t{}) } -> std::same_as<std::unique_ptr<T>>;
   { ct.Lookup(key) } -> std::same_as<uint32_t>;
-  { ct.LookupBatch(keys, static_cast<uint16_t *>(nullptr)) } -> std::same_as<uint64_t>;
+  { ct.LookupBatch(keys, static_cast<dataplane::InterfaceId *>(nullptr)) } -> std::same_as<uint64_t>;
   { ct.Find(key) } -> std::same_as<uint32_t>;
   { t.Insert(key, uint16_t{}, uint8_t{}) } -> std::same_as<uint32_t>;
   t.Erase(slot);
@@ -200,17 +200,11 @@ class BasicFdb {
                        std::span<dataplane::InterfaceId> out) const noexcept {
     promise(keys.size() <= kMaxBatch && out.size() >= keys.size());
     uint64_t words[kMaxBatch];
-    uint16_t values[kMaxBatch];
     for (size_t i = 0; i < keys.size(); i++) {
       words[i] = Word(keys[i]);
     }
     // A miss reads value 0, kInvalidInterfaceId.
-    const uint64_t hits =
-        table_->LookupBatch(std::span<const uint64_t>(words, keys.size()), values);
-    for (size_t i = 0; i < keys.size(); i++) {
-      out[i] = dataplane::InterfaceId(values[i]);
-    }
-    return hits;
+    return table_->LookupBatch(std::span<const uint64_t>(words, keys.size()), out.data());
   }
 
   // -- learning -----------------------------------------------------------------

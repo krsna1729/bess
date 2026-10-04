@@ -138,15 +138,18 @@ class MacTable {
     return s == kNotFound ? 0 : value(s);
   }
 
-  // values[i] = the value for keys[i], 0 for a miss; bit i set for a hit.
-  uint64_t LookupBatch(std::span<const uint64_t> keys, uint16_t *values) const noexcept {
+  // values[i] = V(the value for keys[i]), V(0) for a miss; bit i set for a
+  // hit. V is the caller's value type (the FDB's InterfaceId), so the result
+  // is written once, where the caller wants it.
+  template <typename V = uint16_t>
+  uint64_t LookupBatch(std::span<const uint64_t> keys, V *values) const noexcept {
     uint32_t slots[kMaxBatch];
     FindBatch(keys, slots);
     uint64_t hits = 0;
     for (size_t i = 0; i < keys.size(); i++) {
       const uint16_t v = slots[i] != kNotFound ? value(slots[i]) : 0;
       hits |= uint64_t{v != 0} << i;
-      values[i] = v;
+      values[i] = V(v);
     }
     return hits;
   }

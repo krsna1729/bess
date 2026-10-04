@@ -10,7 +10,8 @@
 //     over PackedMacTable with OwnerWrites / SingleWriter / MultiWriter (table
 //     policy TP2: one-word slots, lock-free shared readers); 7 the raw
 //     PackedMacTable<SingleWriter> as L2Forward calls it (the direct
-//     comparison with 1); stream 0 one hot
+//     comparison with 1); 8 l2::Fdb (MacTable) through the same templated
+//     loop as 4-6 (their like-for-like baseline); stream 0 one hot
 //     MAC, 1 uniform hit, 2 miss
 //   BM_L2Learn/<backend>/<n>   ns per learn of a uniformly chosen MAC on a
 //     table holding n, half of them already present (refresh or move) and half
@@ -135,7 +136,23 @@ void BM_L2Lookup(benchmark::State &state) {
     hits += h;
   };
   if (backend == 0) {
-    run_fdb(FdbWith(n));
+    // Written out as before the FDB became a template, so a before/after
+    // comparison of backend 0 times the library and not the harness.
+    auto f = FdbWith(n);
+    InterfaceId out[Fdb::kMaxBatch];
+    for (auto _ : state) {
+      if (batch == 1) {
+        const InterfaceId got = f->Lookup(kD, macs[pos]);
+        sink += got.value();
+        hits += got != bess::dataplane::kInvalidInterfaceId;
+      } else {
+        sink += f->LookupBatch(std::span<const FdbKey>(&keys[pos], batch),
+                               std::span<InterfaceId>(out, batch));
+      }
+      pos = (pos + batch) & (kStream - 1);
+    }
+  } else if (backend == 8) {
+    run_fdb(FdbWith(n));  // MacTable through the same path as 4-6
   } else if (backend == 4) {
     run_fdb(FdbWith<PackedFdb<bess::dataplane::OwnerWrites>>(n));
   } else if (backend == 5) {
@@ -293,7 +310,7 @@ void BM_FdbAge(benchmark::State &state) {
 }
 
 BENCHMARK(BM_L2Lookup)
-    ->ArgsProduct({{0, 1, 2, 3, 4, 5, 6, 7}, {1024, 65536, 1048576}, {0, 1, 2}, {1, 32}})
+    ->ArgsProduct({{0, 1, 2, 3, 4, 5, 6, 7, 8}, {1024, 65536, 1048576}, {0, 1, 2}, {1, 32}})
     ->MinTime(0.25);
 BENCHMARK(BM_L2Learn)->ArgsProduct({{0, 2, 4, 5, 6}, {1024, 65536, 1048576}})->MinTime(0.25);
 BENCHMARK(BM_FdbAge)->Arg(65536)->Arg(1048576)->Iterations(5);

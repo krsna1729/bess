@@ -469,8 +469,8 @@ reference to something missing.
 ### `l2::PackedMacTable<Cold, Sync>` (one-word MAC table, shared readers)
 
 - **What:** `core/l2/packed_mac_table.h` (D-073): MAC (48 bits), value (14),
-  a flag and an occupied bit in one 64-bit slot; MacTable's hashing, 4-way
-  32-byte buckets at 50% load and breadth-first move search; a cold word per
+  a flag and an occupied bit in one 64-bit slot; a secretly seeded CRC hash,
+  4-way 32-byte buckets at 50% load and breadth-first move search; a cold word per
   slot that only the writer touches. One bridge domain per table.
 - **Sync:** `OwnerWrites` (plain stores), `SingleWriter` (the caller
   serialises writers; readers on any worker), `MultiWriter` (the table's
@@ -483,9 +483,13 @@ reference to something missing.
   inside a move path cannot stall readers, at the price of a rare miss. Proven by deterministic tests at each point inside a move
   (`packed_mac_table_test.cc`), each of which fails if that ordering is
   removed.
-- **Used by:** L2Forward (`SingleWriter`); `BasicFdb<PackedMacTable<...>>`
-  for a one-domain FDB shared by workers.
-- **Cost:** COST
+- **Used by:** L2Forward (`SingleWriter`); the Bridge's FDB
+  (`BasicFdb<PackedMacTable<ExpiryHandle>>`, owned); a one-domain FDB shared
+  by workers (`SingleWriter`/`MultiWriter`).
+- **Cost** (D-073): batch-32 lookups 15-43% faster than l2_table at 1K-1M
+  (hits and misses), scalar misses 10-15% faster, scalar hits 0.3-0.4 ns
+  slower; under the FDB, 20-75% faster than MacTable (1M misses 7.7 ns
+  against 24.7).
 
 ### Member selection (`dataplane/member_select.h`, M16)
 

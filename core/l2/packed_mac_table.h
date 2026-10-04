@@ -14,6 +14,8 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <chrono>
+#include <random>
 #include <span>
 #include <type_traits>
 
@@ -146,7 +148,8 @@ class PackedMacTable {
     while (buckets * kWays < 2 * capacity) {
       buckets <<= 1;
     }
-    std::unique_ptr<PackedMacTable> t(new (std::nothrow) PackedMacTable(capacity, buckets));
+    std::unique_ptr<PackedMacTable> t(
+        new (std::nothrow) PackedMacTable(capacity, buckets, NewSeed()));
     if (t == nullptr) {
       return nullptr;
     }
@@ -211,7 +214,8 @@ class PackedMacTable {
   // values[i] = the value for keys[i], 0 for a miss; bit i set for a hit.
   // The move sequence is read once for the batch and checked once after it,
   // only if something missed; an unstable batch looks its misses up again.
-  uint64_t LookupBatch(std::span<const uint64_t> keys, uint16_t *values) const noexcept {
+  template <typename V = uint16_t>
+  uint64_t LookupBatch(std::span<const uint64_t> keys, V *values) const noexcept {
     promise(keys.size() <= kMaxBatch);
     const uint32_t seq = kShared ? moves_.load(std::memory_order_acquire) : 0;
     uint64_t hashes[kMaxBatch];
@@ -233,7 +237,7 @@ class PackedMacTable {
         }
         word = ProbeWord(Alt(b1, hashes[i]), want);
       }
-      values[i] = static_cast<uint16_t>(ValueOf(word));
+      values[i] = V(static_cast<uint16_t>(ValueOf(word)));
       hits |= uint64_t{word != 0} << i;
     }
     if constexpr (kShared) {
@@ -243,7 +247,7 @@ class PackedMacTable {
         for (; misses != 0; misses &= misses - 1) {
           const unsigned i = static_cast<unsigned>(__builtin_ctzll(misses));
           const uint32_t v = Lookup(keys[i]);
-          values[i] = static_cast<uint16_t>(v);
+          values[i] = V(static_cast<uint16_t>(v));
           hits |= uint64_t{v != 0} << i;
         }
       }
@@ -341,8 +345,23 @@ class PackedMacTable {
   static constexpr uint64_t kOccupied = uint64_t{1} << 63;
   static constexpr uint64_t kKeyMask = kOccupied | kMacMask;
 
-  PackedMacTable(size_t capacity, size_t buckets)
-      : capacity_(capacity), nbuckets_(buckets), mask_(buckets - 1) {}
+  PackedMacTable(size_t capacity, size_t buckets, uint64_t seed)
+      : capacity_(capacity), nbuckets_(buckets), mask_(buckets - 1), seed_(seed) {}
+
+  // Unpredictable without failing: random_device may throw where the system
+  // has no entropy source; the clock is the fallback.
+  // A random odd 64-bit multiplier (odd: a bijection of the key).
+  static uint64_t NewSeed() noexcept {
+    uint64_t seed;
+    try {
+      std::random_device device;
+      seed = uint64_t{device()} << 32 | device();
+    } catch (...) {
+      seed = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) *
+             0xBF58476D1CE4E5B9ull;
+    }
+    return seed | 1;
+  }
 
   static uint64_t Mac(uint64_t key) noexcept { return key >> 16; }
   // What a slot holding `key` has under kKeyMask; a nonzero domain sets a bit
@@ -362,8 +381,15 @@ class PackedMacTable {
   // alternate's tag) mixes all of them. A CRC alone is linear, which gives a
   // bucket's keys one alternate (MacTable's note); the product does not.
   // Cheaper than MacTable's splitmix64 (measured: scalar lookups, D-073).
-  static uint64_t Hash(uint64_t key) noexcept {
-    return uint64_t{arch::Crc32c(key, 0)} * 0x9E3779B97F4A7C15ull;
+  // The CRC is 32 bits for a 48-bit MAC, so MACs with one CRC share both
+  // buckets, and a CRC is linear: such sets are easy to build, and a table
+  // learning from untrusted senders (the Bridge) could be denied chosen MACs.
+  // A seed in the CRC's initial value would not help (linearity keeps the
+  // same keys colliding under every initial value); the key is first
+  // multiplied by a random odd per-table constant, which is not linear, so
+  // which MACs collide depends on a secret (review, 2026-10-04).
+  uint64_t Hash(uint64_t key) const noexcept {
+    return uint64_t{arch::Crc32c(key * seed_, 0)} * 0x9E3779B97F4A7C15ull;
   }
   // The alternate bucket; an involution (Alt(Alt(b)) == b), so a resident
   // entry's other bucket follows from its key and its present bucket.
@@ -517,6 +543,7 @@ class PackedMacTable {
   size_t capacity_;
   size_t nbuckets_;
   size_t mask_;
+  uint64_t seed_;  // the hash's secret odd multiplier
   size_t size_ = 0;
   uint64_t *slots_ = nullptr;
   Cold *cold_ = nullptr;

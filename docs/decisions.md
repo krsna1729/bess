@@ -6506,8 +6506,10 @@ the module as C++ types. No table offered both lock-free readers on many workers
   existing user is unchanged. A storage that holds fewer domains or narrower interfaces than the FDB's defaults makes
   `Create` and the setters refuse what it cannot hold.
 - **`PackedMacTable<Cold, Sync>`**, the one MAC table for shared readers: l2_table's one-word slot (MAC 48 bits, value
-  14, a flag, occupied) with MacTable's hashing, 4-way 32-byte buckets, 50% load and breadth-first move search. One
-  bridge domain per table. Readers on any thread see a slot whole; a move writes its destination before clearing its
+  14, a flag, occupied) with 4-way 32-byte buckets, 50% load and breadth-first move search. One
+  bridge domain per table. The hash is CRC32C of the key times a random odd per-table multiplier, spread by a
+  64-bit odd constant: a CRC is linear, so a seed in its initial value would leave the same MACs colliding; the
+  multiply is not, so the colliding sets depend on a secret (review round 3). Readers on any thread see a slot whole; a move writes its destination before clearing its
   source; a move path is bracketed by an odd sequence number that a reader re-checks only on a miss, so a hit costs
   no more than l2_table's and a key present throughout is never missed (l2_table's one-step move could not move an
   entry back into its primary and so needed no sequence; this table's search can). A reader retries at most
@@ -6519,9 +6521,42 @@ the module as C++ types. No table offered both lock-free readers on many workers
   every slot it could reach, and its one-step move left some unreachable): 64 KiB instead of 32 KiB by default, 4 GiB
   instead of 2 GiB at the largest accepted size, so a configuration at the memory limit can now fail Init with
   ENOMEM. No cold array (an empty `Cold` allocates none). **l2_table is deleted** from bessd; a frozen copy remains only as the benchmarks' baseline.
-- **Bridge** stays on `Fdb` (MacTable): it needs many bridge domains, which one-word slots cannot hold.
+- **Bridge** moves to `BasicFdb<PackedMacTable<ExpiryHandle>>` (owned): it has one bridge domain, and the one-word
+  table is faster than MacTable in every lookup and learn measured (evidence below). **MacTable stays** for FDBs with
+  more than one bridge domain, which one-word slots cannot hold. Needs review (user): fold multi-domain FDBs into one
+  `PackedMacTable` per domain and delete MacTable (it changes capacity from per FDB to per domain).
 
-**Evidence.** EVIDENCE
+**Evidence** (release x86-64-v3, `omarchy-benchmark --isolate --cpu 2`, `tools/ab_bench.py` 16 ABBA rounds; the
+wrapper flagged timer, thermal and function-call interrupts on CPU 2 in every run, so single rows near the noise band
+are not called):
+- *PackedMacTable vs l2_table* (the gate: retire l2_table only at parity where L2Forward runs, the review's
+  condition), `fdb_bench BM_L2Lookup` backend 7 (raw table, as L2Forward calls it) vs 1, same binary, B/A medians:
+
+  | batch 32 | 1K | 64K | 1M |
+  |---|---|---|---|
+  | hot hit | -20.4% | -33.5% | -32.3% |
+  | uniform hit | -17.0% | -32.7% | -15.3% |
+  | miss | -33.0% | -43.2% | -40.3% |
+
+  All 16/16 pairs. Scalar (one key a call, not L2Forward's path): misses -10.5 / -13.4 / -15.2%; hits +7.3 to
+  +11.0% (0.27-0.44 ns) except uniform 64K/1M (no clear difference). The first version (splitmix64 hash, a miss
+  re-probed through Lookup) was 12-20% behind on batch misses and 15-26% on scalar hits; the CRC hash and the
+  once-per-batch sequence check closed it.
+- *Bridge (TP3)*: the FDB over `PackedMacTable<Owner>` (backend 4) vs over MacTable (backend 0), same binary, B/A:
+
+  | | 1K | 64K | 1M |
+  |---|---|---|---|
+  | scalar hot hit | -22.2% | -22.3% | -22.1% |
+  | scalar uniform hit | -19.5% | -29.5% | -40.9% |
+  | scalar miss | -50.7% | -56.0% | -68.7% (24.7 -> 7.7 ns) |
+  | batch 32 hot hit | -29.1% | -28.9% | -27.7% |
+  | batch 32 uniform hit | -28.8% | -40.7% | -44.1% |
+  | batch 32 miss | -48.2% | -61.9% | -75.3% |
+  | learn | -10.3% | -10.3% | -8.7% |
+
+  All 16/16 pairs except learn at 1M (15/16). This answers the review's L2 finding (MacTable 1M misses 19.9 ns
+  against l2_table's 7.0): half the slot bytes (8 vs 16) and one 32-byte bucket probe per candidate.
+TP1_EVIDENCE
 
 **Not done.** Growth (TP4-TP6); NAT's storage choice (TP5-6); usage counters (TP7); conntrack modes (TP8).
 
