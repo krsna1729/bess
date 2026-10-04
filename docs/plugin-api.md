@@ -200,6 +200,7 @@ struct BessPluginDescriptor {
   | `BESS_CAP_RESOURCES` | transactional resources (`init_context().resources()`) |
   | `BESS_CAP_METRICS` | operational metrics (`init_context().metrics()`) |
   | `BESS_CAP_REQUESTS` | worker-to-control requests (`init_context().requests()`) |
+  | `BESS_CAP_EVENTS` | operational events (`init_context().events()`) |
 
   The `standalone_*` conformance plugins in `examples/standalone_plugin` use
   `BESS_PLUGIN`; `sample_plugin`'s `SequentialUpdate` uses
@@ -239,6 +240,7 @@ construction or `Init()`:
 | `instances()` | borrow application-owned shared state (below) |
 | `metrics()` | register a source that reports this module's counters when the control plane asks (`stats::MetricRegistry`, `stats/metric_registry.h`, experimental); keep the returned `MetricSource` as a member declared after what it reads |
 | `requests()` | open a `RequestEndpoint` (`framework/module_requests.h`, experimental): workers post a small request (a table nearly full), the daemon's maintenance loop calls the module's handler under the control-plane lock; one pending request per endpoint, re-armed by `Done()` |
+| `events()` | register an event type in Init (`RegisterType(name, value names)`); a worker posts with `Post(ctx->wid, WorkerEvent{...})`, never blocking (a full ring refuses and counts); the maintenance loop moves events into the log `WatchEvents` streams (`stats::EventHub`, `stats/event_hub.h`, experimental) |
 
 Every type this surface names is installed. Binding a resource's wire codec
 (control-side protobuf metadata, D-044) is in-tree only, through

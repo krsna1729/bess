@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
@@ -93,6 +94,11 @@ func TestLive(t *testing.T) {
 	key := message(t, files, r.KeyType, cfg.Key)
 	value := message(t, files, r.ValueType, cfg.Value)
 
+	wctx, stopWatching := context.WithCancel(ctx)
+	defer stopWatching()
+	events, _ := client.WatchEvents(wctx, 0, "bess.transaction")
+	time.Sleep(300 * time.Millisecond) // the stream is open before the transaction
+
 	tx := client.Transaction()
 	if err := tx.Upsert(r, value, value); err == nil {
 		t.Fatal("a value as key was accepted")
@@ -103,6 +109,16 @@ func TestLive(t *testing.T) {
 	first, err := tx.Commit(ctx)
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	select {
+	case e := <-events:
+		if e.GetFields()["outcome"] != "applied" || e.GetGeneration() != first.Generation ||
+			e.GetFields()["request_id"] != tx.RequestID {
+			t.Fatalf("transaction event %v", e)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no transaction event")
 	}
 
 	again := client.Transaction(WithRequestID(tx.RequestID))

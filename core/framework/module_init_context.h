@@ -18,6 +18,7 @@ namespace rcu {
 class RcuDomain;
 }  // namespace rcu
 namespace stats {
+class EventHub;
 class MetricRegistry;
 }  // namespace stats
 namespace dataplane {
@@ -61,14 +62,15 @@ class ModuleInitContext {
                     ResourceBindings &resource_bindings,
                     framework::InstanceRegistry &instances, rcu::RcuDomain &rcu,
                     const runtime::PortRegistry &ports, stats::MetricRegistry &metrics,
-                    framework::RequestHub &requests) noexcept
+                    framework::RequestHub &requests, stats::EventHub &events) noexcept
       : resources_(resources),
         resource_bindings_(resource_bindings),
         instances_(instances),
         rcu_(rcu),
         ports_(ports),
         metrics_(metrics),
-        requests_(requests) {}
+        requests_(requests),
+        events_(events) {}
 
   ModuleInitContext(const ModuleInitContext &) = delete;
   ModuleInitContext &operator=(const ModuleInitContext &) = delete;
@@ -98,6 +100,11 @@ class ModuleInitContext {
   // loop calls the handler under the control-plane lock. A plugin that calls
   // this requires BESS_CAP_REQUESTS.
   framework::RequestHub &requests() const noexcept { return requests_; }
+  // Operational events (M25 phase 2, stats/event_hub.h): register a type in
+  // Init(); a worker posts with events().Post(ctx->wid, ...), never blocking;
+  // WatchEvents streams them. A plugin that calls this requires
+  // BESS_CAP_EVENTS.
+  stats::EventHub &events() const noexcept { return events_; }
 
   // The framework gives every module its context; a module reads it through
   // Module::init_context() and cannot construct or look one up itself.
@@ -118,10 +125,11 @@ class ModuleInitContext {
   framework::InstanceRegistry &instances_;
   rcu::RcuDomain &rcu_;
   PortDirectory ports_;
-  // Appended in order (M25, then TP4): plugins built before each read the
-  // members above it at unchanged offsets.
+  // Appended in order (M25 metrics, TP4, M25 events): plugins built before
+  // each read the members above it at unchanged offsets.
   stats::MetricRegistry &metrics_;
   framework::RequestHub &requests_;
+  stats::EventHub &events_;
 };
 
 }  // namespace framework

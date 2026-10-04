@@ -4,12 +4,13 @@
 
 #include "control/control_plane.h"
 #include "framework/module_requests.h"
+#include "stats/event_hub.h"
 
 namespace bess::control {
 
 MaintenanceLoop::MaintenanceLoop(ControlPlane &control, framework::RequestHub &requests,
-                                 std::chrono::microseconds interval)
-    : control_(control), requests_(requests), interval_(interval) {
+                                 std::chrono::microseconds interval, stats::EventHub *events)
+    : control_(control), requests_(requests), events_(events), interval_(interval) {
   if (interval_.count() > 0) {
     thread_ = std::thread([this] { Run(); });
   }
@@ -33,6 +34,10 @@ void MaintenanceLoop::Run() {
     {
       auto lock = control_.AcquireLock();
       delivered_.fetch_add(requests_.Deliver(), std::memory_order_relaxed);
+    }
+    if (events_ != nullptr) {
+      // The hub has its own lock: workers' events reach the log every tick.
+      (void)events_->DrainWorkers();
     }
     ticks_.fetch_add(1, std::memory_order_relaxed);
     wait.lock();

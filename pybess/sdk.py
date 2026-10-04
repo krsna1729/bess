@@ -236,6 +236,39 @@ class Client:
             raise
         return any(r == rpc or r.endswith('/' + rpc) for r in rpcs)
 
+    def watch_events(self, from_sequence=0, types=(), reconnect=True):
+        """Operational events (control_v2.WatchEvents), oldest first, until
+        the caller stops iterating.
+
+        Starts at `from_sequence` (0: the next event). A "bess.gap" event names
+        events the daemon no longer held. After a transport failure the stream
+        resumes after the last event seen (`reconnect`); if the daemon
+        restarted meanwhile, DaemonRestarted is raised: what the caller built
+        from earlier events is gone; re-read the state and watch from 0."""
+        next_sequence, epoch = from_sequence, None
+        backoff = self._retry.busy_backoff
+        while True:
+            request = v2.WatchEventsRequest(from_sequence=next_sequence, types=list(types),
+                                            daemon_epoch=epoch or 0)
+            try:
+                for event in self._stub.WatchEvents(request):
+                    if event.type == 'bess.restart' or (epoch is not None and
+                                                         event.daemon_epoch != epoch):
+                        self._observe_epoch(event.daemon_epoch)
+                        raise DaemonRestarted('events of daemon epoch %s ended: the daemon is '
+                                              'now at epoch %d' % (epoch, event.daemon_epoch))
+                    epoch = event.daemon_epoch
+                    next_sequence = event.gap_to if event.type == 'bess.gap' else event.sequence + 1
+                    yield event
+                return
+            except grpc.RpcError as e:
+                if not _no_answer(e):
+                    raise _translate(e)
+                if not reconnect:
+                    raise TransportError(None, e.code())
+                self._sleep(backoff)
+                backoff = min(backoff * 2, 1.0)
+
     def metrics(self):
         """Every metric sample (control_v2.ListMetrics), as
         {(name, ((label, value), ...)): value}."""

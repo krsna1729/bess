@@ -1176,15 +1176,23 @@ void ApiServer::Run() {
     return;
   }
 
-  service.set_shutdown_func([&server]() { server->Shutdown(); });
+  // Shutdown closes the event log first: a WatchEvents stream waiting in it
+  // returns, so Shutdown() is not left waiting for it.
+  auto shutdown = [&server]() {
+    bess::runtime::runtime().events().Close();
+    server->Shutdown();
+  };
+  service.set_shutdown_func(shutdown);
   {
     // Worker-to-control module requests (TP4, D-077), delivered under the
-    // control-plane lock; stopped before the dataplane is torn down below.
+    // control-plane lock, and workers' events moved into the event log (M25);
+    // stopped before the dataplane is torn down below.
     bess::control::MaintenanceLoop maintenance(
         control_plane, bess::runtime::runtime().requests(),
-        std::chrono::microseconds(FLAGS_maintenance_interval_us));
+        std::chrono::microseconds(FLAGS_maintenance_interval_us),
+        &bess::runtime::runtime().events());
     // SIGTERM/SIGINT: the same shutdown as the KillBess RPC (D-030).
-    bess::startup::TerminationWatcher watcher([&server] { server->Shutdown(); });
+    bess::startup::TerminationWatcher watcher(shutdown);
     server->Wait();
   }
 

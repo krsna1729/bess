@@ -237,6 +237,10 @@ RuntimeState::RuntimeState()
     }
     w.Gauge("bess_transaction_generation", "Dataplane transaction generation",
             static_cast<double>(transactions_->generation()));
+    w.Counter("bess_events_lost_total", "Worker events refused by a full ring",
+              static_cast<double>(events_.lost()));
+    w.Gauge("bess_events_next_sequence", "The sequence number the next event gets",
+            static_cast<double>(events_.next_sequence()));
     w.Gauge("bess_transaction_pending_cascades",
             "Removal cascades waiting for a grace period (Apply answers BUSY past 4096)",
             static_cast<double>(transactions_->pending_cascades()));

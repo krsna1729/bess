@@ -357,6 +357,35 @@ message GetCapabilitiesResponse {
   uint64 daemon_epoch = 9;
 }
 
+// -- Operational events (M25 phase 2, D-084) -----------------------------
+//
+// Pushed: control-plane observations, never per-packet logs. A stream starts
+// at `from_sequence` (0: the next event) and, when what it asked for is older
+// than the daemon still holds, first gets one event of type "bess.gap" naming
+// the lost range. Sequences restart with the daemon (daemon_epoch).
+
+message WatchEventsRequest {
+  uint64 from_sequence = 1;
+  repeated string types = 2;  // only these types (empty: all; gaps always)
+  // The epoch `from_sequence` belongs to (0: any). Another epoch: the daemon
+  // restarted and its sequences began again, so the stream starts with one
+  // "bess.restart" event and continues from the next event.
+  uint64 daemon_epoch = 3;
+}
+
+message Event {
+  uint64 sequence = 1;
+  uint64 daemon_epoch = 2;
+  uint64 time_ns = 3;  // monotonic clock
+  string type = 4;     // "bess.transaction", "bess.gap", a module's own
+  string source = 5;
+  uint64 generation = 6;
+  map<string, string> fields = 7;
+  // "bess.gap": events [gap_from, gap_to) are no longer held.
+  uint64 gap_from = 8;
+  uint64 gap_to = 9;
+}
+
 // -- Operational metrics (M25, D-076) ------------------------------------
 //
 // Pulled: each call reads every registered source (the runtime's RCU and
@@ -397,6 +426,7 @@ service Control {
   rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse) {}
   rpc ListMetrics(ListMetricsRequest) returns (ListMetricsResponse) {}
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse) {}
+  rpc WatchEvents(WatchEventsRequest) returns (stream Event) {}
   rpc ListTransactionResources(ListTransactionResourcesRequest)
       returns (ListTransactionResourcesResponse) {}
 }

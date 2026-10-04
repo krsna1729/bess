@@ -185,6 +185,12 @@ type transport interface {
 	list(ctx context.Context) (*pb.ListTransactionResourcesResponse, metadata.MD, error)
 	capabilities(ctx context.Context) (*pb.GetCapabilitiesResponse, metadata.MD, error)
 	metrics(ctx context.Context) (*pb.ListMetricsResponse, metadata.MD, error)
+	watch(ctx context.Context, in *pb.WatchEventsRequest) (eventStream, error)
+}
+
+// eventStream is what WatchEvents reads (the gRPC client stream, or a test's).
+type eventStream interface {
+	Recv() (*pb.Event, error)
 }
 
 type grpcTransport struct{ c pb.ControlClient }
@@ -217,6 +223,10 @@ func (t grpcTransport) metrics(ctx context.Context) (*pb.ListMetricsResponse, me
 	var md metadata.MD
 	r, err := t.c.ListMetrics(ctx, &pb.ListMetricsRequest{}, grpc.Trailer(&md))
 	return r, md, err
+}
+
+func (t grpcTransport) watch(ctx context.Context, in *pb.WatchEventsRequest) (eventStream, error) {
+	return t.c.WatchEvents(ctx, in)
 }
 
 // -- the client ----------------------------------------------------------------
@@ -344,6 +354,58 @@ func (c *Client) Supports(ctx context.Context, rpc string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// WatchEvents streams operational events (control_v2.WatchEvents), oldest
+// first, from `from` (0: the next event); with types, only those (gaps
+// always). A "bess.gap" event names events the daemon no longer held. After a
+// transport failure the stream resumes after the last event delivered. The
+// event channel closes when ctx ends or on an error, which is sent on the
+// error channel first: DaemonRestartedError when the daemon restarted (what
+// was built from earlier events is gone: re-read the state, watch from 0).
+func (c *Client) WatchEvents(ctx context.Context, from uint64, types ...string) (<-chan *pb.Event, <-chan error) {
+	events := make(chan *pb.Event)
+	errc := make(chan error, 1)
+	go func() {
+		defer close(events)
+		next, epoch := from, uint64(0)
+		backoff := c.retry.BusyBackoff
+		for ctx.Err() == nil {
+			stream, err := c.t.watch(ctx, &pb.WatchEventsRequest{FromSequence: next, Types: types, DaemonEpoch: epoch})
+			for err == nil {
+				var e *pb.Event
+				if e, err = stream.Recv(); err != nil {
+					break
+				}
+				if e.GetType() == "bess.restart" || (epoch != 0 && e.GetDaemonEpoch() != epoch) {
+					c.observeEpoch(e.GetDaemonEpoch())
+					errc <- &DaemonRestartedError{From: epoch, To: e.GetDaemonEpoch()}
+					return
+				}
+				epoch = e.GetDaemonEpoch()
+				if e.GetType() == "bess.gap" {
+					next = e.GetGapTo()
+				} else {
+					next = e.GetSequence() + 1
+				}
+				select {
+				case events <- e:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			if !noAnswer(err, nil) {
+				errc <- translate(err, nil)
+				return
+			}
+			c.sleep(backoff)
+			backoff = min(backoff*2, time.Second)
+		}
+	}()
+	return events, errc
 }
 
 // Metrics is every metric sample (control_v2.ListMetrics).

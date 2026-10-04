@@ -105,6 +105,7 @@ file is the reasoning.
 | D-082 | Capability discovery: GetCapabilities, and SDK capabilities/supports/metrics (M27.2) | accepted |
 | D-083 | NAT usage counters: per-mapping packets and bytes, final and interim records through a bounded log (TP7) | accepted |
 | D-085 | Packet parse: the common frame validated on one path ("validate once, execute fast"; tunnel clawback) | accepted |
+| D-084 | Operational events: worker rings, a bounded log, WatchEvents with gaps and restarts, SDK streams (M25 phase 2) | accepted |
 
 
 ---
@@ -7104,4 +7105,36 @@ checked decap went from 4.5x to 3.3x of it); `conntrack_bench BM_Parse` untagged
 -52%, and the general path not slower (QinQ UDP -10%, IPv6 with extension headers -3%); `BM_TrackBatch` -3 to -4% at
 1K and 64K connections, no clear difference at 1M; `nat_bench BM_Translate/3/` -5 to -7% at 4K and 64K mappings, no
 clear difference at 1M (where lookups dominate).
+
+## D-084 Operational events: worker rings, a bounded log, WatchEvents with gaps and restarts, SDK streams (M25 phase 2)
+
+**Status:** accepted (2026-10-05), experimental API, additive wire change.
+**Code:** `core/stats/event_hub.{h,cc}` (new, installed experimental), `core/stats/event_hub_test.cc`,
+`core/runtime/runtime_state.{h,cc}` (`events()`, `bess_events_lost_total`), `core/framework/{module_init_context,plugin,
+plugin_check}.h` (`events()`, `BESS_CAP_EVENTS`), `core/control/maintenance_loop.{h,cc}` (drains every tick),
+`core/control/api_v2.{h,cc}` (`WatchEvents`; a `bess.transaction` event per decided transaction), `core/bessctl.cc`
+(the log closes before the server shuts down), `protobuf/control_v2.proto` (`WatchEvents`, `Event`), `pybess/sdk.py`
+(`watch_events`), `sdk/go/bess/client.go` (`WatchEvents`), `bessctl/module_tests/events.py`, `docs/plugin-api.md`.
+
+**Context.** Roadmap M25 and the UPF gap (Appendix M): controllers need pushed observations (transactions decided,
+loss, a module's own conditions) with an order they can resume from, without per-packet logging and without a
+worker ever waiting. Design: `.scratch/design/m25_observability.md` section 2.
+
+**Decision.**
+- `stats::EventHub`: one bounded single-producer single-consumer ring per worker (256 events of 64 bytes); a worker
+  posts a registered type, a source id and up to six values, never blocking; a full ring refuses and counts, and the
+  next accepted event carries the count, which the log shows as `bess.events_lost`. The maintenance loop moves worker
+  events into the log every tick (the hub has its own lock, not the control-plane lock).
+- The log: the last 65,536 events, each with a sequence (gapless per daemon epoch), monotonic time, generation, type,
+  source and string fields. Control-plane events are appended directly: a `bess.transaction` per transaction the
+  daemon decided (outcome, request id, operations, generation; a replay decided nothing new).
+- `control_v2.WatchEvents(from_sequence, types, daemon_epoch)`: server streaming from a sequence (0: the next event);
+  a reader behind the log first gets one `bess.gap` naming the lost range; a reader of another epoch first gets
+  `bess.restart`. The stream waits on the log, not the control lock; shutdown closes the log first, so no stream holds
+  the server.
+- SDK (Python generator, Go channel): resume after the last delivered event on a transport failure; a restart raises
+  `DaemonRestarted` (the caller's state from earlier events is gone; re-read and watch from 0).
+- Modules: `init_context().events()` behind `BESS_CAP_EVENTS`, the context's last member.
+
+**Evidence.** EVIDENCE
 

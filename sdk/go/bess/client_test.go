@@ -5,6 +5,8 @@ package bess
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +54,8 @@ type fake struct {
 	rejectOps bool
 	oldDaemon bool // answers GetCapabilities with UNIMPLEMENTED
 	refuse    bool // answers GetCapabilities with PERMISSION_DENIED
+	streams   []*scriptedStream
+	watched   [][2]uint64 // (from_sequence, daemon_epoch) per WatchEvents call
 }
 
 func (f *fake) apply(_ context.Context, in *pb.ApplyTransactionRequest) (*pb.ApplyTransactionResponse, metadata.MD, error) {
@@ -109,6 +113,30 @@ func (f *fake) epochOr1() uint64 {
 		return 1
 	}
 	return f.epoch
+}
+
+type scriptedStream struct{ steps []any }
+
+func (s *scriptedStream) Recv() (*pb.Event, error) {
+	if len(s.steps) == 0 {
+		return nil, status.Error(codes.Unavailable, "end of script")
+	}
+	step := s.steps[0]
+	s.steps = s.steps[1:]
+	if err, ok := step.(error); ok {
+		return nil, err
+	}
+	return step.(*pb.Event), nil
+}
+
+func (f *fake) watch(_ context.Context, in *pb.WatchEventsRequest) (eventStream, error) {
+	f.watched = append(f.watched, [2]uint64{in.GetFromSequence(), in.GetDaemonEpoch()})
+	if len(f.streams) == 0 {
+		return nil, status.Error(codes.Unavailable, "no more streams")
+	}
+	st := f.streams[0]
+	f.streams = f.streams[1:]
+	return st, nil
 }
 
 type harness struct {
@@ -413,5 +441,31 @@ func TestSupportsReadsTheDaemonsRPCsAndAnOldDaemonSupportsNothingNew(t *testing.
 	}
 	if _, err := newHarness(&fake{refuse: true}, 1).c.Supports(ctx, "ApplyTransaction"); err == nil {
 		t.Fatal("a refusal other than UNIMPLEMENTED was reported as unsupported")
+	}
+}
+
+func TestWatchEventsResumesAfterTheLastEventAndReportsARestart(t *testing.T) {
+	down := status.Error(codes.Unavailable, "down")
+	f := &fake{streams: []*scriptedStream{
+		{steps: []any{&pb.Event{Sequence: 5, Type: "a", DaemonEpoch: 1}, &pb.Event{Sequence: 6, Type: "b", DaemonEpoch: 1}, down}},
+		{steps: []any{&pb.Event{Type: "bess.gap", GapFrom: 7, GapTo: 9, DaemonEpoch: 1}, &pb.Event{Sequence: 9, Type: "c", DaemonEpoch: 1}, down}},
+		{steps: []any{&pb.Event{Type: "bess.restart", DaemonEpoch: 2}}},
+	}}
+	h := newHarness(f, 1)
+	events, errc := h.c.WatchEvents(context.Background(), 5)
+	var seen []string
+	for e := range events {
+		seen = append(seen, e.GetType())
+	}
+	var restarted *DaemonRestartedError
+	if err := <-errc; !errors.As(err, &restarted) || restarted.To != 2 {
+		t.Fatalf("want DaemonRestartedError to epoch 2, got %v", err)
+	}
+	if strings.Join(seen, ",") != "a,b,bess.gap,c" {
+		t.Fatalf("events %v", seen)
+	}
+	want := [][2]uint64{{5, 0}, {7, 1}, {10, 1}}
+	if fmt.Sprint(f.watched) != fmt.Sprint(want) {
+		t.Fatalf("requests %v, want %v (resumed after the last event, under the epoch seen)", f.watched, want)
 	}
 }

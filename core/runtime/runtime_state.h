@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "framework/instance_registry.h"
+#include "stats/event_hub.h"
 #include "stats/metric_registry.h"
 #include "framework/module_requests.h"
 
@@ -193,6 +194,9 @@ class RuntimeState {
   // engine) are registered here; modules register theirs through
   // ModuleInitContext::metrics(). Read by the ListMetrics RPC.
   stats::MetricRegistry &metrics() { return metrics_; }
+  // Operational events (M25 phase 2): the log WatchEvents streams; workers
+  // post through ModuleInitContext::events(), the maintenance loop drains.
+  stats::EventHub &events() { return events_; }
 
   const PortRegistry &ports() const { return ports_; }
   const ModuleRegistry &modules() const { return modules_; }
@@ -217,6 +221,7 @@ class RuntimeState {
 
   // Before everything that registers a source in it.
   stats::MetricRegistry metrics_;
+  stats::EventHub events_;
   // First: modules (below) release their leases on it as they are destroyed.
   framework::InstanceRegistry instances_;
   // Before modules_ for the same reason: a module's endpoints unregister as it

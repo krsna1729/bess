@@ -87,6 +87,39 @@ TIMEOUT = FakeRpcError(grpc.StatusCode.DEADLINE_EXCEEDED)
 
 class SdkTest(unittest.TestCase):
 
+    def test_watch_events_resumes_after_the_last_event_and_reports_a_restart(self):
+        class Watching(Stub):
+            def __init__(self):
+                super().__init__()
+                self.requests = []
+                self.script = [
+                    [v2.Event(sequence=5, type='a', daemon_epoch=1),
+                     v2.Event(sequence=6, type='b', daemon_epoch=1),
+                     FakeRpcError(grpc.StatusCode.UNAVAILABLE)],
+                    [v2.Event(type='bess.gap', gap_from=7, gap_to=9, daemon_epoch=1),
+                     v2.Event(sequence=9, type='c', daemon_epoch=1),
+                     FakeRpcError(grpc.StatusCode.UNAVAILABLE)],
+                    [v2.Event(type='bess.restart', daemon_epoch=2)],
+                ]
+
+            def WatchEvents(self, request):
+                self.requests.append((request.from_sequence, request.daemon_epoch))
+                for step in self.script.pop(0):
+                    if isinstance(step, Exception):
+                        raise step
+                    yield step
+
+        stub = Watching()
+        client = self.client(stub)
+        seen = []
+        with self.assertRaises(sdk.DaemonRestarted):
+            for event in client.watch_events(from_sequence=5):
+                seen.append(event.type)
+        self.assertEqual(seen, ['a', 'b', 'bess.gap', 'c'])
+        self.assertEqual(stub.requests, [(5, 0), (7, 1), (10, 1)],
+                         'resumed after the last event, under the epoch seen')
+        self.assertEqual(client.daemon_epoch, 2)
+
     def test_supports_reads_the_daemons_rpcs_and_an_old_daemon_supports_nothing_new(self):
         class Capable(Stub):
             def GetCapabilities(self, request, timeout=None):

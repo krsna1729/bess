@@ -29,6 +29,7 @@ const (
 	Control_GetTransaction_FullMethodName           = "/bess.pb.v2.Control/GetTransaction"
 	Control_ListMetrics_FullMethodName              = "/bess.pb.v2.Control/ListMetrics"
 	Control_GetCapabilities_FullMethodName          = "/bess.pb.v2.Control/GetCapabilities"
+	Control_WatchEvents_FullMethodName              = "/bess.pb.v2.Control/WatchEvents"
 	Control_ListTransactionResources_FullMethodName = "/bess.pb.v2.Control/ListTransactionResources"
 )
 
@@ -45,6 +46,7 @@ type ControlClient interface {
 	GetTransaction(ctx context.Context, in *GetTransactionRequest, opts ...grpc.CallOption) (*GetTransactionResponse, error)
 	ListMetrics(ctx context.Context, in *ListMetricsRequest, opts ...grpc.CallOption) (*ListMetricsResponse, error)
 	GetCapabilities(ctx context.Context, in *GetCapabilitiesRequest, opts ...grpc.CallOption) (*GetCapabilitiesResponse, error)
+	WatchEvents(ctx context.Context, in *WatchEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error)
 	ListTransactionResources(ctx context.Context, in *ListTransactionResourcesRequest, opts ...grpc.CallOption) (*ListTransactionResourcesResponse, error)
 }
 
@@ -146,6 +148,25 @@ func (c *controlClient) GetCapabilities(ctx context.Context, in *GetCapabilities
 	return out, nil
 }
 
+func (c *controlClient) WatchEvents(ctx context.Context, in *WatchEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Control_ServiceDesc.Streams[0], Control_WatchEvents_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchEventsRequest, Event]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Control_WatchEventsClient = grpc.ServerStreamingClient[Event]
+
 func (c *controlClient) ListTransactionResources(ctx context.Context, in *ListTransactionResourcesRequest, opts ...grpc.CallOption) (*ListTransactionResourcesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListTransactionResourcesResponse)
@@ -169,6 +190,7 @@ type ControlServer interface {
 	GetTransaction(context.Context, *GetTransactionRequest) (*GetTransactionResponse, error)
 	ListMetrics(context.Context, *ListMetricsRequest) (*ListMetricsResponse, error)
 	GetCapabilities(context.Context, *GetCapabilitiesRequest) (*GetCapabilitiesResponse, error)
+	WatchEvents(*WatchEventsRequest, grpc.ServerStreamingServer[Event]) error
 	ListTransactionResources(context.Context, *ListTransactionResourcesRequest) (*ListTransactionResourcesResponse, error)
 	mustEmbedUnimplementedControlServer()
 }
@@ -206,6 +228,9 @@ func (UnimplementedControlServer) ListMetrics(context.Context, *ListMetricsReque
 }
 func (UnimplementedControlServer) GetCapabilities(context.Context, *GetCapabilitiesRequest) (*GetCapabilitiesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetCapabilities not implemented")
+}
+func (UnimplementedControlServer) WatchEvents(*WatchEventsRequest, grpc.ServerStreamingServer[Event]) error {
+	return status.Errorf(codes.Unimplemented, "method WatchEvents not implemented")
 }
 func (UnimplementedControlServer) ListTransactionResources(context.Context, *ListTransactionResourcesRequest) (*ListTransactionResourcesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListTransactionResources not implemented")
@@ -393,6 +418,17 @@ func _Control_GetCapabilities_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_WatchEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchEventsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ControlServer).WatchEvents(m, &grpc.GenericServerStream[WatchEventsRequest, Event]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Control_WatchEventsServer = grpc.ServerStreamingServer[Event]
+
 func _Control_ListTransactionResources_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListTransactionResourcesRequest)
 	if err := dec(in); err != nil {
@@ -459,6 +495,12 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Control_ListTransactionResources_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WatchEvents",
+			Handler:       _Control_WatchEvents_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "control_v2.proto",
 }

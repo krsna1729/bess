@@ -9,7 +9,9 @@
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #endif
 
+#include <cctype>
 #include <limits>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <variant>
@@ -20,6 +22,7 @@
 #include "module.h"
 #include "port.h"
 #include "runtime/runtime_state.h"
+#include "stats/event_hub.h"
 #include "control/wire_narrow.h"
 #include "worker.h"
 
@@ -471,6 +474,22 @@ grpc::Status ControlV2Service::ApplyTransaction(
     return ToStatus(applied.error(), context);
   }
   *response = std::move(*applied);
+  if (!response->replayed()) {
+    // One event per outcome the daemon decided (a replay decided nothing new).
+    const v2::TransactionRecord &r = response->record();
+    std::string outcome = v2::TransactionRecord::Outcome_Name(r.outcome());
+    if (outcome.rfind("OUTCOME_", 0) == 0) {
+      outcome = outcome.substr(8);
+    }
+    for (char &c : outcome) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    runtime::runtime().events().Emit("bess.transaction", "control",
+                                     {{"request_id", r.request_id()},
+                                      {"outcome", outcome},
+                                      {"operations", std::to_string(r.ops_size())}},
+                                     r.generation());
+  }
   return grpc::Status::OK;
 }
 
@@ -487,6 +506,64 @@ grpc::Status ControlV2Service::ListTransactionResources(
     v2::ListTransactionResourcesResponse *response) {
   auto lock = control_plane_.AcquireLock();
   *response = transactions_.List();
+  return grpc::Status::OK;
+}
+
+grpc::Status ControlV2Service::WatchEvents(grpc::ServerContext *context,
+                                           const v2::WatchEventsRequest *request,
+                                           grpc::ServerWriter<v2::Event> *writer) {
+  // The hub has its own lock: no control-plane lock is held while streaming.
+  stats::EventHub &hub = runtime::runtime().events();
+  const std::set<std::string> types(request->types().begin(), request->types().end());
+  const uint64_t epoch = transactions_.epoch();
+  uint64_t next = request->from_sequence() != 0 ? request->from_sequence() : hub.next_sequence();
+  if (request->daemon_epoch() != 0 && request->daemon_epoch() != epoch) {
+    v2::Event restart;
+    restart.set_type("bess.restart");
+    restart.set_source("bessd");
+    restart.set_daemon_epoch(epoch);
+    if (!writer->Write(restart)) {
+      return grpc::Status::OK;
+    }
+    next = hub.next_sequence();
+  }
+  while (!context->IsCancelled()) {
+    // Short waits: cancellation is noticed within one.
+    stats::EventHub::ReadResult got = hub.Read(next, 256, std::chrono::milliseconds(200));
+    if (got.gap_to != 0) {
+      v2::Event gap;
+      gap.set_type("bess.gap");
+      gap.set_source("bessd");
+      gap.set_daemon_epoch(epoch);
+      gap.set_gap_from(got.gap_from);
+      gap.set_gap_to(got.gap_to);
+      if (!writer->Write(gap)) {
+        return grpc::Status::OK;
+      }
+    }
+    for (const stats::Event &e : got.events) {
+      if (!types.empty() && types.count(e.type) == 0) {
+        continue;
+      }
+      v2::Event out;
+      out.set_sequence(e.sequence);
+      out.set_daemon_epoch(epoch);
+      out.set_time_ns(e.time_ns);
+      out.set_type(e.type);
+      out.set_source(e.source);
+      out.set_generation(e.generation);
+      for (const auto &[k, v] : e.fields) {
+        (*out.mutable_fields())[k] = v;
+      }
+      if (!writer->Write(out)) {
+        return grpc::Status::OK;  // the client went away
+      }
+    }
+    next = got.next;
+    if (got.closed) {
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "bessd is shutting down");
+    }
+  }
   return grpc::Status::OK;
 }
 

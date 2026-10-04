@@ -18,6 +18,9 @@
 namespace bess::framework {
 class RequestHub;
 }  // namespace bess::framework
+namespace bess::stats {
+class EventHub;
+}  // namespace bess::stats
 
 namespace bess::control {
 
@@ -26,8 +29,9 @@ class ControlPlane;
 class MaintenanceLoop {
  public:
   // Starts the thread. `interval` 0 disables the loop (no thread).
+  // With `events`, also moves workers' events into its log every tick.
   MaintenanceLoop(ControlPlane &control, framework::RequestHub &requests,
-                  std::chrono::microseconds interval);
+                  std::chrono::microseconds interval, stats::EventHub *events = nullptr);
   ~MaintenanceLoop();  // stops and joins: no handler runs after it returns
   MaintenanceLoop(const MaintenanceLoop &) = delete;
   MaintenanceLoop &operator=(const MaintenanceLoop &) = delete;
@@ -40,6 +44,7 @@ class MaintenanceLoop {
 
   ControlPlane &control_;
   framework::RequestHub &requests_;
+  stats::EventHub *const events_;
   const std::chrono::microseconds interval_;
   std::mutex stop_mutex_;
   std::condition_variable stop_cv_;

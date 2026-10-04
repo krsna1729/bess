@@ -98,6 +98,9 @@ class ControlV2Service final : public pb::v2::Control::Service {
   grpc::Status GetCapabilities(grpc::ServerContext *context,
                                const pb::v2::GetCapabilitiesRequest *request,
                                pb::v2::GetCapabilitiesResponse *response) override;
+  grpc::Status WatchEvents(grpc::ServerContext *context,
+                           const pb::v2::WatchEventsRequest *request,
+                           grpc::ServerWriter<pb::v2::Event> *writer) override;
 
  private:
   ControlPlane &control_plane_;

@@ -20,7 +20,7 @@ const ModuleInitContext &ModuleInitContext::ProcessDefault() {
       runtime::runtime().transactions().registry(), ResourceBindings::ProcessDefault(),
       runtime::runtime().instances(), runtime::runtime().rcu(),
       runtime::runtime().ports(), runtime::runtime().metrics(),
-      runtime::runtime().requests());
+      runtime::runtime().requests(), runtime::runtime().events());
   return *context;
 }
 
