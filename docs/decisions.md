@@ -106,6 +106,7 @@ file is the reasoning.
 | D-083 | NAT usage counters: per-mapping packets and bytes, final and interim records through a bounded log (TP7) | accepted |
 | D-084 | Operational events: worker rings, a bounded log, WatchEvents with gaps and restarts, SDK streams (M25 phase 2) | accepted |
 | D-085 | Packet parse: the common frame validated on one path ("validate once, execute fast"; tunnel clawback) | accepted |
+| D-086 | Reference appliances as installed-tree plugins with a direct-path self test; R1 router (M24) | accepted |
 
 
 ---
@@ -7162,4 +7163,33 @@ checked decap went from 4.5x to 3.3x of it); `conntrack_bench BM_Parse` untagged
 -52%, and the general path not slower (QinQ UDP -10%, IPv6 with extension headers -3%); `BM_TrackBatch` -3 to -4% at
 1K and 64K connections, no clear difference at 1M; `nat_bench BM_Translate/3/` -5 to -7% at 4K and 64K mappings, no
 clear difference at 1M (where lookups dominate).
+
+
+## D-086 Reference appliances as installed-tree plugins with a direct-path self test; R1 router (M24)
+
+**Status:** accepted (2026-10-05).
+**Code:** `examples/appliances/` (new: `meson.build`, `README.md`, `router/router_app.h`, `router/router_appliance.cc`),
+`tools/check_standalone_plugins.py` (`--set appliances`, module commands), `tools/ci_profile.py` (the install check
+builds and runs them).
+
+**Context.** Roadmap M24 asks for appliances that prove BESS is mechanism-oriented (R1-R5), and the course correction
+(item 6) for them against installed headers. Installed BESS has no static libraries to link a standalone program
+against (persona D, D-074 era): code that uses non-header-only batteries (the router's FIB) runs inside bessd.
+
+**Decision.**
+- Each appliance is an application class in a header (`<name>_app.h`) written against `bess-dev` only, plus a module
+  that adapts it to the graph. The module's `self_test` command runs the application class directly on frames in
+  memory -- no module graph -- and checks what the roadmap says the appliance must demonstrate. CI's install check
+  builds `examples/appliances` from the staged install, loads it into the staged bessd, sends packets through the graph
+  path and calls every `self_test`.
+- R1 router: four interfaces in two VRFs that both route 10.0.0.0/8 (one through an ECMP pair, one through a single
+  next hop), 172.16.0.0/12 in VRF 1, gateways bound through the neighbor table. The application owns the static
+  policy, the interface-to-gate mapping (igate g is interface 2g+1; interface i leaves on gate i-1), the flow hash and
+  the unresolved-neighbor policy (drop). Direct path: overlapping VRFs, ECMP spreading 256 flows over both members
+  with each flow on one path, a neighbor's MAC change used at once with no route written (route count and the
+  application's route writes unchanged), an unresolved neighbor not forwarded to, a miss and an expired TTL dropped.
+
+**Evidence.** Against a staged install of develop: the plugin builds from `bess-dev`, loads into the staged bessd,
+moves 11.2M packets 172.16.1.1 -> gate 0 on the graph path, and `self_test` passes; with VRF 2's route pointed at
+VRF 1's gateway, `self_test` fails with "VRF 2 did not use its own route".
 

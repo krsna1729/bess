@@ -430,6 +430,17 @@ def step_verify_install(s):
                # bessd links DPDK's shared libraries, which are not installed
                'LD_LIBRARY_PATH': os.pathsep.join(
                    filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))})
+    # The reference appliances (M24), built from the installed tree as plugins;
+    # their graph path moves packets and their direct path passes self_test.
+    appliances = ROOT / 'build' / f'appliances-{s.name}'
+    shutil.rmtree(appliances, ignore_errors=True)
+    s.run(['meson', 'setup', appliances, 'examples/appliances'], env=env)
+    s.run(['meson', 'compile', '-C', appliances], env=env)
+    s.run([sys.executable, ROOT / 'tools' / 'check_standalone_plugins.py',
+           '--bessd', bessd[0], '--plugin-dir', appliances, '--set', 'appliances'],
+          env={**env, 'PYTHONPATH': client_root, 'BESS_PROTOBUF_ROOT': client_root,
+               'LD_LIBRARY_PATH': os.pathsep.join(
+                   filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))})
     # A third-party library on the installed primitives, built and tested
     # without bessd (M23, persona E).
     battery = ROOT / 'build' / f'battery-{s.name}'

@@ -20,6 +20,20 @@ import sys
 import tempfile
 import time
 
+def ipv4_udp_frame(dst, ttl=64):
+    """60 bytes: Ethernet, IPv4 (192.168.0.1 -> `dst`, a dotted quad), UDP."""
+    f = bytearray(udp_frame(53))
+    f[22] = ttl
+    f[26:30] = bytes([192, 168, 0, 1])
+    f[30:34] = bytes(int(b) for b in dst.split('.'))
+    f[24:26] = b'\x00\x00'
+    s = sum((f[i] << 8) | f[i + 1] for i in range(14, 34, 2))
+    s = (s & 0xffff) + (s >> 16)
+    s = (s & 0xffff) + (s >> 16)
+    f[24], f[25] = (~s >> 8) & 0xff, ~s & 0xff
+    return bytes(f)
+
+
 def udp_frame(dst_port):
     """60 bytes: Ethernet, IPv4 (10.0.0.1 -> 192.0.2.1), UDP to `dst_port`."""
     f = bytearray(60)
@@ -35,6 +49,16 @@ def udp_frame(dst_port):
 
 # (module class, instance name, packet template or None for Source's own,
 #  the output gate those packets must leave on). Every Init takes EmptyArg.
+# Reference appliances (M24): instances, then module commands each must
+# answer without error (the direct path, no graph).
+APPLIANCES = [
+    # R1: 172.16.1.1 arriving on igate 0 (VRF 1) leaves by interface 1 (gate 0).
+    ('RouterAppliance', 'router0', ipv4_udp_frame('172.16.1.1'), 0),
+]
+APPLIANCE_COMMANDS = [
+    ('router0', 'self_test'),
+]
+
 INSTANCES = [
     ('StandalonePass', 'pass0', None, 0),
     ('StandaloneMacSwap', 'macswap0', None, 0),
@@ -84,7 +108,7 @@ def free_port():
         return probe.getsockname()[1]
 
 
-def run(client, instances):
+def run(client, instances, commands=()):
     names = set(client.list_mclasses().names)
     missing = sorted({mclass for mclass, *_ in instances} - names)
     if missing:
@@ -110,6 +134,9 @@ def run(client, instances):
             raise RuntimeError(f'{mclass} ({name}): no packets left on gate {gate}')
         print(f'  OK: {mclass} ({name}) loaded from the installed tree and moved {sent} '
               f'packets on gate {gate}')
+    for name, command in commands:
+        client.run_module_command(name, command, 'EmptyArg', {})  # raises on failure
+        print(f'  OK: {name}.{command}()')
 
 
 def main() -> int:
@@ -117,6 +144,9 @@ def main() -> int:
     parser.add_argument('--bessd', required=True)
     parser.add_argument('--plugin-dir', required=True)
     parser.add_argument('--grpc-url', help='default: 127.0.0.1 on a free port')
+    parser.add_argument('--set', choices=('standalone', 'appliances'), default='standalone',
+                        help='the conformance plugins (examples/standalone_plugin) or the '
+                             'reference appliances (examples/appliances)')
     args = parser.parse_args()
     args.grpc_url = args.grpc_url or f'127.0.0.1:{free_port()}'
 
@@ -134,7 +164,10 @@ def main() -> int:
         try:
             wait_connected(client, process, args.grpc_url, log_path)
             try:
-                run(client, INSTANCES)
+                if args.set == 'appliances':
+                    run(client, APPLIANCES, APPLIANCE_COMMANDS)
+                else:
+                    run(client, INSTANCES)
             except Exception as error:
                 time.sleep(0.5)
                 raise RuntimeError(f'{error}\nbessd log (tail):\n'
