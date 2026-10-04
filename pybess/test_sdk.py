@@ -195,6 +195,12 @@ class SdkTest(unittest.TestCase):
             with self.assertRaises(sdk.TransportError):
                 self.tx(self.client(stub, attempts=attempts)).commit()
 
+    def test_a_refused_question_after_an_unanswered_send_is_unknown(self):
+        stub = Stub(apply=[TIMEOUT], get=[FakeRpcError(grpc.StatusCode.PERMISSION_DENIED, 'proxy')])
+        with self.assertRaises(sdk.TransportError) as raised:
+            self.tx(self.client(stub)).commit()
+        self.assertEqual(raised.exception.cause, grpc.StatusCode.PERMISSION_DENIED)
+
     def test_a_restart_during_recovery_is_reported_not_guessed(self):
         stub = Stub(apply=[TIMEOUT], get=[(False, 0, 2)])
         with self.assertRaises(sdk.DaemonRestarted):

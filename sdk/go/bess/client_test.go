@@ -270,6 +270,24 @@ func TestNoAnswerAtAllIsAnUnknownOutcome(t *testing.T) {
 	}
 }
 
+func TestARefusedQuestionAfterAnUnansweredSendIsUnknown(t *testing.T) {
+	h := newHarness(&fake{applies: []step{timeout()},
+		gets: []step{{err: status.Error(codes.PermissionDenied, "proxy")}}}, 4)
+	_, err := h.commit(t)
+	if e := as[*TransportError](t, err); e.Code != codes.PermissionDenied {
+		t.Fatal(e)
+	}
+}
+
+func TestResourcesReturnsACopy(t *testing.T) {
+	h := newHarness(&fake{}, 4)
+	all, _ := h.c.Resources(context.Background(), false)
+	delete(all, resource)
+	if _, err := h.c.Resource(context.Background(), resource); err != nil {
+		t.Fatal("editing the returned map changed the client's cache")
+	}
+}
+
 func TestConflictAndRejection(t *testing.T) {
 	h := newHarness(&fake{applies: []step{answer(conflict, 1)}}, 4)
 	_, err := h.commit(t, WithExpectedGeneration(3))

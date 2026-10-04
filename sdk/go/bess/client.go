@@ -23,6 +23,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +51,7 @@ const MaxMessageBytes = 64 << 20
 // key or value, or a request id reused with other contents).
 type InvalidRequestError struct {
 	Message string
+	Code    codes.Code      // the call's status code (codes.OK: refused by the client)
 	Detail  *pb.ErrorDetail // the server's detail, when it sent one
 }
 
@@ -242,10 +244,10 @@ func (c *Client) DaemonEpoch() (uint64, bool) {
 // refresh).
 func (c *Client) Resources(ctx context.Context, refresh bool) (map[string]Resource, error) {
 	c.mu.Lock()
-	cached := c.resources
+	cached := maps.Clone(c.resources)
 	c.mu.Unlock()
 	if cached != nil && !refresh {
-		return cached, nil
+		return cached, nil // a copy: the caller may edit it
 	}
 	actx, cancel := context.WithTimeout(ctx, c.retry.AttemptTimeout)
 	defer cancel()
@@ -264,7 +266,7 @@ func (c *Client) Resources(ctx context.Context, refresh bool) (map[string]Resour
 	c.mu.Lock()
 	c.resources = found
 	c.mu.Unlock()
-	return found, nil
+	return maps.Clone(found), nil
 }
 
 // Resource is the resource name; InvalidRequestError if no module
@@ -481,7 +483,13 @@ func (c *Client) commit(ctx context.Context, req *pb.ApplyTransactionRequest) (*
 				transportFailure, lastUnanswered = te.Code, te.Code
 				continue // still no answer: ask again, never resend blind
 			}
-			return nil, err
+			// The question was refused, but the unanswered send may have
+			// applied: the outcome is unknown, not a refusal.
+			code := codes.Unknown
+			if ir, ok := err.(*InvalidRequestError); ok {
+				code = ir.Code
+			}
+			return nil, &TransportError{RequestID: req.GetRequestId(), Code: code}
 		}
 		if err := c.checkEpoch(answered, epoch); err != nil {
 			return nil, err
@@ -559,5 +567,5 @@ func translate(err error, md metadata.MD) error {
 	if detail != nil && detail.GetCode() == pb.ErrorDetail_CONFLICT {
 		msg = "request id reused with different contents: " + msg
 	}
-	return &InvalidRequestError{Message: msg, Detail: detail}
+	return &InvalidRequestError{Message: msg, Code: status.Code(err), Detail: detail}
 }

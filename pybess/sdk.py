@@ -148,7 +148,8 @@ class RetryPolicy:
 
 # -- the client ------------------------------------------------------------------
 
-_TRANSIENT = (grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE)
+_TRANSIENT = (grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE,
+              grpc.StatusCode.CANCELLED)
 
 
 class Client:
@@ -261,7 +262,9 @@ class Client:
                 known, record, answered_epoch = self.get_transaction(request.request_id)
             except grpc.RpcError as e:
                 if not _no_answer(e):
-                    raise _translate(e)
+                    # The question was refused, but the unanswered send may
+                    # have applied: the outcome is unknown, not a refusal.
+                    raise TransportError(request.request_id, e.code())
                 transport_failure = last_unanswered = e.code()
                 continue  # still no answer: ask again, never resend blind
             self._check_epoch(answered_epoch, epoch)
