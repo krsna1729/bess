@@ -19,9 +19,9 @@ flow_shared_flow_table_test -*Failure*:*Fault*:*Allocat*:*LeavesNoTrace*:*Alloca
 flow_decision_cache_test
 flow_reference_apps_test
 stats_stats_test
-modules_l2_table_test
 route_route_test
 route_route_domain_test
 route_router_transaction_test -*Failure*:*Fault*:*Allocat*:*LeavesNoTrace*:*AllocatesNothing*
 classifier_concurrent_exact_test
 utils_mcslock_test
+l2_packed_mac_table_test

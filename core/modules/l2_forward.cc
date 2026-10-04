@@ -2,181 +2,30 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
+#include <cstring>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "l2_forward.h"
 
-#include <rte_hash_crc.h>
-
 #include "utils/endian.h"
 
-/******************************************************************************/
-// TODO(barath): Move this test code elsewhere.
+namespace {
 
-#include <limits.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
+constexpr int64_t kMaxTableSize = 1048576 * 64;
+constexpr int kDefaultTableSize = 1024;
+constexpr int kMaxBucketSize = 4;
 
-static void l2_forward_init_test() {
-  int ret;
-  struct l2_table l2tbl = {};
-
-  ret = l2_init(&l2tbl, 0, 0);
-  DCHECK_LT(ret, 0);
-
-  ret = l2_init(&l2tbl, 4, 0);
-  DCHECK_LT(ret, 0);
-
-  ret = l2_init(&l2tbl, 0, 2);
-  DCHECK_LT(ret, 0);
-
-  ret = l2_init(&l2tbl, 4, 2);
-  DCHECK(!ret);
-  ret = l2_deinit(&l2tbl);
-  DCHECK_EQ(ret, 0);
-
-  ret = l2_init(&l2tbl, 4, 4);
-  DCHECK(!ret);
-  ret = l2_deinit(&l2tbl);
-  DCHECK_EQ(ret, 0);
-
-  ret = l2_init(&l2tbl, 4, 8);
-  DCHECK_LT(ret, 0);
-
-  ret = l2_init(&l2tbl, 6, 4);
-  DCHECK_LT(ret, 0);
-
-  ret = l2_init(&l2tbl, 2 << 10, 2);
-  DCHECK_EQ(ret, 0);
-  ret = l2_deinit(&l2tbl);
-  DCHECK_EQ(ret, 0);
-
-  ret = l2_init(&l2tbl, 2 << 10, 3);
-  DCHECK_EQ(ret, 0);
+// The table's key word for a MAC (domain 0): the six address bytes, first
+// byte lowest, above 16 zero bits (l2::MakeKey's layout).
+uint64_t MacKey(const char *addr) {
+  uint64_t mac = 0;
+  std::memcpy(&mac, addr, 6);
+  return mac << 16;
 }
 
-static void l2_forward_entry_test() {
-  int ret;
-  struct l2_table l2tbl = {};
-
-  uint64_t addr1 = 0x0123456701234567;
-  uint64_t addr2 = 0x9876543210987654;
-  uint16_t index1 = 0x0123;
-  uint16_t gate_index = -1;
-
-  ret = l2_init(&l2tbl, 4, 4);
-  DCHECK_EQ(ret, 0);
-
-  ret = l2_add_entry(&l2tbl, addr1, index1);
-  LOG(INFO) << "add entry: " << addr1 << ", index: " << index1;
-  DCHECK_EQ(ret, 0);
-
-  ret = l2_find(&l2tbl, addr1, &gate_index);
-  LOG(INFO) << "find entry: " << addr1 << ", index: " << gate_index;
-  DCHECK_EQ(ret, 0);
-  DCHECK_EQ(index1, gate_index);
-
-  ret = l2_find(&l2tbl, addr2, &gate_index);
-  DCHECK_LT(ret, 0);
-
-  ret = l2_del_entry(&l2tbl, addr1);
-  DCHECK_EQ(ret, 0);
-
-  ret = l2_del_entry(&l2tbl, addr2);
-  DCHECK_LT(ret, 0);
-
-  ret = l2_find(&l2tbl, addr1, &gate_index);
-  DCHECK_LT(ret, 0);
-
-  ret = l2_deinit(&l2tbl);
-  DCHECK_EQ(ret, 0);
-}
-
-static void l2_forward_flush_test() {
-  int ret;
-  struct l2_table l2tbl = {};
-
-  uint64_t addr1 = 0x0123456701234567;
-  uint16_t index1 = 0x0123;
-  uint16_t gate_index;
-
-  ret = l2_init(&l2tbl, 4, 4);
-  DCHECK_EQ(ret, 0);
-
-  ret = l2_add_entry(&l2tbl, addr1, index1);
-  DCHECK_EQ(ret, 0);
-
-  ret = l2_flush(&l2tbl);
-  DCHECK_EQ(ret, 0);
-
-  ret = l2_find(&l2tbl, addr1, &gate_index);
-  DCHECK_LT(ret, 0);
-
-  ret = l2_deinit(&l2tbl);
-  DCHECK_EQ(ret, 0);
-}
-
-static void l2_forward_collision_test() {
-  const int h_size = 4;
-  const int b_size = 4;
-  const int max_hb_cnt = h_size * b_size;
-
-  int ret;
-  int i;
-  struct l2_table l2tbl = {};
-
-  uint64_t addr[max_hb_cnt];
-  uint16_t idx[max_hb_cnt];
-  int success[max_hb_cnt];
-  uint32_t offset;
-
-  ret = l2_init(&l2tbl, h_size, b_size);
-  DCHECK_EQ(ret, 0);
-
-  /* collision happens */
-  for (i = 0; i < max_hb_cnt; i++) {
-    addr[i] = random() % ULONG_MAX;
-    idx[i] = random() % USHRT_MAX;
-
-    ret = l2_add_entry(&l2tbl, addr[i], idx[i]);
-    LOG(INFO) << "insert result: " << addr[i] << " " << idx[i] << " " << ret;
-    success[i] = (ret >= 0);
-  }
-
-  /* collision happens */
-  for (i = 0; i < max_hb_cnt; i++) {
-    uint16_t gate_index;
-    gate_index = 0;
-    offset = 0;
-
-    ret = l2_find(&l2tbl, addr[i], &gate_index);
-
-    LOG(INFO) << "find result: " << addr[i] << " " << gate_index << " "
-              << offset;
-
-    if (success[i]) {
-      DCHECK_EQ(ret, 0);
-      DCHECK_EQ(idx[i], gate_index);
-    } else {
-      DCHECK_NE(ret, 0);
-    }
-  }
-
-  ret = l2_deinit(&l2tbl);
-  DCHECK_EQ(ret, 0);
-}
-
-int test_all() {
-  l2_forward_init_test();
-  l2_forward_entry_test();
-  l2_forward_flush_test();
-  l2_forward_collision_test();
-
-  return 0;
-}
+}  // namespace
 
 static int parse_mac_addr(const char *str, char *addr) {
   if (str != nullptr && addr != nullptr) {
@@ -207,15 +56,14 @@ const Commands L2Forward::cmds = {
 };
 
 CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
-  int ret = 0;
   // Wire values are int64: range-check before narrowing, or 2^32 + 1 would
   // become 1.
-  if (arg.size() < 0 || arg.size() > MAX_TABLE_SIZE || arg.bucket() < 0 ||
-      arg.bucket() > MAX_BUCKET_SIZE) {
+  if (arg.size() < 0 || arg.size() > kMaxTableSize || arg.bucket() < 0 ||
+      arg.bucket() > kMaxBucketSize) {
     return CommandFailure(EINVAL,
-                          "size must be in 0..%d and bucket in 0..%d "
+                          "size must be in 0..%lld and bucket in 0..%d "
                           "(0: default)",
-                          MAX_TABLE_SIZE, MAX_BUCKET_SIZE);
+                          static_cast<long long>(kMaxTableSize), kMaxBucketSize);
   }
   int size = static_cast<int>(arg.size());
   int bucket = static_cast<int>(arg.bucket());
@@ -223,27 +71,29 @@ CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
   default_gate_.store(DROP_GATE, std::memory_order_relaxed);
 
   if (size == 0) {
-    size = DEFAULT_TABLE_SIZE;
+    size = kDefaultTableSize;
   }
   if (bucket == 0) {
-    bucket = MAX_BUCKET_SIZE;
+    bucket = kMaxBucketSize;
   }
-
-  ret = l2_init(&l2_table_, size, bucket);
-
-  if (ret != 0) {
-    return CommandFailure(-ret,
+  // The arguments keep their meaning, size * bucket entries (each a power of
+  // two, size at least 2); the table lays them out itself.
+  if (size < 2 || !std::has_single_bit(static_cast<unsigned>(size)) ||
+      !std::has_single_bit(static_cast<unsigned>(bucket))) {
+    return CommandFailure(EINVAL,
                           "initialization failed with argument "
                           "size: '%d' bucket: '%d'",
                           size, bucket);
   }
-
-
+  table_ = Table::Create(static_cast<size_t>(size) * static_cast<size_t>(bucket));
+  if (table_ == nullptr) {
+    return CommandFailure(ENOMEM, "cannot allocate a table of %d entries", size * bucket);
+  }
   return CommandSuccess();
 }
 
 void L2Forward::DeInit() {
-  l2_deinit(&l2_table_);
+  table_.reset();
 }
 
 void L2Forward::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
@@ -251,16 +101,21 @@ void L2Forward::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       default_gate_.load(std::memory_order_relaxed);
 
   const int cnt = batch->cnt();
-  uint64_t dst[bess::PacketBatch::kMaxBurst];
-  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
+  uint64_t keys[bess::PacketBatch::kMaxBurst];
+  uint16_t values[bess::PacketBatch::kMaxBurst];
   for (int i = 0; i < cnt; i++) {
-    // destination MAC (first 6 bytes); assumes little endian
-    dst[i] = *(batch->packet(i).head_data<uint64_t *>()) & 0x0000ffffffffffff;
+    // The destination MAC (first 6 bytes, little endian) as a key word: the
+    // shift drops the two bytes past it.
+    uint64_t head;
+    std::memcpy(&head, batch->packet(i).head_data<const char *>(), sizeof(head));
+    keys[i] = head << 16;
   }
 
-  const uint64_t hits = l2_find_batch(&l2_table_, dst, gates, cnt);
+  const uint64_t hits =
+      table_->LookupBatch(std::span<const uint64_t>(keys, static_cast<size_t>(cnt)), values);
   for (int i = 0; i < cnt; i++) {
-    EmitPacket(ctx, batch->packet(i), (hits >> i) & 1 ? gates[i] : default_gate);
+    EmitPacket(ctx, batch->packet(i),
+               (hits >> i) & 1 ? static_cast<gate_idx_t>(values[i] - 1) : default_gate);
   }
 }
 
@@ -275,7 +130,7 @@ bool ValidWireGate(int64_t gate) {
 }  // namespace
 
 // add/delete/populate change the table in place while workers keep reading
-// (G1.2 mode C; l2_table's single-word slots need no grace period). Each
+// (G1.2 mode C; one-word slots need no grace period). Each
 // command validates everything first, and add undoes its earlier inserts if a
 // later one fails for lack of space, so a refused command leaves the table as
 // it was. That is command-level all-or-nothing, not dataplane atomicity:
@@ -304,9 +159,8 @@ CommandResponse L2Forward::CommandAdd(
       return CommandFailure(EINVAL, "Invalid gate: %lld",
                             static_cast<long long>(entry.gate()));
     }
-    const uint64_t mac = l2_addr_to_u64(addr);
-    gate_idx_t existing;
-    if (l2_find(&l2_table_, mac, &existing) == 0) {
+    const uint64_t mac = MacKey(addr);
+    if (table_->Lookup(mac) != 0) {
       return CommandFailure(EEXIST, "MAC address '%s' already exist", str_addr);
     }
     if (!seen.insert(mac).second) {
@@ -316,14 +170,13 @@ CommandResponse L2Forward::CommandAdd(
   }
 
   for (size_t i = 0; i < entries.size(); i++) {
-    const int r = l2_add_entry(&l2_table_, entries[i].first, entries[i].second);
-    if (r != 0) {
+    if (table_->Insert(entries[i].first, static_cast<uint16_t>(entries[i].second + 1), 0) ==
+        Table::kNotFound) {
       // Out of space part-way: take back what this command added.
       for (size_t j = 0; j < i; j++) {
-        l2_del_entry(&l2_table_, entries[j].first);
+        table_->Erase(table_->Find(entries[j].first));
       }
-      return r == -ENOMEM ? CommandFailure(ENOMEM, "Not enough space")
-                          : CommandFailure(-r);
+      return CommandFailure(ENOMEM, "Not enough space");
     }
   }
   return CommandSuccess();
@@ -343,16 +196,18 @@ CommandResponse L2Forward::CommandDelete(
     if (parse_mac_addr(str_addr, addr) != 0) {
       return CommandFailure(EINVAL, "%s is not a proper mac address", str_addr);
     }
-    const uint64_t mac = l2_addr_to_u64(addr);
-    gate_idx_t gate;
-    if (l2_find(&l2_table_, mac, &gate) != 0) {
+    const uint64_t mac = MacKey(addr);
+    if (table_->Find(mac) == Table::kNotFound) {
       return CommandFailure(ENOENT, "MAC address '%s' does not exist",
                             str_addr);
     }
     macs.push_back(mac);
   }
   for (const uint64_t mac : macs) {
-    l2_del_entry(&l2_table_, mac);  // duplicates in the request: ENOENT, fine
+    const uint32_t slot = table_->Find(mac);
+    if (slot != Table::kNotFound) {  // a duplicate in the request is gone already
+      table_->Erase(slot);
+    }
   }
   return CommandSuccess();
 }
@@ -385,16 +240,12 @@ CommandResponse L2Forward::CommandLookup(
       return CommandFailure(EINVAL, "%s is not a proper mac address", str_addr);
     }
 
-    gate_idx_t gate;
-    int r = l2_find(&l2_table_, l2_addr_to_u64(addr), &gate);
-
-    if (r == -ENOENT) {
+    const uint32_t value = table_->Lookup(MacKey(addr));
+    if (value == 0) {
       return CommandFailure(ENOENT, "MAC address '%s' does not exist",
                             str_addr);
-    } else if (r != 0) {
-      return CommandFailure(EINVAL, "Unknown Error: %d\n", r);
     }
-    ret.add_gates(gate);
+    ret.add_gates(value - 1);
   }
 
   return CommandSuccess(ret);
@@ -416,11 +267,10 @@ CommandResponse L2Forward::CommandPopulate(
     return CommandFailure(EINVAL, "%s is not a proper mac address", base_str);
   }
 
-  base_u64 = l2_addr_to_u64(base_str);
+  base_u64 = MacKey(base_str) >> 16;
 
   // gate_count 0 used to divide by zero (i % gate_cnt) and crash bessd.
-  const int64_t capacity =
-      static_cast<int64_t>(l2_table_.size) * l2_table_.bucket;
+  const int64_t capacity = static_cast<int64_t>(table_->capacity());
   if (arg.count() < 0 || arg.count() > capacity || arg.gate_count() <= 0 ||
       arg.gate_count() > MAX_GATES) {
     return CommandFailure(EINVAL,
@@ -441,17 +291,17 @@ CommandResponse L2Forward::CommandPopulate(
   std::vector<uint64_t> added;
   added.reserve(static_cast<size_t>(cnt));
   for (int64_t i = 0; i < cnt; i++) {
-    const uint64_t mac = bess::utils::be64_t::swap(base_u64 << 16);
-    const int r = l2_add_entry(&l2_table_, mac,
-                               static_cast<gate_idx_t>(i % gate_cnt));
-    if (r == 0) {
-      added.push_back(mac);
-    } else if (r == -ENOMEM) {
-      for (const uint64_t m : added) {
-        l2_del_entry(&l2_table_, m);
+    const uint64_t mac = bess::utils::be64_t::swap(base_u64 << 16) << 16;
+    if (table_->Find(mac) == Table::kNotFound) {
+      if (table_->Insert(mac, static_cast<uint16_t>(i % gate_cnt + 1), 0) != Table::kNotFound) {
+        added.push_back(mac);
+      } else {
+        for (const uint64_t m : added) {
+          table_->Erase(table_->Find(m));
+        }
+        return CommandFailure(ENOMEM, "Not enough space after %lld entries",
+                              static_cast<long long>(i));
       }
-      return CommandFailure(ENOMEM, "Not enough space after %lld entries",
-                            static_cast<long long>(i));
     }
     base_u64++;
   }

@@ -458,12 +458,33 @@ reference to something missing.
   timer sits in a cold array beside it. Fixed capacity, sized for 50% load;
   tables of 2 MiB or more ask for transparent huge pages.
 - **Use:** one worker owns it (learning writes it on the packet path). It is
-  not mode C: a table that a command thread writes while several workers
-  read is `l2_table` (L2Forward) or `ConcurrentExactTable`.
+  not mode C by default: the table is a type parameter (`BasicFdb<Storage>`,
+  D-073), and `PackedMacTable<Cold, SingleWriter|MultiWriter>` gives one
+  bridge domain lock-free readers on every worker (below).
 - **Cost** (D-064): 3.4 ns a hot lookup, 4.1–5.3 ns uniform up to 64K
   entries; 0.6–2.5 ns behind `l2_table` and 1.1–3× ahead of the
   `unordered_map` Bridge used before M14; at 1M entries 1.5–3.2× behind
   `l2_table`.
+
+### `l2::PackedMacTable<Cold, Sync>` (one-word MAC table, shared readers)
+
+- **What:** `core/l2/packed_mac_table.h` (D-073): MAC (48 bits), value (14),
+  a flag and an occupied bit in one 64-bit slot; MacTable's hashing, 4-way
+  32-byte buckets at 50% load and breadth-first move search; a cold word per
+  slot that only the writer touches. One bridge domain per table.
+- **Sync:** `OwnerWrites` (plain stores), `SingleWriter` (the caller
+  serialises writers; readers on any worker), `MultiWriter` (the table's
+  spinlock, `Lock`/`TryLock`).
+- **Semantics for shared readers:** every slot write is one release store;
+  a move writes its destination before clearing its source, and a move
+  path is bracketed by an odd sequence number that a reader re-checks only
+  on a miss, so a key present throughout is never missed and a hit costs no
+  extra. Proven by deterministic tests at each point inside a move
+  (`packed_mac_table_test.cc`), each of which fails if that ordering is
+  removed.
+- **Used by:** L2Forward (`SingleWriter`); `BasicFdb<PackedMacTable<...>>`
+  for a one-domain FDB shared by workers.
+- **Cost:** COST
 
 ### Member selection (`dataplane/member_select.h`, M16)
 
@@ -488,7 +509,7 @@ reference to something missing.
 | ExactMatch | `ConcurrentExactTable` | C: add/delete/clear in place; default gate and restore by G; transactions through resource `<module>/rules` | 0.3 µs per add at any size; D-022 |
 | IPLookup | `RouteTable` (`rte_lpm`) | C | |
 | WildcardMatch | `ConcurrentMaskedTable` (one `ConcurrentExactTable` per mask) | C: add/delete in place; a new or vanished mask republishes only the tuple list; transactions through resource `<module>/rules` | D-014, D-024 |
-| L2Forward | `l2_table` (inline 4-way buckets) | C: single-writer, lock-free readers; whole-word slot stores, no grace period. Multi-entry `add`/`populate` are all-or-nothing per command (validation plus rollback), but not dataplane-atomic: packets see entries one by one | D-017 |
+| L2Forward | `PackedMacTable<SingleWriter>` (one-word slots, 4-way buckets) | C: single-writer, lock-free readers; whole-word slot stores, moves destination-first under a sequence number readers re-check on a miss, no grace period. Multi-entry `add`/`populate` are all-or-nothing per command (validation plus rollback), but not dataplane-atomic: packets see entries one by one | D-017, D-073 |
 | ACL | `std::vector` of rules, linear scan | G: `add` copies, appends and publishes (all or nothing) | D-017; `rte_acl` (G-only) is the candidate for large rule sets |
 | HashLB | configuration only (`ExactMatchTable` for field layout) | G: one `RcuPtr<Config>`, read once per batch | D-017 |
 | URLFilter | `Trie` per host | Pause | legacy: cleartext HTTP only; a modern SNI classifier is recorded in MODERNIZATION §31.6 |
@@ -543,7 +564,7 @@ while packets flow, and nothing needs privileges.
 | table | decided | how |
 |---|---|---|
 | cuckoo backends (WildcardMatch tuples, typed `ExactTable`) | plain or staged body, at generation build | `ResolveLookupBody()` from the built table's footprint and lookup shape |
-| L2Forward's `l2_table` | plain or staged body, at `l2_init` (module Init) | same |
+| L2Forward's `PackedMacTable` | none: every batch hashes, prefetches both buckets, then probes (as MacTable) | - |
 | NAT's binding table (`WorkerFlowTable`, D-068) | capacity, at module Init | `Nat::CapacityFor(addresses)`: the mappings the addresses' ports can serve, at most 1M; `FindBatch` always prefetches |
 | `ConcurrentExactTable` (ExactMatch) | capacity, at create and on growth | `CapacityFor(rules)` and `Headroom()` (D-010); DPDK's own bulk lookup, no body choice |
 | `ConcurrentExactTable`, inside `rte_hash` | signature and key compare functions, at create | DPDK picks SSE2 signature compare, and a SIMD key compare for 16/32/…/128-byte keys (`memcmp` otherwise) |

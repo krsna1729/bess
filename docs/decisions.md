@@ -93,6 +93,7 @@ file is the reasoning.
 | D-070 | Hardware flow rules: a lifecycle owner, not a flow IR (M20) | accepted |
 | D-071 | Portability: one architecture boundary (core/arch), generic fallback for every kernel (M21) | accepted |
 | D-072 | Hardening program: sanitizers with the EAL, fuzzing, fault injection, models, curated clang-tidy (M22) | accepted |
+| D-073 | Table policy: the table is a type the module picks; one MAC table, PackedMacTable (user decisions 1, 3) | accepted |
 | D-074 | Public context accessors return only installed types: ResourceRegistry facade, bindings in-tree, SharedFlowTable installed (consolidation) | accepted |
 | D-075 | Release metadata, SBOM and the compatibility policy (M26) | accepted |
 
@@ -6483,6 +6484,43 @@ fixed 25 s deadline under sanitizer slowdown (scale it before the sanitizer lane
 **Revisit when:** the sanitizer lanes are green for a week (make them gating); a new stateful battery lands (it needs
 a model, fault injection and, if shared, a TSan entry before it is called stable).
 
+## D-073 Table policy: the table is a type the module picks; one MAC table, PackedMacTable (user decisions 1, 3)
+
+**Status:** accepted (2026-10-04), phases 1-2 of the table-policy plan. Later phases (maintenance thread, NAT growth,
+shared NAT, usage counters, conntrack modes) extend this record.
+**Code:** `core/dataplane/table_policy.h`, `core/l2/fdb.h` (`BasicFdb<Storage>`, `FdbStorage`), `core/l2/mac_table.h`,
+`core/l2/packed_mac_table.h`, `core/modules/l2_forward.{h,cc}`, `core/modules/legacy_l2_table_bench.h` (benchmarks only);
+tests `core/l2/packed_mac_table_test.cc`, `core/l2/fdb_model_test.cc`; benchmark `core/l2/fdb_bench.cc` backends 4-7.
+
+**Context.** The user rejected D-064's two MAC tables (MacTable for the Bridge's FDB, l2_table for L2Forward) and set
+the principle: libraries are mechanism; who writes, who reads, which table and whether it grows reach the user through
+the module as C++ types. No table offered both lock-free readers on many workers and the FDB's learning.
+
+**Decision.**
+- **Policy tags** (`dataplane/table_policy.h`): writers `OwnerWrites` / `SingleWriter` / `MultiWriter`, readers
+  `OwnerReads` / `AnyReader`, growth `Fixed` / `Growable`, and `NoLock`, the empty guard of an owned table. A table
+  says what it is through `writers`, `readers`, `growth`, and hands out its guard from `Lock()`.
+- **`BasicFdb<Storage>`**: the FDB is a template over a storage satisfying `FdbStorage` (value-returning `Lookup` and
+  `LookupBatch` for readers, slot operations for the writer, a cold word per slot for the aging timer, the domain and
+  value limits). Every mutation holds the storage's guard. `Fdb` is `BasicFdb<MacTable<ExpiryHandle>>`, so every
+  existing user is unchanged. A storage that holds fewer domains or narrower interfaces than the FDB's defaults makes
+  `Create` and the setters refuse what it cannot hold.
+- **`PackedMacTable<Cold, Sync>`**, the one MAC table for shared readers: l2_table's one-word slot (MAC 48 bits, value
+  14, a flag, occupied) with MacTable's hashing, 4-way 32-byte buckets, 50% load and breadth-first move search. One
+  bridge domain per table. Readers on any thread see a slot whole; a move writes its destination before clearing its
+  source; a move path is bracketed by an odd sequence number that a reader re-checks only on a miss, so a hit costs
+  no more than l2_table's and a key present throughout is never missed (l2_table's one-step move could not move an
+  entry back into its primary and so needed no sequence; this table's search can). `MultiWriter` adds the table's
+  spinlock with `Lock` and `TryLock` (packet-path learning skips on contention: plan decision 2).
+- **L2Forward** keeps its five commands and arguments (`size * bucket` entries) on `PackedMacTable<SingleWriter>`;
+  value = gate + 1. **l2_table is deleted** from bessd; a frozen copy remains only as the benchmarks' baseline.
+- **Bridge** stays on `Fdb` (MacTable): it needs many bridge domains, which one-word slots cannot hold.
+
+**Evidence.** EVIDENCE
+
+**Not done.** Growth (TP4-TP6); NAT's storage choice (TP5-6); usage counters (TP7); conntrack modes (TP8).
+
+**Revisit when:** a module needs shared readers over many bridge domains (a two-word slot or a per-domain table).
 ## D-074 Public context accessors return only installed types: ResourceRegistry facade, bindings in-tree, SharedFlowTable installed (consolidation)
 
 **Status:** accepted (2026-10-04). Changes D-042's capability list.

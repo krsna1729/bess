@@ -14,6 +14,7 @@
 
 #include <sys/mman.h>
 
+#include "dataplane/table_policy.h"
 #include "utils/common.h"
 
 namespace bess::l2 {
@@ -47,6 +48,16 @@ class MacTable {
   static constexpr uint64_t kEmptyKey = ~uint64_t{0};
   static constexpr uint32_t kNotFound = ~uint32_t{0};
   static constexpr size_t kHugePage = size_t{2} << 20;
+  // The whole 64-bit word is the key (the FDB packs domain and MAC into it),
+  // and a value is 16 bits.
+  static constexpr size_t kMaxDomains = 65535;
+  static constexpr uint32_t kMaxValue = 0xFFFF;
+
+  using writers = dataplane::OwnerWrites;
+  using readers = dataplane::OwnerReads;
+  using growth = dataplane::Fixed;
+  using Guard = dataplane::NoLock;
+  Guard Lock() noexcept { return {}; }
 
   static std::unique_ptr<MacTable> Create(size_t capacity) {
     if (capacity == 0 || capacity > (size_t{1} << 28)) {
@@ -119,11 +130,30 @@ class MacTable {
     }
   }
 
-  // A slot for a new key, value 0, flags 0, cold Cold{} -- or kNotFound if
-  // the table holds `capacity` entries or no free slot is reachable. The key
-  // must be absent and not kEmptyKey. Inserting may move other entries (their
-  // slot indices change).
-  uint32_t Insert(uint64_t key) noexcept {
+  // The value for `key`, 0 for a miss (a free slot reads value 0).
+  uint32_t Lookup(uint64_t key) const noexcept {
+    const uint32_t s = Find(key);
+    return s == kNotFound ? 0 : value(s);
+  }
+
+  // values[i] = the value for keys[i], 0 for a miss; bit i set for a hit.
+  uint64_t LookupBatch(std::span<const uint64_t> keys, uint16_t *values) const noexcept {
+    uint32_t slots[kMaxBatch];
+    FindBatch(keys, slots);
+    uint64_t hits = 0;
+    for (size_t i = 0; i < keys.size(); i++) {
+      const uint16_t v = slots[i] != kNotFound ? value(slots[i]) : 0;
+      hits |= uint64_t{v != 0} << i;
+      values[i] = v;
+    }
+    return hits;
+  }
+
+  // A slot for a new key with `value` and `flags`, cold Cold{} -- or
+  // kNotFound if the table holds `capacity` entries or no free slot is
+  // reachable. The key must be absent and not kEmptyKey. Inserting may move
+  // other entries (their slot indices change).
+  uint32_t Insert(uint64_t key, uint16_t value = 0, uint8_t flags = 0) noexcept {
     if (size_ >= capacity_) {
       return kNotFound;
     }
@@ -142,8 +172,8 @@ class MacTable {
     }
     Bucket &b = buckets_[s / kWays];
     b.keys[s % kWays] = key;
-    b.values[s % kWays] = 0;
-    b.flags[s % kWays] = 0;
+    b.values[s % kWays] = value;
+    b.flags[s % kWays] = flags;
     cold_[s] = Cold{};
     size_++;
     return s;

@@ -6,7 +6,12 @@
 //     backend 0 l2::Fdb (generic WorkerFlowTable), 1 legacy l2_table
 //     (MAC-specialised 4-way cuckoo, L2Forward's), 2 std::unordered_map (the
 //     pre-M14 Bridge), 3 the generic flow substrate (WorkerFlowTable<FdbKey,
-//     InterfaceId>, the backend D-064 measured and rejected); stream 0 one hot MAC, 1 uniform hit, 2 miss
+//     InterfaceId>, the backend D-064 measured and rejected); 4/5/6 l2::BasicFdb
+//     over PackedMacTable with OwnerWrites / SingleWriter / MultiWriter (table
+//     policy TP2: one-word slots, lock-free shared readers); 7 the raw
+//     PackedMacTable<SingleWriter> as L2Forward calls it (the direct
+//     comparison with 1); stream 0 one hot
+//     MAC, 1 uniform hit, 2 miss
 //   BM_L2Learn/<backend>/<n>   ns per learn of a uniformly chosen MAC on a
 //     table holding n, half of them already present (refresh or move) and half
 //     new (with the table at its limit the new ones are refused or, for the
@@ -24,7 +29,8 @@
 
 #include "flow/worker_flow_table.h"
 #include "l2/fdb.h"
-#include "modules/l2_table.h"
+#include "modules/legacy_l2_table_bench.h"
+#include "l2/packed_mac_table.h"
 
 namespace {
 
@@ -58,12 +64,17 @@ std::vector<uint32_t> Stream(int64_t s, uint32_t n) {
   return ids;
 }
 
-std::unique_ptr<Fdb> FdbWith(uint32_t n) {
-  Fdb::Config c;
+template <typename Sync>
+using PackedFdb =
+    bess::l2::BasicFdb<bess::l2::PackedMacTable<bess::dataplane::ExpiryHandle, Sync>>;
+
+template <typename F = Fdb>
+std::unique_ptr<F> FdbWith(uint32_t n) {
+  typename F::Config c;
   c.capacity = n;
   c.aging = ~uint64_t{0} >> 4;
   c.max_domains = 1;
-  auto f = Fdb::Create(c).value();
+  auto f = F::Create(c).value();
   for (uint32_t i = 0; i < n; i++) {
     (void)f->AddStatic(kD, Mac(i), InterfaceId(static_cast<uint16_t>(1 + i % 8)));
   }
@@ -100,8 +111,7 @@ void BM_L2Lookup(benchmark::State &state) {
   }
   uint64_t sink = 0, hits = 0;
   size_t pos = 0;
-  if (backend == 0) {
-    auto f = FdbWith(n);
+  const auto run_fdb = [&](auto f) {
     InterfaceId out[Fdb::kMaxBatch];
     for (auto _ : state) {
       if (batch == 1) {
@@ -111,6 +121,34 @@ void BM_L2Lookup(benchmark::State &state) {
       } else {
         sink += f->LookupBatch(std::span<const FdbKey>(&keys[pos], batch),
                                std::span<InterfaceId>(out, batch));
+      }
+      pos = (pos + batch) & (kStream - 1);
+    }
+  };
+  if (backend == 0) {
+    run_fdb(FdbWith(n));
+  } else if (backend == 4) {
+    run_fdb(FdbWith<PackedFdb<bess::dataplane::OwnerWrites>>(n));
+  } else if (backend == 5) {
+    run_fdb(FdbWith<PackedFdb<bess::dataplane::SingleWriter>>(n));
+  } else if (backend == 6) {
+    run_fdb(FdbWith<PackedFdb<bess::dataplane::MultiWriter>>(n));
+  } else if (backend == 7) {
+    using Table = bess::l2::PackedMacTable<uint8_t, bess::dataplane::SingleWriter>;
+    auto t = Table::Create(n);
+    for (uint32_t i = 0; i < n; i++) {
+      (void)t->Insert(U64(Mac(i)) << 16, static_cast<uint16_t>(1 + i % 8), 0);
+    }
+    std::vector<uint64_t> shifted(kStream);
+    for (size_t i = 0; i < kStream; i++) shifted[i] = words[i] << 16;
+    uint16_t values[64];
+    for (auto _ : state) {
+      if (batch == 1) {
+        const uint32_t v = t->Lookup(shifted[pos]);
+        sink += v;
+        hits += v != 0;
+      } else {
+        sink += t->LookupBatch(std::span<const uint64_t>(&shifted[pos], batch), values);
       }
       pos = (pos + batch) & (kStream - 1);
     }
@@ -180,18 +218,27 @@ void BM_L2Learn(benchmark::State &state) {
   for (size_t i = 0; i < kStream; i++) macs[i] = Mac(ids[i]);
   size_t pos = 0;
   uint64_t now = 1;
-  if (backend == 0) {
-    Fdb::Config c;
+  const auto run_learn = [&]<typename F>() {
+    typename F::Config c;
     c.capacity = n;
     c.aging = uint64_t{1} << 40;
     c.max_domains = 1;
-    auto f = Fdb::Create(c).value();
+    auto f = F::Create(c).value();
     for (uint32_t i = 0; i < n; i++) (void)f->Learn(kD, Mac(i), InterfaceId(1), now);
     for (auto _ : state) {
       benchmark::DoNotOptimize(
           f->Learn(kD, macs[pos], InterfaceId(static_cast<uint16_t>(1 + (pos & 3))), ++now));
       pos = (pos + 1) & (kStream - 1);
     }
+  };
+  if (backend == 0) {
+    run_learn.template operator()<Fdb>();
+  } else if (backend == 4) {
+    run_learn.template operator()<PackedFdb<bess::dataplane::OwnerWrites>>();
+  } else if (backend == 5) {
+    run_learn.template operator()<PackedFdb<bess::dataplane::SingleWriter>>();
+  } else if (backend == 6) {
+    run_learn.template operator()<PackedFdb<bess::dataplane::MultiWriter>>();
   } else if (backend == 2) {
     struct Entry { uint16_t gate; uint64_t last; bool is_static; };
     std::unordered_map<uint64_t, Entry> m;
@@ -233,9 +280,10 @@ void BM_FdbAge(benchmark::State &state) {
       benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
 }
 
-BENCHMARK(BM_L2Lookup)->ArgsProduct({{0, 1, 2, 3}, {1024, 65536, 1048576}, {0, 1, 2}, {1, 32}})
+BENCHMARK(BM_L2Lookup)
+    ->ArgsProduct({{0, 1, 2, 3, 4, 5, 6, 7}, {1024, 65536, 1048576}, {0, 1, 2}, {1, 32}})
     ->MinTime(0.25);
-BENCHMARK(BM_L2Learn)->ArgsProduct({{0, 2}, {1024, 65536, 1048576}})->MinTime(0.25);
+BENCHMARK(BM_L2Learn)->ArgsProduct({{0, 2, 4, 5, 6}, {1024, 65536, 1048576}})->MinTime(0.25);
 BENCHMARK(BM_FdbAge)->Arg(65536)->Arg(1048576)->Iterations(5);
 
 }  // namespace

@@ -524,6 +524,7 @@ core_public_subdir_headers = {
     'dataplane/slot_resource.h',
     'dataplane/slot_table.h',
     'dataplane/strong_id.h',
+    'dataplane/table_policy.h',
     'dataplane/tick_rate.h',
     'dataplane/worker_id.h',
   ),
@@ -535,6 +536,7 @@ core_public_subdir_headers = {
   'l2': files(
     'l2/fdb.h',
     'l2/mac_table.h',
+    'l2/packed_mac_table.h',
   ),
   'nat': files(
     'nat/nat.h',
@@ -600,6 +602,7 @@ unit_test_sources = [
   'offload/flow_rule_owner_test.cc',
   'l2/fdb_test.cc',
   'l2/fdb_model_test.cc',
+  'l2/packed_mac_table_test.cc',
   'conntrack/conntrack_test.cc',
   'conntrack/conntrack_model_test.cc',
   'nat/nat_test.cc',
@@ -669,7 +672,6 @@ unit_test_sources = [
   'modules/exact_match_migration_test.cc',
   'modules/exact_match_test.cc',
   'modules/exact_match_transaction_test.cc',
-  'modules/l2_table_test.cc',
   'modules/queue_out_test.cc',
   'modules/session_pipeline_test.cc',
   'modules/wildcard_match_test.cc',

@@ -42,6 +42,7 @@
 //   - size() counts every entry; dynamic_entries() the dynamic ones.
 
 #include "l2/fdb.h"
+#include "l2/packed_mac_table.h"
 
 #include <gtest/gtest.h>
 
@@ -85,10 +86,13 @@ struct FdbModelConfig {
   size_t steps;
 };
 
+template <typename FdbT>
 class FdbModel {
  public:
+  using Fdb = FdbT;
+
   explicit FdbModel(const FdbModelConfig &cfg) : cfg_(cfg), rng_(cfg.seed), now_(cfg.start) {
-    Fdb::Config c;
+    typename Fdb::Config c;
     c.capacity = cfg.capacity;
     c.learn_limit = cfg.learn_limit;
     c.aging = cfg.aging;
@@ -359,10 +363,51 @@ TEST(FdbModelTest, RandomLearningProgrammingAgingAndMapsMatchAModel) {
   };
   for (const auto &cfg : configs) {
     SCOPED_TRACE(::testing::Message() << "seed " << cfg.seed);
-    FdbModel model(cfg);
+    FdbModel<Fdb> model(cfg);
     model.Run();
     if (::testing::Test::HasFatalFailure()) return;
   }
+}
+
+// The same model over the packed one-word table (table policy, TP2): one
+// domain, and capacities below the model's ~27 MACs a domain so tables fill.
+template <typename Sync>
+void RunPacked() {
+  using PackedFdb = BasicFdb<PackedMacTable<dataplane::ExpiryHandle, Sync>>;
+  const uint64_t kNearWrap = ~uint64_t{0} - 2000;
+  const FdbModelConfig configs[] = {
+      {11, 12, 0, 300, 0, 1, 0, 40000},
+      {12, 16, 10, 300, 0, 1, 0, 40000},
+      {13, 16, 12, 300, 3, 1, kNearWrap & ~uint64_t{7}, 40000},
+      {14, 8, 0, 120, 0, 1, kNearWrap, 40000},
+  };
+  for (const auto &cfg : configs) {
+    SCOPED_TRACE(::testing::Message() << "seed " << cfg.seed);
+    FdbModel<PackedFdb> model(cfg);
+    model.Run();
+    if (::testing::Test::HasFatalFailure()) return;
+  }
+}
+
+TEST(FdbModelTest, PackedOwnerTableMatchesTheModel) { RunPacked<dataplane::OwnerWrites>(); }
+TEST(FdbModelTest, PackedSingleWriterTableMatchesTheModel) { RunPacked<dataplane::SingleWriter>(); }
+TEST(FdbModelTest, PackedMultiWriterTableMatchesTheModel) { RunPacked<dataplane::MultiWriter>(); }
+
+TEST(FdbModelTest, PackedTableHoldsOneDomain) {
+  using PackedFdb = BasicFdb<PackedMacTable<dataplane::ExpiryHandle>>;
+  PackedFdb::Config c;
+  c.max_domains = 2;
+  EXPECT_FALSE(PackedFdb::Create(c).has_value());
+  c.max_domains = 1;
+  auto fdb = std::move(*PackedFdb::Create(c));
+  const MacAddress mac{{0x02, 0, 0, 0, 0, 1}};
+  EXPECT_EQ(LearnResult::kIgnored,
+            fdb->Learn(BridgeDomainId(0), mac, InterfaceId(PackedMacTable<dataplane::ExpiryHandle>::kMaxValue + 1), 0));
+  EXPECT_EQ(LearnResult::kLearned,
+            fdb->Learn(BridgeDomainId(0), mac, InterfaceId(PackedMacTable<dataplane::ExpiryHandle>::kMaxValue), 0));
+  EXPECT_EQ(InterfaceId(PackedMacTable<dataplane::ExpiryHandle>::kMaxValue),
+            fdb->Lookup(BridgeDomainId(0), mac));
+  EXPECT_EQ(dataplane::kInvalidInterfaceId, fdb->Lookup(BridgeDomainId(1), mac));
 }
 
 }  // namespace
