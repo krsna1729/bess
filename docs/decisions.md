@@ -102,6 +102,7 @@ file is the reasoning.
 | D-079 | Shared NAT: one binding table for every worker, lock-free lookups, creates under a lock, growth on the control thread (TP6) | accepted |
 | D-080 | Symmetric RSS port option; a conntrack module with owned and per-worker tables, per-worker only on verified symmetric inputs (TP8) | accepted |
 | D-081 | Shared conntrack: one table for every worker, a per-connection lock, deadlines kept by the entry (TP8) | accepted |
+| D-083 | NAT usage counters: per-mapping packets and bytes, final and interim records through a bounded log (TP7) | accepted |
 
 
 ---
@@ -7000,4 +7001,35 @@ connections at once create each exactly once; replies on other workers than thei
 while expiry runs. The owned tracker after the `ct_internal` extraction (release, isolated CPU 2, 12 ABBA rounds,
 contamination flagged): `BM_Track` 3-15% faster on 10 of 11 rows (placement), `BM_TrackBatch` no clear difference on
 8 of 9 rows (one -4%); not slower anywhere.
+## D-083 NAT usage counters: per-mapping packets and bytes, final and interim records through a bounded log (TP7)
+
+**Status:** accepted (2026-10-05), experimental API. Implements table_policy.md section 6 for NAT.
+**Code:** `core/nat/nat.h` (`CountedBinding`, `CountedSharedBinding`, `UsageRecord`, `UsageLog`, `OwnedStore<G, Usage>`,
+`SharedStore<Usage>`, `CountedNat`, `CountedGrowableNat`, `CountedSharedNat`, `RequestReport`, `ReportSome`,
+`DrainUsage`), `core/modules/nat.{h,cc}` (`usage`, `usage_log`, `request_usage_report`, `drain_usage`; the engine is a
+variant of the six NAT types), `protobuf/module_msg.proto` (`NATUsageRecord`, `NATUsageResponse`),
+`core/nat/nat_usage_test.cc`, `bessctl/module_tests/nat.py`.
+
+**Context.** Session-style appliances (the UPF gap, Appendix M) need per-mapping usage: counts while a mapping lives,
+and a last record when it ends, without losing either. NAT learns on the packet path, so the counts live with the
+binding, and a control thread cannot read a worker-owned table.
+
+**Decision.**
+- Usage is part of the store type, chosen at Init (`NATArg.usage`): a NAT without it has no counter fields and no
+  counting code. Owned: plain `packets`/`bytes` in the binding (one writer). Shared: relaxed atomic adds (the small
+  memory option of section 6; the per-worker counter planes are left for when the atomic cost matters). Counted: both
+  directions, IP bytes (the IPv4 total length).
+- Records go through a bounded single-producer single-consumer `UsageLog`: the owner produces (shared: whichever worker
+  holds the NAT's lock), the control side consumes (`drain_usage`). A mapping's end (expiry) logs a final record with
+  its totals; a full log keeps the mapping and its port and retries a granule later, so no final record is dropped.
+- Interim records: `request_usage_report` flags a walk that the packet path runs a few slots per batch (64, inside
+  Expire), never while the table grows, and only when the log has room; `reports_done` counts completed walks. A
+  report advances only while the NAT receives traffic.
+- Growth: owned growth moves the counts with the binding; shared growth starts each copy at zero and adds the
+  original's counts at the fold after the grace period, and an expiry during growth adds both copies, so no packet
+  is counted twice or lost.
+- Known limit (shared): a worker that found a binding just before its expiry may count one more packet into the erased
+  binding after the final record; at most what workers translate in one grace period.
+
+**Evidence.** EVIDENCE
 

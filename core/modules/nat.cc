@@ -32,6 +32,11 @@ constexpr size_t kMigrateSlots = 64;
 const Commands NAT::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&NAT::GetInitialArg),
      Command::THREAD_SAFE},
+    // The usage log is single-consumer: these run under the control lock.
+    {"request_usage_report", "EmptyArg", MODULE_CMD_FUNC(&NAT::CommandRequestUsageReport),
+     Command::THREAD_UNSAFE},
+    {"drain_usage", "EmptyArg", MODULE_CMD_FUNC(&NAT::CommandDrainUsage),
+     Command::THREAD_UNSAFE},
     {"get_runtime_config", "EmptyArg", MODULE_CMD_FUNC(&NAT::GetRuntimeConfig),
      Command::THREAD_SAFE},
     {"set_runtime_config", "EmptyArg", MODULE_CMD_FUNC(&NAT::SetRuntimeConfig),
@@ -82,34 +87,27 @@ CommandResponse NAT::Init(const bess::pb::NATArg &arg) {
   config.capacity = std::min<size_t>(arg.capacity() != 0 ? arg.capacity() : 65536, servable);
   config.start = tsc_to_ns(rdtsc());
   config.seed = rdtsc();
+  config.usage_log = arg.usage_log() != 0 ? arg.usage_log() : 4096;
+  CommandResponse made;
   if (arg.shared()) {
     // Every worker translates through one NAT (TP6, D-079); it grows by
     // default, up to what the addresses serve (user decision 9.3).
     config.max_capacity =
         std::min<size_t>(arg.max_capacity() != 0 ? arg.max_capacity() : servable, servable);
     config.rcu = &init_context().rcu();
-    auto made = nat::SharedNat::Create(config);
-    if (!made) {
-      return CommandFailure(ENOMEM, "cannot create the NAT binding table");
-    }
-    shared_ = std::move(*made);
+    made = arg.usage() ? Make<nat::CountedSharedNat>(config) : Make<nat::SharedNat>(config);
     max_allowed_workers_ = Worker::kMaxWorkers;
   } else {
     config.max_capacity = std::min<size_t>(arg.max_capacity(), servable);
     if (config.max_capacity > config.capacity) {
-      auto made = nat::GrowableNat::Create(config);
-      if (!made) {
-        return CommandFailure(ENOMEM, "cannot create the NAT binding table");
-      }
-      growable_ = std::move(*made);
+      made = arg.usage() ? Make<nat::CountedGrowableNat>(config) : Make<nat::GrowableNat>(config);
     } else {
       config.max_capacity = 0;
-      auto made = nat::Nat::Create(config);
-      if (!made) {
-        return CommandFailure(ENOMEM, "cannot create the NAT binding table");
-      }
-      nat_ = std::move(*made);
+      made = arg.usage() ? Make<nat::CountedNat>(config) : Make<nat::Nat>(config);
     }
+  }
+  if (made.error().code() != 0) {
+    return made;
   }
   grow_ = bess::framework::RequestEndpoint<GrowRequest>(
       init_context().requests(), [this](const GrowRequest &r) { OnGrowRequest(r); });
@@ -118,43 +116,72 @@ CommandResponse NAT::Init(const bess::pb::NATArg &arg) {
   return CommandSuccess();
 }
 
+template <typename N>
+CommandResponse NAT::Make(typename N::Config &config) {
+  auto made = N::Create(config);
+  if (!made) {
+    return CommandFailure(ENOMEM, "cannot create the NAT binding table");
+  }
+  engine_ = std::move(*made);
+  if constexpr (N::kGrowable && !N::kShared) {
+    delete_table_ = [](void *t) { delete static_cast<typename N::Table *>(t); };
+  }
+  return CommandSuccess();
+}
+
 NAT::~NAT() {
-  delete handover_.exchange(nullptr);
-  delete retired_.exchange(nullptr);
+  if (delete_table_ != nullptr) {
+    delete_table_(handover_.exchange(nullptr));
+    delete_table_(retired_.exchange(nullptr));
+  }
 }
 
 // Control side, under the control-plane lock (the maintenance loop).
 void NAT::OnGrowRequest(const GrowRequest &request) {
   if (request.capacity == 0) {
-    delete retired_.exchange(nullptr, std::memory_order_acquire);
+    delete_table_(retired_.exchange(nullptr, std::memory_order_acquire));
     free_.Done();
     return;
   }
-  if (shared_ != nullptr) {
-    // Shared: the whole growth runs here; workers keep translating (D-079).
-    (void)shared_->Grow(request.capacity);
-    grow_.Done();
-    return;
-  }
-  // A table retired by an earlier growth whose free request is still queued.
-  delete retired_.exchange(nullptr, std::memory_order_acquire);
-  auto bigger = nat::GrowableNat::NewTable(request.capacity);
-  if (bigger == nullptr) {
-    // No memory: the table stays as it is (creates refuse with kFull, counted
-    // as drops); the next request asks again.
-    grow_.Done();
-    return;
-  }
-  delete handover_.exchange(bigger.release(), std::memory_order_release);
-  // Re-armed once the worker has taken the table and finished migrating
-  // (ProcessBatch), so a full table asks once per growth.
+  std::visit(
+      [&](auto &engine) {
+        using P = std::decay_t<decltype(engine)>;
+        if constexpr (!std::is_same_v<P, std::monostate>) {
+          using N = typename P::element_type;
+          if constexpr (N::kShared) {
+            // Shared: the whole growth runs here; workers keep translating (D-079).
+            (void)engine->Grow(request.capacity);
+            grow_.Done();
+          } else if constexpr (N::kGrowable) {
+            // A table retired by an earlier growth whose free request is still queued.
+            delete_table_(retired_.exchange(nullptr, std::memory_order_acquire));
+            auto bigger = N::NewTable(request.capacity);
+            if (bigger == nullptr) {
+              // No memory: the table stays as it is (creates refuse with kFull,
+              // counted as drops); the next request asks again.
+              grow_.Done();
+              return;
+            }
+            delete_table_(handover_.exchange(bigger.release(), std::memory_order_release));
+            // Re-armed once the worker has taken the table and finished
+            // migrating (Run), so a full table asks once per growth.
+          }
+        }
+      },
+      engine_);
 }
 
 CommandResponse NAT::GetInitialArg(const bess::pb::EmptyArg &) {
   bess::pb::NATArg resp;
-  for (const auto &a : nat_       ? nat_->addresses()
-                       : growable_ ? growable_->addresses()
-                                   : shared_->addresses()) {
+  const std::vector<nat::ExternalAddress> *addresses = nullptr;
+  std::visit(
+      [&](auto &engine) {
+        if constexpr (!std::is_same_v<std::decay_t<decltype(engine)>, std::monostate>) {
+          addresses = &engine->addresses();
+        }
+      },
+      engine_);
+  for (const auto &a : *addresses) {
     auto ext = resp.add_ext_addrs();
     ext->set_ext_addr(ToIpv4Address(a.addr));
     for (const auto &r : a.ranges) {
@@ -175,40 +202,92 @@ CommandResponse NAT::SetRuntimeConfig(const bess::pb::EmptyArg &) {
   return CommandSuccess();
 }
 
+CommandResponse NAT::CommandRequestUsageReport(const bess::pb::EmptyArg &) {
+  bool counted = false;
+  std::visit(
+      [&](auto &engine) {
+        using P = std::decay_t<decltype(engine)>;
+        if constexpr (!std::is_same_v<P, std::monostate>) {
+          if constexpr (P::element_type::kUsage) {
+            engine->RequestReport();
+            counted = true;
+          }
+        }
+      },
+      engine_);
+  return counted ? CommandSuccess() : CommandFailure(EINVAL, "this NAT has no usage counters (usage)");
+}
+
+CommandResponse NAT::CommandDrainUsage(const bess::pb::EmptyArg &) {
+  bess::pb::NATUsageResponse resp;
+  bool counted = false;
+  std::visit(
+      [&](auto &engine) {
+        using P = std::decay_t<decltype(engine)>;
+        if constexpr (!std::is_same_v<P, std::monostate>) {
+          if constexpr (P::element_type::kUsage) {
+            std::vector<nat::UsageRecord> records;
+            engine->DrainUsage(&records, ~size_t{0});
+            for (const nat::UsageRecord &r : records) {
+              auto *out = resp.add_records();
+              out->set_internal_addr(ToIpv4Address(r.internal.addr));
+              out->set_internal_port(r.internal.port.value());
+              out->set_external_addr(ToIpv4Address(r.external.addr));
+              out->set_external_port(r.external.port.value());
+              out->set_protocol(r.internal.protocol);
+              out->set_packets(r.packets);
+              out->set_bytes(r.bytes);
+              out->set_final(r.final);
+            }
+            resp.set_reports_done(engine->reports_done());
+            counted = true;
+          }
+        }
+      },
+      engine_);
+  if (!counted) {
+    return CommandFailure(EINVAL, "this NAT has no usage counters (usage)");
+  }
+  return CommandSuccess(resp);
+}
+
 void NAT::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  if (nat_ != nullptr) [[likely]] {  // the default: owned, fixed
-    nat_->Expire(ctx->current_ns, kExpireBudget);
-    Translate(*nat_, ctx, batch);
-    return;
-  }
-  if (shared_ != nullptr) {
-    if (shared_->NeedsGrowth()) [[unlikely]] {
-      (void)grow_.Post({shared_->GrowthTarget()});
+  std::visit(
+      [&](auto &engine) {
+        if constexpr (!std::is_same_v<std::decay_t<decltype(engine)>, std::monostate>) {
+          Run(*engine, ctx, batch);
+        }
+      },
+      engine_);
+}
+
+template <typename N>
+void NAT::Run(N &nat, Context *ctx, bess::PacketBatch *batch) {
+  if constexpr (N::kShared) {
+    if (nat.NeedsGrowth()) [[unlikely]] {
+      (void)grow_.Post({nat.GrowthTarget()});
     }
-    shared_->Expire(ctx->current_ns, kExpireBudget);  // whichever worker gets the lock
-    Translate(*shared_, ctx, batch);
-    return;
-  }
-  // Growable: take a handed-over table, migrate a few bindings a batch, hand
-  // the old table back to be freed, ask for a larger one when 3/4 full.
-  nat::GrowableNat &g = *growable_;
-  // A relaxed load first: the exchange (a locked instruction) only when a
-  // table has been handed over, once per growth.
-  if (handover_.load(std::memory_order_relaxed) != nullptr) [[unlikely]] {
-    g.Adopt(std::unique_ptr<nat::GrowableNat::Table>(
-        handover_.exchange(nullptr, std::memory_order_acquire)));
-  }
-  if (g.migrating()) [[unlikely]] {
-    if (auto old = g.MigrateSome(kMigrateSlots)) {
-      retired_.store(old.release(), std::memory_order_release);
-      (void)free_.Post({0});
-      grow_.Done();
+  } else if constexpr (N::kGrowable) {
+    // Take a handed-over table, migrate a few bindings a batch, hand the old
+    // table back to be freed, ask for a larger one when 3/4 full. A relaxed
+    // load first: the exchange (a locked instruction) only when a table has
+    // been handed over, once per growth.
+    if (handover_.load(std::memory_order_relaxed) != nullptr) [[unlikely]] {
+      nat.Adopt(std::unique_ptr<typename N::Table>(
+          static_cast<typename N::Table *>(handover_.exchange(nullptr, std::memory_order_acquire))));
     }
-  } else if (g.NeedsGrowth()) [[unlikely]] {
-    (void)grow_.Post({g.GrowthTarget()});
+    if (nat.migrating()) [[unlikely]] {
+      if (auto old = nat.MigrateSome(kMigrateSlots)) {
+        retired_.store(old.release(), std::memory_order_release);
+        (void)free_.Post({0});
+        grow_.Done();
+      }
+    } else if (nat.NeedsGrowth()) [[unlikely]] {
+      (void)grow_.Post({nat.GrowthTarget()});
+    }
   }
-  g.Expire(ctx->current_ns, kExpireBudget);
-  Translate(g, ctx, batch);
+  nat.Expire(ctx->current_ns, kExpireBudget);  // shared: whichever worker gets the lock
+  Translate(nat, ctx, batch);
 }
 
 template <typename N>
@@ -243,7 +322,14 @@ void NAT::Translate(N &nat, Context *ctx, bess::PacketBatch *batch) {
 }
 
 std::string NAT::GetDesc() const {
-  const size_t n = nat_ ? nat_->size() : growable_ ? growable_->size() : shared_ ? shared_->size() : 0;
+  size_t n = 0;
+  std::visit(
+      [&](auto &engine) {
+        if constexpr (!std::is_same_v<std::decay_t<decltype(engine)>, std::monostate>) {
+          n = engine->size();
+        }
+      },
+      engine_);
   return bess::utils::Format("%zu entries", n);
 }
 

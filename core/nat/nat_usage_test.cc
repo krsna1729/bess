@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Usage counters and records (TP7, D-083): counts per mapping, final records
+// when a mapping ends, interim records on request; through growth and on
+// every worker.
+
+#include <atomic>
+#include <map>
+#include <thread>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "nat/nat.h"
+#include "rcu/rcu_domain.h"
+
+namespace bess::nat {
+namespace {
+
+using conntrack::ParsedFlowPacket;
+using conntrack::ParseFrame;
+using conntrack::ParseStatus;
+
+constexpr uint32_t kPublic = 0xc6336401, kRemote = 0x08080808;
+
+std::vector<uint8_t> Udp(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport,
+                         size_t payload = 0) {
+  std::vector<uint8_t> f(14 + 28 + payload, 0);
+  f[12] = 0x08;
+  f[14] = 0x45, f[22] = 64, f[23] = 17;
+  const uint16_t ip_len = static_cast<uint16_t>(28 + payload);
+  f[16] = static_cast<uint8_t>(ip_len >> 8), f[17] = static_cast<uint8_t>(ip_len);
+  for (int i = 0; i < 4; i++) {
+    f[26 + i] = static_cast<uint8_t>(src >> (24 - 8 * i));
+    f[30 + i] = static_cast<uint8_t>(dst >> (24 - 8 * i));
+  }
+  f[34] = static_cast<uint8_t>(sport >> 8), f[35] = static_cast<uint8_t>(sport);
+  f[36] = static_cast<uint8_t>(dport >> 8), f[37] = static_cast<uint8_t>(dport);
+  const uint16_t udp_len = static_cast<uint16_t>(8 + payload);
+  f[38] = static_cast<uint8_t>(udp_len >> 8), f[39] = static_cast<uint8_t>(udp_len);
+  return f;
+}
+
+uint16_t SrcPort(const std::vector<uint8_t> &f) { return static_cast<uint16_t>(f[34] << 8 | f[35]); }
+
+template <typename N>
+typename N::Config Config(size_t capacity, size_t log = 64, rcu::RcuDomain *domain = nullptr) {
+  typename N::Config c;
+  c.addresses = {{utils::be32_t(kPublic), {{1024, 65536, false}}}};
+  c.capacity = capacity;
+  c.granularity_shift = 0;
+  c.timeout = 1000;
+  c.seed = 3;
+  c.usage_log = log;
+  c.rcu = domain;
+  return c;
+}
+
+template <typename N>
+Verdict Send(N &nat, std::vector<uint8_t> &f, Direction dir, uint64_t now) {
+  ParsedFlowPacket p;
+  EXPECT_EQ(ParseStatus::kOk, ParseFrame(f, p));
+  return nat.Translate(f, p, dir, now);
+}
+
+std::vector<UsageRecord> Drain(auto &nat) {
+  std::vector<UsageRecord> out;
+  nat.DrainUsage(&out, ~size_t{0});
+  return out;
+}
+
+// Both directions count, in IP bytes; a mapping's end is one final record
+// with its totals; a full log delays the end (the mapping and its port live
+// on) instead of losing the record.
+TEST(NatUsageTest, CountsBothDirectionsAndEndsWithAFinalRecord) {
+  auto nat = CountedNat::Create(Config<CountedNat>(16, 2)).value();
+  uint16_t ext_port = 0;
+  for (int i = 0; i < 3; i++) {
+    auto out = Udp(0x0a000001, 4000, kRemote, 53, 100);  // 128 IP bytes
+    ASSERT_EQ(Verdict::kTranslated, Send(*nat, out, Direction::kForward, 10));
+    ext_port = SrcPort(out);
+  }
+  auto in = Udp(kRemote, 53, kPublic, ext_port, 20);  // 48 IP bytes
+  ASSERT_EQ(Verdict::kTranslated, Send(*nat, in, Direction::kReverse, 10));
+  // Two more mappings fill the log of 2 when all three expire.
+  for (uint16_t port : {4001, 4002}) {
+    auto out = Udp(0x0a000001, port, kRemote, 53);
+    ASSERT_EQ(Verdict::kTranslated, Send(*nat, out, Direction::kForward, 10));
+  }
+  EXPECT_EQ(2u, nat->Expire(2000, ~size_t{0})) << "the log holds two final records";
+  EXPECT_EQ(1u, nat->size()) << "the third waits for room";
+  auto records = Drain(*nat);
+  ASSERT_EQ(2u, records.size());
+  EXPECT_EQ(1u, nat->Expire(2000 + CountedNat::kLogRetry, ~size_t{0}));
+  for (const auto &r : Drain(*nat)) records.push_back(r);
+  ASSERT_EQ(3u, records.size());
+  std::map<uint16_t, UsageRecord> by_port;
+  for (const auto &r : records) {
+    EXPECT_TRUE(r.final);
+    by_port[r.internal.port.value()] = r;
+  }
+  EXPECT_EQ(4u, by_port[4000].packets);
+  EXPECT_EQ(3u * 128 + 48, by_port[4000].bytes);
+  EXPECT_EQ(ext_port, by_port[4000].external.port.value());
+  EXPECT_EQ(1u, by_port[4001].packets);
+  EXPECT_EQ(28u, by_port[4001].bytes);
+  EXPECT_EQ(0u, nat->size());
+}
+
+// A requested report gives one interim record per live mapping, with the
+// counts so far, over a few batches; the mappings live on.
+TEST(NatUsageTest, AReportGivesEveryLiveMappingOnce) {
+  auto nat = CountedNat::Create(Config<CountedNat>(256, 512)).value();
+  for (uint16_t port = 5000; port < 5100; port++) {
+    auto out = Udp(0x0a000002, port, kRemote, 53);
+    ASSERT_EQ(Verdict::kTranslated, Send(*nat, out, Direction::kForward, 1));
+  }
+  nat->RequestReport();
+  uint64_t batches = 0;
+  while (nat->reports_done() == 0) {
+    (void)nat->Expire(1, 16);  // the module's per-batch call
+    ASSERT_LT(++batches, 100u);
+  }
+  EXPECT_GT(batches, 1u) << "spread over batches";
+  const auto records = Drain(*nat);
+  ASSERT_EQ(100u, records.size());
+  std::map<uint16_t, int> seen;
+  for (const auto &r : records) {
+    EXPECT_FALSE(r.final);
+    EXPECT_EQ(1u, r.packets);
+    seen[r.internal.port.value()]++;
+  }
+  EXPECT_EQ(100u, seen.size());
+  EXPECT_EQ(100u, nat->size());
+}
+
+// Owned growth moves counts with the mapping.
+TEST(NatUsageTest, CountsMoveWithAGrowingTable) {
+  auto c = Config<CountedGrowableNat>(4, 64);
+  c.max_capacity = 16;
+  auto nat = CountedGrowableNat::Create(c).value();
+  for (uint16_t port = 6000; port < 6003; port++) {
+    for (int k = 0; k < 2; k++) {
+      auto out = Udp(0x0a000003, port, kRemote, 53);
+      ASSERT_EQ(Verdict::kTranslated, Send(*nat, out, Direction::kForward, 1));
+    }
+  }
+  nat->Adopt(CountedGrowableNat::NewTable(nat->GrowthTarget()));
+  while (nat->MigrateSome(1) == nullptr) {
+  }
+  ASSERT_EQ(3u, nat->Expire(5000, ~size_t{0}));
+  const auto records = Drain(*nat);
+  ASSERT_EQ(3u, records.size());
+  for (const auto &r : records) EXPECT_EQ(2u, r.packets) << r.internal.port.value();
+}
+
+// Shared: four workers count one mapping set while the control thread grows
+// the table; after expiry the final records add up to every packet sent.
+TEST(NatUsageTest, SharedCountsAddUpAcrossWorkersAndGrowth) {
+  rcu::RcuDomain domain(8);
+  auto c = Config<CountedSharedNat>(16, 4096, &domain);
+  c.max_capacity = 1024;
+  c.timeout = ~uint64_t{0} / 4;
+  auto nat = CountedSharedNat::Create(c).value();
+  constexpr int kWorkers = 4, kFlows = 300, kRounds = 20;
+  std::atomic<int> online{0};
+  std::atomic<uint64_t> sent{0};
+  std::vector<std::thread> workers;
+  for (int w = 0; w < kWorkers; w++) {
+    workers.emplace_back([&, w] {
+      const rcu::ReaderId reader = static_cast<rcu::ReaderId>(w + 1);
+      if (!domain.Register(reader).has_value()) std::abort();
+      domain.Online(reader);
+      online++;
+      for (int round = 0; round < kRounds; round++) {
+        for (int flow = 0; flow < kFlows; flow++) {
+          auto out = Udp(0x0a000004, static_cast<uint16_t>(7000 + flow), kRemote, 53);
+          ParsedFlowPacket p;
+          if (ParseFrame(out, p) != ParseStatus::kOk) std::abort();
+          if (nat->Translate(out, p, Direction::kForward, 1) == Verdict::kTranslated) sent++;
+          domain.Quiescent(reader);
+        }
+      }
+      domain.Offline(reader);
+    });
+  }
+  while (online.load() < kWorkers) {
+  }
+  size_t grown = 0;
+  while (grown < 5) {  // 16 -> 512 while the workers count
+    if (nat->NeedsGrowth()) {
+      ASSERT_TRUE(nat->Grow(nat->GrowthTarget()));
+      grown++;
+    } else if (online.load() == kWorkers && sent.load() == uint64_t{kWorkers} * kFlows * kRounds) {
+      break;
+    }
+    std::this_thread::yield();
+  }
+  for (auto &t : workers) t.join();
+  EXPECT_GE(grown, 4u);
+  EXPECT_EQ(static_cast<size_t>(kFlows), nat->size());
+  // End everything: one final record per mapping.
+  ASSERT_TRUE(domain.Register(9).has_value());
+  domain.Online(9);
+  ASSERT_EQ(static_cast<size_t>(kFlows), nat->Expire(~uint64_t{0} / 2, ~size_t{0}));
+  domain.Offline(9);
+  domain.Unregister(9);
+  uint64_t total = 0;
+  for (const auto &r : Drain(*nat)) total += r.packets;
+  EXPECT_EQ(sent.load(), total);
+  nat.reset();
+  for (int w = 0; w < kWorkers; w++) domain.Unregister(static_cast<rcu::ReaderId>(w + 1));
+}
+
+}  // namespace
+}  // namespace bess::nat

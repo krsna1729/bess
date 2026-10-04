@@ -807,6 +807,30 @@ message NATArg {
   /// One NAT for every worker (any traffic distribution): lookups lock-free,
   /// creating a mapping takes a lock. Default: one worker.
   bool shared = 4;
+  /// Count packets and IP bytes per mapping (both directions), and log a
+  /// record when a mapping ends or a report is requested (drain_usage).
+  bool usage = 5;
+  /// Records the usage log holds until drained (0: 4096). A full log delays
+  /// expiry, never drops a record.
+  uint32 usage_log = 6;
+}
+
+/// A mapping's usage (NAT.drain_usage): totals since it was made; `final`
+/// when it ended, otherwise an interim record from a requested report.
+message NATUsageRecord {
+  string internal_addr = 1;
+  uint32 internal_port = 2;
+  string external_addr = 3;
+  uint32 external_port = 4;
+  uint32 protocol = 5;
+  uint64 packets = 6;
+  uint64 bytes = 7;
+  bool final = 8;
+}
+
+message NATUsageResponse {
+  repeated NATUsageRecord records = 1;
+  uint64 reports_done = 2;  /// requested reports completed so far
 }
 
 /**

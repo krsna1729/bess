@@ -116,6 +116,33 @@ class BessNatTest(BessModuleTestCase):
         self.assertEqual(40, translated)
         self.assertIn('40 entries', self.bess.get_module_info(nat.name).desc)
 
+    def test_nat_usage(self):
+        # Usage counters (TP7): an interim report with the counts so far,
+        # owned and shared.
+        eth = scapy.Ether(src='02:1e:67:9f:4d:ae', dst='06:16:3e:1b:72:32')
+        for shared in (False, True):
+            nat = NAT(ext_addrs=[{'ext_addr': '192.168.1.1'}], capacity=64,
+                      usage=True, shared=shared)
+            out = scapy.IP(src='172.16.0.2', dst='8.8.8.8') / \
+                scapy.UDP(sport=33000, dport=53) / ('y' * 72)  # 100 IP bytes
+            for _ in range(3):
+                outs = self.run_module(nat, 0, [eth / out], [0, 1])
+                self.assertEqual(len(outs[1]), 1)
+            nat.request_usage_report()
+            # The report walks the table on the packet path: one more batch
+            # (a packet that is dropped: an inbound one with no mapping).
+            stray = eth / scapy.IP(src='8.8.8.8', dst='192.168.1.1') / \
+                scapy.UDP(sport=53, dport=9) / 'z'
+            self.run_module(nat, 1, [stray], [0, 1])
+            resp = nat.drain_usage()
+            self.assertEqual(resp.reports_done, 1)
+            self.assertEqual(len(resp.records), 1)
+            record = resp.records[0]
+            self.assertFalse(record.final)
+            self.assertEqual((record.internal_addr, record.internal_port),
+                             ('172.16.0.2', 33000))
+            self.assertEqual((record.packets, record.bytes), (3, 300))
+
     def test_nat_selfconfig(self):
         # Send initial conf unsorted, see that it comes back sorted
         # (note that this is a bit different from other modules

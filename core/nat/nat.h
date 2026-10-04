@@ -266,6 +266,73 @@ struct SharedBindingTraits : flow::DefaultSharedFlowTableTraits {
   static constexpr size_t kAliases = 1;  // the external endpoint
 };
 
+// -- usage counters (TP7, D-083) --------------------------------------------------
+
+// A mapping's usage: packets and IP bytes, both directions. Owned: plain
+// counters (one writer). Shared: relaxed atomic adds (any worker).
+struct CountedBinding : Binding {
+  uint64_t packets = 0;
+  uint64_t bytes = 0;
+  CountedBinding(Endpoint in, Endpoint ext, uint32_t a, uint64_t now) : Binding{in, ext, a, now} {}
+};
+
+struct CountedSharedBinding : SharedBinding {
+  std::atomic<uint64_t> packets{0};
+  std::atomic<uint64_t> bytes{0};
+  CountedSharedBinding(Endpoint in, Endpoint ext, uint32_t a, uint64_t now)
+      : SharedBinding(in, ext, a, now) {}
+};
+
+// A usage record: a mapping's counts when a report walked it (interim) or when
+// it ended (final). Totals since the mapping was made.
+struct UsageRecord {
+  Endpoint internal;
+  Endpoint external;
+  uint64_t packets = 0;
+  uint64_t bytes = 0;
+  uint64_t last_refresh = 0;
+  bool final = false;
+};
+
+// A bounded single-producer single-consumer ring of usage records: the worker
+// that owns the NAT (or, shared, whichever worker holds its lock) produces;
+// the control side consumes. Push never blocks: false when full, and the
+// producer keeps the record for later (an expiry re-arms; a report waits).
+class UsageLog {
+ public:
+  explicit UsageLog(size_t capacity) : mask_(std::bit_ceil(std::max<size_t>(capacity, 2)) - 1) {
+    slots_ = std::make_unique<UsageRecord[]>(mask_ + 1);
+  }
+  bool Push(const UsageRecord &r) noexcept {
+    const uint64_t tail = tail_.load(std::memory_order_relaxed);
+    if (tail - head_.load(std::memory_order_acquire) > mask_) {
+      return false;
+    }
+    slots_[tail & mask_] = r;
+    tail_.store(tail + 1, std::memory_order_release);
+    return true;
+  }
+  size_t Free() const noexcept {
+    return mask_ + 1 - (tail_.load(std::memory_order_relaxed) - head_.load(std::memory_order_acquire));
+  }
+  bool Pop(UsageRecord *out) noexcept {
+    const uint64_t head = head_.load(std::memory_order_relaxed);
+    if (head == tail_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    *out = slots_[head & mask_];
+    head_.store(head + 1, std::memory_order_release);
+    return true;
+  }
+  size_t capacity() const noexcept { return mask_ + 1; }
+
+ private:
+  const size_t mask_;
+  std::unique_ptr<UsageRecord[]> slots_;
+  alignas(64) std::atomic<uint64_t> head_{0};
+  alignas(64) std::atomic<uint64_t> tail_{0};
+};
+
 // How a NAT stores its bindings: the table policy (table_policy.md, user
 // decisions 1 and 3; the module chooses).
 //
@@ -273,16 +340,36 @@ struct SharedBindingTraits : flow::DefaultSharedFlowTableTraits {
 // capacity (user decision 9.3), the code the NAT had before growth (D-068).
 // GrowableOwnedBindings: the same, and the table may grow (TP5, D-078); the
 // growth code is compiled only here, so a fixed NAT pays nothing for it.
-template <bool Growable>
+template <bool Growable, bool Usage = false>
 struct OwnedStore {
   static constexpr bool kShared = false;
   static constexpr bool kGrowable = Growable;
-  using BindingType = Binding;
-  using Table = flow::WorkerFlowTable<Endpoint, Binding, flow::DefaultFlowHash<Endpoint>,
+  static constexpr bool kUsage = Usage;
+  using BindingType = std::conditional_t<Usage, CountedBinding, Binding>;
+  using Table = flow::WorkerFlowTable<Endpoint, BindingType, flow::DefaultFlowHash<Endpoint>,
                                       flow::DefaultFlowEqual<Endpoint>, BindingTraits>;
   static auto CreateTable(size_t capacity, rcu::RcuDomain *) { return Table::Create(capacity); }
   static uint64_t RefreshOf(const Binding &b) noexcept { return b.last_refresh; }
   static void Refresh(Binding &b, uint64_t now) noexcept { b.last_refresh = now; }
+  static void Count(BindingType &b, uint32_t bytes) noexcept {
+    if constexpr (Usage) {
+      b.packets++;
+      b.bytes += bytes;
+    }
+  }
+  static std::pair<uint64_t, uint64_t> UsageOf(const BindingType &b) noexcept {
+    if constexpr (Usage) {
+      return {b.packets, b.bytes};
+    } else {
+      return {0, 0};
+    }
+  }
+  static void AddUsage(BindingType &b, uint64_t packets, uint64_t bytes) noexcept {
+    if constexpr (Usage) {
+      b.packets += packets;
+      b.bytes += bytes;
+    }
+  }
   struct Lock {  // nothing to exclude
     void Acquire() noexcept {}
     bool TryAcquire() noexcept { return true; }
@@ -299,11 +386,32 @@ using GrowableOwnedBindings = OwnedStore<true>;
 // timer) holds the NAT's lock, which a worker waits for (decision 9.1); expiry
 // runs on whichever worker takes the lock without waiting. Erased bindings are
 // destroyed after an RCU grace period. Fixed capacity (TP6).
-struct SharedBindings {
+template <bool Usage = false>
+struct SharedStore {
   static constexpr bool kShared = true;
   static constexpr bool kGrowable = true;
-  using BindingType = SharedBinding;
-  using Table = flow::SharedFlowTable<Endpoint, SharedBinding, SharedBindingTraits>;
+  static constexpr bool kUsage = Usage;
+  using BindingType = std::conditional_t<Usage, CountedSharedBinding, SharedBinding>;
+  using Table = flow::SharedFlowTable<Endpoint, BindingType, SharedBindingTraits>;
+  static void Count(BindingType &b, uint32_t bytes) noexcept {
+    if constexpr (Usage) {
+      b.packets.fetch_add(1, std::memory_order_relaxed);
+      b.bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+  }
+  static std::pair<uint64_t, uint64_t> UsageOf(const BindingType &b) noexcept {
+    if constexpr (Usage) {
+      return {b.packets.load(std::memory_order_relaxed), b.bytes.load(std::memory_order_relaxed)};
+    } else {
+      return {0, 0};
+    }
+  }
+  static void AddUsage(BindingType &b, uint64_t packets, uint64_t bytes) noexcept {
+    if constexpr (Usage) {
+      b.packets.fetch_add(packets, std::memory_order_relaxed);
+      b.bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+  }
   static auto CreateTable(size_t capacity, rcu::RcuDomain *domain) {
     return Table::Create(capacity, *domain);
   }
@@ -321,6 +429,7 @@ struct SharedBindings {
     rte_spinlock_t lock_;
   };
 };
+using SharedBindings = SharedStore<>;
 
 // 5 minutes (RFC 4787 REQ-5-c), refreshed by outbound packets only (REQ-6).
 inline constexpr uint64_t kDefaultNatTimeout = 300ull * 1000 * 1000 * 1000;
@@ -339,6 +448,8 @@ struct NatConfig {
   // SharedNat only: the domain whose grace periods free erased bindings
   // (every worker that translates is one of its readers).
   rcu::RcuDomain *rcu = nullptr;
+  // With usage counters (the Counted* NATs): the usage log's records.
+  size_t usage_log = 4096;
 };
 
 enum class NatCreateError : uint8_t {
@@ -357,6 +468,7 @@ class BasicNat {
   using BindingT = typename Store::BindingType;
   static constexpr bool kShared = Store::kShared;
   static constexpr bool kGrowable = Store::kGrowable;
+  static constexpr bool kUsage = Store::kUsage;
   // A growable NAT's timers are keyed by the internal endpoint, not a slot
   // handle: a binding moves to a new table without touching its timer (TP5).
   using WheelKey = std::conditional_t<kGrowable, Endpoint, flow::FlowHandle>;
@@ -526,6 +638,10 @@ class BasicNat {
     } else if (dir == Direction::kForward) {
       Store::Refresh(*b, now);
     }
+    if constexpr (kUsage) {
+      // IP bytes: the IPv4 total length (EndpointOf admits IPv4 only).
+      Store::Count(*b, be16_t::swap(rewrite_internal::Load16(frame.data() + p.l3_offset + 2)));
+    }
     Rewrite(frame.data() + p.l3_offset, frame.data() + p.l4_offset, dir, before,
             dir == Direction::kForward ? b->external : b->internal);
     return Verdict::kTranslated;
@@ -551,6 +667,7 @@ class BasicNat {
         (void)old_->Reclaim();
       }
     }
+    ReportSome(kReportSlots);  // a requested usage report, a few slots at a time
     size_t removed = 0;
     if constexpr (!kGrowable) {
       (void)wheel_->Poll(now, budget,
@@ -564,6 +681,9 @@ class BasicNat {
                            const Tick due = Wheel::After(Store::RefreshOf(*b), timeout_);
                            if (static_cast<int64_t>(due - now) > 0) {
                              return due;
+                           }
+                           if (!LogFinal(*b, nullptr)) {
+                             return now + kLogRetry;  // the log is full: keep it a while
                            }
                            ports_.Release(PoolOf(b->address_index), b->external.protocol,
                                           b->external.port.value());
@@ -596,6 +716,9 @@ class BasicNat {
                            if (static_cast<int64_t>(due - now) > 0) {
                              return due;
                            }
+                           if (!LogFinal(*b, o)) {
+                             return now + kLogRetry;  // the log is full: keep it a while
+                           }
                            ports_.Release(PoolOf(b->address_index), b->external.protocol,
                                           b->external.port.value());
                            bool erased = table_->Erase(internal);
@@ -609,6 +732,54 @@ class BasicNat {
     lock_.Release();
     return removed;
   }
+
+  // -- usage (TP7) -----------------------------------------------------------------
+
+  // Asks for an interim record of every live mapping (control side). The walk
+  // runs on the packet path a few slots a batch (ReportSome), never while the
+  // table grows, and waits while the log is full; reports_done() counts walks.
+  void RequestReport() noexcept
+    requires(kUsage)
+  {
+    report_requested_.store(true, std::memory_order_release);
+  }
+  // The owner (shared: called inside Expire, under the lock): continues a
+  // requested report over the next `slots` slots, if the log has room for them.
+  void ReportSome(size_t slots) noexcept {
+    if constexpr (kUsage) {
+      if (!report_requested_.load(std::memory_order_acquire) || old_ != nullptr ||
+          log_->Free() < slots) {
+        return;
+      }
+      cursor_report_ = table_->VisitRange(cursor_report_, slots,
+                                          [this](flow::FlowHandle, const Endpoint &,
+                                                 const BindingT &b) { (void)Log(b, nullptr, false); });
+      if (cursor_report_ >= table_->capacity()) {
+        cursor_report_ = 0;
+        report_requested_.store(false, std::memory_order_relaxed);
+        reports_done_.fetch_add(1, std::memory_order_release);
+      }
+    }
+  }
+  // Control side: up to `max` records, oldest first.
+  size_t DrainUsage(std::vector<UsageRecord> *out, size_t max) noexcept
+    requires(kUsage)
+  {
+    size_t n = 0;
+    UsageRecord r;
+    while (n < max && log_->Pop(&r)) {
+      out->push_back(r);
+      n++;
+    }
+    return n;
+  }
+  uint64_t reports_done() const noexcept {
+    return reports_done_.load(std::memory_order_acquire);
+  }
+  static constexpr size_t kReportSlots = 64;
+  // How long an expiry waits when the usage log is full (the control side
+  // drains it): one wheel granule of ~17 ms at the default granularity.
+  static constexpr Tick kLogRetry = Tick{1} << 24;
 
   // -- growth (TP5) ----------------------------------------------------------------
 
@@ -695,6 +866,10 @@ class BasicNat {
         if (static_cast<int64_t>(old_refresh - Store::RefreshOf(*n)) > 0) {
           Store::Refresh(*n, old_refresh);
         }
+        // A copy starts at zero; the original's counts (before and after the
+        // copy) join it here, so nothing is counted twice or lost.
+        const auto [packets, bytes] = Store::UsageOf(b);
+        Store::AddUsage(*n, packets, bytes);
       }
     });
     std::unique_ptr<Table> retired = std::move(old_);
@@ -791,6 +966,9 @@ class BasicNat {
         wheel_(std::move(wheel)),
         ports_(config.addresses.size()) {
     rng_.SetSeed(config.seed);
+    if constexpr (kUsage) {
+      log_ = std::make_unique<UsageLog>(config.usage_log);
+    }
     max_capacity_ = std::max(config.capacity, config.max_capacity);
     rcu_ = config.rcu;
     if constexpr (kShared) {
@@ -812,6 +990,22 @@ class BasicNat {
 
   size_t PoolOf(size_t address_index) const noexcept { return pool_of_[address_index]; }
 
+  // A usage record for `b` (and, shared while growing, its other copy `o`,
+  // whose counts add: a copy starts at zero). False when the log is full.
+  bool Log(const BindingT &b, const BindingT *o, bool final) noexcept {
+    if constexpr (kUsage) {
+      auto [packets, bytes] = Store::UsageOf(b);
+      if (o != nullptr) {
+        const auto [p2, b2] = Store::UsageOf(*o);
+        packets += p2;
+        bytes += b2;
+      }
+      return log_->Push(UsageRecord{b.internal, b.external, packets, bytes, Store::RefreshOf(b), final});
+    } else {
+      return true;
+    }
+  }
+  bool LogFinal(const BindingT &b, const BindingT *o) noexcept { return Log(b, o, true); }
   // The tables lookups use: the current one and, while growing, the old one.
   // Owned: the owner's pointers. Shared: published for lock-free readers.
   Table *cur() const noexcept {
@@ -950,6 +1144,11 @@ class BasicNat {
   size_t cursor_ = 0;           // its next slot to move
   size_t migrated_tables_ = 0;
   size_t dropped_in_growth_ = 0;
+  // Usage (TP7).
+  std::unique_ptr<UsageLog> log_;
+  std::atomic<bool> report_requested_{false};
+  std::atomic<uint64_t> reports_done_{0};
+  size_t cursor_report_ = 0;
   typename Store::Lock lock_;
   rcu::RcuDomain *rcu_ = nullptr;
   // Shared: the tables published to lock-free readers (owned: unused).
@@ -962,6 +1161,10 @@ class BasicNat {
 using Nat = BasicNat<OwnedBindings>;
 using GrowableNat = BasicNat<GrowableOwnedBindings>;
 using SharedNat = BasicNat<SharedBindings>;
+// The same with usage counters and records (TP7, D-083).
+using CountedNat = BasicNat<OwnedStore<false, true>>;
+using CountedGrowableNat = BasicNat<OwnedStore<true, true>>;
+using CountedSharedNat = BasicNat<SharedStore<true>>;
 
 }  // namespace bess::nat
 

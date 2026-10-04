@@ -29,3 +29,4 @@ stats_metric_registry_test
 framework_module_requests_test
 nat_shared_nat_test
 conntrack_shared_conntrack_test
+nat_nat_usage_test
