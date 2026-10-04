@@ -20,12 +20,14 @@ import sys
 import tempfile
 import time
 
-# module class -> what to pass its Init (all take EmptyArg today).
+# module class -> how many instances (each its own Source -> module -> Sink;
+# every Init takes EmptyArg today).
 PLUGIN_CLASSES = {
-    'StandalonePass': {},
-    'StandaloneMacSwap': {},
-    'StandaloneRangeGate': {},
-    'StandaloneFlowCount': {},  # gate 0 carries packets of flows it already knows
+    'StandalonePass': 1,
+    'StandaloneMacSwap': 1,
+    'StandaloneRangeGate': 1,
+    'StandaloneFlowCount': 1,  # gate 0 carries packets of flows it already knows
+    'StandaloneAppliance': 2,  # the second instance looks up the first's policy graph
 }
 
 
@@ -70,21 +72,24 @@ def run(client, plugin_classes):
     if missing:
         raise RuntimeError(f'plugin classes not registered: {missing}')
     client.add_worker(0, 0)
-    for mclass, arg in plugin_classes.items():
-        name = mclass.lower()
-        client.create_module('Source', name + '_src', {})
-        client.create_module(mclass, name, arg)
-        client.create_module('Sink', name + '_sink', {})
-        client.connect_modules(name + '_src', name)
-        client.connect_modules(name, name + '_sink')
+    names = {mclass: [f'{mclass.lower()}{i}' for i in range(count)]
+             for mclass, count in plugin_classes.items()}
+    for mclass, instances in names.items():
+        for name in instances:
+            client.create_module('Source', name + '_src', {})
+            client.create_module(mclass, name, {})
+            client.create_module('Sink', name + '_sink', {})
+            client.connect_modules(name + '_src', name)
+            client.connect_modules(name, name + '_sink')
     client.resume_all()
     time.sleep(0.3)
     client.pause_all()
-    for mclass in plugin_classes:
-        sent = edge_packets(client, mclass.lower())
-        if sent == 0:
-            raise RuntimeError(f'{mclass}: no packets left the module')
-        print(f'  OK: {mclass} loaded from the installed tree and moved {sent} packets')
+    for mclass, instances in names.items():
+        for name in instances:
+            sent = edge_packets(client, name)
+            if sent == 0:
+                raise RuntimeError(f'{mclass} ({name}): no packets left the module')
+            print(f'  OK: {mclass} ({name}) loaded from the installed tree and moved {sent} packets')
 
 
 def main() -> int:

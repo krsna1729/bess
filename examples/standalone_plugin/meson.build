@@ -12,9 +12,11 @@ bess_dep = dependency('bess-dev', required: true)
 # Conformance plugins (roadmap M2): each is built from the installed `bess-dev`
 # package only. standalone_pass is the trivial module, standalone_macswap
 # manipulates packets, standalone_range_gate uses the public classifier, and
-# standalone_flow_count keeps per-flow state in the public flow table (M23).
+# standalone_flow_count keeps per-flow state in the public flow table, and
+# standalone_appliance shares an application-owned object graph between its
+# instances through the InstanceRegistry (M23, personas C and D).
 foreach plugin : ['standalone_pass', 'standalone_macswap', 'standalone_range_gate',
-                  'standalone_flow_count']
+                  'standalone_flow_count', 'standalone_appliance']
   shared_module(
     plugin,
     plugin + '.cc',

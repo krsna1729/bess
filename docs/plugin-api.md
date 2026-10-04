@@ -46,7 +46,10 @@ the machine cannot supply a header), loads every plugin into the staged
 `bessd`, and runs packets through each through the installed Python client
 (`tools/check_standalone_plugins.py`). One of them, `standalone_flow_count`,
 keeps per-flow state in the public `flow::WorkerFlowTable` (a module on a
-public library). `examples/sdk_battery` is a third-party library on the public
+public library), and `standalone_appliance` is an appliance: its first instance
+creates an application-owned object graph (a range classifier yielding an
+`ActionId`, an `ObjectTable` from action to gate) in the `InstanceRegistry`,
+the second looks it up, and each runs the whole decision in one step. `examples/sdk_battery` is a third-party library on the public
 primitives alone (`StrongId`, `GenerationHandle`, `ExpiryWheel`): leases that
 expire unless renewed, with handles that go stale when a slot is reused. CI
 builds it from the staged install and runs its test without `bessd`.
