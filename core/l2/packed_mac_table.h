@@ -228,6 +228,9 @@ class PackedMacTable {
     uint64_t hits = 0;
     for (size_t i = 0; i < keys.size(); i++) {
       const uint64_t want = Want(keys[i]);
+      // Both loops run keys.size() times: hashes[i] is set (the analyzer
+      // does not relate the two loop bounds).
+      // NOLINTNEXTLINE(clang-analyzer-core.UndefinedBinaryOperatorResult)
       const size_t b1 = hashes[i] & mask_;
       uint64_t word = ProbeWord(b1, want);
       if (word == 0) {

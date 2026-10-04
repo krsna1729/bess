@@ -131,8 +131,7 @@
       "cppcoreguidelines-narrowing-conversions": 2
     },
     "core/modules/l2_forward.cc": {
-      "bugprone-implicit-widening-of-multiplication-result": 1,
-      "cppcoreguidelines-narrowing-conversions": 1
+      "bugprone-implicit-widening-of-multiplication-result": 1
     },
     "core/modules/measure.cc": {
       "cppcoreguidelines-narrowing-conversions": 1

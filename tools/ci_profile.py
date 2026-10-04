@@ -426,7 +426,10 @@ def step_verify_install(s):
     client_root = str(s.stage / 'usr/local/share/bess')
     s.run([sys.executable, ROOT / 'tools' / 'check_standalone_plugins.py',
            '--bessd', bessd[0], '--plugin-dir', s.standalone],
-          env={**env, 'PYTHONPATH': client_root, 'BESS_PROTOBUF_ROOT': client_root})
+          env={**env, 'PYTHONPATH': client_root, 'BESS_PROTOBUF_ROOT': client_root,
+               # bessd links DPDK's shared libraries, which are not installed
+               'LD_LIBRARY_PATH': os.pathsep.join(
+                   filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))})
     # A third-party library on the installed primitives, built and tested
     # without bessd (M23, persona E).
     battery = ROOT / 'build' / f'battery-{s.name}'
