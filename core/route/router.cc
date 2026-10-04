@@ -65,7 +65,8 @@ Router::Router(std::string name, std::unique_ptr<LpmRouteTable> default_routes,
       group_references_(max_groups + 1, 0),
       member_references_(max_next_hops + 1, 0),
       next_hops_name_(name + "/next_hops"),
-      routes_name_(name + "/routes") {
+      routes_name_(name + "/routes"),
+      groups_name_(name + "/groups") {
   // Before any reader can exist: nothing to retire.
   domains_.Publish(SlotOf(kDefaultRouteDomainId),
                    std::make_unique<const Domain>(std::move(default_routes)));
@@ -76,16 +77,23 @@ Router::Router(std::string name, std::unique_ptr<LpmRouteTable> default_routes,
 // no reader can use it.
 Router::~Router() {
   if (engine_ != nullptr) {
-    // Routes reference only next hops, so the two leave together with their
-    // contents; with readers gone, pending removals complete in the call.
-    const std::string names[] = {routes_name_, next_hops_name_};
+    // Routes reference groups and next hops, groups reference next hops: they
+    // leave together with their contents; with readers gone, pending removals
+    // complete in the call.
+    std::vector<std::string> names = {routes_name_};
+    if (groups_res_ != nullptr) {
+      names.push_back(groups_name_);
+    }
+    names.push_back(next_hops_name_);
     auto unregistered = engine_->Unregister(names);
     CHECK(unregistered) << unregistered.error();
   }
 }
 
 // "<router>/routes" (D-023): key Router::RouteKey(domain, prefix), value
-// NextHopId; each route references its next hop in "<router>/next_hops". A
+// NextHopId or NextHopGroupId; each route references what it names in
+// "<router>/next_hops" or "<router>/groups" (the FIB value max_next_hops + id
+// is a group, D-065). A
 // root: erasing a route takes effect at once (rte_lpm deletes in place), so
 // nothing may reference a route. One resource covers every domain: the domain
 // is part of the key, so the same prefix in two domains is two routes, and a
@@ -105,9 +113,12 @@ Router::~Router() {
 // "pending" to Contains()/ReferencesOf() until the transaction ends.
 class Router::RouteResource final : public dataplane::Resource {
  public:
-  explicit RouteResource(Router &router)
-      : Resource(router.routes_name_, {router.next_hops_name_}),
-        router_(router) {}
+  explicit RouteResource(Router &router, bool groups)
+      : Resource(router.routes_name_,
+                 groups ? std::vector<std::string>{router.next_hops_name_, router.groups_name_}
+                        : std::vector<std::string>{router.next_hops_name_}),
+        router_(router),
+        groups_(groups) {}
 
   size_t LiveCount() const override { return router_.CountRoutes(); }
 
@@ -119,15 +130,15 @@ class Router::RouteResource final : public dataplane::Resource {
   std::vector<dataplane::Reference> ReferencesOf(
       const dataplane::ResourceKey &key) const override {
     const auto id = Decode(key);
-    const auto hop = id ? Find(*id) : std::nullopt;
-    return hop ? References(*hop) : std::vector<dataplane::Reference>{};
+    const auto value = id ? Find(*id) : std::nullopt;
+    return value ? References(*value) : std::vector<dataplane::Reference>{};
   }
   void VisitReferences(
       const std::function<void(const dataplane::Reference &)> &visit) const
       override {
     router_.ForEachDomain([&](RouteDomainId, LpmRouteTable &routes) {
-      routes.ForEach([&](Ipv4Prefix, uint32_t hop) {
-        for (const auto &ref : References(NextHopId(hop))) {
+      routes.ForEach([&](Ipv4Prefix, uint32_t value) {
+        for (const auto &ref : References(value)) {
           visit(ref);
         }
       });
@@ -144,7 +155,7 @@ class Router::RouteResource final : public dataplane::Resource {
     }
     LpmRouteTable *table = router_.TableOf(id->domain);
     const Ipv4Prefix prefix = id->prefix;
-    const std::optional<NextHopId> previous = Find(*id);
+    const std::optional<uint32_t> previous = Find(*id);
     if (op.kind == dataplane::OpKind::kErase) {
       if (!previous) {
         return std::unexpected("not found");
@@ -154,19 +165,26 @@ class Router::RouteResource final : public dataplane::Resource {
       erase.previous_references = References(*previous);
       return erase;
     }
-    const NextHopId *hop = std::any_cast<NextHopId>(&op.value);
-    if (hop == nullptr) {
-      return std::unexpected("wrong value type (want NextHopId)");
+    uint32_t value = 0;  // the FIB value: a next-hop id, or max_next_hops + group id
+    if (const NextHopId *hop = std::any_cast<NextHopId>(&op.value)) {
+      if (!router_.ValidId(*hop)) {
+        return std::unexpected(RouteErrorName(RouteError::kInvalidId));
+      }
+      value = hop->value();
+    } else if (const NextHopGroupId *group = std::any_cast<NextHopGroupId>(&op.value)) {
+      if (!groups_ || !router_.ValidGroupId(*group)) {
+        return std::unexpected(RouteErrorName(RouteError::kInvalidId));
+      }
+      value = router_.max_next_hops_ + group->value();
+    } else {
+      return std::unexpected("wrong value type (want NextHopId or NextHopGroupId)");
     }
     if (table == nullptr) {
       return std::unexpected(RouteErrorName(RouteError::kUnknownDomain));
     }
-    if (!router_.ValidId(*hop)) {
-      return std::unexpected(RouteErrorName(RouteError::kInvalidId));
-    }
     // Everything that can throw first; placing the prefix is the last step.
-    auto upsert = std::make_unique<UpsertOp>(*table, prefix, *hop);
-    Reservation reservation{nullptr, References(*hop)};
+    auto upsert = std::make_unique<UpsertOp>(*table, prefix, value);
+    Reservation reservation{nullptr, References(value)};
     reservation.existed = previous.has_value();
     if (previous) {
       reservation.previous_references = References(*previous);
@@ -201,7 +219,8 @@ class Router::RouteResource final : public dataplane::Resource {
         RouteDomainId(static_cast<uint32_t>(raw >> 40)), *prefix};
   }
 
-  std::optional<NextHopId> Find(const ::bess::route::RouteKey &id) const {
+  // The route's FIB value.
+  std::optional<uint32_t> Find(const ::bess::route::RouteKey &id) const {
     if (pending_.contains(id)) {
       return std::nullopt;
     }
@@ -209,23 +228,26 @@ class Router::RouteResource final : public dataplane::Resource {
     if (table == nullptr) {
       return std::nullopt;
     }
-    const auto hop = table->Find(id.prefix);
-    return hop ? std::optional<NextHopId>(NextHopId(*hop)) : std::nullopt;
+    return table->Find(id.prefix);
   }
 
-  std::vector<dataplane::Reference> References(NextHopId hop) const {
-    return {{router_.next_hops_name_, dataplane::EncodeKey(hop)}};
+  std::vector<dataplane::Reference> References(uint32_t value) const {
+    if (value > router_.max_next_hops_) {
+      return {{router_.groups_name_,
+               dataplane::EncodeKey(NextHopGroupId(value - router_.max_next_hops_))}};
+    }
+    return {{router_.next_hops_name_, dataplane::EncodeKey(NextHopId(value))}};
   }
 
   class UpsertOp final : public dataplane::StagedOp {
    public:
-    UpsertOp(LpmRouteTable &table, Ipv4Prefix prefix, NextHopId hop)
-        : table_(table), prefix_(prefix), hop_(hop) {}
+    UpsertOp(LpmRouteTable &table, Ipv4Prefix prefix, uint32_t value)
+        : table_(table), prefix_(prefix), value_(value) {}
     void MarkPlaced() noexcept { placed_ = true; }
     void Publish(dataplane::Retirer &) noexcept override {
       // The prefix is present (placed in Reserve(), or already a route): an
       // in-place value store, which cannot fail.
-      auto set = table_.Upsert(prefix_, static_cast<uint32_t>(hop_.value()));
+      auto set = table_.Upsert(prefix_, value_);
       CHECK(set) << RouteErrorName(set.error());
     }
     void Abort() noexcept override {
@@ -238,7 +260,7 @@ class Router::RouteResource final : public dataplane::Resource {
    private:
     LpmRouteTable &table_;
     Ipv4Prefix prefix_;
-    NextHopId hop_;
+    uint32_t value_;
     bool placed_ = false;
   };
 
@@ -257,7 +279,55 @@ class Router::RouteResource final : public dataplane::Resource {
   };
 
   Router &router_;
+  const bool groups_;  // the router registered "<name>/groups"
   std::set<::bess::route::RouteKey> pending_;  // placed in this transaction
+};
+
+// "<router>/groups": a SlotResource of immutable groups, each referencing its
+// distinct members (a repeated member, a weight, is one reference), so a group
+// cannot name a next hop that does not exist and a member cannot be removed
+// while a group names it. Reserve also checks the id and the member count,
+// before the base reads the members.
+class Router::GroupResource final
+    : public dataplane::SlotResource<NextHopGroupId, NextHopGroup> {
+ public:
+  explicit GroupResource(Router &router)
+      : SlotResource(router.groups_name_, router.groups_,
+                     [hops = router.next_hops_name_](const NextHopGroup &group) {
+                       std::vector<NextHopId> members(group.members.begin(),
+                                                      group.members.begin() + group.size);
+                       std::sort(members.begin(), members.end());
+                       members.erase(std::unique(members.begin(), members.end()), members.end());
+                       std::vector<dataplane::Reference> refs;
+                       refs.reserve(members.size());
+                       for (const NextHopId m : members) {
+                         refs.push_back({hops, dataplane::EncodeKey(m)});
+                       }
+                       return refs;
+                     },
+                     {router.next_hops_name_}),
+        router_(router) {}
+
+  std::expected<Reservation, std::string> Reserve(const dataplane::Op &op) override {
+    if (op.kind == dataplane::OpKind::kUpsert) {
+      NextHopGroupId id;
+      if (!dataplane::DecodeKey(op.key, &id) || !router_.ValidGroupId(id)) {
+        return std::unexpected(RouteErrorName(RouteError::kInvalidId));
+      }
+      const NextHopGroup *group = std::any_cast<NextHopGroup>(&op.value);
+      if (group == nullptr) {
+        return std::unexpected("wrong value type (want NextHopGroup)");
+      }
+      if (group->size == 0 || group->size > NextHopGroup::kMaxMembers) {
+        return std::unexpected("a group has 1 to " + std::to_string(NextHopGroup::kMaxMembers) +
+                               " members");
+      }
+    }
+    return SlotResource::Reserve(op);
+  }
+
+ private:
+  Router &router_;
 };
 
 std::expected<void, std::string> Router::Enroll(
@@ -273,20 +343,33 @@ std::expected<void, std::string> Router::Enroll(
     return std::unexpected("enroll before adding routes");
   }
   if (groups_.size() != 0 || !retiring_groups_.empty()) {
-    return std::unexpected("next-hop groups are not transactional (D-065)");
+    return std::unexpected("enroll before adding next-hop groups");
   }
+  const bool with_groups = group_references_.size() > 1;  // max_groups > 0
   auto hops = std::make_unique<dataplane::SlotResource<NextHopId, NextHop>>(
       next_hops_name_, next_hops_);
-  auto routes = std::make_unique<RouteResource>(*this);
+  std::unique_ptr<GroupResource> groups =
+      with_groups ? std::make_unique<GroupResource>(*this) : nullptr;
+  auto routes = std::make_unique<RouteResource>(*this, with_groups);
   if (auto r = engine.Register(hops.get()); !r) {
     return r;
   }
+  if (groups != nullptr) {
+    if (auto r = engine.Register(groups.get()); !r) {
+      CHECK(engine.Unregister(next_hops_name_));
+      return r;
+    }
+  }
   if (auto r = engine.Register(routes.get()); !r) {
+    if (groups != nullptr) {
+      CHECK(engine.Unregister(groups_name_));
+    }
     CHECK(engine.Unregister(next_hops_name_));
     return r;
   }
   engine_ = &engine;
   next_hops_res_ = std::move(hops);
+  groups_res_ = std::move(groups);
   routes_res_ = std::move(routes);
   return {};
 }
@@ -296,13 +379,18 @@ std::expected<void, std::string> Router::Release() {
   if (engine_ == nullptr) {
     return {};  // not enrolled, or already released
   }
-  const std::string names[] = {routes_name_, next_hops_name_};
+  std::vector<std::string> names = {routes_name_};
+  if (groups_res_ != nullptr) {
+    names.push_back(groups_name_);
+  }
+  names.push_back(next_hops_name_);
   auto released = engine_->ReleaseForTeardown(names);
   if (!released) {
     return released;
   }
   engine_ = nullptr;
   next_hops_res_.reset();
+  groups_res_.reset();
   routes_res_.reset();
   return {};
 }
@@ -625,13 +713,23 @@ size_t Router::next_hop_group_count() const {
 
 size_t Router::GroupReferences(NextHopGroupId id) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return groups_.ValidId(id) && id.value() < group_references_.size()
-             ? group_references_[id.value()]
-             : 0;
+  if (engine_ != nullptr && groups_res_ != nullptr) {
+    return engine_->ReferenceCount(groups_name_, dataplane::EncodeKey(id));
+  }
+  return ValidGroupId(id) ? group_references_[id.value()] : 0;
 }
 
+// Enrolled, the engine counts references per (group, member) once, not per
+// member position; the direct API counts positions.
 size_t Router::GroupMemberships(NextHopId id) const {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (engine_ != nullptr && groups_res_ != nullptr) {
+    size_t n = 0;
+    groups_res_->VisitReferences([&](const dataplane::Reference &ref) {
+      n += ref.key == dataplane::EncodeKey(id) ? 1 : 0;
+    });
+    return n;
+  }
   return ValidId(id) ? member_references_[id.value()] : 0;
 }
 
@@ -735,7 +833,14 @@ size_t Router::next_hop_count() const {
 size_t Router::RouteReferences(NextHopId id) const {
   std::lock_guard<std::mutex> lock(mutex_);
   if (engine_ != nullptr) {
-    return engine_->ReferenceCount(next_hops_name_, dataplane::EncodeKey(id));
+    if (groups_res_ == nullptr) {
+      return engine_->ReferenceCount(next_hops_name_, dataplane::EncodeKey(id));
+    }
+    // Groups reference next hops too: count the routes' references only.
+    const dataplane::Reference wanted{next_hops_name_, dataplane::EncodeKey(id)};
+    size_t n = 0;
+    routes_res_->VisitReferences([&](const dataplane::Reference &ref) { n += ref == wanted; });
+    return n;
   }
   return ValidId(id) ? references_[id.value()] : 0;
 }

@@ -3,6 +3,7 @@
 #ifndef BESS_ROUTE_ROUTER_H_
 #define BESS_ROUTE_ROUTER_H_
 
+#include <algorithm>
 #include <any>
 #include <array>
 #include <atomic>
@@ -165,9 +166,10 @@ struct NextHopGroup {
 // new object (O(1), no FIB change), changing a member's neighbor is the
 // member's next-hop update, and a group in use (routes name it) cannot be
 // removed. In the FIB a group is the value max_next_hops + group id, so a
-// router without groups pays one never-taken branch. Groups are not
-// transactional: an enrolled router refuses them (kEnrolled), and Enroll()
-// refuses a router that has groups.
+// router without groups pays one never-taken branch. Groups are transactional
+// like next hops (user decision on D-065): enrolled, a router with max_groups
+// registers "<name>/groups", a route may name a group, a group references its
+// members, and the direct group setters refuse (kEnrolled).
 //
 // Transactions (G1.2b, D-023): Enroll() registers the next hops and the
 // routes as two resources of a TransactionEngine, so that one transaction can
@@ -278,13 +280,15 @@ class Router {
 
   // -- transactions (D-023) ---------------------------------------------------
 
-  // Registers "<name>/next_hops" (key: EncodeKey(NextHopId), value: NextHop)
-  // and "<name>/routes" (key: RouteKey(domain, prefix), value: NextHopId; each
-  // route references its next hop) with `engine`, which must outlive the router
-  // or its enrollment. Refused once any route exists or a removed next hop is
-  // still retiring (the ledger must start from what it can see). Freezes the
-  // set of domains. Destroying an enrolled router unregisters both (with
-  // workers paused).
+  // Registers "<name>/next_hops" (key: EncodeKey(NextHopId), value: NextHop),
+  // with max_groups "<name>/groups" (key: EncodeKey(NextHopGroupId), value:
+  // NextHopGroup; each group references its distinct members), and
+  // "<name>/routes" (key: RouteKey(domain, prefix), value: NextHopId or
+  // NextHopGroupId; each route references what it names) with `engine`, which
+  // must outlive the router or its enrollment. Refused once any route or group
+  // exists or a removed next hop or group is still retiring (the ledger must
+  // start from what it can see). Freezes the set of domains. Destroying an
+  // enrolled router unregisters them (with workers paused).
   std::expected<void, std::string> Enroll(dataplane::TransactionEngine &engine);
   bool enrolled() const noexcept { return engine_ != nullptr; }
 
@@ -297,6 +301,7 @@ class Router {
 
   const std::string &next_hops_resource() const { return next_hops_name_; }
   const std::string &routes_resource() const { return routes_name_; }
+  const std::string &groups_resource() const { return groups_name_; }
   // The registered resources while enrolled (null otherwise), so the owning
   // module can attach the RPC's typed codecs to them (D-025).
   dataplane::Resource *next_hops_resource_object() const noexcept {
@@ -304,6 +309,9 @@ class Router {
   }
   dataplane::Resource *routes_resource_object() const noexcept {
     return routes_res_.get();
+  }
+  dataplane::Resource *groups_resource_object() const noexcept {
+    return groups_res_.get();
   }
 
   // The routes resource's key: bits 40..63 the domain, 8..39 the address, 0..7
@@ -340,6 +348,28 @@ class Router {
   }
   dataplane::Op SetRouteOp(Ipv4Prefix prefix, NextHopId hop) const {
     return SetRouteOp(kDefaultRouteDomainId, prefix, hop);
+  }
+  // A route to a group.
+  dataplane::Op SetRouteOp(RouteDomainId domain, Ipv4Prefix prefix,
+                           NextHopGroupId group) const {
+    return dataplane::Op::Upsert(routes_name_, RouteKey(domain, prefix),
+                                 std::any(group));
+  }
+  // Adds group `id` or replaces its members (1..NextHopGroup::kMaxMembers; a
+  // member may repeat, as a weight). Members past kMaxMembers are dropped by
+  // the caller's span; an empty or oversized span is rejected at Reserve.
+  dataplane::Op SetNextHopGroupOp(NextHopGroupId id,
+                                  std::span<const NextHopId> members) const {
+    NextHopGroup group;
+    group.size = static_cast<uint32_t>(std::min(members.size(), NextHopGroup::kMaxMembers + 1));
+    for (size_t i = 0; i < members.size() && i < NextHopGroup::kMaxMembers; i++) {
+      group.members[i] = members[i];
+    }
+    return dataplane::Op::Upsert(groups_name_, dataplane::EncodeKey(id),
+                                 std::any(group));
+  }
+  dataplane::Op RemoveNextHopGroupOp(NextHopGroupId id) const {
+    return dataplane::Op::Erase(groups_name_, dataplane::EncodeKey(id));
   }
   dataplane::Op RemoveRouteOp(Ipv4Prefix prefix) const {
     return RemoveRouteOp(kDefaultRouteDomainId, prefix);
@@ -478,6 +508,7 @@ class Router {
          rcu::RcuDomain &rcu);
 
   class RouteResource;
+  class GroupResource;
 
   // The domain's FIB, or nullptr for a domain that does not exist.
   LpmRouteTable *TableOf(RouteDomainId domain) const noexcept {
@@ -496,6 +527,10 @@ class Router {
   size_t CountRoutes() const;
 
   bool ValidId(NextHopId id) const noexcept { return next_hops_.ValidId(id); }
+  // 1..max_groups (none when max_groups is 0).
+  bool ValidGroupId(NextHopGroupId id) const noexcept {
+    return id.value() >= 1 && id.value() < group_references_.size();
+  }
 
   // The member of the group a route value above max_next_hops_ names, as a
   // next-hop id value; 0 (a miss) for a group not published.
@@ -601,8 +636,10 @@ class Router {
   // Set by Enroll(); the resources exist while enrolled.
   const std::string next_hops_name_;
   const std::string routes_name_;
+  const std::string groups_name_;
   dataplane::TransactionEngine *engine_ = nullptr;
   std::unique_ptr<dataplane::Resource> next_hops_res_;
+  std::unique_ptr<dataplane::Resource> groups_res_;  // null without max_groups
   std::unique_ptr<dataplane::Resource> routes_res_;
 };
 

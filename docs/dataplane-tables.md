@@ -215,7 +215,14 @@ state through G, C or W.
 
 - **Next-hop groups** (M15, D-065): `SetNextHopGroup(id, members)` and
   `SetRoute(domain, prefix, NextHopGroupId)`; `Resolve`/`ResolveBatch`/
-  `LookupRoute` take a flow hash that picks the member. Not transactional.
+  `LookupRoute` take a flow hash that picks the member. Transactional when
+  enrolled: with `max_groups`, `Enroll` registers `<router>/groups` beside
+  next hops and routes, so `SetNextHopGroupOp`, `RemoveNextHopGroupOp` and
+  `SetRouteOp(domain, prefix, NextHopGroupId)` commit together with next-hop
+  and route changes. A group references its distinct members and a route the
+  group it names: the engine refuses a member or group still in use. The
+  direct group setters belong to an unenrolled router (`kEnrolled`). The
+  `Router` module does not expose groups.
   Neighbor state lives in `NeighborTable` (control side), whose updates are
   next-hop updates; TTL, MTU, ICMP and ARP mechanics are in `l3_packet.h`.
 
