@@ -152,12 +152,50 @@ class SdkTest(unittest.TestCase):
     def test_the_epoch_is_learned_before_the_first_send(self):
         stub = Stub(apply=[(APPLIED, 2)])
         client = self.client(stub)
-        handle = sdk.Resource(RESOURCE, KEY.DESCRIPTOR.full_name, VALUE.DESCRIPTOR.full_name)
+        handle = sdk.Resource(RESOURCE, KEY.DESCRIPTOR.full_name, VALUE.DESCRIPTOR.full_name, 1)
         tx = client.transaction()
         tx.upsert(handle, KEY(), VALUE())  # no discovery through this client
         with self.assertRaises(sdk.DaemonRestarted):
             tx.commit()  # the daemon answered from epoch 2; it was 1 when the commit began
         self.assertEqual(stub.listed, 1)
+
+    def test_a_handle_from_before_a_restart_is_refused_not_sent(self):
+        stub = Stub(epoch=1, apply=[(APPLIED, 2)])
+        client = self.client(stub)
+        old = client.resource(RESOURCE)
+        built = client.transaction()
+        built.upsert(old, KEY(), VALUE())
+        stub.epoch = 2
+        client.resources(refresh=True)  # the client sees the restart
+        with self.assertRaises(sdk.StaleResource):
+            client.transaction().upsert(old, KEY(), VALUE())
+        with self.assertRaises(sdk.StaleResource):
+            built.commit()  # built before the restart: never sent
+        self.assertEqual(stub.applied, [])
+        fresh = client.resource(RESOURCE)  # looked up again: usable
+        self.assertEqual(fresh.daemon_epoch, 2)
+        result = client.transaction().upsert(fresh, KEY(), VALUE()).commit()
+        self.assertIsInstance(result, sdk.Applied)
+        self.assertEqual(len(stub.applied), 1)
+
+    def test_a_restart_seen_by_a_commit_invalidates_the_old_handles(self):
+        stub = Stub(epoch=1, apply=[(APPLIED, 2)])
+        client = self.client(stub)
+        old = client.resource(RESOURCE)
+        with self.assertRaises(sdk.DaemonRestarted):
+            client.transaction().upsert(old, KEY(), VALUE()).commit()
+        with self.assertRaises(sdk.StaleResource):
+            client.transaction().upsert(old, KEY(), VALUE())
+        self.assertEqual(len(stub.applied), 1)
+
+    def test_one_transaction_holds_handles_of_one_epoch(self):
+        stub = Stub(epoch=1)
+        client = self.client(stub)
+        tx = client.transaction().upsert(client.resource(RESOURCE), KEY(), VALUE())
+        stub.epoch = 2
+        fresh = client.resources(refresh=True)[RESOURCE]  # the client sees the restart
+        with self.assertRaises(sdk.StaleResource):
+            tx.upsert(fresh, KEY(), VALUE())  # valid now, but the transaction is not
 
     def test_internal_without_bess_detail_is_no_answer(self):
         reset = FakeRpcError(grpc.StatusCode.INTERNAL, 'stream reset')

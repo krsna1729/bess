@@ -21,7 +21,13 @@ failed; nothing changed), Busy (still busy after the retries), TransportError
 (no answer at all: the outcome is unknown, not failed), DaemonRestarted (the
 epoch changed: the outcome is lost with the daemon's state; re-read it),
 InvalidRequest (refused before anything was applied, with the server's
-ErrorDetail). Conflicts and rejections are never retried.
+ErrorDetail), StaleResource (a resource handle from before a restart the
+client has seen; nothing was sent). Conflicts and rejections are never retried.
+
+A Resource is bound to the daemon epoch it was discovered under. After the
+client sees another epoch, an old handle is refused, never sent: look the
+resource up again (client.resource(name)), as the restarted daemon may serve
+another set. A transaction is bound to its first resource's epoch.
 
 One limit: the daemon remembers outcomes in a bounded window (4096). A request
 that applied, then aged out of it before the retry asked, looks unseen and is
@@ -102,6 +108,12 @@ class TransportError(Error):
         self.cause = cause
 
 
+class StaleResource(Error):
+    """A resource handle (or a transaction built with it) from an earlier
+    daemon epoch than the one the client has seen. Nothing was sent: look the
+    resource up again and rebuild the transaction."""
+
+
 class DaemonRestarted(Error):
     """The daemon restarted: its state, and the transaction's outcome, are
     gone. Re-read the state and decide again."""
@@ -126,15 +138,18 @@ class Applied:
 
 
 class Resource:
-    """A transactional resource and its key and value message types."""
+    """A transactional resource, its key and value message types, and the
+    daemon epoch it was discovered under (valid only in that epoch)."""
 
-    def __init__(self, name, key_type, value_type):
+    def __init__(self, name, key_type, value_type, daemon_epoch):
         self.name = name
         self.key_type = key_type
         self.value_type = value_type
+        self.daemon_epoch = daemon_epoch
 
     def __repr__(self):
-        return 'Resource(%r, key=%s, value=%s)' % (self.name, self.key_type, self.value_type)
+        return 'Resource(%r, key=%s, value=%s, epoch=%d)' % (
+            self.name, self.key_type, self.value_type, self.daemon_epoch)
 
 
 class RetryPolicy:
@@ -182,7 +197,8 @@ class Client:
                     raise TransportError(None, e.code())
                 raise _translate(e)
             self._observe_epoch(response.daemon_epoch)
-            self._resources = {r.name: Resource(r.name, r.key_type, r.value_type)
+            self._resources = {r.name: Resource(r.name, r.key_type, r.value_type,
+                                                response.daemon_epoch)
                                for r in response.resources}
         return self._resources
 
@@ -220,7 +236,14 @@ class Client:
             self._resources = None  # the restarted daemon's modules may differ
         return changed
 
-    def _commit(self, request):
+    def _check_bound(self, epoch, what):
+        if self.daemon_epoch is None:
+            self.resources(refresh=True)  # learn the epoch before anything is sent
+        if epoch != self.daemon_epoch:
+            raise StaleResource('%s belongs to daemon epoch %d; the daemon is now at %d: '
+                                'look the resource up again' % (what, epoch, self.daemon_epoch))
+
+    def _commit(self, request, epoch):
         """Applies `request` exactly once, whatever the transport does.
 
         Every RPC counts against the attempt budget. After a send without an
@@ -230,9 +253,6 @@ class Client:
         DaemonRestarted: the transaction met a daemon that lost the state
         the caller built it against.
         """
-        if self.daemon_epoch is None:
-            self.resources(refresh=True)  # learn the epoch before sending
-        epoch = self.daemon_epoch
         backoff = self._retry.busy_backoff
         transport_failure = None  # the last RPC that went unanswered
         last_unanswered = None    # its code, kept after later answers
@@ -336,6 +356,7 @@ class Transaction:
         # timeout must be recognised as the same request.
         self.request_id = request_id or uuid.uuid4().hex
         self._ops = []
+        self._epoch = None  # the epoch of the resources the ops were built with
         self.result = None
 
     def upsert(self, resource, key, value):
@@ -360,16 +381,25 @@ class Transaction:
             return self.result
         if not self._ops:
             raise InvalidRequest('empty transaction')
+        self._client._check_bound(self._epoch, 'this transaction')
         request = v2.ApplyTransactionRequest(
             request_id=self.request_id, ops=self._ops,
             consistency=_SCOPE_SNAPSHOT if self._snapshot else _REFERENTIAL)
         if self._expected is not None:
             request.expected_generation = self._expected
-        self.result = self._client._commit(request)
+        self.result = self._client._commit(request, self._epoch)
         return self.result
 
     def _resolve(self, resource):
-        return resource if isinstance(resource, Resource) else self._client.resource(resource)
+        if not isinstance(resource, Resource):
+            resource = self._client.resource(resource)
+        self._client._check_bound(resource.daemon_epoch, 'resource %r' % resource.name)
+        if self._epoch is None:
+            self._epoch = resource.daemon_epoch
+        elif resource.daemon_epoch != self._epoch:
+            raise StaleResource('resource %r belongs to daemon epoch %d, this transaction to %d'
+                                % (resource.name, resource.daemon_epoch, self._epoch))
+        return resource
 
     def __enter__(self):
         return self

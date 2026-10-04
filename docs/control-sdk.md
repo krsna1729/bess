@@ -19,7 +19,7 @@ print(tx.result.generation)                   # committed on a clean exit
 
 Go (`github.com/krsna1729/bess/sdk/go/bess`), the same guarantees with Go
 errors (`*ConflictError`, `*RejectedError`, `*BusyError`, `*TransportError`,
-`*DaemonRestartedError`, `*InvalidRequestError`):
+`*DaemonRestartedError`, `*StaleResourceError`, `*InvalidRequestError`):
 
 ```go
 client, err := bess.Dial("localhost:10514")
@@ -49,6 +49,7 @@ including `dynamicpb` messages built from a descriptor set.
 | `OUTCOME_REJECTED` | `Rejected`, with each failing operation's index and error; nothing changed. |
 | A refused call | `InvalidRequest`, with the server's `ErrorDetail` (code, field, object). |
 | A key or value of the wrong type | `InvalidRequest` before anything is sent. |
+| A resource handle from before a restart the client has seen | `StaleResource` before anything is sent. A handle carries the epoch it was discovered under; a transaction is bound to its first handle's epoch. Look the resource up again (`client.resource(name)` after `resources(refresh=True)`, or after any answer from the new epoch) and rebuild the transaction. |
 
 Conflicts and rejections are never retried. Tuning:
 `sdk.RetryPolicy(attempt_timeout, attempts, busy_backoff)`. Every RPC counts
@@ -64,6 +65,13 @@ application is then a `Conflict`.
 Consistency: `client.transaction(snapshot=True)` asks for
 `CONSISTENCY_SCOPE_SNAPSHOT` (D-050); the default is referential.
 
+Resource handles and restarts: the client knows of a restart only once the
+daemon answers from the new epoch (any call: discovery, a commit, a status
+question); that answer drops the resource cache and makes every older handle
+stale. A restart the client has not seen yet is caught on the commit's answer
+(`DaemonRestarted`), and the daemon decodes keys and values by type, so a
+resource whose schema changed under the same name refuses the request.
+
 ## Tests
 
 `pybess/test_sdk.py` and `sdk/go/bess/client_test.go` script every recovery
@@ -75,5 +83,16 @@ conflict and refuse a mistyped key, then checks the rule steers packets.
 
 ## Not yet
 
-Streaming transactions (the protocol has no stream yet); it will follow this
-contract when it comes.
+This is M27's first slice (transactional control, Python and Go). Still to
+come, as the roadmap's M27 describes:
+
+- Resource capability and binding information in discovery.
+- A machine-readable error taxonomy beyond `ErrorDetail`'s codes: schema
+  mismatch, unknown resource, unsupported capability, unknown after restart.
+- A request field naming the epoch the transaction was built for, so the
+  daemon itself refuses one sent across a restart the client has not seen
+  (today the client reports it as `DaemonRestarted` after the fact).
+- Desired-state, capability, telemetry and event surfaces (M25's metrics and
+  events feed the last two).
+- Streaming transactions (the protocol has no stream yet); they will follow
+  this contract.

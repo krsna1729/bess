@@ -199,13 +199,68 @@ func TestARestartDuringRecoveryIsReportedNotGuessed(t *testing.T) {
 func TestTheEpochIsLearnedBeforeTheFirstSend(t *testing.T) {
 	h := newHarness(&fake{applies: []step{answer(applied, 2)}}, 4)
 	tx := h.c.Transaction()
-	r := Resource{resource, keyType, valueType} // no discovery through this client
+	r := Resource{resource, keyType, valueType, 1} // no discovery through this client
 	_ = tx.Upsert(r, &pb.GetTransactionRequest{}, &pb.ListTransactionResourcesRequest{})
 	_, err := tx.Commit(context.Background())
 	as[*DaemonRestartedError](t, err)
 	if h.f.listed != 1 {
 		t.Fatal("epoch not learned first")
 	}
+}
+
+func upsert(tx *Transaction, r Resource) error {
+	return tx.Upsert(r, &pb.GetTransactionRequest{}, &pb.ListTransactionResourcesRequest{})
+}
+
+func TestAHandleFromBeforeARestartIsRefusedNotSent(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(&fake{epoch: 1, applies: []step{answer(applied, 2)}}, 4)
+	old, _ := h.c.Resource(ctx, resource)
+	built := h.c.Transaction()
+	if err := upsert(built, old); err != nil {
+		t.Fatal(err)
+	}
+	h.f.epoch = 2
+	if _, err := h.c.Resources(ctx, true); err != nil { // the client sees the restart
+		t.Fatal(err)
+	}
+	as[*StaleResourceError](t, upsert(h.c.Transaction(), old))
+	_, err := built.Commit(ctx) // built before the restart: never sent
+	as[*StaleResourceError](t, err)
+	if len(h.f.sent) != 0 {
+		t.Fatal("sent with a stale handle")
+	}
+	fresh, _ := h.c.Resource(ctx, resource) // looked up again: usable
+	tx := h.c.Transaction()
+	if err := upsert(tx, fresh); err != nil || fresh.DaemonEpoch != 2 {
+		t.Fatal(err, fresh)
+	}
+	if _, err := tx.Commit(ctx); err != nil || len(h.f.sent) != 1 {
+		t.Fatal(err, len(h.f.sent))
+	}
+}
+
+func TestARestartSeenByACommitInvalidatesTheOldHandles(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(&fake{epoch: 1, applies: []step{answer(applied, 2)}}, 4)
+	old, _ := h.c.Resource(ctx, resource)
+	tx := h.c.Transaction()
+	_ = upsert(tx, old)
+	_, err := tx.Commit(ctx)
+	as[*DaemonRestartedError](t, err)
+	as[*StaleResourceError](t, upsert(h.c.Transaction(), old))
+}
+
+func TestOneTransactionHoldsHandlesOfOneEpoch(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(&fake{epoch: 1}, 4)
+	old, _ := h.c.Resource(ctx, resource)
+	tx := h.c.Transaction()
+	_ = upsert(tx, old)
+	h.f.epoch = 2
+	all, _ := h.c.Resources(ctx, true)                    // the client sees the restart
+	as[*StaleResourceError](t, upsert(tx, all[resource])) // valid now, but the transaction is not
+	as[*StaleResourceError](t, tx.Erase(all[resource], &pb.GetTransactionRequest{}))
 }
 
 func TestInternalWithoutBessDetailIsNoAnswer(t *testing.T) {

@@ -7,7 +7,9 @@
 // assumed, and the request is sent again only once GetTransaction answered
 // "not known" under the daemon epoch the commit started with; an answer from
 // any other epoch is ErrDaemonRestarted; typed resources are checked before
-// anything is sent; and outcomes are typed. It holds no application
+// anything is sent; a resource handle is bound to the daemon epoch it was
+// discovered under, and one from before a restart the client has seen is
+// refused (StaleResourceError), never sent; and outcomes are typed. It holds no application
 // semantics: resources are whatever modules registered ("<module>/<table>"),
 // keys and values their own protobuf messages.
 //
@@ -121,6 +123,23 @@ func (e *DaemonRestartedError) Error() string {
 	return fmt.Sprintf("bess: the daemon restarted (epoch %d -> %d)", e.From, e.To)
 }
 
+// StaleResourceError: a resource handle, or a transaction built with one,
+// from an earlier daemon epoch than the one the client has seen. Nothing was
+// sent: look the resource up again and rebuild the transaction.
+type StaleResourceError struct {
+	Resource      string // empty: the transaction as a whole
+	Bound, Daemon uint64
+}
+
+func (e *StaleResourceError) Error() string {
+	what := "the transaction"
+	if e.Resource != "" {
+		what = fmt.Sprintf("resource %q", e.Resource)
+	}
+	return fmt.Sprintf("bess: %s belongs to daemon epoch %d, not %d: look the resource up again",
+		what, e.Bound, e.Daemon)
+}
+
 // -- results -------------------------------------------------------------------
 
 // Applied is a transaction that was applied.
@@ -133,9 +152,11 @@ type Applied struct {
 	Record      *pb.TransactionRecord
 }
 
-// Resource is a transactional resource and its key and value message types.
+// Resource is a transactional resource, its key and value message types, and
+// the daemon epoch it was discovered under (valid only in that epoch).
 type Resource struct {
 	Name, KeyType, ValueType string
+	DaemonEpoch              uint64
 }
 
 // RetryPolicy: how long one RPC may take and how many RPCs a commit may make
@@ -260,7 +281,8 @@ func (c *Client) Resources(ctx context.Context, refresh bool) (map[string]Resour
 	}
 	found := make(map[string]Resource, len(r.GetResources()))
 	for _, res := range r.GetResources() {
-		found[res.GetName()] = Resource{res.GetName(), res.GetKeyType(), res.GetValueType()}
+		found[res.GetName()] = Resource{res.GetName(), res.GetKeyType(), res.GetValueType(),
+			r.GetDaemonEpoch()}
 	}
 	c.observeEpoch(r.GetDaemonEpoch())
 	c.mu.Lock()
@@ -350,6 +372,8 @@ type Transaction struct {
 	hasExpected bool
 	snapshot    bool
 	result      *Applied
+	epoch       uint64 // the epoch of the resources the ops were built with
+	bound       bool
 }
 
 // Transaction starts one.
@@ -366,8 +390,24 @@ func (c *Client) Transaction(opts ...TxOption) *Transaction {
 	return t
 }
 
+// bind checks that r belongs to the epoch the client has seen (when it has
+// seen one; Commit checks again) and to this transaction's epoch.
+func (t *Transaction) bind(r Resource) error {
+	if epoch, known := t.c.DaemonEpoch(); known && r.DaemonEpoch != epoch {
+		return &StaleResourceError{Resource: r.Name, Bound: r.DaemonEpoch, Daemon: epoch}
+	}
+	if t.bound && r.DaemonEpoch != t.epoch {
+		return &StaleResourceError{Resource: r.Name, Bound: r.DaemonEpoch, Daemon: t.epoch}
+	}
+	t.epoch, t.bound = r.DaemonEpoch, true
+	return nil
+}
+
 // Upsert adds key -> value to r, or replaces its value.
 func (t *Transaction) Upsert(r Resource, key, value proto.Message) error {
+	if err := t.bind(r); err != nil {
+		return err
+	}
 	if err := checkType(r, "key", key, r.KeyType); err != nil {
 		return err
 	}
@@ -388,6 +428,9 @@ func (t *Transaction) Upsert(r Resource, key, value proto.Message) error {
 
 // Erase removes key from r.
 func (t *Transaction) Erase(r Resource, key proto.Message) error {
+	if err := t.bind(r); err != nil {
+		return err
+	}
 	if err := checkType(r, "key", key, r.KeyType); err != nil {
 		return err
 	}
@@ -426,7 +469,7 @@ func (t *Transaction) Commit(ctx context.Context) (*Applied, error) {
 	if t.hasExpected {
 		req.ExpectedGeneration = proto.Uint64(t.expected)
 	}
-	applied, err := t.c.commit(ctx, req)
+	applied, err := t.c.commit(ctx, req, t.epoch)
 	if err == nil {
 		t.result = applied
 	}
@@ -437,13 +480,15 @@ func (t *Transaction) Commit(ctx context.Context) (*Applied, error) {
 // counts against the attempt budget. After a send without an answer the
 // outcome is asked for; the request is sent again only once GetTransaction
 // answered "not known" under the epoch the commit started with.
-func (c *Client) commit(ctx context.Context, req *pb.ApplyTransactionRequest) (*Applied, error) {
+func (c *Client) commit(ctx context.Context, req *pb.ApplyTransactionRequest, epoch uint64) (*Applied, error) {
 	if _, known := c.DaemonEpoch(); !known {
 		if _, err := c.Resources(ctx, true); err != nil { // learn the epoch before sending
 			return nil, err
 		}
 	}
-	epoch, _ := c.DaemonEpoch()
+	if current, _ := c.DaemonEpoch(); current != epoch {
+		return nil, &StaleResourceError{Bound: epoch, Daemon: current}
+	}
 	backoff := c.retry.BusyBackoff
 	var transportFailure, lastUnanswered codes.Code = codes.OK, codes.OK
 	unknownAttempt := false // a send of this commit went unanswered
