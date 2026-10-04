@@ -44,6 +44,8 @@ INSTANCES = [
     # classifier hit (gate 1), the other the default action (gate 0).
     ('StandaloneAppliance', 'appliance0', udp_frame(1500), 1),
     ('StandaloneAppliance', 'appliance1', udp_frame(53), 0),
+    # Gate 1 only after a request round trip through bessd's maintenance loop.
+    ('StandaloneRequests', 'requests0', None, 1),
 ]
 
 

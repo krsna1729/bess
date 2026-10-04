@@ -123,7 +123,7 @@ ARM64_FLOOR_FEATURES = ('fp', 'asimd', 'crc32', 'atomics', 'asimdrdm')
 DPDK_PROFILE = 'bess'
 STANDALONE_PLUGINS = ('standalone_pass', 'standalone_macswap',
                       'standalone_range_gate', 'standalone_flow_count',
-                      'standalone_appliance')
+                      'standalone_appliance', 'standalone_requests')
 LOCAL_JOB_CAP = 8
 
 

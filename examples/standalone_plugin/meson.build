@@ -16,7 +16,7 @@ bess_dep = dependency('bess-dev', required: true)
 # standalone_appliance shares an application-owned object graph between its
 # instances through the InstanceRegistry (M23, personas C and D).
 foreach plugin : ['standalone_pass', 'standalone_macswap', 'standalone_range_gate',
-                  'standalone_flow_count', 'standalone_appliance']
+                  'standalone_flow_count', 'standalone_appliance', 'standalone_requests']
   shared_module(
     plugin,
     plugin + '.cc',

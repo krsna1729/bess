@@ -24,6 +24,9 @@ namespace dataplane {
 class ResourceRegistry;
 }  // namespace dataplane
 namespace framework {
+class RequestHub;
+}  // namespace framework
+namespace framework {
 class InstanceRegistry;
 class ResourceBindings;
 }  // namespace framework
@@ -57,13 +60,15 @@ class ModuleInitContext {
   ModuleInitContext(dataplane::ResourceRegistry &resources,
                     ResourceBindings &resource_bindings,
                     framework::InstanceRegistry &instances, rcu::RcuDomain &rcu,
-                    const runtime::PortRegistry &ports, stats::MetricRegistry &metrics) noexcept
+                    const runtime::PortRegistry &ports, stats::MetricRegistry &metrics,
+                    framework::RequestHub &requests) noexcept
       : resources_(resources),
         resource_bindings_(resource_bindings),
         instances_(instances),
         rcu_(rcu),
         ports_(ports),
-        metrics_(metrics) {}
+        metrics_(metrics),
+        requests_(requests) {}
 
   ModuleInitContext(const ModuleInitContext &) = delete;
   ModuleInitContext &operator=(const ModuleInitContext &) = delete;
@@ -88,6 +93,11 @@ class ModuleInitContext {
   // returned MetricSource as a member, declared after what it reads. A plugin
   // that calls this requires BESS_CAP_METRICS.
   stats::MetricRegistry &metrics() const noexcept { return metrics_; }
+  // Worker-to-control requests (TP4, framework/module_requests.h): open a
+  // RequestEndpoint on it in Init(); workers post, the daemon's maintenance
+  // loop calls the handler under the control-plane lock. A plugin that calls
+  // this requires BESS_CAP_REQUESTS.
+  framework::RequestHub &requests() const noexcept { return requests_; }
 
   // The framework gives every module its context; a module reads it through
   // Module::init_context() and cannot construct or look one up itself.
@@ -110,6 +120,7 @@ class ModuleInitContext {
   PortDirectory ports_;
   // Last: plugins built before it read the members above at unchanged offsets.
   stats::MetricRegistry &metrics_;
+  framework::RequestHub &requests_;
 };
 
 }  // namespace framework

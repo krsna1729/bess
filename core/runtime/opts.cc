@@ -92,6 +92,11 @@ static bool ValidateMegabytesPerSocket(const char *, int32_t value) {
 
   return true;
 }
+// How often the maintenance loop delivers worker-to-control module requests
+// (TP4, D-077): the longest a posted request waits. 0 disables the loop.
+DEFINE_int32(maintenance_interval_us, 1000,
+             "Interval of the control-side maintenance loop in microseconds (0: off)");
+
 DEFINE_int32(m, -1,
              "Per-socket DPDK memory cap in MB. -1 (default): hugepages if "
              "any are usable, mapped as needed with no cap beyond the host or "

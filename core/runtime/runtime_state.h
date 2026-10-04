@@ -12,6 +12,7 @@
 
 #include "framework/instance_registry.h"
 #include "stats/metric_registry.h"
+#include "framework/module_requests.h"
 
 class Module;
 class Port;
@@ -171,6 +172,9 @@ class RuntimeState {
   TrafficClassRegistry &traffic_classes() { return traffic_classes_; }
   // Application-owned object graphs shared by modules (D-045).
   framework::InstanceRegistry &instances() { return instances_; }
+  // Module requests from workers, delivered by the control side's maintenance
+  // loop (TP4, D-077).
+  framework::RequestHub &requests() { return requests_; }
   WorkerManager &workers();
 
   // The single dataplane reader domain (K1): workers register once and report
@@ -215,6 +219,9 @@ class RuntimeState {
   stats::MetricRegistry metrics_;
   // First: modules (below) release their leases on it as they are destroyed.
   framework::InstanceRegistry instances_;
+  // Before modules_ for the same reason: a module's endpoints unregister as it
+  // is destroyed.
+  framework::RequestHub requests_;
   PortRegistry ports_;
   ModuleRegistry modules_;
   TrafficClassRegistry traffic_classes_;

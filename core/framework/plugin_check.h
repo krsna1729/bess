@@ -11,7 +11,8 @@ namespace bess::framework {
 
 // The optional facilities this daemon provides.
 inline constexpr uint64_t kSupportedPluginCapabilities =
-    BESS_CAP_INIT_CONTEXT | BESS_CAP_INSTANCES | BESS_CAP_RESOURCES | BESS_CAP_METRICS;
+    BESS_CAP_INIT_CONTEXT | BESS_CAP_INSTANCES | BESS_CAP_RESOURCES | BESS_CAP_METRICS |
+    BESS_CAP_REQUESTS;
 
 // Checks a plugin's descriptor against this daemon. Returns an empty string
 // if the plugin may load, otherwise a one-line reason naming what is

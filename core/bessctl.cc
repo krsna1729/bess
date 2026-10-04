@@ -22,6 +22,7 @@
 #include "control/api_v2.h"
 #include "runtime/startup.h"
 #include "control/control_plane.h"
+#include "control/maintenance_loop.h"
 #include "runtime/worker_manager.h"
 #include "bessd.h"
 #include "framework/plugin_loader.h"
@@ -1177,6 +1178,11 @@ void ApiServer::Run() {
 
   service.set_shutdown_func([&server]() { server->Shutdown(); });
   {
+    // Worker-to-control module requests (TP4, D-077), delivered under the
+    // control-plane lock; stopped before the dataplane is torn down below.
+    bess::control::MaintenanceLoop maintenance(
+        control_plane, bess::runtime::runtime().requests(),
+        std::chrono::microseconds(FLAGS_maintenance_interval_us));
     // SIGTERM/SIGINT: the same shutdown as the KillBess RPC (D-030).
     bess::startup::TerminationWatcher watcher([&server] { server->Shutdown(); });
     server->Wait();

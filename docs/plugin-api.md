@@ -199,6 +199,7 @@ struct BessPluginDescriptor {
   | `BESS_CAP_INSTANCES` | `init_context().instances()` |
   | `BESS_CAP_RESOURCES` | transactional resources (`init_context().resources()`) |
   | `BESS_CAP_METRICS` | operational metrics (`init_context().metrics()`) |
+  | `BESS_CAP_REQUESTS` | worker-to-control requests (`init_context().requests()`) |
 
   The `standalone_*` conformance plugins in `examples/standalone_plugin` use
   `BESS_PLUGIN`; `sample_plugin`'s `SequentialUpdate` uses
@@ -237,6 +238,7 @@ construction or `Init()`:
 | `ports().Find(name)` | look up an existing port by name |
 | `instances()` | borrow application-owned shared state (below) |
 | `metrics()` | register a source that reports this module's counters when the control plane asks (`stats::MetricRegistry`, `stats/metric_registry.h`, experimental); keep the returned `MetricSource` as a member declared after what it reads |
+| `requests()` | open a `RequestEndpoint` (`framework/module_requests.h`, experimental): workers post a small request (a table nearly full), the daemon's maintenance loop calls the module's handler under the control-plane lock; one pending request per endpoint, re-armed by `Done()` |
 
 Every type this surface names is installed. Binding a resource's wire codec
 (control-side protobuf metadata, D-044) is in-tree only, through

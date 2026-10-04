@@ -97,6 +97,7 @@ file is the reasoning.
 | D-074 | Public context accessors return only installed types: ResourceRegistry facade, bindings in-tree, SharedFlowTable installed (consolidation) | accepted |
 | D-075 | Release metadata, SBOM and the compatibility policy (M26) | accepted |
 | D-076 | Operational metrics: a pull registry, ListMetrics, built-in RCU and transaction sources (M25 phase 1) | accepted |
+| D-077 | Worker-to-control module requests: a one-slot endpoint per condition and the maintenance loop (TP4) | accepted |
 
 
 ---
@@ -6781,4 +6782,46 @@ changed, so no benchmark applies.
 
 **Revisit when:** a consumer needs histograms (the registry has counters and gauges only), push export, or
 per-worker breakdowns of a built-in source.
+## D-077 Worker-to-control module requests: a one-slot endpoint per condition and the maintenance loop (TP4)
+
+**Status:** accepted (2026-10-04), experimental API.
+**Code:** `core/framework/module_requests.{h,cc}` (new, installed experimental), `core/framework/module_requests_test.cc`,
+`core/control/maintenance_loop.{h,cc}` (new), `core/control/maintenance_loop_test.cc`, `core/bessctl.cc`,
+`core/runtime/{runtime_state.h,opts.h,opts.cc}` (`--maintenance_interval_us`), `core/framework/{module_init_context,
+plugin,plugin_check}.h` (`requests()`, `BESS_CAP_REQUESTS`), `docs/plugin-api.md`.
+
+**Context.** Table policy (D-073, user decisions 1 and 3) needs a worker to ask for work it must not do on the packet
+path: a table nearly full asks the control side to allocate a larger one (TP5/TP6), and later a final usage record
+is handed off (TP7). The user's design (table_policy.md 4.3): the worker only notices and asks; the control core does
+the work; the logic stays in module code. Before: no control-side thread ran anything periodically.
+
+**Decision.**
+- `framework::RequestEndpoint<Request>`: a module opens one per kind of condition in Init, on
+  `init_context().requests()`, with a handler. `Post(request)` from any worker sets the endpoint's pending flag and
+  stores the request; while pending, a post is one relaxed load and returns false. The handler runs once per
+  accepted post; `Done()` re-arms the endpoint when the condition has been dealt with (at once, or when an
+  incremental migration the handler started finishes). Requests are trivially copyable and at most 56 bytes.
+- A one-slot mailbox, not a ring: deduplication means at most one request per endpoint is ever in flight, so a
+  queue would hold nothing more. No DPDK ring, no capacity to choose, no loss accounting; a worker never blocks or
+  allocates. (The M25 design proposed sharing the event ring; events are many and must be counted when lost,
+  requests are deduplicated conditions, so they are separate.)
+- `control::MaintenanceLoop`: a thread `bessctl.cc` starts beside the gRPC server, waking every
+  `--maintenance_interval_us` (default 1000; 0 disables it), which delivers every ready request with the
+  control-plane lock held, as a module command runs. It stops before the shutdown reset, so no handler runs
+  during teardown. Endpoints are opened and destroyed under the same lock (Init, module destruction); a request
+  not yet delivered is discarded with its endpoint.
+- `BESS_CAP_REQUESTS`; the context's member is its last (plugins built earlier read the others at unchanged
+  offsets).
+
+**Evidence.** Fast build: unit 132/132, with `framework_module_requests_test` (one pending request per endpoint
+until Done, closing discards, a moved endpoint keeps one registration, a handler closing a later endpoint, four
+concurrent posters against one deliverer: every accepted post delivered exactly once and never torn; also in the
+TSan list) and `control_maintenance_loop_test` (delivery on the loop's thread, nothing after it stops, interval 0
+starts no thread). End to end: `examples/standalone_plugin/standalone_requests` posts from ProcessBatch and switches
+to gate 1 only in its handler; loaded into a staged bessd by `tools/check_standalone_plugins.py`, it moved 2.7M
+packets on gate 1. A pending post is one relaxed load; no packet-path code of any existing module changed, so no
+benchmark applies.
+
+**Revisit when:** a handler needs to run sooner than one interval (an eventfd wake-up), or a module needs ordered
+multiple requests of one kind (then a bounded ring with loss accounting).
 
