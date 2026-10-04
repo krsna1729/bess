@@ -36,11 +36,13 @@ T PadSize(T a, T b) {
 
 // Return the single hex digit representing `nibble`.  If it cannot be
 // represented, return the char 'X'.
-char NibbleToHD(char nibble) {
-  if (nibble >= 0 && nibble <= 9) {
-    return nibble + '0';
-  } else if (nibble >= 10 && nibble <= 15) {
-    return nibble - 10 + 'A';
+// Unsigned, so the range check means the same where plain char is unsigned
+// (aarch64) as where it is signed (x86).
+char NibbleToHD(unsigned char nibble) {
+  if (nibble <= 9) {
+    return static_cast<char>(nibble + '0');
+  } else if (nibble <= 15) {
+    return static_cast<char>(nibble - 10 + 'A');
   } else {
     return 'X';
   }
