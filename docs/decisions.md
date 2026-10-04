@@ -106,7 +106,7 @@ file is the reasoning.
 | D-083 | NAT usage counters: per-mapping packets and bytes, final and interim records through a bounded log (TP7) | accepted |
 | D-084 | Operational events: worker rings, a bounded log, WatchEvents with gaps and restarts, SDK streams (M25 phase 2) | accepted |
 | D-085 | Packet parse: the common frame validated on one path ("validate once, execute fast"; tunnel clawback) | accepted |
-| D-086 | Reference appliances as installed-tree plugins with a direct-path self test; R1 router, R2 NAT (M24) | accepted |
+| D-086 | Reference appliances as installed-tree plugins with a direct-path self test; R1 router, R2 NAT, R3 policy vSwitch (M24) | accepted |
 
 
 ---
@@ -7165,11 +7165,11 @@ checked decap went from 4.5x to 3.3x of it); `conntrack_bench BM_Parse` untagged
 clear difference at 1M (where lookups dominate).
 
 
-## D-086 Reference appliances as installed-tree plugins with a direct-path self test; R1 router, R2 NAT (M24)
+## D-086 Reference appliances as installed-tree plugins with a direct-path self test; R1 router, R2 NAT, R3 policy vSwitch (M24)
 
 **Status:** accepted (2026-10-05).
 **Code:** `examples/appliances/` (new: `meson.build`, `README.md`, `router/router_app.h`, `router/router_appliance.cc`,
-`nat/nat_app.h`, `nat/nat_appliance.cc`),
+`nat/nat_app.h`, `nat/nat_appliance.cc`, `vswitch/vswitch_app.h`, `vswitch/vswitch_appliance.cc`),
 `tools/check_standalone_plugins.py` (`--set appliances`, module commands), `tools/ci_profile.py` (the install check
 builds and runs them).
 
@@ -7197,11 +7197,19 @@ against (persona D, D-074 era): code that uses non-header-only batteries (the ro
   stranger's SYN to the mapped port is translated (endpoint-independent mapping) and then refused by the firewall; a
   packet to an unmapped port is not translated; after the idle timeout the mapping is gone and its port no longer
   leads inside.
+- R3 policy vSwitch (the neutrality test): the application's own Layer, Group, Rule and CompiledDecision (a 4-byte
+  value the cache holds as the decision id); two tenants, each a policy scope with its own RCU-published policy,
+  DecisionGeneration and decision cache; a miss compiles by walking the layers (a deny in any layer wins; marks and
+  redirects accumulate) and installs against the generation read first. Direct path: web allowed and marked DSCP 10
+  (the TOS rewritten with its checksum), SSH denied, 10.9/16 redirected; repeated flows hit without compiling; the
+  compiler switches tenant 0's ACL group to deny web -- published first, then one generation increment -- and tenant
+  0's web flow recompiles to deny with the cache's entry count unchanged (no walk) while tenant 1 still hits.
 
-**Evidence.** Against a staged install of develop: both plugins build from `bess-dev` and load into the staged bessd;
-on the graph path R1 moves 172.16.1.1 to gate 0 and R2 an inside host's UDP to gate 0 (3.4M packets each), and both
-`self_test`s pass. Mutants: VRF 2's route pointed at VRF 1's gateway fails R1 ("VRF 2 did not use its own route");
-the inbound firewall allowed to start connections fails R2 ("an outside-started connection was admitted"). Found on
+**Evidence.** Against a staged install of develop: the plugins build from `bess-dev` and load into the staged bessd;
+on the graph path R1 moves 172.16.1.1 to gate 0, R2 an inside host's UDP and R3 a tenant's DNS to gate 0, and every
+`self_test` passes. Mutants: VRF 2's route pointed at VRF 1's gateway fails R1 ("VRF 2 did not use its own route");
+the inbound firewall allowed to start connections fails R2 ("an outside-started connection was admitted"); a group
+switch without the generation increment fails R3 ("tenant 0 still allows web after its switch"). Found on
 the way: a NAT whose expiry wheel starts at clock 0 while packets carry the TSC clock refuses every mapping (the
 deadline is beyond the wheel's horizon): the module starts the wheels at the packet clock's now, as the in-tree NAT
 module does.

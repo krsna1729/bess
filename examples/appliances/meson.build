@@ -13,7 +13,7 @@ project('appliances', 'cpp',
 # `self_test` command drives it directly on frames.
 bess_dep = dependency('bess-dev', required: true)
 
-foreach appliance : ['router', 'nat']
+foreach appliance : ['router', 'nat', 'vswitch']
   shared_module(
     appliance + '_appliance',
     appliance / appliance + '_appliance.cc',

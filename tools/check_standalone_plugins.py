@@ -59,10 +59,13 @@ APPLIANCES = [
     # (An unprivileged source port: a privileged one maps only below 1024,
     # outside this appliance's pool.)
     ('NatAppliance', 'nat0', ipv4_udp_frame('8.8.8.8', sport=40000), 0),
+    # R3: DNS to 10.0.0.9 for tenant 0 is allowed by its ACL layer (gate 0).
+    ('VswitchAppliance', 'vswitch0', ipv4_udp_frame('10.0.0.9', sport=40000), 0),
 ]
 APPLIANCE_COMMANDS = [
     ('router0', 'self_test'),
     ('nat0', 'self_test'),
+    ('vswitch0', 'self_test'),
 ]
 
 INSTANCES = [

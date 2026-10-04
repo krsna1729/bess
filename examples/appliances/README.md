@@ -9,6 +9,7 @@ module graph through the module's `self_test` command.
 | appliance | application-owned | BESS batteries | proves |
 |---|---|---|---|
 | R1 `router/` | static policy, interface-to-gate mapping, flow hash, unresolved-neighbor policy | route domains, next hops and groups, neighbor table, checked parse, TTL | overlapping VRFs, ECMP that keeps a flow on one path, a neighbor change with no route written, direct and graph paths |
+| R3 `vswitch/` | Layer, Group, Rule, CompiledDecision; tenants as policy scopes; the layer semantics | decision cache and generation invalidation, RCU-published immutable policy, checked parse | BESS knows none of the policy model; a group switch atomic per tenant; invalidation O(1) by generation (no cache walk), other tenants keep their hits; no graph needed |
 | R2 `nat/` | pool policy, firewall-then-NAT order, the clock | checked parse, conntrack, NAT bindings (worker-owned, reverse alias), port pool, expiry | the reply through the reverse alias, an outside-started connection refused after translation, idle mappings ended on time, nothing NAT-specific in the runtime |
 
 Build and check against a staged install (as CI's install check does):
