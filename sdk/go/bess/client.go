@@ -327,13 +327,13 @@ func (c *Client) Capabilities(ctx context.Context) (*pb.GetCapabilitiesResponse,
 }
 
 // Supports reports whether the daemon serves rpc ("ApplyTransaction" or a
-// full name). A daemon that cannot answer GetCapabilities serves none of
-// the newer RPCs; a transport failure is returned as such.
+// full name). A daemon too old to answer GetCapabilities (UNIMPLEMENTED)
+// serves none of the newer RPCs; any other failure is returned.
 func (c *Client) Supports(ctx context.Context, rpc string) (bool, error) {
 	r, err := c.Capabilities(ctx)
 	if err != nil {
 		var invalid *InvalidRequestError
-		if errors.As(err, &invalid) {
+		if errors.As(err, &invalid) && invalid.Code == codes.Unimplemented {
 			return false, nil
 		}
 		return false, err

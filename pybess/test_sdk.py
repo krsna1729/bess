@@ -97,10 +97,16 @@ class SdkTest(unittest.TestCase):
             def GetCapabilities(self, request, timeout=None):
                 raise FakeRpcError(grpc.StatusCode.UNIMPLEMENTED, 'unknown method')
 
+        class Refusing(Stub):
+            def GetCapabilities(self, request, timeout=None):
+                raise FakeRpcError(grpc.StatusCode.PERMISSION_DENIED, 'no')
+
         capable = self.client(Capable())
         self.assertTrue(capable.supports('ApplyTransaction'))
         self.assertFalse(capable.supports('WatchEvents'))
         self.assertFalse(self.client(Old()).supports('ApplyTransaction'))
+        with self.assertRaises(sdk.InvalidRequest):
+            self.client(Refusing()).supports('ApplyTransaction')
 
     def test_a_discovery_call_that_sees_a_restart_retires_old_handles(self):
         class Restarting(Stub):

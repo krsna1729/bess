@@ -63,9 +63,10 @@ class Error(Exception):
 class InvalidRequest(Error):
     """Refused before anything was applied (bad resource, key or value)."""
 
-    def __init__(self, message, detail=None):
+    def __init__(self, message, detail=None, code=None):
         super().__init__(message)
         self.detail = detail  # control_v2.ErrorDetail, when the server sent one
+        self.code = code      # the call's grpc.StatusCode (None: refused by the client)
 
 
 class Conflict(Error):
@@ -225,11 +226,14 @@ class Client:
 
     def supports(self, rpc):
         """Whether the daemon serves `rpc` ('ApplyTransaction', or a full name).
-        A daemon too old to answer GetCapabilities serves none of the newer RPCs."""
+        A daemon too old to answer GetCapabilities (UNIMPLEMENTED) serves none
+        of the newer RPCs; any other refusal is raised."""
         try:
             rpcs = self.capabilities().rpcs
-        except InvalidRequest:
-            return False
+        except InvalidRequest as e:
+            if e.code == grpc.StatusCode.UNIMPLEMENTED:
+                return False
+            raise
         return any(r == rpc or r.endswith('/' + rpc) for r in rpcs)
 
     def metrics(self):
@@ -379,8 +383,9 @@ def _translate(error):
             detail.ParseFromString(value)
     message = detail.message if detail is not None and detail.message else error.details()
     if detail is not None and detail.code == v2.ErrorDetail.CONFLICT:
-        return InvalidRequest('request id reused with different contents: ' + message, detail)
-    return InvalidRequest(message, detail)
+        return InvalidRequest('request id reused with different contents: ' + message, detail,
+                              error.code())
+    return InvalidRequest(message, detail, error.code())
 
 
 class Transaction:

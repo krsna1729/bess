@@ -51,6 +51,7 @@ type fake struct {
 	listed    int
 	rejectOps bool
 	oldDaemon bool // answers GetCapabilities with UNIMPLEMENTED
+	refuse    bool // answers GetCapabilities with PERMISSION_DENIED
 }
 
 func (f *fake) apply(_ context.Context, in *pb.ApplyTransactionRequest) (*pb.ApplyTransactionResponse, metadata.MD, error) {
@@ -91,6 +92,9 @@ func (f *fake) list(context.Context) (*pb.ListTransactionResourcesResponse, meta
 func (f *fake) capabilities(context.Context) (*pb.GetCapabilitiesResponse, metadata.MD, error) {
 	if f.oldDaemon {
 		return nil, nil, status.Error(codes.Unimplemented, "unknown method GetCapabilities")
+	}
+	if f.refuse {
+		return nil, nil, status.Error(codes.PermissionDenied, "no")
 	}
 	return &pb.GetCapabilitiesResponse{Rpcs: []string{"bess.pb.v2.Control/ApplyTransaction"},
 		DaemonEpoch: f.epochOr1()}, nil, nil
@@ -406,5 +410,8 @@ func TestSupportsReadsTheDaemonsRPCsAndAnOldDaemonSupportsNothingNew(t *testing.
 	}
 	if ok, err := newHarness(&fake{oldDaemon: true}, 1).c.Supports(ctx, "ApplyTransaction"); err != nil || ok {
 		t.Fatalf("old daemon: %v %v", ok, err)
+	}
+	if _, err := newHarness(&fake{refuse: true}, 1).c.Supports(ctx, "ApplyTransaction"); err == nil {
+		t.Fatal("a refusal other than UNIMPLEMENTED was reported as unsupported")
 	}
 }
