@@ -102,6 +102,14 @@ DEFINE_int32(m, -1,
              "any are usable, mapped as needed with no cap beyond the host or "
              "container limit, else normal pages; 0: no hugepages; N: "
              "hugepages, at most N MB per socket");
+// Tracing is DPDK's (M25, D-089): its trace points (EAL, ethdev, mempool,
+// ...) written as CTF for babeltrace or Trace Compass, not a BESS tracer.
+DEFINE_string(dpdk_trace, "",
+              "Enable DPDK trace points matching this regular expression "
+              "(EAL --trace), e.g. 'lib.ethdev.*'. Empty: tracing off");
+DEFINE_string(dpdk_trace_dir, "",
+              "Where DPDK writes the trace (EAL --trace-dir; default: "
+              "$HOME/dpdk-traces)");
 DEFINE_string(pci_allow, "",
               "Comma-separated PCI addresses DPDK may probe (its -a list). "
               "Empty: the addresses a device plugin assigned "

@@ -109,6 +109,7 @@ file is the reasoning.
 | D-086 | Reference appliances as installed-tree plugins with a direct-path self test; R1-R5 (M24) | accepted |
 | D-087 | Release artifacts: a tarball, bess and bess-dev .deb packages with derived dependencies, and a runtime image (M26) | accepted |
 | D-088 | SDK desired state (PipelineBuilder, plan/apply), black-box recovery tests, a controller on the SDK (M27) | accepted |
+| D-089 | Bounded-backpressure observability: pressure transitions, throttled packet-path events, DPDK tracing (M25 phase 3) | accepted |
 
 
 ---
@@ -7311,4 +7312,51 @@ rates 0, 1000 and max (4073 tx/s), so the SDK-applied pipeline and rules steer p
 (3 new tests, the same cases) and the live `control_sdk_go` (a pipeline planned, applied, refused at a stale
 generation, and removed) pass. Capability discovery gains each port's `symmetric_rss` and `rss_signature`
 (`PortInfo` 11, 12; the harness's single-queue unix-socket port reports symmetric).
+
+
+## D-089 Bounded-backpressure observability: pressure transitions, throttled packet-path events, DPDK tracing (M25 phase 3)
+
+**Status:** accepted (2026-10-05).
+**Code:** `core/control/pressure_monitor.{h,cc}` (new), `core/control/pressure_monitor_test.cc` (new),
+`core/control/maintenance_loop.{h,cc}` (samples it about once a second), `core/stats/event_throttle.h` (new, installed),
+`core/stats/event_hub.{h,cc}` (`NamedSource`), `core/stats/event_hub_test.cc`, `core/modules/{nat,conntrack,queue}.{h,cc}`
+(throttled events), `core/runtime/{opts.h,opts.cc,dpdk.cc}`, `core/dpdk.h`, `core/main.cc` (`--dpdk_trace`,
+`--dpdk_trace_dir`, `SaveDpdkTrace`), `bessctl/module_tests/events.py`, `docs/plugin-api.md`.
+
+**Context.** Roadmap M25's exit criteria: packet-path counters stay worker-local and cheap; the exporter can be
+disabled without changing hot layout; operationally important bounded-backpressure conditions are observable. Its
+event candidates include RCU/backlog pressure, flow-table capacity pressure, a full punt queue, and port state. Phase
+2 (D-084) gave the event log and worker rings but no source used them besides transactions. M25 also says to evaluate
+DPDK's tracing before building tracing machinery.
+
+**Decision.**
+- Control-visible conditions, sampled by the maintenance loop about once a second (`PressureMonitor`; the port list
+  under the control-plane lock, port counters read as `GetPortStats` reads them), emitted as transitions only:
+  `bess.rcu_backlog` (high at half the retire high-water mark, past which retiring waits; cleared below an eighth),
+  `bess.port_drops` per port and direction (`dropping` when a sample sees drops after one that saw none, `cleared`
+  with the episode's total; a counter that went down is a new baseline), `bess.port_link` (up/down with the speed; a
+  port's first sample is its baseline, a removed port starts over).
+- Packet-path conditions are posted by the module that meets them, on the failure path only, through
+  `stats::EventThrottle`: at most one event per second per worker, carrying the count since the last one (a post the
+  ring refuses keeps its count), under the module's name (`EventHub::NamedSource`). In tree: `bess.table_full` (NAT
+  bindings refused by a full table or wheel, ConnTrack connections refused by a full table), `bess.nat_ports_exhausted`,
+  `bess.queue_full` (Queue's ring). A batch that meets no failure runs no event code (NAT and ConnTrack count failures
+  in their existing per-packet verdict loop and test the count once per batch; Queue inside its existing drop branch).
+- Tracing is DPDK's: `--dpdk_trace REGEX` passes EAL `--trace` (and `--dpdk_trace_dir` `--trace-dir`), and bessd saves
+  the trace at shutdown (`rte_trace_save`; it does not call `rte_eal_cleanup`). CTF, read with babeltrace or Trace
+  Compass. BESS adds no tracer of its own.
+- Not done: histograms (no consumer, D-076); per-port metrics in `ListMetrics` (the registry is read without the
+  control-plane lock, and the port list needs it); neighbor and offload events (their state lives in applications'
+  code -- the router's neighbors change through transactions, which are already events; flow-rule owners are the
+  application's to report).
+
+**Evidence.** `stats_event_hub_test` (5): the throttle's first occurrence posts at once, the rest of the interval is
+carried by the next event per worker (3, then 2+4+1), under the poster's name; a refused post keeps its count (the
+refused 10 + 1). `control_pressure_monitor_test` (3): RCU high at 500 of 1000 and cleared at 124 (not at 125-499);
+drop episodes per direction from a baseline (tx 3 then cleared with 23; rx in the same sample), a counter reset not an
+episode; link up and down, a down baseline not an event, a removed port's return a new baseline. Live (`events.py`):
+a ConnTrack of capacity 4 fed 64 new UDP flows yields a `bess.table_full` from the module's own name with a count and
+worker. Tracing smoke: `bessd -m 0 --dpdk_trace 'lib.*' --dpdk_trace_dir /tmp/bess-trace`, stopped by KillBess,
+leaves a CTF trace (`metadata`, `channel0_*`) and logs "DPDK trace saved". No performance claim: the library hot loops
+are unchanged and no module-level benchmark covers these modules.
 

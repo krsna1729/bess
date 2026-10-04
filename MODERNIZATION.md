@@ -5083,6 +5083,18 @@ rather than one call site).
      the packet-parse fast path that closed most of the tunnel clawback (D-085); and a GCC dangling-reference fix in
      GetCapabilities that CI's compiler flagged and the local one did not (push 18). Cleanup 2: 139/139 local with
      every live test; the NAT binding shrink (D-068) and the checksum residual (D-071) measured and rejected.
+165. **Batch 3 and cleanup 3 (2026-10-05).** Pushes 22-30: the M24 reference appliances as installed-tree plugins
+     with self tests checked in CI's install step -- R1 router, R2 NAT gateway, R3 policy vSwitch and R5 its
+     hierarchical mode, R4 in-tree because application resources reach the wire only through internal codecs
+     (D-086); the reviewer's six findings fixed (cold-count ageing, generation revocation of promoted rules, total
+     length into the parse, R1's self test on a private app, R4 routed through the FIB, retirements drained). M26
+     release artifacts: tarball script, `bess`/`bess-dev` .deb with derived dependencies, runtime image (D-087). M27:
+     SDK desired state in Python and Go, live black-box tests for lost answers, lost requests and restarts, and
+     `live_transaction_bench` migrated onto the SDK as its first controller (D-088); ports report receive steering.
+     Every push in the batch cancelled the previous run (develop's concurrency), so no full CI run completed between
+     `e78481f8` and `98687b61`; the cheap lanes (protobuf, Go SDK, lanes, TSan) passed on each. Cleanup 3: the tip
+     at 140/140 locally with the events, SDK, metrics, NAT and ConnTrack live tests; three worktrees and 31 merged
+     local branches removed; pushes held until one full run completes.
 
 ## Review process established this session
 

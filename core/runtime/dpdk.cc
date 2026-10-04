@@ -15,6 +15,7 @@
 #include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
+#include <rte_trace.h>
 
 #include <cassert>
 #include <cstdio>
@@ -209,6 +210,13 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
   FILE *org_stdout = stdout;
   stdout = fopencookie(nullptr, "w", dpdk_log_init_funcs);
 
+  if (!FLAGS_dpdk_trace.empty()) {
+    rte_args.Append({"--trace", FLAGS_dpdk_trace});
+    if (!FLAGS_dpdk_trace_dir.empty()) {
+      rte_args.Append({"--trace-dir", FLAGS_dpdk_trace_dir});
+    }
+  }
+
   disable_syslog();
   LOG(INFO) << "Initializing DPDK EAL with options: " << rte_args.Dump();
   int ret = rte_eal_init(rte_args.Argc(), rte_args.Argv());
@@ -265,6 +273,17 @@ std::string GetNonWorkerCoreList() {
 bool is_initialized = false;
 
 }  // namespace
+
+void SaveDpdkTrace() {
+  if (!IsDpdkInitialized() || !rte_trace_is_enabled()) {
+    return;
+  }
+  if (int ret = rte_trace_save(); ret != 0) {
+    LOG(ERROR) << "rte_trace_save() failed: " << ret;
+  } else {
+    LOG(INFO) << "DPDK trace saved";
+  }
+}
 
 bool IsDpdkInitialized() {
   return is_initialized;

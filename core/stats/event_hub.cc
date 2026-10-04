@@ -53,6 +53,17 @@ uint32_t EventHub::RegisterType(const std::string &name,
   return static_cast<uint32_t>(types_.size() - 1);
 }
 
+uint32_t EventHub::NamedSource(const std::string &name) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  for (size_t i = 0; i < source_names_.size(); i++) {
+    if (source_names_[i] == name) {
+      return kNamedSource | static_cast<uint32_t>(i);
+    }
+  }
+  source_names_.push_back(name);
+  return kNamedSource | static_cast<uint32_t>(source_names_.size() - 1);
+}
+
 bool EventHub::Post(int wid, const WorkerEvent &event) noexcept {
   if (wid < 0 || wid >= kMaxWorkers) {
     return false;
@@ -113,7 +124,10 @@ size_t EventHub::DrainWorkers() {
         if (w.type < types_.size()) {
           const Type &t = types_[w.type];
           e.type = t.name;
-          e.source = t.source_prefix + std::to_string(w.source);
+          const uint32_t named = w.source & ~kNamedSource;
+          e.source = (w.source & kNamedSource) != 0 && named < source_names_.size()
+                         ? source_names_[named]
+                         : t.source_prefix + std::to_string(w.source);
           for (size_t i = 0; i < t.value_names.size(); i++) {
             e.fields[t.value_names[i]] = std::to_string(w.values[i]);
           }

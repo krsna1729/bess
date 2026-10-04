@@ -45,6 +45,9 @@ const Commands NAT::cmds = {
      Command::THREAD_SAFE}};
 
 CommandResponse NAT::Init(const bess::pb::NATArg &arg) {
+  table_full_ = bess::stats::EventThrottle(init_context().events(), "bess.table_full", name());
+  ports_exhausted_ =
+      bess::stats::EventThrottle(init_context().events(), "bess.nat_ports_exhausted", name());
   // Check before committing any changes.
   for (const auto &address_range : arg.ext_addrs()) {
     for (const auto &range : address_range.port_ranges()) {
@@ -313,12 +316,23 @@ void NAT::Translate(N &nat, Context *ctx, bess::PacketBatch *batch) {
   }
   nat.TranslateBatch(std::span(frames, cnt), std::span(parsed, cnt), std::span(ok, cnt), dir,
                      now, std::span(verdicts, cnt));
+  uint64_t full = 0, exhausted = 0;
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
     if (verdicts[i] == nat::Verdict::kTranslated) {
       EmitPacket(ctx, pkt, ogate);
     } else {
+      full += verdicts[i] == nat::Verdict::kFull;
+      exhausted += verdicts[i] == nat::Verdict::kExhausted;
       DropPacket(ctx, pkt);
+    }
+  }
+  if ((full | exhausted) != 0) [[unlikely]] {
+    if (full != 0) {
+      table_full_.Note(ctx->wid, now, full);
+    }
+    if (exhausted != 0) {
+      ports_exhausted_.Note(ctx->wid, now, exhausted);
     }
   }
 }

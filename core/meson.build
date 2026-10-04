@@ -66,6 +66,7 @@ control_sources = files(
   'control/control_error.cc',
   'control/control_plane.cc',
   'control/maintenance_loop.cc',
+  'control/pressure_monitor.cc',
   'control/dataplane_transactions.cc',
   'control/pipeline_diff.cc',
   'control/pipeline_plan.cc',
@@ -591,6 +592,7 @@ core_public_subdir_headers = {
   'stats': files(
     'stats/counter_set.h',
     'stats/event_hub.h',
+    'stats/event_throttle.h',
     'stats/metric_registry.h',
     'stats/worker_histogram.h',
     'stats/worker_local.h',
@@ -679,6 +681,7 @@ unit_test_sources = [
   'control/apply_pipeline_test.cc',
   'control/control_plane_test.cc',
   'control/maintenance_loop_test.cc',
+  'control/pressure_monitor_test.cc',
   'bessd_test.cc',
   'gate_test.cc',
   'runtime/memory_test.cc',

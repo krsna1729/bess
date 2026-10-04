@@ -13,6 +13,7 @@
 #include "module.h"
 #include "nat/nat.h"
 #include "pb/module_msg.pb.h"
+#include "stats/event_throttle.h"
 
 // NAT module (endpoint-independent NAPT, RFC 4787), a thin adapter over the
 // nat library (M18, D-068). 2 igates and 2 ogates:
@@ -77,6 +78,10 @@ class NAT final : public Module {
   void (*delete_table_)(void *) = nullptr;
   bess::framework::RequestEndpoint<GrowRequest> grow_;
   bess::framework::RequestEndpoint<GrowRequest> free_;
+  // Bindings refused (M25, D-089): the table (or its wheel) full, or no free
+  // external port.
+  bess::stats::EventThrottle table_full_;
+  bess::stats::EventThrottle ports_exhausted_;
 };
 
 #endif  // BESS_MODULES_NAT_H_

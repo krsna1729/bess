@@ -20,6 +20,8 @@ DECLARE_string(grpc_url);
 DECLARE_int32(m);
 DECLARE_int32(maintenance_interval_us);
 DECLARE_string(pci_allow);
+DECLARE_string(dpdk_trace);
+DECLARE_string(dpdk_trace_dir);
 DECLARE_bool(skip_root_check);
 DECLARE_string(modules);
 DECLARE_bool(core_dump);

@@ -15,6 +15,7 @@
 #include "bessd.h"
 #include "framework/plugin_loader.h"
 #include "debug.h"
+#include "dpdk.h"
 #include "runtime/opts.h"
 #include "packet_pool.h"
 #include "runtime/startup.h"
@@ -139,6 +140,7 @@ int main(int argc, char *argv[]) {
   // runtime (and its RcuDomain) under them. Detaching them instead left live
   // readers behind and aborted on the domain's registered-reader check.
   destroy_all_workers();
+  bess::SaveDpdkTrace();
 
   LOG(INFO) << "BESS daemon has been gracefully shut down";
 

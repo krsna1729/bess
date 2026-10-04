@@ -27,6 +27,7 @@ std::unique_ptr<ConnTrack::Ct> ConnTrack::MakeTable() const {
 }
 
 CommandResponse ConnTrack::Init(const bess::pb::ConnTrackArg &arg) {
+  table_full_ = bess::stats::EventThrottle(init_context().events(), "bess.table_full", name());
   mode_ = arg.mode();
   capacity_ = arg.capacity() != 0 ? arg.capacity() : 65536;
   ct::TimeoutPolicy policy;
@@ -121,11 +122,16 @@ void ConnTrack::Track(T &table, Context *ctx, bess::PacketBatch *batch) {
   }
   table.TrackBatch(std::span(frames, cnt), std::span(parsed, cnt), now, std::span(results, cnt), 0,
                    may_create);
+  uint64_t full = 0;
   for (int i = 0; i < cnt; i++) {
     const ct::TrackStatus s = results[i].status;
     const bool pass = s == ct::TrackStatus::kNew || s == ct::TrackStatus::kExisting ||
                       s == ct::TrackStatus::kRelated;
+    full += s == ct::TrackStatus::kFull;
     EmitPacket(ctx, batch->packet(i), pass ? 0 : 1);
+  }
+  if (full != 0) [[unlikely]] {
+    table_full_.Note(ctx->wid, now, full);
   }
 }
 

@@ -75,6 +75,12 @@ class EventHub {
   uint32_t RegisterType(const std::string &name, const std::vector<std::string> &value_names,
                         const std::string &source_prefix = "");
 
+  // Control side: a source id that the log shows as `name` (a module
+  // instance's name, say) instead of the type's prefix and a number.
+  // Idempotent per name.
+  static constexpr uint32_t kNamedSource = UINT32_C(1) << 31;
+  uint32_t NamedSource(const std::string &name);
+
   // Worker `wid`: false when its ring is full (counted).
   bool Post(int wid, const WorkerEvent &event) noexcept;
 
@@ -118,6 +124,7 @@ class EventHub {
   std::deque<Event> log_;
   uint64_t next_sequence_ = 1;
   bool closed_ = false;
+  std::vector<std::string> source_names_;  // NamedSource ids, without kNamedSource
 };
 
 }  // namespace bess::stats

@@ -77,6 +77,8 @@ CommandResponse Queue::Init(const bess::pb::QueueArg &arg) {
   task_id_t tid;
   CommandResponse err;
 
+  full_ = bess::stats::EventThrottle(init_context().events(), "bess.queue_full", name());
+
   tid = RegisterTask(nullptr);
   if (tid == INVALID_TASK_ID) {
     return CommandFailure(ENOMEM, "Task creation failed");
@@ -167,7 +169,7 @@ std::string Queue::GetDesc() const {
 }
 
 /* from upstream */
-void Queue::ProcessBatch(Context *, bess::PacketBatch *batch) {
+void Queue::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int queued = static_cast<int>(enqueue_fn_(
       queue_, reinterpret_cast<void **>(batch->handles()), batch->cnt(),
       nullptr));
@@ -181,6 +183,7 @@ void Queue::ProcessBatch(Context *, bess::PacketBatch *batch) {
     int to_drop = batch->cnt() - queued;
     stats_.dropped.fetch_add(to_drop, std::memory_order_relaxed);
     bess::PacketFreeBulk(batch->handles() + queued, to_drop);
+    full_.Note(ctx->wid, ctx->current_ns, static_cast<uint64_t>(to_drop));
   }
 }
 

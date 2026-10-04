@@ -12,6 +12,7 @@
 #include "conntrack/shared_conntrack.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
+#include "stats/event_throttle.h"
 #include "worker.h"
 
 // Connection tracking (TP8, D-080): the conntrack library (M17) as a module,
@@ -63,6 +64,8 @@ class ConnTrack final : public Module {
   // PER_WORKER: why the inputs are not symmetric (fail closed, or shared_
   // with fallback_shared), or nullopt.
   std::optional<std::string> refused_;
+  // Connections refused because the table was full (M25, D-089).
+  bess::stats::EventThrottle table_full_;
 };
 
 #endif  // BESS_MODULES_CONNTRACK_H_

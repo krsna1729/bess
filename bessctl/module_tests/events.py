@@ -20,6 +20,24 @@ def rule_key(sip, dip):
 
 class BessEventsTest(BessModuleTestCase):
 
+    def test_a_full_table_is_an_event_not_one_per_packet(self):
+        # M25 phase 3 (D-089): a ConnTrack whose table is full refuses new
+        # connections; the module posts one bess.table_full per second per
+        # worker with the count, under its own name.
+        ct = ConnTrack(capacity=4)
+        client = sdk.Client(self.bess.peer)
+        start = client.metrics()[('bess_events_next_sequence', ())]
+        pkts = [get_udp_packet(sip='10.0.0.%d' % i, dip='10.1.0.1') for i in range(1, 65)]
+        self.run_module(ct, 0, pkts, [0, 1])
+        seen = []
+        for event in client.watch_events(from_sequence=int(start), reconnect=False):
+            if event.type == 'bess.table_full':
+                seen.append(event)
+                break
+        self.assertEqual(seen[0].source, ct.name)
+        self.assertGreater(int(seen[0].fields['count']), 0)
+        self.assertIn('worker', seen[0].fields)
+
     def test_transactions_are_events(self):
         em = ExactMatch(fields=[{'offset': 26, 'num_bytes': 4},
                                 {'offset': 30, 'num_bytes': 4}])

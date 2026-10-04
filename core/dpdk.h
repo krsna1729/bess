@@ -13,6 +13,10 @@ bool IsDpdkInitialized();
 // Safe to call multiple times.
 void InitDpdk(int dpdk_mb_per_socket = 0);
 
+// Writes DPDK's trace (--dpdk_trace) to its directory; nothing when tracing
+// is off. At shutdown: bessd does not call rte_eal_cleanup(), which would.
+void SaveDpdkTrace();
+
 }  // namespace bess
 
 #endif  // BESS_DPDK_H_

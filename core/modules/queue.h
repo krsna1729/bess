@@ -11,6 +11,7 @@
 
 #include "module.h"
 #include "pb/module_msg.pb.h"
+#include "stats/event_throttle.h"
 
 class Queue : public Module {
  public:
@@ -98,6 +99,8 @@ class Queue : public Module {
   } stats_;
 
   bess::pb::QueueArg init_arg_;
+  // Packets dropped because the ring was full (M25, D-089).
+  bess::stats::EventThrottle full_;
 };
 
 #endif  // BESS_MODULES_QUEUE_H_

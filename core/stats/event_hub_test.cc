@@ -4,10 +4,14 @@
 // that fall behind, and readers woken at close.
 
 #include "stats/event_hub.h"
+#include "stats/event_throttle.h"
 
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <set>
+#include <string>
+#include <utility>
 #include <thread>
 
 namespace bess::stats {
@@ -47,6 +51,38 @@ TEST(EventHubTest, WorkerEventsBecomeTypedEventsInOrderAndLossIsCounted) {
   EXPECT_EQ("2", got.events[4].fields.at("count"));
   EXPECT_EQ("99", got.events[5].fields.at("size"));
   EXPECT_EQ(7u, got.next);
+}
+
+// A recurring packet-path condition (D-089): the first occurrence is an event
+// at once, the rest of the interval is counted into the next one, per worker,
+// under the poster's own name; a post the ring refuses keeps its count.
+TEST(EventThrottleTest, OneEventPerIntervalPerWorkerCarryingTheCount) {
+  EventHub hub(1024, 2);
+  EventThrottle full(hub, "bess.table_full", "nat0", 1000);
+  full.Note(0, 10, 3);    // posted: 3
+  full.Note(0, 500, 2);   // counted
+  full.Note(1, 600, 1);   // another worker: posted: 1
+  full.Note(0, 1009, 4);  // inside the interval still: counted
+  full.Note(0, 1010, 1);  // posted: 2 + 4 + 1
+  full.Note(0, 1011, 5);  // counted
+  ASSERT_EQ(3u, hub.DrainWorkers());
+  const auto got = hub.Read(1, 100, milliseconds(0));
+  ASSERT_EQ(3u, got.events.size());
+  EXPECT_EQ("bess.table_full", got.events[0].type);
+  EXPECT_EQ("nat0", got.events[0].source);
+  std::multiset<std::pair<std::string, std::string>> seen;
+  for (const Event &e : got.events) seen.insert({e.fields.at("worker"), e.fields.at("count")});
+  EXPECT_EQ((std::multiset<std::pair<std::string, std::string>>{{"0", "3"}, {"0", "7"}, {"1", "1"}}),
+            seen);
+  // Worker 2's ring (2 slots) full: the refused post keeps its count.
+  EventThrottle other(hub, "bess.queue_full", "q0", 0);
+  for (uint64_t now = 1; now <= 3; now++) other.Note(2, now, 10);
+  ASSERT_EQ(2u, hub.DrainWorkers());
+  other.Note(2, 4, 1);
+  ASSERT_EQ(1u, hub.DrainWorkers());
+  const auto later = hub.Read(4, 100, milliseconds(0));
+  ASSERT_FALSE(later.events.empty());
+  EXPECT_EQ("11", later.events.back().fields.at("count")) << "the refused 10 + 1";
 }
 
 TEST(EventHubTest, AReaderBehindTheLogGetsAGapThenWhatIsHeld) {
