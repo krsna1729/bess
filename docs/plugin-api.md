@@ -53,6 +53,11 @@ the second looks it up, and each runs the whole decision in one step. `examples/
 primitives alone (`StrongId`, `GenerationHandle`, `ExpiryWheel`): leases that
 expire unless renewed, with handles that go stale when a slot is reused. CI
 builds it from the staged install and runs its test without `bessd`.
+`examples/sdk_samples` holds the smallest meaningful program per library --
+router, meters, conntrack and NAT, the FDB, handoff and tunnel decapsulation --
+each with typed use, an update, error handling as values, and the ownership
+rule in its header comment; CI compiles them from the staged install with
+warnings as errors.
 
 - `framework/plugin.h` defines the versioned `bess_plugin_descriptor_v1` C
   ABI (below). `ADD_MODULE` remains the module registration mechanism.

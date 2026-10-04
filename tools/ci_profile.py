@@ -433,6 +433,11 @@ def step_verify_install(s):
     shutil.rmtree(battery, ignore_errors=True)
     s.run(['meson', 'setup', battery, 'examples/sdk_battery'], env=env)
     s.run(['meson', 'test', '-C', battery, '--print-errorlogs'], env=env)
+    # API samples, one per public library, compiled from the install (M23).
+    samples = ROOT / 'build' / f'samples-{s.name}'
+    shutil.rmtree(samples, ignore_errors=True)
+    s.run(['meson', 'setup', samples, 'examples/sdk_samples'], env=env)
+    s.run(['meson', 'compile', '-C', samples], env=env)
 
 
 def tree_state():
