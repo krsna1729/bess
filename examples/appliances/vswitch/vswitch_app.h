@@ -16,12 +16,20 @@
 // Policy is per tenant (a scope): each tenant has its own published policy and
 // its own DecisionGeneration, so switching one tenant's group invalidates that
 // tenant's cached decisions in O(1) and leaves every other tenant's hits alone.
+//
+// R5, Hoverboard-style hierarchical mode (EnableHierarchy): a cold flow takes
+// the default path -- evaluated per packet, nothing cached -- while the
+// application counts it; when the application's own hotness rule says so, the
+// decision is installed in the cache (the fast path) and handed to the
+// application's promotion hook (a hardware flow, for example). BESS defines
+// neither the rule nor the promotion.
 
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -29,6 +37,7 @@
 
 #include "conntrack/packet_parse.h"
 #include "flow/decision_cache.h"
+#include "flow/worker_flow_table.h"
 #include "rcu/rcu_domain.h"
 #include "rcu/rcu_ptr.h"
 #include "utils/checksum.h"
@@ -97,6 +106,21 @@ class VswitchApp {
     }
   }
 
+  using Promote = std::function<void(const VswitchKey &, CompiledDecision)>;
+
+  // R5: flows start cold; a flow's decision is cached once it has sent
+  // `hot_after` packets (the application's rule), and `promote` sees it then.
+  bool EnableHierarchy(uint32_t hot_after, Promote promote) {
+    auto cold = ColdTable::Create(4096);
+    if (!cold) {
+      return false;
+    }
+    cold_ = std::move(*cold);
+    hot_after_ = hot_after;
+    promote_ = std::move(promote);
+    return true;
+  }
+
   // The direct path: parse, look up, compile on a miss, execute. Returns the
   // decision (allow false: drop). A DSCP mark rewrites the IPv4 TOS in place.
   CompiledDecision Process(size_t tenant, std::span<uint8_t> frame) noexcept {
@@ -124,7 +148,12 @@ class VswitchApp {
       const uint64_t g = generations_[tenant].Current();
       d = Compile(*policies_[tenant]->Read(), key);
       compiles_[tenant]++;
-      (void)caches_[tenant]->Install(key, d, g);
+      if (cold_ == nullptr || Hot(key)) {
+        if (caches_[tenant]->Install(key, d, g) != bess::flow::DecisionInstall::kStaleGeneration &&
+            promote_) {
+          promote_(key, d);
+        }
+      }
     }
     if (d.allow && d.dscp != 0xff) {
       uint8_t *ip = frame.data() + p.l3_offset;
@@ -158,12 +187,28 @@ class VswitchApp {
   }
 
   uint64_t hits(size_t t) const noexcept { return hits_[t]; }
+  size_t cold_flows() const noexcept { return cold_ != nullptr ? cold_->size() : 0; }
   uint64_t compiles(size_t t) const noexcept { return compiles_[t]; }
   size_t cached(size_t t) const noexcept { return caches_[t]->size(); }
   uint64_t generation(size_t t) const noexcept { return generations_[t].Current(); }
 
  private:
   using Cache = bess::flow::DecisionCache<VswitchKey, CompiledDecision>;
+  using ColdTable = bess::flow::WorkerFlowTable<VswitchKey, uint32_t>;
+
+  // The application's hotness rule: a flow is hot at its `hot_after`th
+  // packet; until then its packets are counted (a full table: stays cold).
+  bool Hot(const VswitchKey &key) noexcept {
+    auto made = cold_->Emplace(key, 0u);
+    if (made.state == nullptr) {
+      return false;
+    }
+    if (++*made.state < hot_after_) {
+      return false;
+    }
+    (void)cold_->Erase(key);
+    return true;
+  }
 
   explicit VswitchApp(bess::rcu::RcuDomain &rcu) {
     for (auto &p : policies_) {
@@ -231,6 +276,9 @@ class VswitchApp {
   std::array<bess::flow::DecisionGeneration, kTenants> generations_;
   std::array<std::unique_ptr<Cache>, kTenants> caches_;
   std::array<uint64_t, kTenants> hits_{}, compiles_{};
+  std::unique_ptr<ColdTable> cold_;
+  uint32_t hot_after_ = 0;
+  Promote promote_;
 };
 
 }  // namespace appliance

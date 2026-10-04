@@ -106,7 +106,7 @@ file is the reasoning.
 | D-083 | NAT usage counters: per-mapping packets and bytes, final and interim records through a bounded log (TP7) | accepted |
 | D-084 | Operational events: worker rings, a bounded log, WatchEvents with gaps and restarts, SDK streams (M25 phase 2) | accepted |
 | D-085 | Packet parse: the common frame validated on one path ("validate once, execute fast"; tunnel clawback) | accepted |
-| D-086 | Reference appliances as installed-tree plugins with a direct-path self test; R1 router, R2 NAT, R3 policy vSwitch (M24) | accepted |
+| D-086 | Reference appliances as installed-tree plugins with a direct-path self test; R1-R5 (M24) | accepted |
 
 
 ---
@@ -7165,11 +7165,12 @@ checked decap went from 4.5x to 3.3x of it); `conntrack_bench BM_Parse` untagged
 clear difference at 1M (where lookups dominate).
 
 
-## D-086 Reference appliances as installed-tree plugins with a direct-path self test; R1 router, R2 NAT, R3 policy vSwitch (M24)
+## D-086 Reference appliances as installed-tree plugins with a direct-path self test; R1-R5 (M24)
 
 **Status:** accepted (2026-10-05).
 **Code:** `examples/appliances/` (new: `meson.build`, `README.md`, `router/router_app.h`, `router/router_appliance.cc`,
 `nat/nat_app.h`, `nat/nat_appliance.cc`, `vswitch/vswitch_app.h`, `vswitch/vswitch_appliance.cc`),
+`core/dataplane/session_reference_test.cc` (R4, in-tree),
 `tools/check_standalone_plugins.py` (`--set appliances`, module commands), `tools/ci_profile.py` (the install check
 builds and runs them).
 
@@ -7204,12 +7205,27 @@ against (persona D, D-074 era): code that uses non-header-only batteries (the ro
   (the TOS rewritten with its checksum), SSH denied, 10.9/16 redirected; repeated flows hit without compiling; the
   compiler switches tenant 0's ACL group to deny web -- published first, then one generation increment -- and tenant
   0's web flow recompiles to deny with the cache's entry count unchanged (no walk) while tenant 1 still hits.
+- R5 (a mode of R3, `EnableHierarchy`): a cold flow is evaluated per packet and counted in a worker-owned flow table,
+  nothing cached; the application's rule (hot at the third packet) installs its decision in the cache and calls the
+  application's promotion hook, which installs a hardware rule through the flow-rule owner (a fake device in the self
+  test). BESS defines neither the hotness rule nor the promotion.
+- R4 session datapath, in-tree: the application's Session, PdrLikeRule, SessionAction and QosPolicy (none a BESS
+  action type), its three resources (QoS, actions referencing the QoS and the router's next hops, rules referencing
+  the actions) registered with BESS's router in one engine. One transaction installs a session across both owners --
+  the router's next hop and route, the application's QoS policy, action and rule -- and the fused path classifies the
+  UE's downlink, meters it, resolves the router's next hop and writes the session's GTP-U header. A transaction whose
+  action names a next hop nobody installs is refused whole; the router's next hop cannot be removed while the
+  application's action names it, and goes in one transaction with the session (referrers first). In-tree because an
+  application resource reaches the wire through a codec, and codecs are internal (D-074): a public codec facade is
+  the step that would move R4 to the installed tree. **Needs review (user)**: whether to make codecs public for that.
 
 **Evidence.** Against a staged install of develop: the plugins build from `bess-dev` and load into the staged bessd;
 on the graph path R1 moves 172.16.1.1 to gate 0, R2 an inside host's UDP and R3 a tenant's DNS to gate 0, and every
 `self_test` passes. Mutants: VRF 2's route pointed at VRF 1's gateway fails R1 ("VRF 2 did not use its own route");
 the inbound firewall allowed to start connections fails R2 ("an outside-started connection was admitted"); a group
-switch without the generation increment fails R3 ("tenant 0 still allows web after its switch"). Found on
+switch without the generation increment fails R3 ("tenant 0 still allows web after its switch"). R5: two cold packets
+cache nothing; the third caches the decision and installs one rule on the fake device; the fourth hits. R4
+(`dataplane_session_reference_test`, 4 tests): pass. Found on
 the way: a NAT whose expiry wheel starts at clock 0 while packets carry the TSC clock refuses every mapping (the
 deadline is beyond the wheel's horizon): the module starts the wheels at the packet clock's now, as the in-tree NAT
 module does.

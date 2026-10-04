@@ -14,6 +14,8 @@
 
 #include "framework/plugin.h"
 #include "module.h"
+#include "offload/fake_flow_backend.h"
+#include "offload/flow_rule_owner.h"
 #include "vswitch/vswitch_app.h"
 
 namespace {
@@ -81,6 +83,13 @@ class VswitchAppliance final : public Module {
     if (std::string failed = SelfTest(**made); !failed.empty()) {
       return CommandFailure(EINVAL, "R3 direct path: %s", failed.c_str());
     }
+    auto hier = VswitchApp::Create(init_context().rcu());
+    if (!hier) {
+      return CommandFailure(ENOMEM, "%s", hier.error().c_str());
+    }
+    if (std::string failed = SelfTestHierarchy(**hier); !failed.empty()) {
+      return CommandFailure(EINVAL, "R5 hierarchical mode: %s", failed.c_str());
+    }
     return CommandSuccess();
   }
 
@@ -134,6 +143,53 @@ class VswitchAppliance final : public Module {
     }
     if (!app.Process(1, web1).allow || app.compiles(1) != compiles1) {
       return "tenant 1 was disturbed by tenant 0's switch";
+    }
+    return "";
+  }
+
+  // R5: cold flows evaluated per packet and counted; the third packet makes a
+  // flow hot (the application's rule): its decision is cached and, through the
+  // application's promotion hook, installed as a hardware flow rule (the
+  // offload owner over a fake device here).
+  static std::string SelfTestHierarchy(VswitchApp &app) {
+    bess::offload::FakeFlowBackend device;
+    device.set_auto_complete(true);
+    bess::offload::FlowCapabilities caps;
+    caps.supported = true;
+    device.SetCapabilities(0, caps);
+    bess::offload::FlowRuleOwner<bess::offload::FakeFlowBackend> owner(
+        device, bess::offload::FlowRuleOwner<bess::offload::FakeFlowBackend>::Config{});
+    size_t promoted = 0;
+    if (!app.EnableHierarchy(3, [&](const appliance::VswitchKey &k, appliance::CompiledDecision d) {
+          promoted++;
+          if (d.allow) {
+            (void)owner.Install(0, uint64_t{k.dst} << 16 | k.dport, k.src);
+          }
+        })) {
+      return "enable";
+    }
+    for (int i = 1; i <= 2; i++) {
+      auto web = Frame(0x0a010101, 80, 6);
+      if (!app.Process(0, web).allow) {
+        return "a cold flow was not served by the default path";
+      }
+    }
+    if (app.cached(0) != 0 || app.cold_flows() != 1 || promoted != 0) {
+      return "a cold flow was cached or promoted";
+    }
+    auto third = Frame(0x0a010101, 80, 6);
+    (void)app.Process(0, third);
+    owner.Poll([](auto &&...) {});
+    if (app.cached(0) != 1 || app.cold_flows() != 0 || promoted != 1 || device.installed(0) != 1) {
+      return "the hot flow was not installed in the cache and the device (cached " +
+             std::to_string(app.cached(0)) + ", cold " + std::to_string(app.cold_flows()) +
+             ", promoted " + std::to_string(promoted) + ", device " +
+             std::to_string(device.installed(0)) + ")";
+    }
+    const uint64_t compiles = app.compiles(0);
+    auto fourth = Frame(0x0a010101, 80, 6);
+    if (!app.Process(0, fourth).allow || app.compiles(0) != compiles || app.hits(0) != 1) {
+      return "the hot flow did not take the fast path";
     }
     return "";
   }

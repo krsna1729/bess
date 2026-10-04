@@ -654,6 +654,7 @@ unit_test_sources = [
   'dataplane/object_table_publication_test.cc',
   'dataplane/transaction_engine_test.cc',
   'dataplane/transaction_lifecycle_test.cc',
+  'dataplane/session_reference_test.cc',
   'dataplane/scope_snapshot_test.cc',
   'meter/meter_test.cc',
   'meter/meter_set_test.cc',
