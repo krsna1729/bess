@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# A policed, routed session built without C++ (roadmap M23, persona A: the
+# graph user). The graph is
+#
+#   Source -> Rewrite -> ExactMatch -> ActionTable -> Meter -> Router -> Sink
+#
+# and everything dynamic is in the modules' tables, not in the graph: one
+# transaction creates the session's meter, next hop, route, action and the
+# rule that selects the action. It applies all or nothing; a session whose
+# rule names an action that does not exist yet is refused, not half-installed.
+#
+# ExactMatch matches the IPv4 source address and TCP/UDP source port and hands
+# the matching rule's action id to ActionTable, which resolves the action's
+# meter and next hop. Meter passes green (gate 0) on; yellow and red are left
+# unconnected, so the policy is the graph. Router forwards by the action's next
+# hop to its egress gate.
+
+import socket
+import struct
+
+import scapy.all as scapy
+from builtin_pb import module_msg_pb2 as module_msg
+
+SESSION_SIP, SESSION_SPORT = '10.1.2.3', 1234
+EGRESS_GATE = 1
+
+
+def tcp(sip, sport):
+    eth = scapy.Ether(src='02:1e:67:9f:4d:ae', dst='06:16:3e:1b:72:32')
+    ip = scapy.IP(src=sip, dst='10.9.9.9')
+    return bytes(eth / ip / scapy.TCP(sport=sport, dport=80) / ('x' * 16))
+
+
+# The session's packets, and one that matches no rule (ExactMatch's default
+# gate: dropped).
+packets = [tcp(SESSION_SIP, SESSION_SPORT), tcp('192.0.2.1', 4321)]
+
+# Resource names are '<module>/<table>'. ActionTable names the meter and next
+# hop tables of modules created after it: a declared reference binds when its
+# resource registers.
+at::ActionTable(capacity=64, meters='mt/meters', next_hops='rt/next_hops')
+em::ExactMatch(fields=[{'offset': 26, 'num_bytes': 4},
+                       {'offset': 34, 'num_bytes': 2}],
+               action_resource='at/actions')
+mt::Meter(capacity=64)
+rt::Router(max_routes=64, max_tbl8s=16, max_next_hops=64)
+
+Source() -> Rewrite(templates=packets) -> em
+em:0 -> at
+at:0 -> mt
+mt:0 -> rt
+rt:1 -> Sink()  # EGRESS_GATE
+
+
+def op(resource, key, value):
+    return bess.transaction_op(resource, key, value)
+
+
+rule_key = module_msg.ExactMatchRuleKey()
+rule_key.fields.add(value_bin=socket.inet_aton(SESSION_SIP))
+rule_key.fields.add(value_bin=struct.pack('!H', SESSION_SPORT))
+
+session = [
+    # 1 Gbit/s committed and peak, 64 KiB buckets.
+    op('mt/meters', module_msg.MeterIdKey(id=1),
+       module_msg.MeterPolicyValue(tr_tcm=module_msg.TrTcmProfile(
+           committed_rate=125000000, committed_burst=65536,
+           peak_rate=125000000, peak_burst=65536))),
+    op('rt/next_hops', module_msg.RouterNextHopIdKey(id=1),
+       module_msg.RouterNextHopValue(egress_gate=EGRESS_GATE)),
+    op('rt/routes', module_msg.RouterRouteKey(ipv4='10.0.0.0', prefix_length=8),
+       module_msg.RouterRouteValue(next_hop_id=1)),
+    op('at/actions', module_msg.ActionIdKey(id=1),
+       module_msg.ActionValue(meter_id=1, next_hop_id=1)),
+    op('em/rules', rule_key, module_msg.ExactMatchRuleValue(action_id=1)),
+]
+
+result = bess.apply_transaction(session)
+if result.record.outcome != result.record.OUTCOME_APPLIED:
+    raise SystemExit('session transaction not applied: %s' % result.record)
