@@ -4835,6 +4835,18 @@ exhaustively (a closed channel cannot be reopened to restore a sibling branch); 
 
 A change to any row's code changes the model or the test in the same commit.
 
+**Change (consolidation review, performance clawback, 2026-10-04): no attributable cost to claw back.** The review
+asked what the channel costs over a bare `rte_ring`. Measured (release, isolated CPUs 2 and 4, 12 ABBA rounds,
+`handoff_bench`, no context): against `elem8` in the same session the channel is +17-27% on a round trip at bursts
+of 8-32 and +33-72% one way with spaced bursts. Variants with the counters, the pointer nulling or the close check
+compiled out each moved those ratios by up to 20% between sessions, with the counters seemingly the whole round-trip
+gap; but the decisive same-session test -- the counters derived from the ring's own indices (no counter write on
+the hot path) against today's channel -- showed no clear difference on 15 of 20 rows (4 faster by 5-15%, one +9%
+with a 0.68-1.64 interval). The per-variant differences were code placement (inlining across template
+instantiations), as in D-073's measurements, not the semantics. Nothing was changed: counters, nulling and the
+close check stay, and the derived-counter design is not adopted (it would add a stats-read frequency rule for no
+measured gain). Revisit with a profile of a real two-worker pipeline, not the ping-pong microbenchmark.
+
 ## D-055 One CI authority for gating and release lanes; static release links with -fno-lto
 
 **Status:** accepted (2026-10-02), with the exceptions under "Not done".
