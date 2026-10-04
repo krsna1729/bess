@@ -234,6 +234,7 @@ class Client:
         epoch = self.daemon_epoch
         backoff = self._retry.busy_backoff
         transport_failure = None  # the last RPC that went unanswered
+        last_unanswered = None    # its code, kept after later answers
         unknown_attempt = False   # a send of this commit went unanswered
         send = True
         for _ in range(self._retry.attempts):
@@ -243,7 +244,7 @@ class Client:
                 except grpc.RpcError as e:
                     if not _no_answer(e):
                         raise _translate(e)
-                    transport_failure = e.code()
+                    transport_failure = last_unanswered = e.code()
                     unknown_attempt = True
                     send = False  # ask before sending again
                     continue
@@ -261,15 +262,19 @@ class Client:
             except grpc.RpcError as e:
                 if not _no_answer(e):
                     raise _translate(e)
-                transport_failure = e.code()
+                transport_failure = last_unanswered = e.code()
                 continue  # still no answer: ask again, never resend blind
             self._check_epoch(answered_epoch, epoch)
             if known:
                 return _finish(record, True, answered_epoch, unknown_attempt)
             transport_failure = None
             send = True  # confirmed unseen under this epoch: sending again is safe
-        if transport_failure is not None:
-            raise TransportError(request.request_id, transport_failure)
+        # Out of attempts. If any send went unanswered, the outcome is unknown:
+        # "not known" only means "not applied yet" (an unanswered Apply can
+        # still be waiting for the daemon's lock), so Busy -- nothing applied --
+        # would invite a retry under a new id and a second application.
+        if transport_failure is not None or unknown_attempt:
+            raise TransportError(request.request_id, transport_failure or last_unanswered)
         raise Busy('still busy after %d attempts' % self._retry.attempts)
 
     def _check_epoch(self, answered, expected):

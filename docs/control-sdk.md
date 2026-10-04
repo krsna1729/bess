@@ -33,8 +33,11 @@ print(tx.result.generation)                   # committed on a clean exit
 | A key or value of the wrong type | `InvalidRequest` before anything is sent. |
 
 Conflicts and rejections are never retried. Tuning:
-`sdk.RetryPolicy(attempt_timeout, attempts, busy_backoff)` (`attempts=1`: no
-retry, one status query after a timeout).
+`sdk.RetryPolicy(attempt_timeout, attempts, busy_backoff)`. Every RPC counts
+against `attempts`, status queries included: `attempts=2` is one send plus one
+question. When the attempts run out after any unanswered send, the result is
+`TransportError` (unknown), never `Busy`: an unanswered request may still be
+waiting for the daemon and apply later; ask `get_transaction(request_id)`.
 
 One limit: the daemon remembers outcomes in a bounded window (4096). A request
 that applied and then aged out before the retry asked looks unseen and is sent

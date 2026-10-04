@@ -185,6 +185,16 @@ class SdkTest(unittest.TestCase):
             self.tx(self.client(stub, attempts=2)).commit()
         self.assertEqual(raised.exception.request_id, stub.applied[0].request_id)
 
+    def test_out_of_attempts_after_an_unanswered_send_is_unknown_not_busy(self):
+        cases = [
+            (Stub(apply=[TIMEOUT], get=[(False, 0, 1)]), 2),
+            (Stub(apply=[TIMEOUT, (BUSY, 1)], get=[(False, 0, 1)]), 3),
+            (Stub(apply=[TIMEOUT, TIMEOUT], get=[(False, 0, 1), (False, 0, 1)]), 4),
+        ]
+        for stub, attempts in cases:
+            with self.assertRaises(sdk.TransportError):
+                self.tx(self.client(stub, attempts=attempts)).commit()
+
     def test_a_restart_during_recovery_is_reported_not_guessed(self):
         stub = Stub(apply=[TIMEOUT], get=[(False, 0, 2)])
         with self.assertRaises(sdk.DaemonRestarted):
