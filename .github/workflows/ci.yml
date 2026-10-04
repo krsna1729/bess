@@ -48,6 +48,27 @@ jobs:
           breaking: true
           breaking_against: .git#ref=HEAD~1,subdir=protobuf
 
+  # The Go control SDK (M27): its generated code is what the pinned generator
+  # makes from protobuf/control_v2.proto, and it vets and passes its tests.
+  go-sdk:
+    name: Go SDK
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Regenerate and compare
+        run: |
+          tools/gen_go_sdk.sh
+          git diff --exit-code -- sdk/go
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: sdk/go/go.mod
+          cache-dependency-path: sdk/go/go.sum
+      - name: Vet and test
+        working-directory: sdk/go
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+
   build-and-test:
     name: Meson (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -147,6 +168,13 @@ jobs:
           sudo bash env/install-deps.sh runtime
           sudo bash env/install-deps.sh build
           pip3 install --break-system-packages coverage
+
+      # The integration suite runs the Go control SDK against bessd
+      # (bessctl/module_tests/control_sdk_go.py).
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: sdk/go/go.mod
+          cache-dependency-path: sdk/go/go.sum
 
       - name: Cache DPDK
         uses: actions/cache@v6

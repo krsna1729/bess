@@ -39,7 +39,7 @@ test(
 bess_data_dir = join_paths(get_option('datadir'), 'bess')
 install_data(
   files('__init__.py', 'bess.py', 'module.py', 'pm_import.py',
-        'port.py', 'protobuf_to_dict.py'),
+        'port.py', 'protobuf_to_dict.py', 'sdk.py'),
   install_dir: join_paths(bess_data_dir, 'pybess'),
 )
 install_data(
