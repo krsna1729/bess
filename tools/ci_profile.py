@@ -38,6 +38,7 @@ Local runs never exceed 8 build jobs (docs: MODERNIZATION.md "Build profiles").
 
 import argparse
 import hashlib
+import json
 import os
 import platform
 import shutil
@@ -334,6 +335,20 @@ def step_verify_install(s):
         raise SystemExit(f'unexpected install: bessd={bessd} plugins={plugins}')
     s.run([sys.executable, ROOT / 'tools' / 'check_installed_pybess.py',
            '--root', s.stage / 'usr/local/share/bess'], env=env)
+    # Release metadata (M26): the install says what it is made of.
+    info_files = list(s.stage.glob('**/share/bess/build-info.json'))
+    sbom_files = list(s.stage.glob('**/share/doc/bess/bess.spdx.json'))
+    if len(info_files) != 1 or len(sbom_files) != 1:
+        raise SystemExit(f'missing release metadata: {info_files} {sbom_files}')
+    info = json.loads(info_files[0].read_text())
+    for key in ('version', 'commit', 'plugin_api_version', 'compilers', 'options', 'dpdk',
+                'dependencies'):
+        if key not in info:
+            raise SystemExit(f'build-info.json lacks {key}')
+    sbom = json.loads(sbom_files[0].read_text())
+    if sbom.get('spdxVersion') != 'SPDX-2.3' or not any(
+            p['name'] == 'dpdk' and p.get('checksums') for p in sbom.get('packages', [])):
+        raise SystemExit('bess.spdx.json is not an SPDX 2.3 document with the DPDK pin')
 
 
 def tree_state():

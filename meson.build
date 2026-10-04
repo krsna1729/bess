@@ -270,6 +270,23 @@ pkg.generate(
 subdir('protobuf')
 subdir('pybess')
 subdir('core')
+
+# What this build is made of (M26): version, commit, compilers, options, the
+# DPDK pin and every dependency's version, and an SPDX SBOM from the same
+# facts. Regenerated on every build (cheap), installed with bessd.
+custom_target(
+  'build_info',
+  output: ['build-info.json', 'bess.spdx.json'],
+  command: [python, files('tools/build_info.py'),
+            '--build-dir', meson.project_build_root(),
+            '--source-dir', meson.project_source_root(),
+            '--info', '@OUTPUT0@', '--sbom', '@OUTPUT1@'],
+  build_by_default: true,
+  build_always_stale: true,
+  install: true,
+  install_dir: [join_paths(get_option('datadir'), 'bess'),
+                join_paths(get_option('datadir'), 'doc', 'bess')],
+)
 if get_option('build_sample_plugin')
   subdir('sample_plugin')
 endif

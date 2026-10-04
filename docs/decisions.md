@@ -93,6 +93,7 @@ file is the reasoning.
 | D-070 | Hardware flow rules: a lifecycle owner, not a flow IR (M20) | accepted |
 | D-071 | Portability: one architecture boundary (core/arch), generic fallback for every kernel (M21) | accepted |
 | D-072 | Hardening program: sanitizers with the EAL, fuzzing, fault injection, models, curated clang-tidy (M22) | accepted |
+| D-075 | Release metadata, SBOM and the compatibility policy (M26) | accepted |
 
 
 ---
@@ -6453,4 +6454,41 @@ fixed 25 s deadline under sanitizer slowdown (scale it before the sanitizer lane
 
 **Revisit when:** the sanitizer lanes are green for a week (make them gating); a new stateful battery lands (it needs
 a model, fault injection and, if shared, a TSan entry before it is called stable).
+
+## D-075 Release metadata, SBOM and the compatibility policy (M26)
+
+**Status:** accepted (2026-10-04).
+**Code:** `tools/build_info.py`, root `meson.build` (`build_info` target), `tools/ci_profile.py` (verify-install),
+`docs/compatibility.md`.
+
+**Context.** Roadmap M26: a release must say what it is made of (version, commit, plugin API version, compiler, C++
+standard, DPDK version and source checksum, ISA, options, linked library versions, an SBOM), install and build an
+external consumer without the source tree, and document its compatibility promises. Before: the staged install and
+the external plugin build existed (verify-install); no build metadata, no SBOM, and the compatibility rules were
+spread over architecture.md, plugin-api.md and several decisions.
+
+**Decision.**
+- `tools/build_info.py` writes `build-info.json` and an SPDX 2.3 `bess.spdx.json` from the build's own facts:
+  meson's introspection (compilers, options, dependencies found and their versions), `deps/dpdk.json` (DPDK's pin
+  with URL and sha256), `BESS_PLUGIN_API_VERSION`, and git (or "unknown" in a source release). Nothing is kept by
+  hand. A meson target regenerates both on every build and installs them (`share/bess/`, `share/doc/bess/`).
+- The SBOM is deterministic for the same inputs: its namespace is a digest of the facts and its timestamp the
+  commit's, so two builds of one commit produce the same document.
+- CI's verify-install requires both files in the staged install, the metadata keys, and the DPDK pin with its
+  checksum in the SBOM.
+- `docs/compatibility.md` states the promises in one place: wire compatibility (`buf breaking`, WIRE_JSON, required
+  on `develop`), the public/experimental/internal C++ classes, the plugin descriptor rules, and a new rule: a
+  deprecated API keeps working for at least one release after the one that announces its replacement, and its
+  removal is a decision record.
+
+**Evidence.** A fast-profile build and `meson install --destdir` stage `share/bess/build-info.json` (keys: commit,
+compilers, dependencies, dirty, dpdk, name, options, plugin_api_version, version; DPDK 25.11.3 with its URL and
+sha256) and `share/doc/bess/bess.spdx.json` (SPDX-2.3, 13 packages, DPDK's with a checksum). Two runs of
+`tools/build_info.py` over the same build give byte-identical files. CI's verify-install checks both on every lane.
+
+**Not done.** Container image and distro packages (no consumer yet: env/Dockerfile builds the CI image only);
+signing and provenance (M26 item in the roadmap's release work, blocked on secrets); a reproducibility check that
+builds twice and compares (the metadata is deterministic, the binaries are not checked).
+
+**Revisit when:** a consumer needs a container or distro package; release signing keys exist.
 
