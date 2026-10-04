@@ -18,6 +18,8 @@
 #include <optional>
 #include <span>
 
+#include <rte_mbuf.h>
+
 #include "conntrack/packet_parse.h"
 #include "dataplane/handoff.h"
 #include "tunnel/tunnel.h"
@@ -32,21 +34,29 @@ struct Resolved {
 
 using Channel = bess::dataplane::HandoffChannel<Resolved>;
 
-// `packet` is a packet this worker owns (an mbuf from bessd's pool).
-bool HandoffSample(bess::PacketHandle packet) {
+// `packet` is a packet this worker owns (an mbuf from bessd's pool), taken
+// by reference: on success the channel nulls it, so the caller can see it no
+// longer owns it.
+bool HandoffSample(bess::PacketHandle &packet) {
   auto channel = Channel::Create({.capacity = 64});
   if (!channel) {
-    return false;
+    return false;  // `packet` is still the caller's
   }
   if (auto punted = (*channel)->TryPunt(packet, Resolved{7, 42}); !punted) {
-    // Still ours: the error says why (full or closed); drop or retry it.
+    // Still ours: the error says why (full or closed). This sample drops it.
+    rte_pktmbuf_free(packet);
+    packet = nullptr;
     return false;
   }
   // packet == nullptr: the channel owns it until the consumer dequeues it.
   std::array<Channel::Item, 8> items{};
   const size_t n = (*channel)->Dequeue(items);
-  // The consumer owns items[0].packet now and continues with its context.
-  return n == 1 && items[0].context.action == 7;
+  // The consumer owns items[0].packet now; this one is done with it.
+  const bool ok = n == 1 && items[0].context.action == 7;
+  for (size_t i = 0; i < n; i++) {
+    rte_pktmbuf_free(items[i].packet);
+  }
+  return ok;
 }
 
 bool TunnelSample(std::span<const uint8_t> frame) {

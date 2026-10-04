@@ -36,7 +36,7 @@ int main() {
   // a renewed to 25; at 21 only b has expired.
   Expect(table->Renew(a, 5, 20), "renew a");
   uint32_t ended_id = 0;
-  Expect(table->Expire(21, [&](const Subscriber &s) { ended_id = s.id; }) == 1, "one expired");
+  Expect(table->Expire(21, [&](const Subscriber &s) noexcept { ended_id = s.id; }) == 1, "one expired");
   Expect(ended_id == 8, "b expired, not a");
   Expect(table->Holding(b) == nullptr, "b's handle is stale");
   Expect(!table->Renew(b, 21, 10), "a stale handle cannot renew");
@@ -46,7 +46,7 @@ int main() {
   Expect(c.id == b.id && c.generation != b.generation, "slot reused, new generation");
   Expect(table->Holding(b) == nullptr && table->Holding(c)->id == 10, "old handle stays stale");
 
-  Expect(table->Expire(40, [](const Subscriber &) {}) == 2, "both expire");
+  Expect(table->Expire(40, [](const Subscriber &) noexcept {}) == 2, "both expire");
   if (failures == 0) {
     std::printf("lease_table_test: OK\n");
   }

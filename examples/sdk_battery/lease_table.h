@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 #include "dataplane/expiry_wheel.h"
@@ -47,9 +48,15 @@ class LeaseTable {
     const uint32_t slot = free_.back();
     free_.pop_back();
     Entry &e = entries_[slot];
+    e.timer = wheel_->Schedule(Wheel::After(now, ttl), slot);
+    if (e.timer == bess::dataplane::kNoExpiry) {
+      // No timer node (a quarantined one): a lease that could never expire
+      // is refused, and the slot goes back.
+      free_.push_back(slot);
+      return {};
+    }
     e.holder = holder;
     e.live = true;
-    e.timer = wheel_->Schedule(Wheel::After(now, ttl), slot);
     return {LeaseSlot{slot}, e.generation};
   }
 
@@ -65,8 +72,11 @@ class LeaseTable {
   }
 
   // Ends every lease whose deadline has passed; calls fn(holder) for each.
+  // `fn` must not throw: it runs inside the wheel's poll.
   template <typename Fn>
   size_t Expire(uint64_t now, Fn &&fn) {
+    static_assert(std::is_nothrow_invocable_v<Fn &, const Holder &>,
+                  "an expiry callback must be noexcept");
     size_t ended = 0;
     (void)wheel_->Poll(now, ~size_t{0}, [&](uint32_t slot) noexcept {
       Entry &e = entries_[slot];

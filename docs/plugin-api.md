@@ -273,6 +273,13 @@ no name lookup, no reference count. Create and destroy are structural
 operations done under the control-plane lock; the state's own contents must
 provide their own synchronization for live updates.
 
+An instance a plugin creates holds the plugin's code (its deleter and type
+information) for as long as the instance exists, and nothing destroys
+instances on `reset_all`. A plugin that creates registry instances
+(`standalone_appliance` is one) must therefore not be unloaded while they
+exist: destroy them first (`Destroy`, once no lease is held), or keep the
+plugin loaded for the daemon's life.
+
 ---
 
 ## 3. Data Structures and Hot Paths

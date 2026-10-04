@@ -20,15 +20,31 @@ import sys
 import tempfile
 import time
 
-# module class -> how many instances (each its own Source -> module -> Sink;
-# every Init takes EmptyArg today).
-PLUGIN_CLASSES = {
-    'StandalonePass': 1,
-    'StandaloneMacSwap': 1,
-    'StandaloneRangeGate': 1,
-    'StandaloneFlowCount': 1,  # gate 0 carries packets of flows it already knows
-    'StandaloneAppliance': 2,  # the second instance looks up the first's policy graph
-}
+def udp_frame(dst_port):
+    """60 bytes: Ethernet, IPv4 (10.0.0.1 -> 192.0.2.1), UDP to `dst_port`."""
+    f = bytearray(60)
+    f[12] = 0x08                            # IPv4
+    f[14], f[17], f[22], f[23] = 0x45, 28, 64, 17
+    f[26], f[29] = 10, 1
+    f[30], f[32], f[33] = 192, 2, 1
+    f[34], f[35] = 0x03, 0xe8               # source port 1000
+    f[36], f[37] = dst_port >> 8, dst_port & 0xff
+    f[39] = 8
+    return bytes(f)
+
+
+# (module class, instance name, packet template or None for Source's own,
+#  the output gate those packets must leave on). Every Init takes EmptyArg.
+INSTANCES = [
+    ('StandalonePass', 'pass0', None, 0),
+    ('StandaloneMacSwap', 'macswap0', None, 0),
+    ('StandaloneRangeGate', 'rangegate0', udp_frame(1500), 1),  # in [1000, 2000]
+    ('StandaloneFlowCount', 'flowcount0', None, 0),  # flows it already knows
+    # The second appliance looks up the first's policy graph; one sees a
+    # classifier hit (gate 1), the other the default action (gate 0).
+    ('StandaloneAppliance', 'appliance0', udp_frame(1500), 1),
+    ('StandaloneAppliance', 'appliance1', udp_frame(53), 0),
+]
 
 
 def wait_connected(client, process, url, log_path):
@@ -66,30 +82,32 @@ def free_port():
         return probe.getsockname()[1]
 
 
-def run(client, plugin_classes):
+def run(client, instances):
     names = set(client.list_mclasses().names)
-    missing = sorted(set(plugin_classes) - names)
+    missing = sorted({mclass for mclass, *_ in instances} - names)
     if missing:
         raise RuntimeError(f'plugin classes not registered: {missing}')
     client.add_worker(0, 0)
-    names = {mclass: [f'{mclass.lower()}{i}' for i in range(count)]
-             for mclass, count in plugin_classes.items()}
-    for mclass, instances in names.items():
-        for name in instances:
-            client.create_module('Source', name + '_src', {})
-            client.create_module(mclass, name, {})
-            client.create_module('Sink', name + '_sink', {})
+    for mclass, name, template, gate in instances:
+        client.create_module('Source', name + '_src', {})
+        client.create_module(mclass, name, {})
+        client.create_module('Sink', name + '_sink', {})
+        if template is not None:
+            client.create_module('Rewrite', name + '_rw', {'templates': [template]})
+            client.connect_modules(name + '_src', name + '_rw')
+            client.connect_modules(name + '_rw', name)
+        else:
             client.connect_modules(name + '_src', name)
-            client.connect_modules(name, name + '_sink')
+        client.connect_modules(name, name + '_sink', gate)
     client.resume_all()
     time.sleep(0.3)
     client.pause_all()
-    for mclass, instances in names.items():
-        for name in instances:
-            sent = edge_packets(client, name)
-            if sent == 0:
-                raise RuntimeError(f'{mclass} ({name}): no packets left the module')
-            print(f'  OK: {mclass} ({name}) loaded from the installed tree and moved {sent} packets')
+    for mclass, name, _, gate in instances:
+        sent = edge_packets(client, name, gate)
+        if sent == 0:
+            raise RuntimeError(f'{mclass} ({name}): no packets left on gate {gate}')
+        print(f'  OK: {mclass} ({name}) loaded from the installed tree and moved {sent} '
+              f'packets on gate {gate}')
 
 
 def main() -> int:
@@ -114,7 +132,7 @@ def main() -> int:
         try:
             wait_connected(client, process, args.grpc_url, log_path)
             try:
-                run(client, PLUGIN_CLASSES)
+                run(client, INSTANCES)
             except Exception as error:
                 time.sleep(0.5)
                 raise RuntimeError(f'{error}\nbessd log (tail):\n'
