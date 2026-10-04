@@ -25,98 +25,13 @@
 #include "dataplane/continuation.h"
 #include "packet.h"
 #include "packet_pool.h"
-
-// Allocation counting for the packet-path calls: every allocation made while
-// the window is open is counted. (The technique of expiry_wheel_test.cc.)
-namespace {
-std::atomic<bool> g_window_open{false};
-std::atomic<size_t> g_allocations{0};
-
-class AllocationWindow {
- public:
-  AllocationWindow() {
-    g_allocations = 0;
-    g_window_open = true;
-  }
-  ~AllocationWindow() { g_window_open = false; }
-  size_t allocations() const { return g_allocations.load(); }
-};
-
-void *Allocate(std::size_t n, std::size_t align) {
-  if (g_window_open.load(std::memory_order_relaxed)) {
-    g_allocations++;
-  }
-  if (align <= alignof(std::max_align_t)) {
-    if (void *p = std::malloc(n == 0 ? 1 : n)) {
-      return p;
-    }
-  } else if (void *p = std::aligned_alloc(align, (n + align - 1) / align * align)) {
-    return p;
-  }
-  throw std::bad_alloc();
-}
-}  // namespace
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpragmas"
-#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
-void *operator new(std::size_t n) { return Allocate(n, 0); }
-void *operator new[](std::size_t n) { return Allocate(n, 0); }
-void *operator new(std::size_t n, std::align_val_t a) {
-  return Allocate(n, static_cast<std::size_t>(a));
-}
-void *operator new[](std::size_t n, std::align_val_t a) {
-  return Allocate(n, static_cast<std::size_t>(a));
-}
-// The nothrow forms too, so that no allocation is made by the library's own
-// operator new and freed by the replaced operator delete below (AddressSanitizer
-// reports that as alloc-dealloc-mismatch).
-void *operator new(std::size_t n, const std::nothrow_t &) noexcept {
-  try {
-    return Allocate(n, 0);
-  } catch (const std::bad_alloc &) {
-    return nullptr;
-  }
-}
-void *operator new[](std::size_t n, const std::nothrow_t &) noexcept {
-  try {
-    return Allocate(n, 0);
-  } catch (const std::bad_alloc &) {
-    return nullptr;
-  }
-}
-void *operator new(std::size_t n, std::align_val_t a,
-                   const std::nothrow_t &) noexcept {
-  try {
-    return Allocate(n, static_cast<std::size_t>(a));
-  } catch (const std::bad_alloc &) {
-    return nullptr;
-  }
-}
-void *operator new[](std::size_t n, std::align_val_t a,
-                     const std::nothrow_t &) noexcept {
-  try {
-    return Allocate(n, static_cast<std::size_t>(a));
-  } catch (const std::bad_alloc &) {
-    return nullptr;
-  }
-}
-void operator delete(void *p) noexcept { std::free(p); }
-void operator delete[](void *p) noexcept { std::free(p); }
-void operator delete(void *p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
-void operator delete(void *p, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void *p, std::align_val_t) noexcept { std::free(p); }
-void operator delete(void *p, std::size_t, std::align_val_t) noexcept {
-  std::free(p);
-}
-void operator delete[](void *p, std::size_t, std::align_val_t) noexcept {
-  std::free(p);
-}
-#pragma GCC diagnostic pop
+#include "testing/allocation_faults.h"
 
 namespace bess::dataplane {
 namespace {
+
+using fault_injection::AllocationFaults;
+using fault_injection::ForEachFailurePoint;
 
 constexpr HandoffTopology kSpSc = HandoffTopology::kSpSc;
 constexpr HandoffTopology kMpSc = HandoffTopology::kMpSc;
@@ -877,6 +792,27 @@ TEST(HandoffCreateTest, AllocatorRefusalIsAnErrorAndAllocationIsOneBlock) {
   EXPECT_EQ(1, TestAllocator::deallocations) << "one block freed, none leaked";
 }
 
+// Creation has exactly one failure point, the allocator seam above (refused
+// there, it is an error and leaks nothing). It never allocates through
+// operator new, where a failure would bypass the seam: failing each
+// operator-new allocation in turn finds none to fail, for every topology.
+TEST(HandoffCreateTest, CreationFailsOnlyAtTheAllocatorSeam) {
+  TestAllocator::Reset();
+  HandoffConfig config;
+  config.capacity = 256;
+  config.allocator = &TestAllocator::Get();
+  const size_t points = ForEachFailurePoint([&](size_t k) {
+    const AllocationFaults faults(k);
+    ASSERT_TRUE((HandoffChannel<Ctx16, kSpSc>::Create(config).has_value()));
+    ASSERT_TRUE((HandoffChannel<Ctx16, kMpSc>::Create(config).has_value()));
+    ASSERT_TRUE((HandoffChannel<Ctx16, kMpMc>::Create(config).has_value()));
+    ASSERT_TRUE((HandoffChannel<Ctx56, kMpMc>::Create(config).has_value()));
+  });
+  EXPECT_EQ(0u, points) << "Create allocated through operator new";
+  EXPECT_EQ(4, TestAllocator::allocations) << "one seam allocation per channel";
+  EXPECT_EQ(4, TestAllocator::deallocations);
+}
+
 // Placement diagnostics: what was asked for, where it landed, and whether they
 // differ (a cross-NUMA channel must not look local).
 TEST(HandoffCreateTest, PlacementReportsWhereTheMemoryLanded) {
@@ -946,7 +882,7 @@ TEST(HandoffCreateTest, DefaultAllocatorPlacesOnTheDpdkHeapAndAdmitsAFallback) {
 TEST(HandoffCreateTest, NothingAllocatesAfterCreate) {
   FakeChannel<Ctx16, kMpMc> ch(64);
   std::array<PuntItem<Ctx16>, 32> items, out;
-  const AllocationWindow window;
+  const AllocationFaults window;
   for (int round = 0; round < 200; round++) {
     for (uint64_t i = 0; i < items.size(); i++) {
       items[i] = MakeItem<Ctx16>(i);

@@ -299,8 +299,12 @@ class Nat {
     if (!wheel) {
       return std::unexpected(CreateError::kOutOfMemory);
     }
-    std::unique_ptr<Nat> nat(new (std::nothrow) Nat(config, std::move(*table), std::move(*wheel)));
-    if (nat == nullptr) {
+    // The engine copies the addresses and allocates its port bitmaps as it
+    // is built: a refusal there is kOutOfMemory like the others.
+    std::unique_ptr<Nat> nat;
+    try {
+      nat.reset(new Nat(config, std::move(*table), std::move(*wheel)));
+    } catch (const std::bad_alloc &) {
       return std::unexpected(CreateError::kOutOfMemory);
     }
     return nat;

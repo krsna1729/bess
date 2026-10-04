@@ -15,6 +15,19 @@
 
 namespace bess::route {
 
+namespace {
+
+// Room for one more element, grown geometrically: the push_back that follows
+// a commit cannot then fail.
+template <typename T>
+void ReserveOneMore(std::vector<T> &v) {
+  if (v.size() == v.capacity()) {
+    v.reserve(v.empty() ? 4 : 2 * v.capacity());
+  }
+}
+
+}  // namespace
+
 std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
     std::string name, const Config &config, size_t max_next_hops,
     rcu::RcuDomain &domain, size_t max_domains, size_t max_groups) {
@@ -295,9 +308,15 @@ std::expected<void, std::string> Router::Release() {
 }
 
 size_t Router::CompleteRetirementsLocked() {
+  // Room first, for everything that may complete: an object unpublished
+  // below must reach the retire queue, never be dropped by a failed push.
+  std::vector<std::unique_ptr<const NextHopGroup>> emptied_groups;
+  std::vector<std::unique_ptr<const NextHop>> emptied;
+  emptied_groups.reserve(retiring_groups_.size());
+  emptied.reserve(retiring_.size());
+  rcu_.ReserveRetirements(retiring_groups_.size() + retiring_.size());
   // Groups first: a retired group's members stay referenced (so the next
   // hops stay published) until no reader can still select from it.
-  std::vector<std::unique_ptr<const NextHopGroup>> emptied_groups;
   std::erase_if(retiring_groups_, [&](const RetiringGroup &r) {
     if (!rcu_.IsComplete(r.token)) {
       return false;
@@ -316,7 +335,6 @@ size_t Router::CompleteRetirementsLocked() {
     }
   }
 
-  std::vector<std::unique_ptr<const NextHop>> emptied;
   std::erase_if(retiring_, [&](const Retiring &r) {
     if (!rcu_.IsComplete(r.token)) {
       return false;
@@ -355,8 +373,11 @@ std::expected<void, RouteError> Router::SetNextHop(NextHopId id,
     return std::unexpected(RouteError::kNextHopRetiring);
   }
   // One pointer store; a reader holding the previous object keeps it until
-  // its next quiescent state.
-  auto replaced = next_hops_.Publish(id, std::make_unique<const NextHop>(hop));
+  // its next quiescent state. Room in the retire queue first: once the new
+  // object is visible nothing may fail.
+  auto hop_object = std::make_unique<const NextHop>(hop);
+  rcu_.ReserveRetirements(1);
+  auto replaced = next_hops_.Publish(id, std::move(hop_object));
   if (replaced) {
     rcu_.Retire(rcu_.StartGracePeriod(), std::move(replaced));
     rcu_.ReclaimReady();
@@ -384,6 +405,7 @@ std::expected<void, RouteError> Router::RemoveNextHop(NextHopId id) {
   // published until every reader has passed a quiescent state; a later
   // control call empties the slot. No waiting here (a stalled worker must not
   // stall the command path, and a transaction must not hold a blocking wait).
+  ReserveOneMore(retiring_);
   next_hops_.Retire(id);
   retiring_.push_back({id, rcu_.StartGracePeriod()});
   return {};
@@ -409,7 +431,9 @@ std::expected<void, RouteError> Router::CreateDomain(RouteDomainId domain,
   }
   // Fully built before the one store that makes it visible; nothing was
   // published at this slot, so there is nothing to retire.
-  domains_.Publish(slot, std::make_unique<const Domain>(std::move(*table)));
+  auto object = std::make_unique<const Domain>(std::move(*table));
+  ReserveOneMore(domain_ids_);
+  domains_.Publish(slot, std::move(object));
   domain_ids_.insert(
       std::lower_bound(domain_ids_.begin(), domain_ids_.end(), domain), domain);
   return {};
@@ -433,6 +457,7 @@ std::expected<void, RouteError> Router::RemoveDomain(RouteDomainId domain) {
   // A reader that already loaded the Domain keeps it (and its empty FIB)
   // until its next quiescent state; a later lookup misses. No domain id is
   // handed out by a referrer, so the slot can be emptied at once.
+  rcu_.ReserveRetirements(1);
   domains_.Retire(slot);
   // Unpublished first, then the grace period that covers it (as RcuPtr does).
   auto removed = domains_.Unpublish(slot);
@@ -550,6 +575,7 @@ std::expected<void, RouteError> Router::SetNextHopGroup(
     }
     group->members[i] = members[i];
   }
+  rcu_.ReserveRetirements(1);  // for the group this one may replace
   for (const NextHopId m : members) {
     member_references_[m.value()]++;
   }
@@ -586,6 +612,7 @@ std::expected<void, RouteError> Router::RemoveNextHopGroup(NextHopGroupId id) {
     return std::unexpected(RouteError::kNextHopInUse);
   }
   // As RemoveNextHop: readable until a grace period passes.
+  ReserveOneMore(retiring_groups_);
   groups_.Retire(id);
   retiring_groups_.push_back({id, rcu_.StartGracePeriod()});
   return {};

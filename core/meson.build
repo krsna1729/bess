@@ -705,6 +705,30 @@ unit_test_sources = [
   'utils/trie_test.cc',
 ]
 
+# Allocation counting and fail-Nth injection (testing/allocation_faults.h):
+# the object replaces the global operator new and delete, so it is linked
+# whole into the tests listed here and into nothing else.
+allocation_faults_lib = static_library(
+  'testing_allocation_faults',
+  'testing/allocation_faults.cc',
+  include_directories: core_include,
+  dependencies: [gtest_dep],
+)
+allocation_fault_tests = [
+  'dataplane/continuation_test.cc',
+  'dataplane/expiry_wheel_test.cc',
+  'dataplane/handoff_test.cc',
+  'dataplane/transaction_engine_test.cc',
+  'dataplane/transaction_lifecycle_test.cc',
+  'flow/shared_flow_table_test.cc',
+  'flow/worker_flow_table_test.cc',
+  'l2/fdb_test.cc',
+  'nat/nat_test.cc',
+  'offload/flow_rule_owner_test.cc',
+  'route/l3_test.cc',
+  'route/router_transaction_test.cc',
+]
+
 taskset_prog = find_program('taskset', required: false)
 foreach source : unit_test_sources
   test_name = source.replace('.cc', '').replace('/', '_')
@@ -739,6 +763,9 @@ foreach source : unit_test_sources
   elif integration_test
     test_link_whole = runtime_whole
     test_link_with = []
+  endif
+  if source in allocation_fault_tests
+    test_link_whole = [test_link_whole, allocation_faults_lib]
   endif
   # The test main is ours (core/gtest_main.cc) rather than the packaged one:
   # it configures the death-test style and keeps expected-death children from

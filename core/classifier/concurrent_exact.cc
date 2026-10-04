@@ -9,6 +9,7 @@
 
 
 #include <atomic>
+#include <new>
 
 #include "dpdk.h"
 
@@ -49,8 +50,15 @@ ConcurrentExactTable::Create(uint32_t key_len, uint32_t capacity,
     rte_hash_free(table);
     return std::unexpected("rte_hash_rcu_qsbr_add failed");
   }
-  return std::unique_ptr<ConcurrentExactTable>(
-      new ConcurrentExactTable(table, key_len, params.entries, writers));
+  // Nothrow: a refusal here must free the hash rather than leak it (the
+  // message fits the string's inline buffer, so returning it allocates
+  // nothing).
+  auto *wrapper = new (std::nothrow) ConcurrentExactTable(table, key_len, params.entries, writers);
+  if (wrapper == nullptr) {
+    rte_hash_free(table);
+    return std::unexpected("out of memory");
+  }
+  return std::unique_ptr<ConcurrentExactTable>(wrapper);
 }
 
 ConcurrentExactTable::~ConcurrentExactTable() {

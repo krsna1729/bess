@@ -133,8 +133,12 @@ class Fdb {
     if (table == nullptr) {
       return std::unexpected(CreateError::kOutOfMemory);
     }
-    std::unique_ptr<Fdb> fdb(new (std::nothrow) Fdb(std::move(table), std::move(*wheel), config));
-    if (fdb == nullptr) {
+    // The FDB allocates its flood groups as it is built: a refusal there is
+    // kOutOfMemory like the others, not an exception.
+    std::unique_ptr<Fdb> fdb;
+    try {
+      fdb.reset(new Fdb(std::move(table), std::move(*wheel), config));
+    } catch (const std::bad_alloc &) {
       return std::unexpected(CreateError::kOutOfMemory);
     }
     return fdb;

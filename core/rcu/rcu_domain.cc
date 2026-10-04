@@ -2,6 +2,7 @@
 
 #include "rcu/rcu_domain.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -203,7 +204,12 @@ void RcuDomain::Synchronize() {
 
 void RcuDomain::ReserveRetirements(size_t n) {
   std::lock_guard<std::mutex> lock(retire_mutex_);
-  retired_.reserve(retired_.size() + n);
+  // Geometric, like push_back: a caller reserving one at a time (every
+  // RcuPtr::Publish) must not copy the queue on every call.
+  const size_t needed = retired_.size() + n;
+  if (needed > retired_.capacity()) {
+    retired_.reserve(std::max(needed, 2 * retired_.capacity()));
+  }
 }
 
 void RcuDomain::RetireErased(GracePeriod token, void *object,

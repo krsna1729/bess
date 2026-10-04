@@ -741,6 +741,13 @@ TransactionEngine::Result TransactionEngine::Apply(
     }
   }
 
+  // The result a commit returns, built now: once publication starts nothing
+  // may fail, and a std::bad_alloc after the commit would report an applied
+  // transaction as failed.
+  Result applied;
+  applied.outcome = Outcome::kApplied;
+  applied.ops.assign(n, OpResult{OpStatus::kApplied, {}});
+
   // -- publish: from here on nothing may fail, and nothing allocates --------
   if (internal::g_publish_window_hook != nullptr) {
     internal::g_publish_window_hook(true);
@@ -802,11 +809,8 @@ TransactionEngine::Result TransactionEngine::Apply(
   }
   domain_.ReclaimReady();
 
-  Result result;
-  result.outcome = Outcome::kApplied;
-  result.generation = generation_;
-  result.ops.assign(n, OpResult{OpStatus::kApplied, {}});
-  return result;
+  applied.generation = generation_;
+  return applied;
 }
 
 }  // namespace dataplane

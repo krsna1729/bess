@@ -12,9 +12,8 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
-#include <new>
 #include <map>
+#include <optional>
 #include <random>
 #include <set>
 #include <thread>
@@ -24,40 +23,22 @@
 #include "runtime/runtime_state.h"
 #include "dataplane/slot_resource.h"
 #include "dataplane/strong_id.h"
-
-// Allocation counting for the publication window: every allocation made while
-// the engine's test hook reports "publishing" is counted (none are allowed).
-namespace {
-thread_local bool g_in_publish = false;
-std::atomic<size_t> g_publish_allocations{0};
-}  // namespace
-
-// Replacing the global allocation functions pairs malloc with free by design;
-// GCC's -Wmismatched-new-delete does not know these are the replacements.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpragmas"
-#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
-void *operator new(std::size_t n) {
-  if (g_in_publish) {
-    g_publish_allocations++;
-  }
-  if (void *p = std::malloc(n == 0 ? 1 : n)) {
-    return p;
-  }
-  throw std::bad_alloc();
-}
-void *operator new[](std::size_t n) { return operator new(n); }
-void operator delete(void *p) noexcept { std::free(p); }
-void operator delete[](void *p) noexcept { std::free(p); }
-void operator delete(void *p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
-#pragma GCC diagnostic pop
+#include "testing/allocation_faults.h"
 
 namespace bess::dataplane {
 namespace {
 
 using classifier::ConcurrentExactTable;
 using classifier::ExactRuleResource;
+
+using fault_injection::AllocationFaults;
+
+// Allocation counting for the publication window: the engine's test hook
+// opens a window on the publishing thread when publication starts and closes
+// it when publication ends; every allocation in between is counted (none
+// are allowed).
+thread_local std::optional<AllocationFaults> t_publish_window;
+std::atomic<size_t> g_publish_allocations{0};
 
 struct MeterTag;
 struct ActionTag;
@@ -978,11 +959,16 @@ TEST_F(TransactionEngineTest, KeysThatCannotBePlacedRejectCleanly) {
 
 // Publication must not do work that can fail: every allocation happens in
 // preparation, and the publish phase only runs the staged operations and
-// updates bookkeeping that already exists. Counted with a global operator new
-// while the engine reports the publication window.
+// updates bookkeeping that already exists. Counted with an allocation window
+// open while the engine reports the publication window.
 TEST_F(TransactionEngineTest, PublicationDoesNotAllocate) {
   internal::g_publish_window_hook = [](bool entering) {
-    g_in_publish = entering;
+    if (entering) {
+      t_publish_window.emplace();
+    } else {
+      g_publish_allocations += t_publish_window->allocations();
+      t_publish_window.reset();
+    }
   };
   g_publish_allocations = 0;
   // Establish, re-point, replace, erase a chain -- every publish path.

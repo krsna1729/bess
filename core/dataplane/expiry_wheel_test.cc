@@ -19,59 +19,13 @@
 
 #include <gtest/gtest.h>
 
-// Allocation counting for the arm/refresh/cancel/poll paths: every allocation
-// made while the window is open is counted. (Same technique as
-// transaction_engine_test.cc.)
-namespace {
-std::atomic<bool> g_count_allocations{false};
-std::atomic<size_t> g_allocations{0};
-}  // namespace
-
-// Replacing the global allocation functions pairs malloc with free by design;
-// GCC's -Wmismatched-new-delete does not know these are the replacements.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpragmas"
-#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
-void *operator new(std::size_t n) {
-  if (g_count_allocations.load(std::memory_order_relaxed)) {
-    g_allocations++;
-  }
-  if (void *p = std::malloc(n == 0 ? 1 : n)) {
-    return p;
-  }
-  throw std::bad_alloc();
-}
-void *operator new[](std::size_t n) { return operator new(n); }
-void *operator new(std::size_t n, std::align_val_t a) {
-  if (g_count_allocations.load(std::memory_order_relaxed)) {
-    g_allocations++;
-  }
-  if (void *p = std::aligned_alloc(static_cast<std::size_t>(a),
-                                   (n + static_cast<std::size_t>(a) - 1) &
-                                       ~(static_cast<std::size_t>(a) - 1))) {
-    return p;
-  }
-  throw std::bad_alloc();
-}
-void *operator new[](std::size_t n, std::align_val_t a) {
-  return operator new(n, a);
-}
-void operator delete(void *p) noexcept { std::free(p); }
-void operator delete[](void *p) noexcept { std::free(p); }
-void operator delete(void *p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
-void operator delete(void *p, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void *p, std::align_val_t) noexcept { std::free(p); }
-void operator delete(void *p, std::size_t, std::align_val_t) noexcept {
-  std::free(p);
-}
-void operator delete[](void *p, std::size_t, std::align_val_t) noexcept {
-  std::free(p);
-}
-#pragma GCC diagnostic pop
+#include "testing/allocation_faults.h"
 
 namespace bess::dataplane {
 namespace {
+
+using fault_injection::AllocationFaults;
+using fault_injection::ForEachFailurePoint;
 
 using Wheel = ExpiryWheel<uint64_t>;
 
@@ -1050,14 +1004,33 @@ TEST(ExpiryWheelDifferential, OwnerSideRefreshExpiresExactlyWhenTheRealDeadlineI
 
 // -- no allocation after Create ------------------------------------------------------
 
+// Every allocation Create makes (the node array, the engine), refused in
+// turn: kOutOfMemory, and whatever was already allocated is released.
+TEST(ExpiryWheel, CreateFailureAtEveryAllocationLeavesNothingAllocated) {
+  const size_t points = ForEachFailurePoint([](size_t k) {
+    SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
+    const AllocationFaults faults(k);
+    auto wheel = Wheel::Create(1024, 0, 4);
+    if (!faults.injected()) {
+      ASSERT_TRUE(wheel.has_value());
+      ASSERT_NE(kNoExpiry, (*wheel)->Schedule(100, 1));
+      return;
+    }
+    ASSERT_FALSE(wheel.has_value());
+    EXPECT_EQ(ExpiryError::kOutOfMemory, wheel.error());
+    EXPECT_EQ(faults.allocations(), faults.frees() + 1)
+        << "the refused allocation is the only one not freed";
+  });
+  EXPECT_EQ(2u, points) << "the node array and the engine";
+}
+
 TEST(ExpiryWheel, NothingAllocatesAfterCreate) {
   auto wheel = Make<Wheel>(4096, 0);
   std::mt19937_64 rng(3);
   std::vector<ExpiryHandle> handles;
   handles.reserve(4096);
   uint64_t fired = 0;
-  g_allocations = 0;
-  g_count_allocations = true;
+  const AllocationFaults window;
   uint64_t now = 0;
   for (int i = 0; i < 200'000; i++) {
     switch (rng() % 5) {
@@ -1086,8 +1059,7 @@ TEST(ExpiryWheel, NothingAllocatesAfterCreate) {
         wheel->Poll(now, 64, [&](const uint64_t &) noexcept { fired++; });
     }
   }
-  g_count_allocations = false;
-  EXPECT_EQ(0u, g_allocations.load()) << "a timer operation allocated";
+  EXPECT_EQ(0u, window.allocations()) << "a timer operation allocated";
   EXPECT_GT(fired, 0u);
 }
 

@@ -10,10 +10,14 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <random>
+#include <string>
 #include <vector>
+
+#include "testing/allocation_faults.h"
 
 namespace bess::l2 {
 namespace {
@@ -289,6 +293,152 @@ TEST(FdbTest, DifferentialAgainstLegacyBridgeSemantics) {
   // Both paths were exercised.
   EXPECT_GT(forwarded, 1000);
   EXPECT_GT(flooded, 1000);
+}
+
+// -- allocation failure ------------------------------------------------------------
+
+using fault_injection::AllocationFaults;
+using fault_injection::ForEachFailurePoint;
+
+// Every operator-new allocation Create makes (the wheel's nodes and object,
+// the MAC table object, the FDB and its flood groups), refused in turn:
+// Create returns kOutOfMemory -- it does not throw -- and leaves nothing
+// allocated. (The MAC table's arrays come from malloc, out of the window's
+// sight; ASan's leak check covers them.)
+TEST(FdbFaultTest, CreateFailureAtEveryAllocationReturnsOutOfMemoryAndLeaksNothing) {
+  Fdb::Config c;
+  c.capacity = 256;
+  c.max_domains = 64;
+  c.granularity_shift = 0;
+  const size_t points = ForEachFailurePoint([&](size_t k) {
+    SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
+    bool threw = false, injected = false;
+    size_t allocations = 0, frees = 0;
+    {
+      const AllocationFaults faults(k);
+      try {
+        auto fdb = Fdb::Create(c);
+        if (faults.injected()) {
+          ASSERT_FALSE(fdb.has_value());
+          EXPECT_EQ(Fdb::CreateError::kOutOfMemory, fdb.error());
+        } else {
+          ASSERT_TRUE(fdb.has_value());
+          EXPECT_EQ(LearnResult::kLearned, (*fdb)->Learn(kD0, Mac(1), InterfaceId(1), 0));
+        }
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+      injected = faults.injected();
+      allocations = faults.allocations();
+      frees = faults.frees();
+    }
+    EXPECT_FALSE(threw) << "Create threw instead of returning kOutOfMemory";
+    if (injected) {
+      EXPECT_EQ(allocations, frees + 1) << "the refused allocation is the only one not freed";
+    } else {
+      EXPECT_EQ(allocations, frees) << "a destroyed FDB left memory behind";
+    }
+  });
+  EXPECT_EQ(5u, points) << "wheel nodes, wheel, MAC table, FDB, flood groups";
+}
+
+// What a caller can observe of an FDB: entries, counts, flood groups.
+std::string FdbState(const Fdb &fdb) {
+  std::string s = std::to_string(fdb.size()) + "/" + std::to_string(fdb.dynamic_entries());
+  for (uint32_t i = 0; i < 8; i++) {
+    s += " " + std::to_string(fdb.Lookup(kD0, Mac(i)).value());
+  }
+  for (uint16_t d = 0; d < 4; d++) {
+    s += " [";
+    for (const InterfaceId m : fdb.FloodGroup(BridgeDomainId(d))) {
+      s += std::to_string(m.value()) + ",";
+    }
+    s += "]";
+  }
+  return s;
+}
+
+// SetFloodGroup allocates the group's storage. Refusing that allocation
+// throws std::bad_alloc and leaves every group -- the one being replaced
+// included -- and every entry as it was; the same call then succeeds.
+TEST(FdbFaultTest, SetFloodGroupFailureAtEveryAllocationLeavesNoTrace) {
+  const std::vector<InterfaceId> bigger = {InterfaceId(1), InterfaceId(2), InterfaceId(3),
+                                           InterfaceId(4), InterfaceId(5), InterfaceId(6)};
+  const size_t points = ForEachFailurePoint([&](size_t k) {
+    SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
+    auto fdb = Make();
+    ASSERT_EQ(LearnResult::kLearned, fdb->Learn(kD0, Mac(1), InterfaceId(2), 0));
+    ASSERT_EQ(ProgramResult::kAdded, fdb->AddStatic(kD0, Mac(2), InterfaceId(3)));
+    const InterfaceId two[] = {InterfaceId(7), InterfaceId(8)};
+    ASSERT_TRUE(fdb->SetFloodGroup(kD1, two));
+    ASSERT_TRUE(fdb->SetFloodGroup(BridgeDomainId(2), two));
+    const std::string before = FdbState(*fdb);
+    bool threw = false, injected = false;
+    {
+      const AllocationFaults faults(k);
+      try {
+        ASSERT_TRUE(fdb->SetFloodGroup(kD1, bigger));
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+      injected = faults.injected();
+    }
+    if (!injected) {
+      ASSERT_FALSE(threw);
+      ASSERT_EQ(bigger.size(), fdb->FloodGroup(kD1).size());
+      return;
+    }
+    ASSERT_TRUE(threw) << "a refused allocation was swallowed";
+    ASSERT_EQ(before, FdbState(*fdb)) << "a failed SetFloodGroup left a trace";
+    ASSERT_TRUE(fdb->SetFloodGroup(kD1, bigger));
+    ASSERT_EQ(bigger.size(), fdb->FloodGroup(kD1).size());
+  });
+  EXPECT_EQ(1u, points);
+}
+
+// Learning, aging, static programming, removal, flush and lookups never
+// allocate: an FDB entry is created in memory Create committed.
+TEST(FdbFaultTest, LearningAndProgrammingAllocateNothing) {
+  auto fdb = Make(64);
+  std::mt19937 rng(5);
+  std::array<FdbKey, 16> keys{};
+  std::array<InterfaceId, 16> out{};
+  size_t learned = 0, full = 0;
+  const AllocationFaults window;
+  Fdb::Tick now = 0;
+  for (int i = 0; i < 50000; i++) {
+    const MacAddress mac = Mac(rng() % 200);
+    const BridgeDomainId domain(static_cast<uint16_t>(rng() % 3));
+    switch (rng() % 6) {
+      case 0:
+      case 1: {
+        const LearnResult r = fdb->Learn(domain, mac, InterfaceId(1 + rng() % 8), now);
+        learned += r == LearnResult::kLearned;
+        full += r == LearnResult::kFull;
+        break;
+      }
+      case 2:
+        (void)fdb->AddStatic(domain, mac, InterfaceId(9));
+        break;
+      case 3:
+        (void)fdb->Remove(domain, mac);
+        break;
+      case 4:
+        now += rng() % 300;
+        (void)fdb->Age(now, 64);
+        break;
+      default:
+        if (rng() % 64 == 0) {
+          fdb->Flush(rng() % 2 == 0);
+        }
+    }
+    keys[i % keys.size()] = MakeKey(domain, mac);
+    (void)fdb->Lookup(domain, mac);
+    (void)fdb->LookupBatch(keys, out);
+  }
+  EXPECT_EQ(0u, window.allocations()) << "an FDB operation allocated";
+  EXPECT_GT(learned, 1000u);
+  EXPECT_GT(full, 0u) << "the full-table refusal was not exercised";
 }
 
 }  // namespace
