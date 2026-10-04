@@ -27,6 +27,22 @@ equal that table (`tools/check_installed_headers.py`, run on the staged
 install in CI), so a header cannot be installed without being classified or
 classified without being installed. Promoting a header is a recorded decision.
 
+The same check compiles a set of twins against the staged install, each a line
+that must compile and one that must not, with the compiler's diagnostic
+matched (M23): strong ids (`ActionId`, `NextHopId`, `NextHopGroupId`,
+`WorkerId`, `MeterId`, `ScopeId`, `InterfaceId`, `BridgeDomainId`,
+`RouteDomainId`) never convert to an integer or to each other, nor compare
+across kinds; generation handles of different kinds do not convert; a flow
+key must be trivially copyable (`FixedFlowKey`), and a padded one needs its
+own hash and equality (`FlowKeyOps`); an expiry payload must be trivially
+copyable. A new id type or concept gets a twin in `NEGATIVE_CASES`.
+
+CI then builds `examples/standalone_plugin` from the staged `bess-dev` alone (a
+copy of `bess-dev.pc` whose prefix is the stage, so a BESS already installed on
+the machine cannot supply a header), loads every plugin into the staged
+`bessd`, and runs packets through each through the installed Python client
+(`tools/check_standalone_plugins.py`).
+
 - `framework/plugin.h` defines the versioned `bess_plugin_descriptor_v1` C
   ABI (below). `ADD_MODULE` remains the module registration mechanism.
 

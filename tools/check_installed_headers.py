@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import posixpath
 import shlex
@@ -146,6 +147,95 @@ def machine_flag_problems(cflags, march=None):
         return [f"bess-dev cflags carry {machine or 'no -march'}; bessd was built "
                 f"with cpu={march!r}"]
     return []
+
+
+# Compile-time negative tests against the installed SDK (M23). Each case is a
+# twin: `good` must compile, `bad` (one line different) must not, and the
+# compiler's message must match `diagnostic` (GCC's and Clang's wording both),
+# so a bad twin cannot pass by failing for an unrelated reason.
+NEGATIVE_PRELUDE = """\
+#include <cstdint>
+#include <string>
+#include "dataplane/action_id.h"
+#include "dataplane/continuation.h"
+#include "dataplane/expiry_wheel.h"
+#include "dataplane/interface_id.h"
+#include "dataplane/scope.h"
+#include "dataplane/worker_id.h"
+#include "flow/flow_types.h"
+#include "flow/worker_flow_table.h"
+#include "l2/fdb.h"
+#include "meter/meter.h"
+#include "route/next_hop_id.h"
+#include "route/route_domain.h"
+using namespace bess::dataplane;
+namespace flow = bess::flow;
+namespace route = bess::route;
+struct PaddedKey { uint8_t a; uint32_t b; };
+"""
+
+_CONVERSION = r"conversion|convert"
+_COMPARE = r"operator==|invalid operands"
+
+NEGATIVE_CASES = [
+    # (name, good, bad, diagnostic)
+    ("an integer does not become an ActionId",
+     "ActionId a{3u};", "ActionId a = 3u;", _CONVERSION),
+    ("an ActionId does not become an integer",
+     "uint32_t v = ActionId{3u}.value();", "uint32_t v = ActionId{3u};", _CONVERSION),
+    ("a NextHopId does not become an ActionId",
+     "ActionId a{route::NextHopId{1u}.value()};", "ActionId a = route::NextHopId{1u};", _CONVERSION),
+    ("a NextHopGroupId does not become a NextHopId",
+     "route::NextHopId h{route::NextHopGroupId{1u}.value()};",
+     "route::NextHopId h = route::NextHopGroupId{1u};", _CONVERSION),
+    ("ids of different kinds do not compare",
+     "bool b = ActionId{1u} == ActionId{1u};", "bool b = ActionId{1u} == route::NextHopId{1u};", _COMPARE),
+    ("an integer does not become a WorkerId",
+     "WorkerId w{uint16_t{1}};", "WorkerId w = uint16_t{1};", _CONVERSION),
+    ("a ScopeId does not become a MeterId",
+     "bess::meter::MeterId m{ScopeId{1u}.value()};", "bess::meter::MeterId m = ScopeId{1u};", _CONVERSION),
+    ("an InterfaceId does not become a BridgeDomainId",
+     "bess::l2::BridgeDomainId d{InterfaceId{uint16_t{1}}.value()};",
+     "bess::l2::BridgeDomainId d = InterfaceId{uint16_t{1}};", _CONVERSION),
+    ("a NextHopId does not become a RouteDomainId",
+     "route::RouteDomainId d{route::NextHopId{1u}.value()};",
+     "route::RouteDomainId d = route::NextHopId{1u};", _CONVERSION),
+    ("a FlowHandle does not become an ExpiryHandle",
+     "ExpiryHandle e = ExpiryHandle{};", "ExpiryHandle e = flow::FlowHandle{};", _CONVERSION),
+    ("a ContinuationHandle does not become a FlowHandle",
+     "flow::FlowHandle h = flow::FlowHandle{};", "flow::FlowHandle h = ContinuationHandle{};", _CONVERSION),
+    ("a flow key must be trivially copyable (FixedFlowKey)",
+     "using T = flow::WorkerFlowTable<uint64_t, int>; T *t = nullptr;",
+     "using T = flow::WorkerFlowTable<std::string, int>; T *t = nullptr;", r"FixedFlowKey"),
+    ("a padded key needs a hash and an equality (FlowKeyOps)",
+     "using T = flow::WorkerFlowTable<uint64_t, int>; T *t = nullptr;",
+     "using T = flow::WorkerFlowTable<PaddedKey, int>; T *t = nullptr;", r"FlowKeyOps|ByteHashableFlowKey"),
+    ("an expiry payload must be trivially copyable",
+     "using W = ExpiryWheel<uint64_t>; W *w = nullptr;",
+     "using W = ExpiryWheel<std::string>; W *w = nullptr;", r"trivially_copyable|constraints"),
+]
+
+
+def negative_compile_problems(base_cmd, tempdir: Path):
+    """Problems with NEGATIVE_CASES under `base_cmd` (a compiler command line
+    ending before the source file); empty when every twin behaves."""
+    problems = []
+    for index, (name, good, bad, diagnostic) in enumerate(NEGATIVE_CASES):
+        results = {}
+        for twin, line in (("good", good), ("bad", bad)):
+            src = Path(tempdir) / f"negative_{index}_{twin}.cc"
+            src.write_text(NEGATIVE_PRELUDE + "[[maybe_unused]] static void f() {\n  "
+                           + line + "\n}\n")
+            results[twin] = subprocess.run([*base_cmd, str(src)], capture_output=True, text=True)
+        if results["good"].returncode != 0:
+            problems.append(f"{name}: the good twin does not compile (harness bug):\n"
+                            f"{results['good'].stderr[-1500:]}")
+        elif results["bad"].returncode == 0:
+            problems.append(f"{name}: compiles, and must not: {bad}")
+        elif not re.search(diagnostic, results["bad"].stderr):
+            problems.append(f"{name}: fails, but not with /{diagnostic}/:\n"
+                            f"{results['bad'].stderr[-1500:]}")
+    return problems
 
 
 def verify_headers(include_dir: Path, march=None):
@@ -310,6 +400,14 @@ ADD_MODULE(TestModule, "test_module", "installed-header conformance module")
                 f"plugin code:\n{ctx_result.stderr}"
             )
         print("  OK: ModuleInitContext::ProcessDefault() is not callable by authors.")
+
+        # -Werror stays off: an unused variable in a twin is not the point.
+        syntax_cmd = [arg for arg in cmd[: cmd.index("-c")] if arg != "-Werror"] + ["-fsyntax-only"]
+        problems = negative_compile_problems(syntax_cmd, Path(tempdir))
+        if problems:
+            raise RuntimeError("compile-time negative tests:\n  " + "\n  ".join(problems))
+        print(f"  OK: {len(NEGATIVE_CASES)} compile-time negative tests: each bad twin fails "
+              "with its diagnostic, each good twin compiles.")
 
 
 def run_self_test():
