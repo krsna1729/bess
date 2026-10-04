@@ -1,0 +1,27 @@
+# ThreadSanitizer lane (tools/ci_profile.py test --sanitize thread; M22, D-072):
+# the tests that run threads against each other, one per line:
+#   <test binary> [gtest filter]
+# Binaries that link core/testing/allocation_faults exclude its fault-injection
+# cases: TSan's runtime owns operator new, so those cannot inject (D-072).
+# Not listed, single-owner by contract (no cross-thread surface to test):
+# FDB (l2/fdb.h), neighbor table (route/neighbor_table.h), expiry wheel,
+# offload FlowRuleOwner, instance registry. Their publication goes through the
+# RCU, Router and transaction tests below.
+rcu_rcu_test
+rcu_rcu_ptr_test
+dataplane_object_table_publication_test
+dataplane_scope_snapshot_test
+dataplane_transaction_engine_test -*Failure*:*Fault*:*Allocat*:*LeavesNoTrace*:*AllocatesNothing*
+dataplane_transaction_lifecycle_test -*Failure*:*Fault*:*Allocat*:*LeavesNoTrace*:*AllocatesNothing*
+dataplane_handoff_threads_test
+dataplane_continuation_test -*Failure*:*Fault*:*Allocat*:*LeavesNoTrace*:*AllocatesNothing*
+flow_shared_flow_table_test -*Failure*:*Fault*:*Allocat*:*LeavesNoTrace*:*AllocatesNothing*
+flow_decision_cache_test
+flow_reference_apps_test
+stats_stats_test
+modules_l2_table_test
+route_route_test
+route_route_domain_test
+route_router_transaction_test -*Failure*:*Fault*:*Allocat*:*LeavesNoTrace*:*AllocatesNothing*
+classifier_concurrent_exact_test
+utils_mcslock_test

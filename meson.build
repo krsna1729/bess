@@ -20,6 +20,14 @@ endif
 
 
 cpp = meson.get_compiler('cpp')
+
+# protobuf's headers switch generated messages to a different global layout
+# under AddressSanitizer; the system libprotobuf is not built that way, so
+# descriptors come back null (Any::PackFrom crashes in TypeId::name). Every
+# ASan build therefore compiles with the opt-out (M22, D-072).
+if get_option('b_sanitize').contains('address')
+  add_project_arguments('-DPROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT', language: 'cpp')
+endif
 python = import('python').find_installation('python3')
 fs = import('fs')
 

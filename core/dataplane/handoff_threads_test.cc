@@ -32,8 +32,9 @@
 #include "dataplane/continuation.h"
 #include "packet.h"
 #include "packet_pool.h"
+#include "utils/sanitizers.h"
 
-#if defined(__SANITIZE_THREAD__)
+#if BESS_THREAD_SANITIZER
 // The packet pool recycles mbufs through DPDK's uninstrumented mempool code, so
 // ThreadSanitizer cannot see that a free happens-before the next allocation of
 // the same buffer. These tell it.
@@ -130,7 +131,7 @@ class Env {
 
   // nullptr when the pool is empty.
   PacketHandle Alloc(uint64_t tag) {
-#if defined(__SANITIZE_THREAD__)
+#if BESS_THREAD_SANITIZER
     // rte_pktmbuf_alloc split in two so that the acquire sits between the pool's
     // get (uninstrumented library code) and the reset (instrumented inline code).
     void *object = nullptr;
@@ -158,7 +159,7 @@ class Env {
     return tag;
   }
   void Free(PacketHandle packet) {
-#if defined(__SANITIZE_THREAD__)
+#if BESS_THREAD_SANITIZER
     // rte_pktmbuf_free split the same way: the release follows the instrumented
     // prefree (refcount, next, nb_segs) and precedes the pool's put.
     rte_mempool *pool = packet->pool;

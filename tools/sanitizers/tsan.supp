@@ -1,0 +1,22 @@
+# ThreadSanitizer suppressions (M22, D-072). Each entry names code TSan cannot
+# see the synchronisation of, with the reason. Keep this list short.
+#
+# rte_hash's lock-free lookup pairs its key compare with a version counter
+# read in DPDK code built without TSan instrumentation; TSan sees only the
+# BESS-side compare of the key bytes (decisions.md, M9 TSan run).
+race:CmpFixed
+# rte_ring (DPDK 25.11): element copies are ordered by the head/tail protocol
+# through relaxed loads and standalone fences (a consumer after the producer,
+# a producer after the consumer that freed the slot), which ThreadSanitizer
+# does not model; it reports the copies themselves. The handoff channel's own
+# counters, ownership and packets stay instrumented.
+race:__rte_ring_dequeue_elems
+race:__rte_ring_enqueue_elems
+# rte_lpm: a tbl8 group is reused only after a grace period, ordered by the
+# QSBR defer queue inside librte_lpm (uninstrumented); TSan sees the group's
+# re-initialising memset and an inline lookup's read, not the grace period
+# between them. The route tests check every concurrent answer (D-046, D-047).
+# Suppressed by the writer (the tbl8 group's re-initialisation in librte_lpm),
+# not the inline reader: a race of any other writer against a FIB lookup --
+# a BESS table freed or reset under readers -- is still reported.
+race:add_depth_big

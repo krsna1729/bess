@@ -1,0 +1,317 @@
+{
+  "_comment": [
+    "clang-tidy findings (.clang-tidy profile) that predate the M22 gate (D-072).",
+    "tools/check_tidy.py fails on any count above or below an entry, so this list only shrinks.",
+    "Edited by hand and reviewed; `tools/check_tidy.py --report` prints the current counts.",
+    "Counts are those of one clang-tidy major version (clang_tidy_major): CI's pin; another version's",
+    "findings differ, so the gate compares only with that version and otherwise reports."
+  ],
+  "clang_tidy_major": 19,
+  "files": {
+    "core/bessctl.cc": {
+      "bugprone-unused-return-value": 3,
+      "cppcoreguidelines-narrowing-conversions": 6
+    },
+    "core/bessd.cc": {
+      "cert-err33-c": 2,
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/classifier/concurrent_exact.cc": {
+      "performance-no-int-to-ptr": 2
+    },
+    "core/control/control_plane.cc": {
+      "bugprone-unused-return-value": 1,
+      "cppcoreguidelines-narrowing-conversions": 7
+    },
+    "core/control/pipeline_snapshot.cc": {
+      "bugprone-too-small-loop-variable": 1
+    },
+    "core/dataplane/batch_tuning.h": {
+      "bugprone-implicit-widening-of-multiplication-result": 3
+    },
+    "core/dataplane/handoff.h": {
+      "bugprone-implicit-widening-of-multiplication-result": 1
+    },
+    "core/dataplane/member_select.h": {
+      "bugprone-exception-escape": 3
+    },
+    "core/dataplane/transaction_engine.cc": {
+      "cert-err33-c": 1,
+      "performance-inefficient-string-concatenation": 2
+    },
+    "core/debug.cc": {
+      "bugprone-empty-catch": 1,
+      "cert-err33-c": 1,
+      "performance-no-int-to-ptr": 1
+    },
+    "core/drivers/pcap.cc": {
+      "performance-unnecessary-copy-initialization": 1
+    },
+    "core/drivers/unix_socket.cc": {
+      "cert-err33-c": 2,
+      "performance-unnecessary-copy-initialization": 1
+    },
+    "core/framework/exact_match_table.h": {
+      "bugprone-assignment-in-if-condition": 2,
+      "bugprone-implicit-widening-of-multiplication-result": 1,
+      "misc-redundant-expression": 1
+    },
+    "core/framework/plugin_check.cc": {
+      "cert-err33-c": 4
+    },
+    "core/framework/plugin_loader.cc": {
+      "performance-inefficient-vector-operation": 1
+    },
+    "core/gate.cc": {
+      "performance-unnecessary-copy-initialization": 1
+    },
+    "core/gate.h": {
+      "performance-unnecessary-value-param": 2
+    },
+    "core/gate_hooks/pcapng.cc": {
+      "cppcoreguidelines-narrowing-conversions": 4
+    },
+    "core/gate_hooks/tcpdump.cc": {
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/metadata.cc": {
+      "cppcoreguidelines-narrowing-conversions": 12
+    },
+    "core/metadata.h": {
+      "performance-unnecessary-value-param": 1
+    },
+    "core/meter/meter_set.cc": {
+      "bugprone-unchecked-optional-access": 1
+    },
+    "core/module.cc": {
+      "bugprone-assignment-in-if-condition": 1,
+      "cppcoreguidelines-narrowing-conversions": 4
+    },
+    "core/module.h": {
+      "bugprone-fold-init-type": 1,
+      "cppcoreguidelines-narrowing-conversions": 1,
+      "performance-no-int-to-ptr": 1,
+      "performance-unnecessary-value-param": 2
+    },
+    "core/module_graph.cc": {
+      "performance-unnecessary-copy-initialization": 2
+    },
+    "core/modules/bpf.cc": {
+      "cppcoreguidelines-narrowing-conversions": 4
+    },
+    "core/modules/buffer.cc": {
+      "bugprone-multi-level-implicit-pointer-conversion": 4,
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/modules/drr.cc": {
+      "bugprone-implicit-widening-of-multiplication-result": 2
+    },
+    "core/modules/dump.cc": {
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/modules/exact_match.cc": {
+      "bugprone-signed-char-misuse": 1,
+      "cert-str34-c": 1,
+      "cppcoreguidelines-narrowing-conversions": 2,
+      "performance-unnecessary-copy-initialization": 1
+    },
+    "core/modules/flowgen.cc": {
+      "bugprone-implicit-widening-of-multiplication-result": 1,
+      "bugprone-integer-division": 1,
+      "cppcoreguidelines-narrowing-conversions": 8
+    },
+    "core/modules/generic_decap.cc": {
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/modules/generic_encap.cc": {
+      "bugprone-implicit-widening-of-multiplication-result": 1,
+      "cppcoreguidelines-narrowing-conversions": 2
+    },
+    "core/modules/hash_lb.cc": {
+      "cppcoreguidelines-narrowing-conversions": 2
+    },
+    "core/modules/l2_forward.cc": {
+      "bugprone-implicit-widening-of-multiplication-result": 1,
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/modules/l2_table.h": {
+      "clang-analyzer-core.uninitialized.Assign": 1,
+      "cppcoreguidelines-narrowing-conversions": 11
+    },
+    "core/modules/measure.cc": {
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/modules/mttest.cc": {
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/modules/port_inc.cc": {
+      "bugprone-implicit-widening-of-multiplication-result": 1,
+      "cppcoreguidelines-narrowing-conversions": 1,
+      "performance-no-int-to-ptr": 1
+    },
+    "core/modules/queue.cc": {
+      "bugprone-implicit-widening-of-multiplication-result": 1,
+      "cppcoreguidelines-narrowing-conversions": 3
+    },
+    "core/modules/queue_inc.cc": {
+      "bugprone-implicit-widening-of-multiplication-result": 1,
+      "cppcoreguidelines-narrowing-conversions": 1,
+      "performance-no-int-to-ptr": 1
+    },
+    "core/modules/round_robin.cc": {
+      "cppcoreguidelines-narrowing-conversions": 2
+    },
+    "core/modules/set_metadata.cc": {
+      "cppcoreguidelines-narrowing-conversions": 2
+    },
+    "core/modules/source.cc": {
+      "bugprone-implicit-widening-of-multiplication-result": 1,
+      "cppcoreguidelines-narrowing-conversions": 4
+    },
+    "core/modules/split.cc": {
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/modules/update.cc": {
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/modules/vlan_push.cc": {
+      "bugprone-assignment-in-if-condition": 1
+    },
+    "core/modules/wildcard_match.cc": {
+      "bugprone-signed-char-misuse": 1,
+      "cert-str34-c": 1,
+      "cppcoreguidelines-narrowing-conversions": 2
+    },
+    "core/modules/worker_split.cc": {
+      "performance-for-range-copy": 1
+    },
+    "core/packet_checksum.cc": {
+      "bugprone-unchecked-optional-access": 2
+    },
+    "core/pktbatch.h": {
+      "bugprone-multi-level-implicit-pointer-conversion": 4,
+      "misc-redundant-expression": 1
+    },
+    "core/port.h": {
+      "cert-int09-c": 1,
+      "performance-unnecessary-value-param": 2
+    },
+    "core/resume_hook.h": {
+      "performance-unnecessary-value-param": 2
+    },
+    "core/route/route_table.cc": {
+      "cert-err33-c": 1
+    },
+    "core/route/router.cc": {
+      "performance-unnecessary-value-param": 1
+    },
+    "core/runtime/dpdk.cc": {
+      "cert-err33-c": 1,
+      "cppcoreguidelines-narrowing-conversions": 4,
+      "performance-unnecessary-value-param": 1
+    },
+    "core/runtime/memory.cc": {
+      "cppcoreguidelines-narrowing-conversions": 4,
+      "performance-no-int-to-ptr": 3
+    },
+    "core/runtime/memory.h": {
+      "performance-no-int-to-ptr": 1
+    },
+    "core/runtime/runtime_state.cc": {
+      "bugprone-unused-return-value": 2
+    },
+    "core/runtime/startup.cc": {
+      "bugprone-implicit-widening-of-multiplication-result": 2,
+      "performance-inefficient-string-concatenation": 1,
+      "performance-no-automatic-move": 3
+    },
+    "core/runtime/worker_manager.cc": {
+      "bugprone-suspicious-memory-comparison": 1,
+      "cppcoreguidelines-narrowing-conversions": 2
+    },
+    "core/scheduler.h": {
+      "cppcoreguidelines-narrowing-conversions": 2
+    },
+    "core/task.h": {
+      "bugprone-misplaced-widening-cast": 1
+    },
+    "core/traffic_class.cc": {
+      "cppcoreguidelines-narrowing-conversions": 4,
+      "performance-inefficient-vector-operation": 2,
+      "performance-move-const-arg": 1
+    },
+    "core/utils/bpf.cc": {
+      "cppcoreguidelines-narrowing-conversions": 2,
+      "misc-redundant-expression": 1
+    },
+    "core/utils/common.h": {
+      "performance-noexcept-move-constructor": 1
+    },
+    "core/utils/cuckoo_map.h": {
+      "bugprone-assignment-in-if-condition": 2,
+      "bugprone-multi-level-implicit-pointer-conversion": 2,
+      "bugprone-use-after-move": 3,
+      "cppcoreguidelines-narrowing-conversions": 2,
+      "performance-move-const-arg": 1
+    },
+    "core/utils/endian.h": {
+      "misc-redundant-expression": 3
+    },
+    "core/utils/ether.h": {
+      "misc-redundant-expression": 3
+    },
+    "core/utils/fifo_opener.h": {
+      "cppcoreguidelines-virtual-class-destructor": 1
+    },
+    "core/utils/http_parser.cc": {
+      "bugprone-assignment-in-if-condition": 10,
+      "bugprone-implicit-widening-of-multiplication-result": 3,
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/utils/ip.h": {
+      "misc-redundant-expression": 1
+    },
+    "core/utils/pcap_handle.cc": {
+      "cppcoreguidelines-narrowing-conversions": 1,
+      "performance-noexcept-move-constructor": 2
+    },
+    "core/utils/pcap_handle.h": {
+      "performance-noexcept-move-constructor": 2
+    },
+    "core/utils/random.h": {
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/utils/rte_ring_alloc.h": {
+      "cert-err33-c": 1
+    },
+    "core/utils/stacktrace.cc": {
+      "bugprone-multi-level-implicit-pointer-conversion": 1,
+      "cppcoreguidelines-narrowing-conversions": 1,
+      "performance-no-int-to-ptr": 2,
+      "performance-unnecessary-value-param": 3
+    },
+    "core/utils/syscallthread.cc": {
+      "bugprone-implicit-widening-of-multiplication-result": 1
+    },
+    "core/utils/tcp.h": {
+      "misc-redundant-expression": 1
+    },
+    "core/utils/tcp_flow_reconstruct.h": {
+      "bugprone-implicit-widening-of-multiplication-result": 3
+    },
+    "core/utils/time.h": {
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/utils/trie.h": {
+      "bugprone-signed-char-misuse": 4,
+      "cert-str34-c": 4,
+      "cppcoreguidelines-narrowing-conversions": 1
+    },
+    "core/utils/udp.h": {
+      "misc-redundant-expression": 1
+    },
+    "core/worker.cc": {
+      "cppcoreguidelines-narrowing-conversions": 2
+    }
+  }
+}

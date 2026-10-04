@@ -3,13 +3,17 @@
 #include "flow/shared_flow_table.h"
 
 #include <gtest/gtest.h>
+#include <rte_malloc.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <expected>
 #include <functional>
 #include <map>
+#include <new>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -18,9 +22,13 @@
 #include <vector>
 
 #include "rcu/rcu_domain.h"
+#include "testing/allocation_faults.h"
 
 namespace bess::flow {
 namespace {
+
+using fault_injection::AllocationFaults;
+using fault_injection::ForEachFailurePoint;
 
 // More than rte_hash's eight-byte value, poisoned on destruction so a reader
 // that meets a State after its destructor ran is caught.
@@ -370,6 +378,112 @@ TEST_F(SharedFlowTableTest, ConstructionFailureLeavesNothingAllocated) {
     ASSERT_TRUE((*table)->Emplace(1, 1).created());
   }
   EXPECT_EQ(0, FailingAllocator::live);
+}
+
+// Bytes allocated from the DPDK heap, every socket (the directory lives there,
+// out of the allocation window's sight).
+size_t DpdkHeapBytes() {
+  size_t total = 0;
+  for (int socket = 0; socket < RTE_MAX_NUMA_NODES; socket++) {
+    rte_malloc_socket_stats stats{};
+    if (rte_malloc_get_socket_stats(socket, &stats) == 0) {
+      total += stats.heap_allocsz_bytes;
+    }
+  }
+  return total;
+}
+
+// Every operator-new allocation Create makes (the directory's wrapper, the
+// three blocks, the table object), refused in turn: Create fails -- with an
+// error or std::bad_alloc -- and leaves nothing allocated, on the C++ heap or
+// in the DPDK heap that holds the directory.
+TEST_F(SharedFlowTableTest, CreateFailureAtEveryAllocationLeavesNothingAllocated) {
+  (void)Make<Table>(8);  // the EAL is up before the first window
+  const size_t points = ForEachFailurePoint([&](size_t k) {
+    SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
+    const size_t heap = DpdkHeapBytes();
+    std::expected<std::unique_ptr<AliasTable>, FlowTableError> table =
+        std::unexpected(FlowTableError::kInvalidCapacity);
+    bool threw = false, injected = false;
+    size_t allocations = 0, frees = 0;
+    {
+      const AllocationFaults faults(k);
+      try {
+        table = AliasTable::Create(1000, domain_);
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+      injected = faults.injected();
+      allocations = faults.allocations();
+      frees = faults.frees();
+    }
+    if (!injected) {
+      ASSERT_FALSE(threw);
+      ASSERT_TRUE(table.has_value());
+      ASSERT_TRUE((*table)->Emplace(1, 1).created());
+      return;
+    }
+    if (!threw) {
+      ASSERT_FALSE(table.has_value());
+      EXPECT_TRUE(table.error() == FlowTableError::kOutOfMemory ||
+                  table.error() == FlowTableError::kBackendFailed)
+          << static_cast<int>(table.error());
+    }
+    EXPECT_EQ(allocations, frees + 1) << "the refused allocation is the only one not freed";
+    EXPECT_EQ(heap, DpdkHeapBytes()) << "the directory was left in the DPDK heap";
+  });
+  EXPECT_GE(points, 4u);
+}
+
+// Flow creation allocates nothing: after Create, creating, aliasing, finding,
+// erasing (with reclamation) and refusing flows on a full table only use the
+// memory Create committed.
+TEST_F(SharedFlowTableTest, CreatingFlowsAllocatesNothing) {
+  auto t = Make<AliasTable>(64);
+  std::mt19937_64 rng(11);
+  std::vector<FlowHandle> live;
+  live.reserve(64);
+  std::array<uint64_t, 8> keys{};
+  std::array<const Big *, 8> found{};
+  size_t created = 0, refused = 0;
+  const AllocationFaults window;
+  for (int i = 0; i < 20000; i++) {
+    const uint64_t key = rng() % 512;
+    switch (rng() % 4) {
+      case 0:
+      case 1: {
+        auto made = rng() % 2 ? t->Emplace(key, key) : t->EmplaceAliased(key, key + 1000, key);
+        if (made.created()) {
+          live.push_back(made.handle);
+          created++;
+        } else if (made.status == EmplaceStatus::kFull) {
+          refused++;
+        }
+        break;
+      }
+      case 2:
+        if (!live.empty()) {
+          (void)t->AddAlias(live[rng() % live.size()], key + 2000);
+        }
+        break;
+      default:
+        if (!live.empty()) {
+          const size_t j = rng() % live.size();
+          (void)t->Erase(live[j]);
+          live[j] = live.back();
+          live.pop_back();
+        }
+    }
+    keys[i % keys.size()] = key;
+    (void)t->Find(key);
+    (void)t->PeekBatch(keys, found);
+    if (i % 64 == 0) {
+      (void)t->Reclaim();
+    }
+  }
+  EXPECT_EQ(0u, window.allocations()) << "a flow operation allocated";
+  EXPECT_GT(created, 1000u);
+  EXPECT_GT(refused, 0u) << "the full-table refusal was not exercised";
 }
 
 TEST_F(SharedFlowTableTest, CreateRejectsWhatTheDirectoryCannotHold) {

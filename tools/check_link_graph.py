@@ -106,14 +106,35 @@ def find_cycles(edges, exceptions):
     return cycles
 
 
+def ubsan_build(build_dir):
+    """Whether the build directory was configured with UBSan (b_sanitize)."""
+    info = Path(build_dir) / "meson-info" / "intro-buildoptions.json"
+    if not info.exists():
+        return False
+    for option in json.loads(info.read_text()):
+        if option.get("name") == "b_sanitize":
+            value = option.get("value")
+            values = value if isinstance(value, list) else str(value).split(",")
+            return "undefined" in values
+    return False
+
+
 def load_libs(build_dir):
     libs = {}
     patterns = ["core/libbess_*.a", "protobuf/libbess_proto.a"]
+    # UBSan's vptr check makes code reference the typeinfo (_ZTI*) of every
+    # polymorphic type it handles, defined where the type's key function is:
+    # instrumentation, not a dependency (a dynamic_cast or typeid of a
+    # higher-layer type needs its header, which check_includes.py forbids).
+    skip_typeinfo = ubsan_build(build_dir)
     for pattern in patterns:
         for archive in sorted(glob.glob(str(Path(build_dir) / pattern))):
             name = lib_name(archive)
             if name:
-                libs[name] = archive_symbols(archive)
+                defined, undefined = archive_symbols(archive)
+                if skip_typeinfo:
+                    undefined = {s for s in undefined if not s.startswith("_ZTI")}
+                libs[name] = (defined, undefined)
     return libs
 
 
@@ -197,8 +218,16 @@ def main():
     for name in unknown:
         print(f"ERROR: library {name} is not in the allowlisted DAG ({DAG_FILE.name})")
     for a, b, n in violations:
+        owned = libs[b][0]
+        symbols = sorted(s for s in libs[a][1] if s in owned)
+        try:
+            shown = subprocess.run(["c++filt"], input="\n".join(symbols[:5]), capture_output=True,
+                                   text=True).stdout.split("\n") if symbols else []
+        except OSError:  # no c++filt: the mangled names still say enough
+            shown = symbols[:5]
         print(f"ERROR: forbidden link edge {a} -> {b} ({n} symbols) "
-              f"is in neither 'allowed' nor 'exceptions'")
+              f"is in neither 'allowed' nor 'exceptions'; first: "
+              + "; ".join(s for s in shown if s))
     for cycle in cycles:
         print("ERROR: dependency cycle outside the exceptions: " + " -> ".join(cycle))
     for a, b in stale:

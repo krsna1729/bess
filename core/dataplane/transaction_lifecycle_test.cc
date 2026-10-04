@@ -15,7 +15,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -29,34 +28,7 @@
 #include "runtime/runtime_state.h"
 #include "dataplane/slot_resource.h"
 #include "dataplane/strong_id.h"
-
-// Allocation-failure injection: with g_fail_countdown = k >= 0, the (k+1)-th
-// allocation on this thread throws std::bad_alloc (and the countdown turns
-// itself off). Section 9 fails every allocation Apply() makes, one by one.
-namespace {
-thread_local long g_fail_countdown = -1;
-}  // namespace
-
-// Replacing the global allocation functions pairs malloc with free by design;
-// GCC's -Wmismatched-new-delete does not know these are the replacements.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpragmas"
-#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
-void *operator new(std::size_t n) {
-  if (g_fail_countdown >= 0 && g_fail_countdown-- == 0) {
-    throw std::bad_alloc();
-  }
-  if (void *p = std::malloc(n == 0 ? 1 : n)) {
-    return p;
-  }
-  throw std::bad_alloc();
-}
-void *operator new[](std::size_t n) { return operator new(n); }
-void operator delete(void *p) noexcept { std::free(p); }
-void operator delete[](void *p) noexcept { std::free(p); }
-void operator delete(void *p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
-#pragma GCC diagnostic pop
+#include "testing/allocation_faults.h"
 
 namespace bess::dataplane {
 namespace {
@@ -911,7 +883,9 @@ Op WMet(uint32_t id, uint32_t rate) {
 // the engine's first transaction (no scratch capacity yet), a transaction
 // larger than any before it, and one that starts by advancing a pending
 // removal cascade. Each failure must leave the state exactly as it was, and
-// the same transaction must then apply.
+// the same transaction must then apply. A refusal Apply() absorbs (the
+// nothrow buffer std::stable_sort asks for, and does without) must leave the
+// transaction applied exactly as without it.
 TEST(LifecycleAllocationTest, FailureAtEveryAllocationLeavesNoTrace) {
   enum Setting { kFirstUse, kLarger, kAfterRemovals };
   auto chains = [](uint32_t first, uint32_t n) {
@@ -923,57 +897,73 @@ TEST(LifecycleAllocationTest, FailureAtEveryAllocationLeavesNoTrace) {
     }
     return ops;
   };
-  for (Setting setting : {kFirstUse, kLarger, kAfterRemovals}) {
+  // Brings `w` to the setting and returns the transaction to fail.
+  auto prepare = [&](Setting setting, World &w) {
     std::vector<Op> ops;
-    size_t faults = 0;
-    for (long k = 0;; k++) {
+    if (setting == kLarger) {
+      EXPECT_EQ(w.engine.Apply(chains(1, 1)).outcome,
+                TransactionEngine::Outcome::kApplied);
+      ops = chains(2, 12);  // 36 operations against a scratch sized for 3
+    } else if (setting == kAfterRemovals) {
+      EXPECT_EQ(w.engine.Apply(chains(1, 4)).outcome,
+                TransactionEngine::Outcome::kApplied);
+      // Remove two chains (a cascade over two ranks, pending), re-point a
+      // rule and replace a meter.
+      EXPECT_EQ(w.engine
+                    .Apply(std::vector<Op>{
+                        Op::Erase("rules", EncodeKey(uint64_t{1001})),
+                        Op::Erase("actions", EncodeKey(ActionId(1))),
+                        Op::Erase("meters", EncodeKey(MeterId(1))),
+                        Op::Erase("rules", EncodeKey(uint64_t{1002})),
+                        Op::Erase("actions", EncodeKey(ActionId(2))),
+                        Op::Erase("meters", EncodeKey(MeterId(2)))})
+                    .outcome,
+                TransactionEngine::Outcome::kApplied);
+      ops = chains(5, 3);
+      ops.push_back(WRule(1003, 4));
+      ops.push_back(WMet(3, 31));
+      ops.push_back(Op::Erase("rules", EncodeKey(uint64_t{1004})));
+    } else {
+      ops = chains(1, 6);
+    }
+    return ops;
+  };
+  for (Setting setting : {kFirstUse, kLarger, kAfterRemovals}) {
+    std::string applied;
+    {
+      World reference;
+      ASSERT_EQ(reference.engine.Apply(prepare(setting, reference)).outcome,
+                TransactionEngine::Outcome::kApplied);
+      reference.table->ReclaimAll();
+      applied = reference.State();
+    }
+    size_t threw_count = 0;
+    const size_t points = fault_injection::ForEachFailurePoint([&](size_t k) {
       SCOPED_TRACE(testing::Message() << "setting " << setting
                                       << ", failing allocation " << k);
       World w;
-      if (setting == kLarger) {
-        ASSERT_EQ(w.engine.Apply(chains(1, 1)).outcome,
-                  TransactionEngine::Outcome::kApplied);
-        ops = chains(2, 12);  // 36 operations against a scratch sized for 3
-      } else if (setting == kAfterRemovals) {
-        ASSERT_EQ(w.engine.Apply(chains(1, 4)).outcome,
-                  TransactionEngine::Outcome::kApplied);
-        // Remove two chains (a cascade over two ranks, pending), re-point a
-        // rule and replace a meter.
-        ASSERT_EQ(w.engine
-                      .Apply(std::vector<Op>{
-                          Op::Erase("rules", EncodeKey(uint64_t{1001})),
-                          Op::Erase("actions", EncodeKey(ActionId(1))),
-                          Op::Erase("meters", EncodeKey(MeterId(1))),
-                          Op::Erase("rules", EncodeKey(uint64_t{1002})),
-                          Op::Erase("actions", EncodeKey(ActionId(2))),
-                          Op::Erase("meters", EncodeKey(MeterId(2)))})
-                      .outcome,
-                  TransactionEngine::Outcome::kApplied);
-        ops = chains(5, 3);
-        ops.push_back(WRule(1003, 4));
-        ops.push_back(WMet(3, 31));
-        ops.push_back(Op::Erase("rules", EncodeKey(uint64_t{1004})));
-      } else {
-        ops = chains(1, 6);
-      }
+      const std::vector<Op> ops = prepare(setting, w);
+      ASSERT_FALSE(testing::Test::HasFailure());
       const std::string before = w.State();
-      g_fail_countdown = k;
       bool threw = false;
       TransactionEngine::Result r;
-      try {
-        r = w.engine.Apply(ops);
-      } catch (const std::bad_alloc &) {
-        threw = true;
+      {
+        const fault_injection::AllocationFaults window(k);
+        try {
+          r = w.engine.Apply(ops);
+        } catch (const std::bad_alloc &) {
+          threw = true;
+        }
       }
-      const bool fault_fired = g_fail_countdown < 0 && threw;
-      g_fail_countdown = -1;
       if (!threw) {
-        // Every allocation of this Apply() has had its turn to fail.
+        // No allocation was refused (every one has had its turn), or the
+        // refusal was absorbed: applied, as without it.
         ASSERT_EQ(r.outcome, TransactionEngine::Outcome::kApplied);
-        break;
+        w.table->ReclaimAll();
+        ASSERT_EQ(w.State(), applied) << "an absorbed refusal changed the outcome";
+        return;
       }
-      ASSERT_TRUE(fault_fired);
-      faults++;
+      threw_count++;
       ASSERT_FALSE(w.AnyInTransaction()) << "EndTransaction() skipped";
       w.table->ReclaimAll();
       ASSERT_EQ(w.State(), before) << "a failed allocation left a trace";
@@ -981,10 +971,10 @@ TEST(LifecycleAllocationTest, FailureAtEveryAllocationLeavesNoTrace) {
       ASSERT_EQ(w.engine.Apply(ops).outcome,
                 TransactionEngine::Outcome::kApplied);
       ASSERT_FALSE(w.AnyInTransaction()) << "EndTransaction() skipped";
-    }
-    std::printf("setting %d: %zu allocation sites failed in turn\n", setting,
-                faults);
-    EXPECT_GT(faults, 10u);
+    });
+    std::printf("setting %d: %zu failure points, %zu of them thrown\n", setting, points,
+                threw_count);
+    EXPECT_GT(points, 10u);
   }
 }
 

@@ -20,6 +20,10 @@ option('build_benchmarks',
        type: 'boolean',
        value: true,
        description: 'Build benchmark executables')
+option('build_fuzzers',
+       type: 'boolean',
+       value: false,
+       description: 'Build the fuzz harnesses in core/fuzz (libFuzzer with Clang, a corpus replayer with GCC)')
 option('build_sample_plugin',
        type: 'boolean',
        value: true,

@@ -25,117 +25,12 @@
 
 #include "dataplane/expiry_wheel.h"
 #include "dataplane/interface_id.h"
-
-// Allocation counting and failure injection for the table's one allocation
-// (the technique of expiry_wheel_test.cc, with a refusal added): while a
-// window is open every allocation is counted, and the Nth can be made to fail.
-// The nothrow forms the table uses fall back on these throwing ones.
-namespace {
-std::atomic<bool> g_window_open{false};
-std::atomic<size_t> g_allocations{0};
-std::atomic<size_t> g_frees{0};
-std::atomic<int64_t> g_fail_at{-1};
-
-class AllocationWindow {
- public:
-  // fail_at: the 0-based index of the allocation to refuse, or -1.
-  explicit AllocationWindow(int64_t fail_at = -1) {
-    g_allocations = 0;
-    g_frees = 0;
-    g_fail_at = fail_at;
-    g_window_open = true;
-  }
-  ~AllocationWindow() { g_window_open = false; }
-  size_t allocations() const { return g_allocations.load(); }
-  size_t frees() const { return g_frees.load(); }
-};
-
-void *Allocate(std::size_t n, std::size_t align) {
-  if (g_window_open.load(std::memory_order_relaxed)) {
-    const size_t index = g_allocations++;
-    if (static_cast<int64_t>(index) == g_fail_at.load()) {
-      throw std::bad_alloc();
-    }
-  }
-  if (align <= alignof(std::max_align_t)) {
-    if (void *p = std::malloc(n == 0 ? 1 : n)) {
-      return p;
-    }
-  } else if (void *p = std::aligned_alloc(align, (n + align - 1) / align * align)) {
-    return p;
-  }
-  throw std::bad_alloc();
-}
-void Release(void *p) noexcept {
-  if (p != nullptr && g_window_open.load(std::memory_order_relaxed)) {
-    g_frees++;
-  }
-  std::free(p);
-}
-}  // namespace
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpragmas"
-#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
-void *operator new(std::size_t n) { return Allocate(n, 0); }
-void *operator new[](std::size_t n) { return Allocate(n, 0); }
-void *operator new(std::size_t n, std::align_val_t a) {
-  return Allocate(n, static_cast<std::size_t>(a));
-}
-void *operator new[](std::size_t n, std::align_val_t a) {
-  return Allocate(n, static_cast<std::size_t>(a));
-}
-// The nothrow forms are replaced as well. The table allocates with them
-// (`::operator new(n, align, std::nothrow)`, `new (std::nothrow)`), and left to the
-// library they would bypass the counting and the injected refusal and, under
-// AddressSanitizer, hand out memory its own runtime then sees freed by the
-// replaced `operator delete` (alloc-dealloc-mismatch).
-void *operator new(std::size_t n, const std::nothrow_t &) noexcept {
-  try {
-    return Allocate(n, 0);
-  } catch (const std::bad_alloc &) {
-    return nullptr;
-  }
-}
-void *operator new[](std::size_t n, const std::nothrow_t &) noexcept {
-  try {
-    return Allocate(n, 0);
-  } catch (const std::bad_alloc &) {
-    return nullptr;
-  }
-}
-void *operator new(std::size_t n, std::align_val_t a,
-                   const std::nothrow_t &) noexcept {
-  try {
-    return Allocate(n, static_cast<std::size_t>(a));
-  } catch (const std::bad_alloc &) {
-    return nullptr;
-  }
-}
-void *operator new[](std::size_t n, std::align_val_t a,
-                     const std::nothrow_t &) noexcept {
-  try {
-    return Allocate(n, static_cast<std::size_t>(a));
-  } catch (const std::bad_alloc &) {
-    return nullptr;
-  }
-}
-void operator delete(void *p) noexcept { Release(p); }
-void operator delete[](void *p) noexcept { Release(p); }
-void operator delete(void *p, std::size_t) noexcept { Release(p); }
-void operator delete[](void *p, std::size_t) noexcept { Release(p); }
-void operator delete(void *p, std::align_val_t) noexcept { Release(p); }
-void operator delete[](void *p, std::align_val_t) noexcept { Release(p); }
-void operator delete(void *p, std::size_t, std::align_val_t) noexcept {
-  Release(p);
-}
-void operator delete[](void *p, std::size_t, std::align_val_t) noexcept {
-  Release(p);
-}
-#pragma GCC diagnostic pop
+#include "testing/allocation_faults.h"
 
 namespace bess::dataplane {
 namespace {
+
+using fault_injection::AllocationFaults;
 
 struct Hop {
   uint32_t interface;
@@ -493,7 +388,7 @@ TEST(ContinuationTableTest, RandomOperationsMatchAModel) {
 TEST(ContinuationTableTest, NothingAllocatesAfterCreate) {
   auto table = Make(64);
   std::vector<ContinuationHandle> handles(64);
-  const AllocationWindow window;
+  const AllocationFaults window;
   for (int round = 0; round < 50; round++) {
     for (auto &h : handles) {
       h = table->Issue({1, 2});
@@ -512,7 +407,7 @@ TEST(ContinuationTableTest, NothingAllocatesAfterCreate) {
 // with it.
 TEST(ContinuationTableTest, AllocatorRefusalAtCreateIsAnErrorAndLeaksNothing) {
   {
-    const AllocationWindow window(0);  // the slot array
+    const AllocationFaults window(0);  // the slot array
     const auto table = Table::Create(16);
     ASSERT_FALSE(table.has_value());
     EXPECT_EQ(ContinuationError::kOutOfMemory, table.error());
@@ -520,7 +415,7 @@ TEST(ContinuationTableTest, AllocatorRefusalAtCreateIsAnErrorAndLeaksNothing) {
         << "the refused allocation is the only one not freed";
   }
   {
-    const AllocationWindow window(1);  // the table object, after its slots
+    const AllocationFaults window(1);  // the table object, after its slots
     const auto table = Table::Create(16);
     ASSERT_FALSE(table.has_value());
     EXPECT_EQ(ContinuationError::kOutOfMemory, table.error());
@@ -528,7 +423,7 @@ TEST(ContinuationTableTest, AllocatorRefusalAtCreateIsAnErrorAndLeaksNothing) {
     EXPECT_EQ(1u, window.frees()) << "the slot array was released";
   }
   {
-    const AllocationWindow window;
+    const AllocationFaults window;
     {
       auto table = Table::Create(16);
       ASSERT_TRUE(table.has_value());

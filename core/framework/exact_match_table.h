@@ -369,11 +369,13 @@ class ExactMatchTable {
 
       for (size_t j = 0; j < n; j++) {
         uint8_t *k = reinterpret_cast<uint8_t *>(keys[j].u64_arr) + pos;
-
-        *(reinterpret_cast<uint64_t *>(k)) =
-            *(reinterpret_cast<const uint64_t *>(
-                reinterpret_cast<const uint8_t *>(bufs[j]) + offset)) &
-            mask;
+        // memcpy: the field may sit at any offset of the packet or metadata
+        // buffer and at any key position (UBSan, M22); compiles to the same
+        // unaligned 8-byte load and store on x86.
+        uint64_t field;
+        std::memcpy(&field, reinterpret_cast<const uint8_t *>(bufs[j]) + offset, sizeof(field));
+        field &= mask;
+        std::memcpy(k, &field, sizeof(field));
       }
     }
   }

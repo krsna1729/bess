@@ -156,4 +156,32 @@ TEST(EndianTest, Shift) {
   }
 }
 
+// Big-endian fields of packed headers sit at any address (an IPv4 address in
+// an Ethernet frame is 2 mod 4). Reading them must not bind a reference to
+// the misaligned storage; the ASan+UBSan tree aborts here if it does (found
+// by core/fuzz/checksum_plan_fuzz on an std::optional<be16_t> at an odd
+// offset).
+TEST(EndianTest, MisalignedFieldsReadCorrectly) {
+  struct [[gnu::packed]] Fields {
+    uint8_t pad;
+    be16_t b16;
+    be32_t b32;
+    be64_t b64;
+  };
+  alignas(8) unsigned char storage[2 * sizeof(Fields)] = {};
+  for (size_t offset = 0; offset < sizeof(Fields); offset++) {
+    Fields *f = reinterpret_cast<Fields *>(storage + offset);
+    f->b16 = be16_t(0x1234);
+    f->b32 = be32_t(0x12345678);
+    f->b64 = be64_t(0x123456789abcdef0);
+    EXPECT_EQ(0x1234, f->b16.value()) << offset;
+    EXPECT_EQ(0x12345678u, f->b32.value()) << offset;
+    EXPECT_EQ(0x123456789abcdef0u, f->b64.value()) << offset;
+    EXPECT_EQ(0x12, storage[offset + 1]) << offset;  // stored big endian
+    EXPECT_EQ(be32_t(0xedcba987), ~f->b32) << offset;
+    EXPECT_TRUE(f->b16 < be16_t(0x1235)) << offset;
+    EXPECT_EQ(be64_t(0x123456789abcdef1), f->b64 + be64_t(1)) << offset;
+  }
+}
+
 }  // namespace (unnamed)

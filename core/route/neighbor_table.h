@@ -47,43 +47,40 @@ class NeighborTable {
   // Binds next hop `hop` to neighbor `key`, sending from `src_mac` (the
   // interface's address). Returns the NextHop to publish for it now: the
   // neighbor's state and MAC if known, kIncomplete otherwise. Rebinding a hop
-  // moves it.
+  // moves it. Every allocation comes before the first change, so a refused
+  // one (std::bad_alloc) leaves the table as it was, the hop's old binding
+  // included.
   NextHop Bind(NextHopId hop, Key key, const utils::Ethernet::Address &src_mac) {
-    Unbind(hop);
-    auto &entry = neighbors_[key];
-    entry.hops.insert(hop);
-    bindings_[hop] = {key, src_mac};
+    std::set<NextHopId> hop_node{hop};
+    std::map<NextHopId, Binding> binding_node{{hop, Binding{key, src_mac}}};
+    Entry &entry = neighbors_.try_emplace(key).first->second;
+    Unbind(hop, &entry);
+    entry.hops.insert(hop_node.extract(hop_node.begin()));
+    bindings_.insert(binding_node.extract(binding_node.begin()));
     return Make(key, entry.neighbor, src_mac);
   }
 
   // Forgets `hop`'s binding (a neighbor with no hops and never learned is
   // dropped). The next hop itself is the caller's to remove.
-  void Unbind(NextHopId hop) {
-    auto b = bindings_.find(hop);
-    if (b == bindings_.end()) {
-      return;
-    }
-    auto n = neighbors_.find(b->second.key);
-    n->second.hops.erase(hop);
-    if (n->second.hops.empty() && !n->second.learned) {
-      neighbors_.erase(n);
-    }
-    bindings_.erase(b);
-  }
+  void Unbind(NextHopId hop) { Unbind(hop, nullptr); }
 
   // Records what resolution learned about `key`. Returns every bound next hop
-  // with its new object (empty when nothing a next hop carries changed).
+  // with its new object (empty when nothing a next hop carries changed). The
+  // list is built before the neighbor changes, so a refused allocation leaves
+  // it unchanged and a retry still reports every hop.
   Updates Update(Key key, NeighborState state, const utils::Ethernet::Address &mac) {
-    auto &entry = neighbors_[key];
-    entry.learned = true;
-    const bool changed = entry.neighbor.state != state || entry.neighbor.mac != mac;
-    entry.neighbor = {state, mac};
+    // A new entry has no hops: reserving for them does not allocate.
+    Entry &entry = neighbors_.try_emplace(key).first->second;
+    const Neighbor learned{state, mac};
     Updates updates;
-    if (changed) {
+    if (entry.neighbor.state != state || entry.neighbor.mac != mac) {
+      updates.reserve(entry.hops.size());
       for (const NextHopId hop : entry.hops) {
-        updates.emplace_back(hop, Make(key, entry.neighbor, bindings_.at(hop).src_mac));
+        updates.emplace_back(hop, Make(key, learned, bindings_.at(hop).src_mac));
       }
     }
+    entry.learned = true;
+    entry.neighbor = learned;
     return updates;
   }
 
@@ -114,6 +111,21 @@ class NeighborTable {
     hop.dst_mac = n.state == NeighborState::kResolved ? n.mac : utils::Ethernet::Address{};
     hop.src_mac = src_mac;
     return hop;
+  }
+
+  // Unbind, except that `keep` (Bind's target) is not dropped when it is left
+  // empty. Only erases: it cannot fail.
+  void Unbind(NextHopId hop, const Entry *keep) {
+    auto b = bindings_.find(hop);
+    if (b == bindings_.end()) {
+      return;
+    }
+    auto n = neighbors_.find(b->second.key);
+    n->second.hops.erase(hop);
+    if (n->second.hops.empty() && !n->second.learned && &n->second != keep) {
+      neighbors_.erase(n);
+    }
+    bindings_.erase(b);
   }
 
   std::map<Key, Entry> neighbors_;

@@ -18,34 +18,31 @@ constexpr bool is_be_system() {
   return (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__);
 }
 
+// swap() takes its argument by value: BigEndian is packed, so its data_ may
+// sit at any address, and binding a `const T &` to it is a misaligned
+// reference (UB that UBSan's alignment check reports).
 template <typename T>
 class EndianBase {
  public:
-  static constexpr T swap(const T &v);
+  static constexpr T swap(T v);
 };
 
 template <>
 class EndianBase<uint16_t> {
  public:
-  static constexpr uint16_t swap(const uint16_t &v) {
-    return __builtin_bswap16(v);
-  }
+  static constexpr uint16_t swap(uint16_t v) { return __builtin_bswap16(v); }
 };
 
 template <>
 class EndianBase<uint32_t> {
  public:
-  static constexpr uint32_t swap(const uint32_t &v) {
-    return __builtin_bswap32(v);
-  }
+  static constexpr uint32_t swap(uint32_t v) { return __builtin_bswap32(v); }
 };
 
 template <>
 class EndianBase<uint64_t> {
  public:
-  static constexpr uint64_t swap(const uint64_t &v) {
-    return __builtin_bswap64(v);
-  }
+  static constexpr uint64_t swap(uint64_t v) { return __builtin_bswap64(v); }
 };
 
 // NOTE: DO NOT ADD implicit type-conversion, comparison, and operations.

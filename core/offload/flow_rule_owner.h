@@ -135,13 +135,18 @@ class FlowRuleOwner {
       : backend_(backend), config_(config),
         marks_fit_(config.marks == 0 ||
                    uint64_t{config.mark_base} + config.marks - 1 <= UINT32_MAX),
-        slots_(config.max_rules + 1), mark_cookie_(config.marks, kNoCookie) {
+        slots_(config.max_rules + 1), free_marks_(config.marks),
+        mark_cookie_(config.marks, kNoCookie) {
+    free_slots_.reserve(config.max_rules);
     for (uint32_t i = config.max_rules; i >= 1; i--) {
       free_slots_.push_back(i);
     }
     for (uint32_t m = 0; m < config.marks; m++) {
-      free_marks_.push_back(m);
+      free_marks_.PushBack(m);
     }
+    // A MARK is free, on a rule or draining, so the queues never outgrow
+    // config.marks: retiring a rule cannot fail.
+    quarantine_.reserve(config.marks);
   }
 
   // -- install and remove --------------------------------------------------------------
@@ -164,8 +169,7 @@ class FlowRuleOwner {
       if (free_marks_.empty()) {
         return {InstallError::kNoMark, {}, 0, 0};
       }
-      mark = free_marks_.front();
-      free_marks_.pop_front();
+      mark = free_marks_.PopFront();
     }
     const uint32_t index = free_slots_.back();
     free_slots_.pop_back();
@@ -180,7 +184,18 @@ class FlowRuleOwner {
     s.hw = HwHandle{};
     const FlowRuleHandle h{index, s.generation};
     int error = 0;
-    if (!backend_.Submit(port, rule, mark + config_.mark_base, Tag(h), error)) {
+    bool submitted = false;
+    try {
+      submitted = backend_.Submit(port, rule, mark + config_.mark_base, Tag(h), error);
+    } catch (...) {
+      // The handle is free again before the caller sees the exception. The
+      // backend may have thrown after the device took the rule (bookkeeping
+      // after rte_flow_create, say), so the MARK drains on `port` like a
+      // removed rule's: it is not handed out again before NoteDrained(port).
+      Retire(index, /*mark_seen_by_device=*/true);
+      throw;
+    }
+    if (!submitted) {
       s.state = RuleState::kFailed;
       Retire(index, /*mark_seen_by_device=*/false);
       return {InstallError::kRefused, {}, 0, error};
@@ -330,7 +345,7 @@ class FlowRuleOwner {
     drain_epoch_[port]++;
     for (auto it = quarantine_.begin(); it != quarantine_.end();) {
       if (it->port == port && drain_epoch_[port] > it->epoch) {
-        free_marks_.push_back(it->mark);
+        free_marks_.PushBack(it->mark);
         it = quarantine_.erase(it);
       } else {
         ++it;
@@ -428,17 +443,19 @@ class FlowRuleOwner {
   // Starts removing an installed rule. If the device refuses, the rule stays
   // installed with its MARK and hardware handle: the direct caller gets false;
   // a removal started by the owner itself (deferred) is reported through the
-  // next Poll (`report`).
+  // next Poll (`report`). Nothing changes before the step that can fail (a
+  // queue that grows, the backend), so an exception leaves the rule as it was.
   bool StartRemove(uint32_t index, bool report = true) {
     Slot &s = slots_[index];
     if (outstanding_ >= config_.max_outstanding) {
-      s.remove_when_installed = true;  // retried by RetryPendingRemovals
       pending_removals_.push_back(FlowRuleHandle{index, s.generation});
+      s.remove_when_installed = true;  // retried by RetryPendingRemovals
       return true;
     }
-    s.remove_when_installed = false;
     int error = 0;
-    if (!backend_.Remove(s.port, s.hw, Tag({index, s.generation}), error)) {
+    const bool removing = backend_.Remove(s.port, s.hw, Tag({index, s.generation}), error);
+    s.remove_when_installed = false;
+    if (!removing) {
       if (report) {
         reports_.push_back(Completion{FlowRuleHandle{index, s.generation}, RuleState::kInstalled,
                                       s.cookie, error != 0 ? error : -1});
@@ -453,14 +470,14 @@ class FlowRuleOwner {
     return true;
   }
 
-  void Retire(uint32_t index, bool mark_seen_by_device) {
+  void Retire(uint32_t index, bool mark_seen_by_device) noexcept {
     Slot &s = slots_[index];
     if (config_.marks) {
       mark_cookie_[s.mark] = kNoCookie;
       if (mark_seen_by_device) {
         quarantine_.push_back({s.mark, s.port, drain_epoch_[s.port]});
       } else {
-        free_marks_.push_back(s.mark);
+        free_marks_.PushBack(s.mark);
       }
     }
     s.live = false;
@@ -475,22 +492,47 @@ class FlowRuleOwner {
     size_t n = 0;
     while (!pending_removals_.empty() && outstanding_ < config_.max_outstanding) {
       const FlowRuleHandle h = pending_removals_.front();
-      pending_removals_.pop_front();
       Slot *s = Resolve(h);
       if (s != nullptr && s->state == RuleState::kInstalled) {
-        n += StartRemove(h.index) ? 1 : 0;
+        n += StartRemove(h.index) ? 1 : 0;  // on an exception, h stays queued
       }
+      pending_removals_.pop_front();
     }
     return n;
   }
 
  private:
+  // A FIFO of free MARK indices in storage sized once (every MARK is in one
+  // place at a time, so it never overflows): returning a MARK cannot fail.
+  class MarkQueue {
+   public:
+    explicit MarkQueue(uint32_t capacity) : slots_(capacity) {}
+    bool empty() const noexcept { return count_ == 0; }
+    size_t size() const noexcept { return count_; }
+    uint32_t PopFront() noexcept {
+      const uint32_t mark = slots_[head_];
+      head_ = head_ + 1 == slots_.size() ? 0 : head_ + 1;
+      count_--;
+      return mark;
+    }
+    void PushBack(uint32_t mark) noexcept {
+      const size_t tail = head_ + count_;
+      slots_[tail < slots_.size() ? tail : tail - slots_.size()] = mark;
+      count_++;
+    }
+
+   private:
+    std::vector<uint32_t> slots_;
+    size_t head_ = 0;
+    size_t count_ = 0;
+  };
+
   Backend &backend_;
   Config config_;
   bool marks_fit_;  // every MARK value (mark_base + i) fits 32 bits
   std::vector<Slot> slots_;
   std::vector<uint32_t> free_slots_;
-  std::deque<uint32_t> free_marks_;  // FIFO: the longest-free value goes first
+  MarkQueue free_marks_;  // FIFO: the longest-free value goes first
   std::vector<uint64_t> mark_cookie_;
   std::vector<Draining> quarantine_;
   std::deque<FlowRuleHandle> pending_removals_;

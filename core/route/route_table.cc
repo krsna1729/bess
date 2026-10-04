@@ -80,7 +80,10 @@ std::string InstanceName(const std::string &base) {
 
 std::expected<std::unique_ptr<LpmRouteTable::Instance>, RouteError>
 LpmRouteTable::NewInstance(uint32_t default_value) {
+  // Every allocation before rte_lpm_create: a refusal must not leave an
+  // rte_lpm (and its global name) behind.
   const std::string name = InstanceName(name_);
+  auto instance = std::make_unique<Instance>();
   struct rte_lpm_config conf = {};
   conf.max_rules = config_.max_routes;
   conf.number_tbl8s = config_.tbl8_groups;
@@ -98,7 +101,6 @@ LpmRouteTable::NewInstance(uint32_t default_value) {
     return std::unexpected(RouteError::kBackendFailure);
   }
 
-  auto instance = std::make_unique<Instance>();
   instance->lpm = lpm;
   instance->default_value.store(default_value, std::memory_order_relaxed);
   return instance;
@@ -144,12 +146,17 @@ std::expected<void, RouteError> LpmRouteTable::Upsert(Ipv4Prefix prefix,
     default_ = value;
     return {};
   }
+  // The shadow entry first: once rte_lpm has the route, nothing can fail.
+  const auto [rule, inserted] = rules_.try_emplace(prefix, value);
   const int ret = rte_lpm_add(live->lpm, prefix.addr(), prefix.length(), value);
   if (ret != 0) {
+    if (inserted) {
+      rules_.erase(rule);
+    }
     return std::unexpected(ret == -ENOSPC ? RouteError::kTableFull
                                           : RouteError::kBackendFailure);
   }
-  rules_[prefix] = value;
+  rule->second = value;
   return {};
 }
 

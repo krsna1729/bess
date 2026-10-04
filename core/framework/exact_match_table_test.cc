@@ -59,8 +59,10 @@ TEST(EmTableTest, LookupTwoFieldsOneRule) {
   ASSERT_EQ(0, em.AddField(6, 2, 0, 1).first);
   ASSERT_EQ(2, em.num_fields());
   ExactMatchRuleFields rule = {{0x04, 0x03, 0x02, 0x01}, {0x06, 0x05}};
-  uint64_t buf = 0x0506000001020304;
-  ExactMatchKey key = em.MakeKey(&buf);
+  // Every field is read as 8 bytes (the table's contract), so the buffer
+  // extends 8 bytes past the last field's offset.
+  uint64_t buf[2] = {0x0506000001020304, 0};
+  ExactMatchKey key = em.MakeKey(buf);
   ASSERT_EQ(0, em.AddRule(0xBEEF, rule).first);
   uint16_t ret = em.Find(key, 0xDEAD);
   ASSERT_EQ(0xBEEF, ret);
@@ -73,10 +75,11 @@ TEST(EmTableTest, LookupTwoFieldsTwoRules) {
   ASSERT_EQ(2, em.num_fields());
   ExactMatchRuleFields rule1 = {{0x04, 0x03, 0x02, 0x01}, {0x06, 0x05}};
   ExactMatchRuleFields rule2 = {{0x0F, 0x0E, 0x0D, 0x0C}, {0x06, 0x05}};
-  uint64_t buf1 = 0x0506000001020304;
-  uint64_t buf2 = 0x050600000C0D0E0F;
-  uint64_t bad_buf = 0xBAD;
-  const void *bufs[3] = {&buf1, &buf2, &bad_buf};
+  // Each field is read as 8 bytes: padded past the last field's offset.
+  uint64_t buf1[2] = {0x0506000001020304, 0};
+  uint64_t buf2[2] = {0x050600000C0D0E0F, 0};
+  uint64_t bad_buf[2] = {0xBAD, 0};
+  const void *bufs[3] = {buf1, buf2, bad_buf};
   ExactMatchKey keys[3];
   em.MakeKeys(bufs, keys, 3);
   ASSERT_EQ(0, em.AddRule(0xF00, rule1).first);
@@ -93,6 +96,7 @@ TEST(EmTableTest, IgnoreBytesPastEnd) {
   ExactMatchTable<uint16_t> em;
   ASSERT_EQ(0, em.AddField(6, 1, 0, 0).first);
   ASSERT_EQ(0, em.AddField(7, 8, 0, 1).first);
+  // Field 2 is read from offset 7 as 8 bytes: bytes 7-14 of the buffer.
   uint64_t buf[2] = {0x0102030405060708, 0x1112131415161718};
   const void *bufs[1] = {&buf};
   ExactMatchRuleFields rule = {

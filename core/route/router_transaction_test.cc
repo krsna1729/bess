@@ -6,48 +6,27 @@
 // allocation of a transaction failed in turn.
 
 #include <gtest/gtest.h>
+#include <rte_malloc.h>
 
 #include <any>
 #include <atomic>
 #include <cstdlib>
+#include <expected>
+#include <functional>
 #include <map>
 #include <new>
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "runtime/runtime_state.h"
 #include "dataplane/slot_resource.h"
 #include "dataplane/transaction_engine.h"
+#include "route/route_domain.h"
 #include "route/router.h"
-
-// Allocation-failure injection (section 5): with g_fail_countdown = k >= 0,
-// the (k+1)-th allocation on this thread throws std::bad_alloc.
-namespace {
-thread_local long g_fail_countdown = -1;
-}  // namespace
-
-// Replacing the global allocation functions pairs malloc with free by design;
-// GCC's -Wmismatched-new-delete does not know these are the replacements.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpragmas"
-#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
-void *operator new(std::size_t n) {
-  if (g_fail_countdown >= 0 && g_fail_countdown-- == 0) {
-    throw std::bad_alloc();
-  }
-  if (void *p = std::malloc(n == 0 ? 1 : n)) {
-    return p;
-  }
-  throw std::bad_alloc();
-}
-void *operator new[](std::size_t n) { return operator new(n); }
-void operator delete(void *p) noexcept { std::free(p); }
-void operator delete[](void *p) noexcept { std::free(p); }
-void operator delete(void *p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
-#pragma GCC diagnostic pop
+#include "testing/allocation_faults.h"
 
 namespace bess::route {
 namespace {
@@ -523,31 +502,15 @@ TEST_F(RouterTransactionTest, ResolvesWhileTransactionsRun) {
 }
 
 // Every allocation a mixed router transaction makes, failed in turn: the
-// routes, next hops, lookups and ledger stay exactly as they were.
+// routes, next hops, lookups and ledger stay exactly as they were. A refusal
+// the engine absorbs (std::stable_sort's nothrow buffer) leaves the
+// transaction applied exactly as without it.
 TEST_F(RouterTransactionTest, FailureAtEveryAllocationLeavesNoTrace) {
-  size_t faults = 0;
-  for (long k = 0;; k++) {
-    SCOPED_TRACE(testing::Message() << "failing allocation " << k);
+  struct Run {
     TransactionEngine engine{bess::runtime::runtime().rcu()};
-    auto router = MakeRouter();
-    ASSERT_TRUE(router->Enroll(engine));
-    ASSERT_EQ(engine
-                  .Apply(std::vector<Op>{
-                      router->SetNextHopOp(NextHopId(1), Hop(1)),
-                      router->SetNextHopOp(NextHopId(2), Hop(2)),
-                      router->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(1)),
-                      router->SetRouteOp(P(Ip(10, 9, 0, 0), 16),
-                                         NextHopId(2))})
-                  .outcome,
-              Outcome::kApplied);
-    const std::vector<Op> ops = {
-        router->SetNextHopOp(NextHopId(3), Hop(3)),
-        router->SetRouteOp(P(Ip(10, 1, 0, 0), 16), NextHopId(3)),
-        router->SetRouteOp(P(Ip(10, 1, 2, 128), 25), NextHopId(3)),
-        router->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(2)),
-        router->RemoveRouteOp(P(Ip(10, 9, 0, 0), 16)),
-        router->SetNextHopOp(NextHopId(1), Hop(7))};
-    auto state = [&] {
+    std::unique_ptr<Router> router;
+    std::vector<Op> ops;
+    std::string State() const {
       std::string s = std::to_string(router->route_count()) + "/" +
                       std::to_string(router->next_hop_count()) + "/g" +
                       std::to_string(engine.generation());
@@ -559,26 +522,227 @@ TEST_F(RouterTransactionTest, FailureAtEveryAllocationLeavesNoTrace) {
         s += " r" + std::to_string(router->RouteReferences(NextHopId(id)));
       }
       return s;
-    };
-    const std::string before = state();
-    g_fail_countdown = k;
-    bool threw = false;
-    try {
-      engine.Apply(ops);
-    } catch (const std::bad_alloc &) {
-      threw = true;
     }
-    g_fail_countdown = -1;
-    if (!threw) {
-      break;
-    }
-    faults++;
-    ASSERT_EQ(state(), before) << "a failed allocation left a trace";
-    ASSERT_EQ(engine.Apply(ops).outcome, Outcome::kApplied);
-    EXPECT_EQ(EgressOf(*router, Ip(10, 1, 2, 200)), 3);
+  };
+  const auto prepare = [&](Run &run) {
+    run.router = MakeRouter();
+    Router &router = *run.router;
+    ASSERT_TRUE(router.Enroll(run.engine));
+    ASSERT_EQ(run.engine
+                  .Apply(std::vector<Op>{
+                      router.SetNextHopOp(NextHopId(1), Hop(1)),
+                      router.SetNextHopOp(NextHopId(2), Hop(2)),
+                      router.SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(1)),
+                      router.SetRouteOp(P(Ip(10, 9, 0, 0), 16),
+                                        NextHopId(2))})
+                  .outcome,
+              Outcome::kApplied);
+    run.ops = {router.SetNextHopOp(NextHopId(3), Hop(3)),
+               router.SetRouteOp(P(Ip(10, 1, 0, 0), 16), NextHopId(3)),
+               router.SetRouteOp(P(Ip(10, 1, 2, 128), 25), NextHopId(3)),
+               router.SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(2)),
+               router.RemoveRouteOp(P(Ip(10, 9, 0, 0), 16)),
+               router.SetNextHopOp(NextHopId(1), Hop(7))};
+  };
+  std::string applied;
+  {
+    Run reference;
+    prepare(reference);
+    ASSERT_EQ(reference.engine.Apply(reference.ops).outcome, Outcome::kApplied);
+    applied = reference.State();
   }
-  std::printf("[router] %zu allocation sites failed in turn\n", faults);
-  EXPECT_GT(faults, 10u);
+  size_t threw_count = 0;
+  const size_t points = fault_injection::ForEachFailurePoint([&](size_t k) {
+    SCOPED_TRACE(testing::Message() << "failing allocation " << k);
+    Run run;
+    prepare(run);
+    ASSERT_FALSE(testing::Test::HasFailure());
+    const std::string before = run.State();
+    bool threw = false;
+    TransactionEngine::Result result;
+    {
+      const fault_injection::AllocationFaults window(k);
+      try {
+        result = run.engine.Apply(run.ops);
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+    }
+    if (!threw) {
+      // No allocation was refused, or the refusal was absorbed.
+      ASSERT_EQ(result.outcome, Outcome::kApplied);
+      ASSERT_EQ(applied, run.State()) << "an absorbed refusal changed the outcome";
+      return;
+    }
+    threw_count++;
+    ASSERT_EQ(run.State(), before) << "a failed allocation left a trace";
+    ASSERT_EQ(run.engine.Apply(run.ops).outcome, Outcome::kApplied);
+    ASSERT_EQ(applied, run.State());
+  });
+  std::printf("[router] %zu failure points, %zu of them thrown\n", points, threw_count);
+  EXPECT_GT(points, 10u);
+}
+
+// -- live (non-transactional) updates: domains, next hops, groups -----------------
+
+// Bytes allocated from the DPDK heap (the FIBs live there).
+size_t DpdkHeapBytes() {
+  size_t total = 0;
+  for (int socket = 0; socket < RTE_MAX_NUMA_NODES; socket++) {
+    rte_malloc_socket_stats stats{};
+    if (rte_malloc_get_socket_stats(socket, &stats) == 0) {
+      total += stats.heap_allocsz_bytes;
+    }
+  }
+  return total;
+}
+
+// What readers and the control side can observe of a router, read without
+// changing it: counts, domains, every lookup of a fixed set of destinations
+// (both group members), and the reference counts that gate removals.
+std::string LiveState(const Router &r) {
+  std::string s = std::to_string(r.route_count()) + "/" + std::to_string(r.next_hop_count()) +
+                  "/" + std::to_string(r.next_hop_group_count()) + "/" +
+                  std::to_string(r.domain_count());
+  for (uint32_t d = 0; d < 4; d++) {
+    const RouteDomainId domain(d);
+    if (!r.HasDomain(domain)) {
+      s += " d" + std::to_string(d) + "-";
+      continue;
+    }
+    s += " d" + std::to_string(d) + ":" + std::to_string(r.route_count(domain));
+    for (uint32_t dst : {Ip(10, 0, 0, 1), Ip(10, 1, 0, 1), Ip(10, 5, 0, 1), Ip(10, 9, 0, 1),
+                         Ip(20, 0, 0, 1)}) {
+      for (uint32_t hash : {0u, 1u, 2u}) {
+        const NextHop *hop = r.Resolve(domain, dst, hash);
+        s += " " + (hop == nullptr ? std::string("-") : std::to_string(hop->egress.value()));
+      }
+    }
+  }
+  for (uint32_t id = 1; id <= 6; id++) {
+    s += " n" + std::to_string(r.RouteReferences(NextHopId(id))) + "," +
+         std::to_string(r.GroupMemberships(NextHopId(id)));
+  }
+  for (uint32_t g = 1; g <= 3; g++) {
+    const NextHopGroup *group = r.LookupNextHopGroup(NextHopGroupId(g));
+    s += " g" + std::to_string(r.GroupReferences(NextHopGroupId(g))) + "," +
+         (group == nullptr ? std::string("-") : std::to_string(group->size));
+  }
+  return s;
+}
+
+// A router with two extra domains, four next hops, two groups and routes in
+// both domains, every retirement completed.
+std::unique_ptr<Router> LiveRouter() {
+  LpmRouteTable::Config config;
+  config.max_routes = 64;
+  config.tbl8_groups = 16;
+  auto made = Router::Create("live", config, 16, bess::runtime::runtime().rcu(), 4, 4);
+  EXPECT_TRUE(made.has_value());
+  Router &r = **made;
+  for (uint32_t id = 1; id <= 4; id++) {
+    EXPECT_TRUE(r.SetNextHop(NextHopId(id), Hop(id)));
+  }
+  EXPECT_TRUE(r.CreateDomain(RouteDomainId(1), config));
+  EXPECT_TRUE(r.CreateDomain(RouteDomainId(3), config));
+  const NextHopId g1[] = {NextHopId(1), NextHopId(2)};
+  const NextHopId g3[] = {NextHopId(3)};
+  EXPECT_TRUE(r.SetNextHopGroup(NextHopGroupId(1), g1));
+  EXPECT_TRUE(r.SetNextHopGroup(NextHopGroupId(3), g3));
+  EXPECT_TRUE(r.SetRoute(RouteDomainId(0), P(Ip(10, 0, 0, 0), 8), NextHopId(1)));
+  EXPECT_TRUE(r.SetRoute(RouteDomainId(0), P(Ip(10, 9, 0, 0), 16), NextHopId(2)));
+  EXPECT_TRUE(r.SetRoute(RouteDomainId(0), P(Ip(20, 0, 0, 0), 8), NextHopGroupId(1)));
+  EXPECT_TRUE(r.SetRoute(RouteDomainId(1), P(Ip(10, 1, 0, 0), 16), NextHopId(3)));
+  while (r.ReclaimRetired() != 0) {
+    bess::runtime::runtime().rcu().Drain();
+  }
+  bess::runtime::runtime().rcu().Drain();
+  return std::move(made).value();
+}
+
+// Each live update with each allocation it makes refused in turn: it fails
+// (std::bad_alloc or an error), the router -- lookups, counts, references,
+// domains, groups -- is exactly as it was, nothing is left in the DPDK heap,
+// and the same update then succeeds and leaves the router as an undisturbed
+// update would.
+TEST(RouterLiveUpdateFaultTest, FailureAtEveryAllocationLeavesNoTrace) {
+  LpmRouteTable::Config config;
+  config.max_routes = 64;
+  config.tbl8_groups = 16;
+  using Update = std::function<std::expected<void, RouteError>(Router &)>;
+  const std::pair<const char *, Update> updates[] = {
+      {"add a next hop", [](Router &r) { return r.SetNextHop(NextHopId(5), Hop(5)); }},
+      {"replace a next hop", [](Router &r) { return r.SetNextHop(NextHopId(1), Hop(9)); }},
+      {"remove a next hop", [](Router &r) { return r.RemoveNextHop(NextHopId(4)); }},
+      {"add a group",
+       [](Router &r) {
+         const NextHopId m[] = {NextHopId(2), NextHopId(4)};
+         return r.SetNextHopGroup(NextHopGroupId(2), m);
+       }},
+      {"replace a group",
+       [](Router &r) {
+         const NextHopId m[] = {NextHopId(2), NextHopId(3), NextHopId(3)};
+         return r.SetNextHopGroup(NextHopGroupId(1), m);
+       }},
+      {"remove a group", [](Router &r) { return r.RemoveNextHopGroup(NextHopGroupId(3)); }},
+      {"create a domain", [&](Router &r) { return r.CreateDomain(RouteDomainId(2), config); }},
+      {"remove a domain", [](Router &r) { return r.RemoveDomain(RouteDomainId(3)); }},
+      {"add a route",
+       [](Router &r) { return r.SetRoute(RouteDomainId(1), P(Ip(10, 5, 0, 0), 16), NextHopId(2)); }},
+      {"repoint a route at a group",
+       [](Router &r) {
+         return r.SetRoute(RouteDomainId(0), P(Ip(10, 9, 0, 0), 16), NextHopGroupId(3));
+       }},
+      {"remove a route",
+       [](Router &r) { return r.RemoveRoute(RouteDomainId(0), P(Ip(10, 9, 0, 0), 16)); }},
+      {"replace a domain's routes",
+       [](Router &r) {
+         return r.ReplaceRouteSetAtomic(
+             RouteDomainId(1), RouteSet{{P(Ip(10, 1, 0, 0), 16), NextHopId(4)},
+                                        {P(Ip(10, 5, 0, 0), 16), NextHopId(1)},
+                                        {P(Ip(20, 0, 0, 0), 8), NextHopId(2)}});
+       }},
+  };
+  for (const auto &[name, update] : updates) {
+    SCOPED_TRACE(name);
+    std::string expected;
+    {
+      auto reference = LiveRouter();
+      ASSERT_TRUE(update(*reference));
+      expected = LiveState(*reference);
+    }
+    const size_t points = fault_injection::ForEachFailurePoint([&](size_t k) {
+      SCOPED_TRACE(testing::Message() << "failing allocation " << k);
+      auto router = LiveRouter();
+      const std::string before = LiveState(*router);
+      const size_t heap = DpdkHeapBytes();
+      bool threw = false, injected = false;
+      std::expected<void, RouteError> result;
+      {
+        const fault_injection::AllocationFaults window(k);
+        try {
+          result = update(*router);
+        } catch (const std::bad_alloc &) {
+          threw = true;
+        }
+        injected = window.injected();
+      }
+      if (!injected) {
+        ASSERT_FALSE(threw);
+        ASSERT_TRUE(result);
+        ASSERT_EQ(expected, LiveState(*router));
+        return;
+      }
+      ASSERT_TRUE(threw || !result) << "a refused allocation was swallowed";
+      ASSERT_EQ(before, LiveState(*router)) << "a failed update left a trace";
+      EXPECT_EQ(heap, DpdkHeapBytes()) << "a failed update left memory in the DPDK heap";
+      ASSERT_TRUE(update(*router)) << "the update cannot be retried";
+      ASSERT_EQ(expected, LiveState(*router));
+    });
+    // Some updates allocate nothing once their room is reserved up front
+    // (removing a domain or a route, repointing one): zero points is a pass.
+    std::printf("[router live] %s: %zu allocation sites failed in turn\n", name, points);
+  }
 }
 
 }  // namespace

@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -15,8 +16,13 @@
 #include <unordered_map>
 #include <vector>
 
+#include "testing/allocation_faults.h"
+
 namespace bess::flow {
 namespace {
+
+using fault_injection::AllocationFaults;
+using fault_injection::ForEachFailurePoint;
 
 // A key that is not a five-tuple: BESS does not care what a flow is.
 struct FiveTuple {
@@ -443,6 +449,76 @@ TEST_F(WorkerFlowTableTest, ConstructionFailureLeavesNothingAllocated) {
     ASSERT_TRUE((*table)->Emplace(1, 1).created());
   }
   EXPECT_EQ(0, FailingAllocator::live) << "destroying the table must free it";
+}
+
+// Every allocation Create makes with the default allocator -- the three blocks
+// and the table object -- refused in turn: kOutOfMemory, and the ones made
+// before it are released.
+TEST_F(WorkerFlowTableTest, CreateFailureAtEveryAllocationLeavesNothingAllocated) {
+  const size_t points = ForEachFailurePoint([](size_t k) {
+    SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
+    const AllocationFaults faults(k);
+    auto table = AliasTable::Create(1000);
+    if (!faults.injected()) {
+      ASSERT_TRUE(table.has_value());
+      ASSERT_TRUE((*table)->Emplace(1, 1).created());
+      return;
+    }
+    ASSERT_FALSE(table.has_value());
+    EXPECT_EQ(FlowTableError::kOutOfMemory, table.error());
+    EXPECT_EQ(faults.allocations(), faults.frees() + 1)
+        << "the refused allocation is the only one not freed";
+  });
+  EXPECT_EQ(4u, points) << "directory, slots, free list, table";
+}
+
+// Flow creation allocates nothing: once Create has returned, creating flows
+// (plain and aliased), adding aliases, finding, erasing, and refusing creates
+// when the table is full only touch the memory Create committed. So there is
+// no per-flow allocation that could fail.
+TEST_F(WorkerFlowTableTest, CreatingFlowsAllocatesNothing) {
+  auto t = Make<AliasTable>(64);
+  std::mt19937_64 rng(11);
+  std::vector<FlowHandle> live;
+  live.reserve(64);
+  std::array<uint64_t, 8> keys{};
+  std::array<Counted *, 8> found{};
+  size_t created = 0, refused = 0;
+  const AllocationFaults window;
+  for (int i = 0; i < 20000; i++) {
+    const uint64_t key = rng() % 512;
+    switch (rng() % 4) {
+      case 0:
+      case 1: {
+        auto made = rng() % 2 ? t->Emplace(key, key) : t->EmplaceAliased(key, key + 1000, key);
+        if (made.created()) {
+          live.push_back(made.handle);
+          created++;
+        } else if (made.status == EmplaceStatus::kFull) {
+          refused++;
+        }
+        break;
+      }
+      case 2:
+        if (!live.empty()) {
+          (void)t->AddAlias(live[rng() % live.size()], key + 2000);
+        }
+        break;
+      default:
+        if (!live.empty()) {
+          const size_t j = rng() % live.size();
+          (void)t->Erase(live[j]);
+          live[j] = live.back();
+          live.pop_back();
+        }
+    }
+    keys[i % keys.size()] = key;
+    (void)t->Find(key);
+    (void)t->FindBatch(keys, found);
+  }
+  EXPECT_EQ(0u, window.allocations()) << "a flow operation allocated";
+  EXPECT_GT(created, 1000u);
+  EXPECT_GT(refused, 0u) << "the full-table refusal was not exercised";
 }
 
 TEST_F(WorkerFlowTableTest, CreateRejectsCapacitiesItCannotHonour) {

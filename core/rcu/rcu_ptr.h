@@ -84,9 +84,11 @@ class RcuPtr {
   //
   // This does *not* wait for the grace period: reclamation is deferred, and
   // whoever reclaims (a control thread) picks the object up once readers are
-  // done with it.
+  // done with it. Room for the retirement is made before the store, so once
+  // `replacement` is visible nothing can fail.
   GracePeriod Publish(std::unique_ptr<const T> replacement) {
     std::lock_guard<std::mutex> lock(writer_mutex_);
+    domain_.ReserveRetirements(1);
 
     std::unique_ptr<const T> old = ExchangeLocked(std::move(replacement));
     const GracePeriod token = domain_.StartGracePeriod();

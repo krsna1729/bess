@@ -1,5 +1,6 @@
 # Temporary/hidden files
 .*
+!.clang-tidy
 !.github/
 !.dockerignore
 *.dump

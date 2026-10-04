@@ -591,11 +591,15 @@ unit_test_sources = [
   'arch/kernels_test.cc',
   'arch/signal_context_test.cc',
   'flow/decision_cache_test.cc',
+  'flow/decision_cache_model_test.cc',
   'flow/expiry_consumer_test.cc',
   'offload/flow_rule_owner_test.cc',
   'l2/fdb_test.cc',
+  'l2/fdb_model_test.cc',
   'conntrack/conntrack_test.cc',
+  'conntrack/conntrack_model_test.cc',
   'nat/nat_test.cc',
+  'nat/nat_model_test.cc',
   'tunnel/tunnel_test.cc',
   'flow/flow_index_test.cc',
   'flow/reference_apps_test.cc',
@@ -705,6 +709,32 @@ unit_test_sources = [
   'utils/trie_test.cc',
 ]
 
+# Allocation counting and fail-Nth injection (testing/allocation_faults.h):
+# the object replaces the global operator new and delete, so it is linked
+# whole into the tests listed here and into nothing else.
+allocation_faults_lib = static_library(
+  'testing_allocation_faults',
+  'testing/allocation_faults.cc',
+  include_directories: core_include,
+  dependencies: [gtest_dep],
+  # TSan's runtime owns operator new/delete: no replacement there (D-072).
+  cpp_args: get_option('b_sanitize').contains('thread') ? ['-DBESS_ALLOCATION_FAULTS_DISABLED'] : [],
+)
+allocation_fault_tests = [
+  'dataplane/continuation_test.cc',
+  'dataplane/expiry_wheel_test.cc',
+  'dataplane/handoff_test.cc',
+  'dataplane/transaction_engine_test.cc',
+  'dataplane/transaction_lifecycle_test.cc',
+  'flow/shared_flow_table_test.cc',
+  'flow/worker_flow_table_test.cc',
+  'l2/fdb_test.cc',
+  'nat/nat_test.cc',
+  'offload/flow_rule_owner_test.cc',
+  'route/l3_test.cc',
+  'route/router_transaction_test.cc',
+]
+
 taskset_prog = find_program('taskset', required: false)
 foreach source : unit_test_sources
   test_name = source.replace('.cc', '').replace('/', '_')
@@ -739,6 +769,9 @@ foreach source : unit_test_sources
   elif integration_test
     test_link_whole = runtime_whole
     test_link_with = []
+  endif
+  if source in allocation_fault_tests
+    test_link_whole = [test_link_whole, allocation_faults_lib]
   endif
   # The test main is ours (core/gtest_main.cc) rather than the packaged one:
   # it configures the death-test style and keeps expected-death children from
@@ -906,5 +939,72 @@ if get_option('build_benchmarks')
     'benchmarks',
     command: [find_program('true')],
     depends: benchmark_targets,
+  )
+endif
+
+# Fuzz harnesses (core/fuzz, docs/fuzzing.md). With Clang each links the
+# libFuzzer engine; with GCC, which has no libFuzzer, it links a main that
+# replays files. Either way the committed seed corpus is replayed as a test in
+# the 'fuzz' suite. Sanitizers come from b_sanitize. Harnesses use only
+# EAL-free code and link the libraries normally (link_with), so only the
+# objects they reference are pulled in.
+if get_option('build_fuzzers')
+  fuzz_with_libfuzzer = cpp.get_id() == 'clang'
+  if fuzz_with_libfuzzer and not get_option('cpp_args').contains('-fsanitize=fuzzer-no-link')
+    warning('build_fuzzers: library code has no coverage instrumentation; ' +
+            'configure with -Dcpp_args=-fsanitize=fuzzer-no-link (docs/fuzzing.md)')
+  endif
+  # name: extra libraries beyond component_runtime_whole.
+  fuzz_targets = {
+    'packet_cursor': [],
+    'packet_mutation': [],
+    'checksum_plan': [],
+    'classifier_schema': [],
+    'resource_codec': [],
+    'route_prefix': [],
+    'conntrack': [],
+    'nat': [],
+    'tunnel_decap': [],
+    'control_transaction': [bess_control],
+  }
+  fuzz_executables = []
+  foreach fuzz_name, fuzz_libs : fuzz_targets
+    fuzz_sources = ['fuzz/' + fuzz_name + '_fuzz.cc']
+    fuzz_cpp_args = []
+    fuzz_link_args = []
+    fuzz_test_args = []
+    if fuzz_with_libfuzzer
+      fuzz_cpp_args = ['-fsanitize=fuzzer']
+      fuzz_link_args = ['-fsanitize=fuzzer']
+      # libFuzzer's default error exit code, 77, means "skipped" to Meson.
+      fuzz_test_args = ['-runs=0', '-error_exitcode=1']
+      fuzz_sources += ['fuzz/libfuzzer_options.cc']
+    else
+      fuzz_sources += ['fuzz/replay_main.cc']
+    endif
+    fuzz_exe = executable(
+      fuzz_name + '_fuzz',
+      fuzz_sources,
+      include_directories: core_include,
+      cpp_args: fuzz_cpp_args,
+      link_args: fuzz_link_args,
+      link_with: fuzz_libs + component_runtime_whole,
+      dependencies: runtime_deps,
+      build_rpath: runtime_rpath,
+    )
+    fuzz_executables += fuzz_exe
+    test(
+      fuzz_name + '_fuzz_corpus',
+      fuzz_exe,
+      args: fuzz_test_args + [meson.current_source_dir() / 'fuzz' / 'corpus' / fuzz_name],
+      suite: 'fuzz',
+      timeout: 300,
+      env: {'LD_LIBRARY_PATH': dpdk_libdir},
+    )
+  endforeach
+  run_target(
+    'fuzzers',
+    command: [find_program('true')],
+    depends: fuzz_executables,
   )
 endif

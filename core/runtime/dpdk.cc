@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "utils/logging.h"
+#include "utils/sanitizers.h"
 #include <rte_config.h>
 #include <rte_cycles.h>
 #include <rte_eal.h>
@@ -24,6 +25,7 @@
 
 #include "runtime/memory.h"
 #include "runtime/opts.h"
+
 
 namespace bess {
 namespace {
@@ -146,6 +148,14 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
     rte_args.Append({"-m", (heap_mb != nullptr && std::atoi(heap_mb) > 0)
                                ? std::string(heap_mb)
                                : std::string("512")});
+#if BESS_ADDRESS_SANITIZER
+    // Under AddressSanitizer the default heap address lands inside ASan's
+    // shadow region, so DPDK maps the heap high, above the IOMMU's DMA mask
+    // (39 bits on VT-d) that IOVA-as-VA requires: "IOVA exceeding limits of
+    // current DMA mask". Below the shadow (which starts at 0x7fff8000) there
+    // are about 1.7 GB from 256 MB; ASan builds only (M22, D-072).
+    rte_args.Append({"--base-virtaddr", "0x10000000"});
+#endif
   } else {
     // IOVA mode: the EAL's own choice unless -iova says otherwise -- VA
     // when an IOMMU is present and every device supports it (vfio-pci: the

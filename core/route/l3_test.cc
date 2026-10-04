@@ -7,12 +7,15 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "route/l3_packet.h"
 #include "route/neighbor_table.h"
 #include "runtime/runtime_state.h"
+#include "testing/allocation_faults.h"
 #include "utils/checksum.h"
 
 namespace bess::route {
@@ -248,6 +251,154 @@ TEST(NeighborTableTest, ResolutionRepublishesBoundNextHopsOnly) {
   }
   // A neighbor on another interface with the same address is another neighbor.
   EXPECT_FALSE(neighbors.Find({dataplane::InterfaceId(4), 0x0a000001}).has_value());
+}
+
+// -- allocation failure in neighbor updates ------------------------------------------
+
+using fault_injection::AllocationFaults;
+using fault_injection::ForEachFailurePoint;
+
+Ethernet::Address MacOf(uint8_t last) {
+  Ethernet::Address mac{};
+  mac.bytes[0] = 0x02;
+  mac.bytes[5] = last;
+  return mac;
+}
+
+const NeighborTable::Key kGwA{dataplane::InterfaceId(3), 0x0a000001};
+const NeighborTable::Key kGwB{dataplane::InterfaceId(3), 0x0a000002};
+const NeighborTable::Key kGwC{dataplane::InterfaceId(4), 0x0a000003};
+
+// What a caller can observe of a NeighborTable: each neighbor's state and
+// MAC, and the next hops (with their source MACs) an update of it would
+// republish -- the latter probed on a copy, so the table itself is not
+// touched.
+std::string Observe(const NeighborTable &table) {
+  std::string s = std::to_string(table.size());
+  for (const NeighborTable::Key &key : {kGwA, kGwB, kGwC}) {
+    const auto n = table.Find(key);
+    s += " |" + (n ? std::to_string(static_cast<int>(n->state)) + "/" + n->mac.ToString()
+                   : std::string("absent"));
+    NeighborTable probe = table;
+    for (const auto &[id, hop] : probe.Update(key, NeighborState::kResolved, MacOf(0xee))) {
+      s += " h" + std::to_string(id.value()) + "@" + hop.src_mac.ToString();
+    }
+  }
+  return s;
+}
+
+// The table each scenario starts from: A has hops 1 and 2 (learned), B has
+// hop 3 (never learned), C is unknown.
+NeighborTable StartingTable() {
+  NeighborTable t;
+  (void)t.Bind(NextHopId(1), kGwA, MacOf(0xa1));
+  (void)t.Bind(NextHopId(2), kGwA, MacOf(0xa2));
+  (void)t.Update(kGwA, NeighborState::kResolved, MacOf(0x01));
+  (void)t.Bind(NextHopId(3), kGwB, MacOf(0xb3));
+  return t;
+}
+
+// Bind allocates (a neighbor entry, the hop in its set, the binding). Each
+// allocation refused in turn: Bind throws, and the table -- including a
+// binding the hop had before -- is exactly as it was; the same Bind then
+// succeeds and leaves the table as an undisturbed Bind would.
+TEST(NeighborTableFaultTest, BindFailureAtEveryAllocationLeavesNoTrace) {
+  struct Scenario {
+    const char *name;
+    NextHopId hop;
+    NeighborTable::Key key;
+  };
+  const Scenario scenarios[] = {
+      {"new hop, new neighbor", NextHopId(4), kGwC},
+      {"new hop, learned neighbor", NextHopId(4), kGwA},
+      {"rebind the only hop of an unlearned neighbor elsewhere", NextHopId(3), kGwC},
+      {"rebind a hop of a learned neighbor elsewhere", NextHopId(1), kGwB},
+      {"rebind a hop to its own neighbor", NextHopId(2), kGwA},
+  };
+  for (const Scenario &sc : scenarios) {
+    SCOPED_TRACE(sc.name);
+    NeighborTable reference = StartingTable();
+    const NextHop expected = reference.Bind(sc.hop, sc.key, MacOf(0xcc));
+    const size_t points = ForEachFailurePoint([&](size_t k) {
+      SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
+      NeighborTable t = StartingTable();
+      const std::string before = Observe(t);
+      bool threw = false, injected = false;
+      {
+        const AllocationFaults faults(k);
+        try {
+          (void)t.Bind(sc.hop, sc.key, MacOf(0xcc));
+        } catch (const std::bad_alloc &) {
+          threw = true;
+        }
+        injected = faults.injected();
+      }
+      if (!injected) {
+        ASSERT_FALSE(threw);
+        ASSERT_EQ(Observe(reference), Observe(t));
+        return;
+      }
+      ASSERT_TRUE(threw) << "a refused allocation was swallowed";
+      ASSERT_EQ(before, Observe(t)) << "a failed Bind left a trace";
+      const NextHop retried = t.Bind(sc.hop, sc.key, MacOf(0xcc));
+      EXPECT_EQ(expected.neighbor, retried.neighbor);
+      EXPECT_EQ(expected.dst_mac, retried.dst_mac);
+      ASSERT_EQ(Observe(reference), Observe(t));
+    });
+    EXPECT_GE(points, 1u);
+  }
+}
+
+// Update allocates (a new neighbor entry, the list of next hops to
+// republish). Each allocation refused in turn: Update throws and changes
+// nothing -- so the retry still reports every hop to republish, rather than
+// finding the neighbor already "unchanged" and reporting none.
+TEST(NeighborTableFaultTest, UpdateFailureAtEveryAllocationLeavesNoTrace) {
+  struct Scenario {
+    const char *name;
+    NeighborTable::Key key;
+    NeighborState state;
+  };
+  const Scenario scenarios[] = {
+      {"a learned neighbor moves", kGwA, NeighborState::kResolved},
+      {"an unlearned neighbor resolves", kGwB, NeighborState::kResolved},
+      {"an unknown neighbor is learned", kGwC, NeighborState::kUnreachable},
+  };
+  for (const Scenario &sc : scenarios) {
+    SCOPED_TRACE(sc.name);
+    NeighborTable reference = StartingTable();
+    const NeighborTable::Updates expected = reference.Update(sc.key, sc.state, MacOf(0x77));
+    const size_t points = ForEachFailurePoint([&](size_t k) {
+      SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
+      NeighborTable t = StartingTable();
+      const std::string before = Observe(t);
+      bool threw = false, injected = false;
+      {
+        const AllocationFaults faults(k);
+        try {
+          (void)t.Update(sc.key, sc.state, MacOf(0x77));
+        } catch (const std::bad_alloc &) {
+          threw = true;
+        }
+        injected = faults.injected();
+      }
+      if (!injected) {
+        ASSERT_FALSE(threw);
+        ASSERT_EQ(Observe(reference), Observe(t));
+        return;
+      }
+      ASSERT_TRUE(threw) << "a refused allocation was swallowed";
+      ASSERT_EQ(before, Observe(t)) << "a failed Update left a trace";
+      const NeighborTable::Updates retried = t.Update(sc.key, sc.state, MacOf(0x77));
+      ASSERT_EQ(expected.size(), retried.size()) << "the retry lost next hops to republish";
+      for (size_t i = 0; i < expected.size(); i++) {
+        EXPECT_EQ(expected[i].first, retried[i].first);
+        EXPECT_EQ(expected[i].second.dst_mac, retried[i].second.dst_mac);
+      }
+      ASSERT_EQ(Observe(reference), Observe(t));
+    });
+    EXPECT_GE(points, 1u);
+  }
 }
 
 }  // namespace

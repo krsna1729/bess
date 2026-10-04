@@ -92,23 +92,28 @@ class RteFlowBackend {
         a.conf = &mark_conf;
       }
     }
+    // The completion record exists before the device call: once the device
+    // holds the rule, nothing here can throw and leave it untracked (M22).
+    done_.push_back({tag, true, nullptr, 0});
     rte_flow_error err{};
     rte_flow *flow = rte_flow_create(port, &rule.attr, rule.pattern.data(), actions.data(), &err);
     if (flow == nullptr) {
+      done_.pop_back();
       error = rte_errno != 0 ? rte_errno : EINVAL;
       return false;
     }
-    done_.push_back({tag, true, flow, 0});
+    done_.back().hw = flow;
     return true;
   }
 
   bool Remove(uint16_t port, HwHandle hw, uint64_t tag, int &error) {
+    done_.push_back({tag, true, hw, 0});  // before the device call, as in Submit
     rte_flow_error err{};
     if (rte_flow_destroy(port, hw, &err) != 0) {
+      done_.pop_back();
       error = rte_errno != 0 ? rte_errno : EINVAL;
       return false;
     }
-    done_.push_back({tag, true, hw, 0});
     return true;
   }
 

@@ -212,6 +212,10 @@ class EditPlanBuilder {
  public:
   // Removes `bytes` from the front (an outer header to strip).
   EditPlanBuilder &RemovePrefix(uint16_t bytes) {
+    if (remove_ + bytes > 0xFFFF) {
+      error_ = EditBuildError::kOutOfRange;
+      return *this;
+    }
     remove_ += bytes;
     return *this;
   }
@@ -358,6 +362,10 @@ class EditPlanBuilder {
         default:
           if (!add({p.op, 0, p.offset, p.aux})) {
             return std::unexpected(EditBuildError::kTooManySteps);
+          }
+          // A checksum adjustment or a length is per-packet, like a copy.
+          for (size_t i = 0; i < 2 && p.offset + i < image.size(); i++) {
+            image[p.offset + i] = -1;
           }
           range = std::max<uint32_t>(range, p.offset + 2u);
       }

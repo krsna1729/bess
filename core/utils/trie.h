@@ -32,14 +32,18 @@ class Trie {
       }
     }
 
+    // Copies `other`'s subtree, replacing this one's: a child `other` lacks is
+    // removed (it used to stay).
     Node& operator=(const Node& other) {
+      if (this == &other) {
+        return *this;
+      }
       leaf = other.leaf;
       prefix = other.prefix;
       val = other.val;
       for (int i = 0; i < 256; i++) {
-        if (other.children[i] != nullptr) {
-          children[i].reset(new Node(*(other.children[i])));
-        }
+        children[i].reset(other.children[i] != nullptr ? new Node(*(other.children[i]))
+                                                       : nullptr);
       }
       return *this;
     }
@@ -52,6 +56,7 @@ class Trie {
 
   Trie() : root_() {}
   Trie(const Trie& t) : root_(t.root_) {}
+  Trie& operator=(const Trie& t) = default;
 
   // Inserts a string into the trie, associating the key
   // with the value.

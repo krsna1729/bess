@@ -20,6 +20,8 @@
 #include "utils/tcp.h"
 #include "utils/udp.h"
 
+#include "testing/allocation_faults.h"
+
 namespace bess::nat {
 namespace {
 
@@ -144,6 +146,40 @@ TEST(NatTest, ForwardAndReverseRewriteKeepChecksumsValid) {
   EXPECT_EQ(0, bare[40] | bare[41]);
 }
 
+// An echo reply that is all zeros once translated (identifier 0, sequence 0,
+// no payload) sums to +0, which only the checksum 0xffff verifies: the
+// incremental update's 0x0000 is written as 0xffff (found by core/fuzz/nat_fuzz).
+TEST(NatTest, IcmpRewriteToAnAllZeroMessageKeepsTheChecksumValid) {
+  auto zero_reply = [](uint32_t src, uint32_t dst, uint16_t id) {
+    auto f = Frame(1, src, id, dst, /*type=*/0);
+    f.resize(34 + 8);  // no payload
+    Put16(f, 16, 28);
+    auto *ip = reinterpret_cast<utils::Ipv4 *>(f.data() + 14);
+    ip->checksum = 0;
+    ip->checksum = utils::CalculateIpv4NoOptChecksum(*ip);
+    f[36] = f[37] = 0;
+    const uint16_t sum = utils::CalculateGenericChecksum(f.data() + 34, 8);
+    std::memcpy(f.data() + 36, &sum, 2);
+    return f;
+  };
+  // Outbound: the only identifier is 0.
+  Harness out({Pub(kPublic, {{0, 1, false}})});
+  auto f = zero_reply(kInside, kRemote, 12);
+  ASSERT_TRUE(ChecksumsValid(f));
+  ASSERT_EQ(Verdict::kTranslated, out.Send(f, Direction::kForward, 0));
+  EXPECT_EQ(0, f[38] | f[39]);
+  EXPECT_TRUE(ChecksumsValid(f));
+  EXPECT_EQ(0xffff, f[36] << 8 | f[37]);
+  // Inbound: back to the internal identifier 0.
+  Harness in({Pub(kPublic, {{5, 6, false}})});
+  auto request = Frame(1, kInside, 0, kRemote, 8);
+  ASSERT_EQ(Verdict::kTranslated, in.Send(request, Direction::kForward, 0));
+  auto g = zero_reply(kRemote, kPublic, 5);
+  ASSERT_EQ(Verdict::kTranslated, in.Send(g, Direction::kReverse, 1));
+  EXPECT_EQ(0, g[38] | g[39]);
+  EXPECT_TRUE(ChecksumsValid(g));
+}
+
 TEST(NatTest, EndpointIndependentMappingAndDirectionGuard) {
   Harness h({Pub()});
   auto a = Frame(17, kInside, 5000, kRemote, 53);
@@ -239,6 +275,82 @@ TEST(NatTest, IdleMappingsExpireAndFreeTheirPorts) {
   ASSERT_EQ(Verdict::kTranslated, h.Send(b2, Direction::kForward, 280));
   EXPECT_EQ(0u, h.nat->Expire(350, ~size_t{0}));
   EXPECT_EQ(1u, h.nat->Expire(381, ~size_t{0}));
+}
+
+// Every allocation Create makes (the binding table's blocks and object, the
+// wheel, the engine and its copies of the configuration), refused in turn:
+// Create returns kOutOfMemory -- it does not throw -- and leaves nothing
+// allocated.
+TEST(NatFaultTest, CreateFailureAtEveryAllocationReturnsOutOfMemoryAndLeaksNothing) {
+  Nat::Config c;
+  c.addresses = {Pub(kPublic, {{1024, 4096, false}, {8000, 9000, false}}),
+                 Pub(kPublic + 1, {{2000, 3000, false}})};
+  c.capacity = 512;
+  c.granularity_shift = 0;
+  const size_t points = fault_injection::ForEachFailurePoint([&](size_t k) {
+    SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
+    bool threw = false, injected = false;
+    size_t allocations = 0, frees = 0;
+    {
+      const fault_injection::AllocationFaults faults(k);
+      try {
+        auto nat = Nat::Create(c);
+        if (faults.injected()) {
+          ASSERT_FALSE(nat.has_value());
+          EXPECT_EQ(Nat::CreateError::kOutOfMemory, nat.error());
+        } else {
+          ASSERT_TRUE(nat.has_value());
+        }
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+      injected = faults.injected();
+      allocations = faults.allocations();
+      frees = faults.frees();
+    }
+    EXPECT_FALSE(threw) << "Create threw instead of returning kOutOfMemory";
+    if (injected) {
+      EXPECT_EQ(allocations, frees + 1) << "the refused allocation is the only one not freed";
+    } else {
+      EXPECT_EQ(allocations, frees) << "a destroyed engine left memory behind";
+    }
+  });
+  EXPECT_GE(points, 7u);
+}
+
+// Binding creation allocates nothing: once Create has returned, outbound
+// packets that create bindings, refusals on a full table, inbound packets with
+// and without a binding, and expiry only use the memory Create committed --
+// so a per-binding allocation failure cannot exist.
+TEST(NatFaultTest, CreatingBindingsAllocatesNothing) {
+  constexpr size_t kCapacity = 1024;
+  Harness h({Pub(kPublic, {{1024, 65535, false}})}, /*timeout=*/100, kCapacity);
+  constexpr size_t kFrames = 3000;
+  std::vector<std::vector<uint8_t>> out, in;
+  for (size_t i = 0; i < kFrames; i++) {
+    const uint8_t proto = i % 3 == 0 ? 6 : i % 3 == 1 ? 17 : 1;
+    out.push_back(Frame(proto, kInside + static_cast<uint32_t>(i / 1000),
+                        static_cast<uint16_t>(2000 + i), kRemote, proto == 1 ? 8 : 443));
+    in.push_back(Frame(17, kRemote, 53, kPublic, static_cast<uint16_t>(1024 + i)));
+  }
+  size_t translated = 0, full = 0, expired = 0;
+  const fault_injection::AllocationFaults window;
+  for (size_t i = 0; i < kFrames; i++) {
+    // The first half at time 0 overfills the table; the second half follows
+    // an expiry that emptied it, and overfills it again.
+    const uint64_t now = i < kFrames / 2 ? 0 : 1000;
+    if (i == kFrames / 2) {
+      expired = h.nat->Expire(now, ~size_t{0});
+    }
+    const Verdict v = h.Send(out[i], Direction::kForward, now);
+    translated += v == Verdict::kTranslated;
+    full += v == Verdict::kFull;
+    (void)h.Send(in[i], Direction::kReverse, now);
+  }
+  EXPECT_EQ(0u, window.allocations()) << "a binding operation allocated";
+  EXPECT_EQ(kCapacity, expired);
+  EXPECT_EQ(2 * kCapacity, translated);
+  EXPECT_EQ(kFrames - 2 * kCapacity, full);
 }
 
 // A VLAN-tagged frame: every offset shifts by the tag, and the rewrite lands

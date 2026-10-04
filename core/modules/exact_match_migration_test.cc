@@ -206,9 +206,8 @@ struct Fixture {
                                 : packet.data() + fields[i].offset;
       uint64_t loaded = 0;
       std::memcpy(&loaded, base, sizeof(loaded));
-      uint8_t *k =
-          reinterpret_cast<uint8_t *>(key.u64_arr) + f.pos;
-      *reinterpret_cast<uint64_t *>(k) = loaded & f.mask;
+      const uint64_t field = loaded & f.mask;
+      std::memcpy(reinterpret_cast<uint8_t *>(key.u64_arr) + f.pos, &field, sizeof(field));
     }
     return legacy.Find(key, kDefaultGate);
   }

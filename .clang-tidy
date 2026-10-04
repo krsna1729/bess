@@ -1,0 +1,58 @@
+# Curated clang-tidy profile (M22, D-072): checks that find bugs, not style.
+# Roadmap: bugprone-*, selected performance-*, CERT integer/bounds, narrowing
+# and conversions, lifetime/use-after-move, virtual destructors, suspicious
+# memcpy/aliasing. No readability or modernize checks: they create churn
+# without reducing risk.
+#
+# Disabled within the enabled groups, with the reason:
+#   bugprone-easily-swappable-parameters  every (src, dst) pair; no signal
+#   bugprone-narrowing-conversions        alias of cppcoreguidelines-narrowing-conversions (enabled)
+#   bugprone-reserved-identifier          DPDK-style __names in legacy headers; not a defect
+#   bugprone-macro-parentheses            legacy macros; reviewed separately
+#   bugprone-branch-clone                 intentional duplicate branches in table-driven code
+#   bugprone-switch-missing-default-case  enum switches are exhaustive by -Wswitch
+#   bugprone-casting-through-void         same meaning as reinterpret_cast; style
+#   bugprone-throwing-static-initialization  the ADD_MODULE/driver registration
+#                                         statics: run at load, not per packet
+#   performance-enum-size                 wire and ABI enums keep their width
+#   performance-avoid-endl                logging, not packet paths
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-reserved-identifier,
+  -bugprone-macro-parentheses,
+  -bugprone-branch-clone,
+  -bugprone-switch-missing-default-case,
+  -bugprone-casting-through-void,
+  -bugprone-throwing-static-initialization,
+  performance-*,
+  -performance-enum-size,
+  -performance-avoid-endl,
+  cert-int09-c,
+  cert-err33-c,
+  cert-str34-c,
+  cert-oop54-cpp,
+  cert-oop58-cpp,
+  cppcoreguidelines-narrowing-conversions,
+  cppcoreguidelines-virtual-class-destructor,
+  cppcoreguidelines-slicing,
+  clang-analyzer-core.*,
+  clang-analyzer-cplusplus.*,
+  clang-analyzer-unix.Malloc,
+  clang-analyzer-unix.cstring.*,
+  clang-analyzer-security.insecureAPI.UncheckedReturn,
+  misc-redundant-expression,
+  misc-misplaced-const,
+  misc-unconventional-assign-operator,
+  misc-new-delete-overloads,
+  misc-throw-by-value-catch-by-reference
+CheckOptions:
+  cppcoreguidelines-narrowing-conversions.WarnOnIntegerToFloatingPointNarrowingConversion: false
+  cppcoreguidelines-narrowing-conversions.WarnOnFloatingPointNarrowingConversion: false
+  cppcoreguidelines-narrowing-conversions.PedanticMode: false
+  performance-unnecessary-value-param.AllowedTypes: 'std::span;std::string_view;.*Ref$;.*View$;.*Handle$;.*Id$'
+HeaderFilterRegex: '.*/core/.*'
+ExcludeHeaderFilterRegex: '.*/(protobuf|pb)/.*'
+WarningsAsErrors: ''
