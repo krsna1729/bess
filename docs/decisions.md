@@ -7031,5 +7031,13 @@ binding, and a control thread cannot read a worker-owned table.
 - Known limit (shared): a worker that found a binding just before its expiry may count one more packet into the erased
   binding after the final record; at most what workers translate in one grace period.
 
-**Evidence.** EVIDENCE
+**Evidence.** Fast build: unit 135 (with `nat_usage_test`, 5 tests, in the TSan list): both directions count in IP
+bytes and a mapping's end is one final record with its totals (4 packets, 3 x 128 + 48 bytes); with a log of 2 and 3
+mappings due, two end, the third keeps its mapping and port until the log is drained, then ends: no record lost; a
+requested report gives each of 100 live mappings once, over several batches; owned growth moves the counts; a report
+interrupted by growth still gives every mapping; four workers counting while the control thread grows a shared NAT
+16 -> 512 give final records whose packets add up to exactly the packets translated. Live (`nat.py`): an interim
+report gives 3 packets and 300 bytes for a mapping, owned and shared; `request_usage_report` and `drain_usage` run
+while the NAT's worker runs. A NAT without usage compiles none of it (`if constexpr` on the store; Expire's report
+call is empty).
 

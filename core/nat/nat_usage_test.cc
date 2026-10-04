@@ -182,7 +182,7 @@ TEST(NatUsageTest, SharedCountsAddUpAcrossWorkersAndGrowth) {
   rcu::RcuDomain domain(8);
   auto c = Config<CountedSharedNat>(16, 4096, &domain);
   c.max_capacity = 1024;
-  c.timeout = ~uint64_t{0} / 4;
+  c.timeout = 1000000;  // the workers translate at tick 1: nothing expires during the run
   auto nat = CountedSharedNat::Create(c).value();
   constexpr int kWorkers = 4, kFlows = 300, kRounds = 20;
   std::atomic<int> online{0}, finished{0};
@@ -229,7 +229,7 @@ TEST(NatUsageTest, SharedCountsAddUpAcrossWorkersAndGrowth) {
   // End everything: one final record per mapping.
   ASSERT_TRUE(domain.Register(6).has_value());
   domain.Online(6);
-  ASSERT_EQ(static_cast<size_t>(kFlows), nat->Expire(~uint64_t{0} / 2, ~size_t{0}));
+  ASSERT_EQ(static_cast<size_t>(kFlows), nat->Expire(2000000, ~size_t{0}));
   domain.Offline(6);
   domain.Unregister(6);
   uint64_t total = 0;
