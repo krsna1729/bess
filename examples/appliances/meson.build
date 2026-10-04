@@ -13,11 +13,13 @@ project('appliances', 'cpp',
 # `self_test` command drives it directly on frames.
 bess_dep = dependency('bess-dev', required: true)
 
-shared_module(
-  'router_appliance',
-  'router/router_appliance.cc',
-  include_directories: include_directories('.'),
-  dependencies: [bess_dep],
-  install: true,
-  install_dir: get_option('libdir') / 'bess' / 'modules',
-)
+foreach appliance : ['router', 'nat']
+  shared_module(
+    appliance + '_appliance',
+    appliance / appliance + '_appliance.cc',
+    include_directories: include_directories('.'),
+    dependencies: [bess_dep],
+    install: true,
+    install_dir: get_option('libdir') / 'bess' / 'modules',
+  )
+endforeach

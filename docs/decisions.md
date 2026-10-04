@@ -106,7 +106,7 @@ file is the reasoning.
 | D-083 | NAT usage counters: per-mapping packets and bytes, final and interim records through a bounded log (TP7) | accepted |
 | D-084 | Operational events: worker rings, a bounded log, WatchEvents with gaps and restarts, SDK streams (M25 phase 2) | accepted |
 | D-085 | Packet parse: the common frame validated on one path ("validate once, execute fast"; tunnel clawback) | accepted |
-| D-086 | Reference appliances as installed-tree plugins with a direct-path self test; R1 router (M24) | accepted |
+| D-086 | Reference appliances as installed-tree plugins with a direct-path self test; R1 router, R2 NAT (M24) | accepted |
 
 
 ---
@@ -7165,10 +7165,11 @@ checked decap went from 4.5x to 3.3x of it); `conntrack_bench BM_Parse` untagged
 clear difference at 1M (where lookups dominate).
 
 
-## D-086 Reference appliances as installed-tree plugins with a direct-path self test; R1 router (M24)
+## D-086 Reference appliances as installed-tree plugins with a direct-path self test; R1 router, R2 NAT (M24)
 
 **Status:** accepted (2026-10-05).
-**Code:** `examples/appliances/` (new: `meson.build`, `README.md`, `router/router_app.h`, `router/router_appliance.cc`),
+**Code:** `examples/appliances/` (new: `meson.build`, `README.md`, `router/router_app.h`, `router/router_appliance.cc`,
+`nat/nat_app.h`, `nat/nat_appliance.cc`),
 `tools/check_standalone_plugins.py` (`--set appliances`, module commands), `tools/ci_profile.py` (the install check
 builds and runs them).
 
@@ -7189,7 +7190,19 @@ against (persona D, D-074 era): code that uses non-header-only batteries (the ro
   with each flow on one path, a neighbor's MAC change used at once with no route written (route count and the
   application's route writes unchanged), an unresolved neighbor not forwarded to, a miss and an expired TTL dropped.
 
-**Evidence.** Against a staged install of develop: the plugin builds from `bess-dev`, loads into the staged bessd,
-moves 11.2M packets 172.16.1.1 -> gate 0 on the graph path, and `self_test` passes; with VRF 2's route pointed at
-VRF 1's gateway, `self_test` fails with "VRF 2 did not use its own route".
+- R2 stateful NAT: a firewall that admits only connections started inside, in front of endpoint-independent NAPT; the
+  application owns the pool (one public address, ports 20000-29999), the stage order and the clock; the libraries are
+  plain objects it owns (no NAT-specific mechanism in the runtime or framework). Direct path: an outbound SYN is
+  tracked and mapped into the pool; the SYN-ACK returns through the reverse alias to the inside host and port; a
+  stranger's SYN to the mapped port is translated (endpoint-independent mapping) and then refused by the firewall; a
+  packet to an unmapped port is not translated; after the idle timeout the mapping is gone and its port no longer
+  leads inside.
+
+**Evidence.** Against a staged install of develop: both plugins build from `bess-dev` and load into the staged bessd;
+on the graph path R1 moves 172.16.1.1 to gate 0 and R2 an inside host's UDP to gate 0 (3.4M packets each), and both
+`self_test`s pass. Mutants: VRF 2's route pointed at VRF 1's gateway fails R1 ("VRF 2 did not use its own route");
+the inbound firewall allowed to start connections fails R2 ("an outside-started connection was admitted"). Found on
+the way: a NAT whose expiry wheel starts at clock 0 while packets carry the TSC clock refuses every mapping (the
+deadline is beyond the wheel's horizon): the module starts the wheels at the packet clock's now, as the in-tree NAT
+module does.
 

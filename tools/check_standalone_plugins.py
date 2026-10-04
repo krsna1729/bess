@@ -20,10 +20,11 @@ import sys
 import tempfile
 import time
 
-def ipv4_udp_frame(dst, ttl=64):
+def ipv4_udp_frame(dst, ttl=64, sport=1000):
     """60 bytes: Ethernet, IPv4 (192.168.0.1 -> `dst`, a dotted quad), UDP."""
     f = bytearray(udp_frame(53))
     f[22] = ttl
+    f[34], f[35] = sport >> 8, sport & 0xff
     f[26:30] = bytes([192, 168, 0, 1])
     f[30:34] = bytes(int(b) for b in dst.split('.'))
     f[24:26] = b'\x00\x00'
@@ -54,9 +55,14 @@ def udp_frame(dst_port):
 APPLIANCES = [
     # R1: 172.16.1.1 arriving on igate 0 (VRF 1) leaves by interface 1 (gate 0).
     ('RouterAppliance', 'router0', ipv4_udp_frame('172.16.1.1'), 0),
+    # R2: an inside host's UDP to 8.8.8.8 is admitted, mapped and leaves outside (gate 0).
+    # (An unprivileged source port: a privileged one maps only below 1024,
+    # outside this appliance's pool.)
+    ('NatAppliance', 'nat0', ipv4_udp_frame('8.8.8.8', sport=40000), 0),
 ]
 APPLIANCE_COMMANDS = [
     ('router0', 'self_test'),
+    ('nat0', 'self_test'),
 ]
 
 INSTANCES = [
