@@ -185,7 +185,7 @@ TEST(NatUsageTest, SharedCountsAddUpAcrossWorkersAndGrowth) {
   c.timeout = ~uint64_t{0} / 4;
   auto nat = CountedSharedNat::Create(c).value();
   constexpr int kWorkers = 4, kFlows = 300, kRounds = 20;
-  std::atomic<int> online{0};
+  std::atomic<int> online{0}, finished{0};
   std::atomic<uint64_t> sent{0};
   std::vector<std::thread> workers;
   for (int w = 0; w < kWorkers; w++) {
@@ -204,17 +204,22 @@ TEST(NatUsageTest, SharedCountsAddUpAcrossWorkersAndGrowth) {
         }
       }
       domain.Offline(reader);
+      finished++;
     });
   }
   while (online.load() < kWorkers) {
   }
+  // Grow whenever asked (as the module's handler does) until the workers are
+  // done and nothing more is asked; packets refused while the table was full
+  // are not counted as sent.
   size_t grown = 0;
-  while (grown < 5) {  // 16 -> 512 while the workers count
+  while (finished.load() < kWorkers || nat->NeedsGrowth()) {
     if (nat->NeedsGrowth()) {
-      ASSERT_TRUE(nat->Grow(nat->GrowthTarget()));
+      if (!nat->Grow(nat->GrowthTarget())) {
+        ADD_FAILURE() << "growth failed";
+        break;
+      }
       grown++;
-    } else if (online.load() == kWorkers && sent.load() == uint64_t{kWorkers} * kFlows * kRounds) {
-      break;
     }
     std::this_thread::yield();
   }
