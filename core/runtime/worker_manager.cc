@@ -10,6 +10,7 @@
 
 #include "utils/logging.h"
 
+#include "arch/cpu.h"
 #include "runtime/runtime_state.h"
 #include "runtime/thread_placement.h"
 #include "module.h"
@@ -89,12 +90,13 @@ bool WorkerManager::IsCoreUsed(int core) const {
 void WorkerManager::Pause(int wid) {
   Worker *worker = Get(wid);
   if (worker && worker->status() == WORKER_RUNNING) {
+    // Release store, acquire loads of the same atomic: the worker's
+    // BlockWorker() store of WORKER_PAUSED publishes its last writes here.
     worker->set_status(WORKER_PAUSING);
 
-    FULL_BARRIER();
-
     while (worker->status() == WORKER_PAUSING) {
-    } /* spin */
+      arch::CpuRelax();
+    }
   }
 }
 
@@ -113,7 +115,8 @@ void WorkerManager::Resume(int wid) {
     CHECK_EQ(ret, sizeof(uint64_t));
 
     while (worker->status() == WORKER_PAUSED) {
-    } /* spin */
+      arch::CpuRelax();
+    }
   }
 }
 
@@ -141,7 +144,8 @@ void WorkerManager::Destroy(int wid) {
     CHECK_EQ(ret, sizeof(uint64_t));
 
     while (worker->status() == WORKER_PAUSED) {
-    } /* spin */
+      arch::CpuRelax();
+    }
 
     // Wait for the OS thread to fully exit -- not just for status_ to have
     // left WORKER_PAUSED, which happens earlier, inside BlockWorker() --
@@ -207,11 +211,11 @@ void WorkerManager::Launch(int wid, int core, const std::string &scheduler) {
       << "Destroy() must join it before this wid can be reused.";
   threads_[wid] = std::thread(run_worker, &arg);
   scheduler_names_[wid] = scheduler;
-  INST_BARRIER();
 
   /* spin until it becomes ready and fully paused */
   Worker *worker = workers_[wid].load();
   while (worker == nullptr || worker->status() != WORKER_PAUSED) {
+    arch::CpuRelax();
     worker = workers_[wid].load();
   }
 

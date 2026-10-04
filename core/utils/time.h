@@ -11,12 +11,15 @@
 
 #include <sys/time.h>
 
+#include "arch/cpu.h"
+
+// Ticks per second of rdtsc(), measured at start-up (time.cc).
 extern uint64_t tsc_hz;
 
+// The cycle counter (bess::arch::ReadCycleCounter: x86 TSC, arm64
+// CNTVCT_EL0, else nanoseconds); convert with tsc_hz, never a fixed rate.
 static inline uint64_t rdtsc(void) {
-  uint32_t hi, lo;
-  __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
-  return (uint64_t)lo | ((uint64_t)hi << 32);
+  return bess::arch::ReadCycleCounter();
 }
 
 static inline uint64_t tsc_to_ns(uint64_t cycles) {

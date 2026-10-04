@@ -61,6 +61,7 @@
 #include <thread>
 #include <vector>
 
+#include "arch/cpu.h"
 #include "dataplane/handoff.h"
 #include "utils/dpdk_memory.h"
 #include "utils/rte_ring_alloc.h"
@@ -208,12 +209,13 @@ template <size_t E>
 struct CachedSpsc {
   static constexpr size_t kItemBytes = E;
   struct Ring {
-    alignas(64) std::atomic<uint32_t> head{0};  // producer writes
-    uint32_t cached_tail = 0;                   // producer's copy of tail
-    alignas(64) std::atomic<uint32_t> tail{0};  // consumer writes
-    uint32_t cached_head = 0;                   // consumer's copy of head
-    alignas(64) uint32_t mask = kSlots - 1;
-    alignas(64) std::byte slots[kSlots * E];
+    static constexpr size_t kLine = bess::arch::kCacheLineSize;
+    alignas(kLine) std::atomic<uint32_t> head{0};  // producer writes
+    uint32_t cached_tail = 0;                      // producer's copy of tail
+    alignas(kLine) std::atomic<uint32_t> tail{0};  // consumer writes
+    uint32_t cached_head = 0;                      // consumer's copy of head
+    alignas(kLine) uint32_t mask = kSlots - 1;
+    alignas(kLine) std::byte slots[kSlots * E];
   };
   static Ring *Create() {
     void *memory = std::aligned_alloc(64, (sizeof(Ring) + 63) / 64 * 64);
@@ -455,7 +457,7 @@ void OneWay(benchmark::State &state) {
       if (m != 0) {
         nonempty++;
         for (int64_t i = 0; i < pace; i++) {
-          asm volatile("pause");
+          bess::arch::CpuRelax();
         }
       } else {
         empty++;

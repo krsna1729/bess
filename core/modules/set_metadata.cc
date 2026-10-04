@@ -2,8 +2,6 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include <x86intrin.h>
-
 #include <cmath>
 
 #include "set_metadata.h"

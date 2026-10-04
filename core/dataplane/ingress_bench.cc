@@ -42,6 +42,7 @@
 #include <thread>
 #include <vector>
 
+#include "arch/cpu.h"
 #include "dpdk.h"
 #include "pb/ingress_bench.grpc.pb.h"
 
@@ -201,12 +202,13 @@ double RunGrpc(tpb::IngressBench::Stub &stub, const std::string &variant,
 
 // -- shared memory ring ------------------------------------------------------------
 
-struct alignas(64) ShmRing {
+struct alignas(bess::arch::kCacheLineSize) ShmRing {
   static constexpr uint64_t kSlots = 1 << 16;
-  alignas(64) std::atomic<uint64_t> head{0};  // producer publishes
-  alignas(64) std::atomic<uint64_t> tail{0};  // consumer publishes
-  alignas(64) std::atomic<uint64_t> done{0};
-  alignas(64) uint64_t rec[kSlots][2];
+  static constexpr size_t kLine = bess::arch::kCacheLineSize;
+  alignas(kLine) std::atomic<uint64_t> head{0};  // producer publishes
+  alignas(kLine) std::atomic<uint64_t> tail{0};  // consumer publishes
+  alignas(kLine) std::atomic<uint64_t> done{0};
+  alignas(kLine) uint64_t rec[kSlots][2];
 };
 
 // The producer and consumer spin, so they must be on different CPUs: pin
@@ -241,7 +243,7 @@ double RunShm(Table &table, uint64_t total, uint32_t publish_every, bool apply,
     uint64_t head = 0;
     for (uint64_t i = 0; i < total; i++) {
       while (head - ring->tail.load(std::memory_order_acquire) >= ShmRing::kSlots) {
-        __builtin_ia32_pause();
+        bess::arch::CpuRelax();
       }
       auto &r = ring->rec[head % ShmRing::kSlots];
       r[0] = OpKey(i);

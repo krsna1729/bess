@@ -26,7 +26,7 @@ void UnixSocketAcceptThread::Run() {
 
   while (true) {
     // negative FDs are ignored by ppoll()
-    fds[1].fd = owner_->client_fd_;
+    fds[1].fd = owner_->client_fd_.load(std::memory_order_relaxed);
     int res = ppoll(fds, 2, nullptr, Sigmask());
 
     if (IsExitRequested()) {
@@ -50,11 +50,12 @@ void UnixSocketAcceptThread::Run() {
       }
       if (fd < 0) {
         PLOG(ERROR) << "accept4()";
-      } else if (owner_->client_fd_ != UnixSocketPort::kNotConnectedFd) {
+      } else if (owner_->client_fd_.load(std::memory_order_relaxed) !=
+                 UnixSocketPort::kNotConnectedFd) {
         LOG(WARNING) << "Ignoring additional client\n";
         close(fd);
       } else {
-        owner_->client_fd_ = fd;
+        owner_->client_fd_.store(fd, std::memory_order_relaxed);
         if (owner_->confirm_connect_) {
           // Send confirmation that we've accepted their connect().
           send(fd, "yes", 4, 0);
@@ -63,8 +64,9 @@ void UnixSocketAcceptThread::Run() {
 
     } else if (fds[1].revents & (POLLRDHUP | POLLHUP)) {
       // connection dropped by client
-      int fd = owner_->client_fd_;
-      owner_->client_fd_ = UnixSocketPort::kNotConnectedFd;
+      int fd = owner_->client_fd_.load(std::memory_order_relaxed);
+      owner_->client_fd_.store(UnixSocketPort::kNotConnectedFd,
+                               std::memory_order_relaxed);
       close(fd);
     }
   }
@@ -173,8 +175,9 @@ void UnixSocketPort::DeInit() {
   if (listen_fd_ != kNotConnectedFd) {
     close(listen_fd_);
   }
-  if (client_fd_ != kNotConnectedFd) {
-    close(client_fd_);
+  if (int fd = client_fd_.load(std::memory_order_relaxed);
+      fd != kNotConnectedFd) {
+    close(fd);
   }
 
   for (auto *pkt : pkt_recv_vector_) {
@@ -183,7 +186,7 @@ void UnixSocketPort::DeInit() {
 }
 
 int UnixSocketPort::RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
-  int client_fd = client_fd_;
+  int client_fd = client_fd_.load(std::memory_order_relaxed);
 
   DCHECK_EQ(qid, 0);
 
@@ -226,7 +229,7 @@ int UnixSocketPort::RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) 
 int UnixSocketPort::SendPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) {
   int i;
   int sent = 0;
-  int client_fd = client_fd_;
+  int client_fd = client_fd_.load(std::memory_order_relaxed);
 
   DCHECK_EQ(qid, 0);
 

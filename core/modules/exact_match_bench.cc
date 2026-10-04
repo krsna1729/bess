@@ -39,6 +39,7 @@
 
 #include <rte_hash_crc.h>
 
+#include "arch/crc32c.h"
 #include "classifier/cuckoo_exact.h"
 #include "classifier/extract_plan.h"
 #include "classifier/runtime_schema.h"
@@ -265,7 +266,7 @@ struct Fixture {
       const size_t fixed = probe_hash(probe);
       if (fixed != stored_hash(stored) ||
           fixed != rte_hash_crc(values[i].data(), kKeySize, 0) ||
-          fixed != crc32c_sse42_u64(kHashValues[i], 0)) {
+          fixed != bess::arch::Crc32c(kHashValues[i], 0)) {
         return false;
       }
     }
@@ -723,8 +724,7 @@ void BM_HashLegacy_Chunk(benchmark::State &state) {
   uint32_t sink = 0;
   for (auto _ : state) {
     for (size_t i = 0; i < batch; i++) {
-      sink += static_cast<uint32_t>(
-          crc32c_sse42_u64(values[i % 4], 0));
+      sink += bess::arch::Crc32c(values[i % 4], 0);
     }
     benchmark::DoNotOptimize(sink);
   }

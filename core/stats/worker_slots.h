@@ -36,7 +36,7 @@ namespace bess::stats {
 // atomic; they just carry no grouping guarantee.
 //
 // Worker cost of an Update is two extra stores to a line the worker already
-// owns; on x86 the fences compile to nothing.
+// owns, plus the fences: none on x86 (TSO), a DMB and an STLR on arm64.
 class WorkerSlots {
   static constexpr size_t kWordsPerLine = kCacheLine / sizeof(uint64_t);
 

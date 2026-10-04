@@ -67,6 +67,35 @@ inline uint64_t ReadCycleCounter() noexcept {
 #endif
 }
 
+// ReadCycleCounter() ordered against the surrounding instructions, for timing
+// one short operation: every earlier instruction has finished before the read
+// and no later one starts until it is done (x86 LFENCE on both sides; arm64
+// ISB on both sides; elsewhere only the compiler is held back). Slower than
+// ReadCycleCounter(); measure its own cost and subtract it.
+inline uint64_t ReadCycleCounterSerialized() noexcept {
+#if defined(BESS_ARCH_X86)
+  _mm_lfence();
+  const uint64_t v = __rdtsc();
+  _mm_lfence();
+  return v;
+#elif defined(BESS_ARCH_ARM64)
+  uint64_t v;
+  asm volatile("isb\n\tmrs %0, cntvct_el0\n\tisb" : "=r"(v) : : "memory");
+  return v;
+#else
+  asm volatile("" ::: "memory");
+  const uint64_t v = ReadCycleCounter();
+  asm volatile("" ::: "memory");
+  return v;
+#endif
+}
+
+// Stops the compiler from moving memory accesses across this point; emits no
+// instruction and orders nothing between CPUs.
+inline void CompilerBarrier() noexcept {
+  asm volatile("" ::: "memory");
+}
+
 }  // namespace bess::arch
 
 #endif  // BESS_ARCH_CPU_H_

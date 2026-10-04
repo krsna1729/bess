@@ -4,6 +4,8 @@
 
 #include "bypass.h"
 
+#include "arch/cpu.h"
+
 CommandResponse Bypass::Init(const bess::pb::BypassArg &arg) {
   cycles_per_batch_ = arg.cycles_per_batch();
   cycles_per_packet_ = arg.cycles_per_packet();
@@ -29,7 +31,7 @@ void Bypass::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     uint64_t target_tsc = start_tsc + cycles;
     // burn cycles until it comsumes target cycles
     while (rdtsc() < target_tsc) {
-      _mm_pause();
+      bess::arch::CpuRelax();
     }
   }
   RunChooseModule(ctx, ctx->current_igate, batch);

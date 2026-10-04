@@ -34,6 +34,7 @@
 #include <span>
 #include <vector>
 
+#include "arch/crc32c.h"
 #include "nat/nat.h"
 #include "utils/cuckoo_map.h"
 
@@ -52,7 +53,7 @@ struct LegacyHash {
   size_t operator()(const Endpoint &e) const {
     uint64_t v;
     std::memcpy(&v, &e, 8);
-    return crc32c_sse42_u64(v, 0);
+    return bess::arch::Crc32c(v, 0);
   }
 };
 struct LegacyEq {

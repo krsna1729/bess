@@ -30,8 +30,6 @@
 
 #include <benchmark/benchmark.h>
 
-#include <rte_hash_crc.h>
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -40,6 +38,7 @@
 #include <string>
 #include <vector>
 
+#include "arch/crc32c.h"
 #include "classifier/masked_exact.h"
 #include "utils/cuckoo_map.h"
 
@@ -330,15 +329,10 @@ struct LegacyHash {
 
   HashResult operator()(const LegacyKey &key) const noexcept {
     HashResult hash = 0;
-#if __x86_64
     for (size_t i = 0; i < words; i++) {
-      hash = static_cast<HashResult>(crc32c_sse42_u64(key.words[i], hash));
+      hash = static_cast<HashResult>(bess::arch::Crc32c(key.words[i], hash));
     }
     return hash;
-#else
-    return static_cast<HashResult>(
-        rte_hash_crc(&key, words * sizeof(uint64_t), hash));
-#endif
   }
 };
 

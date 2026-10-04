@@ -22,6 +22,7 @@
 #include <sstream>
 #include <string>
 
+#include "arch/signal_context.h"
 #include "module.h"
 #include "packet.h"
 #include "scheduler.h"
@@ -212,13 +213,9 @@ static void TrapHandler(int sig_num, siginfo_t *info, void *ucontext) {
   if (is_fatal && !__sync_bool_compare_and_swap(&already_trapped, false, true))
     return;
 
-#if __i386
-  trap_ip = reinterpret_cast<void *>(uc->uc_mcontext.gregs[REG_EIP]);
-#elif __x86_64
-  trap_ip = reinterpret_cast<void *>(uc->uc_mcontext.gregs[REG_RIP]);
-#else
-#error neither x86 or x86-64
-#endif
+  // nullptr when the architecture's register layout is unknown: StackTrace()
+  // then prints the handler's own backtrace.
+  trap_ip = reinterpret_cast<void *>(arch::ProgramCounter(*uc));
 
   if (is_fatal) {
     oops << "A critical error has occured. Aborting..." << std::endl;

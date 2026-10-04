@@ -477,6 +477,7 @@ core_public_subdir_headers = {
   'arch': files(
     'arch/cpu.h',
     'arch/crc32c.h',
+    'arch/signal_context.h',
   ),
   'utils': files(
     'utils/arp.h',
@@ -583,6 +584,7 @@ endforeach
 
 unit_test_sources = [
   'arch/arch_test.cc',
+  'arch/signal_context_test.cc',
   'flow/decision_cache_test.cc',
   'flow/expiry_consumer_test.cc',
   'offload/flow_rule_owner_test.cc',
@@ -690,6 +692,7 @@ unit_test_sources = [
   'utils/histogram_test.cc',
   'utils/ip_test.cc',
   'utils/llqueue_test.cc',
+  'utils/mcslock_test.cc',
   'utils/pcap_handle_test.cc',
   'utils/tcp_flow_reconstruct_test.cc',
   'utils/time_test.cc',
