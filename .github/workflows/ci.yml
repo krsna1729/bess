@@ -6,8 +6,9 @@ on:
     tags: ['v*']
   pull_request:
     branches: [master, develop]
-  # Nightly: every lane and the benchmark suite, on develop, even without a
-  # push (docs/ci-parity.md).
+  # Nightly: every lane and the benchmark suite on develop, even without a
+  # push (docs/ci-parity.md). A schedule runs on the default branch (master),
+  # so every checkout below names develop for it.
   schedule:
     - cron: '17 3 * * *'
 
@@ -90,6 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || '' }}
           sparse-checkout: tools/ci_profile.py
           sparse-checkout-cone-mode: false
       - id: pick
@@ -103,8 +105,6 @@ jobs:
     continue-on-error: ${{ matrix.experimental }}
     env:
       LANE: --cc ${{ matrix.cc }} --cxx ${{ matrix.cxx }} --name ${{ matrix.name }} ${{ matrix.lane_args }}
-      # Outside the checkout: the clean-tree step checks it is unchanged.
-      CCACHE_DIR: /home/runner/.ccache
       CCACHE_MAXSIZE: 500M
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_COMPRESS: 'true'
@@ -115,6 +115,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || '' }}
           # The merge commit and its base parent: tidy checks a pull
           # request's changed sources.
           fetch-depth: 2
@@ -154,13 +155,17 @@ jobs:
 
       # The configuration and the verification steps live in tools/ci_profile.py,
       # which a developer runs unchanged (docs/ci-parity.md).
-      # Compiler cache per lane, saved by every run and restored from the
-      # newest (pull requests can read develop's). Keyed by commit so each run
-      # saves its own; the prefix restores the most recent.
-      - name: Cache compiler output
-        uses: actions/cache@v6
+      # Compiler cache per lane, outside the checkout (clean-tree checks the
+      # tree is unchanged). Every run restores the newest; only pushes and the
+      # nightly run save (a pull request's 500 MB per lane would churn the
+      # repository's 10 GB cache and evict the DPDK caches).
+      - name: Locate the compiler cache
+        run: echo "CCACHE_DIR=${{ runner.temp }}/ccache" >> "$GITHUB_ENV"
+
+      - name: Restore compiler output
+        uses: actions/cache/restore@v6
         with:
-          path: /home/runner/.ccache
+          path: ${{ runner.temp }}/ccache
           key: ccache-${{ matrix.name }}-${{ runner.arch }}-${{ github.sha }}
           restore-keys: ccache-${{ matrix.name }}-${{ runner.arch }}-
 
@@ -197,6 +202,13 @@ jobs:
       - name: Dump daemon logs on failure
         if: failure()
         run: cat /tmp/bessd.*.INFO.* 2>/dev/null || true
+
+      - name: Save compiler output
+        if: success() && github.event_name != 'pull_request'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ matrix.name }}-${{ runner.arch }}-${{ github.sha }}
 
   publish-release:
     name: Package and Publish Release Binaries
