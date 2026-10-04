@@ -77,6 +77,29 @@ under a new request id could apply the transaction twice.
 
 ## Tests
 
+`pybess/test_sdk_model.py` checks the commit protocol against every
+small-scope behaviour (roadmap Appendix L, A1+): a simulated daemon keeps the
+truth (its epoch, what it applied), and a depth-first search replays the
+client against every combination of a lost request, a lost reply after the
+daemon acted, a busy answer, and a daemon restart before any RPC, for 1 to 4
+attempts (8 to 121 paths). Invariants: at most one application over all
+epochs; `Applied` only if applied, in the answering epoch; `Busy` only if
+nothing applied; `TransportError` only after an unanswered RPC;
+`DaemonRestarted` only after a restart. A blind resend, an ignored epoch and
+`Busy` after an unanswered send each fail it.
+
+| Model action | Code |
+|---|---|
+| Send | `Client._commit` → `ApplyTransaction` |
+| Ask | `Client.get_transaction` → `GetTransaction` |
+| Resend | `_commit`, only after "not known" under the commit's epoch |
+| Epoch check | `Client._check_epoch` / `_observe_epoch` |
+| Out of attempts | the end of `_commit` (`TransportError` or `Busy`) |
+
+The Go client follows the same contract (`sdk/go/bess/client.go`); its scripted
+tests cover the same cases.
+
+
 `pybess/test_sdk.py` and `sdk/go/bess/client_test.go` script every recovery
 path against a fake transport (the `python` suite; the CI job "Go SDK", with
 the race detector). Against a live daemon (the `integration` suite):
