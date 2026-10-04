@@ -34,13 +34,13 @@
 #include <string_view>
 #include <vector>
 
-#include <absl/log/globals.h>
 #include <google/protobuf/any.pb.h>
 #include <google/protobuf/util/message_differencer.h>
 
 #include "dataplane/resource.h"
 #include "framework/resource_codec.h"
 #include "fuzz/fuzz_support.h"
+#include "fuzz/protobuf_quiet.h"
 #include "gate.h"
 #include "pb/module_msg.pb.h"
 #include "utils/ip.h"
@@ -300,8 +300,7 @@ void Run(KeyResult (*key_fn)(const KeyMsg &),
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   static const bool quiet = [] {
-    // Malformed input is expected; protobuf's per-parse error logs are noise.
-    absl::SetMinLogLevel(absl::LogSeverityAtLeast::kInfinity);
+    bess::fuzz::QuietProtobufLogs();
     return true;
   }();
   (void)quiet;

@@ -53,7 +53,6 @@
 #include <utility>
 #include <vector>
 
-#include <absl/log/globals.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include <google/protobuf/util/message_differencer.h>
@@ -65,6 +64,7 @@
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
 #include "fuzz/fuzz_support.h"
+#include "fuzz/protobuf_quiet.h"
 #include "gate.h"
 #include "pb/control_v2.pb.h"
 #include "pb/module_msg.pb.h"
@@ -715,8 +715,7 @@ void CheckList(const Fixture &f, const Model &model, uint64_t epoch) {
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   static const bool quiet = [] {
-    // Malformed input is expected; protobuf's per-parse error logs are noise.
-    absl::SetMinLogLevel(absl::LogSeverityAtLeast::kInfinity);
+    bess::fuzz::QuietProtobufLogs();
     return true;
   }();
   (void)quiet;
