@@ -8,16 +8,9 @@
 #include <cstring>
 
 #include "utils/logging.h"
+#include "utils/sanitizers.h"
 
-#if defined(__SANITIZE_THREAD__)
-#define BESS_THREAD_SANITIZER 1
-#elif defined(__has_feature)
-#if __has_feature(thread_sanitizer)
-#define BESS_THREAD_SANITIZER 1
-#endif
-#endif
-
-#if defined(BESS_THREAD_SANITIZER)
+#if BESS_THREAD_SANITIZER
 // rte_rcu_qsbr_check() answers from acked_token, a relaxed copy another checker
 // wrote, so a thread whose check takes that path has no happens-before edge
 // from the readers' quiescent reports (benign on hardware: the reclaimer's

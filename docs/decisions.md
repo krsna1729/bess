@@ -6356,7 +6356,8 @@ accounting is coarser there; NEON versions of the tag and word kernels (arm64 us
 **Code:** `core/fuzz/` (ten harnesses, seeds, `make_seeds.py`, replay main), `core/testing/allocation_faults.{h,cc}`,
 model tests `core/{flow/decision_cache,conntrack/conntrack,nat/nat,l2/fdb}_model_test.cc`, `.clang-tidy`,
 `tools/check_tidy.py`, `tools/tidy_baseline.json`, `tools/sanitizers/{tsan.supp,tsan_tests.txt}`,
-`core/runtime/dpdk.cc`, `core/rcu/rcu_domain.cc`, `meson.build`, `meson_options.txt` (`build_fuzzers`),
+`core/utils/sanitizers.h` (one detection of ASan and TSan for GCC and every clang), `core/runtime/dpdk.cc`,
+`core/rcu/rcu_domain.cc`, `meson.build`, `meson_options.txt` (`build_fuzzers`),
 `core/meson.build`, `tools/ci_profile.py`, `.github/workflows/ci.yml`, `env/install-deps.sh`, `docs/fuzzing.md`; the
 production fixes listed below.
 

@@ -9,16 +9,9 @@
 // mismatch is between two runtimes, not in BESS code; turn that one check off.
 // Every other ASan check stays on, and ASAN_OPTIONS still overrides this.
 
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer)
-#define BESS_FUZZ_ASAN 1
-#endif
-#endif
-#if defined(__SANITIZE_ADDRESS__)
-#define BESS_FUZZ_ASAN 1
-#endif
+#include "utils/sanitizers.h"
 
-#ifdef BESS_FUZZ_ASAN
+#if BESS_ADDRESS_SANITIZER
 extern "C" const char *__asan_default_options() {
   return "alloc_dealloc_mismatch=0";
 }

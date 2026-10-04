@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "utils/logging.h"
+#include "utils/sanitizers.h"
 #include <rte_config.h>
 #include <rte_cycles.h>
 #include <rte_eal.h>
@@ -25,18 +26,6 @@
 #include "runtime/memory.h"
 #include "runtime/opts.h"
 
-// AddressSanitizer: GCC defines __SANITIZE_ADDRESS__, clang reports it through
-// __has_feature.
-#if defined(__SANITIZE_ADDRESS__)
-#define BESS_ADDRESS_SANITIZER 1
-#elif defined(__has_feature)
-#if __has_feature(address_sanitizer)
-#define BESS_ADDRESS_SANITIZER 1
-#endif
-#endif
-#ifndef BESS_ADDRESS_SANITIZER
-#define BESS_ADDRESS_SANITIZER 0
-#endif
 
 namespace bess {
 namespace {
