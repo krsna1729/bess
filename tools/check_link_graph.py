@@ -220,8 +220,11 @@ def main():
     for a, b, n in violations:
         owned = libs[b][0]
         symbols = sorted(s for s in libs[a][1] if s in owned)
-        shown = subprocess.run(["c++filt"], input="\n".join(symbols[:5]), capture_output=True,
-                               text=True).stdout.split("\n") if symbols else []
+        try:
+            shown = subprocess.run(["c++filt"], input="\n".join(symbols[:5]), capture_output=True,
+                                   text=True).stdout.split("\n") if symbols else []
+        except OSError:  # no c++filt: the mangled names still say enough
+            shown = symbols[:5]
         print(f"ERROR: forbidden link edge {a} -> {b} ({n} symbols) "
               f"is in neither 'allowed' nor 'exceptions'; first: "
               + "; ".join(s for s in shown if s))

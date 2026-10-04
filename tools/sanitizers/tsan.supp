@@ -16,4 +16,7 @@ race:__rte_ring_enqueue_elems
 # QSBR defer queue inside librte_lpm (uninstrumented); TSan sees the group's
 # re-initialising memset and an inline lookup's read, not the grace period
 # between them. The route tests check every concurrent answer (D-046, D-047).
-race:rte_lpm_lookup
+# Suppressed by the writer (the tbl8 group's re-initialisation in librte_lpm),
+# not the inline reader: a race of any other writer against a FIB lookup --
+# a BESS table freed or reset under readers -- is still reported.
+race:add_depth_big

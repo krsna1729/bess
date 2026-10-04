@@ -6379,7 +6379,8 @@ decision cache's generations, and no static analysis beyond the layering checks.
   tests in `tools/sanitizers/tsan_tests.txt` (RCU, object tables, scopes, the transaction engine, handoff,
   continuations, shared flow table, decision cache, stats, L2 table, routes, concurrent exact table, MCS lock), with
   three suppressions (rte_hash's uninstrumented key compare; rte_ring's element copies, ordered by standalone
-  fences TSan does not model; rte_lpm's tbl8 reuse, ordered by a QSBR defer queue inside uninstrumented librte_lpm). FDB, neighbor table, expiry wheel, offload owner and the
+  fences TSan does not model; rte_lpm's tbl8 reuse, ordered by a QSBR defer queue inside uninstrumented librte_lpm, suppressed by its writer
+  `add_depth_big` so a race against a FIB lookup by anything else is still reported). FDB, neighbor table, expiry wheel, offload owner and the
   instance registry are single-owner by contract; their publication is covered through RCU, Router and transactions.
 - **Fuzzing.** Ten libFuzzer harnesses (packet cursor, mutation, checksum plan, classifier schema, resource codec,
   route prefix, conntrack, NAT, tunnel decap, control transactions), each with an oracle beyond "no crash", none
