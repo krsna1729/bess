@@ -5053,6 +5053,19 @@ rather than one call site).
      small tables, tunnel validated path, checksum); then reference appliances against installed headers (M24) and
      the thin control SDK (M27). Kept against the review: NAT growth (user decision 3), gated so a growable table
      costs what a fixed one does outside migration.
+162. **Queue drain and CI throughput (2026-10-04, user decision).** Five PRs times ten lanes (about 40 min each)
+     saturated GitHub's 20 concurrent jobs. CI now runs 5 jobs on a pull request (gcc and clang gating, the two
+     sanitizer lanes, protobuf; arm64, generic and ubuntu-26.04 on pushes and nightly), builds but does not run the
+     benchmarks on pull requests (they were 1047 s of the gating lane's 1310 s test step), restores a per-lane ccache
+     that pushes and the nightly run save, checks clang-tidy on a pull request's changed sources only, runs every lane
+     nightly on `develop`, and cancels a run when a newer commit supersedes it (per pull request, per branch; tag runs
+     always complete). One-off, by user decision, to drain the queue: #20 (D-074), #21 (CI, roadmap Appendices L and
+     M) and #22 were merged with `--admin` before their pull-request checks finished, and table policy (D-073, #18),
+     conntrack `TrackBatch` (D-067 change) and the first M23 slice (persona A sample, compile-time negative tests,
+     hermetic verify-install that loads the installed-tree plugins) were merged locally and pushed to `develop`. Each
+     had a Reviewer pass and local tests; `develop`'s own CI run on the tip (`25e02a3a`) and a local build and test of
+     the tip are the validation (local: 131/132; the one failure was this machine's unconfigured Go shim, and the
+     Go live test passes with a working Go). Normal flow (pull request, required checks) resumes.
 
 ## Review process established this session
 

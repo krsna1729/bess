@@ -27,7 +27,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 def go_command():
     if os.environ.get('BESS_GO'):
         return shlex.split(os.environ['BESS_GO'])
-    if shutil.which('go'):
+    # A `go` on PATH that cannot run (an unconfigured version-manager shim)
+    # is no toolchain.
+    if shutil.which('go') and subprocess.run(['go', 'version'], capture_output=True).returncode == 0:
         return ['go']
     return None
 
