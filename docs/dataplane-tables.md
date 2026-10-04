@@ -486,7 +486,7 @@ reference to something missing.
 | HashLB | configuration only (`ExactMatchTable` for field layout) | G: one `RcuPtr<Config>`, read once per batch | D-017 |
 | URLFilter | `Trie` per host | Pause | legacy: cleartext HTTP only; a modern SNI classifier is recorded in MODERNIZATION §31.6 |
 | BPF | compiled filters | Pause | deferred: G together with the `rte_bpf` decision (MODERNIZATION §31.6) |
-| NAT | `CuckooMap` | worker-owned (the packet path learns flows) | limited to one worker |
+| NAT | `nat::Nat`: bindings on `WorkerFlowTable` (internal endpoint key, external alias), `PortPool` bitmaps, expiry wheel | worker-owned (the packet path creates mappings) | one worker; D-068 |
 | DRR | `CuckooMap` of flows | worker-owned: upstream workers hand packets over an MP/SC ingress ring; the task's worker owns the flow map and queues; commands are atomics | D-019 |
 | Bridge | `l2::Fdb` (`MacTable` + `ExpiryWheel`) | worker-owned (the packet path learns); commands are THREAD_UNSAFE | one worker; D-064 |
 
@@ -521,8 +521,7 @@ The reasoning, rejected alternatives, evidence and revisit triggers are in
 
 BESS discovers host facts once per process, and decides everything that
 depends on a particular table when that table is built. Nothing is tuned
-while packets flow except NAT's per-batch prefetch check (below), and
-nothing needs privileges.
+while packets flow, and nothing needs privileges.
 
 **Once per process (the daemon logs these at startup):**
 
@@ -538,7 +537,7 @@ nothing needs privileges.
 |---|---|---|
 | cuckoo backends (WildcardMatch tuples, typed `ExactTable`) | plain or staged body, at generation build | `ResolveLookupBody()` from the built table's footprint and lookup shape |
 | L2Forward's `l2_table` | plain or staged body, at `l2_init` (module Init) | same |
-| NAT's `CuckooMap` | whether to prefetch, **per batch** | `PrefetchBatch()` re-checks the footprint each batch, because the table grows while packets flow; the check is a size comparison |
+| NAT's binding table (`WorkerFlowTable`, D-068) | capacity, at module Init | `Nat::CapacityFor(addresses)`: the mappings the addresses' ports can serve, at most 1M; `FindBatch` always prefetches |
 | `ConcurrentExactTable` (ExactMatch) | capacity, at create and on growth | `CapacityFor(rules)` and `Headroom()` (D-010); DPDK's own bulk lookup, no body choice |
 | `ConcurrentExactTable`, inside `rte_hash` | signature and key compare functions, at create | DPDK picks SSE2 signature compare, and a SIMD key compare for 16/32/…/128-byte keys (`memcmp` otherwise) |
 | `RouteTable` (`rte_lpm`) | nothing | always plain: one independent load per packet |

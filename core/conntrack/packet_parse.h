@@ -3,6 +3,7 @@
 #ifndef BESS_CONNTRACK_PACKET_PARSE_H_
 #define BESS_CONNTRACK_PACKET_PARSE_H_
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -63,18 +64,21 @@ inline uint16_t Be16(const uint8_t *p) noexcept {
 
 inline constexpr size_t kMaxExtensionHeaders = 8;
 
-// L4 at `off` within `pkt` (the IP packet's bytes up to its stated length).
-inline ParseStatus ParseL4(std::span<const uint8_t> pkt, size_t off, size_t frame_base,
-                           ParsedFlowPacket &out) noexcept {
+// L4 at `off` of the IP packet at `ip`: `present` bytes of it are readable
+// (headers must lie there), `total` is its stated length (which the length
+// checks use; for a chained packet the rest lies in later segments).
+inline ParseStatus ParseL4(const uint8_t *ip, size_t present, size_t total, size_t off,
+                           size_t frame_base, ParsedFlowPacket &out) noexcept {
   out.l4_offset = static_cast<uint16_t>(frame_base + off);
-  out.l4_length = static_cast<uint16_t>(pkt.size() - off);
-  const uint8_t *l4 = pkt.data() + off;
-  const size_t room = pkt.size() - off;
+  out.l4_length = static_cast<uint16_t>(total - off);
+  const uint8_t *l4 = ip + off;
+  const size_t have = present > off ? present - off : 0;  // readable header bytes
+  const size_t room = total - off;                          // the L4 length
   switch (out.protocol) {
     case 6: {  // TCP
       // A first fragment holds at least the fixed header; its options may
       // continue in the next fragment.
-      if (room < 20 || (l4[12] >> 4) < 5 ||
+      if (have < 20 || (l4[12] >> 4) < 5 ||
           (!out.first_fragment && static_cast<size_t>(l4[12] >> 4) * 4 > room)) {
         return ParseStatus::kMalformed;
       }
@@ -87,7 +91,7 @@ inline ParseStatus ParseL4(std::span<const uint8_t> pkt, size_t off, size_t fram
     case 17: {  // UDP
       // The UDP length covers the whole datagram, so a first fragment holds
       // less than it says.
-      if (room < 8 || Be16(l4 + 4) < 8 || (!out.first_fragment && Be16(l4 + 4) > room)) {
+      if (have < 8 || Be16(l4 + 4) < 8 || (!out.first_fragment && Be16(l4 + 4) > room)) {
         return ParseStatus::kMalformed;
       }
       out.l4 = L4Kind::kUdp;
@@ -97,7 +101,7 @@ inline ParseStatus ParseL4(std::span<const uint8_t> pkt, size_t off, size_t fram
     }
     case 1:     // ICMP
     case 58: {  // ICMPv6
-      if (room < 8) {
+      if (have < 8) {
         return ParseStatus::kMalformed;
       }
       out.l4 = out.protocol == 1 ? L4Kind::kIcmp : L4Kind::kIcmpv6;
@@ -112,21 +116,24 @@ inline ParseStatus ParseL4(std::span<const uint8_t> pkt, size_t off, size_t fram
   }
 }
 
-// An IP packet starting at `ip` (frame offset `base`), at most `room` bytes.
-inline ParseStatus ParseIp(const uint8_t *ip, size_t room, size_t base,
+// An IP packet starting at `ip` (frame offset `base`): `present` bytes are
+// readable, `limit` bytes are the packet's (present <= limit; they differ for
+// a chained packet). Headers must be present; lengths are checked against
+// `limit`.
+inline ParseStatus ParseIp(const uint8_t *ip, size_t present, size_t limit, size_t base,
                            ParsedFlowPacket &out) noexcept {
-  if (room < 1) {
+  if (present < 1) {
     return ParseStatus::kMalformed;
   }
   out.l3_offset = static_cast<uint16_t>(base);
   const unsigned version = ip[0] >> 4;
   if (version == 4) {
     const size_t ihl = static_cast<size_t>(ip[0] & 0x0f) * 4;
-    if (room < 20 || ihl < 20 || ihl > room) {
+    if (present < 20 || ihl < 20 || ihl > present) {
       return ParseStatus::kMalformed;
     }
     const size_t total = Be16(ip + 2);
-    if (total < ihl || total > room) {
+    if (total < ihl || total > limit) {
       return ParseStatus::kMalformed;
     }
     out.l3 = L3Kind::kIpv4;
@@ -137,16 +144,17 @@ inline ParseStatus ParseIp(const uint8_t *ip, size_t room, size_t base,
       return ParseStatus::kFragment;
     }
     out.first_fragment = (Be16(ip + 6) & 0x2000) != 0;  // MF set, offset 0
-    return ParseL4(std::span<const uint8_t>(ip, total), ihl, base, out);
+    return ParseL4(ip, std::min(present, total), total, ihl, base, out);
   }
   if (version == 6) {
-    if (room < 40) {
+    if (present < 40) {
       return ParseStatus::kMalformed;
     }
     const size_t total = 40 + size_t{Be16(ip + 4)};
-    if (total > room) {
+    if (total > limit) {
       return ParseStatus::kMalformed;
     }
+    const size_t have = std::min(present, total);
     out.l3 = L3Kind::kIpv6;
     std::memcpy(out.src.data(), ip + 8, 16);
     std::memcpy(out.dst.data(), ip + 24, 16);
@@ -157,11 +165,11 @@ inline ParseStatus ParseIp(const uint8_t *ip, size_t room, size_t base,
         return ParseStatus::kMalformed;
       }
       if (next == 0 || next == 43 || next == 60) {  // hop-by-hop, routing, dest opts
-        if (off + 8 > total) {
+        if (off + 8 > have) {
           return ParseStatus::kMalformed;
         }
         const size_t len = (size_t{ip[off + 1]} + 1) * 8;
-        if (off + len > total) {
+        if (off + len > have) {
           return ParseStatus::kMalformed;
         }
         next = ip[off];
@@ -169,7 +177,7 @@ inline ParseStatus ParseIp(const uint8_t *ip, size_t room, size_t base,
         continue;
       }
       if (next == 44) {  // fragment
-        if (off + 8 > total) {
+        if (off + 8 > have) {
           return ParseStatus::kMalformed;
         }
         const bool initial = (Be16(ip + off + 2) & 0xfff8) == 0;
@@ -185,14 +193,21 @@ inline ParseStatus ParseIp(const uint8_t *ip, size_t room, size_t base,
       break;
     }
     out.protocol = next;
-    return ParseL4(std::span<const uint8_t>(ip, total), off, base, out);
+    return ParseL4(ip, have, total, off, base, out);
   }
   return ParseStatus::kMalformed;
 }
 }  // namespace parse_internal
 
 // Parses an Ethernet frame (optionally with up to two 802.1Q/802.1ad tags).
-inline ParseStatus ParseFrame(std::span<const uint8_t> frame, ParsedFlowPacket &out) noexcept {
+// `frame` is the readable bytes (for a chained packet, its first segment) and
+// `total_len` the packet's length (default: the span's): the headers must be
+// in `frame`, and the IP and L4 lengths are checked against `total_len`.
+inline ParseStatus ParseFrame(std::span<const uint8_t> frame, ParsedFlowPacket &out,
+                              size_t total_len = 0) noexcept {
+  if (total_len < frame.size()) {
+    total_len = frame.size();
+  }
   out = ParsedFlowPacket{};
   size_t off = 12;
   if (frame.size() < 14) {
@@ -210,8 +225,8 @@ inline ParseStatus ParseFrame(std::span<const uint8_t> frame, ParsedFlowPacket &
   if (type != 0x0800 && type != 0x86dd) {
     return ParseStatus::kNotIp;
   }
-  const ParseStatus s =
-      parse_internal::ParseIp(frame.data() + off, frame.size() - off, off, out);
+  const ParseStatus s = parse_internal::ParseIp(frame.data() + off, frame.size() - off,
+                                                total_len - off, off, out);
   if (s == ParseStatus::kOk &&
       ((type == 0x0800) != (out.l3 == L3Kind::kIpv4))) {
     return ParseStatus::kMalformed;  // EtherType and IP version disagree
@@ -222,7 +237,7 @@ inline ParseStatus ParseFrame(std::span<const uint8_t> frame, ParsedFlowPacket &
 // Parses a packet that starts at its IP header.
 inline ParseStatus ParseIpPacket(std::span<const uint8_t> packet, ParsedFlowPacket &out) noexcept {
   out = ParsedFlowPacket{};
-  return parse_internal::ParseIp(packet.data(), packet.size(), 0, out);
+  return parse_internal::ParseIp(packet.data(), packet.size(), packet.size(), 0, out);
 }
 
 }  // namespace bess::conntrack

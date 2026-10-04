@@ -8,7 +8,7 @@
 //   L2Forward  l2_table, 4-way buckets of 8-byte slots (inline entries): a
 //              hit is hash -> primary bucket line (-> alternate bucket).
 //              Staged: hash all + prefetch primary buckets, then l2_find.
-//   NAT        CuckooMap<Endpoint, NatEntry>: hash -> bucket -> entry.
+//   NAT        the binding table (WorkerFlowTable, aliased; M18).
 //              Staged: hash + PrefetchBucketPrehashed, then FindPrehashedAs.
 //   Wildcard   RuntimeMaskedBackend, 16-byte keys, 1/4/8 tuples (masks); each
 //              lookup probes every tuple (one hit, the rest misses). Plain vs
@@ -19,15 +19,17 @@
 #include <benchmark/benchmark.h>
 
 #include <array>
+#include <bit>
 #include <cstring>
 #include <memory>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "classifier/masked_exact.h"
 #include "modules/l2_table.h"
-#include "modules/nat.h"
+#include "nat/nat.h"
 
 namespace {
 
@@ -108,11 +110,17 @@ BENCHMARK(BM_L2Forward)
 
 // -- NAT ------------------------------------------------------------------------------
 
-using NatMap = bess::utils::CuckooMap<Endpoint, NatEntry, Endpoint::Hash,
-                                      Endpoint::EqualTo>;
+// The NAT module's binding table (M18, D-068): one binding per mapping, its
+// internal endpoint the key and its external endpoint an alias. The legacy
+// CuckooMap is compared in nat_bench (BM_Lookup).
+using NatTable = bess::nat::Nat::Table;
+using bess::utils::be16_t;
+using bess::utils::be32_t;
+using bess::nat::Binding;
+using bess::nat::Endpoint;
 
 struct NatFixture {
-  NatMap map;
+  std::unique_ptr<NatTable> table;
   std::vector<Endpoint> stream;
 };
 
@@ -123,18 +131,16 @@ NatFixture &NatFor(size_t entries) {
   f.reset();
   f = std::make_unique<NatFixture>();
   built = entries;
+  f->table = NatTable::Create(entries + entries / 4).value();
   std::mt19937_64 rng(0x4321 + entries);
   std::vector<Endpoint> keys;
+  uint32_t ext = 0;
   while (keys.size() < entries) {
     const uint64_t r = rng();
-    Endpoint e;
-    e.addr = be32_t(static_cast<uint32_t>(r));
-    e.port = be16_t(static_cast<uint16_t>(r >> 32));
-    e.protocol = 6;
-    if (f->map.Find(e) != nullptr) continue;
-    NatEntry v{};
-    v.endpoint = e;
-    if (f->map.Insert(e, v) == nullptr) std::abort();
+    Endpoint e{be32_t(static_cast<uint32_t>(r)), be16_t(static_cast<uint16_t>(r >> 32)), 6};
+    const Endpoint x{be32_t(0xc6000000u | (ext >> 16)), be16_t(static_cast<uint16_t>(ext)), 17};
+    if (!f->table->EmplaceAliased(e, x, Binding{e, x, 0, 0}).created()) continue;
+    ext++;
     keys.push_back(e);
   }
   f->stream.resize(kStream);
@@ -144,36 +150,22 @@ NatFixture &NatFor(size_t entries) {
 
 void BM_Nat(benchmark::State &st) {
   NatFixture &f = NatFor(static_cast<size_t>(st.range(1)));
-  const LookupBody body = BodyArg(
-      st.range(0), {.table_bytes = f.map.MemoryBytes(), .dependent_lines = 2,
-                    .branches_on_loaded_data = true});
-  const Endpoint::Hash hash;
-  const Endpoint::EqualTo eq;
   size_t offset = 0;
   uint64_t found = 0;
-  const NatMap::Entry *hits[kBatch];
-  bess::utils::HashResult h[kBatch];
+  const Binding *hits[kBatch];
   for (auto _ : st) {
-    const Endpoint *keys = &f.stream[offset];
-    bess::dataplane::RunBatch(
-        body, kBatch,
-        [&](size_t i) {
-          h[i] = static_cast<bess::utils::HashResult>(hash(keys[i]));
-          f.map.PrefetchBucketPrehashed(h[i]);
-        },
-        [&](size_t i) {
-          hits[i] = std::as_const(f.map).FindPrehashedAs(h[i], keys[i], eq);
-          found += hits[i] != nullptr;
-        });
+    found += std::popcount(f.table->FindBatch(
+        std::span<const Endpoint>(&f.stream[offset], kBatch), std::span<const Binding *>(hits, kBatch)));
     benchmark::DoNotOptimize(hits);
     offset = (offset + kBatch) % f.stream.size();
   }
   if (found != st.iterations() * kBatch) st.SkipWithError("NAT lookup missed");
   st.SetItemsProcessed(st.iterations() * kBatch);
-  st.counters["table_bytes"] = static_cast<double>(f.map.MemoryBytes());
-  st.SetLabel(BodyLabel(st.range(0), body));
+  st.counters["table_bytes"] = static_cast<double>(f.table->memory_bytes());
+  st.SetLabel("binding table FindBatch");
 }
-BENCHMARK(BM_Nat)->ArgsProduct({{0, 1, 2}, {4096, 65536, 1048576, 4194304}});
+// The first argument is kept (0 only) so the row names stay comparable.
+BENCHMARK(BM_Nat)->ArgsProduct({{0}, {4096, 65536, 1048576, 4194304}});
 
 // -- WildcardMatch ------------------------------------------------------------------
 

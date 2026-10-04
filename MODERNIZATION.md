@@ -4998,6 +4998,18 @@ rather than one call site).
      a connection. Building the key with word stores took a packet from 36 to 20 ns (an unisolated pair). 26
      mutants caught (5 after strengthening tests). Reviewed: four findings fixed.
 
+156. **M18 NAT extraction (D-068).** `nat/nat.h`: endpoints, paired address selection, a bitmap port pool (one per
+     distinct address), one binding per mapping on `WorkerFlowTable` (the external endpoint an alias), generic
+     expiry with an owner-kept deadline, the typed rewrite, `Translate` and `TranslateBatch`; the NAT module is an
+     adapter (same arguments) parsing with the checked M17 parser (chained packets: headers in the first segment).
+     Behaviour changes (D-068): idle mappings expire; no external port 0 and range ends honoured; VLAN-tagged
+     frames translated, malformed ones dropped; endpoints that are another mapping's other side refused; the table
+     bounded and allocated at Init. Isolated (wrapper verdict "contamination": thermal and timer interrupts, no
+     device IRQs), module path (batches of 32, per-batch expiry, the module's table size) against the legacy batch
+     path: about +5 ns a packet at 4K mappings, +4 at 64K, -13 at 1M; port allocation flat at 5-12 ns against
+     7-291 ns with 29.5% failures at 99% taken. 18 mutants caught, 1 equivalent. Needs review (user): the
+     small-table per-packet cost and the Init allocation.
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build

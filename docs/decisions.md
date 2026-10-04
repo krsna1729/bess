@@ -88,6 +88,7 @@ file is the reasoning.
 | D-065 | L3 batteries: next-hop groups in the Router, neighbor table, L3 packet helpers (M15) | accepted |
 | D-066 | Member selection: shared algorithms, no shared group object (M16) | accepted |
 | D-067 | Connection tracking: a library over the flow table and the expiry wheel (M17) | accepted |
+| D-068 | NAT as a library: bindings on the flow table, a bitmap port pool, generic expiry (M18) | accepted |
 
 
 ---
@@ -5920,3 +5921,141 @@ to it).
 
 **Revisit when:** a consumer needs window checks (then sequence tracking per direction), or the 1M-connection
 cost matters (a batch path that prefetches the index, slot and wheel node).
+
+## D-068 NAT as a library: bindings on the flow table, a bitmap port pool, generic expiry (M18)
+
+**Status:** accepted (2026-10-04), experimental API. **Needs review (user):** the module's per-packet cost against
+the legacy module (below: about +5 ns a packet at 4K mappings, +4 at 64K, -13 at 1M) and the table allocated at
+Init (up to about 132 MB) for checked parsing, generic expiry and one binding object per mapping.
+**Code:** `core/nat/nat.h` (new, header-only, installed experimental), `core/nat/nat_test.cc`,
+`core/nat/nat_bench.cc`, `core/modules/nat.{h,cc}`, `core/modules/table_scale_bench.cc`, `core/meson.build`,
+`tools/check_includes.py`, `tools/api_classes.json`.
+
+**Context.** Roadmap M18: take the legacy NAT module apart (parsing, endpoint keys, mapping table, reverse
+mapping, address selection, port allocation, timeout, rewrite, checksums, gates) into reusable pieces over the
+generic flow table and expiry; keep the module compatible; improve packet safety; benchmark port allocators;
+document memory and allocation.
+
+**Decision.**
+- `nat::Endpoint` (8 bytes, padding-free) and `PortRange` as before. `PickAddress` keeps the legacy hash, so an
+  internal address maps to the same external address as before (paired pooling, RFC 4787 REQ-2).
+- `nat::Binding`: one object per mapping in a `WorkerFlowTable` keyed by the internal endpoint with the external
+  endpoint as an alias (`EmplaceAliased`), instead of two unrelated entries; a key found as the other side of a
+  mapping is refused (`kConflict` outbound) rather than translated with that mapping, as the legacy table did.
+- `nat::PortPool`: a bitmap per (external address, protocol class: TCP, UDP, ICMP), 8 KiB each; allocation is a
+  random start and a word-at-a-time scan, release clears the bit. It replaces random start plus linear probing of
+  the table (at most 128 trials).
+- Expiry on the M10 wheel with the owner-kept deadline: an outbound packet stores `last_refresh` in the binding
+  (refresh on outbound only, REQ-6), and the timer is re-armed from it when it fires, so the packet path never
+  touches the wheel (a per-packet wheel refresh cost a cache miss: 26 → 19 ns a packet at 4K, unisolated). An
+  idle mapping (5 minutes, REQ-5) is removed and its port freed.
+- `nat::Rewrite`: the typed translator, the legacy module's incremental checksum updates (IPv4, TCP, UDP with the
+  zero-checksum and 0 → 0xffff rules, ICMP identifier). `Nat::Translate` (one packet) and `TranslateBatch` (the
+  lookups go together through `FindBatch`; a miss is looked up again so two packets of one new flow in a batch
+  share one mapping).
+- Packets are parsed with the checked M17 parser (`conntrack::ParseFrame`): any VLAN tags, IPv4 options and
+  lengths validated; what is not IPv4 TCP, UDP or an ICMP query is dropped.
+- The NAT module is a thin adapter: same protobuf arguments and commands; `CapacityFor(addresses)` bindings (the
+  mappings the ports can serve, at most 1M); 256 units of expiry work per batch.
+
+**Behaviour changes** (intentional; the legacy algorithm is the oracle otherwise):
+- Idle mappings expire (5 minutes without an outbound packet); before, a mapping lived until its port was needed
+  by another mapping, so late inbound packets could still be translated.
+- External port ranges: a privileged internal port (1-1023) gets 1-1023 (before: 0-1022, so external port 0 could
+  be allocated and 1023 never was); other ports get 1024 to `end - 1` (before: up to `end`, past the range).
+- ICMP timestamp replies (type 14) are translated with the other query types (before: 0, 8, 13, 15, 16 only).
+- Checked parsing: VLAN-tagged frames are translated (before: misread as untagged), and malformed, non-IPv4 or
+  non-initial fragments are dropped (before: read without checks). A fragmented datagram's first fragment is
+  translated (it carries the ports) and the rest are dropped.
+- An outbound packet from an endpoint that is another mapping's external endpoint is refused (`kConflict`), and an
+  inbound packet to an endpoint that is a mapping's internal endpoint is not translated (`kNoBinding`); a new
+  mapping whose external endpoint is an internal endpoint's key is refused (`kConflict`). Before, the one table
+  translated all three with the wrong entry.
+- An external address listed twice shares one port bitmap, so its ports are handed out once (before, the table
+  probe skipped used ports; a per-entry bitmap would not).
+- Chained packets: the headers must be in the first segment and the lengths are checked against the whole packet
+  (`ParseFrame`'s `total_len`); the rewrite touches only the headers.
+- The table is bounded and allocated at Init (`CapacityFor`; `kFull` beyond); the legacy CuckooMap grew.
+- External addresses are sorted together with their port ranges (before: the addresses alone, which mismatched
+  them with their ranges in `get_initial_arg` when the input was unsorted).
+
+**Evidence.** `nat_bench`, release `NDEBUG`, gcc x86-64-v3, `omarchy-benchmark --isolate --cpu 2`, 3 repetitions,
+medians. The legacy rows use the legacy module's table types and per-packet code (copied into the benchmark:
+unchecked parse, CuckooMap with forward and reverse entries holding exactly the mappings, `PrefetchBatch` for
+batches, the same rewrite). The library rows size the table as the module does (`CapacityFor`: 1M bindings with the
+benchmark's 20 addresses), so few mappings sit in a sparse table; the module path also runs `Expire(now, 256)` every
+batch. Packet streams draw mappings at random with replacement. CPU 2: no device IRQs; 15,482 thermal-event
+interrupts, timer and SCHED softirqs; wrapper verdict "contamination".
+
+Lookup (ns per lookup, batch 32, a 2^20-key stream drawn with replacement; bytes per mapping at 80% of capacity for the binding table):
+| mappings | legacy CuckooMap | binding table |
+|---|---|---|
+| 4096 | 2.53 (93 B) | 3.36 (125 B) |
+| 65536 | 3.94 (97 B) | 4.51 (125 B) |
+| 1048576 | 16.52 (101 B) | 17.11 (125 B) |
+
+Port allocation (ns per allocation in a 64,512-port span; failures):
+| span taken | legacy probe | PortPool bitmap |
+|---|---|---|
+| 10% | 7.2 (0.0% fail) | 5.1 (0.0% fail) |
+| 50% | 24.3 (0.0% fail) | 5.1 (0.0% fail) |
+| 90% | 54.8 (0.0% fail) | 5.4 (0.0% fail) |
+| 99% | 291.2 (29.5% fail) | 12.3 (0.0% fail) |
+
+Per packet (ns; established mappings; library rows in the module's 1M-binding table):
+| mappings | dir | legacy, per packet | library, per packet | legacy, batch 32 | NAT module path, batch 32 |
+|---|---|---|---|---|---|
+| 4096 | out | 11.4 | 20.7 | 11.5 | 16.4 |
+| 4096 | in | 11.6 | 20.2 | 11.2 | 16.4 |
+| 65536 | out | 17.5 | 29.6 | 14.7 | 18.7 |
+| 65536 | in | 17.8 | 29.4 | 14.9 | 18.7 |
+| 1048576 | out | 71.3 | 111.5 | 50.0 | 37.1 |
+| 1048576 | in | 73.5 | 111.5 | 49.4 | 36.5 |
+
+New mapping (allocate, bind, schedule, rewrite): 59 ns
+
+- **The module path** (the last column against the legacy batch column): +4.9 / +5.2 ns a packet out / in at 4K
+  mappings (11.5 → 16.4, 11.2 → 16.4), +4.0 / +3.8 at 64K (14.7 → 18.7, 14.9 → 18.7), -12.9 / -12.9 at 1M (50.0 →
+  37.1, 49.4 → 36.5; both columns prefetch, so the 1M gain is the table layout and prefetch pattern together
+  [INFERENCE: not isolated]). About 3.5 ns of the small-table cost is the checked parse (`BM_Parse` in D-067); the
+  rest is attributed to the flow table's second dependent line (index, then slot) and the per-batch expiry poll
+  [INFERENCE: not measured separately]. The
+  unbatched `Translate` is 52-82% slower than the legacy per-packet code (it does not prefetch); the module does not
+  use it.
+- Allocation: the bitmap is flat (5-12 ns) and fails only when the span is full; probing grows to 291 ns at 99% taken
+  and gives up on 29.5% of new mappings.
+- Memory: the binding table is 125 bytes a mapping at the benchmark's 80% occupancy (capacity 1.25 n), about 100 at
+  full occupancy, against 93-101 for the legacy table's two entries. The module allocates the whole table at Init,
+  where the legacy CuckooMap grew with use: `CapacityFor` gives 196,608 bindings for one external address (about 26
+  MB with the wheel) and the 1M cap from six addresses (about 132 MB); the port bitmaps add 24 KiB per distinct
+  address.
+- Found while building (unisolated, CPU 6): the endpoint built with three narrow stores and read by the hash as a
+  word stalled store forwarding (40 → 26 ns a packet at 4K once built as one word); a per-packet wheel refresh,
+  replaced by the owner-kept deadline, cost a cache miss (26 → 19 ns).
+
+**Mutation checks** (`nat_nat_test`, fast build; 19: 18 caught, 1 equivalent): UDP zero checksum
+rewritten; TCP checksum not updated; ICMP checksum not updated; a privileged mapping may get port 0; the range end
+inclusive; a suspended range used; port 0 mapped; the direction guard dropped; inbound packets refreshing; expiry
+ignoring the refresh; the port not released on expiry; the address not paired; the bitmap scan not wrapping; a
+batch miss not looked up again (survived until `BatchMatchesPacketByPacket` was added). After review: the parser's
+`total_len` ignored (chained packets), one bitmap per address entry, a key collision reported as `kFull`, a fixed
+L3 offset (VLAN) — caught; the IPv4 header length checked against the whole packet instead of the first segment is
+equivalent for NAT (the L4 presence check then refuses TCP, UDP and ICMP, the only protocols it translates; for a
+protocol whose L4 header is not checked, such as GRE, the mutated parser would accept options beyond the first
+segment, which no caller passing `total_len` reaches today).
+
+**Review** (reviewer agent): round 1 found the library core correct (allocator spans and wrap, port classes, rewrite
+equal to the legacy `Stamp`, endpoint word, expiry re-arm, port release on every removal, direction guard,
+`TranslateBatch`, the adapter's configuration handling) with three findings, all fixed: chained packets were
+dropped; this record did not describe the module path (table size, per-batch expiry, the 1M lookup stream, Init
+memory, counts); and three behaviour differences were unlisted or wrong (reverse to an internal endpoint, duplicate
+addresses, the collision verdict), with VLAN and full-table tests missing. Round 2: correct, go; two wording findings (the 1M attribution and the cost split marked as inference; first
+fragments translated; the equivalent mutant's scope), fixed.
+
+**Not done.** Endpoint-dependent filtering (REQ-8 variants) and hairpinning; port-parity and contiguity (REQ-3/4
+"preservation"); per-worker port partitions (each NAT instance has its own ranges, so partitioning is
+configuration: give each worker's instance disjoint ranges); IPv6 (NAT64/NPTv6); ICMP error translation (quoted
+headers); the conntrack and FDB per-packet wheel refreshes could use the same owner-kept deadline (follow-up).
+
+**Revisit when:** a consumer needs filtering or hairpinning, or the small-table per-packet cost matters (a
+specialised 8-byte-key table with the binding inline, as D-064 did for the FDB).
