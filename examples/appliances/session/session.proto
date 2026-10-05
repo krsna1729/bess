@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
+// Reference appliance R4's wire types (roadmap M24, D-094): the keys and
+// values of its three resources in bess.pb.v2.ApplyTransaction. The router's
+// next hops and routes use BESS's own types (bess.pb.RouterNextHopIdKey,
+// RouterNextHopValue, RouterRouteKey, RouterRouteValue in module_msg.proto).
+//
+// The resources are "<module>/qos", "<module>/actions" and "<module>/rules";
+// ListTransactionResources names these types for each.
+
+syntax = "proto3";
+
+package session_appliance;
+
+// A QoS policy: one srTCM meter (RFC 2697).
+message QosKey {
+  uint32 id = 1;  // 1..16
+}
+message QosValue {
+  uint64 committed_rate = 1;   // bytes/s, non-zero
+  uint64 committed_burst = 2;  // bytes
+  uint64 excess_burst = 3;     // bytes; not both bursts zero
+}
+
+// What a session does with a matched packet: meter by its QoS policy, then
+// GTP-U (its TEID) toward its eNodeB, routed by the module's router through
+// next hop `next_hop_id`, which the action keeps referenced.
+message ActionKey {
+  uint32 id = 1;  // 1..16
+}
+message ActionValue {
+  uint32 qos_id = 1;
+  uint32 next_hop_id = 2;
+  string enb = 3;  // dotted IPv4
+  uint32 teid = 4;
+}
+
+// A downlink PDR, reduced: the UE's address selects the session's action.
+message RuleKey {
+  uint32 id = 1;  // 1..64
+}
+message RuleValue {
+  string ue = 1;  // dotted IPv4
+  uint32 action_id = 2;
+}

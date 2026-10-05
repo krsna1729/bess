@@ -193,18 +193,19 @@ and 5; hardware status in `docs/compatibility.md`.
 | M21 portability | done; arm64 lanes experimental | D-071 |
 | M22 hardening | done; sanitizer lanes experimental; fuzz corpora replayed in CI | D-072, entry 160 |
 | M23 ergonomics | done (persona samples, installed `examples/sdk_samples`, compile-time negative tests) | entry 162; docs/plugin-api.md |
-| M24 reference appliances | done: R1-R3, R5 installed-tree; R4 in-tree | D-086 |
+| M24 reference appliances | done: R1-R5 installed-tree (R4 driven over the control API) | D-086, D-094 |
 | M25 observability | done: metrics, events, pressure, DPDK tracing; histograms wait for a consumer | D-076, D-084, D-089 |
 | M26 release | done: metadata, SBOM, tarball, .deb, image; signing blocked on keys | D-075, D-087 |
 | M27 control SDK | done: Python and Go, desired state, black-box recovery tests, a controller migrated | D-082, D-088 |
 | Plugin unload (roadmap 28.4) | done | D-090 |
 
 Appendix J, audited item by item (2026-10-05): the one gap (plugin unload lifetime) is closed by D-090; the
-meter/stats row by D-091; the fuzz row by CI replaying the corpora; the hardware row by `docs/compatibility.md`.
+meter/stats row by D-091; the fuzz row by CI replaying the corpora; the hardware row by `docs/compatibility.md`;
+R4 on the installed tree by D-094.
 Still partial, each with its record: the update-under-load and memory-at-scale matrices have named gaps
 (performance-contract.md); no checked-in assembly-shape artifact (binary inspection is outside this program's
-tooling); arm64 and sanitizer lanes are not yet gating; R4 and direct appliance builds wait on two user decisions
-(public resource codecs, D-086; installed static archives of the generic libraries); `framework/exact_match_table.h`
+tooling); arm64 and sanitizer lanes are not yet gating; direct appliance builds wait on installed static archives (D-093);
+`framework/exact_match_table.h`
 remains as HashLB's field extractor; "no BESS action language" is a review rule without a mechanical check (the
 runtime's side has one: `check_includes.py` forbids `core/runtime/` every networking battery). Hardware certification (C-HW) is tracked separately and not run.
 

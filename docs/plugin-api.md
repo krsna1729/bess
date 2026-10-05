@@ -12,8 +12,10 @@ This document formalizes the supported C++ and build contract for out-of-tree BE
   the supported source API. External plugins must be rebuilt against their
   target BESS release; BESS does not promise a stable C++ ABI.
 - **Experimental**: the selected headers under
-  `bess/core/{classifier,dataplane,flow,meter,rcu,route,stats}`. Their
-  interfaces may change without preserving source compatibility. (`flow/` is
+  `bess/core/{classifier,dataplane,flow,meter,rcu,route,stats}` and the wire
+  codec facade (`framework/resource_codec.h`, `framework/resource_bindings.h`,
+  D-094). Their interfaces may
+  change without preserving source compatibility. (`flow/` is
   the flow-state library, see `docs/flow-state.md`; a plugin that uses it
   links the `bess_flow` symbols `bessd` already exports.) A public header
   never includes an experimental one.
@@ -60,6 +62,9 @@ the second looks it up, and each runs the whole decision in one step. `examples/
 primitives alone (`StrongId`, `GenerationHandle`, `ExpiryWheel`): leases that
 expire unless renewed, with handles that go stale when a slot is reused. CI
 builds it from the staged install and runs its test without `bessd`.
+`examples/appliances` holds the reference appliances (R1-R5, M24) as plugins;
+CI loads them into the staged `bessd`, and drives R4's resources over the
+control API with its own wire types (below, "Wire codecs").
 `examples/sdk_samples` holds the smallest meaningful program per library --
 router, meters, conntrack and NAT, the FDB, handoff and tunnel decapsulation --
 each with typed use, an update, error handling as values, and the ownership
@@ -242,11 +247,9 @@ construction or `Init()`:
 | `metrics()` | register a source that reports this module's counters when the control plane asks (`stats::MetricRegistry`, `stats/metric_registry.h`, experimental); keep the returned `MetricSource` as a member declared after what it reads |
 | `requests()` | open a `RequestEndpoint` (`framework/module_requests.h`, experimental): workers post a small request (a table nearly full), the daemon's maintenance loop calls the module's handler under the control-plane lock; one pending request per endpoint, re-armed by `Done()` |
 | `events()` | register an event type in Init (`RegisterType(name, value names)`); a worker posts with `Post(ctx->wid, WorkerEvent{...})`, never blocking (a full ring refuses and counts); the maintenance loop moves events into the log `WatchEvents` streams (`stats::EventHub`, `stats/event_hub.h`, experimental). `NamedSource(name)` makes the log show a source by name. For a recurring packet-path condition (a full table or queue), `stats::EventThrottle` (`stats/event_throttle.h`) posts at most one event per second per worker carrying the count, called on the failure path only |
+| `codecs()` | bind a wire codec to each resource registered through `resources()`, so `ApplyTransaction` and `ListTransactionResources` reach it (`framework::ResourceBindings`, experimental; below) |
 
-Every type this surface names is installed. Binding a resource's wire codec
-(control-side protobuf metadata, D-044) is in-tree only, through
-`framework::BindingsOf(init_context())` in the internal
-`framework/resource_bindings.h`: codecs are not part of the plugin SDK yet.
+Every type this surface names is installed.
 
 The context is bound when the `Module` base is constructed, so it is usable in
 a derived constructor's member initializers (for example
@@ -255,6 +258,49 @@ context: `ModuleInitContext::ProcessDefault()` is private to `Module`'s
 constructor, so a module cannot build or look one up for itself. Never call
 `init_context()` from `ProcessBatch` or `RunTask`. Modules in `core/modules` must not include `runtime/`; `tools/check_includes.py`
 enforces that.
+
+### Wire codecs (`init_context().codecs()`, experimental, D-094)
+
+A dataplane resource knows nothing about encoding (D-044). To make one
+reachable over the control API, the module that registers it binds a codec:
+the protobuf key and value messages of the resource and two functions that
+convert them to the resource's key bytes and value (`std::any` of the
+resource's value type). `framework::TypedCodec<KeyMsg, ValueMsg>`
+(`framework/resource_codec.h`) builds one from the two functions; a decode
+error is an `std::unexpected` string, reported as the operation's error.
+`Bind()` returns a `ResourceBinding`: keep it as a member declared after the
+resource and reset it before the resource is released.
+
+```cpp
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
+#include "my_wire.pb.h"  // the plugin's own messages, compiled with protoc
+
+// Init(), after init_context().resources().Register(&rules_):
+binding_ = init_context().codecs().Bind(
+    rules_, std::make_shared<bess::framework::TypedCodec<my::RuleKey, my::RuleValue>>(
+                [](const my::RuleKey &k) -> std::expected<bess::dataplane::ResourceKey, std::string> {
+                  if (k.id() == 0) return std::unexpected("rule id 0 is invalid");
+                  return bess::dataplane::EncodeKey(RuleId(k.id()));
+                },
+                [](const my::RuleValue &v) -> std::expected<std::any, std::string> {
+                  return std::any(Rule{v.ue(), ActionId(v.action_id())});
+                }));
+```
+
+A plugin with its own messages links the generated code and `protobuf`
+(`bess-dev` already requires it, for the same runtime bessd uses); its
+`.proto` file name and package must not collide with BESS's or another
+plugin's (the generated code registers them in the process's descriptor
+pool). A controller needs the message types: `examples/appliances/session`
+installs a descriptor set (`protoc --descriptor_set_out`) next to the plugin,
+which a client loads with `google.protobuf.message_factory`. Codecs and
+protobuf stay out of the dataplane libraries (`tools/check_includes.py`).
+
+A plugin that binds codecs requires `BESS_CAP_RESOURCES` (its resources) and no
+capability of its own: `codecs()` is an inline accessor of an existing context
+member, and `ResourceBindings::Bind` and `ResourceBinding::Reset` have been in
+every `bessd` that checks a plugin descriptor (D-094).
 
 ### Application instances (`init_context().instances()`)
 

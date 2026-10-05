@@ -8,6 +8,13 @@ alone; this proves the result also loads into that install's bessd (every
 symbol the plugin takes from bessd resolves), registers its module class, and
 moves packets: Source -> <plugin module> -> Sink on one worker, for a short
 run, and the plugin's output edge must have carried packets.
+
+With --set appliances (examples/appliances, M24), each appliance's self_test
+must pass too, and R4's resources are driven over the control API (D-094):
+its wire types come from the descriptor set built next to the plugin, a
+transaction installs a session before the traffic (the packets the session
+carries are what leave its gate), and the engine's checks across the
+application's resources and its router are exercised over the wire.
 """
 
 from __future__ import annotations
@@ -61,12 +68,127 @@ APPLIANCES = [
     ('NatAppliance', 'nat0', ipv4_udp_frame('8.8.8.8', sport=40000), 0),
     # R3: DNS to 10.0.0.9 for tenant 0 is allowed by its ACL layer (gate 0).
     ('VswitchAppliance', 'vswitch0', ipv4_udp_frame('10.0.0.9', sport=40000), 0),
+    # R4: a downlink to the UE 10.45.0.1 that the session installed over the
+    # wire claims (SessionWire.install) leaves as GTP-U by its next hop's gate 0.
+    ('SessionAppliance', 'session0', ipv4_udp_frame('10.45.0.1'), 0),
 ]
 APPLIANCE_COMMANDS = [
     ('router0', 'self_test'),
     ('nat0', 'self_test'),
     ('vswitch0', 'self_test'),
+    ('session0', 'self_test'),
 ]
+
+
+class SessionWire:
+    """R4's five resources over control_v2 (D-094): the application's QoS
+    policies, actions and rules (session.proto, from the descriptor set
+    installed next to the plugin) and its router's next hops and routes
+    (BESS's Router* messages)."""
+
+    UE, ENB = '10.45.0.1', '192.0.2.100'
+
+    def __init__(self, plugin_dir, module='session0'):
+        from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+        import pybess.bess as bess
+
+        path = Path(plugin_dir) / 'session_appliance.desc'
+        if not path.is_file():
+            raise RuntimeError(f'{path}: the session appliance\'s descriptor set was not built')
+        pool = descriptor_pool.DescriptorPool()
+        for proto in descriptor_pb2.FileDescriptorSet.FromString(path.read_bytes()).file:
+            pool.Add(proto)
+        self.pb = {name: message_factory.GetMessageClass(
+                       pool.FindMessageTypeByName('session_appliance.' + name))
+                   for name in ('QosKey', 'QosValue', 'ActionKey', 'ActionValue',
+                                'RuleKey', 'RuleValue')}
+        self.op = bess.BESS.transaction_op
+        self.v2 = bess.control_v2
+        self.mm = bess.module_msg
+        self.res = {table: f'{module}/{table}'
+                    for table in ('qos', 'actions', 'rules', 'next_hops', 'routes')}
+
+    def session_ops(self, n, ue, next_hop, router=True, rate=10**9):
+        """Session n: (with `router`) next hop n and the eNodeB's /32 route, then
+        QoS policy n, action n (naming next hop `next_hop`) and rule n."""
+        pb, mm, res = self.pb, self.mm, self.res
+        ops = []
+        if router:
+            ops += [self.op(res['next_hops'], mm.RouterNextHopIdKey(id=n),
+                            mm.RouterNextHopValue(egress_gate=0,
+                                                  neighbor=mm.ROUTER_NEIGHBOR_STATE_RESOLVED)),
+                    self.op(res['routes'], mm.RouterRouteKey(ipv4=self.ENB, prefix_length=32),
+                            mm.RouterRouteValue(next_hop_id=n))]
+        return ops + [
+            self.op(res['qos'], pb['QosKey'](id=n),
+                    pb['QosValue'](committed_rate=rate, committed_burst=1500, excess_burst=1500)),
+            self.op(res['actions'], pb['ActionKey'](id=n),
+                    pb['ActionValue'](qos_id=n, next_hop_id=next_hop, enb=self.ENB, teid=0x1000 + n)),
+            self.op(res['rules'], pb['RuleKey'](id=n), pb['RuleValue'](ue=ue, action_id=n)),
+        ]
+
+    def apply(self, client, ops, outcome, what):
+        record = client.apply_transaction(ops).record
+        if record.outcome != outcome:
+            name = self.v2.TransactionRecord.Outcome.Name
+            raise RuntimeError(f'R4 over the wire: {what}: {name(record.outcome)}, expected '
+                               f'{name(outcome)}: {[(o.status, o.error) for o in record.ops]}')
+        return record
+
+    def install(self, client):
+        """Before the traffic: the resources are listed with their types, and
+        one transaction installs session 1 across the router and the
+        application."""
+        listed = {r.name: (r.key_type, r.value_type)
+                  for r in client.list_transaction_resources().resources}
+        expected = {
+            self.res['qos']: ('session_appliance.QosKey', 'session_appliance.QosValue'),
+            self.res['actions']: ('session_appliance.ActionKey', 'session_appliance.ActionValue'),
+            self.res['rules']: ('session_appliance.RuleKey', 'session_appliance.RuleValue'),
+            self.res['next_hops']: ('bess.pb.RouterNextHopIdKey', 'bess.pb.RouterNextHopValue'),
+            self.res['routes']: ('bess.pb.RouterRouteKey', 'bess.pb.RouterRouteValue'),
+        }
+        for name, types in expected.items():
+            if listed.get(name) != types:
+                raise RuntimeError(f'R4 over the wire: {name} listed as {listed.get(name)}, '
+                                   f'expected {types}')
+        print('  OK: R4\'s five resources are listed with their wire types')
+        applied = self.v2.TransactionRecord.OUTCOME_APPLIED
+        record = self.apply(client, self.session_ops(1, self.UE, next_hop=1), applied,
+                            'installing session 1')
+        if any(o.status != self.v2.TransactionOpResult.STATUS_APPLIED for o in record.ops):
+            raise RuntimeError(f'R4 over the wire: an operation was not applied: {record.ops}')
+        print('  OK: one ApplyTransaction installed a session across the router and the '
+              'application (Applied)')
+
+    def check(self, client):
+        """After the traffic: the engine's checks across owners, over the wire."""
+        rejected = self.v2.TransactionRecord.OUTCOME_REJECTED
+        applied = self.v2.TransactionRecord.OUTCOME_APPLIED
+        generation = client.list_transaction_resources().generation
+        # An action naming a next hop nobody installs: the whole session is
+        # refused, and nothing of it appears.
+        self.apply(client, self.session_ops(2, '10.45.0.2', next_hop=2, router=False), rejected,
+                   'a session naming a missing next hop')
+        if client.list_transaction_resources().generation != generation:
+            raise RuntimeError('R4 over the wire: a rejected transaction moved the generation')
+        self.apply(client, [self.op(self.res['rules'], self.pb['RuleKey'](id=2), erase=True)],
+                   rejected, 'erasing the refused session\'s rule (it must not exist)')
+        print('  OK: a session naming a missing next hop is Rejected whole')
+        # The router's next hop cannot leave while the application's action
+        # names it; with the session, referrers first, it can.
+        route = self.op(self.res['routes'],
+                        self.mm.RouterRouteKey(ipv4=self.ENB, prefix_length=32), erase=True)
+        hop = self.op(self.res['next_hops'], self.mm.RouterNextHopIdKey(id=1), erase=True)
+        self.apply(client, [route, hop], rejected, 'removing a next hop an action names')
+        self.apply(client, [self.op(self.res['rules'], self.pb['RuleKey'](id=1), erase=True),
+                            self.op(self.res['actions'], self.pb['ActionKey'](id=1), erase=True),
+                            self.op(self.res['qos'], self.pb['QosKey'](id=1), erase=True),
+                            route, hop],
+                   applied, 'removing the session with its route and next hop')
+        print('  OK: a next hop an application action names is kept (Rejected); removed with '
+              'the session in one transaction (Applied)')
+
 
 INSTANCES = [
     ('StandalonePass', 'pass0', None, 0),
@@ -117,7 +239,7 @@ def free_port():
         return probe.getsockname()[1]
 
 
-def run(client, instances, commands=()):
+def run(client, instances, commands=(), wire=None):
     names = set(client.list_mclasses().names)
     missing = sorted({mclass for mclass, *_ in instances} - names)
     if missing:
@@ -134,6 +256,8 @@ def run(client, instances, commands=()):
         else:
             client.connect_modules(name + '_src', name)
         client.connect_modules(name, name + '_sink', gate)
+    if wire is not None:
+        wire.install(client)
     client.resume_all()
     time.sleep(0.3)
     client.pause_all()
@@ -146,6 +270,8 @@ def run(client, instances, commands=()):
     for name, command in commands:
         client.run_module_command(name, command, 'EmptyArg', {})  # raises on failure
         print(f'  OK: {name}.{command}()')
+    if wire is not None:
+        wire.check(client)
 
 
 def main() -> int:
@@ -174,7 +300,7 @@ def main() -> int:
             wait_connected(client, process, args.grpc_url, log_path)
             try:
                 if args.set == 'appliances':
-                    run(client, APPLIANCES, APPLIANCE_COMMANDS)
+                    run(client, APPLIANCES, APPLIANCE_COMMANDS, SessionWire(args.plugin_dir))
                 else:
                     run(client, INSTANCES)
             except Exception as error:

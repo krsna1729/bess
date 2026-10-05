@@ -17,6 +17,10 @@ class Resource;
 // wire encoding. Control-side metadata (today the protobuf codec) is bound to
 // a resource here, by the module that registers it, and read by the control
 // plane to decode transactions and list resources.
+//
+// Experimental, installed (D-094): a module or plugin binds through
+// init_context().codecs(), the process's bindings, with the codec types of
+// framework/resource_codec.h.
 
 namespace bess::framework {
 
@@ -90,11 +94,6 @@ class ResourceBindings {
                      std::shared_ptr<const ResourceCodec>>
       codecs_;
 };
-
-class ModuleInitContext;
-// The bindings an in-tree module attaches its resources' codecs to (D-044).
-// Internal: codecs are protobuf-bound and not part of the plugin SDK.
-ResourceBindings &BindingsOf(const ModuleInitContext &context) noexcept;
 
 }  // namespace bess::framework
 

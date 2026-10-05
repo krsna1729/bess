@@ -113,7 +113,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   }
 
   // Typed keys and values over the RPC (D-025).
-  next_hops_binding_ = bess::framework::BindingsOf(init_context()).Bind(
+  next_hops_binding_ = init_context().codecs().Bind(
       *router_->next_hops_resource_object(),
       std::make_shared<bess::framework::TypedCodec<bess::pb::RouterNextHopIdKey,
                                              bess::pb::RouterNextHopValue>>(
@@ -149,7 +149,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
             hop.src_mac = *src;
             return std::any(hop);
           }));
-  routes_binding_ = bess::framework::BindingsOf(init_context()).Bind(
+  routes_binding_ = init_context().codecs().Bind(
       *router_->routes_resource_object(),
       std::make_shared<bess::framework::TypedCodec<bess::pb::RouterRouteKey,
                                              bess::pb::RouterRouteValue>>(

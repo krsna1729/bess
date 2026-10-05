@@ -53,7 +53,7 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
       },
       std::vector<std::string>{meters_resource_, next_hops_resource_});
   // Typed keys and values over the RPC (D-025).
-  binding_ = bess::framework::BindingsOf(init_context()).Bind(
+  binding_ = init_context().codecs().Bind(
       *resource_,
       std::make_shared<bess::framework::TypedCodec<bess::pb::ActionIdKey,
                                              bess::pb::ActionValue>>(

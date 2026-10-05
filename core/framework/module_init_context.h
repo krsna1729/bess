@@ -105,19 +105,23 @@ class ModuleInitContext {
   // WatchEvents streams them. A plugin that calls this requires
   // BESS_CAP_EVENTS.
   stats::EventHub &events() const noexcept { return events_; }
+  // Wire codecs for this module's resources (D-044, D-094; experimental:
+  // framework/resource_bindings.h and framework/resource_codec.h). Bind a
+  // codec to each resource registered through resources() so the control
+  // API (ApplyTransaction, ListTransactionResources) can reach it; keep the
+  // returned ResourceBinding as a member declared after the resource. Codecs
+  // are protobuf-bound control metadata: they never reach the dataplane
+  // libraries. A plugin that calls this requires BESS_CAP_RESOURCES (the
+  // bindings have been in every bessd that checks a plugin descriptor).
+  ResourceBindings &codecs() const noexcept { return resource_bindings_; }
 
   // The framework gives every module its context; a module reads it through
   // Module::init_context() and cannot construct or look one up itself.
-  //
-  // The wire codecs of a module's resources (D-044) are control-plane
-  // metadata, not part of this public surface: in-tree modules reach them
-  // through framework::BindingsOf() (framework/resource_bindings.h).
  private:
   // The context for the process's one active runtime. A separate context per
   // runtime is future work; Module's constructor is the only caller, so
   // ProcessDefault() is not part of the author-facing surface.
   friend class ::Module;
-  friend ResourceBindings &BindingsOf(const ModuleInitContext &context) noexcept;
   static const ModuleInitContext &ProcessDefault();
 
   dataplane::ResourceRegistry &resources_;

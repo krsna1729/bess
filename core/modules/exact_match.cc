@@ -585,7 +585,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
   // Typed keys and values over the RPC (D-025): the rule's fields, packed
   // here as the add command packs them, and the rule's value -- the gate, or
   // the action id in action mode.
-  binding_ = bess::framework::BindingsOf(init_context()).Bind(
+  binding_ = init_context().codecs().Bind(
       *resource_,std::make_shared<bess::framework::TypedCodec<
                           bess::pb::ExactMatchRuleKey,
                           bess::pb::ExactMatchRuleValue>>(

@@ -114,6 +114,7 @@ file is the reasoning.
 | D-091 | Accepted: BM_ThreadsWorkerLocalUpdate +6.7% (2 threads), not attributable to a code change (roadmap 23.2) | accepted |
 | D-092 | Classified live perf tests; master vs develop: framework cost predates the roadmap, module costs located | accepted |
 | D-093 | User decisions of 2026-10-05: public codecs, installed archives, TSan gates, keyless signing; MacTable fold deferred | accepted |
+| D-094 | Experimental public codec facade (`init_context().codecs()`); R4 an installed-tree plugin driven over the control API | accepted |
 
 
 ---
@@ -3174,6 +3175,9 @@ contexts), or a module needs worker topology.
 **Change (D-074, consolidation).** `resources()` now returns the `dataplane::ResourceRegistry` facade and
 `resource_bindings()` left the public context (in-tree modules use `framework::BindingsOf`).
 
+**Change (D-094).** The bindings are public again, experimental, as `init_context().codecs()`;
+`framework::BindingsOf` is gone.
+
 ---
 
 ## D-043 Standalone release link: libgcc_eh ahead of libunwind, non-PIE
@@ -3257,6 +3261,9 @@ non-protobuf control binding needs the codec interface generalized.
 
 **Change (D-074, consolidation).** Modules bind through `framework::BindingsOf(init_context())` (internal
 header); `init_context().resource_bindings()` no longer exists.
+
+**Change (D-094).** `framework/resource_codec.h` and `framework/resource_bindings.h` are installed (experimental);
+modules and plugins bind through `init_context().codecs()`, and `framework::BindingsOf` is gone.
 
 ---
 
@@ -6728,6 +6735,9 @@ require.
 `resource_bindings()` is no longer a public capability. D-044's access route is now
 `framework::BindingsOf(init_context())`.
 
+**Change (D-094).** The public binding facade exists: `init_context().codecs()` returns the experimental, installed
+`framework::ResourceBindings`; `framework::BindingsOf` and its friend declaration are gone.
+
 **Revisit when:** a codec API is promoted to the SDK (public binding facade), or a second control domain per process
 appears (then registries per domain).
 ## D-075 Release metadata, SBOM and the compatibility policy (M26)
@@ -7251,6 +7261,11 @@ the way: a NAT whose expiry wheel starts at clock 0 while packets carry the TSC 
 deadline is beyond the wheel's horizon): the module starts the wheels at the packet clock's now, as the in-tree NAT
 module does.
 
+**Change (D-094).** R4 is an installed-tree plugin (`examples/appliances/session/`): its resources and router
+are registered through `init_context().resources()`, reached over `ApplyTransaction` through codecs it binds with
+`init_context().codecs()`, and checked over the wire by `check_standalone_plugins.py --set appliances`;
+`core/dataplane/session_reference_test.cc` is gone.
+
 
 ## D-087 Release artifacts: a tarball, bess and bess-dev .deb packages with derived dependencies, and a runtime image (M26)
 
@@ -7492,7 +7507,7 @@ ns (8 rounds, 5 of 8 pairs favourable; the change only removes work). Next: the 
 **Decisions.**
 1. **Resource wire codecs get an experimental public facade**, so an installed-tree plugin's resources can be driven
    over the control API (M27) and R4 can move to the installed tree. Protobuf stays at the framework boundary; the
-   dataplane libraries stay protobuf-free. (Its own record when it lands.)
+   dataplane libraries stay protobuf-free. (Landed: D-094.)
 2. **Static archives of `route`, `rcu` and `dataplane` are installed, experimental**, with a CI test linking R1's
    app without bessd (Appendix J "direct appliance build does not require framework"). No ABI promise.
 3. **Folding multi-domain FDBs into one PackedMacTable per domain and deleting MacTable is deferred**: no consumer has
@@ -7512,3 +7527,70 @@ ns (8 rounds, 5 of 8 pairs favourable; the change only removes work). Next: the 
 names `Meson (clang-tsan)`. Signing runs in the release job on `develop` pushes and tags (not reproducible locally:
 keyless signing needs the job's OIDC token).
 
+
+## D-094 Experimental public codec facade (`init_context().codecs()`); R4 an installed-tree plugin driven over the control API
+
+**Status:** accepted (2026-10-05; D-093 item 1).
+**Code:** `core/framework/module_init_context.{h,cc}` (`codecs()`; `BindingsOf` removed),
+`core/framework/resource_bindings.h`, `core/modules/{action_table,exact_match,meter,router,wildcard_match}.cc`
+(bind through `codecs()`), `core/meson.build` and `tools/api_classes.json` (`framework/resource_codec.h`,
+`framework/resource_bindings.h` installed, experimental), `examples/appliances/session/` (new: `session.proto`,
+`session_app.h`, `session_appliance.cc`), `examples/appliances/meson.build` (protoc; descriptor set installed),
+`core/dataplane/session_reference_test.cc` (removed), `tools/check_standalone_plugins.py` (`SessionWire`),
+`docs/plugin-api.md`, `docs/architecture.md`, `examples/appliances/README.md`.
+
+**Context.** D-074 took the resource bindings out of the public context: codecs are protobuf-bound control metadata,
+and the SDK had no codec API. So an installed-tree plugin's resources could be registered (`resources()`) but never
+reached over `ApplyTransaction`, and R4 stayed an in-tree test driving the engine in-process (D-086). The user agreed
+to an experimental public facade (D-093 item 1).
+
+**Decision.**
+- `framework/resource_codec.h` (`ResourceCodec`, `TypedCodec<KeyMsg, ValueMsg>`) and `framework/resource_bindings.h`
+  (`ResourceBindings`, the `ResourceBinding` handle) are installed, experimental. A module binds through
+  `init_context().codecs()`, a non-virtual inline accessor of the context's existing `resource_bindings_` member (no
+  member added, offsets unchanged). `framework::BindingsOf` and its friend declaration are removed; the five in-tree
+  modules use `codecs()`. `module_init_context.h` (public) still only forward-declares `ResourceBindings`, so the
+  public set includes no experimental header, and protobuf stays at the framework boundary: the dataplane headers
+  are unchanged (`check_includes.py`).
+- No new capability bit. The facade adds no bessd symbol: `codecs()` is inline, and `ResourceBindings::Bind` and
+  `ResourceBinding::Reset` have been exported by every bessd since D-044, which precedes the plugin descriptor and its
+  capability check (D-047). A plugin that binds codecs requires `BESS_CAP_RESOURCES` for the resources it binds them
+  to. `BESS_CAP_CODECS` would refuse no daemon that the API range does not already refuse.
+- R4 moves to `examples/appliances/session/`: `SessionApp` (no protobuf) owns its QoS policies, actions and rules
+  (`SlotResource`s over `SlotTable`s; actions reference a QoS policy and the router's next hop, rules an action) and a
+  `route::Router`; `Enroll(init_context().resources())` registers all five with bessd's engine. The module binds a
+  codec to each: the application's messages from `session.proto` (`session_appliance.QosKey/QosValue`,
+  `ActionKey/ActionValue`, `RuleKey/RuleValue`) and BESS's `bess.pb.RouterNextHopIdKey/RouterNextHopValue`,
+  `RouterRouteKey/RouterRouteValue` for its router (the router is BESS's, so its wire types are too; the egress gate
+  is the module's output gate). The graph path: the session's downlink leaves on its next hop's gate as GTP-U header
+  plus inner packet. `examples/appliances/meson.build` compiles the `.proto` with `protoc` and installs its descriptor
+  set, `session_appliance.desc`, next to the plugin.
+- `self_test` (in-process, no engine): one session's five operations are decoded by the codecs the module binds (keys
+  checked against the resource keys, values against the fields; id 0, a message under another type's URL, a bad
+  address and a missing gate refused), written directly into a private `SessionApp`, and the fused path checked on
+  frames: forwarded to next hop 1 with the TEID's GTP-U header and the inner packet, a UE without a session not
+  forwarded, a 64 kB/s policy forwarding then metering a burst, and no way out once the route is removed. The
+  engine's side of the in-tree test (a missing next hop refused whole; a next hop an action names kept; removal
+  referrers first) moves to the wire check, against bessd's real engine.
+- Wire check (`check_standalone_plugins.py --set appliances`, `SessionWire`): the message classes come from the
+  descriptor set (`google.protobuf.message_factory`), the router's from the installed Python client. Before traffic:
+  `ListTransactionResources` names the five resources with their key and value types, and one `ApplyTransaction`
+  installs session 1 (next hop, route, QoS policy, action, rule) and is Applied with every operation applied; the
+  graph then carries the UE's downlink out of gate 0. After traffic: a session whose action names next hop 2 is
+  Rejected, the generation does not move, and its rule does not exist (erasing it is Rejected); removing the route
+  and next hop 1 is Rejected while the action names it; removing the rule, action, QoS policy, route and next hop in
+  one transaction is Applied.
+- `core/dataplane/session_reference_test.cc` and its meson entry are removed: its four cases are covered, two by the
+  self test and two over the wire. Nothing in it needed to stay in-tree.
+
+**Evidence.** Fast build (`-Dcpu=x86-64-v3 -Dbuildtype=debugoptimized`); `meson test --no-suite benchmarks`: 139 of
+140 pass; `module_integration` failed there on this host's state (no Go toolchain for `control_sdk_go`; refused
+connections to the shared default port 10514) and passes alone with `BESS_SKIP_GO=1`. `check_includes.py` and its
+`--self-test` pass. Fresh stage (`meson install --destdir`): `check_installed_headers.py` passes (32 public, 77
+experimental, 5 generated). `examples/appliances` built from the stage alone; `check_standalone_plugins.py --set
+appliances` against the staged bessd: R4's five resources listed with their wire types, session 1 Applied, R1-R4 move
+packets on gate 0, all four `self_test`s pass, the missing-next-hop session Rejected whole, the named next hop kept
+and then removed with the session. Mutant: the action codec decoding key `id + 1` fails the wire check at install
+("OUTCOME_REJECTED ... references missing session0/actions/01000000").
+
+**Revisit when:** a codec API that is not protobuf-bound is wanted, or the facade is promoted to public.

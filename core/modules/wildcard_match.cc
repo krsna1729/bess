@@ -169,7 +169,7 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
           }});
   // Typed keys and values over the RPC (D-025): values and masks per field,
   // checked and packed as the add command does, and {priority, gate}.
-  binding_ = bess::framework::BindingsOf(init_context()).Bind(
+  binding_ = init_context().codecs().Bind(
       *resource_,std::make_shared<bess::framework::TypedCodec<
                           bess::pb::WildcardMatchRuleKey,
                           bess::pb::WildcardMatchRuleValue>>(

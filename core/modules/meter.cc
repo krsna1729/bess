@@ -186,7 +186,7 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
   published_.Initialize(live_->Build());
 
   resource_ = std::make_unique<MetersResource>(*this);
-  binding_ = bess::framework::BindingsOf(init_context()).Bind(
+  binding_ = init_context().codecs().Bind(
       *resource_,
       std::make_shared<bess::framework::TypedCodec<bess::pb::MeterIdKey,
                                              bess::pb::MeterPolicyValue>>(

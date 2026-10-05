@@ -24,9 +24,5 @@ const ModuleInitContext &ModuleInitContext::ProcessDefault() {
   return *context;
 }
 
-ResourceBindings &BindingsOf(const ModuleInitContext &context) noexcept {
-  return context.resource_bindings_;
-}
-
 }  // namespace framework
 }  // namespace bess
