@@ -234,6 +234,7 @@ jobs:
       LANE: --cc gcc-14 --cxx g++-14 --name standalone
     permissions:
       contents: write
+      id-token: write  # Sigstore keyless signing (D-093): GitHub's OIDC identity, no stored keys
     steps:
       - uses: actions/checkout@v7
 
@@ -277,6 +278,22 @@ jobs:
           docker save bess:"$VERSION" | gzip > dist/bess-image-"$VERSION"-$(uname -m).tar.gz
           (cd dist && sha256sum *.deb bess-image-*.tar.gz >> SHA256SUMS)
           echo "RELEASE_VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign release artifacts (Sigstore keyless)
+        # Each artifact gets a .sigstore.json bundle: the signature, the
+        # certificate naming this workflow run, and the transparency-log entry.
+        # Verify with:
+        #   cosign verify-blob --bundle F.sigstore.json \
+        #     --certificate-identity-regexp 'https://github.com/krsna1729/bess/.github/workflows/ci.yml@.*' \
+        #     --certificate-oidc-issuer https://token.actions.githubusercontent.com F
+        run: |
+          cd dist
+          for f in *.tar.gz *.deb SHA256SUMS; do
+            [ -f "$f" ] || continue
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          done
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

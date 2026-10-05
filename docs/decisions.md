@@ -113,6 +113,7 @@ file is the reasoning.
 | D-090 | Plugin unload refuses while the plugin's code is reachable (roadmap 28.4) | accepted |
 | D-091 | Accepted: BM_ThreadsWorkerLocalUpdate +6.7% (2 threads), not attributable to a code change (roadmap 23.2) | accepted |
 | D-092 | Classified live perf tests; master vs develop: framework cost predates the roadmap, module costs located | accepted |
+| D-093 | User decisions of 2026-10-05: public codecs, installed archives, TSan gates, keyless signing; MacTable fold deferred | accepted |
 
 
 ---
@@ -6761,7 +6762,7 @@ sha256) and `share/doc/bess/bess.spdx.json` (SPDX-2.3, 13 packages, DPDK's with 
 
 **Not done.** Container image and distro packages (no consumer yet: env/Dockerfile builds the CI image only; done
 since, D-087);
-signing and provenance (M26 item in the roadmap's release work, blocked on secrets); a reproducibility check that
+signing and provenance (M26 item in the roadmap's release work, blocked on secrets; signing done since, keyless, D-093); a reproducibility check that
 builds twice and compares (the metadata is deterministic, the binaries are not checked).
 
 **Revisit when:** a consumer needs a container or distro package; release signing keys exist.
@@ -7471,4 +7472,33 @@ tree configured `b_ndebug=false` read 6-11 points worse on the sample pipelines.
 - Pre-roadmap module costs (between the Meson cutover and f4fdab03): WildcardMatch 2.4x, ExactMatch +31%.
 
 **Revisit when:** each cost above gets its own bisect and record; the F-class baseline becomes a report-only CI step.
+
+
+## D-093 User decisions of 2026-10-05: public codecs, installed archives, TSan gates, keyless signing; MacTable fold deferred
+
+**Status:** accepted (2026-10-05, the user agreed with every recommendation below).
+**Code (so far):** `tools/ci_profile.py` and `docs/ci-parity.md` (TSan gates), `.github/workflows/ci.yml` (signing).
+
+**Decisions.**
+1. **Resource wire codecs get an experimental public facade**, so an installed-tree plugin's resources can be driven
+   over the control API (M27) and R4 can move to the installed tree. Protobuf stays at the framework boundary; the
+   dataplane libraries stay protobuf-free. (Its own record when it lands.)
+2. **Static archives of `route`, `rcu` and `dataplane` are installed, experimental**, with a CI test linking R1's
+   app without bessd (Appendix J "direct appliance build does not require framework"). No ABI promise.
+3. **Folding multi-domain FDBs into one PackedMacTable per domain and deleting MacTable is deferred**: no consumer has
+   more than one bridge domain, and it moves capacity from per FDB to per domain (D-073).
+4. **L2Forward's doubled slot memory (D-073) is accepted** if L2Forward is not slower for it; the live test shows +1.2
+   ns per packet since f4fdab03, which is checked before this item closes.
+5. **CI:** `clang-tsan` gates now (a required check on `develop`, no longer `experimental`); `clang-asan`, `gcc-arm64`
+   and `clang-arm64` become required after their first fully green run; the ubuntu-26.04 lanes stay experimental.
+6. **Release signing is Sigstore keyless**: the release job (permission `id-token: write`) signs each tarball, .deb,
+   image archive and `SHA256SUMS` with `cosign sign-blob`, the identity being this workflow's GitHub OIDC token; each
+   artifact ships with a `.sigstore.json` bundle (signature, certificate, transparency-log entry). No keys are stored.
+   Verify: `cosign verify-blob --bundle F.sigstore.json --certificate-identity-regexp
+   'https://github.com/krsna1729/bess/.github/workflows/ci.yml@.*' --certificate-oidc-issuer
+   https://token.actions.githubusercontent.com F`.
+
+**Evidence.** TSan: every run of the batch (pushes 25-33) passed the lane; the required-checks list on `develop` now
+names `Meson (clang-tsan)`. Signing runs in the release job on `develop` pushes and tags (not reproducible locally:
+keyless signing needs the job's OIDC token).
 
