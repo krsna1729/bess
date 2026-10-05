@@ -60,6 +60,11 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   third architecture runs, and everything (benchmarks too) builds and tests
   against them. All three are experimental (cannot block a merge) until they
   have been green; `check-pins` already holds them to the gating pins.
+- **Which lanes gate.** `gcc`, `clang` and `clang-tsan` (TSan over
+  `tools/sanitizers/tsan_tests.txt`), with `Protobuf compatibility`, are the
+  required checks on `develop`. `clang-asan` and the two arm64 lanes become
+  required after their first fully green run (user decision, 2026-10-05); the
+  ubuntu-26.04 lanes stay experimental (a future distribution).
 - **Which lanes run when.** The lane table is `LANES` in `tools/ci_profile.py`;
   the workflow's `Lanes` job turns it into the matrix
   (`ci_profile.py lanes --event <event>`). Pull requests run the gating pair
