@@ -6635,7 +6635,10 @@ the module as C++ types. No table offered both lock-free readers on many workers
 - **Bridge** moves to `BasicFdb<PackedMacTable<ExpiryHandle>>` (owned): it has one bridge domain, and the one-word
   table is faster than MacTable in every lookup and learn measured (evidence below). **MacTable stays** for FDBs with
   more than one bridge domain, which one-word slots cannot hold. Needs review (user): fold multi-domain FDBs into one
-  `PackedMacTable` per domain and delete MacTable (it changes capacity from per FDB to per domain).
+  `PackedMacTable` per domain and delete MacTable (it changes capacity from per FDB to per domain). *(User decision,
+  2026-10-05, D-093: deferred until a consumer has more than one bridge domain. The doubled slot memory is accepted:
+  live L2Forward before and after this change (d41bdb0f, dbe41a38; `tools/live_perf.py`, 6 paired rounds, isolated)
+  measured 8.92 and 8.20 ns per packet above the front end, after slower in 3 of 6 pairs -- no regression.)*
 
 **Evidence** (release x86-64-v3, `omarchy-benchmark --isolate --cpu 2`, `tools/ab_bench.py` 16 ABBA rounds; the
 wrapper flagged timer, thermal and function-call interrupts on CPU 2 in every run, so single rows near the noise band
