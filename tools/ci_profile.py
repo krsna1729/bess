@@ -594,6 +594,10 @@ def release_meson_options(s):
         '-Daf_xdp=required',
         '-Dbuild_benchmarks=false',
         '-Dbuild_sample_plugin=false',
+        # `meson install` (package_release.py deb) builds every default
+        # target: the release ships no tests, so it builds none (GCC 14 at -O3
+        # flagged false bounds in test code under -Werror).
+        '-Dbuild_tests=false',
     ]
 
 

@@ -793,7 +793,7 @@ allocation_fault_tests = [
 ]
 
 taskset_prog = find_program('taskset', required: false)
-foreach source : unit_test_sources
+foreach source : (get_option('build_tests') ? unit_test_sources : [])
   test_name = source.replace('.cc', '').replace('/', '_')
   integration_test = (
     source.startswith('control/') or

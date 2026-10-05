@@ -20,6 +20,10 @@ option('build_benchmarks',
        type: 'boolean',
        value: true,
        description: 'Build benchmark executables')
+option('build_tests',
+       type: 'boolean',
+       value: true,
+       description: 'Build the C++ unit tests (the release job turns them off: it installs what it ships)')
 option('build_fuzzers',
        type: 'boolean',
        value: false,
