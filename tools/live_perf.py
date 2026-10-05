@@ -53,8 +53,10 @@ DPDK_LIB = Path('/home/krsna1729/Projects/bess/deps/dpdk-25.11.3/install/lib')
 
 # -- packets --------------------------------------------------------------------
 
-def ipv4_udp(src=0x0a000001, dst=0x0b000001, sport=1000, dport=2000, size=60, vlan=False):
-    """An Ethernet/IPv4/UDP frame of `size` bytes (checksum filled)."""
+def ipv4_udp(src=0x0a000001, dst=0x0b000001, sport=40000, dport=2000, size=60, vlan=False):
+    """An Ethernet/IPv4/UDP frame of `size` bytes (checksum filled). The source
+    port is unprivileged: NAT maps a port below 1024 only into a range below
+    1024 (RFC 4787 REQ-5-a), and M.nat's range starts at 1024."""
     eth = bytes.fromhex('020000000002' '020000000001') + (b'\x81\x00\x00\x01' if vlan else b'')
     eth += b'\x08\x00'
     payload = max(0, size - len(eth) - 28)

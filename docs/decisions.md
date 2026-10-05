@@ -112,6 +112,7 @@ file is the reasoning.
 | D-089 | Bounded-backpressure observability: pressure transitions, throttled packet-path events, DPDK tracing (M25 phase 3) | accepted |
 | D-090 | Plugin unload refuses while the plugin's code is reachable (roadmap 28.4) | accepted |
 | D-091 | Accepted: BM_ThreadsWorkerLocalUpdate +6.7% (2 threads), not attributable to a code change (roadmap 23.2) | accepted |
+| D-092 | Classified live perf tests; master vs develop: framework cost predates the roadmap, module costs located | accepted |
 
 
 ---
@@ -7427,4 +7428,47 @@ two threads updating adjacent slots; the single-thread update rows and every pac
 
 **Revisit when:** a change to `stats/worker_local.h` or `stats/worker_slots.h`, or a packet-path benchmark that shows
 counter updates, regresses; then the row is measured again alongside it.
+
+
+## D-092 Classified live perf tests; master vs develop: framework cost predates the roadmap, module costs located
+
+**Status:** accepted (2026-10-05). Findings recorded; fixes follow as their own records.
+**Code:** `tools/live_perf.py` (new), `tools/four_way_pipeline_bench.py` (counts packets again), `docs/benchmarking.md`,
+`docs/baselines/live-perf-master-vs-929a80ad.json`.
+
+**Context.** The sample-pipeline comparison (four_way_pipeline_bench) had measured 0 Mpps since the scripts' removed
+`track_module` call broke it; fixed, it showed develop 10-41% below master on every sample pipeline and could not say
+why. The user asked for live tests classified so a result points at what started costing more.
+
+**Decision.** `tools/live_perf.py`: small pipelines on one pinned worker, ns per packet from the leaf traffic classes'
+counters (nothing on the packet path). Class F (framework, cross-cutting): Source->Sink floor, N Bypass hops (slope =
+one hop), fan-out, fan-in, Track hooks, scheduler width, packet size, cross-worker Queue. Class M (modules,
+localised): each module behind the same Source->Rewrite->RandomUpdate (1,024 flows) front end, reported above that
+front end; every M test is checked to take its intended path (rule hits, NAT translating -- the template's source
+port is unprivileged, since NAT maps ports below 1024 only into a range below 1024, RFC 4787 REQ-5-a, as master did).
+Palindromic rounds over builds; `--baseline --threshold` exits 1 on a regression. Release trees must define NDEBUG: a
+tree configured `b_ndebug=false` read 6-11 points worse on the sample pipelines.
+
+**Evidence** (isolated CPUs 2,4, 3-4 rounds, contamination flagged; ns per packet):
+
+| test | master | e8c8e176 (Meson cutover) | f4fdab03 (roadmap baseline) | develop |
+|---|---|---|---|---|
+| F.floor | 1.85 | 3.06 | 2.52 | 2.30 |
+| F.hop/1 | 2.26 | 3.73 | 3.20 | 3.05 |
+| F.hop/16 | 8.01 | 10.03 | 10.53 | 10.45 |
+| F.queue | 3.81 | 5.28 | 4.83 | 4.72 |
+| M.nat (above M.base) | 12.62 | -- | 9.37 | 16.78 |
+| M.l2forward | 3.93 | -- | 4.37 | 5.58 |
+| M.wildcardmatch | 18.28 | 18.00 | 42.46 | 43.38 |
+| M.exactmatch | 10.92 | 11.92 | 15.63 | 14.70 |
+| M.iplookup | 3.37 | 4.85 | 4.84 | 4.91 |
+
+- The framework cost (+25-38% over master on every F test) entered between master (Make, older DPDK, static link)
+  and the first Meson build; the roadmap's work since f4fdab03 reduced it (F.floor -9%). Cause not yet isolated: a
+  fully static develop build fails on this host (gflags linked twice), so the link hypothesis is untested.
+- Roadmap-era module costs: NAT +7.4 ns over the legacy module at f4fdab03 (the M18 library, introduced at 1249f4e1;
+  D-068 accepted about +5 ns in its microbenchmark), L2Forward +1.2 ns (PackedMacTable, D-073, likely).
+- Pre-roadmap module costs (between the Meson cutover and f4fdab03): WildcardMatch 2.4x, ExactMatch +31%.
+
+**Revisit when:** each cost above gets its own bisect and record; the F-class baseline becomes a report-only CI step.
 
