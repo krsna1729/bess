@@ -108,6 +108,8 @@ def remove_pidfile(path):
         os.remove(path)
     except FileNotFoundError:
         pass
+    except PermissionError:  # bessd runs as root: the pidfile is root's
+        subprocess.run(['sudo', '-n', 'rm', '-f', path], check=False)
 
 
 def stop_bessd(proc, pidfile):
@@ -121,7 +123,7 @@ def stop_bessd(proc, pidfile):
     remove_pidfile(pidfile)
 
 
-def run_pipeline_worker(variant_key, pipelines, cpu='2,4', duration=1.0):
+def run_pipeline_worker(variant_key, pipelines, cpu='2,4', duration=1.0, metric='sink'):
     info = VARIANTS[variant_key]
     worker_cpus = [int(core) for core in cpu.split(',')]
     port = allocate_tcp_port()
@@ -179,15 +181,18 @@ if is_master:
     bess_dir = '/var/tmp/bess-clawback-base-20260930/bessctl'
 else:
     # Current tree imports
-    sys.path.insert(0, '/home/krsna1729/Projects/bess/build/perf-release/protobuf/generated/python/builtin_pb')
-    sys.path.insert(1, '/home/krsna1729/Projects/bess/build/perf-release/protobuf/generated/python')
-    sys.path.insert(2, '/home/krsna1729/Projects/bess')
-    sys.path.insert(3, '/home/krsna1729/Projects/bess/bessctl')
+    root = {info.get('python_root', '/home/krsna1729/Projects/bess')!r}
+    sys.path.insert(0, root + '/build/perf-release/protobuf/generated/python/builtin_pb')
+    sys.path.insert(1, root + '/build/perf-release/protobuf/generated/python')
+    sys.path.insert(2, root)
+    sys.path.insert(3, root + '/bessctl')
     import bessctl.cli as cli_mod
     import bessctl.commands as commands
     from pybess.bess import BESS
-    bess_dir = '/home/krsna1729/Projects/bess/bessctl'
+    bess_dir = root + '/bessctl'
 
+# perftest scripts still call the removed track_module(); counting is the
+# Track gate hook, enabled below on the Sinks' input gates only.
 BESS.track_module = lambda self, *a, **k: None
 
 bess = BESS()
@@ -212,12 +217,37 @@ for name, path, env_vars in pipelines:
     workers_before = set(w.wid for w in bess.list_workers().workers_status)
     try:
         bess.reset_all()
-        commands._run_file(cli, path, env_vars)
+        import contextlib, io, re
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            commands._run_file(cli, path, env_vars)
+        # Self-measuring perftest scripts (chain, split, merge, ...) run their
+        # own sweeps and tear down: their "<Label>/<n> pps: <value>" lines are
+        # the result, one per configuration.
+        own = re.findall(r'^\\s*(.+?)\\s+pps:\\s+([0-9.]+)', printed.getvalue(), re.M)
+        if own:
+            for label, value in own:
+                res[name + ':' + label.replace(' ', '')] = float(value) / 1e6
+            continue
         time.sleep(0.3)
         bess.resume_all()
+        metric = {metric!r}
+        if metric == 'sink':
+            for module in bess.list_modules().modules:
+                if module.mclass.rsplit('::', 1)[-1].lower() == 'sink':
+                    bess.track_gate(True, '', module.name, direction='in')
 
         def sink_snapshot():
             snapshot = {{}}
+            if metric == 'tc':
+                # Packets the scheduler accounted to leaf traffic classes (the
+                # tasks), with no hook on the packet path.
+                for c in bess.list_tcs().classes_status:
+                    tc = getattr(c, 'class')
+                    if tc.policy == 'leaf':
+                        st = bess.get_tc_stats(tc.name)
+                        snapshot[(tc.name, 0)] = (st.packets, st.timestamp)
+                return snapshot
             for module in bess.list_modules().modules:
                 if module.mclass.rsplit('::', 1)[-1].lower() != 'sink':
                     continue
@@ -256,9 +286,15 @@ for name, path, env_vars in pipelines:
 print(json.dumps({{'results': res, 'skipped': skipped}}))
 """
         # Keep RPC client under the isolation wrapper; it sleeps during packet sampling.
+        client_env = dict(os.environ)
+        if not info['is_master']:
+            # pybess's builtin_pb shim loads the generated modules from here.
+            client_env['BESS_PROTOBUF_ROOT'] = (
+                info.get('python_root', '/home/krsna1729/Projects/bess')
+                + '/build/perf-release/protobuf/generated/python')
         client_res = subprocess.run(
             ['python3', '-c', client_code],
-            capture_output=True, text=True, timeout=120
+            capture_output=True, text=True, timeout=600, env=client_env
         )
         report_found = False
         if client_res.returncode == 0 and client_res.stdout.strip():
@@ -290,10 +326,29 @@ def main():
                    help='Isolated worker CPUs (default: 2,4)')
     p.add_argument('--duration', type=float, default=1.0, help='Measurement window in seconds (default: 1.0)')
     p.add_argument('--output', default='/tmp/four_way_pipelines.json', help='Output JSON path')
+    p.add_argument('--variants', default='master_nat,master_v3,current_v3,current_nat',
+                   help='Which builds, in palindrome order (default: all four)')
+    p.add_argument('--filter', default=None, help='Only configs whose name matches this regex')
+    p.add_argument('--metric', choices=('sink', 'tc'), default='sink',
+                   help='sink: Track hook on the Sinks\' input gates; tc: packets of the leaf '
+                        'traffic classes (no packet-path hook)')
+    p.add_argument('--current-root', default=None,
+                   help='A tree whose build/perf-release replaces the main checkout\'s for current_v3')
     args = p.parse_args()
 
-    seq = ['master_nat', 'master_v3', 'current_v3', 'current_nat',
-           'current_nat', 'current_v3', 'master_v3', 'master_nat']
+    if args.current_root:
+        root = Path(args.current_root)
+        VARIANTS['current_v3']['bessd'] = str(root / 'build/perf-release/core/bessd')
+        VARIANTS['current_v3']['python_root'] = str(root)
+    global SUITE_PIPELINES
+    if args.filter:
+        import re
+        SUITE_PIPELINES = [p_ for p_ in SUITE_PIPELINES if re.search(args.filter, p_[0])]
+    order = args.variants.split(',')
+    unknown = [v for v in order if v not in VARIANTS]
+    if unknown:
+        p.error(f'unknown variants: {unknown}')
+    seq = order + order[::-1]
 
     total_runs = len(seq) * args.rounds
 
@@ -309,7 +364,7 @@ def main():
             run_idx += 1
             t0 = time.time()
             m, skipped = run_pipeline_worker(
-                key, SUITE_PIPELINES, cpu=args.cpu, duration=args.duration)
+                key, SUITE_PIPELINES, cpu=args.cpu, duration=args.duration, metric=args.metric)
             dt = time.time() - t0
             print(f"[{run_idx}/{total_runs}] {VARIANTS[key]['label']:<20}: {len(m)} configs measured, {len(skipped)} skipped ({dt:.2f}s)")
             for name, mpps in m.items():
@@ -334,7 +389,7 @@ def main():
     print(f"| {' | '.join(headers)} |")
     print(f"|{'-' * 28}|{'-' * 14}|{'-' * 14}|{'-' * 14}|{'-' * 14}|{'-' * 16}|{'-' * 17}|{'-' * 16}|")
 
-    all_names = [p[0] for p in SUITE_PIPELINES]
+    all_names = sorted({name for per in data.values() for name in per})
     for name in all_names:
         medians = {
             key: statistics.median(data[key][name]) if data[key][name] else None
@@ -358,7 +413,7 @@ def main():
             f"| {delta(medians['current_v3'], medians['master_nat']):>16} |")
 
     print("\nSkipped or unmeasurable configs:")
-    for name in all_names:
+    for name in sorted(set(all_names) | {n for per in skipped_data.values() for n in per}):
         details = []
         for key, variant in VARIANTS.items():
             reasons = sorted(set(skipped_data[key].get(name, [])))
@@ -375,7 +430,8 @@ def main():
                 'skipped': skipped_data,
                 'excluded_physical_port_configs': EXCLUDED_PIPELINES,
                 'config_sources': CONFIG_SOURCES,
-                'metric': 'sum of Sink input packet-counter deltas per second (Mpps)',
+                'metric': ('sum of Sink input packet-counter deltas per second (Mpps; Track hook on '
+                           'the Sinks\' input gates), or a self-measuring script\'s own pps lines'),
                 'worker_cpus': args.cpu,
                 'rounds': args.rounds,
                 'duration_seconds': args.duration,
