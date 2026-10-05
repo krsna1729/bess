@@ -7474,6 +7474,13 @@ tree configured `b_ndebug=false` read 6-11 points worse on the sample pipelines.
   D-068 accepted about +5 ns in its microbenchmark), L2Forward +1.2 ns (PackedMacTable, D-073, likely).
 - Pre-roadmap module costs (between the Meson cutover and f4fdab03): WildcardMatch 2.4x, ExactMatch +31%.
 
+**NAT breakdown (addendum).** Variants of develop's release build, `M.nat` above the front end, isolated, 6 rounds:
+whole module 19.2 ns; without the per-batch `Expire` call 23.1 vs 23.5 in another session (about 0.4 ns: not the
+cost); module skeleton (no translation) 1.0; parse only 6.1 (so parsing about 5.0); everything but the per-packet emit
+loop 16.7 (lookup, rewrite and refresh about 10.6; the emit loop about 2.5); master 14.9. Change: when every packet of
+a batch translated, the batch leaves whole on its gate (`RunChooseModule`) instead of packet by packet: 19.07 -> 16.63
+ns (8 rounds, 5 of 8 pairs favourable; the change only removes work). Next: the 5 ns parse.
+
 **Revisit when:** each cost above gets its own bisect and record; the F-class baseline becomes a report-only CI step.
 
 

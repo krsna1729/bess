@@ -316,6 +316,16 @@ void NAT::Translate(N &nat, Context *ctx, bess::PacketBatch *batch) {
   }
   nat.TranslateBatch(std::span(frames, cnt), std::span(parsed, cnt), std::span(ok, cnt), dir,
                      now, std::span(verdicts, cnt));
+  // The common case, every packet translated: the batch leaves whole on one
+  // gate (about 2.5 ns a packet less than emitting each; D-092).
+  bool all = true;
+  for (int i = 0; i < cnt; i++) {
+    all &= verdicts[i] == nat::Verdict::kTranslated;
+  }
+  if (all) [[likely]] {
+    RunChooseModule(ctx, ogate, batch);
+    return;
+  }
   uint64_t full = 0, exhausted = 0;
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
