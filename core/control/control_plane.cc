@@ -1493,7 +1493,8 @@ ControlResult<void> ControlPlane::UnloadPlugin(const std::string& path) {
   };
   std::vector<std::string> users;
   for (const auto &[name, m] : runtime::runtime().modules().All()) {
-    if (in(contents.module_classes, m->module_builder()->class_name())) {
+    if (m->module_builder() != nullptr &&
+        in(contents.module_classes, m->module_builder()->class_name())) {
       users.push_back("module " + name);
     }
     auto hooks_of = [&](const auto &gates) {

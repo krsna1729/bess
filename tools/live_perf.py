@@ -345,10 +345,12 @@ def build_spec(text):
                 'pythonpath': [str(MASTER_TOOLCHAIN), str(MASTER)],
                 'env': {'LIVE_PERF_PB2D': str(ROOT / 'pybess/protobuf_to_dict.py')}}
     if text.startswith('current'):
-        tree = Path(text.split(':', 1)[1]) if ':' in text else ROOT
-        gen = tree / 'build/perf-release/protobuf/generated/python'
-        return {'name': 'current' if ':' not in text else tree.name,
-                'bessd': str(tree / 'build/perf-release/core/bessd'), 'modules': '',
+        parts = text.split(':')
+        tree = Path(parts[1]) if len(parts) > 1 else ROOT
+        build = parts[2] if len(parts) > 2 else 'build/perf-release'
+        gen = tree / build / 'protobuf/generated/python'
+        return {'name': 'current' if len(parts) == 1 else tree.name + ('' if len(parts) < 3 else '/' + Path(build).name),
+                'bessd': str(tree / build / 'core/bessd'), 'modules': '',
                 'ld': str(DPDK_LIB), 'pythonpath': [str(gen / 'builtin_pb'), str(gen), str(tree)],
                 'env': {'BESS_PROTOBUF_ROOT': str(gen)}}
     name, rest = text.split('=', 1)
