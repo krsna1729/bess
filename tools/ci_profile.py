@@ -86,10 +86,12 @@ LANES = [
     # N2), the same compilers, DPDK bootstrap and steps as the gating pair,
     # built for the armv8.2-a floor. AF_XDP stays required: Ubuntu 24.04 ships
     # libxdp-dev/libbpf-dev for arm64.
+    # Gating since their first green run (d040ec6d; user decision, D-093).
+    # Still push_only: a pull request does not run them, the push does.
     {'name': 'gcc-arm64', 'os': 'ubuntu-24.04-arm', 'cc': 'gcc-14', 'cxx': 'g++-14',
-     'experimental': True, 'push_only': True},
+     'push_only': True},
     {'name': 'clang-arm64', 'os': 'ubuntu-24.04-arm', 'cc': 'clang-19', 'cxx': 'clang++-19',
-     'experimental': True, 'push_only': True},
+     'push_only': True},
     # Sanitizers (M22, D-072): ASan+UBSan over the unit, architecture, plugin
     # and fuzz-corpus suites; TSan over the concurrency tests in
     # tools/sanitizers/tsan_tests.txt. Experimental until green, then gating:

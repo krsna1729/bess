@@ -7498,7 +7498,7 @@ tree configured `b_ndebug=false` read 6-11 points worse on the sample pipelines.
    'https://github.com/krsna1729/bess/.github/workflows/ci.yml@.*' --certificate-oidc-issuer
    https://token.actions.githubusercontent.com F`.
 
-**Evidence.** TSan: every run of the batch (pushes 25-33) passed the lane; the required-checks list on `develop` now
+**Evidence.** arm64: both lanes green on d040ec6d (push 32), now required and no longer `experimental`. TSan: every run of the batch (pushes 25-33) passed the lane; the required-checks list on `develop` now
 names `Meson (clang-tsan)`. Signing runs in the release job on `develop` pushes and tags (not reproducible locally:
 keyless signing needs the job's OIDC token).
 

@@ -4,6 +4,7 @@
 // every worker.
 
 #include <atomic>
+#include <algorithm>
 #include <map>
 #include <thread>
 #include <vector>
@@ -24,7 +25,10 @@ constexpr uint32_t kPublic = 0xc6336401, kRemote = 0x08080808;
 
 std::vector<uint8_t> Udp(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport,
                          size_t payload = 0) {
-  std::vector<uint8_t> f(14 + 28 + payload, 0);
+  // At least a minimum Ethernet frame (60 bytes, padding after the IP
+  // packet): a shorter buffer is smaller than the TCP checksum offset, which
+  // GCC 14 at -O3 flags on the rewrite's TCP path (-Wstringop-overflow).
+  std::vector<uint8_t> f(std::max<size_t>(14 + 28 + payload, 60), 0);
   f[12] = 0x08;
   f[14] = 0x45, f[22] = 64, f[23] = 17;
   const uint16_t ip_len = static_cast<uint16_t>(28 + payload);
