@@ -165,3 +165,25 @@ honestly). Every run first moves a verified stream; a spin that makes no progres
 for 20 s aborts. Counters: `ns_per_burst`, `ns_per_item`, `bytes_per_item` (ring
 element), `ring_bytes`. For a paired A/B between two rows of one binary use
 `tools/ab_bench.py` with `--filter-b` and `--rename-b`.
+
+## Classified live perf tests (`tools/live_perf.py`)
+
+A sample pipeline says that something got slower, not what. `tools/live_perf.py` runs small pipelines on one
+pinned worker, each isolating one cost, and reports ns per packet from the leaf traffic classes' counters
+(nothing added to the packet path):
+
+- **F, framework (cross-cutting):** `F.floor` (Source -> Sink), `F.hop/N` (N Bypass hops; the slope is the cost
+  of one module hop), `F.fanout/4`, `F.fanin/4`, `F.hook` (Track hooks on every gate), `F.tc/N` (scheduler with
+  N leaves), `F.size/1500`, `F.queue` (cross-worker Queue).
+- **M, modules (localised):** each module after the same Source -> Rewrite -> RandomUpdate (1,024 flows) front
+  end, reported as ns per packet above `M.base` (the front end with a Bypass).
+
+If `F.floor` or the `F.hop` slope moves, every pipeline moves: look at the scheduler, Source/Sink, the packet
+pool and batch dispatch. If one `M` delta moves alone, the cost is in that module.
+
+    omarchy-benchmark --isolate --cpu 2,4 -- tools/live_perf.py \
+        --build master --build current:<tree> --rounds 4 --save run.json
+    tools/live_perf.py --build current --tests F --baseline run.json --threshold 5   # exits 1 on a regression
+
+Builds must be release builds with `NDEBUG` (`b_ndebug=if-release`): a tree configured with `b_ndebug=false`
+pays `_GLIBCXX_ASSERTIONS` everywhere (MODERNIZATION.md entry 148).
