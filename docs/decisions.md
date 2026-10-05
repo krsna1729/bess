@@ -7518,7 +7518,10 @@ WildcardMatch's live cost is still acceptable, or worth optimising (priority pac
 bits so overlapping matches compare without loading records; tuples ordered by their best priority with an early
 exit; or mode W replicas for lookup-heavy users).
 
-**Revisit when:** each cost above gets its own bisect and record; the F-class baseline becomes a report-only CI step.
+CI: the gcc lane runs every F and M test once on pushes and nightly and uploads the result (`ci_profile.py
+live-perf`, report-only, `continue-on-error`), a trend between runs.
+
+**Revisit when:** each cost above gets its own bisect and record.
 
 
 ## D-093 User decisions of 2026-10-05: public codecs, installed archives, TSan gates, keyless signing; MacTable fold deferred

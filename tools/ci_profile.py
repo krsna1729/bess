@@ -561,6 +561,27 @@ STEPS = [
     ('clean-tree', step_clean_tree),
 ]
 
+# Report-only live performance (tools/live_perf.py, D-092): the lane's own
+# build, one round of every F and M test on two runner CPUs, saved for the
+# workflow to upload. A shared runner is no isolated machine, so the result is
+# a trend to compare between runs (the artifacts), never a gate. Not in `all`.
+def step_live_perf(s):
+    out = s.build_dir / 'live-perf.json'
+    cmd = [sys.executable, ROOT / 'tools' / 'live_perf.py',
+           '--build', f'current:{ROOT}:{s.build_dir.relative_to(ROOT)}',
+           '--rounds', '1', '--cpu', '2,3', '--save', out]
+    env = dict(s.env_with_dpdk(), BESS_DPDK_LIB=str(s.dpdk_libdir()))
+    if s.dry_run:
+        print('+ ' + ' '.join(str(c) for c in cmd))
+        return
+    result = subprocess.run([str(c) for c in cmd], env=env, cwd=ROOT)
+    if result.returncode != 0:
+        print(f'live-perf: exited {result.returncode} (report-only, not a failure)')
+
+
+EXTRA_STEPS = [('live-perf', step_live_perf)]
+
+
 # The release job (publish-release in ci.yml): a static standalone bessd built
 # with the same compiler as the gating gcc lane, the `full` DPDK profile, and
 # no benchmarks or sample plugin. It shares this script's compiler and CPU
@@ -706,7 +727,7 @@ def check_cpu(arch):
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('step', choices=[n for n, _ in STEPS + RELEASE_STEPS]
+    parser.add_argument('step', choices=[n for n, _ in STEPS + RELEASE_STEPS + EXTRA_STEPS]
                         + ['all', 'release', 'info', 'check-pins', 'check-cpu', 'cpu', 'lanes'])
     parser.add_argument('--compiler', choices=sorted(PINS))
     parser.add_argument('--cc')
@@ -746,7 +767,7 @@ def main():
     if args.step == 'all' and not args.dry_run:
         s.tree_before = tree_state()
     groups = {'all': STEPS, 'release': RELEASE_STEPS}
-    for name, function in STEPS + RELEASE_STEPS:
+    for name, function in STEPS + RELEASE_STEPS + EXTRA_STEPS:
         if args.step == name or name in [n for n, _ in groups.get(args.step, [])]:
             print(f'== {name}', flush=True)
             function(s)

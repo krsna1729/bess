@@ -202,6 +202,22 @@ jobs:
       - name: Run all Meson tests
         run: python3 tools/ci_profile.py test $LANE
 
+      - name: Live performance, report only (gcc lane, pushes and nightly)
+        # tools/live_perf.py's F and M tests on the lane's build: a trend to
+        # compare between runs' artifacts, never a gate (D-092).
+        if: matrix.name == 'gcc' && github.event_name != 'pull_request'
+        continue-on-error: true
+        run: python3 tools/ci_profile.py live-perf $LANE
+
+      - name: Upload live performance
+        if: matrix.name == 'gcc' && github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-perf-${{ github.sha }}
+          path: build/gcc/live-perf.json
+          if-no-files-found: ignore
+
       - name: Verify install tree, external plugin API and Python client
         run: python3 tools/ci_profile.py verify-install $LANE
 

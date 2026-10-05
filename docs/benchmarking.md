@@ -185,5 +185,10 @@ pool and batch dispatch. If one `M` delta moves alone, the cost is in that modul
         --build master --build current:<tree> --rounds 4 --save run.json
     tools/live_perf.py --build current --tests F --baseline run.json --threshold 5   # exits 1 on a regression
 
+CI runs it report-only: the gcc lane, on pushes and the nightly run, runs one round of every F and M test on its own
+build (`ci_profile.py live-perf`) and uploads `live-perf.json` as the artifact `live-perf-<sha>`. A shared runner is
+not an isolated machine, and the lane is not a release build, so compare runs with each other, never with a local
+baseline; decisions still come from isolated paired runs.
+
 Builds must be release builds with `NDEBUG` (`b_ndebug=if-release`): a tree configured with `b_ndebug=false`
 pays `_GLIBCXX_ASSERTIONS` everywhere (MODERNIZATION.md entry 148).

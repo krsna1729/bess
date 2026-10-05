@@ -48,7 +48,8 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 MASTER = Path('/var/tmp/bess-clawback-base-20260930')
 MASTER_TOOLCHAIN = Path('/var/tmp/master-bench-toolchain')
-DPDK_LIB = Path('/home/krsna1729/Projects/bess/deps/dpdk-25.11.3/install/lib')
+DPDK_LIB = Path(os.environ.get('BESS_DPDK_LIB',
+                             '/home/krsna1729/Projects/bess/deps/dpdk-25.11.3/install/lib'))
 
 
 # -- packets --------------------------------------------------------------------
