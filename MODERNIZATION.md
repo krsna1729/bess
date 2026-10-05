@@ -5128,7 +5128,17 @@ rather than one call site).
      `e78481f8` and `98687b61`; the cheap lanes (protobuf, Go SDK, lanes, TSan) passed on each. Cleanup 3: the tip
      at 140/140 locally with the events, SDK, metrics, NAT and ConnTrack live tests; three worktrees and 31 merged
      local branches removed; pushes held until one full run completes.
-
+166. **Batch 4 and cleanup 4 (2026-10-05).** Pushes 31-40. M25 phase 3 (pressure transitions, throttled packet-path
+     events, DPDK tracing, D-089); plugin unload refused while the plugin's code is reachable (D-090); the user's
+     decisions (D-093): TSan and both arm64 lanes now required checks, Sigstore keyless signing in the release job,
+     public codecs with R4 as an installed-tree plugin driven over the control API (D-094), installed static archives
+     with a standalone router (D-095). Live performance became classified (`tools/live_perf.py`, D-092): framework
+     tests and per-module costs against master, bisected -- NAT's batch emit (-2.4 ns), WildcardMatch's 2x located in
+     mode C (needs review), L2Forward cleared, the framework floor traced with `--counters` to four per-packet
+     alloc/free operations master did not do (D-097, decision pending); static linkage and `-fPIC` ruled out. Two
+     release-job breaks found and fixed: a static DPDK dropped its constructor-registered drivers (D-096; the smoke test
+     now starts bessd), and `meson install` built tests that GCC 14 at -O3 rejected (`build_tests=false`). Cleanup 4:
+     the tip at 150/150 locally with every live test; 14 bisect worktrees and 3 merged branches removed.
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
