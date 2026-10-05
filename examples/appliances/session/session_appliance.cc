@@ -5,7 +5,7 @@
 // and its router's next hops and routes -- are registered with bessd's engine
 // through init_context().resources() and reachable over the control API
 // (bess.pb.v2.ApplyTransaction) through the codecs bound here with
-// init_context().codecs(). The application's wire types are session.proto's;
+// init_context().codecs(). The application's wire types are session_appliance.proto's;
 // the router's are BESS's (bess.pb.RouterNextHopIdKey, ...).
 //
 // Graph path: a downlink frame on igate 0 that a session claims leaves on the
@@ -33,7 +33,7 @@
 #include "framework/resource_codec.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
-#include "session.pb.h"
+#include "session_appliance.pb.h"
 #include "session/session_app.h"
 #include "utils/ip.h"
 

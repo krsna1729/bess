@@ -327,6 +327,10 @@ pkg.generate(
   libraries: ['-L${libdir}/bess', '-lbess_route', '-lbess_dataplane_core', '-lbess_eal',
               '-lbess_rcu', '-lbess_utils'],
   requires: ['bess-dev', 'gflags'],
+  requires_private: ['libpcap'],
+  # A plugin must not link these: it would carry a second EAL and RCU state
+  # (framework/plugin.h refuses to compile with this define).
+  extra_cflags: ['-DBESS_STATIC_ARCHIVES=1'],
 )
 bess_dataplane_libs = [
   bess_dataplane_core,

@@ -7496,7 +7496,27 @@ whole module 19.2 ns; without the per-batch `Expire` call 23.1 vs 23.5 in anothe
 cost); module skeleton (no translation) 1.0; parse only 6.1 (so parsing about 5.0); everything but the per-packet emit
 loop 16.7 (lookup, rewrite and refresh about 10.6; the emit loop about 2.5); master 14.9. Change: when every packet of
 a batch translated, the batch leaves whole on its gate (`RunChooseModule`) instead of packet by packet: 19.07 -> 16.63
-ns (8 rounds, 5 of 8 pairs favourable; the change only removes work). Next: the 5 ns parse.
+ns (8 rounds, 5 of 8 pairs favourable; the change only removes work). The parse (about 3 ns in `conntrack_bench`, 5 live
+with the first touch of each packet's metadata) is the checked parse D-085 kept; not changed.
+
+**WildcardMatch and ExactMatch (addendum).** Each change and its parent, `M.*` above the front end, 3 rounds, isolated:
+
+| commit | M.exactmatch | M.wildcardmatch |
+|---|---|---|
+| b9a6f2f4 (before K3.3) | 10.79 | 17.95 |
+| 50e5455e ExactMatch on the runtime classifier (K3.3) | 24.15 | 17.74 |
+| 1c8a1ec6 (after "recover runtime exact fast path") | 14.41 | 18.05 |
+| 6116eedc WildcardMatch on the masked substrate | 14.52 | 20.92 |
+| c22ec838 / 8dfa97dd ExactMatch mode C (lock-free `rte_hash`) | 13.71 / 17.44 | 20.74 / 20.90 |
+| b0d0015e / fb2a42b6 WildcardMatch mode C (D-014) | 12.64 / 13.22 | 20.75 / **42.05** |
+
+WildcardMatch's cost is mode C (fb2a42b6, D-014): one concurrent table per mask for in-place rule updates, every
+tuple looked up per packet, rule records loaded when several masks match. D-014's microbenchmark measured +27% at 4
+masks and 1K rules (the trade-off the user accepted); live, with packets matching 3-4 of 4 masks, it is about 2x.
+ExactMatch's K3.3 cost was mostly recovered at the time; about +2-3 ns remains. **Needs review (user):** whether
+WildcardMatch's live cost is still acceptable, or worth optimising (priority packed into the table value's 16 free
+bits so overlapping matches compare without loading records; tuples ordered by their best priority with an early
+exit; or mode W replicas for lookup-heavy users).
 
 **Revisit when:** each cost above gets its own bisect and record; the F-class baseline becomes a report-only CI step.
 

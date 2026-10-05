@@ -137,7 +137,12 @@ def deb(args) -> list[Path]:
             build_deb(stage, 'bess', version, runtime_deps,
                       'BESS daemon (bessd), its Python client and schema, build metadata and SBOM',
                       out, [f'{prefix}/bin/bessd', f'{prefix}/share/bess', f'{prefix}/share/doc/bess']),
-            build_deb(stage, 'bess-dev', version, [f'bess (= {version})'],
+            # What bess-dev.pc and bess-dev-static.pc require (glog, gflags,
+            # protobuf, libpcap) as packages, so pkg-config resolves on a host
+            # that has only these packages.
+            build_deb(stage, 'bess-dev', version, [f'bess (= {version})', 'libgoogle-glog-dev',
+                                                   'libgflags-dev', 'libprotobuf-dev',
+                                                   'libpcap-dev'],
                       'BESS plugin and module development headers (bess-dev.pc)', out,
                       [f'{prefix}/include/bess', f'{prefix}/lib/pkgconfig/bess-dev.pc',
                        f'{prefix}/lib/pkgconfig/bess-dev-static.pc',

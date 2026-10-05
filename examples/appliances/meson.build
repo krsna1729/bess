@@ -33,8 +33,10 @@ protoc = find_program('protoc', required: true)
 protobuf_dep = dependency('protobuf', required: true)
 session_proto = custom_target(
   'session_proto',
-  input: 'session/session.proto',
-  output: ['session.pb.cc', 'session.pb.h', 'session_appliance.desc'],
+  # A file name no other plugin's .proto will have: generated code registers
+  # by file name in the process's one protobuf pool, and a duplicate aborts.
+  input: 'session/session_appliance.proto',
+  output: ['session_appliance.pb.cc', 'session_appliance.pb.h', 'session_appliance.desc'],
   command: [protoc, '--proto_path=@CURRENT_SOURCE_DIR@/session', '--cpp_out=@OUTDIR@',
             '--descriptor_set_out=@OUTPUT2@', '@INPUT@'],
   install: true,

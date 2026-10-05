@@ -20,6 +20,13 @@
 // plugin whose [api_min, api_max] contains N.
 #define BESS_PLUGIN_API_VERSION 1
 
+// bess-dev-static.pc (D-095) is for programs without bessd. A plugin runs in
+// bessd and uses its runtime: linking the archives would give it a second EAL
+// and RCU state.
+#ifdef BESS_STATIC_ARCHIVES
+#error "a plugin must not use bess-dev-static (D-095): build it against bess-dev"
+#endif
+
 // Optional daemon facilities a plugin can require. A daemon refuses to load a
 // plugin that requires a facility it was not built with.
 #define BESS_CAP_INIT_CONTEXT (UINT64_C(1) << 0)  // Module::init_context()
