@@ -367,26 +367,29 @@ def step_verify_install(s):
     env = s.env_with_dpdk()
     s.run(['meson', 'install', '-C', s.build_dir, '--destdir', s.stage], env=env)
     if s.dry_run:
-        print('+ check installed headers, build standalone plugins, check bessd')
+        print('+ check installed headers, build standalone plugins and the static router, check bessd')
         return
-    pc = next(s.stage.rglob('bess-dev.pc'), None)
-    if pc is None:
-        raise SystemExit('bess-dev.pc was not installed')
-    # The installed bess-dev.pc names the real prefix (/usr/local). Consumers
-    # here must see the stage and nothing else: a copy whose prefix is the
-    # stage's, first on the path, so a BESS install already on the machine
-    # cannot supply a header (its older Module layout once made every
-    # installed-tree plugin corrupt bessd's heap on a developer machine).
+    # The installed bess-dev.pc and bess-dev-static.pc name the real prefix
+    # (/usr/local). Consumers here must see the stage and nothing else: copies
+    # whose prefix is the stage's, first on the path, so a BESS install already
+    # on the machine cannot supply a header (its older Module layout once made
+    # every installed-tree plugin corrupt bessd's heap on a developer machine)
+    # or an archive.
     staged_pc = s.stage_pkgconfig
     staged_pc.mkdir(parents=True, exist_ok=True)
-    text = pc.read_text()
-    prefix = next((line.split('=', 1)[1] for line in text.splitlines()
-                   if line.startswith('prefix=')), None)
-    if prefix is None:
-        raise SystemExit(f'{pc} has no prefix= line')
-    stage_prefix = s.stage / prefix.lstrip('/')
-    (staged_pc / 'bess-dev.pc').write_text(
-        text.replace(f'prefix={prefix}', f'prefix={stage_prefix}', 1))
+    stage_prefix = None
+    for name in ('bess-dev.pc', 'bess-dev-static.pc'):
+        pc = next(s.stage.rglob(name), None)
+        if pc is None:
+            raise SystemExit(f'{name} was not installed')
+        text = pc.read_text()
+        prefix = next((line.split('=', 1)[1] for line in text.splitlines()
+                       if line.startswith('prefix=')), None)
+        if prefix is None:
+            raise SystemExit(f'{pc} has no prefix= line')
+        stage_prefix = s.stage / prefix.lstrip('/')
+        (staged_pc / name).write_text(
+            text.replace(f'prefix={prefix}', f'prefix={stage_prefix}', 1))
     env['PKG_CONFIG_PATH'] = os.pathsep.join([str(staged_pc), env['PKG_CONFIG_PATH']])
     env['CXX'] = s.env['CXX']
     include = stage_prefix / 'include/bess'
@@ -455,6 +458,14 @@ def step_verify_install(s):
     shutil.rmtree(battery, ignore_errors=True)
     s.run(['meson', 'setup', battery, 'examples/sdk_battery'], env=env)
     s.run(['meson', 'test', '-C', battery, '--print-errorlogs'], env=env)
+    # R1's application as a program without bessd, linked from the installed
+    # route, dataplane and RCU archives and DPDK (D-095); it forwards a frame.
+    static_router = ROOT / 'build' / f'static-router-{s.name}'
+    shutil.rmtree(static_router, ignore_errors=True)
+    s.run(['meson', 'setup', static_router, 'examples/static_router'], env=env)
+    s.run(['meson', 'test', '-C', static_router, '--print-errorlogs'],
+          env={**env, 'LD_LIBRARY_PATH': os.pathsep.join(
+              filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))})
     # API samples, one per public library, compiled from the install (M23).
     samples = ROOT / 'build' / f'samples-{s.name}'
     shutil.rmtree(samples, ignore_errors=True)

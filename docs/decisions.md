@@ -115,6 +115,7 @@ file is the reasoning.
 | D-092 | Classified live perf tests; master vs develop: framework cost predates the roadmap, module costs located | accepted |
 | D-093 | User decisions of 2026-10-05: public codecs, installed archives, TSan gates, keyless signing; MacTable fold deferred | accepted |
 | D-094 | Experimental public codec facade (`init_context().codecs()`); R4 an installed-tree plugin driven over the control API | accepted |
+| D-095 | Installed static archives of route, dataplane core and RCU (`bess-dev-static`); R1 linked without bessd | accepted |
 
 
 ---
@@ -7261,10 +7262,11 @@ the way: a NAT whose expiry wheel starts at clock 0 while packets carry the TSC 
 deadline is beyond the wheel's horizon): the module starts the wheels at the packet clock's now, as the in-tree NAT
 module does.
 
-**Change (D-094).** R4 is an installed-tree plugin (`examples/appliances/session/`): its resources and router
+**Change (D-094, D-095).** R4 is an installed-tree plugin (`examples/appliances/session/`): its resources and router
 are registered through `init_context().resources()`, reached over `ApplyTransaction` through codecs it binds with
 `init_context().codecs()`, and checked over the wire by `check_standalone_plugins.py --set appliances`;
-`core/dataplane/session_reference_test.cc` is gone.
+`core/dataplane/session_reference_test.cc` is gone. R1's application also links without bessd
+(`examples/static_router`).
 
 
 ## D-087 Release artifacts: a tarball, bess and bess-dev .deb packages with derived dependencies, and a runtime image (M26)
@@ -7509,7 +7511,7 @@ ns (8 rounds, 5 of 8 pairs favourable; the change only removes work). Next: the 
    over the control API (M27) and R4 can move to the installed tree. Protobuf stays at the framework boundary; the
    dataplane libraries stay protobuf-free. (Landed: D-094.)
 2. **Static archives of `route`, `rcu` and `dataplane` are installed, experimental**, with a CI test linking R1's
-   app without bessd (Appendix J "direct appliance build does not require framework"). No ABI promise.
+   app without bessd (Appendix J "direct appliance build does not require framework"). No ABI promise. (Landed: D-095.)
 3. **Folding multi-domain FDBs into one PackedMacTable per domain and deleting MacTable is deferred**: no consumer has
    more than one bridge domain, and it moves capacity from per FDB to per domain (D-073).
 4. **L2Forward's doubled slot memory (D-073) is accepted** if L2Forward is not slower for it; the live test shows +1.2
@@ -7594,3 +7596,47 @@ and then removed with the session. Mutant: the action codec decoding key `id + 1
 ("OUTCOME_REJECTED ... references missing session0/actions/01000000").
 
 **Revisit when:** a codec API that is not protobuf-bound is wanted, or the facade is promoted to public.
+
+
+## D-095 Installed static archives of route, dataplane core and RCU (`bess-dev-static`); R1 linked without bessd
+
+**Status:** accepted (2026-10-05; D-093 item 2).
+**Code:** `core/meson.build` (`bess_route`, `bess_dataplane_core`, `bess_rcu`, `bess_eal`, `bess_utils` installed in
+`${libdir}/bess`; `bess-dev-static.pc`), `examples/static_router/` (new), `tools/ci_profile.py` (`verify-install`
+stages both pc files and builds and runs the example), `tools/package_release.py` (the archives and the pc file in
+the `bess-dev` package), `docs/plugin-api.md` (section 6), `docs/architecture.md`, `examples/appliances/README.md`.
+
+**Context.** Installed BESS had no library a program could link: code using a non-header-only battery (the router's
+FIB) ran inside bessd, and the M23 API samples were compiled, not linked (D-086). Appendix J lists "direct appliance
+build does not require framework". The user agreed to installing the archives, experimental, no ABI promise (D-093
+item 2).
+
+**Decision.**
+- Installed, experimental: `libbess_route.a` (router, FIB), `libbess_dataplane_core.a` (resources, the transaction
+  engine, handoff), `libbess_rcu.a`, and the two the router's link closure needs below them, `libbess_eal.a` (lazy
+  EAL bring-up) and `libbess_utils.a`, in `${libdir}/bess`. Archive names and edges are the link graph's
+  (`tools/layer_dag.json`); nothing changes in how bessd links them.
+- `bess-dev-static.pc`: `Libs: -L${libdir}/bess -lbess_route -lbess_dataplane_core -lbess_eal -lbess_rcu -lbess_utils`,
+  `Requires: bess-dev, gflags` (bess-dev's flags, DPDK's shared libraries, glog, protobuf; gflags for the EAL's
+  process options). `bess-dev` is unchanged: plugins never link the archives (bessd provides the symbols, and a second
+  copy would carry its own EAL and RCU state).
+- No ABI promise: an archive is linked only by a program built against the same install (bessd's compiler, options,
+  ISA). The transaction engine's header stays internal (D-074: applying transactions is the control plane's), so the
+  dataplane archive serves the router's resources, not an engine a program drives. Classifier, flow, meter and stats
+  are not installed as archives.
+- `examples/static_router`: R1's `RouterApp` (`examples/appliances/router/router_app.h`) in a program with its own
+  `rcu::RcuDomain`, no bessd, no `Module`, no framework; linked from `bess-dev-static` and DPDK, it routes 172.16.1.1
+  from interface 1 and asserts the egress, the gateway's MAC, interface 1's source MAC and the TTL (64 to 63), VRF 2's
+  own route, and a miss and an expired TTL dropped with the frame unchanged. `verify-install` builds it from the stage
+  (warnings as errors) and runs it.
+
+**Evidence.** Fresh stage: the five archives in `lib/bess`; `pkg-config --libs bess-dev-static` against the stage's pc
+lists them, then DPDK, glog, protobuf and gflags. `meson setup examples/static_router` with `PKG_CONFIG_PATH` naming
+only the stage's pc files and DPDK's: `meson test` passes ("172.16.1.1 forwarded by interface 1 (TTL 64 -> 63,
+gateway A's MAC); VRF 2 routed apart; miss and TTL expiry dropped (3 routes, no bessd)"); the EAL comes up without
+hugepages and no daemon runs. Appendix J's "direct appliance build does not require framework" is addressed by this
+program. `tools/ci_profile.py verify-install --name fast --cc gcc --cxx g++` (the CI step, on the fast build, with
+DPDK's pkg-config directory exported) passes end to end: headers, standalone plugins, appliances with R4's wire
+check, the battery, `static_router`, the samples.
+
+**Revisit when:** another library's archive is wanted by a program, or an ABI promise for the archives is.

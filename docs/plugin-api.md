@@ -12,9 +12,9 @@ This document formalizes the supported C++ and build contract for out-of-tree BE
   the supported source API. External plugins must be rebuilt against their
   target BESS release; BESS does not promise a stable C++ ABI.
 - **Experimental**: the selected headers under
-  `bess/core/{classifier,dataplane,flow,meter,rcu,route,stats}` and the wire
+  `bess/core/{classifier,dataplane,flow,meter,rcu,route,stats}`, the wire
   codec facade (`framework/resource_codec.h`, `framework/resource_bindings.h`,
-  D-094). Their interfaces may
+  D-094), and the static archives of section 6 (D-095). Their interfaces may
   change without preserving source compatibility. (`flow/` is
   the flow-state library, see `docs/flow-state.md`; a plugin that uses it
   links the `bess_flow` symbols `bessd` already exports.) A public header
@@ -65,6 +65,8 @@ builds it from the staged install and runs its test without `bessd`.
 `examples/appliances` holds the reference appliances (R1-R5, M24) as plugins;
 CI loads them into the staged `bessd`, and drives R4's resources over the
 control API with its own wire types (below, "Wire codecs").
+`examples/static_router` is R1's application linked from the installed
+archives with DPDK and no `bessd` (section 6); CI builds and runs it.
 `examples/sdk_samples` holds the smallest meaningful program per library --
 router, meters, conntrack and NAT, the FDB, handoff and tunnel decapsulation --
 each with typed use, an update, error handling as values, and the ownership
@@ -391,3 +393,36 @@ Cross-module state in a pipeline (e.g. classification result $\to$ meter $\to$ r
 2. **Runtime CLI command**:
    `bessctl module load /path/to/my_module.so`
 3. **Symbol resolution**: `bessd` is linked with `-rdynamic` (`export_dynamic: true` in Meson). Symbols defined in `libbess_framework`, `libbess_execution`, `libbess_eal`, and `libdpdk` are exported, allowing loaded modules to resolve runtime methods without duplicating engine code.
+   A plugin never links the static archives of section 6: `bessd` already
+   provides those symbols, and a second copy in the plugin would have state of
+   its own (the EAL's, the RCU domain's).
+
+---
+
+## 6. Static archives for programs without `bessd` (experimental, D-095)
+
+The libraries that implement the router and its FIB (`bess_route`), the
+resource and transaction core (`bess_dataplane_core`), the RCU domain
+(`bess_rcu`), and the EAL bring-up and utilities they link against
+(`bess_eal`, `bess_utils`) are installed as static archives in
+`${libdir}/bess`, with `bess-dev-static.pc`:
+
+```sh
+pkg-config --libs bess-dev-static
+# -L${libdir}/bess -lbess_route -lbess_dataplane_core -lbess_eal -lbess_rcu -lbess_utils
+# then bess-dev's flags (DPDK's shared libraries, glog, protobuf) and gflags
+```
+
+A program (no `bessd`, no `Module`, no framework) owns an
+`rcu::RcuDomain` and creates a `route::Router` on it; the first table brings
+the EAL up without hugepages (512 MB of normal pages; `BESS_DPDK_NOHUGE_MB`
+sizes it). `examples/static_router` runs R1's `RouterApp`
+(`examples/appliances/router/router_app.h`) this way and checks a forwarded
+frame; CI's install check builds it from the stage and runs it.
+
+No ABI promise: the archives are built with bessd's compiler, options and ISA
+and are linked only by a program built against the same install. The
+transaction engine's header stays internal (applying transactions is the
+control plane's, D-074): `bess_dataplane_core` is installed because the router
+needs it (its resources), not as an engine a program can drive. Other
+libraries (classifier, flow, meter, stats) are not installed as archives yet.

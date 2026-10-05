@@ -11,7 +11,8 @@ the release job always shipped them.
 `deb` (on Debian or Ubuntu): two packages from `meson install` of BUILD --
 `bess` (bessd, the Python client and protobuf schema, the build metadata and
 the SPDX SBOM) and `bess-dev` (the headers and bess-dev.pc plugins build
-against). `bess` depends on the packages that own every shared library bessd
+against, and the experimental route, dataplane and RCU archives with
+bess-dev-static.pc, D-095). `bess` depends on the packages that own every shared library bessd
 loads (`ldd`, then `dpkg -S`): a library no package owns stops the build, so
 the package never claims less than bessd needs.
 """
@@ -138,7 +139,10 @@ def deb(args) -> list[Path]:
                       out, [f'{prefix}/bin/bessd', f'{prefix}/share/bess', f'{prefix}/share/doc/bess']),
             build_deb(stage, 'bess-dev', version, [f'bess (= {version})'],
                       'BESS plugin and module development headers (bess-dev.pc)', out,
-                      [f'{prefix}/include/bess', f'{prefix}/lib/pkgconfig/bess-dev.pc']),
+                      [f'{prefix}/include/bess', f'{prefix}/lib/pkgconfig/bess-dev.pc',
+                       f'{prefix}/lib/pkgconfig/bess-dev-static.pc',
+                       *(f'{prefix}/lib/bess/libbess_{name}.a'
+                         for name in ('route', 'dataplane_core', 'eal', 'rcu', 'utils'))]),
         ]
     return made
 

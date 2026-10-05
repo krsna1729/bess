@@ -31,3 +31,11 @@ meson setup build examples/appliances    # PKG_CONFIG_PATH names bess-dev.pc
 meson compile -C build
 python3 tools/check_standalone_plugins.py --bessd <bessd> --plugin-dir build --set appliances
 ```
+
+R1's application also runs as a program without bessd, linked from the
+installed archives (`examples/static_router`, D-095):
+
+```
+meson setup build-static examples/static_router   # PKG_CONFIG_PATH names bess-dev-static.pc
+meson test -C build-static
+```

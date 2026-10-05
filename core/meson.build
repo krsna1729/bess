@@ -241,11 +241,18 @@ resume_hook_compile_deps = low_level_compile_deps + [
 ]
 utility_compile_deps = low_level_compile_deps + [pcap_dep]
 
+# Decision D-095: route, its dataplane core and RCU domain, and the EAL and
+# utility archives they link against are installed (experimental, no ABI
+# promise) with bess-dev-static.pc, so a program can use the router without
+# bessd. Plugins never link them: bessd provides those symbols.
+bess_archive_dir = get_option('libdir') / 'bess'
 bess_utils = static_library(
   'bess_utils',
   utility_sources,
   include_directories: core_include,
   dependencies: utility_compile_deps,
+  install: true,
+  install_dir: bess_archive_dir,
 )
 bess_eal = static_library(
   'bess_eal',
@@ -253,12 +260,16 @@ bess_eal = static_library(
   include_directories: core_include,
   dependencies: runtime_compile_deps + [pcap_dep],
   link_with: [bess_utils],
+  install: true,
+  install_dir: bess_archive_dir,
 )
 bess_rcu = static_library(
   'bess_rcu',
   rcu_sources,
   include_directories: core_include,
   dependencies: low_level_compile_deps,
+  install: true,
+  install_dir: bess_archive_dir,
 )
 bess_dataplane_core = static_library(
   'bess_dataplane_core',
@@ -266,6 +277,8 @@ bess_dataplane_core = static_library(
   include_directories: core_include,
   dependencies: low_level_compile_deps,
   link_with: [bess_eal, bess_rcu],
+  install: true,
+  install_dir: bess_archive_dir,
 )
 bess_classifier = static_library(
   'bess_classifier',
@@ -301,6 +314,19 @@ bess_route = static_library(
   include_directories: core_include,
   dependencies: low_level_compile_deps,
   link_with: [bess_dataplane_core, bess_eal, bess_rcu],
+  install: true,
+  install_dir: bess_archive_dir,
+)
+# Archives first, most dependent first; then bess-dev's flags and DPDK's
+# shared libraries, and what the EAL archive needs (process options).
+pkg.generate(
+  name: 'bess-dev-static',
+  filebase: 'bess-dev-static',
+  description: 'BESS route, dataplane and RCU archives for programs without bessd (experimental)',
+  version: meson.project_version(),
+  libraries: ['-L${libdir}/bess', '-lbess_route', '-lbess_dataplane_core', '-lbess_eal',
+              '-lbess_rcu', '-lbess_utils'],
+  requires: ['bess-dev', 'gflags'],
 )
 bess_dataplane_libs = [
   bess_dataplane_core,
