@@ -175,6 +175,39 @@ separately.
 
 ## Status snapshot
 
+### Roadmap end-state status (2026-10-05)
+
+Against `BESS_Modernization_End_State_Roadmap.md` (milestones M0-M27, Appendix J). Each milestone's record is its
+decision (docs/decisions.md) and log entry; the performance matrices are in `docs/performance-contract.md` sections 4
+and 5; hardware status in `docs/compatibility.md`.
+
+| Milestone | Status | Record |
+|---|---|---|
+| M0 baseline | done; one row accepted unexplained | entries 143, 147; D-091 |
+| M1 layering, M2 public API | done (DAG and include checks, classified installs) | D-047, D-057, D-058, D-041 |
+| M3 init capabilities, M4 resource/schema, M5 instances | done | D-042, D-044, D-074, D-045 |
+| M6 routing, M7 ids, M8 consistency | done | D-046, D-049, D-060, D-050 |
+| M9 flow, M10 expiry, M11 handoff, M12 decision cache, M13 edit plan | done (M13 experimental, not adopted) | D-052, D-056, D-053, D-054, D-062, D-063 |
+| M14 L2, M15 L3, M16 selection, M17 conntrack, M18 NAT, M19 tunnel | done | D-064, D-073, D-065, D-066, D-067, D-080, D-081, D-068, D-078, D-079, D-083, D-069, D-085 |
+| M20 offload | software done; hardware lab not run | D-070 |
+| M21 portability | done; arm64 lanes experimental | D-071 |
+| M22 hardening | done; sanitizer lanes experimental; fuzz corpora replayed in CI | D-072, entry 160 |
+| M23 ergonomics | done (persona samples, installed `examples/sdk_samples`, compile-time negative tests) | entry 162; docs/plugin-api.md |
+| M24 reference appliances | done: R1-R3, R5 installed-tree; R4 in-tree | D-086 |
+| M25 observability | done: metrics, events, pressure, DPDK tracing; histograms wait for a consumer | D-076, D-084, D-089 |
+| M26 release | done: metadata, SBOM, tarball, .deb, image; signing blocked on keys | D-075, D-087 |
+| M27 control SDK | done: Python and Go, desired state, black-box recovery tests, a controller migrated | D-082, D-088 |
+| Plugin unload (roadmap 28.4) | done | D-090 |
+
+Appendix J, audited item by item (2026-10-05): the one gap (plugin unload lifetime) is closed by D-090; the
+meter/stats row by D-091; the fuzz row by CI replaying the corpora; the hardware row by `docs/compatibility.md`.
+Still partial, each with its record: the update-under-load and memory-at-scale matrices have named gaps
+(performance-contract.md); no checked-in assembly-shape artifact (binary inspection is outside this program's
+tooling); arm64 and sanitizer lanes are not yet gating; R4 and direct appliance builds wait on two user decisions
+(public resource codecs, D-086; installed static archives of the generic libraries); `framework/exact_match_table.h`
+remains as HashLB's field extractor; "no network-policy semantics in runtime" and "no BESS action language" are review
+rules without a mechanical check. Hardware certification (C-HW) is tracked separately and not run.
+
 ### Roadmap phase audit (2026-09-24)
 
 This dated table is a snapshot, not the current handoff; see §14 and §31.3
