@@ -205,8 +205,8 @@ Still partial, each with its record: the update-under-load and memory-at-scale m
 (performance-contract.md); no checked-in assembly-shape artifact (binary inspection is outside this program's
 tooling); arm64 and sanitizer lanes are not yet gating; R4 and direct appliance builds wait on two user decisions
 (public resource codecs, D-086; installed static archives of the generic libraries); `framework/exact_match_table.h`
-remains as HashLB's field extractor; "no network-policy semantics in runtime" and "no BESS action language" are review
-rules without a mechanical check. Hardware certification (C-HW) is tracked separately and not run.
+remains as HashLB's field extractor; "no BESS action language" is a review rule without a mechanical check (the
+runtime's side has one: `check_includes.py` forbids `core/runtime/` every networking battery). Hardware certification (C-HW) is tracked separately and not run.
 
 ### Roadmap phase audit (2026-09-24)
 

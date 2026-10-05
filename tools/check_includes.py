@@ -234,6 +234,18 @@ FORBIDDEN_RULES = [
             ("runtime_state.h", "the EAL layer must not depend on the runtime registries"),
         ],
     ),
+    # The runtime holds no network-policy semantics (roadmap section 33,
+    # Appendix J): it owns workers, the RCU domain, the transaction engine and
+    # the registries, never a networking battery. Tests and benchmarks are exempt.
+    (
+        re.compile(r"^core/runtime/"),
+        [
+            (battery, "the runtime must not depend on networking batteries ("
+             + battery.rstrip('/') + ")")
+            for battery in ("route/", "nat/", "conntrack/", "l2/", "tunnel/", "offload/",
+                            "classifier/", "meter/", "flow/", "modules/")
+        ],
+    ),
 ]
 
 
@@ -384,6 +396,10 @@ SELF_TEST_CASES = [
     ("core/runtime/dpdk.cc", '#include "packet_pool.h"', 1),
     ("core/utils/dpdk_memory.cc", '#include "runtime/runtime_state.h"', 1),
     ("core/runtime/thread_placement.cc", '#include "scheduler.h"', 1),
+    # The runtime holds no networking battery.
+    ("core/runtime/runtime_state.cc", '#include "route/router.h"', 1),
+    ("core/runtime/worker_manager.h", '#include "nat/nat.h"', 1),
+    ("core/runtime/runtime_state.h", '#include "flow/decision_cache.h"', 1),
     # glog only through utils/logging.h, which orders it after absl logging;
     # tests included (they log too).
     ("core/modules/a.cc", '#include <glog/logging.h>', 1),
@@ -393,6 +409,8 @@ SELF_TEST_CASES = [
 
 # Includes that must pass: controls proving the rules are not over-broad.
 SELF_TEST_CLEAN = [
+    ("core/runtime/runtime_state.cc", '#include "dataplane/transaction_engine.h"'),
+    ("core/runtime/runtime_state.cc", '#include "rcu/rcu_domain.h"'),
     ("core/dataplane/a.h", '#include "utils/common.h"'),
     ("core/dataplane/a.h", '#include "strong_id.h"'),
     ("core/modules/a.cc", '#include "utils/ip.h"'),
