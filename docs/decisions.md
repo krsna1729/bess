@@ -116,6 +116,7 @@ file is the reasoning.
 | D-093 | User decisions of 2026-10-05: public codecs, installed archives, TSan gates, keyless signing; MacTable fold deferred | accepted |
 | D-094 | Experimental public codec facade (`init_context().codecs()`); R4 an installed-tree plugin driven over the control API | accepted |
 | D-095 | Installed static archives of route, dataplane core and RCU (`bess-dev-static`); R1 linked without bessd | accepted |
+| D-096 | Static DPDK links its constructor-registered drivers (whole-archive kept); release smoke starts bessd | accepted |
 
 
 ---
@@ -7663,3 +7664,29 @@ DPDK's pkg-config directory exported) passes end to end: headers, standalone plu
 check, the battery, `static_router`, the samples.
 
 **Revisit when:** another library's archive is wanted by a program, or an ABI promise for the archives is.
+
+## D-096 Static DPDK links its constructor-registered drivers (whole-archive kept); release smoke starts bessd
+
+**Status:** accepted (2026-10-05).
+**Code:** `meson.build` (DPDK link arguments), `.github/workflows/ci.yml` (release image smoke).
+
+**Context.** Testing whether static DPDK linkage explains the framework cost of D-092, a `-Ddpdk_link=static` bessd
+aborted at its first packet pool: `rte_mempool_create() failed: Invalid argument`. pkg-config's static libdpdk
+wraps the driver archives (buses, mempool ring, net PMDs: they register in constructors) in `-Wl,--whole-archive
+... --no-whole-archive`; Meson reorders and de-duplicates `-l` arguments, which left that wrapper empty and the
+archives outside it, so the linker dropped the unreferenced driver objects. The release job links DPDK statically
+the same way, and its smoke test (`bessd --version`) never creates a pool, so it could not catch this.
+
+**Decision.**
+- The whole-archive group is passed as one argument, `-Wl,--whole-archive,-l:librte_...a,...,--no-whole-archive`,
+  which Meson keeps intact; `-L` paths stay separate.
+- The release image smoke test also starts bessd (`-f -m 0`) and requires it still running after 5 s: DPDK up,
+  pools created, the control server listening.
+- D-092's linkage hypothesis is refuted: develop with static DPDK measured as shared (F.floor 2.31 vs 2.34 ns, F.hop/1
+  3.03 vs 3.09; master 1.83 and 2.30; isolated, 4 rounds). The framework cost's remaining suspects predate the Meson
+  cutover: the DPDK upgrade (mempool and mbuf) and the packet-lifecycle work (Stage 2C's free path for clones, chains
+  and refcounts).
+
+**Evidence.** Before: a release `-Ddpdk_link=static` build aborts at startup as above. After: the same build starts
+and listens (`Server listening on 127.0.0.1:34999`) and runs every F test.
+

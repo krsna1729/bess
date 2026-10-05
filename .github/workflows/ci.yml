@@ -289,8 +289,17 @@ jobs:
           python3 tools/package_release.py deb --build build/standalone --version "$VERSION" --out dist
           DEB=$(cd dist && ls bess_*.deb)
           docker build -f env/runtime.Dockerfile --build-arg DEB="$DEB" -t bess:"$VERSION" dist
-          # The image's bessd starts and reports its version.
+          # The image's bessd reports its version, then starts for real: DPDK
+          # up, packet pools created, the control server listening. Still
+          # running after 5 s (timeout's 124) is a pass; a startup failure
+          # exits earlier (D-096: a static DPDK without its mempool handlers
+          # passed --version and aborted at the first pool).
           docker run --rm --entrypoint /usr/local/bin/bessd bess:"$VERSION" --version
+          set +e
+          docker run --rm --entrypoint timeout bess:"$VERSION" 5 /usr/local/bin/bessd -f -m 0 --skip_root_check
+          rc=$?
+          set -e
+          [ "$rc" = 124 ] || { echo "bessd exited with $rc before the 5 s smoke window"; exit 1; }
           docker save bess:"$VERSION" | gzip > dist/bess-image-"$VERSION"-$(uname -m).tar.gz
           (cd dist && sha256sum *.deb bess-image-*.tar.gz >> SHA256SUMS)
           echo "RELEASE_VERSION=${VERSION}" >> "$GITHUB_ENV"

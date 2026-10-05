@@ -158,13 +158,36 @@ dpdk_pkg_link_args = ['--libs', 'libdpdk']
 if dpdk_is_static
   dpdk_pkg_link_args = ['--libs', '--static', 'libdpdk']
 endif
+# Static DPDK: its drivers and mempool handlers register in constructors, so
+# pkg-config wraps their archives in --whole-archive. Meson reorders and
+# de-duplicates `-l` arguments, which moved them out of that wrapper (a static
+# bessd then had no mempool ops: rte_mempool_create failed with EINVAL). The
+# wrapped group is passed as one `-Wl,` argument, which Meson keeps as is.
 dpdk_link_args = []
+dpdk_whole = []
+dpdk_in_whole = false
 foreach arg : run_command(
   pkg_config, dpdk_pkg_link_args,
   env: pkg_config_env,
   check: true,
 ).stdout().strip().split(' ')
-  if arg != ''
+  if arg == ''
+    continue
+  elif arg == '-Wl,--whole-archive'
+    dpdk_in_whole = true
+  elif arg == '-Wl,--no-whole-archive'
+    if dpdk_whole.length() > 0
+      dpdk_link_args += '-Wl,--whole-archive,' + ','.join(dpdk_whole) + ',--no-whole-archive'
+    endif
+    dpdk_whole = []
+    dpdk_in_whole = false
+  elif dpdk_in_whole and arg.startswith('-l')
+    dpdk_whole += arg
+  elif dpdk_in_whole and arg.startswith('-L')
+    dpdk_link_args += arg
+  elif dpdk_in_whole
+    dpdk_whole += arg
+  else
     dpdk_link_args += arg
   endif
 endforeach
