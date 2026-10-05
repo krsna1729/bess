@@ -76,6 +76,7 @@ def ipv4_udp(src=0x0a000001, dst=0x0b000001, sport=40000, dport=2000, size=60, v
 # names whose leaf traffic classes count the measured packets.
 
 FLOWS = 1024  # source addresses the M tests cycle through (RandomUpdate)
+COUNTERS = 'instructions,cycles,L1-dcache-load-misses,branch-misses'
 
 
 def _source(b, name='src', size=60, template=None):
@@ -326,10 +327,32 @@ def client(args):
             modules = TESTS[name][1](Builder(bess))
             bess.resume_all()
             time.sleep(args.warmup)
+            perf = None
+            if args.counters:
+                # Hardware counters on worker 0's CPU over the window: per packet,
+                # more instructions is more code; more cycles at equal
+                # instructions is stalls (memory, branches).
+                perf = subprocess.Popen(
+                    ['perf', 'stat', '-x', ',', '-C', str(cpus[0]), '-e', COUNTERS,
+                     'sleep', str(args.duration)], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, text=True)
             p0, t0 = leaf_packets(bess, modules)
             time.sleep(args.duration)
             p1, t1 = leaf_packets(bess, modules)
-            out[name] = (t1 - t0) * 1e9 / (p1 - p0) if p1 > p0 and t1 > t0 else None
+            ns = (t1 - t0) * 1e9 / (p1 - p0) if p1 > p0 and t1 > t0 else None
+            if perf is not None:
+                _, err = perf.communicate(timeout=args.duration + 10)
+                counts = {}
+                for line in err.splitlines():
+                    f = line.split(',')
+                    if len(f) > 2 and f[0].replace('.', '').isdigit():
+                        # 'instructions', or 'cpu_core/instructions/' on hybrid CPUs.
+                        event = f[2].split('/')[1] if '/' in f[2] else f[2].split(':')[0]
+                        counts[event] = counts.get(event, 0.0) + float(f[0])
+                packets = max(1, p1 - p0)
+                out[name] = {'ns': ns, **{k + '_per_pkt': v / packets for k, v in counts.items()}}
+            else:
+                out[name] = ns
         except Exception as e:  # recorded, not fatal: a test the build cannot run
             out[name] = 'error: %s' % str(e).splitlines()[0][:160]
     bess.pause_all()
@@ -388,7 +411,8 @@ def run_round(spec, tests, args):
             time.sleep(0.25)
         r = subprocess.run([sys.executable, __file__, '--client', '--port', str(port),
                             '--tests', ','.join(tests), '--cpu', args.cpu,
-                            '--duration', str(args.duration), '--warmup', str(args.warmup)],
+                            '--duration', str(args.duration), '--warmup', str(args.warmup)]
+                           + (['--counters'] if args.counters else []),
                            capture_output=True, text=True, env=env, timeout=1800)
         lines = [l for l in r.stdout.splitlines() if l.startswith('{')]
         if not lines:
@@ -445,6 +469,9 @@ def main():
     p.add_argument('--cpu', default='2,4', help='worker 0 (and worker 1 for F.queue); the last also runs bessd\'s main thread')
     p.add_argument('--duration', type=float, default=1.0)
     p.add_argument('--warmup', type=float, default=0.3)
+    p.add_argument('--counters', action='store_true',
+                   help='also perf-stat worker 0\'s CPU: instructions, cycles, L1D misses and branch '
+                        'misses per packet (needs perf; kernel.perf_event_paranoid <= 0)')
     p.add_argument('--save', help='write medians and raw values here')
     p.add_argument('--baseline', help='a saved run: compare the last build against it')
     p.add_argument('--threshold', type=float, default=5.0, help='percent slower that fails --baseline')
@@ -458,17 +485,36 @@ def main():
     specs = [build_spec(b) for b in (args.build or ['current'])]
     names = [s['name'] for s in specs]
     data = {n: {t: [] for t in tests} for n in names}
+    counters = {n: {} for n in names}
     for r in range(args.rounds):
         for s in (specs if r % 2 == 0 else specs[::-1]):
             t0 = time.time()
             got = run_round(s, tests, args)
             for t in tests:
-                data[s['name']][t].append(got.get(t))
+                v = got.get(t)
+                if isinstance(v, dict):
+                    for k, c in v.items():
+                        if k != 'ns':
+                            counters[s['name']].setdefault(t, {}).setdefault(k, []).append(c)
+                    v = v['ns']
+                data[s['name']][t].append(v)
             print('round %d %-10s %.0fs' % (r + 1, s['name'], time.time() - t0), file=sys.stderr)
     med = report(tests, names, data)
+    if args.counters:
+        keys = ['instructions_per_pkt', 'cycles_per_pkt', 'L1-dcache-load-misses_per_pkt',
+                'branch-misses_per_pkt']
+        print('\n-- counters per packet on worker 0 (median): instructions / cycles / L1D misses / branch misses')
+        for t in tests:
+            row = []
+            for b in names:
+                c = counters[b].get(t, {})
+                row.append(' / '.join('%.1f' % statistics.median(c[k]) if c.get(k) else 'n/a'
+                                      for k in keys))
+            print('%-18s %s' % (t, '   '.join('%s: %s' % (b, r) for b, r in zip(names, row))))
     if args.save:
         Path(args.save).write_text(json.dumps({
-            'tests': tests, 'builds': names, 'raw': data, 'cpu': args.cpu, 'rounds': args.rounds,
+            'tests': tests, 'builds': names, 'raw': data, 'counters': counters, 'cpu': args.cpu,
+            'rounds': args.rounds,
             'duration': args.duration,
             'median': {b: {t: med[(b, t)] for t in tests} for b in names}}, indent=2))
     if args.baseline:
