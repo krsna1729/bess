@@ -1146,7 +1146,7 @@ ControlResult<void> ControlPlane::AttachExistingTcLocked(
     if ((wid != Worker::kAnyWorker && !is_worker_active(wid)) ||
         (wid == Worker::kAnyWorker && active_workers == 0)) {
       if (active_workers == 0 && (wid == 0 || wid == Worker::kAnyWorker)) {
-        launch_worker(0, runtime::DefaultWorkerCore());
+        runtime::runtime().workers().Launch(0, runtime::DefaultWorkerCore(), "");
       } else {
         return std::unexpected(
             Err(EINVAL, "worker:%d does not exist", static_cast<int>(wid)));
