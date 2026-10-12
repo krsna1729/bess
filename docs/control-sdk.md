@@ -115,8 +115,11 @@ unit test holds every built-in command to a real type).
 
 ## bessctl (C++, G1.7)
 
-`build/bessctl/bessctl` (installed as `bin/bessctl`, in the `bess` .deb) is
-built on the C++ SDK alone. Pipelines are manifests: a control_v2 `Pipeline` in
+bessctl's code is built on the C++ SDK alone and ships inside bessd (D-120):
+`bin/bessctl` (in the `bess` .deb; `build/bessctl/bessctl` in a build
+directory) is a symlink to `bessd`, and `bessd ctl ARGS` is the same command.
+`build/bessctl/bessctl-standalone` is the client alone, on `libbess-sdk`, for
+a host without bessd; it is not installed. Pipelines are manifests: a control_v2 `Pipeline` in
 protobuf's JSON mapping, written as JSON or YAML, field names as in
 `control_v2.proto`. A module's or port's `arg`
 may leave out `"@type"`; bessctl takes it from `GetSchema` (the class's or

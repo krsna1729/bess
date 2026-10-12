@@ -343,6 +343,8 @@ subdir('sdk/cpp')
 subdir('bessctl')
 subdir('pybess')
 subdir('core')
+# bessctl is bessd (D-120): the binary runs the client under this name.
+install_symlink('bessctl', pointing_to: 'bessd', install_dir: get_option('bindir'))
 if get_option('build_tests')
   subdir('tests/live')
 endif
@@ -370,8 +372,9 @@ install_subdir(
   'bessctl',
   install_dir: bess_data_dir,
   exclude_directories: ['__pycache__'],
-  # The C++ bessctl's sources: its binary installs to bindir.
-  exclude_files: ['meson.build', 'json.h', 'json.cc', 'manifest.h', 'manifest.cc', 'main.cc',
-                  'manifest_test.cc', 'yaml_io.h', 'yaml_io.cc'],
+  # The C++ bessctl's sources: it installs as bindir/bessctl, a link to bessd.
+  exclude_files: ['meson.build', 'cli.h', 'json.h', 'json.cc', 'manifest.h', 'manifest.cc',
+                  'main.cc', 'standalone_main.cc', 'manifest_test.cc', 'yaml_io.h',
+                  'yaml_io.cc'],
 )
 install_subdir('protobuf', install_dir: bess_data_dir)

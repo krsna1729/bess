@@ -140,6 +140,7 @@ file is the reasoning.
 | D-117 | SetMetadata runs an op list compiled at PreResume (M.metadata -8 instructions, -4.7 cycles per packet); Update's loop inversion rejected (slower) | accepted |
 | D-118 | live_perf keeps control threads off worker CPUs and counts the worker that runs the test; the floor is at parity with master, the per-hop cost is not | accepted |
 | D-119 | Track's per-call overhead cut (cold CurrentWorkerId failure, initial-exec current_worker, static libraries as PIE); the hop without hooks is at master's cost, the gap left is Track's | accepted |
+| D-120 | bessctl is a mode of bessd (multi-call binary): `bin/bessctl` is a symlink to bessd, `bessd ctl` the same; the client runs first, unprivileged, on the SDK alone, with control_v2 registered once | accepted |
 
 
 ---
@@ -8574,3 +8575,64 @@ M baseline, not module deltas.
 
 **Code.** `core/stats/current_worker.h`, `core/worker.{h,cc}`, `meson.build`, `core/meson.build`,
 `tools/live_perf.py`, `docs/benchmarking.md`.
+
+## D-120 bessctl is a mode of bessd: one multi-call binary
+
+**Status:** accepted.
+
+**Problem.** The C++ bessctl (G1.7) was a second executable on libbess-sdk. It shipped beside bessd in the `bess`
+package with its own copy of gRPC, protobuf and the control_v2 code, and nothing kept the two at one version: a
+bessctl from one build could drive a bessd from another.
+
+**Decision.** bessd is also bessctl, busybox style.
+
+- `main()` dispatches first, before signals, glog, gflags, the EAL or plugins: the client runs when argv[0]'s
+  basename is `bessctl` or argv[1] is `ctl` (`bessd ctl ARGS`). It parses its own arguments; no gflags flag
+  applies to it, and nothing of the daemon is initialised, so it needs no hugepages, no root and prints nothing of
+  DPDK's.
+- Before any client code runs, the process gives up every privilege (`core/cli_mode.cc`): `PR_SET_NO_NEW_PRIVS`;
+  the real group and user ids when they differ from the effective ones (`setresgid`, then `setresuid`); empty
+  effective, permitted and inheritable capability sets (raw `capset`, no libcap); no ambient capabilities. A failure
+  stops it with a message; the client never runs privileged.
+- The client's code (`bessctl/`, library `bess_ctl`) still sees only the public C++ SDK: it compiles against the
+  SDK's headers alone, with no include path into core/, and each executable chooses the SDK library it links.
+- control_v2 is registered once. libbess-sdk carries its own control_v2 generated code; bessd links the same
+  messages in `bess_proto`, and protobuf aborts on a second registration of a descriptor in one process. bessd
+  therefore links `bess_sdk_embedded`, the SDK's sources without the generated code, against `bess_proto`.
+  tools/layer_dag.json allows `bess_ctl -> bess_sdk_embedded, bess_proto` and `bess_sdk_embedded -> bess_proto`
+  only; check_link_graph.py now reads both archives.
+- Installed, `bin/bessctl` is a symlink to `bessd` (`install_symlink`); the .deb and the release tarball ship the
+  link, and the `bess` package's dependencies come from bessd alone. In a build directory `bessctl/bessctl` is the
+  same link, and the live tests drive it.
+- `bessctl/bessctl-standalone` is the client alone on libbess-sdk, built and not installed: for a host that only
+  needs the client, e.g. a remote one or one whose CPU cannot run a bessd built for a newer `-march`.
+
+Why: one artifact, so client and daemon are always the same version; gRPC, protobuf and the control_v2 code are
+linked once; the install is smaller.
+
+**Evidence.** Release configuration as in tools/ci_profile.py's release lane (`-Dbuildtype=release
+-Dstatic_binary=standalone -Daf_xdp=required -Dcpu=x86-64-v3`, no tests), GCC 16, linked with mold, sizes in
+bytes:
+
+| binary | before | after |
+|---|---|---|
+| bessd | 16,584,480 | 17,286,480 (+702,000) |
+| bessctl | 3,856,656 | symlink |
+| bessctl-standalone | - | 3,867,032 (not installed) |
+
+On the Arch development host the static release bessd, before this change as after, stops at load:
+Arch ships no libglog.a, so the static lookup of libglog links libglog.so but resolves its `-lgflags` to
+libgflags.a, beside the libgflags.so the gflags dependency links, and gflags refuses the second registration of
+its flags. Running the release link's `bessctl --help` is therefore left to the release lane's verify
+step (tools/ci_profile.py); the standalone client of the same build runs.
+
+The shipped pair shrinks from 20,441,136 to 17,286,480 bytes (-15%). The dev build's bessd in client mode and in
+daemon mode (the live suite, through the symlink) aborts on no duplicate descriptor; the static release link has no
+duplicate symbols. `bessctl_multicall` runs `bessctl --help` and `bessd ctl --help` (exit 0, usage, nothing on
+stderr); `cli_mode_test` checks the dispatch and, in a child, NoNewPrivs 1 and empty CapEff, CapPrm, CapInh and
+CapAmb after the drop.
+
+**Code.** `core/main.cc`, `core/cli_mode.{h,cc}`, `core/cli_mode_test.cc`, `bessctl/cli.h`, `bessctl/main.cc`,
+`bessctl/standalone_main.cc`, `bessctl/meson.build`, `sdk/cpp/meson.build`, `core/meson.build`, `meson.build`,
+`tests/live/meson.build`, `tools/layer_dag.json`, `tools/check_link_graph.py`, `tools/package_release.py`,
+`tools/ci_profile.py`, `docs/control-sdk.md`, `MODERNIZATION.md`.

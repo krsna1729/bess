@@ -12,7 +12,9 @@
 
 #include "dataplane/batch_tuning.h"
 #include "bessctl.h"
+#include "bessctl/cli.h"
 #include "bessd.h"
+#include "cli_mode.h"
 #include "framework/plugin_loader.h"
 #include "debug.h"
 #include "runtime/opts.h"
@@ -24,6 +26,16 @@
 #include "worker.h"
 
 int main(int argc, char *argv[]) {
+  // bessctl is this binary (D-120): the client runs before any daemon setup,
+  // without privileges, on its own argument parser.
+  if (const auto offset = bess::cli_mode::CliArgvOffset(argc, argv)) {
+    if (!bess::cli_mode::DropPrivileges()) {
+      return 1;
+    }
+    argv[*offset] = argv[0];
+    return bess::ctl::Main(argc - *offset, argv + *offset);
+  }
+
   bess::startup::BlockTerminationSignals();  // before any thread exists
   FLAGS_logbuflevel = -1;
   FLAGS_colorlogtostderr = true;

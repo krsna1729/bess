@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "bess/sdk/client.h"
+#include "cli.h"
 #include "manifest.h"
 
 namespace {
@@ -670,7 +671,7 @@ std::optional<bess::sdk::PipelineVersion> ParseVersion(std::string_view s) {
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int bess::ctl::Main(int argc, char **argv) {
   std::vector<std::string> args(argv + 1, argv + argc);
   std::string server = std::getenv("BESS_SERVER") ? std::getenv("BESS_SERVER") : "localhost:10514";
   if (args.size() >= 2 && (args[0] == "-s" || args[0] == "--server")) {

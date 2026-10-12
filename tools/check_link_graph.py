@@ -121,7 +121,10 @@ def ubsan_build(build_dir):
 
 def load_libs(build_dir):
     libs = {}
-    patterns = ["core/libbess_*.a", "protobuf/libbess_proto.a"]
+    # bessctl's code and the SDK bessd embeds (D-120): on the SDK and the
+    # protocol only, never on core.
+    patterns = ["core/libbess_*.a", "protobuf/libbess_proto.a",
+                "sdk/cpp/libbess_sdk_embedded.a", "bessctl/libbess_ctl.a"]
     # UBSan's vptr check makes code reference the typeinfo (_ZTI*) of every
     # polymorphic type it handles, defined where the type's key function is:
     # instrumentation, not a dependency (a dynamic_cast or typeid of a

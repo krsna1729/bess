@@ -5,15 +5,15 @@
     package_release.py tarball --build BUILD --version V [--out DIR]
     package_release.py deb     --build BUILD --version V [--out DIR]
 
-`tarball`: bessd, bessctl, dpdk-devbind.py, the Python client and the docs, as
-the release job always shipped them.
+`tarball`: bessd, bessctl (a symlink to bessd: the C++ client, D-120),
+dpdk-devbind.py, the Python client and the docs.
 
 `deb` (on Debian or Ubuntu): three packages from `meson install` of BUILD --
-`bess` (bessd, the C++ bessctl, the Python client and protobuf schema, the
+`bess` (bessd, bessctl -- a symlink to bessd, D-120 --, the Python client and protobuf schema, the
 build metadata and the SPDX SBOM), `bess-dev` (the headers and bess-dev.pc
 plugins build against, and the experimental route, dataplane and RCU archives
 with bess-dev-static.pc, D-095) and `bess-sdk` (the C++ control SDK). `bess`
-depends on the packages that own every shared library bessd and bessctl load
+depends on the packages that own every shared library bessd loads
 (`ldd`, then `dpkg -S`): a library no package owns stops the build, so the
 package never claims less than they need.
 """
@@ -56,8 +56,8 @@ def tarball(args) -> Path:
         top = Path(tmp) / name
         (top / 'bin').mkdir(parents=True)
         shutil.copy2(Path(args.build) / 'core' / 'bessd', top / 'bin')
-        for script in ('bessctl', 'dpdk-devbind.py'):
-            shutil.copy2(ROOT / 'bin' / script, top / 'bin')
+        (top / 'bin' / 'bessctl').symlink_to('bessd')
+        shutil.copy2(ROOT / 'bin' / 'dpdk-devbind.py', top / 'bin')
         for tree in ('bessctl', 'pybess'):
             shutil.copytree(ROOT / tree, top / tree,
                             ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
@@ -107,11 +107,14 @@ def build_deb(stage: Path, name: str, version: str, depends: list[str], descript
                 raise SystemExit(f'{name}: {rel} is not in the install')
             dst = pkg / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
-            if src.is_dir():
+            if src.is_symlink():
+                dst.symlink_to(os.readlink(src))
+            elif src.is_dir():
                 shutil.copytree(src, dst)
             else:
                 shutil.copy2(src, dst)
-        size_kb = sum(f.stat().st_size for f in pkg.rglob('*') if f.is_file()) // 1024
+        size_kb = sum(f.stat().st_size for f in pkg.rglob('*')
+                      if f.is_file() and not f.is_symlink()) // 1024
         (pkg / 'DEBIAN').mkdir()
         control = [f'Package: {name}', f'Version: {version}', f'Architecture: {arch()}',
                    'Maintainer: BESS developers <bess@localhost>', f'Installed-Size: {size_kb}',
@@ -143,8 +146,10 @@ def deb(args) -> list[Path]:
         libdir = build_option(args.build, 'libdir').strip('/')
         lib = libdir if libdir.startswith(prefix + '/') else f'{prefix}/{libdir}'
         bessd = stage / prefix / 'bin' / 'bessd'
-        bessctl = stage / prefix / 'bin' / 'bessctl'  # the C++ one (G1.7)
-        runtime_deps = sorted(set(owning_packages(bessd) + owning_packages(bessctl))) + ['python3']
+        bessctl = stage / prefix / 'bin' / 'bessctl'  # the C++ one (G1.7): bessd (D-120)
+        if not bessctl.is_symlink() or os.readlink(bessctl) != 'bessd':
+            raise SystemExit(f'{bessctl} is not a symlink to bessd')
+        runtime_deps = owning_packages(bessd) + ['python3']
         made = [
             build_deb(stage, 'bess', version, runtime_deps,
                       'BESS daemon (bessd), bessctl, the Python client and schema, build metadata '

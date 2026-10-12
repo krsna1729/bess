@@ -19,7 +19,9 @@
     "bess_drivers": ["bess_framework", "bess_execution", "bess_eal", "bess_utils", "bess_proto"],
     "bess_gate_hooks": ["bess_framework", "bess_execution", "bess_stats", "bess_utils", "bess_proto"],
     "bess_resume_hooks": ["bess_framework", "bess_execution", "bess_proto"],
-    "bess_proto": []
+    "bess_proto": [],
+    "bess_sdk_embedded": ["bess_proto"],
+    "bess_ctl": ["bess_sdk_embedded", "bess_proto"]
   },
   "exceptions": []
 }

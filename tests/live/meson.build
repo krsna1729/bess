@@ -22,7 +22,7 @@ live_lib = static_library(
 live_inc = include_directories('../../core/testing')
 live_env = {
   'BESSD': bessd.full_path(),
-  'BESSCTL': bessctl_exe.full_path(),
+  'BESSCTL': bessctl_link.full_path(),  # bessd, as installed (D-120)
   'BESS_SDK_CPP_CONFORMANCE': join_paths(meson.project_build_root(), 'sdk', 'cpp',
                                          'sdk_cpp_conformance'),
   'BESS_SOURCE_ROOT': meson.project_source_root(),
@@ -41,7 +41,7 @@ foreach source : live_test_sources
   test(
     name,
     exe,
-    depends: [bessd, bessctl_exe] + sdk_cpp_test_targets,
+    depends: [bessd, bessctl_link] + sdk_cpp_test_targets,
     env: live_env,
     suite: 'live',
     is_parallel: false,

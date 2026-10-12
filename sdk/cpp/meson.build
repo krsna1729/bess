@@ -36,6 +36,19 @@ bess_sdk_dep = declare_dependency(
   dependencies: [protobuf_dep, grpcpp_dep],
 )
 
+# The SDK inside bessd (D-120): the same client without control_v2's
+# generated code, which bessd links once, in bess_proto. Linking libbess-sdk
+# there too would register control_v2.proto twice, and protobuf aborts.
+bess_sdk_embedded_lib = static_library(
+  'bess_sdk_embedded',
+  sdk_cpp_sources + [proto_ready_marker],
+  include_directories: sdk_cpp_inc,
+  implicit_include_directories: false,
+  cpp_args: sdk_cpp_args,
+  dependencies: [protobuf_dep, grpcpp_dep],
+  link_with: bess_proto_lib,
+)
+
 install_headers('include/bess/sdk/client.h', 'include/bess/sdk/transport.h',
                 subdir: 'bess/sdk')
 # The public headers include "control_v2.pb.h" from their own directory.

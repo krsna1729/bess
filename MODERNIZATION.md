@@ -8799,8 +8799,10 @@ consumer-driven (D-008, §31.3 item 2).
   driver per SDK, integration test `control_sdk_conformance`), so they cannot
   drift (D-104).
 - **G1.7 — C++ `bessctl` on the public C++ SDK: PARTIAL** (D-104; replaces the
-  Python bessctl, which is deleted last). `bessctl/` builds `bin/bessctl` on
-  `libbess-sdk` alone: JSON and YAML manifests (D-108; `get`, `validate`,
+  Python bessctl, which is deleted last). `bessctl/`'s code is on the SDK
+  alone and ships inside bessd: `bin/bessctl` is a symlink to bessd, which
+  runs the client under that name or as `bessd ctl` (D-120); the standalone
+  `bessctl-standalone` links `libbess-sdk`. JSON and YAML manifests (D-108; `get`, `validate`,
   `diff`, `plan`, `apply`; resource entries committed after the pipeline), `schema`, `status`,
   `resources`, `metrics`, `events`, module commands over control_v2
   (`command`, D-115), and administration over the v2 Admin

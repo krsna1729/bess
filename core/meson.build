@@ -112,6 +112,7 @@ execution_sources = files(
 
 host_sources = files(
   'bessctl.cc',
+  'cli_mode.cc',
   'bessd.cc',
   'debug.cc',
 )
@@ -470,12 +471,37 @@ bessd = executable(
   ['main.cc', version_h],
   include_directories: core_include,
   link_whole: runtime_whole,
-  dependencies: runtime_deps,
+  dependencies: runtime_deps + [bessctl_embedded_dep],
   export_dynamic: (static_binary_opt != 'fully_static'),
   build_rpath: runtime_rpath,
   link_args: bessd_link_args,
   install: true,
 )
+# bessd as bessctl (D-120), through the build directory's symlink and as
+# `bessd ctl`: the client runs before any daemon setup, so it needs no
+# hugepages or root and prints nothing of DPDK's.
+if get_option('build_tests')
+  test(
+    'bessctl_multicall',
+    find_program('sh'),
+    args: ['-c', '''
+      set -u
+      err=$(mktemp) || exit 1
+      trap "rm -f $err" EXIT
+      check() {
+        out=$("$@" 2>"$err") || { echo "$* exited with $?"; exit 1; }
+        case "$out" in "usage: bessctl "*) ;; *) echo "$*: no usage on stdout"; exit 1;; esac
+        case "$out" in *EAL*) echo "$*: EAL output"; exit 1;; esac
+        if [ -s "$err" ]; then echo "$* wrote to stderr:"; cat "$err"; exit 1; fi
+      }
+      check "$1" --help
+      check "$2" ctl --help
+      ''', 'sh', bessctl_link.full_path(), bessd.full_path()],
+    depends: [bessd, bessctl_link],
+    env: {'LD_LIBRARY_PATH': dpdk_libdir},
+    suite: 'bessctl',
+  )
+endif
 core_public_headers = files(
   'commands.h',
   'event.h',
@@ -710,6 +736,7 @@ unit_test_sources = [
   'control/pressure_monitor_test.cc',
   'control/scheduling_constraints_test.cc',
   'bessctl_wire_ranges_test.cc',
+  'cli_mode_test.cc',
   'bessd_test.cc',
   'gate_test.cc',
   'runtime/memory_test.cc',
@@ -853,6 +880,8 @@ foreach source : (get_option('build_tests') ? unit_test_sources : [])
   elif source.startswith('drivers/')
     test_link_whole = driver_runtime_whole
     test_link_with = []
+  elif source == 'cli_mode_test.cc'
+    test_link_with = [bess_host]
   elif source == 'gate_test.cc'
     test_link_whole = gate_runtime_whole
     test_link_with = []
@@ -962,7 +991,8 @@ test(
   depends: [bess_rcu, bess_dataplane_core, bess_classifier, bess_flow, bess_meter,
             bess_stats, bess_route, bess_utils, bess_packet, bess_eal, bess_execution,
             bess_framework, bess_control, bess_host, bess_drivers,
-            bess_modules, bess_gate_hooks, bess_resume_hooks, bess_proto_lib],
+            bess_modules, bess_gate_hooks, bess_resume_hooks, bess_proto_lib,
+            bess_sdk_embedded_lib, bess_ctl_lib],
   is_parallel: false,
   suite: 'architecture',
 )
