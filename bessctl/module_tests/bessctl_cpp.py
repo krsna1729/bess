@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # The C++ bessctl (G1.7) against a live daemon: a manifest whose args name no
-# types is validated, planned, applied, read back and diffed; a stale
-# generation is refused; the schema and resources are listed.
+# types is validated, planned, applied (with two rules for the ExactMatch it
+# creates), read back and diffed; a bad rule names itself; a stale generation
+# is refused; the schema and resources are listed.
 #
 # The binary is $BESSCTL_CPP (meson sets it), else the default build
 # directory's; without it the test is skipped.
@@ -26,6 +27,14 @@ MANIFEST = {
         {'upstream': 'ctl_src', 'downstream': 'ctl_em'},
         {'upstream': 'ctl_em', 'downstream': 'ctl_sink'},
     ],
+    # 10.0.0.1 -> gate 1 and 10.0.0.2 -> gate 0 (bytes in protobuf JSON are
+    # base64; value_int is a decimal string or number).
+    'resources': {
+        'ctl_em/rules': [
+            {'key': {'fields': [{'value_bin': 'CgAAAQ=='}]}, 'value': {'gate': 1}},
+            {'key': {'fields': [{'value_int': '167772162'}]}, 'value': {'gate': '0'}},
+        ],
+    },
 }
 
 
@@ -61,6 +70,10 @@ class BessctlCppTest(BessModuleTestCase):
             applied = self.bessctl('apply', path).stdout
             self.assertIn('generation', applied)
             generation = int(applied.split()[1].rstrip(':'))
+            self.assertIn('resources: 2 entries in 1 resource(s)', applied)
+            rules = self.bess.run_module_command('ctl_em', 'get_runtime_config', 'EmptyArg',
+                                                 {}).rules
+            self.assertEqual(sorted(r.gate for r in rules), [0, 1])
 
             got = json.loads(self.bessctl('get').stdout)
             em = next(m for m in got['modules'] if m['name'] == 'ctl_em')
@@ -73,6 +86,26 @@ class BessctlCppTest(BessModuleTestCase):
             with open(again, 'w') as f:
                 json.dump(got, f)
             self.assertIn('0 change(s)', self.bessctl('diff', again).stdout)
+
+            # Bad entries: the pipeline (unchanged) applies, the entry is
+            # named, and nothing of the transaction is committed. Entry 1 is
+            # refused by bessctl (no such field), then by the daemon (two
+            # fields for a one-field key).
+            good = {'key': {'fields': [{'value_bin': 'CgAAAw=='}]}, 'value': {'gate': 1}}
+            for entry, error in (
+                    ({'key': {'fields': [{'value_bin': 'CgAAAw=='}]}, 'value': {'nope': 1}},
+                     'resource "ctl_em/rules" entry 1: value: '),
+                    ({'key': {'fields': [{'value_int': 1}, {'value_int': 2}]}, 'value': {}},
+                     'resource "ctl_em/rules" entry 1: ')):
+                bad = os.path.join(tmp, 'bad.json')
+                with open(bad, 'w') as f:
+                    json.dump(dict(got, resources={'ctl_em/rules': [good, entry]}), f)
+                failed = self.bessctl('apply', bad, ok=False)
+                self.assertEqual(failed.returncode, 1, failed.stdout)
+                self.assertIn('the pipeline is applied, its resource entries are not', failed.stderr)
+                self.assertIn(error, failed.stderr)
+                self.assertEqual(len(self.bess.run_module_command(
+                    'ctl_em', 'get_runtime_config', 'EmptyArg', {}).rules), 2)
 
             # A generation that is no longer active is refused, nothing changes.
             # Desired state is the whole pipeline: cut down what `get`

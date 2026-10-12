@@ -97,9 +97,17 @@ std::unique_ptr<Schema> MakeSchema() {
   return std::move(*s);
 }
 
+std::expected<pb::Pipeline, std::string> PipelineOf(const Schema &schema, std::string_view text) {
+  auto m = schema.ManifestFromJson(text);
+  if (!m) {
+    return std::unexpected(m.error());
+  }
+  return std::move(m->pipeline);
+}
+
 TEST(Manifest, AnArgWithoutTypeGetsItsClassesInitType) {
   auto schema = MakeSchema();
-  auto p = schema->PipelineFromJson(R"({
+  auto p = PipelineOf(*schema, R"({
     "modules": [{"name": "m", "mclass": "Fake", "arg": {"wid": 3, "core": "7"}}],
     "ports": [{"name": "p", "driver": "FakePort", "arg": {"upstream": "u", "ogate": 2}}]
   })");
@@ -116,7 +124,7 @@ TEST(Manifest, AnArgWithoutTypeGetsItsClassesInitType) {
 
 TEST(Manifest, AnExplicitTypeIsKeptEvenIfItDiffers) {
   auto schema = MakeSchema();
-  auto p = schema->PipelineFromJson(R"({"modules": [{"name": "m", "mclass": "Fake",
+  auto p = PipelineOf(*schema, R"({"modules": [{"name": "m", "mclass": "Fake",
       "arg": {"@type": "type.googleapis.com/bess.pb.v2.Connection", "upstream": "x"}}]})");
   ASSERT_TRUE(p) << p.error();
   EXPECT_TRUE(p->modules(0).arg().Is<pb::Connection>());
@@ -124,7 +132,7 @@ TEST(Manifest, AnExplicitTypeIsKeptEvenIfItDiffers) {
 
 TEST(Manifest, SixtyFourBitValuesAreNotRounded) {
   auto schema = MakeSchema();
-  auto p = schema->PipelineFromJson(
+  auto p = PipelineOf(*schema,
       R"({"traffic_classes": [{"name": "t", "limit": {"count": 9223372036854775807}}]})");
   ASSERT_TRUE(p) << p.error();
   EXPECT_EQ(std::numeric_limits<int64_t>::max(), p->traffic_classes(0).limit().at("count"));
@@ -142,20 +150,20 @@ TEST(Manifest, UnknownOrUntypedClassesAreNamed) {
       {R"([])", "a manifest is a JSON object"},
   };
   for (const auto &[text, error] : cases) {
-    auto p = schema->PipelineFromJson(text);
+    auto p = PipelineOf(*schema, text);
     ASSERT_FALSE(p) << text;
     EXPECT_NE(std::string::npos, p.error().find(error)) << text << ": " << p.error();
   }
   // A value of the wrong type for the class's argument: protobuf's own error.
-  EXPECT_FALSE(schema->PipelineFromJson(
+  EXPECT_FALSE(PipelineOf(*schema,
       R"({"modules": [{"name": "m", "mclass": "Fake", "arg": {"wid": "x"}}]})"));
   // An untyped class without an arg is fine: nothing to type.
-  EXPECT_TRUE(schema->PipelineFromJson(R"({"modules": [{"name": "m", "mclass": "Opaque"}]})"));
+  EXPECT_TRUE(PipelineOf(*schema, R"({"modules": [{"name": "m", "mclass": "Opaque"}]})"));
 }
 
 TEST(Manifest, WhatGetPrintsApplyReadsBack) {
   auto schema = MakeSchema();
-  auto p = schema->PipelineFromJson(R"({
+  auto p = PipelineOf(*schema, R"({
     "modules": [{"name": "m", "mclass": "Fake", "arg": {"wid": 3}},
                 {"name": "n", "mclass": "Fake",
                  "arg": {"@type": "type.googleapis.com/bess.pb.v2.Connection", "upstream": "x"}}],
@@ -174,9 +182,48 @@ TEST(Manifest, WhatGetPrintsApplyReadsBack) {
     return n;
   }()) << *text;
   EXPECT_NE(std::string::npos, text->find("\"traffic_classes\"")) << *text;
-  auto again = schema->PipelineFromJson(*text);
+  auto again = PipelineOf(*schema, *text);
   ASSERT_TRUE(again) << again.error();
   EXPECT_TRUE(gp::util::MessageDifferencer::Equals(*p, *again)) << *text;
+}
+
+TEST(Manifest, ResourceEntriesAreTakenOutInFileOrderAndTypedLater) {
+  auto schema = MakeSchema();
+  auto m = schema->ManifestFromJson(R"({
+    "modules": [{"name": "m", "mclass": "Fake", "arg": {"wid": 1}}],
+    "resources": {"z/rules": [{"key": {"wid": 2}, "value": {"generation": 9007199254740993}}],
+                  "a/rules": [{"key": {"wid": 3}, "value": {}}, {"key": {}, "value": {}}]}
+  })");
+  ASSERT_TRUE(m) << m.error();
+  EXPECT_EQ(1, m->pipeline.modules_size());
+  ASSERT_EQ(2u, m->resources.size());
+  EXPECT_EQ("z/rules", m->resources[0].first);
+  EXPECT_EQ("a/rules", m->resources[1].first);
+  EXPECT_EQ(3u, m->entries());
+  // An entry becomes the resource's types once the daemon names them; its
+  // numbers are as written (2^53 + 1 survives).
+  auto value = schema->MessageFromJson("bess.pb.v2.ApplyPipelineResponse",
+                                       m->resources[0].second[0].value);
+  ASSERT_TRUE(value) << value.error();
+  pb::ApplyPipelineResponse r;
+  ASSERT_TRUE(r.ParseFromString((*value)->SerializeAsString()));
+  EXPECT_EQ(9007199254740993u, r.generation());
+  EXPECT_FALSE(schema->MessageFromJson("bess.pb.v2.Worker", R"({"nope": 1})"));
+  EXPECT_FALSE(schema->MessageFromJson("no.such.Type", "{}"));
+
+  const std::pair<const char *, const char *> bad[] = {
+      {R"({"resources": []})", "\"resources\" is not an object"},
+      {R"({"resources": {"r": {}}})", "resource \"r\": not a list"},
+      {R"({"resources": {"r": [{"key": {}}]}})", "resource \"r\" entry 0: needs exactly"},
+      {R"({"resources": {"r": [{"key": {}, "value": 1}]}})", "entry 0: needs exactly"},
+      {R"({"resources": {"r": [{"key": {}, "value": {}, "x": 1}]}})", "entry 0: needs exactly"},
+      {R"({"resources": {"r": [1]}})", "entry 0: needs exactly"},
+  };
+  for (const auto &[text, error] : bad) {
+    auto r = schema->ManifestFromJson(text);
+    ASSERT_FALSE(r) << text;
+    EXPECT_NE(std::string::npos, r.error().find(error)) << text << ": " << r.error();
+  }
 }
 
 }  // namespace

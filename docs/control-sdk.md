@@ -123,10 +123,26 @@ bessctl status | resources | metrics | events [--from SEQ] [TYPE...]
 ```
 
 A manifest is the whole desired state: workers and traffic classes included
-(start from `bessctl get`). The daemon validates; bessctl only converts. Not
-yet: YAML, bootstrap transactions in the manifest, the legacy commands (daemon
-start/stop, `.bess` files, interactive shell); the Python bessctl remains for
-those until D-104's last step.
+(start from `bessctl get`). The daemon validates; bessctl only converts.
+
+A manifest may also hold entries for the resources its modules create (see
+`bessctl resources`), in the resource's key and value types:
+
+```json
+"resources": {
+  "em/rules": [{"key": {"fields": [{"value_bin": "CgAAAQ=="}]}, "value": {"gate": 1}}]
+}
+```
+
+`apply` commits them in one transaction after the pipeline, since the
+resources exist only then: if they fail, the pipeline stays applied and the
+error names the entry; both steps are idempotent, so the same `apply` is the
+retry. Entries are added or replaced, never removed, and `get` does not print
+them. `validate`, `diff` and `plan` check only the pipeline.
+
+Not yet: YAML, the legacy commands (daemon start/stop, `.bess` files,
+interactive shell); the Python bessctl remains for those until D-104's last
+step.
 
 ## What they guarantee
 

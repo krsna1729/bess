@@ -128,12 +128,44 @@ void DropImpliedTypes(json::Value &doc, const ArgList &l, const TypeMap &types) 
   }
 }
 
+// Takes "resources" out of the manifest `doc`: {name: [{"key": {}, "value": {}}]}.
+std::expected<std::vector<std::pair<std::string, std::vector<Manifest::Entry>>>, std::string>
+TakeResources(json::Value &doc) {
+  std::vector<std::pair<std::string, std::vector<Manifest::Entry>>> out;
+  const json::Value *resources = json::Find(doc, "resources");
+  if (resources == nullptr) {
+    return out;
+  }
+  if (resources->object() == nullptr) {
+    return std::unexpected(std::string("\"resources\" is not an object of resource names"));
+  }
+  for (const auto &[name, list] : *resources->object()) {
+    if (list.array() == nullptr) {
+      return std::unexpected(std::format("resource \"{}\": not a list of entries", name));
+    }
+    std::vector<Manifest::Entry> entries;
+    for (size_t i = 0; i < list.array()->size(); i++) {
+      const json::Value &entry = (*list.array())[i];
+      const json::Value *key = json::Find(entry, "key");
+      const json::Value *value = json::Find(entry, "value");
+      if (key == nullptr || value == nullptr || entry.object()->size() != 2 ||
+          key->object() == nullptr || value->object() == nullptr) {
+        return std::unexpected(std::format(
+            "resource \"{}\" entry {}: needs exactly \"key\" and \"value\", both objects", name, i));
+      }
+      entries.push_back({json::Dump(*key), json::Dump(*value)});
+    }
+    out.emplace_back(name, std::move(entries));
+  }
+  json::Erase(doc, "resources");
+  return out;
+}
+
 }  // namespace
 
 std::expected<std::unique_ptr<Schema>, std::string> Schema::From(
     const pb::GetSchemaResponse &schema) {
   std::unique_ptr<Schema> s(new Schema());
-  s->response_ = schema;
   s->pool_ = std::make_unique<gp::DescriptorPool>();
   for (const gp::FileDescriptorProto &file : schema.descriptors().file()) {
     if (s->pool_->BuildFile(file) == nullptr) {
@@ -143,6 +175,7 @@ std::expected<std::unique_ptr<Schema>, std::string> Schema::From(
   if (!AddGenerated(pb::Pipeline::descriptor()->file(), *s->pool_)) {
     return std::unexpected(std::string("the daemon's schema conflicts with control_v2.proto"));
   }
+  s->factory_ = std::make_unique<gp::DynamicMessageFactory>(s->pool_.get());
   s->resolver_.reset(
       gp::util::NewTypeResolverForDescriptorPool(std::string(kUrlPrefix), s->pool_.get()));
   for (const pb::ModuleClassSchema &c : schema.module_classes()) {
@@ -154,7 +187,7 @@ std::expected<std::unique_ptr<Schema>, std::string> Schema::From(
   return s;
 }
 
-std::expected<pb::Pipeline, std::string> Schema::PipelineFromJson(std::string_view text) const {
+std::expected<Manifest, std::string> Schema::ManifestFromJson(std::string_view text) const {
   auto doc = json::Parse(text);
   if (!doc) {
     return std::unexpected(doc.error());
@@ -162,6 +195,12 @@ std::expected<pb::Pipeline, std::string> Schema::PipelineFromJson(std::string_vi
   if (doc->object() == nullptr) {
     return std::unexpected(std::string("a manifest is a JSON object"));
   }
+  Manifest m;
+  auto resources = TakeResources(*doc);
+  if (!resources) {
+    return std::unexpected(resources.error());
+  }
+  m.resources = std::move(*resources);
   for (const auto &[list, types] :
        {std::pair{&kModules, &module_types_}, std::pair{&kPorts, &driver_types_}}) {
     if (auto filled = FillTypes(*doc, *list, *types); !filled) {
@@ -175,19 +214,23 @@ std::expected<pb::Pipeline, std::string> Schema::PipelineFromJson(std::string_vi
   if (!status.ok()) {
     return std::unexpected(ParseError(Message(status)));
   }
-  pb::Pipeline p;
-  if (!p.ParseFromString(binary)) {
+  if (!m.pipeline.ParseFromString(binary)) {
     return std::unexpected(std::string("the manifest did not encode as a Pipeline"));
   }
-  return p;
+  return m;
 }
 
 std::expected<std::string, std::string> Schema::PipelineToJson(const pb::Pipeline &p) const {
-  auto text = MessageToJson(pb::Pipeline::descriptor()->full_name(), p.SerializeAsString());
-  if (!text) {
-    return text;
+  gp::util::JsonPrintOptions options;
+  options.preserve_proto_field_names = true;
+  std::string text;
+  const auto status = gp::util::BinaryToJsonString(
+      resolver_.get(), TypeUrl(pb::Pipeline::descriptor()->full_name()), p.SerializeAsString(),
+      &text, options);
+  if (!status.ok()) {
+    return std::unexpected(Message(status));
   }
-  auto doc = json::Parse(*text);
+  auto doc = json::Parse(text);
   if (!doc) {
     return std::unexpected(doc.error());
   }
@@ -196,17 +239,18 @@ std::expected<std::string, std::string> Schema::PipelineToJson(const pb::Pipelin
   return json::Dump(*doc, 2);
 }
 
-std::expected<std::string, std::string> Schema::MessageToJson(std::string_view type,
-                                                              const std::string &binary) const {
-  gp::util::JsonPrintOptions options;
-  options.preserve_proto_field_names = true;
-  std::string out;
-  const auto status =
-      gp::util::BinaryToJsonString(resolver_.get(), TypeUrl(type), binary, &out, options);
-  if (!status.ok()) {
-    return std::unexpected(Message(status));
+std::expected<std::unique_ptr<gp::Message>, std::string> Schema::MessageFromJson(
+    std::string_view type, std::string_view json) const {
+  const gp::Descriptor *d = pool_->FindMessageTypeByName(std::string(type));
+  if (d == nullptr) {
+    return std::unexpected(std::format("the daemon's schema has no type {}", type));
   }
-  return out;
+  std::unique_ptr<gp::Message> m(factory_->GetPrototype(d)->New());
+  const auto status = gp::util::JsonStringToMessage(std::string(json), m.get());
+  if (!status.ok()) {
+    return std::unexpected(ParseError(Message(status)));
+  }
+  return m;
 }
 
 }  // namespace bessctl

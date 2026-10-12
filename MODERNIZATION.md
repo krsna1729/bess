@@ -8759,9 +8759,9 @@ consumer-driven (D-008, §31.3 item 2).
 - **G1.7 — C++ `bessctl` on the public C++ SDK: PARTIAL** (D-104; replaces the
   Python bessctl, which is deleted last). `bessctl/` builds `bin/bessctl` on
   `libbess-sdk` alone: JSON manifests (`get`, `validate`, `diff`, `plan`,
-  `apply`), `schema`, `status`, `resources`, `metrics`, `events`; live suite
-  `bessctl_cpp`. Pending: YAML and bootstrap transactions in manifests, the
-  legacy commands (daemon start/stop, `.bess`, shell), a static baseline
+  `apply`; resource entries committed after the pipeline), `schema`, `status`,
+  `resources`, `metrics`, `events`; live suite `bessctl_cpp`. Pending: YAML,
+  the legacy commands (daemon start/stop, `.bess`, shell), a static baseline
   `-march` build.
 
 The old imperative API should not constrain the ideal end state.

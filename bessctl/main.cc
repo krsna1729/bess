@@ -57,11 +57,12 @@ int Usage() {
 }
 
 int Fail(std::string_view what) {
+  std::fflush(stdout);  // what was printed before the failure, first
   std::println(stderr, "bessctl: {}", what);
   return 1;
 }
 
-int Fail(const Error &e) {
+std::string Describe(const Error &e) {
   std::string text = e.message;
   if (e.detail) {
     if (!e.detail->object().empty()) {
@@ -71,7 +72,14 @@ int Fail(const Error &e) {
       text += " (field " + e.detail->field() + ")";
     }
   }
-  return Fail(text);
+  for (const bess::sdk::OpFailure &f : e.failures) {
+    text += std::format("; operation {}: {}", f.index, f.error);
+  }
+  return text;
+}
+
+int Fail(const Error &e) {
+  return Fail(Describe(e));
 }
 
 std::optional<std::string> ReadInput(const std::string &path) {
@@ -164,11 +172,11 @@ class Cli {
 
   int Validate(const std::string &path) {
     auto schema = LoadSchema();
-    auto p = schema ? ReadManifest(**schema, path) : std::nullopt;
-    if (!p) {
+    auto m = schema ? ReadManifest(**schema, path) : std::nullopt;
+    if (!m) {
       return 1;
     }
-    auto normalized = client_->ValidatePipeline(*p);
+    auto normalized = client_->ValidatePipeline(m->pipeline);
     if (!normalized) {
       return Fail(normalized.error());
     }
@@ -177,16 +185,17 @@ class Cli {
       return Fail(text.error());
     }
     std::println("{}", *text);
+    NoteResources(*m);
     return 0;
   }
 
   int Diff(const std::string &path) {
     auto schema = LoadSchema();
-    auto p = schema ? ReadManifest(**schema, path) : std::nullopt;
-    if (!p) {
+    auto m = schema ? ReadManifest(**schema, path) : std::nullopt;
+    if (!m) {
       return 1;
     }
-    auto diff = client_->DiffPipeline(*p);
+    auto diff = client_->DiffPipeline(m->pipeline);
     if (!diff) {
       return Fail(diff.error());
     }
@@ -196,16 +205,17 @@ class Cli {
     }
     std::println("# against generation {}: {} change(s)", diff->generation,
                  diff->diff.changes_size());
+    NoteResources(*m);
     return 0;
   }
 
   int Plan(const std::string &path) {
     auto schema = LoadSchema();
-    auto p = schema ? ReadManifest(**schema, path) : std::nullopt;
-    if (!p) {
+    auto m = schema ? ReadManifest(**schema, path) : std::nullopt;
+    if (!m) {
       return 1;
     }
-    auto plan = client_->PlanPipeline(*p);
+    auto plan = client_->PlanPipeline(m->pipeline);
     if (!plan) {
       return Fail(plan.error());
     }
@@ -214,16 +224,20 @@ class Cli {
                    pb::ObjectType_Name(s.type()), s.object());
     }
     std::println("# against generation {}: {} step(s)", plan->generation, plan->steps.size());
+    NoteResources(*m);
     return 0;
   }
 
+  // The pipeline, then the manifest's resource entries in one transaction:
+  // its resources exist only once the pipeline does. Both steps are
+  // idempotent, so after a failed second step the same apply is the retry.
   int Apply(const std::string &path, std::optional<uint64_t> generation) {
     auto schema = LoadSchema();
-    auto p = schema ? ReadManifest(**schema, path) : std::nullopt;
-    if (!p) {
+    auto m = schema ? ReadManifest(**schema, path) : std::nullopt;
+    if (!m) {
       return 1;
     }
-    auto r = client_->ApplyPipeline(*p, generation);
+    auto r = client_->ApplyPipeline(m->pipeline, generation);
     if (!r) {
       return Fail(r.error());
     }
@@ -231,6 +245,17 @@ class Cli {
                  "retire {} us",
                  r->generation(), r->applied_ops(), r->workers_paused() ? ", workers paused" : "",
                  r->validation_us(), r->prepare_us(), r->paused_commit_us(), r->retire_us());
+    if (m->resources.empty()) {
+      return 0;
+    }
+    auto committed = CommitEntries(**schema, *m);
+    if (!committed) {
+      return Fail(std::format("the pipeline is applied, its resource entries are not: {}",
+                              committed.error()));
+    }
+    std::println("resources: {} entr{} in {} resource(s); transaction {}, resource generation {}",
+                 m->entries(), m->entries() == 1 ? "y" : "ies", m->resources.size(),
+                 committed->request_id, committed->generation);
     return 0;
   }
 
@@ -294,19 +319,79 @@ class Cli {
     return std::move(*schema);
   }
 
-  static std::optional<pb::Pipeline> ReadManifest(const bessctl::Schema &schema,
-                                                  const std::string &path) {
+  static std::optional<bessctl::Manifest> ReadManifest(const bessctl::Schema &schema,
+                                                       const std::string &path) {
     auto text = ReadInput(path);
     if (!text) {
       Fail("cannot read " + path);
       return std::nullopt;
     }
-    auto p = schema.PipelineFromJson(*text);
-    if (!p) {
-      Fail(path + ": " + p.error());
+    auto m = schema.ManifestFromJson(*text);
+    if (!m) {
+      Fail(path + ": " + m.error());
       return std::nullopt;
     }
-    return std::move(*p);
+    return std::move(*m);
+  }
+
+  // Validate, diff and plan cover the pipeline only: a resource's types are
+  // known once the module that creates it exists. (To stderr: stdout may be
+  // a manifest.)
+  static void NoteResources(const bessctl::Manifest &m) {
+    if (!m.resources.empty()) {
+      std::println(stderr,
+                   "bessctl: resources: {} entr{} not checked (apply commits them after the "
+                   "pipeline)",
+                   m.entries(), m.entries() == 1 ? "y" : "ies");
+    }
+  }
+
+  std::expected<bess::sdk::Applied, std::string> CommitEntries(const bessctl::Schema &schema,
+                                                               const bessctl::Manifest &m) {
+    auto resources = client_->Resources(true);
+    if (!resources) {
+      return std::unexpected(Describe(resources.error()));
+    }
+    bess::sdk::Transaction txn = client_->NewTransaction();
+    std::vector<std::string> ops;  // operation index -> the entry it came from
+    for (const auto &[name, entries] : m.resources) {
+      const auto r = resources->find(name);
+      if (r == resources->end()) {
+        return std::unexpected(std::format("no resource \"{}\" (bessctl resources lists them)",
+                                           name));
+      }
+      for (size_t i = 0; i < entries.size(); i++) {
+        const std::string where = std::format("resource \"{}\" entry {}", name, i);
+        auto key = schema.MessageFromJson(r->second.key_type, entries[i].key);
+        if (!key) {
+          return std::unexpected(std::format("{}: key: {}", where, key.error()));
+        }
+        auto value = schema.MessageFromJson(r->second.value_type, entries[i].value);
+        if (!value) {
+          return std::unexpected(std::format("{}: value: {}", where, value.error()));
+        }
+        if (auto added = txn.Upsert(r->second, **key, **value); !added) {
+          return std::unexpected(std::format("{}: {}", where, Describe(added.error())));
+        }
+        ops.push_back(where);
+      }
+    }
+    auto applied = txn.Commit();
+    if (!applied) {
+      // The SDK's message lists failures by operation; name the entries.
+      const auto &failures = applied.error().failures;
+      if (failures.empty()) {
+        return std::unexpected(Describe(applied.error()));
+      }
+      std::string text = "rejected";
+      for (const bess::sdk::OpFailure &f : failures) {
+        const bool known = f.index >= 0 && static_cast<size_t>(f.index) < ops.size();
+        text += std::format("; {}: {}",
+                            known ? ops[f.index] : std::format("operation {}", f.index), f.error);
+      }
+      return std::unexpected(text);
+    }
+    return std::move(*applied);
   }
 
   std::unique_ptr<Client> client_;
