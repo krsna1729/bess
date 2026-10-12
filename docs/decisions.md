@@ -7906,15 +7906,19 @@ ceiling, the bound and the round trip; `--self-test` and a removed row prove the
   `ACCUMULATE` and the two name maps; `ResourceName` / `ResourceFromName` are the only conversions to text.
 - `PacketBatch::packets()` returns a `PacketRange` (a pointer pair, no `<ranges>` in every packet translation unit);
   45 index loops became range-for. Layout and storage do not change.
-- `CpuId` (a `StrongId<..., uint32_t>` in `[0, CPU_SETSIZE)`) is made only by `CpuIdFrom`, which refuses an
-  out-of-range value. `CpuPresent`, `CpuAllowed`, `DefaultWorkerCore` and `WorkerManager::Launch` take it. The
+- `CpuId` (a `StrongId<..., uint32_t>` in `[0, CPU_SETSIZE)`) is made from untrusted input only by `CpuIdFrom`,
+  which refuses an out-of-range value; `DefaultWorkerCore` builds it from already-validated values (the parsed `-c`,
+  0, a CPU of the process set). `CpuPresent`, `CpuAllowed`, `DefaultWorkerCore` and `WorkerManager::Launch` take it. The
   public `launch_worker(int, int, ...)` and `is_cpu_present(unsigned)` in `worker.h` keep their signatures and
   convert with the same check, so the installed API does not change.
 
 **Bugs fixed on the way.** `AddWorker(wid, core)` took a 64-bit core and cast it to `int`: core 2^32 + n passed every
 check as CPU n and the worker started there. It is now EINVAL (test `CoreIdsBeyond32BitsAreRefused`, which failed
 before the change). Bypass assigned `total_bytes =` in its loop, so `cycles_per_byte` charged the last packet's
-length only; it now sums the batch (master had the same line; only the perftest `.bess` files use the argument).
+length only; it now sums the batch (master had the same line; only the perftest `.bess` files use the argument). The
+legacy TC RPCs narrowed the request's 64-bit `wid` the same way (`AddTc` with 2^32 + 1 attached the class to worker
+1, with 2^32 - 1 to any worker; `ListTcs` filtered likewise); they now refuse it (`api_wire_ranges.py`, which failed
+before the change).
 
 **Evidence.** All unit and live tests pass on the combined tree. In the same paired run as D-102, the build with the
 Resource and `packets()` changes ("types") against "hardcoded": F.floor 1.92 / 1.93, F.hop/4 3.84 / 3.96, M.base
