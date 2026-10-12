@@ -136,9 +136,11 @@ A manifest may also hold entries for the resources its modules create (see
 
 `apply` commits them in one transaction after the pipeline, since the
 resources exist only then: if they fail, the pipeline stays applied and the
-error names the entry; both steps are idempotent, so the same `apply` is the
-retry. Entries are added or replaced, never removed, and `get` does not print
-them. `validate`, `diff` and `plan` check only the pipeline.
+error names the entry. Both steps are idempotent, so after a fix the same
+`apply` is the retry; with `--generation`, give the generation the failed
+`apply` printed (the error says which), since its pipeline step moved it.
+Entries are added or replaced, never removed, and `get` does not print them.
+`validate`, `diff` and `plan` check only the pipeline.
 
 Not yet: YAML, the legacy commands (daemon start/stop, `.bess` files,
 interactive shell); the Python bessctl remains for those until D-104's last
@@ -208,16 +210,11 @@ nothing applied; `TransportError` only after an unanswered RPC;
 The Go and C++ clients follow the same contract (`sdk/go/bess/client.go`,
 `sdk/cpp/src/client.cc`); their scripted tests cover the same cases.
 
-
 `pybess/test_sdk.py`, `sdk/go/bess/client_test.go` and
 `sdk/cpp/client_test.cc` script every recovery path against a fake transport
 (the `python` suite; the CI job "Go SDK", with the race detector; the `sdk`
 suite). Against a live daemon (the `integration` suite):
-`bessctl/module_tests/control_sdk.py` (Python), `control_sdk_go.py`, which
-runs the Go client (`go test -tags live`), and `control_sdk_cpp.py`, which runs
-`sdk_cpp_live_test`: each commits a rule, replays it, meets a conflict, refuses
-a mistyped key and applies a pipeline, then the test checks the rule steers
-packets.
+`bessctl/module_tests/control_sdk.py` (Python) and the conformance suite.
 
 Black-box recovery against the live daemon (`control_sdk.py`, the real stub
 with ApplyTransaction's fate scripted): an answer lost after the daemon applied
@@ -232,6 +229,61 @@ and refused at a stale generation.
 A real controller on the SDK: `tools/live_transaction_bench.py` (D-027's live
 gate) applies its pipeline as desired state and drives its rules as SDK
 transactions; it reads BUSY answers from the daemon's metrics.
+
+### Conformance suite
+
+`sdk/conformance/cases.json` is run, case by case, by each SDK's driver against
+one live bessd (D-104), so the SDKs cannot drift: `sdk/cpp/conformance.cc`
+(`sdk_cpp_conformance`) and `sdk/go/bess/conformance_test.go`
+(`go test -tags live -run TestConformance`, one subtest per case).
+`bessctl/module_tests/control_sdk_conformance.py` creates an ExactMatch, runs
+both drivers, requires every case to pass in each, and checks that the rule
+each left behind steers packets. A behaviour both SDKs must share is a case
+there, not a test in one SDK.
+
+A driver gets the daemon's address, the resource name (`$resource` in the
+cases) and the cases. It builds every message from the daemon's `GetSchema`
+descriptors and protobuf JSON, as a client without generated code would.
+Cases run in order, each with its own labels; a case fails at its first failing
+step. Error kinds are named alike in both drivers: `invalid_request`,
+`conflict`, `rejected`, `busy`, `transport`, `pipeline_conflict`,
+`daemon_restarted`, `stale_resource`, `cancelled`. Every step has `"do"`; a
+step with `"want_error"` passes only if it fails with that kind, otherwise only
+if it succeeds.
+
+| `do` | Fields | Checks |
+|---|---|---|
+| `capabilities` | | a daemon version and at least one module class |
+| `supports` | `rpc`, `want` | `Supports(rpc) == want` |
+| `metrics` | | at least one sample |
+| `schema` | `class` | the class's init type is in the schema's descriptors |
+| `resource` | `name` | the resource exists (or `want_error`) |
+| `watch` | `types`, `as` | opens an event stream from the next event, then waits 300 ms so it is open before what follows |
+| `event` | `watch`, `of`, `want_fields` | within 5 s the stream delivers commit `of`'s event (its `request_id` field), with that commit's generation and these fields |
+| `commit` | `ops`, `request_id_of`, `expected_generation_of`, `generation_delta`, `snapshot`, `as` | one transaction on `$resource` (below) |
+| `transaction_status` | `of` or `request_id`, `want_known`, `want_outcome` | `GetTransaction` of commit `of`'s request id, or `request_id` |
+| `pipeline` | `base`, `add`, `chain`, `remove`, `plan`, `want_changes`, `at_generation_of`, `as` | below |
+
+**commit.** Each op is `{"op": "upsert", "key": {...}, "value": {...}}` or
+`{"op": "erase", "key": {...}}` in the resource's key and value types;
+`"key_as_value": true` builds the key in the value type instead. An op with
+`want_error` must fail when added (the client refuses it before sending) and is
+not part of the transaction. Options: commit `request_id_of`'s request id;
+an expected generation of commit `expected_generation_of`'s plus
+`generation_delta`; `snapshot` (scope) consistency. Checks: `want_replayed`,
+`want_generation_of` (the same generation as that commit), `want_visibility`
+(a `TransactionRecord.Visibility` name) and, for `rejected`,
+`want_failed_ops` (the failed operations' indexes among those sent). `as`
+labels the commit's request id and generation.
+
+**pipeline.** Without `add`, `chain` or `remove`, reads the active pipeline and
+its generation into `as`. Otherwise builds on `base`'s pipeline (a label of an
+earlier pipeline step; the active one if absent): `add` modules (`[name,
+class]`, no argument), `chain` them gate 0 to gate 0, `remove` modules. Then
+`plan` (at least one step), `want_changes` (the diff against the active
+pipeline has that many changes), and the apply, at `at_generation_of`'s
+generation if given. `as` labels the built pipeline and the generation the
+apply reached.
 
 ## Not yet
 

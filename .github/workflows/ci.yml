@@ -149,8 +149,8 @@ jobs:
           sudo bash env/install-deps.sh build
           pip3 install --break-system-packages coverage
 
-      # The integration suite runs the Go control SDK against bessd
-      # (bessctl/module_tests/control_sdk_go.py).
+      # The integration suite runs the Go control SDK's conformance driver
+      # against bessd (bessctl/module_tests/control_sdk_conformance.py).
       - uses: actions/setup-go@v6
         with:
           go-version-file: sdk/go/go.mod

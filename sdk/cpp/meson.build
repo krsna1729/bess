@@ -22,8 +22,11 @@ else
   bess_sdk_lib = library('bess-sdk', sdk_cpp_sources, control_v2_cpp_target,
                          kwargs: sdk_lib_kwargs)
 endif
+# `sources`: a consumer's compile waits for the generated control_v2.pb.h the
+# public headers include (the pattern core/ uses).
 bess_sdk_dep = declare_dependency(
   link_with: bess_sdk_lib,
+  sources: [proto_ready_marker],
   include_directories: sdk_cpp_inc,
   compile_args: core_cpp_include,
   dependencies: [protobuf_dep, grpcpp_dep],
@@ -52,8 +55,8 @@ pkg.generate(
   extra_cflags: ['-std=c++23'],
 )
 
-# The live test program is what bessctl/module_tests/control_sdk_cpp.py runs
-# against a live bessd (pybess/meson.build passes its path).
+# The conformance driver is what bessctl/module_tests/control_sdk_conformance.py
+# runs against a live bessd (pybess/meson.build passes its path).
 sdk_cpp_test_targets = []
 if get_option('build_tests')
   sdk_cpp_test = executable(
@@ -62,10 +65,10 @@ if get_option('build_tests')
     dependencies: [bess_sdk_dep, gtest_dep, dependency('gtest_main', method: 'pkg-config')],
   )
   test('sdk_cpp_client_test', sdk_cpp_test, suite: 'sdk')
-  sdk_cpp_live_test = executable(
-    'sdk_cpp_live_test',
-    'live_test.cc',
+  sdk_cpp_conformance = executable(
+    'sdk_cpp_conformance',
+    'conformance.cc',
     dependencies: [bess_sdk_dep],
   )
-  sdk_cpp_test_targets += sdk_cpp_live_test
+  sdk_cpp_test_targets += sdk_cpp_conformance
 endif

@@ -8751,11 +8751,12 @@ consumer-driven (D-008, §31.3 item 2).
   `GetSystem` is not.
 - **G1.4 — resource stats and events: PENDING.** Existing port/traffic-class
   stats are not per-resource transaction lifecycle stats.
-- **G1.5 — Go SDK: DONE** (`sdk/go`, live suite `control_sdk_go`); it is the SDK
-  for external controllers such as the UPF (D-104).
-- **G1.6 — C++ SDK: DONE** (`sdk/cpp`, `libbess-sdk` and the `bess-sdk` .deb, live
-  suite `control_sdk_cpp`; the Go SDK's contract, case for case). One conformance
-  suite run live against both SDKs is still PENDING (D-104).
+- **G1.5 — Go SDK: DONE** (`sdk/go`); it is the SDK for external controllers
+  such as the UPF (D-104).
+- **G1.6 — C++ SDK: DONE** (`sdk/cpp`, `libbess-sdk` and the `bess-sdk` .deb).
+  Both SDKs run one conformance suite live (`sdk/conformance/cases.json`, a
+  driver per SDK, integration test `control_sdk_conformance`), so they cannot
+  drift (D-104).
 - **G1.7 — C++ `bessctl` on the public C++ SDK: PARTIAL** (D-104; replaces the
   Python bessctl, which is deleted last). `bessctl/` builds `bin/bessctl` on
   `libbess-sdk` alone: JSON manifests (`get`, `validate`, `diff`, `plan`,

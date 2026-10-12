@@ -1,0 +1,91 @@
+{
+  "_comment": [
+    "The control SDK conformance suite (D-104): every SDK runs these cases against one live bessd,",
+    "so they cannot drift. docs/control-sdk.md (\"Conformance suite\") defines the steps;",
+    "bessctl/module_tests/control_sdk_conformance.py starts the daemon, creates $resource (an",
+    "ExactMatch's rules, two 4-byte fields, default gate 3) and runs each SDK's driver. Keys and",
+    "values are protobuf JSON of the resource's types, which the drivers take from GetSchema."
+  ],
+  "cases": [
+    {
+      "name": "discovery",
+      "steps": [
+        {"do": "capabilities"},
+        {"do": "supports", "rpc": "ApplyTransaction", "want": true},
+        {"do": "supports", "rpc": "bess.pb.v2.Control/GetSchema", "want": true},
+        {"do": "supports", "rpc": "NoSuchRpc", "want": false},
+        {"do": "metrics"},
+        {"do": "schema", "class": "ExactMatch"},
+        {"do": "resource", "name": "$resource"},
+        {"do": "resource", "name": "no_such_module/rules", "want_error": "invalid_request"}
+      ]
+    },
+    {
+      "name": "commit_event_replay_conflict",
+      "steps": [
+        {"do": "watch", "types": ["bess.transaction"], "as": "w"},
+        {"do": "commit", "as": "t1", "ops": [
+          {"op": "upsert", "key": {"gate": 1}, "key_as_value": true, "value": {"gate": 1},
+           "want_error": "invalid_request"},
+          {"op": "upsert", "key": {"fields": [{"value_bin": "QSsVAA=="}, {"value_bin": "DCI4Tg=="}]},
+           "value": {"gate": 1}}
+        ], "want_visibility": "VISIBILITY_DEPENDENCY_ORDERED"},
+        {"do": "event", "watch": "w", "want_fields": {"outcome": "applied"}, "of": "t1"},
+        {"do": "commit", "request_id_of": "t1", "ops": [
+          {"op": "upsert", "key": {"fields": [{"value_bin": "QSsVAA=="}, {"value_bin": "DCI4Tg=="}]},
+           "value": {"gate": 1}}
+        ], "want_replayed": true, "want_generation_of": "t1"},
+        {"do": "commit", "expected_generation_of": "t1", "generation_delta": -1, "ops": [
+          {"op": "upsert", "key": {"fields": [{"value_bin": "QSsVAA=="}, {"value_bin": "DCI4Tg=="}]},
+           "value": {"gate": 1}}
+        ], "want_error": "conflict"},
+        {"do": "transaction_status", "of": "t1", "want_known": true, "want_outcome": "OUTCOME_APPLIED"},
+        {"do": "transaction_status", "request_id": "conformance-never-sent", "want_known": false}
+      ]
+    },
+    {
+      "name": "rejected_changes_nothing",
+      "steps": [
+        {"do": "commit", "ops": [
+          {"op": "upsert", "key": {"fields": [{"value_int": "1"}, {"value_int": "2"}]}, "value": {"gate": 2}},
+          {"op": "upsert", "key": {"fields": [{"value_int": "1"}]}, "value": {"gate": 2}}
+        ], "want_error": "rejected", "want_failed_ops": [1]},
+        {"do": "commit", "ops": [
+          {"op": "erase", "key": {"fields": [{"value_int": "1"}, {"value_int": "2"}]}}
+        ], "want_error": "rejected", "want_failed_ops": [0]}
+      ]
+    },
+    {
+      "name": "upsert_erase_and_snapshot_refused",
+      "steps": [
+        {"do": "commit", "snapshot": true, "ops": [
+          {"op": "upsert", "key": {"fields": [{"value_int": "3"}, {"value_int": "4"}]}, "value": {"gate": 0}}
+        ], "want_error": "invalid_request"},
+        {"do": "commit", "ops": [
+          {"op": "upsert", "key": {"fields": [{"value_int": "3"}, {"value_int": "4"}]}, "value": {"gate": 0}}
+        ]},
+        {"do": "commit", "ops": [
+          {"op": "erase", "key": {"fields": [{"value_int": "3"}, {"value_int": "4"}]}}
+        ]},
+        {"do": "commit", "ops": [
+          {"op": "erase", "key": {"fields": [{"value_int": "3"}, {"value_int": "4"}]}}
+        ], "want_error": "rejected", "want_failed_ops": [0]}
+      ]
+    },
+    {
+      "name": "pipeline_plan_apply_conflict",
+      "steps": [
+        {"do": "pipeline", "as": "p0"},
+        {"do": "pipeline", "base": "p0", "add": [["conf_a", "Bypass"], ["conf_b", "Sink"]],
+         "chain": ["conf_a", "conf_b"], "plan": true, "want_changes": 3,
+         "at_generation_of": "p0", "as": "p1"},
+        {"do": "pipeline", "base": "p1", "remove": ["conf_a", "conf_b"], "want_changes": 3,
+         "at_generation_of": "p0", "want_error": "pipeline_conflict"},
+        {"do": "pipeline", "base": "p1", "remove": ["conf_a", "conf_b"],
+         "at_generation_of": "p1", "as": "p2"},
+        {"do": "pipeline", "base": "p2", "add": [["conf_c", "NoSuchClass"]],
+         "want_error": "invalid_request"}
+      ]
+    }
+  ]
+}
