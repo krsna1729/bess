@@ -20,6 +20,7 @@ the package never claims less than bessd needs.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -124,13 +125,22 @@ def build_deb(stage: Path, name: str, version: str, depends: list[str], descript
     return path
 
 
+def build_option(build: str, name: str) -> str:
+    """A configured build's option (e.g. libdir: lib/x86_64-linux-gnu on Debian)."""
+    options = json.loads(subprocess.run(['meson', 'introspect', '--buildoptions', build],
+                                        check=True, capture_output=True, text=True).stdout)
+    return next(o['value'] for o in options if o['name'] == name)
+
+
 def deb(args) -> list[Path]:
     out = Path(args.out)
     version = deb_version(args.version)
     with tempfile.TemporaryDirectory() as tmp:
         stage = Path(tmp) / 'stage'
         run(['meson', 'install', '-C', args.build, '--destdir', stage, '--quiet'])
-        prefix = 'usr/local'
+        prefix = build_option(args.build, 'prefix').strip('/')
+        libdir = build_option(args.build, 'libdir').strip('/')
+        lib = libdir if libdir.startswith(prefix + '/') else f'{prefix}/{libdir}'
         bessd = stage / prefix / 'bin' / 'bessd'
         runtime_deps = owning_packages(bessd) + ['python3']
         made = [
@@ -144,9 +154,9 @@ def deb(args) -> list[Path]:
                                                    'libgflags-dev', 'libprotobuf-dev',
                                                    'libpcap-dev'],
                       'BESS plugin and module development headers (bess-dev.pc)', out,
-                      [f'{prefix}/include/bess', f'{prefix}/lib/pkgconfig/bess-dev.pc',
-                       f'{prefix}/lib/pkgconfig/bess-dev-static.pc',
-                       *(f'{prefix}/lib/bess/libbess_{name}.a'
+                      [f'{prefix}/include/bess', f'{lib}/pkgconfig/bess-dev.pc',
+                       f'{lib}/pkgconfig/bess-dev-static.pc',
+                       *(f'{lib}/bess/libbess_{name}.a'
                          for name in ('route', 'dataplane_core', 'eal', 'rcu', 'utils'))]),
         ]
     return made

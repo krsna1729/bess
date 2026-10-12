@@ -313,9 +313,10 @@ TEST(PacketPoolTest, BulkAllocationInitializesFreshNativeState) {
     EXPECT_EQ(pkt->port, RTE_MBUF_PORT_INVALID);
     EXPECT_EQ(pkt->ol_flags, 0u);
     EXPECT_EQ(pkt->packet_type, 0u);
-    EXPECT_EQ(pkt->tx_offload, 0u);
+    // tx_offload and vlan_tci_outer are not reset on reuse (D-097): with
+    // ol_flags clear they mean nothing, and the TX finalization that sets
+    // offload flags writes tx_offload whole (PacketTxChecksumTest).
     EXPECT_EQ(pkt->vlan_tci, 0);
-    EXPECT_EQ(pkt->vlan_tci_outer, 0);
     EXPECT_EQ(rte_mbuf_refcnt_read(pkt), 1);
     EXPECT_EQ(pkt->nb_segs, 1);
     EXPECT_EQ(pkt->next, nullptr);
@@ -340,16 +341,20 @@ TEST(PacketOwnershipTest, BulkFreeFallsBackForMixedPools) {
   EXPECT_EQ(second_pool.Size(), 4);
 }
 
-TEST(PacketOwnershipTest, BulkFreeFallsBackForNullElement) {
+// A null in a batch is a bug upstream: a debug build stops at it (D-097); a
+// release build does not pay a check per packet for it.
+#ifndef NDEBUG
+TEST(PacketOwnershipDeathTest, BulkFreeOfANullElementIsABug) {
   bess::PlainPacketPool pool(4);
   bess::PacketHandle pkts[3] = {pool.Alloc(), nullptr, pool.Alloc()};
   ASSERT_NE(pkts[0], nullptr);
   ASSERT_NE(pkts[2], nullptr);
-
   EXPECT_FALSE(bess::detail::PacketFreeBulkRawEligible(pkts, 3));
-  bess::PacketFreeBulk(pkts, 3);
-  EXPECT_EQ(pool.Size(), pool.Capacity());
+  EXPECT_DEATH(bess::PacketFreeBulk(pkts, 3), "null packet");
+  bess::PacketFree(pkts[0]);
+  bess::PacketFree(pkts[2]);
 }
+#endif
 
 TEST(PacketOwnershipTest, BulkFreeFallsBackForMultisegmentPackets) {
   bess::PlainPacketPool pool(8);

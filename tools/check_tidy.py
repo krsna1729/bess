@@ -106,6 +106,30 @@ def to_json(counts, major):
         "files": files}
 
 
+def locations(output, build_dir, keys):
+    """clang-tidy's own lines (with the notes that follow them) for the
+    findings of (file, check) `keys`: where a new finding is, in the log."""
+    lines = output.splitlines()
+    shown, out = set(), []
+    for i, line in enumerate(lines):
+        m = WARNING.match(line.strip())
+        if not m:
+            continue
+        rel = os.path.relpath(os.path.normpath(os.path.join(build_dir, m.group("file"))), ROOT)
+        if not any((rel, c) in keys for c in m.group("checks").split(",")):
+            continue
+        where = (rel, m.group("line"), m.group("col"), m.group("checks"))
+        if where in shown:
+            continue
+        shown.add(where)
+        out.append(line)
+        for follow in lines[i + 1:i + 40]:  # the path notes, up to the next finding
+            if WARNING.match(follow.strip()):
+                break
+            out.append(follow)
+    return out
+
+
 def compare(current, baseline):
     problems = []
     keys = set(current) | set(baseline)
@@ -193,6 +217,10 @@ def main():
     if problems:
         print(f"FAILED: clang-tidy findings differ from {BASELINE.name} ({len(problems)} problem(s)):")
         print("\n".join(problems))
+        grown = {k for k in counts if counts[k] > baseline.get(k, 0)}
+        if grown:
+            print("Where (clang-tidy's report of every finding of those file/check pairs):")
+            print("\n".join(locations(output, Path(args.build_dir).resolve(), grown)))
         print(f"Current counts (clang-tidy {major}), in the baseline's format, for review:")
         print(json.dumps(to_json(counts, major), indent=2))
         return 1

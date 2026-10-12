@@ -519,6 +519,29 @@ TEST(PacketTxChecksumTest, EmptyProfileLeavesPacketAndMetadataUntouched) {
   PacketFree(packet);
 }
 
+// Allocation does not reset tx_offload (D-097): a recycled mbuf's stale
+// lengths and segment size must not reach the device. The commit that sets
+// offload flags writes tx_offload whole.
+TEST(PacketTxChecksumTest, HardwareOffloadWritesTxOffloadWhole) {
+  PlainPacketPool pool(8);
+  PacketHandle packet = Build(pool, kIpv4Udp);
+  ASSERT_NE(packet, nullptr);
+  packet->tx_offload = ~uint64_t{0};  // what a previous user left
+  TxOffloadCapabilities capabilities{};
+  capabilities.checksums.ipv4_header = true;
+  capabilities.checksums.udp = true;
+  const auto bound = BindTxFinalizationProfile(V4Profile(V4UdpPlan(true)), capabilities);
+  ASSERT_TRUE(bound.has_value());
+  ASSERT_TRUE(FinalizeTxPacket(packet, *bound).has_value());
+  EXPECT_NE(packet->ol_flags & RTE_MBUF_F_TX_IP_CKSUM, 0u);
+  EXPECT_EQ(packet->l2_len, 0);  // the plan's network offset: a bare IP packet
+  EXPECT_EQ(packet->l3_len, 20);
+  EXPECT_EQ(packet->tso_segsz, 0);
+  EXPECT_EQ(packet->outer_l2_len, 0);
+  EXPECT_EQ(packet->outer_l3_len, 0);
+  PacketFree(packet);
+}
+
 TEST(PacketTxChecksumTest, RejectsPreexistingSegmentationIntent) {
   PlainPacketPool pool(8);
   PacketHandle packet = Build(pool, kIpv4Udp);

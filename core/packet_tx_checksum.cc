@@ -631,6 +631,9 @@ void CommitMetadataAndSeeds(PacketHandle packet,
         static_cast<uint16_t>(write.offset));
     std::memcpy(destination, write.bytes.data(), write.bytes.size());
   }
+  // tx_offload whole first: a recycled or received mbuf may carry stale
+  // lengths, and allocation no longer clears them (D-097).
+  packet->tx_offload = 0;
   if (metadata.set_main_lengths) {
     packet->l2_len = metadata.l2_len;
     packet->l3_len = metadata.l3_len;

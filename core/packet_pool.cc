@@ -168,7 +168,11 @@ bool PacketPool::AllocBulk(PacketHandle *pkts, size_t count, size_t len) {
   }
 
   // Decision D-034 (docs/decisions.md): two 16-byte metadata stores per
-  // packet, plus clears of tx_offload and vlan_tci_outer. The layout
+  // packet. tx_offload and vlan_tci_outer are not cleared here (D-097): they
+  // matter only with transmit-offload flags set, and the one place that sets
+  // those (CommitMetadataAndSeeds, packet_tx_checksum.cc) writes tx_offload
+  // whole; nothing sets RTE_MBUF_F_TX_QINQ. A received mbuf never came
+  // through here anyway. The layout
   // assertions above protect these stores against DPDK mbuf ABI changes; the
   // patterns are little-endian words. Each 16-byte memcpy compiles to one
   // vector store where the target has them (x86 SSE2, arm64).
@@ -192,8 +196,6 @@ bool PacketPool::AllocBulk(PacketHandle *pkts, size_t count, size_t len) {
     std::memcpy(mbuf + offsetof(rte_mbuf, rearm_data), rearm, sizeof(rearm));
     std::memcpy(mbuf + offsetof(rte_mbuf, rx_descriptor_fields1), rxdesc,
                 sizeof(rxdesc));
-    pkts[i]->tx_offload = 0;
-    pkts[i]->vlan_tci_outer = 0;
   }
   return true;
 }
