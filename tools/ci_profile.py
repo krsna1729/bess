@@ -56,7 +56,7 @@ PINS = {
     'gcc': ('gcc-14', 'g++-14'),
     'clang': ('clang-19', 'clang++-19'),
 }
-LANE_SUFFIXES = ('-arm64', '-generic', '-asan', '-tsan')
+LANE_SUFFIXES = ('-arm64', '-generic', '-asan', '-tsan', '-release')
 # Sanitizer lanes (M22, D-072): --sanitize picks the build and the test step.
 SANITIZERS = {'address': '-asan', 'thread': '-tsan'}
 # TSan needs DPDK's C11 atomics and no x86 inline asm in the headers BESS
@@ -100,6 +100,13 @@ LANES = [
      'lane_args': '--sanitize address', 'experimental': True},
     {'name': 'clang-tsan', 'os': 'ubuntu-24.04', 'cc': 'clang-19', 'cxx': 'clang++-19',
      'lane_args': '--sanitize thread'},
+    # Release semantics: the tests and benchmarks built as a release ships
+    # (-O3, NDEBUG: no assert(), no _GLIBCXX_ASSERTIONS, flow-owner checks
+    # off; meson.build), so a test that passes only because a check stops it,
+    # or code that misbehaves only at -O3, shows before a release. Separate
+    # from packaging (`release`, no tests).
+    {'name': 'gcc-release', 'os': 'ubuntu-24.04', 'cc': 'gcc-14', 'cxx': 'g++-14',
+     'lane_args': '--release-semantics', 'experimental': True, 'push_only': True},
     {'name': 'gcc-u26', 'os': 'ubuntu-26.04', 'cc': 'gcc-15', 'cxx': 'g++-15',
      'experimental': True, 'push_only': True},
     {'name': 'clang-u26', 'os': 'ubuntu-26.04', 'cc': 'clang-22', 'cxx': 'clang++-22',
@@ -144,7 +151,8 @@ def meson_options(s):
     options = [
         f'-Dcpu={s.cpu}',
         '-Daf_xdp=required',
-        '-Dbuildtype=debugoptimized',
+        # release: -O3 and b_ndebug=if-release (NDEBUG), as shipped.
+        '-Dbuildtype=release' if s.release_semantics else '-Dbuildtype=debugoptimized',
         '-Dbuild_sample_plugin=true',
         # build_benchmarks stays at its default (true): CI compiles the
         # benchmarks, so every other build of this profile must as well.
@@ -179,7 +187,10 @@ class Setup:
                              '--dry-run and info can show another architecture')
         self.cpu = cpu_floor(self.arch)
         self.arch_generic = args.arch_generic
+        self.release_semantics = args.release_semantics
         self.sanitize = args.sanitize
+        if self.release_semantics and self.sanitize:
+            raise SystemExit('--release-semantics and --sanitize are separate lanes')
         family = args.compiler
         if args.cc or args.cxx:
             if not (args.cc and args.cxx and args.name):
@@ -201,6 +212,7 @@ class Setup:
                     'A diagnostic that exists in only one compiler version can '
                     'still differ from CI.')
             self.name = args.name or (f'ci-{family}' + ('-generic' if self.arch_generic else '')
+                                      + ('-release' if self.release_semantics else '')
                                       + SANITIZERS.get(self.sanitize, ''))
         self.build_dir = ROOT / 'build' / self.name
         self.stage = ROOT / 'build' / f'stage-{self.name}'
@@ -680,6 +692,7 @@ def info(s):
     print(f'                {s.cc}: {s.version(s.cc)}')
     print(f'architecture    {s.arch}, cpu floor {s.cpu}'
           + (', BESS_ARCH_GENERIC' if s.arch_generic else '')
+          + (', release semantics (-O3, NDEBUG)' if s.release_semantics else '')
           + (f', sanitizer {s.sanitize}' if s.sanitize else ''))
     print(f'build dir       {s.build_dir}')
     print(f'DPDK            profile {DPDK_PROFILE}, cpu {s.cpu}, variant {s.variant}')
@@ -772,6 +785,9 @@ def main():
                         help='show another architecture (only with --dry-run or info)')
     parser.add_argument('--arch-generic', action='store_true',
                         help='configure -Darch_generic=true (the gcc-generic lane)')
+    parser.add_argument('--release-semantics', action='store_true',
+                        help='build and test as a release ships: -Dbuildtype=release '
+                        '(-O3, NDEBUG; the gcc-release lane)')
     parser.add_argument('--sanitize', choices=sorted(SANITIZERS),
                         help='a sanitizer lane: address (ASan+UBSan) or thread (TSan)')
     parser.add_argument('--jobs', type=int)

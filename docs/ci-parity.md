@@ -60,6 +60,13 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   third architecture runs, and everything (benchmarks too) builds and tests
   against them. All three are experimental (cannot block a merge) until they
   have been green; `check-pins` already holds them to the gating pins.
+- **Release semantics.** `gcc-release` (`--release-semantics`) builds and
+  tests with `-Dbuildtype=release`, as a release ships: `-O3`, NDEBUG (no
+  `assert()`, no `_GLIBCXX_ASSERTIONS`, `BESS_FLOW_OWNER_CHECKS=0`). The
+  gating lanes test `debugoptimized` with every check on; this lane shows a
+  test that passes only because a check stops it, or code that breaks only at
+  `-O3`. It is not packaging (the `release` step builds the artifacts, without
+  tests). Push-only and experimental until it has been green.
 - **Which lanes gate.** `gcc`, `clang`, `clang-tsan` (TSan over
   `tools/sanitizers/tsan_tests.txt`), `gcc-arm64` and `clang-arm64` (green
   since d040ec6d), with `Protobuf compatibility`, are the required checks on
@@ -71,7 +78,8 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   the workflow's `Lanes` job turns it into the matrix
   (`ci_profile.py lanes --event <event>`). Pull requests run the gating pair
   (`gcc`, `clang`) and the sanitizer lanes; pushes to `develop`/`master` and
-  tags run every lane, adding arm64, generic and ubuntu-26.04 (`push_only`).
+  tags run every lane, adding arm64, generic, release-semantics and
+  ubuntu-26.04 (`push_only`).
   A break those lanes catch shows up on the push and is fixed forward. A new
   push cancels the older run it supersedes: per pull request, per branch
   for pushes to `develop` and `master` (the tip's run covers every merged
