@@ -762,7 +762,8 @@ std::string ResolveCommandArgType(const DescriptorPool &pool, const std::string 
   }
   packages.emplace_back("bess.pb");
   for (const std::string &package : packages) {
-    std::string full = package + "." + declared;
+    std::string full = package;
+    full.append(".").append(declared);
     if (pool.FindMessageTypeByName(full) != nullptr) {
       return full;
     }

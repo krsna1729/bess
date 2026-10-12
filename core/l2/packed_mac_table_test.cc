@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <random>
 #include <thread>
 #include <unordered_map>
@@ -120,6 +121,33 @@ TYPED_TEST(PackedMacTableTest, FillsToCapacity) {
     }
     EXPECT_EQ(t->Insert(Key(rng()), 1, 0), Table::kNotFound) << "past capacity";
   }
+}
+
+// MACs that differ only in their last byte (a vendor's sequential range, the
+// common case) spread over bucket pairs as random ones do. MakeKey copies the
+// MAC little-endian, so that byte is the key word's top byte (bits 40..47 of
+// the 48-bit integer here). A hash that multiplied the word, not the MAC,
+// left the primary bucket one linear function of that byte: under about 1
+// seed in 250, 9-11 of 24 such MACs shared one bucket pair (8 slots), and a
+// small table refused them below capacity.
+TEST(PackedMacTableHashTest, SequentialMacsNeverOverloadABucketPair) {
+  using Table = PackedMacTable<uint32_t, OwnerWrites>;
+  constexpr uint64_t kMacs = 24;
+  size_t overloaded = 0;
+  for (uint64_t seed = 1; seed <= 4000; seed++) {
+    auto t = Table::Create(16, seed * 0x9E3779B97F4A7C15ull);  // 8 buckets
+    ASSERT_NE(t, nullptr);
+    std::map<std::pair<size_t, size_t>, size_t> pairs;
+    for (uint64_t i = 0; i < kMacs; i++) {
+      const uint64_t key = Key(i << 40 | 0x02);
+      const size_t a = t->PrimaryBucketForTesting(key), b = t->AltBucketForTesting(key);
+      pairs[{std::min(a, b), std::max(a, b)}]++;
+    }
+    for (const auto &[pair, keys] : pairs) {
+      overloaded += keys > 2 * Table::kWays;
+    }
+  }
+  EXPECT_EQ(overloaded, 0u);
 }
 
 TYPED_TEST(PackedMacTableTest, KeysWithADomainNeverMatch) {

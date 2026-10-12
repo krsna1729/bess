@@ -6648,9 +6648,13 @@ the module as C++ types. No table offered both lock-free readers on many workers
   `Create` and the setters refuse what it cannot hold.
 - **`PackedMacTable<Cold, Sync>`**, the one MAC table for shared readers: l2_table's one-word slot (MAC 48 bits, value
   14, a flag, occupied) with 4-way 32-byte buckets, 50% load and breadth-first move search. One
-  bridge domain per table. The hash is CRC32C of the key times a random odd per-table multiplier, spread by a
+  bridge domain per table. The hash is CRC32C of the 48-bit MAC times a random odd per-table multiplier, spread by a
   64-bit odd constant: a CRC is linear, so a seed in its initial value would leave the same MACs colliding; the
-  multiply is not, so the colliding sets depend on a secret (review round 3). Readers on any thread see a slot whole; a move writes its destination before clearing its
+  multiply is not, so the colliding sets depend on a secret (review round 3). The MAC, not the key word (amended
+  2026-10-12): the word holds the MAC's last bytes in its top bits, where a product cannot carry their differences
+  down, so sequential MACs put up to 11 of 24 keys on one bucket pair under about 1 seed in 250 and small tables
+  refused them below capacity (`SequentialMacsNeverOverloadABucketPair`; `Fdb::Config::hash_seed` fixes the seed
+  only for reproducible tests). Readers on any thread see a slot whole; a move writes its destination before clearing its
   source; a move path is bracketed by an odd sequence number that a reader re-checks only on a miss, so a hit costs
   no more than l2_table's and a key present throughout is never missed (l2_table's one-step move could not move an
   entry back into its primary and so needed no sequence; this table's search can). A reader retries at most

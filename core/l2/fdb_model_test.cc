@@ -99,6 +99,10 @@ class FdbModel {
     c.granularity_shift = cfg.shift;
     c.max_domains = cfg.max_domains;
     c.start = cfg.start;
+    // Reproducible placement: a small table's refusals below capacity (no
+    // free slot from a key's buckets) depend on its hash; a fixed seed makes
+    // a run the same every time, and the model expects none.
+    c.hash_seed = cfg.seed * 0x9E3779B97F4A7C15ull;
     auto made = Fdb::Create(c);
     EXPECT_TRUE(made.has_value());
     fdb_ = std::move(*made);

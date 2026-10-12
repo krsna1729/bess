@@ -140,7 +140,10 @@ class PackedMacTable {
     }
   }
 
-  static std::unique_ptr<PackedMacTable> Create(size_t capacity) {
+  // `seed`: the hash's secret multiplier; 0 picks an unpredictable one (the
+  // default). A fixed seed makes placement, and so which keys a small table
+  // refuses below capacity, reproducible (tests).
+  static std::unique_ptr<PackedMacTable> Create(size_t capacity, uint64_t seed = 0) {
     if (capacity == 0 || capacity > (size_t{1} << 28)) {
       return nullptr;
     }
@@ -149,7 +152,7 @@ class PackedMacTable {
       buckets <<= 1;
     }
     std::unique_ptr<PackedMacTable> t(
-        new (std::nothrow) PackedMacTable(capacity, buckets, NewSeed()));
+        new (std::nothrow) PackedMacTable(capacity, buckets, (seed != 0 ? seed : NewSeed()) | 1));
     if (t == nullptr) {
       return nullptr;
     }
@@ -353,7 +356,7 @@ class PackedMacTable {
 
   // Unpredictable without failing: random_device may throw where the system
   // has no entropy source; the clock is the fallback.
-  // A random odd 64-bit multiplier (odd: a bijection of the key).
+  // A random 64-bit multiplier (Create makes it odd: a bijection of the MAC).
   static uint64_t NewSeed() noexcept {
     uint64_t seed;
     try {
@@ -363,7 +366,7 @@ class PackedMacTable {
       seed = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) *
              0xBF58476D1CE4E5B9ull;
     }
-    return seed | 1;
+    return seed;
   }
 
   static uint64_t Mac(uint64_t key) noexcept { return key >> 16; }
@@ -388,11 +391,16 @@ class PackedMacTable {
   // buckets, and a CRC is linear: such sets are easy to build, and a table
   // learning from untrusted senders (the Bridge) could be denied chosen MACs.
   // A seed in the CRC's initial value would not help (linearity keeps the
-  // same keys colliding under every initial value); the key is first
+  // same keys colliding under every initial value); the MAC is first
   // multiplied by a random odd per-table constant, which is not linear, so
-  // which MACs collide depends on a secret (review, 2026-10-04).
+  // which MACs collide depends on a secret (review, 2026-10-04). The MAC, not
+  // the key word: the word holds the MAC's last bytes in its top bits, where a
+  // product cannot carry their differences down, so MACs differing only there
+  // (sequential ones) reached the CRC as one varying byte and their buckets
+  // were a fixed linear function of it (overloading small tables below
+  // capacity, review 2026-10-12).
   uint64_t Hash(uint64_t key) const noexcept {
-    return uint64_t{arch::Crc32c(key * seed_, 0)} * 0x9E3779B97F4A7C15ull;
+    return uint64_t{arch::Crc32c((key >> 16) * seed_, 0)} * 0x9E3779B97F4A7C15ull;
   }
   // The alternate bucket; an involution (Alt(Alt(b)) == b), so a resident
   // entry's other bucket follows from its key and its present bucket.

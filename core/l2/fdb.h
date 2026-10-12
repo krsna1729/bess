@@ -150,6 +150,9 @@ class BasicFdb {
     unsigned granularity_shift = 20;  // wheel granularity: 2^shift ticks
     size_t max_domains = 4096;   // domain ids 0..max_domains-1
     Tick start = 0;
+    // A table with a secret hash (PackedMacTable): its seed, 0 for an
+    // unpredictable one. Fixed only to reproduce placement (tests).
+    uint64_t hash_seed = 0;
   };
 
   enum class CreateError : uint8_t { kInvalidConfig, kOutOfMemory };
@@ -169,7 +172,13 @@ class BasicFdb {
                                  ? CreateError::kOutOfMemory
                                  : CreateError::kInvalidConfig);
     }
-    auto table = Table::Create(config.capacity);
+    auto table = [&] {
+      if constexpr (requires { Table::Create(config.capacity, config.hash_seed); }) {
+        return Table::Create(config.capacity, config.hash_seed);
+      } else {
+        return Table::Create(config.capacity);
+      }
+    }();
     if (table == nullptr) {
       return std::unexpected(CreateError::kOutOfMemory);
     }
