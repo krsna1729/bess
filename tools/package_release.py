@@ -8,13 +8,14 @@
 `tarball`: bessd, bessctl, dpdk-devbind.py, the Python client and the docs, as
 the release job always shipped them.
 
-`deb` (on Debian or Ubuntu): two packages from `meson install` of BUILD --
-`bess` (bessd, the Python client and protobuf schema, the build metadata and
-the SPDX SBOM) and `bess-dev` (the headers and bess-dev.pc plugins build
-against, and the experimental route, dataplane and RCU archives with
-bess-dev-static.pc, D-095). `bess` depends on the packages that own every shared library bessd
-loads (`ldd`, then `dpkg -S`): a library no package owns stops the build, so
-the package never claims less than bessd needs.
+`deb` (on Debian or Ubuntu): three packages from `meson install` of BUILD --
+`bess` (bessd, the C++ bessctl, the Python client and protobuf schema, the
+build metadata and the SPDX SBOM), `bess-dev` (the headers and bess-dev.pc
+plugins build against, and the experimental route, dataplane and RCU archives
+with bess-dev-static.pc, D-095) and `bess-sdk` (the C++ control SDK). `bess`
+depends on the packages that own every shared library bessd and bessctl load
+(`ldd`, then `dpkg -S`): a library no package owns stops the build, so the
+package never claims less than they need.
 """
 
 from __future__ import annotations
@@ -142,11 +143,14 @@ def deb(args) -> list[Path]:
         libdir = build_option(args.build, 'libdir').strip('/')
         lib = libdir if libdir.startswith(prefix + '/') else f'{prefix}/{libdir}'
         bessd = stage / prefix / 'bin' / 'bessd'
-        runtime_deps = owning_packages(bessd) + ['python3']
+        bessctl = stage / prefix / 'bin' / 'bessctl'  # the C++ one (G1.7)
+        runtime_deps = sorted(set(owning_packages(bessd) + owning_packages(bessctl))) + ['python3']
         made = [
             build_deb(stage, 'bess', version, runtime_deps,
-                      'BESS daemon (bessd), its Python client and schema, build metadata and SBOM',
-                      out, [f'{prefix}/bin/bessd', f'{prefix}/share/bess', f'{prefix}/share/doc/bess']),
+                      'BESS daemon (bessd), bessctl, the Python client and schema, build metadata '
+                      'and SBOM',
+                      out, [f'{prefix}/bin/bessd', f'{prefix}/bin/bessctl', f'{prefix}/share/bess',
+                            f'{prefix}/share/doc/bess']),
             # What bess-dev.pc and bess-dev-static.pc require (glog, gflags,
             # protobuf, libpcap) as packages, so pkg-config resolves on a host
             # that has only these packages.

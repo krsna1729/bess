@@ -363,7 +363,7 @@ message GetCapabilitiesResponse {
   uint64 daemon_epoch = 9;
 }
 
-// -- Schema discovery (D-104) ---------------------------------------------
+// -- Schema discovery (D-105) ---------------------------------------------
 //
 // What a generic client (bessctl, a manifest tool, a UI) needs to read and
 // write module, driver and resource arguments without generated code: each
@@ -372,7 +372,9 @@ message GetCapabilitiesResponse {
 // resources' key and value types). Plugins' types are included once loaded.
 // Type names are full protobuf names ("bess.pb.ExactMatchArg"); "" where the
 // class did not declare one (a class registered without DEF_MODULE /
-// ADD_DRIVER), or where a command's declared type is not a known message.
+// ADD_DRIVER), or where a command's declared type does not resolve: it is
+// tried as a full name, then in the package of its class's init type, then in
+// bess.pb (docs/plugin-api.md).
 
 message GetSchemaRequest {}
 

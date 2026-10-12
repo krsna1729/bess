@@ -7978,10 +7978,13 @@ parameter type only inside a lambda, and pybess guessed `<Class>Arg` by conventi
   (D-041), so the changed symbol needs no ABI shim.
 - A command keeps its hand-written `arg_type`. The daemon resolves it as a full name, then in the init type's
   package, then in `bess.pb`. A unit test requires every built-in command, class and driver to name a real message,
-  so a typo fails the build instead of leaving a command unusable to generic clients.
+  so a typo fails that test instead of leaving a command unusable to generic clients. A plugin whose `Init` takes
+  `EmptyArg` and whose commands take its own package's messages must declare those by full name
+  (`docs/plugin-api.md`): the daemon does not know which package a plugin's files use.
 - `GetSchema` returns module classes (help, init type, gates, commands with type and thread safety), port drivers,
   and one `FileDescriptorSet`: the files of every type it names and of transaction resources' keys and values, with
-  their imports, each after what it imports, with JSON names. The same unit test builds it into an empty pool.
+  their imports, each after what it imports, with JSON names. The same unit test builds it into an empty pool and
+  checks that a resource's types reach it from a file nothing else names.
 - The SDKs expose it as `Client::Schema` (C++) and `Client.Schema` (Go), uncached because plugins change it. Both
   live tests now build their messages from it instead of a `protoc` descriptor set.
 

@@ -102,6 +102,32 @@ type from `Init`'s parameter; a command's hand-written `arg_type` resolves in
 the init type's package, then `bess.pb` (`""` if neither names a message; a
 unit test holds every built-in command to a real type).
 
+## bessctl (C++, G1.7)
+
+`build/bessctl/bessctl` (installed as `bin/bessctl`, in the `bess` .deb) is
+built on the C++ SDK alone. Pipelines are manifests: a control_v2 `Pipeline` in
+protobuf JSON, field names as in `control_v2.proto`. A module's or port's `arg`
+may leave out `"@type"`; bessctl takes it from `GetSchema` (the class's or
+driver's init type), and `bessctl get` leaves it out where it is that type, so
+what `get` prints, `apply` reads back. Numbers are passed through as written:
+64-bit values are not rounded.
+
+```sh
+bessctl schema ExactMatch         # init type, gates, commands and their types
+bessctl validate pipeline.json    # the daemon's canonical form
+bessctl diff pipeline.json        # what would change
+bessctl plan pipeline.json        # the steps, by phase
+bessctl apply pipeline.json [--generation N]
+bessctl get > pipeline.json       # the active pipeline as a manifest
+bessctl status | resources | metrics | events [--from SEQ] [TYPE...]
+```
+
+A manifest is the whole desired state: workers and traffic classes included
+(start from `bessctl get`). The daemon validates; bessctl only converts. Not
+yet: YAML, bootstrap transactions in the manifest, the legacy commands (daemon
+start/stop, `.bess` files, interactive shell); the Python bessctl remains for
+those until D-104's last step.
+
 ## What they guarantee
 
 | Situation | What the SDK does |

@@ -24,6 +24,10 @@
 #include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
+#include "dataplane/resource.h"
+#include "dataplane/transaction_engine.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
 
 namespace {
 
@@ -528,15 +532,41 @@ TEST_F(ApiV2ServiceTest, LegacyAddTcRangeChecksBeforeNarrowing) {
   EXPECT_TRUE(control_plane.AddTc(child).has_value());
 }
 
+// A resource whose key and value types no class or command names (control_v2's
+// own messages: nothing else in the schema imports control_v2.proto).
+class SchemaOnlyResource final : public bess::dataplane::Resource {
+ public:
+  SchemaOnlyResource() : Resource("schema_only/r") {}
+  bool Contains(const bess::dataplane::ResourceKey &) const override { return false; }
+  std::expected<Reservation, std::string> Reserve(const bess::dataplane::Op &) override {
+    return std::unexpected("unused");
+  }
+  size_t LiveCount() const override { return 0; }
+};
+
 // Schema discovery is what a generic client (bessctl, a manifest, a UI)
 // writes arguments from. Every class and driver names its init type, every
 // command's hand-written type name resolves to a message (a typo would leave
 // that command unusable to such a client), and the descriptor set builds on
 // its own, in its order, into an empty pool.
 TEST_F(ApiV2ServiceTest, SchemaNamesEveryArgumentTypeAndCarriesItsDescriptors) {
+  SchemaOnlyResource resource;
+  bess::dataplane::TransactionEngine &engine = bess::runtime::runtime().transactions();
+  ASSERT_TRUE(engine.registry().Register(&resource));
+  bess::framework::ResourceBinding binding = bess::framework::ResourceBindings::ProcessDefault().Bind(
+      resource, std::make_shared<bess::framework::TypedCodec<v2::Worker, v2::Connection>>(
+                    [](const v2::Worker &) -> std::expected<bess::dataplane::ResourceKey, std::string> {
+                      return std::unexpected("unused");
+                    },
+                    [](const v2::Connection &) -> std::expected<std::any, std::string> {
+                      return std::unexpected("unused");
+                    }));
   grpc::ClientContext ctx;
   v2::GetSchemaResponse resp;
-  ASSERT_TRUE(stub_->GetSchema(&ctx, v2::GetSchemaRequest(), &resp).ok());
+  const grpc::Status status = stub_->GetSchema(&ctx, v2::GetSchemaRequest(), &resp);
+  binding.Reset();
+  ASSERT_TRUE(engine.registry().Unregister("schema_only/r"));
+  ASSERT_TRUE(status.ok());
   ASSERT_GT(resp.module_classes_size(), 0);
   ASSERT_GT(resp.port_drivers_size(), 0);
 
@@ -560,6 +590,9 @@ TEST_F(ApiV2ServiceTest, SchemaNamesEveryArgumentTypeAndCarriesItsDescriptors) {
     EXPECT_NE(nullptr, pool.FindMessageTypeByName(d.init_arg_type()))
         << d.name() << " init '" << d.init_arg_type() << "'";
   }
+  // The resource's types, from a file nothing else above brings in.
+  EXPECT_NE(nullptr, pool.FindMessageTypeByName("bess.pb.v2.Worker"));
+  EXPECT_NE(nullptr, pool.FindMessageTypeByName("bess.pb.v2.Connection"));
 
   ASSERT_NE(nullptr, exact_match);
   EXPECT_EQ("bess.pb.ExactMatchArg", exact_match->init_arg_type());

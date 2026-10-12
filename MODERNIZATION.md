@@ -8742,18 +8742,27 @@ consumer-driven (D-008, §31.3 item 2).
   uses it yet; `VISIBILITY_ATOMIC` is deprecated and never sent.
 - **Other G1.2 follow-ons:** the live Mpps benchmark (D-027) covers unary
   ExactMatch rule churn, not the full ActionTable→Meter→Router chain.
-  Full-chain failure injection under traffic, `ReplaceScope`, production
-  streaming/bulk RPC and the C++ SDK remain pending. The streaming proto in
+  Full-chain failure injection under traffic, `ReplaceScope` and production
+  streaming/bulk RPC remain pending. The streaming proto in
   `protobuf/tests/ingress_bench.proto` is benchmark-only.
-- **G1.3 — `GetSystem` / `GetCapabilities`: PENDING.**
+- **G1.3 — `GetSystem` / `GetCapabilities`: PARTIAL.** `GetCapabilities` (version,
+  RPCs, plugin API, classes, plugins, ports, resources) and `GetSchema` (every
+  init and command argument type with its descriptors, D-105) are served;
+  `GetSystem` is not.
 - **G1.4 — resource stats and events: PENDING.** Existing port/traffic-class
   stats are not per-resource transaction lifecycle stats.
 - **G1.5 — Go SDK: DONE** (`sdk/go`, live suite `control_sdk_go`); it is the SDK
   for external controllers such as the UPF (D-104).
-- **G1.6 — C++ SDK: PENDING.** An installed library and headers, separate from
-  bessd's internals; one conformance suite runs live against both SDKs (D-104).
-- **G1.7 — C++ `bessctl` on the public C++ SDK: PENDING** (D-104; replaces the
-  Python bessctl, which is deleted last).
+- **G1.6 — C++ SDK: DONE** (`sdk/cpp`, `libbess-sdk` and the `bess-sdk` .deb, live
+  suite `control_sdk_cpp`; the Go SDK's contract, case for case). One conformance
+  suite run live against both SDKs is still PENDING (D-104).
+- **G1.7 — C++ `bessctl` on the public C++ SDK: PARTIAL** (D-104; replaces the
+  Python bessctl, which is deleted last). `bessctl/` builds `bin/bessctl` on
+  `libbess-sdk` alone: JSON manifests (`get`, `validate`, `diff`, `plan`,
+  `apply`), `schema`, `status`, `resources`, `metrics`, `events`; live suite
+  `bessctl_cpp`. Pending: YAML and bootstrap transactions in manifests, the
+  legacy commands (daemon start/stop, `.bess`, shell), a static baseline
+  `-march` build.
 
 The old imperative API should not constrain the ideal end state.
 

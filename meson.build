@@ -308,6 +308,7 @@ pkg.generate(
 
 subdir('protobuf')
 subdir('sdk/cpp')
+subdir('bessctl')
 subdir('pybess')
 subdir('core')
 
@@ -334,5 +335,8 @@ install_subdir(
   'bessctl',
   install_dir: bess_data_dir,
   exclude_directories: ['__pycache__'],
+  # The C++ bessctl's sources: its binary installs to bindir.
+  exclude_files: ['meson.build', 'json.h', 'json.cc', 'manifest.h', 'manifest.cc', 'main.cc',
+                  'manifest_test.cc'],
 )
 install_subdir('protobuf', install_dir: bess_data_dir)

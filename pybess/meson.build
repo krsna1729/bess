@@ -10,6 +10,7 @@ python_env = {
   'BESSD_BINARY': join_paths(meson.project_build_root(), 'core', 'bessd'),
   'BESS_SDK_CPP_LIVE_TEST': join_paths(meson.project_build_root(), 'sdk', 'cpp',
                                        'sdk_cpp_live_test'),
+  'BESSCTL_CPP': bessctl_exe.full_path(),
   'LD_LIBRARY_PATH': dpdk_libdir,
 }
 
@@ -32,7 +33,7 @@ test(
   'module_integration',
   python,
   args: [join_paths(meson.project_source_root(), 'bessctl', 'run_module_tests.py')],
-  depends: python_proto_targets + sdk_cpp_test_targets,
+  depends: python_proto_targets + sdk_cpp_test_targets + [bessctl_exe],
   env: integration_env,
   suite: 'integration',
   is_parallel: false,

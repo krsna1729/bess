@@ -421,6 +421,13 @@ def step_verify_install(s):
     plugins = list(s.stage.glob('**/bess/modules/libsequential_update.so'))
     if len(bessd) != 1 or len(plugins) != 1 or not os.access(bessd[0], os.X_OK):
         raise SystemExit(f'unexpected install: bessd={bessd} plugins={plugins}')
+    # The C++ bessctl, run from the stage (its SDK library beside it there).
+    bessctl = list(s.stage.glob('**/bin/bessctl'))
+    if len(bessctl) != 1:
+        raise SystemExit(f'unexpected install: bessctl={bessctl}')
+    sdk_libs = {str(p.parent) for p in s.stage.glob('**/libbess-sdk*')}
+    ctl_env = dict(env, LD_LIBRARY_PATH=os.pathsep.join([*sdk_libs, env.get('LD_LIBRARY_PATH', '')]))
+    s.run([bessctl[0], '--help'], env=ctl_env)
     s.run([sys.executable, ROOT / 'tools' / 'check_installed_pybess.py',
            '--root', s.stage / 'usr/local/share/bess'], env=env)
     # Release metadata (M26): the install says what it is made of.
