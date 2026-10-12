@@ -39,8 +39,11 @@ CommandResponse Source::Init(const bess::pb::SourceArg &arg) {
     pkt_size_.store(arg.pkt_size(), std::memory_order_relaxed);
   }
 
-  burst_.store(bess::PacketBatch::kMaxBurst, std::memory_order_relaxed);
-
+  if (arg.has_burst()) {
+    bess::pb::SourceCommandSetBurstArg burst;
+    burst.set_burst(arg.burst());
+    return CommandSetBurst(burst);
+  }
   return CommandSuccess();
 }
 

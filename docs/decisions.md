@@ -8189,3 +8189,25 @@ refused unchanged.
 **Code.** `protobuf/control_v2.proto`, `core/control/{pipeline_spec,pipeline_snapshot,pipeline_validator,
 pipeline_diff,pipeline_plan,transaction,control_plane,api_v2}.{h,cc}`, `core/worker.cc` (pauser depth), the SDK
 builders (`Task`/`task`, `Remove` drops placements), `bessctl/conf/samples/*.yaml`.
+
+## D-110 Desired state: settings at creation are init arguments; tables are resources
+
+**Decision.** A module's state reaches desired state in one of two ways, by what it is:
+- **Settings** a pipeline fixes when it builds the module are fields of its init argument: `ExactMatchArg.default_gate`,
+  `WildcardMatchArg.default_gate`, `SourceArg.burst` (all optional; absent keeps the old default). Init applies them
+  as the command would (`set_default_gate`, `set_burst`), so the packet path is unchanged; the commands stay, for a
+  change at run time. `get_initial_arg` reproduces a given default gate.
+- **Tables** (rules, routes, entries) are transaction resources (`<module>/<table>`), committed with the pipeline by
+  bessctl and the SDKs.
+
+**Why not single-value resources now.** ExactMatch and WildcardMatch keep the default gate inside the generation they
+publish; the rules resource publishes generations too, so a transactional default gate needs both to stage one
+generation per transaction. No sample or known controller changes a default gate while running; when one does, a
+single-value resource can be added without changing what a manifest says (the init field stays the initial value).
+
+**Evidence.** `modules_exact_match_test` and `modules_wildcard_match_test` (`DefaultGateAtCreation`: applied, echoed by
+`get_initial_arg`, an invalid gate refuses the module). Live: `exactmatch`, `packet_filter`, `wildcardmatch` and
+`port_ranges` as manifests give the same default gate and rules (`get_runtime_config`) as their `.bess` scripts did;
+a Source with burst 32 is created, 33 refused ("burst size must be [0,32]"). 33 of the 38 samples are manifests; left:
+`arp`, `iplookup`, `l2forward`, `vrf_routing` (their tables are not resources yet) and `tc/wfs_double` (a measurement
+script).

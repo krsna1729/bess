@@ -1,0 +1,125 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# WildcardMatch on (destination IP, destination port, in_port metadata)
+# with priorities; anything else goes to the default gate 5.
+#
+# Converted from wildcardmatch.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARYLQKAAABrBBkAQTSAFAAEsB1aGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARjVYKAAABrAw3YwTS1DEAEhk2aGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARjbYKAAABrAw3AwTSH5AAEs43aGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARYLQKAAABrBBkAQTSAVkAEr9saGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARjVYKAAABrAw3YwTSMDkAEr0uaGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARrqIKAAABwKgBewTSAFAAEg5kaGVsbG93b3JsZA=="
+  - name: rewrite1
+    mclass: Rewrite
+    arg:
+      templates:
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARYLQKAAABrBBkAQTSAFAAEsB1aGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARjVYKAAABrAw3YwTS1DEAEhk2aGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARjbYKAAABrAw3AwTSH5AAEs43aGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARYLQKAAABrBBkAQTSAVkAEr9saGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARjVYKAAABrAw3YwTSMDkAEr0uaGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARrqIKAAABwKgBewTSAFAAEg5kaGVsbG93b3JsZA=="
+  - name: setattr0
+    mclass: SetMetadata
+    arg:
+      attrs:
+        - name: in_port
+          size: "2"
+          value_int: "1"
+  - name: setattr1
+    mclass: SetMetadata
+    arg:
+      attrs:
+        - name: in_port
+          size: "2"
+          value_int: "2"
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: sink3
+    mclass: Sink
+  - name: sink4
+    mclass: Sink
+  - name: source0
+    mclass: Source
+  - name: source1
+    mclass: Source
+  - name: wm
+    mclass: WildcardMatch
+    arg:
+      default_gate: 5
+      fields:
+        - offset: 30
+          num_bytes: 4
+        - offset: 36
+          num_bytes: 2
+        - attr_name: in_port
+          num_bytes: 2
+connections:
+  - upstream: rewrite0
+    downstream: wm
+  - upstream: rewrite1
+    downstream: wm
+  - upstream: setattr0
+    downstream: rewrite0
+  - upstream: setattr1
+    downstream: rewrite1
+  - upstream: source0
+    downstream: setattr0
+  - upstream: source1
+    downstream: setattr1
+  - upstream: wm
+    downstream: sink0
+  - upstream: wm
+    ogate: 1
+    downstream: sink1
+  - upstream: wm
+    ogate: 2
+    downstream: sink2
+  - upstream: wm
+    ogate: 3
+    downstream: sink3
+  - upstream: wm
+    ogate: 5
+    downstream: sink4
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: source0
+    wid: 0
+  - module: source1
+    wid: 0
+resources:
+  wm/rules:
+    - key:
+        values: [{value_bin: rBBkAQ==}, {value_int: 80}, {value_int: 1}]
+        masks: [{value_bin: /////w==}, {value_int: 65535}, {value_int: 65535}]
+      value: {gate: 0, priority: 3}
+    - key:
+        values: [{value_bin: rAw3Yw==}, {value_int: 0}, {value_int: 2}]
+        masks: [{value_bin: /////w==}, {value_int: 0}, {value_int: 65535}]
+      value: {gate: 1, priority: 1}
+    - key:
+        values: [{value_bin: rAw3Aw==}, {value_int: 0}, {value_int: 1}]
+        masks: [{value_bin: /////w==}, {value_int: 0}, {value_int: 65535}]
+      value: {gate: 2, priority: 0}
+    - key:
+        values: [{value_bin: rAAAAA==}, {value_int: 0}, {value_int: 0}]
+        masks: [{value_bin: /wAAAA==}, {value_int: 64512}, {value_int: 0}]
+      value: {gate: 2, priority: 2}
+    - key:
+        values: [{value_bin: AAAAAA==}, {value_int: 80}, {value_int: 0}]
+        masks: [{value_bin: AAAAAA==}, {value_int: 65535}, {value_int: 0}]
+      value: {gate: 3, priority: 0}

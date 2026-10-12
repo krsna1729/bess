@@ -191,6 +191,30 @@ TEST_F(WildcardMatchTest, MaxTuplesSetsTheCeilingAndRoundTrips) {
   EXPECT_EQ(12u, out.max_tuples());
 }
 
+// The default gate may be given at creation; get_initial_arg reproduces it,
+// and an invalid one refuses the module.
+TEST_F(WildcardMatchTest, DefaultGateAtCreation) {
+  WildcardMatchArg arg = TwoByteField();
+  arg.set_default_gate(uint64_t{1} << 20);
+  EXPECT_EQ(nullptr, Create(arg)) << "an invalid gate";
+
+  arg.set_default_gate(kGateB);
+  WildcardMatch *m = Create(arg);
+  ASSERT_NE(nullptr, m);
+  bess::pb::EmptyArg empty;
+  CommandResponse config = Run(m, "get_runtime_config", Pack(empty));
+  ASSERT_EQ(0, config.error().code());
+  WildcardMatchConfig runtime;
+  ASSERT_TRUE(config.data().UnpackTo(&runtime));
+  EXPECT_EQ(kGateB, runtime.default_gate());
+  CommandResponse initial = Run(m, "get_initial_arg", Pack(empty));
+  ASSERT_EQ(0, initial.error().code());
+  WildcardMatchArg out;
+  ASSERT_TRUE(initial.data().UnpackTo(&out));
+  ASSERT_TRUE(out.has_default_gate());
+  EXPECT_EQ(kGateB, out.default_gate());
+}
+
 TEST_F(WildcardMatchTest, DeleteExistingAndMissing) {
   WildcardMatch *m = Create(TwoByteField());
   ASSERT_NE(nullptr, m);

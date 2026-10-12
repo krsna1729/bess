@@ -572,6 +572,7 @@ message ExactMatchArg {
   repeated Field fields = 1; ///A list of ExactMatch Fields
   repeated FieldData masks = 2; /// mask(i) corresponds to the mask for field(i)
   string action_resource = 3; /// The ActionTable's actions resource: when set, rules name actions (their action_id) and a match goes to output gate 0 with the action id in packet metadata.
+  optional uint64 default_gate = 4; /// The gate of a packet no rule matches (default: drop); set_default_gate changes it later.
 }
 
 /**
@@ -1157,6 +1158,7 @@ message SourceCommandSetPktSizeArg {
  */
 message SourceArg {
   uint64 pkt_size = 1; /// The size (in bytes) of packet data to produce.
+  optional uint64 burst = 2; /// Packets per batch, at most 32 (default: 32); set_burst changes it later.
 }
 
 /**
@@ -1329,6 +1331,7 @@ message WildcardMatchArg {
   /// Each mask in use is one hash lookup per batch; the limit itself costs
   /// nothing on the packet path. A new mask beyond it is refused with ENOSPC.
   uint32 max_tuples = 2;
+  optional uint64 default_gate = 3; /// The gate of a packet no rule matches (default: drop); set_default_gate changes it later.
 }
 
 /**

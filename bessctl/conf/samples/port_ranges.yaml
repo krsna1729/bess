@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Port classes with WildcardMatch: media (15000) to gate 1, an app port
+# (8500) to 2, web (80) to 3, the rest to the default gate 0.
+#
+# Converted from port_ranges.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: range_classifier
+    mclass: WildcardMatch
+    arg:
+      default_gate: 0
+      fields:
+        - offset: 30
+          num_bytes: 4
+        - offset: 36
+          num_bytes: 2
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "BhY+G3IyAh5nn02uCABFAAAyAAEAAEARrq3AqAFkCgAAAQTSOpgAHpriUE9SVF9SQU5HRV9TQU1QTEVfREFUQQ=="
+        - "BhY+G3IyAh5nn02uCABFAAAyAAEAAEARrq3AqAFkCgAAAQTSITQAHrRGUE9SVF9SQU5HRV9TQU1QTEVfREFUQQ=="
+        - "BhY+G3IyAh5nn02uCABFAAAyAAEAAEARrq3AqAFkCgAAAQTSAFAAHtUqUE9SVF9SQU5HRV9TQU1QTEVfREFUQQ=="
+        - "BhY+G3IyAh5nn02uCABFAAAyAAEAAEARrq3AqAFkCgAAAQTSFbMAHr/HUE9SVF9SQU5HRV9TQU1QTEVfREFUQQ=="
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: sink3
+    mclass: Sink
+  - name: source0
+    mclass: Source
+connections:
+  - upstream: range_classifier
+    downstream: sink0
+  - upstream: range_classifier
+    ogate: 1
+    downstream: sink1
+  - upstream: range_classifier
+    ogate: 2
+    downstream: sink2
+  - upstream: range_classifier
+    ogate: 3
+    downstream: sink3
+  - upstream: rewrite0
+    downstream: range_classifier
+  - upstream: source0
+    downstream: rewrite0
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: source0
+    wid: 0
+resources:
+  range_classifier/rules:
+    - key:
+        values: [{value_bin: CgAAAQ==}, {value_bin: Opg=}]
+        masks: [{value_bin: /////w==}, {value_bin: //8=}]
+      value: {gate: 1, priority: 100}
+    - key:
+        values: [{value_bin: CgAAAQ==}, {value_bin: ITQ=}]
+        masks: [{value_bin: /////w==}, {value_bin: //8=}]
+      value: {gate: 2, priority: 50}
+    - key:
+        values: [{value_bin: CgAAAQ==}, {value_bin: AFA=}]
+        masks: [{value_bin: /////w==}, {value_bin: //8=}]
+      value: {gate: 3, priority: 10}

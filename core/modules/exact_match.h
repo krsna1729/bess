@@ -10,6 +10,7 @@
 #include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -254,6 +255,7 @@ class ExactMatch final : public Module {
   // path writes the matched action id into `action_id`.
   bool action_mode_ = false;
   std::string action_resource_;
+  std::optional<uint64_t> initial_default_gate_;  // as given at creation
   int action_id_attr_ = -1;
 
   // Publication and reclamation (bess::rcu::RcuPtr + the runtime's RcuDomain):

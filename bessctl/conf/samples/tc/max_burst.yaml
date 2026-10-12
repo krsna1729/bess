@@ -1,0 +1,119 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Batch size under cycle limits: on each of two workers, a Source of
+# 1-packet batches and one of 32-packet batches share 1 GHz of cycles
+# (500 MHz each); worker 1 also bounds each class's burst of cycles.
+#
+# Converted from max_burst.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: w0_rewrite
+    mclass: Rewrite
+    arg:
+      templates:
+        - "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMA=="
+  - name: w0_src0
+    mclass: Source
+    arg:
+      burst: 1
+  - name: w0_src1
+    mclass: Source
+    arg:
+      burst: 32
+  - name: w1_rewrite
+    mclass: Rewrite
+    arg:
+      templates:
+        - "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMA=="
+  - name: w1_src0
+    mclass: Source
+    arg:
+      burst: 1
+  - name: w1_src1
+    mclass: Source
+    arg:
+      burst: 32
+connections:
+  - upstream: w0_rewrite
+    downstream: sink0
+  - upstream: w0_src0
+    downstream: w0_rewrite
+  - upstream: w0_src1
+    downstream: w0_rewrite
+  - upstream: w1_rewrite
+    downstream: sink1
+  - upstream: w1_src0
+    downstream: w1_rewrite
+  - upstream: w1_src1
+    downstream: w1_rewrite
+workers:
+  - {wid: 0, core: 0}
+  - wid: 1
+    core: 1
+traffic_classes:
+  - name: w0_1000MHz
+    policy: rate_limit
+    resource: cycle
+    limit:
+      cycle: "1000000000"
+  - name: w0_500MHz_0
+    parent: w0_rr
+    policy: rate_limit
+    resource: cycle
+    wid: -1
+    limit:
+      cycle: "500000000"
+  - name: w0_500MHz_1
+    parent: w0_rr
+    policy: rate_limit
+    resource: cycle
+    wid: -1
+    limit:
+      cycle: "500000000"
+  - name: w0_rr
+    parent: w0_1000MHz
+    policy: round_robin
+    wid: -1
+  - name: w1_1000MHz
+    policy: rate_limit
+    resource: cycle
+    wid: 1
+    limit:
+      cycle: "1000000000"
+  - name: w1_500MHz_0
+    parent: w1_rr
+    policy: rate_limit
+    resource: cycle
+    wid: -1
+    limit:
+      cycle: "500000000"
+    max_burst:
+      cycle: "10000"
+  - name: w1_500MHz_1
+    parent: w1_rr
+    policy: rate_limit
+    resource: cycle
+    wid: -1
+    limit:
+      cycle: "500000000"
+    max_burst:
+      cycle: "10000"
+  - name: w1_rr
+    parent: w1_1000MHz
+    policy: round_robin
+    wid: -1
+tasks:
+  - module: w0_src0
+    parent: w0_500MHz_0
+  - module: w0_src1
+    parent: w0_500MHz_1
+  - module: w1_src0
+    parent: w1_500MHz_0
+  - module: w1_src1
+    parent: w1_500MHz_1

@@ -10,6 +10,7 @@
 #include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -208,6 +209,7 @@ class WildcardMatch final : public Module {
   // Distinct masks the table admits (Init's max_tuples); the writer checks
   // it, the packet path never reads it.
   size_t max_tuples_ = kDefaultMaxTuples;
+  std::optional<uint64_t> initial_default_gate_;  // as given at creation
 
   // The live rule table (also held by the published generation).
   std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table_;

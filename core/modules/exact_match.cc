@@ -526,7 +526,16 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
                           table.error().second.c_str());
   }
   Error err;
-  GenerationPtr gen = Build(*table, /*default_gate=*/DROP_GATE, &err);
+  if (arg.has_default_gate() && !bess::IsValidGateValue(arg.default_gate())) {
+    return CommandFailure(EINVAL, "Invalid default gate: %llu",
+                          static_cast<unsigned long long>(arg.default_gate()));
+  }
+  const gate_idx_t default_gate =
+      arg.has_default_gate() ? static_cast<gate_idx_t>(arg.default_gate()) : DROP_GATE;
+  if (arg.has_default_gate()) {
+    initial_default_gate_ = arg.default_gate();
+  }
+  GenerationPtr gen = Build(*table, default_gate, &err);
   if (gen == nullptr) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
@@ -701,6 +710,9 @@ CommandResponse ExactMatch::GetInitialArg(const bess::pb::EmptyArg &) {
   }
   if (action_mode_) {
     r.set_action_resource(action_resource_);
+  }
+  if (initial_default_gate_) {
+    r.set_default_gate(*initial_default_gate_);
   }
   return CommandSuccess(r);
 }

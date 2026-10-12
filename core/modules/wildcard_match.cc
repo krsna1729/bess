@@ -148,7 +148,16 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
                           table.error().second.c_str());
   }
   Error err;
-  GenerationPtr gen = Build(*table, /*default_gate=*/DROP_GATE, &err);
+  if (arg.has_default_gate() && !bess::IsValidGateValue(arg.default_gate())) {
+    return CommandFailure(EINVAL, "Invalid default gate: %llu",
+                          static_cast<unsigned long long>(arg.default_gate()));
+  }
+  const gate_idx_t default_gate =
+      arg.has_default_gate() ? static_cast<gate_idx_t>(arg.default_gate()) : DROP_GATE;
+  if (arg.has_default_gate()) {
+    initial_default_gate_ = arg.default_gate();
+  }
+  GenerationPtr gen = Build(*table, default_gate, &err);
   if (gen == nullptr) {
     return CommandFailure(err.first, "%s", err.second.c_str());
   }
@@ -653,6 +662,9 @@ CommandResponse WildcardMatch::GetInitialArg(const bess::pb::EmptyArg &) {
   }
   if (max_tuples_ != kDefaultMaxTuples) {
     resp.set_max_tuples(static_cast<uint32_t>(max_tuples_));
+  }
+  if (initial_default_gate_) {
+    resp.set_default_gate(*initial_default_gate_);
   }
   return CommandSuccess(resp);
 }

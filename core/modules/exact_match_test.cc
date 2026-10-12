@@ -106,6 +106,38 @@ TEST_F(ExactMatchTest, AddDeleteClearAndDefaultGate) {
   EXPECT_EQ(7u, config.default_gate()) << "clear keeps the default gate";
 }
 
+// The default gate may be given at creation (manifests have no commands); an
+// invalid one refuses the module.
+TEST_F(ExactMatchTest, DefaultGateAtCreation) {
+  const auto &builders = ModuleBuilder::all_module_builders();
+  const auto it = builders.find("ExactMatch");
+  ASSERT_NE(it, builders.end());
+  for (const uint64_t gate : {uint64_t{9}, uint64_t{1} << 20}) {
+    ExactMatchArg arg;
+    auto *f = arg.add_fields();
+    f->set_offset(26);
+    f->set_num_bytes(4);
+    arg.set_default_gate(gate);
+    google::protobuf::Any packed;
+    ASSERT_TRUE(packed.PackFrom(arg));
+    pb_error_t perr;
+    Module *m = ModuleGraph::CreateModule(it->second, "em_dg", packed, &perr);
+    if (gate == 9) {
+      ASSERT_NE(nullptr, m) << perr.errmsg();
+      EXPECT_EQ(9u, Config(static_cast<ExactMatch *>(m)).default_gate());
+      ExactMatchArg initial;
+      CommandResponse r =
+          static_cast<ExactMatch *>(m)->GetInitialArg(bess::pb::EmptyArg());
+      ASSERT_TRUE(r.data().UnpackTo(&initial));
+      EXPECT_EQ(9u, initial.default_gate()) << "get_initial_arg reproduces it";
+      ModuleGraph::DestroyAllModules();
+    } else {
+      EXPECT_EQ(nullptr, m);
+      EXPECT_EQ(EINVAL, perr.code()) << perr.errmsg();
+    }
+  }
+}
+
 TEST_F(ExactMatchTest, RejectsWrongFieldCountAndSize) {
   ExactMatch *m = Create();
   ASSERT_NE(nullptr, m);

@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+# A packet filter: ExactMatch on (destination IP, destination port) sends
+# HTTP to gate 0, HTTPS to 1, DNS to 2, and the rest to the default gate 5.
+#
+# Converted from packet_filter.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: filter
+    mclass: ExactMatch
+    arg:
+      default_gate: 5
+      fields:
+        - offset: 30
+          num_bytes: 4
+        - offset: 36
+          num_bytes: 2
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "BhY+G3IyAh5nn02uCABFAAAvAAEAAEARrwrAqAEKCgAAAQTSAFAAGxk5TkVUV09SS19EQVRBX1BBQ0tFVA=="
+        - "BhY+G3IyAh5nn02uCABFAAAvAAEAAEARrwrAqAEKCgAAAQTSAbsAGxfOTkVUV09SS19EQVRBX1BBQ0tFVA=="
+        - "BhY+G3IyAh5nn02uCABFAAAvAAEAAEARrwrAqAEKCgAAAQTSADUAGxlUTkVUV09SS19EQVRBX1BBQ0tFVA=="
+        - "BhY+G3IyAh5nn02uCABFAAAvAAEAAEARrwrAqAEKCgAAAQTSJw8AG/J5TkVUV09SS19EQVRBX1BBQ0tFVA=="
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: sink3
+    mclass: Sink
+  - name: source0
+    mclass: Source
+connections:
+  - upstream: filter
+    downstream: sink0
+  - upstream: filter
+    ogate: 1
+    downstream: sink1
+  - upstream: filter
+    ogate: 2
+    downstream: sink2
+  - upstream: filter
+    ogate: 5
+    downstream: sink3
+  - upstream: rewrite0
+    downstream: filter
+  - upstream: source0
+    downstream: rewrite0
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: source0
+    wid: 0
+resources:
+  filter/rules:
+    - key: {fields: [{value_bin: CgAAAQ==}, {value_bin: AFA=}]}
+      value: {gate: 0}
+    - key: {fields: [{value_bin: CgAAAQ==}, {value_bin: Abs=}]}
+      value: {gate: 1}
+    - key: {fields: [{value_bin: CgAAAQ==}, {value_bin: ADU=}]}
+      value: {gate: 2}
