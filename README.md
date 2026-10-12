@@ -62,7 +62,9 @@ builds DPDK for the same floor (on aarch64 DPDK's generic arm64 target).
 of x86/arm64 intrinsics and asm, to build and test on x86 what other
 architectures run; architecture-specific code belongs only in `core/arch/`
 (`tools/check_arch.py`). For benchmarking, see
-[docs/benchmarking.md](docs/benchmarking.md).
+[docs/benchmarking.md](docs/benchmarking.md). Every fixed limit (gates,
+workers, fields, masks, table sizes) and what happens past it is in
+[docs/limits.md](docs/limits.md); `tools/check_limits.py` keeps it complete.
 DPDK is consumed through `pkg-config` and is dynamically linked by default.
 Use `-Ddpdk_link=static` only when a static DPDK link is intentional.
 

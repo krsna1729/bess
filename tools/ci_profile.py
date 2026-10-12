@@ -302,6 +302,8 @@ def step_layers(s):
     s.run([sys.executable, ROOT / 'tools' / 'check_includes.py'])
     s.run([sys.executable, ROOT / 'tools' / 'check_arch.py', '--self-test'])
     s.run([sys.executable, ROOT / 'tools' / 'check_arch.py'])
+    s.run([sys.executable, ROOT / 'tools' / 'check_limits.py', '--self-test'])
+    s.run([sys.executable, ROOT / 'tools' / 'check_limits.py'])
 
 
 def symbolizer():

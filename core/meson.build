@@ -883,6 +883,19 @@ test(
   is_parallel: false,
   suite: 'architecture',
 )
+# Every fixed limit has a row in docs/limits.md.
+test(
+  'check_limits',
+  python,
+  args: [files('../tools/check_limits.py'), '--root', meson.project_source_root()],
+  suite: 'architecture',
+)
+test(
+  'check_limits_self_test',
+  python,
+  args: [files('../tools/check_limits.py'), '--self-test'],
+  suite: 'architecture',
+)
 # Architecture code stays in core/arch/; the allowlist grandfathers the rest
 # and only shrinks (M21, D-071).
 test(
