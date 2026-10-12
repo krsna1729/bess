@@ -154,7 +154,9 @@ class BessctlCppTest(BessModuleTestCase):
             self.assertEqual(self.bessctl('apply', 'f', '--generation', bad, ok=False).returncode, 2)
 
         # `events --from 1` replays what the daemon holds (the transactions
-        # above) at once, then follows; Ctrl-C ends it cleanly.
+        # above) at once, then follows; Ctrl-C ends it cleanly. If tests before
+        # this one filled the daemon's event history, sequence 1 is no longer
+        # held and a bess.gap comes first.
         watch = subprocess.Popen([self.binary, '-s', self.bess.peer, 'events', '--from', '1',
                                   'bess.transaction'],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -162,6 +164,8 @@ class BessctlCppTest(BessModuleTestCase):
             ready, _, _ = select.select([watch.stdout], [], [], 10)
             self.assertTrue(ready, 'events --from 1 printed nothing')
             first = watch.stdout.readline().split()
+            if first[1] == 'bess.gap':  # replayed with what is held: already sent
+                first = watch.stdout.readline().split()
             self.assertEqual(first[1], 'bess.transaction', first)
             self.assertIn('outcome=applied', first)
         finally:
