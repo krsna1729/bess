@@ -12,6 +12,7 @@
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -650,6 +651,61 @@ TEST_F(ApiV2ServiceTest, ThreadUnsafeCommandWaitsForPausedWorkers) {
   EXPECT_EQ(v2::ErrorDetail::RESOURCE_BUSY, detail.code());
   ASSERT_TRUE(control_plane_->PauseAll());
   EXPECT_EQ(grpc::StatusCode::OK, set_size(&detail)) << detail.message();
+}
+
+// Counts the PreResume events it gets.
+class PreResumeCounter final : public Module {
+ public:
+  CommandResponse Init(const bess::pb::EmptyArg &) { return CommandSuccess(); }
+  int OnEvent(bess::Event event) override {
+    if (event != bess::Event::PreResume) {
+      return -ENOTSUP;
+    }
+    events++;
+    return 0;
+  }
+  void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override {
+    RunNextModule(ctx, batch);
+  }
+  static inline std::atomic<int> events = 0;
+};
+ADD_MODULE(PreResumeCounter, "pre_resume_counter", "test: counts PreResume events")
+
+// A worker resumed alone (the legacy per-worker resume) first sends PreResume
+// to the modules it runs, so they rebind to what changed while it was paused.
+TEST_F(ApiV2ServiceTest, ResumingOneWorkerSendsPreResumeToItsModules) {
+  v2::Pipeline p;
+  auto *w = p.add_workers();
+  w->set_wid(0);
+  w->set_core(0);
+  auto *q = p.add_modules();
+  q->set_name("q");
+  q->set_mclass("Queue");
+  ASSERT_TRUE(q->mutable_arg()->PackFrom(bess::pb::QueueArg()));
+  auto *c = p.add_modules();
+  c->set_name("c");
+  c->set_mclass("PreResumeCounter");
+  auto *conn = p.add_connections();
+  conn->set_upstream("q");
+  conn->set_downstream("c");
+  auto *t = p.add_tasks();
+  t->set_module("q");
+  t->set_wid(0);
+  {
+    grpc::ClientContext ctx;
+    v2::ApplyPipelineRequest req;
+    *req.mutable_pipeline() = p;
+    req.set_daemon_epoch(Epoch());
+    v2::ApplyPipelineResponse resp;
+    const grpc::Status status = stub_->ApplyPipeline(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
+  ASSERT_TRUE(control_plane_->ResumeAll());
+  ASSERT_TRUE(control_plane_->PauseWorker(0));
+  const int before = PreResumeCounter::events;
+  ASSERT_TRUE(control_plane_->ResumeWorker(0));
+  EXPECT_EQ(before + 1, PreResumeCounter::events);
+  ASSERT_TRUE(control_plane_->PauseAll());
 }
 
 // The int64 traffic-class fields are range-checked against the scheduler's

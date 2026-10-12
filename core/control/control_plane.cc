@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <cstdarg>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -727,6 +728,13 @@ ControlResult<void> ControlPlane::ResumeWorker(uint64_t wid) {
   }
 
   LOG(INFO) << "*** Resuming worker " << wid << " ***";
+  // The worker's modules rebind to the offsets and graph a change made while
+  // it was paused (a pauser of the other workers sent PreResume only to the
+  // modules they run). The hooks are not rerun: other workers may be running.
+  if (!is_worker_running(static_cast<int>(wid))) {
+    std::set<Module *> sent;
+    send_pre_resume(static_cast<int>(wid), &sent);
+  }
   resume_worker(static_cast<int>(wid));
   return {};
 }

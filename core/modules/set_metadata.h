@@ -39,18 +39,35 @@ class SetMetadata final : public Module {
   CommandResponse Init(const bess::pb::SetMetadataArg &arg);
   CommandResponse GetInitialArg(const bess::pb::EmptyArg &);
 
+  // Compiles `ops_` from the attributes and their offsets, which a resume
+  // assigns just before.
+  int OnEvent(bess::Event event) override;
+
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
  private:
-  enum class Mode { FromPacket, FromValue };
+  // One attribute write, as the packet path runs it: `fn` is specialized by
+  // source (a value, or packet bytes with or without shift and mask) and, for
+  // 1, 2, 4 and 8 bytes, by size.
+  struct Op {
+    void (*fn)(bess::PacketBatch *batch, const Op &op);
+    mt_offset_t mt_offset;
+    const Attr *attr;
+  };
 
-  template <Mode mode = Mode::FromValue>
-  inline void DoProcessBatch(bess::PacketBatch *batch, const struct Attr *attr,
-                             mt_offset_t mt_offset);
+  template <size_t N>
+  static void FromValue(bess::PacketBatch *batch, const Op &op);
+  template <size_t N, bool do_shift, bool do_mask>
+  static void FromPacket(bess::PacketBatch *batch, const Op &op);
+  template <size_t N>
+  static decltype(Op::fn) SelectSized(const Attr &attr);
+  static decltype(Op::fn) Select(const Attr &attr);
 
   CommandResponse AddAttrOne(const bess::pb::SetMetadataArg_Attribute &attr);
 
   std::vector<struct Attr> attrs_;
+  // Attributes without a valid offset (no reader downstream) are left out.
+  std::vector<Op> ops_;
 
   bess::pb::SetMetadataArg init_arg_;
 };

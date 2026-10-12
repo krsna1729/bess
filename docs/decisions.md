@@ -135,6 +135,9 @@ file is the reasoning.
 | D-112 | Generated C++ protobuf code is declared where it is included; one ninja run after a .proto edit | accepted |
 | D-113 | mold links every profile and every CI lane | accepted |
 | D-114 | L2Forward's entries are a transaction resource (`MacTableResource`) | accepted |
+| D-115 | Module commands over control_v2 (`RunModuleCommand`); thread-unsafe commands busy while workers run | accepted |
+| D-116 | Gate counters in ListMetrics | accepted |
+| D-117 | SetMetadata runs an op list compiled at PreResume (M.metadata -8 instructions, -4.7 cycles per packet); Update's loop inversion rejected (slower) | accepted |
 
 
 ---
@@ -8393,3 +8396,53 @@ against a daemon without the change. Live on `l2forward.yaml`: each of `fib`'s f
 reported.
 
 **Code.** `core/control/api_v2.cc` (ListMetrics).
+
+## D-117 SetMetadata runs an op list compiled at PreResume; Update's loop inversion rejected
+
+**Status:** accepted (2026-10-13; the roadmap review's "lifetime" audit, as D-100: work fixed for a graph should not
+run per batch or per packet).
+
+**Decision.** SetMetadata compiles its attributes into ops at PreResume, after the resume assigns metadata offsets.
+An attribute without a valid offset (nothing downstream reads it) gets no op. Each op holds its offset and a function
+chosen once: by source (a constant value, or packet bytes with or without shift and mask) and, for 1, 2, 4 and 8
+bytes, by size (fixed-size copies; other sizes copy at run time as before). The packet path runs the ops; it no longer
+reads offsets per batch, tests their validity, branches on the source, or switches on the size per packet.
+Behaviour is unchanged.
+
+- PreResume also reaches modules whose worker already runs (a resume of all workers when some run). SetMetadata
+  then builds the list aside and replaces its own only when it differs, so a running worker never sees the list
+  change under it on a redundant resume (the offsets are the ones already compiled).
+- The legacy per-worker resume (`ControlPlane::ResumeWorker`, v1 only) now sends PreResume to the modules the worker
+  runs before resuming it, as a pauser does. Before, a change made while the worker was paused (another worker's
+  pauser recomputing offsets and refreshing only its own modules) left the paused worker's modules bound to the old
+  offsets: harmless when offsets were read per batch, a write into another attribute's slot once they are compiled.
+  The resume hooks are not rerun there: other workers may be running.
+
+**Rejected: Update with one pass per packet** (every field applied to a packet before the next packet, the fields in
+locals). M.update (two fields), ns/packet above M.base: 1.37 -> 2.10, slower in 7/8 pairs (unisolated); isolated,
+0.20 -> 0.54, slower in 8/8. The field-outer loop, with
+the field's mask and value constant through the pass, is tighter for the usual one or two fields. Update's fields are
+already compiled when its `add` command runs; nothing changed.
+
+**Evidence.** `core/modules/set_metadata_test.cc`: constant values of sizes 1, 2, 3, 4 and 8, and packet bytes as
+they are, shifted right and left, masked, and both (sizes 2, 3, 4, 8), read back through GenericEncap over 40
+packets; selecting the 1-byte function for 2-byte attributes fails both tests. Update's overlapping fields over 40
+packets. `ApiV2ServiceTest.ResumingOneWorkerSendsPreResumeToItsModules` (a module counting PreResume on a running
+worker, paused and resumed alone) fails without the `ResumeWorker` change.
+
+Live, release trees linked with mold, 8 paired rounds, under `omarchy-benchmark --isolate --cpu 2,4,6` (SMT
+siblings offline; control threads on CPU 2, the worker alone on 4). Per packet on the worker:
+
+| test | instructions | cycles | ns above M.base | rounds slower |
+|---|---|---|---|---|
+| M.metadata (Timestamp, SetMetadata, GenericEncap) | 189.4 -> 181.5 | 44.5 -> 39.8 | 4.47 -> 3.39 | 1/8 |
+| M.base (unchanged code) | 122.1 -> 122.1 | 27.1 -> 27.1 | 7.51 -> 7.47 (ns) | 3/8 |
+| M.update (unchanged code) | 144.5 -> 144.5 | 31.1 -> 31.5 | 1.09 -> 1.27 | 6/8 |
+
+Unchanged code reads the same instruction count in both builds; the ns of a small delta moves by a few tenths with
+code layout alone. The first, unisolated run showed M.metadata -29.9%; an isolated run before D-118's counter fix
+showed -12.8% with M.base itself moving 8% (its counters read an idle worker).
+
+**Code.** `core/modules/set_metadata.{h,cc}`, `core/modules/set_metadata_test.cc`, `core/worker.{h,cc}`
+(`send_pre_resume`, shared with `~WorkerPauser`), `core/control/control_plane.cc` (`ResumeWorker`),
+`core/control/api_v2_test.cc`.

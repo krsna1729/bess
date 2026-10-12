@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <list>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -172,6 +173,11 @@ void pause_all_workers();
  */
 void attach_orphans();
 void resume_worker(int wid);
+// Sends PreResume to every module worker `wid` runs that has not had it yet
+// (`sent` records them), so they rebind to the current metadata offsets and
+// graph before the worker resumes. Modules that answer -ENOTSUP are not asked
+// again.
+void send_pre_resume(int wid, std::set<Module *> *sent);
 void resume_all_workers();
 void destroy_worker(int wid);
 void destroy_all_workers();

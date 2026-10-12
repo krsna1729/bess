@@ -325,6 +325,22 @@ WorkerPauser::WorkerPauser() {
   }
 }
 
+void send_pre_resume(int wid, std::set<Module *> *sent) {
+  auto &resume_modules = bess::event_modules[bess::Event::PreResume];
+  for (auto it = resume_modules.begin(); it != resume_modules.end();) {
+    Module *m = *it;
+    if (!sent->count(m) && m->active_workers()[wid]) {
+      int ret = m->OnEvent(bess::Event::PreResume);
+      sent->insert(m);
+      if (ret == -ENOTSUP) {
+        it = resume_modules.erase(it);
+        continue;
+      }
+    }
+    it++;
+  }
+}
+
 WorkerPauser::~WorkerPauser() {
   if (--pauser_depth == 0) {
     attach_orphans();  // All workers should be paused at this point.
@@ -336,21 +352,7 @@ WorkerPauser::~WorkerPauser() {
 
   std::set<Module *> modules_run;
   for (int wid : workers_paused_) {
-    auto &resume_modules = bess::event_modules[bess::Event::PreResume];
-    for (auto it = resume_modules.begin(); it != resume_modules.end();) {
-      Module *m = *it;
-      if (!modules_run.count(m) && m->active_workers()[wid]) {
-        int ret = m->OnEvent(bess::Event::PreResume);
-        modules_run.insert(m);
-        if (ret == -ENOTSUP) {
-          it = resume_modules.erase(it);
-        } else {
-          it++;
-        }
-      } else {
-        it++;
-      }
-    }
+    send_pre_resume(wid, &modules_run);
     resume_worker(wid);
     VLOG(1) << "*** Worker " << wid << " Resumed ***";
   }

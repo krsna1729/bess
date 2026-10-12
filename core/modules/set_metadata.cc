@@ -2,7 +2,11 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <utility>
+#include <vector>
 
 #include "set_metadata.h"
 
@@ -15,44 +19,6 @@ const Commands SetMetadata::cmds = {
     {"get_initial_arg", "EmptyArg",
      MODULE_CMD_FUNC(&SetMetadata::GetInitialArg), Command::THREAD_SAFE},
 };
-
-template <bool do_shift = false, bool do_mask = false>
-static void CopyFromPacket(bess::PacketBatch *batch, const struct Attr *attr,
-                           mt_offset_t mt_off) {
-  int size = attr->size;
-  int shift = attr->shift;
-  int pkt_off = attr->offset;
-
-  for (bess::PacketRef pkt : batch->packets()) {
-    uint8_t *head = pkt.head_data<uint8_t *>(pkt_off);
-    uint8_t *mt_ptr = _ptr_attr_with_offset<uint8_t>(mt_off, pkt);
-    bess::utils::CopySmall(mt_ptr, head, size);
-    if (do_shift) {
-      if (shift > 0) {
-        bess::utils::ShiftBytesRight(mt_ptr, size, shift);
-      } else {
-        bess::utils::ShiftBytesLeft(mt_ptr, size, -shift);
-      }
-    }
-    if (do_mask) {
-      bess::utils::MaskBytes(mt_ptr, attr->mask.bytes, size);
-    }
-  }
-}
-
-static void CopyFromValue(bess::PacketBatch *batch, const struct Attr *attr,
-                          mt_offset_t mt_off) {
-  int size = attr->size;
-
-  const void *val_ptr = &attr->value;
-
-  for (bess::PacketRef pkt : batch->packets()) {
-    void *mt_ptr;
-
-    mt_ptr = _ptr_attr_with_offset<value_t>(mt_off, pkt);
-    bess::utils::CopySmall(mt_ptr, val_ptr, size);
-  }
-}
 
 CommandResponse SetMetadata::AddAttrOne(
     const bess::pb::SetMetadataArg_Attribute &attr) {
@@ -173,42 +139,115 @@ CommandResponse SetMetadata::GetInitialArg(const bess::pb::EmptyArg &) {
   return CommandSuccess(init_arg_);
 }
 
-template <SetMetadata::Mode mode>
-inline void SetMetadata::DoProcessBatch(bess::PacketBatch *batch,
-                                        const struct Attr *attr,
-                                        mt_offset_t mt_offset) {
-  if (mode == Mode::FromPacket) {
-    bool shift = attr->shift != 0;
-    if (shift && attr->do_mask) {
-      CopyFromPacket<true, true>(batch, attr, mt_offset);
-    } else if (shift && !attr->do_mask) {
-      CopyFromPacket<true, false>(batch, attr, mt_offset);
-    } else if (!shift && attr->do_mask) {
-      CopyFromPacket<false, true>(batch, attr, mt_offset);
-    } else if (!shift && !attr->do_mask) {
-      CopyFromPacket<false, false>(batch, attr, mt_offset);
+template <size_t N>  // N == 0: attr->size at run time
+void SetMetadata::FromValue(bess::PacketBatch *batch, const Op &op) {
+  const mt_offset_t mt_off = op.mt_offset;
+  if constexpr (N != 0) {
+    // A local copy: the stores below cannot alias it, so it stays in a
+    // register.
+    uint8_t value[N];
+    std::memcpy(value, op.attr->value.bytes, N);
+    for (bess::PacketRef pkt : batch->packets()) {
+      std::memcpy(_ptr_attr_with_offset<uint8_t>(mt_off, pkt), value, N);
     }
   } else {
-    CopyFromValue(batch, attr, mt_offset);
+    const size_t size = op.attr->size;
+    const value_t *value = &op.attr->value;
+    for (bess::PacketRef pkt : batch->packets()) {
+      bess::utils::CopySmall(_ptr_attr_with_offset<value_t>(mt_off, pkt), value, size);
+    }
   }
 }
 
-void SetMetadata::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  for (size_t i = 0; i < attrs_.size(); i++) {
-    const struct Attr *attr = &attrs_[i];
-    mt_offset_t mt_offset = attr_offset(i);
+template <size_t N, bool do_shift, bool do_mask>  // N == 0: attr->size at run time
+void SetMetadata::FromPacket(bess::PacketBatch *batch, const Op &op) {
+  const Attr &attr = *op.attr;
+  const size_t size = N != 0 ? N : attr.size;
+  const int shift = attr.shift;
+  const int pkt_off = attr.offset;
+  const mt_offset_t mt_off = op.mt_offset;
 
-    if (!bess::metadata::IsValidOffset(mt_offset)) {
-      continue;
-    }
-
-    if (attr->offset >= 0) {
-      DoProcessBatch<Mode::FromPacket>(batch, attr, mt_offset);
+  for (bess::PacketRef pkt : batch->packets()) {
+    const uint8_t *head = pkt.head_data<uint8_t *>(pkt_off);
+    uint8_t *mt_ptr = _ptr_attr_with_offset<uint8_t>(mt_off, pkt);
+    if constexpr (N != 0) {
+      std::memcpy(mt_ptr, head, N);
     } else {
-      DoProcessBatch<Mode::FromValue>(batch, attr, mt_offset);
+      bess::utils::CopySmall(mt_ptr, head, size);
+    }
+    if constexpr (do_shift) {
+      if (shift > 0) {
+        bess::utils::ShiftBytesRight(mt_ptr, size, shift);
+      } else {
+        bess::utils::ShiftBytesLeft(mt_ptr, size, -shift);
+      }
+    }
+    if constexpr (do_mask) {
+      bess::utils::MaskBytes(mt_ptr, attr.mask.bytes, size);
     }
   }
+}
 
+template <size_t N>
+decltype(SetMetadata::Op::fn) SetMetadata::SelectSized(const Attr &attr) {
+  if (attr.offset < 0) {
+    return &FromValue<N>;
+  }
+  const bool shift = attr.shift != 0;
+  if (shift && attr.do_mask) {
+    return &FromPacket<N, true, true>;
+  }
+  if (shift) {
+    return &FromPacket<N, true, false>;
+  }
+  if (attr.do_mask) {
+    return &FromPacket<N, false, true>;
+  }
+  return &FromPacket<N, false, false>;
+}
+
+decltype(SetMetadata::Op::fn) SetMetadata::Select(const Attr &attr) {
+  switch (attr.size) {
+    case 1:
+      return SelectSized<1>(attr);
+    case 2:
+      return SelectSized<2>(attr);
+    case 4:
+      return SelectSized<4>(attr);
+    case 8:
+      return SelectSized<8>(attr);
+    default:
+      return SelectSized<0>(attr);
+  }
+}
+
+int SetMetadata::OnEvent(bess::Event event) {
+  if (event != bess::Event::PreResume) {
+    return -ENOTSUP;
+  }
+  std::vector<Op> ops;
+  for (size_t i = 0; i < attrs_.size(); i++) {
+    const mt_offset_t mt_offset = attr_offset(i);
+    if (bess::metadata::IsValidOffset(mt_offset)) {
+      ops.push_back({Select(attrs_[i]), mt_offset, &attrs_[i]});
+    }
+  }
+  // PreResume also reaches a module whose worker is running (a resume of all
+  // workers when some already run); the offsets are then the ones compiled,
+  // and the list a worker may be reading is left alone.
+  const auto same = [](const Op &a, const Op &b) {
+    return a.fn == b.fn && a.mt_offset == b.mt_offset && a.attr == b.attr;
+  };
+  if (!std::equal(ops.begin(), ops.end(), ops_.begin(), ops_.end(), same)) {
+    ops_ = std::move(ops);
+  }
+  return 0;
+}
+
+void SetMetadata::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+  for (const Op &op : ops_) {
+    op.fn(batch, op);
+  }
   RunNextModule(ctx, batch);
 }
 
