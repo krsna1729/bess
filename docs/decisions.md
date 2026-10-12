@@ -120,6 +120,7 @@ file is the reasoning.
 | D-097 | The framework floor was the packet alloc and free path: four per-packet operations master did not do | accepted |
 | D-098 | WildcardMatch ranks by a packed priority and skips tuples that cannot win (19.2 ns master, 44.8 develop, 14.6 now) | accepted |
 | D-099 | `Module::EmitBatch`: a burst whose packets all take one gate leaves whole; classifiers use it; `RunSplit` removed | accepted |
+| D-100 | Metadata offsets resolved once per batch, slow helpers deprecated (no measurable gain); GenericEncap template rejected (slower) | accepted |
 
 
 ---
@@ -7805,3 +7806,34 @@ The mixed case does not pay for the uniformity check. ACL's shift has no code ch
 Above M.base, ExactMatch is now 11.64 ns (master 11.09) and IPLookup 1.46 (master 2.92). The mixed case shows the
 remaining framework cost: 22.16 ns against master's 10.50 -- per-packet `EmitPacket` is about twice master's; the next
 item (outputs compiled at PreResume) targets it.
+
+## D-100 Metadata offsets resolved once per batch, slow helpers deprecated; GenericEncap's header template rejected
+
+**Status:** accepted (2026-10-12; from the roadmap review's "lifetime" audit: work fixed for a batch or a graph
+should not run per packet).
+**Code:** `core/modules/{timestamp,vxlan_encap,vxlan_decap,ip_encap,ether_encap,measure}.cc`, `core/module.h`,
+`core/modules/generic_encap.cc`, `core/modules/generic_encap_test.cc`.
+
+**Decision.**
+- The six modules that called `get_attr`/`set_attr(Module*, id, pkt)` in their packet loops (an `attr_offset` read
+  and validity test per packet) now read each offset once per batch and use the `*_with_offset` helpers; behaviour
+  with invalid offsets is unchanged (reads give zero, writes are skipped).
+- `get_attr`, `set_attr` and `ptr_attr(Module*, ...)` are deprecated in the public `core/module.h` (no in-tree
+  callers); removal is a later decision, after a release (compatibility policy).
+- GenericEncap rejects more than `MAX_FIELDS` fields: `Init` wrote `fields_[i]` for every requested field, past the
+  end of the object from the ninth. Its first tests: field order and bytes for every size 1-8 with a metadata field
+  before a constant (fails if a field spills into the next), an unreadable attribute is zeros, too many fields is
+  EINVAL.
+
+**Rejected: a prebuilt header template for GenericEncap** (constants copied once at Init, metadata fields patched per
+packet). Paired A/B, isolated CPUs 2,4, 8 rounds, contamination flagged: M.genericencap (constant 14-byte header)
++0.42 ns, slower in 7/8 rounds; M.metadata (two metadata fields) +2.23 ns, slower in 7/8. The existing loop (each
+field written for the whole batch into a staging array, then one copy per packet) is cheaper than per-packet
+variable-size patching.
+
+**Evidence.** Unit tests 141/141 and live tests (timestamp, vxlan, etherencap, generic_decap, exact_match,
+session_pipeline, control_sdk_go) pass; Reviewer: correct, no findings. Live, paired before/after, isolated CPUs 2,4,
+8 rounds, contamination flagged, median of after minus before: M.metadata (Timestamp attribute mode, SetMetadata,
+GenericEncap) -0.11 ns (5/8 lower), M.vlan -0.46 (6/8), M.genericencap -0.14 (4/8); M.base itself moved -0.74
+with no code change. No measurable gain: the per-packet offset read was already cheap. Kept for clarity and so the
+slow helpers can be retired.
