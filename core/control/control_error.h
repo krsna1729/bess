@@ -42,7 +42,10 @@ struct ControlError {
 };
 
 // A control operation's outcome. [[nodiscard]]: dropping one would hide a
-// failure (D-101). Everything else is std::expected's.
+// failure (D-101). Otherwise std::expected's, except that it is not a
+// std::expected specialization: and_then/or_else continuations must return a
+// plain std::expected, a ControlResult<T> parameter does not deduce T from a
+// plain std::expected, and two ControlResults do not compare with ==.
 template <typename T>
 class [[nodiscard]] ControlResult : public std::expected<T, ControlError> {
  public:

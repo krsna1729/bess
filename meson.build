@@ -252,6 +252,10 @@ if grpc_reflection_lib.found()
   )]
   common_deps += grpc_reflection_deps
 endif
+if not grpc_reflection_lib.found()
+  message('grpc++_reflection not found' + (is_static_deps ? ' as a static archive' : '') +
+          ': bessd builds without gRPC server reflection')
+endif
 
 gtest_dep = dependency('gtest', method: 'pkg-config', required: true)
 benchmark_dep = dependency('benchmark', method: 'pkg-config', required: true)

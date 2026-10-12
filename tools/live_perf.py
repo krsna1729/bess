@@ -216,6 +216,16 @@ def m_exactmatch_mixed(b):
     return m_base(b, [('em', 2)])
 
 
+def m_exactmatch_miss(b):
+    """Every flow misses (the rules hold other addresses): the miss path, bursts uniform on the default gate."""
+    b.mod('ExactMatch', 'em', {'fields': [{'offset': 26, 'num_bytes': 4}]})
+    b.cmd('em', 'set_default_gate', 'ExactMatchCommandSetDefaultGateArg', {'gate': 0})
+    for i in range(FLOWS):
+        b.cmd('em', 'add', 'ExactMatchCommandAddArg',
+              {'gate': 1, 'fields': [{'value_bin': struct.pack('!I', 0x0b000001 + i)}]})
+    return m_base(b, [('em', 2)])
+
+
 def m_wildcardmatch(b):
     b.mod('WildcardMatch', 'wm', {'fields': [{'offset': 26, 'num_bytes': 4},
                                              {'offset': 30, 'num_bytes': 4}]})
@@ -309,6 +319,7 @@ TESTS = {
     'M.base': ('M', m_base),
     'M.exactmatch': ('M', m_exactmatch),
     'M.exactmatch/mixed': ('M', m_exactmatch_mixed),
+    'M.exactmatch/miss': ('M', m_exactmatch_miss),
     'M.wildcardmatch': ('M', m_wildcardmatch),
     'M.iplookup': ('M', m_iplookup),
     'M.l2forward': ('M', m_l2forward),

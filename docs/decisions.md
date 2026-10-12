@@ -7851,6 +7851,12 @@ slow helpers can be retired.
 nodiscard without annotating each. `-Wno-error=unused-result` is removed: an ignored nodiscard value or
 `warn_unused_result` return is a build error again.
 
+Not a drop-in for the alias in three forms, none used in the tree (checked on gcc 16 and clang 22, libstdc++ 16):
+an `and_then`/`or_else` continuation returning `ControlResult` fails libstdc++'s "must return a std::expected"
+assertion (return a plain `std::expected`; it converts); a `template <class T> f(const ControlResult<T>&)` does not
+deduce from a plain `std::expected`; `ControlResult == ControlResult` has no viable overload (compare `.value()`
+or the error). The header says so.
+
 **Evidence.** A full gcc build of every target (tests included) with the attribute: no unused-result warning, so no
 caller dropped a control result. Without the `-Wno-error` flag the build stays clean. A throwaway translation unit
 compiled with the tree's flags that calls a `ControlResult<int>` function and ignores it fails: "ignoring returned
