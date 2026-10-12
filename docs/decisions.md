@@ -128,6 +128,7 @@ file is the reasoning.
 | D-105 | Schema discovery: `GetSchema` names every init and command argument type with a self-contained `FileDescriptorSet`; registration records `Init`'s type (source-compatible) | accepted |
 | D-106 | Every mutating control_v2 request names the daemon epoch it was built under; generations travel with their epoch | accepted |
 | D-107 | The v2 Admin service: plugins, port status, capture into a client FIFO, packet pools, pause/resume of the workers and shutdown; epoch-checked like Control | accepted |
+| D-108 | YAML manifests: libyaml into bessctl's exact-number JSON tree, YAML 1.2 core-schema resolution, refusals named by position | accepted |
 
 
 ---
@@ -8099,3 +8100,41 @@ retried (the C++ test fails if the sent epoch is not carried into the error). En
 bessd (`-m 0 -dpdk=false`): apply, `ports`, `pools`, a refused `plugin import`, `resume`, a one-second `capture src
 out` of 3,480,393 complete pcap records, Ctrl-C exits 0 and the capture restarts on the same gate, `pause` stops the
 worker, `shutdown` ends bessd with status 0.
+
+## D-108 YAML manifests: libyaml into the JSON tree, core-schema scalars
+
+**Decision.** bessctl reads and writes manifests as YAML as well as JSON (D-104's manifest step). YAML is parsed with
+libyaml (`yaml-0.1`, Ubuntu `libyaml-dev`, static in a static build) into the same tree as JSON (`bessctl/json.h`),
+which keeps numbers as written; everything after the tree (types filled from the schema, resource entries, protobuf's
+JSON parser) is shared, so a YAML manifest means exactly what the same JSON does.
+
+- Plain scalars resolve as YAML 1.2's core schema: `null`/`Null`/`NULL`/`~`/empty, `true`/`false` (three cases),
+  decimal integers and floats (kept as written, normalised to JSON's grammar: no `+`, no leading zeros, `.5` -> `0.5`),
+  `0x`/`0o` integers in decimal (64 bits at most), `.inf`/`-.inf`/`.nan` as protobuf's `"Infinity"`/`"-Infinity"`/
+  `"NaN"`; anything else is a string. Not YAML 1.1: `yes`, `on`, `1_000`, `0b101` are strings. Quoted and block
+  scalars and `!!str`/`!` are strings.
+- Anchors and aliases are copies. What a document expands to is bounded before it is allocated: 256 MiB counting 64
+  bytes per value plus its text (keys too), aliases' copies and anchors' kept copies included (an alias bomb, many
+  aliases of a long string, or nested anchors are refused); and the JSON depth limit, an alias's subtree included.
+- Refused with "line L, column C": other tags, merge keys (`<<`: YAML 1.1 only), non-scalar and duplicate keys, more
+  than one document, nesting deeper than the JSON limit.
+- Output (`get -o yaml`, `validate -o yaml`) is block style; a string is plain only if it reads back as that string
+  (to YAML 1.1 readers too: `yes`/`no`/`on`/`off` are quoted), else double-quoted. int64 values are strings, as in
+  protobuf's JSON mapping.
+- Format: `.json`, `.yaml`/`.yml` by extension, else JSON when the first non-blank character is `{`.
+
+**Why libyaml.** The YAML reference parser, in every distribution, C, small, with a static archive; yaml-cpp would add
+a C++ ABI and its own number conversions, and a hand-written subset would read real YAML wrongly. Resolution is ours
+(about 60 lines), so the scalar rules are the schema's, not a library's.
+
+**Evidence.** `bessctl_manifest_test`: the core-schema table (64-bit maxima, hex and octal, quoted look-alikes, block
+scalars), aliases, and each way past the budget (an alias bomb, 5,000 aliases of a 64 KiB string, 200 nested anchors
+over 400,000 values, an aliased subtree past the depth limit; each fails when its charge or check is removed), every
+refusal with its position, `Dump` then `Parse` returning the same tree for strings that look like other scalars, hold
+YAML indicators, or hold characters libyaml folds or refuses (NEL, U+2028/9, C1 controls, U+FEFF/FFFE/FFFF; fails
+without the read-back check or the escapes), a YAML manifest equal to the JSON one including resource entries. End to end against bessd: a YAML
+manifest with anchors validates, plans and applies (with its resource entry); `get -o yaml` read back is 0 changes;
+`validate` of the YAML and the JSON forms prints the same canonical pipeline.
+
+**Code.** `bessctl/yaml_io.{h,cc}`, `bessctl/manifest.{h,cc}` (`Format`, `FormatOf`, `ManifestFrom`, `PipelineTo`),
+`bessctl/main.cc` (`-o`).

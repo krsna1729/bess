@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Manifests: a control_v2 Pipeline in protobuf's JSON mapping, with two
+// Manifests: a control_v2 Pipeline in protobuf's JSON mapping, written as
+// JSON or YAML (yaml_io.h: the same tree, so the same meaning), with two
 // additions.
 //  - A module's or port's "arg" may leave out "@type": the class's or
 //    driver's init type from the daemon's schema (GetSchema) fills it in.
@@ -52,15 +53,21 @@ struct Manifest {
   }
 };
 
+enum class Format { kJson, kYaml };
+
+// A file's format: by extension (.json; .yaml, .yml), else JSON if its first
+// non-blank character is "{", else YAML.
+Format FormatOf(std::string_view path, std::string_view text);
+
 class Schema {
  public:
   // The daemon's types (`schema`) plus control_v2's own.
   static std::expected<std::unique_ptr<Schema>, std::string> From(
       const pb::GetSchemaResponse &schema);
 
-  std::expected<Manifest, std::string> ManifestFromJson(std::string_view text) const;
-  // Pretty JSON, field names as in the .proto files.
-  std::expected<std::string, std::string> PipelineToJson(const pb::Pipeline &p) const;
+  std::expected<Manifest, std::string> ManifestFrom(std::string_view text, Format format) const;
+  // Pretty JSON or block YAML, field names as in the .proto files.
+  std::expected<std::string, std::string> PipelineTo(const pb::Pipeline &p, Format format) const;
 
   // A message of the daemon's type `type` (a resource's key or value) from
   // JSON. Valid while this Schema lives.

@@ -91,6 +91,15 @@ class BessctlCppTest(BessModuleTestCase):
                 json.dump(got, f)
             self.assertIn('0 change(s)', self.bessctl('diff', again).stdout)
 
+            # The same as YAML (D-108): what `get -o yaml` printed is a no-op,
+            # and validates to the canonical form the JSON does.
+            again_yaml = os.path.join(tmp, 'again.yaml')
+            with open(again_yaml, 'w') as f:
+                f.write(self.bessctl('get', '-o', 'yaml').stdout)
+            self.assertIn('0 change(s)', self.bessctl('diff', again_yaml).stdout)
+            self.assertEqual(self.bessctl('validate', again_yaml).stdout,
+                             self.bessctl('validate', again).stdout)
+
             # Bad entries: the pipeline (unchanged) applies, the entry is
             # named, and nothing of the transaction is committed. Entry 1 is
             # refused by bessctl (no such field), then by the daemon (two

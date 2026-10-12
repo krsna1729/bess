@@ -10,6 +10,7 @@
 #include <regex>
 
 #include "json.h"
+#include "yaml_io.h"
 
 namespace bessctl {
 
@@ -192,13 +193,25 @@ std::expected<std::unique_ptr<Schema>, std::string> Schema::From(
   return s;
 }
 
-std::expected<Manifest, std::string> Schema::ManifestFromJson(std::string_view text) const {
-  auto doc = json::Parse(text);
+Format FormatOf(std::string_view path, std::string_view text) {
+  if (path.ends_with(".json")) {
+    return Format::kJson;
+  }
+  if (path.ends_with(".yaml") || path.ends_with(".yml")) {
+    return Format::kYaml;
+  }
+  const size_t first = text.find_first_not_of(" \t\r\n");
+  return first != std::string_view::npos && text[first] == '{' ? Format::kJson : Format::kYaml;
+}
+
+std::expected<Manifest, std::string> Schema::ManifestFrom(std::string_view text,
+                                                          Format format) const {
+  auto doc = format == Format::kJson ? json::Parse(text) : yaml::Parse(text);
   if (!doc) {
     return std::unexpected(doc.error());
   }
   if (doc->object() == nullptr) {
-    return std::unexpected(std::string("a manifest is a JSON object"));
+    return std::unexpected(std::string("a manifest is an object (a mapping)"));
   }
   Manifest m;
   auto resources = TakeResources(*doc);
@@ -225,7 +238,8 @@ std::expected<Manifest, std::string> Schema::ManifestFromJson(std::string_view t
   return m;
 }
 
-std::expected<std::string, std::string> Schema::PipelineToJson(const pb::Pipeline &p) const {
+std::expected<std::string, std::string> Schema::PipelineTo(const pb::Pipeline &p,
+                                                         Format format) const {
   gp::util::JsonPrintOptions options;
   options.preserve_proto_field_names = true;
   std::string text;
@@ -241,7 +255,7 @@ std::expected<std::string, std::string> Schema::PipelineToJson(const pb::Pipelin
   }
   DropImpliedTypes(*doc, kModules, module_types_);
   DropImpliedTypes(*doc, kPorts, driver_types_);
-  return json::Dump(*doc, 2);
+  return format == Format::kJson ? json::Dump(*doc, 2) : yaml::Dump(*doc);
 }
 
 std::expected<std::unique_ptr<gp::Message>, std::string> Schema::MessageFromJson(

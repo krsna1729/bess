@@ -32,7 +32,7 @@ runtime_packages=(
   python3 python3-pip python3-venv
   libnuma1 libpcap0.8t64 zlib1g libunwind8 libbpf1 libxdp1
   libgoogle-glog0v6t64 libgflags2.2 libprotobuf32t64 libgrpc++1.51t64
-  libc-ares2 libsystemd0 libcap2 libelf1t64 libarchive13t64 libjansson4
+  libc-ares2 libsystemd0 libcap2 libelf1t64 libarchive13t64 libjansson4 libyaml-0-2
   libgraph-easy-perl tcpdump
 )
 
@@ -42,7 +42,7 @@ build_packages=(
   libnuma-dev libpcap-dev zlib1g-dev libunwind-dev libbpf-dev libxdp-dev
   libgoogle-glog-dev libgflags-dev libgtest-dev libbenchmark-dev
   libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler
-  libsystemd-dev libc-ares-dev libcap-dev
+  libsystemd-dev libc-ares-dev libcap-dev libyaml-dev
 )
 
 vm_packages=(cloud-image-utils curl numactl openssh-client qemu-kvm qemu-utils)

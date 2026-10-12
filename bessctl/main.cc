@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // bessctl: BESS's command line, on the public C++ SDK only (G1.7, D-104).
-// Pipelines are manifests: control_v2 Pipeline JSON (manifest.h); the daemon
+// Pipelines are manifests: control_v2 Pipeline JSON or YAML (manifest.h); the daemon
 // validates, diffs, plans and applies them.
 
 #include <fcntl.h>
@@ -44,8 +44,8 @@ constexpr std::string_view kUsage = R"(usage: bessctl [-s HOST:PORT] COMMAND [AR
 
   status                         daemon version, epoch, plugins, ports
   schema [CLASS]                 module classes and port drivers, or one class
-  get                            the active pipeline, as a manifest
-  validate FILE                  check FILE; print it in canonical form
+  get [-o json|yaml]             the active pipeline, as a manifest
+  validate FILE [-o json|yaml]   check FILE; print it in canonical form
   diff FILE                      what applying FILE would change
   plan FILE                      the steps applying FILE would run
   apply FILE [--generation G@E]  make FILE the active pipeline (with G@E: only
@@ -69,7 +69,8 @@ constexpr std::string_view kUsage = R"(usage: bessctl [-s HOST:PORT] COMMAND [AR
                                  pipeline creates starts paused)
   shutdown                       stop the daemon
 
-A manifest is a control_v2 Pipeline in protobuf JSON; a module's or port's
+A manifest is a control_v2 Pipeline in protobuf JSON or YAML (by extension,
+.json or .yaml/.yml, else JSON if it starts with "{"); a module's or port's
 "arg" may leave out "@type". FILE "-" is standard input. The daemon is
 -s, else $BESS_SERVER, else localhost:10514.
 )";
@@ -321,7 +322,18 @@ class Cli {
     return Fail("no module class or port driver \"" + args[0] + "\"");
   }
 
-  int Get() {
+  // A pipeline as a manifest, on standard output.
+  static int PrintPipeline(const bessctl::Schema &schema, const pb::Pipeline &p,
+                           bessctl::Format format) {
+    auto text = schema.PipelineTo(p, format);
+    if (!text) {
+      return Fail(text.error());
+    }
+    std::print("{}{}", *text, format == bessctl::Format::kJson ? "\n" : "");
+    return 0;
+  }
+
+  int Get(bessctl::Format format) {
     auto schema = LoadSchema();
     if (!schema) {
       return 1;
@@ -330,15 +342,10 @@ class Cli {
     if (!snap) {
       return Fail(snap.error());
     }
-    auto text = (*schema)->PipelineToJson(snap->pipeline);
-    if (!text) {
-      return Fail(text.error());
-    }
-    std::println("{}", *text);
-    return 0;
+    return PrintPipeline(**schema, snap->pipeline, format);
   }
 
-  int Validate(const std::string &path) {
+  int Validate(const std::string &path, bessctl::Format format) {
     auto schema = LoadSchema();
     auto m = schema ? ReadManifest(**schema, path) : std::nullopt;
     if (!m) {
@@ -348,11 +355,9 @@ class Cli {
     if (!normalized) {
       return Fail(normalized.error());
     }
-    auto text = (*schema)->PipelineToJson(*normalized);
-    if (!text) {
-      return Fail(text.error());
+    if (const int rc = PrintPipeline(**schema, *normalized, format); rc != 0) {
+      return rc;
     }
-    std::println("{}", *text);
     NoteResources(*m);
     return 0;
   }
@@ -499,7 +504,7 @@ class Cli {
       Fail("cannot read " + path);
       return std::nullopt;
     }
-    auto m = schema.ManifestFromJson(*text);
+    auto m = schema.ManifestFrom(*text, bessctl::FormatOf(path, *text));
     if (!m) {
       Fail(path + ": " + m.error());
       return std::nullopt;
@@ -643,11 +648,23 @@ int main(int argc, char **argv) {
   if (command == "schema" && rest.size() <= 1) {
     return cli.ShowSchema(rest);
   }
-  if (command == "get" && rest.empty()) {
-    return cli.Get();
+  // get and validate print JSON, or YAML with -o yaml.
+  std::vector<std::string> printed(rest.begin(), rest.end());
+  auto output = bessctl::Format::kJson;
+  if ((command == "get" || command == "validate") && printed.size() >= 2 &&
+      printed[printed.size() - 2] == "-o") {
+    const std::string &name = printed.back();
+    if (name != "json" && name != "yaml") {
+      return Usage();
+    }
+    output = name == "yaml" ? bessctl::Format::kYaml : bessctl::Format::kJson;
+    printed.resize(printed.size() - 2);
   }
-  if (command == "validate") {
-    return one_file([&](const std::string &f) { return cli.Validate(f); });
+  if (command == "get" && printed.empty()) {
+    return cli.Get(output);
+  }
+  if (command == "validate" && printed.size() == 1) {
+    return cli.Validate(printed[0], output);
   }
   if (command == "diff") {
     return one_file([&](const std::string &f) { return cli.Diff(f); });

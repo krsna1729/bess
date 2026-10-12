@@ -8768,11 +8768,11 @@ consumer-driven (D-008, §31.3 item 2).
   drift (D-104).
 - **G1.7 — C++ `bessctl` on the public C++ SDK: PARTIAL** (D-104; replaces the
   Python bessctl, which is deleted last). `bessctl/` builds `bin/bessctl` on
-  `libbess-sdk` alone: JSON manifests (`get`, `validate`, `diff`, `plan`,
-  `apply`; resource entries committed after the pipeline), `schema`, `status`,
+  `libbess-sdk` alone: JSON and YAML manifests (D-108; `get`, `validate`,
+  `diff`, `plan`, `apply`; resource entries committed after the pipeline), `schema`, `status`,
   `resources`, `metrics`, `events`, and administration over the v2 Admin
   service (D-107: `ports`, `pools`, `plugin`, `capture`, `pause`, `resume`,
-  `shutdown`); live suite `bessctl_cpp`. Pending: YAML, the legacy commands
+  `shutdown`); live suite `bessctl_cpp`. Pending: the legacy commands
   (daemon start, `.bess`, shell), a static baseline `-march` build.
 - **G1.8 — v2 Admin service: DONE at D-104's scope (D-107).** Plugins, port
   status, capture into a client FIFO, packet pools, pause/resume of every

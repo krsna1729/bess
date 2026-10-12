@@ -37,6 +37,7 @@ Meson discovers these through `pkg-config` or executable names. Except for the D
 | zlib | None | Required. |
 | libpcap | None | Required. |
 | NUMA (`numa`) | None | Required. |
+| libyaml (`yaml-0.1`) | None | Required by the C++ bessctl (YAML manifests, `bessctl/yaml_io.cc`); static in a static build. |
 | GoogleTest (`gtest`) | None | Required by test targets. |
 | Google Benchmark (`benchmark`) | None | Required by benchmark targets. `benchmark_main` is optional; Meson falls back to the library. |
 | `pkg-config`, `protoc`, `grpc_cpp_plugin`, `grpc_python_plugin` | None | Required discovery/code-generation tools. |
@@ -60,8 +61,8 @@ below.
 
 | Installer mode | Explicit package names |
 |---|---|
-| `runtime` | `python3`, `python3-pip`, `python3-venv`, `libnuma1`, `libpcap0.8t64`, `zlib1g`, `libunwind8`, `libbpf1`, `libxdp1`, `libgoogle-glog0v6t64`, `libgflags2.2`, `libprotobuf32t64`, `libgrpc++1.51t64`, `libc-ares2`, `libsystemd0`, `libcap2`, `libelf1t64`, `libarchive13t64`, `libjansson4`, `libgraph-easy-perl`, `tcpdump`. |
-| `build` | `build-essential`, `gcc-14`, `g++-14`, `clang-19`, `ccache`, `meson`, `ninja-build`, `pkg-config`, `python3-pyelftools`, `xz-utils`, `libnuma-dev`, `libpcap-dev`, `zlib1g-dev`, `libunwind-dev`, `libbpf-dev`, `libxdp-dev`, `libgoogle-glog-dev`, `libgflags-dev`, `libgtest-dev`, `libbenchmark-dev`, `libgrpc++-dev`, `protobuf-compiler-grpc`, `libprotobuf-dev`, `protobuf-compiler`, `libsystemd-dev`, `libc-ares-dev`, `libcap-dev`. |
+| `runtime` | `python3`, `python3-pip`, `python3-venv`, `libnuma1`, `libpcap0.8t64`, `zlib1g`, `libunwind8`, `libbpf1`, `libxdp1`, `libgoogle-glog0v6t64`, `libgflags2.2`, `libprotobuf32t64`, `libgrpc++1.51t64`, `libc-ares2`, `libsystemd0`, `libcap2`, `libelf1t64`, `libarchive13t64`, `libjansson4`, `libyaml-0-2`, `libgraph-easy-perl`, `tcpdump`. |
+| `build` | `build-essential`, `gcc-14`, `g++-14`, `clang-19`, `ccache`, `meson`, `ninja-build`, `pkg-config`, `python3-pyelftools`, `xz-utils`, `libnuma-dev`, `libpcap-dev`, `zlib1g-dev`, `libunwind-dev`, `libbpf-dev`, `libxdp-dev`, `libgoogle-glog-dev`, `libgflags-dev`, `libgtest-dev`, `libbenchmark-dev`, `libgrpc++-dev`, `protobuf-compiler-grpc`, `libprotobuf-dev`, `protobuf-compiler`, `libsystemd-dev`, `libc-ares-dev`, `libcap-dev`, `libyaml-dev`. |
 | `vm` | `cloud-image-utils`, `curl`, `numactl`, `openssh-client`, `qemu-kvm`, `qemu-utils`. |
 | README binary quick-install | `python3-venv`, `libgraph-easy-perl`. |
 

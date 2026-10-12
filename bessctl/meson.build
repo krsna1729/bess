@@ -2,13 +2,17 @@
 # never on bessd's internals. The Python files in this directory are the old
 # bessctl and pybess's test harness; they go when D-104's last step does.
 
+# YAML manifests (yaml_io.h): libyaml, linked statically in a static build.
+yaml_dep = dependency('yaml-0.1', method: 'pkg-config', static: is_static_deps, required: true)
+
 bessctl_lib = static_library(
   'bessctl_lib',
   'json.cc',
   'manifest.cc',
-  dependencies: [bess_sdk_dep],
+  'yaml_io.cc',
+  dependencies: [bess_sdk_dep, yaml_dep],
 )
-bessctl_dep = declare_dependency(link_with: bessctl_lib, dependencies: [bess_sdk_dep])
+bessctl_dep = declare_dependency(link_with: bessctl_lib, dependencies: [bess_sdk_dep, yaml_dep])
 
 bessctl_exe = executable(
   'bessctl',
