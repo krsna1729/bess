@@ -18,21 +18,23 @@
 #define SYS_CPU_DIR "/sys/devices/system/cpu/cpu%u"
 #define CORE_ID_FILE "topology/core_id"
 
-/* Check if a cpu is present by the presence of the cpu information for it */
 int is_cpu_present(unsigned int core_id) {
-  char path[PATH_MAX];
-  int len = snprintf(path, sizeof(path), SYS_CPU_DIR "/" CORE_ID_FILE, core_id);
-  if (len <= 0 || (unsigned)len >= sizeof(path)) {
-    return 0;
-  }
-  if (access(path, F_OK) != 0) {
-    return 0;
-  }
-
-  return 1;
+  const auto core = bess::runtime::CpuIdFrom(core_id);
+  return core.has_value() && bess::runtime::CpuPresent(*core);
 }
 
 namespace bess::runtime {
+
+// Present when the kernel exposes the CPU's topology.
+bool CpuPresent(CpuId core) {
+  char path[PATH_MAX];
+  int len = snprintf(path, sizeof(path), SYS_CPU_DIR "/" CORE_ID_FILE,
+                     static_cast<unsigned>(core.value()));
+  if (len <= 0 || (unsigned)len >= sizeof(path)) {
+    return false;
+  }
+  return access(path, F_OK) == 0;
+}
 
 cpu_set_t ControlCpus(const cpu_set_t &base, std::span<const int> cores) {
   cpu_set_t out = base;
@@ -73,8 +75,8 @@ std::vector<pid_t> ThreadIds() {
 
 const cpu_set_t &ProcessCpus() { return kProcessCpus; }
 
-bool CpuAllowed(int core) {
-  return core >= 0 && core < CPU_SETSIZE && CPU_ISSET(core, &kProcessCpus);
+bool CpuAllowed(CpuId core) {
+  return CPU_ISSET(core.value(), &kProcessCpus);
 }
 
 std::string CpuList(const cpu_set_t &set) {
@@ -95,19 +97,20 @@ std::string CpuList(const cpu_set_t &set) {
   return out;
 }
 
-int DefaultWorkerCore() {
+CpuId DefaultWorkerCore() {
   if (FLAGS_c >= 0) {
-    return FLAGS_c;  // validated against ProcessCpus() when parsed
+    return CpuId(static_cast<uint32_t>(FLAGS_c));  // validated when parsed
   }
-  if (CpuAllowed(0)) {
-    return 0;  // the historical default
+  if (CPU_ISSET(0, &kProcessCpus)) {
+    return CpuId(0);  // the historical default
   }
   for (int i = 0; i < CPU_SETSIZE; i++) {
     if (CPU_ISSET(i, &kProcessCpus)) {
-      return i;
+      return CpuId(static_cast<uint32_t>(i));
     }
   }
-  return FLAGS_c;
+  LOG(FATAL) << "this process may run on no CPU";
+  __builtin_unreachable();
 }
 
 int PlaceControlThreads(std::span<const WorkerPlacement> workers) {

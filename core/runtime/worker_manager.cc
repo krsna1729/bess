@@ -49,7 +49,7 @@ void *run_worker(void *_arg) {
   if (memcmp(&current_worker, &kZeroWorker, sizeof(Worker)) != 0) {
     const auto *arg = static_cast<const WorkerThreadArg *>(_arg);
     LOG(ERROR) << "current_worker was not pristine at the start of worker "
-               << arg->wid << " (core " << arg->core
+               << arg->wid << " (core " << arg->core.value()
                << ") -- resetting. Stale values: wid=" << current_worker.wid()
                << " core=" << current_worker.core()
                << " socket=" << current_worker.socket()
@@ -189,7 +189,7 @@ void WorkerManager::DetachAllThreads() {
   }
 }
 
-void WorkerManager::Launch(int wid, int core, const std::string &scheduler) {
+void WorkerManager::Launch(int wid, CpuId core, const std::string &scheduler) {
   WorkerThreadArg arg = {.wid = wid, .core = core, .scheduler = nullptr};
   if (scheduler == "") {
     arg.scheduler = new DefaultScheduler();

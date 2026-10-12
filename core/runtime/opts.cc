@@ -43,13 +43,14 @@ static bool ValidateCoreID(const char *, int32_t value) {
   if (value == -1) {
     return true;  // automatic: bess::runtime::DefaultWorkerCore()
   }
-  if (!is_cpu_present(value)) {
+  const auto core = bess::runtime::CpuIdFrom(value);
+  if (!core || !bess::runtime::CpuPresent(*core)) {
     LOG(ERROR) << "Invalid core ID: " << value;
     return false;
   }
   // Inside the CPU set bessd was started with (a container's cpuset, a
   // taskset): a worker pinned elsewhere would fail to start (D-027).
-  if (!bess::runtime::CpuAllowed(value)) {
+  if (!bess::runtime::CpuAllowed(*core)) {
     LOG(ERROR) << "Core " << value << " is not in bessd's CPU set ("
                << bess::runtime::CpuList(bess::runtime::ProcessCpus()) << ")";
     return false;

@@ -578,12 +578,14 @@ ControlResult<void> ControlPlane::AddWorkerLocked(uint64_t wid, uint64_t core, c
   if (wid >= Worker::kMaxWorkers) {
     return std::unexpected(Err(EINVAL, "Invalid worker id"));
   }
-  if (!is_cpu_present(core)) {
-    return std::unexpected(Err(EINVAL, "Invalid core %d", static_cast<int>(core)));
+  const std::optional<runtime::CpuId> cpu = runtime::CpuIdFrom(core);
+  if (!cpu || !runtime::CpuPresent(*cpu)) {
+    return std::unexpected(Err(EINVAL, "Invalid core %llu",
+                               static_cast<unsigned long long>(core)));
   }
-  if (!runtime::CpuAllowed(static_cast<int>(core))) {
-    return std::unexpected(Err(EINVAL, "core %d is not in bessd's CPU set (%s)",
-                               static_cast<int>(core),
+  if (!runtime::CpuAllowed(*cpu)) {
+    return std::unexpected(Err(EINVAL, "core %u is not in bessd's CPU set (%s)",
+                               cpu->value(),
                                runtime::CpuList(runtime::ProcessCpus()).c_str()));
   }
   if (is_worker_active(wid)) {
@@ -594,7 +596,7 @@ ControlResult<void> ControlPlane::AddWorkerLocked(uint64_t wid, uint64_t core, c
                                scheduler.c_str()));
   }
 
-  launch_worker(wid, core, scheduler);
+  runtime::runtime().workers().Launch(static_cast<int>(wid), *cpu, scheduler);
   return {};
 }
 

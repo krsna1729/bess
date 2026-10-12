@@ -188,14 +188,14 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
                                            " is defined twice"));
     }
 
-    if (worker.core < 0 ||
-        !is_cpu_present(static_cast<unsigned>(worker.core))) {
+    const std::optional<runtime::CpuId> cpu = runtime::CpuIdFrom(worker.core);
+    if (!cpu || !runtime::CpuPresent(*cpu)) {
       return std::unexpected(Invalid(
           "worker", "core",
           "worker " + std::to_string(worker.wid) + ": CPU " +
               std::to_string(worker.core) + " is not present"));
     }
-    if (!runtime::CpuAllowed(worker.core)) {
+    if (!runtime::CpuAllowed(*cpu)) {
       return std::unexpected(Invalid(
           "worker", "core",
           "worker " + std::to_string(worker.wid) + ": CPU " +

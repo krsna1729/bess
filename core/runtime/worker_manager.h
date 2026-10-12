@@ -11,6 +11,7 @@
 #include <thread>
 #include <utility>
 
+#include "runtime/thread_placement.h"
 #include "traffic_class.h"
 #include "worker.h"
 
@@ -23,7 +24,7 @@ namespace runtime {
 // pinned to, and the scheduler it owns (the thread takes ownership).
 struct WorkerThreadArg {
   int wid;
-  int core;
+  CpuId core;
   Scheduler *scheduler;
 };
 
@@ -79,7 +80,7 @@ class WorkerManager {
 
   // Starts worker `wid` on `core`, and keeps this process's other threads
   // off every worker's CPU (D-027).
-  void Launch(int wid, int core, const std::string &scheduler);
+  void Launch(int wid, CpuId core, const std::string &scheduler);
   void Destroy(int wid);
   void DestroyAll();
   void DetachAllThreads();

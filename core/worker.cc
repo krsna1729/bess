@@ -95,7 +95,9 @@ bool is_worker_running(int wid) {
 }
 
 void launch_worker(int wid, int core, const std::string &scheduler) {
-  bess::runtime::runtime().workers().Launch(wid, core, scheduler);
+  const auto cpu = bess::runtime::CpuIdFrom(core);
+  CHECK(cpu.has_value()) << "CPU " << core << " is out of range";
+  bess::runtime::runtime().workers().Launch(wid, *cpu, scheduler);
 }
 
 Worker *get_next_active_worker() {
@@ -193,7 +195,7 @@ void *Worker::Run(void *_arg) {
   cpu_set_t set;
 
   CPU_ZERO(&set);
-  CPU_SET(arg->core, &set);
+  CPU_SET(arg->core.value(), &set);
   // Checked, not best-effort: registration below captures this thread's
   // cpuset and derives its NUMA/socket id from it. Silently continuing on
   // failure (a restrictive cgroup/cpuset, a CPU that is not in the process
@@ -203,7 +205,7 @@ void *Worker::Run(void *_arg) {
   // cache under a wrong lcore. Dying here is the lesser evil; rejecting the
   // worker-creation RPC instead would be nicer, later.
   CHECK_EQ(rte_thread_set_affinity(&set), 0)
-      << "failed to pin worker " << arg->wid << " to CPU " << arg->core;
+      << "failed to pin worker " << arg->wid << " to CPU " << arg->core.value();
 
   // Register this pthread as a non-EAL DPDK lcore. DPDK's per-lcore
   // machinery -- above all the default mempool cache that
@@ -234,7 +236,7 @@ void *Worker::Run(void *_arg) {
 
   wid_ = arg->wid;
   rcu_online_ = false;
-  core_ = arg->core;
+  core_ = static_cast<int>(arg->core.value());
   tid_ = gettid();  // read by the control plane once this worker is ready
   // Named for ps/top (15 characters at most); otherwise it inherits the name
   // of whichever thread launched it (a gRPC handler, say).
@@ -245,7 +247,7 @@ void *Worker::Run(void *_arg) {
   // For some reason, rte_socket_id() does not return a correct NUMA ID.
   // Nevertheless, BESS should not crash.
   if (socket_ == SOCKET_ID_ANY) {
-    LOG(WARNING) << "rte_socket_id() returned -1 for " << arg->core;
+    LOG(WARNING) << "rte_socket_id() returned -1 for " << arg->core.value();
     socket_ = 0;
   }
 

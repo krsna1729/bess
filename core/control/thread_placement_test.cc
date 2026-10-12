@@ -26,6 +26,7 @@ namespace {
 
 using bess::runtime::ControlCpus;
 using bess::runtime::CpuAllowed;
+using bess::runtime::CpuId;
 using bess::runtime::CpuList;
 using bess::runtime::ProcessCpus;
 
@@ -110,7 +111,8 @@ TEST(ThreadPlacementTest, WorkersOutsideTheSetAreRefused) {
   const long present = sysconf(_SC_NPROCESSORS_CONF);
   int outside = -1;
   for (int i = 0; i < present; i++) {
-    if (!CpuAllowed(i) && is_cpu_present(static_cast<unsigned>(i))) {
+    const CpuId cpu(static_cast<uint32_t>(i));
+    if (!CpuAllowed(cpu) && bess::runtime::CpuPresent(cpu)) {
       outside = i;
       break;
     }
@@ -125,6 +127,20 @@ TEST(ThreadPlacementTest, WorkersOutsideTheSetAreRefused) {
             std::string::npos)
       << added.error().message;
   EXPECT_FALSE(is_worker_active(0));
+}
+
+// A core id is not truncated on its way to the checks: 2^32 + an allowed CPU
+// names no CPU, so it is refused rather than started on that CPU.
+TEST(ThreadPlacementTest, CoreIdsBeyond32BitsAreRefused) {
+  InitRuntimeOnce();
+  const CpuId allowed = bess::runtime::DefaultWorkerCore();
+  ASSERT_TRUE(CpuAllowed(allowed));
+  bess::control::ControlPlane control_plane;
+  auto added = control_plane.AddWorker(
+      1, (uint64_t{1} << 32) + allowed.value(), "");
+  ASSERT_FALSE(added) << "core 2^32 + " << allowed.value() << " was accepted";
+  EXPECT_EQ(added.error().err, EINVAL);
+  EXPECT_FALSE(is_worker_active(1));
 }
 
 }  // namespace
