@@ -238,8 +238,12 @@ common_deps = [
 ]
 
 # gRPC server reflection (grpcurl and similar tools work without the protos,
-# D-026). Shipped with grpc++ but without a pkg-config file; optional.
-grpc_reflection_lib = cpp.find_library('grpc++_reflection', required: false)
+# D-026). Shipped with grpc++ but without a pkg-config file; optional. Linked
+# the way protobuf is: a static bessd with a shared libgrpc++_reflection loads a
+# second protobuf runtime (the shared one) and aborts at start-up on its empty
+# descriptor pool. No static archive: no reflection in a static bessd.
+grpc_reflection_lib = cpp.find_library('grpc++_reflection', required: false,
+                                       static: is_static_deps)
 grpc_reflection_deps = []
 if grpc_reflection_lib.found()
   grpc_reflection_deps = [declare_dependency(
