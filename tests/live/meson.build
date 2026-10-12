@@ -6,6 +6,7 @@ live_test_sources = [
   'metrics_test.cc',
   'module_traffic_test.cc',
   'classifier_traffic_test.cc',
+  'stateful_modules_test.cc',
 ]
 live_lib = static_library(
   'live_daemon',

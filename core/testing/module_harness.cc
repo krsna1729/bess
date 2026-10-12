@@ -8,6 +8,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "metadata.h"
@@ -203,7 +204,7 @@ void ModuleHarness::WireOutputs(Module *m, std::vector<gate_idx_t> ogates, Task 
   // Metadata offsets, then each module's PreResume (modules that bake
   // attribute offsets into their tables refresh them there), as a resume
   // does.
-  bess::metadata::default_pipeline.ComputeMetadataOffsets();
+  EXPECT_EQ(0, bess::metadata::default_pipeline.ComputeMetadataOffsets());
   uint32_t gates = 0;
   for (const auto &[_, module] : ModuleGraph::GetAllModules()) {
     gates += module->igates().size() + module->ogates().size();

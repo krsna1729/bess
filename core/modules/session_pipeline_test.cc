@@ -7,9 +7,10 @@
 // ledger, the removal cascade, and teardown in an order that does not respect
 // the reference graph (the desired-state planner destroys modules by name).
 //
-// The packet path itself is covered end to end by
-// bessctl/module_tests/session_pipeline.py against a live daemon; here each
-// stage's decision is driven in process.
+// Each stage's decision is driven in process; SessionPacketPathTest runs
+// packets through the connected modules (the ModuleHarness), and
+// tests/live/session_pipeline_test.cc writes transactions while a worker
+// forwards traffic.
 
 #include <gtest/gtest.h>
 
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <random>
 #include <vector>
 
 #include "runtime/runtime_state.h"
@@ -32,8 +34,11 @@
 #include "modules/exact_match.h"
 #include "modules/meter.h"
 #include "modules/router.h"
+#include "modules/router_gate_map.h"
 #include "packet_pool.h"
 #include "pb/module_msg.pb.h"
+#include "testing/module_harness.h"
+#include "testing/packet_builder.h"
 
 namespace {
 
@@ -684,5 +689,131 @@ TEST_F(SessionPipelineTest, CodecsRejectMismatchedFieldsAndUnknownEnums) {
                    .has_value());
 }
 
+// -- The packet path end to end (was bessctl/module_tests/session_pipeline.py):
+// em:0 -> at, at:0 -> mt, mt:0 (green) -> rt, packets run through the real
+// module graph; yellow and red are left unconnected, so those packets are
+// dropped -- the policy is the graph.
+
+// Where a session's next hop sends the packet: a router output gate.
+constexpr gate_idx_t kEgressGate = 7;
+
+// The rule key of a packet from `sip`:`sport`, as the packet carries them.
+std::string WireKey(const char *sip, uint16_t sport) {
+  const auto ip = bess::testing::Ip4(sip);
+  std::string key(ip.begin(), ip.end());
+  key.push_back(static_cast<char>(sport >> 8));
+  key.push_back(static_cast<char>(sport & 0xff));
+  return key;
+}
+
+bess::testing::Bytes SessionPacket(const char *sip, uint16_t sport, std::mt19937 &rng) {
+  return bess::testing::TcpPacket({.sip = sip, .dip = "10.9.9.9", .sport = sport, .dport = 80},
+                                  rng);
+}
+
+class SessionPacketPathTest : public SessionPipelineTest {
+ protected:
+  // The four modules, created referrer-first (the ExactMatch and the
+  // ActionTable name resources of modules that do not exist yet), connected.
+  void SetUp() override {
+    at_ = CreateActionTable("at", "mt/meters", "rt/next_hops");
+    em_ = CreateExactMatch("em", "at/actions");
+    mt_ = CreateMeterModule("mt", 64);
+    rt_ = CreateRouterModule("rt");
+    ASSERT_NE(nullptr, at_);
+    ASSERT_NE(nullptr, em_);
+    ASSERT_NE(nullptr, mt_);
+    ASSERT_NE(nullptr, rt_);
+    // No default hooks (Track counts per worker; the harness is not one).
+    ASSERT_EQ(0, ModuleGraph::ConnectModules(em_, 0, at_, 0, true));
+    ASSERT_EQ(0, ModuleGraph::ConnectModules(at_, 0, mt_, 0, true));
+    ASSERT_EQ(0, ModuleGraph::ConnectModules(mt_, Meter::kGreenGate, rt_, 0, true));
+  }
+
+  // One session: the meter (`burst` bytes, no refill), the next hop to
+  // kEgressGate, the route to it, the action naming both, and the rule.
+  std::vector<Op> SessionOps(const char *sip, uint16_t sport, uint64_t burst) {
+    return {
+        Op::Upsert("mt/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                   std::any(bess::meter::MeterProfileSpec{SlowMeter(burst)})),
+        rt_->router()->SetNextHopOp(
+            NextHopId(1), HopWithEgress(bess::modules::router::InterfaceOf(kEgressGate).value())),
+        rt_->router()->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(1)),
+        Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(1)),
+                   std::any(ActionTable::Action{MeterId(1), NextHopId(1)})),
+        Op::Upsert("em/rules", WireKey(sip, sport), std::any(uint64_t{1})),
+    };
+  }
+
+  // What leaves the router's egress gate for `pkts` sent into the ExactMatch.
+  std::vector<bess::testing::Bytes> Egress(const std::vector<bess::testing::Bytes> &pkts) {
+    return h_.RunPipeline(em_, 0, pkts, rt_, {kEgressGate})[kEgressGate];
+  }
+
+  bess::testing::ModuleHarness h_;
+  ExactMatch *em_ = nullptr;
+  ActionTable *at_ = nullptr;
+  Meter *mt_ = nullptr;
+  Router *rt_ = nullptr;
+  std::mt19937 rng_{7};
+};
+
+// One transaction creates the whole session; two 60-byte packets of it: the
+// meter's 100-byte buckets take the first (green -> the router -> the next
+// hop's egress, unchanged) and not the second (red -> dropped).
+TEST_F(SessionPacketPathTest, SessionTransactionSteersAndPolices) {
+  for (const char *name : {"em/rules", "at/actions", "mt/meters", "rt/next_hops", "rt/routes"}) {
+    EXPECT_NE(nullptr, Engine().FindResource(name)) << name;
+  }
+  auto r = Apply(SessionOps("10.1.2.3", 1234, 100));
+  ASSERT_EQ(Outcome::kApplied, r.outcome) << (r.ops.empty() ? "" : r.ops[0].error);
+
+  const auto pkt1 = SessionPacket("10.1.2.3", 1234, rng_);
+  const auto pkt2 = SessionPacket("10.1.2.3", 1234, rng_);
+  ASSERT_EQ(60u, pkt1.size());
+  EXPECT_EQ((std::vector<bess::testing::Bytes>{pkt1}), Egress({pkt1, pkt2}));
+}
+
+// A packet whose rule does not match takes the ExactMatch default gate
+// (drop); a packet whose action names no next hop is dropped at the router.
+TEST_F(SessionPacketPathTest, OtherSessionsAndMissesAreDropped) {
+  auto r = Apply(SessionOps("10.1.2.3", 1234, 100));
+  ASSERT_EQ(Outcome::kApplied, r.outcome) << (r.ops.empty() ? "" : r.ops[0].error);
+  r = Apply({
+      Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(2)),
+                 std::any(ActionTable::Action{MeterId(0), NextHopId(0)})),
+      Op::Upsert("em/rules", WireKey("10.4.4.4", 4321), std::any(uint64_t{2})),
+  });
+  ASSERT_EQ(Outcome::kApplied, r.outcome) << (r.ops.empty() ? "" : r.ops[0].error);
+
+  const auto miss = SessionPacket("192.0.2.1", 1234, rng_);
+  const auto other = SessionPacket("10.4.4.4", 4321, rng_);
+  EXPECT_TRUE(Egress({miss, other}).empty());
+  // The session's own packet still goes through.
+  const auto own = SessionPacket("10.1.2.3", 1234, rng_);
+  EXPECT_EQ((std::vector<bess::testing::Bytes>{own}), Egress({own}));
+}
+
+// Removing the session -- the rule, the action, the route, the next hop and
+// the meter in one transaction -- stops its packets. (That the meter alone
+// may not go while the action names it is RejectionsLeaveNothingChanged.)
+TEST_F(SessionPacketPathTest, RemovedSessionIsDropped) {
+  // 1000-byte buckets: the meter would pass both packets.
+  auto r = Apply(SessionOps("10.1.2.3", 1234, 1000));
+  ASSERT_EQ(Outcome::kApplied, r.outcome) << (r.ops.empty() ? "" : r.ops[0].error);
+  const auto pkt = SessionPacket("10.1.2.3", 1234, rng_);
+  ASSERT_EQ((std::vector<bess::testing::Bytes>{pkt}), Egress({pkt}));
+
+  r = Apply({
+      Op::Erase("em/rules", WireKey("10.1.2.3", 1234)),
+      Op::Erase("at/actions", bess::dataplane::EncodeKey(ActionId(1))),
+      rt_->router()->RemoveRouteOp(P(Ip(10, 0, 0, 0), 8)),
+      rt_->router()->RemoveNextHopOp(NextHopId(1)),
+      Op::Erase("mt/meters", bess::dataplane::EncodeKey(MeterId(1))),
+  });
+  ASSERT_EQ(Outcome::kApplied, r.outcome) << (r.ops.empty() ? "" : r.ops[0].error);
+  Settle();
+  EXPECT_TRUE(Egress({pkt}).empty());
+}
 
 }  // namespace

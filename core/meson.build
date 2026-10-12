@@ -730,6 +730,7 @@ unit_test_sources = [
   'modules/wildcard_match_test.cc',
   'modules/wildcard_match_transaction_test.cc',
   'modules/l2_forward_test.cc',
+  'modules/nat_test.cc',
   'modules/vif_test.cc',
   'modules/packet_store_test.cc',
   'modules/bypass_test.cc',
