@@ -1147,8 +1147,8 @@ programs into eBPF.
 ## D-019 DRR: a multi-producer ingress ring; the task's worker owns all flow state
 
 **Status:** accepted (2026-09-27), with a single-worker cost recorded.
-**Code:** `core/modules/drr.{h,cc}`, `bessctl/module_tests/drr.py`
-(`test_drr_cross_worker`).
+**Code:** `core/modules/drr.{h,cc}`, `tests/live/module_traffic_test.cc`
+(`DrrAcrossWorkersWithLiveCommands`).
 
 **Context.** DRR allows any number of workers. Upstream workers ran
 `ProcessBatch`, which looked flows up, created them, and could replace a

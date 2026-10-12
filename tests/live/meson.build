@@ -4,8 +4,8 @@ live_test_sources = [
   'bessctl_test.cc',
   'metrics_test.cc',
   'module_traffic_test.cc',
+  'classifier_traffic_test.cc',
 ]
-
 live_lib = static_library(
   'live_daemon',
   'live_daemon.cc',

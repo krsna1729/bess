@@ -50,12 +50,19 @@ class ModuleHarness {
   // The refusal of Init(`arg`) ("" when it accepted; the module is then
   // destroyed again).
   std::string CreateError(const std::string &mclass, const google::protobuf::Message &arg);
+  // The same refusal with its errno (code 0 when Init accepted).
+  pb_error_t CreateFailure(const std::string &mclass, const google::protobuf::Message &arg);
 
   // Runs `in` into `m`'s input gate `igate` and returns what reached each
   // gate of `ogates` (by default 0-15 as far as `m` has them).
   std::map<gate_idx_t, std::vector<Bytes>> Run(Module *m, gate_idx_t igate,
                                                const std::vector<Bytes> &in,
                                                std::vector<gate_idx_t> ogates = {});
+  // Runs `m`'s first task (a task module: DRR, Queue, ...) once and returns
+  // what reached each gate of `ogates` (by default 0-15 as far as `m` has
+  // them): what the module sends of the packets fed to it before.
+  std::map<gate_idx_t, std::vector<Bytes>> RunTask(Module *m,
+                                                   std::vector<gate_idx_t> ogates = {});
 
   // Runs `in` into `first`'s input gate `igate` through the modules the test
   // connected (ModuleGraph::ConnectModules) and returns what reached each of
@@ -74,6 +81,11 @@ class ModuleHarness {
                                     const google::protobuf::Message &arg);
 
  private:
+  // Connects exactly `m`'s gates `ogates` to the capture (all of 0-15 that
+  // `m` has when empty) and sizes `task`'s per-gate batches.
+  void WireOutputs(Module *m, std::vector<gate_idx_t> ogates, Task &task);
+  // Runs `task` once.
+  static void RunOnce(Task &task);
   Module *capture_ = nullptr;
   Module *injector_ = nullptr;
   int next_name_ = 0;

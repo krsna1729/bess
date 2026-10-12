@@ -9,12 +9,19 @@
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <set>
+#include <utility>
 #include <vector>
 
 #include "packet_pool.h"
+#include "pb/module_msg.pb.h"
+#include "testing/module_harness.h"
+#include "testing/packet_builder.h"
 
 class DrrTestPeer {
  public:
@@ -372,6 +379,51 @@ TEST(DrrIngressTest, FullIngressDropsAndFreesTheExcess) {
     EXPECT_EQ(pool.Size(), capacity - (DRR::kIngressSize - 1));
   }
   EXPECT_EQ(pool.Size(), capacity);
+}
+
+}  // namespace
+
+// -- as bessd runs it (was bessctl/module_tests/drr.py) ------------------------
+
+namespace {
+
+using Frame = bess::testing::Bytes;
+using bess::testing::ModuleHarness;
+
+bess::pb::DRRArg DrrArg(uint32_t num_flows, uint64_t quantum, uint32_t max_flow_queue_size) {
+  bess::pb::DRRArg arg;
+  arg.set_num_flows(num_flows);
+  arg.set_quantum(quantum);
+  arg.set_max_flow_queue_size(max_flow_queue_size);
+  return arg;
+}
+
+// A packet in comes out of DRR's task unchanged, for each flow in turn
+// (flows repeat and new ones arrive).
+TEST(DrrModuleTest, EachPacketComesOutOfTheTaskUnchanged) {
+  ModuleHarness h;
+  Module *drr = h.Create("DRR", DrrArg(4, 0, 100));
+  ASSERT_NE(nullptr, drr);
+  std::mt19937 rng(1);
+  const std::pair<const char *, const char *> flows[] = {
+      {"22.22.22.1", "22.22.22.1"}, {"22.22.22.1", "22.22.22.1"}, {"22.22.11.1", "22.22.11.1"},
+      {"22.22.11.1", "22.22.11.1"}, {"22.11.11.1", "22.1.11.1"},
+  };
+  for (const auto &[src, dst] : flows) {
+    const Frame pkt = bess::testing::TcpPacket({.sip = src, .dip = dst}, rng);
+    EXPECT_TRUE(h.Run(drr, 0, {pkt}, {0})[0].empty()) << "queued, not forwarded inline";
+    EXPECT_EQ((std::vector<Frame>{pkt}), h.RunTask(drr, {0})[0]) << src << " -> " << dst;
+  }
+  EXPECT_TRUE(h.RunTask(drr, {0})[0].empty()) << "nothing left queued";
+}
+
+// quantum is uint64 on the wire but stored as uint32 (2^32 + 1 became 1);
+// num_flows + 1 overflowed at UINT32_MAX.
+TEST(DrrModuleTest, ArgumentsDoNotWrap) {
+  ModuleHarness h;
+  EXPECT_EQ(EINVAL, h.CreateFailure("DRR", DrrArg(0, (1ull << 32) + 1, 0)).code());
+  EXPECT_EQ(EINVAL, h.CreateFailure("DRR", DrrArg(UINT32_MAX, 0, 0)).code());
+  EXPECT_EQ(0, h.CreateFailure("DRR", DrrArg(1024, 1500, 0)).code());
 }
 
 }  // namespace

@@ -161,14 +161,64 @@ Module *ModuleHarness::Create(const std::string &mclass, const google::protobuf:
 
 std::string ModuleHarness::CreateError(const std::string &mclass,
                                        const google::protobuf::Message &arg) {
-  pb_error_t error;
-  Module *m = CreateRaw(mclass, arg, "refused" + std::to_string(next_name_++), &error);
-  if (m != nullptr) {
-    ModuleGraph::DestroyModule(m);
+  const pb_error_t error = CreateFailure(mclass, arg);
+  if (error.code() == 0) {
     return "";
   }
   return error.errmsg().empty() ? "refused (code " + std::to_string(error.code()) + ")"
                                 : error.errmsg();
+}
+
+pb_error_t ModuleHarness::CreateFailure(const std::string &mclass,
+                                        const google::protobuf::Message &arg) {
+  pb_error_t error;
+  Module *m = CreateRaw(mclass, arg, "refused" + std::to_string(next_name_++), &error);
+  if (m != nullptr) {
+    ModuleGraph::DestroyModule(m);
+    return pb_error_t();
+  }
+  return error;
+}
+
+void ModuleHarness::WireOutputs(Module *m, std::vector<gate_idx_t> ogates, Task &task) {
+  if (ogates.empty()) {
+    for (gate_idx_t g = 0; g < 16 && g < m->module_builder()->NumOGates(); g++) {
+      ogates.push_back(g);
+    }
+  }
+  // Only the gates asked for reach the capture, whatever an earlier Run
+  // connected.
+  for (gate_idx_t g = 0; g < m->ogates().size(); g++) {
+    if (m->ogates()[g] != nullptr) {
+      ModuleGraph::DisconnectModule(m, g);
+    }
+  }
+  for (gate_idx_t g : ogates) {
+    EXPECT_EQ(0, ModuleGraph::ConnectModules(m, g, capture_, g, true)) << "output gate " << g;
+  }
+  // Global gate indexes, as a resume assigns them (every connected input
+  // gate, then every output gate); the task's per-gate batches are indexed
+  // by them.
+  ModuleGraph::UpdateTaskGraph();
+  // Metadata offsets, then each module's PreResume (modules that bake
+  // attribute offsets into their tables refresh them there), as a resume
+  // does.
+  bess::metadata::default_pipeline.ComputeMetadataOffsets();
+  uint32_t gates = 0;
+  for (const auto &[_, module] : ModuleGraph::GetAllModules()) {
+    gates += module->igates().size() + module->ogates().size();
+    module->OnEvent(bess::Event::PreResume);
+  }
+  task.UpdatePerGateBatch(gates + 1);
+}
+
+void ModuleHarness::RunOnce(Task &task) {
+  Context ctx = {};
+  ctx.wid = 0;
+  ctx.task = &task;
+  ctx.current_tsc = rdtsc();
+  ctx.current_ns = tsc_to_ns(ctx.current_tsc);
+  task(&ctx);
 }
 
 std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::Run(Module *m, gate_idx_t igate,
@@ -185,52 +235,37 @@ std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::RunPipeline(
     ADD_FAILURE() << "no module to run";
     return out;
   }
-  if (ogates.empty()) {
-    for (gate_idx_t g = 0; g < 16 && g < last->module_builder()->NumOGates(); g++) {
-      ogates.push_back(g);
-    }
-  }
   ModuleGraph::DisconnectModule(injector_, 0);
   EXPECT_EQ(0, ModuleGraph::ConnectModules(injector_, 0, first, igate, true));
-  // Only the gates asked for reach the capture, whatever an earlier Run
-  // connected.
-  for (gate_idx_t g = 0; g < last->ogates().size(); g++) {
-    if (last->ogates()[g] != nullptr) {
-      ModuleGraph::DisconnectModule(last, g);
-    }
-  }
-  for (gate_idx_t g : ogates) {
-    EXPECT_EQ(0, ModuleGraph::ConnectModules(last, g, capture_, g, true)) << "output gate " << g;
-  }
-  // Global gate indexes, as a resume assigns them (every connected input
-  // gate, then every output gate); the task's per-gate batches are indexed
-  // by them.
-  ModuleGraph::UpdateTaskGraph();
-  // Metadata offsets, then each module's PreResume (modules that bake
-  // attribute offsets into their tables refresh them there), as a resume
-  // does.
-  bess::metadata::default_pipeline.ComputeMetadataOffsets();
-  uint32_t gates = 0;
-  for (const auto &[_, module] : ModuleGraph::GetAllModules()) {
-    gates += module->igates().size() + module->ogates().size();
-    module->OnEvent(bess::Event::PreResume);
-  }
-
-  captured = &out;
   Task task(injector_, nullptr);
-  task.UpdatePerGateBatch(gates + 1);
+  WireOutputs(last, std::move(ogates), task);
+  captured = &out;
   // One task run per burst: a batch holds kMaxBurst packets.
   for (size_t at = 0; at < in.size(); at += bess::PacketBatch::kMaxBurst) {
     const size_t n = std::min<size_t>(bess::PacketBatch::kMaxBurst, in.size() - at);
     pending.assign(in.begin() + static_cast<ptrdiff_t>(at),
                    in.begin() + static_cast<ptrdiff_t>(at + n));
-    Context ctx = {};
-    ctx.wid = 0;
-    ctx.task = &task;
-    ctx.current_tsc = rdtsc();
-    ctx.current_ns = tsc_to_ns(ctx.current_tsc);
-    task(&ctx);
+    RunOnce(task);
   }
+  captured = nullptr;
+  return out;
+}
+
+std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::RunTask(Module *m,
+                                                                std::vector<gate_idx_t> ogates) {
+  std::map<gate_idx_t, std::vector<Bytes>> out;
+  if (m == nullptr || capture_ == nullptr) {
+    ADD_FAILURE() << "no module to run";
+    return out;
+  }
+  if (m->tasks().empty()) {
+    ADD_FAILURE() << m->name() << " registered no task";
+    return out;
+  }
+  Task task(m, m->tasks()[0]->arg());
+  WireOutputs(m, std::move(ogates), task);
+  captured = &out;
+  RunOnce(task);
   captured = nullptr;
   return out;
 }
