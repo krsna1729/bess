@@ -223,7 +223,7 @@ static void collect_tc(const bess::TrafficClass* c, int wid,
   if (c->policy() == bess::POLICY_RATE_LIMIT) {
     const bess::RateLimitTrafficClass* rl =
         reinterpret_cast<const bess::RateLimitTrafficClass*>(c);
-    std::string resource = bess::ResourceName.at(rl->resource());
+    std::string resource(bess::ResourceName(rl->resource()));
     int64_t limit = rl->limit_arg();
     int64_t max_burst = rl->max_burst_arg();
     status->mutable_class_()->mutable_limit()->insert({resource, limit});
@@ -471,10 +471,10 @@ class BESSControlImpl final : public BESSControl::Service {
     }
 
     response->set_timestamp(get_epoch_time());
-    response->set_count(c->stats().usage[bess::RESOURCE_COUNT]);
-    response->set_cycles(c->stats().usage[bess::RESOURCE_CYCLE]);
-    response->set_packets(c->stats().usage[bess::RESOURCE_PACKET]);
-    response->set_bits(c->stats().usage[bess::RESOURCE_BIT]);
+    response->set_count(c->stats().usage[bess::Resource::kCount]);
+    response->set_cycles(c->stats().usage[bess::Resource::kCycle]);
+    response->set_packets(c->stats().usage[bess::Resource::kPacket]);
+    response->set_bits(c->stats().usage[bess::Resource::kBit]);
 
     return Status::OK;
   }

@@ -243,7 +243,7 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
 
     if (tc.policy == TrafficPolicyName[POLICY_WEIGHTED_FAIR] ||
         tc.policy == TrafficPolicyName[POLICY_RATE_LIMIT]) {
-      if (ResourceMap.count(tc.resource) == 0) {
+      if (!ResourceFromName(tc.resource)) {
         return std::unexpected(Invalid(
             "tc", "resource",
             "traffic class '" + tc.name + "': invalid resource '" +

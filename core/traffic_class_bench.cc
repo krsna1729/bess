@@ -20,6 +20,10 @@ using namespace bess::traffic_class_initializer_types;
 
 namespace {
 
+// The fixture's second argument: the resource, as an integer.
+constexpr int64_t kCountArg = static_cast<int64_t>(Resource::kCount);
+constexpr int64_t kCycleArg = static_cast<int64_t>(Resource::kCycle);
+
 class DummyModule : public Module {
  public:
   struct task_result RunTask(Context *, bess::PacketBatch *,
@@ -40,7 +44,7 @@ class TCWeightedFair : public benchmark::Fixture {
 
   void SetUp(benchmark::State &state) override {
     int num_classes = state.range(0);
-    resource_t resource = (resource_t)state.range(1);
+    const auto resource = static_cast<Resource>(state.range(1));
 
     dummy_ = new DummyModule;
 
@@ -79,7 +83,7 @@ class TCWeightedFair : public benchmark::Fixture {
   Module *dummy_;
 };
 
-// Benchmarks the schedule_once() routine in TC.  For RESOURCE_CNT.
+// Benchmarks the schedule_once() routine in TC.  For Resource::kCount.
 BENCHMARK_DEFINE_F(TCWeightedFair, TCScheduleOnceCount)
 (benchmark::State &state) {
   while (state.KeepRunning()) {
@@ -90,7 +94,7 @@ BENCHMARK_DEFINE_F(TCWeightedFair, TCScheduleOnceCount)
   state.SetComplexityN(state.range(0));
 }
 
-// Benchmarks the schedule_once() routine in TC.  For RESOURCE_CYCLE.
+// Benchmarks the schedule_once() routine in TC.  For Resource::kCycle.
 BENCHMARK_DEFINE_F(TCWeightedFair, TCScheduleOnceCycle)
 (benchmark::State &state) {
   while (state.KeepRunning()) {
@@ -102,39 +106,39 @@ BENCHMARK_DEFINE_F(TCWeightedFair, TCScheduleOnceCycle)
 }
 
 BENCHMARK_REGISTER_F(TCWeightedFair, TCScheduleOnceCount)
-    ->Args({4 << 0, bess::RESOURCE_COUNT})
-    ->Args({4 << 1, bess::RESOURCE_COUNT})
-    ->Args({4 << 2, bess::RESOURCE_COUNT})
-    ->Args({4 << 3, bess::RESOURCE_COUNT})
-    ->Args({4 << 4, bess::RESOURCE_COUNT})
-    ->Args({4 << 5, bess::RESOURCE_COUNT})
-    ->Args({4 << 6, bess::RESOURCE_COUNT})
-    ->Args({4 << 7, bess::RESOURCE_COUNT})
-    ->Args({4 << 8, bess::RESOURCE_COUNT})
-    ->Args({4 << 9, bess::RESOURCE_COUNT})
-    ->Args({4 << 10, bess::RESOURCE_COUNT})
-    ->Args({4 << 11, bess::RESOURCE_COUNT})
-    ->Args({4 << 12, bess::RESOURCE_COUNT})
-    ->Args({4 << 13, bess::RESOURCE_COUNT})
-    ->Args({4 << 14, bess::RESOURCE_COUNT})
+    ->Args({4 << 0, kCountArg})
+    ->Args({4 << 1, kCountArg})
+    ->Args({4 << 2, kCountArg})
+    ->Args({4 << 3, kCountArg})
+    ->Args({4 << 4, kCountArg})
+    ->Args({4 << 5, kCountArg})
+    ->Args({4 << 6, kCountArg})
+    ->Args({4 << 7, kCountArg})
+    ->Args({4 << 8, kCountArg})
+    ->Args({4 << 9, kCountArg})
+    ->Args({4 << 10, kCountArg})
+    ->Args({4 << 11, kCountArg})
+    ->Args({4 << 12, kCountArg})
+    ->Args({4 << 13, kCountArg})
+    ->Args({4 << 14, kCountArg})
     ->Complexity();
 
 BENCHMARK_REGISTER_F(TCWeightedFair, TCScheduleOnceCycle)
-    ->Args({4 << 0, bess::RESOURCE_CYCLE})
-    ->Args({4 << 1, bess::RESOURCE_CYCLE})
-    ->Args({4 << 2, bess::RESOURCE_CYCLE})
-    ->Args({4 << 3, bess::RESOURCE_CYCLE})
-    ->Args({4 << 4, bess::RESOURCE_CYCLE})
-    ->Args({4 << 5, bess::RESOURCE_CYCLE})
-    ->Args({4 << 6, bess::RESOURCE_CYCLE})
-    ->Args({4 << 7, bess::RESOURCE_CYCLE})
-    ->Args({4 << 8, bess::RESOURCE_CYCLE})
-    ->Args({4 << 9, bess::RESOURCE_CYCLE})
-    ->Args({4 << 10, bess::RESOURCE_CYCLE})
-    ->Args({4 << 11, bess::RESOURCE_CYCLE})
-    ->Args({4 << 12, bess::RESOURCE_CYCLE})
-    ->Args({4 << 13, bess::RESOURCE_CYCLE})
-    ->Args({4 << 14, bess::RESOURCE_CYCLE})
+    ->Args({4 << 0, kCycleArg})
+    ->Args({4 << 1, kCycleArg})
+    ->Args({4 << 2, kCycleArg})
+    ->Args({4 << 3, kCycleArg})
+    ->Args({4 << 4, kCycleArg})
+    ->Args({4 << 5, kCycleArg})
+    ->Args({4 << 6, kCycleArg})
+    ->Args({4 << 7, kCycleArg})
+    ->Args({4 << 8, kCycleArg})
+    ->Args({4 << 9, kCycleArg})
+    ->Args({4 << 10, kCycleArg})
+    ->Args({4 << 11, kCycleArg})
+    ->Args({4 << 12, kCycleArg})
+    ->Args({4 << 13, kCycleArg})
+    ->Args({4 << 14, kCycleArg})
     ->Complexity();
 
 // Performs TC Scheduler init/deinit before/after each test.

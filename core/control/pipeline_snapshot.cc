@@ -188,12 +188,12 @@ PipelineSnapshot SnapshotRuntime(const runtime::RuntimeState &runtime) {
     switch (c->policy()) {
       case POLICY_WEIGHTED_FAIR: {
         const auto *wrr = static_cast<const WeightedFairTrafficClass *>(c);
-        entry.resource = ResourceName.at(wrr->resource());
+        entry.resource = ResourceName(wrr->resource());
         break;
       }
       case POLICY_RATE_LIMIT: {
         const auto *rl = static_cast<const RateLimitTrafficClass *>(c);
-        entry.resource = ResourceName.at(rl->resource());
+        entry.resource = ResourceName(rl->resource());
         entry.limit = rl->limit_arg();
         entry.max_burst = rl->max_burst_arg();
         break;

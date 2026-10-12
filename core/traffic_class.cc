@@ -15,6 +15,24 @@
 
 namespace bess {
 
+namespace {
+constexpr std::array<std::string_view, kNumResources> kResourceNames = {
+    "count", "cycle", "packet", "bit"};
+}  // namespace
+
+std::string_view ResourceName(Resource r) {
+  return kResourceNames[static_cast<size_t>(r)];
+}
+
+std::optional<Resource> ResourceFromName(std::string_view name) {
+  for (size_t i = 0; i < kNumResources; i++) {
+    if (kResourceNames[i] == name) {
+      return static_cast<Resource>(i);
+    }
+  }
+  return std::nullopt;
+}
+
 size_t TrafficClass::Size() const {
   size_t ret = 1;  // itself
   for (const auto *child : Children()) {
@@ -121,9 +139,9 @@ void PriorityTrafficClass::BlockTowardsRoot() {
 }
 
 void PriorityTrafficClass::FinishAndAccountTowardsRoot(
-    SchedWakeupQueue *wakeup_queue, TrafficClass *child, resource_arr_t usage,
-    uint64_t tsc) {
-  ACCUMULATE(stats_.usage, usage);
+    SchedWakeupQueue *wakeup_queue, TrafficClass *child,
+    const ResourceUsage &usage, uint64_t tsc) {
+  stats_.usage += usage;
 
   if (child->blocked_) {
     // Find the next child that isn't blocked, if there is one.
@@ -242,9 +260,9 @@ void WeightedFairTrafficClass::BlockTowardsRoot() {
 }
 
 void WeightedFairTrafficClass::FinishAndAccountTowardsRoot(
-    SchedWakeupQueue *wakeup_queue, TrafficClass *child, resource_arr_t usage,
-    uint64_t tsc) {
-  ACCUMULATE(stats_.usage, usage);
+    SchedWakeupQueue *wakeup_queue, TrafficClass *child,
+    const ResourceUsage &usage, uint64_t tsc) {
+  stats_.usage += usage;
 
   auto &item = runnable_children_.mutable_top();
   uint64_t consumed = usage[resource_];
@@ -377,15 +395,15 @@ void RoundRobinTrafficClass::BlockTowardsRoot() {
 }
 
 void RoundRobinTrafficClass::FinishAndAccountTowardsRoot(
-    SchedWakeupQueue *wakeup_queue, TrafficClass *child, resource_arr_t usage,
-    uint64_t tsc) {
-  ACCUMULATE(stats_.usage, usage);
+    SchedWakeupQueue *wakeup_queue, TrafficClass *child,
+    const ResourceUsage &usage, uint64_t tsc) {
+  stats_.usage += usage;
   if (child->blocked_) {
     runnable_children_.erase(runnable_children_.begin() + next_child_);
     blocked_children_.push_back(child);
     blocked_ = runnable_children_.empty();
   } else {
-    next_child_ += usage[RESOURCE_COUNT];
+    next_child_ += usage[Resource::kCount];
   }
 
   // Wrap around for round robin.
@@ -457,9 +475,9 @@ void RateLimitTrafficClass::BlockTowardsRoot() {
 }
 
 void RateLimitTrafficClass::FinishAndAccountTowardsRoot(
-    SchedWakeupQueue *wakeup_queue, TrafficClass *child, resource_arr_t usage,
-    uint64_t tsc) {
-  ACCUMULATE(stats_.usage, usage);
+    SchedWakeupQueue *wakeup_queue, TrafficClass *child,
+    const ResourceUsage &usage, uint64_t tsc) {
+  stats_.usage += usage;
   uint64_t elapsed_cycles = tsc - last_tsc_;
   last_tsc_ = tsc;
 

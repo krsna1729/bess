@@ -20,7 +20,7 @@
 namespace bess {
 
 struct sched_stats {
-  resource_arr_t usage;
+  ResourceUsage usage;
   uint64_t cnt_idle;
   uint64_t cycles_idle;
 };
@@ -281,7 +281,7 @@ class DefaultScheduler : public Scheduler {
 
   // Runs the scheduler once.
   void ScheduleOnce(Context *ctx) {
-    resource_arr_t usage;
+    ResourceUsage usage;
 
     // Schedule.
     LeafTrafficClass *leaf = Scheduler::Next(this->checkpoint_);
@@ -302,14 +302,14 @@ class DefaultScheduler : public Scheduler {
       now = rdtsc();
 
       // Account.
-      usage[RESOURCE_COUNT] = 1;
-      usage[RESOURCE_CYCLE] = now - this->checkpoint_;
-      usage[RESOURCE_PACKET] = ret.packets;
-      usage[RESOURCE_BIT] = ret.bits;
+      usage[Resource::kCount] = 1;
+      usage[Resource::kCycle] = now - this->checkpoint_;
+      usage[Resource::kPacket] = ret.packets;
+      usage[Resource::kBit] = ret.bits;
 
       current_worker.incr_silent_drops(ctx->silent_drops);
       // TODO(barath): Re-enable scheduler-wide stats accumulation.
-      // accumulate(stats_.usage, usage);
+      // stats_.usage += usage;
 
       leaf->FinishAndAccountTowardsRoot(&this->wakeup_queue_, nullptr, usage,
                                         now);
@@ -385,7 +385,7 @@ class ExperimentalScheduler : public Scheduler {
 
   // Runs the scheduler once.
   void ScheduleOnce(Context *ctx) {
-    resource_arr_t usage;
+    ResourceUsage usage;
 
     // Schedule.
     LeafTrafficClass *leaf = Scheduler::Next(this->checkpoint_);
@@ -412,17 +412,17 @@ class ExperimentalScheduler : public Scheduler {
         leaf->wakeup_time_ = now + leaf->wait_cycles();
         this->wakeup_queue_.Add(leaf);
 
-        usage[RESOURCE_COUNT] = 0;
-        usage[RESOURCE_CYCLE] = 0;
-        usage[RESOURCE_PACKET] = 0;
-        usage[RESOURCE_BIT] = 0;
+        usage[Resource::kCount] = 0;
+        usage[Resource::kCycle] = 0;
+        usage[Resource::kPacket] = 0;
+        usage[Resource::kBit] = 0;
       } else {
         leaf->set_wait_cycles((leaf->wait_cycles() + 1) >> 1);
 
-        usage[RESOURCE_COUNT] = 1;
-        usage[RESOURCE_CYCLE] = now - this->checkpoint_;
-        usage[RESOURCE_PACKET] = ret.packets;
-        usage[RESOURCE_BIT] = ret.bits;
+        usage[Resource::kCount] = 1;
+        usage[Resource::kCycle] = now - this->checkpoint_;
+        usage[Resource::kPacket] = ret.packets;
+        usage[Resource::kBit] = ret.bits;
       }
 
       // Account.

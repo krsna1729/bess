@@ -755,14 +755,14 @@ ControlResult<void> ControlPlane::AddTcLocked(const TrafficClassSpec& spec) {
         TrafficClassBuilder::CreateTrafficClass<bess::PriorityTrafficClass>(
             tc_name));
   } else if (policy == bess::TrafficPolicyName[bess::POLICY_WEIGHTED_FAIR]) {
-    if (bess::ResourceMap.count(spec.resource) == 0) {
+    const std::optional<bess::Resource> resource =
+        bess::ResourceFromName(spec.resource);
+    if (!resource) {
       return std::unexpected(Err(EINVAL, "Invalid resource"));
     }
     c = reinterpret_cast<bess::TrafficClass*>(
         TrafficClassBuilder::CreateTrafficClass<
-            bess::WeightedFairTrafficClass>(tc_name,
-                                            bess::ResourceMap.at(
-                                                spec.resource)));
+            bess::WeightedFairTrafficClass>(tc_name, *resource));
   } else if (policy == bess::TrafficPolicyName[bess::POLICY_ROUND_ROBIN]) {
     c = reinterpret_cast<bess::TrafficClass*>(
         TrafficClassBuilder::CreateTrafficClass<bess::RoundRobinTrafficClass>(
@@ -770,7 +770,9 @@ ControlResult<void> ControlPlane::AddTcLocked(const TrafficClassSpec& spec) {
   } else if (policy == bess::TrafficPolicyName[bess::POLICY_RATE_LIMIT]) {
     uint64_t limit = 0;
     uint64_t max_burst = 0;
-    if (bess::ResourceMap.count(spec.resource) == 0) {
+    const std::optional<bess::Resource> resource =
+        bess::ResourceFromName(spec.resource);
+    if (!resource) {
       return std::unexpected(Err(EINVAL, "Invalid resource"));
     }
     if (auto bad = NegativeRate(spec)) {
@@ -784,7 +786,7 @@ ControlResult<void> ControlPlane::AddTcLocked(const TrafficClassSpec& spec) {
     }
     c = reinterpret_cast<bess::TrafficClass*>(
         TrafficClassBuilder::CreateTrafficClass<bess::RateLimitTrafficClass>(
-            tc_name, bess::ResourceMap.at(spec.resource), limit, max_burst));
+            tc_name, *resource, limit, max_burst));
   } else if (policy == bess::TrafficPolicyName[bess::POLICY_LEAF]) {
     return std::unexpected(Err(EINVAL,
                                "Cannot create leaf TC. Use "
@@ -822,14 +824,16 @@ ControlResult<void> ControlPlane::UpdateTcParamsLocked(
   if (c->policy() == bess::POLICY_RATE_LIMIT) {
     bess::RateLimitTrafficClass* tc =
         reinterpret_cast<bess::RateLimitTrafficClass*>(c);
-    if (bess::ResourceMap.count(spec.resource) == 0) {
+    const std::optional<bess::Resource> resource =
+        bess::ResourceFromName(spec.resource);
+    if (!resource) {
       return std::unexpected(Err(EINVAL, "Invalid resource"));
     }
     // Before any mutation: a refused update must change nothing.
     if (auto bad = NegativeRate(spec)) {
       return std::unexpected(*bad);
     }
-    tc->set_resource(bess::ResourceMap.at(spec.resource));
+    tc->set_resource(*resource);
     if (spec.limit.find(spec.resource) != spec.limit.end()) {
       tc->set_limit(spec.limit.at(spec.resource));
     }
@@ -839,10 +843,12 @@ ControlResult<void> ControlPlane::UpdateTcParamsLocked(
   } else if (c->policy() == bess::POLICY_WEIGHTED_FAIR) {
     bess::WeightedFairTrafficClass* tc =
         reinterpret_cast<bess::WeightedFairTrafficClass*>(c);
-    if (bess::ResourceMap.count(spec.resource) == 0) {
+    const std::optional<bess::Resource> resource =
+        bess::ResourceFromName(spec.resource);
+    if (!resource) {
       return std::unexpected(Err(EINVAL, "Invalid resource"));
     }
-    tc->set_resource(bess::ResourceMap.at(spec.resource));
+    tc->set_resource(*resource);
   } else {
     return std::unexpected(Err(EINVAL,
                                "Only 'rate_limit' and"

@@ -4,12 +4,15 @@
 #ifndef BESS_TRAFFIC_CLASS_H_
 #define BESS_TRAFFIC_CLASS_H_
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <list>
+#include <optional>
 #include <queue>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -35,16 +38,39 @@ namespace bess {
 #define QUANTUM (1 << 10)
 
 // Resource types that can be accounted for.
-enum resource_t {
-  RESOURCE_COUNT = 0,  // Count of how many times scheduled
-  RESOURCE_CYCLE,      // CPU cycles
-  RESOURCE_PACKET,     // Packets set
-  RESOURCE_BIT,        // Bits sent
-  NUM_RESOURCES,       // Sentinel. Also used to indicate "no resource".
+enum class Resource : uint8_t {
+  kCount = 0,  // Count of how many times scheduled
+  kCycle,      // CPU cycles
+  kPacket,     // Packets sent
+  kBit,        // Bits sent
 };
 
-// An array of counters for all resource types.
-typedef uint64_t resource_arr_t[NUM_RESOURCES];
+inline constexpr size_t kNumResources = 4;
+
+// One counter per resource, indexed only by Resource. An aggregate: a
+// value-initialized one (`stats_()`) is zeroed, a default-initialized one
+// (`ResourceUsage usage;`) is not, as with the C array it replaces.
+struct ResourceUsage {
+  std::array<uint64_t, kNumResources> counts;
+
+  uint64_t &operator[](Resource r) {
+    return counts[static_cast<size_t>(r)];
+  }
+  uint64_t operator[](Resource r) const {
+    return counts[static_cast<size_t>(r)];
+  }
+  ResourceUsage &operator+=(const ResourceUsage &other) {
+    for (size_t i = 0; i < kNumResources; i++) {
+      counts[i] += other.counts[i];
+    }
+    return *this;
+  }
+};
+
+// The control API's name for each resource ("count", "cycle", "packet",
+// "bit"), and back; nullopt for any other name.
+std::string_view ResourceName(Resource r);
+std::optional<Resource> ResourceFromName(std::string_view name);
 
 // The priority of a traffic class.
 typedef uint32_t priority_t;
@@ -53,7 +79,7 @@ typedef uint32_t priority_t;
 typedef int32_t resource_share_t;
 
 struct tc_stats {
-  resource_arr_t usage;
+  ResourceUsage usage;
   uint64_t cnt_throttled;
 };
 
@@ -99,28 +125,6 @@ using namespace traffic_class_initializer_types;
 
 const std::string TrafficPolicyName[NUM_POLICIES] = {
     "priority", "weighted_fair", "round_robin", "rate_limit", "leaf"};
-
-const std::unordered_map<std::string, enum resource_t> ResourceMap = {
-    {"count", RESOURCE_COUNT},
-    {"cycle", RESOURCE_CYCLE},
-    {"packet", RESOURCE_PACKET},
-    {"bit", RESOURCE_BIT}};
-
-const std::unordered_map<int, std::string> ResourceName = {
-    {RESOURCE_COUNT, "count"},
-    {RESOURCE_CYCLE, "cycle"},
-    {RESOURCE_PACKET, "packet"},
-    {RESOURCE_BIT, "bit"}};
-
-/* acc += x */
-#define ACCUMULATE(acc, x)                                \
-  {                                                       \
-    uint64_t *p1 = acc;                                   \
-    uint64_t *p2 = x;                                     \
-    for (int index = 0; index < NUM_RESOURCES; ++index) { \
-      p1[index] += p2[index];                             \
-    }                                                     \
-  }
 
 class TCChildArgs {
  public:
@@ -169,7 +173,7 @@ class TrafficClass {
   // after execution has finished.
   virtual void FinishAndAccountTowardsRoot(SchedWakeupQueue *wakeup_queue,
                                            TrafficClass *child,
-                                           resource_arr_t usage,
+                                           const ResourceUsage &usage,
                                            uint64_t tsc) = 0;
 
   TrafficClass *parent() const { return parent_; }
@@ -290,7 +294,8 @@ class PriorityTrafficClass final : public TrafficClass {
   void BlockTowardsRoot() override;
 
   void FinishAndAccountTowardsRoot(SchedWakeupQueue *wakeup_queue,
-                                   TrafficClass *child, resource_arr_t usage,
+                                   TrafficClass *child,
+                                   const ResourceUsage &usage,
                                    uint64_t tsc) override;
 
   const std::vector<ChildData> &children() const { return children_; }
@@ -323,7 +328,7 @@ class WeightedFairTrafficClass final : public TrafficClass {
     TrafficClass *c;
   };
 
-  WeightedFairTrafficClass(const std::string &name, resource_t resource)
+  WeightedFairTrafficClass(const std::string &name, Resource resource)
       : TrafficClass(name, POLICY_WEIGHTED_FAIR),
         resource_(resource),
         runnable_children_(),
@@ -346,12 +351,13 @@ class WeightedFairTrafficClass final : public TrafficClass {
   void BlockTowardsRoot() override;
 
   void FinishAndAccountTowardsRoot(SchedWakeupQueue *wakeup_queue,
-                                   TrafficClass *child, resource_arr_t usage,
+                                   TrafficClass *child,
+                                   const ResourceUsage &usage,
                                    uint64_t tsc) override;
 
-  resource_t resource() const { return resource_; }
+  Resource resource() const { return resource_; }
 
-  void set_resource(resource_t res) { resource_ = res; }
+  void set_resource(Resource res) { resource_ = res; }
 
   const extended_priority_queue<ChildData> &runnable_children() const {
     return runnable_children_;
@@ -378,7 +384,7 @@ class WeightedFairTrafficClass final : public TrafficClass {
   }
 
   // The resource that we are sharing.
-  resource_t resource_;
+  Resource resource_;
 
   extended_priority_queue<ChildData> runnable_children_;
   std::list<ChildData> blocked_children_;
@@ -415,7 +421,8 @@ class RoundRobinTrafficClass final : public TrafficClass {
   void BlockTowardsRoot() override;
 
   void FinishAndAccountTowardsRoot(SchedWakeupQueue *wakeup_queue,
-                                   TrafficClass *child, resource_arr_t usage,
+                                   TrafficClass *child,
+                                   const ResourceUsage &usage,
                                    uint64_t tsc) override;
 
   const std::vector<TrafficClass *> &runnable_children() const {
@@ -442,7 +449,7 @@ class RoundRobinTrafficClass final : public TrafficClass {
 // can block and because there is a one-to-one parent-child relationship.
 class RateLimitTrafficClass final : public TrafficClass {
  public:
-  RateLimitTrafficClass(const std::string &name, resource_t resource,
+  RateLimitTrafficClass(const std::string &name, Resource resource,
                         uint64_t limit, uint64_t max_burst)
       : TrafficClass(name, POLICY_RATE_LIMIT),
         resource_(resource),
@@ -473,10 +480,11 @@ class RateLimitTrafficClass final : public TrafficClass {
   void BlockTowardsRoot() override;
 
   void FinishAndAccountTowardsRoot(SchedWakeupQueue *wakeup_queue,
-                                   TrafficClass *child, resource_arr_t usage,
+                                   TrafficClass *child,
+                                   const ResourceUsage &usage,
                                    uint64_t tsc) override;
 
-  resource_t resource() const { return resource_; }
+  Resource resource() const { return resource_; }
 
   // Return the configured limit, in work units
   uint64_t limit() const { return limit_; }
@@ -490,7 +498,7 @@ class RateLimitTrafficClass final : public TrafficClass {
   // Return the configured max burst, in resource units
   uint64_t max_burst_arg() const { return max_burst_arg_; }
 
-  void set_resource(resource_t res) { resource_ = res; }
+  void set_resource(Resource res) { resource_ = res; }
 
   // Set the limit to `limit`, which is in units of the resource type
   void set_limit(uint64_t limit) {
@@ -529,7 +537,7 @@ class RateLimitTrafficClass final : public TrafficClass {
   static const int kUsageAmplifierPow = 32;
 
   // The resource that we are limiting.
-  resource_t resource_;
+  Resource resource_;
 
   // 1 work unit = 2 ^ kUsageAmplifierPow resource usage.
   // (for better precision without using floating point numbers)
@@ -581,9 +589,9 @@ class LeafTrafficClass final : public TrafficClass {
 
   void FinishAndAccountTowardsRoot(SchedWakeupQueue *wakeup_queue,
                                    [[maybe_unused]] TrafficClass *child,
-                                   resource_arr_t usage,
+                                   const ResourceUsage &usage,
                                    uint64_t tsc) override {
-    ACCUMULATE(stats_.usage, usage);
+    stats_.usage += usage;
     if (!parent_) {
       return;
     }
@@ -646,14 +654,14 @@ class TrafficClassBuilder {
   };
   struct WeightedFairArgs {
     WeightedFairFakeType dummy;
-    resource_t resource;
+    Resource resource;
   };
   struct RoundRobinArgs {
     RoundRobinFakeType dummy;
   };
   struct RateLimitArgs {
     RateLimitFakeType dummy;
-    resource_t resource;
+    Resource resource;
     uint64_t limit;
     uint64_t max_burst;
   };
@@ -673,7 +681,7 @@ class TrafficClassBuilder {
   // CreateTree to construct any similar subtree.  Classes that require
   // arguments can be constructed as well; for example,
   //
-  //   CreateTree("bar", {WEIGHTED_FAIR, RESOURCE_CYCLE}, {{WEIGHTED_FAIR, 3,
+  //   CreateTree("bar", {WEIGHTED_FAIR, Resource::kCycle}, {{WEIGHTED_FAIR, 3,
   //   ...}})
   //
   // creates a tree with a weighted fair root sharing cycles and one child with
