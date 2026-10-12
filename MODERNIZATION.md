@@ -8773,10 +8773,10 @@ consumer-driven (D-008, §31.3 item 2).
   `resources`, `metrics`, `events`, and administration over the v2 Admin
   service (D-107: `ports`, `pools`, `plugin`, `capture`, `pause`, `resume`,
   `shutdown`); live suite `bessctl_cpp`. Task placement is desired state, and
-  33 of the 38 `conf/samples` are manifests, each applied live (D-109,
-  D-110). Pending: the legacy commands (daemon start, `.bess`, shell), the
-  IPLookup, L2Forward and ArpResponder tables as resources (four samples), a
-  static baseline `-march` build.
+  35 of the 38 `conf/samples` are manifests, each applied live (D-109,
+  D-110, D-111). Pending: the legacy commands (daemon start, `.bess`,
+  shell), the L2Forward and ArpResponder tables as resources (two samples),
+  a static baseline `-march` build.
 - **G1.8 — v2 Admin service: DONE at D-104's scope (D-107).** Plugins, port
   status, capture into a client FIFO, packet pools, pause/resume of every
   worker and shutdown, epoch-checked like Control, in both SDKs and bessctl.

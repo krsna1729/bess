@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+# VRF-style routing with one IPLookup per tenant: 10.0.0.0/8 goes to tenant
+# Red's gateway (gate 1) or tenant Blue's (gate 2); the default route of each
+# drops to gate 0.
+#
+# Converted from vrf_routing.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: blue_vrf
+    mclass: IPLookup
+  - name: red_vrf
+    mclass: IPLookup
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - BhY+G3IyAh5nn02uCABFAAAuAAEAAEARrRHAqAEBCgECAycRJxIAGjYGVlJGX1JPVVRJTkdfUEFDS0VU
+  - name: rewrite1
+    mclass: Rewrite
+    arg:
+      templates:
+        - BhY+G3IyAh5nn02uCABFAAAuAAEAAEARwqmsEAABCgECAycRJxIAGkueVlJGX1JPVVRJTkdfUEFDS0VU
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: sink3
+    mclass: Sink
+  - name: source0
+    mclass: Source
+  - name: source1
+    mclass: Source
+connections:
+  - upstream: blue_vrf
+    downstream: sink3
+  - upstream: blue_vrf
+    ogate: 2
+    downstream: sink2
+  - upstream: red_vrf
+    downstream: sink1
+  - upstream: red_vrf
+    ogate: 1
+    downstream: sink0
+  - upstream: rewrite0
+    downstream: red_vrf
+  - upstream: rewrite1
+    downstream: blue_vrf
+  - upstream: source0
+    downstream: rewrite0
+  - upstream: source1
+    downstream: rewrite1
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: source0
+    wid: 0
+  - module: source1
+    wid: 0
+resources:
+  red_vrf/routes:
+    - key: {prefix: 0.0.0.0, prefix_len: 0}
+      value: {gate: 0}
+    - key: {prefix: 10.0.0.0, prefix_len: 8}
+      value: {gate: 1}
+  blue_vrf/routes:
+    - key: {prefix: 0.0.0.0, prefix_len: 0}
+      value: {gate: 0}
+    - key: {prefix: 10.0.0.0, prefix_len: 8}
+      value: {gate: 2}

@@ -240,12 +240,12 @@ class Parser {
         case 'r': out += '\r'; break;
         case 't': out += '\t'; break;
         case 'u': {
-          uint32_t cp;
+          uint32_t cp = 0;
           if (!Hex4(cp)) {
             return false;
           }
           if (cp >= 0xD800 && cp <= 0xDBFF) {  // a surrogate pair's first half
-            uint32_t low;
+            uint32_t low = 0;
             if (text_.substr(pos_, 2) != "\\u") {
               return Fail("unpaired surrogate");
             }

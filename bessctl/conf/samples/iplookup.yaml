@@ -1,0 +1,59 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# IPLookup (longest prefix match): 172.16.0.0/16 to gate 1, 192.168.1.0/24
+# to gate 2, the default route to gate 5; 60-byte packets (the .bess default
+# of $BESS_PKT_SIZE).
+#
+# Converted from iplookup.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: ipfwd
+    mclass: IPLookup
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - BhY+G3IyAh5nn02uCABFAAAuAAEAAEARZqcBAgMErBBkAScRJxIAGh5GaGVsbG8wMTIzNDU2Nzg5MDEy
+        - BhY+G3IyAh5nn02uCABFAAAuAAEAAEARk0kBAgMErAw3YycRJxIAGkroaGVsbG8wMTIzNDU2Nzg5MDEy
+        - BhY+G3IyAh5nn02uCABFAAAuAAEAAEARtJUBAgMEwKgBeycRJxIAGmw0aGVsbG8wMTIzNDU2Nzg5MDEy
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: sink3
+    mclass: Sink
+  - name: source0
+    mclass: Source
+connections:
+  - upstream: ipfwd
+    downstream: sink0
+  - upstream: ipfwd
+    ogate: 1
+    downstream: sink1
+  - upstream: ipfwd
+    ogate: 2
+    downstream: sink2
+  - upstream: ipfwd
+    ogate: 5
+    downstream: sink3
+  - upstream: rewrite0
+    downstream: ipfwd
+  - upstream: source0
+    downstream: rewrite0
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: source0
+    wid: 0
+resources:
+  ipfwd/routes:
+    - key: {prefix: 172.16.0.0, prefix_len: 16}
+      value: {gate: 1}
+    - key: {prefix: 192.168.1.0, prefix_len: 24}
+      value: {gate: 2}
+    - key: {prefix: 0.0.0.0, prefix_len: 0}
+      value: {gate: 5}

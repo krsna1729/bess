@@ -124,6 +124,17 @@ message IPLookupCommandDeleteArg {
   uint64 prefix_len = 2; /// The prefix length
 }
 
+/// A route of the IPLookup resource "<module>/routes" (D-111): key.
+message IPLookupRouteKey {
+  string prefix = 1; /// The CIDR IP part of the prefix, e.g. "10.0.0.0"
+  uint64 prefix_len = 2; /// The prefix length (0: the default route)
+}
+
+/// A route of the IPLookup resource "<module>/routes": value.
+message IPLookupRouteValue {
+  uint64 gate = 1; /// The output gate
+}
+
 /**
  * The IPLookup module has a command `clear()` which takes no parameters.
  * This function removes all rules in the IPLookup table.

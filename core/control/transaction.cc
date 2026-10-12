@@ -502,6 +502,7 @@ ControlResult<void> Transaction::ExecuteCommitOp(const PlanOperation &op) {
     // fail and abort: it needs no undo entry. A refusal puts every task back
     // itself (PlaceTasksLocked is all or nothing).
     std::vector<TrafficClassSpec> targets;
+    targets.reserve(place->tasks.size());
     for (const TaskPlacementSpec &task : place->tasks) {
       targets.push_back(task.AsLeafSpec());
     }

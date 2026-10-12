@@ -129,6 +129,9 @@ file is the reasoning.
 | D-106 | Every mutating control_v2 request names the daemon epoch it was built under; generations travel with their epoch | accepted |
 | D-107 | The v2 Admin service: plugins, port status, capture into a client FIFO, packet pools, pause/resume of the workers and shutdown; epoch-checked like Control | accepted |
 | D-108 | YAML manifests: libyaml into bessctl's exact-number JSON tree, YAML 1.2 core-schema resolution, refusals named by position | accepted |
+| D-109 | Task placement is desired state; the samples are manifests | accepted |
+| D-110 | Desired state: settings at creation are init arguments; tables are resources | accepted |
+| D-111 | IPLookup's routes are a transaction resource (`LpmTableResource`) | accepted |
 
 
 ---
@@ -8208,6 +8211,29 @@ single-value resource can be added without changing what a manifest says (the in
 **Evidence.** `modules_exact_match_test` and `modules_wildcard_match_test` (`DefaultGateAtCreation`: applied, echoed by
 `get_initial_arg`, an invalid gate refuses the module). Live: `exactmatch`, `packet_filter`, `wildcardmatch` and
 `port_ranges` as manifests give the same default gate and rules (`get_runtime_config`) as their `.bess` scripts did;
-a Source with burst 32 is created, 33 refused ("burst size must be [0,32]"). 33 of the 38 samples are manifests; left:
+a Source with burst 32 is created, 33 refused ("burst size must be [0,32]"). 33 of the 38 samples were manifests then; left:
 `arp`, `iplookup`, `l2forward`, `vrf_routing` (their tables are not resources yet) and `tc/wfs_double` (a measurement
 script).
+
+## D-111 IPLookup's routes are a transaction resource (`LpmTableResource`)
+
+**Decision.** `route::LpmTableResource` exposes an `LpmRouteTable` to the transaction engine (key: the prefix, value:
+the route's 24-bit value), and IPLookup registers its table as `<module>/routes` (`IPLookupRouteKey {prefix,
+prefix_len}`, `IPLookupRouteValue {gate}`; `prefix_len` 0 is the default route). Routes in several modules change in
+one transaction, all or nothing, with the module's `add`/`delete`/`clear` commands unchanged beside it.
+
+- rte_lpm cannot promise room for a set of prefixes in advance, so a new prefix is placed during Reserve with what its
+  addresses resolve to today (the covering route, else the default, else the module's *miss value*), and Publish
+  stores the real value in place, which cannot fail; a refused transaction deletes what it placed. This is Router's
+  scheme (D-023) without route domains or next-hop references.
+- The miss value is the module's: a value its readers treat exactly as a miss. For IPLookup a miss goes to DROP_GATE,
+  so a placeholder at DROP_GATE changes nothing a packet sees.
+
+**Evidence.** `route_lpm_resource_test`: routes and the default committed together, re-pointed and erased in one
+transaction; a refused transaction leaves no placed prefix (route count and lookups unchanged; fails with Abort's
+erase removed); a full table refuses the whole transaction with nothing visible; bad keys, values and value types are
+refused. Live: `iplookup` and `vrf_routing` as manifests send traffic to the same gates as their `.bess` scripts (1, 2,
+5; red 1, blue 2). 35 of the 38 samples are manifests; left: `arp`, `l2forward` (tables not yet resources) and
+`tc/wfs_double`.
+
+**Code.** `core/route/lpm_resource.h`, `core/modules/ip_lookup.{h,cc}`, `protobuf/module_msg.proto`.

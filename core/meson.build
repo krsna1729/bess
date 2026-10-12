@@ -688,6 +688,7 @@ unit_test_sources = [
   'stats/metric_registry_test.cc',
   'route/route_test.cc',
   'route/router_transaction_test.cc',
+  'route/lpm_resource_test.cc',
   'route/route_domain_test.cc',
   'route/l3_test.cc',
   'rcu/rcu_test.cc',
@@ -787,6 +788,12 @@ allocation_fault_tests = [
 ]
 
 taskset_prog = find_program('taskset', required: false)
+# GCC at -O3 (the gcc-release lane) reports false positives in test code: a
+# PacketBatch filled after clear() (-Wmaybe-uninitialized), the ordering of
+# std::vector<uint8_t> (-Wstringop-overread). In tests they stay warnings, not
+# errors; the code under test keeps -Werror for them.
+unit_test_cpp_args = cpp.get_id() == 'gcc' ? cpp.get_supported_arguments(
+  '-Wno-error=maybe-uninitialized', '-Wno-error=stringop-overread') : []
 foreach source : (get_option('build_tests') ? unit_test_sources : [])
   test_name = source.replace('.cc', '').replace('/', '_')
   integration_test = (
@@ -832,6 +839,7 @@ foreach source : (get_option('build_tests') ? unit_test_sources : [])
     source,
     'gtest_main.cc',
     include_directories: core_include,
+    cpp_args: unit_test_cpp_args,
     link_with: test_link_with,
     link_whole: test_link_whole,
     dependencies: runtime_deps + [gtest_dep],

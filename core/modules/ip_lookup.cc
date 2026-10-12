@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <string>
 
+#include "dataplane/transaction_engine.h"
 #include "utils/bits.h"
 #include "utils/ether.h"
 #include "utils/format.h"
@@ -45,10 +46,54 @@ CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
                           bess::route::RouteErrorName(table.error()));
   }
   routes_ = std::move(*table);
+
+  // The routes as a transaction resource: a prefix that misses today is
+  // placed at DROP_GATE meanwhile, which is what a miss does here.
+  resource_ = std::make_unique<bess::route::LpmTableResource>(
+      name() + "/routes", routes_->untyped(), DROP_GATE);
+  binding_ = init_context().codecs().Bind(
+      *resource_,
+      std::make_shared<bess::framework::TypedCodec<bess::pb::IPLookupRouteKey,
+                                                   bess::pb::IPLookupRouteValue>>(
+          [this](const bess::pb::IPLookupRouteKey &key)
+              -> std::expected<bess::dataplane::ResourceKey, std::string> {
+            ParsedPrefix parsed = ParseIpv4Prefix(key.prefix(), key.prefix_len());
+            if (std::get<0>(parsed)) {
+              return std::unexpected(std::get<1>(parsed));
+            }
+            const auto p = Ipv4Prefix::Make(std::get<2>(parsed).value(),
+                                            static_cast<uint8_t>(key.prefix_len()));
+            if (!p) {
+              return std::unexpected(bess::route::RouteErrorName(p.error()));
+            }
+            return bess::route::LpmTableResource::Key(*p);
+          },
+          [](const bess::pb::IPLookupRouteValue &value)
+              -> std::expected<std::any, std::string> {
+            if (!bess::IsValidGateValue(value.gate()) ||
+                !is_valid_gate(static_cast<gate_idx_t>(value.gate()))) {
+              return std::unexpected("invalid gate " + std::to_string(value.gate()));
+            }
+            return std::any(static_cast<uint32_t>(value.gate()));
+          }));
+  if (auto registered = init_context().resources().Register(resource_.get());
+      !registered) {
+    binding_.Reset();
+    resource_.reset();
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
   return CommandSuccess();
 }
 
 void IPLookup::DeInit() {
+  if (resource_ != nullptr) {
+    // Cannot be refused: routes reference nothing and nothing references
+    // them, and this runs under the control-plane lock transactions take.
+    auto unregistered = init_context().resources().Unregister(resource_->name());
+    CHECK(unregistered) << unregistered.error();
+    binding_.Reset();
+    resource_.reset();
+  }
   // The control plane pauses workers before deleting a module, so no batch
   // can be using the table.
   routes_.reset();

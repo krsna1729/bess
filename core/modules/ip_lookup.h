@@ -10,8 +10,10 @@
 #include <tuple>
 
 #include "dataplane/strong_id.h"
+#include "framework/resource_bindings.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
+#include "route/lpm_resource.h"
 #include "route/route_table.h"
 #include "utils/endian.h"
 
@@ -48,6 +50,9 @@ class IPLookup final : public Module {
   // (one rule insertion per add, not a rebuild), read lock-free per batch.
   // The /0 route is the default gate; with none, misses go to DROP_GATE.
   std::unique_ptr<bess::route::RouteTable<GateRoute>> routes_;
+  // "<name>/routes" (D-111): the same table, transactionally.
+  std::unique_ptr<bess::route::LpmTableResource> resource_;
+  bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
 };
 
 #endif  // BESS_MODULES_IPLOOKUP_H_

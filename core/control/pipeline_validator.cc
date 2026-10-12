@@ -396,6 +396,7 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
     int64_t share;
   };
   std::vector<Child> children;
+  children.reserve(spec.traffic_classes.size() + spec.tasks.size());
   for (const TrafficClassSpec &tc : spec.traffic_classes) {
     children.push_back({"tc", "traffic class '" + tc.name + "'", tc.parent,
                         tc.has_priority, tc.priority, tc.has_share, tc.share});
