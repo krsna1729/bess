@@ -362,12 +362,20 @@ bess_framework = static_library(
   dependencies: framework_compile_deps,
   link_with: bess_dataplane_libs + [bess_execution, bess_eal, bess_packet, bess_rcu, bess_utils],
 )
+bess_gate_hooks = static_library(
+  'bess_gate_hooks',
+  gate_hook_sources + [proto_ready_marker],
+  include_directories: core_include,
+  dependencies: hook_compile_deps,
+  link_with: [bess_framework, bess_execution, bess_eal],
+)
 bess_control = static_library(
   'bess_control',
   control_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: control_compile_deps,
-  link_with: [bess_framework, bess_execution, bess_eal, bess_dataplane_core, bess_rcu],
+  # ListMetrics reads Track's per-gate totals (D-116).
+  link_with: [bess_framework, bess_execution, bess_eal, bess_gate_hooks, bess_dataplane_core, bess_rcu],
 )
 bess_host = static_library(
   'bess_host',
@@ -390,13 +398,6 @@ bess_modules = static_library(
   dependencies: module_compile_deps,
   link_with: bess_dataplane_libs + [bess_framework, bess_execution, bess_eal, bess_rcu, bess_utils],
   pic: true,
-)
-bess_gate_hooks = static_library(
-  'bess_gate_hooks',
-  gate_hook_sources + [proto_ready_marker],
-  include_directories: core_include,
-  dependencies: hook_compile_deps,
-  link_with: [bess_framework, bess_execution, bess_eal],
 )
 bess_resume_hooks = static_library(
   'bess_resume_hooks',
