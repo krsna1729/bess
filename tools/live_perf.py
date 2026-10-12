@@ -259,6 +259,32 @@ def m_wildcardmatch16(b):
     return m_base(b, [('wm', 2)])
 
 
+def m_session(b):
+    """The D-032 session slice: ExactMatch (action mode, one rule per flow) -> ActionTable ->
+    Meter (never red) -> Router (one route) -- per-packet cost of the UPF-style pipeline."""
+    from builtin_pb import module_msg_pb2 as mm
+    op = b.bess.transaction_op
+    b.mod('ActionTable', 'at', {'capacity': 64, 'meters': 'mt/meters', 'next_hops': 'rt/next_hops'})
+    b.mod('ExactMatch', 'em', {'fields': [{'offset': 26, 'num_bytes': 4}],
+                               'action_resource': 'at/actions'})
+    b.mod('Meter', 'mt', {'capacity': 64})
+    b.mod('Router', 'rt', {'max_routes': 64, 'max_tbl8s': 16, 'max_next_hops': 64})
+    ops = [
+        op('mt/meters', mm.MeterIdKey(id=1), mm.MeterPolicyValue(tr_tcm=mm.TrTcmProfile(
+            committed_rate=10**12, committed_burst=10**9, peak_rate=10**12, peak_burst=10**9))),
+        op('rt/next_hops', mm.RouterNextHopIdKey(id=1), mm.RouterNextHopValue(egress_gate=0)),
+        op('rt/routes', mm.RouterRouteKey(ipv4='11.0.0.0', prefix_length=8),
+           mm.RouterRouteValue(next_hop_id=1)),
+        op('at/actions', mm.ActionIdKey(id=1), mm.ActionValue(meter_id=1, next_hop_id=1)),
+    ]
+    for i in range(FLOWS):
+        key = mm.ExactMatchRuleKey()
+        key.fields.add(value_bin=struct.pack('!I', 0x0a000001 + i))
+        ops.append(op('em/rules', key, mm.ExactMatchRuleValue(action_id=1)))
+    b.txn(ops)
+    return m_base(b, [('em', 1), ('at', 1), ('mt', 1), ('rt', 1)])
+
+
 def m_iplookup(b):
     b.mod('IPLookup', 'ipl', {})
     for i in range(256):
@@ -344,6 +370,7 @@ TESTS = {
     'M.split/2': ('M', m_split),
     'M.wildcardmatch': ('M', m_wildcardmatch),
     'M.wildcardmatch/16': ('M', m_wildcardmatch16),
+    'M.session': ('M', m_session),
     'M.iplookup': ('M', m_iplookup),
     'M.l2forward': ('M', m_l2forward),
     'M.acl': ('M', m_acl),
@@ -370,6 +397,13 @@ class Builder:
 
     def cmd(self, module, command, arg_type, arg):
         self.bess.run_module_command(module, command, arg_type, arg)
+
+    def txn(self, ops):
+        """One v2 transaction (resources of Meter, Router, ActionTable, ...); raises unless applied."""
+        from builtin_pb import control_v2_pb2
+        r = self.bess.apply_transaction(ops)
+        if r.record.outcome != control_v2_pb2.TransactionRecord.OUTCOME_APPLIED:
+            raise RuntimeError('transaction not applied: %s' % r.record)
 
 
 def leaf_packets(bess, modules):
