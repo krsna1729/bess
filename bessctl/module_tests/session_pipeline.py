@@ -114,7 +114,7 @@ class BessSessionPipelineTest(BessModuleTestCase):
         # the route to it, the action naming both, and the rule that selects
         # the action.
         sip, sport = '10.1.2.3', 1234
-        r = self.bess.apply_transaction(
+        r = self.apply_transaction(
             self.session_ops(em, at, mt, rt, sip, sport))
         self.assertEqual(r.record.outcome, APPLIED,
                          r.record.ops[0].error if r.record.ops else '')
@@ -130,13 +130,13 @@ class BessSessionPipelineTest(BessModuleTestCase):
 
     def test_other_sessions_and_misses_are_dropped(self):
         em, at, mt, rt = self.build_pipeline()
-        r = self.bess.apply_transaction(
+        r = self.apply_transaction(
             self.session_ops(em, at, mt, rt, '10.1.2.3', 1234))
         self.assertEqual(r.record.outcome, APPLIED)
 
         # A session that matches but names no next hop: the action resolves and
         # the router has nothing to resolve.
-        r = self.bess.apply_transaction([
+        r = self.apply_transaction([
             action_op(self.bess, at, 2, 0, 0),
             rule_op(self.bess, em, '10.4.4.4', 4321, 2),
         ])
@@ -155,13 +155,13 @@ class BessSessionPipelineTest(BessModuleTestCase):
 
     def test_removing_what_a_session_names_is_refused(self):
         em, at, mt, rt = self.build_pipeline()
-        r = self.bess.apply_transaction(
+        r = self.apply_transaction(
             self.session_ops(em, at, mt, rt, '10.1.2.3', 1234))
         self.assertEqual(r.record.outcome, APPLIED)
 
         # The action names the meter: it may not go while it is still named,
         # and the rejected transaction leaves everything in place.
-        r = self.bess.apply_transaction(
+        r = self.apply_transaction(
             [erase_op(self.bess, mt, 'meters', module_msg.MeterIdKey(id=1))])
         self.assertEqual(r.record.outcome, REJECTED)
         self.assertIn('still referenced', r.record.ops[0].error)
@@ -169,7 +169,7 @@ class BessSessionPipelineTest(BessModuleTestCase):
         # Removing the session's names in the same transaction as the action
         # works: the rule, the action, the route, the next hop and the meter go
         # together.
-        r = self.bess.apply_transaction([
+        r = self.apply_transaction([
             erase_op(self.bess, em, 'rules', rule_key('10.1.2.3', 1234)),
             erase_op(self.bess, at, 'actions', module_msg.ActionIdKey(id=1)),
             erase_op(self.bess, rt, 'routes',
@@ -206,7 +206,7 @@ class BessSessionPipelineTest(BessModuleTestCase):
                     self.bess, em, 'rules',
                     rule_key('10.%d.%d.1' % ((i - 4) // 256 % 256,
                                              (i - 4) % 256), 1)))
-            r = self.bess.apply_transaction(ops)
+            r = self.apply_transaction(ops)
             self.assertEqual(r.record.outcome, APPLIED,
                              r.record.ops[0].error if r.record.ops else '')
             stats['applied'] += 1

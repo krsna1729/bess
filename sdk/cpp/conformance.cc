@@ -120,7 +120,7 @@ struct Commit {
 
 struct Pipe {
   v2::Pipeline pipeline;
-  uint64_t generation = 0;
+  bess::sdk::PipelineVersion version;
 };
 
 class Runner {
@@ -170,7 +170,8 @@ class Runner {
     (void)gp::util::MessageToJsonString(json.struct_value(), &text);
     std::unique_ptr<gp::Message> m(factory_.GetPrototype(d)->New());
     if (auto status = gp::util::JsonStringToMessage(text, m.get()); !status.ok()) {
-      *error = std::format("{} from {}: {}", type, text, status.message());
+      // A string_view or a StringPiece, by protobuf version: copy it.
+      *error = std::format("{} from {}: {}", type, text, std::string(status.message()));
       return nullptr;
     }
     return m;
@@ -399,7 +400,7 @@ class Runner {
         return Expect(&snap.error(), want_error, "pipeline");
       }
       if (!builds) {
-        pipes_[Str(s, "as")] = {snap->pipeline, snap->generation};
+        pipes_[Str(s, "as")] = {snap->pipeline, snap->version};
         return std::nullopt;
       }
       base = snap->pipeline;
@@ -425,9 +426,10 @@ class Runner {
       if (!plan || plan->steps.empty()) {
         return "plan: " + (plan ? std::string("no steps") : plan.error().message);
       }
-      if (Field(s, "want_plan_generation_of") != nullptr &&
-          plan->generation != pipes_[Str(s, "want_plan_generation_of")].generation) {
-        return std::format("plan against generation {}", plan->generation);
+      if (Field(s, "want_plan_version_of") != nullptr &&
+          plan->version != pipes_[Str(s, "want_plan_version_of")].version) {
+        return std::format("plan against generation {} of epoch {}", plan->version.generation,
+                           plan->version.daemon_epoch);
       }
     }
     if (const gp::Value *changes = Field(s, "want_changes")) {
@@ -439,16 +441,16 @@ class Runner {
         return std::format("{} change(s)", diff->diff.changes_size());
       }
     }
-    std::optional<uint64_t> at;
-    if (Field(s, "at_generation_of") != nullptr) {
-      at = pipes_[Str(s, "at_generation_of")].generation;
+    std::optional<bess::sdk::PipelineVersion> at;
+    if (Field(s, "at_version_of") != nullptr) {
+      at = pipes_[Str(s, "at_version_of")].version;
     }
     auto done = client_.ApplyPipeline(*p, at);
     if (Outcome failed = Expect(done ? nullptr : &done.error(), want_error, "apply")) {
       return failed;
     }
     if (done && Field(s, "as") != nullptr) {
-      pipes_[Str(s, "as")] = {*p, done->generation()};
+      pipes_[Str(s, "as")] = {*p, {done->generation(), done->daemon_epoch()}};
     }
     return std::nullopt;
   }

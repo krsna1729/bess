@@ -204,6 +204,9 @@ const (
 	ErrorDetail_UNSUPPORTED_TRANSACTION ErrorDetail_Code = 6
 	ErrorDetail_RESOURCE_FAILURE        ErrorDetail_Code = 7
 	ErrorDetail_INTERNAL                ErrorDetail_Code = 8
+	// The request was built under another daemon epoch (a restart since):
+	// refused before any side effect; daemon_epoch is the daemon's (D-106).
+	ErrorDetail_EPOCH_MISMATCH ErrorDetail_Code = 9
 )
 
 // Enum value maps for ErrorDetail_Code.
@@ -218,6 +221,7 @@ var (
 		6: "UNSUPPORTED_TRANSACTION",
 		7: "RESOURCE_FAILURE",
 		8: "INTERNAL",
+		9: "EPOCH_MISMATCH",
 	}
 	ErrorDetail_Code_value = map[string]int32{
 		"CODE_UNSPECIFIED":        0,
@@ -229,6 +233,7 @@ var (
 		"UNSUPPORTED_TRANSACTION": 6,
 		"RESOURCE_FAILURE":        7,
 		"INTERNAL":                8,
+		"EPOCH_MISMATCH":          9,
 	}
 )
 
@@ -1251,6 +1256,7 @@ type GetPipelineResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Pipeline      *Pipeline              `protobuf:"bytes,1,opt,name=pipeline,proto3" json:"pipeline,omitempty"` // the active runtime as desired state
 	Generation    uint64                 `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"`
+	DaemonEpoch   uint64                 `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1295,6 +1301,13 @@ func (x *GetPipelineResponse) GetPipeline() *Pipeline {
 func (x *GetPipelineResponse) GetGeneration() uint64 {
 	if x != nil {
 		return x.Generation
+	}
+	return 0
+}
+
+func (x *GetPipelineResponse) GetDaemonEpoch() uint64 {
+	if x != nil {
+		return x.DaemonEpoch
 	}
 	return 0
 }
@@ -1435,6 +1448,7 @@ type DiffPipelineResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Diff          *PipelineDiff          `protobuf:"bytes,1,opt,name=diff,proto3" json:"diff,omitempty"`
 	Generation    uint64                 `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"` // the active generation the diff was taken against
+	DaemonEpoch   uint64                 `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1479,6 +1493,13 @@ func (x *DiffPipelineResponse) GetDiff() *PipelineDiff {
 func (x *DiffPipelineResponse) GetGeneration() uint64 {
 	if x != nil {
 		return x.Generation
+	}
+	return 0
+}
+
+func (x *DiffPipelineResponse) GetDaemonEpoch() uint64 {
+	if x != nil {
+		return x.DaemonEpoch
 	}
 	return 0
 }
@@ -1531,6 +1552,7 @@ type PlanPipelineResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Steps         []*PlanStep            `protobuf:"bytes,1,rep,name=steps,proto3" json:"steps,omitempty"`
 	Generation    uint64                 `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"`
+	DaemonEpoch   uint64                 `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1579,14 +1601,26 @@ func (x *PlanPipelineResponse) GetGeneration() uint64 {
 	return 0
 }
 
+func (x *PlanPipelineResponse) GetDaemonEpoch() uint64 {
+	if x != nil {
+		return x.DaemonEpoch
+	}
+	return 0
+}
+
 type ApplyPipelineRequest struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	Pipeline *Pipeline              `protobuf:"bytes,1,opt,name=pipeline,proto3" json:"pipeline,omitempty"`
 	// Optimistic concurrency: rejected with ABORTED, before any side effect,
 	// if the active generation differs.
 	ExpectedGeneration *uint64 `protobuf:"varint,2,opt,name=expected_generation,json=expectedGeneration,proto3,oneof" json:"expected_generation,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Required: the daemon epoch the request (and expected_generation) was
+	// built under, from any earlier answer. Zero: INVALID_ARGUMENT (field
+	// "daemon_epoch"); another epoch: FAILED_PRECONDITION with error detail
+	// EPOCH_MISMATCH, before any side effect (D-106).
+	DaemonEpoch   uint64 `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ApplyPipelineRequest) Reset() {
@@ -1633,6 +1667,13 @@ func (x *ApplyPipelineRequest) GetExpectedGeneration() uint64 {
 	return 0
 }
 
+func (x *ApplyPipelineRequest) GetDaemonEpoch() uint64 {
+	if x != nil {
+		return x.DaemonEpoch
+	}
+	return 0
+}
+
 type ApplyPipelineResponse struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Generation     uint64                 `protobuf:"varint,1,opt,name=generation,proto3" json:"generation,omitempty"` // after the apply (unchanged for a no-op)
@@ -1642,6 +1683,7 @@ type ApplyPipelineResponse struct {
 	PrepareUs      uint64                 `protobuf:"varint,5,opt,name=prepare_us,json=prepareUs,proto3" json:"prepare_us,omitempty"`
 	PausedCommitUs uint64                 `protobuf:"varint,6,opt,name=paused_commit_us,json=pausedCommitUs,proto3" json:"paused_commit_us,omitempty"`
 	RetireUs       uint64                 `protobuf:"varint,7,opt,name=retire_us,json=retireUs,proto3" json:"retire_us,omitempty"`
+	DaemonEpoch    uint64                 `protobuf:"varint,8,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1725,14 +1767,22 @@ func (x *ApplyPipelineResponse) GetRetireUs() uint64 {
 	return 0
 }
 
+func (x *ApplyPipelineResponse) GetDaemonEpoch() uint64 {
+	if x != nil {
+		return x.DaemonEpoch
+	}
+	return 0
+}
+
 // Carried in the "bess-error-bin" trailer of a failed call.
 type ErrorDetail struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Code          ErrorDetail_Code       `protobuf:"varint,1,opt,name=code,proto3,enum=bess.pb.v2.ErrorDetail_Code" json:"code,omitempty"`
 	ErrnoValue    int32                  `protobuf:"varint,2,opt,name=errno_value,json=errnoValue,proto3" json:"errno_value,omitempty"` // errno-compatible cause, 0 if none
 	Message       string                 `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
-	Object        string                 `protobuf:"bytes,4,opt,name=object,proto3" json:"object,omitempty"` // offending object, when known
-	Field         string                 `protobuf:"bytes,5,opt,name=field,proto3" json:"field,omitempty"`   // offending field, when known
+	Object        string                 `protobuf:"bytes,4,opt,name=object,proto3" json:"object,omitempty"`                               // offending object, when known
+	Field         string                 `protobuf:"bytes,5,opt,name=field,proto3" json:"field,omitempty"`                                 // offending field, when known
+	DaemonEpoch   uint64                 `protobuf:"varint,6,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"` // EPOCH_MISMATCH: the daemon's epoch
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1800,6 +1850,13 @@ func (x *ErrorDetail) GetField() string {
 		return x.Field
 	}
 	return ""
+}
+
+func (x *ErrorDetail) GetDaemonEpoch() uint64 {
+	if x != nil {
+		return x.DaemonEpoch
+	}
+	return 0
 }
 
 type TransactionOp struct {
@@ -1884,8 +1941,14 @@ type ApplyTransactionRequest struct {
 	ExpectedGeneration *uint64                             `protobuf:"varint,2,opt,name=expected_generation,json=expectedGeneration,proto3,oneof" json:"expected_generation,omitempty"`
 	Ops                []*TransactionOp                    `protobuf:"bytes,3,rep,name=ops,proto3" json:"ops,omitempty"`
 	Consistency        ApplyTransactionRequest_Consistency `protobuf:"varint,4,opt,name=consistency,proto3,enum=bess.pb.v2.ApplyTransactionRequest_Consistency" json:"consistency,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Required: the daemon epoch the request (its resources and
+	// expected_generation) was built under, from any earlier answer. Zero:
+	// INVALID_ARGUMENT (field "daemon_epoch"); another epoch:
+	// FAILED_PRECONDITION with error detail EPOCH_MISMATCH, before any side
+	// effect and before the request id is looked up (D-106).
+	DaemonEpoch   uint64 `protobuf:"varint,5,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ApplyTransactionRequest) Reset() {
@@ -1944,6 +2007,13 @@ func (x *ApplyTransactionRequest) GetConsistency() ApplyTransactionRequest_Consi
 		return x.Consistency
 	}
 	return ApplyTransactionRequest_CONSISTENCY_UNSPECIFIED
+}
+
+func (x *ApplyTransactionRequest) GetDaemonEpoch() uint64 {
+	if x != nil {
+		return x.DaemonEpoch
+	}
+	return 0
 }
 
 type TransactionOpResult struct {
@@ -3461,12 +3531,13 @@ const file_control_v2_proto_rawDesc = "" +
 	"\toperation\x18\x02 \x01(\tR\toperation\x12*\n" +
 	"\x04type\x18\x03 \x01(\x0e2\x16.bess.pb.v2.ObjectTypeR\x04type\x12\x16\n" +
 	"\x06object\x18\x04 \x01(\tR\x06object\"\x14\n" +
-	"\x12GetPipelineRequest\"g\n" +
+	"\x12GetPipelineRequest\"\x8a\x01\n" +
 	"\x13GetPipelineResponse\x120\n" +
 	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x02 \x01(\x04R\n" +
-	"generation\"K\n" +
+	"generation\x12!\n" +
+	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpoch\"K\n" +
 	"\x17ValidatePipelineRequest\x120\n" +
 	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\"P\n" +
 	"\x18ValidatePipelineResponse\x124\n" +
@@ -3474,23 +3545,26 @@ const file_control_v2_proto_rawDesc = "" +
 	"normalized\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\n" +
 	"normalized\"G\n" +
 	"\x13DiffPipelineRequest\x120\n" +
-	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\"d\n" +
+	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\"\x87\x01\n" +
 	"\x14DiffPipelineResponse\x12,\n" +
 	"\x04diff\x18\x01 \x01(\v2\x18.bess.pb.v2.PipelineDiffR\x04diff\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x02 \x01(\x04R\n" +
-	"generation\"G\n" +
+	"generation\x12!\n" +
+	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpoch\"G\n" +
 	"\x13PlanPipelineRequest\x120\n" +
-	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\"b\n" +
+	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\"\x85\x01\n" +
 	"\x14PlanPipelineResponse\x12*\n" +
 	"\x05steps\x18\x01 \x03(\v2\x14.bess.pb.v2.PlanStepR\x05steps\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x02 \x01(\x04R\n" +
-	"generation\"\x96\x01\n" +
+	"generation\x12!\n" +
+	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpoch\"\xb9\x01\n" +
 	"\x14ApplyPipelineRequest\x120\n" +
 	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\x124\n" +
-	"\x13expected_generation\x18\x02 \x01(\x04H\x00R\x12expectedGeneration\x88\x01\x01B\x16\n" +
-	"\x14_expected_generation\"\x8a\x02\n" +
+	"\x13expected_generation\x18\x02 \x01(\x04H\x00R\x12expectedGeneration\x88\x01\x01\x12!\n" +
+	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpochB\x16\n" +
+	"\x14_expected_generation\"\xad\x02\n" +
 	"\x15ApplyPipelineResponse\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\x04R\n" +
@@ -3502,14 +3576,16 @@ const file_control_v2_proto_rawDesc = "" +
 	"\n" +
 	"prepare_us\x18\x05 \x01(\x04R\tprepareUs\x12(\n" +
 	"\x10paused_commit_us\x18\x06 \x01(\x04R\x0epausedCommitUs\x12\x1b\n" +
-	"\tretire_us\x18\a \x01(\x04R\bretireUs\"\xe2\x02\n" +
+	"\tretire_us\x18\a \x01(\x04R\bretireUs\x12!\n" +
+	"\fdaemon_epoch\x18\b \x01(\x04R\vdaemonEpoch\"\x99\x03\n" +
 	"\vErrorDetail\x120\n" +
 	"\x04code\x18\x01 \x01(\x0e2\x1c.bess.pb.v2.ErrorDetail.CodeR\x04code\x12\x1f\n" +
 	"\verrno_value\x18\x02 \x01(\x05R\n" +
 	"errnoValue\x12\x18\n" +
 	"\amessage\x18\x03 \x01(\tR\amessage\x12\x16\n" +
 	"\x06object\x18\x04 \x01(\tR\x06object\x12\x14\n" +
-	"\x05field\x18\x05 \x01(\tR\x05field\"\xb7\x01\n" +
+	"\x05field\x18\x05 \x01(\tR\x05field\x12!\n" +
+	"\fdaemon_epoch\x18\x06 \x01(\x04R\vdaemonEpoch\"\xcb\x01\n" +
 	"\x04Code\x12\x14\n" +
 	"\x10CODE_UNSPECIFIED\x10\x00\x12\x14\n" +
 	"\x10INVALID_ARGUMENT\x10\x01\x12\r\n" +
@@ -3519,18 +3595,20 @@ const file_control_v2_proto_rawDesc = "" +
 	"\rRESOURCE_BUSY\x10\x05\x12\x1b\n" +
 	"\x17UNSUPPORTED_TRANSACTION\x10\x06\x12\x14\n" +
 	"\x10RESOURCE_FAILURE\x10\a\x12\f\n" +
-	"\bINTERNAL\x10\b\"\x95\x01\n" +
+	"\bINTERNAL\x10\b\x12\x12\n" +
+	"\x0eEPOCH_MISMATCH\x10\t\"\x95\x01\n" +
 	"\rTransactionOp\x12\x1a\n" +
 	"\bresource\x18\x01 \x01(\tR\bresource\x12\x14\n" +
 	"\x05erase\x18\x02 \x01(\bR\x05erase\x12&\n" +
 	"\x03key\x18\x03 \x01(\v2\x14.google.protobuf.AnyR\x03key\x12*\n" +
-	"\x05value\x18\x04 \x01(\v2\x14.google.protobuf.AnyR\x05value\"\xef\x02\n" +
+	"\x05value\x18\x04 \x01(\v2\x14.google.protobuf.AnyR\x05value\"\x92\x03\n" +
 	"\x17ApplyTransactionRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x124\n" +
 	"\x13expected_generation\x18\x02 \x01(\x04H\x00R\x12expectedGeneration\x88\x01\x01\x12+\n" +
 	"\x03ops\x18\x03 \x03(\v2\x19.bess.pb.v2.TransactionOpR\x03ops\x12Q\n" +
-	"\vconsistency\x18\x04 \x01(\x0e2/.bess.pb.v2.ApplyTransactionRequest.ConsistencyR\vconsistency\"g\n" +
+	"\vconsistency\x18\x04 \x01(\x0e2/.bess.pb.v2.ApplyTransactionRequest.ConsistencyR\vconsistency\x12!\n" +
+	"\fdaemon_epoch\x18\x05 \x01(\x04R\vdaemonEpoch\"g\n" +
 	"\vConsistency\x12\x1b\n" +
 	"\x17CONSISTENCY_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17CONSISTENCY_REFERENTIAL\x10\x01\x12\x1e\n" +

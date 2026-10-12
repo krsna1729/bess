@@ -46,14 +46,14 @@ class BessDataplaneTransactionsTest(BessModuleTestCase):
         em.set_default_gate(gate=3)
         pkt = get_tcp_packet(sip='65.43.21.0', dip='12.34.56.78')
 
-        r = self.bess.apply_transaction(
+        r = self.apply_transaction(
             [exact_rule(self.bess, em, '65.43.21.0', '12.34.56.78', 1)])
         self.assertEqual(r.record.outcome, APPLIED)
         outs = self.run_module(em, 0, [pkt], [0, 1, 2, 3])
         self.assertEqual(len(outs[1]), 1)
         self.assertSamePackets(outs[1][0], pkt)
 
-        r = self.bess.apply_transaction(
+        r = self.apply_transaction(
             [exact_rule(self.bess, em, '65.43.21.0', '12.34.56.78')])
         self.assertEqual(r.record.outcome, APPLIED)
         outs = self.run_module(em, 0, [pkt], [0, 1, 2, 3])
@@ -69,10 +69,10 @@ class BessDataplaneTransactionsTest(BessModuleTestCase):
 
         ops = [exact_rule(self.bess, em, '10.0.0.1', '10.0.0.2', 1),
                wild_rule(self.bess, wm, '10.0.0.0', '255.0.0.0', 1, 7000)]
-        r = self.bess.apply_transaction(ops, request_id='t-1')
+        r = self.apply_transaction(ops, request_id='t-1')
         self.assertEqual(r.record.outcome, APPLIED)
         self.assertFalse(r.replayed)
-        again = self.bess.apply_transaction(ops, request_id='t-1')
+        again = self.apply_transaction(ops, request_id='t-1')
         self.assertTrue(again.replayed)
         self.assertEqual(again.record.generation, r.record.generation)
         known = self.bess.get_transaction('t-1')
@@ -82,7 +82,7 @@ class BessDataplaneTransactionsTest(BessModuleTestCase):
         # One bad gate rejects both modules' changes.
         bad = [exact_rule(self.bess, em, '10.0.0.3', '10.0.0.4', 2),
                wild_rule(self.bess, wm, '11.0.0.0', '255.0.0.0', 1, 9000)]
-        r = self.bess.apply_transaction(bad)
+        r = self.apply_transaction(bad)
         self.assertEqual(r.record.outcome, REJECTED)
         self.assertIn('invalid gate', r.record.ops[1].error)
         self.assertEqual(len(em.get_runtime_config().rules), 1)
@@ -103,7 +103,7 @@ class BessDataplaneTransactionsTest(BessModuleTestCase):
                 ops.append(exact_rule(self.bess, em,
                                       '10.%d.%d.1' % (j // 256 % 256,
                                                       j % 256), '10.0.0.2'))
-            r = self.bess.apply_transaction(ops)
+            r = self.apply_transaction(ops)
             if r.record.outcome == BUSY:
                 stats['busy'] += 1
                 return

@@ -63,9 +63,13 @@ type fake struct {
 func (f *fake) pipeline(_ context.Context, in proto.Message) (proto.Message, metadata.MD, error) {
 	switch req := in.(type) {
 	case *pb.GetPipelineRequest:
-		return &pb.GetPipelineResponse{Pipeline: &pb.Pipeline{}, Generation: 3}, nil, nil
+		return &pb.GetPipelineResponse{Pipeline: &pb.Pipeline{}, Generation: 3, DaemonEpoch: f.epochOr1()}, nil, nil
 	case *pb.ApplyPipelineRequest:
 		f.applied = append(f.applied, req)
+		if req.GetDaemonEpoch() != f.epochOr1() {
+			md, err := epochRefusal(req.GetDaemonEpoch(), f.epochOr1())
+			return nil, md, err
+		}
 		if len(f.pipelines) > 0 {
 			s := f.pipelines[0]
 			f.pipelines = f.pipelines[1:]
@@ -73,7 +77,7 @@ func (f *fake) pipeline(_ context.Context, in proto.Message) (proto.Message, met
 				return nil, s.md, s.err
 			}
 		}
-		return &pb.ApplyPipelineResponse{Generation: 4}, nil, nil
+		return &pb.ApplyPipelineResponse{Generation: 4, DaemonEpoch: f.epochOr1()}, nil, nil
 	}
 	return nil, nil, status.Error(codes.Unimplemented, "fake")
 }
@@ -83,12 +87,28 @@ func refusal(code codes.Code, detail pb.ErrorDetail_Code) step {
 	return step{err: status.Error(code, "x"), md: metadata.Pairs(errorDetailKey, string(d))}
 }
 
+// epochRefusal is what bessd answers a mutating request built under another
+// epoch (D-106).
+func epochRefusal(sent, daemon uint64) (metadata.MD, error) {
+	if sent == 0 {
+		d, _ := proto.Marshal(&pb.ErrorDetail{Code: pb.ErrorDetail_INVALID_ARGUMENT, Field: "daemon_epoch"})
+		return metadata.Pairs(errorDetailKey, string(d)), status.Error(codes.InvalidArgument, "no epoch")
+	}
+	d, _ := proto.Marshal(&pb.ErrorDetail{Code: pb.ErrorDetail_EPOCH_MISMATCH, Field: "daemon_epoch",
+		DaemonEpoch: daemon, Message: "built under another epoch"})
+	return metadata.Pairs(errorDetailKey, string(d)), status.Error(codes.FailedPrecondition, "epoch")
+}
+
 func (f *fake) apply(_ context.Context, in *pb.ApplyTransactionRequest) (*pb.ApplyTransactionResponse, metadata.MD, error) {
 	f.sent = append(f.sent, proto.Clone(in).(*pb.ApplyTransactionRequest))
 	s := f.applies[0]
 	f.applies = f.applies[1:]
 	if s.err != nil {
 		return nil, s.md, s.err
+	}
+	if in.GetDaemonEpoch() != s.epoch { // the step's epoch is the daemon's
+		md, err := epochRefusal(in.GetDaemonEpoch(), s.epoch)
+		return nil, md, err
 	}
 	rec := &pb.TransactionRecord{RequestId: in.GetRequestId(), Outcome: s.outcome, Generation: 7}
 	if f.rejectOps {
@@ -328,7 +348,14 @@ func TestARestartSeenByACommitInvalidatesTheOldHandles(t *testing.T) {
 	tx := h.c.Transaction()
 	_ = upsert(tx, old)
 	_, err := tx.Commit(ctx)
-	as[*DaemonRestartedError](t, err)
+	// It named its resources' epoch; the daemon refused it (D-106): an
+	// answer, so nothing to ask and nothing applied.
+	if e := as[*DaemonRestartedError](t, err); !e.Refused || e.From != 1 || e.To != 2 {
+		t.Fatal(e)
+	}
+	if h.f.sent[0].GetDaemonEpoch() != 1 || len(h.f.sent) != 1 || len(h.f.asked) != 0 {
+		t.Fatal(h.f.sent, h.f.asked)
+	}
 	as[*StaleResourceError](t, upsert(h.c.Transaction(), old))
 }
 
@@ -549,15 +576,16 @@ func TestApplyPipelineRetriesBusyAndNeverAConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := h.c.ApplyPipeline(ctx, snap.Pipeline, WithPipelineGeneration(snap.Generation))
-	if err != nil || r.GetGeneration() != 4 || len(h.f.applied) != 3 || h.f.applied[0].GetExpectedGeneration() != 3 {
+	r, err := h.c.ApplyPipeline(ctx, snap.Pipeline, WithExpectedVersion(snap.Version))
+	if err != nil || r.GetGeneration() != 4 || len(h.f.applied) != 3 || h.f.applied[0].GetExpectedGeneration() != 3 ||
+		h.f.applied[0].GetDaemonEpoch() != 1 {
 		t.Fatal(r, err, h.f.applied)
 	}
 	if len(h.sleeps) != 2 || h.sleeps[1] != 20*time.Millisecond {
 		t.Fatal(h.sleeps)
 	}
 	h = newHarness(&fake{pipelines: []step{refusal(codes.Aborted, pb.ErrorDetail_CONFLICT)}}, 4)
-	_, err = h.c.ApplyPipeline(ctx, &pb.Pipeline{}, WithPipelineGeneration(1))
+	_, err = h.c.ApplyPipeline(ctx, &pb.Pipeline{}, WithExpectedVersion(PipelineVersion{1, 1}))
 	as[*PipelineConflictError](t, err)
 	if len(h.f.applied) != 1 {
 		t.Fatal(h.f.applied)
@@ -565,6 +593,37 @@ func TestApplyPipelineRetriesBusyAndNeverAConflict(t *testing.T) {
 	h = newHarness(&fake{pipelines: []step{busyStep, busyStep}}, 2)
 	_, err = h.c.ApplyPipeline(ctx, &pb.Pipeline{})
 	as[*BusyError](t, err)
+}
+
+// Every apply names an epoch: its expected version's, else the one the client
+// learned. A restarted daemon refuses it: Refused, not retried, and the
+// client now knows the new epoch.
+func TestAnApplyNamesItsEpochAndARestartRefusesIt(t *testing.T) {
+	ctx := context.Background()
+	f := &fake{}
+	h := newHarness(f, 4)
+	if _, err := h.c.ApplyPipeline(ctx, &pb.Pipeline{}); err != nil {
+		t.Fatal(err)
+	}
+	if f.listed != 1 || f.applied[0].GetDaemonEpoch() != 1 || f.applied[0].ExpectedGeneration != nil {
+		t.Fatal("the epoch was not learned before the apply", f.listed, f.applied[0])
+	}
+	snap, _ := h.c.Pipeline(ctx)
+	f.epoch = 2 // restarted after the snapshot
+	_, err := h.c.ApplyPipeline(ctx, snap.Pipeline, WithExpectedVersion(snap.Version))
+	if e := as[*DaemonRestartedError](t, err); !e.Refused || e.From != 1 || e.To != 2 {
+		t.Fatal(e)
+	}
+	if epoch, _ := h.c.DaemonEpoch(); len(f.applied) != 2 || epoch != 2 {
+		t.Fatal("a refusal was retried, or the new epoch not learned", len(f.applied), epoch)
+	}
+	// An expected version is sent as given: one without its epoch is the
+	// daemon's to refuse, never completed with the current epoch.
+	_, err = h.c.ApplyPipeline(ctx, snap.Pipeline, WithExpectedVersion(PipelineVersion{Generation: 3}))
+	as[*InvalidRequestError](t, err)
+	if last := f.applied[len(f.applied)-1]; last.GetDaemonEpoch() != 0 {
+		t.Fatal("an expected version's missing epoch was filled in", last)
+	}
 }
 
 func TestApplyPipelineWithoutAnAnswerIsUnknownAndNotResent(t *testing.T) {

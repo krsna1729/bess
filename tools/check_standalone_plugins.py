@@ -128,7 +128,7 @@ class SessionWire:
         ]
 
     def apply(self, client, ops, outcome, what):
-        record = client.apply_transaction(ops).record
+        record = client.apply_transaction(ops, daemon_epoch=self.epoch).record
         if record.outcome != outcome:
             name = self.v2.TransactionRecord.Outcome.Name
             raise RuntimeError(f'R4 over the wire: {what}: {name(record.outcome)}, expected '
@@ -139,8 +139,10 @@ class SessionWire:
         """Before the traffic: the resources are listed with their types, and
         one transaction installs session 1 across the router and the
         application."""
-        listed = {r.name: (r.key_type, r.value_type)
-                  for r in client.list_transaction_resources().resources}
+        listing = client.list_transaction_resources()
+        # The daemon this check's transactions are built against (D-106).
+        self.epoch = listing.daemon_epoch
+        listed = {r.name: (r.key_type, r.value_type) for r in listing.resources}
         expected = {
             self.res['qos']: ('session_appliance.QosKey', 'session_appliance.QosValue'),
             self.res['actions']: ('session_appliance.ActionKey', 'session_appliance.ActionValue'),

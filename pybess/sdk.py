@@ -35,12 +35,18 @@ plans and applies it -- the SDK repeats none of that:
 
     snap = client.pipeline()
     p = sdk.PipelineBuilder(snap.pipeline).module('em', 'ExactMatch', arg).connect('rnd', 'em')
-    client.apply_pipeline(p.build(), expected_generation=snap.generation)
+    client.apply_pipeline(p.build(), expected=snap.version)
 
 apply_pipeline retries a busy answer (bounded, like a transaction) and never a
 conflict or a refusal. It has no request id: after no answer, the outcome is
 unknown (TransportError) -- read client.pipeline() and compare before applying
-again, or apply with expected_generation so a second application conflicts.
+again, or apply with `expected` so a second application conflicts.
+
+Generations restart with the daemon, so a version is (generation, daemon
+epoch). Every mutating request names the epoch it was built under (D-106): a
+transaction its resources', an apply its `expected` version's, else the last
+one the client saw. A restarted daemon refuses it (DaemonRestarted, nothing
+applied there).
 
 One limit: the daemon remembers outcomes in a bounded window (4096). A request
 that applied, then aged out of it before the retry asked, looks unseen and is
@@ -48,6 +54,7 @@ sent again. Set expected_generation where applying twice would matter: the
 second application is then a Conflict.
 """
 
+import collections
 import time
 import uuid
 
@@ -129,7 +136,7 @@ class StaleResource(Error):
 
 
 class PipelineConflict(Conflict):
-    """apply_pipeline's expected_generation no longer matched: nothing changed."""
+    """apply_pipeline's expected generation no longer matched: nothing changed."""
 
     def __init__(self, message, detail=None):
         Error.__init__(self, message)
@@ -139,10 +146,16 @@ class PipelineConflict(Conflict):
 
 
 class DaemonRestarted(Error):
-    """The daemon restarted: the state the transaction was built against is
-    gone. The restarted daemon may have applied the request (a restart the
-    client had not seen yet): re-read its state before deciding again; a
-    retry under a new request id could apply it twice."""
+    """The daemon restarted under the request: the state it was built against
+    is gone. `refused`: the daemon refused the request for naming the old
+    epoch (D-106), so nothing of it was applied in the running daemon.
+    Otherwise an answer came from the new epoch (to a status question after
+    an unanswered send, or on an event stream): what happened on the old
+    daemon is lost. Either way, re-read the state before deciding again."""
+
+    def __init__(self, message, refused=False):
+        super().__init__(message)
+        self.refused = refused
 
 
 # -- results ---------------------------------------------------------------------
@@ -311,9 +324,11 @@ class Client:
     # desired state
 
     def pipeline(self):
-        """The active pipeline as desired state, and its generation."""
+        """The active pipeline as desired state, and its version."""
         response = self._read(self._stub.GetPipeline, v2.GetPipelineRequest())
-        return PipelineSnapshot(response.pipeline, response.generation)
+        self._observe_epoch(response.daemon_epoch)
+        return PipelineSnapshot(response.pipeline,
+                                PipelineVersion(response.generation, response.daemon_epoch))
 
     def validate_pipeline(self, pipeline):
         """The daemon's canonical form of `pipeline` (InvalidRequest if invalid)."""
@@ -321,24 +336,32 @@ class Client:
                                    v2.ValidatePipelineRequest(pipeline=pipeline)).normalized
 
     def diff_pipeline(self, pipeline):
-        """(PipelineDiff, generation): what applying `pipeline` would change."""
+        """(PipelineDiff, PipelineVersion): what applying `pipeline` would change."""
         response = self._pipeline_call(self._stub.DiffPipeline,
                                        v2.DiffPipelineRequest(pipeline=pipeline))
-        return response.diff, response.generation
+        self._observe_epoch(response.daemon_epoch)
+        return response.diff, PipelineVersion(response.generation, response.daemon_epoch)
 
     def plan_pipeline(self, pipeline):
-        """([PlanStep], generation): the daemon's plan for `pipeline`."""
+        """([PlanStep], PipelineVersion): the daemon's plan for `pipeline`."""
         response = self._pipeline_call(self._stub.PlanPipeline,
                                        v2.PlanPipelineRequest(pipeline=pipeline))
-        return list(response.steps), response.generation
+        self._observe_epoch(response.daemon_epoch)
+        return list(response.steps), PipelineVersion(response.generation, response.daemon_epoch)
 
-    def apply_pipeline(self, pipeline, expected_generation=None):
-        """Makes `pipeline` the active one, all or nothing; returns the
+    def apply_pipeline(self, pipeline, expected=None):
+        """Makes `pipeline` the active one, all or nothing; with `expected` (a
+        PipelineVersion) only if the active version is still that. Returns the
         daemon's ApplyPipelineResponse (generation, applied_ops, timings)."""
         request = v2.ApplyPipelineRequest(pipeline=pipeline)
-        if expected_generation is not None:
-            request.expected_generation = expected_generation
-        return self._pipeline_call(self._stub.ApplyPipeline, request, retry_busy=True)
+        if expected is not None:
+            request.expected_generation = expected.generation
+            request.daemon_epoch = expected.daemon_epoch
+        else:
+            request.daemon_epoch = self._known_epoch()
+        response = self._pipeline_call(self._stub.ApplyPipeline, request, retry_busy=True)
+        self._observe_epoch(response.daemon_epoch)
+        return response
 
     # transactions
 
@@ -380,6 +403,8 @@ class Client:
                 detail = _detail(e)
                 if detail is None and _no_answer(e):
                     raise TransportError(None, e.code())
+                if detail is not None and detail.code == v2.ErrorDetail.EPOCH_MISMATCH:
+                    raise self._refused_epoch(request.daemon_epoch, detail)
                 if detail is not None and detail.code == v2.ErrorDetail.CONFLICT:
                     raise PipelineConflict(detail.message or e.details(), detail)
                 if (detail is not None and detail.code == v2.ErrorDetail.RESOURCE_BUSY and
@@ -398,6 +423,18 @@ class Client:
         if changed:
             self._resources = None  # the restarted daemon's modules may differ
         return changed
+
+    def _known_epoch(self):
+        """The epoch the client has seen, asked for if it has seen none."""
+        if self.daemon_epoch is None:
+            self.resources(refresh=True)  # any answer names the epoch
+        return self.daemon_epoch
+
+    def _refused_epoch(self, sent, detail):
+        """The daemon refused a request built under epoch `sent` (D-106)."""
+        self._observe_epoch(detail.daemon_epoch)
+        return DaemonRestarted('the daemon restarted (epoch %d -> %d): refused, nothing applied'
+                               % (sent, detail.daemon_epoch), refused=True)
 
     def _check_bound(self, epoch, what):
         if self.daemon_epoch is None:
@@ -427,6 +464,9 @@ class Client:
                     response = self._call(self._stub.ApplyTransaction, request)
                 except grpc.RpcError as e:
                     if not _no_answer(e):
+                        detail = _detail(e)
+                        if detail is not None and detail.code == v2.ErrorDetail.EPOCH_MISMATCH:
+                            raise self._refused_epoch(epoch, detail)
                         raise _translate(e)
                     transport_failure = last_unanswered = e.code()
                     unknown_attempt = True
@@ -553,7 +593,7 @@ class Transaction:
             raise InvalidRequest('empty transaction')
         self._client._check_bound(self._epoch, 'this transaction')
         request = v2.ApplyTransactionRequest(
-            request_id=self.request_id, ops=self._ops,
+            request_id=self.request_id, ops=self._ops, daemon_epoch=self._epoch,
             consistency=_SCOPE_SNAPSHOT if self._snapshot else _REFERENTIAL)
         if self._expected is not None:
             request.expected_generation = self._expected
@@ -594,16 +634,21 @@ def _pack(message):
 
 # -- desired state ------------------------------------------------------------------
 
-class PipelineSnapshot:
-    """The active pipeline (control_v2.Pipeline) and its generation."""
+PipelineVersion = collections.namedtuple('PipelineVersion', 'generation daemon_epoch')
+PipelineVersion.__doc__ = """A pipeline generation and the daemon epoch it
+belongs to: generations restart with the daemon (D-106)."""
 
-    def __init__(self, pipeline, generation):
+
+class PipelineSnapshot:
+    """The active pipeline (control_v2.Pipeline) and its version."""
+
+    def __init__(self, pipeline, version):
         self.pipeline = pipeline
-        self.generation = generation
+        self.version = version
 
     def __repr__(self):
-        return 'PipelineSnapshot(generation=%d, modules=%d)' % (
-            self.generation, len(self.pipeline.modules))
+        return 'PipelineSnapshot(generation=%d, epoch=%d, modules=%d)' % (
+            self.version.generation, self.version.daemon_epoch, len(self.pipeline.modules))
 
 
 class PipelineBuilder:

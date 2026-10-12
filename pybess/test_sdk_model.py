@@ -12,7 +12,8 @@ client against every sequence of choices and checks, for each outcome:
   - Applied only if the daemon applied it, in the epoch that answered;
   - Busy only if nothing was applied anywhere;
   - TransportError only after an RPC that went unanswered;
-  - DaemonRestarted only if the daemon restarted.
+  - DaemonRestarted only if the daemon restarted, and when the daemon refused
+    the request for naming the old epoch (D-106), nothing was applied.
 """
 
 import unittest
@@ -66,6 +67,13 @@ class Daemon:
         if what == 'lose_request':
             self.unanswered = True
             raise FakeRpcError(TIMEOUT)
+        if request.daemon_epoch != self.epoch:  # refused before any effect (D-106)
+            if what == 'lose_reply':
+                self.unanswered = True
+                raise FakeRpcError(TIMEOUT)
+            raise FakeRpcError(grpc.StatusCode.FAILED_PRECONDITION, 'another epoch',
+                               v2.ErrorDetail(code=v2.ErrorDetail.EPOCH_MISMATCH,
+                                              daemon_epoch=self.epoch))
         if what == 'busy':
             return v2.ApplyTransactionResponse(
                 record=v2.TransactionRecord(request_id=request.request_id, outcome=BUSY),
@@ -156,6 +164,8 @@ class SdkProtocolModelTest(unittest.TestCase):
                 self.assertTrue(daemon.unanswered, where)
             elif isinstance(result, sdk.DaemonRestarted):
                 self.assertTrue(daemon.restarted, where)
+                if result.refused:
+                    self.assertEqual(daemon.applications, 0, where)
             else:
                 self.fail('unexpected outcome: ' + where)
         return paths, outcomes

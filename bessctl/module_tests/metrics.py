@@ -40,9 +40,9 @@ class BessMetricsTest(BessModuleTestCase):
         key.fields.add(value_bin=socket.inet_aton('10.0.0.1'))
         key.fields.add(value_bin=socket.inet_aton('10.0.0.2'))
         op = self.bess.transaction_op(em.name + '/rules', key, module_msg.ExactMatchRuleValue(gate=1))
-        self.bess.apply_transaction([op])
+        self.apply_transaction([op])
         # Erasing a key that is not there is refused: a rejection.
-        self.bess.apply_transaction([self.bess.transaction_op(
+        self.apply_transaction([self.bess.transaction_op(
             em.name + '/rules', module_msg.ExactMatchRuleKey(fields=[
                 {'value_bin': socket.inet_aton('9.9.9.9')}, {'value_bin': socket.inet_aton('9.9.9.9')}]),
             erase=True)])

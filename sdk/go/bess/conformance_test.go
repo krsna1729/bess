@@ -101,8 +101,8 @@ type commitLabel struct {
 }
 
 type pipeLabel struct {
-	pipeline   *pb.Pipeline
-	generation uint64
+	pipeline *pb.Pipeline
+	version  PipelineVersion
 }
 
 type watch struct {
@@ -376,7 +376,7 @@ func (r *runner) pipeline(s spec, wantError string) error {
 			return expect(err, wantError, "pipeline")
 		}
 		if !builds {
-			r.pipes[s.str("as")] = pipeLabel{snap.Pipeline, snap.Generation}
+			r.pipes[s.str("as")] = pipeLabel{snap.Pipeline, snap.Version}
 			return nil
 		}
 		base = snap.Pipeline
@@ -401,12 +401,12 @@ func (r *runner) pipeline(s spec, wantError string) error {
 		return expect(err, wantError, "build")
 	}
 	if s.boolean("plan") {
-		steps, g, err := r.client.PlanPipeline(r.ctx, p)
+		steps, v, err := r.client.PlanPipeline(r.ctx, p)
 		if err != nil || len(steps) == 0 {
 			return fmt.Errorf("plan: %d step(s), %v", len(steps), err)
 		}
-		if s.has("want_plan_generation_of") && g != r.pipes[s.str("want_plan_generation_of")].generation {
-			return fmt.Errorf("plan against generation %d", g)
+		if s.has("want_plan_version_of") && v != r.pipes[s.str("want_plan_version_of")].version {
+			return fmt.Errorf("plan against generation %d of epoch %d", v.Generation, v.DaemonEpoch)
 		}
 	}
 	if s.has("want_changes") {
@@ -419,15 +419,15 @@ func (r *runner) pipeline(s spec, wantError string) error {
 		}
 	}
 	var opts []PipelineOption
-	if s.has("at_generation_of") {
-		opts = append(opts, WithPipelineGeneration(r.pipes[s.str("at_generation_of")].generation))
+	if s.has("at_version_of") {
+		opts = append(opts, WithExpectedVersion(r.pipes[s.str("at_version_of")].version))
 	}
 	done, err := r.client.ApplyPipeline(r.ctx, p, opts...)
 	if err := expect(err, wantError, "apply"); err != nil {
 		return err
 	}
 	if err == nil && s.has("as") {
-		r.pipes[s.str("as")] = pipeLabel{p, done.GetGeneration()}
+		r.pipes[s.str("as")] = pipeLabel{p, PipelineVersion{done.GetGeneration(), done.GetDaemonEpoch()}}
 	}
 	return nil
 }

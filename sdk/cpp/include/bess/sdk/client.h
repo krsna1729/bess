@@ -81,9 +81,10 @@ enum class ErrorKind {
   kTransport,
   // ApplyPipeline's expected generation no longer matched; nothing changed.
   kPipelineConflict,
-  // The request met a daemon that lost the state it was built against. The
-  // restarted daemon may have applied it: re-read before deciding again; a
-  // retry under a new request id could apply it twice.
+  // The daemon restarted since the request was built (`from_epoch` ->
+  // `to_epoch`). It refuses requests built under another epoch (D-106), so
+  // nothing of this one is applied in the running daemon, but what the
+  // request was built from is gone: re-read before deciding again.
   kDaemonRestarted,
   // A resource handle, or a transaction built with one, from an earlier
   // daemon epoch than the one the client has seen. Nothing was sent: look the
@@ -146,19 +147,29 @@ struct RetryPolicy {
   std::chrono::nanoseconds busy_backoff = std::chrono::milliseconds(10);  // doubled per BUSY
 };
 
+// A pipeline generation and the daemon epoch it belongs to: generations count
+// from 1 again after a restart, so one means something only with its epoch
+// (D-106). ApplyPipeline's expected version comes from a snapshot, diff, plan
+// or earlier apply.
+struct PipelineVersion {
+  uint64_t generation = 0;
+  uint64_t daemon_epoch = 0;
+  bool operator==(const PipelineVersion &) const = default;
+};
+
 struct PipelineSnapshot {
   pb::Pipeline pipeline;
-  uint64_t generation = 0;
+  PipelineVersion version;
 };
 
 struct PipelineDiffResult {
   pb::PipelineDiff diff;
-  uint64_t generation = 0;  // the generation the diff was taken against
+  PipelineVersion version;  // what the diff was taken against
 };
 
 struct PipelinePlan {
   std::vector<pb::PlanStep> steps;
-  uint64_t generation = 0;  // the generation the plan was made against
+  PipelineVersion version;  // what the plan was made against
 };
 
 struct TransactionStatus {
@@ -237,10 +248,12 @@ class Client {
   Result<pb::Pipeline> ValidatePipeline(const pb::Pipeline &p);
   Result<PipelineDiffResult> DiffPipeline(const pb::Pipeline &p);
   Result<PipelinePlan> PlanPipeline(const pb::Pipeline &p);
-  // Makes `p` the active pipeline, all or nothing; with `expected_generation`
-  // only if the active generation is that (kPipelineConflict otherwise).
+  // Makes `p` the active pipeline, all or nothing; with `expected` only if
+  // the active version is still that (kPipelineConflict if the generation
+  // moved, kDaemonRestarted if the epoch did). Every apply names the daemon
+  // epoch it was built under: `expected`'s, else the last one the client saw.
   Result<pb::ApplyPipelineResponse> ApplyPipeline(
-      const pb::Pipeline &p, std::optional<uint64_t> expected_generation = {},
+      const pb::Pipeline &p, std::optional<PipelineVersion> expected = {},
       std::stop_token stop = {});
 
   // -- transactions --
@@ -255,9 +268,13 @@ class Client {
 
   template <typename Resp, typename Call>
   Result<Resp> Unary(Call &&call);
+  // `sent_epoch`: the epoch a mutating request named (0 for reads).
   template <typename Resp, typename Call>
-  Result<Resp> PipelineCall(Call &&call, bool retry_busy, std::stop_token stop);
+  Result<Resp> PipelineCall(Call &&call, bool retry_busy, std::stop_token stop,
+                            uint64_t sent_epoch = 0);
   bool ObserveEpoch(uint64_t epoch);
+  // The epoch the client has seen, asked for if it has seen none.
+  Result<uint64_t> KnownEpoch();
   Result<void> CheckEpoch(uint64_t answered, uint64_t expected);
   Result<Applied> Commit(const pb::ApplyTransactionRequest &req, uint64_t epoch,
                          std::stop_token stop);

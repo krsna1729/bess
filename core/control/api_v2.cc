@@ -10,7 +10,9 @@
 #endif
 
 #include <cctype>
+#include <format>
 #include <limits>
+#include <optional>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -357,6 +359,35 @@ grpc::Status ToStatus(const ControlError &error,
   return grpc::Status(code, error.message);
 }
 
+// A mutating request names the daemon epoch it was built under (D-106):
+// generations, request ids and resources mean something only within one.
+// Refused before any side effect; nullopt if it is this daemon's.
+std::optional<grpc::Status> RefuseOtherEpoch(uint64_t sent, uint64_t epoch,
+                                             grpc::ServerContext *context) {
+  if (sent == epoch) {
+    return std::nullopt;
+  }
+  v2::ErrorDetail detail;
+  detail.set_field("daemon_epoch");
+  grpc::StatusCode code = grpc::StatusCode::INVALID_ARGUMENT;
+  if (sent == 0) {
+    detail.set_code(v2::ErrorDetail::INVALID_ARGUMENT);
+    detail.set_message("daemon_epoch is required: the epoch of an earlier answer");
+  } else {
+    code = grpc::StatusCode::FAILED_PRECONDITION;
+    detail.set_code(v2::ErrorDetail::EPOCH_MISMATCH);
+    detail.set_daemon_epoch(epoch);
+    detail.set_message(std::format(
+        "built under daemon epoch {}, but the daemon restarted (epoch {}): nothing was applied; "
+        "re-read before deciding again",
+        sent, epoch));
+  }
+  if (context != nullptr) {
+    context->AddTrailingMetadata("bess-error-bin", detail.SerializeAsString());
+  }
+  return grpc::Status(code, detail.message());
+}
+
 // -- service ------------------------------------------------------------------------
 
 grpc::Status ControlV2Service::GetPipeline(grpc::ServerContext *,
@@ -365,6 +396,7 @@ grpc::Status ControlV2Service::GetPipeline(grpc::ServerContext *,
   const auto snapshot = control_plane_.GetPipelineVersioned();
   *response->mutable_pipeline() = ToProto(SpecFromSnapshot(snapshot.value));
   response->set_generation(snapshot.generation);
+  response->set_daemon_epoch(transactions_.epoch());
   return grpc::Status::OK;
 }
 
@@ -396,6 +428,7 @@ grpc::Status ControlV2Service::DiffPipeline(
   }
   *response->mutable_diff() = ToProto(diff->value);
   response->set_generation(diff->generation);
+  response->set_daemon_epoch(transactions_.epoch());
   return grpc::Status::OK;
 }
 
@@ -412,12 +445,16 @@ grpc::Status ControlV2Service::PlanPipeline(
   }
   AppendPlanSteps(plan->value, response->mutable_steps());
   response->set_generation(plan->generation);
+  response->set_daemon_epoch(transactions_.epoch());
   return grpc::Status::OK;
 }
 
 grpc::Status ControlV2Service::ApplyPipeline(
     grpc::ServerContext *context, const v2::ApplyPipelineRequest *request,
     v2::ApplyPipelineResponse *response) {
+  if (auto refused = RefuseOtherEpoch(request->daemon_epoch(), transactions_.epoch(), context)) {
+    return *refused;
+  }
   // DPDK functions may be called (port and module creation).
   current_worker.SetNonWorker();
 
@@ -440,6 +477,7 @@ grpc::Status ControlV2Service::ApplyPipeline(
   response->set_prepare_us(applied->timing.prepare_us);
   response->set_paused_commit_us(applied->timing.paused_commit_us);
   response->set_retire_us(applied->timing.retire_us);
+  response->set_daemon_epoch(transactions_.epoch());
   return grpc::Status::OK;
 }
 
@@ -466,6 +504,9 @@ ControlV2Service::ControlV2Service(ControlPlane &control_plane)
 grpc::Status ControlV2Service::ApplyTransaction(
     grpc::ServerContext *context, const v2::ApplyTransactionRequest *request,
     v2::ApplyTransactionResponse *response) {
+  if (auto refused = RefuseOtherEpoch(request->daemon_epoch(), transactions_.epoch(), context)) {
+    return *refused;
+  }
   // Resources' tables are DPDK structures; commands writing the same tables
   // run under the same lock.
   current_worker.SetNonWorker();

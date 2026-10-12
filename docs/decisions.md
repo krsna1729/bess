@@ -126,6 +126,7 @@ file is the reasoning.
 | D-103 | Typed legacy boundaries: `enum class Resource`, `PacketBatch::packets()`, `CpuId` (fixes core truncation and Bypass byte charge) | accepted |
 | D-104 | Product boundary: Python leaves the runtime (manifests and Admin first, pybess last); HTTP/UI inside bessd, off or localhost by default; C++ SDK + C++ bessctl, Go SDK for external controllers | accepted |
 | D-105 | Schema discovery: `GetSchema` names every init and command argument type with a self-contained `FileDescriptorSet`; registration records `Init`'s type (source-compatible) | accepted |
+| D-106 | Every mutating control_v2 request names the daemon epoch it was built under; generations travel with their epoch | accepted |
 
 
 ---
@@ -7992,3 +7993,42 @@ parameter type only inside a lambda, and pybess guessed `<Class>Arg` by conventi
 mapping would still need an RPC. Keeping pybess's naming convention fails for classes whose `Init` takes `EmptyArg` or
 another package's type. Recording each command's type from its handler (as for `Init`) would change `Command`, which
 plugins build directly; resolution plus a test covers the same mistakes without that.
+
+## D-106 Mandatory daemon epoch on mutating requests
+
+**Status:** accepted (2026-10-12).
+**Code:** `daemon_epoch` in `ApplyTransactionRequest`, `ApplyPipelineRequest`, the Get/Diff/Plan/Apply pipeline
+responses and `ErrorDetail`, `EPOCH_MISMATCH` (`protobuf/control_v2.proto`); `RefuseOtherEpoch`
+(`core/control/api_v2.cc`); `PipelineVersion` and the epoch handling in `sdk/cpp`, `sdk/go/bess` and `pybess/sdk.py`.
+
+**Context.** Generations (pipeline and transaction) start again when bessd restarts. A client that read generation 7,
+lost the daemon, and then applied "at generation 7" could meet a new daemon that had also reached 7 by other writes:
+the expected-generation check passed against unrelated state. A transaction without `expected_generation` had no
+check at all: built from resources of the old daemon, it was applied to whatever the new one had under the same
+names. The SDKs saw the restart only in the answer, after the request had taken effect.
+
+**Decision.**
+- `ApplyTransactionRequest.daemon_epoch` and `ApplyPipelineRequest.daemon_epoch` are required. The daemon checks
+  them first, before any side effect and before the request id is looked up: 0 is `INVALID_ARGUMENT` (detail
+  `INVALID_ARGUMENT`, field `daemon_epoch`); another epoch is `FAILED_PRECONDITION` with detail `EPOCH_MISMATCH` and
+  `ErrorDetail.daemon_epoch` set to the current epoch. A refused request was not applied and is not recorded.
+- Every response that returns a pipeline generation also returns `daemon_epoch`. The SDKs carry the pair as a
+  `PipelineVersion`: snapshots, diffs and plans return one; an apply expects one (`ApplyPipeline(p, version)` in
+  C++, `WithExpectedVersion` in Go, `expected=` in Python).
+- The SDKs fill the field: a transaction names its resources' epoch; an apply names its expected version's epoch,
+  else the last epoch the client saw (asked for first if none). A refusal is `kDaemonRestarted` /
+  `DaemonRestartedError{Refused}` / `DaemonRestarted(refused=True)`: an answer, so it is not retried and no outcome
+  is asked for, and the client now knows the new epoch.
+- bessctl prints every pipeline version as `generation@epoch` (diff, plan, apply), and `apply --generation` takes
+  only that form: a bare generation is a usage error, since it would match a restarted daemon at the same number.
+- `GetTransaction` and the reads take no epoch: they change nothing, and their answers carry the epoch.
+
+**Compatibility.** The wire change is additive (`buf breaking` passes). The behaviour is not: a client that sends no
+epoch is refused. All in-tree clients (both SDKs, pybess, bessctl, tests) send it; no released client used these RPCs
+outside the tree.
+
+**Alternatives.** Keeping the epoch optional (checked only when set) leaves the silent case in place for every
+client that forgets it, which is the case this closes. Making generations unique across restarts (persisted, or
+seeded from time) would remove the comparison problem but not the resource-binding one, and would need state that
+survives a restart. Checking the epoch only in the SDKs cannot stop a request that is already on its way to a new
+daemon.

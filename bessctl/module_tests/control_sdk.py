@@ -167,6 +167,7 @@ class BessControlSdkTest(BessModuleTestCase):
         client = sdk.Client(stub=stub, retry=sdk.RetryPolicy(attempt_timeout=10, attempts=6))
         rules = client.resource(em.name + '/rules')
         epoch = client.daemon_epoch
+        before = sdk.Client(self.bess.peer).pipeline()
         tx = client.transaction()
         tx.upsert(rules, key, module_msg.ExactMatchRuleValue(gate=1))
         try:
@@ -185,6 +186,15 @@ class BessControlSdkTest(BessModuleTestCase):
         # The restarted daemon has no such module.
         with self.assertRaises(sdk.InvalidRequest):
             client.resource(em.name + '/rules')
+        # A request built under the old epoch is refused by the new daemon
+        # (D-106), even where its generation happens to match: nothing applied.
+        fresh = sdk.Client(self.bess.peer)
+        now = fresh.pipeline()
+        stale = sdk.PipelineVersion(now.version.generation, before.version.daemon_epoch)
+        with self.assertRaises(sdk.DaemonRestarted) as raised:
+            fresh.apply_pipeline(before.pipeline, expected=stale)
+        self.assertTrue(raised.exception.refused)
+        self.assertEqual(fresh.pipeline().version, now.version)
 
     def test_a_pipeline_through_the_sdk(self):
         client = sdk.Client(self.bess.peer)
@@ -192,11 +202,12 @@ class BessControlSdkTest(BessModuleTestCase):
         built = (sdk.PipelineBuilder(snap.pipeline)
                  .module('sdk_a', 'Bypass').module('sdk_b', 'Sink').chain('sdk_a', 'sdk_b')
                  .build())
-        steps, generation = client.plan_pipeline(built)
-        self.assertEqual(generation, snap.generation)
+        steps, version = client.plan_pipeline(built)
+        self.assertEqual(version, snap.version)
         self.assertIn('sdk_b', [s.object for s in steps])
-        done = client.apply_pipeline(built, expected_generation=snap.generation)
-        self.assertGreater(done.generation, snap.generation)
+        done = client.apply_pipeline(built, expected=snap.version)
+        self.assertGreater(done.generation, snap.version.generation)
+        self.assertEqual(done.daemon_epoch, snap.version.daemon_epoch)
         names = [m.name for m in client.pipeline().pipeline.modules]
         self.assertIn('sdk_a', names)
         # The same desired state again changes nothing.
@@ -204,7 +215,7 @@ class BessControlSdkTest(BessModuleTestCase):
         # Built against a generation that has moved on: nothing changes.
         removal = sdk.PipelineBuilder(built).remove('sdk_b').build()
         with self.assertRaises(sdk.Conflict):
-            client.apply_pipeline(removal, expected_generation=snap.generation)
+            client.apply_pipeline(removal, expected=snap.version)
         self.assertIn('sdk_b', [m.name for m in client.pipeline().pipeline.modules])
         client.apply_pipeline(sdk.PipelineBuilder(removal).remove('sdk_a').build())
         self.assertNotIn('sdk_a', [m.name for m in client.pipeline().pipeline.modules])

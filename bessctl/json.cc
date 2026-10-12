@@ -378,9 +378,9 @@ void DumpValue(std::string &out, const Value &value, int indent, int level) {
         out += ',';
       }
       newline(level + 1);
-      DumpString(out, (*o)[i].first);
+      DumpString(out, (*o)[i].key);
       out += indent > 0 ? ": " : ":";
-      DumpValue(out, (*o)[i].second, indent, level + 1);
+      DumpValue(out, (*o)[i].value, indent, level + 1);
     }
     newline(level);
     out += '}';
@@ -406,7 +406,7 @@ Value *Find(Value &object, std::string_view key) {
 
 void Erase(Value &object, std::string_view key) {
   if (Object *o = object.object()) {
-    std::erase_if(*o, [&](const auto &member) { return member.first == key; });
+    std::erase_if(*o, [&](const Member &member) { return member.key == key; });
   }
 }
 

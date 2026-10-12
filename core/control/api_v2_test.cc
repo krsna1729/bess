@@ -275,6 +275,15 @@ class ApiV2ServiceTest : public ::testing::Test {
     return detail;
   }
 
+  // The epoch every mutating request names (D-106), learned as a client does.
+  uint64_t Epoch() {
+    grpc::ClientContext ctx;
+    v2::ListTransactionResourcesResponse resp;
+    EXPECT_TRUE(stub_->ListTransactionResources(&ctx, {}, &resp).ok());
+    EXPECT_NE(0u, resp.daemon_epoch());
+    return resp.daemon_epoch();
+  }
+
   std::unique_ptr<ControlPlane> control_plane_;
   std::unique_ptr<ControlV2Service> service_;
   std::unique_ptr<grpc::Server> server_;
@@ -302,6 +311,7 @@ TEST_F(ApiV2ServiceTest, ValidateDiffPlanApplyGet) {
     v2::DiffPipelineResponse resp;
     ASSERT_TRUE(stub_->DiffPipeline(&ctx, req, &resp).ok());
     generation = resp.generation();
+    EXPECT_EQ(Epoch(), resp.daemon_epoch());
     int creates = 0;
     bool saw_connection = false;
     for (const auto &c : resp.diff().changes()) {
@@ -322,6 +332,7 @@ TEST_F(ApiV2ServiceTest, ValidateDiffPlanApplyGet) {
     v2::PlanPipelineResponse resp;
     ASSERT_TRUE(stub_->PlanPipeline(&ctx, req, &resp).ok());
     EXPECT_EQ(generation, resp.generation());
+    EXPECT_EQ(Epoch(), resp.daemon_epoch());
     ASSERT_GT(resp.steps_size(), 0);
     int last_phase = 0;
     for (const auto &s : resp.steps()) {
@@ -336,11 +347,13 @@ TEST_F(ApiV2ServiceTest, ValidateDiffPlanApplyGet) {
     v2::ApplyPipelineRequest req;
     *req.mutable_pipeline() = desired;
     req.set_expected_generation(generation);
+    req.set_daemon_epoch(Epoch());
     v2::ApplyPipelineResponse resp;
     const grpc::Status status = stub_->ApplyPipeline(&ctx, req, &resp);
     ASSERT_TRUE(status.ok()) << status.error_message();
     EXPECT_EQ(generation + 1, resp.generation());
     EXPECT_GT(resp.applied_ops(), 0u);
+    EXPECT_EQ(Epoch(), resp.daemon_epoch());
   }
 
   {
@@ -348,6 +361,7 @@ TEST_F(ApiV2ServiceTest, ValidateDiffPlanApplyGet) {
     v2::GetPipelineResponse resp;
     ASSERT_TRUE(stub_->GetPipeline(&ctx, {}, &resp).ok());
     EXPECT_EQ(generation + 1, resp.generation());
+    EXPECT_EQ(Epoch(), resp.daemon_epoch());
     EXPECT_EQ(2, resp.pipeline().modules_size());
     EXPECT_EQ(1, resp.pipeline().connections_size());
   }
@@ -356,6 +370,7 @@ TEST_F(ApiV2ServiceTest, ValidateDiffPlanApplyGet) {
     grpc::ClientContext ctx;
     v2::ApplyPipelineRequest req;
     *req.mutable_pipeline() = desired;
+    req.set_daemon_epoch(Epoch());
     v2::ApplyPipelineResponse resp;
     ASSERT_TRUE(stub_->ApplyPipeline(&ctx, req, &resp).ok());
     EXPECT_EQ(generation + 1, resp.generation());
@@ -369,6 +384,7 @@ TEST_F(ApiV2ServiceTest, StaleGenerationIsAbortedWithTypedDetail) {
   v2::ApplyPipelineRequest req;
   *req.mutable_pipeline() = SamplePipeline();
   req.set_expected_generation(bess::runtime::runtime().generation() + 100);
+  req.set_daemon_epoch(Epoch());
   v2::ApplyPipelineResponse resp;
   const grpc::Status status = stub_->ApplyPipeline(&ctx, req, &resp);
   EXPECT_EQ(grpc::StatusCode::ABORTED, status.error_code());
@@ -387,6 +403,7 @@ TEST_F(ApiV2ServiceTest, InvalidPipelineIsRejectedBeforeAnySideEffect) {
   grpc::ClientContext ctx;
   v2::ApplyPipelineRequest req;
   *req.mutable_pipeline() = bad;
+  req.set_daemon_epoch(Epoch());
   v2::ApplyPipelineResponse resp;
   const grpc::Status status = stub_->ApplyPipeline(&ctx, req, &resp);
   EXPECT_FALSE(status.ok());
@@ -437,6 +454,7 @@ TEST_F(ApiV2ServiceTest, OutOfRangeWireValuesAreRefusedEverywhere) {
     grpc::ClientContext ctx;
     v2::ApplyPipelineRequest req;
     *req.mutable_pipeline() = bad;
+    req.set_daemon_epoch(Epoch());
     v2::ApplyPipelineResponse resp;
     check(ctx, stub_->ApplyPipeline(&ctx, req, &resp));
   }
@@ -445,6 +463,51 @@ TEST_F(ApiV2ServiceTest, OutOfRangeWireValuesAreRefusedEverywhere) {
   v2::GetPipelineResponse resp;
   ASSERT_TRUE(stub_->GetPipeline(&ctx, {}, &resp).ok());
   EXPECT_EQ(0, resp.pipeline().modules_size()) << "nothing was created";
+}
+
+// A mutating request names the daemon epoch it was built under: without one it
+// is invalid, under another (a restart since) it is refused with the daemon's
+// epoch; either way before any side effect, and a refused transaction's
+// request id is never recorded (D-106).
+TEST_F(ApiV2ServiceTest, MutatingRequestsMustNameTheDaemonsEpoch) {
+  for (const uint64_t sent : {uint64_t{0}, Epoch() + 1}) {
+    SCOPED_TRACE(sent);
+    const grpc::StatusCode want = sent == 0 ? grpc::StatusCode::INVALID_ARGUMENT
+                                            : grpc::StatusCode::FAILED_PRECONDITION;
+    const auto want_code =
+        sent == 0 ? v2::ErrorDetail::INVALID_ARGUMENT : v2::ErrorDetail::EPOCH_MISMATCH;
+    {
+      grpc::ClientContext ctx;
+      v2::ApplyPipelineRequest req;
+      *req.mutable_pipeline() = SamplePipeline();
+      req.set_daemon_epoch(sent);
+      v2::ApplyPipelineResponse resp;
+      EXPECT_EQ(want, stub_->ApplyPipeline(&ctx, req, &resp).error_code());
+      const v2::ErrorDetail detail = DetailOf(ctx);
+      EXPECT_EQ(want_code, detail.code());
+      EXPECT_EQ("daemon_epoch", detail.field());
+      EXPECT_EQ(sent == 0 ? 0 : Epoch(), detail.daemon_epoch());
+    }
+    {
+      grpc::ClientContext ctx;
+      v2::ApplyTransactionRequest req;
+      req.set_request_id("epoch-refused");
+      req.set_daemon_epoch(sent);
+      v2::ApplyTransactionResponse resp;
+      EXPECT_EQ(want, stub_->ApplyTransaction(&ctx, req, &resp).error_code());
+      EXPECT_EQ(want_code, DetailOf(ctx).code());
+    }
+    grpc::ClientContext get_ctx;
+    v2::GetPipelineResponse current;
+    ASSERT_TRUE(stub_->GetPipeline(&get_ctx, {}, &current).ok());
+    EXPECT_EQ(0, current.pipeline().modules_size()) << "nothing applied";
+    grpc::ClientContext tx_ctx;
+    v2::GetTransactionRequest tx_req;
+    tx_req.set_request_id("epoch-refused");
+    v2::GetTransactionResponse tx;
+    ASSERT_TRUE(stub_->GetTransaction(&tx_ctx, tx_req, &tx).ok());
+    EXPECT_FALSE(tx.known()) << "a refused request id is not recorded";
+  }
 }
 
 // The int64 traffic-class fields are range-checked against the scheduler's

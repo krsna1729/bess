@@ -84,6 +84,15 @@ Error DaemonRestarted(uint64_t from, uint64_t to) {
   return e;
 }
 
+// The daemon refused a request built under epoch `sent` (D-106).
+Error RefusedOtherEpoch(uint64_t sent, const pb::ErrorDetail &detail) {
+  Error e = DaemonRestarted(sent, detail.daemon_epoch());
+  e.message += ": refused, nothing applied";
+  e.code = grpc::StatusCode::FAILED_PRECONDITION;
+  e.detail = detail;
+  return e;
+}
+
 Error StaleResource(std::string resource, uint64_t bound, uint64_t daemon) {
   const std::string what = resource.empty()
                                ? std::string("the transaction")
@@ -224,6 +233,16 @@ Result<void> Client::CheckEpoch(uint64_t answered, uint64_t expected) {
     return std::unexpected(DaemonRestarted(expected, answered));
   }
   return {};
+}
+
+Result<uint64_t> Client::KnownEpoch() {
+  if (auto epoch = DaemonEpoch()) {
+    return *epoch;
+  }
+  if (auto r = Resources(true); !r) {  // any answer names the epoch
+    return std::unexpected(std::move(r.error()));
+  }
+  return DaemonEpoch().value_or(0);
 }
 
 Result<std::map<std::string, sdk::Resource>> Client::Resources(bool refresh) {
@@ -384,7 +403,7 @@ Result<void> Client::WatchEvents(
 // policy; no answer is kTransport.
 template <typename Resp, typename Call>
 Result<Resp> Client::PipelineCall(Call &&call, bool retry_busy,
-                                  std::stop_token stop) {
+                                  std::stop_token stop, uint64_t sent_epoch) {
   auto backoff = retry_.busy_backoff;
   for (int attempt = 1;; attempt++) {
     Resp resp;
@@ -394,6 +413,10 @@ Result<Resp> Client::PipelineCall(Call &&call, bool retry_busy,
       return resp;
     }
     const std::optional<pb::ErrorDetail> detail = DecodeDetail(trailers);
+    if (detail && detail->code() == pb::ErrorDetail::EPOCH_MISMATCH) {
+      ObserveEpoch(detail->daemon_epoch());
+      return std::unexpected(RefusedOtherEpoch(sent_epoch, *detail));
+    }
     if (!detail && NoAnswer(status, trailers)) {
       return std::unexpected(TransportFailure(status.error_code()));
     }
@@ -424,7 +447,9 @@ Result<PipelineSnapshot> Client::Pipeline() {
   if (!r) {
     return std::unexpected(std::move(r.error()));
   }
-  return PipelineSnapshot{.pipeline = r->pipeline(), .generation = r->generation()};
+  ObserveEpoch(r->daemon_epoch());
+  return PipelineSnapshot{.pipeline = r->pipeline(),
+                          .version = {r->generation(), r->daemon_epoch()}};
 }
 
 Result<pb::Pipeline> Client::ValidatePipeline(const pb::Pipeline &p) {
@@ -452,7 +477,8 @@ Result<PipelineDiffResult> Client::DiffPipeline(const pb::Pipeline &p) {
   if (!r) {
     return std::unexpected(std::move(r.error()));
   }
-  return PipelineDiffResult{.diff = r->diff(), .generation = r->generation()};
+  ObserveEpoch(r->daemon_epoch());
+  return PipelineDiffResult{.diff = r->diff(), .version = {r->generation(), r->daemon_epoch()}};
 }
 
 Result<PipelinePlan> Client::PlanPipeline(const pb::Pipeline &p) {
@@ -466,24 +492,35 @@ Result<PipelinePlan> Client::PlanPipeline(const pb::Pipeline &p) {
   if (!r) {
     return std::unexpected(std::move(r.error()));
   }
+  ObserveEpoch(r->daemon_epoch());
   return PipelinePlan{
       .steps = std::vector<pb::PlanStep>(r->steps().begin(), r->steps().end()),
-      .generation = r->generation()};
+      .version = {r->generation(), r->daemon_epoch()}};
 }
 
 Result<pb::ApplyPipelineResponse> Client::ApplyPipeline(
-    const pb::Pipeline &p, std::optional<uint64_t> expected_generation,
-    std::stop_token stop) {
+    const pb::Pipeline &p, std::optional<PipelineVersion> expected, std::stop_token stop) {
   pb::ApplyPipelineRequest req;
   *req.mutable_pipeline() = p;
-  if (expected_generation) {
-    req.set_expected_generation(*expected_generation);
+  if (expected) {
+    req.set_expected_generation(expected->generation);
+    req.set_daemon_epoch(expected->daemon_epoch);
+  } else {
+    auto epoch = KnownEpoch();
+    if (!epoch) {
+      return std::unexpected(std::move(epoch.error()));
+    }
+    req.set_daemon_epoch(*epoch);
   }
-  return PipelineCall<pb::ApplyPipelineResponse>(
+  auto r = PipelineCall<pb::ApplyPipelineResponse>(
       [&](Deadline d, auto *resp, Trailers *t) {
         return transport_->ApplyPipeline(d, req, resp, t);
       },
-      true, stop);
+      true, stop, req.daemon_epoch());
+  if (r) {
+    ObserveEpoch(r->daemon_epoch());
+  }
+  return r;
 }
 
 // -- transactions ---------------------------------------------------------------
@@ -540,6 +577,11 @@ Result<Applied> Client::Commit(const pb::ApplyTransactionRequest &req,
           transport_->ApplyTransaction(AttemptDeadline(), req, &resp, &trailers);
       if (!status.ok()) {
         if (!NoAnswer(status, trailers)) {
+          const auto detail = DecodeDetail(trailers);
+          if (detail && detail->code() == pb::ErrorDetail::EPOCH_MISMATCH) {
+            ObserveEpoch(detail->daemon_epoch());
+            return std::unexpected(RefusedOtherEpoch(epoch, *detail));
+          }
           return std::unexpected(Translate(status, trailers));
         }
         transport_failure = last_unanswered = status.error_code();
@@ -670,6 +712,8 @@ Result<Applied> Transaction::Commit(std::stop_token stop) {
   if (expected_generation_) {
     req.set_expected_generation(*expected_generation_);
   }
+  // The epoch of its resources (D-106): a restarted daemon refuses it.
+  req.set_daemon_epoch(epoch_.value_or(0));
   auto applied = client_->Commit(req, epoch_.value_or(0), stop);
   if (applied) {
     result_ = *applied;

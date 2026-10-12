@@ -106,8 +106,8 @@ std::expected<void, std::string> FillTypes(json::Value &doc, const ArgList &l,
     // and inserting moved every member through a temporary that GCC 14 at -O3
     // flagged as maybe-uninitialized (a false positive).
     json::Object &members = *arg->object();
-    members.emplace_back("@type", json::Value{});
-    members.back().second.v = TypeUrl(it->second);
+    members.push_back({"@type", json::Value{}});
+    members.back().value.v = TypeUrl(it->second);
   }
   return {};
 }

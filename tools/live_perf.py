@@ -394,6 +394,8 @@ TESTS = {
 class Builder:
     def __init__(self, bess):
         self.bess = bess
+        # The daemon this setup's transactions are built against (D-106).
+        self.epoch = bess.list_transaction_resources().daemon_epoch
 
     def mod(self, mclass, name, arg):
         self.bess.create_module(mclass, name, arg)
@@ -407,7 +409,7 @@ class Builder:
     def txn(self, ops):
         """One v2 transaction (resources of Meter, Router, ActionTable, ...); raises unless applied."""
         from builtin_pb import control_v2_pb2
-        r = self.bess.apply_transaction(ops)
+        r = self.bess.apply_transaction(ops, daemon_epoch=self.epoch)
         if r.record.outcome != control_v2_pb2.TransactionRecord.OUTCOME_APPLIED:
             raise RuntimeError('transaction not applied: %s' % r.record)
 

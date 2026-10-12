@@ -128,6 +128,24 @@ class Fake final : public Transport {
 
   uint64_t EpochOr1() const { return epoch == 0 ? 1 : epoch; }
 
+  // What bessd answers a mutating request built under another epoch (D-106).
+  static grpc::Status RefuseEpoch(uint64_t sent, uint64_t daemon, Trailers *t) {
+    if (sent == 0) {
+      pb::ErrorDetail d;
+      d.set_code(pb::ErrorDetail::INVALID_ARGUMENT);
+      d.set_field("daemon_epoch");
+      t->emplace(kErrorDetailKey, d.SerializeAsString());
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "no epoch");
+    }
+    pb::ErrorDetail d;
+    d.set_code(pb::ErrorDetail::EPOCH_MISMATCH);
+    d.set_field("daemon_epoch");
+    d.set_daemon_epoch(daemon);
+    d.set_message("built under another epoch");
+    t->emplace(kErrorDetailKey, d.SerializeAsString());
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, d.message());
+  }
+
   grpc::Status ApplyTransaction(Deadline, const pb::ApplyTransactionRequest &in,
                                 pb::ApplyTransactionResponse *out,
                                 Trailers *t) override {
@@ -136,6 +154,9 @@ class Fake final : public Transport {
     if (!s.status.ok()) {
       *t = s.trailers;
       return s.status;
+    }
+    if (in.daemon_epoch() != s.epoch) {  // the step's epoch is the daemon's
+      return RefuseEpoch(in.daemon_epoch(), s.epoch, t);
     }
     pb::TransactionRecord *rec = out->mutable_record();
     rec->set_request_id(in.request_id());
@@ -196,12 +217,16 @@ class Fake final : public Transport {
                            pb::GetPipelineResponse *out, Trailers *) override {
     out->mutable_pipeline();
     out->set_generation(3);
+    out->set_daemon_epoch(EpochOr1());
     return grpc::Status::OK;
   }
 
   grpc::Status ApplyPipeline(Deadline, const pb::ApplyPipelineRequest &in,
                              pb::ApplyPipelineResponse *out, Trailers *t) override {
     applied.push_back(in);
+    if (in.daemon_epoch() != EpochOr1()) {
+      return RefuseEpoch(in.daemon_epoch(), EpochOr1(), t);
+    }
     if (!pipelines.empty()) {
       Step s = Pop(pipelines);
       if (!s.status.ok()) {
@@ -210,6 +235,7 @@ class Fake final : public Transport {
       }
     }
     out->set_generation(4);
+    out->set_daemon_epoch(EpochOr1());
     return grpc::Status::OK;
   }
 
@@ -652,23 +678,70 @@ TEST(SdkClient, ApplyPipelineRetriesBusyAndNeverAConflict) {
     h.f->pipelines = {busy, busy};
     auto snap = h.c->Pipeline();
     ASSERT_TRUE(snap);
-    auto r = h.c->ApplyPipeline(snap->pipeline, snap->generation);
+    auto r = h.c->ApplyPipeline(snap->pipeline, snap->version);
     ASSERT_TRUE(r) << r.error().message;
     EXPECT_EQ(r->generation(), 4u);
     ASSERT_EQ(h.f->applied.size(), 3u);
     EXPECT_EQ(h.f->applied[0].expected_generation(), 3u);
+    EXPECT_EQ(h.f->applied[0].daemon_epoch(), 1u) << "the snapshot's epoch";
     ASSERT_EQ(h.sleeps.size(), 2u);
     EXPECT_EQ(h.sleeps[1], milliseconds(20));
   }
   {
     Harness h(4);
     h.f->pipelines = {Refusal(grpc::StatusCode::ABORTED, pb::ErrorDetail::CONFLICT)};
-    EXPECT_EQ(KindOf(h.c->ApplyPipeline(pb::Pipeline(), 1)), ErrorKind::kPipelineConflict);
+    EXPECT_EQ(KindOf(h.c->ApplyPipeline(pb::Pipeline(), PipelineVersion{1, 1})),
+              ErrorKind::kPipelineConflict);
     EXPECT_EQ(h.f->applied.size(), 1u);
   }
   Harness h(2);
   h.f->pipelines = {busy, busy};
   EXPECT_EQ(KindOf(h.c->ApplyPipeline(pb::Pipeline())), ErrorKind::kBusy);
+}
+
+// Every mutating request names the epoch it was built under (D-106): a
+// transaction its resources', an apply its expected version's, else the one
+// the client learned. A restarted daemon refuses them: kDaemonRestarted,
+// nothing applied, not retried, and the client now knows the new epoch.
+TEST(SdkClient, MutatingRequestsNameTheirEpochAndARestartRefusesThem) {
+  {
+    Harness h(4);
+    EXPECT_TRUE(h.c->ApplyPipeline(pb::Pipeline()));
+    EXPECT_EQ(h.f->listed, 1) << "the epoch was not learned before the apply";
+    EXPECT_EQ(h.f->applied[0].daemon_epoch(), 1u);
+    EXPECT_FALSE(h.f->applied[0].has_expected_generation());
+  }
+  {
+    Harness h(4);
+    auto snap = h.c->Pipeline();
+    ASSERT_TRUE(snap);
+    h.f->epoch = 2;  // restarted after the snapshot
+    auto r = h.c->ApplyPipeline(snap->pipeline, snap->version);
+    ASSERT_EQ(KindOf(r), ErrorKind::kDaemonRestarted);
+    EXPECT_EQ(r.error().from_epoch, 1u);
+    EXPECT_EQ(r.error().to_epoch, 2u);
+    EXPECT_NE(r.error().message.find("nothing applied"), std::string::npos) << r.error().message;
+    EXPECT_EQ(h.f->applied.size(), 1u) << "a refusal was retried";
+    EXPECT_EQ(h.c->DaemonEpoch(), 2u);
+    // An expected version is sent as given: one without its epoch is the
+    // daemon's to refuse, never completed with the current epoch.
+    EXPECT_EQ(KindOf(h.c->ApplyPipeline(snap->pipeline, PipelineVersion{3, 0})),
+              ErrorKind::kInvalidRequest);
+    EXPECT_EQ(h.f->applied.back().daemon_epoch(), 0u);
+  }
+  Harness h(4);
+  h.f->epoch = 1;
+  h.f->applies = {Answer(kApplied, 2)};  // the daemon restarted: epoch 2
+  auto r = h.c->Resource(kResource);
+  ASSERT_TRUE(r);
+  Transaction tx = h.c->NewTransaction();
+  ASSERT_TRUE(Upsert(tx, *r));
+  auto a = tx.Commit();
+  ASSERT_EQ(KindOf(a), ErrorKind::kDaemonRestarted);
+  EXPECT_EQ(h.f->sent[0].daemon_epoch(), 1u) << "the resource's epoch";
+  EXPECT_EQ(h.f->sent.size(), 1u);
+  EXPECT_TRUE(h.f->asked.empty()) << "a refusal is an answer: nothing to ask";
+  EXPECT_EQ(h.c->DaemonEpoch(), 2u);
 }
 
 TEST(SdkClient, ApplyPipelineWithoutAnAnswerIsUnknownAndNotResent) {

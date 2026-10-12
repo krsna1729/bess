@@ -76,6 +76,8 @@ session = [
     op('em/rules', rule_key, module_msg.ExactMatchRuleValue(action_id=1)),
 ]
 
-result = bess.apply_transaction(session)
+# Built against this daemon: a restarted one refuses it (D-106).
+epoch = bess.list_transaction_resources().daemon_epoch
+result = bess.apply_transaction(session, daemon_epoch=epoch)
 if result.record.outcome != result.record.OUTCOME_APPLIED:
     raise SystemExit('session transaction not applied: %s' % result.record)

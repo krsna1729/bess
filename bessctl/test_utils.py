@@ -173,10 +173,16 @@ class BessModuleTestCase(unittest.TestCase):
 
         self.bess.pause_all()
         self.bess.reset_all()
+        # The daemon every transaction of the test is built against (D-106).
+        self.daemon_epoch = self.bess.list_transaction_resources().daemon_epoch
 
         self.sockets = {}
         self.input_ports = {}
         self.output_ports = {}
+
+    def apply_transaction(self, ops, **kwargs):
+        """self.bess.apply_transaction under the test's daemon epoch."""
+        return self.bess.apply_transaction(ops, daemon_epoch=self.daemon_epoch, **kwargs)
 
     def tearDown(self):
         for sock in self.sockets.values():

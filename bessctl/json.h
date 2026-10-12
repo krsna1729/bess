@@ -19,8 +19,11 @@
 namespace bessctl::json {
 
 struct Value;
+struct Member;
 using Array = std::vector<Value>;
-using Object = std::vector<std::pair<std::string, Value>>;
+// A struct, not std::pair: a vector of pairs holding the incomplete Value
+// fails to instantiate inside Value's variant with clang and libstdc++.
+using Object = std::vector<Member>;
 
 // A number's literal text, already checked against the JSON grammar.
 struct Number {
@@ -38,6 +41,13 @@ struct Value {
   const Array *array() const { return std::get_if<Array>(&v); }
   Array *array() { return std::get_if<Array>(&v); }
   const std::string *string() const { return std::get_if<std::string>(&v); }
+};
+
+struct Member {
+  std::string key;
+  Value value;
+
+  bool operator==(const Member &) const = default;
 };
 
 // The member `key` of an object; nullptr if absent or not an object.

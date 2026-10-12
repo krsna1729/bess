@@ -24,7 +24,14 @@
 // applies it. ApplyPipeline retries a busy answer and never a conflict
 // (PipelineConflictError) or a refusal; with no request id, no answer is a
 // TransportError and nothing is resent: read Pipeline again, or apply with
-// WithPipelineGeneration so a second application conflicts.
+// WithExpectedVersion so a second application conflicts.
+//
+// Generations restart with the daemon, so a version is a generation and the
+// daemon epoch it belongs to (PipelineVersion). Every mutating request names
+// the epoch it was built under (D-106): a transaction its resources', an
+// apply its expected version's, else the last one the client saw. A
+// restarted daemon refuses it: DaemonRestartedError with Refused set,
+// nothing applied there.
 package bess
 
 import (
@@ -137,14 +144,23 @@ type PipelineConflictError struct {
 
 func (e *PipelineConflictError) Error() string { return "bess: pipeline conflict: " + e.Message }
 
-// DaemonRestartedError: the transaction met a daemon that lost the state it
-// was built against. The restarted daemon may have applied the request (a
-// restart the client had not seen yet): re-read its state before deciding
-// again; a retry under a new request id could apply it twice.
-type DaemonRestartedError struct{ From, To uint64 }
+// DaemonRestartedError: the daemon restarted under the request. Refused: the
+// daemon refused the request for naming epoch From (D-106), so nothing of it
+// was applied in the running daemon. Otherwise an answer came from epoch To
+// (to a status question after an unanswered send, or on an event stream): what
+// happened on the old daemon is lost. Either way, re-read the state before
+// deciding again.
+type DaemonRestartedError struct {
+	From, To uint64
+	Refused  bool
+}
 
 func (e *DaemonRestartedError) Error() string {
-	return fmt.Sprintf("bess: the daemon restarted (epoch %d -> %d)", e.From, e.To)
+	s := fmt.Sprintf("bess: the daemon restarted (epoch %d -> %d)", e.From, e.To)
+	if e.Refused {
+		s += ": refused, nothing applied"
+	}
+	return s
 }
 
 // StaleResourceError: a resource handle, or a transaction built with one,
@@ -521,80 +537,122 @@ func (c *Client) Resource(ctx context.Context, name string) (Resource, error) {
 
 // -- desired state ----------------------------------------------------------------
 
-// PipelineSnapshot is the active pipeline and its generation.
+// PipelineVersion is a pipeline generation and the daemon epoch it belongs
+// to: generations restart with the daemon (D-106).
+type PipelineVersion struct{ Generation, DaemonEpoch uint64 }
+
+// PipelineSnapshot is the active pipeline and its version.
 type PipelineSnapshot struct {
-	Pipeline   *pb.Pipeline
-	Generation uint64
+	Pipeline *pb.Pipeline
+	Version  PipelineVersion
 }
 
 // Pipeline is the active pipeline as desired state.
 func (c *Client) Pipeline(ctx context.Context) (PipelineSnapshot, error) {
-	r, err := c.pipelineCall(ctx, &pb.GetPipelineRequest{}, false)
+	r, err := c.pipelineCall(ctx, &pb.GetPipelineRequest{}, false, 0)
 	if err != nil {
 		return PipelineSnapshot{}, err
 	}
 	g := r.(*pb.GetPipelineResponse)
-	return PipelineSnapshot{g.GetPipeline(), g.GetGeneration()}, nil
+	c.observeEpoch(g.GetDaemonEpoch())
+	return PipelineSnapshot{g.GetPipeline(), PipelineVersion{g.GetGeneration(), g.GetDaemonEpoch()}}, nil
 }
 
 // ValidatePipeline is the daemon's canonical form of p (InvalidRequestError
 // if p is invalid).
 func (c *Client) ValidatePipeline(ctx context.Context, p *pb.Pipeline) (*pb.Pipeline, error) {
-	r, err := c.pipelineCall(ctx, &pb.ValidatePipelineRequest{Pipeline: p}, false)
+	r, err := c.pipelineCall(ctx, &pb.ValidatePipelineRequest{Pipeline: p}, false, 0)
 	if err != nil {
 		return nil, err
 	}
 	return r.(*pb.ValidatePipelineResponse).GetNormalized(), nil
 }
 
-// DiffPipeline is what applying p would change, and the generation it was
+// DiffPipeline is what applying p would change, and the version it was
 // taken against.
-func (c *Client) DiffPipeline(ctx context.Context, p *pb.Pipeline) (*pb.PipelineDiff, uint64, error) {
-	r, err := c.pipelineCall(ctx, &pb.DiffPipelineRequest{Pipeline: p}, false)
+func (c *Client) DiffPipeline(ctx context.Context, p *pb.Pipeline) (*pb.PipelineDiff, PipelineVersion, error) {
+	r, err := c.pipelineCall(ctx, &pb.DiffPipelineRequest{Pipeline: p}, false, 0)
 	if err != nil {
-		return nil, 0, err
+		return nil, PipelineVersion{}, err
 	}
 	d := r.(*pb.DiffPipelineResponse)
-	return d.GetDiff(), d.GetGeneration(), nil
+	c.observeEpoch(d.GetDaemonEpoch())
+	return d.GetDiff(), PipelineVersion{d.GetGeneration(), d.GetDaemonEpoch()}, nil
 }
 
-// PlanPipeline is the daemon's plan for p, and the generation it was made
+// PlanPipeline is the daemon's plan for p, and the version it was made
 // against.
-func (c *Client) PlanPipeline(ctx context.Context, p *pb.Pipeline) ([]*pb.PlanStep, uint64, error) {
-	r, err := c.pipelineCall(ctx, &pb.PlanPipelineRequest{Pipeline: p}, false)
+func (c *Client) PlanPipeline(ctx context.Context, p *pb.Pipeline) ([]*pb.PlanStep, PipelineVersion, error) {
+	r, err := c.pipelineCall(ctx, &pb.PlanPipelineRequest{Pipeline: p}, false, 0)
 	if err != nil {
-		return nil, 0, err
+		return nil, PipelineVersion{}, err
 	}
 	pl := r.(*pb.PlanPipelineResponse)
-	return pl.GetSteps(), pl.GetGeneration(), nil
+	c.observeEpoch(pl.GetDaemonEpoch())
+	return pl.GetSteps(), PipelineVersion{pl.GetGeneration(), pl.GetDaemonEpoch()}, nil
 }
 
 // PipelineOption sets an ApplyPipeline option.
 type PipelineOption func(*pb.ApplyPipelineRequest)
 
-// WithPipelineGeneration applies only if the active generation is g
-// (PipelineConflictError otherwise).
-func WithPipelineGeneration(g uint64) PipelineOption {
-	return func(r *pb.ApplyPipelineRequest) { r.ExpectedGeneration = &g }
+// WithExpectedVersion applies only if the active version is still v:
+// PipelineConflictError if the generation moved, DaemonRestartedError if the
+// epoch did.
+func WithExpectedVersion(v PipelineVersion) PipelineOption {
+	return func(r *pb.ApplyPipelineRequest) {
+		r.ExpectedGeneration = proto.Uint64(v.Generation)
+		r.DaemonEpoch = v.DaemonEpoch
+	}
 }
 
-// ApplyPipeline makes p the active pipeline, all or nothing.
+// ApplyPipeline makes p the active pipeline, all or nothing. Without
+// WithExpectedVersion it names the last epoch the client saw (asked for if
+// none); with it, the version's epoch, as given.
 func (c *Client) ApplyPipeline(ctx context.Context, p *pb.Pipeline, opts ...PipelineOption) (*pb.ApplyPipelineResponse, error) {
 	req := &pb.ApplyPipelineRequest{Pipeline: p}
 	for _, o := range opts {
 		o(req)
 	}
-	r, err := c.pipelineCall(ctx, req, true)
+	if req.ExpectedGeneration == nil {
+		epoch, err := c.knownEpoch(ctx)
+		if err != nil {
+			return nil, err
+		}
+		req.DaemonEpoch = epoch
+	}
+	r, err := c.pipelineCall(ctx, req, true, req.DaemonEpoch)
 	if err != nil {
 		return nil, err
 	}
-	return r.(*pb.ApplyPipelineResponse), nil
+	a := r.(*pb.ApplyPipelineResponse)
+	c.observeEpoch(a.GetDaemonEpoch())
+	return a, nil
+}
+
+// knownEpoch is the epoch the client has seen, asked for if it has seen none.
+func (c *Client) knownEpoch(ctx context.Context) (uint64, error) {
+	if epoch, known := c.DaemonEpoch(); known {
+		return epoch, nil
+	}
+	if _, err := c.Resources(ctx, true); err != nil { // any answer names the epoch
+		return 0, err
+	}
+	epoch, _ := c.DaemonEpoch()
+	return epoch, nil
+}
+
+// refusedEpoch: the daemon refused a request built under epoch sent (D-106).
+func (c *Client) refusedEpoch(sent uint64, detail *pb.ErrorDetail) error {
+	c.observeEpoch(detail.GetDaemonEpoch())
+	return &DaemonRestartedError{From: sent, To: detail.GetDaemonEpoch(), Refused: true}
 }
 
 // pipelineCall runs a desired-state RPC. An answered refusal carries an
-// ErrorDetail: CONFLICT is PipelineConflictError, RESOURCE_BUSY is retried
-// (retryBusy) within the policy; no answer is TransportError.
-func (c *Client) pipelineCall(ctx context.Context, in proto.Message, retryBusy bool) (proto.Message, error) {
+// ErrorDetail: CONFLICT is PipelineConflictError, EPOCH_MISMATCH a
+// DaemonRestartedError from sentEpoch (the epoch a mutating request named),
+// RESOURCE_BUSY is retried (retryBusy) within the policy; no answer is
+// TransportError.
+func (c *Client) pipelineCall(ctx context.Context, in proto.Message, retryBusy bool, sentEpoch uint64) (proto.Message, error) {
 	backoff := c.retry.BusyBackoff
 	for attempt := 1; ; attempt++ {
 		actx, cancel := context.WithTimeout(ctx, c.retry.AttemptTimeout)
@@ -608,6 +666,8 @@ func (c *Client) pipelineCall(ctx context.Context, in proto.Message, retryBusy b
 			return nil, &TransportError{Code: status.Code(err)}
 		}
 		switch detail.GetCode() {
+		case pb.ErrorDetail_EPOCH_MISMATCH:
+			return nil, c.refusedEpoch(sentEpoch, detail)
 		case pb.ErrorDetail_CONFLICT:
 			return nil, &PipelineConflictError{Message: detail.GetMessage(), Detail: detail}
 		case pb.ErrorDetail_RESOURCE_BUSY:
@@ -870,6 +930,7 @@ func (t *Transaction) Commit(ctx context.Context) (*Applied, error) {
 		RequestId:   t.RequestID,
 		Ops:         t.ops,
 		Consistency: pb.ApplyTransactionRequest_CONSISTENCY_REFERENTIAL,
+		DaemonEpoch: t.epoch, // its resources' epoch: a restarted daemon refuses it (D-106)
 	}
 	if t.snapshot {
 		req.Consistency = pb.ApplyTransactionRequest_CONSISTENCY_SCOPE_SNAPSHOT
@@ -911,6 +972,9 @@ func (c *Client) commit(ctx context.Context, req *pb.ApplyTransactionRequest, ep
 			cancel()
 			if err != nil {
 				if !noAnswer(err, md) {
+					if d := errorDetail(md); d.GetCode() == pb.ErrorDetail_EPOCH_MISMATCH {
+						return nil, c.refusedEpoch(epoch, d)
+					}
 					return nil, translate(err, md)
 				}
 				transportFailure, lastUnanswered = status.Code(err), status.Code(err)

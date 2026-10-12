@@ -8728,6 +8728,11 @@ consumer-driven (D-008, §31.3 item 2).
   Meter participate in dependency-ordered transactions. `ApplyTransaction`,
   `GetTransaction` and `ListTransactionResources` provide the unary typed RPC,
   idempotency and resource discovery.
+  Every mutating request (`ApplyTransaction`, `ApplyPipeline`) names the
+  daemon epoch it was built under, and every generation the API returns comes
+  with its epoch: a restarted daemon refuses an older request before any side
+  effect (`EPOCH_MISMATCH`, D-106), so a generation is never compared across
+  restarts.
 - **D-032 session vertical slice: DONE at basic scope.** One transaction
   creates the ExactMatch action rule, action, K5 meter, next hop and route.
   `session_pipeline_test.cc` drives each stage and rejection/removal path in

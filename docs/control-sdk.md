@@ -66,25 +66,29 @@ from `client.pipeline()`'s snapshot, and the daemon validates, diffs, plans and
 applies it. The SDK repeats none of the planner's logic.
 
 ```python
-snap = client.pipeline()                       # PipelineSnapshot: pipeline, generation
+snap = client.pipeline()                       # PipelineSnapshot: pipeline, version
 p = (sdk.PipelineBuilder(snap.pipeline)
      .module('em', 'ExactMatch', module_msg.ExactMatchArg(...))
      .chain('rnd', 'em')
      .build())
-steps, generation = client.plan_pipeline(p)    # what the daemon would do
-client.apply_pipeline(p, expected_generation=snap.generation)
+steps, version = client.plan_pipeline(p)       # what the daemon would do
+client.apply_pipeline(p, expected=snap.version)
 ```
 
 Go: `bess.NewPipeline(snap.Pipeline).Module(...).Chain(...).Build()`,
 `client.Pipeline`, `ValidatePipeline`, `DiffPipeline`, `PlanPipeline`,
-`ApplyPipeline(ctx, p, bess.WithPipelineGeneration(g))`, with
-`*PipelineConflictError`.
+`ApplyPipeline(ctx, p, bess.WithExpectedVersion(snap.Version))`, with
+`*PipelineConflictError`. C++: `client->ApplyPipeline(p, snap->version)`.
+
+A version is a generation and the daemon epoch it belongs to
+(`PipelineVersion`): generations start again when the daemon restarts, so a
+generation alone means nothing across a restart (D-106).
 
 `apply_pipeline` retries a busy answer within the retry policy and never a
 conflict (`PipelineConflict`, a `Conflict`) or a refusal. It carries no request
 id, so after no answer the outcome is unknown (`TransportError`): read
-`client.pipeline()` before applying again, or apply with `expected_generation`
-so a second application is a conflict. An answer is told from a loss by the
+`client.pipeline()` before applying again, or apply with `expected` so a
+second application is a conflict. An answer is told from a loss by the
 server's `ErrorDetail` (a resource failure is UNAVAILABLE with a detail: an
 answer).
 
@@ -117,7 +121,7 @@ bessctl schema ExactMatch         # init type, gates, commands and their types
 bessctl validate pipeline.json    # the daemon's canonical form
 bessctl diff pipeline.json        # what would change
 bessctl plan pipeline.json        # the steps, by phase
-bessctl apply pipeline.json [--generation N]
+bessctl apply pipeline.json [--generation G@E]
 bessctl get > pipeline.json       # the active pipeline as a manifest
 bessctl status | resources | metrics | events [--from SEQ] [TYPE...]
 ```
@@ -137,8 +141,10 @@ A manifest may also hold entries for the resources its modules create (see
 `apply` commits them in one transaction after the pipeline, since the
 resources exist only then: if they fail, the pipeline stays applied and the
 error names the entry. Both steps are idempotent, so after a fix the same
-`apply` is the retry; with `--generation`, give the generation the failed
+`apply` is the retry; with `--generation`, give the version the failed
 `apply` printed (the error says which), since its pipeline step moved it.
+Versions are printed and read as `generation@epoch`: a generation alone
+would match a restarted daemon that reached the same number (D-106).
 Entries are added or replaced, never removed, and `get` does not print them.
 `validate`, `diff` and `plan` check only the pipeline.
 
@@ -152,9 +158,11 @@ step.
 |---|---|
 | One logical transaction | One `request_id` for its whole life, kept across every retry. |
 | Before the first send | Learns the daemon epoch (resource discovery) if this client has not. |
+| Every send | Names the epoch it was built under (D-106): a transaction its resources', a pipeline apply its expected version's, else the last one the client saw. |
+| The daemon refuses the epoch (`EPOCH_MISMATCH`) | `DaemonRestarted` with `refused` set (C++ `kDaemonRestarted` with the detail; Go `Refused`): the daemon restarted since the request was built and applied nothing of it. An answer: not retried, nothing asked; the client now knows the new epoch. |
 | No answer (deadline, unavailable; `INTERNAL`/`UNKNOWN` without BESS's error detail) | Asks `GetTransaction(request_id)`, again if the question goes unanswered too. Known: that outcome (`replayed`). Answered "not known" under the epoch the commit started with: sends the identical request again (the daemon replays or applies it once). Never sends again on a guess. |
 | No answer through every attempt | `TransportError`: the outcome is unknown, not failed; ask `get_transaction(request_id)` later. |
-| Any answer from another daemon epoch | `DaemonRestarted`: the transaction met a daemon that lost the state it was built against; never reported as applied or as not applied (the new daemon may have applied it: re-read its state). |
+| An answer to a question from another daemon epoch | `DaemonRestarted` (not `refused`): a send went unanswered and the old daemon's outcome is lost with it; never reported as applied or as not applied. The running daemon has not applied it (it refuses the old epoch): re-read its state before deciding. |
 | `OUTCOME_BUSY` | Retries with doubling backoff, then `Busy`. |
 | `OUTCOME_CONFLICT` | `Conflict` (nothing tried); the application decides what a moved generation means. `after_unknown_attempt`: an earlier send of the same commit went unanswered and may have applied. |
 | `OUTCOME_REJECTED` | `Rejected`, with each failing operation's index and error; nothing changed. |
@@ -179,12 +187,12 @@ Consistency: `client.transaction(snapshot=True)` asks for
 Resource handles and restarts: the client knows of a restart only once the
 daemon answers from the new epoch (any call: discovery, a commit, a status
 question); that answer drops the resource cache and makes every older handle
-stale. A restart the client has not seen yet passes these checks: the request
-is sent, and the restarted daemon may apply it (it decodes keys and values by
-type, so a resource whose schema changed under the same name refuses it). The
-answer's new epoch then raises `DaemonRestarted`, which means "the outcome on
-the new daemon is not reported": re-read its state before deciding, as a retry
-under a new request id could apply the transaction twice.
+stale. A restart the client has not seen yet passes these checks, but not the
+daemon's: the request names the old epoch, and the restarted daemon refuses it
+before any effect (D-106). An answer from another epoch to a question
+(`GetTransaction` after an unanswered send) still raises `DaemonRestarted`
+without `refused`, meaning "the outcome on the old daemon is lost": re-read the
+state before deciding.
 
 ## Tests
 
@@ -262,7 +270,7 @@ if it succeeds.
 | `event` | `watch`, `of`, `want_fields` | within 5 s the stream delivers commit `of`'s event (its `request_id` field), with that commit's generation and these fields |
 | `commit` | `ops`, `request_id_of`, `expected_generation_of`, `generation_delta`, `snapshot`, `as` | one transaction on `$resource` (below) |
 | `transaction_status` | `of` or `request_id`, `want_known`, `want_outcome` | `GetTransaction` of commit `of`'s request id, or `request_id` |
-| `pipeline` | `base`, `add`, `chain`, `remove`, `plan`, `want_plan_generation_of`, `want_changes`, `at_generation_of`, `as` | below |
+| `pipeline` | `base`, `add`, `chain`, `remove`, `plan`, `want_plan_version_of`, `want_changes`, `at_version_of`, `as` | below |
 
 **commit.** Each op is `{"op": "upsert", "key": {...}, "value": {...}}` or
 `{"op": "erase", "key": {...}}` in the resource's key and value types;
@@ -277,21 +285,19 @@ an expected generation of commit `expected_generation_of`'s plus
 labels the commit's request id and generation.
 
 **pipeline.** Without `add`, `chain` or `remove`, reads the active pipeline and
-its generation into `as`. Otherwise builds on `base`'s pipeline (a label of an
-earlier pipeline step; the active one if absent): `add` modules (`[name,
-class]`, no argument), `chain` them gate 0 to gate 0, `remove` modules. Then
-`plan` (at least one step; with `want_plan_generation_of`, made against that
-label's generation), `want_changes` (the diff against the active pipeline has
-that many changes), and the apply, at `at_generation_of`'s generation if given.
-`as` labels the built pipeline and the generation the apply reached.
+its version (generation and daemon epoch) into `as`. Otherwise builds on
+`base`'s pipeline (a label of an earlier pipeline step; the active one if
+absent): `add` modules (`[name, class]`, no argument), `chain` them gate 0 to
+gate 0, `remove` modules. Then `plan` (at least one step; with
+`want_plan_version_of`, made against that label's version), `want_changes`
+(the diff against the active pipeline has that many changes), and the apply,
+expecting `at_version_of`'s version if given. `as` labels the built pipeline
+and the version the apply reached.
 
 ## Not yet
 
 - Resource capability and binding information in discovery.
 - A machine-readable error taxonomy beyond `ErrorDetail`'s codes: schema
   mismatch, unknown resource, unsupported capability, unknown after restart.
-- A request field naming the epoch the transaction was built for, so the
-  daemon itself refuses one sent across a restart the client has not seen
-  (today the client reports it as `DaemonRestarted` after the fact).
 - Streaming transactions (the protocol has no stream yet); they will follow
   this contract.

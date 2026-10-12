@@ -70,8 +70,10 @@ class BessctlCppTest(BessModuleTestCase):
             self.assertIn('ctl_em', plan)
 
             applied = self.bessctl('apply', path).stdout
-            self.assertIn('generation', applied)
-            generation = int(applied.split()[1].rstrip(':'))
+            self.assertTrue(applied.startswith('version '), applied)
+            version = applied.split()[1].rstrip(':')  # generation@epoch
+            generation, epoch = (int(x) for x in version.split('@'))
+            self.assertEqual(epoch, self.bess.list_transaction_resources().daemon_epoch)
             self.assertIn('resources: 2 entries in 1 resource(s)', applied)
             rules = self.bess.run_module_command('ctl_em', 'get_runtime_config', 'EmptyArg',
                                                  {}).rules
@@ -120,8 +122,16 @@ class BessctlCppTest(BessModuleTestCase):
             with open(path, 'w') as f:
                 json.dump(reduced, f)
             self.bessctl('apply', path)
-            stale = self.bessctl('apply', again, '--generation', str(generation), ok=False)
+            stale = self.bessctl('apply', again, '--generation', version, ok=False)
             self.assertEqual(stale.returncode, 1)
+            self.assertIn('conflict', stale.stderr)
+            self.assertNotIn('ctl_em', [m.name for m in self.bess.list_modules().modules])
+            # The same generation of another daemon epoch: refused for the
+            # epoch, before the generation is compared (D-106).
+            other = '%d@%d' % (generation, epoch + 1)
+            stale = self.bessctl('apply', again, '--generation', other, ok=False)
+            self.assertEqual(stale.returncode, 1)
+            self.assertIn('restarted', stale.stderr)
             self.assertNotIn('ctl_em', [m.name for m in self.bess.list_modules().modules])
 
         schema = self.bessctl('schema', 'ExactMatch').stdout
@@ -131,7 +141,8 @@ class BessctlCppTest(BessModuleTestCase):
         self.bessctl('metrics')
         self.assertEqual(self.bessctl('nonsense', ok=False).returncode, 2)
         self.assertEqual(self.bessctl('events', '--from', 'x', ok=False).returncode, 2)
-        self.assertEqual(self.bessctl('apply', 'f', '--generation', '-1', ok=False).returncode, 2)
+        for bad in ('-1', '5', '5@0', '5@x'):  # a generation alone is ambiguous
+            self.assertEqual(self.bessctl('apply', 'f', '--generation', bad, ok=False).returncode, 2)
 
         # `events --from 1` replays what the daemon holds (the transactions
         # above) at once, then follows; Ctrl-C ends it cleanly.

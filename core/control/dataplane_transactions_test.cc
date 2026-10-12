@@ -142,8 +142,18 @@ class DataplaneTransactionsTest : public ::testing::Test {
     (void)control_plane_->Reset();
   }
 
-  v2::ApplyTransactionResponse Apply(const v2::ApplyTransactionRequest &req,
+  // Every request here is built against the daemon under test: it names that
+  // daemon's epoch (D-106; the refusal of others is api_v2_test's).
+  uint64_t Epoch() {
+    grpc::ClientContext context;
+    v2::ListTransactionResourcesResponse list;
+    EXPECT_TRUE(stub_->ListTransactionResources(&context, {}, &list).ok());
+    return list.daemon_epoch();
+  }
+
+  v2::ApplyTransactionResponse Apply(v2::ApplyTransactionRequest req,
                                      grpc::Status *status = nullptr) {
+    req.set_daemon_epoch(Epoch());
     grpc::ClientContext context;
     v2::ApplyTransactionResponse response;
     grpc::Status s = stub_->ApplyTransaction(&context, req, &response);
@@ -475,9 +485,16 @@ class ConsistencyRpcTest : public ::testing::Test {
     return req;
   }
 
-  grpc::Status Apply(const v2::ApplyTransactionRequest &req,
+  // Built against the daemon under test: it names that daemon's epoch (D-106).
+  grpc::Status Apply(v2::ApplyTransactionRequest req,
                      v2::ApplyTransactionResponse *response,
                      v2::ErrorDetail *detail = nullptr) {
+    {
+      grpc::ClientContext context;
+      v2::ListTransactionResourcesResponse list;
+      EXPECT_TRUE(stub_->ListTransactionResources(&context, {}, &list).ok());
+      req.set_daemon_epoch(list.daemon_epoch());
+    }
     grpc::ClientContext context;
     const grpc::Status status =
         stub_->ApplyTransaction(&context, req, response);

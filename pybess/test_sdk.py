@@ -64,7 +64,9 @@ class Stub:
         step = self.apply_script.pop(0)
         if isinstance(step, Exception):
             raise step
-        outcome, epoch = step
+        outcome, epoch = step  # `epoch` is the daemon's
+        if request.daemon_epoch != epoch:
+            raise epoch_refusal(request.daemon_epoch, epoch)
         return v2.ApplyTransactionResponse(record=record(outcome, request.request_id),
                                            daemon_epoch=epoch)
 
@@ -85,26 +87,48 @@ BUSY = v2.TransactionRecord.OUTCOME_BUSY
 TIMEOUT = FakeRpcError(grpc.StatusCode.DEADLINE_EXCEEDED)
 
 
+def epoch_refusal(sent, daemon_epoch):
+    """What bessd answers a mutating request built under another epoch, or
+    naming none (D-106)."""
+    if sent == 0:
+        return FakeRpcError(grpc.StatusCode.INVALID_ARGUMENT, 'no epoch',
+                            v2.ErrorDetail(code=v2.ErrorDetail.INVALID_ARGUMENT,
+                                           field='daemon_epoch'))
+    return FakeRpcError(grpc.StatusCode.FAILED_PRECONDITION, 'built under another epoch',
+                        v2.ErrorDetail(code=v2.ErrorDetail.EPOCH_MISMATCH, field='daemon_epoch',
+                                       daemon_epoch=daemon_epoch))
+
+
 class PipelineStub:
     """ApplyPipeline answers from a script; GetPipeline the last applied."""
 
-    def __init__(self, apply=()):
+    def __init__(self, apply=(), epoch=1):
         self.script = list(apply)
         self.sent = []
         self.active = v2.Pipeline()
         self.generation = 3
+        self.epoch = epoch
+        self.listed = 0
+
+    def ListTransactionResources(self, request, timeout=None):
+        self.listed += 1
+        return v2.ListTransactionResourcesResponse(daemon_epoch=self.epoch)
 
     def GetPipeline(self, request, timeout=None):
-        return v2.GetPipelineResponse(pipeline=self.active, generation=self.generation)
+        return v2.GetPipelineResponse(pipeline=self.active, generation=self.generation,
+                                      daemon_epoch=self.epoch)
 
     def ApplyPipeline(self, request, timeout=None):
         self.sent.append(request)
+        if request.daemon_epoch != self.epoch:
+            raise epoch_refusal(request.daemon_epoch, self.epoch)
         step = self.script.pop(0) if self.script else None
         if isinstance(step, Exception):
             raise step
         self.active.CopyFrom(request.pipeline)
         self.generation += 1
-        return v2.ApplyPipelineResponse(generation=self.generation, applied_ops=1)
+        return v2.ApplyPipelineResponse(generation=self.generation, applied_ops=1,
+                                        daemon_epoch=self.epoch)
 
 
 def refused(code, detail_code, message='refused'):
@@ -136,17 +160,39 @@ class PipelineTest(unittest.TestCase):
         client = sdk.Client(stub=stub, sleep=slept.append)
         snap = client.pipeline()
         done = client.apply_pipeline(sdk.PipelineBuilder(snap.pipeline).module('m', 'Sink').build(),
-                                     expected_generation=snap.generation)
+                                     expected=snap.version)
         self.assertEqual(done.generation, 4)
         self.assertEqual(len(stub.sent), 3)
         self.assertEqual(slept, [0.01, 0.02])
         self.assertEqual(stub.sent[0].expected_generation, 3)
+        self.assertEqual(stub.sent[0].daemon_epoch, 1)
         conflict = refused(grpc.StatusCode.ABORTED, v2.ErrorDetail.CONFLICT, 'generation is 9')
         stub = PipelineStub(apply=[conflict])
         with self.assertRaises(sdk.PipelineConflict) as raised:
-            sdk.Client(stub=stub).apply_pipeline(v2.Pipeline(), expected_generation=1)
+            sdk.Client(stub=stub).apply_pipeline(v2.Pipeline(),
+                                                 expected=sdk.PipelineVersion(1, 1))
         self.assertIsInstance(raised.exception, sdk.Conflict)
         self.assertEqual(len(stub.sent), 1)
+
+    def test_an_apply_names_its_epoch_and_a_restart_refuses_it(self):
+        stub = PipelineStub()
+        client = sdk.Client(stub=stub)
+        client.apply_pipeline(v2.Pipeline())
+        self.assertEqual(stub.listed, 1, 'the epoch was not learned before the apply')
+        self.assertEqual(stub.sent[0].daemon_epoch, 1)
+        self.assertFalse(stub.sent[0].HasField('expected_generation'))
+        snap = client.pipeline()
+        stub.epoch = 2  # restarted after the snapshot
+        with self.assertRaises(sdk.DaemonRestarted) as raised:
+            client.apply_pipeline(snap.pipeline, expected=snap.version)
+        self.assertTrue(raised.exception.refused)
+        self.assertEqual(len(stub.sent), 2, 'a refusal was retried')
+        self.assertEqual(client.daemon_epoch, 2)
+        # An expected version is sent as given: one without its epoch is the
+        # daemon's to refuse, never completed with the current epoch.
+        with self.assertRaises(sdk.InvalidRequest):
+            client.apply_pipeline(snap.pipeline, expected=sdk.PipelineVersion(3, 0))
+        self.assertEqual(stub.sent[-1].daemon_epoch, 0)
 
     def test_busy_through_every_attempt_is_busy(self):
         busy = refused(grpc.StatusCode.FAILED_PRECONDITION, v2.ErrorDetail.RESOURCE_BUSY)
@@ -338,8 +384,13 @@ class SdkTest(unittest.TestCase):
         stub = Stub(epoch=1, apply=[(APPLIED, 2)])
         client = self.client(stub)
         old = client.resource(RESOURCE)
-        with self.assertRaises(sdk.DaemonRestarted):
+        with self.assertRaises(sdk.DaemonRestarted) as raised:
             client.transaction().upsert(old, KEY(), VALUE()).commit()
+        # It named its resources' epoch; the daemon refused it (D-106): an
+        # answer, so nothing to ask and nothing applied.
+        self.assertTrue(raised.exception.refused)
+        self.assertEqual(stub.applied[0].daemon_epoch, 1)
+        self.assertEqual(stub.got, [])
         with self.assertRaises(sdk.StaleResource):
             client.transaction().upsert(old, KEY(), VALUE())
         self.assertEqual(len(stub.applied), 1)

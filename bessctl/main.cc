@@ -7,7 +7,7 @@
 #include <pthread.h>
 
 #include <atomic>
-#include <cerrno>
+#include <charconv>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +20,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -40,8 +41,9 @@ constexpr std::string_view kUsage = R"(usage: bessctl [-s HOST:PORT] COMMAND [AR
   validate FILE                  check FILE; print it in canonical form
   diff FILE                      what applying FILE would change
   plan FILE                      the steps applying FILE would run
-  apply FILE [--generation N]    make FILE the active pipeline (with N: only
-                                 if the active generation is still N)
+  apply FILE [--generation G@E]  make FILE the active pipeline (with G@E: only
+                                 if the active version is still generation G
+                                 of daemon epoch E, as diff/plan/apply print)
   resources                      transactional resources (key -> value types)
   metrics                        metric samples
   events [--from SEQ] [TYPE...]  follow operational events until interrupted
@@ -60,6 +62,12 @@ int Fail(std::string_view what) {
   std::fflush(stdout);  // what was printed before the failure, first
   std::println(stderr, "bessctl: {}", what);
   return 1;
+}
+
+// A pipeline version as `apply --generation` reads it back: generation@epoch.
+// Generations restart with the daemon, so one alone is ambiguous (D-106).
+std::string Version(const bess::sdk::PipelineVersion &v) {
+  return std::format("{}@{}", v.generation, v.daemon_epoch);
 }
 
 std::string Describe(const Error &e) {
@@ -203,7 +211,7 @@ class Cli {
       std::println("{:<14} {:<14} {}", pb::ChangeKind_Name(c.kind()),
                    pb::ObjectType_Name(c.type()), c.object());
     }
-    std::println("# against generation {}: {} change(s)", diff->generation,
+    std::println("# against version {}: {} change(s)", Version(diff->version),
                  diff->diff.changes_size());
     NoteResources(*m);
     return 0;
@@ -223,7 +231,8 @@ class Cli {
       std::println("{:<8} {:<20} {:<14} {}", pb::PlanPhase_Name(s.phase()), s.operation(),
                    pb::ObjectType_Name(s.type()), s.object());
     }
-    std::println("# against generation {}: {} step(s)", plan->generation, plan->steps.size());
+    std::println("# against version {}: {} step(s)", Version(plan->version),
+                 plan->steps.size());
     NoteResources(*m);
     return 0;
   }
@@ -231,20 +240,21 @@ class Cli {
   // The pipeline, then the manifest's resource entries in one transaction:
   // its resources exist only once the pipeline does. Both steps are
   // idempotent, so after a failed second step the same apply is the retry
-  // (with --generation, at the generation the first step reached).
-  int Apply(const std::string &path, std::optional<uint64_t> generation) {
+  // (with --generation, at the version the first step reached).
+  int Apply(const std::string &path, std::optional<bess::sdk::PipelineVersion> expected) {
     auto schema = LoadSchema();
     auto m = schema ? ReadManifest(**schema, path) : std::nullopt;
     if (!m) {
       return 1;
     }
-    auto r = client_->ApplyPipeline(m->pipeline, generation);
+    auto r = client_->ApplyPipeline(m->pipeline, expected);
     if (!r) {
       return Fail(r.error());
     }
-    std::println("generation {}: {} operation(s){}; validate {} us, prepare {} us, commit {} us, "
+    const bess::sdk::PipelineVersion reached{r->generation(), r->daemon_epoch()};
+    std::println("version {}: {} operation(s){}; validate {} us, prepare {} us, commit {} us, "
                  "retire {} us",
-                 r->generation(), r->applied_ops(), r->workers_paused() ? ", workers paused" : "",
+                 Version(reached), r->applied_ops(), r->workers_paused() ? ", workers paused" : "",
                  r->validation_us(), r->prepare_us(), r->paused_commit_us(), r->retire_us());
     if (m->resources.empty()) {
       return 0;
@@ -254,7 +264,7 @@ class Cli {
       return Fail(std::format(
           "the pipeline is applied, its resource entries are not: {} (fix and apply again{})",
           committed.error(),
-          generation ? std::format(" with --generation {}", r->generation()) : ""));
+          expected ? std::format(" with --generation {}", Version(reached)) : ""));
     }
     std::println("resources: {} entr{} in {} resource(s); transaction {}, resource generation {}",
                  m->entries(), m->entries() == 1 ? "y" : "ies", m->resources.size(),
@@ -423,16 +433,28 @@ void HandleSignalsOnAThread() {
   }).detach();
 }
 
-std::optional<uint64_t> ParseU64(const std::string &s) {
-  if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos) {
+std::optional<uint64_t> ParseU64(std::string_view s) {
+  uint64_t v = 0;
+  const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+  if (s.empty() || ec != std::errc() || end != s.data() + s.size()) {
     return std::nullopt;
   }
-  errno = 0;
-  const unsigned long long v = std::strtoull(s.c_str(), nullptr, 10);
-  if (errno == ERANGE) {
+  return v;
+}
+
+// "G@E", as Version prints it: a generation means nothing without its epoch
+// (D-106).
+std::optional<bess::sdk::PipelineVersion> ParseVersion(std::string_view s) {
+  const size_t at = s.find('@');
+  if (at == std::string_view::npos) {
     return std::nullopt;
   }
-  return static_cast<uint64_t>(v);
+  auto generation = ParseU64(s.substr(0, at));
+  auto epoch = ParseU64(s.substr(at + 1));
+  if (!generation || !epoch || *epoch == 0) {
+    return std::nullopt;
+  }
+  return bess::sdk::PipelineVersion{*generation, *epoch};
 }
 
 }  // namespace
@@ -474,14 +496,15 @@ int main(int argc, char **argv) {
     return one_file([&](const std::string &f) { return cli.Plan(f); });
   }
   if (command == "apply" && (rest.size() == 1 || (rest.size() == 3 && rest[1] == "--generation"))) {
-    std::optional<uint64_t> generation;
+    std::optional<bess::sdk::PipelineVersion> expected;
     if (rest.size() == 3) {
-      generation = ParseU64(rest[2]);
-      if (!generation) {
+      expected = ParseVersion(rest[2]);
+      if (!expected) {
+        std::println(stderr, "--generation takes GENERATION@EPOCH, as diff, plan and apply print it");
         return Usage();
       }
     }
-    return cli.Apply(rest[0], generation);
+    return cli.Apply(rest[0], expected);
   }
   if (command == "resources" && rest.empty()) {
     return cli.Resources();
