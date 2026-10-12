@@ -692,12 +692,9 @@ class PipelineBuilder:
         return self
 
     def traffic_class(self, name, policy, parent='', resource='', wid=-1, priority=None,
-                      share=None, limit=None, max_burst=None, leaf_module_name='',
-                      leaf_module_taskid=0):
+                      share=None, limit=None, max_burst=None):
         tc = self._p.traffic_classes.add(name=name, policy=policy, parent=parent,
-                                         resource=resource, wid=wid,
-                                         leaf_module_name=leaf_module_name,
-                                         leaf_module_taskid=leaf_module_taskid)
+                                         resource=resource, wid=wid)
         if priority is not None:
             tc.priority = priority
         if share is not None:
@@ -706,14 +703,28 @@ class PipelineBuilder:
         tc.max_burst.update(max_burst or {})
         return self
 
+    def task(self, module, task=0, parent='', wid=None, priority=None, share=None):
+        """Places a module's task: under the traffic class `parent`, or at the
+        root of worker `wid`."""
+        t = self._p.tasks.add(module=module, task=task, parent=parent)
+        if wid is not None:
+            t.wid = wid
+        if priority is not None:
+            t.priority = priority
+        if share is not None:
+            t.share = share
+        return self
+
     def remove(self, name):
         """Drops the port, module or traffic class `name`, and the
-        connections that touch it."""
+        connections and task placements that name it."""
         for field in (self._p.ports, self._p.modules, self._p.traffic_classes):
             for item in [x for x in field if x.name == name]:
                 field.remove(item)
         for c in [c for c in self._p.connections if name in (c.upstream, c.downstream)]:
             self._p.connections.remove(c)
+        for t in [t for t in self._p.tasks if name in (t.module, t.parent)]:
+            self._p.tasks.remove(t)
         return self
 
     def build(self):

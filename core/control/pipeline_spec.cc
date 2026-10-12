@@ -2,6 +2,8 @@
 
 #include "control/pipeline_spec.h"
 
+#include <tuple>
+
 namespace bess {
 namespace control {
 
@@ -24,6 +26,19 @@ bool PortSpec::operator==(const PortSpec &other) const {
 bool ModuleSpec::operator==(const ModuleSpec &other) const {
   return name == other.name && mclass == other.mclass &&
          SameAny(arg, other.arg);
+}
+
+TrafficClassSpec TaskPlacementSpec::AsLeafSpec() const {
+  TrafficClassSpec leaf;
+  leaf.leaf_module_name = module;
+  leaf.leaf_module_taskid = task;
+  leaf.parent = parent;
+  leaf.wid = wid;
+  leaf.has_priority = has_priority;
+  leaf.priority = priority;
+  leaf.has_share = has_share;
+  leaf.share = share;
+  return leaf;
 }
 
 void Normalize(PipelineSpec *spec) {
@@ -60,6 +75,11 @@ void Normalize(PipelineSpec *spec) {
   std::sort(spec->traffic_classes.begin(), spec->traffic_classes.end(),
             [](const TrafficClassSpec &a, const TrafficClassSpec &b) {
               return a.name < b.name;
+            });
+
+  std::sort(spec->tasks.begin(), spec->tasks.end(),
+            [](const TaskPlacementSpec &a, const TaskPlacementSpec &b) {
+              return std::tie(a.module, a.task) < std::tie(b.module, b.task);
             });
 }
 

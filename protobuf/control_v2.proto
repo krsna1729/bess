@@ -57,15 +57,31 @@ message Worker {
 message TrafficClass {
   string name = 1;
   string parent = 2;
-  string policy = 3;    // "priority", "weighted_fair", "round_robin", "rate_limit", "leaf"
+  string policy = 3;    // "priority", "weighted_fair", "round_robin", "rate_limit"
   string resource = 4;  // "count", "cycle", "packet", "bit"
   int32 wid = 5;        // -1: any
   optional int64 priority = 6;
   optional int64 share = 7;
   map<string, int64> limit = 8;
   map<string, int64> max_burst = 9;
-  string leaf_module_name = 10;
-  uint64 leaf_module_taskid = 11;
+  // A module's own (leaf) class is not a traffic class of desired state: its
+  // placement is a TaskPlacement.
+  reserved 10, 11;
+  reserved "leaf_module_name", "leaf_module_taskid";
+}
+
+// Where a module's task is scheduled: under a traffic class, or at the root
+// of a worker (the legacy attach_task). Exactly one of parent and wid. A task
+// no entry names stays where it is; a new one goes to any worker, as the
+// legacy API puts it. GetPipeline lists every task that is placed (attached,
+// or waiting for a resume to attach to a given worker).
+message TaskPlacement {
+  string module = 1;
+  uint32 task = 2;       // the module's task index; 0 for a single-task module
+  string parent = 3;     // a traffic class of this pipeline
+  optional int32 wid = 4;
+  optional int64 priority = 5;  // required under a priority parent
+  optional int64 share = 6;     // required under a weighted_fair parent
 }
 
 message Pipeline {
@@ -74,6 +90,7 @@ message Pipeline {
   repeated Connection connections = 3;
   repeated Worker workers = 4;
   repeated TrafficClass traffic_classes = 5;
+  repeated TaskPlacement tasks = 6;
 }
 
 // -- diff and plan --------------------------------------------------------------
@@ -85,6 +102,7 @@ enum ObjectType {
   CONNECTION = 3;
   WORKER = 4;
   TRAFFIC_CLASS = 5;
+  TASK = 6;  // a module task's placement; object "module:task"
 }
 
 enum ChangeKind {

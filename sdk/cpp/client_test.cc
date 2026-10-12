@@ -659,7 +659,15 @@ TEST(SdkClient, AStopEndsAWatchBlockedOnAnIdleStream) {
 TEST(SdkClient, ThePipelineBuilderAssemblesAndEditsASnapshot) {
   pb::GetTransactionRequest arg;
   arg.set_request_id("x");
+  pb::TaskPlacement on_worker;
+  on_worker.set_module("a");
+  on_worker.set_wid(0);
+  pb::TaskPlacement of_b;
+  of_b.set_module("b");
+  of_b.set_parent("rl");
   auto p = PipelineBuilder()
+               .Task(on_worker)
+               .Task(of_b)
                .Worker(0, 2, "")
                .Module("a", "Source", nullptr)
                .Module("b", "Bypass", &arg)
@@ -679,6 +687,8 @@ TEST(SdkClient, ThePipelineBuilderAssemblesAndEditsASnapshot) {
   ASSERT_TRUE(edited);
   EXPECT_EQ(edited->modules_size(), 2);
   EXPECT_EQ(edited->connections_size(), 0);
+  ASSERT_EQ(edited->tasks_size(), 1) << "the removed module's placement stayed";
+  EXPECT_EQ(edited->tasks(0).module(), "a");
   EXPECT_EQ(p->modules_size(), 3);
 }
 

@@ -890,6 +890,11 @@ PipelineBuilder &PipelineBuilder::TrafficClass(pb::TrafficClass tc) {
   return *this;
 }
 
+PipelineBuilder &PipelineBuilder::Task(pb::TaskPlacement task) {
+  *p_.add_tasks() = std::move(task);
+  return *this;
+}
+
 namespace {
 template <typename Field, typename Pred>
 void EraseIf(Field *field, Pred &&pred) {
@@ -908,6 +913,9 @@ PipelineBuilder &PipelineBuilder::Remove(std::string_view name) {
           [&](const pb::TrafficClass &tc) { return tc.name() == name; });
   EraseIf(p_.mutable_connections(), [&](const pb::Connection &c) {
     return c.upstream() == name || c.downstream() == name;
+  });
+  EraseIf(p_.mutable_tasks(), [&](const pb::TaskPlacement &t) {
+    return t.module() == name || t.parent() == name;
   });
   return *this;
 }

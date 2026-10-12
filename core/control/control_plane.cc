@@ -926,6 +926,98 @@ ControlResult<void> ControlPlane::UpdateTcParentLocked(const TrafficClassSpec& s
   return {};
 }
 
+ControlResult<void> ControlPlane::PlaceTasksLocked(
+    std::span<const TrafficClassSpec> leaves, std::span<const std::string> leaving) {
+  // Every leaf first, before anything moves: a missing task changes nothing.
+  // classes[0, leaves.size()) are placed; the rest, tasks of leaving modules
+  // that sit in a class, only make room.
+  std::vector<bess::TrafficClass*> classes;
+  for (const TrafficClassSpec& leaf : leaves) {
+    ControlResult<bess::TrafficClass*> found = FindTc(leaf);
+    if (!found) {
+      return std::unexpected(found.error());
+    }
+    if ((*found)->policy() != bess::POLICY_LEAF) {
+      return std::unexpected(
+          Err(EINVAL, "'%s' is not a module task", (*found)->name().c_str()));
+    }
+    classes.push_back(*found);
+  }
+  for (const std::string& name : leaving) {
+    const Module* m = runtime::runtime().modules().Find(name);
+    if (m == nullptr) {
+      continue;
+    }
+    for (const auto* task : m->tasks()) {
+      if (task->GetTC()->parent() != nullptr) {
+        classes.push_back(task->GetTC());
+      }
+    }
+  }
+
+  std::vector<TrafficClassSpec> previous;
+  for (bess::TrafficClass* c : classes) {
+    // Where it is now: a scheduler root at its worker; an orphan waits for the
+    // worker the orphan list names.
+    TrafficClassSpec where = AttachmentSpecOf(c);
+    if (c->parent() == nullptr) {
+      for (const auto& [wid, orphan] : runtime::runtime().workers().orphan_tcs()) {
+        if (orphan == c) {
+          where.wid = wid;
+          break;
+        }
+      }
+    }
+    previous.push_back(std::move(where));
+  }
+
+  // Two phases, so placements may trade places (a rate_limit class takes one
+  // child: moving one task in before the other is out would be refused).
+  size_t detached = 0;
+  for (; detached < classes.size(); detached++) {
+    if (!detach_tc(classes[detached])) {
+      break;
+    }
+    if (detached >= leaves.size()) {
+      // A leaving module's task: an orphan (detachable) until it is removed.
+      add_tc_to_orphan(classes[detached], Worker::kAnyWorker);
+    }
+  }
+  size_t attached = 0;
+  ControlResult<void> result;
+  if (detached < classes.size()) {
+    result = std::unexpected(Err(EINVAL, "Cannot detach '%s' from its parent",
+                                 classes[detached]->name().c_str()));
+  } else {
+    for (; attached < leaves.size(); attached++) {
+      result = AttachExistingTcLocked(classes[attached], leaves[attached]);
+      if (!result) {
+        break;
+      }
+    }
+    if (result) {
+      return {};
+    }
+  }
+
+  // Refused: take back what moved (and the orphaned), then put everything
+  // where it was.
+  for (size_t i = 0; i < attached; i++) {
+    (void)detach_tc(classes[i]);
+  }
+  for (size_t i = leaves.size(); i < detached; i++) {
+    (void)detach_tc(classes[i]);
+  }
+  for (size_t i = 0; i < detached; i++) {
+    if (auto restored = AttachExistingTcLocked(classes[i], previous[i]); !restored) {
+      LOG(ERROR) << "Task '" << classes[i]->name()
+                 << "' could not be restored to its previous placement ("
+                 << restored.error().message << ")";
+    }
+  }
+  return result;
+}
+
 // A class that is waiting to be woken up must not stay reachable from a
 // scheduler once it (or an ancestor) is moved or destroyed: the wakeup queue
 // holds raw pointers, and a stale one would be followed on the next wakeup.
@@ -953,6 +1045,27 @@ ControlResult<void> ControlPlane::RemoveTcLocked(const std::string& name) {
   if (c->policy() == bess::POLICY_LEAF) {
     return std::unexpected(
         Err(EINVAL, "Tc '%s' is a leaf class owned by a module", name.c_str()));
+  }
+
+  // Deleting a class deletes its subtree; a module's task there would leave
+  // the module holding a freed leaf. (Plans remove the modules first, and
+  // CheckReversibility refuses a kept task left there.)
+  std::vector<bess::TrafficClass*> pending = c->Children();
+  while (!pending.empty()) {
+    bess::TrafficClass* child = pending.back();
+    pending.pop_back();
+    if (child->policy() == bess::POLICY_LEAF) {
+      return std::unexpected(Err(EBUSY, "Tc '%s' still holds the task of module '%s'",
+                                 name.c_str(),
+                                 static_cast<bess::LeafTrafficClass*>(child)
+                                     ->task()
+                                     ->module()
+                                     ->name()
+                                     .c_str()));
+    }
+    for (bess::TrafficClass* grandchild : child->Children()) {
+      pending.push_back(grandchild);
+    }
   }
 
   RemoveSubtreeFromWakeupQueues(c);

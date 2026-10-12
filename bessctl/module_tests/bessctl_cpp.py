@@ -14,6 +14,7 @@ import select
 import signal
 import subprocess
 import tempfile
+import time
 from test_utils import *
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -216,6 +217,27 @@ class BessctlCppTest(BessModuleTestCase):
         # them all.
         self.bessctl('resume')
         self.bessctl('pause')
+
+    # Every sample manifest (conf/samples, D-104): applies on a reset daemon,
+    # converges (diff reports nothing left), and runs briefly.
+    def test_samples(self):
+        self.binary = bessctl_binary()
+        if not os.access(self.binary, os.X_OK):
+            self.skipTest(self.binary + ' is not built')
+        samples = os.path.join(ROOT, 'bessctl', 'conf', 'samples')
+        paths = sorted(os.path.join(d, f) for d, _, files in os.walk(samples)
+                       for f in files if f.endswith('.yaml'))
+        self.assertTrue(paths)
+        for path in paths:
+            with self.subTest(sample=os.path.relpath(path, samples)):
+                self.bess.pause_all()
+                self.bess.reset_all()
+                self.bessctl('apply', path)
+                self.assertIn('0 change(s)', self.bessctl('diff', path).stdout)
+                self.bessctl('resume')
+                time.sleep(0.2)
+                self.bessctl('pause')
+                self.bessctl('status')
 
 suite = unittest.TestLoader().loadTestsFromTestCase(BessctlCppTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)

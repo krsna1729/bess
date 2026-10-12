@@ -1,0 +1,61 @@
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# A Queue across two workers: on worker 0 a Source limited to 100 packets/s
+# fills the Queue; on worker 1 a priority class runs a Source limited to
+# 100,000 packets/s first, then the Queue's task.
+#
+# Converted from qtest.bess (D-104).
+modules:
+  - name: queue
+    mclass: Queue
+  - name: sink0
+    mclass: Sink
+  - name: source0
+    mclass: Source
+  - name: source1
+    mclass: Source
+connections:
+  - upstream: queue
+    downstream: sink0
+  - upstream: source0
+    downstream: queue
+  - upstream: source1
+    downstream: sink0
+workers:
+  - {wid: 0, core: 0}
+  - wid: 1
+    core: 1
+traffic_classes:
+  - name: fast
+    parent: w2root
+    policy: rate_limit
+    resource: packet
+    wid: -1
+    priority: "0"
+    limit:
+      packet: "100000"
+  - name: queue_rr
+    parent: w2root
+    policy: round_robin
+    wid: -1
+    priority: "1"
+  - name: slow
+    parent: w1root
+    policy: rate_limit
+    resource: packet
+    wid: -1
+    limit:
+      packet: "100"
+  - name: w1root
+    policy: round_robin
+  - name: w2root
+    policy: priority
+    wid: 1
+tasks:
+  - module: queue
+    parent: queue_rr
+  - module: source0
+    parent: slow
+  - module: source1
+    parent: fast

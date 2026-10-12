@@ -54,7 +54,16 @@ struct WorkerChange {
 struct TrafficClassChange {
   std::string name;
   ChangeKind kind = ChangeKind::kUnchanged;
-  TrafficClassSpec desired;
+  TrafficClassSpec desired;  // kRemove: only name and the current parent
+  // kUpdate (moved): its parameters (resource, limit, max_burst) change too.
+  bool params_changed = false;
+};
+
+// A task to place where desired state names (always kUpdate: a task is never
+// created or removed by placement, only moved).
+struct TaskChange {
+  TaskPlacementSpec desired;
+  ChangeKind kind = ChangeKind::kUpdate;
 };
 
 struct PipelineDiff {
@@ -63,12 +72,13 @@ struct PipelineDiff {
   std::vector<ConnectionChange> connections;
   std::vector<WorkerChange> workers;
   std::vector<TrafficClassChange> traffic_classes;
+  std::vector<TaskChange> tasks;  // in (module, task) order
 
   // True when the desired state is already active. A no-op apply must not
   // pause workers and must not bump the generation.
   bool empty() const {
     return ports.empty() && modules.empty() && connections.empty() &&
-           workers.empty() && traffic_classes.empty();
+           workers.empty() && traffic_classes.empty() && tasks.empty();
   }
 };
 

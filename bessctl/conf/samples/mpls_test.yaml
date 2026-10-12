@@ -1,0 +1,27 @@
+
+
+# MPLSPop on MPLS-labelled packets.
+#
+# Converted from mpls_test.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: mplsPop
+    mclass: MPLSPop
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "BhY+G3IyAh5nn02uiEf///H/RQAAHAABAABAEbAmwKgAAQoAAAEnEScSAAjnEA=="
+  - name: sink0
+    mclass: Sink
+  - name: source0
+    mclass: Source
+connections:
+  - upstream: mplsPop
+    downstream: sink0
+  - upstream: rewrite0
+    downstream: mplsPop
+  - upstream: source0
+    downstream: rewrite0
+workers:
+  - {wid: 0, core: 0}

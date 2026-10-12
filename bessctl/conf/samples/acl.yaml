@@ -1,0 +1,36 @@
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# An ACL (rules in its init argument) on crafted UDP packets.
+#
+# Converted from acl.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: fw
+    mclass: ACL
+    arg:
+      rules:
+        - src_ip: "172.12.0.0/16"
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARYLSsEGQBCgAAAScRJxIAEnd0aGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARUuesDDdjDCI4TicRJxIAEmmnaGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARjVasDDdjCgAAAScRJxIAEqQWaGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARJkWsEGQBDCI4TicRJxIAEj0FaGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAyAAEAAEAGUuasDDdjDCI4TicRJxIAAAAAAAAAAFACIAD5tQAAaGVsbG93b3JsZA=="
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARdDPAqAF7DCI4TicRJxIAEorzaGVsbG93b3JsZA=="
+  - name: sink0
+    mclass: Sink
+  - name: source0
+    mclass: Source
+connections:
+  - upstream: fw
+    downstream: sink0
+  - upstream: rewrite0
+    downstream: fw
+  - upstream: source0
+    downstream: rewrite0
+workers:
+  - {wid: 0, core: 0}

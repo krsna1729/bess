@@ -367,8 +367,10 @@ class PipelineBuilder {
   PipelineBuilder &Chain(std::initializer_list<std::string_view> names);
   PipelineBuilder &Worker(int32_t wid, int32_t core, std::string_view scheduler);
   PipelineBuilder &TrafficClass(pb::TrafficClass tc);
-  // Drops the port, module or traffic class `name` and the connections that
-  // touch it.
+  // Where a module's task is scheduled: under a traffic class or at a worker.
+  PipelineBuilder &Task(pb::TaskPlacement task);
+  // Drops the port, module or traffic class `name` and the connections and
+  // task placements that name it.
   PipelineBuilder &Remove(std::string_view name);
 
   // A copy of the pipeline built so far, or the first argument that could

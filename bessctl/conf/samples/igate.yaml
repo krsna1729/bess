@@ -1,0 +1,91 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Input gates: several sources into modules with more than one input gate.
+#
+# Converted from igate.bess (D-104).
+modules:
+  - name: a
+    mclass: Bypass
+  - name: b
+    mclass: Bypass
+  - name: c
+    mclass: Bypass
+  - name: d
+    mclass: Bypass
+  - name: dst
+    mclass: Sink
+  - name: rr
+    mclass: RoundRobin
+    arg:
+      gates:
+        - "0"
+        - "1"
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: sink3
+    mclass: Sink
+  - name: sink4
+    mclass: Sink
+  - name: sink5
+    mclass: Sink
+  - name: source0
+    mclass: Source
+  - name: source1
+    mclass: Source
+  - name: source2
+    mclass: Source
+  - name: source3
+    mclass: Source
+  - name: src0
+    mclass: Source
+  - name: src1
+    mclass: Source
+connections:
+  - upstream: a
+    downstream: sink0
+  - upstream: a
+    ogate: 1
+    downstream: sink1
+  - upstream: b
+    downstream: sink2
+  - upstream: b
+    ogate: 1
+    downstream: sink3
+  - upstream: c
+    downstream: sink4
+  - upstream: c
+    ogate: 1
+    downstream: sink5
+  - upstream: d
+    downstream: dst
+  - upstream: d
+    ogate: 1
+    downstream: dst
+  - upstream: rr
+    downstream: d
+  - upstream: rr
+    ogate: 1
+    downstream: d
+    igate: 1
+  - upstream: source0
+    downstream: a
+  - upstream: source1
+    downstream: a
+    igate: 1
+  - upstream: source2
+    downstream: b
+  - upstream: source3
+    downstream: c
+    igate: 1
+  - upstream: src0
+    downstream: rr
+  - upstream: src1
+    downstream: d
+workers:
+  - {wid: 0, core: 0}

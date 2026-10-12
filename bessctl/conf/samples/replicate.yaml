@@ -1,0 +1,32 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Replicate: every packet copied to three gates.
+#
+# Converted from replicate.bess (D-104).
+modules:
+  - name: repl
+    mclass: Replicate
+    arg:
+      gates:
+        - "0"
+        - "1"
+        - "2"
+  - name: sink
+    mclass: Sink
+  - name: source0
+    mclass: Source
+connections:
+  - upstream: repl
+    downstream: sink
+  - upstream: repl
+    ogate: 1
+    downstream: sink
+  - upstream: repl
+    ogate: 2
+    downstream: sink
+  - upstream: source0
+    downstream: repl
+workers:
+  - {wid: 0, core: 0}

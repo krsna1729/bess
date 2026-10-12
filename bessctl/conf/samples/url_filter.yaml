@@ -1,0 +1,234 @@
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# UrlFilter blocking 100 hosts, on generated HTTP flows.
+#
+# Converted from url_filter.bess (D-104).
+modules:
+  - name: filter
+    mclass: UrlFilter
+    arg:
+      blacklist:
+        - host: www.0.com
+          path: /
+        - host: www.1.com
+          path: /
+        - host: www.2.com
+          path: /
+        - host: www.3.com
+          path: /
+        - host: www.4.com
+          path: /
+        - host: www.5.com
+          path: /
+        - host: www.6.com
+          path: /
+        - host: www.7.com
+          path: /
+        - host: www.8.com
+          path: /
+        - host: www.9.com
+          path: /
+        - host: www.10.com
+          path: /
+        - host: www.11.com
+          path: /
+        - host: www.12.com
+          path: /
+        - host: www.13.com
+          path: /
+        - host: www.14.com
+          path: /
+        - host: www.15.com
+          path: /
+        - host: www.16.com
+          path: /
+        - host: www.17.com
+          path: /
+        - host: www.18.com
+          path: /
+        - host: www.19.com
+          path: /
+        - host: www.20.com
+          path: /
+        - host: www.21.com
+          path: /
+        - host: www.22.com
+          path: /
+        - host: www.23.com
+          path: /
+        - host: www.24.com
+          path: /
+        - host: www.25.com
+          path: /
+        - host: www.26.com
+          path: /
+        - host: www.27.com
+          path: /
+        - host: www.28.com
+          path: /
+        - host: www.29.com
+          path: /
+        - host: www.30.com
+          path: /
+        - host: www.31.com
+          path: /
+        - host: www.32.com
+          path: /
+        - host: www.33.com
+          path: /
+        - host: www.34.com
+          path: /
+        - host: www.35.com
+          path: /
+        - host: www.36.com
+          path: /
+        - host: www.37.com
+          path: /
+        - host: www.38.com
+          path: /
+        - host: www.39.com
+          path: /
+        - host: www.40.com
+          path: /
+        - host: www.41.com
+          path: /
+        - host: www.42.com
+          path: /
+        - host: www.43.com
+          path: /
+        - host: www.44.com
+          path: /
+        - host: www.45.com
+          path: /
+        - host: www.46.com
+          path: /
+        - host: www.47.com
+          path: /
+        - host: www.48.com
+          path: /
+        - host: www.49.com
+          path: /
+        - host: www.50.com
+          path: /
+        - host: www.51.com
+          path: /
+        - host: www.52.com
+          path: /
+        - host: www.53.com
+          path: /
+        - host: www.54.com
+          path: /
+        - host: www.55.com
+          path: /
+        - host: www.56.com
+          path: /
+        - host: www.57.com
+          path: /
+        - host: www.58.com
+          path: /
+        - host: www.59.com
+          path: /
+        - host: www.60.com
+          path: /
+        - host: www.61.com
+          path: /
+        - host: www.62.com
+          path: /
+        - host: www.63.com
+          path: /
+        - host: www.64.com
+          path: /
+        - host: www.65.com
+          path: /
+        - host: www.66.com
+          path: /
+        - host: www.67.com
+          path: /
+        - host: www.68.com
+          path: /
+        - host: www.69.com
+          path: /
+        - host: www.70.com
+          path: /
+        - host: www.71.com
+          path: /
+        - host: www.72.com
+          path: /
+        - host: www.73.com
+          path: /
+        - host: www.74.com
+          path: /
+        - host: www.75.com
+          path: /
+        - host: www.76.com
+          path: /
+        - host: www.77.com
+          path: /
+        - host: www.78.com
+          path: /
+        - host: www.79.com
+          path: /
+        - host: www.80.com
+          path: /
+        - host: www.81.com
+          path: /
+        - host: www.82.com
+          path: /
+        - host: www.83.com
+          path: /
+        - host: www.84.com
+          path: /
+        - host: www.85.com
+          path: /
+        - host: www.86.com
+          path: /
+        - host: www.87.com
+          path: /
+        - host: www.88.com
+          path: /
+        - host: www.89.com
+          path: /
+        - host: www.90.com
+          path: /
+        - host: www.91.com
+          path: /
+        - host: www.92.com
+          path: /
+        - host: www.93.com
+          path: /
+        - host: www.94.com
+          path: /
+        - host: www.95.com
+          path: /
+        - host: www.96.com
+          path: /
+        - host: www.97.com
+          path: /
+        - host: www.98.com
+          path: /
+        - host: www.99.com
+          path: /
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: src
+    mclass: FlowGen
+    arg:
+      template: BhY+G3IyAh5nn02uCABFAABnAAEAAEAGr+bAqAABCgAAAScRAFAAADA5AAAAAFACIACjiAAAR0VUIC9wdWIvV1dXL1RoZVByb2plY3QuaHRtbCBIVFRQLzEuMQ0KSG9zdDogd3d3Lmdvb2dsZS5jb20NCg0K
+      pps: 2200000
+      flow_rate: 800
+      flow_duration: 5
+      arrival: uniform
+      duration: uniform
+connections:
+  - upstream: filter
+    downstream: sink0
+  - upstream: filter
+    ogate: 1
+    downstream: sink1
+  - upstream: src
+    downstream: filter
+workers:
+  - {wid: 0, core: 0}

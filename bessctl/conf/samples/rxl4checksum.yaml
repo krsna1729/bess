@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright(c) 2019 Intel Corporation
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# IPChecksum and L4Checksum verification on generated flows; packets with
+# checksum errors go to their own sinks.
+# 60-byte packets (the .bess default of $BESS_PKT_SIZE).
+#
+# Converted from rxl4checksum.bess (D-104).
+modules:
+  - name: TcpIPRxChecksum
+    mclass: IPChecksum
+    arg:
+      verify: true
+  - name: TcpL4RxChecksum
+    mclass: L4Checksum
+    arg:
+      verify: true
+  - name: UdpIPRxChecksum
+    mclass: IPChecksum
+    arg:
+      verify: true
+  - name: UdpL4RxChecksum
+    mclass: L4Checksum
+    arg:
+      verify: true
+  - name: flowgen0
+    mclass: FlowGen
+    arg:
+      template: BhY+G3IyAh5nn02uCABFAAAuAAEAAEAGZscKAAABCgAAAicRJxIAAAAAAAAAAFACIADptAAAaGVsbG8w
+      pps: 1000000
+      flow_rate: 10000
+      flow_duration: 10
+      arrival: exponential
+      duration: pareto
+      quick_rampup: true
+  - name: flowgen1
+    mclass: FlowGen
+    arg:
+      template: BhY+G3IyAh5nn02uCABFAAAuAAEAAEARZrwKAAABCgAAAicRJxIAGh5baGVsbG8wMTIzNDU2Nzg5MDEy
+      pps: 1000000
+      flow_rate: 10000
+      flow_duration: 10
+      arrival: exponential
+      duration: pareto
+      quick_rampup: true
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: sink3
+    mclass: Sink
+  - name: sink4
+    mclass: Sink
+  - name: sink5
+    mclass: Sink
+connections:
+  - upstream: TcpIPRxChecksum
+    downstream: TcpL4RxChecksum
+  - upstream: TcpIPRxChecksum
+    ogate: 1
+    downstream: sink2
+  - upstream: TcpL4RxChecksum
+    downstream: sink0
+  - upstream: TcpL4RxChecksum
+    ogate: 1
+    downstream: sink3
+  - upstream: UdpIPRxChecksum
+    downstream: UdpL4RxChecksum
+  - upstream: UdpIPRxChecksum
+    ogate: 1
+    downstream: sink4
+  - upstream: UdpL4RxChecksum
+    downstream: sink1
+  - upstream: UdpL4RxChecksum
+    ogate: 1
+    downstream: sink5
+  - upstream: flowgen0
+    downstream: TcpIPRxChecksum
+  - upstream: flowgen1
+    downstream: UdpIPRxChecksum
+workers:
+  - {wid: 0, core: 0}

@@ -1,0 +1,63 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Update and RandomUpdate: round robin between a gate whose packets get a
+# fixed source MAC and one whose UDP ports get random values.
+#
+# Converted from update.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARrxzAqAEBCgAAAScRJxIAEsXcaGVsbG93b3JsZA=="
+  - name: rr
+    mclass: RoundRobin
+    arg:
+      gates:
+        - "1"
+        - "2"
+  - name: rupdate0
+    mclass: RandomUpdate
+    arg:
+      fields:
+        - offset: "34"
+          size: "2"
+          min: "20000"
+          max: "30000"
+        - offset: "36"
+          size: "2"
+          min: "40000"
+          max: "50000"
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: source0
+    mclass: Source
+  - name: update0
+    mclass: Update
+    arg:
+      fields:
+        - offset: "6"
+          size: "6"
+          value: "20015998341291"
+connections:
+  - upstream: rewrite0
+    downstream: rr
+  - upstream: rr
+    ogate: 1
+    downstream: update0
+  - upstream: rr
+    ogate: 2
+    downstream: rupdate0
+  - upstream: rupdate0
+    downstream: sink1
+  - upstream: source0
+    downstream: rewrite0
+  - upstream: update0
+    downstream: sink0
+workers:
+  - {wid: 0, core: 0}

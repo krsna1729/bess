@@ -60,10 +60,17 @@ external controllers such as the UPF; the C++ SDK is the one the C++ bessctl
 
 ## Desired state
 
-The pipeline (ports, modules, connections, workers, traffic classes) is
-desired state: `PipelineBuilder` assembles a `control_v2.Pipeline`, empty or
-from `client.pipeline()`'s snapshot, and the daemon validates, diffs, plans and
-applies it. The SDK repeats none of the planner's logic.
+The pipeline (ports, modules, connections, workers, traffic classes, and where
+each module's task is scheduled) is desired state: `PipelineBuilder`
+assembles a `control_v2.Pipeline`, empty or from `client.pipeline()`'s
+snapshot, and the daemon validates, diffs, plans and applies it. The SDK
+repeats none of the planner's logic.
+
+A task placement (`task('src', parent='limit')` or `task('src', wid=1)`;
+Go and C++ `Task`) puts a module's task under a traffic class or at a
+worker's root, what `attach_task` did. A task no placement names stays where
+it is; a new one goes to any worker. Placements apply together, so tasks may
+trade places (D-109).
 
 ```python
 snap = client.pipeline()                       # PipelineSnapshot: pipeline, version

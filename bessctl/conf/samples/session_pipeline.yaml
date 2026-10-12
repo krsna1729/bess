@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+# A policed, routed session, all in desired state (roadmap M23, persona A:
+# the graph user). The graph is
+#
+#   Source -> Rewrite -> ExactMatch -> ActionTable -> Meter -> Router -> Sink
+#
+# and everything dynamic is in the modules' tables, not in the graph: the
+# resources below are one transaction that creates the session's meter, next
+# hop, route, action and the ExactMatch rule naming that action.
+#
+# Converted from session_pipeline.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: at
+    mclass: ActionTable
+    arg:
+      capacity: "64"
+      meters: mt/meters
+      next_hops: rt/next_hops
+  - name: em
+    mclass: ExactMatch
+    arg:
+      fields:
+        - offset: 26
+          num_bytes: 4
+        - offset: 34
+          num_bytes: 2
+      action_resource: at/actions
+  - name: mt
+    mclass: Meter
+    arg:
+      capacity: "64"
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "BhY+G3IyAh5nn02uCABFAAA4AAEAAEAGW6oKAQIDCgkJCQTSAFAAAAAAAAAAAFACIACn1wAAeHh4eHh4eHh4eHh4eHh4eA=="
+        - "BhY+G3IyAh5nn02uCABFAAA4AAEAAEAGpazAAAIBCgkJCRDhAFAAAAAAAAAAAFACIADlygAAeHh4eHh4eHh4eHh4eHh4eA=="
+  - name: rt
+    mclass: Router
+    arg:
+      max_routes: "64"
+      max_tbl8s: "16"
+      max_next_hops: "64"
+  - name: sink0
+    mclass: Sink
+  - name: source0
+    mclass: Source
+connections:
+  - upstream: at
+    downstream: mt
+  - upstream: em
+    downstream: at
+  - upstream: mt
+    downstream: rt
+  - upstream: rewrite0
+    downstream: em
+  - upstream: rt
+    ogate: 1
+    downstream: sink0
+  - upstream: source0
+    downstream: rewrite0
+workers:
+  - {wid: 0, core: 0}
+resources:
+  # 1 Gbit/s committed and peak, 64 KiB buckets.
+  mt/meters:
+    - key: {id: 1}
+      value:
+        tr_tcm: {committed_rate: 125000000, committed_burst: 65536, peak_rate: 125000000, peak_burst: 65536}
+  rt/next_hops:
+    - key: {id: 1}
+      value: {egress_gate: 1}
+  rt/routes:
+    - key: {ipv4: 10.0.0.0, prefix_length: 8}
+      value: {next_hop_id: 1}
+  at/actions:
+    - key: {id: 1}
+      value: {meter_id: 1, next_hop_id: 1}
+  # The session: TCP from 10.1.2.3 port 1234.
+  em/rules:
+    - key: {fields: [{value_bin: CgECAw==}, {value_bin: BNI=}]}
+      value: {action_id: 1}

@@ -1,0 +1,52 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# A Queue between two tasks: a rate-limited Source pushes, the Queue task
+# pulls. (Its occupancy: the Queue command get_status.)
+#
+# Converted from queue.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: queue
+    mclass: Queue
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "AAIVN6JEAK7zUqrRCABFAAAnAAEAAEARfMN/AAABfwAAAQA1ADUAE6+NSGVsbG8gV29ybGQ="
+  - name: sink0
+    mclass: Sink
+  - name: src
+    mclass: Source
+  - name: vlan_push0
+    mclass: VLANPush
+    arg:
+      tci: "2"
+connections:
+  - upstream: queue
+    downstream: vlan_push0
+  - upstream: rewrite0
+    downstream: queue
+  - upstream: src
+    downstream: rewrite0
+  - upstream: vlan_push0
+    downstream: sink0
+workers:
+  - {wid: 0, core: 0}
+traffic_classes:
+  - name: fast
+    policy: rate_limit
+    resource: packet
+    limit:
+      packet: "9000000"
+  - name: slow
+    policy: rate_limit
+    resource: packet
+    limit:
+      packet: "1000000"
+tasks:
+  - module: queue
+    parent: slow
+  - module: src
+    parent: fast

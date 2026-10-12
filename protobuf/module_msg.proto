@@ -240,7 +240,7 @@ message MeasureCommandGetSummaryResponse {
 /**
  * The Module DRR provides fair scheduling of flows based on a quantum which is
  * number of bytes allocated to each flow on each round of going through all flows.
- * Examples can be found [./bessctl/conf/samples/drr.bess]
+ * Examples can be found [./bessctl/conf/samples/drr.yaml]
  *
  * __Input_Gates__: 1
  * __Output_Gates__:  1

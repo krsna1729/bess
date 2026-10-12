@@ -559,7 +559,9 @@ func TestWatchEventsClosesItsErrorChannelWhenTheContextEnds(t *testing.T) {
 }
 
 func TestThePipelineBuilderAssemblesAndEditsASnapshot(t *testing.T) {
-	p, err := NewPipeline(nil).Worker(0, 2, "").Module("a", "Source", nil).
+	wid := int32(0)
+	p, err := NewPipeline(nil).Task(&pb.TaskPlacement{Module: "a", Wid: &wid}).
+		Task(&pb.TaskPlacement{Module: "b", Parent: "rl"}).Worker(0, 2, "").Module("a", "Source", nil).
 		Module("b", "Bypass", &pb.GetTransactionRequest{RequestId: "x"}).Module("c", "Sink", nil).
 		Chain("a", "b", "c").Connect("b", 1, "c", 0).Build()
 	if err != nil {
@@ -578,6 +580,9 @@ func TestThePipelineBuilderAssemblesAndEditsASnapshot(t *testing.T) {
 	edited, _ := NewPipeline(p).Remove("b").Build()
 	if len(edited.GetModules()) != 2 || len(edited.GetConnections()) != 0 || len(p.GetModules()) != 3 {
 		t.Fatal(edited, p)
+	}
+	if len(edited.GetTasks()) != 1 || edited.GetTasks()[0].GetModule() != "a" {
+		t.Fatal("the removed module's placement stayed:", edited.GetTasks())
 	}
 }
 

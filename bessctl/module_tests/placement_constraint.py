@@ -10,7 +10,7 @@ from test_utils import *
 class BessModuleConstraintTest(BessModuleTestCase):
 
     def test_queue(self):
-        # This is taken from queue.bess
+        # This is taken from the queue sample (conf/samples/queue.yaml)
         src = Source()
         src -> queue::Queue() \
             -> VLANPush(tci=2) \
@@ -28,7 +28,7 @@ class BessModuleConstraintTest(BessModuleTestCase):
 
     def test_nat(self):
         nat_config = [{'ext_addr': '192.168.1.1'}]
-        # From nat.bess -- check that revisiting the same module works
+        # From the nat sample -- check that revisiting the same module works
         # correctly.
         nat = NAT(ext_addrs=nat_config)
 

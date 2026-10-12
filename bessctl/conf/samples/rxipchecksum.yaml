@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright(c) 2019 Intel Corporation
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# IPChecksum verification on generated flows; packets with checksum errors
+# go to their own sinks.
+# 60-byte packets (the .bess default of $BESS_PKT_SIZE).
+#
+# Converted from rxipchecksum.bess (D-104).
+modules:
+  - name: TcpIPRxChecksum
+    mclass: IPChecksum
+    arg:
+      verify: true
+  - name: UdpIPRxChecksum
+    mclass: IPChecksum
+    arg:
+      verify: true
+  - name: flowgen0
+    mclass: FlowGen
+    arg:
+      template: BhY+G3IyAh5nn02uCABFAAAuAAEAAEAGZscKAAABCgAAAicRJxIAAAAAAAAAAFACIADptAAAaGVsbG8w
+      pps: 1000000
+      flow_rate: 10000
+      flow_duration: 10
+      arrival: exponential
+      duration: pareto
+      quick_rampup: true
+  - name: flowgen1
+    mclass: FlowGen
+    arg:
+      template: BhY+G3IyAh5nn02uCABFAAAuAAEAAEARZrwKAAABCgAAAicRJxIAGh5baGVsbG8wMTIzNDU2Nzg5MDEy
+      pps: 1000000
+      flow_rate: 10000
+      flow_duration: 10
+      arrival: exponential
+      duration: pareto
+      quick_rampup: true
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: sink3
+    mclass: Sink
+connections:
+  - upstream: TcpIPRxChecksum
+    downstream: sink0
+  - upstream: TcpIPRxChecksum
+    ogate: 1
+    downstream: sink2
+  - upstream: UdpIPRxChecksum
+    downstream: sink1
+  - upstream: UdpIPRxChecksum
+    ogate: 1
+    downstream: sink3
+  - upstream: flowgen0
+    downstream: TcpIPRxChecksum
+  - upstream: flowgen1
+    downstream: UdpIPRxChecksum
+workers:
+  - {wid: 0, core: 0}

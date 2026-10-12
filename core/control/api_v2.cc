@@ -90,9 +90,19 @@ ControlResult<PipelineSpec> FromProto(const v2::Pipeline &pipeline) {
     tc.share = t.share();
     tc.limit.insert(t.limit().begin(), t.limit().end());
     tc.max_burst.insert(t.max_burst().begin(), t.max_burst().end());
-    tc.leaf_module_name = t.leaf_module_name();
-    tc.leaf_module_taskid = t.leaf_module_taskid();
     spec.traffic_classes.push_back(std::move(tc));
+  }
+  for (const auto &t : pipeline.tasks()) {
+    TaskPlacementSpec task;
+    task.module = t.module();
+    task.task = t.task();
+    task.parent = t.parent();
+    task.wid = t.has_wid() ? t.wid() : Worker::kAnyWorker;  // -1: none
+    task.has_priority = t.has_priority();
+    task.priority = t.priority();
+    task.has_share = t.has_share();
+    task.share = t.share();
+    spec.tasks.push_back(std::move(task));
   }
   return spec;
 }
@@ -153,8 +163,17 @@ v2::Pipeline ToProto(const PipelineSpec &spec) {
     if (t.has_share) tc->set_share(t.share);
     tc->mutable_limit()->insert(t.limit.begin(), t.limit.end());
     tc->mutable_max_burst()->insert(t.max_burst.begin(), t.max_burst.end());
-    tc->set_leaf_module_name(t.leaf_module_name);
-    tc->set_leaf_module_taskid(t.leaf_module_taskid);
+  }
+  for (const auto &t : spec.tasks) {
+    auto *task = out.add_tasks();
+    task->set_module(t.module);
+    task->set_task(static_cast<uint32_t>(t.task));
+    task->set_parent(t.parent);
+    if (t.parent.empty()) {
+      task->set_wid(t.wid);
+    }
+    if (t.has_priority) task->set_priority(t.priority);
+    if (t.has_share) task->set_share(t.share);
   }
   return out;
 }
@@ -179,6 +198,10 @@ v2::ChangeKind ToProto(ChangeKind kind) {
       break;
   }
   return v2::CHANGE_KIND_UNSPECIFIED;
+}
+
+std::string TaskName(const TaskPlacementSpec &task) {
+  return task.module + ":" + std::to_string(task.task);
 }
 
 std::string ConnectionName(const std::string &up, gate_idx_t ogate,
@@ -216,6 +239,9 @@ v2::PipelineDiff ToProto(const PipelineDiff &diff) {
   }
   for (const auto &c : diff.traffic_classes) {
     AddChange(&out, v2::TRAFFIC_CLASS, c.name, c.kind);
+  }
+  for (const auto &c : diff.tasks) {
+    AddChange(&out, v2::TASK, TaskName(c.desired), c.kind);
   }
   return out;
 }
@@ -257,6 +283,12 @@ StepDescription Describe(const PlanOperation &op) {
           return {"create_tc", v2::TRAFFIC_CLASS, o.spec.name};
         } else if constexpr (std::is_same_v<T, ReparentTcOp>) {
           return {"reparent_tc", v2::TRAFFIC_CLASS, o.spec.name};
+        } else if constexpr (std::is_same_v<T, PlaceTasksOp>) {
+          std::string names;
+          for (const auto &task : o.tasks) {
+            names += (names.empty() ? "" : ",") + TaskName(task);
+          }
+          return {"place_tasks", v2::TASK, names};
         } else if constexpr (std::is_same_v<T, UpdateTcParamsOp>) {
           return {"update_tc_params", v2::TRAFFIC_CLASS, o.spec.name};
         } else {

@@ -238,7 +238,7 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
       return std::unexpected(Invalid(
           "tc", "policy",
           "traffic class '" + tc.name + "': invalid policy '" + tc.policy +
-              "' (leaf classes belong to modules, not to desired state)"));
+              "' (a module's own leaf class is placed with 'tasks')"));
     }
 
     if (tc.policy == TrafficPolicyName[POLICY_WEIGHTED_FAIR] ||
@@ -311,101 +311,170 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
         }
       }
     }
+  }
 
-    if (!tc.leaf_module_name.empty()) {
-      if (module_names.count(tc.leaf_module_name) == 0) {
-        return std::unexpected(
-            NotFound("tc", "leaf_module_name",
-                     "traffic class '" + tc.name + "': no module '" +
-                         tc.leaf_module_name + "'"));
-      }
-      if (tc.leaf_module_taskid >= MAX_TASKS_PER_MODULE) {
+  // -- task placements --------------------------------------------------------
+  std::set<std::pair<std::string, uint64_t>> placed;
+  for (const TaskPlacementSpec &task : spec.tasks) {
+    const std::string what =
+        "task '" + task.module + ":" + std::to_string(task.task) + "'";
+    if (module_names.count(task.module) == 0) {
+      return std::unexpected(
+          NotFound("task", "module", what + ": no module '" + task.module + "'"));
+    }
+    if (task.task >= MAX_TASKS_PER_MODULE) {
+      return std::unexpected(Invalid(
+          "task", "task",
+          what + ": the task index must be below " +
+              std::to_string(MAX_TASKS_PER_MODULE)));
+    }
+    if (!placed.insert({task.module, task.task}).second) {
+      return std::unexpected(
+          Duplicate("task", "task", what + " is placed twice"));
+    }
+    if (task.parent.empty()) {
+      if (task.wid < 0 || task.wid >= Worker::kMaxWorkers) {
         return std::unexpected(Invalid(
-            "tc", "leaf_module_taskid",
-            "traffic class '" + tc.name + "': 'taskid' must be between 0 and " +
-                std::to_string(MAX_TASKS_PER_MODULE - 1)));
+            "task", "wid",
+            what + ": needs a parent or a 'wid' between 0 and " +
+                std::to_string(Worker::kMaxWorkers - 1)));
       }
+      if (task.has_priority || task.has_share) {
+        return std::unexpected(Invalid(
+            "task", "parent",
+            what + ": a priority or share needs a parent"));
+      }
+    } else {
+      if (task.wid != Worker::kAnyWorker) {
+        return std::unexpected(Invalid(
+            "task", "wid", what + ": give a parent or a 'wid', not both"));
+      }
+      if (tc_names.count(task.parent) == 0) {
+        return std::unexpected(NotFound(
+            "task", "parent", what + ": no traffic class '" + task.parent + "'"));
+      }
+    }
+    if (task.has_priority &&
+        (task.priority < 0 ||
+         task.priority > std::numeric_limits<bess::priority_t>::max())) {
+      return std::unexpected(Invalid(
+          "task", "priority",
+          what + ": priority " + std::to_string(task.priority) +
+              " is out of range (0 to " +
+              std::to_string(std::numeric_limits<bess::priority_t>::max()) +
+              ")"));
+    }
+    if (task.has_share &&
+        (task.share < 1 ||
+         task.share > std::numeric_limits<bess::resource_share_t>::max())) {
+      return std::unexpected(Invalid(
+          "task", "share",
+          what + ": share " + std::to_string(task.share) +
+              " is out of range (1 to " +
+              std::to_string(
+                  std::numeric_limits<bess::resource_share_t>::max()) +
+              ")"));
     }
   }
 
-  // Attachment constraints: what a parent's policy requires of a child. These
-  // are the constraints the attach path enforces at commit time; catching them
-  // here means an impossible desired tree is refused before anything moves.
+  // Attachment constraints: what a parent's policy requires of a child, a
+  // traffic class or a task. These are the constraints the attach path
+  // enforces at commit time; catching them here means an impossible desired
+  // tree is refused before anything moves.
   std::map<std::string, const TrafficClassSpec *> by_name;
   for (const TrafficClassSpec &tc : spec.traffic_classes) {
     by_name[tc.name] = &tc;
   }
 
+  struct Child {
+    const char *object;  // "tc" or "task"
+    std::string what;
+    const std::string &parent;
+    bool has_priority;
+    int64_t priority;
+    bool has_share;
+    int64_t share;
+  };
+  std::vector<Child> children;
+  for (const TrafficClassSpec &tc : spec.traffic_classes) {
+    children.push_back({"tc", "traffic class '" + tc.name + "'", tc.parent,
+                        tc.has_priority, tc.priority, tc.has_share, tc.share});
+  }
+  for (const TaskPlacementSpec &task : spec.tasks) {
+    children.push_back(
+        {"task", "task '" + task.module + ":" + std::to_string(task.task) + "'",
+         task.parent, task.has_priority, task.priority, task.has_share,
+         task.share});
+  }
+
   std::set<std::pair<std::string, int64_t>> priority_slots;
   std::map<std::string, size_t> children_per_parent;
 
-  for (const TrafficClassSpec &tc : spec.traffic_classes) {
-    if (tc.parent.empty()) {
+  for (const Child &child : children) {
+    if (child.parent.empty()) {
       continue;
     }
 
-    const auto parent_it = by_name.find(tc.parent);
+    const auto parent_it = by_name.find(child.parent);
     if (parent_it == by_name.end()) {
       continue;  // existence is reported above
     }
     const std::string &parent_policy = parent_it->second->policy;
 
     if (parent_policy == TrafficPolicyName[POLICY_PRIORITY]) {
-      if (!tc.has_priority) {
+      if (!child.has_priority) {
         return std::unexpected(
-            Invalid("tc", "priority",
-                    "traffic class '" + tc.name + "': a child of priority "
-                    "class '" + tc.parent + "' must specify a priority"));
+            Invalid(child.object, "priority",
+                    child.what + ": a child of priority class '" +
+                        child.parent + "' must specify a priority"));
       }
-      if (tc.priority == static_cast<int64_t>(DEFAULT_PRIORITY)) {
+      if (child.priority == static_cast<int64_t>(DEFAULT_PRIORITY)) {
         return std::unexpected(
-            Invalid("tc", "priority",
-                    "traffic class '" + tc.name + "': priority " +
+            Invalid(child.object, "priority",
+                    child.what + ": priority " +
                         std::to_string(DEFAULT_PRIORITY) + " is reserved"));
       }
-      if (!priority_slots.insert({tc.parent, tc.priority}).second) {
+      if (!priority_slots.insert({child.parent, child.priority}).second) {
         return std::unexpected(Invalid(
-            "tc", "priority",
-            "traffic class '" + tc.name + "': priority " +
-                std::to_string(tc.priority) + " is already taken under '" +
-                tc.parent + "'"));
+            child.object, "priority",
+            child.what + ": priority " + std::to_string(child.priority) +
+                " is already taken under '" + child.parent + "'"));
       }
-      if (tc.has_share) {
+      if (child.has_share) {
         return std::unexpected(Invalid(
-            "tc", "share",
-            "traffic class '" + tc.name +
-                "': a share is only meaningful under a weighted_fair parent"));
+            child.object, "share",
+            child.what +
+                ": a share is only meaningful under a weighted_fair parent"));
       }
     } else if (parent_policy == TrafficPolicyName[POLICY_WEIGHTED_FAIR]) {
-      if (!tc.has_share) {
+      if (!child.has_share) {
         return std::unexpected(
-            Invalid("tc", "share",
-                    "traffic class '" + tc.name + "': a child of "
-                    "weighted_fair class '" + tc.parent +
-                    "' must specify a share"));
+            Invalid(child.object, "share",
+                    child.what + ": a child of weighted_fair class '" +
+                        child.parent + "' must specify a share"));
       }
-      if (tc.share <= 0) {
+      if (child.share <= 0) {
         return std::unexpected(Invalid(
-            "tc", "share",
-            "traffic class '" + tc.name + "': share must be greater than zero"));
+            child.object, "share",
+            child.what + ": share must be greater than zero"));
       }
-      if (tc.has_priority) {
+      if (child.has_priority) {
         return std::unexpected(
-            Invalid("tc", "priority",
-                    "traffic class '" + tc.name + "': a priority is only "
-                    "meaningful under a priority parent"));
+            Invalid(child.object, "priority",
+                    child.what + ": a priority is only meaningful under a "
+                                 "priority parent"));
       }
     } else {
       // round_robin and rate_limit take no attachment parameter.
-      if (tc.has_priority || tc.has_share) {
+      if (child.has_priority || child.has_share) {
         return std::unexpected(Invalid(
-            "tc", "parent",
-            "traffic class '" + tc.name + "': parent '" + tc.parent +
-                "' (" + parent_policy + ") takes no attachment parameter"));
+            child.object, "parent",
+            child.what + ": parent '" + child.parent + "' (" + parent_policy +
+                ") takes no attachment parameter"));
       }
     }
 
-    children_per_parent[tc.parent]++;
+    children_per_parent[child.parent]++;
   }
 
   for (const auto &entry : children_per_parent) {

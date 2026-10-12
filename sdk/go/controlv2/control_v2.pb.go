@@ -33,6 +33,7 @@ const (
 	ObjectType_CONNECTION              ObjectType = 3
 	ObjectType_WORKER                  ObjectType = 4
 	ObjectType_TRAFFIC_CLASS           ObjectType = 5
+	ObjectType_TASK                    ObjectType = 6 // a module task's placement; object "module:task"
 )
 
 // Enum value maps for ObjectType.
@@ -44,6 +45,7 @@ var (
 		3: "CONNECTION",
 		4: "WORKER",
 		5: "TRAFFIC_CLASS",
+		6: "TASK",
 	}
 	ObjectType_value = map[string]int32{
 		"OBJECT_TYPE_UNSPECIFIED": 0,
@@ -52,6 +54,7 @@ var (
 		"CONNECTION":              3,
 		"WORKER":                  4,
 		"TRAFFIC_CLASS":           5,
+		"TASK":                    6,
 	}
 )
 
@@ -261,7 +264,7 @@ func (x ErrorDetail_Code) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ErrorDetail_Code.Descriptor instead.
 func (ErrorDetail_Code) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{19, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{20, 0}
 }
 
 // How the transaction must become visible to packets (M8, D-050). Two
@@ -325,7 +328,7 @@ func (x ApplyTransactionRequest_Consistency) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ApplyTransactionRequest_Consistency.Descriptor instead.
 func (ApplyTransactionRequest_Consistency) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{21, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{22, 0}
 }
 
 // Zero is never sent: an unset status must not read as success.
@@ -378,7 +381,7 @@ func (x TransactionOpResult_Status) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TransactionOpResult_Status.Descriptor instead.
 func (TransactionOpResult_Status) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{22, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{23, 0}
 }
 
 // Zero is never sent: an unset outcome must not read as applied.
@@ -437,7 +440,7 @@ func (x TransactionRecord_Outcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TransactionRecord_Outcome.Descriptor instead.
 func (TransactionRecord_Outcome) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{23, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{24, 0}
 }
 
 // The consistency level the transaction ran under (it describes what
@@ -505,7 +508,7 @@ func (x TransactionRecord_Visibility) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TransactionRecord_Visibility.Descriptor instead.
 func (TransactionRecord_Visibility) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{23, 1}
+	return file_control_v2_proto_rawDescGZIP(), []int{24, 1}
 }
 
 type MetricSample_Kind int32
@@ -554,7 +557,7 @@ func (x MetricSample_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MetricSample_Kind.Descriptor instead.
 func (MetricSample_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{42, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{43, 0}
 }
 
 type SetCaptureRequest_Direction int32
@@ -603,7 +606,7 @@ func (x SetCaptureRequest_Direction) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SetCaptureRequest_Direction.Descriptor instead.
 func (SetCaptureRequest_Direction) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{54, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{55, 0}
 }
 
 type SetCaptureRequest_Format int32
@@ -652,7 +655,7 @@ func (x SetCaptureRequest_Format) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SetCaptureRequest_Format.Descriptor instead.
 func (SetCaptureRequest_Format) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{54, 1}
+	return file_control_v2_proto_rawDescGZIP(), []int{55, 1}
 }
 
 type Port struct {
@@ -944,20 +947,18 @@ func (x *Worker) GetScheduler() string {
 }
 
 type TrafficClass struct {
-	state            protoimpl.MessageState `protogen:"open.v1"`
-	Name             string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Parent           string                 `protobuf:"bytes,2,opt,name=parent,proto3" json:"parent,omitempty"`
-	Policy           string                 `protobuf:"bytes,3,opt,name=policy,proto3" json:"policy,omitempty"`     // "priority", "weighted_fair", "round_robin", "rate_limit", "leaf"
-	Resource         string                 `protobuf:"bytes,4,opt,name=resource,proto3" json:"resource,omitempty"` // "count", "cycle", "packet", "bit"
-	Wid              int32                  `protobuf:"varint,5,opt,name=wid,proto3" json:"wid,omitempty"`          // -1: any
-	Priority         *int64                 `protobuf:"varint,6,opt,name=priority,proto3,oneof" json:"priority,omitempty"`
-	Share            *int64                 `protobuf:"varint,7,opt,name=share,proto3,oneof" json:"share,omitempty"`
-	Limit            map[string]int64       `protobuf:"bytes,8,rep,name=limit,proto3" json:"limit,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
-	MaxBurst         map[string]int64       `protobuf:"bytes,9,rep,name=max_burst,json=maxBurst,proto3" json:"max_burst,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
-	LeafModuleName   string                 `protobuf:"bytes,10,opt,name=leaf_module_name,json=leafModuleName,proto3" json:"leaf_module_name,omitempty"`
-	LeafModuleTaskid uint64                 `protobuf:"varint,11,opt,name=leaf_module_taskid,json=leafModuleTaskid,proto3" json:"leaf_module_taskid,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Parent        string                 `protobuf:"bytes,2,opt,name=parent,proto3" json:"parent,omitempty"`
+	Policy        string                 `protobuf:"bytes,3,opt,name=policy,proto3" json:"policy,omitempty"`     // "priority", "weighted_fair", "round_robin", "rate_limit"
+	Resource      string                 `protobuf:"bytes,4,opt,name=resource,proto3" json:"resource,omitempty"` // "count", "cycle", "packet", "bit"
+	Wid           int32                  `protobuf:"varint,5,opt,name=wid,proto3" json:"wid,omitempty"`          // -1: any
+	Priority      *int64                 `protobuf:"varint,6,opt,name=priority,proto3,oneof" json:"priority,omitempty"`
+	Share         *int64                 `protobuf:"varint,7,opt,name=share,proto3,oneof" json:"share,omitempty"`
+	Limit         map[string]int64       `protobuf:"bytes,8,rep,name=limit,proto3" json:"limit,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	MaxBurst      map[string]int64       `protobuf:"bytes,9,rep,name=max_burst,json=maxBurst,proto3" json:"max_burst,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TrafficClass) Reset() {
@@ -1053,16 +1054,91 @@ func (x *TrafficClass) GetMaxBurst() map[string]int64 {
 	return nil
 }
 
-func (x *TrafficClass) GetLeafModuleName() string {
+// Where a module's task is scheduled: under a traffic class, or at the root
+// of a worker (the legacy attach_task). Exactly one of parent and wid. A task
+// no entry names stays where it is; a new one goes to any worker, as the
+// legacy API puts it. GetPipeline lists every task that is placed (attached,
+// or waiting for a resume to attach to a given worker).
+type TaskPlacement struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Module        string                 `protobuf:"bytes,1,opt,name=module,proto3" json:"module,omitempty"`
+	Task          uint32                 `protobuf:"varint,2,opt,name=task,proto3" json:"task,omitempty"`    // the module's task index; 0 for a single-task module
+	Parent        string                 `protobuf:"bytes,3,opt,name=parent,proto3" json:"parent,omitempty"` // a traffic class of this pipeline
+	Wid           *int32                 `protobuf:"varint,4,opt,name=wid,proto3,oneof" json:"wid,omitempty"`
+	Priority      *int64                 `protobuf:"varint,5,opt,name=priority,proto3,oneof" json:"priority,omitempty"` // required under a priority parent
+	Share         *int64                 `protobuf:"varint,6,opt,name=share,proto3,oneof" json:"share,omitempty"`       // required under a weighted_fair parent
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TaskPlacement) Reset() {
+	*x = TaskPlacement{}
+	mi := &file_control_v2_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TaskPlacement) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TaskPlacement) ProtoMessage() {}
+
+func (x *TaskPlacement) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v2_proto_msgTypes[5]
 	if x != nil {
-		return x.LeafModuleName
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TaskPlacement.ProtoReflect.Descriptor instead.
+func (*TaskPlacement) Descriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *TaskPlacement) GetModule() string {
+	if x != nil {
+		return x.Module
 	}
 	return ""
 }
 
-func (x *TrafficClass) GetLeafModuleTaskid() uint64 {
+func (x *TaskPlacement) GetTask() uint32 {
 	if x != nil {
-		return x.LeafModuleTaskid
+		return x.Task
+	}
+	return 0
+}
+
+func (x *TaskPlacement) GetParent() string {
+	if x != nil {
+		return x.Parent
+	}
+	return ""
+}
+
+func (x *TaskPlacement) GetWid() int32 {
+	if x != nil && x.Wid != nil {
+		return *x.Wid
+	}
+	return 0
+}
+
+func (x *TaskPlacement) GetPriority() int64 {
+	if x != nil && x.Priority != nil {
+		return *x.Priority
+	}
+	return 0
+}
+
+func (x *TaskPlacement) GetShare() int64 {
+	if x != nil && x.Share != nil {
+		return *x.Share
 	}
 	return 0
 }
@@ -1074,13 +1150,14 @@ type Pipeline struct {
 	Connections    []*Connection          `protobuf:"bytes,3,rep,name=connections,proto3" json:"connections,omitempty"`
 	Workers        []*Worker              `protobuf:"bytes,4,rep,name=workers,proto3" json:"workers,omitempty"`
 	TrafficClasses []*TrafficClass        `protobuf:"bytes,5,rep,name=traffic_classes,json=trafficClasses,proto3" json:"traffic_classes,omitempty"`
+	Tasks          []*TaskPlacement       `protobuf:"bytes,6,rep,name=tasks,proto3" json:"tasks,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Pipeline) Reset() {
 	*x = Pipeline{}
-	mi := &file_control_v2_proto_msgTypes[5]
+	mi := &file_control_v2_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1092,7 +1169,7 @@ func (x *Pipeline) String() string {
 func (*Pipeline) ProtoMessage() {}
 
 func (x *Pipeline) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[5]
+	mi := &file_control_v2_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1105,7 +1182,7 @@ func (x *Pipeline) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Pipeline.ProtoReflect.Descriptor instead.
 func (*Pipeline) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{5}
+	return file_control_v2_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Pipeline) GetPorts() []*Port {
@@ -1143,6 +1220,13 @@ func (x *Pipeline) GetTrafficClasses() []*TrafficClass {
 	return nil
 }
 
+func (x *Pipeline) GetTasks() []*TaskPlacement {
+	if x != nil {
+		return x.Tasks
+	}
+	return nil
+}
+
 type Change struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Type  ObjectType             `protobuf:"varint,1,opt,name=type,proto3,enum=bess.pb.v2.ObjectType" json:"type,omitempty"`
@@ -1156,7 +1240,7 @@ type Change struct {
 
 func (x *Change) Reset() {
 	*x = Change{}
-	mi := &file_control_v2_proto_msgTypes[6]
+	mi := &file_control_v2_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1168,7 +1252,7 @@ func (x *Change) String() string {
 func (*Change) ProtoMessage() {}
 
 func (x *Change) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[6]
+	mi := &file_control_v2_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1181,7 +1265,7 @@ func (x *Change) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Change.ProtoReflect.Descriptor instead.
 func (*Change) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{6}
+	return file_control_v2_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *Change) GetType() ObjectType {
@@ -1214,7 +1298,7 @@ type PipelineDiff struct {
 
 func (x *PipelineDiff) Reset() {
 	*x = PipelineDiff{}
-	mi := &file_control_v2_proto_msgTypes[7]
+	mi := &file_control_v2_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1226,7 +1310,7 @@ func (x *PipelineDiff) String() string {
 func (*PipelineDiff) ProtoMessage() {}
 
 func (x *PipelineDiff) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[7]
+	mi := &file_control_v2_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1239,7 +1323,7 @@ func (x *PipelineDiff) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PipelineDiff.ProtoReflect.Descriptor instead.
 func (*PipelineDiff) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{7}
+	return file_control_v2_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *PipelineDiff) GetChanges() []*Change {
@@ -1261,7 +1345,7 @@ type PlanStep struct {
 
 func (x *PlanStep) Reset() {
 	*x = PlanStep{}
-	mi := &file_control_v2_proto_msgTypes[8]
+	mi := &file_control_v2_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1273,7 +1357,7 @@ func (x *PlanStep) String() string {
 func (*PlanStep) ProtoMessage() {}
 
 func (x *PlanStep) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[8]
+	mi := &file_control_v2_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1286,7 +1370,7 @@ func (x *PlanStep) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanStep.ProtoReflect.Descriptor instead.
 func (*PlanStep) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{8}
+	return file_control_v2_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *PlanStep) GetPhase() PlanPhase {
@@ -1325,7 +1409,7 @@ type GetPipelineRequest struct {
 
 func (x *GetPipelineRequest) Reset() {
 	*x = GetPipelineRequest{}
-	mi := &file_control_v2_proto_msgTypes[9]
+	mi := &file_control_v2_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1337,7 +1421,7 @@ func (x *GetPipelineRequest) String() string {
 func (*GetPipelineRequest) ProtoMessage() {}
 
 func (x *GetPipelineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[9]
+	mi := &file_control_v2_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1350,7 +1434,7 @@ func (x *GetPipelineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPipelineRequest.ProtoReflect.Descriptor instead.
 func (*GetPipelineRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{9}
+	return file_control_v2_proto_rawDescGZIP(), []int{10}
 }
 
 type GetPipelineResponse struct {
@@ -1364,7 +1448,7 @@ type GetPipelineResponse struct {
 
 func (x *GetPipelineResponse) Reset() {
 	*x = GetPipelineResponse{}
-	mi := &file_control_v2_proto_msgTypes[10]
+	mi := &file_control_v2_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1376,7 +1460,7 @@ func (x *GetPipelineResponse) String() string {
 func (*GetPipelineResponse) ProtoMessage() {}
 
 func (x *GetPipelineResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[10]
+	mi := &file_control_v2_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1389,7 +1473,7 @@ func (x *GetPipelineResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPipelineResponse.ProtoReflect.Descriptor instead.
 func (*GetPipelineResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{10}
+	return file_control_v2_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *GetPipelineResponse) GetPipeline() *Pipeline {
@@ -1422,7 +1506,7 @@ type ValidatePipelineRequest struct {
 
 func (x *ValidatePipelineRequest) Reset() {
 	*x = ValidatePipelineRequest{}
-	mi := &file_control_v2_proto_msgTypes[11]
+	mi := &file_control_v2_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1434,7 +1518,7 @@ func (x *ValidatePipelineRequest) String() string {
 func (*ValidatePipelineRequest) ProtoMessage() {}
 
 func (x *ValidatePipelineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[11]
+	mi := &file_control_v2_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1447,7 +1531,7 @@ func (x *ValidatePipelineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ValidatePipelineRequest.ProtoReflect.Descriptor instead.
 func (*ValidatePipelineRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{11}
+	return file_control_v2_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ValidatePipelineRequest) GetPipeline() *Pipeline {
@@ -1466,7 +1550,7 @@ type ValidatePipelineResponse struct {
 
 func (x *ValidatePipelineResponse) Reset() {
 	*x = ValidatePipelineResponse{}
-	mi := &file_control_v2_proto_msgTypes[12]
+	mi := &file_control_v2_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1478,7 +1562,7 @@ func (x *ValidatePipelineResponse) String() string {
 func (*ValidatePipelineResponse) ProtoMessage() {}
 
 func (x *ValidatePipelineResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[12]
+	mi := &file_control_v2_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1491,7 +1575,7 @@ func (x *ValidatePipelineResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ValidatePipelineResponse.ProtoReflect.Descriptor instead.
 func (*ValidatePipelineResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{12}
+	return file_control_v2_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ValidatePipelineResponse) GetNormalized() *Pipeline {
@@ -1510,7 +1594,7 @@ type DiffPipelineRequest struct {
 
 func (x *DiffPipelineRequest) Reset() {
 	*x = DiffPipelineRequest{}
-	mi := &file_control_v2_proto_msgTypes[13]
+	mi := &file_control_v2_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1522,7 +1606,7 @@ func (x *DiffPipelineRequest) String() string {
 func (*DiffPipelineRequest) ProtoMessage() {}
 
 func (x *DiffPipelineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[13]
+	mi := &file_control_v2_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1535,7 +1619,7 @@ func (x *DiffPipelineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffPipelineRequest.ProtoReflect.Descriptor instead.
 func (*DiffPipelineRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{13}
+	return file_control_v2_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *DiffPipelineRequest) GetPipeline() *Pipeline {
@@ -1556,7 +1640,7 @@ type DiffPipelineResponse struct {
 
 func (x *DiffPipelineResponse) Reset() {
 	*x = DiffPipelineResponse{}
-	mi := &file_control_v2_proto_msgTypes[14]
+	mi := &file_control_v2_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1568,7 +1652,7 @@ func (x *DiffPipelineResponse) String() string {
 func (*DiffPipelineResponse) ProtoMessage() {}
 
 func (x *DiffPipelineResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[14]
+	mi := &file_control_v2_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1581,7 +1665,7 @@ func (x *DiffPipelineResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffPipelineResponse.ProtoReflect.Descriptor instead.
 func (*DiffPipelineResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{14}
+	return file_control_v2_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *DiffPipelineResponse) GetDiff() *PipelineDiff {
@@ -1614,7 +1698,7 @@ type PlanPipelineRequest struct {
 
 func (x *PlanPipelineRequest) Reset() {
 	*x = PlanPipelineRequest{}
-	mi := &file_control_v2_proto_msgTypes[15]
+	mi := &file_control_v2_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1626,7 +1710,7 @@ func (x *PlanPipelineRequest) String() string {
 func (*PlanPipelineRequest) ProtoMessage() {}
 
 func (x *PlanPipelineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[15]
+	mi := &file_control_v2_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1639,7 +1723,7 @@ func (x *PlanPipelineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanPipelineRequest.ProtoReflect.Descriptor instead.
 func (*PlanPipelineRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{15}
+	return file_control_v2_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *PlanPipelineRequest) GetPipeline() *Pipeline {
@@ -1660,7 +1744,7 @@ type PlanPipelineResponse struct {
 
 func (x *PlanPipelineResponse) Reset() {
 	*x = PlanPipelineResponse{}
-	mi := &file_control_v2_proto_msgTypes[16]
+	mi := &file_control_v2_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1672,7 +1756,7 @@ func (x *PlanPipelineResponse) String() string {
 func (*PlanPipelineResponse) ProtoMessage() {}
 
 func (x *PlanPipelineResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[16]
+	mi := &file_control_v2_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1685,7 +1769,7 @@ func (x *PlanPipelineResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanPipelineResponse.ProtoReflect.Descriptor instead.
 func (*PlanPipelineResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{16}
+	return file_control_v2_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *PlanPipelineResponse) GetSteps() []*PlanStep {
@@ -1726,7 +1810,7 @@ type ApplyPipelineRequest struct {
 
 func (x *ApplyPipelineRequest) Reset() {
 	*x = ApplyPipelineRequest{}
-	mi := &file_control_v2_proto_msgTypes[17]
+	mi := &file_control_v2_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1738,7 +1822,7 @@ func (x *ApplyPipelineRequest) String() string {
 func (*ApplyPipelineRequest) ProtoMessage() {}
 
 func (x *ApplyPipelineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[17]
+	mi := &file_control_v2_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1751,7 +1835,7 @@ func (x *ApplyPipelineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyPipelineRequest.ProtoReflect.Descriptor instead.
 func (*ApplyPipelineRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{17}
+	return file_control_v2_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ApplyPipelineRequest) GetPipeline() *Pipeline {
@@ -1791,7 +1875,7 @@ type ApplyPipelineResponse struct {
 
 func (x *ApplyPipelineResponse) Reset() {
 	*x = ApplyPipelineResponse{}
-	mi := &file_control_v2_proto_msgTypes[18]
+	mi := &file_control_v2_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1803,7 +1887,7 @@ func (x *ApplyPipelineResponse) String() string {
 func (*ApplyPipelineResponse) ProtoMessage() {}
 
 func (x *ApplyPipelineResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[18]
+	mi := &file_control_v2_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1816,7 +1900,7 @@ func (x *ApplyPipelineResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyPipelineResponse.ProtoReflect.Descriptor instead.
 func (*ApplyPipelineResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{18}
+	return file_control_v2_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ApplyPipelineResponse) GetGeneration() uint64 {
@@ -1890,7 +1974,7 @@ type ErrorDetail struct {
 
 func (x *ErrorDetail) Reset() {
 	*x = ErrorDetail{}
-	mi := &file_control_v2_proto_msgTypes[19]
+	mi := &file_control_v2_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1902,7 +1986,7 @@ func (x *ErrorDetail) String() string {
 func (*ErrorDetail) ProtoMessage() {}
 
 func (x *ErrorDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[19]
+	mi := &file_control_v2_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1915,7 +1999,7 @@ func (x *ErrorDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ErrorDetail.ProtoReflect.Descriptor instead.
 func (*ErrorDetail) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{19}
+	return file_control_v2_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *ErrorDetail) GetCode() ErrorDetail_Code {
@@ -1972,7 +2056,7 @@ type TransactionOp struct {
 
 func (x *TransactionOp) Reset() {
 	*x = TransactionOp{}
-	mi := &file_control_v2_proto_msgTypes[20]
+	mi := &file_control_v2_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1984,7 +2068,7 @@ func (x *TransactionOp) String() string {
 func (*TransactionOp) ProtoMessage() {}
 
 func (x *TransactionOp) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[20]
+	mi := &file_control_v2_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1997,7 +2081,7 @@ func (x *TransactionOp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionOp.ProtoReflect.Descriptor instead.
 func (*TransactionOp) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{20}
+	return file_control_v2_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *TransactionOp) GetResource() string {
@@ -2054,7 +2138,7 @@ type ApplyTransactionRequest struct {
 
 func (x *ApplyTransactionRequest) Reset() {
 	*x = ApplyTransactionRequest{}
-	mi := &file_control_v2_proto_msgTypes[21]
+	mi := &file_control_v2_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2066,7 +2150,7 @@ func (x *ApplyTransactionRequest) String() string {
 func (*ApplyTransactionRequest) ProtoMessage() {}
 
 func (x *ApplyTransactionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[21]
+	mi := &file_control_v2_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2079,7 +2163,7 @@ func (x *ApplyTransactionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyTransactionRequest.ProtoReflect.Descriptor instead.
 func (*ApplyTransactionRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{21}
+	return file_control_v2_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ApplyTransactionRequest) GetRequestId() string {
@@ -2127,7 +2211,7 @@ type TransactionOpResult struct {
 
 func (x *TransactionOpResult) Reset() {
 	*x = TransactionOpResult{}
-	mi := &file_control_v2_proto_msgTypes[22]
+	mi := &file_control_v2_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2139,7 +2223,7 @@ func (x *TransactionOpResult) String() string {
 func (*TransactionOpResult) ProtoMessage() {}
 
 func (x *TransactionOpResult) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[22]
+	mi := &file_control_v2_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2152,7 +2236,7 @@ func (x *TransactionOpResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionOpResult.ProtoReflect.Descriptor instead.
 func (*TransactionOpResult) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{22}
+	return file_control_v2_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *TransactionOpResult) GetStatus() TransactionOpResult_Status {
@@ -2182,7 +2266,7 @@ type TransactionRecord struct {
 
 func (x *TransactionRecord) Reset() {
 	*x = TransactionRecord{}
-	mi := &file_control_v2_proto_msgTypes[23]
+	mi := &file_control_v2_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2194,7 +2278,7 @@ func (x *TransactionRecord) String() string {
 func (*TransactionRecord) ProtoMessage() {}
 
 func (x *TransactionRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[23]
+	mi := &file_control_v2_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2207,7 +2291,7 @@ func (x *TransactionRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionRecord.ProtoReflect.Descriptor instead.
 func (*TransactionRecord) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{23}
+	return file_control_v2_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *TransactionRecord) GetRequestId() string {
@@ -2258,7 +2342,7 @@ type ApplyTransactionResponse struct {
 
 func (x *ApplyTransactionResponse) Reset() {
 	*x = ApplyTransactionResponse{}
-	mi := &file_control_v2_proto_msgTypes[24]
+	mi := &file_control_v2_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2270,7 +2354,7 @@ func (x *ApplyTransactionResponse) String() string {
 func (*ApplyTransactionResponse) ProtoMessage() {}
 
 func (x *ApplyTransactionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[24]
+	mi := &file_control_v2_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2283,7 +2367,7 @@ func (x *ApplyTransactionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyTransactionResponse.ProtoReflect.Descriptor instead.
 func (*ApplyTransactionResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{24}
+	return file_control_v2_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *ApplyTransactionResponse) GetRecord() *TransactionRecord {
@@ -2316,7 +2400,7 @@ type GetTransactionRequest struct {
 
 func (x *GetTransactionRequest) Reset() {
 	*x = GetTransactionRequest{}
-	mi := &file_control_v2_proto_msgTypes[25]
+	mi := &file_control_v2_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2328,7 +2412,7 @@ func (x *GetTransactionRequest) String() string {
 func (*GetTransactionRequest) ProtoMessage() {}
 
 func (x *GetTransactionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[25]
+	mi := &file_control_v2_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2341,7 +2425,7 @@ func (x *GetTransactionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetTransactionRequest.ProtoReflect.Descriptor instead.
 func (*GetTransactionRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{25}
+	return file_control_v2_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *GetTransactionRequest) GetRequestId() string {
@@ -2362,7 +2446,7 @@ type GetTransactionResponse struct {
 
 func (x *GetTransactionResponse) Reset() {
 	*x = GetTransactionResponse{}
-	mi := &file_control_v2_proto_msgTypes[26]
+	mi := &file_control_v2_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2374,7 +2458,7 @@ func (x *GetTransactionResponse) String() string {
 func (*GetTransactionResponse) ProtoMessage() {}
 
 func (x *GetTransactionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[26]
+	mi := &file_control_v2_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2387,7 +2471,7 @@ func (x *GetTransactionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetTransactionResponse.ProtoReflect.Descriptor instead.
 func (*GetTransactionResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{26}
+	return file_control_v2_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *GetTransactionResponse) GetKnown() bool {
@@ -2419,7 +2503,7 @@ type ListTransactionResourcesRequest struct {
 
 func (x *ListTransactionResourcesRequest) Reset() {
 	*x = ListTransactionResourcesRequest{}
-	mi := &file_control_v2_proto_msgTypes[27]
+	mi := &file_control_v2_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2431,7 +2515,7 @@ func (x *ListTransactionResourcesRequest) String() string {
 func (*ListTransactionResourcesRequest) ProtoMessage() {}
 
 func (x *ListTransactionResourcesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[27]
+	mi := &file_control_v2_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2444,7 +2528,7 @@ func (x *ListTransactionResourcesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTransactionResourcesRequest.ProtoReflect.Descriptor instead.
 func (*ListTransactionResourcesRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{27}
+	return file_control_v2_proto_rawDescGZIP(), []int{28}
 }
 
 type TransactionResource struct {
@@ -2458,7 +2542,7 @@ type TransactionResource struct {
 
 func (x *TransactionResource) Reset() {
 	*x = TransactionResource{}
-	mi := &file_control_v2_proto_msgTypes[28]
+	mi := &file_control_v2_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2470,7 +2554,7 @@ func (x *TransactionResource) String() string {
 func (*TransactionResource) ProtoMessage() {}
 
 func (x *TransactionResource) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[28]
+	mi := &file_control_v2_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2483,7 +2567,7 @@ func (x *TransactionResource) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionResource.ProtoReflect.Descriptor instead.
 func (*TransactionResource) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{28}
+	return file_control_v2_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *TransactionResource) GetName() string {
@@ -2518,7 +2602,7 @@ type ListTransactionResourcesResponse struct {
 
 func (x *ListTransactionResourcesResponse) Reset() {
 	*x = ListTransactionResourcesResponse{}
-	mi := &file_control_v2_proto_msgTypes[29]
+	mi := &file_control_v2_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2530,7 +2614,7 @@ func (x *ListTransactionResourcesResponse) String() string {
 func (*ListTransactionResourcesResponse) ProtoMessage() {}
 
 func (x *ListTransactionResourcesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[29]
+	mi := &file_control_v2_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2543,7 +2627,7 @@ func (x *ListTransactionResourcesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTransactionResourcesResponse.ProtoReflect.Descriptor instead.
 func (*ListTransactionResourcesResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{29}
+	return file_control_v2_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *ListTransactionResourcesResponse) GetResources() []*TransactionResource {
@@ -2575,7 +2659,7 @@ type GetCapabilitiesRequest struct {
 
 func (x *GetCapabilitiesRequest) Reset() {
 	*x = GetCapabilitiesRequest{}
-	mi := &file_control_v2_proto_msgTypes[30]
+	mi := &file_control_v2_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2587,7 +2671,7 @@ func (x *GetCapabilitiesRequest) String() string {
 func (*GetCapabilitiesRequest) ProtoMessage() {}
 
 func (x *GetCapabilitiesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[30]
+	mi := &file_control_v2_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2600,7 +2684,7 @@ func (x *GetCapabilitiesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCapabilitiesRequest.ProtoReflect.Descriptor instead.
 func (*GetCapabilitiesRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{30}
+	return file_control_v2_proto_rawDescGZIP(), []int{31}
 }
 
 type PluginInfo struct {
@@ -2615,7 +2699,7 @@ type PluginInfo struct {
 
 func (x *PluginInfo) Reset() {
 	*x = PluginInfo{}
-	mi := &file_control_v2_proto_msgTypes[31]
+	mi := &file_control_v2_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2627,7 +2711,7 @@ func (x *PluginInfo) String() string {
 func (*PluginInfo) ProtoMessage() {}
 
 func (x *PluginInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[31]
+	mi := &file_control_v2_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2640,7 +2724,7 @@ func (x *PluginInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PluginInfo.ProtoReflect.Descriptor instead.
 func (*PluginInfo) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{31}
+	return file_control_v2_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *PluginInfo) GetName() string {
@@ -2695,7 +2779,7 @@ type PortInfo struct {
 
 func (x *PortInfo) Reset() {
 	*x = PortInfo{}
-	mi := &file_control_v2_proto_msgTypes[32]
+	mi := &file_control_v2_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2707,7 +2791,7 @@ func (x *PortInfo) String() string {
 func (*PortInfo) ProtoMessage() {}
 
 func (x *PortInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[32]
+	mi := &file_control_v2_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2720,7 +2804,7 @@ func (x *PortInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PortInfo.ProtoReflect.Descriptor instead.
 func (*PortInfo) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{32}
+	return file_control_v2_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *PortInfo) GetName() string {
@@ -2824,7 +2908,7 @@ type GetCapabilitiesResponse struct {
 
 func (x *GetCapabilitiesResponse) Reset() {
 	*x = GetCapabilitiesResponse{}
-	mi := &file_control_v2_proto_msgTypes[33]
+	mi := &file_control_v2_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2836,7 +2920,7 @@ func (x *GetCapabilitiesResponse) String() string {
 func (*GetCapabilitiesResponse) ProtoMessage() {}
 
 func (x *GetCapabilitiesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[33]
+	mi := &file_control_v2_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2849,7 +2933,7 @@ func (x *GetCapabilitiesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCapabilitiesResponse.ProtoReflect.Descriptor instead.
 func (*GetCapabilitiesResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{33}
+	return file_control_v2_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *GetCapabilitiesResponse) GetDaemonVersion() string {
@@ -2923,7 +3007,7 @@ type GetSchemaRequest struct {
 
 func (x *GetSchemaRequest) Reset() {
 	*x = GetSchemaRequest{}
-	mi := &file_control_v2_proto_msgTypes[34]
+	mi := &file_control_v2_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2935,7 +3019,7 @@ func (x *GetSchemaRequest) String() string {
 func (*GetSchemaRequest) ProtoMessage() {}
 
 func (x *GetSchemaRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[34]
+	mi := &file_control_v2_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2948,7 +3032,7 @@ func (x *GetSchemaRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSchemaRequest.ProtoReflect.Descriptor instead.
 func (*GetSchemaRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{34}
+	return file_control_v2_proto_rawDescGZIP(), []int{35}
 }
 
 type CommandSchema struct {
@@ -2962,7 +3046,7 @@ type CommandSchema struct {
 
 func (x *CommandSchema) Reset() {
 	*x = CommandSchema{}
-	mi := &file_control_v2_proto_msgTypes[35]
+	mi := &file_control_v2_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2974,7 +3058,7 @@ func (x *CommandSchema) String() string {
 func (*CommandSchema) ProtoMessage() {}
 
 func (x *CommandSchema) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[35]
+	mi := &file_control_v2_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2987,7 +3071,7 @@ func (x *CommandSchema) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandSchema.ProtoReflect.Descriptor instead.
 func (*CommandSchema) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{35}
+	return file_control_v2_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *CommandSchema) GetName() string {
@@ -3025,7 +3109,7 @@ type ModuleClassSchema struct {
 
 func (x *ModuleClassSchema) Reset() {
 	*x = ModuleClassSchema{}
-	mi := &file_control_v2_proto_msgTypes[36]
+	mi := &file_control_v2_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3037,7 +3121,7 @@ func (x *ModuleClassSchema) String() string {
 func (*ModuleClassSchema) ProtoMessage() {}
 
 func (x *ModuleClassSchema) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[36]
+	mi := &file_control_v2_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3050,7 +3134,7 @@ func (x *ModuleClassSchema) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModuleClassSchema.ProtoReflect.Descriptor instead.
 func (*ModuleClassSchema) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{36}
+	return file_control_v2_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *ModuleClassSchema) GetName() string {
@@ -3106,7 +3190,7 @@ type PortDriverSchema struct {
 
 func (x *PortDriverSchema) Reset() {
 	*x = PortDriverSchema{}
-	mi := &file_control_v2_proto_msgTypes[37]
+	mi := &file_control_v2_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3118,7 +3202,7 @@ func (x *PortDriverSchema) String() string {
 func (*PortDriverSchema) ProtoMessage() {}
 
 func (x *PortDriverSchema) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[37]
+	mi := &file_control_v2_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3131,7 +3215,7 @@ func (x *PortDriverSchema) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PortDriverSchema.ProtoReflect.Descriptor instead.
 func (*PortDriverSchema) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{37}
+	return file_control_v2_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *PortDriverSchema) GetName() string {
@@ -3170,7 +3254,7 @@ type GetSchemaResponse struct {
 
 func (x *GetSchemaResponse) Reset() {
 	*x = GetSchemaResponse{}
-	mi := &file_control_v2_proto_msgTypes[38]
+	mi := &file_control_v2_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3182,7 +3266,7 @@ func (x *GetSchemaResponse) String() string {
 func (*GetSchemaResponse) ProtoMessage() {}
 
 func (x *GetSchemaResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[38]
+	mi := &file_control_v2_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3195,7 +3279,7 @@ func (x *GetSchemaResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSchemaResponse.ProtoReflect.Descriptor instead.
 func (*GetSchemaResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{38}
+	return file_control_v2_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *GetSchemaResponse) GetModuleClasses() []*ModuleClassSchema {
@@ -3240,7 +3324,7 @@ type WatchEventsRequest struct {
 
 func (x *WatchEventsRequest) Reset() {
 	*x = WatchEventsRequest{}
-	mi := &file_control_v2_proto_msgTypes[39]
+	mi := &file_control_v2_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3252,7 +3336,7 @@ func (x *WatchEventsRequest) String() string {
 func (*WatchEventsRequest) ProtoMessage() {}
 
 func (x *WatchEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[39]
+	mi := &file_control_v2_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3265,7 +3349,7 @@ func (x *WatchEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WatchEventsRequest.ProtoReflect.Descriptor instead.
 func (*WatchEventsRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{39}
+	return file_control_v2_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *WatchEventsRequest) GetFromSequence() uint64 {
@@ -3307,7 +3391,7 @@ type Event struct {
 
 func (x *Event) Reset() {
 	*x = Event{}
-	mi := &file_control_v2_proto_msgTypes[40]
+	mi := &file_control_v2_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3319,7 +3403,7 @@ func (x *Event) String() string {
 func (*Event) ProtoMessage() {}
 
 func (x *Event) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[40]
+	mi := &file_control_v2_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3332,7 +3416,7 @@ func (x *Event) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Event.ProtoReflect.Descriptor instead.
 func (*Event) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{40}
+	return file_control_v2_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *Event) GetSequence() uint64 {
@@ -3406,7 +3490,7 @@ type ListMetricsRequest struct {
 
 func (x *ListMetricsRequest) Reset() {
 	*x = ListMetricsRequest{}
-	mi := &file_control_v2_proto_msgTypes[41]
+	mi := &file_control_v2_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3418,7 +3502,7 @@ func (x *ListMetricsRequest) String() string {
 func (*ListMetricsRequest) ProtoMessage() {}
 
 func (x *ListMetricsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[41]
+	mi := &file_control_v2_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3431,7 +3515,7 @@ func (x *ListMetricsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListMetricsRequest.ProtoReflect.Descriptor instead.
 func (*ListMetricsRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{41}
+	return file_control_v2_proto_rawDescGZIP(), []int{42}
 }
 
 type MetricSample struct {
@@ -3447,7 +3531,7 @@ type MetricSample struct {
 
 func (x *MetricSample) Reset() {
 	*x = MetricSample{}
-	mi := &file_control_v2_proto_msgTypes[42]
+	mi := &file_control_v2_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3459,7 +3543,7 @@ func (x *MetricSample) String() string {
 func (*MetricSample) ProtoMessage() {}
 
 func (x *MetricSample) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[42]
+	mi := &file_control_v2_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3472,7 +3556,7 @@ func (x *MetricSample) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetricSample.ProtoReflect.Descriptor instead.
 func (*MetricSample) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{42}
+	return file_control_v2_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *MetricSample) GetName() string {
@@ -3520,7 +3604,7 @@ type ListMetricsResponse struct {
 
 func (x *ListMetricsResponse) Reset() {
 	*x = ListMetricsResponse{}
-	mi := &file_control_v2_proto_msgTypes[43]
+	mi := &file_control_v2_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3532,7 +3616,7 @@ func (x *ListMetricsResponse) String() string {
 func (*ListMetricsResponse) ProtoMessage() {}
 
 func (x *ListMetricsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[43]
+	mi := &file_control_v2_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3545,7 +3629,7 @@ func (x *ListMetricsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListMetricsResponse.ProtoReflect.Descriptor instead.
 func (*ListMetricsResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{43}
+	return file_control_v2_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *ListMetricsResponse) GetSamples() []*MetricSample {
@@ -3572,7 +3656,7 @@ type ImportPluginRequest struct {
 
 func (x *ImportPluginRequest) Reset() {
 	*x = ImportPluginRequest{}
-	mi := &file_control_v2_proto_msgTypes[44]
+	mi := &file_control_v2_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3584,7 +3668,7 @@ func (x *ImportPluginRequest) String() string {
 func (*ImportPluginRequest) ProtoMessage() {}
 
 func (x *ImportPluginRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[44]
+	mi := &file_control_v2_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3597,7 +3681,7 @@ func (x *ImportPluginRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportPluginRequest.ProtoReflect.Descriptor instead.
 func (*ImportPluginRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{44}
+	return file_control_v2_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *ImportPluginRequest) GetPath() string {
@@ -3623,7 +3707,7 @@ type ImportPluginResponse struct {
 
 func (x *ImportPluginResponse) Reset() {
 	*x = ImportPluginResponse{}
-	mi := &file_control_v2_proto_msgTypes[45]
+	mi := &file_control_v2_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3635,7 +3719,7 @@ func (x *ImportPluginResponse) String() string {
 func (*ImportPluginResponse) ProtoMessage() {}
 
 func (x *ImportPluginResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[45]
+	mi := &file_control_v2_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3648,7 +3732,7 @@ func (x *ImportPluginResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportPluginResponse.ProtoReflect.Descriptor instead.
 func (*ImportPluginResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{45}
+	return file_control_v2_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *ImportPluginResponse) GetDaemonEpoch() uint64 {
@@ -3668,7 +3752,7 @@ type UnloadPluginRequest struct {
 
 func (x *UnloadPluginRequest) Reset() {
 	*x = UnloadPluginRequest{}
-	mi := &file_control_v2_proto_msgTypes[46]
+	mi := &file_control_v2_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3680,7 +3764,7 @@ func (x *UnloadPluginRequest) String() string {
 func (*UnloadPluginRequest) ProtoMessage() {}
 
 func (x *UnloadPluginRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[46]
+	mi := &file_control_v2_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3693,7 +3777,7 @@ func (x *UnloadPluginRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnloadPluginRequest.ProtoReflect.Descriptor instead.
 func (*UnloadPluginRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{46}
+	return file_control_v2_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *UnloadPluginRequest) GetPath() string {
@@ -3719,7 +3803,7 @@ type UnloadPluginResponse struct {
 
 func (x *UnloadPluginResponse) Reset() {
 	*x = UnloadPluginResponse{}
-	mi := &file_control_v2_proto_msgTypes[47]
+	mi := &file_control_v2_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3731,7 +3815,7 @@ func (x *UnloadPluginResponse) String() string {
 func (*UnloadPluginResponse) ProtoMessage() {}
 
 func (x *UnloadPluginResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[47]
+	mi := &file_control_v2_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3744,7 +3828,7 @@ func (x *UnloadPluginResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnloadPluginResponse.ProtoReflect.Descriptor instead.
 func (*UnloadPluginResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{47}
+	return file_control_v2_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *UnloadPluginResponse) GetDaemonEpoch() uint64 {
@@ -3763,7 +3847,7 @@ type GetPortStatusRequest struct {
 
 func (x *GetPortStatusRequest) Reset() {
 	*x = GetPortStatusRequest{}
-	mi := &file_control_v2_proto_msgTypes[48]
+	mi := &file_control_v2_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3775,7 +3859,7 @@ func (x *GetPortStatusRequest) String() string {
 func (*GetPortStatusRequest) ProtoMessage() {}
 
 func (x *GetPortStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[48]
+	mi := &file_control_v2_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3788,7 +3872,7 @@ func (x *GetPortStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPortStatusRequest.ProtoReflect.Descriptor instead.
 func (*GetPortStatusRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{48}
+	return file_control_v2_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *GetPortStatusRequest) GetNames() []string {
@@ -3811,7 +3895,7 @@ type PortStatus struct {
 
 func (x *PortStatus) Reset() {
 	*x = PortStatus{}
-	mi := &file_control_v2_proto_msgTypes[49]
+	mi := &file_control_v2_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3823,7 +3907,7 @@ func (x *PortStatus) String() string {
 func (*PortStatus) ProtoMessage() {}
 
 func (x *PortStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[49]
+	mi := &file_control_v2_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3836,7 +3920,7 @@ func (x *PortStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PortStatus.ProtoReflect.Descriptor instead.
 func (*PortStatus) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{49}
+	return file_control_v2_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *PortStatus) GetName() string {
@@ -3884,7 +3968,7 @@ type GetPortStatusResponse struct {
 
 func (x *GetPortStatusResponse) Reset() {
 	*x = GetPortStatusResponse{}
-	mi := &file_control_v2_proto_msgTypes[50]
+	mi := &file_control_v2_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3896,7 +3980,7 @@ func (x *GetPortStatusResponse) String() string {
 func (*GetPortStatusResponse) ProtoMessage() {}
 
 func (x *GetPortStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[50]
+	mi := &file_control_v2_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3909,7 +3993,7 @@ func (x *GetPortStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPortStatusResponse.ProtoReflect.Descriptor instead.
 func (*GetPortStatusResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{50}
+	return file_control_v2_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *GetPortStatusResponse) GetPorts() []*PortStatus {
@@ -3934,7 +4018,7 @@ type GetPacketPoolsRequest struct {
 
 func (x *GetPacketPoolsRequest) Reset() {
 	*x = GetPacketPoolsRequest{}
-	mi := &file_control_v2_proto_msgTypes[51]
+	mi := &file_control_v2_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3946,7 +4030,7 @@ func (x *GetPacketPoolsRequest) String() string {
 func (*GetPacketPoolsRequest) ProtoMessage() {}
 
 func (x *GetPacketPoolsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[51]
+	mi := &file_control_v2_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3959,7 +4043,7 @@ func (x *GetPacketPoolsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPacketPoolsRequest.ProtoReflect.Descriptor instead.
 func (*GetPacketPoolsRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{51}
+	return file_control_v2_proto_rawDescGZIP(), []int{52}
 }
 
 // One NUMA socket's default packet pool.
@@ -3978,7 +4062,7 @@ type PacketPool struct {
 
 func (x *PacketPool) Reset() {
 	*x = PacketPool{}
-	mi := &file_control_v2_proto_msgTypes[52]
+	mi := &file_control_v2_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3990,7 +4074,7 @@ func (x *PacketPool) String() string {
 func (*PacketPool) ProtoMessage() {}
 
 func (x *PacketPool) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[52]
+	mi := &file_control_v2_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4003,7 +4087,7 @@ func (x *PacketPool) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PacketPool.ProtoReflect.Descriptor instead.
 func (*PacketPool) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{52}
+	return file_control_v2_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *PacketPool) GetSocket() uint32 {
@@ -4065,7 +4149,7 @@ type GetPacketPoolsResponse struct {
 
 func (x *GetPacketPoolsResponse) Reset() {
 	*x = GetPacketPoolsResponse{}
-	mi := &file_control_v2_proto_msgTypes[53]
+	mi := &file_control_v2_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4077,7 +4161,7 @@ func (x *GetPacketPoolsResponse) String() string {
 func (*GetPacketPoolsResponse) ProtoMessage() {}
 
 func (x *GetPacketPoolsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[53]
+	mi := &file_control_v2_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4090,7 +4174,7 @@ func (x *GetPacketPoolsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPacketPoolsResponse.ProtoReflect.Descriptor instead.
 func (*GetPacketPoolsResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{53}
+	return file_control_v2_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *GetPacketPoolsResponse) GetPools() []*PacketPool {
@@ -4130,7 +4214,7 @@ type SetCaptureRequest struct {
 
 func (x *SetCaptureRequest) Reset() {
 	*x = SetCaptureRequest{}
-	mi := &file_control_v2_proto_msgTypes[54]
+	mi := &file_control_v2_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4142,7 +4226,7 @@ func (x *SetCaptureRequest) String() string {
 func (*SetCaptureRequest) ProtoMessage() {}
 
 func (x *SetCaptureRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[54]
+	mi := &file_control_v2_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4155,7 +4239,7 @@ func (x *SetCaptureRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetCaptureRequest.ProtoReflect.Descriptor instead.
 func (*SetCaptureRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{54}
+	return file_control_v2_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *SetCaptureRequest) GetModule() string {
@@ -4216,7 +4300,7 @@ type SetCaptureResponse struct {
 
 func (x *SetCaptureResponse) Reset() {
 	*x = SetCaptureResponse{}
-	mi := &file_control_v2_proto_msgTypes[55]
+	mi := &file_control_v2_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4228,7 +4312,7 @@ func (x *SetCaptureResponse) String() string {
 func (*SetCaptureResponse) ProtoMessage() {}
 
 func (x *SetCaptureResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[55]
+	mi := &file_control_v2_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4241,7 +4325,7 @@ func (x *SetCaptureResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetCaptureResponse.ProtoReflect.Descriptor instead.
 func (*SetCaptureResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{55}
+	return file_control_v2_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *SetCaptureResponse) GetDaemonEpoch() uint64 {
@@ -4263,7 +4347,7 @@ type PauseWorkersRequest struct {
 
 func (x *PauseWorkersRequest) Reset() {
 	*x = PauseWorkersRequest{}
-	mi := &file_control_v2_proto_msgTypes[56]
+	mi := &file_control_v2_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4275,7 +4359,7 @@ func (x *PauseWorkersRequest) String() string {
 func (*PauseWorkersRequest) ProtoMessage() {}
 
 func (x *PauseWorkersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[56]
+	mi := &file_control_v2_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4288,7 +4372,7 @@ func (x *PauseWorkersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseWorkersRequest.ProtoReflect.Descriptor instead.
 func (*PauseWorkersRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{56}
+	return file_control_v2_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *PauseWorkersRequest) GetDaemonEpoch() uint64 {
@@ -4307,7 +4391,7 @@ type PauseWorkersResponse struct {
 
 func (x *PauseWorkersResponse) Reset() {
 	*x = PauseWorkersResponse{}
-	mi := &file_control_v2_proto_msgTypes[57]
+	mi := &file_control_v2_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4319,7 +4403,7 @@ func (x *PauseWorkersResponse) String() string {
 func (*PauseWorkersResponse) ProtoMessage() {}
 
 func (x *PauseWorkersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[57]
+	mi := &file_control_v2_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4332,7 +4416,7 @@ func (x *PauseWorkersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseWorkersResponse.ProtoReflect.Descriptor instead.
 func (*PauseWorkersResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{57}
+	return file_control_v2_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *PauseWorkersResponse) GetDaemonEpoch() uint64 {
@@ -4351,7 +4435,7 @@ type ResumeWorkersRequest struct {
 
 func (x *ResumeWorkersRequest) Reset() {
 	*x = ResumeWorkersRequest{}
-	mi := &file_control_v2_proto_msgTypes[58]
+	mi := &file_control_v2_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4363,7 +4447,7 @@ func (x *ResumeWorkersRequest) String() string {
 func (*ResumeWorkersRequest) ProtoMessage() {}
 
 func (x *ResumeWorkersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[58]
+	mi := &file_control_v2_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4376,7 +4460,7 @@ func (x *ResumeWorkersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeWorkersRequest.ProtoReflect.Descriptor instead.
 func (*ResumeWorkersRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{58}
+	return file_control_v2_proto_rawDescGZIP(), []int{59}
 }
 
 func (x *ResumeWorkersRequest) GetDaemonEpoch() uint64 {
@@ -4395,7 +4479,7 @@ type ResumeWorkersResponse struct {
 
 func (x *ResumeWorkersResponse) Reset() {
 	*x = ResumeWorkersResponse{}
-	mi := &file_control_v2_proto_msgTypes[59]
+	mi := &file_control_v2_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4407,7 +4491,7 @@ func (x *ResumeWorkersResponse) String() string {
 func (*ResumeWorkersResponse) ProtoMessage() {}
 
 func (x *ResumeWorkersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[59]
+	mi := &file_control_v2_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4420,7 +4504,7 @@ func (x *ResumeWorkersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeWorkersResponse.ProtoReflect.Descriptor instead.
 func (*ResumeWorkersResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{59}
+	return file_control_v2_proto_rawDescGZIP(), []int{60}
 }
 
 func (x *ResumeWorkersResponse) GetDaemonEpoch() uint64 {
@@ -4439,7 +4523,7 @@ type ShutdownRequest struct {
 
 func (x *ShutdownRequest) Reset() {
 	*x = ShutdownRequest{}
-	mi := &file_control_v2_proto_msgTypes[60]
+	mi := &file_control_v2_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4451,7 +4535,7 @@ func (x *ShutdownRequest) String() string {
 func (*ShutdownRequest) ProtoMessage() {}
 
 func (x *ShutdownRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[60]
+	mi := &file_control_v2_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4464,7 +4548,7 @@ func (x *ShutdownRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShutdownRequest.ProtoReflect.Descriptor instead.
 func (*ShutdownRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{60}
+	return file_control_v2_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *ShutdownRequest) GetDaemonEpoch() uint64 {
@@ -4484,7 +4568,7 @@ type ShutdownResponse struct {
 
 func (x *ShutdownResponse) Reset() {
 	*x = ShutdownResponse{}
-	mi := &file_control_v2_proto_msgTypes[61]
+	mi := &file_control_v2_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4496,7 +4580,7 @@ func (x *ShutdownResponse) String() string {
 func (*ShutdownResponse) ProtoMessage() {}
 
 func (x *ShutdownResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[61]
+	mi := &file_control_v2_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4509,7 +4593,7 @@ func (x *ShutdownResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShutdownResponse.ProtoReflect.Descriptor instead.
 func (*ShutdownResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{61}
+	return file_control_v2_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *ShutdownResponse) GetDaemonEpoch() uint64 {
@@ -4531,7 +4615,7 @@ type PortStatus_Link struct {
 
 func (x *PortStatus_Link) Reset() {
 	*x = PortStatus_Link{}
-	mi := &file_control_v2_proto_msgTypes[66]
+	mi := &file_control_v2_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4543,7 +4627,7 @@ func (x *PortStatus_Link) String() string {
 func (*PortStatus_Link) ProtoMessage() {}
 
 func (x *PortStatus_Link) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[66]
+	mi := &file_control_v2_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4556,7 +4640,7 @@ func (x *PortStatus_Link) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PortStatus_Link.ProtoReflect.Descriptor instead.
 func (*PortStatus_Link) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{49, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{50, 0}
 }
 
 func (x *PortStatus_Link) GetUp() bool {
@@ -4601,7 +4685,7 @@ type PortStatus_Counters struct {
 
 func (x *PortStatus_Counters) Reset() {
 	*x = PortStatus_Counters{}
-	mi := &file_control_v2_proto_msgTypes[67]
+	mi := &file_control_v2_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4613,7 +4697,7 @@ func (x *PortStatus_Counters) String() string {
 func (*PortStatus_Counters) ProtoMessage() {}
 
 func (x *PortStatus_Counters) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[67]
+	mi := &file_control_v2_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4626,7 +4710,7 @@ func (x *PortStatus_Counters) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PortStatus_Counters.ProtoReflect.Descriptor instead.
 func (*PortStatus_Counters) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{49, 1}
+	return file_control_v2_proto_rawDescGZIP(), []int{50, 1}
 }
 
 func (x *PortStatus_Counters) GetPackets() uint64 {
@@ -4687,7 +4771,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x06Worker\x12\x10\n" +
 	"\x03wid\x18\x01 \x01(\x05R\x03wid\x12\x12\n" +
 	"\x04core\x18\x02 \x01(\x05R\x04core\x12\x1c\n" +
-	"\tscheduler\x18\x03 \x01(\tR\tscheduler\"\xa2\x04\n" +
+	"\tscheduler\x18\x03 \x01(\tR\tscheduler\"\xfc\x03\n" +
 	"\fTrafficClass\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06parent\x18\x02 \x01(\tR\x06parent\x12\x16\n" +
@@ -4697,10 +4781,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\bpriority\x18\x06 \x01(\x03H\x00R\bpriority\x88\x01\x01\x12\x19\n" +
 	"\x05share\x18\a \x01(\x03H\x01R\x05share\x88\x01\x01\x129\n" +
 	"\x05limit\x18\b \x03(\v2#.bess.pb.v2.TrafficClass.LimitEntryR\x05limit\x12C\n" +
-	"\tmax_burst\x18\t \x03(\v2&.bess.pb.v2.TrafficClass.MaxBurstEntryR\bmaxBurst\x12(\n" +
-	"\x10leaf_module_name\x18\n" +
-	" \x01(\tR\x0eleafModuleName\x12,\n" +
-	"\x12leaf_module_taskid\x18\v \x01(\x04R\x10leafModuleTaskid\x1a8\n" +
+	"\tmax_burst\x18\t \x03(\v2&.bess.pb.v2.TrafficClass.MaxBurstEntryR\bmaxBurst\x1a8\n" +
 	"\n" +
 	"LimitEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
@@ -4709,13 +4790,25 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x03R\x05value:\x028\x01B\v\n" +
 	"\t_priorityB\b\n" +
-	"\x06_share\"\x8b\x02\n" +
+	"\x06_shareJ\x04\b\n" +
+	"\x10\vJ\x04\b\v\x10\fR\x10leaf_module_nameR\x12leaf_module_taskid\"\xc5\x01\n" +
+	"\rTaskPlacement\x12\x16\n" +
+	"\x06module\x18\x01 \x01(\tR\x06module\x12\x12\n" +
+	"\x04task\x18\x02 \x01(\rR\x04task\x12\x16\n" +
+	"\x06parent\x18\x03 \x01(\tR\x06parent\x12\x15\n" +
+	"\x03wid\x18\x04 \x01(\x05H\x00R\x03wid\x88\x01\x01\x12\x1f\n" +
+	"\bpriority\x18\x05 \x01(\x03H\x01R\bpriority\x88\x01\x01\x12\x19\n" +
+	"\x05share\x18\x06 \x01(\x03H\x02R\x05share\x88\x01\x01B\x06\n" +
+	"\x04_widB\v\n" +
+	"\t_priorityB\b\n" +
+	"\x06_share\"\xbc\x02\n" +
 	"\bPipeline\x12&\n" +
 	"\x05ports\x18\x01 \x03(\v2\x10.bess.pb.v2.PortR\x05ports\x12,\n" +
 	"\amodules\x18\x02 \x03(\v2\x12.bess.pb.v2.ModuleR\amodules\x128\n" +
 	"\vconnections\x18\x03 \x03(\v2\x16.bess.pb.v2.ConnectionR\vconnections\x12,\n" +
 	"\aworkers\x18\x04 \x03(\v2\x12.bess.pb.v2.WorkerR\aworkers\x12A\n" +
-	"\x0ftraffic_classes\x18\x05 \x03(\v2\x18.bess.pb.v2.TrafficClassR\x0etrafficClasses\"x\n" +
+	"\x0ftraffic_classes\x18\x05 \x03(\v2\x18.bess.pb.v2.TrafficClassR\x0etrafficClasses\x12/\n" +
+	"\x05tasks\x18\x06 \x03(\v2\x19.bess.pb.v2.TaskPlacementR\x05tasks\"x\n" +
 	"\x06Change\x12*\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x16.bess.pb.v2.ObjectTypeR\x04type\x12\x16\n" +
 	"\x06object\x18\x02 \x01(\tR\x06object\x12*\n" +
@@ -5032,7 +5125,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x0fShutdownRequest\x12!\n" +
 	"\fdaemon_epoch\x18\x01 \x01(\x04R\vdaemonEpoch\"5\n" +
 	"\x10ShutdownResponse\x12!\n" +
-	"\fdaemon_epoch\x18\x01 \x01(\x04R\vdaemonEpoch*n\n" +
+	"\fdaemon_epoch\x18\x01 \x01(\x04R\vdaemonEpoch*x\n" +
 	"\n" +
 	"ObjectType\x12\x1b\n" +
 	"\x17OBJECT_TYPE_UNSPECIFIED\x10\x00\x12\b\n" +
@@ -5043,7 +5136,8 @@ const file_control_v2_proto_rawDesc = "" +
 	"CONNECTION\x10\x03\x12\n" +
 	"\n" +
 	"\x06WORKER\x10\x04\x12\x11\n" +
-	"\rTRAFFIC_CLASS\x10\x05*m\n" +
+	"\rTRAFFIC_CLASS\x10\x05\x12\b\n" +
+	"\x04TASK\x10\x06*m\n" +
 	"\n" +
 	"ChangeKind\x12\x1b\n" +
 	"\x17CHANGE_KIND_UNSPECIFIED\x10\x00\x12\n" +
@@ -5099,7 +5193,7 @@ func file_control_v2_proto_rawDescGZIP() []byte {
 }
 
 var file_control_v2_proto_enumTypes = make([]protoimpl.EnumInfo, 11)
-var file_control_v2_proto_msgTypes = make([]protoimpl.MessageInfo, 68)
+var file_control_v2_proto_msgTypes = make([]protoimpl.MessageInfo, 69)
 var file_control_v2_proto_goTypes = []any{
 	(ObjectType)(0),                          // 0: bess.pb.v2.ObjectType
 	(ChangeKind)(0),                          // 1: bess.pb.v2.ChangeKind
@@ -5117,170 +5211,172 @@ var file_control_v2_proto_goTypes = []any{
 	(*Connection)(nil),                       // 13: bess.pb.v2.Connection
 	(*Worker)(nil),                           // 14: bess.pb.v2.Worker
 	(*TrafficClass)(nil),                     // 15: bess.pb.v2.TrafficClass
-	(*Pipeline)(nil),                         // 16: bess.pb.v2.Pipeline
-	(*Change)(nil),                           // 17: bess.pb.v2.Change
-	(*PipelineDiff)(nil),                     // 18: bess.pb.v2.PipelineDiff
-	(*PlanStep)(nil),                         // 19: bess.pb.v2.PlanStep
-	(*GetPipelineRequest)(nil),               // 20: bess.pb.v2.GetPipelineRequest
-	(*GetPipelineResponse)(nil),              // 21: bess.pb.v2.GetPipelineResponse
-	(*ValidatePipelineRequest)(nil),          // 22: bess.pb.v2.ValidatePipelineRequest
-	(*ValidatePipelineResponse)(nil),         // 23: bess.pb.v2.ValidatePipelineResponse
-	(*DiffPipelineRequest)(nil),              // 24: bess.pb.v2.DiffPipelineRequest
-	(*DiffPipelineResponse)(nil),             // 25: bess.pb.v2.DiffPipelineResponse
-	(*PlanPipelineRequest)(nil),              // 26: bess.pb.v2.PlanPipelineRequest
-	(*PlanPipelineResponse)(nil),             // 27: bess.pb.v2.PlanPipelineResponse
-	(*ApplyPipelineRequest)(nil),             // 28: bess.pb.v2.ApplyPipelineRequest
-	(*ApplyPipelineResponse)(nil),            // 29: bess.pb.v2.ApplyPipelineResponse
-	(*ErrorDetail)(nil),                      // 30: bess.pb.v2.ErrorDetail
-	(*TransactionOp)(nil),                    // 31: bess.pb.v2.TransactionOp
-	(*ApplyTransactionRequest)(nil),          // 32: bess.pb.v2.ApplyTransactionRequest
-	(*TransactionOpResult)(nil),              // 33: bess.pb.v2.TransactionOpResult
-	(*TransactionRecord)(nil),                // 34: bess.pb.v2.TransactionRecord
-	(*ApplyTransactionResponse)(nil),         // 35: bess.pb.v2.ApplyTransactionResponse
-	(*GetTransactionRequest)(nil),            // 36: bess.pb.v2.GetTransactionRequest
-	(*GetTransactionResponse)(nil),           // 37: bess.pb.v2.GetTransactionResponse
-	(*ListTransactionResourcesRequest)(nil),  // 38: bess.pb.v2.ListTransactionResourcesRequest
-	(*TransactionResource)(nil),              // 39: bess.pb.v2.TransactionResource
-	(*ListTransactionResourcesResponse)(nil), // 40: bess.pb.v2.ListTransactionResourcesResponse
-	(*GetCapabilitiesRequest)(nil),           // 41: bess.pb.v2.GetCapabilitiesRequest
-	(*PluginInfo)(nil),                       // 42: bess.pb.v2.PluginInfo
-	(*PortInfo)(nil),                         // 43: bess.pb.v2.PortInfo
-	(*GetCapabilitiesResponse)(nil),          // 44: bess.pb.v2.GetCapabilitiesResponse
-	(*GetSchemaRequest)(nil),                 // 45: bess.pb.v2.GetSchemaRequest
-	(*CommandSchema)(nil),                    // 46: bess.pb.v2.CommandSchema
-	(*ModuleClassSchema)(nil),                // 47: bess.pb.v2.ModuleClassSchema
-	(*PortDriverSchema)(nil),                 // 48: bess.pb.v2.PortDriverSchema
-	(*GetSchemaResponse)(nil),                // 49: bess.pb.v2.GetSchemaResponse
-	(*WatchEventsRequest)(nil),               // 50: bess.pb.v2.WatchEventsRequest
-	(*Event)(nil),                            // 51: bess.pb.v2.Event
-	(*ListMetricsRequest)(nil),               // 52: bess.pb.v2.ListMetricsRequest
-	(*MetricSample)(nil),                     // 53: bess.pb.v2.MetricSample
-	(*ListMetricsResponse)(nil),              // 54: bess.pb.v2.ListMetricsResponse
-	(*ImportPluginRequest)(nil),              // 55: bess.pb.v2.ImportPluginRequest
-	(*ImportPluginResponse)(nil),             // 56: bess.pb.v2.ImportPluginResponse
-	(*UnloadPluginRequest)(nil),              // 57: bess.pb.v2.UnloadPluginRequest
-	(*UnloadPluginResponse)(nil),             // 58: bess.pb.v2.UnloadPluginResponse
-	(*GetPortStatusRequest)(nil),             // 59: bess.pb.v2.GetPortStatusRequest
-	(*PortStatus)(nil),                       // 60: bess.pb.v2.PortStatus
-	(*GetPortStatusResponse)(nil),            // 61: bess.pb.v2.GetPortStatusResponse
-	(*GetPacketPoolsRequest)(nil),            // 62: bess.pb.v2.GetPacketPoolsRequest
-	(*PacketPool)(nil),                       // 63: bess.pb.v2.PacketPool
-	(*GetPacketPoolsResponse)(nil),           // 64: bess.pb.v2.GetPacketPoolsResponse
-	(*SetCaptureRequest)(nil),                // 65: bess.pb.v2.SetCaptureRequest
-	(*SetCaptureResponse)(nil),               // 66: bess.pb.v2.SetCaptureResponse
-	(*PauseWorkersRequest)(nil),              // 67: bess.pb.v2.PauseWorkersRequest
-	(*PauseWorkersResponse)(nil),             // 68: bess.pb.v2.PauseWorkersResponse
-	(*ResumeWorkersRequest)(nil),             // 69: bess.pb.v2.ResumeWorkersRequest
-	(*ResumeWorkersResponse)(nil),            // 70: bess.pb.v2.ResumeWorkersResponse
-	(*ShutdownRequest)(nil),                  // 71: bess.pb.v2.ShutdownRequest
-	(*ShutdownResponse)(nil),                 // 72: bess.pb.v2.ShutdownResponse
-	nil,                                      // 73: bess.pb.v2.TrafficClass.LimitEntry
-	nil,                                      // 74: bess.pb.v2.TrafficClass.MaxBurstEntry
-	nil,                                      // 75: bess.pb.v2.Event.FieldsEntry
-	nil,                                      // 76: bess.pb.v2.MetricSample.LabelsEntry
-	(*PortStatus_Link)(nil),                  // 77: bess.pb.v2.PortStatus.Link
-	(*PortStatus_Counters)(nil),              // 78: bess.pb.v2.PortStatus.Counters
-	(*anypb.Any)(nil),                        // 79: google.protobuf.Any
-	(*descriptorpb.FileDescriptorSet)(nil),   // 80: google.protobuf.FileDescriptorSet
+	(*TaskPlacement)(nil),                    // 16: bess.pb.v2.TaskPlacement
+	(*Pipeline)(nil),                         // 17: bess.pb.v2.Pipeline
+	(*Change)(nil),                           // 18: bess.pb.v2.Change
+	(*PipelineDiff)(nil),                     // 19: bess.pb.v2.PipelineDiff
+	(*PlanStep)(nil),                         // 20: bess.pb.v2.PlanStep
+	(*GetPipelineRequest)(nil),               // 21: bess.pb.v2.GetPipelineRequest
+	(*GetPipelineResponse)(nil),              // 22: bess.pb.v2.GetPipelineResponse
+	(*ValidatePipelineRequest)(nil),          // 23: bess.pb.v2.ValidatePipelineRequest
+	(*ValidatePipelineResponse)(nil),         // 24: bess.pb.v2.ValidatePipelineResponse
+	(*DiffPipelineRequest)(nil),              // 25: bess.pb.v2.DiffPipelineRequest
+	(*DiffPipelineResponse)(nil),             // 26: bess.pb.v2.DiffPipelineResponse
+	(*PlanPipelineRequest)(nil),              // 27: bess.pb.v2.PlanPipelineRequest
+	(*PlanPipelineResponse)(nil),             // 28: bess.pb.v2.PlanPipelineResponse
+	(*ApplyPipelineRequest)(nil),             // 29: bess.pb.v2.ApplyPipelineRequest
+	(*ApplyPipelineResponse)(nil),            // 30: bess.pb.v2.ApplyPipelineResponse
+	(*ErrorDetail)(nil),                      // 31: bess.pb.v2.ErrorDetail
+	(*TransactionOp)(nil),                    // 32: bess.pb.v2.TransactionOp
+	(*ApplyTransactionRequest)(nil),          // 33: bess.pb.v2.ApplyTransactionRequest
+	(*TransactionOpResult)(nil),              // 34: bess.pb.v2.TransactionOpResult
+	(*TransactionRecord)(nil),                // 35: bess.pb.v2.TransactionRecord
+	(*ApplyTransactionResponse)(nil),         // 36: bess.pb.v2.ApplyTransactionResponse
+	(*GetTransactionRequest)(nil),            // 37: bess.pb.v2.GetTransactionRequest
+	(*GetTransactionResponse)(nil),           // 38: bess.pb.v2.GetTransactionResponse
+	(*ListTransactionResourcesRequest)(nil),  // 39: bess.pb.v2.ListTransactionResourcesRequest
+	(*TransactionResource)(nil),              // 40: bess.pb.v2.TransactionResource
+	(*ListTransactionResourcesResponse)(nil), // 41: bess.pb.v2.ListTransactionResourcesResponse
+	(*GetCapabilitiesRequest)(nil),           // 42: bess.pb.v2.GetCapabilitiesRequest
+	(*PluginInfo)(nil),                       // 43: bess.pb.v2.PluginInfo
+	(*PortInfo)(nil),                         // 44: bess.pb.v2.PortInfo
+	(*GetCapabilitiesResponse)(nil),          // 45: bess.pb.v2.GetCapabilitiesResponse
+	(*GetSchemaRequest)(nil),                 // 46: bess.pb.v2.GetSchemaRequest
+	(*CommandSchema)(nil),                    // 47: bess.pb.v2.CommandSchema
+	(*ModuleClassSchema)(nil),                // 48: bess.pb.v2.ModuleClassSchema
+	(*PortDriverSchema)(nil),                 // 49: bess.pb.v2.PortDriverSchema
+	(*GetSchemaResponse)(nil),                // 50: bess.pb.v2.GetSchemaResponse
+	(*WatchEventsRequest)(nil),               // 51: bess.pb.v2.WatchEventsRequest
+	(*Event)(nil),                            // 52: bess.pb.v2.Event
+	(*ListMetricsRequest)(nil),               // 53: bess.pb.v2.ListMetricsRequest
+	(*MetricSample)(nil),                     // 54: bess.pb.v2.MetricSample
+	(*ListMetricsResponse)(nil),              // 55: bess.pb.v2.ListMetricsResponse
+	(*ImportPluginRequest)(nil),              // 56: bess.pb.v2.ImportPluginRequest
+	(*ImportPluginResponse)(nil),             // 57: bess.pb.v2.ImportPluginResponse
+	(*UnloadPluginRequest)(nil),              // 58: bess.pb.v2.UnloadPluginRequest
+	(*UnloadPluginResponse)(nil),             // 59: bess.pb.v2.UnloadPluginResponse
+	(*GetPortStatusRequest)(nil),             // 60: bess.pb.v2.GetPortStatusRequest
+	(*PortStatus)(nil),                       // 61: bess.pb.v2.PortStatus
+	(*GetPortStatusResponse)(nil),            // 62: bess.pb.v2.GetPortStatusResponse
+	(*GetPacketPoolsRequest)(nil),            // 63: bess.pb.v2.GetPacketPoolsRequest
+	(*PacketPool)(nil),                       // 64: bess.pb.v2.PacketPool
+	(*GetPacketPoolsResponse)(nil),           // 65: bess.pb.v2.GetPacketPoolsResponse
+	(*SetCaptureRequest)(nil),                // 66: bess.pb.v2.SetCaptureRequest
+	(*SetCaptureResponse)(nil),               // 67: bess.pb.v2.SetCaptureResponse
+	(*PauseWorkersRequest)(nil),              // 68: bess.pb.v2.PauseWorkersRequest
+	(*PauseWorkersResponse)(nil),             // 69: bess.pb.v2.PauseWorkersResponse
+	(*ResumeWorkersRequest)(nil),             // 70: bess.pb.v2.ResumeWorkersRequest
+	(*ResumeWorkersResponse)(nil),            // 71: bess.pb.v2.ResumeWorkersResponse
+	(*ShutdownRequest)(nil),                  // 72: bess.pb.v2.ShutdownRequest
+	(*ShutdownResponse)(nil),                 // 73: bess.pb.v2.ShutdownResponse
+	nil,                                      // 74: bess.pb.v2.TrafficClass.LimitEntry
+	nil,                                      // 75: bess.pb.v2.TrafficClass.MaxBurstEntry
+	nil,                                      // 76: bess.pb.v2.Event.FieldsEntry
+	nil,                                      // 77: bess.pb.v2.MetricSample.LabelsEntry
+	(*PortStatus_Link)(nil),                  // 78: bess.pb.v2.PortStatus.Link
+	(*PortStatus_Counters)(nil),              // 79: bess.pb.v2.PortStatus.Counters
+	(*anypb.Any)(nil),                        // 80: google.protobuf.Any
+	(*descriptorpb.FileDescriptorSet)(nil),   // 81: google.protobuf.FileDescriptorSet
 }
 var file_control_v2_proto_depIdxs = []int32{
-	79, // 0: bess.pb.v2.Port.arg:type_name -> google.protobuf.Any
-	79, // 1: bess.pb.v2.Module.arg:type_name -> google.protobuf.Any
-	73, // 2: bess.pb.v2.TrafficClass.limit:type_name -> bess.pb.v2.TrafficClass.LimitEntry
-	74, // 3: bess.pb.v2.TrafficClass.max_burst:type_name -> bess.pb.v2.TrafficClass.MaxBurstEntry
+	80, // 0: bess.pb.v2.Port.arg:type_name -> google.protobuf.Any
+	80, // 1: bess.pb.v2.Module.arg:type_name -> google.protobuf.Any
+	74, // 2: bess.pb.v2.TrafficClass.limit:type_name -> bess.pb.v2.TrafficClass.LimitEntry
+	75, // 3: bess.pb.v2.TrafficClass.max_burst:type_name -> bess.pb.v2.TrafficClass.MaxBurstEntry
 	11, // 4: bess.pb.v2.Pipeline.ports:type_name -> bess.pb.v2.Port
 	12, // 5: bess.pb.v2.Pipeline.modules:type_name -> bess.pb.v2.Module
 	13, // 6: bess.pb.v2.Pipeline.connections:type_name -> bess.pb.v2.Connection
 	14, // 7: bess.pb.v2.Pipeline.workers:type_name -> bess.pb.v2.Worker
 	15, // 8: bess.pb.v2.Pipeline.traffic_classes:type_name -> bess.pb.v2.TrafficClass
-	0,  // 9: bess.pb.v2.Change.type:type_name -> bess.pb.v2.ObjectType
-	1,  // 10: bess.pb.v2.Change.kind:type_name -> bess.pb.v2.ChangeKind
-	17, // 11: bess.pb.v2.PipelineDiff.changes:type_name -> bess.pb.v2.Change
-	2,  // 12: bess.pb.v2.PlanStep.phase:type_name -> bess.pb.v2.PlanPhase
-	0,  // 13: bess.pb.v2.PlanStep.type:type_name -> bess.pb.v2.ObjectType
-	16, // 14: bess.pb.v2.GetPipelineResponse.pipeline:type_name -> bess.pb.v2.Pipeline
-	16, // 15: bess.pb.v2.ValidatePipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
-	16, // 16: bess.pb.v2.ValidatePipelineResponse.normalized:type_name -> bess.pb.v2.Pipeline
-	16, // 17: bess.pb.v2.DiffPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
-	18, // 18: bess.pb.v2.DiffPipelineResponse.diff:type_name -> bess.pb.v2.PipelineDiff
-	16, // 19: bess.pb.v2.PlanPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
-	19, // 20: bess.pb.v2.PlanPipelineResponse.steps:type_name -> bess.pb.v2.PlanStep
-	16, // 21: bess.pb.v2.ApplyPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
-	3,  // 22: bess.pb.v2.ErrorDetail.code:type_name -> bess.pb.v2.ErrorDetail.Code
-	79, // 23: bess.pb.v2.TransactionOp.key:type_name -> google.protobuf.Any
-	79, // 24: bess.pb.v2.TransactionOp.value:type_name -> google.protobuf.Any
-	31, // 25: bess.pb.v2.ApplyTransactionRequest.ops:type_name -> bess.pb.v2.TransactionOp
-	4,  // 26: bess.pb.v2.ApplyTransactionRequest.consistency:type_name -> bess.pb.v2.ApplyTransactionRequest.Consistency
-	5,  // 27: bess.pb.v2.TransactionOpResult.status:type_name -> bess.pb.v2.TransactionOpResult.Status
-	6,  // 28: bess.pb.v2.TransactionRecord.outcome:type_name -> bess.pb.v2.TransactionRecord.Outcome
-	33, // 29: bess.pb.v2.TransactionRecord.ops:type_name -> bess.pb.v2.TransactionOpResult
-	7,  // 30: bess.pb.v2.TransactionRecord.visibility:type_name -> bess.pb.v2.TransactionRecord.Visibility
-	34, // 31: bess.pb.v2.ApplyTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
-	34, // 32: bess.pb.v2.GetTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
-	39, // 33: bess.pb.v2.ListTransactionResourcesResponse.resources:type_name -> bess.pb.v2.TransactionResource
-	42, // 34: bess.pb.v2.GetCapabilitiesResponse.plugins:type_name -> bess.pb.v2.PluginInfo
-	43, // 35: bess.pb.v2.GetCapabilitiesResponse.ports:type_name -> bess.pb.v2.PortInfo
-	39, // 36: bess.pb.v2.GetCapabilitiesResponse.resources:type_name -> bess.pb.v2.TransactionResource
-	46, // 37: bess.pb.v2.ModuleClassSchema.commands:type_name -> bess.pb.v2.CommandSchema
-	47, // 38: bess.pb.v2.GetSchemaResponse.module_classes:type_name -> bess.pb.v2.ModuleClassSchema
-	48, // 39: bess.pb.v2.GetSchemaResponse.port_drivers:type_name -> bess.pb.v2.PortDriverSchema
-	80, // 40: bess.pb.v2.GetSchemaResponse.descriptors:type_name -> google.protobuf.FileDescriptorSet
-	75, // 41: bess.pb.v2.Event.fields:type_name -> bess.pb.v2.Event.FieldsEntry
-	8,  // 42: bess.pb.v2.MetricSample.kind:type_name -> bess.pb.v2.MetricSample.Kind
-	76, // 43: bess.pb.v2.MetricSample.labels:type_name -> bess.pb.v2.MetricSample.LabelsEntry
-	53, // 44: bess.pb.v2.ListMetricsResponse.samples:type_name -> bess.pb.v2.MetricSample
-	77, // 45: bess.pb.v2.PortStatus.link:type_name -> bess.pb.v2.PortStatus.Link
-	78, // 46: bess.pb.v2.PortStatus.rx:type_name -> bess.pb.v2.PortStatus.Counters
-	78, // 47: bess.pb.v2.PortStatus.tx:type_name -> bess.pb.v2.PortStatus.Counters
-	60, // 48: bess.pb.v2.GetPortStatusResponse.ports:type_name -> bess.pb.v2.PortStatus
-	63, // 49: bess.pb.v2.GetPacketPoolsResponse.pools:type_name -> bess.pb.v2.PacketPool
-	9,  // 50: bess.pb.v2.SetCaptureRequest.direction:type_name -> bess.pb.v2.SetCaptureRequest.Direction
-	10, // 51: bess.pb.v2.SetCaptureRequest.format:type_name -> bess.pb.v2.SetCaptureRequest.Format
-	20, // 52: bess.pb.v2.Control.GetPipeline:input_type -> bess.pb.v2.GetPipelineRequest
-	22, // 53: bess.pb.v2.Control.ValidatePipeline:input_type -> bess.pb.v2.ValidatePipelineRequest
-	24, // 54: bess.pb.v2.Control.DiffPipeline:input_type -> bess.pb.v2.DiffPipelineRequest
-	26, // 55: bess.pb.v2.Control.PlanPipeline:input_type -> bess.pb.v2.PlanPipelineRequest
-	28, // 56: bess.pb.v2.Control.ApplyPipeline:input_type -> bess.pb.v2.ApplyPipelineRequest
-	32, // 57: bess.pb.v2.Control.ApplyTransaction:input_type -> bess.pb.v2.ApplyTransactionRequest
-	36, // 58: bess.pb.v2.Control.GetTransaction:input_type -> bess.pb.v2.GetTransactionRequest
-	52, // 59: bess.pb.v2.Control.ListMetrics:input_type -> bess.pb.v2.ListMetricsRequest
-	41, // 60: bess.pb.v2.Control.GetCapabilities:input_type -> bess.pb.v2.GetCapabilitiesRequest
-	45, // 61: bess.pb.v2.Control.GetSchema:input_type -> bess.pb.v2.GetSchemaRequest
-	50, // 62: bess.pb.v2.Control.WatchEvents:input_type -> bess.pb.v2.WatchEventsRequest
-	38, // 63: bess.pb.v2.Control.ListTransactionResources:input_type -> bess.pb.v2.ListTransactionResourcesRequest
-	55, // 64: bess.pb.v2.Admin.ImportPlugin:input_type -> bess.pb.v2.ImportPluginRequest
-	57, // 65: bess.pb.v2.Admin.UnloadPlugin:input_type -> bess.pb.v2.UnloadPluginRequest
-	59, // 66: bess.pb.v2.Admin.GetPortStatus:input_type -> bess.pb.v2.GetPortStatusRequest
-	62, // 67: bess.pb.v2.Admin.GetPacketPools:input_type -> bess.pb.v2.GetPacketPoolsRequest
-	65, // 68: bess.pb.v2.Admin.SetCapture:input_type -> bess.pb.v2.SetCaptureRequest
-	67, // 69: bess.pb.v2.Admin.PauseWorkers:input_type -> bess.pb.v2.PauseWorkersRequest
-	69, // 70: bess.pb.v2.Admin.ResumeWorkers:input_type -> bess.pb.v2.ResumeWorkersRequest
-	71, // 71: bess.pb.v2.Admin.Shutdown:input_type -> bess.pb.v2.ShutdownRequest
-	21, // 72: bess.pb.v2.Control.GetPipeline:output_type -> bess.pb.v2.GetPipelineResponse
-	23, // 73: bess.pb.v2.Control.ValidatePipeline:output_type -> bess.pb.v2.ValidatePipelineResponse
-	25, // 74: bess.pb.v2.Control.DiffPipeline:output_type -> bess.pb.v2.DiffPipelineResponse
-	27, // 75: bess.pb.v2.Control.PlanPipeline:output_type -> bess.pb.v2.PlanPipelineResponse
-	29, // 76: bess.pb.v2.Control.ApplyPipeline:output_type -> bess.pb.v2.ApplyPipelineResponse
-	35, // 77: bess.pb.v2.Control.ApplyTransaction:output_type -> bess.pb.v2.ApplyTransactionResponse
-	37, // 78: bess.pb.v2.Control.GetTransaction:output_type -> bess.pb.v2.GetTransactionResponse
-	54, // 79: bess.pb.v2.Control.ListMetrics:output_type -> bess.pb.v2.ListMetricsResponse
-	44, // 80: bess.pb.v2.Control.GetCapabilities:output_type -> bess.pb.v2.GetCapabilitiesResponse
-	49, // 81: bess.pb.v2.Control.GetSchema:output_type -> bess.pb.v2.GetSchemaResponse
-	51, // 82: bess.pb.v2.Control.WatchEvents:output_type -> bess.pb.v2.Event
-	40, // 83: bess.pb.v2.Control.ListTransactionResources:output_type -> bess.pb.v2.ListTransactionResourcesResponse
-	56, // 84: bess.pb.v2.Admin.ImportPlugin:output_type -> bess.pb.v2.ImportPluginResponse
-	58, // 85: bess.pb.v2.Admin.UnloadPlugin:output_type -> bess.pb.v2.UnloadPluginResponse
-	61, // 86: bess.pb.v2.Admin.GetPortStatus:output_type -> bess.pb.v2.GetPortStatusResponse
-	64, // 87: bess.pb.v2.Admin.GetPacketPools:output_type -> bess.pb.v2.GetPacketPoolsResponse
-	66, // 88: bess.pb.v2.Admin.SetCapture:output_type -> bess.pb.v2.SetCaptureResponse
-	68, // 89: bess.pb.v2.Admin.PauseWorkers:output_type -> bess.pb.v2.PauseWorkersResponse
-	70, // 90: bess.pb.v2.Admin.ResumeWorkers:output_type -> bess.pb.v2.ResumeWorkersResponse
-	72, // 91: bess.pb.v2.Admin.Shutdown:output_type -> bess.pb.v2.ShutdownResponse
-	72, // [72:92] is the sub-list for method output_type
-	52, // [52:72] is the sub-list for method input_type
-	52, // [52:52] is the sub-list for extension type_name
-	52, // [52:52] is the sub-list for extension extendee
-	0,  // [0:52] is the sub-list for field type_name
+	16, // 9: bess.pb.v2.Pipeline.tasks:type_name -> bess.pb.v2.TaskPlacement
+	0,  // 10: bess.pb.v2.Change.type:type_name -> bess.pb.v2.ObjectType
+	1,  // 11: bess.pb.v2.Change.kind:type_name -> bess.pb.v2.ChangeKind
+	18, // 12: bess.pb.v2.PipelineDiff.changes:type_name -> bess.pb.v2.Change
+	2,  // 13: bess.pb.v2.PlanStep.phase:type_name -> bess.pb.v2.PlanPhase
+	0,  // 14: bess.pb.v2.PlanStep.type:type_name -> bess.pb.v2.ObjectType
+	17, // 15: bess.pb.v2.GetPipelineResponse.pipeline:type_name -> bess.pb.v2.Pipeline
+	17, // 16: bess.pb.v2.ValidatePipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
+	17, // 17: bess.pb.v2.ValidatePipelineResponse.normalized:type_name -> bess.pb.v2.Pipeline
+	17, // 18: bess.pb.v2.DiffPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
+	19, // 19: bess.pb.v2.DiffPipelineResponse.diff:type_name -> bess.pb.v2.PipelineDiff
+	17, // 20: bess.pb.v2.PlanPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
+	20, // 21: bess.pb.v2.PlanPipelineResponse.steps:type_name -> bess.pb.v2.PlanStep
+	17, // 22: bess.pb.v2.ApplyPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
+	3,  // 23: bess.pb.v2.ErrorDetail.code:type_name -> bess.pb.v2.ErrorDetail.Code
+	80, // 24: bess.pb.v2.TransactionOp.key:type_name -> google.protobuf.Any
+	80, // 25: bess.pb.v2.TransactionOp.value:type_name -> google.protobuf.Any
+	32, // 26: bess.pb.v2.ApplyTransactionRequest.ops:type_name -> bess.pb.v2.TransactionOp
+	4,  // 27: bess.pb.v2.ApplyTransactionRequest.consistency:type_name -> bess.pb.v2.ApplyTransactionRequest.Consistency
+	5,  // 28: bess.pb.v2.TransactionOpResult.status:type_name -> bess.pb.v2.TransactionOpResult.Status
+	6,  // 29: bess.pb.v2.TransactionRecord.outcome:type_name -> bess.pb.v2.TransactionRecord.Outcome
+	34, // 30: bess.pb.v2.TransactionRecord.ops:type_name -> bess.pb.v2.TransactionOpResult
+	7,  // 31: bess.pb.v2.TransactionRecord.visibility:type_name -> bess.pb.v2.TransactionRecord.Visibility
+	35, // 32: bess.pb.v2.ApplyTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
+	35, // 33: bess.pb.v2.GetTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
+	40, // 34: bess.pb.v2.ListTransactionResourcesResponse.resources:type_name -> bess.pb.v2.TransactionResource
+	43, // 35: bess.pb.v2.GetCapabilitiesResponse.plugins:type_name -> bess.pb.v2.PluginInfo
+	44, // 36: bess.pb.v2.GetCapabilitiesResponse.ports:type_name -> bess.pb.v2.PortInfo
+	40, // 37: bess.pb.v2.GetCapabilitiesResponse.resources:type_name -> bess.pb.v2.TransactionResource
+	47, // 38: bess.pb.v2.ModuleClassSchema.commands:type_name -> bess.pb.v2.CommandSchema
+	48, // 39: bess.pb.v2.GetSchemaResponse.module_classes:type_name -> bess.pb.v2.ModuleClassSchema
+	49, // 40: bess.pb.v2.GetSchemaResponse.port_drivers:type_name -> bess.pb.v2.PortDriverSchema
+	81, // 41: bess.pb.v2.GetSchemaResponse.descriptors:type_name -> google.protobuf.FileDescriptorSet
+	76, // 42: bess.pb.v2.Event.fields:type_name -> bess.pb.v2.Event.FieldsEntry
+	8,  // 43: bess.pb.v2.MetricSample.kind:type_name -> bess.pb.v2.MetricSample.Kind
+	77, // 44: bess.pb.v2.MetricSample.labels:type_name -> bess.pb.v2.MetricSample.LabelsEntry
+	54, // 45: bess.pb.v2.ListMetricsResponse.samples:type_name -> bess.pb.v2.MetricSample
+	78, // 46: bess.pb.v2.PortStatus.link:type_name -> bess.pb.v2.PortStatus.Link
+	79, // 47: bess.pb.v2.PortStatus.rx:type_name -> bess.pb.v2.PortStatus.Counters
+	79, // 48: bess.pb.v2.PortStatus.tx:type_name -> bess.pb.v2.PortStatus.Counters
+	61, // 49: bess.pb.v2.GetPortStatusResponse.ports:type_name -> bess.pb.v2.PortStatus
+	64, // 50: bess.pb.v2.GetPacketPoolsResponse.pools:type_name -> bess.pb.v2.PacketPool
+	9,  // 51: bess.pb.v2.SetCaptureRequest.direction:type_name -> bess.pb.v2.SetCaptureRequest.Direction
+	10, // 52: bess.pb.v2.SetCaptureRequest.format:type_name -> bess.pb.v2.SetCaptureRequest.Format
+	21, // 53: bess.pb.v2.Control.GetPipeline:input_type -> bess.pb.v2.GetPipelineRequest
+	23, // 54: bess.pb.v2.Control.ValidatePipeline:input_type -> bess.pb.v2.ValidatePipelineRequest
+	25, // 55: bess.pb.v2.Control.DiffPipeline:input_type -> bess.pb.v2.DiffPipelineRequest
+	27, // 56: bess.pb.v2.Control.PlanPipeline:input_type -> bess.pb.v2.PlanPipelineRequest
+	29, // 57: bess.pb.v2.Control.ApplyPipeline:input_type -> bess.pb.v2.ApplyPipelineRequest
+	33, // 58: bess.pb.v2.Control.ApplyTransaction:input_type -> bess.pb.v2.ApplyTransactionRequest
+	37, // 59: bess.pb.v2.Control.GetTransaction:input_type -> bess.pb.v2.GetTransactionRequest
+	53, // 60: bess.pb.v2.Control.ListMetrics:input_type -> bess.pb.v2.ListMetricsRequest
+	42, // 61: bess.pb.v2.Control.GetCapabilities:input_type -> bess.pb.v2.GetCapabilitiesRequest
+	46, // 62: bess.pb.v2.Control.GetSchema:input_type -> bess.pb.v2.GetSchemaRequest
+	51, // 63: bess.pb.v2.Control.WatchEvents:input_type -> bess.pb.v2.WatchEventsRequest
+	39, // 64: bess.pb.v2.Control.ListTransactionResources:input_type -> bess.pb.v2.ListTransactionResourcesRequest
+	56, // 65: bess.pb.v2.Admin.ImportPlugin:input_type -> bess.pb.v2.ImportPluginRequest
+	58, // 66: bess.pb.v2.Admin.UnloadPlugin:input_type -> bess.pb.v2.UnloadPluginRequest
+	60, // 67: bess.pb.v2.Admin.GetPortStatus:input_type -> bess.pb.v2.GetPortStatusRequest
+	63, // 68: bess.pb.v2.Admin.GetPacketPools:input_type -> bess.pb.v2.GetPacketPoolsRequest
+	66, // 69: bess.pb.v2.Admin.SetCapture:input_type -> bess.pb.v2.SetCaptureRequest
+	68, // 70: bess.pb.v2.Admin.PauseWorkers:input_type -> bess.pb.v2.PauseWorkersRequest
+	70, // 71: bess.pb.v2.Admin.ResumeWorkers:input_type -> bess.pb.v2.ResumeWorkersRequest
+	72, // 72: bess.pb.v2.Admin.Shutdown:input_type -> bess.pb.v2.ShutdownRequest
+	22, // 73: bess.pb.v2.Control.GetPipeline:output_type -> bess.pb.v2.GetPipelineResponse
+	24, // 74: bess.pb.v2.Control.ValidatePipeline:output_type -> bess.pb.v2.ValidatePipelineResponse
+	26, // 75: bess.pb.v2.Control.DiffPipeline:output_type -> bess.pb.v2.DiffPipelineResponse
+	28, // 76: bess.pb.v2.Control.PlanPipeline:output_type -> bess.pb.v2.PlanPipelineResponse
+	30, // 77: bess.pb.v2.Control.ApplyPipeline:output_type -> bess.pb.v2.ApplyPipelineResponse
+	36, // 78: bess.pb.v2.Control.ApplyTransaction:output_type -> bess.pb.v2.ApplyTransactionResponse
+	38, // 79: bess.pb.v2.Control.GetTransaction:output_type -> bess.pb.v2.GetTransactionResponse
+	55, // 80: bess.pb.v2.Control.ListMetrics:output_type -> bess.pb.v2.ListMetricsResponse
+	45, // 81: bess.pb.v2.Control.GetCapabilities:output_type -> bess.pb.v2.GetCapabilitiesResponse
+	50, // 82: bess.pb.v2.Control.GetSchema:output_type -> bess.pb.v2.GetSchemaResponse
+	52, // 83: bess.pb.v2.Control.WatchEvents:output_type -> bess.pb.v2.Event
+	41, // 84: bess.pb.v2.Control.ListTransactionResources:output_type -> bess.pb.v2.ListTransactionResourcesResponse
+	57, // 85: bess.pb.v2.Admin.ImportPlugin:output_type -> bess.pb.v2.ImportPluginResponse
+	59, // 86: bess.pb.v2.Admin.UnloadPlugin:output_type -> bess.pb.v2.UnloadPluginResponse
+	62, // 87: bess.pb.v2.Admin.GetPortStatus:output_type -> bess.pb.v2.GetPortStatusResponse
+	65, // 88: bess.pb.v2.Admin.GetPacketPools:output_type -> bess.pb.v2.GetPacketPoolsResponse
+	67, // 89: bess.pb.v2.Admin.SetCapture:output_type -> bess.pb.v2.SetCaptureResponse
+	69, // 90: bess.pb.v2.Admin.PauseWorkers:output_type -> bess.pb.v2.PauseWorkersResponse
+	71, // 91: bess.pb.v2.Admin.ResumeWorkers:output_type -> bess.pb.v2.ResumeWorkersResponse
+	73, // 92: bess.pb.v2.Admin.Shutdown:output_type -> bess.pb.v2.ShutdownResponse
+	73, // [73:93] is the sub-list for method output_type
+	53, // [53:73] is the sub-list for method input_type
+	53, // [53:53] is the sub-list for extension type_name
+	53, // [53:53] is the sub-list for extension extendee
+	0,  // [0:53] is the sub-list for field type_name
 }
 
 func init() { file_control_v2_proto_init() }
@@ -5289,16 +5385,17 @@ func file_control_v2_proto_init() {
 		return
 	}
 	file_control_v2_proto_msgTypes[4].OneofWrappers = []any{}
-	file_control_v2_proto_msgTypes[17].OneofWrappers = []any{}
-	file_control_v2_proto_msgTypes[21].OneofWrappers = []any{}
-	file_control_v2_proto_msgTypes[54].OneofWrappers = []any{}
+	file_control_v2_proto_msgTypes[5].OneofWrappers = []any{}
+	file_control_v2_proto_msgTypes[18].OneofWrappers = []any{}
+	file_control_v2_proto_msgTypes[22].OneofWrappers = []any{}
+	file_control_v2_proto_msgTypes[55].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_control_v2_proto_rawDesc), len(file_control_v2_proto_rawDesc)),
 			NumEnums:      11,
-			NumMessages:   68,
+			NumMessages:   69,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

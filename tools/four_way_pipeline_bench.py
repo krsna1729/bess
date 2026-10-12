@@ -3,7 +3,9 @@
 """Four-way live dataplane throughput comparison for port-free BESS configs.
 
 Runs every samples/perftest .bess configuration that needs no physical PMD
-port, using software Source/Sink paths and isolated worker CPUs:
+port, using software Source/Sink paths and isolated worker CPUs (a sample
+converted to a manifest here, D-104, runs from master's tree, the same script
+on every variant):
   1: Master (native)
   2: Master (x86-64-v3)
   3: Current (x86-64-v3)

@@ -1,0 +1,68 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# VLANPush and VLANPop, single and double tagged.
+#
+# Converted from vlantest.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "AAIVN6JEAK7zUqrRCABFAAAnAAEAAEARfMN/AAABfwAAAQA1ADUAE6+NSGVsbG8gV29ybGQ="
+  - name: rewrite1
+    mclass: Rewrite
+    arg:
+      templates:
+        - "AAIVN6JEAK7zUqrRCABFAAAnAAEAAEARfMN/AAABfwAAAQA1ADUAE6+NSGVsbG8gV29ybGQ="
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: source0
+    mclass: Source
+  - name: source1
+    mclass: Source
+  - name: vlan_pop0
+    mclass: VLANPop
+  - name: vlan_pop1
+    mclass: VLANPop
+  - name: vlan_pop2
+    mclass: VLANPop
+  - name: vlan_push0
+    mclass: VLANPush
+    arg:
+      tci: "2"
+  - name: vlan_push1
+    mclass: VLANPush
+    arg:
+      tci: "2"
+  - name: vlan_push2
+    mclass: VLANPush
+    arg:
+      tci: "3"
+connections:
+  - upstream: rewrite0
+    downstream: vlan_push0
+  - upstream: rewrite1
+    downstream: vlan_push1
+  - upstream: source0
+    downstream: rewrite0
+  - upstream: source1
+    downstream: rewrite1
+  - upstream: vlan_pop0
+    downstream: sink0
+  - upstream: vlan_pop1
+    downstream: vlan_pop2
+  - upstream: vlan_pop2
+    downstream: sink1
+  - upstream: vlan_push0
+    downstream: vlan_pop0
+  - upstream: vlan_push1
+    downstream: vlan_push2
+  - upstream: vlan_push2
+    downstream: vlan_pop1
+workers:
+  - {wid: 0, core: 0}

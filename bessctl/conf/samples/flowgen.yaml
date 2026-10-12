@@ -1,0 +1,26 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# FlowGen: generated TCP flows of 60-byte packets into a Sink (the .bess took
+# the size from $BESS_PKT_SIZE; change the template to vary it).
+#
+# Converted from flowgen.bess (D-104).
+modules:
+  - name: flowgen0
+    mclass: FlowGen
+    arg:
+      template: BhY+G3IyAh5nn02uCABFAAAuAAEAAEAGZscKAAABCgAAAicRJxIAAAAAAAAAAFACIADptAAAaGVsbG8w
+      pps: 1000000
+      flow_rate: 10000
+      flow_duration: 10
+      arrival: exponential
+      duration: pareto
+      quick_rampup: true
+  - name: sink0
+    mclass: Sink
+connections:
+  - upstream: flowgen0
+    downstream: sink0
+workers:
+  - {wid: 0, core: 0}

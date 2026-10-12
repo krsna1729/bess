@@ -11,7 +11,10 @@
 
 #include <gtest/gtest.h>
 
+#include <functional>
+#include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "control/control_plane.h"
@@ -912,6 +915,397 @@ TEST_F(ApplyPipelineTest, LegacyReparentRefusesToMoveAnAttachedRoot) {
   EXPECT_EQ(generation, bess::runtime::runtime().generation());
   EXPECT_TRUE(control_plane_->GetPipeline() == active);
   EXPECT_TRUE(bess::runtime::runtime().traffic_classes().Contains("solo"));
+}
+
+// Two Source modules (one task each) into a Sink, two rate-limited classes on
+// worker 0, and src0's task under rl0: what attach_task sets up, as desired
+// state.
+PipelineSpec PlacedTasks() {
+  PipelineSpec spec;
+  spec.workers.push_back({0, 0, ""});
+  for (const char *name : {"src0", "src1"}) {
+    spec.modules.push_back({name, "Source", {}});
+    spec.connections.push_back({name, 0, "sink", 0, false});
+  }
+  spec.modules.push_back({"sink", "Sink", {}});
+  for (const char *name : {"rl0", "rl1"}) {
+    bess::control::TrafficClassSpec tc;
+    tc.name = name;
+    tc.policy = "rate_limit";
+    tc.resource = "packet";
+    tc.wid = 0;
+    tc.limit["packet"] = 1000;
+    spec.traffic_classes.push_back(tc);
+  }
+  bess::control::TaskPlacementSpec task;
+  task.module = "src0";
+  task.parent = "rl0";
+  spec.tasks.push_back(task);
+  return spec;
+}
+
+const bess::control::TaskPlacementSpec *PlacementOf(const PipelineSpec &spec,
+                                                    const std::string &module) {
+  for (const auto &task : spec.tasks) {
+    if (task.module == module) {
+      return &task;
+    }
+  }
+  return nullptr;
+}
+
+// Where a task is scheduled is desired state: applied, read back by
+// GetPipeline, a no-op to reapply, and moved by a changed placement. A task
+// desired state does not name stays where it is.
+TEST_F(ApplyPipelineTest, TaskPlacementIsDesiredState) {
+  PipelineSpec spec = PlacedTasks();
+  auto applied = control_plane_->ApplyPipeline(spec, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+
+  PipelineSpec running = SpecFromSnapshot(control_plane_->GetPipeline());
+  const auto *placed = PlacementOf(running, "src0");
+  ASSERT_NE(nullptr, placed) << "GetPipeline lost the task's placement";
+  EXPECT_EQ("rl0", placed->parent);
+  auto diff = control_plane_->DiffPipeline(spec);
+  ASSERT_TRUE(diff.has_value()) << diff.error().message;
+  EXPECT_TRUE(diff->empty()) << diff->tasks.size() << " task change(s)";
+  // What GetPipeline printed applies as a no-op too.
+  auto again = control_plane_->DiffPipeline(running);
+  ASSERT_TRUE(again.has_value()) << again.error().message;
+  EXPECT_TRUE(again->empty());
+
+  // src0 moved under rl1; src1 placed at worker 0's root, where a task no
+  // one placed already went (a single worker): no change for it.
+  PipelineSpec moved = spec;
+  moved.tasks[0].parent = "rl1";
+  bess::control::TaskPlacementSpec root;
+  root.module = "src1";
+  root.wid = 0;
+  moved.tasks.push_back(root);
+  diff = control_plane_->DiffPipeline(moved);
+  ASSERT_TRUE(diff.has_value()) << diff.error().message;
+  ASSERT_EQ(1u, diff->tasks.size());
+  EXPECT_EQ("src0", diff->tasks[0].desired.module);
+  applied = control_plane_->ApplyPipeline(moved, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  running = SpecFromSnapshot(control_plane_->GetPipeline());
+  ASSERT_NE(nullptr, PlacementOf(running, "src0"));
+  EXPECT_EQ("rl1", PlacementOf(running, "src0")->parent);
+  ASSERT_NE(nullptr, PlacementOf(running, "src1"));
+  EXPECT_EQ("", PlacementOf(running, "src1")->parent);
+  EXPECT_EQ(0, PlacementOf(running, "src1")->wid);
+  diff = control_plane_->DiffPipeline(moved);
+  ASSERT_TRUE(diff.has_value());
+  EXPECT_TRUE(diff->empty());
+
+  // Not named: left where it is.
+  PipelineSpec unnamed = moved;
+  unnamed.tasks.clear();
+  diff = control_plane_->DiffPipeline(unnamed);
+  ASSERT_TRUE(diff.has_value());
+  EXPECT_TRUE(diff->empty());
+}
+
+// Placements are applied together: two tasks may trade places even where a
+// class takes one child (rate_limit), which one move at a time cannot do.
+TEST_F(ApplyPipelineTest, TasksTradePlaces) {
+  PipelineSpec spec = PlacedTasks();
+  bess::control::TaskPlacementSpec second;
+  second.module = "src1";
+  second.parent = "rl1";
+  spec.tasks.push_back(second);
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+
+  PipelineSpec swapped = spec;
+  swapped.tasks[0].parent = "rl1";
+  swapped.tasks[1].parent = "rl0";
+  auto applied = control_plane_->ApplyPipeline(swapped, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  const PipelineSpec running = SpecFromSnapshot(control_plane_->GetPipeline());
+  ASSERT_NE(nullptr, PlacementOf(running, "src0"));
+  ASSERT_NE(nullptr, PlacementOf(running, "src1"));
+  EXPECT_EQ("rl1", PlacementOf(running, "src0")->parent);
+  EXPECT_EQ("rl0", PlacementOf(running, "src1")->parent);
+}
+
+// A placement the scheduler refuses at commit (the class is full with a task
+// desired state does not name) moves no task: those already moved go back.
+TEST_F(ApplyPipelineTest, RefusedPlacementMovesNoTask) {
+  PipelineSpec spec = PlacedTasks();  // src0 under rl0
+  spec.modules.push_back({"src2", "Source", {}});
+  spec.connections.push_back({"src2", 0, "sink", 0, false});
+  bess::control::TaskPlacementSpec occupant;
+  occupant.module = "src1";
+  occupant.parent = "rl1";
+  spec.tasks.push_back(occupant);
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+  const PipelineSnapshot active = control_plane_->GetPipeline();
+
+  // src0 to worker 0's root (fine), then src2 into rl1, which src1 still
+  // holds: desired state no longer names src1, so only the scheduler knows.
+  PipelineSpec crowded = spec;
+  crowded.tasks.clear();
+  bess::control::TaskPlacementSpec root;
+  root.module = "src0";
+  root.wid = 0;
+  crowded.tasks.push_back(root);
+  bess::control::TaskPlacementSpec intruder;
+  intruder.module = "src2";
+  intruder.parent = "rl1";
+  crowded.tasks.push_back(intruder);
+  auto applied = control_plane_->ApplyPipeline(crowded, {});
+  ASSERT_FALSE(applied.has_value()) << "rl1 took a second child";
+
+  EXPECT_TRUE(control_plane_->GetPipeline() == active);
+  const PipelineSpec running = SpecFromSnapshot(control_plane_->GetPipeline());
+  ASSERT_NE(nullptr, PlacementOf(running, "src0"));
+  EXPECT_EQ("rl0", PlacementOf(running, "src0")->parent) << "src0 stayed moved";
+}
+
+// Removing classes together with the modules whose tasks they hold: deleting
+// a class deletes the leaves under it, so the modules go first.
+TEST_F(ApplyPipelineTest, ClassesGoWithTheTasksTheyHold) {
+  ASSERT_TRUE(control_plane_->ApplyPipeline(PlacedTasks(), {}).has_value());
+
+  PipelineSpec other;
+  other.workers.push_back({0, 0, ""});
+  other.modules.push_back({"src9", "Source", {}});
+  other.modules.push_back({"sink9", "Sink", {}});
+  other.connections.push_back({"src9", 0, "sink9", 0, false});
+  auto applied = control_plane_->ApplyPipeline(other, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  const PipelineSpec running = SpecFromSnapshot(control_plane_->GetPipeline());
+  EXPECT_TRUE(running.traffic_classes.empty());
+  ASSERT_EQ(1u, running.tasks.size());
+  EXPECT_EQ("src9", running.tasks[0].module);
+}
+
+// A class that would still hold the task of a module the plan keeps (and
+// does not place elsewhere) is not removed: the plan is refused unchanged.
+TEST_F(ApplyPipelineTest, AClassHoldingAKeptTaskStays) {
+  ASSERT_TRUE(control_plane_->ApplyPipeline(PlacedTasks(), {}).has_value());
+  const PipelineSnapshot active = control_plane_->GetPipeline();
+
+  PipelineSpec without = PlacedTasks();
+  std::erase_if(without.traffic_classes, [](const auto &tc) { return tc.name == "rl0"; });
+  without.tasks.clear();  // src0 is not placed: it would stay under rl0
+  auto applied = control_plane_->ApplyPipeline(without, {});
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ("transaction", applied.error().field) << applied.error().message;
+  EXPECT_NE(std::string::npos, applied.error().message.find("src0"))
+      << applied.error().message;
+  EXPECT_TRUE(control_plane_->GetPipeline() == active);
+
+  // Placed elsewhere, the class goes.
+  bess::control::TaskPlacementSpec root;
+  root.module = "src0";
+  root.wid = 0;
+  without.tasks.push_back(root);
+  applied = control_plane_->ApplyPipeline(without, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+}
+
+// A class holding a task may move out of a class the plan removes: the
+// task goes with it, so the removal deletes nothing it should not.
+TEST_F(ApplyPipelineTest, AClassMovesOutOfARemovedOneWithItsTask) {
+  PipelineSpec spec = PlacedTasks();  // src0 under rl0
+  bess::control::TrafficClassSpec outer;
+  outer.name = "outer";
+  outer.policy = "round_robin";
+  outer.wid = 0;
+  spec.traffic_classes.push_back(outer);
+  for (auto &tc : spec.traffic_classes) {
+    if (tc.name == "rl0") {
+      tc.parent = "outer";
+      tc.wid = -1;
+    }
+  }
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+
+  PipelineSpec next = spec;
+  std::erase_if(next.traffic_classes, [](const auto &tc) { return tc.name == "outer"; });
+  for (auto &tc : next.traffic_classes) {
+    if (tc.name == "rl0") {
+      tc.parent.clear();
+      tc.wid = 0;
+    }
+  }
+  auto applied = control_plane_->ApplyPipeline(next, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  const PipelineSpec running = SpecFromSnapshot(control_plane_->GetPipeline());
+  ASSERT_NE(nullptr, PlacementOf(running, "src0"));
+  EXPECT_EQ("rl0", PlacementOf(running, "src0")->parent);
+}
+
+// A task the plan moves off a worker it removes does not keep that worker.
+TEST_F(ApplyPipelineTest, ATaskMovesOffARemovedWorker) {
+  PipelineSpec two;
+  two.workers.push_back({0, 0, ""});
+  two.workers.push_back({1, 1, ""});
+  two.modules.push_back({"src0", "Source", {}});
+  two.modules.push_back({"sink", "Sink", {}});
+  two.connections.push_back({"src0", 0, "sink", 0, false});
+  bess::control::TaskPlacementSpec on_one;
+  on_one.module = "src0";
+  on_one.wid = 1;
+  two.tasks.push_back(on_one);
+  ASSERT_TRUE(control_plane_->ApplyPipeline(two, {}).has_value());
+
+  PipelineSpec one = two;
+  one.workers.pop_back();
+  one.tasks[0].wid = 0;
+  auto applied = control_plane_->ApplyPipeline(one, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  const PipelineSpec running = SpecFromSnapshot(control_plane_->GetPipeline());
+  ASSERT_EQ(1u, running.workers.size());
+  ASSERT_NE(nullptr, PlacementOf(running, "src0"));
+  EXPECT_EQ(0, PlacementOf(running, "src0")->wid);
+}
+
+// Tasks of new modules no one placed get a worker that stays: not one the
+// same plan removes (the retire phase would then refuse to remove it), also
+// when the plan's own steps pause workers on the way (a disconnect does).
+TEST_F(ApplyPipelineTest, NewTasksAvoidARemovedWorker) {
+  PipelineSpec two;
+  two.workers.push_back({0, 0, ""});
+  two.workers.push_back({1, 1, ""});
+  two.modules.push_back({"sink", "Sink", {}});
+  two.modules.push_back({"old", "Bypass", {}});
+  two.connections.push_back({"old", 0, "sink", 0, false});
+  ASSERT_TRUE(control_plane_->ApplyPipeline(two, {}).has_value());
+
+  PipelineSpec one = two;
+  one.workers.pop_back();
+  one.modules.pop_back();
+  one.connections.clear();
+  for (const char *name : {"new0", "new1", "new2"}) {  // round robin reaches 1
+    one.modules.push_back({name, "Source", {}});
+    one.connections.push_back({name, 0, "sink", 0, false});
+  }
+  auto applied = control_plane_->ApplyPipeline(one, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  const PipelineSpec running = SpecFromSnapshot(control_plane_->GetPipeline());
+  ASSERT_EQ(1u, running.workers.size());
+  for (const char *name : {"new0", "new1", "new2"}) {
+    ASSERT_NE(nullptr, PlacementOf(running, name)) << name;
+    EXPECT_EQ(0, PlacementOf(running, name)->wid) << name;
+  }
+}
+
+// A task takes the place of a removed module's task, even in a class that
+// takes one child (rate_limit): the leaving task makes room first.
+TEST_F(ApplyPipelineTest, ATaskTakesALeavingTasksPlace) {
+  ASSERT_TRUE(control_plane_->ApplyPipeline(PlacedTasks(), {}).has_value());
+
+  PipelineSpec next = PlacedTasks();  // src0 under rl0
+  std::erase_if(next.modules, [](const auto &m) { return m.name == "src0"; });
+  std::erase_if(next.connections, [](const auto &c) { return c.upstream == "src0"; });
+  next.modules.push_back({"src5", "Source", {}});
+  next.connections.push_back({"src5", 0, "sink", 0, false});
+  next.tasks[0].module = "src5";
+  auto applied = control_plane_->ApplyPipeline(next, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  const PipelineSpec running = SpecFromSnapshot(control_plane_->GetPipeline());
+  ASSERT_NE(nullptr, PlacementOf(running, "src5"));
+  EXPECT_EQ("rl0", PlacementOf(running, "src5")->parent);
+  EXPECT_EQ(nullptr, PlacementOf(running, "src0"));
+}
+
+// A class that moves and changes its limit gets both.
+TEST_F(ApplyPipelineTest, AMovedClassKeepsItsNewLimit) {
+  PipelineSpec spec = PlacedTasks();
+  bess::control::TrafficClassSpec root;
+  root.name = "top";
+  root.policy = "round_robin";
+  root.wid = 0;
+  spec.traffic_classes.push_back(root);
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+
+  for (auto &tc : spec.traffic_classes) {
+    if (tc.name == "rl0") {
+      tc.parent = "top";
+      tc.wid = -1;
+      tc.limit["packet"] = 5000;
+    }
+  }
+  auto applied = control_plane_->ApplyPipeline(spec, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  auto diff = control_plane_->DiffPipeline(spec);
+  ASSERT_TRUE(diff.has_value()) << diff.error().message;
+  EXPECT_TRUE(diff->empty()) << "the limit was left behind";
+}
+
+// A nested tree goes children first, whatever the names sort to: deleting a
+// class deletes the classes under it, which must not be deleted again.
+TEST_F(ApplyPipelineTest, ANestedTreeGoesChildrenFirst) {
+  PipelineSpec tree;
+  tree.workers.push_back({0, 0, ""});
+  std::string parent;
+  for (const char *name : {"a", "b", "c"}) {  // a over b over c
+    bess::control::TrafficClassSpec tc;
+    tc.name = name;
+    tc.policy = "round_robin";
+    tc.parent = parent;
+    tc.wid = parent.empty() ? 0 : -1;
+    tree.traffic_classes.push_back(tc);
+    parent = name;
+  }
+  ASSERT_TRUE(control_plane_->ApplyPipeline(tree, {}).has_value());
+
+  PipelineSpec bare;
+  bare.workers.push_back({0, 0, ""});
+  auto plan = control_plane_->PlanPipeline(bare);
+  ASSERT_TRUE(plan.has_value()) << plan.error().message;
+  std::string order;
+  for (const auto &op : plan->retire_ops) {
+    if (const auto *remove = std::get_if<bess::control::RemoveTcOp>(&op)) {
+      order += remove->name;
+    }
+  }
+  EXPECT_EQ("cba", order);
+
+  auto applied = control_plane_->ApplyPipeline(bare, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  EXPECT_TRUE(SpecFromSnapshot(control_plane_->GetPipeline()).traffic_classes.empty());
+}
+
+// Impossible placements are refused before anything changes.
+TEST_F(ApplyPipelineTest, ImpossibleTaskPlacementsAreRefused) {
+  struct Case {
+    const char *what;
+    std::function<void(PipelineSpec &)> change;
+    const char *field;
+  };
+  const Case cases[] = {
+      {"no module", [](PipelineSpec &s) { s.tasks[0].module = "nope"; }, "module"},
+      {"no parent class", [](PipelineSpec &s) { s.tasks[0].parent = "nope"; }, "parent"},
+      {"neither parent nor wid", [](PipelineSpec &s) { s.tasks[0].parent = ""; }, "wid"},
+      {"both", [](PipelineSpec &s) { s.tasks[0].wid = 0; }, "wid"},
+      {"twice", [](PipelineSpec &s) { s.tasks.push_back(s.tasks[0]); }, "task"},
+      {"task index", [](PipelineSpec &s) { s.tasks[0].task = MAX_TASKS_PER_MODULE; }, "task"},
+      {"a priority under rate_limit",
+       [](PipelineSpec &s) {
+         s.tasks[0].has_priority = true;
+         s.tasks[0].priority = 1;
+       },
+       "parent"},
+      // A rate_limit class takes one child, tasks counted.
+      {"second child of rate_limit",
+       [](PipelineSpec &s) {
+         bess::control::TaskPlacementSpec other = s.tasks[0];
+         other.module = "src1";
+         s.tasks.push_back(other);
+       },
+       "parent"},
+  };
+  for (const Case &c : cases) {
+    PipelineSpec spec = PlacedTasks();
+    c.change(spec);
+    auto applied = control_plane_->ApplyPipeline(spec, {});
+    ASSERT_FALSE(applied.has_value()) << c.what;
+    EXPECT_EQ(c.field, applied.error().field) << c.what << ": " << applied.error().message;
+    EXPECT_TRUE(bess::runtime::runtime().modules().All().empty()) << c.what;
+  }
 }
 
 }  // namespace

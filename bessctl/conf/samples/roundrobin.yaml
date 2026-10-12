@@ -1,0 +1,53 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# RoundRobin: per-packet round robin over gates 0 and 2 (skipping 1).
+#
+# Converted from roundrobin.bess (D-104).
+modules:
+  - name: rr1
+    mclass: RoundRobin
+    arg:
+      gates:
+        - "0"
+        - "1"
+        - "2"
+  - name: rr2
+    mclass: RoundRobin
+    arg:
+      gates:
+        - "0"
+        - "2"
+      mode: packet
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: source0
+    mclass: Source
+  - name: source1
+    mclass: Source
+connections:
+  - upstream: rr1
+    downstream: sink1
+  - upstream: rr1
+    ogate: 1
+    downstream: sink1
+  - upstream: rr1
+    ogate: 2
+    downstream: sink1
+  - upstream: rr2
+    downstream: sink2
+  - upstream: rr2
+    ogate: 1
+    downstream: sink2
+  - upstream: rr2
+    ogate: 2
+    downstream: sink2
+  - upstream: source0
+    downstream: rr1
+  - upstream: source1
+    downstream: rr2
+workers:
+  - {wid: 0, core: 0}

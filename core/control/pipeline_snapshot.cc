@@ -79,6 +79,27 @@ PipelineSpec SpecFromSnapshot(const PipelineSnapshot &snapshot) {
   }
 
   for (const TrafficClassSnapshot &tc : snapshot.traffic_classes) {
+    if (!tc.leaf_module_name.empty()) {
+      // A module task's leaf class: its placement is desired state, the class
+      // is not. Under an internal wrapper it is at that worker's root; with
+      // no worker it is waiting for any worker, which is no placement.
+      TaskPlacementSpec task;
+      task.module = tc.leaf_module_name;
+      task.task = tc.leaf_module_taskid;
+      if (!tc.parent.empty() && tc.parent[0] != '!') {
+        task.parent = tc.parent;
+      } else if (tc.wid != Worker::kAnyWorker) {
+        task.wid = tc.wid;
+      } else {
+        continue;
+      }
+      task.has_priority = tc.has_priority;
+      task.priority = tc.priority;
+      task.has_share = tc.has_share;
+      task.share = tc.share;
+      spec.tasks.push_back(std::move(task));
+      continue;
+    }
     if (!tc.name.empty() && tc.name[0] == '!') {
       continue;
     }
@@ -243,6 +264,17 @@ PipelineSnapshot SnapshotRuntime(const runtime::RuntimeState &runtime) {
       auto it = std::find(tasks.begin(), tasks.end(), task);
       if (it != tasks.end()) {
         entry.leaf_module_taskid = it - tasks.begin();
+      }
+      // A root of a worker's scheduler has that worker; an orphan (not
+      // attached yet) the worker it waits for (-1: any), from the orphan list
+      // a resume attaches.
+      if (c->parent() == nullptr) {
+        for (const auto &[wid, orphan] : runtime.workers().orphan_tcs()) {
+          if (orphan == c) {
+            entry.wid = wid;
+            break;
+          }
+        }
       }
     }
 

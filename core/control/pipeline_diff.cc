@@ -231,8 +231,11 @@ PipelineDiff Diff(const PipelineSnapshot &current,
                active->has_share != tc.has_share ||
                active->share != tc.share) {
       // Attachment is reversible: detach and reattach.
-      diff.traffic_classes.push_back(
-          TrafficClassChange{tc.name, ChangeKind::kUpdate, tc});
+      TrafficClassChange change{tc.name, ChangeKind::kUpdate, tc};
+      change.params_changed = active->resource != tc.resource ||
+                              active->limit != DesiredLimit(tc) ||
+                              active->max_burst != DesiredMaxBurst(tc);
+      diff.traffic_classes.push_back(std::move(change));
     } else if (active->resource != tc.resource ||
                active->limit != DesiredLimit(tc) ||
                active->max_burst != DesiredMaxBurst(tc)) {
@@ -250,12 +253,56 @@ PipelineDiff Diff(const PipelineSnapshot &current,
       continue;  // module leaf classes and scheduler defaults
     }
     if (desired_tcs.find(active.name) == desired_tcs.end()) {
+      // The parent it has now: removals go children first, and deleting a
+      // class deletes the classes still under it.
+      TrafficClassSpec removed;
+      removed.name = active.name;
+      removed.parent = active.parent;
       diff.traffic_classes.push_back(
-          TrafficClassChange{active.name, ChangeKind::kRemove, {}});
+          TrafficClassChange{active.name, ChangeKind::kRemove, removed});
     }
   }
 
   // Drop the unchanged entries: the diff is the set of things to do.
+  // -- task placements --------------------------------------------------------
+  // Only the tasks desired state names: the others stay where they are. A
+  // task is (re)attached when it differs from where it is, or when its module
+  // or its parent class is built anew by this change (the task or the parent
+  // is then a new object).
+  const auto rebuilt = [](const auto &changes, const std::string &name) {
+    for (const auto &change : changes) {
+      if (change.name == name) {
+        return change.kind == ChangeKind::kCreate ||
+               change.kind == ChangeKind::kReplace;
+      }
+    }
+    return false;
+  };
+  for (const TaskPlacementSpec &task : desired.tasks) {
+    bool same = !rebuilt(diff.modules, task.module) &&
+                (task.parent.empty() ||
+                 !rebuilt(diff.traffic_classes, task.parent));
+    if (same) {
+      const TrafficClassSnapshot *leaf = nullptr;
+      for (const TrafficClassSnapshot &tc : current.traffic_classes) {
+        if (tc.leaf_module_name == task.module &&
+            tc.leaf_module_taskid == task.task) {
+          leaf = &tc;
+          break;
+        }
+      }
+      same = leaf != nullptr && EffectiveParent(*leaf) == task.parent &&
+             (!task.parent.empty() || leaf->wid == task.wid) &&
+             leaf->has_priority == task.has_priority &&
+             (!task.has_priority || leaf->priority == task.priority) &&
+             leaf->has_share == task.has_share &&
+             (!task.has_share || leaf->share == task.share);
+    }
+    if (!same) {
+      diff.tasks.push_back(TaskChange{task, ChangeKind::kUpdate});
+    }
+  }
+
   auto drop_unchanged = [](auto &changes) {
     changes.erase(std::remove_if(changes.begin(), changes.end(),
                                  [](const auto &change) {

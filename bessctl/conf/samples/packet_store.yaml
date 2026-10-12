@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Bounded packet store (packets waiting for a downstream event, e.g. paging
+# or ARP resolution): gate 0 released packets, gate 1 evicted or expired ones.
+#
+# Converted from packet_store.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: ps
+    mclass: PacketStore
+    arg:
+      max_packets: 4096
+      max_packets_per_flow: 64
+      timeout_ms: 5000
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "AgAAAAACAgAAAAABCABFAAA2AAEAAEARZrQKAAABCgAAAicRJxIAIpTGUEFDS0VUX1NUT1JFX0JVRkZFUkVEX0RBVEE="
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: source0
+    mclass: Source
+connections:
+  - upstream: ps
+    downstream: sink0
+  - upstream: ps
+    ogate: 1
+    downstream: sink1
+  - upstream: rewrite0
+    downstream: ps
+  - upstream: source0
+    downstream: rewrite0
+workers:
+  - {wid: 0, core: 0}

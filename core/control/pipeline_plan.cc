@@ -114,6 +114,9 @@ PipelinePlan Plan(const PipelineDiff &diff) {
         break;  // handled above, in hierarchy order
       case ChangeKind::kUpdate:
         plan.commit_ops.push_back(ReparentTcOp{change.desired});
+        if (change.params_changed) {
+          plan.commit_ops.push_back(UpdateTcParamsOp{change.desired});
+        }
         break;
       case ChangeKind::kUpdateParams:
         plan.commit_ops.push_back(UpdateTcParamsOp{change.desired});
@@ -132,8 +135,36 @@ PipelinePlan Plan(const PipelineDiff &diff) {
     }
   }
 
+  // Tasks last in the commit, in one step: their modules and parent classes
+  // exist now, and a task leaves a class the retire phase removes before it
+  // goes. Last also because the step has no undo entry: it restores itself
+  // when refused, and nothing after it can abort the transaction.
+  if (!diff.tasks.empty()) {
+    PlaceTasksOp place;
+    for (const TaskChange &change : diff.tasks) {
+      place.tasks.push_back(change.desired);
+    }
+    for (const ModuleChange &change : diff.modules) {
+      if (change.kind == ChangeKind::kRemove) {
+        place.leaving.push_back(change.name);
+      }
+    }
+    plan.commit_ops.push_back(std::move(place));
+  }
+
   // -- retire: teardown, reverse dependency order ---------------------------
-  // Children before parents, the reverse of how they were created.
+  // Modules before ports: a module releases the port queues it acquired.
+  for (const ModuleChange &change : diff.modules) {
+    if (change.kind == ChangeKind::kRemove ||
+        change.kind == ChangeKind::kReplace) {
+      plan.retire_ops.push_back(RemoveModuleOp{change.name});
+    }
+  }
+
+  // Traffic classes after the modules: deleting a class deletes the classes
+  // under it, the leaves of modules' tasks too, which their modules (removed
+  // first) must not outlive. Children before parents, the reverse of how they
+  // were created.
   std::vector<const TrafficClassChange *> tc_removes;
   for (const TrafficClassChange &change : diff.traffic_classes) {
     if (change.kind == ChangeKind::kRemove) {
@@ -147,14 +178,6 @@ PipelinePlan Plan(const PipelineDiff &diff) {
                    });
   for (const TrafficClassChange *change : tc_removes) {
     plan.retire_ops.push_back(RemoveTcOp{change->name});
-  }
-
-  // Modules before ports: a module releases the port queues it acquired.
-  for (const ModuleChange &change : diff.modules) {
-    if (change.kind == ChangeKind::kRemove ||
-        change.kind == ChangeKind::kReplace) {
-      plan.retire_ops.push_back(RemoveModuleOp{change.name});
-    }
   }
 
   for (const PortChange &change : diff.ports) {

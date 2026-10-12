@@ -91,12 +91,32 @@ struct TrafficClassSpec {
   bool operator==(const TrafficClassSpec &other) const = default;
 };
 
+// Where a module's task is scheduled: under `parent`, or (no parent) at the
+// root of worker `wid`. Desired state names only the tasks it places; the
+// leaf class itself belongs to the module.
+struct TaskPlacementSpec {
+  std::string module;
+  uint64_t task = 0;
+  std::string parent;
+  int wid = -1;  // with no parent: the worker; -1: none
+  bool has_priority = false;
+  int64_t priority = 0;
+  bool has_share = false;
+  int64_t share = 0;
+
+  // The legacy attach request this placement is (FindTc by module and task).
+  TrafficClassSpec AsLeafSpec() const;
+
+  bool operator==(const TaskPlacementSpec &other) const = default;
+};
+
 struct PipelineSpec {
   std::vector<PortSpec> ports;
   std::vector<ModuleSpec> modules;
   std::vector<ConnectionSpec> connections;
   std::vector<WorkerSpec> workers;
   std::vector<TrafficClassSpec> traffic_classes;
+  std::vector<TaskPlacementSpec> tasks;
 
   bool operator==(const PipelineSpec &other) const = default;
 };
@@ -104,7 +124,7 @@ struct PipelineSpec {
 // Puts a spec into canonical form: stable ordering and normalized defaults, so
 // that two descriptions of the same pipeline compare equal and diffs do not
 // churn (section 9.6). Sorting is by name (and by (upstream, ogate) for
-// connections, by wid for workers); queue counts default to one queue, since
+// connections, by wid for workers, by (module, task) for tasks); queue counts default to one queue, since
 // that is what the runtime resolves 0 to.
 void Normalize(PipelineSpec *spec);
 

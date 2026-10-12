@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+# L2 learning bridge between two segments (gates 0 and 1): it learns MAC
+# addresses on ingress and switches frames between the segments.
+#
+# Converted from bridge.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: br
+    mclass: Bridge
+    arg:
+      size: 1024
+      aging_time: 300
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "AgAAAAACAgAAAAABCABFAAAvAAEAAEARZrsKAAABCgAAAicRJxIAG6vvQlJJREdFX0RBVEFfUEFZTE9BRA=="
+  - name: rewrite1
+    mclass: Rewrite
+    arg:
+      templates:
+        - "AgAAAAABAgAAAAACCABFAAAvAAEAAEARZrsKAAACCgAAAScRJxIAG6vvQlJJREdFX0RBVEFfUEFZTE9BRA=="
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: source0
+    mclass: Source
+  - name: source1
+    mclass: Source
+connections:
+  - upstream: br
+    downstream: sink0
+  - upstream: br
+    ogate: 1
+    downstream: sink1
+  - upstream: rewrite0
+    downstream: br
+  - upstream: rewrite1
+    downstream: br
+    igate: 1
+  - upstream: source0
+    downstream: rewrite0
+  - upstream: source1
+    downstream: rewrite1
+workers:
+  - {wid: 0, core: 0}

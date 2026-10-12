@@ -140,14 +140,18 @@ class PipelineTest(unittest.TestCase):
     def test_the_builder_assembles_and_edits_a_snapshot(self):
         p = (sdk.PipelineBuilder().worker(0, 2).module('a', 'Source').module('b', 'Bypass')
              .module('c', 'Sink').chain('a', 'b', 'c').connect('b', 'c', ogate=1)
-             .traffic_class('root', 'round_robin', wid=0, share=2, limit={'packet': 10}).build())
+             .traffic_class('root', 'round_robin', wid=0, share=2, limit={'packet': 10})
+             .task('a', wid=0).task('b', parent='root').build())
         self.assertEqual([(c.upstream, c.ogate, c.downstream) for c in p.connections],
                          [('a', 0, 'b'), ('b', 0, 'c'), ('b', 1, 'c')])
         self.assertEqual(p.traffic_classes[0].share, 2)
         self.assertFalse(p.traffic_classes[0].HasField('priority'))
+        self.assertTrue(p.tasks[0].HasField('wid'))
+        self.assertFalse(p.tasks[1].HasField('wid'), 'a parent, not worker 0')
         edited = sdk.PipelineBuilder(p).remove('b').build()
         self.assertEqual([m.name for m in edited.modules], ['a', 'c'])
         self.assertEqual(len(edited.connections), 0)
+        self.assertEqual([t.module for t in edited.tasks], ['a'])
         self.assertEqual(len(p.modules), 3)  # the base is not changed
         arg = v2.GetTransactionRequest(request_id='x')
         packed = sdk.PipelineBuilder().module('m', 'X', arg).build().modules[0].arg

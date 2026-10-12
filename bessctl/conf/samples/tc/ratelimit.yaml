@@ -1,0 +1,74 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Rate limits by each resource: scheduling count (100,000 per second),
+# cycles (100 MHz), packets (10 M/s) and bits (1 Gbit/s), one Source under each.
+#
+# Converted from ratelimit.bess (D-104).
+modules:
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: sink3
+    mclass: Sink
+  - name: sink4
+    mclass: Sink
+  - name: src0
+    mclass: Source
+  - name: src1
+    mclass: Source
+  - name: src2
+    mclass: Source
+  - name: src3
+    mclass: Source
+  - name: src4
+    mclass: Source
+connections:
+  - upstream: src0
+    downstream: sink0
+  - upstream: src1
+    downstream: sink1
+  - upstream: src2
+    downstream: sink2
+  - upstream: src3
+    downstream: sink3
+  - upstream: src4
+    downstream: sink4
+workers:
+  - {wid: 0, core: 0}
+traffic_classes:
+  - name: bit_limit
+    policy: rate_limit
+    resource: bit
+    limit:
+      bit: "1000000000"
+  - name: cycle_limit
+    policy: rate_limit
+    resource: cycle
+    limit:
+      cycle: "100000000"
+  - name: packet_limit
+    policy: rate_limit
+    resource: packet
+    limit:
+      packet: "10000000"
+  - name: schedule_limit
+    policy: rate_limit
+    resource: count
+    limit:
+      count: "100000"
+tasks:
+  - module: src0
+    parent: schedule_limit
+  - module: src1
+    parent: cycle_limit
+  - module: src2
+    parent: packet_limit
+  - module: src3
+    parent: bit_limit
+  - module: src4
+    wid: 0

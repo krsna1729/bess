@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -198,6 +199,15 @@ class ControlPlane {
   // UpdateTcParent this works for a class that is currently attached to a
   // worker: the move purges the subtree from the scheduler wakeup queues first.
   ControlResult<void> ReparentTcLocked(const TrafficClassSpec& spec);
+  // Places module tasks' leaf classes (each spec names one by
+  // leaf_module_name and leaf_module_taskid) under its parent or at its
+  // worker, in two phases: every task is detached, then each attached, so
+  // tasks may trade places. The tasks of the `leaving` modules leave their
+  // classes too (orphaned until their module is removed), making room. All or
+  // nothing: a refused attach puts every task back. For the transaction,
+  // whose workers are paused.
+  ControlResult<void> PlaceTasksLocked(std::span<const TrafficClassSpec> leaves,
+                                       std::span<const std::string> leaving);
   void RemoveSubtreeFromWakeupQueues(bess::TrafficClass* c);
   ControlResult<void> RemoveTcLocked(const std::string& name);
 

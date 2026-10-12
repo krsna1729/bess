@@ -56,6 +56,31 @@ const ConnectionSnapshot *FindEdge(const PipelineSnapshot &snapshot,
   return nullptr;
 }
 
+// The module and task index of a leaf class.
+std::pair<std::string, int> TaskOf(const TrafficClass *c) {
+  const Task *task = static_cast<const LeafTrafficClass *>(c)->task();
+  const Module *module = task->module();
+  const auto &tasks = module->tasks();
+  return {module->name(),
+          static_cast<int>(std::find(tasks.begin(), tasks.end(), task) - tasks.begin())};
+}
+
+// Whether `c` is still under `ancestor` once the commit ran: not if a class
+// between them moves (it goes under a parent of desired state, which a
+// removed class is not).
+bool StaysUnder(const TrafficClass *c, const TrafficClass *ancestor,
+                const std::set<std::string> &moved) {
+  for (; c != nullptr; c = c->parent()) {
+    if (c == ancestor) {
+      return true;
+    }
+    if (moved.count(c->name()) != 0) {
+      return false;
+    }
+  }
+  return false;
+}
+
 const TrafficClassSnapshot *FindTc(const PipelineSnapshot &snapshot,
                                    const std::string &name) {
   for (const TrafficClassSnapshot &tc : snapshot.traffic_classes) {
@@ -142,6 +167,32 @@ ControlResult<void> CheckReversibility(const PipelinePlan &plan) {
       removed_modules.insert(remove->name);
     }
   }
+  // Tasks the commit places anew, and classes it moves: wherever they are
+  // now, they will have left.
+  std::set<std::pair<std::string, int>> placed;
+  std::set<std::string> moved;
+  for (const PlanOperation &op : plan.commit_ops) {
+    if (const auto *place = std::get_if<PlaceTasksOp>(&op)) {
+      for (const TaskPlacementSpec &task : place->tasks) {
+        placed.emplace(task.module, task.task);
+      }
+    } else if (const auto *reparent = std::get_if<ReparentTcOp>(&op)) {
+      moved.insert(reparent->spec.name);
+    }
+  }
+  // A task of a kept module still where `inside` says, once the commit ran.
+  auto stays = [&](const TrafficClass *c,
+                   const std::function<bool(const TrafficClass *)> &inside)
+      -> std::optional<std::string> {
+    if (c->policy() != POLICY_LEAF || !inside(c)) {
+      return std::nullopt;
+    }
+    auto task = TaskOf(c);
+    if (removed_modules.count(task.first) != 0 || placed.count(task) != 0) {
+      return std::nullopt;
+    }
+    return task.first;
+  };
 
   for (const PlanOperation &op : plan.retire_ops) {
     if (const auto *remove = std::get_if<RemovePortOp>(&op)) {
@@ -176,17 +227,32 @@ ControlResult<void> CheckReversibility(const PipelinePlan &plan) {
         continue;
       }
       for (const auto &pair : state.traffic_classes().All()) {
-        TrafficClass *c = pair.second.get();
-        if (c->policy() != POLICY_LEAF || c->Root() != root) {
-          continue;
-        }
-        const Module *owner =
-            static_cast<LeafTrafficClass *>(c)->task()->module();
-        if (removed_modules.count(owner->name()) == 0) {
+        if (auto owner = stays(pair.second.get(), [&](const TrafficClass *c) {
+              return c->Root() == root;
+            })) {
           return std::unexpected(Unsupported(
               "worker", std::to_string(remove->wid),
-              "still runs tasks of module '" + owner->name() +
-                  "', which this plan keeps"));
+              "still runs tasks of module '" + *owner +
+                  "', which this plan keeps and does not place elsewhere"));
+        }
+      }
+    }
+
+    // Deleting a class deletes the leaves under it: a kept module's task there
+    // has to be placed elsewhere.
+    if (const auto *remove = std::get_if<RemoveTcOp>(&op)) {
+      const TrafficClass *tc = state.traffic_classes().Find(remove->name);
+      if (tc == nullptr) {
+        continue;
+      }
+      for (const auto &pair : state.traffic_classes().All()) {
+        if (auto owner = stays(pair.second.get(), [&](const TrafficClass *c) {
+              return StaysUnder(c, tc, moved);
+            })) {
+          return std::unexpected(Unsupported(
+              "tc", remove->name,
+              "still holds a task of module '" + *owner +
+                  "', which this plan keeps and does not place elsewhere"));
         }
       }
     }
@@ -221,9 +287,8 @@ ControlResult<void> Transaction::Commit() {
 
   const auto start = std::chrono::steady_clock::now();
 
-  std::optional<WorkerPauser> pauser;
   if (quiescence_ == Quiescence::kWorkers) {
-    pauser.emplace();
+    pauser_.emplace();
   }
 
   for (const PlanOperation &op : plan_.commit_ops) {
@@ -236,14 +301,15 @@ ControlResult<void> Transaction::Commit() {
     }
   }
 
-  // The quiesced window ends when the pauser goes out of scope; measuring to
-  // here is the closest honest number for "time spent with workers paused".
+  // The quiesced window lasts through Retire (or Abort); this is the time the
+  // commit itself kept workers paused.
   timing_.paused_commit_us = MicrosSince(start);
   return {};
 }
 
 ControlResult<void> Transaction::Retire() {
   if (plan_.retire_ops.empty()) {
+    pauser_.reset();
     return {};
   }
 
@@ -252,19 +318,27 @@ ControlResult<void> Transaction::Retire() {
   // Teardown destroys traffic classes, modules and ports the dataplane can
   // see, so it happens quiesced. It is not undoable by construction: by now the
   // new state is active, so a failure here is reported, not rolled back.
-  WorkerPauser pauser;
+  if (!pauser_) {
+    pauser_.emplace();
+  }
+  ControlResult<void> retired;
   for (const PlanOperation &op : plan_.retire_ops) {
     if (auto injected = MaybeInjectFailure(TransactionPhase::kRetire, op);
         injected.has_value()) {
-      return std::unexpected(*injected);
+      retired = std::unexpected(*injected);
+      break;
     }
     if (auto result = ExecuteRetireOp(op); !result) {
-      return std::unexpected(result.error());
+      retired = std::unexpected(result.error());
+      break;
     }
   }
+  pauser_.reset();
 
-  timing_.retire_us = MicrosSince(start);
-  return {};
+  if (retired) {
+    timing_.retire_us = MicrosSince(start);
+  }
+  return retired;
 }
 
 void Transaction::Abort() noexcept {
@@ -308,6 +382,7 @@ void Transaction::Abort() noexcept {
   }
 
   undo_.clear();
+  pauser_.reset();
 
   // Undoing the operations is not quite enough: leaving the quiesced window
   // attaches orphan traffic classes, and a scheduler that briefly held two
@@ -418,6 +493,21 @@ ControlResult<void> Transaction::ExecuteCommitOp(const PlanOperation &op) {
       }
     }
     undo_.push_back(undo);
+    ops_executed_++;
+    return {};
+  }
+
+  if (const auto *place = std::get_if<PlaceTasksOp>(&op)) {
+    // The last commit operation (Plan puts it there), so nothing after it can
+    // fail and abort: it needs no undo entry. A refusal puts every task back
+    // itself (PlaceTasksLocked is all or nothing).
+    std::vector<TrafficClassSpec> targets;
+    for (const TaskPlacementSpec &task : place->tasks) {
+      targets.push_back(task.AsLeafSpec());
+    }
+    if (auto result = plane_->PlaceTasksLocked(targets, place->leaving); !result) {
+      return std::unexpected(result.error());
+    }
     ops_executed_++;
     return {};
   }

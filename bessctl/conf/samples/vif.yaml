@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Virtual interfaces sharing one pipeline:
+# - VIF 1: VLAN 100, MAC 02:00:00:00:01:01, IP 192.168.1.1, route domain 10 (gate 1)
+# - VIF 2: VLAN 200, MAC 02:00:00:00:02:02, IP 192.168.2.1, route domain 20 (gate 2)
+# - anything else to the default gate 0
+#
+# Converted from vif.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "AgAAAAEBAqq7zN3ugQAAZAgARQAALgABAABAEfcIwKgBZMCoAQEnEScSABp2JFZJRl9TQU1QTEVfUEFZTE9BRA=="
+        - "AgAAAAICAqq7zN3ugQAAyAgARQAALgABAABAEfUIwKgCZMCoAgEnEScSABp0JFZJRl9TQU1QTEVfUEFZTE9BRA=="
+        - "Av//////Aqq7zN3uCABFAAAwAAEAAEARZlgKAABkCgAAAScRJxIAHLYsVU5DTEFTU0lGSUVEX1BBWUxPQUQ="
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: source0
+    mclass: Source
+  - name: vif
+    mclass: Vif
+    arg:
+      interfaces:
+        - id: 1
+          vlan: 100
+          mac_addr: "02:00:00:00:01:01"
+          ip_addr: "192.168.1.1"
+          route_domain: 10
+          gate: 1
+        - id: 2
+          vlan: 200
+          mac_addr: "02:00:00:00:02:02"
+          ip_addr: "192.168.2.1"
+          route_domain: 20
+          gate: 2
+connections:
+  - upstream: rewrite0
+    downstream: vif
+  - upstream: source0
+    downstream: rewrite0
+  - upstream: vif
+    downstream: sink0
+  - upstream: vif
+    ogate: 1
+    downstream: sink1
+  - upstream: vif
+    ogate: 2
+    downstream: sink2
+workers:
+  - {wid: 0, core: 0}

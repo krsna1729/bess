@@ -1,0 +1,67 @@
+# Copyright (c) 2017, Joshua Stone.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Deficit round robin: two sources, each rewritten to its own flow, into a
+# DRR whose task is rate-limited, so DRR shares the throughput fairly.
+#
+# Converted from drr.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: q
+    mclass: DRR
+    arg:
+      num_flows: 4
+      quantum: "1000"
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARrxzAqAEBCgAAAScRJxIAEsXcaGVsbG93b3JsZA=="
+  - name: rewrite1
+    mclass: Rewrite
+    arg:
+      templates:
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARrhrAqAICCgAAAicRJxIAEsTaaGVsbG93b3JsZA=="
+  - name: sink0
+    mclass: Sink
+  - name: src1
+    mclass: Source
+  - name: src2
+    mclass: Source
+connections:
+  - upstream: q
+    downstream: sink0
+  - upstream: rewrite0
+    downstream: q
+  - upstream: rewrite1
+    downstream: q
+  - upstream: src1
+    downstream: rewrite0
+  - upstream: src2
+    downstream: rewrite1
+workers:
+  - {wid: 0, core: 0}
+traffic_classes:
+  - name: fast
+    policy: rate_limit
+    resource: packet
+    limit:
+      packet: "90000"
+  - name: medium
+    policy: rate_limit
+    resource: packet
+    limit:
+      packet: "50000"
+  - name: slow
+    policy: rate_limit
+    resource: packet
+    limit:
+      packet: "40000"
+tasks:
+  - module: q
+    parent: medium
+  - module: src1
+    parent: fast
+  - module: src2
+    parent: slow

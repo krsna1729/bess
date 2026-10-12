@@ -8138,3 +8138,54 @@ manifest with anchors validates, plans and applies (with its resource entry); `g
 
 **Code.** `bessctl/yaml_io.{h,cc}`, `bessctl/manifest.{h,cc}` (`Format`, `FormatOf`, `ManifestFrom`, `PipelineTo`),
 `bessctl/main.cc` (`-o`).
+
+## D-109 Task placement is desired state; the samples are manifests
+
+**Decision.** Where a module's task is scheduled (the legacy `attach_task`) is part of the pipeline: `Pipeline.tasks`
+lists `TaskPlacement {module, task, parent | wid, priority, share}`. GetPipeline lists every placed task (in a class,
+at a worker's root, or orphaned for a named worker); a task desired state does not name stays where it is, and a new
+one goes to any worker, as before. `TrafficClass.leaf_module_name`/`leaf_module_taskid` (never accepted: a desired
+leaf class was refused) are removed (reserved 10, 11). With this, 28 of `bessctl/conf/samples`' 38 scripts are
+manifests (`*.yaml`, converted from what each built); the other ten need module rules as desired state (`em.add`,
+`fib.add`, `set_burst`, ...) or are measurement scripts (`tc/wfs_double`).
+
+- Validation: the module exists, the task index is in range, a task is named once, exactly one of parent and wid, the
+  parent is a traffic class of the pipeline, and the parent's policy rules (priority under priority, share under
+  weighted_fair, one child under rate_limit) count tasks with the classes.
+- Diff: a task changes when its parent, wid, priority or share differ, or its module or parent class is rebuilt.
+- Plan: one `PlaceTasksOp`, the last commit step. It is all or nothing and two-phase (every task leaves, then each
+  attaches), so tasks may trade places under one-child classes; tasks of modules the plan removes leave their classes
+  in the same step (orphaned until the retire phase removes them), so a new task may take a leaving task's place. A
+  refusal puts every task back; being last, the step needs no undo entry.
+
+**Faults fixed on the way** (found applying the samples one after another, without a reset):
+
+- Removing a nested tree deleted a class before its children (removals were ordered by the *desired* parent, which a
+  removed class does not have), leaving freed classes registered: a crash on the next lookup. A removal now carries
+  its current parent.
+- Retirement deleted classes before modules; deleting a class deletes its subtree, module leaves included, and the
+  module then destroyed its freed leaf (crash). Modules now go first; `RemoveTcLocked` refuses a subtree that still
+  holds a task; CheckReversibility refuses removing a class that holds a task of a kept module the plan does not place
+  elsewhere (a class moved out of it takes its tasks along), and no longer counts a task the plan moves off a worker
+  it removes.
+- New modules' tasks went to a worker the same plan removes (round robin over active workers), so retirement failed
+  after the commit: every primitive's own `WorkerPauser` attached orphans when it ended, even nested in the
+  transaction's. Only the outermost pauser attaches orphans now, and the transaction holds one pauser from commit to
+  its end: orphans attach once, after the removed workers are gone, and a rollback after a failed commit runs with
+  workers paused (it ran with them resumed).
+- A class that moved and changed its limit kept the old limit: the diff gave it one kind (reparent). The parameters
+  follow the move now.
+
+**Evidence.** `control_apply_pipeline_test` (29): placement as desired state, trading places, a refused placement that
+moves no task, 8 impossible placements, and one test per fault (each fails, or crashes, with its fix removed:
+`ClassesGoWithTheTasksTheyHold`, `AClassHoldingAKeptTaskStays`, `AClassMovesOutOfARemovedOneWithItsTask`,
+`ATaskMovesOffARemovedWorker`,
+`NewTasksAvoidARemovedWorker`, `ATaskTakesALeavingTasksPlace`, `ANestedTreeGoesChildrenFirst`,
+`AMovedClassKeepsItsNewLimit`). Live (`bessctl_cpp`'s `test_samples`): every sample manifest applies on a reset
+daemon, `diff` reports 0 changes, and it runs. Applying all 28 in sequence and in reverse, without resets: no crash,
+no partial apply; what is refused (a same-named module with another argument, a kept task left in a removed class) is
+refused unchanged.
+
+**Code.** `protobuf/control_v2.proto`, `core/control/{pipeline_spec,pipeline_snapshot,pipeline_validator,
+pipeline_diff,pipeline_plan,transaction,control_plane,api_v2}.{h,cc}`, `core/worker.cc` (pauser depth), the SDK
+builders (`Task`/`task`, `Remove` drops placements), `bessctl/conf/samples/*.yaml`.

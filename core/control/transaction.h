@@ -13,6 +13,7 @@
 #include "control/pipeline_plan.h"
 #include "control/pipeline_snapshot.h"
 #include "control/pipeline_spec.h"
+#include "worker.h"
 
 namespace bess {
 namespace control {
@@ -140,6 +141,10 @@ class Transaction {
   PipelineSnapshot before_;
   std::vector<Undo> undo_;
   Quiescence quiescence_ = Quiescence::kNone;
+  // Held from the commit until the transaction ends (retired or aborted): a
+  // rollback runs quiesced too, and tasks of new modules are given a worker
+  // only once, after the retire phase removed the workers that go.
+  std::optional<WorkerPauser> pauser_;
   size_t ops_executed_ = 0;
   ApplyTiming timing_;
 };

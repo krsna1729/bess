@@ -56,12 +56,20 @@ struct UpdateTcParamsOp {
 struct RemoveTcOp {
   std::string name;
 };
+// Places module tasks where desired state names, all at once (two phases:
+// see ControlPlane::PlaceTasksLocked).
+struct PlaceTasksOp {
+  std::vector<TaskPlacementSpec> tasks;
+  // Modules the plan removes: their tasks leave their classes first, so they
+  // make room (a rate_limit class takes one child) before the retire phase.
+  std::vector<std::string> leaving;
+};
 
 using PlanOperation = std::variant<CreatePortOp, UpdatePortOp, RemovePortOp,
                                    CreateModuleOp, RemoveModuleOp, ConnectOp,
                                    DisconnectOp, AddWorkerOp, RemoveWorkerOp,
                                    CreateTcOp, ReparentTcOp, UpdateTcParamsOp,
-                                   RemoveTcOp>;
+                                   RemoveTcOp, PlaceTasksOp>;
 
 // A dependency-ordered plan in three phases:
 //

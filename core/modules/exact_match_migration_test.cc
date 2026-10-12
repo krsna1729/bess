@@ -19,7 +19,8 @@
 #include <cstdint>
 #include <cstring>
 #include <random>
-#include <set>
+#include <string>
+#include <unordered_set>
 #include <span>
 #include <vector>
 
@@ -245,7 +246,9 @@ std::vector<uint8_t> RandomBytes(std::mt19937_64 &rng, size_t n) {
 std::vector<std::vector<std::vector<uint8_t>>> UniqueRules(
     std::mt19937_64 &rng, const std::vector<TestField> &fields, size_t n) {
   std::vector<std::vector<std::vector<uint8_t>>> rules;
-  std::set<std::vector<uint8_t>> seen;
+  // Hashed, not ordered: GCC 14 -O3 reports a false -Wstringop-overread in
+  // vector<uint8_t>'s ordering (the same as masked_exact.h's key_less).
+  std::unordered_set<std::string> seen;
   while (rules.size() < n) {
     std::vector<std::vector<uint8_t>> rule;
     std::vector<uint8_t> packed;
@@ -254,7 +257,7 @@ std::vector<std::vector<std::vector<uint8_t>>> UniqueRules(
       packed.insert(packed.end(), b.begin(), b.end());
       rule.push_back(std::move(b));
     }
-    if (seen.insert(packed).second) {
+    if (seen.emplace(packed.begin(), packed.end()).second) {
       rules.push_back(std::move(rule));
     }
   }

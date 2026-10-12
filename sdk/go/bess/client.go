@@ -884,8 +884,14 @@ func (b *PipelineBuilder) TrafficClass(tc *pb.TrafficClass) *PipelineBuilder {
 	return b
 }
 
+// Task places a module's task: under a traffic class or at a worker.
+func (b *PipelineBuilder) Task(t *pb.TaskPlacement) *PipelineBuilder {
+	b.p.Tasks = append(b.p.Tasks, t)
+	return b
+}
+
 // Remove drops the port, module or traffic class name and the connections
-// that touch it.
+// and task placements that name it.
 func (b *PipelineBuilder) Remove(name string) *PipelineBuilder {
 	b.p.Ports = slices.DeleteFunc(b.p.Ports, func(p *pb.Port) bool { return p.GetName() == name })
 	b.p.Modules = slices.DeleteFunc(b.p.Modules, func(m *pb.Module) bool { return m.GetName() == name })
@@ -893,6 +899,9 @@ func (b *PipelineBuilder) Remove(name string) *PipelineBuilder {
 		func(tc *pb.TrafficClass) bool { return tc.GetName() == name })
 	b.p.Connections = slices.DeleteFunc(b.p.Connections, func(c *pb.Connection) bool {
 		return c.GetUpstream() == name || c.GetDownstream() == name
+	})
+	b.p.Tasks = slices.DeleteFunc(b.p.Tasks, func(t *pb.TaskPlacement) bool {
+		return t.GetModule() == name || t.GetParent() == name
 	})
 	return b
 }

@@ -529,10 +529,10 @@ TEST_F(ControlPlaneTest, PlanOrdersPhasesByDependency) {
       plan.commit_ops[0]));
 
   ASSERT_EQ(2u, plan.retire_ops.size());
-  EXPECT_TRUE(std::holds_alternative<bess::control::RemoveTcOp>(
-      plan.retire_ops[0]));  // TCs detach before their module goes
   EXPECT_TRUE(std::holds_alternative<bess::control::RemoveModuleOp>(
-      plan.retire_ops[1]));
+      plan.retire_ops[0]));  // a module goes before the classes that may
+  EXPECT_TRUE(std::holds_alternative<bess::control::RemoveTcOp>(
+      plan.retire_ops[1]));  // hold its tasks (deleting them deletes those)
 }
 
 // Rebuilding the same diff twice yields the same plan, in the same order.

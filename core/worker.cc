@@ -306,7 +306,14 @@ void *Worker::Run(void *_arg) {
   return nullptr;
 }
 
+namespace {
+// Pausers nest (a transaction's around the primitives it runs); only the
+// outermost hands orphans to workers, once the whole change is in place.
+thread_local int pauser_depth = 0;
+}  // namespace
+
 WorkerPauser::WorkerPauser() {
+  pauser_depth++;
   if (is_any_worker_running()) {
     for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
       if (is_worker_running(wid)) {
@@ -319,7 +326,9 @@ WorkerPauser::WorkerPauser() {
 }
 
 WorkerPauser::~WorkerPauser() {
-  attach_orphans();  // All workers should be paused at this point.
+  if (--pauser_depth == 0) {
+    attach_orphans();  // All workers should be paused at this point.
+  }
 
   if (!workers_paused_.empty()) {
     bess::run_global_resume_hooks(false);

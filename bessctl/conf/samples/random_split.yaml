@@ -1,0 +1,41 @@
+# Copyright (c) 2014-2017, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# RandomSplit: packets randomly split between gates or dropped.
+#
+# Converted from random_split.bess (D-104). Rewrite templates are the packets it
+# built with scapy.
+modules:
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARrxzAqAEBCgAAAScRJxIAEsXcaGVsbG93b3JsZA=="
+  - name: rs
+    mclass: RandomSplit
+    arg:
+      drop_rate: 0.75
+      gates:
+        - "0"
+        - "1"
+        - "2"
+  - name: sink
+    mclass: Sink
+  - name: source0
+    mclass: Source
+connections:
+  - upstream: rewrite0
+    downstream: rs
+  - upstream: rs
+    downstream: sink
+  - upstream: rs
+    ogate: 1
+    downstream: sink
+  - upstream: rs
+    ogate: 2
+    downstream: sink
+  - upstream: source0
+    downstream: rewrite0
+workers:
+  - {wid: 0, core: 0}
