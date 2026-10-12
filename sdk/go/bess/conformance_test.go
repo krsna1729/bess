@@ -18,7 +18,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +31,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	pb "github.com/krsna1729/bess/sdk/go/controlv2"
 )
@@ -223,8 +226,61 @@ func (r *runner) step(s spec) error {
 		}
 	case "pipeline":
 		return r.pipeline(s, wantError)
+	case "module_command":
+		return r.moduleCommand(s, wantError)
 	default:
 		return fmt.Errorf("unknown step '%s'", what)
+	}
+	return nil
+}
+
+// moduleCommand: the argument's type is arg_type, else the command's in
+// class's schema.
+func (r *runner) moduleCommand(s spec, wantError string) error {
+	command := s.str("command")
+	typ := s.str("arg_type")
+	for _, c := range r.schema.GetModuleClasses() {
+		for _, cmd := range c.GetCommands() {
+			if typ == "" && c.GetName() == s.str("class") && cmd.GetName() == command {
+				typ = cmd.GetArgType()
+			}
+		}
+	}
+	if typ == "" {
+		return fmt.Errorf("%s has no command %s in the schema", s.str("class"), command)
+	}
+	arg, err := r.message(typ, s["arg"])
+	if err != nil {
+		return err
+	}
+	module := s.str("module")
+	if module == "$module" {
+		module, _, _ = strings.Cut(r.resource, "/")
+	}
+	answer, err := r.client.RunModuleCommand(r.ctx, module, command, arg)
+	if err := expect(err, wantError, command); err != nil || wantError != "" {
+		return err
+	}
+	want, ok := s["want_answer"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	got, err := anypb.UnmarshalNew(answer, proto.UnmarshalOptions{Resolver: dynamicpb.NewTypes(r.files)})
+	if err != nil {
+		return fmt.Errorf("answer %s: %v", answer.GetTypeUrl(), err)
+	}
+	text, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(got)
+	if err != nil {
+		return err
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(text, &fields); err != nil {
+		return err
+	}
+	for k, v := range want {
+		if !reflect.DeepEqual(fields[k], v) {
+			return fmt.Errorf("answer %s: want %s = %v", text, k, v)
+		}
 	}
 	return nil
 }

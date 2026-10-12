@@ -104,7 +104,7 @@ struct Error {
   ErrorKind kind = ErrorKind::kInvalidRequest;
   std::string message;  // what happened, for people
   grpc::StatusCode code = grpc::StatusCode::OK;      // kInvalidRequest, kTransport
-  std::optional<pb::ErrorDetail> detail;             // kInvalidRequest, kPipelineConflict
+  std::optional<pb::ErrorDetail> detail;  // kInvalidRequest, kPipelineConflict, answered kBusy
   std::optional<pb::TransactionRecord> record;       // kConflict, kRejected
   bool after_unknown_attempt = false;                // kConflict
   std::vector<OpFailure> failures;                   // kRejected
@@ -258,6 +258,17 @@ class Client {
 
   // -- transactions --
   // The transaction refers to this client: it must not outlive it.
+  // A module's command (D-115; GetSchema lists each class's commands and
+  // argument types): its answer, an empty Any when it has none. Sent under
+  // the epoch the client knows, not retried: a command acts when it runs. A
+  // command's EBUSY is kBusy with the daemon's ErrorDetail (a command not
+  // marked thread-safe while a worker runs the module: PauseWorkers first).
+  // Other failures are kInvalidRequest with the ErrorDetail, the command's
+  // errno in errno_value.
+  Result<google::protobuf::Any> RunModuleCommand(const std::string &module,
+                                                 const std::string &command,
+                                                 const google::protobuf::Message &arg);
+
   Transaction NewTransaction(TransactionOptions options = {});
 
   // `request_id`'s outcome under the current epoch.

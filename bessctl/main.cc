@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <charconv>
@@ -65,6 +66,12 @@ constexpr std::string_view kUsage = R"(usage: bessctl [-s HOST:PORT] COMMAND [AR
                                  | tcpdump -r -  (pcap of a module with more
                                  than one gate there needs a GATE;
                                  the daemon must share this host's /tmp)
+  command MODULE CMD [ARG] [-o json|yaml]
+                                 run MODULE's command CMD (schema CLASS lists
+                                 them) with ARG, JSON or YAML text of the
+                                 command's argument type (default {}); print
+                                 its answer. A command not marked thread-safe
+                                 needs the workers paused
   pause | resume                 pause or resume every worker (a worker a
                                  pipeline creates starts paused)
   shutdown                       stop the daemon
@@ -437,6 +444,45 @@ class Cli {
     return 0;
   }
 
+  int Command(const std::string &module, const std::string &command, const std::string &arg,
+              bessctl::Format format) {
+    auto schema = LoadSchema();
+    if (!schema) {
+      return 1;
+    }
+    auto snapshot = client_->Pipeline();
+    if (!snapshot) {
+      return Fail(snapshot.error());
+    }
+    const auto &modules = snapshot->pipeline.modules();
+    const auto m = std::find_if(modules.begin(), modules.end(),
+                                [&](const pb::Module &x) { return x.name() == module; });
+    if (m == modules.end()) {
+      return Fail(std::format("no module \"{}\"", module));
+    }
+    auto type = (*schema)->CommandArgType(m->mclass(), command);
+    if (!type) {
+      return Fail(type.error());
+    }
+    auto message = (*schema)->MessageFromText(*type, arg);
+    if (!message) {
+      return Fail(std::format("{} {}: argument ({}): {}", module, command, *type, message.error()));
+    }
+    auto answer = client_->RunModuleCommand(module, command, **message);
+    if (!answer) {
+      return Fail(answer.error());
+    }
+    if (answer->type_url().empty()) {
+      return 0;  // the command answers nothing
+    }
+    auto text = (*schema)->AnyTo(*answer, format);
+    if (!text) {
+      return Fail(text.error());
+    }
+    std::print("{}{}", *text, text->ends_with('\n') ? "" : "\n");
+    return 0;
+  }
+
   int Resources() {
     auto resources = client_->Resources(true);
     if (!resources) {
@@ -648,10 +694,10 @@ int main(int argc, char **argv) {
   if (command == "schema" && rest.size() <= 1) {
     return cli.ShowSchema(rest);
   }
-  // get and validate print JSON, or YAML with -o yaml.
+  // get, validate and command print JSON, or YAML with -o yaml.
   std::vector<std::string> printed(rest.begin(), rest.end());
   auto output = bessctl::Format::kJson;
-  if ((command == "get" || command == "validate") && printed.size() >= 2 &&
+  if ((command == "get" || command == "validate" || command == "command") && printed.size() >= 2 &&
       printed[printed.size() - 2] == "-o") {
     const std::string &name = printed.back();
     if (name != "json" && name != "yaml") {
@@ -665,6 +711,9 @@ int main(int argc, char **argv) {
   }
   if (command == "validate" && printed.size() == 1) {
     return cli.Validate(printed[0], output);
+  }
+  if (command == "command" && (printed.size() == 2 || printed.size() == 3)) {
+    return cli.Command(printed[0], printed[1], printed.size() == 3 ? printed[2] : "{}", output);
   }
   if (command == "diff") {
     return one_file([&](const std::string &f) { return cli.Diff(f); });

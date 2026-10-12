@@ -16,6 +16,7 @@ ControlErrorCode CodeFromErrno(int err) {
     case EINVAL:
     case EPERM:
     case EACCES:
+    case ENOTSUP:  // the request names what its target does not support (a command)
       return ControlErrorCode::kInvalidArgument;
     case ENOENT:
       return ControlErrorCode::kNotFound;

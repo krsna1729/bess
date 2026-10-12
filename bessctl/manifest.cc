@@ -186,6 +186,12 @@ std::expected<std::unique_ptr<Schema>, std::string> Schema::From(
       gp::util::NewTypeResolverForDescriptorPool(std::string(kUrlPrefix), s->pool_.get()));
   for (const pb::ModuleClassSchema &c : schema.module_classes()) {
     s->module_types_.emplace(c.name(), c.init_arg_type());
+    auto &commands = s->commands_[c.name()];
+    for (const pb::CommandSchema &cmd : c.commands()) {
+      commands.emplace(cmd.name(), cmd.arg_type());
+    }
+    // Every module answers it, with no argument (ModuleBuilder::RunCommand).
+    commands.emplace("get_initial_arg", "bess.pb.EmptyArg");
   }
   for (const pb::PortDriverSchema &d : schema.port_drivers()) {
     s->driver_types_.emplace(d.name(), d.init_arg_type());
@@ -270,6 +276,57 @@ std::expected<std::unique_ptr<gp::Message>, std::string> Schema::MessageFromJson
     return std::unexpected(ParseError(Message(status)));
   }
   return m;
+}
+
+std::expected<std::string, std::string> Schema::CommandArgType(std::string_view mclass,
+                                                             std::string_view command) const {
+  const auto c = commands_.find(mclass);
+  if (c == commands_.end()) {
+    return std::unexpected(std::format("the daemon has no module class {}", mclass));
+  }
+  const auto cmd = c->second.find(command);
+  if (cmd == c->second.end()) {
+    std::string known;
+    for (const auto &[name, _] : c->second) {
+      known += (known.empty() ? "" : ", ") + name;
+    }
+    return std::unexpected(std::format("{} has no command {} (it has: {})", mclass, command, known));
+  }
+  if (cmd->second.empty()) {
+    return std::unexpected(
+        std::format("{} {}: the daemon declares no argument type for it", mclass, command));
+  }
+  return cmd->second;
+}
+
+std::expected<std::unique_ptr<gp::Message>, std::string> Schema::MessageFromText(
+    std::string_view type, std::string_view text) const {
+  // JSON when it parses as JSON, else YAML (a flow mapping such as
+  // {ip: 1.2.3.4} starts with "{" too).
+  if (json::Parse(text)) {
+    return MessageFromJson(type, text);
+  }
+  auto doc = yaml::Parse(text);
+  if (!doc) {
+    return std::unexpected(doc.error());
+  }
+  return MessageFromJson(type, json::Dump(*doc));
+}
+
+std::expected<std::string, std::string> Schema::AnyTo(const gp::Any &any, Format format) const {
+  gp::util::JsonPrintOptions options;
+  options.preserve_proto_field_names = true;
+  std::string text;
+  const auto status =
+      gp::util::BinaryToJsonString(resolver_.get(), any.type_url(), any.value(), &text, options);
+  if (!status.ok()) {
+    return std::unexpected(std::format("an answer of type {}: {}", any.type_url(), Message(status)));
+  }
+  auto doc = json::Parse(text);
+  if (!doc) {
+    return std::unexpected(doc.error());
+  }
+  return format == Format::kJson ? json::Dump(*doc, 2) : yaml::Dump(*doc);
 }
 
 }  // namespace bessctl

@@ -8330,3 +8330,43 @@ init argument adds its one entry. `tc/wfs_double` was a measurement script (the 
 removed; `bessctl_cpp`'s `test_samples` applies every manifest.
 
 **Code.** `core/l2/mac_table_resource.h`, `core/modules/l2_forward.{h,cc}`, `protobuf/module_msg.proto`.
+
+## D-115 Module commands over control_v2 (`RunModuleCommand`)
+
+**Status:** accepted.
+
+**Decision.** `bess.pb.v2.Control` serves `RunModuleCommand {daemon_epoch, module, command, Any arg}` →
+`{Any data, daemon_epoch}`: a module's command, as the legacy `ModuleCommand` runs it (one
+`ControlPlane::RunModuleCommand`; the legacy RPC now calls it). The roadmap gives modules no resources/actions model
+beyond transaction resources, and the module tests, samples' operators and the Python bessctl all drive modules
+through commands; without a v2 call, deleting pybess would strand them.
+
+- Not a transaction: not retried, not recorded, no event, the generation stays. It names the epoch the client has
+  seen and is refused under another (D-106), as the Admin calls are (D-107).
+- `GetSchema` already names every command's argument type, so a client without generated code builds `arg` from
+  JSON: `bessctl command MODULE CMD [ARG] [-o json|yaml]` takes JSON or YAML text and prints the answer.
+- Errors: an unknown module is `NOT_FOUND`; an unknown command (`ENOTSUP`, now `INVALID_ARGUMENT`, the caller's
+  mistake) and a command's own failure carry its errno in `ErrorDetail` (`field` "command", `object` the module).
+  A command not marked thread-safe while a worker runs the module is EBUSY → `RESOURCE_BUSY`: C++ `kBusy`, Go
+  `*BusyError` (Go's Admin calls now map `RESOURCE_BUSY` as C++'s do). A busy error keeps the
+  daemon's `ErrorDetail` and message (C++ `Error.detail`, Go `BusyError.Detail`): a thread-safe command can be
+  busy too (ExactMatch's `add` while reclamation is behind readers), so the cause is the daemon's to say.
+- **Fix found on the way.** That EBUSY check reads each module's set of workers (`active_workers_`), which only the
+  legacy `CheckSchedulingConstraints` RPC (run by the Python bessctl) and a live connect computed. After
+  `ApplyPipeline` + `ResumeWorkers` every module looked unattached, so thread-unsafe commands ran beside the worker,
+  and `WorkerPauser`'s PreResume events (which read the same set) were skipped. The `setup_taskgraph` resume hook,
+  run on every resume of all workers, now calls `ModuleGraph::PropagateActiveWorker()` too.
+
+**Evidence.** `control_api_v2_test`: `RunModuleCommand` (epoch refused and the command not run; an answer; no
+answer; unknown module and command; the command's own refusal) and `ThreadUnsafeCommandWaitsForPausedWorkers`
+(ApplyPipeline of a Queue task on worker 0, resume: `set_size` is EBUSY / `RESOURCE_BUSY`; paused: it runs). Without
+the hook change the second fails ("ran beside the running worker"). Conformance case `module_command`, both SDKs:
+`set_default_gate`, `get_runtime_config` answering `default_gate` "2", an unknown command and module refused (a
+wrong `want_answer` fails in both drivers). Live, `l2forward.yaml`: `bessctl command fib lookup` with YAML and JSON
+arguments, `add` answering nothing, `-o yaml`, `get_initial_arg`, unknown command (lists the class's commands),
+unknown module, a bad argument field; `arp add` after `resume` is refused, after `pause` it runs. pybess gets no
+`RunModuleCommand`: it is to be deleted, and its callers move to the C++ or Go SDK.
+
+**Code.** `protobuf/control_v2.proto`, `core/control/{control_plane,api_v2}.{h,cc}`, `core/control/control_error.cc`,
+`core/resume_hooks/task_graph.cc`, `core/bessctl.cc`, `sdk/cpp`, `sdk/go/bess/client.go`,
+`bessctl/{main,manifest}.cc`, `sdk/conformance/cases.json`.

@@ -14,6 +14,11 @@ CommandResponse SetupTaskGraph::Init(const bess::pb::EmptyArg &) {
 
 void SetupTaskGraph::Run() {
   ModuleGraph::UpdateTaskGraph();
+  // Which workers run each module, from the graph they resume with: the
+  // EBUSY check of THREAD_UNSAFE commands and PreResume events read it. Only
+  // the legacy CheckSchedulingConstraints set it before, so after
+  // ApplyPipeline + ResumeWorkers every module looked unattached.
+  ModuleGraph::PropagateActiveWorker();
 }
 
 ADD_RESUME_HOOK(SetupTaskGraph)

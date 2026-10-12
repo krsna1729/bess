@@ -74,6 +74,17 @@ class Schema {
   std::expected<std::unique_ptr<google::protobuf::Message>, std::string> MessageFromJson(
       std::string_view type, std::string_view json) const;
 
+  // Module commands (D-115). The argument type of class `mclass`'s command
+  // `command`, as GetSchema declares it.
+  std::expected<std::string, std::string> CommandArgType(std::string_view mclass,
+                                                         std::string_view command) const;
+  // A command's argument from JSON text, or else YAML text.
+  std::expected<std::unique_ptr<google::protobuf::Message>, std::string> MessageFromText(
+      std::string_view type, std::string_view text) const;
+  // A command's answer in `format`, field names as in the .proto files.
+  std::expected<std::string, std::string> AnyTo(const google::protobuf::Any &any,
+                                                Format format) const;
+
  private:
   Schema() = default;
 
@@ -82,6 +93,8 @@ class Schema {
   std::unique_ptr<google::protobuf::util::TypeResolver> resolver_;
   std::map<std::string, std::string, std::less<>> module_types_;  // class -> init type
   std::map<std::string, std::string, std::less<>> driver_types_;  // driver -> init type
+  // class -> command -> argument type
+  std::map<std::string, std::map<std::string, std::string, std::less<>>, std::less<>> commands_;
 };
 
 }  // namespace bessctl

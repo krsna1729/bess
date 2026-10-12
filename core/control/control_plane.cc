@@ -306,6 +306,22 @@ ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConfLocked(const s
   return port->UpdateConf(conf);
 }
 
+ControlResult<bess::pb::CommandResponse> ControlPlane::RunModuleCommand(
+    const std::string& module, const std::string& command,
+    const google::protobuf::Any& arg) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (module.empty()) {
+    return std::unexpected(Err(EINVAL, "Missing module name field 'name'"));
+  }
+  Module* m = runtime::runtime().modules().Find(module);
+  if (m == nullptr) {
+    return std::unexpected(Err(ENOENT, "No module '%s' found", module.c_str()));
+  }
+  // DPDK functions may be called, so be prepared.
+  current_worker.SetNonWorker();
+  return m->RunCommand(command, arg);
+}
+
 ControlResult<void> ControlPlane::ResetPorts() {
   std::lock_guard<std::mutex> lock(mutex_);
   auto result = ResetPortsLocked();

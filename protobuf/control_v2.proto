@@ -514,6 +514,28 @@ message ListMetricsResponse {
   uint64 daemon_epoch = 2;            // counters restart with the daemon
 }
 
+// -- Module commands (D-115) -----------------------------------------------
+//
+// A module's command, as GetSchema lists it (name, argument type,
+// thread_safe): what a module does besides its desired state -- lookups,
+// statistics, one-shot operations -- and the edits of its tables beside its
+// transaction resources. Not transactional: a command acts when it runs. A
+// command not marked thread_safe is refused while a worker runs
+// (FAILED_PRECONDITION, RESOURCE_BUSY, errno EBUSY): pause the workers first
+// (Admin.PauseWorkers). A command's failure is the call's error, with the
+// command's errno in ErrorDetail.errno_value.
+message RunModuleCommandRequest {
+  uint64 daemon_epoch = 1;  // required (D-106)
+  string module = 2;
+  string command = 3;
+  google.protobuf.Any arg = 4;  // the command's argument type
+}
+
+message RunModuleCommandResponse {
+  google.protobuf.Any data = 1;  // the command's answer; unset when it has none
+  uint64 daemon_epoch = 2;
+}
+
 service Control {
   rpc GetPipeline(GetPipelineRequest) returns (GetPipelineResponse) {}
   rpc ValidatePipeline(ValidatePipelineRequest)
@@ -531,6 +553,8 @@ service Control {
   rpc WatchEvents(WatchEventsRequest) returns (stream Event) {}
   rpc ListTransactionResources(ListTransactionResourcesRequest)
       returns (ListTransactionResourcesResponse) {}
+  rpc RunModuleCommand(RunModuleCommandRequest)
+      returns (RunModuleCommandResponse) {}
 }
 
 // -- Administration (D-107) ----------------------------------------------

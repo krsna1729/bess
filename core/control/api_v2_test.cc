@@ -28,6 +28,7 @@
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
+#include "pb/module_msg.pb.h"
 
 namespace {
 
@@ -508,6 +509,115 @@ TEST_F(ApiV2ServiceTest, MutatingRequestsMustNameTheDaemonsEpoch) {
     ASSERT_TRUE(stub_->GetTransaction(&tx_ctx, tx_req, &tx).ok());
     EXPECT_FALSE(tx.known()) << "a refused request id is not recorded";
   }
+}
+
+// A module's commands over v2 (D-115): epoch-checked before anything runs; the
+// answer comes back as the command's Any; a missing module, a command the
+// class does not have and a command's own failure are typed errors carrying
+// the module and the command's errno.
+TEST_F(ApiV2ServiceTest, RunModuleCommand) {
+  google::protobuf::Any arg;
+  ASSERT_TRUE(arg.PackFrom(bess::pb::L2ForwardArg()));
+  ASSERT_TRUE(control_plane_->CreateModule({"l2", "L2Forward", arg}));
+
+  auto run = [&](const std::string &module, const std::string &command,
+                 const google::protobuf::Message &command_arg, uint64_t epoch,
+                 v2::RunModuleCommandResponse *resp, v2::ErrorDetail *detail = nullptr) {
+    grpc::ClientContext ctx;
+    v2::RunModuleCommandRequest req;
+    req.set_daemon_epoch(epoch);
+    req.set_module(module);
+    req.set_command(command);
+    EXPECT_TRUE(req.mutable_arg()->PackFrom(command_arg));
+    const grpc::Status status = stub_->RunModuleCommand(&ctx, req, resp);
+    if (detail != nullptr) {
+      *detail = DetailOf(ctx);
+    }
+    return status.error_code();
+  };
+  bess::pb::L2ForwardCommandAddArg add;
+  auto *entry = add.add_entries();
+  entry->set_addr("02:00:00:00:00:01");
+  entry->set_gate(3);
+  bess::pb::L2ForwardCommandLookupArg lookup;
+  lookup.add_addrs("02:00:00:00:00:01");
+
+  v2::RunModuleCommandResponse resp;
+  v2::ErrorDetail detail;
+  ASSERT_EQ(grpc::StatusCode::INVALID_ARGUMENT, run("l2", "add", add, 0, &resp, &detail));
+  EXPECT_EQ("daemon_epoch", detail.field());
+  EXPECT_NE(grpc::StatusCode::OK, run("l2", "lookup", lookup, Epoch(), &resp))
+      << "the refused add ran";
+
+  ASSERT_EQ(grpc::StatusCode::OK, run("l2", "add", add, Epoch(), &resp));
+  EXPECT_FALSE(resp.has_data()) << "add answers nothing";
+  EXPECT_EQ(Epoch(), resp.daemon_epoch());
+  ASSERT_EQ(grpc::StatusCode::OK, run("l2", "lookup", lookup, Epoch(), &resp));
+  bess::pb::L2ForwardCommandLookupResponse found;
+  ASSERT_TRUE(resp.data().UnpackTo(&found));
+  ASSERT_EQ(1, found.gates_size());
+  EXPECT_EQ(3u, found.gates(0));
+
+  EXPECT_EQ(grpc::StatusCode::NOT_FOUND, run("nope", "lookup", lookup, Epoch(), &resp, &detail));
+  EXPECT_EQ(v2::ErrorDetail::NOT_FOUND, detail.code());
+  EXPECT_EQ("nope", detail.object());
+
+  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, run("l2", "nope", lookup, Epoch(), &resp, &detail));
+  EXPECT_EQ(ENOTSUP, detail.errno_value());
+  EXPECT_EQ("command", detail.field());
+
+  // The command's own refusal: the address is already there.
+  EXPECT_NE(grpc::StatusCode::OK, run("l2", "add", add, Epoch(), &resp, &detail));
+  EXPECT_NE(0, detail.errno_value()) << detail.message();
+  EXPECT_EQ("l2", detail.object());
+}
+
+// A command not marked thread-safe is refused (EBUSY) while a worker runs
+// the module, after the v2 path ApplyPipeline + resume: the resume works out
+// which workers run each module. Paused, it runs.
+TEST_F(ApiV2ServiceTest, ThreadUnsafeCommandWaitsForPausedWorkers) {
+  v2::Pipeline p;
+  auto *w = p.add_workers();
+  w->set_wid(0);
+  w->set_core(0);
+  auto *q = p.add_modules();
+  q->set_name("q");
+  q->set_mclass("Queue");
+  ASSERT_TRUE(q->mutable_arg()->PackFrom(bess::pb::QueueArg()));
+  auto *t = p.add_tasks();
+  t->set_module("q");
+  t->set_wid(0);
+  {
+    grpc::ClientContext ctx;
+    v2::ApplyPipelineRequest req;
+    *req.mutable_pipeline() = p;
+    req.set_daemon_epoch(Epoch());
+    v2::ApplyPipelineResponse resp;
+    const grpc::Status status = stub_->ApplyPipeline(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
+
+  auto set_size = [&](v2::ErrorDetail *detail) {
+    grpc::ClientContext ctx;
+    v2::RunModuleCommandRequest req;
+    req.set_daemon_epoch(Epoch());
+    req.set_module("q");
+    req.set_command("set_size");
+    bess::pb::QueueCommandSetSizeArg arg;
+    arg.set_size(256);
+    EXPECT_TRUE(req.mutable_arg()->PackFrom(arg));
+    v2::RunModuleCommandResponse resp;
+    const grpc::StatusCode code = stub_->RunModuleCommand(&ctx, req, &resp).error_code();
+    *detail = DetailOf(ctx);
+    return code;
+  };
+  v2::ErrorDetail detail;
+  ASSERT_TRUE(control_plane_->ResumeAll());
+  EXPECT_NE(grpc::StatusCode::OK, set_size(&detail)) << "ran beside the running worker";
+  EXPECT_EQ(EBUSY, detail.errno_value());
+  EXPECT_EQ(v2::ErrorDetail::RESOURCE_BUSY, detail.code());
+  ASSERT_TRUE(control_plane_->PauseAll());
+  EXPECT_EQ(grpc::StatusCode::OK, set_size(&detail)) << detail.message();
 }
 
 // The int64 traffic-class fields are range-checked against the scheduler's

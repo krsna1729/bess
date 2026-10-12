@@ -105,6 +105,15 @@ class ControlPlane {
   ControlResult<void> ResetModules();
   ControlResult<void> ConnectModules(const ConnectionSpec& spec);
   ControlResult<void> DisconnectModules(const DisconnectionSpec& spec);
+  // Runs module `module`'s command `command` with `arg` (GetSchema names each
+  // command's argument type), for the legacy ModuleCommand RPC and the v2
+  // RunModuleCommand alike (D-115). A command not marked thread-safe is
+  // refused (EBUSY) while a worker runs: pause first. The command's own
+  // failure is the response's error; the result's error is only "no such
+  // module". Commands change module state, not the pipeline: no generation.
+  ControlResult<bess::pb::CommandResponse> RunModuleCommand(
+      const std::string& module, const std::string& command,
+      const google::protobuf::Any& arg);
 
   // -- workers --
   ControlResult<void> AddWorker(uint64_t wid, uint64_t core,

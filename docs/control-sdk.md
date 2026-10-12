@@ -184,6 +184,27 @@ would match a restarted daemon that reached the same number (D-106).
 Entries are added or replaced, never removed, and `get` does not print them.
 `validate`, `diff` and `plan` check only the pipeline.
 
+## Module commands (D-115)
+
+`RunModuleCommand` (Control service; C++ `client->RunModuleCommand(module,
+command, arg)`, Go `client.RunModuleCommand(ctx, module, command, arg)`) runs a module's
+command, as the legacy `ModuleCommand` did: `arg` is a message of the type
+`GetSchema` names for the command, and the answer is a `google.protobuf.Any`,
+empty when the command answers nothing. Every module also answers
+`get_initial_arg` (`EmptyArg`): its init argument. A command is not a
+transaction: it is not retried, recorded or announced as an event, and the
+pipeline's generation does not change. It names the epoch the client has seen
+and is refused under another (D-106). A command not marked thread-safe is
+refused (EBUSY: C++ `kBusy`, Go `*BusyError`) while a running worker runs the module: pause the workers
+first. An unknown module is `NOT_FOUND`; an unknown command, or the command's
+own failure, carries its errno in the `ErrorDetail`.
+
+```sh
+bessctl command fib lookup '{addrs: ["02:00:00:00:00:01"]}'   # JSON or YAML
+bessctl command em get_runtime_config -o yaml
+bessctl pause && bessctl command arp add '{ip: 10.0.0.1, mac_addr: "02:00:00:00:00:01"}' && bessctl resume
+```
+
 ## Administration (the Admin service, D-107)
 
 Beside `Control`, bessd serves `bess.pb.v2.Admin`: what an operator does to a
@@ -316,7 +337,7 @@ each left behind steers packets. A behaviour both SDKs must share is a case
 there, not a test in one SDK.
 
 A driver gets the daemon's address, the resource name (`$resource` in the
-cases) and the cases. It builds every message from the daemon's `GetSchema`
+cases; `$module` is its module, the part before `/`) and the cases. It builds every message from the daemon's `GetSchema`
 descriptors and protobuf JSON, as a client without generated code would.
 Cases run in order, each with its own labels; a case fails at its first failing
 step. Error kinds are named alike in both drivers: `invalid_request`,
@@ -337,6 +358,7 @@ if it succeeds.
 | `commit` | `ops`, `request_id_of`, `expected_generation_of`, `generation_delta`, `snapshot`, `as` | one transaction on `$resource` (below) |
 | `transaction_status` | `of` or `request_id`, `want_known`, `want_outcome` | `GetTransaction` of commit `of`'s request id, or `request_id` |
 | `pipeline` | `base`, `add`, `chain`, `remove`, `plan`, `want_plan_version_of`, `want_changes`, `at_version_of`, `as` | below |
+| `module_command` | `module`, `command`, `arg`, `class` or `arg_type`, `want_answer` | `RunModuleCommand` (D-115) with `arg` (protobuf JSON) in `arg_type`, else in the argument type `class`'s schema gives the command; the answer, in protobuf JSON with the .proto field names, has the fields of `want_answer` with those values |
 
 **commit.** Each op is `{"op": "upsert", "key": {...}, "value": {...}}` or
 `{"op": "erase", "key": {...}}` in the resource's key and value types;

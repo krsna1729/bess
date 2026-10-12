@@ -86,6 +86,21 @@
         {"do": "pipeline", "base": "p2", "add": [["conf_c", "NoSuchClass"]],
          "want_error": "invalid_request"}
       ]
+    },
+    {
+      "name": "module_command",
+      "steps": [
+        {"do": "module_command", "class": "ExactMatch", "module": "$module",
+         "command": "set_default_gate", "arg": {"gate": 2}},
+        {"do": "module_command", "class": "ExactMatch", "module": "$module",
+         "command": "get_runtime_config", "arg": {}, "want_answer": {"default_gate": "2"}},
+        {"do": "module_command", "class": "ExactMatch", "module": "$module",
+         "command": "set_default_gate", "arg": {"gate": 3}},
+        {"do": "module_command", "module": "$module", "command": "no_such_command",
+         "arg_type": "bess.pb.EmptyArg", "arg": {}, "want_error": "invalid_request"},
+        {"do": "module_command", "class": "ExactMatch", "module": "no_such_module",
+         "command": "get_runtime_config", "arg": {}, "want_error": "invalid_request"}
+      ]
     }
   ]
 }

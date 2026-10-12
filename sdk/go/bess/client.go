@@ -114,9 +114,15 @@ func (e *RejectedError) Error() string {
 
 // BusyError: the dataplane stayed busy through every attempt, and every send
 // was answered (nothing applied).
-type BusyError struct{ Attempts int }
+type BusyError struct {
+	Attempts int
+	Detail   *pb.ErrorDetail // the daemon's, when the last attempt was answered with one
+}
 
 func (e *BusyError) Error() string {
+	if e.Detail.GetMessage() != "" {
+		return fmt.Sprintf("bess: still busy after %d attempts: %s", e.Attempts, e.Detail.GetMessage())
+	}
 	return fmt.Sprintf("bess: still busy after %d attempts", e.Attempts)
 }
 
@@ -227,8 +233,9 @@ type transport interface {
 	// pipeline is one desired-state RPC: in is a Get/Validate/Diff/Plan/
 	// ApplyPipelineRequest, the response the matching response.
 	pipeline(ctx context.Context, in proto.Message) (proto.Message, metadata.MD, error)
-	// admin is one Admin RPC (D-107): in is its request, the response the
-	// matching response.
+	// admin is one epoch-checked call that is not retried -- an Admin RPC
+	// (D-107) or RunModuleCommand (D-115): in is its request, the response
+	// the matching response.
 	admin(ctx context.Context, in proto.Message) (proto.Message, metadata.MD, error)
 }
 
@@ -324,6 +331,8 @@ func (t grpcTransport) admin(ctx context.Context, in proto.Message) (proto.Messa
 		r, err = t.a.ResumeWorkers(ctx, req, grpc.Trailer(&md))
 	case *pb.ShutdownRequest:
 		r, err = t.a.Shutdown(ctx, req, grpc.Trailer(&md))
+	case *pb.RunModuleCommandRequest:
+		r, err = t.c.RunModuleCommand(ctx, req, grpc.Trailer(&md))
 	default:
 		return nil, nil, fmt.Errorf("bess: not an Admin request: %T", in)
 	}
@@ -709,7 +718,7 @@ func (c *Client) pipelineCall(ctx context.Context, in proto.Message, retryBusy b
 				backoff *= 2
 				continue
 			}
-			return nil, &BusyError{Attempts: attempt}
+			return nil, &BusyError{Attempts: attempt, Detail: detail}
 		}
 		return nil, translate(err, md)
 	}
@@ -736,6 +745,9 @@ func (c *Client) adminCall(ctx context.Context, in proto.Message, sentEpoch uint
 	if detail.GetCode() == pb.ErrorDetail_EPOCH_MISMATCH {
 		return nil, c.refusedEpoch(sentEpoch, detail)
 	}
+	if detail.GetCode() == pb.ErrorDetail_RESOURCE_BUSY {
+		return nil, &BusyError{Attempts: 1, Detail: detail} // as the C++ SDK: not retried
+	}
 	return nil, translate(err, md)
 }
 
@@ -752,6 +764,34 @@ func (c *Client) administer(ctx context.Context, in proto.Message, name func(epo
 		return err
 	}
 	return c.checkEpoch(r.(epochAnswer).GetDaemonEpoch(), epoch)
+}
+
+// RunModuleCommand runs module's command with arg (D-115; Schema lists each
+// class's commands and their argument types) and returns its answer, nil when
+// it has none. Sent under the epoch the client knows and not retried: a
+// command acts when it runs. A command's EBUSY is a *BusyError with the
+// daemon's Detail (a command not marked thread-safe while a worker runs the
+// module: PauseWorkers first). Other failures are an *InvalidRequestError
+// whose Detail carries the command's errno (ErrnoValue).
+func (c *Client) RunModuleCommand(ctx context.Context, module, command string, arg proto.Message) (*anypb.Any, error) {
+	packed, err := anypb.New(arg)
+	if err != nil {
+		return nil, fmt.Errorf("bess: packing the argument of %s %s: %w", module, command, err)
+	}
+	epoch, err := c.knownEpoch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	req := &pb.RunModuleCommandRequest{DaemonEpoch: epoch, Module: module, Command: command, Arg: packed}
+	r, err := c.adminCall(ctx, req, epoch)
+	if err != nil {
+		return nil, err
+	}
+	resp := r.(*pb.RunModuleCommandResponse)
+	if err := c.checkEpoch(resp.GetDaemonEpoch(), epoch); err != nil {
+		return nil, err
+	}
+	return resp.GetData(), nil
 }
 
 // ImportPlugin loads the plugin at path (a path on the daemon's host).

@@ -1134,23 +1134,13 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status ModuleCommand(ServerContext*, const CommandRequest* request,
                        CommandResponse* response) override {
-    auto lock = control_plane_.AcquireLock();
-
-    if (!request->name().length()) {
-      return return_with_error(response, EINVAL,
-                               "Missing module name field 'name'");
+    auto result = control_plane_.RunModuleCommand(request->name(), request->cmd(),
+                                                  request->arg());
+    if (!result) {
+      return return_with_error(response, result.error().err, "%s",
+                               result.error().message.c_str());
     }
-    const auto& it = ModuleGraph::GetAllModules().find(request->name());
-    if (it == ModuleGraph::GetAllModules().end()) {
-      return return_with_error(response, ENOENT, "No module '%s' found",
-                               request->name().c_str());
-    }
-
-    // DPDK functions may be called, so be prepared
-    current_worker.SetNonWorker();
-
-    Module* m = bess::runtime::runtime().modules().Find(request->name());
-    *response = m->RunCommand(request->cmd(), request->arg());
+    *response = std::move(*result);
     return Status::OK;
   }
 

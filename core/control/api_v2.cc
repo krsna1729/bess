@@ -611,6 +611,34 @@ grpc::Status ControlV2Service::ListTransactionResources(
   return grpc::Status::OK;
 }
 
+grpc::Status ControlV2Service::RunModuleCommand(
+    grpc::ServerContext *context, const v2::RunModuleCommandRequest *request,
+    v2::RunModuleCommandResponse *response) {
+  if (auto refused = RefuseOtherEpoch(request->daemon_epoch(), transactions_.epoch(), context)) {
+    return *refused;
+  }
+  auto ran = control_plane_.RunModuleCommand(request->module(), request->command(),
+                                             request->arg());
+  if (!ran) {
+    ControlError error = ran.error();
+    error.object = request->module();
+    return ToStatus(error, context);
+  }
+  if (ran->has_error()) {
+    // The command's own failure: its errno decides the code (EBUSY: a
+    // thread-unsafe command while a worker runs).
+    ControlError error = Err(ran->error().code(), "%s", ran->error().errmsg().c_str());
+    error.object = request->module();
+    error.field = "command";
+    return ToStatus(error, context);
+  }
+  if (ran->has_data()) {
+    *response->mutable_data() = std::move(*ran->mutable_data());
+  }
+  response->set_daemon_epoch(transactions_.epoch());
+  return grpc::Status::OK;
+}
+
 grpc::Status ControlV2Service::WatchEvents(grpc::ServerContext *context,
                                            const v2::WatchEventsRequest *request,
                                            grpc::ServerWriter<v2::Event> *writer) {

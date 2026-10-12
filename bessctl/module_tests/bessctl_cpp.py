@@ -218,6 +218,31 @@ class BessctlCppTest(BessModuleTestCase):
         self.bessctl('resume')
         self.bessctl('pause')
 
+    # Module commands (D-115): the argument as JSON or YAML text (a flow
+    # mapping starts with "{" too), the answer printed; a command not marked
+    # thread-safe is refused while a worker runs the module.
+    def test_command(self):
+        self.binary = bessctl_binary()
+        if not os.access(self.binary, os.X_OK):
+            self.skipTest(self.binary + ' is not built')
+        self.bessctl('apply', os.path.join(ROOT, 'bessctl', 'conf', 'samples', 'arp.yaml'))
+        self.bessctl('resume')
+        busy = self.bessctl('command', 'arp', 'add', '{ip: 10.9.8.7, mac_addr: "02:00:00:00:00:07"}',
+                            ok=False)
+        self.assertEqual(busy.returncode, 1)
+        self.assertIn("is not MT safe", busy.stderr)
+        self.bessctl('pause')
+        self.bessctl('command', 'arp', 'add', '{ip: 10.9.8.7, mac_addr: "02:00:00:00:00:07"}')
+        self.bessctl('command', 'arp', 'add', '{"ip": "10.9.8.6", "mac_addr": "02:00:00:00:00:06"}')
+        initial = json.loads(self.bessctl('command', 'arp', 'get_initial_arg').stdout)
+        self.assertEqual(initial['ip'], '1.2.3.4')
+        self.assertIn('ip: "1.2.3.4"', self.bessctl('command', 'arp', 'get_initial_arg',
+                                                  '-o', 'yaml').stdout)
+        unknown = self.bessctl('command', 'arp', 'nope', ok=False)
+        self.assertEqual(unknown.returncode, 1)
+        self.assertIn('it has: add', unknown.stderr)
+        self.assertEqual(self.bessctl('command', 'arp', ok=False).returncode, 2)
+
     # Every sample manifest (conf/samples, D-104): applies on a reset daemon,
     # converges (diff reports nothing left), and runs briefly.
     def test_samples(self):

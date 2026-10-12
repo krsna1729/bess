@@ -157,7 +157,12 @@ class Runner {
   }
 
  private:
-  std::string Var(const std::string &s) const { return s == "$resource" ? resource_ : s; }
+  std::string Var(const std::string &s) const {
+    if (s == "$module") {
+      return resource_.substr(0, resource_.find('/'));
+    }
+    return s == "$resource" ? resource_ : s;
+  }
 
   std::unique_ptr<gp::Message> Make(const std::string &type, const gp::Value &json,
                                     std::string *error) {
@@ -249,6 +254,9 @@ class Runner {
     if (what == "pipeline") {
       return DoPipeline(s, want_error);
     }
+    if (what == "module_command") {
+      return DoModuleCommand(s, want_error);
+    }
     return "unknown step '" + what + "'";
   }
 
@@ -307,6 +315,64 @@ class Runner {
         if (f == found->fields().end() || f->second != v.string_value()) {
           return "event " + found->ShortDebugString() + ": want " + k + "=" + v.string_value();
         }
+      }
+    }
+    return std::nullopt;
+  }
+
+  // The argument's type is `arg_type`, else the command's in `class`'s schema.
+  Outcome DoModuleCommand(const gp::Struct &s, const std::string &want_error) {
+    const std::string command = Str(s, "command");
+    std::string type = Str(s, "arg_type");
+    for (const v2::ModuleClassSchema &c : schema_.module_classes()) {
+      for (const v2::CommandSchema &cmd : c.commands()) {
+        if (type.empty() && c.name() == Str(s, "class") && cmd.name() == command) {
+          type = cmd.arg_type();
+        }
+      }
+    }
+    if (type.empty()) {
+      return std::format("{} has no command {} in the schema", Str(s, "class"), command);
+    }
+    std::string error;
+    std::unique_ptr<gp::Message> arg = Make(type, *Field(s, "arg"), &error);
+    if (arg == nullptr) {
+      return error;
+    }
+    auto answer = client_.RunModuleCommand(Var(Str(s, "module")), command, *arg);
+    if (!answer) {
+      return Expect(&answer.error(), want_error, command);
+    }
+    if (Outcome failed = Expect(nullptr, want_error, command)) {
+      return failed;
+    }
+    const gp::Value *want = Field(s, "want_answer");
+    if (want == nullptr) {
+      return std::nullopt;
+    }
+    const std::string answer_type = answer->type_url().substr(answer->type_url().rfind('/') + 1);
+    const gp::Descriptor *d = pool_.FindMessageTypeByName(answer_type);
+    if (d == nullptr) {
+      return std::format("answer type '{}' not in the schema", answer->type_url());
+    }
+    std::unique_ptr<gp::Message> got(factory_.GetPrototype(d)->New());
+    if (!got->ParseFromString(answer->value())) {
+      return "cannot parse the answer as " + answer_type;
+    }
+    std::string text;
+    gp::util::JsonPrintOptions options;
+    options.preserve_proto_field_names = true;
+    gp::Struct fields;
+    if (!gp::util::MessageToJsonString(*got, &text, options).ok() ||
+        !gp::util::JsonStringToMessage(text, &fields).ok()) {
+      return "cannot read the answer as JSON";
+    }
+    for (const auto &[k, v] : want->struct_value().fields()) {
+      const gp::Value *f = Field(fields, k);
+      if (f == nullptr || f->SerializeAsString() != v.SerializeAsString()) {
+        std::string want_text;
+        (void)gp::util::MessageToJsonString(v, &want_text);
+        return std::format("answer {}: want {} = {}", text, k, want_text);
       }
     }
     return std::nullopt;

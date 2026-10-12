@@ -432,7 +432,10 @@ Result<Resp> Client::PipelineCall(Call &&call, bool retry_busy,
         backoff *= 2;
         continue;
       }
-      return std::unexpected(Busy(attempt));
+      Error e = Busy(attempt);
+      e.message += ": " + detail->message();
+      e.detail = detail;
+      return std::unexpected(std::move(e));
     }
     return std::unexpected(Translate(status, trailers));
   }
@@ -545,6 +548,37 @@ Result<TransactionStatus> Client::GetTransaction(const std::string &request_id) 
   return TransactionStatus{.known = resp.known(),
                            .record = resp.record(),
                            .daemon_epoch = resp.daemon_epoch()};
+}
+
+// -- module commands ----------------------------------------------------------------
+
+Result<google::protobuf::Any> Client::RunModuleCommand(const std::string &module,
+                                                       const std::string &command,
+                                                       const google::protobuf::Message &arg) {
+  const Result<uint64_t> epoch = KnownEpoch();
+  if (!epoch) {
+    return std::unexpected(epoch.error());
+  }
+  pb::RunModuleCommandRequest req;
+  req.set_daemon_epoch(*epoch);
+  req.set_module(module);
+  req.set_command(command);
+  if (!req.mutable_arg()->PackFrom(arg)) {
+    return std::unexpected(Error{.kind = ErrorKind::kInvalidRequest,
+                                 .message = "cannot pack the command's argument"});
+  }
+  auto r = PipelineCall<pb::RunModuleCommandResponse>(
+      [&](Deadline d, pb::RunModuleCommandResponse *resp, Trailers *t) {
+        return transport_->RunModuleCommand(d, req, resp, t);
+      },
+      false, {}, *epoch);
+  if (!r) {
+    return std::unexpected(std::move(r.error()));
+  }
+  if (auto checked = CheckEpoch(r->daemon_epoch(), *epoch); !checked) {
+    return std::unexpected(std::move(checked.error()));
+  }
+  return std::move(*r->mutable_data());
 }
 
 // -- administration ---------------------------------------------------------------
