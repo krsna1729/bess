@@ -263,6 +263,27 @@ class Client {
   // `request_id`'s outcome under the current epoch.
   Result<TransactionStatus> GetTransaction(const std::string &request_id);
 
+  // -- administration (the Admin service, D-107) --
+  // The mutating calls name the epoch the client has seen (asked for if
+  // none); under another the daemon refuses: kDaemonRestarted, nothing done.
+  // No answer is kTransport: they are not retried.
+  // Loads the plugin at `path` (a path on the daemon's host).
+  Result<void> ImportPlugin(const std::string &path);
+  Result<void> UnloadPlugin(const std::string &path);
+  // Link and counters of the ports `names` in that order, or of every port by
+  // name; an unknown name is kInvalidRequest (NOT_FOUND).
+  Result<std::vector<pb::PortStatus>> Ports(const std::vector<std::string> &names = {});
+  // The default packet pool of each NUMA socket.
+  Result<std::vector<pb::PacketPool>> PacketPools();
+  // Starts or stops a capture (`request` without its epoch).
+  Result<void> SetCapture(pb::SetCaptureRequest request);
+  // Pauses every worker; resumes every worker (running the resume hooks
+  // first). A worker a pipeline creates starts paused.
+  Result<void> PauseWorkers();
+  Result<void> ResumeWorkers();
+  // Asks the daemon to stop; it answers first.
+  Result<void> Shutdown();
+
  private:
   friend class Transaction;
 
@@ -272,6 +293,9 @@ class Client {
   template <typename Resp, typename Call>
   Result<Resp> PipelineCall(Call &&call, bool retry_busy, std::stop_token stop,
                             uint64_t sent_epoch = 0);
+  // A mutating Admin call: names the known epoch, checks the answer's.
+  template <typename Resp, typename Req, typename Call>
+  Result<void> Administer(Req req, Call &&call);
   bool ObserveEpoch(uint64_t epoch);
   // The epoch the client has seen, asked for if it has seen none.
   Result<uint64_t> KnownEpoch();

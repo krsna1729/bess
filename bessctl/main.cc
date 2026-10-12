@@ -4,13 +4,20 @@
 // Pipelines are manifests: control_v2 Pipeline JSON (manifest.h); the daemon
 // validates, diffs, plans and applies them.
 
+#include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <format>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -47,6 +54,20 @@ constexpr std::string_view kUsage = R"(usage: bessctl [-s HOST:PORT] COMMAND [AR
   resources                      transactional resources (key -> value types)
   metrics                        metric samples
   events [--from SEQ] [TYPE...]  follow operational events until interrupted
+  ports [NAME...]                link state and counters of the ports
+  pools                          the packet pools, per NUMA socket
+  plugin import|unload PATH      load or unload a plugin (a path on the
+                                 daemon's host)
+  capture MODULE in|out[:GATE] [--pcapng]
+                                 copy the packets on MODULE's input or output
+                                 gates (all, or GATE) to standard output as
+                                 pcap (or pcapng) until interrupted, e.g.
+                                 | tcpdump -r -  (pcap of a module with more
+                                 than one gate there needs a GATE;
+                                 the daemon must share this host's /tmp)
+  pause | resume                 pause or resume every worker (a worker a
+                                 pipeline creates starts paused)
+  shutdown                       stop the daemon
 
 A manifest is a control_v2 Pipeline in protobuf JSON; a module's or port's
 "arg" may leave out "@type". FILE "-" is standard input. The daemon is
@@ -123,6 +144,145 @@ class Cli {
     }
     return 0;
   }
+
+  int Ports(std::span<const std::string> names) {
+    auto ports = client_->Ports(std::vector<std::string>(names.begin(), names.end()));
+    if (!ports) {
+      return Fail(ports.error());
+    }
+    for (const pb::PortStatus &p : *ports) {
+      const pb::PortStatus::Link &l = p.link();
+      std::println("{} ({}): link {}{}", p.name(), p.driver(), l.up() ? "up" : "down",
+                   l.speed_mbps() ? std::format(" {} Mb/s{}{}", l.speed_mbps(),
+                                                l.full_duplex() ? " full-duplex" : " half-duplex",
+                                                l.autoneg() ? " autoneg" : "")
+                                  : std::string());
+      std::println("  rx  packets {} bytes {} dropped {}", p.rx().packets(), p.rx().bytes(),
+                   p.rx().dropped());
+      std::println("  tx  packets {} bytes {} dropped {} prepare errors {}", p.tx().packets(),
+                   p.tx().bytes(), p.tx().dropped(), p.tx().prepare_errors());
+    }
+    return 0;
+  }
+
+  int Pools() {
+    auto pools = client_->PacketPools();
+    if (!pools) {
+      return Fail(pools.error());
+    }
+    for (const pb::PacketPool &p : *pools) {
+      std::println("socket {}: {} packets of {} bytes ({} populated), {} in use, {} available, "
+                   "cache {}",
+                   p.socket(), p.size(), p.element_size(), p.populated(), p.in_use(),
+                   p.available(), p.cache_size());
+    }
+    return 0;
+  }
+
+  int Plugin(const std::string &op, const std::string &path) {
+    auto done = op == "import" ? client_->ImportPlugin(path) : client_->UnloadPlugin(path);
+    if (!done) {
+      return Fail(done.error());
+    }
+    return 0;
+  }
+
+  int Workers(bool resume) {
+    if (auto done = resume ? client_->ResumeWorkers() : client_->PauseWorkers(); !done) {
+      return Fail(done.error());
+    }
+    return 0;
+  }
+
+  int Shutdown() {
+    if (auto done = client_->Shutdown(); !done) {
+      return Fail(done.error());
+    }
+    return 0;
+  }
+
+  // Captures into a FIFO this process makes and copies it to standard output
+  // until `stop`, the end of the stream, or a reader of standard output that
+  // went away; then stops the capture (always, once it started).
+  int Capture(pb::SetCaptureRequest req, std::stop_token stop) {
+    char dir[] = "/tmp/bessctl-capture-XXXXXX";
+    if (mkdtemp(dir) == nullptr) {
+      return Fail(std::format("mkdtemp: {}", std::strerror(errno)));
+    }
+    const std::string fifo = std::string(dir) + "/capture";
+    struct Cleanup {
+      std::string dir, fifo;
+      int fd = -1;
+      ~Cleanup() {
+        if (fd >= 0) {
+          close(fd);
+        }
+        unlink(fifo.c_str());
+        rmdir(dir.c_str());
+      }
+    } cleanup{dir, fifo};
+    if (mkfifo(fifo.c_str(), 0600) != 0) {
+      return Fail(std::format("mkfifo {}: {}", fifo, std::strerror(errno)));
+    }
+    // The read end first: the daemon opens the write end without blocking,
+    // which fails while nobody reads.
+    cleanup.fd = open(fifo.c_str(), O_RDONLY | O_NONBLOCK);
+    if (cleanup.fd < 0) {
+      return Fail(std::format("open {}: {}", fifo, std::strerror(errno)));
+    }
+    req.set_fifo(fifo);
+    req.set_enable(true);
+    if (auto started = client_->SetCapture(req); !started) {
+      return Fail(started.error());
+    }
+    std::signal(SIGPIPE, SIG_IGN);  // a reader that goes away is EPIPE, not death
+    int rc = 0;
+    std::vector<char> buf(1 << 16);
+    while (!stop.stop_requested()) {
+      pollfd p{.fd = cleanup.fd, .events = POLLIN, .revents = 0};
+      if (poll(&p, 1, 200) <= 0) {
+        continue;  // timeout, or a signal: look at `stop` again
+      }
+      const ssize_t n = read(cleanup.fd, buf.data(), buf.size());
+      if (n == 0) {
+        break;  // the daemon closed it (the capture was stopped elsewhere)
+      }
+      if (n < 0) {
+        if (errno == EAGAIN || errno == EINTR) {
+          continue;
+        }
+        rc = Fail(std::format("read {}: {}", fifo, std::strerror(errno)));
+        break;
+      }
+      if (!WriteAll(STDOUT_FILENO, buf.data(), static_cast<size_t>(n))) {
+        break;  // whoever read standard output is gone
+      }
+    }
+    req.clear_fifo();
+    req.set_enable(false);
+    if (auto stopped = client_->SetCapture(req); !stopped) {
+      return Fail(std::format("the capture is still running: {}", Describe(stopped.error())));
+    }
+    return rc;
+  }
+
+ private:
+  static bool WriteAll(int fd, const char *data, size_t size) {
+    while (size > 0) {
+      const ssize_t n = write(fd, data, size);
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n <= 0) {
+        return false;
+      }
+      data += n;
+      size -= static_cast<size_t>(n);
+    }
+    return true;
+  }
+
+ public:
 
   int ShowSchema(std::span<const std::string> args) {
     auto schema = client_->Schema();
@@ -528,6 +688,45 @@ int main(int argc, char **argv) {
     }
     watching = true;
     return cli.Events(from, types, interrupted.get_token());
+  }
+  if (command == "ports") {
+    return cli.Ports(rest);
+  }
+  if (command == "pools" && rest.empty()) {
+    return cli.Pools();
+  }
+  if (command == "plugin" && rest.size() == 2 && (rest[0] == "import" || rest[0] == "unload")) {
+    return cli.Plugin(rest[0], rest[1]);
+  }
+  if ((command == "pause" || command == "resume") && rest.empty()) {
+    return cli.Workers(command == "resume");
+  }
+  if (command == "shutdown" && rest.empty()) {
+    return cli.Shutdown();
+  }
+  if (command == "capture" && (rest.size() == 2 || (rest.size() == 3 && rest[2] == "--pcapng"))) {
+    bess::pb::v2::SetCaptureRequest req;
+    req.set_module(rest[0]);
+    const std::string_view where = rest[1];
+    const std::string_view direction = where.substr(0, where.find(':'));
+    if (direction == "in") {
+      req.set_direction(bess::pb::v2::SetCaptureRequest::DIRECTION_INPUT);
+    } else if (direction == "out") {
+      req.set_direction(bess::pb::v2::SetCaptureRequest::DIRECTION_OUTPUT);
+    } else {
+      return Usage();
+    }
+    if (direction.size() < where.size()) {
+      const auto gate = ParseU64(where.substr(direction.size() + 1));
+      if (!gate || *gate > UINT32_MAX) {
+        return Usage();
+      }
+      req.set_gate(static_cast<uint32_t>(*gate));
+    }
+    req.set_format(rest.size() == 3 ? bess::pb::v2::SetCaptureRequest::FORMAT_PCAPNG
+                                    : bess::pb::v2::SetCaptureRequest::FORMAT_PCAP);
+    watching = true;  // Ctrl-C stops the capture before exiting
+    return cli.Capture(std::move(req), interrupted.get_token());
   }
   return Usage();
 }

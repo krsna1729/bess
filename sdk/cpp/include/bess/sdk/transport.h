@@ -57,6 +57,15 @@ class Transport {
   BESS_SDK_UNARY(DiffPipeline)
   BESS_SDK_UNARY(PlanPipeline)
   BESS_SDK_UNARY(ApplyPipeline)
+  // The Admin service (D-107).
+  BESS_SDK_UNARY(ImportPlugin)
+  BESS_SDK_UNARY(UnloadPlugin)
+  BESS_SDK_UNARY(GetPortStatus)
+  BESS_SDK_UNARY(GetPacketPools)
+  BESS_SDK_UNARY(SetCapture)
+  BESS_SDK_UNARY(PauseWorkers)
+  BESS_SDK_UNARY(ResumeWorkers)
+  BESS_SDK_UNARY(Shutdown)
 #undef BESS_SDK_UNARY
 
   // Opens an event stream; nullptr with `*status` set when it cannot.

@@ -148,9 +148,39 @@ would match a restarted daemon that reached the same number (D-106).
 Entries are added or replaced, never removed, and `get` does not print them.
 `validate`, `diff` and `plan` check only the pipeline.
 
-Not yet: YAML, the legacy commands (daemon start/stop, `.bess` files,
-interactive shell); the Python bessctl remains for those until D-104's last
-step.
+## Administration (the Admin service, D-107)
+
+Beside `Control`, bessd serves `bess.pb.v2.Admin`: what an operator does to a
+running daemon besides its pipeline. Both SDKs wrap it (C++ / Go):
+
+| Call | What it does |
+|---|---|
+| `ImportPlugin(path)` / `UnloadPlugin(path)` | load or unload a plugin (a path on the daemon's host) |
+| `Ports(names...)` | link state and rx/tx counters; every port by name, or the named ones in that order |
+| `PacketPools()` | each NUMA socket's default packet pool: size, in use, available |
+| `SetCapture(request)` | start or stop a pcap or pcapng capture on a module's input or output gates (one, or all; pcap without a gate needs the module to have only one there, since a pcap stream holds one file header) into a FIFO the caller made; at most one capture of each format per gate (`ALREADY_EXISTS`), all gates or none |
+| `PauseWorkers()` / `ResumeWorkers()` | every worker; resuming runs the resume hooks first. A worker a pipeline creates starts paused, and applying a pipeline keeps the workers' state |
+| `Shutdown()` | the daemon answers, then stops |
+
+The mutating calls name the epoch the client has seen and are refused under
+another, as `kDaemonRestarted` / `*DaemonRestartedError{Refused}`, with
+nothing done (D-106); they are not retried.
+
+```sh
+bessctl apply pipeline.json && bessctl resume
+bessctl ports | pools
+bessctl capture em0 out:1 | tcpdump -n -r -     # Ctrl-C stops the capture
+bessctl capture em0 in --pcapng > em0-in.pcapng
+bessctl plugin import /opt/bess/plugins/my.so
+bessctl pause | resume | shutdown
+```
+
+`capture` makes the FIFO under `/tmp`, so the daemon must share the host's
+`/tmp`; it stops the capture when interrupted, when the stream ends, or when
+its reader goes away.
+
+Not yet: YAML, the legacy commands (daemon start, `.bess` files, interactive
+shell); the Python bessctl remains for those until D-104's last step.
 
 ## What they guarantee
 

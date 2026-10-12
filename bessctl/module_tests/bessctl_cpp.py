@@ -160,6 +160,49 @@ class BessctlCppTest(BessModuleTestCase):
             _, err = watch.communicate(timeout=10)
         self.assertEqual(watch.returncode, 0, err)
 
+    # The Admin service through bessctl (D-107): pools, ports, a refused
+    # plugin, and a capture that streams pcap and is stopped on Ctrl-C.
+    def test_admin(self):
+        self.binary = bessctl_binary()
+        if not os.access(self.binary, os.X_OK):
+            self.skipTest(self.binary + ' is not built')
+        pools = self.bessctl('pools').stdout
+        self.assertIn('socket 0: ', pools)
+
+        self.bess.create_port('UnixSocketPort', 'ctl_p0',
+                              {'path': '@bessctl_cpp_%d' % os.getpid()})
+        ports = self.bessctl('ports', 'ctl_p0').stdout
+        self.assertTrue(ports.startswith('ctl_p0 (UnixSocketPort): link '), ports)
+        self.assertIn('rx  packets 0', ports)
+        missing = self.bessctl('ports', 'ctl_nosuch', ok=False)
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn('ctl_nosuch', missing.stderr)
+
+        refused = self.bessctl('plugin', 'import', '/nonexistent/plugin.so', ok=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertEqual(self.bessctl('plugin', 'load', 'x', ok=False).returncode, 2)
+
+        self.bess.create_module('Bypass', 'cap_a')
+        self.bess.create_module('Bypass', 'cap_b')
+        self.bess.connect_modules('cap_a', 'cap_b')
+        for _ in range(2):  # a stopped capture can start again
+            cap = subprocess.Popen([self.binary, '-s', self.bess.peer, 'capture', 'cap_a', 'out:0'],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                ready, _, _ = select.select([cap.stdout], [], [], 10)
+                self.assertTrue(ready, 'capture printed nothing')
+                header = os.read(cap.stdout.fileno(), 24)
+                self.assertEqual(header[:4], b'\xd4\xc3\xb2\xa1', 'a libpcap file header')
+            finally:
+                cap.send_signal(signal.SIGINT)
+                _, err = cap.communicate(timeout=10)
+            self.assertEqual(cap.returncode, 0, err)
+        self.assertEqual(self.bessctl('capture', 'cap_a', 'sideways', ok=False).returncode, 2)
+
+        # Workers: a pipeline's new worker starts paused; resume and pause
+        # them all.
+        self.bessctl('resume')
+        self.bessctl('pause')
 
 suite = unittest.TestLoader().loadTestsFromTestCase(BessctlCppTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)

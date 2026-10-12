@@ -58,6 +58,19 @@ type fake struct {
 	watched   [][2]uint64 // (from_sequence, daemon_epoch) per WatchEvents call
 	pipelines []step      // ApplyPipeline's script (err/md; nil err: applied)
 	applied   []*pb.ApplyPipelineRequest
+	captures  []*pb.SetCaptureRequest
+}
+
+func (f *fake) admin(_ context.Context, in proto.Message) (proto.Message, metadata.MD, error) {
+	if req, ok := in.(*pb.SetCaptureRequest); ok {
+		f.captures = append(f.captures, proto.Clone(req).(*pb.SetCaptureRequest))
+		if req.GetDaemonEpoch() != f.epochOr1() {
+			md, err := epochRefusal(req.GetDaemonEpoch(), f.epochOr1())
+			return nil, md, err
+		}
+		return &pb.SetCaptureResponse{DaemonEpoch: f.epochOr1()}, nil, nil
+	}
+	return nil, nil, status.Error(codes.Unimplemented, "fake")
 }
 
 func (f *fake) pipeline(_ context.Context, in proto.Message) (proto.Message, metadata.MD, error) {
@@ -638,5 +651,35 @@ func TestApplyPipelineWithoutAnAnswerIsUnknownAndNotResent(t *testing.T) {
 	_, err = h.c.ApplyPipeline(context.Background(), &pb.Pipeline{})
 	if e := as[*InvalidRequestError](t, err); e.Detail.GetCode() != pb.ErrorDetail_RESOURCE_FAILURE {
 		t.Fatal(e)
+	}
+}
+
+// The Admin service's mutating calls (D-107) follow D-106: sent under the
+// epoch the client knows (learned first), refused under another as a
+// restart, and not retried.
+func TestAdminCallsNameTheKnownEpochAndARestartRefusesThem(t *testing.T) {
+	f := &fake{}
+	c := newHarness(f, 4).c
+	ctx := context.Background()
+	if err := c.SetCapture(ctx, &pb.SetCaptureRequest{Module: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	if f.listed != 1 || f.captures[0].GetDaemonEpoch() != 1 {
+		t.Fatalf("listed %d, sent under epoch %d: the epoch was not learned first", f.listed, f.captures[0].GetDaemonEpoch())
+	}
+	f.epoch = 2 // restarted
+	err := c.SetCapture(ctx, &pb.SetCaptureRequest{Module: "m"})
+	var restarted *DaemonRestartedError
+	if !errors.As(err, &restarted) || restarted.From != 1 || restarted.To != 2 || !restarted.Refused {
+		t.Fatalf("got %v, want a refused restart from 1 to 2", err)
+	}
+	if len(f.captures) != 2 {
+		t.Fatalf("%d sends: a refusal was retried", len(f.captures))
+	}
+	if err := c.SetCapture(ctx, &pb.SetCaptureRequest{Module: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.captures[2].GetDaemonEpoch(); got != 2 {
+		t.Fatalf("next call under epoch %d, want the new epoch 2", got)
 	}
 }

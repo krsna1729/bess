@@ -1276,10 +1276,11 @@ ControlResult<std::string> enable_hook_for_module(
     return hook->name();
   }
 
-  std::vector<std::string> created_hook_names;
-
-  if (spec.is_igate) {
-    for (auto& gate : m->igates()) {
+  // Every gate of one direction, or none: a failure removes the hooks this
+  // call created, from the gates they were created on.
+  std::vector<std::pair<bess::Gate*, std::string>> created;
+  auto hook_every = [&](const auto& gates) -> ControlResult<void> {
+    for (bess::Gate* gate : gates) {
       if (!gate) {
         continue;
       }
@@ -1288,36 +1289,19 @@ ControlResult<std::string> enable_hook_for_module(
                                                   spec.hook_name, spec.arg,
                                                   &error);
       if (error.code() != 0 || !hook) {
-        // in case of failed creating gate hook, remove previously created
-        // before return
-        for (const auto& name : created_hook_names) {
-          gate->RemoveHook(name);
+        for (const auto& [g, name] : created) {
+          g->RemoveHook(name);
         }
         return std::unexpected(ErrorFromLegacy(error.code(), error.errmsg()));
       }
-      created_hook_names.push_back(hook->name());
+      created.emplace_back(gate, hook->name());
     }
-  } else {
-    for (auto& gate : m->ogates()) {
-      if (!gate) {
-        continue;
-      }
-      pb_error_t error;
-      bess::GateHook* hook = gate->CreateGateHook(&builder, gate,
-                                                  spec.hook_name, spec.arg,
-                                                  &error);
-      if (error.code() != 0 || !hook) {
-        // in case of failed creating gate hook, remove previously created
-        // before return
-        for (const auto& name : created_hook_names) {
-          gate->RemoveHook(name);
-        }
-        return std::unexpected(ErrorFromLegacy(error.code(), error.errmsg()));
-      }
-      created_hook_names.push_back(hook->name());
-    }
+    return {};
+  };
+  ControlResult<void> ret = spec.is_igate ? hook_every(m->igates()) : hook_every(m->ogates());
+  if (!ret) {
+    return std::unexpected(ret.error());
   }
-
   return std::string();
 }
 

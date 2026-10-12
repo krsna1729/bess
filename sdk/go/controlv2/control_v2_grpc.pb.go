@@ -542,3 +542,371 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "control_v2.proto",
 }
+
+const (
+	Admin_ImportPlugin_FullMethodName   = "/bess.pb.v2.Admin/ImportPlugin"
+	Admin_UnloadPlugin_FullMethodName   = "/bess.pb.v2.Admin/UnloadPlugin"
+	Admin_GetPortStatus_FullMethodName  = "/bess.pb.v2.Admin/GetPortStatus"
+	Admin_GetPacketPools_FullMethodName = "/bess.pb.v2.Admin/GetPacketPools"
+	Admin_SetCapture_FullMethodName     = "/bess.pb.v2.Admin/SetCapture"
+	Admin_PauseWorkers_FullMethodName   = "/bess.pb.v2.Admin/PauseWorkers"
+	Admin_ResumeWorkers_FullMethodName  = "/bess.pb.v2.Admin/ResumeWorkers"
+	Admin_Shutdown_FullMethodName       = "/bess.pb.v2.Admin/Shutdown"
+)
+
+// AdminClient is the client API for Admin service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type AdminClient interface {
+	ImportPlugin(ctx context.Context, in *ImportPluginRequest, opts ...grpc.CallOption) (*ImportPluginResponse, error)
+	UnloadPlugin(ctx context.Context, in *UnloadPluginRequest, opts ...grpc.CallOption) (*UnloadPluginResponse, error)
+	GetPortStatus(ctx context.Context, in *GetPortStatusRequest, opts ...grpc.CallOption) (*GetPortStatusResponse, error)
+	GetPacketPools(ctx context.Context, in *GetPacketPoolsRequest, opts ...grpc.CallOption) (*GetPacketPoolsResponse, error)
+	SetCapture(ctx context.Context, in *SetCaptureRequest, opts ...grpc.CallOption) (*SetCaptureResponse, error)
+	PauseWorkers(ctx context.Context, in *PauseWorkersRequest, opts ...grpc.CallOption) (*PauseWorkersResponse, error)
+	ResumeWorkers(ctx context.Context, in *ResumeWorkersRequest, opts ...grpc.CallOption) (*ResumeWorkersResponse, error)
+	Shutdown(ctx context.Context, in *ShutdownRequest, opts ...grpc.CallOption) (*ShutdownResponse, error)
+}
+
+type adminClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewAdminClient(cc grpc.ClientConnInterface) AdminClient {
+	return &adminClient{cc}
+}
+
+func (c *adminClient) ImportPlugin(ctx context.Context, in *ImportPluginRequest, opts ...grpc.CallOption) (*ImportPluginResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ImportPluginResponse)
+	err := c.cc.Invoke(ctx, Admin_ImportPlugin_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) UnloadPlugin(ctx context.Context, in *UnloadPluginRequest, opts ...grpc.CallOption) (*UnloadPluginResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UnloadPluginResponse)
+	err := c.cc.Invoke(ctx, Admin_UnloadPlugin_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) GetPortStatus(ctx context.Context, in *GetPortStatusRequest, opts ...grpc.CallOption) (*GetPortStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetPortStatusResponse)
+	err := c.cc.Invoke(ctx, Admin_GetPortStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) GetPacketPools(ctx context.Context, in *GetPacketPoolsRequest, opts ...grpc.CallOption) (*GetPacketPoolsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetPacketPoolsResponse)
+	err := c.cc.Invoke(ctx, Admin_GetPacketPools_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) SetCapture(ctx context.Context, in *SetCaptureRequest, opts ...grpc.CallOption) (*SetCaptureResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetCaptureResponse)
+	err := c.cc.Invoke(ctx, Admin_SetCapture_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) PauseWorkers(ctx context.Context, in *PauseWorkersRequest, opts ...grpc.CallOption) (*PauseWorkersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PauseWorkersResponse)
+	err := c.cc.Invoke(ctx, Admin_PauseWorkers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) ResumeWorkers(ctx context.Context, in *ResumeWorkersRequest, opts ...grpc.CallOption) (*ResumeWorkersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResumeWorkersResponse)
+	err := c.cc.Invoke(ctx, Admin_ResumeWorkers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) Shutdown(ctx context.Context, in *ShutdownRequest, opts ...grpc.CallOption) (*ShutdownResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ShutdownResponse)
+	err := c.cc.Invoke(ctx, Admin_Shutdown_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// AdminServer is the server API for Admin service.
+// All implementations must embed UnimplementedAdminServer
+// for forward compatibility.
+type AdminServer interface {
+	ImportPlugin(context.Context, *ImportPluginRequest) (*ImportPluginResponse, error)
+	UnloadPlugin(context.Context, *UnloadPluginRequest) (*UnloadPluginResponse, error)
+	GetPortStatus(context.Context, *GetPortStatusRequest) (*GetPortStatusResponse, error)
+	GetPacketPools(context.Context, *GetPacketPoolsRequest) (*GetPacketPoolsResponse, error)
+	SetCapture(context.Context, *SetCaptureRequest) (*SetCaptureResponse, error)
+	PauseWorkers(context.Context, *PauseWorkersRequest) (*PauseWorkersResponse, error)
+	ResumeWorkers(context.Context, *ResumeWorkersRequest) (*ResumeWorkersResponse, error)
+	Shutdown(context.Context, *ShutdownRequest) (*ShutdownResponse, error)
+	mustEmbedUnimplementedAdminServer()
+}
+
+// UnimplementedAdminServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedAdminServer struct{}
+
+func (UnimplementedAdminServer) ImportPlugin(context.Context, *ImportPluginRequest) (*ImportPluginResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ImportPlugin not implemented")
+}
+func (UnimplementedAdminServer) UnloadPlugin(context.Context, *UnloadPluginRequest) (*UnloadPluginResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UnloadPlugin not implemented")
+}
+func (UnimplementedAdminServer) GetPortStatus(context.Context, *GetPortStatusRequest) (*GetPortStatusResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPortStatus not implemented")
+}
+func (UnimplementedAdminServer) GetPacketPools(context.Context, *GetPacketPoolsRequest) (*GetPacketPoolsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPacketPools not implemented")
+}
+func (UnimplementedAdminServer) SetCapture(context.Context, *SetCaptureRequest) (*SetCaptureResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetCapture not implemented")
+}
+func (UnimplementedAdminServer) PauseWorkers(context.Context, *PauseWorkersRequest) (*PauseWorkersResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PauseWorkers not implemented")
+}
+func (UnimplementedAdminServer) ResumeWorkers(context.Context, *ResumeWorkersRequest) (*ResumeWorkersResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ResumeWorkers not implemented")
+}
+func (UnimplementedAdminServer) Shutdown(context.Context, *ShutdownRequest) (*ShutdownResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Shutdown not implemented")
+}
+func (UnimplementedAdminServer) mustEmbedUnimplementedAdminServer() {}
+func (UnimplementedAdminServer) testEmbeddedByValue()               {}
+
+// UnsafeAdminServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to AdminServer will
+// result in compilation errors.
+type UnsafeAdminServer interface {
+	mustEmbedUnimplementedAdminServer()
+}
+
+func RegisterAdminServer(s grpc.ServiceRegistrar, srv AdminServer) {
+	// If the following call pancis, it indicates UnimplementedAdminServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&Admin_ServiceDesc, srv)
+}
+
+func _Admin_ImportPlugin_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ImportPluginRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).ImportPlugin(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_ImportPlugin_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).ImportPlugin(ctx, req.(*ImportPluginRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_UnloadPlugin_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UnloadPluginRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).UnloadPlugin(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_UnloadPlugin_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).UnloadPlugin(ctx, req.(*UnloadPluginRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_GetPortStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPortStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).GetPortStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_GetPortStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).GetPortStatus(ctx, req.(*GetPortStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_GetPacketPools_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPacketPoolsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).GetPacketPools(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_GetPacketPools_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).GetPacketPools(ctx, req.(*GetPacketPoolsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_SetCapture_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetCaptureRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).SetCapture(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_SetCapture_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).SetCapture(ctx, req.(*SetCaptureRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_PauseWorkers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PauseWorkersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).PauseWorkers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_PauseWorkers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).PauseWorkers(ctx, req.(*PauseWorkersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_ResumeWorkers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResumeWorkersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).ResumeWorkers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_ResumeWorkers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).ResumeWorkers(ctx, req.(*ResumeWorkersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_Shutdown_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ShutdownRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).Shutdown(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_Shutdown_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).Shutdown(ctx, req.(*ShutdownRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// Admin_ServiceDesc is the grpc.ServiceDesc for Admin service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var Admin_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "bess.pb.v2.Admin",
+	HandlerType: (*AdminServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "ImportPlugin",
+			Handler:    _Admin_ImportPlugin_Handler,
+		},
+		{
+			MethodName: "UnloadPlugin",
+			Handler:    _Admin_UnloadPlugin_Handler,
+		},
+		{
+			MethodName: "GetPortStatus",
+			Handler:    _Admin_GetPortStatus_Handler,
+		},
+		{
+			MethodName: "GetPacketPools",
+			Handler:    _Admin_GetPacketPools_Handler,
+		},
+		{
+			MethodName: "SetCapture",
+			Handler:    _Admin_SetCapture_Handler,
+		},
+		{
+			MethodName: "PauseWorkers",
+			Handler:    _Admin_PauseWorkers_Handler,
+		},
+		{
+			MethodName: "ResumeWorkers",
+			Handler:    _Admin_ResumeWorkers_Handler,
+		},
+		{
+			MethodName: "Shutdown",
+			Handler:    _Admin_Shutdown_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "control_v2.proto",
+}

@@ -36,30 +36,38 @@ class GrpcEventStream final : public EventStream {
 class GrpcTransportImpl final : public Transport {
  public:
   explicit GrpcTransportImpl(std::shared_ptr<grpc::Channel> channel)
-      : stub_(pb::Control::NewStub(channel)) {}
+      : stub_(pb::Control::NewStub(channel)), admin_(pb::Admin::NewStub(channel)) {}
 
-#define BESS_SDK_GRPC_UNARY(Rpc)                                          \
+#define BESS_SDK_GRPC_UNARY(Stub, Rpc)                                    \
   grpc::Status Rpc(Deadline deadline, const pb::Rpc##Request &req,        \
                    pb::Rpc##Response *resp, Trailers *trailers) override { \
     grpc::ClientContext ctx;                                              \
     ctx.set_deadline(deadline);                                           \
-    grpc::Status status = stub_->Rpc(&ctx, req, resp);                    \
+    grpc::Status status = Stub->Rpc(&ctx, req, resp);                     \
     if (!status.ok()) {                                                   \
       CopyTrailers(ctx, trailers);                                        \
     }                                                                     \
     return status;                                                        \
   }
-  BESS_SDK_GRPC_UNARY(ApplyTransaction)
-  BESS_SDK_GRPC_UNARY(GetTransaction)
-  BESS_SDK_GRPC_UNARY(ListTransactionResources)
-  BESS_SDK_GRPC_UNARY(GetCapabilities)
-  BESS_SDK_GRPC_UNARY(GetSchema)
-  BESS_SDK_GRPC_UNARY(ListMetrics)
-  BESS_SDK_GRPC_UNARY(GetPipeline)
-  BESS_SDK_GRPC_UNARY(ValidatePipeline)
-  BESS_SDK_GRPC_UNARY(DiffPipeline)
-  BESS_SDK_GRPC_UNARY(PlanPipeline)
-  BESS_SDK_GRPC_UNARY(ApplyPipeline)
+  BESS_SDK_GRPC_UNARY(stub_, ApplyTransaction)
+  BESS_SDK_GRPC_UNARY(stub_, GetTransaction)
+  BESS_SDK_GRPC_UNARY(stub_, ListTransactionResources)
+  BESS_SDK_GRPC_UNARY(stub_, GetCapabilities)
+  BESS_SDK_GRPC_UNARY(stub_, GetSchema)
+  BESS_SDK_GRPC_UNARY(stub_, ListMetrics)
+  BESS_SDK_GRPC_UNARY(stub_, GetPipeline)
+  BESS_SDK_GRPC_UNARY(stub_, ValidatePipeline)
+  BESS_SDK_GRPC_UNARY(stub_, DiffPipeline)
+  BESS_SDK_GRPC_UNARY(stub_, PlanPipeline)
+  BESS_SDK_GRPC_UNARY(stub_, ApplyPipeline)
+  BESS_SDK_GRPC_UNARY(admin_, ImportPlugin)
+  BESS_SDK_GRPC_UNARY(admin_, UnloadPlugin)
+  BESS_SDK_GRPC_UNARY(admin_, GetPortStatus)
+  BESS_SDK_GRPC_UNARY(admin_, GetPacketPools)
+  BESS_SDK_GRPC_UNARY(admin_, SetCapture)
+  BESS_SDK_GRPC_UNARY(admin_, PauseWorkers)
+  BESS_SDK_GRPC_UNARY(admin_, ResumeWorkers)
+  BESS_SDK_GRPC_UNARY(admin_, Shutdown)
 #undef BESS_SDK_GRPC_UNARY
 
   std::unique_ptr<EventStream> WatchEvents(const pb::WatchEventsRequest &req,
@@ -70,6 +78,7 @@ class GrpcTransportImpl final : public Transport {
 
  private:
   std::unique_ptr<pb::Control::Stub> stub_;
+  std::unique_ptr<pb::Admin::Stub> admin_;
 };
 
 }  // namespace

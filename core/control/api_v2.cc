@@ -361,9 +361,7 @@ grpc::Status ToStatus(const ControlError &error,
   return grpc::Status(code, error.message);
 }
 
-// A mutating request names the daemon epoch it was built under (D-106):
-// generations, request ids and resources mean something only within one.
-// Refused before any side effect; nullopt if it is this daemon's.
+// Declared in api_v2.h; the Admin service refuses with it too.
 std::optional<grpc::Status> RefuseOtherEpoch(uint64_t sent, uint64_t epoch,
                                              grpc::ServerContext *context) {
   if (sent == epoch) {
@@ -692,11 +690,15 @@ grpc::Status ControlV2Service::GetCapabilities(grpc::ServerContext *,
                                                v2::GetCapabilitiesResponse *response) {
   auto lock = control_plane_.AcquireLock();
   response->set_daemon_version(google::VersionString());
-  // The RPCs as this binary's schema declares them: a client built against a
-  // newer schema sees which ones this daemon lacks.
-  if (const google::protobuf::ServiceDescriptor *service =
-          google::protobuf::DescriptorPool::generated_pool()->FindServiceByName(
-              v2::Control::service_full_name())) {
+  // The RPCs as this binary's schema declares them (Control and Admin, both
+  // served by bessd): a client built against a newer schema sees which ones
+  // this daemon lacks.
+  for (const char *name : {v2::Control::service_full_name(), v2::Admin::service_full_name()}) {
+    const google::protobuf::ServiceDescriptor *service =
+        google::protobuf::DescriptorPool::generated_pool()->FindServiceByName(name);
+    if (service == nullptr) {
+      continue;
+    }
     for (int i = 0; i < service->method_count(); i++) {
       response->add_rpcs(std::string(service->full_name()) + "/" +
                          std::string(service->method(i)->name()));

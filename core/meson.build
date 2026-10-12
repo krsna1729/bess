@@ -62,6 +62,7 @@ eal_sources = files(
 )
 
 control_sources = files(
+  'control/admin_v2.cc',
   'control/api_v2.cc',
   'control/control_error.cc',
   'control/control_plane.cc',
@@ -693,6 +694,7 @@ unit_test_sources = [
   'rcu/rcu_ptr_test.cc',
   'rcu/rcu_worker_test.cc',
   'rcu/rcu_scheduler_test.cc',
+  'control/admin_v2_test.cc',
   'control/api_v2_test.cc',
   'control/dataplane_transactions_test.cc',
   'control/thread_placement_test.cc',

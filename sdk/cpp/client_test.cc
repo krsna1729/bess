@@ -239,6 +239,17 @@ class Fake final : public Transport {
     return grpc::Status::OK;
   }
 
+  std::vector<pb::SetCaptureRequest> captures;
+  grpc::Status SetCapture(Deadline, const pb::SetCaptureRequest &in, pb::SetCaptureResponse *out,
+                          Trailers *t) override {
+    captures.push_back(in);
+    if (in.daemon_epoch() != EpochOr1()) {
+      return RefuseEpoch(in.daemon_epoch(), EpochOr1(), t);
+    }
+    out->set_daemon_epoch(EpochOr1());
+    return grpc::Status::OK;
+  }
+
   std::unique_ptr<EventStream> WatchEvents(const pb::WatchEventsRequest &in,
                                            grpc::Status *status) override {
     watched.emplace_back(in.from_sequence(), in.daemon_epoch());
@@ -742,6 +753,28 @@ TEST(SdkClient, MutatingRequestsNameTheirEpochAndARestartRefusesThem) {
   EXPECT_EQ(h.f->sent.size(), 1u);
   EXPECT_TRUE(h.f->asked.empty()) << "a refusal is an answer: nothing to ask";
   EXPECT_EQ(h.c->DaemonEpoch(), 2u);
+}
+
+// The Admin service's mutating calls (D-107) follow D-106: sent under the
+// epoch the client knows (learned first), refused under another as a restart,
+// and not retried.
+TEST(SdkClient, AdminCallsNameTheKnownEpochAndARestartRefusesThem) {
+  Harness h(4);
+  pb::SetCaptureRequest req;
+  req.set_module("m");
+  ASSERT_TRUE(h.c->SetCapture(req));
+  EXPECT_EQ(h.f->listed, 1) << "the epoch was not learned before the call";
+  EXPECT_EQ(h.f->captures[0].daemon_epoch(), 1u);
+  EXPECT_EQ(h.f->captures[0].module(), "m");
+  h.f->epoch = 2;  // restarted
+  auto r = h.c->SetCapture(req);
+  ASSERT_EQ(KindOf(r), ErrorKind::kDaemonRestarted);
+  EXPECT_EQ(r.error().from_epoch, 1u);
+  EXPECT_EQ(r.error().to_epoch, 2u);
+  EXPECT_EQ(h.f->captures.size(), 2u) << "a refusal was retried";
+  EXPECT_EQ(h.c->DaemonEpoch(), 2u);
+  ASSERT_TRUE(h.c->SetCapture(req));
+  EXPECT_EQ(h.f->captures.back().daemon_epoch(), 2u) << "the next call names the new epoch";
 }
 
 TEST(SdkClient, ApplyPipelineWithoutAnAnswerIsUnknownAndNotResent) {

@@ -547,6 +547,98 @@ Result<TransactionStatus> Client::GetTransaction(const std::string &request_id) 
                            .daemon_epoch = resp.daemon_epoch()};
 }
 
+// -- administration ---------------------------------------------------------------
+
+// A mutating Admin call (D-107): sent under the epoch the client knows; the
+// daemon refuses another (kDaemonRestarted, nothing done). Not retried.
+template <typename Resp, typename Req, typename Call>
+Result<void> Client::Administer(Req req, Call &&call) {
+  const Result<uint64_t> epoch = KnownEpoch();
+  if (!epoch) {
+    return std::unexpected(epoch.error());
+  }
+  req.set_daemon_epoch(*epoch);
+  auto r = PipelineCall<Resp>(
+      [&](Deadline d, Resp *resp, Trailers *t) { return call(d, req, resp, t); }, false, {},
+      *epoch);
+  if (!r) {
+    return std::unexpected(std::move(r.error()));
+  }
+  return CheckEpoch(r->daemon_epoch(), *epoch);
+}
+
+Result<void> Client::ImportPlugin(const std::string &path) {
+  pb::ImportPluginRequest req;
+  req.set_path(path);
+  return Administer<pb::ImportPluginResponse>(
+      std::move(req), [&](Deadline d, const auto &q, auto *resp, Trailers *t) {
+        return transport_->ImportPlugin(d, q, resp, t);
+      });
+}
+
+Result<void> Client::UnloadPlugin(const std::string &path) {
+  pb::UnloadPluginRequest req;
+  req.set_path(path);
+  return Administer<pb::UnloadPluginResponse>(
+      std::move(req), [&](Deadline d, const auto &q, auto *resp, Trailers *t) {
+        return transport_->UnloadPlugin(d, q, resp, t);
+      });
+}
+
+Result<void> Client::SetCapture(pb::SetCaptureRequest request) {
+  return Administer<pb::SetCaptureResponse>(
+      std::move(request), [&](Deadline d, const auto &q, auto *resp, Trailers *t) {
+        return transport_->SetCapture(d, q, resp, t);
+      });
+}
+
+Result<void> Client::PauseWorkers() {
+  return Administer<pb::PauseWorkersResponse>(
+      pb::PauseWorkersRequest(), [&](Deadline d, const auto &q, auto *resp, Trailers *t) {
+        return transport_->PauseWorkers(d, q, resp, t);
+      });
+}
+
+Result<void> Client::ResumeWorkers() {
+  return Administer<pb::ResumeWorkersResponse>(
+      pb::ResumeWorkersRequest(), [&](Deadline d, const auto &q, auto *resp, Trailers *t) {
+        return transport_->ResumeWorkers(d, q, resp, t);
+      });
+}
+
+Result<void> Client::Shutdown() {
+  return Administer<pb::ShutdownResponse>(
+      pb::ShutdownRequest(), [&](Deadline d, const auto &q, auto *resp, Trailers *t) {
+        return transport_->Shutdown(d, q, resp, t);
+      });
+}
+
+Result<std::vector<pb::PortStatus>> Client::Ports(const std::vector<std::string> &names) {
+  pb::GetPortStatusRequest req;
+  for (const std::string &name : names) {
+    req.add_names(name);
+  }
+  auto r = Unary<pb::GetPortStatusResponse>([&](Deadline d, auto *resp, Trailers *t) {
+    return transport_->GetPortStatus(d, req, resp, t);
+  });
+  if (!r) {
+    return std::unexpected(std::move(r.error()));
+  }
+  ObserveEpoch(r->daemon_epoch());
+  return std::vector<pb::PortStatus>(r->ports().begin(), r->ports().end());
+}
+
+Result<std::vector<pb::PacketPool>> Client::PacketPools() {
+  auto r = Unary<pb::GetPacketPoolsResponse>([&](Deadline d, auto *resp, Trailers *t) {
+    return transport_->GetPacketPools(d, pb::GetPacketPoolsRequest(), resp, t);
+  });
+  if (!r) {
+    return std::unexpected(std::move(r.error()));
+  }
+  ObserveEpoch(r->daemon_epoch());
+  return std::vector<pb::PacketPool>(r->pools().begin(), r->pools().end());
+}
+
 // Applies `req` exactly once, whatever the transport does. Every RPC counts
 // against the attempt budget. After a send without an answer the outcome is
 // asked for; the request is sent again only once GetTransaction answered

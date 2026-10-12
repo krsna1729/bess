@@ -514,3 +514,143 @@ service Control {
   rpc ListTransactionResources(ListTransactionResourcesRequest)
       returns (ListTransactionResourcesResponse) {}
 }
+
+// -- Administration (D-107) ----------------------------------------------
+//
+// What an operator does to a running daemon besides its pipeline: plugins,
+// port status, packet capture, packet pools, pausing and resuming the
+// workers, and shutdown. Like Control's
+// mutating calls, Admin's name the daemon epoch they were built under
+// (D-106) and are refused under another, before any side effect.
+
+message ImportPluginRequest {
+  string path = 1;  // a shared object, as the daemon's host sees it
+  uint64 daemon_epoch = 2;
+}
+message ImportPluginResponse {
+  uint64 daemon_epoch = 1;
+}
+
+message UnloadPluginRequest {
+  string path = 1;  // as it was imported
+  uint64 daemon_epoch = 2;
+}
+message UnloadPluginResponse {
+  uint64 daemon_epoch = 1;
+}
+
+message GetPortStatusRequest {
+  repeated string names = 1;  // empty: every port; an unknown name is NOT_FOUND
+}
+
+message PortStatus {
+  message Link {
+    bool up = 1;
+    uint32 speed_mbps = 2;  // 0: unknown
+    bool full_duplex = 3;
+    bool autoneg = 4;
+  }
+  // Counters since the port was created (packets that reached or left the
+  // port's queues, as the port counts them).
+  message Counters {
+    uint64 packets = 1;
+    uint64 bytes = 2;
+    uint64 dropped = 3;
+    uint64 prepare_errors = 4;  // transmit only: packets the PMD's prepare refused
+  }
+  string name = 1;
+  string driver = 2;
+  Link link = 3;
+  Counters rx = 4;
+  Counters tx = 5;
+}
+
+message GetPortStatusResponse {
+  repeated PortStatus ports = 1;  // in request order, else by name
+  uint64 daemon_epoch = 2;
+}
+
+message GetPacketPoolsRequest {}
+
+// One NUMA socket's default packet pool.
+message PacketPool {
+  uint32 socket = 1;
+  uint32 size = 2;        // packets the pool holds
+  uint32 cache_size = 3;  // per-core cache, packets
+  uint32 element_size = 4;
+  uint32 populated = 5;
+  uint32 available = 6;
+  uint32 in_use = 7;
+}
+
+message GetPacketPoolsResponse {
+  repeated PacketPool pools = 1;  // by socket
+  uint64 daemon_epoch = 2;
+}
+
+// Packet capture on a module's gates into a FIFO (or file) the caller
+// opened: libpcap or pcapng records, which tcpdump and wireshark read. The
+// daemon writes; the caller owns the path and its reader, which must exist.
+// A gate has at most one capture of each format: starting a second is
+// ALREADY_EXISTS, and on every gate it is all or nothing.
+message SetCaptureRequest {
+  enum Direction {
+    DIRECTION_UNSPECIFIED = 0;
+    DIRECTION_INPUT = 1;   // input gates: packets arriving at the module
+    DIRECTION_OUTPUT = 2;  // output gates: packets the module sends on
+  }
+  enum Format {
+    FORMAT_UNSPECIFIED = 0;
+    FORMAT_PCAP = 1;
+    FORMAT_PCAPNG = 2;  // with each packet's metadata attributes
+  }
+  string module = 1;
+  Direction direction = 2;
+  // Unset: every gate of that direction. A pcap stream holds one file
+  // header, so pcap without a gate needs the module to have exactly one gate
+  // in that direction (else INVALID_ARGUMENT); pcapng has a section per gate.
+  optional uint32 gate = 3;
+  Format format = 4;
+  string fifo = 5;           // required to start; ignored to stop
+  bool enable = 6;           // false: stop this format's capture there
+  uint64 daemon_epoch = 7;
+}
+
+message SetCaptureResponse {
+  uint64 daemon_epoch = 1;
+}
+
+// Every worker. A worker the pipeline creates starts paused, as in the
+// legacy API; resuming runs the resume hooks (metadata offsets, PreResume
+// module events) first. Applying a pipeline keeps the workers' state.
+message PauseWorkersRequest {
+  uint64 daemon_epoch = 1;
+}
+message PauseWorkersResponse {
+  uint64 daemon_epoch = 1;
+}
+message ResumeWorkersRequest {
+  uint64 daemon_epoch = 1;
+}
+message ResumeWorkersResponse {
+  uint64 daemon_epoch = 1;
+}
+
+message ShutdownRequest {
+  uint64 daemon_epoch = 1;
+}
+// Sent before the daemon stops serving; it then stops its workers and exits.
+message ShutdownResponse {
+  uint64 daemon_epoch = 1;
+}
+
+service Admin {
+  rpc ImportPlugin(ImportPluginRequest) returns (ImportPluginResponse) {}
+  rpc UnloadPlugin(UnloadPluginRequest) returns (UnloadPluginResponse) {}
+  rpc GetPortStatus(GetPortStatusRequest) returns (GetPortStatusResponse) {}
+  rpc GetPacketPools(GetPacketPoolsRequest) returns (GetPacketPoolsResponse) {}
+  rpc SetCapture(SetCaptureRequest) returns (SetCaptureResponse) {}
+  rpc PauseWorkers(PauseWorkersRequest) returns (PauseWorkersResponse) {}
+  rpc ResumeWorkers(ResumeWorkersRequest) returns (ResumeWorkersResponse) {}
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse) {}
+}

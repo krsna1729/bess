@@ -127,6 +127,7 @@ file is the reasoning.
 | D-104 | Product boundary: Python leaves the runtime (manifests and Admin first, pybess last); HTTP/UI inside bessd, off or localhost by default; C++ SDK + C++ bessctl, Go SDK for external controllers | accepted |
 | D-105 | Schema discovery: `GetSchema` names every init and command argument type with a self-contained `FileDescriptorSet`; registration records `Init`'s type (source-compatible) | accepted |
 | D-106 | Every mutating control_v2 request names the daemon epoch it was built under; generations travel with their epoch | accepted |
+| D-107 | The v2 Admin service: plugins, port status, capture into a client FIFO, packet pools, pause/resume of the workers and shutdown; epoch-checked like Control | accepted |
 
 
 ---
@@ -8036,3 +8037,65 @@ client that forgets it, which is the case this closes. Making generations unique
 seeded from time) would remove the comparison problem but not the resource-binding one, and would need state that
 survives a restart. Checking the epoch only in the SDKs cannot stop a request that is already on its way to a new
 daemon.
+
+## D-107 The v2 Admin service: plugins, port status, capture, packet pools, workers, shutdown
+
+**Status:** accepted (2026-10-12).
+**Code:** `service Admin` (`protobuf/control_v2.proto`); `AdminV2Service` (`core/control/admin_v2.{h,cc}`), registered
+beside `ControlV2Service` in bessd (`core/bessctl.cc`); `Client::ImportPlugin`, `UnloadPlugin`, `Ports`, `PacketPools`,
+`SetCapture`, `PauseWorkers`, `ResumeWorkers` and `Shutdown` (`sdk/cpp`, and the same methods in `sdk/go/bess`);
+bessctl `ports`, `pools`, `plugin`, `capture`, `pause`, `resume`, `shutdown`; tests `core/control/admin_v2_test.cc`, the
+SDKs' `AdminCallsNameTheKnownEpochAndARestartRefusesThem`, `bessctl/module_tests/bessctl_cpp.py` (`test_admin`).
+
+**Context.** D-104 orders the manifest and an Admin service first: the operations an operator runs against a live
+daemon besides its pipeline (load a plugin, look at ports, capture packets, look at packet pools, stop the daemon) were
+only in the legacy `BESSControl` service, so the legacy service and the Python bessctl could not go.
+
+**Decision.**
+- A second v2 service, `Admin`, in `control_v2.proto` (same package and file, so the Go and C++ SDKs generate it with
+  `Control`). It is a protocol adapter over the `ControlPlane`, like `Control`; both share one daemon epoch, and
+  `GetCapabilities` lists both services' RPCs.
+- Mutating calls (`ImportPlugin`, `UnloadPlugin`, `SetCapture`, `PauseWorkers`, `ResumeWorkers`, `Shutdown`) name the daemon epoch and are refused under
+  another before any side effect, the D-106 rule. Reads (`GetPortStatus`, `GetPacketPools`) answer with the epoch.
+- `GetPortStatus`: link and rx/tx counters for named ports in request order (an unknown name is `NOT_FOUND`, with the
+  name as the error's object) or every port by name. The legacy batch-size histograms are left out.
+- `GetPacketPools`: each socket's default pool, from `struct rte_mempool`'s own fields and the public counts (valid
+  for any mempool backend).
+- `SetCapture`: the existing TcpDump/PcapNg gate hooks on a module's input or output gates (one gate, or every gate of
+  that direction), writing into a FIFO the caller made. Started under a fixed hook name per format, so a gate has at
+  most one capture of each (a second is `ALREADY_EXISTS`); stopped by hook class. On every gate it is all or nothing:
+  this fixed the rollback in `enable_hook_for_module`, which removed the hooks it had created from the gate that
+  failed instead of the gates they were on (leaving them installed, and removing an existing hook of the same name).
+  Each hook writes its format's file header: pcapng allows a section per gate, but a libpcap stream holds one header
+  (tcpdump rejects a second), so pcap without a gate is the module's only gate in that direction, named as that gate
+  (a gate connected later is not captured), and `INVALID_ARGUMENT` (`field = gate`) with more.
+  The request is checked before anything (module, direction, format, a FIFO to start, `gate < MAX_GATES` before
+  narrowing).
+- `PauseWorkers` / `ResumeWorkers`: every worker, as the legacy `PauseAll` / `ResumeAll` (resuming attaches orphan
+  tasks and runs the resume hooks, which compute metadata offsets and send PreResume events). A worker that
+  `ApplyPipeline` creates starts paused, as in the legacy API, and apply keeps every worker's state: without these a
+  v2-only client (the C++ bessctl) could build a pipeline but never start it. Apply does not resume by itself: a
+  daemon paused for maintenance would start forwarding.
+- `Shutdown`: answers, then runs the daemon's shutdown on a thread of its own (as `KillBess` and SIGTERM do).
+- bessctl `capture MODULE in|out[:GATE] [--pcapng]` makes the FIFO, opens its read end first (the hook opens the
+  write end without blocking), starts the capture, copies it to standard output (for `tcpdump -r -` or wireshark)
+  until interrupted, the stream ends, or standard output's reader goes away, and then always stops it. The daemon must
+  share the host's `/tmp`.
+
+**Not in this service.** Per-worker pause/resume and module/gate statistics: statistics belong in metrics (M25). Gate hooks other than capture and resume hooks stay legacy until a
+client needs them.
+
+**Alternatives.** Adding the RPCs to `Control` would make one service mix desired state with operations on a running
+process; a separate service keeps `Control`'s contract (desired state and transactions) unchanged and lets a
+deployment authorize the two differently. A capture that the daemon streams over gRPC would work across hosts but
+copies every captured packet through the control channel; the FIFO keeps the legacy data path, and a streaming RPC
+can be added when a remote client needs it.
+
+**Evidence.** In process (`control_admin_v2_test`, 6 tests, 3 repeats): every mutating call refused under epoch 0 and
+another epoch with nothing done; capture on one gate, on every gate, pcapng beside pcap, stop by class; every-gate
+capture all or nothing (the old rollback fails it: a hook left behind and the existing one removed); invalid requests
+by field; port status by name and in request order. SDKs: the refusal is a restart from the known epoch and is not
+retried (the C++ test fails if the sent epoch is not carried into the error). End to end against an unprivileged
+bessd (`-m 0 -dpdk=false`): apply, `ports`, `pools`, a refused `plugin import`, `resume`, a one-second `capture src
+out` of 3,480,393 complete pcap records, Ctrl-C exits 0 and the capture restarts on the same gate, `pause` stops the
+worker, `shutdown` ends bessd with status 0.

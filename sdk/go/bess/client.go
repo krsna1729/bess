@@ -227,6 +227,9 @@ type transport interface {
 	// pipeline is one desired-state RPC: in is a Get/Validate/Diff/Plan/
 	// ApplyPipelineRequest, the response the matching response.
 	pipeline(ctx context.Context, in proto.Message) (proto.Message, metadata.MD, error)
+	// admin is one Admin RPC (D-107): in is its request, the response the
+	// matching response.
+	admin(ctx context.Context, in proto.Message) (proto.Message, metadata.MD, error)
 }
 
 // eventStream is what WatchEvents reads (the gRPC client stream, or a test's).
@@ -234,7 +237,10 @@ type eventStream interface {
 	Recv() (*pb.Event, error)
 }
 
-type grpcTransport struct{ c pb.ControlClient }
+type grpcTransport struct {
+	c pb.ControlClient
+	a pb.AdminClient
+}
 
 func (t grpcTransport) apply(ctx context.Context, in *pb.ApplyTransactionRequest) (*pb.ApplyTransactionResponse, metadata.MD, error) {
 	var md metadata.MD
@@ -297,6 +303,33 @@ func (t grpcTransport) pipeline(ctx context.Context, in proto.Message) (proto.Me
 	return r, md, err
 }
 
+func (t grpcTransport) admin(ctx context.Context, in proto.Message) (proto.Message, metadata.MD, error) {
+	var md metadata.MD
+	var r proto.Message
+	var err error
+	switch req := in.(type) {
+	case *pb.ImportPluginRequest:
+		r, err = t.a.ImportPlugin(ctx, req, grpc.Trailer(&md))
+	case *pb.UnloadPluginRequest:
+		r, err = t.a.UnloadPlugin(ctx, req, grpc.Trailer(&md))
+	case *pb.GetPortStatusRequest:
+		r, err = t.a.GetPortStatus(ctx, req, grpc.Trailer(&md))
+	case *pb.GetPacketPoolsRequest:
+		r, err = t.a.GetPacketPools(ctx, req, grpc.Trailer(&md))
+	case *pb.SetCaptureRequest:
+		r, err = t.a.SetCapture(ctx, req, grpc.Trailer(&md))
+	case *pb.PauseWorkersRequest:
+		r, err = t.a.PauseWorkers(ctx, req, grpc.Trailer(&md))
+	case *pb.ResumeWorkersRequest:
+		r, err = t.a.ResumeWorkers(ctx, req, grpc.Trailer(&md))
+	case *pb.ShutdownRequest:
+		r, err = t.a.Shutdown(ctx, req, grpc.Trailer(&md))
+	default:
+		return nil, nil, fmt.Errorf("bess: not an Admin request: %T", in)
+	}
+	return r, md, err
+}
+
 // -- the client ----------------------------------------------------------------
 
 // Client is one daemon's control endpoint. Safe for concurrent use; a
@@ -331,7 +364,7 @@ func Dial(target string, opts ...grpc.DialOption) (*Client, error) {
 
 // NewClient uses an existing connection.
 func NewClient(conn grpc.ClientConnInterface, retry RetryPolicy) *Client {
-	return newClient(grpcTransport{pb.NewControlClient(conn)}, retry, time.Sleep)
+	return newClient(grpcTransport{c: pb.NewControlClient(conn), a: pb.NewAdminClient(conn)}, retry, time.Sleep)
 }
 
 func newClient(t transport, retry RetryPolicy, sleep func(time.Duration)) *Client {
@@ -680,6 +713,105 @@ func (c *Client) pipelineCall(ctx context.Context, in proto.Message, retryBusy b
 		}
 		return nil, translate(err, md)
 	}
+}
+
+// -- administration (the Admin service, D-107) -----------------------------------
+
+// epochAnswer is every Admin response: each names the daemon epoch.
+type epochAnswer interface{ GetDaemonEpoch() uint64 }
+
+// adminCall runs one Admin RPC, not retried: no answer is TransportError, an
+// EPOCH_MISMATCH refusal a DaemonRestartedError from sentEpoch.
+func (c *Client) adminCall(ctx context.Context, in proto.Message, sentEpoch uint64) (proto.Message, error) {
+	actx, cancel := context.WithTimeout(ctx, c.retry.AttemptTimeout)
+	defer cancel()
+	r, md, err := c.t.admin(actx, in)
+	if err == nil {
+		return r, nil
+	}
+	detail := errorDetail(md)
+	if detail == nil && noAnswer(err, md) {
+		return nil, &TransportError{Code: status.Code(err)}
+	}
+	if detail.GetCode() == pb.ErrorDetail_EPOCH_MISMATCH {
+		return nil, c.refusedEpoch(sentEpoch, detail)
+	}
+	return nil, translate(err, md)
+}
+
+// administer runs a mutating Admin call under the epoch the client knows
+// (asked for if none; D-106): name sets it on the request.
+func (c *Client) administer(ctx context.Context, in proto.Message, name func(epoch uint64)) error {
+	epoch, err := c.knownEpoch(ctx)
+	if err != nil {
+		return err
+	}
+	name(epoch)
+	r, err := c.adminCall(ctx, in, epoch)
+	if err != nil {
+		return err
+	}
+	return c.checkEpoch(r.(epochAnswer).GetDaemonEpoch(), epoch)
+}
+
+// ImportPlugin loads the plugin at path (a path on the daemon's host).
+func (c *Client) ImportPlugin(ctx context.Context, path string) error {
+	req := &pb.ImportPluginRequest{Path: path}
+	return c.administer(ctx, req, func(e uint64) { req.DaemonEpoch = e })
+}
+
+// UnloadPlugin unloads the plugin imported from path.
+func (c *Client) UnloadPlugin(ctx context.Context, path string) error {
+	req := &pb.UnloadPluginRequest{Path: path}
+	return c.administer(ctx, req, func(e uint64) { req.DaemonEpoch = e })
+}
+
+// SetCapture starts or stops a capture; req's epoch is filled in (req is
+// changed).
+func (c *Client) SetCapture(ctx context.Context, req *pb.SetCaptureRequest) error {
+	return c.administer(ctx, req, func(e uint64) { req.DaemonEpoch = e })
+}
+
+// PauseWorkers pauses every worker.
+func (c *Client) PauseWorkers(ctx context.Context) error {
+	req := &pb.PauseWorkersRequest{}
+	return c.administer(ctx, req, func(e uint64) { req.DaemonEpoch = e })
+}
+
+// ResumeWorkers resumes every worker, running the resume hooks first. A
+// worker a pipeline creates starts paused.
+func (c *Client) ResumeWorkers(ctx context.Context) error {
+	req := &pb.ResumeWorkersRequest{}
+	return c.administer(ctx, req, func(e uint64) { req.DaemonEpoch = e })
+}
+
+// Shutdown asks the daemon to stop; it answers first.
+func (c *Client) Shutdown(ctx context.Context) error {
+	req := &pb.ShutdownRequest{}
+	return c.administer(ctx, req, func(e uint64) { req.DaemonEpoch = e })
+}
+
+// Ports is the link and counters of the named ports in that order, or of
+// every port by name; an unknown name is an InvalidRequestError.
+func (c *Client) Ports(ctx context.Context, names ...string) ([]*pb.PortStatus, error) {
+	r, err := c.adminCall(ctx, &pb.GetPortStatusRequest{Names: names}, 0)
+	if err != nil {
+		return nil, err
+	}
+	resp := r.(*pb.GetPortStatusResponse)
+	c.observeEpoch(resp.GetDaemonEpoch())
+	return resp.GetPorts(), nil
+}
+
+// PacketPools is the default packet pool of each NUMA socket.
+func (c *Client) PacketPools(ctx context.Context) ([]*pb.PacketPool, error) {
+	r, err := c.adminCall(ctx, &pb.GetPacketPoolsRequest{}, 0)
+	if err != nil {
+		return nil, err
+	}
+	resp := r.(*pb.GetPacketPoolsResponse)
+	c.observeEpoch(resp.GetDaemonEpoch())
+	return resp.GetPools(), nil
 }
 
 // PipelineBuilder assembles a control_v2 Pipeline. It only builds the

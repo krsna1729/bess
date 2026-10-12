@@ -4,6 +4,7 @@
 #define BESS_CONTROL_API_V2_H_
 
 #include <chrono>
+#include <optional>
 
 #include <grpcpp/server_builder.h>
 #include <grpcpp/server_context.h>
@@ -41,6 +42,12 @@ pb::v2::ErrorDetail ToProto(const ControlError &error);
 grpc::Status ToStatus(const ControlError &error,
                       grpc::ServerContext *context = nullptr);
 
+// A mutating request names the daemon epoch it was built under (D-106).
+// Refused before any side effect: INVALID_ARGUMENT for 0, FAILED_PRECONDITION
+// with ErrorDetail EPOCH_MISMATCH for another; nullopt if it is `epoch`.
+std::optional<grpc::Status> RefuseOtherEpoch(uint64_t sent, uint64_t epoch,
+                                             grpc::ServerContext *context);
+
 // The control server's settings, shared by bessd and the tests (D-026).
 // Messages up to kMaxMessageBytes each way: gRPC's 4 MiB default caps one
 // dataplane transaction at roughly 30K typed rules; 64 MiB allows about
@@ -70,6 +77,9 @@ class ControlV2Service final : public pb::v2::Control::Service {
                    dataplane::TransactionEngine &engine,
                    const framework::ResourceBindings &bindings)
       : control_plane_(control_plane), transactions_(engine, bindings) {}
+
+  // This daemon's epoch, drawn once (the Admin service answers with it too).
+  uint64_t epoch() const { return transactions_.epoch(); }
 
   grpc::Status GetPipeline(grpc::ServerContext *context,
                            const pb::v2::GetPipelineRequest *request,

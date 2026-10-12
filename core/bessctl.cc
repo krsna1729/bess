@@ -19,6 +19,7 @@
 #pragma GCC diagnostic pop
 
 #include "control/wire_narrow.h"
+#include "control/admin_v2.h"
 #include "control/api_v2.h"
 #include "runtime/startup.h"
 #include "control/control_plane.h"
@@ -1181,13 +1182,15 @@ void ApiServer::Run() {
     return;
   }
 
-  // One control plane behind both APIs: the legacy imperative BESSControl
-  // service and the v2 desired-state service (G1).
+  // One control plane behind every API: the legacy imperative BESSControl
+  // service, the v2 desired-state service (G1) and v2 administration (D-107).
   bess::control::ControlPlane control_plane;
   BESSControlImpl service(control_plane);
   bess::control::ControlV2Service service_v2(control_plane);
+  bess::control::AdminV2Service admin_v2(control_plane, service_v2.epoch());
   builder_->RegisterService(&service);
   builder_->RegisterService(&service_v2);
+  builder_->RegisterService(&admin_v2);
   builder_->SetSyncServerOption(grpc::ServerBuilder::MAX_POLLERS, 1);
   bess::control::ConfigureControlServer(builder_);
 
@@ -1206,6 +1209,7 @@ void ApiServer::Run() {
     server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(3));
   };
   service.set_shutdown_func(shutdown);
+  admin_v2.set_shutdown(shutdown);
   {
     // Worker-to-control module requests (TP4, D-077), delivered under the
     // control-plane lock, and workers' events moved into the event log (M25);
