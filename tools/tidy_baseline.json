@@ -154,9 +154,6 @@
     "core/modules/round_robin.cc": {
       "cppcoreguidelines-narrowing-conversions": 2
     },
-    "core/modules/set_metadata.cc": {
-      "cppcoreguidelines-narrowing-conversions": 2
-    },
     "core/modules/source.cc": {
       "bugprone-implicit-widening-of-multiplication-result": 1,
       "cppcoreguidelines-narrowing-conversions": 4
