@@ -5,6 +5,7 @@
 
 #include <expected>
 #include <string>
+#include <utility>
 
 namespace bess {
 namespace control {
@@ -40,8 +41,17 @@ struct ControlError {
   std::string field;
 };
 
+// A control operation's outcome. [[nodiscard]]: dropping one would hide a
+// failure (D-101). Everything else is std::expected's.
 template <typename T>
-using ControlResult = std::expected<T, ControlError>;
+class [[nodiscard]] ControlResult : public std::expected<T, ControlError> {
+ public:
+  using std::expected<T, ControlError>::expected;
+  ControlResult(std::expected<T, ControlError> &&other)  // NOLINT: implicit
+      : std::expected<T, ControlError>(std::move(other)) {}
+  ControlResult(const std::expected<T, ControlError> &other)  // NOLINT: implicit
+      : std::expected<T, ControlError>(other) {}
+};
 
 ControlErrorCode CodeFromErrno(int err);
 

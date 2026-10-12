@@ -80,7 +80,6 @@ add_project_arguments(
   '-Wno-error=deprecated-declarations',
   '-Wno-error=array-bounds',
   '-Wno-error=address-of-packed-member',
-  '-Wno-error=unused-result',
   '-Wno-error=unused-variable',
   '-Wno-error=unused-but-set-variable',
   '-Wno-unused-parameter',
