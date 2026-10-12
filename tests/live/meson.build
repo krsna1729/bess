@@ -2,6 +2,7 @@
 # bessd and drives it through the C++ SDK and bessctl. No Python.
 live_test_sources = [
   'bessctl_test.cc',
+  'metrics_test.cc',
 ]
 
 live_lib = static_library(

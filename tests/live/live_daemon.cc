@@ -3,6 +3,8 @@
 #include "live_daemon.h"
 
 #include <fcntl.h>
+#include <google/protobuf/descriptor.pb.h>
+#include <google/protobuf/util/json_util.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -252,6 +254,49 @@ Output Child::Stop(int sig, std::chrono::seconds timeout) {
     result.out.append(buf, static_cast<size_t>(got));
   }
   return result;
+}
+
+Types::Types(bess::sdk::Client &client) {
+  auto schema = client.Schema();
+  if (!schema) {
+    ADD_FAILURE() << "schema: " << schema.error().message;
+    return;
+  }
+  schema_ = std::move(*schema);
+  for (const google::protobuf::FileDescriptorProto &file : schema_.descriptors().file()) {
+    if (pool_.BuildFile(file) == nullptr) {
+      ADD_FAILURE() << "schema: cannot build " << file.name();
+    }
+  }
+}
+
+std::unique_ptr<google::protobuf::Message> Types::Make(const std::string &type,
+                                                       const std::string &json) {
+  const google::protobuf::Descriptor *d = pool_.FindMessageTypeByName(type);
+  if (d == nullptr) {
+    ADD_FAILURE() << "no type " << type << " in the daemon's schema";
+    return nullptr;
+  }
+  std::unique_ptr<google::protobuf::Message> m(factory_.GetPrototype(d)->New());
+  const auto status = google::protobuf::util::JsonStringToMessage(json, m.get());
+  EXPECT_TRUE(status.ok()) << type << " from " << json << ": " << status.message();
+  return m;
+}
+
+std::string Types::ToJson(const google::protobuf::Any &any) {
+  const std::string type = any.type_url().substr(any.type_url().rfind('/') + 1);
+  const google::protobuf::Descriptor *d = pool_.FindMessageTypeByName(type);
+  if (d == nullptr) {
+    ADD_FAILURE() << "no type " << type << " in the daemon's schema";
+    return "";
+  }
+  std::unique_ptr<google::protobuf::Message> m(factory_.GetPrototype(d)->New());
+  EXPECT_TRUE(m->ParseFromString(any.value()));
+  google::protobuf::util::JsonPrintOptions options;
+  options.preserve_proto_field_names = true;
+  std::string text;
+  EXPECT_TRUE(google::protobuf::util::MessageToJsonString(*m, &text, options).ok());
+  return text;
 }
 
 Daemon &Daemon::Shared() {

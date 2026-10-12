@@ -8789,7 +8789,8 @@ consumer-driven (D-008, §31.3 item 2).
   init and command argument type with its descriptors, D-105) are served;
   `GetSystem` is not.
 - **G1.4 — resource stats and events: PENDING.** Existing port/traffic-class
-  stats are not per-resource transaction lifecycle stats.
+  stats are not per-resource transaction lifecycle stats. Gate counters are
+  in ListMetrics (`bess_gate_{packets,batches,bytes}_total`, D-116).
 - **G1.5 — Go SDK: DONE** (`sdk/go`); it is the SDK for external controllers
   such as the UPF (D-104).
 - **G1.6 — C++ SDK: DONE** (`sdk/cpp`, `libbess-sdk` and the `bess-sdk` .deb).

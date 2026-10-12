@@ -8370,3 +8370,26 @@ unknown module, a bad argument field; `arp add` after `resume` is refused, after
 **Code.** `protobuf/control_v2.proto`, `core/control/{control_plane,api_v2}.{h,cc}`, `core/control/control_error.cc`,
 `core/resume_hooks/task_graph.cc`, `core/bessctl.cc`, `sdk/cpp`, `sdk/go/bess/client.go`,
 `bessctl/{main,manifest}.cc`, `sdk/conformance/cases.json`.
+
+## D-116 Gate counters in ListMetrics
+
+**Status:** accepted.
+
+**Decision.** `ListMetrics` reports every tracked gate: `bess_gate_packets_total`, `bess_gate_batches_total` and (when
+the hook counts bytes) `bess_gate_bytes_total`, counters with labels `module`, `gate` and `direction`. The Track hook
+is the default hook of a connected output gate (a connection that skips default hooks has none), so in practice
+`direction` is `out`: a gate's packets are counted once, where they leave. These are the counts the legacy
+`GetModuleInfo` read; v2 had none, and the live tests that replace the Python module tests need them (G1.8: module and
+gate statistics belong in metrics).
+
+- The gates are read in the ListMetrics handler under the control-plane lock, which every change to modules takes;
+  registry sources run without that lock, so they cannot walk modules. The counters themselves are read as
+  `GetModuleInfo` reads them (`Track::totals()`, one consistent reading of the three).
+- The response stays sorted by name, then labels.
+
+**Evidence.** `tests/live/metrics_test.cc` `GateCountersCountWhatCrossed`: Source -> Sink on a worker counts packets
+and batches on `src`'s output gate; a connected gate without traffic counts 0; input gates have no samples. It fails
+against a daemon without the change. Live on `l2forward.yaml`: each of `fib`'s four gates and the chain before it
+reported.
+
+**Code.** `core/control/api_v2.cc` (ListMetrics).

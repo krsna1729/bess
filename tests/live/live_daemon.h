@@ -12,6 +12,8 @@
 #ifndef BESS_TESTS_LIVE_LIVE_DAEMON_H_
 #define BESS_TESTS_LIVE_LIVE_DAEMON_H_
 
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/dynamic_message.h>
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -58,6 +60,25 @@ class Child {
   int out_ = -1;
   int err_ = -1;
   std::string buffered_;  // read past the last line returned
+};
+
+// The daemon's types (GetSchema's descriptors), to build arguments, keys and
+// values from protobuf JSON and read answers, as a client without generated
+// code does.
+class Types {
+ public:
+  explicit Types(bess::sdk::Client &client);
+  // A message of `type` (full name) from JSON; fails the test on a bad one.
+  std::unique_ptr<google::protobuf::Message> Make(const std::string &type,
+                                                  const std::string &json);
+  // An Any (a command's answer) as JSON, field names as in the .proto files.
+  std::string ToJson(const google::protobuf::Any &any);
+  const bess::pb::v2::GetSchemaResponse &schema() const { return schema_; }
+
+ private:
+  bess::pb::v2::GetSchemaResponse schema_;
+  google::protobuf::DescriptorPool pool_;
+  google::protobuf::DynamicMessageFactory factory_{&pool_};
 };
 
 // $NAME; fails the test when unset.

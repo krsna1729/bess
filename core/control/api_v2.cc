@@ -9,6 +9,7 @@
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #endif
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <format>
@@ -17,11 +18,13 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <variant>
 #include <vector>
 
 #include "control/pipeline_snapshot.h"
+#include "gate_hooks/track.h"
 #include "framework/plugin_check.h"
 #include "framework/plugin_loader.h"
 #include "module.h"
@@ -730,7 +733,52 @@ grpc::Status ControlV2Service::ListMetrics(grpc::ServerContext *,
                                            v2::ListMetricsResponse *response) {
   // The registry has its own lock: sources read their objects' counters,
   // which workers write, without the control-plane lock.
-  for (const stats::MetricSample &s : runtime::runtime().metrics().Collect()) {
+  std::vector<stats::MetricSample> samples = runtime::runtime().metrics().Collect();
+  // Gate counters (D-116): the Track hook (a default hook) of every gate
+  // that has one. Modules are read under the control-plane lock, which every
+  // change to them takes; the counters, which workers write, are read as
+  // the legacy GetModuleInfo reads them.
+  {
+    auto lock = control_plane_.AcquireLock();
+    const auto add = [&](Module *m, bess::Gate *g, const char *direction) {
+      const auto *t = reinterpret_cast<const Track *>(g->FindHookByClass(Track::kName));
+      if (t == nullptr) {
+        return;
+      }
+      const Track::Totals totals = t->totals();
+      // Labels in name order, as the registry sorts them.
+      const std::vector<std::pair<std::string, std::string>> labels = {
+          {"direction", direction}, {"gate", std::to_string(g->gate_idx())}, {"module", m->name()}};
+      samples.push_back({"bess_gate_batches_total", stats::MetricKind::kCounter,
+                         "Batches through a module's gate", labels,
+                         static_cast<double>(totals.cnt)});
+      samples.push_back({"bess_gate_packets_total", stats::MetricKind::kCounter,
+                         "Packets through a module's gate", labels,
+                         static_cast<double>(totals.pkts)});
+      if (totals.bytes != 0) {
+        samples.push_back({"bess_gate_bytes_total", stats::MetricKind::kCounter,
+                           "Bytes through a module's gate (when the hook counts bytes)", labels,
+                           static_cast<double>(totals.bytes)});
+      }
+    };
+    for (const auto &[name, module] : runtime::runtime().modules().All()) {
+      for (bess::IGate *g : module->igates()) {
+        if (g != nullptr) {
+          add(module.get(), g, "in");
+        }
+      }
+      for (bess::OGate *g : module->ogates()) {
+        if (g != nullptr) {
+          add(module.get(), g, "out");
+        }
+      }
+    }
+  }
+  std::sort(samples.begin(), samples.end(),
+            [](const stats::MetricSample &a, const stats::MetricSample &b) {
+              return std::tie(a.name, a.labels) < std::tie(b.name, b.labels);
+            });
+  for (const stats::MetricSample &s : samples) {
     v2::MetricSample *out = response->add_samples();
     out->set_name(s.name);
     out->set_kind(s.kind == stats::MetricKind::kCounter ? v2::MetricSample::KIND_COUNTER
