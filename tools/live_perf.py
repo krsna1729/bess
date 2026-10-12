@@ -171,6 +171,9 @@ def f_queue(b):
     b.mod('Sink', 'sink', {})
     b.conn(_source(b), 'q')
     b.conn('q', 'sink')
+    # Both explicit: an unassigned task is placed round-robin from a counter a reset
+    # does not clear, so the Source could join the queue on worker 1.
+    b.bess.attach_task('src', wid=0)
     b.bess.attach_task('q', wid=1)
     return ['q']
 
@@ -387,6 +390,8 @@ TESTS = {
     'M.genericencap': ('M', m_genericencap),
     'M.metadata': ('M', m_metadata),
 }
+# Tests that attach a task to worker 1; the others run on worker 0 alone.
+TWO_WORKERS = {'F.queue'}
 
 
 # -- client: runs inside one build's Python environment ------------------------------
@@ -394,8 +399,6 @@ TESTS = {
 class Builder:
     def __init__(self, bess):
         self.bess = bess
-        # The daemon this setup's transactions are built against (D-106).
-        self.epoch = bess.list_transaction_resources().daemon_epoch
 
     def mod(self, mclass, name, arg):
         self.bess.create_module(mclass, name, arg)
@@ -409,7 +412,10 @@ class Builder:
     def txn(self, ops):
         """One v2 transaction (resources of Meter, Router, ActionTable, ...); raises unless applied."""
         from builtin_pb import control_v2_pb2
-        r = self.bess.apply_transaction(ops, daemon_epoch=self.epoch)
+        # The daemon the transaction is built against (D-106). Asked here, not
+        # per setup: master's API has no transactions and runs only the others.
+        epoch = self.bess.list_transaction_resources().daemon_epoch
+        r = self.bess.apply_transaction(ops, daemon_epoch=epoch)
         if r.record.outcome != control_v2_pb2.TransactionRecord.OUTCOME_APPLIED:
             raise RuntimeError('transaction not applied: %s' % r.record)
 
@@ -444,7 +450,9 @@ def client(args):
             bess.pause_all()
             bess.reset_all()
             bess.add_worker(0, cpus[0])
-            if len(cpus) > 1:
+            # Worker 1 only where a test attaches to it: an unassigned task may be
+            # placed on any worker, and the counters read worker 0's CPU.
+            if name in TWO_WORKERS and len(cpus) > 1:
                 bess.add_worker(1, cpus[1])
             modules = TESTS[name][1](Builder(bess))
             bess.resume_all()
@@ -531,6 +539,20 @@ def run_round(spec, tests, args):
                 if s.connect_ex(('127.0.0.1', port)) == 0:
                     break
             time.sleep(0.25)
+        if args.control_cpu is not None:
+            # Every daemon thread not pinned to one CPU (main, gRPC, DPDK service
+            # threads) onto the control CPU; workers pin themselves to one CPU,
+            # and threads created later inherit their creator's CPU. Builds
+            # without D-027's placement (master) would otherwise float their
+            # control threads onto the worker CPUs.
+            with open(pidfile) as f:
+                pid = f.read().replace('\0', '').strip()  # the pidfile is NUL-padded
+            for task in Path('/proc', pid, 'task').iterdir():
+                status = (task / 'status').read_text()
+                allowed = status.split('Cpus_allowed_list:')[1].split()[0]
+                if ',' in allowed or '-' in allowed:
+                    subprocess.run(['sudo', '-n', 'taskset', '-p', '-c', str(args.control_cpu),
+                                    task.name], check=True, stdout=subprocess.DEVNULL)
         r = subprocess.run([sys.executable, __file__, '--client', '--port', str(port),
                             '--tests', ','.join(tests), '--cpu', args.cpu,
                             '--duration', str(args.duration), '--warmup', str(args.warmup)]
@@ -588,7 +610,9 @@ def main():
     p.add_argument('--tests', default=','.join(TESTS), help='comma-separated, or a class prefix (F, M)')
     p.add_argument('--build', action='append', default=[], help='master | current[:<tree>] | name=<bessd>,<pythonpath>')
     p.add_argument('--rounds', type=int, default=3)
-    p.add_argument('--cpu', default='2,4', help='worker 0 (and worker 1 for F.queue); the last also runs bessd\'s main thread')
+    p.add_argument('--cpu', default='2,4', help='worker 0 (and worker 1 for F.queue); the last is also bessd\'s -c (its default worker core)')
+    p.add_argument('--control-cpu', type=int,
+                   help='move every daemon thread but the workers to this CPU once the daemon is up')
     p.add_argument('--duration', type=float, default=1.0)
     p.add_argument('--warmup', type=float, default=0.3)
     p.add_argument('--counters', action='store_true',

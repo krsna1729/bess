@@ -181,9 +181,19 @@ pinned worker, each isolating one cost, and reports ns per packet from the leaf 
 If `F.floor` or the `F.hop` slope moves, every pipeline moves: look at the scheduler, Source/Sink, the packet
 pool and batch dispatch. If one `M` delta moves alone, the cost is in that module.
 
-    omarchy-benchmark --isolate --cpu 2,4 -- tools/live_perf.py \
-        --build master --build current:<tree> --rounds 4 --save run.json
+    omarchy-benchmark --isolate --diagnose --cpu 2,4,6 -- taskset -c 2,4,6 tools/live_perf.py \
+        --cpu 4,6 --control-cpu 2 --counters \
+        --build master --build current:<tree> --rounds 8 --save run.json
     tools/live_perf.py --build current --tests F --baseline run.json --threshold 5   # exits 1 on a regression
+
+Give every thread that is not a worker its own isolated CPU, the lowest of the set, and put the workers above it.
+The isolated partition holds only what the wrapper starts, but inside it the kernel balances threads freely.
+bessd keeps its control threads (main, gRPC, DPDK service threads) off worker CPUs (D-027), within its starting
+CPU set. master pins them all to its EAL main lcore, which is the lowest CPU it may use. `--control-cpu` moves any
+daemon thread still allowed on several CPUs onto that CPU once the daemon is up. With the workers on 2 and 4 (the
+old recipe), master ran its gRPC threads on worker 0's CPU. `--diagnose` reports IRQ and softirq activity on the
+set and allows the perf counters (`--counters`) for the run. The wrapper takes the SMT siblings (here 3, 5 and 7)
+offline and restores everything on exit.
 
 CI runs it report-only: the gcc lane, on pushes and the nightly run, runs one round of every F and M test on its own
 build (`ci_profile.py live-perf`) and uploads `live-perf.json` as the artifact `live-perf-<sha>`. A shared runner is

@@ -138,6 +138,7 @@ file is the reasoning.
 | D-115 | Module commands over control_v2 (`RunModuleCommand`); thread-unsafe commands busy while workers run | accepted |
 | D-116 | Gate counters in ListMetrics | accepted |
 | D-117 | SetMetadata runs an op list compiled at PreResume (M.metadata -8 instructions, -4.7 cycles per packet); Update's loop inversion rejected (slower) | accepted |
+| D-118 | live_perf keeps control threads off worker CPUs and counts the worker that runs the test; the floor is at parity with master, the per-hop and fan-in costs are not | accepted |
 
 
 ---
@@ -8430,8 +8431,8 @@ packets; selecting the 1-byte function for 2-byte attributes fails both tests. U
 packets. `ApiV2ServiceTest.ResumingOneWorkerSendsPreResumeToItsModules` (a module counting PreResume on a running
 worker, paused and resumed alone) fails without the `ResumeWorker` change.
 
-Live, release trees linked with mold, 8 paired rounds, under `omarchy-benchmark --isolate --cpu 2,4,6` (SMT
-siblings offline; control threads on CPU 2, the worker alone on 4). Per packet on the worker:
+Live, release trees linked with mold, 8 paired rounds, measured as D-118 sets out (isolated CPUs 2, 4 and 6;
+control threads on 2, the worker on 4). Per packet on the worker:
 
 | test | instructions | cycles | ns above M.base | rounds slower |
 |---|---|---|---|---|
@@ -8441,8 +8442,59 @@ siblings offline; control threads on CPU 2, the worker alone on 4). Per packet o
 
 Unchanged code reads the same instruction count in both builds; the ns of a small delta moves by a few tenths with
 code layout alone. The first, unisolated run showed M.metadata -29.9%; an isolated run before D-118's counter fix
-showed -12.8% with M.base itself moving 8% (its counters read an idle worker).
+showed -12.8% with M.base itself moving 8%.
 
 **Code.** `core/modules/set_metadata.{h,cc}`, `core/modules/set_metadata_test.cc`, `core/worker.{h,cc}`
 (`send_pre_resume`, shared with `~WorkerPauser`), `core/control/control_plane.cc` (`ResumeWorker`),
 `core/control/api_v2_test.cc`.
+
+## D-118 live_perf keeps control threads off worker CPUs and counts the right worker; the floor is at parity with master
+
+**Status:** accepted (2026-10-13).
+
+**Context.** The recorded recipe, `omarchy-benchmark --isolate --cpu 2,4 -- tools/live_perf.py`, put everything the
+wrapper starts on the two worker CPUs. This tree's bessd keeps its own threads off worker CPUs (D-027) only within
+its starting CPU set, which then held no other CPU; master pins all of its threads (main, gRPC) to its EAL main lcore,
+the lowest CPU it may use, which was worker 0's. Earlier master-against-tree floor numbers (1.847 against 2.297 ns
+before D-097) were taken that way, or unisolated.
+
+**Decision.** Isolate one more CPU, the lowest, for everything that is not a worker, and put the workers above it:
+`omarchy-benchmark --isolate --diagnose --cpu 2,4,6 -- taskset -c 2,4,6 tools/live_perf.py --cpu 4,6 --control-cpu
+2`. `--control-cpu` (new) moves any daemon thread still allowed on several CPUs onto that CPU once the daemon is up.
+Checked from `/proc/<pid>/task` during runs: in both builds only the workers run on 4 and 6. `--diagnose` also
+lets `--counters` read the worker's instructions and cycles. `live_perf` reads the daemon epoch only for setups that
+run transactions, so master (no transaction API) runs again. `docs/benchmarking.md` carries the recipe.
+
+- **Counters.** The client added worker 1 for every test when given two CPUs, though only F.queue uses it; an
+  unassigned task could be placed on worker 1, and `--counters` then read worker 0's idle polling loop
+  (instructions per packet fell as hops were added: F.hop/16 below F.hop/4). Cycles per packet looked right either
+  way, being clock rate over packet rate. Worker 1 now exists only for F.queue, whose two tasks are both attached explicitly (placement is
+  round-robin from a counter a reset does not clear, so its Source had joined the queue on worker 1). After the
+  fix, unchanged code reads
+  the same instructions in repeated rounds (F.hop/16 118.3 / 118.3) and they grow with hops. Counter figures from
+  earlier live_perf runs of tests with more than one task (F.fanin, F.queue, the M tests) are not reliable; those
+  of single-task F tests are.
+
+**Evidence.** Master against this tree (mold); every F test, 8 rounds, isolated as above, IRQ activity reported on
+the set. Per packet on the worker, master / this tree:
+
+| test | ns | instructions | cycles | rounds slower than master |
+|---|---|---|---|---|
+| F.floor | 2.03 / 1.99 | 36.7 / 35.8 | 7.5 / 7.3 | 4/8 |
+| F.hop/4 | 3.42 / 3.67 | 50.7 / 56.4 | 12.8 / 13.7 | 7/8 |
+| F.hop/16 | 8.29 / 9.41 | 92.8 / 118.4 | 32.1 / 36.3 | 8/8 |
+| F.hook | 2.62 / 2.77 | 42.4 / 46.1 | 9.6 / 10.2 | 7/8 |
+| F.fanin/4 | 2.53 / 3.11 | 41.7 / 42.1 | 9.5 / 12.1 | 8/8 |
+| F.queue | 11.87 / 7.81 | 34.6 / 32.3 | 53.1 / 36.2 | 0/8 |
+| F.tc/16 | 2.28 / 2.16 | 38.5 / 37.3 | 8.4 / 8.0 | 2/8 |
+
+- The floor (Source -> Sink) is at parity: the gap recorded before D-097 is gone, so its follow-up (an A/B of
+  `PacketFreeBulk`'s eligibility check) is not needed.
+- Each module hop costs more than master's: from 4 to 16 hops, 5.17 instructions and 1.88 cycles per hop against
+  3.51 and 1.61 ((118.4 - 56.4) / 12 against (92.8 - 50.7) / 12; (36.3 - 13.7) / 12 against (32.1 - 12.8) / 12).
+- F.fanin/4 (four Sources into one Sink, one worker) is 23% slower with the same instructions: stalls, not code.
+  Earlier runs hid it by spreading the four tasks over two workers.
+- F.queue (Source on worker 0, the Queue's dequeue on worker 1) is 34% faster than master (its own run, 8 rounds).
+- Linked with GNU ld, this tree was within noise of mold in an earlier run of the same tests (D-113).
+
+**Code.** `tools/live_perf.py`, `docs/benchmarking.md`.
