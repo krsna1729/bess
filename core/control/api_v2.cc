@@ -4,6 +4,9 @@
 
 #include <gflags/gflags.h>
 #include <google/protobuf/descriptor.h>
+#include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
+#include <google/protobuf/message.h>
 #include <grpcpp/health_check_service_interface.h>
 #ifdef BESS_GRPC_REFLECTION
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
@@ -14,9 +17,11 @@
 #include <chrono>
 #include <format>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -41,6 +46,44 @@ namespace v2 = pb::v2;
 
 // -- desired state ------------------------------------------------------------
 
+namespace {
+
+// `arg` in canonical wire form: parsed as its type and re-serialized
+// deterministically (field-number order). Desired and active arguments are
+// compared by bytes, and clients do not all encode in field order
+// (protobuf's JSON-to-binary keeps the JSON key order), so the same argument
+// would otherwise read as a change. An unknown type or unparsable value is
+// kept as sent; creating the object reports it.
+google::protobuf::Any Canonical(const google::protobuf::Any &arg) {
+  const std::string_view url = arg.type_url();
+  const google::protobuf::Descriptor *type =
+      google::protobuf::DescriptorPool::generated_pool()->FindMessageTypeByName(
+          std::string(url.substr(url.rfind('/') + 1)));
+  if (type == nullptr) {
+    return arg;
+  }
+  std::unique_ptr<google::protobuf::Message> message(
+      google::protobuf::MessageFactory::generated_factory()->GetPrototype(type)->New());
+  if (!message->ParseFromString(arg.value())) {
+    return arg;
+  }
+  std::string value;
+  {
+    google::protobuf::io::StringOutputStream stream(&value);
+    google::protobuf::io::CodedOutputStream out(&stream);
+    out.SetSerializationDeterministic(true);
+    if (!message->SerializeToCodedStream(&out)) {
+      return arg;
+    }
+  }
+  google::protobuf::Any canonical;
+  canonical.set_type_url(arg.type_url());
+  canonical.set_value(std::move(value));
+  return canonical;
+}
+
+}  // namespace
+
 ControlResult<PipelineSpec> FromProto(const v2::Pipeline &pipeline) {
   PipelineSpec spec;
   int index = 0;
@@ -59,11 +102,11 @@ ControlResult<PipelineSpec> FromProto(const v2::Pipeline &pipeline) {
     index++;
     port.rx_queue_size = p.rx_queue_size();
     port.tx_queue_size = p.tx_queue_size();
-    port.arg = p.arg();
+    port.arg = Canonical(p.arg());
     spec.ports.push_back(std::move(port));
   }
   for (const auto &m : pipeline.modules()) {
-    spec.modules.push_back({m.name(), m.mclass(), m.arg()});
+    spec.modules.push_back({m.name(), m.mclass(), Canonical(m.arg())});
   }
   index = 0;
   for (const auto &c : pipeline.connections()) {

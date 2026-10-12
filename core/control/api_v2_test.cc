@@ -380,6 +380,38 @@ TEST_F(ApiV2ServiceTest, ValidateDiffPlanApplyGet) {
   }
 }
 
+// The same argument encoded in another field order (protobuf's JSON-to-binary
+// keeps the JSON key order) is the same desired state, not a replacement.
+TEST_F(ApiV2ServiceTest, ArgumentFieldOrderIsNotAChange) {
+  v2::Pipeline desired = SamplePipeline();
+  bess::pb::SourceArg arg;
+  arg.set_pkt_size(60);
+  arg.set_burst(32);
+  ASSERT_TRUE(desired.mutable_modules(0)->mutable_arg()->PackFrom(arg));
+  desired.mutable_modules(0)->set_mclass("Source");
+  v2::Pipeline reversed = desired;
+  // burst (field 2) = 32, then pkt_size (field 1) = 60.
+  reversed.mutable_modules(0)->mutable_arg()->set_value(std::string("\x10\x20\x08\x3c", 4));
+  ASSERT_NE(reversed.modules(0).arg().value(), desired.modules(0).arg().value());
+
+  uint64_t first = 0;
+  for (const v2::Pipeline *p : {&reversed, &desired, &reversed}) {
+    grpc::ClientContext ctx;
+    v2::ApplyPipelineRequest req;
+    *req.mutable_pipeline() = *p;
+    req.set_daemon_epoch(Epoch());
+    v2::ApplyPipelineResponse resp;
+    const grpc::Status status = stub_->ApplyPipeline(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+    if (first == 0) {
+      first = resp.generation();
+      continue;
+    }
+    EXPECT_EQ(first, resp.generation()) << "only the first apply changes anything";
+    EXPECT_EQ(0u, resp.applied_ops());
+  }
+}
+
 TEST_F(ApiV2ServiceTest, StaleGenerationIsAbortedWithTypedDetail) {
   grpc::ClientContext ctx;
   v2::ApplyPipelineRequest req;
