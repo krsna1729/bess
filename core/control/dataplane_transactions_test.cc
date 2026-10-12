@@ -11,11 +11,13 @@
 #include <gtest/gtest.h>
 
 #include <any>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <initializer_list>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include <google/protobuf/wrappers.pb.h>
 
@@ -513,7 +515,9 @@ class ConsistencyRpcTest : public ::testing::Test {
     return sessions_.Lookup(bess::dataplane::ScopeId(scope));
   }
 
-  bess::rcu::RcuDomain domain_{8};
+  // A retire budget of 4 (half the high water): BUSY is reachable with a few
+  // meters.
+  bess::rcu::RcuDomain domain_{8, /*retire_high_water=*/8};
   bess::dataplane::ScopeTable<SessionVersion> sessions_{16};
   bess::dataplane::SlotTable<MeterKey, MeterObject> meters_{16};
   bess::dataplane::ScopeResource<SessionVersion> sessions_res_{"sessions",
@@ -633,6 +637,80 @@ TEST_F(ConsistencyRpcTest, UnknownLevelIsRefused) {
             grpc::StatusCode::INVALID_ARGUMENT);
   EXPECT_EQ(detail.field(), "consistency");
   EXPECT_EQ(Session(1), nullptr);
+}
+
+// BUSY -- reclamation behind a reader that has not quiesced -- is waited out
+// by the daemon within a bound (kBusyRetries sleeps from kBusyFirstBackoff):
+// a reader that quiesces during the wait is never seen by the client; one
+// that stays stalled gets BUSY once the bound is spent, recorded nowhere.
+TEST_F(ConsistencyRpcTest, TheDaemonWaitsOutBusyWithinABound) {
+  v2::ApplyTransactionResponse r;
+  for (uint32_t k = 1; k <= 8; k++) {
+    ASSERT_TRUE(Apply(Request("", Level::CONSISTENCY_REFERENTIAL, {Op("meters", k, k)}), &r).ok());
+  }
+  auto erase = [](uint32_t first, uint32_t n, const std::string &id) {
+    v2::ApplyTransactionRequest req = Request(id, Level::CONSISTENCY_REFERENTIAL, {});
+    for (uint32_t k = first; k < first + n; k++) {
+      v2::TransactionOp *op = req.add_ops();
+      *op = Op("meters", k, 0);
+      op->set_erase(true);
+      op->clear_value();
+    }
+    return req;
+  };
+  constexpr bess::rcu::ReaderId kReader = 3;
+  ASSERT_TRUE(domain_.Register(kReader).has_value());
+  domain_.Online(kReader);  // stalled
+  // However the test ends, the reader leaves: teardown must not wait for it.
+  struct Leave {
+    bess::rcu::RcuDomain &domain;
+    ~Leave() {
+      if (domain.IsOnline(kReader)) {
+        domain.Offline(kReader);
+      }
+      domain.Unregister(kReader);
+    }
+  } leave{domain_};
+  // Applied; its removals wait for the reader and fill the budget.
+  ASSERT_TRUE(Apply(erase(1, 4, ""), &r).ok());
+  ASSERT_EQ(r.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+
+  using Outcome = bess::dataplane::TransactionEngine::Outcome;
+  auto count = [&](Outcome o) { return engine_.outcome_counts()[static_cast<size_t>(o)]; };
+  const uint64_t busy = count(Outcome::kBusy), applied = count(Outcome::kApplied);
+  const auto start = std::chrono::steady_clock::now();
+  ASSERT_TRUE(Apply(erase(5, 1, "stalled"), &r).ok());
+  const auto waited = std::chrono::steady_clock::now() - start;
+  EXPECT_EQ(r.record().outcome(), v2::TransactionRecord::OUTCOME_BUSY);
+  EXPECT_GE(waited, bess::control::kBusyFirstBackoff * ((1 << bess::control::kBusyRetries) - 1))
+      << "answered BUSY without waiting";
+  EXPECT_LT(waited, std::chrono::seconds(2)) << "the wait is not bounded";
+  // One answer, however many attempts it took.
+  EXPECT_EQ(count(Outcome::kBusy), busy + 1);
+  EXPECT_EQ(engine_.busy_retried(), static_cast<uint64_t>(bess::control::kBusyRetries));
+  {
+    grpc::ClientContext context;
+    v2::GetTransactionRequest get;
+    get.set_request_id("stalled");
+    v2::GetTransactionResponse known;
+    ASSERT_TRUE(stub_->GetTransaction(&context, get, &known).ok());
+    EXPECT_FALSE(known.known()) << "a BUSY attempted nothing: nothing to record";
+  }
+
+  // The reader quiesces a moment after the request arrives: the daemon's
+  // wait covers it.
+  {
+    std::jthread quiesce([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      domain_.Quiescent(kReader);
+      domain_.Offline(kReader);
+    });
+    ASSERT_TRUE(Apply(erase(5, 1, "brief"), &r).ok());
+  }
+  EXPECT_EQ(r.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED)
+      << "the client saw a BUSY the daemon could have waited out";
+  EXPECT_EQ(count(Outcome::kBusy), busy + 1) << "a BUSY waited out counted as an answer";
+  EXPECT_EQ(count(Outcome::kApplied), applied + 1);
 }
 
 }  // namespace

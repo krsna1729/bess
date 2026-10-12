@@ -159,18 +159,26 @@ class TransactionEngine {
   std::expected<void, std::string> ReleaseForTeardown(
       std::span<const std::string> names);
 
+  // What a kBusy outcome of this Apply() is to its caller: passed on as the
+  // answer, or retried by the caller itself (then it is not an answer).
+  enum class OnBusy : uint8_t { kAnswer, kRetry };
+
   // `consistency` is a request, not a hint: if any operation's resource
   // cannot provide it the answer is Outcome::kUnsupported (the failed
   // operation carries the reason), never a weaker transaction.
   Result Apply(std::span<const Op> ops,
                std::optional<uint64_t> expected_generation = std::nullopt,
-               Consistency consistency = Consistency::kReferential);
+               Consistency consistency = Consistency::kReferential,
+               OnBusy on_busy = OnBusy::kAnswer);
 
   // How many Apply() calls ended in each Outcome, indexed by the enum's value
-  // (operational metrics, M25).
+  // (operational metrics, M25). kBusy counts answers only: a kBusy under
+  // OnBusy::kRetry counts in busy_retried() instead, so a request its caller
+  // waited out counts once, as what it finally was. Both only grow.
   static constexpr size_t kOutcomes = 8;
   using OutcomeCounts = std::array<uint64_t, kOutcomes>;
   OutcomeCounts outcome_counts() const;
+  uint64_t busy_retried() const { return busy_retried_.load(std::memory_order_relaxed); }
   // Removal cascades still waiting for a grace period.
   size_t pending_cascades() const;
 
@@ -300,6 +308,7 @@ class TransactionEngine {
   bool reference_cycle_ = false;
   ResourceRegistry registry_{*this};
   std::array<std::atomic<uint64_t>, kOutcomes> outcome_counts_{};
+  std::atomic<uint64_t> busy_retried_{0};
 };
 
 // The engine behind a registry: for the control plane and in-tree code that

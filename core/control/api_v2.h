@@ -3,6 +3,8 @@
 #ifndef BESS_CONTROL_API_V2_H_
 #define BESS_CONTROL_API_V2_H_
 
+#include <chrono>
+
 #include <grpcpp/server_builder.h>
 #include <grpcpp/server_context.h>
 
@@ -52,6 +54,13 @@ inline constexpr int kMaxMessageBytes = 64 << 20;
 void PrepareControlServer();
 // Per builder: message size limits.
 void ConfigureControlServer(grpc::ServerBuilder *builder);
+
+// ApplyTransaction waits out a BUSY answer (reclamation behind the readers)
+// itself before passing it on: up to kBusyRetries more attempts, sleeping
+// kBusyFirstBackoff, then double that, between them (about 6 ms in all; a
+// grace period is ~11 us, or one task invocation when that is longer, D-012).
+inline constexpr int kBusyRetries = 5;
+inline constexpr std::chrono::microseconds kBusyFirstBackoff{200};
 
 class ControlV2Service final : public pb::v2::Control::Service {
  public:

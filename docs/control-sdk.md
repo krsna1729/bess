@@ -163,7 +163,7 @@ step.
 | No answer (deadline, unavailable; `INTERNAL`/`UNKNOWN` without BESS's error detail) | Asks `GetTransaction(request_id)`, again if the question goes unanswered too. Known: that outcome (`replayed`). Answered "not known" under the epoch the commit started with: sends the identical request again (the daemon replays or applies it once). Never sends again on a guess. |
 | No answer through every attempt | `TransportError`: the outcome is unknown, not failed; ask `get_transaction(request_id)` later. |
 | An answer to a question from another daemon epoch | `DaemonRestarted` (not `refused`): a send went unanswered and the old daemon's outcome is lost with it; never reported as applied or as not applied. The running daemon has not applied it (it refuses the old epoch): re-read its state before deciding. |
-| `OUTCOME_BUSY` | Retries with doubling backoff, then `Busy`. |
+| `OUTCOME_BUSY` | The daemon has already waited out a short BUSY itself (up to 5 more attempts over about 6 ms, within the request's deadline; nothing is recorded under the id). The SDK then retries with doubling backoff, then `Busy`. Metrics: `bess_transactions_total{outcome="busy"}` counts only BUSY answers; attempts the daemon retried count in `bess_transaction_busy_retries_total`. |
 | `OUTCOME_CONFLICT` | `Conflict` (nothing tried); the application decides what a moved generation means. `after_unknown_attempt`: an earlier send of the same commit went unanswered and may have applied. |
 | `OUTCOME_REJECTED` | `Rejected`, with each failing operation's index and error; nothing changed. |
 | A refused call | `InvalidRequest`, with the server's `ErrorDetail` (code, field, object). |

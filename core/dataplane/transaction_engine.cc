@@ -450,8 +450,12 @@ TransactionEngine::Result TransactionEngine::Reject(size_t n_ops,
 
 TransactionEngine::Result TransactionEngine::Apply(std::span<const Op> ops,
                                                   std::optional<uint64_t> expected_generation,
-                                                  Consistency consistency) {
+                                                  Consistency consistency, OnBusy on_busy) {
   Result result = ApplyImpl(ops, expected_generation, consistency);
+  if (result.outcome == Outcome::kBusy && on_busy == OnBusy::kRetry) {
+    busy_retried_.fetch_add(1, std::memory_order_relaxed);
+    return result;
+  }
   const size_t index = static_cast<size_t>(result.outcome);
   if (index < outcome_counts_.size()) {
     outcome_counts_[index].fetch_add(1, std::memory_order_relaxed);

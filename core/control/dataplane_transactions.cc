@@ -104,7 +104,7 @@ DataplaneTransactions::DataplaneTransactions(
     : DataplaneTransactions(engine, bindings, DrawEpoch()) {}
 
 ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
-    const v2::ApplyTransactionRequest &request) {
+    const v2::ApplyTransactionRequest &request, TransactionEngine::OnBusy on_busy) {
   v2::ApplyTransactionResponse response;
   response.set_daemon_epoch(epoch_);
   // A level this build does not know is refused: reading it as referential
@@ -197,7 +197,7 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
       expected = request.expected_generation();
     }
     const TransactionEngine::Result result =
-        engine_.Apply(ops, expected, consistency);
+        engine_.Apply(ops, expected, consistency, on_busy);
     if (result.outcome == TransactionEngine::Outcome::kUnsupported) {
       // A typed error, not a record: the request names a promise a resource
       // cannot keep, which retrying will not change. Nothing was attempted,

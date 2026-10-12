@@ -280,7 +280,10 @@ message TransactionRecord {
     OUTCOME_APPLIED = 1;
     OUTCOME_REJECTED = 2;  // an operation failed; nothing changed
     OUTCOME_CONFLICT = 3;  // expected_generation did not match; nothing tried
-    OUTCOME_BUSY = 4;      // readers slow to quiesce; nothing tried, retry
+    // Readers slow to quiesce; nothing tried. The daemon has already waited a
+    // few milliseconds (within the request's deadline) and retried: back off
+    // before retrying.
+    OUTCOME_BUSY = 4;
   }
   // The consistency level the transaction ran under (it describes what
   // packets could see once the transaction is APPLIED; a transaction that was

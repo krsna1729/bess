@@ -8733,6 +8733,10 @@ consumer-driven (D-008, §31.3 item 2).
   with its epoch: a restarted daemon refuses an older request before any side
   effect (`EPOCH_MISMATCH`, D-106), so a generation is never compared across
   restarts.
+  A BUSY answer (reclamation behind readers) is first waited out by the
+  daemon itself: up to 5 more attempts over about 6 ms, outside the control
+  lock and within the request's deadline (`kBusyRetries`,
+  `ConsistencyRpcTest.TheDaemonWaitsOutBusyWithinABound`).
 - **D-032 session vertical slice: DONE at basic scope.** One transaction
   creates the ExactMatch action rule, action, K5 meter, next hop and route.
   `session_pipeline_test.cc` drives each stage and rejection/removal path in

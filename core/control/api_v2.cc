@@ -10,11 +10,13 @@
 #endif
 
 #include <cctype>
+#include <chrono>
 #include <format>
 #include <limits>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -501,6 +503,24 @@ ControlV2Service::ControlV2Service(ControlPlane &control_plane)
     : ControlV2Service(control_plane, runtime::runtime().transactions(),
                        framework::ResourceBindings::ProcessDefault()) {}
 
+// One event per outcome the daemon decided (not for a replay, which decided
+// nothing new), emitted under the lock that decided it: events follow commit
+// order.
+static void EmitTransactionEvent(const v2::TransactionRecord &r) {
+  std::string outcome = v2::TransactionRecord::Outcome_Name(r.outcome());
+  if (outcome.rfind("OUTCOME_", 0) == 0) {
+    outcome = outcome.substr(8);
+  }
+  for (char &c : outcome) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  runtime::runtime().events().Emit("bess.transaction", "control",
+                                   {{"request_id", r.request_id()},
+                                    {"outcome", outcome},
+                                    {"operations", std::to_string(r.ops_size())}},
+                                   r.generation());
+}
+
 grpc::Status ControlV2Service::ApplyTransaction(
     grpc::ServerContext *context, const v2::ApplyTransactionRequest *request,
     v2::ApplyTransactionResponse *response) {
@@ -510,28 +530,38 @@ grpc::Status ControlV2Service::ApplyTransaction(
   // Resources' tables are DPDK structures; commands writing the same tables
   // run under the same lock.
   current_worker.SetNonWorker();
-  auto lock = control_plane_.AcquireLock();
-  auto applied = transactions_.Apply(*request);
+  // BUSY means reclamation is behind the readers and nothing was attempted
+  // (not recorded under the request id): wait a few grace periods here,
+  // outside the lock, and try again -- each Apply reclaims what became ready
+  // first. Bounded (kBusyRetries, about 6 ms in all) and never past the
+  // caller's deadline, so a stalled reader still answers BUSY promptly. A
+  // retried BUSY is not an answer: it is neither an event nor counted as one.
+  auto backoff = kBusyFirstBackoff;
+  ControlResult<v2::ApplyTransactionResponse> applied;
+  for (int retry = 0;; retry++) {
+    {
+      auto lock = control_plane_.AcquireLock();
+      // Decided before the attempt, so the engine counts a BUSY it will not
+      // answer as a retry, never as an answer it has to take back.
+      const bool may_retry = retry < kBusyRetries && !context->IsCancelled() &&
+                             std::chrono::system_clock::now() + backoff < context->deadline();
+      applied = transactions_.Apply(*request, may_retry ? dataplane::TransactionEngine::OnBusy::kRetry
+                                                        : dataplane::TransactionEngine::OnBusy::kAnswer);
+      if (!may_retry || !applied ||
+          applied->record().outcome() != v2::TransactionRecord::OUTCOME_BUSY) {
+        if (applied && !applied->replayed()) {
+          EmitTransactionEvent(applied->record());
+        }
+        break;
+      }
+    }
+    std::this_thread::sleep_for(backoff);
+    backoff *= 2;
+  }
   if (!applied) {
     return ToStatus(applied.error(), context);
   }
   *response = std::move(*applied);
-  if (!response->replayed()) {
-    // One event per outcome the daemon decided (a replay decided nothing new).
-    const v2::TransactionRecord &r = response->record();
-    std::string outcome = v2::TransactionRecord::Outcome_Name(r.outcome());
-    if (outcome.rfind("OUTCOME_", 0) == 0) {
-      outcome = outcome.substr(8);
-    }
-    for (char &c : outcome) {
-      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    runtime::runtime().events().Emit("bess.transaction", "control",
-                                     {{"request_id", r.request_id()},
-                                      {"outcome", outcome},
-                                      {"operations", std::to_string(r.ops_size())}},
-                                     r.generation());
-  }
   return grpc::Status::OK;
 }
 

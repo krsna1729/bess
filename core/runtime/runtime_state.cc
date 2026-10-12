@@ -235,6 +235,9 @@ RuntimeState::RuntimeState()
       w.Counter("bess_transactions_total", "Dataplane transactions by outcome",
                 static_cast<double>(counts[i]), {{"outcome", kOutcomes[i]}});
     }
+    w.Counter("bess_transaction_busy_retries_total",
+              "BUSY results the daemon waited out and retried itself (not answers)",
+              static_cast<double>(transactions_->busy_retried()));
     w.Gauge("bess_transaction_generation", "Dataplane transaction generation",
             static_cast<double>(transactions_->generation()));
     w.Counter("bess_events_lost_total", "Worker events refused by a full ring",

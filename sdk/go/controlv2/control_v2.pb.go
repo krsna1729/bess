@@ -389,7 +389,10 @@ const (
 	TransactionRecord_OUTCOME_APPLIED     TransactionRecord_Outcome = 1
 	TransactionRecord_OUTCOME_REJECTED    TransactionRecord_Outcome = 2 // an operation failed; nothing changed
 	TransactionRecord_OUTCOME_CONFLICT    TransactionRecord_Outcome = 3 // expected_generation did not match; nothing tried
-	TransactionRecord_OUTCOME_BUSY        TransactionRecord_Outcome = 4 // readers slow to quiesce; nothing tried, retry
+	// Readers slow to quiesce; nothing tried. The daemon has already waited a
+	// few milliseconds (within the request's deadline) and retried: back off
+	// before retrying.
+	TransactionRecord_OUTCOME_BUSY TransactionRecord_Outcome = 4
 )
 
 // Enum value maps for TransactionRecord_Outcome.

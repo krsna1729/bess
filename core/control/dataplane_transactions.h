@@ -43,8 +43,11 @@ class DataplaneTransactions {
                         uint64_t epoch)
       : engine_(engine), bindings_(bindings), epoch_(epoch) {}
 
+  // `on_busy`: whether the caller passes a BUSY outcome on or retries it
+  // itself (TransactionEngine::OnBusy; metrics count only answers).
   ControlResult<pb::v2::ApplyTransactionResponse> Apply(
-      const pb::v2::ApplyTransactionRequest &request);
+      const pb::v2::ApplyTransactionRequest &request,
+      dataplane::TransactionEngine::OnBusy on_busy = dataplane::TransactionEngine::OnBusy::kAnswer);
   pb::v2::GetTransactionResponse Get(const std::string &request_id) const;
   pb::v2::ListTransactionResourcesResponse List() const;
 
