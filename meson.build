@@ -307,6 +307,7 @@ pkg.generate(
 )
 
 subdir('protobuf')
+subdir('sdk/cpp')
 subdir('pybess')
 subdir('core')
 

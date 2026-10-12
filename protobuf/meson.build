@@ -63,6 +63,9 @@ foreach proto_index : range(core_proto_names.length())
     build_by_default: true,
   )
   core_cpp_proto_targets += cpp_target
+  if proto_stem == 'control_v2'
+    control_v2_cpp_target = cpp_target  # the C++ SDK's only generated code
+  endif
 
   python_outputs = [
     'builtin_' + proto_stem.replace('/', '_') + '_pb2.py',

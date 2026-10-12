@@ -1,4 +1,4 @@
-# Control SDKs (`pybess.sdk`, Go `sdk/go`, M27)
+# Control SDKs (`pybess.sdk`, Go `sdk/go`, C++ `sdk/cpp`, M27)
 
 A thin client over the generic control API (`protobuf/control_v2.proto`). It
 adds no semantics of its own: resources are whatever modules registered
@@ -34,6 +34,26 @@ made by `tools/gen_go_sdk.sh` in a pinned container; CI regenerates it and
 fails on any difference, so it never drifts from the `.proto`. Keys and values
 of module resources need no generated Go types: any `proto.Message` works,
 including `dynamicpb` messages built from a descriptor set.
+
+C++ (`sdk/cpp`, `#include <bess/sdk/client.h>`, pkg-config `bess-sdk`, C++23),
+the same guarantees with `std::expected` results whose `Error::kind` names the
+outcome (`kConflict`, `kRejected`, `kBusy`, `kTransport`, `kDaemonRestarted`,
+`kStaleResource`, `kInvalidRequest`, `kPipelineConflict`):
+
+```cpp
+auto client = bess::sdk::Client::Dial("localhost:10514");
+auto rules = client->Resource("em0/rules");
+auto tx = client->NewTransaction({.expected_generation = g});
+tx.Upsert(*rules, key, value);         // any protobuf Message, types checked
+auto applied = tx.Commit();            // Result<Applied>
+```
+
+`libbess-sdk` carries the generated `control_v2` code and installs
+`control_v2.pb.h` next to its headers; it depends on gRPC++ and protobuf, not
+on bessd. Keys and values may be `DynamicMessage`s built from a descriptor set.
+`WatchEvents` blocks and calls back per event; stop it with a `std::stop_token`.
+The Go SDK is the one for external controllers such as the UPF; the C++ SDK is
+the one bessctl is built on (D-104).
 
 ## Desired state
 
@@ -126,16 +146,19 @@ nothing applied; `TransportError` only after an unanswered RPC;
 | Epoch check | `Client._check_epoch` / `_observe_epoch` |
 | Out of attempts | the end of `_commit` (`TransportError` or `Busy`) |
 
-The Go client follows the same contract (`sdk/go/bess/client.go`); its scripted
-tests cover the same cases.
+The Go and C++ clients follow the same contract (`sdk/go/bess/client.go`,
+`sdk/cpp/src/client.cc`); their scripted tests cover the same cases.
 
 
-`pybess/test_sdk.py` and `sdk/go/bess/client_test.go` script every recovery
-path against a fake transport (the `python` suite; the CI job "Go SDK", with
-the race detector). Against a live daemon (the `integration` suite):
-`bessctl/module_tests/control_sdk.py` (Python) and `control_sdk_go.py`, which
-runs the Go client (`go test -tags live`) to commit a rule, replay it, meet a
-conflict and refuse a mistyped key, then checks the rule steers packets.
+`pybess/test_sdk.py`, `sdk/go/bess/client_test.go` and
+`sdk/cpp/client_test.cc` script every recovery path against a fake transport
+(the `python` suite; the CI job "Go SDK", with the race detector; the `sdk`
+suite). Against a live daemon (the `integration` suite):
+`bessctl/module_tests/control_sdk.py` (Python), `control_sdk_go.py`, which
+runs the Go client (`go test -tags live`), and `control_sdk_cpp.py`, which runs
+`sdk_cpp_live_test`: each commits a rule, replays it, meets a conflict, refuses
+a mistyped key and applies a pipeline, then the test checks the rule steers
+packets.
 
 Black-box recovery against the live daemon (`control_sdk.py`, the real stub
 with ApplyTransaction's fate scripted): an answer lost after the daemon applied
