@@ -7724,7 +7724,8 @@ remains, unexplained.
 **Decision.**
 - `pkt == nullptr` and `next != nullptr` are DCHECKs: a null in a batch is a bug upstream (every caller frees a batch or
   a sent prefix of one), and a one-segment mbuf has no next segment (DPDK's invariant). A debug build stops at a null
-  (a death test); a release build pays nothing for it.
+  (a death test); a release build pays nothing for it. `PacketFreeBulk` is in a public header (`core/packet.h`), so
+  this is a contract change for plugins: no element may be null, the first included (it used to go to DPDK's free).
 - Allocation no longer clears `tx_offload` and `vlan_tci_outer`. The one place that sets transmit-offload flags,
   `CommitMetadataAndSeeds`, writes `tx_offload` whole first; that also covers received mbufs, which never came through
   `AllocBulk`. Nothing sets `RTE_MBUF_F_TX_QINQ`; a module that does must set `vlan_tci_outer`.

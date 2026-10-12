@@ -202,6 +202,8 @@ inline bool PacketFreeBulkRawEligible(PacketHandle *pkts, size_t cnt) {
 // Decision D-034 (docs/decisions.md): optimistic fast path for the common case
 // (all direct, single-segment, same pool, refcnt 1).  Falls back to DPDK's
 // rte_pktmbuf_free_bulk for clones, external buffers, and multi-segment chains.
+// Precondition: no element is null (D-097; a debug build stops at one, a
+// release build does not check).
 inline void PacketFreeBulk(PacketHandle *pkts, size_t cnt) {
   if (unlikely(cnt == 0)) {
     return;
@@ -222,7 +224,8 @@ inline void PacketFreeBulk(PacketHandle *pkts, size_t cnt) {
   }
 
   PacketHandle first = pkts[0];
-  if (unlikely(first == nullptr || first->pool == nullptr)) {
+  DCHECK(first != nullptr) << "PacketFreeBulk: a null packet in the batch";
+  if (unlikely(first->pool == nullptr)) {
     rte_pktmbuf_free_bulk(pkts, static_cast<unsigned>(cnt));
     return;
   }
@@ -239,7 +242,7 @@ inline void PacketFreeBulk(PacketHandle *pkts, size_t cnt) {
         << "PacketFreeBulk: a one-segment mbuf with a next segment";
     if (unlikely(!RTE_MBUF_DIRECT(pkt) || pkt->pool != pool ||
                  rte_mbuf_refcnt_read(pkt) != 1 || pkt->nb_segs != 1)) {
-      // Slow path: let DPDK handle nulls, clones, external buffers, and chains.
+      // Slow path: let DPDK handle clones, external buffers, and chains.
       rte_pktmbuf_free_bulk(pkts, static_cast<unsigned>(cnt));
       return;
     }
