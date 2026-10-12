@@ -40,7 +40,7 @@ inline std::array<uint8_t, 6> Mac(std::string_view text) {
   const std::string s(text);
   if (std::sscanf(s.c_str(), "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) !=
       6) {
-    std::fprintf(stderr, "bad MAC address in a test: %s\n", s.c_str());
+    (void)std::fprintf(stderr, "bad MAC address in a test: %s\n", s.c_str());
     std::abort();
   }
   for (int i = 0; i < 6; i++) {
@@ -52,7 +52,7 @@ inline std::array<uint8_t, 6> Mac(std::string_view text) {
 inline std::array<uint8_t, 4> Ip4(std::string_view text) {
   std::array<uint8_t, 4> out{};
   if (inet_pton(AF_INET, std::string(text).c_str(), out.data()) != 1) {
-    std::fprintf(stderr, "bad IPv4 address in a test: %.*s\n", static_cast<int>(text.size()),
+    (void)std::fprintf(stderr, "bad IPv4 address in a test: %.*s\n", static_cast<int>(text.size()),
                  text.data());
     std::abort();
   }
@@ -62,7 +62,7 @@ inline std::array<uint8_t, 4> Ip4(std::string_view text) {
 inline std::array<uint8_t, 16> Ip6(std::string_view text) {
   std::array<uint8_t, 16> out{};
   if (inet_pton(AF_INET6, std::string(text).c_str(), out.data()) != 1) {
-    std::fprintf(stderr, "bad IPv6 address in a test: %.*s\n", static_cast<int>(text.size()),
+    (void)std::fprintf(stderr, "bad IPv6 address in a test: %.*s\n", static_cast<int>(text.size()),
                  text.data());
     std::abort();
   }
@@ -196,7 +196,7 @@ class PacketBuilder {
         return *l;
       }
     }
-    std::fprintf(stderr, "PacketBuilder::Last: no such layer\n");
+    (void)std::fprintf(stderr, "PacketBuilder::Last: no such layer\n");
     std::abort();
   }
 
@@ -381,8 +381,8 @@ inline std::string RandomIp(std::mt19937 &rng) {
 inline std::string RandomMac(std::mt19937 &rng) {
   std::uniform_int_distribution<int> byte(0, 255);
   char buf[18];
-  std::snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", byte(rng) & 0xfe, byte(rng),
-                byte(rng), byte(rng), byte(rng), byte(rng));
+  (void)std::snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", byte(rng) & 0xfe, byte(rng),
+                      byte(rng), byte(rng), byte(rng), byte(rng));
   return buf;
 }
 

@@ -189,9 +189,10 @@ void ModuleHarness::WireOutputs(Module *m, std::vector<gate_idx_t> ogates, Task 
   }
   // Only the gates asked for reach the capture, whatever an earlier Run
   // connected.
-  for (gate_idx_t g = 0; g < m->ogates().size(); g++) {
+  for (size_t g = 0; g < m->ogates().size(); g++) {
     if (m->ogates()[g] != nullptr) {
-      ModuleGraph::DisconnectModule(m, g);
+      // ogates() never exceeds MAX_GATES, which fits gate_idx_t.
+      ModuleGraph::DisconnectModule(m, static_cast<gate_idx_t>(g));
     }
   }
   for (gate_idx_t g : ogates) {
