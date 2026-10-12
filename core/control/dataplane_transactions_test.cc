@@ -290,6 +290,8 @@ TEST_F(DataplaneTransactionsTest, UndecodableOperationsRejectTheTransaction) {
   Pack(op.mutable_key(), one_field);
   expect_rejected(op, "should have 2 fields");
   expect_rejected(ExactRule("em0", 2, 2, MAX_GATES + 5), "invalid gate");
+  // Either module's bad op rejects the other's (was dataplane_transactions.py).
+  expect_rejected(WildRule("wm0", 0x0b000000, 0xff000000, 1, MAX_GATES + 5), "invalid gate");
   op = ExactRule("em0", 2, 2, 2);
   {
     bess::pb::ExactMatchRuleValue val;

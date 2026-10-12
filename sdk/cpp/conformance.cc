@@ -3,7 +3,7 @@
 // The C++ SDK's driver of the control SDK conformance suite (D-104): runs
 // sdk/conformance/cases.json against a live bessd, the steps as defined in
 // docs/control-sdk.md ("Conformance suite"). sdk/go/bess/conformance_test.go is
-// the Go one; bessctl/module_tests/control_sdk_conformance.py runs both.
+// the Go one; tests/live/conformance_test.cc runs both.
 //
 //   sdk_cpp_conformance <address> <resource> <cases.json>
 //
@@ -15,6 +15,7 @@
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/util/json_util.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -193,7 +194,29 @@ class Runner {
       if (caps->daemon_version().empty() || caps->module_classes_size() == 0) {
         return "no daemon version or module classes";
       }
-      return std::nullopt;
+      if (caps->plugin_api_version() == 0 || caps->daemon_epoch() == 0) {
+        return "no plugin API version or daemon epoch";
+      }
+      const auto missing = [this, &s](const char *field, const auto &have) -> Outcome {
+        for (const gp::Value *want : List(s, field)) {
+          const std::string name = Var(want->string_value());
+          if (std::find(have.begin(), have.end(), name) == have.end()) {
+            return std::format("{}: no {}", field, name);
+          }
+        }
+        return std::nullopt;
+      };
+      std::vector<std::string> resources;
+      for (const v2::TransactionResource &r : caps->resources()) {
+        resources.push_back(r.name());
+      }
+      if (Outcome failed = missing("want_rpcs", caps->rpcs())) {
+        return failed;
+      }
+      if (Outcome failed = missing("want_classes", caps->module_classes())) {
+        return failed;
+      }
+      return missing("want_resources", resources);
     }
     if (what == "supports") {
       auto supported = client_.Supports(Str(s, "rpc"));
@@ -456,9 +479,11 @@ class Runner {
   }
 
   Outcome DoPipeline(const gp::Struct &s, const std::string &want_error) {
-    const bool builds = Field(s, "add") || Field(s, "chain") || Field(s, "remove");
+    // `base` alone builds too: that pipeline applied again.
+    const bool builds =
+        Field(s, "add") || Field(s, "chain") || Field(s, "remove") || Field(s, "base");
     v2::Pipeline base;
-    if (builds && Field(s, "base") != nullptr) {
+    if (Field(s, "base") != nullptr) {
       base = pipes_[Str(s, "base")].pipeline;
     } else {
       auto snap = client_.Pipeline();
@@ -514,6 +539,11 @@ class Runner {
     auto done = client_.ApplyPipeline(*p, at);
     if (Outcome failed = Expect(done ? nullptr : &done.error(), want_error, "apply")) {
       return failed;
+    }
+    if (done && Field(s, "want_generation_of") != nullptr &&
+        done->generation() != pipes_[Str(s, "want_generation_of")].version.generation) {
+      return std::format("applied at generation {}, want {}'s", done->generation(),
+                         Str(s, "want_generation_of"));
     }
     if (done && Field(s, "as") != nullptr) {
       pipes_[Str(s, "as")] = {*p, {done->generation(), done->daemon_epoch()}};

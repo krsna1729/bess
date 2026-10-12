@@ -4,11 +4,22 @@
 #ifndef BESS_BESSCTL_H_
 #define BESS_BESSCTL_H_
 
+#include <memory>
 #include <string>
 
 namespace grpc {
 class ServerBuilder;
+class Service;
 }  // namespace grpc
+
+namespace bess::control {
+class ControlPlane;
+}  // namespace bess::control
+
+// The legacy BESSControl service over `control_plane`, as ApiServer::Run
+// serves it beside v2: for tests that run it on an in-process channel.
+std::unique_ptr<grpc::Service> NewLegacyControlService(
+    bess::control::ControlPlane &control_plane);
 
 // gRPC server encapsulation. Usage:
 //   ApiServer server;

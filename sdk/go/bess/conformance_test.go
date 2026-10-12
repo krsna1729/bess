@@ -7,10 +7,9 @@ package bess
 // The Go SDK's driver of the control SDK conformance suite (D-104): runs
 // sdk/conformance/cases.json against a live bessd, the steps as defined in
 // docs/control-sdk.md ("Conformance suite"), one subtest per case.
-// sdk/cpp/conformance.cc is the C++ one; bessctl/module_tests/
-// control_sdk_conformance.py runs both; it writes testdata/conformance.json
-// (the daemon's address and the resource), a file so that a Go run in a
-// container sees it too.
+// sdk/cpp/conformance.cc is the C++ one; tests/live/conformance_test.cc runs
+// both; it writes testdata/conformance.json (the daemon's address and the
+// resource), a file so that a Go run in a container sees it too.
 
 import (
 	"context"
@@ -169,6 +168,26 @@ func (r *runner) step(s spec) error {
 		}
 		if caps.GetDaemonVersion() == "" || len(caps.GetModuleClasses()) == 0 {
 			return errors.New("no daemon version or module classes")
+		}
+		if caps.GetPluginApiVersion() == 0 || caps.GetDaemonEpoch() == 0 {
+			return errors.New("no plugin API version or daemon epoch")
+		}
+		var resources []string
+		for _, res := range caps.GetResources() {
+			resources = append(resources, res.GetName())
+		}
+		for field, have := range map[string][]string{
+			"want_rpcs": caps.GetRpcs(), "want_classes": caps.GetModuleClasses(), "want_resources": resources,
+		} {
+			for _, want := range s.list(field) {
+				name := want.(string)
+				if name == "$resource" {
+					name = r.resource
+				}
+				if !slices.Contains(have, name) {
+					return fmt.Errorf("%s: no %s", field, name)
+				}
+			}
 		}
 	case "supports":
 		ok, err := r.client.Supports(r.ctx, s.str("rpc"))
@@ -422,9 +441,10 @@ func (r *runner) commit(s spec, wantError string) error {
 }
 
 func (r *runner) pipeline(s spec, wantError string) error {
-	builds := s.has("add") || s.has("chain") || s.has("remove")
+	// base alone builds too: that pipeline applied again.
+	builds := s.has("add") || s.has("chain") || s.has("remove") || s.has("base")
 	var base *pb.Pipeline
-	if builds && s.has("base") {
+	if s.has("base") {
 		base = r.pipes[s.str("base")].pipeline
 	} else {
 		snap, err := r.client.Pipeline(r.ctx)
@@ -482,6 +502,9 @@ func (r *runner) pipeline(s spec, wantError string) error {
 	if err := expect(err, wantError, "apply"); err != nil {
 		return err
 	}
+	if err == nil && s.has("want_generation_of") && done.GetGeneration() != r.pipes[s.str("want_generation_of")].version.Generation {
+		return fmt.Errorf("applied at generation %d, want %s's", done.GetGeneration(), s.str("want_generation_of"))
+	}
 	if err == nil && s.has("as") {
 		r.pipes[s.str("as")] = pipeLabel{p, PipelineVersion{done.GetGeneration(), done.GetDaemonEpoch()}}
 	}
@@ -491,7 +514,7 @@ func (r *runner) pipeline(s spec, wantError string) error {
 func TestConformance(t *testing.T) {
 	raw, err := os.ReadFile("testdata/conformance.json")
 	if err != nil {
-		t.Skip("no testdata/conformance.json (control_sdk_conformance.py writes it)")
+		t.Skip("no testdata/conformance.json (tests/live/conformance_test.cc writes it)")
 	}
 	var cfg struct {
 		Address  string `json:"address"`

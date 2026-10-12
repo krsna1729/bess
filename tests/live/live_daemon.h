@@ -37,6 +37,10 @@ struct Output {
 // `timeout`.
 Output RunProgram(const std::vector<std::string> &argv, std::string_view input = "",
                   std::chrono::seconds timeout = std::chrono::seconds(120));
+// RunProgram in the working directory `dir`.
+Output RunProgramIn(const std::string &dir, const std::vector<std::string> &argv,
+                    std::string_view input = "",
+                    std::chrono::seconds timeout = std::chrono::seconds(120));
 
 // A program left running: its standard output read as it comes, then
 // stopped (Ctrl-C ends `bessctl events` and `capture` cleanly).
@@ -106,10 +110,13 @@ class Daemon {
   bool Alive();
   // Starts it again after a test stopped it (a restart is a new epoch).
   void Restart();
+  // Restart on the same address: a client's channel reaches the new daemon,
+  // as after a restart in place (bessd -k).
+  void RestartInPlace();
 
  private:
   Daemon() = default;
-  void Start();
+  void Start(int port = 0);  // 0: a free port
   void Stop();
 
   int pid_ = -1;

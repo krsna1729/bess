@@ -1155,6 +1155,11 @@ class BESSControlImpl final : public BESSControl::Service {
 
 };
 
+std::unique_ptr<grpc::Service> NewLegacyControlService(
+    bess::control::ControlPlane& control_plane) {
+  return std::make_unique<BESSControlImpl>(control_plane);
+}
+
 void ApiServer::Listen(const std::string& addr) {
   if (!builder_) {
     bess::control::PrepareControlServer();  // before the first builder

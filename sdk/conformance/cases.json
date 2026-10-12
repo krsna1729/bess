@@ -2,7 +2,7 @@
   "_comment": [
     "The control SDK conformance suite (D-104): every SDK runs these cases against one live bessd,",
     "so they cannot drift. docs/control-sdk.md (\"Conformance suite\") defines the steps;",
-    "bessctl/module_tests/control_sdk_conformance.py starts the daemon, creates $resource (an",
+    "tests/live/conformance_test.cc starts the daemon, creates $resource (an",
     "ExactMatch's rules, two 4-byte fields, default gate 3) and runs each SDK's driver. Keys and",
     "values are protobuf JSON of the resource's types, which the drivers take from GetSchema."
   ],
@@ -10,7 +10,8 @@
     {
       "name": "discovery",
       "steps": [
-        {"do": "capabilities"},
+        {"do": "capabilities", "want_rpcs": ["bess.pb.v2.Control/GetCapabilities"],
+         "want_classes": ["ExactMatch"], "want_resources": ["$resource"]},
         {"do": "supports", "rpc": "ApplyTransaction", "want": true},
         {"do": "supports", "rpc": "bess.pb.v2.Control/GetSchema", "want": true},
         {"do": "supports", "rpc": "NoSuchRpc", "want": false},
@@ -79,6 +80,7 @@
         {"do": "pipeline", "base": "p0", "add": [["conf_a", "Bypass"], ["conf_b", "Sink"]],
          "chain": ["conf_a", "conf_b"], "plan": true, "want_plan_version_of": "p0", "want_changes": 3,
          "at_version_of": "p0", "as": "p1"},
+        {"do": "pipeline", "base": "p1", "want_changes": 0, "want_generation_of": "p1"},
         {"do": "pipeline", "base": "p1", "remove": ["conf_a", "conf_b"], "want_changes": 3,
          "at_version_of": "p0", "want_error": "pipeline_conflict"},
         {"do": "pipeline", "base": "p1", "remove": ["conf_a", "conf_b"],

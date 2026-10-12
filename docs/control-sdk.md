@@ -308,18 +308,19 @@ The Go and C++ clients follow the same contract (`sdk/go/bess/client.go`,
 `pybess/test_sdk.py`, `sdk/go/bess/client_test.go` and
 `sdk/cpp/client_test.cc` script every recovery path against a fake transport
 (the `python` suite; the CI job "Go SDK", with the race detector; the `sdk`
-suite). Against a live daemon (the `integration` suite):
-`bessctl/module_tests/control_sdk.py` (Python) and the conformance suite.
+suite). Against a live daemon (the `live` suite, `tests/live/`):
+`control_sdk_test.cc` (C++) and the conformance suite.
 
-Black-box recovery against the live daemon (`control_sdk.py`, the real stub
-with ApplyTransaction's fate scripted): an answer lost after the daemon applied
-is recovered through GetTransaction (`replayed`, the daemon's applied counter
-moves by one, the rule steers); a request lost before it arrived is sent again
-once "not known"; a daemon restarted between the send and the question is
-`DaemonRestarted`, the old resource handle is then `StaleResource` and never
-sent. A blind resend after a timeout, or an ignored epoch, fails them. A
-pipeline built, planned and applied through the SDK, re-applied as a no-op,
-and refused at a stale generation.
+Black-box recovery against the live daemon (`control_sdk_test.cc`, the real
+transport with ApplyTransaction's fate scripted): an answer lost after the
+daemon applied is recovered through GetTransaction (`replayed`, the daemon's
+applied counter moves by one, the rule steers); a request lost before it
+arrived is sent again once "not known"; a daemon restarted in place between
+the send and the question is `kDaemonRestarted`, the old resource handle is
+then `kStaleResource` and never sent, and a pipeline built under the old epoch
+is refused. A blind resend after a timeout, or an ignored epoch, fails them.
+Whether a rule steers is read from the gate counters (D-116) of a Source ->
+Update -> ExactMatch pipeline (`tests/live/steering.h`).
 
 A real controller on the SDK: `tools/live_transaction_bench.py` (D-027's live
 gate) applies its pipeline as desired state and drives its rules as SDK
@@ -331,10 +332,10 @@ transactions; it reads BUSY answers from the daemon's metrics.
 one live bessd (D-104), so the SDKs cannot drift: `sdk/cpp/conformance.cc`
 (`sdk_cpp_conformance`) and `sdk/go/bess/conformance_test.go`
 (`go test -tags live -run TestConformance`, one subtest per case).
-`bessctl/module_tests/control_sdk_conformance.py` creates an ExactMatch, runs
-both drivers, requires every case to pass in each, and checks that the rule
-each left behind steers packets. A behaviour both SDKs must share is a case
-there, not a test in one SDK.
+`tests/live/conformance_test.cc` creates an ExactMatch, runs both drivers
+(`$BESS_GO` or `go`; `BESS_SKIP_GO=1` skips Go), requires every case to pass
+in each, and checks that the rule each left behind steers packets. A behaviour
+both SDKs must share is a case there, not a test in one SDK.
 
 A driver gets the daemon's address, the resource name (`$resource` in the
 cases; `$module` is its module, the part before `/`) and the cases. It builds every message from the daemon's `GetSchema`
@@ -348,7 +349,7 @@ if it succeeds.
 
 | `do` | Fields | Checks |
 |---|---|---|
-| `capabilities` | | a daemon version and at least one module class |
+| `capabilities` | `want_rpcs`, `want_classes`, `want_resources` | a daemon version, at least one module class, a plugin API version and a daemon epoch; these RPCs (full names), module classes and resources among those offered |
 | `supports` | `rpc`, `want` | `Supports(rpc) == want` |
 | `metrics` | | at least one sample |
 | `schema` | `class` | the class's init type is in the schema's descriptors |
@@ -372,15 +373,16 @@ an expected generation of commit `expected_generation_of`'s plus
 `want_failed_ops` (the failed operations' indexes among those sent). `as`
 labels the commit's request id and generation.
 
-**pipeline.** Without `add`, `chain` or `remove`, reads the active pipeline and
-its version (generation and daemon epoch) into `as`. Otherwise builds on
-`base`'s pipeline (a label of an earlier pipeline step; the active one if
-absent): `add` modules (`[name, class]`, no argument), `chain` them gate 0 to
-gate 0, `remove` modules. Then `plan` (at least one step; with
-`want_plan_version_of`, made against that label's version), `want_changes`
-(the diff against the active pipeline has that many changes), and the apply,
-expecting `at_version_of`'s version if given. `as` labels the built pipeline
-and the version the apply reached.
+**pipeline.** Without `base`, `add`, `chain` or `remove`, reads the active
+pipeline and its version (generation and daemon epoch) into `as`. Otherwise
+builds on `base`'s pipeline (a label of an earlier pipeline step; the active
+one if absent): `add` modules (`[name, class]`, no argument), `chain` them gate
+0 to gate 0, `remove` modules (`base` alone: that pipeline again). Then `plan`
+(at least one step; with `want_plan_version_of`, made against that label's
+version), `want_changes` (the diff against the active pipeline has that many
+changes), and the apply, expecting `at_version_of`'s version if given;
+`want_generation_of`: the apply reached that label's generation (nothing
+changed). `as` labels the built pipeline and the version the apply reached.
 
 ## Not yet
 

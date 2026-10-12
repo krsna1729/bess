@@ -59,8 +59,8 @@ pkg.generate(
   extra_cflags: ['-std=c++23'],
 )
 
-# The conformance driver is what bessctl/module_tests/control_sdk_conformance.py
-# runs against a live bessd (pybess/meson.build passes its path).
+# The conformance driver is what tests/live/conformance_test.cc runs against a
+# live bessd (tests/live/meson.build passes its path).
 sdk_cpp_test_targets = []
 if get_option('build_tests')
   sdk_cpp_test = executable(

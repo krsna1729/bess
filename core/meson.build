@@ -708,6 +708,8 @@ unit_test_sources = [
   'control/control_plane_test.cc',
   'control/maintenance_loop_test.cc',
   'control/pressure_monitor_test.cc',
+  'control/scheduling_constraints_test.cc',
+  'bessctl_wire_ranges_test.cc',
   'bessd_test.cc',
   'gate_test.cc',
   'runtime/memory_test.cc',
@@ -827,6 +829,7 @@ foreach source : (get_option('build_tests') ? unit_test_sources : [])
   integration_test = (
     source.startswith('control/') or
     source == 'bessd_test.cc' or
+    source == 'bessctl_wire_ranges_test.cc' or
     source == 'registry_test.cc'
   )
   # Tests that only use library code link the libraries normally, so the

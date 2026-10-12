@@ -77,6 +77,11 @@ std::string SourcePath(std::string_view relative) {
 
 Output RunProgram(const std::vector<std::string> &argv, std::string_view input,
                   std::chrono::seconds timeout) {
+  return RunProgramIn("", argv, input, timeout);
+}
+
+Output RunProgramIn(const std::string &dir, const std::vector<std::string> &argv,
+                    std::string_view input, std::chrono::seconds timeout) {
   Output result;
   int in[2], out[2], err[2];
   if (pipe2(in, O_CLOEXEC) != 0 || pipe2(out, O_CLOEXEC) != 0 || pipe2(err, O_CLOEXEC) != 0) {
@@ -88,6 +93,9 @@ Output RunProgram(const std::vector<std::string> &argv, std::string_view input,
   posix_spawn_file_actions_adddup2(&actions, in[0], 0);
   posix_spawn_file_actions_adddup2(&actions, out[1], 1);
   posix_spawn_file_actions_adddup2(&actions, err[1], 2);
+  if (!dir.empty()) {
+    posix_spawn_file_actions_addchdir_np(&actions, dir.c_str());
+  }
   pid_t pid = -1;
   auto args = Argv(argv);
   const int rc = posix_spawn(&pid, args[0], &actions, nullptr, args.data(), environ);
@@ -312,8 +320,10 @@ Daemon &Daemon::Shared() {
 
 Daemon::~Daemon() { Stop(); }
 
-void Daemon::Start() {
-  const int port = FreePort();
+void Daemon::Start(int port) {
+  if (port == 0) {
+    port = FreePort();
+  }
   address_ = "localhost:" + std::to_string(port);
   char log_template[] = "/tmp/bessd-live-XXXXXX";
   const int log_fd = mkstemp(log_template);
@@ -375,6 +385,12 @@ void Daemon::Stop() {
 void Daemon::Restart() {
   Stop();
   Start();
+}
+
+void Daemon::RestartInPlace() {
+  const int port = std::stoi(address_.substr(address_.rfind(':') + 1));
+  Stop();
+  Start(port);
 }
 
 std::unique_ptr<bess::sdk::Client> Daemon::NewClient() const {
