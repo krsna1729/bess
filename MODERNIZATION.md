@@ -5159,6 +5159,18 @@ rather than one call site).
      release-job breaks found and fixed: a static DPDK dropped its constructor-registered drivers (D-096; the smoke test
      now starts bessd), and `meson install` built tests that GCC 14 at -O3 rejected (`build_tests=false`). Cleanup 4:
      the tip at 150/150 locally with every live test; 14 bisect worktrees and 3 merged branches removed.
+167. **Batch 5 and cleanup 5 (2026-10-12).** Pushes 41-50. Framework floor: the D-097 alloc/free change, WildcardMatch
+     packed priority (D-098) and EmitBatch whole-burst emit (D-099), measured against master. Type safety: `[[nodiscard]]`
+     ControlResult (D-101), the scheduler `Resource` enum, `PacketBatch::packets()`, `CpuId`. Python out of the runtime
+     (D-102-D-104): the C++ SDK, `GetSchema` (D-105), the C++ bessctl on the SDK alone (G1.7), one conformance suite run
+     by the C++ and Go SDKs, a mandatory daemon epoch (D-106), daemon-side BUSY retry, the v2 Admin service (D-107), YAML
+     manifests (D-108), task placement as desired state (D-109), every one of the 38 samples a manifest (D-110, D-111,
+     D-114: L2Forward's entries a transaction resource), and module commands over control_v2 (D-115, which also fixed
+     thread-unsafe commands running beside workers after a v2 resume). CI: a gcc-release lane and clang-asan as a
+     required check. Build loop: a fast profile, generated protobuf headers declared where they are included so one
+     ninja run follows a `.proto` edit (D-112), and mold in every profile (D-113; perf baselines must be mold on both
+     sides). Cleanup 5: the tip at 149/149 locally with every live test; 8 scratch worktrees, 1 stale baseline tree and
+     9 merged local branches removed, with the finished GNU ld A/B tree.
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
