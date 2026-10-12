@@ -72,12 +72,12 @@ void IPLookup::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
   const uint64_t hits = table.LookupBatch(std::span(dst, cnt),
                                           std::span(gates, cnt));
+  gate_idx_t out[bess::PacketBatch::kMaxBurst];
   for (int i = 0; i < cnt; i++) {
-    const gate_idx_t gate = (hits >> i) & 1
-                                ? static_cast<gate_idx_t>(gates[i])
-                                : static_cast<gate_idx_t>(DROP_GATE);
-    EmitPacket(ctx, batch->packet(i), gate);
+    out[i] = (hits >> i) & 1 ? static_cast<gate_idx_t>(gates[i])
+                             : static_cast<gate_idx_t>(DROP_GATE);
   }
+  EmitBatch(ctx, batch, out);
 }
 
 ParsedPrefix IPLookup::ParseIpv4Prefix(const std::string &prefix,

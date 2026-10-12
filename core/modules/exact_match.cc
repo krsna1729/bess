@@ -998,11 +998,12 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   // One snapshot for the whole batch: a concurrent command can neither swap
   // the generation mid-batch nor free it under this lookup.
   const Generation *gen = published_.Read();
+  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
   if (!action_mode_) {
     Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
-      EmitPacket(ctx, batch->packet(i),
-                 hit ? static_cast<gate_idx_t>(value) : gen->default_gate);
+      gates[i] = hit ? static_cast<gate_idx_t>(value) : gen->default_gate;
     });
+    EmitBatch(ctx, batch, gates);
     return;
   }
 
@@ -1013,21 +1014,19 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     // Fail closed: a match whose action id cannot be delivered would reach the
     // ActionTable with a stale id, so it takes the default gate instead.
     // RefreshForResume() is where this is reported.
-    for (int i = 0; i < batch->cnt(); i++) {
-      EmitPacket(ctx, batch->packet(i), gen->default_gate);
-    }
+    RunChooseModule(ctx, gen->default_gate, batch);
     return;
   }
   Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
-    bess::PacketRef pkt = batch->packet(i);
     if (!hit) {
-      EmitPacket(ctx, pkt, gen->default_gate);
+      gates[i] = gen->default_gate;
       return;
     }
     _set_attr_with_offset<bess::utils::be32_t>(
-        offset, pkt, bess::utils::be32_t(static_cast<uint32_t>(value)));
-    EmitPacket(ctx, pkt, kActionGate);
+        offset, batch->packet(i), bess::utils::be32_t(static_cast<uint32_t>(value)));
+    gates[i] = kActionGate;
   });
+  EmitBatch(ctx, batch, gates);
 }
 
 // The gate-mode helper cannot carry a 32-bit action id.

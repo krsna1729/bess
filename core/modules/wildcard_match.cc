@@ -819,9 +819,9 @@ inline void WildcardMatch::Classify(bess::PacketBatch *batch,
 }
 
 void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  Classify(batch, [&](int i, gate_idx_t gate) {
-    EmitPacket(ctx, batch->packet(i), gate);
-  });
+  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
+  ClassifyBatch(batch, gates);
+  EmitBatch(ctx, batch, gates);
 }
 
 void WildcardMatch::ClassifyBatch(bess::PacketBatch *batch,

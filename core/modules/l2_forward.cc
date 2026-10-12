@@ -113,10 +113,11 @@ void L2Forward::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
   const uint64_t hits =
       table_->LookupBatch(std::span<const uint64_t>(keys, static_cast<size_t>(cnt)), values);
+  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
   for (int i = 0; i < cnt; i++) {
-    EmitPacket(ctx, batch->packet(i),
-               (hits >> i) & 1 ? static_cast<gate_idx_t>(values[i] - 1) : default_gate);
+    gates[i] = (hits >> i) & 1 ? static_cast<gate_idx_t>(values[i] - 1) : default_gate;
   }
+  EmitBatch(ctx, batch, gates);
 }
 
 namespace {

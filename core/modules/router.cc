@@ -234,9 +234,7 @@ void Router::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   if (!bess::metadata::IsValidOffset(offset)) {
     // Fail closed: an unresolved id would send the packet to a guessed gate.
     // OnEvent(PreResume) is where this is reported.
-    for (int i = 0; i < cnt; i++) {
-      EmitPacket(ctx, batch->packet(i), DROP_GATE);
-    }
+    RunChooseModule(ctx, DROP_GATE, batch);
     return;
   }
 
@@ -250,15 +248,15 @@ void Router::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const uint64_t resolved = router_->LookupNextHops(
       std::span(ids).first(static_cast<size_t>(cnt)),
       std::span(hops).first(static_cast<size_t>(cnt)));
+  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
   for (int i = 0; i < cnt; i++) {
     const route::NextHop *hop =
         (resolved & (uint64_t{1} << i)) != 0 ? hops[i] : nullptr;
-    const gate_idx_t gate =
-        hop != nullptr && hop->neighbor == route::NeighborState::kResolved
-            ? GateOf(hop->egress)
-            : DROP_GATE;
-    EmitPacket(ctx, batch->packet(i), gate);
+    gates[i] = hop != nullptr && hop->neighbor == route::NeighborState::kResolved
+                   ? GateOf(hop->egress)
+                   : DROP_GATE;
   }
+  EmitBatch(ctx, batch, gates);
 }
 
 std::string Router::GetDesc() const {

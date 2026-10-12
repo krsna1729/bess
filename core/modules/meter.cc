@@ -333,9 +333,7 @@ void Meter::MeterBatch(bess::PacketBatch *batch, gate_idx_t *gates) const {
 void Meter::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   std::array<gate_idx_t, bess::PacketBatch::kMaxBurst> gates;
   MeterBatch(batch, gates.data());
-  for (int i = 0; i < batch->cnt(); i++) {
-    EmitPacket(ctx, batch->packet(i), gates[i]);
-  }
+  EmitBatch(ctx, batch, gates.data());
 }
 
 std::string Meter::GetDesc() const {

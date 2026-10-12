@@ -355,8 +355,9 @@ The unit of packet transport between modules:
   - `RunNextModule(ctx, batch)`: passes the entire batch to output gate 0.
   - `RunChooseModule(ctx, gate_idx, batch)`: passes the entire batch to `gate_idx`.
   - Zero redundant gate lookups and zero packet copying.
-- **Multi-gate diverging streams (Splitting)**:
-  - `EmitPacket(ctx, pkt, gate_idx)`: routes an individual packet to `gate_idx`. Used only when packets in the same burst diverge to different gates.
+- **Per-packet gate decisions (classifiers)**:
+  - `EmitBatch(ctx, batch, gates)`: sends packet `i` to `gates[i]`. When every packet has the same gate, the whole batch goes through `RunChooseModule`; otherwise it emits packet by packet. The batch is consumed. Prefer it to an `EmitPacket` loop whenever bursts are often uniform (D-099).
+  - `EmitPacket(ctx, pkt, gate_idx)`: routes an individual packet to `gate_idx`, for paths that decide and emit in one pass.
   - `DropPacket(ctx, pkt)`: places packet in the task's dead batch for batched memory reclamation.
 
 ---

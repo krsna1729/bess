@@ -252,21 +252,13 @@ class alignas(bess::arch::kCacheLineSize) Module {
   // Process OGate hooks and forward packet batches into next modules.
   inline void ProcessOGates(Context *ctx);
 
-  /*
-   * Split a batch into several, one for each ogate
-   * NOTE:
-   *   1. Order is preserved for packets with the same gate.
-   *   2. No ordering guarantee for packets with different gates.
-   *
-   * Update on 11/27/2017, by Shinae Woo
-   * This interface will become DEPRECATED.
-   * Consider using new interfafces supporting faster data-plane support
-   * DropPacket()/EmitPacket()
-   * */
-  [[deprecated(
-      "use the new API EmitPacket()/DropPacket() instead")]] inline void
-  RunSplit(Context *ctx, const gate_idx_t *ogates,
-           bess::PacketBatch *mixed_batch);
+  // Emits packet i of 'batch' to 'ogates[i]'. When every packet goes to one
+  // gate (the common case for classifiers), the batch leaves whole through
+  // RunChooseModule instead of packet by packet (NAT measured about 2.5 ns a
+  // packet less; D-099). 'batch' is consumed either way: the caller must not
+  // use it afterwards.
+  inline void EmitBatch(Context *ctx, bess::PacketBatch *batch,
+                        const gate_idx_t *ogates);
 
   // Register a task.
   task_id_t RegisterTask(void *arg);
@@ -620,25 +612,24 @@ inline void Module::ProcessOGates(Context *ctx) {
   ctx->gate_without_hook_cnt = 0;
 }
 
-inline void Module::RunSplit(Context *ctx, const gate_idx_t *out_gates,
-                             bess::PacketBatch *mixed_batch) {
-  int pkt_cnt = mixed_batch->cnt();
-  if (unlikely(pkt_cnt <= 0)) {
+inline void Module::EmitBatch(Context *ctx, bess::PacketBatch *batch,
+                              const gate_idx_t *ogates) {
+  const int cnt = batch->cnt();
+  if (cnt <= 0) [[unlikely]] {
     return;
   }
-
-  int gate_cnt = ogates_.size();
-  if (unlikely(gate_cnt <= 0)) {
-    deadends_[ctx->wid] += mixed_batch->cnt();
-    deadend(ctx, mixed_batch);
+  const gate_idx_t first = ogates[0];
+  bool same = true;
+  for (int i = 1; i < cnt; i++) {
+    same &= ogates[i] == first;
+  }
+  if (same) [[likely]] {
+    RunChooseModule(ctx, first, batch);
     return;
   }
-
-  for (int i = 0; i < pkt_cnt; i++) {
-    EmitPacket(ctx, mixed_batch->packet(i), out_gates[i]);
+  for (int i = 0; i < cnt; i++) {
+    EmitPacket(ctx, batch->packet(i), ogates[i]);
   }
-
-  mixed_batch->clear();
 }
 
 // run all per-thread initializers
