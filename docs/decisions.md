@@ -117,6 +117,7 @@ file is the reasoning.
 | D-094 | Experimental public codec facade (`init_context().codecs()`); R4 an installed-tree plugin driven over the control API | accepted |
 | D-095 | Installed static archives of route, dataplane core and RCU (`bess-dev-static`); R1 linked without bessd | accepted |
 | D-096 | Static DPDK links its constructor-registered drivers (whole-archive kept); release smoke starts bessd | accepted |
+| D-097 | The framework floor was the packet alloc and free path: four per-packet operations master did not do | accepted |
 
 
 ---
@@ -7689,4 +7690,46 @@ the same way, and its smoke test (`bessd --version`) never creates a pool, so it
 
 **Evidence.** Before: a release `-Ddpdk_link=static` build aborts at startup as above. After: the same build starts
 and listens (`Server listening on 127.0.0.1:34999`) and runs every F test.
+
+
+## D-097 The framework floor was the packet alloc and free path: four per-packet operations master did not do
+
+**Status:** accepted (2026-10-05, the user took the recommendation below).
+**Code:** `tools/live_perf.py` (`--counters`: instructions, cycles, L1D and branch misses per packet from `perf stat`
+on worker 0's CPU); `core/packet.h` (`PacketFreeBulk`: the null and next-segment checks are DCHECKs),
+`core/packet_pool.cc` (`AllocBulk` no longer clears `tx_offload` or `vlan_tci_outer`), `core/packet_tx_checksum.cc`
+(`CommitMetadataAndSeeds` writes `tx_offload` whole), `core/packet_test.cc`, `core/packet_tx_checksum_test.cc`.
+
+**Context.** D-092 found every framework test 22-38% slower than master, from before the Meson cutover. Ruled out:
+static vs shared DPDK (D-096), `-fPIC` in static libraries (`-Db_staticpic=false`: no change), semantic interposition
+(`-fno-semantic-interposition`: no change). The counters showed equal IPC and no L1D or branch misses: develop simply
+executed more instructions, already in Source -> Sink (37 -> 44 per packet).
+
+**Finding.** Master (DPDK 19.11) checked pool, linear-and-direct and refcount before a bulk free, and allocated with
+two 16-byte stores. Develop also checked, per packet, `pkt == nullptr` and `next != nullptr` before the bulk free, and
+cleared `tx_offload` and `vlan_tci_outer` on allocation (D-034). A variant without the four:
+
+| test (ns/packet; instructions/packet) | master | develop | without the four |
+|---|---|---|---|
+| F.floor | 1.82; 36.9 | 2.36; 44.2 | 1.79; 36.0 |
+| F.hop/1 | 2.26 | 2.98 | 2.43 |
+| F.queue | 3.86 | 4.70 | 4.06 |
+| F.hop/16 | 7.06; 93.2 | 9.20; 127.2 | 8.53; 119.1 |
+| M.base | 5.23 | 7.70 | 6.44 |
+
+(isolated CPUs 2,4, 4 rounds, contamination flagged.) A residual of about 1.7 instructions per packet per module hop
+remains, unexplained.
+
+**Decision.**
+- `pkt == nullptr` and `next != nullptr` are DCHECKs: a null in a batch is a bug upstream (every caller frees a batch or
+  a sent prefix of one), and a one-segment mbuf has no next segment (DPDK's invariant). A debug build stops at a null
+  (a death test); a release build pays nothing for it.
+- Allocation no longer clears `tx_offload` and `vlan_tci_outer`. The one place that sets transmit-offload flags,
+  `CommitMetadataAndSeeds`, writes `tx_offload` whole first; that also covers received mbufs, which never came through
+  `AllocBulk`. Nothing sets `RTE_MBUF_F_TX_QINQ`; a module that does must set `vlan_tci_outer`.
+
+**Evidence.** `packet_test` (21; the reuse test no longer expects the two fields reset; the null-element case is a
+debug death test), `packet_tx_checksum_test` (29; new `HardwareOffloadWritesTxOffloadWhole`: `tx_offload` filled with
+ones, finalized with hardware IPv4 and UDP checksums, exact lengths and a zero segment size -- fails without the
+commit-time write). Live numbers above are the variant's; the shipped change is re-measured with the next batch.
 
