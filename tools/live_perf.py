@@ -17,8 +17,9 @@ counters, so nothing is added to the packet path). Classes:
        F.queue          Source -> Queue | worker 1: Queue -> Sink (cross-worker handoff)
   M  module, localised -- ns per packet *above* M.base (Source -> Rewrite -> Bypass -> Sink,
        the same headers and flow mix every M test uses):
-       M.exactmatch, M.wildcardmatch, M.iplookup, M.l2forward, M.acl, M.hashlb,
-       M.update, M.nat, M.vlan
+       M.exactmatch, M.exactmatch/mixed (bursts split across gates), M.wildcardmatch, M.iplookup,
+       M.l2forward, M.acl, M.hashlb, M.update, M.nat, M.vlan, M.genericencap (constant header),
+       M.metadata (Timestamp and SetMetadata attributes read by GenericEncap)
   Reading a result: F.floor or F.hop moving moves every pipeline (cross-cutting);
   only one M delta moving is that module (localised).
 
@@ -192,6 +193,16 @@ def m_exactmatch(b):
     return m_base(b, [('em', 2)])
 
 
+def m_exactmatch_mixed(b):
+    """Every other flow matches: bursts split across two gates (EmitBatch's packet-by-packet path)."""
+    b.mod('ExactMatch', 'em', {'fields': [{'offset': 26, 'num_bytes': 4}]})
+    b.cmd('em', 'set_default_gate', 'ExactMatchCommandSetDefaultGateArg', {'gate': 0})
+    for i in range(0, FLOWS, 2):
+        b.cmd('em', 'add', 'ExactMatchCommandAddArg',
+              {'gate': 1, 'fields': [{'value_bin': struct.pack('!I', 0x0a000001 + i)}]})
+    return m_base(b, [('em', 2)])
+
+
 def m_wildcardmatch(b):
     b.mod('WildcardMatch', 'wm', {'fields': [{'offset': 26, 'num_bytes': 4},
                                              {'offset': 30, 'num_bytes': 4}]})
@@ -251,6 +262,24 @@ def m_vlan(b):
     return m_base(b, [('vpush', 1), ('vpop', 1)])
 
 
+def m_genericencap(b):
+    """A 14-byte header of constants only."""
+    b.mod('GenericEncap', 'ge', {'fields': [{'size': 6, 'value': {'value_int': 0x020000000002}},
+                                            {'size': 6, 'value': {'value_int': 0x020000000001}},
+                                            {'size': 2, 'value': {'value_int': 0x0800}}]})
+    return m_base(b, [('ge', 1)])
+
+
+def m_metadata(b):
+    """Timestamp and SetMetadata write attributes that GenericEncap reads into a header."""
+    b.mod('Timestamp', 'ts', {'attr_name': 'ts'})
+    b.mod('SetMetadata', 'sm', {'attrs': [{'name': 'tag', 'size': 4, 'value_int': 7}]})
+    b.mod('GenericEncap', 'ge', {'fields': [{'size': 8, 'attribute': 'ts'},
+                                            {'size': 4, 'attribute': 'tag'},
+                                            {'size': 2, 'value': {'value_int': 0x0800}}]})
+    return m_base(b, [('ts', 1), ('sm', 1), ('ge', 1)])
+
+
 TESTS = {
     'F.floor': ('F', f_floor),
     'F.hop/1': ('F', f_hop(1)),
@@ -265,6 +294,7 @@ TESTS = {
     'F.queue': ('F', f_queue),
     'M.base': ('M', m_base),
     'M.exactmatch': ('M', m_exactmatch),
+    'M.exactmatch/mixed': ('M', m_exactmatch_mixed),
     'M.wildcardmatch': ('M', m_wildcardmatch),
     'M.iplookup': ('M', m_iplookup),
     'M.l2forward': ('M', m_l2forward),
@@ -273,6 +303,8 @@ TESTS = {
     'M.update': ('M', m_update),
     'M.nat': ('M', m_nat),
     'M.vlan': ('M', m_vlan),
+    'M.genericencap': ('M', m_genericencap),
+    'M.metadata': ('M', m_metadata),
 }
 
 

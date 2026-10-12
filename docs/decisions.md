@@ -119,6 +119,7 @@ file is the reasoning.
 | D-096 | Static DPDK links its constructor-registered drivers (whole-archive kept); release smoke starts bessd | accepted |
 | D-097 | The framework floor was the packet alloc and free path: four per-packet operations master did not do | accepted |
 | D-098 | WildcardMatch ranks by a packed priority and skips tuples that cannot win (19.2 ns master, 44.8 develop, 14.6 now) | accepted |
+| D-099 | `Module::EmitBatch`: a burst whose packets all take one gate leaves whole; classifiers use it; `RunSplit` removed | accepted |
 
 
 ---
@@ -7765,3 +7766,42 @@ on `>=`, inverted packed comparison, no ceiling raise. `modules_wildcard_match_t
 `modules_wildcard_match_transaction_test` (7) pass. Live, same run as D-097 (isolated CPUs 2,4, 4 rounds,
 contamination flagged): M.wildcardmatch master 19.18, develop before 44.82, now 14.58 ns; below master in 4 of 4 pairs.
 
+## D-099 `Module::EmitBatch`: a burst whose packets all take one gate leaves whole; classifiers use it; `RunSplit` removed
+
+**Status:** accepted (2026-10-12; generalizes NAT's measured batch emit, D-092, which the roadmap review asked for).
+**Code:** `core/module.h` (`EmitBatch`; `RunSplit` removed), `core/modules/{exact_match,wildcard_match,l2_forward,
+ip_lookup,router,meter}.cc`, `docs/plugin-api.md`, `tools/live_perf.py` (`M.exactmatch/mixed`, `M.genericencap`,
+`M.metadata`).
+
+**Context.** Classifiers decided a gate per packet and called `EmitPacket` per packet: a gate-vector lookup, null
+check, per-gate batch lookup and hook test for every packet, even when the whole burst took one gate. NAT's
+whole-batch emit saved about 2.4 ns a packet (D-092).
+
+**Decision.**
+- `EmitBatch(ctx, batch, gates)`: when every `gates[i]` is equal the batch goes through `RunChooseModule`; else
+  packet by packet as before. The batch is consumed either way. Drop and dead-end accounting is unchanged (a dead or
+  `DROP_GATE` gate counts the same deadends and silent drops; packets are freed earlier). Hooks see the same packets.
+- ExactMatch (gate and action modes), WildcardMatch, L2Forward, IPLookup, Router and Meter use it; their fail-closed
+  paths call `RunChooseModule` directly. HashLB does not: it spreads packets over gates by design.
+- `RunSplit` (deprecated since 2017 in favour of `EmitPacket`, no callers) is removed, as the compatibility policy
+  requires, by this record. A plugin that still calls it fails to compile; `EmitBatch` is its replacement.
+
+**Evidence.** Reviewer: correct (semantics, ownership, gate arrays). Unit tests (139 of 140; the 140th needs the Go
+toolchain) and live module tests (exact_match, wildcard_match, l2forward, iplookup, session_pipeline, acl, hash_lb,
+dataplane_transactions) pass. Live, paired before/after binaries, isolated CPUs 2,4, 6 rounds, contamination
+flagged; raw ns per packet, median of after minus before:
+
+| test | change | rounds lower |
+|---|---|---|
+| M.exactmatch | -4.32 | 6/6 |
+| M.iplookup | -3.31 | 6/6 |
+| M.l2forward | -2.05 | 6/6 |
+| M.wildcardmatch | -1.36 | 6/6 |
+| M.exactmatch/mixed (bursts split across two gates) | -0.10 | 3/6 |
+| M.acl (unchanged code) | +0.85 | 0/6 |
+| M.hashlb (unchanged code) | +1.08 | 2/6 |
+
+The mixed case does not pay for the uniformity check. ACL's shift has no code change behind it (layout, unexplained).
+Above M.base, ExactMatch is now 11.64 ns (master 11.09) and IPLookup 1.46 (master 2.92). The mixed case shows the
+remaining framework cost: 22.16 ns against master's 10.50 -- per-packet `EmitPacket` is about twice master's; the next
+item (outputs compiled at PreResume) targets it.
