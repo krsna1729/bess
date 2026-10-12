@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # For metadata attribute usage for wildcard matching,
-# also see samples/wildcardmatch.bess
+# also see samples/wildcardmatch.yaml
 
 em::ExactMatch(fields=[{'attr_name':'foo', 'num_bytes':1}, \
                        {'attr_name':'bar', 'num_bytes':2}])

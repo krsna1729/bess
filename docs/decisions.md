@@ -134,6 +134,7 @@ file is the reasoning.
 | D-111 | IPLookup's routes are a transaction resource (`LpmTableResource`) | accepted |
 | D-112 | Generated C++ protobuf code is declared where it is included; one ninja run after a .proto edit | accepted |
 | D-113 | mold links every profile and every CI lane | accepted |
+| D-114 | L2Forward's entries are a transaction resource (`MacTableResource`) | accepted |
 
 
 ---
@@ -8282,7 +8283,50 @@ install command, when the compiler cannot use it. `env/install-deps.sh build` (C
 on `bessd` names mold 2.42.0 in the fast and release trees. The release-semantics suite then passed as before (145
 OK; the two failures are the suites that need root), static module registration (`link_whole`) included.
 
-**Not measured.** The linker lays out sections, so code placement in a release `bessd` can differ from a GNU ld link.
-Perf baselines recorded before this decision were GNU ld links; a perf comparison across it needs a paired run.
+**Packet path.** The linker lays out the code, so a release `bessd` from mold is not byte-for-byte GNU ld's: mold
+merges `.text.unlikely`/`.text.hot` into `.text` in input order where GNU ld's script groups them. Paired
+`tools/live_perf.py` runs, same commit and options, `-fuse-ld=bfd` against mold (two runs, 4 palindromic rounds each,
+CPUs 2 and 4 isolated): every framework (F) test within run-to-run noise (`F.tc/16` takes one of two values, about 2.1
+or 4 ns, in both builds); `M.wildcardmatch/8` and `/16` +1.4 to 2.2% in both runs; `M.hashlb` +5 to 6% (about 0.5
+ns per packet over `M.base`); the other module rows changed sign between runs (`M.exactmatch/mixed` +13% in run 1,
+-0.2% in run 2). mold with `-z keep-text-section-prefix`, which restores the grouping, was no better overall (hashlb
++3%, other rows up to +8% either way), so mold links with its defaults. Perf comparisons across this decision need
+both sides linked by mold; baselines recorded before it were GNU ld links.
 
 **Code.** `meson.build`, `env/install-deps.sh`, `tools/profiles/fast.ini`.
+
+## D-114 L2Forward's entries are a transaction resource (`MacTableResource`)
+
+**Status:** accepted.
+
+**Decision.** L2Forward binds `<name>/macs`: key `L2ForwardMacKey {addr}`, value `L2ForwardMacValue {gate}`; the
+default gate is an optional init argument (`L2ForwardArg.default_gate`, D-110). Its `add`, `delete`,
+`set_default_gate` and `populate` commands are unchanged beside it.
+
+- `core/l2/mac_table_resource.h` (`MacTableResource<Table>`, any `PackedMacTable`): cuckoo placement cannot promise
+  room for a set of keys, so a new MAC is inserted during Reserve with the module's *miss value*, the stored value
+  that does what a miss does now (L2Forward: default gate + 1). Publish stores the real value in place, which cannot
+  fail; a refusal erases what was placed. Unlike ExactMatch's `kPending` (D-021), the reader drops nothing, so the
+  packet path is unchanged.
+- The miss value is read at Reserve and must hold until Publish: it does, because transactions and every module
+  command (`set_default_gate` included) run under the one control-plane lock.
+- Inserts move other entries, so staged operations look their key up again when they run; they keep no slot.
+
+**Evidence.** `l2_mac_table_resource_test`: entries committed, re-pointed and erased in one transaction; a refusal
+leaves no placed entry; 240 keys in one transaction into a 256-entry table (keys moved by later inserts) all publish
+their values; a full table refuses the transaction with nothing visible; bad keys, values and value types are
+refused. `modules_l2_forward_test`: an invalid `default_gate` refuses the module, a valid one is where a miss
+goes; entries written through the module's codec (the RPC's and manifests' path) send their MACs to the gates given
+(0, 3, DROP_GATE), and an erased one goes back to the default gate (fails with the codec storing `gate` instead of
+`gate + 1`). The test calls `ClassifyBatch`, ProcessBatch's decision, split out for it; paired live_perf, 6
+rounds, before and after the split: `M.l2forward` 3.75 and 3.66 ns over `M.base`, slower in 2 of 6 pairs. Live: `l2forward.yaml`
+applies (4 entries in one resource; a diff after it shows 0 changes) and sends
+traffic evenly to gates 1-4, and the legacy `lookup` command reads the same entries.
+
+**Samples.** With `l2forward`, every one of the 38 samples is a manifest. `arp` needs no resource: ArpResponder's
+init argument adds its one entry. `tc/wfs_double` was a measurement script (the pipeline run with the Source's share
+170, then 171, printing Measure latencies); the manifest is the pipeline, and the comparison is a one-field diff
+(`UPDATE TASK src:0`) applied between two readings. `bessctl/test_samples.py`, which ran the `.bess` samples, is
+removed; `bessctl_cpp`'s `test_samples` applies every manifest.
+
+**Code.** `core/l2/mac_table_resource.h`, `core/modules/l2_forward.{h,cc}`, `protobuf/module_msg.proto`.

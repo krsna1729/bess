@@ -1,0 +1,69 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# L2Forward: destination MACs 00:00:00:00:00:01..04 to gates 1..4, each gate
+# to its own Sink. RandomUpdate writes the last four bytes of the destination
+# MAC (1..4), so traffic spreads over the four entries.
+#
+# Converted from l2forward.bess (D-104, D-114). The script's 1000-entry table
+# ($BESS_ENTRIES) was a benchmark, measured now by tools/live_perf.py
+# (M.l2forward); its ExactMatch variant ($BESS_EXACTMATCH) is exactmatch.yaml.
+# The Rewrite template is the packet it built with scapy.
+modules:
+  - name: fib
+    mclass: L2Forward
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - AAAAAAABAgAAAAABkAA=
+  - name: update0
+    mclass: RandomUpdate
+    arg:
+      fields:
+        - {offset: 2, size: 4, min: 1, max: 4}
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: sink3
+    mclass: Sink
+  - name: sink4
+    mclass: Sink
+  - name: source0
+    mclass: Source
+connections:
+  - upstream: source0
+    downstream: rewrite0
+  - upstream: rewrite0
+    downstream: update0
+  - upstream: update0
+    downstream: fib
+  - upstream: fib
+    ogate: 1
+    downstream: sink1
+  - upstream: fib
+    ogate: 2
+    downstream: sink2
+  - upstream: fib
+    ogate: 3
+    downstream: sink3
+  - upstream: fib
+    ogate: 4
+    downstream: sink4
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: source0
+    wid: 0
+resources:
+  fib/macs:
+    - key: {addr: "00:00:00:00:00:01"}
+      value: {gate: 1}
+    - key: {addr: "00:00:00:00:00:02"}
+      value: {gate: 2}
+    - key: {addr: "00:00:00:00:00:03"}
+      value: {gate: 3}
+    - key: {addr: "00:00:00:00:00:04"}
+      value: {gate: 4}

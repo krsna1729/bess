@@ -1,0 +1,37 @@
+# Copyright (c) 2017, Cloudigo.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# ArpResponder: answers ARP requests for 1.2.3.4 with A0:22:33:44:55:66.
+# Source sends one request ("who has 1.2.3.4", from 02:1e:67:9f:4d:ae /
+# 10.0.0.1); the module turns it into the reply and sends it to the Sink.
+#
+# Converted from arp.bess (D-104): the entry is the init argument (Init adds
+# it, as the `add` command does). The script's scapy packet took its ARP
+# sender address from the host's interface; here the sender is fixed.
+modules:
+  - name: arp
+    mclass: ArpResponder
+    arg:
+      ip: 1.2.3.4
+      mac_addr: A0:22:33:44:55:66
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - ////////Ah5nn02uCAYAAQgABgQAAQIeZ59NrgoAAAEAAAAAAAABAgME
+  - name: sink0
+    mclass: Sink
+  - name: source0
+    mclass: Source
+connections:
+  - upstream: source0
+    downstream: rewrite0
+  - upstream: rewrite0
+    downstream: arp
+  - upstream: arp
+    downstream: sink0
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: source0
+    wid: 0

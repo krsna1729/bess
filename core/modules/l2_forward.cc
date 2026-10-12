@@ -9,6 +9,7 @@
 
 #include "l2_forward.h"
 
+#include "dataplane/transaction_engine.h"
 #include "utils/endian.h"
 
 namespace {
@@ -68,7 +69,13 @@ CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
   int size = static_cast<int>(arg.size());
   int bucket = static_cast<int>(arg.bucket());
 
-  default_gate_.store(DROP_GATE, std::memory_order_relaxed);
+  if (arg.has_default_gate() && !bess::IsValidGateValue(arg.default_gate())) {
+    return CommandFailure(EINVAL, "invalid default_gate %llu",
+                          static_cast<unsigned long long>(arg.default_gate()));
+  }
+  default_gate_.store(
+      arg.has_default_gate() ? static_cast<gate_idx_t>(arg.default_gate()) : DROP_GATE,
+      std::memory_order_relaxed);
 
   if (size == 0) {
     size = kDefaultTableSize;
@@ -89,14 +96,60 @@ CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
   if (table_ == nullptr) {
     return CommandFailure(ENOMEM, "cannot allocate a table of %d entries", size * bucket);
   }
+
+  // The entries as a transaction resource: a MAC that misses today is placed
+  // at the default gate meanwhile, which is what a miss does here.
+  resource_ = std::make_unique<bess::l2::MacTableResource<Table>>(
+      name() + "/macs", *table_, [this] {
+        return static_cast<uint16_t>(default_gate_.load(std::memory_order_relaxed) + 1);
+      });
+  binding_ = init_context().codecs().Bind(
+      *resource_,
+      std::make_shared<bess::framework::TypedCodec<bess::pb::L2ForwardMacKey,
+                                                   bess::pb::L2ForwardMacValue>>(
+          [](const bess::pb::L2ForwardMacKey &key)
+              -> std::expected<bess::dataplane::ResourceKey, std::string> {
+            char addr[6];
+            if (parse_mac_addr(key.addr().c_str(), addr) != 0) {
+              return std::unexpected("invalid MAC address '" + key.addr() + "'");
+            }
+            return bess::l2::MacTableResource<Table>::Key(MacKey(addr));
+          },
+          [](const bess::pb::L2ForwardMacValue &value)
+              -> std::expected<std::any, std::string> {
+            if (!bess::IsValidGateValue(value.gate())) {
+              return std::unexpected("invalid gate " + std::to_string(value.gate()));
+            }
+            return std::any(static_cast<uint16_t>(value.gate() + 1));
+          }));
+  if (auto registered = init_context().resources().Register(resource_.get());
+      !registered) {
+    binding_.Reset();
+    resource_.reset();
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
   return CommandSuccess();
 }
 
 void L2Forward::DeInit() {
+  if (resource_ != nullptr) {
+    // Cannot be refused: the entries reference nothing and nothing references
+    // them, and this runs under the control-plane lock transactions take.
+    auto unregistered = init_context().resources().Unregister(resource_->name());
+    CHECK(unregistered) << unregistered.error();
+    binding_.Reset();
+    resource_.reset();
+  }
   table_.reset();
 }
 
 void L2Forward::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
+  ClassifyBatch(batch, gates);
+  EmitBatch(ctx, batch, gates);
+}
+
+void L2Forward::ClassifyBatch(const bess::PacketBatch *batch, gate_idx_t *gates) const {
   const gate_idx_t default_gate =
       default_gate_.load(std::memory_order_relaxed);
 
@@ -113,11 +166,9 @@ void L2Forward::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
   const uint64_t hits =
       table_->LookupBatch(std::span<const uint64_t>(keys, static_cast<size_t>(cnt)), values);
-  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
   for (int i = 0; i < cnt; i++) {
     gates[i] = (hits >> i) & 1 ? static_cast<gate_idx_t>(values[i] - 1) : default_gate;
   }
-  EmitBatch(ctx, batch, gates);
 }
 
 namespace {

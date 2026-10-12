@@ -10,6 +10,8 @@
 #include <memory>
 
 #include "dataplane/table_policy.h"
+#include "framework/resource_bindings.h"
+#include "l2/mac_table_resource.h"
 #include "l2/packed_mac_table.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
@@ -33,6 +35,8 @@ class L2Forward final : public Module {
   void DeInit() override;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
+  // ProcessBatch's decision: gates[i], the output gate of packet i.
+  void ClassifyBatch(const bess::PacketBatch *batch, gate_idx_t *gates) const;
 
   CommandResponse CommandAdd(const bess::pb::L2ForwardCommandAddArg &arg);
   CommandResponse CommandDelete(const bess::pb::L2ForwardCommandDeleteArg &arg);
@@ -50,6 +54,9 @@ class L2Forward final : public Module {
   struct NoCold {};
   using Table = bess::l2::PackedMacTable<NoCold, bess::dataplane::SingleWriter>;
   std::unique_ptr<Table> table_;
+  // "<name>/macs" (D-114): the same table, transactionally.
+  std::unique_ptr<bess::l2::MacTableResource<Table>> resource_;
+  bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
   // Set by commands while workers read it: an atomic field, relaxed on both
   // sides (the gate is independent of the table).
   std::atomic<gate_idx_t> default_gate_;

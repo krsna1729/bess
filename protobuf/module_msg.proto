@@ -356,7 +356,7 @@ message UpdateCommandClearArg {
 /**
  * The module WildcardMatch has a command `add(...)` which inserts a new rule
  * into the WildcardMatch module. For an example of code using WilcardMatch see
- * `bess/bessctl/conf/samples/wildcardmatch.bess`.
+ * `bessctl/conf/samples/wildcardmatch.yaml`.
  */
 /**
  * Transactional rule keys and values (G1.2c, D-025): ExactMatch's resource
@@ -485,7 +485,7 @@ message WildcardMatchCommandSetDefaultGateArg {
 
 /**
  * The module ACL creates an access control module which by default blocks all traffic, unless it contains a rule which specifies otherwise.
- * Examples of ACL can be found in [acl.bess](https://github.com/NetSys/bess/blob/master/bessctl/conf/samples/acl.bess)
+ * Examples of ACL can be found in [`bessctl/conf/samples/acl.yaml`](./bessctl/conf/samples/acl.yaml)
  *
  * __Input Gates__: 1
  * __Output Gates__: 1
@@ -574,7 +574,7 @@ message EtherEncapArg {
  * To instantiate an ExactMatch module, you must specify which fields in the packet to match over. You can add rules using the function `ExactMatch.add(...)`
  * Fields may be stored either in the packet data or its metadata attributes.
  * An example script using the ExactMatch code is found
- * in [`bess/bessctl/conf/samples/exactmatch.bess`](https://github.com/NetSys/bess/blob/master/bessctl/conf/samples/exactmatch.bess).
+ * in [`bessctl/conf/samples/exactmatch.yaml`](./bessctl/conf/samples/exactmatch.yaml).
  *
  * __Input Gates__: 1
  * __Output Gates__: many (configurable)
@@ -642,7 +642,7 @@ message GenericDecapArg {
  *    `de ad be ef <xx> <xx> 12 34`
  * where the 2-byte `<xx> <xx>` comes from the value of metadata attribute `'foo'`
  * for each packet.
- * An example script using GenericEncap is in [`bess/bessctl/conf/samples/generic_encap.bess`](https://github.com/NetSys/bess/blob/master/bessctl/conf/samples/generic_encap.bess).
+ * An example script using GenericEncap is in [`bessctl/conf/samples/generic_encap.yaml`](./bessctl/conf/samples/generic_encap.yaml).
  *
  * __Input Gates__: 1
  * __Output Gates__: 1
@@ -711,6 +711,17 @@ message IPLookupArg {
 message L2ForwardArg {
   int64 size = 1; /// Configures the forwarding hash table -- total number of hash table entries.
   int64 bucket = 2; /// Configures the forwarding hash table -- total number of slots per hash value.
+  optional uint64 default_gate = 3; /// The gate of a packet no entry matches (default: drop); set_default_gate changes it later.
+}
+
+/// An entry of the L2Forward resource "<module>/macs" (D-114): key.
+message L2ForwardMacKey {
+  string addr = 1; /// The MAC address, e.g. "02:00:00:00:00:01"
+}
+
+/// An entry of the L2Forward resource "<module>/macs": value.
+message L2ForwardMacValue {
+  uint64 gate = 1; /// The output gate
 }
 
 /**
@@ -769,7 +780,7 @@ message MetadataTestArg {
  * and destination addresses for packets on the reverse direction.
  * L3/L4 checksums are updated correspondingly.
  * To see an example of NAT in use, see:
- * [`bess/bessctl/conf/samples/nat.bess`](https://github.com/NetSys/bess/blob/master/bessctl/conf/samples/nat.bess)
+ * [`bessctl/conf/samples/nat.yaml`](./bessctl/conf/samples/nat.yaml)
  *
  * Currently only supports TCP/UDP/ICMP.
  * Note that address/port in packet payload (e.g., FTP) are NOT translated.
@@ -850,7 +861,7 @@ message NATUsageResponse {
  * IPv4 addresses. No port number is translated.
  * L3/L4 checksums are updated correspondingly.
  * To see an example of NAT in use, see:
- * [`bess/bessctl/conf/samples/nat.bess`](https://github.com/NetSys/bess/blob/master/bessctl/conf/samples/nat.bess)
+ * [`bessctl/conf/samples/nat.yaml`](./bessctl/conf/samples/nat.yaml)
  *
  * Forward direction (from input gate 0 to output gate 0):
  *  - Source IP address is updated, from internal to external address.
@@ -1331,7 +1342,7 @@ message VXLANEncapArg {
  * pushes packets that do match out a specified gate, and those that don't out a default
  * gate. WildcardMatch is initialized with the fields it should inspect over,
  * rules are added via the `add(...)` function.
- * An example of WildcardMatch is in [`bess/bessctl/conf/samples/wildcardmatch.bess`](https://github.com/NetSys/bess/blob/master/bessctl/conf/samples/wildcardmatch.bess)
+ * An example of WildcardMatch is in [`bessctl/conf/samples/wildcardmatch.yaml`](./bessctl/conf/samples/wildcardmatch.yaml)
  *
  * __Input Gates__: 1
  * __Output Gates__: many (configurable)

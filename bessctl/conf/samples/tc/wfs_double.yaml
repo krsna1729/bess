@@ -1,0 +1,69 @@
+# Two queues under a weighted-fair traffic class (resource: count) that also
+# schedules the Source. Source -> Timestamp -> RandomSplit splits packets over
+# two Queue -> Measure -> Sink paths; the Queues' tasks and the Source's share
+# the class: the Source's share (here 170) against 100 for each Queue decides
+# whether the Queues drain as fast as the Source fills them.
+#
+# Converted from tc/wfs_double.bess (D-104). The script ran this twice, with
+# the Source's share 170 and 171, and printed m1's and m2's latency (average,
+# 90/95/99th percentile). The same comparison now: apply this file, resume for
+# a few seconds, pause, read each Measure's `get_summary` through an SDK; then
+# change the Source's share to 171 and apply again (a one-field diff), resume
+# and read again.
+modules:
+  - name: m1
+    mclass: Measure
+  - name: m2
+    mclass: Measure
+  - name: q1
+    mclass: Queue
+  - name: q2
+    mclass: Queue
+  - name: rr
+    mclass: RandomSplit
+    arg:
+      gates: [0, 1]
+      drop_rate: 0.0
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: src
+    mclass: Source
+  - name: ts
+    mclass: Timestamp
+connections:
+  - upstream: src
+    downstream: ts
+  - upstream: ts
+    downstream: rr
+  - upstream: rr
+    downstream: q1
+  - upstream: rr
+    ogate: 1
+    downstream: q2
+  - upstream: q1
+    downstream: m1
+  - upstream: q2
+    downstream: m2
+  - upstream: m1
+    downstream: sink1
+  - upstream: m2
+    downstream: sink2
+workers:
+  - {wid: 0, core: 0}
+traffic_classes:
+  - name: root
+    policy: weighted_fair
+    resource: count
+    wid: 0
+tasks:
+  - module: src
+    parent: root
+    share: "170"
+  - module: q1
+    parent: root
+    share: "100"
+  - module: q2
+    parent: root
+    share: "100"
