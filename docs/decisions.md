@@ -138,7 +138,8 @@ file is the reasoning.
 | D-115 | Module commands over control_v2 (`RunModuleCommand`); thread-unsafe commands busy while workers run | accepted |
 | D-116 | Gate counters in ListMetrics | accepted |
 | D-117 | SetMetadata runs an op list compiled at PreResume (M.metadata -8 instructions, -4.7 cycles per packet); Update's loop inversion rejected (slower) | accepted |
-| D-118 | live_perf keeps control threads off worker CPUs and counts the worker that runs the test; the floor is at parity with master, the per-hop and fan-in costs are not | accepted |
+| D-118 | live_perf keeps control threads off worker CPUs and counts the worker that runs the test; the floor is at parity with master, the per-hop cost is not | accepted |
+| D-119 | Track's per-call overhead cut (cold CurrentWorkerId failure, initial-exec current_worker, static libraries as PIE); the hop without hooks is at master's cost, the gap left is Track's | accepted |
 
 
 ---
@@ -8492,9 +8493,77 @@ the set. Per packet on the worker, master / this tree:
   `PacketFreeBulk`'s eligibility check) is not needed.
 - Each module hop costs more than master's: from 4 to 16 hops, 5.17 instructions and 1.88 cycles per hop against
   3.51 and 1.61 ((118.4 - 56.4) / 12 against (92.8 - 50.7) / 12; (36.3 - 13.7) / 12 against (32.1 - 12.8) / 12).
-- F.fanin/4 (four Sources into one Sink, one worker) is 23% slower with the same instructions: stalls, not code.
-  Earlier runs hid it by spreading the four tasks over two workers.
+- F.fanin/4 (four Sources into one Sink, one worker) was 23% slower with the same instructions in this run; it
+  did not repeat in later runs (D-119's run: develop 2.73 against master 2.62 ns, 9.7 against 9.5 cycles).
 - F.queue (Source on worker 0, the Queue's dequeue on worker 1) is 34% faster than master (its own run, 8 rounds).
 - Linked with GNU ld, this tree was within noise of mold in an earlier run of the same tests (D-113).
 
 **Code.** `tools/live_perf.py`, `docs/benchmarking.md`.
+
+## D-119 Track's per-call overhead cut; static libraries are compiled as PIE, not -fPIC
+
+**Status:** accepted.
+
+**Problem.** After D-118, F.hop/16 cost 37.8 cycles per packet against master's 31.7. A new test, F.hopnt/16 (the
+same pipeline with the default Track hook removed from every gate), splits that: the hop alone costs 28.5 against
+27.5, within layout noise over 16 hops; the gap is in Track, which runs on every output gate. Track cost about
+17.5 cycles per call per batch against master's 7.9. In the generated code:
+
+- `CurrentWorkerId()`'s inlined `CHECK` stream gave Track a stack frame, a stack-protector canary and saved
+  registers;
+- `current_worker` was read through `__tls_get_addr`: Meson's default `b_staticpic=true` (and `bess_modules`'
+  `pic: true`) compiles every static library `-fPIC`, where a thread-local defined elsewhere is reached by a call.
+  The linker rewrites the call for the executable, but each caller still saves the registers it clobbers. Bypass
+  had the same pattern for DPDK's `per_lcore__lcore_id`, hoisted onto the hop path from its cold dead-end free.
+  Master's Makefile build used the compiler's default, PIE.
+
+**Decision.**
+
+- `CurrentWorkerId()` fails through a cold, out-of-line, `noreturn` function; one unsigned compare checks both
+  bounds.
+- `current_worker` is declared `tls_model("initial-exec")`: it is defined in the executable, so it is always in
+  static TLS, also for a dlopen'd plugin.
+- `b_staticpic=false` in the project's default options, and no `pic: true` on `bess_modules`: static libraries,
+  which only executables link, are compiled as the compiler's default PIE code (GCC on Arch and Ubuntu), as
+  master's were. Shared objects (plugins, the C++ SDK library) are still `-fPIC`. Existing build directories keep
+  their old value: `meson configure <dir> -Db_staticpic=false`.
+- live_perf gains `F.hopnt/16`. F.hop/16 minus F.hopnt/16 is the cost of 17 Track calls per batch.
+- Track's seqlock stays (below).
+
+**Evidence.** One isolated run (D-118), 8 rounds, master / develop before this change / this change; cycles and
+instructions per packet on the worker:
+
+| test | master | before | after |
+|---|---|---|---|
+| F.hop/16 | 31.7 / 92.8 | 37.8 / 118.3 | 34.8 / 108.8 |
+| F.hopnt/16 | 27.5 / 78.7 | 28.5 / 89.1 | 28.5 / 87.6 |
+| F.hop/4 | 12.9 / 50.7 | 14.1 / 56.4 | 13.3 / 53.3 |
+| F.hook | 9.6 / 42.4 | 10.4 / 46.1 | 9.5 / 43.1 |
+| F.floor | 7.5 / 36.7 | 7.4 / 35.7 | 7.3 / 34.7 |
+
+Track, from F.hop/16 minus F.hopnt/16: 4.2 / 9.3 / 6.3 cycles per packet, so about 7.9 / 17.5 / 11.9 cycles per
+call per batch. ns: F.hop/16 8.51 / 10.26 / 9.53; F.hook 2.68 / 2.99 / 2.68. Release tests (189, unit, live and
+fuzz replay) pass on a fresh PIE build.
+
+**Seqlock.** Track variants on one PIE build (F.hop/16 cycles per packet; master 31.6 in that run): as is 35.2,
+without the seqlock 33.9, also with worker 0 fixed 33.7. The seqlock costs about 2.5 cycles per call per batch;
+the slot address (thread-local, multiply, vector) nothing measurable. It stays: it keeps a metrics read's
+batches, packets and bytes from one moment. Beyond it, Track's excess over master is about 1.5 cycles per call
+per batch (4.0 with it).
+
+**Layout noise.** Unchanged code linked twice can differ by several cycles on these tests: one `-fPIC` link read
+F.hopnt/16 at 33.1 in three runs, another (develop) 28.5; two PIE links of the same hop code read 28.1 and 29.7.
+Differences below about 2 cycles per packet on F.hop/16 are layout, not code; claims here rest on instruction
+counts and on effects seen in more than one link.
+
+**Rejected.** `-fno-semantic-interposition` alone: no change. Forcing `RunChooseModule` and `ProcessOGates`
+inline: 10 fewer instructions per packet on F.hop/16, no fewer cycles.
+
+**Also found.** M.base (Source -> Rewrite -> RandomUpdate -> Bypass -> Sink) runs 120 instructions per packet
+against master's 98; 19 of them are Rewrite's: since the PacketRef migration (8b61ea09) it frees a chained tail
+(master leaked it) and resets the mbuf (`rte_pktmbuf_reset`: offload flags, VLAN, packet type, port) before writing
+the template, where master set only the offset and lengths. That is a correctness change and stays; it moves the
+M baseline, not module deltas.
+
+**Code.** `core/stats/current_worker.h`, `core/worker.{h,cc}`, `meson.build`, `core/meson.build`,
+`tools/live_perf.py`, `docs/benchmarking.md`.

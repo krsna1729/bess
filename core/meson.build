@@ -397,7 +397,6 @@ bess_modules = static_library(
   include_directories: core_include,
   dependencies: module_compile_deps,
   link_with: bess_dataplane_libs + [bess_framework, bess_execution, bess_eal, bess_rcu, bess_utils],
-  pic: true,
 )
 bess_resume_hooks = static_library(
   'bess_resume_hooks',

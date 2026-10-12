@@ -148,7 +148,12 @@ class Worker {
 // NOTE: Do not use "thread_local" here. It requires a function call every time
 // it is accessed. Use __thread instead, which incurs minimal runtime overhead.
 // For this, g++ requires Worker to have a trivial constructor and destructor.
-extern __thread Worker current_worker;
+// Initial-exec: objects are built -fPIC, which makes each access a
+// __tls_get_addr call (relaxed at link time, but every caller still saves the
+// registers the call clobbers). The variable is defined in the executable, so
+// it is always in static TLS, also when a dlopen'd plugin reads it.
+extern __thread Worker current_worker
+    __attribute__((tls_model("initial-exec")));
 
 // the following traits are not supported in g++ 4.x
 #if __GNUC__ >= 5

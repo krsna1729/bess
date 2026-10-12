@@ -173,8 +173,9 @@ pinned worker, each isolating one cost, and reports ns per packet from the leaf 
 (nothing added to the packet path):
 
 - **F, framework (cross-cutting):** `F.floor` (Source -> Sink), `F.hop/N` (N Bypass hops; the slope is the cost
-  of one module hop), `F.fanout/4`, `F.fanin/4`, `F.hook` (Track hooks on every gate), `F.tc/N` (scheduler with
-  N leaves), `F.size/1500`, `F.queue` (cross-worker Queue).
+  of one module hop, including the Track hook every output gate has by default), `F.hopnt/16` (the same with
+  those hooks removed: the hop alone), `F.fanout/4`, `F.fanin/4`, `F.hook` (Track hooks on input gates too),
+  `F.tc/N` (scheduler with N leaves), `F.size/1500`, `F.queue` (cross-worker Queue).
 - **M, modules (localised):** each module after the same Source -> Rewrite -> RandomUpdate (1,024 flows) front
   end, reported as ns per packet above `M.base` (the front end with a Bypass).
 

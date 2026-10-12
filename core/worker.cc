@@ -44,7 +44,7 @@ using bess::ResumeHookBuilder;
 
 
 // See worker.h
-__thread Worker current_worker;
+__thread Worker current_worker __attribute__((tls_model("initial-exec")));
 
 int is_worker_active(int wid) {
   return bess::runtime::runtime().workers().IsActive(wid);

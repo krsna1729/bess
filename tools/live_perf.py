@@ -109,6 +109,17 @@ def f_hop(n):
     return build
 
 
+def f_hopnt(n):
+    """F.hop/N with the default Track hook removed from every gate: the hop
+    alone. F.hop minus F.hopnt is the per-gate Track cost."""
+    def build(b):
+        names = f_hop(n)(b)
+        for m in ['src'] + ['bp%d' % i for i in range(n)]:
+            b.bess.track_gate(False, '', m, direction='out')
+        return names
+    return build
+
+
 def f_hook(b):
     names = f_hop(1)(b)
     for m in ('bp0', 'sink'):
@@ -363,6 +374,7 @@ TESTS = {
     'F.hop/1': ('F', f_hop(1)),
     'F.hop/4': ('F', f_hop(4)),
     'F.hop/16': ('F', f_hop(16)),
+    'F.hopnt/16': ('F', f_hopnt(16)),
     'F.hook': ('F', f_hook),
     'F.fanout/4': ('F', f_fanout(4)),
     'F.split/2': ('F', f_split(2)),

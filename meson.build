@@ -12,6 +12,12 @@ project(
     # lookups 8-26%. debug/debugoptimized builds (the gating CI lanes, tests)
     # keep both; glog CHECK() stays on everywhere (D-061).
     'b_ndebug=if-release',
+    # Static libraries are linked into executables (bessd, tests), so they are
+    # compiled as the compiler's default position-independent executable code,
+    # not -fPIC: under -fPIC every read of an external thread-local is a
+    # __tls_get_addr call whose clobbered registers each caller saves (D-119).
+    # Shared objects (plugins, the SDK library) are still compiled -fPIC.
+    'b_staticpic=false',
   ],
 )
 if meson.project_source_root() == meson.project_build_root()

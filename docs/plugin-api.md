@@ -436,8 +436,9 @@ sizes it). `examples/static_router` runs R1's `RouterApp`
 frame; CI's install check builds it from the stage and runs it.
 
 No ABI promise: the archives are built with bessd's compiler, options and ISA
-and are linked only by a program built against the same install. The
-transaction engine's header stays internal (applying transactions is the
+and are linked only by a program built against the same install. They are
+compiled as executable (PIE) code, not `-fPIC` (D-119): a shared library or
+plugin cannot link them. The transaction engine's header stays internal (applying transactions is the
 control plane's, D-074): `bess_dataplane_core` is installed because the router
 needs it (its resources), not as an engine a program can drive. Other
 libraries (classifier, flow, meter, stats) are not installed as archives yet.
