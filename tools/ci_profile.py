@@ -95,9 +95,10 @@ LANES = [
     # Sanitizers (M22, D-072): ASan+UBSan over the unit, architecture, plugin
     # and fuzz-corpus suites; TSan over the concurrency tests in
     # tools/sanitizers/tsan_tests.txt. Experimental until green, then gating:
-    # TSan gates (user decision, 2026-10-05; a required check on develop).
+    # TSan gates (user decision, 2026-10-05; a required check on develop);
+    # ASan since its first fully green run (5c409d37).
     {'name': 'clang-asan', 'os': 'ubuntu-24.04', 'cc': 'clang-19', 'cxx': 'clang++-19',
-     'lane_args': '--sanitize address', 'experimental': True},
+     'lane_args': '--sanitize address'},
     {'name': 'clang-tsan', 'os': 'ubuntu-24.04', 'cc': 'clang-19', 'cxx': 'clang++-19',
      'lane_args': '--sanitize thread'},
     # Release semantics: the tests and benchmarks built as a release ships

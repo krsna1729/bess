@@ -68,12 +68,13 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   `-O3`. It is not packaging (the `release` step builds the artifacts, without
   tests). Push-only and experimental until it has been green.
 - **Which lanes gate.** `gcc`, `clang`, `clang-tsan` (TSan over
-  `tools/sanitizers/tsan_tests.txt`), `gcc-arm64` and `clang-arm64` (green
-  since d040ec6d), with `Protobuf compatibility`, are the required checks on
-  `develop` (user decision, 2026-10-05, D-093). The arm64 lanes run on pushes
-  only, so a pull request cannot wait on them: a pushed break is fixed forward.
-  `clang-asan` becomes required after its first fully green run; the
-  ubuntu-26.04 lanes stay experimental (a future distribution).
+  `tools/sanitizers/tsan_tests.txt`), `clang-asan` (ASan and UBSan, and
+  clang-tidy; required since its first fully green run, 5c409d37),
+  `gcc-arm64` and `clang-arm64` (green since d040ec6d), with `Protobuf
+  compatibility`, are the required checks on `develop` (user decision,
+  2026-10-05, D-093). The arm64 lanes run on pushes only, so a pull request
+  cannot wait on them: a pushed break is fixed forward. The ubuntu-26.04
+  lanes stay experimental (a future distribution).
 - **Which lanes run when.** The lane table is `LANES` in `tools/ci_profile.py`;
   the workflow's `Lanes` job turns it into the matrix
   (`ci_profile.py lanes --event <event>`). Pull requests run the gating pair
@@ -90,8 +91,7 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   nothing; their setup was 80% of a gating lane's test time). clang-tidy
   checks only the changed C++ sources, or every source when a header, a
   `meson.build` or the tidy configuration changes; pushes and the nightly run
-  check all. Tidy runs in the clang-asan lane, which is experimental, so it is
-  advisory until that lane gates. A nightly scheduled run (03:17 UTC) runs
+  check all. Tidy runs in the clang-asan lane, so it gates. A nightly scheduled run (03:17 UTC) runs
   every lane and the benchmarks on `develop` (named explicitly: a schedule
   runs on the default branch, `master`).
 - **Compiler cache.** CI restores a ccache per lane (the newest; pull requests
