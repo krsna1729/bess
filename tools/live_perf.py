@@ -244,6 +244,21 @@ def m_wildcardmatch(b):
     return m_base(b, [('wm', 2)])
 
 
+def m_wildcardmatch16(b):
+    """16 masks in use (max_tuples 16), priorities rising in insertion order: every mask is looked up (worst case)."""
+    b.mod('WildcardMatch', 'wm', {'fields': [{'offset': 26, 'num_bytes': 4},
+                                             {'offset': 30, 'num_bytes': 4}],
+                                  'max_tuples': 16})
+    b.cmd('wm', 'set_default_gate', 'WildcardMatchCommandSetDefaultGateArg', {'gate': 0})
+    for i in range(16):
+        mask = (0xffffffff << (32 - (8 + i))) & 0xffffffff  # /8 .. /23
+        b.cmd('wm', 'add', 'WildcardMatchCommandAddArg',
+              {'gate': 1, 'priority': i,
+               'values': [{'value_int': 0x0a000000 & mask}, {'value_int': 0x0b000000}],
+               'masks': [{'value_int': mask}, {'value_int': 0xff000000}]})
+    return m_base(b, [('wm', 2)])
+
+
 def m_iplookup(b):
     b.mod('IPLookup', 'ipl', {})
     for i in range(256):
@@ -328,6 +343,7 @@ TESTS = {
     'M.exactmatch/miss': ('M', m_exactmatch_miss),
     'M.split/2': ('M', m_split),
     'M.wildcardmatch': ('M', m_wildcardmatch),
+    'M.wildcardmatch/16': ('M', m_wildcardmatch16),
     'M.iplookup': ('M', m_iplookup),
     'M.l2forward': ('M', m_l2forward),
     'M.acl': ('M', m_acl),

@@ -128,6 +128,11 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
   if (static_cast<size_t>(arg.fields_size()) > kMaxFields) {
     return CommandFailure(EINVAL, "too many fields (max %zu)", kMaxFields);
   }
+  if (arg.max_tuples() > kMaxTuplesLimit) {
+    return CommandFailure(EINVAL, "max_tuples must be 1-%zu (0: %zu)",
+                          kMaxTuplesLimit, kDefaultMaxTuples);
+  }
+  max_tuples_ = arg.max_tuples() == 0 ? kDefaultMaxTuples : arg.max_tuples();
 
   field_specs_.clear();
   for (int i = 0; i < arg.fields_size(); i++) {
@@ -331,7 +336,7 @@ WildcardMatch::NewTable() const {
     key_size += static_cast<size_t>(spec.size);
   }
   auto table = bess::classifier::ConcurrentMaskedTable::Create(
-      static_cast<uint32_t>(key_size), kMaxTuples,
+      static_cast<uint32_t>(key_size), max_tuples_,
       init_context().rcu());
   if (!table) {
     return std::unexpected(std::make_pair(EINVAL, table.error()));
@@ -361,7 +366,7 @@ Error WildcardMatch::InsertRule(bess::classifier::ConcurrentMaskedTable &table,
       // callers (UPF's pfcpiface) tell a full mask table by errno 28.
       return std::make_pair(
           ENOSPC, bess::utils::Format("too many distinct masks (%zu, max %zu)",
-                                      table.tuple_count() + 1, kMaxTuples));
+                                      table.tuple_count() + 1, max_tuples_));
     case R::kNotCanonical:
       return std::make_pair(EINVAL, "invalid pair of value and mask");
     case R::kReservedResult:  // gates never reach it
@@ -645,6 +650,9 @@ CommandResponse WildcardMatch::GetInitialArg(const bess::pb::EmptyArg &) {
       f->set_attr_name(spec.attr_name);
     }
     f->set_num_bytes(spec.size);
+  }
+  if (max_tuples_ != kDefaultMaxTuples) {
+    resp.set_max_tuples(static_cast<uint32_t>(max_tuples_));
   }
   return CommandSuccess(resp);
 }

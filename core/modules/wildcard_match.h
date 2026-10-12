@@ -53,7 +53,8 @@ class WildcardMatch final : public Module {
   static constexpr size_t kMaxFields = 8;
   static constexpr size_t kMaxFieldSize = 8;
   static constexpr size_t kMaxKeyBytes = kMaxFields * kMaxFieldSize;
-  static constexpr size_t kMaxTuples = 8;
+  static constexpr size_t kDefaultMaxTuples = 8;  // master's MAX_TUPLES
+  static constexpr size_t kMaxTuplesLimit = 1024;  // max_tuples' upper bound
 
   WildcardMatch() : Module(), published_(init_context().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
@@ -204,6 +205,9 @@ class WildcardMatch final : public Module {
 
   // Field configuration, fixed at Init() time.
   std::vector<FieldSpec> field_specs_;
+  // Distinct masks the table admits (Init's max_tuples); the writer checks
+  // it, the packet path never reads it.
+  size_t max_tuples_ = kDefaultMaxTuples;
 
   // The live rule table (also held by the published generation).
   std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table_;

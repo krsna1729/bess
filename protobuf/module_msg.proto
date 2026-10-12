@@ -1325,6 +1325,10 @@ message VXLANEncapArg {
  */
 message WildcardMatchArg {
   repeated Field fields = 1; /// A list of WildcardMatch fields.
+  /// Distinct masks in use at once (1-1024; 0 or unset: 8, master's limit).
+  /// Each mask in use is one hash lookup per batch; the limit itself costs
+  /// nothing on the packet path. A new mask beyond it is refused with ENOSPC.
+  uint32 max_tuples = 2;
 }
 
 /**

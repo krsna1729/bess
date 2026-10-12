@@ -167,6 +167,30 @@ TEST_F(WildcardMatchTest, TupleCeilingCountsActiveMasksAndClearRestoresIt) {
   EXPECT_NE(0, Run(m, "add", Pack(Rule(0, 0x1111, 9, kGateB))).error().code());
 }
 
+TEST_F(WildcardMatchTest, MaxTuplesSetsTheCeilingAndRoundTrips) {
+  WildcardMatchArg arg = TwoByteField();
+  arg.set_max_tuples(WildcardMatch::kMaxTuplesLimit + 1);
+  EXPECT_EQ(nullptr, Create(arg)) << "beyond the upper bound";
+
+  arg.set_max_tuples(12);
+  WildcardMatch *m = Create(arg);
+  ASSERT_NE(nullptr, m);
+  for (int i = 0; i < 12; i++) {
+    const uint64_t mask = 0xff00u | static_cast<uint64_t>(i);
+    ASSERT_EQ(0, Run(m, "add", Pack(Rule(0, mask, i, kGateA))).error().code())
+        << i;
+  }
+  EXPECT_EQ(ENOSPC,
+            Run(m, "add", Pack(Rule(0, 0xabcd, 13, kGateA))).error().code());
+
+  bess::pb::EmptyArg empty;
+  CommandResponse resp = Run(m, "get_initial_arg", Pack(empty));
+  ASSERT_EQ(0, resp.error().code());
+  WildcardMatchArg out;
+  ASSERT_TRUE(resp.data().UnpackTo(&out));
+  EXPECT_EQ(12u, out.max_tuples());
+}
+
 TEST_F(WildcardMatchTest, DeleteExistingAndMissing) {
   WildcardMatch *m = Create(TwoByteField());
   ASSERT_NE(nullptr, m);

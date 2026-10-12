@@ -3169,8 +3169,10 @@ rather than one call site).
       use it. This is pinned by a module test (priority 100 then priority 1 on
       the same `(mask, value)` leaves priority 1) and by the pre-existing Python
       `test_wildcardmatch`.
-    - **Limits**: `kMaxFields = 8`, `kMaxFieldSize = 8`, `kMaxTuples = 8` are
-      module constants. Zero fields and more than eight fields fail `Init()`
+    - **Limits**: `kMaxFields = 8` and `kMaxFieldSize = 8` are module
+      constants; the tuple ceiling is `WildcardMatchArg.max_tuples` (1-1024,
+      default 8 as in master; ENOSPC beyond it), checked only by the writer.
+      Zero fields and more than eight fields fail `Init()`
       (the legacy code had no `MAX_FIELDS` check at all). The tuple ceiling is
       enforced on the *active distinct masks of the candidate generation*, after
       canonicalization, so a rejected candidate leaves the published one
