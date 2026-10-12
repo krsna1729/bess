@@ -226,6 +226,12 @@ def m_exactmatch_miss(b):
     return m_base(b, [('em', 2)])
 
 
+def m_split(b):
+    """Bursts split across 2 gates packet by packet after the M pipeline: M.exactmatch/mixed's emit cost without the lookup."""
+    b.mod('RoundRobin', 'rr', {'gates': [0, 1], 'mode': 'packet'})
+    return m_base(b, [('rr', 2)])
+
+
 def m_wildcardmatch(b):
     b.mod('WildcardMatch', 'wm', {'fields': [{'offset': 26, 'num_bytes': 4},
                                              {'offset': 30, 'num_bytes': 4}]})
@@ -320,6 +326,7 @@ TESTS = {
     'M.exactmatch': ('M', m_exactmatch),
     'M.exactmatch/mixed': ('M', m_exactmatch_mixed),
     'M.exactmatch/miss': ('M', m_exactmatch_miss),
+    'M.split/2': ('M', m_split),
     'M.wildcardmatch': ('M', m_wildcardmatch),
     'M.iplookup': ('M', m_iplookup),
     'M.l2forward': ('M', m_l2forward),
