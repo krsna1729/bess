@@ -357,9 +357,10 @@ Error WildcardMatch::InsertRule(bess::classifier::ConcurrentMaskedTable &table,
       return std::make_pair(0, std::string());
     case R::kTooManyTuples:
       // The wire-compatible ceiling counts *active* masks: a mask whose last
-      // rule was deleted, or a clear, frees its tuple.
+      // rule was deleted, or a clear, frees its tuple. ENOSPC as in master:
+      // callers (UPF's pfcpiface) tell a full mask table by errno 28.
       return std::make_pair(
-          EINVAL, bess::utils::Format("too many distinct masks (%zu, max %zu)",
+          ENOSPC, bess::utils::Format("too many distinct masks (%zu, max %zu)",
                                       table.tuple_count() + 1, kMaxTuples));
     case R::kNotCanonical:
       return std::make_pair(EINVAL, "invalid pair of value and mask");

@@ -154,8 +154,8 @@ TEST_F(WildcardMatchTest, TupleCeilingCountsActiveMasksAndClearRestoresIt) {
     const uint64_t mask = 0xff00u | static_cast<uint64_t>(i);
     ASSERT_EQ(0, Run(m, "add", Pack(Rule(0, mask, i, kGateA))).error().code());
   }
-  // The ninth distinct mask is rejected.
-  EXPECT_NE(0, Run(m, "add", Pack(Rule(0, 0xabcd, 9, kGateA))).error().code());
+  // The ninth distinct mask is rejected with master's ENOSPC.
+  EXPECT_EQ(ENOSPC, Run(m, "add", Pack(Rule(0, 0xabcd, 9, kGateA))).error().code());
 
   // clear() drops the rules *and* their masks, so capacity is genuinely free.
   bess::pb::EmptyArg empty;
