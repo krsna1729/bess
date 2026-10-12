@@ -528,5 +528,51 @@ TEST_F(ApiV2ServiceTest, LegacyAddTcRangeChecksBeforeNarrowing) {
   EXPECT_TRUE(control_plane.AddTc(child).has_value());
 }
 
+// Schema discovery is what a generic client (bessctl, a manifest, a UI)
+// writes arguments from. Every class and driver names its init type, every
+// command's hand-written type name resolves to a message (a typo would leave
+// that command unusable to such a client), and the descriptor set builds on
+// its own, in its order, into an empty pool.
+TEST_F(ApiV2ServiceTest, SchemaNamesEveryArgumentTypeAndCarriesItsDescriptors) {
+  grpc::ClientContext ctx;
+  v2::GetSchemaResponse resp;
+  ASSERT_TRUE(stub_->GetSchema(&ctx, v2::GetSchemaRequest(), &resp).ok());
+  ASSERT_GT(resp.module_classes_size(), 0);
+  ASSERT_GT(resp.port_drivers_size(), 0);
+
+  google::protobuf::DescriptorPool pool;  // only what the daemon sent
+  for (const auto &file : resp.descriptors().file()) {
+    ASSERT_NE(nullptr, pool.BuildFile(file)) << file.name();
+  }
+  const v2::ModuleClassSchema *exact_match = nullptr;
+  for (const v2::ModuleClassSchema &c : resp.module_classes()) {
+    EXPECT_NE(nullptr, pool.FindMessageTypeByName(c.init_arg_type()))
+        << c.name() << " init '" << c.init_arg_type() << "'";
+    for (const v2::CommandSchema &cmd : c.commands()) {
+      EXPECT_NE(nullptr, pool.FindMessageTypeByName(cmd.arg_type()))
+          << c.name() << "." << cmd.name() << " '" << cmd.arg_type() << "'";
+    }
+    if (c.name() == "ExactMatch") {
+      exact_match = &c;
+    }
+  }
+  for (const v2::PortDriverSchema &d : resp.port_drivers()) {
+    EXPECT_NE(nullptr, pool.FindMessageTypeByName(d.init_arg_type()))
+        << d.name() << " init '" << d.init_arg_type() << "'";
+  }
+
+  ASSERT_NE(nullptr, exact_match);
+  EXPECT_EQ("bess.pb.ExactMatchArg", exact_match->init_arg_type());
+  EXPECT_EQ(1u, exact_match->igates());
+  bool add_found = false;
+  for (const v2::CommandSchema &cmd : exact_match->commands()) {
+    if (cmd.name() == "add") {
+      add_found = true;
+      EXPECT_EQ("bess.pb.ExactMatchCommandAddArg", cmd.arg_type());
+    }
+  }
+  EXPECT_TRUE(add_found);
+}
+
 }  // namespace
 

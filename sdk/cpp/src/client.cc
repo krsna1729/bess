@@ -298,6 +298,16 @@ Result<bool> Client::Supports(std::string_view rpc) {
   return false;
 }
 
+Result<pb::GetSchemaResponse> Client::Schema() {
+  auto r = Unary<pb::GetSchemaResponse>([&](Deadline d, auto *resp, Trailers *t) {
+    return transport_->GetSchema(d, pb::GetSchemaRequest(), resp, t);
+  });
+  if (r) {
+    ObserveEpoch(r->daemon_epoch());
+  }
+  return r;
+}
+
 Result<std::vector<pb::MetricSample>> Client::Metrics() {
   auto r = Unary<pb::ListMetricsResponse>([&](Deadline d, auto *resp, Trailers *t) {
     return transport_->ListMetrics(d, pb::ListMetricsRequest(), resp, t);

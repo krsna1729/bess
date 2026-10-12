@@ -53,6 +53,7 @@ class GrpcTransportImpl final : public Transport {
   BESS_SDK_GRPC_UNARY(GetTransaction)
   BESS_SDK_GRPC_UNARY(ListTransactionResources)
   BESS_SDK_GRPC_UNARY(GetCapabilities)
+  BESS_SDK_GRPC_UNARY(GetSchema)
   BESS_SDK_GRPC_UNARY(ListMetrics)
   BESS_SDK_GRPC_UNARY(GetPipeline)
   BESS_SDK_GRPC_UNARY(ValidatePipeline)

@@ -73,11 +73,13 @@ class PortBuilder {
 
   PortBuilder(std::function<Port *()> port_generator,
               const std::string &class_name, const std::string &name_template,
-              const std::string &help_text, port_init_func_t init_func)
+              const std::string &help_text, port_init_func_t init_func,
+              const std::string &init_arg_type = {})
       : port_generator_(port_generator),
         class_name_(class_name),
         name_template_(name_template),
         help_text_(help_text),
+        init_arg_type_(init_arg_type),
         init_func_(init_func),
         initialized_(false) {}
 
@@ -94,12 +96,14 @@ class PortBuilder {
   static void InitDrivers();
 
   // Should be called via ADD_DRIVER (once per driver file) to register the
-  // existence of this driver.  Always returns true;
+  // existence of this driver.  Always returns true. `init_arg_type` is Init's
+  // argument type by full name (InitArgTypeName; ADD_DRIVER passes it).
   static bool RegisterPortClass(std::function<Port *()> port_generator,
                                 const std::string &class_name,
                                 const std::string &name_template,
                                 const std::string &help_text,
-                                port_init_func_t init_func);
+                                port_init_func_t init_func,
+                                const std::string &init_arg_type = {});
 
   static const std::map<std::string, PortBuilder> &all_port_builders();
 
@@ -110,6 +114,7 @@ class PortBuilder {
   const std::string &class_name() const { return class_name_; }
   const std::string &name_template() const { return name_template_; }
   const std::string &help_text() const { return help_text_; }
+  const std::string &init_arg_type() const { return init_arg_type_; }
   bool initialized() const { return initialized_; }
 
   CommandResponse RunInit(Port *p, const google::protobuf::Any &arg) const {
@@ -132,6 +137,7 @@ class PortBuilder {
   std::string class_name_;     // The name of this Port class.
   std::string name_template_;  // The port default name prefix.
   std::string help_text_;      // Help text about this port type.
+  std::string init_arg_type_;  // Init's argument type, by full name.
 
   port_init_func_t init_func_;  // Initialization function of this Port class
 
@@ -321,6 +327,7 @@ class Port {
 #define ADD_DRIVER(_DRIVER, _NAME_TEMPLATE, _HELP)                       \
   bool __driver__##_DRIVER = PortBuilder::RegisterPortClass(             \
       std::function<Port *()>([]() { return new _DRIVER(); }), #_DRIVER, \
-      _NAME_TEMPLATE, _HELP, PORT_INIT_FUNC(&_DRIVER::Init));
+      _NAME_TEMPLATE, _HELP, PORT_INIT_FUNC(&_DRIVER::Init),             \
+      InitArgTypeName(&_DRIVER::Init));
 
 #endif  // BESS_PORT_H_

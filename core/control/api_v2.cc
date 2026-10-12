@@ -15,6 +15,7 @@
 #include <string>
 #include <type_traits>
 #include <variant>
+#include <vector>
 
 #include "control/pipeline_snapshot.h"
 #include "framework/plugin_check.h"
@@ -661,6 +662,97 @@ grpc::Status ControlV2Service::GetCapabilities(grpc::ServerContext *,
   const v2::ListTransactionResourcesResponse listed = transactions_.List();
   for (const v2::TransactionResource &r : listed.resources()) {
     *response->add_resources() = r;
+  }
+  response->set_daemon_epoch(transactions_.epoch());
+  return grpc::Status::OK;
+}
+
+namespace {
+
+using google::protobuf::Descriptor;
+using google::protobuf::DescriptorPool;
+using google::protobuf::FileDescriptor;
+
+// A command's declared argument type by full name. Commands declare a short
+// name by hand ("ExactMatchCommandAddArg"): it is the full name if it is one,
+// else the name in the package of the class's init argument, else in bess.pb
+// (the built-in modules' package). "" when none names a message.
+std::string ResolveCommandArgType(const DescriptorPool &pool, const std::string &declared,
+                                  const std::string &init_arg_type) {
+  if (declared.empty()) {
+    return {};
+  }
+  if (pool.FindMessageTypeByName(declared) != nullptr) {
+    return declared;
+  }
+  std::vector<std::string> packages;
+  if (const Descriptor *init = pool.FindMessageTypeByName(init_arg_type)) {
+    packages.emplace_back(init->file()->package());
+  }
+  packages.emplace_back("bess.pb");
+  for (const std::string &package : packages) {
+    std::string full = package + "." + declared;
+    if (pool.FindMessageTypeByName(full) != nullptr) {
+      return full;
+    }
+  }
+  return {};
+}
+
+// Adds `file` after everything it imports, once.
+void AddFileClosure(const FileDescriptor *file, std::set<std::string> &added,
+                    google::protobuf::FileDescriptorSet *out) {
+  if (!added.emplace(file->name()).second) {
+    return;
+  }
+  for (int i = 0; i < file->dependency_count(); i++) {
+    AddFileClosure(file->dependency(i), added, out);
+  }
+  google::protobuf::FileDescriptorProto *proto = out->add_file();
+  file->CopyTo(proto);
+  file->CopyJsonNameTo(proto);  // so a client's JSON names match the daemon's
+}
+
+}  // namespace
+
+grpc::Status ControlV2Service::GetSchema(grpc::ServerContext *, const v2::GetSchemaRequest *,
+                                         v2::GetSchemaResponse *response) {
+  // Plugin loads and unloads change the class registries under this lock.
+  auto lock = control_plane_.AcquireLock();
+  const DescriptorPool &pool = *DescriptorPool::generated_pool();
+  std::set<std::string> types;
+  for (const auto &[name, builder] : ModuleBuilder::all_module_builders()) {
+    v2::ModuleClassSchema *out = response->add_module_classes();
+    out->set_name(name);
+    out->set_help(builder.help_text());
+    out->set_init_arg_type(builder.init_arg_type());
+    out->set_igates(builder.NumIGates());
+    out->set_ogates(builder.NumOGates());
+    types.insert(builder.init_arg_type());
+    for (const Command &cmd : builder.cmds()) {
+      v2::CommandSchema *c = out->add_commands();
+      c->set_name(cmd.cmd);
+      c->set_arg_type(ResolveCommandArgType(pool, cmd.arg_type, builder.init_arg_type()));
+      c->set_thread_safe(cmd.mt_safe == Command::THREAD_SAFE);
+      types.insert(c->arg_type());
+    }
+  }
+  for (const auto &[name, builder] : PortBuilder::all_port_builders()) {
+    v2::PortDriverSchema *out = response->add_port_drivers();
+    out->set_name(name);
+    out->set_help(builder.help_text());
+    out->set_init_arg_type(builder.init_arg_type());
+    types.insert(builder.init_arg_type());
+  }
+  for (const v2::TransactionResource &r : transactions_.List().resources()) {
+    types.insert(r.key_type());
+    types.insert(r.value_type());
+  }
+  std::set<std::string> added;
+  for (const std::string &type : types) {
+    if (const Descriptor *d = pool.FindMessageTypeByName(type)) {
+      AddFileClosure(d->file(), added, response->mutable_descriptors());
+    }
   }
   response->set_daemon_epoch(transactions_.epoch());
   return grpc::Status::OK;

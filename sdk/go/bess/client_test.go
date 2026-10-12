@@ -129,6 +129,10 @@ func (f *fake) capabilities(context.Context) (*pb.GetCapabilitiesResponse, metad
 		DaemonEpoch: f.epochOr1()}, nil, nil
 }
 
+func (f *fake) schema(context.Context) (*pb.GetSchemaResponse, metadata.MD, error) {
+	return &pb.GetSchemaResponse{DaemonEpoch: f.epochOr1()}, nil, nil
+}
+
 func (f *fake) metrics(context.Context) (*pb.ListMetricsResponse, metadata.MD, error) {
 	return &pb.ListMetricsResponse{DaemonEpoch: f.epochOr1()}, nil, nil
 }

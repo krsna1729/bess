@@ -82,6 +82,13 @@ static inline module_init_func_t MODULE_INIT_FUNC(
   };
 }
 
+// The protobuf type `fn` (a module's or driver's Init) takes, by full name
+// ("bess.pb.ExactMatchArg"): what a client must pack into the init argument.
+template <typename T, typename C>
+inline std::string InitArgTypeName(CommandResponse (C::*)(const T &)) {
+  return std::string(T::descriptor()->full_name());
+}
+
 class Module;
 
 namespace bess {
@@ -99,23 +106,29 @@ class ModuleBuilder {
       const std::string &name_template, const std::string &help_text,
       const gate_idx_t igates, const gate_idx_t ogates, const Commands &cmds,
       std::function<CommandResponse(Module *, const google::protobuf::Any &)>
-          init_func)
+          init_func,
+      const std::string &init_arg_type = {})
       : module_generator_(module_generator),
         num_igates_(igates),
         num_ogates_(ogates),
         class_name_(class_name),
         name_template_(name_template),
         help_text_(help_text),
+        init_arg_type_(init_arg_type),
         cmds_(cmds),
         init_func_(init_func) {}
 
+  // `init_arg_type` is Init's argument type by full name (InitArgTypeName;
+  // DEF_MODULE passes it). Empty: not declared, and schema discovery
+  // (GetSchema) reports none for the class.
   static bool RegisterModuleClass(std::function<Module *()> module_generator,
                                   const std::string &class_name,
                                   const std::string &name_template,
                                   const std::string &help_text,
                                   const gate_idx_t igates,
                                   const gate_idx_t ogates, const Commands &cmds,
-                                  module_init_func_t init_func);
+                                  module_init_func_t init_func,
+                                  const std::string &init_arg_type = {});
   static bool DeregisterModuleClass(const std::string &class_name);
 
   static std::map<std::string, ModuleBuilder> &all_module_builders_holder(
@@ -132,6 +145,7 @@ class ModuleBuilder {
   const std::string &class_name() const { return class_name_; }
   const std::string &name_template() const { return name_template_; }
   const std::string &help_text() const { return help_text_; }
+  const std::string &init_arg_type() const { return init_arg_type_; }
 
   // The command descriptors, for introspection (name, argument type, thread
   // safety). Callers that want to run a command use RunCommand().
@@ -151,6 +165,7 @@ class ModuleBuilder {
   const std::string class_name_;
   const std::string name_template_;
   const std::string help_text_;
+  const std::string init_arg_type_;
   const Commands cmds_;
   const module_init_func_t init_func_;
 };
@@ -721,7 +736,8 @@ static inline void set_attr(Module *m, int attr_id, bess::PacketRef pkt, T val) 
       ModuleBuilder::RegisterModuleClass(                                \
           std::function<Module *()>([]() { return new _MOD(); }), #_MOD, \
           _NAME_TEMPLATE, _HELP, _MOD::kNumIGates, _MOD::kNumOGates,     \
-          _MOD::cmds, MODULE_INIT_FUNC(&_MOD::Init));                    \
+          _MOD::cmds, MODULE_INIT_FUNC(&_MOD::Init),                     \
+          InitArgTypeName(&_MOD::Init));                                 \
     }                                                                    \
     ~_MOD##_class() { ModuleBuilder::DeregisterModuleClass(#_MOD); }     \
   };

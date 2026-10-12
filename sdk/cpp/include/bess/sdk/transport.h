@@ -50,6 +50,7 @@ class Transport {
   BESS_SDK_UNARY(GetTransaction)
   BESS_SDK_UNARY(ListTransactionResources)
   BESS_SDK_UNARY(GetCapabilities)
+  BESS_SDK_UNARY(GetSchema)
   BESS_SDK_UNARY(ListMetrics)
   BESS_SDK_UNARY(GetPipeline)
   BESS_SDK_UNARY(ValidatePipeline)

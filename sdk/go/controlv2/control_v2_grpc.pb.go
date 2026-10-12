@@ -29,6 +29,7 @@ const (
 	Control_GetTransaction_FullMethodName           = "/bess.pb.v2.Control/GetTransaction"
 	Control_ListMetrics_FullMethodName              = "/bess.pb.v2.Control/ListMetrics"
 	Control_GetCapabilities_FullMethodName          = "/bess.pb.v2.Control/GetCapabilities"
+	Control_GetSchema_FullMethodName                = "/bess.pb.v2.Control/GetSchema"
 	Control_WatchEvents_FullMethodName              = "/bess.pb.v2.Control/WatchEvents"
 	Control_ListTransactionResources_FullMethodName = "/bess.pb.v2.Control/ListTransactionResources"
 )
@@ -46,6 +47,7 @@ type ControlClient interface {
 	GetTransaction(ctx context.Context, in *GetTransactionRequest, opts ...grpc.CallOption) (*GetTransactionResponse, error)
 	ListMetrics(ctx context.Context, in *ListMetricsRequest, opts ...grpc.CallOption) (*ListMetricsResponse, error)
 	GetCapabilities(ctx context.Context, in *GetCapabilitiesRequest, opts ...grpc.CallOption) (*GetCapabilitiesResponse, error)
+	GetSchema(ctx context.Context, in *GetSchemaRequest, opts ...grpc.CallOption) (*GetSchemaResponse, error)
 	WatchEvents(ctx context.Context, in *WatchEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error)
 	ListTransactionResources(ctx context.Context, in *ListTransactionResourcesRequest, opts ...grpc.CallOption) (*ListTransactionResourcesResponse, error)
 }
@@ -148,6 +150,16 @@ func (c *controlClient) GetCapabilities(ctx context.Context, in *GetCapabilities
 	return out, nil
 }
 
+func (c *controlClient) GetSchema(ctx context.Context, in *GetSchemaRequest, opts ...grpc.CallOption) (*GetSchemaResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSchemaResponse)
+	err := c.cc.Invoke(ctx, Control_GetSchema_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *controlClient) WatchEvents(ctx context.Context, in *WatchEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &Control_ServiceDesc.Streams[0], Control_WatchEvents_FullMethodName, cOpts...)
@@ -190,6 +202,7 @@ type ControlServer interface {
 	GetTransaction(context.Context, *GetTransactionRequest) (*GetTransactionResponse, error)
 	ListMetrics(context.Context, *ListMetricsRequest) (*ListMetricsResponse, error)
 	GetCapabilities(context.Context, *GetCapabilitiesRequest) (*GetCapabilitiesResponse, error)
+	GetSchema(context.Context, *GetSchemaRequest) (*GetSchemaResponse, error)
 	WatchEvents(*WatchEventsRequest, grpc.ServerStreamingServer[Event]) error
 	ListTransactionResources(context.Context, *ListTransactionResourcesRequest) (*ListTransactionResourcesResponse, error)
 	mustEmbedUnimplementedControlServer()
@@ -228,6 +241,9 @@ func (UnimplementedControlServer) ListMetrics(context.Context, *ListMetricsReque
 }
 func (UnimplementedControlServer) GetCapabilities(context.Context, *GetCapabilitiesRequest) (*GetCapabilitiesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetCapabilities not implemented")
+}
+func (UnimplementedControlServer) GetSchema(context.Context, *GetSchemaRequest) (*GetSchemaResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetSchema not implemented")
 }
 func (UnimplementedControlServer) WatchEvents(*WatchEventsRequest, grpc.ServerStreamingServer[Event]) error {
 	return status.Errorf(codes.Unimplemented, "method WatchEvents not implemented")
@@ -418,6 +434,24 @@ func _Control_GetCapabilities_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_GetSchema_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSchemaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).GetSchema(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_GetSchema_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).GetSchema(ctx, req.(*GetSchemaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Control_WatchEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(WatchEventsRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -489,6 +523,10 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetCapabilities",
 			Handler:    _Control_GetCapabilities_Handler,
+		},
+		{
+			MethodName: "GetSchema",
+			Handler:    _Control_GetSchema_Handler,
 		},
 		{
 			MethodName: "ListTransactionResources",

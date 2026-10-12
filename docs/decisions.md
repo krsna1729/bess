@@ -125,6 +125,7 @@ file is the reasoning.
 | D-102 | WildcardMatch `max_tuples` at init (default 8), ENOSPC when full; every fixed limit in `docs/limits.md`, checked in CI | accepted |
 | D-103 | Typed legacy boundaries: `enum class Resource`, `PacketBatch::packets()`, `CpuId` (fixes core truncation and Bypass byte charge) | accepted |
 | D-104 | Product boundary: Python leaves the runtime (manifests and Admin first, pybess last); HTTP/UI inside bessd, off or localhost by default; C++ SDK + C++ bessctl, Go SDK for external controllers | accepted |
+| D-105 | Schema discovery: `GetSchema` names every init and command argument type with a self-contained `FileDescriptorSet`; registration records `Init`'s type (source-compatible) | accepted |
 
 
 ---
@@ -7958,3 +7959,33 @@ Resource and `packets()` changes ("types") against "hardcoded": F.floor 1.92 / 1
 attract C++ users; with that SDK built anyway, bessctl on it costs little and keeps it exercised. Keeping Python as
 the runtime configuration language was rejected: it makes `.bess` a contract and the runtime depend on an interpreter.
 
+## D-105 Schema discovery: `GetSchema` and the init argument type at registration
+
+**Status:** accepted (2026-10-12).
+**Code:** `GetSchema` in `protobuf/control_v2.proto` and `core/control/api_v2.cc`; `InitArgTypeName`,
+`ModuleBuilder::init_arg_type`, `PortBuilder::init_arg_type` (`core/module.h`, `core/port.h`); `Client::Schema` in
+both SDKs.
+
+**Context.** D-104 makes the control_v2 `Pipeline` the canonical configuration and puts bessctl, manifests and a UI
+on the public SDK. Module and driver arguments are `Any`: a client without generated code for every module (and
+every plugin) cannot read or write them. The daemon did not know the types either: `MODULE_INIT_FUNC` kept `Init`'s
+parameter type only inside a lambda, and pybess guessed `<Class>Arg` by convention.
+
+**Decision.**
+- `RegisterModuleClass` and `RegisterPortClass` take a trailing `init_arg_type`, defaulted to empty. `DEF_MODULE` /
+  `ADD_MODULE` and `ADD_DRIVER` pass `InitArgTypeName(&X::Init)`, the full name of `Init`'s parameter type. A plugin
+  built with the macros needs no source change; `BESS_PLUGIN_API_VERSION` stays 1. Plugins are rebuilt per release
+  (D-041), so the changed symbol needs no ABI shim.
+- A command keeps its hand-written `arg_type`. The daemon resolves it as a full name, then in the init type's
+  package, then in `bess.pb`. A unit test requires every built-in command, class and driver to name a real message,
+  so a typo fails the build instead of leaving a command unusable to generic clients.
+- `GetSchema` returns module classes (help, init type, gates, commands with type and thread safety), port drivers,
+  and one `FileDescriptorSet`: the files of every type it names and of transaction resources' keys and values, with
+  their imports, each after what it imports, with JSON names. The same unit test builds it into an empty pool.
+- The SDKs expose it as `Client::Schema` (C++) and `Client.Schema` (Go), uncached because plugins change it. Both
+  live tests now build their messages from it instead of a `protoc` descriptor set.
+
+**Alternatives.** gRPC server reflection already serves files by symbol, but not which type a class takes; the
+mapping would still need an RPC. Keeping pybess's naming convention fails for classes whose `Init` takes `EmptyArg` or
+another package's type. Recording each command's type from its handler (as for `Init`) would change `Command`, which
+plugins build directly; resolution plus a test covers the same mistakes without that.

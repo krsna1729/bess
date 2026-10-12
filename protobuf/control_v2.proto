@@ -3,6 +3,7 @@
 syntax = "proto3";
 
 import "google/protobuf/any.proto";
+import "google/protobuf/descriptor.proto";
 
 package bess.pb.v2;
 
@@ -362,6 +363,50 @@ message GetCapabilitiesResponse {
   uint64 daemon_epoch = 9;
 }
 
+// -- Schema discovery (D-104) ---------------------------------------------
+//
+// What a generic client (bessctl, a manifest tool, a UI) needs to read and
+// write module, driver and resource arguments without generated code: each
+// module class's and port driver's init argument type, each module command's
+// argument type, and the descriptors of all of them (with transaction
+// resources' key and value types). Plugins' types are included once loaded.
+// Type names are full protobuf names ("bess.pb.ExactMatchArg"); "" where the
+// class did not declare one (a class registered without DEF_MODULE /
+// ADD_DRIVER), or where a command's declared type is not a known message.
+
+message GetSchemaRequest {}
+
+message CommandSchema {
+  string name = 1;
+  string arg_type = 2;
+  bool thread_safe = 3;  // runs without pausing workers
+}
+
+message ModuleClassSchema {
+  string name = 1;
+  string help = 2;
+  string init_arg_type = 3;
+  uint32 igates = 4;  // input gates the class accepts
+  uint32 ogates = 5;  // output gates
+  repeated CommandSchema commands = 6;
+}
+
+message PortDriverSchema {
+  string name = 1;
+  string help = 2;
+  string init_arg_type = 3;
+}
+
+message GetSchemaResponse {
+  repeated ModuleClassSchema module_classes = 1;  // sorted by name
+  repeated PortDriverSchema port_drivers = 2;     // sorted by name
+  // Every file that defines a type named above or by a transaction resource,
+  // with all their imports, each after the files it imports: building them
+  // in order into an empty pool succeeds.
+  google.protobuf.FileDescriptorSet descriptors = 3;
+  uint64 daemon_epoch = 4;
+}
+
 // -- Operational events (M25 phase 2, D-084) -----------------------------
 //
 // Pushed: control-plane observations, never per-packet logs. A stream starts
@@ -435,6 +480,7 @@ service Control {
   rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse) {}
   rpc ListMetrics(ListMetricsRequest) returns (ListMetricsResponse) {}
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse) {}
+  rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse) {}
   rpc WatchEvents(WatchEventsRequest) returns (stream Event) {}
   rpc ListTransactionResources(ListTransactionResourcesRequest)
       returns (ListTransactionResourcesResponse) {}

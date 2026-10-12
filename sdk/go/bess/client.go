@@ -198,13 +198,14 @@ func DefaultRetryPolicy() RetryPolicy {
 
 // -- transport -----------------------------------------------------------------
 
-// transport is the three RPCs, with each failed call's trailers (tests
-// replace it).
+// transport is the RPCs, with each failed call's trailers (tests replace
+// it).
 type transport interface {
 	apply(ctx context.Context, in *pb.ApplyTransactionRequest) (*pb.ApplyTransactionResponse, metadata.MD, error)
 	get(ctx context.Context, in *pb.GetTransactionRequest) (*pb.GetTransactionResponse, metadata.MD, error)
 	list(ctx context.Context) (*pb.ListTransactionResourcesResponse, metadata.MD, error)
 	capabilities(ctx context.Context) (*pb.GetCapabilitiesResponse, metadata.MD, error)
+	schema(ctx context.Context) (*pb.GetSchemaResponse, metadata.MD, error)
 	metrics(ctx context.Context) (*pb.ListMetricsResponse, metadata.MD, error)
 	watch(ctx context.Context, in *pb.WatchEventsRequest) (eventStream, error)
 	// pipeline is one desired-state RPC: in is a Get/Validate/Diff/Plan/
@@ -240,6 +241,12 @@ func (t grpcTransport) list(ctx context.Context) (*pb.ListTransactionResourcesRe
 func (t grpcTransport) capabilities(ctx context.Context) (*pb.GetCapabilitiesResponse, metadata.MD, error) {
 	var md metadata.MD
 	r, err := t.c.GetCapabilities(ctx, &pb.GetCapabilitiesRequest{}, grpc.Trailer(&md))
+	return r, md, err
+}
+
+func (t grpcTransport) schema(ctx context.Context) (*pb.GetSchemaResponse, metadata.MD, error) {
+	var md metadata.MD
+	r, err := t.c.GetSchema(ctx, &pb.GetSchemaRequest{}, grpc.Trailer(&md))
 	return r, md, err
 }
 
@@ -371,6 +378,24 @@ func (c *Client) Capabilities(ctx context.Context) (*pb.GetCapabilitiesResponse,
 	actx, cancel := context.WithTimeout(ctx, c.retry.AttemptTimeout)
 	defer cancel()
 	r, md, err := c.t.capabilities(actx)
+	if err != nil {
+		if noAnswer(err, md) {
+			return nil, &TransportError{Code: status.Code(err)}
+		}
+		return nil, translate(err, md)
+	}
+	c.observeEpoch(r.GetDaemonEpoch())
+	return r, nil
+}
+
+// Schema returns the argument types of every module class, port driver and
+// module command, with the descriptors to encode them (GetSchema): what a
+// client without generated code for them (a manifest, a UI) needs. Not
+// cached: plugins change it.
+func (c *Client) Schema(ctx context.Context) (*pb.GetSchemaResponse, error) {
+	actx, cancel := context.WithTimeout(ctx, c.retry.AttemptTimeout)
+	defer cancel()
+	r, md, err := c.t.schema(actx)
 	if err != nil {
 		if noAnswer(err, md) {
 			return nil, &TransportError{Code: status.Code(err)}

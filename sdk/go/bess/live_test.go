@@ -8,8 +8,8 @@ package bess
 // writes testdata/live.json): discovery, a typed commit, a replay under the
 // same request id, a conflict, a client-side type refusal, and a pipeline
 // planned, applied and refused at a stale generation. The module's
-// messages are built at run time from a descriptor set (dynamicpb), as a
-// client in a language without generated types would.
+// messages are built at run time from the daemon's own schema (GetSchema,
+// dynamicpb), as a client without generated types would.
 
 import (
 	"context"
@@ -21,16 +21,14 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 type liveConfig struct {
-	Address     string `json:"address"`
-	Resource    string `json:"resource"`
-	Descriptors []byte `json:"descriptors"` // a FileDescriptorSet
-	Key         []byte `json:"key"`         // serialized key message
-	Value       []byte `json:"value"`       // serialized value message
+	Address  string `json:"address"`
+	Resource string `json:"resource"`
+	Key      []byte `json:"key"`   // serialized key message
+	Value    []byte `json:"value"` // serialized value message
 }
 
 func message(t *testing.T, files protoreflectFiles, name string, data []byte) proto.Message {
@@ -63,21 +61,29 @@ func TestLive(t *testing.T) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		t.Fatal(err)
 	}
-	set := &descriptorpb.FileDescriptorSet{}
-	if err := proto.Unmarshal(cfg.Descriptors, set); err != nil {
-		t.Fatal(err)
-	}
-	files, err := protodesc.NewFiles(set)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	ctx := context.Background()
 	client, err := Dial(cfg.Address)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
+	schema, err := client.Schema(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := protodesc.NewFiles(schema.GetDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	initType := ""
+	for _, c := range schema.GetModuleClasses() {
+		if c.GetName() == "ExactMatch" {
+			initType = c.GetInitArgType()
+		}
+	}
+	if _, err := files.FindDescriptorByName(protoreflect.FullName(initType)); err != nil {
+		t.Fatalf("ExactMatch init type %q: %v", initType, err)
+	}
 	r, err := client.Resource(ctx, cfg.Resource)
 	if err != nil {
 		t.Fatal(err)

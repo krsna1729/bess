@@ -88,6 +88,20 @@ so a second application is a conflict. An answer is told from a loss by the
 server's `ErrorDetail` (a resource failure is UNAVAILABLE with a detail: an
 answer).
 
+## Schema discovery
+
+`GetSchema` (C++ `client->Schema()`, Go `client.Schema(ctx)`) names the
+argument type of every module class's init, every port driver's init and every
+module command, by full protobuf name, and carries a `FileDescriptorSet` with
+those types and transaction resources' key and value types, each file after
+its imports. A client without generated code for a type (bessctl, a manifest,
+a UI) builds a `DescriptorPool` from it and reads or writes the type as JSON
+or as a `DynamicMessage`. Loaded plugins' types are included. A class
+registered with `DEF_MODULE`/`ADD_MODULE` or `ADD_DRIVER` declares its init
+type from `Init`'s parameter; a command's hand-written `arg_type` resolves in
+the init type's package, then `bess.pb` (`""` if neither names a message; a
+unit test holds every built-in command to a real type).
+
 ## What they guarantee
 
 | Situation | What the SDK does |

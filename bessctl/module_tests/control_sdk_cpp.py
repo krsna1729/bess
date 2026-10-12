@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # The C++ control SDK (sdk/cpp, G1.6) against a live daemon: this test creates
-# an ExactMatch, hands the C++ live test its resource, key and value (and the
-# descriptors to build them), runs it, and then checks that the rule the C++
-# client committed steers packets. The same steps as control_sdk_go.py.
+# an ExactMatch, hands the C++ live test its resource, key and value (it
+# builds their types from the daemon's GetSchema), runs it, and then checks
+# that the rule the C++ client committed steers packets. The same steps as
+# control_sdk_go.py.
 #
 # The binary is $BESS_SDK_CPP_LIVE_TEST (meson sets it), else the default
 # build directory's. A build without tests (-Dbuild_tests=false) has none: the
@@ -41,18 +42,14 @@ class BessControlSdkCppTest(BessModuleTestCase):
         key.fields.add(value_bin=socket.inet_aton('12.34.56.78'))
         value = module_msg.ExactMatchRuleValue(gate=1)
         with tempfile.TemporaryDirectory() as tmp:
-            descriptors = os.path.join(tmp, 'set.pb')
-            subprocess.check_call(['protoc', '-I', os.path.join(ROOT, 'protobuf'),
-                                   '--include_imports', '--descriptor_set_out=' + descriptors,
-                                   'module_msg.proto'])
             key_file = os.path.join(tmp, 'key')
             value_file = os.path.join(tmp, 'value')
             with open(key_file, 'wb') as f:
                 f.write(key.SerializeToString())
             with open(value_file, 'wb') as f:
                 f.write(value.SerializeToString())
-            run = subprocess.run([binary, self.bess.peer, em.name + '/rules', descriptors,
-                                  key_file, value_file],
+            run = subprocess.run([binary, self.bess.peer, em.name + '/rules', key_file,
+                                  value_file],
                                  capture_output=True, text=True, timeout=120)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 

@@ -209,6 +209,11 @@ class Client {
   // Whether the daemon serves `rpc` ("ApplyTransaction" or a full name). A
   // daemon too old to answer GetCapabilities serves none of the newer RPCs.
   Result<bool> Supports(std::string_view rpc);
+  // The argument types of every module class, port driver and module command,
+  // with the descriptors to encode them (GetSchema): what a client without
+  // generated code for them (a manifest, a UI) needs. Not cached: plugins
+  // change it.
+  Result<pb::GetSchemaResponse> Schema();
   // Every metric sample.
   Result<std::vector<pb::MetricSample>> Metrics();
 

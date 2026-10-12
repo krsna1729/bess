@@ -4,11 +4,11 @@
 // starts it and passes the arguments): discovery, a typed commit and its
 // event, a replay under the same request id, a conflict, a client-side type
 // refusal, and a pipeline planned, applied and refused at a stale generation.
-// The module's messages are built at run time from a descriptor set
-// (DynamicMessageFactory), as a client without generated types would. The
-// same steps as sdk/go/bess/live_test.go.
+// The module's messages are built at run time from the daemon's own schema
+// (GetSchema, DynamicMessageFactory), as a client without generated types
+// would. The same steps as sdk/go/bess/live_test.go.
 //
-//   sdk_cpp_live_test <address> <resource> <descriptor-set> <key> <value>
+//   sdk_cpp_live_test <address> <resource> <key> <value>
 //
 // <key> and <value> are files holding the serialized messages. Exit 0: pass.
 
@@ -55,16 +55,24 @@ std::string ReadFile(const char *path) {
 }  // namespace
 
 int main(int argc, char **argv) {
-  CHECK_THAT(argc == 6, "usage: %s address resource descriptors key value", argv[0]);
-  gp::FileDescriptorSet set;
-  CHECK_THAT(set.ParseFromString(ReadFile(argv[3])), "bad descriptor set");
+  CHECK_THAT(argc == 5, "usage: %s address resource key value", argv[0]);
+  auto client = bess::sdk::Client::Dial(argv[1]);
+  auto schema = client->Schema();
+  CHECK_THAT(schema, "schema: %s", schema.error().message.c_str());
   gp::DescriptorPool pool;
-  for (const auto &file : set.file()) {
+  for (const auto &file : schema->descriptors().file()) {
     CHECK_THAT(pool.BuildFile(file) != nullptr, "cannot build %s", file.name().c_str());
   }
   gp::DynamicMessageFactory factory(&pool);
+  std::string init_type;
+  for (const auto &c : schema->module_classes()) {
+    if (c.name() == "ExactMatch") {
+      init_type = c.init_arg_type();
+    }
+  }
+  CHECK_THAT(pool.FindMessageTypeByName(init_type) != nullptr, "ExactMatch init type '%s'",
+             init_type.c_str());
 
-  auto client = bess::sdk::Client::Dial(argv[1]);
   auto r = client->Resource(argv[2]);
   CHECK_THAT(r, "resource: %s", r.error().message.c_str());
 
@@ -84,8 +92,8 @@ int main(int argc, char **argv) {
     std::unique_ptr<gp::Message> m(factory.GetPrototype(d)->New());
     return m->ParseFromString(ReadFile(file)) ? std::move(m) : nullptr;
   };
-  auto key = make(r->key_type, argv[4]);
-  auto value = make(r->value_type, argv[5]);
+  auto key = make(r->key_type, argv[3]);
+  auto value = make(r->value_type, argv[4]);
   CHECK_THAT(key && value, "key %s / value %s", r->key_type.c_str(), r->value_type.c_str());
 
   // The event stream is open before the transaction.

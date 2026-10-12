@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # The Go control SDK (sdk/go, M27) against a live daemon: this test creates
-# an ExactMatch, hands the Go test its resource, key and value (and the
-# descriptors to build them), runs `go test -tags live`, and then checks that
-# the rule the Go client committed steers packets.
+# an ExactMatch, hands the Go test its resource, key and value (the Go test
+# builds their types from the daemon's GetSchema), runs `go test -tags live`,
+# and then checks that the rule the Go client committed steers packets.
 #
 # The Go command is `go`, or $BESS_GO (for example a container:
 #   BESS_GO="sudo docker run --rm --network host -v $PWD:/src -w /src/sdk/go golang:1.25 go").
@@ -16,7 +16,6 @@ import shlex
 import shutil
 import socket
 import subprocess
-import tempfile
 from test_utils import *
 from builtin_pb import module_msg_pb2 as module_msg
 from pybess import sdk
@@ -32,15 +31,6 @@ def go_command():
     if shutil.which('go') and subprocess.run(['go', 'version'], capture_output=True).returncode == 0:
         return ['go']
     return None
-
-
-def descriptor_set():
-    with tempfile.TemporaryDirectory() as tmp:
-        out = os.path.join(tmp, 'set.pb')
-        subprocess.check_call(['protoc', '-I', os.path.join(ROOT, 'protobuf'), '--include_imports',
-                               '--descriptor_set_out=' + out, 'module_msg.proto'])
-        with open(out, 'rb') as f:
-            return f.read()
 
 
 class BessControlSdkGoTest(BessModuleTestCase):
@@ -61,7 +51,6 @@ class BessControlSdkGoTest(BessModuleTestCase):
         config = {
             'address': self.bess.peer,
             'resource': em.name + '/rules',
-            'descriptors': base64.b64encode(descriptor_set()).decode(),
             'key': base64.b64encode(key.SerializeToString()).decode(),
             'value': base64.b64encode(value.SerializeToString()).decode(),
         }
