@@ -3,6 +3,7 @@
 live_test_sources = [
   'bessctl_test.cc',
   'metrics_test.cc',
+  'module_traffic_test.cc',
 ]
 
 live_lib = static_library(
@@ -11,6 +12,8 @@ live_lib = static_library(
   implicit_include_directories: false,
   dependencies: [bess_sdk_dep, gtest_dep],
 )
+# packet_builder.h (header-only, std only) for test packets.
+live_inc = include_directories('../../core/testing')
 live_env = {
   'BESSD': bessd.full_path(),
   'BESSCTL': bessctl_exe.full_path(),
@@ -25,6 +28,7 @@ foreach source : live_test_sources
     name,
     source,
     implicit_include_directories: false,
+    include_directories: live_inc,
     link_with: live_lib,
     dependencies: [bess_sdk_dep, gtest_dep, dependency('gtest_main', method: 'pkg-config')],
   )

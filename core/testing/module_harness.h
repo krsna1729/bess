@@ -57,6 +57,15 @@ class ModuleHarness {
                                                const std::vector<Bytes> &in,
                                                std::vector<gate_idx_t> ogates = {});
 
+  // Runs `in` into `first`'s input gate `igate` through the modules the test
+  // connected (ModuleGraph::ConnectModules) and returns what reached each of
+  // `last`'s `ogates` (by default 0-15 as far as `last` has them). Metadata
+  // offsets are computed for the graph first, as a resume does, so attributes
+  // flow from writer to reader.
+  std::map<gate_idx_t, std::vector<Bytes>> RunPipeline(Module *first, gate_idx_t igate,
+                                                       const std::vector<Bytes> &in, Module *last,
+                                                       std::vector<gate_idx_t> ogates = {});
+
   // A command, as RunModuleCommand runs it.
   CommandResponse Command(Module *m, const std::string &command,
                           const google::protobuf::Message &arg);

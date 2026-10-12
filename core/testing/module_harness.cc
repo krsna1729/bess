@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "metadata.h"
 #include "module.h"
 #include "module_graph.h"
 #include "runtime/opts.h"
@@ -173,35 +174,46 @@ std::string ModuleHarness::CreateError(const std::string &mclass,
 std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::Run(Module *m, gate_idx_t igate,
                                                             const std::vector<Bytes> &in,
                                                             std::vector<gate_idx_t> ogates) {
+  return RunPipeline(m, igate, in, m, std::move(ogates));
+}
+
+std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::RunPipeline(
+    Module *first, gate_idx_t igate, const std::vector<Bytes> &in, Module *last,
+    std::vector<gate_idx_t> ogates) {
   std::map<gate_idx_t, std::vector<Bytes>> out;
-  if (m == nullptr || injector_ == nullptr || capture_ == nullptr) {
+  if (first == nullptr || last == nullptr || injector_ == nullptr || capture_ == nullptr) {
     ADD_FAILURE() << "no module to run";
     return out;
   }
   if (ogates.empty()) {
-    for (gate_idx_t g = 0; g < 16 && g < m->module_builder()->NumOGates(); g++) {
+    for (gate_idx_t g = 0; g < 16 && g < last->module_builder()->NumOGates(); g++) {
       ogates.push_back(g);
     }
   }
   ModuleGraph::DisconnectModule(injector_, 0);
-  EXPECT_EQ(0, ModuleGraph::ConnectModules(injector_, 0, m, igate, true));
+  EXPECT_EQ(0, ModuleGraph::ConnectModules(injector_, 0, first, igate, true));
   // Only the gates asked for reach the capture, whatever an earlier Run
   // connected.
-  for (gate_idx_t g = 0; g < m->ogates().size(); g++) {
-    if (m->ogates()[g] != nullptr) {
-      ModuleGraph::DisconnectModule(m, g);
+  for (gate_idx_t g = 0; g < last->ogates().size(); g++) {
+    if (last->ogates()[g] != nullptr) {
+      ModuleGraph::DisconnectModule(last, g);
     }
   }
   for (gate_idx_t g : ogates) {
-    EXPECT_EQ(0, ModuleGraph::ConnectModules(m, g, capture_, g, true)) << "output gate " << g;
+    EXPECT_EQ(0, ModuleGraph::ConnectModules(last, g, capture_, g, true)) << "output gate " << g;
   }
   // Global gate indexes, as a resume assigns them (every connected input
   // gate, then every output gate); the task's per-gate batches are indexed
   // by them.
   ModuleGraph::UpdateTaskGraph();
+  // Metadata offsets, then each module's PreResume (modules that bake
+  // attribute offsets into their tables refresh them there), as a resume
+  // does.
+  bess::metadata::default_pipeline.ComputeMetadataOffsets();
   uint32_t gates = 0;
   for (const auto &[_, module] : ModuleGraph::GetAllModules()) {
     gates += module->igates().size() + module->ogates().size();
+    module->OnEvent(bess::Event::PreResume);
   }
 
   captured = &out;
