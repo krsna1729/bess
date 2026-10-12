@@ -57,6 +57,17 @@ class BessApiWireRangesTest(BessModuleTestCase):
         self.assertRefused(self.bess.pause_worker, 2 ** 32)
         self.assertRefused(self.bess.resume_worker, 2 ** 32)
 
+    def test_traffic_class_worker_ids_do_not_wrap(self):
+        # 2^32 + 1 narrowed to int is worker 1; 2^32 - 1 is -1, "any worker".
+        for wid in (2 ** 32 + 1, 2 ** 32 - 1):
+            self.assertRefused(self.bess.add_tc, 'wr_tc', 'round_robin', wid)
+        names = [getattr(s, 'class').name for s in self.bess.list_tcs().classes_status]
+        self.assertNotIn('wr_tc', names)
+        # ListTcs compares the filter before narrowing it.
+        with self.assertRaises(BESS.Error) as refused:
+            self.bess.list_tcs(wid=2 ** 32 + 1)
+        self.assertEqual(refused.exception.code, errno.EINVAL)
+
 
 suite = unittest.TestLoader().loadTestsFromTestCase(BessApiWireRangesTest)
 results = unittest.TextTestRunner(verbosity=2).run(suite)

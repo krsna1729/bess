@@ -183,14 +183,22 @@ static int collect_metadata(Module* m, GetModuleInfoResponse* response) {
   return 0;
 }
 
-static bess::control::TrafficClassSpec to_tc_spec(
+// The request's 64-bit wid is checked before it narrows to the spec's int: a
+// wrapped value is a valid one (2^32 + 1 arrives as worker 1, 2^32 - 1 as
+// kAnyWorker).
+static bess::control::ControlResult<bess::control::TrafficClassSpec> to_tc_spec(
     const bess::pb::TrafficClass& class_) {
+  if (!std::in_range<int>(class_.wid())) {
+    return std::unexpected(bess::control::Err(
+        EINVAL, "'wid' %lld is out of range",
+        static_cast<long long>(class_.wid())));
+  }
   bess::control::TrafficClassSpec spec;
   spec.name = class_.name();
   spec.parent = class_.parent();
   spec.policy = class_.policy();
   spec.resource = class_.resource();
-  spec.wid = class_.wid();
+  spec.wid = static_cast<int>(class_.wid());
   spec.has_priority =
       class_.arg_case() == bess::pb::TrafficClass::kPriority;
   spec.priority = class_.priority();
@@ -355,14 +363,16 @@ class BESSControlImpl final : public BESSControl::Service {
                  ListTcsResponse* response) override {
     auto lock = control_plane_.AcquireLock();
 
-    int wid_filter = request->wid();
-    if (wid_filter >= Worker::kMaxWorkers) {
+    // Compared at the request's width, then narrowed: 2^32 + 1 must not
+    // filter for worker 1.
+    const int64_t requested = request->wid();
+    if (requested >= Worker::kMaxWorkers) {
       return return_with_error(response, EINVAL,
                                "'wid' must be between 0 and %d",
                                Worker::kMaxWorkers - 1);
-    } else if (wid_filter < 0) {
-      wid_filter = Worker::kAnyWorker;
     }
+    const int wid_filter =
+        requested < 0 ? Worker::kAnyWorker : static_cast<int>(requested);
 
     for (const auto& tc_pair : TrafficClassBuilder::all_tcs()) {
       bess::TrafficClass* c = tc_pair.second.get();
@@ -428,7 +438,11 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status AddTc(ServerContext*, const AddTcRequest* request,
                EmptyResponse* response) override {
-    if (auto ret = control_plane_.AddTc(to_tc_spec(request->class_())); !ret) {
+    auto spec = to_tc_spec(request->class_());
+    if (!spec) {
+      return return_with_control_error(response, spec.error());
+    }
+    if (auto ret = control_plane_.AddTc(*spec); !ret) {
       return return_with_control_error(response, ret.error());
     }
     return Status::OK;
@@ -436,8 +450,11 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status UpdateTcParams(ServerContext*, const UpdateTcParamsRequest* request,
                         EmptyResponse* response) override {
-    if (auto ret = control_plane_.UpdateTcParams(to_tc_spec(request->class_()));
-        !ret) {
+    auto spec = to_tc_spec(request->class_());
+    if (!spec) {
+      return return_with_control_error(response, spec.error());
+    }
+    if (auto ret = control_plane_.UpdateTcParams(*spec); !ret) {
       return return_with_control_error(response, ret.error());
     }
     return Status::OK;
@@ -445,8 +462,11 @@ class BESSControlImpl final : public BESSControl::Service {
 
   Status UpdateTcParent(ServerContext*, const UpdateTcParentRequest* request,
                         EmptyResponse* response) override {
-    if (auto ret = control_plane_.UpdateTcParent(to_tc_spec(request->class_()));
-        !ret) {
+    auto spec = to_tc_spec(request->class_());
+    if (!spec) {
+      return return_with_control_error(response, spec.error());
+    }
+    if (auto ret = control_plane_.UpdateTcParent(*spec); !ret) {
       return return_with_control_error(response, ret.error());
     }
     return Status::OK;
