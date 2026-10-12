@@ -118,6 +118,7 @@ file is the reasoning.
 | D-095 | Installed static archives of route, dataplane core and RCU (`bess-dev-static`); R1 linked without bessd | accepted |
 | D-096 | Static DPDK links its constructor-registered drivers (whole-archive kept); release smoke starts bessd | accepted |
 | D-097 | The framework floor was the packet alloc and free path: four per-packet operations master did not do | accepted |
+| D-098 | WildcardMatch ranks by a packed priority and skips tuples that cannot win (19.2 ns master, 44.8 develop, 14.6 now) | accepted |
 
 
 ---
@@ -7731,5 +7732,35 @@ remains, unexplained.
 **Evidence.** `packet_test` (21; the reuse test no longer expects the two fields reset; the null-element case is a
 debug death test), `packet_tx_checksum_test` (29; new `HardwareOffloadWritesTxOffloadWhole`: `tx_offload` filled with
 ones, finalized with hardware IPv4 and UDP checksums, exact lengths and a zero segment size -- fails without the
-commit-time write). Live numbers above are the variant's; the shipped change is re-measured with the next batch.
+commit-time write). Live numbers above are the variant's.
+
+**Shipped (with D-098, same run).** master / develop before / now, ns per packet: F.floor 1.92 / 2.52 / 1.92; F.hop/1
+2.39 / 3.25 / 2.53; F.hook 2.40 / 3.28 / 2.64; F.queue 4.09 / 4.94 / 4.32; F.hop/16 8.59 / 11.05 / 10.35 (isolated CPUs
+2,4, 4 rounds, contamination flagged: IRQ or softirq activity). The per-hop residual remains (todo: bisect it).
+
+## D-098 WildcardMatch ranks by a packed priority and skips tuples that cannot win
+
+**Status:** accepted (2026-10-05, the user approved optimizing WildcardMatch rather than accepting the D-092 cost).
+**Code:** `core/classifier/concurrent_masked.h`, `core/classifier/concurrent_masked.cc`,
+`core/classifier/concurrent_masked_test.cc`.
+
+**Context.** D-092 located the WildcardMatch cost at mode C (`fb2a42b6`, D-014): every tuple was probed, and a packet
+with two matches loaded both rule records to rank them. Live: master 19.18 ns above M.base, develop 44.82.
+
+**Decision.**
+- A table value packs the rule's priority in bits 48-63, biased by 2^15, when it is in [-32767, 32767]; otherwise 0,
+  and ranking falls back to the record. Two matches with different packed priorities rank without a record load;
+  equal priorities still use the record (the later command wins).
+- Each tuple keeps a ceiling: the highest priority any of its rules has had. The writer raises it before the rule
+  becomes visible (Upsert, Commit); it is never lowered while the tuple lives, so it can only be too high (a missed
+  skip), never too low.
+- A republished tuple list is ordered by ceiling, highest first. A lookup skips a tuple once every packet of the batch
+  holds a match whose priority is strictly above the tuple's ceiling (equal is not skipped: a later command could
+  win).
+
+**Evidence.** `concurrent_masked_test` (9): `SkipsOnlyTuplesThatCannotWin`; `RandomRulesMatchABruteForceModel`
+(6 seeds, priorities inside and outside the packed range, deletes, against a brute-force model). Mutants caught: skip
+on `>=`, inverted packed comparison, no ceiling raise. `modules_wildcard_match_test` (12) and
+`modules_wildcard_match_transaction_test` (7) pass. Live, same run as D-097 (isolated CPUs 2,4, 4 rounds,
+contamination flagged): M.wildcardmatch master 19.18, develop before 44.82, now 14.58 ns; below master in 4 of 4 pairs.
 

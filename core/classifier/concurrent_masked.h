@@ -3,6 +3,7 @@
 #ifndef BESS_CLASSIFIER_CONCURRENT_MASKED_H_
 #define BESS_CLASSIFIER_CONCURRENT_MASKED_H_
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -32,9 +33,17 @@ namespace bess::classifier {
 //   rule records (write-once, id-indexed): {priority, sequence, result}
 //
 // A table value packs the rule id (low 32 bits) with the rule's result (bits
-// 32-47), so a packet that exactly one tuple matches -- the common case --
-// takes its result from the table without touching the record; records are
-// loaded only to rank a second match for the same packet.
+// 32-47) and its priority (bits 48-63, biased, when it fits in [-32767,
+// 32767]; 0 otherwise), so a packet that exactly one tuple matches takes its
+// result from the table without touching the record, and a second match ranks
+// by the packed priorities; a record is loaded only for equal priorities (the
+// later command wins) or one that does not fit.
+//
+// Each tuple keeps the highest priority any of its rules has had (raised
+// before a rule becomes visible, never lowered while the tuple lives), and the
+// list is ordered by it when republished. A lookup skips a tuple once every
+// packet of the batch already holds a match of strictly higher priority: a
+// rule there cannot win (D-098).
 //
 // A lookup masks the batch once per tuple, looks it up, and keeps the best
 // rule per packet: higher priority, then the later command (sequence). Adding
@@ -168,9 +177,23 @@ class ConcurrentMaskedTable {
     std::array<std::byte, kMaxBatch * detail::kMaskedMaxKeyBytes> scratch;
     std::array<uint64_t, kMaxBatch> ids;
     std::array<uint64_t, kMaxBatch> best;  // packed table value
+    std::array<int64_t, kMaxBatch> best_priority;
     const size_t scratch_bytes = n * key_len_;
+    const uint64_t all = n == 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1;
     uint64_t matched = 0;
     for (const Tuple &tuple : list->tuples) {
+      if (matched == all) {
+        // Every packet holds a match; a rule here wins only with a priority
+        // at least as high as the lowest of them (equal: the later command).
+        const int64_t ceiling = tuple.max_priority->load(std::memory_order_acquire);
+        int64_t lowest = best_priority[0];
+        for (size_t i = 1; i < n; i++) {
+          lowest = std::min(lowest, best_priority[i]);
+        }
+        if (lowest > ceiling) {
+          continue;
+        }
+      }
       mask_batch_(keys, stride, ConstBytes(tuple.mask.data(), key_len_), n,
                   MutableBytes(scratch).first(scratch_bytes));
       const uint64_t hits = tuple.table->LookupBatch(
@@ -180,9 +203,11 @@ class ConcurrentMaskedTable {
         const uint64_t bit = uint64_t{1} << i;
         if ((matched & bit) == 0) {
           best[i] = ids[i];
+          best_priority[i] = PriorityOf(ids[i]);
           matched |= bit;
-        } else if (Better(Record(IdOf(ids[i])), Record(IdOf(best[i])))) {
+        } else if (Better(ids[i], best[i])) {
           best[i] = ids[i];
+          best_priority[i] = PriorityOf(ids[i]);
         }
       }
     }
@@ -204,6 +229,9 @@ class ConcurrentMaskedTable {
   struct Tuple {
     std::vector<std::byte> mask;
     std::shared_ptr<ConcurrentExactTable> table;
+    // The highest priority any rule of this mask has had (a ceiling for the
+    // lookup's skip); shared by every list that holds the tuple.
+    std::shared_ptr<std::atomic<int64_t>> max_priority;
   };
   struct TupleList {
     std::vector<Tuple> tuples;
@@ -219,14 +247,44 @@ class ConcurrentMaskedTable {
   static RuleId IdOf(uint64_t value) noexcept {
     return static_cast<RuleId>(value);
   }
-  static uint64_t Pack(RuleId id, uint16_t result) noexcept {
-    return uint64_t{id} | (uint64_t{result} << 32);
+  // Bits 48-63: the priority biased by 2^15 when it is in [-32767, 32767],
+  // else 0 (rank from the record).
+  static constexpr int64_t kPackedPriorityLimit = 32767;
+  static uint64_t PackedPriority(int64_t priority) noexcept {
+    return priority >= -kPackedPriorityLimit && priority <= kPackedPriorityLimit
+               ? static_cast<uint64_t>(priority + 32768)
+               : 0;
+  }
+  // The rule's record must be written (it is, before a value names it).
+  uint64_t Pack(RuleId id, uint16_t result) const noexcept {
+    return uint64_t{id} | (uint64_t{result} << 32) |
+           (PackedPriority(Record(id).priority) << 48);
+  }
+  int64_t PriorityOf(uint64_t packed) const noexcept {
+    const uint64_t biased = packed >> 48;
+    return biased != 0 ? static_cast<int64_t>(biased) - 32768 : Record(IdOf(packed)).priority;
   }
 
   static bool Better(const Rule &candidate, const Rule &incumbent) noexcept {
     return candidate.priority != incumbent.priority
                ? candidate.priority > incumbent.priority
                : candidate.sequence > incumbent.sequence;
+  }
+  // Packed values: by their packed priorities when both are and differ, else
+  // by the records.
+  bool Better(uint64_t candidate, uint64_t incumbent) const noexcept {
+    const uint64_t c = candidate >> 48, i = incumbent >> 48;
+    if (c != 0 && i != 0 && c != i) {
+      return c > i;
+    }
+    return Better(Record(IdOf(candidate)), Record(IdOf(incumbent)));
+  }
+  // Raises `tuple`'s ceiling to `priority` (writer, before the rule it is for
+  // becomes visible).
+  static void RaiseCeiling(std::atomic<int64_t> &ceiling, int64_t priority) noexcept {
+    if (priority > ceiling.load(std::memory_order_relaxed)) {
+      ceiling.store(priority, std::memory_order_release);
+    }
   }
 
   const Rule &Record(RuleId id) const noexcept {

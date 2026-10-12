@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -64,6 +65,103 @@ TEST(ConcurrentMaskedTableTest, HigherPriorityThenLaterCommandWins) {
   EXPECT_EQ(21, Classify(*t, key));
   EXPECT_EQ(3u, t->size());
   EXPECT_EQ(3u, t->tuple_count());
+}
+
+// The lookup skips a tuple only when every packet of the batch already holds a
+// strictly higher-priority match (D-098): an equal priority in a later-visited
+// mask still wins as the later command, a higher one in a mask with a lower
+// ceiling still wins, priorities beyond the packed range rank with packed ones,
+// and one unmatched packet keeps every tuple looked up.
+TEST(ConcurrentMaskedTableTest, SkipsOnlyTuplesThatCannotWin) {
+  auto t = MakeTable();
+  // Batch of 4 keys sharing the low byte 0x07.
+  const std::array<uint64_t, 4> keys = {0x1107, 0x2207, 0x3307, 0x4407};
+  ASSERT_EQ(R::kInserted, t->Upsert(C(kLow1), C(B(0x07)), 50, 1));  // matches all: ceiling 50
+  auto classify_all = [&](std::array<uint16_t, 4> &out) {
+    std::array<Bytes, 4> k;
+    for (size_t i = 0; i < 4; i++) k[i] = B(keys[i]);
+    return t->LookupBatch(ConstBytes(k[0].data(), 4 * kKeyLen), kKeyLen, out.data(), 4);
+  };
+  std::array<uint16_t, 4> out{};
+  // A lower-priority, more specific rule cannot win: skipping it is correct.
+  ASSERT_EQ(R::kInserted, t->Upsert(C(kLow2), C(B(0x1107)), 10, 2));
+  ASSERT_EQ(0xfu, classify_all(out));
+  EXPECT_EQ(1, out[0]);
+  // An equal priority added later, in another mask, wins for its key.
+  ASSERT_EQ(R::kInserted, t->Upsert(C(kLow4), C(B(0x2207)), 50, 3));
+  ASSERT_EQ(0xfu, classify_all(out));
+  EXPECT_EQ(3, out[1]);
+  EXPECT_EQ(1, out[0]);
+  // A higher priority beyond the packed range wins over a packed 50.
+  ASSERT_EQ(R::kInserted, t->Upsert(C(kFull), C(B(0x3307)), 1'000'000, 4));
+  ASSERT_EQ(0xfu, classify_all(out));
+  EXPECT_EQ(4, out[2]);
+  // A packed priority above an unpacked negative one.
+  ASSERT_EQ(R::kUpdated, t->Upsert(C(kLow1), C(B(0x07)), -1'000'000, 1));
+  ASSERT_EQ(R::kInserted, t->Upsert(C(kLow2), C(B(0x4407)), -5, 5));
+  ASSERT_EQ(0xfu, classify_all(out));
+  EXPECT_EQ(5, out[3]);
+  EXPECT_EQ(2, out[0]) << "priority 10 beats the now -1,000,000 wide rule";
+}
+
+// Against a brute-force model: random masks, values, priorities (inside and
+// outside the packed range, with ties), updates and deletes, classified in
+// batches of up to 64.
+TEST(ConcurrentMaskedTableTest, RandomRulesMatchABruteForceModel) {
+  for (uint32_t seed = 1; seed <= 6; seed++) {
+    std::mt19937_64 rng(seed);
+    auto t = MakeTable(8);
+    struct ModelRule { uint64_t mask, value; int64_t priority; uint64_t seq; uint16_t result; };
+    std::vector<ModelRule> model;
+    uint64_t seq = 0;
+    const std::array<uint64_t, 6> masks = {~uint64_t{0}, 0xffffffffull, 0xffffull, 0xffull,
+                                           0xff00ffull, 0xf0f0ull};
+    for (int step = 0; step < 400; step++) {
+      const uint64_t mask = masks[rng() % masks.size()];
+      const uint64_t value = (rng() % 4) * 0x0101010101010101ull & mask;
+      if (rng() % 5 == 0) {
+        auto it = std::find_if(model.begin(), model.end(),
+                               [&](const ModelRule &r) { return r.mask == mask && r.value == value; });
+        EXPECT_EQ(it != model.end(), t->Erase(C(B(mask)), C(B(value))));
+        if (it != model.end()) model.erase(it);
+        continue;
+      }
+      const int64_t priority = rng() % 3 == 0 ? static_cast<int64_t>(rng() % 200000) - 100000
+                                              : static_cast<int64_t>(rng() % 8);
+      const uint16_t result = static_cast<uint16_t>(rng() % 1000);
+      const auto r = t->Upsert(C(B(mask)), C(B(value)), priority, result);
+      ASSERT_TRUE(r == R::kInserted || r == R::kUpdated);
+      auto it = std::find_if(model.begin(), model.end(),
+                             [&](const ModelRule &m) { return m.mask == mask && m.value == value; });
+      if (it != model.end()) model.erase(it);
+      model.push_back({mask, value, priority, ++seq, result});
+      // A batch of keys built from the rules' values (to hit) and random ones.
+      const size_t n = 1 + rng() % 64;
+      std::vector<Bytes> keys(n);
+      for (size_t i = 0; i < n; i++) {
+        keys[i] = B((rng() % 4) * 0x0101010101010101ull ^ (rng() % 3 == 0 ? rng() : 0));
+      }
+      std::vector<uint16_t> out(n, 0xEEEE);
+      const uint64_t hits = t->LookupBatch(ConstBytes(keys[0].data(), n * kKeyLen), kKeyLen,
+                                           out.data(), n);
+      for (size_t i = 0; i < n; i++) {
+        uint64_t key;
+        std::memcpy(&key, keys[i].data(), kKeyLen);
+        const ModelRule *best = nullptr;
+        for (const ModelRule &m : model) {
+          if ((key & m.mask) == m.value &&
+              (best == nullptr || m.priority > best->priority ||
+               (m.priority == best->priority && m.seq > best->seq))) {
+            best = &m;
+          }
+        }
+        ASSERT_EQ(best != nullptr, ((hits >> i) & 1) != 0) << "seed " << seed << " step " << step;
+        if (best != nullptr) {
+          ASSERT_EQ(best->result, out[i]) << "seed " << seed << " step " << step << " key " << i;
+        }
+      }
+    }
+  }
 }
 
 // The transactional split (D-024): a prepared new rule is present but loses

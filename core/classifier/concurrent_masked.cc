@@ -2,6 +2,8 @@
 
 #include "classifier/concurrent_masked.h"
 
+#include <limits>
+
 #include <algorithm>
 #include <climits>
 #include <cstring>
@@ -115,6 +117,11 @@ std::shared_ptr<ConcurrentExactTable> ConcurrentMaskedTable::Grown(
 }
 
 void ConcurrentMaskedTable::PublishTuples(std::unique_ptr<TupleList> list) {
+  // Highest ceiling first: the lookup's skip then saves the most lookups.
+  std::stable_sort(list->tuples.begin(), list->tuples.end(), [](const Tuple &a, const Tuple &b) {
+    return a.max_priority->load(std::memory_order_relaxed) >
+           b.max_priority->load(std::memory_order_relaxed);
+  });
   tuples_.Publish(std::move(list));
   domain_.ReclaimReady();
 }
@@ -177,6 +184,10 @@ ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
                        .sequence = next_sequence_++,
                        .result = result};
   const RuleId old = Find(*table, value);
+  // The tuple's ceiling first: a reader that sees the rule sees it raised.
+  auto ceiling = new_tuple ? std::make_shared<std::atomic<int64_t>>(priority)
+                           : list->tuples[index].max_priority;
+  RaiseCeiling(*ceiling, priority);
   if (table->Upsert(value, Pack(id, result)) ==
       ConcurrentExactTable::UpsertResult::kFull) {
     table = Grown(*table);
@@ -192,7 +203,7 @@ ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
     auto next = std::make_unique<TupleList>(*list);
     if (new_tuple) {
       next->tuples.push_back(
-          {std::vector<std::byte>(mask.begin(), mask.end()), table});
+          {std::vector<std::byte>(mask.begin(), mask.end()), table, ceiling});
     } else {
       next->tuples[index].table = table;
     }
@@ -321,7 +332,10 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
   if (new_tuple || replaced) {
     auto next = std::make_unique<TupleList>(*list);
     if (new_tuple) {
-      next->tuples.push_back({prepared.mask, table});
+      // A pending entry never wins: the ceiling rises at Commit().
+      next->tuples.push_back(
+          {prepared.mask, table,
+           std::make_shared<std::atomic<int64_t>>(std::numeric_limits<int64_t>::min())});
     } else {
       next->tuples[index].table = table;
     }
@@ -362,6 +376,7 @@ ConcurrentMaskedTable::RuleId ConcurrentMaskedTable::Commit(
   ConcurrentExactTable &table = *list->tuples[index].table;
   const ConstBytes value(prepared.value.data(), prepared.value.size());
   if (prepared.id != 0) {
+    RaiseCeiling(*list->tuples[index].max_priority, Record(prepared.id).priority);
     // An in-place value store of a present key: cannot fail.
     CHECK(table.Upsert(value, Pack(prepared.id, prepared.result)) ==
           ConcurrentExactTable::UpsertResult::kUpdated);
