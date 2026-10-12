@@ -7804,9 +7804,11 @@ flagged; raw ns per packet, median of after minus before:
 | M.hashlb (unchanged code) | +1.08 | 2/6 |
 
 The mixed case does not pay for the uniformity check. ACL's shift has no code change behind it (layout, unexplained).
-Above M.base, ExactMatch is now 11.64 ns (master 11.09) and IPLookup 1.46 (master 2.92). The mixed case shows the
-remaining framework cost: 22.16 ns against master's 10.50 -- per-packet `EmitPacket` is about twice master's; the next
-item (outputs compiled at PreResume) targets it.
+Above M.base, ExactMatch is now 11.64 ns (master 11.09) and IPLookup 1.46 (master 2.92). The mixed case is 22.16 ns
+against master's 10.50, but not from emitting: `F.split/2` (RoundRobin per packet, two gates, no classifier) is 5.38
+ns against master's 5.69 (19.2 vs 17.2 instructions per packet; 6 rounds, isolated, contamination flagged). The gap
+is in ExactMatch with misses (half the mixed flows miss); master's miss path is cheaper. Compiling gate outputs at
+PreResume would not close it; ExactMatch's miss path is the next item.
 
 ## D-100 Metadata offsets resolved once per batch, slow helpers deprecated; GenericEncap's header template rejected
 
