@@ -132,6 +132,8 @@ file is the reasoning.
 | D-109 | Task placement is desired state; the samples are manifests | accepted |
 | D-110 | Desired state: settings at creation are init arguments; tables are resources | accepted |
 | D-111 | IPLookup's routes are a transaction resource (`LpmTableResource`) | accepted |
+| D-112 | Generated C++ protobuf code is declared where it is included; one ninja run after a .proto edit | accepted |
+| D-113 | mold links every profile and every CI lane | accepted |
 
 
 ---
@@ -8237,3 +8239,50 @@ refused. Live: `iplookup` and `vrf_routing` as manifests send traffic to the sam
 `tc/wfs_double`.
 
 **Code.** `core/route/lpm_resource.h`, `core/modules/ip_lookup.{h,cc}`, `protobuf/module_msg.proto`.
+
+## D-112 Generated C++ protobuf code is declared where it is included
+
+**Status:** accepted.
+
+**Context.** protoc wrote the C++ code into `protobuf/generated/cpp/core/pb/`, and the Meson targets declared copies
+named `protobuf/core_<stem>.pb.h`. Every compile included the first set, which no ninja edge produced. Ninja decides
+what is stale before it runs anything, so the run that regenerated a header did not rebuild the objects that include
+it; the next run did. After a `.proto` edit, one build left stale objects linked into tests (a false SIGABRT in
+`bessctl_manifest_test`), and local scripts built twice. The SDK compiles also read `sdk/cpp/control_v2.pb.h`, the
+install copy, through Meson's implicit include of the target's build directory, with no edge ordering them after it.
+
+**Decision.**
+
+- `protobuf/pb/meson.build` and `protobuf/sample/pb/meson.build` run protoc into their own build directories, and the
+  declared outputs are those files (`pb/module_msg.pb.h` under `-I <build>/protobuf`). The generator skips the copy
+  when protoc wrote the output in place. The `generated/cpp` tree is gone; Python generation is unchanged.
+- The SDK library and its two executables set `implicit_include_directories: false`; the generated header comes
+  through `core_cpp_include`.
+
+**Evidence.** In a fast tree: a field added to `module_msg.proto` rebuilt 160 objects and 149 links in one run, and
+the next run compiled nothing; the revert did the same (1.7 s from ccache). A second run after a full build compiles
+nothing (only the always-run `version.h` and `build_info` steps).
+
+**Code.** `protobuf/meson.build`, `protobuf/pb/meson.build`, `protobuf/sample/pb/meson.build`,
+`tools/generate_protobuf.py`, `sdk/cpp/meson.build`.
+
+## D-113 mold links every profile and every CI lane
+
+**Status:** accepted.
+
+**Context.** D-048 put mold in the fast profile's native file only. Perf, release and CI trees linked with GNU ld:
+2.3 s for `bessd` and 1.7 s for one unit test (this workstation), against 0.33 s and 0.21 s with mold. A tree whose
+headers changed relinks about 190 executables. Two linkers also meant CI linked differently from the developer loop.
+
+**Decision.** `meson.build` adds `-fuse-ld=mold` as a project link argument and stops at configure time, naming the
+install command, when the compiler cannot use it. `env/install-deps.sh build` (CI and the CI container) installs
+`mold`; `tools/profiles/fast.ini` no longer sets it.
+
+**Evidence.** The release-semantics tree (`-O3`, NDEBUG) relinked all 187 executables in 4 s; `readelf -p .comment`
+on `bessd` names mold 2.42.0 in the fast and release trees. The release-semantics suite then passed as before (145
+OK; the two failures are the suites that need root), static module registration (`link_whole`) included.
+
+**Not measured.** The linker lays out sections, so code placement in a release `bessd` can differ from a GNU ld link.
+Perf baselines recorded before this decision were GNU ld links; a perf comparison across it needs a paired run.
+
+**Code.** `meson.build`, `env/install-deps.sh`, `tools/profiles/fast.ini`.

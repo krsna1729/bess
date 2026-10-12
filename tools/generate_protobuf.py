@@ -64,6 +64,8 @@ def main() -> int:
         return 2
 
     for source, destination in zip(generated, outputs):
+        if source == destination:  # protoc wrote it in place
+            continue
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
 

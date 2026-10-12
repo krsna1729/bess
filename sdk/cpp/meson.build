@@ -9,8 +9,12 @@ sdk_cpp_args = core_cpp_include + proto_codegen_args
 
 # A static bessd links its dependencies' archives, which need not be PIC:
 # the SDK is then a static archive too.
+# implicit_include_directories off, here and for the executables below: the
+# build directory holds the install copy of control_v2.pb.h, which no compile
+# here waits for. The generated header comes through core_cpp_include.
 sdk_lib_kwargs = {
   'include_directories': sdk_cpp_inc,
+  'implicit_include_directories': false,
   'cpp_args': sdk_cpp_args,
   'dependencies': [protobuf_dep, grpcpp_dep],
   'install': true,
@@ -39,7 +43,7 @@ custom_target(
   'install_sdk_control_v2_pb_h',
   input: control_v2_cpp_target,
   output: 'control_v2.pb.h',
-  command: [find_program('cp'), join_paths(cpp_proto_root, 'core', 'pb', 'control_v2.pb.h'),
+  command: [find_program('cp'), join_paths(core_pb_dir, 'control_v2.pb.h'),
             '@OUTPUT@'],
   build_by_default: true,
   install: true,
@@ -62,12 +66,14 @@ if get_option('build_tests')
   sdk_cpp_test = executable(
     'sdk_cpp_client_test',
     'client_test.cc',
+    implicit_include_directories: false,
     dependencies: [bess_sdk_dep, gtest_dep, dependency('gtest_main', method: 'pkg-config')],
   )
   test('sdk_cpp_client_test', sdk_cpp_test, suite: 'sdk')
   sdk_cpp_conformance = executable(
     'sdk_cpp_conformance',
     'conformance.cc',
+    implicit_include_directories: false,
     dependencies: [bess_sdk_dep],
   )
   sdk_cpp_test_targets += sdk_cpp_conformance

@@ -1,5 +1,4 @@
 proto_source_dir = meson.current_source_dir()
-cpp_proto_root = join_paths(meson.current_build_dir(), 'generated', 'cpp')
 python_proto_root = join_paths(meson.current_build_dir(), 'generated', 'python')
 protobuf_generator = files('../tools/generate_protobuf.py')
 
@@ -27,46 +26,13 @@ core_proto_files = files(
 )
 
 python_generated_install_entries = []
-core_cpp_proto_targets = []
 core_python_proto_targets = []
+subdir('pb')  # the C++ code: core_cpp_proto_targets, core_pb_dir
 
 foreach proto_index : range(core_proto_names.length())
   proto_name = core_proto_names[proto_index]
   proto_stem = proto_name.replace('.proto', '')
   target_name = 'core_proto_' + proto_stem.replace('/', '_')
-  cpp_proto_source_root = proto_source_dir
-  if proto_stem.startswith('ports/') or proto_stem.startswith('tests/')
-    cpp_proto_source_root = join_paths(proto_source_dir, proto_stem.split('/')[0])
-  endif
-  cpp_outputs = [
-    'core_' + proto_stem.replace('/', '_') + '.pb.cc',
-    'core_' + proto_stem.replace('/', '_') + '.pb.h',
-    'core_' + proto_stem.replace('/', '_') + '.grpc.pb.cc',
-    'core_' + proto_stem.replace('/', '_') + '.grpc.pb.h',
-  ]
-  cpp_target = custom_target(
-    target_name + '_cpp',
-    input: core_proto_files[proto_index],
-    output: cpp_outputs,
-    depend_files: core_proto_files,
-    command: [
-      python,
-      protobuf_generator,
-      protoc.full_path(),
-      grpc_cpp_plugin.full_path(),
-      'cpp',
-      cpp_proto_source_root,
-      join_paths(cpp_proto_root, 'core', 'pb'),
-      '@INPUT@',
-      '@OUTPUT@',
-    ],
-    build_by_default: true,
-  )
-  core_cpp_proto_targets += cpp_target
-  if proto_stem == 'control_v2'
-    control_v2_cpp_target = cpp_target  # the C++ SDK's only generated code
-  endif
-
   python_outputs = [
     'builtin_' + proto_stem.replace('/', '_') + '_pb2.py',
     'builtin_' + proto_stem.replace('/', '_') + '_pb2_grpc.py',
@@ -136,7 +102,7 @@ foreach stem : public_pb_headers
     input: core_cpp_proto_targets,
     output: stem + '.pb.h',
     command: [pb_install_copy,
-              join_paths(cpp_proto_root, 'core', 'pb', stem + '.pb.h'),
+              join_paths(core_pb_dir, stem + '.pb.h'),
               '@OUTPUT@'],
     build_by_default: true,
     install: true,
@@ -148,7 +114,7 @@ test(
   python,
   args: [files('../tools/public_proto_closure.py'),
          '--core-dir', join_paths(meson.project_source_root(), 'core'),
-         '--pb-dir', join_paths(cpp_proto_root, 'core', 'pb'),
+         '--pb-dir', core_pb_dir,
          '--check'],
   depends: core_cpp_proto_targets,
   is_parallel: false,
@@ -165,29 +131,7 @@ test(
 
 sample_proto_name = 'supdate_msg.proto'
 sample_proto_file = files('../sample_plugin/protobuf/supdate_msg.proto')
-sample_cpp_target = custom_target(
-  'sample_proto_cpp',
-  input: sample_proto_file,
-  output: [
-    'sample_supdate_msg.pb.cc',
-    'sample_supdate_msg.pb.h',
-    'sample_supdate_msg.grpc.pb.cc',
-    'sample_supdate_msg.grpc.pb.h',
-  ],
-  depend_files: sample_proto_file,
-  command: [
-    python,
-    protobuf_generator,
-    protoc.full_path(),
-    grpc_cpp_plugin.full_path(),
-    'cpp',
-    join_paths(meson.current_source_dir(), '../sample_plugin/protobuf'),
-    join_paths(cpp_proto_root, 'sample', 'pb'),
-    '@INPUT@',
-    '@OUTPUT@',
-  ],
-  build_by_default: true,
-)
+subdir('sample/pb')  # sample_cpp_target
 
 sample_python_target = custom_target(
   'sample_proto_python',
@@ -287,8 +231,8 @@ protobuf_runtime_deps = [
 ]
 
 core_cpp_include = [
-  '-I' + join_paths(cpp_proto_root, 'core', 'pb'),
-  '-I' + join_paths(cpp_proto_root, 'core'),
+  '-I' + core_pb_dir,
+  '-I' + meson.current_build_dir(),  # "pb/x.pb.h"
 ]
 # protoc-generated code is not ours: newer GCCs report false-positive
 # (maybe-)uninitialized warnings inside protobuf's own headers at -O3, which
@@ -313,6 +257,6 @@ bess_proto_dep = declare_dependency(
   dependencies: protobuf_runtime_deps,
 )
 sample_proto_include = [
-  '-I' + join_paths(cpp_proto_root, 'sample'),
-  '-I' + join_paths(cpp_proto_root, 'sample', 'pb'),
+  '-I' + join_paths(meson.current_build_dir(), 'sample'),  # "pb/supdate_msg.pb.h"
+  '-I' + sample_pb_dir,
 ]

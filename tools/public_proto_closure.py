@@ -10,7 +10,7 @@ sources, so the install names exactly the closure instead. This script computes
 that closure from the real include graph, so it is also the check that the
 named list is neither short nor long.
 
-  public_proto_closure.py --core-dir core --pb-dir BUILD/protobuf/generated/cpp/core/pb
+  public_proto_closure.py --core-dir core --pb-dir BUILD/protobuf/pb
       the closure for the headers named in tools/api_classes.json, one per line
   public_proto_closure.py ... --check
       exit 1 unless it equals the "generated" list of tools/api_classes.json

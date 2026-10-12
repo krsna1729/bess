@@ -21,6 +21,15 @@ endif
 
 cpp = meson.get_compiler('cpp')
 
+# Every profile links with mold: the fast loop, perf and release trees, and
+# CI. GNU ld took 2.3-3.5 s per bessd or test link, mold 0.1-0.3 s (D-048,
+# D-113). One linker everywhere: what CI links is what a developer links.
+if not cpp.has_link_argument('-fuse-ld=mold')
+  error('BESS links with mold (-fuse-ld=mold), and this compiler cannot use it. ' +
+        'Install mold: env/install-deps.sh build (Ubuntu), pacman -S mold (Arch).')
+endif
+add_project_link_arguments('-fuse-ld=mold', language: 'cpp')
+
 # protobuf's headers switch generated messages to a different global layout
 # under AddressSanitizer; the system libprotobuf is not built that way, so
 # descriptors come back null (Any::PackFrom crashes in TypeId::name). Every

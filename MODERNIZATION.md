@@ -100,7 +100,8 @@ hardware; it takes about 2 minutes.
 ### Build profiles
 
 Three profiles, by purpose. Only the first needs a native file; the others are
-ordinary Meson options.
+ordinary Meson options. Every profile, and every CI lane, links with mold
+(`meson.build` refuses to configure without it; D-113).
 
 | Profile | Purpose | Setup |
 |---|---|---|
@@ -108,18 +109,35 @@ ordinary Meson options.
 | **perf** | benchmark numbers | `meson setup build/perf -Dbuildtype=release -Dcpu=native` |
 | **release** | what ships | CI's `-Dbuildtype=release -Dstatic_binary=standalone -Dcpu=x86-64-v3` |
 
-`fast` uses `-O1 -g0`, the mold linker, ccache and no benchmarks. It needs
-`mold` and `ccache` installed (`pacman -S mold ccache`). Measured on this
-workstation (20 cores, `-j8`, GCC 16): a cold build of everything but the
-benchmarks takes 174 s; editing `route_table.cc` and rebuilding its test takes
-5 s; editing `module.cc` and relinking a module test takes 2 s; editing
-`packet_pool.cc` (a core file) and relinking all 92 test binaries and `bessd`
-takes 4 s; editing `module.h`, which 147 translation units include, takes 14 s
-for one test and a few minutes for everything. The tree is 240 MB (205 MB
-executables, 25 MB generated protobuf) against 12 GB for the debugoptimized
-tree. Debug a failure in a separate `-Dbuildtype=debugoptimized` tree. The
-`perf` and `release` rows are the existing configurations and were not
-changed.
+`fast` uses `-O1 -g0`, ccache and no benchmarks. It needs `mold` and `ccache`
+installed (`pacman -S mold ccache`; on Ubuntu `env/install-deps.sh build`). Measured on this
+workstation (20 cores, GCC 16, ccache 4.14), one target built with `ninja -C
+build/fast <target>`:
+
+| Change | Time to the binary |
+|---|---|
+| no change | 0.06 s |
+| one module `.cc`, then `bessd` | 6.4 s (compile 6.3 s, mold link 0.09 s) |
+| then its unit test | 0.1 s |
+| `module.h` (about 150 objects), then `bessd` | 20 s |
+| any edit reverted (ccache hits) | 0.3 s |
+| a `.proto` field, whole tree | one run; the next run compiles nothing (D-112) |
+
+The same edit in a `-Dbuildtype=debugoptimized` tree with GNU ld takes 12.4 s
+(`.cc`) and 28 s (`module.h`); the link alone is 2.3 s. Debug a failure in
+such a separate tree.
+
+For the edit loop:
+
+- Build the one target you run (`ninja -C build/fast core/route_lpm_resource_test`)
+  and run the executable. `meson test` without `--no-rebuild` builds the whole
+  tree first.
+- `meson setup --wipe` keeps the previous `-D` options; to switch an existing
+  tree to this profile, delete the directory and set it up again.
+- What remains of a compile is mostly header parsing: 3.5-5 s of a 6-7 s
+  object is the C++ library, absl, protobuf and the generated `.pb.h` files.
+  A precompiled header of those did not help (loading the 230 MB `.gch` cost as
+  much as the parse); Clang is 0.3-1.5 s faster per object.
 
 `/tmp` must have free space: tests write daemon logs there, and a full `/tmp`
 makes `test_shutdown` fail with a missing "gracefully shut down" line.
