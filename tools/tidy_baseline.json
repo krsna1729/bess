@@ -89,7 +89,6 @@
     },
     "core/module.h": {
       "bugprone-fold-init-type": 1,
-      "cppcoreguidelines-narrowing-conversions": 1,
       "performance-no-int-to-ptr": 1,
       "performance-unnecessary-value-param": 2
     },

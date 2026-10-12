@@ -1497,6 +1497,9 @@ ControlResult<void> ControlPlane::UnloadPlugin(const std::string& path) {
         in(contents.module_classes, m->module_builder()->class_name())) {
       users.push_back("module " + name);
     }
+    // A named reference, not the structured binding: clang-analyzer 19 loses
+    // a binding captured by a lambda (a false "uninitialized" report).
+    const std::string &module_name = name;
     auto hooks_of = [&](const auto &gates) {
       for (const auto *gate : gates) {
         if (gate == nullptr) {
@@ -1504,7 +1507,7 @@ ControlResult<void> ControlPlane::UnloadPlugin(const std::string& path) {
         }
         for (const bess::GateHook *hook : gate->hooks()) {
           if (in(contents.gate_hooks, hook->class_name())) {
-            users.push_back("gate hook " + hook->name() + " on " + name);
+            users.push_back("gate hook " + hook->name() + " on " + module_name);
           }
         }
       }
