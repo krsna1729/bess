@@ -67,7 +67,10 @@ TEST(RandomSplitTest, ForwardsOneMinusTheDropRate) {
     ASSERT_NE(nullptr, split);
     size_t forwarded = 0;
     for (int i = 0; i < kRuns; i++) {
-      for (const Bytes &p : h.Run(split, 0, burst, {0})[0]) {
+      // Named: a range-for over `h.Run(...)[0]` would iterate a vector of a
+      // destroyed map before C++23's lifetime extension (clang 19).
+      auto out = h.Run(split, 0, burst, {0});
+      for (const Bytes &p : out[0]) {
         EXPECT_TRUE(p == udp || p == tcp) << "a forwarded packet is unchanged";
         forwarded++;
       }

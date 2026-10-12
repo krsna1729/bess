@@ -62,7 +62,10 @@ std::string Dump(const gp::Struct &s) {
   return text;
 }
 
-const gp::Value &Get(const gp::Struct &s, const std::string &key) {
+// `key` is a C string: a std::string built at the call site would be a
+// temporary bound to a reference parameter of a function that returns a
+// reference, which g++ 14 flags (-Wdangling-reference) in range-for loops.
+const gp::Value &Get(const gp::Struct &s, const char *key) {
   static const gp::Value missing;
   const auto it = s.fields().find(key);
   return it == s.fields().end() ? missing : it->second;
