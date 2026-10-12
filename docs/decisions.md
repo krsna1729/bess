@@ -121,6 +121,7 @@ file is the reasoning.
 | D-098 | WildcardMatch ranks by a packed priority and skips tuples that cannot win (19.2 ns master, 44.8 develop, 14.6 now) | accepted |
 | D-099 | `Module::EmitBatch`: a burst whose packets all take one gate leaves whole; classifiers use it; `RunSplit` removed | accepted |
 | D-100 | Metadata offsets resolved once per batch, slow helpers deprecated (no measurable gain); GenericEncap template rejected (slower) | accepted |
+| D-101 | `ControlResult` is `[[nodiscard]]`; `-Wno-error=unused-result` removed | accepted |
 
 
 ---
@@ -7837,3 +7838,19 @@ session_pipeline, control_sdk_go) pass; Reviewer: correct, no findings. Live, pa
 GenericEncap) -0.11 ns (5/8 lower), M.vlan -0.46 (6/8), M.genericencap -0.14 (4/8); M.base itself moved -0.74
 with no code change. No measurable gain: the per-packet offset read was already cheap. Kept for clarity and so the
 slow helpers can be retired.
+
+## D-101 `ControlResult` is `[[nodiscard]]`; `-Wno-error=unused-result` removed
+
+**Status:** accepted (2026-10-12; the roadmap review's type-safety item: a control failure must not be droppable).
+**Code:** `core/control/control_error.h`, `meson.build`.
+
+**Decision.** `ControlResult<T>` becomes a `[[nodiscard]]` class derived from `std::expected<T, ControlError>`
+(constructors inherited, plus conversion from a plain `std::expected`), so every function returning one is
+nodiscard without annotating each. `-Wno-error=unused-result` is removed: an ignored nodiscard value or
+`warn_unused_result` return is a build error again.
+
+**Evidence.** A full gcc build of every target (tests included) with the attribute: no unused-result warning, so no
+caller dropped a control result. Without the `-Wno-error` flag the build stays clean. A throwaway translation unit
+compiled with the tree's flags that calls a `ControlResult<int>` function and ignores it fails: "ignoring returned
+value of type 'bess::control::ControlResult<int>', declared with attribute 'nodiscard' [-Werror=unused-result]".
+The clang, arm64 and sanitizer lanes check the other compilers.
