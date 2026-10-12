@@ -51,9 +51,12 @@ std::optional<pb::ErrorDetail> DecodeDetail(const Trailers &trailers) {
 }
 
 Error TransportFailure(grpc::StatusCode code, std::string request_id = {}) {
+  // Only a transaction has a request id; other calls report the status alone.
   Error e = MakeError(ErrorKind::kTransport,
-                      std::format("no answer for \"{}\": status {}", request_id,
-                                  static_cast<int>(code)));
+                      request_id.empty()
+                          ? std::format("no answer: status {}", static_cast<int>(code))
+                          : std::format("no answer for \"{}\": status {}", request_id,
+                                        static_cast<int>(code)));
   e.code = code;
   e.request_id = std::move(request_id);
   return e;
@@ -353,7 +356,9 @@ Result<void> Client::WatchEvents(
     if (stop.stop_requested()) {
       return {};
     }
-    if (!NoAnswer(status, Trailers())) {
+    // A stream that ends with OK (the daemon's write failed, or a proxy
+    // closed a long stream) had no answer either: resume from `next`.
+    if (!status.ok() && !NoAnswer(status, Trailers())) {
       return std::unexpected(Translate(status, Trailers()));
     }
     sleep_(backoff);

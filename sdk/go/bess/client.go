@@ -121,6 +121,10 @@ type TransportError struct {
 }
 
 func (e *TransportError) Error() string {
+	// Only a transaction has a request id; other calls report the code alone.
+	if e.RequestID == "" {
+		return fmt.Sprintf("bess: no answer: %s", e.Code)
+	}
 	return fmt.Sprintf("bess: no answer for %q: %s", e.RequestID, e.Code)
 }
 

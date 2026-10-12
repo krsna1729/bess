@@ -6,7 +6,8 @@
 # client committed steers packets. The same steps as control_sdk_go.py.
 #
 # The binary is $BESS_SDK_CPP_LIVE_TEST (meson sets it), else the default
-# build directory's.
+# build directory's. A build without tests (-Dbuild_tests=false) has none: the
+# test is skipped, as control_sdk_go.py is without Go.
 
 import os
 import socket
@@ -30,7 +31,8 @@ class BessControlSdkCppTest(BessModuleTestCase):
 
     def test_cpp_sdk_commits_a_rule(self):
         binary = live_test_binary()
-        self.assertTrue(os.access(binary, os.X_OK), binary + ' is not built')
+        if not os.access(binary, os.X_OK):
+            self.skipTest(binary + ' is not built (-Dbuild_tests=false)')
         em = ExactMatch(fields=[{'offset': 26, 'num_bytes': 4},
                                 {'offset': 30, 'num_bytes': 4}])
         em.set_default_gate(gate=3)

@@ -8,9 +8,12 @@
 #include <gtest/gtest.h>
 #include <google/protobuf/util/message_differencer.h>
 
+#include <condition_variable>
 #include <deque>
 #include <format>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -85,6 +88,29 @@ class ScriptedStream final : public EventStream {
   grpc::Status status_;
 };
 
+// A stream that delivers nothing until it is cancelled: an idle daemon.
+class IdleStream final : public EventStream {
+ public:
+  bool Read(pb::Event *) override {
+    std::unique_lock lock(mu_);
+    cv_.wait(lock, [&] { return cancelled_; });
+    return false;
+  }
+  grpc::Status Finish() override { return grpc::Status(grpc::StatusCode::CANCELLED, "cancelled"); }
+  void Cancel() override {
+    {
+      std::lock_guard lock(mu_);
+      cancelled_ = true;
+    }
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool cancelled_ = false;
+};
+
 class Fake final : public Transport {
  public:
   uint64_t epoch = 0;
@@ -97,6 +123,7 @@ class Fake final : public Transport {
   bool old_daemon = false;  // GetCapabilities: UNIMPLEMENTED
   bool refuse = false;      // GetCapabilities: PERMISSION_DENIED
   std::deque<std::deque<StreamStep>> streams;
+  bool idle = false;  // every stream is an IdleStream
   std::vector<std::pair<uint64_t, uint64_t>> watched;  // (from, epoch) per call
 
   uint64_t EpochOr1() const { return epoch == 0 ? 1 : epoch; }
@@ -189,6 +216,10 @@ class Fake final : public Transport {
   std::unique_ptr<EventStream> WatchEvents(const pb::WatchEventsRequest &in,
                                            grpc::Status *status) override {
     watched.emplace_back(in.from_sequence(), in.daemon_epoch());
+    if (idle) {
+      *status = grpc::Status::OK;
+      return std::make_unique<IdleStream>();
+    }
     if (streams.empty()) {
       *status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "no more streams");
       return nullptr;
@@ -541,7 +572,8 @@ TEST(SdkClient, WatchEventsResumesAfterTheLastEventAndReportsARestart) {
   Harness h(1);
   h.f->streams = {
       {Ev("bess.start", 5, 1), down},  // fails before its first event
-      {Ev("bess.start", 5, 1), Ev("a", 5, 1), Ev("b", 6, 1), down},
+      // Ends cleanly (a proxy closing a long stream): resumed like a failure.
+      {Ev("bess.start", 5, 1), Ev("a", 5, 1), Ev("b", 6, 1), grpc::Status::OK},
       {Ev("bess.start", 7, 1), gap, Ev("c", 9, 1), Ev("bess.progress", 14, 1), down},
       {Ev("bess.restart", 0, 2)},
   };
@@ -571,6 +603,20 @@ TEST(SdkClient, WatchEventsEndsWhenTheCallerStops) {
   EXPECT_TRUE(h.c->WatchEvents(0, 0, {}, [](const pb::Event &) { return true; },
                                stop.get_token()));
   EXPECT_EQ(h.f->watched.size(), 1u) << "a stopped watch opened a stream";
+}
+
+TEST(SdkClient, AStopEndsAWatchBlockedOnAnIdleStream) {
+  Harness h(1);
+  h.f->idle = true;
+  std::stop_source stop;
+  std::jthread stopper([&] {
+    std::this_thread::sleep_for(milliseconds(50));
+    stop.request_stop();
+  });
+  auto r = h.c->WatchEvents(0, 0, {}, [](const pb::Event &) { return true; },
+                            stop.get_token());
+  EXPECT_TRUE(r);
+  EXPECT_EQ(h.f->watched.size(), 1u);
 }
 
 TEST(SdkClient, ThePipelineBuilderAssemblesAndEditsASnapshot) {

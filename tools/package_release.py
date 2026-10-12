@@ -154,10 +154,17 @@ def deb(args) -> list[Path]:
                                                    'libgflags-dev', 'libprotobuf-dev',
                                                    'libpcap-dev'],
                       'BESS plugin and module development headers (bess-dev.pc)', out,
-                      [f'{prefix}/include/bess', f'{lib}/pkgconfig/bess-dev.pc',
+                      [f'{prefix}/include/bess/core', f'{lib}/pkgconfig/bess-dev.pc',
                        f'{lib}/pkgconfig/bess-dev-static.pc',
                        *(f'{lib}/bess/libbess_{name}.a'
                          for name in ('route', 'dataplane_core', 'eal', 'rcu', 'utils'))]),
+            # The control SDK (bess-sdk.pc): a client of any bessd, so it
+            # needs no bess package, only what bess-sdk.pc requires.
+            build_deb(stage, 'bess-sdk', version, ['libgrpc++-dev', 'libprotobuf-dev'],
+                      'BESS C++ control SDK: libbess-sdk, its headers and bess-sdk.pc', out,
+                      [f'{prefix}/include/bess/sdk', f'{lib}/pkgconfig/bess-sdk.pc',
+                       *(str(p.relative_to(stage))
+                         for p in sorted((stage / lib).glob('libbess-sdk*')))]),
         ]
     return made
 

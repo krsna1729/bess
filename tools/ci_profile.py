@@ -205,6 +205,7 @@ class Setup:
         self.build_dir = ROOT / 'build' / self.name
         self.stage = ROOT / 'build' / f'stage-{self.name}'
         self.standalone = ROOT / 'build' / f'standalone-{self.name}'
+        self.sdk_client = ROOT / 'build' / f'sdk-client-{self.name}'
         self.stage_pkgconfig = ROOT / 'build' / f'stage-pkgconfig-{self.name}'
         self.variant = self.name
         jobs = args.jobs or (4 if self.in_ci else min(LOCAL_JOB_CAP, os.cpu_count() or 1))
@@ -369,9 +370,10 @@ def step_verify_install(s):
     env = s.env_with_dpdk()
     s.run(['meson', 'install', '-C', s.build_dir, '--destdir', s.stage], env=env)
     if s.dry_run:
-        print('+ check installed headers, build standalone plugins and the static router, check bessd')
+        print('+ check installed headers, build standalone plugins, the SDK client and the static '
+              'router, check bessd')
         return
-    # The installed bess-dev.pc and bess-dev-static.pc name the real prefix
+    # The installed .pc files name the real prefix
     # (/usr/local). Consumers here must see the stage and nothing else: copies
     # whose prefix is the stage's, first on the path, so a BESS install already
     # on the machine cannot supply a header (its older Module layout once made
@@ -380,7 +382,7 @@ def step_verify_install(s):
     staged_pc = s.stage_pkgconfig
     staged_pc.mkdir(parents=True, exist_ok=True)
     stage_prefix = None
-    for name in ('bess-dev.pc', 'bess-dev-static.pc'):
+    for name in ('bess-dev.pc', 'bess-dev-static.pc', 'bess-sdk.pc'):
         pc = next(s.stage.rglob(name), None)
         if pc is None:
             raise SystemExit(f'{name} was not installed')
@@ -409,6 +411,12 @@ def step_verify_install(s):
                                  capture_output=True, text=True, check=True).stdout
         if 'bess_plugin_descriptor_v1' not in symbols:
             raise SystemExit(f'{so} does not export bess_plugin_descriptor_v1')
+    # The C++ control SDK from its installed headers, archive and bess-sdk.pc.
+    shutil.rmtree(s.sdk_client, ignore_errors=True)
+    s.run(['meson', 'setup', s.sdk_client, 'examples/sdk_client'], env=env)
+    s.run(['meson', 'compile', '-C', s.sdk_client], env=env)
+    if not (s.sdk_client / 'list_resources').is_file():
+        raise SystemExit(f'{s.sdk_client}/list_resources was not built')
     bessd = list(s.stage.glob('**/bin/bessd'))
     plugins = list(s.stage.glob('**/bess/modules/libsequential_update.so'))
     if len(bessd) != 1 or len(plugins) != 1 or not os.access(bessd[0], os.X_OK):

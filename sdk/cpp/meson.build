@@ -1,29 +1,11 @@
-# The C++ control SDK (G1.6, D-104). Two libraries from the same sources:
-#  - bess_sdk_core: the client code alone. A program that already links
-#    BESS's generated control_v2 code (bessd, for the bessctl it carries)
-#    links this, so the descriptors are registered once.
-#  - libbess-sdk (installed, pkg-config bess-sdk): the client plus the
-#    control_v2 generated code, for programs outside the tree.
-# Neither sees core/: the SDK depends on the protocol, not on bessd.
+# The C++ control SDK (G1.6, D-104): libbess-sdk (installed, pkg-config
+# bess-sdk), the client plus the control_v2 generated code, for programs
+# outside the tree. It does not see core/: the SDK depends on the protocol,
+# not on bessd.
 
 sdk_cpp_inc = include_directories('include')
 sdk_cpp_sources = files('src/client.cc', 'src/grpc_transport.cc')
 sdk_cpp_args = core_cpp_include + proto_codegen_args
-
-bess_sdk_core = static_library(
-  'bess_sdk_core',
-  sdk_cpp_sources,
-  control_v2_cpp_target[1], control_v2_cpp_target[3],  # headers: build order only
-  include_directories: sdk_cpp_inc,
-  cpp_args: sdk_cpp_args,
-  dependencies: [protobuf_dep, grpcpp_dep],
-)
-bess_sdk_core_dep = declare_dependency(
-  link_with: bess_sdk_core,
-  include_directories: sdk_cpp_inc,
-  compile_args: core_cpp_include,
-  dependencies: [protobuf_dep, grpcpp_dep],
-)
 
 # A static bessd links its dependencies' archives, which need not be PIC:
 # the SDK is then a static archive too.

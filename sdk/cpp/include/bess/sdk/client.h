@@ -239,6 +239,7 @@ class Client {
       std::stop_token stop = {});
 
   // -- transactions --
+  // The transaction refers to this client: it must not outlive it.
   Transaction NewTransaction(TransactionOptions options = {});
 
   // `request_id`'s outcome under the current epoch.
@@ -266,7 +267,8 @@ class Client {
   std::optional<uint64_t> epoch_;
 };
 
-// Operations on any resources, applied all or nothing by Commit.
+// Operations on any resources, applied all or nothing by Commit. It refers to
+// the Client that made it, which must outlive it.
 class Transaction {
  public:
   // One id for the whole life of the transaction: a retry after a timeout

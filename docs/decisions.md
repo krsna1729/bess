@@ -201,6 +201,17 @@ network function driven by a controller.
 - miss-heavy traffic on small tables shows up as a real bottleneck;
 - values need to be wider than 8 bytes (then use an id into an `ObjectTable`).
 
+**Measured 2026-10-12 (open).** Bursts that mix hits and misses at random are the case the table above did not
+cover. `live_perf M.exactmatch/mixed` (1024 addresses, every other one a rule; isolated CPU 2, median of 3; the run
+reported IRQ/softirq activity on the target CPUs): master 15.6 ns, this tree 27.6 ns per packet; hit-only 16.6 /
+18.0, miss-only 11.6 / 14.0. Per packet, mixed: 1.71 branch misses against master's 0.67, and 118 cycles against 66.
+A profile of the worker (`perf record -C 2`) puts 37% of its time in DPDK's `__bulk_lookup_lf`. That function has
+two branches per key on the key's own outcome (`if (prim_hitmask)` in the signature pass, `while (prim_hitmask)` in
+the compare pass, `lib/hash/rte_cuckoo_hash.c` 2202 and 2240); with a coin-flip hit pattern each mispredicts about
+half the time, which is the measured +1.0 per packet. Nothing in our code around the call depends on the outcome.
+Closing the gap means a lookup with no per-key branch, that is, the rejected "own lock-free cuckoo" above, or a
+DPDK patch.
+
 ## D-002 `rte_hash` flags: LF, QSBR defer queue; not multi-writer, not ext table
 
 **Status:** accepted (2026-09-25).

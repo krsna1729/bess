@@ -50,10 +50,13 @@ auto applied = tx.Commit();            // Result<Applied>
 
 `libbess-sdk` carries the generated `control_v2` code and installs
 `control_v2.pb.h` next to its headers; it depends on gRPC++ and protobuf, not
-on bessd. Keys and values may be `DynamicMessage`s built from a descriptor set.
-`WatchEvents` blocks and calls back per event; stop it with a `std::stop_token`.
-The Go SDK is the one for external controllers such as the UPF; the C++ SDK is
-the one bessctl is built on (D-104).
+on bessd. Release builds ship it as the `bess-sdk` .deb (a static archive, its
+headers and `bess-sdk.pc`), which needs no `bess` package. Keys and values may
+be `DynamicMessage`s built from a descriptor set. `WatchEvents` blocks and
+calls back per event; stop it with a `std::stop_token`. A `Transaction` refers
+to the `Client` that made it, which must outlive it. The Go SDK is the one for
+external controllers such as the UPF; the C++ SDK is the one the C++ bessctl
+(G1.7, pending) is to be built on (D-104).
 
 ## Desired state
 
