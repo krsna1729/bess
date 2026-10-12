@@ -10,6 +10,7 @@ counters, so nothing is added to the packet path). Classes:
        F.floor          Source -> Sink
        F.hop/N          Source -> N x Bypass -> Sink      (slope: cost per module hop)
        F.fanout/N       Source -> RoundRobin(N gates) -> N Sinks   (gate fan-out)
+       F.split/N        F.fanout/N with packets alternating gates inside each burst (per-packet emit)
        F.fanin/N        N x Source -> one Sink (merge)
        F.hook           F.hop/1 with a Track hook on every gate (gate-hook cost)
        F.tc/N           N leaf traffic classes under round_robin (scheduler cost)
@@ -119,6 +120,18 @@ def f_hook(b):
 def f_fanout(n):
     def build(b):
         b.mod('RoundRobin', 'rr', {'gates': list(range(n))})
+        b.conn(_source(b), 'rr')
+        for g in range(n):
+            b.mod('Sink', 'sink%d' % g, {})
+            b.conn('rr', 'sink%d' % g, g)
+        return ['src']
+    return build
+
+
+def f_split(n):
+    """Every burst split across n gates packet by packet (RoundRobin per-packet mode): EmitPacket's cost."""
+    def build(b):
+        b.mod('RoundRobin', 'rr', {'gates': list(range(n)), 'mode': 'packet'})
         b.conn(_source(b), 'rr')
         for g in range(n):
             b.mod('Sink', 'sink%d' % g, {})
@@ -287,6 +300,7 @@ TESTS = {
     'F.hop/16': ('F', f_hop(16)),
     'F.hook': ('F', f_hook),
     'F.fanout/4': ('F', f_fanout(4)),
+    'F.split/2': ('F', f_split(2)),
     'F.fanin/4': ('F', f_fanin(4)),
     'F.tc/1': ('F', f_tc(1)),
     'F.tc/16': ('F', f_tc(16)),
