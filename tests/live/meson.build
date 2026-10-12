@@ -2,6 +2,7 @@
 # bessd and drives it through the C++ SDK and bessctl. No Python.
 live_test_sources = [
   'bessctl_test.cc',
+  'match_modules_test.cc',
   'metrics_test.cc',
   'module_traffic_test.cc',
   'classifier_traffic_test.cc',

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-// K3.6 module-level test for the migrated WildcardMatch. The packet path is
-// exercised end to end by bessctl/module_tests/wildcard_match.py against a live
-// daemon; this test covers what that harness cannot reach directly: generation
+// K3.6 module-level test for the migrated WildcardMatch: generation
 // construction, rule canonicalization, the module's own limits, introspection
 // byte parity, and the safety cases the legacy implementation had no defined
-// behavior for.
+// behavior for; then packets through the module (WildcardMatchPacketTest, was
+// bessctl/module_tests/wildcard_match.py) in process. Commands while a worker
+// forwards traffic are tests/live/match_modules_test.cc.
 
+#include <google/protobuf/util/message_differencer.h>
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -17,6 +20,8 @@
 #include "module_graph.h"
 #include "modules/wildcard_match.h"
 #include "pb/module_msg.pb.h"
+#include "testing/module_harness.h"
+#include "testing/packet_builder.h"
 
 namespace {
 
@@ -422,6 +427,313 @@ TEST_F(WildcardMatchTest, RejectsWideGateBeforeNarrowing) {
   WildcardMatchConfig config;
   config.set_default_gate(65536);
   EXPECT_NE(0, Run(m, "set_runtime_config", Pack(config)).error().code());
+}
+
+// Packets through the module (was bessctl/module_tests/wildcard_match.py).
+
+using bess::testing::Bytes;
+using bess::testing::Ip4;
+using bess::testing::ModuleHarness;
+using bess::testing::PacketBuilder;
+using bess::testing::TcpPacket;
+using google::protobuf::util::MessageDifferencer;
+using Octets = std::vector<uint8_t>;
+
+Field WmField(uint32_t offset, uint32_t bytes) {
+  Field f;
+  f.set_offset(offset);
+  f.set_num_bytes(bytes);
+  return f;
+}
+
+FieldData BinData(const Octets &bytes) {
+  FieldData d;
+  d.set_value_bin(std::string(bytes.begin(), bytes.end()));
+  return d;
+}
+
+Octets IpOctets(const char *text) {
+  const auto a = Ip4(text);
+  return Octets(a.begin(), a.end());
+}
+
+WildcardMatchCommandAddArg WmRule(uint64_t gate, int64_t priority, const std::vector<Octets> &masks,
+                                  const std::vector<Octets> &values) {
+  WildcardMatchCommandAddArg arg;
+  arg.set_gate(gate);
+  arg.set_priority(priority);
+  for (const Octets &m : masks) {
+    *arg.add_masks() = BinData(m);
+  }
+  for (const Octets &v : values) {
+    *arg.add_values() = BinData(v);
+  }
+  return arg;
+}
+
+WildcardMatchCommandDeleteArg WmKey(const std::vector<Octets> &masks,
+                                    const std::vector<Octets> &values) {
+  WildcardMatchCommandDeleteArg arg;
+  for (const Octets &m : masks) {
+    *arg.add_masks() = BinData(m);
+  }
+  for (const Octets &v : values) {
+    *arg.add_values() = BinData(v);
+  }
+  return arg;
+}
+
+bess::pb::WildcardMatchCommandSetDefaultGateArg WmDefault(uint64_t gate) {
+  bess::pb::WildcardMatchCommandSetDefaultGateArg arg;
+  arg.set_gate(gate);
+  return arg;
+}
+
+Module *CreateWm(ModuleHarness &h, const std::vector<Field> &fields) {
+  WildcardMatchArg arg;
+  for (const Field &f : fields) {
+    *arg.add_fields() = f;
+  }
+  return h.Create("WildcardMatch", arg);
+}
+
+// The gates `out` holds a packet on, each with how many.
+std::map<gate_idx_t, size_t> Counts(const std::map<gate_idx_t, std::vector<Bytes>> &out) {
+  std::map<gate_idx_t, size_t> counts;
+  for (const auto &[gate, packets] : out) {
+    if (!packets.empty()) {
+      counts[gate] = packets.size();
+    }
+  }
+  return counts;
+}
+
+using GateCounts = std::map<gate_idx_t, size_t>;
+
+const Octets kFull4 = {0xff, 0xff, 0xff, 0xff};
+
+// Rules on (IPv4 src, IPv4 dst) send each packet, unchanged, out its rule's
+// gate; a packet no rule matches takes the default gate. Re-adding a (mask,
+// value) with another gate and priority replaces the rule.
+TEST(WildcardMatchPacketTest, IpPairRulesPickTheGateAndMissesTakeTheDefault) {
+  ModuleHarness h;
+  Module *wm = CreateWm(h, {WmField(26, 4), WmField(30, 4)});
+  ASSERT_NE(nullptr, wm);
+  const Octets dip = IpOctets("12.34.56.78");
+  const std::vector<Octets> s1d = {IpOctets("65.43.21.0"), dip};
+  const std::vector<Octets> s2d = {IpOctets("0.12.34.56"), dip};
+  h.MustCommand(wm, "add", WmRule(0, 0, {kFull4, kFull4}, s1d));
+  h.MustCommand(wm, "add", WmRule(1, 1, {kFull4, kFull4}, s1d));
+  h.MustCommand(wm, "add", WmRule(0, 0, {kFull4, kFull4}, s2d));
+  h.MustCommand(wm, "add", WmRule(2, 1, {kFull4, kFull4}, s2d));
+  h.MustCommand(wm, "set_default_gate", WmDefault(3));
+
+  std::mt19937 rng(1);
+  const Bytes pkt1 = TcpPacket({.sip = "65.43.21.0", .dip = "12.34.56.78"}, rng);
+  const Bytes pkt2 = TcpPacket({.sip = "0.12.34.56", .dip = "12.34.56.78"}, rng);
+  const Bytes miss = TcpPacket({.sip = "0.12.33.56", .dip = "12.34.56.78"}, rng);
+
+  EXPECT_TRUE(Counts(h.Run(wm, 0, {}, {0, 1, 2, 3})).empty());
+  auto out = h.Run(wm, 0, {pkt1}, {0, 1, 2, 3});
+  EXPECT_EQ((GateCounts{{1, 1}}), Counts(out));
+  EXPECT_EQ((std::vector<Bytes>{pkt1}), out[1]);
+  out = h.Run(wm, 0, {pkt2}, {0, 1, 2, 3});
+  EXPECT_EQ((GateCounts{{2, 1}}), Counts(out));
+  EXPECT_EQ((std::vector<Bytes>{pkt2}), out[2]);
+  out = h.Run(wm, 0, {miss}, {0, 1, 2, 3});
+  EXPECT_EQ((GateCounts{{3, 1}}), Counts(out));
+  EXPECT_EQ((std::vector<Bytes>{miss}), out[3]);
+}
+
+// Masks need not be prefixes: arbitrary bits inside each byte are matched,
+// the others are wildcards.
+TEST(WildcardMatchPacketTest, NonPrefixMasksMatchOnlyTheMaskedBits) {
+  ModuleHarness h;
+  Module *wm = CreateWm(h, {WmField(26, 4)});
+  ASSERT_NE(nullptr, wm);
+  h.MustCommand(wm, "add", WmRule(1, 1, {{0x0f, 0xf0, 0x00, 0xff}}, {{0x0a, 0x30, 0x00, 0x44}}));
+  h.MustCommand(wm, "set_default_gate", WmDefault(2));
+
+  std::mt19937 rng(2);
+  // 26.51.119.68 = 1a 33 77 44: the masked bits match, the wildcard bits
+  // differ from the rule's.
+  const Bytes hit = TcpPacket({.sip = "26.51.119.68", .dip = "10.0.0.1"}, rng);
+  const Bytes miss = TcpPacket({.sip = "26.51.119.69", .dip = "10.0.0.1"}, rng);
+  EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(wm, 0, {hit}, {0, 1, 2})));
+  EXPECT_EQ((GateCounts{{2, 1}}), Counts(h.Run(wm, 0, {miss}, {0, 1, 2})));
+}
+
+// 1-, 3- and 7-byte fields: the key is not a multiple of eight bytes and no
+// field is word-sized; every byte of every field counts.
+TEST(WildcardMatchPacketTest, MixedFieldSizesFormTheKey) {
+  ModuleHarness h;
+  Module *wm = CreateWm(h, {WmField(26, 1), WmField(27, 3), WmField(30, 7)});
+  ASSERT_NE(nullptr, wm);
+  std::mt19937 rng(3);
+  const Bytes pkt =
+      TcpPacket({.sip = "26.51.119.68", .dip = "10.0.0.1", .sport = 1000, .dport = 2000}, rng);
+  h.MustCommand(wm, "add",
+                WmRule(1, 1, {Octets(1, 0xff), Octets(3, 0xff), Octets(7, 0xff)},
+                       {Octets(pkt.begin() + 26, pkt.begin() + 27),
+                        Octets(pkt.begin() + 27, pkt.begin() + 30),
+                        Octets(pkt.begin() + 30, pkt.begin() + 37)}));
+  h.MustCommand(wm, "set_default_gate", WmDefault(2));
+  EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1, 2})));
+
+  // Only the last byte of the destination address (inside the 7-byte field)
+  // differs.
+  const Bytes other =
+      TcpPacket({.sip = "26.51.119.68", .dip = "10.0.0.9", .sport = 1000, .dport = 2000}, rng);
+  EXPECT_EQ((GateCounts{{2, 1}}), Counts(h.Run(wm, 0, {other}, {0, 1, 2})));
+}
+
+// Two different masks match the same packet: the higher priority wins
+// whichever was added first; at equal priority the later command wins.
+TEST(WildcardMatchPacketTest, PriorityDecidesAcrossMasksAndTiesGoToTheLaterCommand) {
+  ModuleHarness h;
+  const Octets wild_mask = {0xff, 0x00, 0x00, 0x00};
+  const Octets wild = {0x1a, 0x00, 0x00, 0x00};
+  const Octets exact = {0x1a, 0x33, 0x77, 0x44};
+  std::mt19937 rng(4);
+  const Bytes pkt = TcpPacket({.sip = "26.51.119.68", .dip = "10.0.0.1"}, rng);
+
+  Module *wm = CreateWm(h, {WmField(26, 4)});
+  ASSERT_NE(nullptr, wm);
+  h.MustCommand(wm, "add", WmRule(1, 1, {wild_mask}, {wild}));
+  h.MustCommand(wm, "add", WmRule(2, 9, {kFull4}, {exact}));
+  h.MustCommand(wm, "set_default_gate", WmDefault(3));
+  EXPECT_EQ((GateCounts{{2, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1, 2, 3})));
+
+  Module *tie = CreateWm(h, {WmField(26, 4)});
+  ASSERT_NE(nullptr, tie);
+  h.MustCommand(tie, "add", WmRule(1, 5, {wild_mask}, {wild}));
+  h.MustCommand(tie, "add", WmRule(2, 5, {kFull4}, {exact}));
+  h.MustCommand(tie, "set_default_gate", WmDefault(3));
+  EXPECT_EQ((GateCounts{{2, 1}}), Counts(h.Run(tie, 0, {pkt}, {0, 1, 2, 3})));
+
+  Module *reversed = CreateWm(h, {WmField(26, 4)});
+  ASSERT_NE(nullptr, reversed);
+  h.MustCommand(reversed, "add", WmRule(2, 5, {kFull4}, {exact}));
+  h.MustCommand(reversed, "add", WmRule(1, 5, {wild_mask}, {wild}));
+  h.MustCommand(reversed, "set_default_gate", WmDefault(3));
+  EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(reversed, 0, {pkt}, {0, 1, 2, 3})));
+}
+
+// A deleted rule no longer matches; clear() frees the masks' capacity: eight
+// new masks fit afterwards, and they are the ones packets now see (the last
+// matches the probe).
+TEST(WildcardMatchPacketTest, DeleteAndClearChangeWhatPacketsMatch) {
+  ModuleHarness h;
+  Module *wm = CreateWm(h, {WmField(26, 4)});
+  ASSERT_NE(nullptr, wm);
+  const Octets addr = IpOctets("26.51.119.68");
+  h.MustCommand(wm, "add", WmRule(1, 1, {kFull4}, {addr}));
+  h.MustCommand(wm, "set_default_gate", WmDefault(2));
+  std::mt19937 rng(5);
+  const Bytes pkt = TcpPacket({.sip = "26.51.119.68", .dip = "10.0.0.1"}, rng);
+  EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1, 2})));
+
+  h.MustCommand(wm, "delete", WmKey({kFull4}, {addr}));
+  EXPECT_EQ((GateCounts{{2, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1, 2})));
+
+  for (uint8_t i = 0; i < 8; i++) {
+    h.MustCommand(wm, "add", WmRule(1, 1, {{0xff, 0, 0, i}}, {{0x1a, 0, 0, i}}));
+  }
+  h.MustCommand(wm, "clear", bess::pb::EmptyArg());
+  for (uint8_t i = 0; i < 8; i++) {
+    h.MustCommand(wm, "add", WmRule(1, 1, {{0, 0xff, i, 0}}, {{0, 0x33, i, 0}}));
+  }
+  EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1, 2})));
+}
+
+// A field reaching past the end of the packet is not read: the packet takes
+// the default gate (an all-zero read would have matched the rule).
+TEST(WildcardMatchPacketTest, ShortPacketTakesTheDefaultGate) {
+  ModuleHarness h;
+  Module *wm = CreateWm(h, {WmField(30, 4)});
+  ASSERT_NE(nullptr, wm);
+  h.MustCommand(wm, "add", WmRule(1, 1, {kFull4}, {{0, 0, 0, 0}}));
+  h.MustCommand(wm, "set_default_gate", WmDefault(2));
+  const Bytes short_pkt(20, 0);
+  auto out = h.Run(wm, 0, {short_pkt}, {0, 1, 2});
+  EXPECT_EQ((GateCounts{{2, 1}}), Counts(out));
+  EXPECT_EQ((std::vector<Bytes>{short_pkt}), out[2]);
+}
+
+// A field may be a metadata attribute: three SetMetadata writers feed one
+// WildcardMatch through a Merge, and each packet goes where its attribute's
+// value sends it (no rule: the default gate).
+TEST(WildcardMatchPacketTest, MatchesOnAMetadataAttribute) {
+  ModuleHarness h;
+  Field attr;
+  attr.set_attr_name("sangjin");
+  attr.set_num_bytes(2);
+  Module *wm = CreateWm(h, {attr});
+  ASSERT_NE(nullptr, wm);
+  h.MustCommand(wm, "add", WmRule(1, 0, {{0xff, 0xff}}, {{0x88, 0x80}}));
+  h.MustCommand(wm, "add", WmRule(2, 0, {{0xff, 0xff}}, {{0x77, 0x70}}));
+  h.MustCommand(wm, "set_default_gate", WmDefault(0));
+
+  Module *merge = h.Create("Merge", bess::pb::MergeArg());
+  ASSERT_NE(nullptr, merge);
+  // No default gate hooks: Track counts per worker, and the harness runs
+  // off any worker.
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(merge, 0, wm, 0, true));
+  std::vector<Module *> tags;
+  for (const char *value : {"\x77\x90", "\x88\x80", "\x77\x70"}) {
+    bess::pb::SetMetadataArg tag;
+    auto *a = tag.add_attrs();
+    a->set_name("sangjin");
+    a->set_size(2);
+    a->set_value_bin(std::string(value, 2));
+    Module *m = h.Create("SetMetadata", tag);
+    ASSERT_NE(nullptr, m);
+    ASSERT_EQ(0, ModuleGraph::ConnectModules(m, 0, merge, 0, true));
+    tags.push_back(m);
+  }
+
+  // An IPv4/UDP packet without an Ethernet header, as the Python test sent.
+  PacketBuilder b;
+  b.IPv4("1.2.3.4", "2.3.4.5").Udp(10001, 10002).Payload("helloworld");
+  b.Last<PacketBuilder::IPv4Hdr>().ttl = 98;
+  const Bytes pkt = b.Build();
+  for (gate_idx_t i = 0; i < 3; i++) {
+    auto out = h.RunPipeline(tags[i], 0, {pkt}, wm, {0, 1, 2});
+    EXPECT_EQ((GateCounts{{i, 1}}), Counts(out)) << "tag " << i;
+    EXPECT_EQ((std::vector<Bytes>{pkt}), out[i]) << "tag " << i;
+  }
+}
+
+// get_initial_arg reproduces the creation argument (a metadata and a packet
+// field); get_runtime_config the default gate and the rules, sorted by
+// priority.
+TEST(WildcardMatchPacketTest, InitialArgAndRuntimeConfigReproduceTheModule) {
+  ModuleHarness h;
+  WildcardMatchArg arg;
+  Field attr;
+  attr.set_attr_name("babylon5");
+  attr.set_num_bytes(2);
+  *arg.add_fields() = attr;
+  *arg.add_fields() = WmField(10, 1);
+  Module *wm = h.Create("WildcardMatch", arg);
+  ASSERT_NE(nullptr, wm);
+  const WildcardMatchCommandAddArg r1 = WmRule(1, 1, {{0xff, 0xf0}, {0x7f}}, {{0x88, 0x80}, {0x03}});
+  const WildcardMatchCommandAddArg r2 = WmRule(2, 2, {{0xf0, 0xff}, {0x3f}}, {{0x70, 0x70}, {0x05}});
+  h.MustCommand(wm, "add", r2);  // added out of order: the answer is sorted
+  h.MustCommand(wm, "add", r1);
+  h.MustCommand(wm, "set_default_gate", WmDefault(3));
+
+  WildcardMatchConfig expect;
+  expect.set_default_gate(3);
+  *expect.add_rules() = r1;
+  *expect.add_rules() = r2;
+
+  WildcardMatchArg initial;
+  ASSERT_TRUE(h.MustCommand(wm, "get_initial_arg", bess::pb::EmptyArg()).UnpackTo(&initial));
+  EXPECT_TRUE(MessageDifferencer::Equals(arg, initial)) << initial.DebugString();
+  WildcardMatchConfig config;
+  ASSERT_TRUE(h.MustCommand(wm, "get_runtime_config", bess::pb::EmptyArg()).UnpackTo(&config));
+  EXPECT_TRUE(MessageDifferencer::Equals(expect, config)) << config.DebugString();
 }
 
 }  // namespace

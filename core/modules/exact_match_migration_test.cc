@@ -242,7 +242,7 @@ std::vector<uint8_t> RandomBytes(std::mt19937_64 &rng, size_t n) {
 }
 
 // Unique packed rule keys (avoids depending on duplicate-overwrite order,
-// which the module-level UpsertRule and python tests pin separately).
+// which the module-level UpsertRule and ExactMatchPacketTest pin separately).
 std::vector<std::vector<std::vector<uint8_t>>> UniqueRules(
     std::mt19937_64 &rng, const std::vector<TestField> &fields, size_t n) {
   std::vector<std::vector<std::vector<uint8_t>>> rules;
