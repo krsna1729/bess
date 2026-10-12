@@ -73,12 +73,10 @@ inline void ResetPacket(bess::PacketRef pkt) {
 }
 
 inline void Rewrite::DoRewriteSingle(bess::PacketBatch *batch) {
-  const int cnt = batch->cnt();
   uint16_t size = template_size_[0];
   const void *templ = templates_[0];
 
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
+  for (bess::PacketRef pkt : batch->packets()) {
     ResetPacket(pkt);
     void *ptr = pkt.append(size);
     bess::utils::CopyInlined(ptr, templ, size, true);

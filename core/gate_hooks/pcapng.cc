@@ -162,9 +162,7 @@ void Pcapng::ProcessBatch(const bess::PacketBatch *batch) {
   uint64_t ts = tv.tv_sec * 1000000 + tv.tv_usec;
   uint16_t comment_size = static_cast<uint16_t>(attr_template_.size());
 
-  for (int i = 0; i < batch->cnt(); i++) {
-    bess::PacketRef pkt = batch->packet(i);
-
+  for (bess::PacketRef pkt : batch->packets()) {
     Option opt_comment = {
         .code = Option::kComment,
         .len = comment_size,

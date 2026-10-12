@@ -158,7 +158,6 @@ void PacketStore::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
     RunTask(ctx, release_batch, nullptr);
   }
-  const int cnt = batch->cnt();
   const uint64_t now_ns = tsc_to_ns(current_worker.current_tsc());
 
   const auto store_offset = attr_offset(store_id_attr_);
@@ -169,9 +168,7 @@ void PacketStore::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     EvictExpired(now_ns);
   }
 
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
-
+  for (bess::PacketRef pkt : batch->packets()) {
     uint32_t flow_id = 0;
     if (bess::metadata::IsValidOffset(store_offset)) {
       flow_id = get_attr_with_offset<be32_t>(store_offset, pkt).value();

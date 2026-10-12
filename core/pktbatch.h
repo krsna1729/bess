@@ -5,12 +5,15 @@
 #ifndef BESS_PKTBATCH_H_
 #define BESS_PKTBATCH_H_
 
+#include <cstddef>
+
 #include "packet_handle.h"
 #include "utils/copy.h"
 
 namespace bess {
 
 class PacketRef;
+class PacketRange;
 
 class PacketBatch {
  public:
@@ -19,7 +22,8 @@ class PacketBatch {
   void incr_cnt(int n = 1) { cnt_ += n; }
 
   // The stored representation: for ownership/transport machinery (ports,
-  // rings, allocators, batch copies). Packet-processing code wants packet(i).
+  // rings, allocators, batch copies). Packet-processing code wants packets()
+  // or packet(i).
   PacketHandle *handles() { return pkts_; }
   const PacketHandle *handles() const { return pkts_; }
 
@@ -27,6 +31,10 @@ class PacketBatch {
   // PacketRef is complete.
   PacketRef packet(size_t i);
   PacketRef packet(size_t i) const;
+
+  // The live packets, in order, for loops that need no index:
+  // `for (PacketRef pkt : batch->packets())`. Defined in packet.h.
+  PacketRange packets() const;
 
   void clear() { cnt_ = 0; }
 

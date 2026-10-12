@@ -39,9 +39,7 @@ CommandResponse Replicate::CommandSetGates(
 }
 
 void Replicate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  int cnt = batch->cnt();
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef tocopy = batch->packet(i);
+  for (bess::PacketRef tocopy : batch->packets()) {
     for (int j = 1; j < ngates_; j++) {
       bess::PacketRef newpkt(bess::PacketCopy(tocopy.handle()));
       if (newpkt.handle()) {

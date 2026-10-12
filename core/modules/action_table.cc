@@ -141,8 +141,8 @@ void ActionTable::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     // Fail closed: without the action id nothing can be resolved, and without
     // a place to put the action's meter and next hop the modules downstream
     // would see stale ids. OnEvent(PreResume) is where this is reported.
-    for (int i = 0; i < cnt; i++) {
-      EmitPacket(ctx, batch->packet(i), DROP_GATE);
+    for (bess::PacketRef pkt : batch->packets()) {
+      EmitPacket(ctx, pkt, DROP_GATE);
     }
     return;
   }

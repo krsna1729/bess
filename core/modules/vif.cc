@@ -140,14 +140,12 @@ CommandResponse Vif::CommandClear(const bess::pb::VifCommandClearArg &) {
 }
 
 void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  const int cnt = batch->cnt();
   const auto vif_offset = attr_offset(vif_id_attr_);
   const auto domain_offset = attr_offset(route_domain_attr_);
   const bool write_metadata = bess::metadata::IsValidOffset(vif_offset) &&
                               bess::metadata::IsValidOffset(domain_offset);
 
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
+  for (bess::PacketRef pkt : batch->packets()) {
     char *head = pkt.head_data<char *>();
     if (unlikely(pkt.head_len() < sizeof(Ethernet))) {
       EmitPacket(ctx, pkt, default_gate_);

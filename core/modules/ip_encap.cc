@@ -34,16 +34,13 @@ CommandResponse IPEncap::Init(const bess::pb::IPEncapArg &arg[[maybe_unused]]) {
 }
 
 void IPEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  int cnt = batch->cnt();
   const auto src_off = attr_offset(ATTR_R_IP_SRC);
   const auto dst_off = attr_offset(ATTR_R_IP_DST);
   const auto proto_off = attr_offset(ATTR_R_IP_PROTO);
   const auto nexthop_off = attr_offset(ATTR_W_IP_NEXTHOP);
   const auto type_off = attr_offset(ATTR_W_ETHER_TYPE);
 
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
-
+  for (bess::PacketRef pkt : batch->packets()) {
     be32_t ip_src = get_attr_with_offset<be32_t>(src_off, pkt);
     be32_t ip_dst = get_attr_with_offset<be32_t>(dst_off, pkt);
     uint8_t ip_proto = get_attr_with_offset<uint8_t>(proto_off, pkt);

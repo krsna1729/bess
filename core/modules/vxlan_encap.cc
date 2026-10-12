@@ -51,16 +51,13 @@ CommandResponse VXLANEncap::Init(const bess::pb::VXLANEncapArg &arg) {
 // the metadata written here), through the tunnel library (M19, D-069). A
 // packet without the headroom is dropped (before, it went on unencapsulated).
 void VXLANEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  const int cnt = batch->cnt();
   const auto tun_src = attr_offset(ATTR_R_TUN_IP_SRC);
   const auto tun_dst = attr_offset(ATTR_R_TUN_IP_DST);
   const auto tun_id = attr_offset(ATTR_R_TUN_ID);
   const auto out_src = attr_offset(ATTR_W_IP_SRC);
   const auto out_dst = attr_offset(ATTR_W_IP_DST);
   const auto out_proto = attr_offset(ATTR_W_IP_PROTO);
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
-
+  for (bess::PacketRef pkt : batch->packets()) {
     const be32_t ip_src = get_attr_with_offset<be32_t>(tun_src, pkt);
     const be32_t ip_dst = get_attr_with_offset<be32_t>(tun_dst, pkt);
     const be32_t vni = get_attr_with_offset<be32_t>(tun_id, pkt);

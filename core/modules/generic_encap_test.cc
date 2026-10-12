@@ -73,8 +73,7 @@ class GenericEncapTest : public ::testing::Test {
     ctx.task = &task;
     ge->ProcessBatch(&ctx, &batch);
     std::vector<std::vector<uint8_t>> out;
-    for (int i = 0; i < batch.cnt(); i++) {
-      PacketRef ref = batch.packet(i);
+    for (PacketRef ref : batch.packets()) {
       const auto *p = ref.head_data<const uint8_t *>();
       out.emplace_back(p, p + ref.data_len());
     }

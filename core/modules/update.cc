@@ -18,8 +18,6 @@ CommandResponse Update::Init(const bess::pb::UpdateArg &arg) {
 }
 
 void Update::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  int cnt = batch->cnt();
-
   for (size_t i = 0; i < num_fields_; i++) {
     const auto field = &fields_[i];
 
@@ -27,8 +25,7 @@ void Update::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     be64_t value = field->value;
     int16_t offset = field->offset;  // could be < 0
 
-    for (int j = 0; j < cnt; j++) {
-      bess::PacketRef snb = batch->packet(j);
+    for (bess::PacketRef snb : batch->packets()) {
       char *head = snb.head_data<char *>();
 
       be64_t *p = reinterpret_cast<be64_t *>(head + offset);

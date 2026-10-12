@@ -38,19 +38,15 @@ CommandResponse Split::Init(const bess::pb::SplitArg &arg) {
 void Split::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::be64_t;
 
-  int cnt = batch->cnt();
-
   if (attr_id_ >= 0) {
     bess::metadata::mt_offset_t offset = attr_offset(attr_id_);
-    for (int i = 0; i < cnt; i++) {
-      bess::PacketRef pkt = batch->packet(i);
+    for (bess::PacketRef pkt : batch->packets()) {
       uint64_t val = get_attr_with_offset<be64_t>(offset, pkt).value();
       val = (val >> shift_) & mask_;
       EmitPacket(ctx, pkt, val);
     }
   } else {
-    for (int i = 0; i < cnt; i++) {
-      bess::PacketRef pkt = batch->packet(i);
+    for (bess::PacketRef pkt : batch->packets()) {
       uint64_t val = (pkt.head_data<be64_t *>(offset_))->value();
       val = (val >> shift_) & mask_;
       EmitPacket(ctx, pkt, val);

@@ -178,9 +178,7 @@ inline void HashLB::DoProcessBatch<HashLB::Mode::kL2>(
     Context *ctx, bess::PacketBatch *batch, const Config &config) {
   const gate_idx_t *gates = config.gates.data();
   const uint16_t num_gates = static_cast<uint16_t>(config.gates.size());
-  int cnt = batch->cnt();
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef snb = batch->packet(i);
+  for (bess::PacketRef snb : batch->packets()) {
     uint16_t *parts = snb.head_data<uint16_t *>();
     uint16_t sum = 0;
 
@@ -203,9 +201,7 @@ inline void HashLB::DoProcessBatch<HashLB::Mode::kL3>(
   /* assumes untagged packets */
   const int ip_offset = 14;
 
-  int cnt = batch->cnt();
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef snb = batch->packet(i);
+  for (bess::PacketRef snb : batch->packets()) {
     char *head = snb.head_data<char *>();
 
     uint32_t hash_val;
@@ -226,9 +222,7 @@ inline void HashLB::DoProcessBatch<HashLB::Mode::kL4>(
   /* assumes untagged packets */
   const int ip_offset = 14;
 
-  int cnt = batch->cnt();
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef snb = batch->packet(i);
+  for (bess::PacketRef snb : batch->packets()) {
     char *head = snb.head_data<char *>();
     uint32_t l4_offset =
         ip_offset + ((*(reinterpret_cast<uint8_t *>(head + ip_offset)) & 0x0F)

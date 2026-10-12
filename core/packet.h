@@ -270,6 +270,38 @@ inline PacketRef PacketBatch::packet(size_t i) const {
   return PacketRef(handles()[i]);
 }
 
+// The live packets of a batch as PacketRefs (PacketBatch::packets()). A
+// pointer pair: no <ranges> in every packet TU.
+class PacketRange {
+ public:
+  class iterator {
+   public:
+    explicit iterator(const PacketHandle *p) : p_(p) {}
+    PacketRef operator*() const { return PacketRef(*p_); }
+    iterator &operator++() {
+      ++p_;
+      return *this;
+    }
+    bool operator==(const iterator &other) const = default;
+
+   private:
+    const PacketHandle *p_;
+  };
+
+  PacketRange(const PacketHandle *begin, const PacketHandle *end)
+      : begin_(begin), end_(end) {}
+  iterator begin() const { return iterator(begin_); }
+  iterator end() const { return iterator(end_); }
+
+ private:
+  const PacketHandle *begin_;
+  const PacketHandle *end_;
+};
+
+inline PacketRange PacketBatch::packets() const {
+  return PacketRange(handles(), handles() + cnt_);
+}
+
 inline void PacketBatch::add(PacketRef pkt) { handles()[cnt_++] = pkt.handle(); }
 
 }  // namespace bess

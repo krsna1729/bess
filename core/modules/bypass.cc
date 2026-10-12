@@ -20,9 +20,8 @@ void Bypass::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
   if (cycles_per_byte_) {
     uint64_t total_bytes = 0;
-    int cnt = batch->cnt();
-    for (int i = 0; i < cnt; i++) {
-      total_bytes = batch->packet(i).total_len();
+    for (bess::PacketRef pkt : batch->packets()) {
+      total_bytes += pkt.total_len();
     }
     cycles += cycles_per_byte_ * total_bytes;
   }

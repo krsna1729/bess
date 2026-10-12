@@ -26,14 +26,11 @@ CommandResponse EtherEncap::Init(
 };
 
 void EtherEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  int cnt = batch->cnt();
   const auto src_off = attr_offset(ATTR_R_ETHER_SRC);
   const auto dst_off = attr_offset(ATTR_R_ETHER_DST);
   const auto type_off = attr_offset(ATTR_R_ETHER_TYPE);
 
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
-
+  for (bess::PacketRef pkt : batch->packets()) {
     Ethernet::Address ether_src;
     Ethernet::Address ether_dst;
     bess::utils::be16_t ether_type;

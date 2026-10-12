@@ -12,10 +12,7 @@ void VLANSplit::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::Ethernet;
   using bess::utils::Vlan;
 
-  int cnt = batch->cnt();
-
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
+  for (bess::PacketRef pkt : batch->packets()) {
     char *old_head = pkt.head_data<char *>();
     const auto *eth = reinterpret_cast<const Ethernet *>(old_head);
     const be16_t tpid = eth->ether_type;

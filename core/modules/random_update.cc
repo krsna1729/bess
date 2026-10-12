@@ -88,8 +88,6 @@ CommandResponse RandomUpdate::CommandClear(const bess::pb::EmptyArg &) {
 }
 
 void RandomUpdate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  int cnt = batch->cnt();
-
   for (size_t i = 0; i < num_vars_; i++) {
     const auto var = &vars_[i];
 
@@ -99,8 +97,7 @@ void RandomUpdate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     size_t offset = var->offset;
     size_t bit_shift = var->bit_shift;
 
-    for (int j = 0; j < cnt; j++) {
-      bess::PacketRef pkt = batch->packet(j);
+    for (bess::PacketRef pkt : batch->packets()) {
       be32_t *p = pkt.head_data<be32_t *>(offset);
       uint32_t rand_val = min + rng_.GetRange(range);
       *p = (*p & mask) | (be32_t(rand_val) << bit_shift);

@@ -41,8 +41,8 @@ void Track::ProcessBatch(const bess::PacketBatch *batch) {
   const size_t cnt = batch->cnt();
   uint64_t bytes = 0;
   if (track_bytes_) {
-    for (size_t i = 0; i < cnt; i++) {
-      bytes += batch->packet(i).data_len() + kEthernetOverhead;
+    for (bess::PacketRef pkt : batch->packets()) {
+      bytes += pkt.data_len() + kEthernetOverhead;
     }
   }
 

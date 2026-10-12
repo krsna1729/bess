@@ -35,12 +35,10 @@ CommandResponse VXLANDecap::Init(
 // dropped; before, it was decapsulated at fixed offsets regardless.
 void VXLANDecap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::be32_t;
-  const int cnt = batch->cnt();
   const auto tun_src = attr_offset(ATTR_W_TUN_IP_SRC);
   const auto tun_dst = attr_offset(ATTR_W_TUN_IP_DST);
   const auto tun_id = attr_offset(ATTR_W_TUN_ID);
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
+  for (bess::PacketRef pkt : batch->packets()) {
     bess::conntrack::ParsedFlowPacket outer;
     bess::tunnel::Decapsulated d;
     const auto status = bess::tunnel::DecapVxlan(

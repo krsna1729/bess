@@ -338,8 +338,7 @@ TEST(DrrSchedulingTest, BackloggedFlowsGetEqualBytes) {
       bess::PacketBatch out;
       const uint32_t got = DrrTestPeer::NextBatch(drr, &out);
       ASSERT_GT(got, 0u) << "a backlogged DRR produced nothing";
-      for (int i = 0; i < out.cnt(); i++) {
-        bess::PacketRef pkt = out.packet(i);
+      for (bess::PacketRef pkt : out.packets()) {
         const uint8_t flow = pkt.head_data<uint8_t *>()[29];
         ASSERT_TRUE(flow == 1 || flow == 2);
         bytes[flow] += pkt.total_len();

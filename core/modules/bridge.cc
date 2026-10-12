@@ -120,7 +120,6 @@ void Bridge::Flood(Context *ctx, bess::PacketRef pkt, gate_idx_t,
 }
 
 void Bridge::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  const int cnt = batch->cnt();
   const gate_idx_t igate = ctx->current_igate;
   const uint64_t now = tsc_to_ns(current_worker.current_tsc());
   fdb_->Age(now, kAgeBudget);
@@ -133,8 +132,7 @@ void Bridge::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
   }
   const dataplane::InterfaceId ingress = InterfaceOfGate(igate);
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
+  for (bess::PacketRef pkt : batch->packets()) {
     if (unlikely(pkt.head_len() < sizeof(Ethernet))) {
       DropPacket(ctx, pkt);
       continue;

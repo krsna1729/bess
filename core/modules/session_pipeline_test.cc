@@ -260,9 +260,9 @@ TEST_F(SessionPipelineTest, OneTransactionCreatesASession) {
     // next one does not.
     mt->set_attr_offset(0, 0);  // meter_id, at metadata offset 0
     bess::PacketBatch batch = packets.Batch(0, 2);
-    for (int i = 0; i < batch.cnt(); i++) {
-      _set_attr_with_offset<bess::utils::be32_t>(
-          0, batch.packet(i), bess::utils::be32_t(1));
+    for (bess::PacketRef pkt : batch.packets()) {
+      _set_attr_with_offset<bess::utils::be32_t>(0, pkt,
+                                                 bess::utils::be32_t(1));
     }
     std::array<gate_idx_t, 2> gates;
     mt->MeterBatch(&batch, gates.data());

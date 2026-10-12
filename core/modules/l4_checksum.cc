@@ -19,10 +19,7 @@ void L4Checksum::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::Tcp;
   using bess::utils::Udp;
 
-  int cnt = batch->cnt();
-
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
+  for (bess::PacketRef pkt : batch->packets()) {
     Ethernet *eth = pkt.head_data<Ethernet *>();
 
     // Calculate checksum only for IPv4 packets

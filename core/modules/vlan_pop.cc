@@ -11,10 +11,7 @@ void VLANPop::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::be16_t;
   using bess::utils::Ethernet;
 
-  int cnt = batch->cnt();
-
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
+  for (bess::PacketRef pkt : batch->packets()) {
     char *old_head = pkt.head_data<char *>();
     const be16_t tpid =
         reinterpret_cast<const Ethernet *>(old_head)->ether_type;
