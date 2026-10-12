@@ -19,12 +19,15 @@ Columns:
 | Packet data room | 2,048 B (`SNBUF_DATA`) | `--packet_data_room` | 1 to 65,535 − headroom (`kMaxPacketDataSize`, `packet.h`) | start-up refused |
 | Packet metadata area | 128 B | `SNBUF_METADATA` (`snbuf_layout.h`) | No | attributes that do not fit get no offset; their readers fail closed |
 | Metadata attributes per module | 16 | `kMaxAttrsPerModule` (`metadata.h`) | No | ENOSPC from `AddMetadataAttr` (module init fails) |
+| Metadata attribute size | 32 B | `kMetadataAttrMaxSize` (`metadata.h`) | No | EINVAL from `AddMetadataAttr` (module init fails) |
+| Plugin load passes (module inheritance depth) | 10 | `kInheritanceLimit` (`framework/plugin_loader.h`) | No | plugins still unresolved after 10 `dlopen` passes are logged "Failed to load plugin" and the load reports failure |
 | Packet pool default capacity | 65,535 | `PacketPool::kDefaultCapacity` (`packet_pool.h`) | pool creation argument | — |
 | Packet pool per-core cache | 512 (pools > 1,024 packets) | `PacketPool::kMaxCacheSize` | No | — |
 | Burst size | 32 packets | `PacketBatch::kMaxBurst` (`pktbatch.h`) | No | ABI-wide constant |
 | Batches per task run | 256 | `MAX_PBATCH_CNT` (`task.h`) | No | `CHECK` abort (a graph that fans out past it is a bug, D-061) |
 | gRPC message size, each way | 64 MiB | `kMaxMessageBytes` (`control/api_v2.h`) | No | RESOURCE_EXHAUSTED |
 | Default gRPC port | 10514 | `kDefaultPort` (`runtime/opts.cc`) | `--grpc_url` (or the deprecated `-p`) | — |
+| Default bind address | 127.0.0.1 | `kDefaultBindAddr` (`runtime/opts.cc`) | `-b` | — |
 | Scheduler quiescent interval | 10 µs | `kDefaultQuiescentIntervalUs` (`scheduler.h`) | `BESS_QUIESCENT_INTERVAL_US` (µs, or `rounds`), read when a worker starts | — |
 | RCU retire high water | 4,096 pending retirements | `RcuDomain::kDefaultRetireHighWater` | No | the control thread reclaims, waiting for a grace period if needed; the packet path never waits |
 
@@ -78,7 +81,7 @@ Columns:
 | Conntrack | flows | default 65,536 | `ConntrackArg.capacity` | yes | a new connection's packet leaves on gate 1 (not tracked) and `bess.table_full` is raised |
 | Conntrack | IPv6 extension headers parsed | 8 | `kMaxExtensionHeaders` (`conntrack/packet_parse.h`) | No | packet treated as malformed |
 | DRR | flows | default 4,096; max 16M | `DRR::kDefaultNumFlows`, `kMaxNumFlows` | `num_flows` | EINVAL |
-| Queue | size | default 1,024 | `DEFAULT_QUEUE_SIZE` (`queue.cc`) | `size` | — |
+| Queue | size | default 1,024; 4–16,384, a power of 2 | `DEFAULT_QUEUE_SIZE` (`queue.cc`); the bounds are literals in `Queue::SetSize` | `size` | EINVAL "must be in [4, 16384]" / "must be a power of 2" |
 | Measure | histogram | 100 ns buckets to 100 ms | `kDefaultNsPerBucket`, `kDefaultMaxNs` | `latency_ns_resolution`, `latency_ns_max` | values above the range are counted in the last bucket |
 | BPF | snap length | 65,535 | `SNAPLEN` (`bpf.cc`) | No | — |
 | WildcardMatch / ExactMatch | key bytes | 64 (fields × bytes) | `kMaxKeyBytes` | No | follows from the field limits |
@@ -89,6 +92,9 @@ Columns:
 | Measure | jitter sample probability | 0.05 | `kDefaultIpDvSampleProb` | `jitter_sample_prob` | — |
 | FlowGen | smallest TCP packet | 60 B | `kMinTcpPacketSize` (`flowgen.cc`) | No | — |
 | unix_socket port | idle poll interval | 50 µs | `UnixSocketPort::kDefaultMinRxInterval` | port argument `min_rx_interval_ns` | — |
+| VXLANEncap | UDP destination port | 4789 | `VXLANEncap::kDefaultDstPort` | `dstport` | — |
+| Dump | sampling interval | 1 s | `DEFAULT_INTERVAL_NS` (`dump.cc`) | `interval` | — |
+| Router | default route domain | 0 | `kDefaultRouteDomainId` (`route/route_domain.h`) | the route key's `domain` | — |
 
 ## Other fixed constants
 
@@ -110,6 +116,8 @@ Not reachable as a configuration error, but each one changes behavior.
 | `kDefaultTarget`, `kDefaultWindow`, `kDefaultSlots` | 5 ms, 100 ms, 4,096 | `utils/codel.h` | CoDel defaults; no module uses CoDel (only `codel_test`) |
 | `kMaxPidfileLockTrials` | 5 | `bessd.cc` | attempts to lock the pidfile against a running bessd |
 | `MAX_TRACE_DEPTH`, `MAX_TRACE_BUFSIZE` | 32, 4,096 B | `module.cc` | module call tracing, compiled only with `SN_TRACE_MODULES` |
+| `kPackedPriorityLimit` | ±32,767 | `classifier/concurrent_masked.h` | WildcardMatch priorities in this range are packed into the table value and compared there; outside it the rule's record supplies the rank (same result) |
+| `kMaskedMaxKeyBytes` | 64 B | `classifier/masked_exact.h` | widest masked key; sizes the packet path's stack scratch |
 
 ## Internal batch bounds (not reachable from configuration)
 

@@ -16,10 +16,18 @@ from pathlib import Path
 import re
 import sys
 
+# k...Max..., k...Min..., k...Default..., k...Limit... (kMaxBatch,
+# kMetadataAttrMaxSize, kMaxTuplesLimit) and MAX_*/MIN_*/DEFAULT_* constants.
+NAME = r'(k\w*?(?:Max|Min|Default|Limit)\w*|(?:MAX|MIN|DEFAULT)_[A-Z0-9_]+)'
+
 DEFINITION = re.compile(
-    r'^\s*(?:#\s*define\s+((?:MAX|MIN|DEFAULT)_[A-Z0-9_]+)\b'
-    r'|(?:(?:static|inline)\s+)*(?:constexpr|const)\s+[\w:<>]+\s+'
-    r'(k(?:Max|Min|Default)[A-Za-z0-9]*)\s*=)')
+    # A macro: #define MAX_GATES 8192.
+    r'^\s*#\s*define\s+((?:MAX|MIN|DEFAULT)_[A-Z0-9_]+)\b'
+    # A constant of any type (pointers, templates), in or out of its class
+    # (Class::kName), initialized with = or {}, or declared here and defined
+    # elsewhere (;). No '(' before the name: not a function.
+    r'|^\s*(?:(?:static|inline|extern)\s+)*(?:constexpr|const)\b[^=;{(]*?'
+    r'\b(?:\w+::)*' + NAME + r'\s*(?:=|;|\{)')
 
 SKIP = re.compile(r'_test\.cc$|_bench\.(?:cc|h)$|_fuzz|/fuzz/|/testing/')
 
@@ -27,6 +35,7 @@ SKIP = re.compile(r'_test\.cc$|_bench\.(?:cc|h)$|_fuzz|/fuzz/|/testing/')
 NOT_LIMITS = {
     'kMax': 'local saturation bound in dataplane/tick_rate.h arithmetic',
     'kMinVer': 'pcapng format minor version (utils/pcapng.h)',
+    'kNoDefault': 'sentinel for "no default route" (route/route_table.h)',
 }
 
 
@@ -57,11 +66,20 @@ def self_test():
         '  static constexpr size_t kMaxBatch = 64;',
         'static const int kDefaultQuantum =',
         'inline constexpr uint64_t kDefaultNatTimeout = 300;',
-        'constexpr int kNotALimit = 3;',
+        '  static const uint16_t kDefaultDstPort;',
+        'const uint16_t VXLANEncap::kDefaultDstPort = 4789;',
+        'inline constexpr RouteDomainId kDefaultRouteDomainId{0};',
+        'static const char *kDefaultBindAddr = "127.0.0.1";',
+        'static const uint64_t DEFAULT_INTERVAL_NS = 1;',
+        'static const size_t kMetadataAttrMaxSize = 32;',
+        'constexpr int kBurstBytes = 3;',
+        'static const int kMaxThing(int x);',
         '#define BESS_ARCH_X86 1',
     ])
     names = [n for _, n in definitions(sample)]
-    expected = ['MAX_GATES', 'kMaxBatch', 'kDefaultQuantum', 'kDefaultNatTimeout']
+    expected = ['MAX_GATES', 'kMaxBatch', 'kDefaultQuantum', 'kDefaultNatTimeout',
+                'kDefaultDstPort', 'kDefaultDstPort', 'kDefaultRouteDomainId',
+                'kDefaultBindAddr', 'DEFAULT_INTERVAL_NS', 'kMetadataAttrMaxSize']
     if names != expected:
         print(f'self-test: got {names}, want {expected}')
         return 1
