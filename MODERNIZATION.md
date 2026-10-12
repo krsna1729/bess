@@ -8803,7 +8803,7 @@ consumer-driven (D-008, §31.3 item 2).
   `resources`, `metrics`, `events`, module commands over control_v2
   (`command`, D-115), and administration over the v2 Admin
   service (D-107: `ports`, `pools`, `plugin`, `capture`, `pause`, `resume`,
-  `shutdown`); live suite `bessctl_cpp`. Task placement is desired state, and
+  `shutdown`); live suite `live_bessctl` (tests/live, C++). Task placement is desired state, and
   all 38 `conf/samples` are manifests, each applied live (D-109, D-110,
   D-111, D-114). Pending: the legacy commands (daemon start, `.bess`,
   shell), a static baseline `-march` build.

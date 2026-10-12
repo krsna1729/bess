@@ -10,7 +10,6 @@ python_env = {
   'BESSD_BINARY': join_paths(meson.project_build_root(), 'core', 'bessd'),
   'BESS_SDK_CPP_CONFORMANCE': join_paths(meson.project_build_root(), 'sdk', 'cpp',
                                          'sdk_cpp_conformance'),
-  'BESSCTL_CPP': bessctl_exe.full_path(),
   'LD_LIBRARY_PATH': dpdk_libdir,
 }
 

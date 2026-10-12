@@ -713,6 +713,7 @@ unit_test_sources = [
   'runtime/memory_test.cc',
   'metadata_test.cc',
   'module_test.cc',
+  'modules/arp_responder_test.cc',
   'modules/bridge_test.cc',
   'modules/drr_test.cc',
   'modules/exact_match_migration_test.cc',
@@ -774,6 +775,14 @@ allocation_faults_lib = static_library(
   # TSan's runtime owns operator new/delete: no replacement there (D-072).
   cpp_args: get_option('b_sanitize').contains('thread') ? ['-DBESS_ALLOCATION_FAULTS_DISABLED'] : [],
 )
+# In-process module tests (testing/module_harness.h): registers the harness's
+# injector and capture modules, so it is linked whole into modules/ tests.
+module_harness_lib = static_library(
+  'testing_module_harness',
+  'testing/module_harness.cc',
+  include_directories: core_include,
+  dependencies: runtime_deps + [gtest_dep],
+)
 allocation_fault_tests = [
   'dataplane/continuation_test.cc',
   'dataplane/expiry_wheel_test.cc',
@@ -810,7 +819,7 @@ foreach source : (get_option('build_tests') ? unit_test_sources : [])
   test_link_with = component_runtime_whole
   test_link_whole = []
   if source.startswith('modules/')
-    test_link_whole = module_runtime_whole
+    test_link_whole = [module_runtime_whole, module_harness_lib]
     test_link_with = []
   elif source in [
     'dataplane/object_table_rcu_test.cc',

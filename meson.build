@@ -337,6 +337,9 @@ subdir('sdk/cpp')
 subdir('bessctl')
 subdir('pybess')
 subdir('core')
+if get_option('build_tests')
+  subdir('tests/live')
+endif
 
 # What this build is made of (M26): version, commit, compilers, options, the
 # DPDK pin and every dependency's version, and an SPDX SBOM from the same
