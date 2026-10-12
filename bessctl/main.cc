@@ -230,7 +230,8 @@ class Cli {
 
   // The pipeline, then the manifest's resource entries in one transaction:
   // its resources exist only once the pipeline does. Both steps are
-  // idempotent, so after a failed second step the same apply is the retry.
+  // idempotent, so after a failed second step the same apply is the retry
+  // (with --generation, at the generation the first step reached).
   int Apply(const std::string &path, std::optional<uint64_t> generation) {
     auto schema = LoadSchema();
     auto m = schema ? ReadManifest(**schema, path) : std::nullopt;
@@ -250,8 +251,10 @@ class Cli {
     }
     auto committed = CommitEntries(**schema, *m);
     if (!committed) {
-      return Fail(std::format("the pipeline is applied, its resource entries are not: {}",
-                              committed.error()));
+      return Fail(std::format(
+          "the pipeline is applied, its resource entries are not: {} (fix and apply again{})",
+          committed.error(),
+          generation ? std::format(" with --generation {}", r->generation()) : ""));
     }
     std::println("resources: {} entr{} in {} resource(s); transaction {}, resource generation {}",
                  m->entries(), m->entries() == 1 ? "y" : "ies", m->resources.size(),
@@ -475,7 +478,7 @@ int main(int argc, char **argv) {
     if (rest.size() == 3) {
       generation = ParseU64(rest[2]);
       if (!generation) {
-        return Fail("--generation needs a number");
+        return Usage();
       }
     }
     return cli.Apply(rest[0], generation);
@@ -490,11 +493,12 @@ int main(int argc, char **argv) {
     uint64_t from = 0;
     std::vector<std::string> types;
     for (size_t i = 0; i < rest.size(); i++) {
-      if (rest[i] == "--from" && i + 1 < rest.size()) {
-        auto v = ParseU64(rest[++i]);
+      if (rest[i] == "--from") {
+        auto v = i + 1 < rest.size() ? ParseU64(rest[++i]) : std::nullopt;
         if (!v) {
-          return Fail("--from needs a number");
+          return Usage();
         }
+        from = *v;
       } else {
         types.push_back(rest[i]);
       }

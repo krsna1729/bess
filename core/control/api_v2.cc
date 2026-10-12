@@ -744,7 +744,10 @@ grpc::Status ControlV2Service::GetSchema(grpc::ServerContext *, const v2::GetSch
     out->set_init_arg_type(builder.init_arg_type());
     types.insert(builder.init_arg_type());
   }
-  for (const v2::TransactionResource &r : transactions_.List().resources()) {
+  // Held: a range-for over a temporary's member destroys the temporary first
+  // (before C++23's P2718, which GCC 14 and Clang 19 lack).
+  const v2::ListTransactionResourcesResponse resources = transactions_.List();
+  for (const v2::TransactionResource &r : resources.resources()) {
     types.insert(r.key_type());
     types.insert(r.value_type());
   }

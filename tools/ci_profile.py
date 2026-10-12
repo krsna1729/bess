@@ -633,23 +633,37 @@ def step_release_configure(s):
 
 
 def step_release_build(s):
-    s.run(['meson', 'compile', '-C', s.build_dir, '-j', s.jobs, 'core/bessd'],
+    # Both shipped executables: `meson install` (package_release.py) links
+    # the rest, but these are what a static build can fail to link.
+    s.run(['meson', 'compile', '-C', s.build_dir, '-j', s.jobs, 'core/bessd', 'bessctl/bessctl'],
           env=s.env_with_dpdk())
 
 
 def step_release_verify(s):
     bessd = s.build_dir / 'core' / 'bessd'
+    bessctl = s.build_dir / 'bessctl' / 'bessctl'
     if s.dry_run:
         print(f'+ ldd {bessd} must name no librte_*')
+        print(f'+ ldd {bessctl} must name no libbess-sdk, libgrpc++, libprotobuf or libstdc++')
         return
-    if not bessd.is_file():
-        raise SystemExit(f'{bessd} was not built')
+    for binary in (bessd, bessctl):
+        if not binary.is_file():
+            raise SystemExit(f'{binary} was not built')
     linked = subprocess.run(['ldd', bessd], capture_output=True, text=True).stdout
     dynamic_dpdk = [l for l in linked.splitlines() if 'librte' in l.lower()]
     if dynamic_dpdk:
         raise SystemExit('bessd has unexpected dynamic DPDK dependencies:\n'
                          + '\n'.join(dynamic_dpdk))
     print('bessd links no dynamic DPDK library')
+    # bessctl ships beside bessd in the `bess` package, not with bess-sdk:
+    # the SDK and its C++ dependencies are linked in, and it runs.
+    linked = subprocess.run(['ldd', bessctl], capture_output=True, text=True).stdout
+    dynamic = [l for l in linked.splitlines()
+               if re.search(r'lib(bess-sdk|grpc\+\+|protobuf|stdc\+\+)', l)]
+    if dynamic:
+        raise SystemExit('bessctl has unexpected dynamic dependencies:\n' + '\n'.join(dynamic))
+    s.run([bessctl, '--help'])
+    print('bessctl links the SDK, gRPC, protobuf and libstdc++ statically and runs')
 
 
 RELEASE_STEPS = [

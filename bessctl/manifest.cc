@@ -102,7 +102,12 @@ std::expected<void, std::string> FillTypes(json::Value &doc, const ArgList &l,
           "{} \"{}\": {} \"{}\" declares no argument type; give \"@type\" in \"arg\"", l.what,
           Label(item), l.noun, *kind->string()));
     }
-    arg->object()->emplace(arg->object()->begin(), "@type", json::Value{TypeUrl(it->second)});
+    // Appended, not inserted first: protobuf reads "@type" anywhere in an Any,
+    // and inserting moved every member through a temporary that GCC 14 at -O3
+    // flagged as maybe-uninitialized (a false positive).
+    json::Object &members = *arg->object();
+    members.emplace_back("@type", json::Value{});
+    members.back().second.v = TypeUrl(it->second);
   }
   return {};
 }

@@ -10,6 +10,8 @@
 
 import json
 import os
+import select
+import signal
 import subprocess
 import tempfile
 from test_utils import *
@@ -128,6 +130,24 @@ class BessctlCppTest(BessModuleTestCase):
         self.bessctl('status')
         self.bessctl('metrics')
         self.assertEqual(self.bessctl('nonsense', ok=False).returncode, 2)
+        self.assertEqual(self.bessctl('events', '--from', 'x', ok=False).returncode, 2)
+        self.assertEqual(self.bessctl('apply', 'f', '--generation', '-1', ok=False).returncode, 2)
+
+        # `events --from 1` replays what the daemon holds (the transactions
+        # above) at once, then follows; Ctrl-C ends it cleanly.
+        watch = subprocess.Popen([self.binary, '-s', self.bess.peer, 'events', '--from', '1',
+                                  'bess.transaction'],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            ready, _, _ = select.select([watch.stdout], [], [], 10)
+            self.assertTrue(ready, 'events --from 1 printed nothing')
+            first = watch.stdout.readline().split()
+            self.assertEqual(first[1], 'bess.transaction', first)
+            self.assertIn('outcome=applied', first)
+        finally:
+            watch.send_signal(signal.SIGINT)
+            _, err = watch.communicate(timeout=10)
+        self.assertEqual(watch.returncode, 0, err)
 
 
 suite = unittest.TestLoader().loadTestsFromTestCase(BessctlCppTest)

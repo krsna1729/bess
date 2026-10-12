@@ -14,6 +14,7 @@ bessctl_exe = executable(
   'bessctl',
   'main.cc',
   dependencies: [bessctl_dep],
+  link_args: static_exe_link_args,
   install: true,
 )
 
