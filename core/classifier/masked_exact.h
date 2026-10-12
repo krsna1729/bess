@@ -166,8 +166,16 @@ class RuntimeMaskedBackend {
     }
 
     // Group rules by mask, in first-seen order: a tuple is a mask class, not a
-    // priority class.
-    std::map<std::vector<std::byte>, size_t> tuple_of_mask;
+    // priority class. Every mask and value is key_size bytes (checked below
+    // before use), so they compare as that many bytes. (std::vector's
+    // operator<, inlined at -O3, makes GCC 14 report a memcmp bound beyond
+    // any object: -Wstringop-overread, a false positive.)
+    const auto key_less = [key_size](const std::vector<std::byte> &lhs,
+                                     const std::vector<std::byte> &rhs) {
+      return std::memcmp(lhs.data(), rhs.data(), key_size) < 0;
+    };
+    std::map<std::vector<std::byte>, size_t, decltype(key_less)> tuple_of_mask(
+        key_less);
     std::vector<std::vector<std::byte>> masks;
     std::vector<std::vector<std::pair<std::vector<std::byte>, Candidate>>>
         entries;
@@ -218,13 +226,14 @@ class RuntimeMaskedBackend {
       // keys, and leaving the choice to insertion order would make the outcome
       // depend on rule order in a way this substrate does not promise.
       std::sort(group.begin(), group.end(),
-                [](const auto &lhs, const auto &rhs) {
-                  return lhs.first < rhs.first;
+                [&key_less](const auto &lhs, const auto &rhs) {
+                  return key_less(lhs.first, rhs.first);
                 });
       std::vector<std::pair<std::vector<std::byte>, Candidate>> deduped;
       deduped.reserve(group.size());
       for (auto &entry : group) {
-        if (!deduped.empty() && deduped.back().first == entry.first) {
+        // Sorted, so the last kept is not after this one: equal unless less.
+        if (!deduped.empty() && !key_less(deduped.back().first, entry.first)) {
           if (BetterRank(entry.second, deduped.back().second)) {
             deduped.back().second = entry.second;
           }
