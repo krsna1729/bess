@@ -10,7 +10,8 @@
 //
 // Run() connects each output gate asked for to a capture module (no default
 // hooks), queues the packets on an injector task that feeds the module's
-// input gate, and runs that task once: the module's ProcessBatch, its
+// input gate, and runs that task once per burst of PacketBatch::kMaxBurst
+// packets (in order): the module's ProcessBatch, its
 // output-gate processing and the deadend are the dataplane's own. Packets
 // the module drops are not captured; gates not asked for are left
 // unconnected (their packets go to the deadend).

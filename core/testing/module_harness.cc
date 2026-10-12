@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <string>
@@ -184,28 +185,40 @@ std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::Run(Module *m, gate_idx_
   }
   ModuleGraph::DisconnectModule(injector_, 0);
   EXPECT_EQ(0, ModuleGraph::ConnectModules(injector_, 0, m, igate, true));
+  // Only the gates asked for reach the capture, whatever an earlier Run
+  // connected.
+  for (gate_idx_t g = 0; g < m->ogates().size(); g++) {
+    if (m->ogates()[g] != nullptr) {
+      ModuleGraph::DisconnectModule(m, g);
+    }
+  }
   for (gate_idx_t g : ogates) {
-    ModuleGraph::DisconnectModule(m, g);
     EXPECT_EQ(0, ModuleGraph::ConnectModules(m, g, capture_, g, true)) << "output gate " << g;
   }
-  // Global gate indexes, as a resume assigns them; the task's per-gate
-  // batches are indexed by them.
+  // Global gate indexes, as a resume assigns them (every connected input
+  // gate, then every output gate); the task's per-gate batches are indexed
+  // by them.
   ModuleGraph::UpdateTaskGraph();
   uint32_t gates = 0;
   for (const auto &[_, module] : ModuleGraph::GetAllModules()) {
-    gates += module->ogates().size();
+    gates += module->igates().size() + module->ogates().size();
   }
 
-  pending = in;
   captured = &out;
   Task task(injector_, nullptr);
   task.UpdatePerGateBatch(gates + 1);
-  Context ctx = {};
-  ctx.wid = 0;
-  ctx.task = &task;
-  ctx.current_tsc = rdtsc();
-  ctx.current_ns = tsc_to_ns(ctx.current_tsc);
-  task(&ctx);
+  // One task run per burst: a batch holds kMaxBurst packets.
+  for (size_t at = 0; at < in.size(); at += bess::PacketBatch::kMaxBurst) {
+    const size_t n = std::min<size_t>(bess::PacketBatch::kMaxBurst, in.size() - at);
+    pending.assign(in.begin() + static_cast<ptrdiff_t>(at),
+                   in.begin() + static_cast<ptrdiff_t>(at + n));
+    Context ctx = {};
+    ctx.wid = 0;
+    ctx.task = &task;
+    ctx.current_tsc = rdtsc();
+    ctx.current_ns = tsc_to_ns(ctx.current_tsc);
+    task(&ctx);
+  }
   captured = nullptr;
   return out;
 }

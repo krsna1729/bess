@@ -54,4 +54,28 @@ TEST(ArpResponderTest, DropsARequestForAnUnknownAddress) {
   EXPECT_TRUE(h.Run(arp, 0, {request}, {0})[0].empty());
 }
 
+// More requests than a batch holds are all answered, in order.
+TEST(ArpResponderTest, AnswersEveryRequestOfALongRun) {
+  ModuleHarness h;
+  bess::pb::ArpResponderArg entry;
+  entry.set_ip("1.2.3.4");
+  entry.set_mac_addr("A0:22:33:44:55:66");
+  Module *arp = h.Create("ArpResponder", entry);
+  ASSERT_NE(nullptr, arp);
+  std::vector<Bytes> requests;
+  for (int i = 0; i < 100; i++) {
+    requests.push_back(PacketBuilder()
+                           .Ether("ff:ff:ff:ff:ff:ff", "02:1e:67:9f:4d:ae")
+                           .Arp(1, "02:1e:67:9f:4d:ae", "10.0.0." + std::to_string(i % 250 + 1),
+                                "00:00:00:00:00:00", "1.2.3.4")
+                           .Build());
+  }
+  const auto out = h.Run(arp, 0, requests, {0});
+  ASSERT_EQ(100u, out.at(0).size());
+  for (int i = 0; i < 100; i++) {
+    // The reply's target protocol address (offset 14 + 24) is the asker's.
+    EXPECT_EQ(static_cast<uint8_t>(i % 250 + 1), out.at(0)[i][14 + 27]) << i;
+  }
+}
+
 }  // namespace
