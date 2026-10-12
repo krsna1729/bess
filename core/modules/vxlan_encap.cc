@@ -52,12 +52,18 @@ CommandResponse VXLANEncap::Init(const bess::pb::VXLANEncapArg &arg) {
 // packet without the headroom is dropped (before, it went on unencapsulated).
 void VXLANEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const int cnt = batch->cnt();
+  const auto tun_src = attr_offset(ATTR_R_TUN_IP_SRC);
+  const auto tun_dst = attr_offset(ATTR_R_TUN_IP_DST);
+  const auto tun_id = attr_offset(ATTR_R_TUN_ID);
+  const auto out_src = attr_offset(ATTR_W_IP_SRC);
+  const auto out_dst = attr_offset(ATTR_W_IP_DST);
+  const auto out_proto = attr_offset(ATTR_W_IP_PROTO);
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
 
-    const be32_t ip_src = get_attr<be32_t>(this, ATTR_R_TUN_IP_SRC, pkt);
-    const be32_t ip_dst = get_attr<be32_t>(this, ATTR_R_TUN_IP_DST, pkt);
-    const be32_t vni = get_attr<be32_t>(this, ATTR_R_TUN_ID, pkt);
+    const be32_t ip_src = get_attr_with_offset<be32_t>(tun_src, pkt);
+    const be32_t ip_dst = get_attr_with_offset<be32_t>(tun_dst, pkt);
+    const be32_t vni = get_attr_with_offset<be32_t>(tun_id, pkt);
 
     const uint16_t src_port = bess::tunnel::FlowEntropyPort(
         std::span<const uint8_t>(pkt.head_data<const uint8_t *>(), pkt.head_len()));
@@ -70,9 +76,9 @@ void VXLANEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
     bess::tunnel::WriteVxlanUdp(hdr, vni.value(), src_port, dstport_.value(), inner_len);
 
-    set_attr<be32_t>(this, ATTR_W_IP_SRC, pkt, ip_src);
-    set_attr<be32_t>(this, ATTR_W_IP_DST, pkt, ip_dst);
-    set_attr<uint8_t>(this, ATTR_W_IP_PROTO, pkt, bess::utils::Ipv4::Proto::kUdp);
+    set_attr_with_offset<be32_t>(out_src, pkt, ip_src);
+    set_attr_with_offset<be32_t>(out_dst, pkt, ip_dst);
+    set_attr_with_offset<uint8_t>(out_proto, pkt, bess::utils::Ipv4::Proto::kUdp);
     EmitPacket(ctx, pkt, 0);
   }
 }

@@ -27,6 +27,9 @@ CommandResponse EtherEncap::Init(
 
 void EtherEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
+  const auto src_off = attr_offset(ATTR_R_ETHER_SRC);
+  const auto dst_off = attr_offset(ATTR_R_ETHER_DST);
+  const auto type_off = attr_offset(ATTR_R_ETHER_TYPE);
 
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
@@ -35,9 +38,9 @@ void EtherEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     Ethernet::Address ether_dst;
     bess::utils::be16_t ether_type;
 
-    ether_src = get_attr<Ethernet::Address>(this, ATTR_R_ETHER_SRC, pkt);
-    ether_dst = get_attr<Ethernet::Address>(this, ATTR_R_ETHER_DST, pkt);
-    ether_type = get_attr<bess::utils::be16_t>(this, ATTR_R_ETHER_TYPE, pkt);
+    ether_src = get_attr_with_offset<Ethernet::Address>(src_off, pkt);
+    ether_dst = get_attr_with_offset<Ethernet::Address>(dst_off, pkt);
+    ether_type = get_attr_with_offset<bess::utils::be16_t>(type_off, pkt);
 
     Ethernet *eth = static_cast<Ethernet *>(pkt.prepend(sizeof(*eth)));
 

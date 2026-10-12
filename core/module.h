@@ -693,19 +693,23 @@ static inline void set_attr_with_offset(bess::metadata::mt_offset_t offset,
   }
 }
 
-// Slowest but easiest.
-// TODO(melvin): These ought to be members of Module
+// Deprecated (D-100): each call resolves the attribute's offset again, which
+// in a packet loop repeats per packet what is fixed for the whole batch.
+// Resolve attr_offset() once per batch and use the *_with_offset helpers.
 template <typename T>
+[[deprecated("resolve attr_offset() once per batch; use ptr_attr_with_offset")]]
 static inline T *ptr_attr(Module *m, int attr_id, bess::PacketRef pkt) {
   return ptr_attr_with_offset<T>(m->attr_offset(attr_id), pkt);
 }
 
 template <typename T>
+[[deprecated("resolve attr_offset() once per batch; use get_attr_with_offset")]]
 static inline T get_attr(Module *m, int attr_id, bess::PacketRef pkt) {
   return get_attr_with_offset<T>(m->attr_offset(attr_id), pkt);
 }
 
 template <typename T>
+[[deprecated("resolve attr_offset() once per batch; use set_attr_with_offset")]]
 static inline void set_attr(Module *m, int attr_id, bess::PacketRef pkt, T val) {
   set_attr_with_offset(m->attr_offset(attr_id), pkt, val);
 }

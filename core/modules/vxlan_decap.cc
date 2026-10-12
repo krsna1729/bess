@@ -36,6 +36,9 @@ CommandResponse VXLANDecap::Init(
 void VXLANDecap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::be32_t;
   const int cnt = batch->cnt();
+  const auto tun_src = attr_offset(ATTR_W_TUN_IP_SRC);
+  const auto tun_dst = attr_offset(ATTR_W_TUN_IP_DST);
+  const auto tun_id = attr_offset(ATTR_W_TUN_ID);
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
     bess::conntrack::ParsedFlowPacket outer;
@@ -51,9 +54,9 @@ void VXLANDecap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     be32_t src, dst;
     std::memcpy(&src, outer.src.data(), 4);
     std::memcpy(&dst, outer.dst.data(), 4);
-    set_attr<be32_t>(this, ATTR_W_TUN_IP_SRC, pkt, src);
-    set_attr<be32_t>(this, ATTR_W_TUN_IP_DST, pkt, dst);
-    set_attr<be32_t>(this, ATTR_W_TUN_ID, pkt, be32_t(d.id));
+    set_attr_with_offset<be32_t>(tun_src, pkt, src);
+    set_attr_with_offset<be32_t>(tun_dst, pkt, dst);
+    set_attr_with_offset<be32_t>(tun_id, pkt, be32_t(d.id));
     pkt.adj(static_cast<uint16_t>(d.inner_offset));
     EmitPacket(ctx, pkt, 0);
   }

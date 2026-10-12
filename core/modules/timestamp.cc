@@ -52,16 +52,20 @@ CommandResponse Timestamp::Init(const bess::pb::TimestampArg &arg) {
 void Timestamp::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   // We don't use ctx->current_ns here for better accuracy
   uint64_t now_ns = tsc_to_ns(rdtsc());
-  size_t offset = offset_;
 
   int cnt = batch->cnt();
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
-    if (attr_id_ != -1)
-      set_attr<uint64_t>(this, attr_id_, pkt, now_ns);
-    else
-      timestamp_packet(pkt, offset, now_ns);
-
+  if (attr_id_ != -1) {
+    const bess::metadata::mt_offset_t off = attr_offset(attr_id_);
+    if (bess::metadata::IsValidOffset(off)) {
+      for (int i = 0; i < cnt; i++) {
+        _set_attr_with_offset<uint64_t>(off, batch->packet(i), now_ns);
+      }
+    }
+  } else {
+    const size_t offset = offset_;
+    for (int i = 0; i < cnt; i++) {
+      timestamp_packet(batch->packet(i), offset, now_ns);
+    }
   }
   RunNextModule(ctx, batch);
 }

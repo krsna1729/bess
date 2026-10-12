@@ -722,6 +722,7 @@ unit_test_sources = [
   'modules/drr_test.cc',
   'modules/exact_match_migration_test.cc',
   'modules/exact_match_test.cc',
+  'modules/generic_encap_test.cc',
   'modules/exact_match_transaction_test.cc',
   'modules/queue_out_test.cc',
   'modules/session_pipeline_test.cc',

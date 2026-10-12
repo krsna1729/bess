@@ -80,6 +80,9 @@ CommandResponse GenericEncap::AddFieldOne(
  * for each packet.
  */
 CommandResponse GenericEncap::Init(const bess::pb::GenericEncapArg &arg) {
+  if (arg.fields_size() > MAX_FIELDS) {  // fields_ holds MAX_FIELDS
+    return CommandFailure(EINVAL, "at most %d fields", MAX_FIELDS);
+  }
   int size_acc = 0;
 
   for (int i = 0; i < arg.fields_size(); i++) {

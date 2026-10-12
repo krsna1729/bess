@@ -89,11 +89,11 @@ void Measure::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   pkt_cnt_ += batch->cnt();
 
   int cnt = batch->cnt();
+  const bess::metadata::mt_offset_t ts_off =
+      attr_id_ != -1 ? attr_offset(attr_id_) : bess::metadata::kMetadataOffsetNoRead;
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
-    uint64_t pkt_time = 0;
-    if (attr_id_ != -1)
-      pkt_time = get_attr<uint64_t>(this, attr_id_, pkt);
+    uint64_t pkt_time = get_attr_with_offset<uint64_t>(ts_off, pkt);
     if (pkt_time || IsTimestamped(pkt, offset, &pkt_time)) {
       uint64_t diff;
 
