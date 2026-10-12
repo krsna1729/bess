@@ -23,8 +23,9 @@ propose it unprompted.
 - **No real hugepages or NIC in this sandbox.** `/proc/meminfo` shows only
   ~256MB of hugepage capacity, often already exhausted. Run `bessd` with
   `-m 0` (no-hugepage mode — already a supported fallback path in
-  `core/dpdk.cc`). `bessctl/run_module_tests.py` already does this
-  (`daemon start -m 0`); do the same for any manual `bessd` invocation.
+  `core/dpdk.cc`). The live tests (`tests/live/live_daemon.h`) already do this
+  (`-m 0 -skip_root_check -dpdk=false`); do the same for any manual `bessd`
+  invocation.
 - **DPDK build lives in `deps/dpdk-<ver>/`**, gitignored, and is bootstrapped
   with `tools/bootstrap_dpdk.py`.  It reads the single pinned source record
   in `deps/dpdk.json`, verifies the SHA256 before extraction, and installs the
@@ -71,8 +72,8 @@ propose it unprompted.
   (`/usr/src/gtest` ships them on Ubuntu; Arch does not): point `GTEST_DIR`
   at a googletest checkout whose headers match what the test TUs will
   include, or the link fails on `AssertHelper`'s `string_view` ctor.
-  `bessctl/run_module_tests.py` needs root (the daemon refuses otherwise) —
-  the CI runners have it, an unprivileged session does not.
+  The live tests (`meson test --suite live`) start an unprivileged `bessd`
+  (`-skip_root_check`); no root is needed.
 
 ## How to build and verify
 
@@ -146,10 +147,10 @@ The old `core/Makefile`, `core/extra.mk`, and top-level `build.py` are not part
 of the supported build.  Generated protobuf code is never written into the
 source tree.
 
-A live module integration run through `run_module_tests.py` still starts its
-daemon through sudo.  Local verification used the same gRPC reset/run path
-against a foreground `bessd -skip_root_check -m 0`, avoiding sudo while
-exercising all 22 module test files.
+Module tests run without Python: in process through
+`core/testing/module_harness.h` (packets in, gates out) or, when they need a
+running daemon or workers, in `tests/live/` (suite `live`), each binary
+starting its own unprivileged `bessd -skip_root_check -m 0`.
 
 ### Build invariants
 

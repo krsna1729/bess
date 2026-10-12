@@ -366,6 +366,6 @@ install_subdir(
   exclude_directories: ['__pycache__'],
   # The C++ bessctl's sources: its binary installs to bindir.
   exclude_files: ['meson.build', 'json.h', 'json.cc', 'manifest.h', 'manifest.cc', 'main.cc',
-                  'manifest_test.cc'],
+                  'manifest_test.cc', 'yaml_io.h', 'yaml_io.cc'],
 )
 install_subdir('protobuf', install_dir: bess_data_dir)

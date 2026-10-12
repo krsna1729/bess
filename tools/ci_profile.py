@@ -334,14 +334,14 @@ def step_test(s):
     if s.sanitize == 'address':
         # Every unit, architecture, plugin and fuzz-corpus test under ASan and
         # UBSan, halting on the first report. Explicit exclusions: benchmarks
-        # (not built) and the daemon suites `python`, `integration` and `live`
+        # (not built) and the daemon suites `python` and `live`
         # (bessd under ASan is not yet a supported mode; D-072).
         env = s.env_with_dpdk()
         env['ASAN_OPTIONS'] = ('detect_leaks=1:halt_on_error=1:abort_on_error=1'
                                ':external_symbolizer_path=' + symbolizer())
         env['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1:external_symbolizer_path=' + symbolizer()
         s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs',
-               '--no-suite', 'python', '--no-suite', 'integration', '--no-suite', 'live',
+               '--no-suite', 'python', '--no-suite', 'live',
                '--timeout-multiplier', '6'], env=env)
         return
     if s.sanitize == 'thread':
