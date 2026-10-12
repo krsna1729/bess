@@ -259,8 +259,10 @@ class Runner {
     auto w = std::make_unique<Watch>();
     Watch *raw = w.get();
     raw->thread = std::jthread([this, raw, types](std::stop_token stop) {
+      // From sequence 1: what the daemon holds, then live; events are matched
+      // by request id, so no race with what the case does next.
       (void)client_.WatchEvents(
-          0, 0, types,
+          1, 0, types,
           [raw](const v2::Event &e) {
             std::lock_guard lock(raw->mu);
             raw->events.push_back(e);
@@ -270,7 +272,6 @@ class Runner {
           stop);
     });
     watches_[Str(s, "as")] = std::move(w);
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
     return std::nullopt;
   }
 
@@ -352,6 +353,9 @@ class Runner {
     }
     if (!applied) {
       if (Field(s, "want_failed_ops") != nullptr) {
+        if (applied.error().kind != ErrorKind::kRejected) {
+          return "want_failed_ops needs a rejected error, got " + KindName(applied.error().kind);
+        }
         std::vector<int> failed;
         for (const auto &f : applied.error().failures) {
           failed.push_back(f.index);
@@ -420,6 +424,10 @@ class Runner {
       auto plan = client_.PlanPipeline(*p);
       if (!plan || plan->steps.empty()) {
         return "plan: " + (plan ? std::string("no steps") : plan.error().message);
+      }
+      if (Field(s, "want_plan_generation_of") != nullptr &&
+          plan->generation != pipes_[Str(s, "want_plan_generation_of")].generation) {
+        return std::format("plan against generation {}", plan->generation);
       }
     }
     if (const gp::Value *changes = Field(s, "want_changes")) {

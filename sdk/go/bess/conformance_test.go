@@ -236,7 +236,9 @@ func (r *runner) openWatch(s spec) error {
 	}
 	ctx, cancel := context.WithCancel(r.ctx)
 	w := &watch{stop: cancel}
-	events, _ := r.client.WatchEvents(ctx, 0, 0, types...)
+	// From sequence 1: what the daemon holds, then live; events are matched
+	// by request id, so no race with what the case does next.
+	events, _ := r.client.WatchEvents(ctx, 1, 0, types...)
 	go func() {
 		for e := range events {
 			w.mu.Lock()
@@ -245,7 +247,6 @@ func (r *runner) openWatch(s spec) error {
 		}
 	}()
 	r.watches[s.str("as")] = w
-	time.Sleep(300 * time.Millisecond)
 	return nil
 }
 
@@ -333,7 +334,9 @@ func (r *runner) commit(s spec, wantError string) error {
 	if err != nil {
 		if s.has("want_failed_ops") {
 			var rejected *RejectedError
-			errors.As(err, &rejected)
+			if !errors.As(err, &rejected) {
+				return fmt.Errorf("want_failed_ops needs a rejected error, got %v", err)
+			}
 			var failed, want []int
 			for _, f := range rejected.Failures {
 				failed = append(failed, f.Index)
@@ -398,9 +401,12 @@ func (r *runner) pipeline(s spec, wantError string) error {
 		return expect(err, wantError, "build")
 	}
 	if s.boolean("plan") {
-		steps, _, err := r.client.PlanPipeline(r.ctx, p)
+		steps, g, err := r.client.PlanPipeline(r.ctx, p)
 		if err != nil || len(steps) == 0 {
 			return fmt.Errorf("plan: %d step(s), %v", len(steps), err)
+		}
+		if s.has("want_plan_generation_of") && g != r.pipes[s.str("want_plan_generation_of")].generation {
+			return fmt.Errorf("plan against generation %d", g)
 		}
 	}
 	if s.has("want_changes") {

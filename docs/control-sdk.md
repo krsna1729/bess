@@ -258,11 +258,11 @@ if it succeeds.
 | `metrics` | | at least one sample |
 | `schema` | `class` | the class's init type is in the schema's descriptors |
 | `resource` | `name` | the resource exists (or `want_error`) |
-| `watch` | `types`, `as` | opens an event stream from the next event, then waits 300 ms so it is open before what follows |
+| `watch` | `types`, `as` | opens an event stream from sequence 1 (what the daemon holds, then live), so no event of the case is missed |
 | `event` | `watch`, `of`, `want_fields` | within 5 s the stream delivers commit `of`'s event (its `request_id` field), with that commit's generation and these fields |
 | `commit` | `ops`, `request_id_of`, `expected_generation_of`, `generation_delta`, `snapshot`, `as` | one transaction on `$resource` (below) |
 | `transaction_status` | `of` or `request_id`, `want_known`, `want_outcome` | `GetTransaction` of commit `of`'s request id, or `request_id` |
-| `pipeline` | `base`, `add`, `chain`, `remove`, `plan`, `want_changes`, `at_generation_of`, `as` | below |
+| `pipeline` | `base`, `add`, `chain`, `remove`, `plan`, `want_plan_generation_of`, `want_changes`, `at_generation_of`, `as` | below |
 
 **commit.** Each op is `{"op": "upsert", "key": {...}, "value": {...}}` or
 `{"op": "erase", "key": {...}}` in the resource's key and value types;
@@ -280,10 +280,10 @@ labels the commit's request id and generation.
 its generation into `as`. Otherwise builds on `base`'s pipeline (a label of an
 earlier pipeline step; the active one if absent): `add` modules (`[name,
 class]`, no argument), `chain` them gate 0 to gate 0, `remove` modules. Then
-`plan` (at least one step), `want_changes` (the diff against the active
-pipeline has that many changes), and the apply, at `at_generation_of`'s
-generation if given. `as` labels the built pipeline and the generation the
-apply reached.
+`plan` (at least one step; with `want_plan_generation_of`, made against that
+label's generation), `want_changes` (the diff against the active pipeline has
+that many changes), and the apply, at `at_generation_of`'s generation if given.
+`as` labels the built pipeline and the generation the apply reached.
 
 ## Not yet
 

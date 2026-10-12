@@ -77,7 +77,7 @@
       "steps": [
         {"do": "pipeline", "as": "p0"},
         {"do": "pipeline", "base": "p0", "add": [["conf_a", "Bypass"], ["conf_b", "Sink"]],
-         "chain": ["conf_a", "conf_b"], "plan": true, "want_changes": 3,
+         "chain": ["conf_a", "conf_b"], "plan": true, "want_plan_generation_of": "p0", "want_changes": 3,
          "at_generation_of": "p0", "as": "p1"},
         {"do": "pipeline", "base": "p1", "remove": ["conf_a", "conf_b"], "want_changes": 3,
          "at_generation_of": "p0", "want_error": "pipeline_conflict"},
