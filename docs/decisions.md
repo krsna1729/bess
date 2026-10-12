@@ -122,6 +122,9 @@ file is the reasoning.
 | D-099 | `Module::EmitBatch`: a burst whose packets all take one gate leaves whole; classifiers use it; `RunSplit` removed | accepted |
 | D-100 | Metadata offsets resolved once per batch, slow helpers deprecated (no measurable gain); GenericEncap template rejected (slower) | accepted |
 | D-101 | `ControlResult` is `[[nodiscard]]`; `-Wno-error=unused-result` removed | accepted |
+| D-102 | WildcardMatch `max_tuples` at init (default 8), ENOSPC when full; every fixed limit in `docs/limits.md`, checked in CI | accepted |
+| D-103 | Typed legacy boundaries: `enum class Resource`, `PacketBatch::packets()`, `CpuId` (fixes core truncation and Bypass byte charge) | accepted |
+| D-104 | Product boundary: Python leaves the runtime (manifests and Admin first, pybess last); HTTP/UI inside bessd, off or localhost by default; C++ SDK + C++ bessctl, Go SDK for external controllers | accepted |
 
 
 ---
@@ -7862,3 +7865,81 @@ caller dropped a control result. Without the `-Wno-error` flag the build stays c
 compiled with the tree's flags that calls a `ControlResult<int>` function and ignores it fails: "ignoring returned
 value of type 'bess::control::ControlResult<int>', declared with attribute 'nodiscard' [-Werror=unused-result]".
 The clang, arm64 and sanitizer lanes check the other compilers.
+
+## D-102 WildcardMatch `max_tuples` at init (default 8), ENOSPC when full; every fixed limit in `docs/limits.md`, checked in CI
+
+**Status:** accepted (2026-10-12; the user asked for the UPF mask limit, omec-project/upf#1337, to stay 8 by default
+and be configurable at module init at no packet-path cost, and for every hardcoded limit to be documented centrally).
+**Code:** `protobuf/module_msg.proto` (`WildcardMatchArg.max_tuples`), `core/modules/wildcard_match.{h,cc}`,
+`core/modules/wildcard_match_test.cc`, `docs/limits.md`, `tools/check_limits.py`, `tools/live_perf.py`.
+
+**Decision.**
+- `WildcardMatchArg.max_tuples` (uint32; 0 or unset means 8, as in master; at most 1,024) sets the number of
+  distinct masks one WildcardMatch may hold. Only the writer reads it, when a candidate generation is built; the
+  packet path walks the active tuple list and never reads the limit. `get_initial_arg` returns it when it is not 8.
+- A full mask table answers `add` / `set_runtime_config` with ENOSPC, as master does (errno 28 is what the UPF's
+  pfcpiface checks); it was EINVAL. v2 transactions keep their "too many distinct masks" error.
+- `docs/limits.md` lists every limit and default: value, where it is set, whether and how it is configurable, and
+  what happens past it. `tools/check_limits.py` (meson tests `check_limits`, `check_limits_self_test`) fails when a
+  `MAX_*`/`MIN_*`/`DEFAULT_*` macro or constant, or a `k...Max/Min/Default/Limit...` constant in `core/`, is not on
+  the page. It matches qualified, brace-initialized, pointer-typed and declared-only constants.
+- The UPF needs no larger default: under D-032 sessions are exact matches with action ids and use no masks.
+
+**Evidence.** Paired isolated live runs (`omarchy-benchmark --isolate --cpu 2,4`, 6 palindromic rounds;
+contamination verdict: observable IRQ or softirq activity on the target CPUs), ns per packet, the build before the
+argument ("hardcoded") against the build with it ("configurable"): M.base 6.82 / 7.13, M.wildcardmatch (4 masks)
+14.50 / 14.03, M.wildcardmatch/8 (8 masks, equal priorities, so every mask is looked up) 81.18 / 82.42. Worker
+counters on /8: 1,745.4 / 1,747.1 instructions and 342.7 / 347.1 cycles per packet. No difference beyond run noise.
+With `max_tuples: 16`, M.wildcardmatch/16 is 186.64 ns: about 13 ns per additional mask in use, which is the price a
+configuration pays for masks, not for the limit. The module test `MaxTuplesSetsTheCeilingAndRoundTrips` pins the
+ceiling, the bound and the round trip; `--self-test` and a removed row prove the check fails.
+
+## D-103 Typed legacy boundaries: `enum class Resource`, `PacketBatch::packets()`, `CpuId`
+
+**Status:** accepted (2026-10-12; the roadmap's type-safety item for legacy boundaries).
+**Code:** `core/traffic_class.{h,cc}`, `core/scheduler.h`, `core/pktbatch.h`, `core/packet.h`, 45 module loops,
+`core/modules/bypass.cc`, `core/runtime/thread_placement.{h,cc}`, `core/runtime/worker_manager.{h,cc}`,
+`core/control/control_plane.cc`, `core/control/pipeline_validator.cc`, `core/runtime/opts.cc`.
+
+**Decision.**
+- `enum class Resource` and `ResourceUsage` (a `std::array` indexed by it) replace `resource_t`, `resource_arr_t`,
+  `ACCUMULATE` and the two name maps; `ResourceName` / `ResourceFromName` are the only conversions to text.
+- `PacketBatch::packets()` returns a `PacketRange` (a pointer pair, no `<ranges>` in every packet translation unit);
+  45 index loops became range-for. Layout and storage do not change.
+- `CpuId` (a `StrongId<..., uint32_t>` in `[0, CPU_SETSIZE)`) is made only by `CpuIdFrom`, which refuses an
+  out-of-range value. `CpuPresent`, `CpuAllowed`, `DefaultWorkerCore` and `WorkerManager::Launch` take it. The
+  public `launch_worker(int, int, ...)` and `is_cpu_present(unsigned)` in `worker.h` keep their signatures and
+  convert with the same check, so the installed API does not change.
+
+**Bugs fixed on the way.** `AddWorker(wid, core)` took a 64-bit core and cast it to `int`: core 2^32 + n passed every
+check as CPU n and the worker started there. It is now EINVAL (test `CoreIdsBeyond32BitsAreRefused`, which failed
+before the change). Bypass assigned `total_bytes =` in its loop, so `cycles_per_byte` charged the last packet's
+length only; it now sums the batch (master had the same line; only the perftest `.bess` files use the argument).
+
+**Evidence.** All unit and live tests pass on the combined tree. In the same paired run as D-102, the build with the
+Resource and `packets()` changes ("types") against "hardcoded": F.floor 1.92 / 1.93, F.hop/4 3.84 / 3.96, M.base
+6.83 / 6.82, worker instructions per packet within 1% on every test: no codegen cost.
+
+## D-104 Product boundary: Python out of the runtime; HTTP inside bessd; C++ SDK and bessctl, Go SDK for controllers
+
+**Status:** accepted (2026-10-12; the user's decisions on the three open product questions of the roadmap review).
+**Code:** none yet; this records the order of the product-boundary work in MODERNIZATION.md (G1.5-G1.7).
+
+**Decision.**
+- **Python leaves the runtime.** The canonical configuration is the control_v2 `Pipeline` / desired state, not
+  `.bess`. Order: the declarative manifest and the Admin service first (they give operational parity), then the
+  shipped `.bess` samples become manifests, SDK examples and tests, then packages ship without Python, and last
+  pybess, `sugar.py`, the Python bessctl and the default Python protobuf generation are deleted, once coverage is
+  equivalent. Python stays an optional SDK and test language.
+- **HTTP and the UI are inside bessd** (protobuf-JSON, server-sent events, `/metrics`, a static UI), off or bound to
+  localhost by default. One process keeps one source of state and one authorization point.
+- **SDKs.** Two supported SDKs, generated from the same `.proto` files: the Go SDK (`sdk/go`, G1.5, exists) for
+  external controllers such as the UPF's pfcpiface, and a C++ SDK (G1.6) as an installed library separate from
+  bessd's internals, so C++ users can build on it. One conformance suite runs live against both, so they cannot drift.
+- **bessctl is C++ on the public C++ SDK only (G1.7).** It is the C++ SDK's first consumer, which keeps the SDK
+  complete. It validates through a daemon dry-run RPC (one validator, in bessd), not a linked copy.
+
+**Alternatives.** A Go bessctl on the existing Go SDK was cheaper to start, but the user wants a C++ SDK available to
+attract C++ users; with that SDK built anyway, bessctl on it costs little and keeps it exercised. Keeping Python as
+the runtime configuration language was rejected: it makes `.bess` a contract and the runtime depend on an interpreter.
+

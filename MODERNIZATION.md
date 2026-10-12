@@ -8743,13 +8743,17 @@ consumer-driven (D-008, §31.3 item 2).
 - **Other G1.2 follow-ons:** the live Mpps benchmark (D-027) covers unary
   ExactMatch rule churn, not the full ActionTable→Meter→Router chain.
   Full-chain failure injection under traffic, `ReplaceScope`, production
-  streaming/bulk RPC and Go/C++ SDKs remain pending. The streaming proto in
+  streaming/bulk RPC and the C++ SDK remain pending. The streaming proto in
   `protobuf/tests/ingress_bench.proto` is benchmark-only.
 - **G1.3 — `GetSystem` / `GetCapabilities`: PENDING.**
 - **G1.4 — resource stats and events: PENDING.** Existing port/traffic-class
   stats are not per-resource transaction lifecycle stats.
-- **G1.5 / G1.6 — thin Go and C++ SDKs: PENDING.** G1.7 C++ `bessctl` on v2
-  also remains pending.
+- **G1.5 — Go SDK: DONE** (`sdk/go`, live suite `control_sdk_go`); it is the SDK
+  for external controllers such as the UPF (D-104).
+- **G1.6 — C++ SDK: PENDING.** An installed library and headers, separate from
+  bessd's internals; one conformance suite runs live against both SDKs (D-104).
+- **G1.7 — C++ `bessctl` on the public C++ SDK: PENDING** (D-104; replaces the
+  Python bessctl, which is deleted last).
 
 The old imperative API should not constrain the ideal end state.
 
@@ -10389,7 +10393,7 @@ measurements under sustained updates. D-027's live benchmark is useful
 evidence, but it measures ExactMatch rule churn, not that complete chain.
 
 Still open after that gate: production streaming/bulk RPC, `ReplaceScope`,
-Go/C++ SDKs (G1.5/G1.6), `GetSystem`/capabilities (G1.3), and transaction
+the C++ SDK and C++ bessctl (G1.6/G1.7), `GetSystem`/capabilities (G1.3), and transaction
 statistics/events (G1.4). Generic Mode W operation rings remain deliberately
 deferred until two real consumers need them (D-008; §31.3 item 2).
 
@@ -11059,7 +11063,7 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
      deleted.
    **Pending:** a shipped module that consumes a scope; full-chain
    prepare-failure traffic/Mpps gate; production streaming/bulk RPC;
-   `ReplaceScope`; Go/C++ SDKs; G1.3 capabilities and G1.4 stats/events.
+   `ReplaceScope`; the C++ SDK and bessctl; G1.3 capabilities and G1.4 stats/events.
    Generic Mode W remains intentionally deferred until two consumers need it
    (D-008, item 2 above).
 7. **Graph changes without pauses:** publish connections and tasks via RCU.
