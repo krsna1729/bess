@@ -19,8 +19,7 @@
       "performance-no-int-to-ptr": 2
     },
     "core/control/control_plane.cc": {
-      "bugprone-unused-return-value": 1,
-      "cppcoreguidelines-narrowing-conversions": 3
+      "bugprone-unused-return-value": 1
     },
     "core/control/pipeline_snapshot.cc": {
       "bugprone-too-small-loop-variable": 1
@@ -171,9 +170,6 @@
       "cert-str34-c": 1,
       "cppcoreguidelines-narrowing-conversions": 2
     },
-    "core/modules/worker_split.cc": {
-      "performance-for-range-copy": 1
-    },
     "core/packet_checksum.cc": {
       "bugprone-unchecked-optional-access": 2
     },
@@ -300,7 +296,7 @@
       "misc-redundant-expression": 1
     },
     "core/worker.cc": {
-      "cppcoreguidelines-narrowing-conversions": 2
+      "cppcoreguidelines-narrowing-conversions": 1
     }
   }
 }

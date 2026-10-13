@@ -202,6 +202,16 @@ jobs:
       - name: Run all Meson tests
         run: python3 tools/ci_profile.py test $LANE
 
+      - name: Upload test log on failure
+        # --print-errorlogs keeps a failed test's last 100 lines; a live test
+        # prints a dead bessd's log where it notices, often earlier than that.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testlog-${{ matrix.name }}-${{ github.sha }}
+          path: build/${{ matrix.name }}/meson-logs/testlog.txt
+          if-no-files-found: ignore
+
       - name: Live performance, report only (gcc lane, pushes and nightly)
         # tools/live_perf.py's F and M tests on the lane's build: a trend to
         # compare between runs' artifacts, never a gate (D-092).

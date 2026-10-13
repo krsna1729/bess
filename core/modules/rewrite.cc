@@ -36,6 +36,9 @@ CommandResponse Rewrite::Init(const bess::pb::RewriteArg &arg) {
   auto registered = templates_resource_.Register(
       init_context().resources(), init_context().codecs(),
       name() + "/templates",
+      // clang-tidy 19's analyzer loses the unique_ptr moved into the returned
+      // std::expected and reports a leak at the closing brace.
+      // NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
       [](const bess::pb::RewriteArg &v) -> std::expected<Staged, std::string> {
         if (static_cast<size_t>(v.templates_size()) >
             bess::PacketBatch::kMaxBurst) {
@@ -50,6 +53,7 @@ CommandResponse Rewrite::Init(const bess::pb::RewriteArg &arg) {
         }
         return staged;
       },
+      // NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)
       [this](Staged &s) {
         templates_.swap(s.templates);
         next_turn_ = 0;

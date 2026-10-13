@@ -79,6 +79,9 @@ CommandResponse ACL::Init(const bess::pb::ACLArg &arg) {
   // later, so workers keep running (no paused workers).
   auto registered = rules_resource_.Register(
       init_context().resources(), init_context().codecs(), name() + "/rules",
+      // clang-tidy 19's analyzer loses the unique_ptr moved into the returned
+      // std::expected and reports a leak at the closing brace.
+      // NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
       [this](const bess::pb::ACLArg &v) -> std::expected<Staged, std::string> {
         std::vector<ACLRule> parsed;
         CommandResponse r = ParseRules(v, &parsed);
@@ -88,6 +91,7 @@ CommandResponse ACL::Init(const bess::pb::ACLArg &arg) {
         return Staged{std::make_unique<const Rules>(Rules{std::move(parsed)}),
                       v};
       },
+      // NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)
       [this](Staged &s, bess::dataplane::Retirer &retirer) {
         retirer.Retire(rules_.Exchange(std::move(s.rules)));
         arg_.Swap(&s.arg);
