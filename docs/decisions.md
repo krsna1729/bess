@@ -9250,24 +9250,31 @@ independent reference) leaves three routes; the 64K churn shrinks to the same sh
 |---|---|---|---|
 | add 10.0.0.0/8 -> 7, 255.255.255.254/32 -> 1, 255.255.255.255/32 -> 2, then 255.255.255.254/31 -> 3 | 255.255.255.254 / 10.1.2.3 | 1 / 7 | 3 / 3 |
 | add 10.0.0.0/8 -> 7, 255.255.255.254/31 -> 3, the two /32s as above, then delete the /31 | 255.255.255.254 / 10.1.2.3 | 1 / 7 | 0 (miss) / 0 |
+| 10.0.0.0/8 -> 7, 224.0.0.0/4 -> 8, 240.0.0.0/4 -> 9, then add 0.0.0.0/0 -> 6 (re-point, delete alike) | 10.1.2.3 | 7 | 6 (5 on re-point to 5, miss on delete) |
 
 Cause, in `lib/fib/dir24_8.c` `modify_fib()`: changing a prefix walks the routes it covers, moving a left edge
 past each one. When those routes run contiguously up to 255.255.255.255, stepping past the last one wraps the
 edge to 0. The branch for "the edge is already at this route" does not check for the wrap (the other branch
 does), so the loop ends in `install_to_fib(dp, 0, 0, nh)`, which means the whole address space: every tbl24
 entry is overwritten. An add writes the added route's next hop everywhere; a delete writes the covering route's
-(or the default). The trigger needs a prefix ending at 255.255.255.255 updated over routes that tile its end,
-which is why shortest-prefix-first insertion never hit it and why only a handful of the 512K routes mattered.
+(or the default). The trigger is a prefix ending at 255.255.255.255 updated over routes that tile its end. Only
+a handful of the 512K routes mattered, and shortest-prefix-first insertion never hit it. The realistic case is the
+default route (0.0.0.0/0 also ends there): any add, re-point or delete of it while 224.0.0.0/4 and 240.0.0.0/4,
+or 0.0.0.0/1 and 128.0.0.0/1 (which VPN clients install over a default), are present rewrites the whole table.
 
 Ruled out as usage: next-hop width (4-byte and 8-byte fail alike), lookup byte order (`RTE_FIB_F_LOOKUP_NETWORK_ORDER`
 on and off fail alike), the tbl8 pool (D-003: 4x larger, same), the default next hop (0 and 8192 alike), adds of
 existing prefixes and delete semantics (both reproducers use plain add/delete; `rte_lpm` agrees with the reference
-on the same sequences). The code is unchanged on upstream DPDK main (checked 2026-10-13); the last `dir24_8.c` fix,
-"fib: fix prefix addition handling", is already in 25.11.3 and is a different defect.
+on the same sequences). The code is unchanged on upstream DPDK main (checked 2026-10-13). History: the walk was
+correct until `880bc2b5f3bd` ("fib: fix adding default route", 23.07) exempted a left edge of 0 from the final
+range check, so a default route could be added to an empty table. `ab1b927cd73e` (23.11) then added a wrap check
+to one of the walk's two branches only. The last `dir24_8.c` fix, "fib: fix prefix addition handling", is already
+in 25.11.3 and is a different defect.
 
-The fix is one check (verified out of tree only: a copy of `dir24_8.c` with it, linked in place of
-`dir24_8_modify()` against the pinned 25.11.3, answers both reproducers correctly and passes 40 of 40 full-space
-oracle seeds, against 0 of 40 unpatched):
+The fix is one check. It was verified twice. Out of tree: a copy of `dir24_8.c` with the check, linked in place of
+`dir24_8_modify()` against the pinned 25.11.3, answers both reproducers and passes 40 of 40 full-space oracle seeds,
+against 0 of 40 unpatched. In a scratch DPDK main tree: the upstream patch's new `fib_autotest` case and a
+standalone reproducer fail without the check and pass with it.
 
 ```c
 if (ledge == redge) {
@@ -9278,26 +9285,33 @@ if (ledge == redge) {
 }
 ```
 
-`lib/fib/trie.c` `modify_dp()` (`rte_fib6`) has the same loop and the same unchecked branch; not run here.
+`lib/fib/trie.c` `modify_dp()` (`rte_fib6`) has the same defect: the IPv6 forms of the reproducers (the last two
+/128s and their /127; `::/1` + `8000::/1` under `::/0`) fail on 25.11.3 and main. The same check fixes it
+(`rte_ipv6_addr_is_unspec(&ledge)`; introduced with `fd66617c5774`, "fib6: fix adding default route as first
+route"). This matters for D-003's IPv6 revisit.
 
 **Decision.** Keep `rte_lpm` (D-003). BESS builds the DPDK release tarball unpatched (`deps/dpdk.json`), and
 carrying a DPDK patch is not worth it for a lookup that only ties (D-003: 3.70 vs 3.95 ns at 1K routes). The
-fix belongs upstream. The benchmark step of the re-trial (lookup at 1K/64K/512K, build and update cost, memory,
-paired against `rte_lpm`) was not run: it only follows a passing oracle.
+fix belongs upstream: a two-patch series (DIR24_8 and TRIE, each with a DPDK unit test) and a bug report were
+prepared for submission on 2026-10-13. The benchmark step of the re-trial (lookup at 1K/64K/512K, build and update
+cost, memory, paired against `rte_lpm`) was not run, because it only follows a passing oracle.
 
-The re-trial is now a unit test instead of a benchmark flag (`BESS_FIB_GATE` removed). It always runs (about 3 s
-in a debugoptimized build), so a DPDK change is covered without anyone remembering to run it:
+The re-trial is now a unit test instead of a benchmark flag (`BESS_FIB_GATE` removed). It always runs, so a DPDK
+change is covered without anyone remembering to run it. It takes 1-5 s in a debugoptimized build: 1.1 s idle here,
+4.5 s as measured in review.
 
-- `RteFibTest.D130WrapDefectStillPresent` runs both reproducers and asserts the wrong answers above: an expected
+- `RteFibTest.D130WrapDefectStillPresent` runs the reproducers above and asserts their wrong answers: an expected
   failure, written out. A DPDK that answers them correctly fails it on purpose.
 - `RteFibTest.RandomisedChurnMatchesReference` drives `rte_fib`, `rte_lpm` (`RouteTable`) and the reference in lock
-  step through 4 seeds x 2000 random operations: prefix lengths 0-32, the default route, dense overlap around
-  10/8, 192.168/16 and both ends of the space, re-points, deletes that must restore the covering route, deletes of
-  absent routes; checked after every operation. While the defect is present it leaves out prefixes ending at
-  255.255.255.255 (the defect's precondition, and nothing else); when it is gone they are back in with no edit.
-  With them in, all 4 seeds diverge on 25.11.3 within 183-816 operations, `rte_lpm` agreeing with the reference
-  every time. Without them, a 300-seed x 4000-operation run (1.2M operations) found no other disagreement; and
-  `fib_bench`'s 512K set and 64K churn pass with their top-of-space prefixes dropped (4 and 2 of them).
+  step through 4 seeds x 2000 random operations, checked after every operation. The operations cover prefix lengths
+  0-32, the default route, dense overlap around 10/8, 192.168/16 and both ends of the space, re-points, deletes
+  that must restore the covering route, and deletes of absent routes. While the defect is present, it skips only
+  the operations that can trip it: an add, re-point or delete of a prefix ending at 255.255.255.255 (the default
+  route included) while a longer prefix ending there is live. Prefixes ending there are still generated and
+  changed otherwise. A 100-seed x 2000-operation run with the skip passes and still makes 4,698 changes to such
+  prefixes; without the skip, 99 of the 100 seeds diverge, and `rte_lpm` agrees with the reference every time.
+  Once the defect is gone, nothing is skipped, with no edit. `fib_bench`'s 512K set and 64K churn pass with their
+  top-of-space prefixes dropped (4 and 2 of them).
 
 **Revisit when:** `RteFibTest.D130WrapDefectStillPresent` fails (a DPDK upgrade with the fix). Then: retire that
 test (the randomised one already covers the whole space), re-register `fib_bench`'s 512K lookup and 64K churn

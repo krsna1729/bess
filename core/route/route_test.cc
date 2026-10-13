@@ -967,6 +967,34 @@ bool FibHasWrapDefect() {
            del.unrelated == 7);
 }
 
+// A realistic trigger: 224.0.0.0/4 and 240.0.0.0/4 (multicast and reserved
+// space, which a router may route or blackhole) are adjacent and end at
+// 255.255.255.255, so changing the default route walks onto the wrap. (So do
+// the 0.0.0.0/1 + 128.0.0.0/1 pair VPN clients install over a default.) An
+// add, a re-point or a delete of 0.0.0.0/0 then rewrites the whole table;
+// returns what 10.1.2.3 (10.0.0.0/8, value 7) resolves to afterwards.
+uint64_t RunDefaultOverClassDE(int form) {
+  RteFib fib(64, 16);
+  EXPECT_TRUE(fib.ok());
+  if (!fib.ok()) {
+    return 0;
+  }
+  if (form != 0) {
+    EXPECT_EQ(0, fib.Add(P(0, 0), 6));
+  }
+  EXPECT_EQ(0, fib.Add(P(Ip(10, 0, 0, 0), 8), 7));
+  EXPECT_EQ(0, fib.Add(P(Ip(224, 0, 0, 0), 4), 8));
+  EXPECT_EQ(0, fib.Add(P(Ip(240, 0, 0, 0), 4), 9));
+  if (form == 0) {
+    EXPECT_EQ(0, fib.Add(P(0, 0), 6));  // add
+  } else if (form == 1) {
+    EXPECT_EQ(0, fib.Add(P(0, 0), 5));  // re-point
+  } else {
+    EXPECT_EQ(0, fib.Erase(P(0, 0)));  // delete
+  }
+  return fib.Lookup(Ip(10, 1, 2, 3));
+}
+
 // Expected failure, pinned: the DPDK this tree builds still has the defect.
 // When an upgrade fixes it, this fails on purpose -- that is the trigger to
 // rerun the re-trial (docs/decisions.md, D-130 "Revisit when").
@@ -981,6 +1009,9 @@ TEST(RteFibTest, D130WrapDefectStillPresent) {
   const WrapCase del = RunWrapCase(true);
   EXPECT_EQ(RteFib::kMiss, del.covered) << "the whole table falls to default";
   EXPECT_EQ(RteFib::kMiss, del.unrelated);
+  EXPECT_EQ(6u, RunDefaultOverClassDE(0)) << "add 0/0: all of it is 0/0's";
+  EXPECT_EQ(5u, RunDefaultOverClassDE(1)) << "re-point 0/0: likewise";
+  EXPECT_EQ(RteFib::kMiss, RunDefaultOverClassDE(2)) << "delete 0/0: all miss";
 }
 
 uint32_t HostMask(uint8_t len) { return len == 32 ? 0 : ~uint32_t{0} >> len; }
@@ -992,13 +1023,19 @@ void AddEdges(Ipv4Prefix p, std::vector<uint32_t> *keys) {
   keys->insert(keys->end(), {lo, hi, lo - 1, hi + 1});
 }
 
+bool EndsAtTop(Ipv4Prefix p) {
+  return (p.addr() | HostMask(p.length())) == ~uint32_t{0};
+}
+
 // Randomised add / re-point / delete sequences: prefix lengths 0-32 (the
 // default route included), dense overlap, deletes that must restore the
 // covering route, deletes of absent routes. rte_fib, rte_lpm and the
 // reference take every operation in lock step and are compared after each
-// one. `avoid_top` leaves out the prefixes that end at 255.255.255.255 --
-// the D-130 defect's precondition, and nothing else.
-void RunFibOracle(uint64_t seed, size_t steps, bool avoid_top) {
+// one. With `avoid_defect`, an operation that could trip D-130 is skipped:
+// an add, re-point or delete of a prefix ending at 255.255.255.255 (the
+// default route included) while a longer prefix ending there is live. Such
+// prefixes are still generated and changed in every other situation.
+void RunFibOracle(uint64_t seed, size_t steps, bool avoid_defect) {
   constexpr size_t kMaxLive = 256;
   RteFib fib(2 * kMaxLive, 1024);
   ASSERT_TRUE(fib.ok());
@@ -1014,28 +1051,29 @@ void RunFibOracle(uint64_t seed, size_t steps, bool avoid_top) {
                                               Ip(192, 168, 0, 0), 0,
                                               Ip(255, 255, 0, 0)};
   auto random_prefix = [&]() {
-    for (;;) {
-      const uint32_t pick = static_cast<uint32_t>(rng() % 100);
-      uint8_t len;
-      if (pick < 5) {
-        len = static_cast<uint8_t>(rng() % 9);  // /0../8
-      } else if (pick < 15) {
-        len = static_cast<uint8_t>(9 + rng() % 8);
-      } else if (pick < 55) {
-        len = static_cast<uint8_t>(17 + rng() % 8);
-      } else {
-        len = static_cast<uint8_t>(25 + rng() % 8);
-      }
-      const uint32_t addr =
-          rng() % 20 == 0 ? ~uint32_t{0}  // the last prefix of its length
-                          : kBases[rng() % kBases.size()] |
-                                (static_cast<uint32_t>(rng()) & 0xffff);
-      const uint32_t prefix = addr & ~HostMask(len);
-      if (avoid_top && len != 0 && (prefix | HostMask(len)) == ~uint32_t{0}) {
-        continue;
-      }
-      return P(prefix, len);
+    const uint32_t pick = static_cast<uint32_t>(rng() % 100);
+    uint8_t len;
+    if (pick < 5) {
+      len = static_cast<uint8_t>(rng() % 9);  // /0../8
+    } else if (pick < 15) {
+      len = static_cast<uint8_t>(9 + rng() % 8);
+    } else if (pick < 55) {
+      len = static_cast<uint8_t>(17 + rng() % 8);
+    } else {
+      len = static_cast<uint8_t>(25 + rng() % 8);
     }
+    const uint32_t addr =
+        rng() % 20 == 0 ? ~uint32_t{0}  // the last prefix of its length
+                        : kBases[rng() % kBases.size()] |
+                              (static_cast<uint32_t>(rng()) & 0xffff);
+    return P(addr & ~HostMask(len), len);
+  };
+
+  auto trips_defect = [&](Ipv4Prefix p) {
+    return avoid_defect && EndsAtTop(p) &&
+           std::ranges::any_of(live, [&](Ipv4Prefix q) {
+             return q.length() > p.length() && EndsAtTop(q);
+           });
   };
 
   // Compares all three on `keys`; stops at the first disagreement (the
@@ -1078,6 +1116,9 @@ void RunFibOracle(uint64_t seed, size_t steps, bool avoid_top) {
       // to the route covering it.
       const size_t i = rng() % live.size();
       const Ipv4Prefix p = live[i];
+      if (trips_defect(p)) {
+        continue;
+      }
       live[i] = live.back();
       live.pop_back();
       live_set.erase(p);
@@ -1097,6 +1138,9 @@ void RunFibOracle(uint64_t seed, size_t steps, bool avoid_top) {
     } else {
       // Add, or re-point a route already there; 1 in 11 is the default route.
       const Ipv4Prefix p = pick < 50 ? P(0, 0) : random_prefix();
+      if (trips_defect(p)) {
+        continue;
+      }
       const uint32_t v = 1 + static_cast<uint32_t>(rng() % 60000);
       ASSERT_EQ(0, fib.Add(p, v)) << "step " << step;
       ASSERT_TRUE(lpm->Upsert(p, Value(v))) << "step " << step;
@@ -1122,14 +1166,14 @@ void RunFibOracle(uint64_t seed, size_t steps, bool avoid_top) {
 }
 
 TEST(RteFibTest, RandomisedChurnMatchesReference) {
-  // While D-130's defect is present, its precondition is left out (the test
-  // above pins the defect itself); a DPDK that fixes it gets the whole
-  // address space here with no edit.
-  const bool avoid_top = FibHasWrapDefect();
-  RecordProperty("top_of_address_space",
-                 avoid_top ? "left out: D-130 defect present" : "included");
+  // While D-130's defect is present, the operations that could trip it are
+  // skipped (the test above pins the defect itself); a DPDK that fixes it
+  // gets every operation here with no edit.
+  const bool avoid_defect = FibHasWrapDefect();
+  RecordProperty("d130_operations",
+                 avoid_defect ? "skipped: D-130 defect present" : "included");
   for (uint64_t seed : {0x130a, 0x130b, 0x130c, 0x130d}) {
-    RunFibOracle(seed, 2000, avoid_top);
+    RunFibOracle(seed, 2000, avoid_defect);
   }
 }
 
