@@ -147,6 +147,7 @@ file is the reasoning.
 | D-125 | HTTP inside bessd, off by default: protobuf-JSON over the Control RPCs, WatchEvents as server-sent events, Prometheus `/metrics` (replaces tools/bess_prometheus.py), a compiled-in page; every request a call on bessd's own gRPC server over an in-process channel | accepted |
 | D-126 | One SIMD width per process: `--simd_width=auto\|256\|512` and the CPU, decided once before the EAL, passed to DPDK as `--force-max-simd-bitwidth` (auto passes nothing: DPDK's 256 on x86) and to BESS kernels through `arch::RuntimeDispatch`, a function pointer resolved at startup; wider than the CPU is a warning; no AVX-512 kernel (no hardware) | accepted |
 | D-127 | Compiler tuning: a `tune` meson option (`-mtune`, empty by default, not passed to plugins); releases stay `-march=x86-64-v3` with the compiler's default tune (GCC: generic): on this host no `-mtune` (generic, graniterapids, znver5, native alderlake) is consistently faster with GCC 16, and Clang's best tune here is AMD's | accepted |
+| D-131 | Local DPDK patches: `deps/dpdk-patches/NNNN-<slug>.patch` (format-patch, `Upstream-Status` and `BESS-Decision` trailers) applied in order by the bootstrap; a series stamp in the source tree and each install re-extracts or reinstalls on change; `--check-patches` in CI; build-info and the SBOM list the series | accepted |
 
 
 ---
@@ -9230,3 +9231,78 @@ Keep-alive and HTTP/2 were left out: a scraper, `curl` and the page make one req
 `tests/live/live_daemon.{h,cc}` (`Daemon::Launch`, `FreePort`), `tests/live/meson.build`; deleted
 `tools/bess_prometheus.py`; `docs/control-sdk.md`, `docs/limits.md`, `docs/running-in-containers.md`,
 `protobuf/control_v2.proto` and `core/stats/metric_registry.h` (comments), `MODERNIZATION.md` (G1.9).
+
+## D-131 Local DPDK patches
+
+**Status:** accepted.
+
+**Problem.** D-130 found a defect in DPDK itself (`rte_fib` DIR24_8: the update loop wraps at 255.255.255.255
+and overwrites the whole table). BESS pins DPDK (`deps/dpdk.json`) and builds it from the release tarball with
+`tools/bootstrap_dpdk.py`, so a fix need not wait for an upstream release, but there was no way to carry one:
+the bootstrap built the tarball as it is, and nothing recorded what a build's DPDK was beyond the pin.
+
+**Decision.**
+
+- **The series.** `deps/dpdk-patches/NNNN-<slug>.patch`, `git format-patch` output, applied with `git apply
+  -p1` in file-name order to the pristine extracted tarball. An empty or absent directory is pristine DPDK. Any
+  other file there except `README.md` and `.gitkeep` is an error, so a misnamed patch is not skipped silently.
+- **Two trailers per patch.** `Upstream-Status: Pending | Submitted <url> | Accepted <dpdk-commit> |
+  Local-only <reason>` and `BESS-Decision: D-NNN`.
+- **A stamp, not a guess.** The series identity is a sha256 over each patch's name and content digest, in
+  order. The bootstrap writes it as `.bess-dpdk-patches.json` into the source tree and, after `ninja install`,
+  into the install prefix.
+  - A source tree with a different stamp, or none, is replaced by a fresh extraction. The series is applied in
+    a temporary directory and the result renamed into place, so a failed patch leaves the old tree as it was
+    and no tree is patched twice. The failure names the patch and prints the rejected hunks.
+  - Build trees move to the new tree only if the old one was pristine (no stamp or the empty series): its files
+    and the new tree's unchanged files have the same tarball mtimes and patched files are newer, so ninja
+    rebuilds exactly what changed. After a patched tree they are deleted, because a reverted file goes back to
+    an older mtime that ninja would not notice.
+  - An install with a different stamp is deleted before `ninja install`, so a file that only an old patch
+    installed does not stay behind. An install with no stamp counts as the empty series: every install made
+    before this decision is pristine, so with no patches an existing tree is not rebuilt or reinstalled from
+    scratch. (An unstamped source tree is still re-extracted once; with its build trees kept and the same mtimes,
+    ninja has nothing to do.)
+- **A check.** `tools/bootstrap_dpdk.py --check-patches` checks names, numbering, the format-patch header and
+  both trailers, then applies the series to a pristine extraction in a temporary directory. It touches no DPDK
+  tree, and with no patches it does nothing. CI runs it in `tools/ci_profile.py layers`. Both DPDK cache keys
+  in `ci.yml` (lanes and `publish-release`) hash `deps/dpdk-patches/**`.
+- **What a build says.** `build-info.json` gets `dpdk.patches: [{name, sha256, upstream_status}]` (`[]` when
+  pristine), and `verify-install` requires the list. The SPDX dpdk package keeps the upstream version and the
+  tarball's checksum, so vulnerability matching by version still works, and lists the patches in its
+  `sourceInfo`, a plain-text SPDX 2.3 package field. A `25.11.3+bess.<n>` version was rejected: matchers compare
+  versions, and the patches change no upstream version.
+- **Upgrades.** On a DPDK bump each patch must apply or be removed, with the reason in the bump's commit; an
+  `Accepted` patch whose commit is in the new version is removed.
+
+**Evidence.** Run (2026-10-13), without building: `--check-patches` with no patches prints "none" and downloads
+nothing; with a throwaway `git format-patch` comment patch on `lib/fib/dir24_8.c` it applies it to a pristine
+extraction (rc 0); with that patch's `Upstream-Status` line removed it fails with "needs exactly one
+Upstream-Status trailer, has 0" (rc 1); with a second patch whose context is not in DPDK it fails naming
+`0002-bad.patch` and prints the `.rej` hunk (rc 1). `build_info.py` writes `dpdk.patches: []` with no patches
+and the one entry (`name`, `sha256`, `upstream_status: Local-only throwaway smoke test`) with the patch; the SBOM's
+dpdk package gets the `sourceInfo` line only then. `ci_profile.py layers` passes. The tarball's top directory is
+`dpdk-stable-25.11.3`, not the pin's `directory`; `extract` takes the single root, as the old code did.
+
+Bootstrap smoke (2026-10-13, the worktree's private `deps/`, bess profile, `-j8`, ccache warm):
+
+| step | DPDK objects compiled / linked | stamps, install |
+|---|---|---|
+| old script, cold | full build | none |
+| new script, no patches, over it | 0 / 0, "no work to do" (one re-extract: no stamp) | empty series; install content hash unchanged (`745adc5197a22f70`) |
+| throwaway comment patch on `lib/fib/dir24_8.c` | 1 / 2 | series `99c6e9ec…`, install removed and reinstalled |
+| same again | 0 / 0 | unchanged |
+| patch edited | 372 / 148 (re-extracted, build trees dropped) | series `e9e5628a…` |
+| a second patch that does not apply | fails naming it, git's error and the rejected hunk | source stamp unchanged, no `.rej` left |
+| back to no patches | 372 / 148 | empty series, install content hash `745adc5197a22f70` again |
+
+The install's file mtimes change on every bootstrap run, with or without patches, because the bootstrap runs
+`ninja install` each time; the old script did the same.
+
+**Revisit when** DPDK is bumped (apply-or-remove, above); when a patch's upstream status changes; or if BESS
+stops building DPDK itself (a distribution DPDK cannot carry patches, and the decisions that need them would
+have to be reopened).
+
+**Code.** `tools/bootstrap_dpdk.py`, `tools/build_info.py`, `tools/ci_profile.py` (`layers`, `verify-install`),
+`.github/workflows/ci.yml`, `.gitignore`, `deps/dpdk-patches/README.md`, `MODERNIZATION.md`, `README.md`,
+`DEPENDENCY_INVENTORY.md`, `docs/ci-parity.md`.

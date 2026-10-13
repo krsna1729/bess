@@ -112,6 +112,12 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   reason; any count above or below its entry fails, so the list only shrinks.
   It is edited by hand; `check_arch.py --report` prints the current counts in
   its format.
+- **Local DPDK patches apply and say why.** `layers` runs
+  `tools/bootstrap_dpdk.py --check-patches`: every `deps/dpdk-patches/*.patch`
+  is `git format-patch` output with an `Upstream-Status` and a `BESS-Decision`
+  trailer, and the series applies in order to a pristine extraction in a
+  temporary directory (D-131, `deps/dpdk-patches/README.md`). The DPDK cache
+  keys include the patches.
 
 ## Compiler versions
 

@@ -98,6 +98,14 @@ For development and CI, build DPDK with only the software ports:
 default `--profile full` builds every NIC family, for a binary that talks to
 hardware; it takes about 2 minutes.
 
+Local DPDK patches live in `deps/dpdk-patches/` (D-131). The bootstrap applies
+them in order after verifying the tarball, stamps the series into the source
+tree and the install, and re-extracts and rebuilds when the series changes;
+with no patches DPDK is pristine and an existing install is not rebuilt.
+`tools/bootstrap_dpdk.py --check-patches` checks them (CI: the `layers` step),
+and `build-info.json` lists them under `dpdk.patches`. How to add one, the
+trailers and the rule on a DPDK upgrade: `deps/dpdk-patches/README.md`.
+
 ### Build profiles
 
 Three profiles, by purpose. Only the first needs a native file; the others are
@@ -158,7 +166,8 @@ starting its own unprivileged `bessd -skip_root_check -m 0`.
 - Do not restore `core/Makefile`.
 - Do not restore top-level `build.py` as a BESS build orchestrator.
 - DPDK is external and consumed through `pkg-config`.
-- DPDK source/version/checksum has one tracked source of truth: `deps/dpdk.json`.
+- DPDK source/version/checksum has one tracked source of truth: `deps/dpdk.json`;
+  local patches to it, one: `deps/dpdk-patches/` (D-131).
 - Generated C++ and Python protobuf artifacts live in the build tree.
 - The source tree should remain clean after a normal build/test.
 - Cap local build parallelism at `-j8`.

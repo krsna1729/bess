@@ -6,7 +6,7 @@ This is a source-level inventory of explicit dependency declarations in tracked 
 
 | Dependency / tool | Explicit version in the repository | Source and interpretation |
 |---|---|---|
-| DPDK | **25.11.3**, exact archive and SHA-256 `3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7490` | `deps/dpdk.json`; bootstrap downloads this archive and verifies the digest. |
+| DPDK | **25.11.3**, exact archive and SHA-256 `3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7490`, plus the local patches in `deps/dpdk-patches/` (none when empty; D-131) | `deps/dpdk.json`, `deps/dpdk-patches/`; bootstrap downloads this archive, verifies the digest and applies the patches in order. |
 | Meson | `>=1.2.0` | `meson.build`; minimum, not a lock. |
 | libxdp | `>=1.2.2` when AF_XDP is enabled/required | `meson.build`, `tools/bootstrap_dpdk.py`; minimum only. |
 | Python `scapy` | `>=2.7.0` | `requirements.txt`; stable release minimum as of 2026-09-25. |

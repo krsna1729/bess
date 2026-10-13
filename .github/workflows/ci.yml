@@ -160,7 +160,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: deps
-          key: dpdk-bess-${{ matrix.name }}-${{ runner.arch }}-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'tools/bootstrap_dpdk.py') }}
+          key: dpdk-bess-${{ matrix.name }}-${{ runner.arch }}-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'deps/dpdk-patches/**', 'tools/bootstrap_dpdk.py') }}
 
       # The configuration and the verification steps live in tools/ci_profile.py,
       # which a developer runs unchanged (docs/ci-parity.md).
@@ -271,7 +271,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: deps
-          key: dpdk-full-gcc14-${{ runner.arch }}-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'tools/bootstrap_dpdk.py') }}
+          key: dpdk-full-gcc14-${{ runner.arch }}-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'deps/dpdk-patches/**', 'tools/bootstrap_dpdk.py') }}
 
       - name: Bootstrap pinned DPDK
         run: python3 tools/ci_profile.py release-bootstrap $LANE

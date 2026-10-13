@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Download, verify, build, and install the pinned DPDK dependency."""
+"""Download, verify, patch, build, and install the pinned DPDK dependency.
+
+The local patch series (D-131) is deps/dpdk-patches/NNNN-<slug>.patch, applied
+with -p1 in file-name order to the pristine extracted tarball. Its identity (a
+sha256 over the ordered names and patch digests) is stamped into the source
+tree and into each install prefix; a different stamp re-extracts the source or
+reinstalls. `--check-patches` verifies the series without building.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +26,18 @@ from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 METADATA = ROOT / 'deps' / 'dpdk.json'
+PATCH_DIR = ROOT / 'deps' / 'dpdk-patches'
+PATCH_NAME = re.compile(r'\d{4}-[A-Za-z0-9][A-Za-z0-9._-]*\.patch')
+# Files in PATCH_DIR that are not patches. Anything else is an error, so a
+# misnamed patch is never silently left out.
+PATCH_DIR_EXTRAS = frozenset({'README.md', '.gitkeep'})
+# Written into the source tree and into each install prefix.
+STAMP = '.bess-dpdk-patches.json'
+TRAILERS = {
+    'Upstream-Status': re.compile(
+        r'Pending|Submitted https?://\S+|Accepted [0-9a-f]{7,40}|Local-only \S.*'),
+    'BESS-Decision': re.compile(r'D-\d{3,}'),
+}
 
 # What of DPDK to build. Every library is always built (a plugin may use any of
 # them); DPDK's own apps never are. The profiles differ in which drivers:
@@ -73,36 +93,174 @@ def verify_archive(path: Path, expected: str) -> None:
     print(f'Verified {path.name}: {actual}')
 
 
-def download_and_extract(metadata: dict[str, str], source_dir: Path,
-                         archive: Path) -> None:
-    source_dir.parent.mkdir(parents=True, exist_ok=True)
-    if source_dir.exists():
-        print(f'DPDK source already exists at {source_dir}')
-        return
+def patch_series(directory: Path = PATCH_DIR) -> list[Path]:
+    """The series in application order; [] when the directory is absent or
+    holds no patches (pristine DPDK)."""
+    if not directory.is_dir():
+        return []
+    patches, stray = [], []
+    for entry in sorted(directory.iterdir()):
+        if entry.name in PATCH_DIR_EXTRAS:
+            continue
+        if entry.is_file() and PATCH_NAME.fullmatch(entry.name):
+            patches.append(entry)
+        else:
+            stray.append(entry.name)
+    if stray:
+        raise SystemExit(f'{directory}: not a NNNN-<slug>.patch file: '
+                         + ', '.join(stray))
+    return patches
 
+
+def series_record(patches: list[Path]) -> dict:
+    """The series identity: sha256 over each patch's name and content digest,
+    in order. The empty series has the digest of no input."""
+    entries = [{'name': p.name, 'sha256': sha256(p)} for p in patches]
+    digest = hashlib.sha256()
+    for entry in entries:
+        digest.update(f'{entry["name"]}\0{entry["sha256"]}\n'.encode())
+    return {'series': digest.hexdigest(), 'patches': entries}
+
+
+EMPTY_SERIES = series_record([])['series']
+
+
+def read_stamp(path: Path) -> str | None:
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))['series']
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def write_stamp(path: Path, record: dict) -> None:
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + '\n',
+                         encoding='utf-8')
+    os.replace(temporary, path)
+
+
+def trailers(patch: Path) -> dict[str, list[str]]:
+    """The D-131 trailers in a format-patch commit message (before `---`)."""
+    found: dict[str, list[str]] = {key: [] for key in TRAILERS}
+    for line in patch.read_text(encoding='utf-8', errors='replace').splitlines():
+        if line == '---':
+            break
+        key, sep, value = line.partition(':')
+        if sep and key in found:
+            found[key].append(value.strip())
+    return found
+
+
+def patch_problems(patches: list[Path]) -> list[str]:
+    """What makes the series invalid without applying it: format, numbering
+    and the two trailers."""
+    problems = []
+    numbers: dict[str, str] = {}
+    for patch in patches:
+        number = patch.name[:4]
+        if number in numbers:
+            problems.append(f'{patch.name}: number {number} is also {numbers[number]}')
+        numbers[number] = patch.name
+        lines = patch.read_text(encoding='utf-8', errors='replace').splitlines()
+        if not lines or not lines[0].startswith('From ') or not any(
+                line.startswith('Subject: ') for line in lines):
+            problems.append(f'{patch.name}: not `git format-patch` output '
+                            '(no "From " line or Subject header)')
+        for key, values in trailers(patch).items():
+            if len(values) != 1:
+                problems.append(f'{patch.name}: needs exactly one {key} trailer, '
+                                f'has {len(values)}')
+            elif not TRAILERS[key].fullmatch(values[0]):
+                problems.append(f'{patch.name}: invalid {key}: {values[0]!r}')
+    return problems
+
+
+def fetch_archive(metadata: dict[str, str], archive: Path) -> None:
+    archive.parent.mkdir(parents=True, exist_ok=True)
     if not archive.exists():
         print(f'Downloading {metadata["url"]}')
         temporary = archive.with_suffix(archive.suffix + '.download')
         with urlopen(metadata['url']) as response, temporary.open('wb') as output:
             shutil.copyfileobj(response, output)
         os.replace(temporary, archive)
-
     verify_archive(archive, metadata['sha256'])
+
+
+def extract(metadata: dict[str, str], archive: Path, destination: Path) -> Path:
+    with tarfile.open(archive, 'r:*') as package:
+        package.extractall(destination, filter='data')
+    extracted = destination / metadata['directory']
+    if not extracted.is_dir():
+        roots = [
+            candidate for candidate in destination.iterdir()
+            if candidate.is_dir()
+        ]
+        if len(roots) != 1:
+            raise SystemExit(
+                f'archive {archive} did not contain a single source directory')
+        extracted = roots[0]
+    return extracted
+
+
+def apply_series(source_dir: Path, patches: list[Path]) -> None:
+    """Apply the series to a throwaway extraction; the first failure stops
+    with the patch's name and its rejected hunks."""
+    # git apply inside the BESS checkout would resolve paths against the BESS
+    # repository: stop its repository search at the extraction.
+    env = {**os.environ, 'GIT_CEILING_DIRECTORIES': str(source_dir.parent)}
+    for patch in patches:
+        print(f'Applying {patch.name}')
+        result = subprocess.run(['git', 'apply', '-p1', '--whitespace=nowarn',
+                                 str(patch)], cwd=source_dir, env=env,
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            continue
+        # The tree is discarded: apply what applies to show what does not.
+        subprocess.run(['git', 'apply', '-p1', '--whitespace=nowarn', '--reject',
+                        str(patch)], cwd=source_dir, env=env, capture_output=True)
+        rejects = ''.join(f'--- {rej.relative_to(source_dir)}\n{rej.read_text(errors="replace")}'
+                          for rej in sorted(source_dir.rglob('*.rej')))
+        raise SystemExit(f'DPDK patch {patch.name} does not apply:\n'
+                         f'{result.stderr.strip()}\n{rejects}'.rstrip())
+
+
+def is_build_tree(name: str) -> bool:
+    return name == 'build' or name.startswith('build-')
+
+
+def is_install_tree(name: str) -> bool:
+    return name == 'install' or name.startswith('install-')
+
+
+def prepare_source(metadata: dict[str, str], source_dir: Path, archive: Path,
+                   patches: list[Path], record: dict) -> None:
+    """Make source_dir the pristine tarball plus the series. A tree stamped
+    with another series (or none) is replaced by a fresh extraction; the
+    build and install trees inside it move over. Build trees survive only if
+    the old tree was pristine: unchanged files then keep their tarball mtimes
+    and patched files are newer, so ninja rebuilds exactly what changed. After
+    a patched tree they are removed, since a reverted file goes back to an
+    older mtime that ninja would not notice."""
+    previous = read_stamp(source_dir / STAMP) if source_dir.exists() else None
+    if source_dir.exists() and previous == record['series']:
+        print(f'DPDK source at {source_dir} has the current patch series '
+              f'({len(patches)} patches)')
+        return
+    fetch_archive(metadata, archive)
+    keep_builds = previous in (None, EMPTY_SERIES)
     with tempfile.TemporaryDirectory(
             prefix='dpdk-extract-', dir=archive.parent) as temporary:
         temporary_path = Path(temporary)
-        with tarfile.open(archive, 'r:*') as package:
-            package.extractall(temporary_path, filter='data')
-        extracted = temporary_path / metadata['directory']
-        if not extracted.is_dir():
-            roots = [
-                candidate for candidate in temporary_path.iterdir()
-                if candidate.is_dir()
-            ]
-            if len(roots) != 1:
-                raise SystemExit(
-                    f'archive {archive} did not contain a single source directory')
-            extracted = roots[0]
+        extracted = extract(metadata, archive, temporary_path / 'new')
+        apply_series(extracted, patches)
+        write_stamp(extracted / STAMP, record)
+        if source_dir.exists():
+            print(f'Re-extracting {source_dir}: its patch series '
+                  f'{previous or "(no stamp)"} is not {record["series"]}')
+            for entry in source_dir.iterdir():
+                if is_install_tree(entry.name) or (keep_builds and is_build_tree(entry.name)):
+                    os.replace(entry, extracted / entry.name)
+            os.replace(source_dir, temporary_path / 'previous')
         os.replace(extracted, source_dir)
 
 
@@ -188,7 +346,7 @@ def setup_command(source_dir: Path, build_dir: Path, prefix: Path,
 
 def configure_and_build(source_dir: Path, build_dir: Path, prefix: Path,
                          cpu: str | None, profile: str, jobs: int | None,
-                         env: dict[str, str]) -> None:
+                         env: dict[str, str], record: dict) -> None:
     build_dir.parent.mkdir(parents=True, exist_ok=True)
     run(setup_command(source_dir, build_dir, prefix, cpu, profile,
                       platform.machine()), env=env)
@@ -196,11 +354,38 @@ def configure_and_build(source_dir: Path, build_dir: Path, prefix: Path,
     if jobs:
         ninja_cmd.append(f'-j{jobs}')
     run(ninja_cmd, env=env)
+    # An install of another series is removed first, so a file only an old
+    # patch installed does not linger. No stamp counts as the empty series:
+    # every install made before D-131 is pristine.
+    installed = read_stamp(prefix / STAMP) or EMPTY_SERIES
+    if installed != record['series'] and prefix.exists():
+        print(f'Removing {prefix}: installed patch series {installed} '
+              f'is not {record["series"]}')
+        shutil.rmtree(prefix)
     install_cmd = ['ninja', '-C', str(build_dir)]
     if jobs:
         install_cmd.append(f'-j{jobs}')
     install_cmd.append('install')
     run(install_cmd, env=env)
+    write_stamp(prefix / STAMP, record)
+
+
+def check_patches(metadata: dict[str, str], archive: Path,
+                  patches: list[Path]) -> int:
+    """Fail unless the series is well formed and applies, in order, to a
+    pristine extraction in a temporary directory. Touches no DPDK tree."""
+    if not patches:
+        print(f'DPDK patches: none in {PATCH_DIR} (pristine DPDK)')
+        return 0
+    problems = patch_problems(patches)
+    if problems:
+        raise SystemExit('DPDK patch series is invalid:\n  ' + '\n  '.join(problems))
+    fetch_archive(metadata, archive)
+    with tempfile.TemporaryDirectory(prefix='dpdk-check-', dir=archive.parent) as temporary:
+        apply_series(extract(metadata, archive, Path(temporary)), patches)
+    print(f'DPDK patches: {len(patches)} apply cleanly to {metadata["directory"]}; '
+          f'series {series_record(patches)["series"]}')
+    return 0
 
 
 def main() -> int:
@@ -223,6 +408,11 @@ def main() -> int:
                         'overwrite each other (tools/ci_profile.py uses one '
                         'per compiler)')
     parser.add_argument('--print-pkg-config-path', action='store_true')
+    parser.add_argument('--check-patches', action='store_true',
+                        help='check deps/dpdk-patches without building: '
+                        'names, both trailers, and that every patch applies '
+                        'in order to a pristine extraction (in a temporary '
+                        'directory)')
     args = parser.parse_args()
 
     dpdk_dir = ROOT / 'deps' / metadata['directory']
@@ -234,15 +424,18 @@ def main() -> int:
         return 0
 
     archive = ROOT / 'deps' / f'{metadata["directory"]}.tar.xz'
+    patches = patch_series()
+    if args.check_patches:
+        return check_patches(metadata, archive, patches)
+    record = series_record(patches)
     build_dir = dpdk_dir / f'build{suffix}'
     check_af_xdp_dependencies(args.af_xdp)
-    download_and_extract(metadata, dpdk_dir, archive)
+    prepare_source(metadata, dpdk_dir, archive, patches, record)
     build_env = os.environ.copy()
     build_env['PKG_CONFIG_PATH'] = os.pathsep.join(
         filter(None, [build_env.get('PKG_CONFIG_PATH'), str(pkgconfig)]))
     configure_and_build(dpdk_dir, build_dir, prefix, args.cpu, args.profile,
-                        args.jobs, build_env)
-    check_af_xdp_artifacts(prefix, args.af_xdp)
+                        args.jobs, build_env, record)
     print(f'DPDK pkg-config path: {pkgconfig}')
     return 0
 

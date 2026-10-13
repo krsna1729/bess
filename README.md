@@ -33,7 +33,8 @@ Documentation can be found [here](https://github.com/NetSys/bess/wiki/). Please 
 
 The supported developer build uses Meson and Ninja.  DPDK is pinned in
 `deps/dpdk.json`; the bootstrap helper verifies its SHA256 before extracting
-or building it.
+or building it, then applies the local patches in `deps/dpdk-patches/`, if any
+(D-131; see the README there).
 
 ```bash
 tools/bootstrap_dpdk.py --af-xdp auto --cpu x86-64-v3   # aarch64: --cpu armv8.2-a

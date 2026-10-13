@@ -318,6 +318,9 @@ def step_layers(s):
     s.run([sys.executable, ROOT / 'tools' / 'check_arch.py'])
     s.run([sys.executable, ROOT / 'tools' / 'check_limits.py', '--self-test'])
     s.run([sys.executable, ROOT / 'tools' / 'check_limits.py'])
+    # The local DPDK patch series (D-131): names, trailers, and that it
+    # applies in order to a pristine extraction.
+    s.run([sys.executable, ROOT / 'tools' / 'bootstrap_dpdk.py', '--check-patches'])
 
 
 def symbolizer():
@@ -454,7 +457,8 @@ def step_verify_install(s):
                 'dependencies'):
         if key not in info:
             raise SystemExit(f'build-info.json lacks {key}')
-    if not isinstance(info['plugin_api_version'], int) or not info['dpdk'].get('sha256'):
+    if not isinstance(info['plugin_api_version'], int) or not info['dpdk'].get('sha256') \
+            or not isinstance(info['dpdk'].get('patches'), list):
         raise SystemExit(f"build-info.json is incomplete: plugin_api_version="
                          f"{info['plugin_api_version']!r} dpdk={info['dpdk']!r}")
     if os.environ.get('GITHUB_ACTIONS') and info['commit'] == 'unknown':

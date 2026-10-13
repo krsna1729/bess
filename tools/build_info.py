@@ -6,10 +6,11 @@
 
 Both come from the build itself, never from hand-kept lists: meson's
 introspection files (compilers, options, the dependencies found and their
-versions), deps/dpdk.json (DPDK's pinned version, URL and sha256), the plugin
-API version in core/framework/plugin.h, and git when the source is a checkout
-("unknown" in a source release). bessd's install carries both files, so a
-deployed daemon can say exactly what it is made of.
+versions), deps/dpdk.json (DPDK's pinned version, URL and sha256) and the local
+DPDK patch series in deps/dpdk-patches (D-131), the plugin API version in
+core/framework/plugin.h, and git when the source is a checkout ("unknown" in a
+source release). bessd's install carries both files, so a deployed daemon can
+say exactly what it is made of.
 """
 
 import argparse
@@ -21,6 +22,10 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+# A build writes only to its build directory: no __pycache__ in tools/.
+sys.dont_write_bytecode = True
+from bootstrap_dpdk import patch_series, sha256, trailers  # noqa: E402
 
 OPTIONS = ('buildtype', 'cpp_std', 'cpu', 'arch_generic', 'b_sanitize', 'b_lto',
            'build_benchmarks', 'build_fuzzers')
@@ -47,6 +52,13 @@ def plugin_api_version(source_dir):
     return int(match.group(1)) if match else None
 
 
+def dpdk_patches(source_dir):
+    """The series bootstrap_dpdk.py applies, in order."""
+    return [{'name': p.name, 'sha256': sha256(p),
+             'upstream_status': (trailers(p)['Upstream-Status'] or ['unknown'])[0]}
+            for p in patch_series(Path(source_dir) / 'deps' / 'dpdk-patches')]
+
+
 def build_info(build_dir, source_dir):
     project = intro(build_dir, 'projectinfo')
     compilers = intro(build_dir, 'compilers').get('host', {})
@@ -71,10 +83,33 @@ def build_info(build_dir, source_dir):
         'compilers': {lang: {'id': c['id'], 'version': c['version']}
                       for lang, c in sorted(compilers.items())},
         'options': options,
-        'dpdk': {'version': dpdk['version'], 'url': dpdk['url'], 'sha256': dpdk['sha256']},
+        'dpdk': {'version': dpdk['version'], 'url': dpdk['url'], 'sha256': dpdk['sha256'],
+                 'patches': dpdk_patches(source_dir)},
         'dependencies': [{'name': n, 'version': ' '.join(sorted(v))}
                          for n, v in sorted(versions.items())],
     }
+
+
+def dpdk_package(dpdk):
+    """DPDK as built: the pinned tarball (its version and checksum, so
+    vulnerability matching by version still works) plus, in sourceInfo, the
+    local patches applied to it."""
+    package = {
+        'SPDXID': spdx_id('dpdk'),
+        'name': 'dpdk',
+        'versionInfo': dpdk['version'],
+        'downloadLocation': dpdk['url'],
+        'filesAnalyzed': False,
+        'checksums': [{'algorithm': 'SHA256', 'checksumValue': dpdk['sha256']}],
+        'licenseDeclared': 'NOASSERTION',
+    }
+    if dpdk['patches']:
+        package['sourceInfo'] = (
+            f"DPDK {dpdk['version']} release tarball with BESS's local patches applied in "
+            'order (deps/dpdk-patches, D-131): ' + '; '.join(
+                f"{p['name']} sha256 {p['sha256']} Upstream-Status {p['upstream_status']}"
+                for p in dpdk['patches']))
+    return package
 
 
 def spdx_id(name):
@@ -91,15 +126,7 @@ def sbom(info):
         'filesAnalyzed': False,
         'licenseDeclared': 'BSD-3-Clause',
         'comment': f"commit {info['commit']}",
-    }, {
-        'SPDXID': spdx_id('dpdk'),
-        'name': 'dpdk',
-        'versionInfo': info['dpdk']['version'],
-        'downloadLocation': info['dpdk']['url'],
-        'filesAnalyzed': False,
-        'checksums': [{'algorithm': 'SHA256', 'checksumValue': info['dpdk']['sha256']}],
-        'licenseDeclared': 'NOASSERTION',
-    }]
+    }, dpdk_package(info['dpdk'])]
     for dep in info['dependencies']:
         if dep['name'] == 'libdpdk':
             continue  # the pinned source above
