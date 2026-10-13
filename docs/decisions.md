@@ -216,7 +216,7 @@ network function driven by a controller.
 - miss-heavy traffic on small tables shows up as a real bottleneck;
 - values need to be wider than 8 bytes (then use an id into an `ObjectTable`).
 
-**Measured 2026-10-12 (open).** Bursts that mix hits and misses at random are the case the table above did not
+**Measured 2026-10-12; accepted 2026-10-13.** Bursts that mix hits and misses at random are the case the table above did not
 cover. `live_perf M.exactmatch/mixed` (1024 addresses, every other one a rule; isolated CPU 2, median of 3; the run
 reported IRQ/softirq activity on the target CPUs): master 15.6 ns, this tree 27.6 ns per packet; hit-only 16.6 /
 18.0, miss-only 11.6 / 14.0. Per packet, mixed: 1.71 branch misses against master's 0.67, and 118 cycles against 66.
@@ -226,6 +226,13 @@ the compare pass, `lib/hash/rte_cuckoo_hash.c` 2202 and 2240); with a coin-flip 
 half the time, which is the measured +1.0 per packet. Nothing in our code around the call depends on the outcome.
 Closing the gap means a lookup with no per-key branch, that is, the rejected "own lock-free cuckoo" above, or a
 DPDK patch.
+
+Re-measured 2026-10-13 (isolated CPUs 2/4/6, D-118; 8 rounds; ns per packet above M.base, master / this tree):
+mixed 11.27 / 23.62, hit-only 10.24 / 10.64, miss-only 5.84 / 6.97; mixed 65.7 / 119.3 cycles and 0.7 / 1.7 branch
+misses per packet. Decision (user, 2026-10-13): accept. Real traffic is mostly hits, whose branches predict; the gap
+is the cost of an unpredictable mix, and neither carrying a DPDK patch (a branch-free first-candidate compare in
+`__bulk_lookup_lf`, using DPDK's dummy key slot 0) nor owning a lock-free cuckoo is worth it for that case.
+Revisit with the conditions above, or if a deployment shows hit/miss mixes near 50%.
 
 ## D-002 `rte_hash` flags: LF, QSBR defer queue; not multi-writer, not ext table
 
