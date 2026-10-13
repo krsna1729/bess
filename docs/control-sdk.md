@@ -210,7 +210,9 @@ bessctl's code is built on the C++ SDK alone and ships inside bessd (D-120):
 `bin/bessctl` (in the `bess` .deb; `build/bessctl/bessctl` in a build
 directory) is a symlink to `bessd`, and `bessd ctl ARGS` is the same command.
 `build/bessctl/bessctl-standalone` is the client alone, on `libbess-sdk`, for
-a host without bessd; it is not installed. Pipelines are manifests: a control_v2 `Pipeline` in
+a host without bessd; `meson install` leaves it out, and each release ships it
+as `bessctl-<version>-linux-<arch>`, built at the architecture's base ISA with
+its libraries linked in (D-136). Pipelines are manifests: a control_v2 `Pipeline` in
 protobuf's JSON mapping, written as JSON or YAML, field names as in
 `control_v2.proto`. A module's or port's `arg`
 may leave out `"@type"`; bessctl takes it from `GetSchema` (the class's or

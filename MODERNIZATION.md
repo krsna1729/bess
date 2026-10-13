@@ -8812,7 +8812,8 @@ consumer-driven (D-008, §31.3 item 2).
   Python bessctl, which is deleted last). `bessctl/`'s code is on the SDK
   alone and ships inside bessd: `bin/bessctl` is a symlink to bessd, which
   runs the client under that name or as `bessd ctl` (D-120); the standalone
-  `bessctl-standalone` links `libbess-sdk`. JSON and YAML manifests (D-108; `get`, `validate`,
+  `bessctl-standalone` links `libbess-sdk`, and each release ships it as one file at the
+  architecture's base ISA, loading glibc only (D-136). JSON and YAML manifests (D-108; `get`, `validate`,
   `diff`, `plan`, `apply`; resource entries committed after the pipeline), `schema`, `status`,
   `resources`, `metrics`, `events`, module commands over control_v2
   (`command`, D-115), and administration over the v2 Admin
@@ -8821,7 +8822,7 @@ consumer-driven (D-008, §31.3 item 2).
   all 39 `conf/samples` are manifests, each applied live (D-109, D-110,
   D-111, D-114, D-134); no `.bess` script ships (D-134: the metadata graphs are a
   C++ test, the port and plugin scripts manifests, perftest retired). Pending: the
-  legacy commands (daemon start, `.bess`, shell), a static baseline `-march` build.
+  legacy commands (daemon start, `.bess`, shell).
 - **G1.8 — v2 Admin service: DONE at D-104's scope (D-107).** Plugins, port
   status, capture into a client FIFO, packet pools, pause/resume of every
   worker and shutdown, epoch-checked like Control, in both SDKs and bessctl.

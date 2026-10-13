@@ -5,7 +5,8 @@
 # The shipped bessctl is bessd itself (D-120): bessd links bess_ctl and the
 # SDK built without its own control_v2 code (bess_sdk_embedded); installed,
 # bessctl is a symlink to bessd. bessctl-standalone, on libbess-sdk, is the
-# client alone, built but not installed.
+# client alone: not installed; the release builds it at the base ISA and ships
+# it as one file (ci_profile release-client, D-136).
 
 # YAML manifests (yaml_io.h): libyaml, linked statically in a static build.
 yaml_dep = dependency('yaml-0.1', method: 'pkg-config', static: is_static_deps, required: true)

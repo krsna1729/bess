@@ -297,7 +297,10 @@ jobs:
       - name: Verify zero dynamic DPDK dependencies
         run: python3 tools/ci_profile.py release-verify $LANE
 
-      - name: Package release artifacts (tarball, .deb, runtime image)
+      - name: Build the standalone client (base ISA, glibc only)
+        run: python3 tools/ci_profile.py release-client $LANE
+
+      - name: Package release artifacts (tarball, .deb, runtime image, client)
         run: |
           VERSION="${GITHUB_REF_NAME}"
           [ "$GITHUB_REF_TYPE" = tag ] || VERSION=$(git rev-parse --short HEAD)
@@ -324,7 +327,10 @@ jobs:
           [ "$rc" = 124 ] || { echo "bessd exited with $rc before the 5 s smoke window"; exit 1; }
           ARCH=$(uname -m)
           docker save bess:"$VERSION" | gzip > dist/bess-image-"$VERSION"-"$ARCH".tar.gz
-          (cd dist && sha256sum *.deb bess-image-*.tar.gz >> SHA256SUMS-"$ARCH")
+          # bessctl alone, for hosts that only drive a bessd (D-136).
+          install -m 0755 build/client-standalone/bessctl/bessctl-standalone \
+            dist/bessctl-"$VERSION"-linux-"$ARCH"
+          (cd dist && sha256sum *.deb bess-image-*.tar.gz bessctl-*-linux-* >> SHA256SUMS-"$ARCH")
           echo "RELEASE_VERSION=${VERSION}" >> "$GITHUB_ENV"
 
       - uses: sigstore/cosign-installer@v3
@@ -338,7 +344,7 @@ jobs:
         #     --certificate-oidc-issuer https://token.actions.githubusercontent.com F
         run: |
           cd dist
-          for f in *.tar.gz *.deb SHA256SUMS-*; do
+          for f in *.tar.gz *.deb bessctl-*-linux-* SHA256SUMS-*; do
             [ -f "$f" ] || continue
             cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
           done

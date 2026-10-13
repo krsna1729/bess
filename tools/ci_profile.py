@@ -131,6 +131,40 @@ CPU_FLOOR = {
 }
 # The /proc/cpuinfo features -march=armv8.2-a lets the compiler use.
 ARM64_FLOOR_FEATURES = ('fp', 'asimd', 'crc32', 'atomics', 'asimdrdm')
+# The architecture's base ISA, for the standalone client (D-136): it runs on an
+# operator's machine, not only where bessd's floor holds.
+CLIENT_ISA = {
+    'x86_64': 'x86-64',
+    'aarch64': 'armv8-a',
+}
+# What a standalone (static dependencies, static libstdc++) executable still
+# loads: glibc and the kernel's vDSO.
+CLIENT_SHARED_OBJECTS = ('linux-vdso.so', 'libc.so.', 'libm.so.', 'ld-linux')
+# Instructions above the client's base ISA, for BESS's own objects: x86-64-v2
+# (SSSE3, SSE4.1, SSE4.2, POPCNT, CMPXCHG16B), v3 (BMI1/2, LZCNT, MOVBE, and
+# every VEX/EVEX mnemonic is v...), and on aarch64 the ARMv8.1 LSE atomics
+# (armv8-a calls libgcc's outline helpers instead). Not tzcnt: GCC writes
+# __builtin_ctz as `rep bsf`, which objdump prints as tzcnt and a CPU without
+# BMI runs as bsf. Not SSE2's pminub/pmaxub/pminsw/pmaxsw. Static libraries
+# from the distribution are not scanned: OpenSSL and abseil pick their AVX
+# paths at run time.
+ABOVE_CLIENT_ISA = {
+    'x86_64': re.compile(
+        # v3
+        r'v[a-z0-9]+|lzcnt|andn|bextr|blsi|blsr|blsmsk|bzhi|shlx|shrx|sarx|rorx|pdep|pext|'
+        r'movbe|'
+        # SSSE3
+        r'pshufb|palignr|pabs[bwd]|ph(add|sub)(w|d|sw)|psign[bwd]|pmaddubsw|pmulhrsw|'
+        # SSE4.1
+        r'ptest|pmulld|pmuldq|pmin(s[bd]|u[wd])|pmax(s[bd]|u[wd])|pinsr[bdq]|pextr[bdq]|'
+        r'pblendw|blendp[sd]|p?blendv[bp]?[sd]?|round[sp][sd]|dpp[sd]|insertps|extractps|'
+        r'mpsadbw|phminposuw|movntdqa|pcmpeqq|pmovzx[bwd][wdq]|pmovsx[bwd][wdq]|packusdw|'
+        # SSE4.2, POPCNT, CMPXCHG16B
+        r'pcmpgtq|pcmp[ei]str[im]|crc32[bwlq]?|popcnt[wlq]?|cmpxchg16b'),
+    'aarch64': re.compile(r'ld(add|clr|eor|set|smax|smin|umax|umin)[al]*[bh]?|'
+                          r'st(add|clr|eor|set|smax|smin|umax|umin)l?[bh]?|casp?[al]*[bh]?|'
+                          r'swp[al]*[bh]?'),
+}
 DPDK_PROFILE = 'bess'
 STANDALONE_PLUGINS = ('standalone_pass', 'standalone_macswap',
                       'standalone_range_gate', 'standalone_flow_count',
@@ -688,11 +722,76 @@ def step_release_verify(s):
     print('bessctl is bessd, with the SDK linked in, and runs')
 
 
+def client_build_dir(s):
+    return ROOT / 'build' / f'client-{s.name}'
+
+
+def step_release_client(s):
+    """The standalone bessctl for the release (D-136): one file, base ISA."""
+    build = client_build_dir(s)
+    options = [o for o in release_meson_options(s) if not o.startswith('-Dcpu=')]
+    command = ['meson', 'setup']
+    if (build / 'meson-private' / 'coredata.dat').exists():
+        command.append('--reconfigure')
+    env = s.env_with_dpdk()
+    # grpc.pc links -lcares; Debian and Ubuntu name the archive
+    # libcares_static.a, so a static lookup of libcares.a falls back to the
+    # shared library. A directory first on the compiler's search path names it
+    # libcares.a.
+    libs = build.parent / f'{build.name}-libs'
+    if s.dry_run:
+        print(f'+ ln -sf $({s.cxx} -print-file-name=libcares_static.a) {libs}/libcares.a '
+              f'(when it exists); LIBRARY_PATH={libs}:$LIBRARY_PATH for the next two commands')
+    else:
+        cares = subprocess.run([s.cxx, '-print-file-name=libcares_static.a'],
+                               capture_output=True, text=True, check=True).stdout.strip()
+        if os.path.isabs(cares):
+            libs.mkdir(parents=True, exist_ok=True)
+            (libs / 'libcares.a').unlink(missing_ok=True)
+            (libs / 'libcares.a').symlink_to(cares)
+            env['LIBRARY_PATH'] = os.pathsep.join(filter(None, [str(libs),
+                                                                env.get('LIBRARY_PATH')]))
+    s.run(command + [build, *options, f'-Dcpu={CLIENT_ISA[s.arch]}'], env=env)
+    s.run(['meson', 'compile', '-C', build, '-j', s.jobs, 'bessctl/bessctl-standalone'], env=env)
+    client = build / 'bessctl' / 'bessctl-standalone'
+    if s.dry_run:
+        print(f'+ BESS objects in {build}: no instruction above -march={CLIENT_ISA[s.arch]}; '
+              f'ldd {client}: glibc only; {client} --help must run')
+        return
+    above = ABOVE_CLIENT_ISA[s.arch]
+    objects = sorted(build.rglob('*.o'))
+    if not objects:
+        raise SystemExit(f'no objects under {build}')
+    for obj in objects:
+        listing = subprocess.run(['objdump', '-d', '--no-show-raw-insn', obj], capture_output=True,
+                                 text=True, check=True).stdout
+        for line in listing.splitlines():
+            fields = line.split('\t')
+            if len(fields) > 1 and fields[1].split() and above.fullmatch(fields[1].split()[0]):
+                raise SystemExit(f'{obj}: {line.strip()} is above -march={CLIENT_ISA[s.arch]}')
+    linked = subprocess.run(['ldd', client], capture_output=True, text=True,
+                            check=True).stdout.splitlines()
+    extra = [l.strip() for l in linked
+             if l.strip() and not any(g in l for g in CLIENT_SHARED_OBJECTS)]
+    if extra:
+        raise SystemExit(f'{client} loads more than glibc:\n' + '\n'.join(extra))
+    # The oldest glibc it runs on: the newest symbol version it binds.
+    dynamic = subprocess.run(['objdump', '-T', client], capture_output=True, text=True,
+                             check=True).stdout
+    glibc = max((tuple(int(p) for p in v.split('.'))
+                 for v in re.findall(r'GLIBC_(\d+(?:\.\d+)+)', dynamic)), default=())
+    # No DPDK environment: the client needs none.
+    s.run([client, '--help'], stdout=subprocess.DEVNULL)
+    print(f'{client}: {len(objects)} BESS objects at -march={CLIENT_ISA[s.arch]} or below; '
+          f'loads glibc (>= {".".join(map(str, glibc))}) only; runs')
+
+
 RELEASE_STEPS = [
     ('release-bootstrap', step_release_bootstrap),
     ('release-configure', step_release_configure),
     ('release-build', step_release_build),
     ('release-verify', step_release_verify),
+    ('release-client', step_release_client),
 ]
 
 

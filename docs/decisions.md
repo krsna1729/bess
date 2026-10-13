@@ -155,6 +155,7 @@ file is the reasoning.
 | D-133 | Typed worker ids end to end: `WorkerId`, `CpuId` and `SocketId` through `Worker`, the worker functions, `WorkerManager`, `ControlPlane`, `Context::wid` and the event hub; wire and spec ints convert once, checked; the placement model stays on sysfs CPU numbers; `gate_idx_t` unchanged; plugin API 3; same instructions per packet | accepted |
 | D-134 | The last shipped `.bess` scripts are gone: the metadata graphs are a C++ oracle test (every read finds its latest write on every path), `attr_match`, the port scripts and the sample plugin's script are manifests, the perftest scripts are retired (they called a removed API; `live_perf` covers them, plus `M.bpf`) | accepted |
 | D-135 | The runtime has no Python: the `bess` package (bessd, bessctl, sample manifests, protobuf schema, build metadata) and the runtime image hold none and depend on none; `bess-tools` (dpdk-devbind.py) and `bess-python` (the legacy client) are optional packages; the tarball is the runtime plus dpdk-devbind.py; `install-deps.sh runtime` installs libraries only, `python` the rest | accepted |
+| D-136 | Each release ships the standalone bessctl as one file, `bessctl-<version>-linux-<arch>`: built at the architecture's base ISA (`x86-64`, `armv8-a`), every library linked in (c-ares too), loading glibc only; the release job checks BESS's objects for instructions above that ISA, the ldd list and `--help`, and signs it with the rest | accepted |
 
 
 ---
@@ -9916,3 +9917,48 @@ builds all five packages: `bess` (80 entries, no Python), `bess-tools` (dpdk-dev
 **Code.** `meson.build`, `tools/package_release.py`, `env/{runtime.Dockerfile,Dockerfile,ci.Dockerfile,
 install-deps.sh,README.md}`, `.github/workflows/ci.yml`, `README.md`, `DEPENDENCY_INVENTORY.md`,
 `bessctl/test_sugar.py`.
+
+## D-136 The standalone bessctl as a release artifact, at the base ISA
+
+**Status:** accepted (2026-10-14; the G1.7 item "a static baseline `-march` build").
+
+**Problem.** The shipped bessctl is bessd (D-120), so it runs only where bessd's floor holds (`x86-64-v3`,
+`armv8.2-a`) and needs bessd's libraries. An operator drives bessd over gRPC from other hosts too. The client
+alone exists (`bessctl-standalone`, on `libbess-sdk`) but was never shipped, and a static build of it on Ubuntu
+still loaded `libcares.so.2`: `grpc.pc` links `-lcares`, and Debian and Ubuntu name the archive
+`libcares_static.a`, so Meson's static lookup of `libcares.a` fell back to the shared library. Bare Debian 13 and
+Ubuntu 24.04/26.04 images do not have it.
+
+**Decision.**
+- `ci_profile.py release-client` (a release step after `release-verify`) configures `build/client-<lane>` with
+  the release options and `-Dcpu=` the base ISA (`CLIENT_ISA`: `x86-64`, `armv8-a`; Meson's ISA check accepts
+  both), builds `bessctl/bessctl-standalone` only, and links c-ares statically through a `libcares.a` symlink to
+  `libcares_static.a`, first on `LIBRARY_PATH`.
+- It fails unless BESS's own objects (every `.o` of that build: the client, the SDK, the generated protobuf code)
+  hold no instruction above the base ISA (`ABOVE_CLIENT_ISA`: x86-64-v2/v3 mnemonics, every VEX/EVEX `v...`;
+  aarch64's LSE atomics), `ldd` names glibc and the vDSO only, and `--help` runs. It prints the newest glibc
+  symbol version bound, the oldest glibc the file runs on. Distribution archives (OpenSSL, abseil) are not
+  scanned: they choose their AVX paths at run time.
+- The release job copies it to `dist/bessctl-<version>-linux-<arch>`, into `SHA256SUMS-<arch>`, and signs it
+  with the other artifacts. `meson install` still leaves it out: the packages ship bessctl as bessd.
+- Not a fully static (`-static`) binary: glibc's resolver loads NSS modules at run time, and the release's
+  builder decides the glibc floor.
+
+**Evidence.** In `bess-ci:ubuntu-24.04` after `env/install-deps.sh build` (gcc-14; the bootstrap's DPDK `.pc`
+files, unused by the client), `release-client --name standalone`: "9 BESS objects at -march=x86-64 or below;
+loads glibc (>= 2.38) only; runs"; `ldd`: `linux-vdso`, `libm`, `libc`, `ld-linux`. Before the c-ares link, the
+same build loaded `libcares.so.2`, and `--help` failed in bare `debian:trixie`, `debian:sid`, `ubuntu:24.04` and
+`ubuntu:26.04` ("libcares.so.2: cannot open shared object file"); after it, `--help` runs in all four. From bare
+`debian:trixie` (host network) it drove a host bessd (`-dpdk=false`): `status`, `apply` of
+`conf/samples/exactmatch.yaml` (15 operations, 3 resource entries), `resume`, `get -o yaml`, and `metrics` showing
+packets through `em`.
+`debian:bookworm` (glibc 2.36) refuses it ("GLIBC_2.38 not found"): the floor is the builder's glibc. The scan
+finds no mnemonic above the ISA in the `x86-64` objects of `bessctl/` and `sdk/` and 6,443 and 13,331 (`vmovdqu`,
+`lzcnt`, `shrx`, ...) in the same objects of an `x86-64-v3` build. A probe (ctz, popcount, `uint8_t`, `int16_t` and
+`int32_t` min/max loops at -O3): at `x86-64` GCC emits `tzcnt` (`rep bsf`), `pminub` and `pmaxsw` and the scan
+passes it; at `x86-64-v2` it flags `pmaxsd` and `popcnt`. The aarch64 pattern matches every LSE mnemonic form
+(`ldaddal`, `stsetlb`, `caspal`, `swpalb`, ...) and no armv8.0 load, store or exclusive; its first run on real
+objects is the arm64 release job.
+
+**Code.** `tools/ci_profile.py`, `.github/workflows/ci.yml`, `bessctl/{meson.build,standalone_main.cc}`,
+`docs/control-sdk.md`, `README.md`.

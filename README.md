@@ -27,6 +27,11 @@ libraries `env/install-deps.sh runtime` installs. With the tarball:
     sudo bin/bessd -f    # in another terminal:
     bin/bessctl apply share/bess/conf/samples/exactmatch.yaml && bin/bessctl resume
 
+To drive a bessd from another host, take `bessctl-<version>-linux-<arch>` from
+the same release: bessctl alone, one file, built for the architecture's base
+ISA (`x86-64`, `armv8-a`) with its libraries linked in; it needs glibc 2.38 or
+newer and nothing else (D-136).
+
 Documentation can be found [here](https://github.com/NetSys/bess/wiki/). Please consider [contributing](https://github.com/NetSys/bess/wiki/How-to-Contribute) to the project!
 
 ## Build with Meson
