@@ -144,6 +144,7 @@ file is the reasoning.
 | D-121 | ExactMatch: a fused kernel for a key that is one packet field of 1, 2, 4 or 8 bytes (load, mask, CRC32C and key row in one pass, then a prehashed lookup), chosen when a generation is built; 33 fewer instructions per packet on M.exactmatch; the generic path for every other layout | accepted |
 | D-122 | Release artifacts for arm64 as well as x86_64: `publish-release` runs on `ubuntu-24.04` and `ubuntu-24.04-arm`; every file name carries the architecture (`SHA256SUMS-<machine>`) | accepted |
 | D-123 | Process placement: one memory node per bessd (chosen at startup from its CPUs' nodes and the memory it may use; everything allocated there), one reserved control CPU, automatic SMT-striped worker CPUs; anything on another node is diagnosed, never refused; only a CPU outside the set is an error | accepted |
+| D-127 | Compiler tuning: a `tune` meson option (`-mtune`, empty by default, not passed to plugins); releases stay `-march=x86-64-v3` with the compiler's default tune (GCC: generic): on this host no `-mtune` (generic, graniterapids, znver5, native alderlake) is consistently faster with GCC 16, and Clang's best tune here is AMD's | accepted |
 
 
 ---
@@ -8884,3 +8885,90 @@ pipeline_plan,pipeline_snapshot,transaction}`, `core/bessctl.cc`, the tables' he
 `dataplane/handoff.h`), `modules/{ip_lookup,router,source}.cc`, `protobuf/{control_v2,bess_msg}.proto`,
 `sdk/cpp`, `sdk/go`, `pybess/sdk.py`, `bessctl/main.cc`, `tools/check_includes.py`, `tools/tidy_baseline.json`,
 `docs/placement.md` (new), `docs/{running-in-containers,control-sdk,handoff,limits}.md`, `MODERNIZATION.md`.
+
+## D-127 Compiler tuning: `-mtune` is an option, releases keep the compiler's default
+
+**Status:** accepted.
+
+**Problem.** The roadmap's tuning matrix: `-march=x86-64-v3` with `-mtune` generic, graniterapids, znver5 (and the
+build machine's own), across compilers. Nothing could choose `-mtune` without editing flags: `cpu` sets `-march`
+only, and `-march=x86-64-v3` leaves the tune to the compiler.
+
+**Decision.**
+
+- **A `tune` option.** `-Dtune=<name>` adds `-mtune=<name>` to BESS's compile; empty (the default) adds nothing,
+  so default builds are unchanged. A name the compiler rejects stops the configure (`tune=x: gcc rejects
+  -mtune=x on x86_64`). It is not in `bess_isa_args`: tuning changes no instruction a CPU must support and no ABI,
+  so `bess-dev.pc` carries only `-march` (`check_installed_headers.py` still requires exactly that) and a plugin
+  chooses its own tune. The configure message names the tune.
+- **Releases keep the default.** `-march=x86-64-v3`, no `-mtune`. With GCC (the release compiler) that is
+  `generic` (`gcc -march=x86-64-v3 -Q --help=target`). No tune is consistently faster on this host (below), and
+  the release floor runs on every AVX2 CPU from Haswell and Zen 1 to Granite Rapids and Zen 5: a tune is a
+  cost model of one microarchitecture (latencies, which instruction sequences, alignment, unrolling), and
+  `generic` is GCC's model for the mix. A gain for one core measured on another core is not evidence for either;
+  only the host a tune names could justify it, and none is available here. The option lets a deployment that
+  knows its CPUs build for them.
+- **The compilers' defaults differ.** At `-march=x86-64-v3` Clang tunes for its x86-64-v3 model (Haswell's
+  scheduling and tuning): assembly identical to `-mtune=haswell`, different from `-mtune=generic`. GCC's default
+  is `generic`. A GCC/Clang comparison at one `-Dcpu` therefore compares tunes too.
+- **GenericEncap indexes its header rows.** `-mtune=graniterapids` made GCC 16 report `-Wstringop-overflow`
+  (an 8-byte write past `headers[0]`): the loop stepped one pointer from `headers[0]` across rows, outside the
+  row it was derived from. It now writes `headers[j][pos]`; the code is otherwise the same, and its
+  `bugprone-implicit-widening-of-multiplication-result` finding (the `+= MAX_HEADER_SIZE` step) left the tidy
+  baseline.
+
+**Evidence.** One tree (this commit), release (`-O3`, NDEBUG, `b_staticpic=false`), DPDK 25.11.3 shared, mold;
+one build directory per tune (`build/tune-<compiler>-<tune>`). GCC 16.2.1 and Clang 22.1.8 are the only
+compilers on this host (no GCC 14 or 15: CI's GCC 14, which builds the release, is not measured; Clang is the
+second compiler). The host's native tune is GCC's `alderlake` (i9-13900H; Clang's `raptorlake`). Each compiler's
+trees ran in one live_perf run: `slot perf omarchy-benchmark --isolate --diagnose --cpu 2,4,6 -- taskset -c 2,4,6
+tools/live_perf.py --cpu 4,6 --control-cpu 2 --counters --rounds 8`, tests F.floor, F.hop/16, M.base,
+M.exactmatch, M.wildcardmatch, M.iplookup, M.metadata. Paired median ratio of worker cycles per packet against
+the default (rounds faster of 8); full cells (cycles median [min–max] / instructions) in
+[benchmarking.md](benchmarking.md#compiler-tuning-matrix-d-127), raw data `docs/baselines/d127-tune-*.json`:
+
+| test | GCC generic (cycles) | GCC graniterapids | GCC znver5 | GCC alderlake | Clang haswell (cycles) | Clang generic | Clang graniterapids | Clang znver5 | Clang alderlake |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| F.floor | 7.3 | +0.2% (3) | -0.8% (13 of 16)¹ | -0.3% (5) | 11.6 | -3.6% (7) | +1.3% (2) | -10.4% (8) | +0.9% (3) |
+| F.hop/16 | 34.9 | +0.5% (4) | +0.2% (4) | -1.5% (5) | 41.6 | -0.6% (5) | -0.6% (4) | -5.2% (7) | +1.1% (4) |
+| M.base | 25.8 | +2.3% (3) | +1.5% (4) | -2.5% (5) | 38.4 | -2.8% (5) | -4.5% (8) | -6.2% (7) | -2.8% (5) |
+| M.exactmatch | 57.6 | +2.4% (0) | +4.0% (0) | +1.5% (1) | 69.5 | -1.3% (7) | +2.8% (3) | -3.9% (7) | +0.7% (3) |
+| M.wildcardmatch | 73.9 | -2.8% (6) | -1.1% (4) | +1.9% (2) | 96.2 | -4.4% (8) | -3.3% (8) | -6.4% (8) | -3.3% (7) |
+| M.iplookup | 32.4 | -1.2% (5) | -3.4% (6) | -4.3% (5) | 42.7 | +1.0% (3) | +8.3% (0) | -2.1% (6) | +10.2% (0) |
+| M.metadata | 39.4 | +2.2% (3) | -3.4% (6) | -2.8% (6) | 53.9 | +3.5% (0) | +5.3% (1) | +0.1% (3) | +1.6% (3) |
+| bessd text (bytes) | 8,193,549 | 7,701,160 | 7,736,334 | 7,710,370 | 6,349,058 | 6,322,994 | 6,364,746 | 6,388,859 | 6,370,062 |
+
+¹ F.floor is bimodal in every tree: each fresh bessd runs it at about 7.3 or about 13–15 cycles per packet with
+the same instructions. znver5 drew 5 slow daemons of 8 in this run (median +42.7%); a 16-round rerun of F.floor,
+M.base and M.exactmatch (`d127-tune-gcc-floor.json`) gave every tune 2–4 slow daemons and F.floor medians within
+±0.8% (the cell shows the rerun), M.base -3.3% (znver5) and -3.0% (alderlake), +0.1% (graniterapids), and
+M.exactmatch slower than generic again in every tune: +2.3% (graniterapids), +3.8% (znver5), +1.6% (alderlake),
+3–4 rounds of 16 faster.
+
+Reading it:
+
+- **GCC: no consistent winner.** Every GCC tune is within ±4.3% of generic on every test, inside D-016's ±3% band
+  or barely past it, and each wins some tests and loses others: the native tune (alderlake) gains 2.5–4.3% on
+  M.base, M.iplookup and M.metadata and loses 1.5–1.9% on M.exactmatch and M.wildcardmatch; graniterapids gains
+  more than 2% only on M.wildcardmatch. M.exactmatch is the one result that held across two runs, and generic is
+  the fastest there. Instructions per packet move by at most 3 (M.base, M.exactmatch: 2–3 fewer with alderlake
+  and znver5), except M.metadata with graniterapids (8 fewer, -4.7%) and M.wildcardmatch with alderlake (5 fewer,
+  -1.3%), neither with a gain in cycles.
+- **Clang: the AMD tune wins on Intel.** znver5 is the fastest Clang tune on this Raptor Lake core on six of seven
+  tests, and Clang's own native tune (alderlake) is the slowest on M.iplookup (+10.2%). A Zen 5 cost model
+  beating Raptor Lake's on Raptor Lake is not microarchitectural tuning paying off; it is code layout and
+  unrolling choices that happen to suit these loops. That is the reason a tune measured on one host says little
+  about another, and the reason the release does not pick one from this data.
+- **GCC 16 and Clang 22 at the same flags (separate runs, not paired):** GCC's default tree runs F.floor in 7.3
+  cycles per packet against Clang's 11.6, F.hop/16 34.9 against 41.6, M.base 25.8 against 38.4, M.wildcardmatch
+  73.9 against 96.2, with similar instruction counts; the release compiler stays GCC.
+- **Size.** GCC's generic text is 6% larger than its CPU tunes, almost all of it in control-plane, startup,
+  protobuf and SDK objects; the modules on the measured paths differ by at most 9 KB (exact_match).
+
+**Not done.** GCC 14 and 15 (absent here; CI's GCC 14 release build is the shipped binary). Any measurement on
+the CPUs the tunes name (Granite Rapids, Zen 5): this is one Intel hybrid host. The F.floor bimodality (a
+per-daemon effect independent of the tune, same instruction count) is noted, not investigated.
+
+**Code.** `meson_options.txt` (`tune`), `meson.build`, `core/modules/generic_encap.cc`,
+`tools/tidy_baseline.json`, `README.md`, `docs/benchmarking.md` (build note, tuning matrix),
+`docs/plugin-api.md`, `docs/baselines/d127-tune-{gcc,gcc-floor,clang}.json`.

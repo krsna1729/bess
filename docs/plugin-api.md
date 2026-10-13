@@ -100,7 +100,9 @@ as their own dependency.
 DPDK was built with after bessd's and the last `-march` wins; it carries the
 DPDK compile flags bessd used (machine flags removed) and DPDK's shared-library
 link flags instead, so the DPDK prefix is the one bessd was built against.
-With `-Dcpu=native` "bessd's ISA" means the build machine's.
+With `-Dcpu=native` "bessd's ISA" means the build machine's. bessd's `-Dtune`
+(`-mtune`) is not part of it: tuning changes no instruction a CPU must support,
+so `bess-dev` does not carry it and a plugin picks its own (D-127).
 
 **Logging.** Include `"utils/logging.h"`, never `<glog/logging.h>` directly. glog
 and protobuf's absl logging both define `LOG`/`CHECK`/`VLOG`; the header included

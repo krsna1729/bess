@@ -2,6 +2,10 @@ option('cpu',
        type: 'string',
        value: 'native',
        description: 'ISA passed as -march=<cpu>: native, or a portable baseline (x86_64: x86-64-v3; aarch64: armv8.2-a); empty passes no -march')
+option('tune',
+       type: 'string',
+       value: '',
+       description: 'Scheduling model passed as -mtune=<tune> (e.g. generic, znver5, graniterapids); empty passes no -mtune: the compiler default for the -march (x86-64-v3: generic with GCC, haswell with Clang; native: the build machine). Not an ISA: plugins do not inherit it (D-127)')
 option('arch_generic',
        type: 'boolean',
        value: false,

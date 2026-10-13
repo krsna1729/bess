@@ -71,6 +71,21 @@ if get_option('arch_generic')
 endif
 add_project_arguments(bess_isa_args, language: 'cpp')
 
+# `tune` picks the scheduling model (-mtune) without touching the ISA. It is
+# not in bess_isa_args: -mtune changes no instruction a CPU must support and no
+# ABI, so bess-dev.pc does not pass it to plugins. Empty (the default) passes
+# no -mtune: the compiler's own choice for the -march. For -march=x86-64-v3
+# GCC tunes `generic`, Clang its x86-64-v3 model (Haswell's scheduling and
+# tuning, the same code as -mtune=haswell); -march=native tunes for the build
+# machine (D-127).
+tune = get_option('tune')
+if tune != ''
+  if not cpp.has_argument('-mtune=' + tune)
+    error('tune=@0@: @1@ rejects -mtune=@0@ on @2@.'.format(tune, cpp.get_id(), cpu_family))
+  endif
+  add_project_arguments('-mtune=' + tune, language: 'cpp')
+endif
+
 # Whether flow tables check their owner thread (flow/owner.h). It changes a
 # table's layout, so bessd and every plugin built from bess-dev must agree:
 # one value, from bessd's build type, for both (a plugin's own NDEBUG does not
@@ -181,9 +196,10 @@ foreach arg : dpdk_compile_args + dpdk_pc_cflags
     error('DPDK machine flag @0@ would leak into BESS or bess-dev.pc'.format(arg))
   endif
 endforeach
-message('libdpdk machine flags dropped: @0@; BESS compiles with: @1@'.format(
+message('libdpdk machine flags dropped: @0@; BESS compiles with: @1@; tuned for: @2@'.format(
   dpdk_dropped_args.length() > 0 ? ' '.join(dpdk_dropped_args) : '(none)',
-  bess_isa_args.length() > 0 ? ' '.join(bess_isa_args) : '(the compiler default ISA)'))
+  bess_isa_args.length() > 0 ? ' '.join(bess_isa_args) : '(the compiler default ISA)',
+  tune != '' ? '-mtune=' + tune : '(the compiler default for the -march)'))
 
 dpdk_pkg_link_args = ['--libs', 'libdpdk']
 if dpdk_is_static

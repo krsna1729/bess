@@ -122,7 +122,6 @@
       "cppcoreguidelines-narrowing-conversions": 1
     },
     "core/modules/generic_encap.cc": {
-      "bugprone-implicit-widening-of-multiplication-result": 1,
       "cppcoreguidelines-narrowing-conversions": 2
     },
     "core/modules/hash_lb.cc": {

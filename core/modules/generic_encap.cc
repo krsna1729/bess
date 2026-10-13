@@ -119,13 +119,16 @@ void GenericEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     int attr_id = fields_[i].attr_id;
     int offset = (attr_id >= 0) ? attr_offset(attr_id) : 0;
 
-    char *header = headers[0] + fields_[i].pos;
+    // Index the packet's row: a pointer stepped from headers[0] leaves that
+    // row, and GCC (at -mtune=graniterapids, for one) then reports a write
+    // past it (-Wstringop-overflow, D-127).
+    const int pos = fields_[i].pos;
 
-    for (int j = 0; j < cnt; j++, header += MAX_HEADER_SIZE) {
+    for (int j = 0; j < cnt; j++) {
       bess::PacketRef pkt = batch->packet(j);
       const uint64_t word =
           (attr_id < 0) ? value : get_attr_with_offset<uint64_t>(offset, pkt);
-      std::memcpy(header, &word, sizeof(word));
+      std::memcpy(&headers[j][pos], &word, sizeof(word));
     }
   }
 

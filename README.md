@@ -58,6 +58,11 @@ BMI1/2) or `armv8.2-a` (LSE atomics, CRC32; Neoverse N1 and newer).
 the `-march`/`-mcpu`/`-m*` flags in DPDK's pkg-config cflags are dropped, and
 `bess-dev.pc` gives plugins bessd's `-march`. `tools/bootstrap_dpdk.py --cpu`
 builds DPDK for the same floor (on aarch64 DPDK's generic arm64 target).
+`-Dtune=<name>` passes `-mtune=<name>` (the scheduling model, not the ISA:
+plugins do not inherit it). The default, empty, passes none: GCC tunes
+`-march=x86-64-v3` for `generic`, Clang for Haswell, and `-march=native`
+tunes for the build machine. Releases keep the default; D-127 has the
+measurements behind that.
 `-Darch_generic=true` makes `core/arch/` use its portable code paths instead
 of x86/arm64 intrinsics and asm, to build and test on x86 what other
 architectures run; architecture-specific code belongs only in `core/arch/`
