@@ -39,7 +39,7 @@ message UnixSocketPortArg {
   int64 min_rx_interval_ns = 2;
 
   /// If set, the port driver will send a confirmation once
-  /// the port is connected.  This lets pybess avoid a race during
-  /// testing.  See bessctl/test_utils.py for details.
+  /// the port is connected, so a test client can wait for the connection
+  /// before it sends.
   bool confirm_connect = 3;
 }

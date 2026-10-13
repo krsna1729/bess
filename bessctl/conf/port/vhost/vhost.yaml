@@ -1,0 +1,52 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# One VM with two vhost-user ports, one 1024-entry queue pair each; bessd echoes
+# each port's receive queue back to its transmit queue. See README.md: create
+# /tmp/bessd and remove stale /tmp/bessd/vhost_user*.sock before applying.
+# For more VMs, ports or queues, add ports named v<vm>_<port> with socket
+# /tmp/bessd/vhost_user<vm>_<port>.sock, queues=<n> in the vdev string and
+# num_rx/tx_queues: <n>, and one QueueInc -> QueueOut pair per queue.
+#
+# Converted from vhost.bess (D-134).
+ports:
+  - name: v0_0
+    driver: PMDPort
+    rx_queue_size: 1024
+    tx_queue_size: 1024
+    arg: {vdev: "eth_vhost_v0_0,iface=/tmp/bessd/vhost_user0_0.sock,queues=1"}
+  - name: v0_1
+    driver: PMDPort
+    rx_queue_size: 1024
+    tx_queue_size: 1024
+    arg: {vdev: "eth_vhost_v0_1,iface=/tmp/bessd/vhost_user0_1.sock,queues=1"}
+modules:
+  - name: inc0_0
+    mclass: QueueInc
+    arg: {port: v0_0, qid: 0}
+  - name: out0_0
+    mclass: QueueOut
+    arg: {port: v0_0, qid: 0}
+  - name: inc0_1
+    mclass: QueueInc
+    arg: {port: v0_1, qid: 0}
+  - name: out0_1
+    mclass: QueueOut
+    arg: {port: v0_1, qid: 0}
+connections:
+  - upstream: inc0_0
+    downstream: out0_0
+  - upstream: inc0_1
+    downstream: out0_1
+workers:
+  - {wid: 0, core: 0}
+traffic_classes:
+  - name: nf_to_host
+    policy: round_robin
+    wid: 0
+tasks:
+  - module: inc0_0
+    parent: nf_to_host
+  - module: inc0_1
+    parent: nf_to_host

@@ -1,0 +1,40 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Source -> DPDK port 0 in loopback mode -> Sink, with 128-packet queues.
+# Not every DPDK port supports loopback mode. For more ports, repeat the port
+# and its four modules with port_id 1, 2, ...
+#
+# Converted from loopback.bess (D-134).
+ports:
+  - name: pmd0
+    driver: PMDPort
+    rx_queue_size: 128
+    tx_queue_size: 128
+    arg:
+      port_id: 0
+      loopback: true
+modules:
+  - name: source0
+    mclass: Source
+  - name: out0
+    mclass: PortOut
+    arg: {port: pmd0}
+  - name: inc0
+    mclass: PortInc
+    arg: {port: pmd0}
+  - name: sink0
+    mclass: Sink
+connections:
+  - upstream: source0
+    downstream: out0
+  - upstream: inc0
+    downstream: sink0
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: source0
+    wid: 0
+  - module: inc0
+    wid: 0

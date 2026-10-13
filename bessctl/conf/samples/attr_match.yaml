@@ -1,0 +1,89 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# ExactMatch on two metadata attributes (foo: 1 byte, bar: 2 bytes) that
+# SetMetadata writes upstream: source0's packets match the first rule (gate 1),
+# source1's the second (gate 2). SetMetadata stores value_int in network order
+# (big endian): bar 0x1122 is the bytes 11 22. For WildcardMatch on metadata,
+# see wildcardmatch.yaml.
+#
+# Converted from metadata/attr_match.bess (D-134). That script's first rule had
+# bar's bytes in host order (22 11 for 0x1122), so source0's packets never
+# matched it; here it is 11 22.
+modules:
+  - name: em
+    mclass: ExactMatch
+    arg:
+      default_gate: 0
+      fields:
+        - attr_name: foo
+          num_bytes: 1
+        - attr_name: bar
+          num_bytes: 2
+  - name: setfoo0
+    mclass: SetMetadata
+    arg:
+      attrs:
+        - name: foo
+          size: "1"
+          value_int: "204"
+  - name: setbar0
+    mclass: SetMetadata
+    arg:
+      attrs:
+        - name: bar
+          size: "2"
+          value_int: "4386"
+  - name: set1
+    mclass: SetMetadata
+    arg:
+      attrs:
+        - name: bar
+          size: "2"
+          value_int: "13124"
+        - name: foo
+          size: "1"
+          value_int: "66"
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+  - name: sink2
+    mclass: Sink
+  - name: source0
+    mclass: Source
+  - name: source1
+    mclass: Source
+connections:
+  - upstream: source0
+    downstream: setfoo0
+  - upstream: setfoo0
+    downstream: setbar0
+  - upstream: setbar0
+    downstream: em
+  - upstream: source1
+    downstream: set1
+  - upstream: set1
+    downstream: em
+  - upstream: em
+    downstream: sink0
+  - upstream: em
+    ogate: 1
+    downstream: sink1
+  - upstream: em
+    ogate: 2
+    downstream: sink2
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: source0
+    wid: 0
+  - module: source1
+    wid: 0
+resources:
+  em/rules:
+    - key: {fields: [{value_bin: zA==}, {value_bin: ESI=}]}
+      value: {gate: 1}
+    - key: {fields: [{value_bin: Qg==}, {value_bin: M0Q=}]}
+      value: {gate: 2}

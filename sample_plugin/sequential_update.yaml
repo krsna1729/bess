@@ -1,0 +1,58 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# The sample plugin's SequentialUpdate next to the built-in Update: RoundRobin
+# sends every other batch to Update (fixed source MAC address) and the others
+# to SequentialUpdate (UDP source port counting 20000-30000, destination port
+# 40000-50000). Load the plugin first (bessctl plugin import PATH, or bessd
+# --modules DIR). The field list is also the resource su/fields (D-129).
+#
+# Converted from bessctl_conf/sequential_update.bess (D-134). Rewrite's template
+# is the packet it built with scapy.
+modules:
+  - name: source0
+    mclass: Source
+  - name: rewrite0
+    mclass: Rewrite
+    arg:
+      templates:
+        - "BhY+G3IyAh5nn02uCABFAAAmAAEAAEARrxzAqAEBCgAAAScRJxIAEsXcaGVsbG93b3JsZA=="
+  - name: rr
+    mclass: RoundRobin
+    arg: {gates: [1, 2]}
+  - name: update0
+    mclass: Update
+    arg:
+      fields:
+        - {offset: 6, size: 6, value: 20015998341291}  # 12:34:56:78:90:ab
+  - name: su
+    mclass: SequentialUpdate
+    arg:
+      fields:
+        - {offset: 34, size: 2, min: 20000, max: 30000}
+        - {offset: 36, size: 2, min: 40000, max: 50000}
+  - name: sink0
+    mclass: Sink
+  - name: sink1
+    mclass: Sink
+connections:
+  - upstream: source0
+    downstream: rewrite0
+  - upstream: rewrite0
+    downstream: rr
+  - upstream: rr
+    ogate: 1
+    downstream: update0
+  - upstream: rr
+    ogate: 2
+    downstream: su
+  - upstream: update0
+    downstream: sink0
+  - upstream: su
+    downstream: sink1
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: source0
+    wid: 0

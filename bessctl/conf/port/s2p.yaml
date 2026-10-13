@@ -1,0 +1,27 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Source to port: send out of DPDK port 0. For more workers, add a worker, a
+# Source on it connected to out0, and one more transmit queue (num_tx_queues);
+# for more ports, repeat the port and a PortOut every Source connects to.
+#
+# Converted from s2p.bess (D-134).
+ports:
+  - name: pmd0
+    driver: PMDPort
+    arg: {port_id: 0}
+modules:
+  - name: source0
+    mclass: Source
+  - name: out0
+    mclass: PortOut
+    arg: {port: pmd0}
+connections:
+  - upstream: source0
+    downstream: out0
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: source0
+    wid: 0

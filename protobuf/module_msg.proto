@@ -1234,7 +1234,7 @@ message ReplicateCommandSetGatesArg {
 /**
  * The SetMetadata module adds metadata attributes to packets, which are not stored
  * or sent out with packet data. For examples of SetMetadata use, see
- * [`bess/bessctl/conf/attr_match.bess`](https://github.com/NetSys/bess/blob/master/bessctl/conf/metadata/attr_match.bess)
+ * [`bessctl/conf/samples/attr_match.yaml`](./bessctl/conf/samples/attr_match.yaml)
  *
  * __Input Gates__: 1
  * __Output Gates__: 1

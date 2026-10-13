@@ -1,0 +1,32 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Reflector: packets from DPDK port 0 go back out of it with source and
+# destination MAC addresses swapped. For more ports, repeat the port and its
+# three modules with port_id 1, 2, ...
+#
+# Converted from macswap.bess (D-134).
+ports:
+  - name: pmd0
+    driver: PMDPort
+    arg: {port_id: 0}
+modules:
+  - name: inc0
+    mclass: PortInc
+    arg: {port: pmd0}
+  - name: swap0
+    mclass: MACSwap
+  - name: out0
+    mclass: PortOut
+    arg: {port: pmd0}
+connections:
+  - upstream: inc0
+    downstream: swap0
+  - upstream: swap0
+    downstream: out0
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: inc0
+    wid: 0

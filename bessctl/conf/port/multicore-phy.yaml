@@ -1,0 +1,49 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Two workers polling three physical ports by PCI address (replace them with
+# yours): worker 0 receives from p0 and drops; worker 1 forwards p2 to p1. On a
+# two-socket host with the ports on different nodes, bessd warns at creation
+# for each port that is not on its memory node (cross-NUMA, D-123). hlb is
+# connected to nothing.
+#
+# Converted from multicore-phy.bess (D-134).
+ports:
+  - name: p0
+    driver: PMDPort
+    arg: {pci: "82:00.0"}
+  - name: p1
+    driver: PMDPort
+    arg: {pci: "82:00.1"}
+  - name: p2
+    driver: PMDPort
+    arg: {pci: "07:00.0"}
+modules:
+  - name: hlb
+    mclass: HashLB
+    arg: {gates: [0, 1], mode: l2}
+  - name: src0
+    mclass: PortInc
+    arg: {port: p0}
+  - name: sink0
+    mclass: Sink
+  - name: src1
+    mclass: PortInc
+    arg: {port: p2}
+  - name: out1
+    mclass: PortOut
+    arg: {port: p1}
+connections:
+  - upstream: src0
+    downstream: sink0
+  - upstream: src1
+    downstream: out1
+workers:
+  - {wid: 0, core: 0}
+  - {wid: 1, core: 1}
+tasks:
+  - module: src0
+    wid: 0
+  - module: src1
+    wid: 1

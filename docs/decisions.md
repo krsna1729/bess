@@ -153,6 +153,7 @@ file is the reasoning.
 | D-131 | Local DPDK patches: `deps/dpdk-patches/NNNN-<slug>.patch` (format-patch, `Upstream-Status` and `BESS-Decision` trailers) applied in order by the bootstrap; a series stamp in the source tree and each install re-extracts or reinstalls on change; `--check-patches` in CI; build-info and the SBOM list the series | accepted |
 | D-132 | `rte_fib` as a selectable route backend (`backend` on IPLookup and Router; `rte_lpm` stays the default): five carried DPDK patches (one gives `rte_fib` `rte_lpm`'s tbl8 group lifetime, so changes and deletes never allocate), `rte_lpm`'s limits and errors enforced by the table, the defer queue sized to the pool, x86-64 only (plain stores); cheaper changes at every size and faster batch lookups, equal in a small table | accepted |
 | D-133 | Typed worker ids end to end: `WorkerId`, `CpuId` and `SocketId` through `Worker`, the worker functions, `WorkerManager`, `ControlPlane`, `Context::wid` and the event hub; wire and spec ints convert once, checked; the placement model stays on sysfs CPU numbers; `gate_idx_t` unchanged; plugin API 3; same instructions per packet | accepted |
+| D-134 | The last shipped `.bess` scripts are gone: the metadata graphs are a C++ oracle test (every read finds its latest write on every path), `attr_match`, the port scripts and the sample plugin's script are manifests, the perftest scripts are retired (they called a removed API; `live_perf` covers them, plus `M.bpf`) | accepted |
 
 
 ---
@@ -9821,3 +9822,51 @@ the same change is 3-4% faster. A first version stored `wid_` in 16 bits, which 
 `core/traffic_class.{h,cc}`, `core/scheduler.h`, `core/module_graph.cc`, `core/control/{control_plane,
 pipeline_snapshot,transaction}.cc`, `core/bessctl.cc`, `core/stats/{event_hub,event_throttle,current_worker}`,
 `core/modules/{conntrack,port_out,worker_split}`, `core/framework/plugin.h`, `docs/plugin-api.md`.
+
+## D-134 The last shipped `.bess` scripts: tests, manifests, or retired
+
+**Status:** accepted (2026-10-14; the roadmap item "convert shipped .bess samples", after D-109).
+
+**Problem.** 44 `.bess` scripts were left after D-109: 22 metadata graphs in `bessctl/conf/metadata` that only logged
+what the offset allocator chose (nothing checked it), 13 perftest scripts, 8 port scripts (PMD, vhost, Unix socket)
+and the sample plugin's. Each needed the Python bessctl; the self-measuring perftest scripts also called
+`bess.track_module`, which no longer exists, so they could not run at all.
+
+**Decision.**
+- **Metadata graphs: a C++ test.** `MetadataGraphTest.ReadsFindTheirLatestWrite` (`core/metadata_test.cc`) builds
+  each graph (sparse gate numbers, cycles and updates included, plus one update with no writer upstream) and checks the
+  allocator against what a packet sees: every path from a module nothing feeds is walked (a module at most twice),
+  with each metadata byte owned by the write that last stored it. A read with an offset must find its attribute's
+  latest write in every byte; a reader with a write upstream on every path must get an offset. An update with nothing
+  written upstream writes nothing valid (scopes start at writes). A graph with no unfed module (`cycle`) checks only
+  that the allocator terminates.
+- **Manifests.** `bessctl/conf/samples/attr_match.yaml` (live-applied by `BessctlTest.Samples` like every sample);
+  `bessctl/conf/port/{loopback,macswap,multicore-phy,p2s,s2p,s2p2s,unix_port}.yaml` and `port/vhost/vhost.yaml` (they
+  need NICs or vhost peers, so they sit outside `conf/samples`; each script's environment-variable defaults, a
+  comment says how to scale out); `sample_plugin/sequential_update.yaml` (`su.add`'s field folded into the init
+  fields; the field list is the `su/fields` resource). Scapy-built packets are base64 templates.
+- **`attr_match`'s first rule was wrong.** SetMetadata stores `value_int` in network order; the script's first rule
+  had `bar` as 22 11 for 0x1122, so source0's packets went to the default gate. The manifest has 11 22.
+- **Perftest retired.** `chain`, `split`, `merge` are `F.hop/N`, `F.split/2` and `F.fanin/4`; `nat` is `M.nat`;
+  `port_ranges` and `vrf_routing` are `M.wildcardmatch/8` and `M.iplookup` (and the `conf/samples` manifests of the
+  same names); `flowgen` is `samples/flowgen.yaml`; `phy_forward` and `pktgen` need NICs (`port/*.yaml`); the
+  synthetic trees (`complex_merge`, `complex_split`, `merge_asym`) are built from the hop, split and fan-in costs
+  `live_perf` measures. `bpf` had no counterpart: `live_perf` gains `M.bpf` (one compiled filter, every packet
+  matches). `bessctl/test_utils.py` (only the perftest scripts imported it) and `tools/four_way_pipeline_bench.py`
+  (ran `.bess` files through the Python bessctl; `live_perf` replaced it in D-092) are deleted, and so is
+  `.gitattributes` (its one rule was for `*.bess`).
+
+**Rejected: perftest scripts as manifests.** They swept sizes and measured with Python timers; a manifest has no
+sweep and `live_perf` already measures each shape with counters, paired rounds and CPU isolation.
+
+**Evidence.** The graph test passes on all 23 graphs; forcing every scope to offset 0 in `AssignOffsets` failed 5
+of the 22 script graphs, each naming the reader, attribute, offset and byte. Live (`bessd -dpdk=false`, 0.5 s):
+`attr_match.yaml` sends 11.7 M packets out of each of `em`'s gates 1 and 2 and none out of the default gate; with
+the script's rule bytes, gate 1 gets 0 and the default gate 7.5 M. The plugin manifest applies after `bessctl plugin
+import` and both branches forward. Every `port/*.yaml` passes `bessctl validate` (which refuses an unknown field:
+`PMDPortArg` `port_idx`). `M.bpf` runs (one round on the `-O1` fast build, 7.6 ns per packet above `M.base`: a
+smoke run, not a measurement).
+
+**Code.** `core/metadata_test.cc`, `bessctl/conf/samples/attr_match.yaml`, `bessctl/conf/port/`,
+`sample_plugin/{sequential_update.yaml,README.md}`, `tools/live_perf.py`, `protobuf/module_msg.proto` and
+`protobuf/ports/port_msg.proto` (comments).

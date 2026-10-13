@@ -1,0 +1,38 @@
+# Copyright (c) 2014-2016, The Regents of the University of California.
+# Copyright (c) 2016-2017, Nefeli Networks, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# A UnixSocketPort at the abstract address "/tmp/bess_unix_p" ("@" becomes the
+# leading NUL): each packet a client sends comes back with a random source IP.
+# The client connects an AF_UNIX SOCK_SEQPACKET socket to "\0/tmp/bess_unix_p"
+# and sends and receives one Ethernet frame per message. For a filesystem path,
+# drop the "@" (bessd needs write access to the directory). The live test
+# tests/live/classifier_traffic_test.cc (SocketClient) is a client in C++.
+#
+# Converted from unix_port.bess (D-134), without its scapy client.
+ports:
+  - name: p
+    driver: UnixSocketPort
+    arg: {path: "@/tmp/bess_unix_p"}
+modules:
+  - name: inc
+    mclass: PortInc
+    arg: {port: p}
+  - name: randomize
+    mclass: RandomUpdate
+    arg:
+      fields:
+        - {offset: 26, size: 4, min: 0, max: 4294967295}
+  - name: out
+    mclass: PortOut
+    arg: {port: p}
+connections:
+  - upstream: inc
+    downstream: randomize
+  - upstream: randomize
+    downstream: out
+workers:
+  - {wid: 0, core: 0}
+tasks:
+  - module: inc
+    wid: 0

@@ -11,16 +11,24 @@ This example is to demonstrate how to connect BESS to VMs or containers.
   * For container test, you MUST use 1GB pages
 
 
-### vhost.bess
+### vhost.yaml
 
-This BESS script creates `BESS_VMS` VMs, each of which has `BESS_PORTS` Virtio
-ports. Each port has `BESS_QUEUES` RX/TX queue pairs. The datapath is simple:
+This manifest creates the vhost-user ports of one VM: two Virtio ports with one
+RX/TX queue pair each, 1024 entries per queue (the defaults of `BESS_PORTS`,
+`BESS_QUEUES` and `BESS_QSIZE` below; its comment says how to add VMs, ports or
+queues). Apply it before launching the VM or container:
+
+    sudo mkdir -p /tmp/bessd && sudo rm -f /tmp/bessd/vhost_user*.sock
+    bessctl apply vhost.yaml && bessctl resume
+
+The datapath is simple:
 * BESS polls each RX queue, and echoes received packets back to its
   corresponding TX queue.
 * The VM and container are configured to transmit some amount of packets, then
   forward packets across ports. As a result, the initially transmitted packets
   recirculate between BESS and VM/container.
-* With `monitor port` you can see the throughput of this datapath.
+* `bessctl ports` shows each port's packet counts; run it twice to see the
+  throughput of this datapath.
   * Normally vhost side is the performance bottleneck.
 
 
@@ -37,7 +45,7 @@ before launching VMs.
 
 You can launch one or multiple VMs. Each VM runs `testpmd` that simply swaps
 source/destination MAC addresses of packets and forward them from one port to
-another. You must launch `vhost.bess` first, so that QEMU can connect to BESS
+another. You must apply `vhost.yaml` first, so that QEMU can connect to BESS
 vport sockets. Otherwise you will see an error like this:
 `qemu-system-x86_64: ... Failed to connect socket: No such file or directory`
 

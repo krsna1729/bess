@@ -7,6 +7,11 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <functional>
+#include <map>
+#include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "module.h"
@@ -324,6 +329,363 @@ TEST_F(MetadataTest, ScopeComponentDegreeOrder) {
   ASSERT_TRUE((m4->attr_offset(1) >= m3->attr_offset(4) + 2) ||
               (m4->attr_offset(1) + 6 <= m3->attr_offset(4)));
 }
+
+// The pipelines of the old bessctl/conf/metadata/*.bess scripts (which only
+// logged what the allocator chose), checked against what a packet sees: every
+// path from a module nothing feeds is walked (a module at most twice, for
+// cycles) with the metadata bytes owned by the write that last stored them.
+// A read with an offset must find its attribute's latest write on that path
+// in every byte: no path without a writer, no other attribute's write over it,
+// no older write of the attribute. A reader that every path reaches through a
+// writer must get an offset (the allocator must not give up on it).
+struct GraphUse {
+  const char* attr;
+  size_t size;
+  Attribute::AccessMode mode;
+};
+struct GraphNode {
+  const char* name;
+  std::vector<GraphUse> uses;
+};
+struct GraphEdge {
+  const char* from;
+  gate_idx_t ogate;
+  const char* to;
+  gate_idx_t igate;
+};
+struct MetadataGraph {
+  const char* name;
+  std::vector<GraphNode> nodes;
+  std::vector<GraphEdge> edges;
+};
+void PrintTo(const MetadataGraph& graph, std::ostream* os) {
+  *os << graph.name;
+}
+
+constexpr auto kR = Attribute::AccessMode::kRead;
+constexpr auto kW = Attribute::AccessMode::kWrite;
+constexpr auto kU = Attribute::AccessMode::kUpdate;
+
+const std::vector<MetadataGraph>& MetadataGraphs() {
+  static const std::vector<MetadataGraph> graphs = {
+      {"simplest",
+       {{"a", {{"foo", 2, kW}}}, {"b", {{"foo", 2, kR}}}},
+       {{"a", 0, "b", 0}}},
+      {"read_before_write",
+       {{"a", {{"foo", 2, kR}}}, {"b", {{"foo", 2, kW}}}},
+       {{"a", 0, "b", 0}}},
+      {"two_scopes_in_a_chain",
+       {{"a", {{"foo", 2, kW}}},
+        {"b", {{"foo", 2, kR}}},
+        {"c", {}},
+        {"d", {{"foo", 2, kW}}},
+        {"e", {{"foo", 2, kR}}}},
+       {{"a", 0, "b", 0},
+        {"b", 0, "c", 0},
+        {"c", 0, "d", 0},
+        {"d", 0, "e", 0}}},
+      {"four_32_byte_attrs",
+       {{"a", {{"a", 32, kW}, {"b", 32, kW}, {"c", 32, kW}, {"d", 32, kW}}},
+        {"b", {{"a", 32, kR}, {"b", 32, kR}, {"c", 32, kR}, {"d", 32, kR}}}},
+       {{"a", 0, "b", 0}}},
+      {"one_scope_three_writers",
+       {{"a", {{"foo", 2, kW}}},
+        {"b", {{"foo", 2, kW}}},
+        {"c", {{"foo", 2, kW}}},
+        {"d", {{"foo", 2, kR}}},
+        {"e", {{"foo", 2, kR}}},
+        {"f", {{"foo", 2, kR}}},
+        {"g", {{"foo", 2, kR}}}},
+       {{"a", 0, "d", 0},
+        {"a", 1, "e", 0},
+        {"b", 0, "e", 0},
+        {"b", 1, "f", 0},
+        {"c", 0, "f", 0},
+        {"c", 1, "g", 0}}},
+      {"update",
+       {{"a", {{"foo", 2, kW}}},
+        {"b", {{"foo", 2, kU}}},
+        {"c", {{"foo", 2, kR}}}},
+       {{"a", 0, "b", 0}, {"b", 0, "c", 0}}},
+      {"update_branches",
+       {{"a", {{"foo", 2, kW}}},
+        {"b", {{"foo", 2, kU}}},
+        {"c", {{"foo", 2, kR}}},
+        {"d", {{"foo", 2, kU}}},
+        {"e", {{"foo", 2, kR}}},
+        {"f", {{"foo", 2, kW}}},
+        {"g", {{"foo", 2, kU}}},
+        {"h", {{"foo", 2, kR}}}},
+       {{"a", 0, "b", 0},
+        {"b", 0, "c", 0},
+        {"a", 1, "d", 0},
+        {"d", 0, "e", 0},
+        {"f", 0, "d", 0},
+        {"f", 1, "g", 0},
+        {"g", 0, "h", 0}}},
+      {"reader_alone", {{"a", {{"foo", 2, kR}}}}, {}},
+      {"complex_single_attr",
+       {{"a", {{"foo", 2, kW}}},
+        {"b", {{"foo", 2, kW}}},
+        {"c", {{"foo", 2, kR}}},
+        {"d", {{"foo", 2, kW}}},
+        {"e", {{"foo", 2, kR}}},
+        {"f", {{"foo", 2, kW}}},
+        {"g", {}},
+        {"h", {{"foo", 2, kW}}},
+        {"i", {{"foo", 2, kR}}},
+        {"j", {}}},
+       {{"a", 0, "b", 0},
+        {"b", 0, "c", 0},
+        {"b", 1, "e", 0},
+        {"a", 1, "e", 0},
+        {"d", 0, "e", 0},
+        {"f", 0, "g", 0},
+        {"g", 0, "e", 0},
+        {"h", 0, "g", 0},
+        {"h", 1, "i", 0},
+        {"i", 0, "j", 0}}},
+      {"complex_two_attrs",
+       {{"a", {{"foo", 2, kW}}},
+        {"b", {{"bar", 2, kW}}},
+        {"c", {{"foo", 2, kR}, {"bar", 2, kR}}},
+        {"d", {{"foo", 2, kW}}},
+        {"e", {{"foo", 2, kR}}},
+        {"f", {{"bar", 2, kW}}},
+        {"g", {{"bar", 2, kR}, {"foo", 2, kW}}},
+        {"h", {{"bar", 2, kW}}},
+        {"i", {{"foo", 2, kW}}},
+        {"j", {{"foo", 2, kR}, {"bar", 2, kR}}}},
+       {{"a", 0, "b", 0},
+        {"b", 0, "c", 0},
+        {"b", 1, "e", 0},
+        {"a", 1, "e", 0},
+        {"d", 0, "e", 0},
+        {"f", 0, "g", 0},
+        {"g", 0, "e", 0},
+        {"h", 0, "g", 0},
+        {"h", 1, "i", 0},
+        {"i", 0, "j", 0}}},
+      {"complex_five_attrs",
+       {{"a", {{"x1", 2, kW}, {"x2", 2, kW}}},
+        {"b", {{"x1", 2, kW}}},
+        {"c", {}},
+        {"d", {{"x1", 2, kR}}},
+        {"e", {{"x2", 2, kW}}},
+        {"f", {}},
+        {"g", {{"x2", 2, kR}}},
+        {"h", {{"x2", 2, kW}, {"x3", 2, kW}}},
+        {"i", {{"x2", 2, kR}}},
+        {"j", {{"x2", 2, kW}, {"x3", 2, kW}, {"x4", 2, kW}}},
+        {"k", {{"x4", 2, kR}}},
+        {"l", {{"x5", 2, kW}}},
+        {"m", {{"x5", 2, kR}}}},
+       {{"a", 0, "b", 0},
+        {"b", 0, "c", 0},
+        {"c", 0, "d", 0},
+        {"e", 0, "b", 0},
+        {"b", 1, "f", 0},
+        {"f", 0, "g", 0},
+        {"f", 1, "i", 0},
+        {"j", 0, "h", 0},
+        {"h", 0, "f", 0},
+        {"h", 1, "k", 0},
+        {"j", 1, "k", 0},
+        {"k", 0, "i", 0},
+        {"k", 1, "l", 0},
+        {"l", 0, "m", 0}}},
+      {"two_paths_to_a_reader",
+       {{"a", {{"foo", 2, kW}}}, {"b", {}}, {"c", {{"foo", 2, kR}}}},
+       {{"a", 0, "b", 0}, {"b", 0, "c", 0}, {"a", 1, "c", 0}}},
+      {"complex_single_attr_components",
+       {{"a", {{"foo", 2, kW}}},
+        {"b", {{"foo", 2, kW}}},
+        {"c", {{"foo", 2, kR}}},
+        {"d", {{"foo", 2, kW}}},
+        {"e", {{"foo", 2, kR}}},
+        {"f", {{"foo", 2, kW}}},
+        {"g", {}},
+        {"h", {{"foo", 2, kW}}},
+        {"i", {{"foo", 2, kR}}},
+        {"j", {}}},
+       {{"a", 0, "b", 0},
+        {"b", 0, "c", 0},
+        {"a", 1, "e", 0},
+        {"d", 0, "e", 0},
+        {"f", 0, "g", 0},
+        {"g", 0, "e", 0},
+        {"h", 0, "g", 0},
+        {"h", 1, "i", 0},
+        {"i", 0, "j", 0}}},
+      {"update_then_overwrite",
+       {{"a", {{"foo", 2, kW}}},
+        {"b", {{"foo", 2, kU}}},
+        {"c", {{"foo", 2, kW}}}},
+       {{"a", 0, "b", 0}, {"b", 0, "c", 0}}},
+      // Not from a script: an update that nothing upstream wrote.
+      {"update_without_writer",
+       {{"a", {{"foo", 2, kU}}}, {"b", {{"foo", 2, kR}}}},
+       {{"a", 0, "b", 0}}},
+      {"unread_write",
+       {{"a", {{"foo", 2, kW}}},
+        {"b", {{"bar", 2, kW}}},
+        {"c", {{"bar", 2, kR}}}},
+       {{"a", 0, "b", 0}, {"b", 0, "c", 0}}},
+      {"four_sizes",
+       {{"a", {{"foo", 2, kW}, {"bar", 3, kW}, {"baz", 5, kW}, {"quz", 8, kW}}},
+        {"b",
+         {{"foo", 2, kR}, {"bar", 3, kR}, {"baz", 5, kR}, {"quz", 8, kR}}}},
+       {{"a", 0, "b", 0}}},
+      // Input gates that are not contiguous (gate 4, no gate 3) once crashed
+      // the traversal on a null gate.
+      {"sparse_gates",
+       {{"a", {{"foo", 2, kW}, {"bar", 3, kW}, {"baz", 5, kW}, {"quz", 8, kW}}},
+        {"b", {{"foo", 2, kR}, {"bar", 3, kR}}},
+        {"c", {{"baz", 5, kR}, {"quz", 8, kR}}}},
+       {{"a", 1, "b", 2}, {"b", 3, "c", 4}}},
+      {"two_writers_one_read",
+       {{"a", {{"foo", 2, kW}}},
+        {"b", {{"bar", 2, kW}}},
+        {"c", {{"bar", 2, kR}}}},
+       {{"a", 0, "c", 0}, {"b", 0, "c", 0}}},
+      // No module is unfed, so no path is walked: this checks termination.
+      {"cycle",
+       {{"a", {{"foo", 2, kW}}},
+        {"b", {{"foo", 2, kR}}},
+        {"c", {{"foo", 2, kR}}}},
+       {{"a", 0, "b", 0}, {"b", 0, "c", 0}, {"c", 0, "a", 0}}},
+      {"cycle_with_an_entry",
+       {{"a", {{"foo", 2, kW}}},
+        {"b", {{"foo", 2, kR}}},
+        {"c", {}},
+        {"d", {{"foo", 2, kR}}},
+        {"e", {}}},
+       {{"a", 0, "b", 0},
+        {"b", 0, "c", 0},
+        {"c", 0, "d", 0},
+        {"c", 1, "a", 0},
+        {"d", 1, "a", 0},
+        {"e", 0, "a", 0}}},
+  };
+  return graphs;
+}
+
+// MetadataTest (a friend of Pipeline) resets the pipeline; its two modules
+// have no attributes or connections and are not walked.
+class MetadataGraphTest : public MetadataTest,
+                          public ::testing::WithParamInterface<MetadataGraph> {
+};
+
+struct Arrival {
+  bool every_path_written = true;
+  bool reached = false;
+};
+
+struct PathState {
+  std::vector<int> owner = std::vector<int>(kMetadataTotalSize, -1);
+  std::map<std::string, int> last_write;  // attr -> write id
+  std::map<const Module*, int> visits;
+  int next_id = 0;
+};
+
+TEST_P(MetadataGraphTest, ReadsFindTheirLatestWrite) {
+  const MetadataGraph& graph = GetParam();
+  std::map<std::string, Module*> modules;
+  std::map<const Module*, std::string> names;
+  for (const GraphNode& node : graph.nodes) {
+    Module* m = ::create_foo(std::string(graph.name) + "_" + node.name);
+    ASSERT_NE(nullptr, m);
+    for (const GraphUse& use : node.uses) {
+      ASSERT_GE(m->AddMetadataAttr(use.attr, use.size, use.mode), 0);
+    }
+    modules[node.name] = m;
+    names[m] = node.name;
+  }
+  std::map<const Module*, std::vector<const Module*>> next;
+  std::set<const Module*> fed;
+  for (const GraphEdge& e : graph.edges) {
+    Module* from = modules.at(e.from);
+    Module* to = modules.at(e.to);
+    ASSERT_EQ(0, ModuleGraph::ConnectModules(from, e.ogate, to, e.igate));
+    next[from].push_back(to);
+    fed.insert(to);
+  }
+  ASSERT_EQ(0, default_pipeline.ComputeMetadataOffsets());
+
+  std::map<std::pair<const Module*, std::string>, Arrival> arrivals;
+  std::function<void(const Module*, PathState)> walk = [&](const Module* m,
+                                                           PathState s) {
+    if (++s.visits[m] > 2) {
+      return;
+    }
+    size_t i = 0;
+    for (const auto& attr : m->all_attrs()) {
+      const mt_offset_t offset = m->attr_offset(i++);
+      bool written_upstream = false;
+      if (attr.mode == kR || attr.mode == kU) {
+        Arrival& a = arrivals[{m, attr.name}];
+        a.reached = true;
+        const auto written = s.last_write.find(attr.name);
+        written_upstream = written != s.last_write.end();
+        a.every_path_written &= written_upstream;
+        if (offset >= 0) {
+          ASSERT_NE(written, s.last_write.end())
+              << names[m] << " reads " << attr.name << " at " << int{offset}
+              << " on a path with no writer";
+          for (size_t b = 0; b < attr.size; b++) {
+            ASSERT_EQ(written->second, s.owner[offset + b])
+                << names[m] << " reads " << attr.name << " at " << int{offset}
+                << ": byte " << offset + b
+                << " holds another write than its latest";
+          }
+        }
+      }
+      // An update with nothing written upstream writes nothing valid: the
+      // allocator starts scopes at writes only.
+      if (attr.mode == kU && !written_upstream) {
+        s.last_write.erase(attr.name);
+      } else if (attr.mode == kW || attr.mode == kU) {
+        const int id = s.next_id++;
+        s.last_write[attr.name] = id;
+        if (offset >= 0) {
+          for (size_t b = 0; b < attr.size; b++) {
+            s.owner[offset + b] = id;
+          }
+        }
+      }
+    }
+    const auto out = next.find(m);
+    if (out != next.end()) {
+      for (const Module* n : out->second) {
+        walk(n, s);
+      }
+    }
+  };
+  for (const auto& [name, m] : modules) {
+    if (fed.count(m) == 0) {
+      walk(m, PathState{});
+    }
+  }
+
+  for (const auto& [key, arrival] : arrivals) {
+    const Module* m = key.first;
+    size_t i = 0;
+    for (const auto& attr : m->all_attrs()) {
+      if (attr.name == key.second && arrival.every_path_written) {
+        EXPECT_GE(m->attr_offset(i), 0)
+            << names[m] << " reads " << attr.name
+            << " after a write on every path but got no offset";
+      }
+      i++;
+    }
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Pipelines, MetadataGraphTest, ::testing::ValuesIn(MetadataGraphs()),
+    [](const ::testing::TestParamInfo<MetadataGraph>& info) {
+      return std::string(info.param.name);
+    });
 
 }  // namespace metadata
 }  // namespace bess

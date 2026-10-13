@@ -14,3 +14,8 @@ The shared module is written to `build/sample_plugin/libsequential_update.so`
 and installed under `lib/bess/modules`.  The plugin's protobuf sources are
 generated in the build tree; no generated files are written into this source
 directory.
+
+`sequential_update.yaml` is a pipeline that uses it:
+
+    bessctl plugin import "$PWD/build/sample_plugin/libsequential_update.so"
+    bessctl apply sample_plugin/sequential_update.yaml && bessctl resume

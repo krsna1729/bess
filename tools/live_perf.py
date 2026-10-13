@@ -22,7 +22,8 @@ counters, so nothing is added to the packet path). Classes:
        M.wildcardmatch/13b (a 13-byte 5-tuple key), M.iplookup,
        M.iplookup/fib (the same on the rte_fib backend, D-132),
        M.l2forward, M.acl, M.hashlb, M.update, M.nat, M.vlan, M.genericencap (constant header),
-       M.metadata (Timestamp and SetMetadata attributes read by GenericEncap)
+       M.metadata (Timestamp and SetMetadata attributes read by GenericEncap),
+       M.bpf (one compiled filter, every packet matches)
   Reading a result: F.floor or F.hop moving moves every pipeline (cross-cutting);
   only one M delta moving is that module (localised).
 
@@ -391,6 +392,12 @@ def m_metadata(b):
     return m_base(b, [('ts', 1), ('sm', 1), ('ge', 1)])
 
 
+def m_bpf(b):
+    """One compiled filter that every packet matches."""
+    b.mod('BPF', 'bpf', {'filters': [{'priority': 0, 'filter': 'udp dst port 2000', 'gate': 1}]})
+    return m_base(b, [('bpf', 2)])
+
+
 TESTS = {
     'F.floor': ('F', f_floor),
     'F.hop/1': ('F', f_hop(1)),
@@ -425,6 +432,7 @@ TESTS = {
     'M.vlan': ('M', m_vlan),
     'M.genericencap': ('M', m_genericencap),
     'M.metadata': ('M', m_metadata),
+    'M.bpf': ('M', m_bpf),
 }
 # Tests that attach a task to worker 1; the others run on worker 0 alone.
 TWO_WORKERS = {'F.queue'}
