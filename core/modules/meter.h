@@ -3,6 +3,7 @@
 #ifndef BESS_MODULES_METER_H_
 #define BESS_MODULES_METER_H_
 
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -46,6 +47,8 @@ class Meter final : public Module {
   static constexpr gate_idx_t kRedGate = 2;
 
   static const Commands cmds;
+  // "<module>/meters": MeterIdKey -> MeterPolicyValue (D-129).
+  static const ResourceTables resource_tables;
 
   Meter() : Module(), published_(init_context().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
@@ -98,6 +101,11 @@ class Meter final : public Module {
   // Erased meters whose removal stage has not run: absent to the control side,
   // still readable, and not publishable again (SlotTable's kRetiring).
   std::set<bess::meter::MeterId> retiring_;
+  // Each meter's policy as written (the builder keeps only compiled
+  // profiles), for the resource's read-back: policies_ mirrors live_ and
+  // staged_policies_ mirrors staged_, edited and swapped with them.
+  std::map<bess::meter::MeterId, Policy> policies_;
+  std::map<bess::meter::MeterId, Policy> staged_policies_;
 
   bess::rcu::RcuPtr<bess::meter::MeterSet> published_;
 

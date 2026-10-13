@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Commands and transactions while a worker forwards traffic through the
+// Transactions and actions while a worker forwards traffic through the
 // module (G1.2 mode C), against a live bessd: they are accepted, take
 // effect, and the daemon stays up. Was the live cases of
 // bessctl/module_tests/l2forward.py, nat.py and session_pipeline.py; the
@@ -64,11 +64,10 @@ class StatefulModulesTest : public LiveTest {
     ASSERT_TRUE(applied) << applied.error().message;
   }
 
-  void Command(const std::string &module, const std::string &command, const std::string &type,
-               const std::string &json) {
-    auto arg = types_.Make(type, json);
-    auto done = client().RunModuleCommand(module, command, *arg);
-    EXPECT_TRUE(done) << module << " " << command << " " << json << ": " << done.error().message;
+  // Commits `tx`, built by `what`; it must apply.
+  void Commit(bess::sdk::Transaction &tx, const std::string &what) {
+    auto done = tx.Commit();
+    EXPECT_TRUE(done) << what << ": " << done.error().message;
   }
 
   // Packets `module` sent out of `gate` (its D-116 gate counter).
@@ -110,9 +109,9 @@ class StatefulModulesTest : public LiveTest {
   Types types_{client()};
 };
 
-// set_default_gate is THREAD_SAFE: it runs while a worker forwards traffic,
-// and the worker reads the gate atomically. Packets from unknown MACs follow
-// each new default gate: both gates forward.
+// The settings resource needs no pause: a transaction sets the default gate
+// while a worker forwards traffic, and the worker reads the gate atomically.
+// Packets from unknown MACs follow each new default gate: both gates forward.
 TEST_F(StatefulModulesTest, L2ForwardDefaultGateFollowsUnderTraffic) {
   auto src_arg = types_.Make("bess.pb.SourceArg", R"({"pkt_size": 60})");
   auto l2_arg = types_.Make("bess.pb.L2ForwardArg", "{}");
@@ -127,17 +126,22 @@ TEST_F(StatefulModulesTest, L2ForwardDefaultGateFollowsUnderTraffic) {
             .Connect("l2", 1, "sink1", 0)
             .Task(OnWorker0("src")));
 
+  auto settings = client().Resource("l2/settings");
+  ASSERT_TRUE(settings) << settings.error().message;
   const int steps = RunWhileForwarding([&](int i) {
-    Command("l2", "set_default_gate", "bess.pb.L2ForwardCommandSetDefaultGateArg",
-            "{\"gate\": " + std::to_string(i % 2) + "}");
+    const std::string json = "{\"default_gate\": " + std::to_string(i % 2) + "}";
+    auto value = types_.Make(settings->value_type, json);
+    auto tx = client().NewTransaction();
+    EXPECT_TRUE(tx.Set(*settings, *value));
+    Commit(tx, "l2/settings = " + json);
   });
-  EXPECT_GT(steps, 10) << "too few commands ran";
+  EXPECT_GT(steps, 10) << "too few transactions ran";
   EXPECT_GT(GatePackets("l2", 0), 0);
   EXPECT_GT(GatePackets("l2", 1), 0);
 }
 
-// add/delete change the table in place while a worker forwards traffic
-// (G1.2 mode C): every one is accepted, and traffic keeps flowing.
+// Transactions upsert and erase MACs in place while a worker forwards
+// traffic (G1.2 mode C): every one applies, and traffic keeps flowing.
 TEST_F(StatefulModulesTest, L2ForwardAddDeleteUnderTraffic) {
   auto src_arg = types_.Make("bess.pb.SourceArg", R"({"pkt_size": 60})");
   auto rnd_arg = types_.Make("bess.pb.RandomUpdateArg", kRandomAddresses);
@@ -154,23 +158,28 @@ TEST_F(StatefulModulesTest, L2ForwardAddDeleteUnderTraffic) {
             .Connect("l2", 1, "sink1", 0)
             .Task(OnWorker0("src")));
 
+  auto macs = client().Resource("l2/macs");
+  ASSERT_TRUE(macs) << macs.error().message;
+  auto gate1 = types_.Make(macs->value_type, R"({"gate": 1})");
   const int steps = RunWhileForwarding([&](int i) {
     char addr[18];
     std::snprintf(addr, sizeof(addr), "02:00:00:00:%02x:%02x", (i / 2) / 256 % 256,
                   (i / 2) % 256);
+    auto key = types_.Make(macs->key_type, std::string(R"({"addr": ")") + addr + R"("})");
+    auto tx = client().NewTransaction();
     if (i % 2 == 0) {
-      Command("l2", "add", "bess.pb.L2ForwardCommandAddArg",
-              std::string(R"({"entries": [{"addr": ")") + addr + R"(", "gate": 1}]})");
+      EXPECT_TRUE(tx.Upsert(*macs, *key, *gate1));
+      Commit(tx, std::string("upsert ") + addr);
     } else {
-      Command("l2", "delete", "bess.pb.L2ForwardCommandDeleteArg",
-              std::string(R"({"addrs": [")") + addr + R"("]})");
+      EXPECT_TRUE(tx.Erase(*macs, *key));
+      Commit(tx, std::string("erase ") + addr);
     }
   });
-  EXPECT_GT(steps, 10) << "too few commands ran";
+  EXPECT_GT(steps, 10) << "too few transactions ran";
   EXPECT_GT(GatePackets("l2", 0) + GatePackets("l2", 1), 0);
 }
 
-// The NAT's usage commands run while its worker translates (the log must be
+// The NAT's usage actions run while its worker translates (the log must be
 // drainable under traffic, or a full log would stall expiry): a report
 // requested under traffic completes and gives the flow's interim record.
 TEST_F(StatefulModulesTest, NatUsageCommandsWhileRunning) {
@@ -196,13 +205,13 @@ TEST_F(StatefulModulesTest, NatUsageCommandsWhileRunning) {
 
   auto empty = types_.Make("bess.pb.EmptyArg", "{}");
   ASSERT_TRUE(client().ResumeWorkers());
-  auto requested = client().RunModuleCommand("nat", "request_usage_report", *empty);
+  auto requested = client().InvokeAction("nat", "request_usage_report", *empty);
   EXPECT_TRUE(requested) << requested.error().message;
   // The report walks the table on the packet path: drain until it is done.
   std::string drained;
   const auto deadline = Clock::now() + std::chrono::seconds(10);
   while (Clock::now() < deadline) {
-    auto resp = client().RunModuleCommand("nat", "drain_usage", *empty);
+    auto resp = client().InvokeAction("nat", "drain_usage", *empty);
     ASSERT_TRUE(resp) << resp.error().message;
     const std::string json = types_.ToJson(*resp);
     drained += json;

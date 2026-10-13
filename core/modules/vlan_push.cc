@@ -16,11 +16,44 @@ using bess::utils::Ethernet;
 
 const Commands VLANPush::cmds = {
     {"set_tci", "VLANPushArg", MODULE_CMD_FUNC(&VLANPush::CommandSetTci),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
+};
+
+const ResourceTables VLANPush::resource_tables = {
+    ResourceTable::Singleton<bess::pb::VLANPushArg>("settings", true),
 };
 
 CommandResponse VLANPush::Init(const bess::pb::VLANPushArg &arg) {
-  return CommandSetTci(arg);
+  CommandSetTci(arg);
+  auto registered = settings_.Register(
+      init_context().resources(), init_context().codecs(), name() + "/settings",
+      // set_tci keeps the low 16 bits; the resource refuses a wider TCI so
+      // what it reads back is what was set.
+      [](const bess::pb::VLANPushArg &value)
+          -> std::expected<uint16_t, std::string> {
+        if (value.tci() > 0xffff) {
+          return std::unexpected("tci must be in [0, 65535]");
+        }
+        return static_cast<uint16_t>(value.tci());
+      },
+      [this](uint16_t &tci) {
+        vlan_tag_ = be32_t((Ethernet::Type::kVlan << 16) | tci);
+        qinq_tag_ = be32_t((Ethernet::Type::kQinQ << 16) | tci);
+      },
+      [this] {
+        bess::pb::VLANPushArg value;
+        value.set_tci(vlan_tag_.value() & 0xffff);
+        return value;
+      },
+      [this] { return HasRunningWorker(); });
+  if (!registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
+  return CommandSuccess();
+}
+
+void VLANPush::DeInit() {
+  settings_.Release();
 }
 
 CommandResponse VLANPush::CommandSetTci(const bess::pb::VLANPushArg &arg) {

@@ -33,9 +33,13 @@
 
 #include <sys/mman.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <expected>
+#include <string>
+#include <utility>
 
 #include "bpf.h"
 #include "utils/bpf.h"
@@ -48,22 +52,71 @@
 /* Note: unmatched packets are sent to gate 0 */
 #define SNAPLEN 0xffff
 
+// D-129: "<name>/filters" holds the filter list; add, delete, clear and
+// get_initial_arg stay for the legacy ModuleCommand only.
 const Commands BPF::cmds = {
-    {"add", "BPFArg", MODULE_CMD_FUNC(&BPF::CommandAdd),
-     Command::THREAD_UNSAFE},
+    {"add", "BPFArg", MODULE_CMD_FUNC(&BPF::CommandAdd), Command::THREAD_UNSAFE,
+     "", Command::LEGACY_ONLY},
     {"delete", "BPFArg", MODULE_CMD_FUNC(&BPF::CommandDelete),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
     {"clear", "EmptyArg", MODULE_CMD_FUNC(&BPF::CommandClear),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&BPF::GetInitialArg),
-     Command::THREAD_SAFE}};
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY}};
+
+const ResourceTables BPF::resource_tables = {
+    ResourceTable::Singleton<bess::pb::BPFArg>("filters", true)};
 
 CommandResponse BPF::Init(const bess::pb::BPFArg &arg) {
-  return CommandAdd(arg);
+  CommandResponse ret = CommandAdd(arg);
+  if (ret.has_error()) {
+    return ret;
+  }
+
+  // Stage compiles the whole list (a filter that does not compile refuses
+  // the transaction) and sorts it; apply swaps it in. The list it replaced
+  // is freed with the staged value. ProcessBatch reads filters_ in place:
+  // paused workers only.
+  auto registered = filters_resource_.Register(
+      init_context().resources(), init_context().codecs(), name() + "/filters",
+      [](const bess::pb::BPFArg &v) -> std::expected<Staged, std::string> {
+        Staged staged{{}, v};
+        std::vector<bess::utils::Filter> &filters = staged.compiled.filters;
+        filters.reserve(v.filters_size());
+        for (const auto &f : v.filters()) {
+          bess::utils::Filter filter;
+          CommandResponse r = Compile(f, &filter);
+          if (r.has_error()) {
+            return std::unexpected(r.error().errmsg());
+          }
+          filters.push_back(std::move(filter));
+        }
+        // Descending priority; equal priorities keep the order given.
+        std::stable_sort(
+            filters.begin(), filters.end(),
+            [](const bess::utils::Filter &a, const bess::utils::Filter &b) {
+              return b.priority < a.priority;
+            });
+        return staged;
+      },
+      [this](Staged &s) {
+        filters_.swap(s.compiled.filters);
+        arg_.Swap(&s.arg);
+      },
+      [this] { return arg_; }, [this] { return HasRunningWorker(); });
+  if (!registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
+  return CommandSuccess();
 }
 
 void BPF::DeInit() {
-  for (auto &filter : filters_) {
+  filters_resource_.Release();
+  FreeFilters(&filters_);
+}
+
+void BPF::FreeFilters(std::vector<bess::utils::Filter> *filters) {
+  for (auto &filter : *filters) {
 #ifdef __x86_64
     munmap(reinterpret_cast<void *>(filter.func), filter.mmap_size);
 #else
@@ -71,7 +124,7 @@ void BPF::DeInit() {
 #endif
   }
 
-  filters_.clear();
+  filters->clear();
 }
 
 CommandResponse BPF::GetInitialArg(const bess::pb::EmptyArg &) {
@@ -85,41 +138,53 @@ CommandResponse BPF::GetInitialArg(const bess::pb::EmptyArg &) {
   return CommandSuccess(r);
 }
 
-CommandResponse BPF::CommandAdd(const bess::pb::BPFArg &arg) {
-  for (const auto &f : arg.filters()) {
-    if (f.gate() < 0 || f.gate() >= MAX_GATES) {
-      return CommandFailure(EINVAL, "Invalid gate");
-    }
+CommandResponse BPF::Compile(const bess::pb::BPFArg::Filter &f,
+                             bess::utils::Filter *out) {
+  if (f.gate() < 0 || f.gate() >= MAX_GATES) {
+    return CommandFailure(EINVAL, "Invalid gate");
+  }
 
-    bess::utils::Filter filter;
-    filter.priority = f.priority();
-    filter.gate = f.gate();
-    filter.exp = f.filter();
+  bess::utils::Filter filter;
+  filter.priority = f.priority();
+  filter.gate = f.gate();
+  filter.exp = f.filter();
 
-    struct bpf_program il;
-    pcap_t *pcap = pcap_open_dead(DLT_EN10MB, SNAPLEN);
-    if (!pcap) {
-      return CommandFailure(ENOMEM, "failed to create BPF compile context");
-    }
-    const int compile_ret = pcap_compile(pcap, &il, filter.exp.c_str(),
-                                         1, PCAP_NETMASK_UNKNOWN);
-    pcap_close(pcap);
-    if (compile_ret == -1) {
-      return CommandFailure(EINVAL, "BPF compilation error");
-    }
+  struct bpf_program il;
+  pcap_t *pcap = pcap_open_dead(DLT_EN10MB, SNAPLEN);
+  if (!pcap) {
+    return CommandFailure(ENOMEM, "failed to create BPF compile context");
+  }
+  const int compile_ret = pcap_compile(pcap, &il, filter.exp.c_str(), 1,
+                                       PCAP_NETMASK_UNKNOWN);
+  pcap_close(pcap);
+  if (compile_ret == -1) {
+    return CommandFailure(EINVAL, "BPF compilation error");
+  }
 
 #ifdef __x86_64
-    filter.func =
-        bess::utils::bpf_jit_compile(il.bf_insns, il.bf_len, &filter.mmap_size);
-    pcap_freecode(&il);
-    if (!filter.func) {
-      return CommandFailure(ENOMEM, "BPF JIT compilation error");
-    }
+  filter.func =
+      bess::utils::bpf_jit_compile(il.bf_insns, il.bf_len, &filter.mmap_size);
+  pcap_freecode(&il);
+  if (!filter.func) {
+    return CommandFailure(ENOMEM, "BPF JIT compilation error");
+  }
 #else
-    filter.il_code = il;
+  filter.il_code = il;
 #endif
 
+  *out = std::move(filter);
+  return CommandSuccess();
+}
+
+CommandResponse BPF::CommandAdd(const bess::pb::BPFArg &arg) {
+  for (const auto &f : arg.filters()) {
+    bess::utils::Filter filter;
+    CommandResponse ret = Compile(f, &filter);
+    if (ret.has_error()) {
+      return ret;
+    }
     filters_.push_back(filter);
+    *arg_.add_filters() = f;
   }
 
   std::sort(filters_.begin(), filters_.end(),
@@ -144,13 +209,24 @@ CommandResponse BPF::CommandDelete(const bess::pb::BPFArg &arg) {
         break;
       }
     }
+    // The same filter leaves the list as given (filters_ and arg_ hold the
+    // same filters, in different orders).
+    auto *given = arg_.mutable_filters();
+    for (auto i = given->begin(); i != given->end(); ++i) {
+      if (f.priority() == i->priority() && f.gate() == i->gate() &&
+          f.filter() == i->filter()) {
+        given->erase(i);
+        break;
+      }
+    }
   }
 
   return CommandSuccess();
 }
 
 CommandResponse BPF::CommandClear(const bess::pb::EmptyArg &) {
-  DeInit();
+  FreeFilters(&filters_);
+  arg_.Clear();
   return CommandSuccess();
 }
 

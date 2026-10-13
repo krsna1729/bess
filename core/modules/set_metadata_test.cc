@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -134,6 +135,27 @@ TEST(SetMetadataTest, PacketBytesWithShiftAndMask) {
                     "\x00\x03\x08"
                     "\x00\x00\x02",
                     4 + 4 + 2 + 8 + 3 + 3)));
+}
+
+// D-129: SetMetadata has no actions. get_initial_arg is legacy-only
+// (GetPipeline's Module.arg replaces it): InvokeAction refuses it, the legacy
+// command still answers the argument as given.
+TEST(SetMetadataTest, InitialArgIsLegacyOnly) {
+  ModuleHarness h;
+  bess::pb::SetMetadataArg arg;
+  auto *a = arg.add_attrs();
+  a->set_name("v4");
+  a->set_size(4);
+  a->set_value_bin("\x41\x42\x43\x44");
+  Module *md = h.Create("SetMetadata", arg);
+  ASSERT_NE(nullptr, md);
+
+  EXPECT_EQ(ENOTSUP, h.Action(md, "get_initial_arg", bess::pb::EmptyArg()).error().code());
+  bess::pb::SetMetadataArg back;
+  ASSERT_TRUE(h.MustCommand(md, "get_initial_arg", bess::pb::EmptyArg()).UnpackTo(&back));
+  ASSERT_EQ(1, back.attrs_size());
+  EXPECT_EQ("v4", back.attrs(0).name());
+  EXPECT_EQ(4u, back.attrs(0).size());
 }
 
 // Fields apply to every packet in the order given: a later field that

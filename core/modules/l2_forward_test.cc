@@ -5,12 +5,14 @@
 // manifests take -- deciding the gates of the module's packet path. Its
 // commands (add, delete, lookup, populate, set_default_gate) and Init's
 // limits in process (was bessctl/module_tests/l2forward.py; the cases that
-// need a running worker are tests/live/l2_forward_test.cc).
+// need a running worker are tests/live/l2_forward_test.cc). D-129: the macs
+// and "<name>/settings" read back canonically, and the legacy-only commands.
 
 #include "modules/l2_forward.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <any>
 #include <cerrno>
 #include <cstdint>
@@ -324,6 +326,133 @@ TEST(L2ForwardCommandTest, AddRollsBackWhenFull) {
   for (const auto &[addr, gate] : entries) {
     EXPECT_EQ(ENOENT, LookupError(h, l2, {addr})) << addr;
   }
+}
+
+bess::pb::L2ForwardMacKey MacKeyMsg(const std::string &addr) {
+  bess::pb::L2ForwardMacKey key;
+  key.set_addr(addr);
+  return key;
+}
+
+bess::pb::L2ForwardMacValue MacValueMsg(uint64_t gate) {
+  bess::pb::L2ForwardMacValue value;
+  value.set_gate(gate);
+  return value;
+}
+
+bess::pb::L2ForwardSettings Settings(uint64_t default_gate) {
+  bess::pb::L2ForwardSettings settings;
+  settings.set_default_gate(default_gate);
+  return settings;
+}
+
+// MACs upserted through "<name>/macs" read back as the client sent them
+// (lower-case), so the same manifest applies as a no-op; a MAC the legacy add
+// installed in upper case reads back lower-case.
+TEST(L2ForwardResourceTest, MacsRoundTrip) {
+  ModuleHarness h;
+  Module *l2 = h.Create("L2Forward", bess::pb::L2ForwardArg(), "l2r");
+  ASSERT_NE(nullptr, l2);
+  const auto k1 = MacKeyMsg("00:00:00:00:00:01");
+  const auto k2 = MacKeyMsg("02:00:00:00:00:02");
+  const auto k3 = MacKeyMsg("aa:bb:cc:dd:ee:ff");
+  const auto g0 = MacValueMsg(0);
+  const auto g3 = MacValueMsg(3);
+  const auto drop = MacValueMsg(8192);
+  EXPECT_EQ("", h.UpsertResource("l2r/macs", k1, g0));
+  EXPECT_EQ("", h.UpsertResource("l2r/macs", k2, g3));
+  EXPECT_EQ("", h.UpsertResource("l2r/macs", k3, drop));
+  EXPECT_EQ("", h.ReadBackDiffers("l2r/macs", {{&k1, &g0}, {&k2, &g3}, {&k3, &drop}}));
+
+  h.MustCommand(l2, "add", Entries({{"0A:1B:2C:3D:4E:5F", 7}}));
+  const auto k4 = MacKeyMsg("0a:1b:2c:3d:4e:5f");
+  const auto g7 = MacValueMsg(7);
+  EXPECT_EQ("", h.ReadBackDiffers("l2r/macs", {{&k1, &g0}, {&k2, &g3}, {&k3, &drop}, {&k4, &g7}}));
+  std::vector<std::string> addrs;
+  for (const auto &[key, value] : h.ReadResource("l2r/macs")) {
+    bess::pb::L2ForwardMacKey k;
+    ASSERT_TRUE(key.UnpackTo(&k));
+    addrs.push_back(k.addr());
+  }
+  std::sort(addrs.begin(), addrs.end());
+  EXPECT_EQ((std::vector<std::string>{"00:00:00:00:00:01", "02:00:00:00:00:02",
+                                      "0a:1b:2c:3d:4e:5f", "aa:bb:cc:dd:ee:ff"}),
+            addrs);
+
+  const Bytes to3 = ToMac("02:00:00:00:00:02");
+  const Bytes to7 = ToMac("0a:1b:2c:3d:4e:5f");
+  auto out = h.Run(l2, 0, {to3, to7}, {3, 7});
+  EXPECT_EQ((std::vector<Bytes>{to3}), out[3]);
+  EXPECT_EQ((std::vector<Bytes>{to7}), out[7]);
+
+  EXPECT_NE("", h.UpsertResource("l2r/macs", MacKeyMsg("not-a-mac"), g0));
+  EXPECT_NE("", h.UpsertResource("l2r/macs", k1, MacValueMsg(65536)));
+  EXPECT_NE("", h.UpsertResource("l2r/macs", k1, MacValueMsg(8193)));
+  EXPECT_EQ("", h.ReadBackDiffers("l2r/macs", {{&k1, &g0}, {&k2, &g3}, {&k3, &drop}, {&k4, &g7}}))
+      << "refused upserts change nothing";
+}
+
+// "<name>/settings" sets what set_default_gate sets: the gate of a MAC with
+// no entry. It reads back DROP_GATE (8192) at creation, the gate set after,
+// also one the legacy command set; an invalid gate is refused.
+TEST(L2ForwardResourceTest, SettingsSetTheDefaultGate) {
+  ModuleHarness h;
+  Module *l2 = h.Create("L2Forward", bess::pb::L2ForwardArg(), "l2r");
+  ASSERT_NE(nullptr, l2);
+  const auto dropped = Settings(8192);
+  EXPECT_EQ("", h.ReadBackDiffers("l2r/settings", {{nullptr, &dropped}}));
+
+  const Bytes unknown = ToMac("02:00:00:00:00:42");
+  const auto to4 = Settings(4);
+  EXPECT_EQ("", h.SetResource("l2r/settings", to4));
+  EXPECT_EQ((std::vector<Bytes>{unknown}), h.Run(l2, 0, {unknown}, {4})[4]);
+  EXPECT_EQ("", h.ReadBackDiffers("l2r/settings", {{nullptr, &to4}}));
+
+  EXPECT_NE("", h.SetResource("l2r/settings", Settings(65536)));
+  EXPECT_NE("", h.SetResource("l2r/settings", Settings(8193)));
+  EXPECT_EQ("", h.ReadBackDiffers("l2r/settings", {{nullptr, &to4}}));
+  EXPECT_EQ((std::vector<Bytes>{unknown}), h.Run(l2, 0, {unknown}, {4})[4]);
+
+  const auto to0 = Settings(0);
+  EXPECT_EQ("", h.SetResource("l2r/settings", to0));
+  EXPECT_EQ((std::vector<Bytes>{unknown}), h.Run(l2, 0, {unknown}, {0})[0]);
+  EXPECT_EQ("", h.ReadBackDiffers("l2r/settings", {{nullptr, &to0}}));
+
+  bess::pb::L2ForwardCommandSetDefaultGateArg dflt;
+  dflt.set_gate(9);
+  h.MustCommand(l2, "set_default_gate", dflt);
+  const auto to9 = Settings(9);
+  EXPECT_EQ("", h.ReadBackDiffers("l2r/settings", {{nullptr, &to9}}));
+}
+
+// D-129: add, delete and set_default_gate edit resources now: InvokeAction
+// refuses them (ENOTSUP). lookup and populate stay actions.
+TEST(L2ForwardResourceTest, StateCommandsAreLegacyOnly) {
+  ModuleHarness h;
+  Module *l2 = h.Create("L2Forward", TableArg(64, 4), "l2r");
+  ASSERT_NE(nullptr, l2);
+  EXPECT_EQ(ENOTSUP, h.Action(l2, "add", Entries({{"02:00:00:00:00:01", 1}})).error().code());
+  EXPECT_EQ(ENOTSUP,
+            h.Action(l2, "delete", Addrs<bess::pb::L2ForwardCommandDeleteArg>({"02:00:00:00:00:01"}))
+                .error()
+                .code());
+  bess::pb::L2ForwardCommandSetDefaultGateArg dflt;
+  dflt.set_gate(1);
+  EXPECT_EQ(ENOTSUP, h.Action(l2, "set_default_gate", dflt).error().code());
+  EXPECT_TRUE(h.ReadResource("l2r/macs").empty());
+  const auto dropped = Settings(8192);
+  EXPECT_EQ("", h.ReadBackDiffers("l2r/settings", {{nullptr, &dropped}}));
+
+  CommandResponse populated = h.Action(l2, "populate", Populate("aa:bb:cc:dd:ee:fe", 2, 2));
+  EXPECT_EQ(0, populated.error().code()) << populated.error().errmsg();
+  CommandResponse looked_up = h.Action(
+      l2, "lookup",
+      Addrs<bess::pb::L2ForwardCommandLookupArg>({"aa:bb:cc:dd:ee:fe", "aa:bb:cc:dd:ee:ff"}));
+  ASSERT_EQ(0, looked_up.error().code()) << looked_up.error().errmsg();
+  bess::pb::L2ForwardCommandLookupResponse resp;
+  ASSERT_TRUE(looked_up.data().UnpackTo(&resp));
+  EXPECT_EQ((std::vector<uint64_t>{0, 1}), (std::vector<uint64_t>{resp.gates().begin(),
+                                                                  resp.gates().end()}));
 }
 
 }  // namespace

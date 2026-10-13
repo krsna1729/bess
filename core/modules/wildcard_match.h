@@ -21,6 +21,7 @@
 #include "classifier/runtime_schema.h"
 #include "event.h"
 #include "framework/resource_bindings.h"
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "rcu/rcu_ptr.h"
@@ -48,6 +49,10 @@ class WildcardMatch final : public Module {
   static const gate_idx_t kNumOGates = MAX_GATES;
 
   static const Commands cmds;
+  // "<module>/rules" (WildcardMatchRuleKey -> WildcardMatchRuleValue) and
+  // "<module>/settings" (WildcardMatchSettings), D-129. Neither requires
+  // paused workers: rules change in place, the default gate is published.
+  static const ResourceTables resource_tables;
 
   // Module-level limits. The classifier library supports arbitrary widths and
   // tuple counts; these bounds are WildcardMatch's own wire compatibility.
@@ -227,6 +232,12 @@ class WildcardMatch final : public Module {
   // (the generation is released with the module, workers already paused), and
   // every command publishes a replacement rather than clearing it.
   bess::rcu::RcuPtr<Generation> published_;
+
+  // "<module>/settings" (D-129): the default gate, as set_default_gate sets
+  // it. Stage builds the replacement generation; apply publishes it. After
+  // published_, which it touches.
+  bess::framework::Singleton<bess::pb::WildcardMatchSettings, GenerationPtr>
+      settings_;
 };
 
 #endif  // BESS_MODULES_WILDCARDMATCH_H_

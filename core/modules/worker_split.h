@@ -5,6 +5,11 @@
 #ifndef BESS_MODULES_WORKERSPLIT_H_
 #define BESS_MODULES_WORKERSPLIT_H_
 
+#include <array>
+#include <expected>
+#include <string>
+
+#include "framework/singleton_resource.h"
 #include "module.h"
 
 class WorkerSplit final : public Module {
@@ -14,8 +19,10 @@ class WorkerSplit final : public Module {
   WorkerSplit() : Module(), gates_() { max_allowed_workers_ = kNumOGates; }
 
   static const Commands cmds;
+  static const ResourceTables resource_tables;
 
   CommandResponse Init(const bess::pb::WorkerSplitArg &);
+  void DeInit() override;
 
   CommandResponse CommandReset(const bess::pb::WorkerSplitArg &);
 
@@ -24,7 +31,18 @@ class WorkerSplit final : public Module {
   void AddActiveWorker(int wid, const Task *task) override;
 
  private:
+  using Gates = std::array<int, Worker::kMaxWorkers>;
+
+  // The gate of each worker (-1: dropped) `arg` asks for, or why not.
+  static std::expected<Gates, std::string> StageGates(
+      const bess::pb::WorkerSplitArg &arg);
+  // Empty when every worker goes to its own gate (the default mode).
+  bess::pb::WorkerSplitArg ReadGates() const;
+
   int gates_[Worker::kMaxWorkers];
+
+  // "<name>/settings" (D-129): the worker -> gate map, paused workers only.
+  bess::framework::Singleton<bess::pb::WorkerSplitArg, Gates> settings_;
 };
 
 #endif  // BESS_MODULES_WORKERSPLIT_H_

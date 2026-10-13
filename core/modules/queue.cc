@@ -5,6 +5,7 @@
 #include "queue.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 #include "utils/format.h"
@@ -14,56 +15,77 @@
 
 const Commands Queue::cmds = {
     {"set_burst", "QueueCommandSetBurstArg",
-     MODULE_CMD_FUNC(&Queue::CommandSetBurst), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&Queue::CommandSetBurst), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"set_size", "QueueCommandSetSizeArg",
-     MODULE_CMD_FUNC(&Queue::CommandSetSize), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&Queue::CommandSetSize), Command::THREAD_UNSAFE, "",
+     Command::LEGACY_ONLY},
     {"get_status", "QueueCommandGetStatusArg",
-     MODULE_CMD_FUNC(&Queue::CommandGetStatus), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&Queue::CommandGetStatus), Command::THREAD_SAFE,
+     "QueueCommandGetStatusResponse"},
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&Queue::GetInitialArg),
-     Command::THREAD_SAFE},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
     {"get_runtime_config", "EmptyArg",
-     MODULE_CMD_FUNC(&Queue::GetRuntimeConfig), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&Queue::GetRuntimeConfig), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"set_runtime_config", "QueueArg",
-     MODULE_CMD_FUNC(&Queue::SetRuntimeConfig), Command::THREAD_UNSAFE}};
+     MODULE_CMD_FUNC(&Queue::SetRuntimeConfig), Command::THREAD_UNSAFE, "",
+     Command::LEGACY_ONLY}};
 
-int Queue::Resize(int slots) {
-  struct rte_ring *old_queue = queue_;
-  struct rte_ring *new_queue;
+const ResourceTables Queue::resource_tables = {
+    ResourceTable::Singleton<bess::pb::QueueSettings>("settings", true),
+};
 
+void Queue::RingFree::operator()(struct rte_ring *ring) const {
+  bess::PacketHandle pkt;
+  while (rte_ring_sc_dequeue(ring, reinterpret_cast<void **>(&pkt)) == 0) {
+    bess::PacketFree(pkt);
+  }
+  std::free(ring);
+}
+
+std::expected<Queue::RingPtr, int> Queue::AllocRing(uint64_t slots) {
   ssize_t bytes = rte_ring_get_memsize(slots);
   if (bytes < 0) {
-    return -EINVAL;
+    return std::unexpected(EINVAL);
   }
 
-  new_queue = static_cast<rte_ring *>(
+  struct rte_ring *ring = static_cast<rte_ring *>(
       bess::utils::AllocRingMem(static_cast<size_t>(bytes)));
-  if (!new_queue) {
-    return -ENOMEM;
+  if (!ring) {
+    return std::unexpected(ENOMEM);
   }
 
   std::string name = bess::utils::NewRingName("queue");
-  int ret = rte_ring_init(new_queue, name.c_str(), slots, RING_F_SC_DEQ);
-  if (ret) {
-    std::free(new_queue);
-    return -EINVAL;
+  if (rte_ring_init(ring, name.c_str(), slots, RING_F_SC_DEQ)) {
+    std::free(ring);
+    return std::unexpected(EINVAL);
+  }
+  return RingPtr(ring);
+}
+
+void Queue::MigrateRing(struct rte_ring *from, struct rte_ring *to) {
+  bess::PacketHandle pkt;
+  while (rte_ring_sc_dequeue(from, reinterpret_cast<void **>(&pkt)) == 0) {
+    if (rte_ring_sp_enqueue(to, reinterpret_cast<void *>(pkt)) == -ENOBUFS) {
+      bess::PacketFree(pkt);
+    }
+  }
+}
+
+int Queue::Resize(int slots) {
+  auto ring = AllocRing(slots);
+  if (!ring) {
+    return -ring.error();
   }
 
   /* migrate packets from the old queue */
-  if (old_queue) {
-    bess::PacketHandle pkt;
-
-    while (rte_ring_sc_dequeue(old_queue,
-                               reinterpret_cast<void **>(&pkt)) == 0) {
-      ret = rte_ring_sp_enqueue(new_queue, reinterpret_cast<void *>(pkt));
-      if (ret == -ENOBUFS) {
-        bess::PacketFree(pkt);
-      }
-    }
-
-    std::free(old_queue);
+  if (queue_) {
+    MigrateRing(queue_, ring->get());
+    std::free(queue_);
   }
 
-  queue_ = new_queue;
+  queue_ = ring->release();
   size_ = slots;
 
   if (backpressure_) {
@@ -71,6 +93,69 @@ int Queue::Resize(int slots) {
   }
 
   return 0;
+}
+
+std::expected<void, std::string> Queue::ValidSize(uint64_t size) {
+  if (size < 4 || size > 16384) {
+    return std::unexpected("must be in [4, 16384]");
+  }
+  if (size & (size - 1)) {
+    return std::unexpected("must be a power of 2");
+  }
+  return {};
+}
+
+// As set_size and set_burst validate; the ring of a new size is allocated
+// here, so apply only swaps.
+std::expected<Queue::Staged, std::string> Queue::StageSettings(
+    const bess::pb::QueueSettings &value) const {
+  if (auto valid = ValidSize(value.size()); !valid) {
+    return std::unexpected(valid.error());
+  }
+  if (value.burst() > bess::PacketBatch::kMaxBurst) {
+    return std::unexpected(bess::utils::Format(
+        "burst size must be [0,%zu]", bess::PacketBatch::kMaxBurst));
+  }
+  Staged staged;
+  if (value.size() != size_) {
+    auto ring = AllocRing(value.size());
+    if (!ring) {
+      return std::unexpected(
+          bess::utils::Format("cannot allocate the queue: %s",
+                              strerror(ring.error())));
+    }
+    staged.ring = std::move(*ring);
+  }
+  staged.size = value.size();
+  staged.burst = static_cast<int>(value.burst());
+  staged.prefetch = value.prefetch();
+  staged.backpressure = value.backpressure();
+  return staged;
+}
+
+// Workers are paused. The old ring goes back into `staged`, freed (empty)
+// with it after the publish.
+void Queue::ApplySettings(Staged &staged) {
+  if (staged.ring != nullptr) {
+    MigrateRing(queue_, staged.ring.get());
+    struct rte_ring *old = queue_;
+    queue_ = staged.ring.release();
+    staged.ring.reset(old);
+  }
+  size_ = staged.size;
+  burst_.store(staged.burst, std::memory_order_relaxed);
+  prefetch_ = staged.prefetch;
+  backpressure_ = staged.backpressure;
+  AdjustWaterLevels();
+}
+
+bess::pb::QueueSettings Queue::ReadSettings() const {
+  bess::pb::QueueSettings value;
+  value.set_size(size_);
+  value.set_burst(burst_.load(std::memory_order_relaxed));
+  value.set_prefetch(prefetch_);
+  value.set_backpressure(backpressure_);
+  return value;
 }
 
 CommandResponse Queue::Init(const bess::pb::QueueArg &arg) {
@@ -108,6 +193,17 @@ CommandResponse Queue::Init(const bess::pb::QueueArg &arg) {
   }
 
   init_arg_ = arg;
+
+  auto registered = settings_.Register(
+      init_context().resources(), init_context().codecs(), name() + "/settings",
+      [this](const bess::pb::QueueSettings &value) {
+        return StageSettings(value);
+      },
+      [this](Staged &staged) { ApplySettings(staged); },
+      [this] { return ReadSettings(); }, [this] { return HasRunningWorker(); });
+  if (!registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
   return CommandSuccess();
 }
 
@@ -136,8 +232,9 @@ CommandResponse Queue::SetRuntimeConfig(const bess::pb::QueueArg &arg) {
 }
 
 void Queue::DeInit() {
-  bess::PacketHandle pkt;
+  settings_.Release();
 
+  bess::PacketHandle pkt;
   if (queue_) {
     while (rte_ring_sc_dequeue(queue_,
                                reinterpret_cast<void **>(&pkt)) == 0) {
@@ -250,12 +347,8 @@ CommandResponse Queue::CommandSetBurst(
 }
 
 CommandResponse Queue::SetSize(uint64_t size) {
-  if (size < 4 || size > 16384) {
-    return CommandFailure(EINVAL, "must be in [4, 16384]");
-  }
-
-  if (size & (size - 1)) {
-    return CommandFailure(EINVAL, "must be a power of 2");
+  if (auto valid = ValidSize(size); !valid) {
+    return CommandFailure(EINVAL, "%s", valid.error().c_str());
   }
 
   int ret = Resize(size);

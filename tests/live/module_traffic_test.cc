@@ -238,7 +238,7 @@ TEST_F(ModuleTrafficTest, TimestampedAndMeasured) {
   ASSERT_TRUE(client().ResumeWorkers());
   std::this_thread::sleep_for(milliseconds(200));  // warm up ...
   auto empty = types.Make("bess.pb.EmptyArg", "{}");
-  auto cleared = client().RunModuleCommand("measure", "clear", *empty);
+  auto cleared = client().InvokeAction("measure", "clear", *empty);
   EXPECT_TRUE(cleared) << cleared.error().message;
   std::this_thread::sleep_for(milliseconds(800));  // ... then measure
   ASSERT_TRUE(client().PauseWorkers());
@@ -246,7 +246,7 @@ TEST_F(ModuleTrafficTest, TimestampedAndMeasured) {
 
   auto summary_arg = types.Make("bess.pb.MeasureCommandGetSummaryArg",
                                 R"({"latency_percentiles": [0, 25, 50, 99, 100]})");
-  auto summary = client().RunModuleCommand("measure", "get_summary", *summary_arg);
+  auto summary = client().InvokeAction("measure", "get_summary", *summary_arg);
   ASSERT_TRUE(summary) << summary.error().message;
   const std::string json = types.ToJson(*summary);
   gp::Struct s;

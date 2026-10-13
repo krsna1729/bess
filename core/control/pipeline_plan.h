@@ -85,11 +85,17 @@ using PlanOperation = std::variant<CreatePortOp, UpdatePortOp, RemovePortOp,
 //              queues before ports are destroyed, workers last)
 //
 // Each phase is ordered deterministically (by name, or by wid for workers).
+//
+// After the commit and before the retire phase, the listed resources whose
+// contents change are converged in one dataplane transaction (D-129):
+// `resources` names them. The control plane runs that step, not Transaction.
 struct PipelinePlan {
   std::vector<PlanOperation> prepare_ops;
   std::vector<PlanOperation> commit_ops;
   std::vector<PlanOperation> retire_ops;
+  std::vector<std::string> resources;
 
+  // Topology only, as PipelineDiff::empty().
   bool empty() const {
     return prepare_ops.empty() && commit_ops.empty() && retire_ops.empty();
   }

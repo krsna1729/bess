@@ -15,11 +15,16 @@
 #include <cstring>
 #include <random>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "dataplane/transaction_engine.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
 #include "packet_pool.h"
 #include "pb/module_msg.pb.h"
+#include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
 
@@ -424,6 +429,98 @@ TEST(DrrModuleTest, ArgumentsDoNotWrap) {
   EXPECT_EQ(EINVAL, h.CreateFailure("DRR", DrrArg(0, (1ull << 32) + 1, 0)).code());
   EXPECT_EQ(EINVAL, h.CreateFailure("DRR", DrrArg(UINT32_MAX, 0, 0)).code());
   EXPECT_EQ(0, h.CreateFailure("DRR", DrrArg(1024, 1500, 0)).code());
+}
+
+// -- "<name>/settings" (D-129) ---------------------------------------------------
+
+bess::pb::DRRSettings DrrSettings(uint32_t quantum, uint32_t max_flow_queue_size) {
+  bess::pb::DRRSettings s;
+  s.set_quantum(quantum);
+  s.set_max_flow_queue_size(max_flow_queue_size);
+  return s;
+}
+
+// True when "<resource>"'s codec says applying it requires paused workers.
+bool RequiresPausedWorkers(const std::string &resource) {
+  const bess::dataplane::Resource *r =
+      bess::runtime::runtime().transactions().FindResource(resource);
+  EXPECT_NE(nullptr, r) << resource;
+  if (r == nullptr) {
+    return false;
+  }
+  const bess::framework::ResourceCodec *codec =
+      bess::framework::ResourceBindings::ProcessDefault().Find(*r);
+  EXPECT_NE(nullptr, codec) << resource;
+  return codec != nullptr && codec->requires_paused_workers();
+}
+
+// The max flow queue size bounds one flow's backlog; the quantum is what a
+// flow may send per round (a packet bigger than it waits for more rounds).
+TEST(DrrSettingsTest, QueueSizeAndQuantumChangeWhatTheTaskSends) {
+  ModuleHarness h;
+  Module *drr = h.Create("DRR", DrrArg(4, 0, 0), "drr");
+  ASSERT_NE(nullptr, drr);
+  std::mt19937 rng(2);
+  const Frame pkt = bess::testing::TcpPacket({.sip = "10.0.0.1", .dip = "10.0.0.2"}, rng);
+  const std::vector<Frame> five(5, pkt);
+
+  h.Run(drr, 0, five, {0});
+  EXPECT_EQ(5u, h.RunTask(drr, {0})[0].size()) << "default: 8192 per flow";
+
+  ASSERT_EQ("", h.SetResource("drr/settings", DrrSettings(1500, 2)));
+  h.Run(drr, 0, five, {0});
+  EXPECT_EQ(2u, h.RunTask(drr, {0})[0].size()) << "the rest of the flow's packets dropped";
+
+  ASSERT_EQ("", h.SetResource("drr/settings", DrrSettings(1, 2)));
+  h.Run(drr, 0, {pkt}, {0});
+  EXPECT_TRUE(h.RunTask(drr, {0})[0].empty()) << "one byte per round: the packet waits";
+  ASSERT_EQ("", h.SetResource("drr/settings", DrrSettings(1500, 2)));
+  EXPECT_EQ((std::vector<Frame>{pkt}), h.RunTask(drr, {0})[0]);
+}
+
+TEST(DrrSettingsTest, ReadBackRoundTrips) {
+  ModuleHarness h;
+  ASSERT_NE(nullptr, h.Create("DRR", DrrArg(4, 0, 0), "drr"));
+  const bess::pb::DRRSettings initial = DrrSettings(DRR::kDefaultQuantum, DRR::kFlowQueueMax);
+  EXPECT_EQ("", h.ReadBackDiffers("drr/settings", {{nullptr, &initial}}));
+  const bess::pb::DRRSettings s = DrrSettings(3000, 64);
+  ASSERT_EQ("", h.SetResource("drr/settings", s));
+  EXPECT_EQ("", h.ReadBackDiffers("drr/settings", {{nullptr, &s}}));
+}
+
+TEST(DrrSettingsTest, BadValuesRefused) {
+  ModuleHarness h;
+  ASSERT_NE(nullptr, h.Create("DRR", DrrArg(4, 0, 0), "drr"));
+  EXPECT_NE("", h.SetResource("drr/settings", DrrSettings(0, 64)));
+  EXPECT_NE("", h.SetResource("drr/settings", DrrSettings(1500, 0)));
+  const bess::pb::DRRSettings unchanged = DrrSettings(DRR::kDefaultQuantum, DRR::kFlowQueueMax);
+  EXPECT_EQ("", h.ReadBackDiffers("drr/settings", {{nullptr, &unchanged}}));
+}
+
+TEST(DrrSettingsTest, AppliesLive) {
+  ModuleHarness h;
+  ASSERT_NE(nullptr, h.Create("DRR", DrrArg(4, 0, 0), "drr"));
+  EXPECT_FALSE(RequiresPausedWorkers("drr/settings"));
+}
+
+TEST(DrrSettingsTest, SettersAreLegacyOnly) {
+  ModuleHarness h;
+  Module *drr = h.Create("DRR", DrrArg(4, 0, 0), "drr");
+  ASSERT_NE(nullptr, drr);
+  bess::pb::DRRQuantumArg quantum;
+  quantum.set_quantum(700);
+  bess::pb::DRRMaxFlowQueueSizeArg queue_size;
+  queue_size.set_max_queue_size(50);
+  EXPECT_EQ(ENOTSUP, h.Action(drr, "set_quantum_size", quantum).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(drr, "set_max_flow_queue_size", queue_size).error().code());
+  // The legacy commands still run and validate, and the resource reads what
+  // they set.
+  h.MustCommand(drr, "set_quantum_size", quantum);
+  h.MustCommand(drr, "set_max_flow_queue_size", queue_size);
+  EXPECT_EQ(EINVAL,
+            h.Command(drr, "set_quantum_size", bess::pb::DRRQuantumArg()).error().code());
+  const bess::pb::DRRSettings s = DrrSettings(700, 50);
+  EXPECT_EQ("", h.ReadBackDiffers("drr/settings", {{nullptr, &s}}));
 }
 
 }  // namespace

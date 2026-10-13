@@ -2,9 +2,11 @@
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "module.h"
 #include "module_graph.h"
@@ -13,6 +15,7 @@
 #include "packet_pool.h"
 #include "pb/module_msg.pb.h"
 #include "task.h"
+#include "testing/module_harness.h"
 #include "utils/endian.h"
 
 namespace {
@@ -160,6 +163,47 @@ TEST_F(PacketStoreTest, PerFlowCapacityEviction) {
   // Clear remaining
   PacketStoreCommandClearArg clr;
   EXPECT_EQ(0, ps->CommandClear(clr).error().code());
+}
+
+// D-129: release, drop and clear act on held packets, not on configuration:
+// all three are actions (none answers data), so InvokeAction runs them. With
+// no store_id or vif_id writer every packet is held under flow 0.
+TEST(PacketStoreActionTest, ReleaseDropAndClearAreActions) {
+  bess::testing::ModuleHarness h;
+  PacketStoreArg arg;
+  arg.set_max_packets(100);
+  arg.set_max_packets_per_flow(10);
+  Module *ps = h.Create("PacketStore", arg);
+  ASSERT_NE(nullptr, ps);
+
+  const std::vector<bess::testing::Bytes> in(3, bess::testing::Bytes(64, 0xab));
+  auto held = h.Run(ps, 0, in, {0, 1});
+  EXPECT_TRUE(held[0].empty());
+  EXPECT_TRUE(held[1].empty());
+  EXPECT_EQ("3 packets stored across 1 flows (max 100)", ps->GetDesc());
+
+  PacketStoreCommandReleaseArg rel;
+  rel.set_id(0);
+  rel.set_gate(0);
+  CommandResponse r = h.Action(ps, "release", rel);
+  ASSERT_EQ(0, r.error().code()) << r.error().errmsg();
+  EXPECT_EQ(3u, h.RunTask(ps, {0, 1})[0].size());
+  EXPECT_EQ("0 packets stored across 0 flows (max 100)", ps->GetDesc());
+
+  // The released flow is gone: drop now finds nothing.
+  PacketStoreCommandDropArg drp;
+  drp.set_id(0);
+  EXPECT_EQ(ENOENT, h.Action(ps, "drop", drp).error().code());
+
+  h.Run(ps, 0, in, {0, 1});
+  r = h.Action(ps, "drop", drp);
+  EXPECT_EQ(0, r.error().code()) << r.error().errmsg();
+  EXPECT_EQ("0 packets stored across 0 flows (max 100)", ps->GetDesc());
+
+  h.Run(ps, 0, in, {0, 1});
+  r = h.Action(ps, "clear", PacketStoreCommandClearArg());
+  EXPECT_EQ(0, r.error().code()) << r.error().errmsg();
+  EXPECT_EQ("0 packets stored across 0 flows (max 100)", ps->GetDesc());
 }
 
 }  // namespace

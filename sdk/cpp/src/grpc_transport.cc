@@ -60,7 +60,7 @@ class GrpcTransportImpl final : public Transport {
   BESS_SDK_GRPC_UNARY(stub_, DiffPipeline)
   BESS_SDK_GRPC_UNARY(stub_, PlanPipeline)
   BESS_SDK_GRPC_UNARY(stub_, ApplyPipeline)
-  BESS_SDK_GRPC_UNARY(stub_, RunModuleCommand)
+  BESS_SDK_GRPC_UNARY(stub_, InvokeAction)
   BESS_SDK_GRPC_UNARY(admin_, ImportPlugin)
   BESS_SDK_GRPC_UNARY(admin_, UnloadPlugin)
   BESS_SDK_GRPC_UNARY(admin_, GetPortStatus)

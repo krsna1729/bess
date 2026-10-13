@@ -8,10 +8,12 @@
 #include <map>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "arch/crc32c.h"
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "packet.h"
 #include "pb/module_msg.pb.h"
@@ -80,10 +82,12 @@ class UrlFilter final : public Module {
   typedef std::pair<std::string, std::string> Url;
 
   static const Commands cmds;
+  static const ResourceTables resource_tables;
   static const gate_idx_t kNumIGates = 2;
   static const gate_idx_t kNumOGates = 2;
 
   CommandResponse Init(const bess::pb::UrlFilterArg &arg);
+  void DeInit() override;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
@@ -96,8 +100,30 @@ class UrlFilter final : public Module {
   CommandResponse SetRuntimeConfig(const bess::pb::UrlFilterConfig &arg);
 
  private:
-  std::unordered_map<std::string, Trie<std::tuple<>>> blacklist_;
+  using Blacklist = std::unordered_map<std::string, Trie<std::tuple<>>>;
+
+  // A "<name>/blacklist" value, built: the blacklist and the
+  // UrlFilterConfig it came from (read back as given).
+  struct Staged {
+    Blacklist blacklist;
+    bess::pb::UrlFilterConfig config;
+  };
+
+  static void Insert(
+      const google::protobuf::RepeatedPtrField<bess::pb::UrlFilterArg_Url> &urls,
+      Blacklist *blacklist);
+
+  Blacklist blacklist_;
   std::unordered_map<Flow, FlowRecord, FlowHash> flow_cache_;
+
+  // The blacklist as given, in order (control side): "<name>/blacklist"
+  // reads it back. The legacy commands keep it in step with blacklist_.
+  bess::pb::UrlFilterConfig config_;
+  // "<name>/blacklist" (D-129): the whole blacklist; setting it replaces it
+  // (as set_runtime_config does). Paused workers: ProcessBatch reads
+  // blacklist_ in place.
+  bess::framework::Singleton<bess::pb::UrlFilterConfig, Staged>
+      blacklist_resource_;
 };
 
 #endif  // BESS_MODULES_URL_FILTER_H_

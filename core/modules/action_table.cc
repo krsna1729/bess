@@ -20,6 +20,10 @@ namespace dataplane = bess::dataplane;
 
 const Commands ActionTable::cmds = {};
 
+const ResourceTables ActionTable::resource_tables = {
+    ResourceTable::Map<bess::pb::ActionIdKey, bess::pb::ActionValue>("actions"),
+};
+
 CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
   if (arg.meters().empty() || arg.next_hops().empty()) {
     return CommandFailure(
@@ -69,6 +73,23 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
             return std::any(
                 Action{bess::meter::MeterId(value.meter_id()),
                        bess::route::NextHopId(value.next_hop_id())});
+          },
+          // Every live action, as its value names it (an erased one is gone
+          // at once, though it stays readable until its removal stage).
+          [this](const auto &visit) {
+            for (size_t i = 1; i <= actions_->capacity(); i++) {
+              const ActionId id(static_cast<ActionId::rep_type>(i));
+              const Action *action = actions_->Current(id);
+              if (action == nullptr) {
+                continue;
+              }
+              bess::pb::ActionIdKey key;
+              key.set_id(id.value());
+              bess::pb::ActionValue value;
+              value.set_meter_id(action->meter.value());
+              value.set_next_hop_id(action->next_hop.value());
+              visit(key, value);
+            }
           }));
   if (auto registered =
           init_context().resources().Register(resource_.get());

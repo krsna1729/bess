@@ -832,6 +832,33 @@ size_t Router::next_hop_count() const {
   return next_hops_.size();  // live, not counting retiring ones
 }
 
+void Router::ForEachNextHop(
+    const std::function<void(NextHopId, const NextHop &)> &fn) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (size_t i = 1; i <= next_hops_.capacity(); i++) {
+    const NextHopId id(static_cast<uint32_t>(i));
+    if (const NextHop *hop = next_hops_.Current(id); hop != nullptr) {
+      fn(id, *hop);
+    }
+  }
+}
+
+void Router::ForEachRoute(
+    const std::function<void(const ::bess::route::RouteKey &key, NextHopId hop,
+                             NextHopGroupId group)> &fn) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ForEachDomain([&](RouteDomainId domain, const LpmRouteTable &routes) {
+    routes.ForEach([&](Ipv4Prefix prefix, uint32_t value) {
+      const ::bess::route::RouteKey key{domain, prefix};
+      if (value > max_next_hops_) {
+        fn(key, NextHopId(0), NextHopGroupId(value - max_next_hops_));
+      } else {
+        fn(key, NextHopId(value), NextHopGroupId(0));
+      }
+    });
+  });
+}
+
 size_t Router::RouteReferences(NextHopId id) const {
   std::lock_guard<std::mutex> lock(mutex_);
   if (engine_ != nullptr) {

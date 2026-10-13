@@ -4,11 +4,19 @@
 
 #include "round_robin.h"
 
+#include "utils/format.h"
+
 const Commands RoundRobin::cmds = {
     {"set_mode", "RoundRobinCommandSetModeArg",
-     MODULE_CMD_FUNC(&RoundRobin::CommandSetMode), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&RoundRobin::CommandSetMode), Command::THREAD_UNSAFE, "",
+     Command::LEGACY_ONLY},
     {"set_gates", "RoundRobinCommandSetGatesArg",
-     MODULE_CMD_FUNC(&RoundRobin::CommandSetGates), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&RoundRobin::CommandSetGates), Command::THREAD_UNSAFE, "",
+     Command::LEGACY_ONLY},
+};
+
+const ResourceTables RoundRobin::resource_tables = {
+    ResourceTable::Singleton<bess::pb::RoundRobinArg>("settings", true),
 };
 
 CommandResponse RoundRobin::Init(const bess::pb::RoundRobinArg &arg) {
@@ -37,7 +45,66 @@ CommandResponse RoundRobin::Init(const bess::pb::RoundRobinArg &arg) {
     }
   }
 
+  auto registered = settings_.Register(
+      init_context().resources(), init_context().codecs(), name() + "/settings",
+      [](const bess::pb::RoundRobinArg &value) { return StageSettings(value); },
+      [this](Settings &settings) { ApplySettings(settings); },
+      [this] { return ReadSettings(); }, [this] { return HasRunningWorker(); });
+  if (!registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
   return CommandSuccess();
+}
+
+void RoundRobin::DeInit() {
+  settings_.Release();
+}
+
+// As set_mode and set_gates validate, except that the mode is required (the
+// read-back always names it) and a gate must fit a gate index (the commands
+// narrow it unchecked).
+std::expected<RoundRobin::Settings, std::string> RoundRobin::StageSettings(
+    const bess::pb::RoundRobinArg &arg) {
+  Settings staged;
+  if (arg.mode() == "packet") {
+    staged.per_packet = 1;
+  } else if (arg.mode() == "batch") {
+    staged.per_packet = 0;
+  } else {
+    return std::unexpected("argument must be either 'packet' or 'batch'");
+  }
+  if (arg.gates_size() > MAX_RR_GATES) {
+    return std::unexpected(
+        bess::utils::Format("no more than %d gates", MAX_RR_GATES));
+  }
+  staged.gates.reserve(arg.gates_size());
+  for (int64_t gate : arg.gates()) {
+    const gate_idx_t idx = static_cast<gate_idx_t>(gate);
+    if (gate < 0 || static_cast<int64_t>(idx) != gate || !is_valid_gate(idx)) {
+      return std::unexpected(bess::utils::Format(
+          "invalid gate %lld", static_cast<long long>(gate)));
+    }
+    staged.gates.push_back(idx);
+  }
+  return staged;
+}
+
+void RoundRobin::ApplySettings(const Settings &settings) {
+  for (size_t i = 0; i < settings.gates.size(); i++) {
+    gates_[i] = settings.gates[i];
+  }
+  ngates_ = static_cast<int>(settings.gates.size());
+  current_gate_ = 0;
+  per_packet_ = settings.per_packet;
+}
+
+bess::pb::RoundRobinArg RoundRobin::ReadSettings() const {
+  bess::pb::RoundRobinArg value;
+  for (int i = 0; i < ngates_; i++) {
+    value.add_gates(gates_[i]);
+  }
+  value.set_mode(per_packet_ ? "packet" : "batch");
+  return value;
 }
 
 CommandResponse RoundRobin::CommandSetMode(

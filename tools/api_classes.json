@@ -90,6 +90,7 @@
     "framework/plugin.h": "public",
     "framework/resource_bindings.h": "experimental",
     "framework/resource_codec.h": "experimental",
+    "framework/singleton_resource.h": "experimental",
     "meter/meter.h": "experimental",
     "meter/meter_set.h": "experimental",
     "rcu/rcu_domain.h": "experimental",

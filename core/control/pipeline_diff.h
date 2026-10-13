@@ -3,6 +3,7 @@
 #ifndef BESS_CONTROL_PIPELINE_DIFF_H_
 #define BESS_CONTROL_PIPELINE_DIFF_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,19 @@ struct TaskChange {
   ChangeKind kind = ChangeKind::kUpdate;
 };
 
+// What converging one listed resource changes, by entries (D-129).
+struct ResourceDelta {
+  std::string name;
+  uint64_t created = 0;
+  uint64_t updated = 0;
+  uint64_t removed = 0;
+  // False: the resource does not exist yet (the apply creates or replaces its
+  // module); every entry counts as created and is checked at the apply.
+  bool checked = true;
+
+  bool empty() const { return created == 0 && updated == 0 && removed == 0; }
+};
+
 struct PipelineDiff {
   std::vector<PortChange> ports;
   std::vector<ModuleChange> modules;
@@ -73,9 +87,13 @@ struct PipelineDiff {
   std::vector<WorkerChange> workers;
   std::vector<TrafficClassChange> traffic_classes;
   std::vector<TaskChange> tasks;  // in (module, task) order
+  // Listed resources whose contents change, by name. Diff() leaves it empty:
+  // the control plane fills it from the resources themselves
+  // (pipeline_resources.h).
+  std::vector<ResourceDelta> resources;
 
-  // True when the desired state is already active. A no-op apply must not
-  // pause workers and must not bump the generation.
+  // True when the desired topology is already active (resources aside). A
+  // no-op apply must not pause workers and must not bump the generation.
   bool empty() const {
     return ports.empty() && modules.empty() && connections.empty() &&
            workers.empty() && traffic_classes.empty() && tasks.empty();

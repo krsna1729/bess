@@ -4,12 +4,33 @@
 
 #include "queue_inc.h"
 
+#include <expected>
+#include <string>
+
 #include "port.h"
 #include "utils/format.h"
 
+namespace {
+
+// set_burst's refusal ("" when `burst` is valid).
+std::string BurstError(uint64_t burst) {
+  if (burst > bess::PacketBatch::kMaxBurst) {
+    return bess::utils::Format("burst size must be [0,%zu]",
+                               bess::PacketBatch::kMaxBurst);
+  }
+  return "";
+}
+
+}  // namespace
+
+// set_burst edits what "settings" holds: legacy only (D-129).
 const Commands QueueInc::cmds = {{"set_burst", "QueueIncCommandSetBurstArg",
                                   MODULE_CMD_FUNC(&QueueInc::CommandSetBurst),
-                                  Command::THREAD_SAFE}};
+                                  Command::THREAD_SAFE, "",
+                                  Command::LEGACY_ONLY}};
+
+const ResourceTables QueueInc::resource_tables = {
+    ResourceTable::Singleton<bess::pb::QueueIncSettings>("settings")};
 
 CommandResponse QueueInc::Init(const bess::pb::QueueIncArg &arg) {
   const char *port_name;
@@ -41,10 +62,31 @@ CommandResponse QueueInc::Init(const bess::pb::QueueIncArg &arg) {
     return CommandFailure(-ret);
   }
 
+  // Applied live: the burst is a relaxed atomic each task run reads once.
+  auto registered = settings_.Register(
+      init_context().resources(), init_context().codecs(), name() + "/settings",
+      [](const bess::pb::QueueIncSettings &v) -> std::expected<int, std::string> {
+        if (std::string err = BurstError(v.burst()); !err.empty()) {
+          return std::unexpected(std::move(err));
+        }
+        return static_cast<int>(v.burst());
+      },
+      [this](int &burst) { burst_.store(burst, std::memory_order_relaxed); },
+      [this] {
+        bess::pb::QueueIncSettings v;
+        v.set_burst(burst_.load(std::memory_order_relaxed));
+        return v;
+      },
+      nullptr);
+  if (!registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
+
   return CommandSuccess();
 }
 
 void QueueInc::DeInit() {
+  settings_.Release();
   if (port_) {
     port_->ReleaseQueues(reinterpret_cast<const module *>(this), PACKET_DIR_INC,
                          &qid_, 1);
@@ -107,9 +149,8 @@ struct task_result QueueInc::RunTask(Context *ctx, bess::PacketBatch *batch,
 
 CommandResponse QueueInc::CommandSetBurst(
     const bess::pb::QueueIncCommandSetBurstArg &arg) {
-  if (arg.burst() > bess::PacketBatch::kMaxBurst) {
-    return CommandFailure(EINVAL, "burst size must be [0,%zu]",
-                          bess::PacketBatch::kMaxBurst);
+  if (std::string err = BurstError(arg.burst()); !err.empty()) {
+    return CommandFailure(EINVAL, "%s", err.c_str());
   } else {
     burst_.store(arg.burst(), std::memory_order_relaxed);
     return CommandSuccess();

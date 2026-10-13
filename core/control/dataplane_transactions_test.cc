@@ -217,12 +217,19 @@ TEST_F(DataplaneTransactionsTest, ResourcesAreDiscoverable) {
                   ->ListTransactionResources(
                       &context, v2::ListTransactionResourcesRequest(), &list)
                   .ok());
-  ASSERT_EQ(list.resources_size(), 2);
+  ASSERT_EQ(list.resources_size(), 4);
   EXPECT_EQ(list.resources(0).name(), "em0/rules");
   EXPECT_EQ(list.resources(0).key_type(), "bess.pb.ExactMatchRuleKey");
   EXPECT_EQ(list.resources(0).value_type(), "bess.pb.ExactMatchRuleValue");
-  EXPECT_EQ(list.resources(1).name(), "wm0/rules");
-  EXPECT_EQ(list.resources(1).key_type(), "bess.pb.WildcardMatchRuleKey");
+  EXPECT_EQ(list.resources(0).kind(), v2::TransactionResource::KIND_MAP);
+  EXPECT_EQ(list.resources(1).name(), "em0/settings");
+  EXPECT_EQ(list.resources(1).key_type(), "google.protobuf.Empty");
+  EXPECT_EQ(list.resources(1).value_type(), "bess.pb.ExactMatchSettings");
+  EXPECT_EQ(list.resources(1).kind(), v2::TransactionResource::KIND_SINGLETON);
+  EXPECT_FALSE(list.resources(1).requires_paused_workers());
+  EXPECT_EQ(list.resources(2).name(), "wm0/rules");
+  EXPECT_EQ(list.resources(2).key_type(), "bess.pb.WildcardMatchRuleKey");
+  EXPECT_EQ(list.resources(3).name(), "wm0/settings");
   EXPECT_NE(list.daemon_epoch(), 0u);
 }
 
@@ -414,6 +421,24 @@ struct MeterObject {
 struct MeterTag;
 using MeterKey = bess::dataplane::StrongId<MeterTag, uint32_t>;
 
+// The codecs' read-back: every live object of `table` as (id, `field`).
+template <typename Id, typename T>
+auto ReadBack(const bess::dataplane::SlotTable<Id, T> &table,
+              uint32_t T::*field) {
+  return [&table, field](const auto &visit) {
+    for (size_t i = 1; i <= table.capacity(); i++) {
+      const T *object = table.Current(Id(static_cast<uint32_t>(i)));
+      if (object == nullptr) {
+        continue;
+      }
+      google::protobuf::UInt32Value key, value;
+      key.set_value(static_cast<uint32_t>(i));
+      value.set_value(object->*field);
+      visit(key, value);
+    }
+  };
+}
+
 // A scope table ("sessions": one immutable SessionVersion per scope) and an
 // ordinary resource ("meters") behind the real RPC server and codecs; keys and
 // values travel as UInt32Value messages. The scope table is the in-tree
@@ -437,7 +462,8 @@ class ConsistencyRpcTest : public ::testing::Test {
             },
             [](const UInt32Value &value) -> std::expected<std::any, std::string> {
               return std::any(SessionVersion{value.value()});
-            }));
+            },
+            ReadBack(sessions_, &SessionVersion::epoch)));
     meter_binding_ = bindings_.Bind(
         meters_res_,
         std::make_shared<TypedCodec<UInt32Value, UInt32Value>>(
@@ -447,7 +473,8 @@ class ConsistencyRpcTest : public ::testing::Test {
             },
             [](const UInt32Value &value) -> std::expected<std::any, std::string> {
               return std::any(MeterObject{value.value()});
-            }));
+            },
+            ReadBack(meters_, &MeterObject::rate)));
     service_ = std::make_unique<ControlV2Service>(control_plane_, engine_,
                                                   bindings_);
     grpc::ServerBuilder builder;

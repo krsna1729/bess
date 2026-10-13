@@ -24,6 +24,13 @@ namespace route = bess::route;
 
 const Commands Router::cmds = {};
 
+const ResourceTables Router::resource_tables = {
+    ResourceTable::Map<bess::pb::RouterNextHopIdKey,
+                       bess::pb::RouterNextHopValue>("next_hops"),
+    ResourceTable::Map<bess::pb::RouterRouteKey, bess::pb::RouterRouteValue>(
+        "routes"),
+};
+
 namespace {
 
 // The RPC's neighbor state (D-025). Unset means resolved: a next hop written
@@ -58,6 +65,35 @@ std::expected<bess::utils::Ethernet::Address, std::string> MacFromPb(
   }
   return bess::utils::Ethernet::Address(
       reinterpret_cast<const uint8_t *>(bytes.data()));
+}
+
+// The read-back's canonical next hop (D-129): defaults omitted, as proto3
+// does -- no neighbor when resolved (an unset neighbor means resolved), no
+// MAC when zero, any other MAC as its 6 bytes. A client sending an implied
+// default explicitly (RESOLVED, 6 zero bytes) gets the same next hop, which
+// reads back in this form.
+bess::pb::RouterNextHopValue NextHopToPb(const route::NextHop &hop) {
+  bess::pb::RouterNextHopValue value;
+  value.set_egress_gate(bess::modules::router::GateOf(hop.egress));
+  switch (hop.neighbor) {
+    case route::NeighborState::kResolved:
+      break;
+    case route::NeighborState::kIncomplete:
+      value.set_neighbor(bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE);
+      break;
+    case route::NeighborState::kUnreachable:
+      value.set_neighbor(bess::pb::ROUTER_NEIGHBOR_STATE_UNREACHABLE);
+      break;
+  }
+  if (!hop.dst_mac.IsZero()) {
+    value.set_dst_mac(reinterpret_cast<const char *>(hop.dst_mac.bytes),
+                      bess::utils::Ethernet::Address::kSize);
+  }
+  if (!hop.src_mac.IsZero()) {
+    value.set_src_mac(reinterpret_cast<const char *>(hop.src_mac.bytes),
+                      bess::utils::Ethernet::Address::kSize);
+  }
+  return value;
 }
 
 }  // namespace
@@ -157,6 +193,14 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
             hop.dst_mac = *dst;
             hop.src_mac = *src;
             return std::any(hop);
+          },
+          [this](const auto &visit) {
+            router_->ForEachNextHop(
+                [&visit](route::NextHopId id, const route::NextHop &hop) {
+                  bess::pb::RouterNextHopIdKey key;
+                  key.set_id(id.value());
+                  visit(key, NextHopToPb(hop));
+                });
           }));
   routes_binding_ = init_context().codecs().Bind(
       *router_->routes_resource_object(),
@@ -192,6 +236,21 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
               return std::unexpected("next hop id 0 is invalid");
             }
             return std::any(route::NextHopId(value.next_hop_id()));
+          },
+          // The module binds no groups: every route names a next hop.
+          [this](const auto &visit) {
+            router_->ForEachRoute([&visit](const route::RouteKey &id,
+                                           route::NextHopId hop,
+                                           route::NextHopGroupId) {
+              bess::pb::RouterRouteKey key;
+              key.set_ipv4(bess::utils::ToIpv4Address(
+                  bess::utils::be32_t(id.prefix.addr())));
+              key.set_prefix_length(id.prefix.length());
+              key.set_domain(id.domain.value());
+              bess::pb::RouterRouteValue value;
+              value.set_next_hop_id(hop.value());
+              visit(key, value);
+            });
           }));
 
   next_hop_id_attr_ = AddMetadataAttr("next_hop_id",

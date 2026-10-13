@@ -4,12 +4,18 @@
 
 #include <gtest/gtest.h>
 
+#include "dataplane/transaction_engine.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
 #include "pb/module_msg.pb.h"
+#include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
 
 namespace {
 
+using bess::pb::ArpResponderEntryKey;
+using bess::pb::ArpResponderEntryValue;
 using bess::testing::Bytes;
 using bess::testing::ModuleHarness;
 using bess::testing::PacketBuilder;
@@ -76,6 +82,119 @@ TEST(ArpResponderTest, AnswersEveryRequestOfALongRun) {
     // The reply's target protocol address (offset 14 + 24) is the asker's.
     EXPECT_EQ(static_cast<uint8_t>(i % 250 + 1), out.at(0)[i][14 + 27]) << i;
   }
+}
+
+// Whether `resource`'s codec says it requires paused workers.
+bool RequiresPausedWorkers(const std::string &resource) {
+  const bess::dataplane::Resource *r =
+      bess::runtime::runtime().transactions().FindResource(resource);
+  const bess::framework::ResourceCodec *codec =
+      r == nullptr ? nullptr
+                   : bess::framework::ResourceBindings::ProcessDefault().Find(*r);
+  return codec != nullptr && codec->requires_paused_workers();
+}
+
+ArpResponderEntryKey EntryKey(const std::string &ip) {
+  ArpResponderEntryKey key;
+  key.set_ip(ip);
+  return key;
+}
+
+ArpResponderEntryValue EntryValue(const std::string &mac) {
+  ArpResponderEntryValue value;
+  value.set_mac_addr(mac);
+  return value;
+}
+
+Bytes RequestFor(const std::string &ip) {
+  return PacketBuilder()
+      .Ether("ff:ff:ff:ff:ff:ff", "02:1e:67:9f:4d:ae")
+      .Arp(1, "02:1e:67:9f:4d:ae", "10.0.0.1", "00:00:00:00:00:00", ip)
+      .Build();
+}
+
+// The entries resource (D-129): an upserted entry is answered for, reads back
+// as written, and once erased is not answered for.
+TEST(ArpResponderResourceTest, EntriesAnswerAndReadBack) {
+  ModuleHarness h;
+  Module *arp = h.Create("ArpResponder", bess::pb::ArpResponderArg());
+  ASSERT_NE(nullptr, arp);
+  const std::string entries = arp->name() + "/entries";
+  EXPECT_TRUE(RequiresPausedWorkers(entries));
+  EXPECT_TRUE(h.Run(arp, 0, {RequestFor("1.2.3.4")}, {0})[0].empty());
+
+  const ArpResponderEntryKey key = EntryKey("1.2.3.4");
+  const ArpResponderEntryValue value = EntryValue("a0:22:33:44:55:66");
+  ASSERT_EQ("", h.UpsertResource(entries, key, value));
+  const Bytes reply = PacketBuilder()
+                          .Ether("02:1e:67:9f:4d:ae", "a0:22:33:44:55:66")
+                          .Arp(2, "a0:22:33:44:55:66", "1.2.3.4", "02:1e:67:9f:4d:ae",
+                               "10.0.0.1")
+                          .Build();
+  auto out = h.Run(arp, 0, {RequestFor("1.2.3.4")}, {0});
+  ASSERT_EQ(1u, out[0].size());
+  EXPECT_EQ(reply, out[0][0]);
+  EXPECT_EQ("", h.ReadBackDiffers(entries, {{&key, &value}}));
+
+  // An upsert of the same address replaces its MAC.
+  const ArpResponderEntryValue moved = EntryValue("a0:22:33:44:55:77");
+  ASSERT_EQ("", h.UpsertResource(entries, key, moved));
+  EXPECT_EQ("", h.ReadBackDiffers(entries, {{&key, &moved}}));
+
+  ASSERT_EQ("", h.EraseResource(entries, key));
+  EXPECT_TRUE(h.Run(arp, 0, {RequestFor("1.2.3.4")}, {0})[0].empty());
+  EXPECT_EQ("", h.ReadBackDiffers(entries, {}));
+  EXPECT_NE("", h.EraseResource(entries, key));  // not found
+}
+
+// An upper-case MAC reads back in lower case.
+TEST(ArpResponderResourceTest, EntriesReadBackCanonically) {
+  ModuleHarness h;
+  Module *arp = h.Create("ArpResponder", bess::pb::ArpResponderArg());
+  ASSERT_NE(nullptr, arp);
+  const std::string entries = arp->name() + "/entries";
+  ASSERT_EQ("", h.UpsertResource(entries, EntryKey("10.1.2.3"),
+                                 EntryValue("A0:22:33:44:55:66")));
+  const ArpResponderEntryKey key = EntryKey("10.1.2.3");
+  const ArpResponderEntryValue lower = EntryValue("a0:22:33:44:55:66");
+  EXPECT_EQ("", h.ReadBackDiffers(entries, {{&key, &lower}}));
+}
+
+TEST(ArpResponderResourceTest, EntriesRefuseBadKeysAndValues) {
+  ModuleHarness h;
+  Module *arp = h.Create("ArpResponder", bess::pb::ArpResponderArg());
+  ASSERT_NE(nullptr, arp);
+  const std::string entries = arp->name() + "/entries";
+  const ArpResponderEntryValue value = EntryValue("a0:22:33:44:55:66");
+  EXPECT_NE("", h.UpsertResource(entries, EntryKey(""), value));
+  EXPECT_NE("", h.UpsertResource(entries, EntryKey("1.2.3"), value));
+  EXPECT_NE("", h.UpsertResource(entries, EntryKey("1.2.3.4"), EntryValue("nope")));
+  EXPECT_NE("", h.UpsertResource(entries, EntryKey("1.2.3.4"), EntryValue("")));
+  EXPECT_EQ("", h.ReadBackDiffers(entries, {}));
+}
+
+// `add` is legacy only; what it and the init argument add is what the
+// resource reads back.
+TEST(ArpResponderResourceTest, AddIsLegacyOnly) {
+  ModuleHarness h;
+  bess::pb::ArpResponderArg init;
+  init.set_ip("1.2.3.4");
+  init.set_mac_addr("a0:22:33:44:55:66");
+  Module *arp = h.Create("ArpResponder", init);
+  ASSERT_NE(nullptr, arp);
+  const std::string entries = arp->name() + "/entries";
+
+  bess::pb::ArpResponderArg add;
+  add.set_ip("5.6.7.8");
+  add.set_mac_addr("02:00:00:00:00:08");
+  EXPECT_EQ(ENOTSUP, h.Action(arp, "add", add).error().code());
+  h.MustCommand(arp, "add", add);
+  const ArpResponderEntryKey init_key = EntryKey("1.2.3.4");
+  const ArpResponderEntryValue init_value = EntryValue("a0:22:33:44:55:66");
+  const ArpResponderEntryKey added_key = EntryKey("5.6.7.8");
+  const ArpResponderEntryValue added_value = EntryValue("02:00:00:00:00:08");
+  EXPECT_EQ("", h.ReadBackDiffers(entries, {{&init_key, &init_value},
+                                            {&added_key, &added_value}}));
 }
 
 }  // namespace

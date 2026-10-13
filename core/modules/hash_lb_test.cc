@@ -15,7 +15,11 @@
 #include <string>
 #include <vector>
 
+#include "dataplane/transaction_engine.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
 #include "pb/module_msg.pb.h"
+#include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
 
@@ -105,6 +109,116 @@ TEST(HashLbTest, GatesAndModes) {
   EXPECT_TRUE(std::includes(allowed.begin(), allowed.end(), used.begin(), used.end()));
   EXPECT_EQ(EINVAL, h.Command(lb, "set_mode", Mode("bogus")).error().code());
   EXPECT_EQ(l3, h.Run(lb, 0, pkts, kGates)) << "a refused mode changes nothing";
+}
+
+// -- "<name>/settings" (D-129) ---------------------------------------------------
+
+bess::pb::HashLBSettings LbSettings(const std::string &mode,
+                                    std::initializer_list<int64_t> gates) {
+  bess::pb::HashLBSettings s;
+  s.set_mode(mode);
+  for (int64_t g : gates) {
+    s.add_gates(g);
+  }
+  return s;
+}
+
+bess::pb::HashLBArg LbArg(std::initializer_list<int64_t> gates) {
+  bess::pb::HashLBArg arg;
+  for (int64_t g : gates) {
+    arg.add_gates(g);
+  }
+  return arg;
+}
+
+// True when "<resource>"'s codec says applying it requires paused workers.
+bool RequiresPausedWorkers(const std::string &resource) {
+  const bess::dataplane::Resource *r =
+      bess::runtime::runtime().transactions().FindResource(resource);
+  EXPECT_NE(nullptr, r) << resource;
+  if (r == nullptr) {
+    return false;
+  }
+  const bess::framework::ResourceCodec *codec =
+      bess::framework::ResourceBindings::ProcessDefault().Find(*r);
+  EXPECT_NE(nullptr, codec) << resource;
+  return codec != nullptr && codec->requires_paused_workers();
+}
+
+TEST(HashLbSettingsTest, GatesAndModeDecideTheOutputGate) {
+  const std::vector<Bytes> pkts = Flows();
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
+  ASSERT_NE(nullptr, lb);
+
+  ASSERT_EQ("", h.SetResource("lb/settings", LbSettings("l4", {3, 4, 5})));
+  EXPECT_EQ((std::set<gate_idx_t>{3, 4, 5}), GatesUsed(h.Run(lb, 0, pkts, kGates), pkts));
+
+  // Every flow has the same destination: a custom tuple over the
+  // destination address alone sends them all to one gate.
+  bess::pb::HashLBSettings dst_only = LbSettings("", {3, 4, 5});
+  bess::pb::Field *field = dst_only.add_fields();
+  field->set_offset(30);  // IPv4 destination
+  field->set_num_bytes(4);
+  ASSERT_EQ("", h.SetResource("lb/settings", dst_only));
+  EXPECT_EQ(1u, GatesUsed(h.Run(lb, 0, pkts, kGates), pkts).size());
+
+  ASSERT_EQ("", h.SetResource("lb/settings", LbSettings("l3", {6})));
+  EXPECT_EQ((std::set<gate_idx_t>{6}), GatesUsed(h.Run(lb, 0, pkts, kGates), pkts));
+}
+
+TEST(HashLbSettingsTest, ReadBackRoundTrips) {
+  ModuleHarness h;
+  ASSERT_NE(nullptr, h.Create("HashLB", LbArg({1, 2}), "lb"));
+  const bess::pb::HashLBSettings initial = LbSettings("l4", {1, 2});
+  EXPECT_EQ("", h.ReadBackDiffers("lb/settings", {{nullptr, &initial}}))
+      << "no mode given: l4";
+  const bess::pb::HashLBSettings s = LbSettings("l2", {0, 7, 9});
+  ASSERT_EQ("", h.SetResource("lb/settings", s));
+  EXPECT_EQ("", h.ReadBackDiffers("lb/settings", {{nullptr, &s}}));
+
+  bess::pb::HashLBSettings fields = LbSettings("", {2});
+  bess::pb::Field *f = fields.add_fields();
+  f->set_offset(26);
+  f->set_num_bytes(8);
+  ASSERT_EQ("", h.SetResource("lb/settings", fields));
+  EXPECT_EQ("", h.ReadBackDiffers("lb/settings", {{nullptr, &fields}}));
+}
+
+TEST(HashLbSettingsTest, BadValuesRefused) {
+  const std::vector<Bytes> pkts = Flows();
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
+  ASSERT_NE(nullptr, lb);
+  const auto before = h.Run(lb, 0, pkts, kGates);
+  EXPECT_NE("", h.SetResource("lb/settings", LbSettings("l4", {})));
+  EXPECT_NE("", h.SetResource("lb/settings", LbSettings("l4", {65536})))
+      << "not narrowed to gate 0";
+  EXPECT_NE("", h.SetResource("lb/settings", LbSettings("l4", {3, 70000})));
+  EXPECT_NE("", h.SetResource("lb/settings", LbSettings("bogus", {3})));
+  EXPECT_NE("", h.SetResource("lb/settings", LbSettings("", {3})));
+  const bess::pb::HashLBSettings unchanged = LbSettings("l4", {1, 2});
+  EXPECT_EQ("", h.ReadBackDiffers("lb/settings", {{nullptr, &unchanged}}));
+  EXPECT_EQ(before, h.Run(lb, 0, pkts, kGates)) << "refused values change nothing";
+}
+
+TEST(HashLbSettingsTest, AppliesLive) {
+  ModuleHarness h;
+  ASSERT_NE(nullptr, h.Create("HashLB", LbArg({1, 2}), "lb"));
+  EXPECT_FALSE(RequiresPausedWorkers("lb/settings"));
+}
+
+TEST(HashLbSettingsTest, SettersAreLegacyOnly) {
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
+  ASSERT_NE(nullptr, lb);
+  EXPECT_EQ(ENOTSUP, h.Action(lb, "set_gates", Gates({3})).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(lb, "set_mode", Mode("l2")).error().code());
+  // The legacy commands still run, and the resource reads what they set.
+  h.MustCommand(lb, "set_gates", Gates({3}));
+  h.MustCommand(lb, "set_mode", Mode("l2"));
+  const bess::pb::HashLBSettings s = LbSettings("l2", {3});
+  EXPECT_EQ("", h.ReadBackDiffers("lb/settings", {{nullptr, &s}}));
 }
 
 }  // namespace

@@ -34,6 +34,7 @@ const (
 	ObjectType_WORKER                  ObjectType = 4
 	ObjectType_TRAFFIC_CLASS           ObjectType = 5
 	ObjectType_TASK                    ObjectType = 6 // a module task's placement; object "module:task"
+	ObjectType_RESOURCE                ObjectType = 7 // a resource's contents; object its name
 )
 
 // Enum value maps for ObjectType.
@@ -46,6 +47,7 @@ var (
 		4: "WORKER",
 		5: "TRAFFIC_CLASS",
 		6: "TASK",
+		7: "RESOURCE",
 	}
 	ObjectType_value = map[string]int32{
 		"OBJECT_TYPE_UNSPECIFIED": 0,
@@ -55,6 +57,7 @@ var (
 		"WORKER":                  4,
 		"TRAFFIC_CLASS":           5,
 		"TASK":                    6,
+		"RESOURCE":                7,
 	}
 )
 
@@ -264,7 +267,7 @@ func (x ErrorDetail_Code) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ErrorDetail_Code.Descriptor instead.
 func (ErrorDetail_Code) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{21, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{24, 0}
 }
 
 // How the transaction must become visible to packets (M8, D-050). Two
@@ -328,7 +331,7 @@ func (x ApplyTransactionRequest_Consistency) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ApplyTransactionRequest_Consistency.Descriptor instead.
 func (ApplyTransactionRequest_Consistency) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{23, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{26, 0}
 }
 
 // Zero is never sent: an unset status must not read as success.
@@ -381,7 +384,7 @@ func (x TransactionOpResult_Status) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TransactionOpResult_Status.Descriptor instead.
 func (TransactionOpResult_Status) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{24, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{27, 0}
 }
 
 // Zero is never sent: an unset outcome must not read as applied.
@@ -440,7 +443,7 @@ func (x TransactionRecord_Outcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TransactionRecord_Outcome.Descriptor instead.
 func (TransactionRecord_Outcome) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{25, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{28, 0}
 }
 
 // The consistency level the transaction ran under (it describes what
@@ -508,7 +511,56 @@ func (x TransactionRecord_Visibility) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TransactionRecord_Visibility.Descriptor instead.
 func (TransactionRecord_Visibility) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{25, 1}
+	return file_control_v2_proto_rawDescGZIP(), []int{28, 1}
+}
+
+type TransactionResource_Kind int32
+
+const (
+	TransactionResource_KIND_UNSPECIFIED TransactionResource_Kind = 0 // from a daemon before D-129: a map
+	TransactionResource_KIND_MAP         TransactionResource_Kind = 1
+	TransactionResource_KIND_SINGLETON   TransactionResource_Kind = 2
+)
+
+// Enum value maps for TransactionResource_Kind.
+var (
+	TransactionResource_Kind_name = map[int32]string{
+		0: "KIND_UNSPECIFIED",
+		1: "KIND_MAP",
+		2: "KIND_SINGLETON",
+	}
+	TransactionResource_Kind_value = map[string]int32{
+		"KIND_UNSPECIFIED": 0,
+		"KIND_MAP":         1,
+		"KIND_SINGLETON":   2,
+	}
+)
+
+func (x TransactionResource_Kind) Enum() *TransactionResource_Kind {
+	p := new(TransactionResource_Kind)
+	*p = x
+	return p
+}
+
+func (x TransactionResource_Kind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (TransactionResource_Kind) Descriptor() protoreflect.EnumDescriptor {
+	return file_control_v2_proto_enumTypes[8].Descriptor()
+}
+
+func (TransactionResource_Kind) Type() protoreflect.EnumType {
+	return &file_control_v2_proto_enumTypes[8]
+}
+
+func (x TransactionResource_Kind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use TransactionResource_Kind.Descriptor instead.
+func (TransactionResource_Kind) EnumDescriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{33, 0}
 }
 
 type MetricSample_Kind int32
@@ -544,11 +596,11 @@ func (x MetricSample_Kind) String() string {
 }
 
 func (MetricSample_Kind) Descriptor() protoreflect.EnumDescriptor {
-	return file_control_v2_proto_enumTypes[8].Descriptor()
+	return file_control_v2_proto_enumTypes[9].Descriptor()
 }
 
 func (MetricSample_Kind) Type() protoreflect.EnumType {
-	return &file_control_v2_proto_enumTypes[8]
+	return &file_control_v2_proto_enumTypes[9]
 }
 
 func (x MetricSample_Kind) Number() protoreflect.EnumNumber {
@@ -557,7 +609,7 @@ func (x MetricSample_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MetricSample_Kind.Descriptor instead.
 func (MetricSample_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{44, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{48, 0}
 }
 
 type SetCaptureRequest_Direction int32
@@ -593,11 +645,11 @@ func (x SetCaptureRequest_Direction) String() string {
 }
 
 func (SetCaptureRequest_Direction) Descriptor() protoreflect.EnumDescriptor {
-	return file_control_v2_proto_enumTypes[9].Descriptor()
+	return file_control_v2_proto_enumTypes[10].Descriptor()
 }
 
 func (SetCaptureRequest_Direction) Type() protoreflect.EnumType {
-	return &file_control_v2_proto_enumTypes[9]
+	return &file_control_v2_proto_enumTypes[10]
 }
 
 func (x SetCaptureRequest_Direction) Number() protoreflect.EnumNumber {
@@ -606,7 +658,7 @@ func (x SetCaptureRequest_Direction) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SetCaptureRequest_Direction.Descriptor instead.
 func (SetCaptureRequest_Direction) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{58, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{62, 0}
 }
 
 type SetCaptureRequest_Format int32
@@ -642,11 +694,11 @@ func (x SetCaptureRequest_Format) String() string {
 }
 
 func (SetCaptureRequest_Format) Descriptor() protoreflect.EnumDescriptor {
-	return file_control_v2_proto_enumTypes[10].Descriptor()
+	return file_control_v2_proto_enumTypes[11].Descriptor()
 }
 
 func (SetCaptureRequest_Format) Type() protoreflect.EnumType {
-	return &file_control_v2_proto_enumTypes[10]
+	return &file_control_v2_proto_enumTypes[11]
 }
 
 func (x SetCaptureRequest_Format) Number() protoreflect.EnumNumber {
@@ -655,7 +707,7 @@ func (x SetCaptureRequest_Format) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SetCaptureRequest_Format.Descriptor instead.
 func (SetCaptureRequest_Format) EnumDescriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{58, 1}
+	return file_control_v2_proto_rawDescGZIP(), []int{62, 1}
 }
 
 type Port struct {
@@ -1150,6 +1202,116 @@ func (x *TaskPlacement) GetShare() int64 {
 	return 0
 }
 
+// A resource's contents as desired state (D-129): `name` is a transaction
+// resource ("<module>/<table>", ListTransactionResources and GetSchema name
+// them). A map resource has one entry per key; a singleton has exactly one
+// entry, with no key. A pipeline that lists a resource owns its contents: the
+// apply converges it to exactly these entries (an empty list clears a map).
+// A resource the pipeline does not list is left as it is.
+type ResourceEntry struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           *anypb.Any             `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`     // the resource's key type; unset for a singleton
+	Value         *anypb.Any             `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"` // the resource's value type
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResourceEntry) Reset() {
+	*x = ResourceEntry{}
+	mi := &file_control_v2_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResourceEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResourceEntry) ProtoMessage() {}
+
+func (x *ResourceEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v2_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResourceEntry.ProtoReflect.Descriptor instead.
+func (*ResourceEntry) Descriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *ResourceEntry) GetKey() *anypb.Any {
+	if x != nil {
+		return x.Key
+	}
+	return nil
+}
+
+func (x *ResourceEntry) GetValue() *anypb.Any {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+type ResourceContents struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Entries       []*ResourceEntry       `protobuf:"bytes,2,rep,name=entries,proto3" json:"entries,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResourceContents) Reset() {
+	*x = ResourceContents{}
+	mi := &file_control_v2_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResourceContents) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResourceContents) ProtoMessage() {}
+
+func (x *ResourceContents) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v2_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResourceContents.ProtoReflect.Descriptor instead.
+func (*ResourceContents) Descriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *ResourceContents) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *ResourceContents) GetEntries() []*ResourceEntry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
 type Pipeline struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Ports          []*Port                `protobuf:"bytes,1,rep,name=ports,proto3" json:"ports,omitempty"`
@@ -1158,13 +1320,14 @@ type Pipeline struct {
 	Workers        []*Worker              `protobuf:"bytes,4,rep,name=workers,proto3" json:"workers,omitempty"`
 	TrafficClasses []*TrafficClass        `protobuf:"bytes,5,rep,name=traffic_classes,json=trafficClasses,proto3" json:"traffic_classes,omitempty"`
 	Tasks          []*TaskPlacement       `protobuf:"bytes,6,rep,name=tasks,proto3" json:"tasks,omitempty"`
+	Resources      []*ResourceContents    `protobuf:"bytes,7,rep,name=resources,proto3" json:"resources,omitempty"` // sorted by name once validated
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Pipeline) Reset() {
 	*x = Pipeline{}
-	mi := &file_control_v2_proto_msgTypes[6]
+	mi := &file_control_v2_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1176,7 +1339,7 @@ func (x *Pipeline) String() string {
 func (*Pipeline) ProtoMessage() {}
 
 func (x *Pipeline) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[6]
+	mi := &file_control_v2_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1189,7 +1352,7 @@ func (x *Pipeline) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Pipeline.ProtoReflect.Descriptor instead.
 func (*Pipeline) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{6}
+	return file_control_v2_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *Pipeline) GetPorts() []*Port {
@@ -1234,6 +1397,13 @@ func (x *Pipeline) GetTasks() []*TaskPlacement {
 	return nil
 }
 
+func (x *Pipeline) GetResources() []*ResourceContents {
+	if x != nil {
+		return x.Resources
+	}
+	return nil
+}
+
 type Change struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Type  ObjectType             `protobuf:"varint,1,opt,name=type,proto3,enum=bess.pb.v2.ObjectType" json:"type,omitempty"`
@@ -1247,7 +1417,7 @@ type Change struct {
 
 func (x *Change) Reset() {
 	*x = Change{}
-	mi := &file_control_v2_proto_msgTypes[7]
+	mi := &file_control_v2_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1259,7 +1429,7 @@ func (x *Change) String() string {
 func (*Change) ProtoMessage() {}
 
 func (x *Change) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[7]
+	mi := &file_control_v2_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1272,7 +1442,7 @@ func (x *Change) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Change.ProtoReflect.Descriptor instead.
 func (*Change) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{7}
+	return file_control_v2_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *Change) GetType() ObjectType {
@@ -1296,16 +1466,97 @@ func (x *Change) GetKind() ChangeKind {
 	return ChangeKind_CHANGE_KIND_UNSPECIFIED
 }
 
+// What converging a listed resource changes, by entries.
+type ResourceDelta struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Name    string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Created uint64                 `protobuf:"varint,2,opt,name=created,proto3" json:"created,omitempty"`
+	Updated uint64                 `protobuf:"varint,3,opt,name=updated,proto3" json:"updated,omitempty"`
+	Removed uint64                 `protobuf:"varint,4,opt,name=removed,proto3" json:"removed,omitempty"`
+	// False: the resource does not exist yet (its module is created or
+	// replaced by the same apply), so every entry counts as created and the
+	// entries' keys are checked only when the apply commits them.
+	Checked       bool `protobuf:"varint,5,opt,name=checked,proto3" json:"checked,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResourceDelta) Reset() {
+	*x = ResourceDelta{}
+	mi := &file_control_v2_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResourceDelta) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResourceDelta) ProtoMessage() {}
+
+func (x *ResourceDelta) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v2_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResourceDelta.ProtoReflect.Descriptor instead.
+func (*ResourceDelta) Descriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ResourceDelta) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *ResourceDelta) GetCreated() uint64 {
+	if x != nil {
+		return x.Created
+	}
+	return 0
+}
+
+func (x *ResourceDelta) GetUpdated() uint64 {
+	if x != nil {
+		return x.Updated
+	}
+	return 0
+}
+
+func (x *ResourceDelta) GetRemoved() uint64 {
+	if x != nil {
+		return x.Removed
+	}
+	return 0
+}
+
+func (x *ResourceDelta) GetChecked() bool {
+	if x != nil {
+		return x.Checked
+	}
+	return false
+}
+
 type PipelineDiff struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Changes       []*Change              `protobuf:"bytes,1,rep,name=changes,proto3" json:"changes,omitempty"` // unchanged objects are not listed
+	Changes       []*Change              `protobuf:"bytes,1,rep,name=changes,proto3" json:"changes,omitempty"`     // unchanged objects are not listed
+	Resources     []*ResourceDelta       `protobuf:"bytes,2,rep,name=resources,proto3" json:"resources,omitempty"` // listed resources that change
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PipelineDiff) Reset() {
 	*x = PipelineDiff{}
-	mi := &file_control_v2_proto_msgTypes[8]
+	mi := &file_control_v2_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1317,7 +1568,7 @@ func (x *PipelineDiff) String() string {
 func (*PipelineDiff) ProtoMessage() {}
 
 func (x *PipelineDiff) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[8]
+	mi := &file_control_v2_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1330,12 +1581,19 @@ func (x *PipelineDiff) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PipelineDiff.ProtoReflect.Descriptor instead.
 func (*PipelineDiff) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{8}
+	return file_control_v2_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *PipelineDiff) GetChanges() []*Change {
 	if x != nil {
 		return x.Changes
+	}
+	return nil
+}
+
+func (x *PipelineDiff) GetResources() []*ResourceDelta {
+	if x != nil {
+		return x.Resources
 	}
 	return nil
 }
@@ -1352,7 +1610,7 @@ type PlanStep struct {
 
 func (x *PlanStep) Reset() {
 	*x = PlanStep{}
-	mi := &file_control_v2_proto_msgTypes[9]
+	mi := &file_control_v2_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1364,7 +1622,7 @@ func (x *PlanStep) String() string {
 func (*PlanStep) ProtoMessage() {}
 
 func (x *PlanStep) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[9]
+	mi := &file_control_v2_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1377,7 +1635,7 @@ func (x *PlanStep) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanStep.ProtoReflect.Descriptor instead.
 func (*PlanStep) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{9}
+	return file_control_v2_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *PlanStep) GetPhase() PlanPhase {
@@ -1423,7 +1681,7 @@ type WorkerPlacement struct {
 
 func (x *WorkerPlacement) Reset() {
 	*x = WorkerPlacement{}
-	mi := &file_control_v2_proto_msgTypes[10]
+	mi := &file_control_v2_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1435,7 +1693,7 @@ func (x *WorkerPlacement) String() string {
 func (*WorkerPlacement) ProtoMessage() {}
 
 func (x *WorkerPlacement) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[10]
+	mi := &file_control_v2_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1448,7 +1706,7 @@ func (x *WorkerPlacement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkerPlacement.ProtoReflect.Descriptor instead.
 func (*WorkerPlacement) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{10}
+	return file_control_v2_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *WorkerPlacement) GetWid() int32 {
@@ -1493,15 +1751,21 @@ func (x *WorkerPlacement) GetOnControlCpu() bool {
 	return false
 }
 
+// With include_resources, the pipeline lists its resources' contents too
+// (every resource, or those named in `resources`), so a manifest read back
+// and applied again changes nothing. A response above the message limit is
+// RESOURCE_EXHAUSTED: name fewer resources.
 type GetPipelineRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	IncludeResources bool                   `protobuf:"varint,1,opt,name=include_resources,json=includeResources,proto3" json:"include_resources,omitempty"`
+	Resources        []string               `protobuf:"bytes,2,rep,name=resources,proto3" json:"resources,omitempty"` // with include_resources: only these (empty: all)
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *GetPipelineRequest) Reset() {
 	*x = GetPipelineRequest{}
-	mi := &file_control_v2_proto_msgTypes[11]
+	mi := &file_control_v2_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1513,7 +1777,7 @@ func (x *GetPipelineRequest) String() string {
 func (*GetPipelineRequest) ProtoMessage() {}
 
 func (x *GetPipelineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[11]
+	mi := &file_control_v2_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1526,24 +1790,41 @@ func (x *GetPipelineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPipelineRequest.ProtoReflect.Descriptor instead.
 func (*GetPipelineRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{11}
+	return file_control_v2_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *GetPipelineRequest) GetIncludeResources() bool {
+	if x != nil {
+		return x.IncludeResources
+	}
+	return false
+}
+
+func (x *GetPipelineRequest) GetResources() []string {
+	if x != nil {
+		return x.Resources
+	}
+	return nil
 }
 
 type GetPipelineResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The active runtime as desired state; every worker with the core it runs
 	// on, an automatic one included.
-	Pipeline      *Pipeline          `protobuf:"bytes,1,opt,name=pipeline,proto3" json:"pipeline,omitempty"`
-	Generation    uint64             `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"`
-	DaemonEpoch   uint64             `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
-	Workers       []*WorkerPlacement `protobuf:"bytes,4,rep,name=workers,proto3" json:"workers,omitempty"` // observed, by wid
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Pipeline    *Pipeline          `protobuf:"bytes,1,opt,name=pipeline,proto3" json:"pipeline,omitempty"`
+	Generation  uint64             `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"`
+	DaemonEpoch uint64             `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
+	Workers     []*WorkerPlacement `protobuf:"bytes,4,rep,name=workers,proto3" json:"workers,omitempty"` // observed, by wid
+	// The dataplane transaction generation (ApplyTransaction's) the resource
+	// contents were read at.
+	ResourceGeneration uint64 `protobuf:"varint,5,opt,name=resource_generation,json=resourceGeneration,proto3" json:"resource_generation,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *GetPipelineResponse) Reset() {
 	*x = GetPipelineResponse{}
-	mi := &file_control_v2_proto_msgTypes[12]
+	mi := &file_control_v2_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1555,7 +1836,7 @@ func (x *GetPipelineResponse) String() string {
 func (*GetPipelineResponse) ProtoMessage() {}
 
 func (x *GetPipelineResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[12]
+	mi := &file_control_v2_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1568,7 +1849,7 @@ func (x *GetPipelineResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPipelineResponse.ProtoReflect.Descriptor instead.
 func (*GetPipelineResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{12}
+	return file_control_v2_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *GetPipelineResponse) GetPipeline() *Pipeline {
@@ -1599,6 +1880,13 @@ func (x *GetPipelineResponse) GetWorkers() []*WorkerPlacement {
 	return nil
 }
 
+func (x *GetPipelineResponse) GetResourceGeneration() uint64 {
+	if x != nil {
+		return x.ResourceGeneration
+	}
+	return 0
+}
+
 type ValidatePipelineRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Pipeline      *Pipeline              `protobuf:"bytes,1,opt,name=pipeline,proto3" json:"pipeline,omitempty"`
@@ -1608,7 +1896,7 @@ type ValidatePipelineRequest struct {
 
 func (x *ValidatePipelineRequest) Reset() {
 	*x = ValidatePipelineRequest{}
-	mi := &file_control_v2_proto_msgTypes[13]
+	mi := &file_control_v2_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1620,7 +1908,7 @@ func (x *ValidatePipelineRequest) String() string {
 func (*ValidatePipelineRequest) ProtoMessage() {}
 
 func (x *ValidatePipelineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[13]
+	mi := &file_control_v2_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1633,7 +1921,7 @@ func (x *ValidatePipelineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ValidatePipelineRequest.ProtoReflect.Descriptor instead.
 func (*ValidatePipelineRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{13}
+	return file_control_v2_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ValidatePipelineRequest) GetPipeline() *Pipeline {
@@ -1652,7 +1940,7 @@ type ValidatePipelineResponse struct {
 
 func (x *ValidatePipelineResponse) Reset() {
 	*x = ValidatePipelineResponse{}
-	mi := &file_control_v2_proto_msgTypes[14]
+	mi := &file_control_v2_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1664,7 +1952,7 @@ func (x *ValidatePipelineResponse) String() string {
 func (*ValidatePipelineResponse) ProtoMessage() {}
 
 func (x *ValidatePipelineResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[14]
+	mi := &file_control_v2_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1677,7 +1965,7 @@ func (x *ValidatePipelineResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ValidatePipelineResponse.ProtoReflect.Descriptor instead.
 func (*ValidatePipelineResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{14}
+	return file_control_v2_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ValidatePipelineResponse) GetNormalized() *Pipeline {
@@ -1696,7 +1984,7 @@ type DiffPipelineRequest struct {
 
 func (x *DiffPipelineRequest) Reset() {
 	*x = DiffPipelineRequest{}
-	mi := &file_control_v2_proto_msgTypes[15]
+	mi := &file_control_v2_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1708,7 +1996,7 @@ func (x *DiffPipelineRequest) String() string {
 func (*DiffPipelineRequest) ProtoMessage() {}
 
 func (x *DiffPipelineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[15]
+	mi := &file_control_v2_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1721,7 +2009,7 @@ func (x *DiffPipelineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffPipelineRequest.ProtoReflect.Descriptor instead.
 func (*DiffPipelineRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{15}
+	return file_control_v2_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *DiffPipelineRequest) GetPipeline() *Pipeline {
@@ -1732,17 +2020,18 @@ func (x *DiffPipelineRequest) GetPipeline() *Pipeline {
 }
 
 type DiffPipelineResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Diff          *PipelineDiff          `protobuf:"bytes,1,opt,name=diff,proto3" json:"diff,omitempty"`
-	Generation    uint64                 `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"` // the active generation the diff was taken against
-	DaemonEpoch   uint64                 `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	Diff               *PipelineDiff          `protobuf:"bytes,1,opt,name=diff,proto3" json:"diff,omitempty"`
+	Generation         uint64                 `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"` // the active generation the diff was taken against
+	DaemonEpoch        uint64                 `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
+	ResourceGeneration uint64                 `protobuf:"varint,4,opt,name=resource_generation,json=resourceGeneration,proto3" json:"resource_generation,omitempty"` // and the dataplane transaction generation
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *DiffPipelineResponse) Reset() {
 	*x = DiffPipelineResponse{}
-	mi := &file_control_v2_proto_msgTypes[16]
+	mi := &file_control_v2_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1754,7 +2043,7 @@ func (x *DiffPipelineResponse) String() string {
 func (*DiffPipelineResponse) ProtoMessage() {}
 
 func (x *DiffPipelineResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[16]
+	mi := &file_control_v2_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1767,7 +2056,7 @@ func (x *DiffPipelineResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffPipelineResponse.ProtoReflect.Descriptor instead.
 func (*DiffPipelineResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{16}
+	return file_control_v2_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *DiffPipelineResponse) GetDiff() *PipelineDiff {
@@ -1791,6 +2080,13 @@ func (x *DiffPipelineResponse) GetDaemonEpoch() uint64 {
 	return 0
 }
 
+func (x *DiffPipelineResponse) GetResourceGeneration() uint64 {
+	if x != nil {
+		return x.ResourceGeneration
+	}
+	return 0
+}
+
 type PlanPipelineRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Pipeline      *Pipeline              `protobuf:"bytes,1,opt,name=pipeline,proto3" json:"pipeline,omitempty"`
@@ -1800,7 +2096,7 @@ type PlanPipelineRequest struct {
 
 func (x *PlanPipelineRequest) Reset() {
 	*x = PlanPipelineRequest{}
-	mi := &file_control_v2_proto_msgTypes[17]
+	mi := &file_control_v2_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1812,7 +2108,7 @@ func (x *PlanPipelineRequest) String() string {
 func (*PlanPipelineRequest) ProtoMessage() {}
 
 func (x *PlanPipelineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[17]
+	mi := &file_control_v2_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1825,7 +2121,7 @@ func (x *PlanPipelineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanPipelineRequest.ProtoReflect.Descriptor instead.
 func (*PlanPipelineRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{17}
+	return file_control_v2_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *PlanPipelineRequest) GetPipeline() *Pipeline {
@@ -1836,17 +2132,18 @@ func (x *PlanPipelineRequest) GetPipeline() *Pipeline {
 }
 
 type PlanPipelineResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Steps         []*PlanStep            `protobuf:"bytes,1,rep,name=steps,proto3" json:"steps,omitempty"`
-	Generation    uint64                 `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"`
-	DaemonEpoch   uint64                 `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	Steps              []*PlanStep            `protobuf:"bytes,1,rep,name=steps,proto3" json:"steps,omitempty"`
+	Generation         uint64                 `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"`
+	DaemonEpoch        uint64                 `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
+	ResourceGeneration uint64                 `protobuf:"varint,4,opt,name=resource_generation,json=resourceGeneration,proto3" json:"resource_generation,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *PlanPipelineResponse) Reset() {
 	*x = PlanPipelineResponse{}
-	mi := &file_control_v2_proto_msgTypes[18]
+	mi := &file_control_v2_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1858,7 +2155,7 @@ func (x *PlanPipelineResponse) String() string {
 func (*PlanPipelineResponse) ProtoMessage() {}
 
 func (x *PlanPipelineResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[18]
+	mi := &file_control_v2_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1871,7 +2168,7 @@ func (x *PlanPipelineResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanPipelineResponse.ProtoReflect.Descriptor instead.
 func (*PlanPipelineResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{18}
+	return file_control_v2_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *PlanPipelineResponse) GetSteps() []*PlanStep {
@@ -1895,6 +2192,17 @@ func (x *PlanPipelineResponse) GetDaemonEpoch() uint64 {
 	return 0
 }
 
+func (x *PlanPipelineResponse) GetResourceGeneration() uint64 {
+	if x != nil {
+		return x.ResourceGeneration
+	}
+	return 0
+}
+
+// The pipeline's topology first, then its listed resources in one dataplane
+// transaction (after the topology commit, before what it replaced retires):
+// the resources of a module the apply creates exist only then. If the
+// resource transaction is refused, the topology is rolled back too.
 type ApplyPipelineRequest struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	Pipeline *Pipeline              `protobuf:"bytes,1,opt,name=pipeline,proto3" json:"pipeline,omitempty"`
@@ -1905,14 +2213,16 @@ type ApplyPipelineRequest struct {
 	// built under, from any earlier answer. Zero: INVALID_ARGUMENT (field
 	// "daemon_epoch"); another epoch: FAILED_PRECONDITION with error detail
 	// EPOCH_MISMATCH, before any side effect (D-106).
-	DaemonEpoch   uint64 `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	DaemonEpoch uint64 `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
+	// The same for the dataplane transaction generation (resource contents).
+	ExpectedResourceGeneration *uint64 `protobuf:"varint,4,opt,name=expected_resource_generation,json=expectedResourceGeneration,proto3,oneof" json:"expected_resource_generation,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *ApplyPipelineRequest) Reset() {
 	*x = ApplyPipelineRequest{}
-	mi := &file_control_v2_proto_msgTypes[19]
+	mi := &file_control_v2_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1924,7 +2234,7 @@ func (x *ApplyPipelineRequest) String() string {
 func (*ApplyPipelineRequest) ProtoMessage() {}
 
 func (x *ApplyPipelineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[19]
+	mi := &file_control_v2_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1937,7 +2247,7 @@ func (x *ApplyPipelineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyPipelineRequest.ProtoReflect.Descriptor instead.
 func (*ApplyPipelineRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{19}
+	return file_control_v2_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ApplyPipelineRequest) GetPipeline() *Pipeline {
@@ -1961,23 +2271,34 @@ func (x *ApplyPipelineRequest) GetDaemonEpoch() uint64 {
 	return 0
 }
 
+func (x *ApplyPipelineRequest) GetExpectedResourceGeneration() uint64 {
+	if x != nil && x.ExpectedResourceGeneration != nil {
+		return *x.ExpectedResourceGeneration
+	}
+	return 0
+}
+
 type ApplyPipelineResponse struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Generation     uint64                 `protobuf:"varint,1,opt,name=generation,proto3" json:"generation,omitempty"` // after the apply (unchanged for a no-op)
-	AppliedOps     uint64                 `protobuf:"varint,2,opt,name=applied_ops,json=appliedOps,proto3" json:"applied_ops,omitempty"`
-	WorkersPaused  bool                   `protobuf:"varint,3,opt,name=workers_paused,json=workersPaused,proto3" json:"workers_paused,omitempty"`
-	ValidationUs   uint64                 `protobuf:"varint,4,opt,name=validation_us,json=validationUs,proto3" json:"validation_us,omitempty"`
-	PrepareUs      uint64                 `protobuf:"varint,5,opt,name=prepare_us,json=prepareUs,proto3" json:"prepare_us,omitempty"`
-	PausedCommitUs uint64                 `protobuf:"varint,6,opt,name=paused_commit_us,json=pausedCommitUs,proto3" json:"paused_commit_us,omitempty"`
-	RetireUs       uint64                 `protobuf:"varint,7,opt,name=retire_us,json=retireUs,proto3" json:"retire_us,omitempty"`
-	DaemonEpoch    uint64                 `protobuf:"varint,8,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// After the apply (unchanged for a no-op, and when only resource contents
+	// changed: resource_generation counts those).
+	Generation         uint64 `protobuf:"varint,1,opt,name=generation,proto3" json:"generation,omitempty"`
+	AppliedOps         uint64 `protobuf:"varint,2,opt,name=applied_ops,json=appliedOps,proto3" json:"applied_ops,omitempty"`
+	WorkersPaused      bool   `protobuf:"varint,3,opt,name=workers_paused,json=workersPaused,proto3" json:"workers_paused,omitempty"`
+	ValidationUs       uint64 `protobuf:"varint,4,opt,name=validation_us,json=validationUs,proto3" json:"validation_us,omitempty"`
+	PrepareUs          uint64 `protobuf:"varint,5,opt,name=prepare_us,json=prepareUs,proto3" json:"prepare_us,omitempty"`
+	PausedCommitUs     uint64 `protobuf:"varint,6,opt,name=paused_commit_us,json=pausedCommitUs,proto3" json:"paused_commit_us,omitempty"`
+	RetireUs           uint64 `protobuf:"varint,7,opt,name=retire_us,json=retireUs,proto3" json:"retire_us,omitempty"`
+	DaemonEpoch        uint64 `protobuf:"varint,8,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
+	ResourceGeneration uint64 `protobuf:"varint,9,opt,name=resource_generation,json=resourceGeneration,proto3" json:"resource_generation,omitempty"` // dataplane transaction generation after it
+	ResourceOps        uint64 `protobuf:"varint,10,opt,name=resource_ops,json=resourceOps,proto3" json:"resource_ops,omitempty"`                     // resource entries created, updated or erased
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *ApplyPipelineResponse) Reset() {
 	*x = ApplyPipelineResponse{}
-	mi := &file_control_v2_proto_msgTypes[20]
+	mi := &file_control_v2_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1989,7 +2310,7 @@ func (x *ApplyPipelineResponse) String() string {
 func (*ApplyPipelineResponse) ProtoMessage() {}
 
 func (x *ApplyPipelineResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[20]
+	mi := &file_control_v2_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2002,7 +2323,7 @@ func (x *ApplyPipelineResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyPipelineResponse.ProtoReflect.Descriptor instead.
 func (*ApplyPipelineResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{20}
+	return file_control_v2_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ApplyPipelineResponse) GetGeneration() uint64 {
@@ -2061,6 +2382,20 @@ func (x *ApplyPipelineResponse) GetDaemonEpoch() uint64 {
 	return 0
 }
 
+func (x *ApplyPipelineResponse) GetResourceGeneration() uint64 {
+	if x != nil {
+		return x.ResourceGeneration
+	}
+	return 0
+}
+
+func (x *ApplyPipelineResponse) GetResourceOps() uint64 {
+	if x != nil {
+		return x.ResourceOps
+	}
+	return 0
+}
+
 // Carried in the "bess-error-bin" trailer of a failed call.
 type ErrorDetail struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -2076,7 +2411,7 @@ type ErrorDetail struct {
 
 func (x *ErrorDetail) Reset() {
 	*x = ErrorDetail{}
-	mi := &file_control_v2_proto_msgTypes[21]
+	mi := &file_control_v2_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2088,7 +2423,7 @@ func (x *ErrorDetail) String() string {
 func (*ErrorDetail) ProtoMessage() {}
 
 func (x *ErrorDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[21]
+	mi := &file_control_v2_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2101,7 +2436,7 @@ func (x *ErrorDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ErrorDetail.ProtoReflect.Descriptor instead.
 func (*ErrorDetail) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{21}
+	return file_control_v2_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ErrorDetail) GetCode() ErrorDetail_Code {
@@ -2158,7 +2493,7 @@ type TransactionOp struct {
 
 func (x *TransactionOp) Reset() {
 	*x = TransactionOp{}
-	mi := &file_control_v2_proto_msgTypes[22]
+	mi := &file_control_v2_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2170,7 +2505,7 @@ func (x *TransactionOp) String() string {
 func (*TransactionOp) ProtoMessage() {}
 
 func (x *TransactionOp) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[22]
+	mi := &file_control_v2_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2183,7 +2518,7 @@ func (x *TransactionOp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionOp.ProtoReflect.Descriptor instead.
 func (*TransactionOp) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{22}
+	return file_control_v2_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *TransactionOp) GetResource() string {
@@ -2240,7 +2575,7 @@ type ApplyTransactionRequest struct {
 
 func (x *ApplyTransactionRequest) Reset() {
 	*x = ApplyTransactionRequest{}
-	mi := &file_control_v2_proto_msgTypes[23]
+	mi := &file_control_v2_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2252,7 +2587,7 @@ func (x *ApplyTransactionRequest) String() string {
 func (*ApplyTransactionRequest) ProtoMessage() {}
 
 func (x *ApplyTransactionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[23]
+	mi := &file_control_v2_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2265,7 +2600,7 @@ func (x *ApplyTransactionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyTransactionRequest.ProtoReflect.Descriptor instead.
 func (*ApplyTransactionRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{23}
+	return file_control_v2_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *ApplyTransactionRequest) GetRequestId() string {
@@ -2313,7 +2648,7 @@ type TransactionOpResult struct {
 
 func (x *TransactionOpResult) Reset() {
 	*x = TransactionOpResult{}
-	mi := &file_control_v2_proto_msgTypes[24]
+	mi := &file_control_v2_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2325,7 +2660,7 @@ func (x *TransactionOpResult) String() string {
 func (*TransactionOpResult) ProtoMessage() {}
 
 func (x *TransactionOpResult) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[24]
+	mi := &file_control_v2_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2338,7 +2673,7 @@ func (x *TransactionOpResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionOpResult.ProtoReflect.Descriptor instead.
 func (*TransactionOpResult) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{24}
+	return file_control_v2_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *TransactionOpResult) GetStatus() TransactionOpResult_Status {
@@ -2368,7 +2703,7 @@ type TransactionRecord struct {
 
 func (x *TransactionRecord) Reset() {
 	*x = TransactionRecord{}
-	mi := &file_control_v2_proto_msgTypes[25]
+	mi := &file_control_v2_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2380,7 +2715,7 @@ func (x *TransactionRecord) String() string {
 func (*TransactionRecord) ProtoMessage() {}
 
 func (x *TransactionRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[25]
+	mi := &file_control_v2_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2393,7 +2728,7 @@ func (x *TransactionRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionRecord.ProtoReflect.Descriptor instead.
 func (*TransactionRecord) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{25}
+	return file_control_v2_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *TransactionRecord) GetRequestId() string {
@@ -2444,7 +2779,7 @@ type ApplyTransactionResponse struct {
 
 func (x *ApplyTransactionResponse) Reset() {
 	*x = ApplyTransactionResponse{}
-	mi := &file_control_v2_proto_msgTypes[26]
+	mi := &file_control_v2_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2456,7 +2791,7 @@ func (x *ApplyTransactionResponse) String() string {
 func (*ApplyTransactionResponse) ProtoMessage() {}
 
 func (x *ApplyTransactionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[26]
+	mi := &file_control_v2_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2469,7 +2804,7 @@ func (x *ApplyTransactionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyTransactionResponse.ProtoReflect.Descriptor instead.
 func (*ApplyTransactionResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{26}
+	return file_control_v2_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *ApplyTransactionResponse) GetRecord() *TransactionRecord {
@@ -2502,7 +2837,7 @@ type GetTransactionRequest struct {
 
 func (x *GetTransactionRequest) Reset() {
 	*x = GetTransactionRequest{}
-	mi := &file_control_v2_proto_msgTypes[27]
+	mi := &file_control_v2_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2514,7 +2849,7 @@ func (x *GetTransactionRequest) String() string {
 func (*GetTransactionRequest) ProtoMessage() {}
 
 func (x *GetTransactionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[27]
+	mi := &file_control_v2_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2527,7 +2862,7 @@ func (x *GetTransactionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetTransactionRequest.ProtoReflect.Descriptor instead.
 func (*GetTransactionRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{27}
+	return file_control_v2_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *GetTransactionRequest) GetRequestId() string {
@@ -2548,7 +2883,7 @@ type GetTransactionResponse struct {
 
 func (x *GetTransactionResponse) Reset() {
 	*x = GetTransactionResponse{}
-	mi := &file_control_v2_proto_msgTypes[28]
+	mi := &file_control_v2_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2560,7 +2895,7 @@ func (x *GetTransactionResponse) String() string {
 func (*GetTransactionResponse) ProtoMessage() {}
 
 func (x *GetTransactionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[28]
+	mi := &file_control_v2_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2573,7 +2908,7 @@ func (x *GetTransactionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetTransactionResponse.ProtoReflect.Descriptor instead.
 func (*GetTransactionResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{28}
+	return file_control_v2_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *GetTransactionResponse) GetKnown() bool {
@@ -2605,7 +2940,7 @@ type ListTransactionResourcesRequest struct {
 
 func (x *ListTransactionResourcesRequest) Reset() {
 	*x = ListTransactionResourcesRequest{}
-	mi := &file_control_v2_proto_msgTypes[29]
+	mi := &file_control_v2_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2617,7 +2952,7 @@ func (x *ListTransactionResourcesRequest) String() string {
 func (*ListTransactionResourcesRequest) ProtoMessage() {}
 
 func (x *ListTransactionResourcesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[29]
+	mi := &file_control_v2_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2630,21 +2965,23 @@ func (x *ListTransactionResourcesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTransactionResourcesRequest.ProtoReflect.Descriptor instead.
 func (*ListTransactionResourcesRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{29}
+	return file_control_v2_proto_rawDescGZIP(), []int{32}
 }
 
 type TransactionResource struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	KeyType       string                 `protobuf:"bytes,2,opt,name=key_type,json=keyType,proto3" json:"key_type,omitempty"`       // protobuf full name of the key message
-	ValueType     string                 `protobuf:"bytes,3,opt,name=value_type,json=valueType,proto3" json:"value_type,omitempty"` // and of the value message
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                 protoimpl.MessageState   `protogen:"open.v1"`
+	Name                  string                   `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	KeyType               string                   `protobuf:"bytes,2,opt,name=key_type,json=keyType,proto3" json:"key_type,omitempty"`       // protobuf full name of the key message
+	ValueType             string                   `protobuf:"bytes,3,opt,name=value_type,json=valueType,proto3" json:"value_type,omitempty"` // and of the value message
+	Kind                  TransactionResource_Kind `protobuf:"varint,4,opt,name=kind,proto3,enum=bess.pb.v2.TransactionResource_Kind" json:"kind,omitempty"`
+	RequiresPausedWorkers bool                     `protobuf:"varint,5,opt,name=requires_paused_workers,json=requiresPausedWorkers,proto3" json:"requires_paused_workers,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *TransactionResource) Reset() {
 	*x = TransactionResource{}
-	mi := &file_control_v2_proto_msgTypes[30]
+	mi := &file_control_v2_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2656,7 +2993,7 @@ func (x *TransactionResource) String() string {
 func (*TransactionResource) ProtoMessage() {}
 
 func (x *TransactionResource) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[30]
+	mi := &file_control_v2_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2669,7 +3006,7 @@ func (x *TransactionResource) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionResource.ProtoReflect.Descriptor instead.
 func (*TransactionResource) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{30}
+	return file_control_v2_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *TransactionResource) GetName() string {
@@ -2693,6 +3030,20 @@ func (x *TransactionResource) GetValueType() string {
 	return ""
 }
 
+func (x *TransactionResource) GetKind() TransactionResource_Kind {
+	if x != nil {
+		return x.Kind
+	}
+	return TransactionResource_KIND_UNSPECIFIED
+}
+
+func (x *TransactionResource) GetRequiresPausedWorkers() bool {
+	if x != nil {
+		return x.RequiresPausedWorkers
+	}
+	return false
+}
+
 type ListTransactionResourcesResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Resources     []*TransactionResource `protobuf:"bytes,1,rep,name=resources,proto3" json:"resources,omitempty"`
@@ -2704,7 +3055,7 @@ type ListTransactionResourcesResponse struct {
 
 func (x *ListTransactionResourcesResponse) Reset() {
 	*x = ListTransactionResourcesResponse{}
-	mi := &file_control_v2_proto_msgTypes[31]
+	mi := &file_control_v2_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2716,7 +3067,7 @@ func (x *ListTransactionResourcesResponse) String() string {
 func (*ListTransactionResourcesResponse) ProtoMessage() {}
 
 func (x *ListTransactionResourcesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[31]
+	mi := &file_control_v2_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2729,7 +3080,7 @@ func (x *ListTransactionResourcesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTransactionResourcesResponse.ProtoReflect.Descriptor instead.
 func (*ListTransactionResourcesResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{31}
+	return file_control_v2_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ListTransactionResourcesResponse) GetResources() []*TransactionResource {
@@ -2761,7 +3112,7 @@ type GetCapabilitiesRequest struct {
 
 func (x *GetCapabilitiesRequest) Reset() {
 	*x = GetCapabilitiesRequest{}
-	mi := &file_control_v2_proto_msgTypes[32]
+	mi := &file_control_v2_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2773,7 +3124,7 @@ func (x *GetCapabilitiesRequest) String() string {
 func (*GetCapabilitiesRequest) ProtoMessage() {}
 
 func (x *GetCapabilitiesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[32]
+	mi := &file_control_v2_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2786,7 +3137,7 @@ func (x *GetCapabilitiesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCapabilitiesRequest.ProtoReflect.Descriptor instead.
 func (*GetCapabilitiesRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{32}
+	return file_control_v2_proto_rawDescGZIP(), []int{35}
 }
 
 type PluginInfo struct {
@@ -2801,7 +3152,7 @@ type PluginInfo struct {
 
 func (x *PluginInfo) Reset() {
 	*x = PluginInfo{}
-	mi := &file_control_v2_proto_msgTypes[33]
+	mi := &file_control_v2_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2813,7 +3164,7 @@ func (x *PluginInfo) String() string {
 func (*PluginInfo) ProtoMessage() {}
 
 func (x *PluginInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[33]
+	mi := &file_control_v2_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2826,7 +3177,7 @@ func (x *PluginInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PluginInfo.ProtoReflect.Descriptor instead.
 func (*PluginInfo) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{33}
+	return file_control_v2_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *PluginInfo) GetName() string {
@@ -2881,7 +3232,7 @@ type PortInfo struct {
 
 func (x *PortInfo) Reset() {
 	*x = PortInfo{}
-	mi := &file_control_v2_proto_msgTypes[34]
+	mi := &file_control_v2_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2893,7 +3244,7 @@ func (x *PortInfo) String() string {
 func (*PortInfo) ProtoMessage() {}
 
 func (x *PortInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[34]
+	mi := &file_control_v2_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2906,7 +3257,7 @@ func (x *PortInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PortInfo.ProtoReflect.Descriptor instead.
 func (*PortInfo) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{34}
+	return file_control_v2_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *PortInfo) GetName() string {
@@ -3023,7 +3374,7 @@ type GetCapabilitiesResponse struct {
 
 func (x *GetCapabilitiesResponse) Reset() {
 	*x = GetCapabilitiesResponse{}
-	mi := &file_control_v2_proto_msgTypes[35]
+	mi := &file_control_v2_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3035,7 +3386,7 @@ func (x *GetCapabilitiesResponse) String() string {
 func (*GetCapabilitiesResponse) ProtoMessage() {}
 
 func (x *GetCapabilitiesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[35]
+	mi := &file_control_v2_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3048,7 +3399,7 @@ func (x *GetCapabilitiesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCapabilitiesResponse.ProtoReflect.Descriptor instead.
 func (*GetCapabilitiesResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{35}
+	return file_control_v2_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *GetCapabilitiesResponse) GetDaemonVersion() string {
@@ -3157,7 +3508,7 @@ type GetSchemaRequest struct {
 
 func (x *GetSchemaRequest) Reset() {
 	*x = GetSchemaRequest{}
-	mi := &file_control_v2_proto_msgTypes[36]
+	mi := &file_control_v2_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3169,7 +3520,7 @@ func (x *GetSchemaRequest) String() string {
 func (*GetSchemaRequest) ProtoMessage() {}
 
 func (x *GetSchemaRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[36]
+	mi := &file_control_v2_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3182,33 +3533,36 @@ func (x *GetSchemaRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSchemaRequest.ProtoReflect.Descriptor instead.
 func (*GetSchemaRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{36}
+	return file_control_v2_proto_rawDescGZIP(), []int{39}
 }
 
-type CommandSchema struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	ArgType       string                 `protobuf:"bytes,2,opt,name=arg_type,json=argType,proto3" json:"arg_type,omitempty"`
-	ThreadSafe    bool                   `protobuf:"varint,3,opt,name=thread_safe,json=threadSafe,proto3" json:"thread_safe,omitempty"` // runs without pausing workers
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+// A resource table every module of the class has: "<module>/<table>".
+type ResourceSchema struct {
+	state                 protoimpl.MessageState   `protogen:"open.v1"`
+	Table                 string                   `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
+	Kind                  TransactionResource_Kind `protobuf:"varint,2,opt,name=kind,proto3,enum=bess.pb.v2.TransactionResource_Kind" json:"kind,omitempty"`
+	KeyType               string                   `protobuf:"bytes,3,opt,name=key_type,json=keyType,proto3" json:"key_type,omitempty"` // google.protobuf.Empty for a singleton
+	ValueType             string                   `protobuf:"bytes,4,opt,name=value_type,json=valueType,proto3" json:"value_type,omitempty"`
+	RequiresPausedWorkers bool                     `protobuf:"varint,5,opt,name=requires_paused_workers,json=requiresPausedWorkers,proto3" json:"requires_paused_workers,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
-func (x *CommandSchema) Reset() {
-	*x = CommandSchema{}
-	mi := &file_control_v2_proto_msgTypes[37]
+func (x *ResourceSchema) Reset() {
+	*x = ResourceSchema{}
+	mi := &file_control_v2_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *CommandSchema) String() string {
+func (x *ResourceSchema) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*CommandSchema) ProtoMessage() {}
+func (*ResourceSchema) ProtoMessage() {}
 
-func (x *CommandSchema) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[37]
+func (x *ResourceSchema) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v2_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3219,26 +3573,109 @@ func (x *CommandSchema) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use CommandSchema.ProtoReflect.Descriptor instead.
-func (*CommandSchema) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{37}
+// Deprecated: Use ResourceSchema.ProtoReflect.Descriptor instead.
+func (*ResourceSchema) Descriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{40}
 }
 
-func (x *CommandSchema) GetName() string {
+func (x *ResourceSchema) GetTable() string {
+	if x != nil {
+		return x.Table
+	}
+	return ""
+}
+
+func (x *ResourceSchema) GetKind() TransactionResource_Kind {
+	if x != nil {
+		return x.Kind
+	}
+	return TransactionResource_KIND_UNSPECIFIED
+}
+
+func (x *ResourceSchema) GetKeyType() string {
+	if x != nil {
+		return x.KeyType
+	}
+	return ""
+}
+
+func (x *ResourceSchema) GetValueType() string {
+	if x != nil {
+		return x.ValueType
+	}
+	return ""
+}
+
+func (x *ResourceSchema) GetRequiresPausedWorkers() bool {
+	if x != nil {
+		return x.RequiresPausedWorkers
+	}
+	return false
+}
+
+// An action (InvokeAction): an operation that is not state.
+type ActionSchema struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	ArgType       string                 `protobuf:"bytes,2,opt,name=arg_type,json=argType,proto3" json:"arg_type,omitempty"`
+	ResultType    string                 `protobuf:"bytes,3,opt,name=result_type,json=resultType,proto3" json:"result_type,omitempty"`  // "" when it answers nothing
+	ThreadSafe    bool                   `protobuf:"varint,4,opt,name=thread_safe,json=threadSafe,proto3" json:"thread_safe,omitempty"` // runs without pausing workers
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ActionSchema) Reset() {
+	*x = ActionSchema{}
+	mi := &file_control_v2_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ActionSchema) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ActionSchema) ProtoMessage() {}
+
+func (x *ActionSchema) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v2_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ActionSchema.ProtoReflect.Descriptor instead.
+func (*ActionSchema) Descriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *ActionSchema) GetName() string {
 	if x != nil {
 		return x.Name
 	}
 	return ""
 }
 
-func (x *CommandSchema) GetArgType() string {
+func (x *ActionSchema) GetArgType() string {
 	if x != nil {
 		return x.ArgType
 	}
 	return ""
 }
 
-func (x *CommandSchema) GetThreadSafe() bool {
+func (x *ActionSchema) GetResultType() string {
+	if x != nil {
+		return x.ResultType
+	}
+	return ""
+}
+
+func (x *ActionSchema) GetThreadSafe() bool {
 	if x != nil {
 		return x.ThreadSafe
 	}
@@ -3250,16 +3687,17 @@ type ModuleClassSchema struct {
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	Help          string                 `protobuf:"bytes,2,opt,name=help,proto3" json:"help,omitempty"`
 	InitArgType   string                 `protobuf:"bytes,3,opt,name=init_arg_type,json=initArgType,proto3" json:"init_arg_type,omitempty"`
-	Igates        uint32                 `protobuf:"varint,4,opt,name=igates,proto3" json:"igates,omitempty"` // input gates the class accepts
-	Ogates        uint32                 `protobuf:"varint,5,opt,name=ogates,proto3" json:"ogates,omitempty"` // output gates
-	Commands      []*CommandSchema       `protobuf:"bytes,6,rep,name=commands,proto3" json:"commands,omitempty"`
+	Igates        uint32                 `protobuf:"varint,4,opt,name=igates,proto3" json:"igates,omitempty"`      // input gates the class accepts
+	Ogates        uint32                 `protobuf:"varint,5,opt,name=ogates,proto3" json:"ogates,omitempty"`      // output gates
+	Actions       []*ActionSchema        `protobuf:"bytes,7,rep,name=actions,proto3" json:"actions,omitempty"`     // sorted by name
+	Resources     []*ResourceSchema      `protobuf:"bytes,8,rep,name=resources,proto3" json:"resources,omitempty"` // sorted by table
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ModuleClassSchema) Reset() {
 	*x = ModuleClassSchema{}
-	mi := &file_control_v2_proto_msgTypes[38]
+	mi := &file_control_v2_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3271,7 +3709,7 @@ func (x *ModuleClassSchema) String() string {
 func (*ModuleClassSchema) ProtoMessage() {}
 
 func (x *ModuleClassSchema) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[38]
+	mi := &file_control_v2_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3284,7 +3722,7 @@ func (x *ModuleClassSchema) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModuleClassSchema.ProtoReflect.Descriptor instead.
 func (*ModuleClassSchema) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{38}
+	return file_control_v2_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *ModuleClassSchema) GetName() string {
@@ -3322,9 +3760,16 @@ func (x *ModuleClassSchema) GetOgates() uint32 {
 	return 0
 }
 
-func (x *ModuleClassSchema) GetCommands() []*CommandSchema {
+func (x *ModuleClassSchema) GetActions() []*ActionSchema {
 	if x != nil {
-		return x.Commands
+		return x.Actions
+	}
+	return nil
+}
+
+func (x *ModuleClassSchema) GetResources() []*ResourceSchema {
+	if x != nil {
+		return x.Resources
 	}
 	return nil
 }
@@ -3340,7 +3785,7 @@ type PortDriverSchema struct {
 
 func (x *PortDriverSchema) Reset() {
 	*x = PortDriverSchema{}
-	mi := &file_control_v2_proto_msgTypes[39]
+	mi := &file_control_v2_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3352,7 +3797,7 @@ func (x *PortDriverSchema) String() string {
 func (*PortDriverSchema) ProtoMessage() {}
 
 func (x *PortDriverSchema) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[39]
+	mi := &file_control_v2_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3365,7 +3810,7 @@ func (x *PortDriverSchema) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PortDriverSchema.ProtoReflect.Descriptor instead.
 func (*PortDriverSchema) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{39}
+	return file_control_v2_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *PortDriverSchema) GetName() string {
@@ -3404,7 +3849,7 @@ type GetSchemaResponse struct {
 
 func (x *GetSchemaResponse) Reset() {
 	*x = GetSchemaResponse{}
-	mi := &file_control_v2_proto_msgTypes[40]
+	mi := &file_control_v2_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3416,7 +3861,7 @@ func (x *GetSchemaResponse) String() string {
 func (*GetSchemaResponse) ProtoMessage() {}
 
 func (x *GetSchemaResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[40]
+	mi := &file_control_v2_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3429,7 +3874,7 @@ func (x *GetSchemaResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSchemaResponse.ProtoReflect.Descriptor instead.
 func (*GetSchemaResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{40}
+	return file_control_v2_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *GetSchemaResponse) GetModuleClasses() []*ModuleClassSchema {
@@ -3474,7 +3919,7 @@ type WatchEventsRequest struct {
 
 func (x *WatchEventsRequest) Reset() {
 	*x = WatchEventsRequest{}
-	mi := &file_control_v2_proto_msgTypes[41]
+	mi := &file_control_v2_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3486,7 +3931,7 @@ func (x *WatchEventsRequest) String() string {
 func (*WatchEventsRequest) ProtoMessage() {}
 
 func (x *WatchEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[41]
+	mi := &file_control_v2_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3499,7 +3944,7 @@ func (x *WatchEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WatchEventsRequest.ProtoReflect.Descriptor instead.
 func (*WatchEventsRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{41}
+	return file_control_v2_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *WatchEventsRequest) GetFromSequence() uint64 {
@@ -3541,7 +3986,7 @@ type Event struct {
 
 func (x *Event) Reset() {
 	*x = Event{}
-	mi := &file_control_v2_proto_msgTypes[42]
+	mi := &file_control_v2_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3553,7 +3998,7 @@ func (x *Event) String() string {
 func (*Event) ProtoMessage() {}
 
 func (x *Event) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[42]
+	mi := &file_control_v2_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3566,7 +4011,7 @@ func (x *Event) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Event.ProtoReflect.Descriptor instead.
 func (*Event) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{42}
+	return file_control_v2_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *Event) GetSequence() uint64 {
@@ -3640,7 +4085,7 @@ type ListMetricsRequest struct {
 
 func (x *ListMetricsRequest) Reset() {
 	*x = ListMetricsRequest{}
-	mi := &file_control_v2_proto_msgTypes[43]
+	mi := &file_control_v2_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3652,7 +4097,7 @@ func (x *ListMetricsRequest) String() string {
 func (*ListMetricsRequest) ProtoMessage() {}
 
 func (x *ListMetricsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[43]
+	mi := &file_control_v2_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3665,7 +4110,7 @@ func (x *ListMetricsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListMetricsRequest.ProtoReflect.Descriptor instead.
 func (*ListMetricsRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{43}
+	return file_control_v2_proto_rawDescGZIP(), []int{47}
 }
 
 type MetricSample struct {
@@ -3681,7 +4126,7 @@ type MetricSample struct {
 
 func (x *MetricSample) Reset() {
 	*x = MetricSample{}
-	mi := &file_control_v2_proto_msgTypes[44]
+	mi := &file_control_v2_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3693,7 +4138,7 @@ func (x *MetricSample) String() string {
 func (*MetricSample) ProtoMessage() {}
 
 func (x *MetricSample) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[44]
+	mi := &file_control_v2_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3706,7 +4151,7 @@ func (x *MetricSample) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetricSample.ProtoReflect.Descriptor instead.
 func (*MetricSample) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{44}
+	return file_control_v2_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *MetricSample) GetName() string {
@@ -3754,7 +4199,7 @@ type ListMetricsResponse struct {
 
 func (x *ListMetricsResponse) Reset() {
 	*x = ListMetricsResponse{}
-	mi := &file_control_v2_proto_msgTypes[45]
+	mi := &file_control_v2_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3766,7 +4211,7 @@ func (x *ListMetricsResponse) String() string {
 func (*ListMetricsResponse) ProtoMessage() {}
 
 func (x *ListMetricsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[45]
+	mi := &file_control_v2_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3779,7 +4224,7 @@ func (x *ListMetricsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListMetricsResponse.ProtoReflect.Descriptor instead.
 func (*ListMetricsResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{45}
+	return file_control_v2_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *ListMetricsResponse) GetSamples() []*MetricSample {
@@ -3796,41 +4241,43 @@ func (x *ListMetricsResponse) GetDaemonEpoch() uint64 {
 	return 0
 }
 
-// -- Module commands (D-115) -----------------------------------------------
+// -- Module actions (D-129) ------------------------------------------------
 //
-// A module's command, as GetSchema lists it (name, argument type,
-// thread_safe): what a module does besides its desired state -- lookups,
-// statistics, one-shot operations -- and the edits of its tables beside its
-// transaction resources. Not transactional: a command acts when it runs. A
-// command not marked thread_safe is refused while a worker runs
-// (FAILED_PRECONDITION, RESOURCE_BUSY, errno EBUSY): pause the workers first
-// (Admin.PauseWorkers). A command's failure is the call's error, with the
-// command's errno in ErrorDetail.errno_value.
-type RunModuleCommandRequest struct {
+// A module's action, as GetSchema lists it (name, argument and result types,
+// thread_safe): what a module does that is not state -- lookups, statistics,
+// clearing counters, one-shot operations. A module's state is its init
+// argument and its resources, never an action. Not transactional: an action
+// acts when it runs. An action not marked thread_safe is refused while a
+// worker runs (FAILED_PRECONDITION, RESOURCE_BUSY, errno EBUSY): pause the
+// workers first (Admin.PauseWorkers). An action's failure is the call's
+// error, with its errno in ErrorDetail.errno_value. The legacy service's
+// ModuleCommand also runs the commands that edit state, which no action
+// does; they leave with the legacy service.
+type InvokeActionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	DaemonEpoch   uint64                 `protobuf:"varint,1,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"` // required (D-106)
 	Module        string                 `protobuf:"bytes,2,opt,name=module,proto3" json:"module,omitempty"`
-	Command       string                 `protobuf:"bytes,3,opt,name=command,proto3" json:"command,omitempty"`
-	Arg           *anypb.Any             `protobuf:"bytes,4,opt,name=arg,proto3" json:"arg,omitempty"` // the command's argument type
+	Action        string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"`
+	Arg           *anypb.Any             `protobuf:"bytes,4,opt,name=arg,proto3" json:"arg,omitempty"` // the action's argument type
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *RunModuleCommandRequest) Reset() {
-	*x = RunModuleCommandRequest{}
-	mi := &file_control_v2_proto_msgTypes[46]
+func (x *InvokeActionRequest) Reset() {
+	*x = InvokeActionRequest{}
+	mi := &file_control_v2_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *RunModuleCommandRequest) String() string {
+func (x *InvokeActionRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*RunModuleCommandRequest) ProtoMessage() {}
+func (*InvokeActionRequest) ProtoMessage() {}
 
-func (x *RunModuleCommandRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[46]
+func (x *InvokeActionRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v2_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3841,62 +4288,62 @@ func (x *RunModuleCommandRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use RunModuleCommandRequest.ProtoReflect.Descriptor instead.
-func (*RunModuleCommandRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{46}
+// Deprecated: Use InvokeActionRequest.ProtoReflect.Descriptor instead.
+func (*InvokeActionRequest) Descriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{50}
 }
 
-func (x *RunModuleCommandRequest) GetDaemonEpoch() uint64 {
+func (x *InvokeActionRequest) GetDaemonEpoch() uint64 {
 	if x != nil {
 		return x.DaemonEpoch
 	}
 	return 0
 }
 
-func (x *RunModuleCommandRequest) GetModule() string {
+func (x *InvokeActionRequest) GetModule() string {
 	if x != nil {
 		return x.Module
 	}
 	return ""
 }
 
-func (x *RunModuleCommandRequest) GetCommand() string {
+func (x *InvokeActionRequest) GetAction() string {
 	if x != nil {
-		return x.Command
+		return x.Action
 	}
 	return ""
 }
 
-func (x *RunModuleCommandRequest) GetArg() *anypb.Any {
+func (x *InvokeActionRequest) GetArg() *anypb.Any {
 	if x != nil {
 		return x.Arg
 	}
 	return nil
 }
 
-type RunModuleCommandResponse struct {
+type InvokeActionResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Data          *anypb.Any             `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"` // the command's answer; unset when it has none
+	Result        *anypb.Any             `protobuf:"bytes,1,opt,name=result,proto3" json:"result,omitempty"` // the action's result type; unset when it has none
 	DaemonEpoch   uint64                 `protobuf:"varint,2,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *RunModuleCommandResponse) Reset() {
-	*x = RunModuleCommandResponse{}
-	mi := &file_control_v2_proto_msgTypes[47]
+func (x *InvokeActionResponse) Reset() {
+	*x = InvokeActionResponse{}
+	mi := &file_control_v2_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *RunModuleCommandResponse) String() string {
+func (x *InvokeActionResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*RunModuleCommandResponse) ProtoMessage() {}
+func (*InvokeActionResponse) ProtoMessage() {}
 
-func (x *RunModuleCommandResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[47]
+func (x *InvokeActionResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v2_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3907,19 +4354,19 @@ func (x *RunModuleCommandResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use RunModuleCommandResponse.ProtoReflect.Descriptor instead.
-func (*RunModuleCommandResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{47}
+// Deprecated: Use InvokeActionResponse.ProtoReflect.Descriptor instead.
+func (*InvokeActionResponse) Descriptor() ([]byte, []int) {
+	return file_control_v2_proto_rawDescGZIP(), []int{51}
 }
 
-func (x *RunModuleCommandResponse) GetData() *anypb.Any {
+func (x *InvokeActionResponse) GetResult() *anypb.Any {
 	if x != nil {
-		return x.Data
+		return x.Result
 	}
 	return nil
 }
 
-func (x *RunModuleCommandResponse) GetDaemonEpoch() uint64 {
+func (x *InvokeActionResponse) GetDaemonEpoch() uint64 {
 	if x != nil {
 		return x.DaemonEpoch
 	}
@@ -3936,7 +4383,7 @@ type ImportPluginRequest struct {
 
 func (x *ImportPluginRequest) Reset() {
 	*x = ImportPluginRequest{}
-	mi := &file_control_v2_proto_msgTypes[48]
+	mi := &file_control_v2_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3948,7 +4395,7 @@ func (x *ImportPluginRequest) String() string {
 func (*ImportPluginRequest) ProtoMessage() {}
 
 func (x *ImportPluginRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[48]
+	mi := &file_control_v2_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3961,7 +4408,7 @@ func (x *ImportPluginRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportPluginRequest.ProtoReflect.Descriptor instead.
 func (*ImportPluginRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{48}
+	return file_control_v2_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *ImportPluginRequest) GetPath() string {
@@ -3987,7 +4434,7 @@ type ImportPluginResponse struct {
 
 func (x *ImportPluginResponse) Reset() {
 	*x = ImportPluginResponse{}
-	mi := &file_control_v2_proto_msgTypes[49]
+	mi := &file_control_v2_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3999,7 +4446,7 @@ func (x *ImportPluginResponse) String() string {
 func (*ImportPluginResponse) ProtoMessage() {}
 
 func (x *ImportPluginResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[49]
+	mi := &file_control_v2_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4012,7 +4459,7 @@ func (x *ImportPluginResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportPluginResponse.ProtoReflect.Descriptor instead.
 func (*ImportPluginResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{49}
+	return file_control_v2_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *ImportPluginResponse) GetDaemonEpoch() uint64 {
@@ -4032,7 +4479,7 @@ type UnloadPluginRequest struct {
 
 func (x *UnloadPluginRequest) Reset() {
 	*x = UnloadPluginRequest{}
-	mi := &file_control_v2_proto_msgTypes[50]
+	mi := &file_control_v2_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4044,7 +4491,7 @@ func (x *UnloadPluginRequest) String() string {
 func (*UnloadPluginRequest) ProtoMessage() {}
 
 func (x *UnloadPluginRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[50]
+	mi := &file_control_v2_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4057,7 +4504,7 @@ func (x *UnloadPluginRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnloadPluginRequest.ProtoReflect.Descriptor instead.
 func (*UnloadPluginRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{50}
+	return file_control_v2_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *UnloadPluginRequest) GetPath() string {
@@ -4083,7 +4530,7 @@ type UnloadPluginResponse struct {
 
 func (x *UnloadPluginResponse) Reset() {
 	*x = UnloadPluginResponse{}
-	mi := &file_control_v2_proto_msgTypes[51]
+	mi := &file_control_v2_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4095,7 +4542,7 @@ func (x *UnloadPluginResponse) String() string {
 func (*UnloadPluginResponse) ProtoMessage() {}
 
 func (x *UnloadPluginResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[51]
+	mi := &file_control_v2_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4108,7 +4555,7 @@ func (x *UnloadPluginResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnloadPluginResponse.ProtoReflect.Descriptor instead.
 func (*UnloadPluginResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{51}
+	return file_control_v2_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *UnloadPluginResponse) GetDaemonEpoch() uint64 {
@@ -4127,7 +4574,7 @@ type GetPortStatusRequest struct {
 
 func (x *GetPortStatusRequest) Reset() {
 	*x = GetPortStatusRequest{}
-	mi := &file_control_v2_proto_msgTypes[52]
+	mi := &file_control_v2_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4139,7 +4586,7 @@ func (x *GetPortStatusRequest) String() string {
 func (*GetPortStatusRequest) ProtoMessage() {}
 
 func (x *GetPortStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[52]
+	mi := &file_control_v2_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4152,7 +4599,7 @@ func (x *GetPortStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPortStatusRequest.ProtoReflect.Descriptor instead.
 func (*GetPortStatusRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{52}
+	return file_control_v2_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *GetPortStatusRequest) GetNames() []string {
@@ -4179,7 +4626,7 @@ type PortStatus struct {
 
 func (x *PortStatus) Reset() {
 	*x = PortStatus{}
-	mi := &file_control_v2_proto_msgTypes[53]
+	mi := &file_control_v2_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4191,7 +4638,7 @@ func (x *PortStatus) String() string {
 func (*PortStatus) ProtoMessage() {}
 
 func (x *PortStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[53]
+	mi := &file_control_v2_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4204,7 +4651,7 @@ func (x *PortStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PortStatus.ProtoReflect.Descriptor instead.
 func (*PortStatus) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{53}
+	return file_control_v2_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *PortStatus) GetName() string {
@@ -4266,7 +4713,7 @@ type GetPortStatusResponse struct {
 
 func (x *GetPortStatusResponse) Reset() {
 	*x = GetPortStatusResponse{}
-	mi := &file_control_v2_proto_msgTypes[54]
+	mi := &file_control_v2_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4278,7 +4725,7 @@ func (x *GetPortStatusResponse) String() string {
 func (*GetPortStatusResponse) ProtoMessage() {}
 
 func (x *GetPortStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[54]
+	mi := &file_control_v2_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4291,7 +4738,7 @@ func (x *GetPortStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPortStatusResponse.ProtoReflect.Descriptor instead.
 func (*GetPortStatusResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{54}
+	return file_control_v2_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *GetPortStatusResponse) GetPorts() []*PortStatus {
@@ -4316,7 +4763,7 @@ type GetPacketPoolsRequest struct {
 
 func (x *GetPacketPoolsRequest) Reset() {
 	*x = GetPacketPoolsRequest{}
-	mi := &file_control_v2_proto_msgTypes[55]
+	mi := &file_control_v2_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4328,7 +4775,7 @@ func (x *GetPacketPoolsRequest) String() string {
 func (*GetPacketPoolsRequest) ProtoMessage() {}
 
 func (x *GetPacketPoolsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[55]
+	mi := &file_control_v2_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4341,7 +4788,7 @@ func (x *GetPacketPoolsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPacketPoolsRequest.ProtoReflect.Descriptor instead.
 func (*GetPacketPoolsRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{55}
+	return file_control_v2_proto_rawDescGZIP(), []int{59}
 }
 
 // The default packet pool: one, on the memory node (D-123).
@@ -4360,7 +4807,7 @@ type PacketPool struct {
 
 func (x *PacketPool) Reset() {
 	*x = PacketPool{}
-	mi := &file_control_v2_proto_msgTypes[56]
+	mi := &file_control_v2_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4372,7 +4819,7 @@ func (x *PacketPool) String() string {
 func (*PacketPool) ProtoMessage() {}
 
 func (x *PacketPool) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[56]
+	mi := &file_control_v2_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4385,7 +4832,7 @@ func (x *PacketPool) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PacketPool.ProtoReflect.Descriptor instead.
 func (*PacketPool) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{56}
+	return file_control_v2_proto_rawDescGZIP(), []int{60}
 }
 
 func (x *PacketPool) GetSocket() uint32 {
@@ -4447,7 +4894,7 @@ type GetPacketPoolsResponse struct {
 
 func (x *GetPacketPoolsResponse) Reset() {
 	*x = GetPacketPoolsResponse{}
-	mi := &file_control_v2_proto_msgTypes[57]
+	mi := &file_control_v2_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4459,7 +4906,7 @@ func (x *GetPacketPoolsResponse) String() string {
 func (*GetPacketPoolsResponse) ProtoMessage() {}
 
 func (x *GetPacketPoolsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[57]
+	mi := &file_control_v2_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4472,7 +4919,7 @@ func (x *GetPacketPoolsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPacketPoolsResponse.ProtoReflect.Descriptor instead.
 func (*GetPacketPoolsResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{57}
+	return file_control_v2_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *GetPacketPoolsResponse) GetPools() []*PacketPool {
@@ -4512,7 +4959,7 @@ type SetCaptureRequest struct {
 
 func (x *SetCaptureRequest) Reset() {
 	*x = SetCaptureRequest{}
-	mi := &file_control_v2_proto_msgTypes[58]
+	mi := &file_control_v2_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4524,7 +4971,7 @@ func (x *SetCaptureRequest) String() string {
 func (*SetCaptureRequest) ProtoMessage() {}
 
 func (x *SetCaptureRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[58]
+	mi := &file_control_v2_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4537,7 +4984,7 @@ func (x *SetCaptureRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetCaptureRequest.ProtoReflect.Descriptor instead.
 func (*SetCaptureRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{58}
+	return file_control_v2_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *SetCaptureRequest) GetModule() string {
@@ -4598,7 +5045,7 @@ type SetCaptureResponse struct {
 
 func (x *SetCaptureResponse) Reset() {
 	*x = SetCaptureResponse{}
-	mi := &file_control_v2_proto_msgTypes[59]
+	mi := &file_control_v2_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4610,7 +5057,7 @@ func (x *SetCaptureResponse) String() string {
 func (*SetCaptureResponse) ProtoMessage() {}
 
 func (x *SetCaptureResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[59]
+	mi := &file_control_v2_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4623,7 +5070,7 @@ func (x *SetCaptureResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetCaptureResponse.ProtoReflect.Descriptor instead.
 func (*SetCaptureResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{59}
+	return file_control_v2_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *SetCaptureResponse) GetDaemonEpoch() uint64 {
@@ -4645,7 +5092,7 @@ type PauseWorkersRequest struct {
 
 func (x *PauseWorkersRequest) Reset() {
 	*x = PauseWorkersRequest{}
-	mi := &file_control_v2_proto_msgTypes[60]
+	mi := &file_control_v2_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4657,7 +5104,7 @@ func (x *PauseWorkersRequest) String() string {
 func (*PauseWorkersRequest) ProtoMessage() {}
 
 func (x *PauseWorkersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[60]
+	mi := &file_control_v2_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4670,7 +5117,7 @@ func (x *PauseWorkersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseWorkersRequest.ProtoReflect.Descriptor instead.
 func (*PauseWorkersRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{60}
+	return file_control_v2_proto_rawDescGZIP(), []int{64}
 }
 
 func (x *PauseWorkersRequest) GetDaemonEpoch() uint64 {
@@ -4689,7 +5136,7 @@ type PauseWorkersResponse struct {
 
 func (x *PauseWorkersResponse) Reset() {
 	*x = PauseWorkersResponse{}
-	mi := &file_control_v2_proto_msgTypes[61]
+	mi := &file_control_v2_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4701,7 +5148,7 @@ func (x *PauseWorkersResponse) String() string {
 func (*PauseWorkersResponse) ProtoMessage() {}
 
 func (x *PauseWorkersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[61]
+	mi := &file_control_v2_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4714,7 +5161,7 @@ func (x *PauseWorkersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseWorkersResponse.ProtoReflect.Descriptor instead.
 func (*PauseWorkersResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{61}
+	return file_control_v2_proto_rawDescGZIP(), []int{65}
 }
 
 func (x *PauseWorkersResponse) GetDaemonEpoch() uint64 {
@@ -4733,7 +5180,7 @@ type ResumeWorkersRequest struct {
 
 func (x *ResumeWorkersRequest) Reset() {
 	*x = ResumeWorkersRequest{}
-	mi := &file_control_v2_proto_msgTypes[62]
+	mi := &file_control_v2_proto_msgTypes[66]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4745,7 +5192,7 @@ func (x *ResumeWorkersRequest) String() string {
 func (*ResumeWorkersRequest) ProtoMessage() {}
 
 func (x *ResumeWorkersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[62]
+	mi := &file_control_v2_proto_msgTypes[66]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4758,7 +5205,7 @@ func (x *ResumeWorkersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeWorkersRequest.ProtoReflect.Descriptor instead.
 func (*ResumeWorkersRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{62}
+	return file_control_v2_proto_rawDescGZIP(), []int{66}
 }
 
 func (x *ResumeWorkersRequest) GetDaemonEpoch() uint64 {
@@ -4777,7 +5224,7 @@ type ResumeWorkersResponse struct {
 
 func (x *ResumeWorkersResponse) Reset() {
 	*x = ResumeWorkersResponse{}
-	mi := &file_control_v2_proto_msgTypes[63]
+	mi := &file_control_v2_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4789,7 +5236,7 @@ func (x *ResumeWorkersResponse) String() string {
 func (*ResumeWorkersResponse) ProtoMessage() {}
 
 func (x *ResumeWorkersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[63]
+	mi := &file_control_v2_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4802,7 +5249,7 @@ func (x *ResumeWorkersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeWorkersResponse.ProtoReflect.Descriptor instead.
 func (*ResumeWorkersResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{63}
+	return file_control_v2_proto_rawDescGZIP(), []int{67}
 }
 
 func (x *ResumeWorkersResponse) GetDaemonEpoch() uint64 {
@@ -4821,7 +5268,7 @@ type ShutdownRequest struct {
 
 func (x *ShutdownRequest) Reset() {
 	*x = ShutdownRequest{}
-	mi := &file_control_v2_proto_msgTypes[64]
+	mi := &file_control_v2_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4833,7 +5280,7 @@ func (x *ShutdownRequest) String() string {
 func (*ShutdownRequest) ProtoMessage() {}
 
 func (x *ShutdownRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[64]
+	mi := &file_control_v2_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4846,7 +5293,7 @@ func (x *ShutdownRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShutdownRequest.ProtoReflect.Descriptor instead.
 func (*ShutdownRequest) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{64}
+	return file_control_v2_proto_rawDescGZIP(), []int{68}
 }
 
 func (x *ShutdownRequest) GetDaemonEpoch() uint64 {
@@ -4866,7 +5313,7 @@ type ShutdownResponse struct {
 
 func (x *ShutdownResponse) Reset() {
 	*x = ShutdownResponse{}
-	mi := &file_control_v2_proto_msgTypes[65]
+	mi := &file_control_v2_proto_msgTypes[69]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4878,7 +5325,7 @@ func (x *ShutdownResponse) String() string {
 func (*ShutdownResponse) ProtoMessage() {}
 
 func (x *ShutdownResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[65]
+	mi := &file_control_v2_proto_msgTypes[69]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4891,7 +5338,7 @@ func (x *ShutdownResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShutdownResponse.ProtoReflect.Descriptor instead.
 func (*ShutdownResponse) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{65}
+	return file_control_v2_proto_rawDescGZIP(), []int{69}
 }
 
 func (x *ShutdownResponse) GetDaemonEpoch() uint64 {
@@ -4913,7 +5360,7 @@ type PortStatus_Link struct {
 
 func (x *PortStatus_Link) Reset() {
 	*x = PortStatus_Link{}
-	mi := &file_control_v2_proto_msgTypes[70]
+	mi := &file_control_v2_proto_msgTypes[74]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4925,7 +5372,7 @@ func (x *PortStatus_Link) String() string {
 func (*PortStatus_Link) ProtoMessage() {}
 
 func (x *PortStatus_Link) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[70]
+	mi := &file_control_v2_proto_msgTypes[74]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4938,7 +5385,7 @@ func (x *PortStatus_Link) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PortStatus_Link.ProtoReflect.Descriptor instead.
 func (*PortStatus_Link) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{53, 0}
+	return file_control_v2_proto_rawDescGZIP(), []int{57, 0}
 }
 
 func (x *PortStatus_Link) GetUp() bool {
@@ -4983,7 +5430,7 @@ type PortStatus_Counters struct {
 
 func (x *PortStatus_Counters) Reset() {
 	*x = PortStatus_Counters{}
-	mi := &file_control_v2_proto_msgTypes[71]
+	mi := &file_control_v2_proto_msgTypes[75]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4995,7 +5442,7 @@ func (x *PortStatus_Counters) String() string {
 func (*PortStatus_Counters) ProtoMessage() {}
 
 func (x *PortStatus_Counters) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v2_proto_msgTypes[71]
+	mi := &file_control_v2_proto_msgTypes[75]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5008,7 +5455,7 @@ func (x *PortStatus_Counters) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PortStatus_Counters.ProtoReflect.Descriptor instead.
 func (*PortStatus_Counters) Descriptor() ([]byte, []int) {
-	return file_control_v2_proto_rawDescGZIP(), []int{53, 1}
+	return file_control_v2_proto_rawDescGZIP(), []int{57, 1}
 }
 
 func (x *PortStatus_Counters) GetPackets() uint64 {
@@ -5100,20 +5547,34 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x05share\x18\x06 \x01(\x03H\x02R\x05share\x88\x01\x01B\x06\n" +
 	"\x04_widB\v\n" +
 	"\t_priorityB\b\n" +
-	"\x06_share\"\xbc\x02\n" +
+	"\x06_share\"c\n" +
+	"\rResourceEntry\x12&\n" +
+	"\x03key\x18\x01 \x01(\v2\x14.google.protobuf.AnyR\x03key\x12*\n" +
+	"\x05value\x18\x02 \x01(\v2\x14.google.protobuf.AnyR\x05value\"[\n" +
+	"\x10ResourceContents\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x123\n" +
+	"\aentries\x18\x02 \x03(\v2\x19.bess.pb.v2.ResourceEntryR\aentries\"\xf8\x02\n" +
 	"\bPipeline\x12&\n" +
 	"\x05ports\x18\x01 \x03(\v2\x10.bess.pb.v2.PortR\x05ports\x12,\n" +
 	"\amodules\x18\x02 \x03(\v2\x12.bess.pb.v2.ModuleR\amodules\x128\n" +
 	"\vconnections\x18\x03 \x03(\v2\x16.bess.pb.v2.ConnectionR\vconnections\x12,\n" +
 	"\aworkers\x18\x04 \x03(\v2\x12.bess.pb.v2.WorkerR\aworkers\x12A\n" +
 	"\x0ftraffic_classes\x18\x05 \x03(\v2\x18.bess.pb.v2.TrafficClassR\x0etrafficClasses\x12/\n" +
-	"\x05tasks\x18\x06 \x03(\v2\x19.bess.pb.v2.TaskPlacementR\x05tasks\"x\n" +
+	"\x05tasks\x18\x06 \x03(\v2\x19.bess.pb.v2.TaskPlacementR\x05tasks\x12:\n" +
+	"\tresources\x18\a \x03(\v2\x1c.bess.pb.v2.ResourceContentsR\tresources\"x\n" +
 	"\x06Change\x12*\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x16.bess.pb.v2.ObjectTypeR\x04type\x12\x16\n" +
 	"\x06object\x18\x02 \x01(\tR\x06object\x12*\n" +
-	"\x04kind\x18\x03 \x01(\x0e2\x16.bess.pb.v2.ChangeKindR\x04kind\"<\n" +
+	"\x04kind\x18\x03 \x01(\x0e2\x16.bess.pb.v2.ChangeKindR\x04kind\"\x8b\x01\n" +
+	"\rResourceDelta\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
+	"\acreated\x18\x02 \x01(\x04R\acreated\x12\x18\n" +
+	"\aupdated\x18\x03 \x01(\x04R\aupdated\x12\x18\n" +
+	"\aremoved\x18\x04 \x01(\x04R\aremoved\x12\x18\n" +
+	"\achecked\x18\x05 \x01(\bR\achecked\"u\n" +
 	"\fPipelineDiff\x12,\n" +
-	"\achanges\x18\x01 \x03(\v2\x12.bess.pb.v2.ChangeR\achanges\"\x99\x01\n" +
+	"\achanges\x18\x01 \x03(\v2\x12.bess.pb.v2.ChangeR\achanges\x127\n" +
+	"\tresources\x18\x02 \x03(\v2\x19.bess.pb.v2.ResourceDeltaR\tresources\"\x99\x01\n" +
 	"\bPlanStep\x12+\n" +
 	"\x05phase\x18\x01 \x01(\x0e2\x15.bess.pb.v2.PlanPhaseR\x05phase\x12\x1c\n" +
 	"\toperation\x18\x02 \x01(\tR\toperation\x12*\n" +
@@ -5127,15 +5588,18 @@ const file_control_v2_proto_rawDesc = "" +
 	"cross_numa\x18\x04 \x01(\bR\tcrossNuma\x12\x1f\n" +
 	"\vshares_core\x18\x05 \x01(\bR\n" +
 	"sharesCore\x12$\n" +
-	"\x0eon_control_cpu\x18\x06 \x01(\bR\fonControlCpu\"\x14\n" +
-	"\x12GetPipelineRequest\"\xc1\x01\n" +
+	"\x0eon_control_cpu\x18\x06 \x01(\bR\fonControlCpu\"_\n" +
+	"\x12GetPipelineRequest\x12+\n" +
+	"\x11include_resources\x18\x01 \x01(\bR\x10includeResources\x12\x1c\n" +
+	"\tresources\x18\x02 \x03(\tR\tresources\"\xf2\x01\n" +
 	"\x13GetPipelineResponse\x120\n" +
 	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x02 \x01(\x04R\n" +
 	"generation\x12!\n" +
 	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpoch\x125\n" +
-	"\aworkers\x18\x04 \x03(\v2\x1b.bess.pb.v2.WorkerPlacementR\aworkers\"K\n" +
+	"\aworkers\x18\x04 \x03(\v2\x1b.bess.pb.v2.WorkerPlacementR\aworkers\x12/\n" +
+	"\x13resource_generation\x18\x05 \x01(\x04R\x12resourceGeneration\"K\n" +
 	"\x17ValidatePipelineRequest\x120\n" +
 	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\"P\n" +
 	"\x18ValidatePipelineResponse\x124\n" +
@@ -5143,26 +5607,30 @@ const file_control_v2_proto_rawDesc = "" +
 	"normalized\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\n" +
 	"normalized\"G\n" +
 	"\x13DiffPipelineRequest\x120\n" +
-	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\"\x87\x01\n" +
+	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\"\xb8\x01\n" +
 	"\x14DiffPipelineResponse\x12,\n" +
 	"\x04diff\x18\x01 \x01(\v2\x18.bess.pb.v2.PipelineDiffR\x04diff\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x02 \x01(\x04R\n" +
 	"generation\x12!\n" +
-	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpoch\"G\n" +
+	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpoch\x12/\n" +
+	"\x13resource_generation\x18\x04 \x01(\x04R\x12resourceGeneration\"G\n" +
 	"\x13PlanPipelineRequest\x120\n" +
-	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\"\x85\x01\n" +
+	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\"\xb6\x01\n" +
 	"\x14PlanPipelineResponse\x12*\n" +
 	"\x05steps\x18\x01 \x03(\v2\x14.bess.pb.v2.PlanStepR\x05steps\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x02 \x01(\x04R\n" +
 	"generation\x12!\n" +
-	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpoch\"\xb9\x01\n" +
+	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpoch\x12/\n" +
+	"\x13resource_generation\x18\x04 \x01(\x04R\x12resourceGeneration\"\xa1\x02\n" +
 	"\x14ApplyPipelineRequest\x120\n" +
 	"\bpipeline\x18\x01 \x01(\v2\x14.bess.pb.v2.PipelineR\bpipeline\x124\n" +
 	"\x13expected_generation\x18\x02 \x01(\x04H\x00R\x12expectedGeneration\x88\x01\x01\x12!\n" +
-	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpochB\x16\n" +
-	"\x14_expected_generation\"\xad\x02\n" +
+	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpoch\x12E\n" +
+	"\x1cexpected_resource_generation\x18\x04 \x01(\x04H\x01R\x1aexpectedResourceGeneration\x88\x01\x01B\x16\n" +
+	"\x14_expected_generationB\x1f\n" +
+	"\x1d_expected_resource_generation\"\x81\x03\n" +
 	"\x15ApplyPipelineResponse\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\x04R\n" +
@@ -5175,7 +5643,10 @@ const file_control_v2_proto_rawDesc = "" +
 	"prepare_us\x18\x05 \x01(\x04R\tprepareUs\x12(\n" +
 	"\x10paused_commit_us\x18\x06 \x01(\x04R\x0epausedCommitUs\x12\x1b\n" +
 	"\tretire_us\x18\a \x01(\x04R\bretireUs\x12!\n" +
-	"\fdaemon_epoch\x18\b \x01(\x04R\vdaemonEpoch\"\x99\x03\n" +
+	"\fdaemon_epoch\x18\b \x01(\x04R\vdaemonEpoch\x12/\n" +
+	"\x13resource_generation\x18\t \x01(\x04R\x12resourceGeneration\x12!\n" +
+	"\fresource_ops\x18\n" +
+	" \x01(\x04R\vresourceOps\"\x99\x03\n" +
 	"\vErrorDetail\x120\n" +
 	"\x04code\x18\x01 \x01(\x0e2\x1c.bess.pb.v2.ErrorDetail.CodeR\x04code\x12\x1f\n" +
 	"\verrno_value\x18\x02 \x01(\x05R\n" +
@@ -5254,12 +5725,18 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x05known\x18\x01 \x01(\bR\x05known\x125\n" +
 	"\x06record\x18\x02 \x01(\v2\x1d.bess.pb.v2.TransactionRecordR\x06record\x12!\n" +
 	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpoch\"!\n" +
-	"\x1fListTransactionResourcesRequest\"c\n" +
+	"\x1fListTransactionResourcesRequest\"\x95\x02\n" +
 	"\x13TransactionResource\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x19\n" +
 	"\bkey_type\x18\x02 \x01(\tR\akeyType\x12\x1d\n" +
 	"\n" +
-	"value_type\x18\x03 \x01(\tR\tvalueType\"\xa4\x01\n" +
+	"value_type\x18\x03 \x01(\tR\tvalueType\x128\n" +
+	"\x04kind\x18\x04 \x01(\x0e2$.bess.pb.v2.TransactionResource.KindR\x04kind\x126\n" +
+	"\x17requires_paused_workers\x18\x05 \x01(\bR\x15requiresPausedWorkers\">\n" +
+	"\x04Kind\x12\x14\n" +
+	"\x10KIND_UNSPECIFIED\x10\x00\x12\f\n" +
+	"\bKIND_MAP\x10\x01\x12\x12\n" +
+	"\x0eKIND_SINGLETON\x10\x02\"\xa4\x01\n" +
 	" ListTransactionResourcesResponse\x12=\n" +
 	"\tresources\x18\x01 \x03(\v2\x1f.bess.pb.v2.TransactionResourceR\tresources\x12\x1e\n" +
 	"\n" +
@@ -5305,19 +5782,29 @@ const file_control_v2_proto_rawDesc = "" +
 	"\n" +
 	"simd_width\x18\r \x01(\rR\tsimdWidth\x12&\n" +
 	"\x0fdpdk_simd_width\x18\x0e \x01(\rR\rdpdkSimdWidth\"\x12\n" +
-	"\x10GetSchemaRequest\"_\n" +
-	"\rCommandSchema\x12\x12\n" +
+	"\x10GetSchemaRequest\"\xd2\x01\n" +
+	"\x0eResourceSchema\x12\x14\n" +
+	"\x05table\x18\x01 \x01(\tR\x05table\x128\n" +
+	"\x04kind\x18\x02 \x01(\x0e2$.bess.pb.v2.TransactionResource.KindR\x04kind\x12\x19\n" +
+	"\bkey_type\x18\x03 \x01(\tR\akeyType\x12\x1d\n" +
+	"\n" +
+	"value_type\x18\x04 \x01(\tR\tvalueType\x126\n" +
+	"\x17requires_paused_workers\x18\x05 \x01(\bR\x15requiresPausedWorkers\"\x7f\n" +
+	"\fActionSchema\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x19\n" +
 	"\barg_type\x18\x02 \x01(\tR\aargType\x12\x1f\n" +
-	"\vthread_safe\x18\x03 \x01(\bR\n" +
-	"threadSafe\"\xc6\x01\n" +
+	"\vresult_type\x18\x03 \x01(\tR\n" +
+	"resultType\x12\x1f\n" +
+	"\vthread_safe\x18\x04 \x01(\bR\n" +
+	"threadSafe\"\x8d\x02\n" +
 	"\x11ModuleClassSchema\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04help\x18\x02 \x01(\tR\x04help\x12\"\n" +
 	"\rinit_arg_type\x18\x03 \x01(\tR\vinitArgType\x12\x16\n" +
 	"\x06igates\x18\x04 \x01(\rR\x06igates\x12\x16\n" +
-	"\x06ogates\x18\x05 \x01(\rR\x06ogates\x125\n" +
-	"\bcommands\x18\x06 \x03(\v2\x19.bess.pb.v2.CommandSchemaR\bcommands\"^\n" +
+	"\x06ogates\x18\x05 \x01(\rR\x06ogates\x122\n" +
+	"\aactions\x18\a \x03(\v2\x18.bess.pb.v2.ActionSchemaR\aactions\x128\n" +
+	"\tresources\x18\b \x03(\v2\x1a.bess.pb.v2.ResourceSchemaR\tresourcesJ\x04\b\x06\x10\aR\bcommands\"^\n" +
 	"\x10PortDriverSchema\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04help\x18\x02 \x01(\tR\x04help\x12\"\n" +
@@ -5363,14 +5850,14 @@ const file_control_v2_proto_rawDesc = "" +
 	"KIND_GAUGE\x10\x02\"l\n" +
 	"\x13ListMetricsResponse\x122\n" +
 	"\asamples\x18\x01 \x03(\v2\x18.bess.pb.v2.MetricSampleR\asamples\x12!\n" +
-	"\fdaemon_epoch\x18\x02 \x01(\x04R\vdaemonEpoch\"\x96\x01\n" +
-	"\x17RunModuleCommandRequest\x12!\n" +
+	"\fdaemon_epoch\x18\x02 \x01(\x04R\vdaemonEpoch\"\x90\x01\n" +
+	"\x13InvokeActionRequest\x12!\n" +
 	"\fdaemon_epoch\x18\x01 \x01(\x04R\vdaemonEpoch\x12\x16\n" +
-	"\x06module\x18\x02 \x01(\tR\x06module\x12\x18\n" +
-	"\acommand\x18\x03 \x01(\tR\acommand\x12&\n" +
+	"\x06module\x18\x02 \x01(\tR\x06module\x12\x16\n" +
+	"\x06action\x18\x03 \x01(\tR\x06action\x12&\n" +
 	"\x03arg\x18\x04 \x01(\v2\x14.google.protobuf.AnyR\x03arg\"g\n" +
-	"\x18RunModuleCommandResponse\x12(\n" +
-	"\x04data\x18\x01 \x01(\v2\x14.google.protobuf.AnyR\x04data\x12!\n" +
+	"\x14InvokeActionResponse\x12,\n" +
+	"\x06result\x18\x01 \x01(\v2\x14.google.protobuf.AnyR\x06result\x12!\n" +
 	"\fdaemon_epoch\x18\x02 \x01(\x04R\vdaemonEpoch\"L\n" +
 	"\x13ImportPluginRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12!\n" +
@@ -5453,7 +5940,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x0fShutdownRequest\x12!\n" +
 	"\fdaemon_epoch\x18\x01 \x01(\x04R\vdaemonEpoch\"5\n" +
 	"\x10ShutdownResponse\x12!\n" +
-	"\fdaemon_epoch\x18\x01 \x01(\x04R\vdaemonEpoch*x\n" +
+	"\fdaemon_epoch\x18\x01 \x01(\x04R\vdaemonEpoch*\x86\x01\n" +
 	"\n" +
 	"ObjectType\x12\x1b\n" +
 	"\x17OBJECT_TYPE_UNSPECIFIED\x10\x00\x12\b\n" +
@@ -5465,7 +5952,8 @@ const file_control_v2_proto_rawDesc = "" +
 	"\n" +
 	"\x06WORKER\x10\x04\x12\x11\n" +
 	"\rTRAFFIC_CLASS\x10\x05\x12\b\n" +
-	"\x04TASK\x10\x06*m\n" +
+	"\x04TASK\x10\x06\x12\f\n" +
+	"\bRESOURCE\x10\a*m\n" +
 	"\n" +
 	"ChangeKind\x12\x1b\n" +
 	"\x17CHANGE_KIND_UNSPECIFIED\x10\x00\x12\n" +
@@ -5483,7 +5971,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\n" +
 	"\n" +
-	"\x06RETIRE\x10\x032\x96\t\n" +
+	"\x06RETIRE\x10\x032\x8a\t\n" +
 	"\aControl\x12P\n" +
 	"\vGetPipeline\x12\x1e.bess.pb.v2.GetPipelineRequest\x1a\x1f.bess.pb.v2.GetPipelineResponse\"\x00\x12_\n" +
 	"\x10ValidatePipeline\x12#.bess.pb.v2.ValidatePipelineRequest\x1a$.bess.pb.v2.ValidatePipelineResponse\"\x00\x12S\n" +
@@ -5496,8 +5984,8 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x0fGetCapabilities\x12\".bess.pb.v2.GetCapabilitiesRequest\x1a#.bess.pb.v2.GetCapabilitiesResponse\"\x00\x12J\n" +
 	"\tGetSchema\x12\x1c.bess.pb.v2.GetSchemaRequest\x1a\x1d.bess.pb.v2.GetSchemaResponse\"\x00\x12D\n" +
 	"\vWatchEvents\x12\x1e.bess.pb.v2.WatchEventsRequest\x1a\x11.bess.pb.v2.Event\"\x000\x01\x12w\n" +
-	"\x18ListTransactionResources\x12+.bess.pb.v2.ListTransactionResourcesRequest\x1a,.bess.pb.v2.ListTransactionResourcesResponse\"\x00\x12_\n" +
-	"\x10RunModuleCommand\x12#.bess.pb.v2.RunModuleCommandRequest\x1a$.bess.pb.v2.RunModuleCommandResponse\"\x002\xa9\x05\n" +
+	"\x18ListTransactionResources\x12+.bess.pb.v2.ListTransactionResourcesRequest\x1a,.bess.pb.v2.ListTransactionResourcesResponse\"\x00\x12S\n" +
+	"\fInvokeAction\x12\x1f.bess.pb.v2.InvokeActionRequest\x1a .bess.pb.v2.InvokeActionResponse\"\x002\xa9\x05\n" +
 	"\x05Admin\x12S\n" +
 	"\fImportPlugin\x12\x1f.bess.pb.v2.ImportPluginRequest\x1a .bess.pb.v2.ImportPluginResponse\"\x00\x12S\n" +
 	"\fUnloadPlugin\x12\x1f.bess.pb.v2.UnloadPluginRequest\x1a .bess.pb.v2.UnloadPluginResponse\"\x00\x12V\n" +
@@ -5521,8 +6009,8 @@ func file_control_v2_proto_rawDescGZIP() []byte {
 	return file_control_v2_proto_rawDescData
 }
 
-var file_control_v2_proto_enumTypes = make([]protoimpl.EnumInfo, 11)
-var file_control_v2_proto_msgTypes = make([]protoimpl.MessageInfo, 72)
+var file_control_v2_proto_enumTypes = make([]protoimpl.EnumInfo, 12)
+var file_control_v2_proto_msgTypes = make([]protoimpl.MessageInfo, 76)
 var file_control_v2_proto_goTypes = []any{
 	(ObjectType)(0),                          // 0: bess.pb.v2.ObjectType
 	(ChangeKind)(0),                          // 1: bess.pb.v2.ChangeKind
@@ -5532,188 +6020,201 @@ var file_control_v2_proto_goTypes = []any{
 	(TransactionOpResult_Status)(0),          // 5: bess.pb.v2.TransactionOpResult.Status
 	(TransactionRecord_Outcome)(0),           // 6: bess.pb.v2.TransactionRecord.Outcome
 	(TransactionRecord_Visibility)(0),        // 7: bess.pb.v2.TransactionRecord.Visibility
-	(MetricSample_Kind)(0),                   // 8: bess.pb.v2.MetricSample.Kind
-	(SetCaptureRequest_Direction)(0),         // 9: bess.pb.v2.SetCaptureRequest.Direction
-	(SetCaptureRequest_Format)(0),            // 10: bess.pb.v2.SetCaptureRequest.Format
-	(*Port)(nil),                             // 11: bess.pb.v2.Port
-	(*Module)(nil),                           // 12: bess.pb.v2.Module
-	(*Connection)(nil),                       // 13: bess.pb.v2.Connection
-	(*Worker)(nil),                           // 14: bess.pb.v2.Worker
-	(*TrafficClass)(nil),                     // 15: bess.pb.v2.TrafficClass
-	(*TaskPlacement)(nil),                    // 16: bess.pb.v2.TaskPlacement
-	(*Pipeline)(nil),                         // 17: bess.pb.v2.Pipeline
-	(*Change)(nil),                           // 18: bess.pb.v2.Change
-	(*PipelineDiff)(nil),                     // 19: bess.pb.v2.PipelineDiff
-	(*PlanStep)(nil),                         // 20: bess.pb.v2.PlanStep
-	(*WorkerPlacement)(nil),                  // 21: bess.pb.v2.WorkerPlacement
-	(*GetPipelineRequest)(nil),               // 22: bess.pb.v2.GetPipelineRequest
-	(*GetPipelineResponse)(nil),              // 23: bess.pb.v2.GetPipelineResponse
-	(*ValidatePipelineRequest)(nil),          // 24: bess.pb.v2.ValidatePipelineRequest
-	(*ValidatePipelineResponse)(nil),         // 25: bess.pb.v2.ValidatePipelineResponse
-	(*DiffPipelineRequest)(nil),              // 26: bess.pb.v2.DiffPipelineRequest
-	(*DiffPipelineResponse)(nil),             // 27: bess.pb.v2.DiffPipelineResponse
-	(*PlanPipelineRequest)(nil),              // 28: bess.pb.v2.PlanPipelineRequest
-	(*PlanPipelineResponse)(nil),             // 29: bess.pb.v2.PlanPipelineResponse
-	(*ApplyPipelineRequest)(nil),             // 30: bess.pb.v2.ApplyPipelineRequest
-	(*ApplyPipelineResponse)(nil),            // 31: bess.pb.v2.ApplyPipelineResponse
-	(*ErrorDetail)(nil),                      // 32: bess.pb.v2.ErrorDetail
-	(*TransactionOp)(nil),                    // 33: bess.pb.v2.TransactionOp
-	(*ApplyTransactionRequest)(nil),          // 34: bess.pb.v2.ApplyTransactionRequest
-	(*TransactionOpResult)(nil),              // 35: bess.pb.v2.TransactionOpResult
-	(*TransactionRecord)(nil),                // 36: bess.pb.v2.TransactionRecord
-	(*ApplyTransactionResponse)(nil),         // 37: bess.pb.v2.ApplyTransactionResponse
-	(*GetTransactionRequest)(nil),            // 38: bess.pb.v2.GetTransactionRequest
-	(*GetTransactionResponse)(nil),           // 39: bess.pb.v2.GetTransactionResponse
-	(*ListTransactionResourcesRequest)(nil),  // 40: bess.pb.v2.ListTransactionResourcesRequest
-	(*TransactionResource)(nil),              // 41: bess.pb.v2.TransactionResource
-	(*ListTransactionResourcesResponse)(nil), // 42: bess.pb.v2.ListTransactionResourcesResponse
-	(*GetCapabilitiesRequest)(nil),           // 43: bess.pb.v2.GetCapabilitiesRequest
-	(*PluginInfo)(nil),                       // 44: bess.pb.v2.PluginInfo
-	(*PortInfo)(nil),                         // 45: bess.pb.v2.PortInfo
-	(*GetCapabilitiesResponse)(nil),          // 46: bess.pb.v2.GetCapabilitiesResponse
-	(*GetSchemaRequest)(nil),                 // 47: bess.pb.v2.GetSchemaRequest
-	(*CommandSchema)(nil),                    // 48: bess.pb.v2.CommandSchema
-	(*ModuleClassSchema)(nil),                // 49: bess.pb.v2.ModuleClassSchema
-	(*PortDriverSchema)(nil),                 // 50: bess.pb.v2.PortDriverSchema
-	(*GetSchemaResponse)(nil),                // 51: bess.pb.v2.GetSchemaResponse
-	(*WatchEventsRequest)(nil),               // 52: bess.pb.v2.WatchEventsRequest
-	(*Event)(nil),                            // 53: bess.pb.v2.Event
-	(*ListMetricsRequest)(nil),               // 54: bess.pb.v2.ListMetricsRequest
-	(*MetricSample)(nil),                     // 55: bess.pb.v2.MetricSample
-	(*ListMetricsResponse)(nil),              // 56: bess.pb.v2.ListMetricsResponse
-	(*RunModuleCommandRequest)(nil),          // 57: bess.pb.v2.RunModuleCommandRequest
-	(*RunModuleCommandResponse)(nil),         // 58: bess.pb.v2.RunModuleCommandResponse
-	(*ImportPluginRequest)(nil),              // 59: bess.pb.v2.ImportPluginRequest
-	(*ImportPluginResponse)(nil),             // 60: bess.pb.v2.ImportPluginResponse
-	(*UnloadPluginRequest)(nil),              // 61: bess.pb.v2.UnloadPluginRequest
-	(*UnloadPluginResponse)(nil),             // 62: bess.pb.v2.UnloadPluginResponse
-	(*GetPortStatusRequest)(nil),             // 63: bess.pb.v2.GetPortStatusRequest
-	(*PortStatus)(nil),                       // 64: bess.pb.v2.PortStatus
-	(*GetPortStatusResponse)(nil),            // 65: bess.pb.v2.GetPortStatusResponse
-	(*GetPacketPoolsRequest)(nil),            // 66: bess.pb.v2.GetPacketPoolsRequest
-	(*PacketPool)(nil),                       // 67: bess.pb.v2.PacketPool
-	(*GetPacketPoolsResponse)(nil),           // 68: bess.pb.v2.GetPacketPoolsResponse
-	(*SetCaptureRequest)(nil),                // 69: bess.pb.v2.SetCaptureRequest
-	(*SetCaptureResponse)(nil),               // 70: bess.pb.v2.SetCaptureResponse
-	(*PauseWorkersRequest)(nil),              // 71: bess.pb.v2.PauseWorkersRequest
-	(*PauseWorkersResponse)(nil),             // 72: bess.pb.v2.PauseWorkersResponse
-	(*ResumeWorkersRequest)(nil),             // 73: bess.pb.v2.ResumeWorkersRequest
-	(*ResumeWorkersResponse)(nil),            // 74: bess.pb.v2.ResumeWorkersResponse
-	(*ShutdownRequest)(nil),                  // 75: bess.pb.v2.ShutdownRequest
-	(*ShutdownResponse)(nil),                 // 76: bess.pb.v2.ShutdownResponse
-	nil,                                      // 77: bess.pb.v2.TrafficClass.LimitEntry
-	nil,                                      // 78: bess.pb.v2.TrafficClass.MaxBurstEntry
-	nil,                                      // 79: bess.pb.v2.Event.FieldsEntry
-	nil,                                      // 80: bess.pb.v2.MetricSample.LabelsEntry
-	(*PortStatus_Link)(nil),                  // 81: bess.pb.v2.PortStatus.Link
-	(*PortStatus_Counters)(nil),              // 82: bess.pb.v2.PortStatus.Counters
-	(*anypb.Any)(nil),                        // 83: google.protobuf.Any
-	(*descriptorpb.FileDescriptorSet)(nil),   // 84: google.protobuf.FileDescriptorSet
+	(TransactionResource_Kind)(0),            // 8: bess.pb.v2.TransactionResource.Kind
+	(MetricSample_Kind)(0),                   // 9: bess.pb.v2.MetricSample.Kind
+	(SetCaptureRequest_Direction)(0),         // 10: bess.pb.v2.SetCaptureRequest.Direction
+	(SetCaptureRequest_Format)(0),            // 11: bess.pb.v2.SetCaptureRequest.Format
+	(*Port)(nil),                             // 12: bess.pb.v2.Port
+	(*Module)(nil),                           // 13: bess.pb.v2.Module
+	(*Connection)(nil),                       // 14: bess.pb.v2.Connection
+	(*Worker)(nil),                           // 15: bess.pb.v2.Worker
+	(*TrafficClass)(nil),                     // 16: bess.pb.v2.TrafficClass
+	(*TaskPlacement)(nil),                    // 17: bess.pb.v2.TaskPlacement
+	(*ResourceEntry)(nil),                    // 18: bess.pb.v2.ResourceEntry
+	(*ResourceContents)(nil),                 // 19: bess.pb.v2.ResourceContents
+	(*Pipeline)(nil),                         // 20: bess.pb.v2.Pipeline
+	(*Change)(nil),                           // 21: bess.pb.v2.Change
+	(*ResourceDelta)(nil),                    // 22: bess.pb.v2.ResourceDelta
+	(*PipelineDiff)(nil),                     // 23: bess.pb.v2.PipelineDiff
+	(*PlanStep)(nil),                         // 24: bess.pb.v2.PlanStep
+	(*WorkerPlacement)(nil),                  // 25: bess.pb.v2.WorkerPlacement
+	(*GetPipelineRequest)(nil),               // 26: bess.pb.v2.GetPipelineRequest
+	(*GetPipelineResponse)(nil),              // 27: bess.pb.v2.GetPipelineResponse
+	(*ValidatePipelineRequest)(nil),          // 28: bess.pb.v2.ValidatePipelineRequest
+	(*ValidatePipelineResponse)(nil),         // 29: bess.pb.v2.ValidatePipelineResponse
+	(*DiffPipelineRequest)(nil),              // 30: bess.pb.v2.DiffPipelineRequest
+	(*DiffPipelineResponse)(nil),             // 31: bess.pb.v2.DiffPipelineResponse
+	(*PlanPipelineRequest)(nil),              // 32: bess.pb.v2.PlanPipelineRequest
+	(*PlanPipelineResponse)(nil),             // 33: bess.pb.v2.PlanPipelineResponse
+	(*ApplyPipelineRequest)(nil),             // 34: bess.pb.v2.ApplyPipelineRequest
+	(*ApplyPipelineResponse)(nil),            // 35: bess.pb.v2.ApplyPipelineResponse
+	(*ErrorDetail)(nil),                      // 36: bess.pb.v2.ErrorDetail
+	(*TransactionOp)(nil),                    // 37: bess.pb.v2.TransactionOp
+	(*ApplyTransactionRequest)(nil),          // 38: bess.pb.v2.ApplyTransactionRequest
+	(*TransactionOpResult)(nil),              // 39: bess.pb.v2.TransactionOpResult
+	(*TransactionRecord)(nil),                // 40: bess.pb.v2.TransactionRecord
+	(*ApplyTransactionResponse)(nil),         // 41: bess.pb.v2.ApplyTransactionResponse
+	(*GetTransactionRequest)(nil),            // 42: bess.pb.v2.GetTransactionRequest
+	(*GetTransactionResponse)(nil),           // 43: bess.pb.v2.GetTransactionResponse
+	(*ListTransactionResourcesRequest)(nil),  // 44: bess.pb.v2.ListTransactionResourcesRequest
+	(*TransactionResource)(nil),              // 45: bess.pb.v2.TransactionResource
+	(*ListTransactionResourcesResponse)(nil), // 46: bess.pb.v2.ListTransactionResourcesResponse
+	(*GetCapabilitiesRequest)(nil),           // 47: bess.pb.v2.GetCapabilitiesRequest
+	(*PluginInfo)(nil),                       // 48: bess.pb.v2.PluginInfo
+	(*PortInfo)(nil),                         // 49: bess.pb.v2.PortInfo
+	(*GetCapabilitiesResponse)(nil),          // 50: bess.pb.v2.GetCapabilitiesResponse
+	(*GetSchemaRequest)(nil),                 // 51: bess.pb.v2.GetSchemaRequest
+	(*ResourceSchema)(nil),                   // 52: bess.pb.v2.ResourceSchema
+	(*ActionSchema)(nil),                     // 53: bess.pb.v2.ActionSchema
+	(*ModuleClassSchema)(nil),                // 54: bess.pb.v2.ModuleClassSchema
+	(*PortDriverSchema)(nil),                 // 55: bess.pb.v2.PortDriverSchema
+	(*GetSchemaResponse)(nil),                // 56: bess.pb.v2.GetSchemaResponse
+	(*WatchEventsRequest)(nil),               // 57: bess.pb.v2.WatchEventsRequest
+	(*Event)(nil),                            // 58: bess.pb.v2.Event
+	(*ListMetricsRequest)(nil),               // 59: bess.pb.v2.ListMetricsRequest
+	(*MetricSample)(nil),                     // 60: bess.pb.v2.MetricSample
+	(*ListMetricsResponse)(nil),              // 61: bess.pb.v2.ListMetricsResponse
+	(*InvokeActionRequest)(nil),              // 62: bess.pb.v2.InvokeActionRequest
+	(*InvokeActionResponse)(nil),             // 63: bess.pb.v2.InvokeActionResponse
+	(*ImportPluginRequest)(nil),              // 64: bess.pb.v2.ImportPluginRequest
+	(*ImportPluginResponse)(nil),             // 65: bess.pb.v2.ImportPluginResponse
+	(*UnloadPluginRequest)(nil),              // 66: bess.pb.v2.UnloadPluginRequest
+	(*UnloadPluginResponse)(nil),             // 67: bess.pb.v2.UnloadPluginResponse
+	(*GetPortStatusRequest)(nil),             // 68: bess.pb.v2.GetPortStatusRequest
+	(*PortStatus)(nil),                       // 69: bess.pb.v2.PortStatus
+	(*GetPortStatusResponse)(nil),            // 70: bess.pb.v2.GetPortStatusResponse
+	(*GetPacketPoolsRequest)(nil),            // 71: bess.pb.v2.GetPacketPoolsRequest
+	(*PacketPool)(nil),                       // 72: bess.pb.v2.PacketPool
+	(*GetPacketPoolsResponse)(nil),           // 73: bess.pb.v2.GetPacketPoolsResponse
+	(*SetCaptureRequest)(nil),                // 74: bess.pb.v2.SetCaptureRequest
+	(*SetCaptureResponse)(nil),               // 75: bess.pb.v2.SetCaptureResponse
+	(*PauseWorkersRequest)(nil),              // 76: bess.pb.v2.PauseWorkersRequest
+	(*PauseWorkersResponse)(nil),             // 77: bess.pb.v2.PauseWorkersResponse
+	(*ResumeWorkersRequest)(nil),             // 78: bess.pb.v2.ResumeWorkersRequest
+	(*ResumeWorkersResponse)(nil),            // 79: bess.pb.v2.ResumeWorkersResponse
+	(*ShutdownRequest)(nil),                  // 80: bess.pb.v2.ShutdownRequest
+	(*ShutdownResponse)(nil),                 // 81: bess.pb.v2.ShutdownResponse
+	nil,                                      // 82: bess.pb.v2.TrafficClass.LimitEntry
+	nil,                                      // 83: bess.pb.v2.TrafficClass.MaxBurstEntry
+	nil,                                      // 84: bess.pb.v2.Event.FieldsEntry
+	nil,                                      // 85: bess.pb.v2.MetricSample.LabelsEntry
+	(*PortStatus_Link)(nil),                  // 86: bess.pb.v2.PortStatus.Link
+	(*PortStatus_Counters)(nil),              // 87: bess.pb.v2.PortStatus.Counters
+	(*anypb.Any)(nil),                        // 88: google.protobuf.Any
+	(*descriptorpb.FileDescriptorSet)(nil),   // 89: google.protobuf.FileDescriptorSet
 }
 var file_control_v2_proto_depIdxs = []int32{
-	83, // 0: bess.pb.v2.Port.arg:type_name -> google.protobuf.Any
-	83, // 1: bess.pb.v2.Module.arg:type_name -> google.protobuf.Any
-	77, // 2: bess.pb.v2.TrafficClass.limit:type_name -> bess.pb.v2.TrafficClass.LimitEntry
-	78, // 3: bess.pb.v2.TrafficClass.max_burst:type_name -> bess.pb.v2.TrafficClass.MaxBurstEntry
-	11, // 4: bess.pb.v2.Pipeline.ports:type_name -> bess.pb.v2.Port
-	12, // 5: bess.pb.v2.Pipeline.modules:type_name -> bess.pb.v2.Module
-	13, // 6: bess.pb.v2.Pipeline.connections:type_name -> bess.pb.v2.Connection
-	14, // 7: bess.pb.v2.Pipeline.workers:type_name -> bess.pb.v2.Worker
-	15, // 8: bess.pb.v2.Pipeline.traffic_classes:type_name -> bess.pb.v2.TrafficClass
-	16, // 9: bess.pb.v2.Pipeline.tasks:type_name -> bess.pb.v2.TaskPlacement
-	0,  // 10: bess.pb.v2.Change.type:type_name -> bess.pb.v2.ObjectType
-	1,  // 11: bess.pb.v2.Change.kind:type_name -> bess.pb.v2.ChangeKind
-	18, // 12: bess.pb.v2.PipelineDiff.changes:type_name -> bess.pb.v2.Change
-	2,  // 13: bess.pb.v2.PlanStep.phase:type_name -> bess.pb.v2.PlanPhase
-	0,  // 14: bess.pb.v2.PlanStep.type:type_name -> bess.pb.v2.ObjectType
-	17, // 15: bess.pb.v2.GetPipelineResponse.pipeline:type_name -> bess.pb.v2.Pipeline
-	21, // 16: bess.pb.v2.GetPipelineResponse.workers:type_name -> bess.pb.v2.WorkerPlacement
-	17, // 17: bess.pb.v2.ValidatePipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
-	17, // 18: bess.pb.v2.ValidatePipelineResponse.normalized:type_name -> bess.pb.v2.Pipeline
-	17, // 19: bess.pb.v2.DiffPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
-	19, // 20: bess.pb.v2.DiffPipelineResponse.diff:type_name -> bess.pb.v2.PipelineDiff
-	17, // 21: bess.pb.v2.PlanPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
-	20, // 22: bess.pb.v2.PlanPipelineResponse.steps:type_name -> bess.pb.v2.PlanStep
-	17, // 23: bess.pb.v2.ApplyPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
-	3,  // 24: bess.pb.v2.ErrorDetail.code:type_name -> bess.pb.v2.ErrorDetail.Code
-	83, // 25: bess.pb.v2.TransactionOp.key:type_name -> google.protobuf.Any
-	83, // 26: bess.pb.v2.TransactionOp.value:type_name -> google.protobuf.Any
-	33, // 27: bess.pb.v2.ApplyTransactionRequest.ops:type_name -> bess.pb.v2.TransactionOp
-	4,  // 28: bess.pb.v2.ApplyTransactionRequest.consistency:type_name -> bess.pb.v2.ApplyTransactionRequest.Consistency
-	5,  // 29: bess.pb.v2.TransactionOpResult.status:type_name -> bess.pb.v2.TransactionOpResult.Status
-	6,  // 30: bess.pb.v2.TransactionRecord.outcome:type_name -> bess.pb.v2.TransactionRecord.Outcome
-	35, // 31: bess.pb.v2.TransactionRecord.ops:type_name -> bess.pb.v2.TransactionOpResult
-	7,  // 32: bess.pb.v2.TransactionRecord.visibility:type_name -> bess.pb.v2.TransactionRecord.Visibility
-	36, // 33: bess.pb.v2.ApplyTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
-	36, // 34: bess.pb.v2.GetTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
-	41, // 35: bess.pb.v2.ListTransactionResourcesResponse.resources:type_name -> bess.pb.v2.TransactionResource
-	44, // 36: bess.pb.v2.GetCapabilitiesResponse.plugins:type_name -> bess.pb.v2.PluginInfo
-	45, // 37: bess.pb.v2.GetCapabilitiesResponse.ports:type_name -> bess.pb.v2.PortInfo
-	41, // 38: bess.pb.v2.GetCapabilitiesResponse.resources:type_name -> bess.pb.v2.TransactionResource
-	48, // 39: bess.pb.v2.ModuleClassSchema.commands:type_name -> bess.pb.v2.CommandSchema
-	49, // 40: bess.pb.v2.GetSchemaResponse.module_classes:type_name -> bess.pb.v2.ModuleClassSchema
-	50, // 41: bess.pb.v2.GetSchemaResponse.port_drivers:type_name -> bess.pb.v2.PortDriverSchema
-	84, // 42: bess.pb.v2.GetSchemaResponse.descriptors:type_name -> google.protobuf.FileDescriptorSet
-	79, // 43: bess.pb.v2.Event.fields:type_name -> bess.pb.v2.Event.FieldsEntry
-	8,  // 44: bess.pb.v2.MetricSample.kind:type_name -> bess.pb.v2.MetricSample.Kind
-	80, // 45: bess.pb.v2.MetricSample.labels:type_name -> bess.pb.v2.MetricSample.LabelsEntry
-	55, // 46: bess.pb.v2.ListMetricsResponse.samples:type_name -> bess.pb.v2.MetricSample
-	83, // 47: bess.pb.v2.RunModuleCommandRequest.arg:type_name -> google.protobuf.Any
-	83, // 48: bess.pb.v2.RunModuleCommandResponse.data:type_name -> google.protobuf.Any
-	81, // 49: bess.pb.v2.PortStatus.link:type_name -> bess.pb.v2.PortStatus.Link
-	82, // 50: bess.pb.v2.PortStatus.rx:type_name -> bess.pb.v2.PortStatus.Counters
-	82, // 51: bess.pb.v2.PortStatus.tx:type_name -> bess.pb.v2.PortStatus.Counters
-	64, // 52: bess.pb.v2.GetPortStatusResponse.ports:type_name -> bess.pb.v2.PortStatus
-	67, // 53: bess.pb.v2.GetPacketPoolsResponse.pools:type_name -> bess.pb.v2.PacketPool
-	9,  // 54: bess.pb.v2.SetCaptureRequest.direction:type_name -> bess.pb.v2.SetCaptureRequest.Direction
-	10, // 55: bess.pb.v2.SetCaptureRequest.format:type_name -> bess.pb.v2.SetCaptureRequest.Format
-	22, // 56: bess.pb.v2.Control.GetPipeline:input_type -> bess.pb.v2.GetPipelineRequest
-	24, // 57: bess.pb.v2.Control.ValidatePipeline:input_type -> bess.pb.v2.ValidatePipelineRequest
-	26, // 58: bess.pb.v2.Control.DiffPipeline:input_type -> bess.pb.v2.DiffPipelineRequest
-	28, // 59: bess.pb.v2.Control.PlanPipeline:input_type -> bess.pb.v2.PlanPipelineRequest
-	30, // 60: bess.pb.v2.Control.ApplyPipeline:input_type -> bess.pb.v2.ApplyPipelineRequest
-	34, // 61: bess.pb.v2.Control.ApplyTransaction:input_type -> bess.pb.v2.ApplyTransactionRequest
-	38, // 62: bess.pb.v2.Control.GetTransaction:input_type -> bess.pb.v2.GetTransactionRequest
-	54, // 63: bess.pb.v2.Control.ListMetrics:input_type -> bess.pb.v2.ListMetricsRequest
-	43, // 64: bess.pb.v2.Control.GetCapabilities:input_type -> bess.pb.v2.GetCapabilitiesRequest
-	47, // 65: bess.pb.v2.Control.GetSchema:input_type -> bess.pb.v2.GetSchemaRequest
-	52, // 66: bess.pb.v2.Control.WatchEvents:input_type -> bess.pb.v2.WatchEventsRequest
-	40, // 67: bess.pb.v2.Control.ListTransactionResources:input_type -> bess.pb.v2.ListTransactionResourcesRequest
-	57, // 68: bess.pb.v2.Control.RunModuleCommand:input_type -> bess.pb.v2.RunModuleCommandRequest
-	59, // 69: bess.pb.v2.Admin.ImportPlugin:input_type -> bess.pb.v2.ImportPluginRequest
-	61, // 70: bess.pb.v2.Admin.UnloadPlugin:input_type -> bess.pb.v2.UnloadPluginRequest
-	63, // 71: bess.pb.v2.Admin.GetPortStatus:input_type -> bess.pb.v2.GetPortStatusRequest
-	66, // 72: bess.pb.v2.Admin.GetPacketPools:input_type -> bess.pb.v2.GetPacketPoolsRequest
-	69, // 73: bess.pb.v2.Admin.SetCapture:input_type -> bess.pb.v2.SetCaptureRequest
-	71, // 74: bess.pb.v2.Admin.PauseWorkers:input_type -> bess.pb.v2.PauseWorkersRequest
-	73, // 75: bess.pb.v2.Admin.ResumeWorkers:input_type -> bess.pb.v2.ResumeWorkersRequest
-	75, // 76: bess.pb.v2.Admin.Shutdown:input_type -> bess.pb.v2.ShutdownRequest
-	23, // 77: bess.pb.v2.Control.GetPipeline:output_type -> bess.pb.v2.GetPipelineResponse
-	25, // 78: bess.pb.v2.Control.ValidatePipeline:output_type -> bess.pb.v2.ValidatePipelineResponse
-	27, // 79: bess.pb.v2.Control.DiffPipeline:output_type -> bess.pb.v2.DiffPipelineResponse
-	29, // 80: bess.pb.v2.Control.PlanPipeline:output_type -> bess.pb.v2.PlanPipelineResponse
-	31, // 81: bess.pb.v2.Control.ApplyPipeline:output_type -> bess.pb.v2.ApplyPipelineResponse
-	37, // 82: bess.pb.v2.Control.ApplyTransaction:output_type -> bess.pb.v2.ApplyTransactionResponse
-	39, // 83: bess.pb.v2.Control.GetTransaction:output_type -> bess.pb.v2.GetTransactionResponse
-	56, // 84: bess.pb.v2.Control.ListMetrics:output_type -> bess.pb.v2.ListMetricsResponse
-	46, // 85: bess.pb.v2.Control.GetCapabilities:output_type -> bess.pb.v2.GetCapabilitiesResponse
-	51, // 86: bess.pb.v2.Control.GetSchema:output_type -> bess.pb.v2.GetSchemaResponse
-	53, // 87: bess.pb.v2.Control.WatchEvents:output_type -> bess.pb.v2.Event
-	42, // 88: bess.pb.v2.Control.ListTransactionResources:output_type -> bess.pb.v2.ListTransactionResourcesResponse
-	58, // 89: bess.pb.v2.Control.RunModuleCommand:output_type -> bess.pb.v2.RunModuleCommandResponse
-	60, // 90: bess.pb.v2.Admin.ImportPlugin:output_type -> bess.pb.v2.ImportPluginResponse
-	62, // 91: bess.pb.v2.Admin.UnloadPlugin:output_type -> bess.pb.v2.UnloadPluginResponse
-	65, // 92: bess.pb.v2.Admin.GetPortStatus:output_type -> bess.pb.v2.GetPortStatusResponse
-	68, // 93: bess.pb.v2.Admin.GetPacketPools:output_type -> bess.pb.v2.GetPacketPoolsResponse
-	70, // 94: bess.pb.v2.Admin.SetCapture:output_type -> bess.pb.v2.SetCaptureResponse
-	72, // 95: bess.pb.v2.Admin.PauseWorkers:output_type -> bess.pb.v2.PauseWorkersResponse
-	74, // 96: bess.pb.v2.Admin.ResumeWorkers:output_type -> bess.pb.v2.ResumeWorkersResponse
-	76, // 97: bess.pb.v2.Admin.Shutdown:output_type -> bess.pb.v2.ShutdownResponse
-	77, // [77:98] is the sub-list for method output_type
-	56, // [56:77] is the sub-list for method input_type
-	56, // [56:56] is the sub-list for extension type_name
-	56, // [56:56] is the sub-list for extension extendee
-	0,  // [0:56] is the sub-list for field type_name
+	88, // 0: bess.pb.v2.Port.arg:type_name -> google.protobuf.Any
+	88, // 1: bess.pb.v2.Module.arg:type_name -> google.protobuf.Any
+	82, // 2: bess.pb.v2.TrafficClass.limit:type_name -> bess.pb.v2.TrafficClass.LimitEntry
+	83, // 3: bess.pb.v2.TrafficClass.max_burst:type_name -> bess.pb.v2.TrafficClass.MaxBurstEntry
+	88, // 4: bess.pb.v2.ResourceEntry.key:type_name -> google.protobuf.Any
+	88, // 5: bess.pb.v2.ResourceEntry.value:type_name -> google.protobuf.Any
+	18, // 6: bess.pb.v2.ResourceContents.entries:type_name -> bess.pb.v2.ResourceEntry
+	12, // 7: bess.pb.v2.Pipeline.ports:type_name -> bess.pb.v2.Port
+	13, // 8: bess.pb.v2.Pipeline.modules:type_name -> bess.pb.v2.Module
+	14, // 9: bess.pb.v2.Pipeline.connections:type_name -> bess.pb.v2.Connection
+	15, // 10: bess.pb.v2.Pipeline.workers:type_name -> bess.pb.v2.Worker
+	16, // 11: bess.pb.v2.Pipeline.traffic_classes:type_name -> bess.pb.v2.TrafficClass
+	17, // 12: bess.pb.v2.Pipeline.tasks:type_name -> bess.pb.v2.TaskPlacement
+	19, // 13: bess.pb.v2.Pipeline.resources:type_name -> bess.pb.v2.ResourceContents
+	0,  // 14: bess.pb.v2.Change.type:type_name -> bess.pb.v2.ObjectType
+	1,  // 15: bess.pb.v2.Change.kind:type_name -> bess.pb.v2.ChangeKind
+	21, // 16: bess.pb.v2.PipelineDiff.changes:type_name -> bess.pb.v2.Change
+	22, // 17: bess.pb.v2.PipelineDiff.resources:type_name -> bess.pb.v2.ResourceDelta
+	2,  // 18: bess.pb.v2.PlanStep.phase:type_name -> bess.pb.v2.PlanPhase
+	0,  // 19: bess.pb.v2.PlanStep.type:type_name -> bess.pb.v2.ObjectType
+	20, // 20: bess.pb.v2.GetPipelineResponse.pipeline:type_name -> bess.pb.v2.Pipeline
+	25, // 21: bess.pb.v2.GetPipelineResponse.workers:type_name -> bess.pb.v2.WorkerPlacement
+	20, // 22: bess.pb.v2.ValidatePipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
+	20, // 23: bess.pb.v2.ValidatePipelineResponse.normalized:type_name -> bess.pb.v2.Pipeline
+	20, // 24: bess.pb.v2.DiffPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
+	23, // 25: bess.pb.v2.DiffPipelineResponse.diff:type_name -> bess.pb.v2.PipelineDiff
+	20, // 26: bess.pb.v2.PlanPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
+	24, // 27: bess.pb.v2.PlanPipelineResponse.steps:type_name -> bess.pb.v2.PlanStep
+	20, // 28: bess.pb.v2.ApplyPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
+	3,  // 29: bess.pb.v2.ErrorDetail.code:type_name -> bess.pb.v2.ErrorDetail.Code
+	88, // 30: bess.pb.v2.TransactionOp.key:type_name -> google.protobuf.Any
+	88, // 31: bess.pb.v2.TransactionOp.value:type_name -> google.protobuf.Any
+	37, // 32: bess.pb.v2.ApplyTransactionRequest.ops:type_name -> bess.pb.v2.TransactionOp
+	4,  // 33: bess.pb.v2.ApplyTransactionRequest.consistency:type_name -> bess.pb.v2.ApplyTransactionRequest.Consistency
+	5,  // 34: bess.pb.v2.TransactionOpResult.status:type_name -> bess.pb.v2.TransactionOpResult.Status
+	6,  // 35: bess.pb.v2.TransactionRecord.outcome:type_name -> bess.pb.v2.TransactionRecord.Outcome
+	39, // 36: bess.pb.v2.TransactionRecord.ops:type_name -> bess.pb.v2.TransactionOpResult
+	7,  // 37: bess.pb.v2.TransactionRecord.visibility:type_name -> bess.pb.v2.TransactionRecord.Visibility
+	40, // 38: bess.pb.v2.ApplyTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
+	40, // 39: bess.pb.v2.GetTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
+	8,  // 40: bess.pb.v2.TransactionResource.kind:type_name -> bess.pb.v2.TransactionResource.Kind
+	45, // 41: bess.pb.v2.ListTransactionResourcesResponse.resources:type_name -> bess.pb.v2.TransactionResource
+	48, // 42: bess.pb.v2.GetCapabilitiesResponse.plugins:type_name -> bess.pb.v2.PluginInfo
+	49, // 43: bess.pb.v2.GetCapabilitiesResponse.ports:type_name -> bess.pb.v2.PortInfo
+	45, // 44: bess.pb.v2.GetCapabilitiesResponse.resources:type_name -> bess.pb.v2.TransactionResource
+	8,  // 45: bess.pb.v2.ResourceSchema.kind:type_name -> bess.pb.v2.TransactionResource.Kind
+	53, // 46: bess.pb.v2.ModuleClassSchema.actions:type_name -> bess.pb.v2.ActionSchema
+	52, // 47: bess.pb.v2.ModuleClassSchema.resources:type_name -> bess.pb.v2.ResourceSchema
+	54, // 48: bess.pb.v2.GetSchemaResponse.module_classes:type_name -> bess.pb.v2.ModuleClassSchema
+	55, // 49: bess.pb.v2.GetSchemaResponse.port_drivers:type_name -> bess.pb.v2.PortDriverSchema
+	89, // 50: bess.pb.v2.GetSchemaResponse.descriptors:type_name -> google.protobuf.FileDescriptorSet
+	84, // 51: bess.pb.v2.Event.fields:type_name -> bess.pb.v2.Event.FieldsEntry
+	9,  // 52: bess.pb.v2.MetricSample.kind:type_name -> bess.pb.v2.MetricSample.Kind
+	85, // 53: bess.pb.v2.MetricSample.labels:type_name -> bess.pb.v2.MetricSample.LabelsEntry
+	60, // 54: bess.pb.v2.ListMetricsResponse.samples:type_name -> bess.pb.v2.MetricSample
+	88, // 55: bess.pb.v2.InvokeActionRequest.arg:type_name -> google.protobuf.Any
+	88, // 56: bess.pb.v2.InvokeActionResponse.result:type_name -> google.protobuf.Any
+	86, // 57: bess.pb.v2.PortStatus.link:type_name -> bess.pb.v2.PortStatus.Link
+	87, // 58: bess.pb.v2.PortStatus.rx:type_name -> bess.pb.v2.PortStatus.Counters
+	87, // 59: bess.pb.v2.PortStatus.tx:type_name -> bess.pb.v2.PortStatus.Counters
+	69, // 60: bess.pb.v2.GetPortStatusResponse.ports:type_name -> bess.pb.v2.PortStatus
+	72, // 61: bess.pb.v2.GetPacketPoolsResponse.pools:type_name -> bess.pb.v2.PacketPool
+	10, // 62: bess.pb.v2.SetCaptureRequest.direction:type_name -> bess.pb.v2.SetCaptureRequest.Direction
+	11, // 63: bess.pb.v2.SetCaptureRequest.format:type_name -> bess.pb.v2.SetCaptureRequest.Format
+	26, // 64: bess.pb.v2.Control.GetPipeline:input_type -> bess.pb.v2.GetPipelineRequest
+	28, // 65: bess.pb.v2.Control.ValidatePipeline:input_type -> bess.pb.v2.ValidatePipelineRequest
+	30, // 66: bess.pb.v2.Control.DiffPipeline:input_type -> bess.pb.v2.DiffPipelineRequest
+	32, // 67: bess.pb.v2.Control.PlanPipeline:input_type -> bess.pb.v2.PlanPipelineRequest
+	34, // 68: bess.pb.v2.Control.ApplyPipeline:input_type -> bess.pb.v2.ApplyPipelineRequest
+	38, // 69: bess.pb.v2.Control.ApplyTransaction:input_type -> bess.pb.v2.ApplyTransactionRequest
+	42, // 70: bess.pb.v2.Control.GetTransaction:input_type -> bess.pb.v2.GetTransactionRequest
+	59, // 71: bess.pb.v2.Control.ListMetrics:input_type -> bess.pb.v2.ListMetricsRequest
+	47, // 72: bess.pb.v2.Control.GetCapabilities:input_type -> bess.pb.v2.GetCapabilitiesRequest
+	51, // 73: bess.pb.v2.Control.GetSchema:input_type -> bess.pb.v2.GetSchemaRequest
+	57, // 74: bess.pb.v2.Control.WatchEvents:input_type -> bess.pb.v2.WatchEventsRequest
+	44, // 75: bess.pb.v2.Control.ListTransactionResources:input_type -> bess.pb.v2.ListTransactionResourcesRequest
+	62, // 76: bess.pb.v2.Control.InvokeAction:input_type -> bess.pb.v2.InvokeActionRequest
+	64, // 77: bess.pb.v2.Admin.ImportPlugin:input_type -> bess.pb.v2.ImportPluginRequest
+	66, // 78: bess.pb.v2.Admin.UnloadPlugin:input_type -> bess.pb.v2.UnloadPluginRequest
+	68, // 79: bess.pb.v2.Admin.GetPortStatus:input_type -> bess.pb.v2.GetPortStatusRequest
+	71, // 80: bess.pb.v2.Admin.GetPacketPools:input_type -> bess.pb.v2.GetPacketPoolsRequest
+	74, // 81: bess.pb.v2.Admin.SetCapture:input_type -> bess.pb.v2.SetCaptureRequest
+	76, // 82: bess.pb.v2.Admin.PauseWorkers:input_type -> bess.pb.v2.PauseWorkersRequest
+	78, // 83: bess.pb.v2.Admin.ResumeWorkers:input_type -> bess.pb.v2.ResumeWorkersRequest
+	80, // 84: bess.pb.v2.Admin.Shutdown:input_type -> bess.pb.v2.ShutdownRequest
+	27, // 85: bess.pb.v2.Control.GetPipeline:output_type -> bess.pb.v2.GetPipelineResponse
+	29, // 86: bess.pb.v2.Control.ValidatePipeline:output_type -> bess.pb.v2.ValidatePipelineResponse
+	31, // 87: bess.pb.v2.Control.DiffPipeline:output_type -> bess.pb.v2.DiffPipelineResponse
+	33, // 88: bess.pb.v2.Control.PlanPipeline:output_type -> bess.pb.v2.PlanPipelineResponse
+	35, // 89: bess.pb.v2.Control.ApplyPipeline:output_type -> bess.pb.v2.ApplyPipelineResponse
+	41, // 90: bess.pb.v2.Control.ApplyTransaction:output_type -> bess.pb.v2.ApplyTransactionResponse
+	43, // 91: bess.pb.v2.Control.GetTransaction:output_type -> bess.pb.v2.GetTransactionResponse
+	61, // 92: bess.pb.v2.Control.ListMetrics:output_type -> bess.pb.v2.ListMetricsResponse
+	50, // 93: bess.pb.v2.Control.GetCapabilities:output_type -> bess.pb.v2.GetCapabilitiesResponse
+	56, // 94: bess.pb.v2.Control.GetSchema:output_type -> bess.pb.v2.GetSchemaResponse
+	58, // 95: bess.pb.v2.Control.WatchEvents:output_type -> bess.pb.v2.Event
+	46, // 96: bess.pb.v2.Control.ListTransactionResources:output_type -> bess.pb.v2.ListTransactionResourcesResponse
+	63, // 97: bess.pb.v2.Control.InvokeAction:output_type -> bess.pb.v2.InvokeActionResponse
+	65, // 98: bess.pb.v2.Admin.ImportPlugin:output_type -> bess.pb.v2.ImportPluginResponse
+	67, // 99: bess.pb.v2.Admin.UnloadPlugin:output_type -> bess.pb.v2.UnloadPluginResponse
+	70, // 100: bess.pb.v2.Admin.GetPortStatus:output_type -> bess.pb.v2.GetPortStatusResponse
+	73, // 101: bess.pb.v2.Admin.GetPacketPools:output_type -> bess.pb.v2.GetPacketPoolsResponse
+	75, // 102: bess.pb.v2.Admin.SetCapture:output_type -> bess.pb.v2.SetCaptureResponse
+	77, // 103: bess.pb.v2.Admin.PauseWorkers:output_type -> bess.pb.v2.PauseWorkersResponse
+	79, // 104: bess.pb.v2.Admin.ResumeWorkers:output_type -> bess.pb.v2.ResumeWorkersResponse
+	81, // 105: bess.pb.v2.Admin.Shutdown:output_type -> bess.pb.v2.ShutdownResponse
+	85, // [85:106] is the sub-list for method output_type
+	64, // [64:85] is the sub-list for method input_type
+	64, // [64:64] is the sub-list for extension type_name
+	64, // [64:64] is the sub-list for extension extendee
+	0,  // [0:64] is the sub-list for field type_name
 }
 
 func init() { file_control_v2_proto_init() }
@@ -5724,16 +6225,16 @@ func file_control_v2_proto_init() {
 	file_control_v2_proto_msgTypes[3].OneofWrappers = []any{}
 	file_control_v2_proto_msgTypes[4].OneofWrappers = []any{}
 	file_control_v2_proto_msgTypes[5].OneofWrappers = []any{}
-	file_control_v2_proto_msgTypes[19].OneofWrappers = []any{}
-	file_control_v2_proto_msgTypes[23].OneofWrappers = []any{}
-	file_control_v2_proto_msgTypes[58].OneofWrappers = []any{}
+	file_control_v2_proto_msgTypes[22].OneofWrappers = []any{}
+	file_control_v2_proto_msgTypes[26].OneofWrappers = []any{}
+	file_control_v2_proto_msgTypes[62].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_control_v2_proto_rawDesc), len(file_control_v2_proto_rawDesc)),
-			NumEnums:      11,
-			NumMessages:   72,
+			NumEnums:      12,
+			NumMessages:   76,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

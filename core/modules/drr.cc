@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <expected>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -29,6 +30,16 @@ namespace {
 // Decision D-019 (docs/decisions.md).
 const unsigned kIngressRingFlags = RING_F_SC_DEQ;
 
+// set_quantum_size's refusal (nullptr when `size` is valid).
+const char *QuantumError(uint32_t size) {
+  return size == 0 ? "quantum size must be at least 1" : nullptr;
+}
+
+// set_max_flow_queue_size's refusal (nullptr when `queue_size` is valid).
+const char *QueueSizeError(uint32_t queue_size) {
+  return queue_size == 0 ? "max queue size must be at least 1" : nullptr;
+}
+
 }  // namespace
 
 uint32_t RoundToPowerTwo(uint32_t v) {
@@ -42,11 +53,17 @@ uint32_t RoundToPowerTwo(uint32_t v) {
   return v;
 }
 
+// The setters edit what "settings" holds: legacy only (D-129).
 const Commands DRR::cmds = {
     {"set_quantum_size", "DRRQuantumArg",
-     MODULE_CMD_FUNC(&DRR::CommandQuantumSize), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&DRR::CommandQuantumSize), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"set_max_flow_queue_size", "DRRMaxFlowQueueSizeArg",
-     MODULE_CMD_FUNC(&DRR::CommandMaxFlowQueueSize), Command::THREAD_SAFE}};
+     MODULE_CMD_FUNC(&DRR::CommandMaxFlowQueueSize), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY}};
+
+const ResourceTables DRR::resource_tables = {
+    ResourceTable::Singleton<bess::pb::DRRSettings>("settings")};
 
 DRR::DRR()
     : quantum_(kDefaultQuantum),
@@ -118,7 +135,42 @@ CommandResponse DRR::Init(const bess::pb::DRRArg &arg) {
     return CommandFailure(ENOMEM, "task creation failed");
   }
 
-  return AllocateRings();
+  err = AllocateRings();
+  if (err.error().code() != 0) {
+    return err;
+  }
+
+  // Applied live: both are relaxed atomics the task reads per flow round.
+  auto registered = settings_.Register(
+      init_context().resources(), init_context().codecs(), name() + "/settings",
+      [](const bess::pb::DRRSettings &v) -> std::expected<Settings, std::string> {
+        if (const char *err = QuantumError(v.quantum())) {
+          return std::unexpected(err);
+        }
+        if (const char *err = QueueSizeError(v.max_flow_queue_size())) {
+          return std::unexpected(err);
+        }
+        return Settings{v.quantum(), v.max_flow_queue_size()};
+      },
+      [this](Settings &s) {
+        quantum_.store(s.quantum, std::memory_order_relaxed);
+        max_queue_size_.store(s.max_queue_size, std::memory_order_relaxed);
+      },
+      [this] {
+        bess::pb::DRRSettings v;
+        v.set_quantum(quantum_.load(std::memory_order_relaxed));
+        v.set_max_flow_queue_size(max_queue_size_.load(std::memory_order_relaxed));
+        return v;
+      },
+      nullptr);
+  if (!registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
+  return CommandSuccess();
+}
+
+void DRR::DeInit() {
+  settings_.Release();
 }
 
 CommandResponse DRR::AllocateRings() {
@@ -514,8 +566,8 @@ rte_ring *DRR::ResizeQueue(rte_ring *old_queue, uint32_t new_size, int *err) {
 }
 
 CommandResponse DRR::SetQuantumSize(uint32_t size) {
-  if (size == 0) {
-    return CommandFailure(EINVAL, "quantum size must be at least 1");
+  if (const char *err = QuantumError(size)) {
+    return CommandFailure(EINVAL, "%s", err);
   }
 
   quantum_.store(size, std::memory_order_relaxed);
@@ -523,8 +575,8 @@ CommandResponse DRR::SetQuantumSize(uint32_t size) {
 }
 
 CommandResponse DRR::SetMaxFlowQueueSize(uint32_t queue_size) {
-  if (queue_size == 0) {
-    return CommandFailure(EINVAL, "max queue size must be at least 1");
+  if (const char *err = QueueSizeError(queue_size)) {
+    return CommandFailure(EINVAL, "%s", err);
   }
   max_queue_size_.store(queue_size, std::memory_order_relaxed);
   return CommandSuccess();

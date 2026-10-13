@@ -27,6 +27,8 @@ const std::string kKeyType(pb::GetTransactionRequest::descriptor()->full_name())
 const std::string kValueType(
     pb::ListTransactionResourcesRequest::descriptor()->full_name());
 constexpr char kResource[] = "m0/table";
+// The fake's singleton resource; it requires paused workers.
+constexpr char kSingleton[] = "m0/settings";
 
 constexpr auto kApplied = pb::TransactionRecord::OUTCOME_APPLIED;
 constexpr auto kRejected = pb::TransactionRecord::OUTCOME_REJECTED;
@@ -118,6 +120,9 @@ class Fake final : public Transport {
   std::vector<pb::ApplyTransactionRequest> sent;
   std::vector<std::string> asked;
   std::vector<pb::ApplyPipelineRequest> applied;
+  std::vector<pb::GetPipelineRequest> reads;
+  std::deque<Step> actions;  // InvokeAction's script (a failed status, else answered)
+  std::vector<pb::InvokeActionRequest> invoked;
   int listed = 0;
   bool reject_ops = false;
   bool old_daemon = false;  // GetCapabilities: UNIMPLEMENTED
@@ -193,10 +198,17 @@ class Fake final : public Transport {
                                         Trailers *) override {
     listed++;
     out->set_daemon_epoch(EpochOr1());
+    // kResource has no kind (a daemon before D-129): a map.
     auto *r = out->add_resources();
     r->set_name(kResource);
     r->set_key_type(kKeyType);
     r->set_value_type(kValueType);
+    auto *s = out->add_resources();
+    s->set_name(kSingleton);
+    s->set_key_type("google.protobuf.Empty");
+    s->set_value_type(kValueType);
+    s->set_kind(pb::TransactionResource::KIND_SINGLETON);
+    s->set_requires_paused_workers(true);
     return grpc::Status::OK;
   }
 
@@ -213,11 +225,30 @@ class Fake final : public Transport {
     return grpc::Status::OK;
   }
 
-  grpc::Status GetPipeline(Deadline, const pb::GetPipelineRequest &,
+  grpc::Status GetPipeline(Deadline, const pb::GetPipelineRequest &in,
                            pb::GetPipelineResponse *out, Trailers *) override {
+    reads.push_back(in);
     out->mutable_pipeline();
     out->set_generation(3);
     out->set_daemon_epoch(EpochOr1());
+    out->set_resource_generation(9);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status DiffPipeline(Deadline, const pb::DiffPipelineRequest &,
+                            pb::DiffPipelineResponse *out, Trailers *) override {
+    out->mutable_diff();
+    out->set_generation(3);
+    out->set_daemon_epoch(EpochOr1());
+    out->set_resource_generation(9);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status PlanPipeline(Deadline, const pb::PlanPipelineRequest &,
+                            pb::PlanPipelineResponse *out, Trailers *) override {
+    out->set_generation(3);
+    out->set_daemon_epoch(EpochOr1());
+    out->set_resource_generation(9);
     return grpc::Status::OK;
   }
 
@@ -245,6 +276,32 @@ class Fake final : public Transport {
     captures.push_back(in);
     if (in.daemon_epoch() != EpochOr1()) {
       return RefuseEpoch(in.daemon_epoch(), EpochOr1(), t);
+    }
+    out->set_daemon_epoch(EpochOr1());
+    return grpc::Status::OK;
+  }
+
+  // Answers with ActionResult() unless the script says otherwise.
+  static pb::GetTransactionRequest ActionResult() {
+    pb::GetTransactionRequest r;
+    r.set_request_id("answer");
+    return r;
+  }
+  grpc::Status InvokeAction(Deadline, const pb::InvokeActionRequest &in,
+                            pb::InvokeActionResponse *out, Trailers *t) override {
+    invoked.push_back(in);
+    if (in.daemon_epoch() != EpochOr1()) {
+      return RefuseEpoch(in.daemon_epoch(), EpochOr1(), t);
+    }
+    if (!actions.empty()) {
+      Step s = Pop(actions);
+      if (!s.status.ok()) {
+        *t = s.trailers;
+        return s.status;
+      }
+    }
+    if (!out->mutable_result()->PackFrom(ActionResult())) {
+      return grpc::Status(grpc::StatusCode::INTERNAL, "cannot pack the result");
     }
     out->set_daemon_epoch(EpochOr1());
     return grpc::Status::OK;
@@ -829,6 +886,199 @@ TEST(SdkClient, ApplyPipelineWithoutAnAnswerIsUnknownAndNotResent) {
   ASSERT_EQ(KindOf(r), ErrorKind::kInvalidRequest);
   ASSERT_TRUE(r.error().detail);
   EXPECT_EQ(r.error().detail->code(), pb::ErrorDetail::RESOURCE_FAILURE);
+}
+
+// Discovery gives each resource its kind (none, from a daemon before D-129:
+// a map) and whether it changes only with its workers paused.
+TEST(SdkClient, ResourcesCarryTheirKind) {
+  Harness h(4);
+  auto all = h.c->Resources();
+  ASSERT_TRUE(all);
+  EXPECT_EQ(all->at(kResource).kind, pb::TransactionResource::KIND_MAP);
+  EXPECT_FALSE(all->at(kResource).requires_paused_workers);
+  EXPECT_EQ(all->at(kSingleton).kind, pb::TransactionResource::KIND_SINGLETON);
+  EXPECT_TRUE(all->at(kSingleton).requires_paused_workers);
+}
+
+// A singleton is set (an op with a value and no key), never upserted or
+// erased, and a map is never set: the client refuses the wrong one before
+// anything is sent.
+TEST(SdkClient, ASingletonIsSetAndAMapIsNot) {
+  Harness h(4);
+  h.f->applies = {Answer(kApplied, 1)};
+  auto m = h.c->Resource(kResource);
+  auto s = h.c->Resource(kSingleton);
+  ASSERT_TRUE(m && s);
+  Transaction tx = h.c->NewTransaction();
+  EXPECT_EQ(KindOf(Upsert(tx, *s)), ErrorKind::kInvalidRequest);
+  EXPECT_EQ(KindOf(tx.Erase(*s, pb::GetTransactionRequest())), ErrorKind::kInvalidRequest);
+  EXPECT_EQ(KindOf(tx.Set(*m, pb::ListTransactionResourcesRequest())), ErrorKind::kInvalidRequest);
+  EXPECT_EQ(KindOf(tx.Set(*s, pb::GetTransactionRequest())), ErrorKind::kInvalidRequest)
+      << "not its value type";
+  ASSERT_TRUE(tx.Set(*s, pb::ListTransactionResourcesRequest()));
+  auto a = tx.Commit();
+  ASSERT_TRUE(a) << a.error().message;
+  ASSERT_EQ(h.f->sent.size(), 1u);
+  ASSERT_EQ(h.f->sent[0].ops_size(), 1) << "a refused operation was sent";
+  const pb::TransactionOp &op = h.f->sent[0].ops(0);
+  EXPECT_EQ(op.resource(), kSingleton);
+  EXPECT_FALSE(op.has_key());
+  EXPECT_TRUE(op.value().Is<pb::ListTransactionResourcesRequest>());
+  EXPECT_FALSE(op.erase());
+}
+
+// A resource that changes only with its workers paused, refused while one
+// runs (RESOURCE_BUSY), is kBusy at once: sent once, nothing asked, not
+// retried (retrying will not help until the workers are paused).
+TEST(SdkClient, APausedWorkersRefusalIsBusyAndNotRetried) {
+  Harness h(4);
+  h.f->applies = {Refusal(grpc::StatusCode::FAILED_PRECONDITION, pb::ErrorDetail::RESOURCE_BUSY)};
+  auto a = h.Commit();
+  ASSERT_EQ(KindOf(a), ErrorKind::kBusy);
+  ASSERT_TRUE(a.error().detail);
+  EXPECT_EQ(a.error().detail->code(), pb::ErrorDetail::RESOURCE_BUSY);
+  EXPECT_EQ(a.error().attempts, 1);
+  EXPECT_EQ(h.f->sent.size(), 1u);
+  EXPECT_TRUE(h.f->asked.empty());
+  EXPECT_TRUE(h.sleeps.empty());
+}
+
+// Pipeline reads resource contents only when asked (PipelineQuery), and only
+// then has a resource generation; a diff or plan has one when its pipeline
+// lists resources; an apply expects the one its version carries, and a stale
+// one is a conflict.
+TEST(SdkClient, ResourceGenerations) {
+  Harness h(4);
+  auto plain = h.c->Pipeline();
+  ASSERT_TRUE(plain);
+  EXPECT_FALSE(plain->version.resource_generation.has_value());
+  ASSERT_EQ(h.f->reads.size(), 1u);
+  EXPECT_FALSE(h.f->reads[0].include_resources());
+  auto named = h.c->Pipeline({.include_resources = true, .resources = {kResource, kSingleton}});
+  ASSERT_TRUE(named);
+  ASSERT_TRUE(named->version.resource_generation.has_value());
+  EXPECT_EQ(*named->version.resource_generation, 9u);
+  ASSERT_EQ(h.f->reads.size(), 2u);
+  EXPECT_TRUE(h.f->reads[1].include_resources());
+  ASSERT_EQ(h.f->reads[1].resources_size(), 2);
+  EXPECT_EQ(h.f->reads[1].resources(0), kResource);
+  EXPECT_EQ(h.f->reads[1].resources(1), kSingleton);
+
+  pb::Pipeline listed;
+  listed.add_resources()->set_name(kResource);
+  for (const pb::Pipeline &p : {pb::Pipeline(), listed}) {
+    const bool want = p.resources_size() > 0;
+    auto diff = h.c->DiffPipeline(p);
+    auto plan = h.c->PlanPipeline(p);
+    ASSERT_TRUE(diff && plan);
+    for (const PipelineVersion &v : {diff->version, plan->version}) {
+      EXPECT_EQ(v.generation, 3u);
+      EXPECT_EQ(v.resource_generation.has_value(), want);
+      EXPECT_EQ(v.resource_generation.value_or(9), 9u);
+    }
+  }
+
+  ASSERT_TRUE(h.c->ApplyPipeline(listed, named->version));
+  ASSERT_TRUE(h.c->ApplyPipeline(listed, plain->version));
+  ASSERT_EQ(h.f->applied.size(), 2u);
+  EXPECT_TRUE(h.f->applied[0].has_expected_resource_generation());
+  EXPECT_EQ(h.f->applied[0].expected_resource_generation(), 9u);
+  EXPECT_FALSE(h.f->applied[1].has_expected_resource_generation());
+  h.f->pipelines = {Refusal(grpc::StatusCode::ABORTED, pb::ErrorDetail::CONFLICT)};
+  EXPECT_EQ(KindOf(h.c->ApplyPipeline(listed, named->version)), ErrorKind::kPipelineConflict);
+  EXPECT_EQ(h.f->applied.size(), 3u) << "a conflict was retried";
+}
+
+// InvokeAction (D-129) names the module, the action and the epoch the client
+// knows (learned first) and returns the action's result. It is not retried:
+// a busy module is kBusy, a refusal (a legacy-only command: ENOTSUP)
+// kInvalidRequest with the daemon's detail, and a restart refuses it.
+TEST(SdkClient, InvokeAction) {
+  Harness h(4);
+  pb::GetTransactionRequest arg;
+  arg.set_request_id("arg");
+  auto result = h.c->InvokeAction<pb::GetTransactionRequest>("l2", "lookup", arg);
+  ASSERT_TRUE(result) << result.error().message;
+  EXPECT_EQ(result->request_id(), "answer");
+  EXPECT_EQ(h.f->listed, 1) << "the epoch was not learned before the call";
+  ASSERT_EQ(h.f->invoked.size(), 1u);
+  const pb::InvokeActionRequest req = h.f->invoked[0];
+  EXPECT_EQ(req.daemon_epoch(), 1u);
+  EXPECT_EQ(req.module(), "l2");
+  EXPECT_EQ(req.action(), "lookup");
+  pb::GetTransactionRequest sent_arg;
+  ASSERT_TRUE(req.arg().UnpackTo(&sent_arg));
+  EXPECT_EQ(sent_arg.request_id(), "arg");
+  EXPECT_EQ(KindOf(h.c->InvokeAction<pb::GetPipelineRequest>("l2", "lookup", arg)),
+            ErrorKind::kInvalidRequest)
+      << "a result of another type";
+
+  h.f->actions = {Refusal(grpc::StatusCode::FAILED_PRECONDITION, pb::ErrorDetail::RESOURCE_BUSY)};
+  auto busy = h.c->InvokeAction("l2", "populate", arg);
+  ASSERT_EQ(KindOf(busy), ErrorKind::kBusy);
+  ASSERT_TRUE(busy.error().detail);
+  EXPECT_EQ(busy.error().detail->code(), pb::ErrorDetail::RESOURCE_BUSY);
+  EXPECT_EQ(h.f->invoked.size(), 3u) << "a busy action was retried";
+  EXPECT_TRUE(h.sleeps.empty());
+
+  pb::ErrorDetail legacy;
+  legacy.set_code(pb::ErrorDetail::INVALID_ARGUMENT);
+  legacy.set_errno_value(95);  // ENOTSUP
+  legacy.set_field("action");
+  legacy.set_message("add is a legacy-only command");
+  h.f->actions = {Failed(grpc::StatusCode::INVALID_ARGUMENT, legacy)};
+  auto refused = h.c->InvokeAction("l2", "add", arg);
+  ASSERT_EQ(KindOf(refused), ErrorKind::kInvalidRequest);
+  ASSERT_TRUE(refused.error().detail);
+  EXPECT_EQ(refused.error().detail->field(), "action");
+  EXPECT_EQ(refused.error().detail->errno_value(), 95);
+  EXPECT_EQ(h.f->invoked.size(), 4u);
+
+  h.f->epoch = 2;  // restarted
+  auto restarted = h.c->InvokeAction("l2", "lookup", arg);
+  ASSERT_EQ(KindOf(restarted), ErrorKind::kDaemonRestarted);
+  EXPECT_EQ(restarted.error().from_epoch, 1u);
+  EXPECT_EQ(restarted.error().to_epoch, 2u);
+  EXPECT_EQ(h.f->invoked.size(), 5u) << "a refusal was retried";
+  EXPECT_EQ(h.c->DaemonEpoch(), 2u);
+}
+
+// Resource contents (D-129): Resource lists a resource (no entries: an apply
+// clears it), Entry adds a map entry, Setting gives a singleton its one
+// value; Remove drops a module's resources ("<module>/...") with it.
+TEST(SdkClient, ThePipelineBuilderListsResourceContents) {
+  pb::GetTransactionRequest key;
+  key.set_request_id("k");
+  const pb::ListTransactionResourcesRequest value;
+  auto p = PipelineBuilder()
+               .Module("em", "ExactMatch", nullptr)
+               .Module("emx", "ExactMatch", nullptr)
+               .Resource("em/rules")
+               .Entry("em/rules", key, value)
+               .Entry("em/rules", key, value)
+               .Setting("em/settings", key)
+               .Setting("em/settings", value)
+               .Resource("emx/rules")
+               .Build();
+  ASSERT_TRUE(p);
+  ASSERT_EQ(p->resources_size(), 3);
+  EXPECT_EQ(p->resources(0).name(), "em/rules");
+  ASSERT_EQ(p->resources(0).entries_size(), 2) << "listed once, entries added";
+  EXPECT_TRUE(p->resources(0).entries(0).key().Is<pb::GetTransactionRequest>());
+  EXPECT_TRUE(p->resources(0).entries(0).value().Is<pb::ListTransactionResourcesRequest>());
+  const pb::ResourceContents &settings = p->resources(1);
+  EXPECT_EQ(settings.name(), "em/settings");
+  ASSERT_EQ(settings.entries_size(), 1) << "a singleton has one value";
+  EXPECT_FALSE(settings.entries(0).has_key());
+  EXPECT_TRUE(settings.entries(0).value().Is<pb::ListTransactionResourcesRequest>());
+  EXPECT_EQ(p->resources(2).name(), "emx/rules");
+  EXPECT_EQ(p->resources(2).entries_size(), 0) << "listed with no entry: cleared";
+  auto edited = PipelineBuilder(*p).Remove("em").Build();
+  ASSERT_TRUE(edited);
+  EXPECT_EQ(edited->modules_size(), 1);
+  ASSERT_EQ(edited->resources_size(), 1) << "the removed module's resources stayed";
+  EXPECT_EQ(edited->resources(0).name(), "emx/rules");
+  EXPECT_EQ(p->resources_size(), 3);
 }
 
 }  // namespace

@@ -7,11 +7,13 @@
 //    driver's init type from the daemon's schema (GetSchema) fills it in.
 //    Reading a pipeline back drops "@type" where it is that implied type, so
 //    `bessctl get` prints what `bessctl apply` reads.
-//  - "resources" holds entries for transactional resources the pipeline's
-//    modules create: {"em/rules": [{"key": {...}, "value": {...}}]}. They are
-//    committed in one transaction after the pipeline is applied, since the
-//    resources exist only then; a resource's key and value types come from
-//    the daemon then too.
+//  - "resources" (Pipeline.resources, D-129) is an object keyed by resource
+//    name, "<module>/<table>": a map resource's entries as a list,
+//    {"em/rules": [{"key": {...}, "value": {...}}]} ([] clears it), a
+//    singleton as its value, {"em/settings": {"default_gate": 3}}. Its kind
+//    and key and value types are the table's that the module's class
+//    declares (GetSchema), the module being the manifest's of that name, so
+//    a key or value may leave out "@type" too; reading back drops it again.
 
 #ifndef BESSCTL_MANIFEST_H_
 #define BESSCTL_MANIFEST_H_
@@ -25,33 +27,12 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <utility>
-#include <vector>
 
 #include "bess/sdk/client.h"
 
 namespace bessctl {
 
 namespace pb = ::bess::pb::v2;
-
-struct Manifest {
-  // An entry's key and value, as JSON text (numbers as written).
-  struct Entry {
-    std::string key;
-    std::string value;
-  };
-
-  pb::Pipeline pipeline;
-  std::vector<std::pair<std::string, std::vector<Entry>>> resources;  // in file order
-
-  size_t entries() const {
-    size_t n = 0;
-    for (const auto &[_, entries] : resources) {
-      n += entries.size();
-    }
-    return n;
-  }
-};
 
 enum class Format { kJson, kYaml };
 
@@ -65,25 +46,31 @@ class Schema {
   static std::expected<std::unique_ptr<Schema>, std::string> From(
       const pb::GetSchemaResponse &schema);
 
-  std::expected<Manifest, std::string> ManifestFrom(std::string_view text, Format format) const;
+  // A manifest's pipeline, its resources' contents included.
+  std::expected<pb::Pipeline, std::string> PipelineFrom(std::string_view text,
+                                                        Format format) const;
   // Pretty JSON or block YAML, field names as in the .proto files.
   std::expected<std::string, std::string> PipelineTo(const pb::Pipeline &p, Format format) const;
 
-  // A message of the daemon's type `type` (a resource's key or value) from
-  // JSON. Valid while this Schema lives.
+  // A message of the daemon's type `type` from JSON. Valid while this Schema
+  // lives.
   std::expected<std::unique_ptr<google::protobuf::Message>, std::string> MessageFromJson(
       std::string_view type, std::string_view json) const;
 
-  // Module commands (D-115). The argument type of class `mclass`'s command
-  // `command`, as GetSchema declares it.
-  std::expected<std::string, std::string> CommandArgType(std::string_view mclass,
-                                                         std::string_view command) const;
-  // A command's argument from JSON text, or else YAML text.
+  // Module actions (D-129). The argument type of class `mclass`'s action
+  // `action`, as GetSchema declares it.
+  std::expected<std::string, std::string> ActionArgType(std::string_view mclass,
+                                                        std::string_view action) const;
+  // An action's argument from JSON text, or else YAML text.
   std::expected<std::unique_ptr<google::protobuf::Message>, std::string> MessageFromText(
       std::string_view type, std::string_view text) const;
-  // A command's answer in `format`, field names as in the .proto files.
+  // An action's result in `format`, field names as in the .proto files.
   std::expected<std::string, std::string> AnyTo(const google::protobuf::Any &any,
                                                 Format format) const;
+
+  // class -> table -> its resource table (GetSchema's ResourceSchema)
+  using Tables =
+      std::map<std::string, std::map<std::string, pb::ResourceSchema, std::less<>>, std::less<>>;
 
  private:
   Schema() = default;
@@ -93,8 +80,9 @@ class Schema {
   std::unique_ptr<google::protobuf::util::TypeResolver> resolver_;
   std::map<std::string, std::string, std::less<>> module_types_;  // class -> init type
   std::map<std::string, std::string, std::less<>> driver_types_;  // driver -> init type
-  // class -> command -> argument type
-  std::map<std::string, std::map<std::string, std::string, std::less<>>, std::less<>> commands_;
+  // class -> action -> argument type
+  std::map<std::string, std::map<std::string, std::string, std::less<>>, std::less<>> actions_;
+  Tables tables_;
 };
 
 }  // namespace bessctl

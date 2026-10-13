@@ -2,7 +2,8 @@
 
 // ACL in process (was bessctl/module_tests/acl.py): first match wins,
 // unmatched traffic is dropped, and a refused command (a wire port that
-// would narrow, a malformed prefix) changes nothing, all or nothing.
+// would narrow, a malformed prefix) changes nothing, all or nothing. D-129:
+// "<name>/rules" holds the whole rule list, and add/clear are legacy-only.
 
 #include <gtest/gtest.h>
 
@@ -10,7 +11,11 @@
 #include <random>
 #include <string>
 
+#include "dataplane/transaction_engine.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
 #include "pb/module_msg.pb.h"
+#include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
 
@@ -94,6 +99,77 @@ TEST(AclTest, FirstMatchWins) {
       "ACL", Rules({{.src_ip = "10.1.0.0/16"}, {.src_ip = "10.0.0.0/8", .drop = true}}));
   ASSERT_NE(nullptr, pass_first);
   EXPECT_TRUE(Passes(h, pass_first, a));
+}
+
+// Whether the codec bound to `resource` requires paused workers.
+bool RequiresPausedWorkers(const std::string &resource) {
+  const bess::dataplane::Resource *r =
+      bess::runtime::runtime().transactions().FindResource(resource);
+  EXPECT_NE(nullptr, r) << resource;
+  if (r == nullptr) {
+    return false;
+  }
+  const bess::framework::ResourceCodec *codec =
+      bess::framework::ResourceBindings::ProcessDefault().Find(*r);
+  EXPECT_NE(nullptr, codec) << resource;
+  return codec != nullptr && codec->requires_paused_workers();
+}
+
+// "<name>/rules" is the whole ordered rule list: setting it replaces the
+// list (an RCU swap: no paused workers), it reads back as given, a list with
+// a bad rule is refused whole, and an empty list drops everything.
+TEST(AclTest, RulesResourceReplacesTheList) {
+  std::mt19937 rng(3);
+  const Bytes a = TcpPacket({.sip = "10.1.2.3", .dip = "20.0.0.1", .sport = 1000, .dport = 80}, rng);
+  const Bytes b = TcpPacket({.sip = "11.1.2.3", .dip = "20.0.0.1", .sport = 1000, .dport = 80}, rng);
+
+  ModuleHarness h;
+  const auto initial = Rules({{.src_ip = "10.0.0.0/8"}});
+  Module *acl = h.Create("ACL", initial, "acl_res");
+  ASSERT_NE(nullptr, acl);
+  const std::string rules = "acl_res/rules";
+  EXPECT_FALSE(RequiresPausedWorkers(rules));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &initial}})) << "Init's rules";
+
+  // Order matters (first match): b passes, a (in 10/8) is dropped.
+  const auto two = Rules({{.src_ip = "11.0.0.0/8"}, {.src_ip = "10.0.0.0/8", .drop = true}});
+  EXPECT_EQ("", h.SetResource(rules, two));
+  EXPECT_FALSE(Passes(h, acl, a));
+  EXPECT_TRUE(Passes(h, acl, b));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &two}}));
+
+  EXPECT_NE("", h.SetResource(rules, Rules({{.src_ip = "10.0.0.0/8"}, {.dst_ip = "bogus/8"}})));
+  EXPECT_NE("", h.SetResource(rules, Rules({{.dst_port = 65616}})));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &two}})) << "refused sets change nothing";
+  EXPECT_FALSE(Passes(h, acl, a));
+  EXPECT_TRUE(Passes(h, acl, b));
+
+  // The legacy add appends to the same list.
+  h.MustCommand(acl, "add", Rules({{.dst_port = 80}}));
+  const auto three = Rules(
+      {{.src_ip = "11.0.0.0/8"}, {.src_ip = "10.0.0.0/8", .drop = true}, {.dst_port = 80}});
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &three}}));
+
+  const bess::pb::ACLArg none;
+  EXPECT_EQ("", h.SetResource(rules, none));
+  EXPECT_FALSE(Passes(h, acl, a));
+  EXPECT_FALSE(Passes(h, acl, b));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &none}}));
+}
+
+// add and clear edit "<name>/rules": control_v2's InvokeAction refuses them.
+TEST(AclTest, CommandsAreLegacyOnly) {
+  std::mt19937 rng(4);
+  const Bytes b = TcpPacket({.sip = "11.1.2.3", .dip = "20.0.0.1"}, rng);
+  ModuleHarness h;
+  Module *acl = h.Create("ACL", bess::pb::ACLArg());
+  ASSERT_NE(nullptr, acl);
+  EXPECT_EQ(ENOTSUP, h.Action(acl, "add", Rules({{.src_ip = "11.0.0.0/8"}})).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(acl, "clear", bess::pb::EmptyArg()).error().code());
+  EXPECT_FALSE(Passes(h, acl, b)) << "the refused add did nothing";
+  // The legacy ModuleCommand still runs them.
+  h.MustCommand(acl, "add", Rules({{.src_ip = "11.0.0.0/8"}}));
+  EXPECT_TRUE(Passes(h, acl, b));
 }
 
 }  // namespace

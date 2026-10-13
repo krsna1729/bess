@@ -10,6 +10,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <variant>
 
 #include "framework/resource_bindings.h"
 #include "dataplane/transaction_engine.h"
@@ -20,6 +21,11 @@ namespace dataplane = bess::dataplane;
 namespace meter = bess::meter;
 
 const Commands Meter::cmds = {};
+
+const ResourceTables Meter::resource_tables = {
+    ResourceTable::Map<bess::pb::MeterIdKey, bess::pb::MeterPolicyValue>(
+        "meters"),
+};
 
 namespace {
 
@@ -45,6 +51,31 @@ std::expected<meter::MeterProfileSpec, std::string> PolicyFromPb(
       break;
   }
   return std::unexpected("meter policy has no profile set");
+}
+
+// PolicyFromPb's inverse: the message a client sends for `spec` (D-129's
+// read-back; every field is a scalar, so the form is unique).
+bess::pb::MeterPolicyValue PolicyToPb(const meter::MeterProfileSpec &spec) {
+  bess::pb::MeterPolicyValue value;
+  if (const auto *sr = std::get_if<meter::SrTcmSpec>(&spec)) {
+    auto *pb = value.mutable_sr_tcm();
+    pb->set_committed_rate(sr->committed_rate);
+    pb->set_committed_burst(sr->committed_burst);
+    pb->set_excess_burst(sr->excess_burst);
+  } else if (const auto *tr = std::get_if<meter::TrTcmSpec>(&spec)) {
+    auto *pb = value.mutable_tr_tcm();
+    pb->set_committed_rate(tr->committed_rate);
+    pb->set_committed_burst(tr->committed_burst);
+    pb->set_peak_rate(tr->peak_rate);
+    pb->set_peak_burst(tr->peak_burst);
+  } else if (const auto *rfc = std::get_if<meter::TrTcmRfc4115Spec>(&spec)) {
+    auto *pb = value.mutable_tr_tcm_rfc4115();
+    pb->set_committed_rate(rfc->committed_rate);
+    pb->set_committed_burst(rfc->committed_burst);
+    pb->set_excess_rate(rfc->excess_rate);
+    pb->set_excess_burst(rfc->excess_burst);
+  }
+  return value;
 }
 
 }  // namespace
@@ -128,6 +159,7 @@ class Meter::MetersResource final : public dataplane::Resource {
     if (!applied) {
       return std::unexpected(meter::MeterErrorName(applied.error()));
     }
+    owner_.staged_policies_.insert_or_assign(id, *policy);
     Reservation reservation{
         std::make_unique<UpsertOp>(owner_, owner_.staged_->Build()), {},
         // Publishing replaces the generation that is live now.
@@ -204,6 +236,18 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
               return std::unexpected(policy.error());
             }
             return std::any(*policy);
+          },
+          // Every meter the control side holds (an erased one is gone at
+          // once, though it stays readable until its removal stage).
+          [this](const auto &visit) {
+            for (const auto &[id, policy] : policies_) {
+              if (retiring_.contains(id)) {
+                continue;
+              }
+              bess::pb::MeterIdKey key;
+              key.set_id(id.value());
+              visit(key, PolicyToPb(policy));
+            }
           }));
   if (auto registered =
           init_context().resources().Register(resource_.get());
@@ -259,6 +303,7 @@ int Meter::OnEvent(bess::Event event) {
 void Meter::BeginTransaction() {
   if (staged_ == nullptr) {
     staged_ = live_->Clone();
+    staged_policies_ = policies_;
     published_staged_ = false;
   }
 }
@@ -270,6 +315,7 @@ void Meter::PublishStaged(std::unique_ptr<const meter::MeterSet> generation,
   // holds, and the published generation is this operation's view of it.
   if (!published_staged_) {
     live_.swap(staged_);
+    policies_.swap(staged_policies_);
     published_staged_ = true;
   }
   retirer.Retire(published_.Exchange(std::move(generation)));
@@ -281,11 +327,13 @@ void Meter::Unpublish(meter::MeterId id, dataplane::Retirer &later) {
   }
   auto erased = live_->Erase(id);
   CHECK(erased) << meter::MeterErrorName(erased.error());
+  policies_.erase(id);
   later.Retire(published_.Exchange(live_->Build()));
 }
 
 void Meter::EndTransaction() noexcept {
   staged_.reset();
+  staged_policies_.clear();
   published_staged_ = false;
 }
 

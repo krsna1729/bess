@@ -58,6 +58,36 @@ to the `Client` that made it, which must outlive it. The Go SDK is the one for
 external controllers such as the UPF; the C++ SDK is the one the C++ bessctl
 (G1.7, pending) is to be built on (D-104).
 
+## Resources: maps and singletons (D-129)
+
+A module's state is its init argument and its resources; what it does that
+is not state is an action (below). A resource is a map, entries keyed by a
+message (ExactMatch's `em/rules`: `ExactMatchRuleKey` -> `ExactMatchRuleValue`),
+or a singleton, one value under no key (`em/settings`: `ExactMatchSettings`
+with its `default_gate`). Discovery (C++ and Go `Resource`/`Resources`) gives
+each its `kind` (`KIND_MAP`, `KIND_SINGLETON`; a daemon before D-129 sends
+none: a map) and `requires_paused_workers`.
+
+A singleton is set, never upserted or erased: C++ `tx.Set(*settings, value)`,
+Go `tx.Set(settings, value)` add an op with a value and no key. `Upsert` or
+`Erase` on a singleton, and `Set` on a map, are `InvalidRequest` before
+anything is sent.
+
+```cpp
+auto settings = client->Resource("em/settings");   // KIND_SINGLETON
+bess::pb::ExactMatchSettings value;
+value.set_default_gate(3);
+auto tx = client->NewTransaction();
+tx.Set(*settings, value);
+auto applied = tx.Commit();
+```
+
+A resource that requires paused workers changes only while no worker runs
+its module. A transaction on it while one does is refused before anything is
+tried (`FAILED_PRECONDITION`, `RESOURCE_BUSY`): C++ `kBusy`, Go `*BusyError`,
+with the daemon's detail, at once and not retried, since no retry helps until
+the workers are paused (Admin `PauseWorkers`, then `ResumeWorkers`).
+
 ## Desired state
 
 The pipeline (ports, modules, connections, workers, traffic classes, and where
@@ -99,19 +129,80 @@ second application is a conflict. An answer is told from a loss by the
 server's `ErrorDetail` (a resource failure is UNAVAILABLE with a detail: an
 answer).
 
+### Resource contents (D-129)
+
+A pipeline may list resources' contents (`Pipeline.resources`: each a
+`ResourceContents{name, entries}`, an entry a `ResourceEntry{key, value}` of
+the resource's types, a singleton's one entry without a key), and the apply
+makes them desired state too:
+
+- a listed resource converges to exactly its entries (entries created,
+  updated or erased as needed);
+- a listed resource with no entries is cleared;
+- a resource the pipeline does not list is left as it is.
+
+The resources are converged in one dataplane transaction after the topology
+commit (the resources of a module the same apply creates exist only then)
+and before what it replaced retires. If that transaction is refused, the
+topology is rolled back too: the apply is all or nothing.
+`ApplyPipelineResponse.resource_ops` counts the entries created, updated or
+erased. A change to resource contents alone leaves the pipeline generation as
+it is and moves the resource generation (the dataplane transaction
+generation, `ApplyTransaction`'s), reported as `resource_generation`. A diff
+lists what each listed resource would change (`PipelineDiff.resources`:
+created, updated, removed; `checked` false when the resource does not exist
+yet, so its keys are checked only when the apply commits them).
+
+`client.Pipeline` reads only the topology unless asked: C++
+`client->Pipeline({.include_resources = true, .resources = {"em/rules"}})`, Go
+`client.Pipeline(ctx, bess.WithResources("em/rules"))` (no names: every
+resource) lists those resources' contents too, so the snapshot applies back as
+a no-op. A response above the 64 MiB message limit is `RESOURCE_EXHAUSTED`:
+name fewer resources.
+
+Such a snapshot's version carries the resource generation it was read at
+(`PipelineVersion.resource_generation`: C++ `std::optional<uint64_t>`, Go
+`ResourceGeneration *uint64`), and so does a diff's or plan's when its
+pipeline lists resources. Applying with that version as expected sends
+`expected_resource_generation` too: resource contents that moved since are a
+conflict (`kPipelineConflict`, `*PipelineConflictError`), nothing changed. A
+version without one checks only the pipeline generation.
+
+The C++ `PipelineBuilder` lists contents: `Resource(name)` lists a resource
+(with no entry so far: the apply clears it), `Entry(name, key, value)` adds a
+map entry, `Setting(name, value)` gives a singleton its one value; on a
+resource already listed (a snapshot's) they add to its entries. `Remove(name)`
+drops a module's resources (`<module>/...`) with it. In Go, set
+`Pipeline.Resources` (`pb.ResourceContents`, `pb.ResourceEntry` with `anypb`
+key and value).
+
+```cpp
+auto snap = client->Pipeline({.include_resources = true, .resources = {"em/rules"}});
+auto p = bess::sdk::PipelineBuilder(snap->pipeline)
+             .Resource("em/rules")            // read back with its entries
+             .Entry("em/rules", key, value)   // and one more
+             .Setting("em/settings", settings)
+             .Build();
+auto applied = client->ApplyPipeline(*p, snap->version);  // resource_ops, resource_generation
+```
+
 ## Schema discovery
 
 `GetSchema` (C++ `client->Schema()`, Go `client.Schema(ctx)`) names the
-argument type of every module class's init, every port driver's init and every
-module command, by full protobuf name, and carries a `FileDescriptorSet` with
-those types and transaction resources' key and value types, each file after
-its imports. A client without generated code for a type (bessctl, a manifest,
-a UI) builds a `DescriptorPool` from it and reads or writes the type as JSON
-or as a `DynamicMessage`. Loaded plugins' types are included. A class
-registered with `DEF_MODULE`/`ADD_MODULE` or `ADD_DRIVER` declares its init
-type from `Init`'s parameter; a command's hand-written `arg_type` resolves in
-the init type's package, then `bess.pb` (`""` if neither names a message; a
-unit test holds every built-in command to a real type).
+argument type of every module class's init and every port driver's init, and
+each module class's actions (`ModuleClassSchema.actions`: name, `arg_type`,
+`result_type`, `thread_safe`) and resource tables (`resources`: table, kind,
+key and value types, `requires_paused_workers`; module `m`'s resource is
+`m/<table>`, a singleton's key type `google.protobuf.Empty`), by full protobuf
+name. It carries a `FileDescriptorSet` with those types and transaction
+resources' key and value types, each file after its imports. A client without
+generated code for a type (bessctl, a manifest, a UI) builds a
+`DescriptorPool` from it and reads or writes the type as JSON or as a
+`DynamicMessage`. Loaded plugins' types are included. A class registered with
+`DEF_MODULE`/`ADD_MODULE` or `ADD_DRIVER` declares its init type from
+`Init`'s parameter; an action's hand-written `arg_type` resolves in the init
+type's package, then `bess.pb` (`""` if neither names a message; a unit test
+holds every built-in one to a real type).
 
 ## bessctl (C++, G1.7)
 
@@ -128,11 +219,11 @@ what `get` prints, `apply` reads back. Numbers are passed through as written:
 64-bit values are not rounded.
 
 ```sh
-bessctl schema ExactMatch         # init type, gates, commands and their types
+bessctl schema ExactMatch         # init type, gates, actions and resource tables
 bessctl validate pipeline.json    # the daemon's canonical form
 bessctl diff pipeline.json        # what would change
 bessctl plan pipeline.json        # the steps, by phase
-bessctl apply pipeline.json [--generation G@E]
+bessctl apply pipeline.json [--generation G[/R]@E]
 bessctl get > pipeline.json       # the active pipeline as a manifest
 bessctl get -o yaml > p.yaml      # the same, as YAML (also validate -o yaml)
 bessctl status | resources | metrics | events [--from SEQ] [TYPE...]
@@ -193,45 +284,86 @@ before D-123 sends nothing for `core: 0` (proto3's default), which a D-123
 daemon reads as automatic. Explicit core 0 needs a client built from the
 current proto (every SDK in this repository is).
 
-A manifest may also hold entries for the resources its modules create (see
-`bessctl resources`), in the resource's key and value types:
+A manifest's `resources` (`Pipeline.resources`, D-129) lists resources'
+contents by name, `<module>/<table>` (see `bessctl schema CLASS` for a class's
+tables): a map resource's entries as a list of `key`/`value` objects, a
+singleton's value as one object. The kind and the key and value types are the
+table's that the class of the manifest's module of that name declares, so a
+key or value may leave out `"@type"` as an `arg` may:
 
-```json
-"resources": {
-  "em/rules": [{"key": {"fields": [{"value_bin": "CgAAAQ=="}]}, "value": {"gate": 1}}]
-}
+```yaml
+resources:
+  em/rules:                   # a map: exactly these entries
+    - key: {fields: [{value_bin: "CgAAAQ=="}]}
+      value: {gate: 1}
+  em/settings: {default_gate: 0}   # a singleton: its value
+  fib/macs: []                # listed with no entries: cleared
 ```
 
-`apply` commits them in one transaction after the pipeline, since the
-resources exist only then: if they fail, the pipeline stays applied and the
-error names the entry. Both steps are idempotent, so after a fix the same
-`apply` is the retry; with `--generation`, give the version the failed
-`apply` printed (the error says which), since its pipeline step moved it.
+A listed resource becomes exactly what it lists (entries added, replaced and
+removed); one the manifest does not list is left alone. `apply` is one
+`ApplyPipeline`: the topology and the listed resources' contents apply all or
+nothing, so a bad entry (named by `resource 'em/rules' entry N`) changes
+nothing. `validate`, `diff` and `plan` cover resources too: `diff` prints a
+resource's change as `+created ~updated -removed`, `(unchecked)` when its
+module is created by the same apply (its keys are checked only then), and
+`plan` its `RESOURCE` steps. `get` prints every resource's contents, the
+implied `"@type"` left out, so its output applies back as a no-op.
+
 Versions are printed and read as `generation@epoch`: a generation alone
-would match a restarted daemon that reached the same number (D-106).
-Entries are added or replaced, never removed, and `get` does not print them.
-`validate`, `diff` and `plan` check only the pipeline.
+would match a restarted daemon that reached the same number (D-106). When a
+manifest lists resources (and for `get`, on standard error), the version is
+`generation/resource-generation@epoch`: `apply --generation G/R@E` is refused
+if the topology moved past G or any resource's contents past R since; `G@E`
+guards the topology only.
 
-## Module commands (D-115)
+## Module actions (D-129)
 
-`RunModuleCommand` (Control service; C++ `client->RunModuleCommand(module,
-command, arg)`, Go `client.RunModuleCommand(ctx, module, command, arg)`) runs a module's
-command, as the legacy `ModuleCommand` did: `arg` is a message of the type
-`GetSchema` names for the command, and the answer is a `google.protobuf.Any`,
-empty when the command answers nothing. Every module also answers
-`get_initial_arg` (`EmptyArg`): its init argument. A command is not a
-transaction: it is not retried, recorded or announced as an event, and the
-pipeline's generation does not change. It names the epoch the client has seen
-and is refused under another (D-106). A command not marked thread-safe is
-refused (EBUSY: C++ `kBusy`, Go `*BusyError`) while a running worker runs the module: pause the workers
-first. An unknown module is `NOT_FOUND`; an unknown command, or the command's
-own failure, carries its errno in the `ErrorDetail`.
+What a module does that is not state -- lookups, statistics, clearing
+counters, one-shot operations -- is an action. `InvokeAction` (Control
+service; C++ `client->InvokeAction(module, action, arg)`, or
+`client->InvokeAction<R>(...)` for the result unpacked as `R`; Go
+`client.InvokeAction(ctx, module, action, arg)`) runs one: `arg` is a message
+of the type `GetSchema` names for the action (`ModuleClassSchema.actions`),
+and the result is a `google.protobuf.Any`, empty when the action answers
+nothing. For example L2Forward's `lookup` (`L2ForwardCommandLookupArg` ->
+`L2ForwardCommandLookupResponse`) and `populate`, Measure's `get_summary` and
+`clear`. An action is not a transaction: it is not retried, recorded or
+announced as an event, and no generation changes. It names the epoch the
+client has seen and is refused under another (D-106). An action not marked
+thread-safe is refused (EBUSY, `RESOURCE_BUSY`: C++ `kBusy`, Go `*BusyError`)
+while a running worker runs the module: pause the workers first. An unknown
+module is `NOT_FOUND`; an action's own failure carries its errno in the
+`ErrorDetail` (`errno_value`; C++ `kInvalidRequest`, Go
+`*InvalidRequestError`).
+
+The commands that edit state are legacy-only: only the legacy
+`BESSControl.ModuleCommand` reaches them (ExactMatch's and WildcardMatch's
+`add`, `delete`, `clear`, `set_default_gate`, `get_runtime_config`,
+`set_runtime_config`; L2Forward's `add`, `delete`, `set_default_gate`; every
+module's `get_initial_arg`). control_v2 neither lists nor runs them:
+`InvokeAction` answers `INVALID_ARGUMENT` with errno `ENOTSUP` and field
+`action`, as for an unknown action. What they edit is the module's resources
+(`em/rules`, `em/settings`), changed by a transaction or a pipeline apply, and
+its init argument (`GetPipeline`'s `Module.arg`).
 
 ```sh
-bessctl command fib lookup '{addrs: ["02:00:00:00:00:01"]}'   # JSON or YAML
-bessctl command em get_runtime_config -o yaml
-bessctl pause && bessctl command arp add '{ip: 10.0.0.1, mac_addr: "02:00:00:00:00:01"}' && bessctl resume
+bessctl action fib lookup '{addrs: ["02:00:00:00:00:01"]}'   # JSON or YAML
+bessctl action queue get_status -o yaml
+bessctl pause && bessctl action br flush && bessctl resume   # not thread-safe
 ```
+
+`bessctl action MODULE ACTION [ARG] [-o json|yaml]` invokes an action
+(`InvokeAction`, D-129): ARG is JSON or YAML text of the argument type
+`GetSchema` lists for the class's action (default `{}`), and the result is
+printed in its result type. An unknown action, or a command that edits state
+(`add`, `set_default_gate`, `get_initial_arg`, ...: not an action), is refused
+with the class's actions listed; that state is in the module's resources,
+changed by applying a manifest. `bessctl schema CLASS` lists the class's
+actions (`action NAME ARG_TYPE [-> RESULT_TYPE]`, `(no pause)` when
+thread-safe) and resource tables (`resource TABLE map KEY -> VALUE` or
+`resource TABLE singleton VALUE`, `(paused)` when changing it pauses the
+workers); `bessctl resources` the resources that exist, by name, the same way.
 
 ## Administration (the Admin service, D-107)
 
@@ -333,10 +465,12 @@ curl -sN localhost:8080/v2/events
 | No answer through every attempt | `TransportError`: the outcome is unknown, not failed; ask `get_transaction(request_id)` later. |
 | An answer to a question from another daemon epoch | `DaemonRestarted` (not `refused`): a send went unanswered and the old daemon's outcome is lost with it; never reported as applied or as not applied. The running daemon has not applied it (it refuses the old epoch): re-read its state before deciding. |
 | `OUTCOME_BUSY` | The daemon has already waited out a short BUSY itself (up to 5 more attempts over about 6 ms, within the request's deadline; nothing is recorded under the id). The SDK then retries with doubling backoff, then `Busy`. Metrics: `bess_transactions_total{outcome="busy"}` counts only BUSY answers; attempts the daemon retried count in `bess_transaction_busy_retries_total`. |
+| `RESOURCE_BUSY` on a resource that requires paused workers, while a worker runs its module (C++, Go) | `Busy` at once, with the daemon's detail: nothing was tried, and no retry helps until the workers are paused. Not retried, nothing asked. |
 | `OUTCOME_CONFLICT` | `Conflict` (nothing tried); the application decides what a moved generation means. `after_unknown_attempt`: an earlier send of the same commit went unanswered and may have applied. |
 | `OUTCOME_REJECTED` | `Rejected`, with each failing operation's index and error; nothing changed. |
 | A refused call | `InvalidRequest`, with the server's `ErrorDetail` (code, field, object). |
 | A key or value of the wrong type | `InvalidRequest` before anything is sent. |
+| A singleton upserted or erased, a map set (C++, Go) | `InvalidRequest` before anything is sent. |
 | A resource handle from before a restart the client has seen | `StaleResource` before anything is sent. A handle carries the epoch it was discovered under; a transaction is bound to its first handle's epoch. Look the resource up again (`client.resource(name)` after `resources(refresh=True)`, or after any answer from the new epoch) and rebuild the transaction. |
 
 Conflicts and rejections are never retried. Tuning:
@@ -420,8 +554,10 @@ in each, and checks that the rule each left behind steers packets. A behaviour
 both SDKs must share is a case there, not a test in one SDK.
 
 A driver gets the daemon's address, the resource name (`$resource` in the
-cases; `$module` is its module, the part before `/`) and the cases. It builds every message from the daemon's `GetSchema`
-descriptors and protobuf JSON, as a client without generated code would.
+cases; `$module` is its module, the part before `/`, and `$module/<table>`
+that module's other resources) and the cases. It builds every message from
+the daemon's `GetSchema` descriptors and protobuf JSON, as a client without
+generated code would.
 Cases run in order, each with its own labels; a case fails at its first failing
 step. Error kinds are named alike in both drivers: `invalid_request`,
 `conflict`, `rejected`, `busy`, `transport`, `pipeline_conflict`,
@@ -440,8 +576,8 @@ if it succeeds.
 | `event` | `watch`, `of`, `want_fields` | within 5 s the stream delivers commit `of`'s event (its `request_id` field), with that commit's generation and these fields |
 | `commit` | `ops`, `request_id_of`, `expected_generation_of`, `generation_delta`, `snapshot`, `as` | one transaction on `$resource` (below) |
 | `transaction_status` | `of` or `request_id`, `want_known`, `want_outcome` | `GetTransaction` of commit `of`'s request id, or `request_id` |
-| `pipeline` | `base`, `add`, `chain`, `remove`, `plan`, `want_plan_version_of`, `want_changes`, `at_version_of`, `as` | below |
-| `module_command` | `module`, `command`, `arg`, `class` or `arg_type`, `want_answer` | `RunModuleCommand` (D-115) with `arg` (protobuf JSON) in `arg_type`, else in the argument type `class`'s schema gives the command; the answer, in protobuf JSON with the .proto field names, has the fields of `want_answer` with those values |
+| `pipeline` | `base`, `with_resources`, `want_resources`, `add`, `chain`, `remove`, `resources`, `plan`, `want_plan_version_of`, `want_changes`, `at_version_of`, `want_generation_of`, `want_resource_ops`, `want_resource_generation_of`, `as` | below |
+| `action` | `module`, `action`, `arg`, `class` or `arg_type`, `want_answer` | `InvokeAction` (D-129) with `arg` (protobuf JSON) in `arg_type`, else in the argument type `class`'s schema gives the action (`ModuleClassSchema.actions`); the result, in protobuf JSON with the .proto field names, has the fields of `want_answer` with those values. A legacy-only command is named with its `arg_type`, since the schema lists no such action |
 
 **commit.** Each op is `{"op": "upsert", "key": {...}, "value": {...}}` or
 `{"op": "erase", "key": {...}}` in the resource's key and value types;
@@ -455,16 +591,33 @@ an expected generation of commit `expected_generation_of`'s plus
 `want_failed_ops` (the failed operations' indexes among those sent). `as`
 labels the commit's request id and generation.
 
-**pipeline.** Without `base`, `add`, `chain` or `remove`, reads the active
-pipeline and its version (generation and daemon epoch) into `as`. Otherwise
-builds on `base`'s pipeline (a label of an earlier pipeline step; the active
-one if absent): `add` modules (`[name, class]`, no argument), `chain` them gate
-0 to gate 0, `remove` modules (`base` alone: that pipeline again). Then `plan`
-(at least one step; with `want_plan_version_of`, made against that label's
-version), `want_changes` (the diff against the active pipeline has that many
-changes), and the apply, expecting `at_version_of`'s version if given;
-`want_generation_of`: the apply reached that label's generation (nothing
-changed). `as` labels the built pipeline and the version the apply reached.
+**pipeline.** Without `base`, `add`, `chain`, `remove` or `resources`, reads
+the active pipeline and its version (generation and daemon epoch) into `as`;
+`with_resources` (resource names; `[]`: every resource) reads those
+resources' contents too, and the version then has their resource generation.
+`want_resources` checks what was read: each named resource (`{name: [entry,
+...]}`) is listed with exactly these entries, in any order, compared as
+messages. Otherwise builds on `base`'s pipeline (a label of an earlier
+pipeline step; the active one, read as above, if absent): `add` modules
+(`[name, class]`, or `[name, class, arg]` with `arg` in protobuf JSON of the
+class's init type), `chain` them gate 0 to gate 0, `remove` modules and their
+resources (`<module>/...`), then list `resources` (`{name: [entry, ...]}`):
+each named resource with exactly these entries, in place of any listing the
+base had (`[]`: listed empty, so the apply clears it). An entry is `{"key":
+{...}, "value": {...}}`, a singleton's `{"value": {...}}`, in the types the
+schema gives the resource's table for the class of its module in the
+pipeline (`ModuleClassSchema.resources`). `base` alone: that pipeline again.
+Then `plan` (at least one step; with `want_plan_version_of`, made against
+that label's version, resource generation included), `want_changes` (the
+diff against the active pipeline has that many changes), and the apply,
+expecting `at_version_of`'s version if given (with its resource generation,
+if it has one); `want_generation_of`: the apply reached that label's
+generation (the pipeline did not change); `want_resource_ops`: the apply
+created, updated or erased that many resource entries;
+`want_resource_generation_of`: the apply reached that label's resource
+generation (no resource changed). `as` labels the built pipeline and the
+version the apply reached (with the resource generation when it lists
+resources).
 
 ## Not yet
 

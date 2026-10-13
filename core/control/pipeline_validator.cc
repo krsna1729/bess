@@ -503,6 +503,66 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
     }
   }
 
+  // -- resources (D-129) ----------------------------------------------------
+  // Type-level checks only: a key's meaning (its decoding) is the module's,
+  // known once the module exists -- the apply checks it.
+  auto type_of = [](const google::protobuf::Any &any) {
+    const std::string &url = any.type_url();
+    return url.substr(url.rfind('/') + 1);
+  };
+  std::set<std::string> resource_names;
+  for (const ResourceSpec &resource : spec.resources) {
+    if (!resource_names.insert(resource.name).second) {
+      return std::unexpected(Duplicate(resource.name, "resources",
+                                       "resource '" + resource.name + "' is listed twice"));
+    }
+    const size_t slash = resource.name.rfind('/');
+    const std::string module =
+        slash == std::string::npos ? std::string() : resource.name.substr(0, slash);
+    const auto builder = builders.find(module);
+    if (builder == builders.end()) {
+      return std::unexpected(NotFound(
+          resource.name, "resources",
+          "resource '" + resource.name + "': no module '" + module +
+              "' in the pipeline (a resource is named \"<module>/<table>\")"));
+    }
+    const std::string table = resource.name.substr(slash + 1);
+    const ResourceTable *declared = builder->second->FindResourceTable(table);
+    if (declared == nullptr) {
+      std::string tables;
+      for (const ResourceTable &t : builder->second->resource_tables()) {
+        tables += (tables.empty() ? "" : ", ") + t.table;
+      }
+      return std::unexpected(NotFound(
+          resource.name, "resources",
+          "resource '" + resource.name + "': class " + builder->second->class_name() +
+              " has no table '" + table + "' (" + (tables.empty() ? "it has none" : tables) +
+              ")"));
+    }
+    if (declared->kind == ResourceTable::SINGLETON && resource.entries.size() != 1) {
+      return std::unexpected(Invalid(resource.name, "resources",
+                                     "resource '" + resource.name +
+                                         "' is a singleton: it takes exactly one entry"));
+    }
+    for (size_t i = 0; i < resource.entries.size(); i++) {
+      const ResourceEntrySpec &entry = resource.entries[i];
+      const std::string where = "resource '" + resource.name + "' entry " + std::to_string(i);
+      const bool keyless = entry.key.type_url().empty() && entry.key.value().empty();
+      if (declared->kind == ResourceTable::SINGLETON
+              ? !keyless && type_of(entry.key) != declared->key_type
+              : type_of(entry.key) != declared->key_type) {
+        return std::unexpected(Invalid(
+            resource.name, "resources",
+            where + ": key is not a " + declared->key_type +
+                (declared->kind == ResourceTable::SINGLETON ? " (a singleton takes none)" : "")));
+      }
+      if (type_of(entry.value) != declared->value_type) {
+        return std::unexpected(
+            Invalid(resource.name, "resources", where + ": value is not a " + declared->value_type));
+      }
+    }
+  }
+
   Normalize(&spec);
 
   ValidatedPipeline validated;

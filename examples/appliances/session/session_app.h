@@ -156,6 +156,16 @@ class SessionApp {
   bess::dataplane::Resource &rule_resource() noexcept { return rule_resource_; }
   bess::route::Router &router() noexcept { return *router_; }
 
+  // The objects published at each id (SlotTable::Current: live ones only),
+  // for reading the resources back on the control side.
+  const bess::dataplane::SlotTable<QosId, QosPolicy> &qos_table() const noexcept { return qos_; }
+  const bess::dataplane::SlotTable<ActionId, SessionAction> &action_table() const noexcept {
+    return actions_;
+  }
+  const bess::dataplane::SlotTable<RuleId, PdrLikeRule> &rule_table() const noexcept {
+    return rules_;
+  }
+
   // -- direct writes (an application that is not enrolled) -------------------
 
   // For an application with no engine and no concurrent reader (the module's

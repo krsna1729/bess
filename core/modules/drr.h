@@ -11,6 +11,7 @@
 #include <rte_hash_crc.h>
 #include <rte_ring.h>
 
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "pktbatch.h"
@@ -47,7 +48,8 @@ using bess::utils::CuckooMap;
 //    * Max Flow Queue Size: the maximum size that any Flows queue can get
 //          before the module will start dropping the flows packets
 // COMMANDS
-//    set_quantum_size and set_max_flow_queue_size apply live, without
+//    set_quantum_size and set_max_flow_queue_size (legacy only) and the
+//    "<name>/settings" resource (DRRSettings, D-129) apply live, without
 //    pausing workers.
 //
 // THREADING: every packet enters through an ingress ring that any number of
@@ -148,8 +150,12 @@ class DRR final : public Module {
   ~DRR();  // deconstructor
 
   static const Commands cmds;
+  // "settings" (DRRSettings): quantum and max flow queue size, applied live
+  // (D-129).
+  static const ResourceTables resource_tables;
 
   CommandResponse Init(const bess::pb::DRRArg &arg);
+  void DeInit() override;
 
   // Any worker: hands the batch to the task through the ingress ring.
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
@@ -267,5 +273,12 @@ class DRR final : public Module {
   rte_ring *ingress_;     // multi-producer, single-consumer: packets in.
   rte_ring *flow_ring_;   // ring used for round robin.
   Flow *current_flow_;  // store current flow between batch rounds.
+
+  struct Settings {
+    uint32_t quantum;
+    uint32_t max_queue_size;
+  };
+  // "<name>/settings"; after the state it sets.
+  bess::framework::Singleton<bess::pb::DRRSettings, Settings> settings_;
 };
 #endif  // BESS_MODULES_DRR_H_

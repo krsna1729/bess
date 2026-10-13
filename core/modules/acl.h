@@ -4,8 +4,10 @@
 #ifndef BESS_MODULES_ACL_H_
 #define BESS_MODULES_ACL_H_
 
+#include <memory>
 #include <vector>
 
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "rcu/rcu_ptr.h"
 #include "pb/module_msg.pb.h"
@@ -32,12 +34,14 @@ class ACL final : public Module {
   };
 
   static const Commands cmds;
+  static const ResourceTables resource_tables;
 
   ACL() : Module(), rules_(init_context().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 
   CommandResponse Init(const bess::pb::ACLArg &arg);
+  void DeInit() override;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
@@ -46,11 +50,19 @@ class ACL final : public Module {
 
  private:
   // The rule list is one immutable object published through an RcuPtr:
-  // `add` and `clear` publish a replacement while workers keep processing
-  // (G1.2 mode G; ACLs here are small, scanned first-match). A batch reads it
-  // once. Decision D-017 (docs/decisions.md)
+  // `add`, `clear` and the "<name>/rules" resource publish a replacement
+  // while workers keep processing (G1.2 mode G; ACLs here are small,
+  // scanned first-match). A batch reads it once. Decision D-017
+  // (docs/decisions.md)
   struct Rules {
     std::vector<ACLRule> rules;
+  };
+
+  // A "<name>/rules" value, converted: the rule list to publish and the
+  // ACLArg it came from (read back as given).
+  struct Staged {
+    std::unique_ptr<const Rules> rules;
+    bess::pb::ACLArg arg;
   };
 
   // Validates and converts every rule of `arg`; nothing is kept on error.
@@ -59,6 +71,12 @@ class ACL final : public Module {
   void Install(std::vector<ACLRule> rules);
 
   bess::rcu::RcuPtr<Rules> rules_;
+  // The rules as given, in order (control side): "<name>/rules" reads it
+  // back.
+  bess::pb::ACLArg arg_;
+  // "<name>/rules" (D-129): the whole ordered rule list; setting it replaces
+  // the list (an RCU swap: workers keep running).
+  bess::framework::Singleton<bess::pb::ACLArg, Staged> rules_resource_;
 };
 
 #endif  // BESS_MODULES_ACL_H_

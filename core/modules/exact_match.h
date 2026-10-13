@@ -5,6 +5,7 @@
 #ifndef BESS_MODULES_EXACTMATCH_H_
 #define BESS_MODULES_EXACTMATCH_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -22,6 +23,7 @@
 #include "classifier/runtime_schema.h"
 #include "event.h"
 #include "framework/resource_bindings.h"
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "rcu/rcu_ptr.h"
@@ -51,6 +53,9 @@ class ExactMatch final : public Module {
   static constexpr gate_idx_t kActionGate = 0;
 
   static const Commands cmds;
+  // "rules" (ExactMatchRuleKey -> ExactMatchRuleValue) and "settings"
+  // (ExactMatchSettings), both changed while workers run (D-129).
+  static const ResourceTables resource_tables;
 
   // Whether rules name actions rather than gates (see the class comment).
   bool action_mode() const noexcept { return action_mode_; }
@@ -115,9 +120,10 @@ class ExactMatch final : public Module {
   };
 
   // The configuration a batch runs against: the compiled extraction plan, the
-  // default gate, and the rule table. Immutable once published; it changes
-  // only when configuration does (default gate, metadata offsets, a restore,
-  // or table growth).
+  // default gate, and the rule table. Immutable once published, but for the
+  // default gate, which the "settings" resource stores in place; the rest
+  // changes only when configuration does (metadata offsets, a restore, the
+  // legacy set_default_gate, or table growth).
   //
   // Rules are NOT part of a generation (G1.2 mode C). They live in a
   // ConcurrentExactTable -- DPDK's lock-free rte_hash under the runtime
@@ -138,7 +144,10 @@ class ExactMatch final : public Module {
           converted_masks(std::move(masks)),
           baked_source_offsets(std::move(offsets)) {}
 
-    gate_idx_t default_gate = DROP_GATE;
+    // Read once per batch (relaxed): the "settings" resource stores it in the
+    // published generation while workers run, with nothing to allocate or
+    // retire (D-129). A rebuild carries the current value over (D-110).
+    mutable std::atomic<gate_idx_t> default_gate{DROP_GATE};
     bess::classifier::ExtractPlan extract;
     // Shared, updated in place; owned by every generation that maps it (a
     // retired generation keeps a replaced table alive for its grace period).
@@ -290,6 +299,11 @@ class ExactMatch final : public Module {
   // registered from Init() to DeInit().
   std::unique_ptr<bess::classifier::ExactRuleResource> resource_;
   bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
+  // ExactMatchSettings as the singleton resource "<module name>/settings"
+  // (D-129), registered from Init() to DeInit(); after published_, whose
+  // generation's default gate it sets.
+  bess::framework::Singleton<bess::pb::ExactMatchSettings, gate_idx_t>
+      settings_;
 };
 
 #endif  // BESS_MODULES_EXACTMATCH_H_

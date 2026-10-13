@@ -57,22 +57,35 @@ bool DecodeFieldData(const bess::pb::FieldData &data, int field_size,
 
 }  // namespace
 
+// Every command edits state "<module>/rules" or "<module>/settings" now
+// holds, or reads it back (GetPipeline's Module.arg replaces
+// get_initial_arg): all legacy-only (D-129).
 const Commands WildcardMatch::cmds = {
     {"get_initial_arg", "EmptyArg",
-     MODULE_CMD_FUNC(&WildcardMatch::GetInitialArg), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&WildcardMatch::GetInitialArg), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"get_runtime_config", "EmptyArg",
-     MODULE_CMD_FUNC(&WildcardMatch::GetRuntimeConfig), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&WildcardMatch::GetRuntimeConfig), Command::THREAD_SAFE,
+     "", Command::LEGACY_ONLY},
     {"set_runtime_config", "WildcardMatchConfig",
-     MODULE_CMD_FUNC(&WildcardMatch::SetRuntimeConfig), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&WildcardMatch::SetRuntimeConfig), Command::THREAD_SAFE,
+     "", Command::LEGACY_ONLY},
     {"add", "WildcardMatchCommandAddArg",
-     MODULE_CMD_FUNC(&WildcardMatch::CommandAdd), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&WildcardMatch::CommandAdd), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"delete", "WildcardMatchCommandDeleteArg",
-     MODULE_CMD_FUNC(&WildcardMatch::CommandDelete), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&WildcardMatch::CommandDelete), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"clear", "EmptyArg", MODULE_CMD_FUNC(&WildcardMatch::CommandClear),
-     Command::THREAD_SAFE},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
     {"set_default_gate", "WildcardMatchCommandSetDefaultGateArg",
      MODULE_CMD_FUNC(&WildcardMatch::CommandSetDefaultGate),
-     Command::THREAD_SAFE}};
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY}};
+
+const ResourceTables WildcardMatch::resource_tables = {
+    ResourceTable::Map<bess::pb::WildcardMatchRuleKey,
+                       bess::pb::WildcardMatchRuleValue>("rules"),
+    ResourceTable::Singleton<bess::pb::WildcardMatchSettings>("settings")};
 
 CommandResponse WildcardMatch::AddFieldOne(const bess::pb::Field &field,
                                            int idx) {
@@ -213,6 +226,34 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
         }
         return std::any(MaskedRuleResource::Value{
             value.priority(), static_cast<uint16_t>(value.gate())});
+      },
+      // Every rule as a client sends it: per-field value and mask bytes,
+      // full field width (the table holds them canonical), as
+      // get_runtime_config enumerates them.
+      [this](const bess::framework::TypedCodec<
+             bess::pb::WildcardMatchRuleKey,
+             bess::pb::WildcardMatchRuleValue>::TypedVisitor &visit) {
+        bess::pb::WildcardMatchRuleKey key;
+        bess::pb::WildcardMatchRuleValue value;
+        table_->ForEach(
+            [&](bess::classifier::ConstBytes mask,
+                bess::classifier::ConstBytes bytes,
+                const bess::classifier::ConcurrentMaskedTable::Rule &r) {
+              key.Clear();
+              value.Clear();
+              size_t pos = 0;
+              for (const FieldSpec &spec : field_specs_) {
+                const size_t n = static_cast<size_t>(spec.size);
+                key.add_values()->set_value_bin(
+                    reinterpret_cast<const char *>(bytes.data() + pos), n);
+                key.add_masks()->set_value_bin(
+                    reinterpret_cast<const char *>(mask.data() + pos), n);
+                pos += n;
+              }
+              value.set_priority(r.priority);
+              value.set_gate(r.result);
+              visit(key, value);
+            });
       }));
   if (auto registered =
           init_context().resources().Register(resource_.get());
@@ -221,10 +262,49 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
     resource_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
+
+  // The default gate as "<module>/settings" (D-129), what set_default_gate
+  // does: stage validates the gate and builds the replacement generation,
+  // apply swaps it in and retires the one it replaced (one retire). Workers
+  // may run throughout: they read the generation once per batch.
+  if (auto registered = settings_.Register(
+          init_context().resources(), init_context().codecs(),
+          name() + "/settings",
+          [this](const bess::pb::WildcardMatchSettings &v)
+              -> std::expected<GenerationPtr, std::string> {
+            if (!bess::IsValidGateValue(v.default_gate())) {
+              return std::unexpected(bess::utils::Format(
+                  "Invalid gate: %llu",
+                  static_cast<unsigned long long>(v.default_gate())));
+            }
+            Error err;
+            GenerationPtr next =
+                Build(published_.Read()->table,
+                      static_cast<gate_idx_t>(v.default_gate()), &err);
+            if (next == nullptr) {
+              return std::unexpected(err.second);
+            }
+            return next;
+          },
+          [this](GenerationPtr &next, bess::dataplane::Retirer &retirer) {
+            retirer.Retire(published_.Exchange(std::move(next)));
+          },
+          bess::dataplane::Resource::Footprint{.retires = 1},
+          [this] {
+            bess::pb::WildcardMatchSettings v;
+            v.set_default_gate(published_.Read()->default_gate);
+            return v;
+          },
+          nullptr);
+      !registered) {
+    DeInit();
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
   return CommandSuccess();
 }
 
 void WildcardMatch::DeInit() {
+  settings_.Release();
   if (resource_ == nullptr) {
     return;
   }

@@ -6,6 +6,9 @@
 #include <cstring>
 #include <string>
 
+#include "dataplane/transaction_engine.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
 #include "module.h"
 #include "module_graph.h"
 #include "modules/vif.h"
@@ -13,6 +16,9 @@
 #include "task.h"
 #include "packet_pool.h"
 #include "pb/module_msg.pb.h"
+#include "runtime/runtime_state.h"
+#include "testing/module_harness.h"
+#include "testing/packet_builder.h"
 #include "utils/arp.h"
 #include "utils/endian.h"
 #include "utils/ether.h"
@@ -26,6 +32,11 @@ using bess::pb::VifArg;
 using bess::pb::VifCommandAddArg;
 using bess::pb::VifCommandClearArg;
 using bess::pb::VifCommandDeleteArg;
+using bess::pb::VifInterfaceKey;
+using bess::pb::VifInterfaceValue;
+using bess::testing::Bytes;
+using bess::testing::ModuleHarness;
+using bess::testing::PacketBuilder;
 using bess::utils::Arp;
 using bess::utils::be16_t;
 using bess::utils::be32_t;
@@ -247,6 +258,160 @@ TEST_F(VifTest, LocalArpResponder) {
   EXPECT_EQ(expected_vif_ip, reply->sender_ip_addr);
 
   bess::PacketFree(pkt);
+}
+
+// Whether `resource`'s codec says it requires paused workers.
+bool RequiresPausedWorkers(const std::string &resource) {
+  const bess::dataplane::Resource *r =
+      bess::runtime::runtime().transactions().FindResource(resource);
+  const bess::framework::ResourceCodec *codec =
+      r == nullptr ? nullptr
+                   : bess::framework::ResourceBindings::ProcessDefault().Find(*r);
+  return codec != nullptr && codec->requires_paused_workers();
+}
+
+VifInterfaceKey IfaceKey(uint32_t id) {
+  VifInterfaceKey key;
+  key.set_id(id);
+  return key;
+}
+
+// Canonical: lower-case MAC, dotted-decimal address.
+VifInterfaceValue IfaceValue() {
+  VifInterfaceValue value;
+  value.set_vlan(5);
+  value.set_mac_addr("02:00:00:00:00:10");
+  value.set_ip_addr("10.0.0.10");
+  value.set_route_domain(7);
+  value.set_gate(1);
+  return value;
+}
+
+Bytes ToIface() {
+  return PacketBuilder()
+      .Ether("02:00:00:00:00:10", "02:00:00:00:00:01")
+      .Dot1Q(5)
+      .IPv4("10.0.0.1", "10.0.0.10")
+      .Build();
+}
+
+// The interfaces resource (D-129) steers traffic: a frame to the interface's
+// (VLAN, MAC) leaves on its gate; erased, it falls back to the default gate.
+TEST(VifResourceTest, InterfacesSteerTrafficAndReadBack) {
+  ModuleHarness h;
+  VifArg arg;
+  arg.set_default_gate(0);
+  Module *vif = h.Create("Vif", arg);
+  ASSERT_NE(nullptr, vif);
+  const std::string interfaces = vif->name() + "/interfaces";
+  EXPECT_TRUE(RequiresPausedWorkers(interfaces));
+
+  auto out = h.Run(vif, 0, {ToIface()}, {0, 1});
+  EXPECT_EQ(1u, out[0].size());
+  EXPECT_TRUE(out[1].empty());
+
+  const VifInterfaceKey key = IfaceKey(3);
+  const VifInterfaceValue value = IfaceValue();
+  ASSERT_EQ("", h.UpsertResource(interfaces, key, value));
+  out = h.Run(vif, 0, {ToIface()}, {0, 1});
+  EXPECT_TRUE(out[0].empty());
+  EXPECT_EQ(1u, out[1].size());
+  EXPECT_EQ("", h.ReadBackDiffers(interfaces, {{&key, &value}}));
+
+  // The interface's address is answered for on its VLAN.
+  const Bytes request = PacketBuilder()
+                            .Ether("ff:ff:ff:ff:ff:ff", "02:00:00:00:00:01")
+                            .Dot1Q(5)
+                            .Arp(1, "02:00:00:00:00:01", "10.0.0.1",
+                                 "00:00:00:00:00:00", "10.0.0.10")
+                            .Build();
+  out = h.Run(vif, 0, {request}, {0, 1});
+  ASSERT_EQ(1u, out[1].size());
+
+  ASSERT_EQ("", h.EraseResource(interfaces, key));
+  out = h.Run(vif, 0, {ToIface()}, {0, 1});
+  EXPECT_EQ(1u, out[0].size());
+  EXPECT_TRUE(out[1].empty());
+  EXPECT_EQ("", h.ReadBackDiffers(interfaces, {}));
+  EXPECT_NE("", h.EraseResource(interfaces, key));  // not found
+}
+
+// Zero addresses read back omitted, as a client leaves them out; an upper-case
+// MAC reads back in lower case.
+TEST(VifResourceTest, InterfacesReadBackCanonically) {
+  ModuleHarness h;
+  Module *vif = h.Create("Vif", VifArg());
+  ASSERT_NE(nullptr, vif);
+  const std::string interfaces = vif->name() + "/interfaces";
+  VifInterfaceValue bare;
+  bare.set_gate(2);
+  const VifInterfaceKey bare_key = IfaceKey(1);
+  ASSERT_EQ("", h.UpsertResource(interfaces, bare_key, bare));
+  VifInterfaceValue upper = IfaceValue();
+  upper.set_mac_addr("02:AA:BB:CC:DD:EE");
+  const VifInterfaceKey upper_key = IfaceKey(2);
+  ASSERT_EQ("", h.UpsertResource(interfaces, upper_key, upper));
+  VifInterfaceValue lower = upper;
+  lower.set_mac_addr("02:aa:bb:cc:dd:ee");
+  EXPECT_EQ("", h.ReadBackDiffers(interfaces, {{&bare_key, &bare}, {&upper_key, &lower}}));
+}
+
+TEST(VifResourceTest, InterfacesRefuseBadKeysAndValues) {
+  ModuleHarness h;
+  Module *vif = h.Create("Vif", VifArg());
+  ASSERT_NE(nullptr, vif);
+  const std::string interfaces = vif->name() + "/interfaces";
+  EXPECT_NE("", h.UpsertResource(interfaces, IfaceKey(0), IfaceValue()));
+  VifInterfaceValue bad = IfaceValue();
+  bad.set_vlan(4096);
+  EXPECT_NE("", h.UpsertResource(interfaces, IfaceKey(1), bad));
+  bad = IfaceValue();
+  bad.set_mac_addr("zz:00:00:00:00:00");
+  EXPECT_NE("", h.UpsertResource(interfaces, IfaceKey(1), bad));
+  bad = IfaceValue();
+  bad.set_ip_addr("10.0.0");
+  EXPECT_NE("", h.UpsertResource(interfaces, IfaceKey(1), bad));
+  bad = IfaceValue();
+  bad.set_gate(DROP_GATE + 1);
+  EXPECT_NE("", h.UpsertResource(interfaces, IfaceKey(1), bad));
+  EXPECT_EQ("", h.ReadBackDiffers(interfaces, {}));
+}
+
+// The legacy commands stay (legacy surface only) and are what the resource
+// reads back, as are the interfaces of the init argument.
+TEST(VifResourceTest, LegacyCommandsAreLegacyOnly) {
+  ModuleHarness h;
+  VifArg arg;
+  VifArg::Interface *init = arg.add_interfaces();
+  init->set_id(1);
+  init->set_mac_addr("02:00:00:00:00:01");
+  init->set_gate(1);
+  Module *vif = h.Create("Vif", arg);
+  ASSERT_NE(nullptr, vif);
+  const std::string interfaces = vif->name() + "/interfaces";
+
+  VifCommandAddArg add;
+  add.set_id(2);
+  add.set_vlan(5);
+  add.set_mac_addr("02:00:00:00:00:10");
+  add.set_ip_addr("10.0.0.10");
+  add.set_route_domain(7);
+  add.set_gate(1);
+  EXPECT_EQ(ENOTSUP, h.Action(vif, "add", add).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(vif, "delete", VifCommandDeleteArg()).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(vif, "clear", VifCommandClearArg()).error().code());
+  h.MustCommand(vif, "add", add);
+
+  const VifInterfaceKey init_key = IfaceKey(1);
+  VifInterfaceValue init_value;
+  init_value.set_mac_addr("02:00:00:00:00:01");
+  init_value.set_gate(1);
+  const VifInterfaceKey added_key = IfaceKey(2);
+  const VifInterfaceValue added_value = IfaceValue();
+  EXPECT_EQ("", h.ReadBackDiffers(interfaces, {{&init_key, &init_value},
+                                               {&added_key, &added_value}}));
+  h.MustCommand(vif, "clear", VifCommandClearArg());
+  EXPECT_EQ("", h.ReadBackDiffers(interfaces, {}));
 }
 
 }  // namespace

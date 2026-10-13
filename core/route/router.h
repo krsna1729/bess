@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -277,6 +278,19 @@ class Router {
   size_t next_hop_count() const;
   // Routes naming `id` (control-side reference count), across all domains.
   size_t RouteReferences(NextHopId id) const;
+
+  // Control-side walks over the committed state, for reading it back (D-129):
+  // the caller holds the control-plane lock while enrolled (no transaction is
+  // in flight). Live next hops only -- a removed one is absent at once, though
+  // readers may still see it until its grace period ends -- in id order.
+  void ForEachNextHop(
+      const std::function<void(NextHopId, const NextHop &)> &fn) const;
+  // Every route of every domain, in domain order: `hop` names its next hop,
+  // or `group` its next-hop group (the other is 0). `fn` must not call the
+  // router (both walks hold its lock).
+  void ForEachRoute(
+      const std::function<void(const ::bess::route::RouteKey &key,
+                               NextHopId hop, NextHopGroupId group)> &fn) const;
 
   // -- transactions (D-023) ---------------------------------------------------
 

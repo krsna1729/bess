@@ -14,6 +14,7 @@
 #include <google/protobuf/dynamic_message.h>
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/util/json_util.h>
+#include <google/protobuf/util/message_differencer.h>
 
 #include <algorithm>
 #include <chrono>
@@ -158,11 +159,16 @@ class Runner {
   }
 
  private:
+  // The case variables: $resource, and $module (the resource's module) alone
+  // or before "/<table>".
   std::string Var(const std::string &s) const {
-    if (s == "$module") {
-      return resource_.substr(0, resource_.find('/'));
+    if (s == "$resource") {
+      return resource_;
     }
-    return s == "$resource" ? resource_ : s;
+    if (s.starts_with("$module") && (s.size() == 7 || s[7] == '/')) {
+      return resource_.substr(0, resource_.find('/')) + s.substr(7);
+    }
+    return s;
   }
 
   std::unique_ptr<gp::Message> Make(const std::string &type, const gp::Value &json,
@@ -277,8 +283,8 @@ class Runner {
     if (what == "pipeline") {
       return DoPipeline(s, want_error);
     }
-    if (what == "module_command") {
-      return DoModuleCommand(s, want_error);
+    if (what == "action") {
+      return DoAction(s, want_error);
     }
     return "unknown step '" + what + "'";
   }
@@ -343,30 +349,30 @@ class Runner {
     return std::nullopt;
   }
 
-  // The argument's type is `arg_type`, else the command's in `class`'s schema.
-  Outcome DoModuleCommand(const gp::Struct &s, const std::string &want_error) {
-    const std::string command = Str(s, "command");
+  // The argument's type is `arg_type`, else the action's in `class`'s schema.
+  Outcome DoAction(const gp::Struct &s, const std::string &want_error) {
+    const std::string action = Str(s, "action");
     std::string type = Str(s, "arg_type");
     for (const v2::ModuleClassSchema &c : schema_.module_classes()) {
-      for (const v2::CommandSchema &cmd : c.commands()) {
-        if (type.empty() && c.name() == Str(s, "class") && cmd.name() == command) {
-          type = cmd.arg_type();
+      for (const v2::ActionSchema &a : c.actions()) {
+        if (type.empty() && c.name() == Str(s, "class") && a.name() == action) {
+          type = a.arg_type();
         }
       }
     }
     if (type.empty()) {
-      return std::format("{} has no command {} in the schema", Str(s, "class"), command);
+      return std::format("{} has no action {} in the schema", Str(s, "class"), action);
     }
     std::string error;
     std::unique_ptr<gp::Message> arg = Make(type, *Field(s, "arg"), &error);
     if (arg == nullptr) {
       return error;
     }
-    auto answer = client_.RunModuleCommand(Var(Str(s, "module")), command, *arg);
+    auto answer = client_.InvokeAction(Var(Str(s, "module")), action, *arg);
     if (!answer) {
-      return Expect(&answer.error(), want_error, command);
+      return Expect(&answer.error(), want_error, action);
     }
-    if (Outcome failed = Expect(nullptr, want_error, command)) {
+    if (Outcome failed = Expect(nullptr, want_error, action)) {
       return failed;
     }
     const gp::Value *want = Field(s, "want_answer");
@@ -396,6 +402,156 @@ class Runner {
         std::string want_text;
         (void)gp::util::MessageToJsonString(v, &want_text);
         return std::format("answer {}: want {} = {}", text, k, want_text);
+      }
+    }
+    return std::nullopt;
+  }
+
+  // The schema of resource `name` ("<module>/<table>"): the table of the
+  // class of its module in `p`.
+  const v2::ResourceSchema *ResourceTypes(const v2::Pipeline &p, const std::string &name) const {
+    const size_t slash = name.find('/');
+    const std::string module = name.substr(0, slash);
+    const std::string table = slash == std::string::npos ? "" : name.substr(slash + 1);
+    for (const v2::Module &m : p.modules()) {
+      if (m.name() != module) {
+        continue;
+      }
+      for (const v2::ModuleClassSchema &c : schema_.module_classes()) {
+        if (c.name() != m.mclass()) {
+          continue;
+        }
+        for (const v2::ResourceSchema &t : c.resources()) {
+          if (t.table() == table) {
+            return &t;
+          }
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  // One resource entry of the cases ({"key": ..., "value": ...}; a
+  // singleton's has no key, and `key` stays null) in `t`'s types.
+  Outcome MakeEntry(const v2::ResourceSchema &t, const gp::Value &entry,
+                    std::unique_ptr<gp::Message> *key, std::unique_ptr<gp::Message> *value) {
+    const gp::Struct &e = entry.struct_value();
+    std::string error;
+    if (t.kind() != v2::TransactionResource::KIND_SINGLETON) {
+      if (Field(e, "key") == nullptr) {
+        return "no key";
+      }
+      if (*key = Make(t.key_type(), *Field(e, "key"), &error); *key == nullptr) {
+        return error;
+      }
+    }
+    if (Field(e, "value") == nullptr) {
+      return "no value";
+    }
+    if (*value = Make(t.value_type(), *Field(e, "value"), &error); *value == nullptr) {
+      return error;
+    }
+    return std::nullopt;
+  }
+
+  static std::vector<std::string> SortedKeys(const gp::Struct &s) {
+    std::vector<std::string> keys;
+    for (const auto &field : s.fields()) {
+      keys.push_back(field.first);
+    }
+    std::sort(keys.begin(), keys.end());
+    return keys;
+  }
+
+  // Lists each resource of `listed` in `*p` with exactly its entries (in
+  // place of any listing `*p` had): a map's entries, a singleton's value.
+  Outcome ListResources(v2::Pipeline *p, const gp::Struct &listed) {
+    for (const std::string &n : SortedKeys(listed)) {
+      const std::string name = Var(n);
+      const v2::ResourceSchema *t = ResourceTypes(*p, name);
+      if (t == nullptr) {
+        return "no resource " + name + " in the schemas of the pipeline's modules";
+      }
+      auto *listings = p->mutable_resources();
+      for (int i = listings->size() - 1; i >= 0; i--) {
+        if (listings->Get(i).name() == name) {
+          listings->DeleteSubrange(i, 1);
+        }
+      }
+      bess::sdk::PipelineBuilder b(std::move(*p));
+      b.Resource(name);
+      int index = 0;
+      for (const gp::Value &e : listed.fields().at(n).list_value().values()) {
+        std::unique_ptr<gp::Message> key;
+        std::unique_ptr<gp::Message> value;
+        if (Outcome failed = MakeEntry(*t, e, &key, &value)) {
+          return std::format("{} entry {}: {}", name, index, *failed);
+        }
+        if (key != nullptr) {
+          b.Entry(name, *key, *value);
+        } else {
+          b.Setting(name, *value);  // a singleton has one value
+        }
+        index++;
+      }
+      auto built = b.Build();
+      if (!built) {
+        return "build: " + built.error().message;
+      }
+      *p = std::move(*built);
+    }
+    return std::nullopt;
+  }
+
+  // Whether `a` holds `m`.
+  static bool Same(const gp::Message &m, const gp::Any &a) {
+    std::unique_ptr<gp::Message> got(m.New());
+    return got->ParseFromString(a.value()) && gp::util::MessageDifferencer::Equals(*got, m);
+  }
+
+  // `p` lists each resource of `want` with exactly its entries, in any order,
+  // compared as messages.
+  Outcome CheckResources(const v2::Pipeline &p, const gp::Struct &want) {
+    for (const std::string &n : SortedKeys(want)) {
+      const std::string name = Var(n);
+      const v2::ResourceSchema *t = ResourceTypes(p, name);
+      if (t == nullptr) {
+        return "no resource " + name + " in the schemas of the pipeline's modules";
+      }
+      const v2::ResourceContents *have = nullptr;
+      for (const v2::ResourceContents &r : p.resources()) {
+        if (r.name() == name) {
+          have = &r;
+        }
+      }
+      if (have == nullptr) {
+        return name + " was not read";
+      }
+      const auto &entries = want.fields().at(n).list_value().values();
+      if (have->entries_size() != entries.size()) {
+        return std::format("{} has {} entries, want {}", name, have->entries_size(),
+                           entries.size());
+      }
+      std::vector<bool> used(have->entries_size());
+      int index = 0;
+      for (const gp::Value &e : entries) {
+        std::unique_ptr<gp::Message> key;
+        std::unique_ptr<gp::Message> value;
+        if (Outcome failed = MakeEntry(*t, e, &key, &value)) {
+          return std::format("{} entry {}: {}", name, index, *failed);
+        }
+        bool found = false;
+        for (int k = 0; k < have->entries_size() && !found; k++) {
+          const v2::ResourceEntry &h = have->entries(k);
+          if (!used[k] && Same(*value, h.value()) && (key == nullptr || Same(*key, h.key()))) {
+            used[k] = true;
+            found = true;
+          }
+        }
+        if (!found) {
+          return std::format("{} has no entry {} as wanted", name, index);
+        }
+        index++;
       }
     }
     return std::nullopt;
@@ -480,15 +636,27 @@ class Runner {
 
   Outcome DoPipeline(const gp::Struct &s, const std::string &want_error) {
     // `base` alone builds too: that pipeline applied again.
-    const bool builds =
-        Field(s, "add") || Field(s, "chain") || Field(s, "remove") || Field(s, "base");
+    const bool builds = Field(s, "add") || Field(s, "chain") || Field(s, "remove") ||
+                        Field(s, "base") || Field(s, "resources");
     v2::Pipeline base;
     if (Field(s, "base") != nullptr) {
       base = pipes_[Str(s, "base")].pipeline;
     } else {
-      auto snap = client_.Pipeline();
+      bess::sdk::PipelineQuery query;
+      if (Field(s, "with_resources") != nullptr) {
+        query.include_resources = true;
+        for (const gp::Value *n : List(s, "with_resources")) {
+          query.resources.push_back(Var(n->string_value()));
+        }
+      }
+      auto snap = client_.Pipeline(query);
       if (!snap) {
         return Expect(&snap.error(), want_error, "pipeline");
+      }
+      if (const gp::Value *want = Field(s, "want_resources")) {
+        if (Outcome failed = CheckResources(snap->pipeline, want->struct_value())) {
+          return failed;
+        }
       }
       if (!builds) {
         pipes_[Str(s, "as")] = {snap->pipeline, snap->version};
@@ -498,19 +666,39 @@ class Runner {
     }
     bess::sdk::PipelineBuilder b(std::move(base));
     for (const gp::Value *m : List(s, "add")) {
-      const auto &pair = m->list_value().values();
-      b.Module(pair[0].string_value(), pair[1].string_value(), nullptr);
+      const auto &add = m->list_value().values();
+      const std::string &name = add[0].string_value();
+      const std::string &mclass = add[1].string_value();
+      std::unique_ptr<gp::Message> arg;
+      if (add.size() > 2) {  // in the class's init type
+        std::string type;
+        for (const v2::ModuleClassSchema &c : schema_.module_classes()) {
+          if (c.name() == mclass) {
+            type = c.init_arg_type();
+          }
+        }
+        std::string error;
+        if (arg = Make(type, add[2], &error); arg == nullptr) {
+          return std::format("add {}: {}", name, error);
+        }
+      }
+      b.Module(name, mclass, arg.get());
     }
     const auto chain = List(s, "chain");
     for (size_t i = 1; i < chain.size(); i++) {  // Chain: gate 0 to gate 0
       b.Connect(chain[i - 1]->string_value(), 0, chain[i]->string_value(), 0);
     }
     for (const gp::Value *m : List(s, "remove")) {
-      b.Remove(m->string_value());
+      b.Remove(m->string_value());  // and the module's resources
     }
     auto p = b.Build();
     if (!p) {
       return Expect(&p.error(), want_error, "build");
+    }
+    if (const gp::Value *listed = Field(s, "resources")) {
+      if (Outcome failed = ListResources(&*p, listed->struct_value())) {
+        return failed;
+      }
     }
     if (Bool(s, "plan")) {
       auto plan = client_.PlanPipeline(*p);
@@ -540,13 +728,32 @@ class Runner {
     if (Outcome failed = Expect(done ? nullptr : &done.error(), want_error, "apply")) {
       return failed;
     }
-    if (done && Field(s, "want_generation_of") != nullptr &&
+    if (!done) {
+      return std::nullopt;
+    }
+    if (Field(s, "want_generation_of") != nullptr &&
         done->generation() != pipes_[Str(s, "want_generation_of")].version.generation) {
       return std::format("applied at generation {}, want {}'s", done->generation(),
                          Str(s, "want_generation_of"));
     }
-    if (done && Field(s, "as") != nullptr) {
-      pipes_[Str(s, "as")] = {*p, {done->generation(), done->daemon_epoch()}};
+    if (const gp::Value *ops = Field(s, "want_resource_ops");
+        ops != nullptr && done->resource_ops() != static_cast<uint64_t>(ops->number_value())) {
+      return std::format("{} resource op(s)", done->resource_ops());
+    }
+    if (Field(s, "want_resource_generation_of") != nullptr) {
+      const auto &want = pipes_[Str(s, "want_resource_generation_of")].version.resource_generation;
+      if (!want || done->resource_generation() != *want) {
+        return std::format("applied at resource generation {}, want {}'s",
+                           done->resource_generation(), Str(s, "want_resource_generation_of"));
+      }
+    }
+    if (Field(s, "as") != nullptr) {
+      bess::sdk::PipelineVersion v{.generation = done->generation(),
+                                   .daemon_epoch = done->daemon_epoch()};
+      if (p->resources_size() > 0) {
+        v.resource_generation = done->resource_generation();
+      }
+      pipes_[Str(s, "as")] = {*p, v};
     }
     return std::nullopt;
   }

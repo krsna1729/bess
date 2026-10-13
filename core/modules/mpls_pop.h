@@ -5,6 +5,10 @@
 #ifndef BESS_MODULES_MPLSPOP_H_
 #define BESS_MODULES_MPLSPOP_H_
 
+#include <expected>
+#include <string>
+
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "utils/ether.h"
@@ -17,8 +21,12 @@ class MPLSPop final : public Module {
   static const gate_idx_t kNumOGates = 2;
 
   static const Commands cmds;
+  static const ResourceTables resource_tables;
 
   MPLSPop();  // constructor
+
+  CommandResponse Init(const bess::pb::EmptyArg &arg);
+  void DeInit() override;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
@@ -27,6 +35,13 @@ class MPLSPop final : public Module {
  private:
   be16_t next_ether_type_;
   bool remove_eth_header_;
+
+  struct Settings {
+    be16_t next_ether_type;
+    bool remove_eth_header;
+  };
+  // "<name>/settings" (D-129): what `set` sets, paused workers only.
+  bess::framework::Singleton<bess::pb::MplsPopArg, Settings> settings_;
 };
 
 #endif  // BESS_MODULES_MPLSPOP_H_

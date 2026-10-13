@@ -28,6 +28,10 @@ bool ModuleSpec::operator==(const ModuleSpec &other) const {
          SameAny(arg, other.arg);
 }
 
+bool ResourceEntrySpec::operator==(const ResourceEntrySpec &other) const {
+  return SameAny(key, other.key) && SameAny(value, other.value);
+}
+
 TrafficClassSpec TaskPlacementSpec::AsLeafSpec() const {
   TrafficClassSpec leaf;
   leaf.leaf_module_name = module;
@@ -81,6 +85,9 @@ void Normalize(PipelineSpec *spec) {
             [](const TaskPlacementSpec &a, const TaskPlacementSpec &b) {
               return std::tie(a.module, a.task) < std::tie(b.module, b.task);
             });
+
+  std::sort(spec->resources.begin(), spec->resources.end(),
+            [](const ResourceSpec &a, const ResourceSpec &b) { return a.name < b.name; });
 }
 
 }  // namespace control

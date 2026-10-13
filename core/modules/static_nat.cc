@@ -11,11 +11,13 @@
 
 const Commands StaticNAT::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&StaticNAT::GetInitialArg),
-     Command::THREAD_SAFE},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
     {"get_runtime_config", "EmptyArg",
-     MODULE_CMD_FUNC(&StaticNAT::GetRuntimeConfig), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&StaticNAT::GetRuntimeConfig), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"set_runtime_config", "EmptyArg",
-     MODULE_CMD_FUNC(&StaticNAT::SetRuntimeConfig), Command::THREAD_SAFE}};
+     MODULE_CMD_FUNC(&StaticNAT::SetRuntimeConfig), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY}};
 
 CommandResponse StaticNAT::Init(const bess::pb::StaticNATArg &arg) {
   using bess::utils::ParseIpv4Address;

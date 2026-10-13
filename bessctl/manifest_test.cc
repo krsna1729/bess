@@ -223,13 +223,30 @@ TEST(Yaml, DumpReadsBackAsTheSameTree) {
 
 // -- manifests ----------------------------------------------------------------
 
-// A daemon's schema: module class "Fake" takes a Worker, driver "FakePort" a
-// Connection, "Opaque" declares nothing; descriptors as GetSchema sends them.
+// A daemon's schema: module class "Fake" takes a Worker, has the action "go"
+// (a Worker) and the resource tables "rules" (a map, Worker ->
+// ApplyPipelineResponse) and "settings" (a singleton, a Connection); driver
+// "FakePort" takes a Connection; "Opaque" declares nothing. Descriptors as
+// GetSchema sends them.
 pb::GetSchemaResponse FakeSchema() {
   pb::GetSchemaResponse s;
   auto *m = s.add_module_classes();
   m->set_name("Fake");
   m->set_init_arg_type("bess.pb.v2.Worker");
+  auto *go = m->add_actions();
+  go->set_name("go");
+  go->set_arg_type("bess.pb.v2.Worker");
+  auto *rules = m->add_resources();
+  rules->set_table("rules");
+  rules->set_kind(pb::TransactionResource::KIND_MAP);
+  rules->set_key_type("bess.pb.v2.Worker");
+  rules->set_value_type("bess.pb.v2.ApplyPipelineResponse");
+  auto *settings = m->add_resources();
+  settings->set_table("settings");
+  settings->set_kind(pb::TransactionResource::KIND_SINGLETON);
+  settings->set_key_type("google.protobuf.Empty");
+  settings->set_value_type("bess.pb.v2.Connection");
+  settings->set_requires_paused_workers(true);
   s.add_module_classes()->set_name("Opaque");
   auto *d = s.add_port_drivers();
   d->set_name("FakePort");
@@ -255,11 +272,7 @@ std::unique_ptr<Schema> MakeSchema() {
 }
 
 std::expected<pb::Pipeline, std::string> PipelineOf(const Schema &schema, std::string_view text) {
-  auto m = schema.ManifestFrom(text, FormatOf("", text));
-  if (!m) {
-    return std::unexpected(m.error());
-  }
-  return std::move(m->pipeline);
+  return schema.PipelineFrom(text, FormatOf("", text));
 }
 
 TEST(Manifest, AnArgWithoutTypeGetsItsClassesInitType) {
@@ -369,17 +382,18 @@ TEST(Manifest, WhatGetPrintsApplyReadsBack) {
   }
 }
 
-// A YAML manifest is the JSON one: the same pipeline and resource entries,
+// A YAML manifest is the JSON one: the same pipeline, resources included,
 // 64-bit numbers as written.
 TEST(Manifest, YamlMeansWhatTheSameJsonMeans) {
   auto schema = MakeSchema();
-  auto json = schema->ManifestFrom(R"({
+  auto json = schema->PipelineFrom(R"({
     "modules": [{"name": "m", "mclass": "Fake", "arg": {"wid": 3}}],
     "traffic_classes": [{"name": "t", "limit": {"count": 9223372036854775807}}],
-    "resources": {"m/rules": [{"key": {"wid": 2}, "value": {"generation": 9007199254740993}}]}
+    "resources": {"m/rules": [{"key": {"wid": 2}, "value": {"generation": 9007199254740993}}],
+                  "m/settings": {"upstream": "u"}}
   })", Format::kJson);
   ASSERT_TRUE(json) << json.error();
-  auto yaml = schema->ManifestFrom(R"(# a comment
+  auto yaml = schema->PipelineFrom(R"(# a comment
 modules:
   - name: m
     mclass: Fake
@@ -392,14 +406,12 @@ resources:
   m/rules:
     - key: {wid: 2}
       value: {generation: 9007199254740993}
+  m/settings: {upstream: u}
 )", Format::kYaml);
   ASSERT_TRUE(yaml) << yaml.error();
-  EXPECT_TRUE(gp::util::MessageDifferencer::Equals(json->pipeline, yaml->pipeline));
-  ASSERT_EQ(1u, yaml->resources.size());
-  EXPECT_EQ(json->resources[0].first, yaml->resources[0].first);
-  EXPECT_EQ(json->resources[0].second[0].key, yaml->resources[0].second[0].key);
-  EXPECT_EQ(json->resources[0].second[0].value, yaml->resources[0].second[0].value);
-  auto list = schema->ManifestFrom("- a\n", Format::kYaml);
+  EXPECT_TRUE(gp::util::MessageDifferencer::Equals(*json, *yaml));
+  EXPECT_EQ(2, yaml->resources_size());
+  auto list = schema->PipelineFrom("- a\n", Format::kYaml);
   ASSERT_FALSE(list);
   EXPECT_NE(std::string::npos, list.error().find("a manifest is an object")) << list.error();
 }
@@ -413,43 +425,172 @@ TEST(Manifest, FormatIsTheExtensionElseTheFirstCharacter) {
   EXPECT_EQ(Format::kYaml, FormatOf("p.txt", ""));
 }
 
-TEST(Manifest, ResourceEntriesAreTakenOutInFileOrderAndTypedLater) {
+// "resources" names each resource "<module>/<table>": its kind and types are
+// the table's that the class of the manifest's module of that name declares.
+// A map's entries are a list, a singleton is its value (an entry without a
+// key); a map listed with no entries is listed (an apply clears it). File
+// order is kept: the daemon sorts.
+TEST(Manifest, ResourcesAreTypedByTheirModulesTable) {
   auto schema = MakeSchema();
-  auto m = schema->ManifestFrom(R"({
-    "modules": [{"name": "m", "mclass": "Fake", "arg": {"wid": 1}}],
-    "resources": {"z/rules": [{"key": {"wid": 2}, "value": {"generation": 9007199254740993}}],
-                  "a/rules": [{"key": {"wid": 3}, "value": {}}, {"key": {}, "value": {}}]}
-  })", Format::kJson);
-  ASSERT_TRUE(m) << m.error();
-  EXPECT_EQ(1, m->pipeline.modules_size());
-  ASSERT_EQ(2u, m->resources.size());
-  EXPECT_EQ("z/rules", m->resources[0].first);
-  EXPECT_EQ("a/rules", m->resources[1].first);
-  EXPECT_EQ(3u, m->entries());
-  // An entry becomes the resource's types once the daemon names them; its
-  // numbers are as written (2^53 + 1 survives).
-  auto value = schema->MessageFromJson("bess.pb.v2.ApplyPipelineResponse",
-                                       m->resources[0].second[0].value);
-  ASSERT_TRUE(value) << value.error();
-  pb::ApplyPipelineResponse r;
-  ASSERT_TRUE(r.ParseFromString((*value)->SerializeAsString()));
-  EXPECT_EQ(9007199254740993u, r.generation());
-  EXPECT_FALSE(schema->MessageFromJson("bess.pb.v2.Worker", R"({"nope": 1})"));
-  EXPECT_FALSE(schema->MessageFromJson("no.such.Type", "{}"));
+  auto p = PipelineOf(*schema, R"({
+    "modules": [{"name": "z", "mclass": "Fake"}, {"name": "a", "mclass": "Fake"}],
+    "resources": {"z/rules": [{"key": {"wid": 2}, "value": {"generation": 9007199254740993}},
+                              {"key": {}, "value": {}}],
+                  "z/settings": {"upstream": "u", "ogate": 1},
+                  "a/rules": []}
+  })");
+  ASSERT_TRUE(p) << p.error();
+  ASSERT_EQ(3, p->resources_size());
+  EXPECT_EQ("z/rules", p->resources(0).name());
+  EXPECT_EQ("z/settings", p->resources(1).name());
+  EXPECT_EQ("a/rules", p->resources(2).name());
+  const pb::ResourceContents &rules = p->resources(0);
+  ASSERT_EQ(2, rules.entries_size());
+  pb::Worker key;
+  ASSERT_TRUE(rules.entries(0).key().UnpackTo(&key)) << rules.entries(0).key().type_url();
+  EXPECT_EQ(2, key.wid());
+  pb::ApplyPipelineResponse value;
+  ASSERT_TRUE(rules.entries(0).value().UnpackTo(&value));
+  EXPECT_EQ(9007199254740993u, value.generation()) << "2^53 + 1, as written";
+  EXPECT_TRUE(rules.entries(1).key().Is<pb::Worker>());
+  EXPECT_TRUE(rules.entries(1).value().Is<pb::ApplyPipelineResponse>());
+  const pb::ResourceContents &settings = p->resources(1);
+  ASSERT_EQ(1, settings.entries_size());
+  EXPECT_FALSE(settings.entries(0).has_key()) << "a singleton's entry has no key";
+  pb::Connection c;
+  ASSERT_TRUE(settings.entries(0).value().UnpackTo(&c));
+  EXPECT_EQ("u", c.upstream());
+  EXPECT_EQ(1u, c.ogate());
+  EXPECT_EQ(0, p->resources(2).entries_size());
 
-  const std::pair<const char *, const char *> bad[] = {
+  // An explicit type is kept, as an arg's is.
+  auto typed = PipelineOf(*schema, R"({"modules": [{"name": "m", "mclass": "Fake"}],
+      "resources": {"m/settings": {"@type": "type.googleapis.com/bess.pb.v2.Worker", "wid": 4}}})");
+  ASSERT_TRUE(typed) << typed.error();
+  EXPECT_TRUE(typed->resources(0).entries(0).value().Is<pb::Worker>());
+  // Without "resources" a manifest lists none: an apply leaves them alone.
+  auto none = PipelineOf(*schema, R"({"modules": [{"name": "m", "mclass": "Fake"}]})");
+  ASSERT_TRUE(none) << none.error();
+  EXPECT_EQ(0, none->resources_size());
+}
+
+TEST(Manifest, BadResourcesAreNamed) {
+  auto schema = MakeSchema();
+  const std::string m = R"("modules": [{"name": "m", "mclass": "Fake"}, {"name": "o", "mclass": "Opaque"}], )";
+  const std::pair<std::string, const char *> bad[] = {
       {R"({"resources": []})", "\"resources\" is not an object"},
-      {R"({"resources": {"r": {}}})", "resource \"r\": not a list"},
-      {R"({"resources": {"r": [{"key": {}}]}})", "resource \"r\" entry 0: needs exactly"},
-      {R"({"resources": {"r": [{"key": {}, "value": 1}]}})", "entry 0: needs exactly"},
-      {R"({"resources": {"r": [{"key": {}, "value": {}, "x": 1}]}})", "entry 0: needs exactly"},
-      {R"({"resources": {"r": [1]}})", "entry 0: needs exactly"},
+      {R"({"resources": {"r": []}})", "resource \"r\": a resource is named \"<module>/<table>\""},
+      {R"({"resources": {"x/rules": []}})", "resource \"x/rules\": no module \"x\" in the pipeline"},
+      {"{" + m + R"("resources": {"m/nope": []}})",
+       "resource \"m/nope\": module class Fake has no table \"nope\" (it has: rules, settings)"},
+      {"{" + m + R"("resources": {"o/rules": []}})",
+       "module class Opaque has no table \"rules\" (it has none)"},
+      {"{" + m + R"("resources": {"m/rules": {}}})", "resource \"m/rules\": not a list of entries"},
+      {"{" + m + R"("resources": {"m/settings": []}})", "resource \"m/settings\": a singleton"},
+      {"{" + m + R"("resources": {"m/settings": 3}})", "resource \"m/settings\": a singleton"},
+      {"{" + m + R"("resources": {"m/rules": [{"key": {}}]}})",
+       "resource \"m/rules\" entry 0: needs exactly"},
+      {"{" + m + R"("resources": {"m/rules": [{"key": {}, "value": 1}]}})", "entry 0: needs exactly"},
+      {"{" + m + R"("resources": {"m/rules": [{"key": {}, "value": {}, "x": 1}]}})",
+       "entry 0: needs exactly"},
+      {"{" + m + R"("resources": {"m/rules": [{"key": {}, "value": {}}, 1]}})",
+       "entry 1: needs exactly"},
   };
   for (const auto &[text, error] : bad) {
-    auto r = schema->ManifestFrom(text, Format::kJson);
-    ASSERT_FALSE(r) << text;
-    EXPECT_NE(std::string::npos, r.error().find(error)) << text << ": " << r.error();
+    auto p = PipelineOf(*schema, text);
+    ASSERT_FALSE(p) << text;
+    EXPECT_NE(std::string::npos, p.error().find(error)) << text << ": " << p.error();
   }
+  // A key of the wrong shape for its type: protobuf's own error.
+  EXPECT_FALSE(PipelineOf(*schema,
+      "{" + m + R"("resources": {"m/rules": [{"key": {"wid": "x"}, "value": {}}]}})"));
+}
+
+// What `get` prints, `apply` reads back: resources keyed by name, a map's
+// entries and a singleton's value without the table's "@type", a map with no
+// entries as []. A resource bessctl cannot place in a table keeps the
+// entries the daemon sent (the daemon would refuse it back).
+TEST(Manifest, ResourcesReadBackAsTheyAreWritten) {
+  auto schema = MakeSchema();
+  auto p = PipelineOf(*schema, R"({
+    "modules": [{"name": "m", "mclass": "Fake"}, {"name": "n", "mclass": "Fake"}],
+    "resources": {"m/rules": [{"key": {"wid": 2}, "value": {"generation": 9007199254740993}}],
+                  "m/settings": {"upstream": "u"},
+                  "n/rules": [],
+                  "n/settings": {}}
+  })");
+  ASSERT_TRUE(p) << p.error();
+  for (const Format format : {Format::kJson, Format::kYaml}) {
+    auto text = schema->PipelineTo(*p, format);
+    ASSERT_TRUE(text) << text.error();
+    EXPECT_EQ(std::string::npos, text->find("@type")) << *text;
+    EXPECT_EQ(std::string::npos, text->find("entries")) << *text;
+    auto again = PipelineOf(*schema, *text);
+    ASSERT_TRUE(again) << again.error() << "\n" << *text;
+    EXPECT_TRUE(gp::util::MessageDifferencer::Equals(*p, *again)) << *text;
+  }
+  auto text = schema->PipelineTo(*p, Format::kJson);
+  ASSERT_TRUE(text) << text.error();
+  auto doc = json::Parse(*text);
+  ASSERT_TRUE(doc) << doc.error();
+  const json::Value *resources = json::Find(*doc, "resources");
+  ASSERT_NE(nullptr, resources) << *text;
+  EXPECT_EQ(Compact(R"({"m/rules": [{"key": {"wid": 2}, "value": {"generation": "9007199254740993"}}],
+                       "m/settings": {"upstream": "u"}, "n/rules": [], "n/settings": {}})"),
+            json::Dump(*resources));
+
+  pb::Pipeline gone;
+  pb::ResourceEntry *entry = gone.add_resources()->add_entries();
+  gone.mutable_resources(0)->set_name("gone/rules");
+  pb::Worker w;
+  w.set_wid(1);
+  ASSERT_TRUE(entry->mutable_key()->PackFrom(w));
+  ASSERT_TRUE(entry->mutable_value()->PackFrom(w));
+  auto kept = schema->PipelineTo(gone, Format::kJson);
+  ASSERT_TRUE(kept) << kept.error();
+  EXPECT_NE(std::string::npos, kept->find("\"gone/rules\": [")) << *kept;
+  EXPECT_NE(std::string::npos, kept->find("type.googleapis.com/bess.pb.v2.Worker")) << *kept;
+}
+
+// Actions (D-129) are what GetSchema lists for the class: an argument type
+// each; a command that edits state, and get_initial_arg, are none.
+TEST(Schema, ActionsAreTheClassesDeclaredOnes) {
+  auto schema = MakeSchema();
+  auto type = schema->ActionArgType("Fake", "go");
+  ASSERT_TRUE(type) << type.error();
+  EXPECT_EQ("bess.pb.v2.Worker", *type);
+  const std::pair<std::pair<const char *, const char *>, const char *> bad[] = {
+      {{"Fake", "add"}, "Fake has no action add (it has: go)"},
+      {{"Fake", "get_initial_arg"}, "Fake has no action get_initial_arg"},
+      {{"Opaque", "go"}, "Opaque has no action go (it has none)"},
+      {{"Nope", "go"}, "the daemon has no module class Nope"},
+  };
+  for (const auto &[call, error] : bad) {
+    auto t = schema->ActionArgType(call.first, call.second);
+    ASSERT_FALSE(t) << call.first << " " << call.second;
+    EXPECT_NE(std::string::npos, t.error().find(error)) << t.error();
+  }
+  // An argument as JSON or YAML text, a result back in either.
+  for (const char *text : {R"({"wid": 5, "core": 2})", "{wid: 5, core: 2}"}) {
+    auto arg = schema->MessageFromText(*type, text);
+    ASSERT_TRUE(arg) << arg.error();
+    pb::Worker w;
+    ASSERT_TRUE(w.ParseFromString((*arg)->SerializeAsString()));
+    EXPECT_EQ(5, w.wid());
+    EXPECT_EQ(2, w.core());
+  }
+  EXPECT_FALSE(schema->MessageFromJson("bess.pb.v2.Worker", R"({"nope": 1})"));
+  EXPECT_FALSE(schema->MessageFromJson("no.such.Type", "{}"));
+  pb::Worker w;
+  w.set_wid(7);
+  gp::Any result;
+  ASSERT_TRUE(result.PackFrom(w));
+  auto json = schema->AnyTo(result, Format::kJson);
+  ASSERT_TRUE(json) << json.error();
+  EXPECT_NE(std::string::npos, json->find("\"wid\": 7")) << *json;
+  auto yaml = schema->AnyTo(result, Format::kYaml);
+  ASSERT_TRUE(yaml) << yaml.error();
+  EXPECT_NE(std::string::npos, yaml->find("wid: 7")) << *yaml;
 }
 
 }  // namespace

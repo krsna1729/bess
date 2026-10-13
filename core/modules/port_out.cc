@@ -9,7 +9,7 @@
 
 const Commands PortOut::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&PortOut::GetInitialArg),
-     Command::THREAD_SAFE},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
 };
 
 CommandResponse PortOut::Init(const bess::pb::PortOutArg &arg) {

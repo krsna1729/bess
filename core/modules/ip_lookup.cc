@@ -24,14 +24,20 @@ static inline int is_valid_gate(gate_idx_t gate) {
 // THREAD_SAFE: route changes are applied to the live table by its single
 // serialized writer while workers keep looking up (K7; DPDK's lock-free
 // reader design plus the runtime's QSBR for tbl8 reclamation), so workers are
-// never paused for a route change.
+// never paused for a route change. LEGACY_ONLY (D-129): the routes are the
+// "<name>/routes" resource.
 const Commands IPLookup::cmds = {
     {"add", "IPLookupCommandAddArg", MODULE_CMD_FUNC(&IPLookup::CommandAdd),
-     Command::THREAD_SAFE},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
     {"delete", "IPLookupCommandDeleteArg",
-     MODULE_CMD_FUNC(&IPLookup::CommandDelete), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&IPLookup::CommandDelete), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"clear", "EmptyArg", MODULE_CMD_FUNC(&IPLookup::CommandClear),
-     Command::THREAD_SAFE}};
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY}};
+
+const ResourceTables IPLookup::resource_tables = {
+    ResourceTable::Map<bess::pb::IPLookupRouteKey, bess::pb::IPLookupRouteValue>(
+        "routes")};
 
 CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
   bess::route::LpmRouteTable::Config config;
@@ -84,6 +90,19 @@ CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
               return std::unexpected("invalid gate " + std::to_string(value.gate()));
             }
             return std::any(static_cast<uint32_t>(value.gate()));
+          },
+          // Read back as a client sends a route: the network address in
+          // dotted decimal (the key refuses host bits, so it is the only
+          // spelling), "0.0.0.0" with prefix_len 0 for the default route.
+          [this](const auto &visit) {
+            routes_->ForEach([&visit](Ipv4Prefix prefix, GateRoute gate) {
+              bess::pb::IPLookupRouteKey key;
+              key.set_prefix(bess::utils::ToIpv4Address(be32_t(prefix.addr())));
+              key.set_prefix_len(prefix.length());
+              bess::pb::IPLookupRouteValue value;
+              value.set_gate(gate.value());
+              visit(key, value);
+            });
           }));
   if (auto registered = init_context().resources().Register(resource_.get());
       !registered) {

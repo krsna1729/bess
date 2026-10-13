@@ -26,22 +26,34 @@
 
 namespace classifier = bess::classifier;
 
+// LEGACY_ONLY (D-129): the rules are the "<name>/rules" resource, the default
+// gate the "<name>/settings" resource, and the creation argument GetPipeline's
+// Module.arg.
 const Commands ExactMatch::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&ExactMatch::GetInitialArg),
-     Command::THREAD_SAFE},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
     {"get_runtime_config", "EmptyArg",
-     MODULE_CMD_FUNC(&ExactMatch::GetRuntimeConfig), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&ExactMatch::GetRuntimeConfig), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"set_runtime_config", "ExactMatchConfig",
-     MODULE_CMD_FUNC(&ExactMatch::SetRuntimeConfig), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&ExactMatch::SetRuntimeConfig), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"add", "ExactMatchCommandAddArg", MODULE_CMD_FUNC(&ExactMatch::CommandAdd),
-     Command::THREAD_SAFE},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
     {"delete", "ExactMatchCommandDeleteArg",
-     MODULE_CMD_FUNC(&ExactMatch::CommandDelete), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&ExactMatch::CommandDelete), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"clear", "EmptyArg", MODULE_CMD_FUNC(&ExactMatch::CommandClear),
-     Command::THREAD_SAFE},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
     {"set_default_gate", "ExactMatchCommandSetDefaultGateArg",
-     MODULE_CMD_FUNC(&ExactMatch::CommandSetDefaultGate),
-     Command::THREAD_SAFE}};
+     MODULE_CMD_FUNC(&ExactMatch::CommandSetDefaultGate), Command::THREAD_SAFE,
+     "", Command::LEGACY_ONLY}};
+
+const ResourceTables ExactMatch::resource_tables = {
+    ResourceTable::Map<bess::pb::ExactMatchRuleKey,
+                       bess::pb::ExactMatchRuleValue>("rules"),
+    ResourceTable::Singleton<bess::pb::ExactMatchSettings>("settings"),
+};
 
 namespace {
 
@@ -451,7 +463,8 @@ bool ExactMatch::EnsureCapacity(bool force, Error *err) {
   }
   auto next_table = *bigger;
   const bool published = Publish([&](const Generation &current) {
-    return Build(next_table, current.default_gate, err);
+    return Build(next_table,
+                 current.default_gate.load(std::memory_order_relaxed), err);
   }, err);
   if (published) {
     table_ = std::move(next_table);
@@ -573,7 +586,9 @@ void ExactMatch::RefreshForResume() {
   }
 
   Error err;
-  GenerationPtr next = Build(current->table, current->default_gate, &err);
+  const gate_idx_t default_gate =
+      current->default_gate.load(std::memory_order_relaxed);
+  GenerationPtr next = Build(current->table, default_gate, &err);
   if (next != nullptr) {
     published_.Publish(std::move(next));
     init_context().rcu().ReclaimReady();
@@ -587,7 +602,7 @@ void ExactMatch::RefreshForResume() {
   LOG(ERROR) << "ExactMatch '" << name()
              << "': metadata refresh failed (" << err.second
              << "); routing all packets to the default gate";
-  published_.Publish(BuildDegraded(current->table, current->default_gate));
+  published_.Publish(BuildDegraded(current->table, default_gate));
   init_context().rcu().ReclaimReady();
 }
 
@@ -763,6 +778,33 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
               "'action_id' needs an 'action_resource' on this ExactMatch");
         }
         return std::any(uint64_t{value.gate()});
+      },
+      // Read back (D-129) from the table the command path and transactions
+      // write: each key is the rule's fields packed in field order, stored
+      // unmasked as given, so cutting it at the field sizes gives back every
+      // field's bytes. Canonical form: every field as value_bin (one a client
+      // sent as value_int decodes to the same packed key), and the value as
+      // the mode's one field.
+      [this](const auto &visit) {
+        bess::pb::ExactMatchRuleKey key;
+        bess::pb::ExactMatchRuleValue value;
+        table_->ForEach([&](classifier::ConstBytes packed, uint64_t v) {
+          key.Clear();
+          size_t pos = 0;
+          for (const FieldSpec &spec : field_specs_) {
+            key.add_fields()->set_value_bin(
+                reinterpret_cast<const char *>(packed.data() + pos),
+                static_cast<size_t>(spec.size));
+            pos += static_cast<size_t>(spec.size);
+          }
+          value.Clear();
+          if (action_mode_) {
+            value.set_action_id(static_cast<uint32_t>(v));
+          } else {
+            value.set_gate(v);
+          }
+          visit(key, value);
+        });
       }));
   if (auto registered =
           init_context().resources().Register(resource_.get());
@@ -786,10 +828,44 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
       return CommandFailure(-action_id_attr_, "add_metadata_attr() failed");
     }
   }
+
+  // The default gate as the singleton "<name>/settings" (D-129): what
+  // set_default_gate validates and sets. Applied while workers run: a relaxed
+  // store into the published generation, which workers read once per batch.
+  if (auto registered = settings_.Register(
+          init_context().resources(), init_context().codecs(),
+          name() + "/settings",
+          [](const bess::pb::ExactMatchSettings &v)
+              -> std::expected<gate_idx_t, std::string> {
+            if (!bess::IsValidGateValue(v.default_gate())) {
+              return std::unexpected(
+                  "Invalid gate: " + std::to_string(v.default_gate()));
+            }
+            return static_cast<gate_idx_t>(v.default_gate());
+          },
+          [this](gate_idx_t &gate) {
+            published_.Read()->default_gate.store(gate,
+                                                  std::memory_order_relaxed);
+          },
+          [this] {
+            bess::pb::ExactMatchSettings v;
+            v.set_default_gate(
+                published_.Read()->default_gate.load(std::memory_order_relaxed));
+            return v;
+          },
+          nullptr);
+      !registered) {
+    const std::string name = resource_->name();
+    CHECK(init_context().resources().Unregister(name));
+    binding_.Reset();
+    resource_.reset();
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
   return CommandSuccess();
 }
 
 void ExactMatch::DeInit() {
+  settings_.Release();
   if (resource_ == nullptr) {
     return;
   }
@@ -853,7 +929,7 @@ CommandResponse ExactMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
   using rule_t = bess::pb::ExactMatchCommandAddArg;
 
   const Generation *gen = published_.Read();
-  r.set_default_gate(gen->default_gate);
+  r.set_default_gate(gen->default_gate.load(std::memory_order_relaxed));
   // The table is the source of truth: each key is the rule's fields packed
   // in field order.
   table_->ForEach([&](classifier::ConstBytes key, uint64_t value) {
@@ -1012,7 +1088,8 @@ CommandResponse ExactMatch::SetRuntimeConfig(
         return applied;
       }
     }
-    if (published_.Read()->default_gate != default_gate) {
+    if (published_.Read()->default_gate.load(std::memory_order_relaxed) !=
+        default_gate) {
       bess::pb::ExactMatchCommandSetDefaultGateArg gate;
       gate.set_gate(default_gate);
       return CommandSetDefaultGate(gate);
@@ -1101,10 +1178,12 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   // One snapshot for the whole batch: a concurrent command can neither swap
   // the generation mid-batch nor free it under this lookup.
   const Generation *gen = published_.Read();
+  const gate_idx_t default_gate =
+      gen->default_gate.load(std::memory_order_relaxed);
   gate_idx_t gates[bess::PacketBatch::kMaxBurst];
   if (!action_mode_) {
     Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
-      gates[i] = hit ? static_cast<gate_idx_t>(value) : gen->default_gate;
+      gates[i] = hit ? static_cast<gate_idx_t>(value) : default_gate;
     });
     EmitBatch(ctx, batch, gates);
     return;
@@ -1117,12 +1196,12 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     // Fail closed: a match whose action id cannot be delivered would reach the
     // ActionTable with a stale id, so it takes the default gate instead.
     // RefreshForResume() is where this is reported.
-    RunChooseModule(ctx, gen->default_gate, batch);
+    RunChooseModule(ctx, default_gate, batch);
     return;
   }
   Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
     if (!hit) {
-      gates[i] = gen->default_gate;
+      gates[i] = default_gate;
       return;
     }
     _set_attr_with_offset<bess::utils::be32_t>(
@@ -1137,8 +1216,10 @@ void ExactMatch::ClassifyBatch(bess::PacketBatch *batch,
                                gate_idx_t *gates) const {
   DCHECK(!action_mode_);
   const Generation *gen = published_.Read();
+  const gate_idx_t default_gate =
+      gen->default_gate.load(std::memory_order_relaxed);
   Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
-    gates[i] = hit ? static_cast<gate_idx_t>(value) : gen->default_gate;
+    gates[i] = hit ? static_cast<gate_idx_t>(value) : default_gate;
   });
 }
 
@@ -1159,7 +1240,8 @@ bool ExactMatch::SetFusedKernelEnabled(bool enabled, Error *err) {
   const bool was = fused_enabled_;
   fused_enabled_ = enabled;
   const bool published = Publish([&](const Generation &current) {
-    return Build(table_, current.default_gate, err);
+    return Build(table_, current.default_gate.load(std::memory_order_relaxed),
+                 err);
   }, err);
   if (!published) {
     fused_enabled_ = was;

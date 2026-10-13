@@ -34,8 +34,9 @@
 // visibility, request_id, replayed flag. After every request each resource's
 // committed state equals the model's -- the request's effect iff APPLIED,
 // unchanged otherwise (atomicity) -- and so do the generation, the engine's
-// reference ledger, the record count and Get(request_id). List() is checked
-// at the end.
+// reference ledger, the record count and Get(request_id), and each bound
+// resource's read-back (ResourceCodec::Entries) decodes through its codec to
+// exactly the committed state. List() is checked at the end.
 
 #include <any>
 #include <cstddef>
@@ -53,6 +54,7 @@
 #include <utility>
 #include <vector>
 
+#include <google/protobuf/any.pb.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include <google/protobuf/util/message_differencer.h>
@@ -159,18 +161,35 @@ ValueResult RuleValue(const bess::pb::ExactMatchRuleValue &value) {
                                sizeof(gate))};
 }
 
-template <typename KeyMsg, typename ValueMsg>
-std::shared_ptr<const bess::framework::ResourceCodec> Codec(
-    KeyResult (*key_fn)(const KeyMsg &), ValueResult (*value_fn)(const ValueMsg &)) {
-  return std::make_shared<bess::framework::TypedCodec<KeyMsg, ValueMsg>>(
-      key_fn,
-      [value_fn](const ValueMsg &m) -> std::expected<std::any, std::string> {
-        auto v = value_fn(m);
-        if (!v) {
-          return std::unexpected(v.error());
-        }
-        return std::any(std::move(*v));
-      });
+// The read-back (the modules' entries functions): a committed entry as the
+// messages a client sends for it.
+uint32_t IdOf(const ResourceKey &key) {
+  uint32_t id = 0;
+  FUZZ_CHECK(bess::dataplane::DecodeKey(key, &id));
+  return id;
+}
+void MeterRead(const ResourceKey &key, const Val &v, bess::pb::MeterIdKey *k,
+               bess::pb::MeterPolicyValue *m) {
+  k->set_id(IdOf(key));
+  FUZZ_CHECK(m->ParseFromString(v.blob));
+}
+void ActionRead(const ResourceKey &key, const Val &v, bess::pb::ActionIdKey *k,
+                bess::pb::ActionValue *m) {
+  k->set_id(IdOf(key));
+  m->set_meter_id(v.meter);
+  m->set_next_hop_id(v.next_hop);
+}
+void RuleRead(const ResourceKey &key, const Val &v,
+              bess::pb::ExactMatchRuleKey *k, bess::pb::ExactMatchRuleValue *m) {
+  size_t at = 0;
+  for (const size_t size : kFieldSizes) {
+    k->add_fields()->set_value_bin(std::string(key.substr(at, size)));
+    at += size;
+  }
+  uint64_t gate = 0;
+  FUZZ_CHECK(v.blob.size() == sizeof(gate));
+  std::memcpy(&gate, v.blob.data(), sizeof(gate));
+  m->set_gate(gate);
 }
 
 // -- the fake resource ----------------------------------------------------------
@@ -305,6 +324,30 @@ class MapResource final : public Resource {
   const Consistency consistency_;
   Map map_;
 };
+
+template <typename KeyMsg, typename ValueMsg>
+std::shared_ptr<const bess::framework::ResourceCodec> Codec(
+    KeyResult (*key_fn)(const KeyMsg &), ValueResult (*value_fn)(const ValueMsg &),
+    void (*read_fn)(const ResourceKey &, const Val &, KeyMsg *, ValueMsg *),
+    const MapResource &table) {
+  return std::make_shared<bess::framework::TypedCodec<KeyMsg, ValueMsg>>(
+      key_fn,
+      [value_fn](const ValueMsg &m) -> std::expected<std::any, std::string> {
+        auto v = value_fn(m);
+        if (!v) {
+          return std::unexpected(v.error());
+        }
+        return std::any(std::move(*v));
+      },
+      [read_fn, &table](const auto &visit) {
+        for (const auto &[key, value] : table.Snapshot()) {
+          KeyMsg k;
+          ValueMsg v;
+          read_fn(key, value, &k, &v);
+          visit(k, v);
+        }
+      });
+}
 
 // -- the reference model ----------------------------------------------------------
 
@@ -446,9 +489,10 @@ struct Fixture {
     FUZZ_CHECK(engine.Register(&actions).has_value());
     FUZZ_CHECK(engine.Register(&rules).has_value());
     FUZZ_CHECK(engine.Register(&hidden).has_value());
-    meters_binding = bindings.Bind(meters, Codec(MeterKey, MeterValue));
-    actions_binding = bindings.Bind(actions, Codec(ActionKey, ActionValue));
-    rules_binding = bindings.Bind(rules, Codec(RuleKey, RuleValue));
+    meters_binding = bindings.Bind(meters, Codec(MeterKey, MeterValue, MeterRead, meters));
+    actions_binding =
+        bindings.Bind(actions, Codec(ActionKey, ActionValue, ActionRead, actions));
+    rules_binding = bindings.Bind(rules, Codec(RuleKey, RuleValue, RuleRead, rules));
     tx.emplace(engine, bindings, epoch);
   }
   ~Fixture() {
@@ -602,6 +646,25 @@ void CheckState(const Fixture &f, const Model &model) {
                Model::Refs(model.state, key));
   }
   FUZZ_CHECK(f.tx->records() == model.records.size());
+  // Read-back (D-129): each bound resource's entries decode, through its own
+  // codec, to exactly its committed state.
+  for (const char *name : {kMeters, kActions, kRules}) {
+    const bess::framework::ResourceCodec *codec = f.bindings.Find(f.Get(name));
+    FUZZ_CHECK(codec != nullptr);
+    State read;
+    codec->Entries([&](const google::protobuf::Message &key,
+                       const google::protobuf::Message &value) {
+      google::protobuf::Any k, v;
+      FUZZ_CHECK(k.PackFrom(key) && v.PackFrom(value));
+      auto decoded_key = codec->Key(k.type_url(), k.value());
+      auto decoded_value = codec->Value(v.type_url(), v.value());
+      FUZZ_CHECK(decoded_key.has_value() && decoded_value.has_value());
+      const Val *val = std::any_cast<Val>(&*decoded_value);
+      FUZZ_CHECK(val != nullptr);
+      FUZZ_CHECK(read.emplace(std::move(*decoded_key), *val).second);
+    });
+    FUZZ_CHECK(read == f.Get(name).Snapshot());
+  }
 }
 
 void ApplyOne(Fixture &f, Model &model, uint64_t epoch,

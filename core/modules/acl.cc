@@ -3,18 +3,25 @@
 
 #include "acl.h"
 
+#include <expected>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "utils/ether.h"
 #include "utils/ip.h"
 #include "utils/udp.h"
 
+// D-129: "<name>/rules" holds the rule list; add and clear stay for the
+// legacy ModuleCommand only.
 const Commands ACL::cmds = {
-    {"add", "ACLArg", MODULE_CMD_FUNC(&ACL::CommandAdd),
-     Command::THREAD_SAFE},
+    {"add", "ACLArg", MODULE_CMD_FUNC(&ACL::CommandAdd), Command::THREAD_SAFE,
+     "", Command::LEGACY_ONLY},
     {"clear", "EmptyArg", MODULE_CMD_FUNC(&ACL::CommandClear),
-     Command::THREAD_SAFE}};
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY}};
+
+const ResourceTables ACL::resource_tables = {
+    ResourceTable::Singleton<bess::pb::ACLArg>("rules", false)};
 
 CommandResponse ACL::ParseRules(const bess::pb::ACLArg &arg,
                                 std::vector<ACLRule> *out) const {
@@ -65,7 +72,36 @@ CommandResponse ACL::Init(const bess::pb::ACLArg &arg) {
     return ret;
   }
   Install(std::move(rules));
+  arg_ = arg;
+
+  // Stage converts the whole list (a refused rule refuses the transaction);
+  // apply swaps the published list and retires the old one a grace period
+  // later, so workers keep running (no paused workers).
+  auto registered = rules_resource_.Register(
+      init_context().resources(), init_context().codecs(), name() + "/rules",
+      [this](const bess::pb::ACLArg &v) -> std::expected<Staged, std::string> {
+        std::vector<ACLRule> parsed;
+        CommandResponse r = ParseRules(v, &parsed);
+        if (r.has_error()) {
+          return std::unexpected(r.error().errmsg());
+        }
+        return Staged{std::make_unique<const Rules>(Rules{std::move(parsed)}),
+                      v};
+      },
+      [this](Staged &s, bess::dataplane::Retirer &retirer) {
+        retirer.Retire(rules_.Exchange(std::move(s.rules)));
+        arg_.Swap(&s.arg);
+      },
+      bess::dataplane::Resource::Footprint{.retires = 1},
+      [this] { return arg_; }, nullptr);
+  if (!registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
   return CommandSuccess();
+}
+
+void ACL::DeInit() {
+  rules_resource_.Release();
 }
 
 // All or nothing: a rule that fails validation leaves the ACL unchanged.
@@ -78,11 +114,13 @@ CommandResponse ACL::CommandAdd(const bess::pb::ACLArg &arg) {
   std::vector<ACLRule> rules = rules_.Read()->rules;
   rules.insert(rules.end(), added.begin(), added.end());
   Install(std::move(rules));
+  arg_.mutable_rules()->MergeFrom(arg.rules());
   return CommandSuccess();
 }
 
 CommandResponse ACL::CommandClear(const bess::pb::EmptyArg &) {
   Install({});
+  arg_.Clear();
   return CommandSuccess();
 }
 

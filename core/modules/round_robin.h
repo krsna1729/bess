@@ -5,6 +5,11 @@
 #ifndef BESS_MODULES_ROUNDROBIN_H_
 #define BESS_MODULES_ROUNDROBIN_H_
 
+#include <expected>
+#include <string>
+#include <vector>
+
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 
@@ -40,11 +45,13 @@ class RoundRobin final : public Module {
   static const gate_idx_t kNumOGates = MAX_GATES;
 
   static const Commands cmds;
+  static const ResourceTables resource_tables;
 
   RoundRobin()
       : Module(), gates_(), ngates_(), current_gate_(), per_packet_() {}
 
   CommandResponse Init(const bess::pb::RoundRobinArg &arg);
+  void DeInit() override;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
@@ -60,6 +67,17 @@ class RoundRobin final : public Module {
       const bess::pb::RoundRobinCommandSetGatesArg &arg);
 
  private:
+  struct Settings {
+    int per_packet = 0;
+    std::vector<gate_idx_t> gates;
+  };
+
+  // "<name>/settings" (D-129): the gates and the mode, paused workers only.
+  static std::expected<Settings, std::string> StageSettings(
+      const bess::pb::RoundRobinArg &arg);
+  void ApplySettings(const Settings &settings);
+  bess::pb::RoundRobinArg ReadSettings() const;
+
   // ID number for each egress gate.
   gate_idx_t gates_[MAX_RR_GATES];
   // The total number of output gates
@@ -68,6 +86,8 @@ class RoundRobin final : public Module {
   int current_gate_;
   // Whether or not to schedule per-packet or per-batch
   int per_packet_;
+
+  bess::framework::Singleton<bess::pb::RoundRobinArg, Settings> settings_;
 };
 
 /*!

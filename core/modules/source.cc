@@ -3,7 +3,12 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "source.h"
+
+#include <expected>
+#include <string>
+
 #include "packet_pool.h"
+#include "utils/format.h"
 
 namespace {
 
@@ -13,14 +18,38 @@ size_t ConfiguredPacketDataRoom() {
                           : pool->data_room_size();
 }
 
+// set_pkt_size's refusal ("" when `pkt_size` is valid).
+std::string PktSizeError(uint64_t pkt_size) {
+  if (pkt_size == 0 || pkt_size > ConfiguredPacketDataRoom()) {
+    return bess::utils::Format("Invalid packet size: maximum is %zu",
+                               ConfiguredPacketDataRoom());
+  }
+  return "";
+}
+
+// set_burst's refusal ("" when `burst` is valid).
+std::string BurstError(uint64_t burst) {
+  if (burst > bess::PacketBatch::kMaxBurst) {
+    return bess::utils::Format("burst size must be [0,%zu]",
+                               bess::PacketBatch::kMaxBurst);
+  }
+  return "";
+}
+
 }  // namespace
 
+// The setters edit what "settings" holds: legacy only (D-129).
 const Commands Source::cmds = {
     {"set_pkt_size", "SourceCommandSetPktSizeArg",
-     MODULE_CMD_FUNC(&Source::CommandSetPktSize), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&Source::CommandSetPktSize), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"set_burst", "SourceCommandSetBurstArg",
-     MODULE_CMD_FUNC(&Source::CommandSetBurst), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&Source::CommandSetBurst), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
 };
+
+const ResourceTables Source::resource_tables = {
+    ResourceTable::Singleton<bess::pb::SourceSettings>("settings")};
 
 CommandResponse Source::Init(const bess::pb::SourceArg &arg) {
 
@@ -42,16 +71,52 @@ CommandResponse Source::Init(const bess::pb::SourceArg &arg) {
   if (arg.has_burst()) {
     bess::pb::SourceCommandSetBurstArg burst;
     burst.set_burst(arg.burst());
-    return CommandSetBurst(burst);
+    CommandResponse err = CommandSetBurst(burst);
+    if (err.error().code() != 0) {
+      return err;
+    }
+  }
+
+  // Applied live: both fields are relaxed atomics the task reads once per
+  // run (it may pair a new size with the old burst for one run).
+  auto registered = settings_.Register(
+      init_context().resources(), init_context().codecs(), name() + "/settings",
+      [](const bess::pb::SourceSettings &v)
+          -> std::expected<Settings, std::string> {
+        if (std::string err = PktSizeError(v.pkt_size()); !err.empty()) {
+          return std::unexpected(std::move(err));
+        }
+        if (std::string err = BurstError(v.burst()); !err.empty()) {
+          return std::unexpected(std::move(err));
+        }
+        return Settings{static_cast<int>(v.pkt_size()),
+                        static_cast<int>(v.burst())};
+      },
+      [this](Settings &s) {
+        pkt_size_.store(s.pkt_size, std::memory_order_relaxed);
+        burst_.store(s.burst, std::memory_order_relaxed);
+      },
+      [this] {
+        bess::pb::SourceSettings v;
+        v.set_pkt_size(pkt_size_.load(std::memory_order_relaxed));
+        v.set_burst(burst_.load(std::memory_order_relaxed));
+        return v;
+      },
+      nullptr);
+  if (!registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
   return CommandSuccess();
 }
 
+void Source::DeInit() {
+  settings_.Release();
+}
+
 CommandResponse Source::CommandSetBurst(
     const bess::pb::SourceCommandSetBurstArg &arg) {
-  if (arg.burst() > bess::PacketBatch::kMaxBurst) {
-    return CommandFailure(EINVAL, "burst size must be [0,%zu]",
-                          bess::PacketBatch::kMaxBurst);
+  if (std::string err = BurstError(arg.burst()); !err.empty()) {
+    return CommandFailure(EINVAL, "%s", err.c_str());
   }
   burst_.store(arg.burst(), std::memory_order_relaxed);
 
@@ -61,9 +126,8 @@ CommandResponse Source::CommandSetBurst(
 CommandResponse Source::CommandSetPktSize(
     const bess::pb::SourceCommandSetPktSizeArg &arg) {
   uint64_t val = arg.pkt_size();
-  if (val == 0 || val > ConfiguredPacketDataRoom()) {
-    return CommandFailure(EINVAL, "Invalid packet size: maximum is %zu",
-                          ConfiguredPacketDataRoom());
+  if (std::string err = PktSizeError(val); !err.empty()) {
+    return CommandFailure(EINVAL, "%s", err.c_str());
   }
   pkt_size_.store(val, std::memory_order_relaxed);
   return CommandSuccess();

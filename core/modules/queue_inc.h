@@ -7,6 +7,7 @@
 
 #include <atomic>
 
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "port.h"
@@ -16,6 +17,8 @@ class QueueInc final : public Module {
   static const gate_idx_t kNumIGates = 0;
 
   static const Commands cmds;
+  // "settings" (QueueIncSettings): burst, applied live (D-129).
+  static const ResourceTables resource_tables;
 
   QueueInc() : Module(), port_(), qid_(), prefetch_(), burst_() {}
 
@@ -37,8 +40,12 @@ class QueueInc final : public Module {
   Port *port_;
   queue_t qid_;
   int prefetch_;
-  // Set by THREAD_SAFE commands while workers read it.
+  // Set by THREAD_SAFE commands and the settings resource while workers
+  // read it.
   std::atomic<int> burst_;
+
+  // "<name>/settings" (the burst); after the state it sets.
+  bess::framework::Singleton<bess::pb::QueueIncSettings, int> settings_;
 };
 
 #endif  // BESS_MODULES_QUEUEINC_H_

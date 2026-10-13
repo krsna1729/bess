@@ -32,7 +32,7 @@ const (
 	Control_GetSchema_FullMethodName                = "/bess.pb.v2.Control/GetSchema"
 	Control_WatchEvents_FullMethodName              = "/bess.pb.v2.Control/WatchEvents"
 	Control_ListTransactionResources_FullMethodName = "/bess.pb.v2.Control/ListTransactionResources"
-	Control_RunModuleCommand_FullMethodName         = "/bess.pb.v2.Control/RunModuleCommand"
+	Control_InvokeAction_FullMethodName             = "/bess.pb.v2.Control/InvokeAction"
 )
 
 // ControlClient is the client API for Control service.
@@ -51,7 +51,7 @@ type ControlClient interface {
 	GetSchema(ctx context.Context, in *GetSchemaRequest, opts ...grpc.CallOption) (*GetSchemaResponse, error)
 	WatchEvents(ctx context.Context, in *WatchEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error)
 	ListTransactionResources(ctx context.Context, in *ListTransactionResourcesRequest, opts ...grpc.CallOption) (*ListTransactionResourcesResponse, error)
-	RunModuleCommand(ctx context.Context, in *RunModuleCommandRequest, opts ...grpc.CallOption) (*RunModuleCommandResponse, error)
+	InvokeAction(ctx context.Context, in *InvokeActionRequest, opts ...grpc.CallOption) (*InvokeActionResponse, error)
 }
 
 type controlClient struct {
@@ -191,10 +191,10 @@ func (c *controlClient) ListTransactionResources(ctx context.Context, in *ListTr
 	return out, nil
 }
 
-func (c *controlClient) RunModuleCommand(ctx context.Context, in *RunModuleCommandRequest, opts ...grpc.CallOption) (*RunModuleCommandResponse, error) {
+func (c *controlClient) InvokeAction(ctx context.Context, in *InvokeActionRequest, opts ...grpc.CallOption) (*InvokeActionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(RunModuleCommandResponse)
-	err := c.cc.Invoke(ctx, Control_RunModuleCommand_FullMethodName, in, out, cOpts...)
+	out := new(InvokeActionResponse)
+	err := c.cc.Invoke(ctx, Control_InvokeAction_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +217,7 @@ type ControlServer interface {
 	GetSchema(context.Context, *GetSchemaRequest) (*GetSchemaResponse, error)
 	WatchEvents(*WatchEventsRequest, grpc.ServerStreamingServer[Event]) error
 	ListTransactionResources(context.Context, *ListTransactionResourcesRequest) (*ListTransactionResourcesResponse, error)
-	RunModuleCommand(context.Context, *RunModuleCommandRequest) (*RunModuleCommandResponse, error)
+	InvokeAction(context.Context, *InvokeActionRequest) (*InvokeActionResponse, error)
 	mustEmbedUnimplementedControlServer()
 }
 
@@ -264,8 +264,8 @@ func (UnimplementedControlServer) WatchEvents(*WatchEventsRequest, grpc.ServerSt
 func (UnimplementedControlServer) ListTransactionResources(context.Context, *ListTransactionResourcesRequest) (*ListTransactionResourcesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListTransactionResources not implemented")
 }
-func (UnimplementedControlServer) RunModuleCommand(context.Context, *RunModuleCommandRequest) (*RunModuleCommandResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method RunModuleCommand not implemented")
+func (UnimplementedControlServer) InvokeAction(context.Context, *InvokeActionRequest) (*InvokeActionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method InvokeAction not implemented")
 }
 func (UnimplementedControlServer) mustEmbedUnimplementedControlServer() {}
 func (UnimplementedControlServer) testEmbeddedByValue()                 {}
@@ -497,20 +497,20 @@ func _Control_ListTransactionResources_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Control_RunModuleCommand_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RunModuleCommandRequest)
+func _Control_InvokeAction_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InvokeActionRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(ControlServer).RunModuleCommand(ctx, in)
+		return srv.(ControlServer).InvokeAction(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Control_RunModuleCommand_FullMethodName,
+		FullMethod: Control_InvokeAction_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ControlServer).RunModuleCommand(ctx, req.(*RunModuleCommandRequest))
+		return srv.(ControlServer).InvokeAction(ctx, req.(*InvokeActionRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -567,8 +567,8 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Control_ListTransactionResources_Handler,
 		},
 		{
-			MethodName: "RunModuleCommand",
-			Handler:    _Control_RunModuleCommand_Handler,
+			MethodName: "InvokeAction",
+			Handler:    _Control_InvokeAction_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

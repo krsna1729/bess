@@ -7,6 +7,7 @@
 
 #include <atomic>
 
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "port.h"
@@ -16,6 +17,8 @@ class PortInc final : public Module {
   static const gate_idx_t kNumIGates = 0;
 
   static const Commands cmds;
+  // "settings" (PortIncSettings): burst, applied live (D-129).
+  static const ResourceTables resource_tables;
 
   PortInc() : Module(), port_(), prefetch_(), burst_() {
     is_task_ = true;
@@ -41,8 +44,12 @@ class PortInc final : public Module {
  private:
   Port *port_;
   int prefetch_;
-  // Set by THREAD_SAFE commands while workers read it.
+  // Set by THREAD_SAFE commands and the settings resource while workers
+  // read it.
   std::atomic<int> burst_;
+
+  // "<name>/settings" (the burst); after the state it sets.
+  bess::framework::Singleton<bess::pb::PortIncSettings, int> settings_;
 };
 
 #endif  // BESS_MODULES_PORTINC_H_

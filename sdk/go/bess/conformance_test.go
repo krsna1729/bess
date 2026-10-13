@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"reflect"
 	"slices"
@@ -180,10 +181,7 @@ func (r *runner) step(s spec) error {
 			"want_rpcs": caps.GetRpcs(), "want_classes": caps.GetModuleClasses(), "want_resources": resources,
 		} {
 			for _, want := range s.list(field) {
-				name := want.(string)
-				if name == "$resource" {
-					name = r.resource
-				}
+				name := r.vary(want.(string))
 				if !slices.Contains(have, name) {
 					return fmt.Errorf("%s: no %s", field, name)
 				}
@@ -216,10 +214,7 @@ func (r *runner) step(s spec) error {
 		}
 		return errors.New("no class " + s.str("class"))
 	case "resource":
-		name := s.str("name")
-		if name == "$resource" {
-			name = r.resource
-		}
+		name := r.vary(s.str("name"))
 		_, err := r.client.Resource(r.ctx, name)
 		return expect(err, wantError, what)
 	case "watch":
@@ -245,48 +240,57 @@ func (r *runner) step(s spec) error {
 		}
 	case "pipeline":
 		return r.pipeline(s, wantError)
-	case "module_command":
-		return r.moduleCommand(s, wantError)
+	case "action":
+		return r.action(s, wantError)
 	default:
 		return fmt.Errorf("unknown step '%s'", what)
 	}
 	return nil
 }
 
-// moduleCommand: the argument's type is arg_type, else the command's in
-// class's schema.
-func (r *runner) moduleCommand(s spec, wantError string) error {
-	command := s.str("command")
+// vary substitutes the case variables: $resource, and $module (the
+// resource's module) alone or before "/<table>".
+func (r *runner) vary(s string) string {
+	if s == "$resource" {
+		return r.resource
+	}
+	if rest, ok := strings.CutPrefix(s, "$module"); ok && (rest == "" || strings.HasPrefix(rest, "/")) {
+		module, _, _ := strings.Cut(r.resource, "/")
+		return module + rest
+	}
+	return s
+}
+
+// action: the argument's type is arg_type, else the action's in class's
+// schema.
+func (r *runner) action(s spec, wantError string) error {
+	action := s.str("action")
 	typ := s.str("arg_type")
 	for _, c := range r.schema.GetModuleClasses() {
-		for _, cmd := range c.GetCommands() {
-			if typ == "" && c.GetName() == s.str("class") && cmd.GetName() == command {
-				typ = cmd.GetArgType()
+		for _, a := range c.GetActions() {
+			if typ == "" && c.GetName() == s.str("class") && a.GetName() == action {
+				typ = a.GetArgType()
 			}
 		}
 	}
 	if typ == "" {
-		return fmt.Errorf("%s has no command %s in the schema", s.str("class"), command)
+		return fmt.Errorf("%s has no action %s in the schema", s.str("class"), action)
 	}
 	arg, err := r.message(typ, s["arg"])
 	if err != nil {
 		return err
 	}
-	module := s.str("module")
-	if module == "$module" {
-		module, _, _ = strings.Cut(r.resource, "/")
-	}
-	answer, err := r.client.RunModuleCommand(r.ctx, module, command, arg)
-	if err := expect(err, wantError, command); err != nil || wantError != "" {
+	result, err := r.client.InvokeAction(r.ctx, r.vary(s.str("module")), action, arg)
+	if err := expect(err, wantError, action); err != nil || wantError != "" {
 		return err
 	}
 	want, ok := s["want_answer"].(map[string]any)
 	if !ok {
 		return nil
 	}
-	got, err := anypb.UnmarshalNew(answer, proto.UnmarshalOptions{Resolver: dynamicpb.NewTypes(r.files)})
+	got, err := anypb.UnmarshalNew(result, proto.UnmarshalOptions{Resolver: dynamicpb.NewTypes(r.files)})
 	if err != nil {
-		return fmt.Errorf("answer %s: %v", answer.GetTypeUrl(), err)
+		return fmt.Errorf("answer %s: %v", result.GetTypeUrl(), err)
 	}
 	text, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(got)
 	if err != nil {
@@ -302,6 +306,136 @@ func (r *runner) moduleCommand(s spec, wantError string) error {
 		}
 	}
 	return nil
+}
+
+// resourceTypes is the schema of resource name ("<module>/<table>"): the
+// table of the class of its module in p.
+func (r *runner) resourceTypes(p *pb.Pipeline, name string) (*pb.ResourceSchema, error) {
+	module, table, _ := strings.Cut(name, "/")
+	for _, m := range p.GetModules() {
+		if m.GetName() != module {
+			continue
+		}
+		for _, c := range r.schema.GetModuleClasses() {
+			if c.GetName() != m.GetMclass() {
+				continue
+			}
+			for _, t := range c.GetResources() {
+				if t.GetTable() == table {
+					return t, nil
+				}
+			}
+		}
+	}
+	return nil, fmt.Errorf("no resource %s in the schemas of the pipeline's modules", name)
+}
+
+// entry builds one resource entry of the cases ({"key": ..., "value": ...};
+// a singleton's has no key, and key is then nil) in t's types.
+func (r *runner) entry(t *pb.ResourceSchema, e any) (key, value proto.Message, err error) {
+	es, _ := e.(map[string]any)
+	if t.GetKind() != pb.TransactionResource_KIND_SINGLETON {
+		if _, ok := es["key"]; !ok {
+			return nil, nil, errors.New("no key")
+		}
+		if key, err = r.message(t.GetKeyType(), es["key"]); err != nil {
+			return nil, nil, err
+		}
+	}
+	if _, ok := es["value"]; !ok {
+		return nil, nil, errors.New("no value")
+	}
+	value, err = r.message(t.GetValueType(), es["value"])
+	return key, value, err
+}
+
+// listResources lists each resource of listed in p with exactly its entries
+// (in place of any listing p had): a map's entries, a singleton's value.
+func (r *runner) listResources(p *pb.Pipeline, listed map[string]any) error {
+	for _, n := range slices.Sorted(maps.Keys(listed)) {
+		name := r.vary(n)
+		t, err := r.resourceTypes(p, name)
+		if err != nil {
+			return err
+		}
+		contents := &pb.ResourceContents{Name: name}
+		entries, _ := listed[n].([]any)
+		for i, e := range entries {
+			key, value, err := r.entry(t, e)
+			if err != nil {
+				return fmt.Errorf("%s entry %d: %v", name, i, err)
+			}
+			entry := &pb.ResourceEntry{}
+			if entry.Value, err = anypb.New(value); err != nil {
+				return err
+			}
+			if key == nil { // a singleton has one value
+				contents.Entries = []*pb.ResourceEntry{entry}
+				continue
+			}
+			if entry.Key, err = anypb.New(key); err != nil {
+				return err
+			}
+			contents.Entries = append(contents.Entries, entry)
+		}
+		p.Resources = slices.DeleteFunc(p.Resources, func(c *pb.ResourceContents) bool { return c.GetName() == name })
+		p.Resources = append(p.Resources, contents)
+	}
+	return nil
+}
+
+// same: whether a holds m.
+func same(m proto.Message, a *anypb.Any) bool {
+	got := m.ProtoReflect().New().Interface()
+	return proto.Unmarshal(a.GetValue(), got) == nil && proto.Equal(got, m)
+}
+
+// checkResources: p lists each resource of want with exactly its entries, in
+// any order, compared as messages.
+func (r *runner) checkResources(p *pb.Pipeline, want map[string]any) error {
+	for _, n := range slices.Sorted(maps.Keys(want)) {
+		name := r.vary(n)
+		t, err := r.resourceTypes(p, name)
+		if err != nil {
+			return err
+		}
+		i := slices.IndexFunc(p.GetResources(), func(c *pb.ResourceContents) bool { return c.GetName() == name })
+		if i < 0 {
+			return fmt.Errorf("%s was not read", name)
+		}
+		have := p.GetResources()[i].GetEntries()
+		entries, _ := want[n].([]any)
+		if len(have) != len(entries) {
+			return fmt.Errorf("%s has %d entries, want %d", name, len(have), len(entries))
+		}
+		used := make([]bool, len(have))
+		for j, e := range entries {
+			key, value, err := r.entry(t, e)
+			if err != nil {
+				return fmt.Errorf("%s entry %d: %v", name, j, err)
+			}
+			found := false
+			for k, h := range have {
+				if !used[k] && same(value, h.GetValue()) && (key == nil || same(key, h.GetKey())) {
+					used[k], found = true, true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%s has no entry %d as wanted", name, j)
+			}
+		}
+	}
+	return nil
+}
+
+// sameVersion compares versions by value (ResourceGeneration is a pointer).
+func sameVersion(a, b PipelineVersion) bool {
+	if a.Generation != b.Generation || a.DaemonEpoch != b.DaemonEpoch ||
+		(a.ResourceGeneration == nil) != (b.ResourceGeneration == nil) {
+		return false
+	}
+	return a.ResourceGeneration == nil || *a.ResourceGeneration == *b.ResourceGeneration
 }
 
 func (r *runner) openWatch(s spec) error {
@@ -442,14 +576,27 @@ func (r *runner) commit(s spec, wantError string) error {
 
 func (r *runner) pipeline(s spec, wantError string) error {
 	// base alone builds too: that pipeline applied again.
-	builds := s.has("add") || s.has("chain") || s.has("remove") || s.has("base")
+	builds := s.has("add") || s.has("chain") || s.has("remove") || s.has("base") || s.has("resources")
 	var base *pb.Pipeline
 	if s.has("base") {
 		base = r.pipes[s.str("base")].pipeline
 	} else {
-		snap, err := r.client.Pipeline(r.ctx)
+		var query []PipelineQuery
+		if s.has("with_resources") {
+			var names []string
+			for _, n := range s.list("with_resources") {
+				names = append(names, r.vary(n.(string)))
+			}
+			query = append(query, WithResources(names...))
+		}
+		snap, err := r.client.Pipeline(r.ctx, query...)
 		if err != nil {
 			return expect(err, wantError, "pipeline")
+		}
+		if want, ok := s["want_resources"].(map[string]any); ok {
+			if err := r.checkResources(snap.Pipeline, want); err != nil {
+				return err
+			}
 		}
 		if !builds {
 			r.pipes[s.str("as")] = pipeLabel{snap.Pipeline, snap.Version}
@@ -459,8 +606,22 @@ func (r *runner) pipeline(s spec, wantError string) error {
 	}
 	b := NewPipeline(base)
 	for _, m := range s.list("add") {
-		pair := m.([]any)
-		b.Module(pair[0].(string), pair[1].(string), nil)
+		add := m.([]any)
+		name, class := add[0].(string), add[1].(string)
+		var arg proto.Message
+		if len(add) > 2 { // in the class's init type
+			typ := ""
+			for _, c := range r.schema.GetModuleClasses() {
+				if c.GetName() == class {
+					typ = c.GetInitArgType()
+				}
+			}
+			var err error
+			if arg, err = r.message(typ, add[2]); err != nil {
+				return fmt.Errorf("add %s: %v", name, err)
+			}
+		}
+		b.Module(name, class, arg)
 	}
 	var chain []string
 	for _, n := range s.list("chain") {
@@ -469,19 +630,32 @@ func (r *runner) pipeline(s spec, wantError string) error {
 	if len(chain) > 0 {
 		b.Chain(chain...)
 	}
+	removed := map[string]bool{}
 	for _, n := range s.list("remove") {
 		b.Remove(n.(string))
+		removed[n.(string)] = true
 	}
 	p, err := b.Build()
 	if err != nil {
 		return expect(err, wantError, "build")
+	}
+	// A removed module's resources ("<module>/...") go with it, as the C++
+	// builder's Remove drops them.
+	p.Resources = slices.DeleteFunc(p.Resources, func(c *pb.ResourceContents) bool {
+		module, _, _ := strings.Cut(c.GetName(), "/")
+		return removed[module]
+	})
+	if listed, ok := s["resources"].(map[string]any); ok {
+		if err := r.listResources(p, listed); err != nil {
+			return err
+		}
 	}
 	if s.boolean("plan") {
 		steps, v, err := r.client.PlanPipeline(r.ctx, p)
 		if err != nil || len(steps) == 0 {
 			return fmt.Errorf("plan: %d step(s), %v", len(steps), err)
 		}
-		if s.has("want_plan_version_of") && v != r.pipes[s.str("want_plan_version_of")].version {
+		if s.has("want_plan_version_of") && !sameVersion(v, r.pipes[s.str("want_plan_version_of")].version) {
 			return fmt.Errorf("plan against generation %d of epoch %d", v.Generation, v.DaemonEpoch)
 		}
 	}
@@ -499,14 +673,28 @@ func (r *runner) pipeline(s spec, wantError string) error {
 		opts = append(opts, WithExpectedVersion(r.pipes[s.str("at_version_of")].version))
 	}
 	done, err := r.client.ApplyPipeline(r.ctx, p, opts...)
-	if err := expect(err, wantError, "apply"); err != nil {
+	if err := expect(err, wantError, "apply"); err != nil || wantError != "" {
 		return err
 	}
-	if err == nil && s.has("want_generation_of") && done.GetGeneration() != r.pipes[s.str("want_generation_of")].version.Generation {
+	if s.has("want_generation_of") && done.GetGeneration() != r.pipes[s.str("want_generation_of")].version.Generation {
 		return fmt.Errorf("applied at generation %d, want %s's", done.GetGeneration(), s.str("want_generation_of"))
 	}
-	if err == nil && s.has("as") {
-		r.pipes[s.str("as")] = pipeLabel{p, PipelineVersion{done.GetGeneration(), done.GetDaemonEpoch()}}
+	if s.has("want_resource_ops") && done.GetResourceOps() != uint64(s.num("want_resource_ops")) {
+		return fmt.Errorf("%d resource op(s)", done.GetResourceOps())
+	}
+	if s.has("want_resource_generation_of") {
+		want := r.pipes[s.str("want_resource_generation_of")].version.ResourceGeneration
+		if want == nil || done.GetResourceGeneration() != *want {
+			return fmt.Errorf("applied at resource generation %d, want %s's", done.GetResourceGeneration(),
+				s.str("want_resource_generation_of"))
+		}
+	}
+	if s.has("as") {
+		v := PipelineVersion{Generation: done.GetGeneration(), DaemonEpoch: done.GetDaemonEpoch()}
+		if len(p.GetResources()) > 0 {
+			v.ResourceGeneration = proto.Uint64(done.GetResourceGeneration())
+		}
+		r.pipes[s.str("as")] = pipeLabel{p, v}
 	}
 	return nil
 }

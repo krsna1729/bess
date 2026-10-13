@@ -265,7 +265,12 @@ Result<std::map<std::string, sdk::Resource>> Client::Resources(bool refresh) {
     found[res.name()] = sdk::Resource{.name = res.name(),
                                       .key_type = res.key_type(),
                                       .value_type = res.value_type(),
-                                      .daemon_epoch = r->daemon_epoch()};
+                                      .daemon_epoch = r->daemon_epoch(),
+                                      // A daemon before D-129 sends no kind: a map.
+                                      .kind = res.kind() == pb::TransactionResource::KIND_SINGLETON
+                                                  ? pb::TransactionResource::KIND_SINGLETON
+                                                  : pb::TransactionResource::KIND_MAP,
+                                      .requires_paused_workers = res.requires_paused_workers()};
   }
   ObserveEpoch(r->daemon_epoch());
   std::lock_guard lock(mu_);
@@ -441,18 +446,26 @@ Result<Resp> Client::PipelineCall(Call &&call, bool retry_busy,
   }
 }
 
-Result<PipelineSnapshot> Client::Pipeline() {
+Result<PipelineSnapshot> Client::Pipeline(const PipelineQuery &query) {
+  pb::GetPipelineRequest req;
+  req.set_include_resources(query.include_resources);
+  for (const std::string &name : query.resources) {
+    req.add_resources(name);
+  }
   auto r = PipelineCall<pb::GetPipelineResponse>(
       [&](Deadline d, auto *resp, Trailers *t) {
-        return transport_->GetPipeline(d, pb::GetPipelineRequest(), resp, t);
+        return transport_->GetPipeline(d, req, resp, t);
       },
       false, {});
   if (!r) {
     return std::unexpected(std::move(r.error()));
   }
   ObserveEpoch(r->daemon_epoch());
-  return PipelineSnapshot{.pipeline = r->pipeline(),
-                          .version = {r->generation(), r->daemon_epoch()}};
+  PipelineVersion version{r->generation(), r->daemon_epoch()};
+  if (query.include_resources) {
+    version.resource_generation = r->resource_generation();
+  }
+  return PipelineSnapshot{.pipeline = r->pipeline(), .version = version};
 }
 
 Result<pb::Pipeline> Client::ValidatePipeline(const pb::Pipeline &p) {
@@ -481,7 +494,11 @@ Result<PipelineDiffResult> Client::DiffPipeline(const pb::Pipeline &p) {
     return std::unexpected(std::move(r.error()));
   }
   ObserveEpoch(r->daemon_epoch());
-  return PipelineDiffResult{.diff = r->diff(), .version = {r->generation(), r->daemon_epoch()}};
+  PipelineVersion version{r->generation(), r->daemon_epoch()};
+  if (p.resources_size() > 0) {
+    version.resource_generation = r->resource_generation();
+  }
+  return PipelineDiffResult{.diff = r->diff(), .version = version};
 }
 
 Result<PipelinePlan> Client::PlanPipeline(const pb::Pipeline &p) {
@@ -496,9 +513,13 @@ Result<PipelinePlan> Client::PlanPipeline(const pb::Pipeline &p) {
     return std::unexpected(std::move(r.error()));
   }
   ObserveEpoch(r->daemon_epoch());
+  PipelineVersion version{r->generation(), r->daemon_epoch()};
+  if (p.resources_size() > 0) {
+    version.resource_generation = r->resource_generation();
+  }
   return PipelinePlan{
       .steps = std::vector<pb::PlanStep>(r->steps().begin(), r->steps().end()),
-      .version = {r->generation(), r->daemon_epoch()}};
+      .version = version};
 }
 
 Result<pb::ApplyPipelineResponse> Client::ApplyPipeline(
@@ -508,6 +529,9 @@ Result<pb::ApplyPipelineResponse> Client::ApplyPipeline(
   if (expected) {
     req.set_expected_generation(expected->generation);
     req.set_daemon_epoch(expected->daemon_epoch);
+    if (expected->resource_generation) {
+      req.set_expected_resource_generation(*expected->resource_generation);
+    }
   } else {
     auto epoch = KnownEpoch();
     if (!epoch) {
@@ -550,26 +574,26 @@ Result<TransactionStatus> Client::GetTransaction(const std::string &request_id) 
                            .daemon_epoch = resp.daemon_epoch()};
 }
 
-// -- module commands ----------------------------------------------------------------
+// -- module actions -----------------------------------------------------------------
 
-Result<google::protobuf::Any> Client::RunModuleCommand(const std::string &module,
-                                                       const std::string &command,
-                                                       const google::protobuf::Message &arg) {
+Result<google::protobuf::Any> Client::InvokeAction(const std::string &module,
+                                                   const std::string &action,
+                                                   const google::protobuf::Message &arg) {
   const Result<uint64_t> epoch = KnownEpoch();
   if (!epoch) {
     return std::unexpected(epoch.error());
   }
-  pb::RunModuleCommandRequest req;
+  pb::InvokeActionRequest req;
   req.set_daemon_epoch(*epoch);
   req.set_module(module);
-  req.set_command(command);
+  req.set_action(action);
   if (!req.mutable_arg()->PackFrom(arg)) {
     return std::unexpected(Error{.kind = ErrorKind::kInvalidRequest,
-                                 .message = "cannot pack the command's argument"});
+                                 .message = "cannot pack the action's argument"});
   }
-  auto r = PipelineCall<pb::RunModuleCommandResponse>(
-      [&](Deadline d, pb::RunModuleCommandResponse *resp, Trailers *t) {
-        return transport_->RunModuleCommand(d, req, resp, t);
+  auto r = PipelineCall<pb::InvokeActionResponse>(
+      [&](Deadline d, pb::InvokeActionResponse *resp, Trailers *t) {
+        return transport_->InvokeAction(d, req, resp, t);
       },
       false, {}, *epoch);
   if (!r) {
@@ -578,7 +602,7 @@ Result<google::protobuf::Any> Client::RunModuleCommand(const std::string &module
   if (auto checked = CheckEpoch(r->daemon_epoch(), *epoch); !checked) {
     return std::unexpected(std::move(checked.error()));
   }
-  return std::move(*r->mutable_data());
+  return std::move(*r->mutable_result());
 }
 
 // -- administration ---------------------------------------------------------------
@@ -708,6 +732,16 @@ Result<Applied> Client::Commit(const pb::ApplyTransactionRequest &req,
             ObserveEpoch(detail->daemon_epoch());
             return std::unexpected(RefusedOtherEpoch(epoch, *detail));
           }
+          // A resource that changes only with its workers paused, while one
+          // runs (D-129): nothing was tried; retrying will not help until the
+          // caller pauses the workers.
+          if (detail && detail->code() == pb::ErrorDetail::RESOURCE_BUSY) {
+            Error e = Busy(i + 1);
+            e.message = detail->message();
+            e.code = status.error_code();
+            e.detail = detail;
+            return std::unexpected(std::move(e));
+          }
           return std::unexpected(Translate(status, trailers));
         }
         transport_failure = last_unanswered = status.error_code();
@@ -787,6 +821,10 @@ Result<void> Transaction::Upsert(const Resource &r,
   if (auto ok = Bind(r); !ok) {
     return ok;
   }
+  if (r.kind == pb::TransactionResource::KIND_SINGLETON) {
+    return std::unexpected(MakeError(ErrorKind::kInvalidRequest,
+                                     "resource \"" + r.name + "\" is a singleton: Set its value"));
+  }
   if (auto ok = CheckType(r, "key", key, r.key_type); !ok) {
     return ok;
   }
@@ -807,6 +845,10 @@ Result<void> Transaction::Erase(const Resource &r,
   if (auto ok = Bind(r); !ok) {
     return ok;
   }
+  if (r.kind == pb::TransactionResource::KIND_SINGLETON) {
+    return std::unexpected(MakeError(
+        ErrorKind::kInvalidRequest, "resource \"" + r.name + "\" is a singleton: it is set, not erased"));
+  }
   if (auto ok = CheckType(r, "key", key, r.key_type); !ok) {
     return ok;
   }
@@ -815,6 +857,26 @@ Result<void> Transaction::Erase(const Resource &r,
   op.set_erase(true);
   if (!op.mutable_key()->PackFrom(key)) {
     return std::unexpected(MakeError(ErrorKind::kInvalidRequest, "cannot pack the key"));
+  }
+  ops_.push_back(std::move(op));
+  return {};
+}
+
+Result<void> Transaction::Set(const Resource &r, const google::protobuf::Message &value) {
+  if (auto ok = Bind(r); !ok) {
+    return ok;
+  }
+  if (r.kind != pb::TransactionResource::KIND_SINGLETON) {
+    return std::unexpected(MakeError(
+        ErrorKind::kInvalidRequest, "resource \"" + r.name + "\" is a map: Upsert its entries"));
+  }
+  if (auto ok = CheckType(r, "value", value, r.value_type); !ok) {
+    return ok;
+  }
+  pb::TransactionOp op;
+  op.set_resource(r.name);
+  if (!op.mutable_value()->PackFrom(value)) {
+    return std::unexpected(MakeError(ErrorKind::kInvalidRequest, "cannot pack the value"));
   }
   ops_.push_back(std::move(op));
   return {};
@@ -954,6 +1016,44 @@ PipelineBuilder &PipelineBuilder::Remove(std::string_view name) {
   EraseIf(p_.mutable_tasks(), [&](const pb::TaskPlacement &t) {
     return t.module() == name || t.parent() == name;
   });
+  // A module's resources are "<module>/<table>".
+  EraseIf(p_.mutable_resources(), [&](const pb::ResourceContents &r) {
+    const std::string_view n = r.name();
+    return n.size() > name.size() && n.starts_with(name) && n[name.size()] == '/';
+  });
+  return *this;
+}
+
+pb::ResourceContents *PipelineBuilder::Listed(std::string_view name) {
+  for (pb::ResourceContents &r : *p_.mutable_resources()) {
+    if (r.name() == name) {
+      return &r;
+    }
+  }
+  pb::ResourceContents *r = p_.add_resources();
+  r->set_name(std::string(name));
+  return r;
+}
+
+PipelineBuilder &PipelineBuilder::Resource(std::string_view name) {
+  Listed(name);
+  return *this;
+}
+
+PipelineBuilder &PipelineBuilder::Entry(std::string_view resource,
+                                        const google::protobuf::Message &key,
+                                        const google::protobuf::Message &value) {
+  pb::ResourceEntry *e = Listed(resource)->add_entries();
+  Pack(&key, [&] { return e->mutable_key(); });
+  Pack(&value, [&] { return e->mutable_value(); });
+  return *this;
+}
+
+PipelineBuilder &PipelineBuilder::Setting(std::string_view resource,
+                                          const google::protobuf::Message &value) {
+  pb::ResourceContents *r = Listed(resource);
+  r->clear_entries();  // a singleton has one value
+  Pack(&value, [&] { return r->add_entries()->mutable_value(); });
   return *this;
 }
 

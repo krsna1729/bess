@@ -689,71 +689,95 @@ TEST_F(ApiV2ServiceTest, MutatingRequestsMustNameTheDaemonsEpoch) {
   }
 }
 
-// A module's commands over v2 (D-115): epoch-checked before anything runs; the
-// answer comes back as the command's Any; a missing module, a command the
-// class does not have and a command's own failure are typed errors carrying
-// the module and the command's errno.
-TEST_F(ApiV2ServiceTest, RunModuleCommand) {
+// A module's actions over v2 (D-129): epoch-checked before anything runs; the
+// result comes back as the action's Any; a missing module, an action the
+// class does not have, a legacy-only command and an action's own failure are
+// typed errors carrying the module and the errno. The legacy path still runs
+// the legacy-only command.
+TEST_F(ApiV2ServiceTest, InvokeAction) {
   google::protobuf::Any arg;
   ASSERT_TRUE(arg.PackFrom(bess::pb::L2ForwardArg()));
   ASSERT_TRUE(control_plane_->CreateModule({"l2", "L2Forward", arg}));
 
-  auto run = [&](const std::string &module, const std::string &command,
-                 const google::protobuf::Message &command_arg, uint64_t epoch,
-                 v2::RunModuleCommandResponse *resp, v2::ErrorDetail *detail = nullptr) {
+  auto invoke = [&](const std::string &module, const std::string &action,
+                    const google::protobuf::Message &action_arg, uint64_t epoch,
+                    v2::InvokeActionResponse *resp, v2::ErrorDetail *detail = nullptr) {
     grpc::ClientContext ctx;
-    v2::RunModuleCommandRequest req;
+    v2::InvokeActionRequest req;
     req.set_daemon_epoch(epoch);
     req.set_module(module);
-    req.set_command(command);
-    EXPECT_TRUE(req.mutable_arg()->PackFrom(command_arg));
-    const grpc::Status status = stub_->RunModuleCommand(&ctx, req, resp);
+    req.set_action(action);
+    EXPECT_TRUE(req.mutable_arg()->PackFrom(action_arg));
+    const grpc::Status status = stub_->InvokeAction(&ctx, req, resp);
     if (detail != nullptr) {
       *detail = DetailOf(ctx);
     }
     return status.error_code();
   };
-  bess::pb::L2ForwardCommandAddArg add;
-  auto *entry = add.add_entries();
-  entry->set_addr("02:00:00:00:00:01");
-  entry->set_gate(3);
+  bess::pb::L2ForwardCommandPopulateArg populate;
+  populate.set_base("02:00:00:00:00:01");
+  populate.set_count(1);
+  populate.set_gate_count(1);
   bess::pb::L2ForwardCommandLookupArg lookup;
   lookup.add_addrs("02:00:00:00:00:01");
 
-  v2::RunModuleCommandResponse resp;
+  v2::InvokeActionResponse resp;
   v2::ErrorDetail detail;
-  ASSERT_EQ(grpc::StatusCode::INVALID_ARGUMENT, run("l2", "add", add, 0, &resp, &detail));
+  ASSERT_EQ(grpc::StatusCode::INVALID_ARGUMENT,
+            invoke("l2", "populate", populate, 0, &resp, &detail));
   EXPECT_EQ("daemon_epoch", detail.field());
-  EXPECT_NE(grpc::StatusCode::OK, run("l2", "lookup", lookup, Epoch(), &resp))
-      << "the refused add ran";
+  EXPECT_NE(grpc::StatusCode::OK, invoke("l2", "lookup", lookup, Epoch(), &resp))
+      << "the refused populate ran";
 
-  ASSERT_EQ(grpc::StatusCode::OK, run("l2", "add", add, Epoch(), &resp));
-  EXPECT_FALSE(resp.has_data()) << "add answers nothing";
+  ASSERT_EQ(grpc::StatusCode::OK, invoke("l2", "populate", populate, Epoch(), &resp));
+  EXPECT_FALSE(resp.has_result()) << "populate answers nothing";
   EXPECT_EQ(Epoch(), resp.daemon_epoch());
-  ASSERT_EQ(grpc::StatusCode::OK, run("l2", "lookup", lookup, Epoch(), &resp));
+  ASSERT_EQ(grpc::StatusCode::OK, invoke("l2", "lookup", lookup, Epoch(), &resp));
   bess::pb::L2ForwardCommandLookupResponse found;
-  ASSERT_TRUE(resp.data().UnpackTo(&found));
+  ASSERT_TRUE(resp.result().UnpackTo(&found));
   ASSERT_EQ(1, found.gates_size());
-  EXPECT_EQ(3u, found.gates(0));
+  EXPECT_EQ(0u, found.gates(0));
 
-  EXPECT_EQ(grpc::StatusCode::NOT_FOUND, run("nope", "lookup", lookup, Epoch(), &resp, &detail));
+  EXPECT_EQ(grpc::StatusCode::NOT_FOUND,
+            invoke("nope", "lookup", lookup, Epoch(), &resp, &detail));
   EXPECT_EQ(v2::ErrorDetail::NOT_FOUND, detail.code());
   EXPECT_EQ("nope", detail.object());
 
-  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, run("l2", "nope", lookup, Epoch(), &resp, &detail));
+  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT,
+            invoke("l2", "nope", lookup, Epoch(), &resp, &detail));
   EXPECT_EQ(ENOTSUP, detail.errno_value());
-  EXPECT_EQ("command", detail.field());
+  EXPECT_EQ("action", detail.field());
 
-  // The command's own refusal: the address is already there.
-  EXPECT_NE(grpc::StatusCode::OK, run("l2", "add", add, Epoch(), &resp, &detail));
-  EXPECT_NE(0, detail.errno_value()) << detail.message();
+  // A command that edits state the resources hold is not an action: v2
+  // refuses it, and nothing changes; the legacy path still runs it.
+  bess::pb::L2ForwardCommandAddArg add;
+  auto *entry = add.add_entries();
+  entry->set_addr("02:00:00:00:00:09");
+  entry->set_gate(3);
+  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT,
+            invoke("l2", "add", add, Epoch(), &resp, &detail));
+  EXPECT_EQ(ENOTSUP, detail.errno_value());
+  EXPECT_EQ("action", detail.field());
+  bess::pb::L2ForwardCommandLookupArg lookup_added;
+  lookup_added.add_addrs("02:00:00:00:00:09");
+  EXPECT_NE(grpc::StatusCode::OK, invoke("l2", "lookup", lookup_added, Epoch(), &resp))
+      << "the refused add ran";
+  google::protobuf::Any packed_add;
+  ASSERT_TRUE(packed_add.PackFrom(add));
+  EXPECT_TRUE(control_plane_->RunModuleCommand("l2", "add", packed_add));
+  EXPECT_EQ(grpc::StatusCode::OK, invoke("l2", "lookup", lookup_added, Epoch(), &resp));
+
+  // The action's own refusal: the base is not a MAC address.
+  populate.set_base("not a mac");
+  EXPECT_NE(grpc::StatusCode::OK, invoke("l2", "populate", populate, Epoch(), &resp, &detail));
+  EXPECT_EQ(EINVAL, detail.errno_value()) << detail.message();
   EXPECT_EQ("l2", detail.object());
 }
 
-// A command not marked thread-safe is refused (EBUSY) while a worker runs
+// An action not marked thread-safe is refused (EBUSY) while a worker runs
 // the module, after the v2 path ApplyPipeline + resume: the resume works out
 // which workers run each module. Paused, it runs.
-TEST_F(ApiV2ServiceTest, ThreadUnsafeCommandWaitsForPausedWorkers) {
+TEST_F(ApiV2ServiceTest, ThreadUnsafeActionWaitsForPausedWorkers) {
   v2::Pipeline p;
   auto *w = p.add_workers();
   w->set_wid(0);
@@ -762,6 +786,13 @@ TEST_F(ApiV2ServiceTest, ThreadUnsafeCommandWaitsForPausedWorkers) {
   q->set_name("q");
   q->set_mclass("Queue");
   ASSERT_TRUE(q->mutable_arg()->PackFrom(bess::pb::QueueArg()));
+  auto *ps = p.add_modules();
+  ps->set_name("ps");
+  ps->set_mclass("PacketStore");
+  ASSERT_TRUE(ps->mutable_arg()->PackFrom(bess::pb::PacketStoreArg()));
+  auto *c = p.add_connections();
+  c->set_upstream("q");
+  c->set_downstream("ps");
   auto *t = p.add_tasks();
   t->set_module("q");
   t->set_wid(0);
@@ -775,27 +806,95 @@ TEST_F(ApiV2ServiceTest, ThreadUnsafeCommandWaitsForPausedWorkers) {
     ASSERT_TRUE(status.ok()) << status.error_message();
   }
 
-  auto set_size = [&](v2::ErrorDetail *detail) {
+  auto clear = [&](v2::ErrorDetail *detail) {
     grpc::ClientContext ctx;
-    v2::RunModuleCommandRequest req;
+    v2::InvokeActionRequest req;
     req.set_daemon_epoch(Epoch());
-    req.set_module("q");
-    req.set_command("set_size");
-    bess::pb::QueueCommandSetSizeArg arg;
-    arg.set_size(256);
-    EXPECT_TRUE(req.mutable_arg()->PackFrom(arg));
-    v2::RunModuleCommandResponse resp;
-    const grpc::StatusCode code = stub_->RunModuleCommand(&ctx, req, &resp).error_code();
+    req.set_module("ps");
+    req.set_action("clear");
+    EXPECT_TRUE(req.mutable_arg()->PackFrom(bess::pb::PacketStoreCommandClearArg()));
+    v2::InvokeActionResponse resp;
+    const grpc::StatusCode code = stub_->InvokeAction(&ctx, req, &resp).error_code();
     *detail = DetailOf(ctx);
     return code;
   };
   v2::ErrorDetail detail;
   ASSERT_TRUE(control_plane_->ResumeAll());
-  EXPECT_NE(grpc::StatusCode::OK, set_size(&detail)) << "ran beside the running worker";
+  EXPECT_NE(grpc::StatusCode::OK, clear(&detail)) << "ran beside the running worker";
   EXPECT_EQ(EBUSY, detail.errno_value());
   EXPECT_EQ(v2::ErrorDetail::RESOURCE_BUSY, detail.code());
   ASSERT_TRUE(control_plane_->PauseAll());
-  EXPECT_EQ(grpc::StatusCode::OK, set_size(&detail)) << detail.message();
+  EXPECT_EQ(grpc::StatusCode::OK, clear(&detail)) << detail.message();
+}
+
+// A resource that changes only with its workers paused (Queue's settings):
+// a transaction while a worker runs the module is refused RESOURCE_BUSY
+// before anything is tried; ApplyPipeline listing it pauses the workers
+// itself, and the value reads back.
+TEST_F(ApiV2ServiceTest, PausedOnlyResourceIsBusyWhileWorkersRun) {
+  v2::Pipeline p;
+  auto *w = p.add_workers();
+  w->set_wid(0);
+  w->set_core(0);
+  auto *q = p.add_modules();
+  q->set_name("q");
+  q->set_mclass("Queue");
+  ASSERT_TRUE(q->mutable_arg()->PackFrom(bess::pb::QueueArg()));
+  auto *t = p.add_tasks();
+  t->set_module("q");
+  t->set_wid(0);
+  auto apply = [&](const v2::Pipeline &pipeline) {
+    grpc::ClientContext ctx;
+    v2::ApplyPipelineRequest req;
+    *req.mutable_pipeline() = pipeline;
+    req.set_daemon_epoch(Epoch());
+    v2::ApplyPipelineResponse resp;
+    return stub_->ApplyPipeline(&ctx, req, &resp);
+  };
+  {
+    const grpc::Status status = apply(p);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
+  ASSERT_TRUE(control_plane_->ResumeAll());
+
+  bess::pb::QueueSettings settings;
+  settings.set_size(256);
+  settings.set_burst(32);
+  {
+    grpc::ClientContext ctx;
+    v2::ApplyTransactionRequest req;
+    req.set_request_id("paused-only-busy");
+    req.set_daemon_epoch(Epoch());
+    v2::TransactionOp *op = req.add_ops();
+    op->set_resource("q/settings");
+    ASSERT_TRUE(op->mutable_value()->PackFrom(settings));
+    v2::ApplyTransactionResponse resp;
+    const grpc::Status status = stub_->ApplyTransaction(&ctx, req, &resp);
+    EXPECT_EQ(grpc::StatusCode::FAILED_PRECONDITION, status.error_code()) << status.error_message();
+    const v2::ErrorDetail detail = DetailOf(ctx);
+    EXPECT_EQ(v2::ErrorDetail::RESOURCE_BUSY, detail.code());
+    EXPECT_EQ("q/settings", detail.object());
+  }
+
+  v2::ResourceContents *r = p.add_resources();
+  r->set_name("q/settings");
+  ASSERT_TRUE(r->add_entries()->mutable_value()->PackFrom(settings));
+  {
+    const grpc::Status status = apply(p);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
+  grpc::ClientContext ctx;
+  v2::GetPipelineRequest req;
+  req.set_include_resources(true);
+  req.add_resources("q/settings");
+  v2::GetPipelineResponse resp;
+  ASSERT_TRUE(stub_->GetPipeline(&ctx, req, &resp).ok());
+  ASSERT_EQ(1, resp.pipeline().resources_size());
+  ASSERT_EQ(1, resp.pipeline().resources(0).entries_size());
+  bess::pb::QueueSettings read;
+  ASSERT_TRUE(resp.pipeline().resources(0).entries(0).value().UnpackTo(&read));
+  EXPECT_EQ(256u, read.size());
+  EXPECT_FALSE(resp.pipeline().resources(0).entries(0).has_key()) << "a singleton has no key";
 }
 
 // Counts the PreResume events it gets.
@@ -952,9 +1051,10 @@ class SchemaOnlyResource final : public bess::dataplane::Resource {
 
 // Schema discovery is what a generic client (bessctl, a manifest, a UI)
 // writes arguments from. Every class and driver names its init type, every
-// command's hand-written type name resolves to a message (a typo would leave
-// that command unusable to such a client), and the descriptor set builds on
-// its own, in its order, into an empty pool.
+// action's hand-written argument and result type names and every resource
+// table's key and value types resolve to a message (a typo would leave it
+// unusable to such a client), and the descriptor set builds on its own, in
+// its order, into an empty pool. Legacy-only commands are not listed (D-129).
 TEST_F(ApiV2ServiceTest, SchemaNamesEveryArgumentTypeAndCarriesItsDescriptors) {
   SchemaOnlyResource resource;
   bess::dataplane::TransactionEngine &engine = bess::runtime::runtime().transactions();
@@ -966,7 +1066,8 @@ TEST_F(ApiV2ServiceTest, SchemaNamesEveryArgumentTypeAndCarriesItsDescriptors) {
                     },
                     [](const v2::Connection &) -> std::expected<std::any, std::string> {
                       return std::unexpected("unused");
-                    }));
+                    },
+                    [](const auto &) {}));
   grpc::ClientContext ctx;
   v2::GetSchemaResponse resp;
   const grpc::Status status = stub_->GetSchema(&ctx, v2::GetSchemaRequest(), &resp);
@@ -981,15 +1082,28 @@ TEST_F(ApiV2ServiceTest, SchemaNamesEveryArgumentTypeAndCarriesItsDescriptors) {
     ASSERT_NE(nullptr, pool.BuildFile(file)) << file.name();
   }
   const v2::ModuleClassSchema *exact_match = nullptr;
+  const v2::ModuleClassSchema *l2_forward = nullptr;
   for (const v2::ModuleClassSchema &c : resp.module_classes()) {
     EXPECT_NE(nullptr, pool.FindMessageTypeByName(c.init_arg_type()))
         << c.name() << " init '" << c.init_arg_type() << "'";
-    for (const v2::CommandSchema &cmd : c.commands()) {
-      EXPECT_NE(nullptr, pool.FindMessageTypeByName(cmd.arg_type()))
-          << c.name() << "." << cmd.name() << " '" << cmd.arg_type() << "'";
+    for (const v2::ActionSchema &a : c.actions()) {
+      EXPECT_NE(nullptr, pool.FindMessageTypeByName(a.arg_type()))
+          << c.name() << "." << a.name() << " '" << a.arg_type() << "'";
+      if (!a.result_type().empty()) {
+        EXPECT_NE(nullptr, pool.FindMessageTypeByName(a.result_type()))
+            << c.name() << "." << a.name() << " result '" << a.result_type() << "'";
+      }
+    }
+    for (const v2::ResourceSchema &r : c.resources()) {
+      EXPECT_NE(nullptr, pool.FindMessageTypeByName(r.key_type()))
+          << c.name() << "/" << r.table() << " key '" << r.key_type() << "'";
+      EXPECT_NE(nullptr, pool.FindMessageTypeByName(r.value_type()))
+          << c.name() << "/" << r.table() << " value '" << r.value_type() << "'";
     }
     if (c.name() == "ExactMatch") {
       exact_match = &c;
+    } else if (c.name() == "L2Forward") {
+      l2_forward = &c;
     }
   }
   for (const v2::PortDriverSchema &d : resp.port_drivers()) {
@@ -1003,14 +1117,28 @@ TEST_F(ApiV2ServiceTest, SchemaNamesEveryArgumentTypeAndCarriesItsDescriptors) {
   ASSERT_NE(nullptr, exact_match);
   EXPECT_EQ("bess.pb.ExactMatchArg", exact_match->init_arg_type());
   EXPECT_EQ(1u, exact_match->igates());
-  bool add_found = false;
-  for (const v2::CommandSchema &cmd : exact_match->commands()) {
-    if (cmd.name() == "add") {
-      add_found = true;
-      EXPECT_EQ("bess.pb.ExactMatchCommandAddArg", cmd.arg_type());
+  EXPECT_EQ(0, exact_match->actions_size()) << "every ExactMatch command edits state";
+  ASSERT_EQ(2, exact_match->resources_size());
+  EXPECT_EQ("rules", exact_match->resources(0).table());
+  EXPECT_EQ(v2::TransactionResource::KIND_MAP, exact_match->resources(0).kind());
+  EXPECT_EQ("bess.pb.ExactMatchRuleKey", exact_match->resources(0).key_type());
+  EXPECT_EQ("bess.pb.ExactMatchRuleValue", exact_match->resources(0).value_type());
+  EXPECT_EQ("settings", exact_match->resources(1).table());
+  EXPECT_EQ(v2::TransactionResource::KIND_SINGLETON, exact_match->resources(1).kind());
+  EXPECT_EQ("google.protobuf.Empty", exact_match->resources(1).key_type());
+  EXPECT_EQ("bess.pb.ExactMatchSettings", exact_match->resources(1).value_type());
+
+  ASSERT_NE(nullptr, l2_forward);
+  std::vector<std::string> actions;
+  for (const v2::ActionSchema &a : l2_forward->actions()) {
+    actions.push_back(a.name());
+    if (a.name() == "lookup") {
+      EXPECT_EQ("bess.pb.L2ForwardCommandLookupArg", a.arg_type());
+      EXPECT_EQ("bess.pb.L2ForwardCommandLookupResponse", a.result_type());
     }
   }
-  EXPECT_TRUE(add_found);
+  EXPECT_EQ((std::vector<std::string>{"lookup", "populate"}), actions)
+      << "sorted, and add/delete/set_default_gate are legacy-only";
 }
 
 }  // namespace

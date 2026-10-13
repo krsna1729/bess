@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # A Queue between two tasks: a rate-limited Source pushes, the Queue task
-# pulls. (Its occupancy: the Queue command get_status.)
+# pulls. (Its occupancy: `bessctl action queue get_status`.)
 #
 # Converted from queue.bess (D-104). Rewrite templates are the packets it
 # built with scapy.

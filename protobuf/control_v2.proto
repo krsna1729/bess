@@ -91,6 +91,22 @@ message TaskPlacement {
   optional int64 share = 6;     // required under a weighted_fair parent
 }
 
+// A resource's contents as desired state (D-129): `name` is a transaction
+// resource ("<module>/<table>", ListTransactionResources and GetSchema name
+// them). A map resource has one entry per key; a singleton has exactly one
+// entry, with no key. A pipeline that lists a resource owns its contents: the
+// apply converges it to exactly these entries (an empty list clears a map).
+// A resource the pipeline does not list is left as it is.
+message ResourceEntry {
+  google.protobuf.Any key = 1;    // the resource's key type; unset for a singleton
+  google.protobuf.Any value = 2;  // the resource's value type
+}
+
+message ResourceContents {
+  string name = 1;
+  repeated ResourceEntry entries = 2;
+}
+
 message Pipeline {
   repeated Port ports = 1;
   repeated Module modules = 2;
@@ -98,6 +114,7 @@ message Pipeline {
   repeated Worker workers = 4;
   repeated TrafficClass traffic_classes = 5;
   repeated TaskPlacement tasks = 6;
+  repeated ResourceContents resources = 7;  // sorted by name once validated
 }
 
 // -- diff and plan --------------------------------------------------------------
@@ -110,6 +127,7 @@ enum ObjectType {
   WORKER = 4;
   TRAFFIC_CLASS = 5;
   TASK = 6;  // a module task's placement; object "module:task"
+  RESOURCE = 7;  // a resource's contents; object its name
 }
 
 enum ChangeKind {
@@ -129,8 +147,21 @@ message Change {
   ChangeKind kind = 3;
 }
 
+// What converging a listed resource changes, by entries.
+message ResourceDelta {
+  string name = 1;
+  uint64 created = 2;
+  uint64 updated = 3;
+  uint64 removed = 4;
+  // False: the resource does not exist yet (its module is created or
+  // replaced by the same apply), so every entry counts as created and the
+  // entries' keys are checked only when the apply commits them.
+  bool checked = 5;
+}
+
 message PipelineDiff {
   repeated Change changes = 1;  // unchanged objects are not listed
+  repeated ResourceDelta resources = 2;  // listed resources that change
 }
 
 enum PlanPhase {
@@ -164,7 +195,14 @@ message WorkerPlacement {
   bool on_control_cpu = 6;  // a CPU reserved for control threads
 }
 
-message GetPipelineRequest {}
+// With include_resources, the pipeline lists its resources' contents too
+// (every resource, or those named in `resources`), so a manifest read back
+// and applied again changes nothing. A response above the message limit is
+// RESOURCE_EXHAUSTED: name fewer resources.
+message GetPipelineRequest {
+  bool include_resources = 1;
+  repeated string resources = 2;  // with include_resources: only these (empty: all)
+}
 message GetPipelineResponse {
   // The active runtime as desired state; every worker with the core it runs
   // on, an automatic one included.
@@ -172,6 +210,9 @@ message GetPipelineResponse {
   uint64 generation = 2;
   uint64 daemon_epoch = 3;
   repeated WorkerPlacement workers = 4;  // observed, by wid
+  // The dataplane transaction generation (ApplyTransaction's) the resource
+  // contents were read at.
+  uint64 resource_generation = 5;
 }
 
 message ValidatePipelineRequest {
@@ -188,6 +229,7 @@ message DiffPipelineResponse {
   PipelineDiff diff = 1;
   uint64 generation = 2;  // the active generation the diff was taken against
   uint64 daemon_epoch = 3;
+  uint64 resource_generation = 4;  // and the dataplane transaction generation
 }
 
 message PlanPipelineRequest {
@@ -197,8 +239,13 @@ message PlanPipelineResponse {
   repeated PlanStep steps = 1;
   uint64 generation = 2;
   uint64 daemon_epoch = 3;
+  uint64 resource_generation = 4;
 }
 
+// The pipeline's topology first, then its listed resources in one dataplane
+// transaction (after the topology commit, before what it replaced retires):
+// the resources of a module the apply creates exist only then. If the
+// resource transaction is refused, the topology is rolled back too.
 message ApplyPipelineRequest {
   Pipeline pipeline = 1;
   // Optimistic concurrency: rejected with ABORTED, before any side effect,
@@ -209,9 +256,13 @@ message ApplyPipelineRequest {
   // "daemon_epoch"); another epoch: FAILED_PRECONDITION with error detail
   // EPOCH_MISMATCH, before any side effect (D-106).
   uint64 daemon_epoch = 3;
+  // The same for the dataplane transaction generation (resource contents).
+  optional uint64 expected_resource_generation = 4;
 }
 message ApplyPipelineResponse {
-  uint64 generation = 1;     // after the apply (unchanged for a no-op)
+  // After the apply (unchanged for a no-op, and when only resource contents
+  // changed: resource_generation counts those).
+  uint64 generation = 1;
   uint64 applied_ops = 2;
   bool workers_paused = 3;
   uint64 validation_us = 4;
@@ -219,6 +270,8 @@ message ApplyPipelineResponse {
   uint64 paused_commit_us = 6;
   uint64 retire_us = 7;
   uint64 daemon_epoch = 8;
+  uint64 resource_generation = 9;  // dataplane transaction generation after it
+  uint64 resource_ops = 10;        // resource entries created, updated or erased
 }
 
 // Carried in the "bess-error-bin" trailer of a failed call.
@@ -252,6 +305,16 @@ message ErrorDetail {
 // "resource" named "<module>/<table>" ("em0/rules"); its keys and values
 // are typed messages of its own (ListTransactionResources names them), so
 // no client packs BESS's internal keys.
+//
+// Two kinds (D-129). A map resource holds entries by key. A singleton holds
+// one value (a module's run-time settings, "src0/config"): an operation on it
+// is an upsert with no key (or a google.protobuf.Empty one) that sets the
+// value; an erase is refused. Both kinds take part in the same transactions.
+// A resource marked requires_paused_workers changes state its module's
+// workers read without synchronization: a transaction naming it while a
+// worker runs the module is refused before anything is attempted
+// (FAILED_PRECONDITION, error detail RESOURCE_BUSY, errno EBUSY; not
+// recorded under the request id): pause the workers first.
 
 message TransactionOp {
   string resource = 1;
@@ -370,9 +433,16 @@ message GetTransactionResponse {
 message ListTransactionResourcesRequest {}
 
 message TransactionResource {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;  // from a daemon before D-129: a map
+    KIND_MAP = 1;
+    KIND_SINGLETON = 2;
+  }
   string name = 1;
   string key_type = 2;    // protobuf full name of the key message
   string value_type = 3;  // and of the value message
+  Kind kind = 4;
+  bool requires_paused_workers = 5;
 }
 
 message ListTransactionResourcesResponse {
@@ -445,21 +515,32 @@ message GetCapabilitiesResponse {
 //
 // What a generic client (bessctl, a manifest tool, a UI) needs to read and
 // write module, driver and resource arguments without generated code: each
-// module class's and port driver's init argument type, each module command's
-// argument type, and the descriptors of all of them (with transaction
-// resources' key and value types). Plugins' types are included once loaded.
-// Type names are full protobuf names ("bess.pb.ExactMatchArg"); "" where the
-// class did not declare one (a class registered without DEF_MODULE /
-// ADD_DRIVER), or where a command's declared type does not resolve: it is
-// tried as a full name, then in the package of its class's init type, then in
-// bess.pb (docs/plugin-api.md).
+// module class's and port driver's init argument type, each module class's
+// resource tables and actions with their types, and the descriptors of all
+// of them (with transaction resources' key and value types). Plugins' types
+// are included once loaded. Type names are full protobuf names
+// ("bess.pb.ExactMatchArg"); "" where the class did not declare one (a class
+// registered without DEF_MODULE / ADD_DRIVER), or where an action's declared
+// type does not resolve: it is tried as a full name, then in the package of
+// its class's init type, then in bess.pb (docs/plugin-api.md).
 
 message GetSchemaRequest {}
 
-message CommandSchema {
+// A resource table every module of the class has: "<module>/<table>".
+message ResourceSchema {
+  string table = 1;
+  TransactionResource.Kind kind = 2;
+  string key_type = 3;  // google.protobuf.Empty for a singleton
+  string value_type = 4;
+  bool requires_paused_workers = 5;
+}
+
+// An action (InvokeAction): an operation that is not state.
+message ActionSchema {
   string name = 1;
   string arg_type = 2;
-  bool thread_safe = 3;  // runs without pausing workers
+  string result_type = 3;  // "" when it answers nothing
+  bool thread_safe = 4;    // runs without pausing workers
 }
 
 message ModuleClassSchema {
@@ -468,7 +549,10 @@ message ModuleClassSchema {
   string init_arg_type = 3;
   uint32 igates = 4;  // input gates the class accepts
   uint32 ogates = 5;  // output gates
-  repeated CommandSchema commands = 6;
+  reserved 6;
+  reserved "commands";  // D-115's commands: actions and resources since D-129
+  repeated ActionSchema actions = 7;      // sorted by name
+  repeated ResourceSchema resources = 8;  // sorted by table
 }
 
 message PortDriverSchema {
@@ -547,25 +631,27 @@ message ListMetricsResponse {
   uint64 daemon_epoch = 2;            // counters restart with the daemon
 }
 
-// -- Module commands (D-115) -----------------------------------------------
+// -- Module actions (D-129) ------------------------------------------------
 //
-// A module's command, as GetSchema lists it (name, argument type,
-// thread_safe): what a module does besides its desired state -- lookups,
-// statistics, one-shot operations -- and the edits of its tables beside its
-// transaction resources. Not transactional: a command acts when it runs. A
-// command not marked thread_safe is refused while a worker runs
-// (FAILED_PRECONDITION, RESOURCE_BUSY, errno EBUSY): pause the workers first
-// (Admin.PauseWorkers). A command's failure is the call's error, with the
-// command's errno in ErrorDetail.errno_value.
-message RunModuleCommandRequest {
+// A module's action, as GetSchema lists it (name, argument and result types,
+// thread_safe): what a module does that is not state -- lookups, statistics,
+// clearing counters, one-shot operations. A module's state is its init
+// argument and its resources, never an action. Not transactional: an action
+// acts when it runs. An action not marked thread_safe is refused while a
+// worker runs (FAILED_PRECONDITION, RESOURCE_BUSY, errno EBUSY): pause the
+// workers first (Admin.PauseWorkers). An action's failure is the call's
+// error, with its errno in ErrorDetail.errno_value. The legacy service's
+// ModuleCommand also runs the commands that edit state, which no action
+// does; they leave with the legacy service.
+message InvokeActionRequest {
   uint64 daemon_epoch = 1;  // required (D-106)
   string module = 2;
-  string command = 3;
-  google.protobuf.Any arg = 4;  // the command's argument type
+  string action = 3;
+  google.protobuf.Any arg = 4;  // the action's argument type
 }
 
-message RunModuleCommandResponse {
-  google.protobuf.Any data = 1;  // the command's answer; unset when it has none
+message InvokeActionResponse {
+  google.protobuf.Any result = 1;  // the action's result type; unset when it has none
   uint64 daemon_epoch = 2;
 }
 
@@ -586,8 +672,7 @@ service Control {
   rpc WatchEvents(WatchEventsRequest) returns (stream Event) {}
   rpc ListTransactionResources(ListTransactionResourcesRequest)
       returns (ListTransactionResourcesResponse) {}
-  rpc RunModuleCommand(RunModuleCommandRequest)
-      returns (RunModuleCommandResponse) {}
+  rpc InvokeAction(InvokeActionRequest) returns (InvokeActionResponse) {}
 }
 
 // -- Administration (D-107) ----------------------------------------------

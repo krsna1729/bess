@@ -26,6 +26,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "framework/plugin.h"
@@ -71,13 +72,28 @@ std::expected<ResourceKey, std::string> IdKey(uint32_t id, const char *what) {
   return EncodeKey(Id(id));
 }
 
+// A host-order address as the codecs take it.
+std::string Dotted(uint32_t addr) { return bess::utils::ToIpv4Address(bess::utils::be32_t(addr)); }
+
+// Every live object of `table`, in id order (control side).
+template <typename Id, typename T, typename Fn>
+void ForEachLive(const bess::dataplane::SlotTable<Id, T> &table, Fn &&fn) {
+  for (size_t i = 1; i <= table.capacity(); i++) {
+    const Id id(static_cast<typename Id::rep_type>(i));
+    if (const T *object = table.Current(id); object != nullptr) {
+      fn(id, *object);
+    }
+  }
+}
+
 // The codecs of the five resources; the module binds them, the self test
-// decodes through them.
+// decodes through them. Each reads `app`'s committed entries back in the
+// form a client sends them (D-129).
 struct Codecs {
   std::shared_ptr<const ResourceCodec> qos, actions, rules, next_hops, routes;
 };
 
-Codecs MakeCodecs() {
+Codecs MakeCodecs(SessionApp &app) {
   namespace pb = session_appliance;
   Codecs c;
   c.qos = std::make_shared<TypedCodec<pb::QosKey, pb::QosValue>>(
@@ -89,6 +105,18 @@ Codecs MakeCodecs() {
           return std::unexpected(qos.error());
         }
         return std::any(std::move(*qos));
+      },
+      [&app](const auto &visit) {
+        ForEachLive(app.qos_table(), [&](QosId id, const QosPolicy &qos) {
+          pb::QosKey key;
+          key.set_id(id.value());
+          const auto &spec = std::get<bess::meter::SrTcmSpec>(qos.profile->spec());
+          pb::QosValue value;
+          value.set_committed_rate(spec.committed_rate);
+          value.set_committed_burst(spec.committed_burst);
+          value.set_excess_burst(spec.excess_burst);
+          visit(key, value);
+        });
       });
   c.actions = std::make_shared<TypedCodec<pb::ActionKey, pb::ActionValue>>(
       [](const pb::ActionKey &k) { return IdKey<ActionId>(k.id(), "action"); },
@@ -101,6 +129,18 @@ Codecs MakeCodecs() {
           return std::unexpected(enb.error());
         }
         return std::any(SessionAction{QosId(v.qos_id()), NextHopId(v.next_hop_id()), *enb, v.teid()});
+      },
+      [&app](const auto &visit) {
+        ForEachLive(app.action_table(), [&](ActionId id, const SessionAction &action) {
+          pb::ActionKey key;
+          key.set_id(id.value());
+          pb::ActionValue value;
+          value.set_qos_id(action.qos.value());
+          value.set_next_hop_id(action.next_hop.value());
+          value.set_enb(Dotted(action.enb));
+          value.set_teid(action.teid);
+          visit(key, value);
+        });
       });
   c.rules = std::make_shared<TypedCodec<pb::RuleKey, pb::RuleValue>>(
       [](const pb::RuleKey &k) { return IdKey<RuleId>(k.id(), "rule"); },
@@ -113,6 +153,16 @@ Codecs MakeCodecs() {
           return std::unexpected(ue.error());
         }
         return std::any(PdrLikeRule{*ue, ActionId(v.action_id())});
+      },
+      [&app](const auto &visit) {
+        ForEachLive(app.rule_table(), [&](RuleId id, const PdrLikeRule &rule) {
+          pb::RuleKey key;
+          key.set_id(id.value());
+          pb::RuleValue value;
+          value.set_ue(Dotted(rule.ue_ip));
+          value.set_action_id(rule.action.value());
+          visit(key, value);
+        });
       });
   // The router's resources, in BESS's own wire types. The egress gate is
   // this module's output gate; the application's interface is gate + 1.
@@ -139,6 +189,27 @@ Codecs MakeCodecs() {
             return std::unexpected("invalid neighbor state");
         }
         return std::any(hop);
+      },
+      // The neighbor state explicit (as the router module reads it back); this
+      // codec takes no MACs.
+      [&app](const auto &visit) {
+        app.router().ForEachNextHop([&visit](NextHopId id, const NextHop &hop) {
+          bess::pb::RouterNextHopIdKey key;
+          key.set_id(id.value());
+          bess::pb::RouterNextHopValue value;
+          value.set_egress_gate(hop.egress.value() - 1u);
+          switch (hop.neighbor) {
+            case bess::route::NeighborState::kResolved:
+              break;  // canonical: an unset neighbor means resolved (D-129)
+            case bess::route::NeighborState::kIncomplete:
+              value.set_neighbor(bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE);
+              break;
+            case bess::route::NeighborState::kUnreachable:
+              value.set_neighbor(bess::pb::ROUTER_NEIGHBOR_STATE_UNREACHABLE);
+              break;
+          }
+          visit(key, value);
+        });
       });
   c.routes = std::make_shared<TypedCodec<bess::pb::RouterRouteKey, bess::pb::RouterRouteValue>>(
       [](const bess::pb::RouterRouteKey &k) -> std::expected<ResourceKey, std::string> {
@@ -160,6 +231,17 @@ Codecs MakeCodecs() {
           return std::unexpected("next hop id 0 is invalid");
         }
         return std::any(NextHopId(v.next_hop_id()));
+      },
+      [&app](const auto &visit) {
+        app.router().ForEachRoute(
+            [&visit](const bess::route::RouteKey &id, NextHopId hop, bess::route::NextHopGroupId) {
+              bess::pb::RouterRouteKey key;
+              key.set_ipv4(Dotted(id.prefix.addr()));
+              key.set_prefix_length(id.prefix.length());
+              bess::pb::RouterRouteValue value;
+              value.set_next_hop_id(hop.value());
+              visit(key, value);
+            });
       });
   return c;
 }
@@ -200,6 +282,8 @@ class SessionAppliance final : public Module {
   static const gate_idx_t kNumIGates = 1;
   static const gate_idx_t kNumOGates = kOGates;
   static const Commands cmds;
+  // The five resources, all changed while workers run (D-129).
+  static const ResourceTables resource_tables;
 
   CommandResponse Init(const bess::pb::EmptyArg &) {
     auto made = SessionApp::Create(name(), init_context().rcu());
@@ -210,7 +294,7 @@ class SessionAppliance final : public Module {
       return CommandFailure(EINVAL, "%s", enrolled.error().c_str());
     }
     app_ = std::move(*made);
-    const Codecs c = MakeCodecs();
+    const Codecs c = MakeCodecs(*app_);
     bess::framework::ResourceBindings &codecs = init_context().codecs();
     qos_binding_ = codecs.Bind(app_->qos_resource(), c.qos);
     actions_binding_ = codecs.Bind(app_->action_resource(), c.actions);
@@ -278,7 +362,7 @@ class SessionAppliance final : public Module {
     using V = SessionApp::Verdict;
     namespace pb = session_appliance;
     constexpr uint32_t kUe = 0x0a2d0001, kEnb = 0xc0000264;  // 10.45.0.1, 192.0.2.100
-    const Codecs c = MakeCodecs();
+    const Codecs c = MakeCodecs(app);
 
     // One session's five operations, decoded as ApplyTransaction decodes them.
     bess::pb::RouterNextHopIdKey hop_key;
@@ -403,6 +487,14 @@ class SessionAppliance final : public Module {
 const Commands SessionAppliance::cmds = {
     {"self_test", "EmptyArg", MODULE_CMD_FUNC(&SessionAppliance::CommandSelfTest),
      Command::THREAD_UNSAFE},  // the private application is destroyed with workers paused
+};
+
+const ResourceTables SessionAppliance::resource_tables = {
+    ResourceTable::Map<session_appliance::QosKey, session_appliance::QosValue>("qos"),
+    ResourceTable::Map<session_appliance::ActionKey, session_appliance::ActionValue>("actions"),
+    ResourceTable::Map<session_appliance::RuleKey, session_appliance::RuleValue>("rules"),
+    ResourceTable::Map<bess::pb::RouterNextHopIdKey, bess::pb::RouterNextHopValue>("next_hops"),
+    ResourceTable::Map<bess::pb::RouterRouteKey, bess::pb::RouterRouteValue>("routes"),
 };
 
 BESS_PLUGIN_REQUIRES("session_appliance", "1.0.0", BESS_CAP_INIT_CONTEXT | BESS_CAP_RESOURCES);

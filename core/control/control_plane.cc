@@ -10,18 +10,25 @@
 #include <memory>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdarg>
+#include <iterator>
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "utils/logging.h"
 
+#include "control/pipeline_resources.h"
 #include "dataplane/transaction_engine.h"
 #include "framework/instance_registry.h"
 #include "framework/plugin_loader.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
+#include "stats/event_hub.h"
 #include "gate.h"
 #include "message.h"
 #include "module.h"
@@ -45,6 +52,51 @@ namespace {
 // the runtime/registry layer acquires its own result types (G0 commit 2).
 ControlError ErrorFromLegacy(int code, const std::string& message) {
   return ControlError{CodeFromErrno(code), code, message, "", ""};
+}
+
+// D-129: the RPC-reachable resources a new module registered are exactly
+// those its class declares, of the declared kind and types, so GetSchema and
+// desired-state validation tell the truth about every module of the class.
+ControlResult<void> CheckDeclaredResources(const ModuleBuilder& builder,
+                                           const std::string& module) {
+  const dataplane::TransactionEngine& engine = runtime::runtime().transactions();
+  const framework::ResourceBindings& bindings = framework::ResourceBindings::ProcessDefault();
+  auto refuse = [&](const std::string& what) -> ControlResult<void> {
+    ControlError error = Err(EINVAL, "module '%s' (class %s): %s", module.c_str(),
+                             builder.class_name().c_str(), what.c_str());
+    error.object = module;
+    return std::unexpected(error);
+  };
+  const std::string prefix = module + "/";
+  size_t found = 0;
+  for (const std::string& name : engine.ResourceNames()) {
+    if (!name.starts_with(prefix)) {
+      continue;
+    }
+    const dataplane::Resource* resource = engine.FindResource(name);
+    const framework::ResourceCodec* codec =
+        resource == nullptr ? nullptr : bindings.Find(*resource);
+    if (codec == nullptr) {
+      continue;  // not reachable over the RPC
+    }
+    const ResourceTable* table = builder.FindResourceTable(name.substr(prefix.size()));
+    if (table == nullptr) {
+      return refuse("registered resource '" + name + "', which its class does not declare");
+    }
+    const bool singleton = codec->kind() == framework::ResourceCodec::Kind::kSingleton;
+    if (singleton != (table->kind == ResourceTable::SINGLETON) ||
+        codec->key_type() != table->key_type || codec->value_type() != table->value_type ||
+        codec->requires_paused_workers() != table->requires_paused_workers) {
+      return refuse("resource '" + name + "' differs from its declaration (kind, " +
+                    codec->key_type() + " -> " + codec->value_type() + ", paused workers)");
+    }
+    found++;
+  }
+  if (found != builder.resource_tables().size()) {
+    return refuse("registered " + std::to_string(found) + " of its class's " +
+                  std::to_string(builder.resource_tables().size()) + " resource tables");
+  }
+  return {};
 }
 
 // Describes how a live traffic class is attached right now, so a refused move
@@ -310,7 +362,7 @@ ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConfLocked(const s
 
 ControlResult<bess::pb::CommandResponse> ControlPlane::RunModuleCommand(
     const std::string& module, const std::string& command,
-    const google::protobuf::Any& arg) {
+    const google::protobuf::Any& arg, ModuleBuilder::CommandSurface surface) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (module.empty()) {
     return std::unexpected(Err(EINVAL, "Missing module name field 'name'"));
@@ -321,7 +373,7 @@ ControlResult<bess::pb::CommandResponse> ControlPlane::RunModuleCommand(
   }
   // DPDK functions may be called, so be prepared.
   current_worker.SetNonWorker();
-  return m->RunCommand(command, arg);
+  return m->module_builder()->RunCommand(m, command, arg, surface);
 }
 
 ControlResult<void> ControlPlane::ResetPorts() {
@@ -411,10 +463,16 @@ ControlResult<std::string> ControlPlane::CreateModuleLocked(const ModuleSpec& sp
   if (!module) {
     return std::unexpected(ErrorFromLegacy(error.code(), error.errmsg()));
   }
-
   bess::event_modules[bess::Event::PreResume].insert(module);
 
-  return module->name();
+  std::string name = module->name();
+  if (auto declared = CheckDeclaredResources(builder, name); !declared) {
+    auto destroyed = DestroyModuleLocked(name);
+    CHECK(destroyed) << destroyed.error().message;
+    return std::unexpected(declared.error());
+  }
+
+  return name;
 }
 
 ControlResult<void> ControlPlane::DestroyModule(const std::string& name) {
@@ -1724,11 +1782,110 @@ ControlResult<void> ControlPlane::UnloadPlugin(const std::string& path) {
 // Composition
 // ---------------------------------------------------------------------------
 
+ControlResult<void> ControlPlane::DiffResourcesLocked(const PipelineSpec &desired,
+                                                      PipelineDiff *diff) const {
+  const dataplane::TransactionEngine &engine = runtime::runtime().transactions();
+  const framework::ResourceBindings &bindings = framework::ResourceBindings::ProcessDefault();
+  for (const ResourceSpec &resource : desired.resources) {
+    const std::string module = resource.name.substr(0, resource.name.rfind('/'));
+    const bool rebuilt = std::any_of(
+        diff->modules.begin(), diff->modules.end(), [&](const ModuleChange &change) {
+          return change.name == module && (change.kind == ChangeKind::kCreate ||
+                                           change.kind == ChangeKind::kReplace);
+        });
+    if (rebuilt) {
+      if (!resource.entries.empty()) {
+        diff->resources.push_back(
+            ResourceDelta{resource.name, resource.entries.size(), 0, 0, false});
+      }
+      continue;
+    }
+    auto converged = Converge(engine, bindings, resource, /*build_ops=*/false);
+    if (!converged) {
+      return std::unexpected(converged.error());
+    }
+    if (!converged->delta.empty()) {
+      diff->resources.push_back(std::move(converged->delta));
+    }
+  }
+  return {};
+}
+
+ControlResult<size_t> ControlPlane::ApplyResourcesLocked(
+    std::span<const ResourceSpec> resources) {
+  dataplane::TransactionEngine &engine = runtime::runtime().transactions();
+  const framework::ResourceBindings &bindings = framework::ResourceBindings::ProcessDefault();
+  std::vector<dataplane::Op> ops;
+  bool pause = false;
+  for (const ResourceSpec &resource : resources) {
+    auto converged = Converge(engine, bindings, resource, /*build_ops=*/true);
+    if (!converged) {
+      return std::unexpected(converged.error());
+    }
+    pause = pause || (converged->requires_paused_workers && !converged->ops.empty());
+    std::move(converged->ops.begin(), converged->ops.end(), std::back_inserter(ops));
+  }
+  if (ops.empty()) {
+    return size_t{0};
+  }
+  // A resource whose values workers read unsynchronized changes only with
+  // the workers paused (they may be paused for the commit already).
+  std::optional<WorkerPauser> pauser;
+  if (pause) {
+    pauser.emplace();
+  }
+  // BUSY: reclamation is behind the readers and nothing was attempted. Wait
+  // a few grace periods (each Apply reclaims what became ready first), as
+  // ApplyTransaction does, but under the lock: about 6 ms at most.
+  dataplane::TransactionEngine::Result result;
+  auto backoff = std::chrono::microseconds(200);
+  for (int retry = 0;; retry++) {
+    result = engine.Apply(ops);
+    if (result.outcome != dataplane::TransactionEngine::Outcome::kBusy || retry == 5) {
+      break;
+    }
+    std::this_thread::sleep_for(backoff);
+    backoff *= 2;
+  }
+  switch (result.outcome) {
+    case dataplane::TransactionEngine::Outcome::kApplied:
+      break;
+    case dataplane::TransactionEngine::Outcome::kBusy: {
+      ControlError error = Err(EBUSY, "resources: reclamation is behind the readers; retry");
+      error.code = ControlErrorCode::kResourceBusy;
+      error.field = "resources";
+      return std::unexpected(error);
+    }
+    default: {
+      for (size_t i = 0; i < result.ops.size(); i++) {
+        if (result.ops[i].status == dataplane::TransactionEngine::OpStatus::kFailed) {
+          ControlError error = Err(EINVAL, "resource '%s': %s", ops[i].resource.c_str(),
+                                   result.ops[i].error.c_str());
+          error.object = ops[i].resource;
+          error.field = "resources";
+          return std::unexpected(error);
+        }
+      }
+      ControlError error = Err(EINVAL, "resources: the transaction was refused");
+      error.field = "resources";
+      return std::unexpected(error);
+    }
+  }
+  runtime::runtime().events().Emit("bess.transaction", "control",
+                                   {{"request_id", ""},
+                                    {"origin", "pipeline"},
+                                    {"outcome", "applied"},
+                                    {"operations", std::to_string(ops.size())}},
+                                   result.generation);
+  return ops.size();
+}
+
 ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
     const PipelineSpec &desired, const ApplyOptions &options) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   const auto validation_start = std::chrono::steady_clock::now();
+  dataplane::TransactionEngine &engine = runtime::runtime().transactions();
 
   // 1. Validate. Pure, so a rejected spec cannot have touched anything.
   auto validated = bess::control::ValidatePipeline(runtime::runtime(), desired);
@@ -1749,6 +1906,17 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
     error.field = "expected_generation";
     return std::unexpected(error);
   }
+  if (options.expected_resource_generation.has_value() &&
+      *options.expected_resource_generation != engine.generation()) {
+    ControlError error =
+        Err(ESTALE, "expected resource generation %llu, active resource generation %llu",
+            static_cast<unsigned long long>(*options.expected_resource_generation),
+            static_cast<unsigned long long>(engine.generation()));
+    error.code = ControlErrorCode::kConflict;
+    error.object = "pipeline";
+    error.field = "expected_resource_generation";
+    return std::unexpected(error);
+  }
 
   // 3. Diff and plan. Nothing to do means no pause and no generation change.
   const uint64_t validation_us = static_cast<uint64_t>(
@@ -1759,9 +1927,15 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
   PipelineSnapshot before = SnapshotRuntime(runtime::runtime());
   PipelineDiff diff = Diff(before, validated->spec);
   if (diff.empty()) {
+    // The topology is in place: only resource contents may change (D-129).
+    auto converged = ApplyResourcesLocked(validated->spec.resources);
+    if (!converged) {
+      return std::unexpected(converged.error());
+    }
     ApplyTiming timing;
     timing.validation_us = validation_us;
-    return ApplyResult{runtime::runtime().generation(), 0, false, timing};
+    return ApplyResult{runtime::runtime().generation(), 0, false, timing, engine.generation(),
+                       *converged};
   }
   PipelinePlan plan = Plan(diff);
 
@@ -1779,6 +1953,14 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
   if (auto committed = transaction.Commit(); !committed) {
     transaction.Abort();
     return std::unexpected(committed.error());
+  }
+  // The listed resources exist now (a created module registered its own):
+  // converge them in one dataplane transaction, all or nothing. Refused, the
+  // topology goes back too -- nothing of the apply stays.
+  auto converged = ApplyResourcesLocked(validated->spec.resources);
+  if (!converged) {
+    transaction.Abort();
+    return std::unexpected(converged.error());
   }
 
   // Retirement is not undoable, so its preconditions were proven before the
@@ -1803,7 +1985,8 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
   timing.validation_us = validation_us;
 
   return ApplyResult{runtime::runtime().generation(), transaction.ops_executed(),
-                     transaction.quiescence() == Quiescence::kWorkers, timing};
+                     transaction.quiescence() == Quiescence::kWorkers, timing,
+                     engine.generation(), *converged};
 }
 
 ControlResult<ValidatedPipeline> ControlPlane::ValidatePipeline(
@@ -1819,20 +2002,30 @@ PipelineSnapshot ControlPlane::GetPipeline() const {
 
 ControlResult<PipelineDiff> ControlPlane::DiffPipeline(
     const PipelineSpec &desired) const {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  auto validated = bess::control::ValidatePipeline(runtime::runtime(), desired);
-  if (!validated) {
-    return std::unexpected(validated.error());
+  auto diff = DiffPipelineVersioned(desired);
+  if (!diff) {
+    return std::unexpected(diff.error());
   }
-
-  return Diff(SnapshotRuntime(runtime::runtime()), validated->spec);
+  return std::move(diff->value);
 }
 
-ControlPlane::Versioned<PipelineSnapshot> ControlPlane::GetPipelineVersioned()
-    const {
+ControlResult<ControlPlane::Versioned<ControlPlane::PipelineRead>> ControlPlane::ReadPipeline(
+    const ResourceQuery &query) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return {SnapshotRuntime(runtime::runtime()), runtime::runtime().generation()};
+  const dataplane::TransactionEngine &engine = runtime::runtime().transactions();
+  Versioned<PipelineRead> read;
+  read.value.snapshot = SnapshotRuntime(runtime::runtime());
+  read.generation = runtime::runtime().generation();
+  read.resource_generation = engine.generation();
+  if (query.include) {
+    auto resources = ReadResources(engine, framework::ResourceBindings::ProcessDefault(),
+                                   query.names);
+    if (!resources) {
+      return std::unexpected(resources.error());
+    }
+    read.value.resources = std::move(*resources);
+  }
+  return read;
 }
 
 ControlResult<ControlPlane::Versioned<PipelineDiff>>
@@ -1842,9 +2035,13 @@ ControlPlane::DiffPipelineVersioned(const PipelineSpec &desired) const {
   if (!validated) {
     return std::unexpected(validated.error());
   }
-  return Versioned<PipelineDiff>{
-      Diff(SnapshotRuntime(runtime::runtime()), validated->spec),
-      runtime::runtime().generation()};
+  Versioned<PipelineDiff> diff{Diff(SnapshotRuntime(runtime::runtime()), validated->spec),
+                               runtime::runtime().generation(),
+                               runtime::runtime().transactions().generation()};
+  if (auto resources = DiffResourcesLocked(validated->spec, &diff.value); !resources) {
+    return std::unexpected(resources.error());
+  }
+  return diff;
 }
 
 ControlResult<ControlPlane::Versioned<PipelinePlan>>
@@ -1853,7 +2050,8 @@ ControlPlane::PlanPipelineVersioned(const PipelineSpec &desired) const {
   if (!diff) {
     return std::unexpected(diff.error());
   }
-  return Versioned<PipelinePlan>{Plan(diff->value), diff->generation};
+  return Versioned<PipelinePlan>{Plan(diff->value), diff->generation,
+                                 diff->resource_generation};
 }
 
 ControlResult<PipelinePlan> ControlPlane::PlanPipeline(

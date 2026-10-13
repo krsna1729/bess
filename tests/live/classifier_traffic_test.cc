@@ -3,9 +3,9 @@
 // Modules on running workers (was the run_for / run_with_live_commands cases
 // of bessctl/module_tests/{iplookup,acl,hash_lb,bpf,url_filter,drr}.py, and
 // conntrack.py's PER_WORKER cases and worker_split.py): traffic flows while
-// commands change the module, the daemon survives, and the gate counters
-// (D-116) show where the packets went. What a module does to given packets
-// is tested in process (core/modules/*_test.cc).
+// transactions change the module's resources, the daemon survives, and the
+// gate counters (D-116) show where the packets went. What a module does to
+// given packets is tested in process (core/modules/*_test.cc).
 
 #include <sched.h>
 #include <sys/socket.h>
@@ -116,13 +116,34 @@ class ClassifierTrafficTest : public LiveTest {
     ASSERT_TRUE(applied) << applied.error().message;
   }
 
-  // A command that must succeed.
-  void Command(const std::string &module, const std::string &command, const std::string &type,
-               const std::string &json) {
-    auto arg = Arg(type, json);
-    ASSERT_NE(nullptr, arg);
-    auto done = client().RunModuleCommand(module, command, *arg);
-    EXPECT_TRUE(done) << module << "." << command << "(" << json << "): " << done.error().message;
+  // One transaction that must apply: the singleton `r` set to `json`.
+  void Set(const bess::sdk::Resource &r, const std::string &json) {
+    auto value = types_->Make(r.value_type, json);
+    auto tx = client().NewTransaction();
+    auto staged = tx.Set(r, *value);
+    EXPECT_TRUE(staged) << r.name << " = " << json << ": " << staged.error().message;
+    Commit(tx, r.name + " = " + json);
+  }
+  // One transaction that must apply: `key` -> `value` upserted into the map `r`.
+  void Upsert(const bess::sdk::Resource &r, const std::string &key, const std::string &value) {
+    auto k = types_->Make(r.key_type, key);
+    auto v = types_->Make(r.value_type, value);
+    auto tx = client().NewTransaction();
+    auto staged = tx.Upsert(r, *k, *v);
+    EXPECT_TRUE(staged) << r.name << " " << key << ": " << staged.error().message;
+    Commit(tx, "upsert " + r.name + " " + key + " " + value);
+  }
+  // One transaction that must apply: `key` erased from the map `r`.
+  void Erase(const bess::sdk::Resource &r, const std::string &key) {
+    auto k = types_->Make(r.key_type, key);
+    auto tx = client().NewTransaction();
+    auto staged = tx.Erase(r, *k);
+    EXPECT_TRUE(staged) << r.name << " " << key << ": " << staged.error().message;
+    Commit(tx, "erase " + r.name + " " + key);
+  }
+  void Commit(bess::sdk::Transaction &tx, const std::string &what) {
+    auto done = tx.Commit();
+    EXPECT_TRUE(done) << what << ": " << done.error().message;
   }
 
   // Packets that left `module` through output gate `gate` (nullopt: the
@@ -171,8 +192,8 @@ class ClassifierTrafficTest : public LiveTest {
     return b;
   }
 
-  // Workers resumed for `duration`, `command(i)` (i = 0, 1, ...) called in a
-  // loop meanwhile; then paused. The number of commands run.
+  // Workers resumed for `duration`, `command(i)` (i = 0, 1, ...: a
+  // transaction) called in a loop meanwhile; then paused. The number run.
   int RunWhileForwarding(std::chrono::milliseconds duration,
                          const std::function<void(int)> &command = {}) {
     auto resumed = client().ResumeWorkers();
@@ -196,58 +217,67 @@ class ClassifierTrafficTest : public LiveTest {
   std::unique_ptr<gp::Message> random_;
 };
 
-// -- commands while a worker forwards (run_with_live_commands) ---------------
+// -- transactions while a worker forwards (run_with_live_commands) -----------
 
 // Routes change while a worker forwards traffic (K7, mode C).
 TEST_F(ClassifierTrafficTest, IpLookupRoutesChangeWhileForwarding) {
-  Apply(Traffic("ipl", "IPLookup", nullptr, {0, 1}));
-  Command("ipl", "add", "IPLookupCommandAddArg", R"({"prefix": "0.0.0.0", "prefix_len": 0, "gate": 0})");
+  Apply(Traffic("ipl", "IPLookup", nullptr, {0, 1})
+            .Entry("ipl/routes", *Arg("IPLookupRouteKey", R"({"prefix": "0.0.0.0"})"),
+                   *Arg("IPLookupRouteValue", R"({"gate": 0})")));
+  auto routes = client().Resource("ipl/routes");
+  ASSERT_TRUE(routes) << routes.error().message;
   const int commands = RunWhileForwarding(milliseconds(2000), [&](int i) {
     const std::string prefix =
         std::to_string(1 + (i / 2) % 200) + "." + std::to_string((i / 400) % 256) + ".0.0";
+    const std::string key = R"({"prefix": ")" + prefix + R"(", "prefix_len": 16})";
     if (i % 2 == 0) {
-      Command("ipl", "add", "IPLookupCommandAddArg",
-              R"({"prefix": ")" + prefix + R"(", "prefix_len": 16, "gate": 1})");
+      Upsert(*routes, key, R"({"gate": 1})");
     } else {
-      Command("ipl", "delete", "IPLookupCommandDeleteArg",
-              R"({"prefix": ")" + prefix + R"(", "prefix_len": 16})");
+      Erase(*routes, key);
     }
   });
-  EXPECT_GT(commands, 10) << "too few commands ran";
+  EXPECT_GT(commands, 10) << "too few transactions ran";
   EXPECT_GT(Packets("ipl", 0) + Packets("ipl", 1), 0);
 }
 
-// Rules are added and cleared while a worker forwards traffic (mode G).
+// Rules are added and cleared while a worker forwards traffic (mode G): each
+// transaction sets the whole rule list.
 TEST_F(ClassifierTrafficTest, AclRulesChangeWhileForwarding) {
-  auto arg = Arg("ACLArg", R"({"rules": [{"src_ip": "0.0.0.0/0", "drop": false}]})");
+  const std::string pass_all = R"({"src_ip": "0.0.0.0/0", "drop": false})";
+  auto arg = Arg("ACLArg", R"({"rules": [)" + pass_all + "]}");
   Apply(Traffic("acl", "ACL", arg.get(), {0}));
+  auto rules = client().Resource("acl/rules");
+  ASSERT_TRUE(rules) << rules.error().message;
+  std::string list = pass_all;
   const int commands = RunWhileForwarding(milliseconds(2000), [&](int i) {
     if (i % 10 == 9) {
-      Command("acl", "clear", "EmptyArg", "{}");
-      Command("acl", "add", "ACLArg", R"({"rules": [{"src_ip": "0.0.0.0/0", "drop": false}]})");
+      list = pass_all;
     } else {
-      Command("acl", "add", "ACLArg",
-              R"({"rules": [{"dst_port": )" + std::to_string(1000 + i) + R"(, "drop": true}]})");
+      list += R"(, {"dst_port": )" + std::to_string(1000 + i) + R"(, "drop": true})";
     }
+    Set(*rules, R"({"rules": [)" + list + "]}");
   });
-  EXPECT_GT(commands, 10) << "too few commands ran";
+  EXPECT_GT(commands, 10) << "too few transactions ran";
   EXPECT_GT(Packets("acl", 0), 0);
 }
 
-// Gates and mode change while a worker forwards traffic (mode G).
+// Gates and mode change while a worker forwards traffic (mode G): each
+// transaction sets both, one of them changed.
 TEST_F(ClassifierTrafficTest, HashLbGatesAndModeChangeWhileForwarding) {
   auto arg = Arg("HashLBArg", R"({"gates": [0, 1]})");
   Apply(Traffic("lb", "HashLB", arg.get(), {0, 1, 2, 3}));
+  auto settings = client().Resource("lb/settings");
+  ASSERT_TRUE(settings) << settings.error().message;
+  std::string gates = "[0, 1]", mode = "l4";
   const int commands = RunWhileForwarding(milliseconds(2000), [&](int i) {
     if (i % 2 == 0) {
-      Command("lb", "set_gates", "HashLBCommandSetGatesArg",
-              (i / 2) % 2 == 0 ? R"({"gates": [0, 1]})" : R"({"gates": [1, 2, 3]})");
+      gates = (i / 2) % 2 == 0 ? "[0, 1]" : "[1, 2, 3]";
     } else {
-      Command("lb", "set_mode", "HashLBCommandSetModeArg",
-              (i / 2) % 2 == 0 ? R"({"mode": "l3"})" : R"({"mode": "l4"})");
+      mode = (i / 2) % 2 == 0 ? "l3" : "l4";
     }
+    Set(*settings, R"({"mode": ")" + mode + R"(", "gates": )" + gates + "}");
   });
-  EXPECT_GT(commands, 10) << "too few commands ran";
+  EXPECT_GT(commands, 10) << "too few transactions ran";
   double total = 0;
   for (int g = 0; g < 4; g++) {
     total += Packets("lb", g);
@@ -260,9 +290,10 @@ TEST_F(ClassifierTrafficTest, HashLbGatesAndModeChangeWhileForwarding) {
 // Every packet leaves BPF on some gate (unmatched ones on gate 0): what
 // RandomUpdate sent is what BPF's gates forwarded.
 TEST_F(ClassifierTrafficTest, BpfSingleFilterOnAWorker) {
-  Apply(Traffic("bpf", "BPF", nullptr, {0, 1}));
-  Command("bpf", "add", "BPFArg",
-          R"({"filters": [{"priority": 0, "filter": "tcp src port 92", "gate": 1}]})");
+  Apply(Traffic("bpf", "BPF", nullptr, {0, 1})
+            .Setting("bpf/filters",
+                     *Arg("BPFArg", R"({"filters": [{"priority": 0, "filter": "tcp src port 92",
+                                                     "gate": 1}]})")));
   RunWhileForwarding(milliseconds(1000));
   const double sent = Packets("rnd", 0);
   EXPECT_GT(sent, 0);
@@ -272,12 +303,13 @@ TEST_F(ClassifierTrafficTest, BpfSingleFilterOnAWorker) {
 TEST_F(ClassifierTrafficTest, BpfFiveFiltersOnAWorker) {
   const char *filters[] = {"tcp src port 92", "len <= 1000", "ether proto 0x800",
                            "ip proto 47 or ip6 proto 47", "ip host 22.22.22.22"};
-  Apply(Traffic("bpf", "BPF", nullptr, {0, 1, 2, 3, 4}));
+  std::string list;
   for (int i = 0; i < 5; i++) {
-    Command("bpf", "add", "BPFArg",
-            R"({"filters": [{"priority": )" + std::to_string(i) + R"(, "filter": ")" +
-                filters[i] + R"(", "gate": )" + std::to_string(i) + "}]}");
+    list += std::string(i ? ", " : "") + R"({"priority": )" + std::to_string(i) +
+            R"(, "filter": ")" + filters[i] + R"(", "gate": )" + std::to_string(i) + "}";
   }
+  Apply(Traffic("bpf", "BPF", nullptr, {0, 1, 2, 3, 4})
+            .Setting("bpf/filters", *Arg("BPFArg", R"({"filters": [)" + list + "]}")));
   RunWhileForwarding(milliseconds(1000));
   const double sent = Packets("rnd", 0);
   EXPECT_GT(sent, 0);
@@ -294,10 +326,11 @@ TEST_F(ClassifierTrafficTest, BpfFiveFiltersOnAWorker) {
 // Random traffic is not HTTP to a blacklisted host: all of it passes on
 // gate 0, nothing is answered on gate 1.
 TEST_F(ClassifierTrafficTest, UrlFilterOnAWorker) {
-  Apply(Traffic("uf", "UrlFilter", nullptr, {0, 1}));
-  Command("uf", "add", "UrlFilterArg",
-          R"({"blacklist": [{"host": "www.foo.com", "path": "/foo"},
-                            {"host": "www.bar.com", "path": "/bar"}]})");
+  Apply(Traffic("uf", "UrlFilter", nullptr, {0, 1})
+            .Setting("uf/blacklist",
+                     *Arg("UrlFilterConfig",
+                          R"({"blacklist": [{"host": "www.foo.com", "path": "/foo"},
+                                            {"host": "www.bar.com", "path": "/bar"}]})")));
   RunWhileForwarding(milliseconds(1000));
   const double sent = Packets("rnd", 0);
   EXPECT_GT(sent, 0);
@@ -314,11 +347,11 @@ TEST_F(ClassifierTrafficTest, DrrOnAWorker) {
 }
 
 // Producers on two workers and the DRR task on a third, rate-limited so flow
-// queues fill and grow, with live commands throughout. Before D-019 the
-// producers created, resized and freed flow queues that the task was
+// queues fill and grow, with settings transactions throughout. Before D-019
+// the producers created, resized and freed flow queues that the task was
 // dequeuing from; a stress test cannot prove the race is gone (D-007), but
-// it did crash the old code, and it checks that live commands no longer
-// need a pause.
+// it did crash the old code, and it checks that the settings (which do not
+// require paused workers) apply without a pause.
 TEST_F(ClassifierTrafficTest, DrrAcrossWorkersWithLiveCommands) {
   const auto cores = AllowedCores();
   if (cores.size() < 3) {
@@ -345,13 +378,13 @@ TEST_F(ClassifierTrafficTest, DrrAcrossWorkersWithLiveCommands) {
         .Task(OnWorker(src, wid));
   }
   Apply(b);
+  auto settings = client().Resource("drr/settings");
+  ASSERT_TRUE(settings) << settings.error().message;
   const int commands = RunWhileForwarding(milliseconds(3000), [&](int i) {
-    Command("drr", "set_quantum_size", "DRRQuantumArg",
-            R"({"quantum": )" + std::to_string(1000 + i % 1000) + "}");
-    Command("drr", "set_max_flow_queue_size", "DRRMaxFlowQueueSizeArg",
-            R"({"max_queue_size": )" + std::to_string(4096 + i % 4096) + "}");
+    Set(*settings, R"({"quantum": )" + std::to_string(1000 + i % 1000) +
+                       R"(, "max_flow_queue_size": )" + std::to_string(4096 + i % 4096) + "}");
   });
-  EXPECT_GT(commands, 10) << "too few commands ran";
+  EXPECT_GT(commands, 10) << "too few transactions ran";
   EXPECT_GT(Packets("drr", 0), 0);
 }
 

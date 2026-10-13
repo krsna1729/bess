@@ -171,16 +171,61 @@ When BESS dynamically loads the shared library (`dlopen`), the static constructo
 ### Argument types and schema discovery
 
 `GetSchema` (D-105) tells generic clients (the C++ bessctl, manifests, a UI)
-which protobuf type each class's `Init` and each command takes. `ADD_MODULE`
-and `ADD_DRIVER` record `Init`'s parameter type themselves. A command's type is
-the `arg_type` string in `cmds`, which the daemon resolves as a full name
-(`myplugin.pb.SetArg`), else in the package of the class's `Init` type, else in
-`bess.pb`. A plugin whose `Init` takes `bess::pb::EmptyArg` and whose commands
-take its own messages must therefore either give `Init` its own package's type
-or declare those commands' types by full name; otherwise `GetSchema` reports
-`""` and generic clients cannot build the command's argument. (The legacy
-Python bessctl looks short names up in the plugin's module and cannot run a
-command declared by full name.)
+which protobuf type each class's `Init` and each action takes and answers.
+`ADD_MODULE` and `ADD_DRIVER` record `Init`'s parameter type themselves. An
+action's types are the `arg_type` and `result_type` strings in `cmds`, which
+the daemon resolves as a full name (`myplugin.pb.SetArg`), else in the package
+of the class's `Init` type, else in `bess.pb`. A plugin whose `Init` takes
+`bess::pb::EmptyArg` and whose actions take its own messages must therefore
+either give `Init` its own package's type or declare those types by full
+name; otherwise `GetSchema` reports `""` and generic clients cannot build the
+action's argument. (The legacy Python bessctl looks short names up in the
+plugin's module and cannot run a command declared by full name.)
+
+### Resources and actions (D-129)
+
+A module's state is its init argument plus its **resources**; everything else
+a client can do to it is an **action**.
+
+- **Resources** are tables (a map from a key message to a value message) and
+  singletons (one value: run-time settings). A class declares them, and the
+  daemon refuses to create a module whose registered, codec-bound resources
+  named `<module>/<table>` differ from the declaration (kind, key and value
+  types, whether workers must be paused):
+
+  ```cpp
+  class MyModule final : public Module {
+   public:
+    static const Commands cmds;
+    static const ResourceTables resource_tables;
+    ...
+  };
+  const ResourceTables MyModule::resource_tables = {
+      ResourceTable::Map<my::RuleKey, my::RuleValue>("rules"),
+      ResourceTable::Singleton<my::Settings>("settings", /*requires_paused_workers=*/true),
+  };
+  ```
+
+  `GetSchema` lists them; transactions (`ApplyTransaction`) and desired state
+  (`Pipeline.resources`, below) change them.
+- **Actions** are the `cmds` entries with the default exposure
+  (`Command::ACTION`): verbs that are not state (a lookup, a flush, a
+  counter read). `InvokeAction` runs them and `GetSchema` lists them, with
+  `result_type` naming the message an action puts in its answer (empty: it
+  answers nothing).
+- A command that edits state a resource holds (an `add` to a table, a
+  `set_*`, `get_initial_arg`) is `Command::LEGACY_ONLY`: the legacy
+  `ModuleCommand` RPC (pybess, `.bess` scripts) still runs it; control_v2
+  neither lists nor runs it (`ENOTSUP`).
+
+  ```cpp
+  const Commands MyModule::cmds = {
+      {"add", "MyAddArg", MODULE_CMD_FUNC(&MyModule::CommandAdd), Command::THREAD_UNSAFE, "",
+       Command::LEGACY_ONLY},
+      {"stats", "EmptyArg", MODULE_CMD_FUNC(&MyModule::CommandStats), Command::THREAD_SAFE,
+       "MyStatsResponse"},
+  };
+  ```
 
 ### Plugin descriptor (`framework/plugin.h`)
 
@@ -281,13 +326,28 @@ enforces that.
 
 A dataplane resource knows nothing about encoding (D-044). To make one
 reachable over the control API, the module that registers it binds a codec:
-the protobuf key and value messages of the resource and two functions that
+the protobuf key and value messages of the resource, two functions that
 convert them to the resource's key bytes and value (`std::any` of the
-resource's value type). `framework::TypedCodec<KeyMsg, ValueMsg>`
-(`framework/resource_codec.h`) builds one from the two functions; a decode
+resource's value type), and a third that reads the committed entries back as
+messages. `framework::TypedCodec<KeyMsg, ValueMsg>`
+(`framework/resource_codec.h`) builds one from the three functions; a decode
 error is an `std::unexpected` string, reported as the operation's error.
 `Bind()` returns a `ResourceBinding`: keep it as a member declared after the
 resource and reset it before the resource is released.
+
+The read-back (`GetPipeline` with resources, D-129) visits every committed
+entry, under the control-plane lock, from the module's control-side view.
+It must give each entry in **canonical form**: the message a client upserts
+reads back byte-identical under deterministic serialization (defaults
+omitted, one spelling per value: lower-case MAC addresses, the network
+address of a prefix). Otherwise desired state that came from a read applies
+back as an update, every time.
+
+An optional fourth argument, a predicate that is true while a worker runs
+the module (`[this] { return HasRunningWorker(); }`), marks a resource whose
+values workers read unsynchronized: `ApplyTransaction` refuses it
+(`RESOURCE_BUSY`) while a worker runs, and `ApplyPipeline` pauses the
+workers for it.
 
 ```cpp
 #include "framework/resource_bindings.h"
@@ -295,15 +355,56 @@ resource and reset it before the resource is released.
 #include "my_wire.pb.h"  // the plugin's own messages, compiled with protoc
 
 // Init(), after init_context().resources().Register(&rules_):
+using Codec = bess::framework::TypedCodec<my::RuleKey, my::RuleValue>;
 binding_ = init_context().codecs().Bind(
-    rules_, std::make_shared<bess::framework::TypedCodec<my::RuleKey, my::RuleValue>>(
+    rules_, std::make_shared<Codec>(
                 [](const my::RuleKey &k) -> std::expected<bess::dataplane::ResourceKey, std::string> {
                   if (k.id() == 0) return std::unexpected("rule id 0 is invalid");
                   return bess::dataplane::EncodeKey(RuleId(k.id()));
                 },
                 [](const my::RuleValue &v) -> std::expected<std::any, std::string> {
                   return std::any(Rule{v.ue(), ActionId(v.action_id())});
+                },
+                [this](const Codec::TypedVisitor &visit) {
+                  for (const auto &[id, rule] : committed_) {
+                    my::RuleKey k;
+                    k.set_id(id);
+                    my::RuleValue v;
+                    v.set_ue(rule.ue);
+                    v.set_action_id(rule.action);
+                    visit(k, v);
+                  }
                 }));
+```
+
+**Singletons** (`framework/singleton_resource.h`, experimental): a
+`framework::Singleton<ValueMsg, Staged>` member registers the resource and its
+codec together. `stage` validates a value and builds everything it needs
+(it may allocate; its error refuses the transaction); `apply` publishes the
+staged value and must neither fail nor allocate; `read` returns the current
+value in canonical form. A singleton has no key (or `google.protobuf.Empty`)
+and cannot be erased. With no worker predicate `apply` runs while workers
+run, so what it writes must be safe for them (relaxed atomics, or an
+RCU-published object: the `Register` overload whose `apply` also takes the
+`dataplane::Retirer` retires the replaced object, within the
+`Resource::Footprint` it declares). `Release()` (also on destruction) undoes
+the registration; call it in `DeInit`.
+
+```cpp
+// Init():
+auto registered = settings_.Register(
+    init_context().resources(), init_context().codecs(), name() + "/settings",
+    [](const my::Settings &s) -> std::expected<uint32_t, std::string> {
+      if (s.burst() > 32) return std::unexpected("burst must be [0,32]");
+      return s.burst();
+    },
+    [this](uint32_t &burst) { burst_.store(burst, std::memory_order_relaxed); },
+    [this] {
+      my::Settings s;
+      s.set_burst(burst_.load(std::memory_order_relaxed));
+      return s;
+    },
+    nullptr);
 ```
 
 A plugin with its own messages links the generated code and `protobuf`

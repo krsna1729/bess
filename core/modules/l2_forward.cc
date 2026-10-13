@@ -2,7 +2,10 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
+#include <cstdio>
 #include <cstring>
+#include <format>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -26,6 +29,14 @@ uint64_t MacKey(const char *addr) {
   return mac << 16;
 }
 
+// A table key word as a client spells the MAC: lower-case hex, two digits a
+// byte, colon-separated ("aa:bb:cc:dd:ee:ff"; parse_mac_addr reads it back).
+std::string MacString(uint64_t key) {
+  const uint64_t mac = key >> 16;
+  return std::format("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", mac & 0xff, mac >> 8 & 0xff,
+                     mac >> 16 & 0xff, mac >> 24 & 0xff, mac >> 32 & 0xff, mac >> 40 & 0xff);
+}
+
 }  // namespace
 
 static int parse_mac_addr(const char *str, char *addr) {
@@ -43,17 +54,28 @@ static int parse_mac_addr(const char *str, char *addr) {
 
 /******************************************************************************/
 
+// LEGACY_ONLY (D-129): the entries are the "<name>/macs" resource and the
+// default gate the "<name>/settings" singleton. lookup answers; populate is a
+// test/bench generator.
 const Commands L2Forward::cmds = {
     {"add", "L2ForwardCommandAddArg", MODULE_CMD_FUNC(&L2Forward::CommandAdd),
-     Command::THREAD_SAFE},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
     {"delete", "L2ForwardCommandDeleteArg",
-     MODULE_CMD_FUNC(&L2Forward::CommandDelete), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&L2Forward::CommandDelete), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"set_default_gate", "L2ForwardCommandSetDefaultGateArg",
-     MODULE_CMD_FUNC(&L2Forward::CommandSetDefaultGate), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&L2Forward::CommandSetDefaultGate), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"lookup", "L2ForwardCommandLookupArg",
-     MODULE_CMD_FUNC(&L2Forward::CommandLookup), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&L2Forward::CommandLookup), Command::THREAD_SAFE,
+     "L2ForwardCommandLookupResponse"},
     {"populate", "L2ForwardCommandPopulateArg",
      MODULE_CMD_FUNC(&L2Forward::CommandPopulate), Command::THREAD_SAFE},
+};
+
+const ResourceTables L2Forward::resource_tables = {
+    ResourceTable::Map<bess::pb::L2ForwardMacKey, bess::pb::L2ForwardMacValue>("macs"),
+    ResourceTable::Singleton<bess::pb::L2ForwardSettings>("settings"),
 };
 
 CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
@@ -121,6 +143,17 @@ CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
               return std::unexpected("invalid gate " + std::to_string(value.gate()));
             }
             return std::any(static_cast<uint16_t>(value.gate() + 1));
+          },
+          // The control thread is the table's only writer, so reading it
+          // here (under the control-plane lock) races nothing.
+          [this](const auto &visit) {
+            table_->ForEach([this, &visit](uint32_t slot) {
+              bess::pb::L2ForwardMacKey key;
+              key.set_addr(MacString(table_->key(slot)));
+              bess::pb::L2ForwardMacValue value;
+              value.set_gate(table_->value(slot) - 1);
+              visit(key, value);
+            });
           }));
   if (auto registered = init_context().resources().Register(resource_.get());
       !registered) {
@@ -128,10 +161,34 @@ CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
     resource_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
+
+  // "<name>/settings": what set_default_gate sets. An atomic store, so
+  // workers keep running.
+  if (auto registered = settings_.Register(
+          init_context().resources(), init_context().codecs(), name() + "/settings",
+          [](const bess::pb::L2ForwardSettings &value)
+              -> std::expected<gate_idx_t, std::string> {
+            if (!bess::IsValidGateValue(value.default_gate())) {
+              return std::unexpected("invalid default_gate " +
+                                     std::to_string(value.default_gate()));
+            }
+            return static_cast<gate_idx_t>(value.default_gate());
+          },
+          [this](gate_idx_t &gate) { default_gate_.store(gate, std::memory_order_relaxed); },
+          [this] {
+            bess::pb::L2ForwardSettings value;
+            value.set_default_gate(default_gate_.load(std::memory_order_relaxed));
+            return value;
+          },
+          nullptr);
+      !registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
   return CommandSuccess();
 }
 
 void L2Forward::DeInit() {
+  settings_.Release();
   if (resource_ != nullptr) {
     // Cannot be refused: the entries reference nothing and nothing references
     // them, and this runs under the control-plane lock transactions take.

@@ -7,8 +7,10 @@
 
 #include <pcap.h>
 
+#include <utility>
 #include <vector>
 
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "utils/bpf.h"
@@ -18,6 +20,7 @@ class BPF final : public Module {
   static const gate_idx_t kNumOGates = MAX_GATES;
 
   static const Commands cmds;
+  static const ResourceTables resource_tables;
 
   BPF() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 
@@ -32,11 +35,42 @@ class BPF final : public Module {
   CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
 
  private:
+  // Compiled filters this object owns: its destructor frees their code.
+  struct OwnedFilters {
+    std::vector<bess::utils::Filter> filters;
+
+    OwnedFilters() = default;
+    OwnedFilters(OwnedFilters &&other) noexcept
+        : filters(std::move(other.filters)) {
+      other.filters.clear();
+    }
+    OwnedFilters &operator=(OwnedFilters &&) = delete;
+    ~OwnedFilters() { FreeFilters(&filters); }
+  };
+
+  // A "<name>/filters" value, compiled: the filters in priority order and
+  // the BPFArg they came from (read back as given).
+  struct Staged {
+    OwnedFilters compiled;
+    bess::pb::BPFArg arg;
+  };
+
   static bool Match(const bess::utils::Filter &, u_char *, u_int, u_int);
+  // Compiles `f` into `*out` (the code is `*out`'s to free).
+  static CommandResponse Compile(const bess::pb::BPFArg::Filter &f,
+                                 bess::utils::Filter *out);
+  // Frees the code of every filter of `*filters` and empties it.
+  static void FreeFilters(std::vector<bess::utils::Filter> *filters);
 
   void ProcessBatch1Filter(Context *ctx, bess::PacketBatch *batch);
 
   std::vector<bess::utils::Filter> filters_;
+  // The filters as given, in order (control side): "<name>/filters" reads
+  // it back. The legacy commands keep it in step with filters_.
+  bess::pb::BPFArg arg_;
+  // "<name>/filters" (D-129): the whole filter list; setting it replaces the
+  // list. Paused workers: ProcessBatch reads filters_ in place.
+  bess::framework::Singleton<bess::pb::BPFArg, Staged> filters_resource_;
 };
 
 #endif  // BESS_MODULES_BPF_H_

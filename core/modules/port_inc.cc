@@ -4,14 +4,36 @@
 
 #include "port_inc.h"
 
+#include <expected>
+#include <string>
+
 #include "utils/format.h"
 
+namespace {
+
+// set_burst's refusal ("" when `burst` is valid).
+std::string BurstError(uint64_t burst) {
+  if (burst > bess::PacketBatch::kMaxBurst) {
+    return bess::utils::Format("burst size must be [0,%zu]",
+                               bess::PacketBatch::kMaxBurst);
+  }
+  return "";
+}
+
+}  // namespace
+
+// set_burst edits what "settings" holds, and GetPipeline's Module.arg
+// replaces get_initial_arg: legacy only (D-129).
 const Commands PortInc::cmds = {
     {"set_burst", "PortIncCommandSetBurstArg",
-     MODULE_CMD_FUNC(&PortInc::CommandSetBurst), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&PortInc::CommandSetBurst), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&PortInc::GetInitialArg),
-     Command::THREAD_SAFE},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
 };
+
+const ResourceTables PortInc::resource_tables = {
+    ResourceTable::Singleton<bess::pb::PortIncSettings>("settings")};
 
 CommandResponse PortInc::Init(const bess::pb::PortIncArg &arg) {
   const char *port_name;
@@ -58,6 +80,26 @@ CommandResponse PortInc::Init(const bess::pb::PortIncArg &arg) {
     return CommandFailure(-ret);
   }
 
+  // Applied live: the burst is a relaxed atomic each task run reads once.
+  auto registered = settings_.Register(
+      init_context().resources(), init_context().codecs(), name() + "/settings",
+      [](const bess::pb::PortIncSettings &v) -> std::expected<int, std::string> {
+        if (std::string err = BurstError(v.burst()); !err.empty()) {
+          return std::unexpected(std::move(err));
+        }
+        return static_cast<int>(v.burst());
+      },
+      [this](int &burst) { burst_.store(burst, std::memory_order_relaxed); },
+      [this] {
+        bess::pb::PortIncSettings v;
+        v.set_burst(burst_.load(std::memory_order_relaxed));
+        return v;
+      },
+      nullptr);
+  if (!registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
+
   return CommandSuccess();
 }
 
@@ -69,6 +111,7 @@ CommandResponse PortInc::GetInitialArg(const bess::pb::EmptyArg &) {
 }
 
 void PortInc::DeInit() {
+  settings_.Release();
   if (port_) {
     port_->ReleaseQueues(reinterpret_cast<const module *>(this), PACKET_DIR_INC,
                          nullptr, 0);
@@ -137,9 +180,8 @@ CommandResponse PortInc::CommandSetBurst(
     const bess::pb::PortIncCommandSetBurstArg &arg) {
   uint64_t burst = arg.burst();
 
-  if (burst > bess::PacketBatch::kMaxBurst) {
-    return CommandFailure(EINVAL, "burst size must be [0,%zu]",
-                          bess::PacketBatch::kMaxBurst);
+  if (std::string err = BurstError(burst); !err.empty()) {
+    return CommandFailure(EINVAL, "%s", err.c_str());
   }
 
   burst_.store(burst, std::memory_order_relaxed);

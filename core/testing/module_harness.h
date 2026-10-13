@@ -73,12 +73,39 @@ class ModuleHarness {
                                                        const std::vector<Bytes> &in, Module *last,
                                                        std::vector<gate_idx_t> ogates = {});
 
-  // A command, as RunModuleCommand runs it.
+  // A command, as the legacy ModuleCommand runs it (every command).
   CommandResponse Command(Module *m, const std::string &command,
                           const google::protobuf::Message &arg);
   // Fails the test unless the command succeeds; returns its answer.
   google::protobuf::Any MustCommand(Module *m, const std::string &command,
                                     const google::protobuf::Message &arg);
+  // An action, as control_v2's InvokeAction runs it (D-129: a legacy-only
+  // command is refused with ENOTSUP).
+  CommandResponse Action(Module *m, const std::string &action,
+                         const google::protobuf::Message &arg);
+
+  // Resource operations as a client sends them (D-129): decoded through the
+  // resource's codec and applied by the process's transaction engine, each
+  // call one transaction. "" when it applied, else why not (a codec's or a
+  // resource's refusal, "busy: ..." while a worker runs a module whose
+  // resource requires paused workers).
+  std::string SetResource(const std::string &resource, const google::protobuf::Message &value);
+  std::string UpsertResource(const std::string &resource, const google::protobuf::Message &key,
+                             const google::protobuf::Message &value);
+  std::string EraseResource(const std::string &resource, const google::protobuf::Message &key);
+  // The resource's contents as its codec reads them back (desired state's
+  // GetPipeline): (key, value) packed; a singleton's key is a
+  // google.protobuf.Empty. Fails the test for an unknown resource.
+  std::vector<std::pair<google::protobuf::Any, google::protobuf::Any>> ReadResource(
+      const std::string &resource);
+  // "" when the resource holds exactly `entries` as desired state compares
+  // them (keys by the codec's decoding, values by deterministic bytes), so a
+  // manifest listing them applies as a no-op (D-129's round trip); else the
+  // first difference. A singleton's one entry has a null key.
+  std::string ReadBackDiffers(
+      const std::string &resource,
+      const std::vector<std::pair<const google::protobuf::Message *,
+                                  const google::protobuf::Message *>> &entries);
 
  private:
   // Connects exactly `m`'s gates `ogates` to the capture (all of 0-15 that

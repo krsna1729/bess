@@ -3,14 +3,22 @@
 // UrlFilter in process (was bessctl/module_tests/url_filter.py): an HTTP
 // request for a blacklisted host is dropped and answered with a RST to the
 // server (gate 0) and a 403 and a RST to the client (gate 1); other
-// requests pass. The runtime configuration comes back sorted.
+// requests pass. The runtime configuration comes back sorted. D-129:
+// "<name>/blacklist" holds the whole blacklist, and the commands are
+// legacy-only.
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <cstring>
+#include <string>
 #include <vector>
 
+#include "dataplane/transaction_engine.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
 #include "pb/module_msg.pb.h"
+#include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
 
@@ -113,6 +121,104 @@ TEST(UrlFilterTest, RuntimeConfigIsSortedByHostThenPath) {
   EXPECT_EQ("/a", config.blacklist(1).path());
   EXPECT_EQ("www.bluelisted.com", config.blacklist(2).host());
   EXPECT_EQ("/b", config.blacklist(2).path());
+}
+
+// Whether the codec bound to `resource` requires paused workers.
+bool RequiresPausedWorkers(const std::string &resource) {
+  const bess::dataplane::Resource *r =
+      bess::runtime::runtime().transactions().FindResource(resource);
+  EXPECT_NE(nullptr, r) << resource;
+  if (r == nullptr) {
+    return false;
+  }
+  const bess::framework::ResourceCodec *codec =
+      bess::framework::ResourceBindings::ProcessDefault().Find(*r);
+  EXPECT_NE(nullptr, codec) << resource;
+  return codec != nullptr && codec->requires_paused_workers();
+}
+
+bess::pb::UrlFilterConfig Blacklist(
+    std::initializer_list<std::pair<const char *, const char *>> urls) {
+  bess::pb::UrlFilterConfig config;
+  for (const auto &[host, path] : urls) {
+    auto *url = config.add_blacklist();
+    url->set_host(host);
+    url->set_path(path);
+  }
+  return config;
+}
+
+// Whether a request for `host` from `client_ip` (a new flow) is refused:
+// it does not reach the server, and the client gets the 403 and a RST.
+bool Refused(ModuleHarness &h, Module *uf, const char *client_ip, const std::string &host) {
+  const Bytes syn = ToServer(client_ip, "10.0.0.1", Tcp(10001, 80, 0x02, 12345, 0));
+  const std::string request = "GET / HTTP/1.1\r\nHost: " + host + "\r\n\r\n";
+  const Bytes req = ToServer(client_ip, "10.0.0.1", Tcp(10001, 80, 0, 12346, 23456), request.c_str());
+  auto out = h.Run(uf, 0, {syn, req}, {0, 1});
+  const bool passed = out[0] == std::vector<Bytes>{syn, req};
+  EXPECT_EQ(passed, out[1].empty());
+  return !passed;
+}
+
+// "<name>/blacklist" is the whole blacklist (paused workers): setting it
+// replaces the list (as set_runtime_config does), it reads back as given,
+// and an empty list lets everything through. UrlFilter refuses no URL (nor
+// did add): only a value of the wrong type is refused.
+TEST(UrlFilterTest, BlacklistResourceReplacesTheList) {
+  ModuleHarness h;
+  bess::pb::UrlFilterArg arg;
+  auto *url = arg.add_blacklist();
+  url->set_host("www.initial.com");
+  url->set_path("/");
+  Module *uf = h.Create("UrlFilter", arg, "uf_res");
+  ASSERT_NE(nullptr, uf);
+  const std::string blacklist = "uf_res/blacklist";
+  EXPECT_TRUE(RequiresPausedWorkers(blacklist));
+  const auto initial = Blacklist({{"www.initial.com", "/"}});
+  EXPECT_EQ("", h.ReadBackDiffers(blacklist, {{nullptr, &initial}})) << "Init's blacklist";
+
+  // Not sorted: it reads back in this order.
+  const auto two = Blacklist({{"www.zeta.com", "/"}, {"www.alpha.com", "/"}});
+  EXPECT_EQ("", h.SetResource(blacklist, two));
+  EXPECT_TRUE(Refused(h, uf, "192.168.1.1", "www.zeta.com"));
+  EXPECT_TRUE(Refused(h, uf, "192.168.1.2", "www.alpha.com"));
+  EXPECT_FALSE(Refused(h, uf, "192.168.1.3", "www.initial.com")) << "replaced, not added";
+  EXPECT_EQ("", h.ReadBackDiffers(blacklist, {{nullptr, &two}}));
+
+  EXPECT_NE("", h.SetResource(blacklist, arg)) << "a UrlFilterArg is not the value type";
+  EXPECT_EQ("", h.ReadBackDiffers(blacklist, {{nullptr, &two}}));
+
+  // The legacy commands edit the same list.
+  bess::pb::UrlFilterArg more;
+  url = more.add_blacklist();
+  url->set_host("www.beta.com");
+  url->set_path("/");
+  h.MustCommand(uf, "add", more);
+  const auto three = Blacklist({{"www.zeta.com", "/"}, {"www.alpha.com", "/"}, {"www.beta.com", "/"}});
+  EXPECT_EQ("", h.ReadBackDiffers(blacklist, {{nullptr, &three}}));
+  h.MustCommand(uf, "set_runtime_config", initial);
+  EXPECT_EQ("", h.ReadBackDiffers(blacklist, {{nullptr, &initial}}));
+
+  const bess::pb::UrlFilterConfig none;
+  EXPECT_EQ("", h.SetResource(blacklist, none));
+  EXPECT_FALSE(Refused(h, uf, "192.168.1.4", "www.initial.com"));
+  EXPECT_EQ("", h.ReadBackDiffers(blacklist, {{nullptr, &none}}));
+}
+
+// Every command edits or reads back "<name>/blacklist": control_v2's
+// InvokeAction refuses them.
+TEST(UrlFilterTest, CommandsAreLegacyOnly) {
+  ModuleHarness h;
+  Module *uf = h.Create("UrlFilter", bess::pb::UrlFilterArg());
+  ASSERT_NE(nullptr, uf);
+  const bess::pb::EmptyArg empty;
+  EXPECT_EQ(ENOTSUP, h.Action(uf, "add", bess::pb::UrlFilterArg()).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(uf, "clear", empty).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(uf, "get_initial_arg", empty).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(uf, "get_runtime_config", empty).error().code());
+  EXPECT_EQ(ENOTSUP,
+            h.Action(uf, "set_runtime_config", bess::pb::UrlFilterConfig()).error().code());
+  EXPECT_EQ(0, h.Command(uf, "get_runtime_config", empty).error().code());
 }
 
 }  // namespace

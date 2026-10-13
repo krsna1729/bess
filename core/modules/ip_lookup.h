@@ -25,6 +25,7 @@ class IPLookup final : public Module {
   static const gate_idx_t kNumOGates = MAX_GATES;
 
   static const Commands cmds;
+  static const ResourceTables resource_tables;
 
   IPLookup() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 

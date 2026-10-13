@@ -3,7 +3,9 @@
 // G1.2a mode C: ExactMatch's command path against the in-place concurrent
 // table -- add/delete/clear semantics, growth past the initial capacity, and
 // restore -- through the module's own API; then packets through the module
-// (ExactMatchPacketTest, was bessctl/module_tests/exact_match.py) in process.
+// (ExactMatchPacketTest, was bessctl/module_tests/exact_match.py) in process;
+// and the "rules" and "settings" resources with the legacy-only commands
+// (ExactMatchResourceTest, D-129).
 // Commands while a worker forwards traffic are tests/live/match_modules_test.cc
 // and the table's concurrency classifier/concurrent_exact_test.cc.
 
@@ -505,6 +507,154 @@ TEST(ExactMatchPacketTest, MaskedOffRuleBitsStayUnmatchable) {
   EXPECT_EQ((std::map<gate_idx_t, size_t>{{2, 1}}),
             Counts(h.Run(em, 0, {hit_any_second}, {0, 1, 2, 3})));
   EXPECT_EQ((std::map<gate_idx_t, size_t>{{3, 1}}), Counts(h.Run(em, 0, {miss}, {0, 1, 2, 3})));
+}
+
+// D-129: the rules and the default gate as resources, the commands
+// legacy-only.
+
+bess::pb::ExactMatchRuleKey RuleKey(const std::vector<bess::pb::FieldData> &fields) {
+  bess::pb::ExactMatchRuleKey key;
+  for (const bess::pb::FieldData &f : fields) {
+    *key.add_fields() = f;
+  }
+  return key;
+}
+
+bess::pb::ExactMatchRuleValue GateValue(uint64_t gate) {
+  bess::pb::ExactMatchRuleValue value;
+  value.set_gate(gate);
+  return value;
+}
+
+bess::pb::ExactMatchSettings Settings(uint64_t default_gate) {
+  bess::pb::ExactMatchSettings s;
+  s.set_default_gate(default_gate);
+  return s;
+}
+
+// Rules upserted over a metadata and a packet field, both masked, read back
+// as the same entries: each key's bytes as given (masked-off bits too), in
+// canonical form (every field value_bin; a value_int key packs to the same
+// rule), and gate 0 as the empty value.
+TEST(ExactMatchResourceTest, RulesReadBackAsUpserted) {
+  ModuleHarness h;
+  ExactMatchArg arg;
+  *arg.add_fields() = AttrField("resact_em_attr", 2);
+  *arg.add_fields() = OffsetField(26, 4);
+  *arg.add_masks() = Bin("\xff\x0f");
+  *arg.add_masks() = Bin(std::string("\xff\xff\xff\x00", 4));
+  Module *em = h.Create("ExactMatch", arg);
+  ASSERT_NE(nullptr, em);
+  const std::string rules = em->name() + "/rules";
+
+  const auto k1 = RuleKey({Bin("\x88\x80"), Bin(Ip("1.2.3.4"))});
+  const auto k2 = RuleKey({Bin(std::string("\x00\xf1", 2)), Bin(Ip("10.0.0.9"))});
+  bess::pb::FieldData int_field;
+  int_field.set_value_int(0x7077);  // packs little-endian: "\x77\x70"
+  const auto k3 = RuleKey({int_field, Bin(Ip("5.6.7.8"))});
+  const auto v1 = GateValue(1);
+  const auto v2 = GateValue(2);
+  const auto v3 = GateValue(0);
+  EXPECT_EQ("", h.UpsertResource(rules, k1, v1));
+  EXPECT_EQ("", h.UpsertResource(rules, k2, v2));
+  EXPECT_EQ("", h.UpsertResource(rules, k3, v3));
+  EXPECT_EQ("", h.UpsertResource(rules, k1, v2));  // an update: one rule
+
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&k1, &v2}, {&k2, &v2}, {&k3, &v3}}));
+  EXPECT_NE("", h.ReadBackDiffers(rules, {{&k1, &v1}, {&k2, &v2}, {&k3, &v3}}));
+
+  const auto entries = h.ReadResource(rules);
+  ASSERT_EQ(3u, entries.size());
+  bool saw_int_key = false;
+  for (const auto &[packed_key, packed_value] : entries) {
+    const auto key = Unpack<bess::pb::ExactMatchRuleKey>(packed_key);
+    ASSERT_EQ(2, key.fields_size());
+    for (const bess::pb::FieldData &f : key.fields()) {
+      EXPECT_EQ(bess::pb::FieldData::kValueBin, f.encoding_case());
+    }
+    if (key.fields(0).value_bin() == "\x77\x70") {
+      saw_int_key = true;
+      EXPECT_EQ("", Unpack<bess::pb::ExactMatchRuleValue>(packed_value).SerializeAsString());
+    }
+  }
+  EXPECT_TRUE(saw_int_key);
+
+  EXPECT_EQ("", h.EraseResource(rules, k2));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&k1, &v2}, {&k3, &v3}}));
+}
+
+// Rules and the default gate set through resources decide packets; the
+// settings read back as set; a gate out of range is refused and changes
+// nothing.
+TEST(ExactMatchResourceTest, SettingsSetTheDefaultGate) {
+  ModuleHarness h;
+  ExactMatchArg arg;
+  *arg.add_fields() = OffsetField(26, 4);
+  Module *em = h.Create("ExactMatch", arg);
+  ASSERT_NE(nullptr, em);
+  const std::string rules = em->name() + "/rules";
+  const std::string settings = em->name() + "/settings";
+
+  const auto drop = Settings(DROP_GATE);
+  EXPECT_EQ("", h.ReadBackDiffers(settings, {{nullptr, &drop}}))
+      << "no default gate given: drop";
+
+  const auto key = RuleKey({Bin(Ip("1.2.3.4"))});
+  const auto value = GateValue(1);
+  EXPECT_EQ("", h.UpsertResource(rules, key, value));
+  const auto three = Settings(3);
+  EXPECT_EQ("", h.SetResource(settings, three));
+  EXPECT_EQ("", h.ReadBackDiffers(settings, {{nullptr, &three}}));
+
+  std::mt19937 rng(4);
+  const Bytes hit = TcpPacket({.sip = "1.2.3.4", .dip = "5.6.7.8"}, rng);
+  const Bytes miss = TcpPacket({.sip = "1.2.3.5", .dip = "5.6.7.8"}, rng);
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}, {3, 1}}),
+            Counts(h.Run(em, 0, {hit, miss}, {0, 1, 2, 3})));
+  EXPECT_EQ(3u, Unpack<ExactMatchConfig>(
+                    h.MustCommand(em, "get_runtime_config", bess::pb::EmptyArg()))
+                    .default_gate());
+
+  EXPECT_NE("", h.SetResource(settings, Settings(DROP_GATE + 1)));
+  EXPECT_NE("", h.SetResource(settings, Settings(uint64_t{1} << 16)))
+      << "not narrowed to gate 0";
+  EXPECT_EQ("", h.ReadBackDiffers(settings, {{nullptr, &three}}));
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{3, 1}}),
+            Counts(h.Run(em, 0, {miss}, {0, 1, 2, 3})));
+
+  // A rule upserted after the default gate changed keeps it.
+  EXPECT_EQ("", h.UpsertResource(rules, RuleKey({Bin(Ip("1.2.3.5"))}), GateValue(2)));
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{2, 1}}),
+            Counts(h.Run(em, 0, {miss}, {0, 1, 2, 3})));
+  EXPECT_EQ("", h.ReadBackDiffers(settings, {{nullptr, &three}}));
+}
+
+// Every command edits state the resources hold: InvokeAction refuses each
+// (ENOTSUP), while the legacy ModuleCommand still runs them.
+TEST(ExactMatchResourceTest, CommandsAreLegacyOnly) {
+  ModuleHarness h;
+  ExactMatchArg arg;
+  *arg.add_fields() = OffsetField(26, 4);
+  Module *em = h.Create("ExactMatch", arg);
+  ASSERT_NE(nullptr, em);
+  const auto rule = BinRule({Ip("1.2.3.4")}, 1);
+
+  EXPECT_EQ(ENOTSUP, h.Action(em, "add", rule).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(em, "delete", BinKey({Ip("1.2.3.4")})).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(em, "clear", bess::pb::EmptyArg()).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(em, "set_default_gate", DefaultGate(2)).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(em, "get_runtime_config", bess::pb::EmptyArg()).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(em, "set_runtime_config", ExactMatchConfig()).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(em, "get_initial_arg", bess::pb::EmptyArg()).error().code());
+
+  h.MustCommand(em, "add", rule);
+  h.MustCommand(em, "set_default_gate", DefaultGate(2));
+  const auto key = RuleKey({Bin(Ip("1.2.3.4"))});
+  const auto value = GateValue(1);
+  const auto two = Settings(2);
+  EXPECT_EQ("", h.ReadBackDiffers(em->name() + "/rules", {{&key, &value}}))
+      << "a legacy add reads back as the rule";
+  EXPECT_EQ("", h.ReadBackDiffers(em->name() + "/settings", {{nullptr, &two}}));
 }
 
 // The fused kernel (D-121) against the generic path, both in ClassifyBatch

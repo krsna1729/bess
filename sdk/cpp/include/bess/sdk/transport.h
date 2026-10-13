@@ -57,7 +57,7 @@ class Transport {
   BESS_SDK_UNARY(DiffPipeline)
   BESS_SDK_UNARY(PlanPipeline)
   BESS_SDK_UNARY(ApplyPipeline)
-  BESS_SDK_UNARY(RunModuleCommand)
+  BESS_SDK_UNARY(InvokeAction)
   // The Admin service (D-107).
   BESS_SDK_UNARY(ImportPlugin)
   BESS_SDK_UNARY(UnloadPlugin)

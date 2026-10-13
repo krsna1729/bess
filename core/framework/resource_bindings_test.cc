@@ -31,6 +31,8 @@ class FakeResource final : public bess::dataplane::Resource {
 
 class FakeCodec final : public ResourceCodec {
  public:
+  Kind kind() const override { return Kind::kMap; }
+  void Entries(const EntryVisitor &) const override {}
   std::string key_type() const override { return "k"; }
   std::string value_type() const override { return "v"; }
   std::expected<bess::dataplane::ResourceKey, std::string> Key(

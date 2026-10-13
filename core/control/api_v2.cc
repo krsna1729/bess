@@ -156,6 +156,15 @@ ControlResult<PipelineSpec> FromProto(const v2::Pipeline &pipeline) {
     task.share = t.share();
     spec.tasks.push_back(std::move(task));
   }
+  for (const auto &r : pipeline.resources()) {
+    ResourceSpec resource;
+    resource.name = r.name();
+    for (const auto &e : r.entries()) {
+      resource.entries.push_back(
+          {e.has_key() ? Canonical(e.key()) : google::protobuf::Any(), Canonical(e.value())});
+    }
+    spec.resources.push_back(std::move(resource));
+  }
   return spec;
 }
 
@@ -229,6 +238,17 @@ v2::Pipeline ToProto(const PipelineSpec &spec) {
     if (t.has_priority) task->set_priority(t.priority);
     if (t.has_share) task->set_share(t.share);
   }
+  for (const auto &r : spec.resources) {
+    auto *resource = out.add_resources();
+    resource->set_name(r.name);
+    for (const ResourceEntrySpec &e : r.entries) {
+      auto *entry = resource->add_entries();
+      if (HasArg(e.key)) {
+        *entry->mutable_key() = e.key;
+      }
+      *entry->mutable_value() = e.value;
+    }
+  }
   return out;
 }
 
@@ -296,6 +316,16 @@ v2::PipelineDiff ToProto(const PipelineDiff &diff) {
   }
   for (const auto &c : diff.tasks) {
     AddChange(&out, v2::TASK, TaskName(c.desired), c.kind);
+  }
+  // A resource's contents change in place (D-129); the delta counts entries.
+  for (const ResourceDelta &r : diff.resources) {
+    AddChange(&out, v2::RESOURCE, r.name, ChangeKind::kUpdateParams);
+    v2::ResourceDelta *delta = out.add_resources();
+    delta->set_name(r.name);
+    delta->set_created(r.created);
+    delta->set_updated(r.updated);
+    delta->set_removed(r.removed);
+    delta->set_checked(r.checked);
   }
   return out;
 }
@@ -371,6 +401,14 @@ void AppendPlanSteps(const PipelinePlan &plan,
                      google::protobuf::RepeatedPtrField<v2::PlanStep> *out) {
   AppendPhase(plan.prepare_ops, v2::PREPARE, out);
   AppendPhase(plan.commit_ops, v2::COMMIT, out);
+  // After the commit, before the retire phase: one dataplane transaction.
+  for (const std::string &resource : plan.resources) {
+    v2::PlanStep *step = out->Add();
+    step->set_phase(v2::COMMIT);
+    step->set_operation("apply_resources");
+    step->set_type(v2::RESOURCE);
+    step->set_object(resource);
+  }
   AppendPhase(plan.retire_ops, v2::RETIRE, out);
 }
 
@@ -480,14 +518,23 @@ std::optional<grpc::Status> RefuseOtherEpoch(uint64_t sent, uint64_t epoch,
 
 // -- service ------------------------------------------------------------------------
 
-grpc::Status ControlV2Service::GetPipeline(grpc::ServerContext *,
-                                           const v2::GetPipelineRequest *,
+grpc::Status ControlV2Service::GetPipeline(grpc::ServerContext *context,
+                                           const v2::GetPipelineRequest *request,
                                            v2::GetPipelineResponse *response) {
-  const auto snapshot = control_plane_.GetPipelineVersioned();
-  *response->mutable_pipeline() = ToProto(SpecFromSnapshot(snapshot.value));
-  response->set_generation(snapshot.generation);
+  ControlPlane::ResourceQuery query;
+  query.include = request->include_resources();
+  query.names.assign(request->resources().begin(), request->resources().end());
+  auto read = control_plane_.ReadPipeline(query);
+  if (!read) {
+    return ToStatus(read.error(), context);
+  }
+  PipelineSpec spec = SpecFromSnapshot(read->value.snapshot);
+  spec.resources = std::move(read->value.resources);
+  *response->mutable_pipeline() = ToProto(spec);
+  response->set_generation(read->generation);
+  response->set_resource_generation(read->resource_generation);
   response->set_daemon_epoch(transactions_.epoch());
-  for (const WorkerSnapshot &w : snapshot.value.workers) {
+  for (const WorkerSnapshot &w : read->value.snapshot.workers) {
     v2::WorkerPlacement *out = response->add_workers();
     out->set_wid(w.wid);
     out->set_core(w.core);
@@ -495,6 +542,17 @@ grpc::Status ControlV2Service::GetPipeline(grpc::ServerContext *,
     out->set_cross_numa(w.cross_numa);
     out->set_shares_core(w.shares_core);
     out->set_on_control_cpu(w.on_control_cpu);
+  }
+  if (response->ByteSizeLong() > static_cast<size_t>(kMaxMessageBytes)) {
+    const size_t bytes = response->ByteSizeLong();
+    response->Clear();
+    ControlError error = Err(EMSGSIZE,
+                             "the pipeline with its resources is %zu bytes, above the %d-byte "
+                             "message limit: name fewer resources",
+                             bytes, kMaxMessageBytes);
+    error.code = ControlErrorCode::kResourceExhausted;
+    error.field = "resources";
+    return ToStatus(error, context);
   }
   return grpc::Status::OK;
 }
@@ -527,6 +585,7 @@ grpc::Status ControlV2Service::DiffPipeline(
   }
   *response->mutable_diff() = ToProto(diff->value);
   response->set_generation(diff->generation);
+  response->set_resource_generation(diff->resource_generation);
   response->set_daemon_epoch(transactions_.epoch());
   return grpc::Status::OK;
 }
@@ -544,6 +603,7 @@ grpc::Status ControlV2Service::PlanPipeline(
   }
   AppendPlanSteps(plan->value, response->mutable_steps());
   response->set_generation(plan->generation);
+  response->set_resource_generation(plan->resource_generation);
   response->set_daemon_epoch(transactions_.epoch());
   return grpc::Status::OK;
 }
@@ -561,6 +621,9 @@ grpc::Status ControlV2Service::ApplyPipeline(
   if (request->has_expected_generation()) {
     options.expected_generation = request->expected_generation();
   }
+  if (request->has_expected_resource_generation()) {
+    options.expected_resource_generation = request->expected_resource_generation();
+  }
   auto desired = FromProto(request->pipeline());
   if (!desired) {
     return ToStatus(desired.error(), context);
@@ -577,6 +640,8 @@ grpc::Status ControlV2Service::ApplyPipeline(
   response->set_paused_commit_us(applied->timing.paused_commit_us);
   response->set_retire_us(applied->timing.retire_us);
   response->set_daemon_epoch(transactions_.epoch());
+  response->set_resource_generation(applied->resource_generation);
+  response->set_resource_ops(applied->resource_ops);
   return grpc::Status::OK;
 }
 
@@ -678,29 +743,29 @@ grpc::Status ControlV2Service::ListTransactionResources(
   return grpc::Status::OK;
 }
 
-grpc::Status ControlV2Service::RunModuleCommand(
-    grpc::ServerContext *context, const v2::RunModuleCommandRequest *request,
-    v2::RunModuleCommandResponse *response) {
+grpc::Status ControlV2Service::InvokeAction(grpc::ServerContext *context,
+                                            const v2::InvokeActionRequest *request,
+                                            v2::InvokeActionResponse *response) {
   if (auto refused = RefuseOtherEpoch(request->daemon_epoch(), transactions_.epoch(), context)) {
     return *refused;
   }
-  auto ran = control_plane_.RunModuleCommand(request->module(), request->command(),
-                                             request->arg());
+  auto ran = control_plane_.RunModuleCommand(request->module(), request->action(), request->arg(),
+                                             ModuleBuilder::CommandSurface::kActions);
   if (!ran) {
     ControlError error = ran.error();
     error.object = request->module();
     return ToStatus(error, context);
   }
   if (ran->has_error()) {
-    // The command's own failure: its errno decides the code (EBUSY: a
-    // thread-unsafe command while a worker runs).
+    // The action's own failure: its errno decides the code (EBUSY: a
+    // thread-unsafe action while a worker runs; ENOTSUP: no such action).
     ControlError error = Err(ran->error().code(), "%s", ran->error().errmsg().c_str());
     error.object = request->module();
-    error.field = "command";
+    error.field = "action";
     return ToStatus(error, context);
   }
   if (ran->has_data()) {
-    *response->mutable_data() = std::move(*ran->mutable_data());
+    *response->mutable_result() = std::move(*ran->mutable_data());
   }
   response->set_daemon_epoch(transactions_.epoch());
   return grpc::Status::OK;
@@ -928,10 +993,10 @@ using google::protobuf::Descriptor;
 using google::protobuf::DescriptorPool;
 using google::protobuf::FileDescriptor;
 
-// A command's declared argument type by full name. Commands declare a short
-// name by hand ("ExactMatchCommandAddArg"): it is the full name if it is one,
-// else the name in the package of the class's init argument, else in bess.pb
-// (the built-in modules' package). "" when none names a message.
+// An action's declared argument or result type by full name. Actions declare
+// a short name by hand ("L2ForwardCommandLookupArg"): it is the full name if
+// it is one, else the name in the package of the class's init argument, else
+// in bess.pb (the built-in modules' package). "" when none names a message.
 std::string ResolveCommandArgType(const DescriptorPool &pool, const std::string &declared,
                                   const std::string &init_arg_type) {
   if (declared.empty()) {
@@ -985,12 +1050,41 @@ grpc::Status ControlV2Service::GetSchema(grpc::ServerContext *, const v2::GetSch
     out->set_igates(builder.NumIGates());
     out->set_ogates(builder.NumOGates());
     types.insert(builder.init_arg_type());
+    // Actions only (D-129): a legacy-only command edits state its resources
+    // hold, and control_v2 does not run it.
+    std::vector<const Command *> actions;
     for (const Command &cmd : builder.cmds()) {
-      v2::CommandSchema *c = out->add_commands();
-      c->set_name(cmd.cmd);
-      c->set_arg_type(ResolveCommandArgType(pool, cmd.arg_type, builder.init_arg_type()));
-      c->set_thread_safe(cmd.mt_safe == Command::THREAD_SAFE);
-      types.insert(c->arg_type());
+      if (cmd.exposure == Command::ACTION) {
+        actions.push_back(&cmd);
+      }
+    }
+    std::sort(actions.begin(), actions.end(),
+              [](const Command *a, const Command *b) { return a->cmd < b->cmd; });
+    for (const Command *cmd : actions) {
+      v2::ActionSchema *a = out->add_actions();
+      a->set_name(cmd->cmd);
+      a->set_arg_type(ResolveCommandArgType(pool, cmd->arg_type, builder.init_arg_type()));
+      a->set_result_type(ResolveCommandArgType(pool, cmd->result_type, builder.init_arg_type()));
+      a->set_thread_safe(cmd->mt_safe == Command::THREAD_SAFE);
+      types.insert(a->arg_type());
+      types.insert(a->result_type());
+    }
+    std::vector<const ResourceTable *> tables;
+    for (const ResourceTable &t : builder.resource_tables()) {
+      tables.push_back(&t);
+    }
+    std::sort(tables.begin(), tables.end(),
+              [](const ResourceTable *a, const ResourceTable *b) { return a->table < b->table; });
+    for (const ResourceTable *t : tables) {
+      v2::ResourceSchema *r = out->add_resources();
+      r->set_table(t->table);
+      r->set_kind(t->kind == ResourceTable::SINGLETON ? v2::TransactionResource::KIND_SINGLETON
+                                                      : v2::TransactionResource::KIND_MAP);
+      r->set_key_type(t->key_type);
+      r->set_value_type(t->value_type);
+      r->set_requires_paused_workers(t->requires_paused_workers);
+      types.insert(t->key_type);
+      types.insert(t->value_type);
     }
   }
   for (const auto &[name, builder] : PortBuilder::all_port_builders()) {

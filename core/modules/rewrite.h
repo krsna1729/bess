@@ -5,6 +5,9 @@
 #ifndef BESS_MODULES_REWRITE_H_
 #define BESS_MODULES_REWRITE_H_
 
+#include <memory>
+
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 
@@ -14,17 +17,17 @@ class Rewrite final : public Module {
   static const size_t kMaxTemplateSize = 1536;
 
   static const Commands cmds;
+  static const ResourceTables resource_tables;
 
   Rewrite()
       : Module(),
         next_turn_(),
-        num_templates_(),
-        template_size_(),
-        templates_() {
+        templates_(std::make_unique<Templates>()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 
   CommandResponse Init(const bess::pb::RewriteArg &arg);
+  void DeInit() override;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
@@ -32,16 +35,43 @@ class Rewrite final : public Module {
   CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
 
  private:
-  inline void DoRewrite(bess::PacketBatch *batch);
-  inline void DoRewriteSingle(bess::PacketBatch *batch);
+  // The templates, replicated round robin over kNumSlots slots so that a
+  // batch starting at any template reads consecutive slots.
+  struct Templates {
+    size_t num = 0;
+    // precalculated "index % num": the next turn after slot `index`
+    // (index up to kNumSlots: a full batch from the last template)
+    size_t jump[kNumSlots + 1] = {};
+    uint16_t size[kNumSlots] = {};
+    unsigned char data[kNumSlots][kMaxTemplateSize] = {};
+  };
 
-  // For fair round robin we remember the next index in [0, num_templates_).
+  // A "<name>/templates" value, built: the templates and the RewriteArg they
+  // came from (read back as given).
+  struct Staged {
+    std::unique_ptr<Templates> templates;
+    bess::pb::RewriteArg arg;
+  };
+
+  // Builds `arg`'s templates into `*out` (fresh); refuses what `add`
+  // refuses.
+  static CommandResponse Build(const bess::pb::RewriteArg &arg,
+                               Templates *out);
+
+  inline void DoRewrite(const Templates &t, bess::PacketBatch *batch);
+  inline void DoRewriteSingle(const Templates &t, bess::PacketBatch *batch);
+
+  // For fair round robin we remember the next index in [0, num).
   size_t next_turn_;
-  size_t jump_[kNumSlots];  // precalculated "index % num_templates_"
+  std::unique_ptr<Templates> templates_;  // never null
 
-  size_t num_templates_;
-  uint16_t template_size_[kNumSlots];
-  unsigned char templates_[kNumSlots][kMaxTemplateSize];
+  // The templates as given, in order (control side): "<name>/templates"
+  // reads it back.
+  bess::pb::RewriteArg arg_;
+  // "<name>/templates" (D-129): the whole template list; setting it
+  // replaces the list. Paused workers: ProcessBatch reads templates_ and
+  // next_turn_ in place.
+  bess::framework::Singleton<bess::pb::RewriteArg, Staged> templates_resource_;
 };
 
 #endif  // BESS_MODULES_REWRITE_H_

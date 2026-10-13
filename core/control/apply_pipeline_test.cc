@@ -11,7 +11,12 @@
 
 #include <gtest/gtest.h>
 
+#include <google/protobuf/util/json_util.h>
+
+#include <algorithm>
 #include <functional>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <variant>
@@ -19,6 +24,7 @@
 
 #include "control/control_plane.h"
 #include "control/pipeline_spec.h"
+#include "module.h"
 #include "runtime/runtime_state.h"
 #include "control/transaction.h"
 #include "runtime/worker_manager.h"
@@ -1405,6 +1411,253 @@ TEST_F(ApplyPipelineTest, ImpossibleTaskPlacementsAreRefused) {
     EXPECT_EQ(c.field, applied.error().field) << c.what << ": " << applied.error().message;
     EXPECT_TRUE(bess::runtime::runtime().modules().All().empty()) << c.what;
   }
+}
+
+// -- resources as desired state (D-129) ------------------------------------------
+
+google::protobuf::Any Packed(const google::protobuf::Message &m) {
+  google::protobuf::Any any;
+  EXPECT_TRUE(any.PackFrom(m));
+  return any;
+}
+
+// An ExactMatch module on 4 bytes at offset 26 (IPv4 source), and its
+// resources: `rules` maps each address in `rules` to gate 1; `settings` is the
+// default gate when set.
+PipelineSpec ExactMatchPipeline(const std::vector<std::string> &rules,
+                                std::optional<uint64_t> default_gate) {
+  PipelineSpec spec;
+  bess::pb::ExactMatchArg arg;
+  bess::pb::Field *field = arg.add_fields();
+  field->set_offset(26);
+  field->set_num_bytes(4);
+  spec.modules.push_back({"em", "ExactMatch", Packed(arg)});
+  bess::control::ResourceSpec rules_spec{"em/rules", {}};
+  for (const std::string &addr : rules) {
+    bess::pb::ExactMatchRuleKey key;
+    key.add_fields()->set_value_bin(addr);
+    bess::pb::ExactMatchRuleValue value;
+    value.set_gate(1);
+    rules_spec.entries.push_back({Packed(key), Packed(value)});
+  }
+  spec.resources.push_back(std::move(rules_spec));
+  if (default_gate) {
+    bess::pb::ExactMatchSettings settings;
+    settings.set_default_gate(*default_gate);
+    spec.resources.push_back({"em/settings", {{google::protobuf::Any(), Packed(settings)}}});
+  }
+  return spec;
+}
+
+// The contents of `name` as GetPipeline reads them.
+std::optional<bess::control::ResourceSpec> ReadResource(ControlPlane &cp, const std::string &name) {
+  auto read = cp.ReadPipeline({.include = true, .names = {name}});
+  if (!read || read->value.resources.size() != 1) {
+    return std::nullopt;
+  }
+  return read->value.resources[0];
+}
+
+uint64_t DefaultGate(ControlPlane &cp) {
+  auto settings = ReadResource(cp, "em/settings");
+  bess::pb::ExactMatchSettings value;
+  if (!settings || settings->entries.size() != 1 ||
+      !settings->entries[0].value.UnpackTo(&value)) {
+    ADD_FAILURE() << "em/settings unreadable";
+    return 0;
+  }
+  return value.default_gate();
+}
+
+// Listed resources converge to exactly their entries in the same apply as the
+// topology; a listed resource with no entries is cleared; an unlisted one is
+// left alone; and a resource-only change moves the resource generation, not
+// the pipeline's.
+TEST_F(ApplyPipelineTest, ListedResourcesConvergeAndUnlistedOnesStay) {
+  const std::string a("\x0a\x00\x00\x01", 4);
+  const std::string b("\x0a\x00\x00\x02", 4);
+  auto applied = control_plane_->ApplyPipeline(ExactMatchPipeline({a, b}, 3), {});
+  ASSERT_TRUE(applied) << applied.error().message;
+  EXPECT_EQ(3u, applied->resource_ops);
+  auto rules = ReadResource(*control_plane_, "em/rules");
+  ASSERT_TRUE(rules);
+  EXPECT_EQ(2u, rules->entries.size());
+  EXPECT_EQ(3u, DefaultGate(*control_plane_));
+
+  // Same desired state: nothing to do.
+  auto again = control_plane_->ApplyPipeline(ExactMatchPipeline({a, b}, 3), {});
+  ASSERT_TRUE(again) << again.error().message;
+  EXPECT_EQ(0u, again->resource_ops);
+  EXPECT_EQ(0u, again->applied_ops);
+  EXPECT_EQ(applied->generation, again->generation);
+  EXPECT_EQ(applied->resource_generation, again->resource_generation);
+
+  // One rule replaced, settings not listed: only the rules move.
+  const std::string c("\x0a\x00\x00\x03", 4);
+  auto changed = control_plane_->ApplyPipeline(ExactMatchPipeline({a, c}, std::nullopt), {});
+  ASSERT_TRUE(changed) << changed.error().message;
+  EXPECT_EQ(2u, changed->resource_ops) << "b erased, c created";
+  EXPECT_EQ(applied->generation, changed->generation) << "a resource-only change";
+  EXPECT_LT(applied->resource_generation, changed->resource_generation);
+  EXPECT_EQ(3u, DefaultGate(*control_plane_)) << "an unlisted resource is untouched";
+
+  // Listed with no entries: cleared.
+  auto cleared = control_plane_->ApplyPipeline(ExactMatchPipeline({}, std::nullopt), {});
+  ASSERT_TRUE(cleared) << cleared.error().message;
+  EXPECT_EQ(2u, cleared->resource_ops);
+  rules = ReadResource(*control_plane_, "em/rules");
+  ASSERT_TRUE(rules);
+  EXPECT_TRUE(rules->entries.empty());
+  EXPECT_EQ(3u, DefaultGate(*control_plane_));
+}
+
+// What GetPipeline reads with its resources applies back as a no-op, and a
+// stale resource generation is a conflict that changes nothing.
+TEST_F(ApplyPipelineTest, ResourcesReadBackApplyAsANoOpAndAreVersioned) {
+  const std::string a("\x0a\x00\x00\x01", 4);
+  ASSERT_TRUE(control_plane_->ApplyPipeline(ExactMatchPipeline({a}, 2), {}));
+  auto read = control_plane_->ReadPipeline({.include = true});
+  ASSERT_TRUE(read) << read.error().message;
+  PipelineSpec spec = SpecFromSnapshot(read->value.snapshot);
+  spec.resources = read->value.resources;
+
+  auto diff = control_plane_->DiffPipelineVersioned(spec);
+  ASSERT_TRUE(diff) << diff.error().message;
+  for (const auto &r : diff->value.resources) {
+    EXPECT_EQ(0u, r.created + r.updated + r.removed) << r.name;
+  }
+  auto back = control_plane_->ApplyPipeline(
+      spec, {.expected_generation = read->generation,
+             .expected_resource_generation = read->resource_generation});
+  ASSERT_TRUE(back) << back.error().message;
+  EXPECT_EQ(0u, back->resource_ops);
+  EXPECT_EQ(read->generation, back->generation);
+  EXPECT_EQ(read->resource_generation, back->resource_generation);
+
+  // Resource contents move: the version read before is stale.
+  ASSERT_TRUE(control_plane_->ApplyPipeline(ExactMatchPipeline({a}, 5), {}));
+  auto stale = control_plane_->ApplyPipeline(
+      ExactMatchPipeline({}, 7), {.expected_generation = read->generation,
+                                  .expected_resource_generation = read->resource_generation});
+  ASSERT_FALSE(stale);
+  EXPECT_EQ(bess::control::ControlErrorCode::kConflict, stale.error().code);
+  EXPECT_EQ(5u, DefaultGate(*control_plane_));
+  auto rules = ReadResource(*control_plane_, "em/rules");
+  ASSERT_TRUE(rules);
+  EXPECT_EQ(1u, rules->entries.size());
+}
+
+// A resource the apply cannot converge (a gate ExactMatch refuses) aborts the
+// whole apply: the topology it came with is rolled back too.
+TEST_F(ApplyPipelineTest, ARefusedResourceRollsBackTheTopology) {
+  const std::string a("\x0a\x00\x00\x01", 4);
+  auto first = control_plane_->ApplyPipeline(ExactMatchPipeline({a}, 2), {});
+  ASSERT_TRUE(first) << first.error().message;
+
+  PipelineSpec spec = ExactMatchPipeline({}, 99999);
+  spec.modules.push_back({"extra", "Bypass", {}});
+  auto refused = control_plane_->ApplyPipeline(spec, {});
+  ASSERT_FALSE(refused);
+  EXPECT_EQ("resources", refused.error().field) << refused.error().message;
+  EXPECT_EQ(nullptr, bess::runtime::runtime().modules().Find("extra"));
+  EXPECT_EQ(2u, DefaultGate(*control_plane_));
+  auto rules = ReadResource(*control_plane_, "em/rules");
+  ASSERT_TRUE(rules);
+  EXPECT_EQ(1u, rules->entries.size()) << "the rules erase did not stay";
+  auto read = control_plane_->ReadPipeline({});
+  ASSERT_TRUE(read);
+  EXPECT_EQ(first->generation, read->generation);
+}
+
+// The init argument of each class's module in the round trip below, as
+// protobuf JSON; any other class is created with an empty argument.
+const std::map<std::string, std::string> &InitArgs() {
+  static const std::map<std::string, std::string> args = {
+      {"ExactMatch", R"({"fields": [{"offset": 26, "numBytes": 4}]})"},
+      {"WildcardMatch", R"({"fields": [{"offset": 26, "numBytes": 4}]})"},
+      {"PortInc", R"({"port": "p0"})"},
+      {"QueueInc", R"({"port": "p1"})"},
+      {"ActionTable", R"({"meters": "m_Meter/meters", "nextHops": "m_Router/next_hops"})"},
+      // 60 bytes: Ethernet, IPv4 10.0.0.1 -> 10.0.0.2, UDP 1000 -> 2000.
+      {"FlowGen",
+       R"({"template": "AgAAAAACAgAAAAABCABFAAAuAAAAAEARAAAKAAABCgAAAgPoB9AAGgAAAAAAAAAAAAAAAAAAAAAAAAAA",
+           "pps": 1000, "flow_rate": 10, "flow_duration": 10, "arrival": "uniform",
+           "duration": "uniform"})"},
+      {"HashLB", R"({"gates": [0, 1]})"},
+      {"RoundRobin", R"({"gates": [0]})"},
+      {"RandomSplit", R"({"drop_rate": 0, "gates": [0]})"},
+      {"Replicate", R"({"gates": [0]})"},
+  };
+  return args;
+}
+
+// Every in-tree class that declares resources: one module of it, read back
+// with its resources (defaults included) and applied back changes nothing.
+// A read-back that is not the canonical form a client would send would show
+// up here as an update.
+TEST_F(ApplyPipelineTest, EveryDeclaredResourceReadsBackAsANoOp) {
+  for (const std::string name : {"p0", "p1"}) {
+    bess::pb::UnixSocketPortArg port_arg;
+    port_arg.set_path("@bess_apply_pipeline_test_" + name);
+    bess::control::PortSpec port;
+    port.name = name;
+    port.driver = "UnixSocketPort";
+    port.arg = Packed(port_arg);
+    ASSERT_TRUE(control_plane_->CreatePort(port));
+  }
+
+  // Classes whose argument names another module's resources come after it.
+  std::vector<std::pair<std::string, const ModuleBuilder *>> classes;
+  for (const auto &[mclass, builder] : ModuleBuilder::all_module_builders()) {
+    if (!builder.resource_tables().empty()) {
+      classes.emplace_back(mclass, &builder);
+    }
+  }
+  std::stable_partition(classes.begin(), classes.end(),
+                        [](const auto &c) { return c.first != "ActionTable"; });
+  std::vector<std::string> expected;
+  for (const auto &[mclass, builder] : classes) {
+    const google::protobuf::Descriptor *type =
+        google::protobuf::DescriptorPool::generated_pool()->FindMessageTypeByName(
+            builder->init_arg_type());
+    ASSERT_NE(nullptr, type) << mclass << " '" << builder->init_arg_type() << "'";
+    std::unique_ptr<google::protobuf::Message> arg(
+        google::protobuf::MessageFactory::generated_factory()->GetPrototype(type)->New());
+    if (auto it = InitArgs().find(mclass); it != InitArgs().end()) {
+      ASSERT_TRUE(google::protobuf::util::JsonStringToMessage(it->second, arg.get()).ok())
+          << mclass;
+    }
+    const std::string name = "m_" + mclass;
+    auto created = control_plane_->CreateModule({name, mclass, Packed(*arg)});
+    ASSERT_TRUE(created) << mclass << ": " << created.error().message;
+    for (const ResourceTable &t : builder->resource_tables()) {
+      expected.push_back(name + "/" + t.table);
+    }
+  }
+  ASSERT_FALSE(expected.empty());
+  std::sort(expected.begin(), expected.end());
+
+  auto read = control_plane_->ReadPipeline({.include = true});
+  ASSERT_TRUE(read) << read.error().message;
+  std::vector<std::string> listed;
+  for (const auto &r : read->value.resources) {
+    listed.push_back(r.name);
+  }
+  EXPECT_EQ(expected, listed);
+
+  PipelineSpec spec = SpecFromSnapshot(read->value.snapshot);
+  spec.resources = read->value.resources;
+  auto diff = control_plane_->DiffPipeline(spec);
+  ASSERT_TRUE(diff) << diff.error().message;
+  for (const auto &r : diff->resources) {
+    EXPECT_EQ(0u, r.created + r.updated + r.removed)
+        << r.name << ": +" << r.created << " ~" << r.updated << " -" << r.removed;
+  }
+  auto back = control_plane_->ApplyPipeline(spec, {});
+  ASSERT_TRUE(back) << back.error().message;
+  EXPECT_EQ(0u, back->resource_ops);
+  EXPECT_EQ(read->resource_generation, back->resource_generation);
+  EXPECT_EQ(read->generation, back->generation);
 }
 
 }  // namespace

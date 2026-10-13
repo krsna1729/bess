@@ -130,12 +130,12 @@ file is the reasoning.
 | D-107 | The v2 Admin service: plugins, port status, capture into a client FIFO, packet pools, pause/resume of the workers and shutdown; epoch-checked like Control | accepted |
 | D-108 | YAML manifests: libyaml into bessctl's exact-number JSON tree, YAML 1.2 core-schema resolution, refusals named by position | accepted |
 | D-109 | Task placement is desired state; the samples are manifests | accepted |
-| D-110 | Desired state: settings at creation are init arguments; tables are resources | accepted |
+| D-110 | Desired state: settings at creation are init arguments; tables are resources | accepted; superseded in part by D-129 |
 | D-111 | IPLookup's routes are a transaction resource (`LpmTableResource`) | accepted |
 | D-112 | Generated C++ protobuf code is declared where it is included and reached through build-relative include directories; one ninja run after a .proto edit, with GCC and Clang | accepted |
 | D-113 | mold links every profile and every CI lane | accepted |
 | D-114 | L2Forward's entries are a transaction resource (`MacTableResource`) | accepted |
-| D-115 | Module commands over control_v2 (`RunModuleCommand`); thread-unsafe commands busy while workers run | accepted |
+| D-115 | Module commands over control_v2 (`RunModuleCommand`); thread-unsafe commands busy while workers run | accepted; superseded in part by D-129 |
 | D-116 | Gate counters in ListMetrics | accepted |
 | D-117 | SetMetadata runs an op list compiled at PreResume (M.metadata -8 instructions, -4.7 cycles per packet); Update's loop inversion rejected (slower) | accepted |
 | D-118 | live_perf keeps control threads off worker CPUs and counts the worker that runs the test; the floor is at parity with master, the per-hop cost is not | accepted |
@@ -147,6 +147,7 @@ file is the reasoning.
 | D-125 | HTTP inside bessd, off by default: protobuf-JSON over the Control RPCs, WatchEvents as server-sent events, Prometheus `/metrics` (replaces tools/bess_prometheus.py), a compiled-in page; every request a call on bessd's own gRPC server over an in-process channel | accepted |
 | D-126 | One SIMD width per process: `--simd_width=auto\|256\|512` and the CPU, decided once before the EAL, passed to DPDK as `--force-max-simd-bitwidth` (auto passes nothing: DPDK's 256 on x86) and to BESS kernels through `arch::RuntimeDispatch`, a function pointer resolved at startup; wider than the CPU is a warning; no AVX-512 kernel (no hardware) | accepted |
 | D-127 | Compiler tuning: a `tune` meson option (`-mtune`, empty by default, not passed to plugins); releases stay `-march=x86-64-v3` with the compiler's default tune (GCC: generic): on this host no `-mtune` (generic, graniterapids, znver5, native alderlake) is consistently faster with GCC 16, and Clang's best tune here is AMD's | accepted |
+| D-129 | Resources vs actions: a module's state is its init argument and its declared resources (map tables and singletons), converged by `ApplyPipeline` with the topology; actions (`InvokeAction`) are the verbs; state-editing commands are legacy-only | accepted |
 | D-130 | `rte_fib` re-trial: the D-003 failure is an `rte_fib` defect (DIR24_8 update loop wraps at 255.255.255.255 and overwrites the whole table), not BESS usage; `rte_lpm` stays; the re-trial is a unit test that fails when DPDK fixes it | accepted |
 | D-131 | Local DPDK patches: `deps/dpdk-patches/NNNN-<slug>.patch` (format-patch, `Upstream-Status` and `BESS-Decision` trailers) applied in order by the bootstrap; a series stamp in the source tree and each install re-extracts or reinstalls on change; `--check-patches` in CI; build-info and the SBOM list the series | accepted |
 | D-132 | `rte_fib` as a selectable route backend (`backend` on IPLookup and Router; `rte_lpm` stays the default): five carried DPDK patches (one gives `rte_fib` `rte_lpm`'s tbl8 group lifetime, so changes and deletes never allocate), `rte_lpm`'s limits and errors enforced by the table, the defer queue sized to the pool, x86-64 only (plain stores); cheaper changes at every size and faster batch lookups, equal in a small table | accepted |
@@ -8225,6 +8226,9 @@ builders (`Task`/`task`, `Remove` drops placements), `bessctl/conf/samples/*.yam
 
 ## D-110 Desired state: settings at creation are init arguments; tables are resources
 
+**Status:** accepted; *superseded in part by D-129*: run-time settings are singleton resources now (the init fields
+stay the initial value), and tables converge with the pipeline in one `ApplyPipeline`, not committed beside it.
+
 **Decision.** A module's state reaches desired state in one of two ways, by what it is:
 - **Settings** a pipeline fixes when it builds the module are fields of its init argument: `ExactMatchArg.default_gate`,
   `WildcardMatchArg.default_gate`, `SourceArg.burst` (all optional; absent keeps the old default). Init applies them
@@ -8375,7 +8379,8 @@ removed; `bessctl_cpp`'s `test_samples` applies every manifest.
 
 ## D-115 Module commands over control_v2 (`RunModuleCommand`)
 
-**Status:** accepted.
+**Status:** accepted; *superseded in part by D-129*: `RunModuleCommand` is replaced by `InvokeAction`, which runs only
+a class's actions; commands that edit state are legacy-only (the legacy `ModuleCommand`), their state a resource.
 
 **Decision.** `bess.pb.v2.Control` serves `RunModuleCommand {daemon_epoch, module, command, Any arg}` →
 `{Any data, daemon_epoch}`: a module's command, as the legacy `ModuleCommand` runs it (one
@@ -9516,3 +9521,147 @@ or when a deployment's tables are large or churn enough to make `rte_fib` the be
 `core/modules/ip_lookup.cc`, `core/modules/router.cc`, `core/testing/route_backends.h`, the route tests,
 `core/route/route_bench.cc`, `core/fib_bench.cc`, `tools/live_perf.py` (`M.iplookup/fib`),
 `deps/dpdk-patches/0001-0005`.
+
+## D-129 Resources vs actions: declared resources are desired state, actions are verbs
+
+**Status:** accepted. Supersedes in part D-110 (run-time settings) and D-115 (`RunModuleCommand`).
+
+**Decision.** A module's state is its init argument plus its **resources**; everything else a client can do to it is
+an **action**.
+
+- **Resources** are of two kinds. A *map* (`TransactionResource.KIND_MAP`) maps a key message to a value message: a
+  table. A *singleton* (`KIND_SINGLETON`) holds one value under no key (`google.protobuf.Empty` on the wire): run-time
+  settings. Both go through the same transaction engine (`ApplyTransaction`, D-094). A singleton is an ordinary
+  `dataplane::Resource` with an empty key and no erase (`framework::Singleton<ValueMsg, Staged>`,
+  `framework/singleton_resource.h`, experimental): `stage` validates and builds (it may allocate; its error refuses
+  the transaction), `apply` publishes at commit and neither fails nor allocates, `read` gives the value. An `apply`
+  that replaces an object readers may hold retires it (the overload with a `dataplane::Retirer` and a declared
+  `Footprint`).
+- **Each class declares its resources** (`static const ResourceTables resource_tables`, `ResourceTable::Map<K, V>` /
+  `Singleton<V>`, with whether workers must be paused). Creating a module whose codec-bound `<module>/<table>`
+  resources differ from the declaration fails (`CheckDeclaredResources`, EINVAL, the module destroyed), so
+  `GetSchema` (`ModuleClassSchema.resources`) is a promise and desired state naming a resource is validated before
+  the module exists.
+- **Read-back.** A codec has a third function, `entries`, visiting every committed entry from the module's
+  control-side view under the control-plane lock, in canonical form: what a client upserts reads back byte-identical
+  under deterministic serialization (defaults omitted, one spelling per value). Equality of desired and current is
+  the codec's key bytes plus the value's deterministic bytes; the dataplane resource stays free of wire types
+  (D-044).
+- **Paused-only resources.** A resource whose values workers read unsynchronized passes a worker-running predicate to
+  its codec (`requires_paused_workers`, listed by `ListTransactionResources` and `GetSchema`). `ApplyTransaction`
+  refuses it while a worker runs its module, before anything is decoded or recorded (`RESOURCE_BUSY`, `EBUSY`, field
+  `ops`; the SDKs' `kBusy` / `*BusyError`, not retried); `ApplyPipeline` pauses the workers itself.
+- **Desired state includes resources.** `Pipeline.resources` lists `ResourceContents{name, entries}`. A *listed*
+  resource converges to exactly its entries (a listed resource with no entries is cleared); an *unlisted* one is left
+  alone, so a manifest owns only what it names. `ApplyPipeline` runs the topology transaction, then (still holding
+  the lock, before retiring the old objects) one dataplane transaction of every resource difference; if that fails
+  the topology transaction is aborted, so the apply is all or nothing. A resource-only change does not move the
+  pipeline generation; it moves the dataplane (resource) generation, which `GetPipeline`, `DiffPipeline`,
+  `PlanPipeline` and `ApplyPipeline` report (`resource_generation`) and `ApplyPipeline` can require
+  (`expected_resource_generation`, `CONFLICT` otherwise). `DiffPipeline` reports a `ResourceDelta` per listed
+  resource (created, updated, removed; `checked` false when the apply creates or replaces the module, so its entries
+  are only checked then) and `PlanPipeline` an `apply_resources` step. `GetPipeline{include_resources, resources}`
+  reads contents back, singletons without a key; a response over the 64 MiB message limit is `RESOURCE_EXHAUSTED`
+  (`EMSGSIZE`): ask for fewer by name.
+- **Actions.** `InvokeAction{daemon_epoch, module, action, Any arg}` → `{Any result, daemon_epoch}` replaces
+  `RunModuleCommand`. The command table is the action table: a `cmds` entry has `Exposure ACTION` (the default) or
+  `LEGACY_ONLY`, and an action declares its `result_type`. `GetSchema` lists a class's actions
+  (`ModuleClassSchema.actions`: name, argument and result types, thread safety), sorted; `CommandSchema` and field 6
+  (`commands`) are gone (reserved). A legacy-only name is `ENOTSUP` (`INVALID_ARGUMENT`, field `action`). Thread
+  safety and epochs are as D-115 had them.
+- **Legacy-only commands.** Every command that edits state a resource now holds (an `add`/`delete`/`clear` on a
+  table, a `set_*`, `get_runtime_config`/`set_runtime_config`, every class's `get_initial_arg`) stays reachable only
+  through the legacy `BESSControl.ModuleCommand`, with unchanged validation and effect, for pybess, the shipped
+  `.bess` samples and the UPF's pfcpiface. They are **deleted in the "delete pybess / legacy" step**, after the
+  samples are converted (D-104's order), together with the legacy service; until then a legacy edit is visible in
+  the resource read-back (each module keeps one record).
+- **Clients.** C++ SDK: `Client::InvokeAction` (and `InvokeAction<R>`), `Transaction::Set` for singletons (`Upsert` /
+  `Erase` refuse one, `Set` refuses a map), `Resource.kind` / `requires_paused_workers`,
+  `Pipeline(PipelineQuery{include_resources, resources})`, `PipelineVersion.resource_generation`,
+  `PipelineBuilder::Resource/Entry/Setting`. Go SDK the same (`InvokeAction`, `Transaction.Set`,
+  `WithResources(...)`, `PipelineVersion.ResourceGeneration`). bessctl: `action MODULE ACTION [ARG]` replaces
+  `command`; a manifest's `resources:` go into the one `ApplyPipeline` (a map as a list of `{key, value}`, `[]` to
+  clear; a singleton as its value; `@type` implied by the class's table and dropped on `get`); `get` includes
+  resources; `diff` prints each resource's `+created ~updated -removed`; `--generation G[/R]@E`.
+
+The in-tree classes:
+
+| class | resources (`*` paused-only) | legacy-only commands | actions |
+|---|---|---|---|
+| ExactMatch | `rules` map, `settings` (`ExactMatchSettings`) | add, delete, clear, set_default_gate, get/set_runtime_config, get_initial_arg | — |
+| WildcardMatch | `rules` map, `settings` (`WildcardMatchSettings`) | the same seven | — |
+| IPLookup | `routes` map | add, delete, clear | — |
+| L2Forward | `macs` map, `settings` (`L2ForwardSettings`) | add, delete, set_default_gate | lookup, populate |
+| Meter, ActionTable | `meters`, `actions` maps | — | — |
+| Router | `next_hops`, `routes` maps | — | — |
+| Source, PortInc, QueueInc, DRR, HashLB | `settings` (`<Class>Settings`) | their setters; PortInc's get_initial_arg | — |
+| FlowGen | `settings`* (`FlowGenSettings`) | update, set_burst | — |
+| Queue | `settings`* (`QueueSettings`) | set_size, set_burst, get/set_runtime_config, get_initial_arg | get_status |
+| RoundRobin, RandomSplit, Replicate, VLANPush, MPLSPop, WorkerSplit | `settings`* (their init argument) | their setters (`set_*`, MPLSPop `set`, WorkerSplit `reset`) | — |
+| Dump | `settings` (`DumpArg`) | set_interval | — |
+| ACL | `rules` (`ACLArg`, the whole list) | add, clear | — |
+| BPF | `filters`* (`BPFArg`) | add, delete, clear, get_initial_arg | — |
+| Update, RandomUpdate | `fields`* (their argument) | add, clear | — |
+| Rewrite | `templates`* (`RewriteArg`) | add, clear | — |
+| UrlFilter | `blacklist`* (`UrlFilterConfig`) | add, clear, get/set_runtime_config, get_initial_arg | — |
+| Bridge | `statics`* map | add, delete, clear | flush (new: forgets learned MACs) |
+| Vif | `interfaces`* map | add, delete, clear | — |
+| ArpResponder | `entries`* map | add | — |
+| Measure, NAT, PacketStore | — | NAT get/set_runtime_config, get_initial_arg | get_summary, clear; request_usage_report, drain_usage; release, drop, clear |
+| StaticNAT, PortOut, SetMetadata | — | get_initial_arg (StaticNAT also get/set_runtime_config) | — |
+| sample plugin SequentialUpdate | `fields`* | add, clear | — |
+| session appliance | `qos`, `actions`, `rules`, `next_hops`, `routes` maps | — | self_test (every appliance) |
+
+A list a module holds as a whole (ACL rules, BPF filters, Update fields) is a singleton of the whole list, not a map:
+its order matters and it has no natural key.
+
+**Rejected.** *Settings only as init arguments* (D-110): a change at run time then needed a command outside desired
+state. *A separate settings RPC*: a second write path beside transactions, with its own atomicity and replay. *Resources
+committed after `ApplyPipeline` in their own transactions* (bessctl's `CommitEntries` before): a failure left the new
+topology without its tables. *`RunModuleCommand` exposing every command*: two writers of the same state, one
+outside desired state and outside transactions.
+
+**Known doubts.** A read-back is canonical, not normalized: a client that spells out an implied default (a Router
+next hop's `RESOLVED`, six zero MAC bytes; FlowGen's settings, whose unset fields mean "unchanged", so a manifest
+names every field) re-upserts the same value on every apply; the dataplane value is the same, only the resource
+generation moves. WildcardMatch, ExactMatch and L2Forward read a drop default gate back as 8192 (`DROP_GATE`), since
+0 is gate 0. ExactMatch's settings store the default gate atomically into the published generation rather than
+publishing a generation (a staged generation would race a rules upsert growing the table in the same transaction).
+
+**Evidence.** Unit: `control_apply_pipeline_test` `ListedResourcesConvergeAndUnlistedOnesStay` (3 ops; same desired
+state 0 ops, generations unchanged; one rule replaced, settings unlisted: 2 ops, pipeline generation unchanged,
+resource generation moved, settings untouched; listed empty: cleared), `ResourcesReadBackApplyAsANoOpAndAreVersioned`
+(get → diff all zero → apply at the read's versions: 0 ops; stale resource generation: `kConflict`, nothing
+changed), `ARefusedResourceRollsBackTheTopology` (field `resources`, the new module absent, generation unchanged),
+`EveryDeclaredResourceReadsBackAsANoOp` (one module of every class with resources, defaults read back and applied:
+0 ops, every declared table listed); `control_api_v2_test` `InvokeAction` (epoch refused before running; a result;
+no result; unknown module, unknown action, a legacy-only command refused with nothing changed while the legacy path
+runs it; an action's own `EINVAL`), `ThreadUnsafeActionWaitsForPausedWorkers` (PacketStore `clear` behind a Queue task:
+busy, then run when paused), `PausedOnlyResourceIsBusyWhileWorkersRun` (Queue settings: `ApplyTransaction`
+`FAILED_PRECONDITION`/`RESOURCE_BUSY`, then `ApplyPipeline` listing it pauses and applies, read back without a key),
+`SchemaNamesEveryArgumentTypeAndCarriesItsDescriptors` (every action's and table's types resolve; ExactMatch lists no
+action and its two tables; L2Forward's actions are `lookup`, `populate`); `control_dataplane_transactions_test`
+(kinds and paused flags listed); every migrated module's test (round trip by `ReadBackDiffers`, packets change,
+refusals change nothing, `Action` on a legacy-only command `ENOTSUP` while the legacy command works); the SDKs' unit
+tests (kinds, `Set`, busy not retried, versions with resource generations, `InvokeAction`, builder); bessctl's
+manifest tests. Live: `ControlSdkTest.EveryResourceRoundTrips` (every class, a non-default sample of every table in
+one apply; read back and applied at its versions: 0 ops; the original desired state again: 0 ops; a listed empty
+map cleared, an unlisted one kept), the conformance cases in both SDKs (actions, a legacy-only command refused, a
+resource desired-state case), `BessctlTest` (manifest lifecycle with `G/R@E`; every sample applies and diffs to
+`0 change(s)`), the match, classifier, stateful and traffic live tests driving resources under traffic. Found on
+the way: Bridge aged a learned MAC out at once when its clock was not the worker's (`ctx->current_tsc` now, as
+conntrack and NAT); Rewrite read `jump_[63]` out of bounds with 32 templates; FlowGen's `DeInit` leaked the flows
+still scheduled (ASan, once a test destroyed a FlowGen that had run).
+
+`buf breaking` (WIRE_JSON) against the branch's previous state passes: the deleted RPC and messages are not wire
+breaks and `ModuleClassSchema` field 6 is reserved with its name.
+
+**Revisit when** the legacy service is deleted (the `LEGACY_ONLY` entries go with it), or a client needs a resource
+too large to read in one message (a paged read).
+
+**Code.** `protobuf/{control_v2,module_msg}.proto`; `core/commands.h`, `core/module.{h,cc}`;
+`core/framework/{resource_codec,singleton_resource}.h`; `core/control/{api_v2,control_plane,dataplane_transactions,
+pipeline_spec,pipeline_validator,pipeline_diff,pipeline_plan,pipeline_resources,transaction}`; `core/route/router`;
+the modules in the table and their tests; `core/testing/module_harness`; `sdk/cpp`, `sdk/go`,
+`sdk/conformance/cases.json`; `bessctl/{main,manifest}`; `tests/live`; `sample_plugin`, `examples/appliances`;
+`docs/{control-sdk,plugin-api,limits}.md`.

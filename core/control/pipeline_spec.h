@@ -114,6 +114,25 @@ struct TaskPlacementSpec {
   bool operator==(const TaskPlacementSpec &other) const = default;
 };
 
+// One entry of a resource's desired contents (D-129). A singleton's single
+// entry has no key (an empty Any). Compared by serialized bytes, as module
+// arguments are; the RPC adapter puts both into canonical wire form.
+struct ResourceEntrySpec {
+  google::protobuf::Any key;
+  google::protobuf::Any value;
+
+  bool operator==(const ResourceEntrySpec &other) const;
+};
+
+// A resource whose contents desired state owns: an apply converges it to
+// exactly `entries`. A resource desired state does not list is left alone.
+struct ResourceSpec {
+  std::string name;  // "<module>/<table>"
+  std::vector<ResourceEntrySpec> entries;
+
+  bool operator==(const ResourceSpec &other) const = default;
+};
+
 struct PipelineSpec {
   std::vector<PortSpec> ports;
   std::vector<ModuleSpec> modules;
@@ -121,6 +140,7 @@ struct PipelineSpec {
   std::vector<WorkerSpec> workers;
   std::vector<TrafficClassSpec> traffic_classes;
   std::vector<TaskPlacementSpec> tasks;
+  std::vector<ResourceSpec> resources;
 
   bool operator==(const PipelineSpec &other) const = default;
 };
@@ -128,7 +148,8 @@ struct PipelineSpec {
 // Puts a spec into canonical form: stable ordering and normalized defaults, so
 // that two descriptions of the same pipeline compare equal and diffs do not
 // churn (section 9.6). Sorting is by name (and by (upstream, ogate) for
-// connections, by wid for workers, by (module, task) for tasks); queue counts default to one queue, since
+// connections, by wid for workers, by (module, task) for tasks; resources by
+// name, their entries as given); queue counts default to one queue, since
 // that is what the runtime resolves 0 to.
 void Normalize(PipelineSpec *spec);
 

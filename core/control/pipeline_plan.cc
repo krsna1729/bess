@@ -200,6 +200,10 @@ PipelinePlan Plan(const PipelineDiff &diff) {
     }
   }
 
+  for (const ResourceDelta &resource : diff.resources) {
+    plan.resources.push_back(resource.name);
+  }
+
   return plan;
 }
 

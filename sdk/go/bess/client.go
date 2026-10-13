@@ -199,10 +199,15 @@ type Applied struct {
 }
 
 // Resource is a transactional resource, its key and value message types, and
-// the daemon epoch it was discovered under (valid only in that epoch).
+// the daemon epoch it was discovered under (valid only in that epoch). A
+// singleton (D-129) holds one value: Transaction.Set sets it; it has no key
+// and no erase. One that requires paused workers is refused (*BusyError)
+// while a worker runs its module.
 type Resource struct {
 	Name, KeyType, ValueType string
 	DaemonEpoch              uint64
+	Kind                     pb.TransactionResource_Kind // KIND_MAP or KIND_SINGLETON
+	RequiresPausedWorkers    bool
 }
 
 // RetryPolicy: how long one RPC may take and how many RPCs a commit may make
@@ -234,8 +239,8 @@ type transport interface {
 	// ApplyPipelineRequest, the response the matching response.
 	pipeline(ctx context.Context, in proto.Message) (proto.Message, metadata.MD, error)
 	// admin is one epoch-checked call that is not retried -- an Admin RPC
-	// (D-107) or RunModuleCommand (D-115): in is its request, the response
-	// the matching response.
+	// (D-107) or InvokeAction (D-129): in is its request, the response the
+	// matching response.
 	admin(ctx context.Context, in proto.Message) (proto.Message, metadata.MD, error)
 }
 
@@ -331,8 +336,8 @@ func (t grpcTransport) admin(ctx context.Context, in proto.Message) (proto.Messa
 		r, err = t.a.ResumeWorkers(ctx, req, grpc.Trailer(&md))
 	case *pb.ShutdownRequest:
 		r, err = t.a.Shutdown(ctx, req, grpc.Trailer(&md))
-	case *pb.RunModuleCommandRequest:
-		r, err = t.c.RunModuleCommand(ctx, req, grpc.Trailer(&md))
+	case *pb.InvokeActionRequest:
+		r, err = t.c.InvokeAction(ctx, req, grpc.Trailer(&md))
 	default:
 		return nil, nil, fmt.Errorf("bess: not an Admin request: %T", in)
 	}
@@ -418,8 +423,12 @@ func (c *Client) Resources(ctx context.Context, refresh bool) (map[string]Resour
 	}
 	found := make(map[string]Resource, len(r.GetResources()))
 	for _, res := range r.GetResources() {
+		kind := pb.TransactionResource_KIND_MAP // a daemon before D-129 sends none
+		if res.GetKind() == pb.TransactionResource_KIND_SINGLETON {
+			kind = pb.TransactionResource_KIND_SINGLETON
+		}
 		found[res.GetName()] = Resource{res.GetName(), res.GetKeyType(), res.GetValueType(),
-			r.GetDaemonEpoch()}
+			r.GetDaemonEpoch(), kind, res.GetRequiresPausedWorkers()}
 	}
 	c.observeEpoch(r.GetDaemonEpoch())
 	c.mu.Lock()
@@ -580,8 +589,15 @@ func (c *Client) Resource(ctx context.Context, name string) (Resource, error) {
 // -- desired state ----------------------------------------------------------------
 
 // PipelineVersion is a pipeline generation and the daemon epoch it belongs
-// to: generations restart with the daemon (D-106).
-type PipelineVersion struct{ Generation, DaemonEpoch uint64 }
+// to: generations restart with the daemon (D-106). ResourceGeneration
+// (D-129) is the dataplane transaction generation resource contents were
+// read at, when the snapshot included resources or the diff/plan's pipeline
+// listed some; WithExpectedVersion then refuses (PipelineConflictError) if
+// resource contents moved since.
+type PipelineVersion struct {
+	Generation, DaemonEpoch uint64
+	ResourceGeneration      *uint64
+}
 
 // PipelineSnapshot is the active pipeline and its version.
 type PipelineSnapshot struct {
@@ -589,15 +605,35 @@ type PipelineSnapshot struct {
 	Version  PipelineVersion
 }
 
+// PipelineQuery selects what Pipeline reads besides the topology (D-129).
+type PipelineQuery func(*pb.GetPipelineRequest)
+
+// WithResources includes resource contents (of the named resources; none
+// named: all), so the snapshot applies back as a no-op.
+func WithResources(names ...string) PipelineQuery {
+	return func(r *pb.GetPipelineRequest) {
+		r.IncludeResources = true
+		r.Resources = names
+	}
+}
+
 // Pipeline is the active pipeline as desired state.
-func (c *Client) Pipeline(ctx context.Context) (PipelineSnapshot, error) {
-	r, err := c.pipelineCall(ctx, &pb.GetPipelineRequest{}, false, 0)
+func (c *Client) Pipeline(ctx context.Context, query ...PipelineQuery) (PipelineSnapshot, error) {
+	req := &pb.GetPipelineRequest{}
+	for _, q := range query {
+		q(req)
+	}
+	r, err := c.pipelineCall(ctx, req, false, 0)
 	if err != nil {
 		return PipelineSnapshot{}, err
 	}
 	g := r.(*pb.GetPipelineResponse)
 	c.observeEpoch(g.GetDaemonEpoch())
-	return PipelineSnapshot{g.GetPipeline(), PipelineVersion{g.GetGeneration(), g.GetDaemonEpoch()}}, nil
+	v := PipelineVersion{Generation: g.GetGeneration(), DaemonEpoch: g.GetDaemonEpoch()}
+	if req.IncludeResources {
+		v.ResourceGeneration = proto.Uint64(g.GetResourceGeneration())
+	}
+	return PipelineSnapshot{g.GetPipeline(), v}, nil
 }
 
 // ValidatePipeline is the daemon's canonical form of p (InvalidRequestError
@@ -610,6 +646,16 @@ func (c *Client) ValidatePipeline(ctx context.Context, p *pb.Pipeline) (*pb.Pipe
 	return r.(*pb.ValidatePipelineResponse).GetNormalized(), nil
 }
 
+// versionOf is a diff's or plan's version: with the resource generation when
+// the pipeline lists resources.
+func versionOf(p *pb.Pipeline, generation, epoch, resources uint64) PipelineVersion {
+	v := PipelineVersion{Generation: generation, DaemonEpoch: epoch}
+	if len(p.GetResources()) > 0 {
+		v.ResourceGeneration = proto.Uint64(resources)
+	}
+	return v
+}
+
 // DiffPipeline is what applying p would change, and the version it was
 // taken against.
 func (c *Client) DiffPipeline(ctx context.Context, p *pb.Pipeline) (*pb.PipelineDiff, PipelineVersion, error) {
@@ -619,7 +665,7 @@ func (c *Client) DiffPipeline(ctx context.Context, p *pb.Pipeline) (*pb.Pipeline
 	}
 	d := r.(*pb.DiffPipelineResponse)
 	c.observeEpoch(d.GetDaemonEpoch())
-	return d.GetDiff(), PipelineVersion{d.GetGeneration(), d.GetDaemonEpoch()}, nil
+	return d.GetDiff(), versionOf(p, d.GetGeneration(), d.GetDaemonEpoch(), d.GetResourceGeneration()), nil
 }
 
 // PlanPipeline is the daemon's plan for p, and the version it was made
@@ -631,25 +677,29 @@ func (c *Client) PlanPipeline(ctx context.Context, p *pb.Pipeline) ([]*pb.PlanSt
 	}
 	pl := r.(*pb.PlanPipelineResponse)
 	c.observeEpoch(pl.GetDaemonEpoch())
-	return pl.GetSteps(), PipelineVersion{pl.GetGeneration(), pl.GetDaemonEpoch()}, nil
+	return pl.GetSteps(), versionOf(p, pl.GetGeneration(), pl.GetDaemonEpoch(), pl.GetResourceGeneration()), nil
 }
 
 // PipelineOption sets an ApplyPipeline option.
 type PipelineOption func(*pb.ApplyPipelineRequest)
 
 // WithExpectedVersion applies only if the active version is still v:
-// PipelineConflictError if the generation moved, DaemonRestartedError if the
+// PipelineConflictError if a generation moved, DaemonRestartedError if the
 // epoch did.
 func WithExpectedVersion(v PipelineVersion) PipelineOption {
 	return func(r *pb.ApplyPipelineRequest) {
 		r.ExpectedGeneration = proto.Uint64(v.Generation)
 		r.DaemonEpoch = v.DaemonEpoch
+		if v.ResourceGeneration != nil {
+			r.ExpectedResourceGeneration = proto.Uint64(*v.ResourceGeneration)
+		}
 	}
 }
 
-// ApplyPipeline makes p the active pipeline, all or nothing. Without
-// WithExpectedVersion it names the last epoch the client saw (asked for if
-// none); with it, the version's epoch, as given.
+// ApplyPipeline makes p the active pipeline, all or nothing (its listed
+// resources' contents included). Without WithExpectedVersion it names the
+// last epoch the client saw (asked for if none); with it, the version's
+// epoch, as given.
 func (c *Client) ApplyPipeline(ctx context.Context, p *pb.Pipeline, opts ...PipelineOption) (*pb.ApplyPipelineResponse, error) {
 	req := &pb.ApplyPipelineRequest{Pipeline: p}
 	for _, o := range opts {
@@ -766,32 +816,32 @@ func (c *Client) administer(ctx context.Context, in proto.Message, name func(epo
 	return c.checkEpoch(r.(epochAnswer).GetDaemonEpoch(), epoch)
 }
 
-// RunModuleCommand runs module's command with arg (D-115; Schema lists each
-// class's commands and their argument types) and returns its answer, nil when
-// it has none. Sent under the epoch the client knows and not retried: a
-// command acts when it runs. A command's EBUSY is a *BusyError with the
-// daemon's Detail (a command not marked thread-safe while a worker runs the
-// module: PauseWorkers first). Other failures are an *InvalidRequestError
-// whose Detail carries the command's errno (ErrnoValue).
-func (c *Client) RunModuleCommand(ctx context.Context, module, command string, arg proto.Message) (*anypb.Any, error) {
+// InvokeAction runs module's action with arg (D-129; Schema lists each
+// class's actions with their argument and result types) and returns its
+// result, nil when it has none. Sent under the epoch the client knows and not
+// retried: an action acts when it runs. An action's EBUSY is a *BusyError
+// with the daemon's Detail (an action not marked thread-safe while a worker
+// runs the module: PauseWorkers first). Other failures are an
+// *InvalidRequestError whose Detail carries the action's errno (ErrnoValue).
+func (c *Client) InvokeAction(ctx context.Context, module, action string, arg proto.Message) (*anypb.Any, error) {
 	packed, err := anypb.New(arg)
 	if err != nil {
-		return nil, fmt.Errorf("bess: packing the argument of %s %s: %w", module, command, err)
+		return nil, fmt.Errorf("bess: packing the argument of %s %s: %w", module, action, err)
 	}
 	epoch, err := c.knownEpoch(ctx)
 	if err != nil {
 		return nil, err
 	}
-	req := &pb.RunModuleCommandRequest{DaemonEpoch: epoch, Module: module, Command: command, Arg: packed}
+	req := &pb.InvokeActionRequest{DaemonEpoch: epoch, Module: module, Action: action, Arg: packed}
 	r, err := c.adminCall(ctx, req, epoch)
 	if err != nil {
 		return nil, err
 	}
-	resp := r.(*pb.RunModuleCommandResponse)
+	resp := r.(*pb.InvokeActionResponse)
 	if err := c.checkEpoch(resp.GetDaemonEpoch(), epoch); err != nil {
 		return nil, err
 	}
-	return resp.GetData(), nil
+	return resp.GetResult(), nil
 }
 
 // ImportPlugin loads the plugin at path (a path on the daemon's host).
@@ -1059,10 +1109,13 @@ func (t *Transaction) bind(r Resource) error {
 	return nil
 }
 
-// Upsert adds key -> value to r, or replaces its value.
+// Upsert adds key -> value to the map resource r, or replaces its value.
 func (t *Transaction) Upsert(r Resource, key, value proto.Message) error {
 	if err := t.bind(r); err != nil {
 		return err
+	}
+	if r.Kind == pb.TransactionResource_KIND_SINGLETON {
+		return &InvalidRequestError{Message: fmt.Sprintf("resource %q is a singleton: Set its value", r.Name)}
 	}
 	if err := checkType(r, "key", key, r.KeyType); err != nil {
 		return err
@@ -1082,10 +1135,32 @@ func (t *Transaction) Upsert(r Resource, key, value proto.Message) error {
 	return nil
 }
 
-// Erase removes key from r.
+// Set sets the singleton resource r to value (D-129).
+func (t *Transaction) Set(r Resource, value proto.Message) error {
+	if err := t.bind(r); err != nil {
+		return err
+	}
+	if r.Kind != pb.TransactionResource_KIND_SINGLETON {
+		return &InvalidRequestError{Message: fmt.Sprintf("resource %q is a map: Upsert its entries", r.Name)}
+	}
+	if err := checkType(r, "value", value, r.ValueType); err != nil {
+		return err
+	}
+	v, err := anypb.New(value)
+	if err != nil {
+		return &InvalidRequestError{Message: err.Error()}
+	}
+	t.ops = append(t.ops, &pb.TransactionOp{Resource: r.Name, Value: v})
+	return nil
+}
+
+// Erase removes key from the map resource r.
 func (t *Transaction) Erase(r Resource, key proto.Message) error {
 	if err := t.bind(r); err != nil {
 		return err
+	}
+	if r.Kind == pb.TransactionResource_KIND_SINGLETON {
+		return &InvalidRequestError{Message: fmt.Sprintf("resource %q is a singleton: it is set, not erased", r.Name)}
 	}
 	if err := checkType(r, "key", key, r.KeyType); err != nil {
 		return err
@@ -1160,8 +1235,15 @@ func (c *Client) commit(ctx context.Context, req *pb.ApplyTransactionRequest, ep
 			cancel()
 			if err != nil {
 				if !noAnswer(err, md) {
-					if d := errorDetail(md); d.GetCode() == pb.ErrorDetail_EPOCH_MISMATCH {
+					d := errorDetail(md)
+					if d.GetCode() == pb.ErrorDetail_EPOCH_MISMATCH {
 						return nil, c.refusedEpoch(epoch, d)
+					}
+					// A resource that changes only with its workers paused,
+					// while one runs (D-129): nothing was tried, and retrying
+					// will not help until the caller pauses the workers.
+					if d.GetCode() == pb.ErrorDetail_RESOURCE_BUSY {
+						return nil, &BusyError{Attempts: 1, Detail: d}
 					}
 					return nil, translate(err, md)
 				}

@@ -90,18 +90,62 @@
       ]
     },
     {
-      "name": "module_command",
+      "name": "actions",
       "steps": [
-        {"do": "module_command", "class": "ExactMatch", "module": "$module",
-         "command": "set_default_gate", "arg": {"gate": 2}},
-        {"do": "module_command", "class": "ExactMatch", "module": "$module",
-         "command": "get_runtime_config", "arg": {}, "want_answer": {"default_gate": "2"}},
-        {"do": "module_command", "class": "ExactMatch", "module": "$module",
-         "command": "set_default_gate", "arg": {"gate": 3}},
-        {"do": "module_command", "module": "$module", "command": "no_such_command",
+        {"do": "pipeline", "add": [["conf_l2", "L2Forward"], ["conf_measure", "Measure"]]},
+        {"do": "action", "class": "L2Forward", "module": "conf_l2", "action": "populate",
+         "arg": {"base": "02:00:00:00:00:00", "count": 3, "gate_count": 2}},
+        {"do": "action", "class": "L2Forward", "module": "conf_l2", "action": "lookup",
+         "arg": {"addrs": ["02:00:00:00:00:00", "02:00:00:00:00:01", "02:00:00:00:00:02"]},
+         "want_answer": {"gates": ["0", "1", "0"]}},
+        {"do": "action", "class": "L2Forward", "module": "conf_l2", "action": "lookup",
+         "arg": {"addrs": ["02:00:00:00:00:09"]}, "want_error": "invalid_request"},
+        {"do": "action", "class": "Measure", "module": "conf_measure", "action": "clear", "arg": {}},
+        {"do": "action", "class": "Measure", "module": "conf_measure", "action": "get_summary",
+         "arg": {}},
+        {"do": "action", "module": "conf_l2", "action": "add",
+         "arg_type": "bess.pb.L2ForwardCommandAddArg",
+         "arg": {"entries": [{"addr": "02:00:00:00:00:09", "gate": 1}]}, "want_error": "invalid_request"},
+        {"do": "action", "module": "$module", "action": "set_default_gate",
+         "arg_type": "bess.pb.ExactMatchCommandSetDefaultGateArg", "arg": {"gate": 2},
+         "want_error": "invalid_request"},
+        {"do": "pipeline", "with_resources": ["$module/settings"],
+         "want_resources": {"$module/settings": [{"value": {"default_gate": 3}}]}},
+        {"do": "action", "module": "$module", "action": "no_such_action",
          "arg_type": "bess.pb.EmptyArg", "arg": {}, "want_error": "invalid_request"},
-        {"do": "module_command", "class": "ExactMatch", "module": "no_such_module",
-         "command": "get_runtime_config", "arg": {}, "want_error": "invalid_request"}
+        {"do": "action", "class": "L2Forward", "module": "no_such_module", "action": "lookup",
+         "arg": {"addrs": []}, "want_error": "invalid_request"},
+        {"do": "pipeline", "remove": ["conf_l2", "conf_measure"]}
+      ]
+    },
+    {
+      "name": "resources_desired_state",
+      "steps": [
+        {"do": "pipeline", "add": [["conf_em", "ExactMatch", {"fields": [{"offset": 30, "num_bytes": 4}]}]],
+         "resources": {
+           "conf_em/rules": [
+             {"key": {"fields": [{"value_bin": "CgAAAQ=="}]}, "value": {"gate": 1}},
+             {"key": {"fields": [{"value_bin": "CgAAAg=="}]}, "value": {"gate": 2}}
+           ],
+           "conf_em/settings": [{"value": {"default_gate": 3}}]
+         },
+         "want_resource_ops": 3},
+        {"do": "pipeline", "with_resources": ["conf_em/rules", "conf_em/settings"], "as": "r1",
+         "want_resources": {
+           "conf_em/rules": [
+             {"key": {"fields": [{"value_bin": "CgAAAg=="}]}, "value": {"gate": 2}},
+             {"key": {"fields": [{"value_bin": "CgAAAQ=="}]}, "value": {"gate": 1}}
+           ],
+           "conf_em/settings": [{"value": {"default_gate": 3}}]
+         }},
+        {"do": "pipeline", "base": "r1", "at_version_of": "r1", "want_changes": 0,
+         "want_resource_ops": 0, "want_generation_of": "r1", "want_resource_generation_of": "r1"},
+        {"do": "pipeline", "resources": {"conf_em/rules": []}, "want_resource_ops": 2,
+         "want_generation_of": "r1"},
+        {"do": "pipeline", "with_resources": ["conf_em/rules", "conf_em/settings"],
+         "want_resources": {"conf_em/rules": [], "conf_em/settings": [{"value": {"default_gate": 3}}]}},
+        {"do": "pipeline", "base": "r1", "at_version_of": "r1", "want_error": "pipeline_conflict"},
+        {"do": "pipeline", "remove": ["conf_em"]}
       ]
     }
   ]

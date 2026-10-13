@@ -6,7 +6,9 @@
 #define BESS_MODULES_FLOWGEN_H_
 
 #include <atomic>
+#include <optional>
 
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 
@@ -51,25 +53,19 @@ class FlowGen final : public Module {
         generated_flows_(),
         flows_free_(),
         events_(),
-        tmpl_(),
-        template_size_(),
+        params_(),
         rng_(),
-        arrival_(),
-        duration_(),
         quick_rampup_(),
-        total_pps_(),
-        flow_rate_(),
-        flow_duration_(),
-        concurrent_flows_(),
-        flow_pps_(),
-        flow_pkts_(),
-        flow_gap_ns_(),
-        pareto_(),
         burst_() {
     is_task_ = true;
   }
 
   static const Commands cmds;
+  // "settings" (FlowGenSettings): what `update` and `set_burst` set; the
+  // task reads the generator's parameters unsynchronized, so it requires
+  // paused workers (D-129).
+  static const ResourceTables resource_tables;
+
   CommandResponse Init(const bess::pb::FlowGenArg &arg);
   CommandResponse CommandUpdate(const bess::pb::FlowGenArg &arg);
   CommandResponse CommandSetBurst(
@@ -83,21 +79,66 @@ class FlowGen final : public Module {
   std::string GetDesc() const override;
 
  private:
-  void UpdateDerivedParameters();
+  // What `update` changes: the template, the load and the distributions,
+  // and what is derived from them. Only the control thread writes it (Init,
+  // update, the settings resource with workers paused); the task reads it.
+  struct Params {
+    unsigned char tmpl[MAX_TEMPLATE_SIZE] = {};
+    int template_size = 0;
+    uint8_t l4_proto = 0;
+
+    /* base ip and ports IN HOST ORDER */
+    uint32_t ip_src_base = 0;
+    uint32_t ip_dst_base = 0;
+    uint16_t port_src_base = 0;
+    uint16_t port_dst_base = 0;
+
+    Arrival arrival = Arrival::kUniform;
+    Duration duration = Duration::kUniform;
+
+    /* load parameters */
+    double total_pps = 0;
+    double flow_rate = 0;     /* in flows/s */
+    double flow_duration = 0; /* in seconds */
+
+    /* derived variables */
+    double concurrent_flows = 0; /* expected # of flows */
+    double flow_pps = 0;         /* packets/s/flow */
+    double flow_pkts = 0;        /* flow_pps * flow_duration */
+    double flow_gap_ns = 0;      /* == 10^9 / flow_rate */
+
+    struct {
+      double alpha;
+      double inversed_alpha; /* 1.0 / alpha */
+      double mean;           /* determined by alpha */
+    } pareto = {};
+  };
+
+  // A staged settings value: the parameters to install, and the burst
+  // (unset: unchanged).
+  struct Settings {
+    Params params;
+    std::optional<int> burst;
+  };
+
+  static void UpdateDerivedParameters(Params *p);
   double NewFlowPkts();
   double MaxFlowPkts() const;
   uint64_t NextFlowArrival();
   struct flow *ScheduleFlow(uint64_t time_ns);
-  void MeasureParetoMean();
+  static void MeasureParetoMean(Params *p);
   void PopulateInitialFlows();
 
-  CommandResponse UpdateBaseAddresses();
+  static void UpdateBaseAddresses(Params *p);
   bess::PacketRef FillUdpPacket(struct flow *f);
   bess::PacketRef FillTcpPacket(struct flow *f);
   void GeneratePackets(Context *ctx, bess::PacketBatch *batch);
 
   CommandResponse ProcessArguments(const bess::pb::FlowGenArg &arg);
-  CommandResponse ProcessUpdatableArguments(const bess::pb::FlowGenArg &arg);
+  // Validates `update`'s fields and applies them to `p` (zero or empty:
+  // unchanged). `p` is half-updated on a refusal.
+  static CommandResponse ProcessUpdatableArguments(
+      const bess::pb::FlowGenArg &arg, Params *p);
 
   // the number of concurrent flows
   int active_flows_;
@@ -109,28 +150,12 @@ class FlowGen final : public Module {
   // Priority queue of future events
   EventQueue events_;
 
-  unsigned char tmpl_[MAX_TEMPLATE_SIZE] = {};
-  int template_size_;
-  uint8_t l4_proto_;
+  Params params_;
 
   Random rng_;
 
-  Arrival arrival_;
-  Duration duration_;
-
   /* behavior parameters */
   int quick_rampup_;
-
-  /* load parameters */
-  double total_pps_;
-  double flow_rate_;     /* in flows/s */
-  double flow_duration_; /* in seconds */
-
-  /* derived variables */
-  double concurrent_flows_; /* expected # of flows */
-  double flow_pps_;         /* packets/s/flow */
-  double flow_pkts_;        /* flow_pps * flow_duration */
-  double flow_gap_ns_;      /* == 10^9 / flow_rate */
 
   /* ranges over which to vary ips and ports */
   uint32_t ip_src_range_;
@@ -138,21 +163,11 @@ class FlowGen final : public Module {
   uint16_t port_src_range_;
   uint16_t port_dst_range_;
 
-  /* base ip and ports IN HOST ORDER */
-  uint32_t ip_src_base_;
-  uint32_t ip_dst_base_;
-  uint16_t port_src_base_;
-  uint16_t port_dst_base_;
-
-  struct {
-    double alpha;
-    double inversed_alpha; /* 1.0 / alpha */
-    double mean;           /* determined by alpha */
-  } pareto_;
-
   // Set by THREAD_SAFE commands while workers read it.
-
   std::atomic<int> burst_;
+
+  // "<name>/settings"; after the state it sets.
+  bess::framework::Singleton<bess::pb::FlowGenSettings, Settings> settings_;
 };
 
 #endif  // BESS_MODULES_FLOWGEN_H_

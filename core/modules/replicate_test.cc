@@ -8,9 +8,14 @@
 #include <cerrno>
 #include <cstdint>
 #include <random>
+#include <string>
 #include <vector>
 
+#include "dataplane/transaction_engine.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
 #include "pb/module_msg.pb.h"
+#include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
 
@@ -69,6 +74,72 @@ TEST(ReplicateTest, GatesAreValidated) {
   ASSERT_EQ(1u, out[1].size());
   EXPECT_EQ(pkt, out[1][0]);
   EXPECT_TRUE(out[2].empty());
+}
+
+// True when "<resource>"'s codec says applying it requires paused workers.
+bool RequiresPausedWorkers(const std::string &resource) {
+  const bess::dataplane::Resource *r =
+      bess::runtime::runtime().transactions().FindResource(resource);
+  EXPECT_NE(nullptr, r) << resource;
+  if (r == nullptr) {
+    return false;
+  }
+  const bess::framework::ResourceCodec *codec =
+      bess::framework::ResourceBindings::ProcessDefault().Find(*r);
+  EXPECT_NE(nullptr, codec) << resource;
+  return codec != nullptr && codec->requires_paused_workers();
+}
+
+// D-129: "<name>/settings" holds the gates.
+TEST(ReplicateTest, SettingsResourceSetsGates) {
+  ModuleHarness h;
+  Module *rep = h.Create("Replicate", Gates({0, 1}), "rp");
+  ASSERT_NE(nullptr, rep);
+  ASSERT_EQ("", h.SetResource("rp/settings", Gates({0, 2})));
+  std::mt19937 rng(1);
+  const Bytes pkt = bess::testing::TcpPacket(FlowSpec{}, rng);
+  auto out = h.Run(rep, 0, {pkt}, {0, 1, 2});
+  EXPECT_EQ(1u, out[0].size());
+  EXPECT_TRUE(out[1].empty());
+  EXPECT_EQ(1u, out[2].size());
+}
+
+TEST(ReplicateTest, SettingsReadBackMatches) {
+  ModuleHarness h;
+  ASSERT_NE(nullptr, h.Create("Replicate", Gates({0, 1}), "rp"));
+  const bess::pb::ReplicateArg initial = Gates({0, 1});
+  EXPECT_EQ("", h.ReadBackDiffers("rp/settings", {{nullptr, &initial}}));
+  const bess::pb::ReplicateArg s = Gates({0, 5, 31});
+  ASSERT_EQ("", h.SetResource("rp/settings", s));
+  EXPECT_EQ("", h.ReadBackDiffers("rp/settings", {{nullptr, &s}}));
+}
+
+TEST(ReplicateTest, SettingsBadGatesRefused) {
+  ModuleHarness h;
+  ASSERT_NE(nullptr, h.Create("Replicate", Gates({0, 1}), "rp"));
+  EXPECT_NE("", h.SetResource("rp/settings", Gates({32})));
+  EXPECT_NE("", h.SetResource("rp/settings", Gates({-1})));
+  const bess::pb::ReplicateArg unchanged = Gates({0, 1});
+  EXPECT_EQ("", h.ReadBackDiffers("rp/settings", {{nullptr, &unchanged}}));
+}
+
+TEST(ReplicateTest, SettingsRequirePausedWorkers) {
+  ModuleHarness h;
+  ASSERT_NE(nullptr, h.Create("Replicate", Gates({0}), "rp"));
+  EXPECT_TRUE(RequiresPausedWorkers("rp/settings"));
+}
+
+TEST(ReplicateTest, SetGatesIsLegacyOnly) {
+  ModuleHarness h;
+  Module *rep = h.Create("Replicate", Gates({0}), "rp");
+  ASSERT_NE(nullptr, rep);
+  bess::pb::ReplicateCommandSetGatesArg set;
+  set.add_gates(0);
+  set.add_gates(3);
+  EXPECT_EQ(ENOTSUP, h.Action(rep, "set_gates", set).error().code());
+  h.MustCommand(rep, "set_gates", set);
+  const bess::pb::ReplicateArg s = Gates({0, 3});
+  EXPECT_EQ("", h.ReadBackDiffers("rp/settings", {{nullptr, &s}}));
 }
 
 }  // namespace

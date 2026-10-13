@@ -22,7 +22,9 @@
 //   - round trip: the decoded message re-serializes to bytes that parse back
 //     to an equal message and re-serialize identically, and decoding those
 //     bytes packed in a google.protobuf.Any (as a controller sends them)
-//     yields the same result.
+//     yields the same result;
+//   - Entries passes the typed read-back to the type-erased visitor
+//     unchanged (the messages the entries function visits, once each).
 
 #include <any>
 #include <cstddef>
@@ -274,7 +276,9 @@ void Run(KeyResult (*key_fn)(const KeyMsg &),
         calls++;
         seen_value = m;
         return value_fn(m);
-      });
+      },
+      // The read-back: the last messages the conversion functions saw.
+      [&](const auto &visit) { visit(seen_key, seen_value); });
   const ResourceCodec &codec = typed;
   FUZZ_CHECK(codec.key_type() == KeyMsg::descriptor()->full_name());
   FUZZ_CHECK(codec.value_type() == ValueMsg::descriptor()->full_name());
@@ -294,6 +298,20 @@ void Run(KeyResult (*key_fn)(const KeyMsg &),
         },
         key_fn, seen_key, calls, SameKey, project);
   }
+
+  // Entries hands the typed read-back to the interface's visitor unchanged,
+  // once per entry, without running a conversion function.
+  int visited = 0;
+  codec.Entries([&](const google::protobuf::Message &key,
+                    const google::protobuf::Message &value) {
+    visited++;
+    FUZZ_CHECK(key.GetDescriptor() == KeyMsg::descriptor());
+    FUZZ_CHECK(value.GetDescriptor() == ValueMsg::descriptor());
+    FUZZ_CHECK(MessageDifferencer::Equals(key, seen_key));
+    FUZZ_CHECK(MessageDifferencer::Equals(value, seen_value));
+  });
+  FUZZ_CHECK(visited == 1);
+  FUZZ_CHECK(calls == 0 || calls == 2);
 }
 
 }  // namespace

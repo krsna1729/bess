@@ -4,6 +4,8 @@
 #include "url_filter.h"
 
 #include <algorithm>
+#include <expected>
+#include <string>
 #include <tuple>
 
 #include "utils/checksum.h"
@@ -19,17 +21,24 @@ using bess::utils::be16_t;
 
 const uint64_t TIME_OUT_NS = 10ull * 1000 * 1000 * 1000;  // 10 seconds
 
+// D-129: "<name>/blacklist" holds the blacklist; every command edits or
+// reads it back and stays for the legacy ModuleCommand only.
 const Commands UrlFilter::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&UrlFilter::GetInitialArg),
-     Command::THREAD_SAFE},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
     {"get_runtime_config", "EmptyArg",
-     MODULE_CMD_FUNC(&UrlFilter::GetRuntimeConfig), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&UrlFilter::GetRuntimeConfig), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"set_runtime_config", "UrlFilterConfig",
-     MODULE_CMD_FUNC(&UrlFilter::SetRuntimeConfig), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&UrlFilter::SetRuntimeConfig), Command::THREAD_UNSAFE, "",
+     Command::LEGACY_ONLY},
     {"add", "UrlFilterArg", MODULE_CMD_FUNC(&UrlFilter::CommandAdd),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
     {"clear", "EmptyArg", MODULE_CMD_FUNC(&UrlFilter::CommandClear),
-     Command::THREAD_UNSAFE}};
+     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY}};
+
+const ResourceTables UrlFilter::resource_tables = {
+    ResourceTable::Singleton<bess::pb::UrlFilterConfig>("blacklist", true)};
 
 // Template for generating TCP packets without data
 struct[[gnu::packed]] PacketTemplate {
@@ -155,20 +164,55 @@ inline static bess::PacketRef GenerateResetPacket(
   return pkt;
 }
 
+void UrlFilter::Insert(
+    const google::protobuf::RepeatedPtrField<bess::pb::UrlFilterArg_Url> &urls,
+    Blacklist *blacklist) {
+  for (const auto &url : urls) {
+    (*blacklist)[url.host()].Insert(url.path(), {});
+  }
+}
+
 CommandResponse UrlFilter::Init(const bess::pb::UrlFilterArg &arg) {
-  for (const auto &url : arg.blacklist()) {
-    blacklist_[url.host()].Insert(url.path(), {});
+  Insert(arg.blacklist(), &blacklist_);
+  *config_.mutable_blacklist() = arg.blacklist();
+
+  // Stage builds the whole blacklist; apply swaps it in. The blacklist it
+  // replaced is freed with the staged value. ProcessBatch reads blacklist_
+  // in place: paused workers only.
+  auto registered = blacklist_resource_.Register(
+      init_context().resources(), init_context().codecs(),
+      name() + "/blacklist",
+      [](const bess::pb::UrlFilterConfig &v)
+          -> std::expected<Staged, std::string> {
+        Staged staged;
+        Insert(v.blacklist(), &staged.blacklist);
+        staged.config = v;
+        return staged;
+      },
+      [this](Staged &s) {
+        blacklist_.swap(s.blacklist);
+        config_.Swap(&s.config);
+      },
+      [this] { return config_; }, [this] { return HasRunningWorker(); });
+  if (!registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
   return CommandSuccess();
 }
 
+void UrlFilter::DeInit() {
+  blacklist_resource_.Release();
+}
+
 CommandResponse UrlFilter::CommandAdd(const bess::pb::UrlFilterArg &arg) {
-  Init(arg);
+  Insert(arg.blacklist(), &blacklist_);
+  config_.mutable_blacklist()->MergeFrom(arg.blacklist());
   return CommandSuccess();
 }
 
 CommandResponse UrlFilter::CommandClear(const bess::pb::EmptyArg &) {
   blacklist_.clear();
+  config_.Clear();
   return CommandSuccess();
 }
 
@@ -209,9 +253,8 @@ CommandResponse UrlFilter::GetRuntimeConfig(const bess::pb::EmptyArg &) {
 CommandResponse UrlFilter::SetRuntimeConfig(
     const bess::pb::UrlFilterConfig &arg) {
   blacklist_.clear();
-  for (const auto &url : arg.blacklist()) {
-    blacklist_[url.host()].Insert(url.path(), {});
-  }
+  Insert(arg.blacklist(), &blacklist_);
+  config_ = arg;
   return CommandSuccess();
 }
 

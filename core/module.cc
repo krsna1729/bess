@@ -18,17 +18,19 @@
 #include "utils/pcap.h"
 
 const Commands Module::cmds;
+const ResourceTables Module::resource_tables;
 
 bool ModuleBuilder::RegisterModuleClass(
     std::function<Module *()> module_generator, const std::string &class_name,
     const std::string &name_template, const std::string &help_text,
     const gate_idx_t igates, const gate_idx_t ogates, const Commands &cmds,
-    module_init_func_t init_func, const std::string &init_arg_type) {
+    const ResourceTables &resource_tables, module_init_func_t init_func,
+    const std::string &init_arg_type) {
   all_module_builders_holder().emplace(
       std::piecewise_construct, std::forward_as_tuple(class_name),
       std::forward_as_tuple(module_generator, class_name, name_template,
-                            help_text, igates, ogates, cmds, init_func,
-                            init_arg_type));
+                            help_text, igates, ogates, cmds, resource_tables,
+                            init_func, init_arg_type));
   return true;
 }
 
@@ -66,11 +68,26 @@ const std::map<std::string, ModuleBuilder>
   return all_module_builders_holder();
 }
 
-CommandResponse ModuleBuilder::RunCommand(
-    Module *m, const std::string &user_cmd,
-    const google::protobuf::Any &arg) const {
+const ResourceTable *ModuleBuilder::FindResourceTable(std::string_view table) const {
+  for (const ResourceTable &t : resource_tables_) {
+    if (t.table == table) {
+      return &t;
+    }
+  }
+  return nullptr;
+}
+
+CommandResponse ModuleBuilder::RunCommand(Module *m, const std::string &user_cmd,
+                                          const google::protobuf::Any &arg,
+                                          CommandSurface surface) const {
   for (auto &cmd : cmds_) {
     if (user_cmd == cmd.cmd) {
+      if (surface == CommandSurface::kActions && cmd.exposure != Command::ACTION) {
+        return CommandFailure(ENOTSUP,
+                              "'%s' has no action '%s': it edits state, which "
+                              "its resources hold",
+                              class_name_.c_str(), user_cmd.c_str());
+      }
       if (cmd.mt_safe != Command::THREAD_SAFE && m->HasRunningWorker()) {
         return CommandFailure(EBUSY,
                               "There is a running worker and command "
@@ -82,14 +99,16 @@ CommandResponse ModuleBuilder::RunCommand(
     }
   }
 
-  if (user_cmd == "get_initial_arg") {
+  if (surface == CommandSurface::kLegacy && user_cmd == "get_initial_arg") {
     CommandResponse ret;
     *ret.mutable_data() = m->initial_arg_;
     return ret;
   }
 
-  return CommandFailure(ENOTSUP, "'%s' does not support command '%s'",
-                        class_name_.c_str(), user_cmd.c_str());
+  return CommandFailure(ENOTSUP, "'%s' does not support %s '%s'",
+                        class_name_.c_str(),
+                        surface == CommandSurface::kActions ? "action" : "command",
+                        user_cmd.c_str());
 }
 
 CommandResponse ModuleBuilder::RunInit(Module *m,

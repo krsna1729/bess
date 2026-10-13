@@ -36,6 +36,9 @@ class Router final : public Module {
   static const gate_idx_t kNumOGates = MAX_GATES;
 
   static const Commands cmds;
+  // "<module>/next_hops" (RouterNextHopIdKey -> RouterNextHopValue) and
+  // "<module>/routes" (RouterRouteKey -> RouterRouteValue), D-129.
+  static const ResourceTables resource_tables;
 
   Router() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 

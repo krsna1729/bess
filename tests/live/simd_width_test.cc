@@ -142,6 +142,10 @@ TEST_P(SimdWidthLiveTest, ForwardsAndShutsDownWithoutSigill) {
   v2::TaskPlacement drr_task;
   drr_task.set_module("drr");
   drr_task.set_parent("drr_rl");
+  // The default route, as the "ipl/routes" resource (D-129).
+  auto route_key = types.Make("bess.pb.IPLookupRouteKey", R"({"prefix": "0.0.0.0"})");
+  auto route_value = types.Make("bess.pb.IPLookupRouteValue", R"({"gate": 0})");
+  ASSERT_TRUE(route_key && route_value);
   auto pipeline = bess::sdk::PipelineBuilder()
                       .Worker(0, std::nullopt, "")
                       .TrafficClass(rl)
@@ -160,14 +164,11 @@ TEST_P(SimdWidthLiveTest, ForwardsAndShutsDownWithoutSigill) {
                               "drr", "sink"})
                       .Task(src_task)
                       .Task(drr_task)
+                      .Entry("ipl/routes", *route_key, *route_value)
                       .Build();
   ASSERT_TRUE(pipeline) << pipeline.error().message;
   auto applied = client.ApplyPipeline(*pipeline);
   ASSERT_TRUE(applied) << applied.error().message << "\n" << d->Log();
-  auto route = types.Make("bess.pb.IPLookupCommandAddArg",
-                          R"({"prefix": "0.0.0.0", "prefix_len": 0, "gate": 0})");
-  auto added = client.RunModuleCommand("ipl", "add", *route);
-  ASSERT_TRUE(added) << added.error().message;
 
   ASSERT_TRUE(client.ResumeWorkers());
   std::this_thread::sleep_for(std::chrono::milliseconds(1500));

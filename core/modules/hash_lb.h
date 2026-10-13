@@ -8,10 +8,11 @@
 #include <memory>
 #include <vector>
 
+#include "framework/exact_match_table.h"
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "rcu/rcu_ptr.h"
-#include "framework/exact_match_table.h"
 
 using bess::framework::ExactMatchField;
 using bess::framework::ExactMatchKey;
@@ -21,21 +22,26 @@ using bess::framework::ExactMatchTable;
 // Splits packets across output gates by a hash of L2/L3/L4 or chosen fields.
 //
 // The configuration (mode, gate list, field layout) is one immutable object
-// published through an RcuPtr: `set_mode` and `set_gates` build a replacement
-// and publish it while workers keep processing (G1.2 mode G; the
-// configuration is small and changes rarely). A batch reads it once.
+// published through an RcuPtr: the legacy `set_mode` and `set_gates` and the
+// "<name>/settings" resource (HashLBSettings, D-129) build a replacement and
+// publish it while workers keep processing (G1.2 mode G; the configuration
+// is small and changes rarely). A batch reads it once.
 // Decision D-017 (docs/decisions.md)
 class HashLB final : public Module {
  public:
   static const gate_idx_t kNumOGates = MAX_GATES;
 
   static const Commands cmds;
+  // "settings" (HashLBSettings): mode, fields and gates, applied live by an
+  // RCU swap (D-129).
+  static const ResourceTables resource_tables;
 
   HashLB() : Module(), config_(init_context().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 
   CommandResponse Init(const bess::pb::HashLBArg &arg);
+  void DeInit() override;
 
   std::string GetDesc() const override;
 
@@ -58,6 +64,9 @@ class HashLB final : public Module {
     std::shared_ptr<const ExactMatchTable<int>> fields_table =
         std::make_shared<const ExactMatchTable<int>>();
     ExactMatchKeyHash hasher{0};
+    // What set it, as set (mode and fields as set_mode, gates as set_gates
+    // got them): the settings resource's read-back.
+    bess::pb::HashLBSettings settings;
   };
 
   template <Mode mode>
@@ -75,6 +84,11 @@ class HashLB final : public Module {
   void Install(Config config);
 
   bess::rcu::RcuPtr<Config> config_;
+
+  // "<name>/settings": stages a whole Config, swaps it in; after config_.
+  bess::framework::Singleton<bess::pb::HashLBSettings,
+                             std::unique_ptr<const Config>>
+      settings_;
 };
 
 #endif  // BESS_MODULES_HASHLB_H_

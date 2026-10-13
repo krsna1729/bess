@@ -6,8 +6,9 @@
 # 10.0.0.1); the module turns it into the reply and sends it to the Sink.
 #
 # Converted from arp.bess (D-104): the entry is the init argument (Init adds
-# it, as the `add` command does). The script's scapy packet took its ARP
-# sender address from the host's interface; here the sender is fixed.
+# it to the resource arp/entries, which `bessctl get` lists). The script's
+# scapy packet took its ARP sender address from the host's interface; here
+# the sender is fixed.
 modules:
   - name: arp
     mclass: ArpResponder

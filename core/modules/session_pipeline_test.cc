@@ -879,4 +879,267 @@ TEST_F(SessionPacketPathTest, RemovedSessionIsDropped) {
   EXPECT_TRUE(Egress({pkt}).empty());
 }
 
+// -- D-129: the resources as a client writes and reads them --------------------
+
+// One session as wire messages: the meter (`burst` bytes, no refill), the
+// next hop to kEgressGate, the route to it, the action naming both, and the
+// rule selecting the action.
+struct WireSession {
+  bess::pb::MeterIdKey meter_key;
+  bess::pb::MeterPolicyValue meter;
+  bess::pb::RouterNextHopIdKey hop_key;
+  bess::pb::RouterNextHopValue hop;
+  bess::pb::RouterRouteKey route_key;
+  bess::pb::RouterRouteValue route;
+  bess::pb::ActionIdKey action_key;
+  bess::pb::ActionValue action;
+  bess::pb::ExactMatchRuleKey rule_key;
+  bess::pb::ExactMatchRuleValue rule;
+};
+
+WireSession MakeWireSession(const char *sip, uint16_t sport, uint64_t burst) {
+  WireSession s;
+  s.meter_key.set_id(1);
+  auto *tr = s.meter.mutable_tr_tcm();
+  tr->set_committed_rate(1);
+  tr->set_committed_burst(burst);
+  tr->set_peak_rate(1);
+  tr->set_peak_burst(burst);
+  s.hop_key.set_id(1);
+  s.hop.set_egress_gate(kEgressGate);
+  // Resolved: no neighbor, the canonical form (defaults omitted).
+  s.hop.set_dst_mac(std::string("\x02\x00\x00\x00\x00\x01", 6));
+  s.hop.set_src_mac(std::string("\x02\x00\x00\x00\x00\x02", 6));
+  s.route_key.set_ipv4("10.0.0.0");
+  s.route_key.set_prefix_length(8);
+  s.route.set_next_hop_id(1);
+  s.action_key.set_id(1);
+  s.action.set_meter_id(1);
+  s.action.set_next_hop_id(1);
+  const std::string key = WireKey(sip, sport);
+  s.rule_key.add_fields()->set_value_bin(key.substr(0, 4));
+  s.rule_key.add_fields()->set_value_bin(key.substr(4));
+  s.rule.set_action_id(1);
+  return s;
+}
+
+// The session written as a client writes it steers and polices its packets
+// as the internal operations do, and every resource reads back exactly what
+// was upserted -- the action's references to the meter and the next hop, and
+// the route's to the next hop, included.
+TEST_F(SessionPacketPathTest, WireSessionSteersPolicesAndReadsBack) {
+  const WireSession s = MakeWireSession("10.1.2.3", 1234, 100);
+  // Referents first: each call is its own transaction.
+  ASSERT_EQ("", h_.UpsertResource("mt/meters", s.meter_key, s.meter));
+  ASSERT_EQ("", h_.UpsertResource("rt/next_hops", s.hop_key, s.hop));
+  ASSERT_EQ("", h_.UpsertResource("rt/routes", s.route_key, s.route));
+  ASSERT_EQ("", h_.UpsertResource("at/actions", s.action_key, s.action));
+  ASSERT_EQ("", h_.UpsertResource("em/rules", s.rule_key, s.rule));
+
+  const auto pkt1 = SessionPacket("10.1.2.3", 1234, rng_);
+  const auto pkt2 = SessionPacket("10.1.2.3", 1234, rng_);
+  EXPECT_EQ((std::vector<bess::testing::Bytes>{pkt1}), Egress({pkt1, pkt2}));
+
+  EXPECT_EQ("", h_.ReadBackDiffers("mt/meters", {{&s.meter_key, &s.meter}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops", {{&s.hop_key, &s.hop}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("rt/routes", {{&s.route_key, &s.route}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("at/actions", {{&s.action_key, &s.action}}));
+}
+
+// Every meter profile, neighbor state, the default route and actions with and
+// without references read back as written; a reconfiguration reads back the
+// new value, and an erased entry is gone from the read-back at once -- also a
+// meter, whose removal stage has not run yet.
+TEST_F(SessionPacketPathTest, ReadBackFollowsUpsertsAndErases) {
+  bess::pb::MeterIdKey m1, m2, m3;
+  m1.set_id(1);
+  m2.set_id(2);
+  m3.set_id(3);
+  bess::pb::MeterPolicyValue sr, tr, rfc;
+  sr.mutable_sr_tcm()->set_committed_rate(1000);
+  sr.mutable_sr_tcm()->set_committed_burst(1500);
+  tr.mutable_tr_tcm()->set_committed_rate(1000);
+  tr.mutable_tr_tcm()->set_committed_burst(1500);
+  tr.mutable_tr_tcm()->set_peak_rate(2000);
+  tr.mutable_tr_tcm()->set_peak_burst(3000);
+  rfc.mutable_tr_tcm_rfc4115()->set_committed_rate(1000);
+  rfc.mutable_tr_tcm_rfc4115()->set_committed_burst(1500);
+  rfc.mutable_tr_tcm_rfc4115()->set_excess_rate(500);
+  rfc.mutable_tr_tcm_rfc4115()->set_excess_burst(700);
+  ASSERT_EQ("", h_.UpsertResource("mt/meters", m1, sr));
+  ASSERT_EQ("", h_.UpsertResource("mt/meters", m2, tr));
+  ASSERT_EQ("", h_.UpsertResource("mt/meters", m3, rfc));
+
+  bess::pb::RouterNextHopIdKey h1, h2, h3;
+  h1.set_id(1);
+  h2.set_id(2);
+  h3.set_id(3);
+  bess::pb::RouterNextHopValue resolved, incomplete, unreachable;
+  resolved.set_egress_gate(3);
+  // No neighbor: resolved, in the canonical form (defaults omitted).
+  resolved.set_dst_mac(std::string("\x02\x00\x00\x00\x00\x01", 6));
+  incomplete.set_neighbor(bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE);  // gate 0
+  incomplete.set_src_mac(std::string("\x02\x00\x00\x00\x00\x02", 6));
+  unreachable.set_egress_gate(DROP_GATE);
+  unreachable.set_neighbor(bess::pb::ROUTER_NEIGHBOR_STATE_UNREACHABLE);
+  ASSERT_EQ("", h_.UpsertResource("rt/next_hops", h1, resolved));
+  ASSERT_EQ("", h_.UpsertResource("rt/next_hops", h2, incomplete));
+  ASSERT_EQ("", h_.UpsertResource("rt/next_hops", h3, unreachable));
+
+  bess::pb::RouterRouteKey r1, r2, r3;
+  r1.set_ipv4("10.0.0.0");
+  r1.set_prefix_length(8);
+  r2.set_ipv4("0.0.0.0");  // the default route
+  r3.set_ipv4("192.168.1.0");
+  r3.set_prefix_length(24);
+  bess::pb::RouterRouteValue via1, via2, via3;
+  via1.set_next_hop_id(1);
+  via2.set_next_hop_id(2);
+  via3.set_next_hop_id(3);
+  ASSERT_EQ("", h_.UpsertResource("rt/routes", r1, via1));
+  ASSERT_EQ("", h_.UpsertResource("rt/routes", r2, via2));
+  ASSERT_EQ("", h_.UpsertResource("rt/routes", r3, via3));
+
+  bess::pb::ActionIdKey a1, a2, a3;
+  a1.set_id(1);
+  a2.set_id(2);
+  a3.set_id(3);
+  bess::pb::ActionValue both, hop_only, none;
+  both.set_meter_id(1);
+  both.set_next_hop_id(1);
+  hop_only.set_next_hop_id(2);
+  ASSERT_EQ("", h_.UpsertResource("at/actions", a1, both));
+  ASSERT_EQ("", h_.UpsertResource("at/actions", a2, hop_only));
+  ASSERT_EQ("", h_.UpsertResource("at/actions", a3, none));
+
+  EXPECT_EQ("", h_.ReadBackDiffers("mt/meters", {{&m1, &sr}, {&m2, &tr}, {&m3, &rfc}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops",
+                                   {{&h1, &resolved}, {&h2, &incomplete}, {&h3, &unreachable}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("rt/routes", {{&r1, &via1}, {&r2, &via2}, {&r3, &via3}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("at/actions", {{&a1, &both}, {&a2, &hop_only}, {&a3, &none}}));
+
+  // A reconfiguration reads back the new value.
+  ASSERT_EQ("", h_.UpsertResource("mt/meters", m1, rfc));
+  ASSERT_EQ("", h_.UpsertResource("at/actions", a3, hop_only));
+  EXPECT_EQ("", h_.ReadBackDiffers("mt/meters", {{&m1, &rfc}, {&m2, &tr}, {&m3, &rfc}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("at/actions",
+                                   {{&a1, &both}, {&a2, &hop_only}, {&a3, &hop_only}}));
+
+  // Erases, before any removal stage runs.
+  ASSERT_EQ("", h_.EraseResource("at/actions", a3));
+  ASSERT_EQ("", h_.EraseResource("mt/meters", m3));
+  ASSERT_EQ("", h_.EraseResource("rt/routes", r3));
+  ASSERT_EQ("", h_.EraseResource("rt/next_hops", h3));
+  EXPECT_EQ("", h_.ReadBackDiffers("mt/meters", {{&m1, &rfc}, {&m2, &tr}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops", {{&h1, &resolved}, {&h2, &incomplete}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("rt/routes", {{&r1, &via1}, {&r2, &via2}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("at/actions", {{&a1, &both}, {&a2, &hop_only}}));
+  Settle();
+  EXPECT_EQ("", h_.ReadBackDiffers("mt/meters", {{&m1, &rfc}, {&m2, &tr}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops", {{&h1, &resolved}, {&h2, &incomplete}}));
+}
+
+// A next hop reads back in one canonical form: defaults omitted -- no
+// neighbor when resolved, a zero MAC absent. Spelling a default out (six
+// zero bytes, RESOLVED) is the same next hop but not the same message; the
+// read-back form is a fixed point -- applying it again changes nothing.
+TEST_F(SessionPacketPathTest, NextHopReadsBackCanonically) {
+  bess::pb::RouterNextHopIdKey key;
+  key.set_id(4);
+  bess::pb::RouterNextHopValue spelled;
+  spelled.set_egress_gate(2);
+  spelled.set_neighbor(bess::pb::ROUTER_NEIGHBOR_STATE_RESOLVED);
+  spelled.set_dst_mac(std::string(6, '\0'));
+  ASSERT_EQ("", h_.UpsertResource("rt/next_hops", key, spelled));
+
+  const auto read = h_.ReadResource("rt/next_hops");
+  ASSERT_EQ(1u, read.size());
+  bess::pb::RouterNextHopValue canonical;
+  ASSERT_TRUE(read[0].second.UnpackTo(&canonical));
+  EXPECT_EQ(2u, canonical.egress_gate());
+  EXPECT_EQ(bess::pb::ROUTER_NEIGHBOR_STATE_UNSPECIFIED, canonical.neighbor());
+  EXPECT_TRUE(canonical.dst_mac().empty());
+  EXPECT_TRUE(canonical.src_mac().empty());
+  EXPECT_NE("", h_.ReadBackDiffers("rt/next_hops", {{&key, &spelled}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops", {{&key, &canonical}}));
+
+  ASSERT_EQ("", h_.UpsertResource("rt/next_hops", key, canonical));
+  EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops", {{&key, &canonical}}));
+}
+
+// Bad values are refused through the codecs and the resources, and leave
+// nothing behind.
+TEST_F(SessionPacketPathTest, BadResourceValuesAreRefused) {
+  bess::pb::MeterIdKey m1;
+  m1.set_id(1);
+  EXPECT_NE("", h_.UpsertResource("mt/meters", m1, bess::pb::MeterPolicyValue{}));
+  bess::pb::MeterPolicyValue zero_rate;
+  zero_rate.mutable_sr_tcm()->set_committed_burst(1500);
+  EXPECT_NE("", h_.UpsertResource("mt/meters", m1, zero_rate));
+  bess::pb::MeterIdKey m0;
+  bess::pb::MeterPolicyValue sr;
+  sr.mutable_sr_tcm()->set_committed_rate(1000);
+  sr.mutable_sr_tcm()->set_committed_burst(1500);
+  EXPECT_NE("", h_.UpsertResource("mt/meters", m0, sr));
+
+  bess::pb::RouterNextHopIdKey h1;
+  h1.set_id(1);
+  bess::pb::RouterNextHopValue short_mac;
+  short_mac.set_dst_mac(std::string(5, '\x02'));
+  EXPECT_NE("", h_.UpsertResource("rt/next_hops", h1, short_mac));
+  bess::pb::RouterNextHopValue bad_gate;
+  bad_gate.set_egress_gate(DROP_GATE + 1);  // DROP_GATE itself is "no interface"
+  EXPECT_NE("", h_.UpsertResource("rt/next_hops", h1, bad_gate));
+
+  bess::pb::RouterRouteKey r1;
+  r1.set_ipv4("10.0.0.0");
+  r1.set_prefix_length(8);
+  EXPECT_NE("", h_.UpsertResource("rt/routes", r1, bess::pb::RouterRouteValue{}));
+  bess::pb::RouterRouteValue dangling_route;
+  dangling_route.set_next_hop_id(9);
+  EXPECT_NE("", h_.UpsertResource("rt/routes", r1, dangling_route));
+
+  bess::pb::ActionIdKey a1;
+  a1.set_id(1);
+  bess::pb::ActionValue dangling_action;
+  dangling_action.set_meter_id(9);
+  EXPECT_NE("", h_.UpsertResource("at/actions", a1, dangling_action));
+
+  for (const char *name : {"mt/meters", "rt/next_hops", "rt/routes", "at/actions"}) {
+    EXPECT_TRUE(h_.ReadResource(name).empty()) << name;
+  }
+}
+
+// Each class declares exactly the tables its modules bind (the control plane
+// refuses creation otherwise), and none requires paused workers: meters
+// publish generations, next hops and actions are slot tables, routes are
+// rte_lpm's in-place updates.
+TEST_F(SessionPacketPathTest, DeclaredTablesMatchTheBoundCodecs) {
+  const struct {
+    const char *class_name;
+    const char *table;
+    const char *resource;
+  } tables[] = {
+      {"Meter", "meters", "mt/meters"},
+      {"Router", "next_hops", "rt/next_hops"},
+      {"Router", "routes", "rt/routes"},
+      {"ActionTable", "actions", "at/actions"},
+  };
+  for (const auto &t : tables) {
+    const ModuleBuilder &builder = ModuleBuilder::all_module_builders().at(t.class_name);
+    const ResourceTable *declared = builder.FindResourceTable(t.table);
+    ASSERT_NE(nullptr, declared) << t.resource;
+    const auto *resource = Engine().FindResource(t.resource);
+    ASSERT_NE(nullptr, resource) << t.resource;
+    const auto *codec = Bindings().Find(*resource);
+    ASSERT_NE(nullptr, codec) << t.resource;
+    EXPECT_EQ(ResourceTable::MAP, declared->kind) << t.resource;
+    EXPECT_EQ(codec->key_type(), declared->key_type) << t.resource;
+    EXPECT_EQ(codec->value_type(), declared->value_type) << t.resource;
+    EXPECT_FALSE(declared->requires_paused_workers) << t.resource;
+    EXPECT_FALSE(codec->requires_paused_workers()) << t.resource;
+  }
+  EXPECT_EQ(2u, ModuleBuilder::all_module_builders().at("Router").resource_tables().size());
+}
+
 }  // namespace

@@ -2,13 +2,20 @@
 
 #include "vif.h"
 
+#include <any>
 #include <cstring>
+#include <expected>
+#include <span>
+#include <string>
 
 #include "arch/vlan.h"
+#include "dataplane/transaction_engine.h"
+#include "framework/resource_codec.h"
 #include "utils/format.h"
 
 namespace {
 
+namespace dataplane = bess::dataplane;
 using bess::utils::Arp;
 using bess::utils::be16_t;
 using bess::utils::be32_t;
@@ -23,24 +30,132 @@ uint64_t MacToUint64(const Ethernet::Address &addr) {
 
 }  // namespace
 
+// LEGACY_ONLY (D-129): the interfaces are the "<module>/interfaces" resource.
 const Commands Vif::cmds = {
     {"add", "VifCommandAddArg", MODULE_CMD_FUNC(&Vif::CommandAdd),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
     {"delete", "VifCommandDeleteArg", MODULE_CMD_FUNC(&Vif::CommandDelete),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
     {"clear", "VifCommandClearArg", MODULE_CMD_FUNC(&Vif::CommandClear),
-     Command::THREAD_UNSAFE},
+     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
 };
 
-void Vif::RebuildTables() {
-  mac_table_.clear();
-  arp_table_.clear();
-  for (const auto &[id, iface] : interfaces_by_id_) {
-    mac_table_[{iface.vlan, MacToUint64(iface.mac_addr)}] = &iface;
+const ResourceTables Vif::resource_tables = {
+    ResourceTable::Map<bess::pb::VifInterfaceKey, bess::pb::VifInterfaceValue>(
+        "interfaces", /*requires_paused_workers=*/true)};
+
+// "<module>/interfaces": key EncodeKey(id), value an Interface (its id
+// unset). Workers read the tables without synchronization, so this runs with
+// them paused (the codec says so; Reserve refuses otherwise too). Every
+// reservation edits the transaction's copy of the tables and rebuilds its
+// indexes; the first publish swaps the copy in, which allocates nothing.
+class Vif::InterfacesResource final : public dataplane::Resource {
+ public:
+  explicit InterfacesResource(Vif &owner)
+      : Resource(owner.name() + "/interfaces"), owner_(owner) {}
+
+  size_t LiveCount() const override { return owner_.interfaces_by_id_.size(); }
+
+  bool Contains(const dataplane::ResourceKey &key) const override {
+    uint32_t id;
+    return dataplane::DecodeKey(key, &id) &&
+           owner_.interfaces_by_id_.contains(id);
+  }
+
+  std::expected<Reservation, std::string> Reserve(
+      const dataplane::Op &op) override {
+    if (owner_.HasRunningWorker()) {
+      return std::unexpected(
+          "a worker runs the module (interfaces require paused workers)");
+    }
+    uint32_t id;
+    if (!dataplane::DecodeKey(op.key, &id) || id == 0) {
+      return std::unexpected("invalid interface id");
+    }
+    const bool existed = owner_.interfaces_by_id_.contains(id);
+    Interface iface;
+    if (op.kind == dataplane::OpKind::kErase) {
+      if (!existed) {
+        return std::unexpected("not found");
+      }
+    } else {
+      const Interface *value = std::any_cast<Interface>(&op.value);
+      if (value == nullptr) {
+        return std::unexpected("wrong value type (want a Vif interface)");
+      }
+      iface = *value;
+      iface.id = id;
+    }
+
+    Staged &staged = owner_.BeginTransaction();
+    if (op.kind == dataplane::OpKind::kErase) {
+      staged.interfaces_by_id.erase(id);
+    } else {
+      staged.interfaces_by_id[id] = iface;
+    }
+    BuildIndexes(staged.interfaces_by_id, &staged.mac_table, &staged.arp_table);
+    Reservation reservation{std::make_unique<PublishOp>(owner_), {}, {}};
+    reservation.existed = existed;
+    return reservation;
+  }
+
+  void EndTransaction() noexcept override { owner_.EndTransaction(); }
+
+ private:
+  class PublishOp final : public dataplane::StagedOp {
+   public:
+    explicit PublishOp(Vif &owner) : owner_(owner) {}
+    void Publish(dataplane::Retirer &) noexcept override {
+      owner_.PublishStaged();
+    }
+
+   private:
+    Vif &owner_;
+  };
+
+  Vif &owner_;
+};
+
+void Vif::BuildIndexes(const InterfaceMap &interfaces, MacIndex *mac_table,
+                       ArpIndex *arp_table) {
+  mac_table->clear();
+  arp_table->clear();
+  for (const auto &[id, iface] : interfaces) {
+    (*mac_table)[{iface.vlan, MacToUint64(iface.mac_addr)}] = &iface;
     if (iface.ip_addr.value() != 0) {
-      arp_table_[{iface.vlan, iface.ip_addr.value()}] = &iface;
+      (*arp_table)[{iface.vlan, iface.ip_addr.value()}] = &iface;
     }
   }
+}
+
+void Vif::RebuildTables() {
+  BuildIndexes(interfaces_by_id_, &mac_table_, &arp_table_);
+}
+
+Vif::Staged &Vif::BeginTransaction() {
+  if (staged_ == nullptr) {
+    staged_ = std::make_unique<Staged>();
+    staged_->interfaces_by_id = interfaces_by_id_;
+    published_staged_ = false;
+  }
+  return *staged_;
+}
+
+void Vif::PublishStaged() noexcept {
+  // Every reservation of the transaction edited the same copy: the first
+  // publish makes all of it live (map swaps keep the indexes' node pointers
+  // valid), the rest find it done.
+  if (!published_staged_) {
+    interfaces_by_id_.swap(staged_->interfaces_by_id);
+    mac_table_.swap(staged_->mac_table);
+    arp_table_.swap(staged_->arp_table);
+    published_staged_ = true;
+  }
+}
+
+void Vif::EndTransaction() noexcept {
+  staged_.reset();
+  published_staged_ = false;
 }
 
 const Vif::Interface *Vif::Lookup(
@@ -88,7 +203,86 @@ CommandResponse Vif::Init(const bess::pb::VifArg &arg) {
     }
   }
 
+  resource_ = std::make_unique<InterfacesResource>(*this);
+  binding_ = init_context().codecs().Bind(
+      *resource_,
+      std::make_shared<bess::framework::TypedCodec<bess::pb::VifInterfaceKey,
+                                                   bess::pb::VifInterfaceValue>>(
+          [](const bess::pb::VifInterfaceKey &key)
+              -> std::expected<dataplane::ResourceKey, std::string> {
+            if (key.id() == 0) {
+              return std::unexpected("interface 'id' must be non-zero");
+            }
+            return dataplane::EncodeKey(key.id());
+          },
+          [](const bess::pb::VifInterfaceValue &value)
+              -> std::expected<std::any, std::string> {
+            if (!bess::IsValidGateValue(value.gate())) {
+              return std::unexpected("invalid output gate: " +
+                                     std::to_string(value.gate()));
+            }
+            // add masks the VLAN; a value must read back as written.
+            if (value.vlan() > 0x0FFF) {
+              return std::unexpected("invalid VLAN: " +
+                                     std::to_string(value.vlan()));
+            }
+            Interface iface;
+            iface.vlan = static_cast<uint16_t>(value.vlan());
+            iface.route_domain = value.route_domain();
+            iface.gate = static_cast<gate_idx_t>(value.gate());
+            if (!value.mac_addr().empty() &&
+                !iface.mac_addr.FromString(value.mac_addr())) {
+              return std::unexpected("invalid MAC address: '" +
+                                     value.mac_addr() + "'");
+            }
+            if (!value.ip_addr().empty() &&
+                !bess::utils::ParseIpv4Address(value.ip_addr(), &iface.ip_addr)) {
+              return std::unexpected("invalid IPv4 address: '" +
+                                     value.ip_addr() + "'");
+            }
+            return std::any(iface);
+          },
+          // Read back as a client sends an interface: the MAC in lower case
+          // and the address in dotted decimal, each omitted when zero (what
+          // an omitted one means).
+          [this](const auto &visit) {
+            for (const auto &[id, iface] : interfaces_by_id_) {
+              bess::pb::VifInterfaceKey key;
+              key.set_id(id);
+              bess::pb::VifInterfaceValue value;
+              value.set_vlan(iface.vlan);
+              if (MacToUint64(iface.mac_addr) != 0) {
+                value.set_mac_addr(iface.mac_addr.ToString());
+              }
+              if (iface.ip_addr.value() != 0) {
+                value.set_ip_addr(bess::utils::ToIpv4Address(iface.ip_addr));
+              }
+              value.set_route_domain(iface.route_domain);
+              value.set_gate(iface.gate);
+              visit(key, value);
+            }
+          },
+          [this] { return HasRunningWorker(); }));
+  if (auto registered = init_context().resources().Register(resource_.get());
+      !registered) {
+    binding_.Reset();
+    resource_.reset();
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
   return CommandSuccess();
+}
+
+void Vif::DeInit() {
+  if (resource_ == nullptr) {
+    return;
+  }
+  // The interfaces may still be live: the module leaves with them.
+  const std::string name = resource_->name();
+  auto released = init_context().resources().ReleaseForTeardown(
+      std::span<const std::string>(&name, 1));
+  CHECK(released) << released.error();
+  binding_.Reset();
+  resource_.reset();
 }
 
 CommandResponse Vif::CommandAdd(const bess::pb::VifCommandAddArg &arg) {

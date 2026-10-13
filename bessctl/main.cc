@@ -46,14 +46,21 @@ constexpr std::string_view kUsage = R"(usage: bessctl [-s HOST:PORT] COMMAND [AR
 
   status                         daemon version, epoch, plugins, ports
   schema [CLASS]                 module classes and port drivers, or one class
-  get [-o json|yaml]             the active pipeline, as a manifest
+  get [-o json|yaml]             the active pipeline with its resources'
+                                 contents, as a manifest (its version on
+                                 standard error)
   validate FILE [-o json|yaml]   check FILE; print it in canonical form
   diff FILE                      what applying FILE would change
   plan FILE                      the steps applying FILE would run
-  apply FILE [--generation G@E]  make FILE the active pipeline (with G@E: only
-                                 if the active version is still generation G
-                                 of daemon epoch E, as diff/plan/apply print)
-  resources                      transactional resources (key -> value types)
+  apply FILE [--generation G[/R]@E]
+                                 make FILE the active pipeline and its listed
+                                 resources' contents, all or nothing (with
+                                 G@E: only if the active version is still
+                                 generation G of daemon epoch E; with /R also
+                                 resource generation R; as get, diff, plan and
+                                 apply print it)
+  resources                      transactional resources (kind, key -> value
+                                 types; paused: changing it pauses workers)
   metrics                        metric samples
   events [--from SEQ] [TYPE...]  follow operational events until interrupted
   ports [NAME...]                link state and counters of the ports
@@ -67,11 +74,11 @@ constexpr std::string_view kUsage = R"(usage: bessctl [-s HOST:PORT] COMMAND [AR
                                  | tcpdump -r -  (pcap of a module with more
                                  than one gate there needs a GATE;
                                  the daemon must share this host's /tmp)
-  command MODULE CMD [ARG] [-o json|yaml]
-                                 run MODULE's command CMD (schema CLASS lists
-                                 them) with ARG, JSON or YAML text of the
-                                 command's argument type (default {}); print
-                                 its answer. A command not marked thread-safe
+  action MODULE ACTION [ARG] [-o json|yaml]
+                                 invoke MODULE's action ACTION (schema CLASS
+                                 lists them) with ARG, JSON or YAML text of the
+                                 action's argument type (default {}); print
+                                 its result. An action not marked "no pause"
                                  needs the workers paused
   pause | resume                 pause or resume every worker (a worker a
                                  pipeline creates starts paused)
@@ -79,8 +86,11 @@ constexpr std::string_view kUsage = R"(usage: bessctl [-s HOST:PORT] COMMAND [AR
 
 A manifest is a control_v2 Pipeline in protobuf JSON or YAML (by extension,
 .json or .yaml/.yml, else JSON if it starts with "{"); a module's or port's
-"arg" may leave out "@type". FILE "-" is standard input. The daemon is
--s, else $BESS_SERVER, else localhost:10514.
+"arg" may leave out "@type". Its "resources" maps a resource name,
+MODULE/TABLE, to its contents: a map's entries as a list of {key, value}
+([] clears it), a singleton's value as an object; listed resources become
+exactly that, others are left alone. FILE "-" is standard input. The daemon
+is -s, else $BESS_SERVER, else localhost:10514.
 )";
 
 int Usage() {
@@ -94,10 +104,22 @@ int Fail(std::string_view what) {
   return 1;
 }
 
-// A pipeline version as `apply --generation` reads it back: generation@epoch.
-// Generations restart with the daemon, so one alone is ambiguous (D-106).
+// A pipeline version as `apply --generation` reads it back: generation@epoch,
+// or generation/resource-generation@epoch when it guards listed resources'
+// contents too (D-129). Generations restart with the daemon, so one alone is
+// ambiguous (D-106).
 std::string Version(const bess::sdk::PipelineVersion &v) {
-  return std::format("{}@{}", v.generation, v.daemon_epoch);
+  return v.resource_generation
+             ? std::format("{}/{}@{}", v.generation, *v.resource_generation, v.daemon_epoch)
+             : std::format("{}@{}", v.generation, v.daemon_epoch);
+}
+
+// "map KEY -> VALUE" or "singleton VALUE".
+std::string ResourceTypes(pb::TransactionResource::Kind kind, const std::string &key_type,
+                          const std::string &value_type) {
+  return kind == pb::TransactionResource::KIND_SINGLETON
+             ? "singleton " + value_type
+             : std::format("map {} -> {}", key_type, value_type);
 }
 
 std::string Describe(const Error &e) {
@@ -326,9 +348,15 @@ class Cli {
       std::println("{}: {}", c.name(), c.help());
       std::println("  init      {}", c.init_arg_type());
       std::println("  gates     in {} out {}", c.igates(), c.ogates());
-      for (const pb::CommandSchema &cmd : c.commands()) {
-        std::println("  command   {:<20} {}{}", cmd.name(), cmd.arg_type(),
-                     cmd.thread_safe() ? "  (no pause)" : "");
+      for (const pb::ActionSchema &a : c.actions()) {
+        std::println("  action    {:<20} {}{}{}", a.name(), a.arg_type(),
+                     a.result_type().empty() ? "" : " -> " + a.result_type(),
+                     a.thread_safe() ? "  (no pause)" : "");
+      }
+      for (const pb::ResourceSchema &r : c.resources()) {
+        std::println("  resource  {:<20} {}{}", r.table(),
+                     ResourceTypes(r.kind(), r.key_type(), r.value_type()),
+                     r.requires_paused_workers() ? "  (paused)" : "");
       }
       return 0;
     }
@@ -358,57 +386,68 @@ class Cli {
     if (!schema) {
       return 1;
     }
-    auto snap = client_->Pipeline();
+    auto snap = client_->Pipeline({.include_resources = true});
     if (!snap) {
       return Fail(snap.error());
     }
-    return PrintPipeline(**schema, snap->pipeline, format);
+    if (const int rc = PrintPipeline(**schema, snap->pipeline, format); rc != 0) {
+      return rc;
+    }
+    // To stderr: stdout is the manifest.
+    std::println(stderr, "# version {}", Version(snap->version));
+    return 0;
   }
 
   int Validate(const std::string &path, bessctl::Format format) {
     auto schema = LoadSchema();
-    auto m = schema ? ReadManifest(**schema, path) : std::nullopt;
-    if (!m) {
+    auto p = schema ? ReadManifest(**schema, path) : std::nullopt;
+    if (!p) {
       return 1;
     }
-    auto normalized = client_->ValidatePipeline(m->pipeline);
+    auto normalized = client_->ValidatePipeline(*p);
     if (!normalized) {
       return Fail(normalized.error());
     }
-    if (const int rc = PrintPipeline(**schema, *normalized, format); rc != 0) {
-      return rc;
-    }
-    NoteResources(*m);
-    return 0;
+    return PrintPipeline(**schema, *normalized, format);
   }
 
+  // A resource change carries its entry counts; unchecked: its module is
+  // created by the same apply, so its keys are checked only then.
   int Diff(const std::string &path) {
     auto schema = LoadSchema();
-    auto m = schema ? ReadManifest(**schema, path) : std::nullopt;
-    if (!m) {
+    auto p = schema ? ReadManifest(**schema, path) : std::nullopt;
+    if (!p) {
       return 1;
     }
-    auto diff = client_->DiffPipeline(m->pipeline);
+    auto diff = client_->DiffPipeline(*p);
     if (!diff) {
       return Fail(diff.error());
     }
     for (const pb::Change &c : diff->diff.changes()) {
-      std::println("{:<14} {:<14} {}", pb::ChangeKind_Name(c.kind()),
-                   pb::ObjectType_Name(c.type()), c.object());
+      std::string counts;
+      if (c.type() == pb::RESOURCE) {
+        for (const pb::ResourceDelta &d : diff->diff.resources()) {
+          if (d.name() == c.object()) {
+            counts = std::format("  +{} ~{} -{}{}", d.created(), d.updated(), d.removed(),
+                                 d.checked() ? "" : " (unchecked)");
+          }
+        }
+      }
+      std::println("{:<14} {:<14} {}{}", pb::ChangeKind_Name(c.kind()),
+                   pb::ObjectType_Name(c.type()), c.object(), counts);
     }
     std::println("# against version {}: {} change(s)", Version(diff->version),
                  diff->diff.changes_size());
-    NoteResources(*m);
     return 0;
   }
 
   int Plan(const std::string &path) {
     auto schema = LoadSchema();
-    auto m = schema ? ReadManifest(**schema, path) : std::nullopt;
-    if (!m) {
+    auto p = schema ? ReadManifest(**schema, path) : std::nullopt;
+    if (!p) {
       return 1;
     }
-    auto plan = client_->PlanPipeline(m->pipeline);
+    auto plan = client_->PlanPipeline(*p);
     if (!plan) {
       return Fail(plan.error());
     }
@@ -418,47 +457,39 @@ class Cli {
     }
     std::println("# against version {}: {} step(s)", Version(plan->version),
                  plan->steps.size());
-    NoteResources(*m);
     return 0;
   }
 
-  // The pipeline, then the manifest's resource entries in one transaction:
-  // its resources exist only once the pipeline does. Both steps are
-  // idempotent, so after a failed second step the same apply is the retry
-  // (with --generation, at the version the first step reached).
+  // The pipeline and its listed resources' contents, all or nothing.
   int Apply(const std::string &path, std::optional<bess::sdk::PipelineVersion> expected) {
     auto schema = LoadSchema();
-    auto m = schema ? ReadManifest(**schema, path) : std::nullopt;
-    if (!m) {
+    auto p = schema ? ReadManifest(**schema, path) : std::nullopt;
+    if (!p) {
       return 1;
     }
-    auto r = client_->ApplyPipeline(m->pipeline, expected);
+    auto r = client_->ApplyPipeline(*p, expected);
     if (!r) {
       return Fail(r.error());
     }
-    const bess::sdk::PipelineVersion reached{r->generation(), r->daemon_epoch()};
-    std::println("version {}: {} operation(s){}; validate {} us, prepare {} us, commit {} us, "
+    // The resource generation guards what the manifest listed, as diff and
+    // plan report it.
+    const bool lists = p->resources_size() > 0;
+    const bess::sdk::PipelineVersion reached{
+        r->generation(), r->daemon_epoch(),
+        lists ? std::optional<uint64_t>(r->resource_generation()) : std::nullopt};
+    std::println("version {}: {} operation(s){}{}; validate {} us, prepare {} us, commit {} us, "
                  "retire {} us",
-                 Version(reached), r->applied_ops(), r->workers_paused() ? ", workers paused" : "",
-                 r->validation_us(), r->prepare_us(), r->paused_commit_us(), r->retire_us());
-    if (m->resources.empty()) {
-      return 0;
-    }
-    auto committed = CommitEntries(**schema, *m);
-    if (!committed) {
-      return Fail(std::format(
-          "the pipeline is applied, its resource entries are not: {} (fix and apply again{})",
-          committed.error(),
-          expected ? std::format(" with --generation {}", Version(reached)) : ""));
-    }
-    std::println("resources: {} entr{} in {} resource(s); transaction {}, resource generation {}",
-                 m->entries(), m->entries() == 1 ? "y" : "ies", m->resources.size(),
-                 committed->request_id, committed->generation);
+                 Version(reached), r->applied_ops(),
+                 lists ? std::format(", {} resource entr{}", r->resource_ops(),
+                                     r->resource_ops() == 1 ? "y" : "ies")
+                       : "",
+                 r->workers_paused() ? ", workers paused" : "", r->validation_us(),
+                 r->prepare_us(), r->paused_commit_us(), r->retire_us());
     return 0;
   }
 
-  int Command(const std::string &module, const std::string &command, const std::string &arg,
-              bessctl::Format format) {
+  int Action(const std::string &module, const std::string &action, const std::string &arg,
+             bessctl::Format format) {
     auto schema = LoadSchema();
     if (!schema) {
       return 1;
@@ -473,22 +504,22 @@ class Cli {
     if (m == modules.end()) {
       return Fail(std::format("no module \"{}\"", module));
     }
-    auto type = (*schema)->CommandArgType(m->mclass(), command);
+    auto type = (*schema)->ActionArgType(m->mclass(), action);
     if (!type) {
       return Fail(type.error());
     }
     auto message = (*schema)->MessageFromText(*type, arg);
     if (!message) {
-      return Fail(std::format("{} {}: argument ({}): {}", module, command, *type, message.error()));
+      return Fail(std::format("{} {}: argument ({}): {}", module, action, *type, message.error()));
     }
-    auto answer = client_->RunModuleCommand(module, command, **message);
-    if (!answer) {
-      return Fail(answer.error());
+    auto result = client_->InvokeAction(module, action, **message);
+    if (!result) {
+      return Fail(result.error());
     }
-    if (answer->type_url().empty()) {
-      return 0;  // the command answers nothing
+    if (result->type_url().empty()) {
+      return 0;  // the action answers nothing
     }
-    auto text = (*schema)->AnyTo(*answer, format);
+    auto text = (*schema)->AnyTo(*result, format);
     if (!text) {
       return Fail(text.error());
     }
@@ -502,7 +533,8 @@ class Cli {
       return Fail(resources.error());
     }
     for (const auto &[name, r] : *resources) {
-      std::println("{:<32} {} -> {}", name, r.key_type, r.value_type);
+      std::println("{:<32} {}{}", name, ResourceTypes(r.kind, r.key_type, r.value_type),
+                   r.requires_paused_workers ? "  (paused)" : "");
     }
     return 0;
   }
@@ -556,79 +588,19 @@ class Cli {
     return std::move(*schema);
   }
 
-  static std::optional<bessctl::Manifest> ReadManifest(const bessctl::Schema &schema,
-                                                       const std::string &path) {
+  static std::optional<bessctl::pb::Pipeline> ReadManifest(const bessctl::Schema &schema,
+                                                           const std::string &path) {
     auto text = ReadInput(path);
     if (!text) {
       Fail("cannot read " + path);
       return std::nullopt;
     }
-    auto m = schema.ManifestFrom(*text, bessctl::FormatOf(path, *text));
-    if (!m) {
-      Fail(path + ": " + m.error());
+    auto p = schema.PipelineFrom(*text, bessctl::FormatOf(path, *text));
+    if (!p) {
+      Fail(path + ": " + p.error());
       return std::nullopt;
     }
-    return std::move(*m);
-  }
-
-  // Validate, diff and plan cover the pipeline only: a resource's types are
-  // known once the module that creates it exists. (To stderr: stdout may be
-  // a manifest.)
-  static void NoteResources(const bessctl::Manifest &m) {
-    if (!m.resources.empty()) {
-      std::println(stderr,
-                   "bessctl: resources: {} entr{} not checked (apply commits them after the "
-                   "pipeline)",
-                   m.entries(), m.entries() == 1 ? "y" : "ies");
-    }
-  }
-
-  std::expected<bess::sdk::Applied, std::string> CommitEntries(const bessctl::Schema &schema,
-                                                               const bessctl::Manifest &m) {
-    auto resources = client_->Resources(true);
-    if (!resources) {
-      return std::unexpected(Describe(resources.error()));
-    }
-    bess::sdk::Transaction txn = client_->NewTransaction();
-    std::vector<std::string> ops;  // operation index -> the entry it came from
-    for (const auto &[name, entries] : m.resources) {
-      const auto r = resources->find(name);
-      if (r == resources->end()) {
-        return std::unexpected(std::format("no resource \"{}\" (bessctl resources lists them)",
-                                           name));
-      }
-      for (size_t i = 0; i < entries.size(); i++) {
-        const std::string where = std::format("resource \"{}\" entry {}", name, i);
-        auto key = schema.MessageFromJson(r->second.key_type, entries[i].key);
-        if (!key) {
-          return std::unexpected(std::format("{}: key: {}", where, key.error()));
-        }
-        auto value = schema.MessageFromJson(r->second.value_type, entries[i].value);
-        if (!value) {
-          return std::unexpected(std::format("{}: value: {}", where, value.error()));
-        }
-        if (auto added = txn.Upsert(r->second, **key, **value); !added) {
-          return std::unexpected(std::format("{}: {}", where, Describe(added.error())));
-        }
-        ops.push_back(where);
-      }
-    }
-    auto applied = txn.Commit();
-    if (!applied) {
-      // The SDK's message lists failures by operation; name the entries.
-      const auto &failures = applied.error().failures;
-      if (failures.empty()) {
-        return std::unexpected(Describe(applied.error()));
-      }
-      std::string text = "rejected";
-      for (const bess::sdk::OpFailure &f : failures) {
-        const bool known = f.index >= 0 && static_cast<size_t>(f.index) < ops.size();
-        text += std::format("; {}: {}",
-                            known ? ops[f.index] : std::format("operation {}", f.index), f.error);
-      }
-      return std::unexpected(text);
-    }
-    return std::move(*applied);
+    return std::move(*p);
   }
 
   std::unique_ptr<Client> client_;
@@ -666,19 +638,29 @@ std::optional<uint64_t> ParseU64(std::string_view s) {
   return v;
 }
 
-// "G@E", as Version prints it: a generation means nothing without its epoch
-// (D-106).
+// "G@E" or "G/R@E", as Version prints it: a generation means nothing without
+// its epoch (D-106); R, the resource generation, guards the listed
+// resources' contents too (D-129).
 std::optional<bess::sdk::PipelineVersion> ParseVersion(std::string_view s) {
   const size_t at = s.find('@');
   if (at == std::string_view::npos) {
     return std::nullopt;
   }
-  auto generation = ParseU64(s.substr(0, at));
+  std::string_view generations = s.substr(0, at);
+  std::optional<uint64_t> resource_generation;
+  if (const size_t slash = generations.find('/'); slash != std::string_view::npos) {
+    resource_generation = ParseU64(generations.substr(slash + 1));
+    if (!resource_generation) {
+      return std::nullopt;
+    }
+    generations = generations.substr(0, slash);
+  }
+  auto generation = ParseU64(generations);
   auto epoch = ParseU64(s.substr(at + 1));
   if (!generation || !epoch || *epoch == 0) {
     return std::nullopt;
   }
-  return bess::sdk::PipelineVersion{*generation, *epoch};
+  return bess::sdk::PipelineVersion{*generation, *epoch, resource_generation};
 }
 
 }  // namespace
@@ -707,10 +689,10 @@ int bess::ctl::Main(int argc, char **argv) {
   if (command == "schema" && rest.size() <= 1) {
     return cli.ShowSchema(rest);
   }
-  // get, validate and command print JSON, or YAML with -o yaml.
+  // get, validate and action print JSON, or YAML with -o yaml.
   std::vector<std::string> printed(rest.begin(), rest.end());
   auto output = bessctl::Format::kJson;
-  if ((command == "get" || command == "validate" || command == "command") && printed.size() >= 2 &&
+  if ((command == "get" || command == "validate" || command == "action") && printed.size() >= 2 &&
       printed[printed.size() - 2] == "-o") {
     const std::string &name = printed.back();
     if (name != "json" && name != "yaml") {
@@ -725,8 +707,8 @@ int bess::ctl::Main(int argc, char **argv) {
   if (command == "validate" && printed.size() == 1) {
     return cli.Validate(printed[0], output);
   }
-  if (command == "command" && (printed.size() == 2 || printed.size() == 3)) {
-    return cli.Command(printed[0], printed[1], printed.size() == 3 ? printed[2] : "{}", output);
+  if (command == "action" && (printed.size() == 2 || printed.size() == 3)) {
+    return cli.Action(printed[0], printed[1], printed.size() == 3 ? printed[2] : "{}", output);
   }
   if (command == "diff") {
     return one_file([&](const std::string &f) { return cli.Diff(f); });
@@ -739,7 +721,8 @@ int bess::ctl::Main(int argc, char **argv) {
     if (rest.size() == 3) {
       expected = ParseVersion(rest[2]);
       if (!expected) {
-        std::println(stderr, "--generation takes GENERATION@EPOCH, as diff, plan and apply print it");
+        std::println(stderr, "--generation takes GENERATION[/RESOURCE_GENERATION]@EPOCH, as get, "
+                             "diff, plan and apply print it");
         return Usage();
       }
     }

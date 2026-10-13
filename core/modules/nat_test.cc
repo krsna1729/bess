@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 #include <google/protobuf/util/message_differencer.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -244,6 +245,29 @@ TEST(NatModuleTest, InitialArgComesBackSortedAndRuntimeConfigIsEmpty) {
   ASSERT_EQ(2, arg.ext_addrs_size());
   EXPECT_EQ("10.0.0.1", arg.ext_addrs(0).ext_addr());
   EXPECT_EQ("10.0.0.9", arg.ext_addrs(1).ext_addr());
+}
+
+// D-129: the usage commands are actions (drain_usage answers a
+// NATUsageResponse); get_initial_arg and the runtime-config pair are
+// legacy-only: InvokeAction refuses them, the legacy command still runs them.
+TEST(NatModuleTest, UsageCommandsAreActionsAndConfigIsLegacyOnly) {
+  ModuleHarness h;
+  Module *nat = h.Create("NAT", Arg(64, 0, false, /*usage=*/true));
+  ASSERT_NE(nullptr, nat);
+
+  for (const char *legacy : {"get_initial_arg", "get_runtime_config", "set_runtime_config"}) {
+    SCOPED_TRACE(legacy);
+    EXPECT_EQ(ENOTSUP, h.Action(nat, legacy, bess::pb::EmptyArg()).error().code());
+    h.MustCommand(nat, legacy, bess::pb::EmptyArg());
+  }
+
+  CommandResponse r = h.Action(nat, "request_usage_report", bess::pb::EmptyArg());
+  EXPECT_EQ(0, r.error().code()) << r.error().errmsg();
+  r = h.Action(nat, "drain_usage", bess::pb::EmptyArg());
+  ASSERT_EQ(0, r.error().code()) << r.error().errmsg();
+  bess::pb::NATUsageResponse resp;
+  ASSERT_TRUE(r.data().UnpackTo(&resp));
+  EXPECT_EQ(0, resp.records_size());
 }
 
 }  // namespace

@@ -28,7 +28,7 @@ Columns:
 | Packet pool per-core cache | 512 (pools > 1,024 packets) | `PacketPool::kMaxCacheSize` | No | — |
 | Burst size | 32 packets | `PacketBatch::kMaxBurst` (`pktbatch.h`) | No | ABI-wide constant |
 | Batches per task run | 256 | `MAX_PBATCH_CNT` (`task.h`) | No | `CHECK` abort (a graph that fans out past it is a bug, D-061) |
-| gRPC message size, each way | 64 MiB | `kMaxMessageBytes` (`control/api_v2.h`) | No | RESOURCE_EXHAUSTED |
+| gRPC message size, each way | 64 MiB | `kMaxMessageBytes` (`control/api_v2.h`) | No | RESOURCE_EXHAUSTED; a `GetPipeline` with resources larger than this is refused (`RESOURCE_EXHAUSTED`, `EMSGSIZE`): ask for fewer resources by name (D-129) |
 | Default gRPC port | 10514 | `kDefaultPort` (`runtime/opts.cc`) | `--grpc_url` (or the deprecated `-p`) | — |
 | Default bind address | 127.0.0.1 | `kDefaultBindAddr` (`runtime/opts.cc`) | `-b` | — |
 | HTTP adapter (JSON API, events, `/metrics`, page; D-125) | off | `FLAGS_http_addr` (`runtime/opts.cc`) | `--http_addr HOST:PORT` (the host is required; only a loopback host keeps it local) | — |

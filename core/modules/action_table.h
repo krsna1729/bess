@@ -42,6 +42,8 @@ class ActionTable final : public Module {
   static const gate_idx_t kNumOGates = 1;
 
   static const Commands cmds;
+  // "<module>/actions": ActionIdKey -> ActionValue (D-129).
+  static const ResourceTables resource_tables;
 
   using ActionId = bess::dataplane::ActionId;
 

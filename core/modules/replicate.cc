@@ -3,34 +3,82 @@
 
 #include "replicate.h"
 
+#include "utils/format.h"
+
 const Commands Replicate::cmds = {
     {"set_gates", "ReplicateCommandSetGatesArg",
-     MODULE_CMD_FUNC(&Replicate::CommandSetGates), Command::THREAD_UNSAFE},
+     MODULE_CMD_FUNC(&Replicate::CommandSetGates), Command::THREAD_UNSAFE, "",
+     Command::LEGACY_ONLY},
+};
+
+const ResourceTables Replicate::resource_tables = {
+    ResourceTable::Singleton<bess::pb::ReplicateArg>("settings", true),
 };
 
 // Validates every wire gate (int64) before anything changes: each must name
 // one of this module's output gates. They used to be narrowed unchecked.
 template <typename Arg>
-CommandResponse Replicate::SetGates(const Arg &arg) {
+std::expected<Replicate::Gates, std::string> Replicate::StageGates(
+    const Arg &arg) {
   if (arg.gates_size() > kMaxGates) {
-    return CommandFailure(EINVAL, "no more than %d gates", kMaxGates);
+    return std::unexpected(
+        bess::utils::Format("no more than %d gates", kMaxGates));
   }
+  Gates staged;
   for (int i = 0; i < arg.gates_size(); i++) {
     if (arg.gates(i) < 0 || arg.gates(i) >= kNumOGates) {
-      return CommandFailure(EINVAL, "gate %lld is out of range (0..%d)",
-                            static_cast<long long>(arg.gates(i)),
-                            kNumOGates - 1);
+      return std::unexpected(bess::utils::Format(
+          "gate %lld is out of range (0..%d)",
+          static_cast<long long>(arg.gates(i)), kNumOGates - 1));
     }
+    staged.gates[i] = static_cast<gate_idx_t>(arg.gates(i));
   }
-  for (int i = 0; i < arg.gates_size(); i++) {
-    gates_[i] = static_cast<gate_idx_t>(arg.gates(i));
+  staged.ngates = arg.gates_size();
+  return staged;
+}
+
+void Replicate::ApplyGates(const Gates &gates) {
+  for (int i = 0; i < gates.ngates; i++) {
+    gates_[i] = gates.gates[i];
   }
-  ngates_ = arg.gates_size();
+  ngates_ = gates.ngates;
+}
+
+template <typename Arg>
+CommandResponse Replicate::SetGates(const Arg &arg) {
+  auto staged = StageGates(arg);
+  if (!staged) {
+    return CommandFailure(EINVAL, "%s", staged.error().c_str());
+  }
+  ApplyGates(*staged);
   return CommandSuccess();
 }
 
 CommandResponse Replicate::Init(const bess::pb::ReplicateArg &arg) {
-  return SetGates(arg);
+  CommandResponse err = SetGates(arg);
+  if (err.error().code() != 0) {
+    return err;
+  }
+  auto registered = settings_.Register(
+      init_context().resources(), init_context().codecs(), name() + "/settings",
+      [](const bess::pb::ReplicateArg &value) { return StageGates(value); },
+      [this](Gates &gates) { ApplyGates(gates); },
+      [this] {
+        bess::pb::ReplicateArg value;
+        for (int i = 0; i < ngates_; i++) {
+          value.add_gates(gates_[i]);
+        }
+        return value;
+      },
+      [this] { return HasRunningWorker(); });
+  if (!registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
+  return CommandSuccess();
+}
+
+void Replicate::DeInit() {
+  settings_.Release();
 }
 
 CommandResponse Replicate::CommandSetGates(

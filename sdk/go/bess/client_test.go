@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	pb "github.com/krsna1729/bess/sdk/go/controlv2"
 )
@@ -59,16 +61,41 @@ type fake struct {
 	pipelines []step      // ApplyPipeline's script (err/md; nil err: applied)
 	applied   []*pb.ApplyPipelineRequest
 	captures  []*pb.SetCaptureRequest
+	reads     []*pb.GetPipelineRequest  // GetPipeline requests
+	actions   []step                    // InvokeAction's script (err/md; nil err: answered)
+	invoked   []*pb.InvokeActionRequest // InvokeAction requests
 }
 
+// actionResult is what the fake's actions answer.
+var actionResult = &pb.GetTransactionRequest{RequestId: "answer"}
+
+// singleton is the fake's singleton resource; it requires paused workers.
+const singleton = "m0/settings"
+
 func (f *fake) admin(_ context.Context, in proto.Message) (proto.Message, metadata.MD, error) {
-	if req, ok := in.(*pb.SetCaptureRequest); ok {
+	switch req := in.(type) {
+	case *pb.SetCaptureRequest:
 		f.captures = append(f.captures, proto.Clone(req).(*pb.SetCaptureRequest))
 		if req.GetDaemonEpoch() != f.epochOr1() {
 			md, err := epochRefusal(req.GetDaemonEpoch(), f.epochOr1())
 			return nil, md, err
 		}
 		return &pb.SetCaptureResponse{DaemonEpoch: f.epochOr1()}, nil, nil
+	case *pb.InvokeActionRequest:
+		f.invoked = append(f.invoked, proto.Clone(req).(*pb.InvokeActionRequest))
+		if req.GetDaemonEpoch() != f.epochOr1() {
+			md, err := epochRefusal(req.GetDaemonEpoch(), f.epochOr1())
+			return nil, md, err
+		}
+		if len(f.actions) > 0 {
+			s := f.actions[0]
+			f.actions = f.actions[1:]
+			if s.err != nil {
+				return nil, s.md, s.err
+			}
+		}
+		result, _ := anypb.New(actionResult)
+		return &pb.InvokeActionResponse{Result: result, DaemonEpoch: f.epochOr1()}, nil, nil
 	}
 	return nil, nil, status.Error(codes.Unimplemented, "fake")
 }
@@ -76,7 +103,14 @@ func (f *fake) admin(_ context.Context, in proto.Message) (proto.Message, metada
 func (f *fake) pipeline(_ context.Context, in proto.Message) (proto.Message, metadata.MD, error) {
 	switch req := in.(type) {
 	case *pb.GetPipelineRequest:
-		return &pb.GetPipelineResponse{Pipeline: &pb.Pipeline{}, Generation: 3, DaemonEpoch: f.epochOr1()}, nil, nil
+		f.reads = append(f.reads, req)
+		return &pb.GetPipelineResponse{Pipeline: &pb.Pipeline{}, Generation: 3, DaemonEpoch: f.epochOr1(),
+			ResourceGeneration: 9}, nil, nil
+	case *pb.DiffPipelineRequest:
+		return &pb.DiffPipelineResponse{Diff: &pb.PipelineDiff{}, Generation: 3, DaemonEpoch: f.epochOr1(),
+			ResourceGeneration: 9}, nil, nil
+	case *pb.PlanPipelineRequest:
+		return &pb.PlanPipelineResponse{Generation: 3, DaemonEpoch: f.epochOr1(), ResourceGeneration: 9}, nil, nil
 	case *pb.ApplyPipelineRequest:
 		f.applied = append(f.applied, req)
 		if req.GetDaemonEpoch() != f.epochOr1() {
@@ -147,8 +181,11 @@ func (f *fake) list(context.Context) (*pb.ListTransactionResourcesResponse, meta
 	if epoch == 0 {
 		epoch = 1
 	}
+	// resource has no kind (a daemon before D-129): a map.
 	return &pb.ListTransactionResourcesResponse{DaemonEpoch: epoch, Resources: []*pb.TransactionResource{
-		{Name: resource, KeyType: keyType, ValueType: valueType}}}, nil, nil
+		{Name: resource, KeyType: keyType, ValueType: valueType},
+		{Name: singleton, KeyType: "google.protobuf.Empty", ValueType: valueType,
+			Kind: pb.TransactionResource_KIND_SINGLETON, RequiresPausedWorkers: true}}}, nil, nil
 }
 
 func (f *fake) capabilities(context.Context) (*pb.GetCapabilitiesResponse, metadata.MD, error) {
@@ -313,7 +350,7 @@ func TestARestartDuringRecoveryIsReportedNotGuessed(t *testing.T) {
 func TestTheEpochIsLearnedBeforeTheFirstSend(t *testing.T) {
 	h := newHarness(&fake{applies: []step{answer(applied, 2)}}, 4)
 	tx := h.c.Transaction()
-	r := Resource{resource, keyType, valueType, 1} // no discovery through this client
+	r := Resource{Name: resource, KeyType: keyType, ValueType: valueType, DaemonEpoch: 1} // no discovery through this client
 	_ = tx.Upsert(r, &pb.GetTransactionRequest{}, &pb.ListTransactionResourcesRequest{})
 	_, err := tx.Commit(context.Background())
 	as[*DaemonRestartedError](t, err)
@@ -616,7 +653,7 @@ func TestApplyPipelineRetriesBusyAndNeverAConflict(t *testing.T) {
 		t.Fatal(h.sleeps)
 	}
 	h = newHarness(&fake{pipelines: []step{refusal(codes.Aborted, pb.ErrorDetail_CONFLICT)}}, 4)
-	_, err = h.c.ApplyPipeline(ctx, &pb.Pipeline{}, WithExpectedVersion(PipelineVersion{1, 1}))
+	_, err = h.c.ApplyPipeline(ctx, &pb.Pipeline{}, WithExpectedVersion(PipelineVersion{Generation: 1, DaemonEpoch: 1}))
 	as[*PipelineConflictError](t, err)
 	if len(h.f.applied) != 1 {
 		t.Fatal(h.f.applied)
@@ -714,5 +751,171 @@ func TestAdminCallsNameTheKnownEpochAndARestartRefusesThem(t *testing.T) {
 	}
 	if got := f.captures[2].GetDaemonEpoch(); got != 2 {
 		t.Fatalf("next call under epoch %d, want the new epoch 2", got)
+	}
+}
+
+// Discovery gives each resource its kind (none, from a daemon before D-129:
+// a map) and whether it changes only with its workers paused.
+func TestResourcesCarryTheirKind(t *testing.T) {
+	h := newHarness(&fake{}, 4)
+	all, err := h.c.Resources(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := all[resource]; m.Kind != pb.TransactionResource_KIND_MAP || m.RequiresPausedWorkers {
+		t.Fatal(m)
+	}
+	if s := all[singleton]; s.Kind != pb.TransactionResource_KIND_SINGLETON || !s.RequiresPausedWorkers {
+		t.Fatal(s)
+	}
+}
+
+// A singleton is set (an op with a value and no key), never upserted or
+// erased, and a map is never set: the client refuses the wrong one before
+// anything is sent.
+func TestASingletonIsSetAndAMapIsNot(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(&fake{applies: []step{answer(applied, 1)}}, 4)
+	m, _ := h.c.Resource(ctx, resource)
+	s, _ := h.c.Resource(ctx, singleton)
+	tx := h.c.Transaction()
+	as[*InvalidRequestError](t, tx.Upsert(s, &pb.GetTransactionRequest{}, &pb.ListTransactionResourcesRequest{}))
+	as[*InvalidRequestError](t, tx.Erase(s, &pb.GetTransactionRequest{}))
+	as[*InvalidRequestError](t, tx.Set(m, &pb.ListTransactionResourcesRequest{}))
+	as[*InvalidRequestError](t, tx.Set(s, &pb.GetTransactionRequest{})) // not its value type
+	if err := tx.Set(s, &pb.ListTransactionResourcesRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.f.sent) != 1 || len(h.f.sent[0].GetOps()) != 1 {
+		t.Fatal("refused operations were sent:", h.f.sent)
+	}
+	if op := h.f.sent[0].GetOps()[0]; op.GetResource() != singleton || op.GetKey() != nil ||
+		!op.GetValue().MessageIs(&pb.ListTransactionResourcesRequest{}) || op.GetErase() {
+		t.Fatal(op)
+	}
+}
+
+// A resource that changes only with its workers paused, refused while one
+// runs (RESOURCE_BUSY), is a BusyError at once: sent once, nothing asked,
+// not retried (retrying will not help until the workers are paused).
+func TestAPausedWorkersRefusalIsBusyAndNotRetried(t *testing.T) {
+	h := newHarness(&fake{applies: []step{refusal(codes.FailedPrecondition, pb.ErrorDetail_RESOURCE_BUSY)}}, 4)
+	_, err := h.commit(t)
+	if e := as[*BusyError](t, err); e.Detail.GetCode() != pb.ErrorDetail_RESOURCE_BUSY || e.Attempts != 1 {
+		t.Fatal(e)
+	}
+	if len(h.f.sent) != 1 || len(h.f.asked) != 0 || len(h.sleeps) != 0 {
+		t.Fatalf("sent %d, asked %d, slept %v", len(h.f.sent), len(h.f.asked), h.sleeps)
+	}
+}
+
+// Pipeline reads resource contents only when asked (WithResources), and only
+// then has a resource generation; a diff or plan has one when its pipeline
+// lists resources; an apply expects the one its version carries, and a stale
+// one is a conflict.
+func TestResourceGenerations(t *testing.T) {
+	ctx := context.Background()
+	f := &fake{}
+	h := newHarness(f, 4)
+	plain, err := h.c.Pipeline(ctx)
+	if err != nil || plain.Version.ResourceGeneration != nil || f.reads[0].GetIncludeResources() {
+		t.Fatal(plain.Version, err, f.reads)
+	}
+	named, err := h.c.Pipeline(ctx, WithResources(resource, singleton))
+	if err != nil || named.Version.ResourceGeneration == nil || *named.Version.ResourceGeneration != 9 {
+		t.Fatal(named.Version, err)
+	}
+	if r := f.reads[1]; !r.GetIncludeResources() || !slices.Equal(r.GetResources(), []string{resource, singleton}) {
+		t.Fatal(r)
+	}
+	all, err := h.c.Pipeline(ctx, WithResources())
+	if r := f.reads[2]; err != nil || !r.GetIncludeResources() || len(r.GetResources()) != 0 ||
+		all.Version.ResourceGeneration == nil {
+		t.Fatal(r, all.Version, err)
+	}
+
+	listed := &pb.Pipeline{Resources: []*pb.ResourceContents{{Name: resource}}}
+	for _, p := range []*pb.Pipeline{{}, listed} {
+		_, dv, err := h.c.DiffPipeline(ctx, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, pv, err := h.c.PlanPipeline(ctx, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := len(p.GetResources()) > 0
+		for _, v := range []PipelineVersion{dv, pv} {
+			if v.Generation != 3 || (v.ResourceGeneration != nil) != want || (want && *v.ResourceGeneration != 9) {
+				t.Fatal(p, v)
+			}
+		}
+	}
+
+	if _, err := h.c.ApplyPipeline(ctx, listed, WithExpectedVersion(named.Version)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.c.ApplyPipeline(ctx, listed, WithExpectedVersion(plain.Version)); err != nil {
+		t.Fatal(err)
+	}
+	if a := f.applied; a[0].ExpectedResourceGeneration == nil || a[0].GetExpectedResourceGeneration() != 9 ||
+		a[1].ExpectedResourceGeneration != nil {
+		t.Fatal("expected resource generations:", a[0], a[1])
+	}
+	f.pipelines = []step{refusal(codes.Aborted, pb.ErrorDetail_CONFLICT)}
+	_, err = h.c.ApplyPipeline(ctx, listed, WithExpectedVersion(named.Version))
+	as[*PipelineConflictError](t, err)
+	if len(f.applied) != 3 {
+		t.Fatal("a conflict was retried:", len(f.applied))
+	}
+}
+
+// InvokeAction (D-129) names the module, the action and the epoch the client
+// knows (learned first) and returns the action's result. It is not retried:
+// a busy module is a BusyError, a refusal (a legacy-only command: ENOTSUP)
+// an InvalidRequestError with the daemon's detail, and a restart refuses it.
+func TestInvokeAction(t *testing.T) {
+	ctx := context.Background()
+	f := &fake{}
+	c := newHarness(f, 4).c
+	result, err := c.InvokeAction(ctx, "l2", "lookup", &pb.GetTransactionRequest{RequestId: "arg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := &pb.GetTransactionRequest{}
+	if err := result.UnmarshalTo(got); err != nil || got.GetRequestId() != "answer" {
+		t.Fatal(result, err)
+	}
+	req, arg := f.invoked[0], &pb.GetTransactionRequest{}
+	if f.listed != 1 || req.GetDaemonEpoch() != 1 || req.GetModule() != "l2" || req.GetAction() != "lookup" ||
+		req.GetArg().UnmarshalTo(arg) != nil || arg.GetRequestId() != "arg" {
+		t.Fatal("listed", f.listed, req)
+	}
+
+	f.actions = []step{refusal(codes.FailedPrecondition, pb.ErrorDetail_RESOURCE_BUSY)}
+	_, err = c.InvokeAction(ctx, "l2", "populate", &pb.GetTransactionRequest{})
+	if e := as[*BusyError](t, err); e.Detail.GetCode() != pb.ErrorDetail_RESOURCE_BUSY || len(f.invoked) != 2 {
+		t.Fatal(e, len(f.invoked))
+	}
+
+	d, _ := proto.Marshal(&pb.ErrorDetail{Code: pb.ErrorDetail_INVALID_ARGUMENT, ErrnoValue: 95, Field: "action",
+		Message: "add is a legacy-only command"})
+	f.actions = []step{{err: status.Error(codes.InvalidArgument, "x"), md: metadata.Pairs(errorDetailKey, string(d))}}
+	_, err = c.InvokeAction(ctx, "l2", "add", &pb.GetTransactionRequest{})
+	if e := as[*InvalidRequestError](t, err); e.Detail.GetField() != "action" || e.Detail.GetErrnoValue() != 95 ||
+		len(f.invoked) != 3 {
+		t.Fatal(e, len(f.invoked))
+	}
+
+	f.epoch = 2 // restarted
+	_, err = c.InvokeAction(ctx, "l2", "lookup", &pb.GetTransactionRequest{})
+	if e := as[*DaemonRestartedError](t, err); !e.Refused || e.From != 1 || e.To != 2 || len(f.invoked) != 4 {
+		t.Fatal(e, len(f.invoked))
+	}
+	if epoch, _ := c.DaemonEpoch(); epoch != 2 {
+		t.Fatal("the new epoch was not learned:", epoch)
 	}
 }

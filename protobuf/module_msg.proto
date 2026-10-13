@@ -80,6 +80,25 @@ message FlowGenCommandSetBurstArg {
 }
 
 /**
+ * FlowGen's run-time settings (D-129): the singleton resource
+ * "<module>/settings", requiring paused workers. It holds what `update`
+ * (FlowGenArg's updatable fields) and `set_burst` set, validated as they
+ * validate. As for `update`, an unset field (empty template or
+ * distribution, zero rate, no burst) keeps the current value; the read-back
+ * (canonical) form names every field, so a manifest should too. The template
+ * may not change between UDP and TCP.
+ */
+message FlowGenSettings {
+  bytes template = 1; /// The packet template (IPv4 UDP or TCP), as FlowGenArg.template.
+  double pps = 2; /// Packets per second, as FlowGenArg.pps.
+  double flow_rate = 3; /// New flows per second (<= pps), as FlowGenArg.flow_rate.
+  double flow_duration = 4; /// Flow lifetime in seconds, as FlowGenArg.flow_duration.
+  string arrival = 5; /// "uniform" or "exponential".
+  string duration = 6; /// "uniform" or "pareto".
+  optional uint64 burst = 7; /// Packets per batch, at most 32 (set_burst).
+}
+
+/**
  * The HashLB module has a command `set_mode(...)` which takes two parameters.
  * The `mode` parameter specifies whether the load balancer will hash over the
  * src/dest ethernet header (`'l2'`), over the src/dest IP addresses (`'l3'`), or over
@@ -100,6 +119,19 @@ message HashLBCommandSetModeArg {
  */
 message HashLBCommandSetGatesArg {
   repeated int64 gates = 1; ///A list of gate numbers to load balance traffic over
+}
+
+/**
+ * HashLB's run-time settings (D-129): the singleton resource
+ * "<module>/settings", applied live (an RCU-published configuration). mode
+ * and fields are what set_mode sets (fields, when given, override mode; mode
+ * is otherwise one of 'l2', 'l3', 'l4'); gates is what set_gates sets (at
+ * least one, each a valid gate). Read back as last set.
+ */
+message HashLBSettings {
+  string mode = 1; /// 'l2', 'l3' or 'l4' (ignored when fields are given).
+  repeated Field fields = 2; /// A custom tuple to hash over.
+  repeated int64 gates = 3; /// The gates to load balance over.
 }
 
 /**
@@ -279,6 +311,16 @@ message DRRMaxFlowQueueSizeArg {
 }
 
 /**
+ * DRR's run-time settings (D-129): the singleton resource
+ * "<module>/settings", applied live. quantum is what set_quantum_size sets,
+ * max_flow_queue_size what set_max_flow_queue_size sets; both at least 1.
+ */
+message DRRSettings {
+  uint32 quantum = 1; /// Bytes allocated to each flow on every round.
+  uint32 max_flow_queue_size = 2; /// The max size that any flow's queue can get.
+}
+
+/**
  * The module PortInc has a function `set_burst(...)` that allows you to specify the
  * maximum number of packets to be stored in a single PacketBatch released by
  * the module.
@@ -288,12 +330,28 @@ message PortIncCommandSetBurstArg {
 }
 
 /**
+ * PortInc's run-time settings (D-129): the singleton resource
+ * "<module>/settings", applied live: what set_burst sets.
+ */
+message PortIncSettings {
+  uint64 burst = 1; /// Packets per batch, at most 32.
+}
+
+/**
  * The module QueueInc has a function `set_burst(...)` that allows you to specify
  * the maximum number of packets to be stored in a single PacketBatch released
  * by the module.
  */
 message QueueIncCommandSetBurstArg {
   uint64 burst = 1; /// The maximum "burst" of packets (ie, the maximum batch size)
+}
+
+/**
+ * QueueInc's run-time settings (D-129): the singleton resource
+ * "<module>/settings", applied live: what set_burst sets.
+ */
+message QueueIncSettings {
+  uint64 burst = 1; /// Packets per batch, at most 32.
 }
 
 /**
@@ -425,6 +483,12 @@ enum RouterNeighborState {
   ROUTER_NEIGHBOR_STATE_UNREACHABLE = 3;
 }
 
+/**
+ * A Router next hop ("<module>/next_hops"). An unset neighbor means resolved
+ * and an absent MAC the zero address; the resource reads back (D-129) with
+ * the neighbor always set and a zero MAC absent, so desired state that sends
+ * that form applies as a no-op.
+ */
 message RouterNextHopValue {
   uint32 egress_gate = 1;
   RouterNeighborState neighbor = 2;
@@ -481,6 +545,14 @@ message WildcardMatchCommandClearArg {
  */
 message WildcardMatchCommandSetDefaultGateArg {
   uint64 gate = 1;
+}
+
+/**
+ * WildcardMatch's run-time settings, the singleton resource
+ * "<module>/settings" (D-129): what `set_default_gate(...)` sets.
+ */
+message WildcardMatchSettings {
+  uint64 default_gate = 1; /// The gate for traffic that matches no rule.
 }
 
 /**
@@ -594,6 +666,16 @@ message ExactMatchArg {
 message ExactMatchConfig {
   uint64 default_gate = 1;
   repeated ExactMatchCommandAddArg rules = 2;
+}
+
+/**
+ * ExactMatch's run-time settings (D-129): the singleton resource
+ * "<module>/settings". default_gate is the gate of a packet no rule matches
+ * (DROP_GATE, 8192, drops it); setting it is what set_default_gate does. The
+ * rules are the map resource "<module>/rules".
+ */
+message ExactMatchSettings {
+  uint64 default_gate = 1;
 }
 
 /**
@@ -728,12 +810,19 @@ message L2ForwardArg {
 
 /// An entry of the L2Forward resource "<module>/macs" (D-114): key.
 message L2ForwardMacKey {
-  string addr = 1; /// The MAC address, e.g. "02:00:00:00:00:01"
+  string addr = 1; /// The MAC address, lower-case as read back, e.g. "02:00:00:00:00:01"
 }
 
 /// An entry of the L2Forward resource "<module>/macs": value.
 message L2ForwardMacValue {
   uint64 gate = 1; /// The output gate
+}
+
+/// The L2Forward singleton resource "<module>/settings" (D-129): what
+/// set_default_gate sets. Read back with the current gate, 8192 (DROP_GATE)
+/// when packets no entry matches are dropped.
+message L2ForwardSettings {
+  uint64 default_gate = 1; /// The gate of a packet no entry matches (8192: drop)
 }
 
 /**
@@ -1023,6 +1112,19 @@ message QueueArg {
 }
 
 /**
+ * Queue's "<module>/settings" singleton (D-129): the queue's run-time state,
+ * replacing set_size, set_burst and set_runtime_config. Every field is literal
+ * (size 0 is refused; burst 0 releases nothing). Applied with workers paused;
+ * a resize keeps the queued packets that fit.
+ */
+message QueueSettings {
+  uint64 size = 1; /// Capacity in packets: a power of 2 in [4, 16384].
+  uint64 burst = 2; /// Maximum packets per batch released, [0, 32].
+  bool prefetch = 3; /// Prefetch the first 64B of each released packet.
+  bool backpressure = 4; /// Signal overload upstream above the high water mark.
+}
+
+/**
  * The RandomSplit module randomly split/drop packets
  *
  * __InputGates__: 1
@@ -1193,6 +1295,16 @@ message SourceCommandSetPktSizeArg {
 message SourceArg {
   uint64 pkt_size = 1; /// The size (in bytes) of packet data to produce.
   optional uint64 burst = 2; /// Packets per batch, at most 32 (default: 32); set_burst changes it later.
+}
+
+/**
+ * Source's run-time settings (D-129): the singleton resource
+ * "<module>/settings", applied live. pkt_size is what set_pkt_size sets
+ * (1 up to the pool's data room), burst what set_burst sets (at most 32).
+ */
+message SourceSettings {
+  uint64 pkt_size = 1; /// The size (in bytes) of the packets to create.
+  uint64 burst = 2; /// Packets per batch, at most 32.
 }
 
 /**
@@ -1392,6 +1504,18 @@ message ArpResponderArg {
   string mac_addr = 2; /// The MAC address
 }
 
+/// The key of an ArpResponder's "<module>/entries" resource (D-129): the IPv4
+/// address answered for, read back in dotted decimal.
+message ArpResponderEntryKey {
+  string ip = 1;
+}
+
+/// The value of an ArpResponder's "<module>/entries" resource: the MAC the
+/// address resolves to, read back in lower case.
+message ArpResponderEntryValue {
+  string mac_addr = 1;
+}
+
 /**
  * The MPLS pop module removes MPLS labels
  *
@@ -1506,6 +1630,24 @@ message VifCommandDeleteArg {
 message VifCommandClearArg {
 }
 
+/// The key of a Vif's "<module>/interfaces" resource (D-129): the logical VIF
+/// ID (non-zero).
+message VifInterfaceKey {
+  uint32 id = 1;
+}
+
+/// The value of a Vif's "<module>/interfaces" resource: the interface's
+/// fields (VifArg.Interface without the id, which is the key). Read back
+/// canonically: the MAC in lower case and omitted when all zero, the IPv4
+/// address in dotted decimal and omitted when 0.0.0.0.
+message VifInterfaceValue {
+  uint32 vlan = 1;           /// 802.1Q VLAN tag 0..4095 (0: untagged)
+  string mac_addr = 2;       /// Interface MAC address
+  string ip_addr = 3;        /// Local IPv4 address for ARP responder (optional)
+  uint32 route_domain = 4;   /// Associated L3 VRF Route Domain ID
+  uint32 gate = 5;           /// Egress/demux output gate
+}
+
 /**
  * The Bridge module is an L2 learning bridge. It dynamically learns MAC
  * addresses from incoming packets, maps them to arrival gates with an aging
@@ -1530,6 +1672,19 @@ message BridgeCommandDeleteArg {
 }
 
 message BridgeCommandClearArg {
+}
+
+/// The key of a Bridge's "<module>/statics" resource (D-129): one static MAC.
+/// Read back in lower case ("02:aa:bb:cc:dd:ee"); a multicast MAC is refused.
+message BridgeStaticKey {
+  string mac_addr = 1;
+}
+
+/// The value of a Bridge's "<module>/statics" resource: the output gate the
+/// static MAC is forwarded to (DROP_GATE blackholes it). Learned entries are
+/// runtime state and not part of the resource.
+message BridgeStaticValue {
+  uint32 gate = 1;
 }
 
 /**

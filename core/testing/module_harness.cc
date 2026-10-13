@@ -2,19 +2,27 @@
 
 #include "testing/module_harness.h"
 
+#include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstring>
+#include <expected>
 #include <map>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "dataplane/transaction_engine.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
 #include "metadata.h"
 #include "module.h"
 #include "module_graph.h"
 #include "runtime/opts.h"
+#include "runtime/runtime_state.h"
 #include "packet_pool.h"
 #include "pb/module_msg.pb.h"
 #include "port.h"
@@ -283,6 +291,155 @@ google::protobuf::Any ModuleHarness::MustCommand(Module *m, const std::string &c
   EXPECT_EQ(0, r.error().code()) << command << " " << arg.ShortDebugString() << ": "
                                  << r.error().errmsg();
   return r.data();
+}
+
+CommandResponse ModuleHarness::Action(Module *m, const std::string &action,
+                                      const google::protobuf::Message &arg) {
+  return m->module_builder()->RunCommand(m, action, Pack(arg),
+                                         ModuleBuilder::CommandSurface::kActions);
+}
+
+namespace {
+
+// One operation, decoded as ApplyTransaction decodes it, applied alone.
+std::string ApplyWire(const std::string &resource, bool erase, const google::protobuf::Any *key,
+                      const google::protobuf::Any *value) {
+  dataplane::TransactionEngine &engine = runtime::runtime().transactions();
+  const dataplane::Resource *r = engine.FindResource(resource);
+  const framework::ResourceCodec *codec =
+      r == nullptr ? nullptr : framework::ResourceBindings::ProcessDefault().Find(*r);
+  if (codec == nullptr) {
+    return "no resource '" + resource + "'";
+  }
+  if (codec->Busy()) {
+    return "busy: a worker runs the module";
+  }
+  auto k = key == nullptr ? codec->Key("", "") : codec->Key(key->type_url(), key->value());
+  if (!k) {
+    return k.error();
+  }
+  dataplane::Op op;
+  if (erase) {
+    op = dataplane::Op::Erase(resource, std::move(*k));
+  } else {
+    auto v = codec->Value(value->type_url(), value->value());
+    if (!v) {
+      return v.error();
+    }
+    op = dataplane::Op::Upsert(resource, std::move(*k), std::move(*v));
+  }
+  const dataplane::TransactionEngine::Result result =
+      engine.Apply(std::span<const dataplane::Op>(&op, 1));
+  if (result.outcome == dataplane::TransactionEngine::Outcome::kApplied) {
+    return "";
+  }
+  return result.ops.empty() || result.ops[0].error.empty() ? "refused" : result.ops[0].error;
+}
+
+}  // namespace
+
+std::string ModuleHarness::SetResource(const std::string &resource,
+                                       const google::protobuf::Message &value) {
+  const google::protobuf::Any v = Pack(value);
+  return ApplyWire(resource, false, nullptr, &v);
+}
+
+std::string ModuleHarness::UpsertResource(const std::string &resource,
+                                          const google::protobuf::Message &key,
+                                          const google::protobuf::Message &value) {
+  const google::protobuf::Any k = Pack(key);
+  const google::protobuf::Any v = Pack(value);
+  return ApplyWire(resource, false, &k, &v);
+}
+
+std::string ModuleHarness::EraseResource(const std::string &resource,
+                                         const google::protobuf::Message &key) {
+  const google::protobuf::Any k = Pack(key);
+  return ApplyWire(resource, true, &k, nullptr);
+}
+
+std::vector<std::pair<google::protobuf::Any, google::protobuf::Any>> ModuleHarness::ReadResource(
+    const std::string &resource) {
+  std::vector<std::pair<google::protobuf::Any, google::protobuf::Any>> out;
+  const dataplane::Resource *r = runtime::runtime().transactions().FindResource(resource);
+  const framework::ResourceCodec *codec =
+      r == nullptr ? nullptr : framework::ResourceBindings::ProcessDefault().Find(*r);
+  EXPECT_NE(nullptr, codec) << "no resource '" << resource << "'";
+  if (codec == nullptr) {
+    return out;
+  }
+  codec->Entries([&](const google::protobuf::Message &key, const google::protobuf::Message &value) {
+    out.emplace_back(Pack(key), Pack(value));
+  });
+  return out;
+}
+
+namespace {
+
+std::string Deterministic(const google::protobuf::Message &message) {
+  std::string bytes;
+  {
+    google::protobuf::io::StringOutputStream stream(&bytes);
+    google::protobuf::io::CodedOutputStream out(&stream);
+    out.SetSerializationDeterministic(true);
+    EXPECT_TRUE(message.SerializeToCodedStream(&out));
+  }
+  return bytes;
+}
+
+}  // namespace
+
+std::string ModuleHarness::ReadBackDiffers(
+    const std::string &resource,
+    const std::vector<std::pair<const google::protobuf::Message *,
+                                const google::protobuf::Message *>> &entries) {
+  const dataplane::Resource *r = runtime::runtime().transactions().FindResource(resource);
+  const framework::ResourceCodec *codec =
+      r == nullptr ? nullptr : framework::ResourceBindings::ProcessDefault().Find(*r);
+  if (codec == nullptr) {
+    return "no resource '" + resource + "'";
+  }
+  auto internal_key = [&](const google::protobuf::Message *key)
+      -> std::expected<dataplane::ResourceKey, std::string> {
+    if (key == nullptr) {
+      return codec->Key("", "");
+    }
+    const google::protobuf::Any any = Pack(*key);
+    return codec->Key(any.type_url(), any.value());
+  };
+  std::map<dataplane::ResourceKey, std::string> held;
+  std::string error;
+  codec->Entries([&](const google::protobuf::Message &key, const google::protobuf::Message &value) {
+    auto k = internal_key(codec->kind() == framework::ResourceCodec::Kind::kSingleton ? nullptr
+                                                                                       : &key);
+    if (!k) {
+      error = "read back key " + key.ShortDebugString() + " does not decode: " + k.error();
+      return;
+    }
+    held.emplace(std::move(*k), Deterministic(value));
+  });
+  if (!error.empty()) {
+    return error;
+  }
+  if (held.size() != entries.size()) {
+    return "holds " + std::to_string(held.size()) + " entries, desired " +
+           std::to_string(entries.size());
+  }
+  for (const auto &[key, value] : entries) {
+    auto k = internal_key(key);
+    if (!k) {
+      return "desired key does not decode: " + k.error();
+    }
+    const auto it = held.find(*k);
+    if (it == held.end()) {
+      return "no entry for " + (key == nullptr ? std::string("the singleton") : key->ShortDebugString());
+    }
+    if (it->second != Deterministic(*value)) {
+      return "entry " + (key == nullptr ? std::string("(singleton)") : key->ShortDebugString()) +
+             ": desired " + value->ShortDebugString() + ", reads back differently";
+    }
+  }
+  return "";
 }
 
 }  // namespace bess::testing

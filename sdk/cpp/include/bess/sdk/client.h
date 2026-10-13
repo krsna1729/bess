@@ -131,12 +131,17 @@ struct Applied {
 };
 
 // A transactional resource, its key and value message types, and the daemon
-// epoch it was discovered under (valid only in that epoch).
+// epoch it was discovered under (valid only in that epoch). A singleton
+// (D-129) holds one value: Transaction::Set sets it; it has no key and no
+// erase. One that requires paused workers is refused (kBusy) while a worker
+// runs its module.
 struct Resource {
   std::string name;
   std::string key_type;
   std::string value_type;
   uint64_t daemon_epoch = 0;
+  pb::TransactionResource::Kind kind = pb::TransactionResource::KIND_MAP;
+  bool requires_paused_workers = false;
 };
 
 // How long one RPC may take and how many RPCs a commit may make (status
@@ -150,11 +155,21 @@ struct RetryPolicy {
 // A pipeline generation and the daemon epoch it belongs to: generations count
 // from 1 again after a restart, so one means something only with its epoch
 // (D-106). ApplyPipeline's expected version comes from a snapshot, diff, plan
-// or earlier apply.
+// or earlier apply. `resource_generation` (D-129): the dataplane transaction
+// generation resource contents were read at, set when the snapshot included
+// resources or the diff/plan's pipeline listed some; ApplyPipeline then
+// refuses (kPipelineConflict) if resource contents moved since.
 struct PipelineVersion {
   uint64_t generation = 0;
   uint64_t daemon_epoch = 0;
+  std::optional<uint64_t> resource_generation;
   bool operator==(const PipelineVersion &) const = default;
+};
+
+// What Client::Pipeline reads besides the topology (D-129).
+struct PipelineQuery {
+  bool include_resources = false;
+  std::vector<std::string> resources;  // with include_resources: only these (empty: all)
 };
 
 struct PipelineSnapshot {
@@ -220,10 +235,10 @@ class Client {
   // Whether the daemon serves `rpc` ("ApplyTransaction" or a full name). A
   // daemon too old to answer GetCapabilities serves none of the newer RPCs.
   Result<bool> Supports(std::string_view rpc);
-  // The argument types of every module class, port driver and module command,
-  // with the descriptors to encode them (GetSchema): what a client without
-  // generated code for them (a manifest, a UI) needs. Not cached: plugins
-  // change it.
+  // The argument types of every module class, port driver, module action and
+  // resource table, with the descriptors to encode them (GetSchema): what a
+  // client without generated code for them (a manifest, a UI) needs. Not
+  // cached: plugins change it.
   Result<pb::GetSchemaResponse> Schema();
   // Every metric sample.
   Result<std::vector<pb::MetricSample>> Metrics();
@@ -243,32 +258,52 @@ class Client {
                            std::stop_token stop = {});
 
   // -- desired state --
-  Result<PipelineSnapshot> Pipeline();
+  // The active pipeline; with `query.include_resources` its resources'
+  // contents too, so it applies back as a no-op.
+  Result<PipelineSnapshot> Pipeline(const PipelineQuery &query = {});
   // The daemon's canonical form of `p` (kInvalidRequest if invalid).
   Result<pb::Pipeline> ValidatePipeline(const pb::Pipeline &p);
   Result<PipelineDiffResult> DiffPipeline(const pb::Pipeline &p);
   Result<PipelinePlan> PlanPipeline(const pb::Pipeline &p);
-  // Makes `p` the active pipeline, all or nothing; with `expected` only if
-  // the active version is still that (kPipelineConflict if the generation
-  // moved, kDaemonRestarted if the epoch did). Every apply names the daemon
-  // epoch it was built under: `expected`'s, else the last one the client saw.
+  // Makes `p` the active pipeline, all or nothing (its listed resources'
+  // contents included); with `expected` only if the active version is still
+  // that (kPipelineConflict if a generation moved, kDaemonRestarted if the
+  // epoch did). Every apply names the daemon epoch it was built under:
+  // `expected`'s, else the last one the client saw.
   Result<pb::ApplyPipelineResponse> ApplyPipeline(
       const pb::Pipeline &p, std::optional<PipelineVersion> expected = {},
       std::stop_token stop = {});
 
+  // -- actions (D-129) --
+  // A module's action (GetSchema lists each class's actions with their
+  // argument and result types): its result, an empty Any when it has none.
+  // Sent under the epoch the client knows, not retried: an action acts when
+  // it runs. An action's EBUSY is kBusy with the daemon's ErrorDetail (one
+  // not marked thread-safe while a worker runs the module: PauseWorkers
+  // first). Other failures are kInvalidRequest with the ErrorDetail, the
+  // action's errno in errno_value.
+  Result<google::protobuf::Any> InvokeAction(const std::string &module, const std::string &action,
+                                             const google::protobuf::Message &arg);
+  // The same, unpacked as `R` (kInvalidRequest if the result is not one).
+  template <typename R>
+  Result<R> InvokeAction(const std::string &module, const std::string &action,
+                         const google::protobuf::Message &arg) {
+    auto any = InvokeAction(module, action, arg);
+    if (!any) {
+      return std::unexpected(std::move(any.error()));
+    }
+    R result;
+    if (!any->UnpackTo(&result)) {
+      return std::unexpected(Error{.kind = ErrorKind::kInvalidRequest,
+                                   .message = "the result of " + module + " " + action +
+                                              " is not a " +
+                                              std::string(R::descriptor()->full_name())});
+    }
+    return result;
+  }
+
   // -- transactions --
   // The transaction refers to this client: it must not outlive it.
-  // A module's command (D-115; GetSchema lists each class's commands and
-  // argument types): its answer, an empty Any when it has none. Sent under
-  // the epoch the client knows, not retried: a command acts when it runs. A
-  // command's EBUSY is kBusy with the daemon's ErrorDetail (a command not
-  // marked thread-safe while a worker runs the module: PauseWorkers first).
-  // Other failures are kInvalidRequest with the ErrorDetail, the command's
-  // errno in errno_value.
-  Result<google::protobuf::Any> RunModuleCommand(const std::string &module,
-                                                 const std::string &command,
-                                                 const google::protobuf::Message &arg);
-
   Transaction NewTransaction(TransactionOptions options = {});
 
   // `request_id`'s outcome under the current epoch.
@@ -332,11 +367,13 @@ class Transaction {
   // must be recognised as the same request.
   const std::string &request_id() const { return request_id_; }
 
-  // Adds key -> value to `r`, or replaces its value.
+  // Adds key -> value to the map resource `r`, or replaces its value.
   Result<void> Upsert(const Resource &r, const google::protobuf::Message &key,
                       const google::protobuf::Message &value);
-  // Removes `key` from `r`.
+  // Removes `key` from the map resource `r`.
   Result<void> Erase(const Resource &r, const google::protobuf::Message &key);
+  // Sets the singleton resource `r` to `value` (D-129).
+  Result<void> Set(const Resource &r, const google::protobuf::Message &value);
 
   // Applies every operation or none. A committed transaction returns its
   // result again without sending.
@@ -383,9 +420,18 @@ class PipelineBuilder {
   PipelineBuilder &TrafficClass(pb::TrafficClass tc);
   // Where a module's task is scheduled: under a traffic class or at a worker.
   PipelineBuilder &Task(pb::TaskPlacement task);
-  // Drops the port, module or traffic class `name` and the connections and
-  // task placements that name it.
+  // Drops the port, module or traffic class `name` and the connections,
+  // task placements and resource contents that name it.
   PipelineBuilder &Remove(std::string_view name);
+
+  // Resource contents (D-129): listing a resource makes the apply converge
+  // it to exactly the entries listed. Resource(name) lists it (with no entry
+  // so far: an apply clears it); Entry adds key -> value to a map resource;
+  // Setting gives a singleton its value.
+  PipelineBuilder &Resource(std::string_view name);
+  PipelineBuilder &Entry(std::string_view resource, const google::protobuf::Message &key,
+                         const google::protobuf::Message &value);
+  PipelineBuilder &Setting(std::string_view resource, const google::protobuf::Message &value);
 
   // A copy of the pipeline built so far, or the first argument that could
   // not be packed.
@@ -394,6 +440,8 @@ class PipelineBuilder {
  private:
   template <typename Out>
   void Pack(const google::protobuf::Message *arg, Out &&out);
+  // The listed resource `name`, listed (empty) if it was not.
+  pb::ResourceContents *Listed(std::string_view name);
 
   pb::Pipeline p_;
   std::optional<Error> error_;

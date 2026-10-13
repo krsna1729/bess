@@ -144,6 +144,24 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     }
   }
 
+  // A resource whose values workers read unsynchronized is refused while a
+  // worker runs its module (D-129): nothing is attempted or recorded, as for
+  // a thread-unsafe command; pause the workers and send the same request.
+  for (const v2::TransactionOp &op : request.ops()) {
+    const dataplane::Resource *resource = engine_.FindResource(op.resource());
+    const framework::ResourceCodec *codec =
+        resource == nullptr ? nullptr : bindings_.Find(*resource);
+    if (codec != nullptr && codec->Busy()) {
+      return std::unexpected(ControlError{
+          .code = ControlErrorCode::kResourceBusy,
+          .err = EBUSY,
+          .message = "resource '" + op.resource() +
+                     "' changes only with its module's workers paused (a worker runs it)",
+          .object = op.resource(),
+          .field = "ops"});
+    }
+  }
+
   // Decode every operation through its resource's codec; the first that
   // cannot be decoded rejects the transaction.
   const int n = request.ops_size();
@@ -275,6 +293,10 @@ v2::ListTransactionResourcesResponse DataplaneTransactions::List() const {
     out->set_name(name);
     out->set_key_type(codec->key_type());
     out->set_value_type(codec->value_type());
+    out->set_kind(codec->kind() == framework::ResourceCodec::Kind::kSingleton
+                      ? v2::TransactionResource::KIND_SINGLETON
+                      : v2::TransactionResource::KIND_MAP);
+    out->set_requires_paused_workers(codec->requires_paused_workers());
   }
   return response;
 }

@@ -19,6 +19,7 @@
 #include "control/pipeline_validator.h"
 #include "control/transaction.h"
 #include "message.h"
+#include "module.h"
 #include "port.h"
 #include "traffic_class.h"
 #include "utils/common.h"
@@ -107,14 +108,17 @@ class ControlPlane {
   ControlResult<void> ConnectModules(const ConnectionSpec& spec);
   ControlResult<void> DisconnectModules(const DisconnectionSpec& spec);
   // Runs module `module`'s command `command` with `arg` (GetSchema names each
-  // command's argument type), for the legacy ModuleCommand RPC and the v2
-  // RunModuleCommand alike (D-115). A command not marked thread-safe is
-  // refused (EBUSY) while a worker runs: pause first. The command's own
-  // failure is the response's error; the result's error is only "no such
-  // module". Commands change module state, not the pipeline: no generation.
+  // action's argument type): `surface` kLegacy for the legacy ModuleCommand
+  // RPC (every command), kActions for control_v2's InvokeAction (D-129: the
+  // class's actions only; a legacy-only command is ENOTSUP). A command not
+  // marked thread-safe is refused (EBUSY) while a worker runs: pause first.
+  // The command's own failure is the response's error; the result's error is
+  // only "no such module". Commands change module state, not the pipeline:
+  // no generation.
   ControlResult<bess::pb::CommandResponse> RunModuleCommand(
       const std::string& module, const std::string& command,
-      const google::protobuf::Any& arg);
+      const google::protobuf::Any& arg,
+      ModuleBuilder::CommandSurface surface = ModuleBuilder::CommandSurface::kLegacy);
 
   // -- workers --
   // No core: automatic -- Placement::NextWorkerCpu over the live workers'
@@ -159,19 +163,32 @@ class ControlPlane {
   PipelineSnapshot GetPipeline() const;
 
   // Validated desired state -> what has to change -> dependency-ordered plan.
-  // Pure with respect to the runtime; nothing here mutates anything.
+  // Pure with respect to the runtime; nothing here mutates anything. The
+  // diff's `resources` count what converging each listed resource changes
+  // (D-129); a key that does not decode is INVALID_ARGUMENT here already.
   ControlResult<PipelineDiff> DiffPipeline(const PipelineSpec& desired) const;
   ControlResult<PipelinePlan> PlanPipeline(const PipelineSpec& desired) const;
 
-  // The same reads, paired with the generation they observed, taken under
-  // one lock acquisition -- what a client needs to follow up with an
-  // ApplyPipeline(expected_generation) (G1).
+  // The same reads, paired with the generations they observed (the
+  // pipeline's, and the dataplane transaction generation resource contents
+  // are at), taken under one lock acquisition -- what a client needs to
+  // follow up with an ApplyPipeline(expected_generation) (G1).
   template <typename T>
   struct Versioned {
     T value;
     uint64_t generation = 0;
+    uint64_t resource_generation = 0;
   };
-  Versioned<PipelineSnapshot> GetPipelineVersioned() const;
+  // Which resources' contents a read includes (D-129).
+  struct ResourceQuery {
+    bool include = false;
+    std::vector<std::string> names;  // with include: only these (empty: all)
+  };
+  struct PipelineRead {
+    PipelineSnapshot snapshot;
+    std::vector<ResourceSpec> resources;  // by name
+  };
+  ControlResult<Versioned<PipelineRead>> ReadPipeline(const ResourceQuery& query) const;
   ControlResult<Versioned<PipelineDiff>> DiffPipelineVersioned(
       const PipelineSpec& desired) const;
   ControlResult<Versioned<PipelinePlan>> PlanPipelineVersioned(
@@ -179,9 +196,12 @@ class ControlPlane {
 
   // -- transactions --
   // The transactional path (section 9.7): validate, check the expected
-  // generation, diff, plan, then run the plan as a transaction. A failure
-  // leaves the previous runtime active; a no-op apply neither pauses workers
-  // nor bumps the generation.
+  // generations, diff, plan, then run the plan as a transaction: prepare,
+  // commit, the listed resources' contents in one dataplane transaction
+  // (D-129; its refusal aborts the whole apply), retire. A failure leaves the
+  // previous runtime active; a no-op apply neither pauses workers nor bumps
+  // a generation, and one that changes only resource contents bumps only the
+  // dataplane transaction generation.
   ControlResult<ApplyResult> ApplyPipeline(const PipelineSpec& desired,
                                            const ApplyOptions& options);
 
@@ -231,6 +251,15 @@ class ControlPlane {
   ControlResult<void> ResetPortsLocked();
   ControlResult<void> ResetTcsLocked();
   ControlResult<void> ResetWorkersLocked();
+
+  // Fills `diff->resources` for the validated `desired` (D-129). A resource
+  // whose module the diff creates or replaces does not exist yet: unchecked.
+  ControlResult<void> DiffResourcesLocked(const PipelineSpec& desired,
+                                          PipelineDiff* diff) const;
+  // Converges the listed resources in one dataplane transaction, pausing the
+  // workers if a resource that changes requires it. Returns the operations
+  // applied.
+  ControlResult<size_t> ApplyResourcesLocked(std::span<const ResourceSpec> resources);
 
   ControlResult<void> AttachTc(bess::TrafficClass* c_,
                                const TrafficClassSpec& spec);

@@ -10,6 +10,7 @@
 #include <google/protobuf/util/message_differencer.h>
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <map>
 #include <random>
@@ -734,6 +735,169 @@ TEST(WildcardMatchPacketTest, InitialArgAndRuntimeConfigReproduceTheModule) {
   WildcardMatchConfig config;
   ASSERT_TRUE(h.MustCommand(wm, "get_runtime_config", bess::pb::EmptyArg()).UnpackTo(&config));
   EXPECT_TRUE(MessageDifferencer::Equals(expect, config)) << config.DebugString();
+}
+
+// D-129: the rules and the default gate as resources.
+
+FieldData IntData(uint64_t value) {
+  FieldData d;
+  d.set_value_int(value);
+  return d;
+}
+
+bess::pb::WildcardMatchRuleKey WmRuleKey(const std::vector<FieldData> &masks,
+                                         const std::vector<FieldData> &values) {
+  bess::pb::WildcardMatchRuleKey key;
+  for (const FieldData &m : masks) {
+    *key.add_masks() = m;
+  }
+  for (const FieldData &v : values) {
+    *key.add_values() = v;
+  }
+  return key;
+}
+
+bess::pb::WildcardMatchRuleValue WmRuleValue(int64_t priority, uint64_t gate) {
+  bess::pb::WildcardMatchRuleValue value;
+  value.set_priority(priority);
+  value.set_gate(gate);
+  return value;
+}
+
+bess::pb::WildcardMatchSettings WmSettings(uint64_t default_gate) {
+  bess::pb::WildcardMatchSettings settings;
+  settings.set_default_gate(default_gate);
+  return settings;
+}
+
+// Rules of different masks and priorities upserted as "<module>/rules"
+// classify packets as the add command's would, read back as the same
+// entries (an integer-encoded key reads back as bytes and still compares
+// equal through the codec), and an erase takes one out.
+TEST(WildcardMatchResourceTest, RulesResourceClassifiesAndRoundTrips) {
+  ModuleHarness h;
+  Module *wm = CreateWm(h, {WmField(26, 4), WmField(30, 4)});  // sip, dip
+  ASSERT_NE(nullptr, wm);
+  const std::string rules = wm->name() + "/rules";
+  const Octets zero4 = {0, 0, 0, 0};
+
+  // Source exact, destination wild: priority 10, gate 1.
+  const auto key_a = WmRuleKey({BinData(kFull4), BinData(zero4)},
+                               {BinData(IpOctets("26.51.119.68")), BinData(zero4)});
+  const auto val_a = WmRuleValue(10, 1);
+  // Source 26.0.0.0/8 (integer-encoded), destination wild: priority 5, gate 2.
+  const auto key_b = WmRuleKey({IntData(0xff000000), BinData(zero4)},
+                               {IntData(0x1a000000), BinData(zero4)});
+  const auto val_b = WmRuleValue(5, 2);
+  // Source wild, destination exact: priority 20, gate 3.
+  const auto key_c = WmRuleKey({BinData(zero4), BinData(kFull4)},
+                               {BinData(zero4), BinData(IpOctets("10.0.0.1"))});
+  const auto val_c = WmRuleValue(20, 3);
+  ASSERT_EQ("", h.UpsertResource(rules, key_a, val_a));
+  ASSERT_EQ("", h.UpsertResource(rules, key_b, val_b));
+  ASSERT_EQ("", h.UpsertResource(rules, key_c, val_c));
+  ASSERT_EQ("", h.SetResource(wm->name() + "/settings", WmSettings(4)));
+
+  std::mt19937 rng(7);
+  const Bytes all = TcpPacket({.sip = "26.51.119.68", .dip = "10.0.0.1"}, rng);
+  const Bytes a_b = TcpPacket({.sip = "26.51.119.68", .dip = "10.0.0.2"}, rng);
+  const Bytes b = TcpPacket({.sip = "26.1.1.1", .dip = "10.0.0.2"}, rng);
+  const Bytes none = TcpPacket({.sip = "27.0.0.1", .dip = "10.0.0.2"}, rng);
+  const std::vector<gate_idx_t> gates = {0, 1, 2, 3, 4};
+  EXPECT_EQ((GateCounts{{3, 1}}), Counts(h.Run(wm, 0, {all}, gates)));
+  EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(wm, 0, {a_b}, gates)));
+  EXPECT_EQ((GateCounts{{2, 1}}), Counts(h.Run(wm, 0, {b}, gates)));
+  EXPECT_EQ((GateCounts{{4, 1}}), Counts(h.Run(wm, 0, {none}, gates)));
+
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&key_a, &val_a}, {&key_b, &val_b}, {&key_c, &val_c}}));
+  EXPECT_EQ(3u, h.ReadResource(rules).size());
+
+  ASSERT_EQ("", h.EraseResource(rules, key_b));
+  EXPECT_EQ((GateCounts{{4, 1}}), Counts(h.Run(wm, 0, {b}, gates)));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&key_a, &val_a}, {&key_c, &val_c}}));
+
+  // A rule the legacy command adds is read back too.
+  h.MustCommand(wm, "add", WmRule(2, 7, {{0xff, 0, 0, 0}, zero4}, {{0x1b, 0, 0, 0}, zero4}));
+  const auto key_d = WmRuleKey({BinData({0xff, 0, 0, 0}), BinData(zero4)},
+                               {BinData({0x1b, 0, 0, 0}), BinData(zero4)});
+  const auto val_d = WmRuleValue(7, 2);
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&key_a, &val_a}, {&key_c, &val_c}, {&key_d, &val_d}}));
+}
+
+// A rule with a bad gate, a wrong field count or a non-canonical value/mask
+// pair is refused, and nothing changes.
+TEST(WildcardMatchResourceTest, RulesResourceRefusesBadRules) {
+  ModuleHarness h;
+  Module *wm = CreateWm(h, {WmField(26, 4)});
+  ASSERT_NE(nullptr, wm);
+  const std::string rules = wm->name() + "/rules";
+  const auto key = WmRuleKey({BinData(kFull4)}, {BinData(IpOctets("26.51.119.68"))});
+  EXPECT_NE("", h.UpsertResource(rules, key, WmRuleValue(1, uint64_t{1} << 20)));
+  EXPECT_NE("", h.UpsertResource(rules, WmRuleKey({BinData(kFull4), BinData(kFull4)},
+                                                  {BinData(kFull4), BinData(kFull4)}),
+                                 WmRuleValue(1, 1)));
+  EXPECT_NE("", h.UpsertResource(rules, WmRuleKey({BinData({0xff, 0, 0, 0})}, {BinData(kFull4)}),
+                                 WmRuleValue(1, 1)));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {}));
+}
+
+// "<module>/settings" sets the default gate (what set_default_gate does),
+// reads back as set, and refuses a gate out of range, keeping the old one.
+TEST(WildcardMatchResourceTest, SettingsSetTheDefaultGate) {
+  ModuleHarness h;
+  Module *wm = CreateWm(h, {WmField(26, 4)});
+  ASSERT_NE(nullptr, wm);
+  const std::string settings = wm->name() + "/settings";
+  h.MustCommand(wm, "add", WmRule(1, 1, {kFull4}, {IpOctets("26.51.119.68")}));
+  std::mt19937 rng(8);
+  const Bytes hit = TcpPacket({.sip = "26.51.119.68", .dip = "10.0.0.1"}, rng);
+  const Bytes miss = TcpPacket({.sip = "26.51.119.69", .dip = "10.0.0.1"}, rng);
+  EXPECT_TRUE(Counts(h.Run(wm, 0, {miss}, {0, 1, 2, 3})).empty()) << "dropped by default";
+
+  const auto two = WmSettings(2);
+  ASSERT_EQ("", h.SetResource(settings, two));
+  EXPECT_EQ((GateCounts{{2, 1}}), Counts(h.Run(wm, 0, {miss}, {0, 1, 2, 3})));
+  EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(wm, 0, {hit}, {0, 1, 2, 3})));
+  EXPECT_EQ("", h.ReadBackDiffers(settings, {{nullptr, &two}}));
+
+  EXPECT_NE("", h.SetResource(settings, WmSettings(uint64_t{1} << 20)));
+  EXPECT_EQ((GateCounts{{2, 1}}), Counts(h.Run(wm, 0, {miss}, {0, 1, 2, 3})));
+  EXPECT_EQ("", h.ReadBackDiffers(settings, {{nullptr, &two}}));
+
+  // The legacy setter and the resource are the same state.
+  h.MustCommand(wm, "set_default_gate", WmDefault(3));
+  const auto three = WmSettings(3);
+  EXPECT_EQ("", h.ReadBackDiffers(settings, {{nullptr, &three}}));
+  EXPECT_EQ((GateCounts{{3, 1}}), Counts(h.Run(wm, 0, {miss}, {0, 1, 2, 3})));
+
+  // Gate 0 is the proto3 default: it reads back as an empty message.
+  const auto zero = WmSettings(0);
+  ASSERT_EQ("", h.SetResource(settings, zero));
+  EXPECT_EQ((GateCounts{{0, 1}}), Counts(h.Run(wm, 0, {miss}, {0, 1, 2, 3})));
+  EXPECT_EQ("", h.ReadBackDiffers(settings, {{nullptr, &zero}}));
+}
+
+// Every WildcardMatch command edits or reads back resource state: control_v2
+// does not run any of them as an action, while the legacy command still does.
+TEST(WildcardMatchResourceTest, CommandsAreLegacyOnly) {
+  ModuleHarness h;
+  Module *wm = CreateWm(h, {WmField(26, 4)});
+  ASSERT_NE(nullptr, wm);
+  const auto rule = WmRule(1, 1, {kFull4}, {IpOctets("26.51.119.68")});
+  const bess::pb::EmptyArg empty;
+  EXPECT_EQ(ENOTSUP, h.Action(wm, "add", rule).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(wm, "delete", WmKey({kFull4}, {IpOctets("26.51.119.68")}))
+                         .error()
+                         .code());
+  EXPECT_EQ(ENOTSUP, h.Action(wm, "clear", empty).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(wm, "set_default_gate", WmDefault(1)).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(wm, "get_initial_arg", empty).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(wm, "get_runtime_config", empty).error().code());
+  EXPECT_EQ(ENOTSUP, h.Action(wm, "set_runtime_config", WildcardMatchConfig()).error().code());
+  EXPECT_EQ("", h.ReadBackDiffers(wm->name() + "/rules", {})) << "the refused add did nothing";
+
+  EXPECT_EQ(0, h.Command(wm, "add", rule).error().code());
+  EXPECT_EQ(1u, h.ReadResource(wm->name() + "/rules").size());
 }
 
 }  // namespace

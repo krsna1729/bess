@@ -5,6 +5,8 @@
 #include "hash_lb.h"
 
 #include <cstring>
+#include <expected>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -34,11 +36,17 @@ static inline T Load(const char *p) {
   return v;
 }
 
+// The setters edit what "settings" holds: legacy only (D-129).
 const Commands HashLB::cmds = {
     {"set_mode", "HashLBCommandSetModeArg",
-     MODULE_CMD_FUNC(&HashLB::CommandSetMode), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&HashLB::CommandSetMode), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY},
     {"set_gates", "HashLBCommandSetGatesArg",
-     MODULE_CMD_FUNC(&HashLB::CommandSetGates), Command::THREAD_SAFE}};
+     MODULE_CMD_FUNC(&HashLB::CommandSetGates), Command::THREAD_SAFE, "",
+     Command::LEGACY_ONLY}};
+
+const ResourceTables HashLB::resource_tables = {
+    ResourceTable::Singleton<bess::pb::HashLBSettings>("settings")};
 
 HashLB::Config HashLB::Current() const {
   const Config *current = config_.Read();
@@ -81,6 +89,8 @@ CommandResponse HashLB::ApplyMode(const bess::pb::HashLBCommandSetModeArg &arg,
   } else {
     return CommandFailure(EINVAL, "available LB modes: l2, l3, l4");
   }
+  config->settings.set_mode(arg.mode());
+  *config->settings.mutable_fields() = arg.fields();
   return CommandSuccess();
 }
 
@@ -106,6 +116,7 @@ CommandResponse HashLB::ApplyGates(const bess::pb::HashLBCommandSetGatesArg &arg
     gates.push_back(static_cast<gate_idx_t>(arg.gates(i)));
   }
   config->gates = std::move(gates);
+  *config->settings.mutable_gates() = arg.gates();
   return CommandSuccess();
 }
 
@@ -149,9 +160,48 @@ CommandResponse HashLB::Init(const bess::pb::HashLBArg &arg) {
     if (ret.has_error()) {
       return ret;
     }
+  } else {
+    config.settings.set_mode("l4");  // kDefaultMode
   }
   Install(std::move(config));
+
+  // A whole new configuration, validated as set_gates then set_mode validate
+  // it, published by an RCU swap while workers run: the replaced one is
+  // retired against the transaction's grace period.
+  auto registered = settings_.Register(
+      init_context().resources(), init_context().codecs(), name() + "/settings",
+      [this](const bess::pb::HashLBSettings &v)
+          -> std::expected<std::unique_ptr<const Config>, std::string> {
+        Config next;
+        bess::pb::HashLBCommandSetGatesArg gates_arg;
+        *gates_arg.mutable_gates() = v.gates();
+        CommandResponse err = ApplyGates(gates_arg, &next);
+        if (err.has_error()) {
+          return std::unexpected(err.error().errmsg());
+        }
+        bess::pb::HashLBCommandSetModeArg mode_arg;
+        mode_arg.set_mode(v.mode());
+        *mode_arg.mutable_fields() = v.fields();
+        err = ApplyMode(mode_arg, &next);
+        if (err.has_error()) {
+          return std::unexpected(err.error().errmsg());
+        }
+        return std::make_unique<const Config>(std::move(next));
+      },
+      [this](std::unique_ptr<const Config> &next, bess::dataplane::Retirer &retirer) {
+        retirer.Retire(config_.Exchange(std::move(next)));
+      },
+      bess::dataplane::Resource::Footprint{.retires = 1},
+      [this] { return config_.Read()->settings; },
+      nullptr);
+  if (!registered) {
+    return CommandFailure(EEXIST, "%s", registered.error().c_str());
+  }
   return CommandSuccess();
+}
+
+void HashLB::DeInit() {
+  settings_.Release();
 }
 
 std::string HashLB::GetDesc() const {

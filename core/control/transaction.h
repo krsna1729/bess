@@ -39,6 +39,8 @@ struct ApplyOptions {
   // Optimistic concurrency: if set, the apply is rejected with a conflict
   // before any side effect when the active generation differs.
   std::optional<uint64_t> expected_generation;
+  // The same for the dataplane transaction generation (resource contents).
+  std::optional<uint64_t> expected_resource_generation;
 };
 
 // Where a transaction spent its time. Recorded so that pause duration is
@@ -56,6 +58,8 @@ struct ApplyResult {
   size_t applied_ops = 0;    // operations executed (prepare + commit + retire)
   bool workers_paused = false;
   ApplyTiming timing;
+  uint64_t resource_generation = 0;  // dataplane transaction generation after it
+  size_t resource_ops = 0;           // resource entries created, updated or erased
 };
 
 enum class TransactionPhase {

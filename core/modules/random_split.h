@@ -5,6 +5,11 @@
 #ifndef BESS_MODULES_RANDOM_SPLIT_H_
 #define BESS_MODULES_RANDOM_SPLIT_H_
 
+#include <expected>
+#include <string>
+#include <vector>
+
+#include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "utils/random.h"
@@ -19,8 +24,10 @@ class RandomSplit final : public Module {
 
   static const gate_idx_t kNumOGates = MAX_GATES;
   static const Commands cmds;
+  static const ResourceTables resource_tables;
 
   CommandResponse Init(const bess::pb::RandomSplitArg &arg);
+  void DeInit() override;
   CommandResponse CommandSetDroprate(
       const bess::pb::RandomSplitCommandSetDroprateArg &arg);
   CommandResponse CommandSetGates(
@@ -29,10 +36,24 @@ class RandomSplit final : public Module {
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
  private:
+  struct Settings {
+    double drop_rate = 0;
+    std::vector<gate_idx_t> gates;
+  };
+
+  // "<name>/settings" (D-129): validated as set_droprate and set_gates do,
+  // and a gate must fit a gate index (the commands narrow it unchecked).
+  static std::expected<Settings, std::string> StageSettings(
+      const bess::pb::RandomSplitArg &arg);
+  void ApplySettings(const Settings &settings);
+  bess::pb::RandomSplitArg ReadSettings() const;
+
   Random rng_;  // Random number generator
   double drop_rate_;
   gate_idx_t gates_[MAX_SPLIT_GATES];
   gate_idx_t ngates_;
+
+  bess::framework::Singleton<bess::pb::RandomSplitArg, Settings> settings_;
 };
 
 #endif  // BESS_MODULES_RANDOM_SPLIT_H_
