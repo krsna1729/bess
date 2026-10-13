@@ -110,6 +110,7 @@
     "utils/checksum.h": "experimental",
     "utils/common.h": "public",
     "utils/copy.h": "public",
+    "utils/dpdk_memory.h": "experimental",
     "utils/endian.h": "public",
     "utils/ether.h": "public",
     "utils/extended_priority_queue.h": "public",

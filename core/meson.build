@@ -546,6 +546,8 @@ core_public_subdir_headers = {
     'utils/checksum.h',
     'utils/common.h',
     'utils/copy.h',
+    # D-123: the table headers default their socket to utils::MemoryNode().
+    'utils/dpdk_memory.h',
     'utils/endian.h',
     'utils/ether.h',
     'utils/extended_priority_queue.h',

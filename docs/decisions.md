@@ -8871,6 +8871,9 @@ but the striped order.
 **Not done.** A metric for cross-NUMA ports: PMD ports cannot register metrics (drivers -> stats is not a link
 edge) and the builtin metric source runs without the control-plane lock; `GetPortStatus` carries it.
 `buf breaking` (WIRE_JSON) against develop passes with `Worker.core` optional and the new fields.
+`utils/dpdk_memory.h` is now an installed header, classified **experimental** in `tools/api_classes.json`: the
+installed table headers (`handoff.h`, `shared_flow_table.h`, `meter.h`, `meter_set.h`, `route_table.h`) default
+their socket to `utils::MemoryNode()`.
 
 **Code.** `core/runtime/numa_placement.{h,cc}` and `_test.cc` (new), `core/runtime/{thread_placement,dpdk,opts}`,
 `core/main.cc`, `core/utils/dpdk_memory.{h,cc}`, `core/packet_pool.{h,cc}`, `core/worker.cc`,
