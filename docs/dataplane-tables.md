@@ -156,8 +156,8 @@ state through G, C or W.
 ### `RuntimeMaskedBackend` (masked/ternary match, mode G)
 
 - **What:** tuple-space search. There is one exact table per distinct mask,
-  and a lookup masks the batch once per tuple, looks it up, and merges by
-  priority.
+  and a lookup masks the batch once per tuple (a fixed-width kernel for every
+  key width, D-124), looks it up, and merges by priority.
   - Rules must be canonical (`value & ~mask == 0`); anything else is
     rejected at build.
   - Equal priorities resolve to the later rule.

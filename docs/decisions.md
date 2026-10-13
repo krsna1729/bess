@@ -144,6 +144,7 @@ file is the reasoning.
 | D-121 | ExactMatch: a fused kernel for a key that is one packet field of 1, 2, 4 or 8 bytes (load, mask, CRC32C and key row in one pass, then a prehashed lookup), chosen when a generation is built; 33 fewer instructions per packet on M.exactmatch; the generic path for every other layout | accepted |
 | D-122 | Release artifacts for arm64 as well as x86_64: `publish-release` runs on `ubuntu-24.04` and `ubuntu-24.04-arm`; every file name carries the architecture (`SHA256SUMS-<machine>`) | accepted |
 | D-123 | Process placement: one memory node per bessd (chosen at startup from its CPUs' nodes and the memory it may use; everything allocated there), one reserved control CPU, automatic SMT-striped worker CPUs; anything on another node is diagnosed, never refused; only a CPU outside the set is an error | accepted |
+| D-124 | WildcardMatch masks: a fixed-width masking kernel for every key width 1-64 (8-, 4-, 2-, 1-byte steps) replaces the byte loop for widths other than 1/2/4/8 (13-byte key live: -19%); grouping tuples that share a field layout and per-worker tables (mode W) evaluated and not adopted | accepted |
 | D-125 | HTTP inside bessd, off by default: protobuf-JSON over the Control RPCs, WatchEvents as server-sent events, Prometheus `/metrics` (replaces tools/bess_prometheus.py), a compiled-in page; every request a call on bessd's own gRPC server over an in-process channel | accepted |
 | D-126 | One SIMD width per process: `--simd_width=auto\|256\|512` and the CPU, decided once before the EAL, passed to DPDK as `--force-max-simd-bitwidth` (auto passes nothing: DPDK's 256 on x86) and to BESS kernels through `arch::RuntimeDispatch`, a function pointer resolved at startup; wider than the CPU is a warning; no AVX-512 kernel (no hardware) | accepted |
 | D-127 | Compiler tuning: a `tune` meson option (`-mtune`, empty by default, not passed to plugins); releases stay `-march=x86-64-v3` with the compiler's default tune (GCC: generic): on this host no `-mtune` (generic, graniterapids, znver5, native alderlake) is consistently faster with GCC 16, and Clang's best tune here is AMD's | accepted |
@@ -9673,3 +9674,84 @@ pipeline_spec,pipeline_validator,pipeline_diff,pipeline_plan,pipeline_resources,
 the modules in the table and their tests; `core/testing/module_harness`; `sdk/cpp`, `sdk/go`,
 `sdk/conformance/cases.json`; `bessctl/{main,manifest}`; `tests/live`; `sample_plugin`, `examples/appliances`;
 `docs/{control-sdk,plugin-api,limits}.md`.
+
+## D-124 WildcardMatch: fixed-width masking for every key width; shared-layout grouping and mode W not adopted
+
+**Status:** accepted (2026-10-14).
+
+**Problem.** Roadmap item: "WildcardMatch next steps: group masks sharing extraction; evaluate per-worker mode W".
+WildcardMatch already extracts each packet's key once per batch (its `ExtractPlan`, a dense `field0 || field1 ...`
+key); every tuple of its `ConcurrentMaskedTable` keys on that same layout and differs only in its bit mask. Per tuple
+the lookup makes two passes over the batch: a mask pass (`detail::MaskBatchFn`) into scratch rows, then a hash pass
+(`detail::HashBatchFixed<W>`, D-015) over them, then DPDK's prehashed bulk lookup. The mask pass had fixed-width
+kernels only for 1, 2, 4 and 8 bytes; every other width (a 13-byte IPv4 5-tuple, the module's 6-byte example) took
+`MaskBatchVariable`, a byte loop with the mask reloaded per byte.
+
+**Decision.**
+
+- **`detail::MaskBatchFixed<W>` for every width 1-64** (`core/classifier/masked_exact.h`), chosen once per table
+  (`SelectMaskBatch`) as before: the mask is loaded once into 8-byte words and 4-, 2- and 1-byte tail pieces, and each
+  key is masked in those steps -- the same steps `CrcFixed<W>` then reads the row back in, so every reload forwards
+  from its store. `MaskBatchVariable` is gone. Both users take it: `ConcurrentMaskedTable` (WildcardMatch) and
+  `RuntimeMaskedBackend`. Lookup semantics are unchanged: the merge, priority order, the D-098 skip, `kTooManyTuples`
+  at `max_tuples`, the miss gate and the results are untouched code.
+- **Widths 1, 2, 4 and 8 compile to the same code.** The old and new templates instantiated side by side (`-O3
+  -march=x86-64-v3`): clang++ emits identical instructions for all four; g++ identical for 1, 2 and 4, and for 8
+  differs only in the operand order of the loop's `cmpq` (same branch).
+- **Not adopted: grouping tuples that share a field layout.** Implemented and measured: tuples taken eight at a time
+  in list order, one pass loading each key once into registers and deriving every tuple's masked row and CRC32C from
+  it, then a prehashed lookup per tuple; chosen when the tuple list is published, kept to keys of at most 16 bytes.
+  No gain, paired in one binary (`BM_Lookup`, 32-key batches, 1000 rules, ns per batch, grouped / per-tuple, both
+  with the fixed-width mask): 8-byte keys 1 mask 326 / 313, 4 masks 1456 / 1447, 8 masks 2171 / 2072; 13-byte keys
+  345 / 334, 1530 / 1514, 2273 / 2268. A first grouped kernel that built partial words through memory was much slower
+  at 13 bytes (store-forwarding stalls: 1 mask 476 vs 297). Profile (perf, 8-byte key, 1 mask): `__bulk_lookup_lf`
+  40-44%, `rte_hash_lookup_with_hash_bulk_data` 11-12%, `CmpFixed<8>` 12-13%, the merge in `LookupBatch` 19%; the
+  per-tuple mask and hash passes together 7.8%, the grouped kernel 14.3%. With extraction already once per batch,
+  the only work grouping can share is re-reading a key that is in L1; the probe dominates.
+- **Not adopted: per-worker tables (mode W).** Lookups would use an unshared table per worker (the generation backend,
+  `RuntimeMaskedBackend`, is that shape: `BM_Lookup` impl 0 against impl 1, the shared `ConcurrentMaskedTable`).
+  Every rule change would be applied once per worker, memory grows with the worker count, and the D-014 trade
+  (in-place updates with no rebuild) would need per-worker op rings. D-014 recorded the lookup side (+27% for the
+  shared table at 4 masks, 1K rules); this round did not re-measure impl 0 against impl 1 (run `BM_Lookup/0/*`
+  and `BM_Lookup/1/*` to refresh it). Revisit if a lookup-heavy user appears.
+
+**Evidence.** `core/modules/wildcard_match_update_bench.cc` `BM_Lookup/impl/tuples/rules/width` (width added: 8 or
+13 bytes; mask t keeps every byte but byte t). The `debugoptimized` fast build, `-Dcpu=x86-64-v3`, pinned to
+CPU 2 under `slot perf`, 3 repetitions, medians, ns per 32-key batch, 1000 rules, `ConcurrentMaskedTable`:
+
+| key | masks | byte-loop mask (before) | fixed-width mask (after) |
+|---|---|---|---|
+| 13 B | 1 | 465 | 297 |
+| 13 B | 4 | 1931 | 1495 |
+| 13 B | 8 | 3043 | 2173 |
+| 8 B | 1 / 4 / 8 | 280 / 1416 / 2035 | 277 / 1425 / 2047 (same code) |
+
+Before and after are two consecutive runs in one session of the same tree's per-tuple path, before and after the
+kernel change (same flags and arguments); the 8-byte rows differ by noise (identical code).
+
+Live (`tools/live_perf.py`, base d098197f against this change on it, release builds, isolated CPUs 4/6 with
+control on 2, 8 palindromic rounds, ns per packet above `M.base`, then instructions / cycles per packet including the
+base; the run reported IRQ and thermal-interrupt activity on the target CPUs):
+
+| test | base | fixed-width | rounds base was faster |
+|---|---|---|---|
+| `M.wildcardmatch` (8-byte key, 4 masks) | 13.40 (359.9 / 77.4) | 13.29 (360.1 / 76.9) | 2 / 8 |
+| `M.wildcardmatch/13b` (13-byte 5-tuple, 4 masks) | 20.98 (509.2 / 106.5) | 16.99 (443.2 / 92.3) | 0 / 8 |
+| `M.wildcardmatch/8` (8-byte key, 8 masks) | 83.62 (1731.8 / 349.6) | 82.43 (1732.6 / 344.4) | 0 / 8 |
+
+`M.wildcardmatch/13b`'s packets match its rules (UDP from 10.0.0.1-10.0.4.0 to 11.0.0.1 port 2000, every source
+under the /16 and /8 rules; protocol and destination port are in the key, the source port is masked out), so it
+measures hits. The 8-byte rows run the same instructions, as
+the codegen comparison predicts.
+
+**Tests.** `MaskedExactTest.MaskKernelMatchesByteWiseReferenceForEveryWidth`: every width 1-64, all-ones, all-zero
+and random masks, strides of width + 0..2, key and output buffers ending at the last byte the kernel may touch.
+`ConcurrentMaskedTableTest.EveryKeyWidthMatchesABruteForceModel`: widths 1-8, 13, 16, 17, 24, 37 and 64 against a
+brute-force model (12 masks, ties and unpacked priorities, replacements, deletes, a pending prepared rule, batches
+of 1-64 at strides up to width + 2, a miss leaves its slot untouched). Both, `concurrent_masked_test`,
+`wildcard_match_test` and `wildcard_match_transaction_test` pass under clang ASan+UBSan. The fast suite passes
+(180/181, and `live_conformance` passes on rerun with `BESS_GO` set: its Go half needs a Go toolchain).
+
+**Code.** `core/classifier/masked_exact.h`, `core/classifier/masked_exact_test.cc`,
+`core/classifier/concurrent_masked_test.cc`, `core/modules/wildcard_match_update_bench.cc`, `tools/live_perf.py`
+(`M.wildcardmatch/13b`).

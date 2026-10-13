@@ -19,7 +19,8 @@ counters, so nothing is added to the packet path). Classes:
   M  module, localised -- ns per packet *above* M.base (Source -> Rewrite -> Bypass -> Sink,
        the same headers and flow mix every M test uses):
        M.exactmatch, M.exactmatch/mixed (bursts split across gates), M.wildcardmatch,
-       M.iplookup, M.iplookup/fib (the same on the rte_fib backend, D-132),
+       M.wildcardmatch/13b (a 13-byte 5-tuple key), M.iplookup,
+       M.iplookup/fib (the same on the rte_fib backend, D-132),
        M.l2forward, M.acl, M.hashlb, M.update, M.nat, M.vlan, M.genericencap (constant header),
        M.metadata (Timestamp and SetMetadata attributes read by GenericEncap)
   Reading a result: F.floor or F.hop moving moves every pipeline (cross-cutting);
@@ -259,6 +260,26 @@ def m_wildcardmatch(b):
     return m_base(b, [('wm', 2)])
 
 
+def m_wildcardmatch_13b(b):
+    """M.wildcardmatch's four masks on a 13-byte 5-tuple key (source, destination, protocol,
+    source port wildcarded, destination port): a key width with 8-, 4- and 1-byte mask steps
+    (D-124)."""
+    b.mod('WildcardMatch', 'wm', {'fields': [{'offset': 26, 'num_bytes': 4},
+                                             {'offset': 30, 'num_bytes': 4},
+                                             {'offset': 23, 'num_bytes': 1},
+                                             {'offset': 34, 'num_bytes': 2},
+                                             {'offset': 36, 'num_bytes': 2}]})
+    b.cmd('wm', 'set_default_gate', 'WildcardMatchCommandSetDefaultGateArg', {'gate': 0})
+    for i, mask in enumerate((0xffffff00, 0xffff0000, 0xff000000, 0xfffff000)):
+        b.cmd('wm', 'add', 'WildcardMatchCommandAddArg',
+              {'gate': 1, 'priority': i,
+               'values': [{'value_int': 0x0a000000 & mask}, {'value_int': 0x0b000000},
+                          {'value_int': 17}, {'value_int': 0}, {'value_int': 2000}],
+               'masks': [{'value_int': mask}, {'value_int': 0xff000000},
+                         {'value_int': 0xff}, {'value_int': 0}, {'value_int': 0xffff}]})
+    return m_base(b, [('wm', 2)])
+
+
 def m_wildcardmatch_masks(n):
     """n masks in use (/8 .. /8+n-1), all at one priority: D-098's skip needs a best match
     above a tuple's ceiling, so equal priorities look up every mask (worst case). Above 8
@@ -390,6 +411,7 @@ TESTS = {
     'M.exactmatch/miss': ('M', m_exactmatch_miss),
     'M.split/2': ('M', m_split),
     'M.wildcardmatch': ('M', m_wildcardmatch),
+    'M.wildcardmatch/13b': ('M', m_wildcardmatch_13b),
     'M.wildcardmatch/8': ('M', m_wildcardmatch_masks(8)),
     'M.wildcardmatch/16': ('M', m_wildcardmatch_masks(16)),
     'M.session': ('M', m_session),

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <optional>
 #include <random>
 #include <thread>
 #include <vector>
@@ -159,6 +160,116 @@ TEST(ConcurrentMaskedTableTest, RandomRulesMatchABruteForceModel) {
         if (best != nullptr) {
           ASSERT_EQ(best->result, out[i]) << "seed " << seed << " step " << step << " key " << i;
         }
+      }
+    }
+  }
+}
+
+// Against a brute-force model at key widths covering every tail of the
+// fixed-width mask and hash kernels (8-, 4-, 2- and 1-byte steps; D-124): up
+// to 12 masks; priorities with ties and beyond the packed range;
+// replacements, deletes, and a pending (prepared, uncommitted) rule; batches
+// of 1-64 keys, some at a stride wider than the key, in buffers ending
+// exactly at the last key (an over-read is an ASan error).
+TEST(ConcurrentMaskedTableTest, EveryKeyWidthMatchesABruteForceModel) {
+  using Key = std::vector<std::byte>;
+  struct ModelRule {
+    Key mask, value;
+    int64_t priority;
+    uint64_t seq;
+    uint16_t result;
+  };
+  static constexpr std::array<uint8_t, 4> kMaskBytes = {0x00, 0xff, 0xf0, 0x3c};
+  for (const size_t width : std::array<size_t, 14>{1, 2, 3, 4, 5, 6, 7, 8, 13,
+                                                   16, 17, 24, 37, 64}) {
+    for (uint32_t seed = 1; seed <= 3; seed++) {
+      std::mt19937_64 rng(seed * 1000 + width);
+      auto created = ConcurrentMaskedTable::Create(
+          static_cast<uint32_t>(width), 12, bess::runtime::runtime().rcu());
+      ASSERT_TRUE(created.has_value()) << created.error();
+      ConcurrentMaskedTable &t = **created;
+
+      std::vector<Key> masks(12, Key(width));
+      for (Key &m : masks) {
+        for (std::byte &b : m) b = std::byte{kMaskBytes[rng() % 4]};
+      }
+      auto value_byte = [&] {
+        return std::byte{static_cast<uint8_t>((rng() % 3) * 0x55)};
+      };
+      std::vector<ModelRule> model;
+      uint64_t seq = 0;
+      auto find = [&](const Key &mask, const Key &value) {
+        return std::find_if(model.begin(), model.end(), [&](const ModelRule &r) {
+          return r.mask == mask && r.value == value;
+        });
+      };
+      for (int step = 0; step < 300; step++) {
+        const Key &mask = masks[rng() % masks.size()];
+        Key value(width);
+        for (size_t b = 0; b < width; b++) value[b] = value_byte() & mask[b];
+        const ConstBytes cm(mask.data(), width), cv(value.data(), width);
+        if (rng() % 5 == 0) {
+          auto it = find(mask, value);
+          ASSERT_EQ(it != model.end(), t.Erase(cm, cv));
+          if (it != model.end()) model.erase(it);
+        } else {
+          const int64_t priority =
+              rng() % 3 == 0 ? static_cast<int64_t>(rng() % 200000) - 100000
+                             : static_cast<int64_t>(rng() % 8);
+          const auto result = static_cast<uint16_t>(rng() % 1000);
+          const auto r = t.Upsert(cm, cv, priority, result);
+          ASSERT_TRUE(r == R::kInserted || r == R::kUpdated);
+          auto it = find(mask, value);
+          if (it != model.end()) model.erase(it);
+          model.push_back({mask, value, priority, ++seq, result});
+        }
+        // Sometimes a prepared new rule: present in its tuple, never an
+        // answer.
+        std::optional<ConcurrentMaskedTable::Prepared> pending;
+        if (rng() % 4 == 0) {
+          Key pv(width);
+          for (size_t b = 0; b < width; b++) pv[b] = value_byte() & mask[b];
+          if (find(mask, pv) == model.end()) {
+            auto p = t.PrepareUpsert(cm, ConstBytes(pv.data(), width),
+                                     1'000'000, 7);
+            ASSERT_TRUE(p.has_value());
+            pending = std::move(*p);
+          }
+        }
+
+        const size_t n = 1 + rng() % 64;
+        const size_t stride = width + rng() % 3;
+        std::vector<std::byte> keys((n - 1) * stride + width);
+        for (std::byte &b : keys) {
+          b = rng() % 8 == 0 ? static_cast<std::byte>(rng()) : value_byte();
+        }
+        std::vector<uint16_t> out(n, 0xEEEE);
+        const uint64_t hits = t.LookupBatch(ConstBytes(keys.data(), keys.size()),
+                                            stride, out.data(), n);
+
+        for (size_t i = 0; i < n; i++) {
+          const std::byte *key = keys.data() + i * stride;
+          const ModelRule *best = nullptr;
+          for (const ModelRule &m : model) {
+            bool match = true;
+            for (size_t b = 0; b < width; b++) {
+              match = match && (key[b] & m.mask[b]) == m.value[b];
+            }
+            if (match && (best == nullptr || m.priority > best->priority ||
+                          (m.priority == best->priority && m.seq > best->seq))) {
+              best = &m;
+            }
+          }
+          ASSERT_EQ(best != nullptr, ((hits >> i) & 1) != 0)
+              << "width " << width << " seed " << seed << " step " << step;
+          if (best != nullptr) {
+            ASSERT_EQ(best->result, out[i])
+                << "width " << width << " seed " << seed << " step " << step;
+          } else {
+            ASSERT_EQ(0xEEEE, out[i]) << "a miss leaves its slot untouched";
+          }
+        }
+        if (pending) t.Cancel(*pending);
       }
     }
   }

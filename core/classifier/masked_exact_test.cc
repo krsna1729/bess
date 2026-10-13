@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <random>
 #include <span>
 #include <vector>
 
@@ -286,8 +287,8 @@ TEST(MaskedExactTest, InfoReportsTupleSpaceMetrics) {
   EXPECT_EQ(sizeof(uint32_t), info.result_size);
 }
 
-TEST(MaskedExactTest, WideKeysUseTheGenericMaskPath) {
-  // 16-byte keys take the byte-wise masking kernel.
+TEST(MaskedExactTest, WideKeysMaskAndMatch) {
+  // A 16-byte key (two 8-byte steps of the fixed-width kernel).
   std::vector<Byte> value(16, Byte{0});
   std::vector<Byte> mask(16, Byte{0xff});
   mask[0] = Byte{0xf0};
@@ -310,5 +311,41 @@ TEST(MaskedExactTest, WideKeysUseTheGenericMaskPath) {
   EXPECT_EQ(9u, results[0]);
 }
 
+// The masking kernel for every key width (D-124) against a byte-wise
+// reference: all-ones, all-zero and random masks; random keys at strides of
+// width + 0..2; key and output buffers that end exactly at the last byte the
+// kernel may touch, so a tail read or write past it is an ASan error. Output
+// bytes are pre-filled so a missed store shows.
+TEST(MaskedExactTest, MaskKernelMatchesByteWiseReferenceForEveryWidth) {
+  std::mt19937_64 rng(124);
+  for (size_t width = 1; width <= bess::classifier::detail::kMaskedMaxKeyBytes;
+       width++) {
+    const bess::classifier::detail::MaskBatchFn kernel =
+        bess::classifier::detail::SelectMaskBatch(width);
+    ASSERT_NE(nullptr, kernel) << "width " << width;
+    for (int round = 0; round < 12; round++) {
+      std::vector<Byte> mask(width);
+      for (Byte &b : mask) {
+        b = round == 0   ? Byte{0xff}
+            : round == 1 ? Byte{0x00}
+                         : static_cast<Byte>(rng());
+      }
+      const size_t count = 1 + rng() % 64;
+      const size_t stride = width + rng() % 3;
+      std::vector<Byte> keys((count - 1) * stride + width);
+      for (Byte &b : keys) b = static_cast<Byte>(rng());
+      std::vector<Byte> out(count * width, Byte{0xa5});
+      kernel(ConstBytes(keys), stride, ConstBytes(mask), count,
+             std::span<Byte>(out));
+      for (size_t i = 0; i < count; i++) {
+        for (size_t b = 0; b < width; b++) {
+          ASSERT_EQ(keys[i * stride + b] & mask[b], out[i * width + b])
+              << "width " << width << " round " << round << " key " << i
+              << " byte " << b;
+        }
+      }
+    }
+  }
+}
 
 }  // namespace

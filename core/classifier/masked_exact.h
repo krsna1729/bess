@@ -55,50 +55,66 @@ using MaskBatchFn = void (*)(ConstBytes keys, size_t key_stride,
                              ConstBytes mask, size_t count,
                              MutableBytes out) noexcept;
 
+// One mask over `count` keys of exactly Width bytes: the mask is loaded once
+// into words (it may alias `out` as far as the compiler knows, so it would
+// otherwise be reloaded per key), and each key is masked in 8-, 4-, 2- and
+// 1-byte steps -- the same steps the fixed-width hash then reads them back in,
+// so every reload forwards from its store.
 template <size_t Width>
 void MaskBatchFixed(ConstBytes keys, size_t key_stride, ConstBytes mask,
                     size_t count, MutableBytes out) noexcept {
-  using Word = std::conditional_t<
-      Width == 1, uint8_t,
-      std::conditional_t<Width == 2, uint16_t,
-                         std::conditional_t<Width == 4, uint32_t, uint64_t>>>;
-  Word mask_word;
-  std::memcpy(&mask_word, mask.data(), sizeof(mask_word));
-  for (size_t i = 0; i < count; i++) {
-    Word value;
-    std::memcpy(&value, keys.data() + i * key_stride, sizeof(value));
-    value &= mask_word;
-    std::memcpy(out.data() + i * Width, &value, sizeof(value));
+  constexpr size_t kWords = Width / 8;
+  constexpr size_t kTail = Width % 8;
+  std::array<uint64_t, kWords> words;
+  for (size_t w = 0; w < kWords; w++) {
+    std::memcpy(&words[w], mask.data() + 8 * w, 8);
   }
-}
-
-inline void MaskBatchVariable(ConstBytes keys, size_t key_stride,
-                              ConstBytes mask, size_t count,
-                              MutableBytes out) noexcept {
-  const size_t key_bytes = mask.size();
+  [[maybe_unused]] uint32_t mask4 = 0;
+  [[maybe_unused]] uint16_t mask2 = 0;
+  [[maybe_unused]] std::byte mask1{0};
+  if constexpr (kTail >= 4) {
+    std::memcpy(&mask4, mask.data() + 8 * kWords, 4);
+  }
+  if constexpr (kTail % 4 >= 2) {
+    std::memcpy(&mask2, mask.data() + Width - kTail % 2 - 2, 2);
+  }
+  if constexpr (kTail % 2 == 1) {
+    mask1 = mask[Width - 1];
+  }
   for (size_t i = 0; i < count; i++) {
     const std::byte *src = keys.data() + i * key_stride;
-    std::byte *dst = out.data() + i * key_bytes;
-    for (size_t b = 0; b < key_bytes; b++) {
-      dst[b] = src[b] & mask[b];
+    std::byte *dst = out.data() + i * Width;
+    for (size_t w = 0; w < kWords; w++) {
+      uint64_t v;
+      std::memcpy(&v, src + 8 * w, 8);
+      v &= words[w];
+      std::memcpy(dst + 8 * w, &v, 8);
+    }
+    if constexpr (kTail >= 4) {
+      uint32_t v;
+      std::memcpy(&v, src + 8 * kWords, 4);
+      v &= mask4;
+      std::memcpy(dst + 8 * kWords, &v, 4);
+    }
+    if constexpr (kTail % 4 >= 2) {
+      constexpr size_t kAt = Width - kTail % 2 - 2;
+      uint16_t v;
+      std::memcpy(&v, src + kAt, 2);
+      v &= mask2;
+      std::memcpy(dst + kAt, &v, 2);
+    }
+    if constexpr (kTail % 2 == 1) {
+      dst[Width - 1] = src[Width - 1] & mask1;
     }
   }
 }
 
-// Bind the masking kernel to the key width once at build time.
+// Bind the masking kernel to the key width once at build time (1..64 bytes).
 inline MaskBatchFn SelectMaskBatch(size_t key_bytes) {
-  switch (key_bytes) {
-    case 1:
-      return MaskBatchFixed<1>;
-    case 2:
-      return MaskBatchFixed<2>;
-    case 4:
-      return MaskBatchFixed<4>;
-    case 8:
-      return MaskBatchFixed<8>;
-    default:
-      return MaskBatchVariable;
-  }
+  static constexpr auto kTable = []<size_t... I>(std::index_sequence<I...>) {
+    return std::array<MaskBatchFn, sizeof...(I)>{&MaskBatchFixed<I + 1>...};
+  }(std::make_index_sequence<kMaskedMaxKeyBytes>{});
+  return kTable[key_bytes - 1];
 }
 
 }  // namespace detail
