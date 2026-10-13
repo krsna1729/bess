@@ -28,6 +28,7 @@
 #include "flow/owner.h"
 #include "rcu/rcu_domain.h"
 #include "utils/common.h"
+#include "utils/dpdk_memory.h"
 
 // A flow table whose lookup is shared by every worker (roadmap M9, Decision
 // D-052; guide in docs/flow-state.md). Installed (experimental): its
@@ -145,9 +146,11 @@ class SharedFlowTable {
 
   // `capacity` flows. The directory and the slot array are allocated here and
   // never grow. `domain` must outlive the table. Needs the EAL (the directory
-  // is rte_hash): the classifier's lazy bring-up applies.
+  // is rte_hash, on DPDK socket `socket`, by default the memory node): the
+  // classifier's lazy bring-up applies.
   static std::expected<std::unique_ptr<SharedFlowTable>, FlowTableError> Create(
-      size_t capacity, rcu::RcuDomain &domain, int socket = SOCKET_ID_ANY,
+      size_t capacity, rcu::RcuDomain &domain,
+      int socket = bess::utils::MemoryNode(),
       Observer observer = Observer{}) {
     size_t keys = 0;
     if (capacity == 0 || detail::MulOverflows(capacity, kKeysPerSlot, &keys) ||

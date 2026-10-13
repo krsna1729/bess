@@ -74,7 +74,6 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   route::LpmRouteTable::Config config;
   config.max_routes = arg.max_routes() ? arg.max_routes() : 4096;
   config.tbl8_groups = arg.max_tbl8s() ? arg.max_tbl8s() : 256;
-  config.socket = 0;
   const size_t max_next_hops =
       arg.max_next_hops() ? static_cast<size_t>(arg.max_next_hops()) : 4096;
 

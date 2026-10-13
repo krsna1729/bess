@@ -56,6 +56,8 @@ void Fill(::Port *port, v2::PortStatus *out) {
   const ::Port::PortStats stats = port->GetPortStats();
   Fill(stats.inc, out->mutable_rx());
   Fill(stats.out, out->mutable_tx());
+  out->set_numa_node(port->numa_node());
+  out->set_cross_numa(port->cross_numa());
 }
 
 }  // namespace
@@ -114,16 +116,14 @@ grpc::Status AdminV2Service::GetPacketPools(grpc::ServerContext *,
                                             const v2::GetPacketPoolsRequest *,
                                             v2::GetPacketPoolsResponse *response) {
   auto lock = control_plane_.AcquireLock();
-  for (int socket = 0; socket < RTE_MAX_NUMA_NODES; socket++) {
-    PacketPool *pool = PacketPool::GetDefaultPool(socket);
-    if (pool == nullptr || pool->pool() == nullptr) {
-      continue;
-    }
+  // One default pool, on the memory node (D-123).
+  PacketPool *pool = PacketPool::GetDefaultPool();
+  if (pool != nullptr && pool->pool() != nullptr) {
     // Only struct rte_mempool's own fields and the public counts: valid for
     // every mempool backend.
     const rte_mempool *mp = pool->pool();
     v2::PacketPool *out = response->add_pools();
-    out->set_socket(static_cast<uint32_t>(socket));
+    out->set_socket(static_cast<uint32_t>(mp->socket_id));
     out->set_size(mp->size);
     out->set_cache_size(mp->cache_size);
     out->set_element_size(mp->elt_size);

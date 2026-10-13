@@ -13,16 +13,28 @@
 
 namespace bess::utils {
 
+// The DPDK socket id of the process memory node (Decision D-123): bessd picks
+// one NUMA node at startup and everything it allocates lives there. With
+// hugepages it is bess::runtime::MemoryNode(); under --no-huge DPDK labels its
+// whole heap socket 0 (the pages physically follow the process mempolicy,
+// which bessd sets to the memory node), so it is 0 there -- asking for any
+// other socket would fail. Pass it wherever DPDK takes a socket id; NUMA
+// classification of CPUs and devices uses the raw bess::runtime::MemoryNode().
+//
+// Initializes DPDK first if nothing has yet (tests, benchmarks).
+int MemoryNode();
+
 // Performance-critical dataplane memory comes from DPDK's heap (Decision
 // D-029): hugepage-backed when bessd has hugepages, DPDK's normal-page heap
 // under --no-huge -- whatever the EAL was initialized with, and one
-// allocator rather than a parallel one. On the NUMA socket asked for
-// (SOCKET_ID_ANY: DPDK's choice, the caller's socket first). Allocation
-// happens at creation, on the control path; running out is an error there
-// (std::bad_alloc), never a packet-path event.
+// allocator rather than a parallel one. On the NUMA socket asked for, by
+// default the memory node (SOCKET_ID_ANY: DPDK's choice, the caller's socket
+// first); a socket out of memory falls back to any socket, warned once.
+// Allocation happens at creation, on the control path; running out is an
+// error there (std::bad_alloc), never a packet-path event.
 //
 // Initializes DPDK first if nothing has yet (tests, benchmarks).
-void *DpdkAllocate(size_t bytes, size_t align, int socket = SOCKET_ID_ANY);
+void *DpdkAllocate(size_t bytes, size_t align, int socket = MemoryNode());
 void DpdkFree(void *p) noexcept;
 
 template <typename T>
@@ -56,7 +68,7 @@ template <typename T>
 class DpdkArray {
  public:
   DpdkArray() = default;
-  DpdkArray(size_t n, int socket = SOCKET_ID_ANY) : size_(n) {
+  DpdkArray(size_t n, int socket = MemoryNode()) : size_(n) {
     constexpr size_t kAlign =
         alignof(T) > RTE_CACHE_LINE_SIZE ? alignof(T) : RTE_CACHE_LINE_SIZE;
     data_ = static_cast<T *>(DpdkAllocate(n * sizeof(T), kAlign, socket));
@@ -111,7 +123,7 @@ class DpdkArray {
 template <typename T>
 struct DpdkAllocator {
   using value_type = T;
-  int socket = SOCKET_ID_ANY;
+  int socket = MemoryNode();
 
   DpdkAllocator() = default;
   explicit DpdkAllocator(int s) : socket(s) {}

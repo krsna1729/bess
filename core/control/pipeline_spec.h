@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -67,7 +68,9 @@ struct DisconnectionSpec {
 
 struct WorkerSpec {
   int wid = -1;
-  int core = -1;
+  // nullopt: automatic -- the lowest free worker CPU of the memory node,
+  // chosen at creation and kept for the worker's life (D-123).
+  std::optional<int> core;
   std::string scheduler;
 
   bool operator==(const WorkerSpec &other) const = default;

@@ -16,10 +16,15 @@ PipelinePlan Plan(const PipelineDiff &diff) {
   // Workers first: a traffic class may be attached to a worker that does not
   // exist yet. Then ports, then modules -- module Init resolves the ports it
   // references, so those must be in place.
-  for (const WorkerChange &change : diff.workers) {
-    if (change.kind == ChangeKind::kCreate ||
-        change.kind == ChangeKind::kReplace) {
-      plan.prepare_ops.push_back(AddWorkerOp{change.desired});
+  // Workers with an explicit core before automatic ones: an automatic worker
+  // takes a free CPU, and the explicit CPUs are taken first (D-123).
+  for (const bool automatic : {false, true}) {
+    for (const WorkerChange &change : diff.workers) {
+      if ((change.kind == ChangeKind::kCreate ||
+           change.kind == ChangeKind::kReplace) &&
+          change.desired.core.has_value() != automatic) {
+        plan.prepare_ops.push_back(AddWorkerOp{change.desired});
+      }
     }
   }
 

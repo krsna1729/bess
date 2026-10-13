@@ -57,7 +57,7 @@ constexpr std::string_view kUsage = R"(usage: bessctl [-s HOST:PORT] COMMAND [AR
   metrics                        metric samples
   events [--from SEQ] [TYPE...]  follow operational events until interrupted
   ports [NAME...]                link state and counters of the ports
-  pools                          the packet pools, per NUMA socket
+  pools                          the default packet pool (on the memory node)
   plugin import|unload PATH      load or unload a plugin (a path on the
                                  daemon's host)
   capture MODULE in|out[:GATE] [--pcapng]
@@ -143,6 +143,10 @@ class Cli {
     std::println("daemon       {}", caps->daemon_version());
     std::println("epoch        {}", caps->daemon_epoch());
     std::println("plugin API   {}", caps->plugin_api_version());
+    if (!caps->placement().empty()) {  // a daemon before D-123 sends none
+      std::println("memory node  {}", caps->memory_node());
+      std::println("{}", caps->placement());
+    }
     std::println("classes      {}", caps->module_classes_size());
     for (const pb::PluginInfo &p : caps->plugins()) {
       std::println("plugin       {} {} ({})", p.name(), p.version(), p.path());
@@ -161,11 +165,14 @@ class Cli {
     }
     for (const pb::PortStatus &p : *ports) {
       const pb::PortStatus::Link &l = p.link();
-      std::println("{} ({}): link {}{}", p.name(), p.driver(), l.up() ? "up" : "down",
+      std::println("{} ({}): link {}{}{}", p.name(), p.driver(), l.up() ? "up" : "down",
                    l.speed_mbps() ? std::format(" {} Mb/s{}{}", l.speed_mbps(),
                                                 l.full_duplex() ? " full-duplex" : " half-duplex",
                                                 l.autoneg() ? " autoneg" : "")
-                                  : std::string());
+                                  : std::string(),
+                   p.numa_node() < 0 ? std::string()
+                                     : std::format(", NUMA node {}{}", p.numa_node(),
+                                                   p.cross_numa() ? " (cross-NUMA)" : ""));
       std::println("  rx  packets {} bytes {} dropped {}", p.rx().packets(), p.rx().bytes(),
                    p.rx().dropped());
       std::println("  tx  packets {} bytes {} dropped {} prepare errors {}", p.tx().packets(),

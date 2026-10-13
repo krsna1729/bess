@@ -13,6 +13,7 @@
 
 #include "utils/logging.h"
 
+#include "runtime/numa_placement.h"
 #include "runtime/opts.h"
 
 #define SYS_CPU_DIR "/sys/devices/system/cpu/cpu%u"
@@ -97,20 +98,35 @@ std::string CpuList(const cpu_set_t &set) {
   return out;
 }
 
-CpuId DefaultWorkerCore() {
+CpuId DefaultWorkerCore(std::span<const int> used) {
   if (FLAGS_c >= 0) {
     return CpuId(static_cast<uint32_t>(FLAGS_c));  // validated when parsed
   }
-  if (CPU_ISSET(0, &kProcessCpus)) {
-    return CpuId(0);  // the historical default
+  // Any worker given no core: the first free CPU of the memory node (D-123).
+  if (const std::optional<int> cpu = ProcessPlacement().NextWorkerCpu(used)) {
+    return CpuId(static_cast<uint32_t>(*cpu));
   }
+  // Nothing free (every CPU reserved or busy): the first CPU of the set,
+  // shared, rather than no default worker at all.
   for (int i = 0; i < CPU_SETSIZE; i++) {
     if (CPU_ISSET(i, &kProcessCpus)) {
+      LOG(WARNING) << "no free CPU for the default worker: it shares CPU " << i;
       return CpuId(static_cast<uint32_t>(i));
     }
   }
   LOG(FATAL) << "this process may run on no CPU";
   __builtin_unreachable();
+}
+
+cpu_set_t ReservedControlCpus() {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  for (int cpu : ProcessPlacement().control_cpus) {
+    if (cpu >= 0 && cpu < CPU_SETSIZE) {
+      CPU_SET(cpu, &set);
+    }
+  }
+  return set;
 }
 
 int PlaceControlThreads(std::span<const WorkerPlacement> workers) {
@@ -121,13 +137,18 @@ int PlaceControlThreads(std::span<const WorkerPlacement> workers) {
     cores.push_back(w.core);
     worker_tids.push_back(w.tid);
   }
-  const cpu_set_t control = ControlCpus(base, cores);
-  if (!workers.empty() && CPU_EQUAL(&control, &base)) {
-    static bool warned = false;
-    if (!warned) {
-      LOG(WARNING) << "every CPU available to bessd hosts a worker: control "
-                      "threads share CPUs with packet workers";
-      warned = true;
+  // The reserved control CPUs when there are any (D-123); else the rest of
+  // the set (D-027).
+  cpu_set_t control = ReservedControlCpus();
+  if (CPU_COUNT(&control) == 0) {
+    control = ControlCpus(base, cores);
+    if (!workers.empty() && CPU_EQUAL(&control, &base)) {
+      static bool warned = false;
+      if (!warned) {
+        LOG(WARNING) << "every CPU available to bessd hosts a worker: control "
+                        "threads share CPUs with packet workers";
+        warned = true;
+      }
     }
   }
   int moved = 0;

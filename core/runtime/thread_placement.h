@@ -57,9 +57,13 @@ bool CpuPresent(CpuId core);
 bool CpuAllowed(CpuId core);
 // "0-3,8" form, for messages and DPDK's --lcores.
 std::string CpuList(const cpu_set_t &set);
-// The default worker's CPU: -c if given, else CPU 0 if allowed, else the
-// first allowed CPU (a container rarely owns CPU 0).
-CpuId DefaultWorkerCore();
+// The default worker's CPU: -c if given, else the first CPU of the memory
+// node no worker in `used` has and no control thread is reserved (D-123),
+// else (nothing free) the first CPU of the set, shared.
+CpuId DefaultWorkerCore(std::span<const int> used = {});
+// The CPUs reserved for control threads (ProcessPlacement().control_cpus);
+// empty when none is reserved.
+cpu_set_t ReservedControlCpus();
 
 struct WorkerPlacement {
   pid_t tid;
@@ -70,9 +74,10 @@ struct WorkerPlacement {
 // all of `base` if that would leave none (a single-CPU deployment).
 cpu_set_t ControlCpus(const cpu_set_t &base, std::span<const int> cores);
 
-// Applies ControlCpus(ProcessCpus(), worker cores) to every thread of this
-// process that is not one of `workers`; threads created later inherit their
-// creator's set. Returns how many threads it moved.
+// Moves every thread of this process that is not one of `workers` to the
+// reserved control CPUs (D-123), or, with none reserved, to
+// ControlCpus(ProcessCpus(), worker cores); threads created later inherit
+// their creator's set. Returns how many threads it moved.
 int PlaceControlThreads(std::span<const WorkerPlacement> workers);
 
 }  // namespace bess::runtime

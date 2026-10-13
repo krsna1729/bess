@@ -56,8 +56,15 @@ struct ConnectionSnapshot {
 
 struct WorkerSnapshot {
   int wid = -1;
-  int core = -1;
+  int core = -1;  // where it runs, an automatic worker's chosen CPU included
   std::string scheduler;
+
+  // Observed placement (D-123), from DescribeWorkerCpu against the other
+  // workers: diagnostics, never desired state.
+  int numa_node = 0;
+  bool cross_numa = false;
+  bool shares_core = false;
+  bool on_control_cpu = false;
 
   bool operator==(const WorkerSnapshot &other) const = default;
 };

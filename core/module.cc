@@ -220,6 +220,12 @@ CheckConstraintResult Module::CheckModuleConstraints() const {
     }
   }
 
+  // No port constrains its users to a NUMA node any more (D-123: a device on
+  // another node is diagnosed, not refused), so an unconstrained module has
+  // nothing to check -- whatever node its workers are on.
+  if (node_constraints_ == UNCONSTRAINED_SOCKET) {
+    return valid;
+  }
   for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
     if (active_workers_[wid]) {
       placement_constraint socket =

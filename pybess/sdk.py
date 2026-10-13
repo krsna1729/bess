@@ -687,8 +687,12 @@ class PipelineBuilder:
             self.connect(upstream, downstream)
         return self
 
-    def worker(self, wid, core, scheduler=''):
-        self._p.workers.add(wid=wid, core=core, scheduler=scheduler)
+    def worker(self, wid, core=None, scheduler=''):
+        """A worker on CPU `core`; None: automatic (bessd picks a free CPU of
+        its memory node and keeps it for the worker's life, D-123)."""
+        w = self._p.workers.add(wid=wid, scheduler=scheduler)
+        if core is not None:
+            w.core = core
         return self
 
     def traffic_class(self, name, policy, parent='', resource='', wid=-1, priority=None,

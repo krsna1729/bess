@@ -222,7 +222,7 @@ FORBIDDEN_RULES = [
     # be included. Tests and benchmarks are exempt.
     (
         re.compile(
-            r"^core/runtime/(dpdk|memory|opts|path|startup|thread_placement)\.(cc|h)$"
+            r"^core/runtime/(dpdk|memory|opts|path|startup|thread_placement|numa_placement)\.(cc|h)$"
             r"|^core/utils/(dpdk_memory|bpf_program)\.(cc|h)$"
         ),
         [

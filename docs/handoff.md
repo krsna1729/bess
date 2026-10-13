@@ -26,8 +26,9 @@ struct MissContext {                      // trivially copyable, one cache line 
 using Punt   = HandoffChannel<MissContext, HandoffTopology::kSpSc>;
 using Resume = HandoffChannel<Verdict,     HandoffTopology::kSpSc>;
 
-// Once, at setup. The only allocation the channel ever makes.
-HandoffConfig config{.capacity = 1024, .socket = numa_node_of_consumer};
+// Once, at setup. The only allocation the channel ever makes; `.socket`
+// defaults to the daemon's memory node (D-123).
+HandoffConfig config{.capacity = 1024};
 auto punt = *Punt::Create(config);        // std::expected<Ptr, HandoffCreateError>
 
 // Producer, in the packet loop: hand over a burst, keep what was refused.

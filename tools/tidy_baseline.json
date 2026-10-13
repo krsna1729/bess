@@ -20,7 +20,7 @@
     },
     "core/control/control_plane.cc": {
       "bugprone-unused-return-value": 1,
-      "cppcoreguidelines-narrowing-conversions": 5
+      "cppcoreguidelines-narrowing-conversions": 3
     },
     "core/control/pipeline_snapshot.cc": {
       "bugprone-too-small-loop-variable": 1

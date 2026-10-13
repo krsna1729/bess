@@ -37,7 +37,6 @@ CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
   bess::route::LpmRouteTable::Config config;
   config.max_routes = arg.max_rules() ? arg.max_rules() : 1024;
   config.tbl8_groups = arg.max_tbl8s() ? arg.max_tbl8s() : 128;
-  config.socket = 0;
 
   auto table = bess::route::RouteTable<GateRoute>::Create(
       name(), config, init_context().rcu());

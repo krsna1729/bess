@@ -12,11 +12,17 @@
 #include <sched.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <optional>
+#include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "control/control_plane.h"
 #include "runtime/runtime_state.h"
+#include "runtime/numa_placement.h"
+#include "runtime/worker_manager.h"
 #include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
@@ -77,8 +83,10 @@ TEST(ThreadPlacementTest, EverythingStaysInsideTheInheritedSet) {
   EXPECT_TRUE(CpuAllowed(bess::runtime::DefaultWorkerCore()));
 }
 
-// A worker on the last allowed CPU: the other threads leave it, threads
-// created afterwards inherit that, and destroying the worker gives it back.
+// A worker on the last allowed CPU: the other threads run on the reserved
+// control CPU (D-123; with one CPU nothing is reserved and they share it),
+// threads created afterwards inherit that, and destroying the worker leaves
+// them there.
 TEST(ThreadPlacementTest, ControlThreadsLeaveWorkerCpus) {
   InitRuntimeOnce();
   const cpu_set_t &process = ProcessCpus();
@@ -89,20 +97,23 @@ TEST(ThreadPlacementTest, ControlThreadsLeaveWorkerCpus) {
     }
   }
   ASSERT_GE(core, 0);
+  const cpu_set_t reserved = bess::runtime::ReservedControlCpus();
+  const cpu_set_t control = CPU_COUNT(&reserved) > 0 ? reserved : process;
   launch_worker(0, core);
   const cpu_set_t main_now = ThisThread();
   cpu_set_t later;
   std::thread([&] { later = ThisThread(); }).join();
   if (CPU_COUNT(&process) > 1) {
+    EXPECT_EQ(1, CPU_COUNT(&reserved)) << "auto reserves one CPU";
     EXPECT_FALSE(CPU_ISSET(core, &main_now)) << "main thread on worker CPU";
     EXPECT_FALSE(CPU_ISSET(core, &later)) << "new thread on worker CPU";
-    EXPECT_EQ(CPU_COUNT(&main_now), CPU_COUNT(&process) - 1);
+    EXPECT_TRUE(CPU_EQUAL(&main_now, &reserved)) << CpuList(main_now);
   } else {
     EXPECT_TRUE(CPU_EQUAL(&main_now, &process));  // nowhere else to go
   }
   destroy_worker(0);
   const cpu_set_t after = ThisThread();
-  EXPECT_TRUE(CPU_EQUAL(&after, &process)) << "the CPU was not given back";
+  EXPECT_TRUE(CPU_EQUAL(&after, &control)) << CpuList(after);
 }
 
 // A worker CPU outside the set is refused with a clear error, not a crash.
@@ -126,6 +137,7 @@ TEST(ThreadPlacementTest, WorkersOutsideTheSetAreRefused) {
   EXPECT_NE(added.error().message.find("not in bessd's CPU set"),
             std::string::npos)
       << added.error().message;
+  EXPECT_EQ(added.error().err, EINVAL);
   EXPECT_FALSE(is_worker_active(0));
 }
 
@@ -141,6 +153,148 @@ TEST(ThreadPlacementTest, CoreIdsBeyond32BitsAreRefused) {
   ASSERT_FALSE(added) << "core 2^32 + " << allowed.value() << " was accepted";
   EXPECT_EQ(added.error().err, EINVAL);
   EXPECT_FALSE(is_worker_active(1));
+}
+
+// -- automatic workers (D-123) ------------------------------------------------
+//
+// A worker given no core takes Placement::NextWorkerCpu over the live
+// workers' CPUs; an explicit core inside the set is always honoured and only
+// diagnosed. The CPUs come from the real ProcessPlacement(), so a test that
+// needs more CPUs than this machine (or taskset) gives skips.
+
+class AutomaticWorkerTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    InitRuntimeOnce();
+    (void)control_plane_.ResetWorkers();
+  }
+  void TearDown() override { (void)control_plane_.ResetWorkers(); }
+
+  static const bess::runtime::Placement &Placement() {
+    return bess::runtime::ProcessPlacement();
+  }
+  static int CoreOf(int wid) {
+    const Worker *worker = bess::runtime::runtime().workers().Get(wid);
+    return worker != nullptr ? worker->core() : -1;
+  }
+  static std::string Warnings(const bess::runtime::WorkerCpuReport &report) {
+    std::string all;
+    for (const std::string &w : report.warnings) {
+      all += w + "\n";
+    }
+    return all;
+  }
+
+  bess::control::ControlPlane control_plane_;
+};
+
+TEST_F(AutomaticWorkerTest, AWorkerWithoutACoreGetsAWorkerCpuThatIsNotAControlCpu) {
+  if (Placement().WorkerCpus().empty()) {
+    GTEST_SKIP() << "no CPU for automatic workers: " << Placement().Summary();
+  }
+  auto added = control_plane_.AddWorker(0, std::nullopt, "");
+  ASSERT_TRUE(added) << added.error().message;
+  const int core = CoreOf(0);
+  ASSERT_GE(core, 0);
+  EXPECT_TRUE(CPU_ISSET(core, &ProcessCpus())) << core;
+  EXPECT_EQ(1u, Placement().WorkerCpus().count(core)) << Placement().Summary();
+  EXPECT_EQ(0u, Placement().control_cpus.count(core)) << Placement().Summary();
+  EXPECT_EQ(std::optional<int>(core), Placement().NextWorkerCpu({}));
+}
+
+TEST_F(AutomaticWorkerTest, ASecondAutomaticWorkerGetsAnotherCpu) {
+  if (Placement().WorkerCpus().size() < 2) {
+    GTEST_SKIP() << "needs two CPUs for automatic workers: " << Placement().Summary();
+  }
+  ASSERT_TRUE(control_plane_.AddWorker(0, std::nullopt, ""));
+  ASSERT_TRUE(control_plane_.AddWorker(1, std::nullopt, ""));
+  EXPECT_NE(CoreOf(0), CoreOf(1));
+  for (const int wid : {0, 1}) {
+    EXPECT_EQ(1u, Placement().WorkerCpus().count(CoreOf(wid))) << wid;
+    EXPECT_EQ(0u, Placement().control_cpus.count(CoreOf(wid))) << wid;
+  }
+}
+
+TEST_F(AutomaticWorkerTest, ADestroyedWorkersCpuGoesToTheNextAutomaticWorker) {
+  if (Placement().WorkerCpus().size() < 2) {
+    GTEST_SKIP() << "needs two CPUs for automatic workers: " << Placement().Summary();
+  }
+  ASSERT_TRUE(control_plane_.AddWorker(0, std::nullopt, ""));
+  ASSERT_TRUE(control_plane_.AddWorker(1, std::nullopt, ""));
+  const int first = CoreOf(0);
+  const int second = CoreOf(1);
+  ASSERT_TRUE(control_plane_.DestroyWorker(0));
+  ASSERT_TRUE(control_plane_.AddWorker(2, std::nullopt, ""));
+  EXPECT_EQ(first, CoreOf(2)) << "the freed CPU is the first free one again";
+  EXPECT_EQ(second, CoreOf(1)) << "the other worker did not move";
+}
+
+// Every worker CPU taken (by explicit workers here: as many as there are):
+// one more automatic worker is ENOSPC, and nothing is started.
+TEST_F(AutomaticWorkerTest, AnAutomaticWorkerWithNoFreeCpuIsRefusedWithEnospc) {
+  const std::set<int> cpus = Placement().WorkerCpus();
+  if (cpus.size() + 1 > static_cast<size_t>(Worker::kMaxWorkers)) {
+    GTEST_SKIP() << cpus.size() << " worker CPUs: more than the workers there can be";
+  }
+  int wid = 0;
+  for (const int cpu : cpus) {
+    auto added = control_plane_.AddWorker(static_cast<uint64_t>(wid), static_cast<uint64_t>(cpu), "");
+    ASSERT_TRUE(added) << added.error().message;
+    wid++;
+  }
+  auto added = control_plane_.AddWorker(static_cast<uint64_t>(wid), std::nullopt, "");
+  ASSERT_FALSE(added) << "worker " << wid << " got CPU " << CoreOf(wid);
+  EXPECT_EQ(ENOSPC, added.error().err);
+  EXPECT_NE(std::string::npos, added.error().message.find("no free CPU"))
+      << added.error().message;
+  EXPECT_FALSE(is_worker_active(wid));
+}
+
+// An explicit core is honoured even on an automatic worker's CPU: both run
+// there, the automatic one does not move, and the second is diagnosed.
+TEST_F(AutomaticWorkerTest, AnExplicitCoreOnAnAutomaticWorkersCpuIsHonouredBesideIt) {
+  if (Placement().WorkerCpus().empty()) {
+    GTEST_SKIP() << "no CPU for automatic workers: " << Placement().Summary();
+  }
+  ASSERT_TRUE(control_plane_.AddWorker(0, std::nullopt, ""));
+  const int cpu = CoreOf(0);
+  auto added = control_plane_.AddWorker(1, static_cast<uint64_t>(cpu), "");
+  ASSERT_TRUE(added) << added.error().message;
+  EXPECT_EQ(cpu, CoreOf(1));
+  EXPECT_EQ(cpu, CoreOf(0)) << "the automatic worker moved";
+  const bess::runtime::WorkerCpuReport report =
+      bess::runtime::runtime().workers().CpuReport(1);
+  EXPECT_NE(std::string::npos, Warnings(report).find("already runs another worker"))
+      << Warnings(report);
+}
+
+// An automatic worker never takes a CPU an explicit worker holds.
+TEST_F(AutomaticWorkerTest, AnAutomaticWorkerSkipsTheCpuOfAnExplicitOne) {
+  if (Placement().WorkerCpus().size() < 2) {
+    GTEST_SKIP() << "needs two CPUs for automatic workers: " << Placement().Summary();
+  }
+  const std::optional<int> first = Placement().NextWorkerCpu({});
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(control_plane_.AddWorker(0, static_cast<uint64_t>(*first), ""));
+  ASSERT_TRUE(control_plane_.AddWorker(1, std::nullopt, ""));
+  EXPECT_NE(*first, CoreOf(1));
+  const int used[] = {*first};
+  EXPECT_EQ(Placement().NextWorkerCpu(used), std::optional<int>(CoreOf(1)));
+}
+
+// An explicit core on the reserved control CPU is honoured, and diagnosed.
+TEST_F(AutomaticWorkerTest, AnExplicitCoreOnTheControlCpuIsHonouredWithAWarning) {
+  if (Placement().control_cpus.empty()) {
+    GTEST_SKIP() << "no reserved control CPU: " << Placement().Summary();
+  }
+  const int control = *Placement().control_cpus.begin();
+  auto added = control_plane_.AddWorker(0, static_cast<uint64_t>(control), "");
+  ASSERT_TRUE(added) << added.error().message;
+  EXPECT_EQ(control, CoreOf(0));
+  const bess::runtime::WorkerCpuReport report =
+      bess::runtime::runtime().workers().CpuReport(0);
+  EXPECT_TRUE(report.on_control_cpu);
+  EXPECT_NE(std::string::npos, Warnings(report).find("control CPU")) << Warnings(report);
 }
 
 }  // namespace

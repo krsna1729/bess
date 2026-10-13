@@ -16,6 +16,7 @@
 #include "dataplane/batch_stages.h"
 #include "meter/meter.h"
 #include "utils/common.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::meter {
 
@@ -172,11 +173,11 @@ class MeterSetBuilder {
   MeterSetBuilder(const MeterSetBuilder &) = delete;
   MeterSetBuilder &operator=(const MeterSetBuilder &) = delete;
 
-  // Creates meter `id` with full buckets. `socket` places its state; an
-  // exclusive meter belongs on the socket of the worker that will run it.
+  // Creates meter `id` with full buckets. `socket` places its state (a DPDK
+  // socket id, by default the memory node).
   std::expected<void, MeterError> Add(MeterId id, const MeterProfileSpec &spec,
                                       MeterSharing sharing,
-                                      int socket = SOCKET_ID_ANY);
+                                      int socket = bess::utils::MemoryNode());
 
   // Changes meter `id`'s profile. An identical specification is a no-op that
   // keeps the running state. A different one starts fresh state with full

@@ -22,6 +22,7 @@
 #include "rcu/rcu_domain.h"
 #include "rcu/rcu_ptr.h"
 #include "utils/common.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::route {
 
@@ -123,7 +124,7 @@ class LpmRouteTable {
   struct Config {
     uint32_t max_routes = 1024;
     uint32_t tbl8_groups = 256;  // one per /24 that has longer prefixes
-    int socket = SOCKET_ID_ANY;
+    int socket = bess::utils::MemoryNode();  // DPDK socket id (D-123)
   };
 
   static std::expected<std::unique_ptr<LpmRouteTable>, RouteError> Create(

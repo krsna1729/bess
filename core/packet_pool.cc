@@ -15,6 +15,7 @@
 #include "runtime/memory.h"
 #include "runtime/opts.h"
 #include "utils/copy.h"
+#include "utils/dpdk_memory.h"
 #include "worker.h"
 
 namespace bess {
@@ -64,7 +65,7 @@ static_assert(offsetof(rte_mbuf, tx_offload) >=
 static_assert(offsetof(rte_mbuf, vlan_tci_outer) >=
               offsetof(rte_mbuf, rx_descriptor_fields1) + 16);
 
-PacketPool *PacketPool::default_pools_[RTE_MAX_NUMA_NODES];
+PacketPool *PacketPool::default_pool_;
 
 void PacketPool::CreateDefaultPools(size_t capacity, size_t data_room_size) {
   current_worker.SetNonWorker();
@@ -76,28 +77,26 @@ void PacketPool::CreateDefaultPools(size_t capacity, size_t data_room_size) {
     rte_dump_physmem_layout(stdout);
   }
 
-  for (int sid = 0; sid < NumNumaNodes(); sid++) {
-    // What the EAL actually did: -m -1 resolves to normal pages when no
-    // hugepages are usable.
-    if (!rte_eal_has_hugepages()) {
-      LOG(WARNING) << "Hugepage is disabled! Creating PlainPacketPool for "
-                   << capacity << " packets on node " << sid;
-      default_pools_[sid] =
-          new PlainPacketPool(capacity, sid, data_room_size);
-    } else if (FLAGS_dpdk) {
-      LOG(INFO) << "Creating DpdkPacketPool for " << capacity
-                << " packets on node " << sid;
-      default_pools_[sid] =
-          new DpdkPacketPool(capacity, sid, data_room_size);
-    } else {
-      LOG(INFO) << "Creating BessPacketPool for " << capacity
-                << " packets on node " << sid;
-      default_pools_[sid] =
-          new BessPacketPool(capacity, sid, data_room_size);
-    }
-    CHECK(default_pools_[sid])
-        << "Packet pool allocation on node " << sid << " failed!";
+  // One pool, on the memory node: everything bessd allocates lives there
+  // (D-123), so a pool per node would only be memory nobody uses.
+  const int sid = bess::utils::MemoryNode();
+  // What the EAL actually did: -m -1 resolves to normal pages when no
+  // hugepages are usable.
+  if (!rte_eal_has_hugepages()) {
+    LOG(WARNING) << "Hugepage is disabled! Creating PlainPacketPool for "
+                 << capacity << " packets on node " << sid;
+    default_pool_ = new PlainPacketPool(capacity, sid, data_room_size);
+  } else if (FLAGS_dpdk) {
+    LOG(INFO) << "Creating DpdkPacketPool for " << capacity
+              << " packets on node " << sid;
+    default_pool_ = new DpdkPacketPool(capacity, sid, data_room_size);
+  } else {
+    LOG(INFO) << "Creating BessPacketPool for " << capacity
+              << " packets on node " << sid;
+    default_pool_ = new BessPacketPool(capacity, sid, data_room_size);
   }
+  CHECK(default_pool_) << "Packet pool allocation on node " << sid
+                       << " failed!";
 }
 
 PacketPool::PacketPool(size_t capacity, int socket_id, size_t data_room_size)

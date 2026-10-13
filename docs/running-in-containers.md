@@ -3,13 +3,16 @@
 For containers, run `bessd -f` (or set `BESSD_F=true`) so bessd remains PID 1.
 Without it, the legacy daemon mode is still the default and bessd forks.
 Other startup flags can come from `BESSD_<FLAG>` (Decisions D-027, D-029,
-D-030). What it reads, and what a container or Kubernetes pod should give it:
+D-030, D-123). What it reads, and what a container or Kubernetes pod should
+give it ([placement.md](placement.md) has the CPU and NUMA rules, every
+scenario and the Kubernetes settings):
 
 | bessd needs | where it comes from | override |
 |---|---|---|
-| CPUs | its inherited CPU set (cgroup cpuset, Kubernetes CPU manager, taskset); the default worker takes CPU 0 if allowed, else the first CPU of the set; control threads stay off worker CPUs | `-c`, `BESSD_C`; workers outside the set are refused |
-| memory | host-free hugepages bounded by remaining cgroup v2 hugetlb capacity (`max - current` along this cgroup's ancestors), mapped as needed with no cap of bessd's own; otherwise normal pages with a warning | `-m N` caps at N MB per socket; `-m 0` forces normal pages |
-| packet buffers | `-buffers` (default 262,144 per socket, about 600 MB); size it for your pipeline -- modules need memory too | `-buffers`, `BESSD_BUFFERS` |
+| CPUs | its inherited CPU set (cgroup cpuset, Kubernetes CPU manager, taskset); one CPU of the memory node is reserved for control threads; a worker given no core takes a free CPU of the memory node, one per physical core first | `-c`, `--control_cpus`, a worker's `core`; anything outside the set is refused |
+| memory node | the one NUMA node with both bessd's CPUs and memory it may use (cpuset mems); one bessd drives one node | `--numa_node`, `BESSD_NUMA_NODE` |
+| memory | host-free hugepages on the memory node bounded by remaining cgroup v2 hugetlb capacity (`max - current` along this cgroup's ancestors), mapped as needed with no cap of bessd's own; none on other nodes; otherwise normal pages with a warning | `-m N` caps at N MB; `-m 0` forces normal pages |
+| packet buffers | `-buffers` (default 262,144 in one pool on the memory node, about 600 MB); size it for your pipeline -- modules need memory too | `-buffers`, `BESSD_BUFFERS` |
 | NICs | the PCI addresses a device plugin assigned (`PCIDEVICE_*` environment, e.g. the SR-IOV network device plugin); otherwise every device DPDK can use | `-pci_allow`, `BESSD_PCI_ALLOW` |
 | IOVA mode | DPDK's choice: VA with an IOMMU (vfio-pci, the recommended binding), PA where hardware needs it | `-iova`, `BESSD_IOVA` |
 | any flag | `BESSD_<FLAG>` environment variable (e.g. `BESSD_GRPC_URL=0.0.0.0:10514`); the command line wins | -- |

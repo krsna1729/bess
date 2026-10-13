@@ -3,6 +3,7 @@
 
 #include "runtime/opts.h"
 #include "runtime/thread_placement.h"
+#include "runtime/numa_placement.h"
 #include "utils/logging.h"
 
 #include <cstdint>
@@ -58,10 +59,55 @@ static bool ValidateCoreID(const char *, int32_t value) {
   return true;
 }
 DEFINE_int32(c, -1,
-             "Core ID for the default worker thread (-1: CPU 0 if bessd may "
-             "use it, else the first CPU of its CPU set)");
+             "Core ID for the default worker thread (-1: the first free CPU "
+             "of the memory node, as for any worker given no core; D-123)");
 static const bool _c_dummy[[maybe_unused]] =
     google::RegisterFlagValidator(&FLAGS_c, &ValidateCoreID);
+
+static bool ValidateNumaNode(const char *, int32_t value) {
+  if (value < -1) {
+    LOG(ERROR) << "Invalid NUMA node: " << value;
+    return false;
+  }
+  return true;
+}
+// Process placement (D-123): one memory node per bessd.
+DEFINE_int32(numa_node, -1,
+             "NUMA node bessd allocates all its memory on (-1: automatic, the "
+             "node with both bessd's CPUs and memory it may use). A node "
+             "outside those is used anyway, with a warning");
+static const bool _numa_node_dummy[[maybe_unused]] =
+    google::RegisterFlagValidator(&FLAGS_numa_node, &ValidateNumaNode);
+DEFINE_string(control_cpus, "auto",
+              "CPUs reserved for control threads (gRPC, DPDK's main lcore, "
+              "maintenance): 'auto' (the first CPU of the memory node in "
+              "bessd's CPU set; none with one CPU), 'none' (control threads "
+              "avoid only the workers' CPUs), or a CPU list such as '0,1'");
+// Refused at parse time, as -c is: a list that is not one, or names a CPU
+// outside bessd's CPU set -- the one hard placement error (D-123).
+static bool ValidateControlCpus(const char *, const std::string &value) {
+  if (value == "auto" || value == "none") {
+    return true;
+  }
+  const auto cpus = bess::runtime::ParseCpuList(value);
+  if (!cpus || cpus->empty()) {
+    LOG(ERROR) << "--control_cpus='" << value
+               << "' is neither 'auto', 'none' nor a CPU list";
+    return false;
+  }
+  for (int cpu : *cpus) {
+    const auto core = bess::runtime::CpuIdFrom(cpu);
+    if (!core || !bess::runtime::CpuAllowed(*core)) {
+      LOG(ERROR) << "--control_cpus=" << value << ": core " << cpu
+                 << " is not in bessd's CPU set ("
+                 << bess::runtime::CpuList(bess::runtime::ProcessCpus()) << ")";
+      return false;
+    }
+  }
+  return true;
+}
+static const bool _control_cpus_dummy[[maybe_unused]] =
+    google::RegisterFlagValidator(&FLAGS_control_cpus, &ValidateControlCpus);
 
 static bool ValidateTCPPort(const char *, int32_t value) {
   if (value <= 0) {
@@ -99,10 +145,11 @@ DEFINE_int32(maintenance_interval_us, 1000,
              "Interval of the control-side maintenance loop in microseconds (0: off)");
 
 DEFINE_int32(m, -1,
-             "Per-socket DPDK memory cap in MB. -1 (default): hugepages if "
+             "DPDK memory cap in MB on the memory node (other nodes get "
+             "none, D-123). -1 (default): hugepages if "
              "any are usable, mapped as needed with no cap beyond the host or "
              "container limit, else normal pages; 0: no hugepages; N: "
-             "hugepages, at most N MB per socket");
+             "hugepages, at most N MB");
 // Tracing is DPDK's (M25, D-089): its trace points (EAL, ethdev, mempool,
 // ...) written as CTF for babeltrace or Trace Compass, not a BESS tracer.
 DEFINE_string(dpdk_trace, "",
@@ -130,8 +177,8 @@ static bool ValidateBuffersPerSocket(const char *, int32_t value) {
   return true;
 }
 DEFINE_int32(buffers, 262144,
-             "Specifies how many packet buffers to allocate per socket,"
-             " must be a power of 2.");
+             "Packet buffers in the default pool (one pool, on the memory "
+             "node), must be a power of 2.");
 static const bool _buffers_dummy[[maybe_unused]] =
     google::RegisterFlagValidator(&FLAGS_buffers, &ValidateBuffersPerSocket);
 

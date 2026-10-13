@@ -22,6 +22,7 @@
 #include "runtime/runtime_state.h"
 #include "control/transaction.h"
 #include "runtime/worker_manager.h"
+#include "runtime/numa_placement.h"
 #include "pb/module_msg.pb.h"
 #include "pb/port_msg.pb.h"
 #include "runtime/opts.h"
@@ -157,6 +158,104 @@ TEST_F(ApplyPipelineTest, SnapshotOfTheActiveRuntimeIsTheDesiredState) {
   ASSERT_TRUE(diff.has_value()) << diff.error().message;
   EXPECT_TRUE(diff->empty())
       << "the running pipeline must diff clean against its own description";
+}
+
+// D-123: a desired worker without a core is automatic. It gets a worker CPU
+// of the memory node; GetPipeline reports that CPU; re-applying the same
+// desired state (core still unset) matches the worker wherever it runs, so
+// nothing moves, nothing is replaced and the generation stays.
+TEST_F(ApplyPipelineTest, ReapplyingAWorkerWithoutACoreKeepsItsCpuAndReplacesNothing) {
+  const bess::runtime::Placement &placement = bess::runtime::ProcessPlacement();
+  if (placement.WorkerCpus().empty()) {
+    GTEST_SKIP() << "no CPU for automatic workers: " << placement.Summary();
+  }
+  PipelineSpec spec = FullPipeline();
+  spec.workers[0].core.reset();
+
+  auto applied = control_plane_->ApplyPipeline(spec, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  const PipelineSnapshot first = control_plane_->GetPipeline();
+  ASSERT_EQ(1u, first.workers.size());
+  const int core = first.workers[0].core;
+  EXPECT_EQ(1u, placement.WorkerCpus().count(core)) << placement.Summary();
+  EXPECT_EQ(0u, placement.control_cpus.count(core)) << placement.Summary();
+
+  // The active pipeline names the CPU the worker runs on.
+  const PipelineSpec running = SpecFromSnapshot(first);
+  ASSERT_EQ(1u, running.workers.size());
+  EXPECT_EQ(std::optional<int>(core), running.workers[0].core);
+
+  auto diff = control_plane_->DiffPipeline(spec);
+  ASSERT_TRUE(diff.has_value()) << diff.error().message;
+  EXPECT_TRUE(diff->empty()) << "an automatic worker matches wherever it runs";
+
+  auto again = control_plane_->ApplyPipeline(spec, {});
+  ASSERT_TRUE(again.has_value()) << again.error().message;
+  EXPECT_EQ(applied->generation, again->generation);
+  EXPECT_EQ(0u, again->applied_ops);
+  EXPECT_FALSE(again->workers_paused);
+  EXPECT_TRUE(control_plane_->GetPipeline() == first) << "nothing moved";
+
+  // What GetPipeline reported (the core explicit now) is the same pipeline.
+  auto pinned = control_plane_->ApplyPipeline(running, {});
+  ASSERT_TRUE(pinned.has_value()) << pinned.error().message;
+  EXPECT_EQ(applied->generation, pinned->generation);
+  EXPECT_EQ(0u, pinned->applied_ops);
+}
+
+// D-123: an explicit core that differs from where the worker runs replaces
+// it, as before automatic workers existed.
+TEST_F(ApplyPipelineTest, AnExplicitCoreOtherThanTheWorkersCpuIsAReplace) {
+  const bess::runtime::Placement &placement = bess::runtime::ProcessPlacement();
+  if (placement.WorkerCpus().size() < 2) {
+    GTEST_SKIP() << "needs two CPUs for automatic workers: " << placement.Summary();
+  }
+  PipelineSpec spec = FullPipeline();
+  spec.workers[0].core.reset();
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+  const int core = control_plane_->GetPipeline().workers.at(0).core;
+
+  int other = -1;
+  for (const int cpu : placement.WorkerCpus()) {
+    if (cpu != core) {
+      other = cpu;
+      break;
+    }
+  }
+  ASSERT_GE(other, 0);
+  spec.workers[0].core = other;
+  auto diff = control_plane_->DiffPipeline(spec);
+  ASSERT_TRUE(diff.has_value()) << diff.error().message;
+  ASSERT_EQ(1u, diff->workers.size());
+  EXPECT_EQ(bess::control::ChangeKind::kReplace, diff->workers[0].kind);
+}
+
+// D-123: in one desired pipeline, the workers with an explicit core are
+// created first, so an automatic worker never takes a CPU another worker of
+// the same pipeline names.
+TEST_F(ApplyPipelineTest, AnAutomaticWorkerSkipsACpuAnExplicitWorkerOfThePipelineNames) {
+  const bess::runtime::Placement &placement = bess::runtime::ProcessPlacement();
+  if (placement.WorkerCpus().size() < 2) {
+    GTEST_SKIP() << "needs two CPUs for automatic workers: " << placement.Summary();
+  }
+  const std::optional<int> first = placement.NextWorkerCpu({});
+  ASSERT_TRUE(first.has_value());
+
+  PipelineSpec spec = FullPipeline();
+  spec.workers[0].core.reset();  // wid 0: automatic, planned first by wid
+  bess::control::WorkerSpec pinned;
+  pinned.wid = 1;
+  pinned.core = *first;  // the CPU wid 0 would take on its own
+  spec.workers.push_back(pinned);
+
+  auto applied = control_plane_->ApplyPipeline(spec, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  const PipelineSnapshot snapshot = control_plane_->GetPipeline();
+  ASSERT_EQ(2u, snapshot.workers.size());
+  EXPECT_EQ(*first, snapshot.workers[1].core);
+  EXPECT_NE(*first, snapshot.workers[0].core);
+  const int used[] = {*first};
+  EXPECT_EQ(placement.NextWorkerCpu(used), std::optional<int>(snapshot.workers[0].core));
 }
 
 // The acceptance test that matters most: a transaction that fails while

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "control/control_plane.h"
+#include "runtime/numa_placement.h"
 #include "runtime/thread_placement.h"
 #include "runtime/worker_manager.h"
 #include <algorithm>
@@ -576,7 +577,8 @@ ControlResult<void> ControlPlane::DisconnectModulesLocked(const DisconnectionSpe
 // Workers
 // ---------------------------------------------------------------------------
 
-ControlResult<void> ControlPlane::AddWorker(uint64_t wid, uint64_t core,
+ControlResult<void> ControlPlane::AddWorker(uint64_t wid,
+                                            std::optional<uint64_t> core,
                                             const std::string& scheduler) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto result = AddWorkerLocked(wid, core, scheduler);
@@ -590,20 +592,27 @@ ControlResult<void> ControlPlane::AddWorker(uint64_t wid, uint64_t core,
   return result;
 }
 
-ControlResult<void> ControlPlane::AddWorkerLocked(uint64_t wid, uint64_t core, const std::string& scheduler) {
+ControlResult<void> ControlPlane::AddWorkerLocked(
+    uint64_t wid, std::optional<uint64_t> core, const std::string& scheduler) {
 
   if (wid >= Worker::kMaxWorkers) {
     return std::unexpected(Err(EINVAL, "Invalid worker id"));
   }
-  const std::optional<runtime::CpuId> cpu = runtime::CpuIdFrom(core);
-  if (!cpu || !runtime::CpuPresent(*cpu)) {
-    return std::unexpected(Err(EINVAL, "Invalid core %llu",
-                               static_cast<unsigned long long>(core)));
-  }
-  if (!runtime::CpuAllowed(*cpu)) {
-    return std::unexpected(Err(EINVAL, "core %u is not in bessd's CPU set (%s)",
-                               cpu->value(),
-                               runtime::CpuList(runtime::ProcessCpus()).c_str()));
+  // An explicit core anywhere in the process's CPU set is honoured -- on
+  // another node, on a control CPU, beside another worker -- and diagnosed
+  // at launch (D-123); only one outside the set is refused (D-027).
+  std::optional<runtime::CpuId> cpu;
+  if (core.has_value()) {
+    cpu = runtime::CpuIdFrom(*core);
+    if (!cpu || !runtime::CpuPresent(*cpu)) {
+      return std::unexpected(Err(EINVAL, "Invalid core %llu",
+                                 static_cast<unsigned long long>(*core)));
+    }
+    if (!runtime::CpuAllowed(*cpu)) {
+      return std::unexpected(
+          Err(EINVAL, "core %u is not in bessd's CPU set (%s)", cpu->value(),
+              runtime::CpuList(runtime::ProcessCpus()).c_str()));
+    }
   }
   if (is_worker_active(wid)) {
     return std::unexpected(Err(EEXIST, "worker:%d is already active", static_cast<int>(wid)));
@@ -611,6 +620,33 @@ ControlResult<void> ControlPlane::AddWorkerLocked(uint64_t wid, uint64_t core, c
   if (scheduler != "" && scheduler != "experimental") {
     return std::unexpected(Err(EINVAL, "Invalid scheduler %s",
                                scheduler.c_str()));
+  }
+
+  if (!cpu.has_value()) {
+    // Automatic: a CPU of the memory node no live worker runs on, explicit
+    // or automatic. The worker keeps it for its life.
+    const runtime::Placement& placement = runtime::ProcessPlacement();
+    const std::vector<int> used = runtime::runtime().workers().Cores();
+    const std::optional<int> next = placement.NextWorkerCpu(used);
+    if (!next) {
+      const std::set<int> worker_cpus = placement.WorkerCpus();
+      ControlError error = Err(
+          ENOSPC,
+          "no free CPU for an automatic worker on node %d; worker CPUs: %s "
+          "(each runs a worker, or none is left beside the control CPUs %s); "
+          "give the worker an explicit core, or bessd more CPUs",
+          placement.node,
+          worker_cpus.empty() ? "none"
+                              : runtime::FormatCpuList(worker_cpus).c_str(),
+          placement.control_cpus.empty()
+              ? "(none)"
+              : runtime::FormatCpuList(placement.control_cpus).c_str());
+      error.code = ControlErrorCode::kResourceFailure;
+      error.object = std::to_string(wid);
+      error.field = "core";
+      return std::unexpected(error);
+    }
+    cpu = runtime::CpuId(static_cast<uint32_t>(*next));  // a CPU of the set
   }
 
   runtime::runtime().workers().Launch(static_cast<int>(wid), *cpu, scheduler);
@@ -1185,21 +1221,29 @@ ControlPlane::CheckSchedulingConstraints() {
     if (worker == nullptr) {
       continue;
     }
-    int socket = 1ull << worker->socket();
-    int core = worker->core();
+    // Reported for the legacy check only, never a refusal: a worker on
+    // another node than a task's is diagnosed (D-123). An unconstrained task
+    // (every port since D-123) runs anywhere, whatever node the worker is on.
+    const int node = worker->socket();
+    const int core = worker->core();
     bess::TrafficClass* root = worker->scheduler()->root();
 
     for (const auto& tc_pair : TrafficClassBuilder::all_tcs()) {
       bess::TrafficClass* c = tc_pair.second.get();
       if (c->policy() == bess::POLICY_LEAF && root == c->Root()) {
         auto leaf = static_cast<bess::LeafTrafficClass*>(c);
-        int constraints = leaf->task()->GetSocketConstraints();
-        if ((constraints & socket) == 0) {
+        const placement_constraint constraints =
+            leaf->task()->GetSocketConstraints();
+        if (constraints == UNCONSTRAINED_SOCKET) {
+          continue;
+        }
+        const bool allowed = node >= 0 && node < MAX_NUMA_NODE &&
+                             (constraints & (placement_constraint{1} << node)) != 0;
+        if (!allowed) {
           LOG(WARNING) << "Scheduler constraints are violated for wid " << i
-                       << " socket " << socket << " constraint "
-                       << constraints;
+                       << " node " << node << " constraint " << constraints;
           report.violations.push_back(SchedulingConstraintViolation{
-              c->name(), constraints, worker->socket(), core});
+              c->name(), static_cast<int>(constraints), node, core});
         }
       }
     }

@@ -25,6 +25,7 @@
 #include "module.h"
 #include "packet_pool.h"
 #include "resume_hook.h"
+#include "runtime/numa_placement.h"
 #include "runtime/runtime_state.h"
 #include "rcu/rcu_domain.h"
 #include "runtime/worker_manager.h"
@@ -131,14 +132,8 @@ void Worker::SetNonWorker() {
   fd_event_ = INT_MIN;
 
   if (!packet_pool_) {
-    // Packet pools should be available to non-worker threads.
-    // (doesn't need to be NUMA-aware, so pick any)
-    for (int socket = 0; socket < RTE_MAX_NUMA_NODES; socket++) {
-      if (bess::PacketPool *pool = bess::PacketPool::GetDefaultPool(socket)) {
-        packet_pool_ = pool;
-        break;
-      }
-    }
+    // The packet pool is available to non-worker threads too.
+    packet_pool_ = bess::PacketPool::GetDefaultPool();
   }
 }
 
@@ -244,11 +239,12 @@ void *Worker::Run(void *_arg) {
   pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
   socket_ = rte_socket_id();
 
-  // For some reason, rte_socket_id() does not return a correct NUMA ID.
-  // Nevertheless, BESS should not crash.
+  // DPDK could not place this CPU on a node. socket_ says where the worker's
+  // CPU is; with nothing better, assume the memory node (D-123).
   if (socket_ == SOCKET_ID_ANY) {
-    LOG(WARNING) << "rte_socket_id() returned -1 for " << arg->core.value();
-    socket_ = 0;
+    socket_ = bess::runtime::MemoryNode();
+    LOG(WARNING) << "rte_socket_id() returned -1 for " << arg->core.value()
+                 << "; assuming the memory node " << socket_;
   }
 
   fd_event_ = eventfd(0, 0);
@@ -258,7 +254,7 @@ void *Worker::Run(void *_arg) {
 
   current_tsc_ = rdtsc();
 
-  packet_pool_ = bess::PacketPool::GetDefaultPool(socket_);
+  packet_pool_ = bess::PacketPool::GetDefaultPool();
   CHECK_NOTNULL(packet_pool_);
 
   set_status(WORKER_PAUSING);

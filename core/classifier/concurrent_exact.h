@@ -22,6 +22,7 @@
 #include "classifier/backend.h"
 #include "rcu/rcu_domain.h"
 #include "utils/common.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::classifier {
 
@@ -198,10 +199,11 @@ class ConcurrentExactTable {
   static uint32_t CapacityFor(size_t rules) noexcept;
 
   // `capacity` key slots exactly; pass CapacityFor(rules) for the D-010
-  // sizing.
+  // sizing. On DPDK socket `socket`, by default the memory node (D-123).
   static std::expected<std::unique_ptr<ConcurrentExactTable>, std::string>
   Create(uint32_t key_len, uint32_t capacity, rcu::RcuDomain &domain,
-         int socket = SOCKET_ID_ANY, Writers writers = Writers::kSingle);
+         int socket = bess::utils::MemoryNode(),
+         Writers writers = Writers::kSingle);
 
   ~ConcurrentExactTable();
 

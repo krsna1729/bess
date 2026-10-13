@@ -142,6 +142,8 @@ file is the reasoning.
 | D-119 | Track's per-call overhead cut (cold CurrentWorkerId failure, initial-exec current_worker, static libraries as PIE); the hop without hooks is at master's cost, the gap left is Track's | accepted |
 | D-120 | bessctl is a mode of bessd (multi-call binary): `bin/bessctl` is a symlink to bessd, `bessd ctl` the same; the client runs first, unprivileged, on the SDK alone, with control_v2 registered once | accepted |
 | D-121 | ExactMatch: a fused kernel for a key that is one packet field of 1, 2, 4 or 8 bytes (load, mask, CRC32C and key row in one pass, then a prehashed lookup), chosen when a generation is built; 33 fewer instructions per packet on M.exactmatch; the generic path for every other layout | accepted |
+| D-122 | Release artifacts for arm64 as well as x86_64: `publish-release` runs on `ubuntu-24.04` and `ubuntu-24.04-arm`; every file name carries the architecture (`SHA256SUMS-<machine>`) | accepted |
+| D-123 | Process placement: one memory node per bessd (chosen at startup from its CPUs' nodes and the memory it may use; everything allocated there), one reserved control CPU, automatic SMT-striped worker CPUs; anything on another node is diagnosed, never refused; only a CPU outside the set is an error | accepted |
 
 
 ---
@@ -8721,3 +8723,149 @@ runners would overwrite in one GitHub Release). The workflow artifacts are `bess
 check, `bessctl --help` through the symlink, container smoke). The job is not a required check.
 
 **Code.** `.github/workflows/ci.yml` (`publish-release`).
+
+## D-123 Process placement: one memory node, control CPUs, automatic worker CPUs
+
+**Status:** accepted.
+
+**Problem.** Placement was per socket where it existed and nowhere else. Router and IPLookup built their `rte_lpm` on
+socket 0 whatever ran them; every other table (exact match, flow, meters, handoff channels, DPDK arrays) asked for
+`SOCKET_ID_ANY`; one packet pool was made per NUMA node and a worker took its own node's; a PMD port made every
+module that used it "constrained" to the NIC's node, so a worker on another node was a scheduling-constraint
+violation; rings came from the libc heap with no policy. Control threads avoided the workers' CPUs (D-027) but had
+no CPU of their own, and every worker needed an explicit core. Nothing said, in one place, where bessd's memory
+and threads were, or what was wrong with a placement.
+
+**Decision.** One rule everywhere: bessd picks one memory node at startup and everything it allocates lives
+there; anything on another node is diagnosed, never refused. One bessd drives one node: a multi-node host runs one
+bessd per node. The rules, the diagnostics and the deployment guidance are in [placement.md](placement.md).
+
+- **One resolver, four inputs, no environment detection.** `core/runtime/numa_placement.{h,cc}`: a sysfs tree
+  (`cpu/cpuN/nodeM`, else `node/nodeM/cpulist`; `thread_siblings_list`; `node/has_memory`, else `node/online`),
+  the process affinity, `get_mempolicy(MPOL_F_MEMS_ALLOWED)` and the flags `--numa_node` (-1: automatic) and
+  `--control_cpus` (`auto`). Bare metal, a cgroup cpuset, a Kubernetes pod and a VM differ only in what these say,
+  so every scenario is a unit test over a fake sysfs tree. A CPU sysfs does not place is on node 0, DPDK's own
+  assumption (a VM that hides NUMA).
+- **The node.** Candidates are the nodes of bessd's CPUs that have memory it may use. `--numa_node` wins (a
+  warning if it is not a candidate); one candidate is chosen silently; several, the lowest with a warning; none,
+  the lowest node whose memory bessd may use (`mems_allowed` ∩ `has_memory`), with a warning, else the lowest CPU
+  node. Why memory first when nothing matches: a node with no memory, or one the cpuset forbids, makes every
+  hugepage and table allocation fail, and bessd would not start -- a refusal; remote CPUs are only slower.
+- **Used once.** DPDK's `--socket-limit` gives every other node 1 MB, which no hugepage fits under (DPDK reads 0
+  as "no limit"; its validator rejects a heap that would reach the limit), and the memory node the `-m` cap or no
+  limit; nothing changes on a single-node host. `set_mempolicy(MPOL_PREFERRED, node)` before any thread exists
+  makes normal memory (rings, the no-hugepage heap) follow. One default packet pool replaces the per-node array
+  (`PacketPool::GetDefaultPool()`). `bess::utils::MemoryNode()` is the socket every table and DPDK array asks for:
+  the node with hugepages, 0 under `--no-huge`, where DPDK labels its whole heap socket 0 while the pages follow the
+  memory policy. The ENOMEM fallbacks to any socket stay, warned once.
+- **Control CPU.** `auto` reserves one: the first CPU of the memory node in the set; none with one CPU (warned).
+  DPDK's main lcore (`--lcores 127@<it>`), and with it every later thread, and `PlaceControlThreads` use it;
+  `none` keeps D-027's rule; a list names them.
+- **Automatic workers.** `control_v2.Worker.core` is `optional` (field 2, wire-compatible); unset, and the default
+  worker under `-c -1`, take the first of the memory node's free CPUs (minus the control CPU and every worker's
+  CPU) in SMT-striped order: every physical core's first thread, cores by lowest CPU, then the second threads; the
+  control CPU holds its core's first thread. Without sibling information, lowest first. Kept for the worker's life;
+  a desired worker without a core matches the live one wherever it runs, so re-applying moves nothing; explicit
+  cores in one pipeline are created before automatic ones. None free: ENOSPC (`RESOURCE_EXHAUSTED`).
+- **Explicit cores are always honoured** inside the set -- another node, the control CPU, a busy sibling, a CPU
+  another worker holds (two workers naming one CPU in one pipeline are no longer refused) -- each warned at launch,
+  no worker moved; explicitly held CPUs count as used.
+- **The one hard error: a CPU outside the set.** `AddWorker`/`Worker.core` (EINVAL listing the set, unchanged),
+  `-c` and `--control_cpus` (refused at flag parsing, in the same words). The set is the operator's grant whatever
+  enforces it: under a cgroup cpuset `sched_setaffinity` outside it fails, but under taskset or `CPUAffinity=`
+  alone a thread may widen its own affinity, so the refusal is bessd's policy, not the kernel's.
+- **SMT is a diagnostic,** apart from the striped order: a worker sharing a physical core with another worker or
+  the control CPU is warned (`shares_core`); no reservation or placement depends on it.
+- **Diagnostics.** One INFO line at startup, `placement: node N (candidates {..}, reason: ...), control CPUs X,
+  worker CPUs available Y`, also `GetCapabilities.placement` (field 10) with `memory_node` (11) and in `bessctl
+  status`. Workers: a WARNING per finding at launch (`worker N: ...`), and `GetPipelineResponse.workers` (field 4,
+  `WorkerPlacement {wid, core, numa_node, cross_numa, shares_core, on_control_cpu}`), the actual core in
+  `pipeline.workers[].core`, legacy `ListWorkers` `numa_node`/`cross_numa`/`shares_core` (6-8). NICs: a PMD port
+  whose `rte_eth_dev_socket_id` is another node is warned once and reports `PortStatus.numa_node` (6, -1
+  unknown) and `cross_numa` (7); an unknown node (-1) is never warned. PMD ports no longer set a placement
+  constraint, so a NIC's node can no longer make a pipeline a constraint violation; the constraint machinery stays
+  for ports that set one (none in tree).
+
+**Scenarios.** Each row is a test (`NumaPlacementTest.*` in `core/runtime/numa_placement_test.cc` unless named in
+full); two-node rows use CPUs 0-7 on node 0 and 8-15 on node 1, memory on both, unless the row says otherwise.
+
+| # | scenario | node | control CPU | first auto workers | warnings | test |
+|---|---|---|---|---|---|---|
+| 1 | bare metal, 1 node, SMT (siblings i, i+10), all 20 CPUs | 0 | 0 | 1, 2 | none | `BareMetalOneNodeSmt` |
+| 2 | bare metal, 1 node, SMT off | 0 | 0 | 1, 2 | none | `BareMetalOneNodeNoSmt` |
+| 3 | 2 nodes, taskset to node 1's CPUs, mems {0,1} | 1 | 8 | 9, 10 | none | `TwoNodesTasksetToNodeOne` |
+| 4 | 2 nodes, all CPUs, all mems | 0 | 0 | 1, 2 | several candidates | `TwoNodesAllCpusWarnsAmbiguity` |
+| 5 | 2 nodes, all CPUs, `--numa_node=1` | 1 | 8 | 9, 10 | none | `TwoNodesFlagChoosesNodeOne` |
+| 6 | node-0 CPUs, `--numa_node=1` | 1 | 0 | 1, 2 | not a candidate; cross-NUMA per worker | `FlagOutsideCandidatesWarns` |
+| 7 | node ids 0 and 2, taskset to node 2 | 2 | 4 | 5, 6 | none | `NonContiguousNodeIds` |
+| 8 | memory-only node (CXL) beside node 0 | 0 | 0 | 1, 2 | none | `MemoryOnlyNodeIgnored` |
+| 9 | CPUs only on CPU-only node 1, mems {0} | 0 | 4 | 5, 6 | no candidate; cross-NUMA per worker | `CpuOnlyNodeUsesAllowedMemoryNode` |
+| 10 | container cpuset 4-7 (no CPU 0) | 0 | 4 | 5, 6 | none | `ContainerCpusetWithoutCpuZero` |
+| 11 | container, CPUs on both nodes, cpuset.mems {1} | 1 | 8 | 9, 10 | none | `ContainerMemsRestrictToNodeOne` |
+| 12 | container, node-0 CPUs, mems {1} | 1 | 0 | 1, 2 | no candidate; cross-NUMA per worker | `ContainerCpusAndMemsDisjoint` |
+| 13 | 1-CPU container | 0 | none | 5, then ENOSPC | one CPU | `OneCpuContainerSharesTheCpu` |
+| 15 | no hugepages, or free hugepages on one node only | as without | | | none | `HugepagesDoNotChangeThePlacement` (the no-hugepage EAL path: the fast suite) |
+| 16 | k8s Guaranteed, CPU and Memory Manager static, single-numa-node | 1 | 10 | 11, 12 | none | `K8sGuaranteedSingleNumaNode` |
+| 17 | k8s Guaranteed, Memory Manager none | 1 | 10 | 11, 12 | none | `K8sGuaranteedWithoutMemoryManager` |
+| 18 | k8s Burstable shared pool | 0 | 0 | 1, 2 | several candidates | `K8sBurstableSharedPoolWarns` |
+| 20 | VM without `/sys/devices/system/node` | 0 | 0 | 1, 2 | none | `VmWithoutNodeDirectory` |
+| 21 | VM, node directory without CPU links | 0 | 0 | 1, 2 | none | `VmNodeDirectoryWithoutCpuLinks` |
+| 22 | NIC node -1 | | | | none ("unknown") | `DeviceWithUnknownNode` |
+| 23 | VM, `thread_siblings_list` = the CPU | 0 | 0 | 1, 2 | none | `VmVcpusWithoutSmt` |
+| 24 | NIC on the other node | | | | cross-NUMA, once per port | `DeviceOnOtherNodeIsCross` |
+| 25 | explicit worker on another node's CPU | | | | cross-NUMA | `ExplicitWorkerOnOtherNodeWarns` |
+| 26 | explicit worker on the control CPU | | | | on the control CPU | `ExplicitWorkerOnControlCpuWarns` |
+| 27 | explicit worker outside the affinity | | | | refused, EINVAL | `ExplicitWorkerOutsideAffinityIsOutside`; `ThreadPlacementTest.WorkersOutsideTheSetAreRefused` |
+| 28 | allocator exhaustion | | | | ENOSPC | `AllocatorExhaustion`; `AutomaticWorkerTest.AnAutomaticWorkerWithNoFreeCpuIsRefusedWithEnospc` |
+| 29 | stability across re-apply | | | | none | `AllocatorIsStable`; `ApplyPipelineTest.ReapplyingAWorkerWithoutACoreKeepsItsCpuAndReplacesNothing`; `ApiV2ServiceTest.AnAutomaticWorkerIsReportedWhereItRunsAndReapplyIsANoOp` |
+| 30 | a destroyed worker's CPU is reused | | | lowest free | none | `FreedCpuIsReused`; `AutomaticWorkerTest.ADestroyedWorkersCpuGoesToTheNextAutomaticWorker` |
+| i | N+1 whole cores (8 CPUs), 3 workers | 0 | 0 | 1, 2, 3, siblings idle | none | `StripedWholeCoresOnePerCore` |
+| ii | N whole cores (6 CPUs), 3 workers | 0 | 0 | 1, 2, 3 | worker 3 shares the control CPU's core | `StripedLastWorkerOnControlSibling` |
+| iii | 10 cores / 20 threads, 12 workers | 0 | 0 | 1-9, then 10, 11, 12 | each of 10, 11, 12 shares a core | `StripedFirstThreadsThenSiblings`, `StripedOrderWithAdjacentSiblings` |
+| iv | VM without sibling information | 0 | 0 | lowest first | none | `StripedWithoutSiblingsIsLowestFirst` |
+| v | a first-thread worker destroyed | | | that thread again | none | `StripedReusesFreedFirstThread` |
+| vi | explicit core = an automatic worker's CPU | | | the automatic one unchanged | already runs another worker | `ExplicitCoreOnAnAutoWorkersCpuWarns`; `AutomaticWorkerTest.AnExplicitCoreOnAnAutomaticWorkersCpuIsHonouredBesideIt` |
+| vii | explicit worker, then an automatic one | | | skips the explicit CPU | none | `AutoWorkerSkipsExplicitCpu`; `AutomaticWorkerTest.AnAutomaticWorkerSkipsTheCpuOfAnExplicitOne`; `ApplyPipelineTest.AnAutomaticWorkerSkipsACpuAnExplicitWorkerOfThePipelineNames` |
+| viii | explicit core on the control CPU | | | | on the control CPU | `ExplicitWorkerOnControlCpuWarns`; `AutomaticWorkerTest.AnExplicitCoreOnTheControlCpuIsHonouredWithAWarning` |
+| ix | `--control_cpus` outside the set | | | | startup refused | `ControlCpusOutsideSetRefused` |
+| x | taskset-only restriction, worker outside it | | | | EINVAL (not widened) | `ThreadPlacementTest.WorkersOutsideTheSetAreRefused` in `control_thread_placement_test_in_two_cpus` |
+| b | explicit worker on the control CPU's sibling | | | | shares the control CPU's core | `ExplicitWorkerOnControlSiblingWarns` |
+| c | no `thread_siblings_list` | 0 | 0 | 1, 2 | none | `MissingSiblingListsNeverWarn` |
+
+Rows 14 and 19 of the first draft (SMT-aware reservation) were replaced by i-v and b-c: SMT changes no placement
+but the striped order.
+
+**Evidence.**
+
+- **Live, this host** (one node, 20 CPUs: six SMT P-cores 0-11, siblings 2k and 2k+1, eight E-cores 12-19;
+  `bessd -f -m 0`, two workers without a core applied with `bessctl apply`):
+  - `taskset -c 6-9`: `placement: node 0 (candidates {0}, reason: the only node with both bessd's CPUs and its
+    memory), control CPUs 6, worker CPUs available 7-9`; EAL `--lcores 127@6`; workers on 8 (core 8-9's first
+    thread) then 7, warned `worker 1: worker CPU 7 shares a physical core with control CPU 6`; every non-worker
+    thread (main, gRPC, DPDK's interrupt and telemetry threads) `Cpus_allowed_list` 6, `bess-worker-0` 8,
+    `bess-worker-1` 7; re-applying the manifest: 0 changes.
+  - A cgroup cpuset (`systemd-run --scope -p AllowedCPUs=10-13 -p AllowedMemoryNodes=0`): control CPU 10,
+    workers 12 and 13 (E-cores, whole cores), no warning, every other thread on 10.
+  - Under `taskset -c 6-9`: a worker on CPU 2 is refused (`worker 0: CPU 2 is not in bessd's CPU set (6-9)`); a
+    pipeline with workers on 6 (explicit), automatic, and 8 (explicit) runs them on 6, 7 and 8 with the warnings
+    `worker CPU 6 is the reserved control CPU` and two `shares a physical core` for 7; `--control_cpus=2` stops
+    startup with `--control_cpus=2: core 2 is not in bessd's CPU set (6-9)`.
+- **Tests:** `runtime_numa_placement_test` (44, every row above), the new `AutomaticWorkerTest` cases, the
+  apply-pipeline, API v2, manifest and SDK (C++ and Go) cases listed in the table; `control_plane_test`'s
+  duplicate-core case now accepts the pipeline (`AcceptsTwoWorkersOnOneCore`).
+- **Not measured:** cross-NUMA cost (one node here, as D-054 notes for handoff); the multi-node `--socket-limit`
+  form was read in DPDK 25.11's source (`eal_common_dynmem.c`), not run.
+
+**Not done.** A metric for cross-NUMA ports: PMD ports cannot register metrics (drivers -> stats is not a link
+edge) and the builtin metric source runs without the control-plane lock; `GetPortStatus` carries it.
+`buf breaking` (WIRE_JSON) against develop passes with `Worker.core` optional and the new fields.
+
+**Code.** `core/runtime/numa_placement.{h,cc}` and `_test.cc` (new), `core/runtime/{thread_placement,dpdk,opts}`,
+`core/main.cc`, `core/utils/dpdk_memory.{h,cc}`, `core/packet_pool.{h,cc}`, `core/worker.cc`,
+`core/runtime/worker_manager.{h,cc}`, `core/drivers/pmd.{h,cc}`, `core/port.h`, `core/module.cc`,
+`core/control/{control_plane,api_v2,admin_v2,pipeline_spec,pipeline_validator,pipeline_diff,pipeline_plan,
+pipeline_snapshot,transaction}`, `core/bessctl.cc`, the tables' headers (`route/route_table.h`,
+`classifier/{rte_hash_exact,concurrent_exact}.h`, `flow/shared_flow_table.h`, `meter/meter{,_set}.{h,cc}`,
+`dataplane/handoff.h`), `modules/{ip_lookup,router,source}.cc`, `protobuf/{control_v2,bess_msg}.proto`,
+`sdk/cpp`, `sdk/go`, `pybess/sdk.py`, `bessctl/main.cc`, `tools/check_includes.py`, `docs/placement.md` (new),
+`docs/{running-in-containers,control-sdk,handoff,limits}.md`.

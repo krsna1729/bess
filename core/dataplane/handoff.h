@@ -23,6 +23,7 @@
 #include "utils/logging.h"
 
 #include "packet_handle.h"
+#include "utils/dpdk_memory.h"
 
 // Ownership transfer of packets between threads (roadmap M11, Decision D-054;
 // guide in docs/handoff.md). Experimental API.
@@ -183,10 +184,11 @@ struct HandoffConfig {
   // Items the channel can hold. Exact: the ring is sized to the next power of
   // two above it, but refuses at `capacity`.
   size_t capacity = 1024;
-  // NUMA node for the channel's memory. Place it where the consumer (or the
-  // busier side) runs; a channel whose ends sit on different nodes pays the
-  // interconnect on every item and `placement()` is how to see it.
-  int socket = SOCKET_ID_ANY;
+  // NUMA node (DPDK socket id) for the channel's memory: by default the
+  // memory node, where everything bessd allocates lives (D-123). A channel
+  // whose memory is elsewhere pays the interconnect on every item and
+  // `placement()` is how to see it.
+  int socket = bess::utils::MemoryNode();
   // nullptr: DpdkHandoffAllocator().
   const HandoffAllocator *allocator = nullptr;
 };

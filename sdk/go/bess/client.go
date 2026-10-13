@@ -843,7 +843,7 @@ func (c *Client) Ports(ctx context.Context, names ...string) ([]*pb.PortStatus, 
 	return resp.GetPorts(), nil
 }
 
-// PacketPools is the default packet pool of each NUMA socket.
+// PacketPools returns the default packet pool (one, on the memory node; D-123).
 func (c *Client) PacketPools(ctx context.Context) ([]*pb.PacketPool, error) {
 	r, err := c.adminCall(ctx, &pb.GetPacketPoolsRequest{}, 0)
 	if err != nil {
@@ -912,9 +912,16 @@ func (b *PipelineBuilder) Chain(names ...string) *PipelineBuilder {
 	return b
 }
 
-// Worker adds a worker.
+// Worker adds a worker on CPU core.
 func (b *PipelineBuilder) Worker(wid, core int32, scheduler string) *PipelineBuilder {
-	b.p.Workers = append(b.p.Workers, &pb.Worker{Wid: wid, Core: core, Scheduler: scheduler})
+	b.p.Workers = append(b.p.Workers, &pb.Worker{Wid: wid, Core: &core, Scheduler: scheduler})
+	return b
+}
+
+// AutoWorker adds a worker without a core: bessd picks a free CPU of its
+// memory node and keeps it for the worker's life.
+func (b *PipelineBuilder) AutoWorker(wid int32, scheduler string) *PipelineBuilder {
+	b.p.Workers = append(b.p.Workers, &pb.Worker{Wid: wid, Scheduler: scheduler})
 	return b
 }
 

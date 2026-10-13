@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "dpdk.h"
+#include "runtime/numa_placement.h"
 #include "runtime/thread_placement.h"
 #include "runtime/startup.h"
 
@@ -17,6 +18,7 @@
 #include <rte_ethdev.h>
 #include <rte_trace.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -169,19 +171,31 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
     // Dynamic memory (D-029): hugepages are mapped as DPDK's heap needs
     // them -- packet pools at startup, tables when they are created -- within
     // whatever the host or a container's hugetlb limit allows, and at most
-    // `dpdk_mb_per_socket` per socket when -m sets a cap. Nothing is mapped
-    // on the packet path: every dataplane structure is allocated on the
-    // control path.
+    // `dpdk_mb_per_socket` on the memory node when -m sets a cap. Nothing is
+    // mapped on the packet path: every dataplane structure is allocated on
+    // the control path.
     //
     // DPDK's limit is exclusive: an allocation fails once the heap would
     // reach it (eal_memalloc_mem_alloc_validate: `limit > new_len` passes),
     // so a cap of exactly one 1 GiB page rejected that page and bessd could
     // not start. -m N means the heap may reach N MB: pass N + 1.
-    if (dpdk_mb_per_socket > 0) {
-      const std::string cap = std::to_string(dpdk_mb_per_socket + 1);
-      std::string limit = cap;
-      for (int i = 1; i < NumNumaNodes(); i++) {
-        limit += "," + cap;
+    //
+    // One memory node per bessd (D-123): every other node gets a 1 MB limit,
+    // which no hugepage fits under, so nothing is ever mapped there. (DPDK
+    // reads a limit of 0 as "no limit".) The memory node keeps the -m cap,
+    // or no limit.
+    const runtime::Placement &placement = runtime::ProcessPlacement();
+    const int memory_node = placement.node;
+    int nodes = memory_node + 1;  // an entry for every node with memory
+    for (int node : placement.topology.memory_nodes) {
+      nodes = std::max(nodes, node + 1);
+    }
+    if (dpdk_mb_per_socket > 0 || nodes > 1) {
+      const std::string cap =
+          dpdk_mb_per_socket > 0 ? std::to_string(dpdk_mb_per_socket + 1) : "0";
+      std::string limit;
+      for (int i = 0; i < nodes; i++) {
+        limit += (i == 0 ? "" : ",") + (i == memory_node ? cap : std::string("1"));
       }
       rte_args.Append({"--socket-limit", limit});
     }
@@ -233,40 +247,20 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
   rte_openlog_stream(fopencookie(nullptr, "w", dpdk_log_funcs));
 }
 
-// The CPU set bessd was started with, in "corelist" format (e.g.
-// "0-12,16-28"): DPDK's main lcore may run anywhere in it (D-027).
+// Where DPDK's main lcore may run, in "corelist" format (e.g. "0-12,16-28"):
+// the reserved control CPUs (D-123), else the CPU set bessd was started with
+// (D-027).
 std::string GetNonWorkerCoreList() {
-  std::string corelist;
-  const cpu_set_t set = bess::runtime::ProcessCpus();
-
-  // Choose the last core available
-  for (int i = 0; i < CPU_SETSIZE; i++) {
-    if (CPU_ISSET(i, &set)) {
-      int start = i;
-      while (i < CPU_SETSIZE && CPU_ISSET(i, &set)) {
-        i++;
-      }
-      int end = i - 1;
-
-      std::string group = std::to_string(start);
-      if (start < end) {
-        group += "-" + std::to_string(end);
-      }
-
-      if (corelist == "") {
-        corelist += group;
-      } else {
-        corelist += "," + group;
-      }
-    }
+  cpu_set_t set = bess::runtime::ReservedControlCpus();
+  if (CPU_COUNT(&set) == 0) {
+    set = bess::runtime::ProcessCpus();
   }
-
-  if (corelist == "") {
+  std::string corelist = bess::runtime::CpuList(set);
+  if (corelist.empty()) {
     // This should never happen, but just in case...
     PLOG(WARNING) << "No core is allowed for the process?";
     corelist = "0";
   }
-
   return corelist;
 }
 

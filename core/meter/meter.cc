@@ -2,12 +2,14 @@
 
 #include "meter/meter.h"
 
+#include <mutex>
 #include <new>
 #include <type_traits>
 
 #include <rte_malloc.h>
 
 #include "dpdk.h"
+#include "utils/logging.h"
 
 namespace bess::meter {
 
@@ -200,6 +202,11 @@ std::expected<MeterStatePtr, MeterError> MeterState::Create(
   if (memory == nullptr && socket != SOCKET_ID_ANY) {
     // Placement is a performance preference, not a requirement: a socket with
     // no memory left (or none at all) should not make a meter impossible.
+    static std::once_flag warned;
+    std::call_once(warned, [socket] {
+      LOG(WARNING) << "meter state: DPDK socket " << socket
+                   << " is out of memory; allocating on any socket";
+    });
     memory = rte_malloc_socket("bess_meter_state", sizeof(MeterState),
                                alignof(MeterState), SOCKET_ID_ANY);
   }

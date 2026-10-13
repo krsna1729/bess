@@ -284,7 +284,7 @@ class Client {
   // Link and counters of the ports `names` in that order, or of every port by
   // name; an unknown name is kInvalidRequest (NOT_FOUND).
   Result<std::vector<pb::PortStatus>> Ports(const std::vector<std::string> &names = {});
-  // The default packet pool of each NUMA socket.
+  // The default packet pool (one, on the memory node; D-123).
   Result<std::vector<pb::PacketPool>> PacketPools();
   // Starts or stops a capture (`request` without its epoch).
   Result<void> SetCapture(pb::SetCaptureRequest request);
@@ -376,7 +376,10 @@ class PipelineBuilder {
                            std::string_view downstream, uint32_t igate);
   // Gate 0 to gate 0 along `names`.
   PipelineBuilder &Chain(std::initializer_list<std::string_view> names);
-  PipelineBuilder &Worker(int32_t wid, int32_t core, std::string_view scheduler);
+  // A worker on `core`, or, with std::nullopt, an automatic one: bessd picks
+  // a free CPU of its memory node and keeps it for the worker's life.
+  PipelineBuilder &Worker(int32_t wid, std::optional<int32_t> core,
+                          std::string_view scheduler);
   PipelineBuilder &TrafficClass(pb::TrafficClass tc);
   // Where a module's task is scheduled: under a traffic class or at a worker.
   PipelineBuilder &Task(pb::TaskPlacement task);

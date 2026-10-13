@@ -32,8 +32,11 @@ namespace bess {
 // pool transports PacketHandle values.
 class PacketPool {
  public:
-  static PacketPool *GetDefaultPool(int node) { return default_pools_[node]; }
+  // The default pool: one, on the memory node (D-123); nullptr before
+  // CreateDefaultPools().
+  static PacketPool *GetDefaultPool() { return default_pool_; }
 
+  // Creates the default pool on the memory node.
   static void CreateDefaultPools(
       size_t capacity = kDefaultCapacity,
       size_t data_room_size = kDefaultPacketDataSize);
@@ -110,7 +113,7 @@ class PacketPool {
   const size_t data_room_size_;
 
  private:
-  static PacketPool *default_pools_[RTE_MAX_NUMA_NODES];
+  static PacketPool *default_pool_;
 };
 
 class PlainPacketPool : public PacketPool {

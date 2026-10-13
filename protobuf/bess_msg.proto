@@ -56,6 +56,13 @@ message ListWorkersResponse {
     /// Silent drops happen when a module transmit packets via disconnected
     /// output gates.
     int64 silent_drops = 5;
+
+    /// D-123 diagnostics, never refusals: the NUMA node of the worker's CPU,
+    /// whether that is not bessd's memory node, and whether the CPU is an
+    /// SMT sibling of another worker's or of a control CPU.
+    int64 numa_node = 6;
+    bool cross_numa = 7;
+    bool shares_core = 8;
   }
 
   Error error = 1;
@@ -474,7 +481,7 @@ message MempoolDump {
 }
 
 message DumpMempoolRequest {
-    int32 socket = 1; // ID of the socket whose mempool should be dumped. -1 for all sockets
+    int32 socket = 1; // -1: the default pool; else the pool only if it is on that socket
 }
 
 message DumpMempoolResponse {

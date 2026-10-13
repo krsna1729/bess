@@ -18,6 +18,7 @@
 #include "framework/plugin_loader.h"
 #include "debug.h"
 #include "runtime/opts.h"
+#include "runtime/numa_placement.h"
 #include "packet_pool.h"
 #include "runtime/startup.h"
 #include "port.h"
@@ -99,6 +100,10 @@ int main(int argc, char *argv[]) {
   if (use_pidfile) {
     bess::bessd::WritePidfile(pidfile_fd, getpid());
   }
+
+  // One memory node, control CPUs (D-123): resolved and logged once, and
+  // the node preferred for normal memory before any thread exists.
+  bess::runtime::ApplyProcessPlacement();
 
   // Load plugins
   if (!bess::framework::LoadPlugins(FLAGS_modules)) {

@@ -586,6 +586,19 @@ func TestThePipelineBuilderAssemblesAndEditsASnapshot(t *testing.T) {
 	}
 }
 
+// D-123: an automatic worker leaves its core unset (bessd picks the CPU); an
+// explicit core, 0 included, is sent.
+func TestThePipelineBuilderLeavesAnAutomaticWorkersCoreUnset(t *testing.T) {
+	p, err := NewPipeline(nil).AutoWorker(0, "").Worker(1, 0, "").Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := p.GetWorkers()
+	if len(w) != 2 || w[0].Core != nil || w[1].Core == nil || w[1].GetCore() != 0 {
+		t.Fatal(w)
+	}
+}
+
 func TestApplyPipelineRetriesBusyAndNeverAConflict(t *testing.T) {
 	busyStep := refusal(codes.FailedPrecondition, pb.ErrorDetail_RESOURCE_BUSY)
 	h := newHarness(&fake{pipelines: []step{busyStep, busyStep}}, 4)

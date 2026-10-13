@@ -15,6 +15,8 @@
 #include <rte_ethdev.h>
 
 #include "packet_pool.h"
+#include "runtime/numa_placement.h"
+#include "utils/dpdk_memory.h"
 #include "utils/ether.h"
 #include "utils/format.h"
 
@@ -228,14 +230,12 @@ CommandResponse PMDPort::ConfigureDevice(dpdk_port_t port_id,
   const int num_rxq = num_queues[PACKET_DIR_INC];
   const int num_txq = num_queues[PACKET_DIR_OUT];
 
-  int sid = rte_eth_dev_socket_id(port_id);
-  if (sid < 0 || sid > RTE_MAX_NUMA_NODES) {
-    sid = 0;
-  }
-
-  bess::PacketPool *pool = bess::PacketPool::GetDefaultPool(sid);
+  // Descriptor rings and buffers live on the memory node whatever node the
+  // device is on (D-123): there is one packet pool, and it is there.
+  const int sid = bess::utils::MemoryNode();
+  bess::PacketPool *pool = bess::PacketPool::GetDefaultPool();
   if (!pool) {
-    return CommandFailure(ENODEV, "No default packet pool for socket %d", sid);
+    return CommandFailure(ENODEV, "No default packet pool");
   }
 
   const SymmetricRss symmetric =
@@ -509,14 +509,9 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
       (arg.vlan_offload_rx_filter() ? RTE_ETH_VLAN_FILTER_OFFLOAD : 0) |
       (arg.vlan_offload_rx_qinq() ? RTE_ETH_VLAN_EXTEND_OFFLOAD : 0);
 
-  int sid = rte_eth_dev_socket_id(ret_port_id);
-  if (sid < 0 || sid > RTE_MAX_NUMA_NODES) {
-    sid = 0;  // if socket_id is invalid, set to 0
-  }
-
-  bess::PacketPool *pool = bess::PacketPool::GetDefaultPool(sid);
+  bess::PacketPool *pool = bess::PacketPool::GetDefaultPool();
   if (!pool) {
-    return CommandFailure(ENODEV, "No default packet pool for socket %d", sid);
+    return CommandFailure(ENODEV, "No default packet pool");
   }
 
   const size_t usable_single_mbuf_bytes = single_mbuf_rx_capacity(*pool);
@@ -586,9 +581,22 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
   dpdk_port_id_ = ret_port_id;
   SettleRss();
 
-  int numa_node = rte_eth_dev_socket_id(static_cast<int>(ret_port_id));
-  node_placement_ =
-      numa_node == -1 ? UNCONSTRAINED_SOCKET : (1ull << numa_node);
+  // A device on another node works; its DMA and descriptor traffic cross the
+  // interconnect. Diagnosed once, here, and visible on the port (D-123).
+  const int device_node = rte_eth_dev_socket_id(ret_port_id);
+  const int memory_node = bess::runtime::MemoryNode();
+  numa_node_ = device_node < 0 ? -1 : device_node;
+  cross_numa_ = bess::runtime::ClassifyDevice(device_node, memory_node) ==
+                bess::runtime::DeviceNuma::kCross;
+  if (cross_numa_) {
+    LOG(WARNING) << "PMDPort " << name() << " ("
+                 << (dev_info.device ? rte_dev_name(dev_info.device) : "no device")
+                 << ") is on NUMA node " << device_node
+                 << ", bessd's memory node is " << memory_node
+                 << ": cross-NUMA: DMA and descriptor traffic cross the "
+                    "interconnect. Run bessd with --numa_node="
+                 << device_node << ", or one bessd per node.";
+  }
 
   rte_eth_macaddr_get(dpdk_port_id_,
                       reinterpret_cast<rte_ether_addr *>(conf_.mac_addr.bytes));
@@ -762,13 +770,9 @@ CommandResponse PMDPort::UpdateConf(const Conf &conf) {
   // Validate all configuration that can be rejected before stopping the
   // device. A rejected request must not interrupt an otherwise running port.
   if (conf_.mtu != conf.mtu && conf.mtu != 0) {
-    int sid = rte_eth_dev_socket_id(dpdk_port_id_);
-    if (sid < 0 || sid > RTE_MAX_NUMA_NODES) {
-      sid = 0;
-    }
-    bess::PacketPool *pool = bess::PacketPool::GetDefaultPool(sid);
+    bess::PacketPool *pool = bess::PacketPool::GetDefaultPool();
     if (!pool) {
-      return CommandFailure(ENODEV, "No default packet pool for socket %d", sid);
+      return CommandFailure(ENODEV, "No default packet pool");
     }
 
     const size_t usable_single_mbuf_bytes = single_mbuf_rx_capacity(*pool);

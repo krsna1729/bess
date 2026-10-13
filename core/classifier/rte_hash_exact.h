@@ -26,6 +26,7 @@
 #include "classifier/typed_exact.h"
 #include "dpdk.h"
 #include "utils/common.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::classifier {
 
@@ -63,7 +64,7 @@ class RteHashPositionBackend {
     params.key_len = key_len;
     params.hash_func = nullptr;  // Default CRC hash
     params.hash_func_init_val = 0;
-    params.socket_id = SOCKET_ID_ANY;
+    params.socket_id = bess::utils::MemoryNode();
     params.extra_flag = 0;  // Clean immutable generation, no RW concurrency flags
     table_ = rte_hash_create(&params);
   }
@@ -246,7 +247,7 @@ class RteHashDataBackend {
     params.key_len = key_len;
     params.hash_func = nullptr;
     params.hash_func_init_val = 0;
-    params.socket_id = SOCKET_ID_ANY;
+    params.socket_id = bess::utils::MemoryNode();
     params.extra_flag = 0;
     table_ = rte_hash_create(&params);
   }

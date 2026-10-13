@@ -8,7 +8,7 @@
 namespace {
 
 size_t ConfiguredPacketDataRoom() {
-  const bess::PacketPool *pool = bess::PacketPool::GetDefaultPool(0);
+  const bess::PacketPool *pool = bess::PacketPool::GetDefaultPool();
   return pool == nullptr ? bess::kDefaultPacketDataSize
                           : pool->data_room_size();
 }

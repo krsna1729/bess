@@ -330,6 +330,11 @@ class BESSControlImpl final : public BESSControl::Service {
       status->set_core(worker->core());
       status->set_num_tcs(worker->scheduler()->NumTcs());
       status->set_silent_drops(worker->silent_drops());
+      const bess::runtime::WorkerCpuReport placement =
+          bess::runtime::runtime().workers().CpuReport(wid);
+      status->set_numa_node(placement.numa_node);
+      status->set_cross_numa(placement.cross_numa);
+      status->set_shares_core(placement.shares_core);
     }
     return Status::OK;
   }
@@ -845,36 +850,36 @@ class BESSControlImpl final : public BESSControl::Service {
                      DumpMempoolResponse* response) override {
     auto lock = control_plane_.AcquireLock();
 
-    int socket_filter = request->socket();
-    socket_filter =
-        (socket_filter == -1) ? (RTE_MAX_NUMA_NODES - 1) : socket_filter;
-    int socket = (request->socket() == -1) ? 0 : socket_filter;
-    for (; socket <= socket_filter; socket++) {
-      bess::PacketPool* pool = bess::PacketPool::GetDefaultPool(socket);
-      if (!pool) {
-        continue;
-      }
-
-      rte_mempool* mempool = pool->pool();
-      MempoolDump* dump = response->add_dumps();
-      dump->set_socket(socket);
-      dump->set_initialized(mempool != nullptr);
-      if (mempool == nullptr) {
-        continue;
-      }
-      // Backend-independent: only struct rte_mempool's own fields and the
-      // public count APIs. The old code reached into `pool_data` as a
-      // `struct rte_ring*`, which is only valid for the ring_mp_mc backend
-      // PacketPool happens to select today -- the same "correct by
-      // construction" coupling Phase A/B already removed twice. The
-      // deprecated ring_* fields stay unset (zero).
-      dump->set_mp_size(mempool->size);
-      dump->set_mp_cache_size(mempool->cache_size);
-      dump->set_mp_element_size(mempool->elt_size);
-      dump->set_mp_populated_size(mempool->populated_size);
-      dump->set_mp_available_count(rte_mempool_avail_count(mempool));
-      dump->set_mp_in_use_count(rte_mempool_in_use_count(mempool));
+    // One default pool, on the memory node (D-123): dumped for -1, or for
+    // the socket it is on.
+    bess::PacketPool* pool = bess::PacketPool::GetDefaultPool();
+    if (!pool) {
+      return Status::OK;
     }
+    rte_mempool* mempool = pool->pool();
+    const int socket = mempool != nullptr ? mempool->socket_id : -1;
+    if (request->socket() != -1 && request->socket() != socket) {
+      return Status::OK;
+    }
+
+    MempoolDump* dump = response->add_dumps();
+    dump->set_socket(socket);
+    dump->set_initialized(mempool != nullptr);
+    if (mempool == nullptr) {
+      return Status::OK;
+    }
+    // Backend-independent: only struct rte_mempool's own fields and the
+    // public count APIs. The old code reached into `pool_data` as a
+    // `struct rte_ring*`, which is only valid for the ring_mp_mc backend
+    // PacketPool happens to select today -- the same "correct by
+    // construction" coupling Phase A/B already removed twice. The
+    // deprecated ring_* fields stay unset (zero).
+    dump->set_mp_size(mempool->size);
+    dump->set_mp_cache_size(mempool->cache_size);
+    dump->set_mp_element_size(mempool->elt_size);
+    dump->set_mp_populated_size(mempool->populated_size);
+    dump->set_mp_available_count(rte_mempool_avail_count(mempool));
+    dump->set_mp_in_use_count(rte_mempool_in_use_count(mempool));
     return Status::OK;
   }
 

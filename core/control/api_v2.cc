@@ -35,6 +35,7 @@
 #include "module.h"
 #include "port.h"
 #include "runtime/runtime_state.h"
+#include "runtime/numa_placement.h"
 #include "stats/event_hub.h"
 #include "control/wire_narrow.h"
 #include "worker.h"
@@ -121,7 +122,9 @@ ControlResult<PipelineSpec> FromProto(const v2::Pipeline &pipeline) {
     index++;
   }
   for (const auto &w : pipeline.workers()) {
-    spec.workers.push_back({w.wid(), w.core(), w.scheduler()});
+    spec.workers.push_back(
+        {w.wid(), w.has_core() ? std::optional<int>(w.core()) : std::nullopt,
+         w.scheduler()});
   }
   for (const auto &t : pipeline.traffic_classes()) {
     TrafficClassSpec tc;
@@ -195,7 +198,9 @@ v2::Pipeline ToProto(const PipelineSpec &spec) {
   for (const auto &w : spec.workers) {
     auto *worker = out.add_workers();
     worker->set_wid(w.wid);
-    worker->set_core(w.core);
+    if (w.core.has_value()) {
+      worker->set_core(*w.core);
+    }
     worker->set_scheduler(w.scheduler);
   }
   for (const auto &t : spec.traffic_classes) {
@@ -475,6 +480,15 @@ grpc::Status ControlV2Service::GetPipeline(grpc::ServerContext *,
   *response->mutable_pipeline() = ToProto(SpecFromSnapshot(snapshot.value));
   response->set_generation(snapshot.generation);
   response->set_daemon_epoch(transactions_.epoch());
+  for (const WorkerSnapshot &w : snapshot.value.workers) {
+    v2::WorkerPlacement *out = response->add_workers();
+    out->set_wid(w.wid);
+    out->set_core(w.core);
+    out->set_numa_node(w.numa_node);
+    out->set_cross_numa(w.cross_numa);
+    out->set_shares_core(w.shares_core);
+    out->set_on_control_cpu(w.on_control_cpu);
+  }
   return grpc::Status::OK;
 }
 
@@ -888,6 +902,9 @@ grpc::Status ControlV2Service::GetCapabilities(grpc::ServerContext *,
     *response->add_resources() = r;
   }
   response->set_daemon_epoch(transactions_.epoch());
+  const runtime::Placement &placement = runtime::ProcessPlacement();
+  response->set_placement(placement.Summary());
+  response->set_memory_node(placement.node);
   return grpc::Status::OK;
 }
 

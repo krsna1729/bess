@@ -14,6 +14,8 @@ DECLARE_bool(k);
 DECLARE_bool(d);
 DECLARE_bool(a);
 DECLARE_int32(c);
+DECLARE_int32(numa_node);
+DECLARE_string(control_cpus);
 DECLARE_string(b);
 DECLARE_int32(p);
 DECLARE_string(grpc_url);

@@ -77,7 +77,6 @@ class PMDPort final : public Port {
       : Port(),
         dpdk_port_id_(DPDK_PORT_UNKNOWN),
         hot_plugged_(false),
-        node_placement_(UNCONSTRAINED_SOCKET),
         capabilities_(),
         rx_scatter_enabled_(false),
         conf_state_degraded_(false),
@@ -121,6 +120,8 @@ class PMDPort final : public Port {
     return num_queues[PACKET_DIR_INC] <= 1 || symmetric_rss_;
   }
   uint64_t rss_signature() const override { return rss_signature_; }
+  int numa_node() const override { return numa_node_; }
+  bool cross_numa() const override { return cross_numa_; }
 
   /*!
    * Receives packets from the device.
@@ -169,14 +170,6 @@ class PMDPort final : public Port {
   CommandResponse UpdateConf(const Conf &conf) override;
   bool HasActiveOutputUsers() const;
 
-  /*!
-   * Get any placement constraints that need to be met when receiving from this
-   * port.
-   */
-  placement_constraint GetNodePlacementConstraint() const override {
-    return node_placement_;
-  }
-
  private:
   friend class PMDPortTestAccess;
 
@@ -212,10 +205,10 @@ class PMDPort final : public Port {
    */
   bool hot_plugged_;
 
-  /*!
-   * The NUMA node to which device is attached
-   */
-  placement_constraint node_placement_;
+  // The device's NUMA node (-1: unknown) and whether it is other than bessd's
+  // memory node: diagnosed at Init, never a placement constraint (D-123).
+  int numa_node_ = -1;
+  bool cross_numa_ = false;
   PmdCapabilities capabilities_;
   uint64_t tx_device_offloads_enabled_ = 0;
   std::array<uint64_t, MAX_QUEUES_PER_DIR> tx_queue_offloads_enabled_{};

@@ -10,6 +10,8 @@
 
 #include <rte_malloc.h>
 
+#include "utils/logging.h"
+
 namespace bess::meter {
 
 // A per-socket pool of cache-line MeterState slots. Chunks are allocated on
@@ -59,6 +61,11 @@ class MeterStateSlab {
                                     alignof(MeterState), socket_);
     if (chunk == nullptr && socket_ != SOCKET_ID_ANY) {
       // Placement is a preference; see MeterState::Create().
+      static std::once_flag warned;
+      std::call_once(warned, [this] {
+        LOG(WARNING) << "meter slab: DPDK socket " << socket_
+                     << " is out of memory; allocating on any socket";
+      });
       chunk = rte_malloc_socket("bess_meter_slab", bytes, alignof(MeterState),
                                 SOCKET_ID_ANY);
     }

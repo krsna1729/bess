@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -416,8 +417,12 @@ ControlResult<void> Transaction::ExecutePrepareOp(const PlanOperation &op) {
   }
 
   if (const auto *worker = std::get_if<AddWorkerOp>(&op)) {
-    auto result = plane_->AddWorkerLocked(worker->spec.wid, worker->spec.core,
-                                          worker->spec.scheduler);
+    const std::optional<int> &core = worker->spec.core;
+    auto result = plane_->AddWorkerLocked(
+        worker->spec.wid,
+        core ? std::optional<uint64_t>(static_cast<uint64_t>(*core))
+             : std::nullopt,
+        worker->spec.scheduler);
     if (!result) {
       return std::unexpected(result.error());
     }

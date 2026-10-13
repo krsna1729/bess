@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -116,7 +117,12 @@ class ControlPlane {
       const google::protobuf::Any& arg);
 
   // -- workers --
-  ControlResult<void> AddWorker(uint64_t wid, uint64_t core,
+  // No core: automatic -- Placement::NextWorkerCpu over the live workers'
+  // CPUs; ENOSPC when none is free. An explicit core must be in ProcessCpus()
+  // (EINVAL otherwise); anywhere else in it is honoured. Either way, what
+  // DescribeWorkerCpu finds (another node, a control CPU, a shared core) is
+  // logged once as a warning, never refused (D-123).
+  ControlResult<void> AddWorker(uint64_t wid, std::optional<uint64_t> core,
                                 const std::string& scheduler);
   ControlResult<void> DestroyWorker(uint64_t wid);
   ControlResult<void> ResetWorkers();
@@ -198,7 +204,8 @@ class ControlPlane {
   ControlResult<void> DestroyModuleLocked(const std::string& name);
   ControlResult<void> ConnectModulesLocked(const ConnectionSpec& spec);
   ControlResult<void> DisconnectModulesLocked(const DisconnectionSpec& spec);
-  ControlResult<void> AddWorkerLocked(uint64_t wid, uint64_t core,
+  ControlResult<void> AddWorkerLocked(uint64_t wid,
+                                      std::optional<uint64_t> core,
                                       const std::string& scheduler);
   ControlResult<void> DestroyWorkerLocked(uint64_t wid);
   ControlResult<void> AddTcLocked(const TrafficClassSpec& spec);

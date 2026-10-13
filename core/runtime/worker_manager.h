@@ -10,7 +10,9 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
+#include "runtime/numa_placement.h"
 #include "runtime/thread_placement.h"
 #include "traffic_class.h"
 #include "worker.h"
@@ -79,7 +81,10 @@ class WorkerManager {
   Worker *NextActive();
 
   // Starts worker `wid` on `core`, and keeps this process's other threads
-  // off every worker's CPU (D-027).
+  // off every worker's CPU (D-027). Logs, once, each warning
+  // DescribeWorkerCpu has for that CPU (another node, a control CPU, a core
+  // shared with another worker or a control CPU): diagnosed, never refused
+  // (D-123).
   void Launch(int wid, CpuId core, const std::string &scheduler);
   void Destroy(int wid);
   void DestroyAll();
@@ -92,6 +97,12 @@ class WorkerManager {
 
   // True if a live worker is pinned to this CPU.
   bool IsCoreUsed(int core) const;
+  // The CPUs the live workers run on, except worker `except`'s: what an
+  // automatic worker must not take (D-123).
+  std::vector<int> Cores(int except = -1) const;
+  // Where live worker `wid` runs, against the other workers' CPUs as they are
+  // now (D-123); a default report for a wid with no worker.
+  WorkerCpuReport CpuReport(int wid) const;
 
   // Orphan traffic classes: created by TC/module setup and attached to
   // workers when they resume.

@@ -18,10 +18,12 @@
 #include <mutex>
 
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "control/control_plane.h"
 #include "runtime/runtime_state.h"
+#include "runtime/numa_placement.h"
 #include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
@@ -98,6 +100,26 @@ TEST(ApiV2AdapterTest, PipelineRoundTrips) {
   const v2::Pipeline back = bess::control::ToProto(*spec);
   EXPECT_TRUE(MessageDifferencer::Equals(p, back))
       << p.DebugString() << "\nvs\n" << back.DebugString();
+}
+
+// D-123: an unset worker core (automatic) stays unset through the adapter,
+// and an explicit core 0 stays explicit.
+TEST(ApiV2AdapterTest, AnUnsetWorkerCoreStaysUnsetAndCoreZeroStaysSet) {
+  v2::Pipeline p = SamplePipeline();
+  p.mutable_workers(0)->clear_core();
+  auto *pinned = p.add_workers();
+  pinned->set_wid(1);
+  pinned->set_core(0);
+
+  const auto spec = bess::control::FromProto(p);
+  ASSERT_TRUE(spec.has_value()) << spec.error().message;
+  ASSERT_EQ(2u, spec->workers.size());
+  EXPECT_FALSE(spec->workers[0].core.has_value());
+  EXPECT_EQ(std::optional<int>(0), spec->workers[1].core);
+  const v2::Pipeline back = bess::control::ToProto(*spec);
+  EXPECT_FALSE(back.workers(0).has_core());
+  ASSERT_TRUE(back.workers(1).has_core());
+  EXPECT_EQ(0, back.workers(1).core());
 }
 
 // Wire integers wider than their C++ field are refused before the cast. Each
@@ -378,6 +400,71 @@ TEST_F(ApiV2ServiceTest, ValidateDiffPlanApplyGet) {
     EXPECT_EQ(generation + 1, resp.generation());
     EXPECT_EQ(0u, resp.applied_ops());
     EXPECT_FALSE(resp.workers_paused());
+  }
+}
+
+// D-123: a worker applied without a core gets one; GetPipeline names it in
+// the pipeline and reports where it runs (node, cross-NUMA, shared core,
+// control CPU); re-applying the desired state without a core is a no-op; and
+// GetCapabilities carries the process placement.
+TEST_F(ApiV2ServiceTest, AnAutomaticWorkerIsReportedWhereItRunsAndReapplyIsANoOp) {
+  const bess::runtime::Placement &placement = bess::runtime::ProcessPlacement();
+  if (placement.WorkerCpus().empty()) {
+    GTEST_SKIP() << "no CPU for automatic workers: " << placement.Summary();
+  }
+  v2::Pipeline desired = SamplePipeline();
+  desired.mutable_workers(0)->clear_core();
+
+  uint64_t generation = 0;
+  {
+    grpc::ClientContext ctx;
+    v2::ApplyPipelineRequest req;
+    *req.mutable_pipeline() = desired;
+    req.set_daemon_epoch(Epoch());
+    v2::ApplyPipelineResponse resp;
+    const grpc::Status status = stub_->ApplyPipeline(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+    generation = resp.generation();
+  }
+
+  {
+    grpc::ClientContext ctx;
+    v2::GetPipelineResponse resp;
+    ASSERT_TRUE(stub_->GetPipeline(&ctx, {}, &resp).ok());
+    ASSERT_EQ(1, resp.pipeline().workers_size());
+    ASSERT_TRUE(resp.pipeline().workers(0).has_core()) << "the CPU it runs on";
+    const int core = resp.pipeline().workers(0).core();
+    EXPECT_EQ(1u, placement.WorkerCpus().count(core)) << placement.Summary();
+    ASSERT_EQ(1, resp.workers_size());
+    const v2::WorkerPlacement &observed = resp.workers(0);
+    EXPECT_EQ(0, observed.wid());
+    EXPECT_EQ(core, observed.core());
+    const bess::runtime::WorkerCpuReport expected = placement.DescribeWorkerCpu(core, {});
+    EXPECT_EQ(expected.numa_node, observed.numa_node());
+    EXPECT_EQ(expected.cross_numa, observed.cross_numa());
+    EXPECT_EQ(expected.shares_core, observed.shares_core());
+    EXPECT_EQ(expected.on_control_cpu, observed.on_control_cpu());
+    EXPECT_FALSE(observed.on_control_cpu()) << "an automatic worker avoids control CPUs";
+  }
+
+  {  // The same desired state, core still unset: nothing to do.
+    grpc::ClientContext ctx;
+    v2::ApplyPipelineRequest req;
+    *req.mutable_pipeline() = desired;
+    req.set_daemon_epoch(Epoch());
+    v2::ApplyPipelineResponse resp;
+    ASSERT_TRUE(stub_->ApplyPipeline(&ctx, req, &resp).ok());
+    EXPECT_EQ(generation, resp.generation());
+    EXPECT_EQ(0u, resp.applied_ops());
+    EXPECT_FALSE(resp.workers_paused());
+  }
+
+  {
+    grpc::ClientContext ctx;
+    v2::GetCapabilitiesResponse resp;
+    ASSERT_TRUE(stub_->GetCapabilities(&ctx, {}, &resp).ok());
+    EXPECT_EQ(placement.Summary(), resp.placement());
+    EXPECT_EQ(placement.node, resp.memory_node());
   }
 }
 

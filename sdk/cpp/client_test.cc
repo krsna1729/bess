@@ -692,6 +692,17 @@ TEST(SdkClient, ThePipelineBuilderAssemblesAndEditsASnapshot) {
   EXPECT_EQ(p->modules_size(), 3);
 }
 
+// D-123: a worker given no core leaves it unset (bessd picks the CPU); an
+// explicit core, 0 included, is sent.
+TEST(SdkClient, ThePipelineBuilderLeavesAnAutomaticWorkersCoreUnset) {
+  auto p = PipelineBuilder().Worker(0, std::nullopt, "").Worker(1, 0, "").Build();
+  ASSERT_TRUE(p);
+  ASSERT_EQ(p->workers_size(), 2);
+  EXPECT_FALSE(p->workers(0).has_core());
+  ASSERT_TRUE(p->workers(1).has_core());
+  EXPECT_EQ(p->workers(1).core(), 0);
+}
+
 TEST(SdkClient, ApplyPipelineRetriesBusyAndNeverAConflict) {
   const Step busy = Refusal(grpc::StatusCode::FAILED_PRECONDITION, pb::ErrorDetail::RESOURCE_BUSY);
   {

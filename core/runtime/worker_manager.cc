@@ -13,6 +13,7 @@
 #include "arch/cpu.h"
 #include "runtime/runtime_state.h"
 #include "runtime/thread_placement.h"
+#include "runtime/numa_placement.h"
 #include "module.h"
 #include "runtime/opts.h"
 #include "resume_hook.h"
@@ -85,6 +86,25 @@ bool WorkerManager::IsCoreUsed(int core) const {
   }
 
   return false;
+}
+
+std::vector<int> WorkerManager::Cores(int except) const {
+  std::vector<int> cores;
+  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+    const Worker *worker = workers_[wid].load();
+    if (worker != nullptr && wid != except) {
+      cores.push_back(worker->core());
+    }
+  }
+  return cores;
+}
+
+WorkerCpuReport WorkerManager::CpuReport(int wid) const {
+  const Worker *worker = Get(wid);
+  if (worker == nullptr) {
+    return {};
+  }
+  return ProcessPlacement().DescribeWorkerCpu(worker->core(), Cores(wid));
 }
 
 void WorkerManager::Pause(int wid) {
@@ -221,6 +241,10 @@ void WorkerManager::Launch(int wid, CpuId core, const std::string &scheduler) {
 
   num_workers_++;
   PlaceThreads();
+
+  for (const std::string &warning : CpuReport(wid).warnings) {
+    LOG(WARNING) << "worker " << wid << ": " << warning;
+  }
 }
 
 void WorkerManager::PlaceThreads() {

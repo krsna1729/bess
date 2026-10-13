@@ -205,7 +205,9 @@ TEST_F(ControlPlaneTest, RejectsBadWorker) {
   EXPECT_EQ("scheduler", validated.error().field);
 }
 
-TEST_F(ControlPlaneTest, RejectsDuplicateWorkerCore) {
+// Two workers naming one CPU are honoured (and warned at launch): only a CPU
+// outside bessd's set is a placement error (D-123).
+TEST_F(ControlPlaneTest, AcceptsTwoWorkersOnOneCore) {
   PipelineSpec spec = MinimalSpec();
   WorkerSpec second;
   second.wid = 1;
@@ -213,9 +215,7 @@ TEST_F(ControlPlaneTest, RejectsDuplicateWorkerCore) {
   spec.workers.push_back(second);
 
   auto validated = ValidatePipeline(*runtime_, spec);
-  ASSERT_FALSE(validated.has_value());
-  EXPECT_EQ(EINVAL, validated.error().err);
-  EXPECT_EQ("core", validated.error().field);
+  EXPECT_TRUE(validated.has_value()) << validated.error().message;
 }
 
 TEST_F(ControlPlaneTest, RejectsBadTrafficClass) {

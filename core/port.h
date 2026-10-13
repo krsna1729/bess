@@ -238,6 +238,11 @@ class Port {
   // ports means the same tuple lands on the same queue index on both (driver,
   // hash function, key, hashed fields, redirection table). 0: unknown.
   virtual uint64_t rss_signature() const { return 0; }
+  // The NUMA node of the port's device as DPDK reports it; -1: unknown or not
+  // a device. Cross-NUMA: on a node other than bessd's memory node, which is
+  // diagnosed (a warning at Init) and never refused (D-123).
+  virtual int numa_node() const { return -1; }
+  virtual bool cross_numa() const { return false; }
 
   /*!
    * Get any placement constraints that need to be met when receiving from this

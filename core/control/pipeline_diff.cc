@@ -183,10 +183,12 @@ PipelineDiff Diff(const PipelineSnapshot &current,
       }
     }
 
+    // A worker without a core is automatic: it matches the worker of its wid
+    // wherever that runs, so re-applying it moves nothing (D-123).
     if (active == nullptr) {
       diff.workers.push_back(
           WorkerChange{worker.wid, ChangeKind::kCreate, worker});
-    } else if (active->core != worker.core ||
+    } else if ((worker.core.has_value() && active->core != *worker.core) ||
                active->scheduler != worker.scheduler) {
       diff.workers.push_back(
           WorkerChange{worker.wid, ChangeKind::kReplace, worker});

@@ -168,6 +168,21 @@ resources:
 A manifest is the whole desired state: workers and traffic classes included
 (start from `bessctl get`). The daemon validates; bessctl only converts.
 
+A worker's `core` may be left out (D-123): the daemon then picks a free CPU
+of its memory node -- one per physical core before any core's second thread,
+never the reserved control CPU, never a CPU another worker holds -- and keeps
+it for the worker's life. `bessctl get` and `GetPipeline` show the CPU it
+runs on (and `GetPipelineResponse.workers` its node, `cross_numa`,
+`shares_core`, `on_control_cpu`); applying the same manifest again, core still
+left out, moves nothing. No free CPU is `RESOURCE_EXHAUSTED` (ENOSPC). An
+explicit `core` is honoured anywhere in bessd's CPU set, with a warning when it
+is on another node, the control CPU, a CPU another worker uses, or a sibling
+of one; outside the set it is refused. In the SDKs: C++
+`Worker(wid, std::nullopt)`, Go `AutoWorker(wid, scheduler)`, pybess
+`worker(wid)` (`core=None`). `GetCapabilities` carries the daemon's
+`memory_node` and its one-line `placement` summary (`bessctl status` prints
+both); `GetPortStatus` a port's `numa_node` (-1: unknown) and `cross_numa`.
+
 A manifest may also hold entries for the resources its modules create (see
 `bessctl resources`), in the resource's key and value types:
 
@@ -217,7 +232,7 @@ running daemon besides its pipeline. Both SDKs wrap it (C++ / Go):
 |---|---|
 | `ImportPlugin(path)` / `UnloadPlugin(path)` | load or unload a plugin (a path on the daemon's host) |
 | `Ports(names...)` | link state and rx/tx counters; every port by name, or the named ones in that order |
-| `PacketPools()` | each NUMA socket's default packet pool: size, in use, available |
+| `PacketPools()` | the default packet pool (one, on the daemon's memory node, D-123): size, in use, available, its socket |
 | `SetCapture(request)` | start or stop a pcap or pcapng capture on a module's input or output gates (one, or all; pcap without a gate needs the module to have only one there, since a pcap stream holds one file header) into a FIFO the caller made; at most one capture of each format per gate (`ALREADY_EXISTS`), all gates or none |
 | `PauseWorkers()` / `ResumeWorkers()` | every worker; resuming runs the resume hooks first. A worker a pipeline creates starts paused, and applying a pipeline keeps the workers' state |
 | `Shutdown()` | the daemon answers, then stops |

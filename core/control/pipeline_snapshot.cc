@@ -192,6 +192,11 @@ PipelineSnapshot SnapshotRuntime(const runtime::RuntimeState &runtime) {
     entry.wid = wid;
     entry.core = worker->core();
     entry.scheduler = runtime.workers().scheduler_name(wid);
+    const runtime::WorkerCpuReport report = runtime.workers().CpuReport(wid);
+    entry.numa_node = report.numa_node;
+    entry.cross_numa = report.cross_numa;
+    entry.shares_core = report.shares_core;
+    entry.on_control_cpu = report.on_control_cpu;
     snapshot.workers.push_back(std::move(entry));
   }
 

@@ -52,6 +52,7 @@ packet_sources = files(
 # enforces the includes, tools/check_link_graph.py the archive edges).
 eal_sources = files(
   'runtime/thread_placement.cc',
+  'runtime/numa_placement.cc',
   'runtime/dpdk.cc',
   'runtime/opts.cc',
   'runtime/memory.cc',
@@ -727,6 +728,7 @@ unit_test_sources = [
   'control/dataplane_transactions_test.cc',
   'control/thread_placement_test.cc',
   'runtime/startup_test.cc',
+  'runtime/numa_placement_test.cc',
   'framework/instance_registry_test.cc',
   'framework/module_requests_test.cc',
   'modules/shared_instance_test.cc',

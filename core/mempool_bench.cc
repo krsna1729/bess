@@ -6,7 +6,7 @@
 // decoupling. pmd_bench.cc covers the other half of that plan (the PMD
 // boundary); this covers the allocator.
 //
-// Why a dedicated harness: BESS's packet pools are per-socket and shared by
+// Why a dedicated harness: BESS's packet pool is one (D-123) shared by
 // every worker, while DPDK's mempool cache is per *lcore* -- keyed on
 // rte_lcore_id(), the id DPDK assigns when a worker pthread registers as a
 // non-EAL lcore (`rte_thread_register()`, core/worker.cc; before

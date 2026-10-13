@@ -17,6 +17,7 @@
 #include <rte_spinlock.h>
 
 #include "dataplane/strong_id.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::meter {
 
@@ -212,13 +213,13 @@ using MeterStatePtr = std::unique_ptr<MeterState, MeterStateDeleter>;
 // guarantees that by owning both.
 class alignas(RTE_CACHE_LINE_SIZE) MeterState {
  public:
-  // Allocates (on `socket`, a DPDK socket id or SOCKET_ID_ANY) and configures
-  // a standalone state with full buckets, the `rte_meter` initial condition.
-  // MeterSet allocates its states from slabs instead; this is for callers
-  // that manage a meter on their own.
+  // Allocates (on `socket`, a DPDK socket id, by default the memory node;
+  // SOCKET_ID_ANY: any) and configures a standalone state with full buckets,
+  // the `rte_meter` initial condition. MeterSet allocates its states from
+  // slabs instead; this is for callers that manage a meter on their own.
   static std::expected<MeterStatePtr, MeterError> Create(
       const MeterProfile &profile, MeterSharing sharing,
-      int socket = SOCKET_ID_ANY);
+      int socket = bess::utils::MemoryNode());
 
   MeterState(const MeterState &) = delete;
   MeterState &operator=(const MeterState &) = delete;

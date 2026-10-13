@@ -279,6 +279,28 @@ TEST(Manifest, AnArgWithoutTypeGetsItsClassesInitType) {
   EXPECT_EQ(2u, c.ogate());
 }
 
+// D-123: a worker the manifest gives no core is automatic -- the field stays
+// unset, so the daemon picks the CPU -- and an explicit core 0 stays
+// explicit, in the manifest read and in the one written back.
+TEST(Manifest, AWorkerWithoutCoreLeavesItUnsetAndCoreZeroStaysExplicit) {
+  auto schema = MakeSchema();
+  auto p = PipelineOf(*schema, "workers:\n  - {wid: 0}\n  - {wid: 1, core: 0}\n");
+  ASSERT_TRUE(p) << p.error();
+  ASSERT_EQ(2, p->workers_size());
+  EXPECT_FALSE(p->workers(0).has_core());
+  ASSERT_TRUE(p->workers(1).has_core());
+  EXPECT_EQ(0, p->workers(1).core());
+
+  auto text = schema->PipelineTo(*p, Format::kJson);
+  ASSERT_TRUE(text) << text.error();
+  auto back = PipelineOf(*schema, *text);
+  ASSERT_TRUE(back) << back.error() << "\n" << *text;
+  ASSERT_EQ(2, back->workers_size());
+  EXPECT_FALSE(back->workers(0).has_core()) << *text;
+  ASSERT_TRUE(back->workers(1).has_core()) << *text;
+  EXPECT_EQ(0, back->workers(1).core());
+}
+
 TEST(Manifest, AnExplicitTypeIsKeptEvenIfItDiffers) {
   auto schema = MakeSchema();
   auto p = PipelineOf(*schema, R"({"modules": [{"name": "m", "mclass": "Fake",

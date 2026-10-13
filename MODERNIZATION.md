@@ -6616,7 +6616,7 @@ struct ConnectionSpec {
 
 struct WorkerSpec {
   int wid;
-  int core;
+  std::optional<int> core;  // unset: automatic (D-123)
   std::string scheduler;
 };
 

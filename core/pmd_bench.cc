@@ -90,7 +90,7 @@ PmdFixture &GetFixture() {
 }
 
 bess::PacketPool *DefaultPool() {
-  bess::PacketPool *pool = bess::PacketPool::GetDefaultPool(0);
+  bess::PacketPool *pool = bess::PacketPool::GetDefaultPool();
   CHECK(pool != nullptr);
   return pool;
 }

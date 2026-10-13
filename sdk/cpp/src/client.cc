@@ -910,11 +910,14 @@ PipelineBuilder &PipelineBuilder::Chain(
   return *this;
 }
 
-PipelineBuilder &PipelineBuilder::Worker(int32_t wid, int32_t core,
+PipelineBuilder &PipelineBuilder::Worker(int32_t wid,
+                                         std::optional<int32_t> core,
                                          std::string_view scheduler) {
   pb::Worker *w = p_.add_workers();
   w->set_wid(wid);
-  w->set_core(core);
+  if (core.has_value()) {
+    w->set_core(*core);
+  }
   w->set_scheduler(std::string(scheduler));
   return *this;
 }

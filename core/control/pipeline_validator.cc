@@ -175,7 +175,6 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
 
   // -- workers --------------------------------------------------------------
   std::set<int> worker_ids;
-  std::set<int> worker_cores;
   for (const WorkerSpec &worker : spec.workers) {
     if (worker.wid < 0 || worker.wid >= Worker::kMaxWorkers) {
       return std::unexpected(
@@ -188,25 +187,25 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
                                            " is defined twice"));
     }
 
-    const std::optional<runtime::CpuId> cpu = runtime::CpuIdFrom(worker.core);
-    if (!cpu || !runtime::CpuPresent(*cpu)) {
-      return std::unexpected(Invalid(
-          "worker", "core",
-          "worker " + std::to_string(worker.wid) + ": CPU " +
-              std::to_string(worker.core) + " is not present"));
-    }
-    if (!runtime::CpuAllowed(*cpu)) {
-      return std::unexpected(Invalid(
-          "worker", "core",
-          "worker " + std::to_string(worker.wid) + ": CPU " +
-              std::to_string(worker.core) + " is not in bessd's CPU set (" +
-              runtime::CpuList(runtime::ProcessCpus()) + ")"));
-    }
-    if (!worker_cores.insert(worker.core).second) {
-      return std::unexpected(Invalid(
-          "worker", "core",
-          "worker " + std::to_string(worker.wid) + ": CPU " +
-              std::to_string(worker.core) + " is used by another worker"));
+    // No core: automatic, chosen when the worker is created. Two workers
+    // naming one CPU are honoured and warned at launch, like every other
+    // placement finding; only a CPU outside the set is refused (D-123).
+    if (worker.core.has_value()) {
+      const int core = *worker.core;
+      const std::optional<runtime::CpuId> cpu = runtime::CpuIdFrom(core);
+      if (!cpu || !runtime::CpuPresent(*cpu)) {
+        return std::unexpected(Invalid(
+            "worker", "core",
+            "worker " + std::to_string(worker.wid) + ": CPU " +
+                std::to_string(core) + " is not present"));
+      }
+      if (!runtime::CpuAllowed(*cpu)) {
+        return std::unexpected(Invalid(
+            "worker", "core",
+            "worker " + std::to_string(worker.wid) + ": CPU " +
+                std::to_string(core) + " is not in bessd's CPU set (" +
+                runtime::CpuList(runtime::ProcessCpus()) + ")"));
+      }
     }
 
     if (worker.scheduler != "" && worker.scheduler != "experimental") {
