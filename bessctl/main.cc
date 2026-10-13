@@ -147,6 +147,9 @@ class Cli {
       std::println("memory node  {}", caps->memory_node());
       std::println("{}", caps->placement());
     }
+    if (!caps->simd().empty()) {  // a daemon before D-126 sends none
+      std::println("{}", caps->simd());
+    }
     std::println("classes      {}", caps->module_classes_size());
     for (const pb::PluginInfo &p : caps->plugins()) {
       std::println("plugin       {} {} ({})", p.name(), p.version(), p.path());

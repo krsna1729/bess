@@ -26,6 +26,7 @@
 #include "control/control_plane.h"
 #include "runtime/runtime_state.h"
 #include "runtime/numa_placement.h"
+#include "runtime/simd_width.h"
 #include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
@@ -469,6 +470,18 @@ TEST_F(ApiV2ServiceTest, AnAutomaticWorkerIsReportedWhereItRunsAndReapplyIsANoOp
     EXPECT_EQ(placement.Summary(), resp.placement());
     EXPECT_EQ(placement.node, resp.memory_node());
   }
+}
+
+// GetCapabilities carries the SIMD width bessd decided at startup (D-126),
+// the one BESS's kernels run at.
+TEST_F(ApiV2ServiceTest, CapabilitiesCarryTheSimdWidth) {
+  grpc::ClientContext ctx;
+  v2::GetCapabilitiesResponse resp;
+  ASSERT_TRUE(stub_->GetCapabilities(&ctx, {}, &resp).ok());
+  const bess::runtime::SimdWidth &simd = bess::runtime::ProcessSimdWidth();
+  EXPECT_EQ(simd.Summary(), resp.simd());
+  EXPECT_EQ(simd.effective, resp.simd_width());
+  EXPECT_EQ(bess::arch::SimdWidth(), resp.simd_width());
 }
 
 // No free CPU for an automatic worker is RESOURCE_EXHAUSTED on the wire --

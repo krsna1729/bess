@@ -506,25 +506,30 @@ def client(args):
 
 def build_spec(text):
     """'master', or 'current:<tree>' (its build/perf-release), or
-    'name=<bessd>,<pythonpath>' for anything else."""
+    'current:<tree>:<builddir>:<bessd flags, comma-separated>' (the same
+    binary under different flags is a build of its own, e.g.
+    current:.:build/fast:--simd_width=256), or 'name=<bessd>,<pythonpath>' for
+    anything else."""
     if text == 'master':
         return {'name': 'master', 'bessd': str(MASTER / 'bin-v3/bessd'),
                 'modules': str(MASTER / 'bin-v3/modules'), 'ld': '',
                 'pythonpath': [str(MASTER_TOOLCHAIN), str(MASTER)],
-                'env': {'LIVE_PERF_PB2D': str(ROOT / 'pybess/protobuf_to_dict.py')}}
+                'env': {'LIVE_PERF_PB2D': str(ROOT / 'pybess/protobuf_to_dict.py')}, 'flags': []}
     if text.startswith('current'):
-        parts = text.split(':')
+        parts = text.split(':', 3)
         tree = Path(parts[1]) if len(parts) > 1 else ROOT
         build = parts[2] if len(parts) > 2 else 'build/perf-release'
+        flags = [f for f in parts[3].split(',') if f] if len(parts) > 3 else []
         gen = tree / build / 'protobuf/generated/python'
-        return {'name': 'current' if len(parts) == 1 else tree.name + ('' if len(parts) < 3 else '/' + Path(build).name),
+        name = 'current' if len(parts) == 1 else tree.name + ('' if len(parts) < 3 else '/' + Path(build).name)
+        return {'name': name + ''.join(' ' + f for f in flags),
                 'bessd': str(tree / build / 'core/bessd'), 'modules': '',
                 'ld': str(DPDK_LIB), 'pythonpath': [str(gen / 'builtin_pb'), str(gen), str(tree)],
-                'env': {'BESS_PROTOBUF_ROOT': str(gen)}}
+                'env': {'BESS_PROTOBUF_ROOT': str(gen)}, 'flags': flags}
     name, rest = text.split('=', 1)
     bessd, pythonpath = rest.split(',', 1)
     return {'name': name, 'bessd': bessd, 'modules': '', 'ld': str(DPDK_LIB),
-            'pythonpath': pythonpath.split(':'), 'env': {}}
+            'pythonpath': pythonpath.split(':'), 'env': {}, 'flags': []}
 
 
 def free_port():
@@ -543,6 +548,7 @@ def run_round(spec, tests, args):
             '-c', args.cpu.split(',')[-1]]
     if spec['modules']:
         cmd.append('--modules=' + spec['modules'])
+    cmd += spec['flags']
     daemon = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         env = dict(os.environ, PYTHONPATH=':'.join(spec['pythonpath']), **spec['env'])
@@ -620,7 +626,8 @@ def main():
     p.add_argument('--client', action='store_true', help=argparse.SUPPRESS)
     p.add_argument('--port', type=int, help=argparse.SUPPRESS)
     p.add_argument('--tests', default=','.join(TESTS), help='comma-separated, or a class prefix (F, M)')
-    p.add_argument('--build', action='append', default=[], help='master | current[:<tree>] | name=<bessd>,<pythonpath>')
+    p.add_argument('--build', action='append', default=[],
+                   help='master | current[:<tree>[:<builddir>[:<bessd flags,...>]]] | name=<bessd>,<pythonpath>')
     p.add_argument('--rounds', type=int, default=3)
     p.add_argument('--cpu', default='2,4', help='worker 0 (and worker 1 for F.queue); the last is also bessd\'s -c (its default worker core)')
     p.add_argument('--control-cpu', type=int,

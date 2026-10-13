@@ -17,6 +17,7 @@ Columns:
 | Sockets in a placement mask | 16 | `MAX_NUMA_NODE` (`module.h`, builds `UNCONSTRAINED_SOCKET`) | No | not checked; higher sockets cannot be expressed in the mask (no in-tree port sets a mask since D-123: a NIC's node is diagnosed, not a constraint) |
 | CPU or node id in a placement CPU list | 65,536 | `kMaxListValue` (`runtime/numa_placement.cc`) | No | the list is malformed: `--control_cpus` refuses start-up; a sysfs list beyond it is ignored (the CPU is then node 0 / its own core) |
 | NUMA nodes in the memory policy masks | 1,024 | `MemsAllowed`, `ApplyProcessPlacement` (`runtime/numa_placement.cc`) | No | a higher memory node is not seen as allowed; preferring one is skipped with a warning |
+| SIMD width (DPDK paths and BESS kernels, D-126) | `auto`: DPDK's default, 256 bits on x86 (no AVX-512), unlimited on arm64; never above the CPU's | `arch::kDpdkDefaultSimdWidth` (`arch/dpdk_simd.h`, DPDK's `RTE_VECT_DEFAULT_SIMD_BITWIDTH`) | `--simd_width` (`auto`, `256`, `512`) | wider than the CPU: a WARNING, and the CPU's width; any other value refuses start-up |
 | Packet buffers | 262,144 | `--buffers` (`runtime/opts.cc`) | `--buffers` | allocation fails at start-up |
 | Packet data room | 2,048 B (`SNBUF_DATA`) | `--packet_data_room` | 1 to 65,535 − headroom (`kMaxPacketDataSize`, `packet.h`) | start-up refused |
 | Packet metadata area | 128 B | `SNBUF_METADATA` (`snbuf_layout.h`) | No | attributes that do not fit get no offset; their readers fail closed |

@@ -144,6 +144,7 @@ file is the reasoning.
 | D-121 | ExactMatch: a fused kernel for a key that is one packet field of 1, 2, 4 or 8 bytes (load, mask, CRC32C and key row in one pass, then a prehashed lookup), chosen when a generation is built; 33 fewer instructions per packet on M.exactmatch; the generic path for every other layout | accepted |
 | D-122 | Release artifacts for arm64 as well as x86_64: `publish-release` runs on `ubuntu-24.04` and `ubuntu-24.04-arm`; every file name carries the architecture (`SHA256SUMS-<machine>`) | accepted |
 | D-123 | Process placement: one memory node per bessd (chosen at startup from its CPUs' nodes and the memory it may use; everything allocated there), one reserved control CPU, automatic SMT-striped worker CPUs; anything on another node is diagnosed, never refused; only a CPU outside the set is an error | accepted |
+| D-126 | One SIMD width per process: `--simd_width=auto\|256\|512` and the CPU, decided once before the EAL, passed to DPDK as `--force-max-simd-bitwidth` (auto passes nothing: DPDK's 256 on x86) and to BESS kernels through `arch::RuntimeDispatch`, a function pointer resolved at startup; wider than the CPU is a warning; no AVX-512 kernel (no hardware) | accepted |
 | D-127 | Compiler tuning: a `tune` meson option (`-mtune`, empty by default, not passed to plugins); releases stay `-march=x86-64-v3` with the compiler's default tune (GCC: generic): on this host no `-mtune` (generic, graniterapids, znver5, native alderlake) is consistently faster with GCC 16, and Clang's best tune here is AMD's | accepted |
 
 
@@ -8886,6 +8887,122 @@ pipeline_plan,pipeline_snapshot,transaction}`, `core/bessctl.cc`, the tables' he
 `sdk/cpp`, `sdk/go`, `pybess/sdk.py`, `bessctl/main.cc`, `tools/check_includes.py`, `tools/tidy_baseline.json`,
 `docs/placement.md` (new), `docs/{running-in-containers,control-sdk,handoff,limits}.md`, `MODERNIZATION.md`.
 
+## D-126 One SIMD width per process: `--simd_width`, decided before the EAL; `RuntimeDispatch` for BESS kernels
+
+**Status:** accepted.
+
+**Problem.** Nothing in BESS decided how wide a vector path DPDK or BESS's own kernels take. DPDK has a process-wide
+limit, `max_simd_bitwidth`, that its PMDs and libraries consult before choosing a path; BESS never set it, so it was
+DPDK's x86 default, 256 bits, on every CPU: no AVX-512 path even where an operator wanted one, and no way to ask.
+BESS's ISA kernels (`core/arch/`) chose at compile time (`-Dcpu`, `x86-64-v3` in CI: `byte_match`, `crc32c`,
+`checksum_kernels`, `word_probe`, `vlan`, `tag_match`'s 16-bit compare) except one, CuckooMap's four-lane hash
+compare (`MatchHashes32x4`, D-034), which tested `__builtin_cpu_supports("avx2")` on every call from a function
+compiled for baseline x86-64.
+
+**Survey.**
+
+- **DPDK 25.11.** `RTE_VECT_DEFAULT_SIMD_BITWIDTH` is 256 on x86 (the same on every x86 CPU: DPDK does not look
+  at the CPU, it never enables AVX-512 by default), `RTE_VECT_SIMD_MAX` (unlimited) on arm64. The EAL option
+  `--force-max-simd-bitwidth=N` sets it while the arguments are parsed and marks it forced: a later
+  `rte_vect_set_max_simd_bitwidth()` returns `-EPERM`. The API route the DPDK guide gives ("call it before EAL
+  init") does not survive on Linux: `rte_eal_init()` calls `eal_reset_internal_config()` first, which restores the
+  default. Consumers of the limit: the vector Rx/Tx selection of most PMDs (AVX-512 paths in i40e, ice, iavf, idpf,
+  cpfl, virtio; 128/256 limits in mlx5, ixgbe, bnxt and others), ACL, FIB (`dir24_8`, `trie`), `rte_net_crc`,
+  `rte_member`, `rte_thash`, EFD, the distributor, `node/ip4_lookup`. Not consumers: `rte_lpm` (its x4 lookup is
+  fixed at DPDK's build) and `rte_hash` (signature compare chosen by CPU flags at table creation). Every consumer also
+  checks the CPU flag itself, so the limit only ever narrows.
+- **BESS.** No module uses a width-sensitive DPDK library (FIB and ACL only in `fib_bench`/`pmd_bench`); PMD ports
+  are where the limit matters. Of BESS's kernels only `MatchHashes32x4` has a runtime-selected variant; the rest are
+  one implementation per build. None has an AVX-512 variant.
+
+**Decision.**
+
+- **The flag.** `--simd_width=auto|256|512` (default `auto`; `BESSD_SIMD_WIDTH` from the environment, D-030); any
+  other value refuses start-up (gflags validator). `runtime::ResolveSimdWidth(request, CPU features, DPDK default)`
+  is a pure function: `auto` is DPDK's default within the CPU (x86 with AVX2: 256; arm64: 128) and passes nothing to
+  the EAL; `256`/`512` is the request within the CPU, passed as `--force-max-simd-bitwidth <width>`. A request beyond
+  the CPU (`512` without all of AVX-512 F, BW, CD, DQ and VL) is a WARNING and the CPU's width is used and given to
+  DPDK (D-123's diagnose-and-proceed rule); DPDK would refuse the AVX-512 paths on its own CPU checks anyway, so
+  the clamp only keeps the reported width true.
+- **Once, before the EAL.** `runtime::ProcessSimdWidth()` resolves `--simd_width` against `cpuid` on first use,
+  logs it and hands it to the kernels; `main` calls it right after placement, `init_eal` appends its EAL arguments.
+  Test and benchmark binaries that bring the EAL up lazily get `auto`'s width the same way.
+- **Diagnostics.** One INFO line, `simd: width 256 (requested auto; CPU 256, DPDK default 256)`, also
+  `GetCapabilities.simd` (field 12) with `simd_width` in bits (13), printed by `bessctl status`.
+- **`arch::RuntimeDispatch`** (`core/arch/simd_dispatch.h`, installed, experimental): a kernel's variants, widest
+  first, each with the width it needs (a width names an ISA level, DPDK's way: 128 SSE4.2/Advanced SIMD, 256 AVX2,
+  512 the x86-64-v4 AVX-512 set). The function pointer is chosen when the dispatcher is constructed and again by
+  `arch::SetSimdWidth()`, which `ProcessSimdWidth()` calls once before any worker runs; a call is one indirect call
+  and nothing is tested per packet. Dispatchers register in an intrusive list (inline function statics: one list in
+  bessd and the plugins it loads, which bind to bessd's exported definitions) and unregister on destruction (a
+  plugin unloaded). A program that never sets the width runs at `DefaultSimdWidth()`, `auto`'s width.
+- **Converted: `MatchHashes32x4` only.** Its AVX2 and scalar variants are a `RuntimeDispatch`; the per-call
+  `__builtin_cpu_supports` test and the baseline-x86-64 trampoline are gone. The other kernels have no second
+  variant: converting them would add an indirect call to a compile-time choice.
+- **No AVX-512 kernel.** None can be tested here (no AVX-512 on this host; CI's runners are not guaranteed to have it);
+  a kernel gets one with a test that runs it, on hardware that has it. The mechanism, the width plumbing and the
+  selection tests (fake CPU features) are in place for it.
+
+**Tests.** `runtime_simd_width_test`: parsing and the flag validator; the effective-width table (auto, 256 and 512
+against no vectors, SSE4.2/NEON, AVX2 and AVX-512, x86 and arm64 defaults); the warning text; a 512 request with
+only part of the AVX-512 set (F; F+BW; F+BW+VL; all but F) never selects a 512-bit variant; the EAL forced to the
+effective width (`rte_vect_get_max_simd_bitwidth()` equal to it, `rte_vect_set_max_simd_bitwidth()` refused with
+`-EPERM`). `arch_simd_dispatch_test`: widths of fake CPU features, variant selection, a dispatcher re-resolved by
+`SetSimdWidth()` and unregistered when destroyed, `MatchHashes32x4`'s variants equal at every width.
+`control_api_v2_test` (`CapabilitiesCarryTheSimdWidth`). `live_simd_width` (tests/live): bessd with
+`--simd_width=auto`, `256` and `512`, each forwarding for 1.5 s through Source -> Rewrite -> RandomUpdate ->
+ExactMatch (rte_hash) -> WildcardMatch -> IPLookup (rte_lpm) -> IPChecksum -> L4Checksum -> HashLB -> DRR (4,096
+source addresses behind a rate-limited task, so thousands of flows are queued at once and its CuckooMap needs 1,024
+buckets or more, where lookups take the dispatched compare; not observable from outside, so an inference; the
+in-process `utils_cuckoo_map_test` runs 200,000-entry maps through it) ->
+Sink; asserts the width (`GetCapabilities` and the log) against this CPU's features, the warning exactly when 512
+exceeds the CPU, the EAL argument exactly when forced, packets out of every module, and a shutdown that is a clean
+exit and in particular not SIGILL (`WIFSIGNALED && WTERMSIG == SIGILL` fails with its own message). On an AVX-512
+runner the 512 case expects 512.
+
+**Evidence.**
+
+- **Live, this host** (Intel hybrid, AVX2, no AVX-512): `live_simd_width` (GCC and Clang builds) logs
+  `simd: width 256 (requested auto; CPU 256, DPDK default 256)`, `... (requested 256; ...)` with EAL
+  `--force-max-simd-bitwidth 256`, and for 512 `simd: width 256 (requested 512; CPU 256, DPDK default 256)` with the
+  WARNING `--simd_width=512 requested, but this CPU lacks AVX-512 (F, BW, CD, DQ and VL): using 256 bits, its
+  widest, for DPDK and BESS kernels`; about 220,000 packets through every module in 1.5 s, exit 0, no signal, in
+  all three cases.
+- **Throughput, auto vs 256** (`live_perf`, the same `build/fast` binary twice, the second with
+  `--simd_width=256`, a new `current:<tree>:<builddir>:<flags>` form; 8 palindromic rounds, workers on CPUs 4 and 6,
+  control CPU 2, under `omarchy-benchmark --isolate`). Both runs resolve to the same width (256) on this CPU, so the
+  expectation is no difference; ns per packet (M tests above `M.base`), medians:
+
+  | test | auto | 256 | delta | pairs 256 faster | pair range |
+  |---|---:|---:|---:|---:|---:|
+  | M.base | 9.68 | 9.85 | +1.8% | 2/8 | -0.6..+8.8% |
+  | M.exactmatch | 20.03 | 19.89 | -0.7% | 3/8 | -5.6..+8.5% |
+  | M.wildcardmatch | 23.80 | 24.16 | +1.5% | 4/8 | -0.7..+6.7% |
+  | M.iplookup | 11.32 | 11.44 | +1.1% | 4/8 | -2.9..+13.8% |
+  | M.l2forward | 14.03 | 14.00 | -0.2% | 6/8 | -4.3..+10.8% |
+  | M.hashlb | 18.82 | 18.98 | +0.8% | 2/8 | -15.4..+7.5% |
+
+  Every delta is inside its pair range and no test is consistently faster either way: neutral. The run was not
+  clean: another agent's live_perf bessd shared the isolated CPUs for part of it and `--diagnose` reported IRQ and
+  softirq contamination (exit 2), which is what the wide pair ranges show; it bounds any effect at a few percent,
+  not finer.
+- **Not measured:** an AVX-512 host (none available); `--simd_width=512` against `auto` there is where DPDK's
+  AVX-512 PMD paths would differ, with a NIC.
+
+**Not done.** AVX-512 variants of BESS kernels (hardware-blocked, above). Found while writing the live test, not
+changed here: L4Checksum with `verify` false computes a TCP checksum and never emits the packet (an `else` without
+braces, `core/modules/l4_checksum.cc`), so TCP traffic stops there; and DRR behind a rate-limited traffic class
+forwarded exactly 2 x `num_flows` - 1 packets (8,191 for 4,096 flows, 32,767 for 16,384) in 1.5 s at a 1 Mpps
+limit, then nothing.
+
+**Code.** `core/arch/simd_dispatch.h` (new, installed, experimental in `tools/api_classes.json`),
+`core/arch/dpdk_simd.h` (new, internal), `core/arch/tag_match.h`, `core/runtime/simd_width.{h,cc}` (new),
+`core/runtime/{opts.h,opts.cc,dpdk.cc}`, `core/main.cc`, `core/control/api_v2.cc`, `bessctl/main.cc`,
+`protobuf/control_v2.proto` (`GetCapabilitiesResponse.simd` 12, `simd_width` 13), `sdk/go/controlv2` (regenerated),
+tests `core/arch/simd_dispatch_test.cc`, `core/runtime/simd_width_test.cc`, `core/control/api_v2_test.cc`,
+`tests/live/simd_width_test.cc` with `Daemon::Launch`/`Shutdown`/`Log` in `tests/live/live_daemon.{h,cc}`,
+`tools/live_perf.py` (flags in a build spec), docs `placement.md` (SIMD width), `control-sdk.md`, `limits.md`,
+`benchmarking.md`, `performance-clawback.md`, `MODERNIZATION.md` (D2 done).
 ## D-127 Compiler tuning: `-mtune` is an option, releases keep the compiler's default
 
 **Status:** accepted.

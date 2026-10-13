@@ -10,6 +10,7 @@
 #include <cstdint>
 
 #include "arch/cpu.h"
+#include "arch/simd_dispatch.h"
 
 #if defined(BESS_ARCH_X86) && defined(__SSE2__)
 #define BESS_ARCH_TAG_MATCH_SSE2 1
@@ -45,18 +46,18 @@ inline uint32_t MatchTags16x8(const uint16_t *tags, uint16_t tag) noexcept {
 }
 
 // Four 32-bit hashes (CuckooMap buckets). Where a vector version exists
-// (kMatchHashes32x4IsVector) it is compiled for AVX2 and chosen at run time:
-// the caller is built for baseline x86-64 and checks the CPU on each call
-// (one test of a flag the loader filled in), so the scalar compare remains
-// for CPUs without AVX2. D-034 measured it paying off only for tables of
-// 1024+ buckets; callers keep small tables on their own scalar loop.
+// (kMatchHashes32x4IsVector) it is compiled for AVX2 and chosen once, by the
+// process's SIMD width (arch/simd_dispatch.h, D-126): a call is one indirect
+// call, and the scalar compare remains for CPUs without AVX2. D-034 measured
+// it paying off only for tables of 1024+ buckets; callers keep small tables
+// on their own scalar loop.
 #if defined(BESS_ARCH_TAG_MATCH_AVX2_DISPATCH)
 inline constexpr bool kMatchHashes32x4IsVector = true;
 
 namespace detail {
 
-__attribute__((target("avx2"), noinline)) inline unsigned MatchHashes32x4Avx2(
-    const uint32_t *hashes, uint32_t hash) {
+__attribute__((target("avx2"))) inline unsigned MatchHashes32x4Avx2(
+    const uint32_t *hashes, uint32_t hash) noexcept {
   namespace stdx = std::experimental;
   using v4u32 = stdx::fixed_size_simd<uint32_t, 4>;
   const v4u32 values(hashes, stdx::element_aligned);
@@ -71,22 +72,23 @@ __attribute__((target("avx2"), noinline)) inline unsigned MatchHashes32x4Avx2(
   return mask;
 }
 
-}  // namespace detail
-
-__attribute__((target("arch=x86-64,no-avx,no-avx2,no-bmi,no-bmi2"),
-               noinline)) inline unsigned
-MatchHashes32x4(const uint32_t *hashes, uint32_t hash) {
-  if (__builtin_cpu_supports("avx2")) {
-    return detail::MatchHashes32x4Avx2(hashes, hash);
-  }
-
+inline unsigned MatchHashes32x4Scalar(const uint32_t *hashes,
+                                      uint32_t hash) noexcept {
   unsigned mask = 0;
   for (unsigned i = 0; i < 4; ++i) {
-    if (hashes[i] == hash) {
-      mask |= 1u << i;
-    }
+    mask |= static_cast<unsigned>(hashes[i] == hash) << i;
   }
   return mask;
+}
+
+inline RuntimeDispatch<unsigned(const uint32_t *, uint32_t) noexcept, 2>
+    match_hashes_32x4{{{{kSimd256, &MatchHashes32x4Avx2},
+                        {kSimdScalar, &MatchHashes32x4Scalar}}}};
+
+}  // namespace detail
+
+inline unsigned MatchHashes32x4(const uint32_t *hashes, uint32_t hash) noexcept {
+  return detail::match_hashes_32x4(hashes, hash);
 }
 #else
 inline constexpr bool kMatchHashes32x4IsVector = false;

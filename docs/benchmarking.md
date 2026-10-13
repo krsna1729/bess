@@ -191,6 +191,10 @@ pool and batch dispatch. If one `M` delta moves alone, the cost is in that modul
         --build master --build current:<tree> --rounds 8 --save run.json
     tools/live_perf.py --build current --tests F --baseline run.json --threshold 5   # exits 1 on a regression
 
+A build may also name its build directory and bessd flags, comma-separated: `current:<tree>:<builddir>:<flags>`.
+The same binary under different flags is then two builds, paired like any others (D-126 compared
+`current:<tree>:build/fast` with `current:<tree>:build/fast:--simd_width=256`).
+
 Give every thread that is not a worker its own isolated CPU, the lowest of the set, and put the workers above it.
 The isolated partition holds only what the wrapper starts, but inside it the kernel balances threads freely.
 bessd keeps its control threads (main, gRPC, DPDK service threads) off worker CPUs (D-027), within its starting

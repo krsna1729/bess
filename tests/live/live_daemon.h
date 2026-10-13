@@ -21,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "bess/sdk/client.h"
@@ -114,11 +115,23 @@ class Daemon {
   // as after a restart in place (bessd -k).
   void RestartInPlace();
 
+  // A daemon of its own, started with `flags` after the usual ones (Shared()
+  // takes none). Stopped when destroyed, unless Shutdown() ran.
+  static std::unique_ptr<Daemon> Launch(std::vector<std::string> flags);
+  // What it has logged so far (standard output and error).
+  std::string Log() const;
+  // Asks it to shut down and waits (SIGKILL after 10 s): waitpid's raw
+  // status, so a caller can tell a signal (WIFSIGNALED, WTERMSIG) from an
+  // exit; -1 when it was not running.
+  int Shutdown();
+
  private:
   Daemon() = default;
+  explicit Daemon(std::vector<std::string> flags) : flags_(std::move(flags)) {}
   void Start(int port = 0);  // 0: a free port
   void Stop();
 
+  std::vector<std::string> flags_;
   int pid_ = -1;
   std::string address_;
   std::string log_path_;

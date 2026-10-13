@@ -19,6 +19,7 @@
 #include "debug.h"
 #include "runtime/opts.h"
 #include "runtime/numa_placement.h"
+#include "runtime/simd_width.h"
 #include "packet_pool.h"
 #include "runtime/startup.h"
 #include "port.h"
@@ -104,6 +105,10 @@ int main(int argc, char *argv[]) {
   // One memory node, control CPUs (D-123): resolved and logged once, and
   // the node preferred for normal memory before any thread exists.
   bess::runtime::ApplyProcessPlacement();
+
+  // The SIMD width DPDK and BESS's kernels use (D-126): resolved, logged and
+  // applied to the kernels once, before plugins load and the EAL starts.
+  bess::runtime::ProcessSimdWidth();
 
   // Load plugins
   if (!bess::framework::LoadPlugins(FLAGS_modules)) {

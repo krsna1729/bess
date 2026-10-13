@@ -431,6 +431,11 @@ message GetCapabilitiesResponse {
   // CPUs available Y") and the memory node every allocation uses.
   string placement = 10;
   int32 memory_node = 11;
+  // SIMD width (D-126): the summary bessd logged at startup ("simd: width W
+  // (requested R; CPU C, DPDK default D)") and W, the widest vectors DPDK and
+  // BESS kernels use, in bits.
+  string simd = 12;
+  uint32 simd_width = 13;
 }
 
 // -- Schema discovery (D-105) ---------------------------------------------

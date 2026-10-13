@@ -26,6 +26,7 @@ DECLARE_string(dpdk_trace);
 DECLARE_string(dpdk_trace_dir);
 DECLARE_bool(skip_root_check);
 DECLARE_string(modules);
+DECLARE_string(simd_width);
 DECLARE_bool(core_dump);
 DECLARE_bool(no_crashlog);
 DECLARE_int32(buffers);

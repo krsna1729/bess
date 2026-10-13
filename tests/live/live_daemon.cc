@@ -328,9 +328,10 @@ void Daemon::Start(int port) {
   char log_template[] = "/tmp/bessd-live-XXXXXX";
   const int log_fd = mkstemp(log_template);
   log_path_ = log_template;
-  const std::vector<std::string> argv = {Env("BESSD"),       "-f", "-m", "0", "-p",
-                                         std::to_string(port), "-skip_root_check",
-                                         "-dpdk=false"};
+  std::vector<std::string> argv = {Env("BESSD"),       "-f", "-m", "0", "-p",
+                                   std::to_string(port), "-skip_root_check",
+                                   "-dpdk=false"};
+  argv.insert(argv.end(), flags_.begin(), flags_.end());
   posix_spawn_file_actions_t actions;
   posix_spawn_file_actions_init(&actions);
   posix_spawn_file_actions_adddup2(&actions, log_fd, 1);
@@ -363,9 +364,9 @@ void Daemon::Start(int port) {
   ADD_FAILURE() << "bessd did not answer within 30 s:\n" << ReadFile(log_path_);
 }
 
-void Daemon::Stop() {
+int Daemon::Shutdown() {
   if (pid_ <= 0) {
-    return;
+    return -1;
   }
   (void)client_->Shutdown();  // it answers, then stops
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -379,8 +380,24 @@ void Daemon::Stop() {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
   pid_ = -1;
-  unlink(log_path_.c_str());
+  return status;
 }
+
+void Daemon::Stop() {
+  (void)Shutdown();
+  if (!log_path_.empty()) {
+    unlink(log_path_.c_str());
+    log_path_.clear();
+  }
+}
+
+std::unique_ptr<Daemon> Daemon::Launch(std::vector<std::string> flags) {
+  std::unique_ptr<Daemon> d(new Daemon(std::move(flags)));
+  d->Start();
+  return d;
+}
+
+std::string Daemon::Log() const { return ReadFile(log_path_); }
 
 void Daemon::Restart() {
   Stop();

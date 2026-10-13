@@ -136,6 +136,38 @@ node, each with that node's NICs.
 - **Multi-node hosts:** one bessd per node, each with `--numa_node` (or a CPU
   set and NICs on that node) and its own RPC address.
 
+## SIMD width
+
+How wide a vector path DPDK and BESS's own kernels may take is decided once,
+at startup, before the EAL starts (Decision D-126): `--simd_width=auto|256|512`
+(default `auto`; `BESSD_SIMD_WIDTH` in the environment).
+
+| `--simd_width` | DPDK | BESS kernels |
+|---|---|---|
+| `auto` | nothing passed: DPDK's own default, 256 bits on x86 whatever the CPU (no AVX-512 path), unlimited on arm64 | the same width, within the CPU's (x86: 256 with AVX2; arm64: 128) |
+| `256` | `--force-max-simd-bitwidth 256` | 256 |
+| `512` | `--force-max-simd-bitwidth 512` | 512 (no BESS kernel has an AVX-512 variant yet) |
+
+A width the CPU lacks (`512` without AVX-512 F, BW, CD, DQ and VL) is a
+WARNING, and bessd proceeds with the CPU's widest (256 with AVX2), which is
+also what DPDK is given. Forced, DPDK holds the width for the life of the
+process. DPDK limits by it the vector Rx/Tx paths of most PMDs (the AVX-512
+ones: i40e, ice, iavf, idpf, cpfl, virtio), ACL classify, FIB lookup,
+`rte_net_crc`, `rte_member`, `rte_thash`, EFD and the distributor. `rte_lpm`
+(fixed at DPDK's build) and `rte_hash` (CPU flags at table creation) ignore it.
+
+One INFO line at startup, also `GetCapabilities` `simd` (with the width in
+bits, `simd_width`) and in `bessctl status`:
+
+```
+simd: width 256 (requested auto; CPU 256, DPDK default 256)
+```
+
+A BESS kernel with variants for several widths is a `bess::arch::RuntimeDispatch`
+(`core/arch/simd_dispatch.h`): its function pointer is chosen for the width
+when bessd starts, never per packet. A program that does not set the width
+(tests, benchmarks) runs at `auto`'s width.
+
 ## Scenarios
 
 Each row is one test of `core/runtime/numa_placement_test.cc`

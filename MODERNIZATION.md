@@ -9402,7 +9402,7 @@ Architecture-specific implementations should have explicit interfaces and batch-
 
 Do not scatter ISA checks through per-packet code.
 
-### D2 — runtime SIMD policy
+### D2 — runtime SIMD policy — DONE (D-126)
 
 Detect what the CPU supports, but also allow a configured maximum implementation.
 
@@ -9419,6 +9419,14 @@ selected kernel
 Supporting AVX-512 does not mean every workload should always use it.
 
 Selection should occur outside the inner packet loop.
+
+Done in D-126: `--simd_width=auto|256|512` is the configured maximum, the
+CPU's features (cpuid) the available ISA; the smaller is decided once before
+the EAL starts and passed to DPDK as `--force-max-simd-bitwidth`.
+`bess::arch::RuntimeDispatch` (`core/arch/simd_dispatch.h`) resolves a
+kernel's function pointer for that width at startup; `MatchHashes32x4`
+(CuckooMap) is the one kernel with a runtime-selected variant. No BESS kernel
+has an AVX-512 variant: there is no AVX-512 hardware to test one on.
 
 ### D3 — `rte_bpf` experiment — NOT STARTED
 
@@ -10518,7 +10526,7 @@ Its later, refined list (which supersedes the first) is the basis of Phase L.
 | Prefetch-distance sweep (0..12) | **Subsumed** — whole-batch staging (distance = batch) wins for <= 32; revisit only with larger batches (L4) |
 | Fluent pipeline API, coroutines/`std::generator`, virtual stages, `std::function` | **Rejected** — per-packet overhead; both reviews agreed |
 | `llring` vs modern `rte_ring` | **Done** — `llring` deleted (entry 28) |
-| Multiarch runtime dispatch | **Planned** — Phase D2 (runtime SIMD policy) |
+| Multiarch runtime dispatch | **Done** — D-126: `--simd_width`, `arch::RuntimeDispatch` resolved once at startup |
 | Compile-time width policy / `static_for` | **Not needed** — no width parameter survived the ILP result |
 
 ### Guiding rule: the module author's default experience does not change

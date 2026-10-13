@@ -10,6 +10,7 @@ live_test_sources = [
   'match_modules_test.cc',
   'metrics_test.cc',
   'module_traffic_test.cc',
+  'simd_width_test.cc',
   'stateful_modules_test.cc',
 ]
 live_lib = static_library(
@@ -18,8 +19,11 @@ live_lib = static_library(
   implicit_include_directories: false,
   dependencies: [bess_sdk_dep, gtest_dep],
 )
-# packet_builder.h (header-only, std only) for test packets.
+# packet_builder.h (header-only, std only) for test packets; simd_width_test
+# also reads the CPU's vector features from arch/simd_dispatch.h (installed,
+# self-contained), the way bessd does, to know the width to expect.
 live_inc = include_directories('../../core/testing')
+live_arch_inc = include_directories('../../core')
 live_env = {
   'BESSD': bessd.full_path(),
   'BESSCTL': bessctl_link.full_path(),  # bessd, as installed (D-120)
@@ -34,7 +38,7 @@ foreach source : live_test_sources
     name,
     source,
     implicit_include_directories: false,
-    include_directories: live_inc,
+    include_directories: source == 'simd_width_test.cc' ? [live_inc, live_arch_inc] : live_inc,
     link_with: live_lib,
     dependencies: [bess_sdk_dep, gtest_dep, dependency('gtest_main', method: 'pkg-config')],
   )

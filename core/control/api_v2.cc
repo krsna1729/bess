@@ -36,6 +36,7 @@
 #include "port.h"
 #include "runtime/runtime_state.h"
 #include "runtime/numa_placement.h"
+#include "runtime/simd_width.h"
 #include "stats/event_hub.h"
 #include "control/wire_narrow.h"
 #include "worker.h"
@@ -909,6 +910,9 @@ grpc::Status ControlV2Service::GetCapabilities(grpc::ServerContext *,
   const runtime::Placement &placement = runtime::ProcessPlacement();
   response->set_placement(placement.Summary());
   response->set_memory_node(placement.node);
+  const runtime::SimdWidth &simd = runtime::ProcessSimdWidth();
+  response->set_simd(simd.Summary());
+  response->set_simd_width(simd.effective);
   return grpc::Status::OK;
 }
 

@@ -5,6 +5,7 @@
 #include "dpdk.h"
 #include "runtime/numa_placement.h"
 #include "runtime/thread_placement.h"
+#include "runtime/simd_width.h"
 #include "runtime/startup.h"
 
 #include <syslog.h>
@@ -216,6 +217,15 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
     // shared with other DPDK processes -- what a container wants. One file
     // descriptor per memory segment list instead of one per page.
     rte_args.Append({"--in-memory", "--single-file-segments"});
+  }
+
+  // The SIMD width (D-126), decided once before the EAL: under auto nothing,
+  // else --force-max-simd-bitwidth, which DPDK applies while parsing these
+  // arguments and then holds (rte_vect_set_max_simd_bitwidth() returns
+  // -EPERM). Setting it through that function before rte_eal_init() would
+  // not survive: rte_eal_init() resets its internal configuration first.
+  for (const std::string &arg : runtime::ProcessSimdWidth().eal_args) {
+    rte_args.Append({arg});
   }
 
   // reset getopt()

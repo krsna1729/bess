@@ -38,6 +38,7 @@
     "arch/crc32c.h": "experimental",
     "arch/fp_env.h": "experimental",
     "arch/signal_context.h": "experimental",
+    "arch/simd_dispatch.h": "experimental",
     "arch/tag_match.h": "experimental",
     "arch/vlan.h": "experimental",
     "arch/word_probe.h": "experimental",

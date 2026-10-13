@@ -4,6 +4,7 @@
 #include "runtime/opts.h"
 #include "runtime/thread_placement.h"
 #include "runtime/numa_placement.h"
+#include "runtime/simd_width.h"
 #include "utils/logging.h"
 
 #include <cstdint>
@@ -164,6 +165,23 @@ DEFINE_string(pci_allow, "",
               "(PCIDEVICE_* environment), else every device DPDK can use");
 static const bool _m_dummy[[maybe_unused]] =
     google::RegisterFlagValidator(&FLAGS_m, &ValidateMegabytesPerSocket);
+
+// One SIMD width for DPDK and BESS's kernels, set before the EAL starts
+// (D-126).
+DEFINE_string(simd_width, "auto",
+              "Widest SIMD paths DPDK and BESS kernels may take: 'auto' "
+              "(DPDK's default: 256 bits on x86, so no AVX-512), '256' or "
+              "'512'. Wider than the CPU: a warning, and the CPU's width");
+static bool ValidateSimdWidth(const char *, const std::string &value) {
+  if (!bess::runtime::ParseSimdWidthRequest(value)) {
+    LOG(ERROR) << "--simd_width='" << value
+               << "' is neither 'auto', '256' nor '512'";
+    return false;
+  }
+  return true;
+}
+static const bool _simd_width_dummy[[maybe_unused]] =
+    google::RegisterFlagValidator(&FLAGS_simd_width, &ValidateSimdWidth);
 
 static bool ValidateBuffersPerSocket(const char *, int32_t value) {
   if (value <= 0) {
