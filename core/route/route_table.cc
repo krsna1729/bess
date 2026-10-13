@@ -108,10 +108,11 @@ LpmRouteTable::NewInstance(uint32_t default_value) {
     conf.rib_ext_sz = 0;
     conf.dir24_8.nh_sz = RTE_FIB_DIR24_8_4B;
     // One group beyond the budget (FibAdmits): install_to_fib() wants two
-    // free groups to place a range that needs one, so with the budget spent
-    // a re-point of a block whose group was merged away, or the add of a
-    // range ending on a /24 boundary, would otherwise fail where rte_lpm's
-    // cannot. rte_fib rounds the pool up to a multiple of 64.
+    // free groups to add a rule longer than /24 whose range ends on a /24
+    // boundary, though it needs one, so with the budget spent that add would
+    // otherwise fail where rte_lpm's cannot. (Changes and deletes never
+    // allocate: deps/dpdk-patches/0005.) rte_fib rounds the pool up to a
+    // multiple of 64.
     if (config_.tbl8_groups == UINT32_MAX) {
       return std::unexpected(RouteError::kBackendFailure);
     }

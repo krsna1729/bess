@@ -105,7 +105,7 @@ with no patches DPDK is pristine and an existing install is not rebuilt.
 `tools/bootstrap_dpdk.py --check-patches` checks them (CI: the `layers` step),
 and `build-info.json` lists them under `dpdk.patches`. How to add one, the
 trailers and the rule on a DPDK upgrade: `deps/dpdk-patches/README.md`. The
-series today is four `rte_fib` fixes, for the `rte_fib` route backend (D-132).
+series today is four `rte_fib` fixes and one `rte_fib6` fix, for the `rte_fib` route backend (D-132).
 
 ### Build profiles
 
@@ -10263,10 +10263,10 @@ Build the new classifier framework with explicit modern semantics.
 
 D-130 (2026-10-13) root-caused the old correctness failures to an `rte_fib` defect
 (DIR24_8's update loop wraps at 255.255.255.255 and overwrites the whole table).
-D-132 carries the fix and two more `rte_fib` fixes as local DPDK patches (D-131) and
+D-132 carries the fix (and its `rte_fib6` twin) and three more `rte_fib` fixes as local DPDK patches (D-131) and
 offers `rte_fib` as `backend: ROUTE_BACKEND_FIB` on IPLookup and Router, with the
-same limits and errors as `rte_lpm`. `RteFibTest.*` in `route_route_test` fails if a
-build's DPDK lacks a patch; the randomised oracle runs on both backends.
+same limits and errors as `rte_lpm`. `RteFibTest.*` and the `/Fib` route tests in `route_route_test` fail if a
+build's DPDK lacks 0001, 0004 or 0005; the randomised oracle runs on both backends.
 
 #### Do not treat RCU as a multi-writer synchronization primitive
 

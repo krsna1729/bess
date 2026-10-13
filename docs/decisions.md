@@ -149,7 +149,7 @@ file is the reasoning.
 | D-127 | Compiler tuning: a `tune` meson option (`-mtune`, empty by default, not passed to plugins); releases stay `-march=x86-64-v3` with the compiler's default tune (GCC: generic): on this host no `-mtune` (generic, graniterapids, znver5, native alderlake) is consistently faster with GCC 16, and Clang's best tune here is AMD's | accepted |
 | D-130 | `rte_fib` re-trial: the D-003 failure is an `rte_fib` defect (DIR24_8 update loop wraps at 255.255.255.255 and overwrites the whole table), not BESS usage; `rte_lpm` stays; the re-trial is a unit test that fails when DPDK fixes it | accepted |
 | D-131 | Local DPDK patches: `deps/dpdk-patches/NNNN-<slug>.patch` (format-patch, `Upstream-Status` and `BESS-Decision` trailers) applied in order by the bootstrap; a series stamp in the source tree and each install re-extracts or reinstalls on change; `--check-patches` in CI; build-info and the SBOM list the series | accepted |
-| D-132 | `rte_fib` as a selectable route backend (`backend` on IPLookup and Router; `rte_lpm` stays the default): four carried DPDK patches, `rte_lpm`'s limits and errors enforced by the table, the defer queue sized to the pool, x86-64 only (plain stores); cheaper changes at every size and faster batch lookups, equal in a small table | accepted |
+| D-132 | `rte_fib` as a selectable route backend (`backend` on IPLookup and Router; `rte_lpm` stays the default): five carried DPDK patches (one gives `rte_fib` `rte_lpm`'s tbl8 group lifetime, so changes and deletes never allocate), `rte_lpm`'s limits and errors enforced by the table, the defer queue sized to the pool, x86-64 only (plain stores); cheaper changes at every size and faster batch lookups, equal in a small table | accepted |
 
 
 ---
@@ -321,7 +321,7 @@ revisit when IPv6 routing is needed (`rte_lpm6` or `rte_fib6`, measured the
 same way; D-130 notes `rte_fib6` has the same loop).
 
 **Amended by D-132 (2026-10-13):** `rte_fib` is now a selectable backend, with
-D-130's fix and three more carried as DPDK patches; `rte_lpm` stays the
+D-130's fix and four more carried as DPDK patches; `rte_lpm` stays the
 default.
 
 ## D-004 Update modes: concurrent (C) and per-worker (W); generation swap (G) only for bulk loads
