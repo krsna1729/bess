@@ -1,0 +1,175 @@
+From 112bfac309ebe43094e2f8fe3a0efa8742c75c34 Mon Sep 17 00:00:00 2001
+From: Saikrishna Edupuganti <6157640+krsna1729@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 23:12:33 +0530
+Subject: [PATCH] fib: keep tbl8 group while its /24 holds a longer rule
+
+dir24_8 folds a tbl8 group back into its tbl24 entry as soon as all 256
+entries hold one next hop, and adds a rule longer than /24 without a
+group when its next hop equals its parent's. Such a /24 needs a group
+again as soon as a covering rule changes: a later next-hop update or
+delete of the covering rule must allocate, once per such /24 in its
+range. When none is free (all of them reserved, or freed ones still
+waiting in the RCU defer queue), that update or delete fails with
+-ENOSPC after the gaps before the failing one were already written, so
+the table and the RIB disagree. A delete can fail this way too, which
+a caller cannot recover from.
+
+Give each /24 that holds a rule longer than /24 its group for as long
+as such a rule exists, as rte_lpm does: an add of the first such rule
+in a /24 always allocates, a group is not folded while such a rule
+remains, and the delete of the last one folds it. Changing or deleting
+an existing rule then never allocates, and an add allocates before it
+writes anything, so a failed add changes nothing. rsvd_tbl8s, which
+already counts these /24s, now matches the groups in use.
+
+The /24s are tracked in a bitmap (2 MiB, one bit per tbl24 entry), set
+and cleared where rsvd_tbl8s changes, so the check in tbl8_recycle()
+costs one load. The lookup path is unchanged.
+
+Upstream-Status: Pending
+BESS-Decision: D-132
+---
+ lib/fib/dir24_8.c | 63 ++++++++++++++++++++++++++++++++++++++++++++---
+ lib/fib/dir24_8.h |  2 ++
+ 2 files changed, 62 insertions(+), 3 deletions(-)
+
+diff --git a/lib/fib/dir24_8.c b/lib/fib/dir24_8.c
+index 6ec5f03..55b8b62 100644
+--- a/lib/fib/dir24_8.c
++++ b/lib/fib/dir24_8.c
+@@ -252,6 +252,29 @@ __rcu_qsbr_free_resource(void *p, void *data, unsigned int n __rte_unused)
+ 	tbl8_cleanup_and_free(dp, tbl8_idx);
+ }
+ 
++/*
++ * Whether the /24 of ip holds a rule longer than /24. Its tbl8 group lives
++ * exactly as long as that, as in rte_lpm, so changing or deleting an existing
++ * rule never needs a new group.
++ */
++static inline bool
++deep24_test(const struct dir24_8_tbl *dp, uint32_t ip)
++{
++	return (dp->deep24[ip >> 14] >> ((ip >> 8) & 63)) & 1;
++}
++
++static inline void
++deep24_set(struct dir24_8_tbl *dp, uint32_t ip)
++{
++	dp->deep24[ip >> 14] |= 1ULL << ((ip >> 8) & 63);
++}
++
++static inline void
++deep24_clear(struct dir24_8_tbl *dp, uint32_t ip)
++{
++	dp->deep24[ip >> 14] &= ~(1ULL << ((ip >> 8) & 63));
++}
++
+ static void
+ tbl8_recycle(struct dir24_8_tbl *dp, uint32_t ip, uint64_t tbl8_idx)
+ {
+@@ -262,6 +285,9 @@ tbl8_recycle(struct dir24_8_tbl *dp, uint32_t ip, uint64_t tbl8_idx)
+ 	uint32_t *ptr32;
+ 	uint64_t *ptr64;
+ 
++	if (deep24_test(dp, ip))
++		return;
++
+ 	switch (dp->nh_sz) {
+ 	case RTE_FIB_DIR24_8_1B:
+ 		ptr8 = &((uint8_t *)dp->tbl8)[tbl8_idx *
+@@ -487,7 +513,7 @@ dir24_8_modify(struct rte_fib *fib, uint32_t ip, uint8_t depth,
+ 	struct rte_rib_node *node;
+ 	struct rte_rib_node *parent;
+ 	int ret = 0;
+-	uint64_t par_nh, node_nh;
++	uint64_t par_nh, node_nh, tbl24_ent;
+ 
+ 	if ((fib == NULL) || (depth > RTE_FIB_MAXDEPTH))
+ 		return -EINVAL;
+@@ -526,14 +552,23 @@ dir24_8_modify(struct rte_fib *fib, uint32_t ip, uint8_t depth,
+ 		if (node == NULL)
+ 			return -rte_errno;
+ 		rte_rib_set_nh(node, next_hop);
++		/*
++		 * The first rule longer than /24 in a /24 gets its tbl8 group
++		 * even when it changes no next hop, so that a later change of a
++		 * covering rule never needs one.
++		 */
++		if ((depth > 24) && (tmp == NULL))
++			deep24_set(dp, ip);
+ 		parent = rte_rib_lookup_parent(node);
+-		if (parent != NULL) {
++		if ((parent != NULL) && !((depth > 24) && (tmp == NULL))) {
+ 			rte_rib_get_nh(parent, &par_nh);
+ 			if (par_nh == next_hop)
+ 				goto successfully_added;
+ 		}
+ 		ret = modify_fib(dp, rib, ip, depth, next_hop);
+ 		if (ret != 0) {
++			if ((depth > 24) && (tmp == NULL))
++				deep24_clear(dp, ip);
+ 			rte_rib_remove(rib, ip, depth);
+ 			return ret;
+ 		}
+@@ -558,8 +593,17 @@ dir24_8_modify(struct rte_fib *fib, uint32_t ip, uint8_t depth,
+ 			if (depth > 24) {
+ 				tmp = rte_rib_get_nxt(rib, ip, 24, NULL,
+ 					RTE_RIB_GET_NXT_COVER);
+-				if (tmp == NULL)
++				if (tmp == NULL) {
+ 					dp->rsvd_tbl8s--;
++					/* the last one: fold its group */
++					deep24_clear(dp, ip);
++					tbl24_ent = get_tbl24(dp, ip,
++						dp->nh_sz);
++					if ((tbl24_ent & DIR24_8_EXT_ENT) ==
++							DIR24_8_EXT_ENT)
++						tbl8_recycle(dp, ip,
++							tbl24_ent >> 1);
++				}
+ 			}
+ 		}
+ 		return ret;
+@@ -632,6 +676,18 @@ dir24_8_create(const char *name, int socket_id, struct rte_fib_conf *fib_conf)
+ 		return NULL;
+ 	}
+ 
++	snprintf(mem_name, sizeof(mem_name), "DEEP24_%p", dp);
++	dp->deep24 = rte_zmalloc_socket(mem_name,
++			DIR24_8_TBL24_NUM_ENT >> 3,
++			RTE_CACHE_LINE_SIZE, socket_id);
++	if (dp->deep24 == NULL) {
++		rte_errno = ENOMEM;
++		rte_free(dp->tbl8_idxes);
++		rte_free(dp->tbl8);
++		rte_free(dp);
++		return NULL;
++	}
++
+ 	return dp;
+ }
+ 
+@@ -641,6 +697,7 @@ dir24_8_free(void *p)
+ 	struct dir24_8_tbl *dp = (struct dir24_8_tbl *)p;
+ 
+ 	rte_rcu_qsbr_dq_delete(dp->dq);
++	rte_free(dp->deep24);
+ 	rte_free(dp->tbl8_idxes);
+ 	rte_free(dp->tbl8);
+ 	rte_free(dp);
+diff --git a/lib/fib/dir24_8.h b/lib/fib/dir24_8.h
+index b343b5d..f65c0c0 100644
+--- a/lib/fib/dir24_8.h
++++ b/lib/fib/dir24_8.h
+@@ -40,6 +40,8 @@ struct dir24_8_tbl {
+ 	uint64_t	def_nh;		/**< Default next hop */
+ 	uint64_t	*tbl8;		/**< tbl8 table. */
+ 	uint64_t	*tbl8_idxes;	/**< bitmap containing free tbl8 idxes*/
++	/** bitmap of the /24s that hold a rule longer than /24 */
++	uint64_t	*deep24;
+ 	/* tbl24 table. */
+ 	alignas(RTE_CACHE_LINE_SIZE) uint64_t	tbl24[];
+ };
+-- 
+2.55.0
+

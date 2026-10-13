@@ -397,6 +397,51 @@ TEST_P(RouteTableTest, DeletesNeverFailWithAStalledReader) {
   domain.Unregister(kReader);
 }
 
+// The other half of what the transactional route resources depend on
+// (router.cc, lpm_resource.h CHECK it): changing or deleting an existing rule
+// never fails, even with the budget spent and the free groups gone to adds
+// while a stalled reader holds freed ones in the defer queue. The /25 repeats
+// its covering /16's value: rte_fib folded such a /24's group away and needed
+// a new one for any later change of the /16 until deps/dpdk-patches/0005.
+TEST_P(RouteTableTest, ChangesAndDeletesNeverFailWithAStalledReader) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  const bool fib = bess::testing::TestRouteBackend() == RouteBackend::kRteFib;
+  const GroupPool pool = fib ? GroupPool{63, 1} : GroupPool{2, 0};
+  auto table = MakeTable(256, pool.budget);
+  const Ipv4Prefix cover = P(Ip(10, 0, 0, 0), 16);
+  const Ipv4Prefix deep = P(Ip(10, 0, 1, 0), 25);
+  ASSERT_TRUE(table->Upsert(cover, Value(1)));
+  ASSERT_TRUE(table->Upsert(deep, Value(1)));
+  auto block = [](uint32_t i) { return P(Ip(10, 1, i, 64), 26); };
+  for (uint32_t i = 0; i + 1 < pool.budget; i++) {
+    ASSERT_TRUE(table->Upsert(block(i), Value(2)));
+  }
+  constexpr uint32_t kReader = 24;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);  // and never quiescent until the end
+  // Free groups go to new /24s while the freed ones wait for the reader.
+  for (uint32_t i = 0; i < 4 && i + 1 < pool.budget; i++) {
+    ASSERT_TRUE(table->Erase(block(i)));
+    static_cast<void>(table->Upsert(P(Ip(10, 2, i, 64), 26), Value(3)));
+  }
+  EXPECT_TRUE(table->Upsert(cover, Value(9))) << "re-point";
+  EXPECT_EQ(Value(1), table->Read().Lookup(Ip(10, 0, 1, 1)));
+  EXPECT_EQ(Value(9), table->Read().Lookup(Ip(10, 0, 1, 200)));
+  EXPECT_EQ(Value(9), table->Read().Lookup(Ip(10, 0, 200, 1)));
+  EXPECT_TRUE(table->Upsert(deep, Value(9))) << "re-point the deep rule";
+  EXPECT_TRUE(table->Upsert(cover, Value(1))) << "re-point back";
+  EXPECT_EQ(Value(9), table->Read().Lookup(Ip(10, 0, 1, 1)));
+  EXPECT_EQ(Value(1), table->Read().Lookup(Ip(10, 0, 1, 200)));
+  EXPECT_TRUE(table->Erase(cover)) << "delete the cover";
+  EXPECT_EQ(Value(9), table->Read().Lookup(Ip(10, 0, 1, 1)));
+  EXPECT_FALSE(table->Read().Lookup(Ip(10, 0, 1, 200)).has_value());
+  EXPECT_TRUE(table->Erase(deep)) << "delete the deep rule";
+  EXPECT_FALSE(table->Read().Lookup(Ip(10, 0, 1, 1)).has_value());
+  domain.Quiescent(kReader);
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
+}
+
 // Readers (registered RCU readers reporting quiescence between batches, as
 // workers do) look up a fixed key set while the writer churns /26 routes,
 // each of which needs a tbl8 group. The pool is deliberately tiny, so nearly
@@ -1061,32 +1106,35 @@ TEST(RteFibTest, D130PatchIsInEffect) {
   EXPECT_EQ(7u, RunDefaultOverClassDE(2)) << "delete 0/0" << kMissing;
 }
 
-// deps/dpdk-patches/0003 (D-132): a re-point (existing prefix, new next hop)
-// returned 0 even when the table update failed, leaving the old next hop in
-// place. Here the update needs a group because the /25 under the /23 has the
-// /23's next hop (so its /24 kept no group); install_to_fib() then wants two
-// free groups for that range and only one is left. (Two are more than the
-// range needs, so this -ENOSPC is itself early -- the backend gives rte_fib
-// one spare group for it -- but the patch is about reporting it.)
-TEST(RteFibTest, D132FailedRepointIsReported) {
+// deps/dpdk-patches/0005 (D-132): a /24 that holds a rule longer than /24
+// keeps its tbl8 group for as long as it holds one, as in rte_lpm, so
+// changing or deleting an existing rule never needs a new group. Unpatched,
+// the /25 below, which repeats the /23's next hop, gets no group, and the
+// re-point of the /23 then needs one where none is left (-ENOSPC; before
+// 0003 it even reported success).
+TEST(RteFibTest, D132ChangesNeverAllocate) {
   constexpr uint32_t kGroups = 64;
   RteFib fib(256, kGroups);
   ASSERT_TRUE(fib.ok());
   ASSERT_EQ(0, fib.Add(P(Ip(10, 0, 0, 0), 23), 1));
   ASSERT_EQ(0, fib.Add(P(Ip(10, 0, 0, 0), 25), 1));
-  // kGroups - 1 /25s elsewhere take all groups but one.
+  // The other kGroups - 1 groups.
   for (uint32_t i = 0; i + 1 < kGroups; i++) {
     ASSERT_EQ(0, fib.Add(P(Ip(20, 0, i, 0), 25), 2)) << i;
   }
-  EXPECT_EQ(-ENOSPC, fib.Add(P(Ip(10, 0, 0, 0), 23), 3))
-      << "re-point that cannot be installed reported success -- rte_fib "
-         "lacks deps/dpdk-patches/0003 (D-132)";
+  EXPECT_EQ(-ENOSPC, fib.Add(P(Ip(30, 0, 0, 0), 25), 2)) << "pool spent";
+  EXPECT_EQ(0, fib.Add(P(Ip(10, 0, 0, 0), 23), 3))
+      << "a re-point needed a tbl8 group -- rte_fib lacks "
+         "deps/dpdk-patches/0005 (D-132)";
   EXPECT_EQ(1u, fib.Lookup(Ip(10, 0, 0, 1)));
-  EXPECT_EQ(1u, fib.Lookup(Ip(10, 0, 1, 1)));
-  // The rib kept the old next hop too: re-pointing to it is a no-op (it
-  // would otherwise need the same group and fail again).
-  EXPECT_EQ(0, fib.Add(P(Ip(10, 0, 0, 0), 23), 1));
-  EXPECT_EQ(1u, fib.Lookup(Ip(10, 0, 1, 1)));
+  EXPECT_EQ(3u, fib.Lookup(Ip(10, 0, 0, 200)));
+  EXPECT_EQ(3u, fib.Lookup(Ip(10, 0, 1, 1)));
+  EXPECT_EQ(0, fib.Erase(P(Ip(10, 0, 0, 0), 23)));
+  EXPECT_EQ(1u, fib.Lookup(Ip(10, 0, 0, 1)));
+  EXPECT_EQ(RteFib::kMiss, fib.Lookup(Ip(10, 0, 0, 200)));
+  // The last rule longer than /24 in 10.0.0.0/24 frees its group.
+  EXPECT_EQ(0, fib.Erase(P(Ip(10, 0, 0, 0), 25)));
+  EXPECT_EQ(0, fib.Add(P(Ip(30, 0, 0, 0), 25), 2)) << "the group was kept";
 }
 
 uint32_t HostMask(uint8_t len) { return len == 32 ? 0 : ~uint32_t{0} >> len; }

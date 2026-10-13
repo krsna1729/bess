@@ -9424,24 +9424,32 @@ as `rte_lpm`; `rte_lpm` stays the default.
   branches on it once per batch, never per packet. `rte_fib` is DIR24_8 with 4-byte next hops, the QSBR defer
   queue of the runtime's `RcuDomain`, and host-order lookups (the `View` API); /0 stays beside the structure, as
   for `rte_lpm`. Values stay 24-bit for both.
-- **Four carried DPDK patches** (D-131, `Upstream-Status: Pending`, upstream copies in `.scratch/upstream/`):
+- **Five carried DPDK patches** (D-131, `Upstream-Status: Pending`, upstream copies in `.scratch/upstream/`):
 
   | patch | defect | BESS test |
   |---|---|---|
   | 0001 fib | D-130's wrap at 255.255.255.255 overwrites the whole table (DIR24_8) | `RteFibTest.D130PatchIsInEffect` |
   | 0002 fib6 | the same in TRIE (`rte_fib6`) | none: BESS has no IPv6 table yet |
-  | 0003 fib | a re-point whose update fails returns 0 (fixed for TRIE upstream in 3aca5f52b5, not for DIR24_8) | `RteFibTest.D132FailedRepointIsReported` |
+  | 0003 fib | a re-point whose update fails returns 0 (fixed for TRIE upstream in 3aca5f52b5, not for DIR24_8) | none since 0005, which leaves a re-point nothing to fail on; the reproducer (in the upstream package) failed without 0003 |
   | 0004 fib | a range that wants two free groups takes the second without reclaiming from the defer queue: after deletes, adds fail with `-ENOSPC` while the queue holds groups readers released long ago | `RouteTableTest.DeletesNeverFailWithAStalledReader/Fib` |
+  | 0005 fib | a /24's tbl8 group is folded away as soon as its entries are equal, and a rule longer than /24 that repeats its parent's next hop gets none; a later change or delete of a covering rule then needs a group per such /24, and fails with `-ENOSPC` after writing part of its range | `RteFibTest.D132ChangesNeverAllocate`, `RouteTableTest.ChangesAndDeletesNeverFailWithAStalledReader/Fib` |
 
-  The three tests fail against pristine 25.11.3 and pass with the series (run both ways).
+  Each test fails without its patch and passes with the series (run both ways).
+- **Groups live as in `rte_lpm` (0005).** A /24 has a tbl8 group exactly while it holds a rule longer than /24:
+  the first such rule's add allocates it, even when it changes no next hop, and the delete of the last one frees
+  it. So changing or deleting an existing rule never allocates and cannot fail, which `Router`'s and
+  `IPLookup`'s transactions rely on (they `CHECK` it in `Publish` and `Abort`, D-023), and an add allocates
+  before it writes, so a refused add changes nothing. Without it a transaction's `Publish` or `Abort` could
+  fail and abort bessd. The /24s are a 2 MiB bitmap per table (one bit per /24), set and cleared where
+  `rte_fib` already counts them, so the check costs one load; a /24 whose longer rules repeat the covering next
+  hop keeps its group, as in `rte_lpm`.
 - **The same limits and errors as `rte_lpm`.** `rte_fib` does not hold `Config`'s limits itself: it rounds the
   tbl8 pool up to a multiple of 64 groups (`dir24_8_create`), and its RIB takes up to 2 x `max_routes` nodes. The
   table enforces both for that backend, the way `rte_lpm` counts them: at most `max_routes` rules, and one group
   per /24 that holds a rule longer than /24 (`FibAdmits`). A refusal by that count is `kTableFull` with nothing
-  changed. The
-  `rte_fib` pool gets one group beyond the budget, because `install_to_fib` asks for two free groups for a range
-  that ends on a /24 boundary even when it needs one; without the spare, a re-point of a /24 whose group was merged
-  away, or such an add, would fail with the budget not spent, where `rte_lpm` cannot.
+  changed. The `rte_fib` pool gets one group beyond the budget, because `install_to_fib` asks for two free
+  groups for a range that ends on a /24 boundary even when it needs one (a /25 at x.y.z.128); without the spare,
+  such an add would fail with the budget not spent, where `rte_lpm` cannot.
 - **The defer queue holds the whole pool.** `rte_fib`'s defaults to 128 entries (a ring of 255); when it is full
   and a stalled reader blocks reclamation, `rte_fib` logs and leaks the group it could not queue. The backend sets
   `dq_size` to the pool. Without it, `DeletesNeverFailWithAStalledReader/Fib` fails at its 255th group.
@@ -9456,17 +9464,9 @@ as `rte_lpm`; `rte_lpm` stays the default.
   stores. `RouteBackendSupported` asks `arch::kStoresInProgramOrder` (`core/arch/cpu.h`, false on arm64 and in a
   `BESS_ARCH_GENERIC` build). Elsewhere `Create` refuses the backend (`kUnsupportedBackend`, `ENOTSUP`), and the
   backend-parameterised tests and benchmarks run `rte_lpm` only.
-- **Two differences stay, both only while a reader is stalled** (a worker that stops reporting quiescence, so
-  freed groups wait in the defer queue):
-  - `rte_lpm` refuses an add as soon as its freed groups are all in the queue; `rte_fib` first uses its spare
-    group and the rest of its 64-rounded pool, so it refuses later, never earlier.
-  - `rte_fib` places a route that covers several gaps between more specific routes one gap at a time, and a gap
-    in a /24 whose group was merged away needs a new group. When none can be had, the add, re-point or delete fails
-    (`kTableFull`, or `kBackendFailure` for a delete) after the earlier gaps were written: lookups there already
-    give the new answer while the table keeps the old route. `rte_lpm` allocates before it writes and never
-    allocates for a delete. A route placed by a transaction is added with the value already covering it (D-023),
-    which makes `rte_fib` skip the update, so aborting it writes nothing and cannot fail this way. [INFERENCE from
-    `dir24_8_modify`; not tested]
+- **One difference stays, only while a reader is stalled** (a worker that stops reporting quiescence, so freed
+  groups wait in the defer queue): `rte_lpm` refuses an add as soon as its freed groups are all in the queue;
+  `rte_fib` first uses its spare group and the rest of its 64-rounded pool, so it refuses later, never earlier.
 
 **Evidence.** Correctness: every `route_route_test`, `route_router_transaction_test`, `route_route_domain_test`,
 `route_lpm_resource_test` and `modules_ip_lookup_test` case runs on both backends (`/Lpm`, `/Fib`), including the
@@ -9475,8 +9475,11 @@ the per-/24 count is allocated before the DPDK add, so a refused allocation leav
 capacity tests and the RCU group tests. The RCU tests size the pool so that only reuse could succeed (`rte_fib`:
 budget 63, a pool of exactly 64).
 
-Cost (this host, isolated CPU 4, release build, DPDK 25.11.3 with the series; medians of 5; cv at most 1.6%, except
-`UpdateInPlace` on `rte_fib`, 3.1-3.6%, and the uniform-key rows, given in the table):
+Cost (this host, isolated CPU 4, release build, DPDK 25.11.3 with the series up to 0004; medians of 5; cv at most
+1.6%, except `UpdateInPlace` on `rte_fib`, 3.1-3.6%, and the uniform-key rows, given in the table). 0005 leaves the
+lookup path alone; on updates, paired in one session (4 then 5 patches, twice), `UpdateInPlace` on `rte_fib` goes
+from 178-187 / 219-226 / 240-250 to 193-195 / 231-232 / 250-252 ns per change, and `fib_bench`'s one add and
+delete does not move (0.22 / 0.34 / 0.41 µs both ways):
 
 | `route_bench` row | `rte_lpm` | `rte_fib` |
 |---|---|---|
@@ -9496,7 +9499,8 @@ target CPUs. A table that small stays in L1 for both, so `rte_fib`'s lookup adva
 call costs about two instructions more per packet.
 
 Memory is the same order for both: a 64 MiB tbl24 (2^24 4-byte entries) plus 1 KiB per tbl8 group; `rte_fib`'s
-pool is rounded up to 64 groups, and its RIB nodes take the place of `rte_lpm`'s rule table.
+pool is rounded up to 64 groups, it adds 0005's 2 MiB bitmap, and its RIB nodes take the place of `rte_lpm`'s rule
+table.
 
 **Why `rte_lpm` stays the default.** Every existing configuration was measured and run with it, it needs no DPDK
 patch, it runs on arm64, and in a small table its lookup is no slower. `rte_fib` is the choice for tables that
@@ -9511,4 +9515,4 @@ or when a deployment's tables are large or churn enough to make `rte_fib` the be
 `protobuf/module_msg.proto` (`RouteBackend`, `IPLookupArg.backend`, `RouterArg.backend`),
 `core/modules/ip_lookup.cc`, `core/modules/router.cc`, `core/testing/route_backends.h`, the route tests,
 `core/route/route_bench.cc`, `core/fib_bench.cc`, `tools/live_perf.py` (`M.iplookup/fib`),
-`deps/dpdk-patches/0001-0004`.
+`deps/dpdk-patches/0001-0005`.

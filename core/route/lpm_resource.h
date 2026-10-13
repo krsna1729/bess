@@ -22,15 +22,17 @@ namespace bess::route {
 // LpmRouteTable::kMaxValue; the module's codec gives it meaning, a gate for
 // IPLookup). Values refer to nothing the engine tracks.
 //
-// rte_lpm cannot promise room for a set of prefixes in advance, so a new
+// Neither backend can promise room for a set of prefixes in advance, so a new
 // prefix is placed during Reserve() with what its addresses resolve to today
 // (CoveringValue: the covering route, else the default, else `miss_value`, a
 // value the module's readers treat exactly as a miss -- IPLookup's DROP_GATE):
-// no lookup changes until Publish() stores the value in place, which cannot
-// fail. A prefix that does not fit refuses the transaction with nothing
-// visible; Abort() deletes the placeholder. The default route (/0) is a
-// stored value and needs no placement. (Router's routes resource does the
-// same over route domains and next-hop references.)
+// no lookup changes until Publish() stores the value in place. Changing or
+// deleting an existing rule needs no tbl8 group in either backend (rte_fib
+// with deps/dpdk-patches/0005, D-132), so Publish() and Abort() cannot fail.
+// A prefix that does not fit refuses the transaction with nothing visible;
+// Abort() deletes the placeholder. The default route (/0) is a stored value
+// and needs no placement. (Router's routes resource does the same over route
+// domains and next-hop references.)
 class LpmTableResource final : public dataplane::Resource {
  public:
   LpmTableResource(std::string name, LpmRouteTable &table, uint32_t miss_value)

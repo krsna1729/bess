@@ -101,16 +101,18 @@ Router::~Router() {
 // is frozen while enrolled, so the FIB pointers this resource holds stay
 // valid.
 //
-// rte_lpm cannot promise capacity (rules and tbl8 groups) for a set of
+// Neither backend can promise capacity (rules and tbl8 groups) for a set of
 // prefixes in advance, so a new route is placed during Reserve() with a
 // placeholder value: what its addresses resolve to today (the covering
 // route, else the default, else id 0, a miss -- LpmRouteTable::
 // CoveringValue). Readers see no change until Publish() stores the real
 // next hop -- an in-place update of an existing rule, which cannot fail.
 // A prefix that does not fit rejects the transaction with nothing visible;
-// Abort() deletes the placeholder (deletes cannot fail: the tbl8 defer
-// queue holds every group, pinned by RouteTest). Placed prefixes are
-// "pending" to Contains()/ReferencesOf() until the transaction ends.
+// Abort() deletes the placeholder. Updates and deletes of existing rules
+// need no tbl8 group (rte_fib: deps/dpdk-patches/0005, D-132), and the
+// defer queue holds every freed group; RouteTableTest pins both. Placed
+// prefixes are "pending" to Contains()/ReferencesOf() until the transaction
+// ends.
 class Router::RouteResource final : public dataplane::Resource {
  public:
   explicit RouteResource(Router &router, bool groups)
