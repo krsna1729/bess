@@ -557,15 +557,23 @@ TEST_F(TransactionEngineTest, ReadersNeverResolveADanglingReference) {
     }
     const auto r = Apply(ops);
     if (r.outcome != Outcome::kApplied) {
-      // Only an id still retiring, or a full retirement backlog (busy: the
-      // reader has not reported quiescence, as on one CPU), can refuse: give
-      // the reader a turn and retry later.
+      // Only an id still retiring, a full retirement backlog (busy: the
+      // reader has not reported quiescence, as on one CPU), or a rule table
+      // whose deleted slots still wait for that reader (it cannot grow here,
+      // as ExactMatch's would) can refuse: give the reader a turn and retry
+      // later. Slots that never came back would stop txns short below.
       bool retiring = r.outcome == Outcome::kBusy;
       for (const auto &op : r.ops) {
-        retiring |= op.error.find("retiring") != std::string::npos;
+        retiring |= op.error.find("retiring") != std::string::npos ||
+                    op.error.starts_with("table full");
       }
       if (!retiring) {
-        ADD_FAILURE() << "unexpected rejection";
+        std::string errors;
+        for (const auto &op : r.ops) {
+          errors += " [" + op.error + "]";
+        }
+        ADD_FAILURE() << "unexpected rejection: outcome " << static_cast<int>(r.outcome)
+                      << errors;
         break;  // stop the reader below before returning
       }
       version[k] = v;
