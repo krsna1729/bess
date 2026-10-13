@@ -7,6 +7,7 @@ live_test_sources = [
   'control_sdk_test.cc',
   'dataplane_transactions_test.cc',
   'events_test.cc',
+  'http_test.cc',
   'match_modules_test.cc',
   'metrics_test.cc',
   'module_traffic_test.cc',

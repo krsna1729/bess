@@ -15,6 +15,7 @@ scenario and the Kubernetes settings):
 | packet buffers | `-buffers` (default 262,144 in one pool on the memory node, about 600 MB); size it for your pipeline -- modules need memory too | `-buffers`, `BESSD_BUFFERS` |
 | NICs | the PCI addresses a device plugin assigned (`PCIDEVICE_*` environment, e.g. the SR-IOV network device plugin); otherwise every device DPDK can use | `-pci_allow`, `BESSD_PCI_ALLOW` |
 | IOVA mode | DPDK's choice: VA with an IOMMU (vfio-pci, the recommended binding), PA where hardware needs it | `-iova`, `BESSD_IOVA` |
+| HTTP (JSON API, server-sent events, Prometheus `/metrics`, a status page; D-125) | off | `--http_addr`, `BESSD_HTTP_ADDR`: `127.0.0.1:PORT` for the pod alone (a sidecar scraper); `0.0.0.0:PORT` serves the network with no authentication, so only behind a network policy |
 | any flag | `BESSD_<FLAG>` environment variable (e.g. `BESSD_GRPC_URL=0.0.0.0:10514`); the command line wins | -- |
 
 Behaviour a container runtime relies on:

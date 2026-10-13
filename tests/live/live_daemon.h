@@ -90,6 +90,8 @@ class Types {
 std::string Env(const char *name);
 // A path under the source tree.
 std::string SourcePath(std::string_view relative);
+// A TCP port on loopback nothing listens on now.
+int FreePort();
 
 class Daemon {
  public:
@@ -97,6 +99,8 @@ class Daemon {
   // exits.
   static Daemon &Shared();
   ~Daemon();
+
+  int pid() const { return pid_; }
 
   const std::string &address() const { return address_; }
   bess::sdk::Client &client() { return *client_; }

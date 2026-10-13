@@ -40,21 +40,6 @@ std::vector<char *> Argv(const std::vector<std::string> &argv) {
   return out;
 }
 
-// A TCP port nothing listens on now (the daemon binds it right after).
-int FreePort() {
-  const int fd = socket(AF_INET, SOCK_STREAM, 0);
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  socklen_t len = sizeof(addr);
-  if (fd < 0 || bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 ||
-      getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
-    ADD_FAILURE() << "no free port: " << std::strerror(errno);
-  }
-  close(fd);
-  return ntohs(addr.sin_port);
-}
-
 std::string ReadFile(const std::string &path) {
   std::ifstream in(path);
   return std::string(std::istreambuf_iterator<char>(in), {});
@@ -69,6 +54,20 @@ std::string Env(const char *name) {
     return "";
   }
   return v;
+}
+
+int FreePort() {
+  const int fd = socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t len = sizeof(addr);
+  if (fd < 0 || bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 ||
+      getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
+    ADD_FAILURE() << "no free port: " << std::strerror(errno);
+  }
+  close(fd);
+  return ntohs(addr.sin_port);
 }
 
 std::string SourcePath(std::string_view relative) {

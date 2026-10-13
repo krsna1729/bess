@@ -144,6 +144,7 @@ file is the reasoning.
 | D-121 | ExactMatch: a fused kernel for a key that is one packet field of 1, 2, 4 or 8 bytes (load, mask, CRC32C and key row in one pass, then a prehashed lookup), chosen when a generation is built; 33 fewer instructions per packet on M.exactmatch; the generic path for every other layout | accepted |
 | D-122 | Release artifacts for arm64 as well as x86_64: `publish-release` runs on `ubuntu-24.04` and `ubuntu-24.04-arm`; every file name carries the architecture (`SHA256SUMS-<machine>`) | accepted |
 | D-123 | Process placement: one memory node per bessd (chosen at startup from its CPUs' nodes and the memory it may use; everything allocated there), one reserved control CPU, automatic SMT-striped worker CPUs; anything on another node is diagnosed, never refused; only a CPU outside the set is an error | accepted |
+| D-125 | HTTP inside bessd, off by default: protobuf-JSON over the Control RPCs, WatchEvents as server-sent events, Prometheus `/metrics` (replaces tools/bess_prometheus.py), a compiled-in page; every request a call on bessd's own gRPC server over an in-process channel | accepted |
 | D-126 | One SIMD width per process: `--simd_width=auto\|256\|512` and the CPU, decided once before the EAL, passed to DPDK as `--force-max-simd-bitwidth` (auto passes nothing: DPDK's 256 on x86) and to BESS kernels through `arch::RuntimeDispatch`, a function pointer resolved at startup; wider than the CPU is a warning; no AVX-512 kernel (no hardware) | accepted |
 | D-127 | Compiler tuning: a `tune` meson option (`-mtune`, empty by default, not passed to plugins); releases stay `-march=x86-64-v3` with the compiler's default tune (GCC: generic): on this host no `-mtune` (generic, graniterapids, znver5, native alderlake) is consistently faster with GCC 16, and Clang's best tune here is AMD's | accepted |
 
@@ -9102,3 +9103,92 @@ per-daemon effect independent of the tune, same instruction count) is noted, not
 **Code.** `meson_options.txt` (`tune`), `meson.build`, `core/modules/generic_encap.cc`,
 `tools/tidy_baseline.json`, `README.md`, `docs/benchmarking.md` (build note, tuning matrix),
 `docs/plugin-api.md`, `docs/baselines/d127-tune-{gcc,gcc-floor,clang}.json`.
+## D-125 HTTP inside bessd: protobuf-JSON, server-sent events, `/metrics`, a static page
+
+**Status:** accepted.
+
+**Problem.** D-104 puts HTTP and the UI inside bessd, off or on localhost by default, so one process keeps one
+source of state and one authorization point. bessd served only gRPC: a browser, `curl` or a Prometheus scraper
+needed a client with BESS's protos, and Prometheus went through `tools/bess_prometheus.py` (D-076), a Python
+process between the scraper and bessd that D-104 removes with the rest of Python.
+
+**Decision.**
+
+- **Off unless asked.** `--http_addr HOST:PORT` (`BESSD_HTTP_ADDR`); empty, the default, means no listener at all.
+  The host is required (`:8080` and `8080` are refused at startup with the reason): a loopback host keeps it on
+  the machine, and any other, `0.0.0.0` included, is spelled out by whoever starts bessd and logged as a warning
+  (no authentication, no TLS). The socket is bound in `main` before bessd daemonizes, so a taken or malformed
+  address fails the starting command with its reason on the terminal.
+- **One code path.** Every request is a call on bessd's own gRPC server through an in-process channel
+  (`grpc::Server::InProcessChannel`, the server's 64 MiB message limits): the same `ControlV2Service` handlers, the
+  same `RefuseOtherEpoch` and `ErrorDetail` trailers, the same `WatchEvents` loop, and whatever authorization the
+  server gains later applies to HTTP too. No handler is called directly and nothing is reimplemented.
+- **Routes.** `POST /v2/<Method>`: any unary `bess.pb.v2.Control` method, found in the generated descriptor pool
+  (no list to keep in step with the proto), the body parsed with `JsonStringToMessage` (strict: an unknown field is
+  400; an empty body is the empty message), the answer printed with `MessageToJsonString` (proto3 JSON:
+  lowerCamelCase, 64-bit integers as strings). `GET /v2/events`: `WatchEvents` as server-sent events, one JSON
+  `Event` per `data:` line with `id: EPOCH:SEQUENCE` (for `bess.start`, the sequence before the next event), so a
+  browser's `EventSource` reconnects with `Last-Event-ID` and resumes, a restart answered by `bess.restart` as
+  over gRPC; the query (`from_sequence`, `daemon_epoch`, `types=a,b`) wins over the header. `GET /metrics`:
+  `ListMetrics` in the text exposition format 0.0.4. `GET /`: one static page, compiled in
+  (`control/http_ui.h`), that lists modules and metrics through `POST /v2/GetPipeline` and `/v2/ListMetrics` and
+  follows `/v2/events`. The Admin service (shutdown, plugins, capture) is not on HTTP.
+- **Errors.** A failed call answers the gRPC code's HTTP status as `google.rpc.Code` maps it (400 for
+  INVALID_ARGUMENT, FAILED_PRECONDITION and OUT_OF_RANGE; 404; 409 for ALREADY_EXISTS and ABORTED; 501; 503 ...)
+  with `{"code", "status", "message", "detail"}`, `detail` the `bess-error-bin` trailer's `ErrorDetail` as JSON;
+  a body that is not the request's JSON is 400; an unknown path or method 404, a wrong verb 405 with `Allow`.
+- **The exposition renderer** (`control/metrics_exposition.{h,cc}`) carries tools/bess_prometheus.py's output
+  over: HELP and TYPE lines once per family before its samples, families in name order (sorted again, stably, so
+  a family is one run whatever the source), `counter`/`gauge` from the sample's kind (`untyped` otherwise), label
+  values escaping backslash, quote and newline and help text backslash and newline, labels in key order, then the
+  `bess_daemon_epoch` gauge (printed as an integer, not through a double). Values are the shortest text that
+  reads back as the same double (`5` where Python printed `5.0`; `NaN`, `+Inf`, `-Inf` as the format spells them).
+  tools/bess_prometheus.py is deleted.
+- **Threads and bounds.** An accept thread (woken by an eventfd to stop) and one thread per connection, none of
+  them a worker; one request per connection (`Connection: close`). At most 64 connections (503 beyond), 64 KiB
+  and 64 headers, 64 MiB of body (`Content-Length` only; chunked bodies are refused with 411), 10 s to send a
+  request or take a reply. An event stream's connection has a watcher that cancels the call when the client
+  leaves or the server stops, so an idle stream does not hold its thread until the next event. On shutdown the
+  event log closes first (as before), the gRPC server drains, then `HttpServer::Stop` ends the open connections
+  and joins every thread before the dataplane is torn down.
+- **Layering.** The adapter is in `bess_control` (`control/http_server.{h,cc}`), using `utils/http_parser`
+  (picohttpparser, already in `bess_utils`): `bess_control -> bess_utils` was already allowed by
+  tools/layer_dag.json, so the DAG is unchanged. No new dependency: sockets, gRPC, protobuf's JSON utilities.
+
+**Alternatives.** Calling the service's handlers directly with a hand-made `ServerContext` would skip the channel
+but cannot stream (`WatchEvents` needs a `ServerWriter`) and reads no trailers, so errors would lose their
+detail; it would be a second code path. grpc-gateway or an HTTP library (cpp-httplib, Boost.Beast) would add a
+dependency or a process; the routes need a request parser (already in the tree) and a few hundred lines.
+Keep-alive and HTTP/2 were left out: a scraper, `curl` and the page make one request per connection.
+
+**Evidence.**
+
+- `control_metrics_exposition_test` (4 tests): the exact text for families given out of order (HELP/TYPE
+  before samples, counter/gauge/untyped), escaping of label values and help, labels in key order, value
+  spellings (integers, fractions, `1e+20`, NaN and both infinities, `0.1` round-tripping), the epoch printed
+  exactly at 2^64-1.
+- `live_http` (tests/live/http_test.cc, 7 tests, a bessd started with `--http_addr`): `/metrics` parses as the
+  exposition format with HELP right before TYPE, each family typed once, in name order, every sample after its
+  own family's TYPE and of the kind ListMetrics declares, `bess_daemon_epoch` last and equal to the JSON API's
+  epoch (the check that covered bess_prometheus.py, D-076); `ApplyPipeline` without `daemonEpoch` is 400 with
+  `ErrorDetail.field = daemon_epoch`, with it 200, and the gRPC client sees the module; the first server-sent
+  event is `bess.start` under the daemon's epoch with its id; 404 for a path, an unknown method and
+  `WatchEvents` (streamed at `/v2/events`), 405 with `Allow: POST`, 400 for bad JSON, an unknown field and an
+  unknown query parameter; the page. Without the flag, the shared daemon's only listening TCP port (its sockets
+  in `/proc/PID/net/tcp{,6}`) is the gRPC port; `--http_addr=:8080` and `=8080` stop bessd with
+  "expected HOST:PORT".
+- Fast suite (GCC, `-Werror`): 183 tests pass (`live_conformance` with Go 1.27.1 through mise); the new and
+  changed sources compile warning-free with Clang 22; clang-tidy finds nothing in the new sources and the
+  touched ones match tools/tidy_baseline.json; layers (`check_includes`, `check_arch`, `check_limits`) and
+  `check_link_graph` (21 libraries, 63 edges) pass.
+- A curl session against a real bessd (`--http_addr=127.0.0.1:18080`): the exposition text with the 0.0.4
+  content type, the epoch refusal and an accepted `ApplyPipeline`, the 400 and 404 bodies, the `bess.start`
+  event, the page (200, `text/html`); `ss` shows the HTTP socket on 127.0.0.1 only; SIGTERM then ends bessd
+  cleanly (exit 0, "gracefully shut down").
+
+**Code.** `core/control/http_server.{h,cc}`, `core/control/http_ui.h`, `core/control/metrics_exposition.{h,cc}`,
+`core/control/metrics_exposition_test.cc`, `core/bessctl.{h,cc}` (`ApiServer::ServeHttp`), `core/main.cc`,
+`core/runtime/opts.{h,cc}` (`--http_addr`), `core/meson.build`, `tests/live/http_test.cc`,
+`tests/live/live_daemon.{h,cc}` (`Daemon::Launch`, `FreePort`), `tests/live/meson.build`; deleted
+`tools/bess_prometheus.py`; `docs/control-sdk.md`, `docs/limits.md`, `docs/running-in-containers.md`,
+`protobuf/control_v2.proto` and `core/stats/metric_registry.h` (comments), `MODERNIZATION.md` (G1.9).

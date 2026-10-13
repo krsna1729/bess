@@ -267,6 +267,37 @@ its reader goes away.
 Not yet: the legacy commands (daemon start, `.bess` files, interactive
 shell); the Python bessctl remains for those until D-104's last step.
 
+## HTTP (in bessd, D-125)
+
+Off by default. `bessd --http_addr 127.0.0.1:8080` (or `BESSD_HTTP_ADDR`)
+serves HTTP on its own threads, none of them a worker. The host is required:
+a loopback host keeps it on the machine, and any other (`0.0.0.0`, a routable
+address) serves the network with no authentication and no TLS, which bessd
+logs as a warning. Each request is a call on bessd's own gRPC server through
+an in-process channel, so HTTP and gRPC answer alike, under the same epoch
+rules (D-106), and there is one authorization point.
+
+| Route | What |
+|---|---|
+| `POST /v2/<Method>` | a unary `bess.pb.v2.Control` RPC: the body is the request in protobuf JSON (empty: `{}`), the answer the response (lowerCamelCase names, 64-bit integers as strings) |
+| `GET /v2/events` | `WatchEvents` as server-sent events: one JSON `Event` per `data:` line, `id: EPOCH:SEQUENCE`; `?from_sequence=&daemon_epoch=&types=a,b`, or the `Last-Event-ID` a browser's `EventSource` sends on reconnecting |
+| `GET /metrics` | `ListMetrics` in the Prometheus text format 0.0.4: HELP and TYPE before each family, families in name order, `counter`/`gauge` as declared, then `bess_daemon_epoch` |
+| `GET /` | a static page, compiled in, listing modules and metrics and following events through the routes above |
+
+A failed call answers the gRPC code's HTTP status (400 for INVALID_ARGUMENT
+and FAILED_PRECONDITION, 404, 409 for ALREADY_EXISTS and ABORTED, 503 for
+UNAVAILABLE, ...) with `{"code", "status", "message", "detail"}`, `detail`
+being the typed `ErrorDetail`; a body that is not the request's JSON is 400.
+One request per connection. The Admin service is not on HTTP.
+
+```sh
+curl -s localhost:8080/metrics
+curl -s -X POST localhost:8080/v2/GetPipeline
+curl -s -X POST localhost:8080/v2/ApplyPipeline \
+  -d '{"pipeline": {"modules": [{"name": "s", "mclass": "Sink"}]}, "daemonEpoch": "EPOCH"}'
+curl -sN localhost:8080/v2/events
+```
+
 ## What they guarantee
 
 | Situation | What the SDK does |

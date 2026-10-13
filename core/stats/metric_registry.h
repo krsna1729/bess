@@ -16,7 +16,7 @@
 // module, the runtime) registers a callback that reads them when the control
 // plane asks. Nothing here is on a packet path, and no exporter format
 // (Prometheus or other) is known to a library: exporters translate samples
-// outside (ListMetrics RPC, bessctl, tools/bess_prometheus.py).
+// outside (ListMetrics RPC, bessctl, control/metrics_exposition.h).
 
 namespace bess::stats {
 

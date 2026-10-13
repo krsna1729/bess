@@ -2,6 +2,7 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
+#include <memory>
 #include <string>
 #include <unistd.h>
 
@@ -16,6 +17,7 @@
 #include "bessd.h"
 #include "cli_mode.h"
 #include "framework/plugin_loader.h"
+#include "control/http_server.h"
 #include "debug.h"
 #include "runtime/opts.h"
 #include "runtime/numa_placement.h"
@@ -80,6 +82,18 @@ int main(int argc, char *argv[]) {
   int pidfile_fd = use_pidfile ? bess::bessd::CheckUniqueInstance(FLAGS_i) : -1;
   ignore_result(bess::bessd::SetResourceLimit());
 
+  // HTTP (D-125), when asked for: bound before daemonizing, so a bad or
+  // taken address fails this command with the reason on its terminal.
+  std::unique_ptr<bess::control::HttpServer> http;
+  if (!FLAGS_http_addr.empty()) {
+    http = std::make_unique<bess::control::HttpServer>();
+    std::string error;
+    if (!http->Bind(FLAGS_http_addr, &error)) {
+      LOG(ERROR) << error;
+      return 1;
+    }
+  }
+
   int signal_fd = -1;
   if (FLAGS_f) {
     LOG(INFO) << "Launching BESS daemon in process mode...";
@@ -137,6 +151,9 @@ int main(int argc, char *argv[]) {
     ApiServer server;
 
     server.Listen(grpc_url);
+    if (http) {
+      server.ServeHttp(std::move(http));
+    }
 
     // Signal the parent that all initialization has been finished.
     if (!FLAGS_f) {

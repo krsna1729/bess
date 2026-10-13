@@ -5123,8 +5123,8 @@ rather than one call site).
 163. **M25 phase 1: operational metrics (D-076).** A pull registry (`stats::MetricRegistry`) of sources that read
      their owner's plain stats when asked; built-in RCU and transaction sources (grace periods, retired and
      reclaimed objects, the reclamation backlog, online readers, transactions by outcome, generation, pending
-     cascades); `control_v2.ListMetrics`; `tools/bess_prometheus.py`; `init_context().metrics()` behind
-     `BESS_CAP_METRICS`. No packet-path change. Events (`WatchEvents`) are phase 2.
+     cascades); `control_v2.ListMetrics`; `tools/bess_prometheus.py` (replaced by bessd's `GET /metrics`, D-125);
+     `init_context().metrics()` behind `BESS_CAP_METRICS`. No packet-path change. Events (`WatchEvents`) are phase 2.
 164. **Direct pushes to develop, batches of ten (2026-10-04/05, user decision).** Work was pushed straight to `develop`
      (rebased, no PRs), the reviewer agent reviewing every slice with its findings fixed in follow-up commits, and a
      cleanup round after every ten pushes: the develop CI of the round's pushes, a full local regression of the tip
@@ -8816,6 +8816,15 @@ consumer-driven (D-008, §31.3 item 2).
   worker and shutdown, epoch-checked like Control, in both SDKs and bessctl.
   Per-worker control, gate hooks other than capture and resume hooks stay on
   the legacy service; module and gate statistics belong in metrics (G1.4).
+- **G1.9 — HTTP inside bessd: DONE at D-104's scope (D-125).** Off unless
+  `--http_addr HOST:PORT` names an address (the host is required; beyond
+  loopback is logged as unauthenticated). Protobuf-JSON over every unary
+  Control RPC (`POST /v2/<Method>`), `WatchEvents` as server-sent events
+  (`GET /v2/events`), Prometheus `GET /metrics` (replaces
+  `tools/bess_prometheus.py`, deleted), and a compiled-in status page on
+  that JSON API (`GET /`). Each request is a call on bessd's own gRPC server
+  over an in-process channel: one code path, one authorization point. Not on
+  HTTP: the Admin service, TLS, authentication.
 
 The old imperative API should not constrain the ideal end state.
 

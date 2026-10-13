@@ -14,6 +14,7 @@ class Service;
 
 namespace bess::control {
 class ControlPlane;
+class HttpServer;
 }  // namespace bess::control
 
 // The legacy BESSControl service over `control_plane`, as ApiServer::Run
@@ -28,7 +29,8 @@ std::unique_ptr<grpc::Service> NewLegacyControlService(
 //   server.run();
 class ApiServer {
  public:
-  ApiServer() : builder_(nullptr) {}
+  ApiServer();
+  ~ApiServer();
 
   // This class is neither copyable nor movable.
   ApiServer(const ApiServer &) = delete;
@@ -37,11 +39,16 @@ class ApiServer {
   // `addr` is a gRPC url.
   void Listen(const std::string &addr);
 
+  // Run also serves HTTP on `http` (bound already), through an in-process
+  // channel to this gRPC server (D-125); stopped when Run ends.
+  void ServeHttp(std::unique_ptr<bess::control::HttpServer> http);
+
   // Runs the API server until it is shutdown by KillBess RPC.
   void Run();
 
  private:
   grpc::ServerBuilder *builder_;
+  std::unique_ptr<bess::control::HttpServer> http_;
 };
 
 #endif  // BESS_BESSCTL_H_

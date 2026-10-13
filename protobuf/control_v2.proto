@@ -525,7 +525,7 @@ message Event {
 // Pulled: each call reads every registered source (the runtime's RCU and
 // transaction engine, and whatever modules registered). Names follow
 // Prometheus conventions (`bess_` prefix, counters end in `_total`), so an
-// exporter can pass them through (tools/bess_prometheus.py).
+// exporter passes them through (bessd's GET /metrics with --http_addr, D-125).
 
 message ListMetricsRequest {}
 

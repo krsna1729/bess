@@ -68,7 +68,9 @@ control_sources = files(
   'control/api_v2.cc',
   'control/control_error.cc',
   'control/control_plane.cc',
+  'control/http_server.cc',
   'control/maintenance_loop.cc',
+  'control/metrics_exposition.cc',
   'control/pressure_monitor.cc',
   'control/dataplane_transactions.cc',
   'control/pipeline_diff.cc',
@@ -377,8 +379,10 @@ bess_control = static_library(
   control_sources + [proto_ready_marker],
   include_directories: core_include,
   dependencies: control_compile_deps,
-  # ListMetrics reads Track's per-gate totals (D-116).
-  link_with: [bess_framework, bess_execution, bess_eal, bess_gate_hooks, bess_dataplane_core, bess_rcu],
+  # ListMetrics reads Track's per-gate totals (D-116); the HTTP adapter
+  # parses requests with utils/http_parser (D-125).
+  link_with: [bess_framework, bess_execution, bess_eal, bess_gate_hooks, bess_dataplane_core, bess_rcu,
+              bess_utils],
 )
 bess_host = static_library(
   'bess_host',
@@ -741,6 +745,7 @@ unit_test_sources = [
   'control/apply_pipeline_test.cc',
   'control/control_plane_test.cc',
   'control/maintenance_loop_test.cc',
+  'control/metrics_exposition_test.cc',
   'control/pressure_monitor_test.cc',
   'control/scheduling_constraints_test.cc',
   'bessctl_wire_ranges_test.cc',

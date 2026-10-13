@@ -21,6 +21,7 @@
 #include "control/wire_narrow.h"
 #include "control/admin_v2.h"
 #include "control/api_v2.h"
+#include "control/http_server.h"
 #include "runtime/startup.h"
 #include "control/control_plane.h"
 #include "control/maintenance_loop.h"
@@ -1165,6 +1166,14 @@ std::unique_ptr<grpc::Service> NewLegacyControlService(
   return std::make_unique<BESSControlImpl>(control_plane);
 }
 
+ApiServer::ApiServer() : builder_(nullptr) {}
+
+ApiServer::~ApiServer() = default;
+
+void ApiServer::ServeHttp(std::unique_ptr<bess::control::HttpServer> http) {
+  http_ = std::move(http);
+}
+
 void ApiServer::Listen(const std::string& addr) {
   if (!builder_) {
     bess::control::PrepareControlServer();  // before the first builder
@@ -1200,6 +1209,15 @@ void ApiServer::Run() {
     return;
   }
 
+  // HTTP (D-125) calls this server over an in-process channel: the same
+  // services, limits and errors as a gRPC client sees.
+  if (http_) {
+    grpc::ChannelArguments args;
+    args.SetMaxReceiveMessageSize(bess::control::kMaxMessageBytes);
+    args.SetMaxSendMessageSize(bess::control::kMaxMessageBytes);
+    http_->Start(server->InProcessChannel(args));
+  }
+
   // Shutdown closes the event log first: a WatchEvents stream waiting in it
   // returns, so Shutdown() is not left waiting for it.
   auto shutdown = [&server]() {
@@ -1221,6 +1239,11 @@ void ApiServer::Run() {
     // SIGTERM/SIGINT: the same shutdown as the KillBess RPC (D-030).
     bess::startup::TerminationWatcher watcher(shutdown);
     server->Wait();
+  }
+  // Its calls already fail (the server is down); its event streams ended
+  // with the event log.
+  if (http_) {
+    http_->Stop();
   }
 
   // Tear the dataplane down in order while the runtime is still alive:

@@ -132,6 +132,14 @@ DEFINE_int32(
 static const bool _p_dummy[[maybe_unused]] =
     google::RegisterFlagValidator(&FLAGS_p, &ValidateTCPPort);
 
+// D-125: HTTP is off unless an address is named; the host is required, so
+// serving beyond loopback is always spelled out.
+DEFINE_string(http_addr, "",
+              "HOST:PORT for bessd's HTTP adapter (JSON API on /v2/, server-sent "
+              "events, /metrics, a status page); empty (default): no HTTP. "
+              "127.0.0.1:PORT keeps it local; any other host serves the network "
+              "without authentication");
+
 static bool ValidateMegabytesPerSocket(const char *, int32_t value) {
   if (value < -1) {
     LOG(ERROR) << "Invalid memory size: " << value;
