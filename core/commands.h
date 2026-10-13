@@ -54,6 +54,18 @@ struct GenericCommand {
   std::string result_type{};
 
   Exposure exposure = ACTION;
+
+  // Whether running it can change a resource's contents, which advances the
+  // resource generation (D-129). DEFAULT: a LEGACY_ONLY command edits (that is
+  // why it is legacy-only), an action does not. READS marks a legacy-only
+  // reader (get_runtime_config), EDITS an action that edits a resource
+  // (L2Forward's populate).
+  enum Effect { DEFAULT = 0, READS = 1, EDITS = 2 };
+  Effect effect = DEFAULT;
+
+  bool EditsResources() const {
+    return effect == EDITS || (effect == DEFAULT && exposure == LEGACY_ONLY);
+  }
 };
 
 // Command and Commands are specifically *module* commands - these should

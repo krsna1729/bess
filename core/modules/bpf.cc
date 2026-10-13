@@ -62,7 +62,7 @@ const Commands BPF::cmds = {
     {"clear", "EmptyArg", MODULE_CMD_FUNC(&BPF::CommandClear),
      Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&BPF::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY}};
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS}};
 
 const ResourceTables BPF::resource_tables = {
     ResourceTable::Singleton<bess::pb::BPFArg>("filters", true)};

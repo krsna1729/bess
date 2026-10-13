@@ -70,7 +70,8 @@ const Commands L2Forward::cmds = {
      MODULE_CMD_FUNC(&L2Forward::CommandLookup), Command::THREAD_SAFE,
      "L2ForwardCommandLookupResponse"},
     {"populate", "L2ForwardCommandPopulateArg",
-     MODULE_CMD_FUNC(&L2Forward::CommandPopulate), Command::THREAD_SAFE},
+     MODULE_CMD_FUNC(&L2Forward::CommandPopulate), Command::THREAD_SAFE, "",
+     Command::ACTION, Command::EDITS},
 };
 
 const ResourceTables L2Forward::resource_tables = {

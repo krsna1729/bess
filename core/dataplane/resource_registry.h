@@ -35,7 +35,8 @@ class ResourceRegistry {
 
   // References to `key` of `resource` held by other resources' values.
   size_t ReferenceCount(const std::string &resource, const ResourceKey &key) const;
-  // The generation of the last applied transaction.
+  // The resource generation: it advances on every applied transaction and on
+  // an edit made outside one (TransactionEngine::AdvanceGeneration, D-129).
   uint64_t generation() const;
 
  private:

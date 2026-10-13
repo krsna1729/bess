@@ -1511,6 +1511,19 @@ TEST_F(ApplyPipelineTest, ListedResourcesConvergeAndUnlistedOnesStay) {
   EXPECT_EQ(3u, DefaultGate(*control_plane_));
 }
 
+// A listed resource of a module the apply creates is reported, unchecked,
+// even when the list is empty: the apply converges it, and entries the module
+// seeds from its init argument would go without a delta saying so.
+TEST_F(ApplyPipelineTest, ACreatedModulesListedResourceIsAlwaysInTheDiff) {
+  auto diff = control_plane_->DiffPipelineVersioned(ExactMatchPipeline({}, std::nullopt));
+  ASSERT_TRUE(diff) << diff.error().message;
+  ASSERT_EQ(1u, diff->value.resources.size());
+  const bess::control::ResourceDelta &delta = diff->value.resources[0];
+  EXPECT_EQ("em/rules", delta.name);
+  EXPECT_EQ(0u, delta.created);
+  EXPECT_FALSE(delta.checked) << "removals are unknown before the module exists";
+}
+
 // What GetPipeline reads with its resources applies back as a no-op, and a
 // stale resource generation is a conflict that changes nothing.
 TEST_F(ApplyPipelineTest, ResourcesReadBackApplyAsANoOpAndAreVersioned) {
@@ -1545,6 +1558,39 @@ TEST_F(ApplyPipelineTest, ResourcesReadBackApplyAsANoOpAndAreVersioned) {
   auto rules = ReadResource(*control_plane_, "em/rules");
   ASSERT_TRUE(rules);
   EXPECT_EQ(1u, rules->entries.size());
+}
+
+// A legacy command that edits a resource's state (pybess, a .bess script)
+// moves the resource generation, so an apply built on a read from before it
+// conflicts instead of erasing the edit; a legacy reader moves nothing.
+TEST_F(ApplyPipelineTest, LegacyEditsMoveTheResourceGeneration) {
+  const std::string a("\x0a\x00\x00\x01", 4);
+  ASSERT_TRUE(control_plane_->ApplyPipeline(ExactMatchPipeline({a}, 2), {}));
+  auto read = control_plane_->ReadPipeline({.include = true});
+  ASSERT_TRUE(read) << read.error().message;
+
+  auto config = control_plane_->RunModuleCommand("em", "get_runtime_config",
+                                                 Packed(bess::pb::EmptyArg()));
+  ASSERT_TRUE(config && config->error().code() == 0);
+  auto after_read = control_plane_->ReadPipeline({});
+  ASSERT_TRUE(after_read) << after_read.error().message;
+  EXPECT_EQ(read->resource_generation, after_read->resource_generation)
+      << "a legacy reader moved the resource generation";
+
+  bess::pb::ExactMatchCommandSetDefaultGateArg gate;
+  gate.set_gate(4);
+  auto set = control_plane_->RunModuleCommand("em", "set_default_gate", Packed(gate));
+  ASSERT_TRUE(set && set->error().code() == 0);
+  EXPECT_EQ(4u, DefaultGate(*control_plane_));
+
+  PipelineSpec spec = SpecFromSnapshot(read->value.snapshot);
+  spec.resources = read->value.resources;
+  auto stale = control_plane_->ApplyPipeline(
+      spec, {.expected_generation = read->generation,
+             .expected_resource_generation = read->resource_generation});
+  ASSERT_FALSE(stale) << "the apply undid the legacy edit";
+  EXPECT_EQ(bess::control::ControlErrorCode::kConflict, stale.error().code);
+  EXPECT_EQ(4u, DefaultGate(*control_plane_));
 }
 
 // A resource the apply cannot converge (a gate ExactMatch refuses) aborts the

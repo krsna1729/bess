@@ -29,7 +29,7 @@ const Commands PortInc::cmds = {
      MODULE_CMD_FUNC(&PortInc::CommandSetBurst), Command::THREAD_SAFE, "",
      Command::LEGACY_ONLY},
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&PortInc::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
 };
 
 const ResourceTables PortInc::resource_tables = {

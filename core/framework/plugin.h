@@ -17,8 +17,10 @@
 // Version of the supported source API (module, packet and port headers and the
 // framework headers listed in plugin-api.md). It increases when a change to
 // those headers can break a plugin's source. A daemon at version N loads a
-// plugin whose [api_min, api_max] contains N.
-#define BESS_PLUGIN_API_VERSION 1
+// plugin whose [api_min, api_max] contains N. 2 (D-129): ResourceCodec's
+// kind() and Entries(), TypedCodec's entries function, declared
+// resource_tables.
+#define BESS_PLUGIN_API_VERSION 2
 
 // bess-dev-static.pc (D-095) is for programs without bessd. A plugin runs in
 // bessd and uses its runtime: linking the archives would give it a second EAL

@@ -25,6 +25,8 @@ class MPLSPop final : public Module {
 
   MPLSPop();  // constructor
 
+  // Hides Module::Init(EmptyArg) on purpose: ADD_MODULE binds the class's own.
+  // NOLINTNEXTLINE(bugprone-derived-method-shadowing-base-method)
   CommandResponse Init(const bess::pb::EmptyArg &arg);
   void DeInit() override;
 

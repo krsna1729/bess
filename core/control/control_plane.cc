@@ -373,7 +373,19 @@ ControlResult<bess::pb::CommandResponse> ControlPlane::RunModuleCommand(
   }
   // DPDK functions may be called, so be prepared.
   current_worker.SetNonWorker();
-  return m->module_builder()->RunCommand(m, command, arg, surface);
+  auto ran = m->module_builder()->RunCommand(m, command, arg, surface);
+  // D-129: a command that can edit a resource's contents advances the
+  // resource generation, whether or not it succeeded (it may have edited
+  // part), so an ApplyPipeline that read the old contents conflicts instead
+  // of undoing the edit. One the surface refuses ran nothing.
+  for (const auto& cmd : m->module_builder()->cmds()) {
+    if (cmd.cmd == command && cmd.EditsResources() &&
+        (surface == ModuleBuilder::CommandSurface::kLegacy ||
+         cmd.exposure == Command::ACTION)) {
+      runtime::runtime().transactions().AdvanceGeneration();
+    }
+  }
+  return ran;
 }
 
 ControlResult<void> ControlPlane::ResetPorts() {
@@ -1794,10 +1806,11 @@ ControlResult<void> ControlPlane::DiffResourcesLocked(const PipelineSpec &desire
                                            change.kind == ChangeKind::kReplace);
         });
     if (rebuilt) {
-      if (!resource.entries.empty()) {
-        diff->resources.push_back(
-            ResourceDelta{resource.name, resource.entries.size(), 0, 0, false});
-      }
+      // Listed, even with no entries: the apply converges it, and entries the
+      // module seeds from its init argument (Vif's interfaces) that are not
+      // listed are removed. How many is unknown until the module exists.
+      diff->resources.push_back(
+          ResourceDelta{resource.name, resource.entries.size(), 0, 0, false});
       continue;
     }
     auto converged = Converge(engine, bindings, resource, /*build_ops=*/false);

@@ -11,10 +11,10 @@
 
 const Commands StaticNAT::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&StaticNAT::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
     {"get_runtime_config", "EmptyArg",
      MODULE_CMD_FUNC(&StaticNAT::GetRuntimeConfig), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
+     Command::LEGACY_ONLY, Command::READS},
     {"set_runtime_config", "EmptyArg",
      MODULE_CMD_FUNC(&StaticNAT::SetRuntimeConfig), Command::THREAD_SAFE, "",
      Command::LEGACY_ONLY}};

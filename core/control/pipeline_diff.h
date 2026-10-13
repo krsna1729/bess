@@ -74,7 +74,10 @@ struct ResourceDelta {
   uint64_t updated = 0;
   uint64_t removed = 0;
   // False: the resource does not exist yet (the apply creates or replaces its
-  // module); every entry counts as created and is checked at the apply.
+  // module); every listed entry counts as created and is checked at the
+  // apply, and `removed` is unknown (0): entries the module seeds from its init
+  // argument and the list leaves out are removed then. Always reported for a
+  // listed resource, even an empty one.
   bool checked = true;
 
   bool empty() const { return created == 0 && updated == 0 && removed == 0; }

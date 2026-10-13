@@ -250,7 +250,9 @@ struct BessPluginDescriptor {
 - `BESS_PLUGIN_API_VERSION` is the version of the supported source
   API: it increases when a change to the public headers can break a plugin's
   source. A daemon at version N loads a plugin whose `[api_min, api_max]`
-  contains N.
+  contains N. It is 2: version 1 became 2 with D-129 (a `ResourceCodec`
+  has `kind()` and `Entries()`, a `TypedCodec` takes an `entries` function,
+  and a class's codec-bound resources must match its `resource_tables`).
 - `BESS_PLUGIN(name, version)` declares a plugin built against exactly the
   current API (`api_min == api_max == BESS_PLUGIN_API_VERSION`) that needs no
   optional capability. `BESS_PLUGIN_REQUIRES(name, version, capabilities)` is

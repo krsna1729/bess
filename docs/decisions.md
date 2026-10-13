@@ -9560,7 +9560,9 @@ an **action**.
   `PlanPipeline` and `ApplyPipeline` report (`resource_generation`) and `ApplyPipeline` can require
   (`expected_resource_generation`, `CONFLICT` otherwise). `DiffPipeline` reports a `ResourceDelta` per listed
   resource (created, updated, removed; `checked` false when the apply creates or replaces the module, so its entries
-  are only checked then) and `PlanPipeline` an `apply_resources` step. `GetPipeline{include_resources, resources}`
+  are only checked then and entries the module seeds from its init argument and the list leaves out go uncounted;
+  such a resource is reported even when listed empty) and `PlanPipeline` an `apply_resources` step.
+  `GetPipeline{include_resources, resources}`
   reads contents back, singletons without a key; a response over the 64 MiB message limit is `RESOURCE_EXHAUSTED`
   (`EMSGSIZE`): ask for fewer by name.
 - **Actions.** `InvokeAction{daemon_epoch, module, action, Any arg}` → `{Any result, daemon_epoch}` replaces
@@ -9574,7 +9576,13 @@ an **action**.
   through the legacy `BESSControl.ModuleCommand`, with unchanged validation and effect, for pybess, the shipped
   `.bess` samples and the UPF's pfcpiface. They are **deleted in the "delete pybess / legacy" step**, after the
   samples are converted (D-104's order), together with the legacy service; until then a legacy edit is visible in
-  the resource read-back (each module keeps one record).
+  the resource read-back (each module keeps one record), and it advances the resource generation like a
+  transaction, so an `ApplyPipeline` built on an older read conflicts instead of undoing it. A command's `Effect`
+  says whether it edits: by default a legacy-only command does and an action does not; the legacy readers
+  (`get_initial_arg`, `get_runtime_config`) are `READS`, and L2Forward's `populate` action is `EDITS`. The
+  generation moves after an editing command whether or not it succeeded, since it may have edited part.
+- **Plugin source API 2.** `BESS_PLUGIN_API_VERSION` is 2: a `ResourceCodec` has `kind()` and `Entries()`, a
+  `TypedCodec` takes an `entries` function, and a class's codec-bound resources must match its `resource_tables`.
 - **Clients.** C++ SDK: `Client::InvokeAction` (and `InvokeAction<R>`), `Transaction::Set` for singletons (`Upsert` /
   `Erase` refuse one, `Set` refuses a map), `Resource.kind` / `requires_paused_workers`,
   `Pipeline(PipelineQuery{include_resources, resources})`, `PipelineVersion.resource_generation`,

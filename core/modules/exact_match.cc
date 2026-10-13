@@ -31,10 +31,10 @@ namespace classifier = bess::classifier;
 // Module.arg.
 const Commands ExactMatch::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&ExactMatch::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
     {"get_runtime_config", "EmptyArg",
      MODULE_CMD_FUNC(&ExactMatch::GetRuntimeConfig), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
+     Command::LEGACY_ONLY, Command::READS},
     {"set_runtime_config", "ExactMatchConfig",
      MODULE_CMD_FUNC(&ExactMatch::SetRuntimeConfig), Command::THREAD_SAFE, "",
      Command::LEGACY_ONLY},

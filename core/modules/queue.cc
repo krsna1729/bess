@@ -24,10 +24,10 @@ const Commands Queue::cmds = {
      MODULE_CMD_FUNC(&Queue::CommandGetStatus), Command::THREAD_SAFE,
      "QueueCommandGetStatusResponse"},
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&Queue::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
     {"get_runtime_config", "EmptyArg",
      MODULE_CMD_FUNC(&Queue::GetRuntimeConfig), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
+     Command::LEGACY_ONLY, Command::READS},
     {"set_runtime_config", "QueueArg",
      MODULE_CMD_FUNC(&Queue::SetRuntimeConfig), Command::THREAD_UNSAFE, "",
      Command::LEGACY_ONLY}};

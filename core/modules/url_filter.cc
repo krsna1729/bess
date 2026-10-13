@@ -25,10 +25,10 @@ const uint64_t TIME_OUT_NS = 10ull * 1000 * 1000 * 1000;  // 10 seconds
 // reads it back and stays for the legacy ModuleCommand only.
 const Commands UrlFilter::cmds = {
     {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&UrlFilter::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
+     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
     {"get_runtime_config", "EmptyArg",
      MODULE_CMD_FUNC(&UrlFilter::GetRuntimeConfig), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
+     Command::LEGACY_ONLY, Command::READS},
     {"set_runtime_config", "UrlFilterConfig",
      MODULE_CMD_FUNC(&UrlFilter::SetRuntimeConfig), Command::THREAD_UNSAFE, "",
      Command::LEGACY_ONLY},

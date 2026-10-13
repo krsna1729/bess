@@ -1474,8 +1474,11 @@ type ResourceDelta struct {
 	Updated uint64                 `protobuf:"varint,3,opt,name=updated,proto3" json:"updated,omitempty"`
 	Removed uint64                 `protobuf:"varint,4,opt,name=removed,proto3" json:"removed,omitempty"`
 	// False: the resource does not exist yet (its module is created or
-	// replaced by the same apply), so every entry counts as created and the
-	// entries' keys are checked only when the apply commits them.
+	// replaced by the same apply), so every entry counts as created, the
+	// entries' keys are checked only when the apply commits them, and
+	// `removed` is unknown (0): entries the module seeds from its init argument
+	// that the list leaves out are removed then. Reported for every listed
+	// resource of such a module, even an empty one.
 	Checked       bool `protobuf:"varint,5,opt,name=checked,proto3" json:"checked,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -18,7 +18,7 @@ using bess::metadata::mt_offset_t;
 const Commands SetMetadata::cmds = {
     {"get_initial_arg", "EmptyArg",
      MODULE_CMD_FUNC(&SetMetadata::GetInitialArg), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
+     Command::LEGACY_ONLY, Command::READS},
 };
 
 CommandResponse SetMetadata::AddAttrOne(

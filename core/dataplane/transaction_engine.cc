@@ -370,6 +370,11 @@ uint64_t TransactionEngine::generation() const {
   return generation_;
 }
 
+void TransactionEngine::AdvanceGeneration() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  generation_++;
+}
+
 size_t TransactionEngine::ReferenceCount(const std::string &resource,
                                          const ResourceKey &key) const {
   std::lock_guard<std::mutex> lock(mutex_);
