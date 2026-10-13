@@ -148,7 +148,9 @@ class Cli {
       std::println("{}", caps->placement());
     }
     if (!caps->simd().empty()) {  // a daemon before D-126 sends none
-      std::println("{}", caps->simd());
+      std::println("{}; DPDK limit {}", caps->simd(),
+                   caps->dpdk_simd_width() >= 32768 ? std::string("unlimited")
+                                                     : std::to_string(caps->dpdk_simd_width()));
     }
     std::println("classes      {}", caps->module_classes_size());
     for (const pb::PluginInfo &p : caps->plugins()) {

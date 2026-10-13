@@ -89,11 +89,18 @@ TEST_P(SimdWidthLiveTest, ForwardsAndShutsDownWithoutSigill) {
       << caps->simd();
   const std::string startup = d->Log();
   EXPECT_TRUE(Contains(startup, caps->simd())) << startup;
-  const bool forced = requested != "auto";
+  // DPDK is forced only where the CPU's widths are known (x86); on arm64 it
+  // keeps its default, which is never narrower than the kernels' width.
+  const bool forced = requested != "auto" && bess::arch::kCpuSimdWidthKnown;
   EXPECT_EQ(forced, Contains(startup, R"("--force-max-simd-bitwidth", ")" +
                                           std::to_string(expected) + R"(")"))
       << startup;
-  const bool clamped = requested == "512" && cpu < 512;
+  if (forced) {
+    EXPECT_EQ(expected, caps->dpdk_simd_width()) << "DPDK's own limit";
+  } else {
+    EXPECT_GE(caps->dpdk_simd_width(), caps->simd_width()) << "DPDK's own limit";
+  }
+  const bool clamped = requested == "512" && cpu < 512 && bess::arch::kCpuSimdWidthKnown;
   EXPECT_EQ(clamped, Contains(startup, "--simd_width=512 requested, but this CPU lacks AVX-512"))
       << startup;
   if (clamped) {

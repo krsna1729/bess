@@ -3010,10 +3010,13 @@ type GetCapabilitiesResponse struct {
 	Placement  string `protobuf:"bytes,10,opt,name=placement,proto3" json:"placement,omitempty"`
 	MemoryNode int32  `protobuf:"varint,11,opt,name=memory_node,json=memoryNode,proto3" json:"memory_node,omitempty"`
 	// SIMD width (D-126): the summary bessd logged at startup ("simd: width W
-	// (requested R; CPU C, DPDK default D)") and W, the widest vectors DPDK and
-	// BESS kernels use, in bits.
+	// (requested R; CPU C, DPDK default D)"); W, the widest vectors BESS's own
+	// kernels use, in bits; and DPDK's limit as DPDK reports it after EAL
+	// initialization (rte_vect_get_max_simd_bitwidth(); 32768: unlimited, as on
+	// arm64). On x86 the two are equal; on arm64 DPDK keeps its default.
 	Simd          string `protobuf:"bytes,12,opt,name=simd,proto3" json:"simd,omitempty"`
 	SimdWidth     uint32 `protobuf:"varint,13,opt,name=simd_width,json=simdWidth,proto3" json:"simd_width,omitempty"`
+	DpdkSimdWidth uint32 `protobuf:"varint,14,opt,name=dpdk_simd_width,json=dpdkSimdWidth,proto3" json:"dpdk_simd_width,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3135,6 +3138,13 @@ func (x *GetCapabilitiesResponse) GetSimd() string {
 func (x *GetCapabilitiesResponse) GetSimdWidth() uint32 {
 	if x != nil {
 		return x.SimdWidth
+	}
+	return 0
+}
+
+func (x *GetCapabilitiesResponse) GetDpdkSimdWidth() uint32 {
+	if x != nil {
+		return x.DpdkSimdWidth
 	}
 	return 0
 }
@@ -5276,7 +5286,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x10tx_multi_segment\x18\n" +
 	" \x01(\bR\x0etxMultiSegment\x12#\n" +
 	"\rsymmetric_rss\x18\v \x01(\bR\fsymmetricRss\x12#\n" +
-	"\rrss_signature\x18\f \x01(\x04R\frssSignature\"\x8c\x04\n" +
+	"\rrss_signature\x18\f \x01(\x04R\frssSignature\"\xb4\x04\n" +
 	"\x17GetCapabilitiesResponse\x12%\n" +
 	"\x0edaemon_version\x18\x01 \x01(\tR\rdaemonVersion\x12\x12\n" +
 	"\x04rpcs\x18\x02 \x03(\tR\x04rpcs\x12,\n" +
@@ -5293,7 +5303,8 @@ const file_control_v2_proto_rawDesc = "" +
 	"memoryNode\x12\x12\n" +
 	"\x04simd\x18\f \x01(\tR\x04simd\x12\x1d\n" +
 	"\n" +
-	"simd_width\x18\r \x01(\rR\tsimdWidth\"\x12\n" +
+	"simd_width\x18\r \x01(\rR\tsimdWidth\x12&\n" +
+	"\x0fdpdk_simd_width\x18\x0e \x01(\rR\rdpdkSimdWidth\"\x12\n" +
 	"\x10GetSchemaRequest\"_\n" +
 	"\rCommandSchema\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x19\n" +

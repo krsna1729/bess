@@ -142,25 +142,32 @@ How wide a vector path DPDK and BESS's own kernels may take is decided once,
 at startup, before the EAL starts (Decision D-126): `--simd_width=auto|256|512`
 (default `auto`; `BESSD_SIMD_WIDTH` in the environment).
 
-| `--simd_width` | DPDK | BESS kernels |
-|---|---|---|
-| `auto` | nothing passed: DPDK's own default, 256 bits on x86 whatever the CPU (no AVX-512 path), unlimited on arm64 | the same width, within the CPU's (x86: 256 with AVX2; arm64: 128) |
-| `256` | `--force-max-simd-bitwidth 256` | 256 |
-| `512` | `--force-max-simd-bitwidth 512` | 512 (no BESS kernel has an AVX-512 variant yet) |
+| `--simd_width` | DPDK on x86 | DPDK on arm64 | BESS kernels |
+|---|---|---|---|
+| `auto` | nothing passed: DPDK's default, 256 bits whatever the CPU (no AVX-512 path) | nothing passed: DPDK's default, unlimited | DPDK's default within the CPU (x86 with AVX2: 256; arm64: 128) |
+| `256` | `--force-max-simd-bitwidth 256` | nothing passed (unlimited), a WARNING | 256 (arm64: 128) |
+| `512` | `--force-max-simd-bitwidth 512` | nothing passed (unlimited), a WARNING | 512 (arm64: 128; no BESS kernel has an AVX-512 variant yet) |
 
-A width the CPU lacks (`512` without AVX-512 F, BW, CD, DQ and VL) is a
-WARNING, and bessd proceeds with the CPU's widest (256 with AVX2), which is
-also what DPDK is given. Forced, DPDK holds the width for the life of the
-process. DPDK limits by it the vector Rx/Tx paths of most PMDs (the AVX-512
-ones: i40e, ice, iavf, idpf, cpfl, virtio), ACL classify, FIB lookup,
-`rte_net_crc`, `rte_member`, `rte_thash`, EFD and the distributor. `rte_lpm`
-(fixed at DPDK's build) and `rte_hash` (CPU flags at table creation) ignore it.
+On x86, a width the CPU lacks (`512` without AVX-512 F, BW, CD, DQ and VL) is
+a WARNING, and bessd proceeds with the CPU's widest (256 with AVX2), which is
+also what DPDK is given. On arm64 bessd detects Advanced SIMD (128) but not
+SVE, so it cannot know the CPU's widest vectors: clamping DPDK to 128 would
+turn off SVE paths DPDK would otherwise take (hns3's need 256), so an explicit
+width only applies to BESS's kernels and DPDK keeps its default. Forced, DPDK
+holds the width for the life of the process. DPDK limits by it the vector
+Rx/Tx paths of most PMDs (the AVX-512 ones: i40e, ice, iavf, idpf, cpfl,
+virtio), ACL classify, FIB lookup, `rte_net_crc`, `rte_member`, `rte_thash`,
+EFD and the distributor. `rte_lpm` (fixed at DPDK's build) and `rte_hash` (CPU
+flags at table creation) ignore it.
 
-One INFO line at startup, also `GetCapabilities` `simd` (with the width in
-bits, `simd_width`) and in `bessctl status`:
+One INFO line at startup, also `GetCapabilities` `simd` (with the kernels'
+width in bits, `simd_width`) and in `bessctl status`; after the EAL starts a
+second line gives DPDK's own limit, also `GetCapabilities` `dpdk_simd_width`
+(32768: unlimited):
 
 ```
 simd: width 256 (requested auto; CPU 256, DPDK default 256)
+DPDK SIMD limit: 256
 ```
 
 A BESS kernel with variants for several widths is a `bess::arch::RuntimeDispatch`

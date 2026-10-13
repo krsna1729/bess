@@ -482,6 +482,10 @@ TEST_F(ApiV2ServiceTest, CapabilitiesCarryTheSimdWidth) {
   EXPECT_EQ(simd.Summary(), resp.simd());
   EXPECT_EQ(simd.effective, resp.simd_width());
   EXPECT_EQ(bess::arch::SimdWidth(), resp.simd_width());
+  EXPECT_GE(resp.dpdk_simd_width(), resp.simd_width()) << "DPDK's own limit, after the EAL";
+  if (bess::arch::kCpuSimdWidthKnown) {
+    EXPECT_EQ(resp.simd_width(), resp.dpdk_simd_width());
+  }
 }
 
 // No free CPU for an automatic worker is RESOURCE_EXHAUSTED on the wire --

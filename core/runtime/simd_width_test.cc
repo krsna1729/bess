@@ -52,9 +52,14 @@ TEST(SimdWidthTest, TheFlagRefusesOtherValues) {
   EXPECT_NE("", gflags::SetCommandLineOption("simd_width", saved.c_str()));
 }
 
+// x86 shows every width it has (cpuid); arm64 does not (SVE undetected).
+constexpr bool kX86 = true;
+constexpr bool kArm = false;
+
 struct Row {
   SimdWidthRequest request;
   CpuVectorFeatures cpu;
+  bool cpu_width_known;
   uint16_t dpdk_default;
   uint16_t effective;
   std::vector<std::string> eal_args;
@@ -66,20 +71,25 @@ TEST(SimdWidthTest, EffectiveWidthIsTheRequestWithinTheCpu) {
   const std::string force = "--force-max-simd-bitwidth";
   const Row rows[] = {
       // auto: DPDK's default within the CPU, nothing passed to the EAL.
-      {kAuto, kAvx2, kX86Default, 256, {}, false},
-      {kAuto, kAvx512, kX86Default, 256, {}, false},  // no AVX-512 unless asked
-      {kAuto, kNeon, kX86Default, 128, {}, false},
-      {kAuto, kNeon, kArmDefault, 128, {}, false},
-      // 256 and 512 are forced on the EAL, clamped to the CPU with a warning.
-      {k256, kAvx2, kX86Default, 256, {force, "256"}, false},
-      {k256, kAvx512, kX86Default, 256, {force, "256"}, false},
-      {k256, kNeon, kArmDefault, 128, {force, "128"}, true},
-      {k512, kAvx512, kX86Default, 512, {force, "512"}, false},
-      {k512, kAvx2, kX86Default, 256, {force, "256"}, true},  // this host
-      {k512, kNoVectors, kX86Default, 64, {force, "64"}, true},
+      {kAuto, kAvx2, kX86, kX86Default, 256, {}, false},
+      {kAuto, kAvx512, kX86, kX86Default, 256, {}, false},  // no AVX-512 unless asked
+      {kAuto, kNeon, kX86, kX86Default, 128, {}, false},
+      {kAuto, kNeon, kArm, kArmDefault, 128, {}, false},
+      // x86: 256 and 512 are forced on the EAL, clamped to the CPU with a warning.
+      {k256, kAvx2, kX86, kX86Default, 256, {force, "256"}, false},
+      {k256, kAvx512, kX86, kX86Default, 256, {force, "256"}, false},
+      {k256, kNeon, kX86, kX86Default, 128, {force, "128"}, true},
+      {k512, kAvx512, kX86, kX86Default, 512, {force, "512"}, false},
+      {k512, kAvx2, kX86, kX86Default, 256, {force, "256"}, true},  // this host
+      {k512, kNoVectors, kX86, kX86Default, 64, {force, "64"}, true},
+      // arm64: nothing passed (DPDK keeps its unlimited default, SVE paths
+      // included), a warning; BESS kernels at the detected width.
+      {k256, kNeon, kArm, kArmDefault, 128, {}, true},
+      {k512, kNeon, kArm, kArmDefault, 128, {}, true},
   };
   for (const Row &row : rows) {
-    const SimdWidth w = ResolveSimdWidth(row.request, row.cpu, row.dpdk_default);
+    const SimdWidth w =
+        ResolveSimdWidth(row.request, row.cpu, row.cpu_width_known, row.dpdk_default);
     SCOPED_TRACE(w.Summary());
     EXPECT_EQ(row.request, w.request);
     EXPECT_EQ(arch::MaxSimdWidth(row.cpu), w.cpu);
@@ -93,7 +103,7 @@ TEST(SimdWidthTest, EffectiveWidthIsTheRequestWithinTheCpu) {
 
 TEST(SimdWidthTest, SummaryAndWarningSayWhatHappened) {
   const SimdWidth w =
-      ResolveSimdWidth(SimdWidthRequest::k512, kAvx2, kX86Default);
+      ResolveSimdWidth(SimdWidthRequest::k512, kAvx2, kX86, kX86Default);
   EXPECT_EQ("simd: width 256 (requested 512; CPU 256, DPDK default 256)",
             w.Summary());
   ASSERT_EQ(1u, w.warnings.size());
@@ -102,9 +112,13 @@ TEST(SimdWidthTest, SummaryAndWarningSayWhatHappened) {
             w.warnings[0]);
   EXPECT_EQ("--simd_width=256 requested, but this CPU lacks 256-bit vectors (x86 AVX2): "
             "using 128 bits, its widest, for DPDK and BESS kernels",
-            ResolveSimdWidth(SimdWidthRequest::k256, kNeon, kArmDefault).warnings.at(0));
+            ResolveSimdWidth(SimdWidthRequest::k256, kNeon, kX86, kX86Default).warnings.at(0));
+  EXPECT_EQ("--simd_width=512 limits DPDK only where the CPU's vector widths are known (x86); "
+            "SVE is not detected here: DPDK keeps its default limit (unlimited), BESS kernels "
+            "use 128 bits",
+            ResolveSimdWidth(SimdWidthRequest::k512, kNeon, kArm, kArmDefault).warnings.at(0));
   EXPECT_EQ("simd: width 128 (requested auto; CPU 128, DPDK default unlimited)",
-            ResolveSimdWidth(SimdWidthRequest::kAuto, kNeon, kArmDefault).Summary());
+            ResolveSimdWidth(SimdWidthRequest::kAuto, kNeon, kArm, kArmDefault).Summary());
 }
 
 int Wide(int) { return 512; }
@@ -125,7 +139,7 @@ TEST(SimdWidthTest, A512RequestWithoutTheFullAvx512SetNeverSelectsA512Kernel) {
   };
   for (const arch::X86CpuFlags &flags : partial) {
     const SimdWidth w = ResolveSimdWidth(SimdWidthRequest::k512,
-                                         arch::VectorFeaturesFromX86(flags), kX86Default);
+                                         arch::VectorFeaturesFromX86(flags), kX86, kX86Default);
     EXPECT_EQ(256, w.effective);
     EXPECT_EQ(&Middle, arch::SelectSimdVariant<int(int)>(variants, w.effective));
     EXPECT_FALSE(w.warnings.empty());
@@ -133,11 +147,11 @@ TEST(SimdWidthTest, A512RequestWithoutTheFullAvx512SetNeverSelectsA512Kernel) {
   const arch::X86CpuFlags full{.sse42 = true, .avx2 = true, .avx512f = true, .avx512bw = true,
                                .avx512cd = true, .avx512dq = true, .avx512vl = true};
   const SimdWidth w = ResolveSimdWidth(SimdWidthRequest::k512,
-                                       arch::VectorFeaturesFromX86(full), kX86Default);
+                                       arch::VectorFeaturesFromX86(full), kX86, kX86Default);
   EXPECT_EQ(&Wide, arch::SelectSimdVariant<int(int)>(variants, w.effective));
   // Without AVX2 a 256 request does not select the 256-bit kernel either.
   const SimdWidth sse = ResolveSimdWidth(SimdWidthRequest::k256,
-                                         arch::VectorFeaturesFromX86({.sse42 = true}),
+                                         arch::VectorFeaturesFromX86({.sse42 = true}), kX86,
                                          kX86Default);
   EXPECT_EQ(&Portable, arch::SelectSimdVariant<int(int)>(variants, sse.effective));
 }
@@ -147,7 +161,7 @@ TEST(SimdWidthTest, A512RequestWithoutTheFullAvx512SetNeverSelectsA512Kernel) {
 TEST(SimdWidthTest, TheKernelDefaultIsWhatAutoChooses) {
   const CpuVectorFeatures cpu = arch::DetectCpuVectorFeatures();
   EXPECT_EQ(arch::DefaultSimdWidth(cpu),
-            ResolveSimdWidth(SimdWidthRequest::kAuto, cpu,
+            ResolveSimdWidth(SimdWidthRequest::kAuto, cpu, arch::kCpuSimdWidthKnown,
                              arch::kDpdkDefaultSimdWidth)
                 .effective);
   EXPECT_EQ(kArmDefault, arch::kDpdkUnlimitedSimdWidth);
@@ -163,8 +177,14 @@ TEST(SimdWidthTest, TheEalIsForcedToTheEffectiveWidth) {
   EXPECT_EQ(SimdWidthRequest::k512, w.request);
   const uint16_t cpu = arch::MaxSimdWidth(arch::DetectCpuVectorFeatures());
   EXPECT_EQ(cpu < 512 ? cpu : 512, w.effective);
-  EXPECT_EQ(w.effective, arch::DpdkMaxSimdWidth());
   EXPECT_EQ(w.effective, arch::SimdWidth()) << "BESS kernels follow the same width";
+  if (!arch::kCpuSimdWidthKnown) {
+    // arm64: nothing passed, DPDK keeps its default (SVE paths included).
+    EXPECT_TRUE(w.eal_args.empty());
+    EXPECT_EQ(arch::kDpdkDefaultSimdWidth, arch::DpdkMaxSimdWidth());
+    return;
+  }
+  EXPECT_EQ(w.effective, arch::DpdkMaxSimdWidth());
   // Forced: nothing later in the process changes DPDK's limit.
   EXPECT_EQ(-EPERM, rte_vect_set_max_simd_bitwidth(128));
   EXPECT_EQ(w.effective, arch::DpdkMaxSimdWidth());

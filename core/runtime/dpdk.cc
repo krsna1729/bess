@@ -27,6 +27,7 @@
 #include <sstream>
 #include <string>
 
+#include "arch/dpdk_simd.h"
 #include "runtime/memory.h"
 #include "runtime/opts.h"
 
@@ -264,6 +265,11 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
   enable_syslog();
   fclose(stdout);
   stdout = org_stdout;
+  // What DPDK applies (D-126): bessd's width on x86, DPDK's default on arm64.
+  const uint16_t dpdk_width = arch::DpdkMaxSimdWidth();
+  LOG(INFO) << "DPDK SIMD limit: "
+            << (dpdk_width >= arch::kDpdkUnlimitedSimdWidth ? std::string("unlimited")
+                                                            : std::to_string(dpdk_width));
 
   rte_openlog_stream(fopencookie(nullptr, "w", dpdk_log_funcs));
 }

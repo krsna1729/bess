@@ -35,6 +35,8 @@
 #include "module.h"
 #include "port.h"
 #include "runtime/runtime_state.h"
+#include "arch/dpdk_simd.h"
+#include "dpdk.h"
 #include "runtime/numa_placement.h"
 #include "runtime/simd_width.h"
 #include "stats/event_hub.h"
@@ -913,6 +915,10 @@ grpc::Status ControlV2Service::GetCapabilities(grpc::ServerContext *,
   const runtime::SimdWidth &simd = runtime::ProcessSimdWidth();
   response->set_simd(simd.Summary());
   response->set_simd_width(simd.effective);
+  // DPDK's own answer: equal to the above on x86, its default on arm64.
+  if (IsDpdkInitialized()) {
+    response->set_dpdk_simd_width(arch::DpdkMaxSimdWidth());
+  }
   return grpc::Status::OK;
 }
 

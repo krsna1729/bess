@@ -27,6 +27,7 @@
 // BESS_ARCH_GENERIC build the kernels simply declare no vector variants.
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -42,6 +43,16 @@ inline constexpr uint16_t kSimdScalar = 64;  // no vector variant
 inline constexpr uint16_t kSimd128 = 128;
 inline constexpr uint16_t kSimd256 = 256;
 inline constexpr uint16_t kSimd512 = 512;
+
+// Whether DetectCpuVectorFeatures() sees every vector width the CPU has, so
+// a width beyond it is known to be absent. True on x86 (cpuid); not on
+// arm64, where SVE (up to 2048 bits, which DPDK's arm64 paths use) is not
+// detected and 128 is only Advanced SIMD's width (D-126).
+#if defined(__x86_64__) || defined(__i386__)
+inline constexpr bool kCpuSimdWidthKnown = true;
+#else
+inline constexpr bool kCpuSimdWidthKnown = false;
+#endif
 
 // The vector ISA levels a CPU has.
 struct CpuVectorFeatures {
@@ -206,9 +217,9 @@ inline uint16_t SimdWidth() noexcept {
 }
 
 // Sets the width every RuntimeDispatch, present and future, resolves for.
-// bessd calls it once, at startup, before any worker runs: a dispatcher's
-// pointer is a plain word that workers read without synchronization. Tests
-// may call it again (and restore the old width).
+// bessd calls it once, at startup, before any worker runs. Tests may call it
+// again (and restore the old width); a call running meanwhile takes either
+// implementation.
 inline void SetSimdWidth(uint16_t width) noexcept {
   detail::ResolveAll(width);
 }
@@ -229,7 +240,7 @@ class RuntimeDispatch final : detail::DispatchNode {
  public:
   explicit RuntimeDispatch(const std::array<SimdVariant<Fn>, N> &variants) noexcept
       : variants_(variants) {
-    fn_ = SelectSimdVariant<Fn>(variants_, Register());
+    fn_.store(SelectSimdVariant<Fn>(variants_, Register()), std::memory_order_relaxed);
   }
   ~RuntimeDispatch() { Unregister(); }
   RuntimeDispatch(const RuntimeDispatch &) = delete;
@@ -237,20 +248,23 @@ class RuntimeDispatch final : detail::DispatchNode {
 
   template <typename... Args>
   decltype(auto) operator()(Args &&...args) const {
-    return fn_(std::forward<Args>(args)...);
+    return fn_.load(std::memory_order_relaxed)(std::forward<Args>(args)...);
   }
 
   // The implementation calls go to, and every one there is (tests).
-  Fn *selected() const noexcept { return fn_; }
+  Fn *selected() const noexcept { return fn_.load(std::memory_order_relaxed); }
   std::span<const SimdVariant<Fn>> variants() const noexcept { return variants_; }
 
  private:
   void Resolve(uint16_t width) noexcept override {
-    fn_ = SelectSimdVariant<Fn>(variants_, width);
+    fn_.store(SelectSimdVariant<Fn>(variants_, width), std::memory_order_relaxed);
   }
 
   std::array<SimdVariant<Fn>, N> variants_;
-  Fn *fn_ = nullptr;
+  // Relaxed: a plain load on x86 and arm64; atomic only so that a width set
+  // while another thread calls (a test re-resolving) is not a data race.
+  // Either pointer is a correct implementation.
+  std::atomic<Fn *> fn_{nullptr};
 };
 
 }  // namespace bess::arch

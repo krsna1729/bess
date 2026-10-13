@@ -184,7 +184,7 @@ of one; outside the set it is refused. In the SDKs: C++
 `memory_node` and its one-line `placement` summary (`bessctl status` prints
 both); `GetPortStatus` a port's `numa_node` (-1: unknown) and `cross_numa`.
 `GetCapabilities` also carries the SIMD width DPDK and BESS kernels use
-(D-126): `simd_width` in bits and the `simd` summary line (`bessctl status`
+(D-126): `simd_width`, BESS kernels' width in bits, `dpdk_simd_width`, DPDK's own limit after EAL init (32768: unlimited; equal on x86, DPDK's default on arm64), and the `simd` summary line (`bessctl status`
 prints it; see [placement.md](placement.md#simd-width)).
 
 A left-out `core` no longer means CPU 0. The field gained presence, so the

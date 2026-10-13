@@ -9003,6 +9003,19 @@ tests `core/arch/simd_dispatch_test.cc`, `core/runtime/simd_width_test.cc`, `cor
 `tests/live/simd_width_test.cc` with `Daemon::Launch`/`Shutdown`/`Log` in `tests/live/live_daemon.{h,cc}`,
 `tools/live_perf.py` (flags in a build spec), docs `placement.md` (SIMD width), `control-sdk.md`, `limits.md`,
 `benchmarking.md`, `performance-clawback.md`, `MODERNIZATION.md` (D2 done).
+
+**Amendment (review).** arm64: `DetectCpuVectorFeatures()` sees Advanced SIMD (128) but not SVE, so the clamp
+would have passed `--force-max-simd-bitwidth 128` for an explicit 256 or 512 -- narrower than `auto`, which leaves
+DPDK unlimited, and below the 256 that hns3's SVE Rx/Tx paths need. `arch::kCpuSimdWidthKnown` (x86 true, else
+false) is now an input of `ResolveSimdWidth`: where the CPU's widths are not known an explicit width passes nothing
+to the EAL, DPDK keeps its default, BESS kernels take the request within the detected width, and a WARNING says so
+(once: the width is resolved once). Reported separately: `GetCapabilities.simd_width` (13) is BESS's kernels' width,
+the new `dpdk_simd_width` (14) DPDK's own limit read with `rte_vect_get_max_simd_bitwidth()` after EAL init
+(32768: unlimited), also an INFO line `DPDK SIMD limit: N` and in `bessctl status`. Unit rows with fake arm64
+features: explicit 256 and 512 give no EAL argument. The dispatcher's pointer is a `std::atomic<Fn *>` with relaxed
+loads and stores (a plain load on x86 and arm64), so a test re-resolving the width while another thread calls is not
+a data race.
+
 ## D-127 Compiler tuning: `-mtune` is an option, releases keep the compiler's default
 
 **Status:** accepted.

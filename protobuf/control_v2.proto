@@ -432,10 +432,13 @@ message GetCapabilitiesResponse {
   string placement = 10;
   int32 memory_node = 11;
   // SIMD width (D-126): the summary bessd logged at startup ("simd: width W
-  // (requested R; CPU C, DPDK default D)") and W, the widest vectors DPDK and
-  // BESS kernels use, in bits.
+  // (requested R; CPU C, DPDK default D)"); W, the widest vectors BESS's own
+  // kernels use, in bits; and DPDK's limit as DPDK reports it after EAL
+  // initialization (rte_vect_get_max_simd_bitwidth(); 32768: unlimited, as on
+  // arm64). On x86 the two are equal; on arm64 DPDK keeps its default.
   string simd = 12;
   uint32 simd_width = 13;
+  uint32 dpdk_simd_width = 14;
 }
 
 // -- Schema discovery (D-105) ---------------------------------------------

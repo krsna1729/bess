@@ -43,8 +43,8 @@ std::string_view SimdWidthRequestName(SimdWidthRequest request) {
   return "auto";
 }
 
-SimdWidth ResolveSimdWidth(SimdWidthRequest request,
-                           arch::CpuVectorFeatures cpu, uint16_t dpdk_default) {
+SimdWidth ResolveSimdWidth(SimdWidthRequest request, arch::CpuVectorFeatures cpu,
+                           bool cpu_width_known, uint16_t dpdk_default) {
   SimdWidth w;
   w.request = request;
   w.cpu = arch::MaxSimdWidth(cpu);
@@ -56,6 +56,17 @@ SimdWidth ResolveSimdWidth(SimdWidthRequest request,
   const uint16_t requested =
       request == SimdWidthRequest::k512 ? arch::kSimd512 : arch::kSimd256;
   w.effective = std::min(requested, w.cpu);
+  if (!cpu_width_known) {
+    // arm64: SVE goes undetected, so a clamp to the detected width could
+    // narrow DPDK below its default (unlimited; hns3's SVE paths need 256).
+    // DPDK keeps its default; only BESS kernels follow the request.
+    w.warnings.push_back("--simd_width=" + std::to_string(requested) +
+                         " limits DPDK only where the CPU's vector widths are known "
+                         "(x86); SVE is not detected here: DPDK keeps its default "
+                         "limit (" + WidthName(dpdk_default) + "), BESS kernels use " +
+                         std::to_string(w.effective) + " bits");
+    return w;
+  }
   if (requested > w.cpu) {
     // D-123's rule: diagnose, and proceed with what the CPU has.
     w.warnings.push_back(
@@ -86,7 +97,7 @@ const SimdWidth &ProcessSimdWidth() {
         ParseSimdWidthRequest(FLAGS_simd_width);
     SimdWidth w =
         ResolveSimdWidth(request.value_or(SimdWidthRequest::kAuto),
-                         arch::DetectCpuVectorFeatures(),
+                         arch::DetectCpuVectorFeatures(), arch::kCpuSimdWidthKnown,
                          arch::kDpdkDefaultSimdWidth);
     LOG(INFO) << w.Summary();
     for (const std::string &warning : w.warnings) {
