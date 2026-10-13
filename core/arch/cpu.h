@@ -38,6 +38,16 @@ inline constexpr size_t kCacheLineSize = 128;
 inline constexpr size_t kCacheLineSize = 64;
 #endif
 
+// Whether plain (non-atomic, aligned) stores become visible to other cores in
+// program order: x86's total store order. arm64 may reorder them, so code that
+// publishes to lock-free readers with plain stores (rte_fib, D-132) is safe
+// only where this is true. False in a BESS_ARCH_GENERIC build, as on arm64.
+#if defined(BESS_ARCH_X86)
+inline constexpr bool kStoresInProgramOrder = true;
+#else
+inline constexpr bool kStoresInProgramOrder = false;
+#endif
+
 // Tells the CPU this thread is spinning (x86 PAUSE, arm64 YIELD). Also a
 // compiler barrier, as the asm forms are.
 inline void CpuRelax() noexcept {

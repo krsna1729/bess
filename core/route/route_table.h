@@ -21,6 +21,7 @@
 #include <rte_lpm.h>
 #include <rte_memory.h>
 
+#include "arch/cpu.h"
 #include "rcu/rcu_domain.h"
 #include "rcu/rcu_ptr.h"
 #include "utils/common.h"
@@ -102,14 +103,11 @@ enum class RouteBackend : uint8_t {
 
 // rte_fib writes its entries with plain stores (lib/fib/dir24_8.c
 // write_to_fib), so a lock-free reader sees a new tbl8 group's entries before
-// the tbl24 entry that points to it only under x86's store order; rte_lpm
-// uses release stores. Elsewhere the rte_fib backend is refused. (D-132)
+// the tbl24 entry that points to it only where plain stores stay in program
+// order (x86); rte_lpm uses release stores. Elsewhere the rte_fib backend is
+// refused. (D-132)
 inline constexpr bool RouteBackendSupported(RouteBackend backend) {
-#if defined(__x86_64__)
-  return true;
-#else
-  return backend != RouteBackend::kRteFib;
-#endif
+  return backend != RouteBackend::kRteFib || arch::kStoresInProgramOrder;
 }
 
 // IPv4 longest-prefix match on DPDK `rte_lpm` or `rte_fib` (K7, D-132),

@@ -71,14 +71,19 @@ LpmRouteTable::Instance::~Instance() {
 
 namespace {
 
-// rte_lpm and rte_fib names are global to the EAL; RTE_LPM_NAMESIZE-1 is the
-// shorter limit. A replacement instance exists alongside the one it replaces.
+// rte_lpm and rte_fib names are global to the EAL, and a replacement instance
+// exists alongside the one it replaces, so the counter suffix must survive
+// every name DPDK derives from it. The tightest are the defer-queue rings
+// ("LPM_RCU_<name>", "FIB_RCU_<name>", cut to RTE_RCU_QSBR_DQ_NAMESIZE - 1 =
+// 28 characters) and rte_fib's RIB mempool ("MP_<name>", at most 25): 20.
+constexpr size_t kMaxInstanceName = 20;
+
 std::string InstanceName(const std::string &base) {
   static std::atomic<uint64_t> next{0};
   char suffix[24];
   snprintf(suffix, sizeof(suffix), "_r%lu",
            static_cast<unsigned long>(next.fetch_add(1)));
-  const size_t room = RTE_LPM_NAMESIZE - 1 - strlen(suffix);
+  const size_t room = kMaxInstanceName - strlen(suffix);
   return base.substr(0, room) + suffix;
 }
 

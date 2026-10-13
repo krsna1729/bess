@@ -9437,20 +9437,36 @@ as `rte_lpm`; `rte_lpm` stays the default.
 - **The same limits and errors as `rte_lpm`.** `rte_fib` does not hold `Config`'s limits itself: it rounds the
   tbl8 pool up to a multiple of 64 groups (`dir24_8_create`), and its RIB takes up to 2 x `max_routes` nodes. The
   table enforces both for that backend, the way `rte_lpm` counts them: at most `max_routes` rules, and one group
-  per /24 that holds a rule longer than /24 (`FibAdmits`). A refusal is `kTableFull` with nothing changed. The
+  per /24 that holds a rule longer than /24 (`FibAdmits`). A refusal by that count is `kTableFull` with nothing
+  changed. The
   `rte_fib` pool gets one group beyond the budget, because `install_to_fib` asks for two free groups for a range
   that ends on a /24 boundary even when it needs one; without the spare, a re-point of a /24 whose group was merged
   away, or such an add, would fail with the budget not spent, where `rte_lpm` cannot.
 - **The defer queue holds the whole pool.** `rte_fib`'s defaults to 128 entries (a ring of 255); when it is full
   and a stalled reader blocks reclamation, `rte_fib` logs and leaks the group it could not queue. The backend sets
   `dq_size` to the pool. Without it, `DeletesNeverFailWithAStalledReader/Fib` fails at its 255th group.
+- **Instance names are at most 20 characters** (the table name, cut, plus a `_r<N>` counter), for both backends.
+  DPDK derives global names from it: `rte_fib`'s RIB mempool (`MP_<name>`) refuses more than 22, and the
+  defer-queue rings (`LPM_RCU_<name>`, `FIB_RCU_<name>`) keep only 28 characters. Before, with 31, a
+  name over 22 characters failed `rte_fib`'s `Create`, and on either backend a long name made `Clear` or a
+  replacement (`ReplaceAll`, a Router transaction) fail: the new instance's ring had the live one's name.
+  `RouteTableTest.LongNamesSurviveReplacement` failed on both backends with 31 and passes with 20.
 - **x86-64 only.** `rte_fib` writes entries with plain stores (`write_to_fib`), so a lock-free reader sees a new
   tbl8 group filled before the tbl24 entry that points to it only under x86's store order; `rte_lpm` uses release
-  stores. Elsewhere `Create` refuses the backend (`kUnsupportedBackend`, `ENOTSUP`), and the backend-parameterised
-  tests and benchmarks run `rte_lpm` only.
-- **One difference stays.** With a reader stalled, `rte_lpm` refuses an add as soon as its freed groups are all in
-  the defer queue; `rte_fib` first uses its spare group and the rest of its 64-rounded pool. It refuses later, never
-  earlier.
+  stores. `RouteBackendSupported` asks `arch::kStoresInProgramOrder` (`core/arch/cpu.h`, false on arm64 and in a
+  `BESS_ARCH_GENERIC` build). Elsewhere `Create` refuses the backend (`kUnsupportedBackend`, `ENOTSUP`), and the
+  backend-parameterised tests and benchmarks run `rte_lpm` only.
+- **Two differences stay, both only while a reader is stalled** (a worker that stops reporting quiescence, so
+  freed groups wait in the defer queue):
+  - `rte_lpm` refuses an add as soon as its freed groups are all in the queue; `rte_fib` first uses its spare
+    group and the rest of its 64-rounded pool, so it refuses later, never earlier.
+  - `rte_fib` places a route that covers several gaps between more specific routes one gap at a time, and a gap
+    in a /24 whose group was merged away needs a new group. When none can be had, the add, re-point or delete fails
+    (`kTableFull`, or `kBackendFailure` for a delete) after the earlier gaps were written: lookups there already
+    give the new answer while the table keeps the old route. `rte_lpm` allocates before it writes and never
+    allocates for a delete. A route placed by a transaction is added with the value already covering it (D-023),
+    which makes `rte_fib` skip the update, so aborting it writes nothing and cannot fail this way. [INFERENCE from
+    `dir24_8_modify`; not tested]
 
 **Evidence.** Correctness: every `route_route_test`, `route_router_transaction_test`, `route_route_domain_test`,
 `route_lpm_resource_test` and `modules_ip_lookup_test` case runs on both backends (`/Lpm`, `/Fib`), including the
@@ -9459,13 +9475,13 @@ the per-/24 count is allocated before the DPDK add, so a refused allocation leav
 capacity tests and the RCU group tests. The RCU tests size the pool so that only reuse could succeed (`rte_fib`:
 budget 63, a pool of exactly 64).
 
-Cost (this host, isolated CPU 4, release build, DPDK 25.11.3 with the series; medians of 5, cv at most 1.5% except
-where noted):
+Cost (this host, isolated CPU 4, release build, DPDK 25.11.3 with the series; medians of 5; cv at most 1.6%, except
+`UpdateInPlace` on `rte_fib`, 3.1-3.6%, and the uniform-key rows, given in the table):
 
 | `route_bench` row | `rte_lpm` | `rte_fib` |
 |---|---|---|
 | `LookupRouteTable` 1K / 16K / 64K routes, route-derived keys (ns per key, batches of 32) | 5.26 / 5.62 / 5.83 | 3.66 / 4.42 / 4.93 |
-| the same, uniform random keys | 7.30 / 8.42 / 6.95 (cv 7.5% / 0.5% / 9.4%) | 6.51 / 6.57 / 6.61 |
+| the same, uniform random keys | 7.30 / 8.42 / 6.95 (cv 7.5% / 0.5% / 9.4%) | 6.51 / 6.57 / 6.61 (cv 0.4% / 1.5% / 8.4%) |
 | `LookupRouter` 1K / 16K / 64K (ns per packet, next hop included) | 6.69 / 7.37 / 7.72 | 5.16 / 6.25 / 6.64 |
 | `UpdateInPlace` 1K / 16K / 64K (ns per change) | 321 / 4,757 / 19,042 | 187 / 224 / 244 |
 

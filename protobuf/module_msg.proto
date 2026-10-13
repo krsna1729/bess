@@ -687,14 +687,6 @@ message IPEncapArg {
 }
 
 /**
- * An IPLookup module perfroms LPM lookups over a packet destination.
- * IPLookup takes no parameters to instantiate.
- * To add rules to the IPLookup table, use `IPLookup.add()`
- *
- * __Input Gates__: 1
- * __Output Gates__: many (configurable, depending on rule values)
- */
-/**
  * The DPDK longest-prefix-match structure behind an IPv4 route table (D-132).
  * LPM (rte_lpm) is the default. FIB (rte_fib DIR24_8, with BESS's carried
  * DPDK patches) changes routes much faster at every table size and has the
@@ -705,6 +697,14 @@ enum RouteBackend {
   ROUTE_BACKEND_FIB = 1;
 }
 
+/**
+ * An IPLookup module perfroms LPM lookups over a packet destination.
+ * IPLookup takes no parameters to instantiate.
+ * To add rules to the IPLookup table, use `IPLookup.add()`
+ *
+ * __Input Gates__: 1
+ * __Output Gates__: many (configurable, depending on rule values)
+ */
 message IPLookupArg {
   uint32 max_rules = 1; /// Maximum number of rules (default: 1024)
   uint32 max_tbl8s = 2; /// Maximum number of IP prefixes with smaller than /24 (default: 128)

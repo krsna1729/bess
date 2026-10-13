@@ -81,6 +81,7 @@ Columns:
 | Router | next hops | 16M − 1 | `LpmRouteTable::kMaxValue` | `max_next_hops` up to the bound | EINVAL "router capacity exceeds backend limits" |
 | Router | route domains | 16M | `route::kMaxRouteDomains` | `max_domains` up to the bound | EINVAL |
 | Router | members per next-hop group | 64 | `NextHopGroup::kMaxMembers` | No | refused |
+| IPLookup / Router | DPDK table instance name | 20 characters (the module name, cut, plus `_r<N>`) | `kMaxInstanceName` (`route/route_table.cc`) | No | never: the name is cut (DPDK's ring and `rte_fib` RIB mempool names, D-132) |
 | NAT | flows | default 65,536 | `NATArg.capacity`, `max_capacity` | yes | the table grows up to `max_capacity`; past it a new flow's packet is dropped and `bess.table_full` is raised |
 | NAT | idle timeout | 300 s | `kDefaultNatTimeout` (`nat/nat.h`), `BasicNat::kDefaultTimeout` | No | — |
 | Conntrack | flows | default 65,536 | `ConntrackArg.capacity` | yes | a new connection's packet leaves on gate 1 (not tracked) and `bess.table_full` is raised |

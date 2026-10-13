@@ -227,6 +227,26 @@ TEST_P(RouteTableTest, LimitsAreErrors) {
   EXPECT_FALSE(table->Find(P(Ip(1, 1, 2, 0), 25)).has_value());
 }
 
+// A module's name becomes the table's DPDK names. Those are global, cut to
+// DPDK's limits (rte_fib's RIB mempool takes at most 22 characters of it),
+// and a replacement exists beside the table it replaces: a long name must
+// neither fail Create nor make Clear's replacement collide with the live one.
+TEST_P(RouteTableTest, LongNamesSurviveReplacement) {
+  LpmRouteTable::Config config = bess::testing::TestRouteConfig();
+  auto created = RouteTable<Value>::Create(
+      "ip_lookup_upstream_network_instance_a", config,
+      bess::runtime::runtime().rcu());
+  ASSERT_TRUE(created.has_value()) << RouteErrorName(created.error());
+  auto &table = *created;
+  for (int round = 0; round < 3; round++) {
+    ASSERT_TRUE(table->Upsert(P(Ip(10, 1, 1, 0), 25), Value(1))) << round;
+    ASSERT_TRUE(table->Upsert(P(Ip(10, 0, 0, 0), 8), Value(2))) << round;
+    EXPECT_EQ(Value(1), table->Read().Lookup(Ip(10, 1, 1, 1)));
+    ASSERT_TRUE(table->Clear()) << "replacement " << round;
+    EXPECT_FALSE(table->Read().Lookup(Ip(10, 1, 1, 1)).has_value());
+  }
+}
+
 TEST_P(RouteTableTest, BatchMaskWithoutDefault) {
   auto table = MakeTable();
   ASSERT_TRUE(table->Upsert(P(Ip(10, 0, 0, 0), 8), Value(7)));
