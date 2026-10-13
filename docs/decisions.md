@@ -141,6 +141,7 @@ file is the reasoning.
 | D-118 | live_perf keeps control threads off worker CPUs and counts the worker that runs the test; the floor is at parity with master, the per-hop cost is not | accepted |
 | D-119 | Track's per-call overhead cut (cold CurrentWorkerId failure, initial-exec current_worker, static libraries as PIE); the hop without hooks is at master's cost, the gap left is Track's | accepted |
 | D-120 | bessctl is a mode of bessd (multi-call binary): `bin/bessctl` is a symlink to bessd, `bessd ctl` the same; the client runs first, unprivileged, on the SDK alone, with control_v2 registered once | accepted |
+| D-121 | ExactMatch: a fused kernel for a key that is one packet field of 1, 2, 4 or 8 bytes (load, mask, CRC32C and key row in one pass, then a prehashed lookup), chosen when a generation is built; 33 fewer instructions per packet on M.exactmatch; the generic path for every other layout | accepted |
 
 
 ---
@@ -8636,3 +8637,69 @@ CapAmb after the drop.
 `bessctl/standalone_main.cc`, `bessctl/meson.build`, `sdk/cpp/meson.build`, `core/meson.build`, `meson.build`,
 `tests/live/meson.build`, `tools/layer_dag.json`, `tools/check_link_graph.py`, `tools/package_release.py`,
 `tools/ci_profile.py`, `docs/control-sdk.md`, `MODERNIZATION.md`.
+
+## D-121 ExactMatch: a fused kernel for one-field keys
+
+**Status:** accepted.
+
+**Problem.** On M.exactmatch (one 4-byte packet field at offset 26, 1024 rules, all hits) ExactMatch ran about 200
+instructions per packet above M.base against master's 91. Profiled (perf, instructions per packet):
+`__bulk_lookup_lf` 72.5, `ExtractPlan::ExecuteSinglePacket` 30.1, `ExactMatch::Classify` 29.2, `CmpFixed<4>` (rte_hash's
+custom compare, an indirect call per key) 26.7, `rte_hash_lookup_with_hash_bulk_data` 26.6, `HashBatchFixed<4>`
+5.6. About a third was ours, between the packet and the table: a `SourceView` per packet, the plan's batch
+kernel through a function pointer (per packet the op's mask test and width switch), a pass for invalid rows, then
+a second pass over the rows to hash them (D-015) through the table's hash pointer.
+
+**Decision.**
+
+- **Chosen when a generation is built.** `Build()` records a fused kernel in the `Generation` when the plan is
+  `kSinglePacket` under `kCheck`, covers the key, and the key is 1, 2, 4 or 8 bytes: `fused_width`, `fused_offset`
+  and `fused_mask` (all ones when unmasked). Adjacent unmasked fields the plan coalesces into one count (two 4-byte
+  fields make an 8-byte key). Metadata fields, two or more ops, other widths, and the fail-closed generation keep
+  the generic path. Nothing is re-derived per batch: `Classify` tests `fused_width`.
+- **One pass per packet.** `data_len` of the first segment must reach offset + width, as under the plan's
+  `kCheck`; a shorter packet gets a zero key row and a clear valid bit and is never read. Otherwise one `memcpy`
+  load into a W-byte word, the mask, the key row, and its signature with `detail::CrcFixed<W>`, rte_hash's own hash
+  (bit-identical, D-015).
+- **Then one prehashed lookup:** `ConcurrentExactTable::LookupBatchPrehashed(keys, stride, sigs, values, n)`, which
+  calls `rte_hash_lookup_with_hash_bulk_data`; `LookupBatch` is now its hash pass plus that call. The kPending
+  handling (D-022) and the emit loop are unchanged; gate mode and action mode both run it (`Classify`).
+- **Observable for tests:** `fused_key_width()`, and `SetFusedKernelEnabled()`, which republishes the generation
+  with the kernel off or on so a test runs both paths on one module and its table.
+- **Not done: the indirect compare.** rte_hash compares keys through a pointer at every width (`rte_hash_cmp_eq`
+  calls the custom function or an entry of `cmp_jump_table`), so only a DPDK change removes `CmpFixed`'s call.
+
+**Evidence.**
+
+- **Generated code** (GCC 16.2, release, x86-64-v3; `LookupFused<uint32_t>`): a hit costs 19 instructions in
+  the loop: the mbuf pointer, `data_len`, compare and branch, `buf_addr` and `data_off`, the field load, `and` with
+  the mask, the key store, `crc32l`, the signature store, the valid bit (`shlx`, `or`), the loop. No call per packet;
+  the key pointers are filled four per AVX2 add; one call to `rte_hash_lookup_with_hash_bulk_data` per batch; each hit
+  is copied out in 6 instructions.
+- **Live** (two isolated runs, D-118 recipe, 8 rounds each, CPUs 2/4/6; master / develop before this change /
+  this change). ns per packet above M.base; then instructions and cycles per packet on the worker, whole pipeline:
+
+  | test | run 1 ns | run 2 ns | instructions | cycles, run 1 | cycles, run 2 |
+  |---|---|---|---|---|---|
+  | M.base (ns: total) | 5.95 / 7.14 / 7.11 | 6.18 / 7.56 / 7.73 | 98.1 / 119.6 / 119.6 | 22.2 / 26.3 / 26.5 | 22.0 / 26.4 / 27.3 |
+  | M.exactmatch | 10.31 / 10.48 / 9.71 | 11.00 / 10.70 / 10.09 | 189.3 / 319.4 / 286.4 | 61.9 / 64.8 / 62.4 | 62.5 / 64.3 / 62.9 |
+  | M.exactmatch/miss | 5.59 / 6.59 / 5.52 | 5.93 / 6.96 / 5.81 | 218.8 / 257.7 / 224.6 | 43.7 / 51.6 / 47.2 | 44.1 / 51.4 / 47.9 |
+  | M.exactmatch/mixed | 11.03 / 23.81 / 22.38 | 11.82 / 25.47 / 24.66 | 213.9 / 332.4 / 299.5 | 66.2 / 121.3 / 115.7 | 66.4 / 121.2 / 118.2 |
+
+  Instructions per packet fall by 33 on all three ExactMatch tests in both runs (run 2's counts are within 0.4
+  of run 1's): above M.base, hits 199.8 to 166.8 (master 91.2), misses 138.1 to 105.0 (master 120.7). Cycles fall
+  1.4-2.4 on hits, 3.5-4.4 on misses and 3.0-5.6 on mixed bursts; ns above M.base -6 to -7% on hits, -16% on misses.
+  Whole-pipeline cycles are now within 0.5 of master's on hits and 3.5-3.8 above them on misses, while M.base alone
+  is 4-5 above master's (D-119). The mixed burst's gap is still `__bulk_lookup_lf`'s branch misses (1.7 per packet
+  against master's 0.7; D-001). Both runs flagged IRQ or softirq activity on the target CPUs, as earlier runs did.
+- **Tests.** `ExactMatchPacketTest.FusedKernelClassifiesAsTheGenericPath`: widths 1, 2, 4 and 8 at offsets 0, 1,
+  26 and 51, unmasked and masked (hits with masked-off bits set), with packets one byte short of the field and
+  exactly long enough; the fused and generic gates of 256 packets are equal, and short packets take the default
+  gate. `FusedKernelOnlyForOnePacketFieldOf1248Bytes` checks the selection over eleven layouts.
+  `SessionPipelineTest.FusedKernelMatchesTheGenericPathInActionMode` compares the action ids. Mutations of the
+  fused loop, each caught: the field read one byte late, a strict length check (packets exactly long enough
+  rejected), the mask dropped. The fast suite (181 tests, live and Go conformance included) passes; the clang-tidy
+  findings of `exact_match.cc` and `concurrent_exact.cc` are unchanged.
+
+**Code.** `core/modules/exact_match.{h,cc}`, `core/classifier/concurrent_exact.h`, `core/modules/exact_match_test.cc`,
+`core/modules/session_pipeline_test.cc`, `docs/dataplane-tables.md`.

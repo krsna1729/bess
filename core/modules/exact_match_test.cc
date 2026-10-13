@@ -10,6 +10,7 @@
 #include <google/protobuf/util/message_differencer.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <map>
@@ -20,6 +21,7 @@
 #include "module.h"
 #include "module_graph.h"
 #include "runtime/runtime_state.h"
+#include "packet_pool.h"
 #include "modules/exact_match.h"
 #include "pb/module_msg.pb.h"
 #include "testing/module_harness.h"
@@ -503,6 +505,176 @@ TEST(ExactMatchPacketTest, MaskedOffRuleBitsStayUnmatchable) {
   EXPECT_EQ((std::map<gate_idx_t, size_t>{{2, 1}}),
             Counts(h.Run(em, 0, {hit_any_second}, {0, 1, 2, 3})));
   EXPECT_EQ((std::map<gate_idx_t, size_t>{{3, 1}}), Counts(h.Run(em, 0, {miss}, {0, 1, 2, 3})));
+}
+
+// The fused kernel (D-121) against the generic path, both in ClassifyBatch
+// (the code ProcessBatch runs) on one module and its rules.
+
+// Packets of random bytes and lengths, batched 32 at a time.
+class RandomPackets {
+ public:
+  static constexpr size_t kRoom = 64;
+
+  explicit RandomPackets(size_t n) : pool_(n + 64) {
+    for (size_t i = 0; i < n; i++) {
+      bess::PacketHandle pkt = pool_.Alloc(kRoom);
+      EXPECT_NE(pkt, nullptr);
+      handles_.push_back(pkt);
+    }
+  }
+  ~RandomPackets() {
+    for (bess::PacketHandle pkt : handles_) {
+      bess::PacketFree(pkt);
+    }
+  }
+  RandomPackets(const RandomPackets &) = delete;
+  RandomPackets &operator=(const RandomPackets &) = delete;
+
+  size_t size() const { return handles_.size(); }
+  uint8_t *data(size_t i) const {
+    return bess::PacketRef(handles_[i]).head_data<uint8_t *>();
+  }
+  void SetLength(size_t i, size_t len) {
+    bess::PacketRef(handles_[i]).set_data_len(static_cast<uint16_t>(len));
+  }
+
+  // The gates `em` sends every packet to, 32 at a time.
+  std::vector<gate_idx_t> Classify(const ExactMatch *em) const {
+    std::vector<gate_idx_t> gates(handles_.size());
+    for (size_t first = 0; first < handles_.size();
+         first += bess::PacketBatch::kMaxBurst) {
+      const size_t n =
+          std::min(bess::PacketBatch::kMaxBurst, handles_.size() - first);
+      bess::PacketBatch batch;
+      batch.clear();
+      for (size_t i = 0; i < n; i++) {
+        batch.add(bess::PacketRef(handles_[first + i]));
+      }
+      em->ClassifyBatch(&batch, gates.data() + first);
+    }
+    return gates;
+  }
+
+ private:
+  bess::PlainPacketPool pool_;
+  std::vector<bess::PacketHandle> handles_;
+};
+
+// Every width the fused kernel takes, at odd and even offsets, unmasked and
+// masked: hits (some with masked-off bits set), misses, packets one byte
+// too short for the field and packets exactly long enough. The fused and the
+// generic path send every packet to the same gate.
+TEST(ExactMatchPacketTest, FusedKernelClassifiesAsTheGenericPath) {
+  std::mt19937 rng(121);
+  for (const size_t width : {size_t{1}, size_t{2}, size_t{4}, size_t{8}}) {
+    for (const size_t offset : {size_t{0}, size_t{1}, size_t{26}, size_t{51}}) {
+      for (const bool masked : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "width " << width << " offset "
+                                          << offset << " masked " << masked);
+        ExactMatchArg arg;
+        *arg.add_fields() = OffsetField(static_cast<uint32_t>(offset),
+                                        static_cast<uint32_t>(width));
+        // A mask of the same byte everywhere does not depend on byte order.
+        const unsigned mask = masked ? 0xf0u : 0xffu;
+        if (masked) {
+          *arg.add_masks() = Bin(std::string(width, '\xf0'));
+        }
+        arg.set_default_gate(0);
+        ModuleHarness h;
+        auto *em = static_cast<ExactMatch *>(h.Create("ExactMatch", arg));
+        ASSERT_NE(nullptr, em);
+        EXPECT_EQ(width, em->fused_key_width());
+
+        // Rule keys hold only bits the mask keeps, so masked packets match.
+        std::vector<std::string> keys;
+        for (size_t r = 0; r < 64; r++) {
+          std::string key(width, '\0');
+          for (char &c : key) {
+            c = static_cast<char>(rng() & mask);
+          }
+          keys.push_back(key);
+          h.MustCommand(em, "add", BinRule({key}, 1 + r % 15));
+        }
+
+        RandomPackets packets(256);
+        const size_t need = offset + width;
+        for (size_t i = 0; i < packets.size(); i++) {
+          uint8_t *p = packets.data(i);
+          for (size_t k = 0; k < RandomPackets::kRoom; k++) {
+            p[k] = static_cast<uint8_t>(rng());
+          }
+          if (i % 4 != 3) {  // a rule's key, with masked-off bits noise
+            const std::string &key = keys[rng() % keys.size()];
+            for (size_t k = 0; k < width; k++) {
+              p[offset + k] = static_cast<uint8_t>(
+                  static_cast<uint8_t>(key[k]) | (rng() & (0xffu ^ mask)));
+            }
+          }
+          switch (i % 5) {
+            case 0:
+              packets.SetLength(i, need - 1);
+              break;
+            case 1:
+              packets.SetLength(i, need);
+              break;
+            default:
+              packets.SetLength(i, need + rng() % (RandomPackets::kRoom - need + 1));
+              break;
+          }
+        }
+
+        const std::vector<gate_idx_t> fused = packets.Classify(em);
+        Error err;
+        ASSERT_TRUE(em->SetFusedKernelEnabled(false, &err)) << err.second;
+        EXPECT_EQ(0u, em->fused_key_width());
+        const std::vector<gate_idx_t> generic = packets.Classify(em);
+        EXPECT_EQ(generic, fused);
+
+        size_t hits = 0;
+        for (size_t i = 0; i < packets.size(); i++) {
+          hits += fused[i] != 0;
+          if (i % 5 == 0) {
+            EXPECT_EQ(gate_idx_t{0}, fused[i])
+                << "packet " << i << " is too short";
+          }
+        }
+        EXPECT_GT(hits, packets.size() / 3);
+      }
+    }
+  }
+}
+
+// The fused kernel takes exactly a key that is one packet field of 1, 2, 4
+// or 8 bytes (after coalescing adjacent fields); every other layout runs the
+// generic path.
+TEST(ExactMatchPacketTest, FusedKernelOnlyForOnePacketFieldOf1248Bytes) {
+  struct Case {
+    std::vector<bess::pb::Field> fields;
+    size_t fused;
+  };
+  const std::vector<Case> cases = {
+      {{OffsetField(26, 1)}, 1},
+      {{OffsetField(27, 2)}, 2},
+      {{OffsetField(26, 4)}, 4},
+      {{OffsetField(30, 8)}, 8},
+      {{OffsetField(26, 2), OffsetField(28, 2)}, 4},  // coalesced: one field
+      {{OffsetField(26, 4), OffsetField(30, 4)}, 8},
+      {{OffsetField(26, 3)}, 0},
+      {{OffsetField(26, 6)}, 0},
+      {{OffsetField(26, 4), OffsetField(34, 2)}, 0},
+      {{OffsetField(28, 2), OffsetField(26, 2)}, 0},  // key order != packet
+      {{AttrField("fused_kernel_attr", 4)}, 0},
+  };
+  for (size_t c = 0; c < cases.size(); c++) {
+    ModuleHarness h;
+    ExactMatchArg arg;
+    for (const bess::pb::Field &f : cases[c].fields) {
+      *arg.add_fields() = f;
+    }
+    auto *em = static_cast<ExactMatch *>(h.Create("ExactMatch", arg));
+    ASSERT_NE(nullptr, em) << "case " << c;
+    EXPECT_EQ(cases[c].fused, em->fused_key_width()) << "case " << c;
+  }
 }
 
 }  // namespace

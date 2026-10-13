@@ -105,6 +105,115 @@ CommandResponse ApplyRuleOps(bess::dataplane::TransactionEngine &engine,
   return CommandFailure(EINVAL, "rule transaction was rejected");
 }
 
+// The generic path: extract every key with the generation's plan, then look
+// the batch up. ExactMatch's key layout is dense, so a fully-covering plan
+// writes every byte of every valid row and the used region needs no
+// pre-zeroing; a failed extraction writes nothing, and invalid rows are
+// zeroed before the backend (which looks up all rows) sees them. Gapped
+// generic schemas keep the caller-initializes-gap contract and pre-zero
+// instead. Sets *valid to the extraction mask; returns the hit mask.
+uint64_t LookupExtracted(const bess::PacketBatch &batch,
+                         const classifier::ExtractPlan &extract,
+                         size_t key_size,
+                         const classifier::ConcurrentExactTable &table,
+                         std::byte *keys, uint64_t *values,
+                         uint64_t *valid) noexcept {
+  const auto cnt = static_cast<size_t>(batch.cnt());
+  const classifier::MutableBytes rows(keys, cnt * key_size);
+  if (!extract.fully_covers_key()) {
+    std::memset(rows.data(), 0, rows.size());
+  }
+  std::array<classifier::SourceView, bess::PacketBatch::kMaxBurst> sources;
+  for (size_t i = 0; i < cnt; i++) {
+    const bess::PacketRef pkt = batch.packet(i);
+    // Packet span is the first segment only: fields reaching past data_len
+    // (or into later segments) fail extraction under kCheck and take the
+    // default gate instead of over-reading, as the legacy 8-byte loads could.
+    sources[i].packet = classifier::ConstBytes(
+        pkt.head_data<const std::byte *>(),
+        static_cast<size_t>(pkt.data_len()));
+    sources[i].metadata = classifier::ConstBytes(
+        pkt.metadata<const std::byte *>(), SNBUF_METADATA);
+  }
+
+  // One extraction batch dispatch, one backend batch dispatch. Metadata
+  // attribute IDs were resolved to physical offsets at (re)build time, so
+  // nothing here resolves names or parses configuration.
+  const uint64_t ok = extract.ExecuteBatch(
+      std::span<const classifier::SourceView>(sources).first(cnt), rows,
+      key_size);
+  // Invalid rows hold stale scratch (or partial gap bytes); zero them so the
+  // backend sees well-defined keys. Their results are discarded through the
+  // validity mask regardless.
+  const uint64_t all_valid = (uint64_t{1} << cnt) - 1;
+  if ((ok & all_valid) != all_valid) {
+    for (size_t i = 0; i < cnt; i++) {
+      if (!(ok & (uint64_t{1} << i))) {
+        std::memset(keys + i * key_size, 0, key_size);
+      }
+    }
+  }
+  *valid = ok;
+  return table.LookupBatch(rows, key_size, values, cnt);
+}
+
+// The fused fixed-layout kernel (D-121), for a key that is one packet field
+// of sizeof(Word) bytes at `offset`: per packet one length check against the
+// first segment, one load, the mask, the key row and its CRC32C
+// (detail::CrcFixed, rte_hash's own hash, D-015); then one prehashed bulk
+// lookup. A packet too short for the field fails extraction as under the
+// generic plan's kCheck: nothing past data_len is read, its row is zero and
+// its bit in *valid is clear. Returns the lookup's hit mask.
+template <typename Word>
+uint64_t LookupFused(const bess::PacketBatch &batch, size_t offset,
+                     uint64_t mask, const classifier::ConcurrentExactTable &table,
+                     std::byte *keys, uint64_t *values,
+                     uint64_t *valid) noexcept {
+  constexpr size_t kWidth = sizeof(Word);
+  const auto word_mask = static_cast<Word>(mask);
+  const size_t need = offset + kWidth;
+  const auto cnt = static_cast<size_t>(batch.cnt());
+  hash_sig_t sigs[bess::PacketBatch::kMaxBurst];
+  uint64_t ok = 0;
+  for (size_t i = 0; i < cnt; i++) {
+    const bess::PacketRef pkt = batch.packet(i);
+    Word v = 0;
+    if (static_cast<size_t>(pkt.data_len()) >= need) {
+      std::memcpy(&v, pkt.head_data<const std::byte *>() + offset, kWidth);
+      v &= word_mask;
+      ok |= uint64_t{1} << i;
+    }
+    std::byte *row = keys + i * kWidth;
+    std::memcpy(row, &v, kWidth);
+    sigs[i] = classifier::detail::CrcFixed<kWidth>(row);
+  }
+  *valid = ok;
+  return table.LookupBatchPrehashed(classifier::ConstBytes(keys, cnt * kWidth),
+                                    kWidth, sigs, values, cnt);
+}
+
+// LookupFused for a width chosen at publish: 1, 2, 4 or 8.
+uint64_t LookupFused(size_t width, const bess::PacketBatch &batch,
+                     size_t offset, uint64_t mask,
+                     const classifier::ConcurrentExactTable &table,
+                     std::byte *keys, uint64_t *values,
+                     uint64_t *valid) noexcept {
+  switch (width) {
+    case 1:
+      return LookupFused<uint8_t>(batch, offset, mask, table, keys, values,
+                                  valid);
+    case 2:
+      return LookupFused<uint16_t>(batch, offset, mask, table, keys, values,
+                                   valid);
+    case 4:
+      return LookupFused<uint32_t>(batch, offset, mask, table, keys, values,
+                                   valid);
+    default:
+      return LookupFused<uint64_t>(batch, offset, mask, table, keys, values,
+                                   valid);
+  }
+}
+
 }  // namespace
 
 CommandResponse ExactMatch::AddFieldOne(const bess::pb::Field &field,
@@ -370,10 +479,30 @@ ExactMatch::GenerationPtr ExactMatch::Build(
   }
   CHECK_EQ(layout.key_size, table->key_len());
 
-  return std::make_unique<Generation>(
+  auto gen = std::make_unique<Generation>(
       default_gate, std::move(*plan), std::move(table), layout.key_size,
       /*extraction_valid=*/true, std::move(layout.converted_masks),
       std::move(layout.baked_offsets));
+
+  // The fused kernel (D-121) takes a key that is exactly one packet field of
+  // 1, 2, 4 or 8 bytes, checked against the first segment (kCheck).
+  const classifier::ExtractPlan &extract = gen->extract;
+  const size_t width = gen->key_size;
+  if (fused_enabled_ &&
+      extract.kernel() == classifier::ExtractKernel::kSinglePacket &&
+      extract.bounds() == classifier::BoundsPolicy::kCheck &&
+      extract.fully_covers_key() &&
+      (width == 1 || width == 2 || width == 4 || width == 8)) {
+    const classifier::ExtractOp &op = extract.ops()[0];
+    gen->fused_offset = op.source_offset;
+    gen->fused_mask = ~uint64_t{0};
+    if (!op.mask.empty()) {
+      gen->fused_mask = 0;
+      std::memcpy(&gen->fused_mask, op.mask.data(), width);
+    }
+    gen->fused_width = width;
+  }
+  return gen;
 }
 
 ExactMatch::GenerationPtr ExactMatch::BuildDegraded(
@@ -937,58 +1066,20 @@ inline void ExactMatch::Classify(bess::PacketBatch *batch,
     return;
   }
 
-  // Stack scratch only: no packet-path allocation. ExactMatch's key layout
-  // is dense, so a fully-covering plan writes every byte of every valid row
-  // and the used region needs no pre-zeroing; a failed extraction writes
-  // nothing, and invalid rows are zeroed below before the backend (which
-  // looks up all rows) sees them. Gapped generic schemas keep the
-  // caller-initializes-gap contract and pre-zero instead.
-  const size_t key_size = gen.key_size;
-  std::array<classifier::SourceView, bess::PacketBatch::kMaxBurst> sources;
+  // Stack scratch only: no packet-path allocation. A generation with a fused
+  // kernel (one packet field of 1, 2, 4 or 8 bytes, chosen in Build) reads,
+  // hashes and looks up in one pass (D-121); every other layout extracts with
+  // its plan, then looks up.
   std::array<std::byte, bess::PacketBatch::kMaxBurst * kMaxKeyBytes> keys;
-  if (!gen.extract.fully_covers_key()) {
-    std::memset(keys.data(), 0, static_cast<size_t>(cnt) * key_size);
-  }
   std::array<uint64_t, bess::PacketBatch::kMaxBurst> gates;
-
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
-    // Packet span is the first segment only: fields reaching past data_len
-    // (or into later segments) fail extraction under kCheck and take the
-    // default gate instead of over-reading, as the legacy 8-byte loads could.
-    sources[i].packet = classifier::ConstBytes(
-        pkt.head_data<const std::byte *>(),
-        static_cast<size_t>(pkt.data_len()));
-    sources[i].metadata = classifier::ConstBytes(
-        pkt.metadata<const std::byte *>(), SNBUF_METADATA);
-  }
-
-  // One extraction batch dispatch, one backend batch dispatch. Metadata
-  // attribute IDs were resolved to physical offsets at (re)build time, so
-  // nothing here resolves names or parses configuration.
-  const uint64_t valid = gen.extract.ExecuteBatch(
-      std::span<const classifier::SourceView>(sources).first(
-          static_cast<size_t>(cnt)),
-      classifier::MutableBytes(keys).first(static_cast<size_t>(cnt) *
-                                           key_size),
-      key_size);
-  // Invalid rows hold stale scratch (or partial gap bytes); zero them so the
-  // backend sees well-defined keys. Their results are discarded through the
-  // validity mask below regardless.
-  const uint64_t all_valid =
-      (uint64_t{1} << static_cast<size_t>(cnt)) - 1;
-  if ((valid & all_valid) != all_valid) {
-    for (int i = 0; i < cnt; i++) {
-      if (!(valid & (uint64_t{1} << i))) {
-        std::memset(keys.data() + static_cast<size_t>(i) * key_size, 0,
-                    key_size);
-      }
-    }
-  }
-  uint64_t hits = gen.table->LookupBatch(
-      classifier::ConstBytes(keys.data(),
-                             static_cast<size_t>(cnt) * key_size),
-      key_size, gates.data(), static_cast<size_t>(cnt));
+  uint64_t valid = 0;
+  uint64_t hits =
+      gen.fused_width != 0
+          ? LookupFused(gen.fused_width, *batch, gen.fused_offset,
+                        gen.fused_mask, *gen.table, keys.data(), gates.data(),
+                        &valid)
+          : LookupExtracted(*batch, gen.extract, gen.key_size, *gen.table,
+                            keys.data(), gates.data(), &valid);
   hits &= valid;
   // A key a transaction is still preparing holds kPending: a miss (D-022).
   // A separate branch-free pass, which the compiler vectorizes; folding the
@@ -1058,6 +1149,22 @@ void ExactMatch::ClassifyActionsBatch(bess::PacketBatch *batch,
   Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
     action_ids[i] = hit ? static_cast<uint32_t>(value) : 0;
   });
+}
+
+size_t ExactMatch::fused_key_width() const {
+  return published_.Read()->fused_width;
+}
+
+bool ExactMatch::SetFusedKernelEnabled(bool enabled, Error *err) {
+  const bool was = fused_enabled_;
+  fused_enabled_ = enabled;
+  const bool published = Publish([&](const Generation &current) {
+    return Build(table_, current.default_gate, err);
+  }, err);
+  if (!published) {
+    fused_enabled_ = was;
+  }
+  return published;
 }
 
 std::string ExactMatch::GetDesc() const {

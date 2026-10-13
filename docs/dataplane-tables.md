@@ -123,6 +123,9 @@ state through G, C or W.
     still waiting out a grace period).
 - **Reader API:** `LookupBatch(keys, stride, values, n)` for up to 64 keys.
   It returns a hit mask; misses leave `values[i]` untouched.
+  `LookupBatchPrehashed(keys, stride, sigs, values, n)` is the same lookup
+  for a caller that has already hashed the keys with `detail::CrcFixed`
+  (ExactMatch's fused kernel, D-121).
 - **Capacity:** fixed at creation, in key slots. The sizing policy is
   [D-010](decisions.md#d-010-size-concurrent-tables-for-occupancy-and-grace-period-headroom-not-a-fixed-75):
   - create with `CapacityFor(rules)`: 3/4 of a power of two, so every slot

@@ -178,6 +178,10 @@ class SessionPipelineTest : public ::testing::Test {
       std::memcpy(p + 34, &b, sizeof(b));
     }
 
+    void SetLength(size_t i, uint16_t len) {
+      bess::PacketRef(handles_[i]).set_data_len(len);
+    }
+
     bess::PacketBatch Batch(size_t first, size_t n) const {
       bess::PacketBatch batch;
       batch.clear();
@@ -638,6 +642,65 @@ TEST_F(SessionPipelineTest, ActionIdsAreNotNarrowedToGateWidth) {
   std::array<uint32_t, 1> ids;
   em->ClassifyActionsBatch(&batch, ids.data());
   EXPECT_EQ(ids[0], 70000u);
+}
+
+// Action mode with one 4-byte field takes the fused kernel (D-121): its
+// action ids equal the generic path's for hits, misses, and packets too
+// short for the field or exactly long enough.
+TEST_F(SessionPipelineTest, FusedKernelMatchesTheGenericPathInActionMode) {
+  ActionTable *at = CreateActionTable("at", "mt/meters", "rt/next_hops");
+  ASSERT_NE(nullptr, at);
+  bess::pb::ExactMatchArg arg;
+  auto *f = arg.add_fields();
+  f->set_offset(26);
+  f->set_num_bytes(4);
+  arg.set_action_resource("at/actions");
+  auto *em = static_cast<ExactMatch *>(Create("ExactMatch", "em", Pack(arg)));
+  ASSERT_NE(nullptr, em);
+  ASSERT_EQ(4u, em->fused_key_width());
+  for (uint32_t id = 1; id <= 8; id++) {
+    ASSERT_EQ(Apply({Op::Upsert("at/actions",
+                                bess::dataplane::EncodeKey(ActionId(id)),
+                                std::any(ActionTable::Action{
+                                    MeterId(0), NextHopId(0)}))})
+                  .outcome,
+              Outcome::kApplied);
+  }
+  for (uint32_t k = 0; k < 16; k++) {
+    bess::pb::ExactMatchCommandAddArg rule;
+    rule.set_action_id(1 + k % 8);
+    rule.add_fields()->set_value_bin(Key(Ip(10, 0, 0, k), 0).substr(0, 4));
+    ASSERT_EQ(em->CommandAdd(rule).error().code(), 0);
+  }
+
+  // Packets 0-23 carry a rule's key, 24-31 none; every fourth is 29 bytes
+  // (one short of the field's end), every fourth after it exactly 30.
+  constexpr size_t kN = bess::PacketBatch::kMaxBurst;
+  Packets packets(kN);
+  for (size_t i = 0; i < kN; i++) {
+    packets.SetKey(i, i < 24 ? Ip(10, 0, 0, static_cast<uint32_t>(i % 16))
+                             : Ip(10, 0, 1, static_cast<uint32_t>(i)),
+                   0);
+    if (i % 4 == 0) {
+      packets.SetLength(i, 29);
+    } else if (i % 4 == 1) {
+      packets.SetLength(i, 30);
+    }
+  }
+  std::array<uint32_t, kN> fused;
+  std::array<uint32_t, kN> generic;
+  bess::PacketBatch batch = packets.Batch(0, kN);
+  em->ClassifyActionsBatch(&batch, fused.data());
+  Error err;
+  ASSERT_TRUE(em->SetFusedKernelEnabled(false, &err)) << err.second;
+  ASSERT_EQ(0u, em->fused_key_width());
+  em->ClassifyActionsBatch(&batch, generic.data());
+  EXPECT_EQ(fused, generic);
+  for (size_t i = 0; i < kN; i++) {
+    const uint32_t want =
+        i < 24 && i % 4 != 0 ? 1 + static_cast<uint32_t>(i % 16) % 8 : 0;
+    EXPECT_EQ(want, fused[i]) << "packet " << i;
+  }
 }
 
 TEST_F(SessionPipelineTest, ModuleCapacitiesRejectNarrowing) {

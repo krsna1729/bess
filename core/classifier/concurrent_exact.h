@@ -286,13 +286,23 @@ class ConcurrentExactTable {
   uint64_t LookupBatch(ConstBytes keys, size_t stride, uint64_t *values,
                        size_t n) const noexcept {
     promise(n <= 64);
-    const void *ptrs[64];
     hash_sig_t sigs[64];
+    hash_batch_(keys.data(), stride, n, sigs);
+    return LookupBatchPrehashed(keys, stride, sigs, values, n);
+  }
+
+  // LookupBatch with the keys already hashed: sigs[i] must be the table's
+  // hash of key i (detail::CrcFixed over key_len() bytes), for a caller that
+  // builds and hashes its keys in one pass (ExactMatch, D-121).
+  uint64_t LookupBatchPrehashed(ConstBytes keys, size_t stride,
+                                hash_sig_t *sigs, uint64_t *values,
+                                size_t n) const noexcept {
+    promise(n <= 64);
+    const void *ptrs[64];
     void *data[64];
     for (size_t i = 0; i < n; i++) {
       ptrs[i] = keys.data() + i * stride;
     }
-    hash_batch_(keys.data(), stride, n, sigs);
     uint64_t hits = 0;
     rte_hash_lookup_with_hash_bulk_data(table_, ptrs, sigs,
                                         static_cast<uint32_t>(n), &hits, data);

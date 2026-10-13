@@ -76,6 +76,12 @@ class ExactMatch final : public Module {
   void ClassifyActionsBatch(bess::PacketBatch *batch,
                             uint32_t *action_ids) const;
 
+  // Tests (D-121): the published generation's fused-kernel key width (0 when
+  // the generic path classifies), and a switch that republishes with the
+  // fused kernel off or back on, so both paths run on the same rules.
+  size_t fused_key_width() const;
+  bool SetFusedKernelEnabled(bool enabled, Error *err);
+
   std::string GetDesc() const override;
 
   // Recompiles the extraction plan when metadata offsets are reassigned by a
@@ -150,6 +156,14 @@ class ExactMatch final : public Module {
     // metadata attr offset, or kInvalidOffset for unreadable metadata).
     // Compared at PreResume to detect graph-driven offset reassignment.
     std::vector<size_t> baked_source_offsets;
+    // The fused fixed-layout kernel (D-121): the key is one packet field of
+    // 1, 2, 4 or 8 bytes, read, masked, hashed and looked up in one pass.
+    // fused_width is that width, 0 for the generic extract-then-lookup path;
+    // the field starts at packet byte fused_offset, and fused_mask holds its
+    // mask bytes (all ones when unmasked).
+    size_t fused_width = 0;
+    size_t fused_offset = 0;
+    uint64_t fused_mask = 0;
   };
 
   using GenerationPtr = std::unique_ptr<const Generation>;
@@ -257,6 +271,8 @@ class ExactMatch final : public Module {
   std::string action_resource_;
   std::optional<uint64_t> initial_default_gate_;  // as given at creation
   int action_id_attr_ = -1;
+  // Whether Build() may select the fused kernel (tests turn it off).
+  bool fused_enabled_ = true;
 
   // Publication and reclamation (bess::rcu::RcuPtr + the runtime's RcuDomain):
   // one acquire load per batch on the data path, serialized rebuilds off it,
