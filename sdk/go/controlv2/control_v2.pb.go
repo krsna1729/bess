@@ -889,10 +889,13 @@ func (x *Connection) GetSkipDefaultHooks() bool {
 type Worker struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Wid   int32                  `protobuf:"varint,1,opt,name=wid,proto3" json:"wid,omitempty"`
-	// Unset: automatic -- the lowest free CPU of bessd's memory node, minus the
-	// CPUs reserved for control threads, kept for the worker's life. A desired
-	// worker without a core matches the worker of its wid wherever it runs; a
-	// core that differs from where it runs replaces it (D-123).
+	// Unset: automatic -- a free CPU of bessd's memory node in SMT-striped
+	// order (every physical core's first thread before any second), never a
+	// control CPU, kept for the worker's life. A desired worker without a core
+	// matches the worker of its wid wherever it runs; a core that differs from
+	// where it runs replaces it (D-123). Unset no longer means CPU 0: a client
+	// built from the proto before D-123 sends nothing for core 0, which is now
+	// automatic -- explicit core 0 needs a client built from this proto.
 	Core          *int32 `protobuf:"varint,2,opt,name=core,proto3,oneof" json:"core,omitempty"`
 	Scheduler     string `protobuf:"bytes,3,opt,name=scheduler,proto3" json:"scheduler,omitempty"`
 	unknownFields protoimpl.UnknownFields

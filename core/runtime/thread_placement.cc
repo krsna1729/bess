@@ -102,7 +102,8 @@ CpuId DefaultWorkerCore(std::span<const int> used) {
   if (FLAGS_c >= 0) {
     return CpuId(static_cast<uint32_t>(FLAGS_c));  // validated when parsed
   }
-  // Any worker given no core: the first free CPU of the memory node (D-123).
+  // Any worker given no core: a free CPU of the memory node in SMT-striped
+  // order (D-123).
   if (const std::optional<int> cpu = ProcessPlacement().NextWorkerCpu(used)) {
     return CpuId(static_cast<uint32_t>(*cpu));
   }
@@ -121,6 +122,9 @@ CpuId DefaultWorkerCore(std::span<const int> used) {
 cpu_set_t ReservedControlCpus() {
   cpu_set_t set;
   CPU_ZERO(&set);
+  if (!ProcessPlacementApplied()) {
+    return set;  // a test or benchmark: its threads keep the inherited set
+  }
   for (int cpu : ProcessPlacement().control_cpus) {
     if (cpu >= 0 && cpu < CPU_SETSIZE) {
       CPU_SET(cpu, &set);

@@ -183,13 +183,20 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
     // One memory node per bessd (D-123): every other node gets a 1 MB limit,
     // which no hugepage fits under, so nothing is ever mapped there. (DPDK
     // reads a limit of 0 as "no limit".) The memory node keeps the -m cap,
-    // or no limit.
+    // or no limit. DPDK takes at most RTE_MAX_NUMA_NODES entries (node ids
+    // past that are not DPDK sockets at all).
     const runtime::Placement &placement = runtime::ProcessPlacement();
     const int memory_node = placement.node;
+    if (memory_node >= RTE_MAX_NUMA_NODES) {
+      LOG(WARNING) << "memory node " << memory_node << " is beyond DPDK's "
+                   << RTE_MAX_NUMA_NODES << " NUMA nodes: hugepage memory is "
+                   << "not confined to it";
+    }
     int nodes = memory_node + 1;  // an entry for every node with memory
     for (int node : placement.topology.memory_nodes) {
       nodes = std::max(nodes, node + 1);
     }
+    nodes = std::min(nodes, RTE_MAX_NUMA_NODES);
     if (dpdk_mb_per_socket > 0 || nodes > 1) {
       const std::string cap =
           dpdk_mb_per_socket > 0 ? std::to_string(dpdk_mb_per_socket + 1) : "0";
@@ -248,8 +255,10 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
 }
 
 // Where DPDK's main lcore may run, in "corelist" format (e.g. "0-12,16-28"):
-// the reserved control CPUs (D-123), else the CPU set bessd was started with
-// (D-027).
+// in bessd the reserved control CPUs (D-123), else -- none reserved, or a
+// test or benchmark bringing DPDK up lazily -- the CPU set the process was
+// started with (D-027), which the main thread and every thread created
+// after it keep.
 std::string GetNonWorkerCoreList() {
   cpu_set_t set = bess::runtime::ReservedControlCpus();
   if (CPU_COUNT(&set) == 0) {

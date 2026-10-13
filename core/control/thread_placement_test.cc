@@ -11,6 +11,8 @@
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#include <rte_eal.h>
+#include <rte_malloc.h>
 
 #include <cerrno>
 #include <optional>
@@ -20,6 +22,7 @@
 #include <vector>
 
 #include "control/control_plane.h"
+#include "dpdk.h"
 #include "runtime/runtime_state.h"
 #include "runtime/numa_placement.h"
 #include "runtime/worker_manager.h"
@@ -27,6 +30,7 @@
 #include "packet_pool.h"
 #include "port.h"
 #include "worker.h"
+#include "utils/dpdk_memory.h"
 
 namespace {
 
@@ -83,12 +87,41 @@ TEST(ThreadPlacementTest, EverythingStaysInsideTheInheritedSet) {
   EXPECT_TRUE(CpuAllowed(bess::runtime::DefaultWorkerCore()));
 }
 
-// A worker on the last allowed CPU: the other threads run on the reserved
-// control CPU (D-123; with one CPU nothing is reserved and they share it),
-// threads created afterwards inherit that, and destroying the worker leaves
-// them there.
+// A test or benchmark that brings DPDK up lazily is not bessd: nothing is
+// reserved, so rte_eal_init leaves the main thread -- and every thread made
+// after it -- on the inherited set, not pinned to one control CPU.
+TEST(ThreadPlacementTest, LazyEalBringUpKeepsTheInheritedSet) {
+  ASSERT_FALSE(bess::runtime::ProcessPlacementApplied());
+  InitRuntimeOnce();  // the first DPDK user: rte_eal_init runs here
+  ASSERT_TRUE(bess::IsDpdkInitialized());
+  const cpu_set_t reserved = bess::runtime::ReservedControlCpus();
+  EXPECT_EQ(0, CPU_COUNT(&reserved));
+  const cpu_set_t main_now = ThisThread();
+  EXPECT_TRUE(CPU_EQUAL(&main_now, &ProcessCpus())) << CpuList(main_now);
+  cpu_set_t later;
+  std::thread([&] { later = ThisThread(); }).join();
+  EXPECT_TRUE(CPU_EQUAL(&later, &ProcessCpus())) << CpuList(later);
+}
+
+// Row 15 (D-123): without hugepages the node choice is unchanged, and DPDK's
+// one normal-page heap is socket 0, so every table asks for socket 0 there
+// and its allocation succeeds.
+TEST(ThreadPlacementTest, WithoutHugepagesTablesAllocateOnSocketZero) {
+  InitRuntimeOnce();  // FLAGS_m = 0: --no-huge
+  ASSERT_EQ(0, rte_eal_has_hugepages());
+  EXPECT_EQ(0, bess::utils::MemoryNode());
+  void *p = bess::utils::DpdkAllocate(4096, 64);
+  ASSERT_NE(nullptr, p);
+  rte_free(p);
+}
+
+// A worker on the last allowed CPU, in a process placed as bessd places
+// itself: the other threads run on the reserved control CPU (D-123; with one
+// CPU nothing is reserved and they share it), threads created afterwards
+// inherit that, and destroying the worker leaves them there.
 TEST(ThreadPlacementTest, ControlThreadsLeaveWorkerCpus) {
   InitRuntimeOnce();
+  bess::runtime::ApplyProcessPlacement();  // what bessd's main does
   const cpu_set_t &process = ProcessCpus();
   int core = -1;
   for (int i = 0; i < CPU_SETSIZE; i++) {

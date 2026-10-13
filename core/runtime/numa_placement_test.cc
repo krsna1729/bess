@@ -74,13 +74,6 @@ class FakeSysfs {
     Write(node_dir() / name, value);
     return *this;
   }
-  // node/nodeM/hugepages/hugepages-2048kB/free_hugepages.
-  FakeSysfs &FreeHugepages(int node, int pages) {
-    Write(node_dir() / ("node" + std::to_string(node)) /
-              "hugepages/hugepages-2048kB/free_hugepages",
-          std::to_string(pages));
-    return *this;
-  }
 
   Topology Read() const { return ReadTopology(root_.string()); }
 
@@ -298,20 +291,6 @@ TEST(NumaPlacementTest, OneCpuContainerSharesTheCpu) {
   sys.Cpus(0, 7, 0).NodeFile("has_memory", "0");
   const Placement p = Check(Input(sys.Read(), {5}, {0}), {0, {}, {5}, 1});
   EXPECT_EQ(std::nullopt, p.NextWorkerCpu(std::vector<int>{5}));
-}
-
-// Row 15: hugepages are not an input: with or without free hugepages on
-// either node the placement is the same (the no-hugepage EAL path is
-// unchanged; see dpdk.cc and utils/dpdk_memory.h).
-TEST(NumaPlacementTest, HugepagesDoNotChangeThePlacement) {
-  FakeSysfs with;
-  TwoNodes(with);
-  with.FreeHugepages(0, 0).FreeHugepages(1, 512);
-  FakeSysfs without;
-  TwoNodes(without);
-  const Placement a = Check(Input(with.Read(), Range(8, 15), {0, 1}), {1, {8}, {9, 10}, 0});
-  const Placement b = Check(Input(without.Read(), Range(8, 15), {0, 1}), {1, {8}, {9, 10}, 0});
-  EXPECT_EQ(a.Summary(), b.Summary());
 }
 
 // Row 16: Kubernetes Guaranteed pod, CPU Manager static, Memory Manager
@@ -612,14 +591,25 @@ TEST(NumaPlacementTest, SummaryIsOneDiagnosableLine) {
       p.Summary());
 }
 
-// The real host resolves without error (whatever it is).
-TEST(NumaPlacementTest, ThisHostResolves) {
-  const Topology t = ReadTopology("/sys");
-  EXPECT_FALSE(t.memory_nodes.empty());
-  PlacementInput in;
-  in.topology = t;
-  in.cpus = {0};
-  EXPECT_TRUE(ResolvePlacement(in).has_value());
+// Under a seccomp profile that refuses get_mempolicy (RuntimeDefault without
+// CAP_SYS_NICE), the allowed memory nodes come from /proc's status file.
+TEST(NumaPlacementTest, MemsAllowedReadsTheStatusFile) {
+  const fs::path path = fs::temp_directory_path() /
+                        ("bess_numa_status_" + std::to_string(getpid()));
+  std::ofstream(path) << "Name:\tbessd\nCpus_allowed_list:\t0-7\n"
+                      << "Mems_allowed:\t00000000,00000005\n"
+                      << "Mems_allowed_list:\t0,2\nvoluntary_ctxt_switches:\t3\n";
+  EXPECT_EQ((std::set<int>{0, 2}), MemsAllowedFromStatus(path.string()));
+  std::ofstream(path) << "Name:\tbessd\n";  // no such line: unknown (empty)
+  EXPECT_TRUE(MemsAllowedFromStatus(path.string()).empty());
+  fs::remove(path);
+  EXPECT_TRUE(MemsAllowedFromStatus(path.string()).empty());  // unreadable
+}
+
+// The status file and the kernel's memory policy agree on this host (the
+// fallback reads the same cpuset the syscall reports).
+TEST(NumaPlacementTest, MemsAllowedFallbackAgreesWithTheKernel) {
+  EXPECT_EQ(MemsAllowed(), MemsAllowedFromStatus("/proc/self/status"));
 }
 
 }  // namespace

@@ -395,6 +395,7 @@ v2::ErrorDetail ToProto(const ControlError &error) {
       out.set_code(v2::ErrorDetail::UNSUPPORTED_TRANSACTION);
       break;
     case ControlErrorCode::kResourceFailure:
+    case ControlErrorCode::kResourceExhausted:
       out.set_code(v2::ErrorDetail::RESOURCE_FAILURE);
       break;
     case ControlErrorCode::kInternal:
@@ -432,6 +433,9 @@ grpc::Status ToStatus(const ControlError &error,
       break;
     case ControlErrorCode::kResourceFailure:
       code = grpc::StatusCode::UNAVAILABLE;
+      break;
+    case ControlErrorCode::kResourceExhausted:
+      code = grpc::StatusCode::RESOURCE_EXHAUSTED;
       break;
     case ControlErrorCode::kInternal:
       code = grpc::StatusCode::INTERNAL;

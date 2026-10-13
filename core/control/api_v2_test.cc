@@ -13,12 +13,14 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
 
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 
 #include "control/control_plane.h"
@@ -32,6 +34,7 @@
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
 #include "pb/module_msg.pb.h"
+#include "worker.h"
 
 namespace {
 
@@ -466,6 +469,44 @@ TEST_F(ApiV2ServiceTest, AnAutomaticWorkerIsReportedWhereItRunsAndReapplyIsANoOp
     EXPECT_EQ(placement.Summary(), resp.placement());
     EXPECT_EQ(placement.node, resp.memory_node());
   }
+}
+
+// No free CPU for an automatic worker is RESOURCE_EXHAUSTED on the wire --
+// not UNAVAILABLE, which clients retry as a lost answer -- with the detail.
+TEST_F(ApiV2ServiceTest, NoFreeCpuForAnAutomaticWorkerIsResourceExhausted) {
+  const bess::runtime::Placement &placement = bess::runtime::ProcessPlacement();
+  const std::set<int> cpus = placement.WorkerCpus();
+  if (cpus.size() + 1 > static_cast<size_t>(Worker::kMaxWorkers)) {
+    GTEST_SKIP() << "more worker CPUs than workers: " << placement.Summary();
+  }
+  v2::Pipeline desired = SamplePipeline();
+  desired.clear_workers();
+  int wid = 0;
+  for (int cpu : cpus) {  // every worker CPU taken explicitly
+    auto *w = desired.add_workers();
+    w->set_wid(wid++);
+    w->set_core(cpu);
+  }
+  desired.add_workers()->set_wid(wid);  // and one automatic worker
+
+  grpc::ClientContext ctx;
+  v2::ApplyPipelineRequest req;
+  *req.mutable_pipeline() = desired;
+  req.set_daemon_epoch(Epoch());
+  v2::ApplyPipelineResponse resp;
+  const grpc::Status status = stub_->ApplyPipeline(&ctx, req, &resp);
+  ASSERT_FALSE(status.ok());
+  EXPECT_EQ(grpc::StatusCode::RESOURCE_EXHAUSTED, status.error_code())
+      << status.error_message();
+  EXPECT_NE(std::string::npos, status.error_message().find("no free CPU"))
+      << status.error_message();
+  const auto detail = ctx.GetServerTrailingMetadata().find("bess-error-bin");
+  ASSERT_NE(detail, ctx.GetServerTrailingMetadata().end());
+  v2::ErrorDetail decoded;
+  ASSERT_TRUE(decoded.ParseFromString(
+      std::string(detail->second.data(), detail->second.size())));
+  EXPECT_EQ(ENOSPC, decoded.errno_value());
+  EXPECT_EQ("core", decoded.field());
 }
 
 // The same argument encoded in another field order (protobuf's JSON-to-binary

@@ -731,6 +731,23 @@ TEST(SdkClient, ApplyPipelineRetriesBusyAndNeverAConflict) {
   EXPECT_EQ(KindOf(h.c->ApplyPipeline(pb::Pipeline())), ErrorKind::kBusy);
 }
 
+// No free CPU for an automatic worker (D-123): RESOURCE_EXHAUSTED with the
+// daemon's detail is an answered refusal -- kInvalidRequest, sent once, never
+// retried and never taken for no answer.
+TEST(SdkClient, ApplyPipelineExhaustedIsARefusalNotRetried) {
+  Harness h(4);
+  h.f->pipelines = {
+      Refusal(grpc::StatusCode::RESOURCE_EXHAUSTED, pb::ErrorDetail::RESOURCE_FAILURE)};
+  auto r = h.c->ApplyPipeline(pb::Pipeline());
+  ASSERT_FALSE(r);
+  EXPECT_EQ(r.error().kind, ErrorKind::kInvalidRequest);
+  EXPECT_EQ(r.error().code, grpc::StatusCode::RESOURCE_EXHAUSTED);
+  ASSERT_TRUE(r.error().detail.has_value());
+  EXPECT_EQ(r.error().detail->code(), pb::ErrorDetail::RESOURCE_FAILURE);
+  EXPECT_EQ(h.f->applied.size(), 1u);
+  EXPECT_TRUE(h.sleeps.empty());
+}
+
 // Every mutating request names the epoch it was built under (D-106): a
 // transaction its resources', an apply its expected version's, else the one
 // the client learned. A restarted daemon refuses them: kDaemonRestarted,

@@ -68,8 +68,9 @@ struct DisconnectionSpec {
 
 struct WorkerSpec {
   int wid = -1;
-  // nullopt: automatic -- the lowest free worker CPU of the memory node,
-  // chosen at creation and kept for the worker's life (D-123).
+  // nullopt: automatic -- a free worker CPU of the memory node in SMT-striped
+  // order (Placement::NextWorkerCpu), chosen at creation and kept for the
+  // worker's life (D-123).
   std::optional<int> core;
   std::string scheduler;
 

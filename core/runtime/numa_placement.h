@@ -129,10 +129,19 @@ const Placement &ProcessPlacement();
 int MemoryNode();
 // Resolves (if not yet) and prefers the memory node for this thread's -- and
 // every thread it later creates' -- normal (libc) memory: set_mempolicy
-// (MPOL_PREFERRED). Call once, early in main, before any thread exists.
+// (MPOL_PREFERRED); a refusal is a warning. Call once, early in bessd's
+// main, before any thread exists. Marks the process as placed: only then
+// are the control CPUs reserved (ReservedControlCpus()).
 void ApplyProcessPlacement();
-// get_mempolicy(MPOL_F_MEMS_ALLOWED); empty when the kernel cannot say.
+// Whether ApplyProcessPlacement() ran: bessd, not a test or benchmark that
+// brings DPDK up lazily (whose threads keep the inherited CPU set).
+bool ProcessPlacementApplied();
+// The memory nodes this process may allocate on: get_mempolicy
+// (MPOL_F_MEMS_ALLOWED), else (refused, e.g. by seccomp) /proc/self/status's
+// Mems_allowed_list; empty when neither says.
 std::set<int> MemsAllowed();
+// Mems_allowed_list from a /proc/<pid>/status file; empty when absent.
+std::set<int> MemsAllowedFromStatus(const std::string &status_path);
 
 }  // namespace bess::runtime
 

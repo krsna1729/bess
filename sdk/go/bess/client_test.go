@@ -626,6 +626,21 @@ func TestApplyPipelineRetriesBusyAndNeverAConflict(t *testing.T) {
 	as[*BusyError](t, err)
 }
 
+// No free CPU for an automatic worker (D-123): ResourceExhausted with the
+// daemon's detail is an answered refusal -- InvalidRequestError, sent once,
+// never retried and never taken for no answer.
+func TestApplyPipelineExhaustedIsARefusalNotRetried(t *testing.T) {
+	h := newHarness(&fake{pipelines: []step{refusal(codes.ResourceExhausted, pb.ErrorDetail_RESOURCE_FAILURE)}}, 4)
+	_, err := h.c.ApplyPipeline(context.Background(), &pb.Pipeline{})
+	e := as[*InvalidRequestError](t, err)
+	if e.Code != codes.ResourceExhausted || e.Detail.GetCode() != pb.ErrorDetail_RESOURCE_FAILURE {
+		t.Fatal(e)
+	}
+	if len(h.f.applied) != 1 || len(h.sleeps) != 0 {
+		t.Fatal(h.f.applied, h.sleeps)
+	}
+}
+
 // Every apply names an epoch: its expected version's, else the one the client
 // learned. A restarted daemon refuses it: Refused, not retried, and the
 // client now knows the new epoch.

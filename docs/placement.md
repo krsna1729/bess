@@ -14,7 +14,7 @@ differ only in what they say:
 |---|---|---|
 | sysfs | `/sys/devices/system/cpu/cpuN/nodeM` (else `node/nodeM/cpulist`), `cpu/cpuN/topology/thread_siblings_list`, `node/has_memory` (else `node/online`) | each CPU's node and physical core; which nodes have memory |
 | affinity | the CPU set bessd was started with (cgroup cpuset, Kubernetes CPU Manager, taskset) | the CPUs bessd may use |
-| allowed memory | `get_mempolicy(MPOL_F_MEMS_ALLOWED)` (cgroup `cpuset.mems`, Kubernetes Memory Manager) | the nodes bessd may allocate on |
+| allowed memory | `get_mempolicy(MPOL_F_MEMS_ALLOWED)`, else (refused, as under Docker's or Kubernetes' RuntimeDefault seccomp profile without `CAP_SYS_NICE`) `Mems_allowed_list` in `/proc/self/status` (cgroup `cpuset.mems`, Kubernetes Memory Manager) | the nodes bessd may allocate on |
 | flags | `--numa_node` (default -1, automatic), `--control_cpus` (default `auto`) | the operator's choice |
 
 A CPU sysfs does not place on a node is on node 0 (what DPDK assumes too); a
@@ -38,9 +38,11 @@ memory bessd may use.
 
 Then, once: DPDK's `--socket-limit` gives every other node a 1 MB limit, which
 no hugepage fits under (DPDK reads 0 as "no limit"), and the memory node `-m`
-or no limit; `set_mempolicy(MPOL_PREFERRED, node)` makes normal (libc) memory
--- rings, the no-hugepage DPDK heap -- follow; the one default packet pool is
-created there; every table (route, exact match, flow, meters, handoff
+or no limit (DPDK takes 32 nodes, `RTE_MAX_NUMA_NODES`; the list stops
+there); `set_mempolicy(MPOL_PREFERRED, node)` makes normal (libc) memory
+-- rings, the no-hugepage DPDK heap -- follow (refused by a seccomp profile:
+a warning, and only libc memory loses the preference); the one default packet
+pool is created there; every table (route, exact match, flow, meters, handoff
 channels, DPDK arrays) is allocated there. Under `--no-huge` DPDK labels its
 whole heap socket 0, so tables ask DPDK for socket 0 while the pages
 physically follow the memory policy.
@@ -50,7 +52,8 @@ memory node in bessd's set; none when the set has one CPU (control threads
 then share it with the worker, warned). gRPC, DPDK's main lcore and the
 maintenance loop run there. `--control_cpus=none` keeps D-027's rule
 (control threads avoid only the workers' CPUs); `--control_cpus=<list>` names
-the CPUs.
+the CPUs. Only bessd reserves: a test or benchmark that brings DPDK up lazily
+keeps every thread on the CPU set it was started with, as under `none`.
 
 **Automatic workers.** A worker given no core (control_v2 `Worker.core`
 unset, or `-c -1` for the default worker) takes, from the memory node's CPUs
@@ -60,7 +63,12 @@ their lowest CPU), then every core's second thread, and so on. The control
 CPU holds its core's first thread, so its sibling comes after every free
 first thread. Without sibling information the order is lowest first. The CPU
 is kept for the worker's life; applying the same desired state again moves
-nothing. Nothing free: `RESOURCE_EXHAUSTED` (ENOSPC). Never co-located.
+nothing. Nothing free: `RESOURCE_EXHAUSTED` (ENOSPC), an answer clients do
+not retry. Never co-located.
+
+A left-out core no longer means CPU 0: a client built from the proto before
+D-123 sends nothing for `core: 0`, which is now automatic; explicit core 0
+needs a client built from the current proto.
 
 **Explicit cores** are always honoured inside bessd's CPU set: on another node,
 on the control CPU, on a CPU another worker holds, on a busy sibling -- each
@@ -151,7 +159,7 @@ otherwise.
 | 11 | container, CPUs on both nodes, cpuset.mems {1} | 1 | 8 | 9, 10 | none | `ContainerMemsRestrictToNodeOne` |
 | 12 | container, node-0 CPUs, mems {1} | 1 | 0 | 1, 2 | no candidate; cross-NUMA per worker | `ContainerCpusAndMemsDisjoint` |
 | 13 | 1-CPU container (CPU 5) | 0 | none | 5, then ENOSPC | one CPU | `OneCpuContainerSharesTheCpu` |
-| 15 | no hugepages (or free hugepages on one node only) | as without | | | none | `HugepagesDoNotChangeThePlacement`; the no-hugepage EAL path is the fast suite's |
+| 15 | no hugepages (or free hugepages on one node only) | as without | | | none | hugepages are no input of the resolver; `ThreadPlacementTest.WithoutHugepagesTablesAllocateOnSocketZero` |
 | 16 | k8s Guaranteed, CPU+Memory Manager static, single-numa-node (CPUs 10-13, mems {1}) | 1 | 10 | 11, 12 | none | `K8sGuaranteedSingleNumaNode` |
 | 17 | k8s Guaranteed, Memory Manager none (CPUs 10-13, all mems) | 1 | 10 | 11, 12 | none | `K8sGuaranteedWithoutMemoryManager` |
 | 18 | k8s Burstable, shared pool (all CPUs and mems) | 0 | 0 | 1, 2 | several candidates | `K8sBurstableSharedPoolWarns` |
@@ -163,7 +171,7 @@ otherwise.
 | 25 | explicit worker on another node's CPU | | | | cross-NUMA | `ExplicitWorkerOnOtherNodeWarns` |
 | 26 | explicit worker on the control CPU | | | | on the control CPU | `ExplicitWorkerOnControlCpuWarns` |
 | 27 | explicit worker outside the affinity | | | | refused, EINVAL | `ExplicitWorkerOutsideAffinityIsOutside`; `ThreadPlacementTest.WorkersOutsideTheSetAreRefused` |
-| 28 | allocator exhaustion | | | | ENOSPC | `AllocatorExhaustion`; `AutomaticWorkerTest.AnAutomaticWorkerWithNoFreeCpuIsRefusedWithEnospc` |
+| 28 | allocator exhaustion | | | | ENOSPC, `RESOURCE_EXHAUSTED` | `AllocatorExhaustion`; `AutomaticWorkerTest.AnAutomaticWorkerWithNoFreeCpuIsRefusedWithEnospc`; `ApiV2ServiceTest.NoFreeCpuForAnAutomaticWorkerIsResourceExhausted` |
 | 29 | stability across re-apply | | | | none | `AllocatorIsStable`; `ApplyPipelineTest.ReapplyingAWorkerWithoutACoreKeepsItsCpuAndReplacesNothing`; `ApiV2ServiceTest.AnAutomaticWorkerIsReportedWhereItRunsAndReapplyIsANoOp` |
 | 30 | a destroyed worker's CPU is reused | | | lowest free | none | `FreedCpuIsReused`; `AutomaticWorkerTest.ADestroyedWorkersCpuGoesToTheNextAutomaticWorker` |
 | i | N+1 whole cores (8 CPUs, siblings i, i+4), 3 workers | 0 | 0 | 1, 2, 3 (siblings idle) | none | `StripedWholeCoresOnePerCore` |
@@ -178,6 +186,8 @@ otherwise.
 | x | taskset-only restriction, worker on a CPU outside it | | | | refused, EINVAL (not widened) | `ThreadPlacementTest.WorkersOutsideTheSetAreRefused` in `control_thread_placement_test_in_two_cpus` (under taskset) |
 | b | explicit worker on the control CPU's sibling | | | | shares the control CPU's core | `ExplicitWorkerOnControlSiblingWarns` |
 | c | no `thread_siblings_list` at all | 0 | 0 | 1, 2 | none | `MissingSiblingListsNeverWarn` |
+| d | a test or benchmark brings DPDK up lazily | | none reserved | | none | `ThreadPlacementTest.LazyEalBringUpKeepsTheInheritedSet` |
+| e | seccomp refuses `get_mempolicy` (RuntimeDefault, no `CAP_SYS_NICE`) | as allowed by the cpuset | | | none (`set_mempolicy` refused: a warning) | `MemsAllowedReadsTheStatusFile`, `MemsAllowedFallbackAgreesWithTheKernel` |
 
 Rows 14 and 19 (SMT-aware reservation) were dropped: SMT changes no placement
 except the striped order; it is otherwise only diagnosed.

@@ -61,8 +61,10 @@ std::string CpuList(const cpu_set_t &set);
 // node no worker in `used` has and no control thread is reserved (D-123),
 // else (nothing free) the first CPU of the set, shared.
 CpuId DefaultWorkerCore(std::span<const int> used = {});
-// The CPUs reserved for control threads (ProcessPlacement().control_cpus);
-// empty when none is reserved.
+// The CPUs reserved for control threads (ProcessPlacement().control_cpus)
+// once bessd applied its placement (ApplyProcessPlacement()); empty when
+// none is reserved, and in any process that did not (a test or benchmark
+// bringing DPDK up lazily keeps every thread on the inherited set).
 cpu_set_t ReservedControlCpus();
 
 struct WorkerPlacement {

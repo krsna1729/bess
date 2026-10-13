@@ -641,7 +641,7 @@ ControlResult<void> ControlPlane::AddWorkerLocked(
           placement.control_cpus.empty()
               ? "(none)"
               : runtime::FormatCpuList(placement.control_cpus).c_str());
-      error.code = ControlErrorCode::kResourceFailure;
+      error.code = ControlErrorCode::kResourceExhausted;
       error.object = std::to_string(wid);
       error.field = "core";
       return std::unexpected(error);

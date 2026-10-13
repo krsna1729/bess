@@ -8742,7 +8742,9 @@ bessd per node. The rules, the diagnostics and the deployment guidance are in [p
 
 - **One resolver, four inputs, no environment detection.** `core/runtime/numa_placement.{h,cc}`: a sysfs tree
   (`cpu/cpuN/nodeM`, else `node/nodeM/cpulist`; `thread_siblings_list`; `node/has_memory`, else `node/online`),
-  the process affinity, `get_mempolicy(MPOL_F_MEMS_ALLOWED)` and the flags `--numa_node` (-1: automatic) and
+  the process affinity, the allowed memory nodes (`get_mempolicy(MPOL_F_MEMS_ALLOWED)`, else `Mems_allowed_list`
+  in `/proc/self/status`: Docker's and Kubernetes' RuntimeDefault seccomp profile refuses the memory policy calls
+  without `CAP_SYS_NICE`, and an empty answer would mean "every node") and the flags `--numa_node` (-1: automatic) and
   `--control_cpus` (`auto`). Bare metal, a cgroup cpuset, a Kubernetes pod and a VM differ only in what these say,
   so every scenario is a unit test over a fake sysfs tree. A CPU sysfs does not place is on node 0, DPDK's own
   assumption (a VM that hides NUMA).
@@ -8753,20 +8755,28 @@ bessd per node. The rules, the diagnostics and the deployment guidance are in [p
   hugepage and table allocation fail, and bessd would not start -- a refusal; remote CPUs are only slower.
 - **Used once.** DPDK's `--socket-limit` gives every other node 1 MB, which no hugepage fits under (DPDK reads 0
   as "no limit"; its validator rejects a heap that would reach the limit), and the memory node the `-m` cap or no
-  limit; nothing changes on a single-node host. `set_mempolicy(MPOL_PREFERRED, node)` before any thread exists
-  makes normal memory (rings, the no-hugepage heap) follow. One default packet pool replaces the per-node array
+  limit; at most `RTE_MAX_NUMA_NODES` (32) entries, all DPDK parses; nothing changes on a single-node host.
+  `set_mempolicy(MPOL_PREFERRED, node)` before any thread exists makes normal memory (rings, the no-hugepage heap)
+  follow; refused (seccomp), a warning: DPDK memory is still confined, only libc memory loses the preference. One
+  default packet pool replaces the per-node array
   (`PacketPool::GetDefaultPool()`). `bess::utils::MemoryNode()` is the socket every table and DPDK array asks for:
   the node with hugepages, 0 under `--no-huge`, where DPDK labels its whole heap socket 0 while the pages follow the
   memory policy. The ENOMEM fallbacks to any socket stay, warned once.
 - **Control CPU.** `auto` reserves one: the first CPU of the memory node in the set; none with one CPU (warned).
   DPDK's main lcore (`--lcores 127@<it>`), and with it every later thread, and `PlaceControlThreads` use it;
-  `none` keeps D-027's rule; a list names them.
-- **Automatic workers.** `control_v2.Worker.core` is `optional` (field 2, wire-compatible); unset, and the default
+  `none` keeps D-027's rule; a list names them. Only bessd reserves (`ApplyProcessPlacement()` in `main` marks
+  the process placed): a test or benchmark that brings DPDK up lazily keeps its main thread, and every thread it
+  starts, on the inherited set -- pinned to one CPU, a TSan run serialised and a benchmark measured time-slicing.
+- **Automatic workers.** `control_v2.Worker.core` is `optional` (field 2); unset, and the default
   worker under `-c -1`, take the first of the memory node's free CPUs (minus the control CPU and every worker's
   CPU) in SMT-striped order: every physical core's first thread, cores by lowest CPU, then the second threads; the
   control CPU holds its core's first thread. Without sibling information, lowest first. Kept for the worker's life;
   a desired worker without a core matches the live one wherever it runs, so re-applying moves nothing; explicit
-  cores in one pipeline are created before automatic ones. None free: ENOSPC (`RESOURCE_EXHAUSTED`).
+  cores in one pipeline are created before automatic ones. None free: ENOSPC, `RESOURCE_EXHAUSTED` on the wire
+  (`ControlErrorCode::kResourceExhausted`), an answer the SDKs do not retry -- not UNAVAILABLE, which they treat
+  as no answer. Unset no longer means CPU 0: the bytes are unchanged but not their meaning, since a client built
+  from the proto before D-123 sends nothing for `core: 0` (proto3's default), which is now automatic; explicit
+  core 0 needs a client built from the current proto (every SDK here is).
 - **Explicit cores are always honoured** inside the set -- another node, the control CPU, a busy sibling, a CPU
   another worker holds (two workers naming one CPU in one pipeline are no longer refused) -- each warned at launch,
   no worker moved; explicitly held CPUs count as used.
@@ -8804,7 +8814,7 @@ full); two-node rows use CPUs 0-7 on node 0 and 8-15 on node 1, memory on both, 
 | 11 | container, CPUs on both nodes, cpuset.mems {1} | 1 | 8 | 9, 10 | none | `ContainerMemsRestrictToNodeOne` |
 | 12 | container, node-0 CPUs, mems {1} | 1 | 0 | 1, 2 | no candidate; cross-NUMA per worker | `ContainerCpusAndMemsDisjoint` |
 | 13 | 1-CPU container | 0 | none | 5, then ENOSPC | one CPU | `OneCpuContainerSharesTheCpu` |
-| 15 | no hugepages, or free hugepages on one node only | as without | | | none | `HugepagesDoNotChangeThePlacement` (the no-hugepage EAL path: the fast suite) |
+| 15 | no hugepages, or free hugepages on one node only | as without | | | none | hugepages are no input of the resolver; `ThreadPlacementTest.WithoutHugepagesTablesAllocateOnSocketZero` |
 | 16 | k8s Guaranteed, CPU and Memory Manager static, single-numa-node | 1 | 10 | 11, 12 | none | `K8sGuaranteedSingleNumaNode` |
 | 17 | k8s Guaranteed, Memory Manager none | 1 | 10 | 11, 12 | none | `K8sGuaranteedWithoutMemoryManager` |
 | 18 | k8s Burstable shared pool | 0 | 0 | 1, 2 | several candidates | `K8sBurstableSharedPoolWarns` |
@@ -8816,7 +8826,7 @@ full); two-node rows use CPUs 0-7 on node 0 and 8-15 on node 1, memory on both, 
 | 25 | explicit worker on another node's CPU | | | | cross-NUMA | `ExplicitWorkerOnOtherNodeWarns` |
 | 26 | explicit worker on the control CPU | | | | on the control CPU | `ExplicitWorkerOnControlCpuWarns` |
 | 27 | explicit worker outside the affinity | | | | refused, EINVAL | `ExplicitWorkerOutsideAffinityIsOutside`; `ThreadPlacementTest.WorkersOutsideTheSetAreRefused` |
-| 28 | allocator exhaustion | | | | ENOSPC | `AllocatorExhaustion`; `AutomaticWorkerTest.AnAutomaticWorkerWithNoFreeCpuIsRefusedWithEnospc` |
+| 28 | allocator exhaustion | | | | ENOSPC, `RESOURCE_EXHAUSTED` | `AllocatorExhaustion`; `AutomaticWorkerTest.AnAutomaticWorkerWithNoFreeCpuIsRefusedWithEnospc`; `ApiV2ServiceTest.NoFreeCpuForAnAutomaticWorkerIsResourceExhausted` |
 | 29 | stability across re-apply | | | | none | `AllocatorIsStable`; `ApplyPipelineTest.ReapplyingAWorkerWithoutACoreKeepsItsCpuAndReplacesNothing`; `ApiV2ServiceTest.AnAutomaticWorkerIsReportedWhereItRunsAndReapplyIsANoOp` |
 | 30 | a destroyed worker's CPU is reused | | | lowest free | none | `FreedCpuIsReused`; `AutomaticWorkerTest.ADestroyedWorkersCpuGoesToTheNextAutomaticWorker` |
 | i | N+1 whole cores (8 CPUs), 3 workers | 0 | 0 | 1, 2, 3, siblings idle | none | `StripedWholeCoresOnePerCore` |
@@ -8831,6 +8841,8 @@ full); two-node rows use CPUs 0-7 on node 0 and 8-15 on node 1, memory on both, 
 | x | taskset-only restriction, worker outside it | | | | EINVAL (not widened) | `ThreadPlacementTest.WorkersOutsideTheSetAreRefused` in `control_thread_placement_test_in_two_cpus` |
 | b | explicit worker on the control CPU's sibling | | | | shares the control CPU's core | `ExplicitWorkerOnControlSiblingWarns` |
 | c | no `thread_siblings_list` | 0 | 0 | 1, 2 | none | `MissingSiblingListsNeverWarn` |
+| d | a test or benchmark brings DPDK up lazily | | none reserved | | none | `ThreadPlacementTest.LazyEalBringUpKeepsTheInheritedSet` |
+| e | seccomp refuses `get_mempolicy` | as the cpuset allows | | | none (`set_mempolicy` refused: a warning) | `MemsAllowedReadsTheStatusFile`, `MemsAllowedFallbackAgreesWithTheKernel` |
 
 Rows 14 and 19 of the first draft (SMT-aware reservation) were replaced by i-v and b-c: SMT changes no placement
 but the striped order.
@@ -8850,7 +8862,7 @@ but the striped order.
     pipeline with workers on 6 (explicit), automatic, and 8 (explicit) runs them on 6, 7 and 8 with the warnings
     `worker CPU 6 is the reserved control CPU` and two `shares a physical core` for 7; `--control_cpus=2` stops
     startup with `--control_cpus=2: core 2 is not in bessd's CPU set (6-9)`.
-- **Tests:** `runtime_numa_placement_test` (44, every row above), the new `AutomaticWorkerTest` cases, the
+- **Tests:** `runtime_numa_placement_test` (every resolver row above), the new `AutomaticWorkerTest` cases, the
   apply-pipeline, API v2, manifest and SDK (C++ and Go) cases listed in the table; `control_plane_test`'s
   duplicate-core case now accepts the pipeline (`AcceptsTwoWorkersOnOneCore`).
 - **Not measured:** cross-NUMA cost (one node here, as D-054 notes for handoff); the multi-node `--socket-limit`
@@ -8863,9 +8875,9 @@ edge) and the builtin metric source runs without the control-plane lock; `GetPor
 **Code.** `core/runtime/numa_placement.{h,cc}` and `_test.cc` (new), `core/runtime/{thread_placement,dpdk,opts}`,
 `core/main.cc`, `core/utils/dpdk_memory.{h,cc}`, `core/packet_pool.{h,cc}`, `core/worker.cc`,
 `core/runtime/worker_manager.{h,cc}`, `core/drivers/pmd.{h,cc}`, `core/port.h`, `core/module.cc`,
-`core/control/{control_plane,api_v2,admin_v2,pipeline_spec,pipeline_validator,pipeline_diff,pipeline_plan,
-pipeline_snapshot,transaction}`, `core/bessctl.cc`, the tables' headers (`route/route_table.h`,
+`core/control/{control_plane,control_error,api_v2,admin_v2,pipeline_spec,pipeline_validator,pipeline_diff,
+pipeline_plan,pipeline_snapshot,transaction}`, `core/bessctl.cc`, the tables' headers (`route/route_table.h`,
 `classifier/{rte_hash_exact,concurrent_exact}.h`, `flow/shared_flow_table.h`, `meter/meter{,_set}.{h,cc}`,
 `dataplane/handoff.h`), `modules/{ip_lookup,router,source}.cc`, `protobuf/{control_v2,bess_msg}.proto`,
-`sdk/cpp`, `sdk/go`, `pybess/sdk.py`, `bessctl/main.cc`, `tools/check_includes.py`, `docs/placement.md` (new),
-`docs/{running-in-containers,control-sdk,handoff,limits}.md`.
+`sdk/cpp`, `sdk/go`, `pybess/sdk.py`, `bessctl/main.cc`, `tools/check_includes.py`, `tools/tidy_baseline.json`,
+`docs/placement.md` (new), `docs/{running-in-containers,control-sdk,handoff,limits}.md`, `MODERNIZATION.md`.

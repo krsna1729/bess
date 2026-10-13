@@ -21,6 +21,10 @@ enum class ControlErrorCode {
   kResourceBusy,
   kUnsupportedTransaction,
   kResourceFailure,
+  // A bounded resource is used up (no free CPU for an automatic worker):
+  // RESOURCE_EXHAUSTED on the wire, which clients do not retry as they do a
+  // failure (UNAVAILABLE).
+  kResourceExhausted,
   kInternal,
 };
 

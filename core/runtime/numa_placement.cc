@@ -9,12 +9,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <climits>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <string_view>
 
 #include "runtime/opts.h"
 #include "runtime/thread_placement.h"
@@ -457,15 +459,37 @@ std::string Placement::Summary() const {
          ", worker CPUs available " + CpusOrNone(WorkerCpus());
 }
 
+std::set<int> MemsAllowedFromStatus(const std::string &status_path) {
+  constexpr std::string_view kKey = "Mems_allowed_list:";
+  std::ifstream in(status_path);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.compare(0, kKey.size(), kKey) != 0) {
+      continue;
+    }
+    std::string value;
+    for (char c : line.substr(kKey.size())) {
+      if (std::isspace(static_cast<unsigned char>(c)) == 0) {
+        value.push_back(c);
+      }
+    }
+    return ParseCpuList(value).value_or(std::set<int>{});
+  }
+  return {};
+}
+
 std::set<int> MemsAllowed() {
   constexpr unsigned long kMaxNodes = 1024;
   constexpr size_t kBits = sizeof(unsigned long) * CHAR_BIT;
   std::array<unsigned long, kMaxNodes / kBits> mask{};
-  std::set<int> nodes;
   if (syscall(SYS_get_mempolicy, nullptr, mask.data(), kMaxNodes, nullptr,
               MPOL_F_MEMS_ALLOWED) != 0) {
-    return nodes;
+    // A seccomp profile (Docker's and Kubernetes' RuntimeDefault without
+    // CAP_SYS_NICE) refuses the memory policy calls with EPERM; the cpuset's
+    // answer is in /proc too.
+    return MemsAllowedFromStatus("/proc/self/status");
   }
+  std::set<int> nodes;
   for (size_t i = 0; i < kMaxNodes; i++) {
     if ((mask[i / kBits] >> (i % kBits)) & 1UL) {
       nodes.insert(static_cast<int>(i));
@@ -502,8 +526,17 @@ const Placement &ProcessPlacement() {
 
 int MemoryNode() { return ProcessPlacement().node; }
 
+namespace {
+std::atomic<bool> placement_applied{false};
+}  // namespace
+
+bool ProcessPlacementApplied() {
+  return placement_applied.load(std::memory_order_acquire);
+}
+
 void ApplyProcessPlacement() {
   const Placement &p = ProcessPlacement();
+  placement_applied.store(true, std::memory_order_release);
   if (p.topology.memory_nodes.size() <= 1) {
     return;  // one node: nothing to prefer
   }
@@ -516,6 +549,9 @@ void ApplyProcessPlacement() {
   }
   mask[node / kBits] |= 1UL << (node % kBits);
   if (syscall(SYS_set_mempolicy, MPOL_PREFERRED, mask.data(), node + 2) != 0) {
+    // EPERM under a seccomp profile without CAP_SYS_NICE: allocations made
+    // through DPDK still land on the node (--socket-limit); only libc memory
+    // loses the preference.
     PLOG(WARNING) << "set_mempolicy(MPOL_PREFERRED, node " << p.node
                   << ") failed: normal memory follows the kernel's default";
   }

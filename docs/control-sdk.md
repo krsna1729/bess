@@ -174,7 +174,8 @@ never the reserved control CPU, never a CPU another worker holds -- and keeps
 it for the worker's life. `bessctl get` and `GetPipeline` show the CPU it
 runs on (and `GetPipelineResponse.workers` its node, `cross_numa`,
 `shares_core`, `on_control_cpu`); applying the same manifest again, core still
-left out, moves nothing. No free CPU is `RESOURCE_EXHAUSTED` (ENOSPC). An
+left out, moves nothing. No free CPU is `RESOURCE_EXHAUSTED` (ENOSPC, field
+`core` in the detail): an answer, refused, never retried as no answer is. An
 explicit `core` is honoured anywhere in bessd's CPU set, with a warning when it
 is on another node, the control CPU, a CPU another worker uses, or a sibling
 of one; outside the set it is refused. In the SDKs: C++
@@ -182,6 +183,12 @@ of one; outside the set it is refused. In the SDKs: C++
 `worker(wid)` (`core=None`). `GetCapabilities` carries the daemon's
 `memory_node` and its one-line `placement` summary (`bessctl status` prints
 both); `GetPortStatus` a port's `numa_node` (-1: unknown) and `cross_numa`.
+
+A left-out `core` no longer means CPU 0. The field gained presence, so the
+bytes are unchanged but their meaning is not: a client built from the proto
+before D-123 sends nothing for `core: 0` (proto3's default), which a D-123
+daemon reads as automatic. Explicit core 0 needs a client built from the
+current proto (every SDK in this repository is).
 
 A manifest may also hold entries for the resources its modules create (see
 `bessctl resources`), in the resource's key and value types:
