@@ -384,10 +384,19 @@ custom_target(
 if get_option('build_sample_plugin')
   subdir('sample_plugin')
 endif
+# The runtime's data (D-135): sample manifests and the protobuf schema. The
+# vhost VM/container harness runs from a source checkout (it copies the
+# bootstrap's dpdk-testpmd), so it is not installed. dpdk-devbind.py is an ops
+# tool (Python: the bess-tools package).
+install_subdir('bessctl/conf', install_dir: bess_data_dir,
+               exclude_directories: ['port/vhost'])
+install_data('bin/dpdk-devbind.py', install_dir: get_option('bindir'),
+             install_mode: 'rwxr-xr-x')
+# The Python bessctl (legacy client; with pybess, the bess-python package).
 install_subdir(
   'bessctl',
   install_dir: bess_data_dir,
-  exclude_directories: ['__pycache__'],
+  exclude_directories: ['__pycache__', 'conf'],
   # The C++ bessctl's sources: it installs as bindir/bessctl, a link to bessd.
   exclude_files: ['meson.build', 'cli.h', 'json.h', 'json.cc', 'manifest.h', 'manifest.cc',
                   'main.cc', 'standalone_main.cc', 'manifest_test.cc', 'yaml_io.h',

@@ -5,14 +5,17 @@ ARG BASE_IMAGE=ubuntu:noble
 FROM ${BASE_IMAGE} AS runtime
 
 COPY env/install-deps.sh /usr/local/bin/install-bess-deps
-COPY requirements.txt /tmp/requirements.txt
 
-RUN bash /usr/local/bin/install-bess-deps runtime /tmp/requirements.txt && \
+RUN bash /usr/local/bin/install-bess-deps runtime && \
     rm -rf /var/lib/apt/lists/*
 
 FROM runtime AS build
 
-RUN bash /usr/local/bin/install-bess-deps build && \
+# The build runs Python (Meson, tools/, protobuf generation) and the Python
+# tests need the client's packages.
+COPY requirements.txt /tmp/requirements.txt
+RUN bash /usr/local/bin/install-bess-deps python /tmp/requirements.txt && \
+    bash /usr/local/bin/install-bess-deps build && \
     rm -rf /var/lib/apt/lists/*
 
 # The mounted checkout owns DPDK bootstrap and the Meson build.

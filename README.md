@@ -14,18 +14,18 @@ If you are new to BESS, we recommend you start here:
 3. [Write a BESS Configuration Script](https://github.com/NetSys/bess/wiki/Writing-a-BESS-Configuration-Script)
 4. [Connect BESS to a Network Interface, VM, or Container](https://github.com/NetSys/bess/wiki/Hooking-up-BESS-Ports)
 
-To install BESS on Linux quickly, you can download the binary from [Release](https://github.com/NetSys/bess/releases/latest). Please refer to [GCC x86 Options](https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html) to determine which tarball to use. Suppose `bess-core2-linux.tar.gz` is downloaded:
+To install BESS on Linux quickly, download a release from this repository's
+Releases: the `bess` .deb (`sudo apt install ./bess_<version>_amd64.deb`; the
+optional `bess-tools`, `bess-python`, `bess-dev` and `bess-sdk` packages carry
+dpdk-devbind.py, the legacy Python client, the plugin headers and the C++
+control SDK) or the tarball. Neither needs Python; the tarball needs the
+libraries `env/install-deps.sh runtime` installs. With the tarball:
 
-    sudo apt-get install -y python3-venv libgraph-easy-perl
-    python3 -m venv ~/.venvs/bess
-    . ~/.venvs/bess/bin/activate
-    python -m pip install \
-        'scapy>=2.7.0' 'flask>=3.1.3' 'grpcio>=1.84.0' \
-        'protobuf>=7.36.2,<8'
     sudo sysctl vm.nr_hugepages=1024  # For single NUMA node systems
-    tar -xf bess-core2-linux.tar.gz
-    cd bess/
-    bessctl/bessctl
+    tar -xf bess-<version>-linux-x86_64.tar.gz
+    cd bess-<version>-linux-x86_64
+    sudo bin/bessd -f    # in another terminal:
+    bin/bessctl apply share/bess/conf/samples/exactmatch.yaml && bin/bessctl resume
 
 Documentation can be found [here](https://github.com/NetSys/bess/wiki/). Please consider [contributing](https://github.com/NetSys/bess/wiki/How-to-Contribute) to the project!
 

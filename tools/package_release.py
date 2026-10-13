@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
-"""Release artifacts from a release build (M26, D-087).
+"""Release artifacts from a release build (M26, D-087, D-135).
 
     package_release.py tarball --build BUILD --version V [--out DIR]
     package_release.py deb     --build BUILD --version V [--out DIR]
 
-`tarball`: bessd, bessctl (a symlink to bessd: the C++ client, D-120),
-dpdk-devbind.py, the Python client and the docs.
+Both come from `meson install` of BUILD, and the runtime has no Python (D-135).
 
-`deb` (on Debian or Ubuntu): three packages from `meson install` of BUILD --
-`bess` (bessd, bessctl -- a symlink to bessd, D-120 --, the Python client and protobuf schema, the
-build metadata and the SPDX SBOM), `bess-dev` (the headers and bess-dev.pc
-plugins build against, and the experimental route, dataplane and RCU archives
-with bess-dev-static.pc, D-095) and `bess-sdk` (the C++ control SDK). `bess`
-depends on the packages that own every shared library bessd loads
-(`ldd`, then `dpkg -S`): a library no package owns stops the build, so the
-package never claims less than they need.
+`tarball`: the runtime and the ops tools -- bessd, bessctl (a symlink to
+bessd: the C++ client, D-120), the sample manifests, the protobuf schema, the
+build metadata and SBOM, and dpdk-devbind.py -- and the docs.
+
+`deb` (on Debian or Ubuntu): five packages -- `bess` (the runtime: bessd,
+bessctl, the sample manifests, the protobuf schema, the build metadata and
+the SPDX SBOM; no Python), `bess-tools` (dpdk-devbind.py; Python 3),
+`bess-python` (the legacy Python client, pybess
+and the Python bessctl, with their generated protobuf modules), `bess-dev` (the
+headers and bess-dev.pc plugins build against, and the experimental route,
+dataplane and RCU archives with bess-dev-static.pc, D-095) and `bess-sdk` (the
+C++ control SDK). `bess` depends on the packages that own every shared library
+bessd loads (`ldd`, then `dpkg -S`): a library no package owns stops the
+build, so the package never claims less than they need.
 """
 
 from __future__ import annotations
@@ -49,18 +54,64 @@ def deb_version(version: str) -> str:
     return v if v[:1].isdigit() else f'0.0~git{v}'
 
 
+def stage_install(build: str, stage: Path) -> tuple[str, str]:
+    """`meson install` of `build` into `stage`; the prefix and libdir, relative."""
+    run(['meson', 'install', '-C', build, '--destdir', stage, '--quiet'])
+    prefix = build_option(build, 'prefix').strip('/')
+    libdir = build_option(build, 'libdir').strip('/')
+    lib = libdir if libdir.startswith(prefix + '/') else f'{prefix}/{libdir}'
+    bessctl = stage / prefix / 'bin' / 'bessctl'  # the C++ one (G1.7): bessd (D-120)
+    if not bessctl.is_symlink() or os.readlink(bessctl) != 'bessd':
+        raise SystemExit(f'{bessctl} is not a symlink to bessd')
+    return prefix, lib
+
+
+def runtime_paths(prefix: str) -> list[str]:
+    return [f'{prefix}/bin/bessd', f'{prefix}/bin/bessctl', f'{prefix}/share/bess/conf',
+            f'{prefix}/share/bess/protobuf', f'{prefix}/share/bess/build-info.json',
+            f'{prefix}/share/doc/bess']
+
+
+def tools_paths(prefix: str) -> list[str]:
+    return [f'{prefix}/bin/dpdk-devbind.py']
+
+
+def python_paths(prefix: str) -> list[str]:
+    return [f'{prefix}/share/bess/{tree}' for tree in ('pybess', 'builtin_pb', 'plugin_pb', 'bessctl')]
+
+
+def copy_paths(stage: Path, dest: Path, paths: list[str], what: str) -> None:
+    for rel in paths:
+        src = stage / rel
+        if not src.exists() and not src.is_symlink():
+            raise SystemExit(f'{what}: {rel} is not in the install')
+        dst = dest / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_symlink():
+            dst.symlink_to(os.readlink(src))
+        elif src.is_dir():
+            shutil.copytree(src, dst, symlinks=True)
+        else:
+            shutil.copy2(src, dst)
+
+
+def check_no_python(root: Path, what: str) -> None:
+    found = sorted(str(p.relative_to(root)) for p in root.rglob('*')
+                   if p.suffix in ('.py', '.pyc') or p.name == '__pycache__')
+    if found:
+        raise SystemExit(f'{what} must hold no Python (D-135): ' + ', '.join(found))
+
+
 def tarball(args) -> Path:
     name = f'bess-{args.version}-linux-{os.uname().machine}'
     out = Path(args.out)
     with tempfile.TemporaryDirectory() as tmp:
+        stage = Path(tmp) / 'stage'
+        prefix, _ = stage_install(args.build, stage)
         top = Path(tmp) / name
-        (top / 'bin').mkdir(parents=True)
-        shutil.copy2(Path(args.build) / 'core' / 'bessd', top / 'bin')
-        (top / 'bin' / 'bessctl').symlink_to('bessd')
-        shutil.copy2(ROOT / 'bin' / 'dpdk-devbind.py', top / 'bin')
-        for tree in ('bessctl', 'pybess'):
-            shutil.copytree(ROOT / tree, top / tree,
-                            ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        copy_paths(stage / prefix, top, [p.removeprefix(prefix + '/')
+                                         for p in runtime_paths(prefix) + tools_paths(prefix)],
+                   'tarball')
         for doc in ('README.md', 'COPYING'):
             if (ROOT / doc).exists():
                 shutil.copy2(ROOT / doc, top)
@@ -98,21 +149,13 @@ def owning_packages(binary: Path) -> list[str]:
 
 
 def build_deb(stage: Path, name: str, version: str, depends: list[str], description: str,
-              out: Path, paths: list[str]) -> Path:
+              out: Path, paths: list[str], python: bool = True,
+              takes_over: list[str] | None = None) -> Path:
     with tempfile.TemporaryDirectory() as tmp:
         pkg = Path(tmp) / name
-        for rel in paths:
-            src = stage / rel
-            if not src.exists():
-                raise SystemExit(f'{name}: {rel} is not in the install')
-            dst = pkg / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if src.is_symlink():
-                dst.symlink_to(os.readlink(src))
-            elif src.is_dir():
-                shutil.copytree(src, dst)
-            else:
-                shutil.copy2(src, dst)
+        copy_paths(stage, pkg, paths, name)
+        if not python:
+            check_no_python(pkg, name)
         size_kb = sum(f.stat().st_size for f in pkg.rglob('*')
                       if f.is_file() and not f.is_symlink()) // 1024
         (pkg / 'DEBIAN').mkdir()
@@ -121,6 +164,10 @@ def build_deb(stage: Path, name: str, version: str, depends: list[str], descript
                    'Section: net', 'Priority: optional', 'Homepage: https://github.com/krsna1729/bess']
         if depends:
             control.append('Depends: ' + ', '.join(depends))
+        # Files that move here from an older package (Debian policy 7.6.1).
+        if takes_over:
+            older = ', '.join(f'{p} (<< {version})' for p in takes_over)
+            control += [f'Replaces: {older}', f'Breaks: {older}']
         control.append(f'Description: {description}')
         (pkg / 'DEBIAN' / 'control').write_text('\n'.join(control) + '\n')
         path = out / f'{name}_{version}_{arch()}.deb'
@@ -141,21 +188,29 @@ def deb(args) -> list[Path]:
     version = deb_version(args.version)
     with tempfile.TemporaryDirectory() as tmp:
         stage = Path(tmp) / 'stage'
-        run(['meson', 'install', '-C', args.build, '--destdir', stage, '--quiet'])
-        prefix = build_option(args.build, 'prefix').strip('/')
-        libdir = build_option(args.build, 'libdir').strip('/')
-        lib = libdir if libdir.startswith(prefix + '/') else f'{prefix}/{libdir}'
-        bessd = stage / prefix / 'bin' / 'bessd'
-        bessctl = stage / prefix / 'bin' / 'bessctl'  # the C++ one (G1.7): bessd (D-120)
-        if not bessctl.is_symlink() or os.readlink(bessctl) != 'bessd':
-            raise SystemExit(f'{bessctl} is not a symlink to bessd')
-        runtime_deps = owning_packages(bessd) + ['python3']
+        prefix, lib = stage_install(args.build, stage)
+        # Every install under share/bess goes to one of the packages below.
+        claimed = {Path(p).name for p in runtime_paths(prefix) + tools_paths(prefix) +
+                   python_paths(prefix) if p.startswith(f'{prefix}/share/bess/')}
+        unclaimed = sorted({p.name for p in (stage / prefix / 'share' / 'bess').iterdir()} - claimed)
+        if unclaimed:
+            raise SystemExit('share/bess entries no package claims: ' + ', '.join(unclaimed))
         made = [
-            build_deb(stage, 'bess', version, runtime_deps,
-                      'BESS daemon (bessd), bessctl, the Python client and schema, build metadata '
-                      'and SBOM',
-                      out, [f'{prefix}/bin/bessd', f'{prefix}/bin/bessctl', f'{prefix}/share/bess',
-                            f'{prefix}/share/doc/bess']),
+            build_deb(stage, 'bess', version, owning_packages(stage / prefix / 'bin' / 'bessd'),
+                      'BESS daemon (bessd), bessctl, sample manifests, protobuf schema, build '
+                      'metadata and SBOM',
+                      out, runtime_paths(prefix), python=False),
+            # dpdk-devbind.py runs lspci.
+            build_deb(stage, 'bess-tools', version, ['python3', 'pciutils'],
+                      'BESS ops tools: dpdk-devbind.py', out,
+                      tools_paths(prefix)),
+            # grpcio and protobuf at the versions of requirements.txt are newer
+            # than the distributions' python3-grpcio and python3-protobuf: pip.
+            # Its files were in bess before D-135.
+            build_deb(stage, 'bess-python', version, [f'bess (= {version})', 'python3'],
+                      'BESS legacy Python client (pybess, Python bessctl); needs grpcio and '
+                      'protobuf from pip (requirements.txt)', out, python_paths(prefix),
+                      takes_over=['bess']),
             # What bess-dev.pc and bess-dev-static.pc require (glog, gflags,
             # protobuf, libpcap) as packages, so pkg-config resolves on a host
             # that has only these packages.

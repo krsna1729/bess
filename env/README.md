@@ -7,11 +7,16 @@ Run from the repository root:
 
 ```sh
 sudo bash env/install-deps.sh runtime
+sudo bash env/install-deps.sh python
 sudo bash env/install-deps.sh build
 ```
 
-The `runtime` mode installs runtime libraries and the Python packages from
-`requirements.txt`. The `build` mode adds the compiler, Meson/Ninja, and native
+The `runtime` mode installs the libraries bessd (and bessctl, which is bessd)
+loads, and tcpdump; no Python (D-135). The `python` mode installs Python 3 and
+the packages from `requirements.txt` (or the file given after it): the build
+runs Python (Meson, `tools/`, protobuf generation), and the legacy Python
+client, the Python tests and the `tools/` scripts that drive bessd need the
+client's packages. The `build` mode adds the compiler, Meson/Ninja, and native
 development dependencies. The `vm` mode installs QEMU/KVM, NUMA, and
 cloud-image tools for the vhost VM helper:
 
@@ -22,8 +27,8 @@ sudo bash env/install-deps.sh vm
 ## Docker build environment
 
 `env/Dockerfile` is the canonical definition. Its `runtime` stage installs the
-same runtime dependencies as the host script; its final `build` stage adds the
-build toolchain. Build either stage from the repository root:
+same runtime dependencies as the host script; its final `build` stage adds
+Python and the build toolchain. Build either stage from the repository root:
 
 ```sh
 docker build -f env/Dockerfile --target runtime -t bess-runtime .

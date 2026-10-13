@@ -2,26 +2,12 @@
 # Copyright (c) 2016-2017, Nefeli Networks, Inc.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import fnmatch
-import os
 import unittest
 
 from . import sugar
 
-this_dir = os.path.dirname(os.path.realpath(__file__))
-script_dir = os.path.join(this_dir, 'conf')
-
 
 class TestSugar(unittest.TestCase):
-
-    """
-    All scripts in conf/ will be dynamically added here as individual
-    tests (e.g., test_path_to_conf_samples_exactmatch_bess) in this class.
-    The tests will just perform nothing but sugar.xform_file() and
-    check if the resulting code is syntactically correct.
-    This is to see if it causes any exceptions during the process.
-    """
-
     def run_suite(self, suite):
         for case in suite:
             str_input, str_expected = case
@@ -97,21 +83,6 @@ class TestSugar(unittest.TestCase):
 
         self.run_suite(mod_suite)
 
-
-def generate_test_method(path):
-    def template(self):
-        xformed = sugar.xform_file(path)
-        code = compile(xformed, path, 'exec')
-
-    return template
-
-
-for root, dir_names, file_names in os.walk(script_dir):
-    for file_name in fnmatch.filter(file_names, "*.bess"):
-        path = os.path.join(root, file_name)
-        name = 'test' + path.replace('/', '_').replace('.', '_')
-        method = generate_test_method(path)
-        setattr(TestSugar, name, method)
 
 if __name__ == '__main__':
     unittest.main()

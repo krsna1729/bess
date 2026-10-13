@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 {runtime [requirements.txt]|build|vm}" >&2
+  echo "Usage: $0 {runtime|python [requirements.txt]|build|vm}" >&2
   exit 2
 }
 
@@ -11,8 +11,8 @@ if [[ $# -lt 1 || $# -gt 2 ]]; then
 fi
 
 mode="$1"
-if [[ "$mode" != runtime && "$mode" != build && "$mode" != vm ]] ||
-   [[ "$mode" != runtime && $# -eq 2 ]]; then
+if [[ "$mode" != runtime && "$mode" != python && "$mode" != build && "$mode" != vm ]] ||
+   [[ "$mode" != python && $# -eq 2 ]]; then
   usage
 fi
 
@@ -28,13 +28,19 @@ if [[ "${ID:-}" != ubuntu ]] ||
   exit 1
 fi
 
+# What bessd and bessctl (bessd, D-120) load, and tcpdump for bessctl capture.
+# No Python (D-135).
 runtime_packages=(
-  python3 python3-pip python3-venv
   libnuma1 libpcap0.8t64 zlib1g libunwind8 libbpf1 libxdp1
   libgoogle-glog0v6t64 libgflags2.2 libprotobuf32t64 libgrpc++1.51t64
   libc-ares2 libsystemd0 libcap2 libelf1t64 libarchive13t64 libjansson4 libyaml-0-2
-  libgraph-easy-perl tcpdump
+  tcpdump
 )
+
+# The legacy Python client (pybess, the Python bessctl and its graph drawing),
+# the Python tests and the tools/ scripts that drive bessd; requirements.txt
+# from PyPI.
+python_packages=(python3 python3-pip python3-venv libgraph-easy-perl)
 
 build_packages=(
   build-essential gcc-14 g++-14 clang-19 libclang-rt-19-dev clang-tidy-19 llvm-19 ccache mold meson ninja-build pkg-config
@@ -49,6 +55,7 @@ vm_packages=(cloud-image-utils curl numactl openssh-client qemu-kvm qemu-utils)
 
 case "$mode" in
   runtime) packages=("${runtime_packages[@]}") ;;
+  python) packages=("${python_packages[@]}") ;;
   build) packages=("${build_packages[@]}") ;;
   vm) packages=("${vm_packages[@]}") ;;
 esac
@@ -56,7 +63,7 @@ esac
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
 
-if [[ "$mode" == runtime ]]; then
+if [[ "$mode" == python ]]; then
   script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
   repo_root="$(cd -- "$script_dir/.." && pwd)"
   requirements_file="${2:-$repo_root/requirements.txt}"

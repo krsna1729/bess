@@ -154,6 +154,7 @@ file is the reasoning.
 | D-132 | `rte_fib` as a selectable route backend (`backend` on IPLookup and Router; `rte_lpm` stays the default): five carried DPDK patches (one gives `rte_fib` `rte_lpm`'s tbl8 group lifetime, so changes and deletes never allocate), `rte_lpm`'s limits and errors enforced by the table, the defer queue sized to the pool, x86-64 only (plain stores); cheaper changes at every size and faster batch lookups, equal in a small table | accepted |
 | D-133 | Typed worker ids end to end: `WorkerId`, `CpuId` and `SocketId` through `Worker`, the worker functions, `WorkerManager`, `ControlPlane`, `Context::wid` and the event hub; wire and spec ints convert once, checked; the placement model stays on sysfs CPU numbers; `gate_idx_t` unchanged; plugin API 3; same instructions per packet | accepted |
 | D-134 | The last shipped `.bess` scripts are gone: the metadata graphs are a C++ oracle test (every read finds its latest write on every path), `attr_match`, the port scripts and the sample plugin's script are manifests, the perftest scripts are retired (they called a removed API; `live_perf` covers them, plus `M.bpf`) | accepted |
+| D-135 | The runtime has no Python: the `bess` package (bessd, bessctl, sample manifests, protobuf schema, build metadata) and the runtime image hold none and depend on none; `bess-tools` (dpdk-devbind.py) and `bess-python` (the legacy client) are optional packages; the tarball is the runtime plus dpdk-devbind.py; `install-deps.sh runtime` installs libraries only, `python` the rest | accepted |
 
 
 ---
@@ -9873,3 +9874,45 @@ smoke run, not a measurement).
 **Code.** `core/metadata_test.cc`, `bessctl/conf/samples/attr_match.yaml`, `bessctl/conf/port/`,
 `sample_plugin/{sequential_update.yaml,README.md}`, `tools/live_perf.py`, `protobuf/module_msg.proto` and
 `protobuf/ports/port_msg.proto` (comments).
+
+## D-135 Runtime packages without Python
+
+**Status:** accepted (2026-10-14; the roadmap item "runtime packages without Python", after D-120 made bessctl a
+mode of bessd).
+
+**Problem.** bessctl is bessd (D-120) and every sample is a manifest (D-134), yet the `bess` .deb still depended on
+`python3` and shipped the Python client (pybess, the generated Python protobuf modules, the Python bessctl); the
+runtime image installed pip, grpcio and protobuf for it; the release tarball copied the `bessctl` and `pybess`
+source trees; `env/install-deps.sh runtime` installed Python 3 and `requirements.txt`. The vhost VM and container
+harness was installed too, though it only works from a source checkout (it reads `deps/dpdk.json` and copies the
+bootstrap's `dpdk-testpmd`).
+
+**Decision.**
+- **Install layout.** The sample manifests install as `share/bess/conf` (they were inside the Python bessctl's
+  tree); the Python bessctl, pybess and the generated modules stay at `share/bess/{bessctl,pybess,builtin_pb,
+  plugin_pb}`; `bin/dpdk-devbind.py` is installed (it was only in the tarball); `conf/port/vhost` is not.
+- **Packages** (`tools/package_release.py deb`): `bess` = bessd, bessctl, `share/bess/{conf,protobuf,
+  build-info.json}` and the SBOM, depending only on the packages that own bessd's libraries; `bess-tools` =
+  dpdk-devbind.py (python3, pciutils); `bess-python` = the legacy client (bess, python3; grpcio and protobuf from
+  pip, as `requirements.txt` is newer than the distribution's; `Replaces` and `Breaks` an older `bess`, which owned
+  its files); `bess-dev` and `bess-sdk` unchanged. Two checks stop the build: a Python file (`.py`, `.pyc`,
+  `__pycache__`) in `bess`, and an entry under `share/bess` that no package claims.
+- **Tarball:** from `meson install` like the packages: the runtime paths plus dpdk-devbind.py, README and COPYING.
+  The Python client is the `bess-python` package (or the source tree).
+- **Runtime image:** the `bess` package alone; no pip, no `PYTHONPATH`. The release job checks that `bessctl --help`
+  runs in it and that it has no `python3`.
+- **Host installer:** `runtime` installs bessd's libraries and tcpdump; a new `python` mode installs Python 3, pip,
+  venv, graph-easy (the Python bessctl's graph drawing) and `requirements.txt`. Building needs `python` (Meson,
+  `tools/`, protobuf generation), so CI, `env/ci.Dockerfile` and the `env/Dockerfile` build stage install it.
+- `bessctl/test_sugar.py` lost its per-`.bess` test generator (no scripts are left, D-134).
+
+**Evidence.** Tarball of a fast build: `bin/{bessd,bessctl,dpdk-devbind.py}`, `share/bess/{build-info.json,conf,
+protobuf}`, `share/doc/bess`, README, COPYING; dpdk-devbind.py is its only Python file. `deb()` in the
+`bess-ci:ubuntu-24.04` container on that install (bessd's library owners stubbed: the build is not an Ubuntu one)
+builds all five packages: `bess` (80 entries, no Python), `bess-tools` (dpdk-devbind.py), `bess-python`, `bess-dev`,
+`bess-sdk`. A `.py` added under `share/bess/conf` stops it ("bess must hold no Python"), and so does a new
+`share/bess` entry ("share/bess entries no package claims"). The release job (develop pushes) builds the image.
+
+**Code.** `meson.build`, `tools/package_release.py`, `env/{runtime.Dockerfile,Dockerfile,ci.Dockerfile,
+install-deps.sh,README.md}`, `.github/workflows/ci.yml`, `README.md`, `DEPENDENCY_INVENTORY.md`,
+`bessctl/test_sugar.py`.

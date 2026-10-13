@@ -146,6 +146,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo bash env/install-deps.sh runtime
+          sudo bash env/install-deps.sh python
           sudo bash env/install-deps.sh build
           pip3 install --break-system-packages coverage
 
@@ -275,6 +276,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo bash env/install-deps.sh runtime
+          sudo bash env/install-deps.sh python
           sudo bash env/install-deps.sh build
 
       - name: Cache DPDK
@@ -310,6 +312,11 @@ jobs:
           # exits earlier (D-096: a static DPDK without its mempool handlers
           # passed --version and aborted at the first pool).
           docker run --rm --entrypoint /usr/local/bin/bessd bess:"$VERSION" --version
+          # The runtime has no Python (D-135); bessctl is bessd (D-120).
+          docker run --rm --entrypoint /usr/local/bin/bessctl bess:"$VERSION" --help > /dev/null
+          if docker run --rm --entrypoint sh bess:"$VERSION" -c 'command -v python3'; then
+            echo "python3 is in the runtime image"; exit 1
+          fi
           set +e
           docker run --rm --entrypoint timeout bess:"$VERSION" 5 /usr/local/bin/bessd -f -m 0 --skip_root_check
           rc=$?
