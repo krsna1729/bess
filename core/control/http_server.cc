@@ -411,7 +411,7 @@ const google::protobuf::ServiceDescriptor &ControlService() {
 // POST /v2/<method>: the JSON body as the request (empty: the empty
 // message), sent as gRPC's own clients send it.
 Reply CallUnary(const std::shared_ptr<grpc::Channel> &channel,
-                const google::protobuf::MethodDescriptor &method, std::string_view body) {
+                const google::protobuf::MethodDescriptor &method, const std::string &body) {
   google::protobuf::MessageFactory *factory =
       google::protobuf::MessageFactory::generated_factory();
   std::unique_ptr<google::protobuf::Message> request(
@@ -419,7 +419,8 @@ Reply CallUnary(const std::shared_ptr<grpc::Channel> &channel,
   std::unique_ptr<google::protobuf::Message> response(
       factory->GetPrototype(method.output_type())->New());
   if (body.find_first_not_of(" \t\r\n") != std::string_view::npos) {
-    const absl::Status parsed = google::protobuf::util::JsonStringToMessage(body, request.get());
+    // absl::Status or util::Status, by protobuf version (Ubuntu 24.04 has 3.21).
+    const auto parsed = google::protobuf::util::JsonStringToMessage(body, request.get());
     if (!parsed.ok()) {
       return ErrorReply(400, grpc::StatusCode::INVALID_ARGUMENT,
                         "body is not a " + std::string(method.input_type()->full_name()) +
@@ -446,7 +447,7 @@ Reply CallUnary(const std::shared_ptr<grpc::Channel> &channel,
     return ErrorReply(500, grpc::StatusCode::INTERNAL, "unreadable answer");
   }
   Reply reply;
-  const absl::Status printed = google::protobuf::util::MessageToJsonString(*response, &reply.body);
+  const auto printed = google::protobuf::util::MessageToJsonString(*response, &reply.body);
   if (!printed.ok()) {
     return ErrorReply(500, grpc::StatusCode::INTERNAL,
                       "answer not printable as JSON: " + std::string(printed.message()));
