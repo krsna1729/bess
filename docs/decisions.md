@@ -7590,7 +7590,7 @@ live-perf`, report-only, `continue-on-error`), a trend between runs.
 5. **CI:** `clang-tsan` gates now (a required check on `develop`, no longer `experimental`); `clang-asan`, `gcc-arm64`
    and `clang-arm64` become required after their first fully green run; the ubuntu-26.04 lanes stay experimental.
 6. **Release signing is Sigstore keyless**: the release job (permission `id-token: write`) signs each tarball, .deb,
-   image archive and `SHA256SUMS` with `cosign sign-blob`, the identity being this workflow's GitHub OIDC token; each
+   image archive and `SHA256SUMS-<machine>` (D-122) with `cosign sign-blob`, the identity being this workflow's GitHub OIDC token; each
    artifact ships with a `.sigstore.json` bundle (signature, certificate, transparency-log entry). No keys are stored.
    Verify: `cosign verify-blob --bundle F.sigstore.json --certificate-identity-regexp
    'https://github.com/krsna1729/bess/.github/workflows/ci.yml@.*' --certificate-oidc-issuer
@@ -8703,3 +8703,21 @@ a second pass over the rows to hash them (D-015) through the table's hash pointe
 
 **Code.** `core/modules/exact_match.{h,cc}`, `core/classifier/concurrent_exact.h`, `core/modules/exact_match_test.cc`,
 `core/modules/session_pipeline_test.cc`, `docs/dataplane-tables.md`.
+
+## D-122 Release artifacts for arm64 as well as x86_64
+
+**Context.** The release job built only x86_64 ("x86_64 only until the arm64 lanes gate"). The arm64 lanes
+(`gcc-arm64`, `clang-arm64` on `ubuntu-24.04-arm`) gate since D-093.
+
+**Decision.** `publish-release` is a matrix over `ubuntu-24.04` and `ubuntu-24.04-arm`. Each runner runs the same
+steps: `release-bootstrap/configure/build/verify` (CPU floor from `ci_profile.py cpu`: x86-64-v3 or armv8.2-a),
+the tarball, the .deb, the runtime image smoke and Sigstore signing. All file names carry the architecture: the
+tarball `bess-<v>-linux-<machine>.tar.gz`, the .deb `bess_<v>_<amd64|arm64>.deb`, the image archive
+`bess-image-<v>-<machine>.tar.gz` and the checksum list `SHA256SUMS-<machine>` (was `SHA256SUMS`, which the two
+runners would overwrite in one GitHub Release). The workflow artifacts are `bess-<v>-linux-<X64|ARM64>`.
+`fail-fast: false`: one architecture's failure does not cancel the other's artifact.
+
+**Check.** The first develop push after this change is the first run of the static arm64 bessd (link, `ldd`
+check, `bessctl --help` through the symlink, container smoke). The job is not a required check.
+
+**Code.** `.github/workflows/ci.yml` (`publish-release`).
