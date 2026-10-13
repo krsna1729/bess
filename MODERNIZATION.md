@@ -10260,13 +10260,12 @@ Build the new classifier framework with explicit modern semantics.
 
 #### Do not adopt `rte_fib` as routing default yet
 
-The existing benchmark found correctness failures. Revalidation is one command
-and must be rerun on every DPDK version change (`deps/dpdk.json`):
-`BESS_FIB_GATE=1 build-meson/core/fib_bench --benchmark_filter='Fib/routes:(524288|65536)'`.
-It re-registers entry 34's two failing rows (512K arbitrary-order build, 64K
-churn), whose built-in reference check aborts on a wrong answer. Rerun
-2026-09-25 on DPDK 25.11.3: still fails identically (key `0x20b7b6c2` -> 7207
-instead of 5986 from the /12).
+The existing benchmark found correctness failures; D-130 (2026-10-13) root-caused
+them to an `rte_fib` defect (DIR24_8's update loop wraps at 255.255.255.255 and
+overwrites the whole table; three-route reproducer, unfixed upstream). The
+re-trial is now `route_route_test`'s `RteFibTest.*`, run on every build:
+`RteFibTest.D130WrapDefectStillPresent` fails once a DPDK upgrade fixes the
+defect, which is the cue to rerun the benchmark half (D-130 "Revisit when").
 
 #### Do not treat RCU as a multi-writer synchronization primitive
 
@@ -10517,7 +10516,8 @@ deferred until two real consumers need them (D-008; §31.3 item 2).
     (default `taskset`), with nothing machine-specific. It prints current vs
     recorded and flags any decision that flipped.
   - Run by hand on a DPDK pin change, a compiler bump, or new hardware.
-    Correctness gates (`fib_bench` with `BESS_FIB_GATE=1`) may run in CI.
+    Correctness gates run in CI already (the `rte_fib` one is `RteFibTest.*`,
+    D-130).
 - **C-HW (deferred):** real-NIC, offload, RSS, zero-copy, and hardware-meter
   validation remain a separate lab program and do not block software work.
 
@@ -11410,7 +11410,8 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
 
 ### 31.7 Recurring checks
 
-- **On every DPDK upgrade:** `fib_bench` with `BESS_FIB_GATE=1` (D-003).
+- **On every DPDK upgrade:** if `RteFibTest.D130WrapDefectStillPresent`
+  fails, the `rte_fib` defect is fixed: follow D-130's "Revisit when".
   The CI tests in D-007 must pass; they pin every DPDK behaviour we rely
   on. Re-run `BM_Lookup`, `occupancy_bench` and `grace_period_bench`.
 - **On new hardware:** re-run the D-006 and D-011 tuning checks and the

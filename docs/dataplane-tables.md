@@ -642,6 +642,6 @@ Run a benchmark pinned to one isolated core. The tables above name each one.
 | update-mode thresholds, writer rate | `update_scale_bench` |
 | control-ingress transport | `ingress_bench` |
 | plain vs staged body rule | `modules_table_scale_bench`, `classifier_cuckoo_scale_bench` |
-| `rte_fib` rejection (correctness gate) | `fib_bench` with `BESS_FIB_GATE=1` |
+| `rte_fib` rejection (correctness gate, D-130) | `route_route_test` (`RteFibTest.*`, every build); `fib_bench` for cost |
 | LPM lookup and update cost | `route_bench` |
 | meters, counters, RCU | `meter_bench`, `stats_bench`, `rcu_bench` |

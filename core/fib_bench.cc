@@ -72,7 +72,6 @@
 #include <benchmark/benchmark.h>
 
 #include "utils/logging.h"
-#include <cstdlib>
 
 #include <rte_errno.h>
 #include <rte_fib.h>
@@ -551,18 +550,12 @@ BENCHMARK(BM_LookupLpmScalar)
     ->Arg(1 << 16)
     ->Arg(1 << 19);
 
-// FIB is registered only up to 64K routes: at 512K, with rules inserted in
-// the generator's arbitrary (realistic) order -- what a control plane may do,
-// adding a /24 after a /28 under it -- rte_fib (DPDK 25.11.3, DIR24_8,
-// 4-byte next hops) returns a next hop matching no rule at all for some
-// keys. Observed, not root-caused: deterministic across runs, unchanged by a
-// 4x larger tbl8 pool, and gone when the same rule set goes in
-// shortest-prefix-first, while rte_lpm and the independent reference agree in
-// both orders. Re-verified 2026-09-19 with this file's full-key-stream gate
-// and with add/delete return values checked. DPDK 25.11.3 already carries the
-// upstream "fib: fix prefix addition handling" fix, so this is not that known
-// defect. See MODERNIZATION.md entry 34; re-register 1 << 19 here after a DPDK
-// fix that this gate accepts.
+// FIB is registered only up to 64K routes: the 512K generated set holds
+// prefixes ending at 255.255.255.255, and inserting one after the routes it
+// covers trips rte_fib's top-of-address-space defect (D-130: the update loop
+// wraps and overwrites the whole tbl24), which this file's gate catches. The
+// defect and the re-trial live in route_test (RteFibTest); re-register
+// 1 << 19 here once that test reports the defect gone.
 void BM_LookupFib(benchmark::State &state) {
   RunLookup<FibTable, &FibTable::LookupBatch>(state);
 }
@@ -576,14 +569,9 @@ BENCHMARK(BM_AddDeleteLpm)->ArgNames({"routes"})->Arg(1024)->Arg(1 << 16);
 void BM_AddDeleteFib(benchmark::State &state) {
   RunAddDelete<FibTable>(state);
 }
-// FIB's add/delete comparison stops at 1K routes: at 64K, the delete+add
-// churn of the generated rule set leaves some keys resolving to a next hop
-// matching no rule -- caught by this benchmark's post-timing verification
-// (added in the same review-hardening pass), while rte_lpm returns exactly the
-// reference for the same churn at every size. Same defect class as the 512K
-// build finding, but in the *update* path -- the path whose measured cost
-// advantage motivated this experiment -- so FIB's 64K update numbers are not
-// reportable. See MODERNIZATION.md entry 34.
+// FIB's add/delete comparison stops at 1K routes: the 64K delete+add churn
+// trips the same D-130 defect (re-adding a top-of-space prefix over the
+// routes it covers), so FIB's 64K update numbers are not reportable.
 BENCHMARK(BM_AddDeleteFib)->ArgNames({"routes"})->Arg(1024);
 
 }  // namespace
@@ -594,20 +582,6 @@ int main(int argc, char **argv) {
   // Same sandbox-safe EAL as the other benchmarks in this tree: --no-huge,
   // malloc-backed, which is also what rte_lpm/rte_fib allocate from.
   bess::InitDpdk(0);
-
-  // BESS_FIB_GATE=1 re-registers the two rows rte_fib failed in entry 34 --
-  // the 512K arbitrary-order build and the 64K delete+add churn -- whose
-  // built-in verification against the reference LPM aborts on a wrong answer.
-  // Run it on every DPDK version change (deps/dpdk.json); rte_fib may be
-  // reconsidered only once both rows pass.
-  if (const char *gate = std::getenv("BESS_FIB_GATE");
-      gate != nullptr && gate[0] == '1') {
-    benchmark::RegisterBenchmark("BM_LookupFib/routes:524288", BM_LookupFib)
-        ->Arg(1 << 19);
-    benchmark::RegisterBenchmark("BM_AddDeleteFib/routes:65536",
-                                 BM_AddDeleteFib)
-        ->Arg(1 << 16);
-  }
 
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {

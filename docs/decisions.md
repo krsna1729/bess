@@ -147,6 +147,7 @@ file is the reasoning.
 | D-125 | HTTP inside bessd, off by default: protobuf-JSON over the Control RPCs, WatchEvents as server-sent events, Prometheus `/metrics` (replaces tools/bess_prometheus.py), a compiled-in page; every request a call on bessd's own gRPC server over an in-process channel | accepted |
 | D-126 | One SIMD width per process: `--simd_width=auto\|256\|512` and the CPU, decided once before the EAL, passed to DPDK as `--force-max-simd-bitwidth` (auto passes nothing: DPDK's 256 on x86) and to BESS kernels through `arch::RuntimeDispatch`, a function pointer resolved at startup; wider than the CPU is a warning; no AVX-512 kernel (no hardware) | accepted |
 | D-127 | Compiler tuning: a `tune` meson option (`-mtune`, empty by default, not passed to plugins); releases stay `-march=x86-64-v3` with the compiler's default tune (GCC: generic): on this host no `-mtune` (generic, graniterapids, znver5, native alderlake) is consistently faster with GCC 16, and Clang's best tune here is AMD's | accepted |
+| D-130 | `rte_fib` re-trial: the D-003 failure is an `rte_fib` defect (DIR24_8 update loop wraps at 255.255.255.255 and overwrites the whole table), not BESS usage; `rte_lpm` stays; the re-trial is a unit test that fails when DPDK fixes it | accepted |
 | D-131 | Local DPDK patches: `deps/dpdk-patches/NNNN-<slug>.patch` (format-patch, `Upstream-Status` and `BESS-Decision` trailers) applied in order by the bootstrap; a series stamp in the source tree and each install re-extracts or reinstalls on change; `--check-patches` in CI; build-info and the SBOM list the series | accepted |
 
 
@@ -307,15 +308,16 @@ tbl8 groups. `Clear()` builds a fresh table and swaps it. Next hops live in an
   - The failure is deterministic.
   - It does not occur when the rules are inserted shortest-prefix-first.
   - It is not the known upstream defect.
-  - There is no minimal reproducer yet.
-  - Reproduce it with `fib_bench` and `BESS_FIB_GATE=1`.
+  - Root-caused in D-130: an `rte_fib` defect at the top of the address
+    space, with a three-route reproducer.
 
 **Rejected.** `rte_fib`, on correctness. Rebuild per change, on cost.
 
-**Revisit when:** on every DPDK upgrade, run `fib_bench` with
-`BESS_FIB_GATE=1`. If it passes, `rte_fib` is worth re-evaluating for its
-cheaper builds and updates. Also revisit when IPv6 routing is needed
-(`rte_lpm6` or `rte_fib6`, measured the same way).
+**Revisit when:** `RteFibTest.D130WrapDefectStillPresent` fails, which a
+DPDK that fixes the defect makes it do (D-130 says what to rerun). Then
+`rte_fib` is worth re-evaluating for its cheaper builds and updates. Also
+revisit when IPv6 routing is needed (`rte_lpm6` or `rte_fib6`, measured the
+same way; D-130 notes `rte_fib6` has the same loop).
 
 ## D-004 Update modes: concurrent (C) and per-worker (W); generation swap (G) only for bulk loads
 
@@ -9231,6 +9233,79 @@ Keep-alive and HTTP/2 were left out: a scraper, `curl` and the page make one req
 `tests/live/live_daemon.{h,cc}` (`Daemon::Launch`, `FreePort`), `tests/live/meson.build`; deleted
 `tools/bess_prometheus.py`; `docs/control-sdk.md`, `docs/limits.md`, `docs/running-in-containers.md`,
 `protobuf/control_v2.proto` and `core/stats/metric_registry.h` (comments), `MODERNIZATION.md` (G1.9).
+
+## D-130 `rte_fib` re-trial: the D-003 failure is an `rte_fib` defect; `rte_lpm` stays
+
+**Status:** accepted.
+
+**Context.** D-003 rejected `rte_fib` because, with 512K routes in arbitrary order, DIR24_8 returned a next hop
+matching no route, and its 64K delete/re-add churn did the same. There was no minimal reproducer, and the re-trial
+was a benchmark flag (`fib_bench`, `BESS_FIB_GATE=1`) to be run by hand on DPDK upgrades.
+
+**Finding.** An `rte_fib` defect, not BESS usage. Shrinking `fib_bench`'s 512K set (delta debugging against the
+independent reference) leaves three routes; the 64K churn shrinks to the same shape. The two reproducers in
+`route_test` (DIR24_8, 4-byte next hops, default next hop 0):
+
+| sequence | lookup | expected | `rte_fib` 25.11.3 |
+|---|---|---|---|
+| add 10.0.0.0/8 -> 7, 255.255.255.254/32 -> 1, 255.255.255.255/32 -> 2, then 255.255.255.254/31 -> 3 | 255.255.255.254 / 10.1.2.3 | 1 / 7 | 3 / 3 |
+| add 10.0.0.0/8 -> 7, 255.255.255.254/31 -> 3, the two /32s as above, then delete the /31 | 255.255.255.254 / 10.1.2.3 | 1 / 7 | 0 (miss) / 0 |
+
+Cause, in `lib/fib/dir24_8.c` `modify_fib()`: changing a prefix walks the routes it covers, moving a left edge
+past each one. When those routes run contiguously up to 255.255.255.255, stepping past the last one wraps the
+edge to 0. The branch for "the edge is already at this route" does not check for the wrap (the other branch
+does), so the loop ends in `install_to_fib(dp, 0, 0, nh)`, which means the whole address space: every tbl24
+entry is overwritten. An add writes the added route's next hop everywhere; a delete writes the covering route's
+(or the default). The trigger needs a prefix ending at 255.255.255.255 updated over routes that tile its end,
+which is why shortest-prefix-first insertion never hit it and why only a handful of the 512K routes mattered.
+
+Ruled out as usage: next-hop width (4-byte and 8-byte fail alike), lookup byte order (`RTE_FIB_F_LOOKUP_NETWORK_ORDER`
+on and off fail alike), the tbl8 pool (D-003: 4x larger, same), the default next hop (0 and 8192 alike), adds of
+existing prefixes and delete semantics (both reproducers use plain add/delete; `rte_lpm` agrees with the reference
+on the same sequences). The code is unchanged on upstream DPDK main (checked 2026-10-13); the last `dir24_8.c` fix,
+"fib: fix prefix addition handling", is already in 25.11.3 and is a different defect.
+
+The fix is one check (verified out of tree only: a copy of `dir24_8.c` with it, linked in place of
+`dir24_8_modify()` against the pinned 25.11.3, answers both reproducers correctly and passes 40 of 40 full-space
+oracle seeds, against 0 of 40 unpatched):
+
+```c
+if (ledge == redge) {
+	ledge = redge + (uint32_t)(1ULL << (32 - tmp_depth));
+	if (ledge == 0)	/* the covered routes reach the end of the space */
+		break;
+	continue;
+}
+```
+
+`lib/fib/trie.c` `modify_dp()` (`rte_fib6`) has the same loop and the same unchecked branch; not run here.
+
+**Decision.** Keep `rte_lpm` (D-003). BESS builds the DPDK release tarball unpatched (`deps/dpdk.json`), and
+carrying a DPDK patch is not worth it for a lookup that only ties (D-003: 3.70 vs 3.95 ns at 1K routes). The
+fix belongs upstream. The benchmark step of the re-trial (lookup at 1K/64K/512K, build and update cost, memory,
+paired against `rte_lpm`) was not run: it only follows a passing oracle.
+
+The re-trial is now a unit test instead of a benchmark flag (`BESS_FIB_GATE` removed). It always runs (about 3 s
+in a debugoptimized build), so a DPDK change is covered without anyone remembering to run it:
+
+- `RteFibTest.D130WrapDefectStillPresent` runs both reproducers and asserts the wrong answers above: an expected
+  failure, written out. A DPDK that answers them correctly fails it on purpose.
+- `RteFibTest.RandomisedChurnMatchesReference` drives `rte_fib`, `rte_lpm` (`RouteTable`) and the reference in lock
+  step through 4 seeds x 2000 random operations: prefix lengths 0-32, the default route, dense overlap around
+  10/8, 192.168/16 and both ends of the space, re-points, deletes that must restore the covering route, deletes of
+  absent routes; checked after every operation. While the defect is present it leaves out prefixes ending at
+  255.255.255.255 (the defect's precondition, and nothing else); when it is gone they are back in with no edit.
+  With them in, all 4 seeds diverge on 25.11.3 within 183-816 operations, `rte_lpm` agreeing with the reference
+  every time. Without them, a 300-seed x 4000-operation run (1.2M operations) found no other disagreement; and
+  `fib_bench`'s 512K set and 64K churn pass with their top-of-space prefixes dropped (4 and 2 of them).
+
+**Revisit when:** `RteFibTest.D130WrapDefectStillPresent` fails (a DPDK upgrade with the fix). Then: retire that
+test (the randomised one already covers the whole space), re-register `fib_bench`'s 512K lookup and 64K churn
+rows, and run the benchmark half of the re-trial, paired against `rte_lpm` on an isolated CPU. Adopt `rte_fib`
+only if it is no slower on lookup and clearly better on update cost or memory.
+
+**Code.** `core/route/route_test.cc` (`RteFib`, `RteFibTest.*`), `core/fib_bench.cc` (comments; `BESS_FIB_GATE`
+removed), `docs/dataplane-tables.md`, `MODERNIZATION.md`.
 
 ## D-131 Local DPDK patches
 

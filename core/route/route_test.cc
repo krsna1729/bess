@@ -8,25 +8,36 @@
 // key, and must still agree after delete/re-add churn. The concurrent tests
 // then check what K7 adds on top of rte_lpm: that readers running during
 // in-place updates only ever see answers some rule justifies, and that a
-// resolved route always has its next hop.
+// resolved route always has its next hop. The last section runs rte_fib
+// through the same reference on every build: the re-trial D-003 asks for on
+// each DPDK change (D-130).
 
 #include <gtest/gtest.h>
+
+#include <rte_errno.h>
+#include <rte_fib.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <map>
 #include <random>
 #include <set>
+#include <span>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
+#include "dpdk.h"
 #include "runtime/runtime_state.h"
 #include "packet_pool.h"
 #include "route/route_table.h"
 #include "route/router.h"
+#include "utils/dpdk_memory.h"
+#include "utils/endian.h"
 
 namespace bess::route {
 namespace {
@@ -848,6 +859,278 @@ TEST(RouterTest, RewriteL2) {
   EXPECT_EQ(packet::MutationError::kSharedStorage, RewriteL2(ref, hop).error());
   rte_mbuf_refcnt_update(pkt, -1);
   PacketFree(pkt);
+}
+
+// -- rte_fib re-trial (D-003, D-130) ---------------------------------------------
+//
+// rte_fib through the same independent reference, so the re-trial D-003 asks
+// for on every DPDK change is part of this suite. rte_lpm (RouteTable) runs
+// every sequence too, as the control: a disagreement only rte_fib shows is
+// rte_fib's.
+
+// rte_fib as IPLookup would adopt it: DIR24_8 with rte_lpm's 4-byte next hops,
+// lookups on packet-order keys (RTE_FIB_F_LOOKUP_NETWORK_ORDER, the variant
+// fib_bench measures). Rules go in host order, as for rte_lpm.
+class RteFib {
+ public:
+  static constexpr uint64_t kMiss = 0;  // every route value here is >= 1
+
+  RteFib(int max_routes, uint32_t tbl8_groups) {
+    if (!IsDpdkInitialized()) {
+      InitDpdk();
+    }
+    static std::atomic<int> next{0};
+    const std::string name = "fib_test" + std::to_string(next++);
+    rte_fib_conf conf = {};
+    conf.type = RTE_FIB_DIR24_8;
+    conf.default_nh = kMiss;
+    conf.max_routes = max_routes;
+    conf.dir24_8.nh_sz = RTE_FIB_DIR24_8_4B;
+    conf.dir24_8.num_tbl8 = tbl8_groups;
+    conf.flags = RTE_FIB_F_LOOKUP_NETWORK_ORDER;
+    fib_ = rte_fib_create(name.c_str(), utils::MemoryNode(), &conf);
+    EXPECT_NE(nullptr, fib_) << "rte_fib_create: " << rte_strerror(rte_errno);
+  }
+  ~RteFib() { rte_fib_free(fib_); }
+  RteFib(const RteFib &) = delete;
+  RteFib &operator=(const RteFib &) = delete;
+
+  bool ok() const { return fib_ != nullptr; }
+  int Add(Ipv4Prefix p, uint32_t v) {
+    return rte_fib_add(fib_, p.addr(), p.length(), v);
+  }
+  int Erase(Ipv4Prefix p) { return rte_fib_delete(fib_, p.addr(), p.length()); }
+
+  // Host-order addresses, at most 32; kMiss where no route matches.
+  void LookupBatch(std::span<const uint32_t> addrs, std::span<uint64_t> out) {
+    std::array<uint32_t, 32> raw;
+    for (size_t i = 0; i < addrs.size(); i++) {
+      raw[i] = utils::be32_t(addrs[i]).raw_value();
+    }
+    EXPECT_EQ(0, rte_fib_lookup_bulk(fib_, raw.data(), out.data(),
+                                     static_cast<int>(addrs.size())));
+  }
+  uint64_t Lookup(uint32_t addr) {
+    uint64_t nh = kMiss;
+    LookupBatch(std::span(&addr, 1), std::span(&nh, 1));
+    return nh;
+  }
+
+ private:
+  rte_fib *fib_ = nullptr;
+};
+
+// D-130's reproducer for the defect in rte_fib's DIR24_8 update loop
+// (lib/fib/dir24_8.c, modify_fib(); DPDK 25.11.3, and upstream main as of
+// 2026-10). Changing a prefix walks the routes it covers, moving a left edge
+// past each. When the covered routes run contiguously up to 255.255.255.255,
+// stepping past the last one wraps the edge to 0; the "edge already there"
+// branch does not check for the wrap (the other branch does), and the final
+// install_to_fib(0, 0) means "the whole address space": every tbl24 entry
+// is overwritten. An add writes the added route's next hop everywhere, a
+// delete the covering route's (here: the default). Entry 34's "next hop
+// matching no rule" at 512K routes, and its 64K churn failure, were this.
+struct WrapCase {
+  uint64_t covered;    // 255.255.255.254: its own /32, value 1
+  uint64_t unrelated;  // 10.1.2.3: 10.0.0.0/8, value 7
+};
+
+WrapCase RunWrapCase(bool delete_form) {
+  RteFib fib(64, 16);
+  EXPECT_TRUE(fib.ok());
+  if (!fib.ok()) {
+    return {};
+  }
+  const Ipv4Prefix lo = P(Ip(255, 255, 255, 254), 32);
+  const Ipv4Prefix hi = P(Ip(255, 255, 255, 255), 32);
+  const Ipv4Prefix both = P(Ip(255, 255, 255, 254), 31);
+  EXPECT_EQ(0, fib.Add(P(Ip(10, 0, 0, 0), 8), 7));
+  if (delete_form) {
+    // Covering route first (built correctly), then deleted.
+    EXPECT_EQ(0, fib.Add(both, 3));
+    EXPECT_EQ(0, fib.Add(lo, 1));
+    EXPECT_EQ(0, fib.Add(hi, 2));
+    EXPECT_EQ(0, fib.Erase(both));
+  } else {
+    // Covered routes first, then the covering route.
+    EXPECT_EQ(0, fib.Add(lo, 1));
+    EXPECT_EQ(0, fib.Add(hi, 2));
+    EXPECT_EQ(0, fib.Add(both, 3));
+  }
+  return {fib.Lookup(Ip(255, 255, 255, 254)), fib.Lookup(Ip(10, 1, 2, 3))};
+}
+
+bool FibHasWrapDefect() {
+  const WrapCase add = RunWrapCase(false);
+  const WrapCase del = RunWrapCase(true);
+  return !(add.covered == 1 && add.unrelated == 7 && del.covered == 1 &&
+           del.unrelated == 7);
+}
+
+// Expected failure, pinned: the DPDK this tree builds still has the defect.
+// When an upgrade fixes it, this fails on purpose -- that is the trigger to
+// rerun the re-trial (docs/decisions.md, D-130 "Revisit when").
+TEST(RteFibTest, D130WrapDefectStillPresent) {
+  if (!FibHasWrapDefect()) {
+    FAIL() << "rte_fib answers D-130's reproducer correctly now: rerun the "
+              "rte_fib re-trial (D-130), then retire this test";
+  }
+  const WrapCase add = RunWrapCase(false);
+  EXPECT_EQ(3u, add.covered) << "the whole table takes the added /31's value";
+  EXPECT_EQ(3u, add.unrelated);
+  const WrapCase del = RunWrapCase(true);
+  EXPECT_EQ(RteFib::kMiss, del.covered) << "the whole table falls to default";
+  EXPECT_EQ(RteFib::kMiss, del.unrelated);
+}
+
+uint32_t HostMask(uint8_t len) { return len == 32 ? 0 : ~uint32_t{0} >> len; }
+
+// Each prefix's first and last address and the addresses either side.
+void AddEdges(Ipv4Prefix p, std::vector<uint32_t> *keys) {
+  const uint32_t lo = p.addr();
+  const uint32_t hi = lo | HostMask(p.length());
+  keys->insert(keys->end(), {lo, hi, lo - 1, hi + 1});
+}
+
+// Randomised add / re-point / delete sequences: prefix lengths 0-32 (the
+// default route included), dense overlap, deletes that must restore the
+// covering route, deletes of absent routes. rte_fib, rte_lpm and the
+// reference take every operation in lock step and are compared after each
+// one. `avoid_top` leaves out the prefixes that end at 255.255.255.255 --
+// the D-130 defect's precondition, and nothing else.
+void RunFibOracle(uint64_t seed, size_t steps, bool avoid_top) {
+  constexpr size_t kMaxLive = 256;
+  RteFib fib(2 * kMaxLive, 1024);
+  ASSERT_TRUE(fib.ok());
+  auto lpm = MakeTable(2 * kMaxLive, 1024);
+  ReferenceLpm ref;
+  std::vector<Ipv4Prefix> live;
+  std::set<Ipv4Prefix> live_set;
+  std::mt19937_64 rng(seed);
+
+  // Bases that make prefixes overlap: two dense neighbourhoods and both ends
+  // of the address space.
+  constexpr std::array<uint32_t, 4> kBases = {Ip(10, 0, 0, 0),
+                                              Ip(192, 168, 0, 0), 0,
+                                              Ip(255, 255, 0, 0)};
+  auto random_prefix = [&]() {
+    for (;;) {
+      const uint32_t pick = static_cast<uint32_t>(rng() % 100);
+      uint8_t len;
+      if (pick < 5) {
+        len = static_cast<uint8_t>(rng() % 9);  // /0../8
+      } else if (pick < 15) {
+        len = static_cast<uint8_t>(9 + rng() % 8);
+      } else if (pick < 55) {
+        len = static_cast<uint8_t>(17 + rng() % 8);
+      } else {
+        len = static_cast<uint8_t>(25 + rng() % 8);
+      }
+      const uint32_t addr =
+          rng() % 20 == 0 ? ~uint32_t{0}  // the last prefix of its length
+                          : kBases[rng() % kBases.size()] |
+                                (static_cast<uint32_t>(rng()) & 0xffff);
+      const uint32_t prefix = addr & ~HostMask(len);
+      if (avoid_top && len != 0 && (prefix | HostMask(len)) == ~uint32_t{0}) {
+        continue;
+      }
+      return P(prefix, len);
+    }
+  };
+
+  // Compares all three on `keys`; stops at the first disagreement (the
+  // tables have diverged, so later ones say nothing new).
+  auto agree = [&](const std::vector<uint32_t> &keys, size_t step) {
+    const auto view = lpm->Read();
+    for (size_t base = 0; base < keys.size(); base += 32) {
+      const size_t n = std::min<size_t>(32, keys.size() - base);
+      const std::span<const uint32_t> batch(&keys[base], n);
+      std::array<uint64_t, 32> fib_values;
+      std::array<uint32_t, 32> lpm_values;
+      fib.LookupBatch(batch, std::span(fib_values.data(), n));
+      const uint64_t hits =
+          view.LookupBatch(batch, std::span(lpm_values.data(), n));
+      for (size_t i = 0; i < n; i++) {
+        const auto expected = ref.Lookup(batch[i]);
+        const uint64_t lpm_value =
+            (hits >> i) & 1 ? lpm_values[i] : RteFib::kMiss;
+        if (fib_values[i] != expected.value_or(RteFib::kMiss) ||
+            lpm_value != expected.value_or(RteFib::kMiss)) {
+          ADD_FAILURE() << std::hex << "seed 0x" << seed << " step " << std::dec
+                        << step << " key 0x" << std::hex << batch[i]
+                        << std::dec << ": expected "
+                        << expected.value_or(RteFib::kMiss) << ", rte_fib "
+                        << fib_values[i] << ", rte_lpm " << lpm_value
+                        << " (0 = miss)";
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+
+  std::vector<uint32_t> keys;
+  for (size_t step = 0; step < steps; step++) {
+    keys.clear();
+    const uint32_t pick = static_cast<uint32_t>(rng() % 100);
+    if ((pick < 40 || live.size() >= kMaxLive) && !live.empty()) {
+      // Delete a live route (the default too): what it covered falls back
+      // to the route covering it.
+      const size_t i = rng() % live.size();
+      const Ipv4Prefix p = live[i];
+      live[i] = live.back();
+      live.pop_back();
+      live_set.erase(p);
+      ASSERT_EQ(0, fib.Erase(p)) << "step " << step;
+      ASSERT_TRUE(lpm->Erase(p)) << "step " << step;
+      ref.Erase(p);
+      AddEdges(p, &keys);
+    } else if (pick < 45) {
+      // Delete a route that is not there: refused, nothing changes.
+      const Ipv4Prefix p = random_prefix();
+      if (live_set.contains(p)) {
+        continue;
+      }
+      ASSERT_EQ(-ENOENT, fib.Erase(p)) << "step " << step;
+      ASSERT_EQ(RouteError::kNotFound, lpm->Erase(p).error()) << "step " << step;
+      AddEdges(p, &keys);
+    } else {
+      // Add, or re-point a route already there; 1 in 11 is the default route.
+      const Ipv4Prefix p = pick < 50 ? P(0, 0) : random_prefix();
+      const uint32_t v = 1 + static_cast<uint32_t>(rng() % 60000);
+      ASSERT_EQ(0, fib.Add(p, v)) << "step " << step;
+      ASSERT_TRUE(lpm->Upsert(p, Value(v))) << "step " << step;
+      ref.Set(p, v);
+      if (live_set.insert(p).second) {
+        live.push_back(p);
+      }
+      AddEdges(p, &keys);
+    }
+    // Every step: the changed prefix's edges, a sample of the others' edges
+    // and random addresses. Every 64th step and the last: every edge.
+    const bool full = step % 64 == 63 || step + 1 == steps;
+    for (size_t i = 0; i < (full ? live.size() : 8) && !live.empty(); i++) {
+      AddEdges(full ? live[i] : live[rng() % live.size()], &keys);
+    }
+    for (size_t i = 0; i < (full ? 256 : 8); i++) {
+      keys.push_back(static_cast<uint32_t>(rng()));
+    }
+    if (!agree(keys, step)) {
+      return;
+    }
+  }
+}
+
+TEST(RteFibTest, RandomisedChurnMatchesReference) {
+  // While D-130's defect is present, its precondition is left out (the test
+  // above pins the defect itself); a DPDK that fixes it gets the whole
+  // address space here with no edit.
+  const bool avoid_top = FibHasWrapDefect();
+  RecordProperty("top_of_address_space",
+                 avoid_top ? "left out: D-130 defect present" : "included");
+  for (uint64_t seed : {0x130a, 0x130b, 0x130c, 0x130d}) {
+    RunFibOracle(seed, 2000, avoid_top);
+  }
 }
 
 }  // namespace
