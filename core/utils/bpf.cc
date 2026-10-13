@@ -8,6 +8,8 @@
 
 #include "bpf.h"
 
+#include <cstring>
+
 namespace bess {
 namespace utils {
 
@@ -512,14 +514,16 @@ static void emit_code(bpf_bin_stream *stream, u_int value, u_int len) {
     stream->cur_ip++;
     break;
 
-  case 2:
-    *(reinterpret_cast<u_short *>(stream->ibuf + stream->cur_ip)) =
-        (u_short)value;
+  case 2: {
+    // The instruction stream has no alignment: copy, not a typed store.
+    const u_short v = static_cast<u_short>(value);
+    std::memcpy(stream->ibuf + stream->cur_ip, &v, sizeof(v));
     stream->cur_ip += 2;
     break;
+  }
 
   case 4:
-    *(reinterpret_cast<u_int *>(stream->ibuf + stream->cur_ip)) = value;
+    std::memcpy(stream->ibuf + stream->cur_ip, &value, sizeof(value));
     stream->cur_ip += 4;
     break;
   }

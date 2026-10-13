@@ -154,6 +154,12 @@ CommandResponse BPF::CommandClear(const bess::pb::EmptyArg &) {
   return CommandSuccess();
 }
 
+// UBSan's -fsanitize=function reads the 8 bytes before a called function for
+// its type signature; JIT code starts a fresh mapping, so the read faults on
+// the page before it (as in utils/bpf_program.h). Exempt the one indirect call.
+#if defined(__clang__)
+__attribute__((no_sanitize("function")))
+#endif
 inline bool BPF::Match(const bess::utils::Filter &filter, u_char *pkt,
                        u_int wirelen, u_int buflen) {
 #ifdef __x86_64

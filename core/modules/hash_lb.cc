@@ -4,6 +4,7 @@
 
 #include "hash_lb.h"
 
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -25,6 +26,13 @@ static inline uint16_t hash_range(uint32_t hashval, uint16_t range) {
   return static_cast<uint16_t>(bess::dataplane::RangeSelect(hashval, range));
 }
 
+// A header field at any alignment.
+template <typename T>
+static inline T Load(const char *p) {
+  T v;
+  std::memcpy(&v, p, sizeof(v));
+  return v;
+}
 
 const Commands HashLB::cmds = {
     {"set_mode", "HashLBCommandSetModeArg",
@@ -205,9 +213,9 @@ inline void HashLB::DoProcessBatch<HashLB::Mode::kL3>(
     char *head = snb.head_data<char *>();
 
     uint32_t hash_val;
-    uint32_t v0 =
-        *(reinterpret_cast<uint32_t *>(head + ip_offset + 12));   /* src IP */
-    v0 ^= *(reinterpret_cast<uint32_t *>(head + ip_offset + 16)); /* dst IP */
+    // Header fields need not be aligned (the IP header starts 14 bytes in).
+    uint32_t v0 = Load<uint32_t>(head + ip_offset + 12);  /* src IP */
+    v0 ^= Load<uint32_t>(head + ip_offset + 16);          /* dst IP */
 
     hash_val = hash_32(v0, 0);
     EmitPacket(ctx, snb, gates[hash_range(hash_val, num_gates)]);
@@ -228,11 +236,10 @@ inline void HashLB::DoProcessBatch<HashLB::Mode::kL4>(
         ip_offset + ((*(reinterpret_cast<uint8_t *>(head + ip_offset)) & 0x0F)
                      << 2); /* ip_offset + IHL */
     uint32_t hash_val;
-    uint32_t v0 =
-        *(reinterpret_cast<uint32_t *>(head + ip_offset + 12));   /* src IP */
-    v0 ^= *(reinterpret_cast<uint32_t *>(head + ip_offset + 16)); /* dst IP*/
-    v0 ^= *(reinterpret_cast<uint16_t *>(head + l4_offset));      /* src port */
-    v0 ^= *(reinterpret_cast<uint16_t *>(head + l4_offset + 2));  /* dst port */
+    uint32_t v0 = Load<uint32_t>(head + ip_offset + 12);  /* src IP */
+    v0 ^= Load<uint32_t>(head + ip_offset + 16);          /* dst IP */
+    v0 ^= Load<uint16_t>(head + l4_offset);               /* src port */
+    v0 ^= Load<uint16_t>(head + l4_offset + 2);           /* dst port */
 
     v0 ^= *(reinterpret_cast<uint8_t *>(head + ip_offset + 9)); /* ip_proto */
 

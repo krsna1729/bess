@@ -7,9 +7,11 @@
 
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <map>
 #include <numeric>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -671,16 +673,24 @@ static inline T *_ptr_attr_with_offset(bess::metadata::mt_offset_t offset,
   return reinterpret_cast<T *>(addr);
 }
 
+// Attribute offsets are packed, not aligned: copy through a byte pointer, never
+// a typed one (one load or store either way).
 template <typename T>
 static inline T _get_attr_with_offset(bess::metadata::mt_offset_t offset,
                                       bess::PacketRef pkt) {
-  return *_ptr_attr_with_offset<T>(offset, pkt);
+  static_assert(std::is_trivially_copyable_v<T>);
+  promise(offset >= 0);
+  T val;
+  std::memcpy(&val, pkt.metadata<const char *>() + offset, sizeof(T));
+  return val;
 }
 
 template <typename T>
 static inline void _set_attr_with_offset(bess::metadata::mt_offset_t offset,
                                          bess::PacketRef pkt, T val) {
-  *(_ptr_attr_with_offset<T>(offset, pkt)) = val;
+  static_assert(std::is_trivially_copyable_v<T>);
+  promise(offset >= 0);
+  std::memcpy(pkt.metadata<char *>() + offset, &val, sizeof(T));
 }
 
 // Safe version.
