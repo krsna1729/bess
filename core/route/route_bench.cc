@@ -10,6 +10,8 @@
 //                RouteTable     host-order gather + LookupBatch (what
 //                               IPLookup now runs)
 //                Router         LookupBatch + next-hop resolution
+//              RouteTable, Router and UpdateInPlace also run on the rte_fib
+//              backend (the *Fib rows, D-132).
 //   update  -- one route change applied in place (K7) versus rebuilding the
 //              whole rte_lpm for it (the pre-K7 IPLookup behaviour), at each
 //              table size.
@@ -45,6 +47,10 @@ using bess::route::LpmRouteTable;
 using bess::route::NextHop;
 using bess::route::NextHopId;
 using bess::route::NeighborState;
+using bess::route::RouteBackend;
+using bess::route::RouteBackendSupported;
+using bess::route::RouteError;
+using bess::route::RouteErrorName;
 using bess::route::Router;
 
 constexpr size_t kBatch = 32;
@@ -106,8 +112,10 @@ std::vector<uint32_t> Keys(const std::vector<Route> &routes) {
   return keys;
 }
 
-LpmRouteTable::Config ConfigFor(size_t routes) {
+LpmRouteTable::Config ConfigFor(size_t routes,
+                                RouteBackend backend = RouteBackend::kRteLpm) {
   LpmRouteTable::Config config;
+  config.backend = backend;
   config.max_routes = static_cast<uint32_t>(routes * 2);
   config.tbl8_groups = static_cast<uint32_t>(routes / 4 + 256);
   return config;
@@ -119,18 +127,23 @@ struct Fixture {
   std::vector<uint32_t> keys;
 };
 
-// Built once per size and kept: rte_lpm builds are the expensive part.
-Fixture &TableFor(size_t n) {
-  static std::map<size_t, Fixture> fixtures;
-  Fixture &f = fixtures[n];
+// Built once per size and backend and kept: rte_lpm builds are the
+// expensive part.
+Fixture &TableFor(size_t n, RouteBackend backend = RouteBackend::kRteLpm) {
+  // One backend's tables at a time: each holds a 64 MB tbl24 plus its tbl8
+  // pool, and both backends' sets do not fit a 1 GB hugepage.
+  static std::map<std::pair<size_t, RouteBackend>, Fixture> fixtures;
+  std::erase_if(fixtures,
+                [&](const auto &entry) { return entry.first.second != backend; });
+  Fixture &f = fixtures[{n, backend}];
   if (f.table == nullptr) {
     f.routes = Routes(n);
     f.keys = Keys(f.routes);
-    f.table = LpmRouteTable::Create("route_bench", ConfigFor(n),
+    f.table = LpmRouteTable::Create("route_bench", ConfigFor(n, backend),
                                     bess::runtime::runtime().rcu())
                   .value();
     for (const Route &r : f.routes) {
-      (void)f.table->Upsert(r.prefix, r.value);
+      f.table->Upsert(r.prefix, r.value).value();
     }
   }
   return f;
@@ -198,8 +211,12 @@ void BM_LookupRawLpmX4(benchmark::State &state) {
 }
 BENCHMARK(BM_LookupRawLpmX4)->ArgsProduct({{1024, 16384, 65536}, {0, 1}});
 
-void BM_LookupRouteTable(benchmark::State &state) {
-  Fixture &f = TableFor(static_cast<size_t>(state.range(0)));
+void LookupRouteTable(benchmark::State &state, RouteBackend backend) {
+  if (!RouteBackendSupported(backend)) {
+    state.SkipWithError(RouteErrorName(RouteError::kUnsupportedBackend));
+    return;
+  }
+  Fixture &f = TableFor(static_cast<size_t>(state.range(0)), backend);
   const std::vector<uint32_t> keys = StreamFor(f, state.range(1) != 0);
   std::vector<uint32_t> wire(keys.size());
   for (size_t i = 0; i < wire.size(); i++) {
@@ -219,10 +236,18 @@ void BM_LookupRouteTable(benchmark::State &state) {
   }
   state.SetItemsProcessed(state.iterations() * kBatch);
 }
+void BM_LookupRouteTable(benchmark::State &state) {
+  LookupRouteTable(state, RouteBackend::kRteLpm);
+}
 BENCHMARK(BM_LookupRouteTable)->ArgsProduct({{1024, 16384, 65536}, {0, 1}});
+void BM_LookupRouteTableFib(benchmark::State &state) {
+  LookupRouteTable(state, RouteBackend::kRteFib);
+}
+BENCHMARK(BM_LookupRouteTableFib)->ArgsProduct({{1024, 16384, 65536}, {0, 1}});
 
-std::unique_ptr<Router> RouterFor(size_t n, std::vector<uint32_t> *keys) {
-  auto router = Router::Create("route_bench_rt", ConfigFor(n), 1024,
+std::unique_ptr<Router> RouterFor(size_t n, RouteBackend backend,
+                                  std::vector<uint32_t> *keys) {
+  auto router = Router::Create("route_bench_rt", ConfigFor(n, backend), 1024,
                                bess::runtime::runtime().rcu())
                     .value();
   for (uint32_t id = 1; id <= 1023; id++) {
@@ -239,9 +264,13 @@ std::unique_ptr<Router> RouterFor(size_t n, std::vector<uint32_t> *keys) {
   return router;
 }
 
-void BM_LookupRouter(benchmark::State &state) {
+void LookupRouter(benchmark::State &state, RouteBackend backend) {
+  if (!RouteBackendSupported(backend)) {
+    state.SkipWithError(RouteErrorName(RouteError::kUnsupportedBackend));
+    return;
+  }
   std::vector<uint32_t> keys;
-  auto router = RouterFor(static_cast<size_t>(state.range(0)), &keys);
+  auto router = RouterFor(static_cast<size_t>(state.range(0)), backend, &keys);
   size_t offset = 0;
   const NextHop *hops[kBatch];
   uint64_t egress = 0;
@@ -256,7 +285,14 @@ void BM_LookupRouter(benchmark::State &state) {
   benchmark::DoNotOptimize(egress);
   state.SetItemsProcessed(state.iterations() * kBatch);
 }
+void BM_LookupRouter(benchmark::State &state) {
+  LookupRouter(state, RouteBackend::kRteLpm);
+}
 BENCHMARK(BM_LookupRouter)->Arg(1024)->Arg(16384)->Arg(65536);
+void BM_LookupRouterFib(benchmark::State &state) {
+  LookupRouter(state, RouteBackend::kRteFib);
+}
+BENCHMARK(BM_LookupRouterFib)->Arg(1024)->Arg(16384)->Arg(65536);
 
 // -- lookup body study (K4.5 method applied to rte_lpm) ------------------------------
 //
@@ -353,8 +389,12 @@ BENCHMARK(BM_LookupBody)
 
 // One route change in place: add a /28 and delete it again (two changes per
 // iteration, reported per change).
-void BM_UpdateInPlace(benchmark::State &state) {
-  Fixture &f = TableFor(static_cast<size_t>(state.range(0)));
+void UpdateInPlace(benchmark::State &state, RouteBackend backend) {
+  if (!RouteBackendSupported(backend)) {
+    state.SkipWithError(RouteErrorName(RouteError::kUnsupportedBackend));
+    return;
+  }
+  Fixture &f = TableFor(static_cast<size_t>(state.range(0)), backend);
   const Ipv4Prefix p = Ipv4Prefix::Make(0xc6336400, 28).value();  // 198.51.100/28
   for (auto _ : state) {
     (void)f.table->Upsert(p, 7);
@@ -363,7 +403,14 @@ void BM_UpdateInPlace(benchmark::State &state) {
   bess::runtime::runtime().rcu().ReclaimReady();
   state.SetItemsProcessed(state.iterations() * 2);
 }
+void BM_UpdateInPlace(benchmark::State &state) {
+  UpdateInPlace(state, RouteBackend::kRteLpm);
+}
 BENCHMARK(BM_UpdateInPlace)->Arg(1024)->Arg(16384)->Arg(65536);
+void BM_UpdateInPlaceFib(benchmark::State &state) {
+  UpdateInPlace(state, RouteBackend::kRteFib);
+}
+BENCHMARK(BM_UpdateInPlaceFib)->Arg(1024)->Arg(16384)->Arg(65536);
 
 // What one route change cost before K7: a whole new rte_lpm with every rule.
 void BM_UpdateByRebuild(benchmark::State &state) {

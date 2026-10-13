@@ -1,0 +1,81 @@
+From b3d239ff6bb902f57dfcba6aa1913deef3d2ecb9 Mon Sep 17 00:00:00 2001
+From: Saikrishna Edupuganti <6157640+krsna1729@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:28:40 +0530
+Subject: [PATCH] fib: fix no space error with free groups in defer queue
+
+When a range installed by dir24_8 starts inside one /24 and ends in
+another, install_to_fib() makes sure two tbl8 groups are free: it
+allocates the first with tbl8_alloc(), which reclaims a group from the
+RCU defer queue when none is free, but takes the second with plain
+tbl8_get_idx(), which does not. With an RCU defer queue, groups freed
+earlier stay there until a later allocation reclaims them one at a
+time, so after a run of deletes an add of such a range fails with
+-ENOSPC while the queue holds groups that readers have long released:
+the first allocation reclaims one group and the second finds none.
+
+Reclaim for the second group as well, through a helper shared with
+tbl8_alloc(). Take the second group only once the first is allocated,
+so a group reclaimed for it cannot be left marked in use when the first
+allocation fails.
+
+Fixes: 96c3d06a3547 ("fib: implement RCU rule reclamation")
+Cc: stable@dpdk.org
+
+Upstream-Status: Pending
+BESS-Decision: D-132
+---
+ lib/fib/dir24_8.c | 23 +++++++++++++++--------
+ 1 file changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/lib/fib/dir24_8.c b/lib/fib/dir24_8.c
+index 63cbda3..6ec5f03 100644
+--- a/lib/fib/dir24_8.c
++++ b/lib/fib/dir24_8.c
+@@ -200,18 +200,25 @@ tbl8_free_idx(struct dir24_8_tbl *dp, int idx)
+ 		~(1ULL << (idx & BITMAP_SLAB_BITMASK));
+ }
+ 
++/* Take a free tbl8 group; if there is none, try to reclaim one first. */
++static int
++tbl8_get_idx_reclaim(struct dir24_8_tbl *dp)
++{
++	int tbl8_idx = tbl8_get_idx(dp);
++
++	if (unlikely(tbl8_idx == -ENOSPC && dp->dq &&
++			!rte_rcu_qsbr_dq_reclaim(dp->dq, 1, NULL, NULL, NULL)))
++		tbl8_idx = tbl8_get_idx(dp);
++	return tbl8_idx;
++}
++
+ static int
+ tbl8_alloc(struct dir24_8_tbl *dp, uint64_t nh)
+ {
+ 	int64_t	tbl8_idx;
+ 	uint8_t	*tbl8_ptr;
+ 
+-	tbl8_idx = tbl8_get_idx(dp);
+-
+-	/* If there are no tbl8 groups try to reclaim one. */
+-	if (unlikely(tbl8_idx == -ENOSPC && dp->dq &&
+-			!rte_rcu_qsbr_dq_reclaim(dp->dq, 1, NULL, NULL, NULL)))
+-		tbl8_idx = tbl8_get_idx(dp);
++	tbl8_idx = tbl8_get_idx_reclaim(dp);
+ 
+ 	if (tbl8_idx < 0)
+ 		return tbl8_idx;
+@@ -337,10 +344,10 @@ install_to_fib(struct dir24_8_tbl *dp, uint32_t ledge, uint32_t redge,
+ 				 * needs tbl8 for ledge and redge.
+ 				 */
+ 				tbl8_idx = tbl8_alloc(dp, tbl24_tmp);
+-				tmp_tbl8_idx = tbl8_get_idx(dp);
+ 				if (tbl8_idx < 0)
+ 					return -ENOSPC;
+-				else if (tmp_tbl8_idx < 0) {
++				tmp_tbl8_idx = tbl8_get_idx_reclaim(dp);
++				if (tmp_tbl8_idx < 0) {
+ 					tbl8_free_idx(dp, tbl8_idx);
+ 					return -ENOSPC;
+ 				}
+-- 
+2.55.0
+

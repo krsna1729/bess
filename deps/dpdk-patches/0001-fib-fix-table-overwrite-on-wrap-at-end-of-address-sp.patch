@@ -1,0 +1,62 @@
+From 89e9a7e10094dfc5f893341a633ee9436e0c8d80 Mon Sep 17 00:00:00 2001
+From: Saikrishna Edupuganti <6157640+krsna1729@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 15:35:11 +0530
+Subject: [PATCH 1/2] fib: fix table overwrite on wrap at end of address space
+
+When a route is added or deleted, modify_fib() walks the more specific
+routes it covers and moves a left edge past each one. If those routes
+run contiguously up to 255.255.255.255, stepping past the last one
+wraps the left edge to 0. The branch taken when the left edge is
+already at the next covered route does not check for the wrap. The
+final range check no longer stops the walk either, since it skips a
+left edge of 0 (for the default route added first), so the walk ends
+in install_to_fib(dp, 0, 0, nh): the next hop is written over the
+whole address space. An add leaves every tbl24 entry with the added
+route's next hop; a delete leaves every entry with the covering
+route's next hop, or the default next hop.
+
+The common case is a change to the default route while the routes
+under it reach the top of the space contiguously: 0.0.0.0/1 and
+128.0.0.0/1 (as VPN clients install over a default), or 224.0.0.0/4
+and 240.0.0.0/4. Adding, re-pointing or deleting 0.0.0.0/0 then makes
+every lookup return the default route's new next hop, or the default
+next hop. Any prefix ending at 255.255.255.255 behaves the same. With
+10.0.0.0/8 -> 7, 255.255.255.254/32 -> 1 and 255.255.255.255/32 -> 2,
+adding 255.255.255.254/31 -> 3 makes every lookup, 10.1.2.3 included,
+return 3.
+
+Commit ab1b927cd73e ("fib: fix adding default route overwriting entire
+table") added the wrap check after an installed range only. Add the
+same check to the branch that skips an empty range, and a test for
+both cases and both operations.
+
+Fixes: 880bc2b5f3bd ("fib: fix adding default route")
+Cc: stable@dpdk.org
+
+[BESS: lib/ hunk only; the upstream patch also adds test_wrap_around to
+app/test/test_fib.c, made against DPDK main. BESS's reproducers are in
+core/route/route_test.cc.]
+
+Upstream-Status: Pending
+BESS-Decision: D-132
+---
+ lib/fib/dir24_8.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/lib/fib/dir24_8.c b/lib/fib/dir24_8.c
+index 489d2ef427..5a47b76875 100644
+--- a/lib/fib/dir24_8.c
++++ b/lib/fib/dir24_8.c
+@@ -436,6 +436,12 @@ modify_fib(struct dir24_8_tbl *dp, struct rte_rib *rib, uint32_t ip,
+ 			if (ledge == redge) {
+ 				ledge = redge +
+ 					(uint32_t)(1ULL << (32 - tmp_depth));
++				/*
++				 * we got to the end of address space
++				 * and wrapped around
++				 */
++				if (ledge == 0)
++					break;
+ 				continue;
+ 			}
+ 			ret = install_to_fib(dp, ledge, redge,

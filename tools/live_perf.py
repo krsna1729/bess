@@ -18,7 +18,8 @@ counters, so nothing is added to the packet path). Classes:
        F.queue          Source -> Queue | worker 1: Queue -> Sink (cross-worker handoff)
   M  module, localised -- ns per packet *above* M.base (Source -> Rewrite -> Bypass -> Sink,
        the same headers and flow mix every M test uses):
-       M.exactmatch, M.exactmatch/mixed (bursts split across gates), M.wildcardmatch, M.iplookup,
+       M.exactmatch, M.exactmatch/mixed (bursts split across gates), M.wildcardmatch,
+       M.iplookup, M.iplookup/fib (the same on the rte_fib backend, D-132),
        M.l2forward, M.acl, M.hashlb, M.update, M.nat, M.vlan, M.genericencap (constant header),
        M.metadata (Timestamp and SetMetadata attributes read by GenericEncap)
   Reading a result: F.floor or F.hop moving moves every pipeline (cross-cutting);
@@ -304,8 +305,8 @@ def m_session(b):
     return m_base(b, [('em', 1), ('at', 1), ('mt', 1), ('rt', 1)])
 
 
-def m_iplookup(b):
-    b.mod('IPLookup', 'ipl', {})
+def m_iplookup(b, arg=None):
+    b.mod('IPLookup', 'ipl', arg or {})
     for i in range(256):
         b.cmd('ipl', 'add', 'IPLookupCommandAddArg',
               {'prefix': '11.%d.0.0' % i, 'prefix_len': 16, 'gate': 1})
@@ -393,6 +394,7 @@ TESTS = {
     'M.wildcardmatch/16': ('M', m_wildcardmatch_masks(16)),
     'M.session': ('M', m_session),
     'M.iplookup': ('M', m_iplookup),
+    'M.iplookup/fib': ('M', lambda b: m_iplookup(b, {'backend': 'ROUTE_BACKEND_FIB'})),
     'M.l2forward': ('M', m_l2forward),
     'M.acl': ('M', m_acl),
     'M.hashlb': ('M', m_hashlb),

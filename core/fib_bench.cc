@@ -45,7 +45,10 @@
 //   - `bytes_route`: allocation footprint, from rte_malloc_get_socket_stats()
 //     before and after construction (both DPDK tables allocate out of the EAL
 //     heap, so this is the whole cost)
-//   - separately, add/delete cost per operation
+//   - separately, add/delete cost per operation: one route added and
+//     deleted on the full table (UpdateOne, every size) and the whole table
+//     deleted and re-added route by route (AddDelete, 1K and 64K; a 512K
+//     pass would cost rte_lpm at least its ~20 s build)
 //
 // Correctness gate before any timing: each case cross-checks the DPDK result
 // against an independent longest-prefix match computed here from the
@@ -78,6 +81,7 @@
 #include <rte_lpm.h>
 #include <rte_malloc.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -527,6 +531,40 @@ void RunAddDelete(benchmark::State &state) {
                                                    static_cast<double>(items));
 }
 
+// One route change on a full table: add a /28 the table does not hold and
+// delete it again (two changes per iteration, reported per change). This is a
+// control plane's update, at each table size; RunAddDelete is whole-table
+// churn. The table is gated again afterwards.
+template <typename Table>
+void RunUpdateOne(benchmark::State &state) {
+  const size_t routes = static_cast<size_t>(state.range(0));
+  Prepared prep(routes);
+  Table *table = Prepare<Table>(&prep, TableName());
+  Route extra{0xC6336400u, 28, 1};  // 198.51.100.0/28 (TEST-NET-2)
+  while (std::ranges::any_of(prep.routes, [&](const Route &r) {
+    return r.prefix == extra.prefix && r.len == extra.len;
+  })) {
+    extra.prefix += 16;
+  }
+
+  uint64_t items = 0;
+  uint64_t errors = 0;
+  const uint64_t cpu0 = ThreadCpuNs();
+  for (auto _ : state) {
+    errors += table->Add(extra) != 0;
+    errors += table->Delete(extra) != 0;
+    items += 2;
+  }
+  const uint64_t cpu_ns = ThreadCpuNs() - cpu0;
+  CHECK_EQ(errors, 0) << errors << " add/delete operations failed";
+  VerifyAgainstReference(&prep, table);
+  delete table;
+
+  state.SetItemsProcessed(items);
+  state.counters["cpu_ns_op"] = benchmark::Counter(static_cast<double>(cpu_ns) /
+                                                   static_cast<double>(items));
+}
+
 // Sizes: 1K (small edge/ToR table), 64K (plausible transit FIB), 512K (large
 // IPv4 FIB). 512K is this host's ceiling: both tables' tbl24 is fixed at
 // 2^24 entries, which is 64MB for rte_lpm (4-byte entries) and -- because
@@ -550,16 +588,36 @@ BENCHMARK(BM_LookupLpmScalar)
     ->Arg(1 << 16)
     ->Arg(1 << 19);
 
-// FIB is registered only up to 64K routes: the 512K generated set holds
-// prefixes ending at 255.255.255.255, and inserting one after the routes it
-// covers trips rte_fib's top-of-address-space defect (D-130: the update loop
-// wraps and overwrites the whole tbl24), which this file's gate catches. The
-// defect and the re-trial live in route_test (RteFibTest); re-register
-// 1 << 19 here once that test reports the defect gone.
+// The 512K generated set holds prefixes ending at 255.255.255.255; inserting
+// one after the routes it covers trips rte_fib's top-of-address-space defect
+// unless DPDK carries deps/dpdk-patches/0001 (D-130), and this file's gate
+// then fails the run.
 void BM_LookupFib(benchmark::State &state) {
   RunLookup<FibTable, &FibTable::LookupBatch>(state);
 }
-BENCHMARK(BM_LookupFib)->ArgNames({"routes"})->Arg(1024)->Arg(1 << 16);
+BENCHMARK(BM_LookupFib)
+    ->ArgNames({"routes"})
+    ->Arg(1024)
+    ->Arg(1 << 16)
+    ->Arg(1 << 19);
+
+void BM_UpdateOneLpm(benchmark::State &state) {
+  RunUpdateOne<LpmTable>(state);
+}
+BENCHMARK(BM_UpdateOneLpm)
+    ->ArgNames({"routes"})
+    ->Arg(1024)
+    ->Arg(1 << 16)
+    ->Arg(1 << 19);
+
+void BM_UpdateOneFib(benchmark::State &state) {
+  RunUpdateOne<FibTable>(state);
+}
+BENCHMARK(BM_UpdateOneFib)
+    ->ArgNames({"routes"})
+    ->Arg(1024)
+    ->Arg(1 << 16)
+    ->Arg(1 << 19);
 
 void BM_AddDeleteLpm(benchmark::State &state) {
   RunAddDelete<LpmTable>(state);
@@ -569,10 +627,7 @@ BENCHMARK(BM_AddDeleteLpm)->ArgNames({"routes"})->Arg(1024)->Arg(1 << 16);
 void BM_AddDeleteFib(benchmark::State &state) {
   RunAddDelete<FibTable>(state);
 }
-// FIB's add/delete comparison stops at 1K routes: the 64K delete+add churn
-// trips the same D-130 defect (re-adding a top-of-space prefix over the
-// routes it covers), so FIB's 64K update numbers are not reportable.
-BENCHMARK(BM_AddDeleteFib)->ArgNames({"routes"})->Arg(1024);
+BENCHMARK(BM_AddDeleteFib)->ArgNames({"routes"})->Arg(1024)->Arg(1 << 16);
 
 }  // namespace
 

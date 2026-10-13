@@ -15,6 +15,7 @@
 
 #include "dataplane/transaction_engine.h"
 #include "runtime/runtime_state.h"
+#include "testing/route_backends.h"
 
 namespace bess::route {
 namespace {
@@ -35,13 +36,13 @@ Op Set(Ipv4Prefix prefix, uint32_t value) {
 }
 Op Unset(Ipv4Prefix prefix) { return Op::Erase("t/routes", LpmTableResource::Key(prefix)); }
 
-class LpmResourceTest : public ::testing::Test {
+class LpmResourceTest : public bess::testing::RouteBackendTest {
  protected:
   void SetUp() override { Make(64); }
   void TearDown() override { Drop(); }
 
   void Make(uint32_t max_routes) {
-    LpmRouteTable::Config config;
+    LpmRouteTable::Config config = bess::testing::TestRouteConfig();
     config.max_routes = max_routes;
     config.tbl8_groups = 16;
     auto table = LpmRouteTable::Create("t", config, runtime::runtime().rcu());
@@ -67,7 +68,7 @@ class LpmResourceTest : public ::testing::Test {
   std::unique_ptr<LpmTableResource> resource_;
 };
 
-TEST_F(LpmResourceTest, RoutesAndTheDefaultCommitTogether) {
+TEST_P(LpmResourceTest, RoutesAndTheDefaultCommitTogether) {
   ASSERT_EQ(Outcome::kApplied,
             Apply({Set(P(Ip(10, 0, 0, 0), 8), 1), Set(P(Ip(10, 1, 0, 0), 16), 2),
                    Set(P(0, 0), 7)}));
@@ -86,7 +87,7 @@ TEST_F(LpmResourceTest, RoutesAndTheDefaultCommitTogether) {
 
 // A refused transaction leaves no prefix it placed: lookups and the route
 // count are what they were (a placeholder that stayed would be a route).
-TEST_F(LpmResourceTest, ARefusalTakesThePlacedPrefixesBack) {
+TEST_P(LpmResourceTest, ARefusalTakesThePlacedPrefixesBack) {
   ASSERT_EQ(Outcome::kApplied, Apply({Set(P(Ip(10, 0, 0, 0), 8), 1)}));
   const Outcome refused =
       Apply({Set(P(Ip(10, 1, 0, 0), 16), 2), Set(P(Ip(172, 16, 0, 0), 12), 3),
@@ -99,7 +100,7 @@ TEST_F(LpmResourceTest, ARefusalTakesThePlacedPrefixesBack) {
 }
 
 // No room: refused with nothing visible.
-TEST_F(LpmResourceTest, NoRoomRefusesTheWholeTransaction) {
+TEST_P(LpmResourceTest, NoRoomRefusesTheWholeTransaction) {
   Drop();
   Make(2);
   const Outcome refused = Apply({Set(P(Ip(10, 0, 0, 0), 8), 1), Set(P(Ip(11, 0, 0, 0), 8), 2),
@@ -109,7 +110,7 @@ TEST_F(LpmResourceTest, NoRoomRefusesTheWholeTransaction) {
   EXPECT_EQ(std::nullopt, Lookup(Ip(10, 0, 0, 1)));
 }
 
-TEST_F(LpmResourceTest, BadKeysAndValuesAreRefused) {
+TEST_P(LpmResourceTest, BadKeysAndValuesAreRefused) {
   EXPECT_NE(Outcome::kApplied, Apply({Unset(P(Ip(10, 0, 0, 0), 8))})) << "not found";
   EXPECT_NE(Outcome::kApplied,
             Apply({Set(P(Ip(10, 0, 0, 0), 8), LpmRouteTable::kMaxValue + 1)}));
@@ -119,6 +120,8 @@ TEST_F(LpmResourceTest, BadKeysAndValuesAreRefused) {
       << "wrong value type";
   EXPECT_EQ(0u, table_->size());
 }
+
+BESS_INSTANTIATE_ROUTE_BACKENDS(LpmResourceTest);
 
 }  // namespace
 }  // namespace bess::route

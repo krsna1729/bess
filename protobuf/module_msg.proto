@@ -694,9 +694,21 @@ message IPEncapArg {
  * __Input Gates__: 1
  * __Output Gates__: many (configurable, depending on rule values)
  */
+/**
+ * The DPDK longest-prefix-match structure behind an IPv4 route table (D-132).
+ * LPM (rte_lpm) is the default. FIB (rte_fib DIR24_8, with BESS's carried
+ * DPDK patches) changes routes much faster at every table size and has the
+ * same limits and errors; x86-64 only (elsewhere ENOTSUP).
+ */
+enum RouteBackend {
+  ROUTE_BACKEND_LPM = 0;
+  ROUTE_BACKEND_FIB = 1;
+}
+
 message IPLookupArg {
   uint32 max_rules = 1; /// Maximum number of rules (default: 1024)
   uint32 max_tbl8s = 2; /// Maximum number of IP prefixes with smaller than /24 (default: 128)
+  RouteBackend backend = 3; /// Route table structure (default: LPM)
 }
 
 /**
@@ -1449,9 +1461,10 @@ message ActionTableArg {
  */
 message RouterArg {
   uint64 max_routes = 1; /// Most routes (default 4096).
-  uint64 max_tbl8s = 2; /// Most rte_lpm tbl8 groups (default 256).
+  uint64 max_tbl8s = 2; /// Most tbl8 groups (default 256).
   uint64 max_next_hops = 3; /// Most next hops (default 4096).
   uint64 max_domains = 4; /// Route domains (VRFs) 0..n-1, each with its own FIB sized as above (default 1: the default domain only).
+  RouteBackend backend = 5; /// Every domain's route table structure (default: LPM).
 }
 
 /**

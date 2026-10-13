@@ -104,7 +104,8 @@ tree and the install, and re-extracts and rebuilds when the series changes;
 with no patches DPDK is pristine and an existing install is not rebuilt.
 `tools/bootstrap_dpdk.py --check-patches` checks them (CI: the `layers` step),
 and `build-info.json` lists them under `dpdk.patches`. How to add one, the
-trailers and the rule on a DPDK upgrade: `deps/dpdk-patches/README.md`.
+trailers and the rule on a DPDK upgrade: `deps/dpdk-patches/README.md`. The
+series today is four `rte_fib` fixes, for the `rte_fib` route backend (D-132).
 
 ### Build profiles
 
@@ -10258,14 +10259,14 @@ The typed C++ map semantics are useful and the generic replacement cost is nontr
 
 Build the new classifier framework with explicit modern semantics.
 
-#### Do not adopt `rte_fib` as routing default yet
+#### `rte_fib` is a selectable route backend; `rte_lpm` stays the default
 
-The existing benchmark found correctness failures; D-130 (2026-10-13) root-caused
-them to an `rte_fib` defect (DIR24_8's update loop wraps at 255.255.255.255 and
-overwrites the whole table; three-route reproducer, unfixed upstream). The
-re-trial is now `route_route_test`'s `RteFibTest.*`, run on every build:
-`RteFibTest.D130WrapDefectStillPresent` fails once a DPDK upgrade fixes the
-defect, which is the cue to rerun the benchmark half (D-130 "Revisit when").
+D-130 (2026-10-13) root-caused the old correctness failures to an `rte_fib` defect
+(DIR24_8's update loop wraps at 255.255.255.255 and overwrites the whole table).
+D-132 carries the fix and two more `rte_fib` fixes as local DPDK patches (D-131) and
+offers `rte_fib` as `backend: ROUTE_BACKEND_FIB` on IPLookup and Router, with the
+same limits and errors as `rte_lpm`. `RteFibTest.*` in `route_route_test` fails if a
+build's DPDK lacks a patch; the randomised oracle runs on both backends.
 
 #### Do not treat RCU as a multi-writer synchronization primitive
 
@@ -10516,8 +10517,8 @@ deferred until two real consumers need them (D-008; §31.3 item 2).
     (default `taskset`), with nothing machine-specific. It prints current vs
     recorded and flags any decision that flipped.
   - Run by hand on a DPDK pin change, a compiler bump, or new hardware.
-    Correctness gates run in CI already (the `rte_fib` one is `RteFibTest.*`,
-    D-130).
+    Correctness gates run in CI already (the `rte_fib` ones are `RteFibTest.*`
+    and the `/Fib` instances of the route tests, D-130 and D-132).
 - **C-HW (deferred):** real-NIC, offload, RSS, zero-copy, and hardware-meter
   validation remain a separate lab program and do not block software work.
 
@@ -10658,7 +10659,7 @@ stay in OMEC. Where it now stands against this roadmap:
 | Reuse K1-K4 unchanged; no parallel RCU/packet/classifier/checksum systems | Honored | -- |
 | K5 metering as thin `rte_meter` adapter | **Done** (K5) | -- |
 | K6 worker-local counters/snapshots | **Done** (K6) | Stats API: G1.4 |
-| K7 routes/next hops on proven `rte_lpm`; `rte_fib` only after an oracle gate | **Done**; the `rte_fib` gate is a one-command check (entry 85) | -- |
+| K7 routes/next hops on proven `rte_lpm`; `rte_fib` only after an oracle gate | **Done**; `rte_fib` passed the gate with D-130's fix and is a selectable backend (D-132) | -- |
 | **K7 route domains (`RouteDomainId`, VRF-like) for Network Instance** | **Missing** | **K7.1:** a domain id per `RouteTable`/`Router`, and `ApplyRouteSet(domain, routes)` |
 | IPv6 as a separate key/table family (no universal key) | Missing (K7 is IPv4) | K7.2 when the UPF v6 path starts (`rte_lpm6`) |
 | **K3 `rte_acl` RANGE backend** (source+destination arbitrary closed ranges, precedence), differential vs a scalar reference | **Missing** (K3 closed without it) | **K3.8:** replaces the Go-side Cartesian port expansion; any LUT/SIMD specialization only on benchmark evidence (v4 13.7) |
@@ -11410,8 +11411,8 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
 
 ### 31.7 Recurring checks
 
-- **On every DPDK upgrade:** if `RteFibTest.D130WrapDefectStillPresent`
-  fails, the `rte_fib` defect is fixed: follow D-130's "Revisit when".
+- **On every DPDK upgrade:** each `deps/dpdk-patches/` patch must apply or be
+  removed (D-131); `RteFibTest.*` and the `/Fib` route tests must pass.
   The CI tests in D-007 must pass; they pin every DPDK behaviour we rely
   on. Re-run `BM_Lookup`, `occupancy_bench` and `grace_period_bench`.
 - **On new hardware:** re-run the D-006 and D-011 tuning checks and the

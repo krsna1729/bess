@@ -46,8 +46,9 @@ class IPLookup final : public Module {
 
   ParsedPrefix ParseIpv4Prefix(const std::string &prefix, uint64_t prefix_len);
 
-  // K7 route table: a live rte_lpm updated in place under the runtime's QSBR
-  // (one rule insertion per add, not a rebuild), read lock-free per batch.
+  // K7 route table: a live rte_lpm or rte_fib (`backend`, D-132) updated in
+  // place under the runtime's QSBR (one rule insertion per add, not a
+  // rebuild), read lock-free per batch.
   // The /0 route is the default gate; with none, misses go to DROP_GATE.
   std::unique_ptr<bess::route::RouteTable<GateRoute>> routes_;
   // "<name>/routes" (D-111): the same table, transactionally.

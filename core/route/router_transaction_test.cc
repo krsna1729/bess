@@ -29,6 +29,7 @@
 #include "route/route_domain.h"
 #include "route/router.h"
 #include "testing/allocation_faults.h"
+#include "testing/route_backends.h"
 
 namespace bess::route {
 namespace {
@@ -60,12 +61,12 @@ int EgressOf(const Router &router, uint32_t dst) {
 
 using MakeRouterFn = std::function<std::unique_ptr<Router>()>;
 
-class RouterTransactionTest : public ::testing::Test {
+class RouterTransactionTest : public bess::testing::RouteBackendTest {
  protected:
   std::unique_ptr<Router> MakeRouter(uint32_t tbl8_groups = 64,
                                      size_t next_hops = 64,
                                      size_t domains = 1, size_t groups = 0) {
-    LpmRouteTable::Config config;
+    LpmRouteTable::Config config = bess::testing::TestRouteConfig();
     config.max_routes = 4096;
     config.tbl8_groups = tbl8_groups;
     auto router = Router::Create("rt", config, next_hops,
@@ -91,7 +92,7 @@ class RouterTransactionTest : public ::testing::Test {
   TransactionEngine engine_{bess::runtime::runtime().rcu()};
 };
 
-TEST_F(RouterTransactionTest, EnrolledRoutersAreWrittenOnlyThroughTheEngine) {
+TEST_P(RouterTransactionTest, EnrolledRoutersAreWrittenOnlyThroughTheEngine) {
   auto router = MakeRouter();
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1)));  // before: fine
   ASSERT_TRUE(router->SetRoute(P(Ip(10, 0, 0, 0), 8), NextHopId(1)));
@@ -125,8 +126,8 @@ TEST_F(RouterTransactionTest, EnrolledRoutersAreWrittenOnlyThroughTheEngine) {
 // Groups made through the direct API stay out of the engine's ledger: a router
 // that has them cannot enroll, and an enrolled router takes groups only
 // through transactions.
-TEST_F(RouterTransactionTest, DirectGroupsAndEnrollmentExcludeEachOther) {
-  LpmRouteTable::Config config;
+TEST_P(RouterTransactionTest, DirectGroupsAndEnrollmentExcludeEachOther) {
+  LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   auto made = Router::Create("rtg", config, 8, bess::runtime::runtime().rcu(),
                              /*max_domains=*/1, /*max_groups=*/4);
   ASSERT_TRUE(made.has_value());
@@ -152,7 +153,7 @@ TEST_F(RouterTransactionTest, DirectGroupsAndEnrollmentExcludeEachOther) {
             router->RemoveNextHopGroup(NextHopGroupId(1)).error());
 }
 
-TEST_F(RouterTransactionTest, NextHopsAndRoutesChangeTogether) {
+TEST_P(RouterTransactionTest, NextHopsAndRoutesChangeTogether) {
   auto router = MakeRouter();
   ASSERT_TRUE(router->Enroll(engine_.registry()));
   // Given in any order: the engine publishes next hops before routes.
@@ -215,7 +216,7 @@ void ResolveInWindow(bool entering) {
   }
 }
 
-TEST_F(RouterTransactionTest, RoutesBeingPlacedChangeNoLookup) {
+TEST_P(RouterTransactionTest, RoutesBeingPlacedChangeNoLookup) {
   for (bool with_default : {false, true}) {
     SCOPED_TRACE(with_default ? "with a default route" : "no default route");
     auto router = MakeRouter();
@@ -256,7 +257,7 @@ TEST_F(RouterTransactionTest, RoutesBeingPlacedChangeNoLookup) {
   }
 }
 
-TEST_F(RouterTransactionTest, RoutesThatDoNotFitRejectWithNothingVisible) {
+TEST_P(RouterTransactionTest, RoutesThatDoNotFitRejectWithNothingVisible) {
   auto router = MakeRouter(/*tbl8_groups=*/2);
   ASSERT_TRUE(router->Enroll(engine_.registry()));
   ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1))}).outcome,
@@ -281,7 +282,7 @@ TEST_F(RouterTransactionTest, RoutesThatDoNotFitRejectWithNothingVisible) {
 
 // One routes resource covers every domain; the domain is part of the key. The
 // default domain's key is the byte string the pre-domain router used.
-TEST_F(RouterTransactionTest, RoutesInTwoDomainsInOneTransaction) {
+TEST_P(RouterTransactionTest, RoutesInTwoDomainsInOneTransaction) {
   auto router = MakeRouter(/*tbl8_groups=*/64, /*next_hops=*/64, /*domains=*/3);
   const RouteDomainId d1(1), d2(2);
   ASSERT_TRUE(router->Enroll(engine_.registry()));
@@ -363,7 +364,7 @@ TEST_F(RouterTransactionTest, RoutesInTwoDomainsInOneTransaction) {
 
 // A new route is placed per domain during prepare, and a domain's tbl8 pool
 // is its own: filling d1's rejects the transaction without touching d2.
-TEST_F(RouterTransactionTest, PlacementCapacityIsPerDomain) {
+TEST_P(RouterTransactionTest, PlacementCapacityIsPerDomain) {
   auto router = MakeRouter(/*tbl8_groups=*/2, /*next_hops=*/8, /*domains=*/3);
   ASSERT_TRUE(router->Enroll(engine_.registry()));
   ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1))}).outcome,
@@ -397,7 +398,7 @@ struct Action {
   NextHopId via;
 };
 
-TEST_F(RouterTransactionTest, OtherResourcesReferenceNextHops) {
+TEST_P(RouterTransactionTest, OtherResourcesReferenceNextHops) {
   auto router = MakeRouter();
   ASSERT_TRUE(router->Enroll(engine_.registry()));
   dataplane::SlotTable<ActionId, Action> actions(16);
@@ -431,7 +432,7 @@ TEST_F(RouterTransactionTest, OtherResourcesReferenceNextHops) {
 // Readers resolve through the router while transactions add a next hop and a
 // route per session, and remove an older session's route and next hop. A
 // resolved address only ever reaches its own session's next hop.
-TEST_F(RouterTransactionTest, ResolvesWhileTransactionsRun) {
+TEST_P(RouterTransactionTest, ResolvesWhileTransactionsRun) {
   constexpr uint32_t kSessions = 2000;  // next hop ids 1..kSessions
   constexpr uint32_t kLive = 300;
   constexpr uint32_t kSteps = 6000;
@@ -510,7 +511,7 @@ TEST_F(RouterTransactionTest, ResolvesWhileTransactionsRun) {
 // routes, next hops, lookups and ledger stay exactly as they were. A refusal
 // the engine absorbs (std::stable_sort's nothrow buffer) leaves the
 // transaction applied exactly as without it.
-TEST_F(RouterTransactionTest, FailureAtEveryAllocationLeavesNoTrace) {
+TEST_P(RouterTransactionTest, FailureAtEveryAllocationLeavesNoTrace) {
   struct Run {
     TransactionEngine engine{bess::runtime::runtime().rcu()};
     std::unique_ptr<Router> router;
@@ -558,10 +559,10 @@ TEST_F(RouterTransactionTest, FailureAtEveryAllocationLeavesNoTrace) {
   }
   size_t threw_count = 0;
   const size_t points = fault_injection::ForEachFailurePoint([&](size_t k) {
-    SCOPED_TRACE(testing::Message() << "failing allocation " << k);
+    SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
     Run run;
     prepare(run);
-    ASSERT_FALSE(testing::Test::HasFailure());
+    ASSERT_FALSE(::testing::Test::HasFailure());
     const std::string before = run.State();
     bool threw = false;
     TransactionEngine::Result result;
@@ -636,10 +637,12 @@ std::string LiveState(const Router &r) {
   return s;
 }
 
+class RouterLiveUpdateFaultTest : public bess::testing::RouteBackendTest {};
+
 // A router with two extra domains, four next hops, two groups and routes in
 // both domains, every retirement completed.
 std::unique_ptr<Router> LiveRouter() {
-  LpmRouteTable::Config config;
+  LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   config.max_routes = 64;
   config.tbl8_groups = 16;
   auto made = Router::Create("live", config, 16, bess::runtime::runtime().rcu(), 4, 4);
@@ -670,8 +673,8 @@ std::unique_ptr<Router> LiveRouter() {
 // domains, groups -- is exactly as it was, nothing is left in the DPDK heap,
 // and the same update then succeeds and leaves the router as an undisturbed
 // update would.
-TEST(RouterLiveUpdateFaultTest, FailureAtEveryAllocationLeavesNoTrace) {
-  LpmRouteTable::Config config;
+TEST_P(RouterLiveUpdateFaultTest, FailureAtEveryAllocationLeavesNoTrace) {
+  LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   config.max_routes = 64;
   config.tbl8_groups = 16;
   using Update = std::function<std::expected<void, RouteError>(Router &)>;
@@ -717,7 +720,7 @@ TEST(RouterLiveUpdateFaultTest, FailureAtEveryAllocationLeavesNoTrace) {
       expected = LiveState(*reference);
     }
     const size_t points = fault_injection::ForEachFailurePoint([&](size_t k) {
-      SCOPED_TRACE(testing::Message() << "failing allocation " << k);
+      SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
       auto router = LiveRouter();
       const std::string before = LiveState(*router);
       const size_t heap = DpdkHeapBytes();
@@ -768,7 +771,7 @@ std::set<int> EgressesOf(const Router &router, uint32_t dst) {
   return seen;
 }
 
-TEST_F(RouterTransactionTest, GroupsNextHopsAndRoutesChangeInOneTransaction) {
+TEST_P(RouterTransactionTest, GroupsNextHopsAndRoutesChangeInOneTransaction) {
   auto router = MakeRouter(64, 64, 1, /*groups=*/8);
   ASSERT_TRUE(router->Enroll(engine_.registry()));
   EXPECT_EQ(router->groups_resource(), "rt/groups");
@@ -824,7 +827,7 @@ TEST_F(RouterTransactionTest, GroupsNextHopsAndRoutesChangeInOneTransaction) {
   ASSERT_EQ(Apply({router->SetNextHopGroupOp(NextHopGroupId(1), cd)}).outcome, Outcome::kApplied);
 }
 
-TEST_F(RouterTransactionTest, GroupReferencesAreChecked) {
+TEST_P(RouterTransactionTest, GroupReferencesAreChecked) {
   auto router = MakeRouter(64, 64, 1, /*groups=*/4);
   ASSERT_TRUE(router->Enroll(engine_.registry()));
   const NextHopId ab[] = {NextHopId(1), NextHopId(2), NextHopId(1)};  // 1 weighted twice
@@ -873,7 +876,7 @@ TEST_F(RouterTransactionTest, GroupReferencesAreChecked) {
             RouteError::kEnrolled);
 }
 
-TEST_F(RouterTransactionTest, RoutersWithoutGroupsRefuseGroupOps) {
+TEST_P(RouterTransactionTest, RoutersWithoutGroupsRefuseGroupOps) {
   auto router = MakeRouter();  // max_groups 0
   ASSERT_TRUE(router->Enroll(engine_.registry()));
   EXPECT_EQ(router->groups_resource_object(), nullptr);
@@ -890,7 +893,7 @@ TEST_F(RouterTransactionTest, RoutersWithoutGroupsRefuseGroupOps) {
 // A reader resolving through groups while transactions replace members, move
 // routes between groups and next hops, and retire groups: every answer is one
 // of the next hops some committed state allowed for that destination.
-TEST_F(RouterTransactionTest, ReadersResolveThroughGroupsWhileTransactionsRun) {
+TEST_P(RouterTransactionTest, ReadersResolveThroughGroupsWhileTransactionsRun) {
   auto router = MakeRouter(64, 64, 1, /*groups=*/4);
   ASSERT_TRUE(router->Enroll(engine_.registry()));
   std::vector<Op> setup;
@@ -990,7 +993,7 @@ TEST_F(RouterTransactionTest, ReadersResolveThroughGroupsWhileTransactionsRun) {
   EXPECT_GT(reads.load(), 0u);
 }
 
-TEST_F(RouterTransactionTest, GroupTransactionFailureAtEveryAllocationLeavesNoTrace) {
+TEST_P(RouterTransactionTest, GroupTransactionFailureAtEveryAllocationLeavesNoTrace) {
   struct Run {
     TransactionEngine engine{bess::runtime::runtime().rcu()};
     std::unique_ptr<Router> router;
@@ -1038,10 +1041,10 @@ TEST_F(RouterTransactionTest, GroupTransactionFailureAtEveryAllocationLeavesNoTr
     applied = reference.State();
   }
   const size_t points = fault_injection::ForEachFailurePoint([&](size_t k) {
-    SCOPED_TRACE(testing::Message() << "failing allocation " << k);
+    SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
     Run run;
     prepare(run, make);
-    ASSERT_FALSE(testing::Test::HasFailure());
+    ASSERT_FALSE(::testing::Test::HasFailure());
     const std::string before = run.State();
     bool threw = false;
     TransactionEngine::Result result;
@@ -1065,6 +1068,9 @@ TEST_F(RouterTransactionTest, GroupTransactionFailureAtEveryAllocationLeavesNoTr
   std::printf("[router groups] %zu failure points\n", points);
   EXPECT_GT(points, 10u);
 }
+
+BESS_INSTANTIATE_ROUTE_BACKENDS(RouterTransactionTest);
+BESS_INSTANTIATE_ROUTE_BACKENDS(RouterLiveUpdateFaultTest);
 
 }  // namespace
 }  // namespace bess::route

@@ -1,0 +1,60 @@
+From 34d1e6a9ad4dd4542b1adda99d615cfeee8eaf72 Mon Sep 17 00:00:00 2001
+From: Saikrishna Edupuganti <6157640+krsna1729@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 15:35:11 +0530
+Subject: [PATCH 2/2] fib6: fix table overwrite on wrap at end of address space
+
+When a route is added or deleted, modify_dp() walks the more specific
+routes it covers and moves a left edge past each one. If those routes
+run contiguously up to ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff,
+stepping past the last one wraps the left edge to ::. The branch taken
+when the left edge is already at the next covered route does not check
+for the wrap. The final range check no longer stops the walk either,
+since it skips a left edge of :: (for the default route added first),
+so the walk ends in install_to_dp() with both edges at ::: the next
+hop is written over the whole address space. An add leaves every entry
+with the added route's next hop; a delete leaves every entry with the
+covering route's next hop, or the default next hop.
+
+The common case is a change to the default route while the routes
+under it reach the top of the space contiguously, such as ::/1 and
+8000::/1 (as VPN clients install over a default). Adding, re-pointing
+or deleting ::/0 then makes every lookup return the default route's
+new next hop, or the default next hop. Any prefix ending at the last
+address behaves the same: with 2001:db8::/32 -> 7 and the last two
+/128 addresses -> 1 and 2, adding their /127 -> 3 makes every lookup,
+2001:db8::1 included, return 3.
+
+The commit below added the wrap check after an installed range only.
+Add the same check to the branch that skips an empty range, and a test
+for both cases and both operations.
+
+Fixes: fd66617c5774 ("fib6: fix adding default route as first route")
+Cc: stable@dpdk.org
+
+[BESS: lib/ hunk only; the upstream patch also adds test_wrap_around to
+app/test/test_fib6.c, made against DPDK main (its context needs the
+test_drift_* cases, which 25.11.3 does not have).]
+
+Upstream-Status: Pending
+BESS-Decision: D-132
+---
+ lib/fib/trie.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/lib/fib/trie.c b/lib/fib/trie.c
+index 187360d1c8..59f043ce0e 100644
+--- a/lib/fib/trie.c
++++ b/lib/fib/trie.c
+@@ -506,6 +506,12 @@ modify_dp(struct rte_trie_tbl *dp, struct rte_rib6 *rib,
+ 			rte_rib6_get_ip(tmp, &redge);
+ 			if (rte_ipv6_addr_eq(&ledge, &redge)) {
+ 				get_nxt_net(&ledge, tmp_depth);
++				/*
++				 * we got to the end of address space
++				 * and wrapped around
++				 */
++				if (rte_ipv6_addr_is_unspec(&ledge))
++					break;
+ 				continue;
+ 			}
+ 			ret = install_to_dp(dp, &ledge, &redge, next_hop);

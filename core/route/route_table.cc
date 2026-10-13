@@ -24,7 +24,7 @@ const char *RouteErrorName(RouteError error) {
     case RouteError::kNotFound:
       return "no such route";
     case RouteError::kBackendFailure:
-      return "rte_lpm failure";
+      return "route backend (rte_lpm or rte_fib) failure";
     case RouteError::kInvalidId:
       return "id is zero or beyond the configured capacity";
     case RouteError::kUnknownNextHop:
@@ -41,6 +41,8 @@ const char *RouteErrorName(RouteError error) {
       return "route domain already exists";
     case RouteError::kDomainInUse:
       return "route domain is the default or still has routes";
+    case RouteError::kUnsupportedBackend:
+      return "the rte_fib route backend needs x86-64 (D-132)";
   }
   return "unknown route error";
 }
@@ -58,15 +60,19 @@ std::expected<Ipv4Prefix, RouteError> Ipv4Prefix::Make(uint32_t addr,
 }
 
 LpmRouteTable::Instance::~Instance() {
+  // Either free also drains the structure's QSBR defer queue.
   if (lpm != nullptr) {
-    rte_lpm_free(lpm);  // also drains its QSBR defer queue
+    rte_lpm_free(lpm);
+  }
+  if (fib != nullptr) {
+    rte_fib_free(fib);
   }
 }
 
 namespace {
 
-// rte_lpm names are global to the EAL and limited to RTE_LPM_NAMESIZE-1
-// characters; a replacement instance exists alongside the one it replaces.
+// rte_lpm and rte_fib names are global to the EAL; RTE_LPM_NAMESIZE-1 is the
+// shorter limit. A replacement instance exists alongside the one it replaces.
 std::string InstanceName(const std::string &base) {
   static std::atomic<uint64_t> next{0};
   char suffix[24];
@@ -80,10 +86,51 @@ std::string InstanceName(const std::string &base) {
 
 std::expected<std::unique_ptr<LpmRouteTable::Instance>, RouteError>
 LpmRouteTable::NewInstance(uint32_t default_value) {
-  // Every allocation before rte_lpm_create: a refusal must not leave an
-  // rte_lpm (and its global name) behind.
+  // Every allocation before the DPDK create: a refusal must not leave a table
+  // (and its global name) behind.
   const std::string name = InstanceName(name_);
   auto instance = std::make_unique<Instance>();
+  instance->default_value.store(default_value, std::memory_order_relaxed);
+
+  if (config_.backend == RouteBackend::kRteFib) {
+    if (config_.max_routes > static_cast<uint32_t>(INT32_MAX)) {
+      return std::unexpected(RouteError::kBackendFailure);
+    }
+    struct rte_fib_conf conf = {};
+    conf.type = RTE_FIB_DIR24_8;
+    conf.default_nh = kFibMiss;
+    conf.max_routes = static_cast<int>(config_.max_routes);
+    conf.rib_ext_sz = 0;
+    conf.dir24_8.nh_sz = RTE_FIB_DIR24_8_4B;
+    // One group beyond the budget (FibAdmits): install_to_fib() wants two
+    // free groups to place a range that needs one, so with the budget spent
+    // a re-point of a block whose group was merged away, or the add of a
+    // range ending on a /24 boundary, would otherwise fail where rte_lpm's
+    // cannot. rte_fib rounds the pool up to a multiple of 64.
+    if (config_.tbl8_groups == UINT32_MAX) {
+      return std::unexpected(RouteError::kBackendFailure);
+    }
+    conf.dir24_8.num_tbl8 = config_.tbl8_groups + 1;
+    struct rte_fib *fib = rte_fib_create(name.c_str(), config_.socket, &conf);
+    if (fib == nullptr) {
+      return std::unexpected(rte_errno == ENOMEM ? RouteError::kTableFull
+                                                 : RouteError::kBackendFailure);
+    }
+    struct rte_fib_rcu_config rcu = {};
+    rcu.v = domain_.dpdk_qsbr();
+    rcu.mode = RTE_FIB_QSBR_MODE_DQ;
+    // Room for every group (rte_fib's default is 128 entries; rte_lpm's is
+    // its pool): when the queue is full and a stalled reader blocks
+    // reclamation, rte_fib logs and leaks the group it could not queue.
+    rcu.dq_size = RTE_ALIGN_CEIL(conf.dir24_8.num_tbl8, 64);
+    if (rte_fib_rcu_qsbr_add(fib, &rcu) != 0) {
+      rte_fib_free(fib);
+      return std::unexpected(RouteError::kBackendFailure);
+    }
+    instance->fib = fib;
+    return instance;
+  }
+
   struct rte_lpm_config conf = {};
   conf.max_rules = config_.max_routes;
   conf.number_tbl8s = config_.tbl8_groups;
@@ -100,17 +147,40 @@ LpmRouteTable::NewInstance(uint32_t default_value) {
     rte_lpm_free(lpm);
     return std::unexpected(RouteError::kBackendFailure);
   }
-
   instance->lpm = lpm;
-  instance->default_value.store(default_value, std::memory_order_relaxed);
   return instance;
+}
+
+int LpmRouteTable::AddRule(Instance &instance, Ipv4Prefix prefix,
+                           uint32_t value) {
+  if (instance.fib != nullptr) {
+    return rte_fib_add(instance.fib, prefix.addr(), prefix.length(), value);
+  }
+  return rte_lpm_add(instance.lpm, prefix.addr(), prefix.length(), value);
+}
+
+int LpmRouteTable::DeleteRule(Instance &instance, Ipv4Prefix prefix) {
+  if (instance.fib != nullptr) {
+    return rte_fib_delete(instance.fib, prefix.addr(), prefix.length());
+  }
+  return rte_lpm_delete(instance.lpm, prefix.addr(), prefix.length());
+}
+
+bool LpmRouteTable::FibAdmits(const FibBlocks &blocks, size_t routes,
+                              Ipv4Prefix prefix) const {
+  return routes < config_.max_routes &&
+         (prefix.length() <= 24 || blocks.contains(prefix.addr() >> 8) ||
+          blocks.size() < config_.tbl8_groups);
 }
 
 std::expected<std::unique_ptr<LpmRouteTable>, RouteError>
 LpmRouteTable::Create(std::string name, const Config &config,
                       rcu::RcuDomain &domain) {
   if (!IsDpdkInitialized()) {
-    InitDpdk();  // rte_lpm lives in EAL memory
+    InitDpdk();  // rte_lpm and rte_fib live in EAL memory
+  }
+  if (!RouteBackendSupported(config.backend)) {
+    return std::unexpected(RouteError::kUnsupportedBackend);
   }
   std::unique_ptr<LpmRouteTable> table(
       new LpmRouteTable(std::move(name), config, domain));
@@ -136,8 +206,8 @@ std::expected<void, RouteError> LpmRouteTable::Upsert(Ipv4Prefix prefix,
   std::lock_guard<std::mutex> lock(writer_mutex_);
   // Whatever the caller published before this call (a next hop, say) must be
   // visible to any reader that sees the new route: the release fence orders
-  // those earlier writes before rte_lpm's entry stores, whatever memory order
-  // rte_lpm uses for them.
+  // those earlier writes before the backend's entry stores, whatever memory
+  // order the backend uses for them.
   std::atomic_thread_fence(std::memory_order_release);
 
   Instance *live = const_cast<Instance *>(live_.Read());
@@ -146,17 +216,40 @@ std::expected<void, RouteError> LpmRouteTable::Upsert(Ipv4Prefix prefix,
     default_ = value;
     return {};
   }
-  // The shadow entry first: once rte_lpm has the route, nothing can fail.
+  // The shadow entries first: once the backend has the route, nothing can
+  // fail (and an allocation that throws before it leaves nothing behind).
+  const size_t routes = rules_.size();
   const auto [rule, inserted] = rules_.try_emplace(prefix, value);
-  const int ret = rte_lpm_add(live->lpm, prefix.addr(), prefix.length(), value);
+  const bool fib = live->fib != nullptr;
+  const bool deep = fib && inserted && prefix.length() > 24;
+  if (fib && inserted && !FibAdmits(fib_blocks_, routes, prefix)) {
+    rules_.erase(rule);
+    return std::unexpected(RouteError::kTableFull);
+  }
+  FibBlocks::iterator block;
+  if (deep) {
+    try {
+      block = fib_blocks_.try_emplace(prefix.addr() >> 8, 0).first;
+    } catch (...) {
+      rules_.erase(rule);
+      throw;
+    }
+  }
+  const int ret = AddRule(*live, prefix, value);
   if (ret != 0) {
     if (inserted) {
       rules_.erase(rule);
+    }
+    if (deep && block->second == 0) {
+      fib_blocks_.erase(block);
     }
     return std::unexpected(ret == -ENOSPC ? RouteError::kTableFull
                                           : RouteError::kBackendFailure);
   }
   rule->second = value;
+  if (deep) {
+    block->second++;
+  }
   return {};
 }
 
@@ -174,11 +267,17 @@ std::expected<void, RouteError> LpmRouteTable::Erase(Ipv4Prefix prefix) {
   if (rules_.find(prefix) == rules_.end()) {
     return std::unexpected(RouteError::kNotFound);
   }
-  const int ret = rte_lpm_delete(live->lpm, prefix.addr(), prefix.length());
+  const int ret = DeleteRule(*live, prefix);
   if (ret != 0) {
     return std::unexpected(RouteError::kBackendFailure);
   }
   rules_.erase(prefix);
+  if (live->fib != nullptr && prefix.length() > 24) {
+    const auto block = fib_blocks_.find(prefix.addr() >> 8);
+    if (--block->second == 0) {
+      fib_blocks_.erase(block);
+    }
+  }
   return {};
 }
 
@@ -191,6 +290,7 @@ std::expected<void, RouteError> LpmRouteTable::Clear() {
   live_.Publish(std::move(*fresh));
   domain_.ReclaimReady();
   rules_.clear();
+  fib_blocks_.clear();
   return {};
 }
 
@@ -214,19 +314,28 @@ std::expected<void, RouteError> LpmRouteTable::ReplaceAll(
   if (!fresh) {
     return std::unexpected(fresh.error());
   }
+  FibBlocks next_blocks;
+  const bool fib = (*fresh)->fib != nullptr;
+  size_t placed = 0;
   for (const auto &[prefix, value] : next_rules) {
-    const int ret =
-        rte_lpm_add((*fresh)->lpm, prefix.addr(), prefix.length(), value);
+    const int ret = fib && !FibAdmits(next_blocks, placed, prefix)
+                        ? -ENOSPC
+                        : AddRule(**fresh, prefix, value);
     if (ret != 0) {
-      // `fresh` is dropped (rte_lpm_free): the live table was never touched.
+      // `fresh` is dropped (and freed): the live table was never touched.
       return std::unexpected(ret == -ENOSPC ? RouteError::kTableFull
                                             : RouteError::kBackendFailure);
+    }
+    placed++;
+    if (fib && prefix.length() > 24) {
+      next_blocks[prefix.addr() >> 8]++;
     }
   }
   // The one publication: a release store of the finished table.
   live_.Publish(std::move(*fresh));
   domain_.ReclaimReady();
   rules_ = std::move(next_rules);
+  fib_blocks_ = std::move(next_blocks);
   default_ = next_default;
   return {};
 }

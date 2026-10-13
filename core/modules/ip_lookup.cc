@@ -21,7 +21,7 @@ static inline int is_valid_gate(gate_idx_t gate) {
   return (gate < MAX_GATES || gate == DROP_GATE);
 }
 
-// THREAD_SAFE: route changes are applied to the live rte_lpm by its single
+// THREAD_SAFE: route changes are applied to the live table by its single
 // serialized writer while workers keep looking up (K7; DPDK's lock-free
 // reader design plus the runtime's QSBR for tbl8 reclamation), so workers are
 // never paused for a route change.
@@ -37,6 +37,16 @@ CommandResponse IPLookup::Init(const bess::pb::IPLookupArg &arg) {
   bess::route::LpmRouteTable::Config config;
   config.max_routes = arg.max_rules() ? arg.max_rules() : 1024;
   config.tbl8_groups = arg.max_tbl8s() ? arg.max_tbl8s() : 128;
+  switch (arg.backend()) {
+    case bess::pb::ROUTE_BACKEND_LPM:
+      config.backend = bess::route::RouteBackend::kRteLpm;
+      break;
+    case bess::pb::ROUTE_BACKEND_FIB:
+      config.backend = bess::route::RouteBackend::kRteFib;
+      break;
+    default:
+      return CommandFailure(EINVAL, "unknown route backend %d", arg.backend());
+  }
 
   auto table = bess::route::RouteTable<GateRoute>::Create(
       name(), config, init_context().rcu());

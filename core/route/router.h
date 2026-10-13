@@ -483,8 +483,9 @@ class Router {
 
  private:
   // A domain's FIB. Immutable once published, like every SlotTable object:
-  // the FIB inside synchronizes itself (rte_lpm in-place updates, the RcuPtr
-  // generation ReplaceAll publishes), so it is reached through a const Domain.
+  // the FIB inside synchronizes itself (rte_lpm or rte_fib in-place updates,
+  // the RcuPtr generation ReplaceAll publishes), so it is reached through a
+  // const Domain.
   class Domain {
    public:
     explicit Domain(std::unique_ptr<LpmRouteTable> table)

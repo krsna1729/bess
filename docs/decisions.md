@@ -149,6 +149,7 @@ file is the reasoning.
 | D-127 | Compiler tuning: a `tune` meson option (`-mtune`, empty by default, not passed to plugins); releases stay `-march=x86-64-v3` with the compiler's default tune (GCC: generic): on this host no `-mtune` (generic, graniterapids, znver5, native alderlake) is consistently faster with GCC 16, and Clang's best tune here is AMD's | accepted |
 | D-130 | `rte_fib` re-trial: the D-003 failure is an `rte_fib` defect (DIR24_8 update loop wraps at 255.255.255.255 and overwrites the whole table), not BESS usage; `rte_lpm` stays; the re-trial is a unit test that fails when DPDK fixes it | accepted |
 | D-131 | Local DPDK patches: `deps/dpdk-patches/NNNN-<slug>.patch` (format-patch, `Upstream-Status` and `BESS-Decision` trailers) applied in order by the bootstrap; a series stamp in the source tree and each install re-extracts or reinstalls on change; `--check-patches` in CI; build-info and the SBOM list the series | accepted |
+| D-132 | `rte_fib` as a selectable route backend (`backend` on IPLookup and Router; `rte_lpm` stays the default): four carried DPDK patches, `rte_lpm`'s limits and errors enforced by the table, the defer queue sized to the pool, x86-64 only (plain stores); cheaper changes at every size and faster batch lookups, equal in a small table | accepted |
 
 
 ---
@@ -318,6 +319,10 @@ DPDK that fixes the defect makes it do (D-130 says what to rerun). Then
 `rte_fib` is worth re-evaluating for its cheaper builds and updates. Also
 revisit when IPv6 routing is needed (`rte_lpm6` or `rte_fib6`, measured the
 same way; D-130 notes `rte_fib6` has the same loop).
+
+**Amended by D-132 (2026-10-13):** `rte_fib` is now a selectable backend, with
+D-130's fix and three more carried as DPDK patches; `rte_lpm` stays the
+default.
 
 ## D-004 Update modes: concurrent (C) and per-worker (W); generation swap (G) only for bulk loads
 
@@ -9318,6 +9323,10 @@ test (the randomised one already covers the whole space), re-register `fib_bench
 rows, and run the benchmark half of the re-trial, paired against `rte_lpm` on an isolated CPU. Adopt `rte_fib`
 only if it is no slower on lookup and clearly better on update cost or memory.
 
+**Amended by D-132 (2026-10-13):** the fix is carried as `deps/dpdk-patches/0001` (D-131) instead of waiting for
+upstream, `rte_fib` is a selectable backend, and the reproducer test is now `RteFibTest.D130PatchIsInEffect`,
+which fails if a build's DPDK lacks the patch. The benchmark half was run there.
+
 **Code.** `core/route/route_test.cc` (`RteFib`, `RteFibTest.*`), `core/fib_bench.cc` (comments; `BESS_FIB_GATE`
 removed), `docs/dataplane-tables.md`, `MODERNIZATION.md`.
 
@@ -9398,3 +9407,92 @@ have to be reopened).
 **Code.** `tools/bootstrap_dpdk.py`, `tools/build_info.py`, `tools/ci_profile.py` (`layers`, `verify-install`),
 `.github/workflows/ci.yml`, `.gitignore`, `deps/dpdk-patches/README.md`, `MODERNIZATION.md`, `README.md`,
 `DEPENDENCY_INVENTORY.md`, `docs/ci-parity.md`.
+
+## D-132 `rte_fib` as a selectable route backend; `rte_lpm` stays the default
+
+**Status:** accepted (2026-10-13).
+
+**Context.** D-130 found that D-003's `rte_fib` failure was a DPDK defect, and D-131 gave BESS a way to carry
+DPDK fixes. `rte_fib` (DIR24_8) was always the cheaper structure to change: D-003 measured faster builds and
+updates. The user's decision (2026-10-13): carry the fix and offer `rte_fib` as a backend, with the same semantics
+as `rte_lpm`; `rte_lpm` stays the default.
+
+**Decision.**
+
+- **One more field.** `RouteBackend backend` (`ROUTE_BACKEND_LPM` = 0, the default; `ROUTE_BACKEND_FIB`) on
+  `IPLookupArg` and `RouterArg`, fixed for the module's life. `LpmRouteTable` holds either structure; a reader
+  branches on it once per batch, never per packet. `rte_fib` is DIR24_8 with 4-byte next hops, the QSBR defer
+  queue of the runtime's `RcuDomain`, and host-order lookups (the `View` API); /0 stays beside the structure, as
+  for `rte_lpm`. Values stay 24-bit for both.
+- **Four carried DPDK patches** (D-131, `Upstream-Status: Pending`, upstream copies in `.scratch/upstream/`):
+
+  | patch | defect | BESS test |
+  |---|---|---|
+  | 0001 fib | D-130's wrap at 255.255.255.255 overwrites the whole table (DIR24_8) | `RteFibTest.D130PatchIsInEffect` |
+  | 0002 fib6 | the same in TRIE (`rte_fib6`) | none: BESS has no IPv6 table yet |
+  | 0003 fib | a re-point whose update fails returns 0 (fixed for TRIE upstream in 3aca5f52b5, not for DIR24_8) | `RteFibTest.D132FailedRepointIsReported` |
+  | 0004 fib | a range that wants two free groups takes the second without reclaiming from the defer queue: after deletes, adds fail with `-ENOSPC` while the queue holds groups readers released long ago | `RouteTableTest.DeletesNeverFailWithAStalledReader/Fib` |
+
+  The three tests fail against pristine 25.11.3 and pass with the series (run both ways).
+- **The same limits and errors as `rte_lpm`.** `rte_fib` does not hold `Config`'s limits itself: it rounds the
+  tbl8 pool up to a multiple of 64 groups (`dir24_8_create`), and its RIB takes up to 2 x `max_routes` nodes. The
+  table enforces both for that backend, the way `rte_lpm` counts them: at most `max_routes` rules, and one group
+  per /24 that holds a rule longer than /24 (`FibAdmits`). A refusal is `kTableFull` with nothing changed. The
+  `rte_fib` pool gets one group beyond the budget, because `install_to_fib` asks for two free groups for a range
+  that ends on a /24 boundary even when it needs one; without the spare, a re-point of a /24 whose group was merged
+  away, or such an add, would fail with the budget not spent, where `rte_lpm` cannot.
+- **The defer queue holds the whole pool.** `rte_fib`'s defaults to 128 entries (a ring of 255); when it is full
+  and a stalled reader blocks reclamation, `rte_fib` logs and leaks the group it could not queue. The backend sets
+  `dq_size` to the pool. Without it, `DeletesNeverFailWithAStalledReader/Fib` fails at its 255th group.
+- **x86-64 only.** `rte_fib` writes entries with plain stores (`write_to_fib`), so a lock-free reader sees a new
+  tbl8 group filled before the tbl24 entry that points to it only under x86's store order; `rte_lpm` uses release
+  stores. Elsewhere `Create` refuses the backend (`kUnsupportedBackend`, `ENOTSUP`), and the backend-parameterised
+  tests and benchmarks run `rte_lpm` only.
+- **One difference stays.** With a reader stalled, `rte_lpm` refuses an add as soon as its freed groups are all in
+  the defer queue; `rte_fib` first uses its spare group and the rest of its 64-rounded pool. It refuses later, never
+  earlier.
+
+**Evidence.** Correctness: every `route_route_test`, `route_router_transaction_test`, `route_route_domain_test`,
+`route_lpm_resource_test` and `modules_ip_lookup_test` case runs on both backends (`/Lpm`, `/Fib`), including the
+randomised oracle against the reference, the allocation-failure tests (`FailureAtEveryAllocationLeavesNoTrace`:
+the per-/24 count is allocated before the DPDK add, so a refused allocation leaves no trace), the transactional
+capacity tests and the RCU group tests. The RCU tests size the pool so that only reuse could succeed (`rte_fib`:
+budget 63, a pool of exactly 64).
+
+Cost (this host, isolated CPU 4, release build, DPDK 25.11.3 with the series; medians of 5, cv at most 1.5% except
+where noted):
+
+| `route_bench` row | `rte_lpm` | `rte_fib` |
+|---|---|---|
+| `LookupRouteTable` 1K / 16K / 64K routes, route-derived keys (ns per key, batches of 32) | 5.26 / 5.62 / 5.83 | 3.66 / 4.42 / 4.93 |
+| the same, uniform random keys | 7.30 / 8.42 / 6.95 (cv 7.5% / 0.5% / 9.4%) | 6.51 / 6.57 / 6.61 |
+| `LookupRouter` 1K / 16K / 64K (ns per packet, next hop included) | 6.69 / 7.37 / 7.72 | 5.16 / 6.25 / 6.64 |
+| `UpdateInPlace` 1K / 16K / 64K (ns per change) | 321 / 4,757 / 19,042 | 187 / 224 / 244 |
+
+`fib_bench` (raw structures, the D-003 rows): one add and delete of a /28 into a full table is 0.53 / 34.7 / 245 µs
+for `rte_lpm` at 1K / 64K / 512K routes, and 0.23 / 0.35 / 0.43 µs for `rte_fib`; deleting and re-adding all 64K
+routes takes 1.23 s and 74 ms.
+
+In the module the lookup gap closes: `live_perf M.iplookup` against `M.iplookup/fib` (256 /16 routes and a
+default, all hits, isolated CPUs 4/6, 8 rounds, one bessd) is 1.55 and 1.79 ns per packet above `M.base`; 152.3 and
+154.6 instructions and 31.2 and 32.1 cycles per packet, base included. The run reported IRQ/softirq activity on the
+target CPUs. A table that small stays in L1 for both, so `rte_fib`'s lookup advantage does not show, and its batch
+call costs about two instructions more per packet.
+
+Memory is the same order for both: a 64 MiB tbl24 (2^24 4-byte entries) plus 1 KiB per tbl8 group; `rte_fib`'s
+pool is rounded up to 64 groups, and its RIB nodes take the place of `rte_lpm`'s rule table.
+
+**Why `rte_lpm` stays the default.** Every existing configuration was measured and run with it, it needs no DPDK
+patch, it runs on arm64, and in a small table its lookup is no slower. `rte_fib` is the choice for tables that
+change often or are large: a change costs under 0.5 µs at every size measured, against 19 µs at 64K and 245 µs at
+512K for `rte_lpm`.
+
+**Revisit when** a DPDK upgrade contains a carried patch (remove it, D-131) or makes `write_to_fib` use release
+stores (lift the x86-64 restriction); when IPv6 routing is needed (`rte_fib6` with 0002, measured the same way);
+or when a deployment's tables are large or churn enough to make `rte_fib` the better default.
+
+**Code.** `core/route/route_table.{h,cc}` (`RouteBackend`, `RouteBackendSupported`, `FibAdmits`),
+`protobuf/module_msg.proto` (`RouteBackend`, `IPLookupArg.backend`, `RouterArg.backend`),
+`core/modules/ip_lookup.cc`, `core/modules/router.cc`, `core/testing/route_backends.h`, the route tests,
+`core/route/route_bench.cc`, `core/fib_bench.cc`, `tools/live_perf.py` (`M.iplookup/fib`),
+`deps/dpdk-patches/0001-0004`.

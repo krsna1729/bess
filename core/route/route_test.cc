@@ -8,9 +8,9 @@
 // key, and must still agree after delete/re-add churn. The concurrent tests
 // then check what K7 adds on top of rte_lpm: that readers running during
 // in-place updates only ever see answers some rule justifies, and that a
-// resolved route always has its next hop. The last section runs rte_fib
-// through the same reference on every build: the re-trial D-003 asks for on
-// each DPDK change (D-130).
+// resolved route always has its next hop. Every table and router test runs
+// once per backend, rte_lpm and rte_fib (D-132). The last section checks that
+// the DPDK this tree builds carries the rte_fib fix BESS needs (D-130).
 
 #include <gtest/gtest.h>
 
@@ -36,6 +36,7 @@
 #include "packet_pool.h"
 #include "route/route_table.h"
 #include "route/router.h"
+#include "testing/route_backends.h"
 #include "utils/dpdk_memory.h"
 #include "utils/endian.h"
 
@@ -53,7 +54,7 @@ constexpr uint32_t Ip(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
 
 std::unique_ptr<RouteTable<Value>> MakeTable(uint32_t routes = 1024,
                                              uint32_t tbl8 = 256) {
-  LpmRouteTable::Config config;
+  LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   config.max_routes = routes;
   config.tbl8_groups = tbl8;
   auto table = RouteTable<Value>::Create("route_test", config,
@@ -180,7 +181,12 @@ TEST(Ipv4PrefixTest, Validation) {
   EXPECT_EQ(RouteError::kHostBitsSet, Ipv4Prefix::Make(1, 0).error());
 }
 
-TEST(RouteTableTest, LongestPrefixDefaultAndClear) {
+class RouteTableTest : public bess::testing::RouteBackendTest {};
+class RouterTest : public bess::testing::RouteBackendTest {};
+class RouterGroupTest : public bess::testing::RouteBackendTest {};
+class RouteOracleTest : public bess::testing::RouteBackendTest {};
+
+TEST_P(RouteTableTest, LongestPrefixDefaultAndClear) {
   auto table = MakeTable();
   ASSERT_TRUE(table->Upsert(P(Ip(10, 0, 0, 0), 8), Value(1)));
   ASSERT_TRUE(table->Upsert(P(Ip(10, 1, 0, 0), 16), Value(2)));
@@ -210,7 +216,7 @@ TEST(RouteTableTest, LongestPrefixDefaultAndClear) {
   EXPECT_EQ(RouteError::kNotFound, table->Erase(P(0, 0)).error());
 }
 
-TEST(RouteTableTest, LimitsAreErrors) {
+TEST_P(RouteTableTest, LimitsAreErrors) {
   auto table = MakeTable(/*routes=*/4, /*tbl8=*/1);
   EXPECT_EQ(RouteError::kValueOutOfRange,
             table->Upsert(P(Ip(1, 0, 0, 0), 8), Value(1u << 24)).error());
@@ -221,7 +227,7 @@ TEST(RouteTableTest, LimitsAreErrors) {
   EXPECT_FALSE(table->Find(P(Ip(1, 1, 2, 0), 25)).has_value());
 }
 
-TEST(RouteTableTest, BatchMaskWithoutDefault) {
+TEST_P(RouteTableTest, BatchMaskWithoutDefault) {
   auto table = MakeTable();
   ASSERT_TRUE(table->Upsert(P(Ip(10, 0, 0, 0), 8), Value(7)));
   const std::array<uint32_t, 6> keys = {Ip(10, 0, 0, 1), Ip(11, 0, 0, 1),
@@ -238,7 +244,7 @@ TEST(RouteTableTest, BatchMaskWithoutDefault) {
 
 // -- the correctness gate -------------------------------------------------------
 
-TEST(RouteTableTest, LargeArbitraryOrderMatchesReferenceThroughChurn) {
+TEST_P(RouteTableTest, LargeArbitraryOrderMatchesReferenceThroughChurn) {
   constexpr size_t kRoutes = 32768;
   auto table = MakeTable(kRoutes * 2, 8192);
   ReferenceLpm ref;
@@ -278,22 +284,44 @@ TEST(RouteTableTest, LargeArbitraryOrderMatchesReferenceThroughChurn) {
 // tbl8 group freed by a delete is not handed to another /24 while a reader
 // that was online before the delete has not reported quiescence -- that
 // reader may have loaded the old tbl24 entry and be about to read the group.
-// Once the reader is quiescent, the next add reclaims the group. The pool
-// holds one group, so the second /24's add can only succeed by reuse.
-TEST(RouteTableTest, FreedTbl8GroupWaitsForOnlineReaders) {
+// Once the reader is quiescent, the next add reclaims the group.
+//
+// The group pool is sized so that the adds after the delete can only succeed
+// by reuse. rte_lpm's pool is the budget. rte_fib's is the budget plus one
+// spare group, rounded up to a multiple of 64 (route_table.cc), so with a
+// budget of 63 it holds exactly 64 and the spare is used up first.
+struct GroupPool {
+  uint32_t budget;
+  uint32_t spare;
+};
+GroupPool TightPool() {
+  return bess::testing::TestRouteBackend() == RouteBackend::kRteFib
+             ? GroupPool{63, 1}
+             : GroupPool{1, 0};
+}
+
+TEST_P(RouteTableTest, FreedTbl8GroupWaitsForOnlineReaders) {
   rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
-  auto table = MakeTable(64, /*tbl8=*/1);
-  const Ipv4Prefix a = P(Ip(10, 1, 1, 64), 26);
+  const GroupPool pool = TightPool();
+  auto table = MakeTable(256, pool.budget);
+  auto block = [](uint32_t i) { return P(Ip(10, 1, i, 64), 26); };
+  for (uint32_t i = 0; i < pool.budget; i++) {
+    ASSERT_TRUE(table->Upsert(block(i), Value(1)));
+  }
   const Ipv4Prefix b = P(Ip(10, 2, 2, 64), 26);
-  ASSERT_TRUE(table->Upsert(a, Value(1)));
   auto no_group = table->Upsert(b, Value(2));
   ASSERT_FALSE(no_group);
-  ASSERT_EQ(RouteError::kTableFull, no_group.error()) << "pool is one group";
+  ASSERT_EQ(RouteError::kTableFull, no_group.error()) << "the budget is spent";
 
   constexpr uint32_t kReader = 22;
   ASSERT_TRUE(domain.Register(kReader).has_value());
   domain.Online(kReader);
-  ASSERT_TRUE(table->Erase(a));
+  for (uint32_t i = 0; i < pool.spare; i++) {
+    ASSERT_TRUE(table->Erase(block(i)));
+    ASSERT_TRUE(table->Upsert(P(Ip(10, 3, i, 64), 26), Value(3)))
+        << "the spare group";
+  }
+  ASSERT_TRUE(table->Erase(block(pool.spare)));
   auto held = table->Upsert(b, Value(2));
   EXPECT_FALSE(held) << "a freed tbl8 group was reused mid-grace-period";
 
@@ -307,30 +335,42 @@ TEST(RouteTableTest, FreedTbl8GroupWaitsForOnlineReaders) {
 
 // A DPDK behaviour the transactional route resource depends on (D-023): a
 // delete never fails, even with every tbl8 group freed at once while a
-// reader stalls. rte_lpm's QSBR defer queue defaults to one entry per tbl8
-// group, so it always has room; aborting placed routes and publishing
-// erases rely on it.
-TEST(RouteTableTest, DeletesNeverFailWithAStalledReader) {
+// reader stalls, and every group comes back once the reader is quiescent.
+// rte_lpm's QSBR defer queue defaults to one entry per tbl8 group; rte_fib's
+// to 128 (a ring of 255), and rte_fib leaks a group it cannot queue, so the
+// backend sizes it to the pool. 319 groups (a pool of exactly 320) are more
+// than rte_fib's default queue holds.
+TEST_P(RouteTableTest, DeletesNeverFailWithAStalledReader) {
   rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
-  constexpr uint32_t kGroups = 8;
-  auto table = MakeTable(64, kGroups);
-  for (uint32_t i = 0; i < kGroups; i++) {
-    ASSERT_TRUE(table->Upsert(P(Ip(10, 0, i, 128), 25), Value(i + 1)));
+  const bool fib = bess::testing::TestRouteBackend() == RouteBackend::kRteFib;
+  const GroupPool pool = fib ? GroupPool{319, 1} : GroupPool{8, 0};
+  auto table = MakeTable(512, pool.budget);
+  auto route = [](uint32_t i) { return P(Ip(10, i >> 8, i & 0xff, 128), 25); };
+  for (uint32_t i = 0; i < pool.budget; i++) {
+    ASSERT_TRUE(table->Upsert(route(i), Value(i + 1)));
   }
   constexpr uint32_t kReader = 23;
   ASSERT_TRUE(domain.Register(kReader).has_value());
   domain.Online(kReader);  // and never quiescent until the end
   for (int round = 0; round < 2; round++) {
-    for (uint32_t i = 0; i < kGroups; i++) {
-      ASSERT_TRUE(table->Erase(P(Ip(10, 0, i, 128), 25)))
+    for (uint32_t i = 0; i < pool.budget; i++) {
+      ASSERT_TRUE(table->Erase(route(i)))
           << "delete " << i << " failed with the defer queue holding "
           << "every group";
     }
-    // Nothing can be re-added while the reader holds the groups.
-    EXPECT_FALSE(table->Upsert(P(Ip(10, 0, 0, 128), 25), Value(1)));
+    // Nothing beyond the spare groups can be added while the reader holds
+    // the others. (A /26 inside its /24: rte_fib asks for two free groups
+    // for a range that ends on a /24 boundary, like the /25s here.)
+    for (uint32_t i = 0; i < pool.spare; i++) {
+      ASSERT_TRUE(table->Upsert(P(Ip(11, 0, i, 64), 26), Value(1)));
+    }
+    EXPECT_FALSE(table->Upsert(route(0), Value(1)));
+    for (uint32_t i = 0; i < pool.spare; i++) {
+      ASSERT_TRUE(table->Erase(P(Ip(11, 0, i, 64), 26)));
+    }
     domain.Quiescent(kReader);
-    for (uint32_t i = 0; i < kGroups; i++) {
-      ASSERT_TRUE(table->Upsert(P(Ip(10, 0, i, 128), 25), Value(i + 1)));
+    for (uint32_t i = 0; i < pool.budget; i++) {
+      ASSERT_TRUE(table->Upsert(route(i), Value(i + 1))) << "group " << i;
     }
   }
   domain.Offline(kReader);
@@ -346,7 +386,7 @@ TEST(RouteTableTest, DeletesNeverFailWithAStalledReader) {
 // must be one some rule justifies: the covering background /16's value, or
 // the /26's value for keys inside it. A group reused under a reader would
 // surface as another /24's value.
-TEST(RouteTableTest, ConcurrentReadersOnlySeeJustifiedAnswers) {
+TEST_P(RouteTableTest, ConcurrentReadersOnlySeeJustifiedAnswers) {
   rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto table = MakeTable(4096, /*tbl8=*/4);
 
@@ -454,7 +494,7 @@ NextHop Hop(uint32_t egress, uint8_t mac_tail,
 }
 
 std::unique_ptr<Router> MakeRouter(size_t next_hops = 64) {
-  LpmRouteTable::Config config;
+  LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   config.max_routes = 4096;
   config.tbl8_groups = 256;
   auto router = Router::Create("router_test", config, next_hops,
@@ -463,7 +503,7 @@ std::unique_ptr<Router> MakeRouter(size_t next_hops = 64) {
   return std::move(router).value();
 }
 
-TEST(RouterTest, RoutesNeedNextHopsAndPinThem) {
+TEST_P(RouterTest, RoutesNeedNextHopsAndPinThem) {
   auto router = MakeRouter();
   EXPECT_EQ(RouteError::kUnknownNextHop,
             router->SetRoute(P(Ip(10, 0, 0, 0), 8), NextHopId(1)).error());
@@ -498,7 +538,7 @@ TEST(RouterTest, RoutesNeedNextHopsAndPinThem) {
             router->RemoveRoute(P(Ip(10, 0, 0, 0), 8)).error());
 }
 
-TEST(RouterTest, NeighborUpdateNeedsNoRouteChange) {
+TEST_P(RouterTest, NeighborUpdateNeedsNoRouteChange) {
   auto router = MakeRouter();
   ASSERT_TRUE(router->SetNextHop(NextHopId(5),
                                  Hop(2, 0, NeighborState::kIncomplete)));
@@ -513,7 +553,7 @@ TEST(RouterTest, NeighborUpdateNeedsNoRouteChange) {
   EXPECT_EQ(1u, router->route_count());
 }
 
-TEST(RouterTest, ResolveBatch) {
+TEST_P(RouterTest, ResolveBatch) {
   auto router = MakeRouter();
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
   ASSERT_TRUE(router->SetNextHop(NextHopId(2), Hop(2, 2)));
@@ -537,7 +577,7 @@ TEST(RouterTest, ResolveBatch) {
 // named. A reader that found a route whose next hop had already been removed
 // would come back with the bit cleared; RemoveNextHop's grace period is what
 // prevents that.
-TEST(RouterTest, ConcurrentChurnNeverLosesANextHop) {
+TEST_P(RouterTest, ConcurrentChurnNeverLosesANextHop) {
   rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto router = MakeRouter(/*next_hops=*/64);
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
@@ -608,7 +648,7 @@ TEST(RouterTest, ConcurrentChurnNeverLosesANextHop) {
 // quiescent state the id is retiring: routes cannot name it and it cannot be
 // reused, so a reader still holding it from a removed route can never reach a
 // different next hop. Afterwards the next control call drops it.
-TEST(RouterTest, NextHopRemovalIsDeferredNotBlocking) {
+TEST_P(RouterTest, NextHopRemovalIsDeferredNotBlocking) {
   rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto router = MakeRouter(/*next_hops=*/8);
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
@@ -646,7 +686,7 @@ TEST(RouterTest, NextHopRemovalIsDeferredNotBlocking) {
 }
 
 std::unique_ptr<Router> MakeGroupRouter(size_t next_hops = 16, size_t groups = 4) {
-  LpmRouteTable::Config config;
+  LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   config.max_routes = 1024;
   config.tbl8_groups = 64;
   auto router = Router::Create("router_groups", config, next_hops,
@@ -657,7 +697,7 @@ std::unique_ptr<Router> MakeGroupRouter(size_t next_hops = 16, size_t groups = 4
 
 // A group route spreads flows over its members by hash, keeps a flow on one
 // member, and pins the members (D-065).
-TEST(RouterGroupTest, FlowsSpreadOverMembersAndStay) {
+TEST_P(RouterGroupTest, FlowsSpreadOverMembersAndStay) {
   auto router = MakeGroupRouter();
   for (uint32_t i = 1; i <= 4; i++) {
     ASSERT_TRUE(router->SetNextHop(NextHopId(i), Hop(i, static_cast<uint8_t>(i))));
@@ -699,7 +739,7 @@ TEST(RouterGroupTest, FlowsSpreadOverMembersAndStay) {
 }
 
 // Membership and neighbor changes are object updates: no route changes.
-TEST(RouterGroupTest, MembershipAndNeighborChangesNeedNoRouteChange) {
+TEST_P(RouterGroupTest, MembershipAndNeighborChangesNeedNoRouteChange) {
   auto router = MakeGroupRouter();
   for (uint32_t i = 1; i <= 3; i++) {
     ASSERT_TRUE(router->SetNextHop(NextHopId(i), Hop(i, static_cast<uint8_t>(i))));
@@ -740,7 +780,7 @@ TEST(RouterGroupTest, MembershipAndNeighborChangesNeedNoRouteChange) {
   ASSERT_TRUE(router->RemoveNextHopGroup(NextHopGroupId(2)));
 }
 
-TEST(RouterGroupTest, BatchWithHashesMatchesScalar) {
+TEST_P(RouterGroupTest, BatchWithHashesMatchesScalar) {
   auto router = MakeGroupRouter();
   for (uint32_t i = 1; i <= 8; i++) {
     ASSERT_TRUE(router->SetNextHop(NextHopId(i), Hop(i, static_cast<uint8_t>(i))));
@@ -771,7 +811,7 @@ TEST(RouterGroupTest, BatchWithHashesMatchesScalar) {
   }
 }
 
-TEST(RouterGroupTest, InvalidGroupsAreRefused) {
+TEST_P(RouterGroupTest, InvalidGroupsAreRefused) {
   auto router = MakeGroupRouter(/*next_hops=*/8, /*groups=*/2);
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
   const NextHopId one[] = {NextHopId(1)};
@@ -797,7 +837,7 @@ TEST(RouterGroupTest, InvalidGroupsAreRefused) {
   // A router without groups refuses them; route values must fit 24 bits.
   auto plain = MakeRouter(8);
   EXPECT_EQ(RouteError::kInvalidId, plain->SetNextHopGroup(NextHopGroupId(1), one).error());
-  LpmRouteTable::Config config;
+  const LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   EXPECT_EQ(RouteError::kValueOutOfRange,
             Router::Create("too_wide", config, LpmRouteTable::kMaxValue - 1,
                            bess::runtime::runtime().rcu(), 1, 2)
@@ -810,7 +850,7 @@ TEST(RouterGroupTest, InvalidGroupsAreRefused) {
 
 // Removing a group does not wait for readers; the id retires (cannot be
 // reused or named by a route) and its members stay pinned until readers pass.
-TEST(RouterGroupTest, GroupRemovalIsDeferredAndPinsMembers) {
+TEST_P(RouterGroupTest, GroupRemovalIsDeferredAndPinsMembers) {
   rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto router = MakeGroupRouter();
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
@@ -843,7 +883,7 @@ TEST(RouterGroupTest, GroupRemovalIsDeferredAndPinsMembers) {
   domain.Unregister(kReader);
 }
 
-TEST(RouterTest, RewriteL2) {
+TEST(NextHopRewriteTest, RewriteL2) {
   PlainPacketPool pool(8, -1, 128);
   PacketHandle pkt = pool.Alloc(64);
   ASSERT_NE(nullptr, pkt);
@@ -861,16 +901,12 @@ TEST(RouterTest, RewriteL2) {
   PacketFree(pkt);
 }
 
-// -- rte_fib re-trial (D-003, D-130) ---------------------------------------------
+// -- rte_fib directly, and the randomised oracle (D-130, D-132) -----------------
 //
-// rte_fib through the same independent reference, so the re-trial D-003 asks
-// for on every DPDK change is part of this suite. rte_lpm (RouteTable) runs
-// every sequence too, as the control: a disagreement only rte_fib shows is
-// rte_fib's.
-
-// rte_fib as IPLookup would adopt it: DIR24_8 with rte_lpm's 4-byte next hops,
-// lookups on packet-order keys (RTE_FIB_F_LOOKUP_NETWORK_ORDER, the variant
-// fib_bench measures). Rules go in host order, as for rte_lpm.
+// The table tests above run the rte_fib backend as BESS uses it, with /0 kept
+// beside the structure. RteFib is rte_fib itself, /0 included and lookups on
+// packet-order keys (RTE_FIB_F_LOOKUP_NETWORK_ORDER), so the randomised oracle
+// below also covers the parts of rte_fib the backend does not use.
 class RteFib {
  public:
   static constexpr uint64_t kMiss = 0;  // every route value here is >= 1
@@ -920,16 +956,15 @@ class RteFib {
   rte_fib *fib_ = nullptr;
 };
 
-// D-130's reproducer for the defect in rte_fib's DIR24_8 update loop
-// (lib/fib/dir24_8.c, modify_fib(); DPDK 25.11.3, and upstream main as of
-// 2026-10). Changing a prefix walks the routes it covers, moving a left edge
-// past each. When the covered routes run contiguously up to 255.255.255.255,
-// stepping past the last one wraps the edge to 0; the "edge already there"
-// branch does not check for the wrap (the other branch does), and the final
-// install_to_fib(0, 0) means "the whole address space": every tbl24 entry
-// is overwritten. An add writes the added route's next hop everywhere, a
-// delete the covering route's (here: the default). Entry 34's "next hop
-// matching no rule" at 512K routes, and its 64K churn failure, were this.
+// D-130's reproducers for the defect in rte_fib's DIR24_8 update loop
+// (lib/fib/dir24_8.c, modify_fib(); DPDK 25.11.3 and upstream main as of
+// 2026-10, fixed by deps/dpdk-patches/0001). Changing a prefix walks the
+// routes it covers, moving a left edge past each. When the covered routes run
+// contiguously up to 255.255.255.255, stepping past the last one wraps the
+// edge to 0; unpatched, the "edge already there" branch does not check for
+// the wrap, and the final install_to_fib(0, 0) overwrites every tbl24 entry.
+// Entry 34's "next hop matching no rule" at 512K routes, and its 64K churn
+// failure, were this.
 struct WrapCase {
   uint64_t covered;    // 255.255.255.254: its own /32, value 1
   uint64_t unrelated;  // 10.1.2.3: 10.0.0.0/8, value 7
@@ -960,19 +995,13 @@ WrapCase RunWrapCase(bool delete_form) {
   return {fib.Lookup(Ip(255, 255, 255, 254)), fib.Lookup(Ip(10, 1, 2, 3))};
 }
 
-bool FibHasWrapDefect() {
-  const WrapCase add = RunWrapCase(false);
-  const WrapCase del = RunWrapCase(true);
-  return !(add.covered == 1 && add.unrelated == 7 && del.covered == 1 &&
-           del.unrelated == 7);
-}
-
 // A realistic trigger: 224.0.0.0/4 and 240.0.0.0/4 (multicast and reserved
 // space, which a router may route or blackhole) are adjacent and end at
 // 255.255.255.255, so changing the default route walks onto the wrap. (So do
 // the 0.0.0.0/1 + 128.0.0.0/1 pair VPN clients install over a default.) An
 // add, a re-point or a delete of 0.0.0.0/0 then rewrites the whole table;
-// returns what 10.1.2.3 (10.0.0.0/8, value 7) resolves to afterwards.
+// returns what 10.1.2.3 (10.0.0.0/8, value 7) resolves to afterwards: 7 with
+// the patch.
 uint64_t RunDefaultOverClassDE(int form) {
   RteFib fib(64, 16);
   EXPECT_TRUE(fib.ok());
@@ -995,23 +1024,49 @@ uint64_t RunDefaultOverClassDE(int form) {
   return fib.Lookup(Ip(10, 1, 2, 3));
 }
 
-// Expected failure, pinned: the DPDK this tree builds still has the defect.
-// When an upgrade fixes it, this fails on purpose -- that is the trigger to
-// rerun the re-trial (docs/decisions.md, D-130 "Revisit when").
-TEST(RteFibTest, D130WrapDefectStillPresent) {
-  if (!FibHasWrapDefect()) {
-    FAIL() << "rte_fib answers D-130's reproducer correctly now: rerun the "
-              "rte_fib re-trial (D-130), then retire this test";
-  }
+// The DPDK this tree builds must carry deps/dpdk-patches/0001 (D-130): the
+// rte_fib backend gives wrong answers without it.
+TEST(RteFibTest, D130PatchIsInEffect) {
+  constexpr const char *kMissing =
+      " -- rte_fib lacks the D-130 fix: build against a DPDK with "
+      "deps/dpdk-patches applied";
   const WrapCase add = RunWrapCase(false);
-  EXPECT_EQ(3u, add.covered) << "the whole table takes the added /31's value";
-  EXPECT_EQ(3u, add.unrelated);
+  EXPECT_EQ(1u, add.covered) << "add /31 over two /32s" << kMissing;
+  EXPECT_EQ(7u, add.unrelated) << "add /31 over two /32s" << kMissing;
   const WrapCase del = RunWrapCase(true);
-  EXPECT_EQ(RteFib::kMiss, del.covered) << "the whole table falls to default";
-  EXPECT_EQ(RteFib::kMiss, del.unrelated);
-  EXPECT_EQ(6u, RunDefaultOverClassDE(0)) << "add 0/0: all of it is 0/0's";
-  EXPECT_EQ(5u, RunDefaultOverClassDE(1)) << "re-point 0/0: likewise";
-  EXPECT_EQ(RteFib::kMiss, RunDefaultOverClassDE(2)) << "delete 0/0: all miss";
+  EXPECT_EQ(1u, del.covered) << "delete /31 over two /32s" << kMissing;
+  EXPECT_EQ(7u, del.unrelated) << "delete /31 over two /32s" << kMissing;
+  EXPECT_EQ(7u, RunDefaultOverClassDE(0)) << "add 0/0" << kMissing;
+  EXPECT_EQ(7u, RunDefaultOverClassDE(1)) << "re-point 0/0" << kMissing;
+  EXPECT_EQ(7u, RunDefaultOverClassDE(2)) << "delete 0/0" << kMissing;
+}
+
+// deps/dpdk-patches/0003 (D-132): a re-point (existing prefix, new next hop)
+// returned 0 even when the table update failed, leaving the old next hop in
+// place. Here the update needs a group because the /25 under the /23 has the
+// /23's next hop (so its /24 kept no group); install_to_fib() then wants two
+// free groups for that range and only one is left. (Two are more than the
+// range needs, so this -ENOSPC is itself early -- the backend gives rte_fib
+// one spare group for it -- but the patch is about reporting it.)
+TEST(RteFibTest, D132FailedRepointIsReported) {
+  constexpr uint32_t kGroups = 64;
+  RteFib fib(256, kGroups);
+  ASSERT_TRUE(fib.ok());
+  ASSERT_EQ(0, fib.Add(P(Ip(10, 0, 0, 0), 23), 1));
+  ASSERT_EQ(0, fib.Add(P(Ip(10, 0, 0, 0), 25), 1));
+  // kGroups - 1 /25s elsewhere take all groups but one.
+  for (uint32_t i = 0; i + 1 < kGroups; i++) {
+    ASSERT_EQ(0, fib.Add(P(Ip(20, 0, i, 0), 25), 2)) << i;
+  }
+  EXPECT_EQ(-ENOSPC, fib.Add(P(Ip(10, 0, 0, 0), 23), 3))
+      << "re-point that cannot be installed reported success -- rte_fib "
+         "lacks deps/dpdk-patches/0003 (D-132)";
+  EXPECT_EQ(1u, fib.Lookup(Ip(10, 0, 0, 1)));
+  EXPECT_EQ(1u, fib.Lookup(Ip(10, 0, 1, 1)));
+  // The rib kept the old next hop too: re-pointing to it is a no-op (it
+  // would otherwise need the same group and fail again).
+  EXPECT_EQ(0, fib.Add(P(Ip(10, 0, 0, 0), 23), 1));
+  EXPECT_EQ(1u, fib.Lookup(Ip(10, 0, 1, 1)));
 }
 
 uint32_t HostMask(uint8_t len) { return len == 32 ? 0 : ~uint32_t{0} >> len; }
@@ -1023,23 +1078,17 @@ void AddEdges(Ipv4Prefix p, std::vector<uint32_t> *keys) {
   keys->insert(keys->end(), {lo, hi, lo - 1, hi + 1});
 }
 
-bool EndsAtTop(Ipv4Prefix p) {
-  return (p.addr() | HostMask(p.length())) == ~uint32_t{0};
-}
-
 // Randomised add / re-point / delete sequences: prefix lengths 0-32 (the
 // default route included), dense overlap, deletes that must restore the
-// covering route, deletes of absent routes. rte_fib, rte_lpm and the
+// covering route, deletes of absent routes, prefixes ending at
+// 255.255.255.255. The running backend's RouteTable, rte_fib itself and the
 // reference take every operation in lock step and are compared after each
-// one. With `avoid_defect`, an operation that could trip D-130 is skipped:
-// an add, re-point or delete of a prefix ending at 255.255.255.255 (the
-// default route included) while a longer prefix ending there is live. Such
-// prefixes are still generated and changed in every other situation.
-void RunFibOracle(uint64_t seed, size_t steps, bool avoid_defect) {
+// one.
+void RunOracle(uint64_t seed, size_t steps) {
   constexpr size_t kMaxLive = 256;
   RteFib fib(2 * kMaxLive, 1024);
   ASSERT_TRUE(fib.ok());
-  auto lpm = MakeTable(2 * kMaxLive, 1024);
+  auto table = MakeTable(2 * kMaxLive, 1024);
   ReferenceLpm ref;
   std::vector<Ipv4Prefix> live;
   std::set<Ipv4Prefix> live_set;
@@ -1069,36 +1118,29 @@ void RunFibOracle(uint64_t seed, size_t steps, bool avoid_defect) {
     return P(addr & ~HostMask(len), len);
   };
 
-  auto trips_defect = [&](Ipv4Prefix p) {
-    return avoid_defect && EndsAtTop(p) &&
-           std::ranges::any_of(live, [&](Ipv4Prefix q) {
-             return q.length() > p.length() && EndsAtTop(q);
-           });
-  };
-
   // Compares all three on `keys`; stops at the first disagreement (the
   // tables have diverged, so later ones say nothing new).
   auto agree = [&](const std::vector<uint32_t> &keys, size_t step) {
-    const auto view = lpm->Read();
+    const auto view = table->Read();
     for (size_t base = 0; base < keys.size(); base += 32) {
       const size_t n = std::min<size_t>(32, keys.size() - base);
       const std::span<const uint32_t> batch(&keys[base], n);
       std::array<uint64_t, 32> fib_values;
-      std::array<uint32_t, 32> lpm_values;
+      std::array<uint32_t, 32> table_values;
       fib.LookupBatch(batch, std::span(fib_values.data(), n));
       const uint64_t hits =
-          view.LookupBatch(batch, std::span(lpm_values.data(), n));
+          view.LookupBatch(batch, std::span(table_values.data(), n));
       for (size_t i = 0; i < n; i++) {
         const auto expected = ref.Lookup(batch[i]);
-        const uint64_t lpm_value =
-            (hits >> i) & 1 ? lpm_values[i] : RteFib::kMiss;
+        const uint64_t table_value =
+            (hits >> i) & 1 ? table_values[i] : RteFib::kMiss;
         if (fib_values[i] != expected.value_or(RteFib::kMiss) ||
-            lpm_value != expected.value_or(RteFib::kMiss)) {
+            table_value != expected.value_or(RteFib::kMiss)) {
           ADD_FAILURE() << std::hex << "seed 0x" << seed << " step " << std::dec
                         << step << " key 0x" << std::hex << batch[i]
                         << std::dec << ": expected "
                         << expected.value_or(RteFib::kMiss) << ", rte_fib "
-                        << fib_values[i] << ", rte_lpm " << lpm_value
+                        << fib_values[i] << ", table " << table_value
                         << " (0 = miss)";
           return false;
         }
@@ -1116,14 +1158,11 @@ void RunFibOracle(uint64_t seed, size_t steps, bool avoid_defect) {
       // to the route covering it.
       const size_t i = rng() % live.size();
       const Ipv4Prefix p = live[i];
-      if (trips_defect(p)) {
-        continue;
-      }
       live[i] = live.back();
       live.pop_back();
       live_set.erase(p);
       ASSERT_EQ(0, fib.Erase(p)) << "step " << step;
-      ASSERT_TRUE(lpm->Erase(p)) << "step " << step;
+      ASSERT_TRUE(table->Erase(p)) << "step " << step;
       ref.Erase(p);
       AddEdges(p, &keys);
     } else if (pick < 45) {
@@ -1133,17 +1172,14 @@ void RunFibOracle(uint64_t seed, size_t steps, bool avoid_defect) {
         continue;
       }
       ASSERT_EQ(-ENOENT, fib.Erase(p)) << "step " << step;
-      ASSERT_EQ(RouteError::kNotFound, lpm->Erase(p).error()) << "step " << step;
+      ASSERT_EQ(RouteError::kNotFound, table->Erase(p).error()) << "step " << step;
       AddEdges(p, &keys);
     } else {
       // Add, or re-point a route already there; 1 in 11 is the default route.
       const Ipv4Prefix p = pick < 50 ? P(0, 0) : random_prefix();
-      if (trips_defect(p)) {
-        continue;
-      }
       const uint32_t v = 1 + static_cast<uint32_t>(rng() % 60000);
       ASSERT_EQ(0, fib.Add(p, v)) << "step " << step;
-      ASSERT_TRUE(lpm->Upsert(p, Value(v))) << "step " << step;
+      ASSERT_TRUE(table->Upsert(p, Value(v))) << "step " << step;
       ref.Set(p, v);
       if (live_set.insert(p).second) {
         live.push_back(p);
@@ -1165,17 +1201,16 @@ void RunFibOracle(uint64_t seed, size_t steps, bool avoid_defect) {
   }
 }
 
-TEST(RteFibTest, RandomisedChurnMatchesReference) {
-  // While D-130's defect is present, the operations that could trip it are
-  // skipped (the test above pins the defect itself); a DPDK that fixes it
-  // gets every operation here with no edit.
-  const bool avoid_defect = FibHasWrapDefect();
-  RecordProperty("d130_operations",
-                 avoid_defect ? "skipped: D-130 defect present" : "included");
+TEST_P(RouteOracleTest, RandomisedChurnMatchesReference) {
   for (uint64_t seed : {0x130a, 0x130b, 0x130c, 0x130d}) {
-    RunFibOracle(seed, 2000, avoid_defect);
+    RunOracle(seed, 2000);
   }
 }
+
+BESS_INSTANTIATE_ROUTE_BACKENDS(RouteTableTest);
+BESS_INSTANTIATE_ROUTE_BACKENDS(RouterTest);
+BESS_INSTANTIATE_ROUTE_BACKENDS(RouterGroupTest);
+BESS_INSTANTIATE_ROUTE_BACKENDS(RouteOracleTest);
 
 }  // namespace
 }  // namespace bess::route

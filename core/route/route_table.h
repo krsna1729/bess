@@ -15,7 +15,9 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 
+#include <rte_fib.h>
 #include <rte_lpm.h>
 #include <rte_memory.h>
 
@@ -29,10 +31,11 @@ namespace bess::route {
 enum class RouteError : uint8_t {
   kInvalidPrefixLength,  // > 32
   kHostBitsSet,          // address has bits beyond the prefix length
-  kValueOutOfRange,      // route values are 24-bit (rte_lpm next-hop width)
+  kValueOutOfRange,      // route values are 24-bit (rte_lpm next-hop width;
+                         // kept for rte_fib too, D-132)
   kTableFull,            // out of rules or tbl8 groups
   kNotFound,
-  kBackendFailure,       // rte_lpm refused for another reason
+  kBackendFailure,       // rte_lpm or rte_fib refused for another reason
   kInvalidId,            // zero or beyond the configured capacity
   kUnknownNextHop,       // a route names a next hop that does not exist
   kNextHopInUse,         // removing a next hop routes still reference
@@ -44,6 +47,7 @@ enum class RouteError : uint8_t {
                          // removed, or beyond the router's max_domains)
   kDomainExists,         // creating a route domain that already exists
   kDomainInUse,          // removing the default domain, or one with routes
+  kUnsupportedBackend,   // the backend is not safe on this CPU (D-132)
 };
 
 const char *RouteErrorName(RouteError error);
@@ -65,6 +69,8 @@ inline int RouteErrno(RouteError error) {
     case RouteError::kEnrolled:
     case RouteError::kDomainInUse:
       return EBUSY;
+    case RouteError::kUnsupportedBackend:
+      return ENOTSUP;
     default:
       return EINVAL;
   }
@@ -88,18 +94,37 @@ class Ipv4Prefix {
   uint8_t length_;
 };
 
-// IPv4 longest-prefix match on DPDK `rte_lpm` (K7), mapping a prefix to a
-// 24-bit value. Untyped; RouteTable<Value> is the typed face. Decision D-003
-// (docs/decisions.md).
+// Which DPDK longest-prefix-match structure holds a table's rules (D-132).
+enum class RouteBackend : uint8_t {
+  kRteLpm,  // rte_lpm (the default; D-003)
+  kRteFib,  // rte_fib DIR24_8 with 4-byte next hops (deps/dpdk-patches)
+};
+
+// rte_fib writes its entries with plain stores (lib/fib/dir24_8.c
+// write_to_fib), so a lock-free reader sees a new tbl8 group's entries before
+// the tbl24 entry that points to it only under x86's store order; rte_lpm
+// uses release stores. Elsewhere the rte_fib backend is refused. (D-132)
+inline constexpr bool RouteBackendSupported(RouteBackend backend) {
+#if defined(__x86_64__)
+  return true;
+#else
+  return backend != RouteBackend::kRteFib;
+#endif
+}
+
+// IPv4 longest-prefix match on DPDK `rte_lpm` or `rte_fib` (K7, D-132),
+// mapping a prefix to a 24-bit value. Untyped; RouteTable<Value> is the typed
+// face. Decisions D-003 and D-132 (docs/decisions.md).
 //
 // DPDK owns the algorithm and the concurrency design: lookups are lock-free
 // and run while a single writer adds or deletes rules in place -- every entry
-// is written with an atomic store, a new tbl8 group is fully populated before
-// the tbl24 entry that points to it is published, and freed tbl8 groups are
+// is written with one aligned store, a new tbl8 group is filled before the
+// tbl24 entry that points to it is written, and freed tbl8 groups are
 // recycled only after a QSBR grace period. BESS attaches the runtime's own
-// RcuDomain QSBR (defer-queue mode), so that grace period is the same worker
-// quiescence K1 uses, and reclamation happens inside later writer calls with
-// no blocking wait.
+// RcuDomain QSBR (defer-queue mode) to either structure, so that grace period
+// is the same worker quiescence K1 uses, and reclamation happens inside later
+// writer calls with no blocking wait. (rte_lpm orders its stores with atomic
+// release stores; rte_fib uses plain stores, which x86 keeps in order. D-132.)
 //
 // Why in place and not rebuild-and-swap like the K2/K3 generations: rte_lpm's
 // build cost is quadratic in the rule count (entry 34: 5.8 us/route at 64K,
@@ -112,8 +137,12 @@ class Ipv4Prefix {
 // it through RcuPtr, since that is both faster than deleting rule by rule and
 // atomic.
 //
-// The /0 route is kept beside rte_lpm (whose depth starts at 1) as an atomic
-// default value.
+// The /0 route is kept beside the DPDK structure (rte_lpm's depth starts at
+// 1; rte_fib keeps the same model) as an atomic default value.
+//
+// The backend is chosen per table (Config::backend) and fixed for its life.
+// Readers branch on it once per Read()-batch call, never per packet in a
+// batch.
 //
 // Writers are serialized internally. Readers call Read() once per batch and
 // must be RcuDomain readers (workers are).
@@ -125,6 +154,7 @@ class LpmRouteTable {
     uint32_t max_routes = 1024;
     uint32_t tbl8_groups = 256;  // one per /24 that has longer prefixes
     int socket = bess::utils::MemoryNode();  // DPDK socket id (D-123)
+    RouteBackend backend = RouteBackend::kRteLpm;
   };
 
   static std::expected<std::unique_ptr<LpmRouteTable>, RouteError> Create(
@@ -198,10 +228,16 @@ class LpmRouteTable {
   static constexpr uint32_t kNoDefault = UINT32_MAX;
 
  private:
-  // One rte_lpm and the default route that goes with it.
+  // rte_fib's answer for an address no rule covers: above every value, so it
+  // fits rte_fib's 4-byte next hops (at most 2^31 - 1) and is never a route.
+  static constexpr uint32_t kFibMiss = kMaxValue + 1;
+
+  // One DPDK structure (exactly one of `lpm` and `fib`) and the default route
+  // that goes with it.
   struct Instance {
     ~Instance();
     struct rte_lpm *lpm = nullptr;
+    struct rte_fib *fib = nullptr;
     std::atomic<uint32_t> default_value{kNoDefault};
   };
 
@@ -211,6 +247,19 @@ class LpmRouteTable {
 
   std::expected<std::unique_ptr<Instance>, RouteError> NewInstance(
       uint32_t default_value);
+  // The backend's add and delete, with its return codes (0 or -errno).
+  static int AddRule(Instance &instance, Ipv4Prefix prefix, uint32_t value);
+  static int DeleteRule(Instance &instance, Ipv4Prefix prefix);
+  // Rules longer than /24, per /24 block.
+  using FibBlocks = std::unordered_map<uint32_t, uint32_t>;
+  // rte_fib does not hold rte_lpm's limits exactly: it rounds its tbl8 pool
+  // up to a multiple of 64 groups, and its rib takes up to 2 x max_routes
+  // nodes. With that backend Config's limits are enforced here instead, the
+  // way rte_lpm counts them: `routes` rules at most, and one tbl8 group per
+  // /24 block holding a rule longer than /24. False when adding `prefix` to
+  // `routes` rules and `blocks` would exceed them. (D-132)
+  bool FibAdmits(const FibBlocks &blocks, size_t routes,
+                 Ipv4Prefix prefix) const;
 
   const std::string name_;
   const Config config_;
@@ -220,6 +269,8 @@ class LpmRouteTable {
   mutable std::mutex writer_mutex_;
   std::map<Ipv4Prefix, uint32_t> rules_;  // /0 is not in here
   std::optional<uint32_t> default_;
+  // rte_fib only: the blocks FibAdmits counts.
+  FibBlocks fib_blocks_;
 };
 
 class LpmRouteTable::View {
@@ -230,6 +281,14 @@ class LpmRouteTable::View {
   // kNoDefault (above every value) for a miss: Lookup() without the optional,
   // for per-packet callers.
   uint32_t LookupOrMiss(uint32_t addr) const noexcept {
+    if (instance_->fib != nullptr) {
+      uint64_t nh;
+      rte_fib_lookup_bulk(instance_->fib, &addr, &nh, 1);
+      if (nh != kFibMiss) {
+        return static_cast<uint32_t>(nh);
+      }
+      return instance_->default_value.load(std::memory_order_relaxed);
+    }
     uint32_t value;
     if (rte_lpm_lookup(instance_->lpm, addr, &value) == 0) {
       return value;
@@ -245,12 +304,15 @@ class LpmRouteTable::View {
 
   // Looks up every address (host order), writing `values[i]`. Returns a mask
   // with bit i set where a route (or the default) matched; `values` at other
-  // positions is unspecified (it holds rte_lpm's raw miss entry).
-  // Equal sizes, at most kMaxBatch (preconditions).
+  // positions is unspecified. Equal sizes, at most kMaxBatch (preconditions).
   uint64_t LookupBatch(std::span<const uint32_t> addrs,
                        std::span<uint32_t> values) const noexcept;
 
  private:
+  uint64_t LookupBatchFib(std::span<const uint32_t> addrs,
+                          std::span<uint32_t> values,
+                          uint32_t def) const noexcept;
+
   friend class LpmRouteTable;
   explicit View(const Instance *instance) : instance_(instance) {}
 
@@ -261,17 +323,40 @@ inline uint64_t LpmRouteTable::View::LookupBatch(
     std::span<const uint32_t> addrs, std::span<uint32_t> values) const noexcept {
   promise(addrs.size() == values.size() && addrs.size() <= kMaxBatch);
   const uint32_t def = instance_->default_value.load(std::memory_order_relaxed);
-  const struct rte_lpm *lpm = instance_->lpm;
   uint64_t hits = 0;
-  for (size_t i = 0; i < addrs.size(); i++) {
-    uint32_t v;
-    const uint32_t hit = rte_lpm_lookup(lpm, addrs[i], &v) == 0;
-    hits |= uint64_t{hit} << i;
-    values[i] = hit ? v : def;
+  if (instance_->fib != nullptr) {
+    hits = LookupBatchFib(addrs, values, def);
+  } else {
+    const struct rte_lpm *lpm = instance_->lpm;
+    for (size_t i = 0; i < addrs.size(); i++) {
+      uint32_t v;
+      const uint32_t hit = rte_lpm_lookup(lpm, addrs[i], &v) == 0;
+      hits |= uint64_t{hit} << i;
+      values[i] = hit ? v : def;
+    }
   }
   if (def != kNoDefault) {
     hits = addrs.size() == 64 ? ~uint64_t{0}
                               : (uint64_t{1} << addrs.size()) - 1;
+  }
+  return hits;
+}
+
+// One rte_fib_lookup_bulk() for the batch: rte_fib's lookup is reached through
+// a function pointer (scalar, or AVX-512 where the CPU has it), so one call
+// per batch, not per address.
+inline uint64_t LpmRouteTable::View::LookupBatchFib(
+    std::span<const uint32_t> addrs, std::span<uint32_t> values,
+    uint32_t def) const noexcept {
+  uint64_t nh[kMaxBatch];
+  // rte_fib_lookup_bulk() only reads the addresses; its parameter is not const.
+  rte_fib_lookup_bulk(instance_->fib, const_cast<uint32_t *>(addrs.data()), nh,
+                      static_cast<int>(addrs.size()));
+  uint64_t hits = 0;
+  for (size_t i = 0; i < addrs.size(); i++) {
+    const bool hit = nh[i] != kFibMiss;
+    hits |= uint64_t{hit} << i;
+    values[i] = hit ? static_cast<uint32_t>(nh[i]) : def;
   }
   return hits;
 }

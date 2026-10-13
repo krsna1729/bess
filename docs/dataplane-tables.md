@@ -537,7 +537,8 @@ The reasoning, rejected alternatives, evidence and revisit triggers are in
 - [D-002](decisions.md#d-002-rte_hash-flags-lf-qsbr-defer-queue-not-multi-writer-not-ext-table)
   which `rte_hash` modes, and why;
 - [D-003](decisions.md#d-003-ipv4-lpm-rte_lpm-updated-in-place-rte_fib-rejected)
-  `rte_lpm` in place, and `rte_fib` rejected;
+  `rte_lpm` in place, and `rte_fib` rejected (amended by D-132: `rte_fib` is a
+  selectable backend, `rte_lpm` the default);
 - [D-004](decisions.md#d-004-update-modes-concurrent-c-and-per-worker-w-generation-swap-g-only-for-bulk-loads)
   update modes;
 - [D-005](decisions.md#d-005-control-ingress-keep-grpc-with-a-streaming-packed-record-api)
@@ -642,6 +643,6 @@ Run a benchmark pinned to one isolated core. The tables above name each one.
 | update-mode thresholds, writer rate | `update_scale_bench` |
 | control-ingress transport | `ingress_bench` |
 | plain vs staged body rule | `modules_table_scale_bench`, `classifier_cuckoo_scale_bench` |
-| `rte_fib` rejection (correctness gate, D-130) | `route_route_test` (`RteFibTest.*`, every build); `fib_bench` for cost |
+| `rte_fib` backend (correctness, D-130/D-132) | `route_route_test` (`RteFibTest.*`, every build) and the `/Fib` instances of the route tests; `route_bench`, `fib_bench` and `live_perf M.iplookup/fib` for cost |
 | LPM lookup and update cost | `route_bench` |
 | meters, counters, RCU | `meter_bench`, `stats_bench`, `rcu_bench` |

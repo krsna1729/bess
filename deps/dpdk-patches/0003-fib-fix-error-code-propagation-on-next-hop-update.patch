@@ -1,0 +1,42 @@
+From 745db3022f5384df63f0c2d494f76ef6dfd2936a Mon Sep 17 00:00:00 2001
+From: Saikrishna Edupuganti <6157640+krsna1729@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 19:41:51 +0530
+Subject: [PATCH 3/3] fib: fix error code propagation on next hop update
+
+When updating the next hop of an existing prefix, dir24_8_modify()
+ignored the return value of modify_fib() and always returned 0. The
+update can fail with -ENOSPC: a range it installs may need a new tbl8
+group, for example in a /24 whose group was merged back into tbl24
+because a more specific route there had the same next hop, and
+install_to_fib() wants two free groups for such a range. With
+10.0.0.0/23 -> 1, 10.0.0.0/25 -> 1 and only one free group, re-pointing
+the /23 to 3 changed nothing, the RIB kept next hop 1, and the caller
+was told it succeeded. Return the actual result, as commit 3aca5f52b5
+did for trie_modify().
+
+Fixes: 7dc7868b200d ("fib: add DIR24-8 dataplane algorithm")
+Cc: stable@dpdk.org
+
+Upstream-Status: Pending
+BESS-Decision: D-132
+---
+ lib/fib/dir24_8.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/lib/fib/dir24_8.c b/lib/fib/dir24_8.c
+index 4c356b0..2aa2b05 100644
+--- a/lib/fib/dir24_8.c
++++ b/lib/fib/dir24_8.c
+@@ -503,7 +503,8 @@ dir24_8_modify(struct rte_fib *fib, uint32_t ip, uint8_t depth,
+ 			ret = modify_fib(dp, rib, ip, depth, next_hop);
+ 			if (ret == 0)
+ 				rte_rib_set_nh(node, next_hop);
+-			return 0;
++
++			return ret;
+ 		}
+ 		if (depth > 24) {
+ 			tmp = rte_rib_get_nxt(rib, ip, 24, NULL,
+-- 
+2.55.0
+

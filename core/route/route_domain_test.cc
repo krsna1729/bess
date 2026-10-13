@@ -20,6 +20,7 @@
 #include "route/route_domain.h"
 #include "route/router.h"
 #include "runtime/runtime_state.h"
+#include "testing/route_backends.h"
 
 namespace bess::route {
 namespace {
@@ -90,7 +91,7 @@ class ReaderGroup {
 };
 
 LpmRouteTable::Config Cfg(uint32_t routes = 256, uint32_t tbl8 = 16) {
-  LpmRouteTable::Config config;
+  LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   config.max_routes = routes;
   config.tbl8_groups = tbl8;
   return config;
@@ -116,7 +117,9 @@ int EgressOf(const Router &router, RouteDomainId domain, uint32_t dst) {
   return hop == nullptr ? -1 : static_cast<int>(hop->egress.value());
 }
 
-TEST(RouteDomainTest, DefaultDomainExistsAndNothingElseDoes) {
+class RouteDomainTest : public bess::testing::RouteBackendTest {};
+
+TEST_P(RouteDomainTest, DefaultDomainExistsAndNothingElseDoes) {
   auto router = MakeRouter(1);
   EXPECT_TRUE(router->HasDomain(kDefaultRouteDomainId));
   EXPECT_EQ(router->domain_count(), 1u);
@@ -134,7 +137,7 @@ TEST(RouteDomainTest, DefaultDomainExistsAndNothingElseDoes) {
 
 // An unknown, removed or out-of-range domain is a miss everywhere -- readers
 // and writers -- never undefined behaviour.
-TEST(RouteDomainTest, UnknownDomainFailsClosed) {
+TEST_P(RouteDomainTest, UnknownDomainFailsClosed) {
   auto router = MakeRouter(4);
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1)));
   ASSERT_TRUE(router->SetRoute(P(0, 0), NextHopId(1)));  // default domain
@@ -173,7 +176,7 @@ TEST(RouteDomainTest, UnknownDomainFailsClosed) {
             router->RemoveDomain(RouteDomainId(3)).error());
 }
 
-TEST(RouteDomainTest, OverlappingPrefixesResolveIndependently) {
+TEST_P(RouteDomainTest, OverlappingPrefixesResolveIndependently) {
   auto router = MakeRouter(3);
   const RouteDomainId d0 = kDefaultRouteDomainId, d1(1), d2(2);
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(11)));
@@ -229,7 +232,7 @@ TEST(RouteDomainTest, OverlappingPrefixesResolveIndependently) {
   EXPECT_EQ(2u, router->route_count(d2));
 }
 
-TEST(RouteDomainTest, DefaultRoutePerDomain) {
+TEST_P(RouteDomainTest, DefaultRoutePerDomain) {
   auto router = MakeRouter(3);
   const RouteDomainId d0 = kDefaultRouteDomainId, d1(1), d2(2);
   for (uint32_t i = 1; i <= 3; i++) {
@@ -256,7 +259,7 @@ TEST(RouteDomainTest, DefaultRoutePerDomain) {
 
 // A domain can leave and come back while the router lives; it comes back
 // empty, and removing it needs it empty (the reference counts stay exact).
-TEST(RouteDomainTest, DomainLifecycle) {
+TEST_P(RouteDomainTest, DomainLifecycle) {
   auto router = MakeRouter(3);
   const RouteDomainId d1(1);
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1)));
@@ -279,7 +282,7 @@ TEST(RouteDomainTest, DomainLifecycle) {
 }
 
 // A removed domain's FIB is not freed under a reader that already holds it.
-TEST(RouteDomainTest, RemovedDomainOutlivesOnlineReaders) {
+TEST_P(RouteDomainTest, RemovedDomainOutlivesOnlineReaders) {
   rcu::RcuDomain &rcu = bess::runtime::runtime().rcu();
   auto router = MakeRouter(2);
   const RouteDomainId d1(1);
@@ -300,7 +303,7 @@ TEST(RouteDomainTest, RemovedDomainOutlivesOnlineReaders) {
   rcu.Unregister(kReader);
 }
 
-TEST(RouteDomainTest, ReplaceRouteSetAtomicReplacesTheWholeSet) {
+TEST_P(RouteDomainTest, ReplaceRouteSetAtomicReplacesTheWholeSet) {
   auto router = MakeRouter(2);
   const RouteDomainId d0 = kDefaultRouteDomainId, d1(1);
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1)));
@@ -350,7 +353,7 @@ TEST(RouteDomainTest, ReplaceRouteSetAtomicReplacesTheWholeSet) {
 
 // Every way a replacement can fail leaves the old generation visible and the
 // reference counts unchanged.
-TEST(RouteDomainTest, FailedReplacementLeavesTheOldGeneration) {
+TEST_P(RouteDomainTest, FailedReplacementLeavesTheOldGeneration) {
   // Few rules and tbl8 groups, so capacity is easy to exhaust.
   auto router = MakeRouter(2, 8, Cfg(/*routes=*/8, /*tbl8=*/2));
   const RouteDomainId d1(1);
@@ -419,7 +422,7 @@ TEST(RouteDomainTest, FailedReplacementLeavesTheOldGeneration) {
 // Readers batch-resolving a domain while it alternates between two route sets
 // see one whole set per batch, never a mix: that is what one publication
 // means.
-TEST(RouteDomainTest, ReplacementIsOneVisibleStep) {
+TEST_P(RouteDomainTest, ReplacementIsOneVisibleStep) {
   rcu::RcuDomain &rcu = bess::runtime::runtime().rcu();
   auto router = MakeRouter(2, 8, Cfg(/*routes=*/256, /*tbl8=*/4));
   const RouteDomainId d1(1);
@@ -486,7 +489,7 @@ TEST(RouteDomainTest, ReplacementIsOneVisibleStep) {
 // Same early-reuse rule as a single-domain router, with routes in domains: an
 // id a removed route named is not handed out again while a reader may still
 // hold it from any domain.
-TEST(RouteDomainTest, NextHopIdIsNotReusedEarly) {
+TEST_P(RouteDomainTest, NextHopIdIsNotReusedEarly) {
   rcu::RcuDomain &rcu = bess::runtime::runtime().rcu();
   auto router = MakeRouter(3, 8);
   const RouteDomainId d1(1), d2(2);
@@ -525,7 +528,7 @@ TEST(RouteDomainTest, NextHopIdIsNotReusedEarly) {
 // either a miss (the domain does not exist yet, or is empty) or that domain's
 // own hop -- a reader that picked up another domain's FIB, or a freed one,
 // would show a different egress.
-TEST(RouteDomainTest, ConcurrentReadersWhileDomainsAreCreatedAndUpdated) {
+TEST_P(RouteDomainTest, ConcurrentReadersWhileDomainsAreCreatedAndUpdated) {
   rcu::RcuDomain &rcu = bess::runtime::runtime().rcu();
   // Each domain's rte_lpm is a 64 MB tbl24 and tests run with a 512 MB EAL
   // heap: three domains, plus the replacements and retired tables in flight.
@@ -629,6 +632,8 @@ TEST(RouteDomainTest, ConcurrentReadersWhileDomainsAreCreatedAndUpdated) {
   EXPECT_EQ(1u, router_ref.domain_count());
   EXPECT_EQ(0u, router_ref.RouteReferences(NextHopId(2)));
 }
+
+BESS_INSTANTIATE_ROUTE_BACKENDS(RouteDomainTest);
 
 }  // namespace
 }  // namespace bess::route
