@@ -23,6 +23,13 @@ namespace {
 
 constexpr size_t kPoolCapacity = 32767;
 
+// The tests name workers by number: the same number is the worker's RCU
+// reader id (ReaderId). Every worker runs on CPU 0.
+bess::dataplane::WorkerId W(int wid) {
+  return *bess::dataplane::WorkerIdFrom(wid);
+}
+constexpr bess::dataplane::CpuId kCpu0{0};
+
 void InitRuntimeOnce() {
   static bool initialized = false;
   if (initialized) {
@@ -57,17 +64,17 @@ TEST_F(RcuWorkerTest, WorkerRegistersOfflineAndFollowsPauseResume) {
 
   // Launching a worker returns only once the thread is up and paused, so the
   // registration below is already in place when this returns.
-  launch_worker(wid, 0);
+  launch_worker(W(wid), kCpu0);
   EXPECT_TRUE(rcu_->IsRegistered(wid))
       << "a worker registers its reader slot when its thread starts";
   EXPECT_FALSE(rcu_->IsOnline(wid))
       << "a worker that merely exists as a thread is not an active reader";
 
-  resume_worker(wid);
+  resume_worker(W(wid));
   EXPECT_TRUE(rcu_->IsOnline(wid))
       << "resuming brings the reader online before dataplane work";
 
-  pause_worker(wid);
+  pause_worker(W(wid));
   EXPECT_FALSE(rcu_->IsOnline(wid))
       << "pausing takes the reader offline before it blocks";
 
@@ -75,10 +82,10 @@ TEST_F(RcuWorkerTest, WorkerRegistersOfflineAndFollowsPauseResume) {
   const bess::rcu::GracePeriod token = rcu_->StartGracePeriod();
   EXPECT_TRUE(rcu_->IsComplete(token));
 
-  resume_worker(wid);
+  resume_worker(W(wid));
   EXPECT_TRUE(rcu_->IsOnline(wid));
 
-  destroy_worker(wid);
+  destroy_worker(W(wid));
   EXPECT_FALSE(rcu_->IsRegistered(wid))
       << "a destroyed worker gives its reader slot back";
 }
@@ -88,8 +95,8 @@ TEST_F(RcuWorkerTest, WorkerRegistersOfflineAndFollowsPauseResume) {
 TEST_F(RcuWorkerTest, WorkerIdCanBeRecreated) {
   const int wid = 3;
 
-  launch_worker(wid, 0);
-  resume_worker(wid);
+  launch_worker(W(wid), kCpu0);
+  resume_worker(W(wid));
   EXPECT_TRUE(rcu_->IsOnline(wid));
 
   // A running worker reports quiescence on its own every few microseconds
@@ -97,20 +104,20 @@ TEST_F(RcuWorkerTest, WorkerIdCanBeRecreated) {
   // only the outcome after destruction is checked.
   const bess::rcu::GracePeriod held = rcu_->StartGracePeriod();
 
-  destroy_worker(wid);
+  destroy_worker(W(wid));
   EXPECT_FALSE(rcu_->IsRegistered(wid));
   EXPECT_TRUE(rcu_->IsComplete(held))
       << "a destroyed worker must not block grace periods";
 
   // Recreating the same wid registers normally.
-  launch_worker(wid, 0);
+  launch_worker(W(wid), kCpu0);
   EXPECT_TRUE(rcu_->IsRegistered(wid));
   EXPECT_FALSE(rcu_->IsOnline(wid));
-  resume_worker(wid);
+  resume_worker(W(wid));
   EXPECT_TRUE(rcu_->IsOnline(wid));
 
   const bess::rcu::GracePeriod next = rcu_->StartGracePeriod();
-  pause_worker(wid);
+  pause_worker(W(wid));
   EXPECT_TRUE(rcu_->IsComplete(next))
       << "the recreated worker is offline while paused";
 }
@@ -120,8 +127,8 @@ TEST_F(RcuWorkerTest, WorkerIdCanBeRecreated) {
 TEST_F(RcuWorkerTest, PauseDuringGracePeriodReleasesIt) {
   const int wid = 1;
 
-  launch_worker(wid, 0);
-  resume_worker(wid);
+  launch_worker(W(wid), kCpu0);
+  resume_worker(W(wid));
 
   // The worker may or may not have reported quiescence since this token (a
   // running worker reports every few microseconds, D-012), so only the outcome
@@ -131,7 +138,7 @@ TEST_F(RcuWorkerTest, PauseDuringGracePeriodReleasesIt) {
   const bess::rcu::GracePeriod token = rcu_->StartGracePeriod();
 
   // Pausing transitions it offline before it blocks.
-  pause_worker(wid);
+  pause_worker(W(wid));
   EXPECT_TRUE(rcu_->IsComplete(token))
       << "pause must take the reader offline, or reclamation would depend on a "
          "thread that is not running";
@@ -143,13 +150,13 @@ TEST_F(RcuWorkerTest, PauseDuringGracePeriodReleasesIt) {
 // for the worker's first resume (external audit, 2026-09-27).
 TEST_F(RcuWorkerTest, NeverResumedWorkerDoesNotBlockGracePeriods) {
   const int wid = 0;
-  launch_worker(wid, 0);
+  launch_worker(W(wid), kCpu0);
   const bess::rcu::GracePeriod token = rcu_->StartGracePeriod();
   EXPECT_TRUE(rcu_->IsComplete(token))
       << "a launched-but-never-resumed worker holds grace periods";
 
-  resume_worker(wid);
-  pause_worker(wid);
+  resume_worker(W(wid));
+  pause_worker(W(wid));
   EXPECT_TRUE(rcu_->IsComplete(rcu_->StartGracePeriod()));
 }
 
@@ -157,7 +164,7 @@ TEST_F(RcuWorkerTest, NeverResumedWorkerDoesNotBlockGracePeriods) {
 // calls Synchronize() while holding the control-plane lock. With a paused,
 // never-resumed worker that wait must still end.
 TEST_F(RcuWorkerTest, SynchronizeReturnsWithANeverResumedWorker) {
-  launch_worker(0, 0);
+  launch_worker(W(0), kCpu0);
   std::atomic<bool> done{false};
   std::thread writer([&] {
     rcu_->Synchronize();
@@ -168,7 +175,7 @@ TEST_F(RcuWorkerTest, SynchronizeReturnsWithANeverResumedWorker) {
   }
   EXPECT_TRUE(done.load()) << "Synchronize() blocked on a paused worker";
   if (!done) {
-    resume_worker(0);  // release it so the test can finish
+    resume_worker(W(0));  // release it so the test can finish
   }
   writer.join();
 }

@@ -108,7 +108,7 @@ TrafficClassSpec AttachmentSpecOf(const bess::TrafficClass* c) {
   spec.policy = (c->policy() >= 0 && c->policy() < NUM_POLICIES)
                     ? TrafficPolicyName[c->policy()]
                     : "";
-  spec.wid = c->WorkerId();
+  spec.wid = WidOrAny(c->OwnerWorker());
 
   const bess::TrafficClass* parent = c->parent();
   if (parent == nullptr) {
@@ -119,7 +119,7 @@ TrafficClassSpec AttachmentSpecOf(const bess::TrafficClass* c) {
   // reattach target: the class is a root that happens to sit under it.
   if (!parent->name().empty() && parent->name()[0] == '!') {
     spec.parent = "";
-    spec.wid = c->WorkerId();
+    spec.wid = WidOrAny(c->OwnerWorker());
     return spec;
   }
 
@@ -665,15 +665,16 @@ ControlResult<void> ControlPlane::AddWorker(uint64_t wid,
 ControlResult<void> ControlPlane::AddWorkerLocked(
     uint64_t wid, std::optional<uint64_t> core, const std::string& scheduler) {
 
-  if (wid >= Worker::kMaxWorkers) {
+  const std::optional<dataplane::WorkerId> id = dataplane::WorkerIdFrom(wid);
+  if (!id) {
     return std::unexpected(Err(EINVAL, "Invalid worker id"));
   }
   // An explicit core anywhere in the process's CPU set is honoured -- on
   // another node, on a control CPU, beside another worker -- and diagnosed
   // at launch (D-123); only one outside the set is refused (D-027).
-  std::optional<runtime::CpuId> cpu;
+  std::optional<dataplane::CpuId> cpu;
   if (core.has_value()) {
-    cpu = runtime::CpuIdFrom(*core);
+    cpu = dataplane::CpuIdFrom(*core);
     if (!cpu || !runtime::CpuPresent(*cpu)) {
       return std::unexpected(Err(EINVAL, "Invalid core %llu",
                                  static_cast<unsigned long long>(*core)));
@@ -684,8 +685,9 @@ ControlResult<void> ControlPlane::AddWorkerLocked(
               runtime::CpuList(runtime::ProcessCpus()).c_str()));
     }
   }
-  if (is_worker_active(wid)) {
-    return std::unexpected(Err(EEXIST, "worker:%d is already active", static_cast<int>(wid)));
+  if (is_worker_active(*id)) {
+    return std::unexpected(Err(EEXIST, "worker:%u is already active",
+                               unsigned{id->value()}));
   }
   if (scheduler != "" && scheduler != "experimental") {
     return std::unexpected(Err(EINVAL, "Invalid scheduler %s",
@@ -716,10 +718,10 @@ ControlResult<void> ControlPlane::AddWorkerLocked(
       error.field = "core";
       return std::unexpected(error);
     }
-    cpu = runtime::CpuId(static_cast<uint32_t>(*next));  // a CPU of the set
+    cpu = dataplane::CpuId(static_cast<uint32_t>(*next));  // a CPU of the set
   }
 
-  runtime::runtime().workers().Launch(static_cast<int>(wid), *cpu, scheduler);
+  runtime::runtime().workers().Launch(*id, *cpu, scheduler);
   return {};
 }
 
@@ -738,12 +740,14 @@ ControlResult<void> ControlPlane::DestroyWorker(uint64_t wid) {
 
 ControlResult<void> ControlPlane::DestroyWorkerLocked(uint64_t wid) {
 
-  if (wid >= Worker::kMaxWorkers) {
+  const std::optional<dataplane::WorkerId> id = dataplane::WorkerIdFrom(wid);
+  if (!id) {
     return std::unexpected(Err(EINVAL, "Invalid worker id"));
   }
-  Worker* worker = runtime::runtime().workers().Get(wid);
+  Worker* worker = runtime::runtime().workers().Get(*id);
   if (!worker) {
-    return std::unexpected(Err(ENOENT, "Worker %d is not active", static_cast<int>(wid)));
+    return std::unexpected(
+        Err(ENOENT, "Worker %u is not active", unsigned{id->value()}));
   }
 
   bess::TrafficClass* root = worker->scheduler()->root();
@@ -751,13 +755,14 @@ ControlResult<void> ControlPlane::DestroyWorkerLocked(uint64_t wid) {
     for (const auto& it : TrafficClassBuilder::all_tcs()) {
       bess::TrafficClass* c = it.second.get();
       if (c->policy() == bess::POLICY_LEAF && c->Root() == root) {
-        return std::unexpected(Err(EBUSY, "Worker %d has active tasks: %s", static_cast<int>(wid),
+        return std::unexpected(Err(EBUSY, "Worker %u has active tasks: %s",
+                                   unsigned{id->value()},
                                    c->name().c_str()));
       }
     }
   }
 
-  destroy_worker(wid);
+  destroy_worker(*id);
   return {};
 }
 
@@ -792,8 +797,10 @@ ControlResult<void> ControlPlane::PauseAll() {
 ControlResult<void> ControlPlane::PauseWorker(uint64_t wid) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  // The wire id is uint64: check before it narrows to int (2^32 was worker 0).
-  if (wid >= static_cast<uint64_t>(Worker::kMaxWorkers)) {
+  // The wire id is uint64: refused out of range, never narrowed (2^32 was
+  // worker 0).
+  const std::optional<dataplane::WorkerId> id = dataplane::WorkerIdFrom(wid);
+  if (!id) {
     return std::unexpected(Err(EINVAL, "worker id %llu is out of range (max %d)",
                                static_cast<unsigned long long>(wid),
                                Worker::kMaxWorkers - 1));
@@ -804,7 +811,7 @@ ControlResult<void> ControlPlane::PauseWorker(uint64_t wid) {
   // for experts only is sufficient.
   LOG(WARNING) << "PauseWorker() is an experimental operation and should be"
                << " used with care. Long-term support not guaranteed.";
-  pause_worker(static_cast<int>(wid));
+  pause_worker(*id);
   LOG(INFO) << "*** Worker " << wid << " has been paused ***";
   return {};
 }
@@ -826,8 +833,10 @@ ControlResult<void> ControlPlane::ResumeAll() {
 ControlResult<void> ControlPlane::ResumeWorker(uint64_t wid) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  // The wire id is uint64: check before it narrows to int (2^32 was worker 0).
-  if (wid >= static_cast<uint64_t>(Worker::kMaxWorkers)) {
+  // The wire id is uint64: refused out of range, never narrowed (2^32 was
+  // worker 0).
+  const std::optional<dataplane::WorkerId> id = dataplane::WorkerIdFrom(wid);
+  if (!id) {
     return std::unexpected(Err(EINVAL, "worker id %llu is out of range (max %d)",
                                static_cast<unsigned long long>(wid),
                                Worker::kMaxWorkers - 1));
@@ -837,11 +846,11 @@ ControlResult<void> ControlPlane::ResumeWorker(uint64_t wid) {
   // The worker's modules rebind to the offsets and graph a change made while
   // it was paused (a pauser of the other workers sent PreResume only to the
   // modules they run). The hooks are not rerun: other workers may be running.
-  if (!is_worker_running(static_cast<int>(wid))) {
+  if (!is_worker_running(*id)) {
     std::set<Module *> sent;
-    send_pre_resume(static_cast<int>(wid), &sent);
+    send_pre_resume(*id, &sent);
   }
-  resume_worker(static_cast<int>(wid));
+  resume_worker(*id);
   return {};
 }
 
@@ -1093,7 +1102,7 @@ ControlResult<void> ControlPlane::PlaceTasksLocked(
     if (c->parent() == nullptr) {
       for (const auto& [wid, orphan] : runtime::runtime().workers().orphan_tcs()) {
         if (orphan == c) {
-          where.wid = wid;
+          where.wid = WidOrAny(wid);
           break;
         }
       }
@@ -1110,7 +1119,7 @@ ControlResult<void> ControlPlane::PlaceTasksLocked(
     }
     if (detached >= leaves.size()) {
       // A leaving module's task: an orphan (detachable) until it is removed.
-      add_tc_to_orphan(classes[detached], Worker::kAnyWorker);
+      add_tc_to_orphan(classes[detached], std::nullopt);
     }
   }
   size_t attached = 0;
@@ -1152,7 +1161,7 @@ ControlResult<void> ControlPlane::PlaceTasksLocked(
 // scheduler once it (or an ancestor) is moved or destroyed: the wakeup queue
 // holds raw pointers, and a stale one would be followed on the next wakeup.
 void ControlPlane::RemoveSubtreeFromWakeupQueues(bess::TrafficClass* c) {
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+  for (const dataplane::WorkerId wid : dataplane::AllWorkerIds()) {
     Worker* worker = runtime::runtime().workers().Get(wid);
     if (worker != nullptr) {
       worker->scheduler()->wakeup_queue().Remove(c);
@@ -1286,16 +1295,16 @@ ControlPlane::CheckSchedulingConstraints() {
   LOG(INFO) << "Checking scheduling constraints";
   // Check constraints around chains run by each worker. This checks that
   // global constraints are met.
-  for (int i = 0; i < Worker::kMaxWorkers; i++) {
-    Worker* worker = runtime::runtime().workers().Get(i);
+  for (const dataplane::WorkerId wid : dataplane::AllWorkerIds()) {
+    Worker* worker = runtime::runtime().workers().Get(wid);
     if (worker == nullptr) {
       continue;
     }
     // Reported for the legacy check only, never a refusal: a worker on
     // another node than a task's is diagnosed (D-123). An unconstrained task
     // (every port since D-123) runs anywhere, whatever node the worker is on.
-    const int node = worker->socket();
-    const int core = worker->core();
+    const int node = static_cast<int>(worker->socket().value());
+    const int core = static_cast<int>(worker->core().value());
     bess::TrafficClass* root = worker->scheduler()->root();
 
     for (const auto& tc_pair : TrafficClassBuilder::all_tcs()) {
@@ -1310,7 +1319,8 @@ ControlPlane::CheckSchedulingConstraints() {
         const bool allowed = node >= 0 && node < MAX_NUMA_NODE &&
                              (constraints & (placement_constraint{1} << node)) != 0;
         if (!allowed) {
-          LOG(WARNING) << "Scheduler constraints are violated for wid " << i
+          LOG(WARNING) << "Scheduler constraints are violated for wid "
+                       << wid.value()
                        << " node " << node << " constraint " << constraints;
           report.violations.push_back(SchedulingConstraintViolation{
               c->name(), static_cast<int>(constraints), node, core});
@@ -1385,22 +1395,20 @@ ControlResult<void> ControlPlane::AttachExistingTcLocked(
   // Never unregisters or destroys `c`: the class exists, and a failed attach
   // has to leave it where it was. The caller decides whether it is destroyed,
   // and only when it created the class for this operation.
-  int wid = spec.wid;
-
   if (spec.parent == "") {
-    if (wid != Worker::kAnyWorker && (wid < 0 || wid >= Worker::kMaxWorkers)) {
+    if (spec.wid != Worker::kAnyWorker && !dataplane::WorkerIdFrom(spec.wid)) {
       return std::unexpected(Err(EINVAL, "'wid' must be %d or between 0 and %d",
                                  Worker::kAnyWorker, Worker::kMaxWorkers - 1));
     }
+    const std::optional<dataplane::WorkerId> wid = WorkerOrAny(spec.wid);
 
     int active_workers = runtime::runtime().workers().num_workers();
-    if ((wid != Worker::kAnyWorker && !is_worker_active(wid)) ||
-        (wid == Worker::kAnyWorker && active_workers == 0)) {
-      if (active_workers == 0 && (wid == 0 || wid == Worker::kAnyWorker)) {
-        runtime::runtime().workers().Launch(0, runtime::DefaultWorkerCore(), "");
+    if ((wid && !is_worker_active(*wid)) || (!wid && active_workers == 0)) {
+      if (active_workers == 0 && (!wid || wid->value() == 0)) {
+        runtime::runtime().workers().Launch(dataplane::WorkerId(0),
+                                            runtime::DefaultWorkerCore(), "");
       } else {
-        return std::unexpected(
-            Err(EINVAL, "worker:%d does not exist", static_cast<int>(wid)));
+        return std::unexpected(Err(EINVAL, "worker:%d does not exist", spec.wid));
       }
     }
 
@@ -1408,7 +1416,7 @@ ControlResult<void> ControlPlane::AttachExistingTcLocked(
     return {};
   }
 
-  if (wid != Worker::kAnyWorker) {
+  if (spec.wid != Worker::kAnyWorker) {
     return std::unexpected(Err(EINVAL,
                                "Both 'parent' and 'wid'"
                                "have been specified"));

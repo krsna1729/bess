@@ -224,7 +224,7 @@ void ModuleHarness::WireOutputs(Module *m, std::vector<gate_idx_t> ogates, Task 
 
 void ModuleHarness::RunOnce(Task &task) {
   Context ctx = {};
-  ctx.wid = 0;
+  ctx.wid = bess::dataplane::WorkerId(0);
   ctx.task = &task;
   ctx.current_tsc = rdtsc();
   ctx.current_ns = tsc_to_ns(ctx.current_tsc);

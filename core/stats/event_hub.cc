@@ -66,19 +66,19 @@ uint32_t EventHub::NamedSource(const std::string &name) {
   return kNamedSource | static_cast<uint32_t>(source_names_.size() - 1);
 }
 
-bool EventHub::Full(int wid) const noexcept {
-  if (wid < 0 || wid >= kMaxWorkers) {
+bool EventHub::Full(dataplane::WorkerId wid) const noexcept {
+  if (wid.value() >= kMaxWorkers) {
     return true;
   }
-  const Ring &r = *rings_[static_cast<size_t>(wid)];
+  const Ring &r = *rings_[wid.value()];
   return r.tail.load(std::memory_order_relaxed) - r.head.load(std::memory_order_acquire) > r.mask;
 }
 
-bool EventHub::Post(int wid, const WorkerEvent &event) noexcept {
-  if (wid < 0 || wid >= kMaxWorkers) {
+bool EventHub::Post(dataplane::WorkerId wid, const WorkerEvent &event) noexcept {
+  if (wid.value() >= kMaxWorkers) {
     return false;
   }
-  Ring &r = *rings_[static_cast<size_t>(wid)];
+  Ring &r = *rings_[wid.value()];
   const uint64_t tail = r.tail.load(std::memory_order_relaxed);
   if (tail - r.head.load(std::memory_order_acquire) > r.mask) {
     r.refused_since++;

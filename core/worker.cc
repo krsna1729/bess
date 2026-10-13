@@ -47,15 +47,18 @@ using bess::ResumeHookBuilder;
 // See worker.h
 __thread Worker current_worker __attribute__((tls_model("initial-exec")));
 
-int is_worker_active(int wid) {
+using bess::dataplane::WorkerId;
+using bess::dataplane::CpuId;
+
+int is_worker_active(WorkerId wid) {
   return bess::runtime::runtime().workers().IsActive(wid);
 }
 
-int is_worker_core(int cpu) {
+int is_worker_core(CpuId cpu) {
   return bess::runtime::runtime().workers().IsCoreUsed(cpu);
 }
 
-void pause_worker(int wid) {
+void pause_worker(WorkerId wid) {
   bess::runtime::runtime().workers().Pause(wid);
 }
 
@@ -63,7 +66,7 @@ void pause_all_workers() {
   bess::runtime::runtime().workers().PauseAll();
 }
 
-void resume_worker(int wid) {
+void resume_worker(WorkerId wid) {
   bess::runtime::runtime().workers().Resume(wid);
 }
 
@@ -75,7 +78,7 @@ void attach_orphans() {
   bess::runtime::runtime().workers().AttachOrphans();
 }
 
-void destroy_worker(int wid) {
+void destroy_worker(WorkerId wid) {
   bess::runtime::runtime().workers().Destroy(wid);
 }
 
@@ -91,21 +94,19 @@ bool is_any_worker_running() {
   return bess::runtime::runtime().workers().AnyRunning();
 }
 
-bool is_worker_running(int wid) {
+bool is_worker_running(WorkerId wid) {
   return bess::runtime::runtime().workers().IsRunning(wid);
 }
 
-void launch_worker(int wid, int core, const std::string &scheduler) {
-  const auto cpu = bess::runtime::CpuIdFrom(core);
-  CHECK(cpu.has_value()) << "CPU " << core << " is out of range";
-  bess::runtime::runtime().workers().Launch(wid, *cpu, scheduler);
+void launch_worker(WorkerId wid, CpuId core, const std::string &scheduler) {
+  bess::runtime::runtime().workers().Launch(wid, core, scheduler);
 }
 
 Worker *get_next_active_worker() {
   return bess::runtime::runtime().workers().NextActive();
 }
 
-void add_tc_to_orphan(bess::TrafficClass *c, int wid) {
+void add_tc_to_orphan(bess::TrafficClass *c, std::optional<WorkerId> wid) {
   bess::runtime::runtime().workers().AddOrphan(c, wid);
 }
 
@@ -113,7 +114,8 @@ bool remove_tc_from_orphan(bess::TrafficClass *c) {
   return bess::runtime::runtime().workers().RemoveOrphan(c);
 }
 
-const std::list<std::pair<int, bess::TrafficClass *>> &list_orphan_tcs() {
+const std::list<std::pair<std::optional<WorkerId>, bess::TrafficClass *>>
+    &list_orphan_tcs() {
   return bess::runtime::runtime().workers().orphan_tcs();
 }
 
@@ -122,13 +124,12 @@ bool detach_tc(bess::TrafficClass *c) {
 }
 
 void Worker::SetNonWorker() {
-  // These TLS variables should not be accessed by non-worker threads.
-  // Assign INT_MIN to the variables so that the program can crash
-  // when accessed as an index of an array.
-  wid_ = INT_MIN;
+  // These TLS variables should not be accessed by non-worker threads: the
+  // largest values, out of range for every array they could index.
+  wid_ = UINT16_MAX;
   rcu_online_ = false;
-  core_ = INT_MIN;
-  socket_ = INT_MIN;
+  core_ = UINT32_MAX;
+  socket_ = UINT32_MAX;
   fd_event_ = INT_MIN;
 
   if (!packet_pool_) {
@@ -142,7 +143,7 @@ void Worker::ReportQuiescent() {
   // before it is ever resumed must not appear online to DPDK's QSBR (a
   // report on an offline thread does exactly that). rcu_online_ is this
   // thread's own flag, so the check costs nothing shared.
-  if (!rcu_online_ || wid_ < 0 || wid_ >= Worker::kMaxWorkers) {
+  if (!rcu_online_ || wid_ >= Worker::kMaxWorkers) {
     return;
   }
   bess::runtime::runtime().rcu().Quiescent(wid_);
@@ -200,7 +201,8 @@ void *Worker::Run(void *_arg) {
   // cache under a wrong lcore. Dying here is the lesser evil; rejecting the
   // worker-creation RPC instead would be nicer, later.
   CHECK_EQ(rte_thread_set_affinity(&set), 0)
-      << "failed to pin worker " << arg->wid << " to CPU " << arg->core.value();
+      << "failed to pin worker " << arg->wid.value() << " to CPU "
+      << arg->core.value();
 
   // Register this pthread as a non-EAL DPDK lcore. DPDK's per-lcore
   // machinery -- above all the default mempool cache that
@@ -225,26 +227,28 @@ void *Worker::Run(void *_arg) {
   // EAL-config change fails loudly instead of silently degrading every
   // worker's allocator to the cache-bypassing path.
   CHECK_EQ(rte_thread_register(), 0)
-      << "rte_thread_register() failed for worker " << arg->wid << ": "
+      << "rte_thread_register() failed for worker " << arg->wid.value() << ": "
       << rte_strerror(rte_errno);
   const unsigned lcore_id = rte_lcore_id();
 
-  wid_ = arg->wid;
+  wid_ = arg->wid.value();
   rcu_online_ = false;
-  core_ = static_cast<int>(arg->core.value());
+  core_ = arg->core.value();
   tid_ = gettid();  // read by the control plane once this worker is ready
   // Named for ps/top (15 characters at most); otherwise it inherits the name
   // of whichever thread launched it (a gRPC handler, say).
   const std::string name = "bess-worker-" + std::to_string(wid_);
   pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
-  socket_ = rte_socket_id();
-
-  // DPDK could not place this CPU on a node. socket_ says where the worker's
-  // CPU is; with nothing better, assume the memory node (D-123).
-  if (socket_ == SOCKET_ID_ANY) {
-    socket_ = bess::runtime::MemoryNode();
+  // DPDK could not place this CPU on a node (SOCKET_ID_ANY). socket_ says
+  // where the worker's CPU is; with nothing better, assume the memory node
+  // (D-123).
+  if (const int socket = static_cast<int>(rte_socket_id());
+      socket == SOCKET_ID_ANY) {
+    socket_ = static_cast<uint32_t>(bess::runtime::MemoryNode());
     LOG(WARNING) << "rte_socket_id() returned -1 for " << arg->core.value()
                  << "; assuming the memory node " << socket_;
+  } else {
+    socket_ = static_cast<uint32_t>(socket);
   }
 
   fd_event_ = eventfd(0, 0);
@@ -261,7 +265,7 @@ void *Worker::Run(void *_arg) {
 
   // Publish() is a seq_cst store, so it also releases everything above
   // (status_, packet_pool_, ...) to the master's load of workers_[wid_].
-  bess::runtime::runtime().workers().Publish(wid_, this);
+  bess::runtime::runtime().workers().Publish(wid(), this);
 
   // Register as a reader, but stay offline: a worker that merely exists as a
   // thread is not an active RCU participant. It goes online when dataplane
@@ -311,21 +315,21 @@ thread_local int pauser_depth = 0;
 WorkerPauser::WorkerPauser() {
   pauser_depth++;
   if (is_any_worker_running()) {
-    for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+    for (WorkerId wid : bess::dataplane::AllWorkerIds()) {
       if (is_worker_running(wid)) {
         workers_paused_.push_back(wid);
-        VLOG(1) << "*** Pausing Worker " << wid << " ***";
+        VLOG(1) << "*** Pausing Worker " << wid.value() << " ***";
         pause_worker(wid);
       }
     }
   }
 }
 
-void send_pre_resume(int wid, std::set<Module *> *sent) {
+void send_pre_resume(WorkerId wid, std::set<Module *> *sent) {
   auto &resume_modules = bess::event_modules[bess::Event::PreResume];
   for (auto it = resume_modules.begin(); it != resume_modules.end();) {
     Module *m = *it;
-    if (!sent->count(m) && m->active_workers()[wid]) {
+    if (!sent->count(m) && m->active_workers()[wid.value()]) {
       int ret = m->OnEvent(bess::Event::PreResume);
       sent->insert(m);
       if (ret == -ENOTSUP) {
@@ -347,9 +351,9 @@ WorkerPauser::~WorkerPauser() {
   }
 
   std::set<Module *> modules_run;
-  for (int wid : workers_paused_) {
+  for (WorkerId wid : workers_paused_) {
     send_pre_resume(wid, &modules_run);
     resume_worker(wid);
-    VLOG(1) << "*** Worker " << wid << " Resumed ***";
+    VLOG(1) << "*** Worker " << wid.value() << " Resumed ***";
   }
 }

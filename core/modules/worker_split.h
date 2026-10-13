@@ -28,7 +28,8 @@ class WorkerSplit final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  void AddActiveWorker(int wid, const Task *task) override;
+  void AddActiveWorker(bess::dataplane::WorkerId wid,
+                       const Task *task) override;
 
  private:
   using Gates = std::array<int, Worker::kMaxWorkers>;

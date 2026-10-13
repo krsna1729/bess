@@ -70,11 +70,15 @@ int ConnTrack::OnEvent(bess::Event event) {
     return 0;
   }
   refused_ = bess::modules::AsymmetricInputs(*this);
-  for (int wid = 0; wid < Worker::kMaxWorkers && !refused_; wid++) {
-    if (active_workers()[wid] && tables_[wid] == nullptr) {
-      tables_[wid] = MakeTable();
-      if (tables_[wid] == nullptr) {
-        refused_ = bess::utils::Format("no memory for worker %d's table", wid);
+  for (bess::dataplane::WorkerId wid : bess::dataplane::AllWorkerIds()) {
+    if (refused_) {
+      break;
+    }
+    if (active_workers()[wid.value()] && tables_[wid.value()] == nullptr) {
+      tables_[wid.value()] = MakeTable();
+      if (tables_[wid.value()] == nullptr) {
+        refused_ = bess::utils::Format("no memory for worker %u's table",
+                                       unsigned{wid.value()});
       }
     }
   }
@@ -91,8 +95,9 @@ void ConnTrack::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     Track(*shared_, ctx, batch);
     return;
   }
-  Ct *table = mode_ == bess::pb::ConnTrackArg::PER_WORKER ? tables_[ctx->wid].get()
-                                                          : tables_[0].get();
+  Ct *table = mode_ == bess::pb::ConnTrackArg::PER_WORKER
+                  ? tables_[ctx->wid.value()].get()
+                  : tables_[0].get();
   if (refused_ || table == nullptr) [[unlikely]] {
     if (fallback_shared_) {
       Track(*shared_, ctx, batch);

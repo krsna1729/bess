@@ -215,11 +215,11 @@ class ObjectTableRcuTest : public ::testing::Test {
 // generation is destroyed only once the worker reaches a quiescent state --
 // on the control thread.
 TEST_F(ObjectTableRcuTest, WorkerHoldingAnOldGenerationKeepsItAlive) {
-  const int wid = 0;
+  const bess::dataplane::WorkerId wid{0};
 
   g_published->Initialize(BuildTable(/*value=*/1));
 
-  launch_worker(wid, 0);
+  launch_worker(wid, bess::dataplane::CpuId{0});
 
   bess::pb::EmptyArg arg;
   google::protobuf::Any packed;

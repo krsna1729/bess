@@ -93,7 +93,8 @@ void Measure(const Scenario &s, const std::vector<int> &cpus,
     return;
   }
   for (int w = 0; w < s.workers; w++) {
-    launch_worker(w, s.share_one_cpu ? cpus[0] : cpus[w]);
+    launch_worker(*bess::dataplane::WorkerIdFrom(w),
+                  *bess::dataplane::CpuIdFrom(s.share_one_cpu ? cpus[0] : cpus[w]));
   }
   if (s.pipelines) {
     for (int w = 0; w < s.workers; w++) {

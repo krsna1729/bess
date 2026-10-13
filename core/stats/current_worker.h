@@ -10,15 +10,12 @@
 
 namespace bess::stats {
 
-static_assert(dataplane::kMaxWorkers == Worker::kMaxWorkers,
-              "dataplane::kMaxWorkers must match Worker::kMaxWorkers");
-
 // Out of line and cold: an inlined CHECK stream gives every caller a stack
 // frame, a stack-protector canary and saved registers on the packet path.
 [[noreturn, gnu::cold, gnu::noinline]] inline void CurrentWorkerIdFailed(
-    int wid) {
-  LOG(FATAL) << "CurrentWorkerId() called off a worker thread (wid " << wid
-             << ")";
+    dataplane::WorkerId wid) {
+  LOG(FATAL) << "CurrentWorkerId() called off a worker thread (wid "
+             << wid.value() << ")";
   __builtin_unreachable();
 }
 
@@ -26,12 +23,12 @@ static_assert(dataplane::kMaxWorkers == Worker::kMaxWorkers,
 // not have `Context::wid` at hand (gate hooks, for instance). Calling it from
 // a thread that is not a worker is a bug; every build checks.
 inline dataplane::WorkerId CurrentWorkerId() noexcept {
-  const int wid = current_worker.wid();
-  // Else an out-of-range slot (D-061). Unsigned compare: one branch for both bounds.
-  if (static_cast<unsigned>(wid) >= Worker::kMaxWorkers) [[unlikely]] {
+  const dataplane::WorkerId wid = current_worker.wid();
+  // Else an out-of-range slot (D-061): a non-worker thread's is UINT16_MAX.
+  if (wid.value() >= Worker::kMaxWorkers) [[unlikely]] {
     CurrentWorkerIdFailed(wid);
   }
-  return dataplane::WorkerId(static_cast<uint16_t>(wid));
+  return wid;
 }
 
 }  // namespace bess::stats

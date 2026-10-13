@@ -7,11 +7,13 @@
 #include <atomic>
 #include <cstdint>
 #include <list>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "dataplane/worker_id.h"
 #include "runtime/numa_placement.h"
 #include "runtime/thread_placement.h"
 #include "traffic_class.h"
@@ -22,10 +24,12 @@ class Scheduler;
 
 namespace runtime {
 
+using dataplane::WorkerId;
+
 // Arguments handed to a worker OS thread: the BESS worker id, the CPU it is
 // pinned to, and the scheduler it owns (the thread takes ownership).
 struct WorkerThreadArg {
-  int wid;
+  WorkerId wid;
   CpuId core;
   Scheduler *scheduler;
 };
@@ -49,34 +53,27 @@ class WorkerManager {
 
   int num_workers() const { return num_workers_; }
 
-  Worker *Get(int wid) {
-    if (wid < 0 || wid >= Worker::kMaxWorkers) {
-      return nullptr;
-    }
-    return workers_[wid].load();
+  Worker *Get(WorkerId wid) {
+    return wid.value() < Worker::kMaxWorkers ? workers_[wid.value()].load()
+                                             : nullptr;
   }
 
-  const Worker *Get(int wid) const {
-    if (wid < 0 || wid >= Worker::kMaxWorkers) {
-      return nullptr;
-    }
-    return workers_[wid].load();
+  const Worker *Get(WorkerId wid) const {
+    return wid.value() < Worker::kMaxWorkers ? workers_[wid.value()].load()
+                                             : nullptr;
   }
 
   // The scheduler name this worker was launched with ("" for the default one).
-  const std::string &scheduler_name(int wid) const {
+  const std::string &scheduler_name(WorkerId wid) const {
     static const std::string kEmpty;
-    if (wid < 0 || wid >= Worker::kMaxWorkers) {
+    if (wid.value() >= Worker::kMaxWorkers) {
       return kEmpty;
     }
-    return scheduler_names_[wid];
+    return scheduler_names_[wid.value()];
   }
 
-  bool IsActive(int wid) const {
-    return wid >= 0 && wid < Worker::kMaxWorkers &&
-           workers_[wid].load() != nullptr;
-  }
-  bool IsRunning(int wid) const;
+  bool IsActive(WorkerId wid) const { return Get(wid) != nullptr; }
+  bool IsRunning(WorkerId wid) const;
   bool AnyRunning() const;
   Worker *NextActive();
 
@@ -85,30 +82,32 @@ class WorkerManager {
   // DescribeWorkerCpu has for that CPU (another node, a control CPU, a core
   // shared with another worker or a control CPU): diagnosed, never refused
   // (D-123).
-  void Launch(int wid, CpuId core, const std::string &scheduler);
-  void Destroy(int wid);
+  void Launch(WorkerId wid, CpuId core, const std::string &scheduler);
+  void Destroy(WorkerId wid);
   void DestroyAll();
   void DetachAllThreads();
 
-  void Pause(int wid);
+  void Pause(WorkerId wid);
   void PauseAll();
-  void Resume(int wid);
+  void Resume(WorkerId wid);
   void ResumeAll();
 
   // True if a live worker is pinned to this CPU.
-  bool IsCoreUsed(int core) const;
+  bool IsCoreUsed(CpuId core) const;
   // The CPUs the live workers run on, except worker `except`'s: what an
-  // automatic worker must not take (D-123).
-  std::vector<int> Cores(int except = -1) const;
+  // automatic worker must not take (D-123). Plain CPU numbers, as the
+  // placement model (Placement, read from sysfs) takes them.
+  std::vector<int> Cores(std::optional<WorkerId> except = std::nullopt) const;
   // Where live worker `wid` runs, against the other workers' CPUs as they are
   // now (D-123); a default report for a wid with no worker.
-  WorkerCpuReport CpuReport(int wid) const;
+  WorkerCpuReport CpuReport(WorkerId wid) const;
 
   // Orphan traffic classes: created by TC/module setup and attached to
-  // workers when they resume.
-  void AddOrphan(TrafficClass *c, int wid);
+  // workers when they resume, to worker `wid` or (none) any.
+  void AddOrphan(TrafficClass *c, std::optional<WorkerId> wid);
   bool RemoveOrphan(TrafficClass *c);
-  const std::list<std::pair<int, TrafficClass *>> &orphan_tcs() const {
+  const std::list<std::pair<std::optional<WorkerId>, TrafficClass *>>
+      &orphan_tcs() const {
     return orphan_tcs_;
   }
   void AttachOrphans();
@@ -122,7 +121,9 @@ class WorkerManager {
   void AdjustSchedulerDefaults();
 
   // Called by the worker thread itself once it is up.
-  void Publish(int wid, Worker *worker) { workers_[wid].store(worker); }
+  void Publish(WorkerId wid, Worker *worker) {
+    workers_[wid.value()].store(worker);
+  }
 
  private:
   // Moves non-worker threads off the active workers' CPUs.
@@ -134,7 +135,7 @@ class WorkerManager {
   std::array<std::thread, Worker::kMaxWorkers> threads_;
   std::array<std::string, Worker::kMaxWorkers> scheduler_names_;
   int num_workers_ = 0;
-  std::list<std::pair<int, TrafficClass *>> orphan_tcs_;
+  std::list<std::pair<std::optional<WorkerId>, TrafficClass *>> orphan_tcs_;
 };
 
 }  // namespace runtime

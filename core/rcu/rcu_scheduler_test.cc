@@ -157,8 +157,8 @@ class RcuSchedulerTest : public ::testing::Test {
 // A task that is holding a published pointer keeps it alive; the worker only
 // reports quiescence once that task returns.
 TEST_F(RcuSchedulerTest, TaskHoldingAPointerKeepsItAliveUntilItReturns) {
-  const int wid = 0;
-  launch_worker(wid, 0);
+  const bess::dataplane::WorkerId wid{0};
+  launch_worker(wid, bess::dataplane::CpuId{0});
 
   bess::pb::EmptyArg arg;
   google::protobuf::Any packed;
@@ -231,8 +231,8 @@ TEST_F(RcuSchedulerTest, TaskHoldingAPointerKeepsItAliveUntilItReturns) {
 // An online worker with nothing to do must still reach the scheduler boundary
 // and report quiescence, or reclamation would stall whenever traffic stops.
 TEST_F(RcuSchedulerTest, IdleWorkerStillAdvancesGracePeriods) {
-  const int wid = 0;
-  launch_worker(wid, 0);
+  const bess::dataplane::WorkerId wid{0};
+  launch_worker(wid, bess::dataplane::CpuId{0});
   resume_worker(wid);
 
   // The worker reported quiescence on resume; this token needs a fresh one.

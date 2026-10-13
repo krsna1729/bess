@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <optional>
 #include <list>
 #include <set>
 #include <string>
@@ -18,6 +19,8 @@
 #include <thread>
 #include <type_traits>
 
+#include "dataplane/cpu_id.h"
+#include "dataplane/worker_id.h"
 #include "gate.h"
 #include "utils/common.h"
 #include "utils/random.h"
@@ -61,7 +64,10 @@ class Worker {
   // comparisons, and a sanitizer build odr-uses them -- which needs the
   // implicitly-inline definition that `constexpr` static members have.
   static constexpr int kMaxWorkers = 64;
-  static constexpr int kAnyWorker = -1;  // unspecified worker ID
+  static_assert(kMaxWorkers == bess::dataplane::kMaxWorkers);
+  // "No worker given" on the wire and in a pipeline spec (a TC's or task's
+  // wid); typed code says std::optional<WorkerId> instead.
+  static constexpr int kAnyWorker = -1;
 
   /* ----------------------------------------------------------------------
    * functions below are invoked by non-worker threads (the master)
@@ -97,11 +103,17 @@ class Worker {
     std::atomic_ref(status_).store(status, std::memory_order_release);
   }
 
-  int wid() const { return wid_; }
-  int core() const { return core_; }
+  // Meaningful on a worker thread only: elsewhere wid() is out of range
+  // (CurrentWorkerId() checks), and core() and socket() are unset.
+  bess::dataplane::WorkerId wid() const {
+    return bess::dataplane::WorkerId(static_cast<uint16_t>(wid_));
+  }
+  bess::dataplane::CpuId core() const { return bess::dataplane::CpuId(core_); }
   // The worker's OS thread id (gettid), set before it reports ready.
   pid_t tid() const { return tid_; }
-  int socket() const { return socket_; }
+  bess::dataplane::SocketId socket() const {
+    return bess::dataplane::SocketId(socket_);
+  }
   int fd_event() { return fd_event_; }
 
   bess::PacketPool *packet_pool() { return packet_pool_; }
@@ -124,13 +136,16 @@ class Worker {
   alignas(std::atomic_ref<worker_status_t>::required_alignment)
       worker_status_t status_;
 
-  int wid_;   // always [0, kMaxWorkers - 1]
+  // StrongId's default member initializer would make Worker non-trivial
+  // (see __thread below), so the ids are stored raw. 32 bits, as the int it
+  // was: the layout (every field's offset) is unchanged (D-133).
+  uint32_t wid_;  // [0, kMaxWorkers - 1] on a worker; UINT16_MAX elsewhere
   // Whether this worker is an online RCU reader; touched only by its own
   // thread (BlockWorker, the thread's exit), read by ReportQuiescent().
   bool rcu_online_;
-  int core_;  // TODO: should be cpuset_t
+  uint32_t core_;
   pid_t tid_;  // set in Run() (Worker stays trivially constructible)
-  int socket_;
+  uint32_t socket_;
   int fd_event_;
 
   bess::PacketPool *packet_pool_;
@@ -163,28 +178,44 @@ static_assert(std::is_trivially_destructible<Worker>::value,
               "not trivially destructible");
 #endif
 
+// A worker as the wire and pipeline specs carry it: its id, or kAnyWorker.
+inline int WidOrAny(std::optional<bess::dataplane::WorkerId> wid) {
+  return wid ? int{wid->value()} : Worker::kAnyWorker;
+}
+
+// The worker a wire or spec wid names: none for kAnyWorker. The value must
+// already be validated (kAnyWorker or [0, kMaxWorkers)).
+inline std::optional<bess::dataplane::WorkerId> WorkerOrAny(int wid) {
+  if (wid == Worker::kAnyWorker) {
+    return std::nullopt;
+  }
+  const auto id = bess::dataplane::WorkerIdFrom(wid);
+  CHECK(id.has_value()) << "unvalidated worker id " << wid;
+  return id;
+}
+
 // TODO: C++-ify
 
 /* ------------------------------------------------------------------------
  * functions below are invoked by non-worker threads (the master)
  * ------------------------------------------------------------------------ */
-int is_worker_core(int cpu);
+int is_worker_core(bess::dataplane::CpuId cpu);
 
-void pause_worker(int wid);
+void pause_worker(bess::dataplane::WorkerId wid);
 void pause_all_workers();
 
 /*!
  * Attach orphan TCs to workers. Note this does not ensure optimal placement.
  */
 void attach_orphans();
-void resume_worker(int wid);
+void resume_worker(bess::dataplane::WorkerId wid);
 // Sends PreResume to every module worker `wid` runs that has not had it yet
 // (`sent` records them), so they rebind to the current metadata offsets and
 // graph before the worker resumes. Modules that answer -ENOTSUP are not asked
 // again.
-void send_pre_resume(int wid, std::set<Module *> *sent);
+void send_pre_resume(bess::dataplane::WorkerId wid, std::set<Module *> *sent);
 void resume_all_workers();
-void destroy_worker(int wid);
+void destroy_worker(bess::dataplane::WorkerId wid);
 void destroy_all_workers();
 
 // Detach any worker_threads[] entry that's still joinable. Nothing on the
@@ -204,18 +235,20 @@ bool is_any_worker_running();
 
 int is_cpu_present(unsigned int core_id);
 
-int is_worker_active(int wid);
+int is_worker_active(bess::dataplane::WorkerId wid);
 
-bool is_worker_running(int wid);
+bool is_worker_running(bess::dataplane::WorkerId wid);
 
-// arg (int) is the core id the worker should run on, and optionally the
-// scheduler to use.
-void launch_worker(int wid, int core, const std::string &scheduler = "");
+// Starts worker `wid` on CPU `core`, optionally with a named scheduler.
+void launch_worker(bess::dataplane::WorkerId wid, bess::dataplane::CpuId core,
+                   const std::string &scheduler = "");
 
 Worker *get_next_active_worker();
 
-// Add 'c' to the list of orphan traffic classes.
-void add_tc_to_orphan(bess::TrafficClass *c, int wid);
+// Add 'c' to the list of orphan traffic classes, for worker `wid` or (none)
+// whichever worker attach_orphans() picks.
+void add_tc_to_orphan(bess::TrafficClass *c,
+                      std::optional<bess::dataplane::WorkerId> wid);
 
 // Return true if 'c' was removed from the list of orphan traffic classes.
 // 'c' is now owned by the caller, and it must be attached to a tree or
@@ -225,7 +258,9 @@ void add_tc_to_orphan(bess::TrafficClass *c, int wid);
 bool remove_tc_from_orphan(bess::TrafficClass *c);
 
 // Returns a list of all the orphan traffic classes.
-const std::list<std::pair<int, bess::TrafficClass *>> &list_orphan_tcs();
+const std::list<
+    std::pair<std::optional<bess::dataplane::WorkerId>, bess::TrafficClass *>>
+    &list_orphan_tcs();
 
 // Try to detach 'c' from a scheduler, or from the list of orhpan traffic
 // classes.
@@ -244,7 +279,7 @@ class WorkerPauser {
   ~WorkerPauser();
 
  private:
-  std::list<int> workers_paused_;
+  std::list<bess::dataplane::WorkerId> workers_paused_;
 };
 
 #endif  // BESS_WORKER_H_

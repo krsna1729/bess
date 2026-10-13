@@ -40,7 +40,7 @@ struct Context {
   // Set by task scheduler, read by modules
   uint64_t current_tsc;
   uint64_t current_ns;
-  int wid;
+  bess::dataplane::WorkerId wid;
   Task *task;
 
   // Set by module scheduler, read by a task scheduler
@@ -377,8 +377,8 @@ class alignas(bess::arch::kCacheLineSize) Module {
 
   // True if any worker attached to this module is running.
   inline bool HasRunningWorker() const {
-    for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-      if (active_workers_[wid] && is_worker_running(wid)) {
+    for (bess::dataplane::WorkerId wid : bess::dataplane::AllWorkerIds()) {
+      if (active_workers_[wid.value()] && is_worker_running(wid)) {
         return true;
       }
     }
@@ -398,7 +398,8 @@ class alignas(bess::arch::kCacheLineSize) Module {
 
   const std::vector<Module *> &parent_tasks() const { return parent_tasks_; };
 
-  virtual void AddActiveWorker(int wid, const Task *task);
+  virtual void AddActiveWorker(bess::dataplane::WorkerId wid,
+                               const Task *task);
 
   virtual CheckConstraintResult CheckModuleConstraints() const;
 
@@ -538,7 +539,7 @@ inline void Module::RunChooseModule(Context *ctx, gate_idx_t ogate_idx,
   }
 
   if (unlikely(ogate_idx >= ogates_.size())) {
-    deadends_[ctx->wid] += batch->cnt();
+    deadends_[ctx->wid.value()] += batch->cnt();
     deadend(ctx, batch);
     return;
   }
@@ -546,7 +547,7 @@ inline void Module::RunChooseModule(Context *ctx, gate_idx_t ogate_idx,
   ogate = ogates_[ogate_idx];
 
   if (unlikely(!ogate)) {
-    deadends_[ctx->wid] += batch->cnt();
+    deadends_[ctx->wid.value()] += batch->cnt();
     deadend(ctx, batch);
     return;
   }
@@ -564,7 +565,7 @@ inline void Module::RunNextModule(Context *ctx, bess::PacketBatch *batch) {
 
 inline void Module::DropPacket(Context *ctx, bess::PacketRef pkt) {
   ctx->task->dead_batch()->add(pkt);
-  deadends_[ctx->wid]++;
+  deadends_[ctx->wid.value()]++;
   if (static_cast<size_t>(ctx->task->dead_batch()->cnt()) >=
       bess::PacketBatch::kMaxBurst) {
     deadend(ctx, ctx->task->dead_batch());

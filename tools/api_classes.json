@@ -49,6 +49,7 @@
     "dataplane/batch_stages.h": "experimental",
     "dataplane/batch_tuning.h": "experimental",
     "dataplane/continuation.h": "experimental",
+    "dataplane/cpu_id.h": "experimental",
     "dataplane/expiry_wheel.h": "experimental",
     "dataplane/generation_handle.h": "experimental",
     "dataplane/handoff.h": "experimental",

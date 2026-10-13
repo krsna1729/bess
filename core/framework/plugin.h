@@ -19,8 +19,11 @@
 // those headers can break a plugin's source. A daemon at version N loads a
 // plugin whose [api_min, api_max] contains N. 2 (D-129): ResourceCodec's
 // kind() and Entries(), TypedCodec's entries function, declared
-// resource_tables.
-#define BESS_PLUGIN_API_VERSION 2
+// resource_tables. 3 (D-133): typed worker ids -- Context::wid and
+// Worker::wid() are a dataplane::WorkerId, Worker::core() a dataplane::CpuId,
+// Worker::socket() a dataplane::SocketId; EventHub::Post/Full,
+// EventThrottle::Note and Module::AddActiveWorker take a WorkerId.
+#define BESS_PLUGIN_API_VERSION 3
 
 // bess-dev-static.pc (D-095) is for programs without bessd. A plugin runs in
 // bessd and uses its runtime: linking the archives would give it a second EAL

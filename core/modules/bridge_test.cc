@@ -144,7 +144,7 @@ TEST_F(BridgeTest, DynamicMacLearningAndForwarding) {
 
     Context ctx{};
     ctx.current_tsc = rdtsc();
-    ctx.wid = 0;
+    ctx.wid = bess::dataplane::WorkerId(0);
     ctx.task = &task;
     ctx.current_igate = 0;
     br->ProcessBatch(&ctx, &batch);
@@ -175,7 +175,7 @@ TEST_F(BridgeTest, DynamicMacLearningAndForwarding) {
 
     Context ctx{};
     ctx.current_tsc = rdtsc();
-    ctx.wid = 0;
+    ctx.wid = bess::dataplane::WorkerId(0);
     ctx.task = &task;
     ctx.current_igate = 1;
     br->ProcessBatch(&ctx, &batch);
@@ -206,7 +206,7 @@ TEST_F(BridgeTest, DynamicMacLearningAndForwarding) {
 
     Context ctx{};
     ctx.current_tsc = rdtsc();
-    ctx.wid = 0;
+    ctx.wid = bess::dataplane::WorkerId(0);
     ctx.task = &task;
     ctx.current_igate = 0;
     br->ProcessBatch(&ctx, &batch);
@@ -255,7 +255,7 @@ TEST_F(BridgeTest, HairpinFiltering) {
 
   Context ctx{};
   ctx.current_tsc = rdtsc();
-  ctx.wid = 0;
+  ctx.wid = bess::dataplane::WorkerId(0);
   ctx.task = &task;
   ctx.current_igate = 0;
   br->ProcessBatch(&ctx, &batch);

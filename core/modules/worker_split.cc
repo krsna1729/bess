@@ -94,7 +94,7 @@ CommandResponse WorkerSplit::CommandReset(const bess::pb::WorkerSplitArg &arg) {
 }
 
 void WorkerSplit::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  int gate = gates_[ctx->wid];
+  int gate = gates_[ctx->wid.value()];
   if (gate >= 0) {
     RunChooseModule(ctx, gate, batch);
   } else {
@@ -102,12 +102,13 @@ void WorkerSplit::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   }
 }
 
-void WorkerSplit::AddActiveWorker(int wid, const Task *t) {
+void WorkerSplit::AddActiveWorker(bess::dataplane::WorkerId wid,
+                                  const Task *t) {
   if (!HaveVisitedWorker(t)) {  // Have not already accounted for worker.
-    active_workers_[wid] = true;
+    active_workers_[wid.value()] = true;
     visited_tasks_.push_back(t);
     // Only propagate workers downstream on ogate mapped to `wid`
-    int g = gates_[wid];
+    int g = gates_[wid.value()];
     bess::OGate *ogate = (g < 0) ? nullptr : ogates()[g];
     if (ogate) {
       auto next = static_cast<Module *>(ogate->next());

@@ -160,8 +160,9 @@ class TrafficClass {
   const TrafficClass *Root() const { return parent_ ? parent_->Root() : this; }
   TrafficClass *Root() { return parent_ ? parent_->Root() : this; }
 
-  // Returns its worker ID, or -1 (kAnyWorker) if not belongs to any worker yet
-  int WorkerId() const;
+  // The worker whose scheduler holds this class's tree; none while it is an
+  // orphan.
+  std::optional<dataplane::WorkerId> OwnerWorker() const;
 
   // Returns true if 'child' was removed successfully, in which case
   // the caller owns it. Therefore, after a successful call, 'child'

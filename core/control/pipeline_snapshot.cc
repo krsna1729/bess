@@ -183,14 +183,14 @@ PipelineSnapshot SnapshotRuntime(const runtime::RuntimeState &runtime) {
     }
   }
 
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+  for (const dataplane::WorkerId wid : dataplane::AllWorkerIds()) {
     const Worker *worker = runtime.workers().Get(wid);
     if (!worker) {
       continue;
     }
     WorkerSnapshot entry;
-    entry.wid = wid;
-    entry.core = worker->core();
+    entry.wid = wid.value();
+    entry.core = static_cast<int>(worker->core().value());
     entry.scheduler = runtime.workers().scheduler_name(wid);
     const runtime::WorkerCpuReport report = runtime.workers().CpuReport(wid);
     entry.numa_node = report.numa_node;
@@ -208,7 +208,7 @@ PipelineSnapshot SnapshotRuntime(const runtime::RuntimeState &runtime) {
     entry.policy = (c->policy() >= 0 && c->policy() < NUM_POLICIES)
                        ? TrafficPolicyName[c->policy()]
                        : "invalid";
-    entry.wid = c->WorkerId();
+    entry.wid = WidOrAny(c->OwnerWorker());
 
     // Parameters the class owns.
     switch (c->policy()) {
@@ -276,7 +276,7 @@ PipelineSnapshot SnapshotRuntime(const runtime::RuntimeState &runtime) {
       if (c->parent() == nullptr) {
         for (const auto &[wid, orphan] : runtime.workers().orphan_tcs()) {
           if (orphan == c) {
-            entry.wid = wid;
+            entry.wid = WidOrAny(wid);
             break;
           }
         }

@@ -152,6 +152,7 @@ file is the reasoning.
 | D-130 | `rte_fib` re-trial: the D-003 failure is an `rte_fib` defect (DIR24_8 update loop wraps at 255.255.255.255 and overwrites the whole table), not BESS usage; `rte_lpm` stays; the re-trial is a unit test that fails when DPDK fixes it | accepted |
 | D-131 | Local DPDK patches: `deps/dpdk-patches/NNNN-<slug>.patch` (format-patch, `Upstream-Status` and `BESS-Decision` trailers) applied in order by the bootstrap; a series stamp in the source tree and each install re-extracts or reinstalls on change; `--check-patches` in CI; build-info and the SBOM list the series | accepted |
 | D-132 | `rte_fib` as a selectable route backend (`backend` on IPLookup and Router; `rte_lpm` stays the default): five carried DPDK patches (one gives `rte_fib` `rte_lpm`'s tbl8 group lifetime, so changes and deletes never allocate), `rte_lpm`'s limits and errors enforced by the table, the defer queue sized to the pool, x86-64 only (plain stores); cheaper changes at every size and faster batch lookups, equal in a small table | accepted |
+| D-133 | Typed worker ids end to end: `WorkerId`, `CpuId` and `SocketId` through `Worker`, the worker functions, `WorkerManager`, `ControlPlane`, `Context::wid` and the event hub; wire and spec ints convert once, checked; the placement model stays on sysfs CPU numbers; `gate_idx_t` unchanged; plugin API 3; same instructions per packet | accepted |
 
 
 ---
@@ -9755,3 +9756,68 @@ of 1-64 at strides up to width + 2, a miss leaves its slot untouched). Both, `co
 **Code.** `core/classifier/masked_exact.h`, `core/classifier/masked_exact_test.cc`,
 `core/classifier/concurrent_masked_test.cc`, `core/modules/wildcard_match_update_bench.cc`, `tools/live_perf.py`
 (`M.wildcardmatch/13b`).
+
+## D-133 Typed worker ids end to end: `WorkerId`, `CpuId`, `SocketId`
+
+**Status:** accepted (2026-10-14; the roadmap's type-safety item for legacy boundaries, after D-103's `CpuId`).
+
+**Problem.** A worker was an `int` everywhere outside the stats code: `Worker::wid()`, `Context::wid`, the worker
+functions in `worker.h`, every `WorkerManager` method, the orphan list (`-1` for any worker), the event hub. A CPU
+and a NUMA node were `int`s too (`Worker::core()`, `Worker::socket()`), so a CPU could be passed where a worker was
+meant, and each function range-checked (or forgot to) on its own.
+
+**Decision.**
+- `dataplane::WorkerId` (K6) is the worker's type from the wire to the packet path. `WorkerIdFrom(value)` is the one
+  conversion from an integer (nothing outside `[0, kMaxWorkers)`, never truncated); `AllWorkerIds()` iterates the
+  slots. `Context::wid`, `Worker::wid()`, `pause_worker`/`resume_worker`/`destroy_worker`/`launch_worker`/
+  `is_worker_*`, `send_pre_resume`, every `WorkerManager` method, `Module::AddActiveWorker`, `Task::AddActiveWorker`,
+  `Scheduler::AttachOrphan`, `EventHub::Post`/`Full` and `EventThrottle::Note` take it.
+- "Any worker" is `std::optional<WorkerId>` (the orphan list, `add_tc_to_orphan`,
+  `TrafficClass::OwnerWorker()`, which replaces `WorkerId()` returning `-1`). The wire and the pipeline specs keep
+  `int wid` with `-1` (`Worker::kAnyWorker`); `WidOrAny` and `WorkerOrAny` convert at that boundary, after the
+  validator's range check.
+- `dataplane/cpu_id.h` (installed, experimental like `worker_id.h`: `worker.h` uses it; `runtime/` headers are
+  never installed) holds `dataplane::CpuId` (moved from `runtime/thread_placement.h`, which now names it with a
+  `using`) and the new `SocketId` (a NUMA node as DPDK numbers it). `Worker::core()` is a `CpuId`,
+  `Worker::socket()` a `SocketId`; `launch_worker` takes a `CpuId` (it took an `int` and checked it).
+  `ControlPlane` keeps its `uint64_t` wire parameters and converts each once (`WorkerIdFrom`, `CpuIdFrom`),
+  refusing what does not fit.
+- `Worker` keeps raw storage, 32 bits per id as before (a `StrongId` member would make it non-trivial, which
+  `__thread` forbids), and its accessors return the typed ids. A thread that is not a worker holds `UINT16_MAX`
+  (was `INT_MIN`), which `CurrentWorkerId()` still refuses with one compare.
+- **Not typed:** the placement model (`Placement`, `NextWorkerCpu`, `DescribeWorkerCpu`, `WorkerManager::Cores()`)
+  stays on plain CPU numbers: it is a model of what sysfs lists, built and tested from integer sets. DPDK's own
+  socket ids (`int`, `SOCKET_ID_ANY`) stay at DPDK calls. `gate_idx_t` is unchanged: the reusable libraries no longer
+  use it (D-049), and in the module framework it is the gate index of every packet-path call and of the plugin API; a
+  `GateId` there is a separate decision.
+- **Plugin API 3** (`BESS_PLUGIN_API_VERSION`): `Context::wid` and the accessors changed type, and
+  `AddActiveWorker` is virtual, so an override still taking `int` would silently stop overriding; a plugin built for
+  2 is refused, not miscompiled.
+
+**Evidence.** Codegen: `Task::operator()`, `Source::RunTask`, `Sink::ProcessBatch` and `Task::AddToRun` are
+instruction-identical in the release build; `DefaultScheduler::ScheduleLoop` differs in the one-time `ctx.wid`
+store (16-bit) and TLS offsets; the modules' only change is `movzwl` for `movslq` on the dead-end paths that index
+`deadends_` by `ctx->wid`. Live (`tools/live_perf.py`, release builds, CPUs 4/6 isolated, control on 2, 12
+palindromic rounds, instructions / cycles per packet, before / after):
+
+| test | instructions | cycles, release | cycles, `-falign-functions=64` |
+|---|---|---|---|
+| F.floor | 34.8 / 34.7 | 7.2 / 7.2 | 7.3 / 7.3 |
+| F.hop/4 | 53.3 / 53.3 | 13.0 / 13.2 | 13.2 / 13.4 |
+| M.base | 119.6 / 119.5 | 25.3 / 26.5 | 27.4 / 26.4 |
+| M.exactmatch | 286.5 / 286.6 | 56.7 / 59.7 | 61.6 / 59.1 |
+
+The instructions are the same. The cycles move with code placement, not with the change: in the default release
+build `M.base` and `M.exactmatch` are 4-5% slower after it (`Rewrite::ProcessBatch` and
+`RandomUpdate::ProcessBatch` start at another offset in their cache line), and with every function 64-byte aligned
+the same change is 3-4% faster. A first version stored `wid_` in 16 bits, which moved every later `Worker` field by
+8 bytes; `F.floor` was then 3.9% slower in two sessions (7.2 / 7.6 cycles), and equal once the layout was restored.
+
+**Tests.** The existing worker, RCU, placement, control-plane and event-hub tests, retyped; the fast suite passes
+(unit and live) and ASan passes the retyped tests.
+
+**Code.** `core/dataplane/{worker_id,cpu_id}.h`, `tools/api_classes.json`, `core/worker.{h,cc}`,
+`core/runtime/{worker_manager,thread_placement}.{h,cc}`, `core/module.{h,cc}`, `core/task.{h,cc}`,
+`core/traffic_class.{h,cc}`, `core/scheduler.h`, `core/module_graph.cc`, `core/control/{control_plane,
+pipeline_snapshot,transaction}.cc`, `core/bessctl.cc`, `core/stats/{event_hub,event_throttle,current_worker}`,
+`core/modules/{conntrack,port_out,worker_split}`, `core/framework/plugin.h`, `docs/plugin-api.md`.

@@ -8,6 +8,7 @@
 #include <queue>
 #include <string>
 
+#include "dataplane/worker_id.h"
 #include "gate.h"
 #include "pktbatch.h"
 #include "utils/extended_priority_queue.h"
@@ -150,7 +151,7 @@ class Task {
   placement_constraint GetSocketConstraints() const;
 
   // Add a worker to the set of workers that call this task.
-  void AddActiveWorker(int wid) const;
+  void AddActiveWorker(bess::dataplane::WorkerId wid) const;
 };
 
 #endif  // BESS_TASK_H_

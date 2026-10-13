@@ -128,7 +128,7 @@ class Scheduler {
   // Add 'c' at the top of the scheduler's tree.  If the scheduler is empty,
   // 'c' becomes the root, otherwise it is be attached to a default
   // round-robin root.
-  bool AttachOrphan(TrafficClass *c, int wid) {
+  bool AttachOrphan(TrafficClass *c, dataplane::WorkerId wid) {
     if (!root_) {
       root_ = c;
       return true;
@@ -138,7 +138,7 @@ class Scheduler {
     }
     default_rr_class_ =
         TrafficClassBuilder::CreateTrafficClass<RoundRobinTrafficClass>(
-            std::string("!default_rr_") + std::to_string(wid));
+            std::string("!default_rr_") + std::to_string(wid.value()));
     default_rr_class_->AddChild(root_);
     default_rr_class_->AddChild(c);
     root_ = default_rr_class_;

@@ -104,7 +104,7 @@ TEST_F(PacketStoreTest, BufferAndReleaseFlow) {
   }
 
   Context ctx;
-  ctx.wid = 0;
+  ctx.wid = bess::dataplane::WorkerId(0);
   ctx.task = &task;
   ps->ProcessBatch(&ctx, &batch);
 
@@ -153,7 +153,7 @@ TEST_F(PacketStoreTest, PerFlowCapacityEviction) {
   }
 
   Context ctx;
-  ctx.wid = 0;
+  ctx.wid = bess::dataplane::WorkerId(0);
   ctx.task = &task;
   ps->ProcessBatch(&ctx, &batch);
 

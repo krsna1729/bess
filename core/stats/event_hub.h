@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include "dataplane/worker_id.h"
+
 namespace bess::stats {
 
 // Operational events (M25 phase 2, D-084): control-plane observations, never
@@ -84,10 +86,10 @@ class EventHub {
 
   // Worker `wid`: false when its ring is full (counted). A poster's own
   // source ids stay below kNamedSource.
-  bool Post(int wid, const WorkerEvent &event) noexcept;
+  bool Post(dataplane::WorkerId wid, const WorkerEvent &event) noexcept;
   // Worker `wid`: whether its ring is full now (nothing counted), for a
   // poster that keeps what it would post for later (EventThrottle).
-  bool Full(int wid) const noexcept;
+  bool Full(dataplane::WorkerId wid) const noexcept;
 
   // Control side.
   uint64_t Emit(std::string type, std::string source, std::map<std::string, std::string> fields,

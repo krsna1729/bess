@@ -154,8 +154,8 @@ void ModuleGraph::SetUniqueGateIdx() {
 }
 
 void ModuleGraph::ConfigureTasks() {
-  for (int i = 0; i < Worker::kMaxWorkers; i++) {
-    if (bess::runtime::runtime().workers().Get(i) == nullptr) {
+  for (const bess::dataplane::WorkerId wid : bess::dataplane::AllWorkerIds()) {
+    if (bess::runtime::runtime().workers().Get(wid) == nullptr) {
       continue;
     }
 
@@ -371,17 +371,17 @@ void ModuleGraph::PropagateActiveWorker() {
     Module *m = pair.second.get();
     m->ResetActiveWorkerSet();
   }
-  for (int i = 0; i < Worker::kMaxWorkers; i++) {
-    if (bess::runtime::runtime().workers().Get(i) == nullptr) {
+  for (const bess::dataplane::WorkerId wid : bess::dataplane::AllWorkerIds()) {
+    const Worker *worker = bess::runtime::runtime().workers().Get(wid);
+    if (worker == nullptr) {
       continue;
     }
-    if (bess::TrafficClass *root =
-            bess::runtime::runtime().workers().Get(i)->scheduler()->root()) {
+    if (bess::TrafficClass *root = worker->scheduler()->root()) {
       for (const auto &tc_pair : bess::TrafficClassBuilder::all_tcs()) {
         bess::TrafficClass *c = tc_pair.second.get();
         if (c->policy() == bess::POLICY_LEAF && c->Root() == root) {
           auto leaf = static_cast<bess::LeafTrafficClass *>(c);
-          leaf->task()->AddActiveWorker(i);
+          leaf->task()->AddActiveWorker(wid);
         }
       }
     }

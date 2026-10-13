@@ -124,8 +124,8 @@ static inline int SendBatch(
 void PortOut::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   Port *p = port_;
 
-  CHECK(worker_queues_[ctx->wid] >= 0);
-  queue_t qid = worker_queues_[ctx->wid];
+  CHECK(worker_queues_[ctx->wid.value()] >= 0);
+  queue_t qid = worker_queues_[ctx->wid.value()];
   int sent_pkts = 0;
 
   if (queue_users_[qid] == 1) {

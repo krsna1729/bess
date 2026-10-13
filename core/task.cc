@@ -65,7 +65,7 @@ struct task_result Task::operator()(Context *ctx) const {
 }
 
 // Add a worker to the set of workers that call this task.
-void Task::AddActiveWorker(int wid) const {
+void Task::AddActiveWorker(bess::dataplane::WorkerId wid) const {
   if (module_) {
     module_->AddActiveWorker(wid, c_->task());
   }

@@ -20,7 +20,7 @@
 #define CORE_ID_FILE "topology/core_id"
 
 int is_cpu_present(unsigned int core_id) {
-  const auto core = bess::runtime::CpuIdFrom(core_id);
+  const auto core = bess::dataplane::CpuIdFrom(core_id);
   return core.has_value() && bess::runtime::CpuPresent(*core);
 }
 
@@ -138,7 +138,7 @@ int PlaceControlThreads(std::span<const WorkerPlacement> workers) {
   std::vector<int> cores;
   std::vector<pid_t> worker_tids;
   for (const WorkerPlacement &w : workers) {
-    cores.push_back(w.core);
+    cores.push_back(static_cast<int>(w.core.value()));
     worker_tids.push_back(w.tid);
   }
   // The reserved control CPUs when there are any (D-123); else the rest of

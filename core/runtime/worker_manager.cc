@@ -50,10 +50,11 @@ void *run_worker(void *_arg) {
   if (memcmp(&current_worker, &kZeroWorker, sizeof(Worker)) != 0) {
     const auto *arg = static_cast<const WorkerThreadArg *>(_arg);
     LOG(ERROR) << "current_worker was not pristine at the start of worker "
-               << arg->wid << " (core " << arg->core.value()
-               << ") -- resetting. Stale values: wid=" << current_worker.wid()
-               << " core=" << current_worker.core()
-               << " socket=" << current_worker.socket()
+               << arg->wid.value() << " (core " << arg->core.value()
+               << ") -- resetting. Stale values: wid="
+               << current_worker.wid().value()
+               << " core=" << current_worker.core().value()
+               << " socket=" << current_worker.socket().value()
                << " fd_event=" << current_worker.fd_event();
     memset(&current_worker, 0, sizeof(Worker));
   }
@@ -62,13 +63,16 @@ void *run_worker(void *_arg) {
 
 }  // namespace
 
-bool WorkerManager::IsRunning(int wid) const {
-  Worker *worker = IsActive(wid) ? workers_[wid].load() : nullptr;
+bool WorkerManager::IsRunning(WorkerId wid) const {
+  // status() is not const: the slot's pointer, not Get()'s const one.
+  Worker *worker = wid.value() < Worker::kMaxWorkers
+                       ? workers_[wid.value()].load()
+                       : nullptr;
   return worker != nullptr && worker->status() == WORKER_RUNNING;
 }
 
 bool WorkerManager::AnyRunning() const {
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+  for (WorkerId wid : dataplane::AllWorkerIds()) {
     if (IsRunning(wid)) {
       return true;
     }
@@ -77,9 +81,9 @@ bool WorkerManager::AnyRunning() const {
   return false;
 }
 
-bool WorkerManager::IsCoreUsed(int core) const {
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    Worker *worker = workers_[wid].load();
+bool WorkerManager::IsCoreUsed(CpuId core) const {
+  for (const auto &slot : workers_) {
+    const Worker *worker = slot.load();
     if (worker && worker->core() == core) {
       return true;
     }
@@ -88,26 +92,27 @@ bool WorkerManager::IsCoreUsed(int core) const {
   return false;
 }
 
-std::vector<int> WorkerManager::Cores(int except) const {
+std::vector<int> WorkerManager::Cores(std::optional<WorkerId> except) const {
   std::vector<int> cores;
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    const Worker *worker = workers_[wid].load();
+  for (WorkerId wid : dataplane::AllWorkerIds()) {
+    const Worker *worker = Get(wid);
     if (worker != nullptr && wid != except) {
-      cores.push_back(worker->core());
+      cores.push_back(static_cast<int>(worker->core().value()));
     }
   }
   return cores;
 }
 
-WorkerCpuReport WorkerManager::CpuReport(int wid) const {
+WorkerCpuReport WorkerManager::CpuReport(WorkerId wid) const {
   const Worker *worker = Get(wid);
   if (worker == nullptr) {
     return {};
   }
-  return ProcessPlacement().DescribeWorkerCpu(worker->core(), Cores(wid));
+  return ProcessPlacement().DescribeWorkerCpu(
+      static_cast<int>(worker->core().value()), Cores(wid));
 }
 
-void WorkerManager::Pause(int wid) {
+void WorkerManager::Pause(WorkerId wid) {
   Worker *worker = Get(wid);
   if (worker && worker->status() == WORKER_RUNNING) {
     // Release store, acquire loads of the same atomic: the worker's
@@ -121,12 +126,12 @@ void WorkerManager::Pause(int wid) {
 }
 
 void WorkerManager::PauseAll() {
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+  for (WorkerId wid : dataplane::AllWorkerIds()) {
     Pause(wid);
   }
 }
 
-void WorkerManager::Resume(int wid) {
+void WorkerManager::Resume(WorkerId wid) {
   Worker *worker = Get(wid);
   if (worker && worker->status() == WORKER_PAUSED) {
     worker_signal sig = worker_signal::unblock;
@@ -141,19 +146,14 @@ void WorkerManager::Resume(int wid) {
 }
 
 void WorkerManager::ResumeAll() {
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    Worker *worker = workers_[wid].load();
-    if (worker) {
-      worker->scheduler()->AdjustDefault();
-    }
-  }
+  AdjustSchedulerDefaults();
 
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+  for (WorkerId wid : dataplane::AllWorkerIds()) {
     Resume(wid);
   }
 }
 
-void WorkerManager::Destroy(int wid) {
+void WorkerManager::Destroy(WorkerId wid) {
   Pause(wid);
 
   Worker *worker = Get(wid);
@@ -172,10 +172,10 @@ void WorkerManager::Destroy(int wid) {
     // before returning. Worker::Run()'s teardown (`delete scheduler_`)
     // recursively destroys the TC tree, and the registry bookkeeping that
     // goes with it must not run concurrently with control-plane mutation.
-    threads_[wid].join();
+    threads_[wid.value()].join();
 
-    workers_[wid].store(nullptr);
-    scheduler_names_[wid].clear();
+    workers_[wid.value()].store(nullptr);
+    scheduler_names_[wid.value()].clear();
 
     num_workers_--;
     PlaceThreads();  // its CPU is free for control threads again
@@ -196,20 +196,21 @@ void WorkerManager::Destroy(int wid) {
 }
 
 void WorkerManager::DestroyAll() {
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+  for (WorkerId wid : dataplane::AllWorkerIds()) {
     Destroy(wid);
   }
 }
 
 void WorkerManager::DetachAllThreads() {
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    if (threads_[wid].joinable()) {
-      threads_[wid].detach();
+  for (std::thread &thread : threads_) {
+    if (thread.joinable()) {
+      thread.detach();
     }
   }
 }
 
-void WorkerManager::Launch(int wid, CpuId core, const std::string &scheduler) {
+void WorkerManager::Launch(WorkerId wid, CpuId core,
+                           const std::string &scheduler) {
   WorkerThreadArg arg = {.wid = wid, .core = core, .scheduler = nullptr};
   if (scheduler == "") {
     arg.scheduler = new DefaultScheduler();
@@ -226,31 +227,32 @@ void WorkerManager::Launch(int wid, CpuId core, const std::string &scheduler) {
   // point -- but if that invariant is ever violated by a future change,
   // better to CHECK loudly here than to let the assignment below abort the
   // daemon with a bare "terminate called" and no context.
-  CHECK(!threads_[wid].joinable())
-      << "worker thread " << wid << " is still joinable; "
+  std::thread &thread = threads_[wid.value()];
+  CHECK(!thread.joinable())
+      << "worker thread " << wid.value() << " is still joinable; "
       << "Destroy() must join it before this wid can be reused.";
-  threads_[wid] = std::thread(run_worker, &arg);
-  scheduler_names_[wid] = scheduler;
+  thread = std::thread(run_worker, &arg);
+  scheduler_names_[wid.value()] = scheduler;
 
   /* spin until it becomes ready and fully paused */
-  Worker *worker = workers_[wid].load();
+  Worker *worker = Get(wid);
   while (worker == nullptr || worker->status() != WORKER_PAUSED) {
     arch::CpuRelax();
-    worker = workers_[wid].load();
+    worker = Get(wid);
   }
 
   num_workers_++;
   PlaceThreads();
 
   for (const std::string &warning : CpuReport(wid).warnings) {
-    LOG(WARNING) << "worker " << wid << ": " << warning;
+    LOG(WARNING) << "worker " << wid.value() << ": " << warning;
   }
 }
 
 void WorkerManager::PlaceThreads() {
   std::vector<WorkerPlacement> placed;
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    if (const Worker *worker = workers_[wid].load()) {
+  for (const auto &slot : workers_) {
+    if (const Worker *worker = slot.load()) {
       placed.push_back({worker->tid(), worker->core()});
     }
   }
@@ -258,24 +260,24 @@ void WorkerManager::PlaceThreads() {
 }
 
 Worker *WorkerManager::NextActive() {
-  static int prev_wid = 0;
+  static uint16_t prev_wid = 0;
   if (num_workers_ == 0) {
-    Launch(0, DefaultWorkerCore(), "");
-    return Get(0);
+    Launch(WorkerId(0), DefaultWorkerCore(), "");
+    return Get(WorkerId(0));
   }
 
-  while (!IsActive(prev_wid)) {
+  while (!IsActive(WorkerId(prev_wid))) {
     prev_wid = (prev_wid + 1) % Worker::kMaxWorkers;
   }
 
-  Worker *ret = workers_[prev_wid].load();
+  Worker *ret = Get(WorkerId(prev_wid));
   prev_wid = (prev_wid + 1) % Worker::kMaxWorkers;
   return ret;
 }
 
 void WorkerManager::AdjustSchedulerDefaults() {
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    Worker *worker = workers_[wid].load();
+  for (const auto &slot : workers_) {
+    Worker *worker = slot.load();
     if (worker) {
       worker->scheduler()->AdjustDefault();
     }
@@ -293,8 +295,7 @@ void WorkerManager::AttachOrphans() {
 
     Worker *w;
 
-    int wid = tc.first;
-    Worker *named = (wid == Worker::kAnyWorker) ? nullptr : workers_[wid].load();
+    Worker *named = tc.first ? Get(*tc.first) : nullptr;
     if (named == nullptr) {
       w = NextActive();
     } else {
@@ -307,7 +308,7 @@ void WorkerManager::AttachOrphans() {
   orphan_tcs_.clear();
 }
 
-void WorkerManager::AddOrphan(TrafficClass *c, int wid) {
+void WorkerManager::AddOrphan(TrafficClass *c, std::optional<WorkerId> wid) {
   orphan_tcs_.emplace_back(wid, c);
 }
 
@@ -331,8 +332,8 @@ bool WorkerManager::DetachTc(TrafficClass *c) {
   }
 
   // Try to remove from root of one of the schedulers
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    Worker *worker = workers_[wid].load();
+  for (const auto &slot : workers_) {
+    Worker *worker = slot.load();
     if (worker) {
       bool found = worker->scheduler()->RemoveRoot(c);
       if (found) {

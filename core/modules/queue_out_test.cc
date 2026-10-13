@@ -237,7 +237,7 @@ TEST_F(QueueOutChecksumTest, PortOutNoProfilePreservesPacketBytesAndMetadata) {
   batch.clear();
   batch.add(packet);
   Context context{};
-  context.wid = 0;
+  context.wid = bess::dataplane::WorkerId(0);
   output.ProcessBatch(&context, &batch);
   output.DeInit();
 

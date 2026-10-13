@@ -192,7 +192,7 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
     // placement finding; only a CPU outside the set is refused (D-123).
     if (worker.core.has_value()) {
       const int core = *worker.core;
-      const std::optional<runtime::CpuId> cpu = runtime::CpuIdFrom(core);
+      const std::optional<dataplane::CpuId> cpu = dataplane::CpuIdFrom(core);
       if (!cpu || !runtime::CpuPresent(*cpu)) {
         return std::unexpected(Invalid(
             "worker", "core",

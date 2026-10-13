@@ -38,11 +38,11 @@ class EventThrottle {
         interval_ns_(interval_ns) {}
 
   // Worker `wid` met the condition `count` times at `now_ns`.
-  void Note(int wid, uint64_t now_ns, uint64_t count = 1) noexcept {
-    if (hub_ == nullptr || wid < 0 || wid >= EventHub::kMaxWorkers) {
+  void Note(dataplane::WorkerId wid, uint64_t now_ns, uint64_t count = 1) noexcept {
+    if (hub_ == nullptr || wid.value() >= EventHub::kMaxWorkers) {
       return;
     }
-    Slot &s = slots_[static_cast<size_t>(wid)];
+    Slot &s = slots_[wid.value()];
     s.pending += count;
     if (s.posted && now_ns - s.last_ns < interval_ns_) {
       return;

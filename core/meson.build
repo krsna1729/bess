@@ -581,6 +581,7 @@ core_public_subdir_headers = {
     'dataplane/batch_stages.h',
     'dataplane/batch_tuning.h',
     'dataplane/continuation.h',
+    'dataplane/cpu_id.h',
     'dataplane/expiry_wheel.h',
     'dataplane/generation_handle.h',
     'dataplane/handoff.h',

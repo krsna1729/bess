@@ -45,7 +45,7 @@ static bool ValidateCoreID(const char *, int32_t value) {
   if (value == -1) {
     return true;  // automatic: bess::runtime::DefaultWorkerCore()
   }
-  const auto core = bess::runtime::CpuIdFrom(value);
+  const auto core = bess::dataplane::CpuIdFrom(value);
   if (!core || !bess::runtime::CpuPresent(*core)) {
     LOG(ERROR) << "Invalid core ID: " << value;
     return false;
@@ -97,7 +97,7 @@ static bool ValidateControlCpus(const char *, const std::string &value) {
     return false;
   }
   for (int cpu : *cpus) {
-    const auto core = bess::runtime::CpuIdFrom(cpu);
+    const auto core = bess::dataplane::CpuIdFrom(cpu);
     if (!core || !bess::runtime::CpuAllowed(*core)) {
       LOG(ERROR) << "--control_cpus=" << value << ": core " << cpu
                  << " is not in bessd's CPU set ("

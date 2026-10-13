@@ -6,14 +6,11 @@
 #include <sched.h>
 #include <sys/types.h>
 
-#include <concepts>
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <string>
-#include <utility>
 
-#include "dataplane/strong_id.h"
+#include "dataplane/cpu_id.h"
 
 // Whether the kernel exposes CPU `core_id` (topology present). Declared for
 // the whole program in worker.h as well; defined here, in the EAL layer, so
@@ -21,6 +18,8 @@
 int is_cpu_present(unsigned int core_id);
 
 namespace bess::runtime {
+
+using dataplane::CpuId;
 
 // Keeps the daemon's own threads -- main, gRPC, DPDK's service threads --
 // off the CPUs packet workers are pinned to (Decision D-027). Unpinned, the
@@ -35,22 +34,6 @@ namespace bess::runtime {
 // changes. Everything bessd places -- workers, DPDK's lcores, control
 // threads -- stays inside it.
 const cpu_set_t &ProcessCpus();
-
-// A Linux CPU number that fits a cpu_set_t: [0, CPU_SETSIZE). Not a
-// WorkerId and not a DPDK lcore id (worker.h explains the three). Made from
-// untrusted input by CpuIdFrom, which refuses an out-of-range value instead
-// of truncating it: a request's 64-bit core 2^32 + 3 must be refused, not
-// pinned to CPU 3.
-struct CpuIdTag;
-using CpuId = dataplane::StrongId<CpuIdTag, uint32_t>;
-
-template <std::integral T>
-constexpr std::optional<CpuId> CpuIdFrom(T value) {
-  if (std::cmp_less(value, 0) || std::cmp_greater_equal(value, CPU_SETSIZE)) {
-    return std::nullopt;
-  }
-  return CpuId(static_cast<uint32_t>(value));
-}
 
 // Whether the kernel exposes CPU `core` (topology present).
 bool CpuPresent(CpuId core);
@@ -69,7 +52,7 @@ cpu_set_t ReservedControlCpus();
 
 struct WorkerPlacement {
   pid_t tid;
-  int core;
+  CpuId core;
 };
 
 // The CPUs non-worker threads may use: `base` minus the workers' cores, or

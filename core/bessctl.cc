@@ -321,14 +321,14 @@ class BESSControlImpl final : public BESSControl::Service {
                      ListWorkersResponse* response) override {
     auto lock = control_plane_.AcquireLock();
 
-    for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
+    for (const bess::dataplane::WorkerId wid : bess::dataplane::AllWorkerIds()) {
       if (!is_worker_active(wid))
         continue;
       ListWorkersResponse_WorkerStatus* status = response->add_workers_status();
-      status->set_wid(wid);
+      status->set_wid(wid.value());
       status->set_running(is_worker_running(wid));
       Worker* worker = bess::runtime::runtime().workers().Get(wid);
-      status->set_core(worker->core());
+      status->set_core(worker->core().value());
       status->set_num_tcs(worker->scheduler()->NumTcs());
       status->set_silent_drops(worker->silent_drops());
       const bess::runtime::WorkerCpuReport placement =
@@ -383,7 +383,7 @@ class BESSControlImpl final : public BESSControl::Service {
 
     for (const auto& tc_pair : TrafficClassBuilder::all_tcs()) {
       bess::TrafficClass* c = tc_pair.second.get();
-      int wid = c->WorkerId();
+      const int wid = WidOrAny(c->OwnerWorker());
       if (wid_filter == Worker::kAnyWorker || wid_filter == wid) {
         // WRR and Priority TCs associate share/priority to each child
         if (c->policy() == bess::POLICY_WEIGHTED_FAIR) {

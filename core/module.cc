@@ -157,7 +157,7 @@ task_id_t Module::RegisterTask(void *arg) {
       bess::TrafficClassBuilder::CreateTrafficClass<bess::LeafTrafficClass>(
           leafname, t);
 
-  add_tc_to_orphan(c, -1);
+  add_tc_to_orphan(c, std::nullopt);
   tasks_.push_back(t);
   return tasks_.size() - 1;
 }
@@ -197,10 +197,10 @@ placement_constraint Task::GetSocketConstraints() const {
   }
 }
 
-void Module::AddActiveWorker(int wid, const Task *t) {
+void Module::AddActiveWorker(bess::dataplane::WorkerId wid, const Task *t) {
   if (!HaveVisitedWorker(t)) {  // Have not already accounted for
                                 // worker.
-    active_workers_[wid] = true;
+    active_workers_[wid.value()] = true;
     visited_tasks_.push_back(t);
     // Check if we should propagate downstream. We propagate if either
     // `propagate_workers_` is true or if the current module created the task.
@@ -245,12 +245,12 @@ CheckConstraintResult Module::CheckModuleConstraints() const {
   if (node_constraints_ == UNCONSTRAINED_SOCKET) {
     return valid;
   }
-  for (int wid = 0; wid < Worker::kMaxWorkers; wid++) {
-    if (active_workers_[wid]) {
+  for (bess::dataplane::WorkerId wid : bess::dataplane::AllWorkerIds()) {
+    if (active_workers_[wid.value()]) {
       placement_constraint socket =
-          1ull << bess::runtime::runtime().workers().Get(wid)->socket();
+          1ull << bess::runtime::runtime().workers().Get(wid)->socket().value();
       if ((socket & node_constraints_) == 0) {
-        LOG(ERROR) << "Worker wid " << wid
+        LOG(ERROR) << "Worker wid " << wid.value()
                    << " does not meet placement constraints for module "
                    << name_;
         valid = CHECK_NONFATAL_ERROR;
@@ -412,9 +412,9 @@ void Module::DestroyAllTasks() {
   for (auto task : tasks_) {
     auto c = task->GetTC();
 
-    int wid = c->WorkerId();
-    if (wid >= 0) {
-      bess::Scheduler *s = bess::runtime::runtime().workers().Get(wid)->scheduler();
+    if (const auto wid = c->OwnerWorker()) {
+      bess::Scheduler *s =
+          bess::runtime::runtime().workers().Get(*wid)->scheduler();
       s->wakeup_queue().Remove(c);
     }
 

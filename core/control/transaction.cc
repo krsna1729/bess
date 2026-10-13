@@ -219,7 +219,8 @@ ControlResult<void> CheckReversibility(const PipelinePlan &plan) {
     }
 
     if (const auto *remove = std::get_if<RemoveWorkerOp>(&op)) {
-      const Worker *worker = state.workers().Get(remove->wid);
+      const auto wid = dataplane::WorkerIdFrom(remove->wid);
+      const Worker *worker = wid ? state.workers().Get(*wid) : nullptr;
       if (worker == nullptr) {
         continue;  // already gone
       }

@@ -17,6 +17,7 @@
 namespace bess::stats {
 namespace {
 
+using dataplane::WorkerId;
 using std::chrono::milliseconds;
 
 TEST(EventHubTest, WorkerEventsBecomeTypedEventsInOrderAndLossIsCounted) {
@@ -29,14 +30,14 @@ TEST(EventHubTest, WorkerEventsBecomeTypedEventsInOrderAndLossIsCounted) {
     e.source = 7;
     e.values[0] = i;
     e.values[1] = 100;
-    EXPECT_EQ(i < 4, hub.Post(1, e)) << i;  // a ring of 4: the last two refused
+    EXPECT_EQ(i < 4, hub.Post(WorkerId(1), e)) << i;  // a ring of 4: the last two refused
   }
   EXPECT_EQ(2u, hub.lost());
   EXPECT_EQ(4u, hub.DrainWorkers());
   WorkerEvent after;
   after.type = t;
   after.values[0] = 99;
-  ASSERT_TRUE(hub.Post(1, after));
+  ASSERT_TRUE(hub.Post(WorkerId(1), after));
   EXPECT_EQ(1u, hub.DrainWorkers());
   const auto got = hub.Read(1, 100, milliseconds(0));
   ASSERT_EQ(6u, got.events.size()) << "4 + a loss marker + 1";
@@ -59,12 +60,12 @@ TEST(EventHubTest, WorkerEventsBecomeTypedEventsInOrderAndLossIsCounted) {
 TEST(EventThrottleTest, OneEventPerIntervalPerWorkerCarryingTheCount) {
   EventHub hub(1024, 2);
   EventThrottle full(hub, "bess.table_full", "nat0", 1000);
-  full.Note(0, 10, 3);    // posted: 3
-  full.Note(0, 500, 2);   // counted
-  full.Note(1, 600, 1);   // another worker: posted: 1
-  full.Note(0, 1009, 4);  // inside the interval still: counted
-  full.Note(0, 1010, 1);  // posted: 2 + 4 + 1
-  full.Note(0, 1011, 5);  // counted
+  full.Note(WorkerId(0), 10, 3);    // posted: 3
+  full.Note(WorkerId(0), 500, 2);   // counted
+  full.Note(WorkerId(1), 600, 1);   // another worker: posted: 1
+  full.Note(WorkerId(0), 1009, 4);  // inside the interval still: counted
+  full.Note(WorkerId(0), 1010, 1);  // posted: 2 + 4 + 1
+  full.Note(WorkerId(0), 1011, 5);  // counted
   ASSERT_EQ(3u, hub.DrainWorkers());
   const auto got = hub.Read(1, 100, milliseconds(0));
   ASSERT_EQ(3u, got.events.size());
@@ -78,10 +79,10 @@ TEST(EventThrottleTest, OneEventPerIntervalPerWorkerCarryingTheCount) {
   // counted as lost (nothing was).
   EventThrottle other(hub, "bess.queue_full", "q0", 0);
   const uint64_t lost = hub.lost();
-  for (uint64_t now = 1; now <= 3; now++) other.Note(2, now, 10);
+  for (uint64_t now = 1; now <= 3; now++) other.Note(WorkerId(2), now, 10);
   EXPECT_EQ(lost, hub.lost());
   ASSERT_EQ(2u, hub.DrainWorkers());
-  other.Note(2, 4, 1);
+  other.Note(WorkerId(2), 4, 1);
   ASSERT_EQ(1u, hub.DrainWorkers());
   const auto later = hub.Read(4, 100, milliseconds(0));
   ASSERT_FALSE(later.events.empty());
@@ -139,7 +140,7 @@ TEST(EventHubTest, ConcurrentPostersAndDrainLoseNothingUncounted) {
         WorkerEvent e;
         e.type = t;
         e.values[0] = static_cast<uint64_t>(i);
-        if (hub.Post(w, e)) accepted++;
+        if (hub.Post(*dataplane::WorkerIdFrom(w), e)) accepted++;
       }
       done++;
     });

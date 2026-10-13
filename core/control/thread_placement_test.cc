@@ -36,9 +36,10 @@ namespace {
 
 using bess::runtime::ControlCpus;
 using bess::runtime::CpuAllowed;
-using bess::runtime::CpuId;
+using bess::dataplane::CpuId;
 using bess::runtime::CpuList;
 using bess::runtime::ProcessCpus;
+using bess::dataplane::WorkerId;
 
 cpu_set_t Set(std::initializer_list<int> cpus) {
   cpu_set_t set;
@@ -140,7 +141,7 @@ TEST(ThreadPlacementTest, ControlThreadsLeaveWorkerCpus) {
   ASSERT_GE(core, 0);
   const cpu_set_t reserved = bess::runtime::ReservedControlCpus();
   const cpu_set_t control = CPU_COUNT(&reserved) > 0 ? reserved : process;
-  launch_worker(0, core);
+  launch_worker(WorkerId(0), *bess::dataplane::CpuIdFrom(core));
   const cpu_set_t main_now = ThisThread();
   cpu_set_t later;
   std::thread([&] { later = ThisThread(); }).join();
@@ -152,7 +153,7 @@ TEST(ThreadPlacementTest, ControlThreadsLeaveWorkerCpus) {
   } else {
     EXPECT_TRUE(CPU_EQUAL(&main_now, &process));  // nowhere else to go
   }
-  destroy_worker(0);
+  destroy_worker(WorkerId(0));
   const cpu_set_t after = ThisThread();
   EXPECT_TRUE(CPU_EQUAL(&after, &control)) << CpuList(after);
 }
@@ -179,7 +180,7 @@ TEST(ThreadPlacementTest, WorkersOutsideTheSetAreRefused) {
             std::string::npos)
       << added.error().message;
   EXPECT_EQ(added.error().err, EINVAL);
-  EXPECT_FALSE(is_worker_active(0));
+  EXPECT_FALSE(is_worker_active(WorkerId(0)));
 }
 
 // A core id is not truncated on its way to the checks: 2^32 + an allowed CPU
@@ -193,7 +194,7 @@ TEST(ThreadPlacementTest, CoreIdsBeyond32BitsAreRefused) {
       1, (uint64_t{1} << 32) + allowed.value(), "");
   ASSERT_FALSE(added) << "core 2^32 + " << allowed.value() << " was accepted";
   EXPECT_EQ(added.error().err, EINVAL);
-  EXPECT_FALSE(is_worker_active(1));
+  EXPECT_FALSE(is_worker_active(WorkerId(1)));
 }
 
 // -- automatic workers (D-123) ------------------------------------------------
@@ -215,8 +216,9 @@ class AutomaticWorkerTest : public ::testing::Test {
     return bess::runtime::ProcessPlacement();
   }
   static int CoreOf(int wid) {
-    const Worker *worker = bess::runtime::runtime().workers().Get(wid);
-    return worker != nullptr ? worker->core() : -1;
+    const Worker *worker =
+        bess::runtime::runtime().workers().Get(*bess::dataplane::WorkerIdFrom(wid));
+    return worker != nullptr ? static_cast<int>(worker->core().value()) : -1;
   }
   static std::string Warnings(const bess::runtime::WorkerCpuReport &report) {
     std::string all;
@@ -288,7 +290,7 @@ TEST_F(AutomaticWorkerTest, AnAutomaticWorkerWithNoFreeCpuIsRefusedWithEnospc) {
   EXPECT_EQ(ENOSPC, added.error().err);
   EXPECT_NE(std::string::npos, added.error().message.find("no free CPU"))
       << added.error().message;
-  EXPECT_FALSE(is_worker_active(wid));
+  EXPECT_FALSE(is_worker_active(*bess::dataplane::WorkerIdFrom(wid)));
 }
 
 // An explicit core is honoured even on an automatic worker's CPU: both run
@@ -304,7 +306,7 @@ TEST_F(AutomaticWorkerTest, AnExplicitCoreOnAnAutomaticWorkersCpuIsHonouredBesid
   EXPECT_EQ(cpu, CoreOf(1));
   EXPECT_EQ(cpu, CoreOf(0)) << "the automatic worker moved";
   const bess::runtime::WorkerCpuReport report =
-      bess::runtime::runtime().workers().CpuReport(1);
+      bess::runtime::runtime().workers().CpuReport(WorkerId(1));
   EXPECT_NE(std::string::npos, Warnings(report).find("already runs another worker"))
       << Warnings(report);
 }
@@ -333,7 +335,7 @@ TEST_F(AutomaticWorkerTest, AnExplicitCoreOnTheControlCpuIsHonouredWithAWarning)
   ASSERT_TRUE(added) << added.error().message;
   EXPECT_EQ(control, CoreOf(0));
   const bess::runtime::WorkerCpuReport report =
-      bess::runtime::runtime().workers().CpuReport(0);
+      bess::runtime::runtime().workers().CpuReport(WorkerId(0));
   EXPECT_TRUE(report.on_control_cpu);
   EXPECT_NE(std::string::npos, Warnings(report).find("control CPU")) << Warnings(report);
 }
