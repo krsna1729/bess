@@ -20,6 +20,7 @@ DECLARE_string(b);
 DECLARE_int32(p);
 DECLARE_string(grpc_url);
 DECLARE_string(http_addr);
+DECLARE_string(http_allowed_hosts);
 DECLARE_int32(m);
 DECLARE_int32(maintenance_interval_us);
 DECLARE_string(pci_allow);

@@ -9103,6 +9103,7 @@ per-daemon effect independent of the tune, same instruction count) is noted, not
 **Code.** `meson_options.txt` (`tune`), `meson.build`, `core/modules/generic_encap.cc`,
 `tools/tidy_baseline.json`, `README.md`, `docs/benchmarking.md` (build note, tuning matrix),
 `docs/plugin-api.md`, `docs/baselines/d127-tune-{gcc,gcc-floor,clang}.json`.
+
 ## D-125 HTTP inside bessd: protobuf-JSON, server-sent events, `/metrics`, a static page
 
 **Status:** accepted.
@@ -9137,6 +9138,17 @@ process between the scraper and bessd that D-104 removes with the rest of Python
   INVALID_ARGUMENT, FAILED_PRECONDITION and OUT_OF_RANGE; 404; 409 for ALREADY_EXISTS and ABORTED; 501; 503 ...)
   with `{"code", "status", "message", "detail"}`, `detail` the `bess-error-bin` trailer's `ErrorDetail` as JSON;
   a body that is not the request's JSON is 400; an unknown path or method 404, a wrong verb 405 with `Allow`.
+- **Browsers (review, P1).** Loopback alone does not keep a web page out: a page the operator opens can make the
+  browser send requests to `127.0.0.1`, and one that rebinds its own DNS name to `127.0.0.1` makes them
+  same-origin, so it reads `daemonEpoch` from `GetPipeline` and then applies pipelines. Before any call, bessd
+  refuses (403) a request whose `Host` is not `localhost`, an IP address, the host `--http_addr` named or a name
+  in `--http_allowed_hosts` (comma-separated, any case, any port); a page that rebinds still sends its own DNS
+  name, while an IP address in the URL makes the page's origin that address, so no rebinding produces one. A
+  scraper reaching a pod by its IP therefore needs no flag; one using a Service name lists it. Also refused: no
+  `Host` (400), an `Origin` whose host and port are not the `Host`'s, `Sec-Fetch-Site: cross-site` (403), and a
+  POST that is not `Content-Type: application/json` (415): forms and cross-origin "simple" requests cannot send
+  that type without a CORS preflight, and bessd never sends an `Access-Control-Allow-*` header. The page at `/`
+  sends same-origin JSON and passes; `curl` needs `-H 'Content-Type: application/json'` on a POST.
 - **The exposition renderer** (`control/metrics_exposition.{h,cc}`) carries tools/bess_prometheus.py's output
   over: HELP and TYPE lines once per family before its samples, families in name order (sorted again, stably, so
   a family is one run whatever the source), `counter`/`gauge` from the sample's kind (`untyped` otherwise), label
@@ -9146,8 +9158,11 @@ process between the scraper and bessd that D-104 removes with the rest of Python
   tools/bess_prometheus.py is deleted.
 - **Threads and bounds.** An accept thread (woken by an eventfd to stop) and one thread per connection, none of
   them a worker; one request per connection (`Connection: close`). At most 64 connections (503 beyond), 64 KiB
-  and 64 headers, 64 MiB of body (`Content-Length` only; chunked bodies are refused with 411), 10 s to send a
-  request or take a reply. An event stream's connection has a watcher that cancels the call when the client
+  and 64 headers, 64 MiB of body (`Content-Length` only; chunked bodies are refused with 411). The whole request
+  must arrive within 10 s of the connection's accept (review, P3: a per-`recv` timeout let a client trickling a
+  byte every 9 s hold a thread for days, and 64 of them refuse every scrape): each read waits in `poll` for the
+  time left, then 408 and close. Each reply, and each event of a stream, must be taken within 10 s of its first
+  byte, the same way. An event stream's connection has a watcher that cancels the call when the client
   leaves or the server stops, so an idle stream does not hold its thread until the next event. On shutdown the
   event log closes first (as before), the gRPC server drains, then `HttpServer::Stop` ends the open connections
   and joins every thread before the dataplane is torn down.
@@ -9167,28 +9182,36 @@ Keep-alive and HTTP/2 were left out: a scraper, `curl` and the page make one req
   before samples, counter/gauge/untyped), escaping of label values and help, labels in key order, value
   spellings (integers, fractions, `1e+20`, NaN and both infinities, `0.1` round-tripping), the epoch printed
   exactly at 2^64-1.
-- `live_http` (tests/live/http_test.cc, 7 tests, a bessd started with `--http_addr`): `/metrics` parses as the
+- `live_http` (tests/live/http_test.cc, 9 tests, a bessd started with `--http_addr`): `/metrics` parses as the
   exposition format with HELP right before TYPE, each family typed once, in name order, every sample after its
   own family's TYPE and of the kind ListMetrics declares, `bess_daemon_epoch` last and equal to the JSON API's
   epoch (the check that covered bess_prometheus.py, D-076); `ApplyPipeline` without `daemonEpoch` is 400 with
   `ErrorDetail.field = daemon_epoch`, with it 200, and the gRPC client sees the module; the first server-sent
   event is `bess.start` under the daemon's epoch with its id; 404 for a path, an unknown method and
   `WatchEvents` (streamed at `/v2/events`), 405 with `Allow: POST`, 400 for bad JSON, an unknown field and an
-  unknown query parameter; the page. Without the flag, the shared daemon's only listening TCP port (its sockets
-  in `/proc/PID/net/tcp{,6}`) is the gRPC port; `--http_addr=:8080` and `=8080` stop bessd with
-  "expected HOST:PORT".
-- Fast suite (GCC, `-Werror`): 183 tests pass (`live_conformance` with Go 1.27.1 through mise); the new and
+  unknown query parameter; the page. Browsers: a POST under `Host: evil.example` (rebinding) is 403
+  PERMISSION_DENIED, as are `127.0.0.1.evil.example`, an `Origin` of another host, port or `null`, and
+  `Sec-Fetch-Site: cross-site`; no `Host` is 400; `localhost`, `127.0.0.2`, `[::1]`, `10.1.2.3` and both
+  `--http_allowed_hosts` names (any case, any port) are served, and so is a same-origin JSON POST with `Origin`
+  and `Sec-Fetch-Site: same-origin`; `text/plain`, form-encoded and untyped POSTs are 415,
+  `Application/JSON; charset=utf-8` is not; no `Access-Control-Allow` header. A request line followed by a
+  header byte every 500 ms gets 408 after 9-13 s and the next request is served. Without the flag, the shared
+  daemon's only listening TCP port (its sockets in `/proc/PID/net/tcp{,6}`) is the gRPC port;
+  `--http_addr=:8080` and `=8080` stop bessd with "expected HOST:PORT".
+- Fast suite (GCC, `-Werror`, on develop with D-123 and D-127): 184 tests pass (`live_conformance` with Go 1.27.1 through mise); the new and
   changed sources compile warning-free with Clang 22; clang-tidy finds nothing in the new sources and the
   touched ones match tools/tidy_baseline.json; layers (`check_includes`, `check_arch`, `check_limits`) and
-  `check_link_graph` (21 libraries, 63 edges) pass.
+  `check_link_graph` (21 libraries, 65 edges) pass.
 - A curl session against a real bessd (`--http_addr=127.0.0.1:18080`): the exposition text with the 0.0.4
   content type, the epoch refusal and an accepted `ApplyPipeline`, the 400 and 404 bodies, the `bess.start`
   event, the page (200, `text/html`); `ss` shows the HTTP socket on 127.0.0.1 only; SIGTERM then ends bessd
-  cleanly (exit 0, "gracefully shut down").
+  cleanly (exit 0, "gracefully shut down"). After the review fixes: a POST under `Host: evil.example:18080`, one
+  with `Origin: http://evil.example`, one with `Sec-Fetch-Site: cross-site` (403 each) and a `text/plain` one
+  (415) are refused, a same-origin JSON POST is served, and a request trickled by `nc` gets `408 Request Timeout`.
 
 **Code.** `core/control/http_server.{h,cc}`, `core/control/http_ui.h`, `core/control/metrics_exposition.{h,cc}`,
 `core/control/metrics_exposition_test.cc`, `core/bessctl.{h,cc}` (`ApiServer::ServeHttp`), `core/main.cc`,
-`core/runtime/opts.{h,cc}` (`--http_addr`), `core/meson.build`, `tests/live/http_test.cc`,
+`core/runtime/opts.{h,cc}` (`--http_addr`, `--http_allowed_hosts`), `core/meson.build`, `tests/live/http_test.cc`,
 `tests/live/live_daemon.{h,cc}` (`Daemon::Launch`, `FreePort`), `tests/live/meson.build`; deleted
 `tools/bess_prometheus.py`; `docs/control-sdk.md`, `docs/limits.md`, `docs/running-in-containers.md`,
 `protobuf/control_v2.proto` and `core/stats/metric_registry.h` (comments), `MODERNIZATION.md` (G1.9).

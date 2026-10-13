@@ -37,7 +37,8 @@ td.n { text-align: right; font-family: monospace; }
 <script>
 "use strict";
 async function call(method, body) {
-  const r = await fetch("/v2/" + method, {method: "POST", body: JSON.stringify(body || {})});
+  const r = await fetch("/v2/" + method, {method: "POST", headers: {"Content-Type": "application/json"},
+                                          body: JSON.stringify(body || {})});
   const answer = await r.json();
   if (!r.ok) throw new Error(method + ": " + answer.message);
   return answer;

@@ -8823,8 +8823,10 @@ consumer-driven (D-008, §31.3 item 2).
   (`GET /v2/events`), Prometheus `GET /metrics` (replaces
   `tools/bess_prometheus.py`, deleted), and a compiled-in status page on
   that JSON API (`GET /`). Each request is a call on bessd's own gRPC server
-  over an in-process channel: one code path, one authorization point. Not on
-  HTTP: the Admin service, TLS, authentication.
+  over an in-process channel: one code path, one authorization point. Web
+  pages are kept out (DNS rebinding included) by Host, Origin,
+  Sec-Fetch-Site and JSON Content-Type checks. Not on HTTP: the Admin
+  service, TLS, authentication.
 
 The old imperative API should not constrain the ideal end state.
 

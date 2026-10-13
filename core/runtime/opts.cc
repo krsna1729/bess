@@ -140,6 +140,14 @@ DEFINE_string(http_addr, "",
               "127.0.0.1:PORT keeps it local; any other host serves the network "
               "without authentication");
 
+// Requests whose Host is none of these, localhost, an IP address or the
+// --http_addr host are refused: a web page that rebinds its DNS name to
+// bessd still sends its own name (D-125).
+DEFINE_string(http_allowed_hosts, "",
+              "Comma-separated DNS names (no port) HTTP requests may carry as "
+              "Host besides localhost, IP addresses and the --http_addr host, "
+              "e.g. the name a scraper uses for a non-loopback --http_addr");
+
 static bool ValidateMegabytesPerSocket(const char *, int32_t value) {
   if (value < -1) {
     LOG(ERROR) << "Invalid memory size: " << value;

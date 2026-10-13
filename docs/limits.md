@@ -32,7 +32,7 @@ Columns:
 | Default gRPC port | 10514 | `kDefaultPort` (`runtime/opts.cc`) | `--grpc_url` (or the deprecated `-p`) | — |
 | Default bind address | 127.0.0.1 | `kDefaultBindAddr` (`runtime/opts.cc`) | `-b` | — |
 | HTTP adapter (JSON API, events, `/metrics`, page; D-125) | off | `FLAGS_http_addr` (`runtime/opts.cc`) | `--http_addr HOST:PORT` (the host is required; only a loopback host keeps it local) | — |
-| HTTP request headers / body / concurrent connections | 64 KiB and 64 headers / 64 MiB / 64 | `kMaxHeaderBytes`, `kMaxHeaders`, `kMaxBodyBytes`, `kMaxConnections` (`control/http_server.cc`) | No | 431 (400 past 64 headers) / 413 / 503 |
+| HTTP request headers / body / concurrent connections / time to send a request | 64 KiB and 64 headers / 64 MiB / 64 / 10 s from accept | `kMaxHeaderBytes`, `kMaxHeaders`, `kMaxBodyBytes`, `kMaxConnections`, `kIoTimeout` (`control/http_server.cc`) | No | 431 (400 past 64 headers) / 413 / 503 / 408 |
 | Scheduler quiescent interval | 10 µs | `kDefaultQuiescentIntervalUs` (`scheduler.h`) | `BESS_QUIESCENT_INTERVAL_US` (µs, or `rounds`), read when a worker starts | — |
 | RCU retire high water | 4,096 pending retirements | `RcuDomain::kDefaultRetireHighWater` | No | the control thread reclaims, waiting for a grace period if needed; the packet path never waits |
 

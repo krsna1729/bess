@@ -18,6 +18,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cerrno>
 #include <charconv>
 #include <cstring>
@@ -45,8 +47,9 @@ constexpr size_t kMaxBodyBytes = 64 << 20;
 constexpr size_t kMaxHeaders = 64;
 // Each connection is a thread; past this many, 503 at once.
 constexpr size_t kMaxConnections = 64;
-// A request must arrive, and a reply be taken, within this.
-constexpr int kIoTimeoutSeconds = 10;
+// A request must arrive within this of its connection's accept, and each
+// reply (each event, on a stream) be taken within this of its first byte.
+constexpr std::chrono::seconds kIoTimeout{10};
 // How often an event stream checks whether its client left.
 constexpr int kWatchIntervalMs = 200;
 
@@ -85,6 +88,10 @@ struct Request {
   std::string method;
   std::string path;   // without the query
   std::string query;  // after '?', undecoded
+  std::optional<std::string> host;
+  std::optional<std::string> origin;
+  std::string fetch_site;  // Sec-Fetch-Site
+  std::string content_type;
   std::string last_event_id;
   std::string body;
 };
@@ -104,9 +111,11 @@ const char *Reason(int status) {
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 408: return "Request Timeout";
     case 409: return "Conflict";
     case 411: return "Length Required";
     case 413: return "Content Too Large";
+    case 415: return "Unsupported Media Type";
     case 429: return "Too Many Requests";
     case 431: return "Request Header Fields Too Large";
     case 499: return "Client Closed Request";
@@ -118,10 +127,36 @@ const char *Reason(int status) {
   }
 }
 
-bool SendAll(int fd, std::string_view data) {
+using Deadline = std::chrono::steady_clock::time_point;
+
+// Waits until `fd` is ready for `events`; false when `deadline` passes first.
+bool WaitFor(int fd, short events, Deadline deadline) {
+  for (;;) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (left.count() <= 0) {
+      return false;
+    }
+    pollfd p{fd, events, 0};
+    const int n = poll(&p, 1, static_cast<int>(left.count()));
+    if (n > 0) {
+      return true;
+    }
+    if (n < 0 && errno != EINTR) {
+      return false;
+    }
+  }
+}
+
+// All of `data` by `deadline`: a client that takes it a byte at a time
+// cannot hold the connection past it.
+bool SendAll(int fd, std::string_view data, Deadline deadline) {
   while (!data.empty()) {
-    const ssize_t n = send(fd, data.data(), data.size(), MSG_NOSIGNAL);
-    if (n < 0 && errno == EINTR) {
+    if (!WaitFor(fd, POLLOUT, deadline)) {
+      return false;
+    }
+    const ssize_t n = send(fd, data.data(), data.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+    if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
       continue;
     }
     if (n <= 0) {
@@ -141,8 +176,9 @@ void SendReply(int fd, const Reply &reply) {
     head += "Allow: " + reply.allow + "\r\n";
   }
   head += "\r\n";
-  if (SendAll(fd, head)) {
-    SendAll(fd, reply.body);
+  const Deadline deadline = std::chrono::steady_clock::now() + kIoTimeout;
+  if (SendAll(fd, head, deadline)) {
+    SendAll(fd, reply.body, deadline);
   }
 }
 
@@ -231,9 +267,27 @@ Reply StatusReply(const grpc::Status &status, const grpc::ClientContext &ctx) {
                     detail_json);
 }
 
-// Reads one request; nullopt (with `error` filled when there is something to
-// answer) when none arrived whole.
-std::optional<Request> ReadRequest(int fd, Reply *error) {
+// Up to `size` bytes by `deadline`: > 0 read, 0 when the client closed
+// (or failed), -1 when the deadline passed (`error` is then a 408).
+ssize_t RecvBy(int fd, char *buf, size_t size, Deadline deadline, Reply *error) {
+  for (;;) {
+    if (!WaitFor(fd, POLLIN, deadline)) {
+      *error = ErrorReply(408, grpc::StatusCode::DEADLINE_EXCEEDED,
+                          "the request did not arrive within " +
+                              std::to_string(kIoTimeout.count()) + " s");
+      return -1;
+    }
+    const ssize_t n = recv(fd, buf, size, MSG_DONTWAIT);
+    if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+      continue;
+    }
+    return n < 0 ? 0 : n;
+  }
+}
+
+// Reads one request, whole by `deadline`; nullopt (with `error` filled when
+// there is something to answer) when none arrived whole.
+std::optional<Request> ReadRequest(int fd, Deadline deadline, Reply *error) {
   std::string buf;
   size_t parsed_len = 0;
   const char *method = nullptr, *path = nullptr;
@@ -247,12 +301,9 @@ std::optional<Request> ReadRequest(int fd, Reply *error) {
       return std::nullopt;
     }
     char chunk[4096];
-    const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
-    if (n < 0 && errno == EINTR) {
-      continue;
-    }
+    const ssize_t n = RecvBy(fd, chunk, sizeof(chunk), deadline, error);
     if (n <= 0) {
-      return std::nullopt;  // closed or timed out: nothing to answer
+      return std::nullopt;  // closed: nothing to answer; timed out: 408
     }
     buf.append(chunk, static_cast<size_t>(n));
     num_headers = kMaxHeaders;
@@ -294,6 +345,14 @@ std::optional<Request> ReadRequest(int fd, Reply *error) {
       return std::nullopt;
     } else if (is("Last-Event-ID")) {
       req.last_event_id = value;
+    } else if (is("Host")) {
+      req.host = std::string(value);
+    } else if (is("Origin")) {
+      req.origin = std::string(value);
+    } else if (is("Sec-Fetch-Site")) {
+      req.fetch_site = value;
+    } else if (is("Content-Type")) {
+      req.content_type = value;
     }
   }
   const size_t length = content_length.value_or(0);
@@ -304,10 +363,8 @@ std::optional<Request> ReadRequest(int fd, Reply *error) {
   req.body = buf.substr(static_cast<size_t>(header_bytes));
   while (req.body.size() < length) {
     char chunk[16384];
-    const ssize_t n = recv(fd, chunk, std::min(sizeof(chunk), length - req.body.size()), 0);
-    if (n < 0 && errno == EINTR) {
-      continue;
-    }
+    const ssize_t n =
+        RecvBy(fd, chunk, std::min(sizeof(chunk), length - req.body.size()), deadline, error);
     if (n <= 0) {
       return std::nullopt;
     }
@@ -480,7 +537,8 @@ void StreamEvents(int fd, const std::shared_ptr<grpc::Channel> &channel,
   });
   bool streaming = SendAll(fd,
                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-                           "Cache-Control: no-store\r\nConnection: close\r\n\r\n");
+                           "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                           std::chrono::steady_clock::now() + kIoTimeout);
   v2::Event event;
   std::string message, json;
   while (streaming && reader->Read(&event)) {
@@ -494,7 +552,7 @@ void StreamEvents(int fd, const std::shared_ptr<grpc::Channel> &channel,
     json.clear();
     ignore_result(google::protobuf::util::MessageToJsonString(event, &json));
     message += "data: " + json + "\n\n";
-    streaming = SendAll(fd, message);
+    streaming = SendAll(fd, message, std::chrono::steady_clock::now() + kIoTimeout);
   }
   if (!streaming) {
     ctx.TryCancel();
@@ -504,6 +562,96 @@ void StreamEvents(int fd, const std::shared_ptr<grpc::Channel> &channel,
   ignore_result(reader->Finish());
   finished.store(true);
   watcher.join();
+}
+
+// The host name of a Host header value (or an Origin's authority), lower
+// case, without port or IPv6 brackets; nullopt when malformed.
+std::optional<std::string> HostName(std::string_view host) {
+  std::string_view name;
+  if (!host.empty() && host.front() == '[') {
+    const size_t close = host.find(']');
+    if (close == std::string_view::npos ||
+        (close + 1 < host.size() && host[close + 1] != ':')) {
+      return std::nullopt;
+    }
+    name = host.substr(1, close - 1);
+  } else {
+    name = host.substr(0, host.find(':'));
+  }
+  if (name.empty()) {
+    return std::nullopt;
+  }
+  std::string out(name);
+  std::transform(out.begin(), out.end(), out.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return out;
+}
+
+// "localhost" or an IP address: a name no DNS rebinding produces, since a
+// page that rebinds sends its own DNS name, and an address in the URL makes
+// the page's origin that address.
+bool IsLocalhostOrAddress(const std::string &name) {
+  if (name == "localhost") {
+    return true;
+  }
+  in_addr v4{};
+  in6_addr v6{};
+  return inet_pton(AF_INET, name.c_str(), &v4) == 1 ||
+         inet_pton(AF_INET6, name.c_str(), &v6) == 1;
+}
+
+bool EqualsIgnoreCase(std::string_view a, std::string_view b) {
+  return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](unsigned char x, unsigned char y) {
+    return std::tolower(x) == std::tolower(y);
+  });
+}
+
+// What a browser could send on a page's behalf that this daemon refuses
+// (D-125), so no web page, DNS rebinding included, can drive it:
+// - a Host that is not localhost, an IP address or one of `allowed_hosts`:
+//   a page that rebinds its own name to this address still sends its name;
+// - an Origin other than the Host, and Sec-Fetch-Site: cross-site;
+// - a POST that is not application/json, which no cross-origin form or
+//   simple request can send without a preflight this server never allows.
+std::optional<Reply> Refuse(const Request &req, const std::vector<std::string> &allowed_hosts) {
+  const auto forbid = [](const std::string &why) {
+    return ErrorReply(403, grpc::StatusCode::PERMISSION_DENIED, why);
+  };
+  if (!req.host) {
+    return ErrorReply(400, grpc::StatusCode::INVALID_ARGUMENT, "a Host header is required");
+  }
+  const std::optional<std::string> name = HostName(*req.host);
+  if (!name || (!IsLocalhostOrAddress(*name) &&
+                std::find(allowed_hosts.begin(), allowed_hosts.end(), *name) ==
+                    allowed_hosts.end())) {
+    return forbid("Host '" + *req.host +
+                  "' is not a name of this daemon (localhost, an IP address, the --http_addr "
+                  "host or --http_allowed_hosts)");
+  }
+  if (req.origin) {
+    const size_t scheme = req.origin->find("://");
+    const std::string_view authority =
+        scheme == std::string::npos ? std::string_view()
+                                    : std::string_view(*req.origin).substr(scheme + 3);
+    if (scheme == std::string::npos || !EqualsIgnoreCase(authority, *req.host)) {
+      return forbid("Origin '" + *req.origin + "' is not this daemon's (" + *req.host + ")");
+    }
+  }
+  if (EqualsIgnoreCase(req.fetch_site, "cross-site")) {
+    return forbid("a cross-site request");
+  }
+  if (req.method == "POST") {
+    std::string_view type = req.content_type;
+    type = type.substr(0, type.find(';'));
+    while (!type.empty() && (type.back() == ' ' || type.back() == '\t')) {
+      type.remove_suffix(1);
+    }
+    if (!EqualsIgnoreCase(type, "application/json")) {
+      return ErrorReply(415, grpc::StatusCode::INVALID_ARGUMENT,
+                        "POST needs Content-Type: application/json");
+    }
+  }
+  return std::nullopt;
 }
 
 Reply NotAllowed(const Request &req, const char *allowed) {
@@ -552,7 +700,8 @@ Reply Route(const Request &req, const std::shared_ptr<grpc::Channel> &channel) {
 
 HttpServer::~HttpServer() { Stop(); }
 
-bool HttpServer::Bind(const std::string &address, std::string *error) {
+bool HttpServer::Bind(const std::string &address, const std::string &allowed_hosts,
+                      std::string *error) {
   const size_t colon = address.rfind(':');
   if (colon == std::string::npos || colon == 0 || colon + 1 == address.size()) {
     *error = "--http_addr '" + address +
@@ -607,6 +756,29 @@ bool HttpServer::Bind(const std::string &address, std::string *error) {
   if (listen_fd_ < 0) {
     *error = "--http_addr '" + address + "': " + last_error;
     return false;
+  }
+  // Host names requests may carry besides localhost and IP addresses: the
+  // one --http_addr gave, and the list.
+  const auto allow = [this](std::string_view host) {
+    const std::optional<std::string> name = HostName(host);
+    if (name && !IsLocalhostOrAddress(*name) &&
+        std::find(allowed_hosts_.begin(), allowed_hosts_.end(), *name) == allowed_hosts_.end()) {
+      allowed_hosts_.push_back(*name);
+    }
+  };
+  allow(address.substr(0, colon));
+  std::string_view rest = allowed_hosts;
+  while (!rest.empty()) {
+    const size_t comma = rest.find(',');
+    std::string_view entry = rest.substr(0, comma);
+    rest = comma == std::string_view::npos ? std::string_view() : rest.substr(comma + 1);
+    while (!entry.empty() && entry.front() == ' ') {
+      entry.remove_prefix(1);
+    }
+    while (!entry.empty() && entry.back() == ' ') {
+      entry.remove_suffix(1);
+    }
+    allow(entry);
   }
   return true;
 }
@@ -681,9 +853,7 @@ void HttpServer::AcceptLoop() {
     if (fd < 0) {
       continue;  // the client gave up, or out of descriptors for now
     }
-    const timeval timeout{kIoTimeoutSeconds, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    const auto accepted = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(mu_);
     ReapLocked();  // joins finished connections, closing their descriptors
     if (connections_.size() >= kMaxConnections) {
@@ -694,6 +864,7 @@ void HttpServer::AcceptLoop() {
     }
     auto conn = std::make_unique<Connection>();
     conn->fd = fd;
+    conn->accepted = accepted;
     Connection *c = conn.get();
     connections_.push_back(std::move(conn));
     c->thread = std::thread([this, c] { Serve(c); });
@@ -704,8 +875,10 @@ void HttpServer::Serve(Connection *conn) {
   const int fd = conn->fd;
   Reply error;
   error.status = 0;  // nothing to answer unless a reader sets one
-  if (const std::optional<Request> req = ReadRequest(fd, &error)) {
-    if (req->path == "/v2/events" && req->method == "GET") {
+  if (const std::optional<Request> req = ReadRequest(fd, conn->accepted + kIoTimeout, &error)) {
+    if (const std::optional<Reply> refused = Refuse(*req, allowed_hosts_)) {
+      SendReply(fd, *refused);
+    } else if (req->path == "/v2/events" && req->method == "GET") {
       if (const auto watch = ParseWatch(*req, &error)) {
         StreamEvents(fd, channel_, *watch, stopping_);
       } else {

@@ -279,7 +279,7 @@ rules (D-106), and there is one authorization point.
 
 | Route | What |
 |---|---|
-| `POST /v2/<Method>` | a unary `bess.pb.v2.Control` RPC: the body is the request in protobuf JSON (empty: `{}`), the answer the response (lowerCamelCase names, 64-bit integers as strings) |
+| `POST /v2/<Method>` | a unary `bess.pb.v2.Control` RPC: the body is the request in protobuf JSON (empty: `{}`) with `Content-Type: application/json`, the answer the response (lowerCamelCase names, 64-bit integers as strings) |
 | `GET /v2/events` | `WatchEvents` as server-sent events: one JSON `Event` per `data:` line, `id: EPOCH:SEQUENCE`; `?from_sequence=&daemon_epoch=&types=a,b`, or the `Last-Event-ID` a browser's `EventSource` sends on reconnecting |
 | `GET /metrics` | `ListMetrics` in the Prometheus text format 0.0.4: HELP and TYPE before each family, families in name order, `counter`/`gauge` as declared, then `bess_daemon_epoch` |
 | `GET /` | a static page, compiled in, listing modules and metrics and following events through the routes above |
@@ -288,12 +288,35 @@ A failed call answers the gRPC code's HTTP status (400 for INVALID_ARGUMENT
 and FAILED_PRECONDITION, 404, 409 for ALREADY_EXISTS and ABORTED, 503 for
 UNAVAILABLE, ...) with `{"code", "status", "message", "detail"}`, `detail`
 being the typed `ErrorDetail`; a body that is not the request's JSON is 400.
-One request per connection. The Admin service is not on HTTP.
+One request per connection, which must arrive whole within 10 s (408). The
+Admin service is not on HTTP.
+
+**Browsers.** A loopback address is not enough by itself: any web page the
+operator opens can make the browser send requests to `127.0.0.1`, and a page
+that rebinds its own DNS name to `127.0.0.1` makes them same-origin, able to
+read `daemonEpoch` and then apply pipelines. bessd therefore refuses, before
+any call:
+
+- a `Host` that is not `localhost`, an IP address (`127.0.0.1`, `[::1]`, a pod
+  IP: no rebinding produces one, since the page sends its own DNS name), the
+  host `--http_addr` named, or one of `--http_allowed_hosts` (comma-separated
+  DNS names, e.g. the name a scraper uses; any port): 403, and 400 without
+  `Host`;
+- an `Origin` whose host and port are not the `Host`'s, and
+  `Sec-Fetch-Site: cross-site`: 403;
+- a POST that is not `Content-Type: application/json`: 415. Forms and other
+  cross-origin "simple" requests cannot send that type without a CORS
+  preflight, and bessd never answers one with an `Access-Control-Allow-*`
+  header.
+
+The page at `/` passes these checks: its requests are same-origin JSON.
+Beyond loopback, these rules keep browsers out; anything else that reaches
+the port controls the daemon.
 
 ```sh
 curl -s localhost:8080/metrics
-curl -s -X POST localhost:8080/v2/GetPipeline
-curl -s -X POST localhost:8080/v2/ApplyPipeline \
+curl -s -X POST -H 'Content-Type: application/json' localhost:8080/v2/GetPipeline
+curl -s -X POST -H 'Content-Type: application/json' localhost:8080/v2/ApplyPipeline \
   -d '{"pipeline": {"modules": [{"name": "s", "mclass": "Sink"}]}, "daemonEpoch": "EPOCH"}'
 curl -sN localhost:8080/v2/events
 ```

@@ -100,6 +100,20 @@ HttpReply Post(int port, const std::string &path, const std::string &body) {
                             std::to_string(body.size()) + "\r\n\r\n" + body);
 }
 
+// One request with exactly `headers` (each "Name: value"; no Host unless
+// given) and, when not empty, a body with its Content-Length.
+HttpReply Send(int port, const std::string &method, const std::string &path,
+               const std::vector<std::string> &headers, const std::string &body = "") {
+  std::string request = method + " " + path + " HTTP/1.1\r\n";
+  for (const std::string &h : headers) {
+    request += h + "\r\n";
+  }
+  if (!body.empty()) {
+    request += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+  }
+  return Exchange(port, request + "\r\n" + body);
+}
+
 // A top-level JSON member's value: a string's contents or a bare token.
 std::string JsonField(const std::string &json, const std::string &key) {
   const std::string quoted = "\"" + key + "\":";
@@ -147,7 +161,9 @@ class HttpTest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
     http_port_ = bess::live::FreePort();
-    daemon_ = Daemon::Launch({"--http_addr=127.0.0.1:" + std::to_string(http_port_)}).release();
+    daemon_ = Daemon::Launch({"--http_addr=127.0.0.1:" + std::to_string(http_port_),
+                              "--http_allowed_hosts=bess.test, Other.Test"})
+                  .release();
   }
   static void TearDownTestSuite() {
     delete daemon_;
@@ -299,6 +315,85 @@ TEST_F(HttpTest, Errors) {
   EXPECT_EQ(400, Get(http_port_, "/v2/events?bogus=1").status);
   // Still serving.
   EXPECT_EQ(200, Post(http_port_, "/v2/GetCapabilities", "{}").status);
+}
+
+// What a web page could make a browser send (DNS rebinding, cross-site
+// requests, simple POSTs) is refused; a same-origin page and non-browser
+// clients are served.
+TEST_F(HttpTest, BrowserRequestsFromOtherSitesAreRefused) {
+  const std::string port = std::to_string(http_port_);
+  const std::string json = "Content-Type: application/json";
+  const auto status = [&](const std::string &method, const std::vector<std::string> &headers) {
+    const HttpReply got = Send(http_port_, method, method == "GET" ? "/metrics" : "/v2/GetPipeline",
+                               headers, method == "GET" ? "" : "{}");
+    return got.status;
+  };
+  // DNS rebinding: the page's own name, now resolving to 127.0.0.1.
+  {
+    const HttpReply got =
+        Send(http_port_, "POST", "/v2/GetPipeline", {"Host: evil.example:" + port, json}, "{}");
+    EXPECT_EQ(403, got.status) << got.body;
+    EXPECT_EQ("PERMISSION_DENIED", JsonField(got.body, "status")) << got.body;
+  }
+  EXPECT_EQ(403, status("GET", {"Host: evil.example"}));
+  EXPECT_EQ(403, status("GET", {"Host: 127.0.0.1.evil.example:" + port}));
+  EXPECT_EQ(400, status("GET", {})) << "no Host";
+  // localhost, IP addresses and --http_allowed_hosts (any case, any port).
+  for (const std::string &host :
+       std::vector<std::string>{"localhost", "LOCALHOST:" + port, "127.0.0.1:" + port, "127.0.0.2",
+                                "[::1]:" + port, "10.1.2.3:" + port, "bess.test:" + port,
+                                "other.test"}) {
+    EXPECT_EQ(200, status("GET", {"Host: " + host})) << host;
+  }
+  // An Origin must be the Host's own; a cross-site fetch is refused.
+  const std::string self = "Host: 127.0.0.1:" + port;
+  EXPECT_EQ(403, status("POST", {self, json, "Origin: http://evil.example"}));
+  EXPECT_EQ(403, status("POST", {self, json, "Origin: http://127.0.0.1:1"}));
+  EXPECT_EQ(403, status("POST", {self, json, "Origin: null"}));
+  EXPECT_EQ(403, status("GET", {self, "Origin: http://evil.example"}));
+  EXPECT_EQ(403, status("POST", {self, json, "Sec-Fetch-Site: cross-site"}));
+  EXPECT_EQ(200, status("POST", {self, json, "Origin: http://127.0.0.1:" + port,
+                                 "Sec-Fetch-Site: same-origin"}))
+      << "the page's own requests";
+  // A POST is JSON: what forms and simple cross-origin requests send is not.
+  EXPECT_EQ(415, status("POST", {self, "Content-Type: text/plain"}));
+  EXPECT_EQ(415, status("POST", {self, "Content-Type: application/x-www-form-urlencoded"}));
+  EXPECT_EQ(415, status("POST", {self}));
+  EXPECT_EQ(200, status("POST", {self, "Content-Type: Application/JSON; charset=utf-8"}));
+  // No CORS grant, ever.
+  const HttpReply got = Send(http_port_, "POST", "/v2/GetPipeline",
+                             {self, json, "Origin: http://127.0.0.1:" + port}, "{}");
+  EXPECT_EQ(std::string::npos, got.headers.find("Access-Control-Allow")) << got.headers;
+}
+
+// A request trickling in is cut off 10 s after its connection, and its
+// connection's thread is free again.
+TEST_F(HttpTest, SlowRequestTimesOut) {
+  const int fd = Connect(http_port_);
+  const std::string start = "GET /metrics HTTP/1.1\r\n";
+  ASSERT_EQ(static_cast<ssize_t>(start.size()), write(fd, start.data(), start.size()));
+  const auto began = std::chrono::steady_clock::now();
+  std::string raw;
+  // A header byte every 500 ms, never finishing, until the server answers.
+  while (std::chrono::steady_clock::now() - began < std::chrono::seconds(20)) {
+    pollfd p{fd, POLLIN, 0};
+    if (poll(&p, 1, 500) > 0) {
+      char chunk[4096];
+      const ssize_t n = read(fd, chunk, sizeof(chunk));
+      if (n <= 0) {
+        break;
+      }
+      raw.append(chunk, static_cast<size_t>(n));
+      continue;
+    }
+    (void)!send(fd, "X", 1, MSG_NOSIGNAL);
+  }
+  close(fd);
+  const auto took = std::chrono::steady_clock::now() - began;
+  EXPECT_EQ(408, Split(raw).status) << raw;
+  EXPECT_GE(took, std::chrono::seconds(9));
+  EXPECT_LT(took, std::chrono::seconds(13));
+  EXPECT_EQ(200, Get(http_port_, "/metrics").status);
 }
 
 TEST_F(HttpTest, StatusPage) {

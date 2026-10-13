@@ -88,7 +88,7 @@ int main(int argc, char *argv[]) {
   if (!FLAGS_http_addr.empty()) {
     http = std::make_unique<bess::control::HttpServer>();
     std::string error;
-    if (!http->Bind(FLAGS_http_addr, &error)) {
+    if (!http->Bind(FLAGS_http_addr, FLAGS_http_allowed_hosts, &error)) {
       LOG(ERROR) << error;
       return 1;
     }
