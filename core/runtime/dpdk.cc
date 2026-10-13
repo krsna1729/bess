@@ -187,7 +187,10 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
     // past that are not DPDK sockets at all).
     const runtime::Placement &placement = runtime::ProcessPlacement();
     const int memory_node = placement.node;
-    if (memory_node >= RTE_MAX_NUMA_NODES) {
+    // A node DPDK cannot name is not confined (the warning says so): every
+    // node gets the -m cap, or no limit, as before D-123.
+    const bool confined = memory_node < RTE_MAX_NUMA_NODES;
+    if (!confined) {
       LOG(WARNING) << "memory node " << memory_node << " is beyond DPDK's "
                    << RTE_MAX_NUMA_NODES << " NUMA nodes: hugepage memory is "
                    << "not confined to it";
@@ -197,12 +200,13 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
       nodes = std::max(nodes, node + 1);
     }
     nodes = std::min(nodes, RTE_MAX_NUMA_NODES);
-    if (dpdk_mb_per_socket > 0 || nodes > 1) {
+    if (dpdk_mb_per_socket > 0 || (confined && nodes > 1)) {
       const std::string cap =
           dpdk_mb_per_socket > 0 ? std::to_string(dpdk_mb_per_socket + 1) : "0";
       std::string limit;
       for (int i = 0; i < nodes; i++) {
-        limit += (i == 0 ? "" : ",") + (i == memory_node ? cap : std::string("1"));
+        const bool own = !confined || i == memory_node;
+        limit += (i == 0 ? "" : ",") + (own ? cap : std::string("1"));
       }
       rte_args.Append({"--socket-limit", limit});
     }

@@ -82,8 +82,11 @@ TEST(ThreadPlacementTest, ControlCpusAreTheRestWithinTheBase) {
 
 TEST(ThreadPlacementTest, EverythingStaysInsideTheInheritedSet) {
   const cpu_set_t now = ThisThread();
-  // Nothing narrowed this thread yet: the captured set is what we run with.
-  EXPECT_TRUE(CPU_EQUAL(&now, &ProcessCpus())) << CpuList(ProcessCpus());
+  // Inside the captured set, whatever ran before: other tests may already
+  // have narrowed this thread to the control CPUs (PlaceControlThreads).
+  cpu_set_t inside;
+  CPU_AND(&inside, &now, &ProcessCpus());
+  EXPECT_TRUE(CPU_EQUAL(&inside, &now)) << CpuList(now) << " vs " << CpuList(ProcessCpus());
   EXPECT_TRUE(CpuAllowed(bess::runtime::DefaultWorkerCore()));
 }
 
@@ -91,8 +94,13 @@ TEST(ThreadPlacementTest, EverythingStaysInsideTheInheritedSet) {
 // reserved, so rte_eal_init leaves the main thread -- and every thread made
 // after it -- on the inherited set, not pinned to one control CPU.
 TEST(ThreadPlacementTest, LazyEalBringUpKeepsTheInheritedSet) {
-  ASSERT_FALSE(bess::runtime::ProcessPlacementApplied());
-  InitRuntimeOnce();  // the first DPDK user: rte_eal_init runs here
+  // ApplyProcessPlacement is one-way and process-global: once another test
+  // (ControlThreadsLeaveWorkerCpus) ran it, under --gtest_shuffle or
+  // --gtest_repeat, this process is no longer a lazily initialised one.
+  if (bess::runtime::ProcessPlacementApplied()) {
+    GTEST_SKIP() << "process placement already applied in this process";
+  }
+  InitRuntimeOnce();  // brings the EAL up unless an earlier test did
   ASSERT_TRUE(bess::IsDpdkInitialized());
   const cpu_set_t reserved = bess::runtime::ReservedControlCpus();
   EXPECT_EQ(0, CPU_COUNT(&reserved));
