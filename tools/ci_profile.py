@@ -384,6 +384,10 @@ def step_verify_install(s):
         print('skipped: a sanitizer lane installs nothing (the gating lanes verify the install)')
         return
     env = s.env_with_dpdk()
+    # meson install never removes what an earlier install left: a header since
+    # moved or dropped would still be checked (and fail, or pass) as installed.
+    if not s.dry_run:
+        shutil.rmtree(s.stage, ignore_errors=True)
     s.run(['meson', 'install', '-C', s.build_dir, '--destdir', s.stage], env=env)
     if s.dry_run:
         print('+ check installed headers, build standalone plugins, the SDK client and the static '
