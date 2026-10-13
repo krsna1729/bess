@@ -7,8 +7,9 @@ This document formalizes the supported C++ and build contract for out-of-tree BE
 ## Stability and ABI
 
 - **Public**: the module, packet and port headers at `bess/core/`,
-  `framework/{module_init_context,instance_registry,plugin}.h`, the `utils/`
-  helpers in the install, and the generated `pb/*.pb.h` they include. This is
+  `framework/{module_init_context,instance_registry,plugin}.h`, the worker and
+  CPU ids they take (`dataplane/{worker_id,cpu_id,strong_id}.h`, D-133), the
+  `utils/` helpers in the install, and the generated `pb/*.pb.h` they include. This is
   the supported source API. External plugins must be rebuilt against their
   target BESS release; BESS does not promise a stable C++ ABI.
 - **Experimental**: the selected headers under

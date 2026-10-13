@@ -9777,12 +9777,15 @@ meant, and each function range-checked (or forgot to) on its own.
   `TrafficClass::OwnerWorker()`, which replaces `WorkerId()` returning `-1`). The wire and the pipeline specs keep
   `int wid` with `-1` (`Worker::kAnyWorker`); `WidOrAny` and `WorkerOrAny` convert at that boundary, after the
   validator's range check.
-- `dataplane/cpu_id.h` (installed, experimental like `worker_id.h`: `worker.h` uses it; `runtime/` headers are
-  never installed) holds `dataplane::CpuId` (moved from `runtime/thread_placement.h`, which now names it with a
+- `dataplane/cpu_id.h` (`runtime/` headers are never installed) holds `dataplane::CpuId` (moved from
+  `runtime/thread_placement.h`, which now names it with a
   `using`) and the new `SocketId` (a NUMA node as DPDK numbers it). `Worker::core()` is a `CpuId`,
   `Worker::socket()` a `SocketId`; `launch_worker` takes a `CpuId` (it took an `int` and checked it).
   `ControlPlane` keeps its `uint64_t` wire parameters and converts each once (`WorkerIdFrom`, `CpuIdFrom`),
   refusing what does not fit.
+- **Public headers.** `worker.h` and `task.h` are public and now take these ids, and a public header may not
+  include an experimental one, so `dataplane/worker_id.h`, `dataplane/cpu_id.h` and `dataplane/strong_id.h` (the
+  `StrongId` both are built on; standard headers only) are promoted to public in `tools/api_classes.json`.
 - `Worker` keeps raw storage, 32 bits per id as before (a `StrongId` member would make it non-trivial, which
   `__thread` forbids), and its accessors return the typed ids. A thread that is not a worker holds `UINT16_MAX`
   (was `INT_MIN`), which `CurrentWorkerId()` still refuses with one compare.
