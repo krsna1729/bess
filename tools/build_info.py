@@ -25,7 +25,7 @@ from pathlib import Path
 
 # A build writes only to its build directory: no __pycache__ in tools/.
 sys.dont_write_bytecode = True
-from bootstrap_dpdk import patch_series, sha256, trailers  # noqa: E402
+from bootstrap_dpdk import STAMP, patch_series, sha256, trailers  # noqa: E402
 
 OPTIONS = ('buildtype', 'cpp_std', 'cpu', 'arch_generic', 'b_sanitize', 'b_lto',
            'build_benchmarks', 'build_fuzzers')
@@ -52,18 +52,42 @@ def plugin_api_version(source_dir):
     return int(match.group(1)) if match else None
 
 
-def dpdk_patches(source_dir):
-    """The series bootstrap_dpdk.py applies, in order."""
-    return [{'name': p.name, 'sha256': sha256(p),
-             'upstream_status': (trailers(p)['Upstream-Status'] or ['unknown'])[0]}
-            for p in patch_series(Path(source_dir) / 'deps' / 'dpdk-patches')]
+def dpdk_patches(build_dir, source_dir, options):
+    """The series in the DPDK this build links: the stamp bootstrap_dpdk.py
+    writes into the install prefix (none: pristine, D-131). A prefix that is
+    not the checkout's series (bootstrap not re-run after a series change) is
+    recorded as it is, with a warning."""
+    env = dict(os.environ)
+    env['PKG_CONFIG_PATH'] = os.pathsep.join(
+        filter(None, [*options.get('pkg_config_path', []), env.get('PKG_CONFIG_PATH')]))
+    try:
+        prefix = Path(subprocess.run(['pkg-config', '--variable=prefix', 'libdpdk'], env=env,
+                                     capture_output=True, text=True, check=True).stdout.strip())
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise SystemExit(f'build_info: cannot find the DPDK {build_dir} links: {e}')
+    try:
+        installed = json.loads((prefix / STAMP).read_text(encoding='utf-8'))['patches']
+    except FileNotFoundError:
+        installed = []
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise SystemExit(f'build_info: unreadable DPDK patch stamp {prefix / STAMP}: {e}')
+    checkout = patch_series(Path(source_dir) / 'deps' / 'dpdk-patches')
+    status = {(p.name, sha256(p)): (trailers(p)['Upstream-Status'] or ['unknown'])[0]
+              for p in checkout}
+    if [(p['name'], p['sha256']) for p in installed] != list(status):
+        print(f'build_info: WARNING: the DPDK at {prefix} has {len(installed)} local patch(es), '
+              f'not deps/dpdk-patches\' {len(checkout)}: re-run tools/bootstrap_dpdk.py',
+              file=sys.stderr)
+    return [{'name': p['name'], 'sha256': p['sha256'],
+             'upstream_status': status.get((p['name'], p['sha256']), 'unknown')}
+            for p in installed]
 
 
 def build_info(build_dir, source_dir):
     project = intro(build_dir, 'projectinfo')
     compilers = intro(build_dir, 'compilers').get('host', {})
-    options = {o['name']: o['value'] for o in intro(build_dir, 'buildoptions')
-               if o['name'] in OPTIONS}
+    all_options = {o['name']: o['value'] for o in intro(build_dir, 'buildoptions')}
+    options = {n: v for n, v in all_options.items() if n in OPTIONS}
     versions = {}
     for d in intro(build_dir, 'dependencies'):
         versions.setdefault(d['name'], set()).add(d.get('version') or 'unknown')
@@ -84,7 +108,7 @@ def build_info(build_dir, source_dir):
                       for lang, c in sorted(compilers.items())},
         'options': options,
         'dpdk': {'version': dpdk['version'], 'url': dpdk['url'], 'sha256': dpdk['sha256'],
-                 'patches': dpdk_patches(source_dir)},
+                 'patches': dpdk_patches(build_dir, source_dir, all_options)},
         'dependencies': [{'name': n, 'version': ' '.join(sorted(v))}
                          for n, v in sorted(versions.items())],
     }

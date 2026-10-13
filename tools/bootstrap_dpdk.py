@@ -436,6 +436,7 @@ def main() -> int:
         filter(None, [build_env.get('PKG_CONFIG_PATH'), str(pkgconfig)]))
     configure_and_build(dpdk_dir, build_dir, prefix, args.cpu, args.profile,
                         args.jobs, build_env, record)
+    check_af_xdp_artifacts(prefix, args.af_xdp)
     print(f'DPDK pkg-config path: {pkgconfig}')
     return 0
 

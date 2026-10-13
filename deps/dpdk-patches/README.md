@@ -66,9 +66,12 @@ decision before removing the patch.
 
 ## What a build records
 
-`tools/build_info.py` writes the series into the build's `build-info.json`
-(installed as `share/bess/build-info.json`) as
+`tools/build_info.py` writes the series of the DPDK the build links (the
+install prefix's stamp, found with `pkg-config`) into the build's
+`build-info.json` (installed as `share/bess/build-info.json`) as
 `dpdk.patches: [{name, sha256, upstream_status}]`. The list is empty for
-pristine DPDK. The SPDX SBOM (`share/doc/bess/bess.spdx.json`) keeps the dpdk
+pristine DPDK. If that is not the checkout's series, the bootstrap was not run
+again after a series change: the build warns and records what it linked. The
+SPDX SBOM (`share/doc/bess/bess.spdx.json`) keeps the dpdk
 package's upstream version and tarball checksum, so vulnerability matching by
 version still works, and lists the patches in that package's `sourceInfo`.

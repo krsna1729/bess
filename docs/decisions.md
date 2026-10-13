@@ -9268,7 +9268,10 @@ the bootstrap built the tarball as it is, and nothing recorded what a build's DP
   tree, and with no patches it does nothing. CI runs it in `tools/ci_profile.py layers`. Both DPDK cache keys
   in `ci.yml` (lanes and `publish-release`) hash `deps/dpdk-patches/**`.
 - **What a build says.** `build-info.json` gets `dpdk.patches: [{name, sha256, upstream_status}]` (`[]` when
-  pristine), and `verify-install` requires the list. The SPDX dpdk package keeps the upstream version and the
+  pristine), read from the stamp of the DPDK install the build links (found with `pkg-config` on the build's
+  `pkg_config_path`), not from the checkout: after a series change without a new bootstrap the build still links
+  the old DPDK, and says so, with a warning that the checkout differs. `verify-install` requires the list. The
+  SPDX dpdk package keeps the upstream version and the
   tarball's checksum, so vulnerability matching by version still works, and lists the patches in its
   `sourceInfo`, a plain-text SPDX 2.3 package field. A `25.11.3+bess.<n>` version was rejected: matchers compare
   versions, and the patches change no upstream version.
