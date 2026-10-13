@@ -132,7 +132,7 @@ file is the reasoning.
 | D-109 | Task placement is desired state; the samples are manifests | accepted |
 | D-110 | Desired state: settings at creation are init arguments; tables are resources | accepted |
 | D-111 | IPLookup's routes are a transaction resource (`LpmTableResource`) | accepted |
-| D-112 | Generated C++ protobuf code is declared where it is included; one ninja run after a .proto edit | accepted |
+| D-112 | Generated C++ protobuf code is declared where it is included and reached through build-relative include directories; one ninja run after a .proto edit, with GCC and Clang | accepted |
 | D-113 | mold links every profile and every CI lane | accepted |
 | D-114 | L2Forward's entries are a transaction resource (`MacTableResource`) | accepted |
 | D-115 | Module commands over control_v2 (`RunModuleCommand`); thread-unsafe commands busy while workers run | accepted |
@@ -8277,14 +8277,29 @@ install copy, through Meson's implicit include of the target's build directory, 
   declared outputs are those files (`pb/module_msg.pb.h` under `-I <build>/protobuf`). The generator skips the copy
   when protoc wrote the output in place. The `generated/cpp` tree is gone; Python generation is unchanged.
 - The SDK library and its two executables set `implicit_include_directories: false`; the generated header comes
-  through `core_cpp_include`.
+  through `core_pb_inc`.
+- The generated headers are reached through `include_directories` objects (`core_pb_inc`, `sample_pb_inc` in
+  `protobuf/meson.build`), never `'-I' + <build dir>` strings. Meson emits those objects relative to the build
+  directory. The compiler writes a depfile entry as the `-I` path spells it, so with an absolute `-I` the header
+  was an absolute ninja node that no edge produces, distinct from the custom_target's relative output. Only trees
+  compiled through ccache with `base_dir` set to an ancestor escaped it, because ccache rewrites such paths to
+  relative ones; the evidence below came from such a tree.
 
 **Evidence.** In a fast tree: a field added to `module_msg.proto` rebuilt 160 objects and 149 links in one run, and
 the next run compiled nothing; the revert did the same (1.7 s from ccache). A second run after a full build compiles
 nothing (only the always-run `version.h` and `build_info` steps).
 
+**Amendment (absolute include paths).** After D-126 added two fields to `GetCapabilitiesResponse`, one ninja run in a
+clang ASan tree left `sdk/cpp/src/client.cc.o` compiled against the old `control_v2.pb.h`: ASan reported a
+stack-buffer-overflow in the message constructor, and a second run rebuilt 114 objects. `ninja -t deps` named the
+header `/…/build/asan/protobuf/pb/control_v2.pb.h` in the clang trees and in GCC trees built without ccache
+(`build/tune-gcc-*`), and `protobuf/pb/control_v2.pb.h` only in the GCC trees built through ccache (`base_dir` set to
+the checkout's parent). In a clang tree, with a message appended to `control_v2.proto` and one run of
+`libbess-sdk.so`: before the change `ninja -n` still planned 3 steps (`client.cc.o`, `grpc_transport.cc.o`, the link),
+after it 0, and the depfile path is relative.
+
 **Code.** `protobuf/meson.build`, `protobuf/pb/meson.build`, `protobuf/sample/pb/meson.build`,
-`tools/generate_protobuf.py`, `sdk/cpp/meson.build`.
+`tools/generate_protobuf.py`, `sdk/cpp/meson.build`, `sample_plugin/meson.build`.
 
 ## D-113 mold links every profile and every CI lane
 

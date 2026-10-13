@@ -223,17 +223,21 @@ python_package_inits = [
 ]
 
 python_proto_targets = core_python_proto_targets + [sample_python_target] + python_package_inits
-python_proto_include = ['-I' + python_proto_root]
 
 protobuf_runtime_deps = [
   protobuf_dep,
   grpcpp_dep,
 ]
 
-core_cpp_include = [
-  '-I' + core_pb_dir,
-  '-I' + meson.current_build_dir(),  # "pb/x.pb.h"
-]
+# include_directories objects, not '-I' + build-dir strings: meson emits them
+# relative to the build directory, so the compiler's depfile names a generated
+# header by the same path as the custom_target that writes it. With absolute
+# -I paths the depfile's header was a different ninja node that no edge
+# produced, and a .proto edit left its includers stale for one ninja run.
+core_pb_inc = include_directories(
+  'pb',  # "x.pb.h"
+  '.',  # "pb/x.pb.h"
+)
 # protoc-generated code is not ours: newer GCCs report false-positive
 # (maybe-)uninitialized warnings inside protobuf's own headers at -O3, which
 # -Werror would turn into a failed release build. Keep them warnings here.
@@ -244,19 +248,20 @@ proto_codegen_args = cpp.get_supported_arguments(
 bess_proto_lib = static_library(
   'bess_proto',
   core_cpp_proto_targets,
-  cpp_args: core_cpp_include + proto_codegen_args,
+  include_directories: core_pb_inc,
+  cpp_args: proto_codegen_args,
   dependencies: protobuf_runtime_deps,
 )
 bess_proto_headers_dep = declare_dependency(
-  compile_args: core_cpp_include,
+  include_directories: core_pb_inc,
   dependencies: [protobuf_dep],
 )
 bess_proto_dep = declare_dependency(
   link_with: bess_proto_lib,
-  compile_args: core_cpp_include,
+  include_directories: core_pb_inc,
   dependencies: protobuf_runtime_deps,
 )
-sample_proto_include = [
-  '-I' + join_paths(meson.current_build_dir(), 'sample'),  # "pb/supdate_msg.pb.h"
-  '-I' + sample_pb_dir,
-]
+sample_pb_inc = include_directories(
+  'sample',  # "pb/supdate_msg.pb.h"
+  'sample/pb',
+)

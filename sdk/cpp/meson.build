@@ -5,15 +5,15 @@
 
 sdk_cpp_inc = include_directories('include')
 sdk_cpp_sources = files('src/client.cc', 'src/grpc_transport.cc')
-sdk_cpp_args = core_cpp_include + proto_codegen_args
+sdk_cpp_args = proto_codegen_args
 
 # A static bessd links its dependencies' archives, which need not be PIC:
 # the SDK is then a static archive too.
 # implicit_include_directories off, here and for the executables below: the
 # build directory holds the install copy of control_v2.pb.h, which no compile
-# here waits for. The generated header comes through core_cpp_include.
+# here waits for. The generated header comes through core_pb_inc.
 sdk_lib_kwargs = {
-  'include_directories': sdk_cpp_inc,
+  'include_directories': [sdk_cpp_inc, core_pb_inc],
   'implicit_include_directories': false,
   'cpp_args': sdk_cpp_args,
   'dependencies': [protobuf_dep, grpcpp_dep],
@@ -31,8 +31,7 @@ endif
 bess_sdk_dep = declare_dependency(
   link_with: bess_sdk_lib,
   sources: [proto_ready_marker],
-  include_directories: sdk_cpp_inc,
-  compile_args: core_cpp_include,
+  include_directories: [sdk_cpp_inc, core_pb_inc],
   dependencies: [protobuf_dep, grpcpp_dep],
 )
 
@@ -42,7 +41,7 @@ bess_sdk_dep = declare_dependency(
 bess_sdk_embedded_lib = static_library(
   'bess_sdk_embedded',
   sdk_cpp_sources + [proto_ready_marker],
-  include_directories: sdk_cpp_inc,
+  include_directories: [sdk_cpp_inc, core_pb_inc],
   implicit_include_directories: false,
   cpp_args: sdk_cpp_args,
   dependencies: [protobuf_dep, grpcpp_dep],

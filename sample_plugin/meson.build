@@ -5,8 +5,7 @@ sample_plugin = shared_module(
     sample_cpp_target,
     proto_ready_marker,  # core pb/*.pb.h, reached through module.h
   ],
-  include_directories: core_include,
-  cpp_args: core_cpp_include + sample_proto_include,
+  include_directories: [core_include, core_pb_inc, sample_pb_inc],
   dependencies: [dpdk_dep, glog_dep, protobuf_dep, grpcpp_dep],
   build_rpath: dpdk_libdir,
   install: true,
@@ -20,8 +19,7 @@ sample_plugin = shared_module(
 incompatible_probe = shared_module(
   'incompatible_probe',
   ['modules/incompatible_probe.cc', proto_ready_marker],
-  include_directories: core_include,
-  cpp_args: core_cpp_include + sample_proto_include,
+  include_directories: [core_include, core_pb_inc, sample_pb_inc],
   dependencies: [dpdk_dep, glog_dep, protobuf_dep, grpcpp_dep],
   build_rpath: dpdk_libdir,
   install: false,
