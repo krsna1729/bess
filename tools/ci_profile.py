@@ -438,7 +438,10 @@ def step_verify_install(s):
     bessctl = list(s.stage.glob('**/bin/bessctl'))
     if len(bessctl) != 1 or not bessctl[0].is_symlink() or os.readlink(bessctl[0]) != 'bessd':
         raise SystemExit(f'unexpected install: bessctl={bessctl} (a symlink to bessd)')
-    s.run([bessctl[0], '--help'], env=env)
+    # bessd links DPDK's shared libraries except in a static build.
+    s.run([bessctl[0], '--help'],
+          env={**env, 'LD_LIBRARY_PATH': os.pathsep.join(
+              filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))})
     s.run([sys.executable, ROOT / 'tools' / 'check_installed_pybess.py',
            '--root', s.stage / 'usr/local/share/bess'], env=env)
     # Release metadata (M26): the install says what it is made of.
