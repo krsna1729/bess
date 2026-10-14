@@ -156,6 +156,7 @@ file is the reasoning.
 | D-134 | The last shipped `.bess` scripts are gone: the metadata graphs are a C++ oracle test (every read finds its latest write on every path), `attr_match`, the port scripts and the sample plugin's script are manifests, the perftest scripts are retired (they called a removed API; `live_perf` covers them, plus `M.bpf`) | accepted |
 | D-135 | The runtime has no Python: the `bess` package (bessd, bessctl, sample manifests, protobuf schema, build metadata) and the runtime image hold none and depend on none; `bess-tools` (dpdk-devbind.py) and `bess-python` (the legacy client) are optional packages; the tarball is the runtime plus dpdk-devbind.py; `install-deps.sh runtime` installs libraries only, `python` the rest | accepted |
 | D-136 | Each release ships the standalone bessctl as one file, `bessctl-<version>-linux-<arch>`: built at the architecture's base ISA (`x86-64`, `armv8-a`), every library linked in (c-ares too), loading glibc only; the release job checks BESS's objects for instructions above that ISA, the ldd list and `--help`, and signs it with the rest | accepted |
+| D-137 | The plugin checks are C++ live tests on the SDK: `sample_plugin_load` (`tests/live/sample_plugin_test.cc`: --modules load, the incompatible probe refused, the shipped `sequential_update.yaml` run, unload refused while a module lives) and verify-install's installed-tree plugins (`live_standalone_plugins`: conformance plugins and appliances, R4's resources over transactions); `check_sample_plugin.py` and `check_standalone_plugins.py` are gone | accepted |
 
 
 ---
@@ -9962,3 +9963,35 @@ objects is the arm64 release job.
 
 **Code.** `tools/ci_profile.py`, `.github/workflows/ci.yml`, `bessctl/{meson.build,standalone_main.cc}`,
 `docs/control-sdk.md`, `README.md`.
+
+## D-137 The plugin checks are C++ live tests
+
+**Status:** accepted (2026-10-14; the first step of D-104's last item, deleting pybess: CI's checks stop using it).
+
+**Problem.** Two CI checks drove bessd through pybess's legacy client: `tools/check_sample_plugin.py` (the
+`sample_plugin_load` meson test) and `tools/check_standalone_plugins.py` (verify-install, against the staged
+bessd, the plugins built from the staged `bess-dev`, and examples/appliances with R4's resources). Neither can
+outlive pybess, and the live harness (`tests/live/live_daemon.h`) and the C++ SDK do everything they did.
+
+**Decision.**
+- `tests/live/sample_plugin_test.cc` (`live_sample_plugin`, still the `sample_plugin_load` test in the `plugin`
+  suite, built where the sample plugin is): a daemon with `-modules` registers SequentialUpdate; the
+  incompatible probe is refused (its log says so, no class, no listing); the shipped
+  `sample_plugin/sequential_update.yaml` applies through bessctl and moves packets out of `su`; with `su` alive
+  `UnloadPlugin` is EBUSY naming it and keeps the class; after a reset it unloads and the class and listing go.
+  The manifest gained a live test (D-134 checked it by hand).
+- `tests/live/standalone_plugins_test.cc` (`live_standalone_plugins`, built with the tests, not a meson test: the
+  plugins exist only in verify-install, which runs it with `BESSD` = the staged bessd and `BESS_PLUGIN_DIR`).
+  `StandalonePlugins.ConformancePlugins` and `.Appliances` build each chain with `PipelineBuilder`, read gate
+  counters from `Metrics`, run `self_test` with `InvokeAction`, and drive R4's five resources with SDK
+  transactions, typed from `GetSchema` (the plugin's descriptor set is no longer read by the check). A rejected
+  transaction's absence of effect is checked by the next applied one taking the next generation.
+
+**Evidence.** `meson test sample_plugin_load` passes; with an empty plugin directory it fails on the missing class
+and the missing refusal. `ci_profile.py verify-install --name fast` passes both new tests against the staged
+install (1.7 s each); swapping the two plugin directories fails each with "... is not registered".
+
+**Code.** `tests/live/{sample_plugin_test.cc,standalone_plugins_test.cc,meson.build}`,
+`sample_plugin/{meson.build,modules/incompatible_probe.cc}`, `tools/ci_profile.py`, `examples/appliances/{README.md,
+meson.build,session/session_appliance.cc}`, `docs/plugin-api.md`; deleted `tools/check_sample_plugin.py`,
+`tools/check_standalone_plugins.py`.

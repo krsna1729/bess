@@ -29,7 +29,8 @@ Build and check against a staged install (as CI's install check does):
 ```
 meson setup build examples/appliances    # PKG_CONFIG_PATH names bess-dev.pc
 meson compile -C build
-python3 tools/check_standalone_plugins.py --bessd <bessd> --plugin-dir build --set appliances
+BESSD=<bessd> BESS_PLUGIN_DIR=build \
+  <bess build>/tests/live/live_standalone_plugins --gtest_filter=StandalonePlugins.Appliances
 ```
 
 R1's application also runs as a program without bessd, linked from the

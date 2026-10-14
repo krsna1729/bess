@@ -506,25 +506,22 @@ def step_verify_install(s):
             p['name'] == 'dpdk' and p.get('checksums') for p in sbom.get('packages', [])):
         raise SystemExit('bess.spdx.json is not an SPDX 2.3 document with the DPDK pin')
     # The installed-tree plugins load into the staged bessd and move packets,
-    # driven by the installed Python client (M23).
-    client_root = str(s.stage / 'usr/local/share/bess')
-    s.run([sys.executable, ROOT / 'tools' / 'check_standalone_plugins.py',
-           '--bessd', bessd[0], '--plugin-dir', s.standalone],
-          env={**env, 'PYTHONPATH': client_root, 'BESS_PROTOBUF_ROOT': client_root,
-               # bessd links DPDK's shared libraries, which are not installed
-               'LD_LIBRARY_PATH': os.pathsep.join(
-                   filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))})
+    # driven through the C++ SDK (M23; tests/live/standalone_plugins_test.cc).
+    def check_plugins(plugin_dir, test):
+        s.run([s.build_dir / 'tests' / 'live' / 'live_standalone_plugins',
+               f'--gtest_filter=StandalonePlugins.{test}'],
+              env={**env, 'BESSD': str(bessd[0]), 'BESS_PLUGIN_DIR': str(plugin_dir),
+                   # bessd links DPDK's shared libraries, which are not installed
+                   'LD_LIBRARY_PATH': os.pathsep.join(
+                       filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))})
+    check_plugins(s.standalone, 'ConformancePlugins')
     # The reference appliances (M24), built from the installed tree as plugins;
     # their graph path moves packets and their direct path passes self_test.
     appliances = ROOT / 'build' / f'appliances-{s.name}'
     shutil.rmtree(appliances, ignore_errors=True)
     s.run(['meson', 'setup', appliances, 'examples/appliances'], env=env)
     s.run(['meson', 'compile', '-C', appliances], env=env)
-    s.run([sys.executable, ROOT / 'tools' / 'check_standalone_plugins.py',
-           '--bessd', bessd[0], '--plugin-dir', appliances, '--set', 'appliances'],
-          env={**env, 'PYTHONPATH': client_root, 'BESS_PROTOBUF_ROOT': client_root,
-               'LD_LIBRARY_PATH': os.pathsep.join(
-                   filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))})
+    check_plugins(appliances, 'Appliances')
     # A third-party library on the installed primitives, built and tested
     # without bessd (M23, persona E).
     battery = ROOT / 'build' / f'battery-{s.name}'

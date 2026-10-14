@@ -53,8 +53,8 @@ mode-restricted member gets a twin in `NEGATIVE_CASES`.
 CI then builds `examples/standalone_plugin` from the staged `bess-dev` alone (a
 copy of `bess-dev.pc` whose prefix is the stage, so a BESS already installed on
 the machine cannot supply a header), loads every plugin into the staged
-`bessd`, and runs packets through each through the installed Python client
-(`tools/check_standalone_plugins.py`). One of them, `standalone_flow_count`,
+`bessd`, and runs packets through each, driven through the C++ SDK
+(`tests/live/standalone_plugins_test.cc`). One of them, `standalone_flow_count`,
 keeps per-flow state in the public `flow::WorkerFlowTable` (a module on a
 public library), and `standalone_appliance` is an appliance: its first instance
 creates an application-owned object graph (a range classifier yielding an

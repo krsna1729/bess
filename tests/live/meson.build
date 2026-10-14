@@ -53,3 +53,13 @@ foreach source : live_test_sources
     timeout: 600,
   )
 endforeach
+# Plugins built from the installed tree in the installed bessd: ci_profile
+# verify-install runs it with BESSD, BESSCTL and BESS_PLUGIN_DIR set (the
+# plugins exist only there), so it is no meson test.
+live_standalone_plugins = executable(
+  'live_standalone_plugins',
+  'standalone_plugins_test.cc',
+  implicit_include_directories: false,
+  link_with: live_lib,
+  dependencies: [bess_sdk_dep, gtest_dep, dependency('gtest_main', method: 'pkg-config')],
+)

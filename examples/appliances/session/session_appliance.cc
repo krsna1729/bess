@@ -18,7 +18,7 @@
 // memory -- forwarding with the session's TEID, a miss, the meter, and no way
 // out without the route. The engine's side (references across owners,
 // all-or-nothing) is checked over the wire by
-// tools/check_standalone_plugins.py --set appliances.
+// tests/live/standalone_plugins_test.cc (StandalonePlugins.Appliances).
 
 #include <any>
 #include <cstdint>

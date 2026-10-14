@@ -24,27 +24,24 @@ incompatible_probe = shared_module(
   build_rpath: dpdk_libdir,
   install: false,
 )
-sample_plugin_test_env = {
-  'BESS_PROTOBUF_ROOT': join_paths(meson.project_build_root(), 'protobuf', 'generated', 'python'),
-  'PYTHONPATH': ':'.join([
-    join_paths(meson.project_build_root(), 'protobuf', 'generated', 'python'),
-    join_paths(meson.project_build_root(), 'protobuf', 'generated', 'python', 'builtin_pb'),
-    join_paths(meson.project_build_root(), 'protobuf', 'generated', 'python', 'plugin_pb'),
-    meson.project_source_root(),
-  ]),
-  'LD_LIBRARY_PATH': dpdk_libdir,
-}
-test(
-  'sample_plugin_load',
-  python,
-  args: [
-    join_paths(meson.project_source_root(), 'tools', 'check_sample_plugin.py'),
-    '--bessd', join_paths(meson.project_build_root(), 'core', 'bessd'),
-    '--plugin-dir', meson.current_build_dir(),
-  ],
-  depends: [sample_plugin, incompatible_probe] + python_proto_targets,
-  env: sample_plugin_test_env,
-  suite: 'plugin',
-  is_parallel: false,
-  timeout: 60,
-)
+# The plugin in a daemon (tests/live/sample_plugin_test.cc): loaded with
+# --modules, the probe refused, the shipped manifest run, unloaded only once
+# unused. In the `plugin` suite, which every lane runs.
+if get_option('build_tests')
+  live_sample_plugin = executable(
+    'live_sample_plugin',
+    files('../tests/live/sample_plugin_test.cc'),
+    implicit_include_directories: false,
+    link_with: live_lib,
+    dependencies: [bess_sdk_dep, gtest_dep, dependency('gtest_main', method: 'pkg-config')],
+  )
+  test(
+    'sample_plugin_load',
+    live_sample_plugin,
+    depends: [bessd, bessctl_link, sample_plugin, incompatible_probe],
+    env: live_env + {'BESS_PLUGIN_DIR': meson.current_build_dir()},
+    suite: 'plugin',
+    is_parallel: false,
+    timeout: 120,
+  )
+endif

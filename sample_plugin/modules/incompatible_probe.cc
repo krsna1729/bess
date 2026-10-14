@@ -2,7 +2,7 @@
 
 // Test-only plugin: it declares a BESS API range no daemon supports, so the
 // daemon must refuse it and roll back the module its static constructor
-// registered (tools/check_sample_plugin.py checks that it never appears).
+// registered (tests/live/sample_plugin_test.cc checks that it never appears).
 
 #include "framework/plugin.h"
 #include "module.h"

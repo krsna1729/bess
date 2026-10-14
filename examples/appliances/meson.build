@@ -27,8 +27,8 @@ endforeach
 
 # R4's resources are driven over the control API (D-094): its own wire types,
 # compiled for the plugin's codecs, and their descriptor set installed next to
-# the plugin so a controller can build the messages without generated code
-# (tools/check_standalone_plugins.py loads it).
+# the plugin for a controller that builds the messages without generated code
+# and without asking the daemon (GetSchema carries the same descriptors).
 protoc = find_program('protoc', required: true)
 protobuf_dep = dependency('protobuf', required: true)
 session_proto = custom_target(
