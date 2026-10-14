@@ -158,6 +158,7 @@ file is the reasoning.
 | D-136 | Each release ships the standalone bessctl as one file, `bessctl-<version>-linux-<arch>`: built at the architecture's base ISA (`x86-64`, `armv8-a`), every library linked in (c-ares too), loading glibc only; the release job checks BESS's objects for instructions above that ISA, the ldd list and `--help`, and signs it with the rest | accepted |
 | D-137 | The plugin checks are C++ live tests on the SDK: `sample_plugin_load` (`tests/live/sample_plugin_test.cc`: --modules load, the incompatible probe refused, the shipped `sequential_update.yaml` run, unload refused while a module lives) and verify-install's installed-tree plugins (`live_standalone_plugins`: conformance plugins and appliances, R4's resources over transactions); `check_sample_plugin.py` and `check_standalone_plugins.py` are gone | accepted |
 | D-138 | `live_perf` is C++ (`tests/perf/live_perf`, a client of the C++ SDK over control_v2): pipelines and table entries go in as one transaction, ns per packet from the measured modules' Track gate counters over a client-timed window; master is no longer a build it drives; `F.hook` dropped (no v2 `track_gate`); `tools/live_perf.py` is gone. It found two control_v2 defects, both fixed: transactional WildcardMatch rules never reordered the tuple list (D-098 amendment), and `ApplyPipeline` ignored `skip_default_hooks` | accepted |
+| D-139 | `live_transaction_bench` is C++ on the SDK (`tests/perf/live_transaction_bench`): the same pipeline, rates and report against a running bessd, the default gate as `em/settings`, gate counters and busy answers from metrics; `tools/live_transaction_bench.py` is gone; the perf clients share `tests/perf/schema_types.h` | accepted |
 
 
 ---
@@ -10062,3 +10063,29 @@ deleted `tools/live_perf.py`.
 `skip_default_hooks`; applying desired state without the flag reconnects it and the hook returns (desired state
 wins). Like every reconnect, that drops any other hook on the gate, a capture included. `bessctl diff` shows the flip
 as a remove and a create of the same connection name.
+
+## D-139 `live_transaction_bench` is C++ on the SDK
+
+**Status:** accepted (2026-10-14; D-104's last item: no tool needs pybess).
+
+**Problem.** `tools/live_transaction_bench.py` (D-027's live gate) was an SDK controller except where pybess's legacy
+client did the rest: `set_default_gate`, `get_module_info` for the gate counters, `pause_all`/`resume_all`/`reset_all`.
+
+**Decision.**
+- `tests/perf/live_transaction_bench.cc`, built with the tests. Same pipeline (Source -> RandomUpdate over 2 x
+  sessions source addresses -> ExactMatch -> a Sink per gate), the sessions loaded in 1000-rule transactions, each
+  measured transaction one upsert of the next session and one erase of the oldest, the same options (`--grpc-url`,
+  `--worker-core`, `--sessions`, `--pkt-size`, `--duration`, `--rates` with `max`, `--rounds`) and the same table
+  (Mpps, hit fraction, tx/s, client p50/p99 with busy retries counted, busy answers).
+- Everything over control_v2: the pipeline and `em/settings` (default gate 0) as one desired state, the rules as
+  SDK transactions (a commit busy through every retry is rebuilt under a new request id, as before), `PauseWorkers`/
+  `ResumeWorkers`, the gate packets from `bess_gate_packets_total{module="em"}` and busy answers from
+  `bess_transactions_total{outcome="busy"}`. Message types come from `GetSchema`.
+- `Types`, `Base64` and `Be32` move from `live_perf.cc` to `tests/perf/schema_types.h`, shared by both tools.
+
+**Evidence.** One bessd (`build/fast`, worker on CPU 2), `--sessions 20000 --duration 2 --rates 0,1000,max`, the two
+tools in turn: rate 0: 26.77 vs 26.80 Mpps (C++ vs Python); 1000 tx/s: 26.69 vs 26.64 Mpps, p50/p99 274/562 vs
+323/675 µs; max: 5,732 vs 4,731 tx/s at 26.72 vs 26.76 Mpps, p99 288 vs 413 µs; hit 0.50 everywhere, no busy answers.
+
+**Code.** `tests/perf/{live_transaction_bench.cc,schema_types.h,live_perf.cc,meson.build}`, `docs/benchmarking.md`,
+`docs/control-sdk.md`, `docs/performance-contract.md`; deleted `tools/live_transaction_bench.py`.

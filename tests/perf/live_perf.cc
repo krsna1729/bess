@@ -63,6 +63,7 @@
 #include <vector>
 
 #include "bess/sdk/client.h"
+#include "schema_types.h"
 
 extern char **environ;
 
@@ -106,68 +107,9 @@ std::string Ipv4Udp(uint32_t src = 0x0a000001, uint32_t dst = 0x0b000001, uint16
   return f;
 }
 
-std::string Base64(const std::string &in) {
-  static constexpr char kDigits[] =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string out;
-  for (size_t i = 0; i < in.size(); i += 3) {
-    const auto at = [&](size_t j) { return j < in.size() ? uint8_t(in[j]) : 0u; };
-    const uint32_t n = (at(i) << 16) | (at(i + 1) << 8) | at(i + 2);
-    out += kDigits[(n >> 18) & 63];
-    out += kDigits[(n >> 12) & 63];
-    out += i + 1 < in.size() ? kDigits[(n >> 6) & 63] : '=';
-    out += i + 2 < in.size() ? kDigits[n & 63] : '=';
-  }
-  return out;
-}
-
-std::string Be32(uint32_t v) {
-  return {char(v >> 24), char(v >> 16), char(v >> 8), char(v)};
-}
-
-// -- the daemon's types, from GetSchema ----------------------------------------------
-
-class Types {
- public:
-  explicit Types(bess::sdk::Client &client) {
-    auto schema = client.Schema();
-    if (!schema) {
-      throw std::runtime_error("GetSchema: " + schema.error().message);
-    }
-    for (const gp::FileDescriptorProto &file : schema->descriptors().file()) {
-      pool_.BuildFile(file);
-    }
-    for (const v2::ModuleClassSchema &c : schema->module_classes()) {
-      init_types_[c.name()] = c.init_arg_type();
-    }
-  }
-  // A message of `type` (a full name, or one in bess.pb) from protobuf JSON.
-  std::unique_ptr<gp::Message> Make(const std::string &type, const std::string &json) {
-    const std::string full = type.find('.') == std::string::npos ? "bess.pb." + type : type;
-    const gp::Descriptor *d = pool_.FindMessageTypeByName(full);
-    if (d == nullptr) {
-      throw std::runtime_error("the daemon has no type " + full);
-    }
-    std::unique_ptr<gp::Message> m(factory_.GetPrototype(d)->New());
-    if (auto ok = gp::util::JsonStringToMessage(json, m.get()); !ok.ok()) {
-      throw std::runtime_error(full + " " + json + ": " + std::string(ok.message()));
-    }
-    return m;
-  }
-  // The Init argument type of module class `mclass`.
-  const std::string &InitType(const std::string &mclass) const {
-    const auto it = init_types_.find(mclass);
-    if (it == init_types_.end() || it->second.empty()) {
-      throw std::runtime_error("no module class " + mclass + " with an Init argument type");
-    }
-    return it->second;
-  }
-
- private:
-  std::map<std::string, std::string> init_types_;
-  gp::DescriptorPool pool_;
-  gp::DynamicMessageFactory factory_{&pool_};
-};
+using bess::perf::Base64;
+using bess::perf::Be32;
+using bess::perf::Types;
 
 // -- the catalogue -----------------------------------------------------------------
 

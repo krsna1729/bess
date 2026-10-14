@@ -540,9 +540,10 @@ is refused. A blind resend after a timeout, or an ignored epoch, fails them.
 Whether a rule steers is read from the gate counters (D-116) of a Source ->
 Update -> ExactMatch pipeline (`tests/live/steering.h`).
 
-A real controller on the SDK: `tools/live_transaction_bench.py` (D-027's live
-gate) applies its pipeline as desired state and drives its rules as SDK
-transactions; it reads BUSY answers from the daemon's metrics.
+A real controller on the SDK: `tests/perf/live_transaction_bench.cc` (D-027's
+live gate, D-139) applies its pipeline as desired state and drives its rules
+as SDK transactions; it reads the gate counters and busy answers from the
+daemon's metrics.
 
 ### Conformance suite
 
