@@ -7,7 +7,7 @@
 # MAC (1..4), so traffic spreads over the four entries.
 #
 # Converted from l2forward.bess (D-104, D-114). The script's 1000-entry table
-# ($BESS_ENTRIES) was a benchmark, measured now by tools/live_perf.py
+# ($BESS_ENTRIES) was a benchmark, measured now by tests/perf/live_perf
 # (M.l2forward); its ExactMatch variant ($BESS_EXACTMATCH) is exactmatch.yaml.
 # The Rewrite template is the packet it built with scapy.
 modules:

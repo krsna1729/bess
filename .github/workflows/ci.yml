@@ -214,8 +214,8 @@ jobs:
           if-no-files-found: ignore
 
       - name: Live performance, report only (gcc lane, pushes and nightly)
-        # tools/live_perf.py's F and M tests on the lane's build: a trend to
-        # compare between runs' artifacts, never a gate (D-092).
+        # tests/perf/live_perf's F and M tests on the lane's build: a trend to
+        # compare between runs' artifacts, never a gate (D-092, D-138).
         if: matrix.name == 'gcc' && github.event_name != 'pull_request'
         continue-on-error: true
         run: python3 tools/ci_profile.py live-perf $LANE

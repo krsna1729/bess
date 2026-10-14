@@ -157,6 +157,7 @@ file is the reasoning.
 | D-135 | The runtime has no Python: the `bess` package (bessd, bessctl, sample manifests, protobuf schema, build metadata) and the runtime image hold none and depend on none; `bess-tools` (dpdk-devbind.py) and `bess-python` (the legacy client) are optional packages; the tarball is the runtime plus dpdk-devbind.py; `install-deps.sh runtime` installs libraries only, `python` the rest | accepted |
 | D-136 | Each release ships the standalone bessctl as one file, `bessctl-<version>-linux-<arch>`: built at the architecture's base ISA (`x86-64`, `armv8-a`), every library linked in (c-ares too), loading glibc only; the release job checks BESS's objects for instructions above that ISA, the ldd list and `--help`, and signs it with the rest | accepted |
 | D-137 | The plugin checks are C++ live tests on the SDK: `sample_plugin_load` (`tests/live/sample_plugin_test.cc`: --modules load, the incompatible probe refused, the shipped `sequential_update.yaml` run, unload refused while a module lives) and verify-install's installed-tree plugins (`live_standalone_plugins`: conformance plugins and appliances, R4's resources over transactions); `check_sample_plugin.py` and `check_standalone_plugins.py` are gone | accepted |
+| D-138 | `live_perf` is C++ (`tests/perf/live_perf`, a client of the C++ SDK over control_v2): pipelines and table entries go in as one transaction, ns per packet from the measured modules' Track gate counters over a client-timed window; master is no longer a build it drives; `F.hook` dropped (no v2 `track_gate`); `tools/live_perf.py` is gone. It found two control_v2 defects, both fixed: transactional WildcardMatch rules never reordered the tuple list (D-098 amendment), and `ApplyPipeline` ignored `skip_default_hooks` | accepted |
 
 
 ---
@@ -10008,3 +10009,56 @@ install (1.7 s each); swapping the two plugin directories fails each with "... i
 `sample_plugin/{meson.build,modules/incompatible_probe.cc}`, `tools/ci_profile.py`, `examples/appliances/{README.md,
 meson.build,session/session_appliance.cc}`, `docs/plugin-api.md`; deleted `tools/check_sample_plugin.py`,
 `tools/check_standalone_plugins.py`.
+
+## D-138 `live_perf` is C++ on the SDK
+
+**Status:** accepted (2026-10-14; the user: "c++ only. master is an archival snapshot of upstream only").
+
+**Problem.** `tools/live_perf.py` drove bessd through pybess's legacy client: `bess.add_module`, module commands for
+table rules, `track_gate`, and the leaf traffic classes' packet counters with daemon timestamps. None of that
+outlives pybess and the legacy service (D-104), and it measured the legacy command path, which a controller no longer
+uses.
+
+**Decision.**
+- `tests/perf/live_perf.cc`, built with the tests (`build/<dir>/tests/perf/live_perf`). The same F and M catalogue
+  (`--list`), options (`--tests`, `--build`, `--rounds`, `--cpu`, `--control-cpu`, `--duration`, `--warmup`,
+  `--counters`, `--save`, `--baseline`, `--threshold`) and palindromic rounds, one fresh bessd per round.
+- Each test is one `PipelineBuilder` transaction: modules, connections, workers, tasks, traffic classes, and the
+  modules' resources (`em/rules`, `wm/rules`, `ipl/routes`, `l2/macs`, the session tables, the `*/settings`
+  singletons) typed from `GetSchema`. `F.hopnt/16` sets `skip_default_hooks` on the Bypasses' connections.
+- Measurement: the sum of `bess_gate_packets_total{direction="out"}` over the measured modules (`ListMetrics`; the
+  Track hook every connection has by default) across a window timed with the client's steady clock. The v2 API has
+  no traffic-class counters, and the default hook was already on every measured gate, so the packet path is the one
+  the Python tool measured.
+- Builds: `current` (the bessd next to the tool), `current:<tree>[:<builddir>[:<flags>]]`, `name=<bessd>[,flag...]`.
+  master is not a build: it is an archival snapshot of upstream and speaks only the legacy API. Comparisons with
+  master in earlier records stay as recorded.
+- `F.hook` (Track hooks on input gates) is dropped: v2 has no `track_gate`, and D-116 made the default output hook
+  the only gate counter.
+- `--baseline` fails a test the run has no result for (a gate must not pass on an error) and notes tests the saved
+  run lacks; `--save` keeps raw values, per-round counters and medians.
+- CI's report-only `live-perf` step runs it (`ci_profile.py`); `tools/live_perf.py` is deleted.
+
+**What it found.** Same build (`build/fast`, CPUs 2,4), one round each, the two tools agree within a few percent on
+every test but two:
+- `M.wildcardmatch` 47.4 ns vs 12.6: rules added by transaction left WildcardMatch's tuple list unordered, so the
+  D-098 skip never fired. Fixed; D-098 amendment.
+- `F.hopnt/16` equal to `F.hop/16` (11.10 vs 11.22): `ApplyPipeline` dropped `Connection.skip_default_hooks` (the
+  diff's `ConnectionChange` had no such field and the plan connected without it), so every applied connection got
+  the Track hook. Now the snapshot reports a gate without a Track hook as `skip_default_hooks`, the diff compares it
+  (a change reconnects the gate), the plan connects with it, and a rolled-back disconnect restores it.
+  `ControlPlaneTest.ApplyHonoursSkipDefaultHooks` fails without the plan change. After: `F.hop/16` 11.15,
+  `F.hopnt/16` 9.52 (3 rounds; the Python tool, through `track_gate`: 11.77 and 9.92).
+
+**Evidence.** All 33 tests return a number; `--control-cpu`, `--counters` (under `omarchy-benchmark --isolate
+--diagnose`) and `--baseline` exercised; `meson test` 203 of 203.
+
+**Code.** `tests/perf/{live_perf.cc,meson.build}`, `meson.build`, `tools/ci_profile.py`, `.github/workflows/ci.yml`,
+`docs/benchmarking.md`, `bessctl/conf/samples/l2forward.yaml`, `core/control/{pipeline_snapshot.h,
+pipeline_snapshot.cc,pipeline_diff.h,pipeline_diff.cc,pipeline_plan.cc,transaction.cc,control_plane_test.cc}`;
+deleted `tools/live_perf.py`.
+
+**Consequence (review).** A gate whose Track hook was removed through the legacy API now reads as
+`skip_default_hooks`; applying desired state without the flag reconnects it and the hook returns (desired state
+wins). Like every reconnect, that drops any other hook on the gate, a capture included. `bessctl diff` shows the flip
+as a remove and a create of the same connection name.

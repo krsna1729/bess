@@ -170,30 +170,36 @@ for 20 s aborts. Counters: `ns_per_burst`, `ns_per_item`, `bytes_per_item` (ring
 element), `ring_bytes`. For a paired A/B between two rows of one binary use
 `tools/ab_bench.py` with `--filter-b` and `--rename-b`.
 
-## Classified live perf tests (`tools/live_perf.py`)
+## Classified live perf tests (`tests/perf/live_perf`)
 
-A sample pipeline says that something got slower, not what. `tools/live_perf.py` runs small pipelines on one
-pinned worker, each isolating one cost, and reports ns per packet from the leaf traffic classes' counters
-(nothing added to the packet path):
+A sample pipeline says that something got slower, not what. `live_perf` (C++, a client of the C++ SDK over
+control_v2; built with the tests as `build/<dir>/tests/perf/live_perf`) runs small pipelines on one pinned worker,
+each isolating one cost, and reports ns per packet: the measured modules' output-gate packet counters (the Track
+hook every connection has by default, read from `ListMetrics`) over a window the client times. Pipelines and table
+entries go in as one `PipelineBuilder` transaction, the same path a controller uses.
 
 - **F, framework (cross-cutting):** `F.floor` (Source -> Sink), `F.hop/N` (N Bypass hops; the slope is the cost
   of one module hop, including the Track hook every output gate has by default), `F.hopnt/16` (the same with
-  those hooks removed: the hop alone), `F.fanout/4`, `F.fanin/4`, `F.hook` (Track hooks on input gates too),
-  `F.tc/N` (scheduler with N leaves), `F.size/1500`, `F.queue` (cross-worker Queue).
+  those hooks removed: the hop alone), `F.fanout/4`, `F.split/2`, `F.fanin/4`, `F.tc/N` (scheduler with N
+  leaves), `F.size/1500`, `F.queue` (cross-worker Queue).
 - **M, modules (localised):** each module after the same Source -> Rewrite -> RandomUpdate (1,024 flows) front
   end, reported as ns per packet above `M.base` (the front end with a Bypass).
 
 If `F.floor` or the `F.hop` slope moves, every pipeline moves: look at the scheduler, Source/Sink, the packet
-pool and batch dispatch. If one `M` delta moves alone, the cost is in that module.
+pool and batch dispatch. If one `M` delta moves alone, the cost is in that module. `live_perf --list` prints the
+tests.
 
-    omarchy-benchmark --isolate --diagnose --cpu 2,4,6 -- taskset -c 2,4,6 tools/live_perf.py \
+    omarchy-benchmark --isolate --diagnose --cpu 2,4,6 -- taskset -c 2,4,6 build/release/tests/perf/live_perf \
         --cpu 4,6 --control-cpu 2 --counters \
-        --build master --build current:<tree> --rounds 8 --save run.json
-    tools/live_perf.py --build current --tests F --baseline run.json --threshold 5   # exits 1 on a regression
+        --build current --build other=/tree/build/release/core/bessd --rounds 8 --save run.json
+    build/release/tests/perf/live_perf --build current --tests F --baseline run.json --threshold 5   # exits 1 on a regression
 
-A build may also name its build directory and bessd flags, comma-separated: `current:<tree>:<builddir>:<flags>`.
+`current` is the bessd next to the tool (`../../core/bessd`). A build may also name a tree, its build directory and
+bessd flags, comma-separated: `current:<tree>:<builddir>:<flags>`, or a binary and flags: `name=<bessd>[,flag...]`.
 The same binary under different flags is then two builds, paired like any others (D-126 compared
-`current:<tree>:build/fast` with `current:<tree>:build/fast:--simd_width=256`).
+`current:<tree>:build/fast` with `current:<tree>:build/fast:--simd_width=256`). master is an archival snapshot of
+upstream and is not a build `live_perf` drives; the master comparisons in D-092 to D-127 were made with the Python
+tool it replaced (D-138).
 
 Give every thread that is not a worker its own isolated CPU, the lowest of the set, and put the workers above it.
 The isolated partition holds only what the wrapper starts, but inside it the kernel balances threads freely.

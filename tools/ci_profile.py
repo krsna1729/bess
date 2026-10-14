@@ -631,14 +631,14 @@ STEPS = [
     ('clean-tree', step_clean_tree),
 ]
 
-# Report-only live performance (tools/live_perf.py, D-092): the lane's own
-# build, one round of every F and M test on two runner CPUs, saved for the
-# workflow to upload. A shared runner is no isolated machine, so the result is
-# a trend to compare between runs (the artifacts), never a gate. Not in `all`.
+# Report-only live performance (tests/perf/live_perf, D-092, D-138): the
+# lane's own build, one round of every F and M test on two runner CPUs, saved
+# for the workflow to upload. A shared runner is no isolated machine, so the
+# result is a trend to compare between runs (the artifacts), never a gate. Not
+# in `all`.
 def step_live_perf(s):
     out = s.build_dir / 'live-perf.json'
-    cmd = [sys.executable, ROOT / 'tools' / 'live_perf.py',
-           '--build', f'current:{ROOT}:{s.build_dir.relative_to(ROOT)}',
+    cmd = [s.build_dir / 'tests' / 'perf' / 'live_perf', '--build', 'current',
            '--rounds', '1', '--cpu', '2,3', '--save', out]
     env = dict(s.env_with_dpdk(), BESS_DPDK_LIB=str(s.dpdk_libdir()))
     if s.dry_run:

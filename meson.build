@@ -363,6 +363,7 @@ subdir('core')
 install_symlink('bessctl', pointing_to: 'bessd', install_dir: get_option('bindir'))
 if get_option('build_tests')
   subdir('tests/live')
+  subdir('tests/perf')
 endif
 
 # What this build is made of (M26): version, commit, compilers, options, the
