@@ -11,6 +11,7 @@
 #include "task.h"
 #include "traffic_class.h"
 #include "worker.h"
+#include "gate_hooks/track.h"
 
 namespace bess {
 namespace control {
@@ -67,6 +68,7 @@ PipelineSpec SpecFromSnapshot(const PipelineSnapshot &snapshot) {
     entry.ogate = connection.ogate;
     entry.downstream = connection.downstream;
     entry.igate = connection.igate;
+    entry.skip_default_hooks = connection.skip_default_hooks;
     spec.connections.push_back(std::move(entry));
   }
 
@@ -179,6 +181,7 @@ PipelineSnapshot SnapshotRuntime(const runtime::RuntimeState &runtime) {
       entry.ogate = i;
       entry.downstream = igate->module()->name();
       entry.igate = igate->gate_idx();
+      entry.skip_default_hooks = ogates[i]->FindHookByClass(Track::kName) == nullptr;
       snapshot.connections.push_back(std::move(entry));
     }
   }

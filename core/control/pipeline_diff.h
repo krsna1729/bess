@@ -44,6 +44,7 @@ struct ConnectionChange {
   std::string downstream;
   gate_idx_t igate = 0;
   ChangeKind kind = ChangeKind::kUnchanged;  // kCreate == connect, kRemove == disconnect
+  bool skip_default_hooks = false;           // a kCreate's: connect without the Track hook
 };
 
 struct WorkerChange {

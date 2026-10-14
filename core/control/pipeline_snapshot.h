@@ -50,6 +50,8 @@ struct ConnectionSnapshot {
   gate_idx_t ogate = 0;
   std::string downstream;
   gate_idx_t igate = 0;
+  // The output gate has no Track hook: connected with skip_default_hooks.
+  bool skip_default_hooks = false;
 
   bool operator==(const ConnectionSnapshot &other) const = default;
 };

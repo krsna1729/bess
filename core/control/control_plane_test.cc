@@ -15,6 +15,7 @@
 #include "module.h"
 #include "port.h"
 #include "worker.h"
+#include "gate_hooks/track.h"
 
 namespace {
 
@@ -475,6 +476,45 @@ TEST_F(ControlPlaneTest, DiffSeesConnectionChanges) {
 
   ASSERT_TRUE(control_plane.DestroyModule("c1").has_value());
   ASSERT_TRUE(control_plane.DestroyModule("c0").has_value());
+}
+
+// An applied connection keeps its hook choice: skip_default_hooks leaves the
+// output gate without the Track hook, the snapshot reports it (so the same
+// desired state is no change), and flipping it reconnects the gate.
+TEST_F(ControlPlaneTest, ApplyHonoursSkipDefaultHooks) {
+  ControlPlane control_plane;
+  PipelineSpec desired;
+  desired.modules.push_back(ModuleSpec{"h0", "Bypass", {}});
+  desired.modules.push_back(ModuleSpec{"h1", "Bypass", {}});
+  ConnectionSpec connection;
+  connection.upstream = "h0";
+  connection.downstream = "h1";
+  connection.skip_default_hooks = true;
+  desired.connections.push_back(connection);
+  const auto track_hook = [&] {
+    return runtime_->modules().Find("h0")->ogates()[0]->FindHookByClass(Track::kName);
+  };
+
+  auto applied = control_plane.ApplyPipeline(desired, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  EXPECT_EQ(nullptr, track_hook());
+  const auto snapshot = control_plane.GetPipeline();
+  ASSERT_EQ(1u, snapshot.connections.size());
+  EXPECT_TRUE(snapshot.connections[0].skip_default_hooks);
+  auto diff = control_plane.DiffPipeline(desired);
+  ASSERT_TRUE(diff.has_value());
+  EXPECT_TRUE(diff->connections.empty());
+
+  desired.connections[0].skip_default_hooks = false;
+  diff = control_plane.DiffPipeline(desired);
+  ASSERT_TRUE(diff.has_value());
+  ASSERT_EQ(2u, diff->connections.size());
+  applied = control_plane.ApplyPipeline(desired, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  EXPECT_NE(nullptr, track_hook());
+
+  ASSERT_TRUE(control_plane.ApplyPipeline(PipelineSpec{}, {}).has_value());
+  EXPECT_FALSE(runtime_->modules().Contains("h0"));
 }
 
 // An internal traffic class (module leaf) is never part of desired state and

@@ -454,6 +454,7 @@ ControlResult<void> Transaction::ExecuteCommitOp(const PlanOperation &op) {
       undo.connection.ogate = edge->ogate;
       undo.connection.downstream = edge->downstream;
       undo.connection.igate = edge->igate;
+      undo.connection.skip_default_hooks = edge->skip_default_hooks;
     }
     undo_.push_back(undo);
     ops_executed_++;

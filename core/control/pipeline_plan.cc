@@ -68,6 +68,7 @@ PipelinePlan Plan(const PipelineDiff &diff) {
       connection.ogate = change.ogate;
       connection.downstream = change.downstream;
       connection.igate = change.igate;
+      connection.skip_default_hooks = change.skip_default_hooks;
       plan.commit_ops.push_back(ConnectOp{connection});
     }
   }

@@ -63,11 +63,13 @@ const ModuleSnapshot *FindModule(const PipelineSnapshot &snapshot,
   return nullptr;
 }
 
+// The hook choice is part of the edge: changing it reconnects the gate.
 bool SameConnection(const ConnectionSnapshot &current,
                     const ConnectionSpec &desired) {
   return current.upstream == desired.upstream && current.ogate == desired.ogate &&
          current.downstream == desired.downstream &&
-         current.igate == desired.igate;
+         current.igate == desired.igate &&
+         current.skip_default_hooks == desired.skip_default_hooks;
 }
 
 }  // namespace
@@ -151,7 +153,7 @@ PipelineDiff Diff(const PipelineSnapshot &current,
     if (!present) {
       diff.connections.push_back(ConnectionChange{
           connection.upstream, connection.ogate, connection.downstream,
-          connection.igate, ChangeKind::kCreate});
+          connection.igate, ChangeKind::kCreate, connection.skip_default_hooks});
     }
   }
 
