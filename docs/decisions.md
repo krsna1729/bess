@@ -7830,6 +7830,19 @@ on `>=`, inverted packed comparison, no ceiling raise. `modules_wildcard_match_t
 `modules_wildcard_match_transaction_test` (7) pass. Live, same run as D-097 (isolated CPUs 2,4, 4 rounds,
 contamination flagged): M.wildcardmatch master 19.18, develop before 44.82, now 14.58 ns; below master in 4 of 4 pairs.
 
+**Amendment (2026-10-14): the order counts rules a transaction prepares.** Rules added by a transaction (the
+`<module>/rules` resource, the only v2 path) never reordered the list: `PrepareUpsert` published a new tuple with the
+ceiling at its minimum, and `Commit` raised the ceiling but cannot republish (it must not allocate). The list stayed in
+mask insertion order, so the highest-priority tuple could be visited last and the skip never fired. The C++ live_perf,
+which installs rules by transaction, found it: M.wildcardmatch 49.0 ns, 12.6 through the legacy `add` command. Now each
+tuple's shared `Ceiling` also holds `order`, the writer's sort key: the highest priority any of its rules has had or is
+being prepared with. `Upsert` and `PrepareUpsert` raise it first, before any live table changes (a republish
+allocates, and nothing may throw after a live change), and republish the list when that moves the tuple;
+`PublishTuples` sorts by it. The skip still reads only the ceiling, which `Commit` raises as before, so a tuple ordered
+early on a prepared rule that a transaction then cancels costs at most a missed skip. Same run (isolated CPUs 2,4, 4
+rounds, 4db31e52 vs this change): M.wildcardmatch 48.98 → 13.57 ns, M.wildcardmatch/13b 54.61 → 20.33, /8 (equal
+priorities, nothing to skip) 91.65 → 87.52; better in 4 of 4 pairs each.
+
 ## D-099 `Module::EmitBatch`: a burst whose packets all take one gate leaves whole; classifiers use it; `RunSplit` removed
 
 **Status:** accepted (2026-10-12; generalizes NAT's measured batch emit, D-092, which the roadmap review asked for).

@@ -41,9 +41,12 @@ namespace bess::classifier {
 //
 // Each tuple keeps the highest priority any of its rules has had (raised
 // before a rule becomes visible, never lowered while the tuple lives), and the
-// list is ordered by it when republished. A lookup skips a tuple once every
-// packet of the batch already holds a match of strictly higher priority: a
-// rule there cannot win (D-098).
+// list is ordered by the highest priority any of its rules has had or is being
+// prepared with: a transaction's rules raise the ceiling only at commit, which
+// cannot republish, so the order is settled when they are prepared. A lookup
+// skips a tuple once every packet of the batch already holds a match of
+// strictly higher priority: a rule there cannot win (D-098). The order only
+// decides how often that happens; the skip itself reads the ceiling.
 //
 // A lookup masks the batch once per tuple, looks it up, and keeps the best
 // rule per packet: higher priority, then the later command (sequence). Adding
@@ -185,7 +188,7 @@ class ConcurrentMaskedTable {
       if (matched == all) {
         // Every packet holds a match; a rule here wins only with a priority
         // at least as high as the lowest of them (equal: the later command).
-        const int64_t ceiling = tuple.max_priority->load(std::memory_order_acquire);
+        const int64_t ceiling = tuple.ceiling->value.load(std::memory_order_acquire);
         int64_t lowest = best_priority[0];
         for (size_t i = 1; i < n; i++) {
           lowest = std::min(lowest, best_priority[i]);
@@ -226,12 +229,19 @@ class ConcurrentMaskedTable {
   }
 
  private:
+  // Shared by every list that holds the tuple.
+  struct Ceiling {
+    explicit Ceiling(int64_t priority) : value(priority), order(priority) {}
+    // The highest priority any rule of this mask has had (the lookup's skip).
+    std::atomic<int64_t> value;
+    // At least `value`: also counts rules being prepared. The list's sort
+    // key; the writer's alone (readers never load it).
+    int64_t order;
+  };
   struct Tuple {
     std::vector<std::byte> mask;
     std::shared_ptr<ConcurrentExactTable> table;
-    // The highest priority any rule of this mask has had (a ceiling for the
-    // lookup's skip); shared by every list that holds the tuple.
-    std::shared_ptr<std::atomic<int64_t>> max_priority;
+    std::shared_ptr<Ceiling> ceiling;
   };
   struct TupleList {
     std::vector<Tuple> tuples;
@@ -302,8 +312,12 @@ class ConcurrentMaskedTable {
   // A copy of `from` at least twice its capacity; nullptr on failure.
   std::shared_ptr<ConcurrentExactTable> Grown(
       const ConcurrentExactTable &from) const;
-  // Publishes `list` and reclaims what readers are done with.
+  // Publishes `list`, highest order first, and reclaims what readers are done
+  // with.
   void PublishTuples(std::unique_ptr<TupleList> list);
+  // Raises the order of `list`'s tuple `index` to `priority`, republishing
+  // the list if that moves the tuple.
+  void RaiseOrder(const TupleList &list, size_t index, int64_t priority);
   // The rule id stored for `value` in `table`, or 0.
   static RuleId Find(const ConcurrentExactTable &table, ConstBytes value);
   // The index of the tuple with this mask in `list`, or list size.
