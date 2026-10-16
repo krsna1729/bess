@@ -655,16 +655,20 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
           },
           .check_value =
               [this](uint64_t value) -> classifier::ExactRuleResource::Result {
-            if (action_mode_) {
-              if (value == 0 ||
-                  value > std::numeric_limits<uint32_t>::max()) {
-                return std::unexpected("invalid action id " +
-                                       std::to_string(value));
-              }
-              return {};
+            // D-141: the resource holds the packed result, and a transaction
+            // can write it directly, so both halves are checked here.
+            if (!bess::IsCanonicalGateResult(value)) {
+              return std::unexpected(
+                  "result bits above the action id are not part of a rule "
+                  "value");
             }
-            if (!bess::IsValidGateValue(value)) {
-              return std::unexpected("invalid gate " + std::to_string(value));
+            const gate_idx_t gate = bess::GateOfResult(value);
+            if (!bess::IsValidGateValue(gate)) {
+              return std::unexpected("invalid gate " + std::to_string(gate));
+            }
+            if (!action_mode_ && bess::ActionIdOfResult(value) != 0) {
+              return std::unexpected(
+                  "'action_id' needs an 'action_resource' on this ExactMatch");
             }
             return {};
           },
@@ -676,18 +680,22 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
             }
             return {};
           },
-          // Action mode: every rule names an action, so the engine orders the
-          // actions before the rules and refuses a rule whose action is
-          // missing (G1.2b).
+          // Action mode (D-141): a rule that names an action is ordered after
+          // it -- the engine refuses a rule whose action is missing (G1.2b) --
+          // and a rule with action id 0 references nothing.
           .references =
               action_mode_
                   ? classifier::ExactRuleResource::ReferencesFn(
                         [this](uint64_t value) {
+                          const uint32_t action_id =
+                              bess::ActionIdOfResult(value);
+                          if (action_id == 0) {
+                            return std::vector<bess::dataplane::Reference>{};
+                          }
                           return std::vector<bess::dataplane::Reference>{
                               {action_resource_,
                                bess::dataplane::EncodeKey(
-                                   bess::dataplane::ActionId(
-                                       static_cast<uint32_t>(value)))}};
+                                   bess::dataplane::ActionId(action_id))}};
                         })
                   : classifier::ExactRuleResource::ReferencesFn(),
           .may_reference = action_mode_
@@ -716,33 +724,29 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
       },
       [this](const bess::pb::ExactMatchRuleValue &value)
           -> std::expected<std::any, std::string> {
-        if (action_mode_) {
-          if (value.gate() != 0) {
-            return std::unexpected(
-                "this ExactMatch names actions ('action_resource' is set): "
-                "a rule carries 'action_id', not 'gate'");
-          }
-          if (value.action_id() == 0) {
-            return std::unexpected("action id 0 is not a valid action");
-          }
-          return std::any(uint64_t{value.action_id()});
-        }
+        // D-141: one result carries both. In action mode a rule may name its
+        // own gate -- the default 0 is the action table's connection -- and may
+        // leave the action id 0 (a match that takes the gate with no action).
+        // Without an action resource there is nothing to resolve an action id
+        // against, so it must be 0.
         if (!bess::IsValidGateValue(value.gate())) {
           return std::unexpected("invalid gate " +
                                  std::to_string(value.gate()));
         }
-        if (value.action_id() != 0) {
+        if (!action_mode_ && value.action_id() != 0) {
           return std::unexpected(
               "'action_id' needs an 'action_resource' on this ExactMatch");
         }
-        return std::any(uint64_t{value.gate()});
+        return std::any(bess::MakeGateResult(
+            static_cast<gate_idx_t>(value.gate()),
+            action_mode_ ? value.action_id() : 0));
       },
       // Read back (D-129) from the table the command path and transactions
       // write: each key is the rule's fields packed in field order, stored
       // unmasked as given, so cutting it at the field sizes gives back every
       // field's bytes. Canonical form: every field as value_bin (one a client
       // sent as value_int decodes to the same packed key), and the value as
-      // the mode's one field.
+      // its gate and action id (D-141).
       [this](const auto &visit) {
         bess::pb::ExactMatchRuleKey key;
         bess::pb::ExactMatchRuleValue value;
@@ -756,11 +760,8 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
             pos += static_cast<size_t>(spec.size);
           }
           value.Clear();
-          if (action_mode_) {
-            value.set_action_id(static_cast<uint32_t>(v));
-          } else {
-            value.set_gate(v);
-          }
+          value.set_gate(bess::GateOfResult(v));
+          value.set_action_id(bess::ActionIdOfResult(v));
           visit(key, value);
         });
       }));
@@ -913,29 +914,32 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     return;
   }
 
-  // Action mode: a match's value is an ActionId, which goes to the ActionTable
-  // in packet metadata; a miss takes the default gate.
+  // Action mode: a match's result names a gate and an ActionId. The ActionId
+  // goes to the action table in packet metadata, and the packet takes the
+  // rule's gate -- 0 unless the rule names another, which is how a graph
+  // connects the classifier to the action table. A miss takes the default gate
+  // with no action id.
   const bess::metadata::mt_offset_t offset = attr_offset(action_id_attr_);
   if (!bess::metadata::IsValidOffset(offset)) {
     // Fail closed: a match whose action id cannot be delivered would reach the
-    // ActionTable with a stale id, so it takes the default gate instead.
+    // action table with a stale id, so it takes the default gate instead.
     // RefreshForResume() is where this is reported.
     RunChooseModule(ctx, default_gate, batch);
     return;
   }
   Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
-    if (!hit) {
-      gates[i] = default_gate;
-      return;
-    }
+    // D-141: the action id is written on every hit (0 when the rule names no
+    // action) and explicitly 0 on a miss, so a packet can never reach an
+    // action table carrying an id from an earlier lookup.
     _set_attr_with_offset<bess::utils::be32_t>(
-        offset, batch->packet(i), bess::utils::be32_t(static_cast<uint32_t>(value)));
-    gates[i] = kActionGate;
+        offset, batch->packet(i),
+        bess::utils::be32_t(hit ? bess::ActionIdOfResult(value) : 0u));
+    gates[i] = hit ? bess::GateOfResult(value) : default_gate;
   });
   EmitBatch(ctx, batch, gates);
 }
 
-// The gate-mode helper cannot carry a 32-bit action id.
+// The gate-mode helper: gates only, the action id is always 0.
 void ExactMatch::ClassifyBatch(bess::PacketBatch *batch,
                                gate_idx_t *gates) const {
   DCHECK(!action_mode_);
@@ -943,16 +947,21 @@ void ExactMatch::ClassifyBatch(bess::PacketBatch *batch,
   const gate_idx_t default_gate =
       gen->default_gate.load(std::memory_order_relaxed);
   Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
-    gates[i] = hit ? static_cast<gate_idx_t>(value) : default_gate;
+    gates[i] = hit ? bess::GateOfResult(value) : default_gate;
   });
 }
 
-void ExactMatch::ClassifyActionsBatch(bess::PacketBatch *batch,
-                                     uint32_t *action_ids) const {
+// The action-mode helper (D-141): both halves of the result, and the packet
+// path's own miss behaviour -- the default gate with action id 0.
+void ExactMatch::ClassifyActionsBatch(bess::PacketBatch *batch, gate_idx_t *gates,
+                                      uint32_t *action_ids) const {
   DCHECK(action_mode_);
   const Generation *gen = published_.Read();
+  const gate_idx_t default_gate =
+      gen->default_gate.load(std::memory_order_relaxed);
   Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
-    action_ids[i] = hit ? static_cast<uint32_t>(value) : 0;
+    gates[i] = hit ? bess::GateOfResult(value) : default_gate;
+    action_ids[i] = hit ? bess::ActionIdOfResult(value) : 0;
   });
 }
 

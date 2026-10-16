@@ -10174,3 +10174,32 @@ before. Both belong with the classifier result-model work (the `{gate, ActionId}
 `DEPENDENCY_INVENTORY.md`; deleted `core/bessctl.{h,cc}`,
 `core/bessctl_wire_ranges_test.cc`, `protobuf/service.proto`, `pybess/`, `bessctl/*.py`,
 `tools/{check_installed_pybess.py,copy_init.py}`, `requirements.txt`.
+
+## D-141 One classifier result carries a gate and an ActionId
+
+- A rule's result is one 64-bit word: the gate in the low 16 bits, the ActionId above it
+  (`bess::MakeGateResult`, `bess::GateOfResult`, `bess::ActionIdOfResult`, `core/gate.h`). Every combination is
+  legal: `{gate, 0}`, `{0, action}`, `{gate, action}` and `{0, 0}`.
+- The gate is where the packet goes; gate 0 is what a graph connects to the action table. The ActionId is a
+  metadata write, not a gate: the 4-byte `action_id` attribute the module declares when its argument names
+  `action_resource`. Zero means no action.
+- The packet path writes that attribute on *every* hit (0 when the rule names no action) and explicitly 0 on a
+  miss, so a packet cannot reach an action table carrying an id from an earlier lookup.
+- An action id is a transactional reference: a rule whose action id is nonzero is ordered after the action it
+  names and refused while that action is missing; a rule with action id 0 references nothing. `action_mode_`
+  keeps its meaning -- this module names an action resource -- but it no longer implies every rule carries an
+  action.
+- Without `action_resource` an action id is still refused: nothing could resolve it. An invalid gate is refused
+  in both modes, in the typed codec and in the resource's own `check_value`.
+- `ExactMatch::ClassifyActionsBatch` (the fused path's entry point, D-121) now returns both halves, and the
+  fused-kernel test compares its gates and ids against the generic path, so a fused lookup cannot silently drop
+  either half.
+
+**Consequence.** The classifier returns what a session compiler needs in one lookup: the gate the packet leaves
+on and the action record it takes. Before this, a rule could name a gate *or* an action id, never both, so a
+pipeline that had to route a match somewhere other than the action table needed a second classifier. This is the
+BESS half of the UPF's `{gate, ActionId}` item; the WildcardMatch half (action id on the rule value, action
+resource on the argument, the masked table's result) is the next change and reuses this encoding.
+
+**Code.** `core/gate.h`, `core/modules/exact_match.{h,cc}`, `core/modules/session_pipeline_test.cc`,
+`protobuf/module_msg.proto`.

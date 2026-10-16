@@ -36,21 +36,19 @@ using Error = std::pair<int, std::string>;
 // Two modes, fixed at Init():
 //
 //  - gate mode (the default): a rule's value is the output gate a matching
-//    packet leaves on.
-//  - action mode (`action_resource` set): a rule's value is the ActionId of a
-//    per-session action, which the packet path writes into the `action_id`
-//    metadata attribute and forwards on gate 0, so the graph continues into
-//    an ActionTable. The rules are then a resource that references the
-//    actions, and one transaction can create the session's meter, next hop,
-//    route, action and rule together (G1.2b). A miss still takes the default
-//    gate.
+//    packet leaves on, with no action.
+//  - action mode (`action_resource` set): a rule's value names the ActionId of
+//    a per-session action and, optionally, a gate of its own. The packet path
+//    writes the ActionId -- 0 when the rule names none -- into the `action_id`
+//    metadata attribute and forwards the packet on the rule's gate: gate 0
+//    unless the rule says otherwise, which is how a graph connects the
+//    classifier to an ActionTable. The rules are then a resource that
+//    references the actions they name, and one transaction can create the
+//    session's meter, next hop, route, action and rule together (G1.2b). A
+//    miss takes the default gate with action id 0 (D-141).
 class ExactMatch final : public Module {
  public:
   static const gate_idx_t kNumOGates = MAX_GATES;
-
-  // Where a match goes in action mode: the module's first output gate, which
-  // the graph connects to the ActionTable.
-  static constexpr gate_idx_t kActionGate = 0;
 
   static const Commands cmds;
   // "rules" (ExactMatchRuleKey -> ExactMatchRuleValue) and "settings"
@@ -77,8 +75,10 @@ class ExactMatch final : public Module {
   // Gate-mode decision without emitting, for tests and benchmarks driven
   // from a registered reader thread. Action ids are not gate_idx_t values.
   void ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates) const;
-  // Action-mode matched ids; zero for a miss (no action to forward).
-  void ClassifyActionsBatch(bess::PacketBatch *batch,
+  // Action-mode matched results (D-141): the gate the packet leaves on and the
+  // action id to deliver, both exactly as the packet path computes them -- the
+  // default gate and 0 for a miss.
+  void ClassifyActionsBatch(bess::PacketBatch *batch, gate_idx_t *gates,
                             uint32_t *action_ids) const;
 
   // Tests (D-121): the published generation's fused-kernel key width (0 when

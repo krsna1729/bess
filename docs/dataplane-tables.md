@@ -343,8 +343,8 @@ reference to something missing.
   resource writes (including an `edits_resources` action such as L2Forward's
   `populate`), touch the same tables.
 - **Modules taking part today:** ExactMatch registers its rules as
-  `<module>/rules` (key: the fields' bytes in order; value: the gate -- or, in
-  action mode, the ActionId of the action the rule names) from `Init()` to
+  `<module>/rules` (key: the fields' bytes in order; value: the packed result -- the output gate and, when the
+  module names an action resource, the ActionId of the action the rule takes, D-141) from `Init()` to
   `DeInit()`, so one transaction can change the rules of
   several ExactMatch instances. Its table grows during prepare when a new
   key does not fit (`ExactRuleResource::Hooks::make_room`); pending keys

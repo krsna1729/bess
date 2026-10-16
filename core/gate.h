@@ -41,6 +41,35 @@ inline bool IsValidGateValue(uint64_t raw) {
   return raw < MAX_GATES || raw == DROP_GATE;
 }
 
+// The classifier's result (D-141): one 64-bit word that names a gate and an
+// ActionId together. The gate occupies the low 16 bits (gate_idx_t), the
+// ActionId the rest. A module with no action resource leaves the ActionId 0; a
+// rule with an action and no gate of its own uses gate 0, which is how a graph
+// connects the classifier to the action table. Every combination is therefore
+// legal: {gate, 0}, {0, action}, {gate, action}, and {0, 0}.
+inline constexpr unsigned kGateResultBits = 16;
+inline constexpr uint64_t kGateResultMask = (uint64_t{1} << kGateResultBits) - 1;
+
+inline constexpr uint64_t MakeGateResult(gate_idx_t gate, uint32_t action_id) {
+  return (static_cast<uint64_t>(action_id) << kGateResultBits) | gate;
+}
+
+inline constexpr gate_idx_t GateOfResult(uint64_t result) {
+  return static_cast<gate_idx_t>(result & kGateResultMask);
+}
+
+inline constexpr uint32_t ActionIdOfResult(uint64_t result) {
+  return static_cast<uint32_t>(result >> kGateResultBits);
+}
+
+// True when every bit of `value` belongs to the result model. A classifier
+// rule value must be exactly what MakeGateResult produces: bits 48-63 are the
+// masked table's priority slot, and a stored value that is not canonical
+// would not read back as what the codec encodes.
+inline constexpr bool IsCanonicalGateResult(uint64_t value) {
+  return (value >> (kGateResultBits + 32)) == 0;
+}
+
 class Gate;
 class GateHookBuilder;
 

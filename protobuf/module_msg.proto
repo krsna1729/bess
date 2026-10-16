@@ -427,7 +427,13 @@ message ExactMatchRuleKey {
 }
 
 message ExactMatchRuleValue {
+  // The output gate a matching packet leaves on. 0 is the graph's connection
+  // to the action table; DROP_GATE (8192) drops the packet.
   uint64 gate = 1;
+  // The ActionId of the action a matching packet takes, 0 for none. Needs
+  // 'action_resource' on the module. The packet path writes it into the
+  // packet's "action_id" metadata attribute, and writes 0 on a miss, so a
+  // stale id cannot reach a later lookup (D-141).
   uint32 action_id = 2;
 }
 
@@ -654,7 +660,7 @@ message EtherEncapArg {
 message ExactMatchArg {
   repeated Field fields = 1; ///A list of ExactMatch Fields
   repeated FieldData masks = 2; /// mask(i) corresponds to the mask for field(i)
-  string action_resource = 3; /// The ActionTable's actions resource: when set, rules name actions (their action_id) and a match goes to output gate 0 with the action id in packet metadata.
+  string action_resource = 3; /// The ActionTable's actions resource: when set, a rule may name an action (its action_id, 0 for none) and a gate of its own (0, the graph's connection to the action table, unless the rule says otherwise). The action id goes to the packet's "action_id" metadata attribute (D-141).
   optional uint64 default_gate = 4; /// The gate of a packet no rule matches (default: drop); set_default_gate changes it later.
 }
 

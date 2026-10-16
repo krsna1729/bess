@@ -222,7 +222,7 @@ TEST_F(SessionPipelineTest, OneTransactionCreatesASession) {
       Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(1)),
                  std::any(ActionTable::Action{MeterId(1), NextHopId(1)})),
       Op::Upsert("em/rules", Key(session_addr, 0),
-                 std::any(uint64_t{1})),
+                 std::any(bess::MakeGateResult(0, 1))),
   });
   ASSERT_EQ(result.outcome, Outcome::kApplied)
       << (result.ops.empty() ? "" : result.ops[0].error);
@@ -252,7 +252,8 @@ TEST_F(SessionPipelineTest, OneTransactionCreatesASession) {
   {
     bess::PacketBatch batch = packets.Batch(0, 3);
     std::array<uint32_t, 3> actions;
-    em->ClassifyActionsBatch(&batch, actions.data());
+    std::array<gate_idx_t, 3> gates;
+    em->ClassifyActionsBatch(&batch, gates.data(), actions.data());
     EXPECT_EQ(actions[0], 1u);  // matched action id
     EXPECT_EQ(actions[1], 0u);  // miss
     EXPECT_EQ(actions[2], 0u);
@@ -305,7 +306,7 @@ TEST_F(SessionPipelineTest, RejectionsLeaveNothingChanged) {
 
   // A rule naming an action that does not exist: refused.
   auto r = Apply({Op::Upsert("em/rules", Key(Ip(10, 1, 2, 3), 0),
-                             std::any(uint64_t{7}))});
+                             std::any(bess::MakeGateResult(0, 7)))});
   ASSERT_EQ(r.outcome, Outcome::kRejected);
   EXPECT_NE(r.ops[0].error.find("references missing"), std::string::npos)
       << r.ops[0].error;
@@ -382,7 +383,7 @@ TEST_F(SessionPipelineTest, RemovalCascadeAndIdReuse) {
                               std::any(ActionTable::Action{MeterId(1),
                                                            NextHopId(1)})),
                    Op::Upsert("em/rules", Key(Ip(10, 1, 2, 3), 0),
-                              std::any(uint64_t{1}))})
+                              std::any(bess::MakeGateResult(0, 1)))})
                 .outcome,
             Outcome::kApplied);
 
@@ -456,7 +457,7 @@ TEST_F(SessionPipelineTest, RemovalCascadeAndIdReuse) {
                               std::any(ActionTable::Action{MeterId(1),
                                                            NextHopId(1)})),
                    Op::Upsert("em/rules", Key(Ip(10, 1, 2, 3), 0),
-                              std::any(uint64_t{1}))})
+                              std::any(bess::MakeGateResult(0, 1)))})
                 .outcome,
             Outcome::kApplied);
   ASSERT_NE(nullptr, rt->router()->Resolve(Ip(10, 9, 9, 9)));
@@ -489,7 +490,7 @@ TEST_F(SessionPipelineTest, TeardownIgnoresDestructionOrder) {
                               std::any(ActionTable::Action{MeterId(1),
                                                            NextHopId(1)})),
                    Op::Upsert("d_em/rules", Key(Ip(10, 1, 2, 3), 0),
-                              std::any(uint64_t{1}))})
+                              std::any(bess::MakeGateResult(0, 1)))})
                 .outcome,
             Outcome::kApplied);
 
@@ -532,7 +533,7 @@ TEST_F(SessionPipelineTest, ActionModeRulesKeepReferenceCounts) {
   EXPECT_EQ(initial.action_resource(), "at/actions");
 
   const std::string key = Key(Ip(10, 1, 2, 3), 0);
-  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, std::any(uint64_t{1}))}).outcome,
+  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, std::any(bess::MakeGateResult(0, 1)))}).outcome,
             Outcome::kApplied);
   EXPECT_EQ(Engine().ReferenceCount("at/actions",
                                     bess::dataplane::EncodeKey(ActionId(1))),
@@ -544,12 +545,12 @@ TEST_F(SessionPipelineTest, ActionModeRulesKeepReferenceCounts) {
 
   // A rule naming an action that is not there is refused, and the rule it
   // would replace keeps its reference.
-  EXPECT_EQ(Apply({Op::Upsert("em/rules", key, std::any(uint64_t{99}))}).outcome,
+  EXPECT_EQ(Apply({Op::Upsert("em/rules", key, std::any(bess::MakeGateResult(0, 99)))}).outcome,
             Outcome::kRejected);
   EXPECT_EQ(Engine().ReferenceCount("at/actions",
                                     bess::dataplane::EncodeKey(ActionId(1))),
             1u);
-  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, std::any(uint64_t{2}))}).outcome,
+  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, std::any(bess::MakeGateResult(0, 2)))}).outcome,
             Outcome::kApplied);
   EXPECT_EQ(Engine().ReferenceCount("at/actions",
                                     bess::dataplane::EncodeKey(ActionId(1))),
@@ -635,14 +636,60 @@ TEST_F(SessionPipelineTest, ActionIdsAreNotNarrowedToGateWidth) {
                 .outcome,
             Outcome::kApplied);
   const std::string key = Key(Ip(10, 1, 2, 3), 0);
-  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, std::any(uint64_t{70000}))}).outcome,
+  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, std::any(bess::MakeGateResult(0, 70000)))}).outcome,
             Outcome::kApplied);
   Packets packets(1);
   packets.SetKey(0, Ip(10, 1, 2, 3), 0);
   bess::PacketBatch batch = packets.Batch(0, 1);
   std::array<uint32_t, 1> ids;
-  em->ClassifyActionsBatch(&batch, ids.data());
+  std::array<gate_idx_t, 1> gates;
+  em->ClassifyActionsBatch(&batch, gates.data(), ids.data());
   EXPECT_EQ(ids[0], 70000u);
+}
+
+// D-141: one rule result carries a gate and an action id, and every
+// combination is legal -- a gate alone, an action alone, both, or neither. A
+// miss delivers the default gate with action id 0.
+TEST_F(SessionPipelineTest, RuleResultCarriesGateAndActionTogether) {
+  ActionTable *at = CreateActionTable("at", "mt/meters", "rt/next_hops");
+  ASSERT_NE(nullptr, at);
+  for (uint32_t id : {1u, 2u}) {
+    ASSERT_EQ(Apply({Op::Upsert("at/actions",
+                                bess::dataplane::EncodeKey(ActionId(id)),
+                                std::any(ActionTable::Action{
+                                    MeterId(0), NextHopId(0)}))})
+                  .outcome,
+              Outcome::kApplied);
+  }
+  ExactMatch *em = CreateExactMatch("em", "at/actions");
+  ASSERT_NE(nullptr, em);
+  ASSERT_EQ(Apply({Op::Upsert("em/rules", Key(Ip(10, 0, 0, 1), 0),
+                              std::any(bess::MakeGateResult(4, 1))),
+                   Op::Upsert("em/rules", Key(Ip(10, 0, 0, 2), 0),
+                              std::any(bess::MakeGateResult(7, 0))),
+                   Op::Upsert("em/rules", Key(Ip(10, 0, 0, 3), 0),
+                              std::any(bess::MakeGateResult(0, 2)))})
+                .outcome,
+            Outcome::kApplied);
+
+  Packets packets(4);
+  packets.SetKey(0, Ip(10, 0, 0, 1), 0);
+  packets.SetKey(1, Ip(10, 0, 0, 2), 0);
+  packets.SetKey(2, Ip(10, 0, 0, 3), 0);
+  packets.SetKey(3, Ip(192, 0, 2, 1), 0);
+  bess::PacketBatch batch = packets.Batch(0, 4);
+  std::array<gate_idx_t, 4> gates;
+  std::array<uint32_t, 4> actions;
+  em->ClassifyActionsBatch(&batch, gates.data(), actions.data());
+
+  EXPECT_EQ(gates[0], 4u) << "a rule with both takes its own gate";
+  EXPECT_EQ(actions[0], 1u);
+  EXPECT_EQ(gates[1], 7u) << "a rule with a gate and no action";
+  EXPECT_EQ(actions[1], 0u);
+  EXPECT_EQ(gates[2], 0u) << "a rule with an action and no gate of its own";
+  EXPECT_EQ(actions[2], 2u);
+  EXPECT_EQ(gates[3], DROP_GATE) << "a miss takes the default gate";
+  EXPECT_EQ(actions[3], 0u) << "and carries no action id";
 }
 
 // Action mode with one 4-byte field takes the fused kernel (D-121): its
@@ -670,7 +717,7 @@ TEST_F(SessionPipelineTest, FusedKernelMatchesTheGenericPathInActionMode) {
   for (uint32_t k = 0; k < 16; k++) {
     // One 4-byte field: the key is that field's bytes.
     ASSERT_EQ(Apply({Op::Upsert("em/rules", Key(Ip(10, 0, 0, k), 0).substr(0, 4),
-                                std::any(uint64_t{1 + k % 8}))})
+                                std::any(bess::MakeGateResult(0, 1 + k % 8)))})
                   .outcome,
               Outcome::kApplied);
   }
@@ -691,13 +738,16 @@ TEST_F(SessionPipelineTest, FusedKernelMatchesTheGenericPathInActionMode) {
   }
   std::array<uint32_t, kN> fused;
   std::array<uint32_t, kN> generic;
+  std::array<gate_idx_t, kN> fused_gates;
+  std::array<gate_idx_t, kN> generic_gates;
   bess::PacketBatch batch = packets.Batch(0, kN);
-  em->ClassifyActionsBatch(&batch, fused.data());
+  em->ClassifyActionsBatch(&batch, fused_gates.data(), fused.data());
   Error err;
   ASSERT_TRUE(em->SetFusedKernelEnabled(false, &err)) << err.second;
   ASSERT_EQ(0u, em->fused_key_width());
-  em->ClassifyActionsBatch(&batch, generic.data());
+  em->ClassifyActionsBatch(&batch, generic_gates.data(), generic.data());
   EXPECT_EQ(fused, generic);
+  EXPECT_EQ(fused_gates, generic_gates);
   for (size_t i = 0; i < kN; i++) {
     const uint32_t want =
         i < 24 && i % 4 != 0 ? 1 + static_cast<uint32_t>(i % 16) % 8 : 0;
@@ -736,12 +786,20 @@ TEST_F(SessionPipelineTest, CodecsRejectMismatchedFieldsAndUnknownEnums) {
   ASSERT_NE(nullptr, em_res);
   const auto *em_codec = Bindings().Find(*em_res);
   bess::pb::ExactMatchRuleValue em_val;
-  em_val.set_gate(1);
-  em_val.set_action_id(1);
+  em_val.set_gate(MAX_GATES + 1);
   const google::protobuf::Any packed_em_val = Pack(em_val);
   EXPECT_FALSE(em_codec
                    ->Value(packed_em_val.type_url(), packed_em_val.value())
                    .has_value());
+
+  // D-141: a rule may name a gate and an action id together; the shape the
+  // codec used to reject is now the normal one.
+  em_val.set_gate(4);
+  em_val.set_action_id(1);
+  const google::protobuf::Any packed_both = Pack(em_val);
+  EXPECT_TRUE(em_codec
+                  ->Value(packed_both.type_url(), packed_both.value())
+                  .has_value());
 
   const auto *nh_codec = Bindings().Find(*rt->router()->next_hops_resource_object());
   ASSERT_NE(nullptr, nh_codec);
@@ -806,7 +864,7 @@ class SessionPacketPathTest : public SessionPipelineTest {
         rt_->router()->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(1)),
         Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(1)),
                    std::any(ActionTable::Action{MeterId(1), NextHopId(1)})),
-        Op::Upsert("em/rules", WireKey(sip, sport), std::any(uint64_t{1})),
+        Op::Upsert("em/rules", WireKey(sip, sport), std::any(bess::MakeGateResult(0, 1))),
     };
   }
 
@@ -847,7 +905,7 @@ TEST_F(SessionPacketPathTest, OtherSessionsAndMissesAreDropped) {
   r = Apply({
       Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(2)),
                  std::any(ActionTable::Action{MeterId(0), NextHopId(0)})),
-      Op::Upsert("em/rules", WireKey("10.4.4.4", 4321), std::any(uint64_t{2})),
+      Op::Upsert("em/rules", WireKey("10.4.4.4", 4321), std::any(bess::MakeGateResult(0, 2))),
   });
   ASSERT_EQ(Outcome::kApplied, r.outcome) << (r.ops.empty() ? "" : r.ops[0].error);
 
