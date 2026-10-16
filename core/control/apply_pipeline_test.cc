@@ -29,6 +29,8 @@
 #include "control/transaction.h"
 #include "runtime/worker_manager.h"
 #include "runtime/numa_placement.h"
+#include "runtime/thread_placement.h"
+#include "dataplane/cpu_id.h"
 #include "pb/module_msg.pb.h"
 #include "pb/port_msg.pb.h"
 #include "runtime/opts.h"
@@ -59,6 +61,26 @@ void InitRuntimeOnce() {
   FLAGS_m = 0;  // malloc-backed, sandbox-safe: PlainPacketPool
   bess::PacketPool::CreateDefaultPools(kPoolCapacity);
   PortBuilder::InitDrivers();
+}
+
+// Two CPUs a worker spec may name: the kernel exposes the CPU's topology and it
+// is in this process's set, which is what pipeline_validator.cc accepts. Not
+// Placement::WorkerCpus(), which leaves the control CPU out -- on a two-CPU
+// host that leaves one -- and not a hardcoded 0 and 1, since a CPU can be
+// offline and a spec that names one is refused.
+std::vector<int> TwoUsableCpus() {
+  std::vector<int> cpus;
+  for (const int c : bess::runtime::ProcessPlacement().cpus) {
+    const std::optional<bess::dataplane::CpuId> cpu =
+        bess::dataplane::CpuIdFrom(c);
+    if (cpu && bess::runtime::CpuPresent(*cpu)) {
+      cpus.push_back(c);
+      if (cpus.size() == 2) {
+        break;
+      }
+    }
+  }
+  return cpus;
 }
 
 // A pipeline with everything the structural path can do: a worker, two
@@ -1244,9 +1266,13 @@ TEST_F(ApplyPipelineTest, AClassMovesOutOfARemovedOneWithItsTask) {
 
 // A task the plan moves off a worker it removes does not keep that worker.
 TEST_F(ApplyPipelineTest, ATaskMovesOffARemovedWorker) {
+  const std::vector<int> cpus = TwoUsableCpus();
+  if (cpus.size() < 2) {
+    GTEST_SKIP() << "needs two CPUs a worker spec may name";
+  }
   PipelineSpec two;
-  two.workers.push_back({0, 0, ""});
-  two.workers.push_back({1, 1, ""});
+  two.workers.push_back({0, cpus[0], ""});
+  two.workers.push_back({1, cpus[1], ""});
   two.modules.push_back({"src0", "Source", {}});
   two.modules.push_back({"sink", "Sink", {}});
   two.connections.push_back({"src0", 0, "sink", 0, false});
@@ -1272,9 +1298,13 @@ TEST_F(ApplyPipelineTest, ATaskMovesOffARemovedWorker) {
 // same plan removes (the retire phase would then refuse to remove it), also
 // when the plan's own steps pause workers on the way (a disconnect does).
 TEST_F(ApplyPipelineTest, NewTasksAvoidARemovedWorker) {
+  const std::vector<int> cpus = TwoUsableCpus();
+  if (cpus.size() < 2) {
+    GTEST_SKIP() << "needs two CPUs a worker spec may name";
+  }
   PipelineSpec two;
-  two.workers.push_back({0, 0, ""});
-  two.workers.push_back({1, 1, ""});
+  two.workers.push_back({0, cpus[0], ""});
+  two.workers.push_back({1, cpus[1], ""});
   two.modules.push_back({"sink", "Sink", {}});
   two.modules.push_back({"old", "Bypass", {}});
   two.connections.push_back({"old", 0, "sink", 0, false});
