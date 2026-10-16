@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# LeakSanitizer suppressions for the ASan lane (tools/ci_profile.py).
+#
+# Exactly one class of report is suppressed here (D-142): protobuf's generated
+# file registration. When bessd dlopen()s a plugin, the plugin's generated
+# protobuf code calls google::protobuf::internal::AssignDescriptors, which
+# allocates the file's descriptor table once per process and never frees it --
+# protobuf's descriptor structures are process-lifetime by design. `unload
+# plugin` closes the library (so a rebuilt plugin is picked up), which is what
+# makes those allocations unreachable at exit and therefore visible to LSan:
+#
+#   Direct leak of 96 byte(s) in 1 object(s) allocated from:
+#       #0 operator new(unsigned long)
+#       ...
+#       #5 google::protobuf::internal::AssignDescriptors(...)
+#       #6 <unknown module>          <- the closed plugin library
+#
+# Nothing else is suppressed: a bare `leak:*` would hide real leaks in the
+# daemon, and this entry names the one protobuf entry point and nothing more.
+leak:google::protobuf::internal::AssignDescriptors

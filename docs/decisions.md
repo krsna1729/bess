@@ -10209,3 +10209,34 @@ table's lookup therefore reports the winning rule's id next to its gate (`Concur
 **Code.** `core/gate.h`, `core/classifier/concurrent_masked.{h,cc}`, `core/classifier/masked_rule_resource.h`,
 `core/modules/exact_match.{h,cc}`, `core/modules/wildcard_match.{h,cc}`, `core/modules/session_pipeline_test.cc`,
 `protobuf/module_msg.proto`, `docs/dataplane-tables.md`.
+
+## D-142 A plugin's protobuf descriptors are process-lifetime, so the ASan lane suppresses exactly them
+
+- When bessd `dlopen()`s a plugin, the plugin's generated protobuf code registers its file in the daemon's
+  process-global descriptor pool (`google::protobuf::internal::AssignDescriptors`). protobuf never frees those
+  structures: they are process-lifetime allocations by design.
+- `unload plugin` removes what the plugin registered -- its module classes, port drivers and gate hooks -- and
+  closes the library, so a plugin rebuilt at the same path is picked up. The descriptor allocations stay, and
+  after the library is closed nothing can reach them: LSan reports them as leaks. CI run 38894486045 shows
+  exactly that in the clang-asan lane (`sample_plugin_load`): "Direct leak of 96 byte(s) in 1 object(s)", two
+  blocks, top frame `AssignDescriptors`, the calling frame `<unknown module>` (the closed library). It
+  reproduced locally on `build/asan`.
+- Decision: keep the unload semantics and declare the descriptor tables for what they are, with
+  `tools/lsan.supp` naming `AssignDescriptors` and nothing else, used by the ASan lane through
+  `LSAN_OPTIONS=suppressions=` (`ASAN_OPTIONS`'s `suppressions=` is ASan's list, which rejects `leak:` entries
+  outright: "failed to parse suppressions"). A bare `leak:*` would hide real leaks.
+- Why not keep the library mapped instead: the daemon would then run the *old* code after a plugin is rebuilt
+  at the same path, which is worse than the allocation. Why the residual pointer is not reachable in the
+  daemon: `Any` decoding is typed (`Any::UnpackTo` compares the type URL against the target message's own
+  name, no pool lookup), `GetSchema` walks registered module classes, and resource codecs are resolved by
+  registered resource -- all of which a plugin's unload removes first. A client that names an unloaded
+  plugin's message type is refused as an unknown resource or class.
+
+**Consequence.** The ASan lane still catches every real leak; the one entry it ignores is protobuf's own
+process-lifetime bookkeeping for a library the daemon was told to close. Locally (protobuf built from source,
+Arch), two further environment-specific reports need switching off to run that test at all:
+`new_delete_type_mismatch=0` (the CLI's protobuf, known) and `detect_container_overflow=0` (protobuf's
+`RepeatedField::GrowNoAnnotate` memcpy inside its own annotated container, the case
+`__SANITIZER_DISABLE_CONTAINER_OVERFLOW__` exists for). CI's protobuf build does not need them.
+
+**Code.** `tools/lsan.supp`, `tools/ci_profile.py` (the address branch).

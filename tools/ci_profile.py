@@ -376,6 +376,11 @@ def step_test(s):
         env = s.env_with_dpdk()
         env['ASAN_OPTIONS'] = ('detect_leaks=1:halt_on_error=1:abort_on_error=1'
                                ':external_symbolizer_path=' + symbolizer())
+        # tools/lsan.supp suppresses one benign class of report: protobuf's
+        # process-lifetime descriptor tables for a dlopen()ed plugin (D-142).
+        # Leak suppressions are LSan's, and ASan rejects a file that has them
+        # ("failed to parse suppressions"), so they go in LSAN_OPTIONS.
+        env['LSAN_OPTIONS'] = ('suppressions=' + str(ROOT / 'tools' / 'lsan.supp'))
         env['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1:external_symbolizer_path=' + symbolizer()
         s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs',
                '--no-suite', 'live',
