@@ -190,9 +190,9 @@ void OGate::AddTrackHook() {
     }
     track_builder = &it->second;
 
-    // A new Track() instance takes an argument that has a "bits" flag.
+    // Track takes a TrackArg; its byte-counting flag is reserved (D-140), so a
+    // connected gate installs the default one.
     static bess::pb::TrackArg track_arg;
-    track_arg.set_bits(false);
     CHECK(arg.PackFrom(track_arg));
   }
   pb_error_t error;

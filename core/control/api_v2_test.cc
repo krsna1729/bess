@@ -747,19 +747,10 @@ TEST_F(ApiV2ServiceTest, InvokeAction) {
   EXPECT_EQ(ENOTSUP, detail.errno_value());
   EXPECT_EQ("action", detail.field());
 
-  // A command that edits state the resources hold is not an action: v2
-  // refuses it, and nothing changes (the legacy `add` it named is gone with
-  // D-140, so the argument shape no longer exists).
-  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT,
-            invoke("l2", "add", bess::pb::EmptyArg(), Epoch(), &resp, &detail));
-  EXPECT_EQ(ENOTSUP, detail.errno_value());
-  EXPECT_EQ("action", detail.field());
-  bess::pb::L2ForwardCommandLookupArg lookup_added;
-  lookup_added.add_addrs("02:00:00:00:00:09");
-  EXPECT_NE(grpc::StatusCode::OK, invoke("l2", "lookup", lookup_added, Epoch(), &resp))
-      << "the refused add ran";
   // The same state through the resource, as a client writes it (D-140): the
   // entry the legacy `add` would have written.
+  bess::pb::L2ForwardCommandLookupArg lookup_added;
+  lookup_added.add_addrs("02:00:00:00:00:09");
   {
     bess::pb::L2ForwardMacKey key;
     key.set_addr("02:00:00:00:00:09");

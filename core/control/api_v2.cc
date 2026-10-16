@@ -884,11 +884,6 @@ grpc::Status ControlV2Service::ListMetrics(grpc::ServerContext *,
       samples.push_back({"bess_gate_packets_total", stats::MetricKind::kCounter,
                          "Packets through a module's gate", labels,
                          static_cast<double>(totals.pkts)});
-      if (totals.bytes != 0) {
-        samples.push_back({"bess_gate_bytes_total", stats::MetricKind::kCounter,
-                           "Bytes through a module's gate (when the hook counts bytes)", labels,
-                           static_cast<double>(totals.bytes)});
-      }
     };
     for (const auto &[name, module] : runtime::runtime().modules().All()) {
       for (bess::IGate *g : module->igates()) {

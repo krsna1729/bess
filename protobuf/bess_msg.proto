@@ -7,12 +7,8 @@ syntax = "proto3";
 import "google/protobuf/any.proto";
 import "error.proto";
 
-/// - "timestamp" represents the current time in seconds since the Epoch.
-/// (in the same manner as gettimeofday() in C and time.time() in Python)
-///
-/// - All Responses (including EmptyResponse) messages have an "Error"-type
-///   field. Upon a successful RPC the message has the default value
-///   (with error code 0). Otherwise the error code has a non-zero value.
+/// - `CommandResponse` is the reply shape every action uses: an "Error"-type
+///   field, whose code is 0 on success, and the action's data.
 
 package bess.pb;
 
@@ -30,15 +26,13 @@ message CommandResponse {
 //  Gate hooks
 //  -------------------------------------------------------------------------
 
-/// Enable/Disable the "Track" hook on a gate (or all gates)
-///
-/// "Track" hook accumulates the number of total packets, batches and bits
-///  passing through a gate. This incurs some amount of CPU overheads. While
-///  the cost is very small, remember that the delay adds up at every gate.
-///
-/// NOTE: There should be no running worker to run this command.
+/// The "Track" gate hook's argument: it has none (D-144).
+// Track counts packets and batches. Byte counting is gone: the legacy service
+// that configured the hook is deleted (D-140), so `bits` is reserved and
+// `bess_gate_bytes_total` can no longer appear.
 message TrackArg {
-  bool bits = 5;  /// Tracks bits too if True, else only packets and batches
+  reserved 5;
+  reserved "bits";
 }
 
 /// Enable/Disable tcpdump tapping at an input/output gate.

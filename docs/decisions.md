@@ -10264,14 +10264,15 @@ Arch), two further environment-specific reports need switching off to run that t
   one that was cut over.
 
 **Verification.** Every deleted name is absent from the tree: a `grep -w` over `core/ sdk/ tools/ tests/
-protobuf/` for all 111 deleted `message` names finds only two comments in the rewritten tests ("the shape the
-legacy ... wire message carried") and `v2`'s own same-named `ImportPluginRequest`/`UnloadPluginRequest`
-(`core/control/admin_v2.*`). `buf breaking` does not flag such a push: push 68 deleted `service.proto` itself
-and its Protobuf compatibility job was green, as was push 70's.
+protobuf/` for the 99 top-level deleted `message` names finds only two comments in the rewritten tests ("the
+shape the legacy ... wire message carried") and `v2`'s own same-named `ImportPluginRequest`,
+`UnloadPluginRequest` and `TrafficClass` (`core/control/admin_v2.*`, `control_v2.proto`). `buf breaking` does
+not flag such a push: push 68 deleted `service.proto` itself and its Protobuf compatibility job was green, as
+was push 70's.
 
-**Consequence.** The proto surface is 856 lines smaller (bess_msg 544, module_msg 312), and the generated
-bindings every SDK consumer builds shrink with it. A client that asks for a deleted type is refused the same
-way it was after D-140: an unknown type from `GetSchema`.
+**Consequence.** The proto surface is 850 lines smaller (538 in `bess_msg.proto`, 312 in `module_msg.proto`),
+and the generated bindings every SDK consumer builds shrink with it. A client that asks for a deleted type is
+refused the same way it was after D-140: an unknown type from `GetSchema`.
 
 **Code.** `protobuf/bess_msg.proto`, `protobuf/module_msg.proto`, `core/control/control_plane.cc`,
 `core/control/api_v2_test.cc`, `core/modules/{bridge,exact_match,wildcard_match,vif}_test.cc`,
@@ -10288,11 +10289,11 @@ way it was after D-140: an unknown type from `GetSchema`.
 - Decision: remove the feature, not just its switch. `TrackArg` carries no fields (`reserved 5; reserved
   "bits";`), `set_track_bytes`, `track_bytes_`, `Track::Totals::bytes`, the `bytes()` accessor, the `kBytes`
   counter slot and the `bess_gate_bytes_total` sample are gone, and the hook's counter set is two counters.
-- Why reserve the field rather than reuse it: the number and the name were published in the module proto. A
+- Why reserve the field rather than reuse it: the number and the name were published in `bess_msg.proto`. A
   later byte counter -- a different feature, with an explicit switch -- starts from a new number, and no client
   can silently write the old one.
-- Why the metric went with it: a metric that cannot be emitted is a promise the API does not keep. `GetMetrics`
-  now lists exactly what `ProcessBatch` fills.
+- Why the metric went with it: a metric that cannot be emitted is a promise the API does not keep. The
+  `ListMetrics` reply now lists exactly what `ProcessBatch` fills.
 
 **Consequence.** One fewer branch in the per-gate hook and one fewer counter per gate direction, which is the
 per-packet path's own hot structure. Nothing read the value: the metrics sample was the only consumer, and the
