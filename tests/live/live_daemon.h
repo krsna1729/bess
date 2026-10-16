@@ -139,6 +139,9 @@ class Daemon {
   int pid_ = -1;
   std::string address_;
   std::string log_path_;
+  // Shutdown() had to SIGKILL it: keep the log on disk and say where it is
+  // (a daemon stuck in a request is the case worth a record).
+  bool keep_log_ = false;
   std::unique_ptr<bess::sdk::Client> client_;
 };
 

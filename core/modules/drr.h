@@ -271,6 +271,16 @@ class DRR final : public Module {
   rte_ring *flow_ring_;   // ring used for round robin.
   Flow *current_flow_;  // store current flow between batch rounds.
 
+  // The D-019 ownership invariant, checked in debug builds: the task (its
+  // worker owns the flow state and is the ingress ring's only consumer) never
+  // has two drain loops running at once. A violated invariant is what makes a
+  // ring hand out a slot nobody wrote (the intermittent live-test crash).
+  // Per run, not per worker: a task may move between workers while they are
+  // paused, and D-019 only requires one consumer at a time.
+#ifndef NDEBUG
+  std::atomic<bool> draining_{false};
+#endif
+
   struct Settings {
     uint32_t quantum;
     uint32_t max_queue_size;

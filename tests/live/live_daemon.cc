@@ -327,6 +327,7 @@ void Daemon::Start(int port) {
   char log_template[] = "/tmp/bessd-live-XXXXXX";
   const int log_fd = mkstemp(log_template);
   log_path_ = log_template;
+  keep_log_ = false;  // a fresh daemon: this run's log is this run's to remove
   std::vector<std::string> argv = {Env("BESSD"),       "-f", "-m", "0", "-p",
                                    std::to_string(port), "-skip_root_check",
                                    "-dpdk=false"};
@@ -372,8 +373,52 @@ int Daemon::Shutdown() {
   int status = 0;
   while (waitpid(pid_, &status, WNOHANG) == 0) {
     if (std::chrono::steady_clock::now() > deadline) {
-      kill(pid_, SIGKILL);
-      waitpid(pid_, &status, 0);
+      // A daemon that will not stop when asked is the interesting case: it is
+      // stuck after "BESS daemon has been gracefully shut down", and its log
+      // is the only record of where. Its SIGABRT handler (core/debug.cc)
+      // prints a full stack trace, and it is being killed anyway; SIGKILL is
+      // the fallback for a process too wedged to take the signal.
+      //
+      // SIGUSR1 would be the non-fatal way to ask for the same dump, but it
+      // produced nothing in the runs where this fired (2026-10-16).
+      if (kill(pid_, SIGABRT) != 0) {
+        LOG(ERROR) << "SIGABRT to bessd " << pid_ << ": " << std::strerror(errno);
+      }
+      // TrapHandler (core/debug.cc) builds the trace with one addr2line process
+      // per frame, up to 64 frames, and GoPanic writes it in one LOG(FATAL) at
+      // the end: the log is quiet for the whole symbolization, and a line some
+      // other thread logs must not count as the trace and re-arm a quiet timer.
+      // Wait for the process, or 2 s after the log actually holds the trace, up
+      // to 20 s. (A process-directed SIGABRT runs the handler on an arbitrary
+      // thread, so the trace may be another thread's -- enough to see where the
+      // process was, not proof of where the request is stuck.)
+      const auto abort_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(20);
+      size_t logged = ReadFile(log_path_).size();
+      auto quiet_since = std::chrono::steady_clock::now();
+      while (waitpid(pid_, &status, WNOHANG) == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        const std::string log = ReadFile(log_path_);
+        if (log.size() != logged) {
+          logged = log.size();
+          quiet_since = now;
+        }
+        const bool wrote_trace =
+            log.find("A critical error has occured") != std::string::npos ||
+            log.find("Backtrace (recent calls first)") != std::string::npos;
+        if ((wrote_trace && now - quiet_since > std::chrono::seconds(2)) ||
+            now > abort_deadline) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+      ADD_FAILURE() << "bessd does not stop on request; killing it. Its log:\n"
+                    << ReadFile(log_path_);
+      keep_log_ = true;
+      if (waitpid(pid_, &status, WNOHANG) == 0) {
+        kill(pid_, SIGKILL);
+        waitpid(pid_, &status, 0);
+      }
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -385,8 +430,13 @@ int Daemon::Shutdown() {
 void Daemon::Stop() {
   (void)Shutdown();
   if (!log_path_.empty()) {
-    unlink(log_path_.c_str());
-    log_path_.clear();
+    if (keep_log_) {
+      LOG(INFO) << "bessd's log is kept at " << log_path_;
+      log_path_.clear();
+    } else {
+      unlink(log_path_.c_str());
+      log_path_.clear();
+    }
   }
 }
 

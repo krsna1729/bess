@@ -30,6 +30,24 @@ namespace {
 // Decision D-019 (docs/decisions.md).
 const unsigned kIngressRingFlags = RING_F_SC_DEQ;
 
+// A handover invariant, checked in debug builds only: a packet handed to the
+// module, or drained from the ingress ring, satisfies the field invariants
+// every live mbuf has (a buffer address, at least one segment, the head's data
+// within its buffer, data_len within pkt_len). A stale handle -- a pointer to
+// memory the allocator has since reused, whose bytes read as the MALLOC_PERTURB_
+// pattern -- is what turned the intermittent CI crash in DRR::GetId
+// (live_classifier_traffic, 2026-10-15) into a SIGSEGV far from the write that
+// caused it; this reports it at the boundary, with the ring's state.
+//
+// Deliberately not rte_mbuf_sanity_check() (which panics without this context)
+// and not RTE_MBUF_DIRECT/nb_segs==1: an indirect (cloned) or multi-segment
+// packet is legitimate here.
+bool PlausiblePacket(bess::PacketHandle pkt) {
+  return pkt != nullptr && pkt->buf_addr != nullptr && pkt->nb_segs >= 1 &&
+         pkt->data_off <= pkt->buf_len && pkt->data_len <= pkt->pkt_len &&
+         static_cast<uint32_t>(pkt->data_off) + pkt->data_len <= pkt->buf_len;
+}
+
 // The refusal a settings write reports for a quantum below 1 (nullptr when
 // `size` is valid).
 const char *QuantumError(uint32_t size) {
@@ -185,6 +203,17 @@ CommandResponse DRR::AllocateRings() {
 
 void DRR::ProcessBatch(Context *, bess::PacketBatch *batch) {
   const int cnt = batch->cnt();
+  // A batch larger than the framework's maximum, or a handle that is not a
+  // live mbuf, is memory corruption upstream of here; PacketBatch::add() has
+  // no bounds check, so this is the last place it can be caught (D-097's
+  // debug-check convention: no cost in a release build).
+  DCHECK_LE(cnt, static_cast<int>(bess::PacketBatch::kMaxBurst))
+      << "DRR: a batch arrived with " << cnt << " packets";
+  for (int i = 0; i < cnt; i++) {
+    DCHECK(PlausiblePacket(batch->handles()[i]))
+        << "DRR: packet " << i << " of the batch handed over (cnt " << cnt
+        << ") is not a live mbuf";
+  }
   const unsigned sent = rte_ring_mp_enqueue_burst(
       ingress_, reinterpret_cast<void *const *>(batch->handles()), cnt,
       nullptr);
@@ -195,18 +224,36 @@ void DRR::ProcessBatch(Context *, bess::PacketBatch *batch) {
 
 void DRR::DrainIngress(uint32_t limit) {
   bess::PacketHandle pkts[bess::PacketBatch::kMaxBurst];
+  // D-019: one consumer at a time. Both the flag and the check are debug-only
+  // (no cost in a release build): the task may move between workers while they
+  // are paused, so what must never happen is two drains at once, not a second
+  // worker.
+#ifndef NDEBUG
+  const bool already_draining =
+      draining_.exchange(true, std::memory_order_acq_rel);
+  DCHECK(!already_draining)
+      << "DRR: two threads are draining the ingress ring (D-019: the task's "
+         "worker is its only consumer)";
+#endif
   while (limit > 0) {
     const unsigned n = rte_ring_sc_dequeue_burst(
         ingress_, reinterpret_cast<void **>(pkts),
         std::min<uint32_t>(limit, bess::PacketBatch::kMaxBurst), nullptr);
     for (unsigned i = 0; i < n; i++) {
+      DCHECK(PlausiblePacket(pkts[i]))
+          << "DRR: the ingress ring handed out packet " << i << " of " << n
+             << " (value " << static_cast<const void *>(pkts[i])
+             << ", ring count " << rte_ring_count(ingress_) << ")";
       Classify(pkts[i]);
     }
     if (n < bess::PacketBatch::kMaxBurst) {
-      return;
+      break;
     }
     limit -= n;
   }
+#ifndef NDEBUG
+  draining_.store(false, std::memory_order_release);
+#endif
 }
 
 void DRR::Classify(bess::PacketHandle handle) {
