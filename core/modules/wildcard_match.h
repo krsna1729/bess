@@ -70,9 +70,12 @@ class WildcardMatch final : public Module {
   void DeInit() override;
 
   // What ProcessBatch decides, without emitting: gates[i] is the output gate
-  // of packet i. The same code as the packet path, for tests and benchmarks
-  // that drive the module from a registered reader thread.
-  void ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates) const;
+  // of packet i and, when the module has an action resource, action_ids[i] is
+  // the action id to deliver (0 for a miss, D-141). The same code as the
+  // packet path, for tests and benchmarks that drive the module from a
+  // registered reader thread.
+  void ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates,
+                     uint32_t *action_ids) const;
 
   std::string GetDesc() const override;
 
@@ -203,6 +206,13 @@ class WildcardMatch final : public Module {
   // it, the packet path never reads it.
   size_t max_tuples_ = kDefaultMaxTuples;
   std::optional<uint64_t> initial_default_gate_;  // as given at creation
+
+  // Action mode (D-141): the argument names an action resource, so a rule may
+  // carry an ActionId, which the packet path writes into the "action_id"
+  // metadata attribute (0 on a miss). Fixed at Init().
+  bool has_action_resource_ = false;
+  std::string action_resource_;
+  int action_id_attr_ = -1;
 
   // The live rule table (also held by the published generation).
   std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table_;

@@ -34,7 +34,11 @@ class MaskedRuleResource final : public dataplane::Resource {
  public:
   struct Value {
     int64_t priority = 0;
-    uint16_t result = 0;
+    uint16_t gate = 0;
+    // The action the rule takes, 0 for none (D-141): a nonzero id is a
+    // reference the owner resolves, and only a module with an action resource
+    // ever sets one.
+    uint32_t action_id = 0;
   };
   using Result = std::expected<void, std::string>;
   using ReferencesFn =
@@ -74,7 +78,8 @@ class MaskedRuleResource final : public dataplane::Resource {
       return {};
     }
     const auto rule = Find(*table_(), key);
-    return rule ? references_(Value{rule->priority, rule->result})
+    return rule ? references_(Value{rule->priority, rule->gate,
+                                    rule->action_id})
                 : std::vector<dataplane::Reference>{};
   }
   void VisitReferences(
@@ -85,7 +90,8 @@ class MaskedRuleResource final : public dataplane::Resource {
     }
     table_()->ForEach([&](ConstBytes, ConstBytes,
                           const ConcurrentMaskedTable::Rule &rule) {
-      for (const auto &ref : references_(Value{rule.priority, rule.result})) {
+      for (const auto &ref : references_(Value{rule.priority, rule.gate,
+                                               rule.action_id})) {
         visit(ref);
       }
     });
@@ -106,7 +112,8 @@ class MaskedRuleResource final : public dataplane::Resource {
     std::vector<dataplane::Reference> previous_references;
     if (previous && references_) {
       previous_references =
-          references_(Value{previous->priority, previous->result});
+          references_(Value{previous->priority, previous->gate,
+                            previous->action_id});
     }
     if (op.kind == dataplane::OpKind::kErase) {
       if (!previous) {
@@ -140,7 +147,8 @@ class MaskedRuleResource final : public dataplane::Resource {
       references = references_(*v);
     }
     auto staged = std::make_unique<StagedRule>(table);
-    auto prepared = table->PrepareUpsert(mask, value, v->priority, v->result);
+    auto prepared = table->PrepareUpsert(mask, value, v->priority, v->gate,
+                                         v->action_id);
     if (!prepared) {
       return std::unexpected(Describe(prepared.error()));
     }

@@ -825,6 +825,7 @@ class RandomPackets {
   // The gates `em` sends every packet to, 32 at a time.
   std::vector<gate_idx_t> Classify(const ExactMatch *em) const {
     std::vector<gate_idx_t> gates(handles_.size());
+    std::vector<uint32_t> action_ids(handles_.size());
     for (size_t first = 0; first < handles_.size();
          first += bess::PacketBatch::kMaxBurst) {
       const size_t n =
@@ -834,7 +835,8 @@ class RandomPackets {
       for (size_t i = 0; i < n; i++) {
         batch.add(bess::PacketRef(handles_[first + i]));
       }
-      em->ClassifyBatch(&batch, gates.data() + first);
+      em->ClassifyBatch(&batch, gates.data() + first,
+                        action_ids.data() + first);
     }
     return gates;
   }

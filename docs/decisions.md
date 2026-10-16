@@ -10191,15 +10191,21 @@ before. Both belong with the classifier result-model work (the `{gate, ActionId}
   action.
 - Without `action_resource` an action id is still refused: nothing could resolve it. An invalid gate is refused
   in both modes, in the typed codec and in the resource's own `check_value`.
-- `ExactMatch::ClassifyActionsBatch` (the fused path's entry point, D-121) now returns both halves, and the
-  fused-kernel test compares its gates and ids against the generic path, so a fused lookup cannot silently drop
-  either half.
+- Both classifiers' batch helpers (`ClassifyBatch(batch, gates, action_ids)`, which the tests and the
+  benchmarks call and `ProcessBatch` shares) now deliver both halves, and the fused-kernel test compares its
+  gates and ids against the generic path, so a fused lookup cannot silently drop either half.
 
 **Consequence.** The classifier returns what a session compiler needs in one lookup: the gate the packet leaves
 on and the action record it takes. Before this, a rule could name a gate *or* an action id, never both, so a
-pipeline that had to route a match somewhere other than the action table needed a second classifier. This is the
-BESS half of the UPF's `{gate, ActionId}` item; the WildcardMatch half (action id on the rule value, action
-resource on the argument, the masked table's result) is the next change and reuses this encoding.
+pipeline that had to route a match somewhere other than the action table needed a second classifier. Both
+classifiers carry it: ExactMatch packs the pair into its rule value, and in the masked table the gate stays in
+the packed value's 16-bit result slot while the ActionId sits in the rule record. Action mode adds one indexed
+record read per winner and the 4-byte metadata write per packet; a gate-mode lookup stores the same 2-byte gate
+in a `Match` slot as before and skips the id store
+(`ConcurrentMaskedTable::LookupBatch`'s `with_rule_id`), so it reads no record and writes no id. The masked
+table's lookup therefore reports the winning rule's id next to its gate (`ConcurrentMaskedTable::Match`,
+`RuleAt`).
 
-**Code.** `core/gate.h`, `core/modules/exact_match.{h,cc}`, `core/modules/session_pipeline_test.cc`,
-`protobuf/module_msg.proto`.
+**Code.** `core/gate.h`, `core/classifier/concurrent_masked.{h,cc}`, `core/classifier/masked_rule_resource.h`,
+`core/modules/exact_match.{h,cc}`, `core/modules/wildcard_match.{h,cc}`, `core/modules/session_pipeline_test.cc`,
+`protobuf/module_msg.proto`, `docs/dataplane-tables.md`.

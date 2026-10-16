@@ -350,7 +350,8 @@ reference to something missing.
   key does not fit (`ExactRuleResource::Hooks::make_room`); pending keys
   move to the new table with the rest. D-022, D-032.
 - **WildcardMatch** registers its rules as `<module>/rules` (key: packed
-  mask then packed value; value: `{priority, gate}`) through
+  mask then packed value; value: `{priority, gate, action_id}`, where a nonzero
+  action id is a reference to the module's action resource, D-141) through
   `MaskedRuleResource`. A rule being prepared sits in its tuple naming a
   record that loses to every rule and alone reads as a miss; the table's
   lookup filters it, so the packet path is unchanged. The result 0xFFFF is

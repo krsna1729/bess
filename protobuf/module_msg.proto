@@ -434,6 +434,11 @@ message ExactMatchRuleValue {
   // 'action_resource' on the module. The packet path writes it into the
   // packet's "action_id" metadata attribute, and writes 0 on a miss, so a
   // stale id cannot reach a later lookup (D-141).
+  //
+  // Both fields may be 0: on a module with an 'action_resource' that means
+  // "to the action table, with no action", which the table drops (id 0 is no
+  // action), so a rule that names neither is refused traffic rather than a
+  // codec error. Setting an action id still needs the action resource.
   uint32 action_id = 2;
 }
 
@@ -520,7 +525,13 @@ message WildcardMatchRuleKey {
 
 message WildcardMatchRuleValue {
   int64 priority = 1;
+  // The output gate a matching packet leaves on.
   uint64 gate = 2;
+  // The ActionId of the action a matching packet takes, 0 for none. Needs
+  // 'action_resource' on the module. The packet path writes it into the
+  // packet's "action_id" metadata attribute, and writes 0 on a miss, so a
+  // stale id cannot reach a later lookup (D-141).
+  uint32 action_id = 3;
 }
 
 message WildcardMatchCommandAddArg {
@@ -1484,6 +1495,8 @@ message WildcardMatchArg {
   /// nothing on the packet path. A new mask beyond it is refused with ENOSPC.
   uint32 max_tuples = 2;
   optional uint64 default_gate = 3; /// The gate of a packet no rule matches (default: drop); set_default_gate changes it later.
+  /// The ActionTable's actions resource: when set, a rule may name an action (its action_id, 0 for none) as well as a gate, and the action id goes to the packet's "action_id" metadata attribute (D-141).
+  string action_resource = 4;
 }
 
 /**

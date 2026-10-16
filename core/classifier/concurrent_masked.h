@@ -71,7 +71,19 @@ class ConcurrentMaskedTable {
   struct Rule {
     int64_t priority;
     uint64_t sequence;  // command order: ties go to the later command
-    uint16_t result;
+    uint16_t gate;      // the output gate a matching packet leaves on
+    // The ActionId of the action the rule names, 0 for none (D-141). It lives
+    // in the record, not in the packed value: bits 32-47 of the packed value
+    // keep carrying the gate, so a lookup that needs no action reads no
+    // record. Only a module with an action resource reads one.
+    uint32_t action_id;
+  };
+
+  // One lookup result: the winning rule's gate (out of the packed value) and
+  // the rule's id, so a caller that needs the record can load it.
+  struct Match {
+    uint16_t gate;
+    uint32_t rule_id;
   };
 
   enum class UpsertResult : uint8_t {
@@ -102,7 +114,7 @@ class ConcurrentMaskedTable {
   // -- writer ------------------------------------------------------------------
 
   UpsertResult Upsert(ConstBytes mask, ConstBytes value, int64_t priority,
-                      uint16_t result);
+                      uint16_t gate, uint32_t action_id = 0);
   // False if no rule has exactly this (mask, value).
   bool Erase(ConstBytes mask, ConstBytes value);
   // Removes every rule and every tuple.
@@ -125,12 +137,14 @@ class ConcurrentMaskedTable {
     std::vector<std::byte> value;
     RuleId id = 0;        // the new record (upsert); 0 for an erase
     RuleId old = 0;       // the rule replaced or erased; 0 for a new rule
-    uint16_t result = 0;
+    uint16_t gate = 0;
+    uint32_t action_id = 0;
   };
   std::expected<Prepared, UpsertResult> PrepareUpsert(ConstBytes mask,
                                                       ConstBytes value,
                                                       int64_t priority,
-                                                      uint16_t result);
+                                                      uint16_t gate,
+                                                      uint32_t action_id = 0);
   // nullopt if no rule has exactly this (mask, value).
   std::optional<Prepared> PrepareErase(ConstBytes mask, ConstBytes value);
   RuleId Commit(const Prepared &prepared) noexcept;
@@ -141,6 +155,11 @@ class ConcurrentMaskedTable {
 
   // The committed rule with exactly this (mask, value), if any.
   std::optional<Rule> FindRule(ConstBytes mask, ConstBytes value) const;
+
+  // The record a Match names (D-141). Records live in fixed chunks that are
+  // never moved or freed while the table lives, so this is a plain indexed
+  // load -- the one a module with an action resource makes per winner.
+  const Rule &RuleAt(RuleId id) const noexcept { return Record(id); }
 
   // Visits every rule: fn(ConstBytes mask, ConstBytes value, const Rule &).
   template <typename Fn>
@@ -168,10 +187,12 @@ class ConcurrentMaskedTable {
   // -- reader -------------------------------------------------------------------
 
   // Classifies `n` (<= kMaxBatch) keys packed at `stride` bytes. Writes
-  // results[i] and sets bit i for each key some rule matches; others are left
-  // untouched.
-  uint64_t LookupBatch(ConstBytes keys, size_t stride, uint16_t *results,
-                       size_t n) const noexcept {
+  // matches[i].gate and sets bit i for each key some rule matches; others are
+  // left untouched. With `with_rule_id` (D-141), also writes the winning
+  // rule's id -- what a module with an action resource reads the record with;
+  // a gate-mode lookup does not store it, so it pays nothing for the field.
+  uint64_t LookupBatch(ConstBytes keys, size_t stride, Match *matches, size_t n,
+                       bool with_rule_id = true) const noexcept {
     promise(n <= kMaxBatch);
     const TupleList *list = tuples_.Read();
     if (n == 0 || list->tuples.empty()) {
@@ -216,13 +237,16 @@ class ConcurrentMaskedTable {
     }
     for (uint64_t m = matched; m != 0; m &= m - 1) {
       const size_t i = static_cast<size_t>(__builtin_ctzll(m));
-      const auto result = static_cast<uint16_t>(best[i] >> 32);
+      const auto gate = static_cast<uint16_t>(best[i] >> 32);
       // The best match is a rule a transaction is preparing only when
       // nothing else matched (its record loses to every rule): a miss.
-      if (result == kPendingResult) {
+      if (gate == kPendingResult) {
         matched &= ~(uint64_t{1} << i);
       } else {
-        results[i] = result;
+        matches[i].gate = gate;
+        if (with_rule_id) {
+          matches[i].rule_id = IdOf(best[i]);
+        }
       }
     }
     return matched;

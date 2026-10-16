@@ -152,9 +152,10 @@ ConcurrentMaskedTable::RuleId ConcurrentMaskedTable::Find(
 }
 
 ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
-    ConstBytes mask, ConstBytes value, int64_t priority, uint16_t result) {
+    ConstBytes mask, ConstBytes value, int64_t priority, uint16_t gate,
+    uint32_t action_id) {
   promise(mask.size() == key_len_ && value.size() == key_len_);
-  if (result == kPendingResult) {
+  if (gate == kPendingResult) {
     return UpsertResult::kReservedResult;
   }
   for (size_t b = 0; b < key_len_; b++) {
@@ -206,16 +207,17 @@ ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
   // Written before the table add that publishes the id (its release store).
   MutableRecord(id) = {.priority = priority,
                        .sequence = next_sequence_++,
-                       .result = result};
+                       .gate = gate,
+                       .action_id = action_id};
   const RuleId old = Find(*table, value);
   // The tuple's ceiling first: a reader that sees the rule sees it raised.
   auto ceiling = new_tuple ? std::make_shared<Ceiling>(priority)
                            : list->tuples[index].ceiling;
   RaiseCeiling(ceiling->value, priority);
-  if (table->Upsert(value, Pack(id, result)) ==
+  if (table->Upsert(value, Pack(id, gate)) ==
       ConcurrentExactTable::UpsertResult::kFull) {
     table = Grown(*table);
-    if (table == nullptr || table->Upsert(value, Pack(id, result)) ==
+    if (table == nullptr || table->Upsert(value, Pack(id, gate)) ==
                                 ConcurrentExactTable::UpsertResult::kFull) {
       free_ids_.push_back(id);  // never published: reusable at once
       return UpsertResult::kFull;
@@ -283,9 +285,10 @@ std::optional<ConcurrentMaskedTable::Rule> ConcurrentMaskedTable::FindRule(
 std::expected<ConcurrentMaskedTable::Prepared,
               ConcurrentMaskedTable::UpsertResult>
 ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
-                                     int64_t priority, uint16_t result) {
+                                     int64_t priority, uint16_t gate,
+                                     uint32_t action_id) {
   promise(mask.size() == key_len_ && value.size() == key_len_);
-  if (result == kPendingResult) {
+  if (gate == kPendingResult) {
     return std::unexpected(UpsertResult::kReservedResult);
   }
   for (size_t b = 0; b < key_len_; b++) {
@@ -307,7 +310,8 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
     // rule's (ties go to the later command).
     MutableRecord(pending_id_) = {.priority = INT64_MIN,
                                   .sequence = 0,
-                                  .result = kPendingResult};
+                                  .gate = kPendingResult,
+                                  .action_id = 0};
   }
 
   const TupleList *list = tuples_.Read();
@@ -344,7 +348,8 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
   // Written now, named by the table only at Commit() (its release store).
   MutableRecord(id) = {.priority = priority,
                        .sequence = next_sequence_++,
-                       .result = result};
+                       .gate = gate,
+                       .action_id = action_id};
   if (prepared.old == 0) {
     // A new rule: present but pending, so capacity is settled here.
     const uint64_t pending = Pack(pending_id_, kPendingResult);
@@ -375,7 +380,8 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
     PublishTuples(std::move(next));
   }
   prepared.id = id;
-  prepared.result = result;
+  prepared.gate = gate;
+  prepared.action_id = action_id;
   prepared_++;
   return prepared;
 }
@@ -411,7 +417,7 @@ ConcurrentMaskedTable::RuleId ConcurrentMaskedTable::Commit(
   if (prepared.id != 0) {
     RaiseCeiling(list->tuples[index].ceiling->value, Record(prepared.id).priority);
     // An in-place value store of a present key: cannot fail.
-    CHECK(table.Upsert(value, Pack(prepared.id, prepared.result)) ==
+    CHECK(table.Upsert(value, Pack(prepared.id, prepared.gate)) ==
           ConcurrentExactTable::UpsertResult::kUpdated);
     if (prepared.old == 0) {
       size_++;

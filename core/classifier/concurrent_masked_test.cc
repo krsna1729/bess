@@ -42,11 +42,26 @@ std::unique_ptr<ConcurrentMaskedTable> MakeTable(size_t max_tuples = 8) {
   return std::move(*t);
 }
 
-// The result for one key, or -1 on a miss.
+// The gate of one key, or -1 on a miss. The rule id a Match also carries is
+// what a module with an action resource reads its record for (D-141).
 int Classify(const ConcurrentMaskedTable &t, uint64_t key) {
   const Bytes k = B(key);
-  uint16_t result = 0;
-  return t.LookupBatch(C(k), kKeyLen, &result, 1) ? result : -1;
+  ConcurrentMaskedTable::Match m{};
+  return t.LookupBatch(C(k), kKeyLen, &m, 1) ? m.gate : -1;
+}
+
+// LookupBatch that keeps the gates and drops the rule ids: what these tests
+// assert on. n must be <= kMaxBatch.
+uint64_t LookupGates(const ConcurrentMaskedTable &t, ConstBytes keys,
+                     size_t stride, uint16_t *out, size_t n) {
+  std::array<ConcurrentMaskedTable::Match, ConcurrentMaskedTable::kMaxBatch> m;
+  const uint64_t hits = t.LookupBatch(keys, stride, m.data(), n);
+  for (size_t i = 0; i < n; i++) {
+    if ((hits >> i) & 1) {
+      out[i] = m[i].gate;
+    }
+  }
+  return hits;
 }
 
 TEST(ConcurrentMaskedTableTest, HigherPriorityThenLaterCommandWins) {
@@ -81,7 +96,8 @@ TEST(ConcurrentMaskedTableTest, SkipsOnlyTuplesThatCannotWin) {
   auto classify_all = [&](std::array<uint16_t, 4> &out) {
     std::array<Bytes, 4> k;
     for (size_t i = 0; i < 4; i++) k[i] = B(keys[i]);
-    return t->LookupBatch(ConstBytes(k[0].data(), 4 * kKeyLen), kKeyLen, out.data(), 4);
+    return LookupGates(*t, ConstBytes(k[0].data(), 4 * kKeyLen), kKeyLen,
+                       out.data(), 4);
   };
   std::array<uint16_t, 4> out{};
   // A lower-priority, more specific rule cannot win: skipping it is correct.
@@ -143,8 +159,8 @@ TEST(ConcurrentMaskedTableTest, RandomRulesMatchABruteForceModel) {
         keys[i] = B((rng() % 4) * 0x0101010101010101ull ^ (rng() % 3 == 0 ? rng() : 0));
       }
       std::vector<uint16_t> out(n, 0xEEEE);
-      const uint64_t hits = t->LookupBatch(ConstBytes(keys[0].data(), n * kKeyLen), kKeyLen,
-                                           out.data(), n);
+      const uint64_t hits = LookupGates(*t, ConstBytes(keys[0].data(), n * kKeyLen), kKeyLen,
+                                        out.data(), n);
       for (size_t i = 0; i < n; i++) {
         uint64_t key;
         std::memcpy(&key, keys[i].data(), kKeyLen);
@@ -244,8 +260,8 @@ TEST(ConcurrentMaskedTableTest, EveryKeyWidthMatchesABruteForceModel) {
           b = rng() % 8 == 0 ? static_cast<std::byte>(rng()) : value_byte();
         }
         std::vector<uint16_t> out(n, 0xEEEE);
-        const uint64_t hits = t.LookupBatch(ConstBytes(keys.data(), keys.size()),
-                                            stride, out.data(), n);
+        const uint64_t hits = LookupGates(t, ConstBytes(keys.data(), keys.size()),
+                                          stride, out.data(), n);
 
         for (size_t i = 0; i < n; i++) {
           const std::byte *key = keys.data() + i * stride;
@@ -435,8 +451,8 @@ TEST(ConcurrentMaskedTableTest, ConcurrentReadersAlwaysSeeTheStableWinner) {
       while (!stop.load(std::memory_order_relaxed)) {
         for (size_t base = 0; base < keys.size(); base += 32) {
           uint16_t results[32];
-          const uint64_t hits = t->LookupBatch(
-              ConstBytes(packed.data() + base * kKeyLen, 32 * kKeyLen),
+          const uint64_t hits = LookupGates(
+              *t, ConstBytes(packed.data() + base * kKeyLen, 32 * kKeyLen),
               kKeyLen, results, 32);
           if (hits != 0xffffffffull) {
             wrong++;

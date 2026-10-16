@@ -8,6 +8,7 @@
 #include <array>
 #include <cstring>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -150,6 +151,19 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
   if (arg.has_default_gate()) {
     initial_default_gate_ = arg.default_gate();
   }
+  has_action_resource_ = !arg.action_resource().empty();
+  action_resource_ = arg.action_resource();
+  if (has_action_resource_) {
+    // D-141: the ActionId of a matching rule goes to the ActionTable in packet
+    // metadata. Added before the layout is built, so the plan bakes the field
+    // offsets this attribute introduces.
+    action_id_attr_ =
+        AddMetadataAttr("action_id", sizeof(bess::utils::be32_t),
+                        bess::metadata::Attribute::AccessMode::kWrite);
+    if (action_id_attr_ < 0) {
+      return CommandFailure(-action_id_attr_, "add_metadata_attr() failed");
+    }
+  }
   GenerationPtr gen = Build(*table, default_gate, &err);
   if (gen == nullptr) {
     return CommandFailure(err.first, "%s", err.second.c_str());
@@ -166,16 +180,36 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
       name() + "/rules",
       MaskedRuleResource::Hooks{
           .table = [this] { return table_; },
-          .check_value = [](const MaskedRuleResource::Value &v)
+          .check_value = [this](const MaskedRuleResource::Value &v)
               -> MaskedRuleResource::Result {
-            if (!bess::IsValidGateValue(v.result)) {
+            if (!bess::IsValidGateValue(v.gate)) {
               return std::unexpected("invalid gate " +
-                                     std::to_string(v.result));
+                                     std::to_string(v.gate));
+            }
+            if (!has_action_resource_ && v.action_id != 0) {
+              return std::unexpected(
+                  "'action_id' needs an 'action_resource' on this "
+                  "WildcardMatch");
             }
             return {};
-          }});
+          },
+          // A rule that names an action is ordered after it and refused while
+          // it is missing (G1.2b); action id 0 references nothing (D-141).
+          .references = [this](const MaskedRuleResource::Value &v) {
+            if (!has_action_resource_ || v.action_id == 0) {
+              return std::vector<bess::dataplane::Reference>{};
+            }
+            return std::vector<bess::dataplane::Reference>{
+                {action_resource_,
+                 bess::dataplane::EncodeKey(
+                     bess::dataplane::ActionId(v.action_id))}};
+          },
+          .may_reference = has_action_resource_
+                               ? std::vector<std::string>{action_resource_}
+                               : std::vector<std::string>{}});
   // Typed keys and values over the RPC (D-025): values and masks per field,
-  // checked and packed as the class does for a rule, and {priority, gate}.
+  // checked and packed as the class does for a rule, and
+  // {priority, gate, action_id}.
   binding_ = init_context().codecs().Bind(
       *resource_,std::make_shared<bess::framework::TypedCodec<
                           bess::pb::WildcardMatchRuleKey,
@@ -198,14 +232,19 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
             bess::classifier::ConstBytes(mask.data(), mask.size()),
             bess::classifier::ConstBytes(value.data(), value.size()));
       },
-      [](const bess::pb::WildcardMatchRuleValue &value)
+      [this](const bess::pb::WildcardMatchRuleValue &value)
           -> std::expected<std::any, std::string> {
         if (!bess::IsValidGateValue(value.gate())) {
           return std::unexpected("invalid gate " +
                                  std::to_string(value.gate()));
         }
+        if (!has_action_resource_ && value.action_id() != 0) {
+          return std::unexpected(
+              "'action_id' needs an 'action_resource' on this WildcardMatch");
+        }
         return std::any(MaskedRuleResource::Value{
-            value.priority(), static_cast<uint16_t>(value.gate())});
+            value.priority(), static_cast<uint16_t>(value.gate()),
+            has_action_resource_ ? value.action_id() : 0});
       },
       // Every rule as a client sends it: per-field value and mask bytes,
       // full field width (the table holds them canonical), as the resource
@@ -231,7 +270,8 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
                 pos += n;
               }
               value.set_priority(r.priority);
-              value.set_gate(r.result);
+              value.set_gate(r.gate);
+              value.set_action_id(r.action_id);
               visit(key, value);
             });
       }));
@@ -288,11 +328,23 @@ void WildcardMatch::DeInit() {
   if (resource_ == nullptr) {
     return;
   }
-  // The rules reference nothing and nothing may reference them; freed rule
-  // ids still in the removal cascade complete here (workers are paused).
-  auto unregistered =
-      init_context().resources().Unregister(resource_->name());
-  CHECK(unregistered) << unregistered.error();
+  auto &engine = init_context().resources();
+  if (has_action_resource_) {
+    // In action mode the rules reference an ActionTable, so they may leave
+    // with live keys while the graph is disconnected around them: the order
+    // modules are destroyed in must not decide whether a pipeline can be torn
+    // down (D-141).
+    const std::string name = resource_->name();
+    auto released =
+        engine.ReleaseForTeardown(std::span<const std::string>(&name, 1));
+    CHECK(released) << released.error();
+  } else {
+    // Cannot be refused: the rules reference nothing and nothing may
+    // reference them; freed rule ids still in the removal cascade complete
+    // here (workers are paused).
+    auto unregistered = engine.Unregister(resource_->name());
+    CHECK(unregistered) << unregistered.error();
+  }
   binding_.Reset();
   resource_.reset();
 }
@@ -469,6 +521,16 @@ void WildcardMatch::RefreshForResume() {
     return;  // not initialized (or already deinitialized)
   }
 
+  // An action resource needs a readable "action_id" attribute: the packet path
+  // writes it on every hit and fails closed without it. Reported here, where a
+  // resume can still be diagnosed.
+  if (has_action_resource_ &&
+      !bess::metadata::IsValidOffset(attr_offset(action_id_attr_))) {
+    LOG(ERROR) << "WildcardMatch '" << name()
+               << "': the 'action_id' attribute is unreadable (is an "
+                  "ActionTable reading it?): matches take the default gate";
+  }
+
   bool changed = false;
   for (size_t i = 0; i < field_specs_.size(); i++) {
     const FieldSpec &spec = field_specs_[i];
@@ -623,7 +685,7 @@ inline void WildcardMatch::Classify(bess::PacketBatch *batch,
     // Fail-closed generation (metadata offsets unreadable): route everything
     // to the default gate without touching packet or metadata bytes.
     for (int i = 0; i < cnt; i++) {
-      emit(i, default_gate);
+      emit(i, default_gate, 0);
     }
     return;
   }
@@ -633,7 +695,9 @@ inline void WildcardMatch::Classify(bess::PacketBatch *batch,
   std::array<bess::classifier::SourceView, bess::PacketBatch::kMaxBurst>
       sources;
   std::array<std::byte, bess::PacketBatch::kMaxBurst * kMaxKeyBytes> keys;
-  std::array<uint16_t, bess::PacketBatch::kMaxBurst> gates;
+  std::array<bess::classifier::ConcurrentMaskedTable::Match,
+             bess::PacketBatch::kMaxBurst>
+      matches;
 
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
@@ -669,25 +733,59 @@ inline void WildcardMatch::Classify(bess::PacketBatch *batch,
   uint64_t hits = gen->table->LookupBatch(
       bess::classifier::ConstBytes(keys.data(),
                                    static_cast<size_t>(cnt) * key_size),
-      key_size, gates.data(), static_cast<size_t>(cnt));
+      key_size, matches.data(), static_cast<size_t>(cnt),
+      has_action_resource_);
   hits &= valid;
 
   for (int i = 0; i < cnt; i++) {
-    const gate_idx_t gate =
-        (hits & (uint64_t{1} << i)) ? gates[i] : default_gate;
-    emit(i, gate);
+    const bool hit = (hits & (uint64_t{1} << i)) != 0;
+    const gate_idx_t gate = hit ? matches[i].gate : default_gate;
+    // D-141: an action id lives in the rule's record, so only a module with an
+    // action resource reads one, and only for a winner. A miss delivers 0, so
+    // a packet cannot carry an id from an earlier lookup.
+    const uint32_t action_id =
+        hit && has_action_resource_
+            ? gen->table->RuleAt(matches[i].rule_id).action_id
+            : 0;
+    emit(i, gate, action_id);
   }
 }
 
 void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   gate_idx_t gates[bess::PacketBatch::kMaxBurst];
-  ClassifyBatch(batch, gates);
+  const bess::metadata::mt_offset_t offset =
+      has_action_resource_ ? attr_offset(action_id_attr_)
+                           : bess::metadata::mt_offset_t{-1};
+  if (has_action_resource_ && !bess::metadata::IsValidOffset(offset)) {
+    // Fail closed: a match whose action id cannot be delivered would reach the
+    // action table with a stale id, so every packet takes the default gate.
+    // RefreshForResume() is where this is reported.
+    RunChooseModule(ctx, published_.Read()->default_gate, batch);
+    return;
+  }
+  if (has_action_resource_) {
+    uint32_t action_ids[bess::PacketBatch::kMaxBurst];
+    ClassifyBatch(batch, gates, action_ids);
+    for (int i = 0; i < batch->cnt(); i++) {
+      _set_attr_with_offset<bess::utils::be32_t>(
+          offset, batch->packet(i), bess::utils::be32_t(action_ids[i]));
+    }
+  } else {
+    // Gate mode (D-141): no action id to deliver, so the batch is classified
+    // into gates alone -- the record read and the id store do not happen.
+    ClassifyBatch(batch, gates, nullptr);
+  }
   EmitBatch(ctx, batch, gates);
 }
 
-void WildcardMatch::ClassifyBatch(bess::PacketBatch *batch,
-                                  gate_idx_t *gates) const {
-  Classify(batch, [&](int i, gate_idx_t gate) { gates[i] = gate; });
+void WildcardMatch::ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates,
+                                  uint32_t *action_ids) const {
+  Classify(batch, [&](int i, gate_idx_t gate, uint32_t action_id) {
+    gates[i] = gate;
+    if (action_ids != nullptr) {
+      action_ids[i] = action_id;
+    }
+  });
 }
 
 std::string WildcardMatch::GetDesc() const {

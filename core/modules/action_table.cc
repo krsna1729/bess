@@ -122,9 +122,9 @@ void ActionTable::DeInit() {
   if (resource_ == nullptr) {
     return;
   }
-  // An ExactMatch in action mode references these actions, so release rather
-  // than unregister: the order modules are destroyed in must not decide
-  // whether a pipeline can be torn down.
+  // A classifier in action mode references these actions (ExactMatch,
+  // WildcardMatch), so release rather than unregister: the order modules are
+  // destroyed in must not decide whether a pipeline can be torn down.
   const std::string name = resource_->name();
   auto released = init_context().resources().ReleaseForTeardown(
       std::span<const std::string>(&name, 1));

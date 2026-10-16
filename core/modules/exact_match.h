@@ -72,14 +72,12 @@ class ExactMatch final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  // Gate-mode decision without emitting, for tests and benchmarks driven
-  // from a registered reader thread. Action ids are not gate_idx_t values.
-  void ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates) const;
-  // Action-mode matched results (D-141): the gate the packet leaves on and the
-  // action id to deliver, both exactly as the packet path computes them -- the
-  // default gate and 0 for a miss.
-  void ClassifyActionsBatch(bess::PacketBatch *batch, gate_idx_t *gates,
-                            uint32_t *action_ids) const;
+  // What ProcessBatch decides, without emitting: gates[i] is the output gate
+  // of packet i and action_ids[i] the action id to deliver -- always 0 in gate
+  // mode, and 0 for a miss in action mode (D-141). The same code as the packet
+  // path, for tests and benchmarks driven from a registered reader thread.
+  void ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates,
+                     uint32_t *action_ids) const;
 
   // Tests (D-121): the published generation's fused-kernel key width (0 when
   // the generic path classifies), and a switch that republishes with the

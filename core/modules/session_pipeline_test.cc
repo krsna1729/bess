@@ -30,7 +30,9 @@
 #include "meter/meter.h"
 #include "module.h"
 #include "module_graph.h"
+#include "classifier/masked_rule_resource.h"
 #include "modules/action_table.h"
+#include "modules/wildcard_match.h"
 #include "modules/exact_match.h"
 #include "modules/meter.h"
 #include "modules/router.h"
@@ -253,7 +255,7 @@ TEST_F(SessionPipelineTest, OneTransactionCreatesASession) {
     bess::PacketBatch batch = packets.Batch(0, 3);
     std::array<uint32_t, 3> actions;
     std::array<gate_idx_t, 3> gates;
-    em->ClassifyActionsBatch(&batch, gates.data(), actions.data());
+    em->ClassifyBatch(&batch, gates.data(), actions.data());
     EXPECT_EQ(actions[0], 1u);  // matched action id
     EXPECT_EQ(actions[1], 0u);  // miss
     EXPECT_EQ(actions[2], 0u);
@@ -643,7 +645,7 @@ TEST_F(SessionPipelineTest, ActionIdsAreNotNarrowedToGateWidth) {
   bess::PacketBatch batch = packets.Batch(0, 1);
   std::array<uint32_t, 1> ids;
   std::array<gate_idx_t, 1> gates;
-  em->ClassifyActionsBatch(&batch, gates.data(), ids.data());
+  em->ClassifyBatch(&batch, gates.data(), ids.data());
   EXPECT_EQ(ids[0], 70000u);
 }
 
@@ -680,7 +682,7 @@ TEST_F(SessionPipelineTest, RuleResultCarriesGateAndActionTogether) {
   bess::PacketBatch batch = packets.Batch(0, 4);
   std::array<gate_idx_t, 4> gates;
   std::array<uint32_t, 4> actions;
-  em->ClassifyActionsBatch(&batch, gates.data(), actions.data());
+  em->ClassifyBatch(&batch, gates.data(), actions.data());
 
   EXPECT_EQ(gates[0], 4u) << "a rule with both takes its own gate";
   EXPECT_EQ(actions[0], 1u);
@@ -692,9 +694,149 @@ TEST_F(SessionPipelineTest, RuleResultCarriesGateAndActionTogether) {
   EXPECT_EQ(actions[3], 0u) << "and carries no action id";
 }
 
-// Action mode with one 4-byte field takes the fused kernel (D-121): its
-// action ids equal the generic path's for hits, misses, and packets too
-// short for the field or exactly long enough.
+// D-141's wildcard half: a masked rule carries a gate and an action id, the
+// match delivers both -- the action id in packet metadata -- and a miss
+// delivers 0. The codec must accept the pair only where a resource can resolve
+// it, exactly as ExactMatch does.
+TEST_F(SessionPipelineTest, WildcardRuleCarriesGateAndActionTogether) {
+  ActionTable *at = CreateActionTable("at", "mt/meters", "rt/next_hops");
+  ASSERT_NE(nullptr, at);
+  ASSERT_EQ(Apply({Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(3)),
+                              std::any(ActionTable::Action{MeterId(0), NextHopId(0)}))})
+                .outcome,
+            Outcome::kApplied);
+
+  bess::pb::WildcardMatchArg arg;
+  auto *field = arg.add_fields();
+  field->set_offset(26);
+  field->set_num_bytes(4);
+  arg.set_action_resource("at/actions");
+  auto *wm = static_cast<WildcardMatch *>(Create("WildcardMatch", "wm", Pack(arg)));
+  ASSERT_NE(nullptr, wm);
+
+  // The resource key is the packed mask then the packed value; one 4-byte
+  // field, so the field's bytes as the packet carries them, and the value
+  // must be canonical (value & ~mask == 0), which both of these are.
+  const auto field4 = [](uint32_t v) { return Key(v, 0).substr(0, 4); };
+  ASSERT_EQ(Apply({Op::Upsert("wm/rules",
+                              field4(Ip(255, 255, 255, 0)) + field4(Ip(10, 0, 0, 0)),
+                              std::any(bess::classifier::MaskedRuleResource::Value{
+                                  2, 4, 3})),
+                   Op::Upsert("wm/rules",
+                              field4(Ip(255, 255, 0, 0)) + field4(Ip(10, 0, 0, 0)),
+                              std::any(bess::classifier::MaskedRuleResource::Value{
+                                  1, 7, 0}))})
+                .outcome,
+            Outcome::kApplied);
+
+  Packets packets(3);
+  packets.SetKey(0, Ip(10, 0, 0, 5), 0);   // the /24 wins: gate 4, action 3
+  packets.SetKey(1, Ip(10, 0, 9, 9), 0);   // only the /16: gate 7, no action
+  packets.SetKey(2, Ip(192, 0, 2, 1), 0);  // neither: default gate, no action
+  bess::PacketBatch batch = packets.Batch(0, 3);
+  std::array<gate_idx_t, 3> gates;
+  std::array<uint32_t, 3> actions;
+  wm->ClassifyBatch(&batch, gates.data(), actions.data());
+  EXPECT_EQ(gates[0], 4u);
+  EXPECT_EQ(actions[0], 3u);
+  EXPECT_EQ(gates[1], 7u);
+  EXPECT_EQ(actions[1], 0u);
+  EXPECT_EQ(gates[2], DROP_GATE);
+  EXPECT_EQ(actions[2], 0u);
+
+  // The codec: {gate, action_id} is accepted where an action resource can
+  // resolve the id, and refused where there is none.
+  bess::pb::WildcardMatchRuleValue v;
+  v.set_gate(0);
+  v.set_action_id(3);
+  const google::protobuf::Any packed_value = Pack(v);
+  const auto *with_resource = Bindings().Find(*Engine().FindResource("wm/rules"));
+  ASSERT_NE(nullptr, with_resource);
+  EXPECT_TRUE(with_resource->Value(packed_value.type_url(), packed_value.value())
+                  .has_value());
+
+  bess::pb::WildcardMatchArg plain;
+  auto *plain_field = plain.add_fields();
+  plain_field->set_offset(26);
+  plain_field->set_num_bytes(4);
+  auto *plain_wm = static_cast<WildcardMatch *>(
+      Create("WildcardMatch", "wm_plain", Pack(plain)));
+  ASSERT_NE(nullptr, plain_wm);
+  const auto *no_resource =
+      Bindings().Find(*Engine().FindResource("wm_plain/rules"));
+  ASSERT_NE(nullptr, no_resource);
+  EXPECT_FALSE(no_resource->Value(packed_value.type_url(), packed_value.value())
+                   .has_value());
+}
+
+// D-141: a WildcardMatch whose rules reference an action resource must be
+// destroyable while the ActionTable is still there. An action-mode rule leaves
+// with live keys, which the engine refuses for a plain Unregister, so a
+// pipeline's teardown would otherwise depend on module order (and abort the
+// daemon).
+TEST_F(SessionPipelineTest, WildcardTeardownWithAnActionResource) {
+  ActionTable *at = CreateActionTable("at", "mt/meters", "rt/next_hops");
+  ASSERT_NE(nullptr, at);
+  ASSERT_EQ(Apply({Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(1)),
+                              std::any(ActionTable::Action{MeterId(0),
+                                                           NextHopId(0)}))})
+                .outcome,
+            Outcome::kApplied);
+
+  bess::pb::WildcardMatchArg arg;
+  auto *field = arg.add_fields();
+  field->set_offset(26);
+  field->set_num_bytes(4);
+  arg.set_action_resource("at/actions");
+  auto *wm =
+      static_cast<WildcardMatch *>(Create("WildcardMatch", "wm", Pack(arg)));
+  ASSERT_NE(nullptr, wm);
+  ASSERT_EQ(Apply({Op::Upsert("wm/rules",
+                              Key(Ip(255, 255, 255, 0), 0).substr(0, 4) +
+                                  Key(Ip(10, 0, 0, 0), 0).substr(0, 4),
+                              std::any(bess::classifier::MaskedRuleResource::Value{
+                                  1, 0, 1}))})
+                .outcome,
+            Outcome::kApplied);
+
+  // The rule is live and names an action; the table is untouched.
+  ModuleGraph::DestroyModule(wm);
+  EXPECT_NE(nullptr, Engine().FindResource("at/actions"))
+      << "the action table outlives the classifier that referenced it";
+  EXPECT_EQ(nullptr, Engine().FindResource("wm/rules"));
+}
+
+// The other order: the ActionTable goes first, while a live rule still names
+// one of its actions (the order DestroyAllModules uses -- names sort), and
+// the classifier follows with a dangling reference.
+TEST_F(SessionPipelineTest, ActionTableTeardownBeforeTheClassifierThatNamesIt) {
+  ActionTable *at = CreateActionTable("at", "mt/meters", "rt/next_hops");
+  ASSERT_NE(nullptr, at);
+  ASSERT_EQ(Apply({Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(1)),
+                              std::any(ActionTable::Action{MeterId(0),
+                                                           NextHopId(0)}))})
+                .outcome,
+            Outcome::kApplied);
+  bess::pb::WildcardMatchArg arg;
+  auto *field = arg.add_fields();
+  field->set_offset(26);
+  field->set_num_bytes(4);
+  arg.set_action_resource("at/actions");
+  auto *wm =
+      static_cast<WildcardMatch *>(Create("WildcardMatch", "wm2", Pack(arg)));
+  ASSERT_NE(nullptr, wm);
+  ASSERT_EQ(Apply({Op::Upsert("wm2/rules",
+                              Key(Ip(255, 255, 255, 0), 0).substr(0, 4) +
+                                  Key(Ip(10, 0, 0, 0), 0).substr(0, 4),
+                              std::any(bess::classifier::MaskedRuleResource::Value{
+                                  1, 0, 1}))})
+                .outcome,
+            Outcome::kApplied);
+  ModuleGraph::DestroyModule(at);
+  ModuleGraph::DestroyModule(wm);
+  EXPECT_EQ(nullptr, Engine().FindResource("wm2/rules"));
+}
+
 TEST_F(SessionPipelineTest, FusedKernelMatchesTheGenericPathInActionMode) {
   ActionTable *at = CreateActionTable("at", "mt/meters", "rt/next_hops");
   ASSERT_NE(nullptr, at);
@@ -741,11 +883,11 @@ TEST_F(SessionPipelineTest, FusedKernelMatchesTheGenericPathInActionMode) {
   std::array<gate_idx_t, kN> fused_gates;
   std::array<gate_idx_t, kN> generic_gates;
   bess::PacketBatch batch = packets.Batch(0, kN);
-  em->ClassifyActionsBatch(&batch, fused_gates.data(), fused.data());
+  em->ClassifyBatch(&batch, fused_gates.data(), fused.data());
   Error err;
   ASSERT_TRUE(em->SetFusedKernelEnabled(false, &err)) << err.second;
   ASSERT_EQ(0u, em->fused_key_width());
-  em->ClassifyActionsBatch(&batch, generic_gates.data(), generic.data());
+  em->ClassifyBatch(&batch, generic_gates.data(), generic.data());
   EXPECT_EQ(fused, generic);
   EXPECT_EQ(fused_gates, generic_gates);
   for (size_t i = 0; i < kN; i++) {

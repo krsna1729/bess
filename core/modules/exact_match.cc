@@ -939,23 +939,12 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   EmitBatch(ctx, batch, gates);
 }
 
-// The gate-mode helper: gates only, the action id is always 0.
-void ExactMatch::ClassifyBatch(bess::PacketBatch *batch,
-                               gate_idx_t *gates) const {
-  DCHECK(!action_mode_);
-  const Generation *gen = published_.Read();
-  const gate_idx_t default_gate =
-      gen->default_gate.load(std::memory_order_relaxed);
-  Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
-    gates[i] = hit ? bess::GateOfResult(value) : default_gate;
-  });
-}
-
-// The action-mode helper (D-141): both halves of the result, and the packet
-// path's own miss behaviour -- the default gate with action id 0.
-void ExactMatch::ClassifyActionsBatch(bess::PacketBatch *batch, gate_idx_t *gates,
-                                      uint32_t *action_ids) const {
-  DCHECK(action_mode_);
+// The decision without emitting (D-141): both halves of the result, and the
+// packet path's own miss behaviour -- the default gate with action id 0. In
+// gate mode a rule's action id is always 0 (the codec refuses one), so one
+// loop covers both modes.
+void ExactMatch::ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates,
+                               uint32_t *action_ids) const {
   const Generation *gen = published_.Read();
   const gate_idx_t default_gate =
       gen->default_gate.load(std::memory_order_relaxed);

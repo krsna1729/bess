@@ -121,7 +121,8 @@ class Packets {
       batch.add(bess::PacketRef(handles_[first + i]));
     }
     std::vector<gate_idx_t> gates(n);
-    em->ClassifyBatch(&batch, gates.data());
+    std::vector<uint32_t> action_ids(n);
+    em->ClassifyBatch(&batch, gates.data(), action_ids.data());
     return gates;
   }
 

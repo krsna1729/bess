@@ -160,10 +160,11 @@ void BM_ModuleClassify(benchmark::State &state) {
     Load(&batches[b], packets, b * kBatch);
   }
   std::array<gate_idx_t, kBatch> gates;
+  std::array<uint32_t, kBatch> action_ids;
   uint64_t hits = 0;
   size_t b = 0;
   for (auto _ : state) {
-    em->ClassifyBatch(&batches[b], gates.data());
+    em->ClassifyBatch(&batches[b], gates.data(), action_ids.data());
     benchmark::DoNotOptimize(gates);
     for (gate_idx_t g : gates) {
       hits += g != 0;
@@ -251,10 +252,12 @@ void BM_ClassifyUnderTransactions(benchmark::State &state) {
       }
       domain.Online(id);
       std::array<gate_idx_t, kBatch> gates;
+      std::array<uint32_t, kBatch> action_ids;
       uint64_t local = 0, sink = 0;
       size_t b = 0;
       while (!stop.load(std::memory_order_relaxed)) {
-        (b % 2 ? dl : ul)->ClassifyBatch(&batches[b], gates.data());
+        (b % 2 ? dl : ul)->ClassifyBatch(&batches[b], gates.data(),
+                                         action_ids.data());
         for (gate_idx_t g : gates) {
           sink += g;
         }

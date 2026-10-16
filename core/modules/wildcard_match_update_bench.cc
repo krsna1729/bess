@@ -101,14 +101,22 @@ void BM_Lookup(benchmark::State &st) {
   size_t offset = 0;
   uint64_t found = 0;
   std::array<uint16_t, kBatch> results;
+  // D-141: the masked table reports the winning rule's gate and id, so the
+  // concurrent arm needs its own scratch; the generation backend still takes
+  // the gates alone.
+  std::array<bess::classifier::ConcurrentMaskedTable::Match, kBatch> matches;
   for (auto _ : st) {
     const ConstBytes keys(f.stream.data() + offset * width, kBatch * width);
     const uint64_t hits =
         concurrent
-            ? f.concurrent->LookupBatch(keys, width, results.data(), kBatch)
+            ? f.concurrent->LookupBatch(keys, width, matches.data(), kBatch)
             : f.generation.lookup_batch(keys, width, results);
     found += static_cast<uint64_t>(__builtin_popcountll(hits));
-    benchmark::DoNotOptimize(results);
+    if (concurrent) {
+      benchmark::DoNotOptimize(matches);
+    } else {
+      benchmark::DoNotOptimize(results);
+    }
     offset = (offset + kBatch) % kStream;
   }
   if (found != st.iterations() * kBatch) st.SkipWithError("missed a key");
