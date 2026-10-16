@@ -18,7 +18,10 @@ live_lib = static_library(
   'live_daemon',
   'live_daemon.cc',
   implicit_include_directories: false,
-  dependencies: [bess_sdk_dep, gtest_dep],
+  # glog is explicit: the harness logs (LOG(INFO)/LOG(ERROR)) and used to get
+  # the macro from a header protobuf happens to pull in on some toolchains --
+  # CI's did not define it, and every lane failed to build.
+  dependencies: [bess_sdk_dep, gtest_dep, glog_dep],
 )
 # packet_builder.h (header-only, std only) for test packets; simd_width_test
 # also reads the CPU's vector features from arch/simd_dispatch.h (installed,

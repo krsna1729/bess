@@ -3,6 +3,7 @@
 #include "live_daemon.h"
 
 #include <fcntl.h>
+#include <glog/logging.h>
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/util/json_util.h>
 #include <netinet/in.h>
