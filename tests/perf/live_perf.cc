@@ -111,6 +111,38 @@ using bess::perf::Base64;
 using bess::perf::Be32;
 using bess::perf::Types;
 
+// A frame from a space-separated hex string: the smoke test's own bytes, so an
+// arm and its control carry exactly what ci/smoke-gtpu.sh checks.
+std::string FromHex(const std::string &hex) {
+  std::string out;
+  for (size_t i = 0; i < hex.size(); i++) {
+    if (hex[i] == ' ') {
+      continue;
+    }
+    out.push_back(static_cast<char>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+    i++;
+  }
+  return out;
+}
+
+// The G-PDU deploy/smoke-gtpu.yaml sends: Eth / IPv4 / UDP 2152 / GTP-U
+// (TEID 0x11223344) / a 37-byte inner IPv4 packet.
+const std::string &GtpuFrame() {
+  static const std::string frame = FromHex(
+      "02 00 00 00 00 01 02 00 00 00 00 02 08 00 45 00 00 49 00 01 40 00 40 11 ea 78 0a 14 1e 01"
+      " 0a 14 1e 02 08 68 08 68 00 35 00 00 30 ff 00 25 11 22 33 44 45 00 00 25 00 01 40 00 40 11"
+      " 20 b7 0a 00 00 01 08 08 08 08 04 d2 00 35 00 11 00 00 68 65 6c 6c 6f 2d 75 70 66");
+  return frame;
+}
+
+// The inner frame the downlink carries: Eth / IPv4 / UDP, 51 bytes.
+const std::string &InnerFrame() {
+  static const std::string frame = FromHex(
+      "02 00 00 00 00 04 02 00 00 00 00 03 08 00 45 00 00 25 00 01 40 00 40 11 20 b7 0a 00 00 01"
+      " 08 08 08 08 04 d2 00 35 00 11 00 00 68 65 6c 6c 6f 2d 75 70 66");
+  return frame;
+}
+
 // -- the catalogue -----------------------------------------------------------------
 
 // What a test builds: the pipeline, on worker 0 (and worker 1 where it says).
@@ -445,6 +477,65 @@ std::vector<std::string> MAcl(Build &b) {
   return MBase(b, {{"acl", 1}});
 }
 
+// -- the UPF plugin's arms (--plugin DIR loads it) ----------------------------------
+//
+// Each arm brings its own control: the same frame through the same chain with a
+// Bypass in the module's slot, so the delta is the module (and, for the decap,
+// the rule in front of it) and not a frame size or a hop.
+
+// The uplink's front and tail, shared by the decap's arm and its control, all
+// of it deploy/smoke-gtpu.yaml's own composition: the TEID classifier with one
+// rule per session (no rule is what its default gate drops), and the reader
+// that makes the decap's "upf_teid" attribute real -- a write-only attribute
+// gets no offset at all, so without a reader the write is a no-op and the arm
+// would measure less than the graph that ships.
+void MGtpuDecapShared(Build &b) {
+  b.Mod("WildcardMatch", "teid", R"({"fields": [{"offset": 46, "num_bytes": 4}]})");
+  b.Entry("teid/rules", "WildcardMatchRuleKey",
+          R"({"values": [{"value_bin": ")" + Base64(Be32(0x11223344)) + R"("}],)"
+          R"( "masks": [{"value_bin": "/////w=="}]})",
+          "WildcardMatchRuleValue", R"({"priority": 100, "gate": 0})");
+  b.Mod("MetadataTest", "mt", R"({"read": {"upf_teid": 4}})");
+}
+
+// Source -> Rewrite(G-PDU) -> TEID classifier -> GtpuDecap -> reader -> Sink.
+std::vector<std::string> MGtpuDecap(Build &b) {
+  MGtpuDecapShared(b);
+  b.Mod("GtpuDecap", "decap", R"({})");
+  return MBase(b, {{"teid", 1}, {"decap", 1}, {"mt", 1}}, GtpuFrame());
+}
+
+// The same chain with a Bypass in the decap's slot: the delta is the decap.
+std::vector<std::string> MGtpuDecapControl(Build &b) {
+  MGtpuDecapShared(b);
+  return MBase(b, {{"teid", 1}, {"bp", 1}, {"mt", 1}}, GtpuFrame());
+}
+
+// The downlink's front and tail, shared the same way: the ActionId the PDR
+// rule writes (D-141) and the reader that keeps the attribute real.
+void MGtpuEncapShared(Build &b) {
+  b.Mod("SetMetadata", "md",
+        R"({"attrs": [{"name": "action_id", "size": "4", "value_int": "1"}]})");
+  b.Mod("MetadataTest", "mt", R"({"read": {"action_id": 4}})");
+}
+
+// Source -> Rewrite(inner frame) -> SetMetadata(action_id 1) -> GtpuEncap ->
+// reader -> Sink, with the session's tunnel record: a downlink PDR's delivery.
+// The record is the encap module's table, so only this chain declares it.
+std::vector<std::string> MGtpuEncap(Build &b) {
+  MGtpuEncapShared(b);
+  b.Mod("GtpuEncap", "enc", R"({"src_ip": "10.20.30.1"})");
+  b.Entry("enc/tunnels", "upf.pb.TunnelKey", R"({"action_id": 1})", "upf.pb.TunnelEntry",
+          R"({"teid": 287454020, "gnb_ip": "10.20.30.2", "ether_src": "AgAAAAAB",)"
+          R"( "ether_dst": "AgAAAAAC"})");
+  return MBase(b, {{"md", 1}, {"enc", 1}, {"mt", 1}}, InnerFrame());
+}
+
+std::vector<std::string> MGtpuEncapControl(Build &b) {
+  MGtpuEncapShared(b);
+  return MBase(b, {{"md", 1}, {"bp", 1}, {"mt", 1}}, InnerFrame());
+}
+
 std::vector<Test> Catalogue() {
   const auto m = [](const std::string &mclass, const std::string &name, const std::string &arg,
                     int gates) -> Builder {
@@ -521,6 +612,12 @@ std::vector<Test> Catalogue() {
       {"M.bpf", 'M',
        m("BPF", "bpf",
          R"({"filters": [{"priority": 0, "filter": "udp dst port 2000", "gate": 1}]})", 2)},
+      // The UPF plugin's two modules, each with the control arm that shares
+      // its frame (see the builders above). Skipped without --plugin DIR.
+      {"M.gtpu_decap.base", 'M', MGtpuDecapControl},
+      {"M.gtpu_decap", 'M', MGtpuDecap},
+      {"M.gtpu_encap.base", 'M', MGtpuEncapControl},
+      {"M.gtpu_encap", 'M', MGtpuEncap},
   };
 }
 
@@ -537,6 +634,9 @@ struct Options {
   std::string save;
   std::string baseline;
   double threshold = 5.0;
+  // A directory of plugins the daemon loads (--modules=). It also enables the
+  // M.gtpu_* arms, which need the UPF plugin's classes.
+  std::string plugin;
 };
 
 struct BuildSpec {
@@ -718,6 +818,9 @@ std::map<std::string, Sample> RunRound(const BuildSpec &spec, const std::vector<
   cmd.insert(cmd.end(), {spec.bessd, "-f", "-p", std::to_string(port), "--skip_root_check", "-m",
                          "0", "-i", pidfile, "-c", std::to_string(o.cpus.back())});
   cmd.insert(cmd.end(), spec.flags.begin(), spec.flags.end());
+  if (!o.plugin.empty()) {
+    cmd.push_back("--modules=" + o.plugin);
+  }
   const pid_t daemon = Spawn(cmd);
   std::map<std::string, Sample> out;
   try {
@@ -895,6 +998,8 @@ int Main(int argc, char **argv) {
       o.baseline = value();
     } else if (a == "--threshold") {
       o.threshold = std::stod(value());
+    } else if (a == "--plugin") {
+      o.plugin = value();
     } else if (a == "--list") {
       for (const Test &t : Catalogue()) {
         std::printf("%s\n", t.name.c_str());
@@ -904,7 +1009,7 @@ int Main(int argc, char **argv) {
       std::fprintf(stderr,
                    "usage: live_perf [--tests NAME|F|M,...] [--build SPEC]... [--rounds N]\n"
                    "  [--cpu W0[,W1]] [--control-cpu C] [--duration S] [--warmup S] [--counters]\n"
-                   "  [--save FILE] [--baseline FILE [--threshold PCT]] [--list]\n"
+                   "  [--save FILE] [--baseline FILE [--threshold PCT]] [--plugin DIR] [--list]\n"
                    "SPEC: current | current:<tree>[:<builddir>[:<flags,...>]] | name=<bessd>[,flag...]\n");
       return 2;
     }
@@ -922,14 +1027,25 @@ int Main(int argc, char **argv) {
     wanted.push_back(w);
   }
   std::vector<Test> tests;
+  int skipped_plugin = 0;
   for (const Test &t : all) {
     const bool selected =
         wanted.empty() || std::any_of(wanted.begin(), wanted.end(), [&](const std::string &w) {
           return t.name == w || t.name.starts_with(w + ".");
         });
-    if (selected) {
-      tests.push_back(t);
+    if (!selected) {
+      continue;
     }
+    // The GTP-U arms need the UPF plugin's classes; without --plugin the
+    // daemon cannot build their graphs at all.
+    if (o.plugin.empty() && t.name.starts_with("M.gtpu_")) {
+      skipped_plugin++;
+      continue;
+    }
+    tests.push_back(t);
+  }
+  if (skipped_plugin > 0) {
+    std::fprintf(stderr, "note: %d test(s) skipped (they need --plugin DIR)\n", skipped_plugin);
   }
   const bool any_m =
       std::any_of(tests.begin(), tests.end(), [](const Test &t) { return t.cls == 'M'; });

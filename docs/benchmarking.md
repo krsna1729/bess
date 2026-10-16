@@ -184,7 +184,16 @@ entries go in as one `PipelineBuilder` transaction, the same path a controller u
   those hooks removed: the hop alone), `F.fanout/4`, `F.split/2`, `F.fanin/4`, `F.tc/N` (scheduler with N
   leaves), `F.size/1500`, `F.queue` (cross-worker Queue).
 - **M, modules (localised):** each module after the same Source -> Rewrite -> RandomUpdate (1,024 flows) front
-  end, reported as ns per packet above `M.base` (the front end with a Bypass).
+  end, reported as ns per packet above `M.base` (the front end with a Bypass); `M.base`'s own row is the
+  absolute baseline the others are measured from, so an arm and its control subtract to the module's cost.
+- **M.gtpu_\*, out-of-tree modules** (here the UPF plugin, krsna1729/upf `datapath/`): `--plugin DIR` appends
+  `--modules=DIR` to the daemon command and enables them; without the flag they are skipped, so a lane without
+  the plugin stays green. Each arm brings **its own control** (`M.gtpu_decap.base`, `M.gtpu_encap.base`): the
+  shipping graph's own front and tail -- the TEID classifier and its rule, the ActionId write, the tunnel
+  record, the reader that keeps the decap's attribute real -- with a Bypass in the module's slot, so the delta
+  is the module alone. Read an arm and its control as a pair. Measuring a module that needs a tunnel frame
+  against `M.base` would report the frame size, not the module. The frames are the UPF smoke test's
+  (`deploy/smoke-gtpu.yaml`), byte for byte: the numbers describe the graph that ships.
 
 If `F.floor` or the `F.hop` slope moves, every pipeline moves: look at the scheduler, Source/Sink, the packet
 pool and batch dispatch. If one `M` delta moves alone, the cost is in that module. `live_perf --list` prints the
