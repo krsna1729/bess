@@ -371,14 +371,14 @@ def step_test(s):
     if s.sanitize == 'address':
         # Every unit, architecture, plugin and fuzz-corpus test under ASan and
         # UBSan, halting on the first report. Explicit exclusions: benchmarks
-        # (not built) and the daemon suites `python` and `live`
+        # (not built) and the daemon suite `live`
         # (bessd under ASan is not yet a supported mode; D-072).
         env = s.env_with_dpdk()
         env['ASAN_OPTIONS'] = ('detect_leaks=1:halt_on_error=1:abort_on_error=1'
                                ':external_symbolizer_path=' + symbolizer())
         env['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1:external_symbolizer_path=' + symbolizer()
         s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs',
-               '--no-suite', 'python', '--no-suite', 'live',
+               '--no-suite', 'live',
                '--timeout-multiplier', '6'], env=env)
         return
     if s.sanitize == 'thread':
@@ -483,8 +483,13 @@ def step_verify_install(s):
     s.run([bessctl[0], '--help'],
           env={**env, 'LD_LIBRARY_PATH': os.pathsep.join(
               filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))})
-    s.run([sys.executable, ROOT / 'tools' / 'check_installed_pybess.py',
-           '--root', s.stage / 'usr/local/share/bess'], env=env)
+    # No Python in the runtime install (D-135, D-140): the daemon, bessctl and
+    # the shared data hold none, and the only .py that installs is the ops
+    # tool dpdk-devbind.py (the bess-tools package).
+    python_files = sorted(p.name for p in s.stage.rglob('*')
+                          if p.suffix in ('.py', '.pyc') or p.name == '__pycache__')
+    if python_files != ['dpdk-devbind.py']:
+        raise SystemExit(f'install holds unexpected Python: {python_files}')
     # Release metadata (M26): the install says what it is made of.
     info_files = list(s.stage.glob('**/share/bess/build-info.json'))
     sbom_files = list(s.stage.glob('**/share/doc/bess/bess.spdx.json'))

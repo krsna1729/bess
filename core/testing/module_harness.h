@@ -25,6 +25,8 @@
 #include <string>
 #include <vector>
 
+#include "dataplane/resource.h"
+#include "framework/resource_codec.h"
 #include "message.h"
 #include "module.h"
 #include "testing/packet_builder.h"
@@ -73,14 +75,8 @@ class ModuleHarness {
                                                        const std::vector<Bytes> &in, Module *last,
                                                        std::vector<gate_idx_t> ogates = {});
 
-  // A command, as the legacy ModuleCommand runs it (every command).
-  CommandResponse Command(Module *m, const std::string &command,
-                          const google::protobuf::Message &arg);
-  // Fails the test unless the command succeeds; returns its answer.
-  google::protobuf::Any MustCommand(Module *m, const std::string &command,
-                                    const google::protobuf::Message &arg);
-  // An action, as control_v2's InvokeAction runs it (D-129: a legacy-only
-  // command is refused with ENOTSUP).
+  // An action, as control_v2's InvokeAction runs it (D-140: the class's
+  // commands are its actions; an unknown one is ENOTSUP).
   CommandResponse Action(Module *m, const std::string &action,
                          const google::protobuf::Message &arg);
 
@@ -106,6 +102,13 @@ class ModuleHarness {
       const std::string &resource,
       const std::vector<std::pair<const google::protobuf::Message *,
                                   const google::protobuf::Message *>> &entries);
+  // The resource's codec, as a client's writes are decoded through it
+  // (nullptr for an unknown resource): for a test that builds several
+  // operations itself.
+  const bess::framework::ResourceCodec *Codec(const std::string &resource);
+  // Several operations in one transaction, as a client sends them: "" when it
+  // applied, else the refusal (all-or-nothing, so a refusal applies none).
+  std::string Apply(const std::vector<bess::dataplane::Op> &ops);
 
  private:
   // Connects exactly `m`'s gates `ogates` to the capture (all of 0-15 that

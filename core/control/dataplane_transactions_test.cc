@@ -188,20 +188,21 @@ class DataplaneTransactionsTest : public ::testing::Test {
     return response;
   }
 
-  static size_t Rules(const char *name) {
-    Module *m = bess::runtime::runtime().modules().Find(name);
-    if (auto *em = dynamic_cast<ExactMatch *>(m)) {
-      bess::pb::ExactMatchConfig config;
-      EXPECT_TRUE(em->GetRuntimeConfig(bess::pb::EmptyArg())
-                      .data()
-                      .UnpackTo(&config));
-      return static_cast<size_t>(config.rules_size());
+  // The number of rules the module's "<name>/rules" resource holds (the
+  // table the RPC writes).
+  static size_t Rules(const std::string &module) {
+    const bess::dataplane::Resource *r =
+        bess::runtime::runtime().transactions().FindResource(module + "/rules");
+    EXPECT_NE(nullptr, r) << module;
+    const bess::framework::ResourceCodec *codec =
+        r == nullptr ? nullptr : bess::framework::ResourceBindings::ProcessDefault().Find(*r);
+    EXPECT_NE(nullptr, codec) << module;
+    size_t rules = 0;
+    if (codec != nullptr) {
+      codec->Entries(
+          [&](const google::protobuf::Message &, const google::protobuf::Message &) { rules++; });
     }
-    auto *wm = dynamic_cast<WildcardMatch *>(m);
-    bess::pb::WildcardMatchConfig config;
-    EXPECT_TRUE(
-        wm->GetRuntimeConfig(bess::pb::EmptyArg()).data().UnpackTo(&config));
-    return static_cast<size_t>(config.rules_size());
+    return rules;
   }
 
   std::unique_ptr<ControlPlane> control_plane_;
@@ -247,28 +248,13 @@ TEST_F(DataplaneTransactionsTest, TypedOperationsAcrossModules) {
   EXPECT_EQ(Rules("em0"), 1u);
   EXPECT_EQ(Rules("wm0"), 1u);
 
-  // The server packs keys exactly as the commands do: the legacy delete
-  // finds the rule the RPC added.
-  bess::pb::ExactMatchCommandDeleteArg del;
-  *del.add_fields() = Int(0x0a000001);
-  *del.add_fields() = Int(80);
-  auto *em = static_cast<ExactMatch *>(
-      bess::runtime::runtime().modules().Find("em0"));
-  EXPECT_FALSE(em->CommandDelete(del).has_error());
-  EXPECT_EQ(Rules("em0"), 0u);
-  // And the RPC erases what the command path added.
-  ASSERT_FALSE(em->CommandAdd([] {
-                   bess::pb::ExactMatchCommandAddArg add;
-                   add.set_gate(9);
-                   *add.add_fields() = Int(7);
-                   *add.add_fields() = Int(8);
-                   return add;
-                 }())
-                   .has_error());
+  // An erase op names the same key the upsert wrote: the RPC reads back what
+  // it wrote (the engine's key encoding is the codec's).
   v2::ApplyTransactionRequest erase;
-  *erase.add_ops() = EraseExact("em0", 7, 8);
+  *erase.add_ops() = EraseExact("em0", 0x0a000001, 80);
   EXPECT_EQ(Apply(erase).record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
   EXPECT_EQ(Rules("em0"), 0u);
+  EXPECT_EQ(Rules("wm0"), 1u) << "the other module's rule stays";
 }
 
 TEST_F(DataplaneTransactionsTest, UndecodableOperationsRejectTheTransaction) {

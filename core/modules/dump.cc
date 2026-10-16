@@ -13,10 +13,8 @@
 
 static const uint64_t DEFAULT_INTERVAL_NS = 1 * NS_PER_SEC; /* 1 sec */
 
-const Commands Dump::cmds = {
-    {"set_interval", "DumpArg", MODULE_CMD_FUNC(&Dump::CommandSetInterval),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-};
+// "settings" (DumpArg) holds the interval; the class has no actions.
+const Commands Dump::cmds = {};
 
 const ResourceTables Dump::resource_tables = {
     ResourceTable::Singleton<bess::pb::DumpArg>("settings"),
@@ -37,7 +35,7 @@ CommandResponse Dump::Init(const bess::pb::DumpArg &arg) {
   interval_sec_ = 1.0;
   next_ns_ = tsc_to_ns(rdtsc());
   if (arg.interval()) {
-    CommandResponse err = CommandSetInterval(arg);
+    CommandResponse err = SetInterval(arg);
     if (err.error().code() != 0) {
       return err;
     }
@@ -88,7 +86,8 @@ void Dump::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   RunChooseModule(ctx, ctx->current_igate, batch);
 }
 
-CommandResponse Dump::CommandSetInterval(const bess::pb::DumpArg &arg) {
+// The init argument's interval, validated before anything is installed.
+CommandResponse Dump::SetInterval(const bess::pb::DumpArg &arg) {
   double sec = arg.interval();
 
   if (!ValidInterval(sec)) {

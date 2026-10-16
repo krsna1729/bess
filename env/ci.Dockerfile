@@ -8,9 +8,7 @@
 FROM ubuntu:24.04
 
 COPY env/install-deps.sh /opt/bess/env/install-deps.sh
-COPY requirements.txt /opt/bess/requirements.txt
 RUN bash /opt/bess/env/install-deps.sh runtime \
- && bash /opt/bess/env/install-deps.sh python /opt/bess/requirements.txt \
  && bash /opt/bess/env/install-deps.sh build \
  && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*

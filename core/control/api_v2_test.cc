@@ -691,9 +691,8 @@ TEST_F(ApiV2ServiceTest, MutatingRequestsMustNameTheDaemonsEpoch) {
 
 // A module's actions over v2 (D-129): epoch-checked before anything runs; the
 // result comes back as the action's Any; a missing module, an action the
-// class does not have, a legacy-only command and an action's own failure are
-// typed errors carrying the module and the errno. The legacy path still runs
-// the legacy-only command.
+// class does not have, a command that edits state (not an action), and an
+// action's own failure are typed errors carrying the module and the errno.
 TEST_F(ApiV2ServiceTest, InvokeAction) {
   google::protobuf::Any arg;
   ASSERT_TRUE(arg.PackFrom(bess::pb::L2ForwardArg()));
@@ -749,7 +748,7 @@ TEST_F(ApiV2ServiceTest, InvokeAction) {
   EXPECT_EQ("action", detail.field());
 
   // A command that edits state the resources hold is not an action: v2
-  // refuses it, and nothing changes; the legacy path still runs it.
+  // refuses it, and nothing changes.
   bess::pb::L2ForwardCommandAddArg add;
   auto *entry = add.add_entries();
   entry->set_addr("02:00:00:00:00:09");
@@ -762,9 +761,25 @@ TEST_F(ApiV2ServiceTest, InvokeAction) {
   lookup_added.add_addrs("02:00:00:00:00:09");
   EXPECT_NE(grpc::StatusCode::OK, invoke("l2", "lookup", lookup_added, Epoch(), &resp))
       << "the refused add ran";
-  google::protobuf::Any packed_add;
-  ASSERT_TRUE(packed_add.PackFrom(add));
-  EXPECT_TRUE(control_plane_->RunModuleCommand("l2", "add", packed_add));
+  // The same state through the resource, as a client writes it (D-140): the
+  // entry the legacy `add` would have written.
+  {
+    bess::pb::L2ForwardMacKey key;
+    key.set_addr("02:00:00:00:00:09");
+    bess::pb::L2ForwardMacValue value;
+    value.set_gate(3);
+    grpc::ClientContext ctx;
+    v2::ApplyTransactionRequest req;
+    req.set_request_id("l2-macs-add");
+    req.set_daemon_epoch(Epoch());
+    v2::TransactionOp *op = req.add_ops();
+    op->set_resource("l2/macs");
+    ASSERT_TRUE(op->mutable_key()->PackFrom(key));
+    ASSERT_TRUE(op->mutable_value()->PackFrom(value));
+    v2::ApplyTransactionResponse applied;
+    const grpc::Status status = stub_->ApplyTransaction(&ctx, req, &applied);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
   EXPECT_EQ(grpc::StatusCode::OK, invoke("l2", "lookup", lookup_added, Epoch(), &resp));
 
   // The action's own refusal: the base is not a MAC address.
@@ -1138,7 +1153,7 @@ TEST_F(ApiV2ServiceTest, SchemaNamesEveryArgumentTypeAndCarriesItsDescriptors) {
     }
   }
   EXPECT_EQ((std::vector<std::string>{"lookup", "populate"}), actions)
-      << "sorted, and add/delete/set_default_gate are legacy-only";
+      << "sorted; the state commands went with the legacy service (D-140)";
 }
 
 }  // namespace

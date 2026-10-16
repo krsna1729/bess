@@ -23,9 +23,9 @@ stopping traffic.
    whole batch. It never caches the view across invocations: the view stays
    valid only until the worker's next quiescent point, which is between task
    invocations.
-2. **Workers only read shared tables.** Writes come from the command thread
-   (module commands, the v2 control API). State that the packet path itself
-   writes, such as learned flows or counters, is worker-owned instead
+2. **Workers only read shared tables.** Writes come from the control thread
+   (the v2 control API: resources and actions). State that the packet path
+   itself writes, such as learned flows or counters, is worker-owned instead
    (section 3).
 3. **Resolve metadata offsets per batch, and fail closed.**
    `Module::Init()` registers metadata attributes; it does not assign
@@ -94,13 +94,14 @@ and fatal at millions:
 
 | structure | one change by rebuild (G) | one change in place (C) |
 |---|---|---|
-| ExactMatch, through the module command | 426 µs at 1K rules, 47 ms at 100K, 645 ms at 1M | 0.3 µs at any size |
+| ExactMatch, one rule | 426 µs at 1K rules, 47 ms at 100K, 645 ms at 1M | 0.3 µs at any size |
 | IPLookup (`rte_lpm`) | 9.4 ms at 1K routes, 341 ms at 64K; a 512K build takes ~21 s | 0.5-33 µs |
 | WildcardMatch (masked, 8 tuples) | 7 µs at 8 rules, 500 µs at 256 rules | (G today; see section 5) |
 
-A whole-table swap is reserved for cases with no incremental alternative: a
-restore (`set_runtime_config`), `Clear()` on a route table, and structures
-such as `rte_acl` that can only be compiled whole.
+A whole-table swap is reserved for cases with no incremental alternative:
+`Clear()` on a route table, and structures such as `rte_acl` that can only be
+compiled whole. Desired state is not one: `ApplyPipeline` diffs a resource into
+per-key upserts and erases, so it goes through the incremental mode.
 
 Marking a command `THREAD_SAFE` is a promise that it is safe to run while
 workers keep processing packets. Only mark it so when the command changes
@@ -334,12 +335,13 @@ reference to something missing.
   references; a one-operation transaction costs about 307 ns against 44 ns
   for a direct write (P-core). Tables that do take part in references are
   written only through the engine.
-  `ExactMatch` in action mode uses the engine even for `add`, `delete`,
-  `clear` and `set_runtime_config`: a command bypassing it would not update
-  the rule-to-action reference ledger. Gate mode keeps direct writes.
+  `ExactMatch` in action mode writes its rules only through the engine
+  (`<name>/rules`): a write bypassing it would not update the
+  rule-to-action reference ledger. Gate mode keeps direct writes.
 - **The runtime has one engine**, `runtime().transactions()`. Call
-  `Apply()` under the control-plane lock, as module commands run: a
-  module's own commands write the same tables.
+  `Apply()` under the control-plane lock: the control plane, and a module's own
+  resource writes (including an `edits_resources` action such as L2Forward's
+  `populate`), touch the same tables.
 - **Modules taking part today:** ExactMatch registers its rules as
   `<module>/rules` (key: the fields' bytes in order; value: the gate -- or, in
   action mode, the ActionId of the action the rule names) from `Init()` to
@@ -616,8 +618,12 @@ pass a stress run by luck.
 
 - Pick the structure and update mode from sections 2 and 3.
 - Read the table once per batch; do not cache the view across invocations.
-- Write only from commands; mark a command `THREAD_SAFE` only if it goes
-  through G, C or W.
+- Write only from the control thread: a resource's apply, or an action that
+  writes the resource it owns and says `edits_resources` (which advances the
+  resource generation).
+- Mark an action `THREAD_SAFE` only if it changes state through G, C or W (a
+  table a worker may keep reading); otherwise it is refused while a worker runs
+  and the client pauses first.
 - For C: handle `kFull` by growing, size spare slots for rate × grace
   period, and keep one writer.
 - For G: build off the packet path, publish with `RcuPtr::Publish`, and never

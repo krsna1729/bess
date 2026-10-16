@@ -30,12 +30,14 @@ namespace {
 // Decision D-019 (docs/decisions.md).
 const unsigned kIngressRingFlags = RING_F_SC_DEQ;
 
-// set_quantum_size's refusal (nullptr when `size` is valid).
+// The refusal a settings write reports for a quantum below 1 (nullptr when
+// `size` is valid).
 const char *QuantumError(uint32_t size) {
   return size == 0 ? "quantum size must be at least 1" : nullptr;
 }
 
-// set_max_flow_queue_size's refusal (nullptr when `queue_size` is valid).
+// The refusal a settings write reports for a max queue size below 1 (nullptr
+// when `queue_size` is valid).
 const char *QueueSizeError(uint32_t queue_size) {
   return queue_size == 0 ? "max queue size must be at least 1" : nullptr;
 }
@@ -53,14 +55,9 @@ uint32_t RoundToPowerTwo(uint32_t v) {
   return v;
 }
 
-// The setters edit what "settings" holds: legacy only (D-129).
-const Commands DRR::cmds = {
-    {"set_quantum_size", "DRRQuantumArg",
-     MODULE_CMD_FUNC(&DRR::CommandQuantumSize), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
-    {"set_max_flow_queue_size", "DRRMaxFlowQueueSizeArg",
-     MODULE_CMD_FUNC(&DRR::CommandMaxFlowQueueSize), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY}};
+// The setters edit what "settings" holds (DRRSettings); the class has no
+// actions.
+const Commands DRR::cmds = {};
 
 const ResourceTables DRR::resource_tables = {
     ResourceTable::Singleton<bess::pb::DRRSettings>("settings")};
@@ -184,15 +181,6 @@ CommandResponse DRR::AllocateRings() {
     return CommandFailure(-err_num);
   }
   return CommandSuccess();
-}
-
-CommandResponse DRR::CommandQuantumSize(const bess::pb::DRRQuantumArg &arg) {
-  return SetQuantumSize(arg.quantum());
-}
-
-CommandResponse DRR::CommandMaxFlowQueueSize(
-    const bess::pb::DRRMaxFlowQueueSizeArg &arg) {
-  return SetMaxFlowQueueSize(arg.max_queue_size());
 }
 
 void DRR::ProcessBatch(Context *, bess::PacketBatch *batch) {

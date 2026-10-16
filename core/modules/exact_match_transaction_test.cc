@@ -72,12 +72,21 @@ TransactionEngine::Result Apply(std::vector<Op> ops) {
   return Engine().Apply(ops);
 }
 
-size_t RuleCount(ExactMatch *em) {
-  bess::pb::ExactMatchConfig config;
-  CommandResponse r = em->GetRuntimeConfig(bess::pb::EmptyArg());
-  EXPECT_FALSE(r.has_error());
-  EXPECT_TRUE(r.data().UnpackTo(&config));
-  return static_cast<size_t>(config.rules_size());
+// The number of rules the module's "<name>/rules" resource holds (the table
+// the transaction engine writes and the packet path reads).
+size_t RuleCount(const std::string &module) {
+  const bess::dataplane::Resource *r = bess::runtime::runtime().transactions().FindResource(
+      module + "/rules");
+  EXPECT_NE(nullptr, r) << module;
+  const bess::framework::ResourceCodec *codec =
+      r == nullptr ? nullptr : bess::framework::ResourceBindings::ProcessDefault().Find(*r);
+  EXPECT_NE(nullptr, codec) << module;
+  size_t rules = 0;
+  if (codec != nullptr) {
+    codec->Entries(
+        [&](const google::protobuf::Message &, const google::protobuf::Message &) { rules++; });
+  }
+  return rules;
 }
 
 // Packets whose keys the test sets, batched 32 at a time.
@@ -135,7 +144,7 @@ TEST_F(ExactMatchTransactionTest, RulesAreAResourceWhileTheModuleExists) {
   ExactMatch *em = CreateEm("em");
   auto r = Apply({Add("em", 1, 2, 5)});
   ASSERT_EQ(r.outcome, Outcome::kApplied);
-  EXPECT_EQ(RuleCount(em), 1u);
+  EXPECT_EQ(RuleCount(em->name()), 1u);
   Packets packets(2);
   packets.Set(0, 1, 2);
   packets.Set(1, 1, 3);
@@ -159,7 +168,7 @@ TEST_F(ExactMatchTransactionTest, RulesAreAResourceWhileTheModuleExists) {
   ASSERT_EQ(r.outcome, Outcome::kRejected);
   ExactMatch *again = CreateEm("em");
   ASSERT_NE(again, nullptr);
-  EXPECT_EQ(RuleCount(again), 0u);
+  EXPECT_EQ(RuleCount(again->name()), 0u);
   EXPECT_EQ(Apply({Add("em", 1, 2, 5)}).outcome, Outcome::kApplied);
 }
 
@@ -182,8 +191,8 @@ TEST_F(ExactMatchTransactionTest, OneTransactionChangesSeveralModules) {
   EXPECT_EQ(r.ops[2].status, TransactionEngine::OpStatus::kFailed);
   EXPECT_EQ(packets.Classify(ul, 0, 1)[0], 3);
   EXPECT_EQ(packets.Classify(dl, 1, 1)[0], 4);
-  EXPECT_EQ(RuleCount(ul), 1u);
-  EXPECT_EQ(RuleCount(dl), 1u);
+  EXPECT_EQ(RuleCount(ul->name()), 1u);
+  EXPECT_EQ(RuleCount(dl->name()), 1u);
 
   ASSERT_EQ(Apply({Remove("ul", 10, 1), Remove("dl", 10, 2)}).outcome,
             Outcome::kApplied);
@@ -191,33 +200,25 @@ TEST_F(ExactMatchTransactionTest, OneTransactionChangesSeveralModules) {
   EXPECT_EQ(packets.Classify(dl, 1, 1)[0], DROP_GATE);
 }
 
-TEST_F(ExactMatchTransactionTest, CommandsAndTransactionsShareTheRules) {
+TEST_F(ExactMatchTransactionTest, TransactionsWriteTheModulesTable) {
   ExactMatch *em = CreateEm("em");
-  bess::pb::ExactMatchCommandAddArg add;
-  add.set_gate(5);
-  add.add_fields()->set_value_int(1);
-  add.add_fields()->set_value_int(1);
-  ASSERT_FALSE(em->CommandAdd(add).has_error());
-
-  // A transaction sees the command's rule, and the command the
-  // transaction's.
+  ASSERT_EQ(Apply({Add("em", 1, 1, 5)}).outcome, Outcome::kApplied);
+  // A second transaction sees the first one's rule.
   ASSERT_EQ(Apply({Add("em", 1, 1, 6), Add("em", 2, 2, 7)}).outcome,
             Outcome::kApplied);
-  EXPECT_EQ(RuleCount(em), 2u);
-  bess::pb::ExactMatchCommandDeleteArg del;
-  del.add_fields()->set_value_int(2);
-  del.add_fields()->set_value_int(2);
-  ASSERT_FALSE(em->CommandDelete(del).has_error());
+  EXPECT_EQ(RuleCount("em"), 2u);
+  ASSERT_EQ(Apply({Remove("em", 2, 2)}).outcome, Outcome::kApplied);
+  EXPECT_EQ(RuleCount("em"), 1u);
+  // Erasing what is not there is refused, and refuses the whole transaction.
   auto r = Apply({Remove("em", 2, 2)});
   ASSERT_EQ(r.outcome, Outcome::kRejected);
   EXPECT_EQ(r.ops[0].error, "not found");
   ASSERT_EQ(Apply({Remove("em", 1, 1)}).outcome, Outcome::kApplied);
-  EXPECT_EQ(RuleCount(em), 0u);
-
-  // clear empties the resource too.
+  EXPECT_EQ(RuleCount("em"), 0u);
+  // Two statements: in one expectation the argument order is unspecified, so
+  // RuleCount could run before the apply that adds the rule.
   ASSERT_EQ(Apply({Add("em", 3, 3, 1)}).outcome, Outcome::kApplied);
-  ASSERT_FALSE(em->CommandClear(bess::pb::EmptyArg()).has_error());
-  EXPECT_EQ(Apply({Remove("em", 3, 3)}).outcome, Outcome::kRejected);
+  EXPECT_EQ(RuleCount("em"), 1u);
 }
 
 // The table grows inside a transaction (a larger copy, published as a new
@@ -235,7 +236,7 @@ TEST_F(ExactMatchTransactionTest, GrowsWhileATransactionIsPrepared) {
   };
   Packets packets(32);
   auto expect_rules = [&](uint32_t n) {
-    EXPECT_EQ(RuleCount(em), n);
+    EXPECT_EQ(RuleCount(em->name()), n);
     for (uint32_t first = 0; first < 2 * kRules; first += 32) {
       for (size_t i = 0; i < 32; i++) {
         packets.Set(i, first + static_cast<uint32_t>(i), 1);
@@ -367,8 +368,8 @@ TEST_F(ExactMatchTransactionTest, LookupsWhileTransactionsRun) {
   EXPECT_EQ(wrong.load(), 0u);
   EXPECT_GT(hits.load(), 0u);
   EXPECT_GT(misses.load(), 0u);
-  EXPECT_EQ(RuleCount(ul), kLive);
-  EXPECT_EQ(RuleCount(dl), kLive);
+  EXPECT_EQ(RuleCount(ul->name()), kLive);
+  EXPECT_EQ(RuleCount(dl->name()), kLive);
   // The live window is exactly the last kLive sessions.
   for (uint32_t k = 0; k < 64; k++) {
     const uint32_t s = (kSteps - 1 - k * 47) % kSessions;

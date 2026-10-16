@@ -11,7 +11,7 @@ FROM ubuntu:24.04
 ARG DEB
 COPY ${DEB} /tmp/
 # apt resolves the package's Depends (the libraries bessd loads). No Python:
-# bessctl is bessd (D-120); the Python client is the bess-python package.
+# bessctl is bessd (D-120), and the Python client is gone (D-140).
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends /tmp/${DEB} \
  && rm -rf /var/lib/apt/lists/* /tmp/${DEB}

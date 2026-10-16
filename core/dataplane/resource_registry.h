@@ -41,7 +41,6 @@ class ResourceRegistry {
 
  private:
   friend class TransactionEngine;
-  friend TransactionEngine &EngineOf(ResourceRegistry &registry) noexcept;
   explicit ResourceRegistry(TransactionEngine &engine) noexcept : engine_(engine) {}
 
   TransactionEngine &engine_;

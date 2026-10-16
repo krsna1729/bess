@@ -41,6 +41,28 @@ using bess::testing::PacketBuilder;
 using bess::utils::be16_t;
 using bess::utils::Ethernet;
 
+// Whether `resource`'s codec says it requires paused workers.
+bool RequiresPausedWorkers(const std::string &resource) {
+  const bess::dataplane::Resource *r =
+      bess::runtime::runtime().transactions().FindResource(resource);
+  const bess::framework::ResourceCodec *codec =
+      r == nullptr ? nullptr
+                   : bess::framework::ResourceBindings::ProcessDefault().Find(*r);
+  return codec != nullptr && codec->requires_paused_workers();
+}
+
+BridgeStaticKey StaticKey(const std::string &mac) {
+  BridgeStaticKey key;
+  key.set_mac_addr(mac);
+  return key;
+}
+
+BridgeStaticValue StaticValue(uint32_t gate) {
+  BridgeStaticValue value;
+  value.set_gate(gate);
+  return value;
+}
+
 class BridgeTest : public ::testing::Test {
  protected:
   void TearDown() override { ModuleGraph::DestroyAllModules(); }
@@ -61,44 +83,6 @@ class BridgeTest : public ::testing::Test {
     return dynamic_cast<Bridge *>(m);
   }
 };
-
-TEST_F(BridgeTest, BridgeInitAndCommands) {
-  BridgeArg arg;
-  arg.set_size(512);
-  arg.set_aging_time(60);
-
-  Bridge *br = CreateBridge(arg);
-  ASSERT_NE(nullptr, br);
-
-  // Add static entry
-  BridgeCommandAddArg add;
-  add.set_mac_addr("02:aa:bb:cc:dd:ee");
-  add.set_gate(2);
-  CommandResponse res = br->CommandAdd(add);
-  EXPECT_EQ(0, res.error().code());
-
-  // Add invalid MAC must fail
-  BridgeCommandAddArg bad_add;
-  bad_add.set_mac_addr("invalid-mac");
-  bad_add.set_gate(1);
-  res = br->CommandAdd(bad_add);
-  EXPECT_NE(0, res.error().code());
-
-  // Delete static entry
-  BridgeCommandDeleteArg del;
-  del.set_mac_addr("02:aa:bb:cc:dd:ee");
-  res = br->CommandDelete(del);
-  EXPECT_EQ(0, res.error().code());
-
-  // Delete non-existent entry must fail
-  res = br->CommandDelete(del);
-  EXPECT_NE(0, res.error().code());
-
-  // Clear
-  BridgeCommandClearArg clr;
-  res = br->CommandClear(clr);
-  EXPECT_EQ(0, res.error().code());
-}
 
 TEST_F(BridgeTest, DynamicMacLearningAndForwarding) {
   BridgeArg arg;
@@ -228,10 +212,10 @@ TEST_F(BridgeTest, HairpinFiltering) {
   Task task(br, nullptr);
 
   // Add static entry for Host A on Gate 0
-  BridgeCommandAddArg add;
-  add.set_mac_addr("02:00:00:00:00:01");
-  add.set_gate(0);
-  EXPECT_EQ(0, br->CommandAdd(add).error().code());
+  ModuleHarness h;
+  EXPECT_EQ("", h.UpsertResource(br->name() + "/statics",
+                                 StaticKey("02:00:00:00:00:01"),
+                                 StaticValue(0)));
 
   // Packet arrives on Gate 0 destined for Host A (same gate) -> Hairpin filter drops it!
   bess::PacketHandle pkt = pool.Alloc();
@@ -262,53 +246,33 @@ TEST_F(BridgeTest, HairpinFiltering) {
   // Packet was dropped by hairpin filtering
 }
 
-// Static programming through the module: DROP_GATE is accepted (a blackholed
-// MAC), a multicast MAC is refused, and statics beyond `size` plus
-// kStaticReserve are refused with ENOSPC (the FDB is bounded, D-064).
+// Static programming through the resource: DROP_GATE is accepted (a
+// blackholed MAC), a multicast MAC is refused, and statics beyond `size` plus
+// kStaticReserve are refused (the FDB is bounded, D-064).
 TEST_F(BridgeTest, StaticProgrammingLimits) {
   BridgeArg arg;
   arg.set_size(1);
   Bridge *br = CreateBridge(arg);
   ASSERT_NE(nullptr, br);
-  BridgeCommandAddArg add;
-  add.set_mac_addr("02:00:00:00:00:01");
-  add.set_gate(DROP_GATE);
-  EXPECT_EQ(0, br->CommandAdd(add).error().code());
-  add.set_mac_addr("01:00:5e:00:00:01");
-  add.set_gate(1);
-  EXPECT_EQ(EINVAL, br->CommandAdd(add).error().code());
-  int last = 0;
+  ModuleHarness h;
+  const std::string statics = br->name() + "/statics";
+
+  EXPECT_EQ("", h.UpsertResource(statics, StaticKey("02:00:00:00:00:01"),
+                                 StaticValue(DROP_GATE)));
+  EXPECT_NE("", h.UpsertResource(statics, StaticKey("01:00:5e:00:00:01"),
+                                 StaticValue(1)));  // multicast
+  std::string last;
   for (int i = 0; i < 1 + static_cast<int>(Bridge::kStaticReserve); i++) {
-    add.set_mac_addr(bess::utils::Format("02:00:00:01:%02x:%02x", i >> 8, i & 0xff));
-    last = br->CommandAdd(add).error().code();
-    if (last != 0) {
+    last = h.UpsertResource(
+        statics,
+        StaticKey(bess::utils::Format("02:00:00:01:%02x:%02x", i >> 8, i & 0xff)),
+        StaticValue(1));
+    if (!last.empty()) {
       EXPECT_EQ(static_cast<int>(Bridge::kStaticReserve), i);  // the 1,026th entry
       break;
     }
   }
-  EXPECT_EQ(ENOSPC, last);
-}
-
-// Whether `resource`'s codec says it requires paused workers.
-bool RequiresPausedWorkers(const std::string &resource) {
-  const bess::dataplane::Resource *r =
-      bess::runtime::runtime().transactions().FindResource(resource);
-  const bess::framework::ResourceCodec *codec =
-      r == nullptr ? nullptr
-                   : bess::framework::ResourceBindings::ProcessDefault().Find(*r);
-  return codec != nullptr && codec->requires_paused_workers();
-}
-
-BridgeStaticKey StaticKey(const std::string &mac) {
-  BridgeStaticKey key;
-  key.set_mac_addr(mac);
-  return key;
-}
-
-BridgeStaticValue StaticValue(uint32_t gate) {
-  BridgeStaticValue value;
-  value.set_gate(gate);
-  return value;
+  EXPECT_NE(std::string::npos, last.find("FDB full")) << last;
 }
 
 // A frame from host A to host B.
@@ -388,23 +352,16 @@ TEST(BridgeResourceTest, StaticsRefuseBadKeysAndValues) {
   EXPECT_EQ("", h.ReadBackDiffers(statics, {}));
 }
 
-// The legacy commands stay (legacy surface only) and keep the resource's
-// read-back in step; `flush` is an action that forgets learned MACs only.
-TEST(BridgeResourceTest, LegacyCommandsAndFlushAction) {
+// `flush` is an action that forgets learned MACs only; the statics stay.
+TEST(BridgeResourceTest, FlushActionForgetsLearnedMacsOnly) {
   ModuleHarness h;
   Module *br = h.Create("Bridge", BridgeArg());
   ASSERT_NE(nullptr, br);
   const std::string statics = br->name() + "/statics";
 
-  BridgeCommandAddArg add;
-  add.set_mac_addr("02:00:00:00:00:09");
-  add.set_gate(3);
-  EXPECT_EQ(ENOTSUP, h.Action(br, "add", add).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(br, "delete", BridgeCommandDeleteArg()).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(br, "clear", BridgeCommandClearArg()).error().code());
-  h.MustCommand(br, "add", add);
   const BridgeStaticKey key = StaticKey("02:00:00:00:00:09");
   const BridgeStaticValue value = StaticValue(3);
+  ASSERT_EQ("", h.UpsertResource(statics, key, value));
   EXPECT_EQ("", h.ReadBackDiffers(statics, {{&key, &value}}));
 
   // Learn host A on gate 0, then reach it from gate 1: forwarded, not
@@ -424,10 +381,6 @@ TEST(BridgeResourceTest, LegacyCommandsAndFlushAction) {
   EXPECT_EQ(1u, out[0].size());
   EXPECT_EQ(1u, out[2].size());
   EXPECT_EQ("", h.ReadBackDiffers(statics, {{&key, &value}}));
-
-  // clear (legacy) removes the statics too.
-  h.MustCommand(br, "clear", BridgeCommandClearArg());
-  EXPECT_EQ("", h.ReadBackDiffers(statics, {}));
 }
 
 }  // namespace

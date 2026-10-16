@@ -52,26 +52,34 @@
 /* Note: unmatched packets are sent to gate 0 */
 #define SNAPLEN 0xffff
 
-// D-129: "<name>/filters" holds the filter list; add, delete, clear and
-// get_initial_arg stay for the legacy ModuleCommand only.
-const Commands BPF::cmds = {
-    {"add", "BPFArg", MODULE_CMD_FUNC(&BPF::CommandAdd), Command::THREAD_UNSAFE,
-     "", Command::LEGACY_ONLY},
-    {"delete", "BPFArg", MODULE_CMD_FUNC(&BPF::CommandDelete),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-    {"clear", "EmptyArg", MODULE_CMD_FUNC(&BPF::CommandClear),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-    {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&BPF::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS}};
+// "<name>/filters" holds the whole filter list; the class has no actions.
+const Commands BPF::cmds = {};
 
 const ResourceTables BPF::resource_tables = {
     ResourceTable::Singleton<bess::pb::BPFArg>("filters", true)};
 
 CommandResponse BPF::Init(const bess::pb::BPFArg &arg) {
-  CommandResponse ret = CommandAdd(arg);
-  if (ret.has_error()) {
-    return ret;
+  // The init argument's filters, compiled and sorted as the resource's are:
+  // a filter that does not compile refuses the creation. OwnedFilters frees
+  // the list it replaced.
+  OwnedFilters compiled;
+  compiled.filters.reserve(arg.filters_size());
+  for (const auto &f : arg.filters()) {
+    bess::utils::Filter filter;
+    CommandResponse ret = Compile(f, &filter);
+    if (ret.has_error()) {
+      return ret;
+    }
+    compiled.filters.push_back(std::move(filter));
   }
+  // Descending priority; equal priorities keep the order given.
+  std::stable_sort(
+      compiled.filters.begin(), compiled.filters.end(),
+      [](const bess::utils::Filter &a, const bess::utils::Filter &b) {
+        return b.priority < a.priority;
+      });
+  filters_.swap(compiled.filters);
+  arg_ = arg;
 
   // Stage compiles the whole list (a filter that does not compile refuses
   // the transaction) and sorts it; apply swaps it in. The list it replaced
@@ -127,17 +135,6 @@ void BPF::FreeFilters(std::vector<bess::utils::Filter> *filters) {
   filters->clear();
 }
 
-CommandResponse BPF::GetInitialArg(const bess::pb::EmptyArg &) {
-  bess::pb::BPFArg r;
-  for (auto f : filters_) {
-    auto *f_pb = r.add_filters();
-    f_pb->set_priority(f.priority);
-    f_pb->set_filter(f.exp);
-    f_pb->set_gate(f.gate);
-  }
-  return CommandSuccess(r);
-}
-
 CommandResponse BPF::Compile(const bess::pb::BPFArg::Filter &f,
                              bess::utils::Filter *out) {
   if (f.gate() < 0 || f.gate() >= MAX_GATES) {
@@ -173,60 +170,6 @@ CommandResponse BPF::Compile(const bess::pb::BPFArg::Filter &f,
 #endif
 
   *out = std::move(filter);
-  return CommandSuccess();
-}
-
-CommandResponse BPF::CommandAdd(const bess::pb::BPFArg &arg) {
-  for (const auto &f : arg.filters()) {
-    bess::utils::Filter filter;
-    CommandResponse ret = Compile(f, &filter);
-    if (ret.has_error()) {
-      return ret;
-    }
-    filters_.push_back(filter);
-    *arg_.add_filters() = f;
-  }
-
-  std::sort(filters_.begin(), filters_.end(),
-            [](const bess::utils::Filter &a, const bess::utils::Filter &b) {
-              // descending order of priority number
-              return b.priority < a.priority;
-            });
-
-  return CommandSuccess();
-}
-
-CommandResponse BPF::CommandDelete(const bess::pb::BPFArg &arg) {
-  for (const auto &f : arg.filters()) {
-    if (f.gate() < 0 || f.gate() >= MAX_GATES) {
-      return CommandFailure(EINVAL, "Invalid gate");
-    }
-
-    for (auto i = filters_.begin(); i != filters_.end(); ++i) {
-      if (f.priority() == i->priority && f.gate() == i->gate &&
-          f.filter() == i->exp) {
-        filters_.erase(i);
-        break;
-      }
-    }
-    // The same filter leaves the list as given (filters_ and arg_ hold the
-    // same filters, in different orders).
-    auto *given = arg_.mutable_filters();
-    for (auto i = given->begin(); i != given->end(); ++i) {
-      if (f.priority() == i->priority() && f.gate() == i->gate() &&
-          f.filter() == i->filter()) {
-        given->erase(i);
-        break;
-      }
-    }
-  }
-
-  return CommandSuccess();
-}
-
-CommandResponse BPF::CommandClear(const bess::pb::EmptyArg &) {
-  FreeFilters(&filters_);
-  arg_.Clear();
   return CommandSuccess();
 }
 

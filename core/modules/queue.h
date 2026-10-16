@@ -39,9 +39,6 @@ class Queue : public Module {
   }
 
   CommandResponse Init(const bess::pb::QueueArg &arg);
-  CommandResponse GetInitialArg(const bess::pb::EmptyArg &);
-  CommandResponse GetRuntimeConfig(const bess::pb::EmptyArg &arg);
-  CommandResponse SetRuntimeConfig(const bess::pb::QueueArg &arg);
 
   void DeInit() override;
 
@@ -53,8 +50,6 @@ class Queue : public Module {
 
   std::string GetDesc() const override;
 
-  CommandResponse CommandSetBurst(const bess::pb::QueueCommandSetBurstArg &arg);
-  CommandResponse CommandSetSize(const bess::pb::QueueCommandSetSizeArg &arg);
   CommandResponse CommandGetStatus(
       const bess::pb::QueueCommandGetStatusArg &arg);
 

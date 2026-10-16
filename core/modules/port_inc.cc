@@ -22,15 +22,8 @@ std::string BurstError(uint64_t burst) {
 
 }  // namespace
 
-// set_burst edits what "settings" holds, and GetPipeline's Module.arg
-// replaces get_initial_arg: legacy only (D-129).
-const Commands PortInc::cmds = {
-    {"set_burst", "PortIncCommandSetBurstArg",
-     MODULE_CMD_FUNC(&PortInc::CommandSetBurst), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
-    {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&PortInc::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
-};
+// "settings" (PortIncSettings) holds burst; the class has no actions.
+const Commands PortInc::cmds = {};
 
 const ResourceTables PortInc::resource_tables = {
     ResourceTable::Singleton<bess::pb::PortIncSettings>("settings")};
@@ -103,13 +96,6 @@ CommandResponse PortInc::Init(const bess::pb::PortIncArg &arg) {
   return CommandSuccess();
 }
 
-CommandResponse PortInc::GetInitialArg(const bess::pb::EmptyArg &) {
-  bess::pb::PortIncArg arg;
-  arg.set_port(port_->name());
-  arg.set_prefetch(prefetch_);
-  return CommandSuccess(arg);
-}
-
 void PortInc::DeInit() {
   settings_.Release();
   if (port_) {
@@ -174,18 +160,6 @@ struct task_result PortInc::RunTask(Context *ctx, bess::PacketBatch *batch,
   return {.block = false,
           .packets = cnt,
           .bits = (received_bytes + cnt * pkt_overhead) * 8};
-}
-
-CommandResponse PortInc::CommandSetBurst(
-    const bess::pb::PortIncCommandSetBurstArg &arg) {
-  uint64_t burst = arg.burst();
-
-  if (std::string err = BurstError(burst); !err.empty()) {
-    return CommandFailure(EINVAL, "%s", err.c_str());
-  }
-
-  burst_.store(burst, std::memory_order_relaxed);
-  return CommandSuccess();
 }
 
 ADD_MODULE(PortInc, "port_inc", "receives packets from a port")

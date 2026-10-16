@@ -30,15 +30,9 @@ uint64_t MacToUint64(const Ethernet::Address &addr) {
 
 }  // namespace
 
-// LEGACY_ONLY (D-129): the interfaces are the "<module>/interfaces" resource.
-const Commands Vif::cmds = {
-    {"add", "VifCommandAddArg", MODULE_CMD_FUNC(&Vif::CommandAdd),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-    {"delete", "VifCommandDeleteArg", MODULE_CMD_FUNC(&Vif::CommandDelete),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-    {"clear", "VifCommandClearArg", MODULE_CMD_FUNC(&Vif::CommandClear),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-};
+// The interfaces are the "<module>/interfaces" resource (D-129); the class
+// has no actions.
+const Commands Vif::cmds = {};
 
 const ResourceTables Vif::resource_tables = {
     ResourceTable::Map<bess::pb::VifInterfaceKey, bess::pb::VifInterfaceValue>(
@@ -197,7 +191,7 @@ CommandResponse Vif::Init(const bess::pb::VifArg &arg) {
     add_arg.set_route_domain(iface_pb.route_domain());
     add_arg.set_gate(iface_pb.gate());
 
-    CommandResponse ret = CommandAdd(add_arg);
+    CommandResponse ret = Add(add_arg);
     if (ret.error().code() != 0) {
       return ret;
     }
@@ -285,7 +279,8 @@ void Vif::DeInit() {
   resource_.reset();
 }
 
-CommandResponse Vif::CommandAdd(const bess::pb::VifCommandAddArg &arg) {
+// The init argument's interfaces, validated before anything is installed.
+CommandResponse Vif::Add(const bess::pb::VifCommandAddArg &arg) {
   if (arg.id() == 0) {
     return CommandFailure(EINVAL, "interface 'id' must be non-zero");
   }
@@ -315,21 +310,6 @@ CommandResponse Vif::CommandAdd(const bess::pb::VifCommandAddArg &arg) {
 
   interfaces_by_id_[iface.id] = iface;
   RebuildTables();
-  return CommandSuccess();
-}
-
-CommandResponse Vif::CommandDelete(const bess::pb::VifCommandDeleteArg &arg) {
-  if (interfaces_by_id_.erase(arg.id()) == 0) {
-    return CommandFailure(ENOENT, "interface id %u not found", arg.id());
-  }
-  RebuildTables();
-  return CommandSuccess();
-}
-
-CommandResponse Vif::CommandClear(const bess::pb::VifCommandClearArg &) {
-  interfaces_by_id_.clear();
-  mac_table_.clear();
-  arp_table_.clear();
   return CommandSuccess();
 }
 

@@ -11,11 +11,10 @@ Both come from `meson install` of BUILD, and the runtime has no Python (D-135).
 bessd: the C++ client, D-120), the sample manifests, the protobuf schema, the
 build metadata and SBOM, and dpdk-devbind.py -- and the docs.
 
-`deb` (on Debian or Ubuntu): five packages -- `bess` (the runtime: bessd,
+`deb` (on Debian or Ubuntu): four packages -- `bess` (the runtime: bessd,
 bessctl, the sample manifests, the protobuf schema, the build metadata and
 the SPDX SBOM; no Python), `bess-tools` (dpdk-devbind.py; Python 3),
-`bess-python` (the legacy Python client, pybess
-and the Python bessctl, with their generated protobuf modules), `bess-dev` (the
+`bess-dev` (the
 headers and bess-dev.pc plugins build against, and the experimental route,
 dataplane and RCU archives with bess-dev-static.pc, D-095) and `bess-sdk` (the
 C++ control SDK). `bess` depends on the packages that own every shared library
@@ -74,10 +73,6 @@ def runtime_paths(prefix: str) -> list[str]:
 
 def tools_paths(prefix: str) -> list[str]:
     return [f'{prefix}/bin/dpdk-devbind.py']
-
-
-def python_paths(prefix: str) -> list[str]:
-    return [f'{prefix}/share/bess/{tree}' for tree in ('pybess', 'builtin_pb', 'plugin_pb', 'bessctl')]
 
 
 def copy_paths(stage: Path, dest: Path, paths: list[str], what: str) -> None:
@@ -190,8 +185,8 @@ def deb(args) -> list[Path]:
         stage = Path(tmp) / 'stage'
         prefix, lib = stage_install(args.build, stage)
         # Every install under share/bess goes to one of the packages below.
-        claimed = {Path(p).name for p in runtime_paths(prefix) + tools_paths(prefix) +
-                   python_paths(prefix) if p.startswith(f'{prefix}/share/bess/')}
+        claimed = {Path(p).name for p in runtime_paths(prefix) + tools_paths(prefix)
+                   if p.startswith(f'{prefix}/share/bess/')}
         unclaimed = sorted({p.name for p in (stage / prefix / 'share' / 'bess').iterdir()} - claimed)
         if unclaimed:
             raise SystemExit('share/bess entries no package claims: ' + ', '.join(unclaimed))
@@ -204,13 +199,6 @@ def deb(args) -> list[Path]:
             build_deb(stage, 'bess-tools', version, ['python3', 'pciutils'],
                       'BESS ops tools: dpdk-devbind.py', out,
                       tools_paths(prefix)),
-            # grpcio and protobuf at the versions of requirements.txt are newer
-            # than the distributions' python3-grpcio and python3-protobuf: pip.
-            # Its files were in bess before D-135.
-            build_deb(stage, 'bess-python', version, [f'bess (= {version})', 'python3'],
-                      'BESS legacy Python client (pybess, Python bessctl); needs grpcio and '
-                      'protobuf from pip (requirements.txt)', out, python_paths(prefix),
-                      takes_over=['bess']),
             # What bess-dev.pc and bess-dev-static.pc require (glog, gflags,
             # protobuf, libpcap) as packages, so pkg-config resolves on a host
             # that has only these packages.

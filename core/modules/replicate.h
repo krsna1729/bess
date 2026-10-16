@@ -29,12 +29,6 @@ class Replicate final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  /*!
-   * Sets the number of output gates.
-   */
-  CommandResponse CommandSetGates(
-      const bess::pb::ReplicateCommandSetGatesArg &arg);
-
  private:
   struct Gates {
     std::array<gate_idx_t, kMaxGates> gates{};

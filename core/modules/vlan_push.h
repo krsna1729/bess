@@ -27,8 +27,6 @@ class VLANPush final : public Module {
 
   std::string GetDesc() const override;
 
-  CommandResponse CommandSetTci(const bess::pb::VLANPushArg &arg);
-
  private:
   bess::utils::be32_t vlan_tag_;
   bess::utils::be32_t qinq_tag_;

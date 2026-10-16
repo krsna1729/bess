@@ -28,9 +28,6 @@ class RandomUpdate final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  CommandResponse CommandAdd(const bess::pb::RandomUpdateArg &arg);
-  CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
-
  private:
   struct Var {
     bess::utils::be32_t mask;  // bits with 1 won't be updated

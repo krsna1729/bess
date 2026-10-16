@@ -4248,14 +4248,15 @@ func (x *ListMetricsResponse) GetDaemonEpoch() uint64 {
 //
 // A module's action, as GetSchema lists it (name, argument and result types,
 // thread_safe): what a module does that is not state -- lookups, statistics,
-// clearing counters, one-shot operations. A module's state is its init
-// argument and its resources, never an action. Not transactional: an action
-// acts when it runs. An action not marked thread_safe is refused while a
-// worker runs (FAILED_PRECONDITION, RESOURCE_BUSY, errno EBUSY): pause the
+// clearing counters, one-shot operations. An action holds no state: a
+// resource's entries are written through the resource, and one action that
+// writes them outside a transaction (L2Forward's populate, which the schema
+// marks) advances the resource generation, so a commit that expected the old
+// value is refused (D-140). Not transactional: an action acts when it runs.
+// An action not marked thread_safe is refused while a worker runs
+// (FAILED_PRECONDITION, RESOURCE_BUSY, errno EBUSY): pause the
 // workers first (Admin.PauseWorkers). An action's failure is the call's
-// error, with its errno in ErrorDetail.errno_value. The legacy service's
-// ModuleCommand also runs the commands that edit state, which no action
-// does; they leave with the legacy service.
+// error, with its errno in ErrorDetail.errno_value.
 type InvokeActionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	DaemonEpoch   uint64                 `protobuf:"varint,1,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"` // required (D-106)

@@ -29,9 +29,9 @@ constexpr size_t kMigrateSlots = 64;
 
 }  // namespace
 
+// The usage log's two actions; the addresses are the init argument, which
+// GetPipeline's Module.arg carries back (D-129).
 const Commands NAT::cmds = {
-    {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&NAT::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
     // While workers run: the usage log's one consumer is the control side
     // (every module command holds the control-plane lock); a report request
     // is one atomic flag.
@@ -39,10 +39,7 @@ const Commands NAT::cmds = {
      Command::THREAD_SAFE},
     {"drain_usage", "EmptyArg", MODULE_CMD_FUNC(&NAT::CommandDrainUsage),
      Command::THREAD_SAFE, "NATUsageResponse"},
-    {"get_runtime_config", "EmptyArg", MODULE_CMD_FUNC(&NAT::GetRuntimeConfig),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
-    {"set_runtime_config", "EmptyArg", MODULE_CMD_FUNC(&NAT::SetRuntimeConfig),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY}};
+};
 
 CommandResponse NAT::Init(const bess::pb::NATArg &arg) {
   table_full_ = bess::stats::EventThrottle(init_context().events(), "bess.table_full", name());
@@ -80,9 +77,9 @@ CommandResponse NAT::Init(const bess::pb::NATArg &arg) {
     return CommandFailure(EINVAL,
                           "at least one external IP address must be specified");
   }
-  // Sorted (with their ranges) so GetInitialArg is predictable and an internal
-  // address maps to the same external one as before (the hash indexes this
-  // order).
+  // Sorted (with their ranges) so the module's initial argument is predictable
+  // and an internal address maps to the same external one as before (the hash
+  // indexes this order).
   std::stable_sort(config.addresses.begin(), config.addresses.end(),
                    [](const auto &a, const auto &b) { return a.addr < b.addr; });
   // 65,536 bindings (user decision 3-B, D-068) or what the addresses can
@@ -174,37 +171,6 @@ void NAT::OnGrowRequest(const GrowRequest &request) {
         }
       },
       engine_);
-}
-
-CommandResponse NAT::GetInitialArg(const bess::pb::EmptyArg &) {
-  bess::pb::NATArg resp;
-  const std::vector<nat::ExternalAddress> *addresses = nullptr;
-  std::visit(
-      [&](auto &engine) {
-        if constexpr (!std::is_same_v<std::decay_t<decltype(engine)>, std::monostate>) {
-          addresses = &engine->addresses();
-        }
-      },
-      engine_);
-  for (const auto &a : *addresses) {
-    auto ext = resp.add_ext_addrs();
-    ext->set_ext_addr(ToIpv4Address(a.addr));
-    for (const auto &r : a.ranges) {
-      auto erange = ext->add_port_ranges();
-      erange->set_begin(r.begin);
-      erange->set_end(r.end);
-      erange->set_suspended(r.suspended);
-    }
-  }
-  return CommandSuccess(resp);
-}
-
-CommandResponse NAT::GetRuntimeConfig(const bess::pb::EmptyArg &) {
-  return CommandSuccess();
-}
-
-CommandResponse NAT::SetRuntimeConfig(const bess::pb::EmptyArg &) {
-  return CommandSuccess();
 }
 
 CommandResponse NAT::CommandRequestUsageReport(const bess::pb::EmptyArg &) {

@@ -28,9 +28,6 @@ class StaticNAT : public Module {
   static const Commands cmds;
 
   CommandResponse Init(const bess::pb::StaticNATArg &arg);
-  CommandResponse GetInitialArg(const bess::pb::EmptyArg &arg);
-  CommandResponse GetRuntimeConfig(const bess::pb::EmptyArg &arg);
-  CommandResponse SetRuntimeConfig(const bess::pb::EmptyArg &arg);
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 

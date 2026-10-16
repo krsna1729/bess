@@ -180,8 +180,7 @@ of the class's `Init` type, else in `bess.pb`. A plugin whose `Init` takes
 `bess::pb::EmptyArg` and whose actions take its own messages must therefore
 either give `Init` its own package's type or declare those types by full
 name; otherwise `GetSchema` reports `""` and generic clients cannot build the
-action's argument. (The legacy Python bessctl looks short names up in the
-plugin's module and cannot run a command declared by full name.)
+action's argument.
 
 ### Resources and actions (D-129)
 
@@ -209,24 +208,28 @@ a client can do to it is an **action**.
 
   `GetSchema` lists them; transactions (`ApplyTransaction`) and desired state
   (`Pipeline.resources`, below) change them.
-- **Actions** are the `cmds` entries with the default exposure
-  (`Command::ACTION`): verbs that are not state (a lookup, a flush, a
-  counter read). `InvokeAction` runs them and `GetSchema` lists them, with
-  `result_type` naming the message an action puts in its answer (empty: it
-  answers nothing).
-- A command that edits state a resource holds (an `add` to a table, a
-  `set_*`, `get_initial_arg`) is `Command::LEGACY_ONLY`: the legacy
-  `ModuleCommand` RPC (pybess, `.bess` scripts) still runs it; control_v2
-  neither lists nor runs it (`ENOTSUP`).
+- **Actions** are the `cmds` entries: verbs that are not state (a lookup, a
+  flush, a counter read, a table generator). `InvokeAction` runs them and
+  `GetSchema` lists them, with `result_type` naming the message an action puts
+  in its answer (empty: it answers nothing). An action holds no state: a
+  resource's entries are written through the resource, and an action that can
+  write one outside a transaction (L2Forward's `populate`) says so with
+  `edits_resources`, which advances the resource generation so a concurrent
+  apply conflicts. There is no `LEGACY_ONLY` command and no legacy
+  `ModuleCommand` RPC left to run one (D-140).
 
   ```cpp
   const Commands MyModule::cmds = {
-      {"add", "MyAddArg", MODULE_CMD_FUNC(&MyModule::CommandAdd), Command::THREAD_UNSAFE, "",
-       Command::LEGACY_ONLY},
       {"stats", "EmptyArg", MODULE_CMD_FUNC(&MyModule::CommandStats), Command::THREAD_SAFE,
        "MyStatsResponse"},
+      {"populate", "MyPopulateArg", MODULE_CMD_FUNC(&MyModule::CommandPopulate),
+       Command::THREAD_SAFE, "", /*edits_resources=*/true},
   };
   ```
+
+  `edits_resources` says the action can change a resource's contents (it
+  advances the resource generation, so a concurrent `ApplyPipeline` conflicts
+  instead of undoing the edit); it defaults to false.
 
 ### Plugin descriptor (`framework/plugin.h`)
 
@@ -251,14 +254,21 @@ struct BessPluginDescriptor {
 - `BESS_PLUGIN_API_VERSION` is the version of the supported source
   API: it increases when a change to the public headers can break a plugin's
   source. A daemon at version N loads a plugin whose `[api_min, api_max]`
-  contains N. It is 3: version 1 became 2 with D-129 (a `ResourceCodec`
+  contains N. It is 4: version 1 became 2 with D-129 (a `ResourceCodec`
   has `kind()` and `Entries()`, a `TypedCodec` takes an `entries` function,
-  and a class's codec-bound resources must match its `resource_tables`), and
+  and a class's codec-bound resources must match its `resource_tables`),
   2 became 3 with D-133 (typed worker ids: `Context::wid` and
   `Worker::wid()` are a `dataplane::WorkerId`, indexed with `.value()`;
   `Worker::core()` is a `dataplane::CpuId` and `Worker::socket()` a
   `dataplane::SocketId`; `EventHub::Post`/`Full`, `EventThrottle::Note` and
-  `Module::AddActiveWorker` take a `WorkerId`).
+  `Module::AddActiveWorker` take a `WorkerId`), and 3 became 4 with D-140
+  (a `cmds` entry is a name, an argument type, a handler, its thread safety,
+  the answer's type and `edits_resources`: `Command::Exposure`,
+  `Command::Effect`, `LEGACY_ONLY` and the rest of that pair are gone, and
+  `ModuleBuilder::RunCommand` takes no `CommandSurface`; the gate-hook command
+  surface is gone with it -- `GateHookCommand(s)`, `GATE_HOOK_CMD_FUNC`, the
+  required static `cmds` member and `GateHook::RunCommand`/`set_builder` -- so
+  `ADD_GATE_HOOK` takes no command table).
 - `BESS_PLUGIN(name, version)` declares a plugin built against exactly the
   current API (`api_min == api_max == BESS_PLUGIN_API_VERSION`) that needs no
   optional capability. `BESS_PLUGIN_REQUIRES(name, version, capabilities)` is

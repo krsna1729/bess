@@ -35,10 +35,6 @@ class IPLookup final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  CommandResponse CommandAdd(const bess::pb::IPLookupCommandAddArg &arg);
-  CommandResponse CommandDelete(const bess::pb::IPLookupCommandDeleteArg &arg);
-  CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
-
  private:
   // A route's value is an output gate (DROP_GATE included), stored directly:
   // this module's result *is* a gate, so there is no next-hop indirection.

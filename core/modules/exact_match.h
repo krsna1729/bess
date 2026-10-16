@@ -96,15 +96,6 @@ class ExactMatch final : public Module {
 
   CommandResponse Init(const bess::pb::ExactMatchArg &arg);
   void DeInit() override;
-  CommandResponse GetInitialArg(const bess::pb::EmptyArg &arg);
-  CommandResponse GetRuntimeConfig(const bess::pb::EmptyArg &arg);
-  CommandResponse SetRuntimeConfig(const bess::pb::ExactMatchConfig &arg);
-  CommandResponse CommandAdd(const bess::pb::ExactMatchCommandAddArg &arg);
-  CommandResponse CommandDelete(
-      const bess::pb::ExactMatchCommandDeleteArg &arg);
-  CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
-  CommandResponse CommandSetDefaultGate(
-      const bess::pb::ExactMatchCommandSetDefaultGateArg &arg);
 
  private:
   // One configured rule: the field values to match (in field order) and the
@@ -122,8 +113,8 @@ class ExactMatch final : public Module {
   // The configuration a batch runs against: the compiled extraction plan, the
   // default gate, and the rule table. Immutable once published, but for the
   // default gate, which the "settings" resource stores in place; the rest
-  // changes only when configuration does (metadata offsets, a restore, the
-  // legacy set_default_gate, or table growth).
+  // changes only when configuration does (metadata offsets, a rule-table
+  // rebuild, or table growth).
   //
   // Rules are NOT part of a generation (G1.2 mode C). They live in a
   // ConcurrentExactTable -- DPDK's lock-free rte_hash under the runtime
@@ -133,15 +124,12 @@ class ExactMatch final : public Module {
   struct Generation {
     Generation(gate_idx_t d, bess::classifier::ExtractPlan e,
                std::shared_ptr<bess::classifier::ConcurrentExactTable> t,
-               size_t k, bool valid,
-               std::vector<std::vector<std::byte>> masks,
-               std::vector<size_t> offsets)
+               size_t k, bool valid, std::vector<size_t> offsets)
         : default_gate(d),
           extract(std::move(e)),
           table(std::move(t)),
           key_size(k),
           extraction_valid(valid),
-          converted_masks(std::move(masks)),
           baked_source_offsets(std::move(offsets)) {}
 
     // Read once per batch (relaxed): the "settings" resource stores it in the
@@ -158,9 +146,6 @@ class ExactMatch final : public Module {
     // path then routes everything to the default gate instead of reading an
     // incorrect metadata region (fail-closed).
     bool extraction_valid = true;
-    // Per-field converted mask bytes (legacy ExactMatchField::mask byte
-    // order), for GetInitialArg serialization.
-    std::vector<std::vector<std::byte>> converted_masks;
     // Per-field source offset baked into `extract` (packet byte offset, or
     // metadata attr offset, or kInvalidOffset for unreadable metadata).
     // Compared at PreResume to detect graph-driven offset reassignment.
@@ -196,12 +181,6 @@ class ExactMatch final : public Module {
   // count against the module's configured fields.
   Error RuleFieldsFromPb(const RepeatedPtrField<bess::pb::FieldData> &fields,
                          std::vector<std::vector<uint8_t>> *rule);
-  // The value a rule command carries: the gate (gate mode) or the action id
-  // (action mode), refusing the field the mode does not use.
-  Error RuleValueFromPb(const bess::pb::ExactMatchCommandAddArg &arg,
-                        uint64_t *value) const;
-  // Turns a command argument into a `Rule`, validating value and fields.
-  Error RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg, Rule *rule);
   // Replaces the published generation with `build(current)`, or leaves the
   // active one alone when the builder returns nullptr (with *err set). Runs
   // only on the control plane, where command and graph mutations are
@@ -236,9 +215,6 @@ class ExactMatch final : public Module {
   struct KeyLayout {
     size_t key_size = 0;
     std::vector<bess::classifier::RuntimeKeyField> key_fields;
-    // Converted mask bytes per field, in legacy ExactMatchField::mask byte
-    // order (for GetInitialArg serialization).
-    std::vector<std::vector<std::byte>> converted_masks;
     // Source offset baked into the plan per field, or kInvalidOffset for
     // unreadable metadata.
     std::vector<size_t> baked_offsets;
@@ -272,7 +248,6 @@ class ExactMatch final : public Module {
     size_t mask_bin_len = 0;    // value_bin length; 0 for value_int/empty
   };
   std::vector<FieldSpec> field_specs_;
-  bool empty_masks_;  // mainly for GetInitialArg
 
   // Action mode (see the class comment): rules name actions, and the packet
   // path writes the matched action id into `action_id`.
@@ -289,7 +264,7 @@ class ExactMatch final : public Module {
   // a packet worker.
   // Never null between Init() and module destruction (DeInit() leaves it: the
   // generation is released with the module, workers already paused), and
-  // every command publishes a replacement rather than clearing it.
+  // every writer publishes a replacement rather than clearing it.
   bess::rcu::RcuPtr<Generation> published_;
 
   // The table the command path writes (always the current generation's).

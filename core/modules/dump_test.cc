@@ -79,14 +79,4 @@ TEST(DumpSettingsTest, DoesNotRequirePausedWorkers) {
   EXPECT_FALSE(RequiresPausedWorkers("d/settings"));
 }
 
-TEST(DumpSettingsTest, SetIntervalIsLegacyOnly) {
-  ModuleHarness h;
-  Module *m = h.Create("Dump", bess::pb::DumpArg(), "d");
-  ASSERT_NE(nullptr, m);
-  EXPECT_EQ(ENOTSUP, h.Action(m, "set_interval", Interval(2)).error().code());
-  h.MustCommand(m, "set_interval", Interval(2));
-  const bess::pb::DumpArg s = Interval(2);
-  EXPECT_EQ("", h.ReadBackDiffers("d/settings", {{nullptr, &s}}));
-}
-
 }  // namespace

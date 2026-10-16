@@ -3,7 +3,8 @@
 // IPLookup in process (was bessctl/module_tests/iplookup.py): longest-prefix
 // routes to gates, deleted and unknown routes, prefixes with host bits, and
 // wire gates that do not fit gate_idx_t; the "<name>/routes" resource (D-129):
-// applied, read back canonically, refused, and the legacy-only commands.
+// applied, read back canonically, refused; its commands went with the legacy
+// service (D-140).
 
 #include <gtest/gtest.h>
 
@@ -23,21 +24,6 @@ using bess::testing::Bytes;
 using bess::testing::ModuleHarness;
 using bess::testing::TcpPacket;
 
-bess::pb::IPLookupCommandAddArg Route(const std::string &prefix, uint64_t len, uint64_t gate) {
-  bess::pb::IPLookupCommandAddArg arg;
-  arg.set_prefix(prefix);
-  arg.set_prefix_len(len);
-  arg.set_gate(gate);
-  return arg;
-}
-
-bess::pb::IPLookupCommandDeleteArg Prefix(const std::string &prefix, uint64_t len) {
-  bess::pb::IPLookupCommandDeleteArg arg;
-  arg.set_prefix(prefix);
-  arg.set_prefix_len(len);
-  return arg;
-}
-
 // Every test runs with backend LPM and FIB (D-132).
 class IpLookupTest : public bess::testing::RouteBackendTest {
  protected:
@@ -50,48 +36,6 @@ class IpLookupTest : public bess::testing::RouteBackendTest {
   }
 };
 
-TEST_P(IpLookupTest, RoutesToTheGateOfTheMatchingPrefix) {
-  std::mt19937 rng(1);
-  const Bytes to22 = TcpPacket({.sip = "12.22.22.22", .dip = "22.22.22.22"}, rng);
-  const Bytes to32 = TcpPacket({.sip = "12.22.22.22", .dip = "32.22.22.22"}, rng);
-  const Bytes to42 = TcpPacket({.sip = "12.22.22.22", .dip = "42.22.22.22"}, rng);
-
-  ModuleHarness h;
-  Module *ipl = h.Create("IPLookup", Arg());
-  ASSERT_NE(nullptr, ipl);
-  h.MustCommand(ipl, "add", Route("22.22.22.0", 24, 0));
-  h.MustCommand(ipl, "add", Route("32.22.22.0", 24, 1));
-  h.MustCommand(ipl, "add", Route("42.22.22.0", 24, 1));
-  h.MustCommand(ipl, "delete", Prefix("42.22.22.0", 24));
-  EXPECT_NE(0, h.Command(ipl, "delete", Prefix("52.22.22.0", 24)).error().code())
-      << "deleting a route that is not there";
-
-  auto out = h.Run(ipl, 0, {to22, to32, to42}, {0, 1});
-  EXPECT_EQ((std::vector<Bytes>{to22}), out[0]);
-  EXPECT_EQ((std::vector<Bytes>{to32}), out[1]) << "the deleted route forwards nothing";
-}
-
-TEST_P(IpLookupTest, PrefixWithHostBitsIsRefused) {
-  ModuleHarness h;
-  Module *ipl = h.Create("IPLookup", Arg());
-  ASSERT_NE(nullptr, ipl);
-  EXPECT_EQ(EINVAL, h.Command(ipl, "add", Route("22.22.22.0", 16, 0)).error().code());
-}
-
-// The gate is uint64 on the wire; 65536 + g used to route to gate g.
-TEST_P(IpLookupTest, GateDoesNotWrap) {
-  std::mt19937 rng(2);
-  const Bytes pkt = TcpPacket({.sip = "12.0.0.1", .dip = "10.1.2.3"}, rng);
-  ModuleHarness h;
-  Module *ipl = h.Create("IPLookup", Arg());
-  ASSERT_NE(nullptr, ipl);
-  EXPECT_EQ(EINVAL, h.Command(ipl, "add", Route("10.0.0.0", 8, 65536 + 1)).error().code());
-  EXPECT_EQ(EINVAL, h.Command(ipl, "add", Route("10.0.0.0", 8, 1ull << 32)).error().code());
-  EXPECT_TRUE(h.Run(ipl, 0, {pkt}, {0, 1})[1].empty()) << "a refused route is not installed";
-  h.MustCommand(ipl, "add", Route("10.0.0.0", 8, 1));
-  EXPECT_EQ((std::vector<Bytes>{pkt}), h.Run(ipl, 0, {pkt}, {0, 1})[1]);
-}
-
 bess::pb::IPLookupRouteKey RouteKey(const std::string &prefix, uint64_t len) {
   bess::pb::IPLookupRouteKey key;
   key.set_prefix(prefix);
@@ -103,6 +47,43 @@ bess::pb::IPLookupRouteValue RouteValue(uint64_t gate) {
   bess::pb::IPLookupRouteValue value;
   value.set_gate(gate);
   return value;
+}
+
+TEST_P(IpLookupTest, RoutesToTheGateOfTheMatchingPrefix) {
+  std::mt19937 rng(1);
+  const Bytes to22 = TcpPacket({.sip = "12.22.22.22", .dip = "22.22.22.22"}, rng);
+  const Bytes to32 = TcpPacket({.sip = "12.22.22.22", .dip = "32.22.22.22"}, rng);
+  const Bytes to42 = TcpPacket({.sip = "12.22.22.22", .dip = "42.22.22.22"}, rng);
+
+  ModuleHarness h;
+  Module *ipl = h.Create("IPLookup", Arg(), "ipl");
+  ASSERT_NE(nullptr, ipl);
+  EXPECT_EQ("", h.UpsertResource("ipl/routes", RouteKey("22.22.22.0", 24), RouteValue(0)));
+  EXPECT_EQ("", h.UpsertResource("ipl/routes", RouteKey("32.22.22.0", 24), RouteValue(1)));
+  EXPECT_EQ("", h.UpsertResource("ipl/routes", RouteKey("42.22.22.0", 24), RouteValue(1)));
+  EXPECT_EQ("", h.EraseResource("ipl/routes", RouteKey("42.22.22.0", 24)));
+  EXPECT_NE("", h.EraseResource("ipl/routes", RouteKey("52.22.22.0", 24)))
+      << "deleting a route that is not there";
+
+  auto out = h.Run(ipl, 0, {to22, to32, to42}, {0, 1});
+  EXPECT_EQ((std::vector<Bytes>{to22}), out[0]);
+  EXPECT_EQ((std::vector<Bytes>{to32}), out[1]) << "the deleted route forwards nothing";
+}
+
+// The gate is uint64 on the wire; 65536 + g used to route to gate g.
+TEST_P(IpLookupTest, GateDoesNotWrap) {
+  std::mt19937 rng(2);
+  const Bytes pkt = TcpPacket({.sip = "12.0.0.1", .dip = "10.1.2.3"}, rng);
+  ModuleHarness h;
+  Module *ipl = h.Create("IPLookup", Arg(), "ipl");
+  ASSERT_NE(nullptr, ipl);
+  EXPECT_NE("", h.UpsertResource("ipl/routes", RouteKey("10.0.0.0", 8),
+                                 RouteValue(65536 + 1)));
+  EXPECT_NE("", h.UpsertResource("ipl/routes", RouteKey("10.0.0.0", 8),
+                                 RouteValue(uint64_t{1} << 32)));
+  EXPECT_TRUE(h.Run(ipl, 0, {pkt}, {0, 1})[1].empty()) << "a refused route is not installed";
+  EXPECT_EQ("", h.UpsertResource("ipl/routes", RouteKey("10.0.0.0", 8), RouteValue(1)));
+  EXPECT_EQ((std::vector<Bytes>{pkt}), h.Run(ipl, 0, {pkt}, {0, 1})[1]);
 }
 
 // Routes upserted through "<name>/routes" decide the gates (longest prefix
@@ -151,12 +132,6 @@ TEST_P(IpLookupTest, RoutesResourceRoundTrip) {
   EXPECT_EQ("", h.EraseResource("ipl/routes", k0));
   EXPECT_TRUE(h.Run(ipl, 0, {elsewhere}, {3})[3].empty());
   EXPECT_EQ("", h.ReadBackDiffers("ipl/routes", {{&k8, &g1}, {&k16, &g2}, {&k24, &g0}}));
-
-  h.MustCommand(ipl, "add", Route("172.16.0.0", 12, 5));
-  const auto k12 = RouteKey("172.16.0.0", 12);
-  const auto g5 = RouteValue(5);
-  EXPECT_EQ("", h.ReadBackDiffers("ipl/routes",
-                                  {{&k8, &g1}, {&k16, &g2}, {&k24, &g0}, {&k12, &g5}}));
 }
 
 // The resource refuses what add refuses: host bits, a prefix length past 32,
@@ -176,21 +151,6 @@ TEST_P(IpLookupTest, RoutesResourceRefusesBadRoutes) {
   EXPECT_NE("", h.EraseResource("ipl/routes", RouteKey("10.0.0.0", 8))) << "not there";
   EXPECT_TRUE(h.ReadResource("ipl/routes").empty());
   EXPECT_TRUE(h.Run(ipl, 0, {pkt}, {1})[1].empty());
-}
-
-// D-129: add, delete and clear edit the routes, which are the resource now:
-// InvokeAction refuses them (ENOTSUP); the legacy command still runs them.
-TEST_P(IpLookupTest, RouteCommandsAreLegacyOnly) {
-  ModuleHarness h;
-  Module *ipl = h.Create("IPLookup", Arg(), "ipl");
-  ASSERT_NE(nullptr, ipl);
-  EXPECT_EQ(ENOTSUP, h.Action(ipl, "add", Route("10.0.0.0", 8, 1)).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(ipl, "delete", Prefix("10.0.0.0", 8)).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(ipl, "clear", bess::pb::EmptyArg()).error().code());
-  EXPECT_TRUE(h.ReadResource("ipl/routes").empty());
-  h.MustCommand(ipl, "add", Route("10.0.0.0", 8, 1));
-  h.MustCommand(ipl, "clear", bess::pb::EmptyArg());
-  EXPECT_TRUE(h.ReadResource("ipl/routes").empty());
 }
 
 BESS_INSTANTIATE_ROUTE_BACKENDS(IpLookupTest);

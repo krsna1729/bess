@@ -82,6 +82,16 @@ if get_option('build_tests')
     dependencies: [bess_sdk_dep, gtest_dep, dependency('gtest_main', method: 'pkg-config')],
   )
   test('sdk_cpp_client_test', sdk_cpp_test, suite: 'sdk')
+  # M27's small-scope protocol model (Appendix L.1.2): the commit protocol
+  # against every sequence of lost requests, lost replies, busy answers and
+  # one restart, within the attempt budget.
+  sdk_cpp_model_test = executable(
+    'sdk_cpp_commit_model_test',
+    'client_model_test.cc',
+    implicit_include_directories: false,
+    dependencies: [bess_sdk_dep, gtest_dep, dependency('gtest_main', method: 'pkg-config')],
+  )
+  test('sdk_cpp_commit_model_test', sdk_cpp_model_test, suite: 'sdk')
   sdk_cpp_conformance = executable(
     'sdk_cpp_conformance',
     'conformance.cc',

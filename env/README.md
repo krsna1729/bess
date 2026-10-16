@@ -7,17 +7,13 @@ Run from the repository root:
 
 ```sh
 sudo bash env/install-deps.sh runtime
-sudo bash env/install-deps.sh python
 sudo bash env/install-deps.sh build
 ```
 
 The `runtime` mode installs the libraries bessd (and bessctl, which is bessd)
-loads, and tcpdump; no Python (D-135). The `python` mode installs Python 3 and
-the packages from `requirements.txt` (or the file given after it): the build
-runs Python (Meson, `tools/`, protobuf generation), and the legacy Python
-client, the Python tests and the `tools/` scripts that drive bessd need the
-client's packages. The `build` mode adds the compiler, Meson/Ninja, and native
-development dependencies. The `vm` mode installs QEMU/KVM, NUMA, and
+loads, and tcpdump; no Python (D-135). The `build` mode adds the compiler,
+Meson/Ninja, and native development dependencies (the build itself runs
+Python: Meson, `tools/`). The `vm` mode installs QEMU/KVM, NUMA, and
 cloud-image tools for the vhost VM helper:
 
 ```sh

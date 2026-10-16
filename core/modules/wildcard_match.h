@@ -82,15 +82,6 @@ class WildcardMatch final : public Module {
   int OnEvent(bess::Event event) override;
 
   CommandResponse Init(const bess::pb::WildcardMatchArg &arg);
-  CommandResponse GetInitialArg(const bess::pb::EmptyArg &arg);
-  CommandResponse GetRuntimeConfig(const bess::pb::EmptyArg &arg);
-  CommandResponse SetRuntimeConfig(const bess::pb::WildcardMatchConfig &arg);
-  CommandResponse CommandAdd(const bess::pb::WildcardMatchCommandAddArg &arg);
-  CommandResponse CommandDelete(
-      const bess::pb::WildcardMatchCommandDeleteArg &arg);
-  CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
-  CommandResponse CommandSetDefaultGate(
-      const bess::pb::WildcardMatchCommandSetDefaultGateArg &arg);
 
  private:
   // One configured rule: per-field value and mask bytes (exactly as decoded
@@ -143,7 +134,7 @@ class WildcardMatch final : public Module {
   struct FieldSpec {
     bool by_offset = true;
     int offset = 0;         // valid when by_offset
-    std::string attr_name;  // otherwise (for GetInitialArg)
+    std::string attr_name;  // otherwise
     int attr_id = -1;       // resolved once at Init() when !by_offset
     int size = 0;
   };
@@ -183,9 +174,6 @@ class WildcardMatch final : public Module {
   std::expected<std::shared_ptr<bess::classifier::ConcurrentMaskedTable>,
                 Error>
   NewTable() const;
-  // Inserts or replaces `rule` in `table`; the error on failure.
-  Error InsertRule(bess::classifier::ConcurrentMaskedTable &table,
-                   const Rule &rule) const;
   // Builds a generation around `table`; nullptr with *err set on failure.
   // Runs on the control plane, off the data path.
   GenerationPtr Build(
@@ -230,11 +218,11 @@ class WildcardMatch final : public Module {
   // a packet worker.
   // Never null between Init() and module destruction: there is no DeInit()
   // (the generation is released with the module, workers already paused), and
-  // every command publishes a replacement rather than clearing it.
+  // every writer publishes a replacement rather than clearing it.
   bess::rcu::RcuPtr<Generation> published_;
 
-  // "<module>/settings" (D-129): the default gate, as set_default_gate sets
-  // it. Stage builds the replacement generation; apply publishes it. After
+  // "<module>/settings" (D-129): the default gate. Stage builds the
+  // replacement generation; apply publishes it. After
   // published_, which it touches.
   bess::framework::Singleton<bess::pb::WildcardMatchSettings, GenerationPtr>
       settings_;

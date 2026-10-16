@@ -25,9 +25,10 @@ public:
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  CommandResponse
-  CommandAdd(const sample::supdate::pb::SequentialUpdateArg &arg);
-  CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
+  // Appends the fields of `arg` to the list (Init's use: the creation
+  // argument). The resource sets the whole list.
+  CommandResponse AddFields(
+      const sample::supdate::pb::SequentialUpdateArg &arg);
 
 private:
   struct Var {

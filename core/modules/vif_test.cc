@@ -62,55 +62,6 @@ class VifTest : public ::testing::Test {
   }
 };
 
-TEST_F(VifTest, VifInitAndCommands) {
-  VifArg arg;
-  arg.set_default_gate(5);
-
-  auto *iface = arg.add_interfaces();
-  iface->set_id(1);
-  iface->set_vlan(100);
-  iface->set_mac_addr("02:00:00:00:01:01");
-  iface->set_ip_addr("192.168.1.1");
-  iface->set_route_domain(10);
-  iface->set_gate(1);
-
-  Vif *vif = CreateVif(arg);
-  ASSERT_NE(nullptr, vif);
-
-  // Add a second interface dynamically
-  VifCommandAddArg add2;
-  add2.set_id(2);
-  add2.set_vlan(200);
-  add2.set_mac_addr("02:00:00:00:02:02");
-  add2.set_ip_addr("192.168.2.1");
-  add2.set_route_domain(20);
-  add2.set_gate(2);
-  CommandResponse res = vif->CommandAdd(add2);
-  EXPECT_EQ(0, res.error().code());
-
-  // Adding with ID 0 must fail
-  VifCommandAddArg add_bad;
-  add_bad.set_id(0);
-  add_bad.set_gate(1);
-  res = vif->CommandAdd(add_bad);
-  EXPECT_NE(0, res.error().code());
-
-  // Delete interface 1
-  VifCommandDeleteArg del1;
-  del1.set_id(1);
-  res = vif->CommandDelete(del1);
-  EXPECT_EQ(0, res.error().code());
-
-  // Deleting again must fail (ENOENT)
-  res = vif->CommandDelete(del1);
-  EXPECT_NE(0, res.error().code());
-
-  // Clear all
-  VifCommandClearArg clr;
-  res = vif->CommandClear(clr);
-  EXPECT_EQ(0, res.error().code());
-}
-
 TEST_F(VifTest, VlanDemuxAndTagStripping) {
   VifArg arg;
   arg.set_default_gate(5);
@@ -377,9 +328,8 @@ TEST(VifResourceTest, InterfacesRefuseBadKeysAndValues) {
   EXPECT_EQ("", h.ReadBackDiffers(interfaces, {}));
 }
 
-// The legacy commands stay (legacy surface only) and are what the resource
-// reads back, as are the interfaces of the init argument.
-TEST(VifResourceTest, LegacyCommandsAreLegacyOnly) {
+// The init argument's interfaces are what the resource reads back.
+TEST(VifResourceTest, InitInterfacesAreTheResource) {
   ModuleHarness h;
   VifArg arg;
   VifArg::Interface *init = arg.add_interfaces();
@@ -390,28 +340,11 @@ TEST(VifResourceTest, LegacyCommandsAreLegacyOnly) {
   ASSERT_NE(nullptr, vif);
   const std::string interfaces = vif->name() + "/interfaces";
 
-  VifCommandAddArg add;
-  add.set_id(2);
-  add.set_vlan(5);
-  add.set_mac_addr("02:00:00:00:00:10");
-  add.set_ip_addr("10.0.0.10");
-  add.set_route_domain(7);
-  add.set_gate(1);
-  EXPECT_EQ(ENOTSUP, h.Action(vif, "add", add).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(vif, "delete", VifCommandDeleteArg()).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(vif, "clear", VifCommandClearArg()).error().code());
-  h.MustCommand(vif, "add", add);
-
   const VifInterfaceKey init_key = IfaceKey(1);
   VifInterfaceValue init_value;
   init_value.set_mac_addr("02:00:00:00:00:01");
   init_value.set_gate(1);
-  const VifInterfaceKey added_key = IfaceKey(2);
-  const VifInterfaceValue added_value = IfaceValue();
-  EXPECT_EQ("", h.ReadBackDiffers(interfaces, {{&init_key, &init_value},
-                                               {&added_key, &added_value}}));
-  h.MustCommand(vif, "clear", VifCommandClearArg());
-  EXPECT_EQ("", h.ReadBackDiffers(interfaces, {}));
+  EXPECT_EQ("", h.ReadBackDiffers(interfaces, {{&init_key, &init_value}}));
 }
 
 }  // namespace

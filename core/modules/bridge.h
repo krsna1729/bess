@@ -26,8 +26,7 @@
 // Control path (D-129): the static MACs are the "<module>/statics" resource
 // (key BridgeStaticKey, value BridgeStaticValue); learned entries are runtime
 // state, emptied by the `flush` action. The FDB is worker-owned, so the
-// resource requires paused workers. add/delete/clear stay for the legacy
-// ModuleCommand only.
+// resource requires paused workers.
 class Bridge final : public Module {
  public:
   static const gate_idx_t kNumIGates = MAX_GATES;
@@ -47,9 +46,6 @@ class Bridge final : public Module {
 
   CommandResponse Init(const bess::pb::BridgeArg &arg);
   void DeInit() override;
-  CommandResponse CommandAdd(const bess::pb::BridgeCommandAddArg &arg);
-  CommandResponse CommandDelete(const bess::pb::BridgeCommandDeleteArg &arg);
-  CommandResponse CommandClear(const bess::pb::BridgeCommandClearArg &arg);
   // Removes every learned entry; static entries stay.
   CommandResponse CommandFlush(const bess::pb::EmptyArg &arg);
 

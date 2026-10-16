@@ -32,8 +32,7 @@ struct arp_entry {
 //
 // Control path (D-129): the cache is the "<module>/entries" resource (key
 // ArpResponderEntryKey, value ArpResponderEntryValue). Workers read it without
-// synchronization, so the resource requires paused workers. `add` stays for
-// the legacy ModuleCommand only.
+// synchronization, so the resource requires paused workers.
 class ArpResponder final : public Module {
  public:
   static const gate_idx_t kNumIGates = 1;
@@ -47,13 +46,14 @@ class ArpResponder final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  CommandResponse CommandAdd(const bess::pb::ArpResponderArg &arg);
-
   // The module's `entries` resource.
   class EntriesResource;
 
  private:
   friend class EntriesResource;
+
+  // The init argument's entry, validated before anything is installed.
+  CommandResponse Add(const bess::pb::ArpResponderArg &arg);
 
   // Mapping between IP (key) and its ARP entry (MAC Address)
   std::map<be32_t, struct arp_entry> entries_;

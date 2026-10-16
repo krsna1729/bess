@@ -159,6 +159,7 @@ file is the reasoning.
 | D-137 | The plugin checks are C++ live tests on the SDK: `sample_plugin_load` (`tests/live/sample_plugin_test.cc`: --modules load, the incompatible probe refused, the shipped `sequential_update.yaml` run, unload refused while a module lives) and verify-install's installed-tree plugins (`live_standalone_plugins`: conformance plugins and appliances, R4's resources over transactions); `check_sample_plugin.py` and `check_standalone_plugins.py` are gone | accepted |
 | D-138 | `live_perf` is C++ (`tests/perf/live_perf`, a client of the C++ SDK over control_v2): pipelines and table entries go in as one transaction, ns per packet from the measured modules' Track gate counters over a client-timed window; master is no longer a build it drives; `F.hook` dropped (no v2 `track_gate`); `tools/live_perf.py` is gone. It found two control_v2 defects, both fixed: transactional WildcardMatch rules never reordered the tuple list (D-098 amendment), and `ApplyPipeline` ignored `skip_default_hooks` | accepted |
 | D-139 | `live_transaction_bench` is C++ on the SDK (`tests/perf/live_transaction_bench`): the same pipeline, rates and report against a running bessd, the default gate as `em/settings`, gate counters and busy answers from metrics; `tools/live_transaction_bench.py` is gone; the perf clients share `tests/perf/schema_types.h` | accepted |
+| D-140 | The legacy service is gone: no `BESSControl` RPC, `service.proto`, pybess, Python bessctl, `bess-python` package, legacy-only module commands, `LEGACY_ONLY`/`Exposure` or gate-hook command table (plugin API 4); each module's `cmds` entries are its actions, `get_initial_arg` is `GetPipeline`'s `Module.arg`, and state is changed through resources (`edits_resources` marks an action that edits one) | accepted |
 
 
 ---
@@ -10089,3 +10090,87 @@ tools in turn: rate 0: 26.77 vs 26.80 Mpps (C++ vs Python); 1000 tx/s: 26.69 vs 
 
 **Code.** `tests/perf/{live_transaction_bench.cc,schema_types.h,live_perf.cc,meson.build}`, `docs/benchmarking.md`,
 `docs/control-sdk.md`, `docs/performance-contract.md`; deleted `tools/live_transaction_bench.py`.
+
+## D-140 The legacy service is gone
+
+**Status:** accepted (2026-10-16; D-104's product boundary, completed).
+
+**Problem.** `BESSControl` (`protobuf/service.proto`, `core/bessctl.cc`) was still served beside control_v2, with
+pybess and the Python bessctl as its clients (D-135 shipped them as an optional `bess-python` package) and
+`Command::LEGACY_ONLY` marking every module command that existed only for it. Three surfaces meant three places to
+change a behaviour, and two of them had no test lane that a release ran.
+
+**Decision.**
+- The legacy RPC layer is deleted: `core/bessctl.{h,cc}`, `protobuf/service.proto`, the wire-range test, the
+  Python client (`pybess/`), the Python bessctl (`bessctl/*.py` and its generated protobuf packages), the
+  `bess-python` package, `requirements.txt` and the installer's `python` mode. `core/api_server.{h,cc}` serves
+  control_v2's `ControlV2Service` and `AdminV2Service` only; the daemon's shutdown still comes from
+  `AdminV2.Shutdown` through `TerminationWatcher`.
+- Every module command is an action (D-129): `Command::Exposure`, `Command::Effect` and every `LEGACY_ONLY` entry
+  are gone, `ModuleBuilder::RunCommand` has one surface (and no `get_initial_arg`), and `ControlPlane::
+  RunModuleCommand` takes no surface. State a command used to edit is changed through the resource that holds it;
+  the creation argument is `GetPipeline`'s `Module.arg` (`Module::initial_arg`).
+- One flag replaces the exposure/effect pair: `Command::edits_resources` (false by default, true for L2Forward's
+  `populate`), which still advances the resource generation so a concurrent apply conflicts instead of undoing the
+  edit.
+- The gate-hook command surface is deleted with it (`GateHookCommand`/`GateHookCommands`,
+  `GateHookBuilder::RegisterGateHook`'s `cmds` argument, `GateHookBuilder::RunCommand`, `Track`'s `reset`): the
+  legacy service was its only caller. `ControlPlane::ConfigureGateHook` stays for `Admin.SetCapture`.
+- Resume hooks lose their RPC as well: `ControlPlane::ConfigureResumeHook` is gone, so the daemon runs the global
+  hooks the build installs (SetupMetadata and SetupTaskGraph self-install) and nothing can add or remove one at run
+  time. `ConfigureResumeHookRequest`, `ConfigureGateHookRequest` and `GateHookCommandRequest` stay in
+  `protobuf/bess_msg.proto` as unused wire types. Gate hooks: `Track` is installed per connection by desired state
+  (`Connection.skip_default_hooks` omits it) and capture by `Admin.SetCapture`, so what has no route is a
+  third-party hook class, `Track`'s own `reset`, and the byte counting `TrackArg.bits` used to set
+  (`bess_gate_bytes_total` can no longer appear).
+- `BESS_PLUGIN_API_VERSION` is 4: a `cmds` entry is a name, an argument type, a handler, its thread safety, the
+  answer's type and `edits_resources`, and the gate-hook command surface (`GateHookCommand(s)`,
+  `GATE_HOOK_CMD_FUNC`, the static `cmds` member, `GateHook::RunCommand`) is gone with it, so `ADD_GATE_HOOK` takes
+  no command table and a plugin written against 3 does not compile (docs/plugin-api.md).
+- Tests drive the production path: `ModuleHarness` has no `Command`/`MustCommand`, and a command a class no longer
+  declares answers `ENOTSUP` from `InvokeAction`.
+
+**Consequence.** A controller built against `BESSControl` stops working at the wire; the Go and C++ SDKs over
+control_v2 are the supported clients (docs/control-sdk.md). The exhaustive Python model check of the commit
+protocol (`pybess/test_sdk_model.py`, a depth-first search over lost requests, lost replies, busy answers and
+restarts) left with pybess, so the search was ported to the C++ SDK in the same change, where the roadmap's
+Appendix L.1.2 asks for each model: `sdk/cpp/client_model_test.cc` replays the production client against every
+sequence of those behaviours within the attempt budget and checks the same invariants (at most one application
+over all epochs, `Applied` only where the daemon applied it, `Busy` only when nothing applied, `TransportError`
+only after an unanswered RPC, `DaemonRestarted` only after a restart). It is mutation-checked: dropping the
+client's "never report an unknown outcome as a failure" guard makes it fail.
+
+docs/compatibility.md asks a deprecated API to keep working for a release after the release that announces its
+replacement. No release has shipped (no tag, no published artifact), so the window has not opened for
+`BESSControl`, `Command::Exposure`/`LEGACY_ONLY` or the gate-hook command table: this is the removal recorded, not
+one taken early. What a release does ship is the plugin API version that names the source break -- 4 -- and the
+history in `docs/plugin-api.md`.
+
+What else the legacy service was the only route to, and now has none (D-107 had deferred these "until a client
+needs them"; a client without a route is not deferred, it is gone): a gate-hook class other than the pcap/pcapng
+capture or the default `Track` -- `Track` itself is desired state's own (installed per connection, omitted by
+`Connection.skip_default_hooks`), and what it loses is its `reset` and its byte counting (`TrackArg.bits`;
+`bess_gate_bytes_total` can no longer appear), so the packet path counts only through the metrics those hooks
+publish -- resume hooks, both installing one (`ConfigureResumeHook`) and removing one; the in-tree
+resume hooks still run on resume; and an in-place port reconfiguration (`SetPortConf`, MTU/admin-up/MAC): desired
+state refuses a port's `kUpdate` ("remove and recreate it"), so that is the route. Desired state covers `Track`'s
+presence and `Admin.SetCapture` covers capture, so a client that needs a third-party hook class, `Track`'s `reset`
+or byte counting, or a non-default resume hook needs a new RPC.
+
+Two answer shapes changed with the surface. A refused resource write is a `TransactionOpResult` -- a status and a
+message, no errno -- so a mask table that is full reads "too many distinct masks" rather than `ENOSPC` (errno 28),
+which is what UPF's pfcpiface checked; and an action's failure carries its errno in `ErrorDetail.errno_value` as
+before. Both belong with the classifier result-model work (the `{gate, ActionId}` item), not here.
+
+**Code.** `core/api_server.{h,cc}`, `core/{main.cc,commands.h,module.cc,module.h,gate.{h,cc},worker.h}`,
+`core/gate_hooks/track.{h,cc}`, `core/dataplane/{transaction_engine.h,resource_registry.h}`,
+`core/control/{api_v2.cc,admin_v2.cc,control_plane.{h,cc}}`, `core/testing/module_harness.{h,cc}`, every module's
+`cmds` table and its tests, `sample_plugin/`, `protobuf/{meson.build,control_v2.proto}`, `meson.build`,
+`tools/{ci_profile.py,check_installed_headers.py,package_release.py,generate_protobuf.py}`,
+`.github/workflows/ci.yml`, `env/`, `README.md`, `MODERNIZATION.md`,
+`BESS_Modernization_End_State_Roadmap.md`, `sdk/cpp/{client_model_test.cc,meson.build}`,
+`sdk/cpp/client_test.cc`, `sdk/go/bess/client_test.go`,
+`docs/{plugin-api.md,control-sdk.md,compatibility.md,dataplane-tables.md}`,
+`DEPENDENCY_INVENTORY.md`; deleted `core/bessctl.{h,cc}`,
+`core/bessctl_wire_ranges_test.cc`, `protobuf/service.proto`, `pybess/`, `bessctl/*.py`,
+`tools/{check_installed_pybess.py,copy_init.py}`, `requirements.txt`.

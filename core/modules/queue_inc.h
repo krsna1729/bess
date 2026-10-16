@@ -33,15 +33,11 @@ class QueueInc final : public Module {
 
   std::string GetDesc() const override;
 
-  CommandResponse CommandSetBurst(
-      const bess::pb::QueueIncCommandSetBurstArg &arg);
-
  private:
   Port *port_;
   queue_t qid_;
   int prefetch_;
-  // Set by THREAD_SAFE commands and the settings resource while workers
-  // read it.
+  // Set by the settings resource while workers read it.
   std::atomic<int> burst_;
 
   // "<name>/settings" (the burst); after the state it sets.

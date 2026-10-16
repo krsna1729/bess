@@ -114,21 +114,4 @@ TEST(QueueSettingsTest, RequiresPausedWorkers) {
   EXPECT_TRUE(RequiresPausedWorkers("q/settings"));
 }
 
-TEST(QueueSettingsTest, SettersAreLegacyOnly) {
-  ModuleHarness h;
-  Module *q = h.Create("Queue", bess::pb::QueueArg(), "q");
-  ASSERT_NE(nullptr, q);
-  bess::pb::QueueCommandSetSizeArg size;
-  size.set_size(64);
-  EXPECT_EQ(ENOTSUP, h.Action(q, "set_size", size).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(q, "set_burst", bess::pb::QueueCommandSetBurstArg()).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(q, "set_runtime_config", bess::pb::QueueArg()).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(q, "get_runtime_config", bess::pb::EmptyArg()).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(q, "get_initial_arg", bess::pb::EmptyArg()).error().code());
-  // The legacy command still runs, and the resource reads what it set.
-  h.MustCommand(q, "set_size", size);
-  const bess::pb::QueueSettings s = Settings(64, bess::PacketBatch::kMaxBurst);
-  EXPECT_EQ("", h.ReadBackDiffers("q/settings", {{nullptr, &s}}));
-}
-
 }  // namespace

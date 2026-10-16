@@ -320,7 +320,6 @@ endif
 
 protoc = find_program('protoc', required: true)
 grpc_cpp_plugin = find_program('grpc_cpp_plugin', required: true)
-grpc_python_plugin = find_program('grpc_python_plugin', required: true)
 
 version_h = custom_target(
   'version.h',
@@ -357,7 +356,6 @@ pkg.generate(
 subdir('protobuf')
 subdir('sdk/cpp')
 subdir('bessctl')
-subdir('pybess')
 subdir('core')
 # bessctl is bessd (D-120): the binary runs the client under this name.
 install_symlink('bessctl', pointing_to: 'bessd', install_dir: get_option('bindir'))
@@ -389,18 +387,9 @@ endif
 # vhost VM/container harness runs from a source checkout (it copies the
 # bootstrap's dpdk-testpmd), so it is not installed. dpdk-devbind.py is an ops
 # tool (Python: the bess-tools package).
+bess_data_dir = join_paths(get_option('datadir'), 'bess')
 install_subdir('bessctl/conf', install_dir: bess_data_dir,
                exclude_directories: ['port/vhost'])
 install_data('bin/dpdk-devbind.py', install_dir: get_option('bindir'),
              install_mode: 'rwxr-xr-x')
-# The Python bessctl (legacy client; with pybess, the bess-python package).
-install_subdir(
-  'bessctl',
-  install_dir: bess_data_dir,
-  exclude_directories: ['__pycache__', 'conf'],
-  # The C++ bessctl's sources: it installs as bindir/bessctl, a link to bessd.
-  exclude_files: ['meson.build', 'cli.h', 'json.h', 'json.cc', 'manifest.h', 'manifest.cc',
-                  'main.cc', 'standalone_main.cc', 'manifest_test.cc', 'yaml_io.h',
-                  'yaml_io.cc'],
-)
 install_subdir('protobuf', install_dir: bess_data_dir)

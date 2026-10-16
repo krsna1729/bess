@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-// G1.2a mode C for ExactMatch, measured through the module and the tables it
-// uses.
+// G1.2a mode C for ExactMatch: the per-batch lookup the packet path makes,
+// measured against the tables it uses. (The module's add/delete commands were
+// measured here too; they are gone with the legacy service -- D-140. A rule
+// change now goes through the transaction engine:
+// exact_match_transaction_bench.cc.)
 //
-//   BM_ModuleAddDelete/N  a module holding N rules (2 fields, 4+2 bytes):
-//                         one `add` of a new rule and one `delete` of it per
-//                         iteration, through the command API. Items = ops.
-//                         This file builds against the pre-G1.2 module as
-//                         well (public commands only), for the before/after.
 //   BM_Lookup/impl/N      the per-batch lookup the packet path makes: 32
 //                         random 8-byte keys against N rules. impl 0 = the
 //                         K3 cuckoo generation backend ExactMatch used, 1 =
@@ -36,71 +34,6 @@
 #endif
 
 namespace {
-
-bess::pb::ExactMatchCommandAddArg Rule(uint32_t a, uint16_t b, uint64_t gate) {
-  bess::pb::ExactMatchCommandAddArg arg;
-  arg.set_gate(gate);
-  arg.add_fields()->set_value_int(a);
-  arg.add_fields()->set_value_int(b);
-  return arg;
-}
-
-ExactMatch *CreateModule(size_t rules) {
-  ModuleGraph::DestroyAllModules();
-  bess::pb::ExactMatchArg arg;
-  auto *f = arg.add_fields();
-  f->set_offset(26);
-  f->set_num_bytes(4);
-  f = arg.add_fields();
-  f->set_offset(34);
-  f->set_num_bytes(2);
-  google::protobuf::Any packed;
-  if (!packed.PackFrom(arg)) {
-    std::abort();
-  }
-  pb_error_t perr;
-  Module *m = ModuleGraph::CreateModule(
-      ModuleBuilder::all_module_builders().at("ExactMatch"), "em", packed,
-      &perr);
-  if (m == nullptr || perr.code() != 0) {
-    std::abort();
-  }
-  auto *em = static_cast<ExactMatch *>(m);
-  // Prefill by restore: one bulk build in either implementation.
-  bess::pb::ExactMatchConfig config;
-  for (size_t r = 0; r < rules; r++) {
-    *config.add_rules() =
-        Rule(static_cast<uint32_t>(r), static_cast<uint16_t>(r), r % 64);
-  }
-  if (em->SetRuntimeConfig(config).has_error()) {
-    std::abort();
-  }
-  return em;
-}
-
-void BM_ModuleAddDelete(benchmark::State &st) {
-  const size_t rules = static_cast<size_t>(st.range(0));
-  ExactMatch *m = CreateModule(rules);
-  uint32_t next = 0x80000000u;
-  for (auto _ : st) {
-    const auto add = Rule(next, 7, 3);
-    bess::pb::ExactMatchCommandDeleteArg del;
-    *del.mutable_fields() = add.fields();
-    if (m->CommandAdd(add).has_error() || m->CommandDelete(del).has_error()) {
-      st.SkipWithError("command failed");
-      break;
-    }
-    next++;
-  }
-  st.SetItemsProcessed(st.iterations() * 2);
-  ModuleGraph::DestroyAllModules();
-}
-BENCHMARK(BM_ModuleAddDelete)
-    ->Arg(1000)
-    ->Arg(10000)
-    ->Arg(100000)
-    ->Arg(1000000)
-    ->Unit(benchmark::kMicrosecond);
 
 #ifdef HAVE_CONCURRENT_EXACT
 

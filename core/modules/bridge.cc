@@ -53,16 +53,9 @@ gate_idx_t GateOfInterface(dataplane::InterfaceId i) {
 
 }  // namespace
 
-// LEGACY_ONLY (D-129): the static entries are the "<module>/statics"
-// resource. THREAD_UNSAFE: the FDB is worker-owned.
+// The statics are the "<module>/statics" resource (D-129); `flush` is the
+// class's one action. THREAD_UNSAFE: the FDB is worker-owned.
 const Commands Bridge::cmds = {
-    {"add", "BridgeCommandAddArg", MODULE_CMD_FUNC(&Bridge::CommandAdd),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-    {"delete", "BridgeCommandDeleteArg", MODULE_CMD_FUNC(&Bridge::CommandDelete),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-    // Flushes the statics too, which are desired state: legacy only.
-    {"clear", "BridgeCommandClearArg", MODULE_CMD_FUNC(&Bridge::CommandClear),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
     {"flush", "EmptyArg", MODULE_CMD_FUNC(&Bridge::CommandFlush),
      Command::THREAD_UNSAFE},
 };
@@ -261,49 +254,6 @@ void Bridge::DeInit() {
   CHECK(released) << released.error();
   binding_.Reset();
   resource_.reset();
-}
-
-CommandResponse Bridge::CommandAdd(const bess::pb::BridgeCommandAddArg &arg) {
-  Ethernet::Address mac;
-  if (!mac.FromString(arg.mac_addr())) {
-    return CommandFailure(EINVAL, "invalid MAC address: '%s'",
-                          arg.mac_addr().c_str());
-  }
-  if (!bess::IsValidGateValue(arg.gate())) {
-    return CommandFailure(EINVAL, "invalid output gate: %u", arg.gate());
-  }
-  switch (fdb_->AddStatic(kDomain, ToL2(ToKey(mac)),
-                          InterfaceOfGate(static_cast<gate_idx_t>(arg.gate())))) {
-    case l2::ProgramResult::kAdded:
-    case l2::ProgramResult::kReplaced:
-      statics_[ToKey(mac)] = static_cast<gate_idx_t>(arg.gate());
-      return CommandSuccess();
-    case l2::ProgramResult::kInvalid:
-      return CommandFailure(EINVAL, "a multicast MAC cannot be a static entry");
-    case l2::ProgramResult::kFull:
-      break;
-  }
-  return CommandFailure(ENOSPC, "FDB full (%zu entries)", fdb_->capacity());
-}
-
-CommandResponse Bridge::CommandDelete(
-    const bess::pb::BridgeCommandDeleteArg &arg) {
-  Ethernet::Address mac;
-  if (!mac.FromString(arg.mac_addr())) {
-    return CommandFailure(EINVAL, "invalid MAC address: '%s'",
-                          arg.mac_addr().c_str());
-  }
-  if (!fdb_->Remove(kDomain, ToMac(mac))) {
-    return CommandFailure(ENOENT, "MAC address not found in FDB");
-  }
-  statics_.erase(ToKey(mac));
-  return CommandSuccess();
-}
-
-CommandResponse Bridge::CommandClear(const bess::pb::BridgeCommandClearArg &) {
-  fdb_->Flush(/*static_too=*/true);
-  statics_.clear();
-  return CommandSuccess();
 }
 
 CommandResponse Bridge::CommandFlush(const bess::pb::EmptyArg &) {

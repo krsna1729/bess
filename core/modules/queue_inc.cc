@@ -23,11 +23,8 @@ std::string BurstError(uint64_t burst) {
 
 }  // namespace
 
-// set_burst edits what "settings" holds: legacy only (D-129).
-const Commands QueueInc::cmds = {{"set_burst", "QueueIncCommandSetBurstArg",
-                                  MODULE_CMD_FUNC(&QueueInc::CommandSetBurst),
-                                  Command::THREAD_SAFE, "",
-                                  Command::LEGACY_ONLY}};
+// "settings" (QueueIncSettings) holds burst; the class has no actions.
+const Commands QueueInc::cmds = {};
 
 const ResourceTables QueueInc::resource_tables = {
     ResourceTable::Singleton<bess::pb::QueueIncSettings>("settings")};
@@ -145,16 +142,6 @@ struct task_result QueueInc::RunTask(Context *ctx, bess::PacketBatch *batch,
   return {.block = false,
           .packets = cnt,
           .bits = (received_bytes + cnt * pkt_overhead) * 8};
-}
-
-CommandResponse QueueInc::CommandSetBurst(
-    const bess::pb::QueueIncCommandSetBurstArg &arg) {
-  if (std::string err = BurstError(arg.burst()); !err.empty()) {
-    return CommandFailure(EINVAL, "%s", err.c_str());
-  } else {
-    burst_.store(arg.burst(), std::memory_order_relaxed);
-    return CommandSuccess();
-  }
 }
 
 ADD_MODULE(QueueInc, "queue_inc",

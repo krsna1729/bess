@@ -2,8 +2,8 @@
 
 // QueueInc's "<name>/settings" singleton (D-129) in process: the burst set
 // through the resource's codec is what each receive asks the port's queue
-// for, it reads back canonically, a burst set_burst refuses is refused, and
-// set_burst is legacy only.
+// for, it reads back canonically, and a burst set_burst refuses is refused
+// (set_burst went with the legacy service, D-140).
 
 #include <gtest/gtest.h>
 
@@ -118,22 +118,6 @@ TEST_F(QueueIncSettingsTest, AppliesLive) {
   ModuleHarness h;
   ASSERT_NE(nullptr, h.Create("QueueInc", Arg(), "qi"));
   EXPECT_FALSE(RequiresPausedWorkers("qi/settings"));
-}
-
-TEST_F(QueueIncSettingsTest, SetBurstIsLegacyOnly) {
-  ModuleHarness h;
-  Module *inc = h.Create("QueueInc", Arg(), "qi");
-  ASSERT_NE(nullptr, inc);
-  bess::pb::QueueIncCommandSetBurstArg burst;
-  burst.set_burst(5);
-  EXPECT_EQ(ENOTSUP, h.Action(inc, "set_burst", burst).error().code());
-  // The legacy command still runs, and the resource reads what it set.
-  h.MustCommand(inc, "set_burst", burst);
-  const bess::pb::QueueIncSettings s = Settings(5);
-  EXPECT_EQ("", h.ReadBackDiffers("qi/settings", {{nullptr, &s}}));
-  bess::pb::QueueIncCommandSetBurstArg too_big;
-  too_big.set_burst(bess::PacketBatch::kMaxBurst + 1);
-  EXPECT_EQ(EINVAL, h.Command(inc, "set_burst", too_big).error().code());
 }
 
 }  // namespace

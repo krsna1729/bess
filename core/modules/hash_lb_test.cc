@@ -43,20 +43,6 @@ std::vector<Bytes> Flows(int n = 64) {
   return pkts;
 }
 
-bess::pb::HashLBCommandSetGatesArg Gates(std::initializer_list<int64_t> gates) {
-  bess::pb::HashLBCommandSetGatesArg arg;
-  for (int64_t g : gates) {
-    arg.add_gates(g);
-  }
-  return arg;
-}
-
-bess::pb::HashLBCommandSetModeArg Mode(const std::string &mode) {
-  bess::pb::HashLBCommandSetModeArg arg;
-  arg.set_mode(mode);
-  return arg;
-}
-
 const std::vector<gate_idx_t> kGates = {0, 1, 2, 3, 4, 5, 6, 7};
 
 // The gates that got packets; every packet must come out unchanged on one.
@@ -77,38 +63,6 @@ std::set<gate_idx_t> GatesUsed(const std::map<gate_idx_t, std::vector<Bytes>> &o
 TEST(HashLbTest, NoGatesIsRefusedAtCreation) {
   ModuleHarness h;
   EXPECT_EQ(EINVAL, h.CreateFailure("HashLB", bess::pb::HashLBArg()).code());
-}
-
-TEST(HashLbTest, GatesAndModes) {
-  const std::vector<Bytes> pkts = Flows();
-  ModuleHarness h;
-  bess::pb::HashLBArg arg;
-  arg.add_gates(1);
-  arg.add_gates(2);
-  Module *lb = h.Create("HashLB", arg);
-  ASSERT_NE(nullptr, lb);
-  EXPECT_EQ((std::set<gate_idx_t>{1, 2}), GatesUsed(h.Run(lb, 0, pkts, kGates), pkts))
-      << "all flows on the configured gates";
-
-  h.MustCommand(lb, "set_gates", Gates({3, 4, 5}));
-  const auto spread = h.Run(lb, 0, pkts, kGates);
-  EXPECT_EQ((std::set<gate_idx_t>{3, 4, 5}), GatesUsed(spread, pkts));
-
-  // 65536 would narrow to gate 0; it must be refused, and a bad gate later
-  // in the list must not leave a half-written list behind.
-  EXPECT_EQ(EINVAL, h.Command(lb, "set_gates", Gates({65536})).error().code());
-  EXPECT_EQ(EINVAL, h.Command(lb, "set_gates", Gates({6, 7, 70000})).error().code());
-  // No destinations: every packet would index an empty gate list.
-  EXPECT_EQ(EINVAL, h.Command(lb, "set_gates", Gates({})).error().code());
-  EXPECT_EQ(spread, h.Run(lb, 0, pkts, kGates)) << "refused commands change nothing";
-
-  h.MustCommand(lb, "set_mode", Mode("l3"));
-  const auto l3 = h.Run(lb, 0, pkts, kGates);
-  const auto used = GatesUsed(l3, pkts);
-  const std::set<gate_idx_t> allowed = {3, 4, 5};
-  EXPECT_TRUE(std::includes(allowed.begin(), allowed.end(), used.begin(), used.end()));
-  EXPECT_EQ(EINVAL, h.Command(lb, "set_mode", Mode("bogus")).error().code());
-  EXPECT_EQ(l3, h.Run(lb, 0, pkts, kGates)) << "a refused mode changes nothing";
 }
 
 // -- "<name>/settings" (D-129) ---------------------------------------------------
@@ -150,6 +104,8 @@ TEST(HashLbSettingsTest, GatesAndModeDecideTheOutputGate) {
   ModuleHarness h;
   Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
   ASSERT_NE(nullptr, lb);
+  EXPECT_EQ((std::set<gate_idx_t>{1, 2}), GatesUsed(h.Run(lb, 0, pkts, kGates), pkts))
+      << "all flows on the configuration's gates";
 
   ASSERT_EQ("", h.SetResource("lb/settings", LbSettings("l4", {3, 4, 5})));
   EXPECT_EQ((std::set<gate_idx_t>{3, 4, 5}), GatesUsed(h.Run(lb, 0, pkts, kGates), pkts));
@@ -206,19 +162,6 @@ TEST(HashLbSettingsTest, AppliesLive) {
   ModuleHarness h;
   ASSERT_NE(nullptr, h.Create("HashLB", LbArg({1, 2}), "lb"));
   EXPECT_FALSE(RequiresPausedWorkers("lb/settings"));
-}
-
-TEST(HashLbSettingsTest, SettersAreLegacyOnly) {
-  ModuleHarness h;
-  Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
-  ASSERT_NE(nullptr, lb);
-  EXPECT_EQ(ENOTSUP, h.Action(lb, "set_gates", Gates({3})).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(lb, "set_mode", Mode("l2")).error().code());
-  // The legacy commands still run, and the resource reads what they set.
-  h.MustCommand(lb, "set_gates", Gates({3}));
-  h.MustCommand(lb, "set_mode", Mode("l2"));
-  const bess::pb::HashLBSettings s = LbSettings("l2", {3});
-  EXPECT_EQ("", h.ReadBackDiffers("lb/settings", {{nullptr, &s}}));
 }
 
 }  // namespace

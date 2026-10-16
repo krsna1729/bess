@@ -7,18 +7,13 @@
 #include "tx_checksum_profile.h"
 #include "utils/format.h"
 
-const Commands PortOut::cmds = {
-    {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&PortOut::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
-};
+const Commands PortOut::cmds = {};
 
 CommandResponse PortOut::Init(const bess::pb::PortOutArg &arg) {
   const char *port_name;
   int ret;
 
-  has_tx_checksum_profile_ = false;
   tx_checksum_profile_ = {};
-  tx_checksum_profile_arg_.Clear();
 
   if (!arg.port().length()) {
     return CommandFailure(EINVAL, "'port' must be given as a string");
@@ -43,8 +38,6 @@ CommandResponse PortOut::Init(const bess::pb::PortOutArg &arg) {
       return CommandFailure(EINVAL, "Invalid tx_checksum_profile");
     }
     tx_checksum_profile_ = *bound;
-    tx_checksum_profile_arg_ = arg.tx_checksum_profile();
-    has_tx_checksum_profile_ = true;
   }
 
   if (port_->num_queues[PACKET_DIR_OUT] == 0) {
@@ -65,15 +58,6 @@ CommandResponse PortOut::Init(const bess::pb::PortOutArg &arg) {
   }
 
   return CommandSuccess();
-}
-
-CommandResponse PortOut::GetInitialArg(const bess::pb::EmptyArg &) {
-  bess::pb::PortOutArg arg;
-  arg.set_port(port_->name());
-  if (has_tx_checksum_profile_) {
-    *arg.mutable_tx_checksum_profile() = tx_checksum_profile_arg_;
-  }
-  return CommandSuccess(arg);
 }
 
 void PortOut::DeInit() {

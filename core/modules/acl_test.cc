@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // ACL in process (was bessctl/module_tests/acl.py): first match wins,
-// unmatched traffic is dropped, and a refused command (a wire port that
+// unmatched traffic is dropped, and a refused set (a wire port that
 // would narrow, a malformed prefix) changes nothing, all or nothing. D-129:
-// "<name>/rules" holds the whole rule list, and add/clear are legacy-only.
+// "<name>/rules" holds the whole rule list.
 
 #include <gtest/gtest.h>
 
@@ -54,36 +54,6 @@ bool Passes(ModuleHarness &h, Module *acl, const Bytes &pkt) {
   EXPECT_EQ(1u, out[0].size());
   EXPECT_EQ(pkt, out[0][0]);
   return true;
-}
-
-TEST(AclTest, RulesAndRefusedCommands) {
-  std::mt19937 rng(1);
-  const Bytes a = TcpPacket({.sip = "10.1.2.3", .dip = "20.0.0.1", .sport = 1000, .dport = 80}, rng);
-  const Bytes b = TcpPacket({.sip = "11.1.2.3", .dip = "20.0.0.1", .sport = 1000, .dport = 80}, rng);
-
-  ModuleHarness h;
-  Module *acl = h.Create("ACL", Rules({{.src_ip = "10.0.0.0/8"}}));
-  ASSERT_NE(nullptr, acl);
-  EXPECT_TRUE(Passes(h, acl, a));
-  EXPECT_FALSE(Passes(h, acl, b)) << "unmatched traffic is dropped";
-
-  // 65616 would narrow to 80 and forward `b`; it must be refused.
-  EXPECT_EQ(EINVAL, h.Command(acl, "add", Rules({{.dst_port = 65616}})).error().code());
-  EXPECT_FALSE(Passes(h, acl, b)) << "a refused add changes nothing";
-
-  EXPECT_EQ(EINVAL,
-            h.Command(acl, "add", Rules({{.src_ip = "11.0.0.0/8"}, {.dst_ip = "bogus/8"}}))
-                .error()
-                .code());
-  EXPECT_FALSE(Passes(h, acl, b)) << "all or nothing: the good rule was not added";
-  EXPECT_TRUE(Passes(h, acl, a));
-
-  h.MustCommand(acl, "add", Rules({{.dst_port = 80}}));
-  EXPECT_TRUE(Passes(h, acl, b));
-
-  h.MustCommand(acl, "clear", bess::pb::EmptyArg());
-  EXPECT_FALSE(Passes(h, acl, a));
-  EXPECT_FALSE(Passes(h, acl, b));
 }
 
 TEST(AclTest, FirstMatchWins) {
@@ -144,32 +114,11 @@ TEST(AclTest, RulesResourceReplacesTheList) {
   EXPECT_FALSE(Passes(h, acl, a));
   EXPECT_TRUE(Passes(h, acl, b));
 
-  // The legacy add appends to the same list.
-  h.MustCommand(acl, "add", Rules({{.dst_port = 80}}));
-  const auto three = Rules(
-      {{.src_ip = "11.0.0.0/8"}, {.src_ip = "10.0.0.0/8", .drop = true}, {.dst_port = 80}});
-  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &three}}));
-
   const bess::pb::ACLArg none;
   EXPECT_EQ("", h.SetResource(rules, none));
   EXPECT_FALSE(Passes(h, acl, a));
   EXPECT_FALSE(Passes(h, acl, b));
   EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &none}}));
-}
-
-// add and clear edit "<name>/rules": control_v2's InvokeAction refuses them.
-TEST(AclTest, CommandsAreLegacyOnly) {
-  std::mt19937 rng(4);
-  const Bytes b = TcpPacket({.sip = "11.1.2.3", .dip = "20.0.0.1"}, rng);
-  ModuleHarness h;
-  Module *acl = h.Create("ACL", bess::pb::ACLArg());
-  ASSERT_NE(nullptr, acl);
-  EXPECT_EQ(ENOTSUP, h.Action(acl, "add", Rules({{.src_ip = "11.0.0.0/8"}})).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(acl, "clear", bess::pb::EmptyArg()).error().code());
-  EXPECT_FALSE(Passes(h, acl, b)) << "the refused add did nothing";
-  // The legacy ModuleCommand still runs them.
-  h.MustCommand(acl, "add", Rules({{.src_ip = "11.0.0.0/8"}}));
-  EXPECT_TRUE(Passes(h, acl, b));
 }
 
 }  // namespace

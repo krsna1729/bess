@@ -50,8 +50,7 @@ TEST(ReplicateTest, CopiesEachPacketToEveryGate) {
 }
 
 // Gates are int64 on the wire and were narrowed unchecked: each must name
-// one of the module's 32 output gates, and a refused set_gates changes
-// nothing.
+// one of the module's 32 output gates.
 TEST(ReplicateTest, GatesAreValidated) {
   ModuleHarness h;
   const std::vector<std::vector<int64_t>> bad = {
@@ -62,10 +61,6 @@ TEST(ReplicateTest, GatesAreValidated) {
 
   Module *rep = h.Create("Replicate", Gates({0, 1}));
   ASSERT_NE(nullptr, rep);
-  bess::pb::ReplicateCommandSetGatesArg set;
-  set.add_gates(2);
-  set.add_gates(40);
-  EXPECT_EQ(EINVAL, h.Command(rep, "set_gates", set).error().code());
 
   std::mt19937 rng(1);
   const Bytes pkt = bess::testing::UdpPacket(FlowSpec{}, rng);
@@ -127,19 +122,6 @@ TEST(ReplicateTest, SettingsRequirePausedWorkers) {
   ModuleHarness h;
   ASSERT_NE(nullptr, h.Create("Replicate", Gates({0}), "rp"));
   EXPECT_TRUE(RequiresPausedWorkers("rp/settings"));
-}
-
-TEST(ReplicateTest, SetGatesIsLegacyOnly) {
-  ModuleHarness h;
-  Module *rep = h.Create("Replicate", Gates({0}), "rp");
-  ASSERT_NE(nullptr, rep);
-  bess::pb::ReplicateCommandSetGatesArg set;
-  set.add_gates(0);
-  set.add_gates(3);
-  EXPECT_EQ(ENOTSUP, h.Action(rep, "set_gates", set).error().code());
-  h.MustCommand(rep, "set_gates", set);
-  const bess::pb::ReplicateArg s = Gates({0, 3});
-  EXPECT_EQ("", h.ReadBackDiffers("rp/settings", {{nullptr, &s}}));
 }
 
 }  // namespace

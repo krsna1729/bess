@@ -3,7 +3,7 @@
 // RandomUpdate in process: each field overwrites `size` bytes at `offset`
 // with a random value in [min, max] (min == max here, so the packets are
 // known). D-129: "<name>/fields" holds the whole field list (setting it
-// replaces the list), and add/clear are legacy-only.
+// replaces the list); `add` and `clear` went with the legacy service (D-140).
 
 #include <gtest/gtest.h>
 
@@ -100,32 +100,10 @@ TEST(RandomUpdateTest, FieldsResourceReplacesTheList) {
   EXPECT_EQ("", h.ReadBackDiffers(fields, {{nullptr, &two}})) << "refused sets change nothing";
   EXPECT_EQ(expected, Through(h, ru, zeros));
 
-  // The legacy add appends to the same list.
-  h.MustCommand(ru, "add", Fields({{.offset = 40, .size = 1, .min = 0x22, .max = 0x22}}));
-  const auto three = Fields({{.offset = 0, .size = 1, .min = 0x42, .max = 0x42},
-                             {.offset = 20, .size = 2, .min = 0x1234, .max = 0x1234},
-                             {.offset = 40, .size = 1, .min = 0x22, .max = 0x22}});
-  EXPECT_EQ("", h.ReadBackDiffers(fields, {{nullptr, &three}}));
-  expected[40] = 0x22;
-  EXPECT_EQ(expected, Through(h, ru, zeros));
-
   const bess::pb::RandomUpdateArg none;
   EXPECT_EQ("", h.SetResource(fields, none));
   EXPECT_EQ(zeros, Through(h, ru, zeros));
   EXPECT_EQ("", h.ReadBackDiffers(fields, {{nullptr, &none}}));
-}
-
-// add and clear edit "<name>/fields": control_v2's InvokeAction refuses them.
-TEST(RandomUpdateTest, CommandsAreLegacyOnly) {
-  ModuleHarness h;
-  Module *ru = h.Create("RandomUpdate", bess::pb::RandomUpdateArg());
-  ASSERT_NE(nullptr, ru);
-  const auto one = Fields({{.offset = 0, .size = 1, .min = 1, .max = 1}});
-  EXPECT_EQ(ENOTSUP, h.Action(ru, "add", one).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(ru, "clear", bess::pb::EmptyArg()).error().code());
-  const Bytes zeros(60, 0);
-  EXPECT_EQ(zeros, Through(h, ru, zeros)) << "the refused add did nothing";
-  EXPECT_EQ(0, h.Command(ru, "add", one).error().code());
 }
 
 }  // namespace

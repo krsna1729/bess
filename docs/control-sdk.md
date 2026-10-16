@@ -1,4 +1,4 @@
-# Control SDKs (`pybess.sdk`, Go `sdk/go`, C++ `sdk/cpp`, M27)
+# Control SDKs (Go `sdk/go`, C++ `sdk/cpp`, M27)
 
 A thin client over the generic control API (`protobuf/control_v2.proto`). It
 adds no semantics of its own: resources are whatever modules registered
@@ -6,19 +6,9 @@ adds no semantics of its own: resources are whatever modules registered
 adds is the part of the protocol that is easy to get wrong when every
 controller writes it again.
 
-```python
-from pybess import sdk
-
-client = sdk.Client('localhost:10514')
-rules = client.resource('em0/rules')          # discovered, with its types
-with client.transaction(expected_generation=g) as tx:
-    tx.upsert(rules, key, value)              # types checked here
-    tx.erase(rules, other_key)
-print(tx.result.generation)                   # committed on a clean exit
-```
-
-Go (`github.com/krsna1729/bess/sdk/go/bess`), the same guarantees with Go
-errors (`*ConflictError`, `*RejectedError`, `*BusyError`, `*TransportError`,
+Go (`github.com/krsna1729/bess/sdk/go/bess`) and C++ (`sdk/cpp`) are the two
+clients, each the same guarantees in its own error type -- Go
+(`*ConflictError`, `*RejectedError`, `*BusyError`, `*TransportError`,
 `*DaemonRestartedError`, `*StaleResourceError`, `*InvalidRequestError`):
 
 ```go
@@ -92,42 +82,43 @@ the workers are paused (Admin `PauseWorkers`, then `ResumeWorkers`).
 
 The pipeline (ports, modules, connections, workers, traffic classes, and where
 each module's task is scheduled) is desired state: `PipelineBuilder`
-assembles a `control_v2.Pipeline`, empty or from `client.pipeline()`'s
-snapshot, and the daemon validates, diffs, plans and applies it. The SDK
-repeats none of the planner's logic.
+assembles a `control_v2.Pipeline`, empty or from a snapshot
+(`Client::Pipeline` in C++, `Client.Pipeline` in Go), and the daemon
+validates, diffs, plans and applies it. The SDK repeats none of the planner's
+logic.
 
-A task placement (`task('src', parent='limit')` or `task('src', wid=1)`;
-Go and C++ `Task`) puts a module's task under a traffic class or at a
-worker's root, what `attach_task` did. A task no placement names stays where
-it is; a new one goes to any worker. Placements apply together, so tasks may
-trade places (D-109).
+A task placement (`PipelineBuilder::Task(TaskPlacement{module, parent})`, or
+`{module, wid}`; Go and C++ `Task`) puts a module's task under a traffic class
+or at a worker's root, what `attach_task` did. A task no placement names stays
+where it is; a new one goes to any worker. Placements apply together, so tasks
+may trade places (D-109).
 
-```python
-snap = client.pipeline()                       # PipelineSnapshot: pipeline, version
-p = (sdk.PipelineBuilder(snap.pipeline)
-     .module('em', 'ExactMatch', module_msg.ExactMatchArg(...))
-     .chain('rnd', 'em')
-     .build())
-steps, version = client.plan_pipeline(p)       # what the daemon would do
-client.apply_pipeline(p, expected=snap.version)
+```cpp
+auto snap = client->Pipeline();                // PipelineSnapshot: pipeline, version
+auto p = bess::sdk::PipelineBuilder(snap.pipeline)
+             .Module("em", "ExactMatch", arg)
+             .Chain("rnd", "em")
+             .Build();
+auto steps = client->PlanPipeline(p);          // what the daemon would do
+client->ApplyPipeline(p, snap.version);
 ```
 
 Go: `bess.NewPipeline(snap.Pipeline).Module(...).Chain(...).Build()`,
 `client.Pipeline`, `ValidatePipeline`, `DiffPipeline`, `PlanPipeline`,
 `ApplyPipeline(ctx, p, bess.WithExpectedVersion(snap.Version))`, with
-`*PipelineConflictError`. C++: `client->ApplyPipeline(p, snap->version)`.
+`*PipelineConflictError`.
 
 A version is a generation and the daemon epoch it belongs to
 (`PipelineVersion`): generations start again when the daemon restarts, so a
 generation alone means nothing across a restart (D-106).
 
-`apply_pipeline` retries a busy answer within the retry policy and never a
+`ApplyPipeline` retries a busy answer within the retry policy and never a
 conflict (`PipelineConflict`, a `Conflict`) or a refusal. It carries no request
-id, so after no answer the outcome is unknown (`TransportError`): read
-`client.pipeline()` before applying again, or apply with `expected` so a
-second application is a conflict. An answer is told from a loss by the
-server's `ErrorDetail` (a resource failure is UNAVAILABLE with a detail: an
-answer).
+id, so after no answer the outcome is unknown (`TransportError`): read the
+pipeline (`Client::Pipeline`, `Client.Pipeline`) before applying again, or
+apply with the expected version so a second application is a conflict. An
+answer is told from a loss by the server's `ErrorDetail` (a resource failure
+is UNAVAILABLE with a detail: an answer).
 
 ### Resource contents (D-129)
 
@@ -272,8 +263,8 @@ left out, moves nothing. No free CPU is `RESOURCE_EXHAUSTED` (ENOSPC, field
 explicit `core` is honoured anywhere in bessd's CPU set, with a warning when it
 is on another node, the control CPU, a CPU another worker uses, or a sibling
 of one; outside the set it is refused. In the SDKs: C++
-`Worker(wid, std::nullopt)`, Go `AutoWorker(wid, scheduler)`, pybess
-`worker(wid)` (`core=None`). `GetCapabilities` carries the daemon's
+`Worker(wid, std::nullopt)`, Go `AutoWorker(wid, scheduler)`.
+`GetCapabilities` carries the daemon's
 `memory_node` and its one-line `placement` summary (`bessctl status` prints
 both); `GetPortStatus` a port's `numa_node` (-1: unknown) and `cross_numa`.
 `GetCapabilities` also carries the SIMD width DPDK and BESS kernels use
@@ -331,7 +322,11 @@ and the result is a `google.protobuf.Any`, empty when the action answers
 nothing. For example L2Forward's `lookup` (`L2ForwardCommandLookupArg` ->
 `L2ForwardCommandLookupResponse`) and `populate`, Measure's `get_summary` and
 `clear`. An action is not a transaction: it is not retried, recorded or
-announced as an event, and no generation changes. It names the epoch the
+announced as an event, and the pipeline generation does not change. An action
+marked `edits_resources` writes the resource it owns outside a transaction
+(L2Forward's `populate`) and advances the resource generation, so a client that
+caches it and commits against the old value gets `ABORTED` (CONFLICT) instead
+of overwriting what the action wrote. It names the epoch the
 client has seen and is refused under another (D-106). An action not marked
 thread-safe is refused (EBUSY, `RESOURCE_BUSY`: C++ `kBusy`, Go `*BusyError`)
 while a running worker runs the module: pause the workers first. An unknown
@@ -339,15 +334,14 @@ module is `NOT_FOUND`; an action's own failure carries its errno in the
 `ErrorDetail` (`errno_value`; C++ `kInvalidRequest`, Go
 `*InvalidRequestError`).
 
-The commands that edit state are legacy-only: only the legacy
-`BESSControl.ModuleCommand` reaches them (ExactMatch's and WildcardMatch's
-`add`, `delete`, `clear`, `set_default_gate`, `get_runtime_config`,
-`set_runtime_config`; L2Forward's `add`, `delete`, `set_default_gate`; every
-module's `get_initial_arg`). control_v2 neither lists nor runs them:
-`InvokeAction` answers `INVALID_ARGUMENT` with errno `ENOTSUP` and field
-`action`, as for an unknown action. What they edit is the module's resources
-(`em/rules`, `em/settings`), changed by a transaction or a pipeline apply, and
-its init argument (`GetPipeline`'s `Module.arg`).
+The commands that used to edit state are gone (D-140): there is no
+`BESSControl.ModuleCommand`. What those commands changed is the module's
+resources (`em/rules`, `em/settings`), changed by a transaction or a pipeline
+apply, and the init argument is shown by `GetPipeline`'s `Module.arg`. An
+action that still fills a resource (L2Forward's `populate`) says so with
+`edits_resources` and moves the resource generation. `InvokeAction` answers
+`INVALID_ARGUMENT` with errno `ENOTSUP` and field `action` for a name a class
+does not declare.
 
 ```sh
 bessctl action fib lookup '{addrs: ["02:00:00:00:00:01"]}'   # JSON or YAML
@@ -358,9 +352,9 @@ bessctl pause && bessctl action br flush && bessctl resume   # not thread-safe
 `bessctl action MODULE ACTION [ARG] [-o json|yaml]` invokes an action
 (`InvokeAction`, D-129): ARG is JSON or YAML text of the argument type
 `GetSchema` lists for the class's action (default `{}`), and the result is
-printed in its result type. An unknown action, or a command that edits state
-(`add`, `set_default_gate`, `get_initial_arg`, ...: not an action), is refused
-with the class's actions listed; that state is in the module's resources,
+printed in its result type. An unknown action is refused with the class's
+actions listed; state a class used to change through a command
+(`add`, `set_default_gate`, ...) is in the module's resources now (D-140),
 changed by applying a manifest. `bessctl schema CLASS` lists the class's
 actions (`action NAME ARG_TYPE [-> RESULT_TYPE]`, `(no pause)` when
 thread-safe) and resource tables (`resource TABLE map KEY -> VALUE` or
@@ -398,8 +392,8 @@ bessctl pause | resume | shutdown
 `/tmp`; it stops the capture when interrupted, when the stream ends, or when
 its reader goes away.
 
-Not yet: the legacy commands (daemon start, `.bess` files, interactive
-shell); the Python bessctl remains for those until D-104's last step.
+Not yet: an interactive shell. The Python bessctl and the legacy commands it
+used are gone (D-140): `bessctl` runs manifests and one-shot commands.
 
 ## HTTP (in bessd, D-125)
 
@@ -501,32 +495,18 @@ state before deciding.
 
 ## Tests
 
-`pybess/test_sdk_model.py` checks the commit protocol against every
-small-scope behaviour (roadmap Appendix L, A1+): a simulated daemon keeps the
-truth (its epoch, what it applied), and a depth-first search replays the
-client against every combination of a lost request, a lost reply after the
-daemon acted, a busy answer, and a daemon restart before any RPC, for 1 to 4
-attempts (8 to 121 paths). Invariants: at most one application over all
-epochs; `Applied` only if applied, in the answering epoch; `Busy` only if
-nothing applied; `TransportError` only after an unanswered RPC;
-`DaemonRestarted` only after a restart. A blind resend, an ignored epoch and
-`Busy` after an unanswered send each fail it.
-
-| Model action | Code |
-|---|---|
-| Send | `Client._commit` → `ApplyTransaction` |
-| Ask | `Client.get_transaction` → `GetTransaction` |
-| Resend | `_commit`, only after "not known" under the commit's epoch |
-| Epoch check | `Client._check_epoch` / `_observe_epoch` |
-| Out of attempts | the end of `_commit` (`TransportError` or `Busy`) |
-
 The Go and C++ clients follow the same contract (`sdk/go/bess/client.go`,
-`sdk/cpp/src/client.cc`); their scripted tests cover the same cases.
+`sdk/cpp/src/client.cc`); their scripted tests cover the same cases against a
+fake transport: a lost request, a lost reply after the daemon acted, a busy
+answer, and a daemon restart before any RPC. Invariants: at most one
+application over all epochs; `Applied` only if applied, in the answering epoch;
+`Busy` only if nothing applied; `TransportError` only after an unanswered RPC;
+`DaemonRestarted` only after a restart.
 
-`pybess/test_sdk.py`, `sdk/go/bess/client_test.go` and
-`sdk/cpp/client_test.cc` script every recovery path against a fake transport
-(the `python` suite; the CI job "Go SDK", with the race detector; the `sdk`
-suite). Against a live daemon (the `live` suite, `tests/live/`):
+`sdk/go/bess/client_test.go` and `sdk/cpp/client_test.cc` script every recovery
+path against a fake transport
+(the CI job "Go SDK", with the race detector; the `sdk` suite). Against a live
+daemon (the `live` suite, `tests/live/`):
 `control_sdk_test.cc` (C++) and the conformance suite.
 
 Black-box recovery against the live daemon (`control_sdk_test.cc`, the real
@@ -580,7 +560,7 @@ if it succeeds.
 | `commit` | `ops`, `request_id_of`, `expected_generation_of`, `generation_delta`, `snapshot`, `as` | one transaction on `$resource` (below) |
 | `transaction_status` | `of` or `request_id`, `want_known`, `want_outcome` | `GetTransaction` of commit `of`'s request id, or `request_id` |
 | `pipeline` | `base`, `with_resources`, `want_resources`, `add`, `chain`, `remove`, `resources`, `plan`, `want_plan_version_of`, `want_changes`, `at_version_of`, `want_generation_of`, `want_resource_ops`, `want_resource_generation_of`, `as` | below |
-| `action` | `module`, `action`, `arg`, `class` or `arg_type`, `want_answer` | `InvokeAction` (D-129) with `arg` (protobuf JSON) in `arg_type`, else in the argument type `class`'s schema gives the action (`ModuleClassSchema.actions`); the result, in protobuf JSON with the .proto field names, has the fields of `want_answer` with those values. A legacy-only command is named with its `arg_type`, since the schema lists no such action |
+| `action` | `module`, `action`, `arg`, `class` or `arg_type`, `want_answer` | `InvokeAction` (D-129) with `arg` (protobuf JSON) in `arg_type`, else in the argument type `class`'s schema gives the action (`ModuleClassSchema.actions`); the result, in protobuf JSON with the .proto field names, has the fields of `want_answer` with those values. A name the schema lists no action for (a command that went with the legacy service, D-140) takes its argument type from `arg_type`, since nothing else gives it |
 
 **commit.** Each op is `{"op": "upsert", "key": {...}, "value": {...}}` or
 `{"op": "erase", "key": {...}}` in the resource's key and value types;

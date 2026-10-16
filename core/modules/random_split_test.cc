@@ -157,18 +157,4 @@ TEST(RandomSplitTest, SettingsRequirePausedWorkers) {
   EXPECT_TRUE(RequiresPausedWorkers("rs/settings"));
 }
 
-TEST(RandomSplitTest, SettersAreLegacyOnly) {
-  ModuleHarness h;
-  Module *m = h.Create("RandomSplit", SplitSettings(0, {0}), "rs");
-  ASSERT_NE(nullptr, m);
-  bess::pb::RandomSplitCommandSetDroprateArg rate;
-  rate.set_drop_rate(0.5);
-  EXPECT_EQ(ENOTSUP, h.Action(m, "set_droprate", rate).error().code());
-  EXPECT_EQ(ENOTSUP,
-            h.Action(m, "set_gates", bess::pb::RandomSplitCommandSetGatesArg()).error().code());
-  h.MustCommand(m, "set_droprate", rate);
-  const bess::pb::RandomSplitArg s = SplitSettings(0.5, {0});
-  EXPECT_EQ("", h.ReadBackDiffers("rs/settings", {{nullptr, &s}}));
-}
-
 }  // namespace

@@ -23,7 +23,13 @@
 // Worker::wid() are a dataplane::WorkerId, Worker::core() a dataplane::CpuId,
 // Worker::socket() a dataplane::SocketId; EventHub::Post/Full,
 // EventThrottle::Note and Module::AddActiveWorker take a WorkerId.
-#define BESS_PLUGIN_API_VERSION 3
+// 4 (D-140): Command::Exposure, Effect, LEGACY_ONLY and the rest of that pair
+// are gone -- a cmds entry is a name, an argument type, a handler, its thread
+// safety, the answer's type and edits_resources -- and ModuleBuilder::RunCommand
+// takes no CommandSurface. The gate-hook command surface went with it:
+// GateHookCommand(s), GATE_HOOK_CMD_FUNC, the required static cmds member and
+// GateHook::RunCommand/set_builder, and ADD_GATE_HOOK takes no command table.
+#define BESS_PLUGIN_API_VERSION 4
 
 // bess-dev-static.pc (D-095) is for programs without bessd. A plugin runs in
 // bessd and uses its runtime: linking the archives would give it a second EAL

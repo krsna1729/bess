@@ -31,9 +31,6 @@ class Rewrite final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  CommandResponse CommandAdd(const bess::pb::RewriteArg &arg);
-  CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
-
  private:
   // The templates, replicated round robin over kNumSlots slots so that a
   // batch starting at any template reads consecutive slots.

@@ -4,7 +4,8 @@
 // `set_burst` set, through the resource's codec, changes the packets the
 // task generates; it reads back canonically (every field named), unset fields
 // keep their value as for `update`, what they refuse is refused, it requires
-// paused workers, and the commands it supersedes are legacy only.
+// paused workers, and `update` and `set_burst` went with the legacy service
+// (D-140).
 
 #include <gtest/gtest.h>
 
@@ -153,28 +154,6 @@ TEST(FlowGenSettingsTest, RequiresPausedWorkers) {
   ModuleHarness h;
   ASSERT_NE(nullptr, h.Create("FlowGen", Arg(), "fg"));
   EXPECT_TRUE(RequiresPausedWorkers("fg/settings"));
-}
-
-TEST(FlowGenSettingsTest, UpdateAndSetBurstAreLegacyOnly) {
-  ModuleHarness h;
-  Module *fg = h.Create("FlowGen", Arg(), "fg");
-  ASSERT_NE(nullptr, fg);
-  bess::pb::FlowGenArg update;
-  update.set_pps(2e12);
-  bess::pb::FlowGenCommandSetBurstArg burst;
-  burst.set_burst(7);
-  EXPECT_EQ(ENOTSUP, h.Action(fg, "update", update).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(fg, "set_burst", burst).error().code());
-  // The legacy commands still run and validate, and the resource reads what
-  // they set.
-  h.MustCommand(fg, "update", update);
-  h.MustCommand(fg, "set_burst", burst);
-  bess::pb::FlowGenCommandSetBurstArg too_big;
-  too_big.set_burst(33);
-  EXPECT_EQ(EINVAL, h.Command(fg, "set_burst", too_big).error().code());
-  bess::pb::FlowGenSettings s = Settings(Template(false, 60), 7);
-  s.set_pps(2e12);
-  EXPECT_EQ("", h.ReadBackDiffers("fg/settings", {{nullptr, &s}}));
 }
 
 }  // namespace

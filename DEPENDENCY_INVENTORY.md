@@ -9,10 +9,6 @@ This is a source-level inventory of explicit dependency declarations in tracked 
 | DPDK | **25.11.3**, exact archive and SHA-256 `3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7490`, plus the local patches in `deps/dpdk-patches/` (none when empty; D-131) | `deps/dpdk.json`, `deps/dpdk-patches/`; bootstrap downloads this archive, verifies the digest and applies the patches in order. |
 | Meson | `>=1.2.0` | `meson.build`; minimum, not a lock. |
 | libxdp | `>=1.2.2` when AF_XDP is enabled/required | `meson.build`, `tools/bootstrap_dpdk.py`; minimum only. |
-| Python `scapy` | `>=2.7.0` | `requirements.txt`; stable release minimum as of 2026-09-25. |
-| Python `flask` | `>=3.1.3` | `requirements.txt`; stable release minimum as of 2026-09-25. |
-| Python `grpcio` | `>=1.84.0` | `requirements.txt`; stable release minimum as of 2026-09-25; requires Python >=3.10. |
-| Python `protobuf` | `>=7.36.2,<8` | `requirements.txt`; bounded major range; stable release minimum as of 2026-09-25; requires Python >=3.10. |
 | GitHub Actions checkout | `actions/checkout@v7` | `.github/workflows/ci.yml`; major tag, not an immutable commit SHA. |
 | GitHub Actions cache | `actions/cache@v6` | `.github/workflows/ci.yml`; major tag, not an immutable commit SHA. |
 | GitHub-hosted runner | `ubuntu-24.04` | `.github/workflows/ci.yml`; OS release label, not an image digest. |
@@ -31,7 +27,7 @@ Meson discovers these through `pkg-config` or executable names. Except for the D
 | libbpf | None | Required with AF_XDP; no Meson minimum. |
 | glog (`libglog`) | None in Meson | Required. Source compatibility notes discuss glog `>=0.7`; see historical references. |
 | gflags | None | Required. |
-| protobuf (`protobuf`) | None for C++ library in Meson | Required; separate Python `protobuf` range above. |
+| protobuf (`protobuf`) | None | Required (the C++ library and the `protoc` plugin). |
 | gRPC C++ (`grpc++`) | None | Required. |
 | libunwind | None | Required. |
 | zlib | None | Required. |
@@ -40,20 +36,20 @@ Meson discovers these through `pkg-config` or executable names. Except for the D
 | libyaml (`yaml-0.1`) | None | Required by the C++ bessctl (YAML manifests, `bessctl/yaml_io.cc`); static in a static build. |
 | GoogleTest (`gtest`) | None | Required by test targets. |
 | Google Benchmark (`benchmark`) | None | Required by benchmark targets. `benchmark_main` is optional; Meson falls back to the library. |
-| `pkg-config`, `protoc`, `grpc_cpp_plugin`, `grpc_python_plugin` | None | Required discovery/code-generation tools. |
-| Python 3, C/C++ compiler, Ninja | None | Python 3/compiler are selected by Meson; Ninja is used by the documented Meson build. |
+| `pkg-config`, `protoc`, `grpc_cpp_plugin` | None | Required discovery/code-generation tools. |
+| C/C++ compiler, Ninja | None | The compiler is selected by Meson; Ninja is used by the documented Meson build. |
 
-`core/meson.build`, `protobuf/meson.build`, `pybess/meson.build`, and `sample_plugin/meson.build` add targets and reuse these root dependencies; they add no further version constraints.
+`core/meson.build`, `protobuf/meson.build`, and `sample_plugin/meson.build` add targets and reuse these root dependencies; they add no further version constraints.
 
 ## Python declarations and consistency
 
-- `requirements.txt`: `scapy>=2.7.0`, `flask>=3.1.3`, `grpcio>=1.84.0`, `protobuf>=7.36.2,<8`.
-- The host installer's `python` mode, the `env/Dockerfile` build stage and `env/ci.Dockerfile` consume
-  `requirements.txt`; the runtime (the `runtime` mode, the release packages' `bess` and the runtime image) has
-  no Python (D-135).
-- CI uses the host installer and adds `coverage` without a version constraint.
+- The Python client (pybess, the Python bessctl, its generated protobuf packages) is gone (D-140): no
+  `requirements.txt` is tracked, the host installer has no `python` mode, and no build step generates Python code.
+  The build itself still needs `python3` from the standard library (Meson, `tools/write_version.py`,
+  `tools/build_info.py`, `tools/generate_protobuf.py` and the checks in `tools/`); `dpdk-devbind.py` (the
+  `bess-tools` package) is the only Python a package carries.
+- The runtime (the `runtime` installer mode, the release packages and the runtime image) has no Python (D-135).
 - The root `README.md` binary quick-install needs no Python.
-- No tracked Python lockfile was found; the ranges allow pip to resolve newer compatible releases.
 
 ## OS packages explicitly named
 
@@ -64,8 +60,7 @@ below.
 | Installer mode | Explicit package names |
 |---|---|
 | `runtime` | `libnuma1`, `libpcap0.8t64`, `zlib1g`, `libunwind8`, `libbpf1`, `libxdp1`, `libgoogle-glog0v6t64`, `libgflags2.2`, `libprotobuf32t64`, `libgrpc++1.51t64`, `libc-ares2`, `libsystemd0`, `libcap2`, `libelf1t64`, `libarchive13t64`, `libjansson4`, `libyaml-0-2`, `tcpdump`. |
-| `python` | `python3`, `python3-pip`, `python3-venv`, `libgraph-easy-perl`, then `requirements.txt` from PyPI. |
-| `build` | `build-essential`, `gcc-14`, `g++-14`, `clang-19`, `ccache`, `mold`, `meson`, `ninja-build`, `pkg-config`, `python3-pyelftools`, `xz-utils`, `libnuma-dev`, `libpcap-dev`, `zlib1g-dev`, `libunwind-dev`, `libbpf-dev`, `libxdp-dev`, `libgoogle-glog-dev`, `libgflags-dev`, `libgtest-dev`, `libbenchmark-dev`, `libgrpc++-dev`, `protobuf-compiler-grpc`, `libprotobuf-dev`, `protobuf-compiler`, `libsystemd-dev`, `libc-ares-dev`, `libcap-dev`, `libyaml-dev`. |
+| `build` | `build-essential`, `gcc-14`, `g++-14`, `clang-19`, `ccache`, `mold`, `meson`, `ninja-build`, `pkg-config`, `python3`, `python3-pyelftools`, `xz-utils`, `libnuma-dev`, `libpcap-dev`, `zlib1g-dev`, `libunwind-dev`, `libbpf-dev`, `libxdp-dev`, `libgoogle-glog-dev`, `libgflags-dev`, `libgtest-dev`, `libbenchmark-dev`, `libgrpc++-dev`, `protobuf-compiler-grpc`, `libprotobuf-dev`, `protobuf-compiler`, `libsystemd-dev`, `libc-ares-dev`, `libcap-dev`, `libyaml-dev`. |
 | `vm` | `cloud-image-utils`, `curl`, `numactl`, `openssh-client`, `qemu-kvm`, `qemu-utils`. |
 
 ## Container, VM, and external action references
@@ -93,8 +88,9 @@ These explicit version mentions in repository documentation or compatibility cod
 ## Reproducibility summary
 
 1. DPDK is the only major native dependency with an exact source archive and SHA-256 pin.
-2. Python requirements are ranges, not a lock; host, Docker, CI, and the quick-install instructions use the same lower bounds.
+2. No Python package list is tracked (D-140): the build uses the system `python3` standard library only, and the
+   packages install `dpdk-devbind.py` alone.
 3. Most C++ libraries and all APT packages are resolved from OS repositories without version constraints.
 4. The build-container base and Ubuntu VM cloud image use mutable tags/URLs rather than image digests.
 5. Current CI action references use major tags rather than immutable commit SHAs.
-6. No tracked Poetry/Pipenv/npm/Cargo/Go lockfile or equivalent dependency lock was found. `requirements.txt` is the only tracked Python package list.
+6. No tracked Poetry/Pipenv/npm/Cargo/Go lockfile or equivalent dependency lock was found.

@@ -14,17 +14,16 @@ using bess::utils::be16_t;
 using bess::utils::be32_t;
 using bess::utils::Ethernet;
 
-const Commands VLANPush::cmds = {
-    {"set_tci", "VLANPushArg", MODULE_CMD_FUNC(&VLANPush::CommandSetTci),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-};
+// "settings" (VLANPushArg) holds the TCI; the class has no actions.
+const Commands VLANPush::cmds = {};
 
 const ResourceTables VLANPush::resource_tables = {
     ResourceTable::Singleton<bess::pb::VLANPushArg>("settings", true),
 };
 
 CommandResponse VLANPush::Init(const bess::pb::VLANPushArg &arg) {
-  CommandSetTci(arg);
+  vlan_tag_ = be32_t((Ethernet::Type::kVlan << 16) | static_cast<uint16_t>(arg.tci()));
+  qinq_tag_ = be32_t((Ethernet::Type::kQinQ << 16) | static_cast<uint16_t>(arg.tci()));
   auto registered = settings_.Register(
       init_context().resources(), init_context().codecs(), name() + "/settings",
       // set_tci keeps the low 16 bits; the resource refuses a wider TCI so
@@ -54,13 +53,6 @@ CommandResponse VLANPush::Init(const bess::pb::VLANPushArg &arg) {
 
 void VLANPush::DeInit() {
   settings_.Release();
-}
-
-CommandResponse VLANPush::CommandSetTci(const bess::pb::VLANPushArg &arg) {
-  uint16_t tci = arg.tci();
-  vlan_tag_ = be32_t((Ethernet::Type::kVlan << 16) | tci);
-  qinq_tag_ = be32_t((Ethernet::Type::kQinQ << 16) | tci);
-  return CommandSuccess();
 }
 
 // the behavior is undefined if a packet is already double tagged

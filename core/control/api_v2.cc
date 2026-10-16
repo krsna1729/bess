@@ -749,8 +749,8 @@ grpc::Status ControlV2Service::InvokeAction(grpc::ServerContext *context,
   if (auto refused = RefuseOtherEpoch(request->daemon_epoch(), transactions_.epoch(), context)) {
     return *refused;
   }
-  auto ran = control_plane_.RunModuleCommand(request->module(), request->action(), request->arg(),
-                                             ModuleBuilder::CommandSurface::kActions);
+  auto ran = control_plane_.RunModuleCommand(request->module(), request->action(),
+                                             request->arg());
   if (!ran) {
     ControlError error = ran.error();
     error.object = request->module();
@@ -1050,13 +1050,10 @@ grpc::Status ControlV2Service::GetSchema(grpc::ServerContext *, const v2::GetSch
     out->set_igates(builder.NumIGates());
     out->set_ogates(builder.NumOGates());
     types.insert(builder.init_arg_type());
-    // Actions only (D-129): a legacy-only command edits state its resources
-    // hold, and control_v2 does not run it.
+    // Every command the class declares is an action (D-129, D-140).
     std::vector<const Command *> actions;
     for (const Command &cmd : builder.cmds()) {
-      if (cmd.exposure == Command::ACTION) {
-        actions.push_back(&cmd);
-      }
+      actions.push_back(&cmd);
     }
     std::sort(actions.begin(), actions.end(),
               [](const Command *a, const Command *b) { return a->cmd < b->cmd; });

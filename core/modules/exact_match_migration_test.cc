@@ -325,15 +325,6 @@ void RunDifferential(const std::vector<TestField> &fields, uint64_t seed,
   EXPECT_EQ(0u, plant_mismatches);
 }
 
-TEST(ExactMatchGate, RejectsWideDefaultGateBeforeNarrowing) {
-  ExactMatch module;
-
-  // Protobuf stores the gate as uint64; 65536 must not wrap to gate 0.
-  bess::pb::ExactMatchConfig config;
-  config.set_default_gate(65536);
-  EXPECT_NE(0, module.SetRuntimeConfig(config).error().code());
-}
-
 TEST(ExactMatchMigration, SingleIpFieldDefaultMask) {
   RunDifferential({{true, 26, 4, 0}}, 0x1234, 16, 2000);
 }

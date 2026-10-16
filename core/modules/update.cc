@@ -11,23 +11,22 @@
 
 #include "utils/endian.h"
 
-// D-129: "<name>/fields" holds the field list; add and clear stay for the
-// legacy ModuleCommand only.
-const Commands Update::cmds = {
-    {"add", "UpdateArg", MODULE_CMD_FUNC(&Update::CommandAdd),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-    {"clear", "EmptyArg", MODULE_CMD_FUNC(&Update::CommandClear),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-};
+// "<name>/fields" holds the whole field list; the class has no actions.
+const Commands Update::cmds = {};
 
 const ResourceTables Update::resource_tables = {
     ResourceTable::Singleton<bess::pb::UpdateArg>("fields", true)};
 
 CommandResponse Update::Init(const bess::pb::UpdateArg &arg) {
-  CommandResponse ret = CommandAdd(arg);
-  if (ret.has_error()) {
-    return ret;
+  // The init argument's fields; a refused one refuses the creation.
+  for (int i = 0; i < arg.fields_size(); i++) {
+    CommandResponse ret = ParseField(arg.fields(i), &fields_[i]);
+    if (ret.has_error()) {
+      return ret;
+    }
   }
+  num_fields_ = arg.fields_size();
+  arg_ = arg;
 
   // Stage converts the whole list; apply copies it in (no allocation).
   // ProcessBatch reads fields_ in place: paused workers only.
@@ -108,32 +107,6 @@ CommandResponse Update::ParseField(const bess::pb::UpdateArg::Field &field,
   out->offset = field.offset();
   out->mask = mask;
   out->value = value;
-  return CommandSuccess();
-}
-
-CommandResponse Update::CommandAdd(const bess::pb::UpdateArg &arg) {
-  size_t curr = num_fields_;
-
-  if (curr + arg.fields_size() > kMaxFields) {
-    return CommandFailure(EINVAL, "max %zu variables can be specified",
-                          kMaxFields);
-  }
-
-  for (int i = 0; i < arg.fields_size(); i++) {
-    CommandResponse ret = ParseField(arg.fields(i), &fields_[curr + i]);
-    if (ret.has_error()) {
-      return ret;
-    }
-  }
-
-  num_fields_ = curr + arg.fields_size();
-  arg_.mutable_fields()->MergeFrom(arg.fields());
-  return CommandSuccess();
-}
-
-CommandResponse Update::CommandClear(const bess::pb::EmptyArg &) {
-  num_fields_ = 0;
-  arg_.Clear();
   return CommandSuccess();
 }
 

@@ -552,8 +552,8 @@ TEST(Manifest, ResourcesReadBackAsTheyAreWritten) {
   EXPECT_NE(std::string::npos, kept->find("type.googleapis.com/bess.pb.v2.Worker")) << *kept;
 }
 
-// Actions (D-129) are what GetSchema lists for the class: an argument type
-// each; a command that edits state, and get_initial_arg, are none.
+// Actions (D-129, D-140) are what GetSchema lists for the class: an argument
+// type each; the state commands the legacy service ran are none of them.
 TEST(Schema, ActionsAreTheClassesDeclaredOnes) {
   auto schema = MakeSchema();
   auto type = schema->ActionArgType("Fake", "go");

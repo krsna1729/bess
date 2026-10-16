@@ -10,10 +10,9 @@
 using bess::utils::Ethernet;
 using bess::utils::Mpls;
 
-const Commands MPLSPop::cmds = {{"set", "MplsPopArg",
-                                 MODULE_CMD_FUNC(&MPLSPop::CommandSet),
-                                 Command::THREAD_UNSAFE, "",
-                                 Command::LEGACY_ONLY}};
+// "settings" (MplsPopArg) holds the ether type and header removal; the class
+// has no actions.
+const Commands MPLSPop::cmds = {};
 
 const ResourceTables MPLSPop::resource_tables = {
     ResourceTable::Singleton<bess::pb::MplsPopArg>("settings", true),
@@ -89,12 +88,6 @@ void MPLSPop::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
     EmitPacket(ctx, pkt, 0);
   }
-}
-
-CommandResponse MPLSPop::CommandSet(const bess::pb::MplsPopArg &arg) {
-  remove_eth_header_ = arg.remove_eth_header();
-  next_ether_type_ = be16_t(arg.next_eth_type());
-  return CommandSuccess();
 }
 
 ADD_MODULE(MPLSPop, "mpls_pop", "Pop MPLS label")

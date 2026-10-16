@@ -1254,7 +1254,8 @@ TEST_F(ApplyPipelineTest, ATaskMovesOffARemovedWorker) {
   on_one.module = "src0";
   on_one.wid = 1;
   two.tasks.push_back(on_one);
-  ASSERT_TRUE(control_plane_->ApplyPipeline(two, {}).has_value());
+  auto two_applied = control_plane_->ApplyPipeline(two, {});
+  ASSERT_TRUE(two_applied.has_value()) << two_applied.error().message;
 
   PipelineSpec one = two;
   one.workers.pop_back();
@@ -1277,7 +1278,8 @@ TEST_F(ApplyPipelineTest, NewTasksAvoidARemovedWorker) {
   two.modules.push_back({"sink", "Sink", {}});
   two.modules.push_back({"old", "Bypass", {}});
   two.connections.push_back({"old", 0, "sink", 0, false});
-  ASSERT_TRUE(control_plane_->ApplyPipeline(two, {}).has_value());
+  auto two_applied = control_plane_->ApplyPipeline(two, {});
+  ASSERT_TRUE(two_applied.has_value()) << two_applied.error().message;
 
   PipelineSpec one = two;
   one.workers.pop_back();
@@ -1560,27 +1562,22 @@ TEST_F(ApplyPipelineTest, ResourcesReadBackApplyAsANoOpAndAreVersioned) {
   EXPECT_EQ(1u, rules->entries.size());
 }
 
-// A legacy command that edits a resource's state (pybess, a .bess script)
-// moves the resource generation, so an apply built on a read from before it
-// conflicts instead of erasing the edit; a legacy reader moves nothing.
-TEST_F(ApplyPipelineTest, LegacyEditsMoveTheResourceGeneration) {
+// A resource write (here an apply's own) moves the resource generation, so an
+// apply built on a read from before it conflicts instead of erasing the edit;
+// a read moves nothing.
+TEST_F(ApplyPipelineTest, ResourceEditsMoveTheResourceGeneration) {
   const std::string a("\x0a\x00\x00\x01", 4);
   ASSERT_TRUE(control_plane_->ApplyPipeline(ExactMatchPipeline({a}, 2), {}));
   auto read = control_plane_->ReadPipeline({.include = true});
   ASSERT_TRUE(read) << read.error().message;
 
-  auto config = control_plane_->RunModuleCommand("em", "get_runtime_config",
-                                                 Packed(bess::pb::EmptyArg()));
-  ASSERT_TRUE(config && config->error().code() == 0);
   auto after_read = control_plane_->ReadPipeline({});
   ASSERT_TRUE(after_read) << after_read.error().message;
   EXPECT_EQ(read->resource_generation, after_read->resource_generation)
-      << "a legacy reader moved the resource generation";
+      << "a read moved the resource generation";
 
-  bess::pb::ExactMatchCommandSetDefaultGateArg gate;
-  gate.set_gate(4);
-  auto set = control_plane_->RunModuleCommand("em", "set_default_gate", Packed(gate));
-  ASSERT_TRUE(set && set->error().code() == 0);
+  // The same rules, another default gate: the write moves the generation.
+  ASSERT_TRUE(control_plane_->ApplyPipeline(ExactMatchPipeline({a}, 4), {}));
   EXPECT_EQ(4u, DefaultGate(*control_plane_));
 
   PipelineSpec spec = SpecFromSnapshot(read->value.snapshot);
@@ -1588,9 +1585,67 @@ TEST_F(ApplyPipelineTest, LegacyEditsMoveTheResourceGeneration) {
   auto stale = control_plane_->ApplyPipeline(
       spec, {.expected_generation = read->generation,
              .expected_resource_generation = read->resource_generation});
-  ASSERT_FALSE(stale) << "the apply undid the legacy edit";
+  ASSERT_FALSE(stale) << "the apply undid the resource edit";
   EXPECT_EQ(bess::control::ControlErrorCode::kConflict, stale.error().code);
   EXPECT_EQ(4u, DefaultGate(*control_plane_));
+}
+
+// An action that edits the resource it owns (L2Forward's populate, D-140)
+// moves the resource generation through RunModuleCommand, so an apply built on
+// a read from before the action conflicts instead of erasing what it wrote; an
+// action that only reads leaves the generation where it was.
+TEST_F(ApplyPipelineTest, AnEditingActionMovesTheResourceGeneration) {
+  ASSERT_TRUE(control_plane_->CreateModule({"l2", "L2Forward", Packed(bess::pb::L2ForwardArg())}));
+  auto read = control_plane_->ReadPipeline({.include = true});
+  ASSERT_TRUE(read) << read.error().message;
+
+  bess::pb::L2ForwardCommandPopulateArg populate;
+  populate.set_base("02:00:00:00:00:01");
+  populate.set_count(1);
+  populate.set_gate_count(1);
+  auto ran = control_plane_->RunModuleCommand("l2", "populate", Packed(populate));
+  ASSERT_TRUE(ran) << ran.error().message;
+  EXPECT_EQ(0, ran->error().code()) << ran->error().errmsg();
+  ASSERT_TRUE(ReadResource(*control_plane_, "l2/macs"));
+  EXPECT_EQ(1u, ReadResource(*control_plane_, "l2/macs")->entries.size());
+
+  auto after_action = control_plane_->ReadPipeline({});
+  ASSERT_TRUE(after_action) << after_action.error().message;
+  EXPECT_NE(read->resource_generation, after_action->resource_generation)
+      << "the editing action did not move the resource generation";
+  EXPECT_EQ(read->generation, after_action->generation)
+      << "an action moved the pipeline generation";
+
+  // A read-only action (lookup) does not move it: the EditsResources() flag,
+  // not the action, decides.
+  bess::pb::L2ForwardCommandLookupArg lookup;
+  lookup.add_addrs("02:00:00:00:00:01");
+  auto looked_up = control_plane_->RunModuleCommand("l2", "lookup", Packed(lookup));
+  ASSERT_TRUE(looked_up) << looked_up.error().message;
+  EXPECT_EQ(0, looked_up->error().code()) << looked_up->error().errmsg();
+  auto after_lookup = control_plane_->ReadPipeline({});
+  ASSERT_TRUE(after_lookup) << after_lookup.error().message;
+  EXPECT_EQ(after_action->resource_generation, after_lookup->resource_generation)
+      << "a read-only action moved the resource generation";
+
+  PipelineSpec spec = SpecFromSnapshot(read->value.snapshot);
+  spec.resources = read->value.resources;
+  auto stale = control_plane_->ApplyPipeline(
+      spec, {.expected_generation = read->generation,
+             .expected_resource_generation = read->resource_generation});
+  ASSERT_FALSE(stale) << "the apply undid the action's edit";
+  EXPECT_EQ(bess::control::ControlErrorCode::kConflict, stale.error().code);
+  EXPECT_EQ("expected_resource_generation", stale.error().field) << stale.error().message;
+  ASSERT_TRUE(ReadResource(*control_plane_, "l2/macs"));
+  EXPECT_EQ(1u, ReadResource(*control_plane_, "l2/macs")->entries.size());
+
+  // An action that does not exist ran nothing, so it moves nothing.
+  auto missing = control_plane_->RunModuleCommand("l2", "no_such_action", Packed(populate));
+  ASSERT_TRUE(missing) << missing.error().message;
+  EXPECT_EQ(ENOTSUP, missing->error().code()) << missing->error().errmsg();
+  auto after_missing = control_plane_->ReadPipeline({});
+  ASSERT_TRUE(after_missing) << after_missing.error().message;
+  EXPECT_EQ(after_lookup->resource_generation, after_missing->resource_generation);
 }
 
 // A resource the apply cannot converge (a gate ExactMatch refuses) aborts the

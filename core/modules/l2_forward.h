@@ -40,10 +40,6 @@ class L2Forward final : public Module {
   // ProcessBatch's decision: gates[i], the output gate of packet i.
   void ClassifyBatch(const bess::PacketBatch *batch, gate_idx_t *gates) const;
 
-  CommandResponse CommandAdd(const bess::pb::L2ForwardCommandAddArg &arg);
-  CommandResponse CommandDelete(const bess::pb::L2ForwardCommandDeleteArg &arg);
-  CommandResponse CommandSetDefaultGate(
-      const bess::pb::L2ForwardCommandSetDefaultGateArg &arg);
   CommandResponse CommandLookup(const bess::pb::L2ForwardCommandLookupArg &arg);
   CommandResponse CommandPopulate(
       const bess::pb::L2ForwardCommandPopulateArg &arg);

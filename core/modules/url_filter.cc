@@ -21,21 +21,9 @@ using bess::utils::be16_t;
 
 const uint64_t TIME_OUT_NS = 10ull * 1000 * 1000 * 1000;  // 10 seconds
 
-// D-129: "<name>/blacklist" holds the blacklist; every command edits or
-// reads it back and stays for the legacy ModuleCommand only.
-const Commands UrlFilter::cmds = {
-    {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&UrlFilter::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
-    {"get_runtime_config", "EmptyArg",
-     MODULE_CMD_FUNC(&UrlFilter::GetRuntimeConfig), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY, Command::READS},
-    {"set_runtime_config", "UrlFilterConfig",
-     MODULE_CMD_FUNC(&UrlFilter::SetRuntimeConfig), Command::THREAD_UNSAFE, "",
-     Command::LEGACY_ONLY},
-    {"add", "UrlFilterArg", MODULE_CMD_FUNC(&UrlFilter::CommandAdd),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-    {"clear", "EmptyArg", MODULE_CMD_FUNC(&UrlFilter::CommandClear),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY}};
+// "<name>/blacklist" holds the whole blacklist (UrlFilterConfig); the class
+// has no actions.
+const Commands UrlFilter::cmds = {};
 
 const ResourceTables UrlFilter::resource_tables = {
     ResourceTable::Singleton<bess::pb::UrlFilterConfig>("blacklist", true)};
@@ -202,60 +190,6 @@ CommandResponse UrlFilter::Init(const bess::pb::UrlFilterArg &arg) {
 
 void UrlFilter::DeInit() {
   blacklist_resource_.Release();
-}
-
-CommandResponse UrlFilter::CommandAdd(const bess::pb::UrlFilterArg &arg) {
-  Insert(arg.blacklist(), &blacklist_);
-  config_.mutable_blacklist()->MergeFrom(arg.blacklist());
-  return CommandSuccess();
-}
-
-CommandResponse UrlFilter::CommandClear(const bess::pb::EmptyArg &) {
-  blacklist_.clear();
-  config_.Clear();
-  return CommandSuccess();
-}
-
-// Retrieves an argument that would re-create this module in
-// such a way that SetRuntimeConfig would build the same one.
-CommandResponse UrlFilter::GetInitialArg(const bess::pb::EmptyArg &) {
-  bess::pb::UrlFilterArg resp;
-  // Our return value is empty since we return
-  // the current blacklist as the runtime config.
-  return CommandSuccess(resp);
-}
-
-// Retrieves a configuration that will restore this module.
-CommandResponse UrlFilter::GetRuntimeConfig(const bess::pb::EmptyArg &) {
-  bess::pb::UrlFilterConfig resp;
-  using rule_t = bess::pb::UrlFilterArg_Url;
-  for (const auto &it : blacklist_) {
-    auto entries = it.second.Dump();
-    for (auto entry : entries) {
-      rule_t *hp = resp.add_blacklist();
-      hp->set_host(it.first);
-      hp->set_path(std::get<0>(entry));
-      // For now, ignore get<1> and get<2>, which are
-      // the tuple and the prefix boolean, respectively.
-      // The tuple is (currently) always empty and the boolean
-      // is (currently) always false -- see the .Insert() above.
-    }
-  }
-  // Dump() is sorted, but blacklist_ is not: we use a
-  // stable sort to just sort by the host as the outer key.
-  std::stable_sort(
-      resp.mutable_blacklist()->begin(), resp.mutable_blacklist()->end(),
-      [](const rule_t &a, const rule_t &b) { return a.host() < b.host(); });
-  return CommandSuccess(resp);
-}
-
-// Restores the module's configuration.
-CommandResponse UrlFilter::SetRuntimeConfig(
-    const bess::pb::UrlFilterConfig &arg) {
-  blacklist_.clear();
-  Insert(arg.blacklist(), &blacklist_);
-  config_ = arg;
-  return CommandSuccess();
 }
 
 void UrlFilter::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {

@@ -34,9 +34,6 @@ class NAT final : public Module {
   ~NAT() override;
 
   CommandResponse Init(const bess::pb::NATArg &arg);
-  CommandResponse GetInitialArg(const bess::pb::EmptyArg &arg);
-  CommandResponse GetRuntimeConfig(const bess::pb::EmptyArg &arg);
-  CommandResponse SetRuntimeConfig(const bess::pb::EmptyArg &arg);
   // Usage (TP7, D-083): ask for an interim record of every mapping; drain
   // the records (interim and final) the packet path has logged.
   CommandResponse CommandRequestUsageReport(const bess::pb::EmptyArg &arg);

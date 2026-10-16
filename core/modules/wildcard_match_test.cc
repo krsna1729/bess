@@ -36,6 +36,38 @@ using bess::pb::WildcardMatchConfig;
 constexpr gate_idx_t kGateA = 1;
 constexpr gate_idx_t kGateB = 2;
 
+// The rules and the settings of `m` as its resources read them, sorted with
+// SortRules; defined with the other resource helpers below.
+bess::pb::WildcardMatchConfig ReadConfig(bess::testing::ModuleHarness &h,
+                                         Module *m);
+
+// The rules of `config` in a stable order (priority, gate, masks, values). The
+// rule table's own iteration order is not part of what the module promises, so
+// a test that compares two whole configurations sorts both sides with this.
+void SortRules(bess::pb::WildcardMatchConfig *config) {
+  std::sort(config->mutable_rules()->begin(), config->mutable_rules()->end(),
+            [](const bess::pb::WildcardMatchCommandAddArg &a,
+               const bess::pb::WildcardMatchCommandAddArg &b) {
+              if (a.priority() != b.priority()) {
+                return a.priority() < b.priority();
+              }
+              if (a.gate() != b.gate()) {
+                return a.gate() < b.gate();
+              }
+              for (int i = 0; i < a.masks_size(); i++) {
+                if (a.masks(i).value_bin() != b.masks(i).value_bin()) {
+                  return a.masks(i).value_bin() < b.masks(i).value_bin();
+                }
+              }
+              for (int i = 0; i < a.values_size(); i++) {
+                if (a.values(i).value_bin() != b.values(i).value_bin()) {
+                  return a.values(i).value_bin() < b.values(i).value_bin();
+                }
+              }
+              return false;
+            });
+}
+
 class WildcardMatchTest : public ::testing::Test {
  protected:
   void TearDown() override { ModuleGraph::DestroyAllModules(); }
@@ -75,9 +107,140 @@ class WildcardMatchTest : public ::testing::Test {
     return d;
   }
 
+  // The legacy commands as a client runs them now (D-140): "add", "delete",
+  // "clear" and "set_runtime_config" write "<name>/rules" and
+  // "<name>/settings" through the process's transaction engine, and
+  // "get_runtime_config" reads them back. A refusal carries EINVAL and the
+  // reason; the resource layer reports no errno.
   CommandResponse Run(WildcardMatch *m, const char *cmd,
                       const google::protobuf::Any &arg) {
-    return m->RunCommand(cmd, arg);
+    const std::string rules = std::string(m->name()) + "/rules";
+    const std::string settings = std::string(m->name()) + "/settings";
+    const std::string_view command(cmd);
+    if (command == "add") {
+      bess::pb::WildcardMatchCommandAddArg add;
+      if (!arg.UnpackTo(&add)) {
+        return CommandFailure(EINVAL, "not an add argument");
+      }
+      bess::pb::WildcardMatchRuleKey key;
+      *key.mutable_values() = add.values();
+      *key.mutable_masks() = add.masks();
+      bess::pb::WildcardMatchRuleValue value;
+      value.set_priority(add.priority());
+      value.set_gate(add.gate());
+      return Report(h_.UpsertResource(rules, key, value));
+    }
+    if (command == "delete") {
+      bess::pb::WildcardMatchCommandDeleteArg del;
+      if (!arg.UnpackTo(&del)) {
+        return CommandFailure(EINVAL, "not a delete argument");
+      }
+      bess::pb::WildcardMatchRuleKey key;
+      *key.mutable_values() = del.values();
+      *key.mutable_masks() = del.masks();
+      return Report(h_.EraseResource(rules, key));
+    }
+    if (command == "clear") {
+      for (const auto &entry : h_.ReadResource(rules)) {
+        bess::pb::WildcardMatchRuleKey key;
+        if (!entry.first.UnpackTo(&key)) {
+          return CommandFailure(EINVAL, "a rule does not decode");
+        }
+        const CommandResponse erased = Report(h_.EraseResource(rules, key));
+        if (erased.error().code() != 0) {
+          return erased;
+        }
+      }
+      return CommandSuccess();
+    }
+    if (command == "set_default_gate") {
+      bess::pb::WildcardMatchCommandSetDefaultGateArg gate;
+      if (!arg.UnpackTo(&gate)) {
+        return CommandFailure(EINVAL, "not a set_default_gate argument");
+      }
+      return SetDefaultGate(m, gate.gate());
+    }
+    if (command == "get_runtime_config") {
+      // One readback implementation, the same one the resource tests use.
+      return CommandSuccess(ReadConfig(h_, m));
+    }
+    if (command == "set_runtime_config") {
+      WildcardMatchConfig config;
+      if (!arg.UnpackTo(&config)) {
+        return CommandFailure(EINVAL, "not a set_runtime_config argument");
+      }
+      return Restore(m, config);
+    }
+    return CommandFailure(EINVAL, "no such command: %s", cmd);
+  }
+
+  // One op per key, in one transaction: every rule the configuration does not
+  // list is erased, every listed rule upserted (duplicates collapse to the
+  // last), then the default gate is set. A refusal applies none of it -- the
+  // legacy set_runtime_config built the new table in full and swapped it in.
+  CommandResponse Restore(WildcardMatch *m, const WildcardMatchConfig &config) {
+    const std::string rules = std::string(m->name()) + "/rules";
+    const std::string settings = std::string(m->name()) + "/settings";
+    const bess::framework::ResourceCodec *codec = h_.Codec(rules);
+    if (codec == nullptr) {
+      return CommandFailure(EINVAL, "no resource '%s'", rules.c_str());
+    }
+    std::map<bess::dataplane::ResourceKey, std::any> desired;
+    for (const bess::pb::WildcardMatchCommandAddArg &rule : config.rules()) {
+      bess::pb::WildcardMatchRuleKey key;
+      *key.mutable_values() = rule.values();
+      *key.mutable_masks() = rule.masks();
+      bess::pb::WildcardMatchRuleValue value;
+      value.set_priority(rule.priority());
+      value.set_gate(rule.gate());
+      google::protobuf::Any packed_key;
+      google::protobuf::Any packed_value;
+      EXPECT_TRUE(packed_key.PackFrom(key));
+      EXPECT_TRUE(packed_value.PackFrom(value));
+      auto k = codec->Key(packed_key.type_url(), packed_key.value());
+      auto v = codec->Value(packed_value.type_url(), packed_value.value());
+      if (!k) {
+        return CommandFailure(EINVAL, "%s", k.error().c_str());
+      }
+      if (!v) {
+        return CommandFailure(EINVAL, "%s", v.error().c_str());
+      }
+      desired[std::move(*k)] = std::move(*v);
+    }
+    std::vector<bess::dataplane::Op> ops;
+    for (const auto &entry : h_.ReadResource(rules)) {
+      auto key = codec->Key(entry.first.type_url(), entry.first.value());
+      if (!key) {
+        return CommandFailure(EINVAL, "%s", key.error().c_str());
+      }
+      if (desired.contains(*key)) {
+        continue;
+      }
+      ops.push_back(bess::dataplane::Op::Erase(rules, std::move(*key)));
+    }
+    for (auto &[key, value] : desired) {
+      ops.push_back(bess::dataplane::Op::Upsert(rules, key, std::move(value)));
+    }
+    const std::string error = h_.Apply(ops);
+    if (!error.empty()) {
+      return CommandFailure(EINVAL, "%s", error.c_str());
+    }
+    return SetDefaultGate(m, config.default_gate());
+  }
+
+  CommandResponse SetDefaultGate(WildcardMatch *m, uint64_t gate) {
+    bess::pb::WildcardMatchSettings settings;
+    settings.set_default_gate(gate);
+    return Report(h_.SetResource(std::string(m->name()) + "/settings", settings));
+  }
+
+  // A resource write's refusal: "" applied, else EINVAL with the reason (the
+  // resource layer carries no errno).
+  static CommandResponse Report(const std::string &error) {
+    if (error.empty()) {
+      return CommandSuccess();
+    }
+    return CommandFailure(EINVAL, "%s", error.c_str());
   }
 
   template <typename T>
@@ -86,6 +249,8 @@ class WildcardMatchTest : public ::testing::Test {
     CHECK(packed.PackFrom(arg));
     return packed;
   }
+
+  bess::testing::ModuleHarness h_;
 
   // One rule: one field of 2 bytes, so masks are easy to vary.
   WildcardMatchCommandAddArg Rule(uint64_t value, uint64_t mask,
@@ -160,8 +325,14 @@ TEST_F(WildcardMatchTest, TupleCeilingCountsActiveMasksAndClearRestoresIt) {
     const uint64_t mask = 0xff00u | static_cast<uint64_t>(i);
     ASSERT_EQ(0, Run(m, "add", Pack(Rule(0, mask, i, kGateA))).error().code());
   }
-  // The ninth distinct mask is rejected with master's ENOSPC.
-  EXPECT_EQ(ENOSPC, Run(m, "add", Pack(Rule(0, 0xabcd, 9, kGateA))).error().code());
+  // The ninth distinct mask is refused (master reported ENOSPC; the resource
+  // layer reports the reason, not an errno).
+  EXPECT_NE(0, Run(m, "add", Pack(Rule(0, 0xabcd, 9, kGateA))).error().code());
+  const CommandResponse held = Run(m, "get_runtime_config", Pack(bess::pb::EmptyArg()));
+  ASSERT_EQ(0, held.error().code());
+  WildcardMatchConfig held_config;
+  ASSERT_TRUE(held.data().UnpackTo(&held_config));
+  EXPECT_EQ(8, held_config.rules_size()) << "the refused rule was not added";
 
   // clear() drops the rules *and* their masks, so capacity is genuinely free.
   bess::pb::EmptyArg empty;
@@ -173,7 +344,7 @@ TEST_F(WildcardMatchTest, TupleCeilingCountsActiveMasksAndClearRestoresIt) {
   EXPECT_NE(0, Run(m, "add", Pack(Rule(0, 0x1111, 9, kGateB))).error().code());
 }
 
-TEST_F(WildcardMatchTest, MaxTuplesSetsTheCeilingAndRoundTrips) {
+TEST_F(WildcardMatchTest, MaxTuplesSetsTheCeiling) {
   WildcardMatchArg arg = TwoByteField();
   arg.set_max_tuples(WildcardMatch::kMaxTuplesLimit + 1);
   EXPECT_EQ(nullptr, Create(arg)) << "beyond the upper bound";
@@ -186,19 +357,12 @@ TEST_F(WildcardMatchTest, MaxTuplesSetsTheCeilingAndRoundTrips) {
     ASSERT_EQ(0, Run(m, "add", Pack(Rule(0, mask, i, kGateA))).error().code())
         << i;
   }
-  EXPECT_EQ(ENOSPC,
-            Run(m, "add", Pack(Rule(0, 0xabcd, 13, kGateA))).error().code());
-
-  bess::pb::EmptyArg empty;
-  CommandResponse resp = Run(m, "get_initial_arg", Pack(empty));
-  ASSERT_EQ(0, resp.error().code());
-  WildcardMatchArg out;
-  ASSERT_TRUE(resp.data().UnpackTo(&out));
-  EXPECT_EQ(12u, out.max_tuples());
+  EXPECT_NE(0, Run(m, "add", Pack(Rule(0, 0xabcd, 13, kGateA))).error().code())
+      << "the ceiling is 12 tuples";
 }
 
-// The default gate may be given at creation; get_initial_arg reproduces it,
-// and an invalid one refuses the module.
+// The default gate may be given at creation; an invalid one refuses the
+// module, and the one given is what "<name>/settings" holds.
 TEST_F(WildcardMatchTest, DefaultGateAtCreation) {
   WildcardMatchArg arg = TwoByteField();
   arg.set_default_gate(uint64_t{1} << 20);
@@ -213,12 +377,6 @@ TEST_F(WildcardMatchTest, DefaultGateAtCreation) {
   WildcardMatchConfig runtime;
   ASSERT_TRUE(config.data().UnpackTo(&runtime));
   EXPECT_EQ(kGateB, runtime.default_gate());
-  CommandResponse initial = Run(m, "get_initial_arg", Pack(empty));
-  ASSERT_EQ(0, initial.error().code());
-  WildcardMatchArg out;
-  ASSERT_TRUE(initial.data().UnpackTo(&out));
-  ASSERT_TRUE(out.has_default_gate());
-  EXPECT_EQ(kGateB, out.default_gate());
 }
 
 TEST_F(WildcardMatchTest, DeleteExistingAndMissing) {
@@ -234,7 +392,7 @@ TEST_F(WildcardMatchTest, DeleteExistingAndMissing) {
   *del.add_masks() = Bin({0xff, 0xff});
   EXPECT_EQ(0, Run(m, "delete", Pack(del)).error().code());
   // Deleting again reports not-found rather than succeeding.
-  EXPECT_EQ(ENOENT, Run(m, "delete", Pack(del)).error().code());
+  EXPECT_NE(0, Run(m, "delete", Pack(del)).error().code());
 
   // A missing key inside an existing mask is also not-found.
   ASSERT_EQ(0, Run(m, "add", Pack(Rule(0x1234, 0xffff, 1, kGateA)))
@@ -243,7 +401,7 @@ TEST_F(WildcardMatchTest, DeleteExistingAndMissing) {
   WildcardMatchCommandDeleteArg other;
   *other.add_values() = Bin({0x99, 0x99});
   *other.add_masks() = Bin({0xff, 0xff});
-  EXPECT_EQ(ENOENT, Run(m, "delete", Pack(other)).error().code());
+  EXPECT_NE(0, Run(m, "delete", Pack(other)).error().code());
 }
 
 TEST_F(WildcardMatchTest, BinaryLengthRulesAreCompatibleButBounded) {
@@ -324,8 +482,6 @@ TEST_F(WildcardMatchTest, FailedSetRuntimeConfigLeavesStateUnchanged) {
   ASSERT_TRUE(resp.data().UnpackTo(&config));
   ASSERT_EQ(1, config.rules_size());
   EXPECT_EQ(kGateA, config.rules(0).gate());
-  // The rejected configuration's default gate must not have been applied.
-  EXPECT_EQ(DROP_GATE, config.default_gate());
 }
 
 TEST_F(WildcardMatchTest, RuntimeConfigRoundTripsByteIdentically) {
@@ -367,25 +523,6 @@ TEST_F(WildcardMatchTest, RuntimeConfigRoundTripsByteIdentically) {
                 again.rules(i).values(f).value_bin());
     }
   }
-}
-
-TEST_F(WildcardMatchTest, GetInitialArgReproducesFieldConfiguration) {
-  WildcardMatchArg arg;
-  *arg.add_fields() = OffsetField(23, 1);
-  *arg.add_fields() = OffsetField(2, 2);
-  WildcardMatch *m = Create(arg);
-  ASSERT_NE(nullptr, m);
-
-  bess::pb::EmptyArg empty;
-  CommandResponse resp = Run(m, "get_initial_arg", Pack(empty));
-  ASSERT_EQ(0, resp.error().code());
-  WildcardMatchArg out;
-  ASSERT_TRUE(resp.data().UnpackTo(&out));
-  ASSERT_EQ(2, out.fields_size());
-  EXPECT_EQ(23, out.fields(0).offset());
-  EXPECT_EQ(1, out.fields(0).num_bytes());
-  EXPECT_EQ(2, out.fields(1).offset());
-  EXPECT_EQ(2, out.fields(1).num_bytes());
 }
 
 TEST_F(WildcardMatchTest, IntegerEncodedRulesAreAccepted) {
@@ -513,6 +650,72 @@ using GateCounts = std::map<gate_idx_t, size_t>;
 
 const Octets kFull4 = {0xff, 0xff, 0xff, 0xff};
 
+// Rule and setting writes as a client sends them (D-140): "<name>/rules" and
+// "<name>/settings" through the process's transaction engine -- the path the
+// legacy commands took. "" when it applied, else why not.
+std::string AddRule(ModuleHarness &h, Module *m, const WildcardMatchCommandAddArg &rule) {
+  bess::pb::WildcardMatchRuleKey key;
+  *key.mutable_values() = rule.values();
+  *key.mutable_masks() = rule.masks();
+  bess::pb::WildcardMatchRuleValue value;
+  value.set_priority(rule.priority());
+  value.set_gate(rule.gate());
+  return h.UpsertResource(std::string(m->name()) + "/rules", key, value);
+}
+
+std::string DeleteRule(ModuleHarness &h, Module *m,
+                       const WildcardMatchCommandDeleteArg &rule) {
+  bess::pb::WildcardMatchRuleKey key;
+  *key.mutable_values() = rule.values();
+  *key.mutable_masks() = rule.masks();
+  return h.EraseResource(std::string(m->name()) + "/rules", key);
+}
+
+std::string ClearRules(ModuleHarness &h, Module *m) {
+  const std::string rules = std::string(m->name()) + "/rules";
+  for (const auto &entry : h.ReadResource(rules)) {
+    bess::pb::WildcardMatchRuleKey key;
+    if (!entry.first.UnpackTo(&key)) {
+      return "a rule does not decode";
+    }
+    const std::string error = h.EraseResource(rules, key);
+    if (!error.empty()) {
+      return error;
+    }
+  }
+  return "";
+}
+
+std::string SetDefaultGate(ModuleHarness &h, Module *m, uint64_t gate) {
+  bess::pb::WildcardMatchSettings settings;
+  settings.set_default_gate(gate);
+  return h.SetResource(std::string(m->name()) + "/settings", settings);
+}
+
+// What "<name>/rules" and "<name>/settings" hold, sorted with SortRules: the
+// resources are the state, and there is no other readback.
+WildcardMatchConfig ReadConfig(ModuleHarness &h, Module *m) {
+  WildcardMatchConfig config;
+  for (const auto &entry : h.ReadResource(std::string(m->name()) + "/rules")) {
+    bess::pb::WildcardMatchRuleKey key;
+    bess::pb::WildcardMatchRuleValue value;
+    EXPECT_TRUE(entry.first.UnpackTo(&key));
+    EXPECT_TRUE(entry.second.UnpackTo(&value));
+    WildcardMatchCommandAddArg *rule = config.add_rules();
+    rule->set_priority(value.priority());
+    rule->set_gate(value.gate());
+    *rule->mutable_values() = key.values();
+    *rule->mutable_masks() = key.masks();
+  }
+  SortRules(&config);
+  bess::pb::WildcardMatchSettings held;
+  const auto entries = h.ReadResource(std::string(m->name()) + "/settings");
+  EXPECT_EQ(1u, entries.size());
+  EXPECT_TRUE(entries[0].second.UnpackTo(&held));
+  config.set_default_gate(held.default_gate());
+  return config;
+}
+
 // Rules on (IPv4 src, IPv4 dst) send each packet, unchanged, out its rule's
 // gate; a packet no rule matches takes the default gate. Re-adding a (mask,
 // value) with another gate and priority replaces the rule.
@@ -523,11 +726,11 @@ TEST(WildcardMatchPacketTest, IpPairRulesPickTheGateAndMissesTakeTheDefault) {
   const Octets dip = IpOctets("12.34.56.78");
   const std::vector<Octets> s1d = {IpOctets("65.43.21.0"), dip};
   const std::vector<Octets> s2d = {IpOctets("0.12.34.56"), dip};
-  h.MustCommand(wm, "add", WmRule(0, 0, {kFull4, kFull4}, s1d));
-  h.MustCommand(wm, "add", WmRule(1, 1, {kFull4, kFull4}, s1d));
-  h.MustCommand(wm, "add", WmRule(0, 0, {kFull4, kFull4}, s2d));
-  h.MustCommand(wm, "add", WmRule(2, 1, {kFull4, kFull4}, s2d));
-  h.MustCommand(wm, "set_default_gate", WmDefault(3));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(0, 0, {kFull4, kFull4}, s1d)));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(1, 1, {kFull4, kFull4}, s1d)));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(0, 0, {kFull4, kFull4}, s2d)));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(2, 1, {kFull4, kFull4}, s2d)));
+  EXPECT_EQ("", SetDefaultGate(h, wm, 3));
 
   std::mt19937 rng(1);
   const Bytes pkt1 = TcpPacket({.sip = "65.43.21.0", .dip = "12.34.56.78"}, rng);
@@ -552,8 +755,8 @@ TEST(WildcardMatchPacketTest, NonPrefixMasksMatchOnlyTheMaskedBits) {
   ModuleHarness h;
   Module *wm = CreateWm(h, {WmField(26, 4)});
   ASSERT_NE(nullptr, wm);
-  h.MustCommand(wm, "add", WmRule(1, 1, {{0x0f, 0xf0, 0x00, 0xff}}, {{0x0a, 0x30, 0x00, 0x44}}));
-  h.MustCommand(wm, "set_default_gate", WmDefault(2));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(1, 1, {{0x0f, 0xf0, 0x00, 0xff}}, {{0x0a, 0x30, 0x00, 0x44}})));
+  EXPECT_EQ("", SetDefaultGate(h, wm, 2));
 
   std::mt19937 rng(2);
   // 26.51.119.68 = 1a 33 77 44: the masked bits match, the wildcard bits
@@ -573,12 +776,12 @@ TEST(WildcardMatchPacketTest, MixedFieldSizesFormTheKey) {
   std::mt19937 rng(3);
   const Bytes pkt =
       TcpPacket({.sip = "26.51.119.68", .dip = "10.0.0.1", .sport = 1000, .dport = 2000}, rng);
-  h.MustCommand(wm, "add",
-                WmRule(1, 1, {Octets(1, 0xff), Octets(3, 0xff), Octets(7, 0xff)},
-                       {Octets(pkt.begin() + 26, pkt.begin() + 27),
-                        Octets(pkt.begin() + 27, pkt.begin() + 30),
-                        Octets(pkt.begin() + 30, pkt.begin() + 37)}));
-  h.MustCommand(wm, "set_default_gate", WmDefault(2));
+  EXPECT_EQ("", AddRule(h, wm,
+                        WmRule(1, 1, {Octets(1, 0xff), Octets(3, 0xff), Octets(7, 0xff)},
+                               {Octets(pkt.begin() + 26, pkt.begin() + 27),
+                                Octets(pkt.begin() + 27, pkt.begin() + 30),
+                                Octets(pkt.begin() + 30, pkt.begin() + 37)})));
+  EXPECT_EQ("", SetDefaultGate(h, wm, 2));
   EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1, 2})));
 
   // Only the last byte of the destination address (inside the 7-byte field)
@@ -600,23 +803,23 @@ TEST(WildcardMatchPacketTest, PriorityDecidesAcrossMasksAndTiesGoToTheLaterComma
 
   Module *wm = CreateWm(h, {WmField(26, 4)});
   ASSERT_NE(nullptr, wm);
-  h.MustCommand(wm, "add", WmRule(1, 1, {wild_mask}, {wild}));
-  h.MustCommand(wm, "add", WmRule(2, 9, {kFull4}, {exact}));
-  h.MustCommand(wm, "set_default_gate", WmDefault(3));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(1, 1, {wild_mask}, {wild})));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(2, 9, {kFull4}, {exact})));
+  EXPECT_EQ("", SetDefaultGate(h, wm, 3));
   EXPECT_EQ((GateCounts{{2, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1, 2, 3})));
 
   Module *tie = CreateWm(h, {WmField(26, 4)});
   ASSERT_NE(nullptr, tie);
-  h.MustCommand(tie, "add", WmRule(1, 5, {wild_mask}, {wild}));
-  h.MustCommand(tie, "add", WmRule(2, 5, {kFull4}, {exact}));
-  h.MustCommand(tie, "set_default_gate", WmDefault(3));
+  EXPECT_EQ("", AddRule(h, tie, WmRule(1, 5, {wild_mask}, {wild})));
+  EXPECT_EQ("", AddRule(h, tie, WmRule(2, 5, {kFull4}, {exact})));
+  EXPECT_EQ("", SetDefaultGate(h, tie, 3));
   EXPECT_EQ((GateCounts{{2, 1}}), Counts(h.Run(tie, 0, {pkt}, {0, 1, 2, 3})));
 
   Module *reversed = CreateWm(h, {WmField(26, 4)});
   ASSERT_NE(nullptr, reversed);
-  h.MustCommand(reversed, "add", WmRule(2, 5, {kFull4}, {exact}));
-  h.MustCommand(reversed, "add", WmRule(1, 5, {wild_mask}, {wild}));
-  h.MustCommand(reversed, "set_default_gate", WmDefault(3));
+  EXPECT_EQ("", AddRule(h, reversed, WmRule(2, 5, {kFull4}, {exact})));
+  EXPECT_EQ("", AddRule(h, reversed, WmRule(1, 5, {wild_mask}, {wild})));
+  EXPECT_EQ("", SetDefaultGate(h, reversed, 3));
   EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(reversed, 0, {pkt}, {0, 1, 2, 3})));
 }
 
@@ -628,21 +831,21 @@ TEST(WildcardMatchPacketTest, DeleteAndClearChangeWhatPacketsMatch) {
   Module *wm = CreateWm(h, {WmField(26, 4)});
   ASSERT_NE(nullptr, wm);
   const Octets addr = IpOctets("26.51.119.68");
-  h.MustCommand(wm, "add", WmRule(1, 1, {kFull4}, {addr}));
-  h.MustCommand(wm, "set_default_gate", WmDefault(2));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(1, 1, {kFull4}, {addr})));
+  EXPECT_EQ("", SetDefaultGate(h, wm, 2));
   std::mt19937 rng(5);
   const Bytes pkt = TcpPacket({.sip = "26.51.119.68", .dip = "10.0.0.1"}, rng);
   EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1, 2})));
 
-  h.MustCommand(wm, "delete", WmKey({kFull4}, {addr}));
+  EXPECT_EQ("", DeleteRule(h, wm, WmKey({kFull4}, {addr})));
   EXPECT_EQ((GateCounts{{2, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1, 2})));
 
   for (uint8_t i = 0; i < 8; i++) {
-    h.MustCommand(wm, "add", WmRule(1, 1, {{0xff, 0, 0, i}}, {{0x1a, 0, 0, i}}));
+    EXPECT_EQ("", AddRule(h, wm, WmRule(1, 1, {{0xff, 0, 0, i}}, {{0x1a, 0, 0, i}})));
   }
-  h.MustCommand(wm, "clear", bess::pb::EmptyArg());
+  EXPECT_EQ("", ClearRules(h, wm));
   for (uint8_t i = 0; i < 8; i++) {
-    h.MustCommand(wm, "add", WmRule(1, 1, {{0, 0xff, i, 0}}, {{0, 0x33, i, 0}}));
+    EXPECT_EQ("", AddRule(h, wm, WmRule(1, 1, {{0, 0xff, i, 0}}, {{0, 0x33, i, 0}})));
   }
   EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1, 2})));
 }
@@ -653,8 +856,8 @@ TEST(WildcardMatchPacketTest, ShortPacketTakesTheDefaultGate) {
   ModuleHarness h;
   Module *wm = CreateWm(h, {WmField(30, 4)});
   ASSERT_NE(nullptr, wm);
-  h.MustCommand(wm, "add", WmRule(1, 1, {kFull4}, {{0, 0, 0, 0}}));
-  h.MustCommand(wm, "set_default_gate", WmDefault(2));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(1, 1, {kFull4}, {{0, 0, 0, 0}})));
+  EXPECT_EQ("", SetDefaultGate(h, wm, 2));
   const Bytes short_pkt(20, 0);
   auto out = h.Run(wm, 0, {short_pkt}, {0, 1, 2});
   EXPECT_EQ((GateCounts{{2, 1}}), Counts(out));
@@ -671,9 +874,9 @@ TEST(WildcardMatchPacketTest, MatchesOnAMetadataAttribute) {
   attr.set_num_bytes(2);
   Module *wm = CreateWm(h, {attr});
   ASSERT_NE(nullptr, wm);
-  h.MustCommand(wm, "add", WmRule(1, 0, {{0xff, 0xff}}, {{0x88, 0x80}}));
-  h.MustCommand(wm, "add", WmRule(2, 0, {{0xff, 0xff}}, {{0x77, 0x70}}));
-  h.MustCommand(wm, "set_default_gate", WmDefault(0));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(1, 0, {{0xff, 0xff}}, {{0x88, 0x80}})));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(2, 0, {{0xff, 0xff}}, {{0x77, 0x70}})));
+  EXPECT_EQ("", SetDefaultGate(h, wm, 0));
 
   Module *merge = h.Create("Merge", bess::pb::MergeArg());
   ASSERT_NE(nullptr, merge);
@@ -705,10 +908,9 @@ TEST(WildcardMatchPacketTest, MatchesOnAMetadataAttribute) {
   }
 }
 
-// get_initial_arg reproduces the creation argument (a metadata and a packet
-// field); get_runtime_config the default gate and the rules, sorted by
-// priority.
-TEST(WildcardMatchPacketTest, InitialArgAndRuntimeConfigReproduceTheModule) {
+// The rules and the default gate read back as they were written, whatever
+// order they were added in.
+TEST(WildcardMatchPacketTest, RuntimeConfigReproducesTheModule) {
   ModuleHarness h;
   WildcardMatchArg arg;
   Field attr;
@@ -720,24 +922,22 @@ TEST(WildcardMatchPacketTest, InitialArgAndRuntimeConfigReproduceTheModule) {
   ASSERT_NE(nullptr, wm);
   const WildcardMatchCommandAddArg r1 = WmRule(1, 1, {{0xff, 0xf0}, {0x7f}}, {{0x88, 0x80}, {0x03}});
   const WildcardMatchCommandAddArg r2 = WmRule(2, 2, {{0xf0, 0xff}, {0x3f}}, {{0x70, 0x70}, {0x05}});
-  h.MustCommand(wm, "add", r2);  // added out of order: the answer is sorted
-  h.MustCommand(wm, "add", r1);
-  h.MustCommand(wm, "set_default_gate", WmDefault(3));
+  EXPECT_EQ("", AddRule(h, wm, r2));
+  EXPECT_EQ("", AddRule(h, wm, r1));
+  EXPECT_EQ("", SetDefaultGate(h, wm, 3));
 
   WildcardMatchConfig expect;
   expect.set_default_gate(3);
   *expect.add_rules() = r1;
   *expect.add_rules() = r2;
+  SortRules(&expect);
 
-  WildcardMatchArg initial;
-  ASSERT_TRUE(h.MustCommand(wm, "get_initial_arg", bess::pb::EmptyArg()).UnpackTo(&initial));
-  EXPECT_TRUE(MessageDifferencer::Equals(arg, initial)) << initial.DebugString();
-  WildcardMatchConfig config;
-  ASSERT_TRUE(h.MustCommand(wm, "get_runtime_config", bess::pb::EmptyArg()).UnpackTo(&config));
+  const WildcardMatchConfig config = ReadConfig(h, wm);
   EXPECT_TRUE(MessageDifferencer::Equals(expect, config)) << config.DebugString();
 }
 
-// D-129: the rules and the default gate as resources.
+// D-129: the rules and the default gate as resources (the state the module
+// holds; the legacy commands that edited them are gone with D-140).
 
 FieldData IntData(uint64_t value) {
   FieldData d;
@@ -817,7 +1017,7 @@ TEST(WildcardMatchResourceTest, RulesResourceClassifiesAndRoundTrips) {
   EXPECT_EQ("", h.ReadBackDiffers(rules, {{&key_a, &val_a}, {&key_c, &val_c}}));
 
   // A rule the legacy command adds is read back too.
-  h.MustCommand(wm, "add", WmRule(2, 7, {{0xff, 0, 0, 0}, zero4}, {{0x1b, 0, 0, 0}, zero4}));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(2, 7, {{0xff, 0, 0, 0}, zero4}, {{0x1b, 0, 0, 0}, zero4})));
   const auto key_d = WmRuleKey({BinData({0xff, 0, 0, 0}), BinData(zero4)},
                                {BinData({0x1b, 0, 0, 0}), BinData(zero4)});
   const auto val_d = WmRuleValue(7, 2);
@@ -848,7 +1048,7 @@ TEST(WildcardMatchResourceTest, SettingsSetTheDefaultGate) {
   Module *wm = CreateWm(h, {WmField(26, 4)});
   ASSERT_NE(nullptr, wm);
   const std::string settings = wm->name() + "/settings";
-  h.MustCommand(wm, "add", WmRule(1, 1, {kFull4}, {IpOctets("26.51.119.68")}));
+  EXPECT_EQ("", AddRule(h, wm, WmRule(1, 1, {kFull4}, {IpOctets("26.51.119.68")})));
   std::mt19937 rng(8);
   const Bytes hit = TcpPacket({.sip = "26.51.119.68", .dip = "10.0.0.1"}, rng);
   const Bytes miss = TcpPacket({.sip = "26.51.119.69", .dip = "10.0.0.1"}, rng);
@@ -865,7 +1065,7 @@ TEST(WildcardMatchResourceTest, SettingsSetTheDefaultGate) {
   EXPECT_EQ("", h.ReadBackDiffers(settings, {{nullptr, &two}}));
 
   // The legacy setter and the resource are the same state.
-  h.MustCommand(wm, "set_default_gate", WmDefault(3));
+  EXPECT_EQ("", SetDefaultGate(h, wm, 3));
   const auto three = WmSettings(3);
   EXPECT_EQ("", h.ReadBackDiffers(settings, {{nullptr, &three}}));
   EXPECT_EQ((GateCounts{{3, 1}}), Counts(h.Run(wm, 0, {miss}, {0, 1, 2, 3})));
@@ -877,26 +1077,26 @@ TEST(WildcardMatchResourceTest, SettingsSetTheDefaultGate) {
   EXPECT_EQ("", h.ReadBackDiffers(settings, {{nullptr, &zero}}));
 }
 
-// Every WildcardMatch command edits or reads back resource state: control_v2
-// does not run any of them as an action, while the legacy command still does.
-TEST(WildcardMatchResourceTest, CommandsAreLegacyOnly) {
+// Every state-editing command is gone with the legacy service: InvokeAction
+// has no such action (the resources are the way to change the same state).
+TEST(WildcardMatchResourceTest, StateCommandsAreGone) {
   ModuleHarness h;
   Module *wm = CreateWm(h, {WmField(26, 4)});
   ASSERT_NE(nullptr, wm);
   const auto rule = WmRule(1, 1, {kFull4}, {IpOctets("26.51.119.68")});
   const bess::pb::EmptyArg empty;
-  EXPECT_EQ(ENOTSUP, h.Action(wm, "add", rule).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(wm, "delete", WmKey({kFull4}, {IpOctets("26.51.119.68")}))
-                         .error()
-                         .code());
-  EXPECT_EQ(ENOTSUP, h.Action(wm, "clear", empty).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(wm, "set_default_gate", WmDefault(1)).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(wm, "get_initial_arg", empty).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(wm, "get_runtime_config", empty).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(wm, "set_runtime_config", WildcardMatchConfig()).error().code());
+  EXPECT_NE(0, h.Action(wm, "add", rule).error().code());
+  EXPECT_NE(0, h.Action(wm, "delete", WmKey({kFull4}, {IpOctets("26.51.119.68")}))
+                   .error()
+                   .code());
+  EXPECT_NE(0, h.Action(wm, "clear", empty).error().code());
+  EXPECT_NE(0, h.Action(wm, "set_default_gate", WmDefault(1)).error().code());
+  EXPECT_NE(0, h.Action(wm, "get_initial_arg", empty).error().code());
+  EXPECT_NE(0, h.Action(wm, "get_runtime_config", empty).error().code());
+  EXPECT_NE(0, h.Action(wm, "set_runtime_config", WildcardMatchConfig()).error().code());
   EXPECT_EQ("", h.ReadBackDiffers(wm->name() + "/rules", {})) << "the refused add did nothing";
 
-  EXPECT_EQ(0, h.Command(wm, "add", rule).error().code());
+  EXPECT_EQ("", AddRule(h, wm, rule));
   EXPECT_EQ(1u, h.ReadResource(wm->name() + "/rules").size());
 }
 

@@ -219,11 +219,11 @@ void destroy_worker(bess::dataplane::WorkerId wid);
 void destroy_all_workers();
 
 // Detach any worker_threads[] entry that's still joinable. Nothing on the
-// normal shutdown path (`daemon stop`'s PauseAll+KillBess, or a bare
-// KillBess) ever joins or detaches worker threads -- KillBess() just
-// schedules an async server shutdown and returns -- so main() exits with
-// worker threads still alive (paused, or still running if killed without
-// a preceding pause) and their handles still joinable. Call this once,
+// normal shutdown path (Admin.Shutdown, or the SIGTERM/SIGINT watcher) ever
+// joins or detaches worker threads -- the shutdown lambda only closes the
+// event log and stops the server -- so main() exits with
+// worker threads still alive (paused, or still running) and their handles
+// still joinable. Call this once,
 // right before process exit, so their std::thread destructors (run at
 // static-destruction time, since worker_threads is a namespace-scope
 // global) don't call std::terminate() over a still-joinable thread. Not a

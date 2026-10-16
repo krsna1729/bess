@@ -61,15 +61,12 @@ class FlowGen final : public Module {
   }
 
   static const Commands cmds;
-  // "settings" (FlowGenSettings): what `update` and `set_burst` set; the
-  // task reads the generator's parameters unsynchronized, so it requires
+  // "settings" (FlowGenSettings): the generator's parameters; the
+  // task reads them unsynchronized, so it requires
   // paused workers (D-129).
   static const ResourceTables resource_tables;
 
   CommandResponse Init(const bess::pb::FlowGenArg &arg);
-  CommandResponse CommandUpdate(const bess::pb::FlowGenArg &arg);
-  CommandResponse CommandSetBurst(
-      const bess::pb::FlowGenCommandSetBurstArg &arg);
 
   void DeInit() override;
 

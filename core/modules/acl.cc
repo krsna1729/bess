@@ -12,13 +12,9 @@
 #include "utils/ip.h"
 #include "utils/udp.h"
 
-// D-129: "<name>/rules" holds the rule list; add and clear stay for the
-// legacy ModuleCommand only.
-const Commands ACL::cmds = {
-    {"add", "ACLArg", MODULE_CMD_FUNC(&ACL::CommandAdd), Command::THREAD_SAFE,
-     "", Command::LEGACY_ONLY},
-    {"clear", "EmptyArg", MODULE_CMD_FUNC(&ACL::CommandClear),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY}};
+// D-129: "<name>/rules" (a singleton) holds the whole rule list; the class
+// has no actions.
+const Commands ACL::cmds = {};
 
 const ResourceTables ACL::resource_tables = {
     ResourceTable::Singleton<bess::pb::ACLArg>("rules", false)};
@@ -106,26 +102,6 @@ CommandResponse ACL::Init(const bess::pb::ACLArg &arg) {
 
 void ACL::DeInit() {
   rules_resource_.Release();
-}
-
-// All or nothing: a rule that fails validation leaves the ACL unchanged.
-CommandResponse ACL::CommandAdd(const bess::pb::ACLArg &arg) {
-  std::vector<ACLRule> added;
-  CommandResponse ret = ParseRules(arg, &added);
-  if (ret.has_error()) {
-    return ret;
-  }
-  std::vector<ACLRule> rules = rules_.Read()->rules;
-  rules.insert(rules.end(), added.begin(), added.end());
-  Install(std::move(rules));
-  arg_.mutable_rules()->MergeFrom(arg.rules());
-  return CommandSuccess();
-}
-
-CommandResponse ACL::CommandClear(const bess::pb::EmptyArg &) {
-  Install({});
-  arg_.Clear();
-  return CommandSuccess();
 }
 
 void ACL::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {

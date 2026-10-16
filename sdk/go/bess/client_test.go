@@ -875,8 +875,9 @@ func TestResourceGenerations(t *testing.T) {
 
 // InvokeAction (D-129) names the module, the action and the epoch the client
 // knows (learned first) and returns the action's result. It is not retried:
-// a busy module is a BusyError, a refusal (a legacy-only command: ENOTSUP)
-// an InvalidRequestError with the daemon's detail, and a restart refuses it.
+// a busy module is a BusyError, a refusal (a name the class declares no action
+// for: ENOTSUP) an InvalidRequestError with the daemon's detail, and a restart
+// refuses it.
 func TestInvokeAction(t *testing.T) {
 	ctx := context.Background()
 	f := &fake{}
@@ -902,7 +903,7 @@ func TestInvokeAction(t *testing.T) {
 	}
 
 	d, _ := proto.Marshal(&pb.ErrorDetail{Code: pb.ErrorDetail_INVALID_ARGUMENT, ErrnoValue: 95, Field: "action",
-		Message: "add is a legacy-only command"})
+		Message: "'L2Forward' does not support action 'add'"})
 	f.actions = []step{{err: status.Error(codes.InvalidArgument, "x"), md: metadata.Pairs(errorDetailKey, string(d))}}
 	_, err = c.InvokeAction(ctx, "l2", "add", &pb.GetTransactionRequest{})
 	if e := as[*InvalidRequestError](t, err); e.Detail.GetField() != "action" || e.Detail.GetErrnoValue() != 95 ||

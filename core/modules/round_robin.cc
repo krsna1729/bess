@@ -6,14 +6,8 @@
 
 #include "utils/format.h"
 
-const Commands RoundRobin::cmds = {
-    {"set_mode", "RoundRobinCommandSetModeArg",
-     MODULE_CMD_FUNC(&RoundRobin::CommandSetMode), Command::THREAD_UNSAFE, "",
-     Command::LEGACY_ONLY},
-    {"set_gates", "RoundRobinCommandSetGatesArg",
-     MODULE_CMD_FUNC(&RoundRobin::CommandSetGates), Command::THREAD_UNSAFE, "",
-     Command::LEGACY_ONLY},
-};
+// "settings" (RoundRobinArg) holds mode and gates; the class has no actions.
+const Commands RoundRobin::cmds = {};
 
 const ResourceTables RoundRobin::resource_tables = {
     ResourceTable::Singleton<bess::pb::RoundRobinArg>("settings", true),
@@ -105,37 +99,6 @@ bess::pb::RoundRobinArg RoundRobin::ReadSettings() const {
   }
   value.set_mode(per_packet_ ? "packet" : "batch");
   return value;
-}
-
-CommandResponse RoundRobin::CommandSetMode(
-    const bess::pb::RoundRobinCommandSetModeArg &arg) {
-  if (arg.mode() == "packet") {
-    per_packet_ = 1;
-  } else if (arg.mode() == "batch") {
-    per_packet_ = 0;
-  } else {
-    return CommandFailure(EINVAL,
-                          "argument must be either 'packet' or 'batch'");
-  }
-  return CommandSuccess();
-}
-
-CommandResponse RoundRobin::CommandSetGates(
-    const bess::pb::RoundRobinCommandSetGatesArg &arg) {
-  if (arg.gates_size() > MAX_RR_GATES) {
-    return CommandFailure(EINVAL, "no more than %d gates", MAX_RR_GATES);
-  }
-
-  for (int i = 0; i < arg.gates_size(); i++) {
-    int elem = arg.gates(i);
-    gates_[i] = elem;
-    if (!is_valid_gate(gates_[i])) {
-      return CommandFailure(EINVAL, "invalid gate %d", gates_[i]);
-    }
-  }
-
-  ngates_ = arg.gates_size();
-  return CommandSuccess();
 }
 
 void RoundRobin::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {

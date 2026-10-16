@@ -31,12 +31,11 @@ enum class ControlErrorCode {
 struct ControlError {
   ControlErrorCode code = ControlErrorCode::kInternal;
 
-  // errno-compatible value carried through to the legacy protobuf surface
-  // (Error.code: 0 for success, errno > 0 for failure).
+  // errno-compatible value, carried out as ErrorDetail.errno_value on the
+  // wire (0 for success, errno > 0 for failure).
   int err = 0;
 
-  // Human-readable message; identical to the text the legacy handlers
-  // produced for the same failure.
+  // Human-readable message, from the module or the control plane.
   std::string message;
 
   // Optional structured context, filled in as operations migrate to the

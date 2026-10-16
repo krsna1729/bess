@@ -27,22 +27,15 @@ class Source final : public Module {
   struct task_result RunTask(Context *ctx, bess::PacketBatch *batch,
                              void *arg) override;
 
-  CommandResponse CommandSetBurst(
-      const bess::pb::SourceCommandSetBurstArg &arg);
-  CommandResponse CommandSetPktSize(
-      const bess::pb::SourceCommandSetPktSizeArg &arg);
-
  private:
   struct Settings {
     int pkt_size;
     int burst;
   };
 
-  // Set by THREAD_SAFE commands and the settings resource while workers
-  // read it.
+  // Set by the settings resource while workers read it.
   std::atomic<int> pkt_size_;
-  // Set by THREAD_SAFE commands and the settings resource while workers
-  // read it.
+  // Set by the settings resource while workers read it.
   std::atomic<int> burst_;
 
   // "<name>/settings"; after the state it sets.

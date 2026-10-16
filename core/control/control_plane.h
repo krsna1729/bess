@@ -96,29 +96,22 @@ class ControlPlane {
 
   // -- ports --
   ControlResult<PortInfo> CreatePort(const PortSpec& spec);
-  ControlResult<void> DestroyPort(const std::string& name);
-  ControlResult<bess::pb::CommandResponse> SetPortConf(
-      const std::string& name, const PortConfSpec& spec);
-  ControlResult<void> ResetPorts();
 
   // -- modules --
   ControlResult<std::string> CreateModule(const ModuleSpec& spec);
   ControlResult<void> DestroyModule(const std::string& name);
-  ControlResult<void> ResetModules();
   ControlResult<void> ConnectModules(const ConnectionSpec& spec);
   ControlResult<void> DisconnectModules(const DisconnectionSpec& spec);
-  // Runs module `module`'s command `command` with `arg` (GetSchema names each
-  // action's argument type): `surface` kLegacy for the legacy ModuleCommand
-  // RPC (every command), kActions for control_v2's InvokeAction (D-129: the
-  // class's actions only; a legacy-only command is ENOTSUP). A command not
-  // marked thread-safe is refused (EBUSY) while a worker runs: pause first.
-  // The command's own failure is the response's error; the result's error is
-  // only "no such module". Commands change module state, not the pipeline:
-  // no generation.
+  // Runs module `module`'s action `command` with `arg` (GetSchema names each
+  // action's argument type). A command not marked thread-safe is refused
+  // (EBUSY) while a worker runs: pause first. The command's own failure is the
+  // response's error; the result's error is only "no such module". An action
+  // that edits the resource it owns (edits_resources) moves the resource
+  // generation, so an apply built on an older read conflicts instead of
+  // undoing the edit (D-129, D-140).
   ControlResult<bess::pb::CommandResponse> RunModuleCommand(
       const std::string& module, const std::string& command,
-      const google::protobuf::Any& arg,
-      ModuleBuilder::CommandSurface surface = ModuleBuilder::CommandSurface::kLegacy);
+      const google::protobuf::Any& arg);
 
   // -- workers --
   // No core: automatic -- Placement::NextWorkerCpu over the live workers'
@@ -137,19 +130,12 @@ class ControlPlane {
 
   // -- traffic classes --
   ControlResult<void> AddTc(const TrafficClassSpec& spec);
-  ControlResult<void> UpdateTcParams(const TrafficClassSpec& spec);
   ControlResult<void> UpdateTcParent(const TrafficClassSpec& spec);
-  ControlResult<void> ResetTcs();
   ControlResult<SchedulingConstraintsReport> CheckSchedulingConstraints();
 
   // -- gate hooks --
   ControlResult<std::string> ConfigureGateHook(const GateHookSpec& spec,
                                                bool enable);
-
-  // -- resume hooks --
-  ControlResult<bess::pb::CommandResponse> ConfigureResumeHook(
-      const std::string& hook_name, bool enable,
-      const google::protobuf::Any& arg);
 
   // -- plugins --
   ControlResult<void> ImportPlugin(const std::string& path);
@@ -218,8 +204,6 @@ class ControlPlane {
   // take the lock and call these.
   ControlResult<PortInfo> CreatePortLocked(const PortSpec& spec);
   ControlResult<void> DestroyPortLocked(const std::string& name);
-  ControlResult<bess::pb::CommandResponse> SetPortConfLocked(
-      const std::string& name, const PortConfSpec& spec);
   ControlResult<std::string> CreateModuleLocked(const ModuleSpec& spec);
   ControlResult<void> DestroyModuleLocked(const std::string& name);
   ControlResult<void> ConnectModulesLocked(const ConnectionSpec& spec);

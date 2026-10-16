@@ -78,16 +78,9 @@ const ResourceTable *ModuleBuilder::FindResourceTable(std::string_view table) co
 }
 
 CommandResponse ModuleBuilder::RunCommand(Module *m, const std::string &user_cmd,
-                                          const google::protobuf::Any &arg,
-                                          CommandSurface surface) const {
+                                          const google::protobuf::Any &arg) const {
   for (auto &cmd : cmds_) {
     if (user_cmd == cmd.cmd) {
-      if (surface == CommandSurface::kActions && cmd.exposure != Command::ACTION) {
-        return CommandFailure(ENOTSUP,
-                              "'%s' has no action '%s': it edits state, which "
-                              "its resources hold",
-                              class_name_.c_str(), user_cmd.c_str());
-      }
       if (cmd.mt_safe != Command::THREAD_SAFE && m->HasRunningWorker()) {
         return CommandFailure(EBUSY,
                               "There is a running worker and command "
@@ -99,16 +92,8 @@ CommandResponse ModuleBuilder::RunCommand(Module *m, const std::string &user_cmd
     }
   }
 
-  if (surface == CommandSurface::kLegacy && user_cmd == "get_initial_arg") {
-    CommandResponse ret;
-    *ret.mutable_data() = m->initial_arg_;
-    return ret;
-  }
-
-  return CommandFailure(ENOTSUP, "'%s' does not support %s '%s'",
-                        class_name_.c_str(),
-                        surface == CommandSurface::kActions ? "action" : "command",
-                        user_cmd.c_str());
+  return CommandFailure(ENOTSUP, "'%s' does not support action '%s'",
+                        class_name_.c_str(), user_cmd.c_str());
 }
 
 CommandResponse ModuleBuilder::RunInit(Module *m,

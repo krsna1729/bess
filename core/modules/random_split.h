@@ -28,10 +28,6 @@ class RandomSplit final : public Module {
 
   CommandResponse Init(const bess::pb::RandomSplitArg &arg);
   void DeInit() override;
-  CommandResponse CommandSetDroprate(
-      const bess::pb::RandomSplitCommandSetDroprateArg &arg);
-  CommandResponse CommandSetGates(
-      const bess::pb::RandomSplitCommandSetGatesArg &arg);
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
@@ -41,8 +37,8 @@ class RandomSplit final : public Module {
     std::vector<gate_idx_t> gates;
   };
 
-  // "<name>/settings" (D-129): validated as set_droprate and set_gates do,
-  // and a gate must fit a gate index (the commands narrow it unchecked).
+  // "<name>/settings" (D-129): validated as the setters did,
+  // and a gate must fit a gate index.
   static std::expected<Settings, std::string> StageSettings(
       const bess::pb::RandomSplitArg &arg);
   void ApplySettings(const Settings &settings);

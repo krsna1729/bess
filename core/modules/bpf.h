@@ -29,11 +29,6 @@ class BPF final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  CommandResponse GetInitialArg(const bess::pb::EmptyArg &);
-  CommandResponse CommandAdd(const bess::pb::BPFArg &arg);
-  CommandResponse CommandDelete(const bess::pb::BPFArg &arg);
-  CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
-
  private:
   // Compiled filters this object owns: its destructor frees their code.
   struct OwnedFilters {
@@ -65,8 +60,8 @@ class BPF final : public Module {
   void ProcessBatch1Filter(Context *ctx, bess::PacketBatch *batch);
 
   std::vector<bess::utils::Filter> filters_;
-  // The filters as given, in order (control side): "<name>/filters" reads
-  // it back. The legacy commands keep it in step with filters_.
+  // The filters as given, in order (control side): "<name>/filters" reads it
+  // back and writes it whole.
   bess::pb::BPFArg arg_;
   // "<name>/filters" (D-129): the whole filter list; setting it replaces the
   // list. Paused workers: ProcessBatch reads filters_ in place.

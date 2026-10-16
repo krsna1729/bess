@@ -12,7 +12,7 @@
 #include <gflags/gflags.h>
 
 #include "dataplane/batch_tuning.h"
-#include "bessctl.h"
+#include "api_server.h"
 #include "bessctl/cli.h"
 #include "bessd.h"
 #include "cli_mode.h"
@@ -169,14 +169,15 @@ int main(int argc, char *argv[]) {
 
   rte_eal_mp_wait_lcore();
 
-  // Nothing along the normal shutdown path (`daemon stop` -> PauseAll then
-  // KillBess, or a bare KillBess) stops the workers: KillBess() only
-  // schedules an async server shutdown, so we get here with worker threads
-  // alive (paused, or still running if killed without a pause) and still
-  // registered as RCU readers. Stop them in order -- pause, quit, join, which
-  // also unregisters each reader -- before static destruction tears down the
-  // runtime (and its RcuDomain) under them. Detaching them instead left live
-  // readers behind and aborted on the domain's registered-reader check.
+  // The normal shutdown path -- Admin.Shutdown's detached thread, or the
+  // SIGTERM/SIGINT watcher -- only closes the event log and stops the server
+  // (server->Shutdown with a 3 s deadline); nothing there stops or joins a
+  // worker. So we get here with worker threads alive (paused by the client
+  // before it asked, or still running) and still registered as RCU readers.
+  // Stop them in order -- pause, quit, join, which also unregisters each
+  // reader -- before static destruction tears down the runtime (and its
+  // RcuDomain) under them. Detaching them instead left live readers behind and
+  // aborted on the domain's registered-reader check.
   destroy_all_workers();
 
   LOG(INFO) << "BESS daemon has been gracefully shut down";

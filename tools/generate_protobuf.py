@@ -50,11 +50,6 @@ def main() -> int:
             generated_root_path / stem.parent / f'{stem.name}.grpc.pb.cc',
             generated_root_path / stem.parent / f'{stem.name}.grpc.pb.h',
         ]
-    elif mode == 'python':
-        generated = [
-            generated_root_path / stem.parent / f'{stem.name}_pb2.py',
-            generated_root_path / stem.parent / f'{stem.name}_pb2_grpc.py',
-        ]
     else:
         print(f'unsupported protobuf mode: {mode}', file=sys.stderr)
         return 2

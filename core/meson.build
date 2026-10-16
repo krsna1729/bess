@@ -116,7 +116,7 @@ execution_sources = files(
 )
 
 host_sources = files(
-  'bessctl.cc',
+  'api_server.cc',
   'cli_mode.cc',
   'bessd.cc',
   'debug.cc',
@@ -751,7 +751,6 @@ unit_test_sources = [
   'control/metrics_exposition_test.cc',
   'control/pressure_monitor_test.cc',
   'control/scheduling_constraints_test.cc',
-  'bessctl_wire_ranges_test.cc',
   'cli_mode_test.cc',
   'bessd_test.cc',
   'gate_test.cc',
@@ -779,12 +778,10 @@ unit_test_sources = [
   'modules/vif_test.cc',
   'modules/packet_store_test.cc',
   'modules/measure_test.cc',
-  'modules/port_out_test.cc',
   'modules/port_inc_test.cc',
   'modules/queue_inc_test.cc',
   'modules/source_test.cc',
   'modules/flowgen_test.cc',
-  'modules/static_nat_test.cc',
   'modules/bypass_test.cc',
   'modules/buffer_test.cc',
   'modules/generic_decap_test.cc',
@@ -889,7 +886,6 @@ foreach source : (get_option('build_tests') ? unit_test_sources : [])
   integration_test = (
     source.startswith('control/') or
     source == 'bessd_test.cc' or
-    source == 'bessctl_wire_ranges_test.cc' or
     source == 'registry_test.cc'
   )
   # Tests that only use library code link the libraries normally, so the

@@ -38,15 +38,9 @@ std::string BurstError(uint64_t burst) {
 
 }  // namespace
 
-// The setters edit what "settings" holds: legacy only (D-129).
-const Commands Source::cmds = {
-    {"set_pkt_size", "SourceCommandSetPktSizeArg",
-     MODULE_CMD_FUNC(&Source::CommandSetPktSize), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
-    {"set_burst", "SourceCommandSetBurstArg",
-     MODULE_CMD_FUNC(&Source::CommandSetBurst), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
-};
+// "settings" (SourceSettings) holds packet size and burst; the class has no
+// actions.
+const Commands Source::cmds = {};
 
 const ResourceTables Source::resource_tables = {
     ResourceTable::Singleton<bess::pb::SourceSettings>("settings")};
@@ -69,12 +63,10 @@ CommandResponse Source::Init(const bess::pb::SourceArg &arg) {
   }
 
   if (arg.has_burst()) {
-    bess::pb::SourceCommandSetBurstArg burst;
-    burst.set_burst(arg.burst());
-    CommandResponse err = CommandSetBurst(burst);
-    if (err.error().code() != 0) {
-      return err;
+    if (std::string err = BurstError(arg.burst()); !err.empty()) {
+      return CommandFailure(EINVAL, "%s", err.c_str());
     }
+    burst_.store(arg.burst(), std::memory_order_relaxed);
   }
 
   // Applied live: both fields are relaxed atomics the task reads once per
@@ -111,26 +103,6 @@ CommandResponse Source::Init(const bess::pb::SourceArg &arg) {
 
 void Source::DeInit() {
   settings_.Release();
-}
-
-CommandResponse Source::CommandSetBurst(
-    const bess::pb::SourceCommandSetBurstArg &arg) {
-  if (std::string err = BurstError(arg.burst()); !err.empty()) {
-    return CommandFailure(EINVAL, "%s", err.c_str());
-  }
-  burst_.store(arg.burst(), std::memory_order_relaxed);
-
-  return CommandSuccess();
-}
-
-CommandResponse Source::CommandSetPktSize(
-    const bess::pb::SourceCommandSetPktSizeArg &arg) {
-  uint64_t val = arg.pkt_size();
-  if (std::string err = PktSizeError(val); !err.empty()) {
-    return CommandFailure(EINVAL, "%s", err.c_str());
-  }
-  pkt_size_.store(val, std::memory_order_relaxed);
-  return CommandSuccess();
 }
 
 struct task_result Source::RunTask(Context *ctx, bess::PacketBatch *batch,

@@ -15,11 +15,9 @@
 
 using bess::metadata::mt_offset_t;
 
-const Commands SetMetadata::cmds = {
-    {"get_initial_arg", "EmptyArg",
-     MODULE_CMD_FUNC(&SetMetadata::GetInitialArg), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY, Command::READS},
-};
+// No resources and no actions: the attributes are the init argument, which
+// GetPipeline's Module.arg carries back (D-129).
+const Commands SetMetadata::cmds = {};
 
 CommandResponse SetMetadata::AddAttrOne(
     const bess::pb::SetMetadataArg_Attribute &attr) {
@@ -132,12 +130,7 @@ CommandResponse SetMetadata::Init(const bess::pb::SetMetadataArg &arg) {
     }
   }
 
-  init_arg_ = arg;
   return CommandSuccess();
-}
-
-CommandResponse SetMetadata::GetInitialArg(const bess::pb::EmptyArg &) {
-  return CommandSuccess(init_arg_);
 }
 
 template <size_t N>  // N == 0: attr->size at run time

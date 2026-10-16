@@ -13,15 +13,10 @@
 
 using bess::utils::be32_t;
 
-// D-129: "<name>/fields" holds the field list; add and clear stay for the
-// legacy ModuleCommand only.
-const Commands SequentialUpdate::cmds = {
-    {"add", "SequentialUpdateArg",
-     MODULE_CMD_FUNC(&SequentialUpdate::CommandAdd), Command::THREAD_UNSAFE,
-     "", Command::LEGACY_ONLY},
-    {"clear", "EmptyArg", MODULE_CMD_FUNC(&SequentialUpdate::CommandClear),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-};
+// D-140: every legacy command is gone. "<name>/fields" holds the field list
+// (the whole list, as SequentialUpdateArg); the creation argument is
+// GetPipeline's Module.arg.
+const Commands SequentialUpdate::cmds = {};
 
 const ResourceTables SequentialUpdate::resource_tables = {
     ResourceTable::Singleton<sample::supdate::pb::SequentialUpdateArg>("fields",
@@ -29,7 +24,7 @@ const ResourceTables SequentialUpdate::resource_tables = {
 
 CommandResponse
 SequentialUpdate::Init(const sample::supdate::pb::SequentialUpdateArg &arg) {
-  CommandResponse ret = CommandAdd(arg);
+  CommandResponse ret = AddFields(arg);
   if (ret.has_error()) {
     return ret;
   }
@@ -124,7 +119,7 @@ CommandResponse SequentialUpdate::ParseField(
   return CommandSuccess();
 }
 
-CommandResponse SequentialUpdate::CommandAdd(
+CommandResponse SequentialUpdate::AddFields(
     const sample::supdate::pb::SequentialUpdateArg &arg) {
   size_t curr = num_vars_;
   if (curr + arg.fields_size() > kMaxVariable) {
@@ -141,12 +136,6 @@ CommandResponse SequentialUpdate::CommandAdd(
 
   num_vars_ = curr + arg.fields_size();
   arg_.mutable_fields()->MergeFrom(arg.fields());
-  return CommandSuccess();
-}
-
-CommandResponse SequentialUpdate::CommandClear(const bess::pb::EmptyArg &) {
-  num_vars_ = 0;
-  arg_.Clear();
   return CommandSuccess();
 }
 

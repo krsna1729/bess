@@ -32,8 +32,6 @@ class MPLSPop final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  CommandResponse CommandSet(const bess::pb::MplsPopArg &arg);
-
  private:
   be16_t next_ether_type_;
   bool remove_eth_header_;

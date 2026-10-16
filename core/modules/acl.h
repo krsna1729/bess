@@ -45,12 +45,9 @@ class ACL final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  CommandResponse CommandAdd(const bess::pb::ACLArg &arg);
-  CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
-
  private:
-  // The rule list is one immutable object published through an RcuPtr:
-  // `add`, `clear` and the "<name>/rules" resource publish a replacement
+  // The rule list is one immutable object published through an RcuPtr: init
+  // and the "<name>/rules" resource publish a replacement
   // while workers keep processing (G1.2 mode G; ACLs here are small,
   // scanned first-match). A batch reads it once. Decision D-017
   // (docs/decisions.md)

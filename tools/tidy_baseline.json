@@ -8,9 +8,6 @@
   ],
   "clang_tidy_major": 19,
   "files": {
-    "core/bessctl.cc": {
-      "cppcoreguidelines-narrowing-conversions": 4
-    },
     "core/bessd.cc": {
       "cert-err33-c": 2,
       "cppcoreguidelines-narrowing-conversions": 1
@@ -115,7 +112,7 @@
     "core/modules/flowgen.cc": {
       "bugprone-implicit-widening-of-multiplication-result": 1,
       "bugprone-integer-division": 1,
-      "cppcoreguidelines-narrowing-conversions": 8
+      "cppcoreguidelines-narrowing-conversions": 7
     },
     "core/modules/generic_decap.cc": {
       "cppcoreguidelines-narrowing-conversions": 1
@@ -137,24 +134,22 @@
     },
     "core/modules/port_inc.cc": {
       "bugprone-implicit-widening-of-multiplication-result": 1,
-      "cppcoreguidelines-narrowing-conversions": 1,
       "performance-no-int-to-ptr": 1
     },
     "core/modules/queue.cc": {
       "bugprone-implicit-widening-of-multiplication-result": 1,
-      "cppcoreguidelines-narrowing-conversions": 3
+      "cppcoreguidelines-narrowing-conversions": 2
     },
     "core/modules/queue_inc.cc": {
       "bugprone-implicit-widening-of-multiplication-result": 1,
-      "cppcoreguidelines-narrowing-conversions": 1,
       "performance-no-int-to-ptr": 1
     },
     "core/modules/round_robin.cc": {
-      "cppcoreguidelines-narrowing-conversions": 2
+      "cppcoreguidelines-narrowing-conversions": 1
     },
     "core/modules/source.cc": {
       "bugprone-implicit-widening-of-multiplication-result": 1,
-      "cppcoreguidelines-narrowing-conversions": 4
+      "cppcoreguidelines-narrowing-conversions": 3
     },
     "core/modules/split.cc": {
       "cppcoreguidelines-narrowing-conversions": 1

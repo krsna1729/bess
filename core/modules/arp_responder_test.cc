@@ -24,12 +24,11 @@ using bess::testing::PacketBuilder;
 // output: the reply comes from the entry's MAC, to the asker.
 TEST(ArpResponderTest, AnswersARequestForAnEntry) {
   ModuleHarness h;
-  Module *arp = h.Create("ArpResponder", bess::pb::ArpResponderArg());
-  ASSERT_NE(nullptr, arp);
   bess::pb::ArpResponderArg entry;
   entry.set_ip("1.2.3.4");
   entry.set_mac_addr("A0:22:33:44:55:66");
-  h.MustCommand(arp, "add", entry);
+  Module *arp = h.Create("ArpResponder", entry);
+  ASSERT_NE(nullptr, arp);
 
   const Bytes request = PacketBuilder()
                             .Ether("ff:ff:ff:ff:ff:ff", "02:1e:67:9f:4d:ae")
@@ -173,28 +172,17 @@ TEST(ArpResponderResourceTest, EntriesRefuseBadKeysAndValues) {
   EXPECT_EQ("", h.ReadBackDiffers(entries, {}));
 }
 
-// `add` is legacy only; what it and the init argument add is what the
-// resource reads back.
-TEST(ArpResponderResourceTest, AddIsLegacyOnly) {
+// The init argument's entry is an entry like any other (D-129).
+TEST(ArpResponderResourceTest, InitEntryIsAnEntry) {
   ModuleHarness h;
   bess::pb::ArpResponderArg init;
   init.set_ip("1.2.3.4");
   init.set_mac_addr("a0:22:33:44:55:66");
   Module *arp = h.Create("ArpResponder", init);
   ASSERT_NE(nullptr, arp);
-  const std::string entries = arp->name() + "/entries";
-
-  bess::pb::ArpResponderArg add;
-  add.set_ip("5.6.7.8");
-  add.set_mac_addr("02:00:00:00:00:08");
-  EXPECT_EQ(ENOTSUP, h.Action(arp, "add", add).error().code());
-  h.MustCommand(arp, "add", add);
-  const ArpResponderEntryKey init_key = EntryKey("1.2.3.4");
-  const ArpResponderEntryValue init_value = EntryValue("a0:22:33:44:55:66");
-  const ArpResponderEntryKey added_key = EntryKey("5.6.7.8");
-  const ArpResponderEntryValue added_value = EntryValue("02:00:00:00:00:08");
-  EXPECT_EQ("", h.ReadBackDiffers(entries, {{&init_key, &init_value},
-                                            {&added_key, &added_value}}));
+  const ArpResponderEntryKey key = EntryKey("1.2.3.4");
+  const ArpResponderEntryValue value = EntryValue("a0:22:33:44:55:66");
+  EXPECT_EQ("", h.ReadBackDiffers(arp->name() + "/entries", {{&key, &value}}));
 }
 
 }  // namespace

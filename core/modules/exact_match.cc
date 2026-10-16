@@ -26,28 +26,10 @@
 
 namespace classifier = bess::classifier;
 
-// LEGACY_ONLY (D-129): the rules are the "<name>/rules" resource, the default
-// gate the "<name>/settings" resource, and the creation argument GetPipeline's
-// Module.arg.
-const Commands ExactMatch::cmds = {
-    {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&ExactMatch::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
-    {"get_runtime_config", "EmptyArg",
-     MODULE_CMD_FUNC(&ExactMatch::GetRuntimeConfig), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY, Command::READS},
-    {"set_runtime_config", "ExactMatchConfig",
-     MODULE_CMD_FUNC(&ExactMatch::SetRuntimeConfig), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
-    {"add", "ExactMatchCommandAddArg", MODULE_CMD_FUNC(&ExactMatch::CommandAdd),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
-    {"delete", "ExactMatchCommandDeleteArg",
-     MODULE_CMD_FUNC(&ExactMatch::CommandDelete), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
-    {"clear", "EmptyArg", MODULE_CMD_FUNC(&ExactMatch::CommandClear),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
-    {"set_default_gate", "ExactMatchCommandSetDefaultGateArg",
-     MODULE_CMD_FUNC(&ExactMatch::CommandSetDefaultGate), Command::THREAD_SAFE,
-     "", Command::LEGACY_ONLY}};
+// D-140: every legacy command is gone. The rules are the "<name>/rules"
+// resource and the default gate the "<name>/settings" resource; the creation
+// argument is GetPipeline's Module.arg.
+const Commands ExactMatch::cmds = {};
 
 const ResourceTables ExactMatch::resource_tables = {
     ResourceTable::Map<bess::pb::ExactMatchRuleKey,
@@ -95,26 +77,6 @@ bool ConvertMask(uint64_t raw, int size, bool is_packet,
   out->resize(static_cast<size_t>(size));
   std::memcpy(out->data(), &converted, static_cast<size_t>(size));
   return true;
-}
-
-// Action-mode commands use the same writer and reference ledger as the
-// transaction RPC. A direct table mutation would leave stale incoming counts.
-CommandResponse ApplyRuleOps(bess::dataplane::TransactionEngine &engine,
-                             std::span<const bess::dataplane::Op> ops) {
-  auto result = engine.Apply(ops);
-  using Outcome = bess::dataplane::TransactionEngine::Outcome;
-  if (result.outcome == Outcome::kApplied) {
-    return CommandSuccess();
-  }
-  if (result.outcome == Outcome::kBusy) {
-    return CommandFailure(EBUSY, "transaction reclamation is behind readers");
-  }
-  for (const auto &op : result.ops) {
-    if (!op.error.empty()) {
-      return CommandFailure(EINVAL, "%s", op.error.c_str());
-    }
-  }
-  return CommandFailure(EINVAL, "rule transaction was rejected");
 }
 
 // The generic path: extract every key with the generation's plan, then look
@@ -294,11 +256,9 @@ bool ExactMatch::ComputeLayout(bool tolerate_invalid_metadata,
 
   layout->key_size = 0;
   layout->key_fields.clear();
-  layout->converted_masks.clear();
   layout->baked_offsets.clear();
   layout->metadata_valid = true;
   layout->key_fields.reserve(field_specs_.size());
-  layout->converted_masks.reserve(field_specs_.size());
   layout->baked_offsets.reserve(field_specs_.size());
 
   size_t pos = 0;
@@ -363,10 +323,9 @@ bool ExactMatch::ComputeLayout(bool tolerate_invalid_metadata,
       return false;
     }
     if (!is_default) {
-      field.normalization.mask = converted;
+      field.normalization.mask = std::move(converted);
     }
     layout->key_fields.push_back(std::move(field));
-    layout->converted_masks.push_back(std::move(converted));
     layout->baked_offsets.push_back(baked);
     pos += static_cast<size_t>(spec.size);
   }
@@ -494,8 +453,7 @@ ExactMatch::GenerationPtr ExactMatch::Build(
 
   auto gen = std::make_unique<Generation>(
       default_gate, std::move(*plan), std::move(table), layout.key_size,
-      /*extraction_valid=*/true, std::move(layout.converted_masks),
-      std::move(layout.baked_offsets));
+      /*extraction_valid=*/true, std::move(layout.baked_offsets));
 
   // The fused kernel (D-121) takes a key that is exactly one packet field of
   // 1, 2, 4 or 8 bytes, checked against the first segment (kCheck).
@@ -542,8 +500,7 @@ ExactMatch::GenerationPtr ExactMatch::BuildDegraded(
 
   return std::make_unique<Generation>(
       default_gate, std::move(*plan), std::move(table), layout.key_size,
-      /*extraction_valid=*/false, std::move(layout.converted_masks),
-      std::move(layout.baked_offsets));
+      /*extraction_valid=*/false, std::move(layout.baked_offsets));
 }
 
 void ExactMatch::RefreshForResume() {
@@ -639,8 +596,9 @@ bool ExactMatch::Publish(
 CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
   action_mode_ = !arg.action_resource().empty();
   action_resource_ = arg.action_resource();
-  empty_masks_ = arg.masks_size() == 0;
-  if (arg.fields_size() != arg.masks_size() && !empty_masks_) {
+  // No masks at all means "match every bit" for every field.
+  const bool empty_masks = arg.masks_size() == 0;
+  if (arg.fields_size() != arg.masks_size() && !empty_masks) {
     return CommandFailure(EINVAL,
                           "must provide masks for all fields (or no masks for "
                           "default match on all bits on all fields)");
@@ -652,7 +610,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
   for (auto i = 0; i < arg.fields_size(); ++i) {
     CommandResponse err;
 
-    if (empty_masks_) {
+    if (empty_masks) {
       bess::pb::FieldData emptymask;
       err = AddFieldOne(arg.fields(i), emptymask, i);
     } else {
@@ -829,8 +787,8 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
     }
   }
 
-  // The default gate as the singleton "<name>/settings" (D-129): what
-  // set_default_gate validates and sets. Applied while workers run: a relaxed
+  // The default gate as the singleton "<name>/settings" (D-129): the gate is
+  // validated by the resource's codec. Applied while workers run: a relaxed
   // store into the published generation, which workers read once per batch.
   if (auto registered = settings_.Register(
           init_context().resources(), init_context().codecs(),
@@ -888,240 +846,6 @@ void ExactMatch::DeInit() {
   }
   binding_.Reset();
   resource_.reset();
-}
-
-// Retrieves an ExactMatchArg that would reconstruct this module.
-CommandResponse ExactMatch::GetInitialArg(const bess::pb::EmptyArg &) {
-  bess::pb::ExactMatchArg r;
-
-  const Generation *gen = published_.Read();
-  for (size_t i = 0; i < field_specs_.size(); i++) {
-    const FieldSpec &spec = field_specs_[i];
-    bess::pb::Field *ret_field = r.add_fields();
-    if (!spec.by_offset) {
-      ret_field->set_attr_name(spec.attr_name);
-    } else {
-      ret_field->set_offset(spec.offset);
-    }
-    ret_field->set_num_bytes(spec.size);
-    if (!empty_masks_) {
-      bess::pb::FieldData *ret_mask = r.add_masks();
-      // Masks are serialized in the converted (table-applied) byte order,
-      // matching the legacy ExactMatchField::mask dump.
-      const char *ptr =
-          reinterpret_cast<const char *>(gen->converted_masks[i].data());
-      ret_mask->set_value_bin(ptr, static_cast<size_t>(spec.size));
-    }
-  }
-  if (action_mode_) {
-    r.set_action_resource(action_resource_);
-  }
-  if (initial_default_gate_) {
-    r.set_default_gate(*initial_default_gate_);
-  }
-  return CommandSuccess(r);
-}
-
-// Retrieves an ExactMatchConfig that would restore this module's
-// runtime configuration.
-CommandResponse ExactMatch::GetRuntimeConfig(const bess::pb::EmptyArg &) {
-  bess::pb::ExactMatchConfig r;
-  using rule_t = bess::pb::ExactMatchCommandAddArg;
-
-  const Generation *gen = published_.Read();
-  r.set_default_gate(gen->default_gate.load(std::memory_order_relaxed));
-  // The table is the source of truth: each key is the rule's fields packed
-  // in field order.
-  table_->ForEach([&](classifier::ConstBytes key, uint64_t value) {
-    rule_t *out = r.add_rules();
-    if (action_mode_) {
-      out->set_action_id(static_cast<uint32_t>(value));
-    } else {
-      out->set_gate(value);
-    }
-    size_t pos = 0;
-    for (const FieldSpec &spec : field_specs_) {
-      bess::pb::FieldData *field = out->add_fields();
-      // See GetInitialArg above for why we only set_value_bin here.
-      field->set_value_bin(reinterpret_cast<const char *>(key.data() + pos),
-                           static_cast<size_t>(spec.size));
-      pos += static_cast<size_t>(spec.size);
-    }
-  });
-  std::sort(r.mutable_rules()->begin(), r.mutable_rules()->end(),
-            [](const rule_t &a, const rule_t &b) {
-              // Primary sort key is the rule's value (gate or action id).
-              const uint64_t av = a.gate() != 0 ? a.gate() : a.action_id();
-              const uint64_t bv = b.gate() != 0 ? b.gate() : b.action_id();
-              if (av != bv) {
-                return av < bv;
-              }
-              // After that, sort by value-to-be-matched, in field order.
-              for (int i = 0; i < a.fields_size(); i++) {
-                if (a.fields(i).value_bin() != b.fields(i).value_bin()) {
-                  return a.fields(i).value_bin() < b.fields(i).value_bin();
-                }
-              }
-              // Huh: a, b exactly equal - should not happen unless
-              // std::sort() is poor.
-              return false;
-            });
-  return CommandSuccess(r);
-}
-
-Error ExactMatch::RuleValueFromPb(
-    const bess::pb::ExactMatchCommandAddArg &arg, uint64_t *value) const {
-  if (action_mode_) {
-    // A rule names an action: the value is its id, and `gate` is not used.
-    if (arg.gate() != 0) {
-      return std::make_pair(
-          EINVAL, "this ExactMatch names actions ('action_resource' is set): "
-                  "a rule carries 'action_id', not 'gate'");
-    }
-    if (arg.action_id() == 0) {
-      return std::make_pair(EINVAL, "'action_id' is required (id 0 is not a "
-                                    "valid action)");
-    }
-    *value = arg.action_id();
-    return std::make_pair(0, std::string());
-  }
-  // Validate the 64-bit wire value before narrowing: gate_idx_t is 16-bit, so
-  // a post-cast check would accept e.g. 65536 as gate 0.
-  if (!bess::IsValidGateValue(arg.gate())) {
-    return std::make_pair(
-        EINVAL,
-        bess::utils::Format("Invalid gate: %llu",
-                            static_cast<unsigned long long>(arg.gate())));
-  }
-  if (arg.action_id() != 0) {
-    return std::make_pair(
-        EINVAL, "'action_id' needs an 'action_resource' on this ExactMatch");
-  }
-  *value = arg.gate();
-  return std::make_pair(0, std::string());
-}
-
-Error ExactMatch::RuleFromPb(const bess::pb::ExactMatchCommandAddArg &arg,
-                             Rule *rule) {
-  uint64_t value = 0;
-  Error ret = RuleValueFromPb(arg, &value);
-  if (ret.first) {
-    return ret;
-  }
-
-  if (arg.fields_size() == 0) {
-    return std::make_pair(EINVAL, "'fields' must be a list");
-  }
-
-  ret = RuleFieldsFromPb(arg.fields(), &rule->fields);
-  if (ret.first) {
-    return ret;
-  }
-  rule->value = value;
-
-  return std::make_pair(0, std::string());
-}
-
-// Gate mode restores a fresh table in one swap. In action mode rules may name
-// live actions: reconcile them through one transaction so the engine sees
-// every reference change. As with the transaction RPC, its operations become
-// visible in dependency order, not all at once.
-CommandResponse ExactMatch::SetRuntimeConfig(
-    const bess::pb::ExactMatchConfig &arg) {
-  if (!bess::IsValidGateValue(arg.default_gate())) {
-    return CommandFailure(
-        EINVAL, "Invalid default gate: %llu",
-        static_cast<unsigned long long>(arg.default_gate()));
-  }
-  const gate_idx_t default_gate = static_cast<gate_idx_t>(arg.default_gate());
-
-  // A whole-configuration restore: one of the few deliberate rebuilds (G1.2
-  // mode G, bulk load). Build a fresh table, then publish it in one step.
-  std::vector<std::pair<std::vector<std::byte>, uint64_t>> rules;
-  rules.reserve(static_cast<size_t>(arg.rules_size()));
-  for (auto i = 0; i < arg.rules_size(); i++) {
-    Rule rule;
-    std::vector<std::byte> key;
-    Error ret = RuleFromPb(arg.rules(i), &rule);
-    if (!ret.first) {
-      ret = PackKey(rule.fields, &key);
-    }
-    if (ret.first) {
-      return CommandFailure(ret.first, "%s", ret.second.c_str());
-    }
-    rules.emplace_back(std::move(key), rule.value);
-  }
-  if (action_mode_) {
-    using bess::dataplane::Op;
-    std::map<std::string, uint64_t, std::less<>> desired;
-    for (const auto &[key, value] : rules) {
-      desired[std::string(reinterpret_cast<const char *>(key.data()),
-                          key.size())] = value;
-    }
-    std::vector<Op> ops;
-    ops.reserve(table_->size() + desired.size());
-    table_->ForEach([&](classifier::ConstBytes key, uint64_t value) {
-      const std::string_view packed(reinterpret_cast<const char *>(key.data()),
-                                    key.size());
-      auto it = desired.find(packed);
-      if (it == desired.end()) {
-        ops.push_back(Op::Erase(resource_->name(), std::string(packed)));
-      } else {
-        if (it->second != value) {
-          ops.push_back(Op::Upsert(resource_->name(), it->first,
-                                   std::any(it->second)));
-        }
-        desired.erase(it);
-      }
-    });
-    for (const auto &[key, value] : desired) {
-      ops.push_back(Op::Upsert(resource_->name(), key, std::any(value)));
-    }
-    if (!ops.empty()) {
-      KeyLayout layout;
-      Error err;
-      if (!ComputeLayout(/*tolerate_invalid_metadata=*/false, &layout, &err)) {
-        return CommandFailure(err.first, "%s", err.second.c_str());
-      }
-      CommandResponse applied = ApplyRuleOps(bess::dataplane::EngineOf(init_context().resources()), ops);
-      if (applied.error().code() != 0) {
-        return applied;
-      }
-    }
-    if (published_.Read()->default_gate.load(std::memory_order_relaxed) !=
-        default_gate) {
-      bess::pb::ExactMatchCommandSetDefaultGateArg gate;
-      gate.set_gate(default_gate);
-      return CommandSetDefaultGate(gate);
-    }
-    return CommandSuccess();
-  }
-  // Duplicates collapse to one rule with the last value, as inserting them
-  // into the table always did.
-  auto table = FillTable(rules.size(), [&](classifier::ConcurrentExactTable &t) {
-    for (const auto &[key, value] : rules) {
-      if (t.Upsert(classifier::ConstBytes(key.data(), key.size()), value) ==
-          classifier::ConcurrentExactTable::UpsertResult::kFull) {
-        return false;
-      }
-    }
-    return true;
-  });
-  if (!table) {
-    return CommandFailure(table.error().first, "%s",
-                          table.error().second.c_str());
-  }
-
-  Error err;
-  auto next_table = *table;
-  const bool published = Publish([&](const Generation &) {
-    return Build(next_table, default_gate, &err);
-  }, &err);
-  if (!published) {
-    return CommandFailure(err.first, "%s", err.second.c_str());
-  }
-  table_ = std::move(next_table);
-  return CommandSuccess();
 }
 
 // The packet path's per-batch decision, shared by ProcessBatch and
@@ -1282,121 +1006,6 @@ Error ExactMatch::RuleFieldsFromPb(
   }
 
   return std::make_pair(0, std::string());
-}
-
-// add/delete/clear write the shared table in place (G1.2 mode C): one
-// rte_hash operation each, with workers reading throughout. No generation is
-// built -- except the rare, amortized growth in EnsureCapacity.
-CommandResponse ExactMatch::CommandAdd(
-    const bess::pb::ExactMatchCommandAddArg &arg) {
-  Rule rule;
-  Error ret = RuleFromPb(arg, &rule);
-  std::vector<std::byte> key;
-  if (!ret.first) {
-    ret = PackKey(rule.fields, &key);
-  }
-  if (ret.first) {
-    return CommandFailure(ret.first, "%s", ret.second.c_str());
-  }
-  if (action_mode_) {
-    const std::string packed(reinterpret_cast<const char *>(key.data()),
-                             key.size());
-    const bess::dataplane::Op op = bess::dataplane::Op::Upsert(
-        resource_->name(), packed, std::any(rule.value));
-    return ApplyRuleOps(bess::dataplane::EngineOf(init_context().resources()), std::span(&op, 1));
-  }
-  if (!EnsureCapacity(/*force=*/false, &ret)) {
-    return CommandFailure(ret.first, "%s", ret.second.c_str());
-  }
-  const classifier::ConstBytes k(key.data(), key.size());
-  using classifier::ConcurrentExactTable;
-  if (table_->Upsert(k, rule.value) == ConcurrentExactTable::UpsertResult::kFull) {
-    // Full inside the headroom: a burst of deletes still in their grace
-    // period outran it (or displacement ran out of room). Grow rather than
-    // refuse.
-    if (!EnsureCapacity(/*force=*/true, &ret)) {
-      return CommandFailure(ret.first, "%s", ret.second.c_str());
-    }
-    if (table_->Upsert(k, rule.value) ==
-        ConcurrentExactTable::UpsertResult::kFull) {
-      return CommandFailure(ENOSPC, "rule table is full");
-    }
-  }
-  return CommandSuccess();
-}
-
-CommandResponse ExactMatch::CommandDelete(
-    const bess::pb::ExactMatchCommandDeleteArg &arg) {
-  if (arg.fields_size() == 0) {
-    return CommandFailure(EINVAL, "argument must be a list");
-  }
-
-  std::vector<std::vector<uint8_t>> fields;
-  Error ret = RuleFieldsFromPb(arg.fields(), &fields);
-  std::vector<std::byte> key;
-  if (!ret.first) {
-    ret = PackKey(fields, &key);
-  }
-  if (ret.first) {
-    return CommandFailure(ret.first, "%s", ret.second.c_str());
-  }
-  if (action_mode_) {
-    const std::string packed(reinterpret_cast<const char *>(key.data()),
-                             key.size());
-    if (!resource_->Contains(packed)) {
-      return CommandFailure(ENOENT, "rule doesn't exist");
-    }
-    const bess::dataplane::Op op =
-        bess::dataplane::Op::Erase(resource_->name(), packed);
-    return ApplyRuleOps(bess::dataplane::EngineOf(init_context().resources()), std::span(&op, 1));
-  }
-  if (!table_->Erase(classifier::ConstBytes(key.data(), key.size()))) {
-    return CommandFailure(ENOENT, "rule doesn't exist");
-  }
-  return CommandSuccess();
-}
-
-CommandResponse ExactMatch::CommandClear(const bess::pb::EmptyArg &) {
-  // Rules go, the default gate stays -- what ClearRules() did to the live
-  // table. Deleted in place, rule by rule; workers never stop reading.
-  if (action_mode_) {
-    std::vector<bess::dataplane::Op> ops;
-    ops.reserve(table_->size());
-    table_->ForEach([&](classifier::ConstBytes key, uint64_t) {
-      ops.push_back(bess::dataplane::Op::Erase(
-          resource_->name(),
-          std::string(reinterpret_cast<const char *>(key.data()), key.size())));
-    });
-    return ops.empty() ? CommandSuccess()
-                       : ApplyRuleOps(bess::dataplane::EngineOf(init_context().resources()), ops);
-  }
-  std::vector<std::vector<std::byte>> keys;
-  keys.reserve(table_->size());
-  table_->ForEach([&](classifier::ConstBytes key, uint64_t) {
-    keys.emplace_back(key.begin(), key.end());
-  });
-  for (const auto &key : keys) {
-    table_->Erase(classifier::ConstBytes(key.data(), key.size()));
-  }
-  return CommandSuccess();
-}
-
-CommandResponse ExactMatch::CommandSetDefaultGate(
-    const bess::pb::ExactMatchCommandSetDefaultGateArg &arg) {
-  if (!bess::IsValidGateValue(arg.gate())) {
-    return CommandFailure(EINVAL, "Invalid gate: %llu",
-                          static_cast<unsigned long long>(arg.gate()));
-  }
-  const gate_idx_t gate = static_cast<gate_idx_t>(arg.gate());
-  Error err;
-  const bool published = Publish([&](const Generation &current) {
-    return Build(current.table, gate, &err);
-  }, &err);
-  if (!published) {
-    return CommandFailure(err.first, "%s", err.second.c_str());
-  }
-
-  return CommandSuccess();
 }
 
 ADD_MODULE(ExactMatch, "em", "Multi-field classifier with an exact match table")

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The C++ client for BESS's generic control API (control_v2), with the same
-// guarantees as the Go SDK (sdk/go) and Python's pybess.sdk
-// (docs/control-sdk.md):
+// guarantees as the Go SDK (sdk/go, docs/control-sdk.md):
 //
 //  - one request id per logical transaction, kept across retries;
 //  - after a send without an answer the outcome is asked for, never assumed,

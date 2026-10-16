@@ -2,8 +2,7 @@
 
 // PortInc's "<name>/settings" singleton (D-129) in process: the burst set
 // through the resource's codec is what each receive asks the port for, it
-// reads back canonically, a burst set_burst refuses is refused, and set_burst
-// and get_initial_arg are legacy only.
+// reads back canonically, and a burst set_burst refuses is refused.
 
 #include <gtest/gtest.h>
 
@@ -117,26 +116,6 @@ TEST_F(PortIncSettingsTest, AppliesLive) {
   ModuleHarness h;
   ASSERT_NE(nullptr, h.Create("PortInc", Arg(), "pi"));
   EXPECT_FALSE(RequiresPausedWorkers("pi/settings"));
-}
-
-TEST_F(PortIncSettingsTest, SetBurstAndInitialArgAreLegacyOnly) {
-  ModuleHarness h;
-  Module *inc = h.Create("PortInc", Arg(), "pi");
-  ASSERT_NE(nullptr, inc);
-  bess::pb::PortIncCommandSetBurstArg burst;
-  burst.set_burst(2);
-  EXPECT_EQ(ENOTSUP, h.Action(inc, "set_burst", burst).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(inc, "get_initial_arg", bess::pb::EmptyArg()).error().code());
-  // The legacy commands still run, and the resource reads what they set.
-  h.MustCommand(inc, "set_burst", burst);
-  const bess::pb::PortIncSettings s = Settings(2);
-  EXPECT_EQ("", h.ReadBackDiffers("pi/settings", {{nullptr, &s}}));
-  bess::pb::PortIncCommandSetBurstArg too_big;
-  too_big.set_burst(bess::PacketBatch::kMaxBurst + 1);
-  EXPECT_EQ(EINVAL, h.Command(inc, "set_burst", too_big).error().code());
-  bess::pb::PortIncArg back;
-  ASSERT_TRUE(h.MustCommand(inc, "get_initial_arg", bess::pb::EmptyArg()).UnpackTo(&back));
-  EXPECT_EQ("port-inc-test", back.port());
 }
 
 }  // namespace

@@ -22,10 +22,10 @@ using bess::framework::ExactMatchTable;
 // Splits packets across output gates by a hash of L2/L3/L4 or chosen fields.
 //
 // The configuration (mode, gate list, field layout) is one immutable object
-// published through an RcuPtr: the legacy `set_mode` and `set_gates` and the
-// "<name>/settings" resource (HashLBSettings, D-129) build a replacement and
-// publish it while workers keep processing (G1.2 mode G; the configuration
-// is small and changes rarely). A batch reads it once.
+// published through an RcuPtr: the "<name>/settings" resource (HashLBSettings,
+// D-129) builds a replacement and publishes it while workers keep processing
+// (G1.2 mode G; the configuration is small and changes rarely). A batch reads
+// it once.
 // Decision D-017 (docs/decisions.md)
 class HashLB final : public Module {
  public:
@@ -46,10 +46,6 @@ class HashLB final : public Module {
   std::string GetDesc() const override;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
-
-  CommandResponse CommandSetMode(const bess::pb::HashLBCommandSetModeArg &arg);
-  CommandResponse CommandSetGates(
-      const bess::pb::HashLBCommandSetGatesArg &arg);
 
  private:
   enum class Mode { kL2, kL3, kL4, kOther };

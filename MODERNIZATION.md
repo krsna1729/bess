@@ -30,9 +30,11 @@ propose it unprompted.
   with `tools/bootstrap_dpdk.py`.  It reads the single pinned source record
   in `deps/dpdk.json`, verifies the SHA256 before extraction, and installs the
   pkg-config file under `deps/dpdk-<ver>/install/lib/pkgconfig/`.
-- **Python dependencies are still external** in a fresh shell.  Install
-  `requirements.txt` with the environment's package manager before running
-  Python tests.  Meson generates all protobuf stubs in its build tree.
+- **Python is not part of the runtime or the clients.** `bessd`, `bessctl`, the
+  C++ SDK and the tools are C++; the Go SDK is Go. pybess, the Python bessctl,
+  `requirements.txt` and the installer's `python` mode left with D-140
+  (2026-10-16). The build and the checks do use `python3` from the standard
+  library (Meson, `tools/*.py`); no third-party Python package is needed.
 - **Commit author identity**: the WSL sandbox auto-set a wrong identity
   (`root@PARAM.localdomain`). Environment-specific -- on the Arch machine this
   session moved to, commits are authored correctly (`Saikrishna Edupuganti

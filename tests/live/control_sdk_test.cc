@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-// The C++ control SDK against a live bessd (was
-// bessctl/module_tests/control_sdk.py, which drove pybess.sdk): a transaction
+// The C++ control SDK against a live bessd: a transaction
 // steers packets, a stale one changes nothing, an erase returns them to the
 // default gate. Black-box recovery, through the daemon's real transport with
 // ApplyTransaction's fate scripted: an answer lost after the daemon applied is

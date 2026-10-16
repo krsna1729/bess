@@ -280,23 +280,9 @@ std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::RunTask(Module *m,
   return out;
 }
 
-CommandResponse ModuleHarness::Command(Module *m, const std::string &command,
-                                       const google::protobuf::Message &arg) {
-  return m->RunCommand(command, Pack(arg));
-}
-
-google::protobuf::Any ModuleHarness::MustCommand(Module *m, const std::string &command,
-                                                 const google::protobuf::Message &arg) {
-  CommandResponse r = Command(m, command, arg);
-  EXPECT_EQ(0, r.error().code()) << command << " " << arg.ShortDebugString() << ": "
-                                 << r.error().errmsg();
-  return r.data();
-}
-
 CommandResponse ModuleHarness::Action(Module *m, const std::string &action,
                                       const google::protobuf::Message &arg) {
-  return m->module_builder()->RunCommand(m, action, Pack(arg),
-                                         ModuleBuilder::CommandSurface::kActions);
+  return m->module_builder()->RunCommand(m, action, Pack(arg));
 }
 
 namespace {
@@ -440,6 +426,20 @@ std::string ModuleHarness::ReadBackDiffers(
     }
   }
   return "";
+}
+
+const framework::ResourceCodec *ModuleHarness::Codec(const std::string &resource) {
+  const dataplane::Resource *r = runtime::runtime().transactions().FindResource(resource);
+  return r == nullptr ? nullptr : framework::ResourceBindings::ProcessDefault().Find(*r);
+}
+
+std::string ModuleHarness::Apply(const std::vector<dataplane::Op> &ops) {
+  const dataplane::TransactionEngine::Result result =
+      runtime::runtime().transactions().Apply(std::span<const dataplane::Op>(ops));
+  if (result.outcome == dataplane::TransactionEngine::Outcome::kApplied) {
+    return "";
+  }
+  return result.ops.empty() || result.ops[0].error.empty() ? "refused" : result.ops[0].error;
 }
 
 }  // namespace bess::testing

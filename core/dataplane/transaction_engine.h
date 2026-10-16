@@ -188,10 +188,9 @@ class TransactionEngine {
 
   // Advances on every applied transaction and on AdvanceGeneration().
   uint64_t generation() const;
-  // Records a change to resource state made outside a transaction (a legacy
-  // command, an action that edits a resource; D-129), so that a writer that
-  // read the old state fails its expected generation instead of undoing the
-  // change.
+  // Records a change to resource state made outside a transaction (an action
+  // that edits a resource; D-129), so that a writer that read the old state
+  // fails its expected generation instead of undoing the change.
   void AdvanceGeneration();
   // The registered resource with this name, or null. The pointer is valid
   // while it stays registered (callers hold the control-plane lock).
@@ -316,12 +315,6 @@ class TransactionEngine {
   std::array<std::atomic<uint64_t>, kOutcomes> outcome_counts_{};
   std::atomic<uint64_t> busy_retried_{0};
 };
-
-// The engine behind a registry: for the control plane and in-tree code that
-// applies transactions (a module's legacy commands), never for plugins.
-inline TransactionEngine &EngineOf(ResourceRegistry &registry) noexcept {
-  return registry.engine_;
-}
 
 }  // namespace dataplane
 }  // namespace bess

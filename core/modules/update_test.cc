@@ -2,7 +2,7 @@
 
 // Update in process: each field overwrites `size` bytes at `offset` with its
 // value. D-129: "<name>/fields" holds the whole field list (setting it
-// replaces the list), and add/clear are legacy-only.
+// replaces the list); `add` and `clear` went with the legacy service (D-140).
 
 #include <gtest/gtest.h>
 
@@ -96,32 +96,10 @@ TEST(UpdateTest, FieldsResourceReplacesTheList) {
   EXPECT_EQ("", h.ReadBackDiffers(fields, {{nullptr, &two}})) << "refused sets change nothing";
   EXPECT_EQ(expected, Through(h, u, zeros));
 
-  // The legacy add appends to the same list.
-  h.MustCommand(u, "add", Fields({{.offset = 20, .size = 1, .value = 0x22}}));
-  const auto three = Fields({{.offset = 0, .size = 2, .value = 0xabcd},
-                             {.offset = 10, .size = 1, .value = 0x7f},
-                             {.offset = 20, .size = 1, .value = 0x22}});
-  EXPECT_EQ("", h.ReadBackDiffers(fields, {{nullptr, &three}}));
-  expected[20] = 0x22;
-  EXPECT_EQ(expected, Through(h, u, zeros));
-
   const bess::pb::UpdateArg none;
   EXPECT_EQ("", h.SetResource(fields, none));
   EXPECT_EQ(zeros, Through(h, u, zeros));
   EXPECT_EQ("", h.ReadBackDiffers(fields, {{nullptr, &none}}));
-}
-
-// add and clear edit "<name>/fields": control_v2's InvokeAction refuses them.
-TEST(UpdateTest, CommandsAreLegacyOnly) {
-  ModuleHarness h;
-  Module *u = h.Create("Update", bess::pb::UpdateArg());
-  ASSERT_NE(nullptr, u);
-  const auto one = Fields({{.offset = 0, .size = 1, .value = 1}});
-  EXPECT_EQ(ENOTSUP, h.Action(u, "add", one).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(u, "clear", bess::pb::EmptyArg()).error().code());
-  const Bytes zeros(60, 0);
-  EXPECT_EQ(zeros, Through(h, u, zeros)) << "the refused add did nothing";
-  EXPECT_EQ(0, h.Command(u, "add", one).error().code());
 }
 
 }  // namespace

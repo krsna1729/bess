@@ -85,14 +85,4 @@ TEST(VLANPushSettingsTest, RequiresPausedWorkers) {
   EXPECT_TRUE(RequiresPausedWorkers("vp/settings"));
 }
 
-TEST(VLANPushSettingsTest, SetTciIsLegacyOnly) {
-  ModuleHarness h;
-  Module *m = h.Create("VLANPush", Tci(5), "vp");
-  ASSERT_NE(nullptr, m);
-  EXPECT_EQ(ENOTSUP, h.Action(m, "set_tci", Tci(7)).error().code());
-  h.MustCommand(m, "set_tci", Tci(7));
-  const bess::pb::VLANPushArg s = Tci(7);
-  EXPECT_EQ("", h.ReadBackDiffers("vp/settings", {{nullptr, &s}}));
-}
-
 }  // namespace

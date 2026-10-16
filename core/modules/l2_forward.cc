@@ -54,24 +54,17 @@ static int parse_mac_addr(const char *str, char *addr) {
 
 /******************************************************************************/
 
-// LEGACY_ONLY (D-129): the entries are the "<name>/macs" resource and the
-// default gate the "<name>/settings" singleton. lookup answers; populate is a
-// test/bench generator.
+// The entries are the "<name>/macs" resource and the default gate the
+// "<name>/settings" singleton (D-129). lookup answers; populate is a
+// test/bench generator that fills the same table, so it advances the resource
+// generation.
 const Commands L2Forward::cmds = {
-    {"add", "L2ForwardCommandAddArg", MODULE_CMD_FUNC(&L2Forward::CommandAdd),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
-    {"delete", "L2ForwardCommandDeleteArg",
-     MODULE_CMD_FUNC(&L2Forward::CommandDelete), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
-    {"set_default_gate", "L2ForwardCommandSetDefaultGateArg",
-     MODULE_CMD_FUNC(&L2Forward::CommandSetDefaultGate), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
     {"lookup", "L2ForwardCommandLookupArg",
      MODULE_CMD_FUNC(&L2Forward::CommandLookup), Command::THREAD_SAFE,
      "L2ForwardCommandLookupResponse"},
     {"populate", "L2ForwardCommandPopulateArg",
      MODULE_CMD_FUNC(&L2Forward::CommandPopulate), Command::THREAD_SAFE, "",
-     Command::ACTION, Command::EDITS},
+     /*edits_resources=*/true},
 };
 
 const ResourceTables L2Forward::resource_tables = {
@@ -163,7 +156,7 @@ CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
 
-  // "<name>/settings": what set_default_gate sets. An atomic store, so
+  // "<name>/settings": the default gate. An atomic store, so
   // workers keep running.
   if (auto registered = settings_.Register(
           init_context().resources(), init_context().codecs(), name() + "/settings",
@@ -229,110 +222,8 @@ void L2Forward::ClassifyBatch(const bess::PacketBatch *batch, gate_idx_t *gates)
   }
 }
 
-namespace {
-
-// Gates are int64 on the wire: check before narrowing (65536 is not gate 0,
-// -1 is not gate 65535). DROP_GATE (8192) fits the slot's 15-bit field.
-bool ValidWireGate(int64_t gate) {
-  return gate >= 0 && bess::IsValidGateValue(static_cast<uint64_t>(gate));
-}
-
-}  // namespace
-
-// add/delete/populate change the table in place while workers keep reading
-// (G1.2 mode C; one-word slots need no grace period). Each
-// command validates everything first, and add undoes its earlier inserts if a
-// later one fails for lack of space, so a refused command leaves the table as
-// it was. That is command-level all-or-nothing, not dataplane atomicity:
-// entries become visible to packets one by one as they are inserted, and a
-// rolled-back add may have been seen briefly. All-or-nothing changes across
-// tables are what G1.2b transactions add (referential, or scope-snapshot for a
-// scope table: D-050); these commands promise neither.
-CommandResponse L2Forward::CommandAdd(
-    const bess::pb::L2ForwardCommandAddArg &arg) {
-  std::vector<std::pair<uint64_t, gate_idx_t>> entries;
-  entries.reserve(static_cast<size_t>(arg.entries_size()));
-  std::unordered_set<uint64_t> seen;  // duplicates within the request
-  seen.reserve(static_cast<size_t>(arg.entries_size()));
-  for (int i = 0; i < arg.entries_size(); i++) {
-    const auto &entry = arg.entries(i);
-    if (!entry.addr().length()) {
-      return CommandFailure(EINVAL,
-                            "add list item map must contain addr as a string");
-    }
-    const char *str_addr = entry.addr().c_str();
-    char addr[6];
-    if (parse_mac_addr(str_addr, addr) != 0) {
-      return CommandFailure(EINVAL, "%s is not a proper mac address", str_addr);
-    }
-    if (!ValidWireGate(entry.gate())) {
-      return CommandFailure(EINVAL, "Invalid gate: %lld",
-                            static_cast<long long>(entry.gate()));
-    }
-    const uint64_t mac = MacKey(addr);
-    if (table_->Lookup(mac) != 0) {
-      return CommandFailure(EEXIST, "MAC address '%s' already exist", str_addr);
-    }
-    if (!seen.insert(mac).second) {
-      return CommandFailure(EEXIST, "MAC address '%s' given twice", str_addr);
-    }
-    entries.emplace_back(mac, static_cast<gate_idx_t>(entry.gate()));
-  }
-
-  for (size_t i = 0; i < entries.size(); i++) {
-    if (table_->Insert(entries[i].first, static_cast<uint16_t>(entries[i].second + 1), 0) ==
-        Table::kNotFound) {
-      // Out of space part-way: take back what this command added.
-      for (size_t j = 0; j < i; j++) {
-        table_->Erase(table_->Find(entries[j].first));
-      }
-      return CommandFailure(ENOMEM, "Not enough space");
-    }
-  }
-  return CommandSuccess();
-}
-
-CommandResponse L2Forward::CommandDelete(
-    const bess::pb::L2ForwardCommandDeleteArg &arg) {
-  std::vector<uint64_t> macs;
-  macs.reserve(static_cast<size_t>(arg.addrs_size()));
-  for (int i = 0; i < arg.addrs_size(); i++) {
-    const auto &_addr = arg.addrs(i);
-    if (!_addr.length()) {
-      return CommandFailure(EINVAL, "lookup must be list of string");
-    }
-    const char *str_addr = _addr.c_str();
-    char addr[6];
-    if (parse_mac_addr(str_addr, addr) != 0) {
-      return CommandFailure(EINVAL, "%s is not a proper mac address", str_addr);
-    }
-    const uint64_t mac = MacKey(addr);
-    if (table_->Find(mac) == Table::kNotFound) {
-      return CommandFailure(ENOENT, "MAC address '%s' does not exist",
-                            str_addr);
-    }
-    macs.push_back(mac);
-  }
-  for (const uint64_t mac : macs) {
-    const uint32_t slot = table_->Find(mac);
-    if (slot != Table::kNotFound) {  // a duplicate in the request is gone already
-      table_->Erase(slot);
-    }
-  }
-  return CommandSuccess();
-}
-
-CommandResponse L2Forward::CommandSetDefaultGate(
-    const bess::pb::L2ForwardCommandSetDefaultGateArg &arg) {
-  if (!ValidWireGate(arg.gate())) {
-    return CommandFailure(EINVAL, "Invalid gate: %lld",
-                          static_cast<long long>(arg.gate()));
-  }
-  default_gate_.store(static_cast<gate_idx_t>(arg.gate()),
-                      std::memory_order_relaxed);
-  return CommandSuccess();
-}
-
+// lookup and populate read and fill the table in place while workers keep
+// reading (G1.2 mode C; one-word slots need no grace period).
 CommandResponse L2Forward::CommandLookup(
     const bess::pb::L2ForwardCommandLookupArg &arg) {
   bess::pb::L2ForwardCommandLookupResponse ret;

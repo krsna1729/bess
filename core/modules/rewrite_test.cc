@@ -2,8 +2,8 @@
 
 // Rewrite in process: each packet's data is replaced by the next template,
 // round robin. D-129: "<name>/templates" holds the whole template list
-// (setting it replaces the list and restarts the round robin), and add/clear
-// are legacy-only.
+// (setting it replaces the list and restarts the round robin); `add` and
+// `clear` went with the legacy service (D-140).
 
 #include <gtest/gtest.h>
 
@@ -81,30 +81,10 @@ TEST(RewriteTest, TemplatesResourceReplacesTheList) {
   EXPECT_EQ("", h.SetResource(templates, two));
   EXPECT_EQ((std::vector<Bytes>{B(t1)}), h.Run(rw, 0, {pkt}, {0})[0]);
 
-  // The legacy add appends to the same list.
-  h.MustCommand(rw, "add", Templates({t0}));
-  const auto three = Templates({t1, t2, t0});
-  EXPECT_EQ("", h.ReadBackDiffers(templates, {{nullptr, &three}}));
-  EXPECT_EQ((std::vector<Bytes>{B(t2), B(t0), B(t1)}), h.Run(rw, 0, {pkt, pkt, pkt}, {0})[0]);
-
   const bess::pb::RewriteArg none;
   EXPECT_EQ("", h.SetResource(templates, none));
   EXPECT_EQ((std::vector<Bytes>{pkt}), h.Run(rw, 0, {pkt}, {0})[0]) << "no template: unchanged";
   EXPECT_EQ("", h.ReadBackDiffers(templates, {{nullptr, &none}}));
-}
-
-// add and clear edit "<name>/templates": control_v2's InvokeAction refuses
-// them.
-TEST(RewriteTest, CommandsAreLegacyOnly) {
-  ModuleHarness h;
-  Module *rw = h.Create("Rewrite", bess::pb::RewriteArg());
-  ASSERT_NE(nullptr, rw);
-  const auto one = Templates({std::string(60, 'a')});
-  EXPECT_EQ(ENOTSUP, h.Action(rw, "add", one).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(rw, "clear", bess::pb::EmptyArg()).error().code());
-  const Bytes pkt(60, 0);
-  EXPECT_EQ((std::vector<Bytes>{pkt}), h.Run(rw, 0, {pkt}, {0})[0]) << "the refused add did nothing";
-  EXPECT_EQ(0, h.Command(rw, "add", one).error().code());
 }
 
 }  // namespace

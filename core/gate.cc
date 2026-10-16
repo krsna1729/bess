@@ -15,18 +15,15 @@
 
 namespace bess {
 
-const GateHookCommands GateHook::cmds;
-
 bool GateHookBuilder::RegisterGateHook(GateHook::constructor_t constructor,
                                        const std::string &class_name,
                                        const std::string &name_template,
                                        const std::string &help_text,
-                                       const GateHookCommands &cmds,
                                        GateHook::init_func_t init_func) {
   return all_gate_hook_builders_holder()
       .emplace(std::piecewise_construct, std::forward_as_tuple(class_name),
                std::forward_as_tuple(constructor, class_name, name_template,
-                                     help_text, cmds, init_func))
+                                     help_text, init_func))
       .second;
 }
 
@@ -85,7 +82,6 @@ GateHook *Gate::CreateGateHook(const GateHookBuilder *builder, Gate *gate,
 
   hook->set_class_name(builder->class_name());
   hook->set_name(hook_name);
-  hook->set_builder(builder);
   hook->set_arg(arg);
   hook->set_gate(gate);
   int ret = gate->AddHook(hook);
@@ -153,29 +149,6 @@ void Gate::RemoveHookByClass(const std::string &class_name) {
       return;
     }
   }
-}
-
-// TODO(torek): combine (template) with ModuleBuilder::RunCommand
-CommandResponse GateHookBuilder::RunCommand(
-    GateHook *hook, const std::string &user_cmd,
-    const google::protobuf::Any &arg) const {
-  Module *mod = hook->gate()->module();
-  for (auto &cmd : cmds_) {
-    if (user_cmd == cmd.cmd) {
-      if (cmd.mt_safe != GateHookCommand::THREAD_SAFE &&
-          mod->HasRunningWorker()) {
-        return CommandFailure(EBUSY,
-                              "There is a running worker and command "
-                              "'%s' is not MT safe",
-                              cmd.cmd.c_str());
-      }
-
-      return cmd.func(hook, arg);
-    }
-  }
-
-  return CommandFailure(ENOTSUP, "'%s' does not support command '%s'",
-                        class_name_.c_str(), user_cmd.c_str());
 }
 
 void Gate::ClearHooks() {

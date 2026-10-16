@@ -13,24 +13,13 @@
 
 #define DEFAULT_QUEUE_SIZE 1024
 
+// "settings" (QueueSettings) holds size, burst, prefetch and backpressure;
+// `get_status` is the class's one action.
 const Commands Queue::cmds = {
-    {"set_burst", "QueueCommandSetBurstArg",
-     MODULE_CMD_FUNC(&Queue::CommandSetBurst), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
-    {"set_size", "QueueCommandSetSizeArg",
-     MODULE_CMD_FUNC(&Queue::CommandSetSize), Command::THREAD_UNSAFE, "",
-     Command::LEGACY_ONLY},
     {"get_status", "QueueCommandGetStatusArg",
      MODULE_CMD_FUNC(&Queue::CommandGetStatus), Command::THREAD_SAFE,
      "QueueCommandGetStatusResponse"},
-    {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&Queue::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
-    {"get_runtime_config", "EmptyArg",
-     MODULE_CMD_FUNC(&Queue::GetRuntimeConfig), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY, Command::READS},
-    {"set_runtime_config", "QueueArg",
-     MODULE_CMD_FUNC(&Queue::SetRuntimeConfig), Command::THREAD_UNSAFE, "",
-     Command::LEGACY_ONLY}};
+};
 
 const ResourceTables Queue::resource_tables = {
     ResourceTable::Singleton<bess::pb::QueueSettings>("settings", true),
@@ -207,30 +196,6 @@ CommandResponse Queue::Init(const bess::pb::QueueArg &arg) {
   return CommandSuccess();
 }
 
-CommandResponse Queue::GetInitialArg(const bess::pb::EmptyArg &) {
-  return CommandSuccess(init_arg_);
-}
-
-CommandResponse Queue::GetRuntimeConfig(const bess::pb::EmptyArg &) {
-  bess::pb::QueueArg ret;
-  ret.set_size(size_);
-  ret.set_prefetch(prefetch_);
-  ret.set_backpressure(backpressure_);
-  return CommandSuccess(ret);
-}
-
-CommandResponse Queue::SetRuntimeConfig(const bess::pb::QueueArg &arg) {
-  if (size_ != arg.size() && arg.size() != 0) {
-    CommandResponse err = SetSize(arg.size());
-    if (err.error().code() != 0) {
-      return err;
-    }
-  }
-  prefetch_ = arg.prefetch();
-  backpressure_ = arg.backpressure();
-  return CommandSuccess();
-}
-
 void Queue::DeInit() {
   settings_.Release();
 
@@ -333,19 +298,6 @@ struct task_result Queue::RunTask(Context *ctx, bess::PacketBatch *batch,
           .bits = (total_bytes + cnt * pkt_overhead) * 8};
 }
 
-CommandResponse Queue::CommandSetBurst(
-    const bess::pb::QueueCommandSetBurstArg &arg) {
-  uint64_t burst = arg.burst();
-
-  if (burst > bess::PacketBatch::kMaxBurst) {
-    return CommandFailure(EINVAL, "burst size must be [0,%zu]",
-                          bess::PacketBatch::kMaxBurst);
-  }
-
-  burst_.store(burst, std::memory_order_relaxed);
-  return CommandSuccess();
-}
-
 CommandResponse Queue::SetSize(uint64_t size) {
   if (auto valid = ValidSize(size); !valid) {
     return CommandFailure(EINVAL, "%s", valid.error().c_str());
@@ -357,11 +309,6 @@ CommandResponse Queue::SetSize(uint64_t size) {
   }
 
   return CommandSuccess();
-}
-
-CommandResponse Queue::CommandSetSize(
-    const bess::pb::QueueCommandSetSizeArg &arg) {
-  return SetSize(arg.size());
 }
 
 CommandResponse Queue::CommandGetStatus(

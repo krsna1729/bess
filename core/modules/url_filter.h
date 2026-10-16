@@ -93,12 +93,6 @@ class UrlFilter final : public Module {
 
   std::string GetDesc() const override;
 
-  CommandResponse CommandAdd(const bess::pb::UrlFilterArg &arg);
-  CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
-  CommandResponse GetInitialArg(const bess::pb::EmptyArg &arg);
-  CommandResponse GetRuntimeConfig(const bess::pb::EmptyArg &arg);
-  CommandResponse SetRuntimeConfig(const bess::pb::UrlFilterConfig &arg);
-
  private:
   using Blacklist = std::unordered_map<std::string, Trie<std::tuple<>>>;
 
@@ -117,7 +111,7 @@ class UrlFilter final : public Module {
   std::unordered_map<Flow, FlowRecord, FlowHash> flow_cache_;
 
   // The blacklist as given, in order (control side): "<name>/blacklist"
-  // reads it back. The legacy commands keep it in step with blacklist_.
+  // reads it back.
   bess::pb::UrlFilterConfig config_;
   // "<name>/blacklist" (D-129): the whole blacklist; setting it replaces it
   // (as set_runtime_config does). Paused workers: ProcessBatch reads

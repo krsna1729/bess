@@ -18,10 +18,9 @@ namespace dataplane = bess::dataplane;
 using bess::utils::Arp;
 using bess::utils::be16_t;
 
-// LEGACY_ONLY (D-129): the entries are the "<module>/entries" resource.
-const Commands ArpResponder::cmds = {
-    {"add", "ArpResponderArg", MODULE_CMD_FUNC(&ArpResponder::CommandAdd),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY}};
+// The entries are the "<module>/entries" resource (D-129); the class has no
+// actions.
+const Commands ArpResponder::cmds = {};
 
 const ResourceTables ArpResponder::resource_tables = {
     ResourceTable::Map<bess::pb::ArpResponderEntryKey,
@@ -123,7 +122,7 @@ class ArpResponder::EntriesResource final : public dataplane::Resource {
 
 CommandResponse ArpResponder::Init(const bess::pb::ArpResponderArg &arg) {
   if (!arg.ip().empty() || !arg.mac_addr().empty()) {
-    CommandResponse added = CommandAdd(arg);
+    CommandResponse added = Add(arg);
     if (added.error().code() != 0) {
       return added;
     }
@@ -187,7 +186,8 @@ void ArpResponder::DeInit() {
   resource_.reset();
 }
 
-CommandResponse ArpResponder::CommandAdd(const bess::pb::ArpResponderArg &arg) {
+// The init argument's entry, validated before anything is installed.
+CommandResponse ArpResponder::Add(const bess::pb::ArpResponderArg &arg) {
   be32_t ip_addr;
   arp_entry entry;
 

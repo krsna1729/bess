@@ -187,7 +187,7 @@ TEST(NatModuleTest, UsageReportGivesTheCountsSoFar) {
     for (int i = 0; i < 3; i++) {
       ASSERT_EQ(1u, h.Run(nat, 0, {out}, {0, 1})[1].size());
     }
-    h.MustCommand(nat, "request_usage_report", bess::pb::EmptyArg());
+    ASSERT_EQ(0, h.Action(nat, "request_usage_report", bess::pb::EmptyArg()).error().code());
     // The report walks the table on the packet path: one more batch (a
     // packet that is dropped: an inbound one with no mapping).
     const Bytes stray = PacketBuilder()
@@ -201,7 +201,9 @@ TEST(NatModuleTest, UsageReportGivesTheCountsSoFar) {
     EXPECT_TRUE(dropped[1].empty());
 
     bess::pb::NATUsageResponse resp;
-    ASSERT_TRUE(h.MustCommand(nat, "drain_usage", bess::pb::EmptyArg()).UnpackTo(&resp));
+    CommandResponse drained = h.Action(nat, "drain_usage", bess::pb::EmptyArg());
+    ASSERT_EQ(0, drained.error().code()) << drained.error().errmsg();
+    ASSERT_TRUE(drained.data().UnpackTo(&resp));
     EXPECT_EQ(1u, resp.reports_done());
     ASSERT_EQ(1, resp.records_size());
     const auto &record = resp.records(0);
@@ -213,53 +215,12 @@ TEST(NatModuleTest, UsageReportGivesTheCountsSoFar) {
   }
 }
 
-// get_initial_arg gives back the addresses with their ranges as given, the
-// addresses sorted; there is no runtime configuration.
-TEST(NatModuleTest, InitialArgComesBackSortedAndRuntimeConfigIsEmpty) {
-  ModuleHarness h;
-  bess::pb::NATArg iconf;
-  auto *ext = iconf.add_ext_addrs();
-  ext->set_ext_addr(kPublic);
-  auto *r = ext->add_port_ranges();
-  r->set_begin(1);
-  r->set_end(1024);
-  r = ext->add_port_ranges();
-  r->set_begin(1025);
-  r->set_end(65535);
-  Module *nat = h.Create("NAT", iconf);
-  ASSERT_NE(nullptr, nat);
-
-  bess::pb::NATArg arg;
-  ASSERT_TRUE(h.MustCommand(nat, "get_initial_arg", bess::pb::EmptyArg()).UnpackTo(&arg));
-  EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(iconf, arg))
-      << arg.ShortDebugString();
-  EXPECT_TRUE(h.MustCommand(nat, "get_runtime_config", bess::pb::EmptyArg()).value().empty());
-
-  // Two addresses given out of order come back in address order.
-  bess::pb::NATArg unsorted;
-  unsorted.add_ext_addrs()->set_ext_addr("10.0.0.9");
-  unsorted.add_ext_addrs()->set_ext_addr("10.0.0.1");
-  Module *two = h.Create("NAT", unsorted);
-  ASSERT_NE(nullptr, two);
-  ASSERT_TRUE(h.MustCommand(two, "get_initial_arg", bess::pb::EmptyArg()).UnpackTo(&arg));
-  ASSERT_EQ(2, arg.ext_addrs_size());
-  EXPECT_EQ("10.0.0.1", arg.ext_addrs(0).ext_addr());
-  EXPECT_EQ("10.0.0.9", arg.ext_addrs(1).ext_addr());
-}
-
 // D-129: the usage commands are actions (drain_usage answers a
-// NATUsageResponse); get_initial_arg and the runtime-config pair are
-// legacy-only: InvokeAction refuses them, the legacy command still runs them.
-TEST(NatModuleTest, UsageCommandsAreActionsAndConfigIsLegacyOnly) {
+// NATUsageResponse).
+TEST(NatModuleTest, UsageCommandsAreActions) {
   ModuleHarness h;
   Module *nat = h.Create("NAT", Arg(64, 0, false, /*usage=*/true));
   ASSERT_NE(nullptr, nat);
-
-  for (const char *legacy : {"get_initial_arg", "get_runtime_config", "set_runtime_config"}) {
-    SCOPED_TRACE(legacy);
-    EXPECT_EQ(ENOTSUP, h.Action(nat, legacy, bess::pb::EmptyArg()).error().code());
-    h.MustCommand(nat, legacy, bess::pb::EmptyArg());
-  }
 
   CommandResponse r = h.Action(nat, "request_usage_report", bess::pb::EmptyArg());
   EXPECT_EQ(0, r.error().code()) << r.error().errmsg();

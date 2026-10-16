@@ -156,20 +156,15 @@ class ModuleBuilder {
   const std::string &init_arg_type() const { return init_arg_type_; }
 
   // The command descriptors, for introspection (name, argument and result
-  // types, thread safety, exposure). Callers that want to run a command use
+  // types, thread safety). Callers that want to run a command use
   // RunCommand().
   const Commands &cmds() const { return cmds_; }
   const ResourceTables &resource_tables() const { return resource_tables_; }
   const ResourceTable *FindResourceTable(std::string_view table) const;
 
-  // Which commands a caller reaches: the legacy ModuleCommand every command
-  // (and the generic get_initial_arg), control_v2's InvokeAction only the
-  // actions (D-129).
-  enum class CommandSurface { kLegacy, kActions };
-
+  // Runs `user_cmd` (control_v2's InvokeAction; D-140: no legacy surface).
   CommandResponse RunCommand(Module *m, const std::string &user_cmd,
-                             const google::protobuf::Any &arg,
-                             CommandSurface surface = CommandSurface::kLegacy) const;
+                             const google::protobuf::Any &arg) const;
 
   CommandResponse RunInit(Module *m, const google::protobuf::Any &arg) const;
 

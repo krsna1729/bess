@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package bess is a thin client for BESS's generic control API (control_v2,
-// roadmap M27). It has the same guarantees as Python's pybess.sdk
-// (docs/control-sdk.md): one request id per logical transaction, kept across
+// roadmap M27). It has the same guarantees as the C++ SDK (sdk/cpp,
+// docs/control-sdk.md): one request id per logical transaction, kept across
 // retries; after a send without an answer the outcome is asked for, never
 // assumed, and the request is sent again only once GetTransaction answered
 // "not known" under the daemon epoch the commit started with; an answer from

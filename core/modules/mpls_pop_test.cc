@@ -100,14 +100,4 @@ TEST(MplsPopSettingsTest, RequiresPausedWorkers) {
   EXPECT_TRUE(RequiresPausedWorkers("mp/settings"));
 }
 
-TEST(MplsPopSettingsTest, SetIsLegacyOnly) {
-  ModuleHarness h;
-  Module *m = h.Create("MPLSPop", bess::pb::EmptyArg(), "mp");
-  ASSERT_NE(nullptr, m);
-  const bess::pb::MplsPopArg s = Settings(true, 0x86dd);
-  EXPECT_EQ(ENOTSUP, h.Action(m, "set", s).error().code());
-  h.MustCommand(m, "set", s);
-  EXPECT_EQ("", h.ReadBackDiffers("mp/settings", {{nullptr, &s}}));
-}
-
 }  // namespace

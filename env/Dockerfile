@@ -11,11 +11,8 @@ RUN bash /usr/local/bin/install-bess-deps runtime && \
 
 FROM runtime AS build
 
-# The build runs Python (Meson, tools/, protobuf generation) and the Python
-# tests need the client's packages.
-COPY requirements.txt /tmp/requirements.txt
-RUN bash /usr/local/bin/install-bess-deps python /tmp/requirements.txt && \
-    bash /usr/local/bin/install-bess-deps build && \
+# The build runs Python (Meson, tools/).
+RUN bash /usr/local/bin/install-bess-deps build && \
     rm -rf /var/lib/apt/lists/*
 
 # The mounted checkout owns DPDK bootstrap and the Meson build.

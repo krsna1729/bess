@@ -26,7 +26,6 @@
 // Control path (D-129): the interfaces are the "<module>/interfaces"
 // resource (key VifInterfaceKey, value VifInterfaceValue). Workers read the
 // tables without synchronization, so the resource requires paused workers.
-// add/delete/clear stay for the legacy ModuleCommand only.
 class Vif final : public Module {
  public:
   static const gate_idx_t kNumOGates = MAX_GATES;
@@ -46,9 +45,6 @@ class Vif final : public Module {
 
   CommandResponse Init(const bess::pb::VifArg &arg);
   void DeInit() override;
-  CommandResponse CommandAdd(const bess::pb::VifCommandAddArg &arg);
-  CommandResponse CommandDelete(const bess::pb::VifCommandDeleteArg &arg);
-  CommandResponse CommandClear(const bess::pb::VifCommandClearArg &arg);
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
   std::string GetDesc() const override;
@@ -58,6 +54,9 @@ class Vif final : public Module {
 
  private:
   friend class InterfacesResource;
+
+  // The init argument's interfaces, validated before anything is installed.
+  CommandResponse Add(const bess::pb::VifCommandAddArg &arg);
 
   using InterfaceMap = std::map<uint32_t, Interface>;
   // Key: (vlan, mac as uint64)

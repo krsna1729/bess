@@ -498,9 +498,11 @@ TEST_F(SessionPipelineTest, TeardownIgnoresDestructionOrder) {
       << "a resource outlived its module";
 }
 
-// Module commands must not bypass the action-rule reference ledger. Restore
-// also checks every new action before changing the existing rules.
-TEST_F(SessionPipelineTest, ActionModeCommandsKeepReferenceCounts) {
+// A rule change must not bypass the action-rule reference ledger. A client
+// writes "em/rules"; the engine checks the rule's action and keeps the
+// reference counts. (The legacy add/delete/clear/set_runtime_config commands
+// are gone -- D-140.)
+TEST_F(SessionPipelineTest, ActionModeRulesKeepReferenceCounts) {
   Meter *mt = CreateMeterModule("mt", 16);
   Router *rt = CreateRouterModule("rt");
   ActionTable *at = CreateActionTable("at", "mt/meters", "rt/next_hops");
@@ -526,15 +528,12 @@ TEST_F(SessionPipelineTest, ActionModeCommandsKeepReferenceCounts) {
             Outcome::kApplied);
 
   bess::pb::ExactMatchArg initial;
-  ASSERT_TRUE(em->GetInitialArg(bess::pb::EmptyArg()).data().UnpackTo(&initial));
+  ASSERT_TRUE(em->initial_arg().UnpackTo(&initial));
   EXPECT_EQ(initial.action_resource(), "at/actions");
 
-  bess::pb::ExactMatchCommandAddArg rule;
-  rule.set_action_id(1);
   const std::string key = Key(Ip(10, 1, 2, 3), 0);
-  rule.add_fields()->set_value_bin(key.substr(0, 4));
-  rule.add_fields()->set_value_bin(key.substr(4));
-  ASSERT_EQ(em->CommandAdd(rule).error().code(), 0);
+  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, std::any(uint64_t{1}))}).outcome,
+            Outcome::kApplied);
   EXPECT_EQ(Engine().ReferenceCount("at/actions",
                                     bess::dataplane::EncodeKey(ActionId(1))),
             1u);
@@ -543,33 +542,38 @@ TEST_F(SessionPipelineTest, ActionModeCommandsKeepReferenceCounts) {
                 .outcome,
             Outcome::kRejected);
 
-  bess::pb::ExactMatchConfig config;
-  config.set_default_gate(DROP_GATE);
-  *config.add_rules() = rule;
-  config.mutable_rules(0)->set_action_id(99);
-  EXPECT_NE(em->SetRuntimeConfig(config).error().code(), 0);
+  // A rule naming an action that is not there is refused, and the rule it
+  // would replace keeps its reference.
+  EXPECT_EQ(Apply({Op::Upsert("em/rules", key, std::any(uint64_t{99}))}).outcome,
+            Outcome::kRejected);
   EXPECT_EQ(Engine().ReferenceCount("at/actions",
                                     bess::dataplane::EncodeKey(ActionId(1))),
             1u);
-  config.mutable_rules(0)->set_action_id(2);
-  ASSERT_EQ(em->SetRuntimeConfig(config).error().code(), 0);
+  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, std::any(uint64_t{2}))}).outcome,
+            Outcome::kApplied);
   EXPECT_EQ(Engine().ReferenceCount("at/actions",
                                     bess::dataplane::EncodeKey(ActionId(1))),
             0u);
   EXPECT_EQ(Engine().ReferenceCount("at/actions",
                                     bess::dataplane::EncodeKey(ActionId(2))),
             1u);
-  ASSERT_EQ(em->CommandClear(bess::pb::EmptyArg()).error().code(), 0);
+  // A referenced action cannot be erased: the rule still holds it.
+  EXPECT_EQ(Apply({Op::Erase("at/actions",
+                             bess::dataplane::EncodeKey(ActionId(2)))})
+                .outcome,
+            Outcome::kRejected);
+  EXPECT_EQ(Engine().ReferenceCount("at/actions",
+                                    bess::dataplane::EncodeKey(ActionId(2))),
+            1u);
+  // Erasing the rule releases it, and then the action goes.
+  ASSERT_EQ(Apply({Op::Erase("em/rules", key)}).outcome, Outcome::kApplied);
   EXPECT_EQ(Engine().ReferenceCount("at/actions",
                                     bess::dataplane::EncodeKey(ActionId(2))),
             0u);
-  ASSERT_EQ(em->CommandAdd(rule).error().code(), 0);
-  bess::pb::ExactMatchCommandDeleteArg remove;
-  *remove.mutable_fields() = rule.fields();
-  ASSERT_EQ(em->CommandDelete(remove).error().code(), 0);
-  EXPECT_EQ(Engine().ReferenceCount("at/actions",
-                                    bess::dataplane::EncodeKey(ActionId(1))),
-            0u);
+  ASSERT_EQ(Apply({Op::Erase("at/actions",
+                             bess::dataplane::EncodeKey(ActionId(2)))})
+                .outcome,
+            Outcome::kApplied);
 }
 
 TEST_F(SessionPipelineTest, RouterCodecRejectsOutOfRangePrefix) {
@@ -630,12 +634,9 @@ TEST_F(SessionPipelineTest, ActionIdsAreNotNarrowedToGateWidth) {
                                   MeterId(0), NextHopId(0)}))})
                 .outcome,
             Outcome::kApplied);
-  bess::pb::ExactMatchCommandAddArg rule;
-  rule.set_action_id(70000);
   const std::string key = Key(Ip(10, 1, 2, 3), 0);
-  rule.add_fields()->set_value_bin(key.substr(0, 4));
-  rule.add_fields()->set_value_bin(key.substr(4));
-  ASSERT_EQ(em->CommandAdd(rule).error().code(), 0);
+  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, std::any(uint64_t{70000}))}).outcome,
+            Outcome::kApplied);
   Packets packets(1);
   packets.SetKey(0, Ip(10, 1, 2, 3), 0);
   bess::PacketBatch batch = packets.Batch(0, 1);
@@ -667,10 +668,11 @@ TEST_F(SessionPipelineTest, FusedKernelMatchesTheGenericPathInActionMode) {
               Outcome::kApplied);
   }
   for (uint32_t k = 0; k < 16; k++) {
-    bess::pb::ExactMatchCommandAddArg rule;
-    rule.set_action_id(1 + k % 8);
-    rule.add_fields()->set_value_bin(Key(Ip(10, 0, 0, k), 0).substr(0, 4));
-    ASSERT_EQ(em->CommandAdd(rule).error().code(), 0);
+    // One 4-byte field: the key is that field's bytes.
+    ASSERT_EQ(Apply({Op::Upsert("em/rules", Key(Ip(10, 0, 0, k), 0).substr(0, 4),
+                                std::any(uint64_t{1 + k % 8}))})
+                  .outcome,
+              Outcome::kApplied);
   }
 
   // Packets 0-23 carry a rule's key, 24-31 none; every fourth is 29 bytes

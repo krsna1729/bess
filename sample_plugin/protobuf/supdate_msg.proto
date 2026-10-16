@@ -6,13 +6,6 @@ syntax = "proto3";
 package sample.supdate.pb;
 
 /**
- * The function `clear()` for SequentialUpdate takes no parameters and clears all
- * state in the module.
- */
-message SequentialUpdateCommandClearArg {
-}
-
-/**
  * The SequentialUpdate module rewrites a specified field (`offset` and `size`) in a packet
  * with a sequentially increased value from a specified min to max values.
  *

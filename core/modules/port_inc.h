@@ -29,7 +29,6 @@ class PortInc final : public Module {
 
   // The port it receives from; a task's argument is its queue id.
   const Port *port() const { return port_; }
-  CommandResponse GetInitialArg(const bess::pb::EmptyArg &);
 
   void DeInit() override;
 
@@ -38,14 +37,10 @@ class PortInc final : public Module {
 
   std::string GetDesc() const override;
 
-  CommandResponse CommandSetBurst(
-      const bess::pb::PortIncCommandSetBurstArg &arg);
-
  private:
   Port *port_;
   int prefetch_;
-  // Set by THREAD_SAFE commands and the settings resource while workers
-  // read it.
+  // Set by the settings resource while workers read it.
   std::atomic<int> burst_;
 
   // "<name>/settings" (the burst); after the state it sets.

@@ -6,16 +6,16 @@
 
 #include "utils/format.h"
 
-const Commands WorkerSplit::cmds = {
-    {"reset", "WorkerSplitArg", MODULE_CMD_FUNC(&WorkerSplit::CommandReset),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY}};
+// "settings" (WorkerSplitArg) holds the worker-to-gate map; the class has no
+// actions.
+const Commands WorkerSplit::cmds = {};
 
 const ResourceTables WorkerSplit::resource_tables = {
     ResourceTable::Singleton<bess::pb::WorkerSplitArg>("settings", true),
 };
 
 CommandResponse WorkerSplit::Init(const bess::pb::WorkerSplitArg &arg) {
-  CommandResponse err = CommandReset(arg);
+  CommandResponse err = Reset(arg);
   if (err.error().code() != 0) {
     return err;
   }
@@ -82,7 +82,8 @@ bess::pb::WorkerSplitArg WorkerSplit::ReadGates() const {
   return value;
 }
 
-CommandResponse WorkerSplit::CommandReset(const bess::pb::WorkerSplitArg &arg) {
+// The gates the init argument asks for, once StageGates accepts them.
+CommandResponse WorkerSplit::Reset(const bess::pb::WorkerSplitArg &arg) {
   auto gates = StageGates(arg);
   if (!gates) {
     return CommandFailure(EINVAL, "%s", gates.error().c_str());

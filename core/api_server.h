@@ -1,32 +1,22 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_BESSCTL_H_
-#define BESS_BESSCTL_H_
+#ifndef BESS_API_SERVER_H_
+#define BESS_API_SERVER_H_
 
 #include <memory>
 #include <string>
 
 namespace grpc {
 class ServerBuilder;
-class Service;
 }  // namespace grpc
 
 namespace bess::control {
-class ControlPlane;
 class HttpServer;
 }  // namespace bess::control
 
-// The legacy BESSControl service over `control_plane`, as ApiServer::Run
-// serves it beside v2: for tests that run it on an in-process channel.
-std::unique_ptr<grpc::Service> NewLegacyControlService(
-    bess::control::ControlPlane &control_plane);
-
-// gRPC server encapsulation. Usage:
-//   ApiServer server;
-//   server.Listen('0.0.0.0:777');
-//   server.Listen('127.0.0.1:888');
-//   server.run();
+// bessd's control endpoint: the control_v2 services (Control and Admin) over
+// gRPC, and over HTTP when one is given.
 class ApiServer {
  public:
   ApiServer();
@@ -43,12 +33,15 @@ class ApiServer {
   // channel to this gRPC server (D-125); stopped when Run ends.
   void ServeHttp(std::unique_ptr<bess::control::HttpServer> http);
 
-  // Runs the API server until it is shutdown by KillBess RPC.
+  // Runs the API server until Admin.Shutdown or SIGTERM/SIGINT.
   void Run();
 
  private:
-  grpc::ServerBuilder *builder_;
+  // Owned: its plugins (gRPC's reflection one among them) are freed with it,
+  // and LSan sees nothing unreachable at exit (the ASan lane runs the plugin
+  // tests with detect_leaks=1).
+  std::unique_ptr<grpc::ServerBuilder> builder_;
   std::unique_ptr<bess::control::HttpServer> http_;
 };
 
-#endif  // BESS_BESSCTL_H_
+#endif  // BESS_API_SERVER_H_

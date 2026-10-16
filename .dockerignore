@@ -1,5 +1,4 @@
 **
-!requirements.txt
 !env/
 !env/Dockerfile
 !env/install-deps.sh

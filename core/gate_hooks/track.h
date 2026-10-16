@@ -12,14 +12,11 @@
 // TrackGate counts the number of packets, batches and bytes seen by a gate.
 //
 // The counts are K6 worker-local counters: each worker adds to its own slot
-// with no lock, a batch's three counts are one grouped update (a reading
-// never sees a batch's packets without its bytes), and reset is a
-// controller-side baseline, so it needs no worker pause.
+// with no lock, and a batch's three counts are one grouped update (a reading
+// never sees a batch's packets without its bytes).
 class Track final : public bess::GateHook {
  public:
   Track();
-
-  static const GateHookCommands cmds;
 
   CommandResponse Init(const bess::Gate *, const bess::pb::TrackArg &);
 
@@ -39,8 +36,6 @@ class Track final : public bess::GateHook {
   void set_track_bytes(bool track) { track_bytes_ = track; }
 
   void ProcessBatch(const bess::PacketBatch *batch);
-
-  CommandResponse CommandReset(const bess::pb::EmptyArg &);
 
   static constexpr uint16_t kPriority = 0;
   static const std::string kName;

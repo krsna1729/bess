@@ -19,6 +19,8 @@
 
 #include "runtime/runtime_state.h"
 #include "dataplane/transaction_engine.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
 #include "module.h"
 #include "module_graph.h"
 #include "modules/exact_match.h"
@@ -85,12 +87,21 @@ TransactionEngine::Result Apply(std::vector<Op> ops) {
   return Engine().Apply(ops);
 }
 
-size_t RuleCount(WildcardMatch *wm) {
-  bess::pb::WildcardMatchConfig config;
-  CommandResponse r = wm->GetRuntimeConfig(bess::pb::EmptyArg());
-  EXPECT_FALSE(r.has_error());
-  EXPECT_TRUE(r.data().UnpackTo(&config));
-  return static_cast<size_t>(config.rules_size());
+// The number of rules the module's "<name>/rules" resource holds (the table
+// the transaction engine writes and the packet path reads).
+size_t RuleCount(const std::string &module) {
+  const bess::dataplane::Resource *r =
+      bess::runtime::runtime().transactions().FindResource(module + "/rules");
+  EXPECT_NE(nullptr, r) << module;
+  const bess::framework::ResourceCodec *codec =
+      r == nullptr ? nullptr : bess::framework::ResourceBindings::ProcessDefault().Find(*r);
+  EXPECT_NE(nullptr, codec) << module;
+  size_t rules = 0;
+  if (codec != nullptr) {
+    codec->Entries(
+        [&](const google::protobuf::Message &, const google::protobuf::Message &) { rules++; });
+  }
+  return rules;
 }
 
 class Packets {
@@ -146,7 +157,7 @@ TEST_F(WildcardMatchTransactionTest, RulesAreAResourceWhileTheModuleExists) {
   WildcardMatch *wm = CreateWm("wm");
   ASSERT_EQ(Apply({Add("wm", kAll, 0, 10, 0, 1, 5)}).outcome,
             Outcome::kApplied);
-  EXPECT_EQ(RuleCount(wm), 1u);
+  EXPECT_EQ(RuleCount(wm->name()), 1u);
   Packets packets(2);
   packets.Set(0, 10, 99);
   packets.Set(1, 11, 99);
@@ -171,7 +182,7 @@ TEST_F(WildcardMatchTransactionTest, RulesAreAResourceWhileTheModuleExists) {
   EXPECT_EQ(Apply({Add("wm", kAll, 0, 10, 0, 1, 5)}).outcome,
             Outcome::kRejected);
   WildcardMatch *again = CreateWm("wm");
-  EXPECT_EQ(RuleCount(again), 0u);
+  EXPECT_EQ(RuleCount(again->name()), 0u);
 }
 
 // The invariant a pending rule must keep: inside the publication window
@@ -227,12 +238,12 @@ TEST_F(WildcardMatchTransactionTest, RejectionLeavesNothingBehind) {
                   Add("wm", kAll, 0, 30, 0, 2, MAX_GATES + 3)});
   ASSERT_EQ(r.outcome, Outcome::kRejected);
   EXPECT_EQ(packets.Classify(wm, 0, 3), before);
-  EXPECT_EQ(RuleCount(wm), 1u);
+  EXPECT_EQ(RuleCount(wm->name()), 1u);
   // The masks it created are dropped by the next change, command or
   // transaction.
   ASSERT_EQ(Apply({Add("wm", kAll, 0, 31, 0, 1, 2)}).outcome,
             Outcome::kApplied);
-  EXPECT_EQ(RuleCount(wm), 2u);
+  EXPECT_EQ(RuleCount(wm->name()), 2u);
   EXPECT_EQ(packets.Classify(wm, 0, 3), before);
 }
 
@@ -257,22 +268,17 @@ TEST_F(WildcardMatchTransactionTest, OneTransactionAcrossModuleKinds) {
   EXPECT_EQ(packets.Classify(wm, 0, 1)[0], 8);
 }
 
-// Commands and transactions write the same rules; a tuple table grows inside
-// a transaction; freed rule ids come back once the cascade runs.
+// Transactions write the module's rules; a tuple table grows inside a
+// transaction; freed rule ids come back once the cascade runs.
 TEST_F(WildcardMatchTransactionTest, CommandsGrowthAndIdReuse) {
   WildcardMatch *wm = CreateWm("wm");
-  bess::pb::WildcardMatchCommandAddArg add;
-  add.set_gate(3);
-  add.set_priority(1);
-  const std::string v = Bytes(50, 0), m = Bytes(kAll, 0);
-  add.add_values()->set_value_bin(v.substr(0, 4));
-  add.add_values()->set_value_bin(v.substr(4, 2));
-  add.add_masks()->set_value_bin(m.substr(0, 4));
-  add.add_masks()->set_value_bin(m.substr(4, 2));
-  ASSERT_FALSE(wm->CommandAdd(add).has_error());
+  // A rule over the module's two fields, as the client's codec packs it
+  // (D-140: the legacy `add` command is gone).
+  ASSERT_EQ(Apply({Add("wm", kAll, 0, 50, 0, 1, 3)}).outcome,
+            Outcome::kApplied);
   ASSERT_EQ(Apply({Remove("wm", kAll, 0, 50, 0)}).outcome,
             Outcome::kApplied);
-  EXPECT_EQ(RuleCount(wm), 0u);
+  EXPECT_EQ(RuleCount("wm"), 0u);
 
   // 3000 rules in one mask, from an empty tuple: several growths.
   std::vector<Op> ops;
@@ -280,7 +286,7 @@ TEST_F(WildcardMatchTransactionTest, CommandsGrowthAndIdReuse) {
     ops.push_back(Add("wm", kAll, kPort, a, 1, 1, 1 + a % 60));
   }
   ASSERT_EQ(Engine().Apply(ops).outcome, Outcome::kApplied);
-  EXPECT_EQ(RuleCount(wm), 3000u);
+  EXPECT_EQ(RuleCount(wm->name()), 3000u);
   Packets packets(32);
   for (uint32_t first = 0; first < 3000; first += 32) {
     for (uint32_t i = 0; i < 32; i++) {
@@ -303,7 +309,7 @@ TEST_F(WildcardMatchTransactionTest, CommandsGrowthAndIdReuse) {
       ASSERT_EQ(packets.Classify(wm, 0, 1)[0], gate);
     }
   }
-  EXPECT_EQ(RuleCount(wm), 3000u);
+  EXPECT_EQ(RuleCount(wm->name()), 3000u);
 }
 
 // The adapter returns every id a commit frees, through the engine's removal
@@ -400,7 +406,7 @@ TEST_F(WildcardMatchTransactionTest, LookupsWhileTransactionsRun) {
   domain.Unregister(kReader);
   EXPECT_EQ(wrong.load(), 0u);
   EXPECT_GT(hits.load(), 0u);
-  EXPECT_EQ(RuleCount(wm), kLive);
+  EXPECT_EQ(RuleCount(wm->name()), kLive);
 }
 
 }  // namespace

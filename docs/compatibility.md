@@ -6,8 +6,9 @@ reads (roadmap M26).
 
 ## Wire protocol (gRPC / protobuf)
 
-The protobuf API (`protobuf/`, both the legacy `BESSControl` service and the
-generic `bess.pb.v2.Control`) is the primary compatibility boundary.
+The protobuf API (`protobuf/`) is the primary compatibility boundary: the
+generic `bess.pb.v2.Control` service. The legacy `BESSControl` service is gone
+(D-140), so its methods are no longer served.
 
 - Changes are wire- and JSON-compatible: `buf breaking` (rule set
   `WIRE_JSON`, `buf.yaml`) runs on every pull request against the target
@@ -17,9 +18,9 @@ generic `bess.pb.v2.Control`) is the primary compatibility boundary.
 - Removed meanings keep their numbers: a value that no longer applies stays
   defined and documented as never sent (for example
   `TransactionRecord.VISIBILITY_ATOMIC`), so old clients still decode.
-- Clients in other languages can implement the protocol from the `.proto`
-  files alone; `pybess.sdk` is a convenience and correctness layer over it
-  (docs/control-sdk.md), not a second protocol.
+- Clients in other languages implement the protocol from the `.proto` files
+  alone; the Go SDK (`sdk/go`) and the C++ SDK (`sdk/cpp`) are convenience and
+  correctness layers over it (docs/control-sdk.md), not a second protocol.
 
 ## C++ source API
 

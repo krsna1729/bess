@@ -11,35 +11,25 @@
 
 #include "message.h"
 
-// TODO(torek): refactor; instead of "module command" and "gate command"
-// we should just have "command".  The constraint right now is that the
-// commands to a module or gate-hook instance are redirected through
-// the underlying builder (module) or factory (gate-hook), which
-// get in the way here.
+// A module class's commands are its actions (D-129, D-140): operations that
+// run through ModuleBuilder::RunCommand, which control_v2's InvokeAction calls.
 
 class Module;
-namespace bess {
-class GateHook;
-};  // namespace bess
 
 using module_cmd_func_t =
     pb_func_t<CommandResponse, Module, google::protobuf::Any>;
-using gate_hook_cmd_func_t =
-    pb_func_t<CommandResponse, bess::GateHook, google::protobuf::Any>;
 
-// Describes a single command that can be issued to a module
-// or gate hook (according to cmd_func_t).
+// Describes a single command that can be issued to a module.
 //
-// A module class's commands are its actions (D-129): operations that are not
-// state -- lookups, statistics, clearing counters -- which control_v2's
-// InvokeAction runs and GetSchema lists. A command that edits state a
-// resource now holds is LEGACY_ONLY: the legacy ModuleCommand still runs it
-// (pybess, .bess scripts), control_v2 neither lists nor runs it, and it
-// leaves with the legacy service.
+// A module class's commands are its actions (D-129, D-140): operations that
+// are not state -- lookups, statistics, clearing counters -- which control_v2's
+// InvokeAction runs and GetSchema lists. An action does not *hold* state: what
+// it reads and writes lives in the module's resources. One action may write a
+// resource outside a transaction (L2Forward's populate), and it says so with
+// edits_resources so its write moves the resource generation (see below).
 template <typename cmd_func_t>
 struct GenericCommand {
   enum ThreadSafety { THREAD_UNSAFE = 0, THREAD_SAFE = 1 };
-  enum Exposure { ACTION = 0, LEGACY_ONLY = 1 };
 
   std::string cmd;
   std::string arg_type;
@@ -53,28 +43,19 @@ struct GenericCommand {
   // answers nothing.
   std::string result_type{};
 
-  Exposure exposure = ACTION;
-
   // Whether running it can change a resource's contents, which advances the
-  // resource generation (D-129). DEFAULT: a LEGACY_ONLY command edits (that is
-  // why it is legacy-only), an action does not. READS marks a legacy-only
-  // reader (get_runtime_config), EDITS an action that edits a resource
-  // (L2Forward's populate).
-  enum Effect { DEFAULT = 0, READS = 1, EDITS = 2 };
-  Effect effect = DEFAULT;
+  // resource generation (D-129): an action that edits a resource, such as
+  // L2Forward's populate.
+  bool edits_resources = false;
 
-  bool EditsResources() const {
-    return effect == EDITS || (effect == DEFAULT && exposure == LEGACY_ONLY);
-  }
+  bool EditsResources() const { return edits_resources; }
 };
 
 // Command and Commands are specifically *module* commands - these should
-// be ModuleCommand and ModuleCommands, but they got there first.
+// be ModuleCommand and ModuleCommands, but they got there first. Gate hooks
+// have no command surface (D-140): their classes take no commands.
 using Command = GenericCommand<module_cmd_func_t>;
 using Commands = std::vector<Command>;
-
-using GateHookCommand = GenericCommand<gate_hook_cmd_func_t>;
-using GateHookCommands = std::vector<GateHookCommand>;
 
 // A resource table every module of a class registers as "<module>/<table>"
 // (D-129), declared with the class so that GetSchema lists it and desired

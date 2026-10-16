@@ -24,16 +24,9 @@ static inline int is_valid_gate(gate_idx_t gate) {
 // THREAD_SAFE: route changes are applied to the live table by its single
 // serialized writer while workers keep looking up (K7; DPDK's lock-free
 // reader design plus the runtime's QSBR for tbl8 reclamation), so workers are
-// never paused for a route change. LEGACY_ONLY (D-129): the routes are the
-// "<name>/routes" resource.
-const Commands IPLookup::cmds = {
-    {"add", "IPLookupCommandAddArg", MODULE_CMD_FUNC(&IPLookup::CommandAdd),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY},
-    {"delete", "IPLookupCommandDeleteArg",
-     MODULE_CMD_FUNC(&IPLookup::CommandDelete), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
-    {"clear", "EmptyArg", MODULE_CMD_FUNC(&IPLookup::CommandClear),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY}};
+// never paused for a route change.
+// "<name>/routes" holds the routes; the class has no actions.
+const Commands IPLookup::cmds = {};
 
 const ResourceTables IPLookup::resource_tables = {
     ResourceTable::Map<bess::pb::IPLookupRouteKey, bess::pb::IPLookupRouteValue>(
@@ -182,75 +175,6 @@ ParsedPrefix IPLookup::ParseIpv4Prefix(const std::string &prefix,
         be32_t(0));
   }
   return std::make_tuple(0, "", net_addr);
-}
-
-CommandResponse IPLookup::CommandAdd(
-    const bess::pb::IPLookupCommandAddArg &arg) {
-  // uint64 on the wire: check before narrowing (65536 + g used to route to g).
-  if (!bess::IsValidGateValue(arg.gate())) {
-    return CommandFailure(EINVAL, "Invalid gate: %llu",
-                          static_cast<unsigned long long>(arg.gate()));
-  }
-  gate_idx_t gate = static_cast<gate_idx_t>(arg.gate());
-  uint64_t prefix_len = arg.prefix_len();
-  ParsedPrefix prefix = ParseIpv4Prefix(arg.prefix(), prefix_len);
-  if (std::get<0>(prefix)) {
-    return CommandFailure(std::get<0>(prefix), "%s",
-                          std::get<1>(prefix).c_str());
-  }
-
-  if (!is_valid_gate(gate)) {
-    return CommandFailure(EINVAL, "Invalid gate: %hu", gate);
-  }
-
-  const auto p = Ipv4Prefix::Make(std::get<2>(prefix).value(),
-                                  static_cast<uint8_t>(prefix_len));
-  if (!p) {
-    return CommandFailure(EINVAL, "%s", bess::route::RouteErrorName(p.error()));
-  }
-  // An existing prefix is re-pointed, as rte_lpm_add() always did.
-  if (auto added = routes_->Upsert(*p, GateRoute(gate)); !added) {
-    return CommandFailure(RouteErrno(added.error()), "%s",
-                          bess::route::RouteErrorName(added.error()));
-  }
-  return CommandSuccess();
-}
-
-CommandResponse IPLookup::CommandDelete(
-    const bess::pb::IPLookupCommandDeleteArg &arg) {
-  uint64_t prefix_len = arg.prefix_len();
-  ParsedPrefix prefix = ParseIpv4Prefix(arg.prefix(), prefix_len);
-  if (std::get<0>(prefix)) {
-    return CommandFailure(std::get<0>(prefix), "%s",
-                          std::get<1>(prefix).c_str());
-  }
-
-  const auto p = Ipv4Prefix::Make(std::get<2>(prefix).value(),
-                                  static_cast<uint8_t>(prefix_len));
-  if (!p) {
-    return CommandFailure(EINVAL, "%s", bess::route::RouteErrorName(p.error()));
-  }
-  auto erased = routes_->Erase(*p);
-  if (!erased) {
-    if (prefix_len == 0 && erased.error() == RouteError::kNotFound) {
-      return CommandSuccess();  // deleting an unset default always succeeded
-    }
-    if (erased.error() == RouteError::kNotFound) {
-      return CommandFailure(ENOENT, "no such rule");
-    }
-    return CommandFailure(RouteErrno(erased.error()), "%s",
-                          bess::route::RouteErrorName(erased.error()));
-  }
-  return CommandSuccess();
-}
-
-CommandResponse IPLookup::CommandClear(const bess::pb::EmptyArg &) {
-  // Rules go, the default gate stays -- what rte_lpm_delete_all() did.
-  if (auto cleared = routes_->Clear(); !cleared) {
-    return CommandFailure(RouteErrno(cleared.error()), "%s",
-                          bess::route::RouteErrorName(cleared.error()));
-  }
-  return CommandSuccess();
 }
 
 ADD_MODULE(IPLookup, "ip_lookup",

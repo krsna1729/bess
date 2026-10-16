@@ -92,18 +92,4 @@ TEST(RoundRobinSettingsTest, RequiresPausedWorkers) {
   EXPECT_TRUE(RequiresPausedWorkers("rr/settings"));
 }
 
-TEST(RoundRobinSettingsTest, SettersAreLegacyOnly) {
-  ModuleHarness h;
-  Module *rr = h.Create("RoundRobin", Settings({0}, "batch"), "rr");
-  ASSERT_NE(nullptr, rr);
-  bess::pb::RoundRobinCommandSetModeArg mode;
-  mode.set_mode("packet");
-  EXPECT_EQ(ENOTSUP, h.Action(rr, "set_mode", mode).error().code());
-  EXPECT_EQ(ENOTSUP,
-            h.Action(rr, "set_gates", bess::pb::RoundRobinCommandSetGatesArg()).error().code());
-  h.MustCommand(rr, "set_mode", mode);
-  const bess::pb::RoundRobinArg s = Settings({0}, "packet");
-  EXPECT_EQ("", h.ReadBackDiffers("rr/settings", {{nullptr, &s}}));
-}
-
 }  // namespace

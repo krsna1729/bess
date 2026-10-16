@@ -48,9 +48,10 @@ using bess::utils::CuckooMap;
 //    * Max Flow Queue Size: the maximum size that any Flows queue can get
 //          before the module will start dropping the flows packets
 // COMMANDS
-//    set_quantum_size and set_max_flow_queue_size (legacy only) and the
-//    "<name>/settings" resource (DRRSettings, D-129) apply live, without
-//    pausing workers.
+//    The "<name>/settings" resource (DRRSettings, D-129) applies live,
+//    without pausing workers; the legacy commands
+//    set_quantum_size and set_max_flow_queue_size went with the legacy
+//    service (D-140).
 //
 // THREADING: every packet enters through an ingress ring that any number of
 // upstream workers may feed; the module's task, on one worker, drains it and
@@ -162,10 +163,6 @@ class DRR final : public Module {
 
   struct task_result RunTask(Context *ctx, bess::PacketBatch *batch,
                              void *arg) override;
-
-  CommandResponse CommandQuantumSize(const bess::pb::DRRQuantumArg &arg);
-  CommandResponse CommandMaxFlowQueueSize(
-      const bess::pb::DRRMaxFlowQueueSizeArg &arg);
 
  private:
   //  Sets the quantum: the number of bytes allocated to each flow on every

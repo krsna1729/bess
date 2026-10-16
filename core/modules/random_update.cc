@@ -11,23 +11,22 @@
 
 using bess::utils::be32_t;
 
-// D-129: "<name>/fields" holds the field list; add and clear stay for the
-// legacy ModuleCommand only.
-const Commands RandomUpdate::cmds = {
-    {"add", "RandomUpdateArg", MODULE_CMD_FUNC(&RandomUpdate::CommandAdd),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-    {"clear", "EmptyArg", MODULE_CMD_FUNC(&RandomUpdate::CommandClear),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-};
+// "<name>/fields" holds the whole variable list; the class has no actions.
+const Commands RandomUpdate::cmds = {};
 
 const ResourceTables RandomUpdate::resource_tables = {
     ResourceTable::Singleton<bess::pb::RandomUpdateArg>("fields", true)};
 
 CommandResponse RandomUpdate::Init(const bess::pb::RandomUpdateArg &arg) {
-  CommandResponse ret = CommandAdd(arg);
-  if (ret.has_error()) {
-    return ret;
+  // The init argument's variables; a refused one refuses the creation.
+  for (int i = 0; i < arg.fields_size(); i++) {
+    CommandResponse ret = ParseField(arg.fields(i), &vars_[i]);
+    if (ret.has_error()) {
+      return ret;
+    }
   }
+  num_vars_ = arg.fields_size();
+  arg_ = arg;
 
   // Stage converts the whole list; apply copies it in (no allocation).
   // ProcessBatch reads vars_ in place: paused workers only.
@@ -117,31 +116,6 @@ CommandResponse RandomUpdate::ParseField(
   // avoid modulo 0
   out->range = (max - min + 1) ?: 0xffffffff;
   out->bit_shift = (4 - size) * 8;
-  return CommandSuccess();
-}
-
-CommandResponse RandomUpdate::CommandAdd(const bess::pb::RandomUpdateArg &arg) {
-  size_t curr = num_vars_;
-  if (curr + arg.fields_size() > kMaxVariable) {
-    return CommandFailure(EINVAL, "max %zu variables can be specified",
-                          kMaxVariable);
-  }
-
-  for (int i = 0; i < arg.fields_size(); i++) {
-    CommandResponse ret = ParseField(arg.fields(i), &vars_[curr + i]);
-    if (ret.has_error()) {
-      return ret;
-    }
-  }
-
-  num_vars_ = curr + arg.fields_size();
-  arg_.mutable_fields()->MergeFrom(arg.fields());
-  return CommandSuccess();
-}
-
-CommandResponse RandomUpdate::CommandClear(const bess::pb::EmptyArg &) {
-  num_vars_ = 0;
-  arg_.Clear();
   return CommandSuccess();
 }
 

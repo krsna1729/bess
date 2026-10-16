@@ -2,8 +2,8 @@
 
 // Source's "<name>/settings" singleton (D-129) in process: packet size and
 // burst set through the resource's codec change what the task emits, read
-// back canonically, refuse what the setters refuse, and the setters it
-// supersedes are legacy only.
+// back canonically, and refuse what the setters refuse; `set_pkt_size` and
+// `set_burst` went with the legacy service (D-140).
 
 #include <gtest/gtest.h>
 
@@ -87,27 +87,6 @@ TEST(SourceSettingsTest, AppliesLive) {
   ModuleHarness h;
   ASSERT_NE(nullptr, h.Create("Source", bess::pb::SourceArg(), "src"));
   EXPECT_FALSE(RequiresPausedWorkers("src/settings"));
-}
-
-TEST(SourceSettingsTest, SettersAreLegacyOnly) {
-  ModuleHarness h;
-  Module *src = h.Create("Source", bess::pb::SourceArg(), "src");
-  ASSERT_NE(nullptr, src);
-  bess::pb::SourceCommandSetPktSizeArg size;
-  size.set_pkt_size(200);
-  bess::pb::SourceCommandSetBurstArg burst;
-  burst.set_burst(3);
-  EXPECT_EQ(ENOTSUP, h.Action(src, "set_pkt_size", size).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(src, "set_burst", burst).error().code());
-  // The legacy commands still run, validate as before, and the resource
-  // reads what they set.
-  h.MustCommand(src, "set_pkt_size", size);
-  h.MustCommand(src, "set_burst", burst);
-  bess::pb::SourceCommandSetBurstArg too_big;
-  too_big.set_burst(33);
-  EXPECT_EQ(EINVAL, h.Command(src, "set_burst", too_big).error().code());
-  const bess::pb::SourceSettings s = Settings(200, 3);
-  EXPECT_EQ("", h.ReadBackDiffers("src/settings", {{nullptr, &s}}));
 }
 
 }  // namespace

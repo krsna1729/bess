@@ -97,14 +97,4 @@ TEST(WorkerSplitSettingsTest, RequiresPausedWorkers) {
   EXPECT_TRUE(RequiresPausedWorkers("ws/settings"));
 }
 
-TEST(WorkerSplitSettingsTest, ResetIsLegacyOnly) {
-  ModuleHarness h;
-  Module *m = h.Create("WorkerSplit", bess::pb::WorkerSplitArg(), "ws");
-  ASSERT_NE(nullptr, m);
-  const bess::pb::WorkerSplitArg s = Map({{0, 1}});
-  EXPECT_EQ(ENOTSUP, h.Action(m, "reset", s).error().code());
-  h.MustCommand(m, "reset", s);
-  EXPECT_EQ("", h.ReadBackDiffers("ws/settings", {{nullptr, &s}}));
-}
-
 }  // namespace

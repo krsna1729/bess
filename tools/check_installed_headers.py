@@ -43,7 +43,7 @@ CLASSES = ("public", "experimental")
 # already refuses anything unlisted; these give the common mistakes their own
 # message and keep a table edit from listing one of them.
 INTERNAL_FORBIDDEN = [
-    "bessctl.h",
+    "api_server.h",
     "bessd.h",
     "debug.h",
     "dpdk.h",
@@ -63,7 +63,6 @@ INTERNAL_FORBIDDEN = [
     "classifier/concurrent_exact.h",
     "classifier/concurrent_masked.h",
     # Generated protocol the public headers do not include.
-    "pb/service.pb.h",
     "pb/control_v2.pb.h",
     "pb/test_msg.pb.h",
     "pb/ingress_bench.pb.h",
@@ -389,7 +388,7 @@ ADD_MODULE(TestModule, "test_module", "installed-header conformance module")
         print("  OK: plugin and curated API headers compile from installed artifacts.")
 
         # Neither header is installed; the plugin must fail on exactly that one.
-        for bad_header in ("runtime/runtime_state.h", "pb/service.grpc.pb.h"):
+        for bad_header in ("runtime/runtime_state.h", "pb/control_v2.grpc.pb.h"):
             bad_cpp = Path(tempdir) / "bad_plugin.cc"
             bad_cpp.write_text(f'#include "module.h"\n#include "{bad_header}"\n')
             bad_cmd = list(cmd)
@@ -451,7 +450,7 @@ def run_self_test():
     assert problems(everything) == "", problems(everything)
     for extra, want in [
         ("flow/flow_table.h", "installed but not classified in api_classes.json: flow/flow_table.h"),
-        ("pb/service.grpc.pb.h", "internal file was installed: pb/service.grpc.pb.h"),
+        ("pb/bess_msg.grpc.pb.h", "internal file was installed: pb/bess_msg.grpc.pb.h"),
         ("pb/error.grpc.pb.h", "internal file was installed: pb/error.grpc.pb.h"),
         ("pb/control_v2.pb.h", "internal file was installed: pb/control_v2.pb.h"),
         ("pb/error.pb.cc", "internal file was installed: pb/error.pb.cc"),

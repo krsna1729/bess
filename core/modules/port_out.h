@@ -23,8 +23,6 @@ class PortOut final : public Module {
       : Module(),
         port_(),
         tx_checksum_profile_(),
-        tx_checksum_profile_arg_(),
-        has_tx_checksum_profile_(false),
         worker_queues_(),
         queue_users_(),
         queue_locks_() {
@@ -32,7 +30,6 @@ class PortOut final : public Module {
   }
 
   CommandResponse Init(const bess::pb::PortOutArg &arg);
-  CommandResponse GetInitialArg(const bess::pb::EmptyArg &);
 
   void DeInit() override;
 
@@ -46,8 +43,6 @@ class PortOut final : public Module {
   Port *port_;
 
   bess::packet::BoundTxFinalizationProfile tx_checksum_profile_;
-  bess::pb::TxChecksumProfile tx_checksum_profile_arg_;
-  bool has_tx_checksum_profile_;
 
   int worker_queues_[Worker::kMaxWorkers];
 

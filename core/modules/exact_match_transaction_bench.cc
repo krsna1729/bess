@@ -58,12 +58,12 @@ const cpu_set_t kInitialCpus = [] {
 constexpr size_t kBatch = 32;
 constexpr size_t kBatches = 1024;  // 32K packets: keys spread over the table
 
-bess::pb::ExactMatchCommandAddArg Rule(uint32_t a, uint16_t b, uint64_t gate) {
-  bess::pb::ExactMatchCommandAddArg arg;
-  arg.set_gate(gate);
-  arg.add_fields()->set_value_int(a);
-  arg.add_fields()->set_value_int(b);
-  return arg;
+// The packed key of a rule over the two fields (4 bytes, 2 bytes).
+std::string Key(uint32_t a, uint16_t b) {
+  std::string key(6, '\0');
+  std::memcpy(key.data(), &a, sizeof(a));
+  std::memcpy(key.data() + 4, &b, sizeof(b));
+  return key;
 }
 
 // Fields: 4 bytes at offset 26 (IPv4 source), 2 bytes at offset 34 (UDP
@@ -89,12 +89,18 @@ ExactMatch *CreateModule(const char *name, size_t rules) {
     std::abort();
   }
   auto *em = static_cast<ExactMatch *>(m);
-  bess::pb::ExactMatchConfig config;
+  // Prefill in one bulk transaction -- the way a client loads a table
+  // (D-140: the legacy set_runtime_config restore is gone).
+  std::vector<bess::dataplane::Op> ops;
+  ops.reserve(rules);
   for (size_t r = 0; r < rules; r++) {
-    *config.add_rules() = Rule(static_cast<uint32_t>(r),
-                               static_cast<uint16_t>(r), 1 + r % 63);
+    ops.push_back(bess::dataplane::Op::Upsert(
+        std::string(name) + "/rules",
+        Key(static_cast<uint32_t>(r), static_cast<uint16_t>(r)),
+        std::any(uint64_t{1 + r % 63})));
   }
-  if (em->SetRuntimeConfig(config).has_error()) {
+  if (bess::runtime::runtime().transactions().Apply(ops).outcome !=
+      bess::dataplane::TransactionEngine::Outcome::kApplied) {
     std::abort();
   }
   return em;
@@ -172,13 +178,6 @@ void BM_ModuleClassify(benchmark::State &state) {
 }
 BENCHMARK(BM_ModuleClassify)
     ->ArgsProduct({{1000, 128000, 1000000}, {0, 1}});
-
-std::string Key(uint32_t a, uint16_t b) {
-  std::string key(6, '\0');
-  std::memcpy(key.data(), &a, sizeof(a));
-  std::memcpy(key.data() + 4, &b, sizeof(b));
-  return key;
-}
 
 void BM_ClassifyUnderTransactions(benchmark::State &state) {
   using bess::dataplane::Op;

@@ -3,10 +3,10 @@
 // L2Forward (D-114): the default gate at creation, and "<name>/macs" entries
 // written through the resource's codec -- the path the transaction RPC and
 // manifests take -- deciding the gates of the module's packet path. Its
-// commands (add, delete, lookup, populate, set_default_gate) and Init's
-// limits in process (was bessctl/module_tests/l2forward.py; the cases that
-// need a running worker are tests/live/l2_forward_test.cc). D-129: the macs
-// and "<name>/settings" read back canonically, and the legacy-only commands.
+// actions (lookup, populate) and Init's limits in process (was
+// bessctl/module_tests/l2forward.py; the cases that need a running worker are
+// tests/live/l2_forward_test.cc). D-129: the macs and "<name>/settings" read
+// back canonically; its other commands went with the legacy service (D-140).
 
 #include "modules/l2_forward.h"
 
@@ -145,17 +145,6 @@ using bess::testing::Bytes;
 using bess::testing::ModuleHarness;
 using bess::testing::PacketBuilder;
 
-bess::pb::L2ForwardCommandAddArg Entries(
-    const std::vector<std::pair<std::string, int64_t>> &entries) {
-  bess::pb::L2ForwardCommandAddArg arg;
-  for (const auto &[addr, gate] : entries) {
-    auto *e = arg.add_entries();
-    e->set_addr(addr);
-    e->set_gate(gate);
-  }
-  return arg;
-}
-
 template <typename Arg>
 Arg Addrs(const std::vector<std::string> &addrs) {
   Arg arg;
@@ -168,14 +157,16 @@ Arg Addrs(const std::vector<std::string> &addrs) {
 // The gates lookup answers for `addrs` (the test fails if it refuses).
 std::vector<uint64_t> Lookup(ModuleHarness &h, Module *m, const std::vector<std::string> &addrs) {
   bess::pb::L2ForwardCommandLookupResponse resp;
-  EXPECT_TRUE(h.MustCommand(m, "lookup", Addrs<bess::pb::L2ForwardCommandLookupArg>(addrs))
-                  .UnpackTo(&resp));
+  const CommandResponse answered =
+      h.Action(m, "lookup", Addrs<bess::pb::L2ForwardCommandLookupArg>(addrs));
+  EXPECT_EQ(0, answered.error().code()) << answered.error().errmsg();
+  EXPECT_TRUE(answered.data().UnpackTo(&resp));
   return {resp.gates().begin(), resp.gates().end()};
 }
 
 // The errno lookup refuses `addrs` with (0: answered).
 int LookupError(ModuleHarness &h, Module *m, const std::vector<std::string> &addrs) {
-  return h.Command(m, "lookup", Addrs<bess::pb::L2ForwardCommandLookupArg>(addrs))
+  return h.Action(m, "lookup", Addrs<bess::pb::L2ForwardCommandLookupArg>(addrs))
       .error()
       .code();
 }
@@ -205,129 +196,6 @@ Bytes ToMac(const std::string &dst) {
       .Build();
 }
 
-// Entries added by command: a MAC already present is refused (EEXIST);
-// lookup answers each MAC's gate and packets to those MACs leave there;
-// delete removes an entry, and deleting it again is refused (ENOENT).
-TEST(L2ForwardCommandTest, AddLookupDelete) {
-  ModuleHarness h;
-  Module *l2 = h.Create("L2Forward", bess::pb::L2ForwardArg());
-  ASSERT_NE(nullptr, l2);
-  h.MustCommand(l2, "add",
-                Entries({{"00:01:02:03:04:05", 64}, {"aa:bb:cc:dd:ee:ff", 1},
-                         {"11:11:11:11:11:22", 2}}));
-  EXPECT_EQ(EEXIST, h.Command(l2, "add", Entries({{"00:01:02:03:04:05", 0}})).error().code());
-
-  EXPECT_EQ((std::vector<uint64_t>{1, 64}), Lookup(h, l2, {"aa:bb:cc:dd:ee:ff", "00:01:02:03:04:05"}));
-  const Bytes to_1 = ToMac("aa:bb:cc:dd:ee:ff");
-  const Bytes to_64 = ToMac("00:01:02:03:04:05");
-  const Bytes to_2 = ToMac("11:11:11:11:11:22");
-  auto out = h.Run(l2, 0, {to_1, to_64, to_2}, {0, 1, 2, 64});
-  EXPECT_TRUE(out[0].empty());
-  EXPECT_EQ((std::vector<Bytes>{to_1}), out[1]);
-  EXPECT_EQ((std::vector<Bytes>{to_2}), out[2]);
-  EXPECT_EQ((std::vector<Bytes>{to_64}), out[64]);
-
-  h.MustCommand(l2, "delete", Addrs<bess::pb::L2ForwardCommandDeleteArg>({"00:01:02:03:04:05"}));
-  EXPECT_EQ(ENOENT, h.Command(l2, "delete",
-                              Addrs<bess::pb::L2ForwardCommandDeleteArg>({"00:01:02:03:04:05"}))
-                        .error()
-                        .code());
-  EXPECT_EQ(ENOENT, LookupError(h, l2, {"00:01:02:03:04:05"}));
-  // No entry and no default gate: dropped.
-  out = h.Run(l2, 0, {to_64}, {0, 1, 2, 64});
-  EXPECT_TRUE(out[64].empty());
-}
-
-// Commands validate everything before applying anything: int64 wire gates
-// are checked before narrowing (65536 is not gate 0, -1 not 65535; 8193 is
-// past DROP_GATE), a bad entry adds nothing (not even the good one before
-// it), a MAC given twice in one add is refused, and populate with
-// gate_count 0 is refused (it used to divide by zero and crash bessd).
-TEST(L2ForwardCommandTest, CommandsValidateBeforeApplying) {
-  ModuleHarness h;
-  Module *l2 = h.Create("L2Forward", bess::pb::L2ForwardArg());
-  ASSERT_NE(nullptr, l2);
-  for (const int64_t gate : {int64_t{65536}, int64_t{-1}, int64_t{8193}}) {
-    EXPECT_EQ(EINVAL, h.Command(l2, "add", Entries({{"00:01:02:03:04:05", gate}})).error().code())
-        << gate;
-  }
-  EXPECT_EQ(ENOENT, LookupError(h, l2, {"00:01:02:03:04:05"}));
-
-  EXPECT_EQ(EINVAL,
-            h.Command(l2, "add", Entries({{"00:01:02:03:04:06", 1}, {"not-a-mac", 2}}))
-                .error()
-                .code());
-  EXPECT_EQ(ENOENT, LookupError(h, l2, {"00:01:02:03:04:06"})) << "nothing was added";
-
-  EXPECT_EQ(EEXIST,
-            h.Command(l2, "add", Entries({{"00:01:02:03:04:07", 1}, {"00:01:02:03:04:07", 2}}))
-                .error()
-                .code());
-  EXPECT_EQ(ENOENT, LookupError(h, l2, {"00:01:02:03:04:07"}));
-
-  EXPECT_EQ(EINVAL,
-            h.Command(l2, "populate", Populate("00:01:02:03:00:00", 10, 0)).error().code());
-  EXPECT_EQ(ENOENT, LookupError(h, l2, {"00:01:02:03:00:00"}));
-
-  bess::pb::L2ForwardCommandSetDefaultGateArg dflt;
-  dflt.set_gate(65536);
-  EXPECT_EQ(EINVAL, h.Command(l2, "set_default_gate", dflt).error().code());
-  // Still the default (drop), not gate 0.
-  EXPECT_TRUE(h.Run(l2, 0, {ToMac("02:00:00:00:00:42")}, {0})[0].empty());
-
-  h.MustCommand(l2, "add", Entries({{"00:01:02:03:04:08", 5}}));
-  EXPECT_EQ((std::vector<uint64_t>{5}), Lookup(h, l2, {"00:01:02:03:04:08"}));
-}
-
-// Init's table limits: size 1 used to compute an alternate bucket far
-// outside the table, and int64 sizes narrowed to int (2^32 + 1 became 1);
-// sizes must be powers of two. A two-bucket table of 4 works.
-TEST(L2ForwardCommandTest, TableSizeLimits) {
-  ModuleHarness h;
-  for (const auto &bad : {TableArg(1, 0), TableArg((int64_t{1} << 32) + 1, 0), TableArg(-4, 0),
-                          TableArg(0, (int64_t{1} << 32) + 4), TableArg(6, 0)}) {
-    EXPECT_NE("", h.CreateError("L2Forward", bad)) << bad.ShortDebugString();
-  }
-  Module *l2 = h.Create("L2Forward", TableArg(2, 4));
-  ASSERT_NE(nullptr, l2);
-  h.MustCommand(l2, "add", Entries({{"02:00:00:00:00:01", 3}}));
-  EXPECT_EQ((std::vector<uint64_t>{3}), Lookup(h, l2, {"02:00:00:00:00:01"}));
-}
-
-// populate starts at `base` (an extra shift used to start two bytes lower),
-// counts up across byte boundaries, cycles the gates, and refuses more
-// entries than the table has slots.
-TEST(L2ForwardCommandTest, PopulateStartsAtBaseAndCyclesGates) {
-  ModuleHarness h;
-  Module *l2 = h.Create("L2Forward", TableArg(64, 4));
-  ASSERT_NE(nullptr, l2);
-  h.MustCommand(l2, "populate", Populate("aa:bb:cc:dd:ee:fe", 4, 3));
-  EXPECT_EQ((std::vector<uint64_t>{0, 1, 2, 0}),
-            Lookup(h, l2, {"aa:bb:cc:dd:ee:fe", "aa:bb:cc:dd:ee:ff", "aa:bb:cc:dd:ef:00",
-                           "aa:bb:cc:dd:ef:01"}));
-  EXPECT_EQ(ENOENT, LookupError(h, l2, {"00:00:aa:bb:cc:dd"}));
-  EXPECT_EQ(EINVAL,
-            h.Command(l2, "populate", Populate("02:00:00:00:00:00", 64 * 4 + 1, 1)).error().code());
-  EXPECT_EQ(ENOENT, LookupError(h, l2, {"02:00:00:00:00:00"}));
-}
-
-// A multi-entry add that runs out of space takes back what it added.
-TEST(L2ForwardCommandTest, AddRollsBackWhenFull) {
-  ModuleHarness h;
-  Module *l2 = h.Create("L2Forward", TableArg(2, 1));  // two slots
-  ASSERT_NE(nullptr, l2);
-  std::vector<std::pair<std::string, int64_t>> entries;
-  for (int i = 1; i <= 5; i++) {
-    char addr[18];
-    std::snprintf(addr, sizeof(addr), "02:00:00:00:00:%02x", i);
-    entries.emplace_back(addr, i);
-  }
-  EXPECT_EQ(ENOMEM, h.Command(l2, "add", Entries(entries)).error().code());
-  for (const auto &[addr, gate] : entries) {
-    EXPECT_EQ(ENOENT, LookupError(h, l2, {addr})) << addr;
-  }
-}
-
 bess::pb::L2ForwardMacKey MacKeyMsg(const std::string &addr) {
   bess::pb::L2ForwardMacKey key;
   key.set_addr(addr);
@@ -344,6 +212,97 @@ bess::pb::L2ForwardSettings Settings(uint64_t default_gate) {
   bess::pb::L2ForwardSettings settings;
   settings.set_default_gate(default_gate);
   return settings;
+}
+
+// Entries written through "<name>/macs": lookup answers each MAC's gate and
+// packets to those MACs leave there; an erased entry takes the default gate
+// again.
+TEST(L2ForwardResourceTest, MacsDecideTheGatesAndErase) {
+  ModuleHarness h;
+  Module *l2 = h.Create("L2Forward", bess::pb::L2ForwardArg(), "l2");
+  ASSERT_NE(nullptr, l2);
+  const std::string macs = "l2/macs";
+  EXPECT_EQ("", h.UpsertResource(macs, MacKeyMsg("00:01:02:03:04:05"), MacValueMsg(64)));
+  EXPECT_EQ("", h.UpsertResource(macs, MacKeyMsg("aa:bb:cc:dd:ee:ff"), MacValueMsg(1)));
+  EXPECT_EQ("", h.UpsertResource(macs, MacKeyMsg("11:11:11:11:11:22"), MacValueMsg(2)));
+
+  EXPECT_EQ((std::vector<uint64_t>{1, 64}), Lookup(h, l2, {"aa:bb:cc:dd:ee:ff", "00:01:02:03:04:05"}));
+  const Bytes to_1 = ToMac("aa:bb:cc:dd:ee:ff");
+  const Bytes to_64 = ToMac("00:01:02:03:04:05");
+  const Bytes to_2 = ToMac("11:11:11:11:11:22");
+  auto out = h.Run(l2, 0, {to_1, to_64, to_2}, {0, 1, 2, 64});
+  EXPECT_TRUE(out[0].empty());
+  EXPECT_EQ((std::vector<Bytes>{to_1}), out[1]);
+  EXPECT_EQ((std::vector<Bytes>{to_2}), out[2]);
+  EXPECT_EQ((std::vector<Bytes>{to_64}), out[64]);
+
+  EXPECT_EQ("", h.EraseResource(macs, MacKeyMsg("00:01:02:03:04:05")));
+  EXPECT_NE("", h.EraseResource(macs, MacKeyMsg("00:01:02:03:04:05")))
+      << "erasing an entry that is not there";
+  EXPECT_EQ(ENOENT, LookupError(h, l2, {"00:01:02:03:04:05"}));
+  // No entry and no default gate: dropped.
+  out = h.Run(l2, 0, {to_64}, {0, 1, 2, 64});
+  EXPECT_TRUE(out[64].empty());
+}
+
+// A refused write applies nothing: int64 wire gates are checked before
+// narrowing (65536 is not gate 0; 8193 is past DROP_GATE), a bad MAC or a bad
+// default gate is refused, and populate with gate_count 0 is refused (it used
+// to divide by zero and crash bessd).
+TEST(L2ForwardResourceTest, RefusedWritesChangeNothing) {
+  ModuleHarness h;
+  Module *l2 = h.Create("L2Forward", bess::pb::L2ForwardArg(), "l2");
+  ASSERT_NE(nullptr, l2);
+  const std::string macs = "l2/macs";
+  const auto k = MacKeyMsg("00:01:02:03:04:05");
+  EXPECT_NE("", h.UpsertResource(macs, k, MacValueMsg(65536))) << 65536;
+  EXPECT_NE("", h.UpsertResource(macs, k, MacValueMsg(8193))) << 8193;
+  EXPECT_EQ(ENOENT, LookupError(h, l2, {"00:01:02:03:04:05"}));
+
+  EXPECT_NE("", h.UpsertResource(macs, MacKeyMsg("not-a-mac"), MacValueMsg(1)));
+  EXPECT_EQ(ENOENT, LookupError(h, l2, {"00:01:02:03:04:06"})) << "nothing was written";
+
+  EXPECT_EQ(EINVAL, h.Action(l2, "populate", Populate("00:01:02:03:00:00", 10, 0)).error().code());
+  EXPECT_EQ(ENOENT, LookupError(h, l2, {"00:01:02:03:00:00"}));
+
+  EXPECT_NE("", h.SetResource("l2/settings", Settings(65536)));
+  // Still the default (drop), not gate 0.
+  EXPECT_TRUE(h.Run(l2, 0, {ToMac("02:00:00:00:00:42")}, {0})[0].empty());
+
+  EXPECT_EQ("", h.UpsertResource(macs, MacKeyMsg("00:01:02:03:04:08"), MacValueMsg(5)));
+  EXPECT_EQ((std::vector<uint64_t>{5}), Lookup(h, l2, {"00:01:02:03:04:08"}));
+}
+
+// Init's table limits: size 1 used to compute an alternate bucket far
+// outside the table, and int64 sizes narrowed to int (2^32 + 1 became 1);
+// sizes must be powers of two. A two-bucket table of 4 works.
+TEST(L2ForwardResourceTest, TableSizeLimits) {
+  ModuleHarness h;
+  for (const auto &bad : {TableArg(1, 0), TableArg((int64_t{1} << 32) + 1, 0), TableArg(-4, 0),
+                          TableArg(0, (int64_t{1} << 32) + 4), TableArg(6, 0)}) {
+    EXPECT_NE("", h.CreateError("L2Forward", bad)) << bad.ShortDebugString();
+  }
+  Module *l2 = h.Create("L2Forward", TableArg(2, 4), "l2");
+  ASSERT_NE(nullptr, l2);
+  EXPECT_EQ("", h.UpsertResource("l2/macs", MacKeyMsg("02:00:00:00:00:01"), MacValueMsg(3)));
+  EXPECT_EQ((std::vector<uint64_t>{3}), Lookup(h, l2, {"02:00:00:00:00:01"}));
+}
+
+// populate starts at `base` (an extra shift used to start two bytes lower),
+// counts up across byte boundaries, cycles the gates, and refuses more
+// entries than the table has slots.
+TEST(L2ForwardResourceTest, PopulateStartsAtBaseAndCyclesGates) {
+  ModuleHarness h;
+  Module *l2 = h.Create("L2Forward", TableArg(64, 4), "l2");
+  ASSERT_NE(nullptr, l2);
+  EXPECT_EQ(0, h.Action(l2, "populate", Populate("aa:bb:cc:dd:ee:fe", 4, 3)).error().code());
+  EXPECT_EQ((std::vector<uint64_t>{0, 1, 2, 0}),
+            Lookup(h, l2, {"aa:bb:cc:dd:ee:fe", "aa:bb:cc:dd:ee:ff", "aa:bb:cc:dd:ef:00",
+                           "aa:bb:cc:dd:ef:01"}));
+  EXPECT_EQ(ENOENT, LookupError(h, l2, {"00:00:aa:bb:cc:dd"}));
+  EXPECT_EQ(EINVAL,
+            h.Action(l2, "populate", Populate("02:00:00:00:00:00", 64 * 4 + 1, 1)).error().code());
+  EXPECT_EQ(ENOENT, LookupError(h, l2, {"02:00:00:00:00:00"}));
 }
 
 // MACs upserted through "<name>/macs" read back as the client sent them
@@ -364,7 +323,8 @@ TEST(L2ForwardResourceTest, MacsRoundTrip) {
   EXPECT_EQ("", h.UpsertResource("l2r/macs", k3, drop));
   EXPECT_EQ("", h.ReadBackDiffers("l2r/macs", {{&k1, &g0}, {&k2, &g3}, {&k3, &drop}}));
 
-  h.MustCommand(l2, "add", Entries({{"0A:1B:2C:3D:4E:5F", 7}}));
+  // An upper-case MAC names the same entry and reads back lower case.
+  EXPECT_EQ("", h.UpsertResource("l2r/macs", MacKeyMsg("0A:1B:2C:3D:4E:5F"), MacValueMsg(7)));
   const auto k4 = MacKeyMsg("0a:1b:2c:3d:4e:5f");
   const auto g7 = MacValueMsg(7);
   EXPECT_EQ("", h.ReadBackDiffers("l2r/macs", {{&k1, &g0}, {&k2, &g3}, {&k3, &drop}, {&k4, &g7}}));
@@ -417,28 +377,14 @@ TEST(L2ForwardResourceTest, SettingsSetTheDefaultGate) {
   EXPECT_EQ("", h.SetResource("l2r/settings", to0));
   EXPECT_EQ((std::vector<Bytes>{unknown}), h.Run(l2, 0, {unknown}, {0})[0]);
   EXPECT_EQ("", h.ReadBackDiffers("l2r/settings", {{nullptr, &to0}}));
-
-  bess::pb::L2ForwardCommandSetDefaultGateArg dflt;
-  dflt.set_gate(9);
-  h.MustCommand(l2, "set_default_gate", dflt);
-  const auto to9 = Settings(9);
-  EXPECT_EQ("", h.ReadBackDiffers("l2r/settings", {{nullptr, &to9}}));
 }
 
-// D-129: add, delete and set_default_gate edit resources now: InvokeAction
-// refuses them (ENOTSUP). lookup and populate stay actions.
-TEST(L2ForwardResourceTest, StateCommandsAreLegacyOnly) {
+// D-129: lookup and populate are the class's actions; the state they do not
+// touch is the resources'.
+TEST(L2ForwardResourceTest, LookupAndPopulateAreActions) {
   ModuleHarness h;
   Module *l2 = h.Create("L2Forward", TableArg(64, 4), "l2r");
   ASSERT_NE(nullptr, l2);
-  EXPECT_EQ(ENOTSUP, h.Action(l2, "add", Entries({{"02:00:00:00:00:01", 1}})).error().code());
-  EXPECT_EQ(ENOTSUP,
-            h.Action(l2, "delete", Addrs<bess::pb::L2ForwardCommandDeleteArg>({"02:00:00:00:00:01"}))
-                .error()
-                .code());
-  bess::pb::L2ForwardCommandSetDefaultGateArg dflt;
-  dflt.set_gate(1);
-  EXPECT_EQ(ENOTSUP, h.Action(l2, "set_default_gate", dflt).error().code());
   EXPECT_TRUE(h.ReadResource("l2r/macs").empty());
   const auto dropped = Settings(8192);
   EXPECT_EQ("", h.ReadBackDiffers("l2r/settings", {{nullptr, &dropped}}));

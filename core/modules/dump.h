@@ -19,12 +19,13 @@ class Dump final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  CommandResponse CommandSetInterval(const bess::pb::DumpArg &arg);
-
   static const Commands cmds;
   static const ResourceTables resource_tables;
 
  private:
+  // The init argument's interval, validated before anything is installed.
+  CommandResponse SetInterval(const bess::pb::DumpArg &arg);
+
   // Workers read it while it is set (relaxed): "<name>/settings" applies
   // while they run.
   std::atomic<uint64_t> min_interval_ns_;

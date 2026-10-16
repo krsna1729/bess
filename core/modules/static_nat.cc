@@ -9,15 +9,9 @@
 #include "utils/tcp.h"
 #include "utils/udp.h"
 
-const Commands StaticNAT::cmds = {
-    {"get_initial_arg", "EmptyArg", MODULE_CMD_FUNC(&StaticNAT::GetInitialArg),
-     Command::THREAD_SAFE, "", Command::LEGACY_ONLY, Command::READS},
-    {"get_runtime_config", "EmptyArg",
-     MODULE_CMD_FUNC(&StaticNAT::GetRuntimeConfig), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY, Command::READS},
-    {"set_runtime_config", "EmptyArg",
-     MODULE_CMD_FUNC(&StaticNAT::SetRuntimeConfig), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY}};
+// No resources and no actions: the pairs are the init argument, which
+// GetPipeline's Module.arg carries back (D-129).
+const Commands StaticNAT::cmds = {};
 
 CommandResponse StaticNAT::Init(const bess::pb::StaticNATArg &arg) {
   using bess::utils::ParseIpv4Address;
@@ -62,33 +56,6 @@ CommandResponse StaticNAT::Init(const bess::pb::StaticNATArg &arg) {
                       .size = int_end.value() - int_start.value() + 1});
   }
 
-  return CommandSuccess();
-}
-
-CommandResponse StaticNAT::GetInitialArg(const bess::pb::EmptyArg &) {
-  using bess::utils::ToIpv4Address;
-
-  bess::pb::StaticNATArg resp;
-  for (const auto &pair : pairs_) {
-    auto *pb_pair = resp.add_pairs();
-
-    auto *int_range = pb_pair->mutable_int_range();
-    int_range->set_start(ToIpv4Address(be32_t(pair.int_addr)));
-    int_range->set_end(ToIpv4Address(be32_t(pair.int_addr + pair.size)));
-
-    auto *ext_range = pb_pair->mutable_ext_range();
-    ext_range->set_start(ToIpv4Address(be32_t(pair.ext_addr)));
-    ext_range->set_end(ToIpv4Address(be32_t(pair.ext_addr + pair.size)));
-  }
-
-  return CommandSuccess(resp);
-}
-
-CommandResponse StaticNAT::GetRuntimeConfig(const bess::pb::EmptyArg &) {
-  return CommandSuccess();
-}
-
-CommandResponse StaticNAT::SetRuntimeConfig(const bess::pb::EmptyArg &) {
   return CommandSuccess();
 }
 

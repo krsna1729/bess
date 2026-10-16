@@ -183,7 +183,7 @@ ControlResult<PortInfo> ControlPlane::CreatePort(const PortSpec& spec) {
   auto result = CreatePortLocked(spec);
   if (result) {
     // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
+    // an apply and a direct change share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
     runtime::runtime().BumpGeneration();
@@ -291,19 +291,6 @@ ControlResult<PortInfo> ControlPlane::CreatePortLocked(const PortSpec& spec) {
   return info;
 }
 
-ControlResult<void> ControlPlane::DestroyPort(const std::string& name) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto result = DestroyPortLocked(name);
-  if (result) {
-    // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
-    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
-    // ApplyPipeline() bumps once for the whole transaction.
-    runtime::runtime().BumpGeneration();
-  }
-  return result;
-}
-
 ControlResult<void> ControlPlane::DestroyPortLocked(const std::string& name) {
 
   if (name.length() == 0) {
@@ -322,47 +309,9 @@ ControlResult<void> ControlPlane::DestroyPortLocked(const std::string& name) {
   return {};
 }
 
-ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConf(
-    const std::string& name, const PortConfSpec& spec) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto result = SetPortConfLocked(name, spec);
-  if (result) {
-    // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
-    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
-    // ApplyPipeline() bumps once for the whole transaction.
-    runtime::runtime().BumpGeneration();
-  }
-  return result;
-}
-
-ControlResult<bess::pb::CommandResponse> ControlPlane::SetPortConfLocked(const std::string& name, const PortConfSpec& spec) {
-
-  if (!name.length()) {
-    return std::unexpected(Err(EINVAL, "Port name is not given"));
-  }
-
-  Port *port = runtime::runtime().ports().Find(name);
-  if (!port) {
-    return std::unexpected(Err(ENOENT, "No port `%s' found", name.c_str()));
-  }
-
-  Port::Conf conf;
-  conf.mtu = spec.mtu;
-  conf.admin_up = spec.admin_up;
-
-  if (!conf.mac_addr.FromString(spec.mac_addr)) {
-    return std::unexpected(
-        Err(EINVAL, "MAC address should be formatted xx:xx:xx:xx:xx:xx"));
-  }
-
-  WorkerPauser wp;
-  return port->UpdateConf(conf);
-}
-
 ControlResult<bess::pb::CommandResponse> ControlPlane::RunModuleCommand(
     const std::string& module, const std::string& command,
-    const google::protobuf::Any& arg, ModuleBuilder::CommandSurface surface) {
+    const google::protobuf::Any& arg) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (module.empty()) {
     return std::unexpected(Err(EINVAL, "Missing module name field 'name'"));
@@ -373,32 +322,17 @@ ControlResult<bess::pb::CommandResponse> ControlPlane::RunModuleCommand(
   }
   // DPDK functions may be called, so be prepared.
   current_worker.SetNonWorker();
-  auto ran = m->module_builder()->RunCommand(m, command, arg, surface);
-  // D-129: a command that can edit a resource's contents advances the
+  auto ran = m->module_builder()->RunCommand(m, command, arg);
+  // D-129: an action that can edit a resource's contents advances the
   // resource generation, whether or not it succeeded (it may have edited
   // part), so an ApplyPipeline that read the old contents conflicts instead
-  // of undoing the edit. One the surface refuses ran nothing.
+  // of undoing the edit. An action that does not exist ran nothing.
   for (const auto& cmd : m->module_builder()->cmds()) {
-    if (cmd.cmd == command && cmd.EditsResources() &&
-        (surface == ModuleBuilder::CommandSurface::kLegacy ||
-         cmd.exposure == Command::ACTION)) {
+    if (cmd.cmd == command && cmd.EditsResources()) {
       runtime::runtime().transactions().AdvanceGeneration();
     }
   }
   return ran;
-}
-
-ControlResult<void> ControlPlane::ResetPorts() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto result = ResetPortsLocked();
-  if (result) {
-    // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
-    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
-    // ApplyPipeline() bumps once for the whole transaction.
-    runtime::runtime().BumpGeneration();
-  }
-  return result;
 }
 
 ControlResult<void> ControlPlane::ResetPortsLocked() {
@@ -432,7 +366,7 @@ ControlResult<std::string> ControlPlane::CreateModule(const ModuleSpec& spec) {
   auto result = CreateModuleLocked(spec);
   if (result) {
     // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
+    // an apply and a direct change share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
     runtime::runtime().BumpGeneration();
@@ -492,7 +426,7 @@ ControlResult<void> ControlPlane::DestroyModule(const std::string& name) {
   auto result = DestroyModuleLocked(name);
   if (result) {
     // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
+    // an apply and a direct change share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
     runtime::runtime().BumpGeneration();
@@ -523,19 +457,6 @@ ControlResult<void> ControlPlane::DestroyModuleLocked(const std::string& name) {
   return {};
 }
 
-ControlResult<void> ControlPlane::ResetModules() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto result = ResetModulesLocked();
-  if (result) {
-    // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
-    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
-    // ApplyPipeline() bumps once for the whole transaction.
-    runtime::runtime().BumpGeneration();
-  }
-  return result;
-}
-
 ControlResult<void> ControlPlane::ResetModulesLocked() {
   WorkerPauser wp;
 
@@ -550,7 +471,7 @@ ControlResult<void> ControlPlane::ConnectModules(const ConnectionSpec& spec) {
   auto result = ConnectModulesLocked(spec);
   if (result) {
     // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
+    // an apply and a direct change share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
     runtime::runtime().BumpGeneration();
@@ -612,7 +533,7 @@ ControlResult<void> ControlPlane::DisconnectModules(
   auto result = DisconnectModulesLocked(spec);
   if (result) {
     // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
+    // an apply and a direct change share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
     runtime::runtime().BumpGeneration();
@@ -654,7 +575,7 @@ ControlResult<void> ControlPlane::AddWorker(uint64_t wid,
   auto result = AddWorkerLocked(wid, core, scheduler);
   if (result) {
     // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
+    // an apply and a direct change share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
     runtime::runtime().BumpGeneration();
@@ -730,7 +651,7 @@ ControlResult<void> ControlPlane::DestroyWorker(uint64_t wid) {
   auto result = DestroyWorkerLocked(wid);
   if (result) {
     // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
+    // an apply and a direct change share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
     runtime::runtime().BumpGeneration();
@@ -771,7 +692,7 @@ ControlResult<void> ControlPlane::ResetWorkers() {
   auto result = ResetWorkersLocked();
   if (result) {
     // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
+    // an apply and a direct change share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
     runtime::runtime().BumpGeneration();
@@ -863,7 +784,7 @@ ControlResult<void> ControlPlane::AddTc(const TrafficClassSpec& spec) {
   auto result = AddTcLocked(spec);
   if (result) {
     // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
+    // an apply and a direct change share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
     runtime::runtime().BumpGeneration();
@@ -943,15 +864,6 @@ ControlResult<void> ControlPlane::AddTcLocked(const TrafficClassSpec& spec) {
   return AttachTc(c, spec);
 }
 
-ControlResult<void> ControlPlane::UpdateTcParams(const TrafficClassSpec& spec) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto result = UpdateTcParamsLocked(spec);
-  if (result) {
-    runtime::runtime().BumpGeneration();
-  }
-  return result;
-}
-
 ControlResult<void> ControlPlane::UpdateTcParamsLocked(
     const TrafficClassSpec& spec) {
   WorkerPauser wp;
@@ -1004,7 +916,7 @@ ControlResult<void> ControlPlane::UpdateTcParent(const TrafficClassSpec& spec) {
   auto result = UpdateTcParentLocked(spec);
   if (result) {
     // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
+    // an apply and a direct change share one sequence
     // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
     // ApplyPipeline() bumps once for the whole transaction.
     runtime::runtime().BumpGeneration();
@@ -1253,19 +1165,6 @@ ControlResult<void> ControlPlane::ReparentTcLocked(const TrafficClassSpec& spec)
   }
 
   return {};
-}
-
-ControlResult<void> ControlPlane::ResetTcs() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto result = ResetTcsLocked();
-  if (result) {
-    // Every successful structural mutation advances the generation, so
-    // the legacy RPC path and the transactional path share one sequence
-    // (MODERNIZATION.md section 9.8). The *Locked() primitives never bump:
-    // ApplyPipeline() bumps once for the whole transaction.
-    runtime::runtime().BumpGeneration();
-  }
-  return result;
 }
 
 ControlResult<void> ControlPlane::ResetTcsLocked() {
@@ -1661,53 +1560,6 @@ ControlResult<std::string> ControlPlane::ConfigureGateHook(
     return std::unexpected(ret.error());
   }
   return std::string();
-}
-
-// ---------------------------------------------------------------------------
-// Resume hooks
-// ---------------------------------------------------------------------------
-
-ControlResult<bess::pb::CommandResponse> ControlPlane::ConfigureResumeHook(
-    const std::string& hook_name, bool enable,
-    const google::protobuf::Any& arg) {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  auto& hooks = bess::global_resume_hooks;
-  auto hook_it = hooks.end();
-  for (auto it = hooks.begin(); it != hooks.end(); ++it) {
-    if (it->get()->name() == hook_name) {
-      hook_it = it;
-      break;
-    }
-  }
-
-  if (!enable) {
-    if (hook_it != hooks.end()) {
-      hooks.erase(hook_it);
-    }
-    return bess::pb::CommandResponse();
-  }
-
-  if (hook_it != hooks.end()) {
-    return std::unexpected(
-        Err(EEXIST, "Resume hook '%s' is already installed", hook_name.c_str()));
-  }
-
-  const auto builder = bess::ResumeHookBuilder::all_resume_hook_builders().find(
-      hook_name);
-  if (builder == bess::ResumeHookBuilder::all_resume_hook_builders().end()) {
-    return std::unexpected(
-        Err(ENOENT, "No such resume hook '%s'", hook_name.c_str()));
-  }
-  auto hook = builder->second.CreateResumeHook();
-  bess::pb::CommandResponse init_response =
-      builder->second.InitResumeHook(hook.get(), arg);
-  if (init_response.has_error()) {
-    return init_response;
-  }
-  hooks.insert(std::move(hook));
-
-  return init_response;
 }
 
 // ---------------------------------------------------------------------------

@@ -503,24 +503,4 @@ TEST(DrrSettingsTest, AppliesLive) {
   EXPECT_FALSE(RequiresPausedWorkers("drr/settings"));
 }
 
-TEST(DrrSettingsTest, SettersAreLegacyOnly) {
-  ModuleHarness h;
-  Module *drr = h.Create("DRR", DrrArg(4, 0, 0), "drr");
-  ASSERT_NE(nullptr, drr);
-  bess::pb::DRRQuantumArg quantum;
-  quantum.set_quantum(700);
-  bess::pb::DRRMaxFlowQueueSizeArg queue_size;
-  queue_size.set_max_queue_size(50);
-  EXPECT_EQ(ENOTSUP, h.Action(drr, "set_quantum_size", quantum).error().code());
-  EXPECT_EQ(ENOTSUP, h.Action(drr, "set_max_flow_queue_size", queue_size).error().code());
-  // The legacy commands still run and validate, and the resource reads what
-  // they set.
-  h.MustCommand(drr, "set_quantum_size", quantum);
-  h.MustCommand(drr, "set_max_flow_queue_size", queue_size);
-  EXPECT_EQ(EINVAL,
-            h.Command(drr, "set_quantum_size", bess::pb::DRRQuantumArg()).error().code());
-  const bess::pb::DRRSettings s = DrrSettings(700, 50);
-  EXPECT_EQ("", h.ReadBackDiffers("drr/settings", {{nullptr, &s}}));
-}
-
 }  // namespace

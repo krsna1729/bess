@@ -1,6 +1,9 @@
 # Resume Hooks
 Resume hooks allow you to run arbitrary code immediately before a worker is
-resumed. They can be configured with the `ConfigureResumeHook()` RPC.
+resumed. The daemon runs the hooks installed by default; the RPC that added or
+removed a global hook at run time (`ConfigureResumeHook`) left with the legacy
+service (D-140), so a hook that is not compiled in needs a control_v2 route
+first.
 
 The API is simple, similar to that of `GateHook`. All you need to do is:
 

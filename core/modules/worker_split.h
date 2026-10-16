@@ -24,8 +24,6 @@ class WorkerSplit final : public Module {
   CommandResponse Init(const bess::pb::WorkerSplitArg &);
   void DeInit() override;
 
-  CommandResponse CommandReset(const bess::pb::WorkerSplitArg &);
-
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
   void AddActiveWorker(bess::dataplane::WorkerId wid,
@@ -37,6 +35,8 @@ class WorkerSplit final : public Module {
   // The gate of each worker (-1: dropped) `arg` asks for, or why not.
   static std::expected<Gates, std::string> StageGates(
       const bess::pb::WorkerSplitArg &arg);
+  // Applies the init argument's gates.
+  CommandResponse Reset(const bess::pb::WorkerSplitArg &arg);
   // Empty when every worker goes to its own gate (the default mode).
   bess::pb::WorkerSplitArg ReadGates() const;
 

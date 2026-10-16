@@ -28,13 +28,9 @@ using bess::utils::be32_t;
 const double PARETO_TAIL_LIMIT = 0.99;
 constexpr size_t kMinTcpPacketSize = 60;
 
-// update and set_burst edit what "settings" holds: legacy only (D-129).
-const Commands FlowGen::cmds = {
-    {"update", "FlowGenArg", MODULE_CMD_FUNC(&FlowGen::CommandUpdate),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-    {"set_burst", "FlowGenCommandSetBurstArg",
-     MODULE_CMD_FUNC(&FlowGen::CommandSetBurst), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY}};
+// "settings" (FlowGenSettings) holds the parameters; the class has no
+// actions.
+const Commands FlowGen::cmds = {};
 
 const ResourceTables FlowGen::resource_tables = {
     ResourceTable::Singleton<bess::pb::FlowGenSettings>("settings",
@@ -312,29 +308,6 @@ void FlowGen::UpdateDerivedParameters(Params *p) {
   if (p->flow_rate > 0.0) {
     p->flow_gap_ns = 1e9 / p->flow_rate;
   }
-}
-
-CommandResponse FlowGen::CommandUpdate(const bess::pb::FlowGenArg &arg) {
-  CommandResponse err;
-  err = ProcessUpdatableArguments(arg, &params_);
-  if (err.error().code() != 0) {
-    return err;
-  }
-
-  UpdateDerivedParameters(&params_);
-
-  return CommandSuccess();
-}
-
-CommandResponse FlowGen::CommandSetBurst(
-    const bess::pb::FlowGenCommandSetBurstArg &arg) {
-  if (std::string err = BurstError(arg.burst()); err.empty()) {
-    burst_.store(arg.burst(), std::memory_order_relaxed);
-  } else {
-    return CommandFailure(EINVAL, "%s", err.c_str());
-  }
-
-  return CommandSuccess();
 }
 
 CommandResponse FlowGen::Init(const bess::pb::FlowGenArg &arg) {

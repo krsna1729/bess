@@ -5,11 +5,8 @@
 
 #include "utils/format.h"
 
-const Commands Replicate::cmds = {
-    {"set_gates", "ReplicateCommandSetGatesArg",
-     MODULE_CMD_FUNC(&Replicate::CommandSetGates), Command::THREAD_UNSAFE, "",
-     Command::LEGACY_ONLY},
-};
+// "settings" (ReplicateArg) holds the gates; the class has no actions.
+const Commands Replicate::cmds = {};
 
 const ResourceTables Replicate::resource_tables = {
     ResourceTable::Singleton<bess::pb::ReplicateArg>("settings", true),
@@ -79,11 +76,6 @@ CommandResponse Replicate::Init(const bess::pb::ReplicateArg &arg) {
 
 void Replicate::DeInit() {
   settings_.Release();
-}
-
-CommandResponse Replicate::CommandSetGates(
-    const bess::pb::ReplicateCommandSetGatesArg &arg) {
-  return SetGates(arg);
 }
 
 void Replicate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {

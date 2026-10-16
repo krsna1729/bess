@@ -36,14 +36,9 @@ static inline T Load(const char *p) {
   return v;
 }
 
-// The setters edit what "settings" holds: legacy only (D-129).
-const Commands HashLB::cmds = {
-    {"set_mode", "HashLBCommandSetModeArg",
-     MODULE_CMD_FUNC(&HashLB::CommandSetMode), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY},
-    {"set_gates", "HashLBCommandSetGatesArg",
-     MODULE_CMD_FUNC(&HashLB::CommandSetGates), Command::THREAD_SAFE, "",
-     Command::LEGACY_ONLY}};
+// "settings" (HashLBSettings) holds mode, fields and gates; the class has no
+// actions.
+const Commands HashLB::cmds = {};
 
 const ResourceTables HashLB::resource_tables = {
     ResourceTable::Singleton<bess::pb::HashLBSettings>("settings")};
@@ -117,30 +112,6 @@ CommandResponse HashLB::ApplyGates(const bess::pb::HashLBCommandSetGatesArg &arg
   }
   config->gates = std::move(gates);
   *config->settings.mutable_gates() = arg.gates();
-  return CommandSuccess();
-}
-
-// Both commands build a whole new configuration and install it only if every
-// part validated: a refused command changes nothing.
-CommandResponse HashLB::CommandSetMode(
-    const bess::pb::HashLBCommandSetModeArg &arg) {
-  Config next = Current();
-  CommandResponse ret = ApplyMode(arg, &next);
-  if (ret.has_error()) {
-    return ret;
-  }
-  Install(std::move(next));
-  return CommandSuccess();
-}
-
-CommandResponse HashLB::CommandSetGates(
-    const bess::pb::HashLBCommandSetGatesArg &arg) {
-  Config next = Current();
-  CommandResponse ret = ApplyGates(arg, &next);
-  if (ret.has_error()) {
-    return ret;
-  }
-  Install(std::move(next));
   return CommandSuccess();
 }
 

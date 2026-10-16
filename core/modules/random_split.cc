@@ -13,13 +13,9 @@ static inline bool is_valid_gate(gate_idx_t gate) {
   return (gate < MAX_GATES || gate == DROP_GATE);
 }
 
-const Commands RandomSplit::cmds = {
-    {"set_droprate", "RandomSplitCommandSetDroprateArg",
-     MODULE_CMD_FUNC(&RandomSplit::CommandSetDroprate), Command::THREAD_UNSAFE,
-     "", Command::LEGACY_ONLY},
-    {"set_gates", "RandomSplitCommandSetGatesArg",
-     MODULE_CMD_FUNC(&RandomSplit::CommandSetGates), Command::THREAD_UNSAFE,
-     "", Command::LEGACY_ONLY}};
+// "settings" (RandomSplitArg) holds the drop rate and the gates; the class
+// has no actions.
+const Commands RandomSplit::cmds = {};
 
 const ResourceTables RandomSplit::resource_tables = {
     ResourceTable::Singleton<bess::pb::RandomSplitArg>("settings", true),
@@ -101,37 +97,6 @@ bess::pb::RandomSplitArg RandomSplit::ReadSettings() const {
     value.add_gates(gates_[i]);
   }
   return value;
-}
-
-CommandResponse RandomSplit::CommandSetDroprate(
-    const bess::pb::RandomSplitCommandSetDroprateArg &arg) {
-  double drop_rate = arg.drop_rate();
-  if (drop_rate < 0 || drop_rate > 1) {
-    return CommandFailure(EINVAL, "drop rate needs to be between [0, 1]");
-  }
-  drop_rate_ = drop_rate;
-
-  return CommandSuccess();
-}
-
-CommandResponse RandomSplit::CommandSetGates(
-    const bess::pb::RandomSplitCommandSetGatesArg &arg) {
-  if (arg.gates_size() > MAX_SPLIT_GATES) {
-    return CommandFailure(EINVAL, "no more than %d gates", MAX_SPLIT_GATES);
-  }
-
-  for (int i = 0; i < arg.gates_size(); i++) {
-    if (!is_valid_gate(arg.gates(i))) {
-      return CommandFailure(EINVAL, "Invalid gate %d", gates_[i]);
-    }
-  }
-
-  ngates_ = arg.gates_size();
-  for (int i = 0; i < ngates_; i++) {
-    gates_[i] = arg.gates(i);
-  }
-
-  return CommandSuccess();
 }
 
 void RandomSplit::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {

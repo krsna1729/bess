@@ -1,6 +1,5 @@
 # The C++ bessctl (G1.7, D-104): on the public C++ SDK (libbess-sdk) only,
-# never on bessd's internals. The Python files in this directory are the old
-# bessctl and pybess's test harness; they go when D-104's last step does.
+# never on bessd's internals.
 #
 # The shipped bessctl is bessd itself (D-120): bessd links bess_ctl and the
 # SDK built without its own control_v2 code (bess_sdk_embedded); installed,

@@ -217,7 +217,7 @@ grpc::Status AdminV2Service::SetCapture(grpc::ServerContext *context,
   }
   // Started under one name per format, so a gate has at most one capture of
   // each (a second is ALREADY_EXISTS, not a second writer on the FIFO);
-  // stopped by class, which also stops one the legacy API started.
+  // stopped by class, which stops one this service started under any name.
   if (request->enable()) {
     spec.hook_name = request->format() == v2::SetCaptureRequest::FORMAT_PCAP ? "pcap_capture"
                                                                               : "pcapng_capture";

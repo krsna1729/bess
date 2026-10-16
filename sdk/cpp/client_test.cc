@@ -991,8 +991,8 @@ TEST(SdkClient, ResourceGenerations) {
 
 // InvokeAction (D-129) names the module, the action and the epoch the client
 // knows (learned first) and returns the action's result. It is not retried:
-// a busy module is kBusy, a refusal (a legacy-only command: ENOTSUP)
-// kInvalidRequest with the daemon's detail, and a restart refuses it.
+// a busy module is kBusy, a refusal (a name the class declares no action for:
+// ENOTSUP) kInvalidRequest with the daemon's detail, and a restart refuses it.
 TEST(SdkClient, InvokeAction) {
   Harness h(4);
   pb::GetTransactionRequest arg;
@@ -1021,12 +1021,12 @@ TEST(SdkClient, InvokeAction) {
   EXPECT_EQ(h.f->invoked.size(), 3u) << "a busy action was retried";
   EXPECT_TRUE(h.sleeps.empty());
 
-  pb::ErrorDetail legacy;
-  legacy.set_code(pb::ErrorDetail::INVALID_ARGUMENT);
-  legacy.set_errno_value(95);  // ENOTSUP
-  legacy.set_field("action");
-  legacy.set_message("add is a legacy-only command");
-  h.f->actions = {Failed(grpc::StatusCode::INVALID_ARGUMENT, legacy)};
+  pb::ErrorDetail refused_detail;
+  refused_detail.set_code(pb::ErrorDetail::INVALID_ARGUMENT);
+  refused_detail.set_errno_value(95);  // ENOTSUP
+  refused_detail.set_field("action");
+  refused_detail.set_message("'L2Forward' does not support action 'add'");
+  h.f->actions = {Failed(grpc::StatusCode::INVALID_ARGUMENT, refused_detail)};
   auto refused = h.c->InvokeAction("l2", "add", arg);
   ASSERT_EQ(KindOf(refused), ErrorKind::kInvalidRequest);
   ASSERT_TRUE(refused.error().detail);

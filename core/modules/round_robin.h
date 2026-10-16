@@ -55,17 +55,6 @@ class RoundRobin final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  /*!
-   * Switches the RoundRobin module between "batch" vs "packet" scheduling.
-   */
-  CommandResponse CommandSetMode(
-      const bess::pb::RoundRobinCommandSetModeArg &arg);
-  /*!
-   * Sets the number of output gates.
-   */
-  CommandResponse CommandSetGates(
-      const bess::pb::RoundRobinCommandSetGatesArg &arg);
-
  private:
   struct Settings {
     int per_packet = 0;

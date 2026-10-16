@@ -58,8 +58,7 @@ class GateHook {
       : gate_(gate),
         class_name_(class_name),
         name_(name),
-        priority_(priority),
-        builder_() {}
+        priority_(priority) {}
 
   virtual ~GateHook() {}
 
@@ -83,16 +82,9 @@ class GateHook {
 
   virtual void ProcessBatch(const bess::PacketBatch *) {}
 
-  CommandResponse RunCommand(const std::string &cmd,
-                             const google::protobuf::Any &arg);
-
-  void set_builder(const GateHookBuilder *builder) { builder_ = builder; }
-
   bool operator<(const GateHook &rhs) const {
     return std::tie(priority_, name_) < std::tie(rhs.priority_, rhs.name_);
   }
-
-  static const GateHookCommands cmds;
 
  protected:
   Gate *gate_;
@@ -101,7 +93,6 @@ class GateHook {
   std::string class_name_;
   std::string name_;
   const uint16_t priority_;
-  const GateHookBuilder *builder_;
   google::protobuf::Any arg_;
 
   DISALLOW_COPY_AND_ASSIGN(GateHook);
@@ -121,20 +112,18 @@ class GateHookBuilder {
   GateHookBuilder(GateHook::constructor_t constructor,
                   const std::string &class_name,
                   const std::string &name_template,
-                  const std::string &help_text, const GateHookCommands &cmds,
+                  const std::string &help_text,
                   GateHook::init_func_t init_func)
       : hook_constructor_(constructor),
         class_name_(class_name),
         name_template_(name_template),
         help_text_(help_text),
-        cmds_(cmds),
         hook_init_func_(init_func) {}
 
   static bool RegisterGateHook(GateHook::constructor_t constructor,
                                const std::string &class_name,
                                const std::string &name_template,
                                const std::string &help_text,
-                               const GateHookCommands &cmds,
                                GateHook::init_func_t init_func);
 
   static std::map<std::string, GateHookBuilder> &all_gate_hook_builders_holder(
@@ -146,13 +135,6 @@ class GateHookBuilder {
   const std::string &name_template() const { return name_template_; }
   const std::string &help_text() const { return help_text_; }
 
-  // The command descriptors, for introspection (name, argument type, thread
-  // safety). Callers that want to run a command use RunCommand().
-  const GateHookCommands &cmds() const { return cmds_; }
-
-  CommandResponse RunCommand(GateHook *hook, const std::string &user_cmd,
-                             const google::protobuf::Any &arg) const;
-
  private:
   friend class Gate;
 
@@ -160,14 +142,8 @@ class GateHookBuilder {
   std::string class_name_;
   std::string name_template_;
   std::string help_text_;
-  const GateHookCommands cmds_;
   GateHook::init_func_t hook_init_func_;
 };
-
-inline CommandResponse GateHook::RunCommand(const std::string &cmd,
-                                            const google::protobuf::Any &arg) {
-  return builder_->RunCommand(this, cmd, arg);
-}
 
 // A class for gate, will be inherited for input gates and output gates
 class Gate {
@@ -276,19 +252,6 @@ class OGate : public Gate {
 
 }  // namespace bess
 
-template <typename T, typename H>
-static inline gate_hook_cmd_func_t GATE_HOOK_CMD_FUNC(
-    CommandResponse (H::*fn)(const T &)) {
-  return [fn](bess::GateHook *h, const google::protobuf::Any &arg) {
-    T arg_;
-    if (!UnpackTypedArgument(arg, &arg_)) {
-      return CommandFailure(EINVAL, "invalid protobuf argument");
-    }
-    auto base_fn = std::mem_fn(fn);
-    return base_fn(static_cast<H *>(h), arg_);
-  };
-}
-
 template <typename H, typename A>
 static inline bess::GateHook::init_func_t InitGateHookWithGenericArg(
     CommandResponse (H::*fn)(const bess::Gate *, const A &)) {
@@ -306,7 +269,7 @@ static inline bess::GateHook::init_func_t InitGateHookWithGenericArg(
 #define ADD_GATE_HOOK(_HOOK, _NAME_TEMPLATE, _HELP)                    \
   bool __gate_hook__##_HOOK = bess::GateHookBuilder::RegisterGateHook( \
       std::function<bess::GateHook *()>([]() { return new _HOOK(); }), \
-      _HOOK::kName, _NAME_TEMPLATE, _HELP, _HOOK::cmds,                \
+      _HOOK::kName, _NAME_TEMPLATE, _HELP,                             \
       InitGateHookWithGenericArg(&_HOOK::Init));
 
 #endif  // BESS_GATE_H_

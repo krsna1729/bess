@@ -146,9 +146,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo bash env/install-deps.sh runtime
-          sudo bash env/install-deps.sh python
           sudo bash env/install-deps.sh build
-          pip3 install --break-system-packages coverage
 
       # The live suite runs the Go control SDK's conformance driver against
       # bessd (tests/live/conformance_test.cc).
@@ -229,7 +227,7 @@ jobs:
           path: build/gcc/live-perf.json
           if-no-files-found: ignore
 
-      - name: Verify install tree, external plugin API and Python client
+      - name: Verify install tree and external plugin API
         run: python3 tools/ci_profile.py verify-install $LANE
 
       - name: Check the build left the source tree unchanged
@@ -276,7 +274,6 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo bash env/install-deps.sh runtime
-          sudo bash env/install-deps.sh python
           sudo bash env/install-deps.sh build
 
       - name: Cache DPDK

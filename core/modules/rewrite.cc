@@ -12,23 +12,22 @@
 
 #include "utils/copy.h"
 
-// D-129: "<name>/templates" holds the template list; add and clear stay for
-// the legacy ModuleCommand only.
-const Commands Rewrite::cmds = {
-    {"add", "RewriteArg", MODULE_CMD_FUNC(&Rewrite::CommandAdd),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-    {"clear", "EmptyArg", MODULE_CMD_FUNC(&Rewrite::CommandClear),
-     Command::THREAD_UNSAFE, "", Command::LEGACY_ONLY},
-};
+// "<name>/templates" holds the whole template list; the class has no
+// actions.
+const Commands Rewrite::cmds = {};
 
 const ResourceTables Rewrite::resource_tables = {
     ResourceTable::Singleton<bess::pb::RewriteArg>("templates", true)};
 
 CommandResponse Rewrite::Init(const bess::pb::RewriteArg &arg) {
-  CommandResponse ret = CommandAdd(arg);
+  // The init argument's templates; a refused one refuses the creation.
+  auto next = std::make_unique<Templates>();
+  CommandResponse ret = Build(arg, next.get());
   if (ret.has_error()) {
     return ret;
   }
+  templates_ = std::move(next);
+  arg_ = arg;
 
   // Stage builds the whole template table; apply swaps it in and restarts
   // the round robin. The table it replaced is freed with the staged value.
@@ -98,35 +97,6 @@ CommandResponse Rewrite::Build(const bess::pb::RewriteArg &arg,
     out->jump[i] = i % num;
   }
 
-  return CommandSuccess();
-}
-
-CommandResponse Rewrite::CommandAdd(const bess::pb::RewriteArg &arg) {
-  size_t curr = templates_->num;
-
-  if (curr + arg.templates_size() > bess::PacketBatch::kMaxBurst) {
-    return CommandFailure(EINVAL, "max %zu packet templates can be used %zu %d",
-                          bess::PacketBatch::kMaxBurst, curr,
-                          arg.templates_size());
-  }
-
-  // The list so far plus `arg`'s, built afresh (all or nothing).
-  bess::pb::RewriteArg all = arg_;
-  all.mutable_templates()->MergeFrom(arg.templates());
-  auto next = std::make_unique<Templates>();
-  CommandResponse ret = Build(all, next.get());
-  if (ret.has_error()) {
-    return ret;
-  }
-  templates_ = std::move(next);
-  arg_ = std::move(all);
-  return CommandSuccess();
-}
-
-CommandResponse Rewrite::CommandClear(const bess::pb::EmptyArg &) {
-  next_turn_ = 0;
-  templates_->num = 0;
-  arg_.Clear();
   return CommandSuccess();
 }
 

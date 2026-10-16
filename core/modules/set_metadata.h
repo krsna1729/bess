@@ -37,7 +37,6 @@ class SetMetadata final : public Module {
   }
 
   CommandResponse Init(const bess::pb::SetMetadataArg &arg);
-  CommandResponse GetInitialArg(const bess::pb::EmptyArg &);
 
   // Compiles `ops_` from the attributes and their offsets, which a resume
   // assigns just before.
@@ -68,8 +67,6 @@ class SetMetadata final : public Module {
   std::vector<struct Attr> attrs_;
   // Attributes without a valid offset (no reader downstream) are left out.
   std::vector<Op> ops_;
-
-  bess::pb::SetMetadataArg init_arg_;
 };
 
 #endif  // BESS_MODULES_SETMETADATA_H_
