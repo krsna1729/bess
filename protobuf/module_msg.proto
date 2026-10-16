@@ -25,61 +25,6 @@ message EmptyArg {
 }
 
 /**
- * The BPF module has a command `clear()` that takes no parameters.
- * This command removes all filters from the module.
- */
-message BPFCommandClearArg {
-}
-
-/**
- * The ExactMatch module has a command `add(...)` that takes two parameters.
- * The ExactMatch initializer specifies what fields in a packet to inspect; add() specifies
- * which values to check for over these fields.
- * add() inserts a new rule into the ExactMatch module such that traffic matching
- * that bytestring will be forwarded
- * out a specified gate.
- * Example use: `add(fields=[aton('12.3.4.5'), aton('5.4.3.2')], gate=2)`
- */
-message ExactMatchCommandAddArg {
-  uint64 gate = 1; /// The gate to forward out packets that mach this rule.
-  repeated FieldData fields = 2; /// The exact match values to check for
-  uint32 action_id = 3; /// The action this rule names (action mode only).
-}
-
-/**
- * The ExactMatch module has a command `delete(...)` which deletes an existing rule.
- * Example use: `delete(fields=[aton('12.3.4.5'), aton('5.4.3.2')])`
- */
-message ExactMatchCommandDeleteArg {
-  repeated FieldData fields = 2; /// The field values for the rule to be deleted.
-}
-
-/**
- * The ExactMatch module has a command `clear()` which takes no parameters.
- * This command removes all rules from the ExactMatch module.
- */
-message ExactMatchCommandClearArg {
-}
-
-/**
- * The ExactMatch module has a command `set_default_gate(...)` which takes one parameter.
- * This command routes all traffic which does _not_ match a rule to a specified gate.
- * Example use in bessctl: `setDefaultGate(gate=2)`
- */
-message ExactMatchCommandSetDefaultGateArg {
-  uint64 gate = 1; /// The gate number to send the default traffic out.
-}
-
-/**
- * The FlowGen module has a command `set_burst(...)` that allows you to specify
- * the maximum number of packets to be stored in a single PacketBatch released
- * by the module.
- */
-message FlowGenCommandSetBurstArg {
-  uint64 burst = 1;
-}
-
-/**
  * FlowGen's run-time settings (D-129): the singleton resource
  * "<module>/settings", requiring paused workers. It holds what `update`
  * (FlowGenArg's updatable fields) and `set_burst` set, validated as they
@@ -134,28 +79,6 @@ message HashLBSettings {
   repeated int64 gates = 3; /// The gates to load balance over.
 }
 
-/**
- * The IPLookup module has a command `add(...)` which takes three paramters.
- * This function accepts the routing rules -- CIDR prefix, CIDR prefix length,
- * and what gate to forward matching traffic out on.
- * Example use in bessctl: `table.add(prefix='10.0.0.0', prefix_len=8, gate=2)`
- */
-message IPLookupCommandAddArg {
-  string prefix = 1; /// The CIDR IP part of the prefix to match
-  uint64 prefix_len = 2; /// The prefix length
-  uint64 gate = 3; /// The number of the gate to forward matching traffic on.
-}
-
-/**
- * The IPLookup module has a command `delete(...)` which takes two paramters.
- * This function accepts the routing rules -- CIDR prefix, CIDR prefix length,
- * Example use in bessctl: `table.delete(prefix='10.0.0.0', prefix_len=8)`
- */
-message IPLookupCommandDeleteArg {
-  string prefix = 1; /// The CIDR IP part of the prefix to match
-  uint64 prefix_len = 2; /// The prefix length
-}
-
 /// A route of the IPLookup resource "<module>/routes" (D-111): key.
 message IPLookupRouteKey {
   string prefix = 1; /// The CIDR IP part of the prefix, e.g. "10.0.0.0"
@@ -165,44 +88,6 @@ message IPLookupRouteKey {
 /// A route of the IPLookup resource "<module>/routes": value.
 message IPLookupRouteValue {
   uint64 gate = 1; /// The output gate
-}
-
-/**
- * The IPLookup module has a command `clear()` which takes no parameters.
- * This function removes all rules in the IPLookup table.
- * Example use in bessctl: `myiplookuptable.clear()`
- */
-message IPLookupCommandClearArg {
-}
-
-/**
- * The L2Forward module forwards traffic via exact match over the Ethernet
- * destination address. The command `add(...)`  allows you to specifiy a
- * MAC address and which gate the L2Forward module should direct it out of.
- */
-message L2ForwardCommandAddArg {
-  message Entry {
-    string addr = 1; /// The MAC address to match
-    int64 gate = 2; /// Which gate to send out traffic matching this address.
-  }
-  repeated Entry entries = 1; /// A list of L2Forward entries.
-}
-
-/**
- * The L2Forward module has a function `delete(...)` to remove a rule
- * from the MAC forwarding table.
- */
-message L2ForwardCommandDeleteArg {
-  repeated string addrs = 1; /// The address to remove from the forwarding table
-}
-
-/**
- * For traffic reaching the L2Forward module which does not match a MAC rule,
- * the function `set_default_gate(...)` allows you to specify a default gate
- * to direct unmatched traffic to.
- */
-message L2ForwardCommandSetDefaultGateArg {
-  int64 gate = 1; /// The default gate to forward traffic which matches no entry to.
 }
 
 /**
@@ -295,22 +180,6 @@ message DRRArg {
 }
 
 /**
- * the SetQuantumSize function sets a new quantum for DRR module to operate on.
- */
-message DRRQuantumArg {
-  uint32 quantum = 1;  /// the number of bytes to allocate to each on every round
-}
-
-/**
- * The SetMaxQueueSize function sets a new maximum flow queue size for DRR module.
- * If the flow's queue gets to this size, the module starts dropping packets to
- * that flow until the queue is below this size.
- */
-message DRRMaxFlowQueueSizeArg {
-  uint32 max_queue_size = 1;  /// the max size that any Flows queue can get
-}
-
-/**
  * DRR's run-time settings (D-129): the singleton resource
  * "<module>/settings", applied live. quantum is what set_quantum_size sets,
  * max_flow_queue_size what set_max_flow_queue_size sets; both at least 1.
@@ -318,15 +187,6 @@ message DRRMaxFlowQueueSizeArg {
 message DRRSettings {
   uint32 quantum = 1; /// Bytes allocated to each flow on every round.
   uint32 max_flow_queue_size = 2; /// The max size that any flow's queue can get.
-}
-
-/**
- * The module PortInc has a function `set_burst(...)` that allows you to specify the
- * maximum number of packets to be stored in a single PacketBatch released by
- * the module.
- */
-message PortIncCommandSetBurstArg {
-  uint64 burst = 1; /// The maximum "burst" of packets (ie, the maximum batch size)
 }
 
 /**
@@ -338,37 +198,11 @@ message PortIncSettings {
 }
 
 /**
- * The module QueueInc has a function `set_burst(...)` that allows you to specify
- * the maximum number of packets to be stored in a single PacketBatch released
- * by the module.
- */
-message QueueIncCommandSetBurstArg {
-  uint64 burst = 1; /// The maximum "burst" of packets (ie, the maximum batch size)
-}
-
-/**
  * QueueInc's run-time settings (D-129): the singleton resource
  * "<module>/settings", applied live: what set_burst sets.
  */
 message QueueIncSettings {
   uint64 burst = 1; /// Packets per batch, at most 32.
-}
-
-/**
- * The module Queue has a function `set_burst(...)` that allows you to specify
- * the maximum number of packets to be stored in a single PacketBatch released
- * by the module.
- */
-message QueueCommandSetBurstArg {
-  uint64 burst = 1; /// The maximum "burst" of packets (ie, the maximum batch size)
-}
-
-/**
- * The module Queue has a function `set_size(...)` that allows specifying the
- * size of the queue in total number of packets.
- */
-message QueueCommandSetSizeArg {
-  uint64 size = 1; /// The maximum number of packets to store in the queue.
 }
 
 /**
@@ -388,27 +222,6 @@ message QueueCommandGetStatusResponse {
   uint64 enqueued = 3; /// total enqueued
   uint64 dequeued = 4; /// total dequeued
   uint64 dropped = 5;  /// total dropped
-}
-
-/**
- * The function `clear()` for RandomUpdate takes no parameters and clears all
- * state in the module.
- */
-message RandomUpdateCommandClearArg {
-}
-
-/**
- * The function `clear()` for Rewrite takes no parameters and clears all state
- * in the module.
- */
-message RewriteCommandClearArg {
-}
-
-/**
- * The function `clear()` for Update takes no parameters and clears all state in
- * the module.
- */
-message UpdateCommandClearArg {
 }
 
 /**
@@ -542,29 +355,6 @@ message WildcardMatchCommandAddArg {
 }
 
 /**
- * The module WildcardMatch has a command `delete(...)` which removes a rule -- simply specify the values and masks from the previously inserted rule to remove them.
- */
-message WildcardMatchCommandDeleteArg {
-  repeated FieldData values = 1; /// The values being checked for in the rule
-  repeated FieldData masks = 2; /// The bitmask from the rule.
-}
-
-/**
- * The function `clear()` for WildcardMatch takes no parameters, it clears
- * all state in the WildcardMatch module (is equivalent to calling delete for all rules)
- */
-message WildcardMatchCommandClearArg {
-}
-
-/**
- * For traffic which does not match any rule in the WildcardMatch module,
- * the `set_default_gate(...)` function specifies which gate to send this extra traffic to.
- */
-message WildcardMatchCommandSetDefaultGateArg {
-  uint64 gate = 1;
-}
-
-/**
  * WildcardMatch's run-time settings, the singleton resource
  * "<module>/settings" (D-129): what `set_default_gate(...)` sets.
  */
@@ -673,16 +463,6 @@ message ExactMatchArg {
   repeated FieldData masks = 2; /// mask(i) corresponds to the mask for field(i)
   string action_resource = 3; /// The ActionTable's actions resource: when set, a rule may name an action (its action_id, 0 for none) and a gate of its own (0, the graph's connection to the action table, unless the rule says otherwise). The action id goes to the packet's "action_id" metadata attribute (D-141).
   optional uint64 default_gate = 4; /// The gate of a packet no rule matches (default: drop); set_default_gate changes it later.
-}
-
-/**
- * ExactMatchConfig represents the current runtime configuration
- * of an ExactMatch module, as returned by get_runtime_config and
- * set by set_runtime_config.
- */
-message ExactMatchConfig {
-  uint64 default_gate = 1;
-  repeated ExactMatchCommandAddArg rules = 2;
 }
 
 /**
@@ -1008,12 +788,6 @@ message StaticNATArg {
 }
 
 /**
- * This module is used for testing purposes.
- */
-message NoOpArg {
-}
-
-/**
  * The PortInc module connects a physical or virtual port and releases
  * packets from it. PortInc does not support multiqueueing.
  * For details on how to configure PortInc using DPDK, virtual ports,
@@ -1153,22 +927,6 @@ message RandomSplitArg {
 }
 
 /**
- * The RandomSplit module has a function `set_droprate(...)` which specifies
- * the probability of dropping packets
- */
-message RandomSplitCommandSetDroprateArg {
-  double drop_rate = 1; /// Probability of dropping packet.
-}
-
-/**
- * The RandomSplit module has a function `set_gates(...)` which changes
- * the total number of output gates in the module.
- */
-message RandomSplitCommandSetGatesArg {
-  repeated int64 gates = 1; /// A list of gate numbers to split the traffic.
-}
-
-/**
  * The RandomUpdate module rewrites a specified field (`offset` and `size`) in a packet
  * with a random value between a specified min and max values.
  *
@@ -1202,22 +960,6 @@ message RewriteArg {
 }
 
 /**
- * The RoundRobin module has a function `set_gates(...)` which changes
- * the total number of output gates in the module.
- */
-message RoundRobinCommandSetGatesArg {
-  repeated int64 gates = 1; /// A list of gate numbers to round-robin the traffic over.
-}
-
-/**
- * The RoundRobin module has a function `set_mode(...)` which specifies whether
- * to balance traffic across gates per-packet or per-batch.
- */
-message RoundRobinCommandSetModeArg {
-  string mode = 1; /// whether to perform `'packet'` or `'batch'` round robin partitioning.
-}
-
-/**
  * The RoundRobin module splits packets from one input gate across multiple output
  * gates.
  *
@@ -1238,14 +980,6 @@ message RoundRobinArg {
  */
 message ReplicateArg {
   repeated int64 gates = 1; /// A list of gate numbers to send packet copies to.
-}
-
-/**
- * The Replicate module has a function `set_gates(...)` which changes
- * the total number of output gates in the module.
- */
-message ReplicateCommandSetGatesArg {
-  repeated int64 gates = 1; /// A list of gate numbers to replicate the traffic over.
 }
 
 /**
@@ -1284,23 +1018,6 @@ message SetMetadataArg {
  * __Output Gates__: 0
  */
 message SinkArg {
-}
-
-/**
- * The Source module has a function `set_burst(...)` which
- * specifies the maximum number of packets to release in a single packetbatch
- * from the module.
- */
-message SourceCommandSetBurstArg {
-  uint64 burst = 1; /// The maximum number of packets to release in a packetbatch from the module.
-}
-
-/**
- * The Source module has a function `set_pkt_size(...)` which specifies the size
- * of packets to be produced by the Source module.
- */
-message SourceCommandSetPktSizeArg {
-  uint64 pkt_size = 1; /// The size (in bytes) of the packets for Source to create.
 }
 
 /**
@@ -1500,16 +1217,6 @@ message WildcardMatchArg {
 }
 
 /**
- * WildcardMatchConfig represents the current runtime configuration
- * of a WildcardMatch module, as returned by get_runtime_config and
- * set by set_runtime_config.
- */
-message WildcardMatchConfig {
-  uint64 default_gate = 1;
-  repeated WildcardMatchCommandAddArg rules = 2;
-}
-
-/**
  * The ARP Responder module is responding to ARP requests.
  * It has a function `add(...)` which adds one IP-MAC mapping.
  *
@@ -1642,13 +1349,6 @@ message VifCommandAddArg {
   uint32 gate = 6;
 }
 
-message VifCommandDeleteArg {
-  uint32 id = 1;
-}
-
-message VifCommandClearArg {
-}
-
 /// The key of a Vif's "<module>/interfaces" resource (D-129): the logical VIF
 /// ID (non-zero).
 message VifInterfaceKey {
@@ -1679,18 +1379,6 @@ message VifInterfaceValue {
 message BridgeArg {
   uint32 size = 1;        /// Maximum dynamic MAC entries (default: 1024)
   uint32 aging_time = 2;  /// Aging timeout in seconds (default: 300)
-}
-
-message BridgeCommandAddArg {
-  string mac_addr = 1;    /// Static MAC address
-  uint32 gate = 2;        /// Output gate
-}
-
-message BridgeCommandDeleteArg {
-  string mac_addr = 1;    /// MAC address to delete
-}
-
-message BridgeCommandClearArg {
 }
 
 /// The key of a Bridge's "<module>/statics" resource (D-129): one static MAC.

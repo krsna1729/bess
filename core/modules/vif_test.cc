@@ -30,8 +30,6 @@ using bess::PacketRef;
 using bess::PlainPacketPool;
 using bess::pb::VifArg;
 using bess::pb::VifCommandAddArg;
-using bess::pb::VifCommandClearArg;
-using bess::pb::VifCommandDeleteArg;
 using bess::pb::VifInterfaceKey;
 using bess::pb::VifInterfaceValue;
 using bess::testing::Bytes;

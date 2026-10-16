@@ -10240,3 +10240,63 @@ Arch), two further environment-specific reports need switching off to run that t
 `__SANITIZER_DISABLE_CONTAINER_OVERFLOW__` exists for). CI's protobuf build does not need them.
 
 **Code.** `tools/lsan.supp`, `tools/ci_profile.py` (the address branch).
+
+---
+
+## D-143 The protobuf surface keeps only what runs: the legacy command messages are gone
+
+- The legacy `BESSControl` service is gone (D-140), and with it every command only that service could call.
+  Their argument and reply messages stayed: a message is API surface a client can name, a schema every
+  language's bindings generate, and a name the JSON form of the API owns.
+- The rule that decides what stays: a message stays when a live path names it -- `GetSchema`'s roots (a module's
+  Init argument, its actions, its resource keys and values, `Pipeline` itself) -- or when a *test* names it as a
+  value type. 99 messages failed it: 82 named by no code and outside every live root, 4 whose only reference was
+  the deleted service (plus one stale error string in `control_plane.cc`), and 13 that tests drove through the
+  legacy command shapes.
+- `HashLBCommandSet{Mode,Gates}Arg` stay: `HashLB::Init` applies them (`core/modules/hash_lb.cc:120-127`). The
+  prune is by *reference*, never by name.
+- What replaced the test-only messages: local value types (`EmRule`/`EmConfig` in the exact-match tests,
+  `WmRuleSpec`/`WmConfig` in the wildcard ones) and the resource key/value protos, so a fixture is a value in
+  the resource model the module actually has. A fixture that asserted a gone command's shape passes an empty
+  argument and reads the state back through the resource instead.
+- Why not keep them "just in case": nothing can reach them. Keeping them keeps codegen, bindings and the JSON
+  name space for calls no client can make, and it hides the real surface -- resources and actions -- behind the
+  one that was cut over.
+
+**Verification.** Every deleted name is absent from the tree: a `grep -w` over `core/ sdk/ tools/ tests/
+protobuf/` for all 111 deleted `message` names finds only two comments in the rewritten tests ("the shape the
+legacy ... wire message carried") and `v2`'s own same-named `ImportPluginRequest`/`UnloadPluginRequest`
+(`core/control/admin_v2.*`). `buf breaking` does not flag such a push: push 68 deleted `service.proto` itself
+and its Protobuf compatibility job was green, as was push 70's.
+
+**Consequence.** The proto surface is 856 lines smaller (bess_msg 544, module_msg 312), and the generated
+bindings every SDK consumer builds shrink with it. A client that asks for a deleted type is refused the same
+way it was after D-140: an unknown type from `GetSchema`.
+
+**Code.** `protobuf/bess_msg.proto`, `protobuf/module_msg.proto`, `core/control/control_plane.cc`,
+`core/control/api_v2_test.cc`, `core/modules/{bridge,exact_match,wildcard_match,vif}_test.cc`,
+`sdk/conformance/cases.json`.
+
+---
+
+## D-144 The gate byte counter is gone; its switch was never reachable
+
+- `TrackArg.bits` was the byte counter's only switch. `core/gate_hooks/track.cc:21` read it, and
+  `OGate::AddTrackHook` installs the hook with a default `TrackArg` (`core/module_graph.cc:320`), so in every
+  build the switch was false: the hook counted batches and packets, and `bess_gate_bytes_total` -- emitted only
+  when the value was nonzero -- could never appear.
+- Decision: remove the feature, not just its switch. `TrackArg` carries no fields (`reserved 5; reserved
+  "bits";`), `set_track_bytes`, `track_bytes_`, `Track::Totals::bytes`, the `bytes()` accessor, the `kBytes`
+  counter slot and the `bess_gate_bytes_total` sample are gone, and the hook's counter set is two counters.
+- Why reserve the field rather than reuse it: the number and the name were published in the module proto. A
+  later byte counter -- a different feature, with an explicit switch -- starts from a new number, and no client
+  can silently write the old one.
+- Why the metric went with it: a metric that cannot be emitted is a promise the API does not keep. `GetMetrics`
+  now lists exactly what `ProcessBatch` fills.
+
+**Consequence.** One fewer branch in the per-gate hook and one fewer counter per gate direction, which is the
+per-packet path's own hot structure. Nothing read the value: the metrics sample was the only consumer, and the
+accessor had no caller.
+
+**Code.** `core/gate_hooks/track.h`, `core/gate_hooks/track.cc`, `core/control/api_v2.cc`,
+`protobuf/bess_msg.proto`.

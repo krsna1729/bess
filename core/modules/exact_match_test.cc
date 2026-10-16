@@ -31,29 +31,83 @@
 namespace {
 
 using bess::pb::ExactMatchArg;
-using bess::pb::ExactMatchCommandAddArg;
-using bess::pb::ExactMatchCommandDeleteArg;
-using bess::pb::ExactMatchConfig;
 
 using bess::pb::ExactMatchRuleKey;
 using bess::pb::ExactMatchRuleValue;
 using bess::testing::ModuleHarness;
 
+// The shape the legacy ExactMatchConfig wire message carried (rules and a
+// default gate). That message went with the legacy service (D-140); the tests
+// compare configurations, so they compare this.
+struct EmRule {
+  ExactMatchRuleKey key;
+  uint64_t gate_value = 0;
+  uint64_t action_value = 0;
+  uint64_t gate() const { return gate_value; }
+  uint64_t action_id() const { return action_value; }
+  void set_gate(uint64_t g) { gate_value = g; }
+  void set_action_id(uint64_t a) { action_value = a; }
+  int fields_size() const { return key.fields_size(); }
+  const bess::pb::FieldData &fields(int i) const { return key.fields(i); }
+  bess::pb::FieldData *add_fields() { return key.add_fields(); }
+  bess::pb::FieldData *mutable_fields(int i) { return key.mutable_fields(i); }
+};
+
+struct EmConfig {
+  std::vector<EmRule> rule_list;
+  uint64_t gate_value = 0;
+  int rules_size() const { return static_cast<int>(rule_list.size()); }
+  const EmRule &rules(int i) const { return rule_list[i]; }
+  const std::vector<EmRule> &rules() const { return rule_list; }
+  std::vector<EmRule> *mutable_rules() { return &rule_list; }
+  EmRule *mutable_rules(int i) { return &rule_list[i]; }
+  EmRule *add_rules() {
+    rule_list.emplace_back();
+    return &rule_list.back();
+  }
+  uint64_t default_gate() const { return gate_value; }
+  void set_default_gate(uint64_t g) { gate_value = g; }
+  std::string DebugString() const {
+    std::string out = "default_gate: " + std::to_string(gate_value);
+    for (const EmRule &r : rule_list) {
+      out += "\nrule: gate " + std::to_string(r.gate()) + " action " +
+             std::to_string(r.action_id()) + " fields " +
+             std::to_string(r.fields_size());
+    }
+    return out;
+  }
+  bool operator==(const EmConfig &o) const {
+    if (gate_value != o.gate_value || rule_list.size() != o.rule_list.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < rule_list.size(); i++) {
+      const EmRule &a = rule_list[i];
+      const EmRule &b = o.rule_list[i];
+      if (a.gate() != b.gate() || a.action_id() != b.action_id() ||
+          a.fields_size() != b.fields_size()) {
+        return false;
+      }
+      for (int f = 0; f < a.fields_size(); f++) {
+        if (a.fields(f).SerializeAsString() != b.fields(f).SerializeAsString()) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+};
+
 // Rule edits as a client sends them (D-140): "<name>/rules" through the
 // process's transaction engine -- the path the legacy `add`, `delete` and
 // `clear` commands took. "" when it applied, else why not.
-std::string AddRule(ModuleHarness &h, Module *m, const ExactMatchCommandAddArg &rule) {
-  ExactMatchRuleKey key;
-  *key.mutable_fields() = rule.fields();
+std::string AddRule(ModuleHarness &h, Module *m, const EmRule &rule) {
   ExactMatchRuleValue value;
   value.set_gate(rule.gate());
   value.set_action_id(rule.action_id());
-  return h.UpsertResource(std::string(m->name()) + "/rules", key, value);
+  return h.UpsertResource(std::string(m->name()) + "/rules", rule.key, value);
 }
 
-std::string DeleteRule(ModuleHarness &h, Module *m, const ExactMatchCommandDeleteArg &rule) {
-  ExactMatchRuleKey key;
-  *key.mutable_fields() = rule.fields();
+std::string DeleteRule(ModuleHarness &h, Module *m, const ExactMatchRuleKey &key) {
   return h.EraseResource(std::string(m->name()) + "/rules", key);
 }
 
@@ -83,7 +137,7 @@ std::string SetDefaultGate(ModuleHarness &h, Module *m, uint64_t gate) {
 // and every listed rule upserted together, so a bad rule refuses the whole
 // change. The legacy `set_runtime_config` built the new table in full and
 // swapped it in; this holds the same line for a client.
-std::string Restore(ModuleHarness &h, Module *m, const ExactMatchConfig &config) {
+std::string Restore(ModuleHarness &h, Module *m, const EmConfig &config) {
   const std::string rules = std::string(m->name()) + "/rules";
   const bess::framework::ResourceCodec *codec = h.Codec(rules);
   EXPECT_NE(nullptr, codec) << rules;
@@ -93,15 +147,13 @@ std::string Restore(ModuleHarness &h, Module *m, const ExactMatchConfig &config)
   // One op per key: duplicates collapse to the last, as the legacy restore's
   // table build did (and as one transaction requires).
   std::map<bess::dataplane::ResourceKey, std::any> desired;
-  for (const ExactMatchCommandAddArg &rule : config.rules()) {
-    ExactMatchRuleKey key;
-    *key.mutable_fields() = rule.fields();
+  for (const EmRule &rule : config.rules()) {
     ExactMatchRuleValue value;
     value.set_gate(rule.gate());
     value.set_action_id(rule.action_id());
     google::protobuf::Any packed_key;
     google::protobuf::Any packed_value;
-    EXPECT_TRUE(packed_key.PackFrom(key));
+    EXPECT_TRUE(packed_key.PackFrom(rule.key));
     EXPECT_TRUE(packed_value.PackFrom(value));
     auto k = codec->Key(packed_key.type_url(), packed_key.value());
     auto v = codec->Value(packed_value.type_url(), packed_value.value());
@@ -138,20 +190,20 @@ std::string Restore(ModuleHarness &h, Module *m, const ExactMatchConfig &config)
 
 // What "<name>/rules" and "<name>/settings" hold, as get_runtime_config
 // reported it (its sort included): the resources are the state.
-ExactMatchConfig ReadConfig(ModuleHarness &h, Module *m) {
-  ExactMatchConfig config;
+EmConfig ReadConfig(ModuleHarness &h, Module *m) {
+  EmConfig config;
   for (const auto &[packed_key, packed_value] : h.ReadResource(std::string(m->name()) + "/rules")) {
     ExactMatchRuleKey key;
     ExactMatchRuleValue value;
     EXPECT_TRUE(packed_key.UnpackTo(&key));
     EXPECT_TRUE(packed_value.UnpackTo(&value));
-    ExactMatchCommandAddArg *rule = config.add_rules();
-    *rule->mutable_fields() = key.fields();
+    EmRule *rule = config.add_rules();
+    rule->key = key;
     rule->set_gate(value.gate());
     rule->set_action_id(value.action_id());
   }
   std::sort(config.mutable_rules()->begin(), config.mutable_rules()->end(),
-            [](const ExactMatchCommandAddArg &a, const ExactMatchCommandAddArg &b) {
+            [](const EmRule &a, const EmRule &b) {
               // ReadConfig's order, for a stable comparison (the table's own
               // iteration order is not what the module promises): by the
               // rule's value first.
@@ -199,27 +251,27 @@ class ExactMatchTest : public ::testing::Test {
     return static_cast<ExactMatch *>(m);
   }
 
-  static ExactMatchCommandAddArg Rule(uint32_t a, uint16_t b, uint64_t gate) {
-    ExactMatchCommandAddArg arg;
+  static EmRule Rule(uint32_t a, uint16_t b, uint64_t gate) {
+    EmRule arg;
     arg.set_gate(gate);
     arg.add_fields()->set_value_int(a);
     arg.add_fields()->set_value_int(b);
     return arg;
   }
 
-  static ExactMatchCommandDeleteArg Key(uint32_t a, uint16_t b) {
-    ExactMatchCommandDeleteArg arg;
-    arg.add_fields()->set_value_int(a);
-    arg.add_fields()->set_value_int(b);
-    return arg;
+  static ExactMatchRuleKey Key(uint32_t a, uint16_t b) {
+    ExactMatchRuleKey key;
+    key.add_fields()->set_value_int(a);
+    key.add_fields()->set_value_int(b);
+    return key;
   }
 
-  std::string AddRule(Module *m, const ExactMatchCommandAddArg &rule) {
+  std::string AddRule(Module *m, const EmRule &rule) {
     return ::AddRule(h_, m, rule);
   }
 
-  std::string DeleteRule(Module *m, const ExactMatchCommandDeleteArg &rule) {
-    return ::DeleteRule(h_, m, rule);
+  std::string DeleteRule(Module *m, const ExactMatchRuleKey &key) {
+    return ::DeleteRule(h_, m, key);
   }
 
   std::string ClearRules(Module *m) { return ::ClearRules(h_, m); }
@@ -228,11 +280,11 @@ class ExactMatchTest : public ::testing::Test {
     return ::SetDefaultGate(h_, m, gate);
   }
 
-  std::string Restore(Module *m, const ExactMatchConfig &config) {
+  std::string Restore(Module *m, const EmConfig &config) {
     return ::Restore(h_, m, config);
   }
 
-  ExactMatchConfig Config(Module *m) { return ReadConfig(h_, m); }
+  EmConfig Config(Module *m) { return ReadConfig(h_, m); }
 
   bess::testing::ModuleHarness h_;
 };
@@ -245,7 +297,7 @@ TEST_F(ExactMatchTest, AddDeleteClearAndDefaultGate) {
   EXPECT_EQ("", AddRule(m, Rule(2, 20, 4)));  // update
   EXPECT_EQ("2 fields, 2 rules", m->GetDesc());
 
-  ExactMatchConfig config = Config(m);
+  EmConfig config = Config(m);
   ASSERT_EQ(2, config.rules_size());
   EXPECT_EQ(3u, config.rules(0).gate());  // ReadConfig's order: by gate
   EXPECT_EQ(4u, config.rules(1).gate());
@@ -302,12 +354,12 @@ TEST_F(ExactMatchTest, DefaultGateAtCreation) {
 TEST_F(ExactMatchTest, RejectsWrongFieldCountAndSize) {
   ExactMatch *m = Create();
   ASSERT_NE(nullptr, m);
-  ExactMatchCommandAddArg one_field;
+  EmRule one_field;
   one_field.set_gate(1);
   one_field.add_fields()->set_value_int(1);
   EXPECT_NE("", AddRule(m, one_field)) << "one field, the module has two";
 
-  ExactMatchCommandAddArg wide = Rule(1, 2, 1);
+  EmRule wide = Rule(1, 2, 1);
   wide.mutable_fields(1)->set_value_bin(std::string(3, 'x'));
   EXPECT_NE("", AddRule(m, wide)) << "a field wider than the module's";
   EXPECT_EQ(0, Config(m).rules_size());
@@ -326,7 +378,7 @@ TEST_F(ExactMatchTest, GrowsWithoutLosingRules) {
       EXPECT_EQ("", DeleteRule(m, Key(i - 2, static_cast<uint16_t>((i - 2) * 7))));
     }
   }
-  const ExactMatchConfig config = Config(m);
+  const EmConfig config = Config(m);
   EXPECT_EQ(static_cast<int>(kRules - kRules / 5), config.rules_size());
   EXPECT_EQ("2 fields, 16000 rules", m->GetDesc());
   for (const auto &rule : config.rules()) {
@@ -367,21 +419,21 @@ TEST_F(ExactMatchTest, RestoreReplacesRulesAndCollapsesDuplicates) {
   ASSERT_NE(nullptr, m);
   EXPECT_EQ("", AddRule(m, Rule(9, 9, 9)));
 
-  ExactMatchConfig restore;
+  EmConfig restore;
   restore.set_default_gate(5);
   *restore.add_rules() = Rule(1, 1, 1);
   *restore.add_rules() = Rule(2, 2, 2);
   *restore.add_rules() = Rule(1, 1, 3);  // last one wins
   EXPECT_EQ("", Restore(m, restore));
 
-  const ExactMatchConfig config = Config(m);
+  const EmConfig config = Config(m);
   EXPECT_EQ(5u, config.default_gate());
   ASSERT_EQ(2, config.rules_size());
   EXPECT_EQ(2u, config.rules(0).gate());
   EXPECT_EQ(3u, config.rules(1).gate());
 
   // A bad restore leaves the running configuration alone.
-  ExactMatchConfig bad = restore;
+  EmConfig bad = restore;
   bad.mutable_rules(0)->mutable_fields(0)->set_value_bin("toolong!!");
   EXPECT_NE("", Restore(m, bad));
   EXPECT_EQ(2, Config(m).rules_size());
@@ -394,7 +446,6 @@ using bess::testing::Ip4;
 using bess::testing::ModuleHarness;
 using bess::testing::PacketBuilder;
 using bess::testing::TcpPacket;
-using google::protobuf::util::MessageDifferencer;
 
 bess::pb::Field OffsetField(uint32_t offset, uint32_t bytes) {
   bess::pb::Field f;
@@ -421,8 +472,8 @@ std::string Ip(const char *text) {
   return std::string(a.begin(), a.end());
 }
 
-ExactMatchCommandAddArg BinRule(const std::vector<std::string> &values, uint64_t gate) {
-  ExactMatchCommandAddArg arg;
+EmRule BinRule(const std::vector<std::string> &values, uint64_t gate) {
+  EmRule arg;
   arg.set_gate(gate);
   for (const std::string &v : values) {
     *arg.add_fields() = Bin(v);
@@ -430,17 +481,11 @@ ExactMatchCommandAddArg BinRule(const std::vector<std::string> &values, uint64_t
   return arg;
 }
 
-ExactMatchCommandDeleteArg BinKey(const std::vector<std::string> &values) {
-  ExactMatchCommandDeleteArg arg;
+ExactMatchRuleKey BinKey(const std::vector<std::string> &values) {
+  ExactMatchRuleKey arg;
   for (const std::string &v : values) {
     *arg.add_fields() = Bin(v);
   }
-  return arg;
-}
-
-bess::pb::ExactMatchCommandSetDefaultGateArg DefaultGate(uint64_t gate) {
-  bess::pb::ExactMatchCommandSetDefaultGateArg arg;
-  arg.set_gate(gate);
   return arg;
 }
 
@@ -552,13 +597,13 @@ TEST(ExactMatchPacketTest, RuntimeConfigReproducesTheModule) {
   EXPECT_EQ("", AddRule(h, em, BinRule({std::string("\x88\x80", 2), "\x03"}, 1)));
   EXPECT_EQ("", SetDefaultGate(h, em, 3));
 
-  ExactMatchConfig expect;
+  EmConfig expect;
   expect.set_default_gate(3);
   *expect.add_rules() = BinRule({std::string("\x88\x80", 2), "\x03"}, 1);
   *expect.add_rules() = BinRule({"\x77\x70", "\x05"}, 2);
 
-  const ExactMatchConfig config = ReadConfig(h, em);
-  EXPECT_TRUE(MessageDifferencer::Equals(expect, config)) << config.DebugString();
+  const EmConfig config = ReadConfig(h, em);
+  EXPECT_EQ(expect, config) << config.DebugString();
 }
 
 // Every mutating command rebuilds the table; a metadata field must survive
@@ -575,7 +620,7 @@ TEST(ExactMatchPacketTest, MetadataFieldSurvivesTableRebuilds) {
   EXPECT_EQ("", AddRule(h, em, BinRule({key}, 1)));
   EXPECT_EQ("", AddRule(h, em, BinRule({key}, 2)));  // an update: one rule
   EXPECT_EQ("", SetDefaultGate(h, em, 3));
-  ExactMatchConfig restore;
+  EmConfig restore;
   restore.set_default_gate(2);
   *restore.add_rules() = BinRule({key}, 1);
   EXPECT_EQ("", Restore(h, em, restore));
@@ -597,7 +642,7 @@ TEST(ExactMatchPacketTest, CollapsedDuplicateIsOneTableEntry) {
   *arg.add_fields() = OffsetField(26, 4);
   Module *em = h.Create("ExactMatch", arg);
   ASSERT_NE(nullptr, em);
-  ExactMatchConfig restore;
+  EmConfig restore;
   restore.set_default_gate(0);
   *restore.add_rules() = BinRule({Ip("1.2.3.4")}, 1);
   *restore.add_rules() = BinRule({Ip("1.2.3.4")}, 2);
@@ -773,12 +818,12 @@ TEST(ExactMatchResourceTest, StateCommandsAreGone) {
   ASSERT_NE(nullptr, em);
   const auto rule = BinRule({Ip("1.2.3.4")}, 1);
 
-  EXPECT_NE(0, h.Action(em, "add", rule).error().code());
+  EXPECT_NE(0, h.Action(em, "add", bess::pb::EmptyArg()).error().code());
   EXPECT_NE(0, h.Action(em, "delete", BinKey({Ip("1.2.3.4")})).error().code());
   EXPECT_NE(0, h.Action(em, "clear", bess::pb::EmptyArg()).error().code());
-  EXPECT_NE(0, h.Action(em, "set_default_gate", DefaultGate(2)).error().code());
+  EXPECT_NE(0, h.Action(em, "set_default_gate", Settings(2)).error().code());
   EXPECT_NE(0, h.Action(em, "get_runtime_config", bess::pb::EmptyArg()).error().code());
-  EXPECT_NE(0, h.Action(em, "set_runtime_config", ExactMatchConfig()).error().code());
+  EXPECT_NE(0, h.Action(em, "set_runtime_config", bess::pb::EmptyArg()).error().code());
   EXPECT_NE(0, h.Action(em, "get_initial_arg", bess::pb::EmptyArg()).error().code());
 
   EXPECT_EQ("", AddRule(h, em, rule));

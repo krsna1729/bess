@@ -850,9 +850,7 @@ ControlResult<void> ControlPlane::AddTcLocked(const TrafficClassSpec& spec) {
         TrafficClassBuilder::CreateTrafficClass<bess::RateLimitTrafficClass>(
             tc_name, *resource, limit, max_burst));
   } else if (policy == bess::TrafficPolicyName[bess::POLICY_LEAF]) {
-    return std::unexpected(Err(EINVAL,
-                               "Cannot create leaf TC. Use "
-                               "UpdateTcParentRequest message"));
+    return std::unexpected(Err(EINVAL, "Cannot create leaf TC"));
   } else {
     return std::unexpected(Err(EINVAL, "Invalid traffic policy"));
   }

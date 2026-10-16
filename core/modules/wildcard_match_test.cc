@@ -30,24 +30,95 @@ using bess::pb::Field;
 using bess::pb::FieldData;
 using bess::pb::WildcardMatchArg;
 using bess::pb::WildcardMatchCommandAddArg;
-using bess::pb::WildcardMatchCommandDeleteArg;
-using bess::pb::WildcardMatchConfig;
 
 constexpr gate_idx_t kGateA = 1;
 constexpr gate_idx_t kGateB = 2;
 
+// The shape the legacy WildcardMatchConfig wire message carried (rules and a
+// default gate). That message went with the legacy service (D-140); the tests
+// compare configurations, so they compare this.
+struct WmRuleSpec {
+  bess::pb::WildcardMatchRuleKey key;  // masks and values
+  int64_t priority_value = 0;
+  uint64_t gate_value = 0;
+  int64_t priority() const { return priority_value; }
+  uint64_t gate() const { return gate_value; }
+  void set_priority(int64_t p) { priority_value = p; }
+  void set_gate(uint64_t g) { gate_value = g; }
+  int masks_size() const { return key.masks_size(); }
+  int values_size() const { return key.values_size(); }
+  const FieldData &masks(int i) const { return key.masks(i); }
+  const FieldData &values(int i) const { return key.values(i); }
+  FieldData *add_masks() { return key.add_masks(); }
+  FieldData *add_values() { return key.add_values(); }
+
+  WmRuleSpec() = default;
+  // A rule as the legacy `add` command built it: the live argument shape
+  // carries the same masks, values, priority and gate.
+  explicit WmRuleSpec(const bess::pb::WildcardMatchCommandAddArg &arg) {
+    *key.mutable_values() = arg.values();
+    *key.mutable_masks() = arg.masks();
+    priority_value = arg.priority();
+    gate_value = arg.gate();
+  }
+};
+
+struct WmConfig {
+  std::vector<WmRuleSpec> rule_list;
+  uint64_t gate_value = 0;
+  int rules_size() const { return static_cast<int>(rule_list.size()); }
+  const WmRuleSpec &rules(int i) const { return rule_list[i]; }
+  const std::vector<WmRuleSpec> &rules() const { return rule_list; }
+  std::vector<WmRuleSpec> *mutable_rules() { return &rule_list; }
+  WmRuleSpec *mutable_rules(int i) { return &rule_list[i]; }
+  WmRuleSpec *add_rules() {
+    rule_list.emplace_back();
+    return &rule_list.back();
+  }
+  uint64_t default_gate() const { return gate_value; }
+  void set_default_gate(uint64_t g) { gate_value = g; }
+  std::string DebugString() const {
+    std::string out = "default_gate: " + std::to_string(gate_value);
+    for (const WmRuleSpec &r : rule_list) {
+      out += "\nrule: priority " + std::to_string(r.priority()) + " gate " +
+             std::to_string(r.gate());
+    }
+    return out;
+  }
+  bool operator==(const WmConfig &o) const {
+    if (gate_value != o.gate_value || rule_list.size() != o.rule_list.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < rule_list.size(); i++) {
+      const WmRuleSpec &a = rule_list[i];
+      const WmRuleSpec &b = o.rule_list[i];
+      if (a.priority() != b.priority() || a.gate() != b.gate() ||
+          a.masks_size() != b.masks_size() ||
+          a.values_size() != b.values_size()) {
+        return false;
+      }
+      for (int f = 0; f < a.masks_size(); f++) {
+        if (a.masks(f).SerializeAsString() != b.masks(f).SerializeAsString() ||
+            a.values(f).SerializeAsString() !=
+                b.values(f).SerializeAsString()) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+};
+
 // The rules and the settings of `m` as its resources read them, sorted with
 // SortRules; defined with the other resource helpers below.
-bess::pb::WildcardMatchConfig ReadConfig(bess::testing::ModuleHarness &h,
-                                         Module *m);
+WmConfig ReadConfig(bess::testing::ModuleHarness &h, Module *m);
 
 // The rules of `config` in a stable order (priority, gate, masks, values). The
 // rule table's own iteration order is not part of what the module promises, so
 // a test that compares two whole configurations sorts both sides with this.
-void SortRules(bess::pb::WildcardMatchConfig *config) {
+void SortRules(WmConfig *config) {
   std::sort(config->mutable_rules()->begin(), config->mutable_rules()->end(),
-            [](const bess::pb::WildcardMatchCommandAddArg &a,
-               const bess::pb::WildcardMatchCommandAddArg &b) {
+            [](const WmRuleSpec &a, const WmRuleSpec &b) {
               if (a.priority() != b.priority()) {
                 return a.priority() < b.priority();
               }
@@ -107,15 +178,13 @@ class WildcardMatchTest : public ::testing::Test {
     return d;
   }
 
-  // The legacy commands as a client runs them now (D-140): "add", "delete",
-  // "clear" and "set_runtime_config" write "<name>/rules" and
-  // "<name>/settings" through the process's transaction engine, and
-  // "get_runtime_config" reads them back. A refusal carries EINVAL and the
-  // reason; the resource layer reports no errno.
+  // The legacy commands as a client runs them now (D-140): "add" and "delete"
+  // write "<name>/rules", "clear" erases them, "set_default_gate" writes
+  // "<name>/settings", each through the process's transaction engine. A
+  // refusal carries EINVAL and the reason; the resource layer reports no errno.
   CommandResponse Run(WildcardMatch *m, const char *cmd,
                       const google::protobuf::Any &arg) {
     const std::string rules = std::string(m->name()) + "/rules";
-    const std::string settings = std::string(m->name()) + "/settings";
     const std::string_view command(cmd);
     if (command == "add") {
       bess::pb::WildcardMatchCommandAddArg add;
@@ -131,13 +200,10 @@ class WildcardMatchTest : public ::testing::Test {
       return Report(h_.UpsertResource(rules, key, value));
     }
     if (command == "delete") {
-      bess::pb::WildcardMatchCommandDeleteArg del;
-      if (!arg.UnpackTo(&del)) {
+      bess::pb::WildcardMatchRuleKey key;
+      if (!arg.UnpackTo(&key)) {
         return CommandFailure(EINVAL, "not a delete argument");
       }
-      bess::pb::WildcardMatchRuleKey key;
-      *key.mutable_values() = del.values();
-      *key.mutable_masks() = del.masks();
       return Report(h_.EraseResource(rules, key));
     }
     if (command == "clear") {
@@ -154,23 +220,15 @@ class WildcardMatchTest : public ::testing::Test {
       return CommandSuccess();
     }
     if (command == "set_default_gate") {
-      bess::pb::WildcardMatchCommandSetDefaultGateArg gate;
-      if (!arg.UnpackTo(&gate)) {
+      bess::pb::WildcardMatchSettings settings;
+      if (!arg.UnpackTo(&settings)) {
         return CommandFailure(EINVAL, "not a set_default_gate argument");
       }
-      return SetDefaultGate(m, gate.gate());
+      return Report(
+          h_.SetResource(std::string(m->name()) + "/settings", settings));
     }
-    if (command == "get_runtime_config") {
-      // One readback implementation, the same one the resource tests use.
-      return CommandSuccess(ReadConfig(h_, m));
-    }
-    if (command == "set_runtime_config") {
-      WildcardMatchConfig config;
-      if (!arg.UnpackTo(&config)) {
-        return CommandFailure(EINVAL, "not a set_runtime_config argument");
-      }
-      return Restore(m, config);
-    }
+    // No readback command: the resources are the state, and a test reads them
+    // with ReadConfig (as the resource tests do).
     return CommandFailure(EINVAL, "no such command: %s", cmd);
   }
 
@@ -178,7 +236,7 @@ class WildcardMatchTest : public ::testing::Test {
   // list is erased, every listed rule upserted (duplicates collapse to the
   // last), then the default gate is set. A refusal applies none of it -- the
   // legacy set_runtime_config built the new table in full and swapped it in.
-  CommandResponse Restore(WildcardMatch *m, const WildcardMatchConfig &config) {
+  CommandResponse Restore(WildcardMatch *m, const WmConfig &config) {
     const std::string rules = std::string(m->name()) + "/rules";
     const std::string settings = std::string(m->name()) + "/settings";
     const bess::framework::ResourceCodec *codec = h_.Codec(rules);
@@ -186,10 +244,8 @@ class WildcardMatchTest : public ::testing::Test {
       return CommandFailure(EINVAL, "no resource '%s'", rules.c_str());
     }
     std::map<bess::dataplane::ResourceKey, std::any> desired;
-    for (const bess::pb::WildcardMatchCommandAddArg &rule : config.rules()) {
-      bess::pb::WildcardMatchRuleKey key;
-      *key.mutable_values() = rule.values();
-      *key.mutable_masks() = rule.masks();
+    for (const WmRuleSpec &rule : config.rules()) {
+      bess::pb::WildcardMatchRuleKey key = rule.key;
       bess::pb::WildcardMatchRuleValue value;
       value.set_priority(rule.priority());
       value.set_gate(rule.gate());
@@ -306,11 +362,7 @@ TEST_F(WildcardMatchTest, AddOverwritesSameMaskAndValueRegardlessOfPriority) {
                    .error()
                    .code());
 
-  bess::pb::EmptyArg empty;
-  CommandResponse resp = Run(m, "get_runtime_config", Pack(empty));
-  ASSERT_EQ(0, resp.error().code());
-  WildcardMatchConfig config;
-  ASSERT_TRUE(resp.data().UnpackTo(&config));
+  const WmConfig config = ReadConfig(h_, m);
   ASSERT_EQ(1, config.rules_size());
   EXPECT_EQ(kGateB, config.rules(0).gate());
   EXPECT_EQ(1, config.rules(0).priority());
@@ -328,10 +380,7 @@ TEST_F(WildcardMatchTest, TupleCeilingCountsActiveMasksAndClearRestoresIt) {
   // The ninth distinct mask is refused (master reported ENOSPC; the resource
   // layer reports the reason, not an errno).
   EXPECT_NE(0, Run(m, "add", Pack(Rule(0, 0xabcd, 9, kGateA))).error().code());
-  const CommandResponse held = Run(m, "get_runtime_config", Pack(bess::pb::EmptyArg()));
-  ASSERT_EQ(0, held.error().code());
-  WildcardMatchConfig held_config;
-  ASSERT_TRUE(held.data().UnpackTo(&held_config));
+  const WmConfig held_config = ReadConfig(h_, m);
   EXPECT_EQ(8, held_config.rules_size()) << "the refused rule was not added";
 
   // clear() drops the rules *and* their masks, so capacity is genuinely free.
@@ -371,11 +420,7 @@ TEST_F(WildcardMatchTest, DefaultGateAtCreation) {
   arg.set_default_gate(kGateB);
   WildcardMatch *m = Create(arg);
   ASSERT_NE(nullptr, m);
-  bess::pb::EmptyArg empty;
-  CommandResponse config = Run(m, "get_runtime_config", Pack(empty));
-  ASSERT_EQ(0, config.error().code());
-  WildcardMatchConfig runtime;
-  ASSERT_TRUE(config.data().UnpackTo(&runtime));
+  const WmConfig runtime = ReadConfig(h_, m);
   EXPECT_EQ(kGateB, runtime.default_gate());
 }
 
@@ -387,7 +432,7 @@ TEST_F(WildcardMatchTest, DeleteExistingAndMissing) {
                    .error()
                    .code());
 
-  WildcardMatchCommandDeleteArg del;
+  bess::pb::WildcardMatchRuleKey del;
   *del.add_values() = Bin({0x34, 0x12});
   *del.add_masks() = Bin({0xff, 0xff});
   EXPECT_EQ(0, Run(m, "delete", Pack(del)).error().code());
@@ -398,7 +443,7 @@ TEST_F(WildcardMatchTest, DeleteExistingAndMissing) {
   ASSERT_EQ(0, Run(m, "add", Pack(Rule(0x1234, 0xffff, 1, kGateA)))
                    .error()
                    .code());
-  WildcardMatchCommandDeleteArg other;
+  bess::pb::WildcardMatchRuleKey other;
   *other.add_values() = Bin({0x99, 0x99});
   *other.add_masks() = Bin({0xff, 0xff});
   EXPECT_NE(0, Run(m, "delete", Pack(other)).error().code());
@@ -449,11 +494,7 @@ TEST_F(WildcardMatchTest, FullInt64PrioritySurvivesRoundTrip) {
                    .error()
                    .code());
 
-  bess::pb::EmptyArg empty;
-  CommandResponse resp = Run(m, "get_runtime_config", Pack(empty));
-  ASSERT_EQ(0, resp.error().code());
-  WildcardMatchConfig config;
-  ASSERT_TRUE(resp.data().UnpackTo(&config));
+  const WmConfig config = ReadConfig(h_, m);
   ASSERT_EQ(2, config.rules_size());
   EXPECT_EQ(negative, config.rules(0).priority());
   EXPECT_EQ(big, config.rules(1).priority());
@@ -469,17 +510,13 @@ TEST_F(WildcardMatchTest, FailedSetRuntimeConfigLeavesStateUnchanged) {
 
   // Second rule is invalid (value outside its mask), so the whole
   // configuration must be rejected and the installed one left serving.
-  WildcardMatchConfig bad;
+  WmConfig bad;
   bad.set_default_gate(kGateB);
-  *bad.add_rules() = Rule(0x1234, 0xffff, 5, kGateB);
-  *bad.add_rules() = Rule(0xffff, 0x00ff, 5, kGateB);
-  EXPECT_NE(0, Run(m, "set_runtime_config", Pack(bad)).error().code());
+  *bad.add_rules() = WmRuleSpec(Rule(0x1234, 0xffff, 5, kGateB));
+  *bad.add_rules() = WmRuleSpec(Rule(0xffff, 0x00ff, 5, kGateB));
+  EXPECT_NE(0, Restore(m, bad).error().code());
 
-  bess::pb::EmptyArg empty;
-  CommandResponse resp = Run(m, "get_runtime_config", Pack(empty));
-  ASSERT_EQ(0, resp.error().code());
-  WildcardMatchConfig config;
-  ASSERT_TRUE(resp.data().UnpackTo(&config));
+  const WmConfig config = ReadConfig(h_, m);
   ASSERT_EQ(1, config.rules_size());
   EXPECT_EQ(kGateA, config.rules(0).gate());
 }
@@ -496,19 +533,12 @@ TEST_F(WildcardMatchTest, RuntimeConfigRoundTripsByteIdentically) {
                    .error()
                    .code());
 
-  bess::pb::EmptyArg empty;
-  CommandResponse first = Run(m, "get_runtime_config", Pack(empty));
-  ASSERT_EQ(0, first.error().code());
-  WildcardMatchConfig config;
-  ASSERT_TRUE(first.data().UnpackTo(&config));
+  WmConfig config = ReadConfig(h_, m);
   config.set_default_gate(kGateA);
 
   // Re-applying the exported configuration must reproduce it exactly.
-  ASSERT_EQ(0, Run(m, "set_runtime_config", Pack(config)).error().code());
-  CommandResponse second = Run(m, "get_runtime_config", Pack(empty));
-  ASSERT_EQ(0, second.error().code());
-  WildcardMatchConfig again;
-  ASSERT_TRUE(second.data().UnpackTo(&again));
+  ASSERT_EQ(0, Restore(m, config).error().code());
+  const WmConfig again = ReadConfig(h_, m);
 
   EXPECT_EQ(config.default_gate(), again.default_gate());
   ASSERT_EQ(config.rules_size(), again.rules_size());
@@ -536,11 +566,7 @@ TEST_F(WildcardMatchTest, IntegerEncodedRulesAreAccepted) {
   *arg.add_masks() = Int(0xffff);
   EXPECT_EQ(0, Run(m, "add", Pack(arg)).error().code());
 
-  bess::pb::EmptyArg empty;
-  CommandResponse resp = Run(m, "get_runtime_config", Pack(empty));
-  ASSERT_EQ(0, resp.error().code());
-  WildcardMatchConfig config;
-  ASSERT_TRUE(resp.data().UnpackTo(&config));
+  const WmConfig config = ReadConfig(h_, m);
   ASSERT_EQ(1, config.rules_size());
   // value_int decodes big-endian into the field bytes (legacy uint64_to_bin
   // with big_endian=true), while value_bin is verbatim.
@@ -557,14 +583,14 @@ TEST_F(WildcardMatchTest, RejectsWideGateBeforeNarrowing) {
                    .error()
                    .code());
 
-  bess::pb::WildcardMatchCommandSetDefaultGateArg default_gate;
-  default_gate.set_gate(65536);
+  bess::pb::WildcardMatchSettings default_gate;
+  default_gate.set_default_gate(65536);
   EXPECT_NE(0, Run(m, "set_default_gate", Pack(default_gate))
                    .error()
                    .code());
-  WildcardMatchConfig config;
+  WmConfig config;
   config.set_default_gate(65536);
-  EXPECT_NE(0, Run(m, "set_runtime_config", Pack(config)).error().code());
+  EXPECT_NE(0, Restore(m, config).error().code());
 }
 
 // Packets through the module (was bessctl/module_tests/wildcard_match.py).
@@ -574,7 +600,6 @@ using bess::testing::Ip4;
 using bess::testing::ModuleHarness;
 using bess::testing::PacketBuilder;
 using bess::testing::TcpPacket;
-using google::protobuf::util::MessageDifferencer;
 using Octets = std::vector<uint8_t>;
 
 Field WmField(uint32_t offset, uint32_t bytes) {
@@ -609,9 +634,9 @@ WildcardMatchCommandAddArg WmRule(uint64_t gate, int64_t priority, const std::ve
   return arg;
 }
 
-WildcardMatchCommandDeleteArg WmKey(const std::vector<Octets> &masks,
-                                    const std::vector<Octets> &values) {
-  WildcardMatchCommandDeleteArg arg;
+bess::pb::WildcardMatchRuleKey WmKey(const std::vector<Octets> &masks,
+                                     const std::vector<Octets> &values) {
+  bess::pb::WildcardMatchRuleKey arg;
   for (const Octets &m : masks) {
     *arg.add_masks() = BinData(m);
   }
@@ -621,9 +646,9 @@ WildcardMatchCommandDeleteArg WmKey(const std::vector<Octets> &masks,
   return arg;
 }
 
-bess::pb::WildcardMatchCommandSetDefaultGateArg WmDefault(uint64_t gate) {
-  bess::pb::WildcardMatchCommandSetDefaultGateArg arg;
-  arg.set_gate(gate);
+bess::pb::WildcardMatchSettings WmDefault(uint64_t gate) {
+  bess::pb::WildcardMatchSettings arg;
+  arg.set_default_gate(gate);
   return arg;
 }
 
@@ -664,11 +689,8 @@ std::string AddRule(ModuleHarness &h, Module *m, const WildcardMatchCommandAddAr
 }
 
 std::string DeleteRule(ModuleHarness &h, Module *m,
-                       const WildcardMatchCommandDeleteArg &rule) {
-  bess::pb::WildcardMatchRuleKey key;
-  *key.mutable_values() = rule.values();
-  *key.mutable_masks() = rule.masks();
-  return h.EraseResource(std::string(m->name()) + "/rules", key);
+                       const bess::pb::WildcardMatchRuleKey &rule) {
+  return h.EraseResource(std::string(m->name()) + "/rules", rule);
 }
 
 std::string ClearRules(ModuleHarness &h, Module *m) {
@@ -694,18 +716,18 @@ std::string SetDefaultGate(ModuleHarness &h, Module *m, uint64_t gate) {
 
 // What "<name>/rules" and "<name>/settings" hold, sorted with SortRules: the
 // resources are the state, and there is no other readback.
-WildcardMatchConfig ReadConfig(ModuleHarness &h, Module *m) {
-  WildcardMatchConfig config;
+WmConfig ReadConfig(ModuleHarness &h, Module *m) {
+  WmConfig config;
   for (const auto &entry : h.ReadResource(std::string(m->name()) + "/rules")) {
     bess::pb::WildcardMatchRuleKey key;
     bess::pb::WildcardMatchRuleValue value;
     EXPECT_TRUE(entry.first.UnpackTo(&key));
     EXPECT_TRUE(entry.second.UnpackTo(&value));
-    WildcardMatchCommandAddArg *rule = config.add_rules();
+    WmRuleSpec *rule = config.add_rules();
     rule->set_priority(value.priority());
     rule->set_gate(value.gate());
-    *rule->mutable_values() = key.values();
-    *rule->mutable_masks() = key.masks();
+    *rule->key.mutable_values() = key.values();
+    *rule->key.mutable_masks() = key.masks();
   }
   SortRules(&config);
   bess::pb::WildcardMatchSettings held;
@@ -926,14 +948,14 @@ TEST(WildcardMatchPacketTest, RuntimeConfigReproducesTheModule) {
   EXPECT_EQ("", AddRule(h, wm, r1));
   EXPECT_EQ("", SetDefaultGate(h, wm, 3));
 
-  WildcardMatchConfig expect;
+  WmConfig expect;
   expect.set_default_gate(3);
-  *expect.add_rules() = r1;
-  *expect.add_rules() = r2;
+  *expect.add_rules() = WmRuleSpec(r1);
+  *expect.add_rules() = WmRuleSpec(r2);
   SortRules(&expect);
 
-  const WildcardMatchConfig config = ReadConfig(h, wm);
-  EXPECT_TRUE(MessageDifferencer::Equals(expect, config)) << config.DebugString();
+  const WmConfig config = ReadConfig(h, wm);
+  EXPECT_EQ(expect, config) << config.DebugString();
 }
 
 // D-129: the rules and the default gate as resources (the state the module
@@ -1093,7 +1115,7 @@ TEST(WildcardMatchResourceTest, StateCommandsAreGone) {
   EXPECT_NE(0, h.Action(wm, "set_default_gate", WmDefault(1)).error().code());
   EXPECT_NE(0, h.Action(wm, "get_initial_arg", empty).error().code());
   EXPECT_NE(0, h.Action(wm, "get_runtime_config", empty).error().code());
-  EXPECT_NE(0, h.Action(wm, "set_runtime_config", WildcardMatchConfig()).error().code());
+  EXPECT_NE(0, h.Action(wm, "set_runtime_config", bess::pb::EmptyArg()).error().code());
   EXPECT_EQ("", h.ReadBackDiffers(wm->name() + "/rules", {})) << "the refused add did nothing";
 
   EXPECT_EQ("", AddRule(h, wm, rule));
