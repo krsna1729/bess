@@ -638,7 +638,11 @@ func (c *Client) Pipeline(ctx context.Context, query ...PipelineQuery) (Pipeline
 	if req.IncludeResources {
 		v.ResourceGeneration = proto.Uint64(g.GetResourceGeneration())
 	}
-	return PipelineSnapshot{g.GetPipeline(), v, g.GetWorkers()}, nil
+	return PipelineSnapshot{
+		Pipeline: g.GetPipeline(),
+		Version:  v,
+		Workers:  g.GetWorkers(),
+	}, nil
 }
 
 // ValidatePipeline is the daemon's canonical form of p (InvalidRequestError
