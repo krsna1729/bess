@@ -96,6 +96,20 @@ BESS installs development headers and a standard pkg-config file:
 `bess-dev` does not require `grpc++`. Plugins that use gRPC must declare it
 as their own dependency.
 
+**A staged prefix.** `bess-dev.pc` names the prefix it was configured with
+(`prefix=/usr/local` for a normal install). A `--destdir` install — a stage, or
+the CI tree described above — puts the tree somewhere else, so plain
+`pkg-config` still resolves `-I/usr/local/include/bess` and a plugin build
+fails on `module.h`. Point it at the stage with
+`PKG_CONFIG_PATH=<stage>/lib/pkgconfig pkg-config --define-prefix --cflags
+bess-dev` (keep `PKG_CONFIG_PATH` absolute, or the derived prefix comes out
+relative). Meson honours `PKG_CONFIG`, so the wrapper carries the flag through:
+`PKG_CONFIG='pkg-config --define-prefix' PKG_CONFIG_PATH=<stage>/lib/pkgconfig
+meson setup build` resolves the stage's includes (verified against a stage — a
+C++ plugin built this way compiles `module.h`), and it is how the UPF's meson
+builds reach a stage. Passing `-I<stage>/include/bess
+-I<stage>/include/bess/core` explicitly also works.
+
 **ISA.** A plugin compiles for bessd's ISA (M21). `bess-dev` does not
 `Requires: libdpdk`, because pkg-config would append the `-march`/`-mrtm`
 DPDK was built with after bessd's and the last `-march` wins; it carries the
