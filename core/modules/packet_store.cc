@@ -35,9 +35,25 @@ CommandResponse PacketStore::Init(const bess::pb::PacketStoreArg &arg) {
     return CommandFailure(ENOMEM, "Task creation failed");
   }
 
-  store_id_attr_ =
-      AddMetadataAttr("store_id", sizeof(be32_t), AccessMode::kRead);
-  vif_id_attr_ = AddMetadataAttr("vif_id", sizeof(be32_t), AccessMode::kRead);
+  // The flow key is the first of these the graph provides; the default pair is
+  // the historical behaviour, store_id over vif_id.
+  if (arg.key_attrs().empty()) {
+    key_attrs_ = {"store_id", "vif_id"};
+  } else {
+    key_attrs_.assign(arg.key_attrs().begin(), arg.key_attrs().end());
+  }
+  key_attr_ids_.clear();
+  for (const std::string &name : key_attrs_) {
+    const int attr_id = AddMetadataAttr(name, sizeof(be32_t), AccessMode::kRead);
+    if (attr_id < 0) {
+      // Without this the id is an error code, and the packet path would index
+      // attr_offsets_ with it: a duplicate, an empty name, more than
+      // kMaxAttrsPerModule names, or a size clash with another module.
+      return CommandFailure(-attr_id, "add_metadata_attr(%s) failed",
+                            name.c_str());
+    }
+    key_attr_ids_.push_back(attr_id);
+  }
 
   return CommandSuccess();
 }
@@ -160,8 +176,16 @@ void PacketStore::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   }
   const uint64_t now_ns = tsc_to_ns(current_worker.current_tsc());
 
-  const auto store_offset = attr_offset(store_id_attr_);
-  const auto vif_offset = attr_offset(vif_id_attr_);
+  // Which of the configured names is the key is fixed when the graph is
+  // compiled, so it is decided once per run: the first one this graph provides.
+  bess::metadata::mt_offset_t key_offset = bess::metadata::kMetadataOffsetNoRead;
+  for (const int attr_id : key_attr_ids_) {
+    const bess::metadata::mt_offset_t offset = attr_offset(attr_id);
+    if (bess::metadata::IsValidOffset(offset)) {
+      key_offset = offset;
+      break;
+    }
+  }
 
   // Evict expired packets if store is growing
   if (total_packets_ >= max_packets_) {
@@ -170,10 +194,8 @@ void PacketStore::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
   for (bess::PacketRef pkt : batch->packets()) {
     uint32_t flow_id = 0;
-    if (bess::metadata::IsValidOffset(store_offset)) {
-      flow_id = get_attr_with_offset<be32_t>(store_offset, pkt).value();
-    } else if (bess::metadata::IsValidOffset(vif_offset)) {
-      flow_id = get_attr_with_offset<be32_t>(vif_offset, pkt).value();
+    if (bess::metadata::IsValidOffset(key_offset)) {
+      flow_id = get_attr_with_offset<be32_t>(key_offset, pkt).value();
     }
 
     auto &queue = store_[flow_id];

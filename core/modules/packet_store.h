@@ -13,7 +13,8 @@
 #include "utils/endian.h"
 
 // PacketStore: Bounded, ownership-safe packet buffer (K9).
-// Buffers packets indexed by flow ID (from metadata 'store_id' or 'vif_id').
+// Buffers packets indexed by flow ID: the first of `key_attrs` that the graph
+// provides, which by default is the metadata 'store_id' and then 'vif_id'.
 // Supports bounded capacity, per-flow limits, aging eviction, and on-demand
 // release/discard via commands.
 class PacketStore final : public Module {
@@ -58,8 +59,11 @@ class PacketStore final : public Module {
   uint64_t timeout_ns_ = 5'000'000'000ULL;  // 5 seconds
   size_t total_packets_ = 0;
 
-  int store_id_attr_ = -1;
-  int vif_id_attr_ = -1;
+  // The flow key: the attribute names to try in order (default: store_id, then
+  // vif_id) and the ids AddMetadataAttr returned for them. The first one this
+  // graph provides is the key.
+  std::vector<std::string> key_attrs_;
+  std::vector<int> key_attr_ids_;
 
   // flow_id -> FIFO queue of stored packets
   std::map<uint32_t, std::deque<StoredPacket>> store_;

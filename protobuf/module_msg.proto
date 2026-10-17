@@ -1407,6 +1407,9 @@ message PacketStoreArg {
   uint32 max_packets = 1;           /// Maximum total packets in store (default: 4096)
   uint32 max_packets_per_flow = 2;  /// Maximum packets per flow/session ID (default: 64)
   uint32 timeout_ms = 3;            /// Maximum buffering time in ms (default: 5000)
+  repeated string key_attrs = 4;    /// The metadata attributes that may carry the flow ID,
+                                    /// in priority order: the first one this graph provides
+                                    /// is the key. Default: store_id, then vif_id.
 }
 
 message PacketStoreCommandReleaseArg {
