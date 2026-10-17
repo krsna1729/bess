@@ -235,6 +235,8 @@ def main():
     p.add_argument('--cpu', default='2', help='Pinned CPU core (default: 2)')
     p.add_argument('--allow-busy', action='store_true', help='Skip pre-flight CPU check')
     p.add_argument('--output', default='', help='Path to save raw JSON results')
+    p.add_argument('--baseline-dir', default='/var/tmp/bess-clawback-base-20260930',
+                   help='Directory holding the baseline bin-native/ and bin-v3/ trees the master_* targets run')
     p.add_argument('--extra', nargs=argparse.REMAINDER, default=[], help='Extra args to benchmark')
     args = p.parse_args()
 
@@ -282,12 +284,12 @@ def main():
     targets = {
         'master_nat': {
             'label': 'Master (native)',
-            'binary': f"/var/tmp/bess-clawback-base-20260930/bin-native/{cfg['m_bin']}",
+            'binary': f"{args.baseline_dir}/bin-native/{cfg['m_bin']}",
             'env': {}
         },
         'master_v3': {
             'label': 'Master (x86-64-v3)',
-            'binary': f"/var/tmp/bess-clawback-base-20260930/bin-v3/{cfg['m_bin']}",
+            'binary': f"{args.baseline_dir}/bin-v3/{cfg['m_bin']}",
             'env': {}
         },
         'current_v3': {
@@ -301,6 +303,14 @@ def main():
             'env': {'LD_LIBRARY_PATH': '/home/krsna1729/Projects/bess/deps/dpdk-25.11.3/install/lib'}
         }
     }
+    # The baseline trees are build output that lives outside the repo: say so
+    # plainly rather than letting the benchmark fail with a missing-binary error.
+    for name in ('master_nat', 'master_v3'):
+        binary = Path(targets[name]['binary'])
+        if not binary.exists():
+            sys.exit(f"{targets[name]['label']}: {binary} does not exist. "
+                     f"Pass --baseline-dir, or rebuild the baseline (bin-native/ and "
+                     f"bin-v3/) from the commit it was taken at.")
 
     # Order of palindromic runs per cycle: A, B, C, D, D, C, B, A
     seq = ['master_nat', 'master_v3', 'current_v3', 'current_nat',
