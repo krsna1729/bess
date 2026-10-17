@@ -37,9 +37,16 @@ class ApiServer {
   void Run();
 
  private:
-  // Owned: its plugins (gRPC's reflection one among them) are freed with it,
-  // and LSan sees nothing unreachable at exit (the ASan lane runs the plugin
-  // tests with detect_leaks=1).
+  // Owned: the builder and its plugins (gRPC's reflection one among them) are
+  // freed with it, when the server goes out of scope in main.cc, before the
+  // workers are stopped. That ownership is not verified by a leak check
+  // anywhere: no in-process test uses ApiServer - each builds its own
+  // grpc::ServerBuilder, so only main.cc constructs one - and the ASan lane
+  // never reaches it: it skips the live suite (--no-suite live), its install
+  // check returns early for sanitizer lanes, and live-perf runs only in the
+  // gcc lane (the "Live performance, report only" step in ci.yml). CI's own
+  // LSan works (tools/lsan.supp suppresses a real report from that lane,
+  // D-142), so the gap is coverage, not the tool.
   std::unique_ptr<grpc::ServerBuilder> builder_;
   std::unique_ptr<bess::control::HttpServer> http_;
 };
