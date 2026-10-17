@@ -45,6 +45,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -152,6 +153,16 @@ func Dial(cfg Config) (*bess.Client, error) {
 	return client, nil
 }
 
+// joinCleanup folds a graph cleanup's failure into the error the run is
+// returning. Both are kept: the cleanup's says what state the daemon was left
+// in, the run's says why. Nothing is written about a cleanup that succeeded.
+func joinCleanup(cerr, err error) error {
+	if cerr == nil {
+		return err
+	}
+	return errors.Join(err, fmt.Errorf("removing the bench graph: %w", cerr))
+}
+
 // Sweep is the whole measurement in one call: dial, churn every shape, fit the
 // line, and close the client. Config.Addr must be set.
 func Sweep(ctx context.Context, cfg Config) (res Result, floor Floor, err error) {
@@ -162,15 +173,15 @@ func Sweep(ctx context.Context, cfg Config) (res Result, floor Floor, err error)
 	}
 	defer client.Close()
 	if cfg.ApplyGraph {
-		cleanup, err := ApplyGraph(ctx, client, cfg, cfg.WorkerCore, false)
+		var cleanup func(context.Context) error
+		cleanup, err = ApplyGraph(ctx, client, cfg, cfg.WorkerCore, false)
 		if cleanup != nil {
 			// The cleanup comes back even with an error, because the graph may
 			// be on the daemon; a caller has to be able to tell if it fails.
-			defer func() {
-				if cerr := cleanup(context.WithoutCancel(ctx)); cerr != nil && err == nil {
-					err = fmt.Errorf("removing the bench graph: %w", cerr)
-				}
-			}()
+			// The named result is assigned here, which is why cleanup is
+			// declared above: a short declaration would shadow the error and
+			// the failure would never reach the caller.
+			defer func() { err = joinCleanup(cleanup(context.WithoutCancel(ctx)), err) }()
 		}
 		if err != nil {
 			return Result{}, Floor{}, err

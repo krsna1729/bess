@@ -6,6 +6,7 @@ package bench
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -133,6 +134,35 @@ func TestCompareRejectsTwoDifferentPaths(t *testing.T) {
 	}
 	if !strings.Contains(c.String(), "one operation at two sizes") {
 		t.Errorf("the report should explain itself:\n%s", c.String())
+	}
+}
+
+// TestJoinCleanupKeepsBothErrors: a cleanup that fails leaves the daemon in a
+// state the caller has to hear about, whether or not the run also failed. The
+// error a caller sees must carry both, and a cleanup that succeeded must add
+// nothing at all -- an empty wrapper would read as a failure.
+func TestJoinCleanupKeepsBothErrors(t *testing.T) {
+	runErr := errors.New("the churn was refused")
+	cleanupErr := errors.New("no route to the daemon")
+
+	if got := joinCleanup(nil, runErr); got != runErr {
+		t.Errorf("a cleanup that succeeded must not wrap the run's error: %v", got)
+	}
+	if got := joinCleanup(nil, nil); got != nil {
+		t.Errorf("neither failing is not an error: %v", got)
+	}
+
+	onlyCleanup := joinCleanup(cleanupErr, nil)
+	if !errors.Is(onlyCleanup, cleanupErr) {
+		t.Errorf("a cleanup failure on its own is the run's error: %v", onlyCleanup)
+	}
+	if !strings.Contains(onlyCleanup.Error(), "removing the bench graph") {
+		t.Errorf("the message should say what failed: %v", onlyCleanup)
+	}
+
+	both := joinCleanup(cleanupErr, runErr)
+	if !errors.Is(both, runErr) || !errors.Is(both, cleanupErr) {
+		t.Errorf("both failures belong in the error: %v", both)
 	}
 }
 
