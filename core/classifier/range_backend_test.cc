@@ -172,64 +172,78 @@ TEST(RangeBackendTest, PrecedenceAndOverlappingRanges) {
 }
 
 TEST(RangeBackendTest, DifferentialFuzzAgainstScalarReference) {
-  // Create 50 random rules with overlapping port ranges and priorities
+  // Randomised masks and values over several key sizes, with masks shorter
+  // than, equal to and longer than the key. The rules this replaced built both
+  // value and mask from TestKey{}, i.e. an all-zero mask, and (key & 0) == 0
+  // holds for every key: nothing about the comparison was exercised.
   std::mt19937 rng(42);
   std::uniform_int_distribution<uint16_t> port_dist(1, 60000);
   std::uniform_int_distribution<int64_t> prio_dist(1, 1000);
+  std::uniform_int_distribution<int> byte_dist(0, 255);
 
-  std::vector<RangeRule<uint32_t>> rules;
-  for (uint32_t i = 0; i < 50; i++) {
-    uint16_t s_lo = port_dist(rng);
-    uint16_t s_hi = s_lo + (port_dist(rng) % 1000);
-    uint16_t d_lo = port_dist(rng);
-    uint16_t d_hi = d_lo + (port_dist(rng) % 1000);
-
-    TestKey k{};
-    TestKey m{};
-    rules.push_back({
-        .value = ToBytes(k),
-        .mask = ToBytes(m),
-        .src_range = PortRange{.low = s_lo, .high = s_hi},
-        .dst_range = PortRange{.low = d_lo, .high = d_hi},
-        .src_port_offset = 4,
-        .dst_port_offset = 6,
-        .priority = prio_dist(rng),
-        .result = i + 1,
-    });
-  }
-
-  RangeClassifier<uint32_t> fast_classifier(rules);
-  ScalarRangeBackend<uint32_t> scalar_ref(std::move(rules));
-
-  // Run 1,000 random packet lookups in batches of 32
   constexpr size_t kBatchSize = 32;
   constexpr size_t kTotalPackets = 1024;
-  std::vector<std::byte> keys(sizeof(TestKey) * kTotalPackets);
 
-  for (size_t i = 0; i < kTotalPackets; i++) {
-    TestKey pkt{.src_port = be16_t(port_dist(rng)), .dst_port = be16_t(port_dist(rng))};
-    std::memcpy(keys.data() + i * sizeof(TestKey), &pkt, sizeof(TestKey));
-  }
+  for (const size_t key_size : {size_t{4}, size_t{8}, size_t{12}, size_t{13}}) {
+    for (const size_t mask_len : {key_size - 1, key_size, key_size + 3}) {
+      std::vector<RangeRule<uint32_t>> rules;
+      for (uint32_t i = 0; i < 50; i++) {
+        std::vector<std::byte> value(mask_len);
+        std::vector<std::byte> mask(mask_len);
+        for (size_t j = 0; j < mask_len; j++) {
+          mask[j] = static_cast<std::byte>(byte_dist(rng));
+          // Half the values carry bits the mask does not select.
+          value[j] = static_cast<std::byte>(
+              (j % 2 == 0) ? (byte_dist(rng) & static_cast<int>(mask[j]))
+                           : byte_dist(rng));
+        }
 
-  for (size_t b = 0; b < kTotalPackets; b += kBatchSize) {
-    std::array<uint32_t, kBatchSize> fast_results{};
-    std::array<uint32_t, kBatchSize> scalar_results{};
+        const uint16_t s_lo = port_dist(rng);
+        const uint16_t s_hi = s_lo + (port_dist(rng) % 1000);
+        const uint16_t d_lo = port_dist(rng);
+        const uint16_t d_hi = d_lo + (port_dist(rng) % 1000);
 
-    ConstBytes batch_keys(keys.data() + b * sizeof(TestKey), kBatchSize * sizeof(TestKey));
+        rules.push_back({
+            .value = std::move(value),
+            .mask = std::move(mask),
+            .src_range = PortRange{.low = s_lo, .high = s_hi},
+            .dst_range = PortRange{.low = d_lo, .high = d_hi},
+            .src_port_offset = 4,
+            .dst_port_offset = 6,
+            .priority = prio_dist(rng),
+            .result = i + 1,
+        });
+      }
 
-    uint64_t fast_hits = fast_classifier.LookupBatch(
-        batch_keys, sizeof(TestKey), sizeof(TestKey),
-        std::span<uint32_t>(fast_results));
+      RangeClassifier<uint32_t> fast_classifier(rules);
+      ScalarRangeBackend<uint32_t> scalar_ref(std::move(rules));
 
-    uint64_t scalar_hits = scalar_ref.LookupBatch(
-        batch_keys, sizeof(TestKey), sizeof(TestKey),
-        std::span<uint32_t>(scalar_results));
+      std::vector<std::byte> keys(key_size * kTotalPackets);
+      for (auto &b : keys) {
+        b = static_cast<std::byte>(byte_dist(rng));
+      }
 
-    EXPECT_EQ(fast_hits, scalar_hits) << "Hit mask mismatch at batch " << b;
-    for (size_t i = 0; i < kBatchSize; i++) {
-      if (fast_hits & (uint64_t{1} << i)) {
-        EXPECT_EQ(fast_results[i], scalar_results[i])
-            << "Result mismatch at packet " << (b + i);
+      for (size_t b = 0; b < kTotalPackets; b += kBatchSize) {
+        std::array<uint32_t, kBatchSize> fast_results{};
+        std::array<uint32_t, kBatchSize> scalar_results{};
+
+        ConstBytes batch_keys(keys.data() + b * key_size, kBatchSize * key_size);
+
+        uint64_t fast_hits = fast_classifier.LookupBatch(
+            batch_keys, key_size, key_size, std::span<uint32_t>(fast_results));
+
+        uint64_t scalar_hits = scalar_ref.LookupBatch(
+            batch_keys, key_size, key_size, std::span<uint32_t>(scalar_results));
+
+        EXPECT_EQ(fast_hits, scalar_hits)
+            << "Hit mask mismatch at batch " << b << ", key size " << key_size
+            << ", mask length " << mask_len;
+        for (size_t i = 0; i < kBatchSize; i++) {
+          if (fast_hits & (uint64_t{1} << i)) {
+            EXPECT_EQ(fast_results[i], scalar_results[i])
+                << "Result mismatch at packet " << (b + i);
+          }
+        }
       }
     }
   }
