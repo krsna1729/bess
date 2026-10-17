@@ -100,9 +100,19 @@ void BM_K38HandWrittenBatch(benchmark::State &state) {
     uint64_t hits = 0;
     for (size_t i = 0; i < batch_size; i++) {
       const PacketKey &k = keys[i];
-      const uint16_t src = k.src_port.value();
-      const uint16_t dst = k.dst_port.value();
-      const bool match = k.src_ip == kSrcIp && k.dst_ip == kDstIp &&
+      uint32_t ip_src = k.src_ip;
+      uint32_t ip_dst = k.dst_ip;
+      uint16_t src = k.src_port.value();
+      uint16_t dst = k.dst_port.value();
+      // Every key in the vector is identical, so without these barriers the
+      // compiler hoists the whole comparison out of the timed loop and the arm
+      // measures a store loop. The typed arm passes raw bytes to a call, so it
+      // cannot be folded the same way.
+      benchmark::DoNotOptimize(ip_src);
+      benchmark::DoNotOptimize(ip_dst);
+      benchmark::DoNotOptimize(src);
+      benchmark::DoNotOptimize(dst);
+      const bool match = ip_src == kSrcIp && ip_dst == kDstIp &&
                          src >= kSrcLow && src <= kSrcHigh && dst >= kDstLow &&
                          dst <= kDstHigh;
       results[i] = match ? 1u : 0u;
