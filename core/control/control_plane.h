@@ -226,8 +226,12 @@ class ControlPlane {
   // classes too (orphaned until their module is removed), making room. All or
   // nothing: a refused attach puts every task back. For the transaction,
   // whose workers are paused.
+  // `previous_out`, when given, receives where each class this call moves sat
+  // before it moved, in the same order: the transaction's undo for a placement
+  // is to run this again with those specs.
   ControlResult<void> PlaceTasksLocked(std::span<const TrafficClassSpec> leaves,
-                                       std::span<const std::string> leaving);
+                                       std::span<const std::string> leaving,
+                                       std::vector<TrafficClassSpec> *previous_out = nullptr);
   void RemoveSubtreeFromWakeupQueues(bess::TrafficClass* c);
   ControlResult<void> RemoveTcLocked(const std::string& name);
 

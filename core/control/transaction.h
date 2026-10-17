@@ -66,6 +66,9 @@ enum class TransactionPhase {
   kPrepare,
   kCommit,
   kRetire,
+  // The resource convergence that follows the commit. It is not a plan
+  // operation, so an injector sees a default-constructed one.
+  kResources,
 };
 
 // Test-only failure injection: when set, the engine asks before executing each
@@ -77,6 +80,10 @@ using FailureInjector = std::function<std::optional<ControlError>(
 
 void SetFailureInjector(FailureInjector injector);
 void ClearFailureInjector();
+
+// Test-only: the same injector, asked about the resource convergence after the
+// commit, which no plan operation can produce a failure for.
+std::optional<ControlError> MaybeInjectResourceFailure();
 
 // Transaction state machine (section 9.7):
 //
@@ -127,6 +134,11 @@ class Transaction {
       kRemoveTc,        // undo a TC that this transaction created
       kReparentTc,      // put a TC back under its previous parent
       kRestoreTcParams, // put a TC's parameters back
+      // Put placed tasks back where they were. One entry carries every class
+      // the placement moved, because restoring them is the same two-phase
+      // operation that moved them: a class that takes one child needs the
+      // other one out first.
+      kRestorePlacement,
     };
 
     Kind kind;
@@ -134,6 +146,7 @@ class Transaction {
     ConnectionSpec connection;
     int wid = -1;
     TrafficClassSpec tc;
+    std::vector<TrafficClassSpec> placements;  // kRestorePlacement
   };
 
   ControlResult<void> ExecutePrepareOp(const PlanOperation &op);

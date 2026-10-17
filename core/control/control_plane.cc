@@ -976,7 +976,8 @@ ControlResult<void> ControlPlane::UpdateTcParentLocked(const TrafficClassSpec& s
 }
 
 ControlResult<void> ControlPlane::PlaceTasksLocked(
-    std::span<const TrafficClassSpec> leaves, std::span<const std::string> leaving) {
+    std::span<const TrafficClassSpec> leaves, std::span<const std::string> leaving,
+    std::vector<TrafficClassSpec> *previous_out) {
   // Every leaf first, before anything moves: a missing task changes nothing.
   // classes[0, leaves.size()) are placed; the rest, tasks of leaving modules
   // that sit in a class, only make room.
@@ -1018,6 +1019,9 @@ ControlResult<void> ControlPlane::PlaceTasksLocked(
       }
     }
     previous.push_back(std::move(where));
+  }
+  if (previous_out != nullptr) {
+    *previous_out = previous;
   }
 
   // Two phases, so placements may trade places (a rate_limit class takes one
@@ -1827,8 +1831,12 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
   }
   // The listed resources exist now (a created module registered its own):
   // converge them in one dataplane transaction, all or nothing. Refused, the
-  // topology goes back too -- nothing of the apply stays.
-  auto converged = ApplyResourcesLocked(validated->spec.resources);
+  // topology goes back too -- the placement carries an undo for exactly this
+  // case -- and nothing of the apply stays.
+  ControlResult<size_t> converged = ApplyResourcesLocked(validated->spec.resources);
+  if (auto injected = MaybeInjectResourceFailure(); injected.has_value()) {
+    converged = std::unexpected(*injected);
+  }
   if (!converged) {
     transaction.Abort();
     return std::unexpected(converged.error());

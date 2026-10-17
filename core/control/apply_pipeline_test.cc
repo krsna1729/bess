@@ -1242,6 +1242,52 @@ TEST_F(ApplyPipelineTest, TasksTradePlaces) {
   EXPECT_EQ("rl0", PlacementOf(running, "src1")->parent);
 }
 
+// The placement is the last commit operation, but not the last step that can
+// fail: the resource convergence runs after the commit and aborts the
+// transaction. Its undo has to put the tasks back -- without one the placement
+// stays while the rest of the commit rolls back, and the runtime matches
+// neither the old spec nor the new one.
+TEST_F(ApplyPipelineTest, ResourceFailureAfterCommitRestoresThePlacement) {
+  PipelineSpec spec = PlacedTasks();
+  ASSERT_TRUE(control_plane_->ApplyPipeline(spec, {}).has_value());
+  const Fingerprint before = Capture();
+
+  // src0 moves from rl0 to rl1, so the plan ends with a placement.
+  PipelineSpec moved = spec;
+  moved.tasks[0].parent = "rl1";
+  auto plan = control_plane_->PlanPipeline(moved);
+  ASSERT_TRUE(plan.has_value()) << plan.error().message;
+  ASSERT_FALSE(plan->commit_ops.empty());
+  ASSERT_TRUE(std::holds_alternative<bess::control::PlaceTasksOp>(
+      plan->commit_ops.back()))
+      << "the plan should end with the task placement";
+
+  bess::control::SetFailureInjector(
+      [](bess::control::TransactionPhase phase,
+         const bess::control::PlanOperation &) {
+        if (phase != bess::control::TransactionPhase::kResources) {
+          return std::optional<bess::control::ControlError>();
+        }
+        return std::optional<bess::control::ControlError>(
+            bess::control::Err(EIO, "injected resource failure"));
+      });
+  auto applied = control_plane_->ApplyPipeline(moved, {});
+  bess::control::ClearFailureInjector();
+
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_TRUE(Capture() == before) << "the abort left the placement behind";
+  auto diff = control_plane_->DiffPipeline(spec);
+  ASSERT_TRUE(diff.has_value()) << diff.error().message;
+  EXPECT_TRUE(diff->empty()) << "the runtime no longer matches the old spec";
+
+  // With the failure gone the same apply lands, placement included.
+  applied = control_plane_->ApplyPipeline(moved, {});
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  const PipelineSpec running = SpecFromSnapshot(control_plane_->GetPipeline());
+  ASSERT_NE(nullptr, PlacementOf(running, "src0"));
+  EXPECT_EQ("rl1", PlacementOf(running, "src0")->parent);
+}
+
 // A placement the scheduler refuses at commit (the class is full with a task
 // desired state does not name) moves no task: those already moved go back.
 TEST_F(ApplyPipelineTest, RefusedPlacementMovesNoTask) {

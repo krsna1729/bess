@@ -113,6 +113,10 @@ void ClearFailureInjector() {
   Injector() = nullptr;
 }
 
+std::optional<ControlError> MaybeInjectResourceFailure() {
+  return MaybeInjectFailure(TransactionPhase::kResources, PlanOperation{});
+}
+
 Quiescence RequiredQuiescence(const PipelinePlan &plan) {
   // Setup alone can run while workers run; anything that rewires the graph or
   // tears down objects the dataplane can see cannot.
@@ -373,6 +377,9 @@ void Transaction::Abort() noexcept {
       case Undo::Kind::kRestoreTcParams:
         result = plane_->UpdateTcParamsLocked(undo.tc);
         break;
+      case Undo::Kind::kRestorePlacement:
+        result = plane_->PlaceTasksLocked(undo.placements, {});
+        break;
     }
 
     if (!result) {
@@ -505,17 +512,26 @@ ControlResult<void> Transaction::ExecuteCommitOp(const PlanOperation &op) {
   }
 
   if (const auto *place = std::get_if<PlaceTasksOp>(&op)) {
-    // The last commit operation (Plan puts it there), so nothing after it can
-    // fail and abort: it needs no undo entry. A refusal puts every task back
-    // itself (PlaceTasksLocked is all or nothing).
+    // The last commit operation (Plan puts it there), but not the last step
+    // that can fail: the resource convergence runs after the commit and aborts
+    // the transaction. So the placement records where each class it moves sat,
+    // and the abort puts them back -- into classes that are still there, since
+    // RemoveTcOp is a retire operation and one in the commit phase refuses the
+    // whole apply before this runs. A refusal here puts every task back itself
+    // (PlaceTasksLocked is all or nothing).
     std::vector<TrafficClassSpec> targets;
     targets.reserve(place->tasks.size());
     for (const TaskPlacementSpec &task : place->tasks) {
       targets.push_back(task.AsLeafSpec());
     }
-    if (auto result = plane_->PlaceTasksLocked(targets, place->leaving); !result) {
+    std::vector<TrafficClassSpec> previous;
+    if (auto result = plane_->PlaceTasksLocked(targets, place->leaving, &previous);
+        !result) {
       return std::unexpected(result.error());
     }
+    Undo undo{Undo::Kind::kRestorePlacement, {}, {}, -1, {}};
+    undo.placements = std::move(previous);
+    undo_.push_back(std::move(undo));
     ops_executed_++;
     return {};
   }

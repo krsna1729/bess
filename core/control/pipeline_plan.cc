@@ -143,8 +143,9 @@ PipelinePlan Plan(const PipelineDiff &diff) {
 
   // Tasks last in the commit, in one step: their modules and parent classes
   // exist now, and a task leaves a class the retire phase removes before it
-  // goes. Last also because the step has no undo entry: it restores itself
-  // when refused, and nothing after it can abort the transaction.
+  // goes. Last also because it restores itself when refused. It is not the
+  // last step that can fail, though -- the resource convergence after the
+  // commit aborts the transaction -- so it carries an undo entry.
   if (!diff.tasks.empty()) {
     PlaceTasksOp place;
     for (const TaskChange &change : diff.tasks) {
