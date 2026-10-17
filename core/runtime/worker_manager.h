@@ -128,6 +128,11 @@ class WorkerManager {
  private:
   // Moves non-worker threads off the active workers' CPUs.
   void PlaceThreads();
+  // The worker whose scheduler has `c` as its root, or nullptr. A root is
+  // attached but parentless, so this is the question `c->parent()` cannot
+  // answer; AttachOrphans needs it to keep a class from being attached to two
+  // workers at once.
+  const Worker *RootedOnAnyWorker(const TrafficClass *c) const;
   // The slots are written by the worker thread and read by the control thread
   // (the launch spin below, pause/resume, teardown), so they are atomic --
   // the legacy `Worker *volatile workers[]` array is what this replaces.

@@ -284,12 +284,39 @@ void WorkerManager::AdjustSchedulerDefaults() {
   }
 }
 
+const Worker *WorkerManager::RootedOnAnyWorker(const TrafficClass *c) const {
+  for (const auto &slot : workers_) {
+    const Worker *worker = slot.load();
+    if (worker != nullptr && worker->scheduler()->root() == c) {
+      return worker;
+    }
+  }
+  return nullptr;
+}
+
 void WorkerManager::AttachOrphans() {
   CHECK(!AnyRunning());
   // Distribute all orphan TCs to workers.
   for (const auto &tc : orphan_tcs_) {
     TrafficClass *c = tc.second;
     if (c->parent()) {
+      continue;
+    }
+
+    // A root has no parent, so the check above cannot see a class that is
+    // already attached as a worker's root. Attaching it to a second worker
+    // would run its task on two workers at once: for a module whose task owns
+    // a single-consumer ring that is two consumers, and that is the state that
+    // hands out a slot nobody wrote (D-019; drr.h's ring comment). A class is
+    // orphaned or attached, never both.
+    const Worker *owner = RootedOnAnyWorker(c);
+    DCHECK(owner == nullptr)
+        << "traffic class " << c->name() << " is the root of worker "
+        << owner->wid().value() << " and is also in the orphan list";
+    if (owner != nullptr) {
+      LOG(ERROR) << "traffic class " << c->name() << " is already the root of "
+                 << "worker " << owner->wid().value()
+                 << "; not attaching it to a second worker";
       continue;
     }
 
@@ -302,7 +329,10 @@ void WorkerManager::AttachOrphans() {
       w = named;
     }
 
-    w->scheduler()->AttachOrphan(c, w->wid());
+    if (!w->scheduler()->AttachOrphan(c, w->wid())) {
+      LOG(ERROR) << "attaching traffic class " << c->name() << " to worker "
+                 << w->wid().value() << " failed";
+    }
   }
 
   orphan_tcs_.clear();
