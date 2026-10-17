@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <random>
 #include <span>
@@ -172,30 +173,68 @@ TEST(RangeBackendTest, PrecedenceAndOverlappingRanges) {
 }
 
 TEST(RangeBackendTest, DifferentialFuzzAgainstScalarReference) {
-  // Randomised masks and values over several key sizes, with masks shorter
-  // than, equal to and longer than the key. The rules this replaced built both
-  // value and mask from TestKey{}, i.e. an all-zero mask, and (key & 0) == 0
-  // holds for every key: nothing about the comparison was exercised.
+  // Keys are built from the rules, not at random. A random key against a random
+  // mask matches with probability around 2^-32, so a random stream only shows
+  // that both sides miss - a MatchFast that always returned false would pass
+  // it. Each constructible rule gets a key that takes its masked value, fills
+  // the unmasked bits at random and puts both ports inside its ranges, so the
+  // hit path and the result are exercised; the remaining keys are one flipped
+  // masked bit or one port at high + 1 away from such a key, so near-misses
+  // are too. Rules whose mask selects port bytes cannot be hit this way and are
+  // left to the near-miss and random keys.
   std::mt19937 rng(42);
   std::uniform_int_distribution<uint16_t> port_dist(1, 60000);
   std::uniform_int_distribution<int64_t> prio_dist(1, 1000);
   std::uniform_int_distribution<int> byte_dist(0, 255);
 
   constexpr size_t kBatchSize = 32;
-  constexpr size_t kTotalPackets = 1024;
+  constexpr size_t kRules = 24;
+
+  uint64_t total_fast_hits = 0;
+  uint64_t total_scalar_hits = 0;
 
   for (const size_t key_size : {size_t{4}, size_t{8}, size_t{12}, size_t{13}}) {
     for (const size_t mask_len : {key_size - 1, key_size, key_size + 3}) {
+      const size_t src_off = 4;
+      const size_t dst_off = 6;
+      const bool ports_fit = dst_off + sizeof(uint16_t) <= key_size;
+
       std::vector<RangeRule<uint32_t>> rules;
-      for (uint32_t i = 0; i < 50; i++) {
+      std::vector<std::vector<std::byte>> rule_keys;  // hit keys, per rule
+
+      for (uint32_t i = 0; i < kRules; i++) {
+        // Half the rules leave the port bytes unmasked, so a key can satisfy
+        // the mask and land inside both ranges. The whole window has to be
+        // inside the mask, or a chosen port would violate the mask instead.
+        const bool ports_free =
+            ports_fit && (i % 2 == 0) &&
+            src_off + sizeof(uint16_t) <= mask_len &&
+            dst_off + sizeof(uint16_t) <= mask_len;
+
         std::vector<std::byte> value(mask_len);
         std::vector<std::byte> mask(mask_len);
         for (size_t j = 0; j < mask_len; j++) {
           mask[j] = static_cast<std::byte>(byte_dist(rng));
-          // Half the values carry bits the mask does not select.
+          // A rule can only ever match if its value carries no bits outside its
+          // mask, so the constructible rules are built that way. The others
+          // carry such bits on purpose and can never match: they still
+          // exercise the rejection path.
           value[j] = static_cast<std::byte>(
-              (j % 2 == 0) ? (byte_dist(rng) & static_cast<int>(mask[j]))
-                           : byte_dist(rng));
+              (ports_free || j % 2 == 0)
+                  ? (byte_dist(rng) & static_cast<int>(mask[j]))
+                  : byte_dist(rng));
+        }
+        if (ports_free) {
+          for (size_t j = 0; j < sizeof(uint16_t); j++) {
+            if (src_off + j < mask_len) {
+              mask[src_off + j] = std::byte{0};
+              value[src_off + j] = std::byte{0};
+            }
+            if (dst_off + j < mask_len) {
+              mask[dst_off + j] = std::byte{0};
+              value[dst_off + j] = std::byte{0};
+            }
+          }
         }
 
         const uint16_t s_lo = port_dist(rng);
@@ -203,42 +242,110 @@ TEST(RangeBackendTest, DifferentialFuzzAgainstScalarReference) {
         const uint16_t d_lo = port_dist(rng);
         const uint16_t d_hi = d_lo + (port_dist(rng) % 1000);
 
+        if (ports_free) {
+          std::vector<std::byte> key(key_size);
+          for (size_t j = 0; j < key_size; j++) {
+            const std::byte m =
+                j < mask.size() ? mask[j] : std::byte{0};
+            const std::byte v =
+                j < value.size() ? value[j] : std::byte{0};
+            key[j] = (v & m) |
+                     (static_cast<std::byte>(byte_dist(rng)) &
+                      static_cast<std::byte>(~static_cast<int>(m)));
+          }
+          const be16_t src_port{static_cast<uint16_t>(
+              s_lo + (port_dist(rng) % (s_hi - s_lo + 1)))};
+          const be16_t dst_port{static_cast<uint16_t>(
+              d_lo + (port_dist(rng) % (d_hi - d_lo + 1)))};
+          std::memcpy(key.data() + src_off, &src_port, sizeof(src_port));
+          std::memcpy(key.data() + dst_off, &dst_port, sizeof(dst_port));
+          rule_keys.push_back(std::move(key));
+        } else {
+          rule_keys.emplace_back();
+        }
+
         rules.push_back({
             .value = std::move(value),
             .mask = std::move(mask),
             .src_range = PortRange{.low = s_lo, .high = s_hi},
             .dst_range = PortRange{.low = d_lo, .high = d_hi},
-            .src_port_offset = 4,
-            .dst_port_offset = 6,
+            .src_port_offset = src_off,
+            .dst_port_offset = dst_off,
             .priority = prio_dist(rng),
             .result = i + 1,
         });
       }
 
       RangeClassifier<uint32_t> fast_classifier(rules);
-      ScalarRangeBackend<uint32_t> scalar_ref(std::move(rules));
+      // A copy, not a move: the key loop below still reads rules[i].
+      ScalarRangeBackend<uint32_t> scalar_ref(rules);
 
-      std::vector<std::byte> keys(key_size * kTotalPackets);
-      for (auto &b : keys) {
-        b = static_cast<std::byte>(byte_dist(rng));
+      // Per rule: its hit key, the same key with one masked bit flipped, and
+      // the same key with one port stepped past its range's end.
+      std::vector<std::vector<std::byte>> keys;
+      for (size_t i = 0; i < rules.size(); i++) {
+        const auto &hit = rule_keys[i];
+        if (hit.empty()) {
+          continue;
+        }
+        keys.push_back(hit);
+
+        auto flipped = hit;
+        for (size_t j = 0; j < mask_len && j < key_size; j++) {
+          if (rules[i].mask[j] != std::byte{0}) {
+            flipped[j] ^= static_cast<std::byte>(
+                byte_dist(rng) & static_cast<int>(rules[i].mask[j]));
+            break;
+          }
+        }
+        keys.push_back(std::move(flipped));
+
+        if (ports_fit) {
+          auto past = hit;
+          // One past the range's end: a near-miss, not a hit.
+          const be16_t src_hi{
+              static_cast<uint16_t>(rules[i].src_range.high + 1)};
+          const be16_t dst_hi{
+              static_cast<uint16_t>(rules[i].dst_range.high + 1)};
+          std::memcpy(past.data() + src_off, &src_hi, sizeof(src_hi));
+          std::memcpy(past.data() + dst_off, &dst_hi, sizeof(dst_hi));
+          keys.push_back(std::move(past));
+        }
+
+        auto random_key = hit;
+        for (auto &b : random_key) {
+          b = static_cast<std::byte>(byte_dist(rng));
+        }
+        keys.push_back(std::move(random_key));
       }
 
-      for (size_t b = 0; b < kTotalPackets; b += kBatchSize) {
+      for (size_t b = 0; b < keys.size(); b += kBatchSize) {
+        const size_t count = std::min(kBatchSize, keys.size() - b);
         std::array<uint32_t, kBatchSize> fast_results{};
         std::array<uint32_t, kBatchSize> scalar_results{};
 
-        ConstBytes batch_keys(keys.data() + b * key_size, kBatchSize * key_size);
+        std::vector<std::byte> flat(count * key_size);
+        for (size_t i = 0; i < count; i++) {
+          std::memcpy(flat.data() + i * key_size, keys[b + i].data(), key_size);
+        }
 
+        ConstBytes batch_keys(flat.data(), flat.size());
+        // Only `count` keys are in the buffer: a full 32-element span would
+        // make LookupBatch read past it.
         uint64_t fast_hits = fast_classifier.LookupBatch(
-            batch_keys, key_size, key_size, std::span<uint32_t>(fast_results));
-
+            batch_keys, key_size, key_size,
+            std::span<uint32_t>(fast_results).first(count));
         uint64_t scalar_hits = scalar_ref.LookupBatch(
-            batch_keys, key_size, key_size, std::span<uint32_t>(scalar_results));
+            batch_keys, key_size, key_size,
+            std::span<uint32_t>(scalar_results).first(count));
+
+        total_fast_hits += std::popcount(fast_hits);
+        total_scalar_hits += std::popcount(scalar_hits);
 
         EXPECT_EQ(fast_hits, scalar_hits)
             << "Hit mask mismatch at batch " << b << ", key size " << key_size
             << ", mask length " << mask_len;
-        for (size_t i = 0; i < kBatchSize; i++) {
+        for (size_t i = 0; i < count; i++) {
           if (fast_hits & (uint64_t{1} << i)) {
             EXPECT_EQ(fast_results[i], scalar_results[i])
                 << "Result mismatch at packet " << (b + i);
@@ -247,6 +354,12 @@ TEST(RangeBackendTest, DifferentialFuzzAgainstScalarReference) {
       }
     }
   }
+
+  // Without this the whole comparison could be vacuous: a stream that never
+  // hits exercises only the rejection path, and an always-false implementation
+  // would pass it.
+  EXPECT_GT(total_scalar_hits, 0u);
+  EXPECT_EQ(total_fast_hits, total_scalar_hits);
 }
 
 TEST(RangeBackendTest, CartesianExplosionElimination) {
