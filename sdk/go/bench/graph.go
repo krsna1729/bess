@@ -187,9 +187,10 @@ func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int,
 
 // paused runs body with the daemon's workers paused. A resume that fails is
 // reported, because it leaves the daemon paused. A pause that fails is reported
-// too, but does not stop body: ApplyPipeline is safe with the workers running,
-// and leaving the daemon holding the bench graph, with the caller's own pipeline
-// gone, would be the worse outcome.
+// too, but does not stop body: the pause is a precaution against traffic seeing
+// a half-removed graph, while aborting would leave the daemon holding the bench
+// graph and the caller's own pipeline gone, which is the worse of the two, and
+// the failure reaches the caller either way.
 func paused(ctx context.Context, pause, resume func(context.Context) error, body func() error) (err error) {
 	defer func() {
 		if rerr := resume(ctx); rerr != nil {
@@ -205,11 +206,12 @@ func paused(ctx context.Context, pause, resume func(context.Context) error, body
 }
 
 // resumeAfterFailure resumes the workers on an error path and returns err with
-// the resume's own failure folded in. The caller is already reporting err, and a
-// resume that also fails would otherwise leave the daemon paused silently.
+// the resume's own failure joined in, so a caller can match either one. The
+// caller is already reporting err, and a resume that also fails would otherwise
+// leave the daemon paused silently.
 func resumeAfterFailure(ctx context.Context, c *bess.Client, err error) error {
 	if rerr := c.ResumeWorkers(ctx); rerr != nil {
-		return fmt.Errorf("%w (and resuming the workers failed too: %v)", err, rerr)
+		return errors.Join(err, fmt.Errorf("resuming the workers: %w", rerr))
 	}
 	return err
 }
