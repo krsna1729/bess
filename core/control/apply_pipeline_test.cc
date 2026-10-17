@@ -177,6 +177,93 @@ TEST_F(ApplyPipelineTest, AppliesACompletePipeline) {
   EXPECT_FALSE(again->workers_paused);
 }
 
+// The module half of PolicyChangeIsRefusedTransactionally: a module's argument
+// is applied at construction, so a different one is a kReplace in the diff, and
+// the transaction that would perform it is refused - the live module cannot be
+// reconfigured in place, and replacing it transactionally is not supported.
+// The path the refusal names is two transactions: remove the module, then add
+// it back with the new argument, which is what builds it again.
+TEST_F(ApplyPipelineTest, AChangedModuleArgumentIsARefusedReplace) {
+  ASSERT_TRUE(control_plane_->ApplyPipeline(FullPipeline(), {}).has_value());
+  const PipelineSnapshot active = control_plane_->GetPipeline();
+
+  // The runtime's own report, re-applied, is not a change.
+  const PipelineSpec live = SpecFromSnapshot(active);
+  auto same = control_plane_->DiffPipeline(live);
+  ASSERT_TRUE(same.has_value()) << same.error().message;
+  EXPECT_TRUE(same->modules.empty())
+      << "a module reports the argument it was built with, so re-applying it "
+         "changes nothing";
+
+  // A different argument is.
+  PipelineSpec changed = live;
+  for (bess::control::ModuleSpec &module : changed.modules) {
+    if (module.name == "src") {
+      bess::pb::BypassArg arg;
+      arg.set_cycles_per_packet(7);
+      ASSERT_TRUE(module.arg.PackFrom(arg));
+    }
+  }
+  auto diff = control_plane_->DiffPipeline(changed);
+  ASSERT_TRUE(diff.has_value()) << diff.error().message;
+  ASSERT_EQ(1u, diff->modules.size()) << "only src's argument changed";
+  EXPECT_EQ("src", diff->modules[0].name);
+  EXPECT_EQ(bess::control::ChangeKind::kReplace, diff->modules[0].kind);
+
+  // The transaction is refused, and nothing moves.
+  const uint64_t generation = bess::runtime::runtime().generation();
+  auto applied = control_plane_->ApplyPipeline(changed, {});
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(bess::control::ControlErrorCode::kUnsupportedTransaction,
+            applied.error().code);
+  EXPECT_EQ("module", applied.error().object);
+  EXPECT_EQ("transaction", applied.error().field);
+  EXPECT_NE(std::string::npos,
+            applied.error().message.find("applied at construction"))
+      << applied.error().message;
+  EXPECT_EQ(generation, bess::runtime::runtime().generation());
+  EXPECT_TRUE(control_plane_->GetPipeline() == active);
+
+  // The path the refusal names: remove the module in one transaction, add it
+  // back with the new argument in the next. The live snapshot reports the
+  // argument the module was built with, so reading the new one back is what
+  // proves it was built again.
+  PipelineSpec without_src = changed;
+  without_src.modules.erase(
+      std::remove_if(without_src.modules.begin(), without_src.modules.end(),
+                     [](const bess::control::ModuleSpec &module) {
+                       return module.name == "src";
+                     }),
+      without_src.modules.end());
+  without_src.connections.erase(
+      std::remove_if(without_src.connections.begin(),
+                     without_src.connections.end(),
+                     [](const bess::control::ConnectionSpec &connection) {
+                       return connection.upstream == "src";
+                     }),
+      without_src.connections.end());
+  ASSERT_TRUE(control_plane_->ApplyPipeline(without_src, {}).has_value());
+  ASSERT_TRUE(control_plane_->ApplyPipeline(changed, {}).has_value());
+
+  bool found = false;
+  for (const bess::control::ModuleSnapshot &module :
+       control_plane_->GetPipeline().modules) {
+    if (module.name != "src") {
+      continue;
+    }
+    found = true;
+    bess::pb::BypassArg seen;
+    ASSERT_TRUE(module.arg.UnpackTo(&seen)) << module.arg.type_url();
+    EXPECT_EQ(7u, seen.cycles_per_packet());
+  }
+  EXPECT_TRUE(found);
+
+  // And nothing is left over: the same desired state again moves nothing.
+  auto settled = control_plane_->ApplyPipeline(changed, {});
+  ASSERT_TRUE(settled.has_value()) << settled.error().message;
+  EXPECT_EQ(0u, settled->applied_ops);
+}
+
 TEST_F(ApplyPipelineTest, SnapshotOfTheActiveRuntimeIsTheDesiredState) {
   ASSERT_TRUE(control_plane_->ApplyPipeline(FullPipeline(), {}).has_value());
 
