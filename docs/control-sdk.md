@@ -493,6 +493,41 @@ before any effect (D-106). An answer from another epoch to a question
 without `refused`, meaning "the outcome on the old daemon is lost": re-read the
 state before deciding.
 
+## Shipping the Go SDK (D-145)
+
+`sdk/go` is a module of its own (`github.com/krsna1729/bess/sdk/go`, go 1.24, with
+grpc and protobuf the only direct requirements), so another repository can depend
+on it without this one: its descriptors are committed beside the client
+(`sdk/go/controlv2`), and nothing in it needs the C++ tree, a codegen step or a
+running bessd.
+
+A consumer pins it by revision. No tag exists yet, so what can be pinned today is
+a branch, resolved once and recorded as a pseudo-version:
+
+```sh
+go get github.com/krsna1729/bess/sdk/go@develop
+# require github.com/krsna1729/bess/sdk/go v0.0.0-20261016142821-0fb10e55b202
+```
+
+The plan is a tag, and it must carry the module's directory: a module in a
+subdirectory is released as `git tag sdk/go/vX.Y.Z <commit>`, because that is the
+name the module proxy looks for. Push it on a commit CI has already run -- the
+release workflow triggers on tags -- and remember that a published tag is
+immutable for consumers: the proxy caches it, so moving one is not a fix but a
+different module.
+
+Only an *unpinned* query reads the default branch: `go get ....@latest` uses the
+repository's default branch, which is `develop`, where the work lands -- not
+`master`, the archival mirror of upstream, which no release path names. A query
+that names a revision -- `@develop`, `@0fb10e5`, `@v0.1.0` -- uses it and needs no
+default branch at all. (Before the flip, `@latest` answered "no matching versions
+for query latest", because the default branch had no `sdk/` in it.)
+
+Working in two checkouts at once is what a `go.work` is for: it is machine-local
+and untracked here, it points the module path at a local directory, and it
+overrides what `go.mod` says, so an edit needs no push. It stays a development
+shortcut -- CI and every other consumer build from the pin above.
+
 ## Tests
 
 The Go and C++ clients follow the same contract (`sdk/go/bess/client.go`,

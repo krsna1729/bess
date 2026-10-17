@@ -160,6 +160,7 @@ file is the reasoning.
 | D-138 | `live_perf` is C++ (`tests/perf/live_perf`, a client of the C++ SDK over control_v2): pipelines and table entries go in as one transaction, ns per packet from the measured modules' Track gate counters over a client-timed window; master is no longer a build it drives; `F.hook` dropped (no v2 `track_gate`); `tools/live_perf.py` is gone. It found two control_v2 defects, both fixed: transactional WildcardMatch rules never reordered the tuple list (D-098 amendment), and `ApplyPipeline` ignored `skip_default_hooks` | accepted |
 | D-139 | `live_transaction_bench` is C++ on the SDK (`tests/perf/live_transaction_bench`): the same pipeline, rates and report against a running bessd, the default gate as `em/settings`, gate counters and busy answers from metrics; `tools/live_transaction_bench.py` is gone; the perf clients share `tests/perf/schema_types.h` | accepted |
 | D-140 | The legacy service is gone: no `BESSControl` RPC, `service.proto`, pybess, Python bessctl, `bess-python` package, legacy-only module commands, `LEGACY_ONLY`/`Exposure` or gate-hook command table (plugin API 4); each module's `cmds` entries are its actions, `get_initial_arg` is `GetPipeline`'s `Module.arg`, and state is changed through resources (`edits_resources` marks an action that edits one) | accepted |
+| D-145 | The Go SDK ships as a nested module under module-prefixed tags (`sdk/go/vX.Y.Z`), consumed by pinning a tag or a commit; unpinned queries resolve through the repository's default branch, which is `develop`, while `master` stays the archival upstream mirror and no branch is renamed; `go.work` is a machine-local development shortcut, never how a consumer builds | accepted |
 
 
 ---
@@ -10301,3 +10302,29 @@ accessor had no caller.
 
 **Code.** `core/gate_hooks/track.h`, `core/gate_hooks/track.cc`, `core/control/api_v2.cc`,
 `protobuf/bess_msg.proto`.
+
+## D-145 The Go SDK ships as a nested module, `develop` is the default branch
+
+- `sdk/go` is a module of its own (`github.com/krsna1729/bess/sdk/go`), descriptors committed beside the
+  client (`sdk/go/controlv2`) and grpc and protobuf its only direct requirements, so another repository
+  depends on it without this tree: no codegen step, no C++ build, no bessd.
+- Decision: consumers pin a revision, and the revision to prefer is a *tag* -- `git tag sdk/go/vX.Y.Z
+  <commit>`. The `sdk/go/` prefix is what the module proxy requires of a module in a subdirectory, and a
+  published tag is immutable for consumers because the proxy caches it. Tags are cut on commits CI has already
+  run. No such tag exists yet, so what a consumer can pin today is a branch, resolved once and recorded as a
+  pseudo-version: `go get github.com/krsna1729/bess/sdk/go@develop` writes
+  `v0.0.0-20261016142821-0fb10e55b202`, or the same by commit.
+- Only an *unpinned* query (`@latest`) reads the repository's **default branch**, so that branch is `develop`,
+  where the work lands. A query that names a branch, a commit or a version (`@develop`, `@0fb10e5`, `@v0.1.0`)
+  uses that revision and no default branch at all. `master` keeps being what it is, the archival mirror of
+  upstream, and no release path names it.
+- Measured: `go get github.com/krsna1729/bess/sdk/go@latest` answered "no matching versions for query latest"
+  while the default branch was `master` (it has no `sdk/` at all); `@develop` resolved to a pseudo-version
+  (`v0.0.0-20261016142821-0fb10e55b202`). With `develop` as the default branch, `@latest` resolves the same
+  way on a direct fetch, while the public proxy serves its cached answer until it refreshes.
+- A `go.work` in a consumer stays a machine-local development shortcut: it is untracked here, it points the
+  module path at a local directory and overrides `go.mod`, so an edit needs no push.
+
+**Consequence.** No branch is renamed: Go reads the default branch and the tags, never a branch name, so
+`master` keeps its archival meaning and `develop` keeps the pushes. What remains is a release act rather than a
+layout change: cut `sdk/go/v0.1.0` on a green commit, then repin the consumers from `@develop` to the tag.
