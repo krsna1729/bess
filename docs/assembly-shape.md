@@ -5,23 +5,31 @@ header-only, so their shape is what the *release* flags make of them: this page
 records the instructions each one compiles to, under its own symbol, and checks
 the header's claim against them. It is a review, not a benchmark.
 
-The wrapper translation unit is checked in as `tools/asm_shape.cc`: each kernel
-is `inline` in a header, so no archive carries a symbol to disassemble, and the
-wrappers are `noinline` with arguments the compiler cannot fold. Reproduce with
+The probe is `core/arch/asm_shape.cc`, built by Meson as `bess_arch_asm_shape`
+(so every lane compiles it and clang-tidy has its flags; nothing links or
+installs it): each kernel is `inline` in a header, so no archive carries a
+symbol to disassemble, and the wrappers are `noinline` with arguments the
+compiler cannot fold. Read the assembly with
+
+```sh
+ninja -C build/perf-release core/libbess_arch_asm_shape.a
+objdump -d --no-show-raw-insn build/perf-release/core/libbess_arch_asm_shape.a
+```
+
+or compile the same unit by hand with a `core/` translation unit's flags from
+`build/perf-release/compile_commands.json` (D-127: releases stay
+`-march=x86-64-v3`; AVX2 is in that floor, AVX-512 is not):
 
 ```sh
 g++ -O3 -march=x86-64-v3 -DNDEBUG -D_FILE_OFFSET_BITS=64 -std=c++23 -I core \
-    -S -o /tmp/asm_shape.s tools/asm_shape.cc
+    -S -o /tmp/asm_shape.s core/arch/asm_shape.cc
 awk '/^[_a-zA-Z][A-Za-z0-9_.]*:$/{f=$1} /^\t[a-z]/{print f, $1}' \
     /tmp/asm_shape.s | sort | uniq -c
 ```
 
-The flags are a `core/` translation unit's from
-`build/perf-release/compile_commands.json` (D-127: releases stay
-`-march=x86-64-v3`; AVX2 is in that floor, AVX-512 is not). Split the output by
-symbol as above, not by `.LFB` order: a TU-wide mnemonic count attributes one
-kernel's instructions to another (the first version of this page did exactly
-that, and swapped two bodies).
+Split the output by symbol as above, not by `.LFB` order: a TU-wide mnemonic
+count attributes one kernel's instructions to another (the first version of this
+page did exactly that, and swapped two bodies).
 
 ## What each kernel is
 

@@ -354,6 +354,18 @@ bess_packet = static_library(
   dependencies: low_level_compile_deps,
   link_with: [bess_utils],
 )
+
+# The assembly-shape probe (roadmap Appendix J; docs/assembly-shape.md). Every
+# kernel in arch/ is inline in a header, so no archive carries a symbol to
+# disassemble: this target compiles the noinline wrappers with the real flags
+# in every lane, which keeps the probe compiling and gives clang-tidy the file's
+# flags. Nothing links it into bessd and nothing installs it.
+bess_arch_asm_shape = static_library(
+  'bess_arch_asm_shape',
+  'arch/asm_shape.cc',
+  include_directories: core_include,
+  dependencies: low_level_compile_deps,
+)
 bess_execution = static_library(
   'bess_execution',
   execution_sources + [proto_ready_marker],
