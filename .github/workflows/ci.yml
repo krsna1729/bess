@@ -104,8 +104,11 @@ jobs:
           go test -race -count=1 ./...
 
   # The Python control SDK (D-146): its generated code is what the pinned
-  # generator makes from protobuf/control_v2.proto, and its unit tests run
-  # against a scripted transport - no daemon, no network.
+  # generator makes from protobuf/control_v2.proto (with protoc's own protobuf
+  # version stamp normalized, so that one line no longer varies with the build
+  # of the pin - every other byte is still the packager's protoc output, which
+  # is what this diff checks), and its unit tests run against a scripted
+  # transport - no daemon, no network.
   python-sdk:
     name: Python SDK
     runs-on: ubuntu-24.04

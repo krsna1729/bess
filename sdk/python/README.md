@@ -76,4 +76,7 @@ The output under `bess/controlv2/` is committed, and CI regenerates it and
 diffs, so the committed code cannot drift from the protos. The generator needs
 `grpcio-tools` only (pinned to the version CI installs, since its bundled
 `protoc` is what emits the messages, the stubs and the type stubs); the SDK
-itself needs neither.
+itself needs neither. The pin alone does not make the bytes: the same
+`grpcio-tools` release stamps different protobuf versions depending on which
+protobuf its packager built it against, so the generator normalizes that one
+stamp to the floor `pyproject.toml` declares.
