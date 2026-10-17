@@ -103,6 +103,29 @@ jobs:
           go run github.com/kisielk/errcheck@v1.30.0 -ignoretests ./...
           go test -race -count=1 ./...
 
+  # The Python control SDK (D-146): its generated code is what the pinned
+  # generator makes from protobuf/control_v2.proto, and its unit tests run
+  # against a scripted transport - no daemon, no network.
+  python-sdk:
+    name: Python SDK
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || '' }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: The pinned toolchain and runtime
+        run: python3 -m pip install grpcio-tools==1.83.1 grpcio==1.83.1 protobuf==7.36.1
+      - name: Regenerate and compare
+        run: |
+          tools/gen_python_sdk.sh
+          git diff --exit-code -- sdk/python/bess/controlv2
+      - name: Unit tests
+        working-directory: sdk/python
+        run: python3 -m unittest discover -s tests -t .
+
   # The lane table lives in tools/ci_profile.py (LANES, with the compiler
   # pins); pull requests run the gating pair and the sanitizer lanes, pushes
   # every lane (docs/ci-parity.md).

@@ -1,4 +1,4 @@
-# Control SDKs (Go `sdk/go`, C++ `sdk/cpp`, M27)
+# Control SDKs (C++ `sdk/cpp`, Go `sdk/go`, Python `sdk/python`, M27)
 
 A thin client over the generic control API (`protobuf/control_v2.proto`). It
 adds no semantics of its own: resources are whatever modules registered
@@ -6,9 +6,10 @@ adds no semantics of its own: resources are whatever modules registered
 adds is the part of the protocol that is easy to get wrong when every
 controller writes it again.
 
-Go (`github.com/krsna1729/bess/sdk/go/bess`), C++ (`sdk/cpp`) and Python
-(`sdk/python`, D-146) are the clients - all first-class, on the same wire and
-with the same guarantees - each in its own error type. Go
+Go (`github.com/krsna1729/bess/sdk/go/bess`) and C++ (`sdk/cpp`) are the
+clients today; Python (`sdk/python`) is the third, first-class per D-146, its
+clean-room rebuild in progress - same wire, same guarantees, its own error
+type. Go
 (`*ConflictError`, `*RejectedError`, `*BusyError`, `*TransportError`,
 `*DaemonRestartedError`, `*StaleResourceError`, `*InvalidRequestError`):
 

@@ -227,7 +227,7 @@ and 5; hardware status in `docs/compatibility.md`.
 | M24 reference appliances | done: R1-R5 installed-tree (R4 driven over the control API); R1 also links without bessd. R4 is a reduced session datapath (downlink, `PdrLikeRule{ue_ip, action}`, linear scan): the session-compiler appliance for real is the roadmap's P1 row 7, the UPF slice in the upf repo, and it is **not** covered by this row | D-086, D-094, D-095 |
 | M25 observability | done: metrics, events, pressure, DPDK tracing; histograms wait for a consumer | D-076, D-084, D-089 |
 | M26 release | done: metadata, SBOM, tarball, .deb, image; signing blocked on keys | D-075, D-087 |
-| M27 control SDK | done: C++, Python and Go, all first-class SDKs over control_v2 (the Python one is rebuilt clean-room, D-146); desired state, black-box recovery tests, a controller migrated | D-082, D-088, D-146 |
+| M27 control SDK | done: C++ and Go; Python is first-class per D-146 and its clean-room rebuild is in progress; desired state, black-box recovery tests, a controller migrated | D-082, D-088, D-146 |
 | Plugin unload (roadmap 28.4) | done | D-090 |
 
 Appendix J, audited item by item (2026-10-05): the one gap (plugin unload lifetime) is closed by D-090; the

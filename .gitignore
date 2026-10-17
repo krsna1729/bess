@@ -63,3 +63,7 @@ build-*/
 .ninja_log
 .ninja_deps
 sdk/go/bess/testdata/
+
+# setuptools build tree from a local pip install
+sdk/python/build/
+sdk/python/*.egg-info/
