@@ -88,7 +88,8 @@ func run() (err error) {
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", *addr, err)
 	}
-	defer client.Close()
+	// The exit code carries what the run found; a failed Close adds nothing.
+	defer func() { _ = client.Close() }()
 
 	cfg := bench.Config{Addr: *addr, Resource: *resource, Shapes: shapes,
 		Seconds: *seconds, Preload: *preload, PktSize: *pktSize, Gates: *gates, Base: uint32(base)}

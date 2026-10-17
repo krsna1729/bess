@@ -171,7 +171,9 @@ func Sweep(ctx context.Context, cfg Config) (res Result, floor Floor, err error)
 	if err != nil {
 		return Result{}, Floor{}, err
 	}
-	defer client.Close()
+	// A Close that fails has nothing a measurement can act on: the numbers are
+	// already in hand.
+	defer func() { _ = client.Close() }()
 	if cfg.ApplyGraph {
 		var cleanup func(context.Context) error
 		cleanup, err = ApplyGraph(ctx, client, cfg, cfg.WorkerCore, false)

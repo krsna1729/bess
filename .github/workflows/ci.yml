@@ -85,14 +85,22 @@ jobs:
           cache-dependency-path: sdk/go/go.sum
       - name: Vet and test
         working-directory: sdk/go
+        # Two analyzers go vet does not run by default, both for one shape: an
+        # error that reaches nobody. shadow catches a shadowed variable a
+        # cleanup closure then never sees (b363a091); errcheck catches an
+        # unchecked return (the bench's resume, graph.go). Both arrive through a
+        # module-aware go run, so neither enters go.mod. Both pins are the newest
+        # of their kind on purpose: an older analyzer cannot read a newer
+        # toolchain's export data, which fails as "internal error: package ...
+        # without types", so a pin matched to this job's Go would break a
+        # developer's newer one. GOTOOLCHAIN=auto is what lets this job fetch the
+        # toolchain a pin asks for.
+        env:
+          GOTOOLCHAIN: auto
         run: |
           go vet ./...
-          # The shadow pass is not in go vet's default set, and it catches a
-          # shape nothing else does: a shadowed error that a cleanup closure
-          # then never sees (b363a091). The module-aware go run keeps the tool
-          # out of go.mod, and the version is pinned to one whose own go.mod
-          # still matches the toolchain this job installs from sdk/go/go.mod.
-          go run golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow@v0.38.0 ./...
+          go run golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow@v0.52.0 ./...
+          go run github.com/kisielk/errcheck@v1.30.0 -ignoretests ./...
           go test -race -count=1 ./...
 
   # The lane table lives in tools/ci_profile.py (LANES, with the compiler
