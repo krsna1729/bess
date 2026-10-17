@@ -94,7 +94,7 @@ where it is; a new one goes to any worker. Placements apply together, so tasks
 may trade places (D-109).
 
 ```cpp
-auto snap = client->Pipeline();                // PipelineSnapshot: pipeline, version
+auto snap = client->Pipeline();                // PipelineSnapshot: pipeline, version, workers
 auto p = bess::sdk::PipelineBuilder(snap.pipeline)
              .Module("em", "ExactMatch", arg)
              .Chain("rnd", "em")
@@ -102,6 +102,12 @@ auto p = bess::sdk::PipelineBuilder(snap.pipeline)
 auto steps = client->PlanPipeline(p);          // what the daemon would do
 client->ApplyPipeline(p, snap.version);
 ```
+
+`PipelineSnapshot.workers` is where the daemon runs the workers it was asked
+about (`control_v2.WorkerPlacement`: `wid`, `core`, `shares_core`; D-123):
+a worker's `core` is filled for an automatic worker too, so a tool that let
+the daemon place its workers can read back which CPUs it got. Empty against a
+daemon that predates the field.
 
 Go: `bess.NewPipeline(snap.Pipeline).Module(...).Chain(...).Build()`,
 `client.Pipeline`, `ValidatePipeline`, `DiffPipeline`, `PlanPipeline`,

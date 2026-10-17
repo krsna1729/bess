@@ -599,10 +599,15 @@ type PipelineVersion struct {
 	ResourceGeneration      *uint64
 }
 
-// PipelineSnapshot is the active pipeline and its version.
+// PipelineSnapshot is the active pipeline and its version. Workers is where
+// the daemon runs each worker it was asked about (observed, by wid; D-123):
+// Core is set for an automatic worker too, so a tool that let the daemon place
+// its workers can read back which CPUs it got. Empty against a daemon that
+// predates the field.
 type PipelineSnapshot struct {
 	Pipeline *pb.Pipeline
 	Version  PipelineVersion
+	Workers  []*pb.WorkerPlacement
 }
 
 // PipelineQuery selects what Pipeline reads besides the topology (D-129).
@@ -633,7 +638,7 @@ func (c *Client) Pipeline(ctx context.Context, query ...PipelineQuery) (Pipeline
 	if req.IncludeResources {
 		v.ResourceGeneration = proto.Uint64(g.GetResourceGeneration())
 	}
-	return PipelineSnapshot{g.GetPipeline(), v}, nil
+	return PipelineSnapshot{g.GetPipeline(), v, g.GetWorkers()}, nil
 }
 
 // ValidatePipeline is the daemon's canonical form of p (InvalidRequestError

@@ -465,7 +465,9 @@ Result<PipelineSnapshot> Client::Pipeline(const PipelineQuery &query) {
   if (query.include_resources) {
     version.resource_generation = r->resource_generation();
   }
-  return PipelineSnapshot{.pipeline = r->pipeline(), .version = version};
+  return PipelineSnapshot{.pipeline = r->pipeline(),
+                          .version = version,
+                          .workers = {r->workers().begin(), r->workers().end()}};
 }
 
 Result<pb::Pipeline> Client::ValidatePipeline(const pb::Pipeline &p) {

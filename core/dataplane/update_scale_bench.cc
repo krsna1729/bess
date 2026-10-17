@@ -54,6 +54,8 @@
 #include <vector>
 
 #include "dpdk.h"
+#include "runtime/numa_placement.h"
+#include "runtime/thread_placement.h"
 #include "utils/cuckoo_map.h"
 
 // Lookup results land here so the compiler cannot drop the timed lookups.
@@ -108,7 +110,47 @@ struct Options {
   double seconds = 2.0;
   std::vector<uint64_t> rates = {0, 1000000, UINT64_MAX};
   bool e1 = true, e2 = true, e3 = false;
+  bool allow_dirty_placement = false;  // silence the placement warning
 };
+
+// -- placement (D-123) --------------------------------------------------------------
+
+// Warns (never refuses) when the pinned CPUs would measure SMT contention.
+// The topology comes from the daemon's own resolver, bess::runtime
+// (core/runtime/numa_placement.h), so the bench derives nothing itself; the
+// CPU set is this process's inherited affinity, the one every CPU of the run
+// lives in.
+void WarnIfSharedCores(const Options &o) {
+  if (o.allow_dirty_placement) {
+    return;  // the operator asked for no comment on the placement
+  }
+  const bess::runtime::Topology topology = bess::runtime::ReadTopology("/sys");
+  bool dirty = false;
+  for (size_t i = 0; i < o.cpus.size(); i++) {
+    const int cpu = static_cast<int>(o.cpus[i]);
+    if (topology.SharesCore(cpu, o.control_cpu)) {
+      std::fprintf(stderr, "worker CPU %d shares a physical core with control CPU %d\n", cpu,
+                   o.control_cpu);
+      dirty = true;
+    }
+    for (size_t j = i + 1; j < o.cpus.size(); j++) {
+      const int other = static_cast<int>(o.cpus[j]);
+      if (topology.SharesCore(cpu, other)) {
+        std::fprintf(stderr, "worker CPUs %d and %d are SMT siblings\n", cpu, other);
+        dirty = true;
+      }
+    }
+  }
+  if (!dirty) {
+    return;
+  }
+  std::fprintf(stderr,
+               "PLACEMENT WARNING: those CPUs are all in this process's set (%s), so nothing\n"
+               "outside the run competes with them, but the SMT pair does: these numbers\n"
+               "include that contention. Measure one CPU per physical core for numbers\n"
+               "worth publishing. (--allow-dirty-placement silences this.)\n",
+               bess::runtime::CpuList(bess::runtime::ProcessCpus()).c_str());
+}
 
 // -- tables ------------------------------------------------------------------------
 
@@ -529,8 +571,10 @@ int main(int argc, char **argv) {
       o.e1 = a.find("e1") != std::string::npos;
       o.e2 = a.find("e2") != std::string::npos;
       o.e3 = a.find("e3") != std::string::npos;
+    } else if (a.rfind("--allow-dirty-placement", 0) == 0) {
+      o.allow_dirty_placement = true;
     } else if (a.rfind("--benchmark_min_time", 0) == 0) {
-      // Meson smoke run: tiny and quick.
+      // Meson smoke run: tiny and quick, on whatever CPUs a small machine has.
       o.sizes = {1000};
       o.cpus = {0, 1};
       o.control_cpu = 0;
@@ -538,6 +582,7 @@ int main(int argc, char **argv) {
       o.rates = {0, 100000};
     }
   }
+  WarnIfSharedCores(o);
   bess::InitDpdk(0);
   if (o.e1) RunE1(o);
   if (o.e2) RunE2(o);

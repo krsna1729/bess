@@ -174,6 +174,11 @@ struct PipelineQuery {
 struct PipelineSnapshot {
   pb::Pipeline pipeline;
   PipelineVersion version;
+  // Where each worker runs, as the daemon observes it (D-123): the core an
+  // automatic worker was given, and whether it shares a physical core with
+  // another worker or a control CPU. Empty against a daemon that predates the
+  // field. A bench placing workers automatically reads its cores from here.
+  std::vector<pb::WorkerPlacement> workers;
 };
 
 struct PipelineDiffResult {

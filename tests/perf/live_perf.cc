@@ -63,6 +63,7 @@
 #include <vector>
 
 #include "bess/sdk/client.h"
+#include "placement_check.h"
 #include "schema_types.h"
 
 extern char **environ;
@@ -637,6 +638,7 @@ struct Options {
   // A directory of plugins the daemon loads (--modules=). It also enables the
   // M.gtpu_* arms, which need the UPF plugin's classes.
   std::string plugin;
+  bool allow_dirty_placement = false;  // silence the placement warning
 };
 
 struct BuildSpec {
@@ -726,6 +728,31 @@ void Check(const bess::sdk::Result<void> &r, const std::string &what) {
   }
 }
 
+// Reports where the daemon put the workers -- its own verdict from
+// GetPipeline (D-123), never a topology the client derives. Checked once per
+// distinct placement, since a round reuses the same cores for every test and a
+// warning repeated per test buries the run.
+void ReportPlacement(bess::sdk::Client &client, const Options &o) {
+  auto snapshot = client.Pipeline();
+  if (!snapshot) {
+    return;
+  }
+  std::vector<int> cores;
+  for (const v2::WorkerPlacement &w : snapshot->workers) {
+    cores.push_back(w.core());
+  }
+  std::sort(cores.begin(), cores.end());
+  static std::vector<int> reported;
+  if (cores == reported) {
+    return;
+  }
+  reported = cores;
+  if (auto caps = client.Capabilities()) {
+    bess::perf::PrintPlacement(caps->placement());
+  }
+  bess::perf::ReportWorkerPlacement(snapshot->workers, o.allow_dirty_placement);
+}
+
 Sample RunTest(bess::sdk::Client &client, Types &types, const Test &test, const Options &o) {
   Sample out;
   try {
@@ -745,6 +772,7 @@ Sample RunTest(bess::sdk::Client &client, Types &types, const Test &test, const 
     if (!applied) {
       throw std::runtime_error(applied.error().message);
     }
+    ReportPlacement(client, o);
     Check(client.ResumeWorkers(), "resume");
     std::this_thread::sleep_for(std::chrono::duration<double>(o.warmup));
     // Hardware counters on worker 0's CPU over the window: per packet, more
@@ -992,6 +1020,8 @@ int Main(int argc, char **argv) {
       o.warmup = std::stod(value());
     } else if (a == "--counters") {
       o.counters = true;
+    } else if (a == "--allow-dirty-placement") {
+      o.allow_dirty_placement = true;
     } else if (a == "--save") {
       o.save = value();
     } else if (a == "--baseline") {
@@ -1009,7 +1039,8 @@ int Main(int argc, char **argv) {
       std::fprintf(stderr,
                    "usage: live_perf [--tests NAME|F|M,...] [--build SPEC]... [--rounds N]\n"
                    "  [--cpu W0[,W1]] [--control-cpu C] [--duration S] [--warmup S] [--counters]\n"
-                   "  [--save FILE] [--baseline FILE [--threshold PCT]] [--plugin DIR] [--list]\n"
+                   "  [--allow-dirty-placement] [--save FILE] [--baseline FILE [--threshold PCT]]\n"
+                   "  [--plugin DIR] [--list]\n"
                    "SPEC: current | current:<tree>[:<builddir>[:<flags,...>]] | name=<bessd>[,flag...]\n");
       return 2;
     }
