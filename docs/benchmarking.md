@@ -24,6 +24,14 @@ How to produce numbers that can be trusted and compared. Decisions in
 - **Pin each benchmark to one CPU, and isolate that CPU from other
   tasks** where you can: a cgroup v2 isolated partition, `isolcpus`, or at
   least `taskset`. Use the performance governor.
+- **Record the power profile beside the number.** On this host
+  `powerprofilesctl set performance` moves these metrics 13-20%: the same
+  release binary, ten fresh daemons each, gave F.floor 1.91 / F.hop/16 8.11 /
+  M.base 6.80 under `balanced` against 1.65 / 6.87 / 5.93 under
+  `performance`. A `performance` run is therefore not comparable to a
+  `balanced` one, and the recorded baselines (D-127's tune matrix among them)
+  were taken under the default profile. State `powerprofilesctl get` with any
+  number you keep, and put the profile back afterwards.
 - **On hybrid CPUs, measure on each core type** (for example one P-core
   and one E-core); results differ materially.
 - **Make sure the machine is otherwise idle.** A stray busy process never
@@ -226,7 +234,11 @@ tests.
         --build current --build other=/tree/build/release/core/bessd --rounds 8 --save run.json
     build/release/tests/perf/live_perf --build current --tests F --baseline run.json --threshold 5   # exits 1 on a regression
 
-`current` is the bessd next to the tool (`../../core/bessd`). A build may also name a tree, its build directory and
+`current` is the bessd next to the tool (`../../core/bessd`), and `live_perf`'s default builddir is
+`build/perf-release`: measure there. `build/fast` is configured with meson buildtype `plain` plus fast.ini's
+`-O1 -g0`, so a number from it is not comparable to the release baselines -- reading the two against each other
+is how a 2x "regression" was once written up that was nothing but the build (F.floor read 3.7-4.0 on
+`build/fast` against 1.91 on `build/perf-release`). A build may also name a tree, its build directory and
 bessd flags, comma-separated: `current:<tree>:<builddir>:<flags>`, or a binary and flags: `name=<bessd>[,flag...]`.
 The same binary under different flags is then two builds, paired like any others (D-126 compared
 `current:<tree>:build/fast` with `current:<tree>:build/fast:--simd_width=256`). master is an archival snapshot of
