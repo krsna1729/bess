@@ -55,8 +55,10 @@ void BM_K38RangeLookupBatch(benchmark::State &state) {
 
   std::vector<PacketKey> keys(batch_size);
   for (size_t i = 0; i < batch_size; i++) {
-    keys[i].src_port = be16_t(1500);
-    keys[i].dst_port = be16_t(8500);
+    // Alternating hit/miss, in both arms: with every key identical the
+    // compiler can fold a hand-written comparison out of the timed loop.
+    keys[i].src_port = be16_t(i % 2 == 0 ? 1500 : 3000);
+    keys[i].dst_port = be16_t(i % 2 == 0 ? 8500 : 9500);
   }
 
   std::vector<std::byte> raw_keys(sizeof(PacketKey) * batch_size);
@@ -86,8 +88,10 @@ void BM_K38HandWrittenBatch(benchmark::State &state) {
 
   std::vector<PacketKey> keys(batch_size);
   for (size_t i = 0; i < batch_size; i++) {
-    keys[i].src_port = be16_t(1500);
-    keys[i].dst_port = be16_t(8500);
+    // Alternating hit/miss, in both arms: with every key identical the
+    // compiler can fold a hand-written comparison out of the timed loop.
+    keys[i].src_port = be16_t(i % 2 == 0 ? 1500 : 3000);
+    keys[i].dst_port = be16_t(i % 2 == 0 ? 8500 : 9500);
   }
 
   std::vector<uint32_t> results(batch_size);
@@ -100,19 +104,12 @@ void BM_K38HandWrittenBatch(benchmark::State &state) {
     uint64_t hits = 0;
     for (size_t i = 0; i < batch_size; i++) {
       const PacketKey &k = keys[i];
-      uint32_t ip_src = k.src_ip;
-      uint32_t ip_dst = k.dst_ip;
-      uint16_t src = k.src_port.value();
-      uint16_t dst = k.dst_port.value();
-      // Every key in the vector is identical, so without these barriers the
-      // compiler hoists the whole comparison out of the timed loop and the arm
-      // measures a store loop. The typed arm passes raw bytes to a call, so it
-      // cannot be folded the same way.
-      benchmark::DoNotOptimize(ip_src);
-      benchmark::DoNotOptimize(ip_dst);
-      benchmark::DoNotOptimize(src);
-      benchmark::DoNotOptimize(dst);
-      const bool match = ip_src == kSrcIp && ip_dst == kDstIp &&
+      const uint16_t src = k.src_port.value();
+      const uint16_t dst = k.dst_port.value();
+      // No barriers: the stream alternates hit/miss, so the comparison cannot
+      // be folded out of the loop, and per-key barriers would add reloads the
+      // typed arm (a call over raw bytes) does not pay.
+      const bool match = k.src_ip == kSrcIp && k.dst_ip == kDstIp &&
                          src >= kSrcLow && src <= kSrcHigh && dst >= kDstLow &&
                          dst <= kDstHigh;
       results[i] = match ? 1u : 0u;
@@ -155,8 +152,10 @@ void BM_CartesianTernaryLookupBatch(benchmark::State &state) {
 
   std::vector<PacketKey> keys(batch_size);
   for (size_t i = 0; i < batch_size; i++) {
-    keys[i].src_port = be16_t(1500);
-    keys[i].dst_port = be16_t(8500);
+    // Alternating hit/miss, in both arms: with every key identical the
+    // compiler can fold a hand-written comparison out of the timed loop.
+    keys[i].src_port = be16_t(i % 2 == 0 ? 1500 : 3000);
+    keys[i].dst_port = be16_t(i % 2 == 0 ? 8500 : 9500);
   }
 
   std::vector<std::byte> raw_keys(sizeof(PacketKey) * batch_size);
