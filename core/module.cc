@@ -141,6 +141,15 @@ task_id_t Module::RegisterTask(void *arg) {
   bess::LeafTrafficClass *c =
       bess::TrafficClassBuilder::CreateTrafficClass<bess::LeafTrafficClass>(
           leafname, t);
+  if (c == nullptr) {
+    // The leaf could not be registered (its name is taken), and the builder's
+    // unique_ptr has already destroyed it -- which destroyed `t` with it
+    // (~LeafTrafficClass detaches and deletes its task). There is nothing left
+    // to free here, so report the failure the way callers expect instead of
+    // pushing that freed task into tasks_ and a null class into the orphan
+    // list: DestroyAllTasks would delete it a second time.
+    return INVALID_TASK_ID;
+  }
 
   add_tc_to_orphan(c, std::nullopt);
   tasks_.push_back(t);

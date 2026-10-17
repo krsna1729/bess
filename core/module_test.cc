@@ -3,6 +3,7 @@
 
 #include "module.h"
 #include "module_graph.h"
+#include "traffic_class.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -126,6 +127,27 @@ Module *create_acme_with_task(const char *name, pb_error_t *perr) {
   EXPECT_EQ("foo bar", builder.help_text());
 
   return m;
+}
+
+// A task's leaf is registered under a name derived from the module and the
+// task index. When that name is already taken the registry refuses the new
+// leaf, and the builder's unique_ptr has already destroyed it -- which destroys
+// the task it was built with, because ~LeafTrafficClass detaches and deletes
+// its task. RegisterTask must report that failure: pushing the freed task into
+// tasks_ leaves DestroyAllTasks to delete it a second time, and the null class
+// it would hand to the orphan list is a crash of its own.
+TEST_F(ModuleTester, RegisterTaskRefusesATakenLeafName) {
+  pb_error_t perr;
+  Module *m = create_acme_with_task("acme_task", &perr);
+  ASSERT_NE(nullptr, m);
+
+  // The name RegisterTask picks for its first task, taken by another leaf.
+  Task *blocker = new Task(m, nullptr);
+  ASSERT_NE(nullptr, bess::TrafficClassBuilder::CreateTrafficClass<
+                         bess::LeafTrafficClass>("!leaf_acme_task:0", blocker));
+
+  EXPECT_EQ(INVALID_TASK_ID, m->RegisterTask(nullptr));
+  EXPECT_TRUE(m->tasks().empty());
 }
 
 // Check that new module classes are actually created correctly and stored in
