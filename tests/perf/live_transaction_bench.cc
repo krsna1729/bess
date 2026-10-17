@@ -27,18 +27,22 @@
 //   live_transaction_bench --worker-core 2 --rates 0,1000,10000,max
 
 #include <sys/resource.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -121,10 +125,12 @@ std::unique_ptr<google::protobuf::Message> Value(Types &types, int session) {
                     R"({"gate": )" + std::to_string(1 + session % kGates) + "}");
 }
 
-// One transaction -- add the next session's rule, drop the oldest; two
-// operations, so the live set stays at --sessions -- and the seconds the
-// answering call took. A busy answer is retried with the transaction built
-// again under a new request id: the daemon applied nothing.
+// One transaction: the sessions `upserts` names get a rule, the ones `erases`
+// names lose theirs, and the seconds the answering call took. A busy answer is
+// retried with the transaction built again under a new request id: the daemon
+// applied nothing. One upsert and one erase per transaction keeps the live set
+// at --sessions; --upserts/--erases say otherwise, and the file header says what
+// that does to the address window.
 double Commit(bess::sdk::Client &client, Types &types, const Options &o,
               const bess::sdk::Resource &rules, int block, const std::vector<int> &upserts,
               const std::vector<int> &erases) {
@@ -443,12 +449,27 @@ void Measure(std::vector<Committer *> &committers, Bench &bench, const Options &
   const auto deadline =
       start + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(o.duration));
   std::vector<std::thread> threads;
-  for (size_t i = 1; i < committers.size(); i++) {
-    threads.emplace_back([&, i] { committers[i]->Run(per_client, deadline); });
+  threads.reserve(committers.size());
+  std::vector<std::exception_ptr> errors(committers.size());
+  for (size_t i = 0; i < committers.size(); i++) {
+    threads.emplace_back([&, i] {
+      try {
+        committers[i]->Run(per_client, deadline);
+      } catch (...) {
+        errors[i] = std::current_exception();
+      }
+    });
   }
-  committers[0]->Run(per_client, deadline);
   for (std::thread &t : threads) {
     t.join();
+  }
+  // A committer that threw stops the run, but only after every thread has been
+  // joined: rethrowing from inside a thread, or while a joinable thread still
+  // exists, terminates the process instead of printing the error.
+  for (const std::exception_ptr &error : errors) {
+    if (error) {
+      std::rethrow_exception(error);
+    }
   }
   const double elapsed = std::chrono::duration<double>(Clock::now() - start).count();
   std::optional<DaemonCpu> cpu_after;
@@ -590,8 +611,8 @@ int Main(int argc, char **argv) {
                    "  [--sessions N] [--pkt-size B] [--duration S] [--rates R,...|max] [--rounds N]\n"
                    "  [--upserts N] [--erases N] [--keep]\n"
                    "  [--attach] [--block-offset K] [--blocks-total T]  (several processes, one\n"
-                   "  daemon: the first builds with --blocks-total, the rest --attach with their\n"
-                   "  own --block-offset)\n");
+                   "  daemon: the first builds with --blocks-total --keep, the rest --attach with\n"
+                   "  their own --block-offset)\n");
       return 2;
     }
   }

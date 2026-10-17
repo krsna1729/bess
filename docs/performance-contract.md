@@ -164,13 +164,12 @@ daemon's process, 512 rules) remove the effect entirely:
 | worker on a different physical core | 26.83 Mpps | 27.31 Mpps (4,117 tx/s, p50 202 us) |
 
 On separate cores the packet path does not move -- and the client's latency
-improves, so the comparison is not won by doing less work. The first table's IPC
-drop (2.58 to 1.83) is the worker sharing one core's issue slots and caches with
-a busy writer; on separate cores the daemon-wide IPC only falls 2.60 to 2.32,
-which is the control thread's own instructions being counted instead of
-displacing the worker's. (The counters cover the whole window, the packet rate
-only the client's run, so the first table's per-packet column is a ratio, not a
-measurement.) So the cost of a control-plane write on the datapath, on one
+improves, so the comparison is not won by doing less work. The hardware-counter
+table's IPC drop (2.30 without churn to 1.48 with it) is the worker sharing one
+core's issue slots and caches with a busy writer. (The counters cover the whole
+window, the packet rate only the client's run, so that table's per-packet column
+is a ratio, not a measurement.) So the cost of a control-plane write on the
+datapath, on one
 worker, at a few thousand transactions a second, is below the noise floor once
 the writer has a core of its own; what is *not* measured is many workers reading
 one table while it is written, which is the case a partitioned layout would have
@@ -234,8 +233,10 @@ includes the synchronous gRPC completion-queue work done on the calling thread.
 of control work; if it does not move, the serialized resource is the
 control-plane lock (`api_v2.cc:686-731` holds it across the whole apply) or
 something under it. (2) A timer inside the handler split into lock wait / digest
-/ apply -- `/proc` cannot see a lock. (3) `--ops-per-tx K` batching, the lever
-that works either way, since a session change is one transaction by construction.
+/ apply -- `/proc` cannot see a lock. (3) Operations per transaction: the bench
+prices them already (`--upserts N --erases M`, benchmarking.md), the lever that
+works either way, since a session change is one transaction by construction. No
+run of those is recorded against the `--clients` ceiling yet.
 `--attach --block-offset` (added 2026-10-17, **not yet exercised**) is there for
 the several-processes arm. Parked by decision 2026-10-17: the UPF comes first;
 this resumes after it.
@@ -253,9 +254,13 @@ is a single read per batch.
 `update_scale_bench` E2 measures control-thread churn into one shared lock-free
 table against per-worker shards fed by per-owner op rings, and at 3 workers on
 distinct P-cores (control on its own core, powersave, 2 s a point) it is a wash
-at every rate that does not saturate -- 65K keys: 259.0 against 257.4 Mlookups/s
-at rest, 198.5 against 200.7 at 100k ops/s, 414.5 against 418.2 at 1M; 1M keys:
-165.6 against 186.8, 164.5 against 190.3, 153.6 against 160.6. At saturation the
+at 65K keys -- 259.0 against 257.4 Mlookups/s at rest, 198.5 against 200.7 at
+100k ops/s, 414.5 against 418.2 at 1M -- and not one at 1M keys, where the shared
+arm reads 165.6 against 186.8, 164.5 against 190.3 and 153.6 against 160.6: a
+13-16% gap in the sharded arm's favour, which the sentence here used to call a
+wash. Two of these numbers are odd on their face and are not explained here: the
+65K arm reads 414.5 Mlookups/s under 1M ops/s of churn against 259.0 at rest, and
+the 1M-key gap is wider than the 65K one. At saturation the
 sharded arm trades the datapath for throughput (447.6 against 25.3 Mlookups/s
 with 8.4 against 79.4 Mops/s applied): the control thread applies directly into
 the shared table while the sharded workers apply their own rings. The win D-028
@@ -268,6 +273,68 @@ its own table between batches -- and the layout matters where several writers
 contend. Batching transactions raises the control rate (one RPC and one commit
 for many changes) but does not change who writes, so it does not remove this
 cost.
+
+### The same tools, re-run on the current tree (2026-10-18)
+
+A re-run of the two subsections above, on `develop` at `487dc0c9` plus the
+bench's multi-client arm, to check that their claims still hold rather than to
+replace their numbers: the recipes differ (this one: `build/clang`, clang
+`-O2 -g -march=x86-64-v3`, `bessd -m 0`, profile `balanced`, the client pinned to
+one E-core -- cpu 12 -- for the single-client arms and to the E-cores 12-19 for
+the client-count arms, a fresh daemon per arm, load 3.3-4.2).
+
+| churn target | 0 | 1,000/s | 10,000/s | max |
+|---|---|---|---|---|
+| Mpps, worker on the control CPU's SMT sibling (cpu 1) | 31.71 | 29.94 | 26.12 (4,040 tx/s) | 26.08 (3,951 tx/s) |
+| Mpps, worker on its own physical core (cpu 2) | 32.64 | 32.43 | 32.09 (4,442 tx/s) | 32.39 (4,300 tx/s) |
+| client p50, separate cores | - | 226 us | 184 us | 189 us |
+
+Same shape as 2026-10-16's sweep, and the placement warning fired by itself for
+the co-located arm ("worker 0 on core 1 shares a physical core with another
+worker or a control thread"), which is D-123's report read back through the SDK.
+With a core of its own the packet path is flat and the client answers in under
+190 us; co-located, the worker loses 5.6 Mpps at 4,000 transactions a second
+(31.71 to 26.08).
+
+The daemon's own counters over the separate-core arm, read with `bessctl
+metrics`: 68,196 transactions applied, zero busy, zero conflict, zero rejected,
+zero unsupported, and `bess_transaction_busy_retries_total` zero -- the daemon
+never waited out a BUSY and retried. Whatever a transaction costs, it is not
+pacing.
+
+The client-count arms, at `max` and one round each (E-cores only, which is the
+difference from the 2026-10-17 table above -- that run's clients had the P-cores
+too, and these numbers are correspondingly lower):
+
+| clients | transactions/s | p50 | p99 | packet rate | client CPU/tx |
+|---|---|---|---|---|---|
+| 1 | 4,350 (3 rounds: 4,343 / 4,364 / 4,387) | 187-189 us | 273-298 us | 31.6-31.7 Mpps | 101.8 us (0.68 cores) |
+| 2 | 8,896 | 179 us | 314 us | 32.30 Mpps | 107.7 us (1.43 cores) |
+| 4 | 12,716 | 261 us | 515 us | 32.38 Mpps | 106.4 us (2.10 cores) |
+| 8 | 13,075 | 520 us | 1,306 us | 31.92 Mpps | 100.4 us (2.07 cores) |
+
+The same plateau (about 13,000/s), the same latency shape, and the same
+conclusion: the single client's ~4,400/s is that client's wire ceiling, not the
+daemon's. The packet path does not pay for it here either -- 31.92 Mpps at 8
+clients against 32.39 at one.
+
+One limit of the bench, worth stating where its numbers are read: with
+`--upserts` different from `--erases` the live set grows or shrinks, and a run
+dies once the window leaves the `2 x --sessions` address space the traffic
+generator covers (an erase of a key that is not there is refused). Equal counts
+are what the tables above use.
+
+**The session graph, for the same attribution.** The UPF's own bench
+(`ci/bench-n4.sh MODES=establish`, its stage at `3f3716df`, 2,048 establishments
+through the whole control path -- PFCP, the session compiler, one control_v2
+transaction, the answer) reports establish p50 2.989 ms, p95 3.994 ms, p99
+4.358 ms, 331.9/s -- within 6% of the 2.832 ms the same script recorded on
+2026-10-17. The daemon's counters say the time is not pacing: over the bench arms
+above, 68,196 transactions applied with `bess_transaction_busy_retries_total`
+zero and no busy answers, and at 331/s the wire is nowhere near the ~4,400/s one
+client reaches, so there was no BUSY to wait out. It is work per transaction: the
+same transaction against the bench's four-module pipeline has a 187 us p50, so
+the session graph's tables and its larger plan are what the other ~2.8 ms is.
 
 ## 5. Memory-at-Scale Matrix
 

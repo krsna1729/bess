@@ -272,7 +272,13 @@ cores for every test — and `--allow-dirty-placement` silences it. A warned run
 `live_perf` and `update_scale_bench` keep their CPUs explicit — they pin their own threads and read perf counters — so their
 `--cpu`/`--cpus` stay one CPU per physical core; only `live_transaction_bench` places workers automatically (see above).
 `update_scale_bench` has no daemon to ask, so it reads the same resolver's topology (`bess::runtime::ReadTopology`,
-`core/runtime/numa_placement.h`) and warns the same way.
+`core/runtime/numa_placement.h`) and warns on shared physical cores among its own pinned CPUs: it has no worker
+placement and no memory node to check.
+`live_transaction_bench` additionally takes `--clients N` (N committers, one connection and one pacing thread
+each; the report pools their latency, sums their rate and adds a `clients:` line, and each rate point prints the
+client CPU it cost), `--daemon-pid` (the daemon's per-thread CPU per transaction, with the busy-polling workers
+subtracted) and `--attach`/`--block-offset`/`--blocks-total` (several bench processes against one daemon, each
+owning a slice of the rule space; the builder runs with `--keep`).
 
 A bench run with `LD_LIBRARY_PATH` naming a stage (`build/stage-<lane>/usr/local/lib`) loads the **staged** `libbess-sdk.so`, not
 the one in the build directory: after any change to the SDK's headers, re-install (`meson install -C build/<lane> --no-rebuild
