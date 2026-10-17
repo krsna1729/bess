@@ -5507,8 +5507,8 @@ Avoid marketing language.
 
 ## Performance
 
-- [x] typed classifier near specialized reference — the update-under-load matrix's ExactMatch rows (D-022, D-052) and WildcardMatch's ordering fix (D-098), against the checked-in baseline `docs/baselines/m0-baseline.json`; the kernels' scalar/SIMD requirements are stated in `performance-contract.md`
-- [x] typed flow lookup near specialized reference — the flow rows: mode C's 1M entries at 232.6 Mlookups/s across 4 workers + 1 writer, 194.5-248.9 under 1-4.5M mods/s (D-052), and the churn and E-core rows (D-056)
+- [ ] typed classifier near specialized reference — the matrix has the typed paths' throughput rows (ExactMatch D-022/D-052, WildcardMatch D-024 and D-098's ordering fix) but no typed-vs-specialized ratio: `performance-contract.md` §2 asks for code that "must approach optimal hand-written assembly", and no record measures a hand-written or specialized arm to compare against. The kernel half of that section is now reviewed (`docs/assembly-shape.md`), which names `TypedExactTable`, `RangeClassifier` and `ScopeTable::Lookup` as *not* covered
+- [ ] typed flow lookup near specialized reference — the flow rows (mode C's 232.6 Mlookups/s at 1M entries, D-052; the churn and E-core rows, D-056) are absolute, not a comparison against a specialized baseline. The nearest comparisons in the record are D-073's `PackedMacTable` against the deleted `l2_table` (−20.4% to −44.1% batch-32) and D-034's AVX2-vs-scalar, and neither is the typed flow lookup
 - [x] routing baseline retained — `live_perf`'s F.hop / F.hopnt / M.base against the d127 baseline (M.base 6.80 ns/pkt on build/perf-release at `balanced`), plus the route and next-hop-group rows (D-060, D-065)
 - [x] meter/stats baseline retained — D-091's rows: exclusive `MeterState::Check` 5.42 ns and worker-local counter `Update` 1.25 ns, with the shared alternatives priced (74.2 ns at 2 threads; 51.9 M/s for `fetch_add`)
 - [x] decision-cache hit characterized — the matrix's row: uniform hit 7.97 ns scalar / 5.87 batch-32 at 64K, and after one `Invalidate()` with half the entries stale 16.51 / 9.32; install 33 ns (D-062)

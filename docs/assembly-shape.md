@@ -2,48 +2,65 @@
 
 Appendix J's "assembly review complete for critical kernels". The kernels are
 header-only, so their shape is what the *release* flags make of them: this page
-records the instructions each one compiles to, and checks the header's claim
-against them. It is a review, not a benchmark.
+records the instructions each one compiles to, under its own symbol, and checks
+the header's claim against them. It is a review, not a benchmark.
 
-Reproduce with a throwaway translation unit that calls each kernel and
+The wrapper translation unit is checked in as `tools/asm_shape.cc`: each kernel
+is `inline` in a header, so no archive carries a symbol to disassemble, and the
+wrappers are `noinline` with arguments the compiler cannot fold. Reproduce with
 
 ```sh
-g++ -O3 -march=x86-64-v3 -DNDEBUG -std=c++23 -I core -S -o kernels.s kernels.cc
+g++ -O3 -march=x86-64-v3 -DNDEBUG -D_FILE_OFFSET_BITS=64 -std=c++23 -I core \
+    -S -o /tmp/asm_shape.s tools/asm_shape.cc
+awk '/^[_a-zA-Z][A-Za-z0-9_.]*:$/{f=$1} /^\t[a-z]/{print f, $1}' \
+    /tmp/asm_shape.s | sort | uniq -c
 ```
 
-which is the release shape (D-127: releases stay `-march=x86-64-v3`; AVX2 is in
-that floor, AVX-512 is not).
+The flags are a `core/` translation unit's from
+`build/perf-release/compile_commands.json` (D-127: releases stay
+`-march=x86-64-v3`; AVX2 is in that floor, AVX-512 is not). Split the output by
+symbol as above, not by `.LFB` order: a TU-wide mnemonic count attributes one
+kernel's instructions to another (the first version of this page did exactly
+that, and swapped two bodies).
 
 ## What each kernel is
 
-| kernel | source | the emitted body | header's claim |
+| wrapper | kernel | the emitted body | header's claim |
 |---|---|---|---|
-| `Crc32c(uint64_t, uint32_t)` | `arch/crc32c.h` | `movl` + `crc32q %rdi, %rax` + `ret` | the instruction |
-| `SumWords32` (AVX2 path) | `arch/checksum_kernels.h` | `vmovdqu`/`vpunpck{h,l}dq` + `vpaddq` stream, `vextracti128`/`vpextrq` fold, then the `addq`/`adcq` asm chain | "two ymm streams", "8 then 2 words per step" |
-| `AddWords32<5>` | `arch/checksum_kernels.h` | the inline asm: `addl (%rsi), %eax` + four `adcl` + `adcl $0` | "one add/adc chain" |
-| `SkipBytesOutsideRanges` | `arch/byte_match.h` | `vmovdqu` + `vpcmpestri $4, (%rdi), %xmm0` + the pointer arithmetic | "SSE4.2 PCMPESTRI in ranges mode" |
-| `MaskedWordCandidates64x4` | `arch/word_probe.h` | `vmovdqa (%rdi), %ymm0` (the inline asm's 32-byte load) + two `vpbroadcastq` + the compare and mask | "one 32-byte vector load, issued as inline assembly" |
-| `MatchTags16x8` | `arch/tag_match.h` | `vpbroadcastd` + `vpcmpeqd` + `vmovmskps` | "one vector compare, one mask" |
-| `MatchHashes32x4` | `arch/tag_match.h` | `vpbroadcastd` + `vpcmpeqd` + `vpand` + `vpsrldq`/`vpor` folds + `vmovd` | the dispatched AVX2 compare |
-| `RemoveVlanTag` | `arch/vlan.h` | `vmovdqu` + `vpslldq $4` + `vmovdqu` | "one 16-byte load, one byte shift, one store" |
-| `InsertVlanTag` | `arch/vlan.h` | `vmovdqu 4(%rdi)` + `vpinsrd $3` + `vmovdqu` | "one 16-byte load, one lane insert, one store" |
+| `k_crc64` | `Crc32c(uint64_t, uint32_t)` | `movl` + `crc32q %rdi, %rax` + `ret` | the instruction |
+| `k_sumwords` | `SumWords32` | four `vmovdqu` + four `vpunpck{h,l}dq` + eight `vpaddq` + `vextracti128`/`vpextrq`, then the `addq`/`adcq` chain, with the block loop (`jbe`) | "two ymm streams", "8 then 2 words per step" |
+| `k_addwords5` | `AddWords32<5>` | the inline asm: `addl (%rsi), %eax` + five `adcl` | "one add/adc chain" |
+| `k_skipbytes` | `SkipBytesOutsideRanges` | `vmovdqu` + `vpcmpestri $4, (%rdi), %xmm0`, the pointer arithmetic and the block loop | "SSE4.2 PCMPESTRI in ranges mode" |
+| `k_probe4` | `MaskedWordCandidates64x4` | `vmovdqa (%rdi), %ymm0` (the inline asm's 32-byte load) + two `vpbroadcastq` + `vpcmpeqq` + `vmovmskpd` + `vzeroupper` | "one 32-byte vector load, issued as inline assembly" |
+| `k_match16x8` | `MatchTags16x8` | `vpbroadcastw` + `vpcmpeqw` + `vpacksswb` + `vpmovmskb` + `vmovd` | "one vector compare, one mask" |
+| `k_match32x4` | `MatchHashes32x4` | `jmp` - the dispatch itself; the AVX2 callee is `vpbroadcastd` + `vpcmpeqd` + `vmovmskps`, and the scalar callee (local, no symbol) is `vpcmpeqd` + `vpand` + a `vpsrldq`/`vpor` fold | the dispatched AVX2 compare |
+| `k_vlan_remove` | `RemoveVlanTag` | `vmovdqu` + `vpslldq $4` + `vmovdqu` | "one 16-byte load, one byte shift, one store" |
+| `k_vlan_insert` | `InsertVlanTag` | `vmovdqu 4(%rdi)` + `vpinsrd $3` + `vmovdqu` | "one 16-byte load, one lane insert, one store" |
 
-Every body is three to twenty instructions, with no call, no branch and no
-scalar fallback on this target. The three that are a single instruction plus
-their loads and stores (`Crc32c`, `RemoveVlanTag`, `InsertVlanTag`) are as short
-as the operation allows.
+Every body is three to forty instructions, with no call, and the only branches
+are the two length loops (`SkipBytesOutsideRanges`, `SumWords32`). The three
+that are a single instruction plus their loads and stores (`Crc32c`,
+`RemoveVlanTag`, `InsertVlanTag`) are as short as the operation allows.
 
 ## What this settles, and what it does not
 
 - **Settled:** each kernel's claim in its header matches the emitted code, and
   the critical kernels are *not* left to the compiler's choice: the ones whose
-  shape matters are intrinsics or inline assembly (`crc32q`, `pcmpestri`,
-  `vmovdqa`, the `add/adc` chains), and the two that are written portably
+  shape matters are intrinsics or inline assembly (`crc32q`, `vpcmpestri`,
+  `vmovdqa`, the `add/adc` chains), and the ones written portably
   (`MatchTags16x8`, `RemoveVlanTag`/`InsertVlanTag`) compile to a single vector
-  operation as well.
+  operation as well. No kernel calls `rte_hash_crc` on this target: the CRC's
+  fallback path is not reached where SSE4.2 exists.
+- **Not covered, and why the item is not the whole of §2:** the typed hot paths
+  `performance-contract.md` §2 names - `TypedExactTable`, `RangeClassifier`,
+  `ScopeTable::Lookup` - are *callers* of these kernels and of their own
+  generated plans, and no record measures them against a hand-written
+  specialized arm. This page is the kernel half of "near-specialized assembly";
+  the typed half has the matrix's throughput rows and the checked-in baseline,
+  not a typed-vs-specialized ratio.
 - **The dispatched one:** `MatchHashes32x4` is an indirect call through
   `RuntimeDispatch` (D-034, D-126), so its *callee* is one of the two bodies in
-  `tag_match.h`; this review checked the AVX2 body's shape, not the dispatch's
+  `tag_match.h`; this review checked both bodies' shapes, not the dispatch's
   cost. The dispatch is one load and one indirect call, and D-034's measurement
   is the reason it exists.
 - **Not settled here:** how the *callers* inline these (the review is of the
@@ -51,13 +68,12 @@ as the operation allows.
   x86-64-v3. The arm64 paths (`__crc32cd`, NEON shuffles) are the same source
   under a different `#if`, and the CI's arm64 lane compiles them.
 
-## Why this is a page rather than a script
+## Why this is a page and a wrapper rather than a script
 
 An earlier note said binary inspection was "outside this program's tooling".
-That is wrong for a *review*: the reproduction above is two commands, and the
-comparison is against a header comment that already states the expected
-instructions and the measured alternative (each kernel's header records the
-delta it was chosen for - 11-25% for the checksum kernels, 7% for the IPv4
-header, +10%/+56% for the word probe's atomic-load alternative). What is *not*
-here is a checked-in disassembly of a whole binary, which would be a build
-artifact rather than a review.
+That is wrong for a *review*: the wrapper above is 60 lines, the comparison is
+against a header comment that already states the expected instructions and the
+measured alternative (each kernel's header records the delta it was chosen for -
+11-25% for the checksum kernels, 7% for the IPv4 header, +10%/+56% for the word
+probe's atomic-load alternative). What is *not* here is a checked-in disassembly
+of a whole binary, which would be a build artifact rather than a review.
