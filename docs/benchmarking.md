@@ -202,14 +202,17 @@ entries go in as one `PipelineBuilder` transaction, the same path a controller u
 - **M, modules (localised):** each module after the same Source -> Rewrite -> RandomUpdate (1,024 flows) front
   end, reported as ns per packet above `M.base` (the front end with a Bypass); `M.base`'s own row is the
   absolute baseline the others are measured from, so an arm and its control subtract to the module's cost.
-- **M.gtpu_\*, out-of-tree modules** (here the UPF plugin, krsna1729/upf `datapath/`): `--plugin DIR` appends
-  `--modules=DIR` to the daemon command and enables them; without the flag they are skipped, so a lane without
-  the plugin stays green. Each arm brings **its own control** (`M.gtpu_decap.base`, `M.gtpu_encap.base`): the
-  shipping graph's own front and tail -- the TEID classifier and its rule, the ActionId write, the tunnel
-  record, the reader that keeps the decap's attribute real -- with a Bypass in the module's slot, so the delta
-  is the module alone. Read an arm and its control as a pair. Measuring a module that needs a tunnel frame
-  against `M.base` would report the frame size, not the module. The frames are the UPF smoke test's
-  (`deploy/smoke-gtpu.yaml`), byte for byte: the numbers describe the graph that ships.
+- **M.gtpu_\* and M.urr_count\*, out-of-tree modules** (here the UPF plugin, krsna1729/upf `datapath/`):
+  `--plugin DIR` appends `--modules=DIR` to the daemon command and enables them; without the flag they are
+  skipped, so a lane without the plugin stays green. Each arm brings **its own control** (`M.gtpu_decap.base`,
+  `M.gtpu_encap.base`, `M.urr_count.base`), with a Bypass in the module's slot so the delta is the module
+  alone; read an arm and its control as a pair. The GTP-U pair's control is the shipping graph's own front and
+  tail -- the TEID classifier and its rule, the ActionId write, the tunnel record, the reader that keeps the
+  decap's attribute real -- and its frames are the UPF smoke test's (`deploy/smoke-gtpu.yaml`), byte for byte:
+  the numbers describe the graph that ships. The `M.urr_count` pair's is the same chain with the module
+  swapped for the Bypass: SetMetadata writes the PDR rule's ActionId (D-141), a reader keeps the attribute
+  real, and the frame is the chain the compiler writes a charged session into. Measuring a module that needs a
+  tunnel frame against `M.base` would report the frame size, not the module.
 
 If `F.floor` or the `F.hop` slope moves, every pipeline moves: look at the scheduler, Source/Sink, the packet
 pool and batch dispatch. If one `M` delta moves alone, the cost is in that module. `live_perf --list` prints the

@@ -673,7 +673,7 @@ struct Options {
   std::string baseline;
   double threshold = 5.0;
   // A directory of plugins the daemon loads (--modules=). It also enables the
-  // M.gtpu_* arms, which need the UPF plugin's classes.
+  // M.gtpu_* and M.urr_count* arms, which need the UPF plugin's classes.
   std::string plugin;
   bool allow_dirty_placement = false;  // silence the placement warning
 };
@@ -1104,9 +1104,14 @@ int Main(int argc, char **argv) {
     if (!selected) {
       continue;
     }
-    // The GTP-U arms need the UPF plugin's classes; without --plugin the
-    // daemon cannot build their graphs at all.
-    if (o.plugin.empty() && t.name.starts_with("M.gtpu_")) {
+    // The UPF arms need the UPF plugin's classes; without --plugin the daemon
+    // cannot build their graphs at all.
+    static const char *const kPluginArms[] = {"M.gtpu_", "M.urr_count"};
+    bool needs_plugin = false;
+    for (const char *prefix : kPluginArms) {
+      needs_plugin |= t.name.starts_with(prefix);
+    }
+    if (o.plugin.empty() && needs_plugin) {
       skipped_plugin++;
       continue;
     }
