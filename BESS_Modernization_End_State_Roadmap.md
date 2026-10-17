@@ -5491,74 +5491,74 @@ Avoid marketing language.
 
 ## Architecture
 
-- [ ] build DAG has no forbidden edge
-- [ ] no reusable battery depends on Module/runtime/control
-- [ ] runtime has no network-policy semantics
-- [ ] no generic BESS action/policy language exists
-- [ ] graph adapters wrap libraries rather than contain unique mechanisms
+- [x] build DAG has no forbidden edge — `tools/check_includes.py` enforces `docs/architecture.md`'s DAG (M1): the packet substrate and the dataplane core may not include framework, runtime, control, protobuf, gRPC or `module.h`; every `..` component is banned; it runs in CI
+- [x] no reusable battery depends on Module/runtime/control — the rules above plus the Meson libraries: `bess_flow`, `bess_route`, `bess_meter`, `bess_classifier`, `bess_dataplane_core` and `bess_rcu` build and link without the framework, and `examples/static_router` links R1's app from them (D-095)
+- [x] runtime has no network-policy semantics — `docs/architecture.md` ("No BESS policy language: BESS provides fast mechanisms, not high-level network policy ASTs"), D-129 (a module's state is its init argument and declared resources; actions are the verbs)
+- [x] no generic BESS action/policy language exists — the same line, with R3 as the proof: its Layer/Group/Rule/CompiledDecision model is the application's, and BESS supplies only the decision cache, generation invalidation, RCU publication and checked parse
+- [x] graph adapters wrap libraries rather than contain unique mechanisms — `docs/architecture.md`'s "three faces, one implementation": a direct C++ library, a thin graph adapter in `modules/`, and a control binding where needed; R1's `RouterApp` runs both as a module and as `examples/static_router` and makes the same decision for the same frame
 
 ## C++ public API
 
-- [ ] installed headers are manifest-driven
-- [ ] stable/experimental/internal distinction documented
-- [ ] direct appliance build does not require framework
-- [ ] no source-tree internal include in reference appliances
-- [ ] plugin compatibility descriptor works
+- [x] installed headers are manifest-driven — `tools/check_installed_headers.py` (an internal header installed, or a public header including one, fails) over meson's install set; `docs/compatibility.md` states the rule
+- [x] stable/experimental/internal distinction documented — `docs/compatibility.md` (stable: the supported source API, no ABI promise; experimental: the selected `bess/core/{classifier,dataplane,flow,meter,rcu,route,stats}` headers and the codec facades; internal: never installed) and `docs/plugin-api.md`
+- [x] direct appliance build does not require framework — D-095: `bess_route`, `bess_dataplane_core` and `bess_rcu` are installed (experimental, PIE), and CI's install check builds `examples/static_router` (R1's application) from the stage and runs it without `bessd`
+- [x] no source-tree internal include in reference appliances — `examples/appliances` is built by the install check against the *staged* install only (its includes resolve to installed headers: `pb/module_msg.pb.h` is the installed schema), and `check_installed_headers.py` refuses a public header that includes an internal one
+- [x] plugin compatibility descriptor works — `BESS_PLUGIN_REQUIRES("router_appliance", "1.0.0", BESS_CAP_INIT_CONTEXT)` in every appliance, checked by the staged daemon; the incompatible probe is refused in `tests/live/sample_plugin_test.cc` (D-137)
 
 ## Performance
 
-- [ ] typed classifier near specialized reference
-- [ ] typed flow lookup near specialized reference
-- [ ] routing baseline retained
-- [ ] meter/stats baseline retained
-- [ ] decision-cache hit characterized
-- [ ] handoff compared to optimized ring/Queue
-- [ ] update-under-load matrix complete
-- [ ] memory-at-scale matrix complete
-- [ ] assembly review complete for critical kernels
+- [x] typed classifier near specialized reference — the update-under-load matrix's ExactMatch rows (D-022, D-052) and WildcardMatch's ordering fix (D-098), against the checked-in baseline `docs/baselines/m0-baseline.json`; the kernels' scalar/SIMD requirements are stated in `performance-contract.md`
+- [x] typed flow lookup near specialized reference — the flow rows: mode C's 1M entries at 232.6 Mlookups/s across 4 workers + 1 writer, 194.5-248.9 under 1-4.5M mods/s (D-052), and the churn and E-core rows (D-056)
+- [x] routing baseline retained — `live_perf`'s F.hop / F.hopnt / M.base against the d127 baseline (M.base 6.80 ns/pkt on build/perf-release at `balanced`), plus the route and next-hop-group rows (D-060, D-065)
+- [x] meter/stats baseline retained — D-091's rows: exclusive `MeterState::Check` 5.42 ns and worker-local counter `Update` 1.25 ns, with the shared alternatives priced (74.2 ns at 2 threads; 51.9 M/s for `fetch_add`)
+- [x] decision-cache hit characterized — the matrix's row: uniform hit 7.97 ns scalar / 5.87 batch-32 at 64K, and after one `Invalidate()` with half the entries stale 16.51 / 9.32; install 33 ns (D-062)
+- [x] handoff compared to optimized ring/Queue — the `handoff_bench` row: enqueue+dequeue at b = 1/8/32 is SP/SC 6.2/9.0/18.5 ns, MP/SC 13.4/19.5/25.3, MP/MC 22.9/28.5/34.4; one refused call 2.4 ns (SP/SC), 6.6 (MP/SC) (D-054)
+- [ ] update-under-load matrix complete — the matrix is in `docs/performance-contract.md` with a "Gaps against Gate C" list: packets through a live graph under updates (only D-027), update p50/p99 for most structures, grace-period wait time, reclamation backlog, busy/backpressure frequency, per-structure target rates, and "not measured under load at all" for WildcardMatch, shared NAT and conntrack, FDB learning with concurrent lookups and more. Every row is from one laptop (D-004 wants a server-class re-run)
+- [ ] memory-at-scale matrix complete — the matrix is in `docs/performance-contract.md` with its own gap list: M0's footprint set is not a set (only meters, stats, LPM/FIB and `ObjectTable`), 10M rows are missing for most structures, conntrack bytes per connection were never measured, and §24's fields (live vs capacity bytes, allocation counts, retirement high water, touched bytes per operation) are missing for most
+- [ ] assembly review complete for critical kernels — partial and recorded: the Cuckoo AVX2 helper's disassembly (D-034, `performance-clawback.md`) and the typed paths' scalar/SIMD requirements are checked, but no assembly-shape artifact is checked in; binary inspection is outside this program's tooling
 
 ## Correctness
 
-- [ ] transaction lifecycle tests pass
-- [ ] flow model/stress pass
-- [ ] expiry stale-generation tests pass
-- [ ] handoff ownership stress pass
-- [ ] FDB model/aging pass
-- [ ] routing snapshot/referential tests pass
-- [ ] conntrack state model pass
-- [ ] NAT differential pass
-- [ ] offload lifecycle mock tests pass
-- [ ] plugin unload lifetime test passes
+- [x] transaction lifecycle tests pass — `core/dataplane/transaction_lifecycle_test.cc` and `transaction_engine_test.cc`: staged, committed, aborted and retired, with the engine's reference checks across owners; green in CI's gcc/clang/asan lanes and in the local full suite
+- [x] flow model/stress pass — `core/flow/worker_flow_table_test.cc`, `shared_flow_table_test.cc`, `flow_index_test.cc`, `decision_cache_model_test.cc` and `reference_apps_test.cc` (three appliance states written only against the public API), plus the live churn in the update-under-load rows (D-052, D-056)
+- [x] expiry stale-generation tests pass — `core/dataplane/expiry_wheel_test.cc`, `core/flow/expiry_consumer_test.cc` and `core/classifier/generation_test.cc`: a stale generation's expiry never ends a reinstalled entry
+- [x] handoff ownership stress pass — `core/dataplane/handoff_test.cc` and `handoff_threads_test.cc` (single- and multi-producer/consumer topologies, refusal under a full channel), with the SP/SC, MP/SC and MP/MC costs in the matrix (D-054)
+- [x] FDB model/aging pass — `core/l2/fdb_model_test.cc`, `fdb_test.cc`, `packed_mac_table_test.cc` and `mac_table_resource_test.cc`; the aging scan's cost is in the memory and update matrices (D-073)
+- [x] routing snapshot/referential tests pass — `core/route/route_test.cc`, `route_domain_test.cc`, `router_transaction_test.cc` and `lpm_resource_test.cc`: a next hop an action names cannot leave, a session naming a missing next hop is refused whole, and a route domain refuses enrollment once (D-046, D-060)
+- [x] conntrack state model pass — `core/conntrack/conntrack_model_test.cc`, `conntrack_test.cc` and `shared_conntrack_test.cc` (four workers create 4,000 connections at once, each exactly once; D-081)
+- [x] NAT differential pass — `core/nat/nat_model_test.cc`, `nat_test.cc`, `shared_nat_test.cc` and `nat_usage_test.cc`: the reply through the reverse alias, an outside-started connection refused after translation, idle mappings ended on time, growth and shrink (D-068, D-078)
+- [x] offload lifecycle mock tests pass — `core/offload/flow_rule_owner_test.cc` over the fake backend: install, refuse on a full device, revoke by generation, uninstall, and the MARK path
+- [x] plugin unload lifetime test passes — `core/framework/plugin_check_test.cc` plus the live `tests/live/sample_plugin_test.cc`: unload is refused (EBUSY, naming them) while a module, port, gate hook or instance of the plugin lives (D-137)
 
 ## Appliance neutrality
 
-- [ ] router reference
-- [ ] stateful NAT reference
-- [ ] VFP/OVS-style policy-vSwitch reference
-- [ ] session compiler reference
-- [ ] hierarchical promotion path
-- [ ] none requires application model to become BESS graph/policy IR
+- [x] router reference — R1 `examples/appliances/router`: VRFs, ECMP that keeps a flow on one path, a neighbor change with no route written, direct and graph paths; `examples/static_router` links it without `bessd`
+- [x] stateful NAT reference — R2 `examples/appliances/nat`: firewall-then-NAPT order, the reply through the reverse alias, an outside-started connection refused after translation, idle mappings ended on time
+- [x] VFP/OVS-style policy-vSwitch reference — R3 `examples/appliances/vswitch`: Layer/Group/Rule/CompiledDecision are the application's; a group switch is atomic per tenant, invalidation is O(1) by generation, other tenants keep their hits
+- [x] session compiler reference — R4 `examples/appliances/session`: Session/PdrLikeRule/SessionAction/QosPolicy over slot tables, the router and meters, driven over the control API with its own wire types. Reduced (downlink, linear scan): the full session compiler is the UPF slice (roadmap P1 row 7, `MODERNIZATION.md`)
+- [x] hierarchical promotion path — R5 (R3's mode): cold flows on the default path with the flow table's counts, a hot flow (third packet) cached and installed as a hardware rule through the flow-rule owner
+- [x] none requires application model to become BESS graph/policy IR — R3's header states it and its self test proves it: BESS provides the decision cache, generation invalidation, RCU publication and checked parse, and knows none of Layer/Group/Rule; `tools/check_includes.py` keeps protobuf and codecs out of the dataplane libraries
 
 ## Control
 
-- [ ] request IDs/digests
-- [ ] daemon epochs
-- [ ] timeout recovery
-- [ ] BUSY/conflict/rejected distinctions
-- [ ] resource handles/discovery
-- [ ] desired-state generation handling
-- [ ] application-specific semantics remain outside BESS SDK
+- [x] request IDs/digests — `TransactionRequest.request_id` with the recorded outcome (`GetTransaction`, `replayed`), so a retry of an identical request replays rather than re-applies; `daemon_epoch` scopes the record, so an id is only "unknown", never "never ran" (D-106)
+- [x] daemon epochs — `daemon_epoch` on every request and response; a mutating request names the epoch it was built under, and another epoch is `EPOCH_MISMATCH` (FAILED_PRECONDITION) before any side effect (D-106)
+- [x] timeout recovery — a busy outcome says the daemon already waited within the request's deadline and retried ("back off before retrying"); timeout, restart and idempotency have black-box integration tests (D-088)
+- [x] BUSY/conflict/rejected distinctions — `OUTCOME_REJECTED`, `OUTCOME_CONFLICT` and the busy outcome, with gRPC `ABORTED` for a generation conflict and `FAILED_PRECONDITION` for a busy resource; `ErrorDetail` in the `bess-error-bin` trailing metadata for typed handling
+- [x] resource handles/discovery — `ListTransactionResources` ("<module>/<table>"), `GetSchema` (each class's Init and action types) and `GetCapabilities`; a resource's keys and values are typed messages of its own, so no client packs BESS's internal keys
+- [x] desired-state generation handling — `ApplyPipeline` converges a listed resource to exactly its entries, `expected_generation` and `expected_resource_generation` are checked before any side effect, and every answer reports its generation with the epoch it was read under
+- [x] application-specific semantics remain outside BESS SDK — the SDK defines no PDR/FAR/QER, VFP group or OpenFlow action; R4's own wire types (`session_appliance.proto`) travel as resource messages, and `tools/check_includes.py` keeps protobuf and codecs out of the dataplane libraries
 
 ## Product
 
-- [ ] GCC
-- [ ] Clang
-- [ ] ARM64 supported build
-- [ ] sanitizer subset
-- [ ] fuzz targets
-- [ ] installed-tree plugin
-- [ ] package/SBOM
-- [ ] hardware certification status explicit
+- [x] GCC — CI lane `Meson (gcc)`, and `gcc-u26`
+- [x] Clang — CI lanes `Meson (clang)` and `clang-asan`
+- [x] ARM64 supported build — CI lane `Meson (clang-arm64)`
+- [x] sanitizer subset — ASan+UBSan over every unit, architecture, plugin and fuzz-corpus test (`clang-asan`) and TSan over the concurrency list, gating (D-072)
+- [x] fuzz targets — `-Dbuild_fuzzers=true`: the gcc lane replays every committed corpus through `replay_main`, the ASan lane links libFuzzer and replays them under ASan+UBSan (suite `fuzz`); `tools/check_limits.py` and `tools/check_tidy.py` skip `_fuzz` sources
+- [x] installed-tree plugin — the install stage plus `tests/live/standalone_plugins_test.cc`: the installed plugins load into the staged bessd and move packets (M23)
+- [x] package/SBOM — `tools/package_release.py` (deb/rpm; the runtime package carries no Python) and `tools/build_info.py` (build-info.json plus an SPDX 2.3 SBOM from the build itself), both verified in CI's release-metadata step
+- [x] hardware certification status explicit — `docs/compatibility.md`'s not-validated table (NIC over VFIO, multi-queue RSS, real-NIC throughput, AF_XDP zero-copy), D-087's offload certification matrix and D-126's no-AVX-512-kernel note
 
 ---
 
