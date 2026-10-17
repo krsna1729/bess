@@ -154,7 +154,7 @@ func Dial(cfg Config) (*bess.Client, error) {
 
 // Sweep is the whole measurement in one call: dial, churn every shape, fit the
 // line, and close the client. Config.Addr must be set.
-func Sweep(ctx context.Context, cfg Config) (Result, Floor, error) {
+func Sweep(ctx context.Context, cfg Config) (res Result, floor Floor, err error) {
 	cfg = cfg.WithDefaults()
 	client, err := Dial(cfg)
 	if err != nil {
@@ -163,17 +163,25 @@ func Sweep(ctx context.Context, cfg Config) (Result, Floor, error) {
 	defer client.Close()
 	if cfg.ApplyGraph {
 		cleanup, err := ApplyGraph(ctx, client, cfg, cfg.WorkerCore, false)
+		if cleanup != nil {
+			// The cleanup comes back even with an error, because the graph may
+			// be on the daemon; a caller has to be able to tell if it fails.
+			defer func() {
+				if cerr := cleanup(context.WithoutCancel(ctx)); cerr != nil && err == nil {
+					err = fmt.Errorf("removing the bench graph: %w", cerr)
+				}
+			}()
+		}
 		if err != nil {
 			return Result{}, Floor{}, err
 		}
-		defer func() { _ = cleanup(context.WithoutCancel(ctx)) }()
 		time.Sleep(WaitSettled)
 	}
-	res, err := Run(ctx, client, cfg)
+	res, err = Run(ctx, client, cfg)
 	if err != nil {
 		return Result{}, Floor{}, err
 	}
-	floor, err := Fit(res.Shapes)
+	floor, err = Fit(res.Shapes)
 	if err != nil {
 		return Result{}, Floor{}, err
 	}

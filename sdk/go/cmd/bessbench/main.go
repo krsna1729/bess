@@ -48,7 +48,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (err error) {
 	addr := flag.String("addr", "localhost:10514", "the daemon's control endpoint")
 	shapesFlag := flag.String("shapes", "2,8,16,32", "operations per transaction, even and comma separated")
 	seconds := flag.Duration("seconds", 2*time.Second, "each shape's measurement window")
@@ -93,17 +93,24 @@ func run() error {
 	cfg := bench.Config{Addr: *addr, Resource: *resource, Shapes: shapes,
 		Seconds: *seconds, Preload: *preload, PktSize: *pktSize, Gates: *gates, Base: uint32(base)}
 	if !*noGraph {
-		cleanup, err := bench.ApplyGraph(ctx, client, cfg, *workerCore, *force)
-		if err != nil {
-			return err
+		cleanup, applyErr := bench.ApplyGraph(ctx, client, cfg, *workerCore, *force)
+		if cleanup != nil {
+			// Applying can fail after the daemon's own pipeline was cleared, so
+			// the cleanup runs then too; if it fails, the run fails.
+			defer func() {
+				cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+				defer cancel()
+				if cerr := cleanup(cctx); cerr != nil {
+					fmt.Fprintf(os.Stderr, "bessbench: %v\n", cerr)
+					if err == nil {
+						err = fmt.Errorf("the daemon's pipeline was not put back: %w", cerr)
+					}
+				}
+			}()
 		}
-		defer func() {
-			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-			defer cancel()
-			if err := cleanup(cctx); err != nil {
-				fmt.Fprintf(os.Stderr, "bessbench: %v\n", err)
-			}
-		}()
+		if applyErr != nil {
+			return applyErr
+		}
 		time.Sleep(bench.WaitSettled)
 	}
 
@@ -117,8 +124,8 @@ func run() error {
 	}
 	if len(res.Shapes) < 3 {
 		fmt.Fprintf(os.Stderr,
-			"bessbench: warning: a line through %d shapes is thin -- the defaults use four, a second each\n",
-			len(res.Shapes))
+			"bessbench: warning: a line through %d shapes is thin -- the default sweep is four, %s each\n",
+			len(res.Shapes), flag.Lookup("seconds").DefValue)
 	}
 	if *asJSON {
 		return writeJSON(res, floor, samples)

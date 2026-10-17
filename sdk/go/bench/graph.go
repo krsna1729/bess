@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"time"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -36,14 +35,10 @@ import (
 // against an idle one measure the same thing.
 func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int, force bool) (func(context.Context) error, error) {
 	cfg = cfg.WithDefaults()
-	// The snapshot has to carry the resources, not only the topology: a daemon's
-	// table entries and sessions are part of what is being replaced, and
-	// restoring modules with empty tables is not a restore.
-	query := []bess.PipelineQuery{}
-	if names := resourceNames(ctx, c); len(names) > 0 {
-		query = append(query, bess.WithResources(names...))
-	}
-	snap, err := c.Pipeline(ctx, query...)
+	// WithResources with no names means every resource: the snapshot has to
+	// carry their contents, or a restore would put the daemon's modules back
+	// with their tables emptied, which is worse than not offering to restore.
+	snap, err := c.Pipeline(ctx, bess.WithResources())
 	if err != nil {
 		return nil, fmt.Errorf("reading the pipeline: %w", err)
 	}
@@ -169,7 +164,17 @@ func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int,
 	}
 	if _, err := c.ApplyPipeline(ctx, pipeline, bess.WithExpectedVersion(version)); err != nil {
 		_ = c.ResumeWorkers(ctx)
-		return nil, fmt.Errorf("applying the bench graph: %w", err)
+		// Force cleared the daemon's own pipeline, so a failure here leaves it
+		// with nothing at all: put back what was there before reporting it.
+		if len(previous.GetModules()) > 0 {
+			if rerr := remove(ctx); rerr != nil {
+				return remove, fmt.Errorf("applying the bench graph: %w (and putting the daemon's pipeline back failed too: %v)", err, rerr)
+			}
+			// The daemon's own pipeline is back, so there is nothing left to
+			// clean up: handing back the cleanup would run it a second time.
+			return nil, fmt.Errorf("applying the bench graph: %w", err)
+		}
+		return remove, fmt.Errorf("applying the bench graph: %w", err)
 	}
 	if err := c.ResumeWorkers(ctx); err != nil {
 		// The graph is on the daemon; hand back what takes it off anyway.
@@ -181,21 +186,6 @@ func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int,
 // MatchModule is the name the bench graph gives its ExactMatch module, and so
 // the name an importer's own graph needs if they would rather keep theirs.
 const MatchModule = "em"
-
-// resourceNames is every resource the daemon reports, so that a snapshot carries
-// their contents and not only the modules that hold them.
-func resourceNames(ctx context.Context, c *bess.Client) []string {
-	res, err := c.Resources(ctx, true)
-	if err != nil {
-		return nil
-	}
-	names := make([]string, 0, len(res))
-	for name := range res {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
 
 // WaitSettled gives the workers a moment to pick up a newly applied graph. It is
 // what the C++ bench sleeps for, kept here so both wait the same way.
