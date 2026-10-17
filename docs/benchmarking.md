@@ -71,12 +71,15 @@ default each transaction adds one session's rule and removes the oldest;
 size fixed (which is what makes a sweep a slope, not table growth), and `--keep`
 leaves the pipeline applied so another client can be measured against the same
 modules and the same live traffic. Run interleaved with the Go SDK's own
-benchmark (`livebench_test.go`) on one daemon, p50 per shape (2, 8 and 16
-operations) is C++ 114.5, 141.0, 180.5 us against Go 103.4, 114.3, 129.6 us:
-ratios of 0.90, 0.81 and 0.72, or about 105 us fixed plus 4.7 us per operation
-against 100 us plus 1.9 us. Nothing measured splits a per-operation cost between
-the client, the wire and the daemon's table update, and interleaving is not
-optional: the same client's p50 moved about 13% between two daemons. It prints
+benchmark (`livebench_test.go`) on one daemon, three ABBA rounds per shape, the
+worker on a core of its own (`--worker-core 2`; with the default it shares CPU 0
+with the daemon's control thread, which costs both clients about 3x on p99 and
+halves the packet rate). Averaged over six runs per client, p50 at 2, 8 and 16
+operations is C++ 110.5, 158.5, 201.5 us against Go 92.9, 109.3, 135.6 us:
+ratios of 0.84, 0.69 and 0.67, or about 99 us fixed plus 6.1 us per operation
+against 87 us plus 3.1 us. Nothing measured splits a per-operation cost between
+the client, the wire and the daemon's table update, and one run per client means
+little: the same client's p50 varied by up to a quarter here. It prints
 Mpps through the module, the hit fraction (about 0.5 while the live set stays
 the shape's size, which checks that rules steer packets; a table that grows
 shows more), transactions/s achieved, client-side
