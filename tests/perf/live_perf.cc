@@ -136,6 +136,26 @@ const std::string &GtpuFrame() {
   return frame;
 }
 
+// The G-PDU deploy/smoke-gtpu.yaml's `rewrite_up` sends (95 bytes): the frame
+// above with a PDU Session Container, which is where a real gNB puts the QoS
+// flow. The E flag (0x34) makes the four-octet optional tail present, whose
+// last octet names the container (0x85, TS 29.281); the container's length
+// octet 0x01 covers its two content octets and its next-type octet, the first
+// content octet 0x10 is the uplink PDU type (1), and the QFI 5 sits in the low
+// six bits of the second. The three lengths grew by the eight bytes (IPv4
+// 0x51, UDP 0x3d, GTP-U 0x2d) and the IPv4 checksum with them (0xea70); the
+// inner packet is byte for byte the frame above, so the decap's own checks
+// still read it. This is the frame that makes the decap's chain walk run: with
+// no container there is nothing to walk, which is what the plain arm measures.
+const std::string &GtpuFrameWithPduSessionContainer() {
+  static const std::string frame = FromHex(
+      "02 00 00 00 00 01 02 00 00 00 00 02 08 00 45 00 00 51 00 01 40 00 40 11 ea 70 0a 14 1e 01"
+      " 0a 14 1e 02 08 68 08 68 00 3d 00 00 34 ff 00 2d 11 22 33 44 00 00 00 85 01 10 05 00 45 00"
+      " 00 25 00 01 40 00 40 11 20 b7 0a 00 00 01 08 08 08 08 04 d2 00 35 00 11 00 00 68 65 6c 6c"
+      " 6f 2d 75 70 66");
+  return frame;
+}
+
 // The inner frame the downlink carries: Eth / IPv4 / UDP, 51 bytes.
 const std::string &InnerFrame() {
   static const std::string frame = FromHex(
@@ -490,13 +510,16 @@ std::vector<std::string> MAcl(Build &b) {
 // that makes the decap's "upf_teid" attribute real -- a write-only attribute
 // gets no offset at all, so without a reader the write is a no-op and the arm
 // would measure less than the graph that ships.
-void MGtpuDecapShared(Build &b) {
+void MGtpuDecapShared(Build &b, bool qfi = false) {
   b.Mod("WildcardMatch", "teid", R"({"fields": [{"offset": 46, "num_bytes": 4}]})");
   b.Entry("teid/rules", "WildcardMatchRuleKey",
           R"({"values": [{"value_bin": ")" + Base64(Be32(0x11223344)) + R"("}],)"
           R"( "masks": [{"value_bin": "/////w=="}]})",
           "WildcardMatchRuleValue", R"({"priority": 100, "gate": 0})");
-  b.Mod("MetadataTest", "mt", R"({"read": {"upf_teid": 4}})");
+  // The container frame's arm reads `qfi` as well: that is the write the chain
+  // walk produces, and a write-only attribute gets no offset at all.
+  b.Mod("MetadataTest", "mt", qfi ? R"({"read": {"upf_teid": 4, "qfi": 1}})"
+                                  : R"({"read": {"upf_teid": 4}})");
 }
 
 // Source -> Rewrite(G-PDU) -> TEID classifier -> GtpuDecap -> reader -> Sink.
@@ -510,6 +533,22 @@ std::vector<std::string> MGtpuDecap(Build &b) {
 std::vector<std::string> MGtpuDecapControl(Build &b) {
   MGtpuDecapShared(b);
   return MBase(b, {{"teid", 1}, {"bp", 1}, {"mt", 1}}, GtpuFrame());
+}
+
+// The same pair over the container frame, where the decap's chain walk actually
+// runs (the plain arm has no container to walk): this is the number that says
+// whether fusing the TEID lookup with the decap buys anything.
+std::vector<std::string> MGtpuDecapQfi(Build &b) {
+  MGtpuDecapShared(b, /*qfi=*/true);
+  b.Mod("GtpuDecap", "decap", R"({})");
+  return MBase(b, {{"teid", 1}, {"decap", 1}, {"mt", 1}},
+               GtpuFrameWithPduSessionContainer());
+}
+
+std::vector<std::string> MGtpuDecapQfiControl(Build &b) {
+  MGtpuDecapShared(b, /*qfi=*/true);
+  return MBase(b, {{"teid", 1}, {"bp", 1}, {"mt", 1}},
+               GtpuFrameWithPduSessionContainer());
 }
 
 // The downlink's front and tail, shared the same way: the ActionId the PDR
@@ -651,6 +690,8 @@ std::vector<Test> Catalogue() {
       // its frame (see the builders above). Skipped without --plugin DIR.
       {"M.gtpu_decap.base", 'M', MGtpuDecapControl},
       {"M.gtpu_decap", 'M', MGtpuDecap},
+      {"M.gtpu_decap.qfi.base", 'M', MGtpuDecapQfiControl},
+      {"M.gtpu_decap.qfi", 'M', MGtpuDecapQfi},
       {"M.gtpu_encap.base", 'M', MGtpuEncapControl},
       {"M.gtpu_encap", 'M', MGtpuEncap},
       {"M.urr_count.base", 'M', MUrrCountControl},
