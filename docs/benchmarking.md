@@ -65,10 +65,21 @@ tools/ab_bench.py OLD_BINARY NEW_BINARY --filter 'BM_Lookup' \
 `live_transaction_bench` (C++ on the SDK, built with the tests as
 `build/<dir>/tests/perf/live_transaction_bench`; D-139) measures a running
 bessd: packets classified by a real ExactMatch module on one worker while a
-client changes its rules through the transaction RPC (D-025) at given rates
-(each transaction adds one session's rule and removes the oldest). It prints
-Mpps through the module, the hit fraction (about 0.5 by construction, which
-checks that rules steer packets), transactions/s achieved, client-side
+client changes its rules through the transaction RPC (D-025) at given rates. By
+default each transaction adds one session's rule and removes the oldest;
+`--upserts N --erases M` set that shape, where equal counts keep the table's
+size fixed (which is what makes a sweep a slope, not table growth), and `--keep`
+leaves the pipeline applied so another client can be measured against the same
+modules and the same live traffic. Run interleaved with the Go SDK's own
+benchmark (`livebench_test.go`) on one daemon, p50 per shape (2, 8 and 16
+operations) is C++ 114.5, 141.0, 180.5 us against Go 103.4, 114.3, 129.6 us:
+ratios of 0.90, 0.81 and 0.72, or about 105 us fixed plus 4.7 us per operation
+against 100 us plus 1.9 us. Nothing measured splits a per-operation cost between
+the client, the wire and the daemon's table update, and interleaving is not
+optional: the same client's p50 moved about 13% between two daemons. It prints
+Mpps through the module, the hit fraction (about 0.5 while the live set stays
+the shape's size, which checks that rules steer packets; a table that grows
+shows more), transactions/s achieved, client-side
 latency and the daemon's busy answers. Start bessd isolated on the worker core
 as for any benchmark, run the tool from another core (`--grpc-url`,
 `--worker-core`), and compare rates within one run (`--rounds` interleaves

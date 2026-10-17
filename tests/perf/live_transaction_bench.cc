@@ -17,7 +17,9 @@
 // Pipeline: Source -> RandomUpdate (IPv4 source address over 2 x sessions
 // values) -> ExactMatch (source address) -> Sink per gate. A session is one
 // exact rule; each transaction adds the next session's rule and removes the
-// oldest (two operations), so the live set stays at `--sessions`.
+// oldest: two operations by default, and --upserts/--erases set the count, so
+// one sweep prices an operation rather than a transaction. With more upserts
+// than erases the live set grows for the length of the run.
 //
 // Start bessd first (isolated as you benchmark anything else), e.g.
 //   omarchy-benchmark --cpu 2,4 --isolate -- sudo env ... bessd -k -f
@@ -57,6 +59,9 @@ struct Options {
   double duration = 5.0;
   std::vector<int> rates = {0, 1000, 10000, -1};  // -1: as fast as possible
   int rounds = 1;
+  int upserts = 1;  // rules added per transaction
+  int erases = 1;   // rules dropped per transaction
+  bool keep = false;  // leave the pipeline applied for the next client
 };
 
 class Bench {
@@ -127,9 +132,9 @@ class Bench {
         due += std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / rate));
         std::this_thread::sleep_until(due);
       }
-      Commit({next_}, {oldest}, latency);
-      next_++;
-      oldest++;
+      Commit(Range(next_, o_.upserts), Range(oldest, o_.erases), latency);
+      next_ += o_.upserts;
+      oldest += o_.erases;
       done++;
     }
     const double elapsed = std::chrono::duration<double>(Clock::now() - start).count();
@@ -166,6 +171,16 @@ class Bench {
     if (!r) {
       throw std::runtime_error(what + ": " + r.error().message);
     }
+  }
+
+  // `count` consecutive session numbers, the rules one transaction touches.
+  static std::vector<int> Range(int first, int count) {
+    std::vector<int> v;
+    v.reserve(count);
+    for (int i = 0; i < count; i++) {
+      v.push_back(first + i);
+    }
+    return v;
   }
 
   // The rule key of `session` (its address cycles over 2 x sessions).
@@ -274,16 +289,26 @@ int Main(int argc, char **argv) {
       }
     } else if (a == "--rounds") {
       o.rounds = std::stoi(value());
+    } else if (a == "--upserts") {
+      o.upserts = std::stoi(value());
+    } else if (a == "--erases") {
+      o.erases = std::stoi(value());
+    } else if (a == "--keep") {
+      o.keep = true;
     } else {
       std::fprintf(stderr,
                    "usage: live_transaction_bench [--grpc-url HOST:PORT] [--worker-core C]\n"
                    "  [--sessions N] [--pkt-size B] [--duration S] [--rates R,...|max]"
-                   " [--rounds N]\n");
+                   " [--rounds N]\n"
+                   "  [--upserts N] [--erases N] [--keep]\n");
       return 2;
     }
   }
   if (o.sessions <= 0) {
     throw std::runtime_error("--sessions must be positive");
+  }
+  if (o.upserts < 0 || o.erases < 0 || o.upserts + o.erases == 0) {
+    throw std::runtime_error("--upserts/--erases must be non-negative and not both zero");
   }
   // Busy answers are retried quickly and often: the bench measures them.
   auto client = bess::sdk::Client::Dial(
@@ -291,6 +316,7 @@ int Main(int argc, char **argv) {
                                          .busy_backoff = std::chrono::microseconds(10)});
   Bench bench(*client, o);
   bench.Build();
+  std::printf("# %d upserts + %d erases per transaction\n", o.upserts, o.erases);
   std::printf("%8s %8s %6s %10s %9s %9s %6s\n", "rate", "Mpps", "hit", "tx/s", "p50 us",
               "p99 us", "busy");
   for (int round = 0; round < o.rounds; round++) {
@@ -298,7 +324,11 @@ int Main(int argc, char **argv) {
       bench.Measure(rate);
     }
   }
-  bench.Reset();
+  if (!o.keep) {
+    // --keep leaves the pipeline applied, so another client can be measured
+    // against the same modules and the same traffic.
+    bench.Reset();
+  }
   return 0;
 }
 
