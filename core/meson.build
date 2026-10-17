@@ -737,6 +737,7 @@ unit_test_sources = [
   'rcu/rcu_scheduler_test.cc',
   'control/admin_v2_test.cc',
   'control/api_v2_test.cc',
+  'control/api_server_test.cc',
   'control/dataplane_transactions_test.cc',
   'control/thread_placement_test.cc',
   'runtime/startup_test.cc',
