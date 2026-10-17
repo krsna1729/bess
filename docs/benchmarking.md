@@ -74,12 +74,14 @@ modules and the same live traffic. Run interleaved with the Go SDK's own
 benchmark (`livebench_test.go`) on one daemon, three ABBA rounds per shape, the
 worker on a core of its own (`--worker-core 2`; with the default it shares CPU 0
 with the daemon's control thread, which costs both clients about 3x on p99 and
-halves the packet rate). Averaged over six runs per client, p50 at 2, 8 and 16
-operations is C++ 110.5, 158.5, 201.5 us against Go 92.9, 109.3, 135.6 us:
-ratios of 0.84, 0.69 and 0.67, or about 99 us fixed plus 6.1 us per operation
-against 87 us plus 3.1 us. Nothing measured splits a per-operation cost between
-the client, the wire and the daemon's table update, and one run per client means
-little: the same client's p50 varied by up to a quarter here. It prints
+halves the packet rate). Medians of six runs per client, with the range of those
+runs in brackets: p50 at 2, 8 and 16 operations is C++ 111 (103-120), 161
+(150-166) and 191.5 (185-240) us against Go 93 (84-100), 110 (106-111) and 136
+(131-140) us. Ratios of 0.84, 0.68 and 0.71, or about 99 us fixed plus 5.8 us
+per operation against 87 us plus 3.1 us. Nothing measured splits a per-operation
+cost between the client, the wire and the daemon's table update, and one run per
+client means little: the spread within a client reaches a quarter of the median
+here. It prints
 Mpps through the module, the hit fraction (about 0.5 while the live set stays
 the shape's size, which checks that rules steer packets; a table that grows
 shows more), transactions/s achieved, client-side
