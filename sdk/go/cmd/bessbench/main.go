@@ -115,6 +115,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if len(res.Shapes) < 3 {
+		fmt.Fprintf(os.Stderr,
+			"bessbench: warning: a line through %d shapes is thin -- the defaults use four, a second each\n",
+			len(res.Shapes))
+	}
 	if *asJSON {
 		return writeJSON(res, floor, samples)
 	}

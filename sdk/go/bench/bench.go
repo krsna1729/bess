@@ -76,6 +76,11 @@ type Config struct {
 	PktSize  int           `json:"pkt_size,omitempty"` // the bench graph's packet size; default 60
 	Gates    int           `json:"gates,omitempty"`    // gates rules steer to; default 4
 	Base     uint32        `json:"base,omitempty"`     // first key address; default 0x0b000000
+	// ApplyGraph makes Sweep apply the bench graph rather than use one that is
+	// already there, on WorkerCore. It is the same safe path the command takes:
+	// a daemon with a pipeline is refused rather than replaced.
+	ApplyGraph bool `json:"apply_graph,omitempty"`
+	WorkerCore int  `json:"worker_core,omitempty"` // that graph's worker CPU; default 2, never the control CPU
 }
 
 // WithDefaults fills in what a caller left out, so a caller can spread the
@@ -98,6 +103,9 @@ func (c Config) WithDefaults() Config {
 	}
 	if c.PktSize == 0 {
 		c.PktSize = 60
+	}
+	if c.WorkerCore == 0 {
+		c.WorkerCore = 2
 	}
 	if c.Base == 0 {
 		c.Base = 0x0b000000
@@ -153,6 +161,14 @@ func Sweep(ctx context.Context, cfg Config) (Result, Floor, error) {
 		return Result{}, Floor{}, err
 	}
 	defer client.Close()
+	if cfg.ApplyGraph {
+		cleanup, err := ApplyGraph(ctx, client, cfg, cfg.WorkerCore, false)
+		if err != nil {
+			return Result{}, Floor{}, err
+		}
+		defer func() { _ = cleanup(context.WithoutCancel(ctx)) }()
+		time.Sleep(WaitSettled)
+	}
 	res, err := Run(ctx, client, cfg)
 	if err != nil {
 		return Result{}, Floor{}, err
@@ -318,6 +334,9 @@ type Comparison struct {
 	OwnPerOp  time.Duration `json:"own_per_op_ns,omitempty"`
 	HasFit    bool          `json:"has_fit,omitempty"`
 	PerOpHigh bool          `json:"per_op_above_floor,omitempty"`
+	// OwnLineRejected says the caller gave two or more samples but they do not
+	// describe one path at two sizes, so only the per-sample excesses stand.
+	OwnLineRejected bool `json:"own_line_rejected,omitempty"`
 }
 
 // Excess is one sample against the floor. PerOp is what the sample implies per
@@ -349,10 +368,16 @@ func Compare(floor Floor, samples ...Sample) Comparison {
 		out.Excess = append(out.Excess, e)
 		shapes = append(shapes, Shape{Ops: s.Ops, P50: s.Latency})
 	}
+	// A line through the caller's samples is only a line if it describes one
+	// path at two sizes. A fixed part at or below zero means it does not: the
+	// samples are different operations, and their per-sample excesses above are
+	// all that can be read from them.
 	if len(shapes) >= 2 {
-		if own, err := Fit(shapes); err == nil {
+		if own, err := Fit(shapes); err == nil && own.Fixed > 0 {
 			out.OwnFixed, out.OwnPerOp, out.HasFit = own.Fixed, own.PerOp, true
 			out.PerOpHigh = own.PerOp > floor.PerOp
+		} else {
+			out.OwnLineRejected = true
 		}
 	}
 	return out
@@ -380,14 +405,12 @@ func (c Comparison) String() string {
 		if c.PerOpHigh {
 			verb = "above"
 		}
-		line := fmt.Sprintf("%.2fus per operation", us(c.OwnPerOp))
-		if c.OwnFixed > 0 {
-			line = fmt.Sprintf("%.1fus fixed + %s", us(c.OwnFixed), line)
-		} else {
-			line += " (its fixed part came out at or below zero, which means the samples are too alike in shape to separate the two terms)"
-		}
-		fmt.Fprintf(&b, "  their own line: %s, %.2fx %s the floor's per-operation cost\n", line,
+		fmt.Fprintf(&b, "  their own line: %.1fus fixed + %.2fus per operation, %.2fx %s the floor's per-operation cost\n",
+			us(c.OwnFixed), us(c.OwnPerOp),
 			float64(c.OwnPerOp)/float64(c.Floor.PerOp), verb)
+	} else if c.OwnLineRejected {
+		fmt.Fprintf(&b, "  no line for the caller: these samples are not one operation at two sizes, so\n"+
+			"  only the excesses above stand (measure the same operation at two or more sizes for a line)\n")
 	}
 	return b.String()
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -21,22 +22,35 @@ import (
 
 // ApplyGraph applies the graph this package measures: Source -> RandomUpdate ->
 // ExactMatch -> one Sink per gate, on one worker whose core is given. The
-// returned function removes it again -- restoring whatever was applied before,
-// if anything was and force allowed it -- and callers should defer it, including
-// on interrupt. Nodes are named as the C++ live_transaction_bench names them, so
+// returned function removes it again -- putting back the pipeline that was
+// applied before, with the resource contents the daemon reported, if anything
+// was and force allowed it -- and callers should defer it, including on
+// interrupt. Nodes are named as the C++ live_transaction_bench names them, so
 // the two measure the same shape under the same traffic.
 //
 // A daemon that already has a pipeline is left alone unless force is set: the
-// floor is not worth someone's graph.
+// floor is not worth someone's graph. With force, what comes back is the
+// pipeline as it was read -- its modules, its settings, and the contents of the
+// resources it reported -- so anything a snapshot does not carry does not come
+// back. A daemon that is serving traffic is still best left alone: two runs
+// against an idle one measure the same thing.
 func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int, force bool) (func(context.Context) error, error) {
 	cfg = cfg.WithDefaults()
-	snap, err := c.Pipeline(ctx)
+	// The snapshot has to carry the resources, not only the topology: a daemon's
+	// table entries and sessions are part of what is being replaced, and
+	// restoring modules with empty tables is not a restore.
+	query := []bess.PipelineQuery{}
+	if names := resourceNames(ctx, c); len(names) > 0 {
+		query = append(query, bess.WithResources(names...))
+	}
+	snap, err := c.Pipeline(ctx, query...)
 	if err != nil {
 		return nil, fmt.Errorf("reading the pipeline: %w", err)
 	}
 	previous := snap.Pipeline
 	if n := len(previous.GetModules()); n > 0 && !force {
-		return nil, fmt.Errorf("the daemon already runs a pipeline (%d modules); pass -force to replace it for the run and restore it after", n)
+		return nil, fmt.Errorf("the daemon already runs a pipeline (%d modules, %d resources); pass -force to replace it for the run and restore it after",
+			n, len(previous.GetResources()))
 	}
 	sc, err := c.Schema(ctx)
 	if err != nil {
@@ -109,38 +123,79 @@ func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int,
 			Downstream: fmt.Sprintf("sink%d", gate), Igate: 0})
 	}
 
-	if err := c.PauseWorkers(ctx); err != nil {
-		return nil, fmt.Errorf("pausing workers: %w", err)
-	}
-	if _, err := c.ApplyPipeline(ctx, pipeline, bess.WithExpectedVersion(snap.Version)); err != nil {
-		_ = c.ResumeWorkers(ctx)
-		return nil, fmt.Errorf("applying the bench graph: %w", err)
-	}
-	if err := c.ResumeWorkers(ctx); err != nil {
-		return nil, fmt.Errorf("resuming workers: %w", err)
-	}
-
-	return func(cctx context.Context) error {
+	remove := func(cctx context.Context) error {
 		_ = c.PauseWorkers(cctx)
 		defer c.ResumeWorkers(cctx)
-		restore := previous
-		if restore == nil || len(restore.GetModules()) == 0 {
-			restore = &pb.Pipeline{}
-		}
+		// The bench graph comes off first, for the same reason the caller's had
+		// to: its modules carry the names the restored ones carry.
 		cur, err := c.Pipeline(cctx)
 		if err != nil {
 			return err
 		}
-		if _, err := c.ApplyPipeline(cctx, restore, bess.WithExpectedVersion(cur.Version)); err != nil {
+		if _, err := c.ApplyPipeline(cctx, &pb.Pipeline{}, bess.WithExpectedVersion(cur.Version)); err != nil {
 			return fmt.Errorf("removing the bench graph: %w", err)
 		}
+		back := previous
+		if back == nil || len(back.GetModules()) == 0 {
+			return nil
+		}
+		cur, err = c.Pipeline(cctx)
+		if err != nil {
+			return err
+		}
+		if _, err := c.ApplyPipeline(cctx, back, bess.WithExpectedVersion(cur.Version)); err != nil {
+			return fmt.Errorf("putting the daemon's own pipeline back: %w", err)
+		}
 		return nil
-	}, nil
+	}
+	if err := c.PauseWorkers(ctx); err != nil {
+		return nil, fmt.Errorf("pausing workers: %w", err)
+	}
+	// A module that is already there with a different argument cannot be
+	// replaced in the same transaction that renames it: with force, the old
+	// graph comes off first and only then does the bench graph go on.
+	version := snap.Version
+	if len(previous.GetModules()) > 0 {
+		if _, err := c.ApplyPipeline(ctx, &pb.Pipeline{}, bess.WithExpectedVersion(version)); err != nil {
+			_ = c.ResumeWorkers(ctx)
+			return nil, fmt.Errorf("clearing the daemon's pipeline: %w", err)
+		}
+		cur, err := c.Pipeline(ctx)
+		if err != nil {
+			_ = c.ResumeWorkers(ctx)
+			return nil, fmt.Errorf("reading the pipeline after clearing it: %w", err)
+		}
+		version = cur.Version
+	}
+	if _, err := c.ApplyPipeline(ctx, pipeline, bess.WithExpectedVersion(version)); err != nil {
+		_ = c.ResumeWorkers(ctx)
+		return nil, fmt.Errorf("applying the bench graph: %w", err)
+	}
+	if err := c.ResumeWorkers(ctx); err != nil {
+		// The graph is on the daemon; hand back what takes it off anyway.
+		return remove, fmt.Errorf("resuming workers: %w", err)
+	}
+	return remove, nil
 }
 
 // MatchModule is the name the bench graph gives its ExactMatch module, and so
 // the name an importer's own graph needs if they would rather keep theirs.
 const MatchModule = "em"
+
+// resourceNames is every resource the daemon reports, so that a snapshot carries
+// their contents and not only the modules that hold them.
+func resourceNames(ctx context.Context, c *bess.Client) []string {
+	res, err := c.Resources(ctx, true)
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(res))
+	for name := range res {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
 
 // WaitSettled gives the workers a moment to pick up a newly applied graph. It is
 // what the C++ bench sleeps for, kept here so both wait the same way.

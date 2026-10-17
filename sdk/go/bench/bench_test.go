@@ -6,6 +6,7 @@ package bench
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -109,6 +110,29 @@ func TestMeasureTakesTheMedian(t *testing.T) {
 	}
 	if s.Latency < 300*time.Microsecond {
 		t.Errorf("the median of 100..500us sleeps is at least 300us, got %v", s.Latency)
+	}
+}
+
+// TestCompareRejectsTwoDifferentPaths: samples that are not one operation at two
+// sizes fit a fixed part at or below zero, which is not a line. The per-sample
+// excesses are all that can be read, and the comparison has to say so instead of
+// printing a negative fixed cost.
+func TestCompareRejectsTwoDifferentPaths(t *testing.T) {
+	floor := Floor{Fixed: 90 * time.Microsecond, PerOp: 4 * time.Microsecond}
+	c := Compare(floor,
+		Sample{Ops: 4, Latency: 410 * time.Microsecond, Label: "modify"},
+		Sample{Ops: 11, Latency: 2100 * time.Microsecond, Label: "establish"})
+	if c.HasFit {
+		t.Errorf("two different operations should not give a line: fixed %v", c.OwnFixed)
+	}
+	if !c.OwnLineRejected {
+		t.Error("the comparison should say why the caller has no line")
+	}
+	if len(c.Excess) != 2 {
+		t.Errorf("the per-sample excesses are still the answer: %v", c.Excess)
+	}
+	if !strings.Contains(c.String(), "one operation at two sizes") {
+		t.Errorf("the report should explain itself:\n%s", c.String())
 	}
 }
 
