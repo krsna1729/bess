@@ -76,6 +76,46 @@ void BM_K38RangeLookupBatch(benchmark::State &state) {
 }
 BENCHMARK(BM_K38RangeLookupBatch)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
 
+// The hand-written specialized arm: the same keys and the same rule as
+// BM_K38RangeLookupBatch above, checked with direct unsigned comparisons - the
+// shape performance-contract.md section 2 says the generated code must
+// approach. The IP fields are compared against the rule's value under its full
+// mask, so the two arms decide the same thing.
+void BM_K38HandWrittenBatch(benchmark::State &state) {
+  const size_t batch_size = static_cast<size_t>(state.range(0));
+
+  std::vector<PacketKey> keys(batch_size);
+  for (size_t i = 0; i < batch_size; i++) {
+    keys[i].src_port = be16_t(1500);
+    keys[i].dst_port = be16_t(8500);
+  }
+
+  std::vector<uint32_t> results(batch_size);
+
+  constexpr uint16_t kSrcLow = 1000, kSrcHigh = 2000;
+  constexpr uint16_t kDstLow = 8000, kDstHigh = 9000;
+  constexpr uint32_t kSrcIp = 0x0a000001, kDstIp = 0x0a000002;
+
+  for (auto _ : state) {
+    uint64_t hits = 0;
+    for (size_t i = 0; i < batch_size; i++) {
+      const PacketKey &k = keys[i];
+      const uint16_t src = k.src_port.value();
+      const uint16_t dst = k.dst_port.value();
+      const bool match = k.src_ip == kSrcIp && k.dst_ip == kDstIp &&
+                         src >= kSrcLow && src <= kSrcHigh && dst >= kDstLow &&
+                         dst <= kDstHigh;
+      results[i] = match ? 1u : 0u;
+      hits += match ? 1u : 0u;
+    }
+    benchmark::DoNotOptimize(hits);
+    benchmark::DoNotOptimize(results);
+  }
+
+  state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(batch_size));
+}
+BENCHMARK(BM_K38HandWrittenBatch)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
+
 // Benchmark Equivalent Cartesian Expanded Ternary Masks (25 rules)
 void BM_CartesianTernaryLookupBatch(benchmark::State &state) {
   const size_t batch_size = static_cast<size_t>(state.range(0));
