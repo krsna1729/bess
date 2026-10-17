@@ -143,6 +143,13 @@ TEST_F(MetricsTest, GateCountersCountWhatCrossed) {
 // starts. A task reachable from two schedulers at once -- the state the D-019
 // invariant in drr.h describes, which is what makes its ingress ring hand out a
 // slot nobody wrote -- would leave the old worker's count growing.
+//
+// Both halves are load-bearing, demonstrated by mutation: pinning the metric's
+// worker label to "0" fails the worker-1 assertion ("the DRR's task did not run
+// on worker 1 after the move"), and reporting the module's total runs under each
+// worker's series fails the frozen-count check at the end. The worker-1 half is
+// also what a daemon without the module label trips; the ASSERT at the top is
+// what a missing worker-0 series trips.
 TEST_F(MetricsTest, TaskRunsFollowThePlacement) {
   if (AllowedCores().size() < 2) {
     GTEST_SKIP() << "moving a task needs two allowed CPUs";
