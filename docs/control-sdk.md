@@ -6,8 +6,9 @@ adds no semantics of its own: resources are whatever modules registered
 adds is the part of the protocol that is easy to get wrong when every
 controller writes it again.
 
-Go (`github.com/krsna1729/bess/sdk/go/bess`) and C++ (`sdk/cpp`) are the two
-clients, each the same guarantees in its own error type -- Go
+Go (`github.com/krsna1729/bess/sdk/go/bess`), C++ (`sdk/cpp`) and Python
+(`sdk/python`, D-146) are the clients - all first-class, on the same wire and
+with the same guarantees - each in its own error type. Go
 (`*ConflictError`, `*RejectedError`, `*BusyError`, `*TransportError`,
 `*DaemonRestartedError`, `*StaleResourceError`, `*InvalidRequestError`):
 

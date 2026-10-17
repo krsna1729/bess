@@ -165,6 +165,7 @@ file is the reasoning.
 | D-143 | The protobuf surface keeps only what runs: the legacy command messages went with the service that could call them (a message is API surface a client can name, and a schema every generator compiles), so only what a live call or a resource uses remains | accepted |
 | D-144 | The gate byte counter is gone: `TrackArg.bits` was its only switch and every hook was installed with the default arg, so `bess_gate_bytes_total` could never appear; the feature went with it, while the field number and name stay reserved so no client can silently write the old one | accepted |
 | D-145 | The Go SDK ships as a nested module under module-prefixed tags (`sdk/go/vX.Y.Z`), consumed by pinning a tag or a commit; unpinned queries resolve through the repository's default branch, which is `develop`, while `master` stays the archival upstream mirror and no branch is renamed; `go.work` is a machine-local development shortcut, never how a consumer builds | accepted |
+| D-146 | C++, Python and Go are all first-class control_v2 SDKs, and the Python one is rebuilt clean-room: a fresh client taking `pybess.sdk`'s place - the same transaction discipline (one request id per logical transaction, recovery through `GetTransaction`, the daemon epoch, typed resources and typed outcomes) over the same wire, with no legacy service and no place in the runtime package (D-135). It amends D-104's count of two supported SDKs | accepted |
 
 
 ---
@@ -10332,3 +10333,37 @@ accessor had no caller.
 **Consequence.** No branch is renamed: Go reads the default branch and the tags, never a branch name, so
 `master` keeps its archival meaning and `develop` keeps the pushes. What remains is a release act rather than a
 layout change: cut `sdk/go/v0.1.0` on a green commit, then repin the consumers from `@develop` to the tag.
+
+---
+
+## D-146 A clean-room Python SDK on control_v2 only
+
+**Status:** accepted (2026-10-17; the user's decision, recorded here because the record did not carry it).
+
+- pybess left with D-140 because it was *packaged into the runtime*: `bess-python` shipped `pybess`, the
+  generated Python protobuf packages and the Python bessctl, and the legacy `BESSControl` service lived in the
+  same package (D-135). Its `pybess/sdk.py` was already a control_v2 client, by its own docstring: "A thin
+  client for BESS's generic control API (control_v2), M27. It makes the subtle parts of the transaction
+  protocol hard to get wrong: one request id per logical transaction, kept across retries; recovery after a
+  timeout through GetTransaction instead of guessing; the daemon epoch, so an outcome lost to a restart is
+  reported as unknown rather than as 'never ran'; typed resources checked before anything is sent; and typed
+  outcomes." So what D-140 removed was a client whose *delivery* was entangled with the runtime, not one whose
+  protocol was wrong.
+- **Decision.** A clean-room Python SDK on control_v2 only, taking `pybess.sdk`'s place. It is a fresh
+  implementation over the wire the Go and C++ SDKs already use (`protobuf/control_v2.proto`, `package
+  bess.pb.v2`), not a resurrection of the deleted package: no legacy service, no `pybess/bess.py`, no
+  `Module`/`Port` wrappers, no `.bess` scripts.
+- **All three are first-class** (the user's correction to D-104's count of two). C++, Python and Go are
+  supported clients of the same wire: documented together in `docs/control-sdk.md`, tested in CI, and shipped
+  as their own artifacts - the C++ SDK as installed headers plus `bess-sdk.pc`, the Go SDK as a module under
+  `sdk/go/vX.Y.Z` tags, the Python SDK as its own package. "First-class" is about the *client*; none of the
+  three is part of the *runtime* package: D-135's `bess` carries no Python and `tools/package_release.py`
+  refuses Python files in that tree, so a machine without Python still has a working daemon and a C++ bessctl.
+- **The shape is not new.** The Go and C++ SDKs are the model (`sdk/go/bess`: `Client`, `Transaction`,
+  `PipelineBuilder`, `PipelineVersion`, `PipelineSnapshot`, `RetryPolicy`, and typed errors for invalid
+  request, conflict, rejection, busy and transport failure), and the schemas come from the daemon
+  (`GetSchema`'s `google.protobuf.FileDescriptorSet`), so the SDK ships generated code for the control protocol
+  only and builds resource messages from descriptors - the same choice both existing SDKs made.
+- **Consequence for the docs.** `docs/control-sdk.md` no longer says "the two clients": it names all three,
+  with the Python one marked as the clean-room rebuild (D-146). A sentence elsewhere that reads as a
+  prohibition on a Python client is corrected the same way.
