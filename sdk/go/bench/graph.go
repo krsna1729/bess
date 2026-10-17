@@ -5,6 +5,7 @@ package bench
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -122,29 +123,29 @@ func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int,
 	}
 
 	remove := func(cctx context.Context) error {
-		_ = c.PauseWorkers(cctx)
-		defer c.ResumeWorkers(cctx)
-		// The bench graph comes off first, for the same reason the caller's had
-		// to: its modules carry the names the restored ones carry.
-		cur, err := c.Pipeline(cctx)
-		if err != nil {
-			return err
-		}
-		if _, err = c.ApplyPipeline(cctx, &pb.Pipeline{}, bess.WithExpectedVersion(cur.Version)); err != nil {
-			return fmt.Errorf("removing the bench graph: %w", err)
-		}
-		back := previous
-		if back == nil || len(back.GetModules()) == 0 {
+		return paused(cctx, c.PauseWorkers, c.ResumeWorkers, func() error {
+			// The bench graph comes off first, for the same reason the caller's
+			// had to: its modules carry the names the restored ones carry.
+			cur, err := c.Pipeline(cctx)
+			if err != nil {
+				return err
+			}
+			if _, err = c.ApplyPipeline(cctx, &pb.Pipeline{}, bess.WithExpectedVersion(cur.Version)); err != nil {
+				return fmt.Errorf("removing the bench graph: %w", err)
+			}
+			back := previous
+			if back == nil || len(back.GetModules()) == 0 {
+				return nil
+			}
+			cur, err = c.Pipeline(cctx)
+			if err != nil {
+				return err
+			}
+			if _, err = c.ApplyPipeline(cctx, back, bess.WithExpectedVersion(cur.Version)); err != nil {
+				return fmt.Errorf("putting the daemon's own pipeline back: %w", err)
+			}
 			return nil
-		}
-		cur, err = c.Pipeline(cctx)
-		if err != nil {
-			return err
-		}
-		if _, err := c.ApplyPipeline(cctx, back, bess.WithExpectedVersion(cur.Version)); err != nil {
-			return fmt.Errorf("putting the daemon's own pipeline back: %w", err)
-		}
-		return nil
+		})
 	}
 	if err := c.PauseWorkers(ctx); err != nil {
 		return nil, fmt.Errorf("pausing workers: %w", err)
@@ -155,18 +156,16 @@ func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int,
 	version := snap.Version
 	if len(previous.GetModules()) > 0 {
 		if _, err := c.ApplyPipeline(ctx, &pb.Pipeline{}, bess.WithExpectedVersion(version)); err != nil {
-			_ = c.ResumeWorkers(ctx)
-			return nil, fmt.Errorf("clearing the daemon's pipeline: %w", err)
+			return nil, resumeAfterFailure(ctx, c, fmt.Errorf("clearing the daemon's pipeline: %w", err))
 		}
 		cur, err := c.Pipeline(ctx)
 		if err != nil {
-			_ = c.ResumeWorkers(ctx)
-			return nil, fmt.Errorf("reading the pipeline after clearing it: %w", err)
+			return nil, resumeAfterFailure(ctx, c, fmt.Errorf("reading the pipeline after clearing it: %w", err))
 		}
 		version = cur.Version
 	}
 	if _, err := c.ApplyPipeline(ctx, pipeline, bess.WithExpectedVersion(version)); err != nil {
-		_ = c.ResumeWorkers(ctx)
+		err = resumeAfterFailure(ctx, c, err)
 		// Force cleared the daemon's own pipeline, so a failure here leaves it
 		// with nothing at all: put back what was there before reporting it.
 		if len(previous.GetModules()) > 0 {
@@ -184,6 +183,35 @@ func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int,
 		return remove, fmt.Errorf("resuming workers: %w", err)
 	}
 	return remove, nil
+}
+
+// paused runs body with the daemon's workers paused. A resume that fails is
+// reported, because it leaves the daemon paused. A pause that fails is reported
+// too, but does not stop body: ApplyPipeline is safe with the workers running,
+// and leaving the daemon holding the bench graph, with the caller's own pipeline
+// gone, would be the worse outcome.
+func paused(ctx context.Context, pause, resume func(context.Context) error, body func() error) (err error) {
+	defer func() {
+		if rerr := resume(ctx); rerr != nil {
+			err = errors.Join(err, fmt.Errorf("resuming the workers: %w", rerr))
+		}
+	}()
+	pauseErr := pause(ctx)
+	err = body()
+	if pauseErr != nil {
+		err = errors.Join(fmt.Errorf("pausing the workers: %w", pauseErr), err)
+	}
+	return err
+}
+
+// resumeAfterFailure resumes the workers on an error path and returns err with
+// the resume's own failure folded in. The caller is already reporting err, and a
+// resume that also fails would otherwise leave the daemon paused silently.
+func resumeAfterFailure(ctx context.Context, c *bess.Client, err error) error {
+	if rerr := c.ResumeWorkers(ctx); rerr != nil {
+		return fmt.Errorf("%w (and resuming the workers failed too: %v)", err, rerr)
+	}
+	return err
 }
 
 // MatchModule is the name the bench graph gives its ExactMatch module, and so

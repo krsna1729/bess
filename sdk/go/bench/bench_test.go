@@ -166,6 +166,43 @@ func TestJoinCleanupKeepsBothErrors(t *testing.T) {
 	}
 }
 
+// stub is a pause or a resume that does nothing but report err.
+func stub(err error) func(context.Context) error {
+	return func(context.Context) error { return err }
+}
+
+// TestPausedReportsEveryFailure: the pause is where a daemon can be left paused,
+// so neither half may vanish. A failed pause must not stop the body, because the
+// body is what puts the caller's own pipeline back; a failed resume must reach
+// the caller, because nothing else would say the daemon is paused.
+func TestPausedReportsEveryFailure(t *testing.T) {
+	ctx := context.Background()
+	bodyErr := errors.New("the graph would not come off")
+	pauseErr := errors.New("no route to the daemon")
+	resumeErr := errors.New("the workers would not start")
+
+	ran := false
+	if got := paused(ctx, stub(nil), stub(nil), func() error { ran = true; return nil }); got != nil || !ran {
+		t.Errorf("a clean pause runs the body and adds nothing: %v (ran=%v)", got, ran)
+	}
+
+	ran = false
+	got := paused(ctx, stub(pauseErr), stub(nil), func() error { ran = true; return nil })
+	if !ran || !errors.Is(got, pauseErr) || !strings.Contains(got.Error(), "pausing the workers") {
+		t.Errorf("a failed pause runs the body and is reported: %v (ran=%v)", got, ran)
+	}
+
+	got = paused(ctx, stub(nil), stub(resumeErr), func() error { return nil })
+	if !errors.Is(got, resumeErr) || !strings.Contains(got.Error(), "resuming the workers") {
+		t.Errorf("a failed resume is the caller's only warning: %v", got)
+	}
+
+	got = paused(ctx, stub(pauseErr), stub(resumeErr), func() error { return bodyErr })
+	if !errors.Is(got, bodyErr) || !errors.Is(got, pauseErr) || !errors.Is(got, resumeErr) {
+		t.Errorf("every failure belongs in the error: %v", got)
+	}
+}
+
 func abs(d time.Duration) time.Duration {
 	if d < 0 {
 		return -d
