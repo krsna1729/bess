@@ -101,6 +101,174 @@ Roadmap §23.1 Gate C and Appendix J ("update-under-load matrix complete"). One 
 
 ---
 
+### The live API, measured (2026-10-16)
+
+Everything above is a bench binary calling the machinery in-process. The live
+path -- a client, gRPC, protobuf, the daemon's control thread -- is a different
+number, and it was measured on this host (20 lcores, `bessd 612cbff1`, `-m 0`
+so no hugepages) with `tests/perf/live_transaction_bench`, 512 sessions, three
+rounds:
+
+| measurement | result |
+|---|---|
+| transactions per second at a 10,000/s target | 6,337 / 5,548 / 6,204 |
+| the same at max | 5,927 / 5,267 / 6,404 |
+| latency at 1,000 / 10,000 transactions per second | p50 193-240 / 106-134 us; p99 908-958 us |
+| packet rate at 0 / 1,000 / 10,000 / max per second | 26.7 / 24.4 / 14.1 / 14.3 Mpps |
+
+Two facts follow. First, the live rate is wire-bound, not engine-bound: a
+transaction's p50 is about 110 us, so one synchronous client cannot ask for much
+more than 9,000/s, and the measured 6,300/s is that ceiling with the daemon's
+work on top. The 695K sessions/s of the row above is the same machinery with no
+wire in the path; the two numbers differ by the API, not by a 110x regression.
+Second, the packet-rate row above is not a cost of transactions: it is the
+control thread stealing a worker's core-see the next table. Re-run as a rate
+sweep with both placements (`--rates 0,1000,10000,max`, 512 sessions, 7 s a
+point, client on an E-core, `powersave`, a fresh daemon per arm):
+
+| churn target | 0 | 1,000/s | 10,000/s | max |
+|---|---|---|---|---|
+| Mpps, worker on the control CPU's SMT sibling | 27.56 | 25.92 | 22.35 (4,143 tx/s) | 22.32 (4,096 tx/s) |
+| Mpps, worker on its own physical core | 26.84 | 27.01 | 27.62 (4,592 tx/s) | 27.66 (4,588 tx/s) |
+| client p50 with separate cores | - | 230 us | 177 us | 178 us |
+
+With a core each, the packet path is flat to the client's own ceiling (about
+4,600 transactions/s) and the client's latency is better, so nothing is being
+traded. The "every transaction costs the datapath about 80 us" this section used
+to state (1,000/s -> -8%, 6,000/s -> -47%) was the co-located arm's shape; its
+corollary -- that the cost is a fixed price per publication rather than per rule
+rebuilt -- was measured under that placement and is withdrawn until re-measured.
+
+**And the cost is contention with the writer, not the engine.** Measured on a
+four-CPU confinement (`taskset -c 2-6`, worker on CPU 3, powersave), packets
+alone against packets plus a 10,000/s churn (5,620 transactions/s achieved),
+with user-space hardware counters on the daemon's whole process:
+
+| | packets only | plus churn | per packet |
+|---|---|---|---|
+| packet rate | 24.23 Mpps | 17.65 Mpps | -27% |
+| instructions | 61.10 G / 7.05 s | 53.39 G / 7.03 s | 358 -> 430 (+20%) |
+| cycles | 26.52 G | 36.14 G | 155 -> 291 (+88%) |
+| IPC | 2.30 | 1.48 | -36% |
+
+**That table is SMT co-location, not a memory effect.** The daemon placed the
+worker on CPU 3, the SMT sibling of its own control CPU 2, and said so
+(`worker 0: worker CPU 3 shares a physical core with control CPU 2`). The same
+two phases re-run with the two on different physical cores (`taskset -c 2,4`,
+worker CPU 4, client on an E-core, `powersave`, user-space counters on the
+daemon's process, 512 rules) remove the effect entirely:
+
+| | packets only | plus a 10,000/s churn |
+|---|---|---|
+| worker on the control CPU's SMT sibling | 27.19 Mpps | 21.39 Mpps (3,561 tx/s, p50 239 us) |
+| worker on a different physical core | 26.83 Mpps | 27.31 Mpps (4,117 tx/s, p50 202 us) |
+
+On separate cores the packet path does not move -- and the client's latency
+improves, so the comparison is not won by doing less work. The first table's IPC
+drop (2.58 to 1.83) is the worker sharing one core's issue slots and caches with
+a busy writer; on separate cores the daemon-wide IPC only falls 2.60 to 2.32,
+which is the control thread's own instructions being counted instead of
+displacing the worker's. (The counters cover the whole window, the packet rate
+only the client's run, so the first table's per-packet column is a ratio, not a
+measurement.) So the cost of a control-plane write on the datapath, on one
+worker, at a few thousand transactions a second, is below the noise floor once
+the writer has a core of its own; what is *not* measured is many workers reading
+one table while it is written, which is the case a partitioned layout would have
+to win. One loose end closed: the 80 us figure came from this same harness, placed the
+same way, so it is the co-located shape and not a property of transactions. One
+lesson: the daemon honoured the harness's explicit `--worker-core 3` -- D-123
+says an explicit core is the caller's to honour, never the placement's -- and
+warned about it; without an explicit core its SMT-striped order takes a free
+core's first thread (CPU 4 here), which `numa_placement_test.cc` pins
+(`StripedWholeCoresOnePerCore`, `ExplicitWorkerOnControlSiblingWarns`). So pass
+no core, or a first thread of a core the control CPU is not on.
+`omarchy-benchmark --cpu/--cores` offlines unused siblings by default
+(`--no-offline-siblings` keeps them) and adds a cgroup v2 isolated partition with
+`--isolate`; it is the tool that keeps this honest.
+
+### The live API's ceiling, and what it is not (2026-10-17, preliminary)
+
+`live_transaction_bench --clients N` opens N connections from one process, each
+with its own committer thread and its own slice of the rule space; the rate
+reported is the aggregate and the latency the pooled one. The per-rate detail
+line prints client CPU per transaction (the committer thread's own clock) and,
+with `--daemon-pid`, the daemon's process-wide CPU from `/proc/<pid>/stat`
+(utime+stime, which includes threads that have exited) minus its long-lived
+packet workers. Measured on this host (20 lcores, 10 physical cores,
+`powersave`, daemon confined to CPUs 2 and 4 -- control 2, worker 4 -- clients on
+every other CPU, 512 sessions a client, 5 s a point, `-m 0`):
+
+| clients | transactions/s | p50 | p99 | packet rate | client CPU/tx |
+|---|---|---|---|---|---|
+| 1 | 6,800 | 112 us | 308 us | 27.06 Mpps | 49 us |
+| 2 | 11,122 | 149 us | 340 us | 23.25 Mpps | 55 us |
+| 4 | 13,490 | 258 us | 536 us | 26.76 Mpps | 62 us |
+| 8 | 13,262 | 519 us | 1,363 us | 26.34 Mpps | 82 us |
+| 16 | 12,661 | 1,000 us | 4,267 us | 26.08 Mpps | 83 us |
+
+The daemon side, measured on the 4-client arm with the instrument above:
+**140.4 us of process CPU per transaction**, of which the packet worker's
+busy-poll is 1.00 core over the window -- so the control path alone is **66.9 us
+of CPU per transaction, about 0.9 core at 13,581 tx/s**. The aggregate stops at
+about 13,300/s and more clients then only inflate latency (16 clients: p50
+1,000 us, p99 4,267 us), while the packet path stays flat at 26-27 Mpps.
+
+**Reading:** at the plateau the control path is using about one core, and bessd
+in these runs had exactly one control CPU (it was pinned to CPUs 2 and 4). The
+plateau is therefore consistent with the control path being CPU-saturated --
+gRPC's sync-server pollers spin (they are part of that 0.9 core) and each
+transaction costs its protobuf decode, plan, apply and response -- and *not*
+with a serialized off-CPU wait. An earlier reading of this table said "neither
+side is CPU-bound" on the strength of per-thread `schedstat` sums; that sum
+undercounts (probed 2026-10-17: the process-wide `/proc/<pid>/stat` figure is
+about three times the sum of the live threads' deltas), so it is withdrawn, as
+is the "5.5 switches per transaction" that came with it (`/proc/<pid>/status`'s
+switch counters moved by 0 over a 5 s, 70K-transaction window: the pollers do
+not sleep). **Confounders in the table above:** the client's CPU set included
+CPUs 3 and 5, the HT siblings of the daemon's control CPU 2 and worker 4 (the
+2-client dip to 23.25 Mpps is plausibly that), and client CPU per transaction
+includes the synchronous gRPC completion-queue work done on the calling thread.
+
+**Next, in order.** (1) Re-run with the daemon free to use several control CPUs
+(`taskset -c 2,6,8,10`, worker 4): if the plateau scales, it was one core's worth
+of control work; if it does not move, the serialized resource is the
+control-plane lock (`api_v2.cc:686-731` holds it across the whole apply) or
+something under it. (2) A timer inside the handler split into lock wait / digest
+/ apply -- `/proc` cannot see a lock. (3) `--ops-per-tx K` batching, the lever
+that works either way, since a session change is one transaction by construction.
+`--attach --block-offset` (added 2026-10-17, **not yet exercised**) is there for
+the several-processes arm. Parked by decision 2026-10-17: the UPF comes first;
+this resumes after it.
+
+**Closing the churn question above** (the subsection before this one is a
+different measurement: the API's ceiling, not the datapath's cost of a write).
+The engine is innocent, and its own counters say so: 33,725 transactions applied
+with zero busy, zero conflict, zero rejected, zero pending cascades, and *one*
+RCU grace period for the whole run. The classifier's publication is correct by
+design (build a replacement generation, publish it, retire the old one against a
+grace period, never destroy a table on a worker) and a worker's per-publish work
+is a single read per batch.
+
+**What the fix direction actually is.** Not partitioning for its own sake.
+`update_scale_bench` E2 measures control-thread churn into one shared lock-free
+table against per-worker shards fed by per-owner op rings, and at 3 workers on
+distinct P-cores (control on its own core, powersave, 2 s a point) it is a wash
+at every rate that does not saturate -- 65K keys: 259.0 against 257.4 Mlookups/s
+at rest, 198.5 against 200.7 at 100k ops/s, 414.5 against 418.2 at 1M; 1M keys:
+165.6 against 186.8, 164.5 against 190.3, 153.6 against 160.6. At saturation the
+sharded arm trades the datapath for throughput (447.6 against 25.3 Mlookups/s
+with 8.4 against 79.4 Mops/s applied): the control thread applies directly into
+the shared table while the sharded workers apply their own rings. The win D-028
+recorded (3.4x) is a different case with a different writer: packet-path writers
+each learning their own flows, where one shared table serializes them on its
+lock (12 threads, 3% new flows: partitioned 6.5M inserts/s with 209M lookups/s
+against shared 1.9M and 62M; at 0.4% new flows the two are within 10%). So the
+property that pays is **the writer being the reader** -- an owner applying into
+its own table between batches -- and the layout matters where several writers
+contend. Batching transactions raises the control rate (one RPC and one commit
+for many changes) but does not change who writes, so it does not remove this
+cost.
+
 ## 5. Memory-at-Scale Matrix
 
 Roadmap §23.1 Gate D, §24 and Appendix J ("memory-at-scale matrix complete"). Bytes are as each record measured them (slab, EAL heap growth, or the structure's own storage; the cell says which where the record does). "[derived]" marks the one product computed here from recorded factors.

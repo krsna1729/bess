@@ -96,7 +96,14 @@ shows more), transactions/s achieved, client-side
 latency and the daemon's busy answers. Start bessd isolated on the worker core
 as for any benchmark, run the tool from another core (`--grpc-url`,
 `--worker-core`), and compare rates within one run (`--rounds` interleaves
-them).
+them). `--worker-core auto` lets the daemon place the worker (D-123 order: a
+free CPU, striped across the sockets). Before it measures, the tool prints the
+daemon's own placement line and warns for any worker the daemon reports on a
+shared physical core, on a control CPU, or off its memory node
+(`control_v2.WorkerPlacement`, the resolver's verdict read back through
+GetPipeline — the client derives no topology); `--allow-dirty-placement`
+silences the warning. Numbers taken while siblings compete measure contention,
+so treat a warned run as the caveat says.
 
 ## Flow-state tables
 
@@ -258,6 +265,18 @@ CI runs it report-only: the gcc lane, on pushes and the nightly run, runs one ro
 build (`ci_profile.py live-perf`) and uploads `live-perf.json` as the artifact `live-perf-<sha>`. A shared runner is
 not an isolated machine, and the lane is not a release build, so compare runs with each other, never with a local
 baseline; decisions still come from isolated paired runs.
+
+`live_perf` reports the same verdict itself before it measures: the daemon's placement line and a warning for any worker it reports
+on a shared physical core, on a control CPU, or off its memory node — once per distinct placement, since a round reuses the same
+cores for every test — and `--allow-dirty-placement` silences it. A warned run still measures; the numbers carry the caveat.
+`live_perf` and `update_scale_bench` keep their CPUs explicit — they pin their own threads and read perf counters — so their
+`--cpu`/`--cpus` stay one CPU per physical core; only `live_transaction_bench` places workers automatically (see above).
+`update_scale_bench` has no daemon to ask, so it reads the same resolver's topology (`bess::runtime::ReadTopology`,
+`core/runtime/numa_placement.h`) and warns the same way.
+
+A bench run with `LD_LIBRARY_PATH` naming a stage (`build/stage-<lane>/usr/local/lib`) loads the **staged** `libbess-sdk.so`, not
+the one in the build directory: after any change to the SDK's headers, re-install (`meson install -C build/<lane> --no-rebuild
+--destdir build/stage-<lane>`) or the bench runs an old SDK against new headers, which is a crash, not a mismatch it can report.
 
 Builds must be release builds with `NDEBUG` (`b_ndebug=if-release`): a tree configured with `b_ndebug=false`
 pays `_GLIBCXX_ASSERTIONS` everywhere (MODERNIZATION.md entry 148).
