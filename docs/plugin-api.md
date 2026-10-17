@@ -307,7 +307,7 @@ struct BessPluginDescriptor {
   `BESS_PLUGIN`; `sample_plugin`'s `SequentialUpdate` uses
   `BESS_PLUGIN_REQUIRES(..., BESS_CAP_INIT_CONTEXT)`.
 
-When `bessd` loads a plugin (`--modules` directory or `bessctl module load`) it
+When `bessd` loads a plugin (`--modules` directory or `bessctl plugin import`) it
 `dlopen`s it, looks up `bess_plugin_descriptor_v1`, and checks in this order:
 `abi_version` equals the daemon's, `api_min <= api_max`, the daemon's API
 version lies in the range, and every required capability is provided. A
@@ -324,7 +324,7 @@ test checks that `IncompatibleProbe` is absent after refusal). Any other
 side effect of a plugin's static initializers is the plugin's own to avoid:
 keep them free of effects, and do real setup in `Init()`. At daemon start a
 refusal is a warning and the daemon keeps running with the remaining plugins;
-`bessctl module load` returns a generic `Failed loading plugin` error and the
+`bessctl plugin import` returns a generic `Failed loading plugin` error and the
 reason is in the daemon log only.
 
 ### Runtime capabilities (`init_context()`)
@@ -541,7 +541,7 @@ Cross-module state in a pipeline (e.g. classification result $\to$ meter $\to$ r
    `bessd --modules=/usr/local/lib/bess/modules`
    Loads all `.so` modules found in the directory before starting listening for RPCs.
 2. **Runtime CLI command**:
-   `bessctl module load /path/to/my_module.so`
+   `bessctl plugin import /path/to/my_module.so`
 3. **Symbol resolution**: `bessd` is linked with `-rdynamic` (`export_dynamic: true` in Meson). Symbols defined in `libbess_framework`, `libbess_execution`, `libbess_eal`, and `libdpdk` are exported, allowing loaded modules to resolve runtime methods without duplicating engine code.
    A plugin never links the static archives of section 6: `bessd` already
    provides those symbols, and a second copy in the plugin would have state of

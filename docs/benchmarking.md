@@ -205,8 +205,11 @@ entries go in as one `PipelineBuilder` transaction, the same path a controller u
 - **M.gtpu_\* and M.urr_count\*, out-of-tree modules** (here the UPF plugin, krsna1729/upf `datapath/`):
   `--plugin DIR` appends `--modules=DIR` to the daemon command and enables them; without the flag they are
   skipped, so a lane without the plugin stays green. Each arm brings **its own control** (`M.gtpu_decap.base`,
-  `M.gtpu_encap.base`, `M.urr_count.base`), with a Bypass in the module's slot so the delta is the module
-  alone; read an arm and its control as a pair. The GTP-U pair's control is the shipping graph's own front and
+  `M.gtpu_encap.base`, `M.urr_count.base`, `M.gtpu_decap.qfi.base`), with a Bypass in the module's slot so the
+  delta is the module alone; read an arm and its control as a pair. The `M.gtpu_decap.qfi` pair carries the
+  container frame and a reader of both `upf_teid` and `qfi`, so it is the one whose chain walk runs:
+  (qfi - qfi.base) minus (decap - decap.base) is what the container adds to the decap. The GTP-U pair's control
+  is the shipping graph's own front and
   tail -- the TEID classifier and its rule, the ActionId write, the tunnel record, the reader that keeps the
   decap's attribute real -- and its frames are the UPF smoke test's (`deploy/smoke-gtpu.yaml`), byte for byte:
   the numbers describe the graph that ships. The `M.urr_count` pair's is the same chain with the module

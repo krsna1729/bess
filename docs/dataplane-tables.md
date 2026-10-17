@@ -33,10 +33,10 @@ stopping traffic.
    connected graph.
    `PauseAll()` stops workers but does not compute the layout. `ResumeAll()`
    invokes `SetupMetadata` before `resume_all_workers()` but does not pause
-   workers itself. `bessctl run file` calls `resume_all()` in its `finally`
-   block. Do not call `resume_all()` inside the script: that starts workers;
-   the wrapper then runs `SetupMetadata` again while they can be reading the
-   offsets, which are rewritten in place (D-032). Keep workers quiescent for
+   workers itself. In the v2 path a transaction pauses only where a converged
+   resource requires it (`requires_paused_workers`, control_plane.cc:1696) and
+   that pause is scoped to the operation, so nothing resumes behind a caller's
+   back. Keep workers quiescent for
    layout computation. Check `bess::metadata::IsValidOffset()` and drop or
    take a default path rather than reading byte 0; ActionTable, Meter and
    Router fail closed and report invalid offsets from `OnEvent(PreResume)`.
