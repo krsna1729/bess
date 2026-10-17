@@ -55,8 +55,7 @@ void BM_K38RangeLookupBatch(benchmark::State &state) {
 
   std::vector<PacketKey> keys(batch_size);
   for (size_t i = 0; i < batch_size; i++) {
-    // Alternating hit/miss, in both arms: with every key identical the
-    // compiler can fold a hand-written comparison out of the timed loop.
+    // Alternating hit/miss, in every arm: all three arms see one stream.
     keys[i].src_port = be16_t(i % 2 == 0 ? 1500 : 3000);
     keys[i].dst_port = be16_t(i % 2 == 0 ? 8500 : 9500);
   }
@@ -88,8 +87,7 @@ void BM_K38HandWrittenBatch(benchmark::State &state) {
 
   std::vector<PacketKey> keys(batch_size);
   for (size_t i = 0; i < batch_size; i++) {
-    // Alternating hit/miss, in both arms: with every key identical the
-    // compiler can fold a hand-written comparison out of the timed loop.
+    // Alternating hit/miss, in every arm: all three arms see one stream.
     keys[i].src_port = be16_t(i % 2 == 0 ? 1500 : 3000);
     keys[i].dst_port = be16_t(i % 2 == 0 ? 8500 : 9500);
   }
@@ -106,9 +104,8 @@ void BM_K38HandWrittenBatch(benchmark::State &state) {
       const PacketKey &k = keys[i];
       const uint16_t src = k.src_port.value();
       const uint16_t dst = k.dst_port.value();
-      // No barriers: the stream alternates hit/miss, so the comparison cannot
-      // be folded out of the loop, and per-key barriers would add reloads the
-      // typed arm (a call over raw bytes) does not pay.
+      // No per-key barriers: the stream varies, and both sides should pay the
+      // same shape of work.
       const bool match = k.src_ip == kSrcIp && k.dst_ip == kDstIp &&
                          src >= kSrcLow && src <= kSrcHigh && dst >= kDstLow &&
                          dst <= kDstHigh;
@@ -152,8 +149,7 @@ void BM_CartesianTernaryLookupBatch(benchmark::State &state) {
 
   std::vector<PacketKey> keys(batch_size);
   for (size_t i = 0; i < batch_size; i++) {
-    // Alternating hit/miss, in both arms: with every key identical the
-    // compiler can fold a hand-written comparison out of the timed loop.
+    // Alternating hit/miss, in every arm: all three arms see one stream.
     keys[i].src_port = be16_t(i % 2 == 0 ? 1500 : 3000);
     keys[i].dst_port = be16_t(i % 2 == 0 ? 8500 : 9500);
   }
