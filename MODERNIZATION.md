@@ -4725,7 +4725,8 @@ rather than one call site).
        runs them in the CI image. An outside review of `451ccd47` also found, and the tree
        confirmed: `Bridge` and `PacketStore` declared `kMaxWorkers` while mutating
        unsynchronised `std::unordered_map` / `std::map` state on the packet path (both now
-       `max_allowed_workers_ = 1`, which the module graph enforces as a fatal constraint);
+       `max_allowed_workers_ = 1`, which the module graph enforces as a fatal constraint; Bridge's pin stands, and
+       PacketStore's was lifted on 2026-10-17 when it became single-owner - D-129 amendment);
        and `docs/performance-contract.md` stated cache-line counts as global invariants
        (rewritten as kernel-specific targets).
      - **Own mistake:** the GCC 14 pin was mine and caused the red release job; the earlier

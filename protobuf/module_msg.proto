@@ -1400,6 +1400,19 @@ message BridgeStaticValue {
  * enqueuing up to `max_packets` total and `max_packets_per_flow` per flow.
  * Packets are released on demand via `release(id)` or evicted on timeout/overflow.
  *
+ * The store is owned by the module's own task, so any worker may feed it and
+ * the three commands below are accepted while the dataplane runs: with a worker
+ * running they take effect on the owner's next task run, in the order they were
+ * sent, and a client reads the result back (a gate, a count, or the module's
+ * description). They never fail with ENOENT - a flow that holds nothing is a
+ * no-op - and a full request ring is ENOSPC, which may be retried. The memory
+ * bound is `max_packets` stored, plus the ingress ring's in-flight packets
+ * (4095; when the ring is full they are freed, and
+ * bess_packet_store_ingress_dropped_packets_total counts them), plus the
+ * packets a release has queued for the owner to emit. Erasing a
+ * "<module>/flows" entry leaves that flow's packets in the store: `drop` is the
+ * action that frees them.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 2 (0: released, 1: expired/evicted)
  */
@@ -1410,6 +1423,21 @@ message PacketStoreArg {
   repeated string key_attrs = 4;    /// The metadata attributes that may carry the flow ID,
                                     /// in priority order: the first one this graph provides
                                     /// is the key. Default: store_id, then vif_id.
+}
+
+/// The per-flow limits of the "<module>/flows" resource (D-129): a flow's own
+/// numbers, set inside the session's transaction. An entry with neither field
+/// set, or no entry at all, leaves PacketStoreArg's module-wide numbers in
+/// force; a timeout_ns of 0 (present) means this flow's packets never expire,
+/// and max_packets_per_flow of 0 (present) means the module-wide per-flow
+/// default. The module-wide max_packets stays the outer bound for every flow.
+message PacketStoreFlowKey {
+  uint32 id = 1;                    /// Flow/session ID (the key_attrs value)
+}
+
+message PacketStoreFlowValue {
+  optional uint64 timeout_ns = 1;           /// 0 = no expiry; absent = PacketStoreArg.timeout_ms
+  optional uint32 max_packets_per_flow = 2; /// 0 = PacketStoreArg.max_packets_per_flow
 }
 
 message PacketStoreCommandReleaseArg {

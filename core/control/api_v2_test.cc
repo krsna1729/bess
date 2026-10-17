@@ -789,13 +789,16 @@ TEST_F(ApiV2ServiceTest, ThreadUnsafeActionWaitsForPausedWorkers) {
   q->set_name("q");
   q->set_mclass("Queue");
   ASSERT_TRUE(q->mutable_arg()->PackFrom(bess::pb::QueueArg()));
-  auto *ps = p.add_modules();
-  ps->set_name("ps");
-  ps->set_mclass("PacketStore");
-  ASSERT_TRUE(ps->mutable_arg()->PackFrom(bess::pb::PacketStoreArg()));
+  // Bridge's `flush` is the tree's remaining thread-unsafe action (PacketStore's
+  // three are THREAD_SAFE since the D-129 amendment), and the Queue's task on
+  // worker 0 puts a running worker in its path.
+  auto *br = p.add_modules();
+  br->set_name("br");
+  br->set_mclass("Bridge");
+  ASSERT_TRUE(br->mutable_arg()->PackFrom(bess::pb::BridgeArg()));
   auto *c = p.add_connections();
   c->set_upstream("q");
-  c->set_downstream("ps");
+  c->set_downstream("br");
   auto *t = p.add_tasks();
   t->set_module("q");
   t->set_wid(0);
@@ -809,13 +812,13 @@ TEST_F(ApiV2ServiceTest, ThreadUnsafeActionWaitsForPausedWorkers) {
     ASSERT_TRUE(status.ok()) << status.error_message();
   }
 
-  auto clear = [&](v2::ErrorDetail *detail) {
+  auto flush = [&](v2::ErrorDetail *detail) {
     grpc::ClientContext ctx;
     v2::InvokeActionRequest req;
     req.set_daemon_epoch(Epoch());
-    req.set_module("ps");
-    req.set_action("clear");
-    EXPECT_TRUE(req.mutable_arg()->PackFrom(bess::pb::PacketStoreCommandClearArg()));
+    req.set_module("br");
+    req.set_action("flush");
+    EXPECT_TRUE(req.mutable_arg()->PackFrom(bess::pb::EmptyArg()));
     v2::InvokeActionResponse resp;
     const grpc::StatusCode code = stub_->InvokeAction(&ctx, req, &resp).error_code();
     *detail = DetailOf(ctx);
@@ -823,11 +826,11 @@ TEST_F(ApiV2ServiceTest, ThreadUnsafeActionWaitsForPausedWorkers) {
   };
   v2::ErrorDetail detail;
   ASSERT_TRUE(control_plane_->ResumeAll());
-  EXPECT_NE(grpc::StatusCode::OK, clear(&detail)) << "ran beside the running worker";
+  EXPECT_NE(grpc::StatusCode::OK, flush(&detail)) << "ran beside the running worker";
   EXPECT_EQ(EBUSY, detail.errno_value());
   EXPECT_EQ(v2::ErrorDetail::RESOURCE_BUSY, detail.code());
   ASSERT_TRUE(control_plane_->PauseAll());
-  EXPECT_EQ(grpc::StatusCode::OK, clear(&detail)) << detail.message();
+  EXPECT_EQ(grpc::StatusCode::OK, flush(&detail)) << detail.message();
 }
 
 // A resource that changes only with its workers paused (Queue's settings):

@@ -5715,7 +5715,8 @@ Source: an external UPF (OMEC) gap analysis against `develop` at `451ccd47`, re-
 of success: how much generic dataplane infrastructure an OMEC-style UPF can delete, so that it carries only PFCP and
 GTP semantics. Several of its gaps have closed since: the Go control SDK (M27.1), Bridge's unsynchronised FDB (now
 `PackedMacTable` with one writer, D-073), the thin `rte_flow` owner instead of a second flow language (D-070), and
-PacketStore's data race (pinned to one worker). The rest are adopted below. None defines PFCP, URR, QER or DDN
+PacketStore's data race (pinned to one worker at the time of this analysis; now concurrent - one owner, its `flows`
+table live, D-129 amendment). The rest are adopted below. None defines PFCP, URR, QER or DDN
 semantics; each is a generic mechanism a UPF composes. Order: after M23 (no new major abstraction before it), in
 the order listed.
 

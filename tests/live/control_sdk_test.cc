@@ -410,6 +410,8 @@ std::vector<ModuleSample> EveryResourceSample() {
                              "route_domain": 7, "gate": 1})"}}}}},
       {"arp", "ArpResponder", "", false,
        {{"entries", {{R"({"ip": "1.2.3.4"})", R"({"mac_addr": "a0:22:33:44:55:66"})"}}}}},
+      {"ps", "PacketStore", R"({"max_packets": 64, "max_packets_per_flow": 4})", true,
+       {{"flows", {{R"({"id": 1})", R"({"timeout_ns": 1000000, "max_packets_per_flow": 4})"}}}}},
   };
 }
 

@@ -9672,8 +9672,8 @@ changed), `ARefusedResourceRollsBackTheTopology` (field `resources`, the new mod
 `EveryDeclaredResourceReadsBackAsANoOp` (one module of every class with resources, defaults read back and applied:
 0 ops, every declared table listed); `control_api_v2_test` `InvokeAction` (epoch refused before running; a result;
 no result; unknown module, unknown action, a legacy-only command refused with nothing changed while the legacy path
-runs it; an action's own `EINVAL`), `ThreadUnsafeActionWaitsForPausedWorkers` (PacketStore `clear` behind a Queue task:
-busy, then run when paused), `PausedOnlyResourceIsBusyWhileWorkersRun` (Queue settings: `ApplyTransaction`
+runs it; an action's own `EINVAL`), `ThreadUnsafeActionWaitsForPausedWorkers` (Bridge `flush` behind a Queue task:
+busy, then run when paused - it used PacketStore's `clear` until that became THREAD_SAFE, D-129 amendment), `PausedOnlyResourceIsBusyWhileWorkersRun` (Queue settings: `ApplyTransaction`
 `FAILED_PRECONDITION`/`RESOURCE_BUSY`, then `ApplyPipeline` listing it pauses and applies, read back without a key),
 `SchemaNamesEveryArgumentTypeAndCarriesItsDescriptors` (every action's and table's types resolve; ExactMatch lists no
 action and its two tables; L2Forward's actions are `lookup`, `populate`); `control_dataplane_transactions_test`
@@ -9701,6 +9701,30 @@ pipeline_spec,pipeline_validator,pipeline_diff,pipeline_plan,pipeline_resources,
 the modules in the table and their tests; `core/testing/module_harness`; `sdk/cpp`, `sdk/go`,
 `sdk/conformance/cases.json`; `bessctl/{main,manifest}`; `tests/live`; `sample_plugin`, `examples/appliances`;
 `docs/{control-sdk,plugin-api,limits}.md`.
+
+**Amendment (2026-10-17): PacketStore is concurrent; its `flows` table no longer needs a pause.** The module was the
+tree's most pause-prone: every command and the `flows` table needed paused workers, because one `std::map`/
+`std::deque` store served every worker (the old pin refused any pipeline with more than one worker). The user asked
+for it to be concurrent ("keep it simple for now with C and control as the owner"). Now the module has one owner, its
+own task: a packet on any other worker's input goes over an MPSC ingress ring - whose elements carry the flow id the
+*feeder* read, so a pause that reassigns metadata offsets cannot change which flow a handed-over packet belongs to -
+to the owner, which stores it in its own run. The verbs (`release`, `drop`, `clear`) and the `flows` table are
+applied by the owner from an SPSC request ring, or directly by the caller when no worker runs at all and nothing is
+in flight. No command returns `EBUSY`, the `flows` table no longer needs a pause, and `release`/`drop`/`clear` no
+longer return `ENOENT` for a flow that holds nothing (only `ENOSPC` is left: a full request ring). The per-flow cap
+is exact again (one store), and the limits table is published by RCU - a reader's `shared_ptr` keeps the old table
+alive - so a table read never races the owner. Client-visible: an erase of a flow no longer frees its packets
+(`drop` does); a command is accepted, not completed - the owner applies it once every packet that was in the ring
+before it is stored (at most `kIngressPerRun` a run, so it can take more than one run under load) - and packets are
+stored when the module's own task runs. Two counters, because the two losses differ:
+`bess_packet_store_dropped_packets_total` is what `drop` freed, and
+`bess_packet_store_ingress_dropped_packets_total` is what a full ingress ring refused (a freed packet, not a gate-1
+eviction: downstream runs on the owner's worker only). Evidence: 20 tests in `core/modules/packet_store_test.cc`,
+including a release that waits for 2048 packets still on the ring (the test fails against a per-run drain) and a
+two-operation transaction publishing both entries; live, a daemon with a two-worker
+`source -> rewrite -> packet_store` graph - `drop` moved `bess_packet_store_dropped_packets_total` 0 -> 64 while both
+workers ran, `release` moved the store's gate 0 from 0 to 64, an erase applied with `0 operation(s)` and read back as
+`[]`, and `ps/flows` was listed without the paused flag while `rewrite0/templates` still carries it.
 
 ## D-124 WildcardMatch: fixed-width masking for every key width; shared-layout grouping and mode W not adopted
 
