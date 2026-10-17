@@ -5,6 +5,7 @@
 #ifndef BESS_MODULES_DRR_H_
 #define BESS_MODULES_DRR_H_
 
+#include <array>
 #include <atomic>
 #include <cstdlib>
 
@@ -15,6 +16,7 @@
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "pktbatch.h"
+#include "stats/metric_registry.h"
 #include "utils/cuckoo_map.h"
 #include "utils/ip.h"
 
@@ -280,6 +282,14 @@ class DRR final : public Module {
 #ifndef NDEBUG
   std::atomic<bool> draining_{false};
 #endif
+
+  // Runs of the module's task, per worker, for ListMetrics. A task is placed on
+  // one worker, so a second worker's count growing means the task is reachable
+  // from two schedulers at once -- the state the D-019 invariant above
+  // describes, which a release build (no assertion) can otherwise not see. Read
+  // by the metric below, which is declared after it.
+  std::array<uint64_t, bess::dataplane::kMaxWorkers> task_runs_{};
+  bess::stats::MetricSource task_runs_metric_;
 
   struct Settings {
     uint32_t quantum;

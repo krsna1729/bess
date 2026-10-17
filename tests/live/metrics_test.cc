@@ -14,7 +14,9 @@
 
 namespace {
 
+using bess::live::AllowedCores;
 using bess::live::LiveTest;
+using bess::live::OnWorker;
 using bess::live::Types;
 namespace v2 = bess::pb::v2;
 
@@ -134,6 +136,65 @@ TEST_F(MetricsTest, GateCountersCountWhatCrossed) {
   for (size_t i = 1; i < samples.size(); i++) {
     EXPECT_LE(samples[i - 1].name(), samples[i].name()) << "sorted by name";
   }
+}
+
+// A module's task is placed on one worker. Moving it while traffic runs moves
+// the runs with it: the worker it left stops counting and the worker it went to
+// starts. A task reachable from two schedulers at once -- the state the D-019
+// invariant in drr.h describes, which is what makes its ingress ring hand out a
+// slot nobody wrote -- would leave the old worker's count growing.
+TEST_F(MetricsTest, TaskRunsFollowThePlacement) {
+  if (AllowedCores().size() < 2) {
+    GTEST_SKIP() << "moving a task needs two allowed CPUs";
+  }
+  Types types(client());
+  auto src_arg = types.Make("bess.pb.SourceArg", R"({"pkt_size": 60})");
+  auto drr_arg = types.Make("bess.pb.DRRArg", R"({"num_flows": 1024})");
+
+  const auto pipeline_on = [&](int wid) {
+    return bess::sdk::PipelineBuilder()
+        .Worker(0, AllowedCores().at(0), "")
+        .Worker(1, AllowedCores().at(1), "")
+        .Module("src", "Source", src_arg.get())
+        .Module("drr", "DRR", drr_arg.get())
+        .Module("sink", "Sink", nullptr)
+        .Chain({"src", "drr", "sink"})
+        .Task(OnWorker("src", 0))
+        .Task(OnWorker("drr", wid))
+        .Build();
+  };
+
+  auto first = pipeline_on(0);
+  ASSERT_TRUE(first) << first.error().message;
+  auto applied = client().ApplyPipeline(*first);
+  ASSERT_TRUE(applied) << applied.error().message;
+  ASSERT_TRUE(client().ResumeWorkers());
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  ASSERT_TRUE(client().PauseWorkers());
+
+  const auto before = Value(Metrics(), "bess_drr_task_runs_total", {{"worker", "0"}});
+  ASSERT_TRUE(before) << "the DRR's task ran on worker 0";
+  EXPECT_GT(before.value_or(-1), 0);
+
+  // The same graph with the task on the other worker: a placement, applied
+  // while traffic runs.
+  auto second = pipeline_on(1);
+  ASSERT_TRUE(second) << second.error().message;
+  applied = client().ApplyPipeline(*second);
+  ASSERT_TRUE(applied) << applied.error().message;
+  ASSERT_TRUE(client().ResumeWorkers());
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  ASSERT_TRUE(client().PauseWorkers());
+
+  const auto samples = Metrics();
+  const auto moved = Value(samples, "bess_drr_task_runs_total", {{"worker", "1"}});
+  ASSERT_TRUE(moved) << "the DRR's task did not run on worker 1 after the move";
+  EXPECT_GT(moved.value_or(-1), 0);
+  const auto after0 = Value(samples, "bess_drr_task_runs_total", {{"worker", "0"}});
+  ASSERT_TRUE(after0) << "the worker-0 series went away";
+  EXPECT_EQ(before.value_or(-1), after0.value_or(-2))
+      << "the worker the task left kept running it";
+  EXPECT_TRUE(daemon().Alive());
 }
 
 }  // namespace

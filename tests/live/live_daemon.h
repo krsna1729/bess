@@ -15,6 +15,7 @@
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/dynamic_message.h>
 #include <gtest/gtest.h>
+#include <sched.h>
 
 #include <chrono>
 #include <memory>
@@ -92,6 +93,14 @@ std::string Env(const char *name);
 std::string SourcePath(std::string_view relative);
 // A TCP port on loopback nothing listens on now.
 int FreePort();
+
+// The CPUs this process (and any daemon it started) may run on: a worker's
+// core must be one of them.
+std::vector<int> AllowedCores();
+
+// A task placement on worker `wid` with no parent: desired state names the
+// module and the worker, and the module's own leaf class follows.
+bess::pb::v2::TaskPlacement OnWorker(const std::string &module, int wid);
 
 class Daemon {
  public:

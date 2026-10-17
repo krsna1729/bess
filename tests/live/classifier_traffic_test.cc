@@ -29,7 +29,9 @@ namespace {
 
 namespace v2 = bess::pb::v2;
 namespace gp = google::protobuf;
+using bess::live::AllowedCores;
 using bess::live::LiveTest;
+using bess::live::OnWorker;
 using bess::live::Types;
 using bess::sdk::PipelineBuilder;
 using bess::testing::Bytes;
@@ -56,28 +58,6 @@ std::string Base64(const Bytes &data) {
     out += i + 2 < data.size() ? kAlphabet[n & 63] : '=';
   }
   return out;
-}
-
-// The CPUs this process (and the daemon it started) may run on.
-std::vector<int> AllowedCores() {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  std::vector<int> cores;
-  if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-    for (int c = 0; c < CPU_SETSIZE; c++) {
-      if (CPU_ISSET(c, &set)) {
-        cores.push_back(c);
-      }
-    }
-  }
-  return cores;
-}
-
-v2::TaskPlacement OnWorker(const std::string &module, int wid) {
-  v2::TaskPlacement t;
-  t.set_module(module);
-  t.set_wid(wid);
-  return t;
 }
 
 v2::TaskPlacement UnderClass(const std::string &module, const std::string &parent) {

@@ -57,6 +57,27 @@ std::string Env(const char *name) {
   return v;
 }
 
+std::vector<int> AllowedCores() {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  std::vector<int> cores;
+  if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+    for (int c = 0; c < CPU_SETSIZE; c++) {
+      if (CPU_ISSET(c, &set)) {
+        cores.push_back(c);
+      }
+    }
+  }
+  return cores;
+}
+
+bess::pb::v2::TaskPlacement OnWorker(const std::string &module, int wid) {
+  bess::pb::v2::TaskPlacement t;
+  t.set_module(module);
+  t.set_wid(wid);
+  return t;
+}
+
 int FreePort() {
   const int fd = socket(AF_INET, SOCK_STREAM, 0);
   sockaddr_in addr{};

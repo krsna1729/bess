@@ -181,10 +181,26 @@ CommandResponse DRR::Init(const bess::pb::DRRArg &arg) {
   if (!registered) {
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
+
+  // The task's runs by worker (drr.h): ListMetrics reads it, and the live test
+  // that moves the task between workers asserts the old worker's count stops.
+  task_runs_metric_ = init_context().metrics().Register(
+      [this](bess::stats::MetricWriter &writer) {
+        for (size_t wid = 0; wid < task_runs_.size(); wid++) {
+          if (task_runs_[wid] == 0) {
+            continue;  // a worker that never ran the task is not a series
+          }
+          writer.Counter("bess_drr_task_runs_total",
+                         "Runs of the module's task, by the worker that ran it",
+                         static_cast<double>(task_runs_[wid]),
+                         {{"worker", std::to_string(wid)}});
+        }
+      });
   return CommandSuccess();
 }
 
 void DRR::DeInit() {
+  task_runs_metric_.Reset();
   settings_.Release();
 }
 
@@ -277,6 +293,7 @@ void DRR::Classify(bess::PacketHandle handle) {
 
 struct task_result DRR::RunTask(Context *ctx, bess::PacketBatch *batch,
                                 void *) {
+  task_runs_[ctx->wid.value()]++;
   if (children_overload_ > 0) {
     return {
         .block = true, .packets = 0, .bits = 0,
