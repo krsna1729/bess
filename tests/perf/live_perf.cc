@@ -537,6 +537,40 @@ std::vector<std::string> MGtpuEncapControl(Build &b) {
   return MBase(b, {{"md", 1}, {"bp", 1}, {"mt", 1}}, InnerFrame());
 }
 
+// SetMetadata writes the PDR rule's ActionId (D-141) and a reader keeps the
+// attribute real: what the counting module reads, and what its control arm
+// shares.
+void MUrrCountFront(Build &b) {
+  b.Mod("SetMetadata", "md",
+        R"({"attrs": [{"name": "action_id", "size": "4", "value_int": "1"}]})");
+  b.Mod("MetadataTest", "mt", R"({"read": {"action_id": 4}})");
+}
+
+// Source -> SetMetadata(action_id 1) -> UrrCount -> reader -> Sink, with an
+// entry for the rule the module counts: the chain the compiler writes a charged
+// session into. M.urr_count.empty is the module present with no entry, which is
+// what a graph whose sessions do not all charge pays -- the early-out the design
+// prices at one lookup (docs/design.md, "Per feature, per packet"). Its control
+// arm is the same chain with Bypass in the module's slot.
+std::vector<std::string> MUrrCount(Build &b) {
+  MUrrCountFront(b);
+  b.Mod("UrrCount", "cnt", R"({"capacity": 65536})");
+  b.Entry("cnt/counters", "upf.pb.CounterKey", R"({"action_id": 1})",
+          "upf.pb.CounterEntry", R"({})");
+  return MBase(b, {{"md", 1}, {"cnt", 1}, {"mt", 1}}, InnerFrame());
+}
+
+std::vector<std::string> MUrrCountEmpty(Build &b) {
+  MUrrCountFront(b);
+  b.Mod("UrrCount", "cnt", R"({"capacity": 65536})");
+  return MBase(b, {{"md", 1}, {"cnt", 1}, {"mt", 1}}, InnerFrame());
+}
+
+std::vector<std::string> MUrrCountControl(Build &b) {
+  MUrrCountFront(b);
+  return MBase(b, {{"md", 1}, {"bp", 1}, {"mt", 1}}, InnerFrame());
+}
+
 std::vector<Test> Catalogue() {
   const auto m = [](const std::string &mclass, const std::string &name, const std::string &arg,
                     int gates) -> Builder {
@@ -619,6 +653,9 @@ std::vector<Test> Catalogue() {
       {"M.gtpu_decap", 'M', MGtpuDecap},
       {"M.gtpu_encap.base", 'M', MGtpuEncapControl},
       {"M.gtpu_encap", 'M', MGtpuEncap},
+      {"M.urr_count.base", 'M', MUrrCountControl},
+      {"M.urr_count", 'M', MUrrCount},
+      {"M.urr_count.empty", 'M', MUrrCountEmpty},
   };
 }
 
