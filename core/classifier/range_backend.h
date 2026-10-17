@@ -171,11 +171,71 @@ class RangeClassifier {
                      });
   }
 
+  // The mask compare is word-wise here, and the port checks repeat the
+  // reference's: the reference stays byte-at-a-time because it is the
+  // differential oracle, so the two implementations must stay separate. The
+  // byte loop dominated the lookup (K3.8's bench measured 2.1x a hand-written
+  // scalar arm), and a mask is an unaligned byte string, so the words are read
+  // with memcpy.
+  [[nodiscard]] static bool MatchFast(
+      const typename ScalarRangeBackend<Result, Priority>::RuleEntry &rule,
+      const std::byte *key, size_t key_size) noexcept {
+    const size_t check_len = std::min(rule.mask.size(), key_size);
+    size_t i = 0;
+    for (; i + sizeof(uint64_t) <= check_len; i += sizeof(uint64_t)) {
+      uint64_t k, m, v;
+      std::memcpy(&k, key + i, sizeof(uint64_t));
+      std::memcpy(&m, rule.mask.data() + i, sizeof(uint64_t));
+      std::memcpy(&v, rule.value.data() + i, sizeof(uint64_t));
+      if ((k & m) != v) {
+        return false;
+      }
+    }
+    for (; i < check_len; i++) {
+      if ((key[i] & rule.mask[i]) != rule.value[i]) {
+        return false;
+      }
+    }
+
+    if (!rule.src_range.IsWildcard() &&
+        rule.src_port_offset + sizeof(uint16_t) <= key_size) {
+      bess::utils::be16_t be_port;
+      std::memcpy(&be_port, key + rule.src_port_offset, sizeof(uint16_t));
+      if (!rule.src_range.Contains(be_port.value())) {
+        return false;
+      }
+    }
+
+    if (!rule.dst_range.IsWildcard() &&
+        rule.dst_port_offset + sizeof(uint16_t) <= key_size) {
+      bess::utils::be16_t be_port;
+      std::memcpy(&be_port, key + rule.dst_port_offset, sizeof(uint16_t));
+      if (!rule.dst_range.Contains(be_port.value())) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
   // Lookup a batch of packets. Guarantees 100% equivalence to the scalar reference.
   [[nodiscard]] uint64_t LookupBatch(ConstBytes keys, size_t key_stride,
                                      size_t key_size,
                                      std::span<Result> results) const noexcept {
-    return reference_.LookupBatch(keys, key_stride, key_size, results);
+    const size_t count = std::min(results.size(), size_t{64});
+    uint64_t hit_mask = 0;
+
+    for (size_t i = 0; i < count; i++) {
+      const std::byte *key = keys.data() + i * key_stride;
+      for (const auto &rule : rules_) {
+        if (MatchFast(rule, key, key_size)) {
+          results[i] = rule.result;
+          hit_mask |= (uint64_t{1} << i);
+          break;
+        }
+      }
+    }
+    return hit_mask;
   }
 
   [[nodiscard]] const ScalarRangeBackend<Result, Priority> &reference() const noexcept {
