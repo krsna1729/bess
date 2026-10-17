@@ -530,6 +530,7 @@ ControlResult<void> Transaction::ExecuteCommitOp(const PlanOperation &op) {
       return std::unexpected(result.error());
     }
     Undo undo{Undo::Kind::kRestorePlacement, {}, {}, -1, {}};
+    undo.name = "task placement";
     undo.placements = std::move(previous);
     undo_.push_back(std::move(undo));
     ops_executed_++;

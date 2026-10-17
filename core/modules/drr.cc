@@ -30,6 +30,9 @@ namespace {
 // Decision D-019 (docs/decisions.md).
 const unsigned kIngressRingFlags = RING_F_SC_DEQ;
 
+// The one counter in DRR's task_runs_ set (drr.h): the module's task runs.
+constexpr size_t kTaskRuns = 0;
+
 // A handover invariant, checked in debug builds only: a packet handed to the
 // module, or drained from the ingress ring, satisfies the field invariants
 // every live mbuf has (a buffer address, at least one segment, the head's data
@@ -186,14 +189,17 @@ CommandResponse DRR::Init(const bess::pb::DRRArg &arg) {
   // that moves the task between workers asserts the old worker's count stops.
   task_runs_metric_ = init_context().metrics().Register(
       [this](bess::stats::MetricWriter &writer) {
-        for (size_t wid = 0; wid < task_runs_.size(); wid++) {
-          if (task_runs_[wid] == 0) {
+        const bess::stats::CounterSnapshot snap = task_runs_.Snapshot(true);
+        for (size_t wid = 0; wid < bess::dataplane::kMaxWorkers; wid++) {
+          const uint64_t runs = snap.PerWorker(
+              bess::dataplane::WorkerId(static_cast<uint16_t>(wid)), kTaskRuns);
+          if (runs == 0) {
             continue;  // a worker that never ran the task is not a series
           }
           writer.Counter("bess_drr_task_runs_total",
                          "Runs of the module's task, by the worker that ran it",
-                         static_cast<double>(task_runs_[wid]),
-                         {{"worker", std::to_string(wid)}});
+                         static_cast<double>(runs),
+                         {{"module", name()}, {"worker", std::to_string(wid)}});
         }
       });
   return CommandSuccess();
@@ -293,7 +299,7 @@ void DRR::Classify(bess::PacketHandle handle) {
 
 struct task_result DRR::RunTask(Context *ctx, bess::PacketBatch *batch,
                                 void *) {
-  task_runs_[ctx->wid.value()]++;
+  task_runs_.ForWorker(ctx->wid).Add(kTaskRuns, 1);
   if (children_overload_ > 0) {
     return {
         .block = true, .packets = 0, .bits = 0,

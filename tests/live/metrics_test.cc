@@ -172,12 +172,17 @@ TEST_F(MetricsTest, TaskRunsFollowThePlacement) {
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   ASSERT_TRUE(client().PauseWorkers());
 
-  const auto before = Value(Metrics(), "bess_drr_task_runs_total", {{"worker", "0"}});
+  const auto before = Value(Metrics(), "bess_drr_task_runs_total",
+                            {{"module", "drr"}, {"worker", "0"}});
   ASSERT_TRUE(before) << "the DRR's task ran on worker 0";
   EXPECT_GT(before.value_or(-1), 0);
 
-  // The same graph with the task on the other worker: a placement, applied
-  // while traffic runs.
+  // The same graph with the task on the other worker. The workers are resumed
+  // first, so ApplyPipeline has to quiesce running workers itself -- the path
+  // where a placement and an orphan attach meet -- rather than being handed a
+  // paused dataplane. A CounterSet is what makes the read above safe while
+  // they run.
+  ASSERT_TRUE(client().ResumeWorkers());
   auto second = pipeline_on(1);
   ASSERT_TRUE(second) << second.error().message;
   applied = client().ApplyPipeline(*second);
@@ -186,13 +191,21 @@ TEST_F(MetricsTest, TaskRunsFollowThePlacement) {
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   ASSERT_TRUE(client().PauseWorkers());
 
-  const auto samples = Metrics();
-  const auto moved = Value(samples, "bess_drr_task_runs_total", {{"worker", "1"}});
+  const auto settled = Value(Metrics(), "bess_drr_task_runs_total",
+                             {{"module", "drr"}, {"worker", "0"}});
+  ASSERT_TRUE(settled) << "the worker-0 series went away";
+  const auto moved = Value(Metrics(), "bess_drr_task_runs_total",
+                           {{"module", "drr"}, {"worker", "1"}});
   ASSERT_TRUE(moved) << "the DRR's task did not run on worker 1 after the move";
   EXPECT_GT(moved.value_or(-1), 0);
-  const auto after0 = Value(samples, "bess_drr_task_runs_total", {{"worker", "0"}});
-  ASSERT_TRUE(after0) << "the worker-0 series went away";
-  EXPECT_EQ(before.value_or(-1), after0.value_or(-2))
+
+  // The task is worker 1's now, so more traffic must not move worker 0's count.
+  ASSERT_TRUE(client().ResumeWorkers());
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  ASSERT_TRUE(client().PauseWorkers());
+  const auto after0 = Value(Metrics(), "bess_drr_task_runs_total",
+                            {{"module", "drr"}, {"worker", "0"}});
+  EXPECT_EQ(settled.value_or(-1), after0.value_or(-2))
       << "the worker the task left kept running it";
   EXPECT_TRUE(daemon().Alive());
 }

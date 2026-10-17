@@ -16,6 +16,7 @@
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "pktbatch.h"
+#include "stats/counter_set.h"
 #include "stats/metric_registry.h"
 #include "utils/cuckoo_map.h"
 #include "utils/ip.h"
@@ -288,7 +289,11 @@ class DRR final : public Module {
   // from two schedulers at once -- the state the D-019 invariant above
   // describes, which a release build (no assertion) can otherwise not see. Read
   // by the metric below, which is declared after it.
-  std::array<uint64_t, bess::dataplane::kMaxWorkers> task_runs_{};
+  //
+  // A CounterSet (K6), not a plain array: the metric reads it on the control
+  // thread while workers increment it, and CounterSet is the type that makes
+  // that read safe (worker-local cells, a snapshot for the reader).
+  bess::stats::CounterSet task_runs_{{"runs"}};
   bess::stats::MetricSource task_runs_metric_;
 
   struct Settings {
