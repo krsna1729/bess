@@ -1,20 +1,27 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-// The wrapper translation unit for docs/assembly-shape.md (roadmap Appendix J:
+// The assembly-shape probe for docs/assembly-shape.md (roadmap Appendix J:
 // "assembly review complete for critical kernels").
 //
-// Every kernel in core/arch is `inline` in a header, so no archive carries a
-// symbol to disassemble. This unit calls each one behind a `noinline` wrapper
-// and is compiled by hand with the release flags, which makes each kernel's own
-// body appear under the wrapper's symbol:
+// Every kernel in arch/ is `inline` in a header, so no archive carries a symbol
+// to disassemble. This unit calls each one behind a `noinline` wrapper, and
+// Meson builds it as bess_arch_asm_shape (nothing links or installs it), so
+// every lane compiles the probe with the real flags. Read the assembly from the
+// built archive:
 //
-//   g++ -O3 -march=x86-64-v3 -DNDEBUG -std=c++23 -I core -S -o /tmp/asm_shape.s \
-//       tools/asm_shape.cc
-//   awk '/^[_a-zA-Z][A-Za-z0-9_.]*:$/{f=$1} /^\t[a-z]/{print f, $1}' \
-//       /tmp/asm_shape.s | sort | uniq -c
+//   ninja -C build/perf-release core/libbess_arch_asm_shape.a
+//   objdump -d --no-show-raw-insn build/perf-release/core/libbess_arch_asm_shape.a
 //
-// It is not built by Meson: it exists to be read, and its arguments come from
-// the caller so nothing folds on constants.
+// or compile this unit by hand with a core/ translation unit's flags (a
+// release's are -O3 -march=x86-64-v3 -DNDEBUG -D_FILE_OFFSET_BITS=64
+// -std=c++23 -I core) and split the output by symbol:
+//
+//   g++ -O3 -march=x86-64-v3 -DNDEBUG -std=c++23 -I core -S -o /tmp/asm_shape.s core/arch/asm_shape.cc
+//   awk '/^[_a-zA-Z][A-Za-z0-9_.]*:$/{f=$1} /^\t[a-z]/{print f, $1}' /tmp/asm_shape.s
+//
+// The wrappers take their arguments from the caller, so nothing folds on
+// constants, and the includes are portable: the arm64 lanes compile this unit
+// too (their kernels take the other side of each #if).
 
 #include <cstddef>
 #include <cstdint>
