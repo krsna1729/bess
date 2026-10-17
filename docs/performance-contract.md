@@ -16,6 +16,7 @@ This contract defines the performance, memory, and concurrency invariants for al
 2. **Near-Specialized Assembly for Typed Paths**:
    - For typed hot paths (e.g. `TypedExactTable`, `RangeClassifier`, `ScopeTable::Lookup`), code generation must approach optimal hand-written assembly.
    - Branching and comparisons must use direct scalar or SIMD instructions (e.g., unsigned integer comparisons for port ranges, 16-byte vector shifts for VLAN stripping (`core/arch/vlan.h`) and key extraction).
+   - `docs/assembly-shape.md` is the review of what `core/arch`'s kernels actually compile to under the release flags, kernel by kernel, against each header's claim.
 
 3. **Bound Genericity Outside the Packet Loop**:
    - Genericity (field extraction plans, hash seeds, schema layouts, output gate mappings) must be computed and baked at configuration, generation, or transaction commit time.
