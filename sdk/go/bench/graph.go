@@ -57,7 +57,10 @@ func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int,
 	}
 	classes := make(map[string]protoreflect.MessageDescriptor, len(sc.GetModuleClasses()))
 	for _, mc := range sc.GetModuleClasses() {
-		if md, err := message(files, protoreflect.FullName(mc.GetInitArgType())); err == nil {
+		// A class whose init message the schema does not carry cannot be built;
+		// arg() reports that by name if the graph asks for it.
+		md, merr := message(files, protoreflect.FullName(mc.GetInitArgType()))
+		if merr == nil {
 			classes[mc.GetName()] = md
 		}
 	}
@@ -68,12 +71,12 @@ func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int,
 		}
 		m := dynamicpb.NewMessage(md)
 		if fields != nil {
-			raw, err := json.Marshal(fields)
-			if err != nil {
-				return nil, fmt.Errorf("%s init: %w", class, err)
+			raw, merr := json.Marshal(fields)
+			if merr != nil {
+				return nil, fmt.Errorf("%s init: %w", class, merr)
 			}
-			if err := protojson.Unmarshal(raw, m); err != nil {
-				return nil, fmt.Errorf("%s init from %s: %w", class, raw, err)
+			if uerr := protojson.Unmarshal(raw, m); uerr != nil {
+				return nil, fmt.Errorf("%s init from %s: %w", class, raw, uerr)
 			}
 		}
 		return anypb.New(m)
@@ -127,7 +130,7 @@ func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int,
 		if err != nil {
 			return err
 		}
-		if _, err := c.ApplyPipeline(cctx, &pb.Pipeline{}, bess.WithExpectedVersion(cur.Version)); err != nil {
+		if _, err = c.ApplyPipeline(cctx, &pb.Pipeline{}, bess.WithExpectedVersion(cur.Version)); err != nil {
 			return fmt.Errorf("removing the bench graph: %w", err)
 		}
 		back := previous

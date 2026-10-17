@@ -87,6 +87,12 @@ jobs:
         working-directory: sdk/go
         run: |
           go vet ./...
+          # The shadow pass is not in go vet's default set, and it catches a
+          # shape nothing else does: a shadowed error that a cleanup closure
+          # then never sees (b363a091). The module-aware go run keeps the tool
+          # out of go.mod, and the version is pinned to one whose own go.mod
+          # still matches the toolchain this job installs from sdk/go/go.mod.
+          go run golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow@v0.38.0 ./...
           go test -race -count=1 ./...
 
   # The lane table lives in tools/ci_profile.py (LANES, with the compiler

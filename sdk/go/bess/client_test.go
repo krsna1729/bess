@@ -839,13 +839,13 @@ func TestResourceGenerations(t *testing.T) {
 
 	listed := &pb.Pipeline{Resources: []*pb.ResourceContents{{Name: resource}}}
 	for _, p := range []*pb.Pipeline{{}, listed} {
-		_, dv, err := h.c.DiffPipeline(ctx, p)
-		if err != nil {
-			t.Fatal(err)
+		_, dv, derr := h.c.DiffPipeline(ctx, p)
+		if derr != nil {
+			t.Fatal(derr)
 		}
-		_, pv, err := h.c.PlanPipeline(ctx, p)
-		if err != nil {
-			t.Fatal(err)
+		_, pv, perr := h.c.PlanPipeline(ctx, p)
+		if perr != nil {
+			t.Fatal(perr)
 		}
 		want := len(p.GetResources()) > 0
 		for _, v := range []PipelineVersion{dv, pv} {
@@ -855,10 +855,10 @@ func TestResourceGenerations(t *testing.T) {
 		}
 	}
 
-	if _, err := h.c.ApplyPipeline(ctx, listed, WithExpectedVersion(named.Version)); err != nil {
+	if _, err = h.c.ApplyPipeline(ctx, listed, WithExpectedVersion(named.Version)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.c.ApplyPipeline(ctx, listed, WithExpectedVersion(plain.Version)); err != nil {
+	if _, err = h.c.ApplyPipeline(ctx, listed, WithExpectedVersion(plain.Version)); err != nil {
 		t.Fatal(err)
 	}
 	if a := f.applied; a[0].ExpectedResourceGeneration == nil || a[0].GetExpectedResourceGeneration() != 9 ||
@@ -887,8 +887,8 @@ func TestInvokeAction(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := &pb.GetTransactionRequest{}
-	if err := result.UnmarshalTo(got); err != nil || got.GetRequestId() != "answer" {
-		t.Fatal(result, err)
+	if uerr := result.UnmarshalTo(got); uerr != nil || got.GetRequestId() != "answer" {
+		t.Fatal(result, uerr)
 	}
 	req, arg := f.invoked[0], &pb.GetTransactionRequest{}
 	if f.listed != 1 || req.GetDaemonEpoch() != 1 || req.GetModule() != "l2" || req.GetAction() != "lookup" ||

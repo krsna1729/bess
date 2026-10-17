@@ -256,14 +256,14 @@ func churn(ctx context.Context, c *bess.Client, rules bess.Resource, keys, value
 	for time.Now().Before(deadline) {
 		tx := c.Transaction()
 		for i := 0; i < k; i++ {
-			i := (*next + i) % LiveAddrs
-			if err := tx.Upsert(rules, keys[i], values[i]); err != nil {
+			idx := (*next + i) % LiveAddrs
+			if err := tx.Upsert(rules, keys[idx], values[idx]); err != nil {
 				return nil, err
 			}
 		}
 		for i := 0; i < k; i++ {
-			i := (*oldest + i) % LiveAddrs
-			if err := tx.Erase(rules, keys[i]); err != nil {
+			idx := (*oldest + i) % LiveAddrs
+			if err := tx.Erase(rules, keys[idx]); err != nil {
 				return nil, err
 			}
 		}
