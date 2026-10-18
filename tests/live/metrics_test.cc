@@ -118,7 +118,8 @@ TEST_F(MetricsTest, GateCountersCountWhatCrossed) {
   ASSERT_TRUE(applied) << applied.error().message;
   ASSERT_TRUE(client().ResumeWorkers());
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  ASSERT_TRUE(client().PauseWorkers());
+  const auto paused = client().PauseWorkers();
+  ASSERT_TRUE(paused) << paused.error().message;
 
   const auto samples = Metrics();
   const auto out = Value(samples, "bess_gate_packets_total",
@@ -177,7 +178,8 @@ TEST_F(MetricsTest, TaskRunsFollowThePlacement) {
   ASSERT_TRUE(applied) << applied.error().message;
   ASSERT_TRUE(client().ResumeWorkers());
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
-  ASSERT_TRUE(client().PauseWorkers());
+  const auto paused_first = client().PauseWorkers();
+  ASSERT_TRUE(paused_first) << paused_first.error().message;
 
   const auto before = Value(Metrics(), "bess_drr_task_runs_total",
                             {{"module", "drr"}, {"worker", "0"}});
@@ -196,7 +198,8 @@ TEST_F(MetricsTest, TaskRunsFollowThePlacement) {
   ASSERT_TRUE(applied) << applied.error().message;
   ASSERT_TRUE(client().ResumeWorkers());
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
-  ASSERT_TRUE(client().PauseWorkers());
+  const auto paused_after_move = client().PauseWorkers();
+  ASSERT_TRUE(paused_after_move) << paused_after_move.error().message;
 
   const auto settled = Value(Metrics(), "bess_drr_task_runs_total",
                              {{"module", "drr"}, {"worker", "0"}});
@@ -209,7 +212,8 @@ TEST_F(MetricsTest, TaskRunsFollowThePlacement) {
   // The task is worker 1's now, so more traffic must not move worker 0's count.
   ASSERT_TRUE(client().ResumeWorkers());
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
-  ASSERT_TRUE(client().PauseWorkers());
+  const auto paused_after = client().PauseWorkers();
+  ASSERT_TRUE(paused_after) << paused_after.error().message;
   const auto after0 = Value(Metrics(), "bess_drr_task_runs_total",
                             {{"module", "drr"}, {"worker", "0"}});
   EXPECT_EQ(settled.value_or(-1), after0.value_or(-2))

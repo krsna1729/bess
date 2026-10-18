@@ -159,6 +159,13 @@ class LiveTest : public ::testing::Test {
  protected:
   void SetUp() override { Daemon::Shared().Reset(); }
   void TearDown() override {
+    // A daemon that died or stopped answering leaves no trace in a bare
+    // ASSERT_TRUE, so say so and print its log: the failure then names the
+    // cause instead of pointing at whichever call noticed it.
+    if (!Daemon::Shared().Alive()) {
+      ADD_FAILURE() << "bessd is not answering; log:\n"
+                    << Daemon::Shared().Log();
+    }
     if (Daemon::Shared().Alive()) {
       Daemon::Shared().Reset();
     }
