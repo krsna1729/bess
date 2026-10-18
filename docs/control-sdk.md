@@ -290,6 +290,25 @@ both); `GetPortStatus` a port's `numa_node` (-1: unknown) and `cross_numa`.
 (D-126): `simd_width`, BESS kernels' width in bits, `dpdk_simd_width`, DPDK's own limit after EAL init (32768: unlimited; equal on x86, DPDK's default on arm64), and the `simd` summary line (`bessctl status`
 prints it; see [placement.md](placement.md#simd-width)).
 
+`GetResourceStatus` answers in one call what the daemon has and has used (D-149)
+-- the numbers a controller reads before it grows the graph. Every resource the
+RPC can reach is listed with what it holds now (`live`, `Resource::LiveCount`)
+and, where the kind states one, its `capacity` in entries. `has_capacity` says
+which, and "not stated" is **not** "unbounded": a bounded kind that has not been
+taught to state its bound reports false too, so a controller must not read
+absence as freedom -- nor a zero capacity as a full table. Slot tables, exact
+tables that cannot grow and `l2/macs` state their bound (a module built on the
+framework's resources states it with no code); a tuple space, which grows with
+the rules' groups, does not. Beside the
+resources the reply carries the daemon's `rss_bytes`, the EAL heap's
+`heap_total_bytes` and `heap_alloc_bytes` on the daemon's memory node, the
+reclamation budget (`rcu_pending`, `rcu_high_water`: the same counters
+`bess.rcu_backlog` alerts on, and past half of the high-water mark the engine's
+retiring waits), and `workers` by core. Every field is a fact the daemon holds
+now, never a prediction: what a change will cost depends on the resource's own
+shape (a rule's groups, a cascade's removals), so the controller does that
+arithmetic.
+
 A left-out `core` no longer means CPU 0. The field gained presence, so the
 bytes are unchanged but their meaning is not: a client built from the proto
 before D-123 sends nothing for `core: 0` (proto3's default), which a D-123

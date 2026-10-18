@@ -222,6 +222,21 @@ a client can do to it is an **action**.
 
   `GetSchema` lists them; transactions (`ApplyTransaction`) and desired state
   (`Pipeline.resources`, below) change them.
+- **Stating a bound (D-149).** `GetResourceStatus` reports each resource's
+  live entries and, when the resource states one, its capacity, so a
+  controller sees the ceiling it can plan against before it writes. The
+  framework's resources state it for you: `dataplane::SlotResource` (its
+  table's id count), `classifier::ExactRuleResource` (what its table accepts,
+  when the owner cannot grow it) and a settings singleton (1: the one value
+  it holds, which `live` does not count), so a module built on them writes
+  nothing. A resource of your own overrides
+  `std::optional<uint64_t> Capacity() const` when it knows a firm ceiling on
+  entries (`return table_.capacity();`) and leaves it alone otherwise. Two
+  rules: not stated is not unbounded (the reply says only that no number was
+  given), and never report a growable table's current size as its capacity,
+  since the ceiling moves. A ceiling is not a promise of room: a hash table's
+  placement can refuse before the table is full, and a refused transaction
+  leaves nothing behind.
 - **Actions** are the `cmds` entries: verbs that are not state (a lookup, a
   flush, a counter read, a table generator). `InvokeAction` runs them and
   `GetSchema` lists them, with `result_type` naming the message an action puts

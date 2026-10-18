@@ -99,6 +99,11 @@ class ControlStub:
                 request_serializer=control__v2__pb2.InvokeActionRequest.SerializeToString,
                 response_deserializer=control__v2__pb2.InvokeActionResponse.FromString,
                 _registered_method=True)
+        self.GetResourceStatus = channel.unary_unary(
+                '/bess.pb.v2.Control/GetResourceStatus',
+                request_serializer=control__v2__pb2.GetResourceStatusRequest.SerializeToString,
+                response_deserializer=control__v2__pb2.GetResourceStatusResponse.FromString,
+                _registered_method=True)
 
 
 class ControlServicer:
@@ -182,6 +187,12 @@ class ControlServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetResourceStatus(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ControlServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -249,6 +260,11 @@ def add_ControlServicer_to_server(servicer, server):
                     servicer.InvokeAction,
                     request_deserializer=control__v2__pb2.InvokeActionRequest.FromString,
                     response_serializer=control__v2__pb2.InvokeActionResponse.SerializeToString,
+            ),
+            'GetResourceStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetResourceStatus,
+                    request_deserializer=control__v2__pb2.GetResourceStatusRequest.FromString,
+                    response_serializer=control__v2__pb2.GetResourceStatusResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -602,6 +618,33 @@ class Control:
             '/bess.pb.v2.Control/InvokeAction',
             control__v2__pb2.InvokeActionRequest.SerializeToString,
             control__v2__pb2.InvokeActionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetResourceStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/bess.pb.v2.Control/GetResourceStatus',
+            control__v2__pb2.GetResourceStatusRequest.SerializeToString,
+            control__v2__pb2.GetResourceStatusResponse.FromString,
             options,
             channel_credentials,
             insecure,

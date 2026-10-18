@@ -10,6 +10,7 @@
 #include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -332,6 +333,15 @@ class Resource {
   // register a populated resource that may reference others, since its
   // existing references would be missing from the ledger.
   virtual size_t LiveCount() const = 0;
+
+  // The capacity this resource can state, or nullopt when it has none to
+  // state. A slot table knows its bound; a tuple space grows with the rules'
+  // groups and has no number, so "no capacity to state" is its honest
+  // answer -- reported as has_capacity false, never as a zero a controller
+  // could read as a full table. GetResourceStatus reports this beside
+  // LiveCount() so a controller can see the ceiling it can plan against --
+  // a ceiling, not a promise of room (placement can refuse below it).
+  virtual std::optional<uint64_t> Capacity() const { return std::nullopt; }
 
  private:
   friend class TransactionEngine;

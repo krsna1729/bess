@@ -50,6 +50,10 @@ class DataplaneTransactions {
       dataplane::TransactionEngine::OnBusy on_busy = dataplane::TransactionEngine::OnBusy::kAnswer);
   pb::v2::GetTransactionResponse Get(const std::string &request_id) const;
   pb::v2::ListTransactionResourcesResponse List() const;
+  // What each reachable resource holds now and, where it can state one, its
+  // capacity (GetResourceStatus). Same reachability rule as List(): a
+  // resource without a codec is not reported.
+  pb::v2::GetResourceStatusResponse ResourceStatus() const;
 
   uint64_t epoch() const { return epoch_; }
   size_t records() const { return records_.size(); }

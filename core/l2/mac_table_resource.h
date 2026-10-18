@@ -46,6 +46,17 @@ class MacTableResource final : public dataplane::Resource {
 
   size_t LiveCount() const override { return table_.size(); }
 
+  // The table's bound, which this kind can state: the most entries it
+  // accepts (an insert at that size refuses with "table full"). A ceiling,
+  // not a promise of room: the slots are sized at twice the capacity so a
+  // placement below it practically always succeeds, but cuckoo placement
+  // cannot promise room in advance (see above), so a write under the ceiling
+  // can still refuse. Reported so a controller can see the most room it has
+  // instead of discovering the bound by a refused transaction.
+  std::optional<uint64_t> Capacity() const override {
+    return table_.capacity();
+  }
+
   bool Contains(const dataplane::ResourceKey &key) const override {
     uint64_t mac = 0;
     return Decode(key, &mac) && Present(mac);

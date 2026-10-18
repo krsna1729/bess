@@ -16,6 +16,7 @@
 #include <cctype>
 #include <chrono>
 #include <format>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -28,6 +29,10 @@
 #include <variant>
 #include <vector>
 
+#include <rte_malloc.h>
+#include <unistd.h>
+
+#include "rcu/rcu_domain.h"
 #include "control/pipeline_snapshot.h"
 #include "gate_hooks/track.h"
 #include "framework/plugin_check.h"
@@ -35,6 +40,8 @@
 #include "module.h"
 #include "port.h"
 #include "runtime/runtime_state.h"
+#include "runtime/worker_manager.h"
+#include "utils/dpdk_memory.h"
 #include "arch/dpdk_simd.h"
 #include "dpdk.h"
 #include "runtime/numa_placement.h"
@@ -740,6 +747,63 @@ grpc::Status ControlV2Service::ListTransactionResources(
     v2::ListTransactionResourcesResponse *response) {
   auto lock = control_plane_.AcquireLock();
   *response = transactions_.List();
+  return grpc::Status::OK;
+}
+
+namespace {
+
+// The daemon's resident set in bytes, from /proc/self/statm (field 2 is
+// resident pages). Zero when the file cannot be read: the reply reports the
+// facts it has, and a zero tells a controller the read failed rather than
+// that the daemon is empty.
+uint64_t ReadRssBytes() {
+  std::ifstream statm("/proc/self/statm");
+  uint64_t total_pages = 0;
+  uint64_t resident_pages = 0;
+  if (!(statm >> total_pages >> resident_pages)) {
+    return 0;
+  }
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  return resident_pages * static_cast<uint64_t>(page_size > 0 ? page_size : 0);
+}
+
+}  // namespace
+
+grpc::Status ControlV2Service::GetResourceStatus(
+    grpc::ServerContext *, const v2::GetResourceStatusRequest *,
+    v2::GetResourceStatusResponse *response) {
+  // Reads that need no control-plane lock come first, so a controller polling
+  // this RPC does not hold the lock ApplyPipeline wants while they run: the
+  // daemon's RSS, the EAL heap, and the two RCU numbers. The RCU numbers are
+  // the ones PressureMonitor::Take() reads for the rcu_backlog alert, taken
+  // from the same accessors, without the port walk Take() does under the lock
+  // for samples this reply has no use for. The heap is the daemon's memory
+  // node, not socket 0: bessd confines its DPDK memory to one node (D-123),
+  // so every other socket's heap is empty and reading it would report a
+  // successful zero for a daemon that has memory.
+  const uint64_t rss_bytes = ReadRssBytes();
+  rte_malloc_socket_stats stats{};
+  const bool have_heap =
+      rte_malloc_get_socket_stats(bess::utils::MemoryNode(), &stats) == 0;
+  rcu::RcuDomain &rcu = runtime::runtime().rcu();
+  const uint64_t rcu_pending = rcu.pending_retired();
+  const uint64_t rcu_high_water = rcu.retire_high_water();
+
+  // The control-plane lock, as ReadPipeline takes it: the resource walk and
+  // the worker list are control-plane state.
+  auto lock = control_plane_.AcquireLock();
+  *response = transactions_.ResourceStatus();
+  response->set_rss_bytes(rss_bytes);
+  if (have_heap) {
+    response->set_heap_total_bytes(stats.heap_totalsz_bytes);
+    response->set_heap_alloc_bytes(stats.heap_allocsz_bytes);
+  }
+  response->set_rcu_pending(rcu_pending);
+  response->set_rcu_high_water(rcu_high_water);
+
+  for (int core : runtime::runtime().workers().Cores()) {
+    response->add_workers()->set_cpu(static_cast<uint32_t>(core));
+  }
   return grpc::Status::OK;
 }
 

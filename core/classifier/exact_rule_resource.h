@@ -92,6 +92,20 @@ class ExactRuleResource final : public dataplane::Resource {
   // kPending placeholder is counted.
   size_t LiveCount() const override { return table_().size(); }
 
+  // The most live keys the table accepts. A key is refused unless Headroom()
+  // slots stay free for deletes waiting out a grace period (HasRoomForOne),
+  // so a table at capacity holds capacity - Headroom keys. Stated only when
+  // the owner cannot grow the table (no make_room hook): a growable table's
+  // ceiling moves, and "not stated" is the honest answer for it.
+  std::optional<uint64_t> Capacity() const override {
+    if (make_room_) {
+      return std::nullopt;
+    }
+    const uint32_t slots = table_().capacity();
+    const uint32_t headroom = ConcurrentExactTable::Headroom(slots);
+    return slots > headroom ? slots - headroom : 0;
+  }
+
   // The value a key holds while a transaction that adds it is being
   // prepared. Readers treat it as a miss.
   static constexpr uint64_t kPending = ~uint64_t{0};

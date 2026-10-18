@@ -792,6 +792,50 @@ class InvokeActionResponse(_message.Message):
     daemon_epoch: int
     def __init__(self, result: _Optional[_Union[_any_pb2.Any, _Mapping]] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
 
+class GetResourceStatusRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class ResourceOccupancy(_message.Message):
+    __slots__ = ("name", "live", "has_capacity", "capacity")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    LIVE_FIELD_NUMBER: _ClassVar[int]
+    HAS_CAPACITY_FIELD_NUMBER: _ClassVar[int]
+    CAPACITY_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    live: int
+    has_capacity: bool
+    capacity: int
+    def __init__(self, name: _Optional[str] = ..., live: _Optional[int] = ..., has_capacity: _Optional[bool] = ..., capacity: _Optional[int] = ...) -> None: ...
+
+class WorkerStatus(_message.Message):
+    __slots__ = ("cpu",)
+    CPU_FIELD_NUMBER: _ClassVar[int]
+    cpu: int
+    def __init__(self, cpu: _Optional[int] = ...) -> None: ...
+
+class GetResourceStatusResponse(_message.Message):
+    __slots__ = ("resources", "generation", "rss_bytes", "heap_total_bytes", "heap_alloc_bytes", "rcu_pending", "rcu_high_water", "workers", "daemon_epoch")
+    RESOURCES_FIELD_NUMBER: _ClassVar[int]
+    GENERATION_FIELD_NUMBER: _ClassVar[int]
+    RSS_BYTES_FIELD_NUMBER: _ClassVar[int]
+    HEAP_TOTAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    HEAP_ALLOC_BYTES_FIELD_NUMBER: _ClassVar[int]
+    RCU_PENDING_FIELD_NUMBER: _ClassVar[int]
+    RCU_HIGH_WATER_FIELD_NUMBER: _ClassVar[int]
+    WORKERS_FIELD_NUMBER: _ClassVar[int]
+    DAEMON_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    resources: _containers.RepeatedCompositeFieldContainer[ResourceOccupancy]
+    generation: int
+    rss_bytes: int
+    heap_total_bytes: int
+    heap_alloc_bytes: int
+    rcu_pending: int
+    rcu_high_water: int
+    workers: _containers.RepeatedCompositeFieldContainer[WorkerStatus]
+    daemon_epoch: int
+    def __init__(self, resources: _Optional[_Iterable[_Union[ResourceOccupancy, _Mapping]]] = ..., generation: _Optional[int] = ..., rss_bytes: _Optional[int] = ..., heap_total_bytes: _Optional[int] = ..., heap_alloc_bytes: _Optional[int] = ..., rcu_pending: _Optional[int] = ..., rcu_high_water: _Optional[int] = ..., workers: _Optional[_Iterable[_Union[WorkerStatus, _Mapping]]] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
+
 class ImportPluginRequest(_message.Message):
     __slots__ = ("path", "daemon_epoch")
     PATH_FIELD_NUMBER: _ClassVar[int]

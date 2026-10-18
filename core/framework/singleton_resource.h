@@ -85,6 +85,11 @@ class SingletonResource final : public dataplane::Resource {
 
   size_t LiveCount() const override { return 0; }
 
+  // One value, set and never erased: the bound is 1. (LiveCount stays 0 --
+  // the value is the module's own state, not an entry -- so a reply cannot
+  // tell a set singleton from an unset one; documented in D-149.)
+  std::optional<uint64_t> Capacity() const override { return 1; }
+
  private:
   class Set final : public dataplane::StagedOp {
    public:

@@ -301,4 +301,24 @@ v2::ListTransactionResourcesResponse DataplaneTransactions::List() const {
   return response;
 }
 
+v2::GetResourceStatusResponse DataplaneTransactions::ResourceStatus() const {
+  v2::GetResourceStatusResponse response;
+  response.set_daemon_epoch(epoch_);
+  response.set_generation(engine_.generation());
+  for (const std::string &name : engine_.ResourceNames()) {
+    const dataplane::Resource *resource = engine_.FindResource(name);
+    if (resource == nullptr || bindings_.Find(*resource) == nullptr) {
+      continue;  // not reachable over the RPC, as in List()
+    }
+    auto *out = response.add_resources();
+    out->set_name(name);
+    out->set_live(resource->LiveCount());
+    if (const std::optional<uint64_t> capacity = resource->Capacity()) {
+      out->set_has_capacity(true);
+      out->set_capacity(*capacity);
+    }
+  }
+  return response;
+}
+
 }  // namespace bess::control

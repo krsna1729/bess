@@ -115,6 +115,12 @@ class ControlV2Service final : public pb::v2::Control::Service {
   grpc::Status InvokeAction(grpc::ServerContext *context,
                             const pb::v2::InvokeActionRequest *request,
                             pb::v2::InvokeActionResponse *response) override;
+  // What the daemon has and has used: the resources it would write, the
+  // memory it would spend from, and the reclamation budget it would draw on.
+  grpc::Status GetResourceStatus(
+      grpc::ServerContext *context,
+      const pb::v2::GetResourceStatusRequest *request,
+      pb::v2::GetResourceStatusResponse *response) override;
   grpc::Status ListMetrics(grpc::ServerContext *context,
                            const pb::v2::ListMetricsRequest *request,
                            pb::v2::ListMetricsResponse *response) override;

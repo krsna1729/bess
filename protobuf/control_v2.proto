@@ -660,6 +660,49 @@ message InvokeActionResponse {
   uint64 daemon_epoch = 2;
 }
 
+// -- Resource status ------------------------------------------------------
+//
+// What the daemon has, what it has used, and what it can still take: the
+// numbers a controller reads before it adds modules or grows a table. Every
+// field is a fact the daemon holds now, never a prediction -- what a change
+// will cost depends on the resource's own shape (a rule's groups, a cascade's
+// removals), so the controller does that arithmetic from these facts.
+//
+// A resource states a capacity or it does not: has_capacity says which, and
+// "not stated" is not "unbounded" -- a bounded kind that has not been taught
+// to state its bound reports false too, so a controller must not read absence
+// as freedom. capacity counts entries when present.
+//
+// The reply is one call so a controller needs no second round trip to decide
+// whether it can proceed: the resources it would write, the memory it would
+// spend from, the workers that would carry it, and the reclamation budget it
+// would draw on.
+
+message GetResourceStatusRequest {}
+
+message ResourceOccupancy {
+  string name = 1;      // '<module>/<table>', as the registry names it
+  uint64 live = 2;      // committed entries (Resource::LiveCount)
+  bool has_capacity = 3;
+  uint64 capacity = 4;  // entries; meaningful when has_capacity
+}
+
+message WorkerStatus {
+  uint32 cpu = 1;   // the core this worker runs on
+}
+
+message GetResourceStatusResponse {
+  repeated ResourceOccupancy resources = 1;
+  uint64 generation = 2;        // the resource generation (D-129)
+  uint64 rss_bytes = 3;         // the daemon process, from /proc/self/statm
+  uint64 heap_total_bytes = 4;  // the EAL heap on the daemon's memory node
+  uint64 heap_alloc_bytes = 5;
+  uint64 rcu_pending = 6;       // objects waiting for a grace period
+  uint64 rcu_high_water = 7;    // past it, retiring waits (the engine uses half)
+  repeated WorkerStatus workers = 8;
+  uint64 daemon_epoch = 9;
+}
+
 service Control {
   rpc GetPipeline(GetPipelineRequest) returns (GetPipelineResponse) {}
   rpc ValidatePipeline(ValidatePipelineRequest)
@@ -678,6 +721,8 @@ service Control {
   rpc ListTransactionResources(ListTransactionResourcesRequest)
       returns (ListTransactionResourcesResponse) {}
   rpc InvokeAction(InvokeActionRequest) returns (InvokeActionResponse) {}
+  rpc GetResourceStatus(GetResourceStatusRequest)
+      returns (GetResourceStatusResponse) {}
 }
 
 // -- Administration (D-107) ----------------------------------------------

@@ -42,6 +42,11 @@ class SlotResource : public Resource {
 
   size_t LiveCount() const override { return table_.size(); }
 
+  // Ids are 1..capacity and an id is never shared, so the bound is firm: every
+  // module that keeps its objects in a SlotResource states it without writing
+  // anything.
+  std::optional<uint64_t> Capacity() const override { return table_.capacity(); }
+
   bool Contains(const ResourceKey &key) const override {
     Id id;
     return DecodeKey(key, &id) && table_.Contains(id);

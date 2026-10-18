@@ -33,6 +33,7 @@ const (
 	Control_WatchEvents_FullMethodName              = "/bess.pb.v2.Control/WatchEvents"
 	Control_ListTransactionResources_FullMethodName = "/bess.pb.v2.Control/ListTransactionResources"
 	Control_InvokeAction_FullMethodName             = "/bess.pb.v2.Control/InvokeAction"
+	Control_GetResourceStatus_FullMethodName        = "/bess.pb.v2.Control/GetResourceStatus"
 )
 
 // ControlClient is the client API for Control service.
@@ -52,6 +53,7 @@ type ControlClient interface {
 	WatchEvents(ctx context.Context, in *WatchEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error)
 	ListTransactionResources(ctx context.Context, in *ListTransactionResourcesRequest, opts ...grpc.CallOption) (*ListTransactionResourcesResponse, error)
 	InvokeAction(ctx context.Context, in *InvokeActionRequest, opts ...grpc.CallOption) (*InvokeActionResponse, error)
+	GetResourceStatus(ctx context.Context, in *GetResourceStatusRequest, opts ...grpc.CallOption) (*GetResourceStatusResponse, error)
 }
 
 type controlClient struct {
@@ -201,6 +203,16 @@ func (c *controlClient) InvokeAction(ctx context.Context, in *InvokeActionReques
 	return out, nil
 }
 
+func (c *controlClient) GetResourceStatus(ctx context.Context, in *GetResourceStatusRequest, opts ...grpc.CallOption) (*GetResourceStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetResourceStatusResponse)
+	err := c.cc.Invoke(ctx, Control_GetResourceStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlServer is the server API for Control service.
 // All implementations must embed UnimplementedControlServer
 // for forward compatibility.
@@ -218,6 +230,7 @@ type ControlServer interface {
 	WatchEvents(*WatchEventsRequest, grpc.ServerStreamingServer[Event]) error
 	ListTransactionResources(context.Context, *ListTransactionResourcesRequest) (*ListTransactionResourcesResponse, error)
 	InvokeAction(context.Context, *InvokeActionRequest) (*InvokeActionResponse, error)
+	GetResourceStatus(context.Context, *GetResourceStatusRequest) (*GetResourceStatusResponse, error)
 	mustEmbedUnimplementedControlServer()
 }
 
@@ -266,6 +279,9 @@ func (UnimplementedControlServer) ListTransactionResources(context.Context, *Lis
 }
 func (UnimplementedControlServer) InvokeAction(context.Context, *InvokeActionRequest) (*InvokeActionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method InvokeAction not implemented")
+}
+func (UnimplementedControlServer) GetResourceStatus(context.Context, *GetResourceStatusRequest) (*GetResourceStatusResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetResourceStatus not implemented")
 }
 func (UnimplementedControlServer) mustEmbedUnimplementedControlServer() {}
 func (UnimplementedControlServer) testEmbeddedByValue()                 {}
@@ -515,6 +531,24 @@ func _Control_InvokeAction_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_GetResourceStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetResourceStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).GetResourceStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_GetResourceStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).GetResourceStatus(ctx, req.(*GetResourceStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Control_ServiceDesc is the grpc.ServiceDesc for Control service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -569,6 +603,10 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "InvokeAction",
 			Handler:    _Control_InvokeAction_Handler,
+		},
+		{
+			MethodName: "GetResourceStatus",
+			Handler:    _Control_GetResourceStatus_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

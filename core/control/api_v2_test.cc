@@ -777,6 +777,82 @@ TEST_F(ApiV2ServiceTest, InvokeAction) {
   EXPECT_EQ("l2", detail.object());
 }
 
+// GetResourceStatus: what a controller reads before it grows the graph --
+// what the resources hold, the daemon's own memory, the reclamation budget it
+// would draw on, and the workers that would carry the change. One call, so a
+// controller needs no second round trip to decide whether it can proceed.
+TEST_F(ApiV2ServiceTest, ResourceStatusReportsWhatTheDaemonHolds) {
+  // A resource with an entry: L2Forward's l2/macs, written through the
+  // resource as a client does (the same write InvokeAction makes).
+  google::protobuf::Any arg;
+  ASSERT_TRUE(arg.PackFrom(bess::pb::L2ForwardArg()));
+  ASSERT_TRUE(control_plane_->CreateModule({"l2", "L2Forward", arg}));
+  bess::pb::ExactMatchArg em;
+  bess::pb::Field *em_field = em.add_fields();
+  em_field->set_offset(26);
+  em_field->set_num_bytes(4);
+  google::protobuf::Any em_arg;
+  ASSERT_TRUE(em_arg.PackFrom(em));
+  ASSERT_TRUE(control_plane_->CreateModule({"em", "ExactMatch", em_arg}));
+  {
+    bess::pb::L2ForwardMacKey key;
+    key.set_addr("02:00:00:00:00:09");
+    bess::pb::L2ForwardMacValue value;
+    value.set_gate(3);
+    grpc::ClientContext ctx;
+    v2::ApplyTransactionRequest req;
+    req.set_request_id("l2-macs-add");
+    req.set_daemon_epoch(Epoch());
+    v2::TransactionOp *op = req.add_ops();
+    op->set_resource("l2/macs");
+    ASSERT_TRUE(op->mutable_key()->PackFrom(key));
+    ASSERT_TRUE(op->mutable_value()->PackFrom(value));
+    v2::ApplyTransactionResponse applied;
+    const grpc::Status status = stub_->ApplyTransaction(&ctx, req, &applied);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
+
+  grpc::ClientContext ctx;
+  v2::GetResourceStatusResponse resp;
+  ASSERT_TRUE(stub_->GetResourceStatus(&ctx, {}, &resp).ok());
+
+  EXPECT_EQ(Epoch(), resp.daemon_epoch());
+  EXPECT_NE(0u, resp.generation()) << "the generation a commit names";
+
+  // The resource a controller would write: what it holds now, and the ceiling
+  // this kind can state -- the most entries the table accepts, so a controller
+  // sees the most room it has instead of learning the bound from a refused
+  // transaction. A kind that cannot state one reports has_capacity false and
+  // must leave no capacity behind, since a controller reading a zero would
+  // see a full table.
+  const v2::ResourceOccupancy *macs = nullptr;
+  const v2::ResourceOccupancy *growable = nullptr;
+  for (const v2::ResourceOccupancy &r : resp.resources()) {
+    EXPECT_FALSE(r.name().empty());
+    if (!r.has_capacity()) {
+      EXPECT_EQ(0u, r.capacity()) << r.name() << ": absent means absent";
+    }
+    if (r.name() == "l2/macs") {
+      macs = &r;
+    } else if (r.name() == "em/rules") {
+      growable = &r;
+    }
+  }
+  ASSERT_NE(nullptr, macs) << "the module's table is listed";
+  EXPECT_EQ(1u, macs->live()) << "the entry the transaction wrote";
+  ASSERT_TRUE(macs->has_capacity()) << "a cuckoo table knows its bound";
+  EXPECT_GE(macs->capacity(), macs->live()) << "the bound covers what is held";
+  ASSERT_NE(nullptr, growable) << "the exact table is listed";
+  EXPECT_FALSE(growable->has_capacity()) << "a table its owner can grow states no ceiling";
+  EXPECT_EQ(0u, growable->capacity()) << "and leaves no number a reader could take for full";
+
+  // The daemon's own memory, the EAL heap the dataplane allocates from, and
+  // the reclamation budget: past half of rcu_high_water, retiring waits.
+  EXPECT_NE(0u, resp.rss_bytes());
+  EXPECT_NE(0u, resp.heap_total_bytes());
+  EXPECT_NE(0u, resp.rcu_high_water());
+}
+
 // An action not marked thread-safe is refused (EBUSY) while a worker runs
 // the module, after the v2 path ApplyPipeline + resume: the resume works out
 // which workers run each module. Paused, it runs.

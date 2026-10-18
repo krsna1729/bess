@@ -10545,3 +10545,77 @@ why it now owns its domain). It asserts the whole set is refused with `over_budg
 `ApplyBatched` applies it in more than one transaction counted from `outcome_counts()` rather than timed, and that
 a second clear reports the keys absent. The control-plane path is `ApplyResourcesLocked` (D-129's desired-state
 rules); the engine's budget itself is `retire_high_water()/2`, unchanged.
+
+## D-149 A status surface for controllers: one call, facts not predictions
+
+**Status:** accepted (2026-10-18).
+**Code:** `protobuf/control_v2.proto` (`GetResourceStatus`), `core/control/api_v2.{h,cc}`,
+`core/control/dataplane_transactions.{h,cc}` (`ResourceStatus`), `core/dataplane/resource.h`
+(`Resource::Capacity`) and its overrides in `core/dataplane/slot_resource.h`,
+`core/classifier/exact_rule_resource.h`, `core/framework/singleton_resource.h` and
+`core/l2/mac_table_resource.h`, tests in `core/control/api_v2_test.cc` and
+`core/dataplane/transaction_engine_test.cc`, and the regenerated `sdk/go/controlv2` and
+`sdk/python/bess/controlv2`.
+**Analysis:** [control-sdk.md](control-sdk.md).
+
+**Context.** A controller that wants to add modules or grow a table had no one place to ask whether it could.
+The facts existed, scattered: `ListTransactionResources` names every resource but not what it holds,
+`GetPacketPools` the mbuf pools, `GetCapabilities` the placement, `ListMetrics` counters -- and the RCU
+reclamation budget, the number a controller adding rules meets first, existed only as the `bess.rcu_backlog`
+*alert* (the pressure monitor's transition events), never as data a client could read before it wrote. The
+UPF's controller is the driving case: its per-session tables grow one PDR at a time, and "can I take this
+session" should be an answer rather than a discovery made by a refused transaction.
+
+**Decision.** One RPC, `Control.GetResourceStatus`, whose reply carries only facts the daemon holds now: each
+reachable resource with `live` (its committed entries, `Resource::LiveCount`) and, where its kind states one,
+`capacity`; the daemon's `rss_bytes` (`/proc/self/statm`) and the totals of the EAL heap on the node bessd's
+DPDK memory is confined to (`rte_malloc_get_socket_stats(bess::utils::MemoryNode())`, not socket 0: D-123
+gives every other node an empty heap, and reading it would *succeed* reporting zero, indistinguishable from a
+failed read); `rcu_pending` and `rcu_high_water` from the accessors `PressureMonitor::Take()` reads for the
+`rcu_backlog` alert, so a controller's reasoning and its alerts agree; and `workers` by core. Reachability is
+`ListTransactionResources`' own rule: a resource without a codec is not reported.
+
+**Capacity is per kind, "not stated" is an answer, and it is not "unbounded".** `Resource` gains
+`virtual std::optional<uint64_t> Capacity()`, nullopt by default, and the reply carries `has_capacity` beside
+`capacity` so a controller reads presence rather than treating a zero as a full table -- the trap a bare
+uint64 would set. `has_capacity: false` means only that the kind states no number: a tuple space grows with the
+rules' groups and has none, and a bounded kind not yet taught to state its bound leaves it unstated too, so a
+controller must not read absence as freedom. Capacity counts entries and is a ceiling, not a promise of room:
+a hash table's placement can refuse before the table is full (a refused transaction leaves nothing behind).
+
+Module authors write nothing for the common cases, because the framework's resources state their own bound:
+`SlotResource` its table's id count, `ExactRuleResource` what its table accepts (slots less the headroom kept
+for deletes waiting out a grace period) -- stated only when the owner cannot grow the table, since a growable
+table's ceiling moves -- a settings singleton 1, and `MacTableResource` its packed cuckoo table's capacity (the
+slots are sized at twice it, so a placement below it practically always succeeds). A resource of its own kind
+overrides `Capacity()` when it knows a firm ceiling (plugin-api.md). Per kind, not a central table in the
+daemon: the kind that owns the structure knows its bound and cannot drift from it. Moving to a central table
+would change no wire format, since the reply carries only the number.
+
+**The lock covers only what it protects.** The control-plane lock is held for `transactions_.ResourceStatus()`
+and the worker list, which are control-plane state. The `statm` read, the heap read and the two RCU numbers
+need no lock and are taken before it, so a controller polling this RPC does not hold the lock `ApplyPipeline`
+wants while they run. The RPC does not call `PressureMonitor::Take()`: that walks every port under the lock
+(its documented precondition) for a sample this reply has no use for.
+
+**Facts, not predictions.** The daemon reports what it has and has used; it does not predict what a change
+will cost, because that depends on the resource's own shape (a rule's groups, a cascade's removals) and only
+the resource knows it. The controller does the arithmetic from the facts, which is the honest split: it knows
+what it intends to do.
+
+**Evidence.** `ApiV2ServiceTest.ResourceStatusReportsWhatTheDaemonHolds` creates an L2Forward module, writes
+one `l2/macs` entry through a transaction, and asserts the reply lists `l2/macs` with `live` 1 and a stated
+capacity covering it, that a kind which cannot state one leaves no capacity behind, that `generation`
+advanced, and that `rss_bytes`, `heap_total_bytes` and `rcu_high_water` are non-zero. (The first version of
+that test ran over `SamplePipeline`, which creates no codec-reachable resource and advances no resource
+generation: the test found its own premise wrong, which is why it writes a real entry.)
+`TransactionEngineTest.StatedCapacityIsACeilingTheResourceEnforces` makes a stated bound earn its name: an
+exact table that cannot grow is filled to what it states and the next write is refused, a slot table states
+its id count, and a growable table states none.
+
+**Not in this change.** The per-module rollup (resources grouped by their `<module>/<table>` prefix, plus an
+optional `Module::ReportFootprint` for what a module holds privately, shared versus per-worker distinguished)
+is the module layer of the same surface and belongs on the tree's list, not here; nor are the packet pools,
+which `GetPacketPools` already answers. One limit is documented rather than fixed: `live` is always 0 for a
+singleton resource (`framework/singleton_resource.h`), so the reply cannot distinguish a set singleton from an
+unset one; a `set` flag on the reply would fix it if a controller ever needs it.

@@ -966,6 +966,56 @@ TEST_F(TransactionEngineTest, KeysThatCannotBePlacedRejectCleanly) {
   ASSERT_TRUE(engine_.Unregister("crowded_rules"));
 }
 
+// A capacity a framework resource states is a ceiling a controller can plan
+// against, so it must be true: a slot table states its id count, an exact
+// table that cannot grow states what it accepts before refusing (its slots
+// less the headroom kept for deletes waiting out a grace period) -- and the
+// write one past it is refused -- and an exact table whose owner can grow it
+// states none, because its ceiling moves.
+TEST_F(TransactionEngineTest, StatedCapacityIsACeilingTheResourceEnforces) {
+  const uint64_t meters_capacity = meters_res_->Capacity().value_or(0);
+  EXPECT_EQ(kIds, meters_capacity) << "a slot table states its id count";
+  EXPECT_LE(meters_res_->LiveCount(), meters_capacity);
+
+  auto fixed = ConcurrentExactTable::Create(8, 768, domain_);
+  ASSERT_TRUE(fixed.has_value());
+  ExactRuleResource res("ceiling_rules", **fixed);
+  ASSERT_TRUE(engine_.Register(&res));
+  const uint64_t headroom = ConcurrentExactTable::Headroom(768);
+  const uint64_t capacity = res.Capacity().value_or(0);
+  ASSERT_EQ(768u - headroom, capacity);
+
+  for (uint64_t first = 1; first <= capacity; first += 64) {
+    std::vector<Op> ops;
+    for (uint64_t k = first; k < first + 64 && k <= capacity; k++) {
+      ops.push_back(Op::Upsert("ceiling_rules", EncodeKey(k), std::any(uint64_t{1})));
+    }
+    ASSERT_EQ(Apply(ops).outcome, Outcome::kApplied) << "keys from " << first;
+  }
+  EXPECT_EQ(capacity, res.LiveCount()) << "the table holds what it states";
+  const auto over = Apply(
+      {Op::Upsert("ceiling_rules", EncodeKey(capacity + 1), std::any(uint64_t{1}))});
+  ASSERT_EQ(over.outcome, Outcome::kRejected);
+  EXPECT_NE(over.ops[0].error.find("table full"), std::string::npos) << over.ops[0].error;
+  EXPECT_EQ(capacity, res.LiveCount()) << "the refused key left nothing behind";
+
+  auto growable = ConcurrentExactTable::Create(8, 768, domain_);
+  ASSERT_TRUE(growable.has_value());
+  ExactRuleResource grows(
+      "growing_rules",
+      ExactRuleResource::Hooks{
+          .table = [&growable]() -> ConcurrentExactTable & { return **growable; },
+          .make_room = [](bool) -> ExactRuleResource::Result { return {}; }});
+  EXPECT_FALSE(grows.Capacity().has_value()) << "a growable table states no ceiling";
+
+  std::vector<Op> erase;
+  for (uint64_t k = 1; k <= capacity; k++) {
+    erase.push_back(Op::Erase("ceiling_rules", EncodeKey(k)));
+  }
+  ASSERT_EQ(Apply(erase).outcome, Outcome::kApplied);
+  ASSERT_TRUE(engine_.Unregister("ceiling_rules"));
+}
+
 // Publication must not do work that can fail: every allocation happens in
 // preparation, and the publish phase only runs the staged operations and
 // updates bookkeeping that already exists. Counted with an allocation window
