@@ -156,6 +156,8 @@ class FirewallTable {
                         FirewallFamily family) noexcept;
 
  private:
+  friend class FirewallScan;
+
   struct Entry {
     PackedKey key;
     uint32_t rule;  // index into rules_
@@ -197,6 +199,51 @@ class FirewallTable {
   std::vector<FirewallRule> rules_;
   std::vector<Group> groups_;  // ordered by first_rule, best first
   Stats stats_;
+};
+
+// A scan over a small policy: the rules in policy order, matched with the same
+// predicate the indexed table uses, and no groups, no packed-key table and no
+// best-index ordering. A policy of a handful of rules is cheaper to scan than to
+// index (the measured crossover is in docs/dataplane-tables.md), and a caller
+// that holds one policy per session wants the smallest structure that is still
+// exact.
+//
+// The predicate is shared, not copied: a lookup packs the key to the rule's own
+// prefix lengths and calls FirewallTable::Matches, which is what the index does
+// per group. A scan therefore pays one packing per rule rather than one per
+// group - which is why it is for policies of a few rules, and why the two
+// structures cannot disagree about what a rule means.
+class FirewallScan {
+ public:
+  // The same refusals FirewallTable::Build makes, rule for rule: a policy the
+  // index accepts is a policy the scan accepts, and the other way round.
+  static std::expected<FirewallScan, std::string> Create(
+      std::vector<FirewallRule> rules);
+
+  // Classifies `n` (<= 64) keys exactly as FirewallTable::LookupBatch does: bit
+  // i set for each key a rule matched, that rule's action in matches[i].action,
+  // and its 1-based id when `with_rule_id`. A key nothing matches is left
+  // untouched.
+  uint64_t LookupBatch(const FirewallKey *keys, size_t n,
+                       FirewallTable::Match *matches,
+                       bool with_rule_id = true) const noexcept;
+
+  // One key; true when a rule matched.
+  bool Lookup(const FirewallKey &key,
+              FirewallTable::Match *match) const noexcept;
+
+  // False when no rule can judge a packet of `family` - the same derived answer
+  // FirewallTable::HasFamily gives, so a caller can drop stray traffic without
+  // a scan.
+  bool HasFamily(FirewallFamily family) const noexcept;
+
+  size_t rule_count() const noexcept { return rules_.size(); }
+  const std::vector<FirewallRule> &rules() const noexcept { return rules_; }
+
+ private:
+  FirewallScan() = default;
+
+  std::vector<FirewallRule> rules_;
 };
 
 }  // namespace bess::classifier

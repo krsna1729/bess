@@ -187,6 +187,63 @@ bool FirewallTable::Matches(const FirewallRule &rule, const FirewallKey &key,
   return true;
 }
 
+// The refusals both structures make, rule for rule, so a policy the index
+// accepts is a policy the scan accepts and the other way round. `index` is
+// 1-based, the way the messages count rules and the way a Match's rule_id does.
+std::optional<std::string> CheckRule(const FirewallRule &rule,
+                                     uint32_t index) {
+  const std::string where = "rule " + std::to_string(index) + ": ";
+  switch (rule.family) {
+    case FirewallFamily::kIpv4:
+    case FirewallFamily::kIpv6:
+      break;
+    case FirewallFamily::kAny:
+      // A rule with no family cannot carry a prefix: there would be no width
+      // to read the length against.
+      if (rule.src_len != 0 || rule.dst_len != 0) {
+        return where +
+               "a rule that names no family cannot carry a prefix";
+      }
+      break;
+  }
+  const uint8_t bits = FamilyBits(rule.family);
+  if (rule.src_len > bits) {
+    return where + "source prefix length " + std::to_string(rule.src_len) +
+           " is beyond " + std::to_string(bits);
+  }
+  if (rule.dst_len > bits) {
+    return where + "destination prefix length " + std::to_string(rule.dst_len) +
+           " is beyond " + std::to_string(bits);
+  }
+  if (rule.src_port_low > rule.src_port_high) {
+    return where + "source port range " + std::to_string(rule.src_port_low) +
+           "-" + std::to_string(rule.src_port_high) +
+           " has its low bound above its high";
+  }
+  if (rule.dst_port_low > rule.dst_port_high) {
+    return where + "destination port range " +
+           std::to_string(rule.dst_port_low) + "-" +
+           std::to_string(rule.dst_port_high) +
+           " has its low bound above its high";
+  }
+  return std::nullopt;
+}
+
+// What both structures do to a rule once it is known to be expressible: mask
+// the addresses to their prefix lengths - a sloppy prefix means its network,
+// the same reading the UPF gives an SDF prefix - and derive whether the ports
+// need checking at all, a full 0..65535 range being no check. The predicate
+// reads both, so a structure that skips this answers differently: that is not a
+// hypothetical, it is what the scan did before this function existed.
+void NormalizeRule(FirewallRule &rule) {
+  rule.src_net =
+      FirewallTable::MaskedAddr(rule.src_net, rule.src_len, rule.family);
+  rule.dst_net =
+      FirewallTable::MaskedAddr(rule.dst_net, rule.dst_len, rule.family);
+  rule.checks_ports = rule.src_port_low != 0 || rule.src_port_high != 0xffff ||
+                      rule.dst_port_low != 0 || rule.dst_port_high != 0xffff;
+}
+
 std::expected<std::unique_ptr<const FirewallTable>, std::string>
 FirewallTable::Build(std::vector<FirewallRule> rules) {
   auto table = std::unique_ptr<FirewallTable>(new FirewallTable());
@@ -200,43 +257,9 @@ FirewallTable::Build(std::vector<FirewallRule> rules) {
   uint32_t index = 0;  // 0 is "no rule", so rules are 1-based
   for (FirewallRule &rule : rules) {
     index++;
-    const std::string where = "rule " + std::to_string(index) + ": ";
-    switch (rule.family) {
-      case FirewallFamily::kIpv4:
-      case FirewallFamily::kIpv6:
-        break;
-      case FirewallFamily::kAny:
-        // A rule with no family cannot carry a prefix: there would be no
-        // width to read the length against.
-        if (rule.src_len != 0 || rule.dst_len != 0) {
-          return std::unexpected(where +
-                                 "a rule that names no family cannot carry a "
-                                 "prefix");
-        }
-        break;
-    }
-    const uint8_t bits = FamilyBits(rule.family);
-    if (rule.src_len > bits) {
-      return std::unexpected(where + "source prefix length " +
-                             std::to_string(rule.src_len) + " is beyond " +
-                             std::to_string(bits));
-    }
-    if (rule.dst_len > bits) {
-      return std::unexpected(where + "destination prefix length " +
-                             std::to_string(rule.dst_len) + " is beyond " +
-                             std::to_string(bits));
-    }
-    if (rule.src_port_low > rule.src_port_high) {
-      return std::unexpected(where + "source port range " +
-                             std::to_string(rule.src_port_low) + "-" +
-                             std::to_string(rule.src_port_high) +
-                             " has its low bound above its high");
-    }
-    if (rule.dst_port_low > rule.dst_port_high) {
-      return std::unexpected(where + "destination port range " +
-                             std::to_string(rule.dst_port_low) + "-" +
-                             std::to_string(rule.dst_port_high) +
-                             " has its low bound above its high");
+    if (std::optional<std::string> refused = CheckRule(rule, index);
+        refused.has_value()) {
+      return std::unexpected(*refused);
     }
 
     const GroupKey group_key{static_cast<uint8_t>(rule.family), rule.proto,
@@ -262,10 +285,7 @@ FirewallTable::Build(std::vector<FirewallRule> rules) {
     // prefix), and the bytes beyond the family's width are zero: mask once,
     // here, so the packet path compares a masked network and never the
     // caller's original address.
-    rule.src_net = MaskedAddr(rule.src_net, rule.src_len, rule.family);
-    rule.dst_net = MaskedAddr(rule.dst_net, rule.dst_len, rule.family);
-    rule.checks_ports = rule.src_port_low != 0 || rule.src_port_high != 0xffff ||
-                        rule.dst_port_low != 0 || rule.dst_port_high != 0xffff;
+    NormalizeRule(rule);
 
     group.entries.push_back(
         Entry{Pack(rule.src_net, rule.src_len, rule.dst_net, rule.dst_len,
@@ -413,6 +433,78 @@ uint64_t FirewallTable::LookupBatch(const FirewallKey *keys, size_t n,
     }
   }
   return matched;
+}
+
+std::expected<FirewallScan, std::string> FirewallScan::Create(
+    std::vector<FirewallRule> rules) {
+  for (size_t i = 0; i < rules.size(); i++) {
+    if (std::optional<std::string> refused =
+            CheckRule(rules[i], static_cast<uint32_t>(i + 1));
+        refused.has_value()) {
+      return std::unexpected(*refused);
+    }
+  }
+  // The same normalization Build applies, through the same function: the
+  // shared predicate reads the masked network and the derived port flag, so a
+  // scan that stored the caller's rule as given would answer differently - both
+  // ways, as it turned out, missing rules it should find and finding rules it
+  // should not.
+  for (FirewallRule &rule : rules) {
+    NormalizeRule(rule);
+  }
+  FirewallScan scan;
+  scan.rules_ = std::move(rules);
+  return scan;
+}
+
+bool FirewallScan::Lookup(const FirewallKey &key,
+                          FirewallTable::Match *match) const noexcept {
+  for (size_t i = 0; i < rules_.size(); i++) {
+    const FirewallRule &rule = rules_[i];
+    // The family is part of a rule's identity in the index (a group is one
+    // family); here it is this test, and a rule that names no family sees both.
+    if (rule.family != FirewallFamily::kAny && rule.family != key.family) {
+      continue;
+    }
+    // The index packs once per group; a scan packs once per rule, which is what
+    // it trades for having no groups at all.
+    const FirewallTable::PackedKey packed =
+        FirewallTable::Pack(key.src, rule.src_len, key.dst, rule.dst_len,
+                            key.family);
+    if (FirewallTable::Matches(rule, key, packed)) {
+      match->action = rule.action;
+      match->rule_id = static_cast<uint32_t>(i + 1);
+      return true;
+    }
+  }
+  return false;
+}
+
+uint64_t FirewallScan::LookupBatch(const FirewallKey *keys, size_t n,
+                                   FirewallTable::Match *matches,
+                                   bool with_rule_id) const noexcept {
+  uint64_t mask = 0;
+  for (size_t i = 0; i < n && i < 64; i++) {
+    FirewallTable::Match match;
+    if (!Lookup(keys[i], &match)) {
+      continue;  // a key nothing matches is left untouched
+    }
+    mask |= uint64_t{1} << i;
+    matches[i].action = match.action;
+    if (with_rule_id) {
+      matches[i].rule_id = match.rule_id;
+    }
+  }
+  return mask;
+}
+
+bool FirewallScan::HasFamily(FirewallFamily family) const noexcept {
+  for (const FirewallRule &rule : rules_) {
+    if (rule.family == FirewallFamily::kAny || rule.family == family) {
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace bess::classifier

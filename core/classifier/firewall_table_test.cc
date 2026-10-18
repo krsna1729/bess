@@ -27,6 +27,7 @@ using bess::classifier::FirewallAddr;
 using bess::classifier::FirewallFamily;
 using bess::classifier::FirewallKey;
 using bess::classifier::FirewallRule;
+using bess::classifier::FirewallScan;
 using bess::classifier::FirewallTable;
 
 constexpr FirewallFamily k4 = FirewallFamily::kIpv4;
@@ -432,64 +433,82 @@ TEST(FirewallTableTest, LookupBatchReportsMaskActionAndRule) {
   EXPECT_EQ(77u, only_action[2].rule_id);
 }
 
-TEST(FirewallTableTest, MatchesTheScalarReferenceOverRandomRuleSets) {
-  std::mt19937 rng = bess::testing::SeededRng(20261018);
+// One random rule and one random key from the corpus the reference test walks:
+// the index and the scan are judged on the same inputs, so their agreement is
+// not a coincidence of two generators.
+FirewallRule RandomRule(std::mt19937 &rng) {
   std::uniform_int_distribution<int> family_pick(0, 2);
   std::uniform_int_distribution<int> proto_pick(0, 2);
   std::uniform_int_distribution<int> byte(0, 255);
   std::uniform_int_distribution<int> port(0, 65535);
   std::uniform_int_distribution<int> action(0, 3);
 
+  FirewallRule r;
+  const int pick = family_pick(rng);
+  r.family = pick == 0 ? k4 : (pick == 1 ? k6 : kAny);
+  // A family with no prefix at all cannot carry a length (the table refuses
+  // that), so such a rule stays at 0.
+  if (r.family != kAny) {
+    r.src_len = static_cast<uint8_t>(rng() % (r.family == k4 ? 33 : 129));
+    r.dst_len = static_cast<uint8_t>(rng() % (r.family == k4 ? 33 : 129));
+    for (size_t b = 0; b < 16; b++) {
+      r.src_net[b] = static_cast<uint8_t>(byte(rng));
+      r.dst_net[b] = static_cast<uint8_t>(byte(rng));
+    }
+  }
+  const int p = proto_pick(rng);
+  r.proto = p == 0 ? 0 : (p == 1 ? kTcp : kUdp);
+  const bool wide_src = rng() % 3 == 0;
+  const bool wide_dst = rng() % 3 == 0;
+  if (!wide_src) {
+    r.src_port_low = static_cast<uint16_t>(port(rng));
+    r.src_port_high = static_cast<uint16_t>(
+        std::min<int>(0xffff, r.src_port_low + static_cast<int>(rng() % 500)));
+  }
+  if (!wide_dst) {
+    r.dst_port_low = static_cast<uint16_t>(port(rng));
+    r.dst_port_high = static_cast<uint16_t>(
+        std::min<int>(0xffff, r.dst_port_low + static_cast<int>(rng() % 500)));
+  }
+  r.action = static_cast<uint16_t>(action(rng));
+  return r;
+}
+
+FirewallKey RandomKey(std::mt19937 &rng) {
+  std::uniform_int_distribution<int> proto_pick(0, 2);
+  std::uniform_int_distribution<int> byte(0, 255);
+  std::uniform_int_distribution<int> port(0, 65535);
+
+  FirewallKey key;
+  const bool v6 = rng() % 2 == 0;
+  key.family = v6 ? k6 : k4;
+  for (size_t b = 0; b < 16; b++) {
+    // A v4 key's addresses are four bytes wide, as a packet's are.
+    key.src[b] = v6 || b < 4 ? static_cast<uint8_t>(byte(rng)) : 0;
+    key.dst[b] = v6 || b < 4 ? static_cast<uint8_t>(byte(rng)) : 0;
+  }
+  const int p = proto_pick(rng);
+  key.proto = p == 0 ? 0 : (p == 1 ? kTcp : kUdp);
+  key.src_port = static_cast<uint16_t>(port(rng));
+  key.dst_port = static_cast<uint16_t>(port(rng));
+  return key;
+}
+
+TEST(FirewallTableTest, MatchesTheScalarReferenceOverRandomRuleSets) {
+  std::mt19937 rng = bess::testing::SeededRng(20261018);
+
   for (int round = 0; round < 200; round++) {
     const int count = 1 + static_cast<int>(rng() % 12);
     std::vector<FirewallRule> rules;
+    rules.reserve(static_cast<size_t>(count));
     for (int i = 0; i < count; i++) {
-      FirewallRule r;
-      const int pick = family_pick(rng);
-      r.family = pick == 0 ? k4 : (pick == 1 ? k6 : kAny);
-      // A family with no prefix at all cannot carry a length (the table
-      // refuses that), so such a rule stays at 0.
-      if (r.family != kAny) {
-        r.src_len = static_cast<uint8_t>(rng() % (r.family == k4 ? 33 : 129));
-        r.dst_len = static_cast<uint8_t>(rng() % (r.family == k4 ? 33 : 129));
-        for (size_t b = 0; b < 16; b++) {
-          r.src_net[b] = static_cast<uint8_t>(byte(rng));
-          r.dst_net[b] = static_cast<uint8_t>(byte(rng));
-        }
-      }
-      const int p = proto_pick(rng);
-      r.proto = p == 0 ? 0 : (p == 1 ? kTcp : kUdp);
-      const bool wide_src = rng() % 3 == 0;
-      const bool wide_dst = rng() % 3 == 0;
-      if (!wide_src) {
-        r.src_port_low = static_cast<uint16_t>(port(rng));
-        r.src_port_high = static_cast<uint16_t>(
-            std::min<int>(0xffff, r.src_port_low + static_cast<int>(rng() % 500)));
-      }
-      if (!wide_dst) {
-        r.dst_port_low = static_cast<uint16_t>(port(rng));
-        r.dst_port_high = static_cast<uint16_t>(
-            std::min<int>(0xffff, r.dst_port_low + static_cast<int>(rng() % 500)));
-      }
-      r.action = static_cast<uint16_t>(action(rng));
-      rules.push_back(r);
+      rules.push_back(RandomRule(rng));
     }
 
     auto table = FirewallTable::Build(rules);
     ASSERT_TRUE(table.has_value()) << table.error();
     for (int k = 0; k < 200; k++) {
-      FirewallKey key;
-      const bool v6 = rng() % 2 == 0;
-      key.family = v6 ? k6 : k4;
-      for (size_t b = 0; b < 16; b++) {
-        // A v4 key's addresses are four bytes wide, as a packet's are.
-        key.src[b] = v6 || b < 4 ? static_cast<uint8_t>(byte(rng)) : 0;
-        key.dst[b] = v6 || b < 4 ? static_cast<uint8_t>(byte(rng)) : 0;
-      }
-      const int p = proto_pick(rng);
-      key.proto = p == 0 ? 0 : (p == 1 ? kTcp : kUdp);
-      key.src_port = static_cast<uint16_t>(port(rng));
-      key.dst_port = static_cast<uint16_t>(port(rng));
+      const FirewallKey key = RandomKey(rng);
 
       FirewallTable::Match match;
       const bool found = (*table)->Lookup(key, &match);
@@ -498,6 +517,89 @@ TEST(FirewallTableTest, MatchesTheScalarReferenceOverRandomRuleSets) {
       if (want != 0) {
         EXPECT_EQ(want, match.rule_id) << "round " << round << " key " << k;
         EXPECT_EQ(rules[want - 1].action, match.action);
+      }
+    }
+  }
+}
+
+// The scan is a second implementation of the same answer, so the test that
+// matters is agreement: with the index, with the scalar reference, and about
+// which policies are expressible at all. A policy the index refuses the scan
+// must refuse with the same message, or the two would disagree about what a
+// caller may program.
+TEST(FirewallTableTest, TheScanAgreesWithTheIndexOverRandomRuleSets) {
+  std::mt19937 rng = bess::testing::SeededRng(20261019);
+
+  for (int round = 0; round < 200; round++) {
+    const int count = 1 + static_cast<int>(rng() % 12);
+    std::vector<FirewallRule> rules;
+    rules.reserve(static_cast<size_t>(count));
+    for (int i = 0; i < count; i++) {
+      rules.push_back(RandomRule(rng));
+    }
+
+    auto table = FirewallTable::Build(rules);
+    auto scan = FirewallScan::Create(rules);
+    ASSERT_EQ(table.has_value(), scan.has_value())
+        << "round " << round << ": the index and the scan disagree about the "
+        << "policy";
+    if (!table.has_value()) {
+      EXPECT_EQ(table.error(), scan.error()) << "round " << round;
+      continue;
+    }
+
+    EXPECT_EQ((*table)->rule_count(), scan->rule_count());
+    EXPECT_EQ((*table)->HasFamily(k4), scan->HasFamily(k4));
+    EXPECT_EQ((*table)->HasFamily(k6), scan->HasFamily(k6));
+
+    for (int k = 0; k < 200; k++) {
+      const FirewallKey key = RandomKey(rng);
+
+      FirewallTable::Match indexed;
+      FirewallTable::Match scanned;
+      const bool found_indexed = (*table)->Lookup(key, &indexed);
+      const bool found_scanned = scan->Lookup(key, &scanned);
+      const uint32_t want = Reference(rules, key);
+      // The reference is the arbiter, so it is asserted first: when the two
+      // structures disagree, the failure says which one is wrong.
+      ASSERT_EQ(want != 0, found_scanned) << "round " << round << " key " << k;
+      ASSERT_EQ(want != 0, found_indexed) << "round " << round << " key " << k;
+      ASSERT_EQ(found_indexed, found_scanned)
+          << "round " << round << " key " << k;
+      if (want != 0) {
+        EXPECT_EQ(want, scanned.rule_id) << "round " << round << " key " << k;
+        EXPECT_EQ(indexed.rule_id, scanned.rule_id);
+        EXPECT_EQ(indexed.action, scanned.action);
+        EXPECT_EQ(rules[want - 1].action, scanned.action);
+      }
+    }
+
+    // A batch: the same mask, the same actions, the same ids - and a key
+    // nothing matches is left untouched by both.
+    std::array<FirewallKey, 64> keys;
+    for (FirewallKey &key : keys) {
+      key = RandomKey(rng);
+    }
+    std::array<FirewallTable::Match, 64> indexed_matches;
+    std::array<FirewallTable::Match, 64> scanned_matches;
+    for (size_t i = 0; i < keys.size(); i++) {
+      indexed_matches[i] = FirewallTable::Match{0xffff, 0xffffffff};
+      scanned_matches[i] = FirewallTable::Match{0xffff, 0xffffffff};
+    }
+    const uint64_t indexed_mask = (*table)->LookupBatch(
+        keys.data(), keys.size(), indexed_matches.data());
+    const uint64_t scanned_mask = scan->LookupBatch(
+        keys.data(), keys.size(), scanned_matches.data());
+    EXPECT_EQ(indexed_mask, scanned_mask) << "round " << round;
+    for (size_t i = 0; i < keys.size(); i++) {
+      EXPECT_EQ(indexed_matches[i].action, scanned_matches[i].action)
+          << "round " << round << " key " << i;
+      EXPECT_EQ(indexed_matches[i].rule_id, scanned_matches[i].rule_id)
+          << "round " << round << " key " << i;
+      if ((indexed_mask & (uint64_t{1} << i)) == 0) {
+        // Untouched: both leave the caller's value alone on a miss.
+        EXPECT_EQ(0xffff, scanned_matches[i].action);
+        EXPECT_EQ(0xffffffffu, scanned_matches[i].rule_id);
       }
     }
   }

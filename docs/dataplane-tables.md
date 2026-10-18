@@ -196,6 +196,17 @@ is *cheaper to scan* (117 M/s) than to index, because the index pays a group
 scan and a binary search per key: a handful of rules wants the scan itself (or
 `RuntimeMaskedBackend`), and the index's advantage grows to 72x at 1,000 rules.
 
+That scan is a class: `FirewallScan`, in the same header. It holds the rules in
+policy order and answers `Lookup`/`LookupBatch` with the same `Match` shape and
+the **same predicate** - a lookup packs the key to the rule's own prefix lengths
+and calls the `Matches` the index calls per group - so the two structures cannot
+disagree about what a rule means, and they refuse the same policies with the
+same message. It pays one packing per rule rather than one per group, which is
+exactly the trade above: it is the right structure for a handful of rules, and
+it is the one to use when a caller holds **one policy per session** (the UPF's
+PDR matcher), where a few rules and no groups is both the smallest memory and
+the fastest answer. The index is what a policy of hundreds of rules wants.
+
 One change rebuilds the whole table (mode G): about 50 µs at 1K rules and about
 1 ms at 10,000. A per-session table with 100K+ rules therefore wants sharding
 (one table per direction, or per UE group) or an incremental path that does not
