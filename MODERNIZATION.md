@@ -2391,7 +2391,12 @@ rather than one call site).
     — a scheduler that briefly held two roots keeps a `!default_rr_*` wrapper
     behind, and the failed transaction left it in the snapshot. `Abort()` now
     collapses scheduler defaults after replaying the undo log, so a failed
-    transaction leaves no trace, internal traffic classes included.
+    transaction leaves no trace, internal traffic classes included. The
+    collapse happens on a worker only while it is parked: the resume that
+    unblocks a paused worker collapses its wrapper first (`WorkerManager::
+    Resume`), `Abort()` covers the workers a pauser never resumes, and a
+    worker still running keeps its wrapper until a pause parks it, because its
+    thread reads that tree (`Scheduler::Next` → `PickNextChild`) with no lock.
     `SpecFromSnapshot()` also treats an internal parent as "no parent", which is
     what makes re-applying the running pipeline a no-op.
 

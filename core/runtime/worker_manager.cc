@@ -134,6 +134,13 @@ void WorkerManager::PauseAll() {
 void WorkerManager::Resume(WorkerId wid) {
   Worker *worker = Get(wid);
   if (worker && worker->status() == WORKER_PAUSED) {
+    // The last moment this worker's tree may be rewritten: the thread is
+    // parked and reads root_ and the round-robin's children again the instant
+    // it is unblocked. Doing it here is also what lets a transaction leave no
+    // trace: the pauser attaches orphans and resumes in one step, so the
+    // wrapper that attach created is collapsed before the worker runs again.
+    AdjustSchedulerDefault(wid);
+
     worker_signal sig = worker_signal::unblock;
 
     int ret = write(worker->fd_event(), &sig, sizeof(sig));
@@ -146,8 +153,6 @@ void WorkerManager::Resume(WorkerId wid) {
 }
 
 void WorkerManager::ResumeAll() {
-  AdjustSchedulerDefaults();
-
   for (WorkerId wid : dataplane::AllWorkerIds()) {
     Resume(wid);
   }
@@ -275,12 +280,23 @@ Worker *WorkerManager::NextActive() {
   return ret;
 }
 
+void WorkerManager::AdjustSchedulerDefault(WorkerId wid) {
+  Worker *worker = Get(wid);
+  if (worker == nullptr || worker->status() != WORKER_PAUSED) {
+    // A running worker's thread is inside Scheduler::Next() ->
+    // PickNextChild() reading exactly what AdjustDefault() deletes, and
+    // neither Scheduler nor TrafficClass has a lock of its own, so its tree is
+    // rewritten only after a pause parks it. A worker still parking
+    // (WORKER_PAUSING) is left alone for the same reason.
+    return;
+  }
+
+  worker->scheduler()->AdjustDefault();
+}
+
 void WorkerManager::AdjustSchedulerDefaults() {
-  for (const auto &slot : workers_) {
-    Worker *worker = slot.load();
-    if (worker) {
-      worker->scheduler()->AdjustDefault();
-    }
+  for (WorkerId wid : dataplane::AllWorkerIds()) {
+    AdjustSchedulerDefault(wid);
   }
 }
 

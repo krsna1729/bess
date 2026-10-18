@@ -116,8 +116,14 @@ class WorkerManager {
   // ownership of the detached class to the caller.
   bool DetachTc(TrafficClass *c);
 
-  // Collapses the per-worker default round-robin wrappers that orphan
-  // attachment creates when a scheduler briefly holds more than one root.
+  // Collapses the default round-robin wrapper on `wid`'s scheduler, if it has
+  // one: orphan attachment creates it when a scheduler briefly holds more than
+  // one root. Does nothing unless that worker is parked -- the rewrite deletes
+  // the class its thread would otherwise be reading.
+  void AdjustSchedulerDefault(WorkerId wid);
+
+  // The same, over every worker: the workers a pauser does not resume (it
+  // records only the ones it found running) still need their wrapper gone.
   void AdjustSchedulerDefaults();
 
   // Called by the worker thread itself once it is up.

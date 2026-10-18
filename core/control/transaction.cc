@@ -397,7 +397,11 @@ void Transaction::Abort() noexcept {
   // attaches orphan traffic classes, and a scheduler that briefly held two
   // roots keeps a default round-robin wrapper for them. Collapse those, so a
   // failed transaction leaves no trace at all -- including in the structural
-  // snapshot.
+  // snapshot. The resume a pauser performs collapses its own workers' wrappers
+  // on the way out; this call covers the rest, since the pauser records only
+  // the workers it found running and a worker that was already paused is never
+  // resumed. A worker still running keeps its wrapper until a pause parks it:
+  // its thread reads the tree.
   runtime::runtime().workers().AdjustSchedulerDefaults();
 }
 
