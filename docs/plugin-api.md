@@ -514,6 +514,7 @@ The unit of packet transport between modules:
 ## 4. Metadata Chaining
 
 Cross-module state in a pipeline (e.g. classification result $\to$ meter $\to$ routing decision) travels in metadata attributes:
+- A write happens only where something reads: offsets are computed from writer to reader, so an attribute nothing reads gets **no offset at all** and the write is skipped. A module that publishes a result must therefore tolerate a graph that does not consume it - and a graph that expects the result must contain a reader, or the producer silently writes nothing.
 - Attributes are declared during `Init`:
   ```cpp
   action_id_attr_ = AddMetadataAttr("action_id", sizeof(bess::utils::be32_t),

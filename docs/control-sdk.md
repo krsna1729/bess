@@ -60,6 +60,17 @@ with its `default_gate`). Discovery (C++ and Go `Resource`/`Resources`) gives
 each its `kind` (`KIND_MAP`, `KIND_SINGLETON`; a daemon before D-129 sends
 none: a map) and `requires_paused_workers`.
 
+**A transaction must contain what it references.** A value that names another
+resource's key is refused unless that key is written *somewhere* in the same
+transaction, or the resource already holds it (`references missing
+<resource>/<key>`; a key the transaction erases while something still refers to
+it is `... is still referenced`). The order of the operations does not matter -
+the engine sorts the commit itself, upserts before erases and resources by rank
+- so a client that emits a session's records in one transaction must *include*
+every record the others name (a rule, its action, the action's meter, tunnel and
+next hop), and may modify an existing action without re-upserting it. Omitting
+one is the whole failure mode, and a rejected transaction publishes nothing.
+
 A singleton is set, never upserted or erased: C++ `tx.Set(*settings, value)`,
 Go `tx.Set(settings, value)` add an op with a value and no key. `Upsert` or
 `Erase` on a singleton, and `Set` on a map, are `InvalidRequest` before
