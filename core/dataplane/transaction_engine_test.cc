@@ -16,6 +16,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -1219,6 +1220,66 @@ TEST(TransactionEngineRegistrationTest, ReferenceCyclesAreRefused) {
   ASSERT_TRUE(engine.ReleaseForTeardown(
       std::vector<std::string>{"first", "second"}));
   domain.Drain();
+}
+
+// A clear of a map with many keys is one op per entry, and a transaction retires
+// what its operations remove, so past retire_high_water()/2 the engine refuses
+// the whole set with "split it" and applies nothing. ApplyBatched() splits it
+// instead: bounded transactions, all applied, converged.
+//
+// Its own domain, small on purpose: the budget is the engine's own number, and a
+// test that borrowed the runtime's large one could not exceed it with a table
+// this size. Convergence is checked through the engine's own answer for a key
+// that is not there - a refusal - rather than by a second clear succeeding,
+// because an erase of an absent key is refused, not ignored.
+TEST(TransactionEngineBatchingTest, ASetPastTheRetireBudgetIsSplitAndApplied) {
+  rcu::RcuDomain domain(1, /*retire_high_water=*/8);
+  TransactionEngine engine(domain);
+  SlotTable<MeterId, Meter> meters(64);
+  SlotResource<MeterId, Meter> resource("meters", meters);
+  ASSERT_TRUE(engine.Register(&resource).has_value());
+
+  const size_t budget = domain.retire_high_water() / 2;
+  ASSERT_EQ(4u, budget);
+  const size_t count = budget * 4;
+
+  std::vector<Op> upserts;
+  upserts.reserve(count);
+  for (size_t i = 0; i < count; i++) {
+    upserts.push_back(Op::Upsert("meters", EncodeKey(MeterId(i + 1)),
+                                 std::any(Meter(static_cast<uint32_t>(i)))));
+  }
+  const auto seeded = engine.Apply(upserts);
+  ASSERT_EQ(seeded.outcome, Outcome::kApplied) << seeded.ops[0].error;
+
+  std::vector<Op> erases;
+  erases.reserve(count);
+  for (size_t i = 0; i < count; i++) {
+    erases.push_back(Op::Erase("meters", EncodeKey(MeterId(i + 1))));
+  }
+
+  // One transaction of the whole set is over budget: refused, nothing applied.
+  const auto refused = engine.Apply(erases);
+  ASSERT_EQ(refused.outcome, Outcome::kRejected);
+  EXPECT_TRUE(refused.over_budget);
+
+  const size_t before =
+      engine.outcome_counts()[static_cast<size_t>(Outcome::kApplied)];
+  const auto batched = engine.ApplyBatched(erases);
+  ASSERT_EQ(batched.outcome, Outcome::kApplied) << batched.ops[0].error;
+  const size_t after =
+      engine.outcome_counts()[static_cast<size_t>(Outcome::kApplied)];
+  EXPECT_GT(after - before, 1u) << "the set must take more than one transaction";
+
+  // Converged: every key is gone, which the engine reports as a refusal to
+  // erase a key that is not there. That is also the reason the busy retry lives
+  // inside ApplyBatched: re-running the whole request would hit this.
+  const auto again = engine.ApplyBatched(erases);
+  EXPECT_EQ(again.outcome, Outcome::kRejected);
+  ASSERT_FALSE(again.ops.empty());
+  EXPECT_NE(std::string::npos, again.ops[0].error.find("not found"))
+      << "a converged clear must report the keys as absent, got: "
+      << again.ops[0].error;
 }
 
 }  // namespace

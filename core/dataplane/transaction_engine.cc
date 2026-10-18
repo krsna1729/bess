@@ -665,10 +665,15 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
       size_t{footprint.retires} + size_t{footprint.removals};
   const size_t retire_budget = domain_.retire_high_water() / 2;
   if (may_retire > retire_budget) {
-    return Reject(n, 0,
-                  "transaction retires up to " + std::to_string(may_retire) +
-                      " objects, more than one batch allows (" +
-                      std::to_string(retire_budget) + "); split it");
+    Result result =
+        Reject(n, 0,
+               "transaction retires up to " + std::to_string(may_retire) +
+                   " objects, more than one batch allows (" +
+                   std::to_string(retire_budget) + "); split it");
+    // ApplyBatched() splits on this; a caller of Apply() has the same fact in
+    // the error text above.
+    result.over_budget = true;
+    return result;
   }
   if (domain_.pending_retired() + deferred_objects_ + may_retire >
           retire_budget ||
@@ -864,6 +869,64 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
 
   applied.generation = generation_;
   return applied;
+}
+
+TransactionEngine::Result TransactionEngine::ApplyBatched(
+    std::span<const Op> ops, Consistency consistency) {
+  // An empty request is trivially applied: the caller asked for nothing to be
+  // in effect, and nothing is.
+  if (ops.empty()) {
+    Result result;
+    result.outcome = Outcome::kApplied;
+    result.generation = generation_;
+    return result;
+  }
+  Result last;
+  size_t offset = 0;
+  while (offset < ops.size()) {
+    size_t take = ops.size() - offset;
+    auto backoff = std::chrono::microseconds(200);
+    for (int retry = 0;; retry++) {
+      Result result =
+          Apply(ops.subspan(offset, take), std::nullopt, consistency);
+      if (result.outcome == Outcome::kApplied) {
+        last = std::move(result);
+        break;
+      }
+      // Busy: reclamation is behind the readers and nothing in this batch was
+      // attempted, so the same batch may be retried - and it must be the same
+      // batch, because the batches before it are applied and an erase of an
+      // already-erased key is refused ("not found"), not ignored. That is why
+      // the retry lives here rather than in a caller looping over the whole
+      // request.
+      if (result.outcome == Outcome::kBusy && retry < 5) {
+        std::this_thread::sleep_for(backoff);
+        backoff *= 2;
+        continue;
+      }
+      // Over budget: halve and try again. The budget is the engine's own
+      // (retire_high_water()/2) and what an operation retires depends on its
+      // cascade, not on its count, so a batch cannot be sized from the
+      // request - it is found by asking.
+      if (result.outcome == Outcome::kRejected && result.over_budget &&
+          take > 1) {
+        take = take / 2;
+        continue;
+      }
+      // A real failure, or a single operation that cannot fit a batch alone:
+      // report it, naming its resource so the caller need not map a
+      // batch-relative index back to its own request.
+      for (size_t i = 0; i < result.ops.size(); i++) {
+        if (result.ops[i].status == OpStatus::kFailed) {
+          result.ops[i].resource = ops[offset + i].resource;
+          break;
+        }
+      }
+      return result;
+    }
+    offset += take;
+  }
+  return last;
 }
 
 }  // namespace dataplane

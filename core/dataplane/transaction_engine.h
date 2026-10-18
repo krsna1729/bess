@@ -80,6 +80,10 @@ class TransactionEngine {
   struct OpResult {
     OpStatus status = OpStatus::kNotApplied;
     std::string error;  // for kFailed
+    // The resource the operation named, when the engine knows it: set on a
+    // result ApplyBatched() returns, so a caller reporting a failure does not
+    // have to map a batch-relative index back to its own request.
+    std::string resource;
   };
 
   enum class Outcome : uint8_t {
@@ -97,6 +101,11 @@ class TransactionEngine {
     Outcome outcome = Outcome::kRejected;
     uint64_t generation = 0;      // after the transaction
     std::vector<OpResult> ops;    // one per operation, in request order
+    // The retire-budget refusal specifically: the transaction is well-formed
+    // but would retire more objects than one batch allows, so it must be
+    // split rather than fixed. ApplyBatched() reads it; a caller of Apply()
+    // finds the same fact in the failed operation's error text.
+    bool over_budget = false;
   };
 
   explicit TransactionEngine(rcu::RcuDomain &domain) : domain_(domain) {}
@@ -170,6 +179,22 @@ class TransactionEngine {
                std::optional<uint64_t> expected_generation = std::nullopt,
                Consistency consistency = Consistency::kReferential,
                OnBusy on_busy = OnBusy::kAnswer);
+
+  // Apply() with the operations split into transactions that each respect the
+  // engine's retire budget. A caller whose op list is proportional to a
+  // resource's contents - a clear of a map with many keys - cannot size a
+  // transaction itself: what one retires depends on the operations' cascades,
+  // not on their count, and the budget is not the caller's to know. So this
+  // splits adaptively (apply what fits; on the budget refusal halve and try
+  // again) and applies the batches in request order.
+  //
+  // Convergence, not atomicity: the batches that applied stay applied, and the
+  // caller's next Apply finishes the rest, the desired state being unchanged.
+  // On a failure the answer is that batch's Result, and its failed operation
+  // carries the resource name, so a caller reporting the error does not have to
+  // map a batch-relative index back to its own request.
+  Result ApplyBatched(std::span<const Op> ops,
+                      Consistency consistency = Consistency::kReferential);
 
   // How many Apply() calls ended in each Outcome, indexed by the enum's value
   // (operational metrics, M25). kBusy counts answers only: a kBusy under

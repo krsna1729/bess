@@ -1712,16 +1712,15 @@ ControlResult<size_t> ControlPlane::ApplyResourcesLocked(
   // BUSY: reclamation is behind the readers and nothing was attempted. Wait
   // a few grace periods (each Apply reclaims what became ready first), as
   // ApplyTransaction does, but under the lock: about 6 ms at most.
-  dataplane::TransactionEngine::Result result;
-  auto backoff = std::chrono::microseconds(200);
-  for (int retry = 0;; retry++) {
-    result = engine.Apply(ops);
-    if (result.outcome != dataplane::TransactionEngine::Outcome::kBusy || retry == 5) {
-      break;
-    }
-    std::this_thread::sleep_for(backoff);
-    backoff *= 2;
-  }
+  //
+  // ApplyBatched, not Apply: a resource whose op list is proportional to its
+  // contents - a clear of a map with many keys - cannot be sized by the caller,
+  // and one transaction with one op per entry is refused as over budget. The
+  // batches apply in order and converge; a failure reports its own resource. It
+  // also owns the busy retry, which cannot live out here: a caller looping over
+  // the whole request would re-apply the batches that already applied, and an
+  // erase of an already-erased key is refused ("not found"), not ignored.
+  const dataplane::TransactionEngine::Result result = engine.ApplyBatched(ops);
   switch (result.outcome) {
     case dataplane::TransactionEngine::Outcome::kApplied:
       break;
@@ -1734,9 +1733,14 @@ ControlResult<size_t> ControlPlane::ApplyResourcesLocked(
     default: {
       for (size_t i = 0; i < result.ops.size(); i++) {
         if (result.ops[i].status == dataplane::TransactionEngine::OpStatus::kFailed) {
-          ControlError error = Err(EINVAL, "resource '%s': %s", ops[i].resource.c_str(),
+          // ApplyBatched() returns the failing batch's results, so the resource
+          // comes from there rather than from our own request order: a failure
+          // in batch k would otherwise be reported against operation i of the
+          // whole request, which is a different operation.
+          ControlError error = Err(EINVAL, "resource '%s': %s",
+                                   result.ops[i].resource.c_str(),
                                    result.ops[i].error.c_str());
-          error.object = ops[i].resource;
+          error.object = result.ops[i].resource;
           error.field = "resources";
           return std::unexpected(error);
         }
