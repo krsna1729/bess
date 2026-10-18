@@ -171,7 +171,8 @@ inline std::expected<size_t, IcmpRefusal> BuildIcmpv4Error(
     std::span<const uint8_t> original, const Icmpv4ErrorSpec &spec,
     std::span<uint8_t> out) noexcept {
   if (original.size() < sizeof(utils::Ipv4) || (original[0] >> 4) != 4 ||
-      (original[0] & 0x0f) < 5 || original.size() < (original[0] & 0x0fu) * 4u) {
+      (original[0] & 0x0f) < 5 ||
+      original.size() < static_cast<size_t>(original[0] & 0x0fu) * 4) {
     return std::unexpected(IcmpRefusal::kMalformed);
   }
   utils::Ipv4 orig;

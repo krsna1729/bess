@@ -4,7 +4,10 @@
 #ifndef BESS_UTILS_ICMP_H_
 #define BESS_UTILS_ICMP_H_
 
+#include <cstdint>
 #include <type_traits>
+
+#include "endian.h"
 
 namespace bess {
 namespace utils {
@@ -18,9 +21,9 @@ struct[[gnu::packed]] Icmp {
   be16_t seq_num;     // ICMP packet sequence number
 };
 
-static_assert(std::is_standard_layout<Icmp>::value &&
-                  std::is_trivial<Icmp>::value,
-              "Icmp must be standard-layout and trivial");
+static_assert(std::is_standard_layout<Icmp>::value,
+              "Icmp must be standard-layout");
+static_assert(std::is_trivial<Icmp>::value, "Icmp must be trivial");
 static_assert(sizeof(Icmp) == 8, "struct Icmp is incorrect");
 
 }  // namespace utils
