@@ -674,6 +674,7 @@ core_public_subdir_headers = {
     'stats/crossing_notifier.h',
     'stats/event_hub.h',
     'stats/event_throttle.h',
+    'stats/keyed_counters.h',
     'stats/metric_registry.h',
     'stats/worker_histogram.h',
     'stats/worker_local.h',

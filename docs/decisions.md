@@ -10829,3 +10829,64 @@ shows the count; an unresolved neighbor is dropped without being counted as a fa
 frame leaving the router's egress gate carries the hop's addresses and nothing else changes - it pinned the
 frame as untouched before this change, and the full suite is what found it. `docs/dataplane-tables.md`'s Router
 paragraph states the write beside the metadata read.
+
+## D-154 Per-worker keyed counters: one plane per worker, sized to the workers that exist
+
+**Status:** accepted (2026-10-18).
+**Code:** `core/stats/keyed_counters.h` (new, header-only, installed and classed experimental),
+`core/stats/stats_test.cc` (`KeyedCountersTest`, 5), `core/meson.build`, `tools/api_classes.json`,
+`docs/plugin-api.md`.
+**Analysis:** [plugin-api.md](plugin-api.md).
+
+**Context.** D-150 left two libraries to follow the tick hub: a threshold table (D-151) and "per-worker keyed
+counters a module's counters are built from". The consumer is a counter module, and the live one is the UPF's
+`UrrCount`: its counters are per rule and per worker, keyed by the rule's ActionId slot, two cells per rule
+(octets and packets), and it hand-rolls the planes itself (their `datapath/urr_count.h`: cache-line arrays of
+relaxed atomics, one plane per worker, `(action_id - 1) * kCellsPerRule` as the offset, and their own note that
+the two cells of one packet need not be seen together because they are additive). The tree's K6 storage,
+`stats::WorkerSlots`, follows the same *rule* - one writer per plane, relaxed updates, atomics only so a
+concurrent reader is well defined - but not the same *shape*: its storage is one plane per `kMaxWorkers` slot
+(64) whatever the daemon runs, and `ReadSlot` copies a whole plane into a span. A keyed plane is large (1M keys
+x 2 cells x 8 B x 8 workers is 128 MB), so the fixed 64 slots and a whole-plane copy are both the wrong shape,
+and every module that keeps its own planes keeps its own bugs.
+
+**Decision.** `stats::KeyedCounters` is the shared structure: `KeyedCounters(keys, cells_per_key, workers)`.
+
+- **One plane per worker, sized to the worker count the owner passes.** The owner is a module: a `stats/` header
+  may not include `runtime/` (the battery's own layering rule), and `Module::num_active_workers()` is 0 until
+  placement (`core/module.cc:192`), so the number comes from the caller in either case. The planes are padded to
+  whole cache lines so no two workers share one, and `bytes()` states the allocation for a footprint report.
+  This is the class's reason to exist: `CounterSet`'s cells are a small schema, this one's are a key space.
+- **The keys are the owner's dense indices, and nothing is allocated on the packet path.** `Add(key, cell, n)` is
+  a relaxed load, an add and a relaxed store; there is no hash, no growth and no map, and `Add` is `noexcept`. A
+  key the owner cannot place is the owner's to drop, exactly as it drops a packet for a rule it does not know.
+- **Reads are per cell, and there is no sequence word.** A single cell is always read whole, and the cells are
+  additive, so a crossing that lands during a read is reported by the next one - the level-triggered rule D-151
+  states. `WorkerSlots`' seqlock is for cells that must agree (a batch's packets and bytes); a keyed read does
+  not need it, and paying for it would put a second writer-facing store on the packet path.
+- **Reuse of a key is the owner's.** A key's cells keep their value when the owner reuses the slot, so a module
+  that re-arms a threshold on a reused key either records the value it saw and subtracts it, or keeps its keys
+  monotonic. Zeroing a plane from the control side would race its writer.
+- **Its preconditions are promises, not checks.** `keys`, `cells_per_key` and `workers` are at least 1 and
+  `workers` at most `kMaxWorkers`, stated as `promise`s (`core/utils/common.h:24`: a hint to the optimiser, so a
+  violation is undefined behaviour - the tree's convention for a caller bug). The zero key space is the one that
+  matters, and review found it: `RoundUpToLine(0)` is 0, so every plane is empty and the first `ForWorker` hands
+  out a pointer into nothing. A module that owns a capacity refuses a zero one in its own Init rather than
+  passing it here.
+
+**Costs.** The memory is the module's to size and to report; a read is one relaxed load per plane, so a sweep
+costs the armed keys times the worker count, which D-151's budgeted sweep already bounds.
+
+**The alternative, and why it is not this commit.** `WorkerSlots` could take a worker count and a per-cell read,
+and this class could then be a thin view over it, which would leave one storage implementation in the tree. That
+is a change to a landed K6 class (its `ForWorker`/`ReadSlot` contracts, its own callers) made for a caller whose
+contract differs - per-cell reads, no grouped reads, planes sized by the owner - so the storage is left alone
+here. If a third per-worker structure appears, sharing the storage is the change to make, and this class's
+planes are the shape it would take.
+
+**Evidence.** `KeyedCountersTest` (5): a plane's cells sum over the workers and stay apart (a cell never written
+reads 0); every `(key, cell)` is its own cell in every plane, so a stride that dropped the plane padding or
+swapped key and cell fails; each plane starts on a cache line of its own and ends before the next begins; the
+allocation scales with the worker count and is at least the cells themselves; and four writer threads adding
+200,000 times each leave the exact totals while a concurrent reader never sees a sum above the final one. Fast
+build: suite 216/216.
