@@ -164,11 +164,14 @@ class RouterTest : public ::testing::Test {
   }
 
   // A router that routes by destination (D-155): the mode is configuration,
-  // not a guess about the graph's wiring.
-  Router *MakeDestinationRouter(uint64_t domains = 1) {
+  // not a guess about the graph's wiring. `groups` sets max_groups (D-156).
+  Router *MakeDestinationRouter(uint64_t domains = 1, uint64_t groups = 0) {
     bess::pb::RouterArg arg;
     arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
     arg.set_max_domains(domains);
+    if (groups != 0) {
+      arg.set_max_groups(groups);
+    }
     return dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
   }
 
@@ -199,6 +202,30 @@ class RouterTest : public ::testing::Test {
     key.set_domain(domain);
     bess::pb::RouterRouteValue value;
     value.set_next_hop_id(hop);
+    EXPECT_EQ("", h_.UpsertResource("rt/routes", key, value));
+  }
+
+  // One next-hop group (D-156), written as a client writes it: the members in
+  // selection order, a repeated member a weight.
+  void MakeGroup(Router *rt, uint32_t id, const std::vector<uint32_t> &members) {
+    bess::pb::RouterGroupIdKey key;
+    key.set_id(id);
+    bess::pb::RouterGroupValue value;
+    for (const uint32_t member : members) {
+      value.add_member_ids(member);
+    }
+    EXPECT_EQ("", h_.UpsertResource("rt/groups", key, value));
+  }
+
+  // One route naming a group instead of a hop (D-156).
+  void MakeGroupRoute(Router *rt, const char *prefix, uint32_t length, uint32_t domain,
+                      uint32_t group) {
+    bess::pb::RouterRouteKey key;
+    key.set_ipv4(prefix);
+    key.set_prefix_length(length);
+    key.set_domain(domain);
+    bess::pb::RouterRouteValue value;
+    value.set_group_id(group);
     EXPECT_EQ("", h_.UpsertResource("rt/routes", key, value));
   }
 
@@ -568,6 +595,200 @@ TEST_F(RouterTest, ASharedFrameIsCopiedBeforeTheTtlIsWritten) {
   for (bess::PacketHandle kept : sharer->kept_) {
     bess::PacketFree(kept);
   }
+}
+
+// A frame to `dst` whose flow -- the addresses and ports a group route hashes
+// to pick a member (route::FlowHash) -- differs by its ports.
+Bytes FlowFrame(const char *dst, uint16_t src_port, uint16_t dst_port) {
+  PacketBuilder b;
+  b.Ether("02:00:00:00:00:0a", "02:00:00:00:00:0b")
+      .IPv4("192.0.2.1", dst)
+      .Udp(src_port, dst_port)
+      .Payload("payload");
+  return b.Build();
+}
+
+// -- mode 2: next-hop groups (D-156) ------------------------------------------
+
+// A route naming a group spreads flows over its members, and a flow keeps
+// the member it landed on: the same packet hashes the same way every time.
+TEST_F(RouterTest, AGroupRoutePicksOneMemberPerFlow) {
+  Router *rt = MakeDestinationRouter(1, 1);
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeHop(rt, 2, 2, "02:00:00:00:00:cc", "02:00:00:00:00:aa");
+  MakeGroup(rt, 1, {1, 2});
+  MakeGroupRoute(rt, "198.51.100.0", 24, 0, 1);
+
+  // The gate the one frame left on: 1 or 2, -1 for anything else.
+  const auto gate_of = [&](const Bytes &frame) -> int {
+    auto out = RunToDestination(rt, frame, 0, {0, 1, 2});
+    for (gate_idx_t gate : {1, 2}) {
+      if (!out[gate].empty()) {
+        EXPECT_EQ(1u, out[gate].size());
+        EXPECT_EQ(gate == 1 ? Mac("02:00:00:00:00:bb") : Mac("02:00:00:00:00:cc"),
+                  DstOf(out[gate][0]))
+            << "the picked member's own addresses were written";
+        EXPECT_EQ(63, TtlOf(out[gate][0])) << "a router decrements what it forwards";
+        return gate;
+      }
+    }
+    return -1;
+  };
+
+  std::map<uint16_t, int> picked;
+  std::map<int, int> spread;
+  for (uint16_t port = 1; port <= 64; port++) {
+    const int gate = gate_of(FlowFrame("198.51.100.9", 4000, port));
+    ASSERT_GE(gate, 1) << "flow " << port << " was forwarded";
+    picked[port] = gate;
+    spread[gate]++;
+  }
+  EXPECT_EQ(2u, spread.size())
+      << "64 flows spread over both members: " << spread[1] << "/" << spread[2];
+  for (const auto &[port, gate] : picked) {
+    EXPECT_EQ(gate, gate_of(FlowFrame("198.51.100.9", 4000, port)))
+        << "flow " << port << " kept its member";
+  }
+}
+
+// A repeated member is a weight: it takes that many selection slots, so
+// {1, 1, 2} sends about two thirds of the flows to hop 1 -- and the rest
+// still reach hop 2, a weight is not a takeover.
+TEST_F(RouterTest, ARepeatedMemberIsAWeight) {
+  Router *rt = MakeDestinationRouter(1, 1);
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeHop(rt, 2, 2, "02:00:00:00:00:cc", "02:00:00:00:00:aa");
+  MakeGroup(rt, 1, {1, 1, 2});
+  MakeGroupRoute(rt, "198.51.100.0", 24, 0, 1);
+
+  size_t ones = 0;
+  size_t twos = 0;
+  for (uint16_t port = 1; port <= 192; port++) {
+    auto out = RunToDestination(rt, FlowFrame("198.51.100.9", 4000, port), 0, {1, 2});
+    ones += out[1].size();
+    twos += out[2].size();
+  }
+  EXPECT_EQ(192u, ones + twos) << "every flow was forwarded to one member";
+  EXPECT_GT(ones, twos) << "the member twice in the list takes two of three slots: " << ones
+                        << " to hop 1, " << twos << " to hop 2";
+  EXPECT_GT(twos, 0) << "the other member still gets the slots it holds";
+}
+
+// A route names a next hop or a group (the two id fields), and whatever it names must
+// exist by the end of the transaction: a route to a group that was never
+// written, to one past max_groups, and one with no target at all are refused.
+TEST_F(RouterTest, ARouteToAnUnknownGroupIsRefused) {
+  Router *rt = MakeDestinationRouter(1, 4);
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, nullptr, nullptr);
+
+  bess::pb::RouterRouteKey key;
+  key.set_ipv4("198.51.100.0");
+  key.set_prefix_length(24);
+  bess::pb::RouterRouteValue value;
+  value.set_group_id(1);
+  EXPECT_NE("", h_.UpsertResource("rt/routes", key, value))
+      << "group 1 does not exist: a route references what it names";
+  value.set_group_id(5);
+  EXPECT_NE("", h_.UpsertResource("rt/routes", key, value))
+      << "group id 5 is past max_groups";
+  bess::pb::RouterRouteValue no_target;
+  EXPECT_NE("", h_.UpsertResource("rt/routes", key, no_target))
+      << "a route names a next hop or a group";
+  bess::pb::RouterRouteValue both;
+  both.set_next_hop_id(1);
+  both.set_group_id(1);
+  const std::string both_error = h_.UpsertResource("rt/routes", key, both);
+  EXPECT_NE(std::string::npos, both_error.find("not both"))
+      << "the two ids are separate namespaces: one target, not both: " << both_error;
+  MakeGroup(rt, 1, {1});
+  value.set_group_id(1);
+  EXPECT_EQ("", h_.UpsertResource("rt/routes", key, value)) << "now the group exists";
+}
+
+// The groups resource reads back in the form a client sends (D-129), members
+// in their stored order with a weight as a repeat; a route naming a group
+// reads back naming the group.
+TEST_F(RouterTest, GroupsAndGroupRoutesReadBack) {
+  Router *rt = MakeDestinationRouter(1, 1);
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, nullptr, nullptr);
+  MakeHop(rt, 2, 2, nullptr, nullptr);
+  MakeGroup(rt, 1, {1, 2, 1});
+  MakeGroupRoute(rt, "198.51.100.0", 24, 0, 1);
+
+  auto groups = h_.ReadResource("rt/groups");
+  ASSERT_EQ(1u, groups.size());
+  bess::pb::RouterGroupIdKey group_key;
+  bess::pb::RouterGroupValue group_value;
+  ASSERT_TRUE(groups[0].first.UnpackTo(&group_key));
+  ASSERT_TRUE(groups[0].second.UnpackTo(&group_value));
+  EXPECT_EQ(1u, group_key.id());
+  EXPECT_EQ((std::vector<uint32_t>{1, 2, 1}),
+            (std::vector<uint32_t>(group_value.member_ids().begin(),
+                                   group_value.member_ids().end())))
+      << "the order is the group's meaning, a repeat is its weight";
+
+  auto routes = h_.ReadResource("rt/routes");
+  ASSERT_EQ(1u, routes.size());
+  bess::pb::RouterRouteValue route_value;
+  ASSERT_TRUE(routes[0].second.UnpackTo(&route_value));
+  EXPECT_EQ(0u, route_value.next_hop_id()) << "the route names the group, not a hop";
+  EXPECT_EQ(1u, route_value.group_id());
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("1 groups")) << rt->GetDesc();
+}
+
+// References are the engine's (D-023): a group a route names cannot leave,
+// and neither can a member the group names; removing them in the right order
+// works.
+TEST_F(RouterTest, AGroupInUseCannotLeave) {
+  Router *rt = MakeDestinationRouter(1, 1);
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, nullptr, nullptr);
+  MakeHop(rt, 2, 2, nullptr, nullptr);
+  MakeGroup(rt, 1, {1, 2});
+  MakeGroupRoute(rt, "198.51.100.0", 24, 0, 1);
+
+  bess::pb::RouterRouteKey route_key;
+  route_key.set_ipv4("198.51.100.0");
+  route_key.set_prefix_length(24);
+  bess::pb::RouterGroupIdKey group_key;
+  group_key.set_id(1);
+  bess::pb::RouterNextHopIdKey hop_key;
+  hop_key.set_id(2);
+
+  EXPECT_NE("", h_.EraseResource("rt/groups", group_key)) << "a route names the group";
+  EXPECT_NE("", h_.EraseResource("rt/next_hops", hop_key)) << "the group names the hop";
+  EXPECT_EQ("", h_.EraseResource("rt/routes", route_key));
+  EXPECT_EQ("", h_.EraseResource("rt/groups", group_key));
+  EXPECT_EQ("", h_.EraseResource("rt/next_hops", hop_key));
+  EXPECT_EQ(0u, rt->router()->next_hop_group_count());
+}
+
+// Without max_groups the module still registers the groups resource -- a
+// class registers every table it declares (D-156) -- and it holds nothing and
+// refuses every id: a group write and a route naming a group are refused the
+// same way an unknown one is.
+TEST_F(RouterTest, WithoutMaxGroupsTheGroupsResourceIsEmpty) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, nullptr, nullptr);
+
+  EXPECT_TRUE(h_.ReadResource("rt/groups").empty()) << "registered, and empty";
+  bess::pb::RouterGroupIdKey group_key;
+  group_key.set_id(1);
+  bess::pb::RouterGroupValue group_value;
+  group_value.add_member_ids(1);
+  EXPECT_NE("", h_.UpsertResource("rt/groups", group_key, group_value));
+  bess::pb::RouterRouteKey route_key;
+  route_key.set_ipv4("198.51.100.0");
+  route_key.set_prefix_length(24);
+  bess::pb::RouterRouteValue route_value;
+  route_value.set_group_id(1);
+  EXPECT_NE("", h_.UpsertResource("rt/routes", route_key, route_value));
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("0 groups")) << rt->GetDesc();
 }
 
 }  // namespace

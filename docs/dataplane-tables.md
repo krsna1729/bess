@@ -66,7 +66,7 @@ stopping traffic.
 | masked/ternary match with priorities (5-tuple ACL style) | `RuntimeMaskedBackend` in a generation | `classifier/masked_exact.h` | rebuild + swap (mode G) |
 | masked 5-tuple **with port ranges**, both families, order = policy order | `FirewallTable` | `classifier/firewall_table.h` | rebuild + swap (mode G) |
 | exact match with a compile-time key type (a struct you own) | `ExactTable<Key, Result, Backend>` | `classifier/typed_exact.h` | rebuild + swap (G) |
-| IPv4 longest-prefix match | `RouteTable<Value>`; `Router` for routes + next hops | `route/route_table.h`, `route/router.h` | in place (C) |
+| IPv4 longest-prefix match | `RouteTable<Value>`; `Router` for routes + next hops + groups | `route/route_table.h`, `route/router.h` | in place (C) |
 | id → object (the result of a lookup is a rich object) | `ObjectTable<Id, T>` | `dataplane/object_table.h` | rebuild + swap (G) |
 | rate limiting / policing | `MeterSet` (+ `MeterState`) | `meter/meter_set.h` | set: G; bucket state: per meter, see header |
 | counters and histograms read by the controller | `CounterSet`, `WorkerHistogram` | `stats/counter_set.h`, `stats/worker_histogram.h` | worker-owned |
@@ -309,13 +309,20 @@ refused. An unset port bound is 65535, not 0, because the proto field is
 - **Next-hop groups** (M15, D-065): `SetNextHopGroup(id, members)` and
   `SetRoute(domain, prefix, NextHopGroupId)`; `Resolve`/`ResolveBatch`/
   `LookupRoute` take a flow hash that picks the member. Transactional when
-  enrolled: with `max_groups`, `Enroll` registers `<router>/groups` beside
-  next hops and routes, so `SetNextHopGroupOp`, `RemoveNextHopGroupOp` and
+  enrolled: `Enroll` registers `<router>/groups` beside next hops and routes
+  -- always, because a class must register every table it declares (D-156);
+  without `max_groups` the resource exists, holds nothing, and every group id
+  is invalid. `SetNextHopGroupOp`, `RemoveNextHopGroupOp` and
   `SetRouteOp(domain, prefix, NextHopGroupId)` commit together with next-hop
   and route changes. A group references its distinct members and a route the
   group it names: the engine refuses a member or group still in use. The
   direct group setters belong to an unenrolled router (`kEnrolled`). The
-  `Router` module does not expose groups.
+  `Router` module exposes groups as `<router>/groups` with `max_groups`
+  (D-156): `RouterGroupIdKey -> RouterGroupValue` is a member list of 1..64
+  next-hop ids in selection order, a repeated id a weight; a route's value
+  names a next hop or a group, exactly one (`RouterRouteValue`, D-156), and a
+  group route picks its member with `route::FlowHash` over the frame's
+  addresses and ports, the one function the appliance hashes with too.
   Neighbor state lives in `NeighborTable` (control side), whose updates are
   next-hop updates; TTL, MTU, ICMP and ARP mechanics are in `l3_packet.h`.
 
@@ -446,8 +453,9 @@ reference to something missing.
   lookup filters it, so the packet path is unchanged. The result 0xFFFF is
   reserved for it. D-024.
 - **Router** (opt-in, `Router::Enroll(engine)`): next hops as
-  `<router>/next_hops`, routes as `<router>/routes` (each route references
-  its next hop). An enrolled router is written only through the engine
+  `<router>/next_hops`, groups as `<router>/groups` (a member list, D-156),
+  routes as `<router>/routes` (each route references the next hop or the
+  group it names). An enrolled router is written only through the engine
   (the direct setters refuse, `kEnrolled`). New routes are placed during
   prepare with the value their addresses already resolve to, so rte_lpm
   capacity is settled before anything is visible. A change costs

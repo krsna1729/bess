@@ -80,11 +80,7 @@ Router::~Router() {
     // Routes reference groups and next hops, groups reference next hops: they
     // leave together with their contents; with readers gone, pending removals
     // complete in the call.
-    std::vector<std::string> names = {routes_name_};
-    if (groups_res_ != nullptr) {
-      names.push_back(groups_name_);
-    }
-    names.push_back(next_hops_name_);
+    std::vector<std::string> names = {routes_name_, groups_name_, next_hops_name_};
     auto unregistered = engine_->Unregister(names);
     CHECK(unregistered) << unregistered.error();
   }
@@ -115,12 +111,10 @@ Router::~Router() {
 // ends.
 class Router::RouteResource final : public dataplane::Resource {
  public:
-  explicit RouteResource(Router &router, bool groups)
+  explicit RouteResource(Router &router)
       : Resource(router.routes_name_,
-                 groups ? std::vector<std::string>{router.next_hops_name_, router.groups_name_}
-                        : std::vector<std::string>{router.next_hops_name_}),
-        router_(router),
-        groups_(groups) {}
+                 std::vector<std::string>{router.next_hops_name_, router.groups_name_}),
+        router_(router) {}
 
   size_t LiveCount() const override { return router_.CountRoutes(); }
 
@@ -174,7 +168,10 @@ class Router::RouteResource final : public dataplane::Resource {
       }
       value = hop->value();
     } else if (const NextHopGroupId *group = std::any_cast<NextHopGroupId>(&op.value)) {
-      if (!groups_ || !router_.ValidGroupId(*group)) {
+      // ValidGroupId is the whole test that groups exist: without max_groups
+      // the resource is registered (a class registers every table it
+      // declares) and holds nothing, so every id is invalid.
+      if (!router_.ValidGroupId(*group)) {
         return std::unexpected(RouteErrorName(RouteError::kInvalidId));
       }
       value = router_.max_next_hops_ + group->value();
@@ -281,7 +278,6 @@ class Router::RouteResource final : public dataplane::Resource {
   };
 
   Router &router_;
-  const bool groups_;  // the router registered "<name>/groups"
   std::set<::bess::route::RouteKey> pending_;  // placed in this transaction
 };
 
@@ -347,25 +343,24 @@ std::expected<void, std::string> Router::Enroll(
   if (groups_.size() != 0 || !retiring_groups_.empty()) {
     return std::unexpected("enroll before adding next-hop groups");
   }
-  const bool with_groups = group_references_.size() > 1;  // max_groups > 0
   auto hops = std::make_unique<dataplane::SlotResource<NextHopId, NextHop>>(
       next_hops_name_, next_hops_);
-  std::unique_ptr<GroupResource> groups =
-      with_groups ? std::make_unique<GroupResource>(*this) : nullptr;
-  auto routes = std::make_unique<RouteResource>(*this, with_groups);
+  // The groups resource is registered whether or not max_groups is set: the
+  // control plane refuses a class that registers fewer tables than it
+  // declares (CheckDeclaredResources), and the Router module declares all
+  // three (D-156). Without max_groups it holds nothing and every id is
+  // invalid.
+  auto groups = std::make_unique<GroupResource>(*this);
+  auto routes = std::make_unique<RouteResource>(*this);
   if (auto r = engine.Register(hops.get()); !r) {
     return r;
   }
-  if (groups != nullptr) {
-    if (auto r = engine.Register(groups.get()); !r) {
-      CHECK(engine.Unregister(next_hops_name_));
-      return r;
-    }
+  if (auto r = engine.Register(groups.get()); !r) {
+    CHECK(engine.Unregister(next_hops_name_));
+    return r;
   }
   if (auto r = engine.Register(routes.get()); !r) {
-    if (groups != nullptr) {
-      CHECK(engine.Unregister(groups_name_));
-    }
+    CHECK(engine.Unregister(groups_name_));
     CHECK(engine.Unregister(next_hops_name_));
     return r;
   }
@@ -381,11 +376,7 @@ std::expected<void, std::string> Router::Release() {
   if (engine_ == nullptr) {
     return {};  // not enrolled, or already released
   }
-  std::vector<std::string> names = {routes_name_};
-  if (groups_res_ != nullptr) {
-    names.push_back(groups_name_);
-  }
-  names.push_back(next_hops_name_);
+  std::vector<std::string> names = {routes_name_, groups_name_, next_hops_name_};
   auto released = engine_->ReleaseForTeardown(names);
   if (!released) {
     return released;
@@ -715,7 +706,7 @@ size_t Router::next_hop_group_count() const {
 
 size_t Router::GroupReferences(NextHopGroupId id) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (engine_ != nullptr && groups_res_ != nullptr) {
+  if (engine_ != nullptr) {
     return engine_->ReferenceCount(groups_name_, dataplane::EncodeKey(id));
   }
   return ValidGroupId(id) ? group_references_[id.value()] : 0;
@@ -725,7 +716,7 @@ size_t Router::GroupReferences(NextHopGroupId id) const {
 // member position; the direct API counts positions.
 size_t Router::GroupMemberships(NextHopId id) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (engine_ != nullptr && groups_res_ != nullptr) {
+  if (engine_ != nullptr) {
     size_t n = 0;
     groups_res_->VisitReferences([&](const dataplane::Reference &ref) {
       n += ref.key == dataplane::EncodeKey(id) ? 1 : 0;
@@ -843,6 +834,17 @@ void Router::ForEachNextHop(
   }
 }
 
+void Router::ForEachNextHopGroup(
+    const std::function<void(NextHopGroupId, const NextHopGroup &)> &fn) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (size_t i = 1; i <= groups_.capacity(); i++) {
+    const NextHopGroupId id(static_cast<uint32_t>(i));
+    if (const NextHopGroup *group = groups_.Current(id); group != nullptr) {
+      fn(id, *group);
+    }
+  }
+}
+
 void Router::ForEachRoute(
     const std::function<void(const ::bess::route::RouteKey &key, NextHopId hop,
                              NextHopGroupId group)> &fn) const {
@@ -862,9 +864,6 @@ void Router::ForEachRoute(
 size_t Router::RouteReferences(NextHopId id) const {
   std::lock_guard<std::mutex> lock(mutex_);
   if (engine_ != nullptr) {
-    if (groups_res_ == nullptr) {
-      return engine_->ReferenceCount(next_hops_name_, dataplane::EncodeKey(id));
-    }
     // Groups reference next hops too: count the routes' references only.
     const dataplane::Reference wanted{next_hops_name_, dataplane::EncodeKey(id)};
     size_t n = 0;

@@ -320,14 +320,42 @@ message RouterNextHopValue {
   bytes src_mac = 4;
 }
 
+/**
+ * The key of a Router's "<module>/groups" resource (D-129, D-156): a next-hop
+ * group id, 1..max_groups.
+ */
+message RouterGroupIdKey {
+  uint32 id = 1;
+}
+
+/**
+ * A Router next-hop group ("<module>/groups", D-065, D-156): the member next
+ * hops a route naming the group selects among. Members are in selection
+ * order, 1..64 of them, and a repeated member is a weight (it takes that many
+ * selection slots). A member must exist and a route naming the group
+ * references it: the engine refuses a member or a group still in use. Reads
+ * back in exactly this form (D-129), members in their stored order.
+ */
+message RouterGroupValue {
+  repeated uint32 member_ids = 1;
+}
+
 message RouterRouteKey {
   string ipv4 = 1;
   uint32 prefix_length = 2;
   uint32 domain = 3; /// Route domain (default 0); must be below the router's max_domains.
 }
 
+/**
+ * A route's target: a next hop, or the group whose member the flow hash
+ * picks. Ids are one-based, so 0 -- the default -- names nothing, and a route
+ * names exactly one of the two: the codec refuses a value that names both or
+ * neither (D-156). `next_hop_id` keeps its number and its meaning, so a route
+ * written for a hop reads back unchanged (D-129).
+ */
 message RouterRouteValue {
-  uint32 next_hop_id = 1;
+  uint32 next_hop_id = 1; /// The next hop the route forwards to (0: not that).
+  uint32 group_id = 2; /// The group the route forwards through (0: not that; needs max_groups).
 }
 
 
@@ -1339,9 +1367,9 @@ enum RouteMode {
 /**
  * The Router module forwards a packet to the egress its next-hop id (from
  * packet metadata) names, or -- in ROUTE_MODE_DESTINATION -- routes it by its
- * own IPv4 destination address in the route domain it carries (D-155). Routes
- * and next hops are the resource pair D-023 describes, changed together or
- * not at all.
+ * own IPv4 destination address in the route domain it carries (D-155). Routes,
+ * next hops and next-hop groups are the resources D-023 describes, changed
+ * together or not at all.
  *
  * __Input Gates__: 1
  * __Output Gates__: many (the next hop's egress)
@@ -1353,6 +1381,7 @@ message RouterArg {
   uint64 max_domains = 4; /// Route domains (VRFs) 0..n-1, each with its own FIB sized as above (default 1: the default domain only).
   RouteBackend backend = 5; /// Every domain's route table structure (default: LPM).
   RouteMode mode = 6; /// What the packet path decides from (default: the next_hop_id metadata).
+  uint64 max_groups = 7; /// Most next-hop groups (default 0: none; a route may name a group only with a nonzero bound). Together with max_next_hops, bounded by the 24-bit route value.
 }
 
 /**

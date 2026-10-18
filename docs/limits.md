@@ -79,6 +79,7 @@ Columns:
 | Meter | meters | default 1,024 | `MeterArg.capacity` | yes (up to the id width) | EINVAL |
 | ActionTable | actions | default 1,024 | `ActionTableArg.capacity` | yes (up to the id width) | EINVAL |
 | Router | next hops | 16M − 1 | `LpmRouteTable::kMaxValue` | `max_next_hops` up to the bound | EINVAL "router capacity exceeds backend limits" |
+| Router | next-hop groups | 16M − 1 − `max_next_hops` | `LpmRouteTable::kMaxValue` (shares the bound with `max_next_hops`) | `max_groups` up to the bound; 0 (the default) registers the empty resource | EINVAL "router capacity exceeds backend limits" |
 | Router | route domains | 16M | `route::kMaxRouteDomains` | `max_domains` up to the bound | EINVAL |
 | Router | members per next-hop group | 64 | `NextHopGroup::kMaxMembers` | No | refused |
 | IPLookup / Router | DPDK table instance name | 20 characters (the module name, cut, plus `_r<N>`) | `kMaxInstanceName` (`route/route_table.cc`) | No | never: the name is cut (DPDK's ring and `rte_fib` RIB mempool names, D-132) |
