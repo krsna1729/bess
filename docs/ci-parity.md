@@ -30,6 +30,13 @@ Build trees go to `build/ci-<lane>`, DPDK to
 `deps/dpdk-*/install-<lane>` (`tools/bootstrap_dpdk.py --variant`), so nothing
 here touches the fast tree or its DPDK.
 
+A step run alone (`verify-install`, `test`, `layers`) does not bootstrap DPDK
+first, and a fresh checkout has no `deps/dpdk-*/install-<lane>` at all: the step
+then dies in `pkg-config --variable=libdir libdpdk`. Run
+`tools/bootstrap_dpdk.py --variant fast` once (71 s when the DPDK build tree is
+already there) before a step, or run the whole profile, whose first step is
+`bootstrap`. This cost three stage rebuilds once, so it is worth the sentence.
+
 ## What the profile fixes
 
 | Setting | Value | Why |
