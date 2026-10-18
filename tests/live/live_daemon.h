@@ -12,6 +12,7 @@
 #ifndef BESS_TESTS_LIVE_LIVE_DAEMON_H_
 #define BESS_TESTS_LIVE_LIVE_DAEMON_H_
 
+#include <glog/logging.h>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/dynamic_message.h>
 #include <gtest/gtest.h>
@@ -161,10 +162,13 @@ class LiveTest : public ::testing::Test {
   void TearDown() override {
     // A daemon that died or stopped answering leaves no trace in a bare
     // ASSERT_TRUE, so say so and print its log: the failure then names the
-    // cause instead of pointing at whichever call noticed it.
+    // cause instead of pointing at whichever call noticed it. A live daemon
+    // still has context worth printing when a test failed.
     if (!Daemon::Shared().Alive()) {
       ADD_FAILURE() << "bessd is not answering; log:\n"
                     << Daemon::Shared().Log();
+    } else if (::testing::Test::HasFailure()) {
+      LOG(INFO) << "bessd log:\n" << Daemon::Shared().Log();
     }
     if (Daemon::Shared().Alive()) {
       Daemon::Shared().Reset();
