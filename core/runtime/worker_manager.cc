@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <set>
+#include <thread>
 #include <vector>
 
 #include "utils/logging.h"

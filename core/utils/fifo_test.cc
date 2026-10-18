@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
