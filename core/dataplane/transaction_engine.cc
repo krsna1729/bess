@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <thread>
 #include <utility>
 
 #include "utils/logging.h"

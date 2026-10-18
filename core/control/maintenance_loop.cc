@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <thread>
 
 #include "control/control_plane.h"
 #include "control/pressure_monitor.h"
