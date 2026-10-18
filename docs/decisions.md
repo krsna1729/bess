@@ -10619,3 +10619,59 @@ is the module layer of the same surface and belongs on the tree's list, not here
 which `GetPacketPools` already answers. One limit is documented rather than fixed: `live` is always 0 for a
 singleton resource (`framework/singleton_resource.h`), so the reply cannot distinguish a set singleton from an
 unset one; a `set` flag on the reply would fix it if a controller ever needs it.
+
+## D-150 Periodic control-side work for modules: the framework owns the clock, the module owns the work
+
+**Status:** accepted (2026-10-18; the user's design: the framework should not know about counters).
+**Code:** `core/framework/module_tick.{h,cc}` (`TickHub`, `TickEndpoint`, `TickContext`),
+`core/framework/module_init_context.{h,cc}` (`ticks()`), `core/framework/plugin.h` and `plugin_check.h`
+(`BESS_CAP_TICKS`, 1<<7), `core/runtime/runtime_state.h`, `core/control/maintenance_loop.{h,cc}`,
+`core/api_server.cc`, `core/meson.build` and `tools/api_classes.json` (the header is installed, classed
+experimental), tests in `core/framework/module_tick_test.cc` and `core/control/maintenance_loop_test.cc`,
+`docs/plugin-api.md`.
+
+**Context.** A module can have work that belongs on the control side and on a clock: a UPF counter module
+reading its per-worker counters against limits a controller armed (a volume threshold has to be noticed
+without the controller polling every counter), ageing, fill checks. The pieces existed but not the clock: a
+`RequestEndpoint` runs when a worker posts, a module command runs when a controller asks, and the maintenance
+loop visits the control side every tick under the lock without letting a module in. The first design put the
+knowledge of counters in the framework (a counter-source registry, an arm RPC, a sweep). That made the
+framework own a concept only some modules have, added an RPC and two regenerated SDKs for it, and served one
+kind of module.
+
+**Decision.** The framework offers only "call this module's code periodically, on the control side". A module
+opens a `TickEndpoint` in `Init` (RAII, like `RequestEndpoint`; `init_context().ticks()`, `BESS_CAP_TICKS`) with a
+period and a callback; the maintenance loop runs the callbacks that are due under the control-plane lock, as it
+runs request handlers. The framework owns three things so a module need not:
+
+- *When.* A callback is due on the first tick and then no sooner than `period` after the start of its previous
+  call (zero: every tick).
+- *How long.* Each call gets a time slice (the loop's, 250 microseconds by default), which the callback sees as
+  `ctx.Expired()` and honours by stopping at a point it can resume from. The framework cannot stop a callback
+  (only the module knows a safe stopping point), so it measures instead: `TickHub::overruns()` counts calls that
+  ran past their slice (an accessor today; a metric is the step when a consumer wants it), because the
+  control-plane lock is held for the whole call and a module command waits for it.
+- *Events.* `ctx.Emit(type, source, fields)` queues an event; the loop appends the queue to the log after
+  releasing the lock, so a burst costs the callback a queue push, not an allocation-heavy append under the lock.
+
+Lifetime follows the request hub's rule: an endpoint is opened in `Init` and destroyed with the module, both
+under the control-plane lock; destruction takes it out of the hub, so the hub never calls a module that is gone.
+A callback may open endpoints and close others, not its own (the call is running inside it).
+
+**What a module builds on it.** Counter thresholds are a module's own affair, as are their arming (the module's
+own action, typed by its own `GetSchema`, so no new RPC and no SDK change) and their event shape. The shared
+pieces that follow are libraries, not framework: a budgeted, level-triggered threshold table a module's tick
+uses, and per-worker keyed counters a module's counters are built from. Each lands as its own change.
+
+**Costs.** A module wires its own tick and arm action (about twenty lines with the library), and there is no
+uniform SDK call that arms thresholds on any module; a consumer's event handler is shared by agreeing on an
+event type and fields, not by the framework.
+
+**Evidence.** `ModuleTickTest` (8): a zero period is every tick and the callback sees the tick count; a long
+period holds an endpoint back after its first call and a short one lets it run again; a call that runs past its
+slice is counted and a polite one is not; a destroyed endpoint is never called; an endpoint assigned in `Init`
+keeps its registration with its state; a callback may close an endpoint not yet called; queued events come out
+once, in order. `MaintenanceLoopTest.ATickRunsOnTheLoopThreadUnderTheControlLock` runs a callback that holds
+for a millisecond and has the test thread take the control lock 200 times, finding the callback running in none:
+the lock is held across the call. `MaintenanceLoopTest.ATicksEventsReachTheLog` reads a tick's event, with its
+type, source and fields, from the daemon's log. Fast build: suite 214/214.

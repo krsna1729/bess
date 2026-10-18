@@ -107,6 +107,7 @@ execution_sources = files(
   'event.cc',
   'framework/instance_registry.cc',
   'framework/module_requests.cc',
+  'framework/module_tick.cc',
   'packet_pool.cc',
   'resume_hook.cc',
   'runtime/runtime_state.cc',
@@ -584,6 +585,7 @@ core_public_subdir_headers = {
   'framework': files(
     'framework/instance_registry.h',
     'framework/module_requests.h',
+    'framework/module_tick.h',
     'framework/module_init_context.h',
     'framework/plugin.h',
     'framework/resource_bindings.h',
@@ -761,6 +763,7 @@ unit_test_sources = [
   'runtime/simd_width_test.cc',
   'framework/instance_registry_test.cc',
   'framework/module_requests_test.cc',
+  'framework/module_tick_test.cc',
   'modules/shared_instance_test.cc',
   'control/apply_pipeline_test.cc',
   'control/control_plane_test.cc',

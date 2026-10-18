@@ -14,6 +14,7 @@
 #include "stats/event_hub.h"
 #include "stats/metric_registry.h"
 #include "framework/module_requests.h"
+#include "framework/module_tick.h"
 
 class Module;
 class Port;
@@ -176,6 +177,9 @@ class RuntimeState {
   // Module requests from workers, delivered by the control side's maintenance
   // loop (TP4, D-077).
   framework::RequestHub &requests() { return requests_; }
+  // Periodic control-side work for modules (D-150): the maintenance loop runs
+  // it under the control-plane lock.
+  framework::TickHub &ticks() { return ticks_; }
   WorkerManager &workers();
 
   // The single dataplane reader domain (K1): workers register once and report
@@ -227,6 +231,7 @@ class RuntimeState {
   // Before modules_ for the same reason: a module's endpoints unregister as it
   // is destroyed.
   framework::RequestHub requests_;
+  framework::TickHub ticks_;
   PortRegistry ports_;
   ModuleRegistry modules_;
   TrafficClassRegistry traffic_classes_;

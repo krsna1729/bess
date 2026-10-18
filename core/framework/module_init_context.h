@@ -26,6 +26,7 @@ class ResourceRegistry;
 }  // namespace dataplane
 namespace framework {
 class RequestHub;
+class TickHub;
 }  // namespace framework
 namespace framework {
 class InstanceRegistry;
@@ -62,7 +63,8 @@ class ModuleInitContext {
                     ResourceBindings &resource_bindings,
                     framework::InstanceRegistry &instances, rcu::RcuDomain &rcu,
                     const runtime::PortRegistry &ports, stats::MetricRegistry &metrics,
-                    framework::RequestHub &requests, stats::EventHub &events) noexcept
+                    framework::RequestHub &requests, stats::EventHub &events,
+                    framework::TickHub &ticks) noexcept
       : resources_(resources),
         resource_bindings_(resource_bindings),
         instances_(instances),
@@ -70,7 +72,8 @@ class ModuleInitContext {
         ports_(ports),
         metrics_(metrics),
         requests_(requests),
-        events_(events) {}
+        events_(events),
+        ticks_(ticks) {}
 
   ModuleInitContext(const ModuleInitContext &) = delete;
   ModuleInitContext &operator=(const ModuleInitContext &) = delete;
@@ -105,6 +108,12 @@ class ModuleInitContext {
   // WatchEvents streams them. A plugin that calls this requires
   // BESS_CAP_EVENTS.
   stats::EventHub &events() const noexcept { return events_; }
+  // Periodic control-side work (D-150, framework/module_tick.h): open a
+  // TickEndpoint on it in Init(); the daemon's maintenance loop calls the
+  // callback under the control-plane lock with a time slice, and appends the
+  // events it emits after the lock is released. A plugin that calls this
+  // requires BESS_CAP_TICKS.
+  framework::TickHub &ticks() const noexcept { return ticks_; }
   // Wire codecs for this module's resources (D-044, D-094; experimental:
   // framework/resource_bindings.h and framework/resource_codec.h). Bind a
   // codec to each resource registered through resources() so the control
@@ -134,6 +143,7 @@ class ModuleInitContext {
   stats::MetricRegistry &metrics_;
   framework::RequestHub &requests_;
   stats::EventHub &events_;
+  framework::TickHub &ticks_;
 };
 
 }  // namespace framework

@@ -86,7 +86,7 @@ void ApiServer::Run() {
     // control-plane lock, and workers' events moved into the event log (M25);
     // stopped before the dataplane is torn down below.
     bess::control::MaintenanceLoop maintenance(
-        control_plane, bess::runtime::runtime().requests(),
+        control_plane, bess::runtime::runtime().requests(), bess::runtime::runtime().ticks(),
         std::chrono::microseconds(FLAGS_maintenance_interval_us),
         &bess::runtime::runtime().events());
     // SIGTERM/SIGINT: the same shutdown as Admin.Shutdown (D-030).

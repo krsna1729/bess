@@ -88,6 +88,7 @@
     "flow/shared_flow_table.h": "experimental",
     "framework/instance_registry.h": "public",
     "framework/module_requests.h": "experimental",
+    "framework/module_tick.h": "experimental",
     "framework/module_init_context.h": "public",
     "framework/plugin.h": "public",
     "framework/resource_bindings.h": "experimental",

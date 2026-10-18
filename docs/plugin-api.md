@@ -317,6 +317,7 @@ struct BessPluginDescriptor {
   | `BESS_CAP_REQUESTS` | worker-to-control requests (`init_context().requests()`) |
   | `BESS_CAP_EVENTS` | operational events (`init_context().events()`) |
   | `BESS_CAP_EVENT_SOURCES` | named event sources and the throttled packet-path events (`EventHub::NamedSource`, `EventHub::Full`, `stats::EventThrottle`) |
+  | `BESS_CAP_TICKS` | periodic control-side work (`init_context().ticks()`) |
 
   The `standalone_*` conformance plugins in `examples/standalone_plugin` use
   `BESS_PLUGIN`; `sample_plugin`'s `SequentialUpdate` uses
@@ -356,6 +357,7 @@ construction or `Init()`:
 | `instances()` | borrow application-owned shared state (below) |
 | `metrics()` | register a source that reports this module's counters when the control plane asks (`stats::MetricRegistry`, `stats/metric_registry.h`, experimental); keep the returned `MetricSource` as a member declared after what it reads |
 | `requests()` | open a `RequestEndpoint` (`framework/module_requests.h`, experimental): workers post a small request (a table nearly full), the daemon's maintenance loop calls the module's handler under the control-plane lock; one pending request per endpoint, re-armed by `Done()` |
+| `ticks()` | open a `TickEndpoint` (`framework/module_tick.h`, experimental, D-150): the maintenance loop calls the module's callback under the control-plane lock, no sooner than its `period` after the previous start, with a time slice the callback checks as `ctx.Expired()` and resumes next tick; `ctx.Emit(type, source, fields)` queues an event the loop appends to the log after the lock is released. For work that belongs on a clock on the control side (reading the module's own counters against limits a controller armed, ageing, fill checks): the framework knows nothing about what the callback does, and a controller reaches the module through its own action |
 | `events()` | register an event type in Init (`RegisterType(name, value names)`); a worker posts with `Post(ctx->wid, WorkerEvent{...})`, never blocking (a full ring refuses and counts); the maintenance loop moves events into the log `WatchEvents` streams (`stats::EventHub`, `stats/event_hub.h`, experimental). `NamedSource(name)` makes the log show a source by name. For a recurring packet-path condition (a full table or queue), `stats::EventThrottle` (`stats/event_throttle.h`) posts at most one event per second per worker carrying the count, called on the failure path only |
 | `codecs()` | bind a wire codec to each resource registered through `resources()`, so `ApplyTransaction` and `ListTransactionResources` reach it (`framework::ResourceBindings`, experimental; below) |
 

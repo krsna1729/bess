@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // The daemon's maintenance loop (TP4, D-077): a control-side thread that wakes
 // every interval and, under the control-plane lock, delivers the requests
-// workers posted to module endpoints (framework/module_requests.h). Handlers
-// therefore run exactly as a module command does: serialized with every RPC,
-// never on a worker. With an event log, it also moves workers' events into it
-// every tick and, about once a second, samples the control-visible pressure
-// conditions (control/pressure_monitor.h).
+// workers posted to module endpoints (framework/module_requests.h) and calls
+// the modules' tick endpoints that are due (framework/module_tick.h, D-150).
+// Handlers and ticks therefore run exactly as a module command does:
+// serialized with every RPC, never on a worker. The events the ticks queued
+// are appended to the log after the lock is released. With an event log, it
+// also moves workers' events into it every tick and, about once a second,
+// samples the control-visible pressure conditions (control/pressure_monitor.h).
 
 #ifndef BESS_CONTROL_MAINTENANCE_LOOP_H_
 #define BESS_CONTROL_MAINTENANCE_LOOP_H_
@@ -20,6 +22,7 @@
 
 namespace bess::framework {
 class RequestHub;
+class TickHub;
 }  // namespace bess::framework
 namespace bess::stats {
 class EventHub;
@@ -34,10 +37,13 @@ class MaintenanceLoop {
  public:
   // Starts the thread. `interval` 0 disables the loop (no thread).
   // With `events`, also moves workers' events into its log every tick and
-  // emits pressure transitions (sampled every `pressure_period`).
+  // emits pressure transitions (sampled every `pressure_period`), and appends
+  // the events the ticks queued. Each due tick endpoint is given `tick_slice`.
   MaintenanceLoop(ControlPlane &control, framework::RequestHub &requests,
-                  std::chrono::microseconds interval, stats::EventHub *events = nullptr,
-                  std::chrono::microseconds pressure_period = std::chrono::seconds(1));
+                  framework::TickHub &ticks, std::chrono::microseconds interval,
+                  stats::EventHub *events = nullptr,
+                  std::chrono::microseconds pressure_period = std::chrono::seconds(1),
+                  std::chrono::microseconds tick_slice = std::chrono::microseconds(250));
   ~MaintenanceLoop();  // stops and joins: no handler runs after it returns
   MaintenanceLoop(const MaintenanceLoop &) = delete;
   MaintenanceLoop &operator=(const MaintenanceLoop &) = delete;
@@ -50,6 +56,8 @@ class MaintenanceLoop {
 
   ControlPlane &control_;
   framework::RequestHub &requests_;
+  framework::TickHub &tick_hub_;
+  const std::chrono::microseconds tick_slice_;
   stats::EventHub *const events_;
   const std::chrono::microseconds interval_;
   std::unique_ptr<PressureMonitor> pressure_;
