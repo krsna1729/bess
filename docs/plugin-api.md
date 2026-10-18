@@ -381,6 +381,28 @@ values workers read unsynchronized: `ApplyTransaction` refuses it
 (`RESOURCE_BUSY`) while a worker runs, and `ApplyPipeline` pauses the
 workers for it.
 
+**A value may be empty on purpose, and then the read-back is not a source of
+truth.** A value is copied on every publish, so state that changes per packet
+belongs in the module's per-worker planes: a counter kept in a value would be
+zeroed by a handover, because a publish copies what the control side last wrote.
+The read-back (`Contents`, `GetPipeline`) returns such an entry's identity and
+size and nothing that changes - a tick built on it would read a row per key and
+decide every report from zeros. That state is reached through the module's own
+command instead: the UPF's counter module reads its per-worker planes from
+`RuleCounts(ctx, module)` and names the module, and a `Contents` read of the same
+resource returns 90 B per rule carrying no counts. The line to keep: a resource
+is the desired state a client programs and a worker reads; a worker's accumulated
+state is the module's own.
+
+**An index a module uses in its own keys is the graph's, not the module's.** A
+module that keys by a "domain" (a routing instance, a slice, a tenant) does not
+invent the number: it is the slot the graph assigned, the same discipline as a
+gate index, which belongs to the connection rather than to the module. Read it
+from the deployment's own configuration at Init and refuse a value the graph does
+not carry, so two instances that agree on the graph agree on the keys - and a
+downlink rule written against one deployment's numbering cannot silently land in
+another's table.
+
 ```cpp
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
