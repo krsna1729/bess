@@ -64,6 +64,27 @@ inline TtlResult DecrementHopLimit(std::span<uint8_t> ipv6_header) noexcept {
   return TtlResult::kForward;
 }
 
+// -- ECMP flow hash --------------------------------------------------------------
+
+// The hash a route that names a next-hop group picks its member with: the
+// addresses, the ports and the protocol, mixed. Which fields a deployment
+// hashes is its own choice (D-066); what matters here is that every path
+// resolving the same group hashes the same way, so a flow keeps one member.
+// The Router module and the router appliance call this one function, so a
+// flow cannot land on different members in the two paths. `src`/`dst` are the
+// header's address words as stored (one byte order for all callers), the
+// ports are host order.
+inline uint32_t FlowHash(uint32_t src, uint32_t dst, uint16_t src_port,
+                         uint16_t dst_port, uint8_t protocol) noexcept {
+  uint64_t x = (uint64_t{src} << 32 | dst) ^
+               (uint64_t{src_port} << 24 | uint64_t{dst_port} << 8 | protocol);
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ull;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebull;
+  return static_cast<uint32_t>(x ^ (x >> 31));
+}
+
 // -- MTU -----------------------------------------------------------------------
 
 enum class MtuResult : uint8_t {

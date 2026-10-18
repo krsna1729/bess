@@ -91,10 +91,10 @@ class RouterApp {
         p.l3 != bess::conntrack::L3Kind::kIpv4) {
       return {Verdict::kNotIpv4};
     }
-    uint32_t dst;
-    std::memcpy(&dst, p.dst.data(), 4);
-    dst = __builtin_bswap32(dst);
-    const NextHop *hop = router_->Resolve(in->vrf, dst, FlowHash(p));
+    // The LPM takes host order, on any host: the endian wrapper converts.
+    bess::utils::be32_t dst;
+    std::memcpy(&dst, p.dst.data(), sizeof(dst));
+    const NextHop *hop = router_->Resolve(in->vrf, dst.value(), FlowHash(p));
     if (hop == nullptr) {
       return {Verdict::kNoRoute};
     }
@@ -144,18 +144,15 @@ class RouterApp {
     return a;
   }
 
-  // The application's flow hash: addresses, ports and protocol, mixed.
+  // The application's flow hash: the parsed frame's addresses, ports and
+  // protocol, mixed by the library's one implementation (route::FlowHash), so
+  // the Router module -- this appliance's graph adapter -- picks the same
+  // member of a group route that this path picks.
   static uint32_t FlowHash(const bess::conntrack::ParsedFlowPacket &p) noexcept {
     uint32_t s, d;
     std::memcpy(&s, p.src.data(), 4);
     std::memcpy(&d, p.dst.data(), 4);
-    uint64_t x = (uint64_t{s} << 32 | d) ^ (uint64_t{p.src_port} << 24 | uint64_t{p.dst_port} << 8 |
-                                           p.protocol);
-    x ^= x >> 30;
-    x *= 0xbf58476d1ce4e5b9ull;
-    x ^= x >> 27;
-    x *= 0x94d049bb133111ebull;
-    return static_cast<uint32_t>(x ^ (x >> 31));
+    return bess::route::FlowHash(s, d, p.src_port, p.dst_port, p.protocol);
   }
 
   // The static control policy (the application's): four interfaces, two VRFs
