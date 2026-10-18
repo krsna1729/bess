@@ -10675,3 +10675,50 @@ once, in order. `MaintenanceLoopTest.ATickRunsOnTheLoopThreadUnderTheControlLock
 for a millisecond and has the test thread take the control lock 200 times, finding the callback running in none:
 the lock is held across the call. `MaintenanceLoopTest.ATicksEventsReachTheLog` reads a tick's event, with its
 type, source and fields, from the daemon's log. Fast build: suite 214/214.
+
+## D-151 Armed counter limits are a library a module's tick uses
+
+**Status:** accepted (2026-10-18).
+**Code:** `core/framework/threshold_table.h` (`ThresholdTable`, `ReportCrossings`, `kCounterThresholdEvent`),
+`core/framework/threshold_table_test.cc`, `core/meson.build` and `tools/api_classes.json` (installed,
+experimental), `docs/plugin-api.md`.
+
+**Context.** D-150 gave a module a clock on the control side and said what follows is libraries, not
+framework. The driving case is a counter module whose controller wants to know when a counter reaches a limit
+(a UPF usage report at a volume threshold) without reading every counter every second. Worker-side checks see
+only a worker's own share of a key whose traffic is spread across workers; the module's own read covers all of
+its planes.
+
+**Decision.** `ThresholdTable` is a plain control-side class a module holds beside its counters. The module's
+own arm action calls `Arm(key, limit)`; its tick calls `Sweep(read, stop)` and `ReportCrossings(ctx, name(), r)`.
+It is header-only and knows nothing of the framework's hubs: the module supplies the read (key to total, or
+nullopt when the key is gone) and the stop condition (normally `ctx.Expired()`). Level-triggered: an entry fires
+when its total is at or past its limit at a sweep, so arming a counter already past its limit fires at the next
+sweep and no crossing slips between arming and counting. An entry fires once and is removed (the controller
+re-arms with its next limit); a key the read no longer knows is dropped and reported as gone, so a deleted rule
+leaves no entry behind; arming an armed key replaces its limit. A sweep makes at most as many reads as the table
+held when it began, looks at `stop()` every 16 entries and never before the first batch, and resumes where it
+stopped, so a pass over any number of armed keys completes across ticks within the tick's slice. A removal
+leaves the cursor on the slot the last entry moved into, which is read next; when the sweep had already passed
+that entry it is read twice in the sweep and the entry it displaced waits for the next one, so no entry is lost
+but a single sweep need not reach every entry. The read runs under the control-plane lock and must be bounded,
+must not allocate or block, and must not modify the table (Arm, Disarm and Clear are the module's, not the
+read's).
+
+**One event shape.** `bess.counter_threshold`, source the module's name, fields `key`, `value` (the total the
+read returned) and `limit`. Every producer uses it, so a consumer's handler serves them all; the opt-in
+worker-side notifier that follows reports the same shape.
+
+**Costs.** No packet-path code and no memory beside the counters the module already keeps, but the report
+latency is the maintenance interval plus, for a very large table, the ticks a pass takes; a module that needs
+a crossing reported faster than that has the worker-side notifier, exact only when a key's traffic is pinned to
+one worker.
+
+**Evidence.** `ThresholdTableTest` (9): fires once at the limit and is removed and does not fire again; a
+counter already past its limit fires at the next sweep with the total it has; arming replaces a limit; disarm
+says whether there was an entry; a key the read no longer knows is dropped and reported once; a stopped sweep
+resumes, every key past its limit fires exactly once, and every armed entry is looked at within a few more
+passes; the order of reads pins that a removal leaves the cursor on the slot the last entry moved into (a
+variant that skipped it passes every outcome check and fails only this one); a sweep always evaluates its first
+batch; `ReportCrossings` queues the shared event with the module's name as source and key, value and limit as
+fields, through a real `TickEndpoint`.
