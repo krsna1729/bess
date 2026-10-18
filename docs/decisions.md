@@ -10954,3 +10954,73 @@ neighbor drop and count; TTL 0 and 1 drop while 2 leaves as 1; the `route_domain
 domain this router does not hold misses instead of aliasing domain 0; an ARP frame, an IPv6 frame, a frame that
 says IPv4 and has no header, and a non-initial fragment are dropped with their own counters; and a shared
 payload is copied before the TTL is written, so the payload's other holder keeps the header it arrived with.
+
+## D-156 The Router module exposes next-hop groups
+
+**Status:** accepted (2026-10-19; D-155 left groups out on purpose, as the commit that comes next).
+**Code:** `protobuf/module_msg.proto` (`RouterArg.max_groups`, `RouterGroupIdKey`, `RouterGroupValue`,
+`RouterRouteValue.group_id`), `core/route/router.{h,cc}` (`ForEachNextHopGroup`; the groups resource is
+registered whether or not `max_groups` is set), `core/modules/router.{h,cc}` (the codec, the read-back,
+`GetDesc`), `core/modules/router_test.cc` (6 new), `core/modules/session_pipeline_test.cc` (Router's declared
+tables are three), `core/route/router_transaction_test.cc`, `core/fuzz/resource_codec_fuzz.cc` and the two
+seeds it gains, `tests/live/control_sdk_test.cc`, `docs/dataplane-tables.md`, `docs/limits.md`.
+**Analysis:** [dataplane-tables.md](dataplane-tables.md).
+
+**Context.** D-155 left one gap in the module on purpose: a route named a next hop and nothing else. The FIB
+half of groups - `SetNextHopGroup`, a route value of `max_next_hops + group id`, member selection by the flow
+hash - exists in the library since D-065, but `RouterArg` had no `max_groups` and `RouterRouteValue` named one
+next hop, so a graph could not express the ECMP pair the appliance demonstrates
+(`examples/appliances/router`), and the module could not be called equivalent to the appliance without it.
+
+**Decision.**
+
+- **`RouterArg.max_groups` sizes the group table** (default 0: none). With `max_next_hops` it must fit the
+  24-bit route value (`LpmRouteTable::kMaxValue`); `Init` checks the bound before creating the router, so the
+  refusal reads "router capacity exceeds backend limits" rather than the library's own error name.
+- **A route names a next hop or a group: `next_hop_id` stays, `group_id` is added.** A oneof is the natural
+  shape for "exactly one", and buf's `WIRE_JSON` breaking check refuses moving a field into a oneof
+  (`FIELD_SAME_ONEOF`: presence is part of the wire and JSON contract, D-026), so the fields stay plain, the
+  ids are one-based (0, the default, names nothing), and the codec refuses a value that names both or
+  neither. The native values stay distinct (`NextHopId` vs `NextHopGroupId`, D-065), so the route resource
+  cannot confuse the two, and the read-back writes the id a client sent (D-129).
+- **`<module>/groups` is a map `RouterGroupIdKey -> RouterGroupValue`**: `member_ids` is 1..64 next-hop ids
+  in selection order, a repeated id a weight (it takes that many selection slots), which is what the library
+  stores (D-065) and what the read-back returns. Shape is the codec's (empty, more than 64, id 0); existence
+  is the engine's: a member must exist and a route must name the group, so a session's hop, its group and the
+  route can still land in one transaction, and the group's or member's removal is refused while referenced
+  (D-023).
+- **The groups resource is registered whether or not `max_groups` is set**, and its codec bound either way.
+  The control plane refuses a class that registers fewer tables than it declares (`CheckDeclaredResources`,
+  D-129), and a class's declarations are static while a module instance's registrations are per-instance, so
+  "declared but sometimes absent" cannot exist. With `max_groups` 0 the resource exists, holds nothing, and
+  `ValidGroupId` refuses every id - the same refusal an out-of-range id gets. This amends D-065's note that
+  the resource is registered "with `max_groups`"; `router_transaction_test.cc`'s case moves from "the object
+  is null" to "the resource is empty and refuses".
+- **`RouteReferences` counts routes in the enrolled case whether or not `max_groups` is set**, as D-065's
+  change text says. Without `max_groups` it used to return the engine's whole count for the hop, which included
+  a non-route resource's reference (`OtherResourcesReferenceNextHops` pinned "2 = route + action"); now that
+  the groups resource is always registered, that branch is gone: the test pins 1 (routes) beside the engine's 2
+  (routes + action), which is the ledger that still refuses the removal.
+- **Selection stays the dataplane's**: the module already passes `route::FlowHash` to `Resolve` (D-155), the
+  same function the appliance hashes with, so a flow keeps one member in both paths and no control-side call
+  picks a member. `GetDesc` reports the live group count beside routes and next hops.
+
+**Not in this change.** Actions still name a single next hop (`RouterNextHopValue` has no group, and an
+ActionTable's reference is a hop), so traffic selected by a rule cannot ECMP without a FIB route deciding the
+hop; whether an action may name a group is not decided here. `IPLookup` retirement is still its own commit
+(`docs/compatibility.md`), and the direct group setters remain library-only. A group has no counters or
+actions of its own: a member's next hop and the route that names the group are the whole policy.
+
+**Evidence.** `RouterTest` (21, `core/modules/router_test.cc`): six new cases - 64 flows over a two-member
+group all leave on a member's gate with its addresses written and the TTL decremented, and each flow keeps
+its member; `{1, 1, 2}` sends more flows to hop 1 and still sends some to hop 2; a route to a group that
+does not exist, to one past `max_groups`, one with no target, and one naming both a hop and a group are each
+refused with nothing applied, and the first applies once the group exists; the groups resource and a group
+route read back in the form a client sends (members in order, the weight as a repeat; the route as
+`group_id`); a group a route names and a member a group names cannot be erased, and the route, then the
+group, then the member can; without
+`max_groups` the resource is registered, reads back empty, and refuses a group write and a group route.
+`router_transaction_test.cc` pins the always-registered resource and the empty-resource refusals; the codec
+fuzz models the two ids and its corpus gains a group route and a both-targets seed; the SDK live test
+round-trips a group sample. buf breaking (`WIRE_JSON`, D-026) against develop is clean -- `next_hop_id` is
+untouched and `group_id` is new; a oneof shape fails `FIELD_SAME_ONEOF` (verified).

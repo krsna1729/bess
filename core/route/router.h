@@ -168,18 +168,21 @@ struct NextHopGroup {
 // member's next-hop update, and a group in use (routes name it) cannot be
 // removed. In the FIB a group is the value max_next_hops + group id, so a
 // router without groups pays one never-taken branch. Groups are transactional
-// like next hops (user decision on D-065): enrolled, a router with max_groups
-// registers "<name>/groups", a route may name a group, a group references its
-// members, and the direct group setters refuse (kEnrolled).
+// like next hops (user decision on D-065): enrolled, Enroll registers
+// "<name>/groups" beside next hops and routes -- always, not only with
+// max_groups: a class must register every table it declares (D-156), so
+// without max_groups the resource exists and holds nothing, and every group
+// id is invalid. A route may name a group, a group references its members,
+// and the direct group setters refuse (kEnrolled).
 //
-// Transactions (G1.2b, D-023): Enroll() registers the next hops and the
-// routes as two resources of a TransactionEngine, so that one transaction can
-// change them together with other modules' tables (a rule, the action it
-// names, the route that action forwards to). The routes resource holds every
-// domain's routes under one resource; the key carries the domain (RouteKey).
-// An enrolled router has one writer, the engine: the direct setters above
-// refuse (kEnrolled), and the engine's reference ledger replaces the
-// router's own counts.
+// Transactions (G1.2b, D-023): Enroll() registers the next hops, the groups
+// and the routes as three resources of a TransactionEngine, so that one
+// transaction can change them together with other modules' tables (a rule,
+// the action it names, the route that action forwards to). The routes
+// resource holds every domain's routes under one resource; the key carries
+// the domain (RouteKey). An enrolled router has one writer, the engine: the
+// direct setters above refuse (kEnrolled), and the engine's reference ledger
+// replaces the router's own counts.
 class Router {
  public:
   using Config = LpmRouteTable::Config;
@@ -277,6 +280,8 @@ class Router {
   size_t route_count(RouteDomainId domain) const;
   size_t next_hop_count() const;
   // Routes naming `id` (control-side reference count), across all domains.
+  // Enrolled, routes only: a group holding the hop is GroupMemberships, and a
+  // non-route resource naming it lives in the engine's ledger (D-065, D-023).
   size_t RouteReferences(NextHopId id) const;
 
   // Control-side walks over the committed state, for reading it back (D-129):
@@ -291,12 +296,17 @@ class Router {
   void ForEachRoute(
       const std::function<void(const ::bess::route::RouteKey &key,
                                NextHopId hop, NextHopGroupId group)> &fn) const;
+  // Every live group, in id order, under the same rule as ForEachNextHop: a
+  // removed one is absent at once, though readers may still see it until its
+  // grace period ends.
+  void ForEachNextHopGroup(
+      const std::function<void(NextHopGroupId, const NextHopGroup &)> &fn) const;
 
   // -- transactions (D-023) ---------------------------------------------------
 
   // Registers "<name>/next_hops" (key: EncodeKey(NextHopId), value: NextHop),
-  // with max_groups "<name>/groups" (key: EncodeKey(NextHopGroupId), value:
-  // NextHopGroup; each group references its distinct members), and
+  // "<name>/groups" (key: EncodeKey(NextHopGroupId), value: NextHopGroup;
+  // each group references its distinct members), and
   // "<name>/routes" (key: RouteKey(domain, prefix), value: NextHopId or
   // NextHopGroupId; each route references what it names) with `engine`, which
   // must outlive the router or its enrollment. Refused once any route or group
@@ -654,7 +664,7 @@ class Router {
   const std::string groups_name_;
   dataplane::ResourceRegistry *engine_ = nullptr;
   std::unique_ptr<dataplane::Resource> next_hops_res_;
-  std::unique_ptr<dataplane::Resource> groups_res_;  // null without max_groups
+  std::unique_ptr<dataplane::Resource> groups_res_;  // holds nothing without max_groups
   std::unique_ptr<dataplane::Resource> routes_res_;
 };
 

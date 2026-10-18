@@ -35,11 +35,14 @@
 //     domain the packet carries (a `route_domain` be32 attribute a VIF
 //     writes; domain 0 when nothing writes it), drop what the FIB does not
 //     resolve or whose neighbor is not resolved, decrement the TTL, write the
-//     hop's addresses, and leave on the hop's egress gate. A frame that is
-//     not an IPv4 packet, one whose headers do not parse, and a non-initial
-//     fragment (its L4 header is in an earlier fragment, so it cannot be
-//     hashed to a group member) are dropped and counted. The `next_hop_id`
-//     attribute is ignored in this mode, even if some module writes it.
+//     hop's addresses, and leave on the hop's egress gate. A route names a
+//     next hop or a next-hop group; a group route picks its member by the
+//     frame's flow hash (route::FlowHash, the appliance's function), so a
+//     flow keeps one member. A frame that is not an IPv4 packet, one whose
+//     headers do not parse, and a non-initial fragment (its L4 header is in
+//     an earlier fragment, so it cannot be hashed to a group member) are
+//     dropped and counted. The `next_hop_id` attribute is ignored in this
+//     mode, even if some module writes it.
 //
 // Both modes drop a packet whose hop is unknown, or whose neighbor is not
 // resolved: what to do toward an unresolved neighbor (queue, punt, drop) is
@@ -57,9 +60,10 @@
 // forwarding it with the addresses it arrived with would put it on the wire as
 // someone else's.
 //
-// Control path: `<module>/next_hops` and `<module>/routes` are resources, so
-// one transaction can create a session's next hop, the route to it, the
-// action that names it and the rule that selects the action. An enrolled
+// Control path: `<module>/next_hops`, `<module>/groups` (sized by
+// `max_groups`; a route names a next hop or a group) and `<module>/routes`
+// are resources, so one transaction can create a session's next hop, the
+// route to it, the action that names it and the rule that selects the action. An enrolled
 // router has one writer, the engine: the direct setters refuse with kEnrolled,
 // and the engine's ledger replaces the router's own reference counts. New
 // routes are placed during prepare with the value their addresses already
@@ -69,8 +73,10 @@ class Router final : public Module {
   static const gate_idx_t kNumOGates = MAX_GATES;
 
   static const Commands cmds;
-  // "<module>/next_hops" (RouterNextHopIdKey -> RouterNextHopValue) and
-  // "<module>/routes" (RouterRouteKey -> RouterRouteValue), D-129.
+  // "<module>/next_hops" (RouterNextHopIdKey -> RouterNextHopValue),
+  // "<module>/groups" (RouterGroupIdKey -> RouterGroupValue, with
+  // `max_groups`) and "<module>/routes" (RouterRouteKey -> RouterRouteValue),
+  // D-129.
   static const ResourceTables resource_tables;
 
   Router() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
@@ -138,6 +144,7 @@ class Router final : public Module {
   std::unique_ptr<bess::route::Router> router_;
   // After router_, which owns the resources they bind (D-044).
   bess::framework::ResourceBinding next_hops_binding_;
+  bess::framework::ResourceBinding groups_binding_;
   bess::framework::ResourceBinding routes_binding_;
   int next_hop_id_attr_ = -1;
   // The route domain a packet arrived in, written by the graph's VIF; domain 0

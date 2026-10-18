@@ -30,6 +30,8 @@ const Commands Router::cmds = {};
 const ResourceTables Router::resource_tables = {
     ResourceTable::Map<bess::pb::RouterNextHopIdKey,
                        bess::pb::RouterNextHopValue>("next_hops"),
+    ResourceTable::Map<bess::pb::RouterGroupIdKey, bess::pb::RouterGroupValue>(
+        "groups"),
     ResourceTable::Map<bess::pb::RouterRouteKey, bess::pb::RouterRouteValue>(
         "routes"),
 };
@@ -132,6 +134,12 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   }
   const size_t max_next_hops =
       arg.max_next_hops() ? static_cast<size_t>(arg.max_next_hops()) : 4096;
+  const size_t max_groups =
+      arg.max_groups() ? static_cast<size_t>(arg.max_groups()) : 0;
+  // A FIB value is 24 bits and holds max_next_hops + group id (D-065).
+  if (max_groups > route::LpmRouteTable::kMaxValue - max_next_hops) {
+    return CommandFailure(EINVAL, "router capacity exceeds backend limits");
+  }
 
   const size_t max_domains =
       arg.max_domains() ? static_cast<size_t>(arg.max_domains()) : 1;
@@ -141,7 +149,8 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   }
 
   auto router = route::Router::Create(name(), config, max_next_hops,
-                                      init_context().rcu(), max_domains);
+                                      init_context().rcu(), max_domains,
+                                      max_groups);
   if (!router) {
     return CommandFailure(route::RouteErrno(router.error()), "router: %s",
                           route::RouteErrorName(router.error()));
@@ -162,6 +171,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   if (auto enrolled = router_->Enroll(init_context().resources());
       !enrolled) {
     next_hops_binding_.Reset();
+    groups_binding_.Reset();
     routes_binding_.Reset();
     router_.reset();
     return CommandFailure(EINVAL, "%s", enrolled.error().c_str());
@@ -212,6 +222,53 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                   visit(key, NextHopToPb(hop));
                 });
           }));
+  groups_binding_ = init_context().codecs().Bind(
+      *router_->groups_resource_object(),
+      std::make_shared<bess::framework::TypedCodec<bess::pb::RouterGroupIdKey,
+                                             bess::pb::RouterGroupValue>>(
+          [](const bess::pb::RouterGroupIdKey &key)
+              -> std::expected<dataplane::ResourceKey, std::string> {
+            if (key.id() == 0) {
+              return std::unexpected("group id 0 is invalid");
+            }
+            return dataplane::EncodeKey(route::NextHopGroupId(key.id()));
+          },
+          [](const bess::pb::RouterGroupValue &value)
+              -> std::expected<std::any, std::string> {
+            const int members = value.member_ids_size();
+            if (members == 0 ||
+                static_cast<size_t>(members) > route::NextHopGroup::kMaxMembers) {
+              return std::unexpected(
+                  "a group has 1 to " +
+                  std::to_string(route::NextHopGroup::kMaxMembers) +
+                  " members");
+            }
+            // A repeated member is a weight: it takes that many selection
+            // slots (D-065), so the order is the group's meaning and is kept.
+            route::NextHopGroup group;
+            group.size = static_cast<uint32_t>(members);
+            for (int i = 0; i < members; i++) {
+              const uint32_t member = value.member_ids(i);
+              if (member == 0) {
+                return std::unexpected("group member id 0 is invalid");
+              }
+              group.members[static_cast<size_t>(i)] = route::NextHopId(member);
+            }
+            return std::any(group);
+          },
+          [this](const auto &visit) {
+            router_->ForEachNextHopGroup(
+                [&visit](route::NextHopGroupId id,
+                         const route::NextHopGroup &group) {
+                  bess::pb::RouterGroupIdKey key;
+                  key.set_id(id.value());
+                  bess::pb::RouterGroupValue value;
+                  for (uint32_t i = 0; i < group.size; i++) {
+                    value.add_member_ids(group.members[i].value());
+                  }
+                  visit(key, value);
+                });
+          }));
   routes_binding_ = init_context().codecs().Bind(
       *router_->routes_resource_object(),
       std::make_shared<bess::framework::TypedCodec<bess::pb::RouterRouteKey,
@@ -242,23 +299,36 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
           },
           [](const bess::pb::RouterRouteValue &value)
               -> std::expected<std::any, std::string> {
-            if (value.next_hop_id() == 0) {
-              return std::unexpected("next hop id 0 is invalid");
+            // An id is one-based, so 0 names nothing: a route names exactly
+            // one of the two, never both (they are separate namespaces).
+            const uint32_t hop = value.next_hop_id();
+            const uint32_t group = value.group_id();
+            if (hop != 0 && group != 0) {
+              return std::unexpected("a route names a next hop or a group, not both");
             }
-            return std::any(route::NextHopId(value.next_hop_id()));
+            if (hop != 0) {
+              return std::any(route::NextHopId(hop));
+            }
+            if (group != 0) {
+              return std::any(route::NextHopGroupId(group));
+            }
+            return std::unexpected("a route names a next hop or a group");
           },
-          // The module binds no groups: every route names a next hop.
           [this](const auto &visit) {
             router_->ForEachRoute([&visit](const route::RouteKey &id,
                                            route::NextHopId hop,
-                                           route::NextHopGroupId) {
+                                           route::NextHopGroupId group) {
               bess::pb::RouterRouteKey key;
               key.set_ipv4(bess::utils::ToIpv4Address(
                   bess::utils::be32_t(id.prefix.addr())));
               key.set_prefix_length(id.prefix.length());
               key.set_domain(id.domain.value());
               bess::pb::RouterRouteValue value;
-              value.set_next_hop_id(hop.value());
+              if (group.value() != 0) {
+                value.set_group_id(group.value());
+              } else {
+                value.set_next_hop_id(hop.value());
+              }
               visit(key, value);
             });
           }));
@@ -270,6 +340,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
     auto released = router_->Release();
     CHECK(released) << released.error();
     next_hops_binding_.Reset();
+    groups_binding_.Reset();
     routes_binding_.Reset();
     router_.reset();
     return CommandFailure(-next_hop_id_attr_, "add_metadata_attr() failed");
@@ -285,6 +356,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
     auto released = router_->Release();
     CHECK(released) << released.error();
     next_hops_binding_.Reset();
+    groups_binding_.Reset();
     routes_binding_.Reset();
     router_.reset();
     return CommandFailure(-route_domain_attr_, "add_metadata_attr() failed");
@@ -302,6 +374,7 @@ void Router::DeInit() {
   auto released = router_->Release();
   CHECK(released) << released.error();
   next_hops_binding_.Reset();
+  groups_binding_.Reset();
   routes_binding_.Reset();
   router_.reset();
 }
@@ -521,15 +594,17 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
 std::string Router::GetDesc() const {
   if (!routes_by_destination()) {
     return bess::utils::Format(
-        "%zu routes, %zu next hops, %zu header write failures, next-hop id from metadata",
+        "%zu routes, %zu next hops, %zu groups, %zu header write failures, next-hop id from metadata",
         router_->route_count(), router_->next_hop_count(),
+        router_->next_hop_group_count(),
         static_cast<size_t>(header_write_failures()));
   }
   return bess::utils::Format(
-      "%zu routes, %zu next hops, %zu header write failures, routing by "
+      "%zu routes, %zu next hops, %zu groups, %zu header write failures, routing by "
       "destination (not ipv4: %zu, malformed: %zu, non-initial fragments: %zu, "
       "no route: %zu, unresolved: %zu, ttl expired: %zu)",
       router_->route_count(), router_->next_hop_count(),
+      router_->next_hop_group_count(),
       static_cast<size_t>(header_write_failures()),
       static_cast<size_t>(not_ipv4_frames()), static_cast<size_t>(malformed_frames()),
       static_cast<size_t>(non_initial_fragments()), static_cast<size_t>(no_route_frames()),

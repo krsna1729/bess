@@ -1321,8 +1321,8 @@ TEST_F(SessionPacketPathTest, BadResourceValuesAreRefused) {
 
 // Each class declares exactly the tables its modules bind (the control plane
 // refuses creation otherwise), and none requires paused workers: meters
-// publish generations, next hops and actions are slot tables, routes are
-// rte_lpm's in-place updates.
+// publish generations, next hops, groups and actions are slot tables, routes
+// are rte_lpm's in-place updates.
 TEST_F(SessionPacketPathTest, DeclaredTablesMatchTheBoundCodecs) {
   const struct {
     const char *class_name;
@@ -1331,6 +1331,7 @@ TEST_F(SessionPacketPathTest, DeclaredTablesMatchTheBoundCodecs) {
   } tables[] = {
       {"Meter", "meters", "mt/meters"},
       {"Router", "next_hops", "rt/next_hops"},
+      {"Router", "groups", "rt/groups"},
       {"Router", "routes", "rt/routes"},
       {"ActionTable", "actions", "at/actions"},
   };
@@ -1348,7 +1349,7 @@ TEST_F(SessionPacketPathTest, DeclaredTablesMatchTheBoundCodecs) {
     EXPECT_FALSE(declared->requires_paused_workers) << t.resource;
     EXPECT_FALSE(codec->requires_paused_workers()) << t.resource;
   }
-  EXPECT_EQ(2u, ModuleBuilder::all_module_builders().at("Router").resource_tables().size());
+  EXPECT_EQ(3u, ModuleBuilder::all_module_builders().at("Router").resource_tables().size());
 }
 
 }  // namespace

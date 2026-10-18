@@ -358,10 +358,12 @@ std::vector<ModuleSample> EveryResourceSample() {
          {{R"({"id": 1})", R"({"tr_tcm": {"committed_rate": 1, "committed_burst": 100,
                                           "peak_rate": 1, "peak_burst": 100}})"}}}}},
       // A next hop's canonical form omits defaults: no neighbor when resolved.
-      {"rt", "Router", R"({"max_routes": 64, "max_tbl8s": 16, "max_next_hops": 64})", false,
+      {"rt", "Router",
+       R"({"max_routes": 64, "max_tbl8s": 16, "max_next_hops": 64, "max_groups": 8})", false,
        {{"next_hops",
          {{R"({"id": 1})",
            R"({"egress_gate": 7, "dst_mac": "AgAAAAAB", "src_mac": "AgAAAAAC"})"}}},
+        {"groups", {{R"({"id": 1})", R"({"member_ids": [1]})"}}},
         {"routes", {{R"({"ipv4": "10.0.0.0", "prefix_length": 8})", R"({"next_hop_id": 1})"}}}}},
       {"at", "ActionTable", R"({"capacity": 64, "meters": "mt/meters", "next_hops": "rt/next_hops"})",
        false, {{"actions", {{R"({"id": 1})", R"({"meter_id": 1, "next_hop_id": 1})"}}}}},

@@ -417,7 +417,10 @@ TEST_P(RouterTransactionTest, OtherResourcesReferenceNextHops) {
                    router->SetRouteOp(P(Ip(30, 0, 0, 0), 8), NextHopId(4))})
                 .outcome,
             Outcome::kApplied);
-  EXPECT_EQ(router->RouteReferences(NextHopId(4)), 2u);  // route + action
+  EXPECT_EQ(router->RouteReferences(NextHopId(4)), 1u)
+      << "routes only: the action's reference is the engine's, not a route";
+  EXPECT_EQ(engine_.ReferenceCount(hops, dataplane::EncodeKey(NextHopId(4))), 2u)
+      << "the engine counts the action too, and that is what protects the hop";
 
   // The router's resources cannot leave while "actions" may reference them.
   const std::string names[] = {router->routes_resource(), hops};
@@ -876,18 +879,27 @@ TEST_P(RouterTransactionTest, GroupReferencesAreChecked) {
             RouteError::kEnrolled);
 }
 
-TEST_P(RouterTransactionTest, RoutersWithoutGroupsRefuseGroupOps) {
+// Without max_groups the groups resource is still registered -- a module
+// class registers every table it declares (D-156) -- but it holds nothing and
+// every id is invalid, so group ops and routes that name a group are refused
+// and nothing resolves through one.
+TEST_P(RouterTransactionTest, RoutersWithoutGroupsRegisterAnEmptyGroupsResource) {
   auto router = MakeRouter();  // max_groups 0
   ASSERT_TRUE(router->Enroll(engine_.registry()));
-  EXPECT_EQ(router->groups_resource_object(), nullptr);
+  ASSERT_NE(router->groups_resource_object(), nullptr);
+  EXPECT_EQ(router->next_hop_group_count(), 0u);
   ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1))}).outcome, Outcome::kApplied);
   const NextHopId one[] = {NextHopId(1)};
-  EXPECT_NE(Apply({router->SetNextHopGroupOp(NextHopGroupId(1), one)}).outcome,
-            Outcome::kApplied);
-  EXPECT_NE(Apply({router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
-                                      NextHopGroupId(1))})
-                .outcome,
-            Outcome::kApplied);
+  const auto group = Apply({router->SetNextHopGroupOp(NextHopGroupId(1), one)});
+  EXPECT_NE(group.outcome, Outcome::kApplied);
+  EXPECT_NE(group.ops[0].error.find("configured capacity"), std::string::npos)
+      << group.ops[0].error;
+  const auto route = Apply({router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                               NextHopGroupId(1))});
+  EXPECT_NE(route.outcome, Outcome::kApplied);
+  EXPECT_NE(route.ops[0].error.find("configured capacity"), std::string::npos)
+      << route.ops[0].error;
+  EXPECT_EQ(EgressOf(*router, Ip(10, 0, 0, 1)), -1) << "nothing resolved through a group";
 }
 
 // A reader resolving through groups while transactions replace members, move

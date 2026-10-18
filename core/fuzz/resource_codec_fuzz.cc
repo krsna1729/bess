@@ -205,13 +205,30 @@ KeyResult RouteKey(const bess::pb::RouterRouteKey &key) {
   return Bytes(addr.value()) + Bytes(key.prefix_length()) +
          Bytes(key.domain());
 }
+// A route's target: a next-hop id (a plain uint32 in the model) or a group id
+// (distinct, as NextHopGroupId is distinct from NextHopId in the module), so
+// the projection tells the two apart even when the ids collide.
+struct RouteGroupId {
+  uint32_t id;
+};
+
 ValueResult RouteVal(const bess::pb::RouterRouteValue &value) {
-  if (value.next_hop_id() == 0) {
-    return std::unexpected("next hop id 0 is invalid");
+  // Ids are one-based: a route names exactly one of the two, never both.
+  if (value.next_hop_id() != 0 && value.group_id() != 0) {
+    return std::unexpected("a route names a next hop or a group, not both");
   }
-  return std::any(uint32_t{value.next_hop_id()});
+  if (value.next_hop_id() != 0) {
+    return std::any(uint32_t{value.next_hop_id()});
+  }
+  if (value.group_id() != 0) {
+    return std::any(RouteGroupId{value.group_id()});
+  }
+  return std::unexpected("a route names a next hop or a group");
 }
 std::string ProjectNextHop(const std::any &v) {
+  if (const auto *group = std::any_cast<RouteGroupId>(&v)) {
+    return std::string("group:") + Bytes(group->id);
+  }
   return Bytes(std::any_cast<uint32_t>(v));
 }
 
